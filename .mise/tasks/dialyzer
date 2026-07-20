@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+#MISE description="Run Dialyzer type checking"
+set -euo pipefail
+
+exec mise exec -- mix dialyzer "$@"

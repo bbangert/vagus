@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+#MISE description="Run Credo static analysis"
+set -euo pipefail
+
+exec mise exec -- mix credo "$@"
