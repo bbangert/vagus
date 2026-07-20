@@ -1,1 +1,25 @@
 *.fw
+
+# The directory Mix will write compiled artifacts to (umbrella-wide).
+/_build/
+
+# If you run "mix test --cover", coverage assets end up here.
+/cover/
+
+# The directory Mix downloads dependency sources to (umbrella-wide).
+/deps/
+
+# Where third-party dependencies like ExDoc output generated docs.
+/doc/
+
+# Temporary files, for example, from tests.
+/tmp/
+
+# Scratch/dev-only working files, not part of the shipped tree.
+/.dev/
+
+# If the VM crashes, it generates a dump, let's ignore it too.
+erl_crash.dump
+
+# ElixirLS build/cache artifacts.
+/.elixir_ls/
