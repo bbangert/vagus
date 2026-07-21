@@ -31,6 +31,8 @@ defmodule Vagus.Application do
         # `/services` endpoints have their store the moment requests arrive.
         Vagus.Addon.Registry,
         Vagus.Services,
+        Vagus.Discovery,
+        Vagus.Auth,
 
         # Supervisor-API emulator's HTTP surface (Bandit + Plug.Router),
         # isolated with its own restart budget so a crash there can't take

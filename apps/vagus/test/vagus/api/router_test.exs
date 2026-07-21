@@ -180,11 +180,11 @@ defmodule Vagus.API.RouterTest do
   end
 
   describe "GET /discovery" do
-    test "returns an empty discovery list (no add-ons)" do
+    test "returns an empty discovery list + services index (no add-ons)" do
       conn = conn(:get, "/discovery") |> authed() |> call()
       assert conn.status == 200
       assert json_body(conn)["result"] == "ok"
-      assert json_body(conn)["data"] == %{"discovery" => []}
+      assert json_body(conn)["data"] == %{"discovery" => [], "services" => %{}}
     end
   end
 

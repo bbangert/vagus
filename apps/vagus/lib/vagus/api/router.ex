@@ -31,6 +31,7 @@ defmodule Vagus.API.Router do
   alias Vagus.API.{Envelope, StaticData}
   alias Vagus.Backend
   alias Vagus.Core.TokenStore
+  alias Vagus.Discovery
   alias Vagus.Services
 
   alias Vagus.API.Models.{
@@ -215,12 +216,74 @@ defmodule Vagus.API.Router do
     Envelope.send_ok(conn, %{panels: %{}})
   end
 
-  # Fetched by hassio's discovery setup at every Core boot (observed on
-  # device 2026-07-20: 404 here logs "Can't read discover info: not found").
-  # Raw-dict path — `data["discovery"]` is a list of add-on service
-  # discovery messages; honestly empty with no add-ons.
+  # -- Discovery registry (§A3.2) --------------------------------------------
+  # An add-on publishes a discovery message (POST) for a service it declares
+  # in its config.yaml `discovery:` list; Supervisor mints a uuid, stores it,
+  # and pushes the message (minus `config`) to Core, which re-fetches the full
+  # record here and drives a config flow. Core reads the list at every boot
+  # (`@require_home_assistant` → the supervisor token); add-ons only write.
+
   get "/discovery" do
-    Envelope.send_ok(conn, %{discovery: []})
+    if home_assistant?(conn.assigns.caller) do
+      messages = Discovery.list()
+
+      services =
+        messages
+        |> Enum.group_by(& &1.service, & &1.addon)
+        |> Map.new(fn {service, slugs} -> {service, Enum.uniq(slugs)} end)
+
+      Envelope.send_ok(conn, %{
+        discovery: Enum.map(messages, &discovery_view/1),
+        services: services
+      })
+    else
+      Envelope.send_error(conn, "unauthorized", 403)
+    end
+  end
+
+  get "/discovery/:uuid" do
+    if home_assistant?(conn.assigns.caller) do
+      case Discovery.get(uuid) do
+        {:ok, message} -> Envelope.send_ok(conn, discovery_view(message))
+        :error -> Envelope.send_error(conn, "Discovery message not found", 404)
+      end
+    else
+      Envelope.send_error(conn, "unauthorized", 403)
+    end
+  end
+
+  post "/discovery" do
+    with {:addon, %{slug: slug, discovery: declared}} <- conn.assigns.caller,
+         {:ok, service, config} <- validate_discovery(conn.body_params),
+         true <- service in declared do
+      {:ok, message} = Discovery.add(slug, service, config)
+      push_discovery(:post, message)
+      Envelope.send_ok(conn, %{uuid: message.uuid})
+    else
+      {:error, message} -> Envelope.send_error(conn, message, 400)
+      # A non-add-on caller, or an add-on that didn't declare the service.
+      _ -> Envelope.send_error(conn, "Caller may not provide this discovery", 403)
+    end
+  end
+
+  delete "/discovery/:uuid" do
+    case conn.assigns.caller do
+      {:addon, %{slug: slug}} ->
+        case Discovery.delete(uuid, slug) do
+          {:ok, message} ->
+            push_discovery(:delete, message)
+            Envelope.send_ok(conn, %{})
+
+          {:error, :not_found} ->
+            Envelope.send_error(conn, "Discovery message not found", 404)
+
+          {:error, :not_owner} ->
+            Envelope.send_error(conn, "Caller does not own this discovery", 403)
+        end
+
+      _ ->
+        Envelope.send_error(conn, "Caller may not delete discovery", 403)
+    end
   end
 
   # Polled by Core's backup integration ("hassio.local" agent — observed on
@@ -283,6 +346,30 @@ defmodule Vagus.API.Router do
       Envelope.send_ok(conn, %{})
     else
       Envelope.send_error(conn, "Caller may not delete '#{service}'", 403)
+    end
+  end
+
+  # -- Add-on auth API (§A3.3) -----------------------------------------------
+  # A provider add-on with `auth_api: true` (e.g. Mosquitto's NGINX) validates
+  # an external client's HA username/password. Credentials arrive as Basic
+  # header, JSON, or form body (in that order); the add-on itself authenticates
+  # via `X-Supervisor-Token` (so the `Authorization` header is free for Basic).
+  # Success → 200; failure → 401 + `WWW-Authenticate`.
+
+  get "/auth" do
+    handle_auth(conn)
+  end
+
+  post "/auth" do
+    handle_auth(conn)
+  end
+
+  delete "/auth/cache" do
+    if match?({:addon, %{auth_api: true}}, conn.assigns.caller) do
+      :ok = Vagus.Auth.reset_cache()
+      Envelope.send_ok(conn, %{})
+    else
+      Envelope.send_error(conn, "Caller is not allowed to access the auth API", 403)
     end
   end
 
@@ -368,10 +455,120 @@ defmodule Vagus.API.Router do
       )
   end
 
+  # -- discovery helpers -----------------------------------------------------
+
+  # The V1 single/list message shape Core's hassio discovery reads.
+  defp discovery_view(%{uuid: uuid, addon: addon, service: service, config: config}) do
+    %{addon: addon, service: service, uuid: uuid, config: config}
+  end
+
+  # POST /discovery body `SCHEMA_DISCOVERY`: {service(req str), config(req dict)}.
+  defp validate_discovery(params) when is_map(params) do
+    with {:ok, service} <- require_string(params, "service"),
+         config when is_map(config) <- Map.get(params, "config") do
+      {:ok, service, config}
+    else
+      _ -> {:error, "config is required and must be an object"}
+    end
+  end
+
+  defp validate_discovery(_params), do: {:error, "invalid discovery body"}
+
+  # Fire-and-forget push to Core `POST|DELETE api/hassio_push/discovery/{uuid}`
+  # with the message minus `config` (`app`→`addon`), only meaningful once Core
+  # is reachable — `Vagus.Core.Client.request` returns `{:error,
+  # :no_refresh_token}` until the handshake has happened, which is exactly the
+  # `check_api_state()` gate. Decoupled via `Task.start/1` so the add-on's
+  # response never waits on a Core round-trip; failures are logged only.
+  defp push_discovery(method, %{uuid: uuid, addon: addon, service: service}) do
+    body = Jason.encode!(%{"addon" => addon, "service" => service, "uuid" => uuid})
+
+    Task.start(fn ->
+      case Vagus.Core.Client.request(method, "/api/hassio_push/discovery/#{uuid}",
+             headers: [{"content-type", "application/json"}],
+             body: body
+           ) do
+        {:ok, _response} ->
+          :ok
+
+        {:error, :no_refresh_token} ->
+          Logger.debug("Vagus.API.Router: discovery #{method} not pushed — Core not connected")
+
+        {:error, reason} ->
+          Logger.warning(
+            "Vagus.API.Router: discovery #{method} push for #{uuid} failed: #{inspect(reason)}"
+          )
+      end
+    end)
+
+    :ok
+  end
+
+  # -- auth helpers ----------------------------------------------------------
+
+  defp handle_auth(conn) do
+    case conn.assigns.caller do
+      {:addon, %{auth_api: true, slug: slug}} ->
+        case extract_credentials(conn) do
+          {:ok, username, password} ->
+            if Vagus.Auth.check_login(username, password, slug) do
+              Envelope.send_ok(conn, %{})
+            else
+              unauthorized_basic(conn)
+            end
+
+          :error ->
+            unauthorized_basic(conn)
+        end
+
+      _ ->
+        Envelope.send_error(conn, "Caller is not allowed to access the auth API", 403)
+    end
+  end
+
+  # Credential channels in order: Basic header, then JSON/form body
+  # (`username` or its alias `user`, plus `password`).
+  defp extract_credentials(conn) do
+    case basic_credentials(conn) do
+      {:ok, _username, _password} = ok ->
+        ok
+
+      :error ->
+        params = conn.body_params
+        username = params["username"] || params["user"]
+        password = params["password"]
+
+        if is_binary(username) and is_binary(password),
+          do: {:ok, username, password},
+          else: :error
+    end
+  end
+
+  defp basic_credentials(conn) do
+    with ["Basic " <> encoded] <- get_req_header(conn, "authorization"),
+         {:ok, decoded} <- Base.decode64(encoded),
+         [username, password] <- String.split(decoded, ":", parts: 2) do
+      {:ok, username, password}
+    else
+      _ -> :error
+    end
+  end
+
+  defp unauthorized_basic(conn) do
+    conn
+    |> put_resp_header("www-authenticate", ~s(Basic realm="Home Assistant Authentication"))
+    |> Envelope.send_error("Invalid authentication", 401)
+  end
+
   # -- caller/grant helpers (see Vagus.API.Auth for how :caller is assigned) --
 
   defp addon_slug({:addon, %{slug: slug}}), do: slug
   defp addon_slug(_), do: nil
+
+  # Discovery reads are Core-only (`@require_home_assistant`): Core polls with
+  # the supervisor token, resolved to `:supervisor` by `Vagus.API.Auth`.
+  defp home_assistant?(:supervisor), do: true
+  defp home_assistant?(_caller), do: false
 
   # May the caller provide/delete this service? (its role must be "provide").
   defp provider?({:addon, %{services_role: roles}}, service),
