@@ -121,11 +121,6 @@ config :vagus, :addon_data_root, "/root/vagus/addons"
 # pointed at .3 with `--dns` and for add-ons resolving external hosts.
 config :vagus, :dns_upstream, "1.1.1.1"
 
-# Listen on all host addresses (not just the .3 anchor) so the bind doesn't
-# race the .3 assignment to the hassio iface (done at first add-on install,
-# alongside .2). Add-ons still target 172.30.32.3 as their resolver.
-config :vagus, :dns_bind_ip, "0.0.0.0"
-
 # Core's Supervisor unix socket (M4 /auth). Core is run with
 # SUPERVISOR_CORE_API_SOCKET=<this path> and its dir bind-mounted to the host;
 # `Vagus.Auth` reaches api/hassio_auth over it, authenticating as the

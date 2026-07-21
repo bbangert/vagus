@@ -52,29 +52,42 @@ defmodule Vagus.DNS do
 
   ## GenServer
 
+  @bind_retry_ms 5_000
+
   @impl GenServer
   def init(opts) do
-    # Listen address (distinct from the `.3` anchor used in records): on target
-    # this is `0.0.0.0` so the bind doesn't depend on `.3` already being
-    # assigned to the bridge iface (which happens later, at add-on install).
-    ip =
-      to_ip(Keyword.get(opts, :ip, Application.get_env(:vagus, :dns_bind_ip, Network.dns_ip())))
+    # Bind the DNS socket to the `.3` anchor itself (not `0.0.0.0`): a client's
+    # stub resolver drops replies whose source IP isn't the server it queried,
+    # and only a socket bound to `.3` sources its replies from `.3`. Because
+    # `.3` is assigned to the hassio iface later (at first add-on install), a
+    # failed bind is retried rather than fatal.
+    state = %{
+      socket: nil,
+      ip:
+        to_ip(Keyword.get(opts, :ip, Application.get_env(:vagus, :dns_bind_ip, Network.dns_ip()))),
+      port: Keyword.get(opts, :port, Application.get_env(:vagus, :dns_port, 53)),
+      static: static_zone(),
+      dynamic: %{},
+      upstream:
+        parse_upstream(Keyword.get(opts, :upstream, Application.get_env(:vagus, :dns_upstream)))
+    }
 
-    port = Keyword.get(opts, :port, Application.get_env(:vagus, :dns_port, 53))
+    {:ok, try_bind(state)}
+  end
 
-    upstream =
-      parse_upstream(Keyword.get(opts, :upstream, Application.get_env(:vagus, :dns_upstream)))
-
+  defp try_bind(%{ip: ip, port: port} = state) do
     case :gen_udp.open(port, [:binary, :inet, {:ip, ip}, active: true, reuseaddr: true]) do
       {:ok, socket} ->
-        {:ok, %{socket: socket, static: static_zone(), dynamic: %{}, upstream: upstream}}
+        Logger.info("Vagus.DNS: listening on #{fmt(ip)}:#{port}")
+        %{state | socket: socket}
 
       {:error, reason} ->
-        # Don't take down the app if :53 can't bind (e.g. missing capability or
-        # port taken) — log and stay idle; add-on /etc/hosts still covers the
-        # supervisor anchor.
-        Logger.error("Vagus.DNS: failed to bind #{fmt(ip)}:#{port} (#{inspect(reason)})")
-        {:ok, %{socket: nil, static: static_zone(), dynamic: %{}, upstream: upstream}}
+        Logger.warning(
+          "Vagus.DNS: bind #{fmt(ip)}:#{port} failed (#{inspect(reason)}), retrying in #{@bind_retry_ms}ms"
+        )
+
+        Process.send_after(self(), :retry_bind, @bind_retry_ms)
+        state
     end
   end
 
@@ -96,6 +109,9 @@ defmodule Vagus.DNS do
     handle_packet(packet, host, port, state)
     {:noreply, state}
   end
+
+  def handle_info(:retry_bind, %{socket: nil} = state), do: {:noreply, try_bind(state)}
+  def handle_info(:retry_bind, state), do: {:noreply, state}
 
   def handle_info(_other, state), do: {:noreply, state}
 
