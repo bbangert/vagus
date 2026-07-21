@@ -6,7 +6,7 @@ defmodule Vagus.Engine.ManagerTest do
   describe "daemon_args/0" do
     test "matches the locked balena-engine-daemon flags" do
       assert Manager.daemon_args() == [
-               "--data-root=/data/balena-engine",
+               "--data-root=/root/balena-engine",
                "--exec-root=/run/balena-engine",
                "--pidfile=/run/balena-engine.pid",
                "--host=unix:///run/balena-engine.sock",

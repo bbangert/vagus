@@ -62,7 +62,12 @@ defmodule Vagus.Engine.Manager do
   # How long to wait before re-attempting a failed/lost daemon start.
   @retry_ms 5_000
 
-  @data_root "/data/balena-engine"
+  # Use the real mount path, NOT the `/data` symlink (→ `/root`): runc rejects a
+  # container rootfs whose path contains a symlink component ("invalid rootfs:
+  # not an absolute path, or a symlink"), which blocked every container from
+  # starting on-device. `/root/balena-engine` is the same physical directory,
+  # just without the symlink. (On-device P0-T1 finding, 2026-07-21.)
+  @data_root "/root/balena-engine"
   @exec_root "/run/balena-engine"
   @pidfile "/run/balena-engine.pid"
   @socket "unix:///run/balena-engine.sock"
