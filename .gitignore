@@ -23,3 +23,4 @@ erl_crash.dump
 
 # ElixirLS build/cache artifacts.
 /.elixir_ls/
+.claude/home-backup/
