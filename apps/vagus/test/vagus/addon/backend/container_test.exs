@@ -27,18 +27,21 @@ defmodule Vagus.Addon.Backend.ContainerTest do
 
   describe "build_config/1 — pinned §A1.4 invariants" do
     setup do
-      %{cfg: Container.build_config(mosquitto_spec()), host: Container.build_config(mosquitto_spec()) |> Map.fetch!("HostConfig")}
+      %{
+        cfg: Container.build_config(mosquitto_spec()),
+        host: Container.build_config(mosquitto_spec()) |> Map.fetch!("HostConfig")
+      }
     end
 
-    test "Privileged is always false", %{host: host}, do: assert host["Privileged"] == false
+    test("Privileged is always false", %{host: host}, do: assert(host["Privileged"] == false))
 
     test "SecurityOpt always includes seccomp=unconfined", %{host: host} do
       assert host["SecurityOpt"] == ["seccomp=unconfined"]
     end
 
-    test "OomScoreAdj is 200", %{host: host}, do: assert host["OomScoreAdj"] == 200
+    test("OomScoreAdj is 200", %{host: host}, do: assert(host["OomScoreAdj"] == 200))
 
-    test "no restart policy", %{host: host}, do: assert host["RestartPolicy"] == %{"Name" => ""}
+    test("no restart policy", %{host: host}, do: assert(host["RestartPolicy"] == %{"Name" => ""}))
 
     test "supervisor_managed label always present", %{cfg: cfg} do
       assert cfg["Labels"]["supervisor_managed"] == ""
@@ -54,7 +57,7 @@ defmodule Vagus.Addon.Backend.ContainerTest do
       assert host["DnsOptions"] == ["timeout:10"]
     end
 
-    test "Init reflects the spec", %{host: host}, do: assert host["Init"] == false
+    test("Init reflects the spec", %{host: host}, do: assert(host["Init"] == false))
 
     test "hostname + Domainname + bridge alias", %{cfg: cfg} do
       assert cfg["Hostname"] == "core-mosquitto"
@@ -73,8 +76,9 @@ defmodule Vagus.Addon.Backend.ContainerTest do
     end
 
     test "mounts → bind mounts with propagation + read_only", %{host: host} do
-      assert %{"Type" => "bind", "Source" => "/data/ssl", "Target" => "/ssl", "ReadOnly" => false} in
-               host["Mounts"]
+      assert %{"Type" => "bind", "Source" => "/data/ssl", "Target" => "/ssl", "ReadOnly" => false} in host[
+               "Mounts"
+             ]
 
       share = Enum.find(host["Mounts"], &(&1["Target"] == "/share"))
       assert share["BindOptions"] == %{"Propagation" => "rslave"}
@@ -84,7 +88,11 @@ defmodule Vagus.Addon.Backend.ContainerTest do
   describe "build_config/1 — variants" do
     test "apparmor profile adds a SecurityOpt entry" do
       cfg = Container.build_config(mosquitto_spec(apparmor: "addon_core_mosquitto"))
-      assert cfg["HostConfig"]["SecurityOpt"] == ["seccomp=unconfined", "apparmor=addon_core_mosquitto"]
+
+      assert cfg["HostConfig"]["SecurityOpt"] == [
+               "seccomp=unconfined",
+               "apparmor=addon_core_mosquitto"
+             ]
     end
 
     test "host network: NetworkMode host, no port publishing or networking config" do
@@ -99,6 +107,42 @@ defmodule Vagus.Addon.Backend.ContainerTest do
       cfg = Container.build_config(mosquitto_spec(hostname: nil))
       refute Map.has_key?(cfg, "Domainname")
       refute Map.has_key?(cfg, "NetworkingConfig")
+    end
+  end
+
+  describe "build_config/1 — advanced fields" do
+    test "cap_add / tmpfs / pid_mode / uts_mode / open_stdin flow through" do
+      cfg =
+        Container.build_config(
+          mosquitto_spec(
+            cap_add: ["NET_ADMIN"],
+            tmpfs: %{"/tmp" => "", "/dev/shm" => ""},
+            pid_mode: "host",
+            uts_mode: "host",
+            open_stdin: true
+          )
+        )
+
+      assert cfg["HostConfig"]["CapAdd"] == ["NET_ADMIN"]
+      assert cfg["HostConfig"]["Tmpfs"] == %{"/tmp" => "", "/dev/shm" => ""}
+      assert cfg["HostConfig"]["PidMode"] == "host"
+      assert cfg["HostConfig"]["UTSMode"] == "host"
+      assert cfg["OpenStdin"] == true
+    end
+
+    test "hostname set but empty dns → no Domainname" do
+      cfg = Container.build_config(mosquitto_spec(dns: []))
+      refute Map.has_key?(cfg, "Domainname")
+    end
+  end
+
+  describe "normalize_state/1 (hermetic)" do
+    test "maps Docker inspect State to coarse atoms" do
+      assert Container.normalize_state(%{"Running" => true}) == :running
+      assert Container.normalize_state(%{"Running" => false, "Restarting" => true}) == :restarting
+      assert Container.normalize_state(%{"Status" => "restarting"}) == :restarting
+      assert Container.normalize_state(%{"Running" => false, "Status" => "exited"}) == :stopped
+      assert Container.normalize_state(%{}) == :stopped
     end
   end
 

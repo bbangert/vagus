@@ -19,6 +19,32 @@ defmodule Vagus.Runtime.DockerTest do
     end
   end
 
+  describe "container ref validation (hermetic — rejects before any connect)" do
+    @malicious ["../images/create?fromImage=evil", "a/b", "a?b", "?x", "/x", "..", ""]
+
+    test "path-op refs outside the Docker charset are rejected, no daemon touched" do
+      for ref <- @malicious do
+        assert {:error, {:invalid_ref, ^ref}} = Docker.start_container(ref)
+        assert {:error, {:invalid_ref, ^ref}} = Docker.stop_container(ref)
+        assert {:error, {:invalid_ref, ^ref}} = Docker.restart_container(ref)
+        assert {:error, {:invalid_ref, ^ref}} = Docker.remove_container(ref)
+        assert {:error, {:invalid_ref, ^ref}} = Docker.inspect_container(ref)
+      end
+    end
+
+    test "a non-string ref is rejected" do
+      assert {:error, {:invalid_ref, :not_a_string}} = Docker.start_container(nil)
+    end
+
+    test "legitimate names/ids pass validation (fail later at connect, not at the ref check)" do
+      # valid ref → not an :invalid_ref error; with no daemon it fails at connect.
+      assert {:error, {:connect, _}} =
+               Docker.start_container("addon_core_mosquitto",
+                 socket: "/tmp/nope-#{System.unique_integer([:positive])}.sock"
+               )
+    end
+  end
+
   describe "against a live daemon" do
     @describetag :docker
 
@@ -59,11 +85,14 @@ defmodule Vagus.Runtime.DockerTest do
 
     test "pull of a nonexistent image reports a stream error, not :ok" do
       assert {:error, {:pull_failed, _}} =
-               Docker.pull_image("vagus-does-not-exist-#{System.unique_integer([:positive])}:nope")
+               Docker.pull_image(
+                 "vagus-does-not-exist-#{System.unique_integer([:positive])}:nope"
+               )
     end
 
     test "remove of a missing container is idempotent :ok" do
-      assert :ok = Docker.remove_container("vagus-rt-missing-#{System.unique_integer([:positive])}")
+      assert :ok =
+               Docker.remove_container("vagus-rt-missing-#{System.unique_integer([:positive])}")
     end
   end
 end

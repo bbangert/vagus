@@ -155,10 +155,15 @@ defmodule Vagus.Addon.Backend.Container do
     env |> Enum.map(fn {k, v} -> "#{k}=#{v}" end) |> Enum.sort()
   end
 
-  defp normalize_state(%{"Running" => true}), do: :running
-  defp normalize_state(%{"Restarting" => true}), do: :restarting
-  defp normalize_state(%{"Status" => "restarting"}), do: :restarting
-  defp normalize_state(_), do: :stopped
+  @doc """
+  Normalizes a Docker inspect `"State"` map to a coarse `Backend.state()`.
+  Public for hermetic testing (the daemon-facing `state/1` wraps it).
+  """
+  @spec normalize_state(map()) :: Vagus.Addon.Backend.state()
+  def normalize_state(%{"Running" => true}), do: :running
+  def normalize_state(%{"Restarting" => true}), do: :restarting
+  def normalize_state(%{"Status" => "restarting"}), do: :restarting
+  def normalize_state(_), do: :stopped
 
   defp maybe_put(map, _key, nil), do: map
   defp maybe_put(map, key, value), do: Map.put(map, key, value)

@@ -22,9 +22,20 @@ defmodule Vagus.Runtime.Docker do
 
   @default_socket "/var/run/docker.sock"
   @recv_timeout 60_000
+  # Cap a single response body so a hostile/huge daemon stream can't exhaust a
+  # 1GB device (mirrors the router's Plug.Parsers `length:` discipline).
+  @max_body 16_777_216
+  # Docker container name/id charset. A ref is interpolated into the request
+  # path, so anything outside this (`/`, `?`, a leading `.`) could rewrite the
+  # request against the root socket — reject at the boundary.
+  @ref_re ~r/^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/
 
   @typedoc "A decoded Engine-API response."
-  @type response :: %{status: non_neg_integer(), headers: [{String.t(), String.t()}], body: term()}
+  @type response :: %{
+          status: non_neg_integer(),
+          headers: [{String.t(), String.t()}],
+          body: term()
+        }
 
   ## Connectivity
 
@@ -86,20 +97,28 @@ defmodule Vagus.Runtime.Docker do
 
   @doc "POST `/containers/{id}/start`. Idempotent: an already-started (304) is `:ok`."
   @spec start_container(String.t(), keyword()) :: :ok | {:error, term()}
-  def start_container(id, opts \\ []), do: post_no_content("/containers/#{id}/start", [204, 304], opts)
+  def start_container(id, opts \\ []) do
+    with :ok <- ensure_ref(id),
+         do: post_no_content("/containers/#{id}/start", [204, 304], opts)
+  end
 
   @doc "POST `/containers/{id}/stop` (`opts[:timeout]` seconds). Already-stopped (304) is `:ok`."
   @spec stop_container(String.t(), keyword()) :: :ok | {:error, term()}
   def stop_container(id, opts \\ []) do
     query = if t = opts[:timeout], do: [t: t], else: []
-    post_no_content("/containers/#{id}/stop", [204, 304], Keyword.put(opts, :query, query))
+
+    with :ok <- ensure_ref(id),
+         do:
+           post_no_content("/containers/#{id}/stop", [204, 304], Keyword.put(opts, :query, query))
   end
 
   @doc "POST `/containers/{id}/restart` (`opts[:timeout]` seconds)."
   @spec restart_container(String.t(), keyword()) :: :ok | {:error, term()}
   def restart_container(id, opts \\ []) do
     query = if t = opts[:timeout], do: [t: t], else: []
-    post_no_content("/containers/#{id}/restart", [204], Keyword.put(opts, :query, query))
+
+    with :ok <- ensure_ref(id),
+         do: post_no_content("/containers/#{id}/restart", [204], Keyword.put(opts, :query, query))
   end
 
   @doc """
@@ -109,18 +128,25 @@ defmodule Vagus.Runtime.Docker do
   """
   @spec remove_container(String.t(), keyword()) :: :ok | {:error, term()}
   def remove_container(id, opts \\ []) do
-    query = [force: bool(Keyword.get(opts, :force, true)), v: bool(Keyword.get(opts, :volumes, false))]
+    query = [
+      force: bool(Keyword.get(opts, :force, true)),
+      v: bool(Keyword.get(opts, :volumes, false))
+    ]
 
-    case request(:delete, "/containers/#{id}", Keyword.merge(opts, query: query)) do
-      {:ok, %{status: s}} when s in [204, 404] -> :ok
-      {:ok, %{status: status, body: body}} -> {:error, {:remove_failed, status, message(body)}}
-      {:error, reason} -> {:error, reason}
+    with :ok <- ensure_ref(id) do
+      case request(:delete, "/containers/#{id}", Keyword.merge(opts, query: query)) do
+        {:ok, %{status: s}} when s in [204, 404] -> :ok
+        {:ok, %{status: status, body: body}} -> {:error, {:remove_failed, status, message(body)}}
+        {:error, reason} -> {:error, reason}
+      end
     end
   end
 
   @doc "GET `/containers/{id}/json` — the full inspect map."
   @spec inspect_container(String.t(), keyword()) :: {:ok, map()} | {:error, term()}
-  def inspect_container(id, opts \\ []), do: get_json("/containers/#{id}/json", opts)
+  def inspect_container(id, opts \\ []) do
+    with :ok <- ensure_ref(id), do: get_json("/containers/#{id}/json", opts)
+  end
 
   @doc "GET `/containers/json` — running containers (`opts[:all]` includes stopped)."
   @spec list_containers(keyword()) :: {:ok, [map()]} | {:error, term()}
@@ -148,7 +174,9 @@ defmodule Vagus.Runtime.Docker do
 
     case Mint.HTTP.connect(:http, {:local, socket}, 0, mode: :passive, hostname: "localhost") do
       {:ok, conn} ->
-        result =
+        # try/after so the socket is always closed — including when a *raise*
+        # (not just an error tuple) escapes the request/recv path.
+        try do
           with {:ok, conn, ref} <- Mint.HTTP.request(conn, method, full_path, headers, body || ""),
                {:ok, _conn, responses} <- recv_all(conn, ref) do
             {:ok, assemble(responses, ref)}
@@ -156,9 +184,9 @@ defmodule Vagus.Runtime.Docker do
             {:error, _conn, reason} -> {:error, reason}
             {:error, reason} -> {:error, reason}
           end
-
-        Mint.HTTP.close(conn)
-        result
+        after
+          Mint.HTTP.close(conn)
+        end
 
       {:error, reason} ->
         {:error, {:connect, reason}}
@@ -170,6 +198,13 @@ defmodule Vagus.Runtime.Docker do
   def socket_path, do: Application.get_env(:vagus, :docker_socket, @default_socket)
 
   ## Internals
+
+  # Reject a container ref that could break out of the request path.
+  defp ensure_ref(id) when is_binary(id) do
+    if Regex.match?(@ref_re, id), do: :ok, else: {:error, {:invalid_ref, id}}
+  end
+
+  defp ensure_ref(_id), do: {:error, {:invalid_ref, :not_a_string}}
 
   defp get_json(path, opts) do
     case request(:get, path, opts) do
@@ -186,22 +221,50 @@ defmodule Vagus.Runtime.Docker do
     end
   end
 
-  defp recv_all(conn, ref, acc \\ []) do
+  # Accumulate response batches newest-first (O(1) prepend, not O(n²) `++`),
+  # enforcing a hard body ceiling so an unbounded daemon stream can't exhaust
+  # memory. Flattened back into arrival order on `:done`.
+  defp recv_all(conn, ref, acc \\ [], size \\ 0) do
     case Mint.HTTP.recv(conn, 0, @recv_timeout) do
       {:ok, conn, responses} ->
-        acc = acc ++ responses
-        if Enum.any?(responses, &match?({:done, ^ref}, &1)),
-          do: {:ok, conn, acc},
-          else: recv_all(conn, ref, acc)
+        size = size + data_size(responses)
+        acc = [responses | acc]
+
+        cond do
+          size > @max_body ->
+            {:error, conn, :response_too_large}
+
+          Enum.any?(responses, &match?({:done, ^ref}, &1)) ->
+            {:ok, conn, acc |> Enum.reverse() |> List.flatten()}
+
+          true ->
+            recv_all(conn, ref, acc, size)
+        end
 
       {:error, conn, reason, _responses} ->
         {:error, conn, reason}
     end
   end
 
+  defp data_size(responses) do
+    Enum.reduce(responses, 0, fn
+      {:data, _ref, chunk}, acc -> acc + byte_size(chunk)
+      _other, acc -> acc
+    end)
+  end
+
   defp assemble(responses, ref) do
-    status = Enum.find_value(responses, fn {:status, ^ref, s} -> s; _ -> nil end)
-    headers = Enum.find_value(responses, [], fn {:headers, ^ref, h} -> h; _ -> nil end)
+    status =
+      Enum.find_value(responses, fn
+        {:status, ^ref, s} -> s
+        _ -> nil
+      end)
+
+    headers =
+      Enum.find_value(responses, [], fn
+        {:headers, ^ref, h} -> h
+        _ -> nil
+      end)
 
     body =
       responses

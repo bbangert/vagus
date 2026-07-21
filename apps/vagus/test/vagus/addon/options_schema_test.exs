@@ -31,8 +31,17 @@ defmodule Vagus.Addon.OptionsSchemaTest do
     end
 
     test "bool accepts the usual spellings" do
-      for {v, e} <- [{true, true}, {"true", true}, {"yes", true}, {"on", true}, {1, true},
-                     {false, false}, {"no", false}, {"off", false}, {0, false}] do
+      for {v, e} <- [
+            {true, true},
+            {"true", true},
+            {"yes", true},
+            {"on", true},
+            {1, true},
+            {false, false},
+            {"no", false},
+            {"off", false},
+            {0, false}
+          ] do
         assert {:ok, %{"a" => ^e}} = S.validate(%{"a" => "bool"}, %{"a" => v})
       end
 
@@ -102,7 +111,9 @@ defmodule Vagus.Addon.OptionsSchemaTest do
 
       log =
         capture_log(fn ->
-          assert {:ok, %{"a" => "x"} = out} = S.validate(%{"a" => "str"}, %{"a" => "x", "extra" => 1})
+          assert {:ok, %{"a" => "x"} = out} =
+                   S.validate(%{"a" => "str"}, %{"a" => "x", "extra" => 1})
+
           refute Map.has_key?(out, "extra")
         end)
 
@@ -113,10 +124,12 @@ defmodule Vagus.Addon.OptionsSchemaTest do
   describe "nested structures" do
     test "nested map recurses" do
       schema = %{"customize" => %{"active" => "bool", "folder" => "str"}}
+
       assert {:ok, %{"customize" => %{"active" => true, "folder" => "m"}}} =
                S.validate(schema, %{"customize" => %{"active" => "true", "folder" => "m"}})
 
-      assert {:error, _} = S.validate(schema, %{"customize" => %{"active" => "x", "folder" => "m"}})
+      assert {:error, _} =
+               S.validate(schema, %{"customize" => %{"active" => "x", "folder" => "m"}})
     end
 
     test "list of scalars" do
@@ -164,6 +177,38 @@ defmodule Vagus.Addon.OptionsSchemaTest do
     test "unknown secret errors" do
       assert {:error, m} = S.validate(%{"a" => "str"}, %{"a" => "!secret nope"})
       assert m =~ "Unknown secret 'nope'"
+    end
+  end
+
+  describe "malformed schema robustness (untrusted add-on config → error, never crash)" do
+    test "malformed schema elements are errors, not FunctionClauseError crashes" do
+      for bad <- [[], ["str", "int"], false, 123, %{"k" => []}] do
+        assert {:error, _} = S.validate(%{"a" => bad}, %{"a" => "x"})
+      end
+    end
+
+    test "unparseable numeric bounds (bare '-') are treated as unbounded, not a crash" do
+      assert {:ok, %{"a" => 1.5}} = S.validate(%{"a" => "float(-,)"}, %{"a" => 1.5})
+      assert {:ok, %{"a" => 7}} = S.validate(%{"a" => "int(-,)"}, %{"a" => 7})
+    end
+  end
+
+  describe "match() ReDoS mitigation" do
+    test "input over the byte cap is rejected before matching" do
+      big = String.duplicate("a", 5_000)
+      assert {:error, m} = S.validate(%{"a" => "match([a-z]+)"}, %{"a" => big})
+      assert m =~ "match limit"
+    end
+
+    test "a catastrophic-backtracking regex returns quickly (match_limit-bounded)" do
+      # (a+)+$ against non-matching input is the classic ReDoS; match_limit caps
+      # the backtracking so this fails fast instead of pinning the scheduler.
+      schema = %{"a" => "match((a+)+$)"}
+      value = %{"a" => String.duplicate("a", 40) <> "!"}
+
+      {micros, result} = :timer.tc(fn -> S.validate(schema, value) end)
+      assert {:error, _} = result
+      assert micros < 1_000_000, "match should be bounded, took #{micros}us"
     end
   end
 

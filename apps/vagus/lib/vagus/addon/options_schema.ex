@@ -55,6 +55,12 @@ defmodule Vagus.Addon.OptionsSchema do
 
   require Logger
 
+  # `match(<regex>)` regexes come from untrusted add-on schemas. Cap the input
+  # length and bound PCRE's backtracking steps so a catastrophic-backtracking
+  # regex can't pin a scheduler (CPU DoS) — there's no AppArmor backstop.
+  @max_match_input 4_096
+  @match_limit 100_000
+
   @type element :: String.t() | [element()] | %{optional(String.t()) => element()}
   @type schema :: %{optional(String.t()) => element()} | false
   @type options :: %{optional(String.t()) => term()}
@@ -99,6 +105,11 @@ defmodule Vagus.Addon.OptionsSchema do
 
     try do
       {:ok, validate_map(schema, options, "", secrets)}
+    rescue
+      # Defense-in-depth: a malformed schema/value shape that slips past the
+      # explicit clauses becomes an error, never a caller crash (schemas are
+      # untrusted add-on config).
+      e -> {:error, "invalid schema: " <> Exception.message(e)}
     catch
       {:invalid, message} -> {:error, message}
     end
@@ -154,6 +165,12 @@ defmodule Vagus.Addon.OptionsSchema do
     |> apply_token(value, path)
   end
 
+  # Malformed schema element (empty/multi-element list, a bare bool/number,
+  # etc.) — an error, not a FunctionClauseError crash.
+  defp validate_element(other, _value, path, _secrets) do
+    invalid("#{path} has an invalid schema element: #{inspect(other)}")
+  end
+
   # -- token parsing --------------------------------------------------------
 
   defp parse_token("bool", _path), do: :bool
@@ -167,32 +184,57 @@ defmodule Vagus.Addon.OptionsSchema do
       caps = Regex.run(~r/^device\(subsystem=([a-z]+)\)$/, token) ->
         {:device, Enum.at(caps, 1)}
 
-      caps = Regex.run(~r/^str\((\d*),(\d*)\)$/, token) -> {:str, bound(caps, 1), bound(caps, 2)}
-      "str" == token -> {:str, nil, nil}
+      caps = Regex.run(~r/^str\((\d*),(\d*)\)$/, token) ->
+        {:str, bound(caps, 1), bound(caps, 2)}
+
+      "str" == token ->
+        {:str, nil, nil}
 
       caps = Regex.run(~r/^password\((\d*),(\d*)\)$/, token) ->
         {:password, bound(caps, 1), bound(caps, 2)}
 
-      "password" == token -> {:password, nil, nil}
+      "password" == token ->
+        {:password, nil, nil}
 
       caps = Regex.run(~r/^int\((-?\d*),(-?\d*)\)$/, token) ->
         {:int, bound(caps, 1), bound(caps, 2)}
 
-      "int" == token -> {:int, nil, nil}
+      "int" == token ->
+        {:int, nil, nil}
 
       caps = Regex.run(~r/^float\((-?\d*\.?\d*),(-?\d*\.?\d*)\)$/, token) ->
         {:float, fbound(caps, 1), fbound(caps, 2)}
 
-      "float" == token -> {:float, nil, nil}
+      "float" == token ->
+        {:float, nil, nil}
 
-      caps = Regex.run(~r/^match\((.*)\)$/s, token) -> {:match, Enum.at(caps, 1)}
-      caps = Regex.run(~r/^list\((.+)\)$/, token) -> {:list, String.split(Enum.at(caps, 1), "|")}
-      true -> invalid("Unknown type '#{token}' at #{path}")
+      caps = Regex.run(~r/^match\((.*)\)$/s, token) ->
+        {:match, Enum.at(caps, 1)}
+
+      caps = Regex.run(~r/^list\((.+)\)$/, token) ->
+        {:list, String.split(Enum.at(caps, 1), "|")}
+
+      true ->
+        invalid("Unknown type '#{token}' at #{path}")
     end
   end
 
-  defp bound(caps, i), do: with("" <- Enum.at(caps, i), do: nil, else: (s -> String.to_integer(s)))
-  defp fbound(caps, i), do: with("" <- Enum.at(caps, i), do: nil, else: (s -> String.to_float(pad(s))))
+  # Parse a captured bound. The regex can capture forms `String.to_*/1` would
+  # raise on (e.g. a bare `"-"`); an unparseable bound is treated as unbounded
+  # rather than crashing.
+  defp bound(caps, i) do
+    case Enum.at(caps, i) do
+      "" -> nil
+      s -> with {n, ""} <- Integer.parse(s), do: n, else: (_ -> nil)
+    end
+  end
+
+  defp fbound(caps, i) do
+    case Enum.at(caps, i) do
+      "" -> nil
+      s -> with {n, ""} <- Float.parse(pad(s)), do: n, else: (_ -> nil)
+    end
+  end
 
   # Normalize a regex-allowed float bound (`-?\d*\.?\d*`) into a form
   # `String.to_float/1` accepts: ".5"->"0.5", "-.5"->"-0.5", "1."->"1.0",
@@ -224,19 +266,40 @@ defmodule Vagus.Addon.OptionsSchema do
 
   defp apply_token(:email, value, path) do
     s = check_str(value, nil, nil, path)
-    if Regex.match?(~r/^[^@\s]+@[^@\s]+\.[^@\s]+$/, s), do: s, else: invalid("#{path} is not an email")
+
+    if Regex.match?(~r/^[^@\s]+@[^@\s]+\.[^@\s]+$/, s),
+      do: s,
+      else: invalid("#{path} is not an email")
   end
 
   defp apply_token(:url, value, path) do
     s = check_str(value, nil, nil, path)
-    if Regex.match?(~r|^[a-z][a-z0-9+.\-]*://.+|i, s), do: s, else: invalid("#{path} is not a URL")
+
+    if Regex.match?(~r|^[a-z][a-z0-9+.\-]*://.+|i, s),
+      do: s,
+      else: invalid("#{path} is not a URL")
   end
 
   defp apply_token({:match, regex}, value, path) do
     s = to_string(value)
+
+    if byte_size(s) > @max_match_input,
+      do: invalid("#{path} exceeds the #{@max_match_input}-byte match limit")
+
     compiled = compile_regex(regex, path)
+
     # Python re.match: anchored at start, not required to reach the end.
-    case :re.run(s, compiled, [{:capture, :none}, :anchored]) do
+    # `match_limit`/`match_limit_recursion` bound PCRE backtracking so a
+    # catastrophic-backtracking regex can't pin the scheduler; exceeding the
+    # limit surfaces as `nomatch` (fails validation, as it should).
+    opts = [
+      {:capture, :none},
+      :anchored,
+      {:match_limit, @match_limit},
+      {:match_limit_recursion, @match_limit}
+    ]
+
+    case :re.run(s, compiled, opts) do
       :match -> s
       :nomatch -> invalid("#{path} does not match #{inspect(regex)}")
     end
