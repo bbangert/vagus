@@ -31,6 +31,14 @@ defmodule Vagus.Application do
         # `/services` endpoints have their store the moment requests arrive.
         Vagus.Addon.Registry,
         Vagus.Addon.State,
+
+        # Boot-time reconciliation (M4-P8-T1): restarts `boot: auto` add-ons
+        # left `:started` in the persisted state file. Sits unconditionally
+        # here on both :host and target — `start_link/1` returns `:ignore`
+        # unless `config :vagus, :addon_boot_start` is set (only target.exs
+        # sets it; :host/:test stay ephemeral). Started right after
+        # `Vagus.Addon.State` so it never races the store it reads from.
+        Vagus.Addon.BootStarter,
         Vagus.Addon.Store,
         Vagus.Backups,
         Vagus.Services,

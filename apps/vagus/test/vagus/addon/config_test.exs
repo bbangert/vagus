@@ -190,5 +190,73 @@ defmodule Vagus.Addon.ConfigTest do
       assert c.options["certfile"] == "fullchain.pem"
       refute c.host_network
     end
+
+    test "round-trips through to_persistable/1 (M4-P8-T1 persistence)" do
+      assert {:ok, c} = Config.parse(@mosquitto)
+      assert Config.parse(Config.to_persistable(c)) == {:ok, c}
+    end
+  end
+
+  describe "to_persistable/1 round-trip (M4-P8-T1 — parse/1 stays the single validator)" do
+    test "a maximal fixture exercising every field round-trips" do
+      raw = %{
+        "name" => "Maximal",
+        "version" => "1.2.3-beta.4",
+        "slug" => "maximal_addon",
+        "description" => "exercises every Config field",
+        "arch" => ["aarch64", "amd64", "armhf", "armv7", "i386"],
+        "startup" => "once",
+        "boot" => "manual",
+        "init" => false,
+        "image" => "homeassistant/{arch}-addon-maximal",
+        "ports" => %{"1234/tcp" => 1234, "5678/udp" => nil},
+        "map" => [
+          %{"type" => "share", "read_only" => false, "path" => "/share"},
+          %{"type" => "ssl", "read_only" => true, "path" => nil},
+          "addons:rw"
+        ],
+        "hassio_api" => true,
+        "hassio_role" => "manager",
+        "homeassistant_api" => true,
+        "auth_api" => true,
+        "docker_api" => true,
+        "services" => ["mqtt:provide", "mysql:want"],
+        "discovery" => ["mqtt", "mysql"],
+        "host_network" => false,
+        "host_dbus" => true,
+        "host_pid" => true,
+        "host_ipc" => true,
+        "host_uts" => true,
+        "privileged" => ["SYS_ADMIN", "NET_ADMIN"],
+        "full_access" => true,
+        "devices" => ["/dev/ttyUSB0"],
+        "apparmor" => false,
+        "ingress" => true,
+        "ingress_port" => 8123,
+        "watchdog" => "tcp://[HOST]:1234",
+        "webui" => "http://[HOST]:8123",
+        "options" => %{"greeting" => "hi", "count" => 3, "nested" => %{"a" => [1, 2, 3]}},
+        "schema" => %{"greeting" => "str", "count" => "int"},
+        "backup" => "cold",
+        "backup_pre" => "pre.sh",
+        "backup_post" => "post.sh",
+        "backup_exclude" => ["**/*.log"],
+        "timeout" => 30
+      }
+
+      assert {:ok, c} = Config.parse(raw)
+      assert Config.parse(Config.to_persistable(c)) == {:ok, c}
+    end
+
+    test "a config with nil optional fields (image/watchdog/webui/backup hooks) round-trips" do
+      assert {:ok, c} = Config.parse(@required)
+      assert c.image == nil
+      assert Config.parse(Config.to_persistable(c)) == {:ok, c}
+    end
+
+    test "schema: false round-trips" do
+      assert {:ok, c} = Config.parse(Map.put(@required, "schema", false))
+      assert Config.parse(Config.to_persistable(c)) == {:ok, c}
+    end
   end
 end

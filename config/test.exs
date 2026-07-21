@@ -37,3 +37,10 @@ config :vagus, :backends, %{
   host: Vagus.Backend.HostMock,
   os: Vagus.Backend.OSMock
 }
+
+# Add-on state stays in-memory (nil disables `Vagus.Addon.State` file
+# persistence) and boot reconciliation stays off (`Vagus.Addon.BootStarter`
+# `:ignore`s) — `mix test` has no real engine socket to poll and no
+# device-reboot scenario to reconcile (M4-P8-T1).
+config :vagus, :addon_state_path, nil
+config :vagus, :addon_boot_start, false

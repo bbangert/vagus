@@ -146,6 +146,72 @@ defmodule Vagus.Addon.Config do
 
   def valid_slug?(_slug), do: false
 
+  @doc """
+  The inverse of `parse/1`: renders `config` back to the raw, string-keyed
+  wire shape `parse/1` itself accepts — needed so `Vagus.Addon.State` can
+  persist an installed add-on's config to disk (§ M4-P8-T1, real-Supervisor
+  parity for its persisted `sys_apps.data`) and restore it across a device
+  reboot without a second, divergent decoder: `parse/1` stays the single
+  validator, both on the store's initial `config.yaml`/`config.json` decode
+  and on this on-disk reload.
+
+  Only has to be `parse/1`'s inverse, not a general serializer — every field
+  is emitted verbatim (including `nil`s, e.g. `image`/`watchdog`/`webui`),
+  and `map:` entries are rendered in the dict form (`%{"type", "read_only",
+  "path"}`) since `parse/1` already normalizes both the legacy string form
+  and the dict form to that same struct shape. If a round-trip
+  (`parse(to_persistable(c)) == {:ok, c}`) ever breaks for some field, fix
+  it here — never loosen `parse/1`, which stays the load-time validator for
+  untrusted add-on-supplied config too.
+  """
+  @spec to_persistable(t()) :: map()
+  def to_persistable(%__MODULE__{} = c) do
+    %{
+      "name" => c.name,
+      "version" => c.version,
+      "slug" => c.slug,
+      "description" => c.description,
+      "arch" => c.arch,
+      "startup" => c.startup,
+      "boot" => c.boot,
+      "init" => c.init,
+      "image" => c.image,
+      "ports" => c.ports,
+      "map" => Enum.map(c.map, &mapping_to_persistable/1),
+      "hassio_api" => c.hassio_api,
+      "hassio_role" => c.hassio_role,
+      "homeassistant_api" => c.homeassistant_api,
+      "auth_api" => c.auth_api,
+      "docker_api" => c.docker_api,
+      "services" => c.services,
+      "discovery" => c.discovery,
+      "host_network" => c.host_network,
+      "host_dbus" => c.host_dbus,
+      "host_pid" => c.host_pid,
+      "host_ipc" => c.host_ipc,
+      "host_uts" => c.host_uts,
+      "privileged" => c.privileged,
+      "full_access" => c.full_access,
+      "devices" => c.devices,
+      "apparmor" => c.apparmor,
+      "ingress" => c.ingress,
+      "ingress_port" => c.ingress_port,
+      "watchdog" => c.watchdog,
+      "webui" => c.webui,
+      "options" => c.options,
+      "schema" => c.schema,
+      "backup" => c.backup,
+      "backup_pre" => c.backup_pre,
+      "backup_post" => c.backup_post,
+      "backup_exclude" => c.backup_exclude,
+      "timeout" => c.timeout
+    }
+  end
+
+  defp mapping_to_persistable(%{type: type, read_only: read_only, path: path}) do
+    %{"type" => type, "read_only" => read_only, "path" => path}
+  end
+
   ## Internals
 
   defp build(raw) do

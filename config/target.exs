@@ -101,6 +101,14 @@ config :mdns_lite,
 config :vagus, :api_port, 80
 config :vagus, :token_path, "/data/vagus/token"
 
+# Add-on state persistence + boot reconciliation (M4-P8-T1). `/data` is a
+# symlink to `/root` — fine for plain `File.read!/write!/rename` IO like
+# this, same as `:token_path` above; only a runc container *rootfs* path
+# (see `:addon_data_root` below) needs the real, non-symlinked `/root/...`
+# form.
+config :vagus, :addon_state_path, "/data/vagus/addons.json"
+config :vagus, :addon_boot_start, true
+
 # Core-facing token handshake (P3-T1/T2) — see config/host.exs for the
 # rationale, identical on target.
 config :vagus, :core_token_path, "/data/vagus/core_token.json"
