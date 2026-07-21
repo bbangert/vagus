@@ -2,19 +2,38 @@ defmodule Vagus.API.Supervisor do
   @moduledoc """
   Isolated supervisor for the Supervisor-API emulator's HTTP surface.
 
-  Holds the `Bandit` server (`plug: Vagus.API.Router`) under its own
-  bounded restart budget, mirroring `Vagus.Engine.DaemonSupervisor`'s
-  isolation rationale: a Bandit crash-loop must never escalate past this
-  subtree and bring down the rest of `Vagus.Supervisor`.
+  Holds the `Bandit` server (`plug: Vagus.API.Dispatcher` — see that module
+  for why the entry point is a small dispatcher rather than
+  `Vagus.API.Router` directly, `docs/contract-2026.7-m4b-ingress-watchdog.md`
+  §B2) under its own bounded restart budget, mirroring
+  `Vagus.Engine.DaemonSupervisor`'s isolation rationale: a Bandit
+  crash-loop must never escalate past this subtree and bring down the rest
+  of `Vagus.Supervisor`.
 
-  RAM discipline: `thousand_island_options: [num_acceptors: 2]` — no
-  per-request processes or Registry/ETS are needed for this static-data
-  Phase 2 surface.
+  Also holds `Vagus.Ingress.Finch`, the connection pool the ingress
+  reverse-proxy leg (`Vagus.API.IngressProxy`) uses to reach add-on
+  containers — started before Bandit so the pool exists the moment the
+  first proxied request can arrive. `pools: %{default: [size: 4]}`: a small
+  pool deliberately, matching the 1GB-device RAM discipline the rest of
+  this module documents; ingress traffic is a handful of panel
+  iframes/WS-adjacent polls at a time, not a fan-out workload.
+
+  RAM discipline: `thousand_island_options: [num_acceptors: 2, read_timeout:
+  900_000]` — no per-request processes or Registry/ETS are needed for this
+  static-data Phase 2 surface. The 15-minute `read_timeout` (Thousand
+  Island's default is 60s) is set deliberately, not left to coincidentally
+  match anything: it mirrors the ingress session's own 15-minute sliding
+  idle window (`Vagus.Ingress` §B1.2), so a legitimately idle-but-open
+  ingress connection (a long-polling panel asset, a slow log tail) is never
+  killed by the transport layer before the session itself would time the
+  client out (research doc §3 gotcha 2).
 
   `config :vagus, :api_server_enabled` (default `true`) gates whether
-  Bandit is actually started — `false` in `config/test.exs` so `mix test`
-  never binds a port at all (contract tests exercise `Vagus.API.Router`
-  directly via `Plug.Test`, with no listening server involved).
+  Bandit (and the Finch pool) are actually started — `false` in
+  `config/test.exs` so `mix test` never binds a port at all (contract tests
+  exercise `Vagus.API.Router`/`Vagus.API.IngressProxy` directly, either via
+  `Plug.Test` or their own hermetic `start_supervised` stack, with no
+  app-started listening server involved).
   """
 
   use Supervisor
@@ -37,8 +56,11 @@ defmodule Vagus.API.Supervisor do
         port = Application.get_env(:vagus, :api_port, 8888)
 
         [
+          {Finch, name: Vagus.Ingress.Finch, pools: %{default: [size: 4]}},
           {Bandit,
-           plug: Vagus.API.Router, port: port, thousand_island_options: [num_acceptors: 2]}
+           plug: Vagus.API.Dispatcher,
+           port: port,
+           thousand_island_options: [num_acceptors: 2, read_timeout: 900_000]}
         ]
       else
         []

@@ -48,6 +48,13 @@ defmodule Vagus.MixProject do
       {:plug, "~> 1.20"},
       {:bandit, "~> 1.12"},
       {:finch, "~> 0.23.0"},
+      # Ingress reverse proxy (M4b): websock_adapter provides the
+      # Plug-side WebSocket upgrade (`WebSockAdapter.upgrade/4`) for the
+      # browser leg of the ingress WS bridge; mint_web_socket (previously
+      # only transitive via vendored fresh) is hand-rolled directly for the
+      # add-on leg — see .claude/plans/vagus-m4-ingress-watchdog.
+      {:websock_adapter, "~> 0.5"},
+      {:mint_web_socket, "~> 1.0"},
       # Vendored, not Hex: fresh 0.4.4's own mix.exs is incompatible with
       # Elixir ~> 1.20 (hard Mix.raise on charlist elixirc_paths) and
       # upstream is unmaintained since 2024. See vendor/fresh/mix.exs for
