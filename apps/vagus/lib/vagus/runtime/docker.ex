@@ -149,6 +149,26 @@ defmodule Vagus.Runtime.Docker do
   end
 
   @doc """
+  GET `/containers/{id}/logs?stdout&stderr&tail=N` — the container's recent log
+  output as the raw (multiplexed, when no TTY) stream body. `opts[:tail]`
+  defaults to `100`. Non-following (one-shot); the follow stream is a later add.
+  """
+  @spec container_logs(String.t(), keyword()) :: {:ok, binary()} | {:error, term()}
+  def container_logs(id, opts \\ []) do
+    tail = Keyword.get(opts, :tail, 100)
+    query = [stdout: true, stderr: true, tail: tail]
+
+    with :ok <- ensure_ref(id) do
+      case request(:get, "/containers/#{id}/logs", Keyword.merge(opts, query: query)) do
+        {:ok, %{status: 200, body: body}} when is_binary(body) -> {:ok, body}
+        {:ok, %{status: 200}} -> {:ok, ""}
+        {:ok, %{status: status, body: body}} -> {:error, {:http, status, message(body)}}
+        {:error, reason} -> {:error, reason}
+      end
+    end
+  end
+
+  @doc """
   GET `/containers/{id}/stats?stream=false` — a single resource-usage sample
   (with `precpu_stats` for the CPU delta). Raw Engine-API stats map.
   """

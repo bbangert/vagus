@@ -33,7 +33,7 @@ defmodule Vagus.API.Router do
   alias Vagus.Backend
   alias Vagus.Core.TokenStore
   alias Vagus.Discovery
-  alias Vagus.Runtime.{Docker, Stats}
+  alias Vagus.Runtime.{Docker, Logs, Stats}
   alias Vagus.Services
 
   alias Vagus.API.Models.{
@@ -272,6 +272,42 @@ defmodule Vagus.API.Router do
       {:error, :forbidden} ->
         Envelope.send_error(conn, "Not authorized for this add-on", 403)
     end
+  end
+
+  # -- Logs (§A5) — text/plain, one entry per line, X-First-Cursor +
+  # X-Accel-Buffering headers. One-shot (the frontend's tolerated legacy GET);
+  # live `/follow` streaming is a later add. Sourced from the engine's container
+  # logs; families without a container (host) are honestly empty. ------------
+
+  get "/addons/:slug/logs" do
+    case resolve_info_slug(slug, conn.assigns.caller) do
+      {:ok, resolved} -> send_logs(conn, "addon_#{resolved}")
+      {:error, :forbidden} -> Envelope.send_error(conn, "Not authorized for this add-on", 403)
+    end
+  end
+
+  get "/addons/:slug/logs/latest" do
+    case resolve_info_slug(slug, conn.assigns.caller) do
+      {:ok, resolved} -> send_logs(conn, "addon_#{resolved}", no_colors: true)
+      {:error, :forbidden} -> Envelope.send_error(conn, "Not authorized for this add-on", 403)
+    end
+  end
+
+  get("/core/logs", do: send_logs(conn, core_container()))
+  get("/core/logs/latest", do: send_logs(conn, core_container(), no_colors: true))
+  get("/supervisor/logs", do: send_logs(conn, supervisor_container()))
+  get("/supervisor/logs/latest", do: send_logs(conn, supervisor_container(), no_colors: true))
+  get("/host/logs", do: send_logs(conn, nil))
+  get("/host/logs/latest", do: send_logs(conn, nil, no_colors: true))
+
+  # JSON side-endpoints (§A5): one boot (we don't track journald boots), no
+  # extra syslog identifiers.
+  get "/host/logs/boots" do
+    Envelope.send_ok(conn, %{boots: %{"0" => "vagus"}})
+  end
+
+  get "/host/logs/identifiers" do
+    Envelope.send_ok(conn, %{identifiers: []})
   end
 
   # Not called by the hassio integration's coordinator in this Core
@@ -527,6 +563,45 @@ defmodule Vagus.API.Router do
         "Vagus.API.Router: host/#{action} backend call failed:\n" <>
           Exception.format(:error, exception, __STACKTRACE__)
       )
+  end
+
+  # -- logs helpers ----------------------------------------------------------
+
+  # Send a plain-text log body (§A5): the required headers, then the demuxed +
+  # (optionally) de-colored container logs. No container / an engine error is an
+  # honestly-empty 200, not a failure — a log poll must not error. `?lines=N`
+  # tails, `?no_colors` strips ANSI.
+  defp send_logs(conn, ref, opts \\ []) do
+    conn = fetch_query_params(conn)
+    lines = log_lines(conn)
+
+    no_colors =
+      Map.has_key?(conn.query_params, "no_colors") or Keyword.get(opts, :no_colors, false)
+
+    body = log_body(ref, lines, no_colors)
+
+    conn
+    |> put_resp_header("x-first-cursor", "0")
+    |> put_resp_header("x-accel-buffering", "no")
+    |> put_resp_content_type("text/plain")
+    |> send_resp(200, body)
+    |> halt()
+  end
+
+  defp log_body(nil, _lines, _no_colors), do: ""
+
+  defp log_body(ref, lines, no_colors) do
+    case Docker.container_logs(ref, tail: lines) do
+      {:ok, raw} -> Logs.format(raw, no_colors: no_colors)
+      {:error, _reason} -> ""
+    end
+  end
+
+  defp log_lines(conn) do
+    case Integer.parse(Map.get(conn.query_params, "lines", "100")) do
+      {n, _} when n >= 2 -> n
+      _ -> 100
+    end
   end
 
   # -- stats helpers ---------------------------------------------------------
