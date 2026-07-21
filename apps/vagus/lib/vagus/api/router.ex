@@ -191,6 +191,30 @@ defmodule Vagus.API.Router do
     Envelope.send_ok(conn, AddonsList.build!(StaticData.addons_list()))
   end
 
+  # An add-on reads its own effective (merged + schema-validated) options
+  # (§A3.4 / `supervisor/api/apps.py` `options_config`) — bashio's
+  # `bashio::config`/`bashio::addon.config` fetch this once and cache it. Only
+  # `self` is permitted (the real handler 403s any other slug); `self` resolves
+  # to the calling add-on. The effective options are exactly what
+  # `Manager.start` wrote to that add-on's `/data/options.json`.
+  get "/addons/:slug/options/config" do
+    cond do
+      slug != "self" ->
+        Envelope.send_error(conn, "This can be only read by the app itself!", 403)
+
+      match?({:addon, _}, conn.assigns.caller) ->
+        {:addon, %{slug: caller_slug}} = conn.assigns.caller
+
+        case read_addon_options(caller_slug) do
+          {:ok, options} -> Envelope.send_ok(conn, options)
+          :error -> Envelope.send_error(conn, "Invalid configuration data for the app", 400)
+        end
+
+      true ->
+        Envelope.send_error(conn, "Self is not an App", 400)
+    end
+  end
+
   # -- Stats coordinator (60s) -----------------------------------------------
 
   get "/core/stats" do
@@ -502,6 +526,28 @@ defmodule Vagus.API.Router do
     end)
 
     :ok
+  end
+
+  # -- addon self-config helper ----------------------------------------------
+
+  # Reads the effective options `Manager.start` wrote to the add-on's
+  # `/data/options.json` (data root from `config :vagus, :addon_data_root`).
+  defp read_addon_options(slug) do
+    path =
+      Path.join([
+        Application.get_env(:vagus, :addon_data_root, "/data"),
+        "addons",
+        "data",
+        slug,
+        "options.json"
+      ])
+
+    with {:ok, bin} <- File.read(path),
+         {:ok, options} when is_map(options) <- Jason.decode(bin) do
+      {:ok, options}
+    else
+      _ -> :error
+    end
   end
 
   # -- auth helpers ----------------------------------------------------------

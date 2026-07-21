@@ -14,11 +14,14 @@ defmodule Vagus.Network do
   reached by bridged containers via the gateway.
   """
 
+  require Logger
+
   alias Vagus.Runtime.Docker
 
   @name "hassio"
   @subnet "172.30.32.0/23"
   @ip_range "172.30.33.0/24"
+  @prefix "23"
 
   @anchors %{
     gateway: "172.30.32.1",
@@ -76,5 +79,41 @@ defmodule Vagus.Network do
       {:error, {:http, 404, _}} -> Docker.create_network(config(), opts)
       {:error, reason} -> {:error, reason}
     end
+  end
+
+  @doc """
+  Binds the Supervisor anchor IP (`172.30.32.2/23`) to the host `hassio` bridge
+  interface, so the host-networked emulator (Bandit on `0.0.0.0`) answers there
+  — the address bridged add-ons reach via `http://supervisor` (§A6). The bridge
+  driver already puts the gateway `.1` on the interface; this adds `.2` beside
+  it once the interface exists (i.e. after `ensure/1` created the network).
+
+  Idempotent + best-effort: an address already present (`ip` prints
+  "File exists"), a missing interface, or a missing `ip` tool is logged and
+  treated as `:ok` — never fatal to an add-on install.
+  """
+  @spec ensure_supervisor_ip() :: :ok
+  def ensure_supervisor_ip do
+    args = ["addr", "add", "#{supervisor_ip()}/#{@prefix}", "dev", @name]
+
+    case System.cmd("ip", args, stderr_to_stdout: true) do
+      {_out, 0} ->
+        :ok
+
+      {out, _code} ->
+        if String.contains?(out, "File exists") do
+          :ok
+        else
+          Logger.warning(
+            "Vagus.Network: binding #{supervisor_ip()} to #{@name} failed: #{String.trim(out)}"
+          )
+
+          :ok
+        end
+    end
+  rescue
+    e ->
+      Logger.warning("Vagus.Network: ensure_supervisor_ip errored: #{Exception.message(e)}")
+      :ok
   end
 end

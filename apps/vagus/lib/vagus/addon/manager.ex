@@ -123,8 +123,14 @@ defmodule Vagus.Addon.Manager do
 
   defp maybe_ensure_network(_config, opts) do
     case Network.ensure(network_opts(opts)) do
-      {:ok, _id} -> :ok
-      {:error, reason} -> {:error, {:network, reason}}
+      {:ok, _id} ->
+        # Bind the supervisor anchor (.2) to the freshly-ensured bridge so the
+        # host-networked emulator answers where the add-on reaches it (§A6).
+        Network.ensure_supervisor_ip()
+        :ok
+
+      {:error, reason} ->
+        {:error, {:network, reason}}
     end
   end
 
