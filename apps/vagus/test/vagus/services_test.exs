@@ -40,4 +40,18 @@ defmodule Vagus.ServicesTest do
     Services.set("mqtt", @mqtt, "core_mosquitto", svc)
     assert [%{slug: "mqtt", available: true, providers: ["core_mosquitto"]}] = Services.list(svc)
   end
+
+  test "delete_by_slug purges every service the slug provides, leaving others intact", %{
+    svc: svc
+  } do
+    assert :ok = Services.set("mqtt", @mqtt, "core_mosquitto", svc)
+    assert {:ok, ["mqtt"]} = Services.delete_by_slug("core_mosquitto", svc)
+    assert :error = Services.get("mqtt", svc)
+  end
+
+  test "delete_by_slug for a slug that provides nothing is a no-op", %{svc: svc} do
+    assert :ok = Services.set("mqtt", @mqtt, "core_mosquitto", svc)
+    assert {:ok, []} = Services.delete_by_slug("someone_else", svc)
+    assert {:ok, _data} = Services.get("mqtt", svc)
+  end
 end

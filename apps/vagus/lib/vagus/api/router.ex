@@ -29,8 +29,9 @@ defmodule Vagus.API.Router do
   require Logger
 
   alias Vagus.API.{Envelope, StaticData}
-  alias Vagus.Addon.{Store, StoreView}
+  alias Vagus.Addon.{Manager, OptionsSchema, State, Store, StoreView}
   alias Vagus.Backend
+  alias Vagus.Backups
   alias Vagus.Core.TokenStore
   alias Vagus.Discovery
   alias Vagus.Runtime.{Docker, Logs, Stats}
@@ -69,8 +70,16 @@ defmodule Vagus.API.Router do
   # generic error, so `hassio` never sees the route's honest 400 ("no update
   # available") and wedges in ConfigEntryNotReady. The real Supervisor
   # (aiohttp server) tolerates these, so we must too.
+  #
+  # `POST /backups/new/upload` is the one route that legitimately needs a
+  # large body (a backup tar). Rather than raise the shared 64KB cap for
+  # every route, the `{:multipart, length: ...}` tuple form overrides the
+  # length just for the multipart parser — json/urlencoded (everything else)
+  # stay at the tight 64KB bound. Plug spools multipart file parts to disk
+  # (`Plug.Upload`) as they're read, so this doesn't buffer the whole upload
+  # in memory either.
   plug(Plug.Parsers,
-    parsers: [:json, :urlencoded],
+    parsers: [:json, :urlencoded, {:multipart, length: 268_435_456}],
     pass: ["*/*"],
     json_decoder: Jason,
     length: 65_536
@@ -202,8 +211,16 @@ defmodule Vagus.API.Router do
 
   # -- Addon coordinator (15 min) -------------------------------------------
 
+  # Backed by `Vagus.Addon.State` (not `StaticData`, unlike most other GETs
+  # here) — the installed-addon list a `POST .../install` grows and a
+  # `POST .../uninstall` shrinks. Each entry reuses `Vagus.Addon.Info.render/3`
+  # (the `GET /addons/{slug}/info` shape, a superset of the wire's
+  # `InstalledAddon`) rather than a separate summary builder — `AddonsList`
+  # only pins the outer `addons` key (`Vagus.API.Model`), so the extra fields
+  # are harmless. Honestly empty with no add-ons installed.
   get "/addons" do
-    Envelope.send_ok(conn, AddonsList.build!(StaticData.addons_list()))
+    addons = Enum.map(State.list(), &addon_list_entry/1)
+    Envelope.send_ok(conn, AddonsList.build!(%{addons: addons}))
   end
 
   # Add-on info (§A1; `supervisor/api/apps.py` `info_data`). Core's hassio
@@ -250,6 +267,61 @@ defmodule Vagus.API.Router do
       true ->
         Envelope.send_error(conn, "Self is not an App", 400)
     end
+  end
+
+  # -- Addon lifecycle (M4-P3-T1; §A1.1) -------------------------------------
+  #
+  # Every route here is supervisor-only (Core drives install/start/stop from
+  # the frontend's addon dashboard; an add-on never manages its own or
+  # another's lifecycle) — a non-supervisor caller gets a 403 before any
+  # `Manager`/`Store` call.
+
+  # Store slug is rewritten onto the parsed config (a store entry's own
+  # `config.slug` is the add-on's bare slug, e.g. "mosquitto"; installed
+  # add-ons run under the store slug, e.g. "core_mosquitto" — see
+  # `Vagus.Addon.Store`'s moduledoc) before `Manager.install/2` builds the
+  # container spec from it, and before `State.put/3` records it as
+  # installed-but-stopped (a freshly-installed add-on isn't started yet).
+  post "/store/addons/:slug/install" do
+    handle_install(conn, slug)
+  end
+
+  # Legacy alias some Supervisor-API clients use instead of the `/store/...`
+  # path for the same action.
+  post "/addons/:slug/install" do
+    handle_install(conn, slug)
+  end
+
+  post "/addons/:slug/start" do
+    lifecycle_action(conn, slug, fn -> Manager.start_slug(slug) end)
+  end
+
+  post "/addons/:slug/stop" do
+    lifecycle_action(conn, slug, fn -> Manager.stop(slug) end)
+  end
+
+  post "/addons/:slug/restart" do
+    lifecycle_action(conn, slug, fn -> Manager.restart(slug) end)
+  end
+
+  # `{"remove_config": bool}` is accepted (Core's `AddonsOptions`/uninstall
+  # payload) and ignored — this emulator has no separate "keep config"
+  # retention to honor; `Manager.uninstall/2` always purges the data dir.
+  post "/addons/:slug/uninstall" do
+    lifecycle_action(conn, slug, fn -> Manager.uninstall(slug) end)
+  end
+
+  # `POST /addons/{slug}/options` (SCHEMA_OPTIONS). M4 only implements the
+  # `options` key: `null` resets to no user options, a map is validated
+  # against the add-on's schema (merged over its config defaults, mirroring
+  # what `Manager.start/2` would write) and — only if valid — stored via
+  # `State.put_options/2`. Other SCHEMA_OPTIONS keys (`boot`, `watchdog`,
+  # `auto_update`, …) aren't modeled yet; they're accepted and ignored rather
+  # than 400ing a caller that also sets them. Never restarts the add-on
+  # itself — the caller is expected to follow up with `.../restart` if it
+  # wants the new options live.
+  post "/addons/:slug/options" do
+    handle_addon_options(conn, slug)
   end
 
   # -- Stats coordinator (60s) -----------------------------------------------
@@ -399,14 +471,63 @@ defmodule Vagus.API.Router do
   # device 2026-07-20: 404 logs "Unexpected error for hassio.local: not
   # found"). aiohasupervisor `BackupList` requires only `backups`;
   # `GET /backups/info` (`BackupsInfo`) additionally requires
-  # `days_until_stale` (Supervisor default: 30). Honestly empty — backups
-  # are out of this slug's scope.
+  # `days_until_stale` (Supervisor default: 30). Backed by `Vagus.Backups`
+  # (M4-P6-T2; §A4) — supervisor-caller only, same as the rest of the
+  # backup surface below.
+
   get "/backups" do
-    Envelope.send_ok(conn, %{backups: []})
+    supervisor_only(conn, fn ->
+      entries = Backups.list() |> Enum.map(&backup_list_entry/1)
+      Envelope.send_ok(conn, %{backups: entries})
+    end)
   end
 
   get "/backups/info" do
-    Envelope.send_ok(conn, %{backups: [], days_until_stale: 30})
+    supervisor_only(conn, fn ->
+      entries = Backups.list() |> Enum.map(&backup_list_entry/1)
+      Envelope.send_ok(conn, %{backups: entries, days_until_stale: 30})
+    end)
+  end
+
+  get "/backups/:slug/info" do
+    supervisor_only(conn, fn ->
+      case Backups.get(slug) do
+        {:ok, entry} -> Envelope.send_ok(conn, backup_info(entry))
+        :error -> Envelope.send_error(conn, "Backup does not exist", 404)
+      end
+    end)
+  end
+
+  post "/backups/new/partial" do
+    supervisor_only(conn, fn -> handle_backup_new_partial(conn, conn.body_params) end)
+  end
+
+  post "/backups/new/upload" do
+    supervisor_only(conn, fn -> handle_backup_upload(conn) end)
+  end
+
+  post "/backups/:slug/restore/partial" do
+    supervisor_only(conn, fn -> handle_backup_restore(conn, slug, conn.body_params) end)
+  end
+
+  get "/backups/:slug/download" do
+    supervisor_only(conn, fn -> handle_backup_download(conn, slug) end)
+  end
+
+  delete "/backups/:slug" do
+    supervisor_only(conn, fn ->
+      case Backups.delete(slug) do
+        :ok -> Envelope.send_ok(conn, %{})
+        :error -> Envelope.send_error(conn, "Backup does not exist", 404)
+      end
+    end)
+  end
+
+  post "/backups/reload" do
+    supervisor_only(conn, fn ->
+      :ok = Backups.reload()
+      Envelope.send_ok(conn, %{})
+    end)
   end
 
   # -- Add-on service registry (§A3.1) ---------------------------------------
@@ -642,6 +763,327 @@ defmodule Vagus.API.Router do
       }
     end)
   end
+
+  # -- addon lifecycle helpers ------------------------------------------------
+
+  # `GET /addons` entry: the effective options (falling back to the config
+  # defaults, same as `/addons/{slug}/info`) rendered through
+  # `Vagus.Addon.Info.render/3`.
+  defp addon_list_entry(%{config: config, state: state}) do
+    options =
+      case read_addon_options(config.slug) do
+        {:ok, opts} -> opts
+        :error -> config.options
+      end
+
+    Vagus.Addon.Info.render(config, state, options)
+  end
+
+  defp handle_install(conn, slug) do
+    if conn.assigns.caller == :supervisor do
+      case Store.get(slug) do
+        {:ok, %{config: entry_config}} ->
+          # The store entry's own `config.slug` is the add-on's bare slug
+          # (e.g. "mosquitto"); installed add-ons run under the store slug
+          # (e.g. "core_mosquitto" — see `Vagus.Addon.Store`'s moduledoc).
+          config = %{entry_config | slug: slug}
+
+          case Manager.install(config) do
+            :ok ->
+              :ok = State.put(config, :stopped)
+              Envelope.send_ok(conn, %{})
+
+            {:error, reason} ->
+              Envelope.send_error(conn, inspect(reason), 400)
+          end
+
+        :error ->
+          Envelope.send_error(conn, "Addon #{slug} does not exist in the store", 404)
+      end
+    else
+      Envelope.send_error(conn, "unauthorized", 403)
+    end
+  end
+
+  # Shared supervisor-only-caller + result-mapping wrapper for
+  # start/stop/restart/uninstall — all four share the same
+  # `:ok | {:ok, _} | {:error, :not_found} | {:error, reason}` result shape.
+  defp lifecycle_action(conn, slug, fun) do
+    if conn.assigns.caller == :supervisor do
+      case fun.() do
+        :ok -> Envelope.send_ok(conn, %{})
+        {:ok, _} -> Envelope.send_ok(conn, %{})
+        {:error, :not_found} -> Envelope.send_error(conn, "Addon #{slug} does not exist", 404)
+        {:error, reason} -> Envelope.send_error(conn, inspect(reason), 400)
+      end
+    else
+      Envelope.send_error(conn, "unauthorized", 403)
+    end
+  end
+
+  defp handle_addon_options(conn, slug) do
+    if conn.assigns.caller == :supervisor do
+      case State.get(slug) do
+        :error ->
+          Envelope.send_error(conn, "Addon #{slug} does not exist", 404)
+
+        {:ok, %{config: config}} ->
+          apply_addon_options(conn, slug, config, Map.fetch(conn.body_params, "options"))
+      end
+    else
+      Envelope.send_error(conn, "unauthorized", 403)
+    end
+  end
+
+  # `options: nil` resets to no user options; a map is validated (merged over
+  # the config defaults, mirroring `Manager.start/2`'s own write path) before
+  # being stored raw (not the merged/validated result — `start_slug/2` redoes
+  # that merge+validate itself against whatever the config looks like at
+  # start time). Any other SCHEMA_OPTIONS key (or no `options` key at all) is
+  # accepted and ignored.
+  defp apply_addon_options(conn, slug, _config, {:ok, nil}) do
+    :ok = State.put_options(slug, %{})
+    Envelope.send_ok(conn, %{})
+  end
+
+  defp apply_addon_options(conn, slug, config, {:ok, options}) when is_map(options) do
+    case OptionsSchema.effective(config.schema, config.options, options) do
+      {:ok, _validated} ->
+        :ok = State.put_options(slug, options)
+        Envelope.send_ok(conn, %{})
+
+      {:error, _reason} ->
+        Envelope.send_error(conn, "Invalid options", 400)
+    end
+  end
+
+  defp apply_addon_options(conn, _slug, _config, {:ok, _other}) do
+    Envelope.send_error(conn, "options must be an object or null", 400)
+  end
+
+  defp apply_addon_options(conn, _slug, _config, :error) do
+    Envelope.send_ok(conn, %{})
+  end
+
+  # -- backup helpers (M4-P6-T2; §A4) -----------------------------------------
+
+  # Shared supervisor-only-caller guard for every `/backups...` route — Core
+  # drives backups from the frontend, an add-on never manages backups.
+  defp supervisor_only(conn, fun) do
+    if conn.assigns.caller == :supervisor,
+      do: fun.(),
+      else: Envelope.send_error(conn, "unauthorized", 403)
+  end
+
+  defp mb(bytes), do: Float.round(bytes / 1_048_576, 2)
+
+  # `GET /backups` / `GET /backups/info` list entry (pinned V1 shape).
+  defp backup_list_entry(%{backup: b, size_bytes: size_bytes}) do
+    %{
+      slug: b["slug"],
+      name: b["name"],
+      date: b["date"],
+      type: "partial",
+      size: mb(size_bytes),
+      size_bytes: size_bytes,
+      location: nil,
+      locations: [nil],
+      protected: false,
+      compressed: true,
+      location_attributes: %{".local" => %{protected: false, size_bytes: size_bytes}},
+      content: %{
+        homeassistant: false,
+        addons: Enum.map(b["addons"] || [], & &1["slug"]),
+        folders: []
+      }
+    }
+  end
+
+  # `GET /backups/{slug}/info` shape.
+  defp backup_info(%{backup: b, size_bytes: size_bytes}) do
+    %{
+      slug: b["slug"],
+      type: "partial",
+      name: b["name"],
+      date: b["date"],
+      size: mb(size_bytes),
+      size_bytes: size_bytes,
+      compressed: true,
+      protected: false,
+      location_attributes: %{".local" => %{protected: false, size_bytes: size_bytes}},
+      supervisor_version: b["supervisor_version"],
+      homeassistant: nil,
+      location: nil,
+      locations: [nil],
+      addons:
+        Enum.map(b["addons"] || [], fn a ->
+          %{slug: a["slug"], name: a["name"], version: a["version"], size: a["size"]}
+        end),
+      repositories: [],
+      folders: [],
+      homeassistant_exclude_database: nil,
+      extra: %{}
+    }
+  end
+
+  defp handle_backup_new_partial(conn, params) do
+    with :ok <- reject_password(params),
+         :ok <- reject_homeassistant(params, "Core backup not supported"),
+         :ok <- reject_folders(params),
+         :ok <- validate_filename(params),
+         {:ok, addon_slugs} <- resolve_create_addon_slugs(params) do
+      case Backups.create_partial(Map.get(params, "name"), addon_slugs) do
+        {:ok, slug} ->
+          Envelope.send_ok(conn, %{slug: slug, job_id: new_job_id()})
+
+        {:error, {:not_installed, addon_slug}} ->
+          Envelope.send_error(conn, "Addon #{addon_slug} is not installed", 400)
+
+        {:error, reason} ->
+          Envelope.send_error(conn, inspect(reason), 400)
+      end
+    else
+      {:error, message} -> Envelope.send_error(conn, message, 400)
+    end
+  end
+
+  defp handle_backup_restore(conn, slug, params) do
+    case Backups.get(slug) do
+      :error ->
+        Envelope.send_error(conn, "Backup does not exist", 404)
+
+      {:ok, _entry} ->
+        with :ok <- reject_password(params),
+             :ok <- reject_homeassistant(params, "Core restore not supported"),
+             :ok <- reject_folders(params),
+             {:ok, addon_slugs} <- require_addons_list(params) do
+          case Backups.restore_partial(slug, addon_slugs) do
+            :ok ->
+              Envelope.send_ok(conn, %{job_id: new_job_id()})
+
+            {:error, message} when is_binary(message) ->
+              Envelope.send_error(conn, message, 400)
+
+            {:error, reason} ->
+              Envelope.send_error(conn, inspect(reason), 400)
+          end
+        else
+          {:error, message} -> Envelope.send_error(conn, message, 400)
+        end
+    end
+  end
+
+  defp handle_backup_download(conn, slug) do
+    case Backups.get(slug) do
+      {:ok, %{backup: b, path: path}} ->
+        filename = Regex.replace(~r/[^A-Za-z0-9]+/, b["name"] || slug, "_") <> ".tar"
+
+        conn
+        |> put_resp_content_type("application/tar", nil)
+        |> put_resp_header("content-disposition", "attachment; filename=#{filename}")
+        |> send_file(200, path)
+
+      :error ->
+        Envelope.send_error(conn, "Backup does not exist", 404)
+    end
+  end
+
+  # The uploaded tar's bytes are validated by `Backups.put_file/1` itself
+  # (`Vagus.Backup.read/1`) — any field name is accepted (the first
+  # `%Plug.Upload{}` found in the parsed multipart params is used), matching
+  # the real Supervisor's tolerance of arbitrary multipart field naming.
+  defp handle_backup_upload(conn) do
+    case first_upload(conn.body_params) do
+      {:ok, %Plug.Upload{path: path}} ->
+        with {:ok, tar} <- File.read(path),
+             {:ok, slug} <- Backups.put_file(tar) do
+          Envelope.send_ok(conn, %{slug: slug})
+        else
+          _ -> Envelope.send_error(conn, "invalid backup file", 400)
+        end
+
+      :error ->
+        Envelope.send_error(conn, "no file uploaded", 400)
+    end
+  end
+
+  defp first_upload(params) when is_map(params) do
+    case Enum.find_value(params, fn {_k, v} -> match?(%Plug.Upload{}, v) and v end) do
+      %Plug.Upload{} = upload -> {:ok, upload}
+      _ -> :error
+    end
+  end
+
+  defp first_upload(_params), do: :error
+
+  defp reject_password(params) do
+    case Map.get(params, "password") do
+      v when is_binary(v) and v != "" -> {:error, "protected backups are not supported"}
+      _ -> :ok
+    end
+  end
+
+  defp reject_homeassistant(params, message) do
+    if Map.get(params, "homeassistant") == true, do: {:error, message}, else: :ok
+  end
+
+  defp reject_folders(params) do
+    case Map.get(params, "folders") do
+      list when is_list(list) and list != [] -> {:error, "folder backup not supported"}
+      _ -> :ok
+    end
+  end
+
+  defp validate_filename(params) do
+    case Map.get(params, "filename") do
+      nil ->
+        :ok
+
+      fname when is_binary(fname) ->
+        if Regex.match?(~r/^[^\/]+\.tar$/, fname),
+          do: :ok,
+          else: {:error, "filename must match ^[^/]+\\.tar$"}
+
+      _other ->
+        {:error, "filename must be a string"}
+    end
+  end
+
+  # `"ALL"` resolves to every currently-installed slug (§A4's
+  # `addons:"ALL"|[slug]`); an explicit list is passed through as-is (whether
+  # each slug is actually installed is `Backups.create_partial/3`'s concern).
+  defp resolve_create_addon_slugs(params) do
+    case Map.get(params, "addons") do
+      "ALL" ->
+        {:ok, Enum.map(State.list(), & &1.config.slug)}
+
+      list when is_list(list) ->
+        if Enum.all?(list, &is_binary/1),
+          do: {:ok, list},
+          else: {:error, "addons must be a list of slugs"}
+
+      _other ->
+        {:error, "addons is required (\"ALL\" or a list of slugs)"}
+    end
+  end
+
+  # Partial restore's `addons` is always an explicit list (no `"ALL"`, §A4).
+  defp require_addons_list(params) do
+    case Map.get(params, "addons") do
+      list when is_list(list) ->
+        if Enum.all?(list, &is_binary/1),
+          do: {:ok, list},
+          else: {:error, "addons must be a list of slugs"}
+
+      _other ->
+        {:error, "addons is required and must be a list of slugs"}
+    end
+  end
+
+  # uuid4hex-shaped job id (32 lowercase hex chars) — mirrors
+  # `Vagus.Discovery`'s own uuid minting, not a validated RFC 4122 v4 (the
+  # wire only cares about the shape/uniqueness, never parses it back).
+  defp new_job_id, do: Base.encode16(:crypto.strong_rand_bytes(16), case: :lower)
 
   # -- discovery helpers -----------------------------------------------------
 

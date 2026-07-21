@@ -78,6 +78,32 @@ defmodule Vagus.Runtime.Docker do
     end
   end
 
+  @doc """
+  DELETE `/images/{name}` (`name` a `"repo:tag"` or `"repo"` ref, as built by
+  `Vagus.Addon.Manager.build_spec/2`). A missing image (404) is treated as
+  `:ok` (already gone) — mirrors `remove_container/2`/`remove_network/2`.
+
+  Unlike a container/network id, an image ref legitimately contains `/`
+  (repo namespace) and `:` (tag), so it can't reuse `ensure_ref/1`'s
+  container-id charset; `ensure_image_ref/1` instead only rejects the
+  sequences that could still break out of the request path.
+  """
+  @spec remove_image(String.t(), keyword()) :: :ok | {:error, term()}
+  def remove_image(name, opts \\ []) do
+    with :ok <- ensure_image_ref(name) do
+      case request(:delete, "/images/#{name}", opts) do
+        {:ok, %{status: s}} when s in [200, 404] ->
+          :ok
+
+        {:ok, %{status: status, body: body}} ->
+          {:error, {:remove_image_failed, status, message(body)}}
+
+        {:error, reason} ->
+          {:error, reason}
+      end
+    end
+  end
+
   ## Containers
 
   @doc """
@@ -185,6 +211,40 @@ defmodule Vagus.Runtime.Docker do
     get_json("/containers/json", Keyword.merge(opts, query: query))
   end
 
+  @doc """
+  Runs `cmd` (via `/bin/sh -c`) inside container `id` and waits for it to
+  exit — the §A4 `backup_pre`/`backup_post` hook for a **hot** add-on.
+  `:ok` on exit code 0, `{:error, {:exec, code}}` on nonzero.
+
+  **Deviation from the originally-specified approach**: the ticket describes
+  starting the exec non-detached (`Detach: false`) and reading the
+  hijacked/streamed `/exec/{id}/start` response body to completion through
+  this module's `request/4`. Docker documents that endpoint as hijacking the
+  HTTP connection to transport stdin/stdout/stderr directly — a duplex,
+  protocol-upgraded stream that doesn't fit `request/4`'s buffered
+  request-then-full-response model (built for ordinary Engine-API JSON
+  calls, not an upgraded connection), without either blocking indefinitely
+  on a malformed read or risking a wedged connection on a 1GB device.
+  Instead this starts the exec `Detach: true` (fire-and-forget — the
+  daemon still runs the command to completion, it just doesn't hold the
+  HTTP connection open for output) and polls `GET /exec/{id}/json` for
+  `Running: false` to read `ExitCode`. Consequence: `backup_pre`/
+  `backup_post` output isn't captured anywhere (only the exit code is
+  observed) — acceptable here since no current add-on config in scope
+  (Mosquitto ships HOT with no pre/post at all) exercises this path; a
+  future add-on that needs the command's stdout/stderr will need a real
+  streaming client.
+  """
+  @spec exec(String.t(), String.t(), keyword()) :: :ok | {:error, term()}
+  def exec(id, cmd, opts \\ []) do
+    with :ok <- ensure_ref(id),
+         {:ok, exec_id} <- create_exec(id, cmd, opts),
+         :ok <- start_exec_detached(exec_id, opts),
+         {:ok, exit_code} <- await_exec(exec_id, opts) do
+      if exit_code == 0, do: :ok, else: {:error, {:exec, exit_code}}
+    end
+  end
+
   ## Networks
 
   @doc "POST `/networks/create` with `config` (an Engine-API network config). Returns `{:ok, id}`."
@@ -278,6 +338,75 @@ defmodule Vagus.Runtime.Docker do
   end
 
   defp ensure_ref(_id), do: {:error, {:invalid_ref, :not_a_string}}
+
+  ## `exec/3` internals — see the deviation note on `exec/3` itself.
+
+  defp create_exec(id, cmd, opts) do
+    body = %{"Cmd" => ["/bin/sh", "-c", cmd], "AttachStdout" => true, "AttachStderr" => true}
+
+    case request(:post, "/containers/#{id}/exec", Keyword.merge(opts, body: body)) do
+      {:ok, %{status: 201, body: %{"Id" => exec_id}}} ->
+        {:ok, exec_id}
+
+      {:ok, %{status: status, body: body}} ->
+        {:error, {:exec_create_failed, status, message(body)}}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp start_exec_detached(exec_id, opts) do
+    body = %{"Detach" => true}
+
+    case request(:post, "/exec/#{exec_id}/start", Keyword.merge(opts, body: body)) do
+      {:ok, %{status: s}} when s in [200, 204] ->
+        :ok
+
+      {:ok, %{status: status, body: body}} ->
+        {:error, {:exec_start_failed, status, message(body)}}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  # ~30s cap (150 * 200ms) — long enough for a reasonable backup_pre/post
+  # hook, bounded so a hung command can't wedge a backup job forever.
+  @exec_poll_interval 200
+  @exec_poll_max 150
+
+  defp await_exec(exec_id, opts, attempt \\ 0) do
+    case request(:get, "/exec/#{exec_id}/json", opts) do
+      {:ok, %{status: 200, body: %{"Running" => false, "ExitCode" => code}}} ->
+        {:ok, code}
+
+      {:ok, %{status: 200}} when attempt < @exec_poll_max ->
+        Process.sleep(@exec_poll_interval)
+        await_exec(exec_id, opts, attempt + 1)
+
+      {:ok, %{status: 200}} ->
+        {:error, :exec_timeout}
+
+      {:ok, %{status: status, body: body}} ->
+        {:error, {:exec_inspect_failed, status, message(body)}}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  # An image ref is a path segment too, so it needs the same anti-traversal
+  # discipline as `ensure_ref/1` — but its legitimate charset is much wider
+  # (repo namespaces, registry `host:port` prefixes, tags), so this only
+  # blocks the specific sequences that could rewrite the request path.
+  defp ensure_image_ref(name) when is_binary(name) do
+    if String.contains?(name, ["..", "?", "#"]),
+      do: {:error, {:invalid_ref, name}},
+      else: :ok
+  end
+
+  defp ensure_image_ref(_name), do: {:error, {:invalid_ref, :not_a_string}}
 
   defp get_json(path, opts) do
     case request(:get, path, opts) do

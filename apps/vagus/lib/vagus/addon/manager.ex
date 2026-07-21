@@ -15,13 +15,27 @@ defmodule Vagus.Addon.Manager do
       `/data/options.json`, ensures the bind-source dirs exist, then creates +
       starts the container via the backend.
 
-  Backend is injectable (`:backend`, default `Backend.Container`); the data
-  root is `config :vagus, :addon_data_root` (default `/data`), overridable via
-  `:data_root` (host tests point it at a tmp dir).
+  Backend is injectable (`:backend`, defaulting to `config :vagus,
+  :addon_backend` — itself defaulting to `Backend.Container` — so router
+  tests can swap in a fake backend for a whole request without threading an
+  opt through every call site); the data root is `config :vagus,
+  :addon_data_root` (default `/data`), overridable via `:data_root` (host
+  tests point it at a tmp dir).
 
-  Full per-add-on state/supervision (`Vagus.Addon` GenServer + token registry)
-  and the store/repo clone are follow-ups; here `start/2` returns the
-  container id + generated token to the caller.
+  P3-T1 adds the rest of the lifecycle on top of install/start:
+
+    * `stop/2` — docker-stop then remove the container (the real
+      Supervisor's `stop` removes the container; `start` always re-creates),
+      deregister the token + DNS record, record `:stopped`;
+    * `start_slug/2` — re-`start/2` a previously-installed slug using its
+      `Vagus.Addon.State`-stored config + user options;
+    * `restart/2` — `stop/2` (tolerating any failure but `:not_found`) then
+      `start_slug/2`;
+    * `uninstall/2` — stop+remove the container and image (both
+      best-effort), purge the slug's discovery/service registrations, drop
+      its `Registry`/`DNS`/`State` entries, and `File.rm_rf` its data dir —
+      gated on the slug matching a safe directory-name charset, since the
+      slug is interpolated into that rm_rf path.
   """
 
   require Logger
@@ -70,15 +84,103 @@ defmodule Vagus.Addon.Manager do
     spec = build_spec(config, opts)
     data_root = data_root(opts)
 
+    user_options = Keyword.get(opts, :user_options, %{})
+
     with :ok <- ensure_mount_sources(spec),
-         :ok <- write_options(config, data_root, Keyword.get(opts, :user_options, %{})),
+         :ok <- write_options(config, data_root, user_options),
          :ok <- maybe_ensure_network(config, opts),
          {:ok, id} <- backend(opts).create(spec),
          :ok <- start_or_cleanup(id, opts) do
       register_identity(config, token)
-      record_state(config)
+      record_state(config, :started, user_options: user_options)
       register_dns(config, id, opts)
       {:ok, %{id: id, access_token: token}}
+    end
+  end
+
+  @doc """
+  Stops `slug`: docker-stop then remove the container (§A1.1 — the real
+  Supervisor's `stop` removes the container, and `start` always re-creates
+  one), deregister its token (`Registry.unregister_slug/1`) and DNS record
+  (`DNS.unregister/1`), and record `:stopped` (preserving any stored user
+  options). Idempotent: a backend error stopping/removing an
+  already-stopped/absent container is logged and tolerated, never surfaced
+  as a failure — only an unknown (never-installed) `slug` is an error.
+  """
+  @spec stop(String.t(), keyword()) :: :ok | {:error, :not_found}
+  def stop(slug, opts \\ []) do
+    case Vagus.Addon.State.get(slug) do
+      :error ->
+        {:error, :not_found}
+
+      {:ok, %{config: config}} ->
+        stop_and_remove_container(config, opts)
+        deregister_slug(config)
+        record_state(config, :stopped)
+        :ok
+    end
+  end
+
+  @doc """
+  Re-`start/2`s a previously-installed `slug` using its
+  `Vagus.Addon.State`-stored config and user options (a fresh token is
+  generated, same as any `start/2`). `{:error, :not_found}` if `slug` isn't
+  tracked (never installed, or already uninstalled).
+  """
+  @spec start_slug(String.t(), keyword()) ::
+          {:ok, %{id: String.t(), access_token: String.t()}} | {:error, term()}
+  def start_slug(slug, opts \\ []) do
+    case Vagus.Addon.State.get(slug) do
+      :error ->
+        {:error, :not_found}
+
+      {:ok, %{config: config, user_options: user_options}} ->
+        start(config, Keyword.put_new(opts, :user_options, user_options || %{}))
+    end
+  end
+
+  @doc """
+  Restarts `slug`: `stop/2` then `start_slug/2`. Any `stop/2` failure other
+  than `{:error, :not_found}` is tolerated (`stop/2` itself already tolerates
+  backend errors — this only guards the unknown-slug case, which must still
+  short-circuit before attempting a start).
+  """
+  @spec restart(String.t(), keyword()) ::
+          {:ok, %{id: String.t(), access_token: String.t()}} | {:error, term()}
+  def restart(slug, opts \\ []) do
+    case stop(slug, opts) do
+      {:error, :not_found} -> {:error, :not_found}
+      _ -> start_slug(slug, opts)
+    end
+  end
+
+  @doc """
+  Uninstalls `slug`: stop+remove the container and remove the image (both
+  best-effort — a daemon that's already gone-ahead-and-forgotten either one
+  isn't a failure here), purge its discovery messages
+  (`Vagus.Discovery.delete_by_slug/1`) and service registrations
+  (`Vagus.Services.delete_by_slug/1`), drop its `Registry`/`DNS`/`State`
+  entries, then `File.rm_rf` its data dir (`<data_root>/addons/data/<slug>`).
+
+  The data-dir removal is gated on `slug` matching a safe directory-name
+  charset (`~r/^[-_a-z0-9]+$/`) — `slug` is interpolated straight into that
+  rm_rf path, so a slug that fails the check (which should never happen for
+  a config `Vagus.Addon.Config.parse/1` produced, but this is cheap insurance
+  against a hand-built/corrupted `State` entry) is skipped rather than risk
+  deleting outside the add-on's own data dir; `{:error, {:invalid_slug, _}}`
+  is returned in that case (every other step still runs).
+  """
+  @spec uninstall(String.t(), keyword()) :: :ok | {:error, :not_found} | {:error, term()}
+  def uninstall(slug, opts \\ []) do
+    case Vagus.Addon.State.get(slug) do
+      :error ->
+        {:error, :not_found}
+
+      {:ok, %{config: config}} ->
+        stop_and_remove_container(config, opts)
+        remove_image_best_effort(config, opts)
+        purge_side_state(config.slug)
+        remove_data_dir(config.slug, opts)
     end
   end
 
@@ -133,7 +235,9 @@ defmodule Vagus.Addon.Manager do
 
   ## Internals
 
-  defp backend(opts), do: Keyword.get(opts, :backend, @default_backend)
+  defp backend(opts), do: Keyword.get(opts, :backend, default_backend())
+
+  defp default_backend, do: Application.get_env(:vagus, :addon_backend, @default_backend)
 
   defp maybe_ensure_network(%Config{host_network: true}, _opts), do: :ok
 
@@ -251,11 +355,111 @@ defmodule Vagus.Addon.Manager do
     :ok
   end
 
-  # Record the add-on as started so `GET /addons/{slug}/info` can serve it.
-  # Best-effort: skipped if the store isn't running (isolated unit tests).
-  defp record_state(config) do
-    if Process.whereis(Vagus.Addon.State), do: Vagus.Addon.State.put(config, :started)
+  # Record the add-on's lifecycle state so `GET /addons/{slug}/info` (and the
+  # lifecycle routes) can serve it. Best-effort: skipped if the store isn't
+  # running (isolated unit tests). `state_opts` forwards to `State.put/3`
+  # (e.g. `user_options:` on a start; omitted on a stop, so the prior
+  # user options are preserved — see `Vagus.Addon.State.put/3`).
+  defp record_state(config, state, state_opts \\ []) do
+    if Process.whereis(Vagus.Addon.State), do: Vagus.Addon.State.put(config, state, state_opts)
     :ok
+  end
+
+  # Deregister a stopped/uninstalled add-on's token + DNS record. Best-effort,
+  # same rationale as `register_identity/2`/`register_dns/3`.
+  defp deregister_slug(%Config{slug: slug}) do
+    if Process.whereis(Vagus.Addon.Registry), do: Vagus.Addon.Registry.unregister_slug(slug)
+    if Process.whereis(Vagus.DNS), do: Vagus.DNS.unregister(String.replace(slug, "_", "-"))
+    :ok
+  end
+
+  # docker-stop then remove (§A1.1's pinned `stop` semantics). Both calls are
+  # tolerated: an already-stopped/absent container is idempotent success at
+  # the backend, but a legitimately-failing daemon call (e.g. no daemon in a
+  # host devcontainer) must not block deregistration/state bookkeeping either
+  # — this is best-effort the same way DNS/registry side effects are.
+  defp stop_and_remove_container(config, opts) do
+    id = "addon_#{config.slug}"
+
+    case backend(opts).stop(id, opts) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning("Vagus.Addon.Manager: stop #{id} failed (tolerated): #{inspect(reason)}")
+    end
+
+    case backend(opts).remove(id, opts) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning("Vagus.Addon.Manager: remove #{id} failed (tolerated): #{inspect(reason)}")
+    end
+
+    :ok
+  end
+
+  # Image removal goes straight through `Vagus.Runtime.Docker` (not the
+  # injectable `:backend` — the `Backend` behaviour is container-lifecycle
+  # only, and image removal isn't part of it) and is best-effort: a config
+  # with no `image:` (raises building the spec) or a daemon that's already
+  # forgotten the image both just log and move on.
+  defp remove_image_best_effort(config, opts) do
+    case safe_image_ref(config, opts) do
+      {:ok, image} ->
+        case Vagus.Runtime.Docker.remove_image(image, network_opts(opts)) do
+          :ok ->
+            :ok
+
+          {:error, reason} ->
+            Logger.warning(
+              "Vagus.Addon.Manager: remove image #{image} failed (tolerated): #{inspect(reason)}"
+            )
+        end
+
+      :error ->
+        :ok
+    end
+  end
+
+  defp safe_image_ref(config, opts) do
+    {:ok, build_spec(config, opts).image}
+  rescue
+    ArgumentError -> :error
+  end
+
+  # Purge every other subsystem's record of `slug` on uninstall. Each touch
+  # is best-effort/guarded the same way the rest of the manager's side
+  # registrations are — an uninstall must complete even in an isolated test
+  # that never started the full app.
+  defp purge_side_state(slug) do
+    if Process.whereis(Vagus.Discovery), do: Vagus.Discovery.delete_by_slug(slug)
+    if Process.whereis(Vagus.Services), do: Vagus.Services.delete_by_slug(slug)
+    if Process.whereis(Vagus.Addon.Registry), do: Vagus.Addon.Registry.unregister_slug(slug)
+    if Process.whereis(Vagus.DNS), do: Vagus.DNS.unregister(String.replace(slug, "_", "-"))
+    if Process.whereis(Vagus.Addon.State), do: Vagus.Addon.State.delete(slug)
+    :ok
+  end
+
+  # Directory-name-safe charset for a slug interpolated into the data-dir
+  # rm_rf path — deliberately stricter than `Vagus.Addon.Config`'s own slug
+  # regex (which allows `.` and uppercase): this is the last line of defense
+  # against a destructive rm_rf, so it only accepts what a real store/config
+  # slug actually looks like.
+  @slug_dir_re ~r/^[-_a-z0-9]+$/
+
+  defp remove_data_dir(slug, opts) do
+    if Regex.match?(@slug_dir_re, slug) do
+      File.rm_rf(Path.join([data_root(opts), "addons", "data", slug]))
+      :ok
+    else
+      Logger.warning(
+        "Vagus.Addon.Manager: refusing to rm_rf the data dir for unsafe slug #{inspect(slug)}"
+      )
+
+      {:error, {:invalid_slug, slug}}
+    end
   end
 
   # Register `<slug-with-dashes>` → the container's hassio-bridge IP in the DNS

@@ -7,7 +7,9 @@ defmodule Vagus.Services do
 
   Holds one config map per service plus the provider slug. `get/1` returns the
   stored fields with the provider under the legacy `"addon"` key (the V1 wire
-  shape Core's `aiohasupervisor` reads).
+  shape Core's `aiohasupervisor` reads). `delete_by_slug/2` purges every
+  service a given add-on provides (called from `Vagus.Addon.Manager.uninstall/2`
+  so a removed add-on's stale provider entries don't linger).
   """
 
   use GenServer
@@ -43,6 +45,15 @@ defmodule Vagus.Services do
     GenServer.call(server, :list)
   end
 
+  @doc """
+  Clears every service provided by `slug` (e.g. on add-on stop/uninstall).
+  Mirrors `Vagus.Discovery.delete_by_slug/2`. Returns the freed service names.
+  """
+  @spec delete_by_slug(String.t(), GenServer.server()) :: {:ok, [String.t()]}
+  def delete_by_slug(slug, server \\ __MODULE__) do
+    GenServer.call(server, {:delete_by_slug, slug})
+  end
+
   ## GenServer
 
   @impl GenServer
@@ -69,6 +80,12 @@ defmodule Vagus.Services do
       %{slug: ^slug} -> {:reply, :ok, Map.delete(state, service)}
       _other -> {:reply, {:error, :not_provider}, state}
     end
+  end
+
+  def handle_call({:delete_by_slug, slug}, _from, state) do
+    {owned, rest} = Enum.split_with(state, fn {_service, %{slug: s}} -> s == slug end)
+    freed = Enum.map(owned, fn {service, _} -> service end)
+    {:reply, {:ok, freed}, Map.new(rest)}
   end
 
   def handle_call(:list, _from, state) do

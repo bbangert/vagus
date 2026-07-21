@@ -32,6 +32,7 @@ defmodule Vagus.Application do
         Vagus.Addon.Registry,
         Vagus.Addon.State,
         Vagus.Addon.Store,
+        Vagus.Backups,
         Vagus.Services,
         Vagus.Discovery,
         Vagus.Auth

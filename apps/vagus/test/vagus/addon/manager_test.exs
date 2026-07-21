@@ -172,6 +172,132 @@ defmodule Vagus.Addon.ManagerTest do
     end
   end
 
+  describe "stop/2, start_slug/2, restart/2, uninstall/2 (fake backend + real State/Registry/DNS/Discovery/Services)" do
+    setup do
+      :persistent_term.put({__MODULE__.FakeBackend, :pid}, self())
+
+      data_root =
+        Path.join(System.tmp_dir!(), "vagus-mgr-lifecycle-#{System.unique_integer([:positive])}")
+
+      on_exit(fn -> File.rm_rf(data_root) end)
+
+      {:ok, config} =
+        Config.parse(%{
+          "name" => "Test",
+          "version" => "3",
+          "slug" => "life_addon",
+          "description" => "d",
+          "arch" => ["amd64"],
+          "image" => "homeassistant/{arch}-addon-test",
+          "host_network" => true
+        })
+
+      on_exit(fn ->
+        Vagus.Addon.State.delete("life_addon")
+        Vagus.Addon.Registry.unregister_slug("life_addon")
+        if Process.whereis(Vagus.DNS), do: Vagus.DNS.unregister("life-addon")
+        Vagus.Discovery.delete_by_slug("life_addon")
+        Vagus.Services.delete_by_slug("life_addon")
+      end)
+
+      %{config: config, data_root: data_root}
+    end
+
+    test "stop on an unknown slug is :not_found" do
+      assert {:error, :not_found} = Manager.stop("no-such-#{System.unique_integer([:positive])}")
+    end
+
+    test "stop: backend stop+remove called, State -> :stopped, registry/DNS deregistered",
+         %{config: config, data_root: dr} do
+      assert {:ok, _} = Manager.start(config, backend: __MODULE__.FakeBackend, data_root: dr)
+      assert {:ok, %{state: :started}} = Vagus.Addon.State.get("life_addon")
+
+      assert :ok = Manager.stop("life_addon", backend: __MODULE__.FakeBackend)
+      assert_received {:stop, "addon_life_addon"}
+      assert_received {:remove, "addon_life_addon"}
+
+      assert {:ok, %{state: :stopped}} = Vagus.Addon.State.get("life_addon")
+      assert :error = Vagus.Addon.Registry.identity_for_token("does-not-matter")
+    end
+
+    test "start_slug on an unknown slug is :not_found" do
+      assert {:error, :not_found} =
+               Manager.start_slug("no-such-#{System.unique_integer([:positive])}")
+    end
+
+    test "restart round-trip: new token, options.json rewritten", %{config: config, data_root: dr} do
+      assert {:ok, %{access_token: token1}} =
+               Manager.start(config, backend: __MODULE__.FakeBackend, data_root: dr)
+
+      assert {:ok, %{access_token: token2}} =
+               Manager.restart("life_addon", backend: __MODULE__.FakeBackend, data_root: dr)
+
+      assert token1 != token2
+      assert_received {:stop, "addon_life_addon"}
+      assert_received {:remove, "addon_life_addon"}
+      assert_received {:create, _spec}
+
+      opts_path = Path.join([dr, "addons", "data", "life_addon", "options.json"])
+      assert File.exists?(opts_path)
+    end
+
+    test "restart on an unknown slug is :not_found" do
+      assert {:error, :not_found} =
+               Manager.restart("no-such-#{System.unique_integer([:positive])}")
+    end
+
+    test "uninstall on an unknown slug is :not_found" do
+      assert {:error, :not_found} =
+               Manager.uninstall("no-such-#{System.unique_integer([:positive])}")
+    end
+
+    test "uninstall purges State + the data dir + discovery + services", %{
+      config: config,
+      data_root: dr
+    } do
+      assert {:ok, _} = Manager.start(config, backend: __MODULE__.FakeBackend, data_root: dr)
+      data_dir = Path.join([dr, "addons", "data", "life_addon"])
+      assert File.dir?(data_dir)
+
+      {:ok, _message} = Vagus.Discovery.add("life_addon", "mqtt", %{})
+      :ok = Vagus.Services.set("mqtt", %{"host" => "h", "port" => 1}, "life_addon")
+
+      assert :ok = Manager.uninstall("life_addon", backend: __MODULE__.FakeBackend, data_root: dr)
+
+      refute File.exists?(data_dir)
+      assert :error = Vagus.Addon.State.get("life_addon")
+      refute Enum.any?(Vagus.Discovery.list(), &(&1.addon == "life_addon"))
+      assert :error = Vagus.Services.get("mqtt")
+    end
+
+    test "uninstall refuses to rm_rf outside the data dir for a slug that fails the safety regex",
+         %{data_root: dr} do
+      hostile = %Config{
+        name: "Hostile",
+        version: "1",
+        slug: "../evil",
+        description: "d",
+        arch: ["amd64"],
+        image: "x/y"
+      }
+
+      :ok = Vagus.Addon.State.put(hostile, :stopped)
+
+      # `<data_root>/addons/data/../evil` resolves to `<data_root>/addons/evil`
+      # — this is exactly what an unguarded rm_rf would delete.
+      escape_dir = Path.join(dr, "addons/evil")
+      File.mkdir_p!(escape_dir)
+      sentinel = Path.join(escape_dir, "sentinel.txt")
+      File.write!(sentinel, "keep me")
+
+      assert {:error, _reason} =
+               Manager.uninstall("../evil", backend: __MODULE__.FakeBackend, data_root: dr)
+
+      assert File.exists?(sentinel)
+      Vagus.Addon.State.delete("../evil")
+    end
+  end
+
   defmodule FakeBackend do
     @behaviour Vagus.Addon.Backend
 
@@ -191,10 +317,10 @@ defmodule Vagus.Addon.ManagerTest do
     def start(id), do: notify({:start, id}) && :ok
 
     @impl true
-    def stop(_id, _opts \\ []), do: :ok
+    def stop(id, _opts \\ []), do: notify({:stop, id}) && :ok
 
     @impl true
-    def remove(_id, _opts \\ []), do: :ok
+    def remove(id, _opts \\ []), do: notify({:remove, id}) && :ok
 
     @impl true
     def state(_id), do: {:ok, :running}
