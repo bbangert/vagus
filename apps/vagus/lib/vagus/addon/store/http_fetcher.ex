@@ -35,8 +35,13 @@ defmodule Vagus.Addon.Store.HTTPFetcher do
 
   defp codeload_url(url, ref) do
     case Regex.run(~r{github\.com[/:]([^/]+)/([^/.]+)}, url) do
-      [_, owner, repo] -> {:ok, "https://codeload.github.com/#{owner}/#{repo}/tar.gz/#{ref}"}
-      _ -> {:error, {:unsupported_repo_url, url}}
+      [_, owner, repo] ->
+        # Encode the ref — a branch/tag can contain `/` or other path-unsafe
+        # characters that would otherwise reshape the URL.
+        {:ok, "https://codeload.github.com/#{owner}/#{repo}/tar.gz/#{URI.encode(ref)}"}
+
+      _ ->
+        {:error, {:unsupported_repo_url, url}}
     end
   end
 

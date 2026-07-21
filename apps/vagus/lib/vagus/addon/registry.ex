@@ -53,11 +53,18 @@ defmodule Vagus.Addon.Registry do
   """
   @spec identity_from_config(Vagus.Addon.Config.t()) :: identity()
   def identity_from_config(config) do
+    # `services:` entries are `"service:role"`; tolerate a malformed entry with
+    # no `:` (grant it no role) rather than crashing registration on a bad
+    # config.yaml.
     services_role =
-      Map.new(config.services, fn s ->
-        [service, role] = String.split(s, ":", parts: 2)
-        {service, role}
+      config.services
+      |> Enum.flat_map(fn s ->
+        case String.split(s, ":", parts: 2) do
+          [service, role] -> [{service, role}]
+          [_service] -> []
+        end
       end)
+      |> Map.new()
 
     %{
       slug: config.slug,

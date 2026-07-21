@@ -74,6 +74,13 @@ defmodule Vagus.API.AddonInfoRouterTest do
     assert call("/addons/core_mosquitto/stats", [{"x-supervisor-token", token}]).status == 403
   end
 
+  test "a slug with path/ref-unsafe characters is rejected (403), not interpolated" do
+    conn = call("/addons/bad;slug/stats", [{"authorization", "Bearer #{Vagus.API.Token.get()}"}])
+    assert conn.status == 403
+    conn = call("/addons/bad;slug/info", [{"authorization", "Bearer #{Vagus.API.Token.get()}"}])
+    assert conn.status == 403
+  end
+
   test "/core/stats returns the zero CoreStats shape when no container configured" do
     conn = call("/core/stats", [{"authorization", "Bearer #{Vagus.API.Token.get()}"}])
     assert conn.status == 200

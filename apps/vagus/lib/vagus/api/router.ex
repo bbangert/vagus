@@ -693,12 +693,24 @@ defmodule Vagus.API.Router do
   end
 
   # Resolve the slug an info request may read: the supervisor (Core) may read
-  # any slug; an add-on may read `self` or its own slug, nothing else.
-  defp resolve_info_slug(slug, :supervisor), do: {:ok, slug}
+  # any slug; an add-on may read `self` or its own slug, nothing else. The
+  # supervisor slug comes from the URL, so validate it before it's interpolated
+  # into a container ref (`addon_<slug>`) or the `options.json` path — a `/` or
+  # `..` must never shape a Docker ref or traverse the data root.
+  defp resolve_info_slug(slug, :supervisor) do
+    if valid_slug?(slug), do: {:ok, slug}, else: {:error, :forbidden}
+  end
+
   defp resolve_info_slug("self", {:addon, %{slug: own}}), do: {:ok, own}
   defp resolve_info_slug(own, {:addon, %{slug: own}}), do: {:ok, own}
   defp resolve_info_slug(_slug, {:addon, _}), do: {:error, :forbidden}
   defp resolve_info_slug(_slug, _caller), do: {:error, :forbidden}
+
+  # Add-on slugs are `RE_SLUG` (`[A-Za-z0-9._-]`); additionally forbid `..` so
+  # the value is safe both as a Docker ref suffix and a path component.
+  defp valid_slug?(slug) do
+    Regex.match?(~r/\A[A-Za-z0-9_.-]+\z/, slug) and not String.contains?(slug, "..")
+  end
 
   # -- addon self-config helper ----------------------------------------------
 

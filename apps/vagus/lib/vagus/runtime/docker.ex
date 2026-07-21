@@ -383,10 +383,15 @@ defmodule Vagus.Runtime.Docker do
        |> Enum.map_join("&", fn {k, v} -> "#{k}=#{URI.encode_www_form(to_string(v))}" end))
   end
 
+  # The tag is the part after the last ":" that follows the last "/", so a
+  # registry `host:port` before the path isn't mistaken for a tag
+  # (e.g. `ghcr.io:443/org/img:1.0` → repo `ghcr.io:443/org/img`, tag `1.0`).
   defp split_image(image) do
-    case String.split(image, ":", parts: 2) do
-      [repo, tag] -> {repo, tag}
-      [repo] -> {repo, "latest"}
+    last_segment = image |> String.split("/") |> List.last()
+
+    case String.split(last_segment, ":", parts: 2) do
+      [_name, tag] -> {String.replace_suffix(image, ":" <> tag, ""), tag}
+      [_name] -> {image, "latest"}
     end
   end
 

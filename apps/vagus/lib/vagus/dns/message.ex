@@ -79,17 +79,17 @@ defmodule Vagus.DNS.Message do
   # that isn't a 1..63 length or the `0` terminator is rejected.
   defp parse_question(data), do: parse_q(data, 0, [])
 
+  # Out of bytes before a terminator → malformed. The explicit guard keeps every
+  # `:binary.at`/`binary_part` below in-bounds, so no rescue-as-control-flow.
+  defp parse_q(data, pos, _acc) when pos >= byte_size(data), do: :error
+
   defp parse_q(data, pos, acc) do
     case :binary.at(data, pos) do
-      0 ->
-        if byte_size(data) >= pos + 5 do
-          qtype = :binary.decode_unsigned(binary_part(data, pos + 1, 2))
-          qclass = :binary.decode_unsigned(binary_part(data, pos + 3, 2))
-          name = acc |> Enum.reverse() |> Enum.join(".") |> String.downcase()
-          {:ok, name, qtype, qclass, binary_part(data, 0, pos + 5)}
-        else
-          :error
-        end
+      0 when byte_size(data) >= pos + 5 ->
+        qtype = :binary.decode_unsigned(binary_part(data, pos + 1, 2))
+        qclass = :binary.decode_unsigned(binary_part(data, pos + 3, 2))
+        name = acc |> Enum.reverse() |> Enum.join(".") |> String.downcase()
+        {:ok, name, qtype, qclass, binary_part(data, 0, pos + 5)}
 
       len when len in 1..63 and byte_size(data) >= pos + 1 + len ->
         parse_q(data, pos + 1 + len, [binary_part(data, pos + 1, len) | acc])
@@ -97,7 +97,5 @@ defmodule Vagus.DNS.Message do
       _ ->
         :error
     end
-  rescue
-    _ -> :error
   end
 end
