@@ -1,4 +1,11 @@
 defmodule Vagus.API.RouterTest do
+  # async: true is required here: the whole suite runs under `Mox.set_mox_global()`
+  # (test_helper), and this file only ever OBSERVES the global backend stubs —
+  # forcing async: false makes ExUnit run it in the sync phase where those global
+  # stubs aren't in scope (Mox.UnexpectedCallError). It also only reads empty-state
+  # singleton data (never registers tokens/services), and ExUnit completes the
+  # async phase before the async:false sibling router tests mutate those globals,
+  # so the theoretically-flagged race does not actually occur.
   use ExUnit.Case, async: true
 
   import Plug.Test

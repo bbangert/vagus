@@ -74,11 +74,25 @@ defmodule Vagus.Addon.Manager do
          :ok <- write_options(config, data_root, Keyword.get(opts, :user_options, %{})),
          :ok <- maybe_ensure_network(config, opts),
          {:ok, id} <- backend(opts).create(spec),
-         :ok <- backend(opts).start(id) do
+         :ok <- start_or_cleanup(id, opts) do
       register_identity(config, token)
       record_state(config)
       register_dns(config, id, opts)
       {:ok, %{id: id, access_token: token}}
+    end
+  end
+
+  # Start the created container; if start fails, remove it (best-effort) so a
+  # retry doesn't collide on the fixed `addon_<slug>` name with an orphaned,
+  # created-but-unstarted container.
+  defp start_or_cleanup(id, opts) do
+    case backend(opts).start(id) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        _ = backend(opts).remove(id)
+        {:error, {:start_failed, reason}}
     end
   end
 

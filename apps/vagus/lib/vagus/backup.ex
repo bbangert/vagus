@@ -16,6 +16,10 @@ defmodule Vagus.Backup do
   """
 
   @version 2
+  # Bomb guards: the outer tar is uncompressed so its own size is the bound;
+  # inner add-on tars are gzip'd, so their gunzip is capped during inflation.
+  @max_outer 536_870_912
+  @max_inner_uncompressed 268_435_456
 
   @type addon_spec :: %{
           slug: String.t(),
@@ -48,7 +52,8 @@ defmodule Vagus.Backup do
   """
   @spec read(binary()) :: {:ok, map()} | {:error, term()}
   def read(tar) when is_binary(tar) do
-    with {:ok, entries} <- untar(tar, compressed: false),
+    with :ok <- guard_outer_size(tar),
+         {:ok, entries} <- untar_plain(tar),
          {:ok, json} <- fetch_member(entries, "backup.json"),
          {:ok, backup} <- Jason.decode(json) do
       {:ok, %{backup: backup, members: Enum.map(entries, fn {name, _} -> name end)}}
@@ -63,21 +68,37 @@ defmodule Vagus.Backup do
   @spec extract_addon(binary(), String.t()) ::
           {:ok, %{addon: map(), data: [{String.t(), binary()}]}} | {:error, term()}
   def extract_addon(tar, slug) when is_binary(tar) do
-    with {:ok, entries} <- untar(tar, compressed: false),
+    with :ok <- guard_outer_size(tar),
+         {:ok, entries} <- untar_plain(tar),
          {:ok, inner_gz} <- member(entries, "#{slug}.tar.gz"),
-         {:ok, inner} <- untar(inner_gz, compressed: true),
+         {:ok, inner} <- Vagus.Targz.extract_capped(inner_gz, @max_inner_uncompressed),
          {:ok, addon_json} <- fetch_member(inner, "addon.json"),
-         {:ok, addon} <- Jason.decode(addon_json) do
-      data =
-        for {name, content} <- inner, String.starts_with?(strip_dot(name), "data/") do
-          {String.replace_prefix(strip_dot(name), "data/", ""), content}
-        end
-
+         {:ok, addon} <- Jason.decode(addon_json),
+         {:ok, data} <- collect_data(inner) do
       {:ok, %{addon: addon, data: data}}
     else
       :error -> {:error, :not_in_backup}
       other -> other
     end
+  end
+
+  # `data/` files as {relpath, content}, rejecting any member that escapes the
+  # add-on dir (`..`/absolute) — a hostile backup must not write outside /data
+  # when a future restore materializes these as root (zip-slip).
+  defp collect_data(inner) do
+    Enum.reduce_while(inner, {:ok, []}, fn {name, content}, {:ok, acc} ->
+      rel = strip_dot(name)
+
+      cond do
+        not String.starts_with?(rel, "data/") -> {:cont, {:ok, acc}}
+        unsafe_path?(rel) -> {:halt, {:error, {:unsafe_path, rel}}}
+        true -> {:cont, {:ok, [{String.replace_prefix(rel, "data/", ""), content} | acc]}}
+      end
+    end)
+  end
+
+  defp unsafe_path?(path) do
+    String.starts_with?(path, "/") or ".." in Path.split(path)
   end
 
   ## backup.json
@@ -177,10 +198,15 @@ defmodule Vagus.Backup do
     end
   end
 
-  defp untar(bin, compressed: compressed?) do
-    opts = if compressed?, do: [:memory, :compressed], else: [:memory]
+  # Reject an oversized outer tar before extraction (it's uncompressed, so its
+  # byte size is its real size — no gunzip amplification here).
+  defp guard_outer_size(tar) when byte_size(tar) > @max_outer, do: {:error, :too_large}
+  defp guard_outer_size(_tar), do: :ok
 
-    case :erl_tar.extract({:binary, bin}, opts) do
+  # The outer tar is plain (uncompressed); inner add-on tars are gunzipped via
+  # the capped `Vagus.Targz` path instead.
+  defp untar_plain(bin) do
+    case :erl_tar.extract({:binary, bin}, [:memory]) do
       {:ok, entries} -> {:ok, Enum.map(entries, fn {n, c} -> {to_string(n), c} end)}
       {:error, reason} -> {:error, {:untar, reason}}
     end

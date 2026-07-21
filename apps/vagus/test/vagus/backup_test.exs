@@ -71,6 +71,37 @@ defmodule Vagus.BackupTest do
     assert {:error, _} = Backup.read("not a tar at all")
   end
 
+  test "extract_addon refuses a data member that escapes /data (zip-slip, W4)" do
+    # Hand-build a malicious backup: inner tar with a `data/../escape` member.
+    inner =
+      build_tar(
+        [
+          {~c"./addon.json", ~s({"version":"1","state":"started"})},
+          {~c"./data/../escape.txt", "pwned"}
+        ],
+        compressed: true
+      )
+
+    outer = build_tar([{~c"./evil.tar.gz", inner}], compressed: false)
+
+    case Backup.extract_addon(outer, "evil") do
+      {:error, {:unsafe_path, _}} -> :ok
+      {:ok, %{data: data}} -> refute Enum.any?(data, fn {p, _} -> String.contains?(p, "..") end)
+    end
+  end
+
+  # Build a tar in memory (mirrors Vagus.Backup's own erl_tar temp-file sink).
+  defp build_tar(members, compressed: compressed?) do
+    path = Path.join(System.tmp_dir!(), "vagus-mal-#{System.unique_integer([:positive])}.tar")
+    open = if compressed?, do: [:write, :compressed], else: [:write]
+    {:ok, t} = :erl_tar.open(String.to_charlist(path), open)
+    Enum.each(members, fn {n, b} -> :ok = :erl_tar.add(t, b, n, []) end)
+    :ok = :erl_tar.close(t)
+    bin = File.read!(path)
+    File.rm(path)
+    bin
+  end
+
   test "an add-on with no data dir still backs up (empty data)", %{data: _data} do
     s = %{
       slug: "b",

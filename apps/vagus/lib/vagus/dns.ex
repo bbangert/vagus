@@ -27,6 +27,9 @@ defmodule Vagus.DNS do
   alias Vagus.Network
 
   @forward_timeout 2_000
+  # Cap concurrent upstream relays so a flood of un-owned queries can't exhaust
+  # processes/file descriptors.
+  @max_inflight 64
 
   def start_link(opts \\ []) do
     GenServer.start_link(__MODULE__, opts, name: Keyword.get(opts, :name, __MODULE__))
@@ -68,6 +71,7 @@ defmodule Vagus.DNS do
       port: Keyword.get(opts, :port, Application.get_env(:vagus, :dns_port, 53)),
       static: static_zone(),
       dynamic: %{},
+      inflight: 0,
       upstream:
         parse_upstream(Keyword.get(opts, :upstream, Application.get_env(:vagus, :dns_upstream)))
     }
@@ -106,8 +110,11 @@ defmodule Vagus.DNS do
 
   @impl GenServer
   def handle_info({:udp, socket, host, port, packet}, %{socket: socket} = state) do
-    handle_packet(packet, host, port, state)
-    {:noreply, state}
+    {:noreply, handle_packet(packet, host, port, state)}
+  end
+
+  def handle_info(:forward_done, state) do
+    {:noreply, %{state | inflight: max(state.inflight - 1, 0)}}
   end
 
   def handle_info(:retry_bind, %{socket: nil} = state), do: {:noreply, try_bind(state)}
@@ -117,6 +124,7 @@ defmodule Vagus.DNS do
 
   ## Query handling
 
+  # Returns the (possibly inflight-incremented) state.
   defp handle_packet(packet, host, port, state) do
     case Message.parse_query(packet) do
       {:ok, %{qtype: qtype} = query} ->
@@ -128,6 +136,7 @@ defmodule Vagus.DNS do
             # upstream's NXDOMAIN for the AAAA as "the name doesn't exist".
             ips = if qtype == Message.type_a(), do: [ip], else: []
             reply(state.socket, host, port, Message.answer(query, ips))
+            state
 
           :error ->
             forward_or_nxdomain(packet, query, host, port, state)
@@ -135,7 +144,7 @@ defmodule Vagus.DNS do
 
       {:error, _reason} ->
         # Unparseable (e.g. multi-question) — forward raw if we can, else drop.
-        if state.upstream, do: forward(packet, host, port, state)
+        if state.upstream, do: forward(packet, host, port, state), else: state
     end
   end
 
@@ -144,24 +153,42 @@ defmodule Vagus.DNS do
       forward(packet, host, port, state)
     else
       reply(state.socket, host, port, Message.nxdomain(query))
+      state
     end
   end
 
   # Relay the raw query to the upstream resolver from a throwaway process so a
   # slow upstream never blocks the server; the answer goes back out our socket.
-  defp forward(packet, host, port, %{socket: socket, upstream: upstream}) do
+  # Bounded by `@max_inflight` (drop over the cap) so a flood of misses can't
+  # exhaust processes/FDs; the ephemeral socket is always closed (`try/after`),
+  # and `:forward_done` decrements the in-flight counter when the relay ends.
+  defp forward(_packet, _host, _port, %{inflight: n} = state) when n >= @max_inflight, do: state
+
+  defp forward(packet, host, port, %{socket: socket, upstream: upstream} = state) do
+    server = self()
+
     spawn(fn ->
-      with {:ok, s} <- :gen_udp.open(0, [:binary, active: false]),
-           :ok <- :gen_udp.send(s, upstream, 53, packet),
-           {:ok, {_ip, _p, resp}} <- :gen_udp.recv(s, 0, @forward_timeout) do
-        :gen_udp.send(socket, host, port, resp)
-        :gen_udp.close(s)
-      else
-        _ -> :ok
+      try do
+        case :gen_udp.open(0, [:binary, active: false]) do
+          {:ok, s} ->
+            try do
+              with :ok <- :gen_udp.send(s, upstream, 53, packet),
+                   {:ok, {_ip, _p, resp}} <- :gen_udp.recv(s, 0, @forward_timeout) do
+                :gen_udp.send(socket, host, port, resp)
+              end
+            after
+              :gen_udp.close(s)
+            end
+
+          {:error, _reason} ->
+            :ok
+        end
+      after
+        send(server, :forward_done)
       end
     end)
 
-    :ok
+    %{state | inflight: state.inflight + 1}
   end
 
   defp reply(nil, _host, _port, _packet), do: :ok

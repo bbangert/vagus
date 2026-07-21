@@ -27,10 +27,20 @@ defmodule Vagus.Addon.Store do
     GenServer.start_link(__MODULE__, opts, name: Keyword.get(opts, :name, __MODULE__))
   end
 
-  @doc "Re-fetches every repository and rebuilds the catalog. Returns `{:ok, count}`."
+  @doc """
+  Re-fetches every repository and rebuilds the catalog. Returns `{:ok, count}`.
+
+  The (slow, network-bound) fetch runs in the **caller's** process, not the
+  GenServer — only a fast snapshot read and catalog swap touch the server — so a
+  concurrent `catalog/0`/`get/1` (e.g. Core polling `/store`) is never blocked
+  behind a reload.
+  """
   @spec reload(GenServer.server()) :: {:ok, non_neg_integer()}
   def reload(server \\ __MODULE__) do
-    GenServer.call(server, :reload, 120_000)
+    {repositories, fetcher} = GenServer.call(server, :snapshot)
+    catalog = build_catalog(repositories, fetcher)
+    :ok = GenServer.call(server, {:put_catalog, catalog})
+    {:ok, map_size(catalog)}
   end
 
   @doc "All catalog entries as `%{store_slug => %{config, repository}}`."
@@ -65,9 +75,12 @@ defmodule Vagus.Addon.Store do
   end
 
   @impl GenServer
-  def handle_call(:reload, _from, state) do
-    catalog = build_catalog(state.repositories, state.fetcher)
-    {:reply, {:ok, map_size(catalog)}, %{state | catalog: catalog}}
+  def handle_call(:snapshot, _from, state) do
+    {:reply, {state.repositories, state.fetcher}, state}
+  end
+
+  def handle_call({:put_catalog, catalog}, _from, state) do
+    {:reply, :ok, %{state | catalog: catalog}}
   end
 
   def handle_call(:catalog, _from, state), do: {:reply, state.catalog, state}

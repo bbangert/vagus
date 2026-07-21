@@ -31,6 +31,20 @@ defmodule Vagus.DNS.MessageTest do
     assert {:error, _} = Message.parse_query(<<1, 2, 3>>)
   end
 
+  test "rejects a compression-pointer / out-of-range label-length byte" do
+    hdr = <<0x1::16, 0x0100::16, 1::16, 0::16, 0::16, 0::16>>
+    # 0xC0 = compression pointer high bits (not valid as a question label length)
+    assert {:error, _} = Message.parse_query(hdr <> <<0xC0, 5, "xxxxx", 0, 1::16, 1::16>>)
+    # 64 is > the 63-byte label max
+    assert {:error, _} = Message.parse_query(hdr <> <<64, "x", 0, 1::16, 1::16>>)
+  end
+
+  test "rejects a label that runs past the buffer" do
+    hdr = <<0x1::16, 0x0100::16, 1::16, 0::16, 0::16, 0::16>>
+    # claims a 10-byte label but only 3 bytes follow
+    assert {:error, _} = Message.parse_query(hdr <> <<10, "abc">>)
+  end
+
   test "answer echoes the question and appends an A record" do
     {:ok, q} = Message.parse_query(query("supervisor", 0xABCD))
     resp = Message.answer(q, [{172, 30, 32, 2}])

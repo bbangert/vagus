@@ -9,10 +9,13 @@ defmodule Vagus.Auth do
   (authenticated as the Supervisor via `Vagus.Core.Client`); a `200` means the
   credentials are valid and the pair is remembered.
 
-  The cache is keyed by `sha256("username:password")`. The real Supervisor
-  additionally 19-round-rehashes with a per-process salt, but that detail is
-  purely internal — the cache never crosses any wire — so a plain sha256 key is
-  equivalent for interop while still never holding a plaintext password.
+  The cache is keyed by `sha256(term_to_binary({username, password}))`
+  (unambiguous — a `"user:pass"` join would collide across field boundaries)
+  and entries expire after `@ttl_seconds` so a rotated password stops working.
+  The real Supervisor additionally 19-round-rehashes with a per-process salt,
+  but that detail is purely internal — the cache never crosses any wire — so a
+  plain sha256 key is equivalent for interop while never holding a plaintext
+  password.
   """
 
   use GenServer
@@ -62,8 +65,11 @@ defmodule Vagus.Auth do
     Application.get_env(:vagus, :core_client, Vagus.Core.Client)
   end
 
+  # Hash the pair unambiguously: a `"#{u}:#{p}"` join is non-injective
+  # (`{"a:b","c"}` and `{"a","b:c"}` collide), which would let a cached login
+  # authenticate a *different* username/password split without re-checking Core.
   defp cache_key(username, password) do
-    :crypto.hash(:sha256, "#{username}:#{password}")
+    :crypto.hash(:sha256, :erlang.term_to_binary({username, password}))
   end
 
   defp cached?(key, server), do: GenServer.call(server, {:cached?, key})
@@ -100,19 +106,34 @@ defmodule Vagus.Auth do
 
   ## GenServer
 
-  @impl GenServer
-  def init(_opts), do: {:ok, MapSet.new()}
+  # Cached logins expire so a rotated/revoked HA password stops authenticating
+  # without a manual `DELETE /auth/cache`.
+  @ttl_seconds 300
 
   @impl GenServer
+  def init(_opts), do: {:ok, %{}}
+
+  # Prune the entry on read if it has expired (returns false, drops it).
+  @impl GenServer
   def handle_call({:cached?, key}, _from, cache) do
-    {:reply, MapSet.member?(cache, key), cache}
+    case Map.get(cache, key) do
+      nil ->
+        {:reply, false, cache}
+
+      inserted ->
+        if now() - inserted < @ttl_seconds,
+          do: {:reply, true, cache},
+          else: {:reply, false, Map.delete(cache, key)}
+    end
   end
 
   def handle_call({:remember, key}, _from, cache) do
-    {:reply, :ok, MapSet.put(cache, key)}
+    {:reply, :ok, Map.put(cache, key, now())}
   end
 
   def handle_call(:reset, _from, _cache) do
-    {:reply, :ok, MapSet.new()}
+    {:reply, :ok, %{}}
   end
+
+  defp now, do: System.monotonic_time(:second)
 end

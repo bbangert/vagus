@@ -14,6 +14,8 @@ defmodule Vagus.Addon.Store.HTTPFetcher do
 
   @finch Vagus.Core.Finch
   @max_archive 33_554_432
+  # Hard cap on the DECOMPRESSED archive so a gzip bomb can't OOM the device.
+  @max_uncompressed 268_435_456
 
   @doc "Fetches + extracts `repository`'s archive. See the moduledoc."
   @spec fetch(map()) :: {:ok, [{String.t(), binary()}]} | {:error, term()}
@@ -54,16 +56,16 @@ defmodule Vagus.Addon.Store.HTTPFetcher do
     end
   end
 
-  # `:erl_tar` gives `[{charlist_path, content}]`; normalize paths to strings and
-  # drop the leading wrapper dir GitHub adds (`<repo>-<ref>/`).
+  # Bounded gunzip + in-memory tar extract (caps the decompressed size so a
+  # gzip bomb can't OOM), then normalize paths to strings and drop the leading
+  # wrapper dir GitHub adds (`<repo>-<ref>/`).
   defp extract(archive) do
-    case :erl_tar.extract({:binary, archive}, [:memory, :compressed]) do
+    case Vagus.Targz.extract_capped(archive, @max_uncompressed) do
       {:ok, entries} ->
-        {:ok,
-         Enum.map(entries, fn {path, content} -> {strip_wrapper(to_string(path)), content} end)}
+        {:ok, Enum.map(entries, fn {path, content} -> {strip_wrapper(path), content} end)}
 
       {:error, reason} ->
-        {:error, {:untar, reason}}
+        {:error, reason}
     end
   end
 

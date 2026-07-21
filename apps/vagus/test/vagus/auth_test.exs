@@ -67,6 +67,17 @@ defmodule Vagus.AuthTest do
     end)
   end
 
+  test "cache key does not collide across the user:pass boundary (B2)", %{cache: cache} do
+    # Cache ("alice", "x:y"); a differently-split pair ("alice:x", "y") must NOT
+    # be served from that cache entry — it must re-check Core.
+    with_core([{:ok, %{status: 200}}, {:ok, %{status: 401}}], fn ->
+      opts = [server: cache, core_client: StubCore]
+      assert Auth.check_login("alice", "x:y", "m", opts)
+      refute Auth.check_login("alice:x", "y", "m", opts)
+      assert length(core_calls()) == 2
+    end)
+  end
+
   test "reset_cache forces a re-check against Core", %{cache: cache} do
     with_core([{:ok, %{status: 200}}, {:ok, %{status: 200}}], fn ->
       opts = [server: cache, core_client: StubCore]

@@ -68,6 +68,23 @@ defmodule Vagus.Addon.StoreTest do
     assert map_size(catalog) == 2
   end
 
+  test "a single unparseable config.yaml is skipped; the rest of the repo still loads" do
+    defmodule BadFetcher do
+      def fetch(%{slug: "core"}) do
+        {:ok,
+         [
+           {"mosquitto/config.yaml", Vagus.Addon.StoreTest.mosquitto_yaml()},
+           # missing required fields (name/version/slug/...) → Config.parse errors
+           {"broken/config.yaml", "description: no required fields here\n"}
+         ]}
+      end
+    end
+
+    catalog = Store.build_catalog(@repos, BadFetcher)
+    assert Map.has_key?(catalog, "core_mosquitto")
+    assert map_size(catalog) == 1
+  end
+
   test "the Store GenServer reloads + serves the catalog" do
     srv = start_supervised!({Store, name: nil, fetcher: FixtureFetcher, repositories: @repos})
 
