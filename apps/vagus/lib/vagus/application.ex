@@ -46,6 +46,9 @@ defmodule Vagus.Application do
         Vagus.Auth
       ] ++
         dns_children() ++
+        events_children() ++
+        watchdog_children() ++
+        ingress_children() ++
         [
           # Supervisor-API emulator's HTTP surface (Bandit + Plug.Router),
           # isolated with its own restart budget so a crash there can't take
@@ -72,6 +75,41 @@ defmodule Vagus.Application do
   # does its real work on target.
   defp dns_children do
     if Application.get_env(:vagus, :dns_enabled, true), do: [Vagus.DNS], else: []
+  end
+
+  # The docker-events stream (M4B-IW-P1-T1), gated by `:events_enabled` (false
+  # in test.exs) — mirrors `:dns_enabled`. `mix test` has no real engine
+  # socket to stream from; unit tests start their own instance against a fake
+  # unix-socket server instead.
+  defp events_children do
+    if Application.get_env(:vagus, :events_enabled, true), do: [Vagus.Runtime.Events], else: []
+  end
+
+  # Both halves of the add-on watchdog (§B6 container-event +
+  # M4B-IW-P1-T3's §B7 application probe), gated together by
+  # `:watchdog_enabled` (false in test.exs) — mirrors `:events_enabled`.
+  # §B6.5: the two are independent code paths with independent state, but
+  # they share a single on/off switch since neither is useful without the
+  # other in practice. Isolated under `Vagus.Addon.Watchdog.Supervisor`
+  # (review W2) rather than as bare children here — see that module for the
+  # isolation rationale. Unit tests start their own instances with injected
+  # fakes instead of subscribing to the real `Vagus.Runtime.Events`/engine/
+  # `Vagus.Addon.State`.
+  defp watchdog_children do
+    if Application.get_env(:vagus, :watchdog_enabled, true) do
+      [Vagus.Addon.Watchdog.Supervisor]
+    else
+      []
+    end
+  end
+
+  # Ingress sessions + token resolution + dynamic-port allocator
+  # (M4B-IW-P2-T1, §B1/§B3), gated by `:ingress_enabled` (false in test.exs)
+  # — mirrors `:watchdog_enabled`. Router/unit tests `start_supervised` their
+  # own instance under the default name, which would clash with an
+  # app-started one.
+  defp ingress_children do
+    if Application.get_env(:vagus, :ingress_enabled, true), do: [Vagus.Ingress], else: []
   end
 
   # List all child processes to be supervised

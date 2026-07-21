@@ -10,6 +10,21 @@ config :vagus, :api_server_enabled, false
 # :api_server_enabled.
 config :vagus, :dns_enabled, false
 
+# Don't start the docker-events stream during `mix test` — there's no real
+# engine socket to connect to. Mirrors :dns_enabled; the events unit tests
+# start their own instance against a fake unix-socket server.
+config :vagus, :events_enabled, false
+
+# Don't start the container-event watchdog during `mix test` — same
+# rationale as :events_enabled; watchdog unit tests start their own
+# instance with injected fakes.
+config :vagus, :watchdog_enabled, false
+
+# Don't start the ingress session store during `mix test` — ingress
+# unit/router tests `start_supervised` their own instance under the default
+# name, which would clash with an app-started one. Mirrors :watchdog_enabled.
+config :vagus, :ingress_enabled, false
+
 # Strict-mode Vagus.API.Model: an undeclared/missing key raises instead of
 # just being logged, so a drifted field list fails the test suite loudly.
 config :vagus, :model_strict, true
