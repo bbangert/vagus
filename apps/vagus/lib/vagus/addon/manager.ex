@@ -163,13 +163,17 @@ defmodule Vagus.Addon.Manager do
   (`Vagus.Services.delete_by_slug/1`), drop its `Registry`/`DNS`/`State`
   entries, then `File.rm_rf` its data dir (`<data_root>/addons/data/<slug>`).
 
-  The data-dir removal is gated on `slug` matching a safe directory-name
-  charset (`~r/^[-_a-z0-9]+$/`) — `slug` is interpolated straight into that
-  rm_rf path, so a slug that fails the check (which should never happen for
-  a config `Vagus.Addon.Config.parse/1` produced, but this is cheap insurance
-  against a hand-built/corrupted `State` entry) is skipped rather than risk
-  deleting outside the add-on's own data dir; `{:error, {:invalid_slug, _}}`
-  is returned in that case (every other step still runs).
+  The data-dir removal is gated on `Vagus.Addon.Config.valid_slug?/1` (W3) —
+  `slug` is interpolated straight into that rm_rf path, so a slug that fails
+  the check is skipped rather than risk deleting outside the add-on's own
+  data dir; `{:error, {:invalid_slug, _}}` is returned in that case (every
+  other step still runs). `valid_slug?/1` is the same charset
+  `Config.parse/1` itself enforces (permissive of uppercase/dots), plus an
+  explicit `.`/`..`/`/` reject — so, unlike this guard's previous
+  lowercase-only regex (which any uppercase- or dot-containing, otherwise
+  perfectly valid, `Config.parse/1`-produced slug would fail, silently
+  orphaning that add-on's data dir on every uninstall), a real parsed config
+  can only ever fail this check via one of those degenerate `.`/`..` tokens.
   """
   @spec uninstall(String.t(), keyword()) :: :ok | {:error, :not_found} | {:error, term()}
   def uninstall(slug, opts \\ []) do
@@ -455,15 +459,8 @@ defmodule Vagus.Addon.Manager do
     :ok
   end
 
-  # Directory-name-safe charset for a slug interpolated into the data-dir
-  # rm_rf path — deliberately stricter than `Vagus.Addon.Config`'s own slug
-  # regex (which allows `.` and uppercase): this is the last line of defense
-  # against a destructive rm_rf, so it only accepts what a real store/config
-  # slug actually looks like.
-  @slug_dir_re ~r/^[-_a-z0-9]+$/
-
   defp remove_data_dir(slug, opts) do
-    if Regex.match?(@slug_dir_re, slug) do
+    if Config.valid_slug?(slug) do
       File.rm_rf(Path.join([data_root(opts), "addons", "data", slug]))
       :ok
     else

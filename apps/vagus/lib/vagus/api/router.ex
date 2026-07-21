@@ -71,15 +71,22 @@ defmodule Vagus.API.Router do
   # available") and wedges in ConfigEntryNotReady. The real Supervisor
   # (aiohttp server) tolerates these, so we must too.
   #
+  # No `:multipart` parser here (B1 fix). An earlier revision carved out a
+  # 256MB multipart `length:` override on this same router-wide plug, which
+  # runs BEFORE `Vagus.API.Auth` — so an unauthenticated multipart POST to
+  # ANY path would spool up to 256MB to disk with no token at all,
+  # exhausting a 1GB device's disk/FDs under concurrent requests (exactly
+  # the memory-pressure attack the 64KB default below exists to prevent).
   # `POST /backups/new/upload` is the one route that legitimately needs a
-  # large body (a backup tar). Rather than raise the shared 64KB cap for
-  # every route, the `{:multipart, length: ...}` tuple form overrides the
-  # length just for the multipart parser — json/urlencoded (everything else)
-  # stay at the tight 64KB bound. Plug spools multipart file parts to disk
-  # (`Plug.Upload`) as they're read, so this doesn't buffer the whole upload
-  # in memory either.
+  # large multipart body (a backup tar); it now parses its own still-unread
+  # body itself, route-locally, AFTER `Vagus.API.Auth` and the
+  # supervisor-only check have both run (see `handle_backup_upload/1`'s
+  # `parse_multipart/1`). Every other multipart POST — including a
+  # non-supervisor caller hitting this same route — passes through here
+  # completely unread (`pass: ["*/*"]` below), so it's never spooled to disk
+  # pre-auth.
   plug(Plug.Parsers,
-    parsers: [:json, :urlencoded, {:multipart, length: 268_435_456}],
+    parsers: [:json, :urlencoded],
     pass: ["*/*"],
     json_decoder: Jason,
     length: 65_536
@@ -988,23 +995,57 @@ defmodule Vagus.API.Router do
     end
   end
 
+  # Memoized `Plug.Parsers.init/1` result for the route-local multipart parse
+  # below — `init/1` only normalizes options into an opaque tuple, so
+  # computing it once at compile time (rather than per-request) is safe.
+  @multipart_parser_opts Plug.Parsers.init(parsers: [{:multipart, length: 268_435_456}], pass: [])
+
   # The uploaded tar's bytes are validated by `Backups.put_file/1` itself
   # (`Vagus.Backup.read/1`) — any field name is accepted (the first
   # `%Plug.Upload{}` found in the parsed multipart params is used), matching
   # the real Supervisor's tolerance of arbitrary multipart field naming.
+  #
+  # Multipart parsing happens HERE (B1), not on the router-wide
+  # `Plug.Parsers` — by the time this runs, `Vagus.API.Auth` and
+  # `supervisor_only/2` (this route's caller only reaches here through that
+  # wrapper) have already gated the request to an authenticated supervisor
+  # caller, so the 256MB/disk-spooling multipart parse only ever happens for
+  # that caller. The body is still unread at this point (the router-wide
+  # parser passed it through, `pass: ["*/*"]`), so `parse_multipart/1` is
+  # reading it for the first time.
   defp handle_backup_upload(conn) do
-    case first_upload(conn.body_params) do
-      {:ok, %Plug.Upload{path: path}} ->
-        with {:ok, tar} <- File.read(path),
-             {:ok, slug} <- Backups.put_file(tar) do
-          Envelope.send_ok(conn, %{slug: slug})
-        else
-          _ -> Envelope.send_error(conn, "invalid backup file", 400)
+    case parse_multipart(conn) do
+      {:ok, conn} ->
+        case first_upload(conn.body_params) do
+          {:ok, %Plug.Upload{path: path}} ->
+            with {:ok, tar} <- File.read(path),
+                 {:ok, slug} <- Backups.put_file(tar) do
+              Envelope.send_ok(conn, %{slug: slug})
+            else
+              _ -> Envelope.send_error(conn, "invalid backup file", 400)
+            end
+
+          :error ->
+            Envelope.send_error(conn, "no file uploaded", 400)
         end
 
-      :error ->
-        Envelope.send_error(conn, "no file uploaded", 400)
+      {:error, conn} ->
+        Envelope.send_error(conn, "invalid backup upload", 400)
     end
+  end
+
+  # `pass: []` on this route-local parser means a non-multipart content-type
+  # raises `Plug.Parsers.UnsupportedMediaTypeError` (this route has no other
+  # valid upload method) rather than silently passing through unparsed; a
+  # malformed multipart body raises `Plug.Parsers.ParseError`. Both are
+  # honest 400s here rather than falling through to the router's generic
+  # `Plug.ErrorHandler`/`handle_errors/2`, which would 415/500 them.
+  defp parse_multipart(conn) do
+    {:ok, Plug.Parsers.call(conn, @multipart_parser_opts)}
+  rescue
+    e in [Plug.Parsers.ParseError, Plug.Parsers.UnsupportedMediaTypeError] ->
+      Logger.debug("Vagus.API.Router: multipart upload parse failed: #{Exception.message(e)}")
+      {:error, conn}
   end
 
   defp first_upload(params) when is_map(params) do

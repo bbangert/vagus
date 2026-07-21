@@ -30,6 +30,17 @@ defmodule Vagus.Runtime.Docker do
   # request against the root socket — reject at the boundary.
   @ref_re ~r/^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/
 
+  # Docker image-reference allowlist (W1) — a real ref legitimately contains
+  # `/` (repo namespace) and `:` (tag/registry port), so it can't reuse
+  # `@ref_re`'s container-id charset; this instead allowlists the actual
+  # docker-reference charset (`[a-zA-Z0-9._:@/-]`) rather than blocklisting
+  # a handful of "dangerous" sequences, since a blocklist only ever covers
+  # the sequences someone thought of. `..` is additionally rejected even
+  # though the charset already permits `.`, since `a/../b`-style segments
+  # could otherwise rewrite the request path; a leading `/` is rejected too
+  # (belt-and-suspenders — the anchored `^[a-zA-Z0-9]` already excludes it).
+  @image_ref_re ~r"^[a-zA-Z0-9][a-zA-Z0-9._:@/-]*$"
+
   @typedoc "A decoded Engine-API response."
   @type response :: %{
           status: non_neg_integer(),
@@ -85,8 +96,9 @@ defmodule Vagus.Runtime.Docker do
 
   Unlike a container/network id, an image ref legitimately contains `/`
   (repo namespace) and `:` (tag), so it can't reuse `ensure_ref/1`'s
-  container-id charset; `ensure_image_ref/1` instead only rejects the
-  sequences that could still break out of the request path.
+  container-id charset; `ensure_image_ref/1` instead allowlists the
+  docker-reference charset (W1 — this used to be a 3-item blocklist, which
+  only ever covers the sequences someone thought of).
   """
   @spec remove_image(String.t(), keyword()) :: :ok | {:error, term()}
   def remove_image(name, opts \\ []) do
@@ -398,12 +410,16 @@ defmodule Vagus.Runtime.Docker do
 
   # An image ref is a path segment too, so it needs the same anti-traversal
   # discipline as `ensure_ref/1` — but its legitimate charset is much wider
-  # (repo namespaces, registry `host:port` prefixes, tags), so this only
-  # blocks the specific sequences that could rewrite the request path.
+  # (repo namespaces, registry `host:port` prefixes, tags), so this
+  # allowlists the docker-reference charset instead of blocklisting specific
+  # sequences (W1).
   defp ensure_image_ref(name) when is_binary(name) do
-    if String.contains?(name, ["..", "?", "#"]),
-      do: {:error, {:invalid_ref, name}},
-      else: :ok
+    if Regex.match?(@image_ref_re, name) and not String.contains?(name, "..") and
+         not String.starts_with?(name, "/") do
+      :ok
+    else
+      {:error, {:invalid_ref, name}}
+    end
   end
 
   defp ensure_image_ref(_name), do: {:error, {:invalid_ref, :not_a_string}}

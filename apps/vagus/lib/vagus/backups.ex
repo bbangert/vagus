@@ -22,16 +22,10 @@ defmodule Vagus.Backups do
 
   require Logger
 
-  alias Vagus.Addon.{Manager, State}
+  alias Vagus.Addon.{Config, Manager, State}
   alias Vagus.Runtime.Docker
 
   @default_data_root "/data"
-  # Same charset as `Vagus.Addon.Manager`'s `@slug_dir_re` — a backup slug is
-  # interpolated straight into both the `<dir>/<slug>.tar` store path and the
-  # `<data_root>/addons/data/<slug>` restore target, so an upload (attacker-
-  # controlled `backup.json`) or a hand-built restore request can't use a
-  # `/`/`..`-laced slug to escape either directory.
-  @slug_re ~r/^[-_a-z0-9]+$/
 
   def start_link(opts \\ []) do
     GenServer.start_link(__MODULE__, opts, name: Keyword.get(opts, :name, __MODULE__))
@@ -132,15 +126,32 @@ defmodule Vagus.Backups do
 
   @doc """
   Restores `addon_slugs` from `backup_slug` (already resolved by the caller
-  — restore never accepts `"ALL"`, §A4). Per add-on: absent from the backup
-  → `{:error, "Addon <slug> not in backup"}`; not currently installed →
-  `{:error, "Addon <slug> is not installed"}` (restoring onto a fresh
-  install would need a store re-install first — out of M4 scope). Otherwise:
-  `Manager.stop` (tolerates not-running), replace the data dir wholesale
-  with the backup's `data/` files, `State.put_options/2` the backed-up user
-  options, and `Manager.start_slug` iff the backup recorded the add-on as
-  `"started"`. The first per-addon error aborts the whole call (no
-  partial-success reporting).
+  — restore never accepts `"ALL"`, §A4). Two phases (W2):
+
+    1. PRE-FLIGHT (no side effects): every requested slug is validated,
+       confirmed installed (`Vagus.Addon.State`), and confirmed present +
+       parseable in the backup tar (`Vagus.Backup.extract_addon/2`) — absent
+       from the backup → `{:error, "Addon <slug> not in backup"}`; not
+       currently installed → `{:error, "Addon <slug> is not installed"}`
+       (restoring onto a fresh install would need a store re-install first —
+       out of M4 scope). A failure here aborts the whole call before ANY
+       add-on has been stopped or touched — a multi-slug restore no longer
+       stops/wipes slugs 1..N-1 only to discover slug N is missing.
+    2. APPLY, per add-on: `Manager.stop` (tolerates not-running); the
+       backup's `data/` files are staged into a temp sibling of the data dir
+       first (`stage_files/3`) and only swapped in via `File.rename/2` once
+       staging fully succeeds — a mid-write failure (disk full) leaves the
+       existing data dir completely untouched instead of half-wiped;
+       `State.put_options/2` the backed-up user options (tolerating a
+       concurrent uninstall having removed the slug — logged, restart
+       skipped, not a raise); then `Manager.start_slug` iff the backup
+       recorded the add-on as `"started"`.
+
+  The first per-addon apply-phase error aborts the whole call (no
+  partial-success reporting) as `{:error, {:restore, slug, reason}}`; a
+  disk-full/permission `File` failure during staging is caught and returned
+  the same way, never raised (which would otherwise surface as a generic
+  500 instead of an honest error envelope).
   """
   @spec restore_partial(String.t(), [String.t()], keyword()) :: :ok | {:error, term()}
   def restore_partial(backup_slug, addon_slugs, opts \\ []) do
@@ -149,13 +160,9 @@ defmodule Vagus.Backups do
 
     case get(backup_slug, server) do
       {:ok, %{path: path}} ->
-        with {:ok, tar} <- File.read(path) do
-          Enum.reduce_while(addon_slugs, :ok, fn slug, :ok ->
-            case restore_addon(tar, slug, data_root, opts) do
-              :ok -> {:cont, :ok}
-              {:error, reason} -> {:halt, {:error, reason}}
-            end
-          end)
+        with {:ok, tar} <- File.read(path),
+             {:ok, prepared} <- preflight_restore(tar, addon_slugs) do
+          apply_restore(prepared, data_root, opts)
         end
 
       :error ->
@@ -356,31 +363,125 @@ defmodule Vagus.Backups do
     :crypto.hash(:sha, date <> name) |> Base.encode16(case: :lower) |> binary_part(0, 8)
   end
 
-  ## Internals — restore_partial
+  ## Internals — restore_partial: pre-flight
 
-  defp restore_addon(tar, slug, data_root, opts) do
-    with :ok <- validate_slug(slug),
-         {:ok, %{addon: addon, data: files}} <- Vagus.Backup.extract_addon(tar, slug) do
-      case State.get(slug) do
-        {:ok, _entry} -> do_restore(slug, addon, files, data_root, opts)
-        :error -> {:error, "Addon #{slug} is not installed"}
+  # Validates every requested slug — charset, installed, present + parseable
+  # in the backup — before returning; nothing has been stopped or written
+  # yet at this point, whichever slug (if any) fails.
+  defp preflight_restore(tar, addon_slugs) do
+    addon_slugs
+    |> Enum.reduce_while({:ok, []}, fn slug, {:ok, acc} ->
+      case preflight_addon(tar, slug) do
+        {:ok, item} -> {:cont, {:ok, [item | acc]}}
+        {:error, reason} -> {:halt, {:error, reason}}
       end
-    else
-      {:error, :not_in_backup} -> {:error, "Addon #{slug} not in backup"}
-      {:error, {:invalid_slug, _}} -> {:error, "Addon #{slug} not in backup"}
+    end)
+    |> case do
+      {:ok, list} -> {:ok, Enum.reverse(list)}
+      other -> other
     end
   end
 
-  defp do_restore(slug, addon, files, data_root, opts) do
+  defp preflight_addon(tar, slug) do
+    with :ok <- validate_slug(slug),
+         {:ok, _entry} <- state_get(slug),
+         {:ok, %{addon: addon, data: files}} <- Vagus.Backup.extract_addon(tar, slug) do
+      {:ok, {slug, addon, files}}
+    else
+      {:error, {:invalid_slug, _}} -> {:error, "Addon #{slug} not in backup"}
+      {:error, :not_installed} -> {:error, "Addon #{slug} is not installed"}
+      {:error, :not_in_backup} -> {:error, "Addon #{slug} not in backup"}
+    end
+  end
+
+  defp state_get(slug) do
+    case State.get(slug) do
+      {:ok, entry} -> {:ok, entry}
+      :error -> {:error, :not_installed}
+    end
+  end
+
+  defp validate_slug(slug) do
+    if Config.valid_slug?(slug),
+      do: :ok,
+      else: {:error, {:invalid_slug, slug}}
+  end
+
+  ## Internals — restore_partial: apply
+
+  defp apply_restore(prepared, data_root, opts) do
+    Enum.reduce_while(prepared, :ok, fn {slug, addon, files}, :ok ->
+      case restore_one(slug, addon, files, data_root, opts) do
+        :ok -> {:cont, :ok}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+  end
+
+  defp restore_one(slug, addon, files, data_root, opts) do
     Manager.stop(slug, opts)
 
     data_dir = Path.join([data_root, "addons", "data", slug])
+
+    case stage_files(data_dir, files, slug) do
+      {:ok, staging_dir} -> swap_and_finish(slug, addon, data_dir, staging_dir, opts)
+      {:error, _reason} = error -> error
+    end
+  end
+
+  # Stages the backup's `data/` files into a temp dir SIBLING of `data_dir`
+  # (same parent, so the swap below is a same-filesystem, near-instant
+  # `File.rename/2`) — nothing under `data_dir` itself is touched until
+  # staging fully succeeds, so a mid-write failure (disk full) leaves the
+  # existing data dir intact rather than half-wiped.
+  defp stage_files(data_dir, files, slug) do
+    parent = Path.dirname(data_dir)
+    unique = System.unique_integer([:positive])
+    staging_dir = Path.join(parent, ".restore-#{Path.basename(data_dir)}-#{unique}")
+
+    with :ok <- safe_mkdir_p(staging_dir, slug),
+         :ok <- materialize(staging_dir, files, slug) do
+      {:ok, staging_dir}
+    else
+      {:error, _reason} = error ->
+        File.rm_rf(staging_dir)
+        error
+    end
+  end
+
+  defp swap_and_finish(slug, addon, data_dir, staging_dir, opts) do
     File.rm_rf(data_dir)
-    File.mkdir_p!(data_dir)
-    materialize(data_dir, files)
 
-    :ok = State.put_options(slug, get_in(addon, ["user", "options"]) || %{})
+    case File.rename(staging_dir, data_dir) do
+      :ok ->
+        finish_restore(slug, addon, opts)
 
+      {:error, reason} ->
+        File.rm_rf(staging_dir)
+        {:error, {:restore, slug, reason}}
+    end
+  end
+
+  # `State.put_options/2` returning `:error` means a concurrent uninstall
+  # removed the slug's `State` entry between pre-flight and here — tolerated
+  # (logged, restart skipped for this slug) rather than the old `:ok = ...`
+  # match, which would raise (surfacing as a 500) instead of the honest
+  # partial-failure this already is.
+  defp finish_restore(slug, addon, opts) do
+    case State.put_options(slug, get_in(addon, ["user", "options"]) || %{}) do
+      :ok ->
+        maybe_start(slug, addon, opts)
+
+      :error ->
+        Logger.warning(
+          "Vagus.Backups: #{slug} was uninstalled mid-restore — options not restored, restart skipped"
+        )
+
+        :ok
+    end
+  end
+
+  defp maybe_start(slug, addon, opts) do
     if addon["state"] == "started" do
       case Manager.start_slug(slug, opts) do
         {:ok, _} -> :ok
@@ -392,19 +493,32 @@ defmodule Vagus.Backups do
   end
 
   # `Vagus.Backup.extract_addon/2` already zip-slip-guards these relative
-  # paths, so materializing them under `data_dir` is safe.
-  defp materialize(data_dir, files) do
-    Enum.each(files, fn {rel, content} ->
-      path = Path.join(data_dir, rel)
-      File.mkdir_p!(Path.dirname(path))
-      File.write!(path, content)
+  # paths, so materializing them under `dir` is safe. Non-bang `File` calls
+  # + `reduce_while` (not `File.mkdir_p!`/`File.write!`) so a disk-full/
+  # permission failure returns an honest `{:error, {:restore, slug, reason}}`
+  # instead of raising and 500ing the router.
+  defp materialize(dir, files, slug) do
+    Enum.reduce_while(files, :ok, fn {rel, content}, :ok ->
+      path = Path.join(dir, rel)
+
+      case safe_mkdir_p(Path.dirname(path), slug) do
+        :ok ->
+          case File.write(path, content) do
+            :ok -> {:cont, :ok}
+            {:error, reason} -> {:halt, {:error, {:restore, slug, reason}}}
+          end
+
+        {:error, _reason} = error ->
+          {:halt, error}
+      end
     end)
   end
 
-  defp validate_slug(slug) do
-    if is_binary(slug) and Regex.match?(@slug_re, slug),
-      do: :ok,
-      else: {:error, {:invalid_slug, slug}}
+  defp safe_mkdir_p(dir, slug) do
+    case File.mkdir_p(dir) do
+      :ok -> :ok
+      {:error, reason} -> {:error, {:restore, slug, reason}}
+    end
   end
 
   defp iso8601_now, do: DateTime.utc_now() |> DateTime.to_iso8601()

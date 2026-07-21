@@ -69,6 +69,43 @@ defmodule Vagus.Addon.ConfigTest do
       assert {:error, msg} = Config.parse(Map.put(@required, "init", "yes"))
       assert msg =~ "init"
     end
+
+    test "invalid version characters rejected (W1 — docker tag charset)" do
+      for bad <- ["1.0/../etc", "1.0 beta", "1.0?x", "1.0#frag", "../1.0"] do
+        assert {:error, msg} = Config.parse(%{@required | "version" => bad})
+        assert msg =~ "version"
+      end
+    end
+
+    test "legitimate version shapes accepted" do
+      for good <- ["1.0.0", "7.1.0", "2026.7.2", "1.0.0-beta.1", "v1-2"] do
+        assert {:ok, c} = Config.parse(%{@required | "version" => good})
+        assert c.version == good
+      end
+    end
+  end
+
+  describe "valid_slug?/1 (W3 — the shared rm_rf/restore guard)" do
+    test "accepts everything parse/1's own slug charset accepts" do
+      assert Config.valid_slug?("core_mosquitto")
+      assert Config.valid_slug?("Core.Mosquitto")
+      assert Config.valid_slug?("a-b_c.d")
+    end
+
+    test "rejects the degenerate . and .. tokens even though the charset allows them" do
+      refute Config.valid_slug?(".")
+      refute Config.valid_slug?("..")
+    end
+
+    test "rejects anything containing a slash" do
+      refute Config.valid_slug?("../evil")
+      refute Config.valid_slug?("a/b")
+    end
+
+    test "rejects non-binary input" do
+      refute Config.valid_slug?(nil)
+      refute Config.valid_slug?(123)
+    end
   end
 
   describe "map: normalization (string + dict forms)" do

@@ -15,6 +15,13 @@ defmodule Vagus.Addon.Config do
   """
 
   @slug_re ~r/^[-_.A-Za-z0-9]+$/
+  # Docker tag charset (W1) — `version:` becomes the tag half of the image
+  # ref `Vagus.Addon.Manager.image_ref/2` builds (`"#{image}:#{version}"`)
+  # and, unlike `slug`, previously had no charset validation at all even
+  # though it's just as add-on-supplied/untrusted; an unvalidated value
+  # could smuggle extra path/query structure into the Engine-API image
+  # pull/delete calls that build on it.
+  @version_re ~r/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/
   @service_re ~r/^(?<service>mqtt|mysql):(?<rights>provide|want|need)$/
   @arch_all ~w(aarch64 amd64 armhf armv7 i386)
   @startups ~w(initialize system services application once)
@@ -119,12 +126,32 @@ defmodule Vagus.Addon.Config do
 
   def parse(_raw), do: {:error, "config must be a map"}
 
+  @doc """
+  The shared "is this slug safe to interpolate into a filesystem path" check
+  (W3) — used by both `Vagus.Addon.Manager`'s data-dir `rm_rf` guard and
+  `Vagus.Backups`' restore/create slug validation, replacing their previous
+  divergent (and lowercase-only) regexes with the charset `parse/1` itself
+  actually enforces (`@slug_re`, which permits uppercase and dots).
+
+  That charset alone isn't enough for an `rm_rf`/`File` path segment though
+  — `.` and `..` are themselves valid tokens under it — so this additionally
+  rejects a bare `"."`/`".."` and anything containing `/` (redundant given
+  `@slug_re` already excludes `/`, kept as explicit, charset-independent
+  insurance) before returning `true`.
+  """
+  @spec valid_slug?(term()) :: boolean()
+  def valid_slug?(slug) when is_binary(slug) do
+    Regex.match?(@slug_re, slug) and slug not in [".", ".."] and not String.contains?(slug, "/")
+  end
+
+  def valid_slug?(_slug), do: false
+
   ## Internals
 
   defp build(raw) do
     %__MODULE__{
       name: req_str(raw, "name"),
-      version: req_str(raw, "version"),
+      version: version(raw),
       slug: slug(raw),
       description: req_str(raw, "description"),
       arch: arch(raw)
@@ -190,6 +217,14 @@ defmodule Vagus.Addon.Config do
     if Regex.match?(@slug_re, slug),
       do: slug,
       else: invalid("slug '#{slug}' has invalid characters")
+  end
+
+  defp version(raw) do
+    version = req_str(raw, "version")
+
+    if Regex.match?(@version_re, version),
+      do: version,
+      else: invalid("version '#{version}' has invalid characters")
   end
 
   defp arch(raw) do

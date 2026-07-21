@@ -282,7 +282,7 @@ defmodule Vagus.Addon.ManagerTest do
       assert :error = Vagus.Services.get("mqtt")
     end
 
-    test "uninstall refuses to rm_rf outside the data dir for a slug that fails the safety regex",
+    test "uninstall refuses to rm_rf outside the data dir for a slug that fails the safety check",
          %{data_root: dr} do
       hostile = %Config{
         name: "Hostile",
@@ -294,6 +294,7 @@ defmodule Vagus.Addon.ManagerTest do
       }
 
       :ok = Vagus.Addon.State.put(hostile, :stopped)
+      on_exit(fn -> Vagus.Addon.State.delete("../evil") end)
 
       # `<data_root>/addons/data/../evil` resolves to `<data_root>/addons/evil`
       # — this is exactly what an unguarded rm_rf would delete.
@@ -306,7 +307,37 @@ defmodule Vagus.Addon.ManagerTest do
                Manager.uninstall("../evil", backend: __MODULE__.FakeBackend, data_root: dr)
 
       assert File.exists?(sentinel)
-      Vagus.Addon.State.delete("../evil")
+    end
+
+    # W3: `Config`'s own slug charset permits a bare `..` (and `.`) as a
+    # token — the shared `Config.valid_slug?/1` guard must reject those
+    # explicitly, not just rely on the charset (which the old lowercase-only
+    # regex here happened to reject only because it also excluded `.`).
+    test "uninstall refuses to rm_rf outside the data dir for the bare slug \"..\"",
+         %{data_root: dr} do
+      hostile = %Config{
+        name: "Hostile",
+        version: "1",
+        slug: "..",
+        description: "d",
+        arch: ["amd64"],
+        image: "x/y"
+      }
+
+      :ok = Vagus.Addon.State.put(hostile, :stopped)
+      on_exit(fn -> Vagus.Addon.State.delete("..") end)
+
+      # `<data_root>/addons/data/..` resolves to `<data_root>/addons` itself
+      # — this is exactly what an unguarded rm_rf would delete.
+      addons_dir = Path.join(dr, "addons")
+      File.mkdir_p!(addons_dir)
+      sentinel = Path.join(addons_dir, "sentinel.txt")
+      File.write!(sentinel, "keep me")
+
+      assert {:error, _reason} =
+               Manager.uninstall("..", backend: __MODULE__.FakeBackend, data_root: dr)
+
+      assert File.exists?(sentinel)
     end
   end
 

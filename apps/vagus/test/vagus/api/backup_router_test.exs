@@ -101,6 +101,37 @@ defmodule Vagus.API.BackupRouterTest do
 
   defp body(conn), do: Jason.decode!(conn.resp_body)
 
+  # Builds a REAL `multipart/form-data` raw body (W4) — exercises the
+  # route-local `Plug.Parsers` call `handle_backup_upload/1` makes (B1),
+  # unlike a `Plug.Test.conn/3` map body (which bypasses `Plug.Parsers`
+  # entirely and would pass even if the real multipart pipeline broke).
+  # `parts`: `{:file, name, filename, content_type, content}` or
+  # `{:field, name, value}`.
+  defp multipart_conn(path, parts) do
+    boundary = "vagusTestBoundary#{System.unique_integer([:positive])}"
+
+    conn(:post, path, build_multipart(boundary, parts))
+    |> put_req_header("content-type", "multipart/form-data; boundary=#{boundary}")
+  end
+
+  defp build_multipart(boundary, parts) do
+    parts_body =
+      Enum.map_join(parts, "", fn
+        {:file, name, filename, content_type, content} ->
+          "--#{boundary}\r\n" <>
+            "content-disposition: form-data; name=\"#{name}\"; filename=\"#{filename}\"\r\n" <>
+            "content-type: #{content_type}\r\n\r\n" <>
+            content <> "\r\n"
+
+        {:field, name, value} ->
+          "--#{boundary}\r\n" <>
+            "content-disposition: form-data; name=\"#{name}\"\r\n\r\n" <>
+            value <> "\r\n"
+      end)
+
+    parts_body <> "--#{boundary}--\r\n"
+  end
+
   defp create_backup(slug) do
     conn = supervisor_call(:post, "/backups/new/partial", %{"addons" => [slug]})
     assert conn.status == 200
@@ -292,25 +323,15 @@ defmodule Vagus.API.BackupRouterTest do
     end
   end
 
-  describe "POST /backups/new/upload" do
-    test "a valid tar -> {slug}", %{data_root: _dr} do
+  describe "POST /backups/new/upload (real multipart, W4/B1)" do
+    test "a real multipart upload with a valid tar -> {slug}" do
       spec = %{slug: "up1", name: "Uploaded", addons: []}
       {:ok, tar} = Vagus.Backup.create(spec, date: "2026-07-21T00:00:00Z")
 
-      tmp_path =
-        Path.join(System.tmp_dir!(), "vagus-upload-#{System.unique_integer([:positive])}")
-
-      File.write!(tmp_path, tar)
-      on_exit(fn -> File.rm(tmp_path) end)
-
-      upload = %Plug.Upload{
-        path: tmp_path,
-        filename: "backup.tar",
-        content_type: "application/tar"
-      }
-
       conn =
-        conn(:post, "/backups/new/upload", %{"file" => upload})
+        multipart_conn("/backups/new/upload", [
+          {:file, "file", "backup.tar", "application/tar", tar}
+        ])
         |> put_req_header("authorization", "Bearer #{Vagus.API.Token.get()}")
         |> Vagus.API.Router.call(@opts)
 
@@ -319,26 +340,62 @@ defmodule Vagus.API.BackupRouterTest do
       assert {:ok, _entry} = Backups.get("up1")
     end
 
-    test "garbage upload -> 400" do
-      tmp_path =
-        Path.join(System.tmp_dir!(), "vagus-upload-bad-#{System.unique_integer([:positive])}")
-
-      File.write!(tmp_path, "not a tar at all")
-      on_exit(fn -> File.rm(tmp_path) end)
-
-      upload = %Plug.Upload{path: tmp_path, filename: "junk.tar", content_type: "application/tar"}
+    test "garbage bytes inside a real multipart body -> 400" do
+      garbage = :crypto.strong_rand_bytes(256)
 
       conn =
-        conn(:post, "/backups/new/upload", %{"file" => upload})
+        multipart_conn("/backups/new/upload", [
+          {:file, "file", "junk.tar", "application/tar", garbage}
+        ])
         |> put_req_header("authorization", "Bearer #{Vagus.API.Token.get()}")
         |> Vagus.API.Router.call(@opts)
 
       assert conn.status == 400
     end
 
-    test "no file uploaded -> 400" do
-      conn = supervisor_call(:post, "/backups/new/upload", %{})
+    test "a real multipart body with no file part -> 400" do
+      conn =
+        multipart_conn("/backups/new/upload", [{:field, "note", "no file attached"}])
+        |> put_req_header("authorization", "Bearer #{Vagus.API.Token.get()}")
+        |> Vagus.API.Router.call(@opts)
+
       assert conn.status == 400
+    end
+
+    test "a non-multipart content-type POST to this route -> 400, not 415/500" do
+      conn =
+        conn(:post, "/backups/new/upload", "just some bytes")
+        |> put_req_header("content-type", "text/plain")
+        |> put_req_header("authorization", "Bearer #{Vagus.API.Token.get()}")
+        |> Vagus.API.Router.call(@opts)
+
+      assert conn.status == 400
+    end
+
+    test "an add-on (non-supervisor) caller's multipart POST gets 403 without the body being parsed" do
+      slug = "core_upload_forbidden"
+      token = "tok-#{System.unique_integer([:positive])}"
+
+      :ok =
+        Registry.register(token, %{slug: slug, services_role: %{}, auth_api: false, discovery: []})
+
+      on_exit(fn -> Registry.unregister_slug(slug) end)
+
+      conn =
+        multipart_conn("/backups/new/upload", [{:field, "note", "irrelevant"}])
+        |> put_req_header("x-supervisor-token", token)
+        |> Vagus.API.Router.call(@opts)
+
+      assert conn.status == 403
+    end
+
+    test "a multipart POST to a non-upload route is passed through unread, not 415/500" do
+      conn =
+        multipart_conn("/supervisor/reload", [{:field, "note", "irrelevant"}])
+        |> put_req_header("authorization", "Bearer #{Vagus.API.Token.get()}")
+        |> Vagus.API.Router.call(@opts)
+
+      assert conn.status == 200
     end
   end
 

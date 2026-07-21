@@ -260,6 +260,35 @@ defmodule Vagus.BackupsTest do
       assert {:error, _reason} =
                Backups.restore_partial("nosuchbk", ["whatever"], server: server, data_root: dr)
     end
+
+    test "pre-flight (W2): a later slug failing means an earlier slug is never touched", %{
+      data_root: dr,
+      server: server
+    } do
+      slug = "core_preflight_ok"
+      ghost = "core_preflight_missing"
+      install(slug, dr)
+      install(ghost, dr)
+      File.write!(Path.join(data_dir(dr, slug), "keep.txt"), "original")
+
+      {:ok, backup_slug} =
+        Backups.create_partial(nil, [slug], server: server, data_root: dr)
+
+      :ok = @backend.reset_calls()
+
+      assert {:error, message} =
+               Backups.restore_partial(backup_slug, [slug, ghost],
+                 server: server,
+                 data_root: dr,
+                 backend: @backend
+               )
+
+      assert message =~ "not in backup"
+      # `slug` (which IS valid/installed/in-backup) must not have been
+      # stopped/wiped just because `ghost` (checked second) fails pre-flight.
+      assert @backend.calls() == []
+      assert File.read!(Path.join(data_dir(dr, slug), "keep.txt")) == "original"
+    end
   end
 
   describe "delete/2" do

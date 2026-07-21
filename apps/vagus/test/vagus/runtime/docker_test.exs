@@ -45,6 +45,44 @@ defmodule Vagus.Runtime.DockerTest do
     end
   end
 
+  describe "image ref validation (hermetic — rejects before any connect, W1)" do
+    @malicious_images [
+      "../images/create?fromImage=evil",
+      "a/../../etc",
+      "..",
+      "/etc/passwd",
+      "repo:tag?x",
+      "repo#frag",
+      "repo tag with space",
+      ""
+    ]
+
+    test "path-op image refs outside the docker-reference charset are rejected" do
+      for ref <- @malicious_images do
+        assert {:error, {:invalid_ref, ^ref}} = Docker.remove_image(ref)
+      end
+    end
+
+    test "a non-string image ref is rejected" do
+      assert {:error, {:invalid_ref, :not_a_string}} = Docker.remove_image(nil)
+    end
+
+    test "legitimate image refs (namespaces, tags, registry host:port) pass validation" do
+      for ref <- [
+            "alpine",
+            "alpine:3",
+            "homeassistant/amd64-addon-mosquitto:7.1.0",
+            "ghcr.io:443/org/img:1.0",
+            "library/ubuntu@sha256:abc123"
+          ] do
+        assert {:error, {:connect, _}} =
+                 Docker.remove_image(ref,
+                   socket: "/tmp/nope-#{System.unique_integer([:positive])}.sock"
+                 )
+      end
+    end
+  end
+
   describe "against a live daemon" do
     @describetag :docker
 
