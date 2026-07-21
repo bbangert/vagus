@@ -120,14 +120,16 @@ defmodule Vagus.DNS do
   defp handle_packet(packet, host, port, state) do
     case Message.parse_query(packet) do
       {:ok, %{qtype: qtype} = query} ->
-        a_type = Message.type_a()
+        case lookup(strip_suffix(query.qname), state) do
+          {:ok, ip} ->
+            # We're authoritative for this name: answer A with the record, and
+            # any other type (e.g. AAAA) as NOERROR-with-no-answers. Never
+            # forward an owned name — a stub resolver doing A+AAAA would take
+            # upstream's NXDOMAIN for the AAAA as "the name doesn't exist".
+            ips = if qtype == Message.type_a(), do: [ip], else: []
+            reply(state.socket, host, port, Message.answer(query, ips))
 
-        cond do
-          qtype == a_type and match?({:ok, _}, lookup(strip_suffix(query.qname), state)) ->
-            {:ok, ip} = lookup(strip_suffix(query.qname), state)
-            reply(state.socket, host, port, Message.answer(query, [ip]))
-
-          true ->
+          :error ->
             forward_or_nxdomain(packet, query, host, port, state)
         end
 

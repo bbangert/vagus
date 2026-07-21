@@ -13,7 +13,7 @@ defmodule Vagus.DNSTest do
     %{server: server, port: port, sock: sock}
   end
 
-  defp ask(sock, port, name) do
+  defp ask(sock, port, name, qtype \\ 1) do
     labels =
       name
       |> String.split(".")
@@ -21,7 +21,8 @@ defmodule Vagus.DNSTest do
       |> IO.iodata_to_binary()
 
     packet =
-      <<0x2222::16, 0x0100::16, 1::16, 0::16, 0::16, 0::16>> <> labels <> <<0, 1::16, 1::16>>
+      <<0x2222::16, 0x0100::16, 1::16, 0::16, 0::16, 0::16>> <>
+        labels <> <<0, qtype::16, 1::16>>
 
     :ok = :gen_udp.send(sock, {127, 0, 0, 1}, port, packet)
     {:ok, {_ip, _p, resp}} = :gen_udp.recv(sock, 0, 2000)
@@ -62,6 +63,15 @@ defmodule Vagus.DNSTest do
     assert ask(s, p, "temp-addon").ancount == 1
     :ok = DNS.unregister("temp-addon", srv)
     assert ask(s, p, "temp-addon").rcode == 3
+  end
+
+  test "an owned name queried as AAAA is NOERROR with no answers (not NXDOMAIN)", %{
+    sock: s,
+    port: p
+  } do
+    r = ask(s, p, "supervisor", 28)
+    assert r.rcode == 0
+    assert r.ancount == 0
   end
 
   test "unknown name with no upstream → NXDOMAIN", %{sock: s, port: p} do
