@@ -163,6 +163,8 @@ defmodule Vagus.Engine.Manager do
   defp start_daemon(state) do
     Logger.info("Vagus.Engine.Manager: internet reached, starting balena-engine-daemon")
 
+    make_root_shared()
+
     case current_name_servers() |> ResolvConf.write() do
       :ok ->
         :ok
@@ -190,6 +192,23 @@ defmodule Vagus.Engine.Manager do
         Process.send_after(self(), :retry_daemon_start, @retry_ms)
         state
     end
+  end
+
+  # Add-ons bind-mount share/media with `rslave` propagation, which the daemon
+  # rejects unless the source's mount is shared/slave ("not a shared or slave
+  # mount"). HAOS makes the rootfs shared; replicate that once here, before any
+  # add-on container starts. Idempotent + best-effort. (On-device Gate-1
+  # finding, 2026-07-21.)
+  defp make_root_shared do
+    case System.cmd("/bin/mount", ["--make-rshared", "/"], stderr_to_stdout: true) do
+      {_out, 0} ->
+        :ok
+
+      {out, code} ->
+        Logger.warning("Vagus.Engine.Manager: make-rshared / failed (#{code}): #{out}")
+    end
+  rescue
+    e -> Logger.warning("Vagus.Engine.Manager: make-rshared / errored: #{Exception.message(e)}")
   end
 
   defp monitor_daemon(state, pid) do

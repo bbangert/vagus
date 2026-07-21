@@ -106,6 +106,15 @@ config :vagus, :token_path, "/data/vagus/token"
 config :vagus, :core_token_path, "/data/vagus/core_token.json"
 config :vagus, :core_base_url, "http://localhost:8123"
 
+# Add-on runtime (M4). The balena-engine daemon's control socket
+# (`Vagus.Engine.Manager`'s `--host`); `Vagus.Runtime.Docker` talks to it.
+config :vagus, :docker_socket, "/run/balena-engine.sock"
+
+# Add-on data/bind-source root. Use the REAL mount path (`/root`), not the
+# `/data` symlink — the same runc symlink hazard that blocked the engine
+# data-root (see Vagus.Engine.Manager) applies to bind sources.
+config :vagus, :addon_data_root, "/root/vagus/addons"
+
 # Host-management backends (P4-T1) — the real vintage_net/Nerves.Runtime-
 # backed implementations. See config/host.exs for the :host-side stubs and
 # config/test.exs for the Mox mocks.
