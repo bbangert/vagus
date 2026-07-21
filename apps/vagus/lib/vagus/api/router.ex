@@ -191,6 +191,28 @@ defmodule Vagus.API.Router do
     Envelope.send_ok(conn, AddonsList.build!(StaticData.addons_list()))
   end
 
+  # Add-on info (§A1; `supervisor/api/apps.py` `info_data`). Core's hassio
+  # discovery fetches this for a discovery message's provider slug to resolve
+  # the add-on name before creating the config flow. Readable by the supervisor
+  # (Core) for any slug, and by an add-on for itself (`self` or its own slug).
+  get "/addons/:slug/info" do
+    caller = conn.assigns.caller
+
+    with {:ok, resolved} <- resolve_info_slug(slug, caller),
+         {:ok, %{config: config, state: state}} <- Vagus.Addon.State.get(resolved) do
+      options =
+        case read_addon_options(resolved) do
+          {:ok, opts} -> opts
+          :error -> config.options
+        end
+
+      Envelope.send_ok(conn, Vagus.Addon.Info.render(config, state, options))
+    else
+      {:error, :forbidden} -> Envelope.send_error(conn, "Not authorized for this add-on", 403)
+      _ -> Envelope.send_error(conn, "Add-on #{slug} does not exist", 404)
+    end
+  end
+
   # An add-on reads its own effective (merged + schema-validated) options
   # (§A3.4 / `supervisor/api/apps.py` `options_config`) — bashio's
   # `bashio::config`/`bashio::addon.config` fetch this once and cache it. Only
@@ -527,6 +549,14 @@ defmodule Vagus.API.Router do
 
     :ok
   end
+
+  # Resolve the slug an info request may read: the supervisor (Core) may read
+  # any slug; an add-on may read `self` or its own slug, nothing else.
+  defp resolve_info_slug(slug, :supervisor), do: {:ok, slug}
+  defp resolve_info_slug("self", {:addon, %{slug: own}}), do: {:ok, own}
+  defp resolve_info_slug(own, {:addon, %{slug: own}}), do: {:ok, own}
+  defp resolve_info_slug(_slug, {:addon, _}), do: {:error, :forbidden}
+  defp resolve_info_slug(_slug, _caller), do: {:error, :forbidden}
 
   # -- addon self-config helper ----------------------------------------------
 

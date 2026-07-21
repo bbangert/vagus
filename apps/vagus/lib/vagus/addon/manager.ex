@@ -76,6 +76,7 @@ defmodule Vagus.Addon.Manager do
          {:ok, id} <- backend(opts).create(spec),
          :ok <- backend(opts).start(id) do
       register_identity(config, token)
+      record_state(config)
       {:ok, %{id: id, access_token: token}}
     end
   end
@@ -232,6 +233,13 @@ defmodule Vagus.Addon.Manager do
       Vagus.Addon.Registry.register(token, Vagus.Addon.Registry.identity_from_config(config))
     end
 
+    :ok
+  end
+
+  # Record the add-on as started so `GET /addons/{slug}/info` can serve it.
+  # Best-effort: skipped if the store isn't running (isolated unit tests).
+  defp record_state(config) do
+    if Process.whereis(Vagus.Addon.State), do: Vagus.Addon.State.put(config, :started)
     :ok
   end
 

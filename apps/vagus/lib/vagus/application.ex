@@ -30,6 +30,7 @@ defmodule Vagus.Application do
         # surface so `Vagus.API.Auth` can resolve add-on tokens and the
         # `/services` endpoints have their store the moment requests arrive.
         Vagus.Addon.Registry,
+        Vagus.Addon.State,
         Vagus.Services,
         Vagus.Discovery,
         Vagus.Auth,
