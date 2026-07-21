@@ -371,12 +371,48 @@ The add-on is built from the **`esphome` repo itself**
 differentiated by which base image layer is used
 (`ghcr.io/esphome/docker-base:debian-ha-addon-*`).
 
-**`[VERIFY GAP]`: the add-on's `config.yaml` manifest itself is not present
-in the indexed `esphome` repo** (grep for `ingress_port`, `panel_icon`,
-`config.yaml` inside the repo turned up nothing but doc/test references) —
-it must live in a separate, unindexed repository. Everything below is
-inferred from the s6-overlay rootfs scripts (`docker/ha-addon-rootfs/`),
-which are ground truth for runtime behavior even without the manifest.
+**`[VERIFY GAP — CLOSED 2026-07-21, P5-T1]`**: the manifest lives in the
+separate **`esphome/home-assistant-addon`** repo (branch `main`, one add-on
+per top-level dir: `esphome/`, `esphome-beta/`, `esphome-dev/`). The real
+`esphome/config.yaml` (version 2026.7.1), captured verbatim during the
+P5-T1 gate:
+
+```yaml
+---
+url: https://esphome.io/
+arch: [amd64, aarch64]
+hassio_api: true
+auth_api: true
+host_network: true
+ingress: true
+ingress_port: 0
+panel_icon: mdi:esphome
+uart: true
+ports:
+  6052/tcp: null
+map: [config:rw]
+discovery: [esphome]
+schema:
+  home_assistant_dashboard_integration: bool?
+  default_compile_process_limit: int(1,)?
+  leave_front_door_open: bool?
+backup_exclude: ['*/*/']
+init: false
+startup: services
+name: ESPHome Device Builder
+panel_title: ESPHome Builder
+version: 2026.7.1
+slug: esphome
+description: Build your own smart home devices using ESPHome, no programming
+  experience required
+image: ghcr.io/esphome/esphome-hassio
+```
+
+Confirms the inferences below: `ingress_port: 0` (dynamic) — and notably
+`host_network: true`, so the ingress proxy target is `127.0.0.1:<port>`,
+not a bridge IP. No `ingress_stream`, no `ingress_entry`, no `panel_admin`
+(defaults apply). Everything below was inferred from the s6-overlay rootfs
+scripts (`docker/ha-addon-rootfs/`) before the manifest was located.
 
 - `etc/s6-overlay/s6-rc.d/esphome/run:65`: launches
   `esphome-device-builder --ha-addon --ingress-port
