@@ -1,0 +1,284 @@
+defmodule Vagus.Runtime.Docker do
+  @moduledoc """
+  Docker Engine API client over the daemon's Unix socket (Mint HTTP/1) — the
+  real Engine-API driver the `docs/contract-2026.7-m4-addendum.md` §A1 calls
+  for, replacing `Vagus.Engine`'s spike-era CLI shelling.
+
+  balena-engine is a moby fork speaking the same Engine API, so this same
+  client drives both: on the host it talks to `/var/run/docker.sock` (regular
+  Docker, for development + tests); on target to
+  `/run/balena-engine.sock`. The socket path is
+  `config :vagus, :docker_socket` (default `/var/run/docker.sock`), overridable
+  per call via the `:socket` option.
+
+  Transport: one short-lived Mint connection per request over the
+  `{:local, socket}` address (Engine-API calls are add-on-lifecycle rate, not
+  hot-path), driven synchronously in `:passive` mode. Streaming endpoints
+  (`/logs`, `/stats` follow) need a held connection and are added with P5.
+
+  All calls return `{:ok, term}` / `{:error, reason}` and never raise on a
+  daemon-side or transport error.
+  """
+
+  @default_socket "/var/run/docker.sock"
+  @recv_timeout 60_000
+
+  @typedoc "A decoded Engine-API response."
+  @type response :: %{status: non_neg_integer(), headers: [{String.t(), String.t()}], body: term()}
+
+  ## Connectivity
+
+  @doc "GET `/_ping` — `:ok` if the daemon answers 200, else `{:error, reason}`."
+  @spec ping(keyword()) :: :ok | {:error, term()}
+  def ping(opts \\ []) do
+    case request(:get, "/_ping", opts) do
+      {:ok, %{status: 200}} -> :ok
+      {:ok, %{status: status}} -> {:error, {:unexpected_status, status}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  @doc "GET `/version` — the daemon's version map."
+  @spec version(keyword()) :: {:ok, map()} | {:error, term()}
+  def version(opts \\ []), do: get_json("/version", opts)
+
+  @doc "GET `/info` — the daemon's info map."
+  @spec info(keyword()) :: {:ok, map()} | {:error, term()}
+  def info(opts \\ []), do: get_json("/info", opts)
+
+  ## Images
+
+  @doc """
+  POST `/images/create?fromImage=&tag=` — pulls `image` (a `"repo:tag"` or
+  `"repo"` string). Consumes the progress stream to completion; returns
+  `{:error, {:pull_failed, detail}}` if the stream carries an `errorDetail`.
+
+  `opts[:platform]` sets the `platform` query (e.g. `"linux/arm64"`).
+  """
+  @spec pull_image(String.t(), keyword()) :: :ok | {:error, term()}
+  def pull_image(image, opts \\ []) when is_binary(image) do
+    {repo, tag} = split_image(image)
+    query = [fromImage: repo, tag: tag] ++ platform_query(opts)
+
+    case request(:post, "/images/create", Keyword.merge(opts, query: query, body: "")) do
+      {:ok, %{status: 200, body: body}} -> check_pull_stream(body)
+      {:ok, %{status: status, body: body}} -> {:error, {:pull_failed, {status, body}}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  ## Containers
+
+  @doc """
+  POST `/containers/create[?name=]` with `config` (an Engine-API container
+  config map). Returns `{:ok, id}`.
+  """
+  @spec create_container(map(), keyword()) :: {:ok, String.t()} | {:error, term()}
+  def create_container(config, opts \\ []) when is_map(config) do
+    query = if name = opts[:name], do: [name: name], else: []
+
+    case request(:post, "/containers/create", Keyword.merge(opts, query: query, body: config)) do
+      {:ok, %{status: 201, body: %{"Id" => id}}} -> {:ok, id}
+      {:ok, %{status: status, body: body}} -> {:error, {:create_failed, status, message(body)}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  @doc "POST `/containers/{id}/start`. Idempotent: an already-started (304) is `:ok`."
+  @spec start_container(String.t(), keyword()) :: :ok | {:error, term()}
+  def start_container(id, opts \\ []), do: post_no_content("/containers/#{id}/start", [204, 304], opts)
+
+  @doc "POST `/containers/{id}/stop` (`opts[:timeout]` seconds). Already-stopped (304) is `:ok`."
+  @spec stop_container(String.t(), keyword()) :: :ok | {:error, term()}
+  def stop_container(id, opts \\ []) do
+    query = if t = opts[:timeout], do: [t: t], else: []
+    post_no_content("/containers/#{id}/stop", [204, 304], Keyword.put(opts, :query, query))
+  end
+
+  @doc "POST `/containers/{id}/restart` (`opts[:timeout]` seconds)."
+  @spec restart_container(String.t(), keyword()) :: :ok | {:error, term()}
+  def restart_container(id, opts \\ []) do
+    query = if t = opts[:timeout], do: [t: t], else: []
+    post_no_content("/containers/#{id}/restart", [204], Keyword.put(opts, :query, query))
+  end
+
+  @doc """
+  DELETE `/containers/{id}`. `opts[:force]` (default true) kills a running
+  container; `opts[:volumes]` (default false) removes anonymous volumes.
+  A missing container (404) is treated as `:ok` (already gone).
+  """
+  @spec remove_container(String.t(), keyword()) :: :ok | {:error, term()}
+  def remove_container(id, opts \\ []) do
+    query = [force: bool(Keyword.get(opts, :force, true)), v: bool(Keyword.get(opts, :volumes, false))]
+
+    case request(:delete, "/containers/#{id}", Keyword.merge(opts, query: query)) do
+      {:ok, %{status: s}} when s in [204, 404] -> :ok
+      {:ok, %{status: status, body: body}} -> {:error, {:remove_failed, status, message(body)}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  @doc "GET `/containers/{id}/json` — the full inspect map."
+  @spec inspect_container(String.t(), keyword()) :: {:ok, map()} | {:error, term()}
+  def inspect_container(id, opts \\ []), do: get_json("/containers/#{id}/json", opts)
+
+  @doc "GET `/containers/json` — running containers (`opts[:all]` includes stopped)."
+  @spec list_containers(keyword()) :: {:ok, [map()]} | {:error, term()}
+  def list_containers(opts \\ []) do
+    query = [all: bool(Keyword.get(opts, :all, false))]
+    get_json("/containers/json", Keyword.merge(opts, query: query))
+  end
+
+  ## Generic request
+
+  @doc """
+  Issues a single Engine-API request over the Unix socket.
+
+  `opts`: `:socket`, `:query` (keyword/map → query string), `:body`
+  (a map → JSON, or a raw string/`nil`), `:headers`. Returns `{:ok, response}`
+  where `response.body` is JSON-decoded when the daemon says so, else the raw
+  string.
+  """
+  @spec request(atom(), String.t(), keyword()) :: {:ok, response()} | {:error, term()}
+  def request(method, path, opts \\ []) do
+    socket = Keyword.get(opts, :socket, socket_path())
+    full_path = path <> encode_query(Keyword.get(opts, :query, []))
+    {headers, body} = prepare_body(Keyword.get(opts, :body), Keyword.get(opts, :headers, []))
+    method = method |> to_string() |> String.upcase()
+
+    case Mint.HTTP.connect(:http, {:local, socket}, 0, mode: :passive, hostname: "localhost") do
+      {:ok, conn} ->
+        result =
+          with {:ok, conn, ref} <- Mint.HTTP.request(conn, method, full_path, headers, body || ""),
+               {:ok, _conn, responses} <- recv_all(conn, ref) do
+            {:ok, assemble(responses, ref)}
+          else
+            {:error, _conn, reason} -> {:error, reason}
+            {:error, reason} -> {:error, reason}
+          end
+
+        Mint.HTTP.close(conn)
+        result
+
+      {:error, reason} ->
+        {:error, {:connect, reason}}
+    end
+  end
+
+  @doc "The resolved daemon socket path."
+  @spec socket_path() :: String.t()
+  def socket_path, do: Application.get_env(:vagus, :docker_socket, @default_socket)
+
+  ## Internals
+
+  defp get_json(path, opts) do
+    case request(:get, path, opts) do
+      {:ok, %{status: status, body: body}} when status in 200..299 -> {:ok, body}
+      {:ok, %{status: status, body: body}} -> {:error, {:http, status, message(body)}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp post_no_content(path, ok_statuses, opts) do
+    case request(:post, path, Keyword.put_new(opts, :body, "")) do
+      {:ok, %{status: s}} -> if s in ok_statuses, do: :ok, else: {:error, {:http, s}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp recv_all(conn, ref, acc \\ []) do
+    case Mint.HTTP.recv(conn, 0, @recv_timeout) do
+      {:ok, conn, responses} ->
+        acc = acc ++ responses
+        if Enum.any?(responses, &match?({:done, ^ref}, &1)),
+          do: {:ok, conn, acc},
+          else: recv_all(conn, ref, acc)
+
+      {:error, conn, reason, _responses} ->
+        {:error, conn, reason}
+    end
+  end
+
+  defp assemble(responses, ref) do
+    status = Enum.find_value(responses, fn {:status, ^ref, s} -> s; _ -> nil end)
+    headers = Enum.find_value(responses, [], fn {:headers, ^ref, h} -> h; _ -> nil end)
+
+    body =
+      responses
+      |> Enum.filter(&match?({:data, ^ref, _}, &1))
+      |> Enum.map_join("", fn {:data, ^ref, chunk} -> chunk end)
+
+    %{status: status, headers: headers, body: decode_body(body, headers)}
+  end
+
+  defp decode_body("", _headers), do: %{}
+
+  defp decode_body(body, headers) do
+    if json?(headers) do
+      case Jason.decode(body) do
+        {:ok, decoded} -> decoded
+        {:error, _} -> body
+      end
+    else
+      body
+    end
+  end
+
+  defp json?(headers) do
+    Enum.any?(headers, fn {k, v} ->
+      String.downcase(k) == "content-type" and String.contains?(v, "application/json")
+    end)
+  end
+
+  defp prepare_body(nil, headers), do: {headers, ""}
+  defp prepare_body(body, headers) when is_binary(body), do: {headers, body}
+
+  defp prepare_body(body, headers) when is_map(body) do
+    {[{"content-type", "application/json"} | headers], Jason.encode!(body)}
+  end
+
+  defp encode_query([]), do: ""
+  defp encode_query(query) when is_map(query), do: encode_query(Map.to_list(query))
+
+  defp encode_query(query) do
+    "?" <>
+      (query
+       |> Enum.reject(fn {_k, v} -> is_nil(v) or v == "" end)
+       |> Enum.map_join("&", fn {k, v} -> "#{k}=#{URI.encode_www_form(to_string(v))}" end))
+  end
+
+  defp split_image(image) do
+    case String.split(image, ":", parts: 2) do
+      [repo, tag] -> {repo, tag}
+      [repo] -> {repo, "latest"}
+    end
+  end
+
+  defp platform_query(opts), do: if(p = opts[:platform], do: [platform: p], else: [])
+
+  defp check_pull_stream(body) do
+    # /images/create streams newline-delimited JSON status objects; an
+    # errorDetail anywhere means the pull failed even though the HTTP status
+    # was 200.
+    if String.contains?(body, "errorDetail") or String.contains?(body, "\"error\""),
+      do: {:error, {:pull_failed, last_error_line(body)}},
+      else: :ok
+  end
+
+  defp last_error_line(body) do
+    body
+    |> String.split("\n", trim: true)
+    |> Enum.map(&Jason.decode/1)
+    |> Enum.find_value(body, fn
+      {:ok, %{"error" => e}} -> e
+      _ -> nil
+    end)
+  end
+
+  defp message(body) when is_map(body), do: Map.get(body, "message", inspect(body))
+  defp message(body), do: inspect(body)
+
+  defp bool(true), do: "true"
+  defp bool(false), do: "false"
+  defp bool(other), do: to_string(other)
+end

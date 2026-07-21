@@ -17,4 +17,6 @@ Mox.stub_with(Vagus.Backend.NetworkMock, Vagus.Backend.Network.HostStub)
 Mox.stub_with(Vagus.Backend.HostMock, Vagus.Backend.Host.HostStub)
 Mox.stub_with(Vagus.Backend.OSMock, Vagus.Backend.OS.HostStub)
 
-ExUnit.start()
+# Tests tagged `:docker` need a running Docker/balena-engine daemon on the
+# host socket; they're opt-in via `mix test --include docker`.
+ExUnit.start(exclude: [:docker])
