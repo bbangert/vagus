@@ -115,6 +115,12 @@ config :vagus, :docker_socket, "/run/balena-engine.sock"
 # data-root (see Vagus.Engine.Manager) applies to bind sources.
 config :vagus, :addon_data_root, "/root/vagus/addons"
 
+# Add-on DNS (M4-P1-T2). `Vagus.DNS` binds the hassio `dns` anchor
+# (172.30.32.3:53) and forwards names it doesn't own to this upstream
+# (`locals`); 1.1.1.1 keeps it a complete resolver for a host-networked Core
+# pointed at .3 with `--dns` and for add-ons resolving external hosts.
+config :vagus, :dns_upstream, "1.1.1.1"
+
 # Host-management backends (P4-T1) — the real vintage_net/Nerves.Runtime-
 # backed implementations. See config/host.exs for the :host-side stubs and
 # config/test.exs for the Mox mocks.

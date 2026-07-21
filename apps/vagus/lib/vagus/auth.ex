@@ -72,13 +72,26 @@ defmodule Vagus.Auth do
   # POST core api/hassio_auth {username,password,addon}; 200 ⇒ valid. Any
   # non-200, transport error, or "Core not connected yet"
   # (`{:error, :no_refresh_token}`) is a rejection.
+  #
+  # Prefer Core's Supervisor unix socket when configured: `api/hassio_auth`'s
+  # `_check_access` requires the request to originate from the SUPERVISOR IP or
+  # that socket, and the host-networked emulator can't present a `172.30.32.2`
+  # source over TCP — the socket is the channel that authenticates us as the
+  # Supervisor user (see `Vagus.Core.ApiSocket`). With no socket configured
+  # (host tests), fall back to the injectable TCP client.
   defp forward(username, password, addon_slug, core_client) do
-    body =
-      Jason.encode!(%{"username" => username, "password" => password, "addon" => addon_slug})
+    body = %{"username" => username, "password" => password, "addon" => addon_slug}
 
+    case Vagus.Core.ApiSocket.path() do
+      nil -> forward_tcp(body, core_client)
+      _socket -> match?({:ok, 200}, Vagus.Core.ApiSocket.post("/api/hassio_auth", body))
+    end
+  end
+
+  defp forward_tcp(body, core_client) do
     case core_client.request(:post, "/api/hassio_auth",
            headers: [{"content-type", "application/json"}],
-           body: body
+           body: Jason.encode!(body)
          ) do
       {:ok, %{status: 200}} -> true
       _ -> false

@@ -33,25 +33,35 @@ defmodule Vagus.Application do
         Vagus.Addon.State,
         Vagus.Services,
         Vagus.Discovery,
-        Vagus.Auth,
+        Vagus.Auth
+      ] ++
+        dns_children() ++
+        [
+          # Supervisor-API emulator's HTTP surface (Bandit + Plug.Router),
+          # isolated with its own restart budget so a crash there can't take
+          # down the rest of the app. Started on both :host and real targets
+          # — see `Vagus.API.Supervisor` for the isolation rationale.
+          {Vagus.API.Supervisor, []},
 
-        # Supervisor-API emulator's HTTP surface (Bandit + Plug.Router),
-        # isolated with its own restart budget so a crash there can't take
-        # down the rest of the app. Started on both :host and real targets
-        # — see `Vagus.API.Supervisor` for the isolation rationale.
-        {Vagus.API.Supervisor, []},
-
-        # Core-facing token handshake + event-push machinery (TokenStore,
-        # Finch, Client, EventPusher), isolated the same way. Started on
-        # both :host and real targets — see `Vagus.Core.Supervisor` for the
-        # isolation rationale.
-        {Vagus.Core.Supervisor, []}
-      ] ++ target_children()
+          # Core-facing token handshake + event-push machinery (TokenStore,
+          # Finch, Client, EventPusher), isolated the same way. Started on
+          # both :host and real targets — see `Vagus.Core.Supervisor` for the
+          # isolation rationale.
+          {Vagus.Core.Supervisor, []}
+        ] ++ target_children()
 
     # See https://elixir.hexdocs.pm/Supervisor.html
     # for other strategies and supported options
     opts = [strategy: :one_for_one, name: Vagus.Supervisor]
     Supervisor.start_link(children, opts)
+  end
+
+  # The `hassio` DNS server (M4-P1-T2), gated by `:dns_enabled` (false in
+  # test.exs so `mix test` never binds :53). On :host dev the .3 anchor / :53
+  # bind fails gracefully (logged, idle) since there's no hassio bridge; it
+  # does its real work on target.
+  defp dns_children do
+    if Application.get_env(:vagus, :dns_enabled, true), do: [Vagus.DNS], else: []
   end
 
   # List all child processes to be supervised

@@ -5,6 +5,11 @@ import Config
 # dangling listeners or racing port conflicts across runs (P2-T1).
 config :vagus, :api_server_enabled, false
 
+# Don't bind the DNS server (:53 / the .3 anchor) during `mix test` — the DNS
+# unit tests start their own instance on a loopback high port. Mirrors
+# :api_server_enabled.
+config :vagus, :dns_enabled, false
+
 # Strict-mode Vagus.API.Model: an undeclared/missing key raises instead of
 # just being logged, so a drifted field list fails the test suite loudly.
 config :vagus, :model_strict, true

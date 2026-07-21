@@ -77,6 +77,7 @@ defmodule Vagus.Addon.Manager do
          :ok <- backend(opts).start(id) do
       register_identity(config, token)
       record_state(config)
+      register_dns(config, id, opts)
       {:ok, %{id: id, access_token: token}}
     end
   end
@@ -241,6 +242,28 @@ defmodule Vagus.Addon.Manager do
   defp record_state(config) do
     if Process.whereis(Vagus.Addon.State), do: Vagus.Addon.State.put(config, :started)
     :ok
+  end
+
+  # Register `<slug-with-dashes>` → the container's hassio-bridge IP in the DNS
+  # server (§A6) so Core / other add-ons resolve the add-on by name. Best-effort:
+  # only for bridged add-ons, only when the DNS server + Docker inspect are
+  # available; any failure is logged and ignored (the add-on still runs).
+  defp register_dns(%Config{host_network: true}, _id, _opts), do: :ok
+
+  defp register_dns(%Config{slug: slug}, id, opts) do
+    with true <- is_pid(Process.whereis(Vagus.DNS)),
+         {:ok, %{"NetworkSettings" => %{"Networks" => networks}}} <-
+           Vagus.Runtime.Docker.inspect_container(id, network_opts(opts)),
+         %{"IPAddress" => ip} when is_binary(ip) and ip != "" <-
+           Map.get(networks, Network.name()) do
+      Vagus.DNS.register(String.replace(slug, "_", "-"), ip)
+    else
+      _ -> :ok
+    end
+  rescue
+    e ->
+      Logger.warning("Vagus.Addon.Manager: DNS register for #{slug} failed: #{inspect(e)}")
+      :ok
   end
 
   defp ensure_token(opts), do: Keyword.put_new(opts, :access_token, generate_token())
