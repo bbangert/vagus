@@ -14,16 +14,23 @@ defmodule Vagus.Addon.StoreView do
 
   alias Vagus.Addon.Config
 
-  @doc "The `StoreAddon` summary for `GET /store/addons` (and the `GET /store` list)."
-  @spec summary(String.t(), %{config: Config.t(), repository: String.t()}) :: map()
-  def summary(store_slug, %{config: config, repository: repo}) do
-    base_fields(store_slug, config, repo)
+  @doc """
+  The `StoreAddon` summary for `GET /store/addons` (and the `GET /store` list).
+
+  `installed?` is whether the add-on is currently installed locally — a
+  required `StoreAddon`/`StoreAddonComplete` field (found live in P5:
+  Core 2026.7.2's aiohasupervisor raises `MissingField` without it, killing
+  the whole hassio coordinator refresh).
+  """
+  @spec summary(String.t(), %{config: Config.t(), repository: String.t()}, boolean()) :: map()
+  def summary(store_slug, %{config: config, repository: repo}, installed?) do
+    base_fields(store_slug, config, repo, installed?)
   end
 
   @doc "The `StoreAddonComplete` detail for `GET /store/addons/{slug}`."
-  @spec detail(String.t(), %{config: Config.t(), repository: String.t()}) :: map()
-  def detail(store_slug, %{config: config, repository: repo}) do
-    base_fields(store_slug, config, repo)
+  @spec detail(String.t(), %{config: Config.t(), repository: String.t()}, boolean()) :: map()
+  def detail(store_slug, %{config: config, repository: repo}, installed?) do
+    base_fields(store_slug, config, repo, installed?)
     |> Map.merge(%{
       "apparmor" => if(config.apparmor, do: "default", else: "disable"),
       "auth_api" => config.auth_api,
@@ -42,11 +49,13 @@ defmodule Vagus.Addon.StoreView do
     })
   end
 
-  # AddonInfoBaseFields + AddonInfoStoreBaseFields, shared by both shapes.
-  defp base_fields(store_slug, config, repo) do
+  # AddonInfoBaseFields + AddonInfoStoreBaseFields + installed, shared by
+  # both shapes.
+  defp base_fields(store_slug, config, repo, installed?) do
     %{
       "advanced" => false,
       "available" => true,
+      "installed" => installed?,
       "build" => config.image == nil,
       "description" => config.description,
       "homeassistant" => nil,

@@ -133,7 +133,8 @@ config :vagus, :dns_upstream, "1.1.1.1"
 # `POST /store/reload` fetches + parses these into the catalog. `core` gives
 # the store-slug prefix (core_mosquitto), matching the Supervisor.
 config :vagus, :store_repositories, [
-  %{slug: "core", url: "https://github.com/home-assistant/addons", ref: "master"}
+  %{slug: "core", url: "https://github.com/home-assistant/addons", ref: "master"},
+  %{slug: "esphome", url: "https://github.com/esphome/home-assistant-addon", ref: "main"}
 ]
 
 # Core's Supervisor unix socket (M4 /auth). Core is run with

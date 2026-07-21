@@ -71,6 +71,14 @@ defmodule Vagus.MixProject do
       # See config/host.exs for usage.
       {:nerves_runtime, "~> 0.13.12"},
 
+      # Build-time only (`runtime: false`), never in a release: the globally
+      # installed nerves_bootstrap archive (needed by vagus_platform's
+      # firmware builds) injects a `nerves.bootstrap` step into
+      # `deps.get`/`deps.precompile` for the top-level project EVEN on
+      # MIX_TARGET=host, and that task hard-raises when the project doesn't
+      # declare :nerves. Same pattern as vagus_platform's own declaration.
+      {:nerves, "~> 1.13", runtime: false},
+
       # Supervises the balena-engine daemon as an OS process (engine
       # supervision, see Vagus.Engine.Manager).
       {:muontrap, "~> 1.8"},

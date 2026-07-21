@@ -195,7 +195,7 @@ defmodule Vagus.API.Router do
 
   get "/store/addons/:slug" do
     case Store.get(slug) do
-      {:ok, entry} -> Envelope.send_ok(conn, StoreView.detail(slug, entry))
+      {:ok, entry} -> Envelope.send_ok(conn, StoreView.detail(slug, entry, installed?(slug)))
       :error -> Envelope.send_error(conn, "Addon #{slug} does not exist in the store", 404)
     end
   end
@@ -812,8 +812,13 @@ defmodule Vagus.API.Router do
   end
 
   defp store_addon_summaries do
-    Store.catalog() |> Enum.map(fn {slug, entry} -> StoreView.summary(slug, entry) end)
+    Store.catalog()
+    |> Enum.map(fn {slug, entry} -> StoreView.summary(slug, entry, installed?(slug)) end)
   end
+
+  # Store slugs and installed-state slugs share the same namespace
+  # (`core_mosquitto` both in the catalog and in `Vagus.Addon.State`).
+  defp installed?(store_slug), do: match?({:ok, _}, State.get(store_slug))
 
   # The Repository wire shape (slug/name/source/url/maintainer, all strings).
   defp store_repositories do

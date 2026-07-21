@@ -377,4 +377,23 @@ defmodule Vagus.API.IngressProxyTest do
     assert %{"data" => %{"session" => session}} = json(resp)
     assert session =~ ~r/\A[0-9a-f]{128}\z/
   end
+
+  # `default_target/1`'s bridge branch needs a real docker daemon (out of
+  # scope here), but the `host_network: true` branch short-circuits before
+  # the docker inspect — regression test for the P5-T1 on-device 502
+  # (ESPHome is host-networked; its ingress port is bound on the emulator's
+  # own loopback, not a `hassio` bridge IP).
+  test "default_target resolves a host_network add-on to 127.0.0.1" do
+    slug = "ingress_hostnet_#{System.unique_integer([:positive])}"
+
+    {:ok, config} =
+      required_config(slug)
+      |> Map.put("host_network", true)
+      |> Vagus.Addon.Config.parse()
+
+    :ok = State.put(config, :started)
+    on_exit(fn -> State.delete(slug) end)
+
+    assert {:ok, {"127.0.0.1", 8099}} = Vagus.API.IngressProxy.default_target(slug)
+  end
 end

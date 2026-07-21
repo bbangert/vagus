@@ -126,7 +126,7 @@ defmodule Vagus.API.IngressProxy do
 
       {:ok, entry} ->
         with {:ok, port} <- resolve_port(entry),
-             {:ok, ip} <- resolve_ip(slug) do
+             {:ok, ip} <- resolve_ip(slug, entry) do
           {:ok, {ip, port}}
         end
     end
@@ -143,7 +143,13 @@ defmodule Vagus.API.IngressProxy do
 
   defp resolve_port(_entry), do: {:error, :no_ingress_port}
 
-  defp resolve_ip(slug) do
+  # A `host_network: true` add-on (e.g. ESPHome) has no `hassio` bridge IP —
+  # its ingress port is bound on the host itself, i.e. this emulator's
+  # loopback. Same rule as `Vagus.Addon.Watchdog.Probe`'s default
+  # `:host_ip_fun` (§B7).
+  defp resolve_ip(_slug, %{config: %{host_network: true}}), do: {:ok, "127.0.0.1"}
+
+  defp resolve_ip(slug, _entry) do
     id = "addon_#{slug}"
 
     with {:ok, %{"NetworkSettings" => %{"Networks" => networks}}} <-

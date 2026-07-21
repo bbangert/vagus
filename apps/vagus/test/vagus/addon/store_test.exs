@@ -97,7 +97,7 @@ defmodule Vagus.Addon.StoreTest do
 
   test "StoreView.summary is the StoreAddon shape with the store slug + repo" do
     catalog = Store.build_catalog(@repos, FixtureFetcher)
-    s = StoreView.summary("core_mosquitto", catalog["core_mosquitto"])
+    s = StoreView.summary("core_mosquitto", catalog["core_mosquitto"], false)
 
     assert s["slug"] == "core_mosquitto"
     assert s["repository"] == "core"
@@ -106,17 +106,19 @@ defmodule Vagus.Addon.StoreTest do
     assert s["version_latest"] == "7.1.0"
     assert s["arch"] == ["aarch64", "amd64"]
     assert s["build"] == false
+    assert s["installed"] == false
     refute Map.has_key?(s, "auth_api")
   end
 
   test "StoreView.detail adds the ext fields (StoreAddonComplete)" do
     catalog = Store.build_catalog(@repos, FixtureFetcher)
-    d = StoreView.detail("core_mosquitto", catalog["core_mosquitto"])
+    d = StoreView.detail("core_mosquitto", catalog["core_mosquitto"], true)
 
     assert d["slug"] == "core_mosquitto"
     assert d["auth_api"] == true
     assert d["hassio_role"] == "default"
     assert d["apparmor"] in ["default", "disable", "profile"]
     assert d["detached"] == false
+    assert d["installed"] == true
   end
 end
