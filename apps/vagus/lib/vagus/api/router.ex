@@ -55,8 +55,19 @@ defmodule Vagus.API.Router do
   # `Plug.Parsers`' 8MB default would let an unauthenticated caller (auth
   # runs after parsing) pressure a 1GB device's memory just by posting a
   # huge body.
+  #
+  # `pass: ["*/*"]` so a body whose content-type has no parser is skipped,
+  # not rejected with 415. Core's Supervisor client (`aiohasupervisor` via
+  # aiohttp) sends bodyless action POSTs — e.g. `supervisor/update` during
+  # entry setup while not yet onboarded — with `Content-Type:
+  # application/octet-stream, Content-Length: 0`. Without a pass-through the
+  # parser 415s before routing, and `aiohasupervisor` maps the non-400 to a
+  # generic error, so `hassio` never sees the route's honest 400 ("no update
+  # available") and wedges in ConfigEntryNotReady. The real Supervisor
+  # (aiohttp server) tolerates these, so we must too.
   plug(Plug.Parsers,
     parsers: [:json, :urlencoded],
+    pass: ["*/*"],
     json_decoder: Jason,
     length: 65_536
   )

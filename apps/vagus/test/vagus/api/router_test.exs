@@ -227,6 +227,39 @@ defmodule Vagus.API.RouterTest do
     end
   end
 
+  describe "bodyless POST with an unparseable content-type reaches its route (P2-T6 regression)" do
+    # Core's Supervisor client (aiohasupervisor via aiohttp) sends bodyless
+    # action POSTs — e.g. `supervisor/update` during entry setup while not
+    # yet onboarded — with `Content-Type: application/octet-stream,
+    # Content-Length: 0`. `Plug.Parsers` must pass these through (`pass:
+    # ["*/*"]`) rather than 415, or the route's honest 400 never runs and
+    # `hassio` wedges in ConfigEntryNotReady (mapped by the client to a
+    # generic "internal server error"). Regression for the host dev-loop gate.
+    test "POST /supervisor/update (octet-stream, empty body) -> route's 400, not 415" do
+      conn =
+        conn(:post, "/supervisor/update", "")
+        |> put_req_header("content-type", "application/octet-stream")
+        |> authed()
+        |> call()
+
+      assert conn.status == 400
+      body = json_body(conn)
+      assert body["result"] == "error"
+      assert body["message"] =~ "not supported"
+    end
+
+    test "POST /supervisor/reload (octet-stream, empty body) -> route's 200 ok, not 415" do
+      conn =
+        conn(:post, "/supervisor/reload", "")
+        |> put_req_header("content-type", "application/octet-stream")
+        |> authed()
+        |> call()
+
+      assert conn.status == 200
+      assert json_body(conn)["result"] == "ok"
+    end
+  end
+
   describe "network-interface + host-action routes (P4-T3/T4), against the default host-stub backends" do
     test "GET /network/interface/eth-host/info matches the pinned NetworkInterface key set" do
       conn = conn(:get, "/network/interface/eth-host/info") |> authed() |> call()
