@@ -89,6 +89,7 @@ defmodule Vagus.Addon.Manager do
     with :ok <- ensure_mount_sources(spec),
          :ok <- write_options(config, data_root, user_options),
          :ok <- maybe_ensure_network(config, opts),
+         :ok <- remove_stale_container(spec, opts),
          {:ok, id} <- backend(opts).create(spec),
          :ok <- start_or_cleanup(id, opts) do
       register_identity(config, token)
@@ -182,6 +183,18 @@ defmodule Vagus.Addon.Manager do
         purge_side_state(config.slug)
         remove_data_dir(config.slug, opts)
     end
+  end
+
+  # A container named `addon_<slug>` may already exist — e.g. after a device
+  # reboot or emulator restart, the previous session's container survives while
+  # the in-memory add-on state does not, and `create` would 409 on the fixed
+  # name. The real Supervisor's `DockerInterface.run` stops+removes any
+  # existing container before creating (§A1.4 — no restart policy, the manager
+  # owns the lifecycle), so do the same, tolerantly (absent/not-running is fine).
+  defp remove_stale_container(spec, opts) do
+    _ = backend(opts).stop(spec.name, [])
+    _ = backend(opts).remove(spec.name, [])
+    :ok
   end
 
   # Start the created container; if start fails, remove it (best-effort) so a

@@ -150,6 +150,18 @@ defmodule Vagus.Addon.ManagerTest do
       assert_received {:start, "fake-id"}
     end
 
+    test "start removes a stale same-name container before create (reboot orphan)",
+         %{config: config, data_root: dr} do
+      # After a device reboot the previous session's `addon_<slug>` container
+      # survives while in-memory state does not; `create` would 409 on the
+      # fixed name. Supervisor's `DockerInterface.run` stops+removes first.
+      assert {:ok, _} = Manager.start(config, backend: __MODULE__.FakeBackend, data_root: dr)
+
+      assert_received {:stop, "addon_test_addon"}
+      assert_received {:remove, "addon_test_addon"}
+      assert_received {:create, _spec}
+    end
+
     test "invalid options (schema mismatch) fail start before any create",
          %{data_root: dr} do
       {:ok, bad} =
