@@ -16,6 +16,35 @@ defmodule Vagus.Addon.State do
   updates `user_options` directly via `put_options/2` without touching
   lifecycle state or restarting the add-on.
 
+  ## Per-install persisted settings (IW-P0-T2)
+
+  Four more fields ride alongside `user_options`, needed by the upcoming
+  ingress + watchdog features (`docs/contract-2026.7-m4b-ingress-watchdog.md`
+  §B3.1, §B8):
+
+    * `ingress_token` — the real Supervisor generates this once at install
+      time (`secrets.token_urlsafe()`) and never regenerates it — unlike
+      `access_token`, which is reissued every start. Here it's generated
+      with `Base.url_encode64(:crypto.strong_rand_bytes(32), padding: false)`
+      the first time a slug's entry is created (charset `[-_A-Za-z0-9]`,
+      matching the real ingress middleware's
+      `/ingress/[-_A-Za-z0-9]+/.*` route regex) and then preserved verbatim
+      by every later `put/3` call, restart, and persistence round-trip —
+      the same "preserve unless this is a brand-new entry" rule `put/3`
+      already applies to `user_options`.
+    * `ingress_port` — `nil | pos_integer()`, default `nil`. The resolved
+      dynamic port; left unset here and allocated later by the ingress
+      subsystem (§B3.2).
+    * `ingress_panel` — boolean, default `false`. The user-facing sidebar
+      toggle (independent of the config-time `ingress` capability flag).
+    * `watchdog` — boolean, default `false`. The persisted watchdog
+      enable/disable (§B8) — there's no `config.yaml` default for this; it's
+      purely a per-install setting.
+
+  `put_setting/4` writes one of `ingress_port`/`ingress_panel`/`watchdog`
+  for an already-tracked slug (`:error` if untracked); `ingress_token` has
+  no setter since nothing ever changes it once assigned.
+
   ## Persistence (M4-P8-T1)
 
   Real Supervisor persists installed add-ons + their options to
@@ -23,22 +52,29 @@ defmodule Vagus.Addon.State do
   emulator would need every add-on reinstalled by hand after every reboot.
   `opts[:persist_path]` (falling back to `config :vagus, :addon_state_path`)
   names a JSON file this GenServer loads from at `init/1` and write-throughs
-  to after every mutating call (`put/3`, `put_options/3`, `delete/2`); `nil`
-  (the default in `config/test.exs`, and implicitly on `:host` where it's
-  never set) disables persistence entirely — pure in-memory, the original
-  behavior.
+  to after every mutating call (`put/3`, `put_options/3`, `put_setting/4`,
+  `delete/2`); `nil` (the default in `config/test.exs`, and implicitly on
+  `:host` where it's never set) disables persistence entirely — pure
+  in-memory, the original behavior.
 
   The file holds `{"version": 1, "addons": {"<slug>": {"config": <raw
   Config.to_persistable/1 map>, "state": "started"|"stopped",
-  "user_options": {...}}}}`. `Config.parse/1` — not this module — is the
-  single validator on reload: each entry's `config` is re-parsed (and its
-  key checked against the parsed slug) at `init/1`, and anything
-  invalid/mismatched, or a file that's missing/unreadable/not-JSON, is
-  logged and dropped rather than crashing boot — a corrupt state file must
-  never brick the device. Writes are `mkdir_p` + write-to-`.tmp` +
-  `File.rename` (atomic against a mid-write power loss) and best-effort: a
-  write failure is logged and the lifecycle call still succeeds, since a
-  flash write failure is not a reason to fail an add-on start/stop.
+  "user_options": {...}, "ingress_token": "...", "ingress_port":
+  null|<port>, "ingress_panel": bool, "watchdog": bool}}}`.
+  `Config.parse/1` — not this module — is the single validator on reload:
+  each entry's `config` is re-parsed (and its key checked against the
+  parsed slug) at `init/1`, and anything invalid/mismatched, or a file
+  that's missing/unreadable/not-JSON, is logged and dropped rather than
+  crashing boot — a corrupt state file must never brick the device. The
+  four new fields are decoded tolerantly rather than invalidating the whole
+  entry: a missing/non-string `ingress_token` gets a freshly generated one
+  (old files predate the field), a missing/invalid `ingress_port` falls
+  back to `nil`, and a missing/non-boolean `ingress_panel`/`watchdog` falls
+  back to `false` — the format is purely additive, so the version number
+  doesn't change. Writes are `mkdir_p` + write-to-`.tmp` + `File.rename`
+  (atomic against a mid-write power loss) and best-effort: a write failure
+  is logged and the lifecycle call still succeeds, since a flash write
+  failure is not a reason to fail an add-on start/stop.
   """
 
   use GenServer
@@ -47,7 +83,15 @@ defmodule Vagus.Addon.State do
 
   alias Vagus.Addon.Config
 
-  @type entry :: %{config: Config.t(), state: :started | :stopped, user_options: map()}
+  @type entry :: %{
+          config: Config.t(),
+          state: :started | :stopped,
+          user_options: map(),
+          ingress_token: String.t(),
+          ingress_port: nil | pos_integer(),
+          ingress_panel: boolean(),
+          watchdog: boolean()
+        }
 
   @persist_version 1
 
@@ -85,6 +129,26 @@ defmodule Vagus.Addon.State do
     GenServer.call(server, {:put_options, slug, user_options})
   end
 
+  @doc """
+  Writes one persisted per-install setting for `slug` — `:ingress_port`,
+  `:ingress_panel`, or `:watchdog` (`ingress_token` has no setter; it's
+  generated once and never changes). `:error` if `slug` isn't tracked (not
+  installed). The guard clause is load-bearing: it's the only thing
+  stopping a typo'd/unknown key from being written straight to the entry
+  map and silently persisted.
+  """
+  @spec put_setting(
+          String.t(),
+          :ingress_port | :ingress_panel | :watchdog,
+          term(),
+          GenServer.server()
+        ) ::
+          :ok | :error
+  def put_setting(slug, key, value, server \\ __MODULE__)
+      when key in [:ingress_port, :ingress_panel, :watchdog] do
+    GenServer.call(server, {:put_setting, slug, key, value})
+  end
+
   @doc "Removes `slug` (e.g. on uninstall). Returns `:ok` even if absent."
   @spec delete(String.t(), GenServer.server()) :: :ok
   def delete(slug, server \\ __MODULE__) do
@@ -115,7 +179,11 @@ defmodule Vagus.Addon.State do
         } = s
       ) do
     resolved_options = user_options || existing_user_options(entries, slug)
-    entry = %{config: config, state: state, user_options: resolved_options}
+
+    entry =
+      %{config: config, state: state, user_options: resolved_options}
+      |> Map.merge(preserved_settings(entries, slug))
+
     entries = Map.put(entries, slug, entry)
     persist(s.path, entries)
     {:reply, :ok, %{s | entries: entries}}
@@ -129,6 +197,18 @@ defmodule Vagus.Addon.State do
     case Map.fetch(entries, slug) do
       {:ok, entry} ->
         entries = Map.put(entries, slug, %{entry | user_options: user_options})
+        persist(s.path, entries)
+        {:reply, :ok, %{s | entries: entries}}
+
+      :error ->
+        {:reply, :error, s}
+    end
+  end
+
+  def handle_call({:put_setting, slug, key, value}, _from, %{entries: entries} = s) do
+    case Map.fetch(entries, slug) do
+      {:ok, entry} ->
+        entries = Map.put(entries, slug, Map.put(entry, key, value))
         persist(s.path, entries)
         {:reply, :ok, %{s | entries: entries}}
 
@@ -152,6 +232,40 @@ defmodule Vagus.Addon.State do
       %{user_options: opts} -> opts
       nil -> %{}
     end
+  end
+
+  # Same "preserve unless this is a brand-new entry" rule as
+  # `existing_user_options/2`, for the four settings introduced in
+  # IW-P0-T2: an existing slug keeps whatever it already has (in
+  # particular `ingress_token`, which must never regenerate), while a
+  # genuinely new install gets defaults plus a freshly generated token.
+  defp preserved_settings(entries, slug) do
+    case Map.get(entries, slug) do
+      %{
+        ingress_token: token,
+        ingress_port: port,
+        ingress_panel: panel,
+        watchdog: watchdog
+      } ->
+        %{ingress_token: token, ingress_port: port, ingress_panel: panel, watchdog: watchdog}
+
+      nil ->
+        %{
+          ingress_token: generate_ingress_token(),
+          ingress_port: nil,
+          ingress_panel: false,
+          watchdog: false
+        }
+    end
+  end
+
+  # Charset `[-_A-Za-z0-9]` (URL-safe base64, no padding) — matches the real
+  # ingress middleware's `/ingress/[-_A-Za-z0-9]+/.*` route regex
+  # (`docs/contract-2026.7-m4b-ingress-watchdog.md` §B3.1). Generated once
+  # per slug at entry creation and never regenerated, mirroring the real
+  # Supervisor's `secrets.token_urlsafe()` at install time.
+  defp generate_ingress_token do
+    Base.url_encode64(:crypto.strong_rand_bytes(32), padding: false)
   end
 
   ## Persistence internals
@@ -218,7 +332,17 @@ defmodule Vagus.Addon.State do
          true <- config.slug == slug,
          {:ok, state} <- decode_state(state_raw) do
       user_options = Map.get(raw, "user_options", %{})
-      {:ok, %{config: config, state: state, user_options: user_options}}
+
+      {:ok,
+       %{
+         config: config,
+         state: state,
+         user_options: user_options,
+         ingress_token: decode_ingress_token(raw),
+         ingress_port: decode_ingress_port(raw),
+         ingress_panel: decode_bool_setting(raw, "ingress_panel"),
+         watchdog: decode_bool_setting(raw, "watchdog")
+       }}
     else
       _ ->
         Logger.warning(
@@ -237,6 +361,34 @@ defmodule Vagus.Addon.State do
   defp decode_state("started"), do: {:ok, :started}
   defp decode_state("stopped"), do: {:ok, :stopped}
   defp decode_state(_other), do: :error
+
+  # Missing/non-string -> freshly generated (old files predate the field,
+  # and a garbage value here is worse than a working one — this token gates
+  # ingress URL access).
+  defp decode_ingress_token(raw) do
+    case Map.get(raw, "ingress_token") do
+      token when is_binary(token) -> token
+      _ -> generate_ingress_token()
+    end
+  end
+
+  # Missing/invalid (non-integer, zero, or negative) -> nil, same as a
+  # never-allocated port; the ingress subsystem allocates a real one later.
+  defp decode_ingress_port(raw) do
+    case Map.get(raw, "ingress_port") do
+      port when is_integer(port) and port > 0 -> port
+      _ -> nil
+    end
+  end
+
+  # Missing/non-boolean -> false, the documented default for both
+  # `ingress_panel` and `watchdog`.
+  defp decode_bool_setting(raw, key) do
+    case Map.get(raw, key) do
+      value when is_boolean(value) -> value
+      _ -> false
+    end
+  end
 
   defp persist(nil, _entries), do: :ok
 
@@ -264,12 +416,25 @@ defmodule Vagus.Addon.State do
     %{
       "version" => @persist_version,
       "addons" =>
-        Map.new(entries, fn {slug, %{config: config, state: state, user_options: user_options}} ->
+        Map.new(entries, fn {slug,
+                             %{
+                               config: config,
+                               state: state,
+                               user_options: user_options,
+                               ingress_token: ingress_token,
+                               ingress_port: ingress_port,
+                               ingress_panel: ingress_panel,
+                               watchdog: watchdog
+                             }} ->
           {slug,
            %{
              "config" => Config.to_persistable(config),
              "state" => Atom.to_string(state),
-             "user_options" => user_options
+             "user_options" => user_options,
+             "ingress_token" => ingress_token,
+             "ingress_port" => ingress_port,
+             "ingress_panel" => ingress_panel,
+             "watchdog" => watchdog
            }}
         end)
     }

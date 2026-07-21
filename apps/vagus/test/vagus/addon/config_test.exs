@@ -22,6 +22,11 @@ defmodule Vagus.Addon.ConfigTest do
       assert c.init == true
       assert c.hassio_role == "default"
       assert c.ingress_port == 8099
+      assert c.ingress_entry == nil
+      assert c.ingress_stream == false
+      assert c.panel_icon == "mdi:puzzle"
+      assert c.panel_title == nil
+      assert c.panel_admin == true
       assert c.apparmor == true
       assert c.backup == "hot"
       assert c.timeout == 10
@@ -82,6 +87,118 @@ defmodule Vagus.Addon.ConfigTest do
         assert {:ok, c} = Config.parse(%{@required | "version" => good})
         assert c.version == good
       end
+    end
+  end
+
+  describe "ingress + panel config (§B3.1)" do
+    test "new fields parse with their documented defaults" do
+      assert {:ok, c} = Config.parse(@required)
+      assert c.ingress == false
+      assert c.ingress_port == 8099
+      assert c.ingress_entry == nil
+      assert c.ingress_stream == false
+      assert c.panel_icon == "mdi:puzzle"
+      assert c.panel_title == nil
+      assert c.panel_admin == true
+    end
+
+    test "new fields parse when set explicitly" do
+      raw =
+        Map.merge(@required, %{
+          "ingress" => true,
+          "ingress_port" => 8123,
+          "ingress_entry" => "dashboard",
+          "ingress_stream" => true,
+          "panel_icon" => "mdi:chip",
+          "panel_title" => "My Panel",
+          "panel_admin" => false
+        })
+
+      assert {:ok, c} = Config.parse(raw)
+      assert c.ingress == true
+      assert c.ingress_port == 8123
+      assert c.ingress_entry == "dashboard"
+      assert c.ingress_stream == true
+      assert c.panel_icon == "mdi:chip"
+      assert c.panel_title == "My Panel"
+      assert c.panel_admin == false
+    end
+
+    test "ingress_port accepts exactly 0 (dynamic assignment)" do
+      assert {:ok, c} = Config.parse(Map.put(@required, "ingress_port", 0))
+      assert c.ingress_port == 0
+    end
+
+    test "ingress_port accepts the upper bound 65535" do
+      assert {:ok, c} = Config.parse(Map.put(@required, "ingress_port", 65_535))
+      assert c.ingress_port == 65_535
+    end
+
+    test "ingress_port rejects negative values" do
+      assert {:error, msg} = Config.parse(Map.put(@required, "ingress_port", -1))
+      assert msg =~ "ingress_port"
+    end
+
+    test "ingress_port rejects values above 65535" do
+      assert {:error, msg} = Config.parse(Map.put(@required, "ingress_port", 70_000))
+      assert msg =~ "ingress_port"
+    end
+
+    test "panel_icon rejects a non-string value" do
+      assert {:error, msg} = Config.parse(Map.put(@required, "panel_icon", 123))
+      assert msg =~ "panel_icon"
+    end
+
+    # §B3.2 last paragraph: ingress_port: 0 + a ports: host value in the
+    # dynamic ingress range (62000-65500) would let a client bypass the
+    # ingress session-cookie check by hitting the add-on directly.
+    test "ingress_port: 0 + a ports: host value in 62000-65500 is a parse error" do
+      raw =
+        Map.merge(@required, %{
+          "ingress_port" => 0,
+          "ports" => %{"8099/tcp" => 62_500}
+        })
+
+      assert {:error, msg} = Config.parse(raw)
+      assert msg =~ "ingress_port"
+    end
+
+    test "ingress_port: 0 + a ports: host value outside the dynamic range parses fine" do
+      raw =
+        Map.merge(@required, %{
+          "ingress_port" => 0,
+          "ports" => %{"8099/tcp" => 8123}
+        })
+
+      assert {:ok, c} = Config.parse(raw)
+      assert c.ingress_port == 0
+    end
+
+    test "a non-zero ingress_port alongside a ports: value in the dynamic range is fine" do
+      raw =
+        Map.merge(@required, %{
+          "ingress_port" => 8099,
+          "ports" => %{"8099/tcp" => 62_500}
+        })
+
+      assert {:ok, c} = Config.parse(raw)
+      assert c.ingress_port == 8099
+    end
+
+    test "round-trips through to_persistable/1 with every new field set" do
+      raw =
+        Map.merge(@required, %{
+          "ingress" => true,
+          "ingress_port" => 0,
+          "ingress_entry" => "dashboard",
+          "ingress_stream" => true,
+          "panel_icon" => "mdi:chip",
+          "panel_title" => "My Panel",
+          "panel_admin" => false
+        })
+
+      assert {:ok, c} = Config.parse(raw)
+      assert Config.parse(Config.to_persistable(c)) == {:ok, c}
     end
   end
 
@@ -233,6 +350,11 @@ defmodule Vagus.Addon.ConfigTest do
         "apparmor" => false,
         "ingress" => true,
         "ingress_port" => 8123,
+        "ingress_entry" => "dashboard",
+        "ingress_stream" => true,
+        "panel_icon" => "mdi:chip",
+        "panel_title" => "My Panel",
+        "panel_admin" => false,
         "watchdog" => "tcp://[HOST]:1234",
         "webui" => "http://[HOST]:8123",
         "options" => %{"greeting" => "hi", "count" => 3, "nested" => %{"a" => [1, 2, 3]}},

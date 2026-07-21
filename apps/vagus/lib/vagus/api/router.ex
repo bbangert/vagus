@@ -220,7 +220,7 @@ defmodule Vagus.API.Router do
 
   # Backed by `Vagus.Addon.State` (not `StaticData`, unlike most other GETs
   # here) — the installed-addon list a `POST .../install` grows and a
-  # `POST .../uninstall` shrinks. Each entry reuses `Vagus.Addon.Info.render/3`
+  # `POST .../uninstall` shrinks. Each entry reuses `Vagus.Addon.Info.render/4`
   # (the `GET /addons/{slug}/info` shape, a superset of the wire's
   # `InstalledAddon`) rather than a separate summary builder — `AddonsList`
   # only pins the outer `addons` key (`Vagus.API.Model`), so the extra fields
@@ -234,18 +234,27 @@ defmodule Vagus.API.Router do
   # discovery fetches this for a discovery message's provider slug to resolve
   # the add-on name before creating the config flow. Readable by the supervisor
   # (Core) for any slug, and by an add-on for itself (`self` or its own slug).
+  #
+  # `GET /addons/self/info` resolves through `resolve_info_slug/2` to the
+  # caller's own slug and hits this same clause, so an ingress add-on reading
+  # its own info gets its resolved dynamic `ingress_port` back exactly the way
+  # `bashio::addon.ingress_port` expects (§B3.2 fact 5) — no separate path
+  # needed for the self-read case.
   get "/addons/:slug/info" do
     caller = conn.assigns.caller
 
     with {:ok, resolved} <- resolve_info_slug(slug, caller),
-         {:ok, %{config: config, state: state}} <- Vagus.Addon.State.get(resolved) do
+         {:ok, %{config: config, state: state} = entry} <- Vagus.Addon.State.get(resolved) do
       options =
         case read_addon_options(resolved) do
           {:ok, opts} -> opts
           :error -> config.options
         end
 
-      Envelope.send_ok(conn, Vagus.Addon.Info.render(config, state, options))
+      Envelope.send_ok(
+        conn,
+        Vagus.Addon.Info.render(config, state, options, ingress_settings(entry))
+      )
     else
       {:error, :forbidden} -> Envelope.send_error(conn, "Not authorized for this add-on", 403)
       _ -> Envelope.send_error(conn, "Add-on #{slug} does not exist", 404)
@@ -318,15 +327,18 @@ defmodule Vagus.API.Router do
     lifecycle_action(conn, slug, fn -> Manager.uninstall(slug) end)
   end
 
-  # `POST /addons/{slug}/options` (SCHEMA_OPTIONS). M4 only implements the
-  # `options` key: `null` resets to no user options, a map is validated
-  # against the add-on's schema (merged over its config defaults, mirroring
-  # what `Manager.start/2` would write) and — only if valid — stored via
-  # `State.put_options/2`. Other SCHEMA_OPTIONS keys (`boot`, `watchdog`,
-  # `auto_update`, …) aren't modeled yet; they're accepted and ignored rather
-  # than 400ing a caller that also sets them. Never restarts the add-on
-  # itself — the caller is expected to follow up with `.../restart` if it
-  # wants the new options live.
+  # `POST /addons/{slug}/options` (SCHEMA_OPTIONS). Implements three keys:
+  # `options` (`null` resets to no user options, a map is validated against
+  # the add-on's schema — merged over its config defaults, mirroring what
+  # `Manager.start/2` would write — and, only if valid, stored raw via
+  # `State.put_options/2`), `watchdog`, and `ingress_panel` (both booleans,
+  # persisted via `State.put_setting/3` — §B3.1/§B8 of
+  # `docs/contract-2026.7-m4b-ingress-watchdog.md`; the real Supervisor sets
+  # both from this same handler, sharing `SCHEMA_OPTIONS`). Other
+  # SCHEMA_OPTIONS keys (`boot`, `auto_update`, …) aren't modeled yet;
+  # they're accepted and ignored rather than 400ing a caller that also sets
+  # them. Never restarts the add-on itself — the caller is expected to
+  # follow up with `.../restart` if it wants the new options live.
   post "/addons/:slug/options" do
     handle_addon_options(conn, slug)
   end
@@ -399,9 +411,54 @@ defmodule Vagus.API.Router do
   # Polled by hassio's addon_panel setup at every Core boot (observed on
   # device 2026-07-20: 404 here logs "Can't read panel info: not found").
   # Raw-dict path in Core (no aiohasupervisor model) — `data["panels"]` is a
-  # map of addon-slug → panel config; honestly empty with no add-ons.
+  # map of addon-slug → panel config. Backed by `Vagus.Ingress.Panels.list/1`
+  # (IW-P2-T3; §B4.1) — one entry per installed ingress-capable add-on,
+  # `enable` reflecting its `ingress_panel` toggle. Auth is unchanged: §B1.4
+  # explicitly does NOT put this route in the ingress-proxy's
+  # no-security-check bypass, so it goes through the router's normal
+  # token-validation middleware like every other route (any authenticated
+  # caller, not just the supervisor/Core).
   get "/ingress/panels" do
-    Envelope.send_ok(conn, %{panels: %{}})
+    Envelope.send_ok(conn, %{panels: Vagus.Ingress.Panels.list()})
+  end
+
+  # -- Ingress session lifecycle (IW-P2-T1; §B1.1/B1.2) ----------------------
+  # Both routes are `@require_home_assistant` upstream: only a caller
+  # authenticated as Core's own Supervisor token may create/renew a session
+  # — resolved to `:supervisor` by `Vagus.API.Auth`, same as `home_assistant?`
+  # elsewhere in this router. Deliberately **401**, not this router's usual
+  # 403-for-wrong-caller pattern (e.g. `supervisor_only/2`'s backup routes) —
+  # upstream's `@require_home_assistant` wrapper raises `HTTPUnauthorized`
+  # specifically, and the contract calls this out as the one place a
+  # wrong-caller rejection isn't a 403.
+  post "/ingress/session" do
+    if conn.assigns.caller == :supervisor do
+      # `session_data_user_id` (§B1.1) would resolve an HA user via
+      # `sys_homeassistant.list_users()` to attach to the session; this
+      # emulator doesn't model HA users, so the key is accepted (no 400) and
+      # simply ignored.
+      {:ok, token} = Vagus.Ingress.create_session()
+      Envelope.send_ok(conn, %{session: token})
+    else
+      Envelope.send_error(conn, "unauthorized", 401)
+    end
+  end
+
+  post "/ingress/validate_session" do
+    if conn.assigns.caller == :supervisor do
+      case Map.fetch(conn.body_params, "session") do
+        {:ok, session} when is_binary(session) ->
+          case Vagus.Ingress.validate_session(session) do
+            :ok -> Envelope.send_ok(conn, %{})
+            :error -> Envelope.send_error(conn, "Session does not exist", 401)
+          end
+
+        _missing_or_invalid ->
+          Envelope.send_error(conn, "session is required", 400)
+      end
+    else
+      Envelope.send_error(conn, "unauthorized", 401)
+    end
   end
 
   # -- Discovery registry (§A3.2) --------------------------------------------
@@ -775,15 +832,21 @@ defmodule Vagus.API.Router do
 
   # `GET /addons` entry: the effective options (falling back to the config
   # defaults, same as `/addons/{slug}/info`) rendered through
-  # `Vagus.Addon.Info.render/3`.
-  defp addon_list_entry(%{config: config, state: state}) do
+  # `Vagus.Addon.Info.render/4`.
+  defp addon_list_entry(%{config: config, state: state} = entry) do
     options =
       case read_addon_options(config.slug) do
         {:ok, opts} -> opts
         :error -> config.options
       end
 
-    Vagus.Addon.Info.render(config, state, options)
+    Vagus.Addon.Info.render(config, state, options, ingress_settings(entry))
+  end
+
+  # `Vagus.Addon.Info.render/4`'s `settings` param is exactly the State
+  # entry's ingress/watchdog fields, minus `config`/`state`/`user_options`.
+  defp ingress_settings(entry) do
+    Map.take(entry, [:ingress_token, :ingress_port, :ingress_panel, :watchdog])
   end
 
   defp handle_install(conn, slug) do
@@ -835,41 +898,115 @@ defmodule Vagus.API.Router do
           Envelope.send_error(conn, "Addon #{slug} does not exist", 404)
 
         {:ok, %{config: config}} ->
-          apply_addon_options(conn, slug, config, Map.fetch(conn.body_params, "options"))
+          apply_addon_options(conn, slug, config, conn.body_params)
       end
     else
       Envelope.send_error(conn, "unauthorized", 403)
     end
   end
 
-  # `options: nil` resets to no user options; a map is validated (merged over
-  # the config defaults, mirroring `Manager.start/2`'s own write path) before
-  # being stored raw (not the merged/validated result — `start_slug/2` redoes
-  # that merge+validate itself against whatever the config looks like at
-  # start time). Any other SCHEMA_OPTIONS key (or no `options` key at all) is
-  # accepted and ignored.
-  defp apply_addon_options(conn, slug, _config, {:ok, nil}) do
-    :ok = State.put_options(slug, %{})
-    Envelope.send_ok(conn, %{})
-  end
-
-  defp apply_addon_options(conn, slug, config, {:ok, options}) when is_map(options) do
-    case OptionsSchema.effective(config.schema, config.options, options) do
-      {:ok, _validated} ->
-        :ok = State.put_options(slug, options)
-        Envelope.send_ok(conn, %{})
-
-      {:error, _reason} ->
-        Envelope.send_error(conn, "Invalid options", 400)
+  # Validates every known key present in the body *before* applying any of
+  # them — a 400 from a bad `watchdog` must not leave a valid `options` half
+  # -applied — then applies whichever of the three were present. A body with
+  # none of `options`/`watchdog`/`ingress_panel` (or only unmodeled keys like
+  # `boot`) is accepted and ignored, matching the pre-existing
+  # accept-and-ignore behavior for SCHEMA_OPTIONS keys this emulator doesn't
+  # implement.
+  defp apply_addon_options(conn, slug, config, body) do
+    with {:ok, options_action} <- validate_options_key(body, config),
+         {:ok, watchdog_action} <- validate_watchdog_key(body),
+         {:ok, ingress_panel_action} <- validate_ingress_panel_key(body) do
+      apply_options_action(slug, options_action)
+      apply_watchdog_action(slug, config, watchdog_action)
+      apply_ingress_panel_action(slug, ingress_panel_action)
+      Envelope.send_ok(conn, %{})
+    else
+      {:error, message} -> Envelope.send_error(conn, message, 400)
     end
   end
 
-  defp apply_addon_options(conn, _slug, _config, {:ok, _other}) do
-    Envelope.send_error(conn, "options must be an object or null", 400)
+  # `options: nil` resets to no user options; a map is validated (merged over
+  # the config defaults, mirroring `Manager.start/2`'s own write path) —
+  # stored raw if valid (not the merged/validated result — `start_slug/2`
+  # redoes that merge+validate itself against whatever the config looks like
+  # at start time). No `options` key at all is a no-op, not an error.
+  defp validate_options_key(body, config) do
+    case Map.fetch(body, "options") do
+      :error ->
+        {:ok, :none}
+
+      {:ok, nil} ->
+        {:ok, :reset}
+
+      {:ok, options} when is_map(options) ->
+        case OptionsSchema.effective(config.schema, config.options, options) do
+          {:ok, _validated} -> {:ok, {:set, options}}
+          {:error, _reason} -> {:error, "Invalid options"}
+        end
+
+      {:ok, _other} ->
+        {:error, "options must be an object or null"}
+    end
   end
 
-  defp apply_addon_options(conn, _slug, _config, :error) do
-    Envelope.send_ok(conn, %{})
+  defp apply_options_action(_slug, :none), do: :ok
+  defp apply_options_action(slug, :reset), do: State.put_options(slug, %{})
+  defp apply_options_action(slug, {:set, options}), do: State.put_options(slug, options)
+
+  # `watchdog` must be a boolean when present; no key at all is a no-op.
+  defp validate_watchdog_key(body) do
+    case Map.fetch(body, "watchdog") do
+      :error -> {:ok, :none}
+      {:ok, value} when is_boolean(value) -> {:ok, {:set, value}}
+      {:ok, _other} -> {:error, "watchdog must be a boolean"}
+    end
+  end
+
+  # `startup: "once"` add-ons silently ignore a `watchdog: true` POST
+  # (contract §B8 — the real Supervisor's `App.watchdog` setter logs a
+  # warning and drops it rather than persisting a watchdog on a one-shot
+  # container) but still return 200, matching the real handler's behavior of
+  # never 400ing over this. `false` is always honored (there's nothing
+  # unsafe about explicitly disabling a watchdog that could never have been
+  # enabled).
+  defp apply_watchdog_action(_slug, _config, :none), do: :ok
+
+  defp apply_watchdog_action(slug, %{startup: "once"}, {:set, true}) do
+    Logger.warning(
+      "Vagus.API.Router: ignoring watchdog=true for #{slug} (startup: once add-ons never watchdog)"
+    )
+
+    :ok
+  end
+
+  defp apply_watchdog_action(slug, _config, {:set, value}) do
+    :ok = State.put_setting(slug, :watchdog, value)
+  end
+
+  # `ingress_panel` must be a boolean when present; no key at all is a no-op.
+  # The Core panel push the real Supervisor also does here
+  # (`sys_ingress.update_hass_panel`, contract §B4.4) is applied by
+  # `apply_ingress_panel_action/2` below, right after persisting the toggle.
+  defp validate_ingress_panel_key(body) do
+    case Map.fetch(body, "ingress_panel") do
+      :error -> {:ok, :none}
+      {:ok, value} when is_boolean(value) -> {:ok, {:set, value}}
+      {:ok, _other} -> {:error, "ingress_panel must be a boolean"}
+    end
+  end
+
+  defp apply_ingress_panel_action(_slug, :none), do: :ok
+
+  defp apply_ingress_panel_action(slug, {:set, value}) do
+    :ok = State.put_setting(slug, :ingress_panel, value)
+
+    # §B4.4: real Supervisor `await`s `sys_ingress.update_hass_panel(app)`
+    # inside this same request. Ours fire-and-forgets (the default async
+    # path in `Vagus.Ingress.Panels.update_hass_panel/2`) so this options
+    # POST never blocks on Core's availability — see that function's
+    # moduledoc for why that's safe (Core re-fetches the full panel list
+    # itself rather than trusting the push body).
+    Vagus.Ingress.Panels.update_hass_panel(slug)
   end
 
   # -- backup helpers (M4-P6-T2; §A4) -----------------------------------------

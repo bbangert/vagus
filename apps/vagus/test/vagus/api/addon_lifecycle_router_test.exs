@@ -266,6 +266,71 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
     test "options is supervisor-only (403)" do
       assert addon_call(:post, "/addons/core_opts/options", "core_opts").status == 403
     end
+
+    test "watchdog: true is persisted" do
+      conn = supervisor_call(:post, "/addons/core_opts/options", %{"watchdog" => true})
+      assert conn.status == 200
+      assert {:ok, %{watchdog: true}} = State.get("core_opts")
+    end
+
+    test "watchdog: false is persisted" do
+      :ok = State.put_setting("core_opts", :watchdog, true)
+      conn = supervisor_call(:post, "/addons/core_opts/options", %{"watchdog" => false})
+      assert conn.status == 200
+      assert {:ok, %{watchdog: false}} = State.get("core_opts")
+    end
+
+    test "watchdog: true on a startup: once add-on is silently ignored (200, stays false)" do
+      config = fixture_config("once") |> Map.put(:slug, "core_once") |> Map.put(:startup, "once")
+      :ok = State.put(config, :stopped)
+      on_exit(fn -> State.delete("core_once") end)
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          conn = supervisor_call(:post, "/addons/core_once/options", %{"watchdog" => true})
+          assert conn.status == 200
+        end)
+
+      assert log =~ "ignoring watchdog=true"
+      assert {:ok, %{watchdog: false}} = State.get("core_once")
+    end
+
+    test "ingress_panel is persisted" do
+      conn = supervisor_call(:post, "/addons/core_opts/options", %{"ingress_panel" => true})
+      assert conn.status == 200
+      assert {:ok, %{ingress_panel: true}} = State.get("core_opts")
+    end
+
+    test "a non-boolean watchdog -> 400, nothing persisted" do
+      conn = supervisor_call(:post, "/addons/core_opts/options", %{"watchdog" => "yes"})
+      assert conn.status == 400
+      assert body(conn)["message"] =~ "watchdog must be a boolean"
+      assert {:ok, %{watchdog: false}} = State.get("core_opts")
+    end
+
+    test "a non-boolean ingress_panel -> 400, nothing persisted" do
+      conn = supervisor_call(:post, "/addons/core_opts/options", %{"ingress_panel" => "yes"})
+      assert conn.status == 400
+      assert body(conn)["message"] =~ "ingress_panel must be a boolean"
+      assert {:ok, %{ingress_panel: false}} = State.get("core_opts")
+    end
+
+    test "a body with only watchdog (no options key) succeeds" do
+      conn = supervisor_call(:post, "/addons/core_opts/options", %{"watchdog" => true})
+      assert conn.status == 200
+      assert {:ok, %{watchdog: true, user_options: %{}}} = State.get("core_opts")
+    end
+
+    test "a bad watchdog alongside a valid options map -> 400, options NOT applied" do
+      conn =
+        supervisor_call(:post, "/addons/core_opts/options", %{
+          "watchdog" => "yes",
+          "options" => %{"greeting" => "hey"}
+        })
+
+      assert conn.status == 400
+      assert {:ok, %{user_options: %{}, watchdog: false}} = State.get("core_opts")
+    end
   end
 
   describe "GET /addons" do

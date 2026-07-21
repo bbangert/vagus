@@ -69,6 +69,90 @@ defmodule Vagus.Addon.StateTest do
     assert :error = State.put_options("nope", %{"a" => 1}, s)
   end
 
+  describe "per-install settings (IW-P0-T2)" do
+    test "a new entry gets a freshly generated token and default settings", %{config: c, s: s} do
+      :ok = State.put(c, :started, server: s)
+
+      assert {:ok,
+              %{
+                ingress_token: token,
+                ingress_port: nil,
+                ingress_panel: false,
+                watchdog: false
+              }} = State.get("core_mosquitto", s)
+
+      assert is_binary(token)
+      assert token =~ ~r/^[-_A-Za-z0-9]+$/
+    end
+
+    test "the ingress_token is generated once and stable across a later put/3", %{
+      config: c,
+      s: s
+    } do
+      :ok = State.put(c, :started, server: s)
+      assert {:ok, %{ingress_token: token1}} = State.get("core_mosquitto", s)
+
+      :ok = State.put(c, :stopped, server: s)
+      assert {:ok, %{ingress_token: token2}} = State.get("core_mosquitto", s)
+
+      assert token1 == token2
+    end
+
+    test "two different slugs get two different tokens", %{s: s} do
+      {:ok, other} =
+        Config.parse(%{
+          "name" => "Other",
+          "version" => "1",
+          "slug" => "other",
+          "description" => "d",
+          "arch" => ["aarch64"]
+        })
+
+      {:ok, c} =
+        Config.parse(%{
+          "name" => "Mosquitto broker",
+          "version" => "7.1.0",
+          "slug" => "core_mosquitto",
+          "description" => "An Open Source MQTT broker",
+          "arch" => ["aarch64"]
+        })
+
+      :ok = State.put(c, :started, server: s)
+      :ok = State.put(other, :started, server: s)
+
+      assert {:ok, %{ingress_token: token1}} = State.get("core_mosquitto", s)
+      assert {:ok, %{ingress_token: token2}} = State.get("other", s)
+      assert token1 != token2
+    end
+
+    test "put_setting/4 writes ingress_port, ingress_panel, and watchdog", %{config: c, s: s} do
+      :ok = State.put(c, :started, server: s)
+
+      assert :ok = State.put_setting("core_mosquitto", :ingress_port, 62_001, s)
+      assert :ok = State.put_setting("core_mosquitto", :ingress_panel, true, s)
+      assert :ok = State.put_setting("core_mosquitto", :watchdog, true, s)
+
+      assert {:ok,
+              %{
+                ingress_port: 62_001,
+                ingress_panel: true,
+                watchdog: true
+              }} = State.get("core_mosquitto", s)
+    end
+
+    test "put_setting/4 preserves the other settings and user_options", %{config: c, s: s} do
+      :ok = State.put(c, :started, server: s, user_options: %{"greeting" => "hi"})
+      :ok = State.put_setting("core_mosquitto", :watchdog, true, s)
+
+      assert {:ok, %{user_options: %{"greeting" => "hi"}, watchdog: true, ingress_panel: false}} =
+               State.get("core_mosquitto", s)
+    end
+
+    test "put_setting/4 on an unknown slug is :error", %{s: s} do
+      assert :error = State.put_setting("nope", :watchdog, true, s)
+    end
+  end
+
   test "delete removes the entry", %{config: c, s: s} do
     :ok = State.put(c, :started, server: s)
     :ok = State.delete("core_mosquitto", s)
@@ -107,6 +191,68 @@ defmodule Vagus.Addon.StateTest do
       assert on_disk["addons"]["core_mosquitto"]["state"] == "started"
       assert on_disk["addons"]["core_mosquitto"]["user_options"] == %{"greeting" => "hi"}
       assert on_disk["addons"]["core_mosquitto"]["config"]["slug"] == "core_mosquitto"
+      assert is_binary(on_disk["addons"]["core_mosquitto"]["ingress_token"])
+      assert on_disk["addons"]["core_mosquitto"]["ingress_port"] == nil
+      assert on_disk["addons"]["core_mosquitto"]["ingress_panel"] == false
+      assert on_disk["addons"]["core_mosquitto"]["watchdog"] == false
+    end
+
+    test "put_setting persists across a reload, and the ingress_token survives the round-trip", %{
+      config: c,
+      path: path
+    } do
+      s1 = start_persisted(path)
+      :ok = State.put(c, :started, server: s1)
+      assert {:ok, %{ingress_token: token}} = State.get("core_mosquitto", s1)
+
+      :ok = State.put_setting("core_mosquitto", :ingress_port, 62_001, s1)
+      :ok = State.put_setting("core_mosquitto", :ingress_panel, true, s1)
+      :ok = State.put_setting("core_mosquitto", :watchdog, true, s1)
+      GenServer.stop(s1)
+
+      s2 = start_persisted(path)
+
+      assert {:ok,
+              %{
+                ingress_token: ^token,
+                ingress_port: 62_001,
+                ingress_panel: true,
+                watchdog: true
+              }} = State.get("core_mosquitto", s2)
+    end
+
+    test "an old persisted file without the new fields loads with defaults + a generated token",
+         %{
+           config: c,
+           path: path
+         } do
+      File.mkdir_p!(Path.dirname(path))
+
+      on_disk = %{
+        "version" => 1,
+        "addons" => %{
+          "core_mosquitto" => %{
+            "config" => Vagus.Addon.Config.to_persistable(c),
+            "state" => "started",
+            "user_options" => %{"greeting" => "hi"}
+          }
+        }
+      }
+
+      File.write!(path, Jason.encode!(on_disk))
+
+      s = start_persisted(path)
+
+      assert {:ok,
+              %{
+                user_options: %{"greeting" => "hi"},
+                ingress_token: token,
+                ingress_port: nil,
+                ingress_panel: false,
+                watchdog: false
+              }} = State.get("core_mosquitto", s)
+
+      assert is_binary(token)
     end
 
     test "put_options and delete each re-persist the file", %{config: c, path: path} do

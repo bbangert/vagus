@@ -12,6 +12,12 @@ defmodule Vagus.Addon.Config do
 
   Config is untrusted (add-on-supplied), so `parse/1` returns
   `{:error, reason}` for anything malformed — never raises.
+
+  `ingress_entry`/`ingress_stream`/`panel_icon`/`panel_title`/`panel_admin`
+  (`docs/contract-2026.7-m4b-ingress-watchdog.md` §B3.1) round out the
+  ingress/panel config knobs alongside the pre-existing `ingress`/
+  `ingress_port`; `ingress_port` additionally enforces the §B3.2
+  dynamic-port/`ports:` collision guard at parse time.
   """
 
   @slug_re ~r/^[-_.A-Za-z0-9]+$/
@@ -61,6 +67,11 @@ defmodule Vagus.Addon.Config do
           apparmor: boolean(),
           ingress: boolean(),
           ingress_port: non_neg_integer(),
+          ingress_entry: String.t() | nil,
+          ingress_stream: boolean(),
+          panel_icon: String.t(),
+          panel_title: String.t() | nil,
+          panel_admin: boolean(),
           watchdog: String.t() | nil,
           webui: String.t() | nil,
           options: map(),
@@ -102,6 +113,11 @@ defmodule Vagus.Addon.Config do
             apparmor: true,
             ingress: false,
             ingress_port: 8099,
+            ingress_entry: nil,
+            ingress_stream: false,
+            panel_icon: "mdi:puzzle",
+            panel_title: nil,
+            panel_admin: true,
             watchdog: nil,
             webui: nil,
             options: %{},
@@ -196,6 +212,11 @@ defmodule Vagus.Addon.Config do
       "apparmor" => c.apparmor,
       "ingress" => c.ingress,
       "ingress_port" => c.ingress_port,
+      "ingress_entry" => c.ingress_entry,
+      "ingress_stream" => c.ingress_stream,
+      "panel_icon" => c.panel_icon,
+      "panel_title" => c.panel_title,
+      "panel_admin" => c.panel_admin,
       "watchdog" => c.watchdog,
       "webui" => c.webui,
       "options" => c.options,
@@ -245,7 +266,12 @@ defmodule Vagus.Addon.Config do
     |> put(:devices, str_list(raw, "devices"))
     |> put(:apparmor, boolean(raw, "apparmor", true))
     |> put(:ingress, boolean(raw, "ingress", false))
-    |> put(:ingress_port, int(raw, "ingress_port", 8099))
+    |> put_ingress_port(raw)
+    |> put(:ingress_entry, opt_str(raw, "ingress_entry"))
+    |> put(:ingress_stream, boolean(raw, "ingress_stream", false))
+    |> put(:panel_icon, panel_icon(raw))
+    |> put(:panel_title, opt_str(raw, "panel_title"))
+    |> put(:panel_admin, boolean(raw, "panel_admin", true))
     |> put(:watchdog, opt_str(raw, "watchdog"))
     |> put(:webui, opt_str(raw, "webui"))
     |> put(:options, map_field(raw, "options", %{}))
@@ -330,6 +356,55 @@ defmodule Vagus.Addon.Config do
     case Map.get(raw, key, default) do
       v when is_integer(v) -> v
       other -> invalid("field '#{key}' must be an integer, got #{inspect(other)}")
+    end
+  end
+
+  # `ingress_port` (§B3.1): a literal 1-65535 or exactly 0 (dynamic
+  # assignment). Sets `:ingress_port` on the config being built (rather than
+  # just returning the value like the other field helpers) so it can also run
+  # the §B3.2 port-collision guard below against the config's already-parsed
+  # `:ports` (set earlier in the `build/1` pipeline).
+  defp put_ingress_port(config, raw) do
+    port = ingress_port_value(raw)
+    :ok = validate_ingress_dynamic_guard(config.ports, port)
+    %{config | ingress_port: port}
+  end
+
+  defp ingress_port_value(raw) do
+    case Map.get(raw, "ingress_port", 8099) do
+      v when is_integer(v) and v >= 0 and v <= 65_535 ->
+        v
+
+      v when is_integer(v) ->
+        invalid("field 'ingress_port' must be between 0 and 65535, got #{v}")
+
+      other ->
+        invalid("field 'ingress_port' must be an integer, got #{inspect(other)}")
+    end
+  end
+
+  # §B3.2 last paragraph: an add-on declaring `ingress_port: 0` (dynamic
+  # assignment) that also maps a host `ports:` value inside the dynamic
+  # ingress range (62000-65500) is rejected — that collision would let a
+  # client hit the add-on's ingress endpoint directly on the host, bypassing
+  # the ingress-session-cookie check entirely.
+  defp validate_ingress_dynamic_guard(_ports, port) when port != 0, do: :ok
+
+  defp validate_ingress_dynamic_guard(ports, 0) do
+    if Enum.any?(Map.values(ports), &(is_integer(&1) and &1 in 62_000..65_500)) do
+      invalid(
+        "ingress_port: 0 conflicts with a 'ports:' host value in the dynamic ingress " <>
+          "range 62000-65500 (§B3.2)"
+      )
+    else
+      :ok
+    end
+  end
+
+  defp panel_icon(raw) do
+    case Map.get(raw, "panel_icon", "mdi:puzzle") do
+      v when is_binary(v) -> v
+      other -> invalid("field 'panel_icon' must be a string, got #{inspect(other)}")
     end
   end
 

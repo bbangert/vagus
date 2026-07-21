@@ -12,7 +12,9 @@ defmodule Vagus.Addon.Manager do
       the pinned §A1.4 invariants (via `Backend.Container`);
     * `install/2` — ensures the bridge and pulls the image;
     * `start/2` — generates a fresh per-add-on token, writes the validated
-      `/data/options.json`, ensures the bind-source dirs exist, then creates +
+      `/data/options.json`, ensures the bind-source dirs exist, resolves a
+      dynamic ingress port if the config declares one (`ingress_port: 0`,
+      `docs/contract-2026.7-m4b-ingress-watchdog.md` §B3.2), then creates +
       starts the container via the backend.
 
   Backend is injectable (`:backend`, defaulting to `config :vagus,
@@ -36,12 +38,55 @@ defmodule Vagus.Addon.Manager do
       its `Registry`/`DNS`/`State` entries, and `File.rm_rf` its data dir —
       gated on the slug matching a safe directory-name charset, since the
       slug is interpolated into that rm_rf path.
+
+  ## W6 — per-slug serialization (IW-P1-T2)
+
+  Once `Vagus.Addon.Watchdog` can autonomously call `start_slug/2`/
+  `restart/2` from its own `Task`, the previously-benign possibility of two
+  lifecycle calls for the same slug running concurrently (a user's
+  `POST /addons/{slug}/stop` landing mid-way through a watchdog-driven
+  restart, or two watchdog attempts overlapping) becomes a real race: both
+  sides issue raw create/start/stop/remove calls against the same
+  `addon_<slug>` container name, and interleaving them can leave the
+  container, the `State` entry, and the DNS/Registry/token side-state
+  mutually inconsistent (e.g. a stop's `remove` racing a restart's
+  `create`, or a `:stopped` record clobbered back to `:started` by a
+  restart that started *before* the stop that should have won).
+
+  Every public lifecycle function (`start/2`, `start_slug/2`, `stop/2`,
+  `restart/2`, `uninstall/2`) therefore wraps its body in
+  `:global.trans({{:addon_lifecycle, slug}, self()}, fun, [node()])` — a
+  mutex keyed by slug. `:global.trans/3` blocks (rather than erroring) a
+  second caller until the first releases, so callers never need to handle
+  a "locked" result; passing `[node()]` scopes it to this node only (Vagus
+  is single-node, there's no cluster to coordinate the lock across, so
+  `:global`'s cross-node broadcast/consensus machinery would be pure
+  overhead here — `:global.trans` is used purely for its **reentrant local
+  mutex** behavior, not its distribution). Reentrant matters because
+  `restart/2` calls `stop/2` then `start_slug/2`, and `start_slug/2` calls
+  `start/2` — all from the same process, which must not deadlock against
+  its own outer lock. `:global.set_lock/2` (which `:global.trans` uses
+  internally) already guarantees this: a second `set_lock` call for the
+  same `{LockId, RequesterId}` pair from the *same requester* (here,
+  `self()`) increments a counter rather than blocking, so nested calls
+  from one process compose safely while a genuinely different process
+  calling with the same slug still queues behind the outer holder. No
+  extra supervision is needed — `:global` is already part of the runtime
+  (`:kernel`), there is nothing here for `Vagus.Application` to start or
+  own.
+
+  `stop/2` and `uninstall/2` additionally record `Vagus.Addon.State`'s
+  `:stopped` state **before** touching the container (see each function's
+  doc) — the watchdog's manual-stop suppression (§B6.3's `_manual_stop`
+  analogue) depends on the `die` event a stop/uninstall causes finding
+  `state: :stopped` already recorded, not racing to see it.
   """
 
   require Logger
 
   alias Vagus.Addon.Backend.Spec
   alias Vagus.Addon.{Config, OptionsSchema}
+  alias Vagus.Ingress.Panels
   alias Vagus.Network
 
   @default_backend Vagus.Addon.Backend.Container
@@ -72,13 +117,21 @@ defmodule Vagus.Addon.Manager do
     end
   end
 
+  # install/2 isn't part of W6's lock (it never touches a running
+  # container — only image pull + bridge setup — so it can't race
+  # start/stop/restart/uninstall the way they race each other).
+
   @doc """
   Starts the add-on: fresh token → validated `/data/options.json` → bind-source
   dirs → create + start. Returns `{:ok, %{id: id, access_token: token}}`.
   """
   @spec start(Config.t(), keyword()) ::
           {:ok, %{id: String.t(), access_token: String.t()}} | {:error, term()}
-  def start(%Config{} = config, opts \\ []) do
+  def start(%Config{slug: slug} = config, opts \\ []) do
+    with_slug_lock(slug, fn -> do_start(config, opts) end)
+  end
+
+  defp do_start(%Config{} = config, opts) do
     token = generate_token()
     opts = Keyword.put(opts, :access_token, token)
     spec = build_spec(config, opts)
@@ -90,11 +143,13 @@ defmodule Vagus.Addon.Manager do
          :ok <- write_options(config, data_root, user_options),
          :ok <- maybe_ensure_network(config, opts),
          :ok <- remove_stale_container(spec, opts),
+         :ok <- maybe_allocate_ingress_port(config, opts),
          {:ok, id} <- backend(opts).create(spec),
          :ok <- start_or_cleanup(id, opts) do
       register_identity(config, token)
       record_state(config, :started, user_options: user_options)
       register_dns(config, id, opts)
+      maybe_push_panel(config)
       {:ok, %{id: id, access_token: token}}
     end
   end
@@ -107,17 +162,29 @@ defmodule Vagus.Addon.Manager do
   options). Idempotent: a backend error stopping/removing an
   already-stopped/absent container is logged and tolerated, never surfaced
   as a failure — only an unknown (never-installed) `slug` is an error.
+
+  W6: `record_state(config, :stopped)` runs **before**
+  `stop_and_remove_container/2`, not after — the docker `die` event this
+  stop causes must already find `state: :stopped` in `Vagus.Addon.State`
+  when `Vagus.Addon.Watchdog` looks it up (§B6.3's `_manual_stop`
+  analogue), not a stale `:started` that would make the watchdog treat a
+  deliberate stop as a crash to restart.
   """
   @spec stop(String.t(), keyword()) :: :ok | {:error, :not_found}
   def stop(slug, opts \\ []) do
+    with_slug_lock(slug, fn -> do_stop(slug, opts) end)
+  end
+
+  defp do_stop(slug, opts) do
     case Vagus.Addon.State.get(slug) do
       :error ->
         {:error, :not_found}
 
       {:ok, %{config: config}} ->
+        record_state(config, :stopped)
         stop_and_remove_container(config, opts)
         deregister_slug(config)
-        record_state(config, :stopped)
+        maybe_push_panel(config)
         :ok
     end
   end
@@ -131,11 +198,18 @@ defmodule Vagus.Addon.Manager do
   @spec start_slug(String.t(), keyword()) ::
           {:ok, %{id: String.t(), access_token: String.t()}} | {:error, term()}
   def start_slug(slug, opts \\ []) do
+    with_slug_lock(slug, fn -> do_start_slug(slug, opts) end)
+  end
+
+  defp do_start_slug(slug, opts) do
     case Vagus.Addon.State.get(slug) do
       :error ->
         {:error, :not_found}
 
       {:ok, %{config: config, user_options: user_options}} ->
+        # start/2 re-acquires the same slug's lock — reentrant for this
+        # process (W6), so this doesn't deadlock against the lock
+        # with_slug_lock/2 already holds above.
         start(config, Keyword.put_new(opts, :user_options, user_options || %{}))
     end
   end
@@ -149,6 +223,10 @@ defmodule Vagus.Addon.Manager do
   @spec restart(String.t(), keyword()) ::
           {:ok, %{id: String.t(), access_token: String.t()}} | {:error, term()}
   def restart(slug, opts \\ []) do
+    with_slug_lock(slug, fn -> do_restart(slug, opts) end)
+  end
+
+  defp do_restart(slug, opts) do
     case stop(slug, opts) do
       {:error, :not_found} -> {:error, :not_found}
       _ -> start_slug(slug, opts)
@@ -174,17 +252,31 @@ defmodule Vagus.Addon.Manager do
   perfectly valid, `Config.parse/1`-produced slug would fail, silently
   orphaning that add-on's data dir on every uninstall), a real parsed config
   can only ever fail this check via one of those degenerate `.`/`..` tokens.
+
+  W6: like `stop/2`, `record_state(config, :stopped)` runs **before**
+  `stop_and_remove_container/2` — the same manual-stop-suppression
+  rationale, for the brief window before `purge_side_state/1` deletes the
+  `State` entry entirely.
   """
   @spec uninstall(String.t(), keyword()) :: :ok | {:error, :not_found} | {:error, term()}
   def uninstall(slug, opts \\ []) do
+    with_slug_lock(slug, fn -> do_uninstall(slug, opts) end)
+  end
+
+  defp do_uninstall(slug, opts) do
     case Vagus.Addon.State.get(slug) do
       :error ->
         {:error, :not_found}
 
       {:ok, %{config: config}} ->
+        record_state(config, :stopped)
         stop_and_remove_container(config, opts)
         remove_image_best_effort(config, opts)
         purge_side_state(config.slug)
+        # State entry is gone by now — `maybe_push_panel/1` resolves to a
+        # DELETE push, mirroring upstream forcing `ingress_panel = false` +
+        # pushing on uninstall (§B4.2).
+        maybe_push_panel(config)
         remove_data_dir(config.slug, opts)
     end
   end
@@ -214,6 +306,38 @@ defmodule Vagus.Addon.Manager do
         {:error, {:start_failed, reason}}
     end
   end
+
+  # For a dynamic-ingress-port add-on (`ingress_port: 0`, §B3.1), resolve +
+  # persist the real port (`Vagus.Ingress.dynamic_port/2`, §B3.2) BEFORE the
+  # container is created — the add-on's own entrypoint reads the port back via
+  # `GET /addons/self/info` (`bashio::addon.ingress_port`) right after start,
+  # so it must already exist in `Vagus.Addon.State` by the time the container
+  # runs (§B3.2 fact 5; this relies on the add-on's `Vagus.Addon.State` entry
+  # already existing, which the install route creates before any start).
+  #
+  # Best-effort only when the ingress server isn't running at all (isolated
+  # host unit tests, `:ingress_enabled false`) — same `Process.whereis` guard
+  # style as `register_identity/2`/`record_state/3`. A *running* server that
+  # fails to allocate is different: an ingress add-on without its port is
+  # broken, so that case fails the start outright rather than being tolerated.
+  # `opts[:ingress_server]` overrides the target (default `Vagus.Ingress`),
+  # so tests can inject a private instance.
+  defp maybe_allocate_ingress_port(%Config{ingress: true, ingress_port: 0, slug: slug}, opts) do
+    server = ingress_server(opts)
+
+    if Process.whereis(server) do
+      case Vagus.Ingress.dynamic_port(slug, server) do
+        {:ok, _port} -> :ok
+        {:error, reason} -> {:error, {:ingress_port, reason}}
+      end
+    else
+      :ok
+    end
+  end
+
+  defp maybe_allocate_ingress_port(_config, _opts), do: :ok
+
+  defp ingress_server(opts), do: Keyword.get(opts, :ingress_server, Vagus.Ingress)
 
   @doc "Builds the runtime-neutral `Backend.Spec` for `config`. Pure given `opts`."
   @spec build_spec(Config.t(), keyword()) :: Spec.t()
@@ -251,6 +375,14 @@ defmodule Vagus.Addon.Manager do
   end
 
   ## Internals
+
+  # W6: per-slug reentrant mutex around each public lifecycle function's
+  # body — see the moduledoc's "W6" section for why `:global.trans/3`
+  # (reentrant per-process, node-local here) rather than a `GenServer`/
+  # `Registry`-backed lock.
+  defp with_slug_lock(slug, fun) do
+    :global.trans({{:addon_lifecycle, slug}, self()}, fun, [node()])
+  end
 
   defp backend(opts), do: Keyword.get(opts, :backend, default_backend())
 
@@ -493,6 +625,21 @@ defmodule Vagus.Addon.Manager do
       Logger.warning("Vagus.Addon.Manager: DNS register for #{slug} failed: #{inspect(e)}")
       :ok
   end
+
+  # Best-effort Core sidebar-panel refresh on a lifecycle transition — a plan
+  # decision beyond §B4.4 (which only pushes on options-change/uninstall):
+  # keeping Core's panel list current across start/stop too costs nothing,
+  # since Core re-fetches the full list on every push rather than trusting
+  # its body (`Panels`' moduledoc) — an extra push here is harmless, not just
+  # tolerated. `Panels.update_hass_panel/2` already guards for an
+  # unreachable/absent Core client itself, so a bare call is fine here, same
+  # as `register_dns/3`'s `Process.whereis` style for its own side effect.
+  defp maybe_push_panel(%Config{ingress: true, slug: slug}) do
+    Panels.update_hass_panel(slug)
+    :ok
+  end
+
+  defp maybe_push_panel(_config), do: :ok
 
   defp ensure_token(opts), do: Keyword.put_new(opts, :access_token, generate_token())
 

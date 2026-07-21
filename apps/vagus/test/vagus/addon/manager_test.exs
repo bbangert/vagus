@@ -184,6 +184,113 @@ defmodule Vagus.Addon.ManagerTest do
     end
   end
 
+  describe "ingress dynamic port allocation (IW-P2-T2, §B3.2)" do
+    setup do
+      :persistent_term.put({__MODULE__.FakeBackend, :pid}, self())
+
+      data_root =
+        Path.join(System.tmp_dir!(), "vagus-mgr-ingress-#{System.unique_integer([:positive])}")
+
+      on_exit(fn -> File.rm_rf(data_root) end)
+
+      {:ok, config} =
+        Config.parse(%{
+          "name" => "ESPHome",
+          "version" => "1",
+          "slug" => "ingress_addon",
+          "description" => "d",
+          "arch" => ["amd64"],
+          "image" => "homeassistant/{arch}-addon-esphome",
+          "host_network" => true,
+          "ingress" => true,
+          "ingress_port" => 0
+        })
+
+      on_exit(fn -> Vagus.Addon.State.delete("ingress_addon") end)
+
+      %{config: config, data_root: data_root}
+    end
+
+    test "ingress_port: 0 add-on allocates + persists a dynamic port before create",
+         %{config: config, data_root: dr} do
+      # Mirrors the real install flow: `POST /addons/{slug}/install` calls
+      # `State.put(config, :stopped)` right after `Manager.install/2` — the
+      # State entry (and its ingress_token) must already exist before
+      # `start/2` can allocate + persist a dynamic port against it.
+      :ok = Vagus.Addon.State.put(config, :stopped)
+
+      name = :"ingress_#{System.unique_integer([:positive])}"
+      start_supervised!({Vagus.Ingress, name: name})
+
+      assert {:ok, _} =
+               Manager.start(config,
+                 backend: __MODULE__.FakeBackend,
+                 data_root: dr,
+                 ingress_server: name
+               )
+
+      assert_received {:create, _spec}
+
+      assert {:ok, %{ingress_port: port}} = Vagus.Addon.State.get("ingress_addon")
+      assert is_integer(port) and port in 62_000..65_500
+    end
+
+    test "allocation failure (untracked slug, :not_found) fails the start before any create",
+         %{config: config, data_root: dr} do
+      name = :"ingress_#{System.unique_integer([:positive])}"
+      start_supervised!({Vagus.Ingress, name: name})
+
+      # No `State.put/2` here — the slug is untracked, so `dynamic_port/2`
+      # has nowhere to persist an allocation.
+      assert {:error, {:ingress_port, :not_found}} =
+               Manager.start(config,
+                 backend: __MODULE__.FakeBackend,
+                 data_root: dr,
+                 ingress_server: name
+               )
+
+      refute_received {:create, _}
+    end
+
+    test "ingress server not running: allocation is skipped silently (host unit tests)",
+         %{config: config, data_root: dr} do
+      :ok = Vagus.Addon.State.put(config, :stopped)
+
+      assert {:ok, _} =
+               Manager.start(config,
+                 backend: __MODULE__.FakeBackend,
+                 data_root: dr,
+                 ingress_server: :no_such_ingress_process
+               )
+
+      assert_received {:create, _spec}
+    end
+
+    test "a non-ingress add-on never touches the ingress server", %{data_root: dr} do
+      {:ok, plain} =
+        Config.parse(%{
+          "name" => "Plain",
+          "version" => "1",
+          "slug" => "plain_addon",
+          "description" => "d",
+          "arch" => ["amd64"],
+          "image" => "homeassistant/{arch}-addon-plain",
+          "host_network" => true
+        })
+
+      on_exit(fn -> Vagus.Addon.State.delete("plain_addon") end)
+
+      assert {:ok, _} =
+               Manager.start(plain,
+                 backend: __MODULE__.FakeBackend,
+                 data_root: dr,
+                 ingress_server: :no_such_ingress_process
+               )
+
+      assert_received {:create, _spec}
+    end
+  end
+
   describe "stop/2, start_slug/2, restart/2, uninstall/2 (fake backend + real State/Registry/DNS/Discovery/Services)" do
     setup do
       :persistent_term.put({__MODULE__.FakeBackend, :pid}, self())
@@ -339,6 +446,240 @@ defmodule Vagus.Addon.ManagerTest do
 
       assert File.exists?(sentinel)
     end
+  end
+
+  describe "ingress panel push hook on lifecycle transitions (IW-P2-T3, §B4.4 + plan decision)" do
+    # `Vagus.Ingress.Panels.update_hass_panel/2` is best-effort by design
+    # (fire-and-forget `Task.start/1`, warning-not-raise on failure — see
+    # that module's tests for the push semantics themselves); this only
+    # proves `Manager`'s start/stop/uninstall hooks calling it never crash
+    # the lifecycle call itself, whether or not a reachable Core is behind
+    # the app's always-running default-named `Vagus.Core.Client` (there's no
+    # test-env gate for it, unlike `Vagus.Ingress`/`Vagus.DNS`).
+    setup do
+      :persistent_term.put({__MODULE__.FakeBackend, :pid}, self())
+
+      data_root =
+        Path.join(System.tmp_dir!(), "vagus-mgr-panel-push-#{System.unique_integer([:positive])}")
+
+      on_exit(fn -> File.rm_rf(data_root) end)
+
+      {:ok, config} =
+        Config.parse(%{
+          "name" => "ESPHome",
+          "version" => "1",
+          "slug" => "panel_push_addon",
+          "description" => "d",
+          "arch" => ["amd64"],
+          "image" => "homeassistant/{arch}-addon-esphome",
+          "host_network" => true,
+          "ingress" => true
+        })
+
+      on_exit(fn ->
+        Vagus.Addon.State.delete("panel_push_addon")
+        Vagus.Addon.Registry.unregister_slug("panel_push_addon")
+        Vagus.Discovery.delete_by_slug("panel_push_addon")
+        Vagus.Services.delete_by_slug("panel_push_addon")
+      end)
+
+      %{config: config, data_root: data_root}
+    end
+
+    test "start, stop, and uninstall of an ingress add-on all succeed without crashing",
+         %{config: config, data_root: dr} do
+      assert {:ok, _} = Manager.start(config, backend: __MODULE__.FakeBackend, data_root: dr)
+      assert :ok = Manager.stop("panel_push_addon", backend: __MODULE__.FakeBackend)
+
+      assert {:ok, _} =
+               Manager.start_slug("panel_push_addon",
+                 backend: __MODULE__.FakeBackend,
+                 data_root: dr
+               )
+
+      assert :ok =
+               Manager.uninstall("panel_push_addon",
+                 backend: __MODULE__.FakeBackend,
+                 data_root: dr
+               )
+    end
+  end
+
+  describe "W6 — record-:stopped-before-container-touch + per-slug serialization" do
+    setup do
+      slug = "w6_addon_#{System.unique_integer([:positive])}"
+      :persistent_term.put({__MODULE__.OrderingBackend, :pid}, self())
+
+      data_root =
+        Path.join(System.tmp_dir!(), "vagus-mgr-w6-#{System.unique_integer([:positive])}")
+
+      on_exit(fn ->
+        File.rm_rf(data_root)
+        Vagus.Addon.State.delete(slug)
+        Vagus.Addon.Registry.unregister_slug(slug)
+      end)
+
+      {:ok, config} =
+        Config.parse(%{
+          "name" => "Test",
+          "version" => "1",
+          "slug" => slug,
+          "description" => "d",
+          "arch" => ["amd64"],
+          "image" => "homeassistant/{arch}-addon-test",
+          "host_network" => true
+        })
+
+      %{config: config, slug: slug, data_root: data_root}
+    end
+
+    test "stop/2 records State :stopped before the container is touched", %{
+      config: config,
+      slug: slug,
+      data_root: dr
+    } do
+      assert {:ok, _} = Manager.start(config, backend: __MODULE__.OrderingBackend, data_root: dr)
+
+      assert :ok = Manager.stop(slug, backend: __MODULE__.OrderingBackend)
+
+      assert_received {:stop_saw_state, {:ok, %{state: :stopped}}}
+    end
+
+    test "uninstall/2 records State :stopped before the container is touched", %{
+      config: config,
+      slug: slug,
+      data_root: dr
+    } do
+      assert {:ok, _} = Manager.start(config, backend: __MODULE__.OrderingBackend, data_root: dr)
+
+      assert :ok = Manager.uninstall(slug, backend: __MODULE__.OrderingBackend, data_root: dr)
+
+      assert_received {:stop_saw_state, {:ok, %{state: :stopped}}}
+    end
+
+    test "concurrent restart/2 and stop/2 for the same slug never interleave", %{
+      config: config,
+      slug: slug,
+      data_root: dr
+    } do
+      log = :ets.new(:w6_serial_log, [:public, :ordered_set])
+      :persistent_term.put({__MODULE__.SlowBackend, :log}, log)
+
+      assert {:ok, _} = Manager.start(config, backend: __MODULE__.SlowBackend, data_root: dr)
+
+      # Only the two concurrent ops below matter for the interleaving
+      # assertion — the setup start above also logs (untagged) `stop`/
+      # `create` entries via `remove_stale_container/2`'s stale-container
+      # cleanup, which would otherwise show up as a spurious third chunk.
+      :ets.delete_all_objects(log)
+
+      restart_task =
+        Task.async(fn ->
+          Process.put(:w6_log_tag, :restart)
+          Manager.restart(slug, backend: __MODULE__.SlowBackend, data_root: dr)
+        end)
+
+      # Give the restart task a moment to acquire the slug lock and enter
+      # its stop's sleep, so the concurrent stop below deterministically
+      # queues behind it instead of racing to go first — either order is
+      # fine for what's being proven (no interleaving), this just keeps the
+      # test from being a coin flip about which op logs first.
+      Process.sleep(5)
+
+      stop_task =
+        Task.async(fn ->
+          Process.put(:w6_log_tag, :stop)
+          Manager.stop(slug, backend: __MODULE__.SlowBackend)
+        end)
+
+      Task.await(restart_task, 5_000)
+      Task.await(stop_task, 5_000)
+
+      tags =
+        log
+        |> :ets.tab2list()
+        |> Enum.sort_by(&elem(&1, 0))
+        |> Enum.map(fn {_seq, {tag, _event, _id}} -> tag end)
+
+      :ets.delete(log)
+
+      # Serialized: one op's entries are entirely contiguous before the
+      # other's — chunk_by collapses consecutive same-tag runs, so any
+      # interleaving (tag alternating more than once) would produce more
+      # than 2 chunks.
+      assert tags |> Enum.chunk_by(& &1) |> length() == 2
+    end
+  end
+
+  defmodule OrderingBackend do
+    @moduledoc false
+    @behaviour Vagus.Addon.Backend
+
+    defp notify(msg),
+      do: send(:persistent_term.get({Vagus.Addon.ManagerTest.OrderingBackend, :pid}), msg)
+
+    @impl true
+    def pull(_spec), do: :ok
+
+    @impl true
+    def create(_spec), do: {:ok, "fake-id"}
+
+    @impl true
+    def start(_id), do: :ok
+
+    @impl true
+    def stop(id, _opts \\ []) do
+      slug = String.replace_prefix(id, "addon_", "")
+      notify({:stop_saw_state, Vagus.Addon.State.get(slug)})
+      :ok
+    end
+
+    @impl true
+    def remove(_id, _opts \\ []), do: :ok
+
+    @impl true
+    def state(_id), do: {:ok, :running}
+  end
+
+  defmodule SlowBackend do
+    @moduledoc false
+    @behaviour Vagus.Addon.Backend
+
+    defp log(entry) do
+      table = :persistent_term.get({Vagus.Addon.ManagerTest.SlowBackend, :log})
+      tag = Process.get(:w6_log_tag, :unknown)
+
+      :ets.insert(
+        table,
+        {System.unique_integer([:monotonic]), {tag, elem(entry, 0), elem(entry, 1)}}
+      )
+    end
+
+    @impl true
+    def pull(_spec), do: :ok
+
+    @impl true
+    def create(spec) do
+      log({:create, spec.name})
+      {:ok, "fake-id"}
+    end
+
+    @impl true
+    def start(_id), do: :ok
+
+    @impl true
+    def stop(id, _opts \\ []) do
+      log({:stop_start, id})
+      Process.sleep(30)
+      log({:stop_end, id})
+      :ok
+    end
+
+    @impl true
+    def remove(_id, _opts \\ []), do: :ok
+
+    @impl true
+    def state(_id), do: {:ok, :running}
   end
 
   defmodule FakeBackend do

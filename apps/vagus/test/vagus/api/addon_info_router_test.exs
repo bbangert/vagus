@@ -89,4 +89,54 @@ defmodule Vagus.API.AddonInfoRouterTest do
     assert data["memory_usage"] == 0
     assert Map.has_key?(data, "memory_percent")
   end
+
+  describe "ingress fields + watchdog (§B3.4, §B8)" do
+    setup do
+      {:ok, c} =
+        Config.parse(%{
+          "name" => "ESPHome",
+          "version" => "1.0.0",
+          "slug" => "core_esphome",
+          "description" => "ESPHome dashboard",
+          "arch" => ["aarch64"],
+          "ingress" => true,
+          "ingress_port" => 6052
+        })
+
+      :ok = State.put(c, :started)
+      :ok = State.put_setting("core_esphome", :ingress_panel, true)
+      :ok = State.put_setting("core_esphome", :watchdog, true)
+      {:ok, entry} = State.get("core_esphome")
+      on_exit(fn -> State.delete("core_esphome") end)
+      %{config: c, entry: entry}
+    end
+
+    test "info carries the real per-install ingress token in entry/url, plus the persisted panel/watchdog bools",
+         %{entry: entry} do
+      conn =
+        call("/addons/core_esphome/info", [
+          {"authorization", "Bearer #{Vagus.API.Token.get()}"}
+        ])
+
+      assert conn.status == 200
+      info = data(conn)
+
+      token = entry.ingress_token
+      assert info["ingress"] == true
+      assert info["ingress_entry"] == "/api/hassio_ingress/#{token}"
+      assert info["ingress_url"] == "/api/hassio_ingress/#{token}/"
+      assert info["ingress_port"] == 6052
+      assert info["ingress_panel"] == true
+      assert info["watchdog"] == true
+    end
+
+    test "GET /addons/self/info serves the same resolved ingress fields (§B3.2 fact 5)" do
+      token = addon_token("core_esphome")
+      conn = call("/addons/self/info", [{"x-supervisor-token", token}])
+      assert conn.status == 200
+      info = data(conn)
+      assert info["ingress"] == true
+      assert info["ingress_port"] == 6052
+    end
+  end
 end
