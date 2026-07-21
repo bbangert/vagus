@@ -148,6 +148,16 @@ defmodule Vagus.Runtime.Docker do
     with :ok <- ensure_ref(id), do: get_json("/containers/#{id}/json", opts)
   end
 
+  @doc """
+  GET `/containers/{id}/stats?stream=false` — a single resource-usage sample
+  (with `precpu_stats` for the CPU delta). Raw Engine-API stats map.
+  """
+  @spec stats(String.t(), keyword()) :: {:ok, map()} | {:error, term()}
+  def stats(id, opts \\ []) do
+    with :ok <- ensure_ref(id),
+         do: get_json("/containers/#{id}/stats", Keyword.put(opts, :query, stream: false))
+  end
+
   @doc "GET `/containers/json` — running containers (`opts[:all]` includes stopped)."
   @spec list_containers(keyword()) :: {:ok, [map()]} | {:error, term()}
   def list_containers(opts \\ []) do

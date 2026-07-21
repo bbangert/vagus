@@ -33,6 +33,7 @@ defmodule Vagus.API.Router do
   alias Vagus.Backend
   alias Vagus.Core.TokenStore
   alias Vagus.Discovery
+  alias Vagus.Runtime.{Docker, Stats}
   alias Vagus.Services
 
   alias Vagus.API.Models.{
@@ -254,11 +255,23 @@ defmodule Vagus.API.Router do
   # -- Stats coordinator (60s) -----------------------------------------------
 
   get "/core/stats" do
-    Envelope.send_ok(conn, CoreStats.build!(StaticData.core_stats()))
+    Envelope.send_ok(conn, CoreStats.build!(container_stats(core_container())))
   end
 
   get "/supervisor/stats" do
-    Envelope.send_ok(conn, CoreStats.build!(StaticData.core_stats()))
+    Envelope.send_ok(conn, CoreStats.build!(container_stats(supervisor_container())))
+  end
+
+  # Real per-add-on resource usage from the engine (§A5/P5-T2). Readable by the
+  # supervisor (Core) for any slug and by an add-on for itself.
+  get "/addons/:slug/stats" do
+    case resolve_info_slug(slug, conn.assigns.caller) do
+      {:ok, resolved} ->
+        Envelope.send_ok(conn, CoreStats.build!(container_stats("addon_#{resolved}")))
+
+      {:error, :forbidden} ->
+        Envelope.send_error(conn, "Not authorized for this add-on", 403)
+    end
   end
 
   # Not called by the hassio integration's coordinator in this Core
@@ -515,6 +528,22 @@ defmodule Vagus.API.Router do
           Exception.format(:error, exception, __STACKTRACE__)
       )
   end
+
+  # -- stats helpers ---------------------------------------------------------
+
+  # Real engine stats for `ref`, or all-zeros when there's no container
+  # configured/running (honest idle) — a stats poll must never error.
+  defp container_stats(nil), do: Stats.zero()
+
+  defp container_stats(ref) do
+    case Docker.stats(ref) do
+      {:ok, raw} -> Stats.compute(raw)
+      {:error, _reason} -> Stats.zero()
+    end
+  end
+
+  defp core_container, do: Application.get_env(:vagus, :core_container)
+  defp supervisor_container, do: Application.get_env(:vagus, :supervisor_container)
 
   # -- store helpers ---------------------------------------------------------
 

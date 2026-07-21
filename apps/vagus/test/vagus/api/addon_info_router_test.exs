@@ -66,4 +66,20 @@ defmodule Vagus.API.AddonInfoRouterTest do
     conn = call("/addons/ghost/info", [{"authorization", "Bearer #{Vagus.API.Token.get()}"}])
     assert conn.status == 404
   end
+
+  # /addons/{slug}/stats shares the info access rules (P5-T2). The 403 path
+  # returns before any engine call, so this stays hermetic.
+  test "an add-on may not read another add-on's stats" do
+    token = addon_token("some_other")
+    assert call("/addons/core_mosquitto/stats", [{"x-supervisor-token", token}]).status == 403
+  end
+
+  test "/core/stats returns the zero CoreStats shape when no container configured" do
+    conn = call("/core/stats", [{"authorization", "Bearer #{Vagus.API.Token.get()}"}])
+    assert conn.status == 200
+    data = Jason.decode!(conn.resp_body)["data"]
+    assert data["cpu_percent"] == 0.0
+    assert data["memory_usage"] == 0
+    assert Map.has_key?(data, "memory_percent")
+  end
 end
