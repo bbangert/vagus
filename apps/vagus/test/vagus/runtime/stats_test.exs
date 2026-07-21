@@ -46,6 +46,22 @@ defmodule Vagus.Runtime.StatsTest do
     assert s.blk_write == 8192
   end
 
+  test "cgroup v2 sample (no cache key) subtracts inactive_file as reclaimable" do
+    # This device runs a unified cgroup v2 hierarchy: memory_stats.stats has
+    # no "cache" (that's v1) — the reclaimable page cache is "inactive_file".
+    raw = %{
+      "memory_stats" => %{
+        "usage" => 100_000_000,
+        "limit" => 500_000_000,
+        "stats" => %{"inactive_file" => 30_000_000}
+      }
+    }
+
+    s = Stats.compute(raw)
+    assert s.memory_usage == 70_000_000
+    assert s.memory_percent == 14.0
+  end
+
   test "a just-started sample with no precpu_stats yields 0 cpu, not a crash" do
     s = Stats.compute(%{"memory_stats" => %{"usage" => 10, "limit" => 100}})
     assert s.cpu_percent == 0.0

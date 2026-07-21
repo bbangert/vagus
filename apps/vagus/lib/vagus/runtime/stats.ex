@@ -66,11 +66,16 @@ defmodule Vagus.Runtime.Stats do
 
   defp total_usage(cpu_stats), do: get_in(cpu_stats, ["cpu_usage", "total_usage"]) || 0
 
-  # usage minus reclaimable page cache, like the Supervisor.
+  # usage minus reclaimable page cache, like the Supervisor. cgroup v1 reports
+  # the reclaimable figure as "cache"; cgroup v2 (this device) has no "cache"
+  # key and reports it as "inactive_file" instead. Without the v2 fallback the
+  # subtraction is a no-op on a v2 host and the figure over-reports by the full
+  # page cache (`supervisor/docker/stats.py` uses inactive_file on v2).
   defp memory_usage(raw) do
     usage = get_in(raw, ["memory_stats", "usage"]) || 0
-    cache = get_in(raw, ["memory_stats", "stats", "cache"]) || 0
-    max(usage - cache, 0)
+    stats = get_in(raw, ["memory_stats", "stats"]) || %{}
+    reclaimable = stats["cache"] || stats["inactive_file"] || 0
+    max(usage - reclaimable, 0)
   end
 
   defp network(raw, key) do
