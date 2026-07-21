@@ -54,7 +54,12 @@ defmodule Vagus.DNS do
 
   @impl GenServer
   def init(opts) do
-    ip = to_ip(Keyword.get(opts, :ip, Application.get_env(:vagus, :dns_ip, Network.dns_ip())))
+    # Listen address (distinct from the `.3` anchor used in records): on target
+    # this is `0.0.0.0` so the bind doesn't depend on `.3` already being
+    # assigned to the bridge iface (which happens later, at add-on install).
+    ip =
+      to_ip(Keyword.get(opts, :ip, Application.get_env(:vagus, :dns_bind_ip, Network.dns_ip())))
+
     port = Keyword.get(opts, :port, Application.get_env(:vagus, :dns_port, 53))
 
     upstream =

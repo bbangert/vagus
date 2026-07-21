@@ -82,11 +82,13 @@ defmodule Vagus.Network do
   end
 
   @doc """
-  Binds the Supervisor anchor IP (`172.30.32.2/23`) to the host `hassio` bridge
-  interface, so the host-networked emulator (Bandit on `0.0.0.0`) answers there
-  — the address bridged add-ons reach via `http://supervisor` (§A6). The bridge
-  driver already puts the gateway `.1` on the interface; this adds `.2` beside
-  it once the interface exists (i.e. after `ensure/1` created the network).
+  Binds the host-served anchor IPs — supervisor `172.30.32.2` and dns
+  `172.30.32.3` — to the host `hassio` bridge interface, so the host-networked
+  emulator (Bandit on `0.0.0.0`, `Vagus.DNS` on `0.0.0.0:53`) answers there:
+  `.2` is where bridged add-ons reach `http://supervisor` and `.3` is the
+  resolver they're configured with (§A6). The bridge driver already puts the
+  gateway `.1` on the interface; these are added beside it once the interface
+  exists (i.e. after `ensure/1` created the network).
 
   Idempotent + best-effort: an address already present (`ip` prints
   "File exists"), a missing interface, or a missing `ip` tool is logged and
@@ -94,26 +96,28 @@ defmodule Vagus.Network do
   """
   @spec ensure_supervisor_ip() :: :ok
   def ensure_supervisor_ip do
-    args = ["addr", "add", "#{supervisor_ip()}/#{@prefix}", "dev", @name]
+    bind_anchor(supervisor_ip())
+    bind_anchor(dns_ip())
+    :ok
+  end
 
-    case System.cmd("ip", args, stderr_to_stdout: true) do
+  defp bind_anchor(ip) do
+    case System.cmd("ip", ["addr", "add", "#{ip}/#{@prefix}", "dev", @name],
+           stderr_to_stdout: true
+         ) do
       {_out, 0} ->
         :ok
 
       {out, _code} ->
-        if String.contains?(out, "File exists") do
-          :ok
-        else
-          Logger.warning(
-            "Vagus.Network: binding #{supervisor_ip()} to #{@name} failed: #{String.trim(out)}"
-          )
-
-          :ok
+        unless String.contains?(out, "File exists") do
+          Logger.warning("Vagus.Network: binding #{ip} to #{@name} failed: #{String.trim(out)}")
         end
+
+        :ok
     end
   rescue
     e ->
-      Logger.warning("Vagus.Network: ensure_supervisor_ip errored: #{Exception.message(e)}")
+      Logger.warning("Vagus.Network: binding anchor #{ip} errored: #{Exception.message(e)}")
       :ok
   end
 end
