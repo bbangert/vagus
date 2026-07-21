@@ -155,6 +155,49 @@ defmodule Vagus.Runtime.Docker do
     get_json("/containers/json", Keyword.merge(opts, query: query))
   end
 
+  ## Networks
+
+  @doc "POST `/networks/create` with `config` (an Engine-API network config). Returns `{:ok, id}`."
+  @spec create_network(map(), keyword()) :: {:ok, String.t()} | {:error, term()}
+  def create_network(config, opts \\ []) when is_map(config) do
+    case request(:post, "/networks/create", Keyword.merge(opts, body: config)) do
+      {:ok, %{status: 201, body: %{"Id" => id}}} ->
+        {:ok, id}
+
+      {:ok, %{status: 409}} ->
+        {:error, :already_exists}
+
+      {:ok, %{status: status, body: body}} ->
+        {:error, {:create_network_failed, status, message(body)}}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  @doc "GET `/networks/{id}` — the network's inspect map."
+  @spec inspect_network(String.t(), keyword()) :: {:ok, map()} | {:error, term()}
+  def inspect_network(id, opts \\ []) do
+    with :ok <- ensure_ref(id), do: get_json("/networks/#{id}", opts)
+  end
+
+  @doc "DELETE `/networks/{id}`. A missing network (404) is `:ok`."
+  @spec remove_network(String.t(), keyword()) :: :ok | {:error, term()}
+  def remove_network(id, opts \\ []) do
+    with :ok <- ensure_ref(id) do
+      case request(:delete, "/networks/#{id}", opts) do
+        {:ok, %{status: s}} when s in [204, 404] ->
+          :ok
+
+        {:ok, %{status: status, body: body}} ->
+          {:error, {:remove_network_failed, status, message(body)}}
+
+        {:error, reason} ->
+          {:error, reason}
+      end
+    end
+  end
+
   ## Generic request
 
   @doc """
