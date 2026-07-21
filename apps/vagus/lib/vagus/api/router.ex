@@ -31,6 +31,7 @@ defmodule Vagus.API.Router do
   alias Vagus.API.{Envelope, StaticData}
   alias Vagus.Backend
   alias Vagus.Core.TokenStore
+  alias Vagus.Services
 
   alias Vagus.API.Models.{
     AccessPoint,
@@ -236,6 +237,55 @@ defmodule Vagus.API.Router do
     Envelope.send_ok(conn, %{backups: [], days_until_stale: 30})
   end
 
+  # -- Add-on service registry (§A3.1) ---------------------------------------
+  # An add-on that provides a service (e.g. Mosquitto → mqtt) publishes its
+  # connection config; Core/other add-ons read it. Access is by the caller's
+  # `services_role` grant (from its config.yaml `services:`).
+
+  get "/services" do
+    Envelope.send_ok(conn, %{services: Services.list()})
+  end
+
+  post "/services/:service" do
+    if provider?(conn.assigns.caller, service) do
+      case validate_service(service, conn.body_params) do
+        {:ok, data} ->
+          case Services.set(service, data, addon_slug(conn.assigns.caller)) do
+            :ok ->
+              Envelope.send_ok(conn, %{})
+
+            {:error, :already_provided} ->
+              Envelope.send_error(conn, "Service already provided", 400)
+          end
+
+        {:error, message} ->
+          Envelope.send_error(conn, message, 400)
+      end
+    else
+      Envelope.send_error(conn, "Caller may not provide '#{service}'", 403)
+    end
+  end
+
+  get "/services/:service" do
+    if service_reader?(conn.assigns.caller, service) do
+      case Services.get(service) do
+        {:ok, data} -> Envelope.send_ok(conn, data)
+        :error -> Envelope.send_error(conn, "Service not enabled", 400)
+      end
+    else
+      Envelope.send_error(conn, "Caller not authorized for '#{service}'", 403)
+    end
+  end
+
+  delete "/services/:service" do
+    if provider?(conn.assigns.caller, service) do
+      Services.delete(service, addon_slug(conn.assigns.caller))
+      Envelope.send_ok(conn, %{})
+    else
+      Envelope.send_error(conn, "Caller may not delete '#{service}'", 403)
+    end
+  end
+
   # -- Entry setup (once) ----------------------------------------------------
 
   get "/supervisor/ping" do
@@ -316,5 +366,75 @@ defmodule Vagus.API.Router do
         "Vagus.API.Router: host/#{action} backend call failed:\n" <>
           Exception.format(:error, exception, __STACKTRACE__)
       )
+  end
+
+  # -- caller/grant helpers (see Vagus.API.Auth for how :caller is assigned) --
+
+  defp addon_slug({:addon, %{slug: slug}}), do: slug
+  defp addon_slug(_), do: nil
+
+  # May the caller provide/delete this service? (its role must be "provide").
+  defp provider?({:addon, %{services_role: roles}}, service),
+    do: Map.get(roles, service) == "provide"
+
+  defp provider?(_caller, _service), do: false
+
+  # May the caller read the service? Supervisor/Core always; an add-on iff it
+  # declares any role for the service (provide/want/need).
+  defp service_reader?(:supervisor, _service), do: true
+
+  defp service_reader?({:addon, %{services_role: roles}}, service),
+    do: Map.has_key?(roles, service)
+
+  defp service_reader?(_caller, _service), do: false
+
+  # Validate a service publish body. Only `mqtt` is known (§A3.1
+  # SCHEMA_SERVICE_MQTT).
+  defp validate_service("mqtt", params) when is_map(params) do
+    with {:ok, host} <- require_string(params, "host"),
+         {:ok, port} <- require_port(params, "port"),
+         {:ok, protocol} <- mqtt_protocol(params) do
+      data =
+        %{
+          "host" => host,
+          "port" => port,
+          "ssl" => Map.get(params, "ssl", false),
+          "protocol" => protocol
+        }
+        |> put_optional_string(params, "username")
+        |> put_optional_string(params, "password")
+
+      if is_boolean(data["ssl"]), do: {:ok, data}, else: {:error, "ssl must be a boolean"}
+    end
+  end
+
+  defp validate_service(service, _params), do: {:error, "unknown service '#{service}'"}
+
+  defp require_string(params, key) do
+    case Map.get(params, key) do
+      v when is_binary(v) -> {:ok, v}
+      _ -> {:error, "#{key} is required"}
+    end
+  end
+
+  defp require_port(params, key) do
+    case Map.get(params, key) do
+      p when is_integer(p) and p >= 1 and p <= 65_535 -> {:ok, p}
+      _ -> {:error, "#{key} must be a port (1-65535)"}
+    end
+  end
+
+  defp mqtt_protocol(params) do
+    case Map.get(params, "protocol", "3.1.1") do
+      v when v in ["3.1", "3.1.1"] -> {:ok, v}
+      _ -> {:error, "protocol must be 3.1 or 3.1.1"}
+    end
+  end
+
+  defp put_optional_string(data, params, key) do
+    case Map.get(params, key) do
+      v when is_binary(v) -> Map.put(data, key, v)
+      _ -> data
+    end
   end
 end

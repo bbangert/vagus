@@ -75,6 +75,7 @@ defmodule Vagus.Addon.Manager do
          :ok <- maybe_ensure_network(config, opts),
          {:ok, id} <- backend(opts).create(spec),
          :ok <- backend(opts).start(id) do
+      register_identity(config, token)
       {:ok, %{id: id, access_token: token}}
     end
   end
@@ -215,6 +216,17 @@ defmodule Vagus.Addon.Manager do
     else
       {:error, reason} -> {:error, {:invalid_options, reason}}
     end
+  end
+
+  # Register the running add-on's token → identity/grants so the emulator's
+  # add-on-facing endpoints can authorize it. Best-effort: skipped if the
+  # registry isn't running (e.g. isolated unit tests).
+  defp register_identity(config, token) do
+    if Process.whereis(Vagus.Addon.Registry) do
+      Vagus.Addon.Registry.register(token, Vagus.Addon.Registry.identity_from_config(config))
+    end
+
+    :ok
   end
 
   defp ensure_token(opts), do: Keyword.put_new(opts, :access_token, generate_token())

@@ -26,9 +26,11 @@ defmodule Vagus.Application do
   def start(_type, _args) do
     children =
       [
-        # Children for all targets
-        # Starts a worker by calling: Vagus.Worker.start_link(arg)
-        # {Vagus.Worker, arg},
+        # Add-on identity + service registries (M4). Started before the HTTP
+        # surface so `Vagus.API.Auth` can resolve add-on tokens and the
+        # `/services` endpoints have their store the moment requests arrive.
+        Vagus.Addon.Registry,
+        Vagus.Services,
 
         # Supervisor-API emulator's HTTP surface (Bandit + Plug.Router),
         # isolated with its own restart budget so a crash there can't take
