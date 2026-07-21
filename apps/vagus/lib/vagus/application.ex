@@ -31,6 +31,7 @@ defmodule Vagus.Application do
         # `/services` endpoints have their store the moment requests arrive.
         Vagus.Addon.Registry,
         Vagus.Addon.State,
+        Vagus.Addon.Store,
         Vagus.Services,
         Vagus.Discovery,
         Vagus.Auth

@@ -188,6 +188,20 @@ defmodule Vagus.API.RouterTest do
     end
   end
 
+  describe "GET /store/addons (P2-T3)" do
+    test "empty catalog → empty addons list" do
+      conn = conn(:get, "/store/addons") |> authed() |> call()
+      assert conn.status == 200
+      assert json_body(conn)["data"] == %{"addons" => []}
+    end
+
+    test "unknown store slug → 404" do
+      conn = conn(:get, "/store/addons/core_ghost") |> authed() |> call()
+      assert conn.status == 404
+      assert json_body(conn)["result"] == "error"
+    end
+  end
+
   describe "GET /backups and /backups/info" do
     test "returns an empty BackupList" do
       conn = conn(:get, "/backups") |> authed() |> call()

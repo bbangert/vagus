@@ -56,6 +56,10 @@ defmodule Vagus.MixProject do
       {:fresh, path: "../../vendor/fresh"},
       {:jason, "~> 1.4"},
 
+      # Parses add-on `config.yaml` in the store (P2-T3). yamerl-backed;
+      # pulled into all targets since the store runs on-device.
+      {:yaml_elixir, "~> 2.11"},
+
       # Allow Nerves.Runtime on host to support development, testing and CI.
       # See config/host.exs for usage.
       {:nerves_runtime, "~> 0.13.12"},

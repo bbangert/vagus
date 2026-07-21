@@ -121,6 +121,13 @@ config :vagus, :addon_data_root, "/root/vagus/addons"
 # pointed at .3 with `--dns` and for add-ons resolving external hosts.
 config :vagus, :dns_upstream, "1.1.1.1"
 
+# Add-on store repositories (M4-P2-T3). The official "core" add-ons repo;
+# `POST /store/reload` fetches + parses these into the catalog. `core` gives
+# the store-slug prefix (core_mosquitto), matching the Supervisor.
+config :vagus, :store_repositories, [
+  %{slug: "core", url: "https://github.com/home-assistant/addons", ref: "master"}
+]
+
 # Core's Supervisor unix socket (M4 /auth). Core is run with
 # SUPERVISOR_CORE_API_SOCKET=<this path> and its dir bind-mounted to the host;
 # `Vagus.Auth` reaches api/hassio_auth over it, authenticating as the

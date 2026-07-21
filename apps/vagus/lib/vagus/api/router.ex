@@ -29,6 +29,7 @@ defmodule Vagus.API.Router do
   require Logger
 
   alias Vagus.API.{Envelope, StaticData}
+  alias Vagus.Addon.{Store, StoreView}
   alias Vagus.Backend
   alias Vagus.Core.TokenStore
   alias Vagus.Discovery
@@ -164,9 +165,22 @@ defmodule Vagus.API.Router do
     conn
   end
 
-  # Wire path is "store", NOT "/store/info" (§3, §20).
+  # Wire path is "store", NOT "/store/info" (§3, §20). Backed by the live
+  # `Vagus.Addon.Store` catalog (§A1 store routes) — honestly empty until a
+  # repository is configured + `POST /store/reload` fetches it.
   get "/store" do
-    Envelope.send_ok(conn, StoreInfo.build!(StaticData.store_info()))
+    Envelope.send_ok(conn, StoreInfo.build!(store_info_data()))
+  end
+
+  get "/store/addons" do
+    Envelope.send_ok(conn, %{addons: store_addon_summaries()})
+  end
+
+  get "/store/addons/:slug" do
+    case Store.get(slug) do
+      {:ok, entry} -> Envelope.send_ok(conn, StoreView.detail(slug, entry))
+      :error -> Envelope.send_error(conn, "Addon #{slug} does not exist in the store", 404)
+    end
   end
 
   # Wire path is "mounts", NOT "/mounts/info" (§3, §20).
@@ -462,8 +476,9 @@ defmodule Vagus.API.Router do
   end
 
   # Fired by the addon coordinator on non-scheduled refreshes, before
-  # re-listing addons (§3).
+  # re-listing addons (§3). Re-fetches the store repositories.
   post "/store/reload" do
+    {:ok, _count} = Store.reload()
     Envelope.send_ok(conn, %{})
   end
 
@@ -499,6 +514,29 @@ defmodule Vagus.API.Router do
         "Vagus.API.Router: host/#{action} backend call failed:\n" <>
           Exception.format(:error, exception, __STACKTRACE__)
       )
+  end
+
+  # -- store helpers ---------------------------------------------------------
+
+  defp store_info_data do
+    %{addons: store_addon_summaries(), repositories: store_repositories()}
+  end
+
+  defp store_addon_summaries do
+    Store.catalog() |> Enum.map(fn {slug, entry} -> StoreView.summary(slug, entry) end)
+  end
+
+  # The Repository wire shape (slug/name/source/url/maintainer, all strings).
+  defp store_repositories do
+    Enum.map(Store.repositories(), fn repo ->
+      %{
+        slug: repo.slug,
+        name: Map.get(repo, :name, repo.slug),
+        source: repo.url,
+        url: repo.url,
+        maintainer: Map.get(repo, :maintainer, "")
+      }
+    end)
   end
 
   # -- discovery helpers -----------------------------------------------------
