@@ -13,12 +13,27 @@ set -euo pipefail
 # namespace is reachable via the docker0 gateway, hence the 172.17.0.1
 # default. Override SUPERVISOR_HOST if your bridge differs.
 #
+# HOST_PORT is the host-side port Core's web UI is published on (container
+# side is always 8123). Override it when host 8123 is already taken (e.g. a
+# port-forward to a real HA). Because the emulator's EventPusher/Client dial
+# Core back at `config :vagus, :core_base_url`, a non-8123 HOST_PORT also
+# requires the emulator to be started with a matching VAGUS_CORE_BASE_URL —
+# `up` prints the exact export to use (config/host.exs reads that env var).
+#
 # Usage:
 #   scripts/dev-core.sh up        # start (pulls image on first run)
 #   scripts/dev-core.sh down      # stop + remove container (keeps /config volume)
 #   scripts/dev-core.sh restart   # bounce Core to force an immediate full poll
 #   scripts/dev-core.sh logs      # follow Core logs
 #   scripts/dev-core.sh reset     # down + delete the /config volume (fresh onboarding)
+#
+#   # Example when host 8123 is occupied:
+#   HOST_PORT=8124 scripts/dev-core.sh up
+#
+# Start the emulator (host BEAM) BEFORE `up` — if Core boots first it logs
+# one-shot "connecting to supervisor" errors from discovery/addon_panel and a
+# hassio ConfigEntryNotReady (hassio self-heals on retry; the other two need a
+# Core `restart`). Emulator-first avoids the noise entirely.
 
 CORE_VERSION="${CORE_VERSION:-2026.7.2}"
 CORE_IMAGE="ghcr.io/home-assistant/home-assistant:${CORE_VERSION}"
@@ -26,6 +41,7 @@ CONTAINER_NAME="${CONTAINER_NAME:-vagus-dev-core}"
 CONFIG_VOLUME="${CONFIG_VOLUME:-vagus-dev-core-config}"
 SUPERVISOR_HOST="${SUPERVISOR_HOST:-172.17.0.1}"
 SUPERVISOR_PORT="${SUPERVISOR_PORT:-8888}"
+HOST_PORT="${HOST_PORT:-8123}"
 
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 token_file="${TOKEN_FILE:-${repo_root}/.dev/supervisor_token}"
@@ -46,13 +62,19 @@ token() {
 case "${1:-up}" in
   up)
     docker run -d --name "$CONTAINER_NAME" \
-      -p 8123:8123 \
+      -p "${HOST_PORT}:8123" \
       -e SUPERVISOR="${SUPERVISOR_HOST}:${SUPERVISOR_PORT}" \
       -e SUPERVISOR_TOKEN="$(token)" \
       -e TZ="${TZ:-UTC}" \
       -v "${CONFIG_VOLUME}:/config" \
       "$CORE_IMAGE"
-    echo "Core ${CORE_VERSION} up: http://localhost:8123 — supervisor expected at ${SUPERVISOR_HOST}:${SUPERVISOR_PORT}"
+    echo "Core ${CORE_VERSION} up: http://localhost:${HOST_PORT} — supervisor expected at ${SUPERVISOR_HOST}:${SUPERVISOR_PORT}"
+    if [[ "$HOST_PORT" != "8123" ]]; then
+      echo
+      echo "NOTE: Core is on host port ${HOST_PORT}, not 8123. Start the emulator with a matching"
+      echo "      callback URL so EventPusher/Client reach Core:"
+      echo "        export VAGUS_CORE_BASE_URL=http://localhost:${HOST_PORT}"
+    fi
     ;;
   down)
     docker rm -f "$CONTAINER_NAME"

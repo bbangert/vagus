@@ -25,7 +25,16 @@ config :vagus, :core_token_path, Path.expand("../.dev/core_token.json", __DIR__)
 # Core to call INTO). Real Home Assistant OS installs run Core and
 # Supervisor on the same host-networked machine, so localhost:8123 is
 # correct on both host and target (contract §5 auth exchange, §4 WS URL).
-config :vagus, :core_base_url, "http://localhost:8123"
+#
+# `VAGUS_CORE_BASE_URL` env override for the host dev loop: when
+# `scripts/dev-core.sh` publishes Core on a non-8123 host port (its
+# `HOST_PORT`, e.g. to dodge a host 8123 collision), the emulator must dial
+# that port instead. `mix run` re-evaluates this file per invocation, so the
+# env var is read at emulator boot; dev-core.sh prints the exact export to
+# use. Unset → the correct default for real HAOS (Core host-networked on 8123).
+config :vagus,
+       :core_base_url,
+       System.get_env("VAGUS_CORE_BASE_URL") || "http://localhost:8123"
 
 # Host-management backends (P4-T1) — plausible-but-honest stubs, some of
 # which (OS) read the same Nerves.Runtime.KV pre-populated below.
