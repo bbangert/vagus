@@ -79,7 +79,14 @@ defmodule Vagus.Application do
           # Finch, Client, EventPusher), isolated the same way. Started on
           # both :host and real targets — see `Vagus.Core.Supervisor` for the
           # isolation rationale.
-          {Vagus.Core.Supervisor, []}
+          {Vagus.Core.Supervisor, []},
+
+          # Auto-installs + boots the default native provider (the mqttx broker,
+          # M5-P5). `:ignore` unless `config :vagus, :default_native_addon` is set
+          # (only target.exs sets it). Placed last so `Native.Supervisor`,
+          # `Services`, `Discovery`, and `Vagus.DNS` are all up before it installs
+          # + starts the broker (which needs none of the container engine).
+          Vagus.Addon.DefaultProvider
         ] ++ target_children()
 
     # See https://elixir.hexdocs.pm/Supervisor.html

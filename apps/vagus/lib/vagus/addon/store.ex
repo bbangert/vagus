@@ -66,7 +66,7 @@ defmodule Vagus.Addon.Store do
   @impl GenServer
   def init(opts) do
     state = %{
-      fetcher: Keyword.get(opts, :fetcher, @default_fetcher),
+      fetcher: Keyword.get(opts, :fetcher, configured_fetcher()),
       repositories: Keyword.get(opts, :repositories, configured_repositories()),
       catalog: %{}
     }
@@ -153,5 +153,12 @@ defmodule Vagus.Addon.Store do
 
   defp configured_repositories do
     Application.get_env(:vagus, :store_repositories, [])
+  end
+
+  # `:store_fetcher` lets a target select `BuiltinFetcher` (embeds Vagus's native
+  # virtual add-ons + delegates git repos to HTTPFetcher) without a bespoke child
+  # spec; defaults to plain HTTP fetching.
+  defp configured_fetcher do
+    Application.get_env(:vagus, :store_fetcher, @default_fetcher)
   end
 end
