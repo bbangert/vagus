@@ -56,6 +56,17 @@ defmodule Vagus.Mqtt.BrokerTest do
     refute_receive {:mqtt_message, ["garage", "door"], _}, 500
   end
 
+  test "accepts MQTT 5.0 and 3.1 connects and routes across versions", %{port: port} do
+    # Home Assistant Core connects with MQTT 5.0; a 3.1.1-only broker rejects it
+    # (P6 finding) — `supported_versions: [3, 4, 5]`.
+    v5_sub = connect_client!(port, "v5sub", 5)
+    v31_pub = connect_client!(port, "v31pub", 3)
+
+    {:ok, _} = MqttX.Client.subscribe(v5_sub, "cross/version", qos: 1)
+    :ok = MqttX.Client.publish(v31_pub, "cross/version", "ok", qos: 1)
+    assert_receive {:mqtt_message, ["cross", "version"], "ok"}, 1_000
+  end
+
   test "reaps a subscriber's routing entries when it disconnects", %{port: port} do
     sub = connect_client!(port, "sub")
     pub = connect_client!(port, "pub")
@@ -92,15 +103,13 @@ defmodule Vagus.Mqtt.BrokerTest do
 
   # ---------- helpers ----------
 
-  defp connect_client!(port, tag) do
+  defp connect_client!(port, tag, version \\ 4) do
     {:ok, client} =
       MqttX.Client.connect(
         host: "127.0.0.1",
         port: port,
         client_id: "#{tag}-#{System.unique_integer([:positive])}",
-        # Broker negotiates 3.1.1 only (supported_versions: [4]); mqttx's client
-        # defaults to v5 as of 0.10.0, so opt into v4 explicitly.
-        protocol_version: 4,
+        protocol_version: version,
         clean_session: true,
         retry_interval: 100,
         handler: Collector,

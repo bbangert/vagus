@@ -21,9 +21,12 @@ defmodule Vagus.Mqtt.Broker do
        dispatching to `Vagus.Mqtt.Broker.Handler`, with a coarse connection-rate
        cap (`max_connections`).
 
-  `supported_versions: [4]` restricts negotiation to MQTT 3.1.1, the v1
-  conformance target (mqttx's 5.0 codec paths stay available but v1 is not gated
-  on full 5.0 semantics). Note the mqttx API split: listener binding (`:port`,
+  `supported_versions: [3, 4, 5]` accepts MQTT 3.1 / 3.1.1 / 5.0 CONNECTs — Home
+  Assistant Core's MQTT client connects with 5.0, so a 3.1.1-only broker rejects
+  it at the version gate and HA's setup silently fails (P6 finding). mqttx runs
+  the 5.0 codec; v1 isn't gated on full 5.0 semantics (properties/shared-subs),
+  but basic connect/pub/sub/retained work across versions. Note the mqttx API
+  split: listener binding (`:port`,
   `:ip`) goes in the 3rd `start_link` arg, but protocol options like
   `supported_versions` are read from `handler_opts[:transport_opts]` (the 2nd
   arg, as a map) — the 3rd arg is only consulted by the transport adapter.
@@ -103,7 +106,7 @@ defmodule Vagus.Mqtt.Broker do
                [
                  subscriptions: subs_name,
                  auth: auth,
-                 transport_opts: %{supported_versions: [4]}
+                 transport_opts: %{supported_versions: [3, 4, 5]}
                ],
                [
                  transport: MqttX.Transport.ThousandIsland,

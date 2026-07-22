@@ -58,9 +58,9 @@ defmodule Vagus.Mqtt.Broker.Handler do
   end
 
   # Carry the full subscription options (not just QoS) into the Router so that
-  # `no_local`/`retain_as_published`/`retain_handling` are honoured. They're
-  # always the v3.1.1 defaults today (`supported_versions: [4]`), but plumbing
-  # them now keeps `match/3`'s no-local filtering correct if MQTT 5.0 is enabled.
+  # `no_local`/`retain_as_published`/`retain_handling` are honoured — the broker
+  # accepts MQTT 5.0 (`supported_versions: [3, 4, 5]`), whose subscribers can set
+  # these; `match/3`'s no-local filtering relies on them being plumbed here.
   defp subscribe_opts(topic) do
     [
       qos: topic.qos,
