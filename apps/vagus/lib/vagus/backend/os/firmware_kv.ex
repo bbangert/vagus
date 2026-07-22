@@ -21,7 +21,7 @@ defmodule Vagus.Backend.OS.FirmwareKV do
   alias Nerves.Runtime.KV
   alias Vagus.API.Models.BootSlot
 
-  @doc "The active fwup slot, `\"a\"` or `\"b\"` (defaults to `\"a\"` if unknown)."
+  @doc ~S[The active fwup slot, `"a"` or `"b"` (defaults to `"a"` if unknown).]
   @spec active_slot() :: String.t()
   def active_slot do
     active_uuid = KV.get_active("nerves_fw_uuid")
@@ -33,7 +33,7 @@ defmodule Vagus.Backend.OS.FirmwareKV do
     end
   end
 
-  @doc "The firmware version recorded for `slot` (`\"a\"`/`\"b\"`), or `nil`."
+  @doc ~S[The firmware version recorded for `slot` (`"a"`/`"b"`), or `nil`.]
   @spec version(String.t()) :: String.t() | nil
   def version(slot), do: KV.get("#{slot}.nerves_fw_version")
 

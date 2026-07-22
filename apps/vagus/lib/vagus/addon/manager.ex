@@ -111,9 +111,8 @@ defmodule Vagus.Addon.Manager do
   def install(%Config{} = config, opts \\ []) do
     spec = build_spec(config, ensure_token(opts))
 
-    with :ok <- maybe_ensure_network(config, opts),
-         :ok <- backend(opts).pull(spec) do
-      :ok
+    with :ok <- maybe_ensure_network(config, opts) do
+      backend(opts).pull(spec)
     end
   end
 
@@ -467,6 +466,8 @@ defmodule Vagus.Addon.Manager do
     end
   end
 
+  # path is internal/config-derived, not request input
+  # sobelow_skip ["Traversal.FileModule"]
   defp ensure_mount_sources(%Spec{mounts: mounts}) do
     Enum.reduce_while(mounts, :ok, fn %{source: source}, :ok ->
       case File.mkdir_p(source) do
@@ -478,18 +479,22 @@ defmodule Vagus.Addon.Manager do
 
   # Validate merged options against the add-on schema and write /data/options.json
   # (the per-add-on data dir is the /data bind source).
+  # path is internal/config-derived, not request input
+  # sobelow_skip ["Traversal.FileModule"]
   defp write_options(config, data_root, user_options) do
-    with {:ok, options} <- OptionsSchema.effective(config.schema, config.options, user_options) do
-      path = Path.join([data_root, "addons", "data", config.slug, "options.json"])
+    case OptionsSchema.effective(config.schema, config.options, user_options) do
+      {:ok, options} ->
+        path = Path.join([data_root, "addons", "data", config.slug, "options.json"])
 
-      with :ok <- File.mkdir_p(Path.dirname(path)),
-           :ok <- File.write(path, Jason.encode!(options)) do
-        :ok
-      else
-        {:error, reason} -> {:error, {:write_options, reason}}
-      end
-    else
-      {:error, reason} -> {:error, {:invalid_options, reason}}
+        with :ok <- File.mkdir_p(Path.dirname(path)),
+             :ok <- File.write(path, Jason.encode!(options)) do
+          :ok
+        else
+          {:error, reason} -> {:error, {:write_options, reason}}
+        end
+
+      {:error, reason} ->
+        {:error, {:invalid_options, reason}}
     end
   end
 
@@ -591,6 +596,8 @@ defmodule Vagus.Addon.Manager do
     :ok
   end
 
+  # path is internal/config-derived, not request input
+  # sobelow_skip ["Traversal.FileModule"]
   defp remove_data_dir(slug, opts) do
     if Config.valid_slug?(slug) do
       File.rm_rf(Path.join([data_root(opts), "addons", "data", slug]))

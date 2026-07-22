@@ -10,7 +10,7 @@ defmodule Vagus.Backend.Network.HostStubTest do
       assert NetworkInfo.build!(attrs) == attrs
     end
 
-    test "the single interface is \"eth-host\", not \"eth0\"" do
+    test ~S(the single interface is "eth-host", not "eth0") do
       assert [%{interface: "eth-host"}] = HostStub.info().interfaces
     end
   end

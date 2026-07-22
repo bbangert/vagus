@@ -23,9 +23,8 @@ defmodule Vagus.Addon.Store.HTTPFetcher do
     ref = Map.get(repo, :ref, "master")
 
     with {:ok, codeload} <- codeload_url(url, ref),
-         {:ok, archive} <- download(codeload),
-         {:ok, files} <- extract(archive) do
-      {:ok, files}
+         {:ok, archive} <- download(codeload) do
+      extract(archive)
     end
   end
 

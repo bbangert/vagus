@@ -11,7 +11,7 @@ defmodule Vagus.Addon.BootStarterTest do
   """
   use ExUnit.Case, async: false
 
-  alias Vagus.Addon.{BootStarter, Backend.Fake, Config, State}
+  alias Vagus.Addon.{Backend.Fake, BootStarter, Config, State}
 
   setup do
     prev_backend = Application.get_env(:vagus, :addon_backend)

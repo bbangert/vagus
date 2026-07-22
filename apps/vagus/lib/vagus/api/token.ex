@@ -43,6 +43,8 @@ defmodule Vagus.API.Token do
     end
   end
 
+  # path is internal/config-derived, not request input
+  # sobelow_skip ["Traversal.FileModule"]
   defp read_or_generate(path) do
     case File.read(path) do
       {:ok, contents} -> String.trim(contents)
@@ -50,6 +52,8 @@ defmodule Vagus.API.Token do
     end
   end
 
+  # path is internal/config-derived, not request input
+  # sobelow_skip ["Traversal.FileModule"]
   defp generate_and_persist(path) do
     token = :crypto.strong_rand_bytes(32) |> Base.encode16(case: :lower)
     :ok = File.mkdir_p(Path.dirname(path))

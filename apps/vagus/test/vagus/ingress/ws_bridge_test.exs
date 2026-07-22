@@ -217,8 +217,8 @@ defmodule Vagus.Ingress.WSBridgeTest do
   """
   use ExUnit.Case, async: false
 
-  alias Vagus.Ingress.WSBridgeTest.{Client, FakeAddon}
   alias Vagus.Addon.{Config, State}
+  alias Vagus.Ingress.WSBridgeTest.{Client, FakeAddon}
 
   setup do
     start_supervised!({Vagus.Ingress, []})

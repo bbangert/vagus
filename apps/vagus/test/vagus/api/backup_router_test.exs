@@ -119,7 +119,7 @@ defmodule Vagus.API.BackupRouterTest do
       Enum.map_join(parts, "", fn
         {:file, name, filename, content_type, content} ->
           "--#{boundary}\r\n" <>
-            "content-disposition: form-data; name=\"#{name}\"; filename=\"#{filename}\"\r\n" <>
+            ~s(content-disposition: form-data; name="#{name}"; filename="#{filename}"\r\n) <>
             "content-type: #{content_type}\r\n\r\n" <>
             content <> "\r\n"
 

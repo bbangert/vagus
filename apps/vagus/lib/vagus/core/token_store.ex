@@ -128,6 +128,9 @@ defmodule Vagus.Core.TokenStore do
     Enum.each(subscribers, &send(&1, {:token_store, :refresh_token_available}))
   end
 
+  # `path` is the compile/config-time token-store path, never request input —
+  # no user-controlled traversal is possible.
+  # sobelow_skip ["Traversal.FileModule"]
   defp read_persisted(path) do
     with {:ok, contents} <- File.read(path),
          {:ok, %{} = decoded} <- Jason.decode(contents) do
@@ -137,6 +140,8 @@ defmodule Vagus.Core.TokenStore do
     end
   end
 
+  # `path` is the compile/config-time token-store path, not request input.
+  # sobelow_skip ["Traversal.FileModule"]
   defp persist(path, options) do
     :ok = File.mkdir_p(Path.dirname(path))
 
@@ -155,6 +160,7 @@ defmodule Vagus.Core.TokenStore do
   # This file holds Core's admin-grade refresh token — restrict it to the
   # owning user. A chmod failure doesn't invalidate the write that already
   # landed, so it's logged rather than raised.
+  # sobelow_skip ["Traversal.FileModule"]
   defp chmod_admin_only(path) do
     case File.chmod(path, 0o600) do
       :ok ->

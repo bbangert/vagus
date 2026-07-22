@@ -240,7 +240,7 @@ defmodule Vagus.API.IngressProxy do
   # a path, the connection itself already carries the host.
   defp build_ws_path(rest, query_string) do
     path = "/" <> Enum.join(rest, "/")
-    if query_string in [nil, ""], do: path, else: path <> "?" <> query_string
+    if query_string == "", do: path, else: path <> "?" <> query_string
   end
 
   defp requested_subprotocols(conn) do
@@ -306,7 +306,7 @@ defmodule Vagus.API.IngressProxy do
   defp build_url(ip, port, rest, query_string) do
     path = Enum.join(rest, "/")
     base = "http://#{ip}:#{port}/#{path}"
-    if query_string in [nil, ""], do: base, else: base <> "?" <> query_string
+    if query_string == "", do: base, else: base <> "?" <> query_string
   end
 
   defp build_request_headers(conn) do

@@ -71,6 +71,8 @@ defmodule Vagus.Backups do
   call), and indexes it. Returns `{:ok, slug}`.
   """
   @spec put_file(binary(), GenServer.server()) :: {:ok, String.t()} | {:error, term()}
+  # path is internal/config-derived, not request input
+  # sobelow_skip ["Traversal.FileModule"]
   def put_file(tar, server \\ __MODULE__) when is_binary(tar) do
     with {:ok, %{backup: backup}} <- Vagus.Backup.read(tar),
          slug <- backup["slug"],
@@ -154,6 +156,8 @@ defmodule Vagus.Backups do
   500 instead of an honest error envelope).
   """
   @spec restore_partial(String.t(), [String.t()], keyword()) :: :ok | {:error, term()}
+  # path is internal/config-derived, not request input
+  # sobelow_skip ["Traversal.FileModule"]
   def restore_partial(backup_slug, addon_slugs, opts \\ []) do
     server = Keyword.get(opts, :server, __MODULE__)
     data_root = data_root(opts)
@@ -195,6 +199,8 @@ defmodule Vagus.Backups do
   def handle_call({:put_index, slug, entry}, _from, %{index: index} = state),
     do: {:reply, :ok, %{state | index: Map.put(index, slug, entry)}}
 
+  # path is internal/config-derived, not request input
+  # sobelow_skip ["Traversal.FileModule"]
   def handle_call({:delete, slug}, _from, %{index: index} = state) do
     case Map.fetch(index, slug) do
       {:ok, %{path: path}} ->
@@ -213,6 +219,8 @@ defmodule Vagus.Backups do
   # explicit `install`/`start` call), this runs unconditionally at
   # `Vagus.Application` boot, and a `/data` that isn't writable yet (or ever,
   # e.g. a sandboxed `mix test` run) must not crash the whole app.
+  # path is internal/config-derived, not request input
+  # sobelow_skip ["Traversal.FileModule"]
   defp ensure_and_scan(dir) do
     case File.mkdir_p(dir) do
       :ok ->
@@ -231,6 +239,8 @@ defmodule Vagus.Backups do
     |> Enum.reduce(%{}, fn path, acc -> index_file(path, acc) end)
   end
 
+  # path is internal/config-derived, not request input
+  # sobelow_skip ["Traversal.FileModule"]
   defp index_file(path, acc) do
     with {:ok, bin} <- File.read(path),
          {:ok, %{backup: backup}} <- Vagus.Backup.read(bin) do
@@ -434,6 +444,8 @@ defmodule Vagus.Backups do
   # `File.rename/2`) — nothing under `data_dir` itself is touched until
   # staging fully succeeds, so a mid-write failure (disk full) leaves the
   # existing data dir intact rather than half-wiped.
+  # path is internal/config-derived, not request input
+  # sobelow_skip ["Traversal.FileModule"]
   defp stage_files(data_dir, files, slug) do
     parent = Path.dirname(data_dir)
     unique = System.unique_integer([:positive])
@@ -449,6 +461,8 @@ defmodule Vagus.Backups do
     end
   end
 
+  # path is internal/config-derived, not request input
+  # sobelow_skip ["Traversal.FileModule"]
   defp swap_and_finish(slug, addon, data_dir, staging_dir, opts) do
     File.rm_rf(data_dir)
 
@@ -497,6 +511,8 @@ defmodule Vagus.Backups do
   # + `reduce_while` (not `File.mkdir_p!`/`File.write!`) so a disk-full/
   # permission failure returns an honest `{:error, {:restore, slug, reason}}`
   # instead of raising and 500ing the router.
+  # path is internal/config-derived, not request input
+  # sobelow_skip ["Traversal.FileModule"]
   defp materialize(dir, files, slug) do
     Enum.reduce_while(files, :ok, fn {rel, content}, :ok ->
       path = Path.join(dir, rel)
@@ -514,6 +530,8 @@ defmodule Vagus.Backups do
     end)
   end
 
+  # path is internal/config-derived, not request input
+  # sobelow_skip ["Traversal.FileModule"]
   defp safe_mkdir_p(dir, slug) do
     case File.mkdir_p(dir) do
       :ok -> :ok

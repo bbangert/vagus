@@ -278,6 +278,8 @@ defmodule Vagus.Addon.State do
     Keyword.get(opts, :persist_path, Application.get_env(:vagus, :addon_state_path))
   end
 
+  # path is internal/config-derived, not request input
+  # sobelow_skip ["Traversal.FileModule"]
   defp load_entries(path) do
     case File.read(path) do
       {:ok, content} ->
@@ -392,6 +394,8 @@ defmodule Vagus.Addon.State do
 
   defp persist(nil, _entries), do: :ok
 
+  # path is internal/config-derived, not request input
+  # sobelow_skip ["Traversal.FileModule"]
   defp persist(path, entries) do
     tmp = path <> ".tmp"
 

@@ -117,7 +117,7 @@ defmodule Vagus.API.RouterTest do
 
       interfaces = body["data"]["interfaces"]
       assert is_list(interfaces)
-      assert length(interfaces) > 0
+      assert interfaces != []
 
       for interface <- interfaces do
         assert keys(interface) == MapSet.new(@network_interface_keys)

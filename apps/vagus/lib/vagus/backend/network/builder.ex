@@ -55,7 +55,7 @@ defmodule Vagus.Backend.Network.Builder do
     }
   end
 
-  @doc "`\"ethernet\"` or `\"wireless\"`, by `vintage_net`'s interface naming convention."
+  @doc ~S(`"ethernet"` or `"wireless"`, by `vintage_net`'s interface naming convention.)
   @spec interface_type(String.t()) :: String.t()
   def interface_type(ifname) do
     if String.starts_with?(ifname, "wlan"), do: "wireless", else: "ethernet"

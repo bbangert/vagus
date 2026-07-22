@@ -12,8 +12,8 @@ defmodule Vagus.API.IngressRouterTest do
   use ExUnit.Case, async: false
   use Plug.Test
 
-  alias Vagus.API.{Router, Token}
   alias Vagus.Addon.{Config, Registry, State}
+  alias Vagus.API.{Router, Token}
 
   @opts Router.init([])
 

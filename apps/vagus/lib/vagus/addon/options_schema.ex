@@ -224,15 +224,27 @@ defmodule Vagus.Addon.OptionsSchema do
   # rather than crashing.
   defp bound(caps, i) do
     case Enum.at(caps, i) do
-      "" -> nil
-      s -> with {n, ""} <- Integer.parse(s), do: n, else: (_ -> nil)
+      "" ->
+        nil
+
+      s ->
+        case Integer.parse(s) do
+          {n, ""} -> n
+          _ -> nil
+        end
     end
   end
 
   defp fbound(caps, i) do
     case Enum.at(caps, i) do
-      "" -> nil
-      s -> with {n, ""} <- Float.parse(pad(s)), do: n, else: (_ -> nil)
+      "" ->
+        nil
+
+      s ->
+        case Float.parse(pad(s)) do
+          {n, ""} -> n
+          _ -> nil
+        end
     end
   end
 

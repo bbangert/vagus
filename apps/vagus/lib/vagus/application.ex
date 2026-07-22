@@ -114,7 +114,7 @@ defmodule Vagus.Application do
 
   # List all child processes to be supervised
   if Mix.target() == :host do
-    defp target_children() do
+    defp target_children do
       [
         # Children that only run on the host during development or test.
         # In general, prefer using `config/host.exs` for differences.
@@ -124,7 +124,7 @@ defmodule Vagus.Application do
       ]
     end
   else
-    defp target_children() do
+    defp target_children do
       [
         # Holds the balena-engine daemon once Vagus.Engine.Manager starts
         # it. A dedicated DynamicSupervisor (rather than starting the

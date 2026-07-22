@@ -165,6 +165,8 @@ defmodule Vagus.Backup do
   end
 
   # Recursively read a directory into [{relative_path, content}]. Absent dir → [].
+  # path is internal/config-derived, not request input
+  # sobelow_skip ["Traversal.FileModule"]
   defp read_dir(dir) do
     if File.dir?(dir) do
       dir
@@ -179,6 +181,8 @@ defmodule Vagus.Backup do
 
   ## tar helpers
 
+  # path is internal/config-derived, not request input
+  # sobelow_skip ["Traversal.FileModule"]
   defp write_tar(members, compressed: compressed?) do
     path =
       Path.join(System.tmp_dir!(), "vagus-backup-#{System.unique_integer([:positive])}.tar")

@@ -19,8 +19,8 @@ defmodule Vagus.API.Auth do
 
   import Plug.Conn
 
-  alias Vagus.API.{Envelope, Token}
   alias Vagus.Addon.Registry
+  alias Vagus.API.{Envelope, Token}
 
   @impl Plug
   def init(opts), do: opts

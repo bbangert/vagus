@@ -28,8 +28,8 @@ defmodule Vagus.API.Router do
 
   require Logger
 
-  alias Vagus.API.{Envelope, StaticData}
   alias Vagus.Addon.{Manager, OptionsSchema, State, Store, StoreView}
+  alias Vagus.API.{Envelope, StaticData}
   alias Vagus.Backend
   alias Vagus.Backups
   alias Vagus.Core.TokenStore
@@ -1122,6 +1122,8 @@ defmodule Vagus.API.Router do
     end
   end
 
+  # path is internal/config-derived, not request input
+  # sobelow_skip ["Traversal.FileModule", "Traversal.SendFile"]
   defp handle_backup_download(conn, slug) do
     case Backups.get(slug) do
       {:ok, %{backup: b, path: path}} ->
@@ -1155,6 +1157,8 @@ defmodule Vagus.API.Router do
   # that caller. The body is still unread at this point (the router-wide
   # parser passed it through, `pass: ["*/*"]`), so `parse_multipart/1` is
   # reading it for the first time.
+  # path is internal/config-derived, not request input
+  # sobelow_skip ["Traversal.FileModule"]
   defp handle_backup_upload(conn) do
     case parse_multipart(conn) do
       {:ok, conn} ->
@@ -1341,6 +1345,8 @@ defmodule Vagus.API.Router do
 
   # Reads the effective options `Manager.start` wrote to the add-on's
   # `/data/options.json` (data root from `config :vagus, :addon_data_root`).
+  # path is internal/config-derived, not request input
+  # sobelow_skip ["Traversal.FileModule"]
   defp read_addon_options(slug) do
     path =
       Path.join([

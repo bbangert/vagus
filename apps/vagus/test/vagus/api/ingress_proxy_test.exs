@@ -94,9 +94,9 @@ defmodule Vagus.API.IngressProxyTest do
   """
   use ExUnit.Case, async: false
 
+  alias Vagus.Addon.{Config, State}
   alias Vagus.API.IngressProxyTest.{FakeAddon, HitCounter}
   alias Vagus.API.Token
-  alias Vagus.Addon.{Config, State}
 
   @client_finch Vagus.API.IngressProxyTest.ClientFinch
 
