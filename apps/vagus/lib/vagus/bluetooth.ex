@@ -20,6 +20,14 @@ defmodule Vagus.Bluetooth do
   `BR2_PACKAGE_BLUEZ5_UTILS`) so a misbuilt firmware degrades to "no
   Bluetooth" instead of an app-toppling supervision crash loop — same
   pattern as `Vagus.Addon.BootStarter`.
+
+  Phase 2 (vagus-improv): the tree's tail carries the Improv-over-BLE
+  Wi-Fi provisioning group + its reaper (see `Vagus.Improv` /
+  `Vagus.Improv.Reaper`), mounted per improv's contract — appended last
+  under `:rest_for_one`, so a `bluetoothd` restart rebuilds the group
+  while an Improv fault never disturbs the daemons. The group idles
+  disarmed on an online boot and is reaped once the network is up;
+  disable entirely with `improv: false` in opts.
   """
 
   use Supervisor
@@ -63,11 +71,28 @@ defmodule Vagus.Bluetooth do
     # Same explicit budget as the upstream tree: a daemon crash-loop
     # escalates to Vagus.Supervisor within a minute instead of cycling
     # silently forever.
-    Supervisor.init(daemon_children(opts),
+    Supervisor.init(children(opts),
       strategy: :rest_for_one,
       max_restarts: 10,
       max_seconds: 60
     )
+  end
+
+  @doc """
+  The full child list: the daemon slice plus (unless `improv: false`) the
+  Improv provisioning tail. Public for child-order tests.
+  """
+  @spec children(keyword()) :: [Supervisor.child_spec() | {module(), term()} | module()]
+  def children(opts \\ []) do
+    daemon_children(opts) ++ improv_children(opts)
+  end
+
+  defp improv_children(opts) do
+    if Keyword.get(opts, :improv, true) do
+      [Vagus.Improv.supervisor_child(), Vagus.Improv.Reaper]
+    else
+      []
+    end
   end
 
   @doc """

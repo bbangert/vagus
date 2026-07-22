@@ -33,6 +33,25 @@ defmodule Vagus.BluetoothTest do
     end
   end
 
+  describe "children/1" do
+    test "appends the Improv group + reaper after the daemon slice" do
+      children = Vagus.Bluetooth.children()
+
+      assert children ==
+               Vagus.Bluetooth.daemon_children() ++
+                 [Vagus.Improv.supervisor_child(), Vagus.Improv.Reaper]
+
+      # Mounting contract: Improv rides LAST under :rest_for_one so a
+      # bluetoothd restart rebuilds it, never the other way around.
+      assert [{Improv.Supervisor, _opts}, Vagus.Improv.Reaper] = Enum.take(children, -2)
+    end
+
+    test "improv: false yields the bare daemon slice" do
+      assert Vagus.Bluetooth.children(improv: false) ==
+               Vagus.Bluetooth.daemon_children(improv: false)
+    end
+  end
+
   describe "start_link/1" do
     import ExUnit.CaptureLog
 
