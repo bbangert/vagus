@@ -28,6 +28,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # nerves_uevent compiles a C port that #includes <libmnl/libmnl.h>, and
+      # it's pulled into the host build too — the runner needs the netlink dev
+      # headers (build-essential is already on the image).
+      - name: Install native build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libmnl-dev
+
       - uses: erlef/setup-beam@v1
         with:
           otp-version: ${{ env.OTP_VERSION }}
