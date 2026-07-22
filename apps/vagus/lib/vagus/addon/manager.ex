@@ -655,10 +655,17 @@ defmodule Vagus.Addon.Manager do
   # only for bridged add-ons, only when the DNS server + Docker inspect are
   # available; any failure is logged and ignored (the add-on still runs).
   defp register_dns(%Config{host_network: true}, _id, _opts), do: :ok
-  # A native add-on has no container to `inspect_container` for a bridge IP; its
-  # DNS advertisement is synthesized separately (MQ-P3-T3). Skip the pointless,
-  # always-swallowed Docker call here.
-  defp register_dns(%Config{backend: :native}, _id, _opts), do: :ok
+  # A native add-on has no container/bridge IP to inspect (MQ-P3-T3). Advertise
+  # the supervisor anchor IP — the in-BEAM broker listens there and it's
+  # reachable from every bridged add-on + Core, same as the injected
+  # `supervisor`/`hassio` host entries. Best-effort, like the container path.
+  defp register_dns(%Config{backend: :native, slug: slug}, _id, _opts) do
+    if is_pid(Process.whereis(Vagus.DNS)) do
+      Vagus.DNS.register(String.replace(slug, "_", "-"), Network.supervisor_ip())
+    end
+
+    :ok
+  end
 
   defp register_dns(%Config{slug: slug}, id, opts) do
     with true <- is_pid(Process.whereis(Vagus.DNS)),

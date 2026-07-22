@@ -21,9 +21,12 @@ defmodule Vagus.Mqtt.Broker do
        dispatching to `Vagus.Mqtt.Broker.Handler`, with a coarse connection-rate
        cap (`max_connections`).
 
-  `supported_versions: [4]` restricts negotiation to MQTT 3.1.1, the v1
-  conformance target (mqttx's 5.0 codec paths stay available but v1 is not gated
-  on full 5.0 semantics). Note the mqttx API split: listener binding (`:port`,
+  `supported_versions: [3, 4, 5]` accepts MQTT 3.1 / 3.1.1 / 5.0 CONNECTs — Home
+  Assistant Core's MQTT client connects with 5.0, so a 3.1.1-only broker rejects
+  it at the version gate and HA's setup silently fails (P6 finding). mqttx runs
+  the 5.0 codec; v1 isn't gated on full 5.0 semantics (properties/shared-subs),
+  but basic connect/pub/sub/retained work across versions. Note the mqttx API
+  split: listener binding (`:port`,
   `:ip`) goes in the 3rd `start_link` arg, but protocol options like
   `supported_versions` are read from `handler_opts[:transport_opts]` (the 2nd
   arg, as a map) — the 3rd arg is only consulted by the transport adapter.
@@ -36,7 +39,7 @@ defmodule Vagus.Mqtt.Broker do
 
   use Supervisor
 
-  alias Vagus.Mqtt.Broker.{AuthCache, Handler, Subscriptions}
+  alias Vagus.Mqtt.Broker.{AuthCache, Handler, Logs, Provider, Subscriptions}
 
   @default_port 1883
 
@@ -71,6 +74,10 @@ defmodule Vagus.Mqtt.Broker do
     name = Keyword.get(opts, :name, __MODULE__)
     subs_name = Keyword.get(opts, :subscriptions_name, Module.concat(name, Subscriptions))
     authcache_name = Keyword.get(opts, :auth_cache_name, Module.concat(name, AuthCache))
+    # String segment (not the `Logs` alias) so `Vagus.Addon.Backend.Native.logs/2`
+    # re-derives the identical name — `Module.concat(name, Logs)` would append the
+    # alias's full path, `Module.concat(name, "Logs")` appends just the segment.
+    logs_name = Keyword.get(opts, :logs_name, Module.concat(name, "Logs"))
     port = Keyword.get(opts, :port, @default_port)
     ip = Keyword.get(opts, :ip, default_ip())
     max_connections = Keyword.get(opts, :max_connections, @default_max_connections)
@@ -79,46 +86,77 @@ defmodule Vagus.Mqtt.Broker do
     # broker's reconnect-storm mitigation is wired without the caller knowing.
     auth = Keyword.put(Keyword.get(opts, :auth, []), :neg_cache, authcache_name)
 
-    children = [
-      # Ordered first under :rest_for_one so the cache table always exists while
-      # the listener is up, and a Subscriptions/listener crash never drops it.
-      {AuthCache, name: authcache_name},
-      {Subscriptions, name: subs_name},
-      %{
-        id: :listener,
-        # MqttX.Server.start_link returns ThousandIsland's own supervisor pid,
-        # which holds every live connection process — mark it :supervisor with an
-        # :infinity shutdown so TI's graceful connection drain isn't brutal-killed.
-        type: :supervisor,
-        shutdown: :infinity,
-        start:
-          {MqttX.Server, :start_link,
-           [
-             Handler,
+    children =
+      [
+        # Ordered first under :rest_for_one so the cache table always exists while
+        # the listener is up, and a Subscriptions/listener crash never drops it.
+        {AuthCache, name: authcache_name},
+        {Subscriptions, name: subs_name},
+        %{
+          id: :listener,
+          # MqttX.Server.start_link returns ThousandIsland's own supervisor pid,
+          # which holds every live connection process — mark it :supervisor with an
+          # :infinity shutdown so TI's graceful connection drain isn't brutal-killed.
+          type: :supervisor,
+          shutdown: :infinity,
+          start:
+            {MqttX.Server, :start_link,
              [
-               subscriptions: subs_name,
-               auth: auth,
-               transport_opts: %{supported_versions: [4]}
-             ],
-             [
-               transport: MqttX.Transport.ThousandIsland,
-               port: port,
-               ip: ip,
-               rate_limit: [max_connections: max_connections, interval: 1000]
-             ]
-           ]}
-      }
-    ]
+               Handler,
+               [
+                 subscriptions: subs_name,
+                 auth: auth,
+                 transport_opts: %{supported_versions: [3, 4, 5]}
+               ],
+               [
+                 transport: MqttX.Transport.ThousandIsland,
+                 port: port,
+                 ip: ip,
+                 # Let MQTT keepalive (mqttx's own 1.5x keep-alive timer) govern
+                 # liveness, not ThousandIsland's 60s socket read timeout — which
+                 # otherwise closes an idle-but-healthy connection whose keep-alive
+                 # is >= ~40s (e.g. HA at 60s drops ~every 130s). Needs the mqttx
+                 # fork pin in mix.exs that threads read_timeout through.
+                 read_timeout: :infinity,
+                 rate_limit: [max_connections: max_connections, interval: 1000]
+               ]
+             ]}
+        },
+        # Last: the telemetry-fed log buffer (MQ-P3-T2). After the listener so a
+        # buffer crash restarts only itself, never drops connections.
+        {Logs, name: logs_name}
+      ] ++ provider_child(name, port, Keyword.get(opts, :provider))
 
     Supervisor.init(children, strategy: :rest_for_one, max_restarts: 5, max_seconds: 30)
   end
 
+  # The `mqtt` service/discovery provider (MQ-P4-T1) — added only when the broker
+  # is the real native add-on (`Backend.Native` passes `:provider`); bare
+  # instances (routing/auth unit tests) omit it and never touch the global
+  # service/discovery registries. Last child so it publishes with the listener up.
+  defp provider_child(_name, _port, nil), do: []
+
+  defp provider_child(name, port, provider_opts) do
+    opts =
+      [name: Module.concat(name, "Provider"), host: advertised_host(), port: port] ++
+        Keyword.take(provider_opts, [:slug, :services, :discovery, :data_dir])
+
+    [{Provider, opts}]
+  end
+
   if Mix.target() == :host do
     defp default_ip, do: {127, 0, 0, 1}
+    defp advertised_host, do: "127.0.0.1"
   else
-    defp default_ip do
-      {:ok, ip} = :inet.parse_address(String.to_charlist(Vagus.Network.supervisor_ip()))
-      ip
-    end
+    # Bind all interfaces, NOT the supervisor anchor (172.30.32.2): the broker
+    # is started early (engine-independent, `Vagus.Addon.DefaultProvider`), before
+    # the hassio bridge's `.2` anchor is bound, so binding `.2` fails with
+    # `:eaddrnotavail` on a fresh boot (P6 finding). `0.0.0.0` always succeeds and
+    # is reachable at `.2` once the bridge comes up + on host-net localhost for
+    # Core — the service still *advertises* `.2`. (HAOS's Mosquitto also exposes
+    # 1883 on the host.)
+    defp default_ip, do: {0, 0, 0, 0}
+
+    defp advertised_host, do: Vagus.Network.supervisor_ip()
   end
 end

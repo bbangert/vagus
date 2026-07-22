@@ -27,6 +27,28 @@ defmodule Vagus.Addon.StoreView do
     base_fields(store_slug, config, repo, installed?)
   end
 
+  @doc """
+  The `Repository` wire shape for `GET /store`'s `repositories` list.
+
+  Built-in "virtual" repositories (M5, e.g. `%{slug: "core", builtin: :mqtt}`)
+  carry no `:url` — mirror real Supervisor's `core`/`local` repos, whose `url`
+  is null while `source` stays a non-null string (aiohasupervisor's `Repository`
+  model requires it). Reading `repo.url` directly would `KeyError` on a built-in
+  repo → `GET /store` 500 → the hassio config entry fails setup.
+  """
+  @spec repository(map()) :: map()
+  def repository(repo) do
+    url = Map.get(repo, :url)
+
+    %{
+      slug: repo.slug,
+      name: Map.get(repo, :name, repo.slug),
+      source: url || repo.slug,
+      url: url,
+      maintainer: Map.get(repo, :maintainer, "")
+    }
+  end
+
   @doc "The `StoreAddonComplete` detail for `GET /store/addons/{slug}`."
   @spec detail(String.t(), %{config: Config.t(), repository: String.t()}, boolean()) :: map()
   def detail(store_slug, %{config: config, repository: repo}, installed?) do

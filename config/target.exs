@@ -132,10 +132,26 @@ config :vagus, :dns_upstream, "1.1.1.1"
 # Add-on store repositories (M4-P2-T3). The official "core" add-ons repo;
 # `POST /store/reload` fetches + parses these into the catalog. `core` gives
 # the store-slug prefix (core_mosquitto), matching the Supervisor.
+#
+# The `%{builtin: :mqtt}` entry (M5-P5) injects Vagus's native mqttx broker into
+# the catalog as `core_mqtt` — the default MQTT provider. `:store_fetcher`
+# selects `BuiltinFetcher`, which serves builtin repos from an embedded config
+# and delegates the git-backed ones to the HTTP fetcher. The containerized
+# Mosquitto (`core_mosquitto`, from the official repo) stays in the catalog as a
+# reference but is never auto-installed (only `core_mqtt` is — see
+# `:default_native_addon`); both can't own `:1883`/the mqtt service at once.
+config :vagus, :store_fetcher, Vagus.Addon.Store.BuiltinFetcher
+
 config :vagus, :store_repositories, [
+  %{slug: "core", builtin: :mqtt},
   %{slug: "core", url: "https://github.com/home-assistant/addons", ref: "master"},
   %{slug: "esphome", url: "https://github.com/esphome/home-assistant-addon", ref: "main"}
 ]
+
+# Make the native mqttx broker the default MQTT provider (M5-P5):
+# `Vagus.Addon.DefaultProvider` auto-installs + boots this store slug on startup,
+# independent of the container engine.
+config :vagus, :default_native_addon, "core_mqtt"
 
 # Core's Supervisor unix socket (M4 /auth). Core is run with
 # SUPERVISOR_CORE_API_SOCKET=<this path> and its dir bind-mounted to the host;

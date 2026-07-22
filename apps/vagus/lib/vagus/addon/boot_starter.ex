@@ -29,7 +29,17 @@ defmodule Vagus.Addon.BootStarter do
   (never blocking `Vagus.Application`'s boot on the engine); every
   `opts[:interval]` (default #{5_000}ms) it retries, up to
   `opts[:max_attempts]` (default 60) before giving up and logging. Once the
-  ping succeeds, it walks `Vagus.Addon.State.list/0` (server ref
+  ping succeeds it first ensures the `hassio` bridge and binds the host-served
+  `.2`/`.3` anchors (`opts[:ensure_network]`, default `Vagus.Network.ensure/0`
+  + `ensure_supervisor_ip/0`) — those anchors are ephemeral (lost on reboot)
+  and were previously only re-bound as a side effect of a **container** add-on's
+  network setup, so a native-only device (e.g. the native MQTT broker with
+  Mosquitto uninstalled) had nothing standing the bridge up and Core could not
+  reach the Supervisor at `172.30.32.2:80`. Binding here, engine-gated and
+  independent of any add-on, closes that gap. It is best-effort: a failure is
+  logged and reconciliation still proceeds.
+
+  It then walks `Vagus.Addon.State.list/0` (server ref
   `opts[:state]`, default `Vagus.Addon.State`) exactly once:
 
     * `state: :started, config.boot == "auto"` → `Vagus.Addon.Manager.start_slug/2`,
@@ -58,6 +68,7 @@ defmodule Vagus.Addon.BootStarter do
   require Logger
 
   alias Vagus.Addon.{Manager, State}
+  alias Vagus.Network
 
   @default_interval 5_000
   @default_max_attempts 60
@@ -79,6 +90,7 @@ defmodule Vagus.Addon.BootStarter do
   def init(opts) do
     state = %{
       ping: Keyword.get(opts, :ping, &default_ping/0),
+      ensure_network: Keyword.get(opts, :ensure_network, &default_ensure_network/0),
       interval: Keyword.get(opts, :interval, @default_interval),
       max_attempts: Keyword.get(opts, :max_attempts, @default_max_attempts),
       state_server: Keyword.get(opts, :state, State),
@@ -97,6 +109,7 @@ defmodule Vagus.Addon.BootStarter do
   defp poll(%{ping: ping, attempt: attempt, max_attempts: max_attempts} = state) do
     case ping.() do
       :ok ->
+        state.ensure_network.()
         reconcile(state)
         state
 
@@ -144,4 +157,23 @@ defmodule Vagus.Addon.BootStarter do
   defp reconcile_entry(%{state: :stopped}, _server), do: :ok
 
   defp default_ping, do: Vagus.Runtime.Docker.ping()
+
+  # Stand up the hassio bridge and bind the host-served .2/.3 anchors, so a
+  # native-only device (no container add-on to do it as a side effect) still
+  # lets Core reach the Supervisor at 172.30.32.2:80. Best-effort — a failure
+  # is logged and boot reconciliation continues.
+  defp default_ensure_network do
+    case Network.ensure() do
+      {:ok, _id} ->
+        Network.ensure_supervisor_ip()
+
+      {:error, reason} ->
+        Logger.warning(
+          "Vagus.Addon.BootStarter: hassio bridge ensure failed (#{inspect(reason)}); " <>
+            "supervisor/dns anchors not bound — Core/bridged add-ons may not reach the Supervisor"
+        )
+
+        :ok
+    end
+  end
 end

@@ -105,11 +105,43 @@ defmodule Vagus.Addon.BootStarterTest do
       if n < 3, do: {:error, :not_ready}, else: :ok
     end
 
-    start_supervised!({BootStarter, ping: ping, interval: 1, max_attempts: 20, name: nil})
+    start_supervised!(
+      {BootStarter,
+       ping: ping, ensure_network: fn -> :ok end, interval: 1, max_attempts: 20, name: nil}
+    )
 
     assert eventually(fn -> match?({:ok, %{state: :started}}, State.get(slug)) end)
     assert eventually(fn -> :create in Fake.calls() end)
     assert Enum.any?(Fake.calls(), &match?({:start, _id}, &1))
+  end
+
+  test "on engine-ready it ensures the bridge/anchors BEFORE reconciling add-ons" do
+    parent = self()
+    slug = "boot_ensure_net_#{System.unique_integer([:positive])}"
+    # boot: manual + :started → reconcile demotes it to :stopped (no backend
+    # call), a clean observable side effect to order against.
+    seed(slug, :started, fixture_config(slug, %{"boot" => "manual"}))
+
+    # Capture the entry's lifecycle state at the instant ensure_network runs. If
+    # it fires before reconcile, the entry is still :started (reconcile hasn't
+    # demoted it yet) — that's the ordering proof.
+    ensure_network = fn -> send(parent, {:state_at_ensure, State.get(slug)}) end
+
+    start_supervised!(
+      {BootStarter,
+       ping: fn -> :ok end,
+       ensure_network: ensure_network,
+       interval: 1,
+       max_attempts: 5,
+       name: nil}
+    )
+
+    # The anchor bind must run once the engine is ready, independent of any
+    # add-on — a native-only device has no container add-on to bind .2/.3 — and
+    # BEFORE reconcile (so Core can reach the Supervisor as add-ons come up).
+    assert_receive {:state_at_ensure, {:ok, %{state: :started}}}, 500
+    # ...and reconcile then ran (demoted the manual entry), confirming the order.
+    assert eventually(fn -> match?({:ok, %{state: :stopped}}, State.get(slug)) end)
   end
 
   # QUARANTINED (:flaky) — asserts the *global* shared `Backend.Fake` recorder
@@ -133,7 +165,10 @@ defmodule Vagus.Addon.BootStarterTest do
 
     seed(slug, :started, config)
 
-    start_supervised!({BootStarter, ping: fn -> :ok end, interval: 1, max_attempts: 5, name: nil})
+    start_supervised!(
+      {BootStarter,
+       ping: fn -> :ok end, ensure_network: fn -> :ok end, interval: 1, max_attempts: 5, name: nil}
+    )
 
     assert eventually(fn -> match?({:ok, %{state: :stopped}}, State.get(slug)) end)
     refute :create in Fake.calls()
@@ -144,7 +179,10 @@ defmodule Vagus.Addon.BootStarterTest do
     slug = "boot_manual_#{System.unique_integer([:positive])}"
     seed(slug, :started, fixture_config(slug, %{"boot" => "manual"}))
 
-    start_supervised!({BootStarter, ping: fn -> :ok end, interval: 1, max_attempts: 5, name: nil})
+    start_supervised!(
+      {BootStarter,
+       ping: fn -> :ok end, ensure_network: fn -> :ok end, interval: 1, max_attempts: 5, name: nil}
+    )
 
     assert eventually(fn -> match?({:ok, %{state: :stopped}}, State.get(slug)) end)
     assert Fake.calls() == []
@@ -157,7 +195,12 @@ defmodule Vagus.Addon.BootStarterTest do
 
     pid =
       start_supervised!(
-        {BootStarter, ping: fn -> :ok end, interval: 1, max_attempts: 5, name: nil}
+        {BootStarter,
+         ping: fn -> :ok end,
+         ensure_network: fn -> :ok end,
+         interval: 1,
+         max_attempts: 5,
+         name: nil}
       )
 
     # Give the reconcile pass a moment to (not) act, then confirm nothing

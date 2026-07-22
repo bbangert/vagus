@@ -27,6 +27,10 @@
   {"lib/vagus/core/api_socket.ex", :unused_fun},
   {"lib/vagus/core/api_socket.ex", :invalid_contract},
   {"lib/vagus/addon/boot_starter.ex", :no_return},
+  # default_ensure_network's `{:ok, _id} <- Network.ensure()` — same cascade as
+  # manager.ex:pattern_match below: the stubbed socket makes dialyzer infer the
+  # success branch dead on host. Device-proven; not a defect.
+  {"lib/vagus/addon/boot_starter.ex", :pattern_match},
   {"lib/vagus/addon/backend/container.ex", :no_return},
   {"lib/vagus/addon/backend/container.ex", :pattern_match},
   {"lib/vagus/addon/manager.ex", :pattern_match},
