@@ -55,15 +55,15 @@ defmodule Vagus.Addon.Backend.NativeTest do
     setup do
       port = free_port()
       prev_port = Application.get_env(:vagus, :mqtt_broker_port)
+      prev_root = Application.get_env(:vagus, :addon_data_root)
       Application.put_env(:vagus, :mqtt_broker_port, port)
       data_root = tmp_dir()
+      Application.put_env(:vagus, :addon_data_root, data_root)
 
       on_exit(fn ->
         Manager.uninstall(@slug, data_root: data_root)
-
-        if prev_port,
-          do: Application.put_env(:vagus, :mqtt_broker_port, prev_port),
-          else: Application.delete_env(:vagus, :mqtt_broker_port)
+        restore_env(:mqtt_broker_port, prev_port)
+        restore_env(:addon_data_root, prev_root)
       end)
 
       %{config: mqtt_config(), port: port, data_root: data_root}
@@ -123,12 +123,113 @@ defmodule Vagus.Addon.Backend.NativeTest do
     end
   end
 
+  # Forwards received MQTT messages to the owning test process.
+  defmodule Collector do
+    @moduledoc false
+    def handle_mqtt_event(:message, {topic, payload, _packet}, %{pid: pid} = state) do
+      send(pid, {:mqtt_message, topic, payload})
+      state
+    end
+
+    def handle_mqtt_event(_event, _data, state), do: state
+  end
+
+  describe "services / discovery / backup (MQ-P4)" do
+    setup do
+      port = free_port()
+      dr = tmp_dir()
+      prev_port = Application.get_env(:vagus, :mqtt_broker_port)
+      prev_root = Application.get_env(:vagus, :addon_data_root)
+      Application.put_env(:vagus, :mqtt_broker_port, port)
+      # Align the Provider's data dir (config) with the Manager's (opt) so the
+      # persisted broker_state.json rides in the backup tar.
+      Application.put_env(:vagus, :addon_data_root, dr)
+
+      backups = :"backups_#{System.unique_integer([:positive])}"
+      start_supervised!({Vagus.Backups, name: backups, dir: Path.join(dr, "backup")})
+
+      config = mqtt_config()
+      assert :ok = Manager.install(config, data_root: dr)
+      :ok = State.put(config, :stopped)
+      assert {:ok, _} = Manager.start(config, data_root: dr)
+
+      on_exit(fn ->
+        Manager.uninstall(@slug, data_root: dr)
+        Vagus.Services.delete_by_slug(@slug)
+        Vagus.Discovery.delete_by_slug(@slug)
+        restore_env(:mqtt_broker_port, prev_port)
+        restore_env(:addon_data_root, prev_root)
+      end)
+
+      %{port: port, dr: dr, backups: backups}
+    end
+
+    test "publishes the mqtt service with the add-on slug + addons credentials" do
+      assert {:ok, data} = Vagus.Services.get("mqtt")
+      assert data["addon"] == @slug
+      assert data["host"] == "127.0.0.1"
+      assert data["protocol"] == "3.1.1"
+      assert data["username"] == "addons"
+      assert is_binary(data["password"]) and data["password"] != ""
+    end
+
+    test "the published addons credentials authenticate a client", %{port: port} do
+      {:ok, %{"password" => pass}} = Vagus.Services.get("mqtt")
+      assert connected_within?(connect_auth(port, "addons", pass))
+    end
+
+    test "adds an mqtt discovery message for the add-on" do
+      assert Enum.any?(Vagus.Discovery.list(), &(&1.service == "mqtt" and &1.addon == @slug))
+    end
+
+    test "retained message + QoS1 round-trip through the broker", %{port: port} do
+      {:ok, %{"password" => pass}} = Vagus.Services.get("mqtt")
+      pub = connect_auth(port, "addons", pass)
+      assert connected_within?(pub)
+      :ok = MqttX.Client.publish(pub, "sensor/room", "21.5", qos: 1, retain: true)
+
+      # A subscriber that connects AFTER the retained publish still receives it.
+      sub = connect_collector(port, "addons", pass)
+      assert connected_within?(sub)
+      {:ok, _} = MqttX.Client.subscribe(sub, "sensor/room", qos: 1)
+      assert_receive {:mqtt_message, ["sensor", "room"], "21.5"}, 1_000
+    end
+
+    test "hot backup then restore preserves the addons password + re-publishes",
+         %{dr: dr, backups: backups} do
+      {:ok, %{"password" => pass0}} = Vagus.Services.get("mqtt")
+
+      assert {:ok, backup_slug} =
+               Vagus.Backups.create_partial(nil, [@slug], server: backups, data_root: dr)
+
+      # Drift the on-disk state so a plain restart would mint a NEW password —
+      # only a working restore brings pass0 back.
+      state_path = Path.join([dr, "addons", "data", @slug, "broker_state.json"])
+      File.write!(state_path, Jason.encode!(%{"addons_password" => "DRIFTED"}))
+
+      # Restore stops the broker, stages the backed-up data dir, and restarts it.
+      assert :ok =
+               Vagus.Backups.restore_partial(backup_slug, [@slug], server: backups, data_root: dr)
+
+      # The restarted broker re-published the service with the RESTORED password.
+      creds =
+        eventually(
+          fn -> Vagus.Services.get("mqtt") end,
+          &match?({:ok, %{"password" => ^pass0}}, &1)
+        )
+
+      assert {:ok, %{"password" => ^pass0}} = creds
+    end
+  end
+
   describe "native runtime surfaces (stats / logs / DNS / watchdog liveness, MQ-P3)" do
     setup do
       port = free_port()
       prev_port = Application.get_env(:vagus, :mqtt_broker_port)
+      prev_root = Application.get_env(:vagus, :addon_data_root)
       Application.put_env(:vagus, :mqtt_broker_port, port)
       dr = tmp_dir()
+      Application.put_env(:vagus, :addon_data_root, dr)
 
       # A DNS server under the global name so Manager.register_dns finds it
       # (the app doesn't start one in :test — dns_enabled is false).
@@ -143,10 +244,10 @@ defmodule Vagus.Addon.Backend.NativeTest do
 
       on_exit(fn ->
         Manager.uninstall(@slug, data_root: dr)
-
-        if prev_port,
-          do: Application.put_env(:vagus, :mqtt_broker_port, prev_port),
-          else: Application.delete_env(:vagus, :mqtt_broker_port)
+        Vagus.Services.delete_by_slug(@slug)
+        Vagus.Discovery.delete_by_slug(@slug)
+        restore_env(:mqtt_broker_port, prev_port)
+        restore_env(:addon_data_root, prev_root)
       end)
 
       %{port: port, dr: dr}
@@ -380,6 +481,39 @@ defmodule Vagus.Addon.Backend.NativeTest do
     :sys.get_state(sentinel)
     :ok
   end
+
+  defp connect_auth(port, user, pass), do: connect(port, user, pass, [])
+
+  defp connect_collector(port, user, pass),
+    do: connect(port, user, pass, handler: Collector, handler_state: %{pid: self()})
+
+  defp connect(port, user, pass, extra) do
+    {:ok, client} =
+      MqttX.Client.connect(
+        [
+          host: "127.0.0.1",
+          port: port,
+          client_id: "c-#{System.unique_integer([:positive])}",
+          protocol_version: 4,
+          username: user,
+          password: pass,
+          retry_interval: 300
+        ] ++ extra
+      )
+
+    client
+  end
+
+  defp connected_within?(client, tries \\ 60) do
+    cond do
+      MqttX.Client.connected?(client) -> true
+      tries == 0 -> false
+      true -> Process.sleep(25) && connected_within?(client, tries - 1)
+    end
+  end
+
+  defp restore_env(key, nil), do: Application.delete_env(:vagus, key)
+  defp restore_env(key, value), do: Application.put_env(:vagus, key, value)
 
   # Poll `fun` until `pred` holds (or the budget runs out); returns the last value.
   defp eventually(fun, pred, tries \\ 50) do

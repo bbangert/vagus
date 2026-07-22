@@ -36,7 +36,7 @@ defmodule Vagus.Mqtt.Broker do
 
   use Supervisor
 
-  alias Vagus.Mqtt.Broker.{AuthCache, Handler, Logs, Subscriptions}
+  alias Vagus.Mqtt.Broker.{AuthCache, Handler, Logs, Provider, Subscriptions}
 
   @default_port 1883
 
@@ -83,49 +83,67 @@ defmodule Vagus.Mqtt.Broker do
     # broker's reconnect-storm mitigation is wired without the caller knowing.
     auth = Keyword.put(Keyword.get(opts, :auth, []), :neg_cache, authcache_name)
 
-    children = [
-      # Ordered first under :rest_for_one so the cache table always exists while
-      # the listener is up, and a Subscriptions/listener crash never drops it.
-      {AuthCache, name: authcache_name},
-      {Subscriptions, name: subs_name},
-      %{
-        id: :listener,
-        # MqttX.Server.start_link returns ThousandIsland's own supervisor pid,
-        # which holds every live connection process — mark it :supervisor with an
-        # :infinity shutdown so TI's graceful connection drain isn't brutal-killed.
-        type: :supervisor,
-        shutdown: :infinity,
-        start:
-          {MqttX.Server, :start_link,
-           [
-             Handler,
+    children =
+      [
+        # Ordered first under :rest_for_one so the cache table always exists while
+        # the listener is up, and a Subscriptions/listener crash never drops it.
+        {AuthCache, name: authcache_name},
+        {Subscriptions, name: subs_name},
+        %{
+          id: :listener,
+          # MqttX.Server.start_link returns ThousandIsland's own supervisor pid,
+          # which holds every live connection process — mark it :supervisor with an
+          # :infinity shutdown so TI's graceful connection drain isn't brutal-killed.
+          type: :supervisor,
+          shutdown: :infinity,
+          start:
+            {MqttX.Server, :start_link,
              [
-               subscriptions: subs_name,
-               auth: auth,
-               transport_opts: %{supported_versions: [4]}
-             ],
-             [
-               transport: MqttX.Transport.ThousandIsland,
-               port: port,
-               ip: ip,
-               rate_limit: [max_connections: max_connections, interval: 1000]
-             ]
-           ]}
-      },
-      # Last: the telemetry-fed log buffer (MQ-P3-T2). After the listener so a
-      # buffer crash restarts only itself, never drops connections.
-      {Logs, name: logs_name}
-    ]
+               Handler,
+               [
+                 subscriptions: subs_name,
+                 auth: auth,
+                 transport_opts: %{supported_versions: [4]}
+               ],
+               [
+                 transport: MqttX.Transport.ThousandIsland,
+                 port: port,
+                 ip: ip,
+                 rate_limit: [max_connections: max_connections, interval: 1000]
+               ]
+             ]}
+        },
+        # Last: the telemetry-fed log buffer (MQ-P3-T2). After the listener so a
+        # buffer crash restarts only itself, never drops connections.
+        {Logs, name: logs_name}
+      ] ++ provider_child(name, port, Keyword.get(opts, :provider))
 
     Supervisor.init(children, strategy: :rest_for_one, max_restarts: 5, max_seconds: 30)
   end
 
+  # The `mqtt` service/discovery provider (MQ-P4-T1) — added only when the broker
+  # is the real native add-on (`Backend.Native` passes `:provider`); bare
+  # instances (routing/auth unit tests) omit it and never touch the global
+  # service/discovery registries. Last child so it publishes with the listener up.
+  defp provider_child(_name, _port, nil), do: []
+
+  defp provider_child(name, port, provider_opts) do
+    opts =
+      [name: Module.concat(name, "Provider"), host: advertised_host(), port: port] ++
+        Keyword.take(provider_opts, [:slug, :services, :discovery, :data_dir])
+
+    [{Provider, opts}]
+  end
+
   if Mix.target() == :host do
     defp default_ip, do: {127, 0, 0, 1}
+    defp advertised_host, do: "127.0.0.1"
   else
     defp default_ip do
       {:ok, ip} = :inet.parse_address(String.to_charlist(Vagus.Network.supervisor_ip()))
       ip
     end
+
+    defp advertised_host, do: Vagus.Network.supervisor_ip()
   end
 end

@@ -315,6 +315,13 @@ defmodule Vagus.Backups do
           {:error, reason} -> {:error, {:cold_stop_failed, config.slug, reason}}
         end
 
+      # A native add-on has no container to `docker_exec` a backup_pre in. Its
+      # snapshot-able state (the `addons` creds) is already persisted to
+      # `<data_dir>/broker_state.json` by `Vagus.Mqtt.Broker.Provider`, so it
+      # rides along in the tar with nothing to prepare (MQ-P4-T2).
+      config.backend == :native ->
+        :ok
+
       is_binary(config.backup_pre) ->
         case docker_exec(config, config.backup_pre, opts) do
           :ok -> :ok
@@ -345,6 +352,10 @@ defmodule Vagus.Backups do
 
             :ok
         end
+
+      # Native add-on: nothing to run post-tar (see begin_backup/2, MQ-P4-T2).
+      config.backend == :native ->
+        :ok
 
       is_binary(config.backup_post) ->
         case docker_exec(config, config.backup_post, opts) do

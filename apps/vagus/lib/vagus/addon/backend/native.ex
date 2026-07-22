@@ -129,7 +129,12 @@ defmodule Vagus.Addon.Backend.Native do
   # observes the permanent death and demotes `State` to `:stopped`.
   defp broker_child_spec(id, slug) do
     Supervisor.child_spec(
-      {Broker, name: broker_name(id), port: broker_port(), auth: [slug: slug]},
+      {
+        Broker,
+        # Publish the mqtt service + discovery on start (MQ-P4-T1). Bare broker
+        # instances (unit tests) omit this and stay isolated.
+        name: broker_name(id), port: broker_port(), auth: [slug: slug], provider: [slug: slug]
+      },
       id: broker_name(id),
       restart: :temporary
     )
