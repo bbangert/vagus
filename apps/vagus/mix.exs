@@ -15,6 +15,17 @@ defmodule Vagus.MixProject do
       start_permanent: Mix.env() == :prod,
       elixirc_paths: elixirc_paths(Mix.env()),
       deps: deps(),
+      # NOTE on PLT staleness: dialyxir NEVER checks/updates the PLT from an
+      # umbrella child (`no_check?/1` hard-returns true — `check_plt: true`
+      # and a custom `plt_file:` are both defeated; a missing PLT triggers a
+      # parent-context build, an existing one is used as-is). A PLT restored
+      # from CI's _build cache is therefore frozen at its build-time app set
+      # — new deps dialyze as unknown_function forever, and vendored path
+      # deps (not in mix.lock) never enter it, which is what originally
+      # spawned the since-removed mqttx ignore filters. The fix lives in
+      # .github/workflows/ci.yml: PLTs are deleted on any cache-key miss so
+      # dialyxir rebuilds them against the current deps. Locally: delete
+      # _build/*/dialyxir_* after changing deps.
       dialyzer: [ignore_warnings: ".dialyzer_ignore.exs", list_unused_filters: true]
     ]
   end
@@ -101,6 +112,20 @@ defmodule Vagus.MixProject do
       # Supervises the balena-engine daemon as an OS process (engine
       # supervision, see Vagus.Engine.Manager).
       {:muontrap, "~> 1.8"},
+
+      # BlueZ stack bring-up (dbus-daemon + bluetoothd under MuonTrap).
+      # Vagus starts only the daemon slice of its tree — HA Core is the BLE
+      # consumer via the /run/dbus bind (see Vagus.Bluetooth).
+      {:bluez, "~> 0.1.0"},
+
+      # bluez's compile-time macro dep, overridden as a git checkout pinned
+      # to its release tag: the hex package's mix.exs derives its version
+      # from `git describe --always --tags` at compile time, and a hex dep
+      # dir isn't a git repo — describe walks up into THIS repo, which has
+      # no tags, yielding a bare sha that Mix rejects as a Version. A git
+      # checkout at the tag makes describe answer "0.5.4" deterministically
+      # (locally and in CI).
+      {:typedstruct, github: "saleyn/typedstruct", tag: "0.5.4", override: true, runtime: false},
 
       # Vagus.Engine.Manager subscribes to vintage_net's aggregate
       # ["connection"] property directly (compile-time `Mix.target()`

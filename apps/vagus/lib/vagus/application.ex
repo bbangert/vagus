@@ -89,9 +89,14 @@ defmodule Vagus.Application do
           Vagus.Addon.DefaultProvider
         ] ++ target_children()
 
-    # See https://elixir.hexdocs.pm/Supervisor.html
-    # for other strategies and supported options
-    opts = [strategy: :one_for_one, name: Vagus.Supervisor]
+    # Explicit restart budget (was the OTP default 3/5s): the top level now
+    # holds several independent failure sources (DNS, engine, ingress,
+    # Vagus.Bluetooth, ...) that share this budget, and the isolated subtrees
+    # (Engine.DaemonSupervisor, Native.Supervisor, Vagus.Bluetooth) already
+    # budget their own crash-looping internally before escalating here —
+    # 3-in-5s of *escalated* exits would take the whole app down too eagerly.
+    # 5/30 mirrors the budget those isolation supervisors use themselves.
+    opts = [strategy: :one_for_one, name: Vagus.Supervisor, max_restarts: 5, max_seconds: 30]
     Supervisor.start_link(children, opts)
   end
 
@@ -166,7 +171,14 @@ defmodule Vagus.Application do
         # Waits for VintageNet internet connectivity, then writes
         # /run/resolv.conf and starts the balena-engine daemon. Only runs on
         # the target — VintageNet isn't present/meaningful on :host.
-        {Vagus.Engine.Manager, []}
+        {Vagus.Engine.Manager, []},
+
+        # Bluetooth daemons (dbus-daemon --system + bluetoothd -E), the
+        # daemons-only slice of the Bluez stack. HA Core consumes the
+        # adapter through the /run/dbus bind on its container; Vagus runs
+        # no BLE clients of its own. `:ignore` when the system was built
+        # without BlueZ. See Vagus.Bluetooth.
+        Vagus.Bluetooth
       ]
     end
   end

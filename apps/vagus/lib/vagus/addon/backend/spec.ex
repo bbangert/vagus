@@ -14,11 +14,16 @@ defmodule Vagus.Addon.Backend.Spec do
 
   @type network :: :hassio | :host
 
+  # `:system` marks a source dir owned by the host system (e.g. /run/dbus,
+  # created by Vagus.Bluetooth), not by the add-on manager: the manager must
+  # never create it, so a missing source fails the add-on start loudly
+  # instead of silently binding an empty directory.
   @type mount :: %{
           required(:source) => String.t(),
           required(:target) => String.t(),
           optional(:read_only) => boolean(),
-          optional(:propagation) => String.t() | nil
+          optional(:propagation) => String.t() | nil,
+          optional(:system) => boolean()
         }
 
   @type t :: %__MODULE__{

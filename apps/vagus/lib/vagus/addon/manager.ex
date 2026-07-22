@@ -479,8 +479,22 @@ defmodule Vagus.Addon.Manager do
     mapped =
       config.map |> Enum.map(&map_mount(&1, data_root, config.slug)) |> Enum.reject(&is_nil/1)
 
-    [data_mount | mapped]
+    [data_mount | mapped] ++ host_dbus_mount(config)
   end
+
+  # Real-Supervisor parity (MOUNT_DBUS): a `host_dbus: true` add-on gets the
+  # host system-bus socket dir bound read-only, same as HA Core's container.
+  # `system: true` keeps `ensure_mount_sources/1` from mkdir-ing it — /run/dbus
+  # is owned by Vagus.Bluetooth/Bluez.prepare_runtime/0, and on a BlueZ-less
+  # firmware (Vagus.Bluetooth `:ignore`d) creating it here would hand the
+  # add-on a valid-looking but daemon-less bus mount instead of a loud
+  # create-time failure (the engine rejects a bind whose source is missing).
+  defp host_dbus_mount(%Config{host_dbus: true}),
+    do: [
+      %{source: "/run/dbus", target: "/run/dbus", read_only: true, propagation: nil, system: true}
+    ]
+
+  defp host_dbus_mount(_config), do: []
 
   defp map_mount(%{type: "addon_config", read_only: ro}, data_root, slug) do
     %{
@@ -505,11 +519,18 @@ defmodule Vagus.Addon.Manager do
   # path is internal/config-derived, not request input
   # sobelow_skip ["Traversal.FileModule"]
   defp ensure_mount_sources(%Spec{mounts: mounts}) do
-    Enum.reduce_while(mounts, :ok, fn %{source: source}, :ok ->
-      case File.mkdir_p(source) do
-        :ok -> {:cont, :ok}
-        {:error, reason} -> {:halt, {:error, {:mkdir, source, reason}}}
-      end
+    Enum.reduce_while(mounts, :ok, fn
+      # System-owned sources (see Spec.mount/0 `:system`) are never created
+      # here — if the owner (e.g. Vagus.Bluetooth for /run/dbus) hasn't stood
+      # them up, container create fails loudly on the missing bind source.
+      %{system: true}, :ok ->
+        {:cont, :ok}
+
+      %{source: source}, :ok ->
+        case File.mkdir_p(source) do
+          :ok -> {:cont, :ok}
+          {:error, reason} -> {:halt, {:error, {:mkdir, source, reason}}}
+        end
     end)
   end
 
