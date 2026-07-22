@@ -3,8 +3,8 @@ defmodule Vagus.Addon.Backend.NativeTest do
   # real TCP port for the broker subtree.
   use ExUnit.Case, async: false
 
-  alias Vagus.Addon.{Config, Info, Manager, State}
   alias Vagus.Addon.Backend.Native
+  alias Vagus.Addon.{Config, Info, Manager, State}
   alias Vagus.Addon.Store.BuiltinFetcher
 
   @slug "core_mqtt"
