@@ -139,10 +139,14 @@ defmodule Vagus.Mqtt.Broker do
     defp default_ip, do: {127, 0, 0, 1}
     defp advertised_host, do: "127.0.0.1"
   else
-    defp default_ip do
-      {:ok, ip} = :inet.parse_address(String.to_charlist(Vagus.Network.supervisor_ip()))
-      ip
-    end
+    # Bind all interfaces, NOT the supervisor anchor (172.30.32.2): the broker
+    # is started early (engine-independent, `Vagus.Addon.DefaultProvider`), before
+    # the hassio bridge's `.2` anchor is bound, so binding `.2` fails with
+    # `:eaddrnotavail` on a fresh boot (P6 finding). `0.0.0.0` always succeeds and
+    # is reachable at `.2` once the bridge comes up + on host-net localhost for
+    # Core — the service still *advertises* `.2`. (HAOS's Mosquitto also exposes
+    # 1883 on the host.)
+    defp default_ip, do: {0, 0, 0, 0}
 
     defp advertised_host, do: Vagus.Network.supervisor_ip()
   end

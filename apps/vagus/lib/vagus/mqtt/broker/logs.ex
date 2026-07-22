@@ -20,8 +20,6 @@ defmodule Vagus.Mqtt.Broker.Logs do
 
   use GenServer
 
-  require Logger
-
   @max 200
 
   @events [
