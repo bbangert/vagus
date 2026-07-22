@@ -170,6 +170,10 @@ defmodule Vagus.Addon.Watchdog do
       running_check: Keyword.get(opts, :running_check, &default_running_check/1),
       backoff_base_ms: Keyword.get(opts, :backoff_base_ms, @default_backoff_base_ms),
       clock: Keyword.get(opts, :clock, &default_clock/0),
+      # 1-arity `(ms -> any)` that pauses between failed attempts. Default
+      # `Process.sleep/1`; tests inject a recorder so backoff *growth* is asserted
+      # against the computed schedule, not perturbable wall-clock.
+      sleep: Keyword.get(opts, :sleep, &Process.sleep/1),
       attempt_timeout_ms: Keyword.get(opts, :attempt_timeout_ms, @default_attempt_timeout_ms),
       sequence_deadline_ms:
         Keyword.get(opts, :sequence_deadline_ms, @default_sequence_deadline_ms),
@@ -320,6 +324,7 @@ defmodule Vagus.Addon.Watchdog do
       manager: state.manager,
       running_check: state.running_check,
       backoff_base_ms: state.backoff_base_ms,
+      sleep: state.sleep,
       state_server: state.state_server,
       attempt_timeout_ms: state.attempt_timeout_ms
     }
@@ -383,7 +388,7 @@ defmodule Vagus.Addon.Watchdog do
             give_up(slug, cfg)
 
           _error ->
-            Process.sleep(backoff_ms(attempt, cfg))
+            cfg.sleep.(backoff_ms(attempt, cfg))
             try_attempt(slug, action_type, attempt + 1, cfg)
         end
     end

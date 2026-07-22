@@ -346,6 +346,13 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
     end
 
     test "an empty State -> empty list" do
+      # `Vagus.Addon.State` is a global singleton other tests seed; this file is
+      # async: false, so nothing runs concurrently and we can reset it to a
+      # genuinely empty state here rather than assuming a stale entry from an
+      # earlier test isn't lingering (the source of a rare CI flake). `delete/1`
+      # is pure state removal — no backend call.
+      for %{config: %{slug: slug}} <- State.list(), do: State.delete(slug)
+
       conn = supervisor_call(:get, "/addons")
       assert conn.status == 200
       assert body(conn)["data"]["addons"] == []

@@ -220,14 +220,9 @@ defmodule Vagus.Addon.WatchdogTest do
 
   ## 4: 5 failed attempts, growing backoff, then demoted
 
-  # QUARANTINED (:flaky) — asserts real wall-clock backoff *ratios* between
-  # retry attempts (g2 >= g1 * 1.8) and a minimum elapsed sum; a slow/loaded
-  # CI runner compresses/perturbs those gaps and the ratio assertion fails.
-  # Excluded in CI until rewritten against the injected clock rather than real
-  # time. Tracked in scratchpad "test-hardening" TODO. Reliable at normal speed.
-  @tag :flaky
-  test "a manager that always fails is retried 5 times with growing gaps, then State is demoted",
+  test "a manager that always fails is retried 5 times with a doubling backoff, then State is demoted",
        %{state_pid: state_pid} do
+    parent = self()
     slug = unique_slug("wd")
     seed(state_pid, slug, :started, true)
     set_manager_result(always({:error, :boom}))
@@ -237,33 +232,26 @@ defmodule Vagus.Addon.WatchdogTest do
         state: state_pid,
         manager: FakeManager,
         running_check: fn _slug -> false end,
-        backoff_base_ms: 5
+        backoff_base_ms: 5,
+        # Record the COMPUTED backoff instead of sleeping. Formerly this test
+        # measured real elapsed gaps and asserted `g2 >= g1 * 1.8`, which a
+        # loaded CI runner perturbed (the `@tag :flaky` root cause). Injecting
+        # the sleep makes the schedule exact + instant.
+        sleep: fn ms -> send(parent, {:backoff, ms}) end
       )
 
     send(pid, die_event(slug))
 
-    # W4: per-attempt timestamps (not just a cumulative floor) — a flat,
-    # non-growing backoff would still satisfy `elapsed >= 70` alone.
-    timestamps =
-      for _ <- 1..5 do
-        assert_receive({:attempt, ts}, 1_000)
-        ts
-      end
-
-    gaps = timestamps |> Enum.chunk_every(2, 1, :discard) |> Enum.map(fn [a, b] -> b - a end)
-
-    # Backoff base 5ms doubling per attempt (5, 10, 20, 40) — each successive
-    # gap must be at least ~1.8x the previous (tolerance for scheduling
-    # jitter, short of the exact 2x) to actually pin *growth*, not just a
-    # floor.
-    gaps
-    |> Enum.chunk_every(2, 1, :discard)
-    |> Enum.each(fn [g1, g2] -> assert g2 >= g1 * 1.8 end)
-
-    # Keep the original cumulative floor too.
-    assert Enum.sum(gaps) >= 70
+    # 5 attempts (all fail) → 4 backoffs between them; base 5ms doubling each
+    # time: 5, 10, 20, 40. Exact growth, no timing measurement. The 5th attempt
+    # gives up without sleeping.
+    for expected <- [5, 10, 20, 40] do
+      assert_receive {:backoff, ^expected}, 1_000
+    end
 
     assert eventually(fn -> match?({:ok, %{state: :stopped}}, State.get(slug, state_pid)) end)
+    # Exactly four backoffs — the sequence gave up on attempt 5, not slept again.
+    refute_received {:backoff, _}
   end
 
   ## 4b (W1): a manager call that never returns is bounded, not wedged
@@ -464,10 +452,6 @@ defmodule Vagus.Addon.WatchdogTest do
       case Application.get_env(:vagus, :watchdog_test_pid) do
         pid when is_pid(pid) ->
           send(pid, {kind, slug})
-          # W4: per-attempt timestamp, for the backoff-growth test — sent
-          # unconditionally since no other test asserts on the absence of
-          # this message tag.
-          send(pid, {:attempt, System.monotonic_time(:millisecond)})
 
         _ ->
           :ok

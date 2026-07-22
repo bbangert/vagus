@@ -111,8 +111,9 @@ defmodule Vagus.Addon.BootStarterTest do
     )
 
     assert eventually(fn -> match?({:ok, %{state: :started}}, State.get(slug)) end)
-    assert eventually(fn -> :create in Fake.calls() end)
-    assert Enum.any?(Fake.calls(), &match?({:start, _id}, &1))
+    # This add-on WAS created + started (scoped to its id, so no cross-test bleed).
+    assert eventually(fn -> {:create, "addon_#{slug}"} in Fake.calls() end)
+    assert Enum.any?(Fake.calls_for("addon_#{slug}"), &match?({:start, _id}, &1))
   end
 
   test "on engine-ready it ensures the bridge/anchors BEFORE reconciling add-ons" do
@@ -144,12 +145,10 @@ defmodule Vagus.Addon.BootStarterTest do
     assert eventually(fn -> match?({:ok, %{state: :stopped}}, State.get(slug)) end)
   end
 
-  # QUARANTINED (:flaky) — asserts the *global* shared `Backend.Fake` recorder
-  # is empty, which a foreign async writer from another async:false test can
-  # pollute on a slow/loaded CI runner. Excluded in CI until the recorder is
-  # isolated per-test. Tracked in scratchpad "test-hardening" TODO. Passes
-  # reliably at normal speed.
-  @tag :flaky
+  # These assert the ABSENCE of backend calls for THIS test's add-on. They read
+  # the shared `Backend.Fake` recorder scoped to the add-on's id (`Fake.calls_for/1`),
+  # so a foreign/lingering writer for a *different* slug can't pollute them — the
+  # per-test isolation that lifted the former `@tag :flaky` quarantine.
   test "a start failure demotes the entry to :stopped" do
     slug = "boot_fail_#{System.unique_integer([:positive])}"
 
@@ -171,10 +170,10 @@ defmodule Vagus.Addon.BootStarterTest do
     )
 
     assert eventually(fn -> match?({:ok, %{state: :stopped}}, State.get(slug)) end)
-    refute :create in Fake.calls()
+    # Validation failed before create — no backend call for this add-on at all.
+    assert Fake.calls_for("addon_#{slug}") == []
   end
 
-  @tag :flaky
   test "boot: manual + :started is demoted to :stopped without any backend calls" do
     slug = "boot_manual_#{System.unique_integer([:positive])}"
     seed(slug, :started, fixture_config(slug, %{"boot" => "manual"}))
@@ -185,10 +184,9 @@ defmodule Vagus.Addon.BootStarterTest do
     )
 
     assert eventually(fn -> match?({:ok, %{state: :stopped}}, State.get(slug)) end)
-    assert Fake.calls() == []
+    assert Fake.calls_for("addon_#{slug}") == []
   end
 
-  @tag :flaky
   test "a :stopped entry is left alone" do
     slug = "boot_stopped_#{System.unique_integer([:positive])}"
     seed(slug, :stopped, fixture_config(slug, %{"boot" => "auto"}))
@@ -208,10 +206,9 @@ defmodule Vagus.Addon.BootStarterTest do
     assert eventually(fn -> Process.alive?(pid) end)
     Process.sleep(20)
     assert {:ok, %{state: :stopped}} = State.get(slug)
-    assert Fake.calls() == []
+    assert Fake.calls_for("addon_#{slug}") == []
   end
 
-  @tag :flaky
   test "engine never ready (all pings fail) -> gives up without touching State" do
     slug = "boot_never_ready_#{System.unique_integer([:positive])}"
     seed(slug, :started, fixture_config(slug, %{"boot" => "auto"}))
@@ -224,6 +221,6 @@ defmodule Vagus.Addon.BootStarterTest do
     Process.sleep(100)
 
     assert {:ok, %{state: :started}} = State.get(slug)
-    assert Fake.calls() == []
+    assert Fake.calls_for("addon_#{slug}") == []
   end
 end
