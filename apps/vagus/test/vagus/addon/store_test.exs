@@ -110,6 +110,26 @@ defmodule Vagus.Addon.StoreTest do
     refute Map.has_key?(s, "auth_api")
   end
 
+  test "StoreView.repository maps a git repo (url present) to source=url" do
+    r = StoreView.repository(%{slug: "core", url: "https://github.com/home-assistant/addons"})
+
+    assert r.slug == "core"
+    assert r.url == "https://github.com/home-assistant/addons"
+    assert r.source == "https://github.com/home-assistant/addons"
+    assert r.name == "core"
+    assert r.maintainer == ""
+  end
+
+  test "StoreView.repository tolerates a built-in repo with no :url (source=slug, url=nil)" do
+    # A url-less built-in repo (M5 %{slug: "core", builtin: :mqtt}) must not
+    # KeyError — that 500'd GET /store and failed the hassio config-entry setup.
+    r = StoreView.repository(%{slug: "core", builtin: :mqtt})
+
+    assert r.slug == "core"
+    assert r.url == nil
+    assert r.source == "core"
+  end
+
   test "StoreView.detail adds the ext fields (StoreAddonComplete)" do
     catalog = Store.build_catalog(@repos, FixtureFetcher)
     d = StoreView.detail("core_mosquitto", catalog["core_mosquitto"], true)

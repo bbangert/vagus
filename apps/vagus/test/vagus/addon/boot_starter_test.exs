@@ -105,11 +105,35 @@ defmodule Vagus.Addon.BootStarterTest do
       if n < 3, do: {:error, :not_ready}, else: :ok
     end
 
-    start_supervised!({BootStarter, ping: ping, interval: 1, max_attempts: 20, name: nil})
+    start_supervised!(
+      {BootStarter,
+       ping: ping, ensure_network: fn -> :ok end, interval: 1, max_attempts: 20, name: nil}
+    )
 
     assert eventually(fn -> match?({:ok, %{state: :started}}, State.get(slug)) end)
     assert eventually(fn -> :create in Fake.calls() end)
     assert Enum.any?(Fake.calls(), &match?({:start, _id}, &1))
+  end
+
+  test "on engine-ready it ensures the bridge/anchors before reconciling add-ons" do
+    parent = self()
+    slug = "boot_ensure_net_#{System.unique_integer([:positive])}"
+    seed(slug, :started, fixture_config(slug, %{"boot" => "auto"}))
+
+    ensure_network = fn -> send(parent, :ensure_network_called) end
+
+    start_supervised!(
+      {BootStarter,
+       ping: fn -> :ok end,
+       ensure_network: ensure_network,
+       interval: 1,
+       max_attempts: 5,
+       name: nil}
+    )
+
+    # The anchor bind must run once the engine is ready, independent of any
+    # add-on — a native-only device has no container add-on to bind .2/.3.
+    assert_receive :ensure_network_called, 500
   end
 
   # QUARANTINED (:flaky) — asserts the *global* shared `Backend.Fake` recorder
@@ -133,7 +157,10 @@ defmodule Vagus.Addon.BootStarterTest do
 
     seed(slug, :started, config)
 
-    start_supervised!({BootStarter, ping: fn -> :ok end, interval: 1, max_attempts: 5, name: nil})
+    start_supervised!(
+      {BootStarter,
+       ping: fn -> :ok end, ensure_network: fn -> :ok end, interval: 1, max_attempts: 5, name: nil}
+    )
 
     assert eventually(fn -> match?({:ok, %{state: :stopped}}, State.get(slug)) end)
     refute :create in Fake.calls()
@@ -144,7 +171,10 @@ defmodule Vagus.Addon.BootStarterTest do
     slug = "boot_manual_#{System.unique_integer([:positive])}"
     seed(slug, :started, fixture_config(slug, %{"boot" => "manual"}))
 
-    start_supervised!({BootStarter, ping: fn -> :ok end, interval: 1, max_attempts: 5, name: nil})
+    start_supervised!(
+      {BootStarter,
+       ping: fn -> :ok end, ensure_network: fn -> :ok end, interval: 1, max_attempts: 5, name: nil}
+    )
 
     assert eventually(fn -> match?({:ok, %{state: :stopped}}, State.get(slug)) end)
     assert Fake.calls() == []
@@ -157,7 +187,12 @@ defmodule Vagus.Addon.BootStarterTest do
 
     pid =
       start_supervised!(
-        {BootStarter, ping: fn -> :ok end, interval: 1, max_attempts: 5, name: nil}
+        {BootStarter,
+         ping: fn -> :ok end,
+         ensure_network: fn -> :ok end,
+         interval: 1,
+         max_attempts: 5,
+         name: nil}
       )
 
     # Give the reconcile pass a moment to (not) act, then confirm nothing

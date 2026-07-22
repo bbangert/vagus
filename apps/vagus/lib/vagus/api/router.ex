@@ -835,15 +835,7 @@ defmodule Vagus.API.Router do
 
   # The Repository wire shape (slug/name/source/url/maintainer, all strings).
   defp store_repositories do
-    Enum.map(Store.repositories(), fn repo ->
-      %{
-        slug: repo.slug,
-        name: Map.get(repo, :name, repo.slug),
-        source: repo.url,
-        url: repo.url,
-        maintainer: Map.get(repo, :maintainer, "")
-      }
-    end)
+    Enum.map(Store.repositories(), &StoreView.repository/1)
   end
 
   # -- addon lifecycle helpers ------------------------------------------------
@@ -1305,34 +1297,10 @@ defmodule Vagus.API.Router do
   defp validate_discovery(_params), do: {:error, "invalid discovery body"}
 
   # Fire-and-forget push to Core `POST|DELETE api/hassio_push/discovery/{uuid}`
-  # with the message minus `config` (`app`→`addon`), only meaningful once Core
-  # is reachable — `Vagus.Core.Client.request` returns `{:error,
-  # :no_refresh_token}` until the handshake has happened, which is exactly the
-  # `check_api_state()` gate. Decoupled via `Task.start/1` so the add-on's
-  # response never waits on a Core round-trip; failures are logged only.
-  defp push_discovery(method, %{uuid: uuid, addon: addon, service: service}) do
-    body = Jason.encode!(%{"addon" => addon, "service" => service, "uuid" => uuid})
-
-    Task.start(fn ->
-      case Vagus.Core.Client.request(method, "/api/hassio_push/discovery/#{uuid}",
-             headers: [{"content-type", "application/json"}],
-             body: body
-           ) do
-        {:ok, _response} ->
-          :ok
-
-        {:error, :no_refresh_token} ->
-          Logger.debug("Vagus.API.Router: discovery #{method} not pushed — Core not connected")
-
-        {:error, reason} ->
-          Logger.warning(
-            "Vagus.API.Router: discovery #{method} push for #{uuid} failed: #{inspect(reason)}"
-          )
-      end
-    end)
-
-    :ok
-  end
+  # with the message minus `config` (`app`→`addon`). Shared with the native
+  # broker's provider via `Vagus.Discovery.Push` — see that module for the
+  # `no_refresh_token`/best-effort semantics.
+  defp push_discovery(method, message), do: Vagus.Discovery.Push.push(method, message)
 
   # Resolve the slug an info request may read: the supervisor (Core) may read
   # any slug; an add-on may read `self` or its own slug, nothing else. The
