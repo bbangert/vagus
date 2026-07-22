@@ -109,6 +109,7 @@ defmodule Vagus.Addon.Manager do
   """
   @spec install(Config.t(), keyword()) :: :ok | {:error, term()}
   def install(%Config{} = config, opts \\ []) do
+    opts = put_backend(opts, config)
     spec = build_spec(config, ensure_token(opts))
 
     with :ok <- maybe_ensure_network(config, opts) do
@@ -132,7 +133,7 @@ defmodule Vagus.Addon.Manager do
 
   defp do_start(%Config{} = config, opts) do
     token = generate_token()
-    opts = Keyword.put(opts, :access_token, token)
+    opts = opts |> put_backend(config) |> Keyword.put(:access_token, token)
     spec = build_spec(config, opts)
     data_root = data_root(opts)
 
@@ -180,6 +181,7 @@ defmodule Vagus.Addon.Manager do
         {:error, :not_found}
 
       {:ok, %{config: config}} ->
+        opts = put_backend(opts, config)
         record_state(config, :stopped)
         stop_and_remove_container(config, opts)
         deregister_slug(config)
@@ -268,6 +270,7 @@ defmodule Vagus.Addon.Manager do
         {:error, :not_found}
 
       {:ok, %{config: config}} ->
+        opts = put_backend(opts, config)
         record_state(config, :stopped)
         stop_and_remove_container(config, opts)
         remove_image_best_effort(config, opts)
@@ -387,7 +390,21 @@ defmodule Vagus.Addon.Manager do
 
   defp default_backend, do: Application.get_env(:vagus, :addon_backend, @default_backend)
 
+  # Per-add-on backend selection (M5): a `backend: native` add-on (the mqttx
+  # virtual add-on) routes every `backend(opts)` call site through
+  # `Backend.Native` instead of the global `:addon_backend` default, while every
+  # other add-on keeps the container default. `put_new` so an explicitly-injected
+  # `:backend` (tests) still wins. Native `stop`/`remove` are idempotent no-ops
+  # on an unstarted id, so `remove_stale_container/2` needs no native special-case.
+  defp put_backend(opts, %Config{backend: :native}),
+    do: Keyword.put_new(opts, :backend, Vagus.Addon.Backend.Native)
+
+  defp put_backend(opts, %Config{}), do: opts
+
   defp maybe_ensure_network(%Config{host_network: true}, _opts), do: :ok
+  # Native "virtual add-ons" have no container on the hassio bridge — nothing to
+  # attach, so don't stand the bridge up on their account (M5).
+  defp maybe_ensure_network(%Config{backend: :native}, _opts), do: :ok
 
   defp maybe_ensure_network(_config, opts) do
     case Network.ensure(network_opts(opts)) do

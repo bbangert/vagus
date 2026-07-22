@@ -47,7 +47,6 @@
   # - ingress/ws_bridge + core/events: Mint.WebSocket / MapSet opaque-type
   #   pedantry (flush_pending IS called; the caller is only "unreachable"
   #   via the same Mint typing story). No behaviour issue.
-  {"lib/vagus/addon/backend/native.ex", :no_return},
   {"lib/vagus/addon/backend/microvm.ex", :no_return},
   {"lib/vagus/backend/host/nerves.ex", :no_return},
   {"lib/vagus/backend/host/nerves.ex", :pattern_match},

@@ -56,7 +56,13 @@ defmodule Vagus.Application do
          name: Vagus.Addon.Backend.Native.Supervisor,
          strategy: :one_for_one,
          max_restarts: 5,
-         max_seconds: 30}
+         max_seconds: 30},
+
+        # Keeps `Vagus.Addon.State` honest for native add-ons: demotes a broker
+        # subtree to `:stopped` if OTP supervision exhausts its restart budget
+        # (no Docker `die` event fires for a BEAM crash). Started after the
+        # DynamicSupervisor it watches children of, and after `Vagus.Addon.State`.
+        Vagus.Addon.Backend.Native.Sentinel
       ] ++
         dns_children() ++
         events_children() ++
