@@ -166,7 +166,14 @@ defmodule Vagus.Application do
         # Waits for VintageNet internet connectivity, then writes
         # /run/resolv.conf and starts the balena-engine daemon. Only runs on
         # the target — VintageNet isn't present/meaningful on :host.
-        {Vagus.Engine.Manager, []}
+        {Vagus.Engine.Manager, []},
+
+        # Bluetooth daemons (dbus-daemon --system + bluetoothd -E), the
+        # daemons-only slice of the Bluez stack. HA Core consumes the
+        # adapter through the /run/dbus bind on its container; Vagus runs
+        # no BLE clients of its own. `:ignore` when the system was built
+        # without BlueZ. See Vagus.Bluetooth.
+        Vagus.Bluetooth
       ]
     end
   end

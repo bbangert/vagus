@@ -76,6 +76,28 @@ defmodule Vagus.Addon.ManagerTest do
       assert share.propagation == "rslave"
     end
 
+    test "mounts: host_dbus add-on gets /run/dbus read-only; default does not", %{spec: s} do
+      # default (mosquitto fixture has no host_dbus)
+      refute Enum.any?(s.mounts, &(&1.target == "/run/dbus"))
+
+      {:ok, dbus_cfg} =
+        Config.parse(%{
+          "name" => "N",
+          "version" => "1",
+          "slug" => "dbus_addon",
+          "description" => "d",
+          "arch" => ["amd64"],
+          "image" => "x/y",
+          "host_dbus" => true
+        })
+
+      dbus_spec = Manager.build_spec(dbus_cfg, access_token: "t", arch: "amd64")
+      dbus = Enum.find(dbus_spec.mounts, &(&1.target == "/run/dbus"))
+      assert dbus.source == "/run/dbus"
+      assert dbus.read_only == true
+      assert dbus.propagation == nil
+    end
+
     test "host_network add-on: NetworkMode host, no ports/hostname", %{} do
       {:ok, hostcfg} =
         Config.parse(%{

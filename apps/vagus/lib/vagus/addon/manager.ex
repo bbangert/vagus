@@ -479,8 +479,15 @@ defmodule Vagus.Addon.Manager do
     mapped =
       config.map |> Enum.map(&map_mount(&1, data_root, config.slug)) |> Enum.reject(&is_nil/1)
 
-    [data_mount | mapped]
+    [data_mount | mapped] ++ host_dbus_mount(config)
   end
+
+  # Real-Supervisor parity (MOUNT_DBUS): a `host_dbus: true` add-on gets the
+  # host system-bus socket dir bound read-only, same as HA Core's container.
+  defp host_dbus_mount(%Config{host_dbus: true}),
+    do: [%{source: "/run/dbus", target: "/run/dbus", read_only: true, propagation: nil}]
+
+  defp host_dbus_mount(_config), do: []
 
   defp map_mount(%{type: "addon_config", read_only: ro}, data_root, slug) do
     %{

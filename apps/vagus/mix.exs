@@ -102,6 +102,20 @@ defmodule Vagus.MixProject do
       # supervision, see Vagus.Engine.Manager).
       {:muontrap, "~> 1.8"},
 
+      # BlueZ stack bring-up (dbus-daemon + bluetoothd under MuonTrap).
+      # Vagus starts only the daemon slice of its tree — HA Core is the BLE
+      # consumer via the /run/dbus bind (see Vagus.Bluetooth).
+      {:bluez, "~> 0.1.0"},
+
+      # bluez's compile-time macro dep, overridden as a git checkout pinned
+      # to its release tag: the hex package's mix.exs derives its version
+      # from `git describe --always --tags` at compile time, and a hex dep
+      # dir isn't a git repo — describe walks up into THIS repo, which has
+      # no tags, yielding a bare sha that Mix rejects as a Version. A git
+      # checkout at the tag makes describe answer "0.5.4" deterministically
+      # (locally and in CI).
+      {:typedstruct, github: "saleyn/typedstruct", tag: "0.5.4", override: true, runtime: false},
+
       # Vagus.Engine.Manager subscribes to vintage_net's aggregate
       # ["connection"] property directly (compile-time `Mix.target()`
       # branching keeps this reference out of the :host build — vintage_net
