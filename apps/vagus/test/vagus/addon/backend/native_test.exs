@@ -123,6 +123,74 @@ defmodule Vagus.Addon.Backend.NativeTest do
     end
   end
 
+  describe "native runtime surfaces (stats / logs / DNS / watchdog liveness, MQ-P3)" do
+    setup do
+      port = free_port()
+      prev_port = Application.get_env(:vagus, :mqtt_broker_port)
+      Application.put_env(:vagus, :mqtt_broker_port, port)
+      dr = tmp_dir()
+
+      # A DNS server under the global name so Manager.register_dns finds it
+      # (the app doesn't start one in :test — dns_enabled is false).
+      start_supervised!(
+        {Vagus.DNS, name: Vagus.DNS, ip: {127, 0, 0, 1}, port: free_port(), upstream: nil}
+      )
+
+      config = mqtt_config()
+      assert :ok = Manager.install(config, data_root: dr)
+      :ok = State.put(config, :stopped)
+      assert {:ok, _} = Manager.start(config, data_root: dr)
+
+      on_exit(fn ->
+        Manager.uninstall(@slug, data_root: dr)
+
+        if prev_port,
+          do: Application.put_env(:vagus, :mqtt_broker_port, prev_port),
+          else: Application.delete_env(:vagus, :mqtt_broker_port)
+      end)
+
+      %{port: port, dr: dr}
+    end
+
+    test "stats are process-derived while running and zero when stopped", %{dr: dr} do
+      stats = Native.stats(@id)
+      assert stats.memory_usage > 0
+      assert stats.cpu_percent == 0.0
+      assert stats.memory_limit == 0
+      assert Enum.sort(Map.keys(stats)) == Enum.sort(Map.keys(Vagus.Runtime.Stats.zero()))
+
+      assert :ok = Manager.stop(@slug, data_root: dr)
+      assert Native.stats(@id) == Vagus.Runtime.Stats.zero()
+    end
+
+    test "watchdog liveness follows the broker subtree", %{dr: dr} do
+      assert Native.running?(@id)
+      assert :ok = Manager.stop(@slug, data_root: dr)
+      refute Native.running?(@id)
+    end
+
+    test "DNS advertises the broker at the supervisor anchor IP" do
+      assert {:ok, {172, 30, 32, 2}} = Vagus.DNS.resolve("core-mqtt", Vagus.DNS)
+    end
+
+    test "logs capture broker activity as text/plain lines", %{port: port} do
+      # An anonymous CONNECT is rejected by auth, but mqttx emits the connect
+      # telemetry BEFORE auth runs — enough to prove the buffer is wired.
+      {:ok, _client} =
+        MqttX.Client.connect(
+          host: "127.0.0.1",
+          port: port,
+          client_id: "logs-probe",
+          protocol_version: 4,
+          retry_interval: 500
+        )
+
+      lines = eventually(fn -> Native.logs(@id) end, &(&1 != []))
+      assert is_list(lines)
+      assert Enum.any?(lines, &String.contains?(&1, "CONNECT"))
+    end
+  end
+
   describe "store catalog" do
     test "the builtin fetcher exposes the native add-on as core_mqtt" do
       catalog = Vagus.Addon.Store.build_catalog([%{slug: "core", builtin: :mqtt}], BuiltinFetcher)
@@ -311,6 +379,17 @@ defmodule Vagus.Addon.Backend.NativeTest do
     Native.Sentinel.watch(id, sentinel)
     :sys.get_state(sentinel)
     :ok
+  end
+
+  # Poll `fun` until `pred` holds (or the budget runs out); returns the last value.
+  defp eventually(fun, pred, tries \\ 50) do
+    value = fun.()
+
+    cond do
+      pred.(value) -> value
+      tries == 0 -> value
+      true -> Process.sleep(20) && eventually(fun, pred, tries - 1)
+    end
   end
 
   defp unique_id, do: "addon_sentinel_#{System.unique_integer([:positive])}"

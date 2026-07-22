@@ -28,6 +28,7 @@ defmodule Vagus.API.Router do
 
   require Logger
 
+  alias Vagus.Addon.Backend.Native
   alias Vagus.Addon.{Manager, OptionsSchema, State, Store, StoreView}
   alias Vagus.API.{Envelope, StaticData}
   alias Vagus.Backend
@@ -775,10 +776,16 @@ defmodule Vagus.API.Router do
 
   defp log_body(nil, _lines, _no_colors), do: ""
 
+  # Native "virtual add-ons" have no container — serve the broker's telemetry log
+  # buffer (already text/plain, one entry per line) instead of Docker logs.
   defp log_body(ref, lines, no_colors) do
-    case Docker.container_logs(ref, tail: lines) do
-      {:ok, raw} -> Logs.format(raw, no_colors: no_colors)
-      {:error, _reason} -> ""
+    if Native.running?(ref) do
+      ref |> Native.logs(lines: lines) |> Enum.join("\n")
+    else
+      case Docker.container_logs(ref, tail: lines) do
+        {:ok, raw} -> Logs.format(raw, no_colors: no_colors)
+        {:error, _reason} -> ""
+      end
     end
   end
 
@@ -795,10 +802,16 @@ defmodule Vagus.API.Router do
   # configured/running (honest idle) — a stats poll must never error.
   defp container_stats(nil), do: Stats.zero()
 
+  # Native add-ons have no container to poll — derive stats from the broker
+  # subtree's processes (same shape) instead of `Docker.stats`.
   defp container_stats(ref) do
-    case Docker.stats(ref) do
-      {:ok, raw} -> Stats.compute(raw)
-      {:error, _reason} -> Stats.zero()
+    if Native.running?(ref) do
+      Native.stats(ref)
+    else
+      case Docker.stats(ref) do
+        {:ok, raw} -> Stats.compute(raw)
+        {:error, _reason} -> Stats.zero()
+      end
     end
   end
 

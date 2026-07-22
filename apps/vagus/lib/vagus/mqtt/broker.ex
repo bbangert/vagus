@@ -36,7 +36,7 @@ defmodule Vagus.Mqtt.Broker do
 
   use Supervisor
 
-  alias Vagus.Mqtt.Broker.{AuthCache, Handler, Subscriptions}
+  alias Vagus.Mqtt.Broker.{AuthCache, Handler, Logs, Subscriptions}
 
   @default_port 1883
 
@@ -71,6 +71,10 @@ defmodule Vagus.Mqtt.Broker do
     name = Keyword.get(opts, :name, __MODULE__)
     subs_name = Keyword.get(opts, :subscriptions_name, Module.concat(name, Subscriptions))
     authcache_name = Keyword.get(opts, :auth_cache_name, Module.concat(name, AuthCache))
+    # String segment (not the `Logs` alias) so `Vagus.Addon.Backend.Native.logs/2`
+    # re-derives the identical name — `Module.concat(name, Logs)` would append the
+    # alias's full path, `Module.concat(name, "Logs")` appends just the segment.
+    logs_name = Keyword.get(opts, :logs_name, Module.concat(name, "Logs"))
     port = Keyword.get(opts, :port, @default_port)
     ip = Keyword.get(opts, :ip, default_ip())
     max_connections = Keyword.get(opts, :max_connections, @default_max_connections)
@@ -107,7 +111,10 @@ defmodule Vagus.Mqtt.Broker do
                rate_limit: [max_connections: max_connections, interval: 1000]
              ]
            ]}
-      }
+      },
+      # Last: the telemetry-fed log buffer (MQ-P3-T2). After the listener so a
+      # buffer crash restarts only itself, never drops connections.
+      {Logs, name: logs_name}
     ]
 
     Supervisor.init(children, strategy: :rest_for_one, max_restarts: 5, max_seconds: 30)

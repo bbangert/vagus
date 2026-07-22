@@ -80,6 +80,38 @@ defmodule Vagus.Addon.Backend.Native do
     end
   end
 
+  @doc "True if a native broker subtree is currently running for `id`."
+  @spec running?(Vagus.Addon.Backend.id()) :: boolean()
+  def running?(id), do: match?({:ok, :running}, state(id))
+
+  @doc """
+  Process-derived stats for a native add-on, in `Vagus.Runtime.Stats` shape
+  (MQ-P3-T1): `memory_usage` is the summed memory of the broker subtree's
+  processes; cpu/network/block are best-effort zero (an in-BEAM broker has no
+  cgroup accounting). All-zeros when the broker isn't running.
+  """
+  @spec stats(Vagus.Addon.Backend.id()) :: map()
+  def stats(id) do
+    case Process.whereis(broker_name(id)) do
+      pid when is_pid(pid) -> %{Vagus.Runtime.Stats.zero() | memory_usage: subtree_memory(pid)}
+      nil -> Vagus.Runtime.Stats.zero()
+    end
+  end
+
+  @doc """
+  The native broker's recent log lines (MQ-P3-T2), newest last. `opts[:lines]`
+  bounds the count (default 100). `[]` when the broker (hence its log buffer)
+  isn't running.
+  """
+  @spec logs(Vagus.Addon.Backend.id(), keyword()) :: [String.t()]
+  def logs(id, opts \\ []) do
+    # "Logs" string segment matches how `Vagus.Mqtt.Broker` names the child.
+    case Process.whereis(Module.concat(broker_name(id), "Logs")) do
+      pid when is_pid(pid) -> Broker.Logs.tail(pid, Keyword.get(opts, :lines, 100))
+      nil -> []
+    end
+  end
+
   @doc "The registered name of the broker subtree for a native add-on `id`."
   @spec broker_name(Vagus.Addon.Backend.id()) :: atom()
   def broker_name(id), do: Module.concat(Broker, id)
@@ -105,4 +137,32 @@ defmodule Vagus.Addon.Backend.Native do
 
   # Fixed 1883 in production; overridable so hermetic tests bind a free port.
   defp broker_port, do: Application.get_env(:vagus, :mqtt_broker_port, 1883)
+
+  # Sum `:memory` across the broker supervisor and every process below it
+  # (Subscriptions, AuthCache, the ThousandIsland listener tree + its live
+  # connections, the log buffer). Only recurses into children typed `:supervisor`
+  # so `which_children` is never called on a plain worker.
+  defp subtree_memory(root) do
+    [root | descendants(root)]
+    |> Enum.reduce(0, fn pid, acc ->
+      case Process.info(pid, :memory) do
+        {:memory, bytes} -> acc + bytes
+        nil -> acc
+      end
+    end)
+  end
+
+  defp descendants(supervisor) do
+    supervisor
+    |> Supervisor.which_children()
+    |> Enum.flat_map(fn
+      {_id, pid, :supervisor, _mods} when is_pid(pid) -> [pid | descendants(pid)]
+      {_id, pid, :worker, _mods} when is_pid(pid) -> [pid]
+      _ -> []
+    end)
+  rescue
+    _ -> []
+  catch
+    :exit, _ -> []
+  end
 end

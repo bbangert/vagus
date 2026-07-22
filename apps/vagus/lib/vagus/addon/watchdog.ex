@@ -460,10 +460,21 @@ defmodule Vagus.Addon.Watchdog do
   defp event_server_alive?(name) when is_atom(name), do: is_pid(Process.whereis(name))
   defp event_server_alive?(_other), do: false
 
+  # Liveness for the restart sequence. A native "virtual add-on" has no container
+  # to inspect (MQ-P3-T4) — a live broker subtree registered under `broker_name`
+  # IS the liveness signal. A running native broker short-circuits to `true`;
+  # everything else (a stopped native, or any container) falls through to the
+  # Docker inspect (a stopped native 404s → false, which is correct).
   defp default_running_check(slug) do
-    case Docker.inspect_container("addon_" <> slug) do
-      {:ok, %{"State" => %{"Running" => true}}} -> true
-      _other -> false
+    id = "addon_" <> slug
+
+    if is_pid(Process.whereis(Vagus.Addon.Backend.Native.broker_name(id))) do
+      true
+    else
+      case Docker.inspect_container(id) do
+        {:ok, %{"State" => %{"Running" => true}}} -> true
+        _other -> false
+      end
     end
   end
 
