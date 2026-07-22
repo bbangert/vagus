@@ -42,16 +42,30 @@ jobs:
           elixir-version: ${{ env.ELIXIR_VERSION }}
 
       # deps + build caches. The Dialyzer PLT lives under _build, so a warm
-      # _build cache also skips the (slow) first-run PLT build.
+      # _build cache also skips the (slow) first-run PLT build. vendor/** is
+      # in the key because vendored path deps (mqttx, fresh) aren't in
+      # mix.lock but must invalidate the PLT like any other dep change.
       - name: Cache deps and _build
+        id: mix-cache
         uses: actions/cache@v4
         with:
           path: |
             deps
             _build
-          key: mix-${{ runner.os }}-otp${{ env.OTP_VERSION }}-ex${{ env.ELIXIR_VERSION }}-${{ hashFiles('mix.lock') }}
+          key: mix-${{ runner.os }}-otp${{ env.OTP_VERSION }}-ex${{ env.ELIXIR_VERSION }}-${{ hashFiles('mix.lock', 'vendor/**') }}
           restore-keys: |
             mix-${{ runner.os }}-otp${{ env.OTP_VERSION }}-ex${{ env.ELIXIR_VERSION }}-
+
+      # PLT staleness guard: dialyxir never checks/updates a PLT from an
+      # umbrella child (apps/vagus), so a PLT restored via restore-keys
+      # prefix fallback stays frozen at its build-time app set — every dep
+      # added since then dialyzes as "unknown_function" forever (this is how
+      # CI's PLT missed mqttx from M5 until vagus-bluetooth). On an exact
+      # key miss (deps changed), drop the PLTs so the Dialyzer step rebuilds
+      # them against the CURRENT app set.
+      - name: Drop stale Dialyzer PLTs on cache-key miss
+        if: steps.mix-cache.outputs.cache-hit != 'true'
+        run: rm -f _build/*/dialyxir_*.plt _build/*/dialyxir_*.plt.hash
 
       - name: Install hex, rebar, nerves_bootstrap
         run: |
