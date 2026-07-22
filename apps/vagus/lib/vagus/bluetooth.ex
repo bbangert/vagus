@@ -30,8 +30,18 @@ defmodule Vagus.Bluetooth do
   @default_bluetoothd "/usr/libexec/bluetooth/bluetoothd"
 
   def start_link(opts \\ []) do
-    dbus_daemon = Keyword.get(opts, :dbus_daemon_path, @default_dbus_daemon)
-    bluetoothd = Keyword.get(opts, :bluetoothd_path, @default_bluetoothd)
+    # Normalize the daemon paths INTO opts before anything reads them, so the
+    # existence check here and the child specs `Bluez.children/1` builds in
+    # `init/1` can never disagree — Bluez applies its own defaults for these
+    # keys, which happen to match @default_* today but aren't contractually
+    # tied to them (Copilot review, PR #4).
+    opts =
+      opts
+      |> Keyword.put_new(:dbus_daemon_path, @default_dbus_daemon)
+      |> Keyword.put_new(:bluetoothd_path, @default_bluetoothd)
+
+    dbus_daemon = Keyword.fetch!(opts, :dbus_daemon_path)
+    bluetoothd = Keyword.fetch!(opts, :bluetoothd_path)
 
     if File.exists?(dbus_daemon) and File.exists?(bluetoothd) do
       Supervisor.start_link(__MODULE__, opts, name: __MODULE__)
