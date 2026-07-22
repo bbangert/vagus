@@ -41,21 +41,21 @@ defmodule Vagus.Addon.DefaultProviderTest do
     :sys.get_state(name)
 
     assert {:ok, %{state: :started, config: %{backend: :native}}} = State.get(@slug)
-    assert Native.running?("addon_#{@slug}")
+    assert eventually(fn -> Native.running?("addon_#{@slug}") end)
   end
 
   test "is idempotent when the provider is already installed and running" do
     name = :"dp_#{System.unique_integer([:positive])}"
     start_supervised!({DefaultProvider, name: name})
     :sys.get_state(name)
-    assert Native.running?("addon_#{@slug}")
+    assert eventually(fn -> Native.running?("addon_#{@slug}") end)
 
     # A second ensurer must not crash or double-install.
     name2 = :"dp_#{System.unique_integer([:positive])}"
     start_supervised!(Supervisor.child_spec({DefaultProvider, name: name2}, id: name2))
     :sys.get_state(name2)
     assert {:ok, %{state: :started}} = State.get(@slug)
-    assert Native.running?("addon_#{@slug}")
+    assert eventually(fn -> Native.running?("addon_#{@slug}") end)
   end
 
   test "start_link/1 is :ignore without :default_native_addon" do
@@ -66,6 +66,22 @@ defmodule Vagus.Addon.DefaultProviderTest do
   end
 
   # ---------- helpers ----------
+
+  # `Native.running?` right after the `:sys.get_state` barrier can momentarily
+  # read false: the barrier syncs the DefaultProvider's `:ensure` continue, not
+  # the broker subtree's separate (re)start / Sentinel re-arm, which under a
+  # loaded scheduler (busy CI runner) can lag that return. Poll briefly — a
+  # genuinely-down broker still fails once the window elapses.
+  defp eventually(fun, attempts \\ 200) do
+    Enum.reduce_while(1..attempts, false, fn _, _ ->
+      if fun.() do
+        {:halt, true}
+      else
+        Process.sleep(5)
+        {:cont, false}
+      end
+    end)
+  end
 
   defp restore_env(key, nil), do: Application.delete_env(:vagus, key)
   defp restore_env(key, value), do: Application.put_env(:vagus, key, value)
