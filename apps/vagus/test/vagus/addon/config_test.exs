@@ -380,5 +380,22 @@ defmodule Vagus.Addon.ConfigTest do
       assert {:ok, c} = Config.parse(Map.put(@required, "schema", false))
       assert Config.parse(Config.to_persistable(c)) == {:ok, c}
     end
+
+    test "backend defaults to :container and round-trips (M5)" do
+      assert {:ok, c} = Config.parse(@required)
+      assert c.backend == :container
+      assert Config.parse(Config.to_persistable(c)) == {:ok, c}
+    end
+
+    test "backend: native parses to :native and round-trips (M5)" do
+      assert {:ok, c} = Config.parse(Map.put(@required, "backend", "native"))
+      assert c.backend == :native
+      assert Config.parse(Config.to_persistable(c)) == {:ok, c}
+    end
+
+    test "an unknown backend value is rejected (strict, like other enum fields)" do
+      assert {:error, msg} = Config.parse(Map.put(@required, "backend", "wasm"))
+      assert msg =~ "backend"
+    end
   end
 end

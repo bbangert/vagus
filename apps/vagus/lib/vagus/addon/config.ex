@@ -30,6 +30,7 @@ defmodule Vagus.Addon.Config do
   @version_re ~r/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/
   @service_re ~r/^(?<service>mqtt|mysql):(?<rights>provide|want|need)$/
   @arch_all ~w(aarch64 amd64 armhf armv7 i386)
+  @backends ~w(container native)
   @startups ~w(initialize system services application once)
   @boots ~w(auto manual manual_only)
   @roles ~w(default homeassistant backup manager admin)
@@ -43,6 +44,7 @@ defmodule Vagus.Addon.Config do
           slug: String.t(),
           description: String.t(),
           arch: [String.t()],
+          backend: :container | :native,
           startup: String.t(),
           boot: String.t(),
           init: boolean(),
@@ -89,6 +91,7 @@ defmodule Vagus.Addon.Config do
             slug: nil,
             description: nil,
             arch: [],
+            backend: :container,
             startup: "application",
             boot: "auto",
             init: true,
@@ -188,6 +191,7 @@ defmodule Vagus.Addon.Config do
       "slug" => c.slug,
       "description" => c.description,
       "arch" => c.arch,
+      "backend" => Atom.to_string(c.backend),
       "startup" => c.startup,
       "boot" => c.boot,
       "init" => c.init,
@@ -243,6 +247,7 @@ defmodule Vagus.Addon.Config do
       description: req_str(raw, "description"),
       arch: arch(raw)
     }
+    |> put(:backend, backend(raw))
     |> put(:startup, enum(raw, "startup", @startups, "application"))
     |> put(:boot, enum(raw, "boot", @boots, "auto"))
     |> put(:init, boolean(raw, "init", true))
@@ -284,6 +289,17 @@ defmodule Vagus.Addon.Config do
   end
 
   defp put(config, key, value), do: Map.put(config, key, value)
+
+  # Which runtime backend drives this add-on (§A1.6). `native` = a supervised
+  # BEAM subtree ("virtual add-on", e.g. the mqttx broker); anything else =
+  # the default containerized backend. An explicit atom map (not
+  # `String.to_atom`) keeps untrusted config from minting arbitrary atoms.
+  defp backend(raw) do
+    case enum(raw, "backend", @backends, "container") do
+      "native" -> :native
+      _ -> :container
+    end
+  end
 
   # -- required / typed field helpers ---------------------------------------
 

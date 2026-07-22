@@ -64,6 +64,13 @@ defmodule Vagus.MixProject do
       {:fresh, path: "../../vendor/fresh"},
       {:jason, "~> 1.4"},
 
+      # Native MQTT broker (M5, vagus-mqtt): pure-Elixir MQTT 5.0
+      # client/server/codec, embedded as a BEAM-subtree "virtual add-on"
+      # behind the `Vagus.Addon.Backend.Native` seam — replaces the
+      # containerized Mosquitto add-on as the default MQTT provider.
+      # All targets (runs on-device).
+      {:mqttx, "~> 0.10"},
+
       # Parses add-on `config.yaml` in the store (P2-T3). yamerl-backed;
       # pulled into all targets since the store runs on-device.
       {:yaml_elixir, "~> 2.11"},
