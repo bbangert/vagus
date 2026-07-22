@@ -112,6 +112,12 @@ defmodule Vagus.Mqtt.Broker do
                  transport: MqttX.Transport.ThousandIsland,
                  port: port,
                  ip: ip,
+                 # Let MQTT keepalive (mqttx's own 1.5x keep-alive timer) govern
+                 # liveness, not ThousandIsland's 60s socket read timeout — which
+                 # otherwise closes an idle-but-healthy connection whose keep-alive
+                 # is >= ~40s (e.g. HA at 60s drops ~every 130s). Needs the mqttx
+                 # fork pin in mix.exs that threads read_timeout through.
+                 read_timeout: :infinity,
                  rate_limit: [max_connections: max_connections, interval: 1000]
                ]
              ]}

@@ -69,7 +69,15 @@ defmodule Vagus.MixProject do
       # behind the `Vagus.Addon.Backend.Native` seam — replaces the
       # containerized Mosquitto add-on as the default MQTT provider.
       # All targets (runs on-device).
-      {:mqttx, "~> 0.10"},
+      #
+      # Pinned to a fork carrying a one-line, backward-compatible patch that
+      # threads ThousandIsland's `read_timeout` through the transport opts
+      # (branch `read-timeout-passthrough`, off the upstream v0.10.0 tag). The
+      # broker sets `read_timeout: :infinity` so MQTT keepalive — not
+      # ThousandIsland's 60s socket idle timeout — governs liveness; otherwise a
+      # healthy but idle HA connection (keep-alive 60s) is dropped every ~130s.
+      # Upstream PR: cignosystems/mqttx. Drop this pin once merged + released.
+      {:mqttx, github: "bbangert/mqttx", ref: "15573de2583dd5dc095bf42b98d4778a52cb5dba"},
 
       # Parses add-on `config.yaml` in the store (P2-T3). yamerl-backed;
       # pulled into all targets since the store runs on-device.
