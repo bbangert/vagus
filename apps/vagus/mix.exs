@@ -93,7 +93,14 @@ defmodule Vagus.MixProject do
       # Test-only: Vagus.Backend.{Network,Host,OS} behaviours are mocked in
       # config/test.exs so handler tests can assert the router calls the
       # configured backend without exercising real hardware.
-      {:mox, "~> 1.2", only: :test, targets: :host}
+      {:mox, "~> 1.2", only: :test, targets: :host},
+
+      # Static analysis / linting tooling. dev+test only, never in a release
+      # (runtime: false). sobelow is Phoenix-oriented; kept for parity even
+      # though this app is Plug/Bandit, not Phoenix.
+      {:credo, "~> 1.7", only: [:dev, :test], runtime: false, targets: :host},
+      {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false, targets: :host},
+      {:sobelow, "~> 0.13", only: [:dev, :test], runtime: false, targets: :host}
     ]
   end
 end
