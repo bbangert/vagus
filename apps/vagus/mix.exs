@@ -15,7 +15,19 @@ defmodule Vagus.MixProject do
       start_permanent: Mix.env() == :prod,
       elixirc_paths: elixirc_paths(Mix.env()),
       deps: deps(),
-      dialyzer: [ignore_warnings: ".dialyzer_ignore.exs", list_unused_filters: true]
+      # check_plt: dialyxir skips PLT consistency checks in umbrella children
+      # by default ("In an Umbrella child, not checking PLT"), so a PLT
+      # restored from CI's _build cache via restore-keys prefix fallback
+      # (exact key misses whenever mix.lock changes) never learns about new
+      # deps — every new dep then dialyzes as unknown_function, and vendored
+      # path deps (not in mix.lock, so never a cache-key change) stay stale
+      # forever, which is what originally spawned the mqttx ignore filters.
+      # Forcing the check reconciles the PLT with the current deps each run.
+      dialyzer: [
+        ignore_warnings: ".dialyzer_ignore.exs",
+        list_unused_filters: true,
+        check_plt: true
+      ]
     ]
   end
 
