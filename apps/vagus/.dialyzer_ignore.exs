@@ -61,5 +61,16 @@
   # typed as a map). Correct, defensive, not worth churning. (The analogous
   # ingress_proxy `query_string` dead-nil check was fixed at the source rather
   # than ignored — `in [nil, ""]` → `== ""`, since Plug guarantees a binary.)
-  {"lib/vagus/addon/manager.ex", :guard_fail}
+  {"lib/vagus/addon/manager.ex", :guard_fail},
+
+  # ── Root 4: mqttx (0.10.0) ships no dialyzer-visible type/callback info ────
+  # The `:mqttx` dep exposes no typespecs the PLT can see, so Dialyzer reports
+  # its behaviour callbacks, public types, and `MqttX.Server.Router` functions as
+  # missing/unknown — even though they exist and are exercised by the M5 broker's
+  # own test suite (`test/vagus/mqtt/`). All runtime-proven; not defects in our
+  # code. Matches the repo convention of baselining spec-light dep gaps here
+  # rather than polluting the PLT. Revisit if mqttx ships specs.
+  {"lib/vagus/mqtt/broker/handler.ex", :callback_info_missing},
+  {"lib/vagus/mqtt/broker/subscriptions.ex", :unknown_type},
+  {"lib/vagus/mqtt/broker/subscriptions.ex", :unknown_function}
 ]

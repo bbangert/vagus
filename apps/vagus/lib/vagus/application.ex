@@ -43,7 +43,20 @@ defmodule Vagus.Application do
         Vagus.Backups,
         Vagus.Services,
         Vagus.Discovery,
-        Vagus.Auth
+        Vagus.Auth,
+
+        # Holds the native "virtual add-on" BEAM subtrees (M5, the mqttx
+        # broker) once `Vagus.Addon.Backend.Native.start/1` starts them —
+        # mirrors `Vagus.Engine.DaemonSupervisor`. Started unconditionally on
+        # both :host and target (unlike the Docker engine, native add-ons run
+        # in dev/host too), empty until an add-on is started. A dedicated
+        # DynamicSupervisor keeps a broker crash-loop's restart intensity
+        # isolated from the rest of the app's tree.
+        {DynamicSupervisor,
+         name: Vagus.Addon.Backend.Native.Supervisor,
+         strategy: :one_for_one,
+         max_restarts: 5,
+         max_seconds: 30}
       ] ++
         dns_children() ++
         events_children() ++
