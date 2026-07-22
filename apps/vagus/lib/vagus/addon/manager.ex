@@ -396,10 +396,24 @@ defmodule Vagus.Addon.Manager do
   # other add-on keeps the container default. `put_new` so an explicitly-injected
   # `:backend` (tests) still wins. Native `stop`/`remove` are idempotent no-ops
   # on an unstarted id, so `remove_stale_container/2` needs no native special-case.
-  defp put_backend(opts, %Config{backend: :native}),
-    do: Keyword.put_new(opts, :backend, Vagus.Addon.Backend.Native)
+  #
+  # SECURITY: `backend:` comes from UNTRUSTED store `config.yaml`. Native add-ons
+  # run un-sandboxed (no container/apparmor/caps), so `:native` is honoured ONLY
+  # for a first-party allowlist (`:native_addon_slugs`, default `["core_mqtt"]`).
+  # A store add-on that declares `backend: native` on any other slug silently
+  # falls back to the container backend — it can't escape the sandbox or
+  # impersonate the built-in broker.
+  defp put_backend(opts, %Config{backend: :native, slug: slug} = config) do
+    if native_allowed?(slug),
+      do: Keyword.put_new(opts, :backend, Vagus.Addon.Backend.Native),
+      else: put_backend(opts, %{config | backend: :container})
+  end
 
   defp put_backend(opts, %Config{}), do: opts
+
+  defp native_allowed?(slug) do
+    slug in Application.get_env(:vagus, :native_addon_slugs, ["core_mqtt"])
+  end
 
   defp maybe_ensure_network(%Config{host_network: true}, _opts), do: :ok
   # Native "virtual add-ons" have no container on the hassio bridge — nothing to
@@ -423,6 +437,11 @@ defmodule Vagus.Addon.Manager do
   defp network_opts(opts), do: Keyword.take(opts, [:socket])
 
   defp hostname(slug), do: String.replace(slug, "_", "-")
+
+  # A native add-on has no image — `nil` is honest (the container-only fields of
+  # the Spec are ignored by `Backend.Native`), and it means native survival no
+  # longer depends on a placeholder `image:` in the config.
+  defp image_ref(%Config{backend: :native}, _arch), do: nil
 
   defp image_ref(%Config{image: nil, slug: slug}, _arch),
     do: raise(ArgumentError, "add-on #{slug} has no image: (local build not supported yet)")
@@ -576,6 +595,9 @@ defmodule Vagus.Addon.Manager do
   # only, and image removal isn't part of it) and is best-effort: a config
   # with no `image:` (raises building the spec) or a daemon that's already
   # forgotten the image both just log and move on.
+  # Native add-ons have no image to remove (and `image_ref/2` is nil for them).
+  defp remove_image_best_effort(%Config{backend: :native}, _opts), do: :ok
+
   defp remove_image_best_effort(config, opts) do
     case safe_image_ref(config, opts) do
       {:ok, image} ->
@@ -633,6 +655,10 @@ defmodule Vagus.Addon.Manager do
   # only for bridged add-ons, only when the DNS server + Docker inspect are
   # available; any failure is logged and ignored (the add-on still runs).
   defp register_dns(%Config{host_network: true}, _id, _opts), do: :ok
+  # A native add-on has no container to `inspect_container` for a bridge IP; its
+  # DNS advertisement is synthesized separately (MQ-P3-T3). Skip the pointless,
+  # always-swallowed Docker call here.
+  defp register_dns(%Config{backend: :native}, _id, _opts), do: :ok
 
   defp register_dns(%Config{slug: slug}, id, opts) do
     with true <- is_pid(Process.whereis(Vagus.DNS)),

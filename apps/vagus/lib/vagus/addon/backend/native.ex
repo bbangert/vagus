@@ -42,6 +42,9 @@ defmodule Vagus.Addon.Backend.Native do
         :ok
 
       {:error, {:already_started, _pid}} ->
+        # Re-arm the Sentinel too — a redundant start must not leave a running
+        # broker unwatched (e.g. after a Sentinel restart re-monitored nothing).
+        Native.Sentinel.watch(id)
         :ok
 
       {:error, reason} ->
@@ -86,10 +89,17 @@ defmodule Vagus.Addon.Backend.Native do
   def slug_from_id("addon_" <> slug), do: slug
   def slug_from_id(id), do: id
 
+  # `restart: :temporary` bounds the blast radius: the broker's OWN supervisor
+  # (`Vagus.Mqtt.Broker`, 5/30) absorbs transient child crashes, and if IT
+  # exhausts its budget and terminates, the shared `Native.Supervisor` neither
+  # restarts it nor counts it against its own budget — so one crash-looping
+  # native add-on can't take its siblings down with it. `Native.Sentinel` then
+  # observes the permanent death and demotes `State` to `:stopped`.
   defp broker_child_spec(id, slug) do
     Supervisor.child_spec(
       {Broker, name: broker_name(id), port: broker_port(), auth: [slug: slug]},
-      id: broker_name(id)
+      id: broker_name(id),
+      restart: :temporary
     )
   end
 

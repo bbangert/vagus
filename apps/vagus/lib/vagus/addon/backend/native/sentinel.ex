@@ -53,13 +53,28 @@ defmodule Vagus.Addon.Backend.Native.Sentinel do
   def init(opts) do
     # Testability: override the demotion sink (default Vagus.Addon.State) and the
     # recheck delay so a hermetic test doesn't wait a real second.
-    {:ok,
-     %{
-       by_ref: %{},
-       by_id: %{},
-       state_mod: Keyword.get(opts, :state_mod, State),
-       recheck_ms: Keyword.get(opts, :recheck_ms, @recheck_ms)
-     }}
+    state = %{
+      by_ref: %{},
+      by_id: %{},
+      state_mod: Keyword.get(opts, :state_mod, State),
+      recheck_ms: Keyword.get(opts, :recheck_ms, @recheck_ms)
+    }
+
+    {:ok, state, {:continue, :reconcile}}
+  end
+
+  @impl GenServer
+  def handle_continue(:reconcile, state) do
+    # A Sentinel restart (crash, or app-level cascade) would otherwise start with
+    # an empty watch set and silently un-monitor every already-running native
+    # broker — disabling demote-on-give-up until the next fresh start/1. Rebuild
+    # the watch set from State's source of truth: every `:started` native add-on.
+    reconciled =
+      state.state_mod.list()
+      |> Enum.filter(fn e -> e.state == :started and e.config.backend == :native end)
+      |> Enum.reduce(state, fn e, acc -> monitor("addon_" <> e.config.slug, acc) end)
+
+    {:noreply, reconciled}
   end
 
   @impl GenServer
