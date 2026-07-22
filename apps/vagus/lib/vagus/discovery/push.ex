@@ -28,32 +28,66 @@ defmodule Vagus.Discovery.Push do
 
   @doc """
   Pushes `message` (add via `:post`, remove via `:delete`) to Core. Always
-  returns `:ok` — the actual request runs in a detached task.
+  returns `:ok` — the actual request runs in a detached task (`deliver/3`).
+
+  `opts[:request_fun]` overrides the Core request function (arity 3, matching
+  `Vagus.Core.Client.request/3`); used by tests to drive `deliver/3`'s branches
+  synchronously without a live Core.
   """
-  @spec push(:post | :delete, message()) :: :ok
-  def push(method, %{uuid: uuid, addon: addon, service: service}) do
+  @spec push(:post | :delete, message(), keyword()) :: :ok
+  def push(method, message, opts \\ []) do
+    request_fun = Keyword.get(opts, :request_fun, &Vagus.Core.Client.request/3)
+    Task.start(fn -> deliver(method, message, request_fun) end)
+    :ok
+  end
+
+  @doc """
+  The synchronous body of one push — issues the Core request via `request_fun`
+  and logs per outcome. Exposed (not private) only so tests can exercise every
+  branch deterministically; production always reaches it through `push/3`'s
+  detached task.
+
+  `request_fun` is expected to return a tagged tuple, but a misbehaving call must
+  not kill the detached task with only a default crash report: an exception is
+  `rescue`d and an exit (e.g. a `GenServer.call` to an unstarted
+  `Vagus.Core.Client`, which exits `:noproc`) is `catch`ed — both logged and
+  swallowed like any other push failure.
+  """
+  @spec deliver(:post | :delete, message(), (atom(), String.t(), keyword() -> term())) :: :ok
+  def deliver(method, %{uuid: uuid, addon: addon, service: service}, request_fun) do
     body = Jason.encode!(%{"addon" => addon, "service" => service, "uuid" => uuid})
 
-    Task.start(fn ->
-      case Vagus.Core.Client.request(method, "/api/hassio_push/discovery/#{uuid}",
-             headers: [{"content-type", "application/json"}],
-             body: body
-           ) do
-        {:ok, _response} ->
-          :ok
+    case request_fun.(method, "/api/hassio_push/discovery/#{uuid}",
+           headers: [{"content-type", "application/json"}],
+           body: body
+         ) do
+      {:ok, _response} ->
+        :ok
 
-        {:error, :no_refresh_token} ->
-          Logger.debug(
-            "Vagus.Discovery.Push: discovery #{method} not pushed — Core not connected"
-          )
+      {:error, :no_refresh_token} ->
+        Logger.debug("Vagus.Discovery.Push: discovery #{method} not pushed — Core not connected")
 
-        {:error, reason} ->
-          Logger.warning(
-            "Vagus.Discovery.Push: discovery #{method} push for #{uuid} failed: #{inspect(reason)}"
-          )
-      end
-    end)
+      {:error, reason} ->
+        Logger.warning(
+          "Vagus.Discovery.Push: discovery #{method} push for #{uuid} failed: #{inspect(reason)}"
+        )
+    end
 
     :ok
+  rescue
+    e ->
+      Logger.warning(
+        "Vagus.Discovery.Push: discovery #{method} push for #{uuid} crashed: " <>
+          Exception.message(e)
+      )
+
+      :ok
+  catch
+    :exit, reason ->
+      Logger.warning(
+        "Vagus.Discovery.Push: discovery #{method} push for #{uuid} exited: #{inspect(reason)}"
+      )
+
+      :ok
   end
 end

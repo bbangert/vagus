@@ -83,10 +83,11 @@ defmodule Vagus.Mqtt.Broker.Provider do
 
   @impl GenServer
   def terminate(_reason, state) do
-    if alive?(state.services), do: Vagus.Services.delete(@service, state.slug, state.services)
+    if alive?(state.services),
+      do: best_effort(fn -> Vagus.Services.delete(@service, state.slug, state.services) end)
 
     if state.uuid && alive?(state.discovery) do
-      case Vagus.Discovery.delete(state.uuid, state.slug, state.discovery) do
+      case best_effort(fn -> Vagus.Discovery.delete(state.uuid, state.slug, state.discovery) end) do
         {:ok, message} -> state.push.(:delete, message)
         _ -> :ok
       end
@@ -109,15 +110,22 @@ defmodule Vagus.Mqtt.Broker.Provider do
   end
 
   defp publish_service(services, slug, payload) do
-    if alive?(services), do: Vagus.Services.set(@service, payload, slug, services)
+    if alive?(services),
+      do: best_effort(fn -> Vagus.Services.set(@service, payload, slug, services) end)
   end
 
   defp publish_discovery(discovery, slug, payload, push) do
     if alive?(discovery) do
-      # Discovery.add/4 is speced `{:ok, message()}` — match it directly.
-      {:ok, %{uuid: uuid} = message} = Vagus.Discovery.add(slug, @service, payload, discovery)
-      push.(:post, message)
-      uuid
+      # Discovery.add/4 is speced `{:ok, message()}`; `best_effort` adds `:error`
+      # if the registry died mid-call, so match both.
+      case best_effort(fn -> Vagus.Discovery.add(slug, @service, payload, discovery) end) do
+        {:ok, %{uuid: uuid} = message} ->
+          push.(:post, message)
+          uuid
+
+        _ ->
+          nil
+      end
     end
   end
 
@@ -125,8 +133,10 @@ defmodule Vagus.Mqtt.Broker.Provider do
   # (crashed) broker instance, so a fresh publish never duplicates it in Core.
   defp clear_stale_discovery(discovery, slug, push) do
     if alive?(discovery) do
-      {:ok, removed} = Vagus.Discovery.delete_by_slug(slug, discovery)
-      Enum.each(removed, &push.(:delete, &1))
+      case best_effort(fn -> Vagus.Discovery.delete_by_slug(slug, discovery) end) do
+        {:ok, removed} -> Enum.each(removed, &push.(:delete, &1))
+        _ -> :ok
+      end
     end
   end
 
@@ -173,4 +183,17 @@ defmodule Vagus.Mqtt.Broker.Provider do
 
   defp alive?(server) when is_atom(server), do: is_pid(Process.whereis(server))
   defp alive?(server) when is_pid(server), do: Process.alive?(server)
+
+  # Registry calls are best-effort in two layers: `alive?/1` skips a registry
+  # that was never started (isolated tests), and this swallows an `:exit` should
+  # the registry crash *between* that check and the call (the TOCTOU) — so a
+  # registry blip never propagates out of the Provider and restarts the whole
+  # broker subtree. Returns the fun's value, or `:error` on exit.
+  defp best_effort(fun) do
+    fun.()
+  catch
+    :exit, reason ->
+      Logger.debug("Vagus.Mqtt.Broker.Provider: registry call skipped (exit #{inspect(reason)})")
+      :error
+  end
 end

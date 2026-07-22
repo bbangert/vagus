@@ -115,12 +115,17 @@ defmodule Vagus.Addon.BootStarterTest do
     assert Enum.any?(Fake.calls(), &match?({:start, _id}, &1))
   end
 
-  test "on engine-ready it ensures the bridge/anchors before reconciling add-ons" do
+  test "on engine-ready it ensures the bridge/anchors BEFORE reconciling add-ons" do
     parent = self()
     slug = "boot_ensure_net_#{System.unique_integer([:positive])}"
-    seed(slug, :started, fixture_config(slug, %{"boot" => "auto"}))
+    # boot: manual + :started → reconcile demotes it to :stopped (no backend
+    # call), a clean observable side effect to order against.
+    seed(slug, :started, fixture_config(slug, %{"boot" => "manual"}))
 
-    ensure_network = fn -> send(parent, :ensure_network_called) end
+    # Capture the entry's lifecycle state at the instant ensure_network runs. If
+    # it fires before reconcile, the entry is still :started (reconcile hasn't
+    # demoted it yet) — that's the ordering proof.
+    ensure_network = fn -> send(parent, {:state_at_ensure, State.get(slug)}) end
 
     start_supervised!(
       {BootStarter,
@@ -132,8 +137,11 @@ defmodule Vagus.Addon.BootStarterTest do
     )
 
     # The anchor bind must run once the engine is ready, independent of any
-    # add-on — a native-only device has no container add-on to bind .2/.3.
-    assert_receive :ensure_network_called, 500
+    # add-on — a native-only device has no container add-on to bind .2/.3 — and
+    # BEFORE reconcile (so Core can reach the Supervisor as add-ons come up).
+    assert_receive {:state_at_ensure, {:ok, %{state: :started}}}, 500
+    # ...and reconcile then ran (demoted the manual entry), confirming the order.
+    assert eventually(fn -> match?({:ok, %{state: :stopped}}, State.get(slug)) end)
   end
 
   # QUARANTINED (:flaky) — asserts the *global* shared `Backend.Fake` recorder
