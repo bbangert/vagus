@@ -1,0 +1,22 @@
+# Sobelow configuration (read automatically by `mix sobelow`).
+#
+# skip: true   — honor inline `# sobelow_skip [...]` annotations. This app is
+#                Plug/Bandit, not Phoenix, so Sobelow's Traversal.FileModule
+#                check (built for web-param-derived paths) only ever fires on
+#                internal, config/slug-derived filesystem paths — each such
+#                site is waived at the source with a justification comment.
+# exit: "low"  — fail (non-zero) on any unskipped finding at low severity or
+#                above, so CI genuinely gates on it.
+[
+  exit: "low",
+  format: "txt",
+  ignore_files: [],
+  ignore: [],
+  out: nil,
+  private: false,
+  router: nil,
+  skip: true,
+  threshold: :low,
+  verbose: false,
+  version: false
+]

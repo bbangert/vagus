@@ -1,0 +1,82 @@
+name: ci
+
+# Host-side gate for the emulator (apps/vagus): compile, format, tests, and
+# the three static analyzers (Credo, Dialyzer, Sobelow). Everything runs at
+# MIX_TARGET=host — the Nerves system / firmware build is target-only
+# (targets:-gated deps) and lives in the nerves_system_vagus repo's own CI,
+# so nothing here pulls Buildroot.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # Must track .mise.toml. erlef/setup-beam needs the bare OTP version and an
+  # Elixir version tagged with the OTP major.
+  OTP_VERSION: "29.0.3"
+  ELIXIR_VERSION: "1.20.2-otp-29"
+  MIX_TARGET: host
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ env.OTP_VERSION }}
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+
+      # deps + build caches. The Dialyzer PLT lives under _build, so a warm
+      # _build cache also skips the (slow) first-run PLT build.
+      - name: Cache deps and _build
+        uses: actions/cache@v4
+        with:
+          path: |
+            deps
+            _build
+          key: mix-${{ runner.os }}-otp${{ env.OTP_VERSION }}-ex${{ env.ELIXIR_VERSION }}-${{ hashFiles('mix.lock') }}
+          restore-keys: |
+            mix-${{ runner.os }}-otp${{ env.OTP_VERSION }}-ex${{ env.ELIXIR_VERSION }}-
+
+      - name: Install hex, rebar, nerves_bootstrap
+        run: |
+          mix local.hex --force
+          mix local.rebar --force
+          # nerves_bootstrap injects a nerves.bootstrap step into deps.* for
+          # every project in the umbrella; the apps declare {:nerves,
+          # runtime: false} so it's satisfied at MIX_TARGET=host. Matches the
+          # local dev/toolchain setup.
+          mix archive.install hex nerves_bootstrap --force
+
+      - name: Fetch deps
+        run: mix deps.get
+
+      - name: Compile (warnings as errors)
+        run: mix compile --warnings-as-errors
+
+      - name: Format check
+        run: mix format --check-formatted
+
+      - name: Tests
+        run: mix test
+
+      # Credo / Dialyzer / Sobelow are declared in apps/vagus (that's where
+      # the code + their configs live). Run them from there.
+      - name: Credo
+        working-directory: apps/vagus
+        run: mix credo --strict
+
+      - name: Dialyzer
+        working-directory: apps/vagus
+        run: mix dialyzer
+
+      - name: Sobelow
+        working-directory: apps/vagus
+        run: mix sobelow
