@@ -89,9 +89,14 @@ defmodule Vagus.Application do
           Vagus.Addon.DefaultProvider
         ] ++ target_children()
 
-    # See https://elixir.hexdocs.pm/Supervisor.html
-    # for other strategies and supported options
-    opts = [strategy: :one_for_one, name: Vagus.Supervisor]
+    # Explicit restart budget (was the OTP default 3/5s): the top level now
+    # holds several independent failure sources (DNS, engine, ingress,
+    # Vagus.Bluetooth, ...) that share this budget, and the isolated subtrees
+    # (Engine.DaemonSupervisor, Native.Supervisor, Vagus.Bluetooth) already
+    # budget their own crash-looping internally before escalating here —
+    # 3-in-5s of *escalated* exits would take the whole app down too eagerly.
+    # 5/30 mirrors the budget those isolation supervisors use themselves.
+    opts = [strategy: :one_for_one, name: Vagus.Supervisor, max_restarts: 5, max_seconds: 30]
     Supervisor.start_link(children, opts)
   end
 
