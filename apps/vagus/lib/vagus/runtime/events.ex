@@ -14,13 +14,17 @@ defmodule Vagus.Runtime.Events do
 
   ## Filtering — server-side + client-side
 
-  The request already asks the daemon to filter to
-  `{"label":["supervisor_managed"],"type":["container"]}`, but this is
-  belt-and-braces: some older Engine-API versions silently ignore unknown
-  filter keys (the plan's self-check #1), so every event is *also* checked
-  client-side before being forwarded — only `Type == "container"` events
-  whose Actor attributes carry the `supervisor_managed` label key, or whose
-  container name starts with `addon_`, are ever sent to a subscriber. A
+  The request asks the daemon to filter to `{"type":["container"]}` only —
+  it can't be narrower, because docker ANDs filter keys (a
+  `label=supervisor_managed` filter would also exclude the label-less
+  adopted Core container, whose events the Core watchdog needs). The
+  authoritative gate is client-side (the plan's self-check #1 — some older
+  Engine-API versions silently ignore filters anyway): only
+  `Type == "container"` events whose Actor attributes carry the
+  `supervisor_managed` label key, whose container name starts with
+  `addon_`, or whose name equals `Vagus.Core.Container.name()` (the
+  adopted Core container carries no Vagus label until its first rebuild —
+  name is its only stable identity) are ever sent to a subscriber. A
   daemon that ignores the server-side filter entirely still can't flood
   subscribers with unrelated host-container noise.
 
@@ -177,11 +181,12 @@ defmodule Vagus.Runtime.Events do
 
   ## Connect
 
+  # Type-only server filter: docker ANDs filter keys, so a label filter here
+  # would drop the (label-less) adopted Core container's events entirely —
+  # see moduledoc "Filtering". The client-side check in dispatch/2 is the
+  # authoritative gate.
   defp do_connect(state) do
-    filters =
-      URI.encode_www_form(
-        Jason.encode!(%{"label" => ["supervisor_managed"], "type" => ["container"]})
-      )
+    filters = URI.encode_www_form(Jason.encode!(%{"type" => ["container"]}))
 
     path = "/events?filters=" <> filters
 
@@ -313,9 +318,13 @@ defmodule Vagus.Runtime.Events do
     attributes = Map.get(actor, "Attributes") || %{}
     name = Map.get(attributes, "name")
 
+    # Core-name pass-through: the adopted Core container has no Vagus label
+    # (and won't until a rebuild), so its fixed name is its identity here.
+    # Container.name/0 is an Application.get_env read — cheap per event.
     managed? =
       Map.has_key?(attributes, "supervisor_managed") or
-        (is_binary(name) and String.starts_with?(name, "addon_"))
+        (is_binary(name) and
+           (String.starts_with?(name, "addon_") or name == Vagus.Core.Container.name()))
 
     if Map.get(event, "Type") == "container" and managed? do
       payload = %{

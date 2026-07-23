@@ -56,6 +56,10 @@
   {"lib/vagus/addon/manager.ex", :pattern_match},
   {"lib/vagus/addon/watchdog.ex", :pattern_match},
   {"lib/vagus/addon/watchdog/probe.ex", :pattern_match},
+  # Core.Watchdog.Probe's default_running_check inspects the Core container
+  # through the same unix-socket Docker client — its {:ok, %{"State" => ...}}
+  # branch reads as dead under the Mint story (vagus-core-watchdog CW-P3-T1).
+  {"lib/vagus/core/watchdog/probe.ex", :pattern_match},
   {"lib/vagus/api/ingress_proxy.ex", :pattern_match},
   {"lib/vagus/api/router.ex", :pattern_match},
   {"lib/vagus/api/router.ex", :pattern_match_cov},

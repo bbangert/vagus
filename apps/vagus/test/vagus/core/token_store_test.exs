@@ -125,4 +125,59 @@ defmodule Vagus.Core.TokenStoreTest do
       refute_receive {:token_store, :refresh_token_available}, 50
     end
   end
+
+  describe "get_watchdog/1" do
+    test "defaults to true when the field was never posted", %{path: path} do
+      store = start_store(path)
+      assert TokenStore.get_watchdog(store) == true
+    end
+
+    test "returns the posted boolean and persists it across restart", %{path: path} do
+      store = start_store(path, :watchdog_persistence_store)
+      :ok = TokenStore.put_options(%{"watchdog" => false}, store)
+      assert TokenStore.get_watchdog(store) == false
+
+      stop_supervised!(store)
+      start_supervised!({TokenStore, name: store, path: path})
+      assert TokenStore.get_watchdog(store) == false
+    end
+  end
+
+  describe "watchdog_changed notification" do
+    test "flipping the watchdog value notifies subscribers", %{path: path} do
+      store = start_store(path)
+      :ok = TokenStore.subscribe(store)
+
+      :ok = TokenStore.put_options(%{"watchdog" => false}, store)
+      assert_receive {:token_store, :watchdog_changed}
+
+      :ok = TokenStore.put_options(%{"watchdog" => true}, store)
+      assert_receive {:token_store, :watchdog_changed}
+    end
+
+    test "an idempotent re-put of the same value does not notify", %{path: path} do
+      store = start_store(path)
+      :ok = TokenStore.put_options(%{"watchdog" => false}, store)
+      :ok = TokenStore.subscribe(store)
+
+      :ok = TokenStore.put_options(%{"watchdog" => false}, store)
+      refute_receive {:token_store, :watchdog_changed}, 50
+    end
+
+    test "a first-ever watchdog: true put matches the default and does not notify", %{path: path} do
+      store = start_store(path)
+      :ok = TokenStore.subscribe(store)
+
+      :ok = TokenStore.put_options(%{"watchdog" => true}, store)
+      refute_receive {:token_store, :watchdog_changed}, 50
+    end
+
+    test "a watchdog flip does not also fire the refresh-token notification", %{path: path} do
+      store = start_store(path)
+      :ok = TokenStore.subscribe(store)
+
+      :ok = TokenStore.put_options(%{"watchdog" => false}, store)
+      refute_receive {:token_store, :refresh_token_available}, 50
+    end
+  end
 end

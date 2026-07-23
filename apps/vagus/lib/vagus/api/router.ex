@@ -123,8 +123,10 @@ defmodule Vagus.API.Router do
 
   # `version`/`version_latest`/`update_available` come from `Vagus.Core.Versions`
   # (CL-P3-T2) — real state seeded by boot adoption / kept current by
-  # `update/2` — every other field is still `StaticData.core_info/0`'s Phase 2
-  # static value. `HomeAssistantInfo` declares both `version` and
+  # `update/2` — and `watchdog` from the persisted `Vagus.Core.TokenStore`
+  # option (CW-P0-T3, so a `POST core/options {"watchdog": bool}` toggle
+  # round-trips honestly); every other field is still `StaticData.core_info/0`'s
+  # Phase 2 static value. `HomeAssistantInfo` declares both `version` and
   # `version_latest` nullable, so a not-yet-adopted/offline `nil` from
   # `Versions` is a valid response, not a fallback case.
   get "/core/info" do
@@ -134,7 +136,8 @@ defmodule Vagus.API.Router do
       Map.merge(StaticData.core_info(), %{
         version: Versions.installed(server),
         version_latest: Versions.latest(server),
-        update_available: Versions.update_available?(server)
+        update_available: Versions.update_available?(server),
+        watchdog: TokenStore.get_watchdog()
       })
 
     Envelope.send_ok(conn, HomeAssistantInfo.build!(attrs))

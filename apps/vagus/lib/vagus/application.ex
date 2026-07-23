@@ -89,6 +89,15 @@ defmodule Vagus.Application do
           # seed target) is already up.
           Vagus.Core.Boot,
 
+          # Core watchdog pair (CW-P2-T2): API probe + crash-loop event half,
+          # isolated under their own supervisor. Unconditional child, gated by
+          # `config :vagus, :core_watchdog` via the same `:ignore` convention
+          # as `Vagus.Core.Boot` above (only target.exs sets it — no real Core
+          # container exists on :host/test). Placed after `Vagus.Core.Supervisor`
+          # (TokenStore subscription) and `Vagus.Core.Boot` (adoption seeds
+          # Versions before the first 120s probe tick could ever act).
+          Vagus.Core.Watchdog.Supervisor,
+
           # Auto-installs + boots the default native provider (the mqttx broker,
           # M5-P5). `:ignore` unless `config :vagus, :default_native_addon` is set
           # (only target.exs sets it). Placed last so `Native.Supervisor`,
