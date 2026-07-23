@@ -104,7 +104,7 @@ defmodule Vagus.Core.WatchdogTest do
 
       crash_die(pid)
       crash_die(pid)
-      refute_receive :rebuild_called, 50
+      refute_receive :rebuild_called, 150
 
       crash_die(pid)
       assert_receive :rebuild_called
@@ -122,7 +122,7 @@ defmodule Vagus.Core.WatchdogTest do
       advance(ctx.clock, 11 * @minute)
       st = crash_die(pid)
 
-      refute_receive :rebuild_called, 50
+      refute_receive :rebuild_called, 150
       assert length(st.dies) == 1
     end
 
@@ -130,7 +130,7 @@ defmodule Vagus.Core.WatchdogTest do
       pid = start_watchdog(ctx)
 
       for _ <- 1..3, do: crash_die(pid, 0)
-      refute_receive :rebuild_called, 50
+      refute_receive :rebuild_called, 150
       assert :sys.get_state(pid).dies == []
     end
 
@@ -142,7 +142,7 @@ defmodule Vagus.Core.WatchdogTest do
         :sys.get_state(pid)
       end
 
-      refute_receive :rebuild_called, 50
+      refute_receive :rebuild_called, 150
       assert :sys.get_state(pid).dies == []
     end
 
@@ -154,7 +154,7 @@ defmodule Vagus.Core.WatchdogTest do
         :sys.get_state(pid)
       end
 
-      refute_receive :rebuild_called, 50
+      refute_receive :rebuild_called, 150
       assert :sys.get_state(pid).dies == []
     end
 
@@ -166,7 +166,7 @@ defmodule Vagus.Core.WatchdogTest do
         :sys.get_state(pid)
       end
 
-      refute_receive :rebuild_called, 50
+      refute_receive :rebuild_called, 150
       assert :sys.get_state(pid).dies == []
     end
   end
@@ -182,7 +182,7 @@ defmodule Vagus.Core.WatchdogTest do
 
       # 11th loop inside the window: detected but dropped.
       trigger_loop(pid, ctx)
-      refute_receive :rebuild_called, 50
+      refute_receive :rebuild_called, 150
       # The die window still reset — no stale strikes linger.
       assert :sys.get_state(pid).dies == []
 
@@ -221,7 +221,7 @@ defmodule Vagus.Core.WatchdogTest do
       pid = start_watchdog(ctx)
 
       for _ <- 1..3, do: crash_die(pid)
-      refute_receive :rebuild_called, 50
+      refute_receive :rebuild_called, 150
       assert :sys.get_state(pid).dies == []
     end
 
@@ -247,7 +247,7 @@ defmodule Vagus.Core.WatchdogTest do
       end
 
       trigger_loop_start.()
-      assert_receive {:rebuild_started, rebuild_pid}
+      assert_receive {:rebuild_started, rebuild_pid}, 1_000
 
       # The old container's churn during our own rebuild is expected.
       for _ <- 1..3, do: crash_die(pid)
@@ -255,6 +255,33 @@ defmodule Vagus.Core.WatchdogTest do
 
       send(rebuild_pid, :finish_rebuild)
       settle(pid)
+    end
+  end
+
+  describe "action-deadline failsafe" do
+    test "force-clears a wedged rebuild so the watchdog can never stay stuck", ctx do
+      test_pid = self()
+
+      pid =
+        start_watchdog(ctx,
+          action_deadline_ms: 50,
+          rebuild: fn ->
+            send(test_pid, :rebuild_started)
+            Process.sleep(:infinity)
+          end
+        )
+
+      for _ <- 1..3 do
+        advance(ctx.clock, 1_000)
+        crash_die(pid)
+      end
+
+      assert_receive :rebuild_started, 1_000
+
+      # The 50ms deadline fires, brutal-kills the wedged task, and clears
+      # the in-flight slot — future crash windows can act again.
+      wait_until(fn -> :sys.get_state(pid).task == nil end)
+      assert Process.alive?(pid)
     end
   end
 

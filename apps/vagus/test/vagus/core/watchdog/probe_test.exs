@@ -119,7 +119,7 @@ defmodule Vagus.Core.Watchdog.ProbeTest do
 
       script_push(ctx.script, :check, [:unhealthy])
       tick(pid)
-      refute_receive {:restart_called, _}, 50
+      refute_receive {:restart_called, _}, 150
 
       script_push(ctx.script, :check, [:unhealthy])
       tick_and_settle(pid)
@@ -135,7 +135,7 @@ defmodule Vagus.Core.Watchdog.ProbeTest do
       tick(pid)
       tick(pid)
 
-      refute_receive {:restart_called, _}, 50
+      refute_receive {:restart_called, _}, 150
       assert :sys.get_state(pid).misses == 1
     end
   end
@@ -157,7 +157,7 @@ defmodule Vagus.Core.Watchdog.ProbeTest do
       tick_and_settle(pid)
 
       assert_receive {:rebuild_called, :ok}
-      refute_receive {:restart_called, _}, 50
+      refute_receive {:restart_called, _}, 150
       assert :sys.get_state(pid).given_up == true
     end
 
@@ -196,8 +196,8 @@ defmodule Vagus.Core.Watchdog.ProbeTest do
       script_push(ctx.script, :check, [:unhealthy, :unhealthy])
       tick(pid)
       tick(pid)
-      refute_receive {:restart_called, _}, 50
-      refute_receive {:rebuild_called, _}, 50
+      refute_receive {:restart_called, _}, 150
+      refute_receive {:rebuild_called, _}, 150
 
       # Toggle off → on via the real TokenStore round-trip (the probe is
       # subscribed): the ladder resets fully.
@@ -260,7 +260,7 @@ defmodule Vagus.Core.Watchdog.ProbeTest do
       tick(pid)
       tick(pid)
 
-      refute_receive {:restart_called, _}, 50
+      refute_receive {:restart_called, _}, 150
       assert :sys.get_state(pid).misses == 0
       # The probe never even ran — both scripted results are still queued.
       assert Agent.get(ctx.script, &Map.get(&1, :check)) == [:unhealthy, :unhealthy]
@@ -273,7 +273,7 @@ defmodule Vagus.Core.Watchdog.ProbeTest do
       tick(pid)
       tick(pid)
 
-      refute_receive {:restart_called, _}, 50
+      refute_receive {:restart_called, _}, 150
       assert :sys.get_state(pid).misses == 0
     end
 
@@ -296,7 +296,7 @@ defmodule Vagus.Core.Watchdog.ProbeTest do
       script_push(ctx.script, :check, [:unhealthy, :unhealthy])
       tick(pid)
       tick(pid)
-      assert_receive {:restart_started, restart_pid}
+      assert_receive {:restart_started, restart_pid}, 1_000
 
       # In flight: another tick consults neither check nor restart.
       script_push(ctx.script, :check, [:unhealthy])
@@ -306,6 +306,31 @@ defmodule Vagus.Core.Watchdog.ProbeTest do
       send(restart_pid, :finish_restart)
       wait_until(fn -> :sys.get_state(pid).action == nil end)
       assert :sys.get_state(pid).reanimations == 1
+    end
+  end
+
+  describe "action-deadline failsafe" do
+    test "force-clears a wedged action so the probe can never stay stuck", ctx do
+      test_pid = self()
+
+      pid =
+        start_probe(ctx,
+          action_deadline_ms: 50,
+          restart: fn ->
+            send(test_pid, :restart_started)
+            Process.sleep(:infinity)
+          end
+        )
+
+      script_push(ctx.script, :check, [:unhealthy, :unhealthy])
+      tick(pid)
+      tick(pid)
+      assert_receive :restart_started, 1_000
+
+      # The 50ms deadline fires, brutal-kills the wedged task, and clears
+      # the in-flight slot — ticks can probe again.
+      wait_until(fn -> :sys.get_state(pid).action == nil end)
+      assert Process.alive?(pid)
     end
   end
 
