@@ -57,7 +57,7 @@ defmodule Vagus.Improv.Reaper do
     state = %{
       connection: Keyword.get(opts, :connection, &default_connection/0),
       improv_state: Keyword.get(opts, :improv_state, &default_improv_state/0),
-      reap: Keyword.get(opts, :reap, &default_reap/0),
+      reap: Keyword.get(opts, :reap, &__MODULE__.reap/0),
       check_delay_ms: Keyword.get(opts, :check_delay_ms, @check_delay_ms),
       recheck_ms: Keyword.get(opts, :recheck_ms, @recheck_ms),
       check_scheduled?: false
@@ -126,17 +126,39 @@ defmodule Vagus.Improv.Reaper do
     :exit, _ -> :disarmed
   end
 
+  @doc false
   # terminate_child + delete_child are two separate synchronous calls, not
   # an atomic pair: a bluetoothd crash landing exactly between them can
   # resurrect the group via the :rest_for_one cascade before the spec is
-  # deleted. That race self-heals — the same cascade also restarts THIS
-  # reaper (a :transient child's spec survives its :normal stop), and the
-  # fresh reaper re-checks and re-reaps — so it costs one extra cycle, not
-  # correctness.
-  defp default_reap do
-    case Supervisor.terminate_child(Vagus.Bluetooth, Improv.Supervisor) do
-      :ok -> :ok = Supervisor.delete_child(Vagus.Bluetooth, Improv.Supervisor)
-      {:error, :not_found} -> :ok
+  # deleted, making delete_child answer {:error, :running} — so every
+  # non-:ok return is handled (a bare `:ok =` match here would crash the
+  # reaper and spend Vagus.Bluetooth restart budget on a benign race;
+  # Copilot review, PR #5). The cascade has fully completed by the time
+  # our own call returns, so ONE retry of the pair closes the window; if
+  # something still holds the group alive after that, log and leave it —
+  # worst case is idle-Improv memory, and the next cascade restarts this
+  # reaper (a :transient child's spec survives its :normal stop) for
+  # another pass. Public with the supervisor injectable purely so the
+  # happy/idempotent paths are unit-testable against a toy supervisor.
+  @spec reap(Supervisor.supervisor(), non_neg_integer()) :: :ok
+  def reap(supervisor \\ Vagus.Bluetooth, attempts_left \\ 1) do
+    with :ok <- Supervisor.terminate_child(supervisor, Improv.Supervisor),
+         :ok <- Supervisor.delete_child(supervisor, Improv.Supervisor) do
+      :ok
+    else
+      {:error, :not_found} ->
+        :ok
+
+      {:error, _reason} when attempts_left > 0 ->
+        reap(supervisor, attempts_left - 1)
+
+      {:error, reason} ->
+        Logger.warning(
+          "Vagus.Improv.Reaper: reap incomplete (#{inspect(reason)}); " <>
+            "leaving the Improv group in place for a later pass"
+        )
+
+        :ok
     end
   end
 

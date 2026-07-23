@@ -106,4 +106,32 @@ defmodule Vagus.Improv.ReaperTest do
     refute_receive :reaped, 100
     assert Process.alive?(pid)
   end
+
+  describe "reap/2" do
+    test "terminates + deletes the Improv child; idempotent when already gone" do
+      # A toy supervisor standing in for Vagus.Bluetooth, holding a child
+      # under the Improv.Supervisor id like the real tree does.
+      sup =
+        start_supervised!(%{
+          id: :toy_bluetooth,
+          type: :supervisor,
+          start:
+            {Supervisor, :start_link,
+             [
+               [%{id: Improv.Supervisor, start: {Agent, :start_link, [fn -> :improv end]}}],
+               [strategy: :one_for_one]
+             ]}
+        })
+
+      assert [{Improv.Supervisor, child, _, _}] = Supervisor.which_children(sup)
+      assert is_pid(child) and Process.alive?(child)
+
+      assert :ok = Vagus.Improv.Reaper.reap(sup)
+      refute Process.alive?(child)
+      assert Supervisor.which_children(sup) == []
+
+      # Re-run on an already-reaped tree: {:error, :not_found} -> :ok.
+      assert :ok = Vagus.Improv.Reaper.reap(sup)
+    end
+  end
 end
