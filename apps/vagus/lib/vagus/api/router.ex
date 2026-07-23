@@ -45,7 +45,10 @@ defmodule Vagus.API.Router do
     AddonsList,
     AvailableUpdates,
     CoreStats,
+    DatadiskList,
+    HardwareInfo,
     HomeAssistantInfo,
+    HostDisksUsage,
     HostInfo,
     JobsInfo,
     MountsInfo,
@@ -147,8 +150,37 @@ defmodule Vagus.API.Router do
     Envelope.send_ok(conn, OSInfo.build!(Backend.os().info()))
   end
 
+  # Storage page's Move-data-disk dialog (CW survey P1) — honestly empty,
+  # see the model's moduledoc.
+  get "/os/datadisk/list" do
+    Envelope.send_ok(conn, DatadiskList.build!(%{devices: [], disks: []}))
+  end
+
   get "/host/info" do
     Envelope.send_ok(conn, HostInfo.build!(Backend.host().info()))
+  end
+
+  # Storage page breakdown chart + backup-settings UI (CW survey P1).
+  # `max_depth` query param defaults to 1 like upstream; a non-integer
+  # value falls back rather than erroring (upstream behavior).
+  get "/host/disks/default/usage" do
+    conn = fetch_query_params(conn)
+
+    max_depth =
+      case Integer.parse(Map.get(conn.query_params, "max_depth", "1")) do
+        {depth, _rest} when depth > 0 -> depth
+        _other -> 1
+      end
+
+    Envelope.send_ok(
+      conn,
+      HostDisksUsage.build!(Backend.Host.DiskBreakdown.usage(max_depth: max_depth))
+    )
+  end
+
+  # Settings → Hardware → "All hardware" dialog (CW survey P1).
+  get "/hardware/info" do
+    Envelope.send_ok(conn, HardwareInfo.build!(Backend.Host.Hardware.info()))
   end
 
   get "/network/info" do

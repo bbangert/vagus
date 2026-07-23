@@ -31,6 +31,36 @@ defmodule Vagus.Backend.Host.DiskUsage do
     ErlangError -> {0.0, 0.0, 0.0}
   end
 
+  @doc """
+  Runs `df -k path` and returns `{total_bytes, free_bytes}` as integers —
+  the byte-accurate variant `GET /host/disks/default/usage` needs (the
+  GB floats above stay as-is for `/host/info` continuity). `{0, 0}` on
+  any failure, same rationale as `usage_gb/1`.
+  """
+  @spec usage_bytes(String.t()) :: {non_neg_integer(), non_neg_integer()}
+  def usage_bytes(path) do
+    case System.cmd("df", ["-k", path], stderr_to_stdout: true) do
+      {output, 0} -> parse_bytes(output)
+      _error -> {0, 0}
+    end
+  rescue
+    ErlangError -> {0, 0}
+  end
+
+  @doc "Pure parser for `df -k`'s output returning `{total_bytes, free_bytes}`."
+  @spec parse_bytes(String.t()) :: {non_neg_integer(), non_neg_integer()}
+  def parse_bytes(output) do
+    with [_header, data_line | _rest] <- String.split(output, "\n", trim: true),
+         [_filesystem, total_kb, _used_kb, free_kb | _rest] <-
+           String.split(data_line, ~r/\s+/, trim: true),
+         {total, _} <- Integer.parse(total_kb),
+         {free, _} <- Integer.parse(free_kb) do
+      {total * 1024, free * 1024}
+    else
+      _other -> {0, 0}
+    end
+  end
+
   @doc "Pure parser for `df -k`'s output (the two-line, whitespace-columns form)."
   @spec parse(String.t()) :: {float(), float(), float()}
   def parse(output) do
