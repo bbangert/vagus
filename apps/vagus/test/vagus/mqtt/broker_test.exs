@@ -67,6 +67,43 @@ defmodule Vagus.Mqtt.BrokerTest do
     assert_receive {:mqtt_message, ["cross", "version"], "ok"}, 1_000
   end
 
+  # MQ-P4-T3-orig (hermetic half): retained + QoS1/2 round-trips. The
+  # backup/restore and /services halves were superseded by the revised
+  # MQ-P4-T3 (see plan); retained/QoS is what remained untested.
+  test "a retained message is delivered to a LATER subscriber", %{port: port} do
+    pub = connect_client!(port, "ret-pub")
+    :ok = MqttX.Client.publish(pub, "ret/state", "sticky", qos: 1, retain: true)
+
+    # Subscriber connects AFTER the publish — delivery can only come from
+    # the broker's retained store.
+    sub = connect_client!(port, "ret-sub")
+    {:ok, _} = MqttX.Client.subscribe(sub, "ret/state", qos: 1)
+    assert_receive {:mqtt_message, ["ret", "state"], "sticky"}, 1_000
+
+    # An empty retained publish clears the store. It's ALSO a normal
+    # publish, so the still-connected subscriber legitimately receives the
+    # empty payload live (both clients report into this test process) —
+    # consume that delivery first.
+    :ok = MqttX.Client.publish(pub, "ret/state", "", qos: 1, retain: true)
+    assert_receive {:mqtt_message, ["ret", "state"], ""}, 1_000
+
+    # A FRESH subscriber gets nothing: the retained entry is gone.
+    late = connect_client!(port, "ret-late")
+    {:ok, _} = MqttX.Client.subscribe(late, "ret/state", qos: 1)
+    refute_receive {:mqtt_message, ["ret", "state"], _}, 500
+  end
+
+  test "QoS 2 publish round-trips to a QoS 2 subscriber", %{port: port} do
+    sub = connect_client!(port, "q2-sub")
+    pub = connect_client!(port, "q2-pub")
+
+    {:ok, _granted} = MqttX.Client.subscribe(sub, "exactly/once", qos: 2)
+    :ok = MqttX.Client.publish(pub, "exactly/once", "one-time", qos: 2)
+    assert_receive {:mqtt_message, ["exactly", "once"], "one-time"}, 1_000
+    # Exactly-once at the protocol layer: no duplicate delivery.
+    refute_receive {:mqtt_message, ["exactly", "once"], "one-time"}, 500
+  end
+
   test "reaps a subscriber's routing entries when it disconnects", %{port: port} do
     sub = connect_client!(port, "sub")
     pub = connect_client!(port, "pub")
