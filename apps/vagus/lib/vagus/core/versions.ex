@@ -272,13 +272,35 @@ defmodule Vagus.Core.Versions do
     }
   end
 
+  # Same shape rule the router applies to user-supplied versions
+  # (`validate_core_update_version/1`): the fetched value ends up in
+  # `Container.image/1` and persisted state via `update(nil)`, so an
+  # upstream-served value gets the same scrutiny as request input —
+  # an invalid tag is treated exactly like a fetch failure (stale cache
+  # or nil), never cached.
+  @version_tag_re ~r/\A[A-Za-z0-9][A-Za-z0-9._-]*\z/
+  @version_max_len 128
+
   defp apply_fetch_result(state, {:ok, version}) do
-    %{state | latest_cache: %{value: version, fetched_at: state.now.()}}
+    if valid_version_tag?(version) do
+      %{state | latest_cache: %{value: version, fetched_at: state.now.()}}
+    else
+      Logger.warning(
+        "Vagus.Core.Versions: upstream served a non-tag-shaped version " <>
+          "(#{inspect(String.slice(version, 0, 64))}) — ignoring"
+      )
+
+      state
+    end
   end
 
   defp apply_fetch_result(state, {:error, reason}) do
     Logger.debug("Vagus.Core.Versions: latest fetch failed (#{inspect(reason)})")
     state
+  end
+
+  defp valid_version_tag?(version) do
+    byte_size(version) <= @version_max_len and Regex.match?(@version_tag_re, version)
   end
 
   defp reply_waiters(state) do

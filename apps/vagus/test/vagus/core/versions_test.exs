@@ -195,6 +195,51 @@ defmodule Vagus.Core.VersionsTest do
       assert Versions.latest(versions) == nil
     end
 
+    # The fetched value feeds Container.image/1 + persistence via
+    # update(nil), so an upstream-served non-tag-shaped string must be
+    # treated exactly like a fetch failure — never cached.
+    test "a non-tag-shaped upstream version is ignored, not cached" do
+      path = tmp_path()
+      on_exit(fn -> File.rm(path) end)
+      clock = start_clock_agent()
+
+      agent =
+        start_supervised!(
+          Supervisor.child_spec({Agent, fn -> {:ok, "../evil"} end}, id: make_ref())
+        )
+
+      versions =
+        start_versions(
+          path: path,
+          now: clock_fun(clock),
+          fetch: fn -> Agent.get(agent, & &1) end
+        )
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert Versions.latest(versions) == nil
+        end)
+
+      assert log =~ "non-tag-shaped version"
+
+      # Invalid result was not cached: a now-valid fetch replaces it
+      # immediately (no 24h TTL standing in the way).
+      Agent.update(agent, fn _bad -> {:ok, "2026.7.5"} end)
+      assert Versions.latest(versions) == "2026.7.5"
+    end
+
+    test "an overlong upstream version is ignored, not cached" do
+      path = tmp_path()
+      on_exit(fn -> File.rm(path) end)
+      long = String.duplicate("9", 129)
+
+      versions = start_versions(path: path, fetch: fn -> {:ok, long} end)
+
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert Versions.latest(versions) == nil
+      end)
+    end
+
     test "a fetch error with a stale cache falls back to the cached value" do
       path = tmp_path()
       on_exit(fn -> File.rm(path) end)
