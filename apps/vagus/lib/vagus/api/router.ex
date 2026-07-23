@@ -1014,11 +1014,13 @@ defmodule Vagus.API.Router do
 
         logs_pid ->
           # Subscribe BEFORE tailing so no line is lost between backfill and
-          # live; both calls serialize through the same GenServer, so the
-          # worst case is one line appearing in both (preferred over a
-          # silent gap).
+          # live; both calls hit the SAME pid (not a fresh logs_server
+          # lookup — a broker restart between the two would split them
+          # across incarnations; Copilot review, PR #6) and serialize
+          # through that GenServer, so the worst case is one line appearing
+          # in both (preferred over a silent gap).
           :ok = Broker.Logs.subscribe(logs_pid)
-          {:native, logs_pid, Native.logs(ref, lines: lines)}
+          {:native, logs_pid, Broker.Logs.tail(logs_pid, lines)}
       end
     else
       # Linked on purpose: if this request process dies abnormally, the link
