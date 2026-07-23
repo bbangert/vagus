@@ -546,6 +546,27 @@ defmodule Vagus.Addon.Backend.NativeTest do
       refute_receive {:revive_called, _}, 400
     end
 
+    test "no revive when boot flipped to manual after the demotion scheduled it" do
+      test = self()
+      id = unique_id()
+      config = %{boot: "auto", slug: Native.slug_from_id(id)}
+
+      sentinel =
+        start_revive_sentinel(:"rv_#{System.unique_integer([:positive])}", config, fn cfg ->
+          send(test, {:revive_called, cfg})
+          {:ok, %{}}
+        end)
+
+      kill_watched_broker(sentinel, id)
+      assert_receive {:state_put, ^config, :stopped}, 1_000
+
+      # Config edited (e.g. re-install) to boot: manual before the revive
+      # delay elapses — the CURRENT config must win.
+      manual = %{config | boot: "manual"}
+      :persistent_term.put({ReviveState, :entry}, {:ok, %{state: :stopped, config: manual}})
+      refute_receive {:revive_called, _}, 400
+    end
+
     test "no revive for a non-auto add-on" do
       test = self()
       id = unique_id()

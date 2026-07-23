@@ -129,9 +129,12 @@ defmodule Vagus.Addon.Backend.Native.Sentinel do
     slug = Native.slug_from_id(id)
 
     case state.state_mod.get(slug) do
-      # Still down and still installed — attempt the restart. Success
-      # re-arms the watch through Native.start inside Manager.start/1.
-      {:ok, %{state: :stopped, config: config}} ->
+      # Still down, still installed, and STILL boot:auto on the current
+      # config (it may have been flipped to manual since the demotion
+      # scheduled this — re-checked here and again on every retry;
+      # Copilot review, PR #7) — attempt the restart. Success re-arms the
+      # watch through Native.start inside Manager.start/1.
+      {:ok, %{state: :stopped, config: %{boot: "auto"} = config}} ->
         case state.revive_fun.(config) do
           {:ok, _} ->
             Logger.info("Vagus.Addon.Backend.Native.Sentinel: revived #{slug}")
