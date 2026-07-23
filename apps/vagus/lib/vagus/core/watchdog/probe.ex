@@ -233,7 +233,7 @@ defmodule Vagus.Core.Watchdog.Probe do
         Logger.debug("Vagus.Core.Watchdog.Probe: #{st.action.kind} in flight; skipping tick")
         st
 
-      not TokenStore.get_watchdog(st.token_store) ->
+      not watchdog_on?(st.token_store) ->
         Logger.debug("Vagus.Core.Watchdog.Probe: watchdog option off; skipping tick")
         st
 
@@ -393,6 +393,15 @@ defmodule Vagus.Core.Watchdog.Probe do
   defp server_alive?(pid) when is_pid(pid), do: Process.alive?(pid)
   defp server_alive?(name) when is_atom(name), do: is_pid(Process.whereis(name))
   defp server_alive?(_other), do: false
+
+  # The store can be briefly down (mid-restart) exactly when a tick fires;
+  # a crashed probe would reset the whole ladder. Fall back to the upstream
+  # `true` default instead — same tolerance maybe_subscribe/1 already has.
+  defp watchdog_on?(token_store) do
+    TokenStore.get_watchdog(token_store)
+  catch
+    :exit, _reason -> true
+  end
 
   defp default_running_check do
     case Docker.inspect_container(Container.name()) do

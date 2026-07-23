@@ -290,5 +290,15 @@ defmodule Vagus.Core.WatchdogTest do
       pid = start_watchdog(ctx)
       assert Process.alive?(pid)
     end
+
+    test "crash dies still count (watchdog-on default) when the token store is down", ctx do
+      pid = start_watchdog(ctx, token_store: :nonexistent_store_for_core_watchdog_test)
+
+      for _ <- 1..3, do: crash_die(pid)
+
+      assert_receive :rebuild_called
+      settle(pid)
+      assert Process.alive?(pid)
+    end
   end
 end

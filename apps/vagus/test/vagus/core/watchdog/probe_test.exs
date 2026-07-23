@@ -339,5 +339,16 @@ defmodule Vagus.Core.Watchdog.ProbeTest do
       pid = start_probe(ctx, token_store: :nonexistent_token_store_for_probe_test)
       assert Process.alive?(pid)
     end
+
+    test "ticks default to watchdog-on when the token store is down", ctx do
+      pid = start_probe(ctx, token_store: :nonexistent_token_store_for_probe_test)
+
+      script_push(ctx.script, :check, [:unhealthy, :unhealthy])
+      tick(pid)
+      tick_and_settle(pid)
+
+      assert_receive {:restart_called, :ok}
+      assert Process.alive?(pid)
+    end
   end
 end

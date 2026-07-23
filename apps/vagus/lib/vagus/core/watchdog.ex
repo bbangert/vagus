@@ -196,7 +196,7 @@ defmodule Vagus.Core.Watchdog do
         Logger.debug("Vagus.Core.Watchdog: die during in-flight rebuild ignored")
         st
 
-      not TokenStore.get_watchdog(st.token_store) ->
+      not watchdog_on?(st.token_store) ->
         Logger.debug("Vagus.Core.Watchdog: watchdog option off; ignoring Core die event")
         st
 
@@ -236,7 +236,7 @@ defmodule Vagus.Core.Watchdog do
           "exhausted; dropping"
       )
 
-      %{st | dies: []}
+      %{st | dies: [], actions: actions}
     else
       Logger.error(
         "Vagus.Core.Watchdog: Core is crash-looping (#{count} crash dies within " <>
@@ -305,6 +305,15 @@ defmodule Vagus.Core.Watchdog do
   defp server_alive?(pid) when is_pid(pid), do: Process.alive?(pid)
   defp server_alive?(name) when is_atom(name), do: is_pid(Process.whereis(name))
   defp server_alive?(_other), do: false
+
+  # The store can be briefly down (mid-restart) when a die event arrives; a
+  # crashed watchdog would drop the whole crash window. Fall back to the
+  # upstream `true` default instead — same tolerance maybe_subscribe/1 has.
+  defp watchdog_on?(token_store) do
+    TokenStore.get_watchdog(token_store)
+  catch
+    :exit, _reason -> true
+  end
 
   defp default_clock, do: System.monotonic_time(:millisecond)
 end
