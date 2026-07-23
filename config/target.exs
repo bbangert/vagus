@@ -114,6 +114,13 @@ config :vagus, :addon_boot_start, true
 # :host/:test; only target enables the poll-then-adopt GenServer.
 config :vagus, :core_boot, true
 
+# Core watchdog pair (CW-P2-T2): API probe + crash-loop event half
+# (`Vagus.Core.Watchdog.Supervisor` returns :ignore when unset — same
+# target-only convention as :core_boot above; there is no real Core
+# container to watch on :host/:test). Runtime on/off lives separately in
+# the persisted TokenStore `watchdog` option (POST /core/options).
+config :vagus, :core_watchdog, true
+
 # Core-facing token handshake (P3-T1/T2) — see config/host.exs for the
 # rationale, identical on target.
 config :vagus, :core_token_path, "/data/vagus/core_token.json"

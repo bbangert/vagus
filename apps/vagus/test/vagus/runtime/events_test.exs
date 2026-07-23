@@ -163,6 +163,32 @@ defmodule Vagus.Runtime.EventsTest do
     assert_receive {:docker_event, %{name: "addon_bar", action: "start"}}, 1_000
   end
 
+  test "a Core-named container event (no label) is forwarded — Core-name pass-through", %{
+    path: path,
+    listen: listen
+  } do
+    name = unique_name()
+    start_events(name, path)
+
+    {sock, _head} = accept_conn(listen)
+    send_ok_headers(sock)
+
+    # The adopted Core container: name "homeassistant", NO supervisor_managed
+    # label, exit code as docker sends it (string attribute).
+    line = event_json("die", Vagus.Core.Container.name(), "core01", %{"exitCode" => "1"}) <> "\n"
+    send_chunk(sock, line)
+
+    assert_receive {:docker_event, event}, 1_000
+    assert event.name == Vagus.Core.Container.name()
+    assert event.action == "die"
+    assert event.exit_code == 1
+
+    # sentinel: an unlabeled non-Core, non-addon name on the same stream is
+    # still dropped — the pass-through is exact-name, not a general loosening.
+    send_chunk(sock, event_json("die", "homeassistant-imposter", "imp01") <> "\n")
+    refute_receive {:docker_event, %{name: "homeassistant-imposter"}}, 300
+  end
+
   test "a JSON object split across two chunk frames/writes is reassembled", %{
     path: path,
     listen: listen

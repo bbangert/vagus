@@ -23,9 +23,12 @@ defmodule Vagus.Core.TokenStore do
   Subscribers (`subscribe/1`) get a `{:token_store, :refresh_token_available}`
   message the moment a refresh token first lands or changes value — this is
   how `Vagus.Core.EventPusher` knows it's safe to start connecting instead
-  of polling. A subscriber that already missed the notification (e.g. it
-  starts up after the token landed) is expected to also call
-  `get_refresh_token/1` once at its own `init/1`, since this store does not
+  of polling. They also get `{:token_store, :watchdog_changed}` when the
+  effective `watchdog` value (see `get_watchdog/1`) flips — this is how the
+  Core watchdog reacts to a `POST core/options {"watchdog": bool}` toggle
+  live instead of polling. A subscriber that already missed a notification
+  (e.g. it starts up after the token landed) is expected to also call the
+  relevant getter once at its own `init/1`, since this store does not
   replay history to new subscribers.
   """
 
@@ -82,9 +85,21 @@ defmodule Vagus.Core.TokenStore do
   end
 
   @doc """
+  Returns the effective persisted `watchdog` option — `true` when the field
+  has never been posted (upstream Supervisor's default), otherwise the
+  posted boolean. A persisted non-boolean (defensive: nothing writes one
+  today) also reads as the `true` default.
+  """
+  @spec get_watchdog(GenServer.server()) :: boolean()
+  def get_watchdog(server \\ __MODULE__) do
+    GenServer.call(server, :get_watchdog)
+  end
+
+  @doc """
   Registers the calling process to receive
   `{:token_store, :refresh_token_available}` the next time a refresh token
-  first lands or changes.
+  first lands or changes, and `{:token_store, :watchdog_changed}` when the
+  effective `watchdog` value flips.
   """
   @spec subscribe(GenServer.server()) :: :ok
   def subscribe(server \\ __MODULE__) do
@@ -105,6 +120,10 @@ defmodule Vagus.Core.TokenStore do
     {:reply, Map.get(state.options, "refresh_token"), state}
   end
 
+  def handle_call(:get_watchdog, _from, state) do
+    {:reply, effective_watchdog(state.options), state}
+  end
+
   def handle_call({:put_options, fields}, _from, state) do
     accepted = Map.take(fields, @accepted_fields)
     old_refresh_token = Map.get(state.options, "refresh_token")
@@ -114,7 +133,14 @@ defmodule Vagus.Core.TokenStore do
     persist(state.path, new_options)
 
     if is_binary(new_refresh_token) and new_refresh_token != old_refresh_token do
-      notify_subscribers(state.subscribers)
+      notify_subscribers(state.subscribers, :refresh_token_available)
+    end
+
+    # Compared on the *effective* value (default true), so a first-ever
+    # `watchdog: true` put is not a flip and an idempotent re-put never
+    # notifies.
+    if effective_watchdog(new_options) != effective_watchdog(state.options) do
+      notify_subscribers(state.subscribers, :watchdog_changed)
     end
 
     {:reply, :ok, %{state | options: new_options}}
@@ -124,8 +150,15 @@ defmodule Vagus.Core.TokenStore do
     {:reply, :ok, %{state | subscribers: MapSet.put(state.subscribers, pid)}}
   end
 
-  defp notify_subscribers(subscribers) do
-    Enum.each(subscribers, &send(&1, {:token_store, :refresh_token_available}))
+  defp notify_subscribers(subscribers, message) do
+    Enum.each(subscribers, &send(&1, {:token_store, message}))
+  end
+
+  defp effective_watchdog(options) do
+    case Map.get(options, "watchdog") do
+      value when is_boolean(value) -> value
+      _absent_or_invalid -> true
+    end
   end
 
   # `path` is the compile/config-time token-store path, never request input —

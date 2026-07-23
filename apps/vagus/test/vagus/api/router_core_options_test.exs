@@ -54,6 +54,25 @@ defmodule Vagus.API.RouterCoreOptionsTest do
     end
   end
 
+  describe "GET /core/info watchdog field (CW-P0-T3)" do
+    test "reflects the persisted watchdog option, live" do
+      on_exit(fn -> TokenStore.put_options(%{"watchdog" => true}) end)
+
+      conn = post_options("/core/options", %{"watchdog" => false})
+      assert conn.status == 200
+
+      info = conn(:get, "/core/info") |> authed() |> call()
+      assert info.status == 200
+      assert json_body(info)["data"]["watchdog"] == false
+
+      conn = post_options("/core/options", %{"watchdog" => true})
+      assert conn.status == 200
+
+      info = conn(:get, "/core/info") |> authed() |> call()
+      assert json_body(info)["data"]["watchdog"] == true
+    end
+  end
+
   describe "POST /homeassistant/options (alias)" do
     test "persists refresh_token identically to /core/options" do
       token = "router-ha-options-#{System.unique_integer([:positive])}"
