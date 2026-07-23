@@ -17,6 +17,11 @@ defmodule Vagus.Runtime.EventsTest do
   end
 
   defp start_fake_server(path) do
+    # rm first: a leftover socket file from a previous run collides
+    # (:eaddrinuse) — pre-existing latent flake, fixed alongside
+    # logs/follow_test.exs which inherited this helper.
+    _ = File.rm(path)
+
     {:ok, listen} =
       :gen_tcp.listen(0, [
         :binary,

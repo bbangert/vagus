@@ -118,6 +118,13 @@ config :vagus, :core_base_url, "http://localhost:8123"
 # (`Vagus.Engine.Manager`'s `--host`); `Vagus.Runtime.Docker` talks to it.
 config :vagus, :docker_socket, "/run/balena-engine.sock"
 
+# The HA Core container's name on the engine — the source behind the
+# /core (and /homeassistant alias) logs + stats routes. Was never set
+# before vagus-follow-logs, which made every /core/logs response an
+# "honest empty" (found during the P4-T2 device gate); matches the
+# canonical run recipe in memory (vagus-device-and-toolchain).
+config :vagus, :core_container, "homeassistant"
+
 # Add-on data/bind-source root. Use the REAL mount path (`/root`), not the
 # `/data` symlink — the same runc symlink hazard that blocked the engine
 # data-root (see Vagus.Engine.Manager) applies to bind sources.

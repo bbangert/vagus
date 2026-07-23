@@ -35,6 +35,7 @@ defmodule Vagus.API.Router do
   alias Vagus.Backups
   alias Vagus.Core.TokenStore
   alias Vagus.Discovery
+  alias Vagus.Mqtt.Broker
   alias Vagus.Runtime.{Docker, Logs, Stats}
   alias Vagus.Services
 
@@ -367,8 +368,8 @@ defmodule Vagus.API.Router do
   end
 
   # -- Logs (§A5) — text/plain, one entry per line, X-First-Cursor +
-  # X-Accel-Buffering headers. One-shot (the frontend's tolerated legacy GET);
-  # live `/follow` streaming is a later add. Sourced from the engine's container
+  # X-Accel-Buffering headers. One-shot routes here; live `/follow`
+  # streaming in the section below. Sourced from the engine's container
   # logs; families without a container (host) are honestly empty. ------------
 
   get "/addons/:slug/logs" do
@@ -391,6 +392,91 @@ defmodule Vagus.API.Router do
   get("/supervisor/logs/latest", do: send_logs(conn, supervisor_container(), no_colors: true))
   get("/host/logs", do: send_logs(conn, nil))
   get("/host/logs/latest", do: send_logs(conn, nil, no_colors: true))
+
+  # -- Logs: live `/follow` streaming (§A5) — chunked text/plain, connection
+  # held open. Container families ride a per-connection Runtime.Logs.Follow
+  # (docker --follow; its tail=N carries the backfill on the SAME stream, so
+  # no separate backfill write — no gap, no duplication). The native broker
+  # subscribes to its Broker.Logs buffer. Sourceless families stream an
+  # honest empty body and close. ---------------------------------------------
+
+  get "/addons/:slug/logs/follow" do
+    case resolve_info_slug(slug, conn.assigns.caller) do
+      {:ok, resolved} -> follow_logs(conn, "addon_#{resolved}")
+      {:error, :forbidden} -> Envelope.send_error(conn, "Not authorized for this add-on", 403)
+    end
+  end
+
+  get("/core/logs/follow", do: follow_logs(conn, core_container()))
+  get("/supervisor/logs/follow", do: follow_logs(conn, supervisor_container()))
+  get("/host/logs/follow", do: follow_logs(conn, nil))
+
+  # /homeassistant/* is the contract's alias of /core/* (§A5).
+  get("/homeassistant/logs", do: send_logs(conn, core_container()))
+  get("/homeassistant/logs/latest", do: send_logs(conn, core_container(), no_colors: true))
+  get("/homeassistant/logs/follow", do: follow_logs(conn, core_container()))
+
+  # audio/dns/multicast: Vagus runs no dedicated plugin containers for these
+  # families — every route streams/serves an honest empty body (§A5: a log
+  # poll must not error).
+  get("/audio/logs", do: send_logs(conn, nil))
+  get("/audio/logs/latest", do: send_logs(conn, nil, no_colors: true))
+  get("/audio/logs/follow", do: follow_logs(conn, nil))
+  get("/dns/logs", do: send_logs(conn, nil))
+  get("/dns/logs/latest", do: send_logs(conn, nil, no_colors: true))
+  get("/dns/logs/follow", do: follow_logs(conn, nil))
+  get("/multicast/logs", do: send_logs(conn, nil))
+  get("/multicast/logs/latest", do: send_logs(conn, nil, no_colors: true))
+  get("/multicast/logs/follow", do: follow_logs(conn, nil))
+
+  # Boots (§A5): no journald on Nerves, so this device has exactly one boot —
+  # bootid `0` (or our literal boot id) serves the current source, any other
+  # offset/id is honestly empty. `/host/logs/boots` below reports the single
+  # boot consistently.
+  get("/host/logs/boots/:bootid", do: send_logs(conn, nil))
+  get("/host/logs/boots/:bootid/follow", do: follow_logs(conn, nil))
+  get("/core/logs/boots/:bootid", do: send_logs(conn, boot_ref(bootid, core_container())))
+
+  get "/core/logs/boots/:bootid/follow" do
+    follow_logs(conn, boot_ref(bootid, core_container()))
+  end
+
+  get "/homeassistant/logs/boots/:bootid" do
+    send_logs(conn, boot_ref(bootid, core_container()))
+  end
+
+  get "/homeassistant/logs/boots/:bootid/follow" do
+    follow_logs(conn, boot_ref(bootid, core_container()))
+  end
+
+  get "/supervisor/logs/boots/:bootid" do
+    send_logs(conn, boot_ref(bootid, supervisor_container()))
+  end
+
+  get "/supervisor/logs/boots/:bootid/follow" do
+    follow_logs(conn, boot_ref(bootid, supervisor_container()))
+  end
+
+  get "/addons/:slug/logs/boots/:bootid" do
+    case resolve_info_slug(slug, conn.assigns.caller) do
+      {:ok, resolved} -> send_logs(conn, boot_ref(bootid, "addon_#{resolved}"))
+      {:error, :forbidden} -> Envelope.send_error(conn, "Not authorized for this add-on", 403)
+    end
+  end
+
+  get "/addons/:slug/logs/boots/:bootid/follow" do
+    case resolve_info_slug(slug, conn.assigns.caller) do
+      {:ok, resolved} -> follow_logs(conn, boot_ref(bootid, "addon_#{resolved}"))
+      {:error, :forbidden} -> Envelope.send_error(conn, "Not authorized for this add-on", 403)
+    end
+  end
+
+  get("/audio/logs/boots/:bootid", do: send_logs(conn, nil))
+  get("/audio/logs/boots/:bootid/follow", do: follow_logs(conn, nil))
+  get("/dns/logs/boots/:bootid", do: send_logs(conn, nil))
+  get("/dns/logs/boots/:bootid/follow", do: follow_logs(conn, nil))
+  get("/multicast/logs/boots/:bootid", do: send_logs(conn, nil))
+  get("/multicast/logs/boots/:bootid/follow", do: follow_logs(conn, nil))
 
   # JSON side-endpoints (§A5): one boot (we don't track journald boots), no
   # extra syslog identifiers.
@@ -759,35 +845,99 @@ defmodule Vagus.API.Router do
   # tails, `?no_colors` strips ANSI.
   defp send_logs(conn, ref, opts \\ []) do
     conn = fetch_query_params(conn)
-    lines = log_lines(conn)
 
-    no_colors =
-      Map.has_key?(conn.query_params, "no_colors") or Keyword.get(opts, :no_colors, false)
+    case logs_accept(conn) do
+      :error ->
+        Envelope.send_error(conn, "Accept must be text/plain, text/x-log or */*", 400)
 
-    body = log_body(ref, lines, no_colors)
+      {:ok, accept_verbose?} ->
+        lines = log_lines(conn)
+        verbose = accept_verbose? or Map.has_key?(conn.query_params, "verbose")
 
-    conn
-    |> put_resp_header("x-first-cursor", "0")
-    |> put_resp_header("x-accel-buffering", "no")
-    |> put_resp_content_type("text/plain")
-    |> send_resp(200, body)
-    |> halt()
+        no_colors =
+          Map.has_key?(conn.query_params, "no_colors") or Keyword.get(opts, :no_colors, false)
+
+        body = log_body(ref, lines, no_colors, verbose)
+
+        conn
+        |> put_resp_header("x-first-cursor", "0")
+        |> put_resp_header("x-accel-buffering", "no")
+        |> put_resp_content_type("text/plain")
+        |> send_resp(200, body)
+        |> halt()
+    end
   end
 
-  defp log_body(nil, _lines, _no_colors), do: ""
+  # §A5: `Accept` (when present) must be text/plain, text/x-log or `*/*`,
+  # else 400; text/x-log additionally selects the verbose line format.
+  defp logs_accept(conn) do
+    case get_req_header(conn, "accept") do
+      [] ->
+        {:ok, false}
+
+      [accept | _rest] ->
+        types =
+          accept
+          |> String.split(",")
+          |> Enum.map(fn t ->
+            t |> String.split(";") |> hd() |> String.trim() |> String.downcase()
+          end)
+
+        cond do
+          "text/x-log" in types -> {:ok, true}
+          Enum.any?(types, &(&1 in ["text/plain", "*/*"])) -> {:ok, false}
+          true -> :error
+        end
+    end
+  end
+
+  defp log_body(nil, _lines, _no_colors, _verbose), do: ""
 
   # Native "virtual add-ons" have no container — serve the broker's telemetry log
   # buffer (already text/plain, one entry per line) instead of Docker logs.
-  defp log_body(ref, lines, no_colors) do
+  # Verbose for native/broker lines is the plain line with the host/ident
+  # prefix (no per-line source timestamp exists — documented approximation).
+  defp log_body(ref, lines, no_colors, verbose) do
     if Native.running?(ref) do
-      ref |> Native.logs(lines: lines) |> Enum.join("\n")
+      raw = Native.logs(ref, lines: lines)
+
+      if verbose do
+        Enum.map_join(raw, "\n", &Logs.verbose_line(&1, log_host(), ref))
+      else
+        Enum.join(raw, "\n")
+      end
     else
-      case Docker.container_logs(ref, tail: lines) do
-        {:ok, raw} -> Logs.format(raw, no_colors: no_colors)
+      # verbose rides docker's own per-line RFC3339 stamps (timestamps=true).
+      case Docker.container_logs(ref, tail: lines, timestamps: verbose) do
+        {:ok, raw} -> raw |> Logs.format(no_colors: no_colors) |> maybe_verbose_body(ref, verbose)
         {:error, _reason} -> ""
       end
     end
   end
+
+  defp maybe_verbose_body(text, _ref, false), do: text
+
+  defp maybe_verbose_body(text, ref, true) do
+    host = log_host()
+
+    text
+    |> String.split("\n")
+    |> Enum.map_join("\n", fn
+      "" -> ""
+      line -> Logs.verbose_line(line, host, ref)
+    end)
+  end
+
+  defp log_host do
+    {:ok, host} = :inet.gethostname()
+    to_string(host)
+  end
+
+  # bootid `0` (or this device's literal single boot id) is the current
+  # boot; any other offset/id has no journal behind it — honest empty.
+  defp boot_ref("0", ref), do: ref
+  defp boot_ref("vagus", ref), do: ref
+  defp boot_ref(_other, _ref), do: nil
 
   defp log_lines(conn) do
     case Integer.parse(Map.get(conn.query_params, "lines", "100")) do
@@ -795,6 +945,207 @@ defmodule Vagus.API.Router do
       _ -> 100
     end
   end
+
+  # -- follow (live streaming) helpers ---------------------------------------
+
+  # §A5 `/logs/follow`: required headers, chunked 200, then hold the
+  # connection streaming the source until it ends, the client disconnects
+  # (`chunk/2 → {:error, _}`, the ingress_proxy pattern), or the idle window
+  # elapses. A nil/unavailable source streams an honest empty body and
+  # closes — a log poll must not error (matches send_logs/3).
+  defp follow_logs(conn, ref, opts \\ []) do
+    conn = fetch_query_params(conn)
+
+    case logs_accept(conn) do
+      :error ->
+        Envelope.send_error(conn, "Accept must be text/plain, text/x-log or */*", 400)
+
+      {:ok, accept_verbose?} ->
+        do_follow_logs(conn, ref, accept_verbose?, opts)
+    end
+  end
+
+  defp do_follow_logs(conn, ref, accept_verbose?, opts) do
+    lines = log_lines(conn)
+    verbose = accept_verbose? or Map.has_key?(conn.query_params, "verbose")
+
+    fmt = %{
+      no_colors:
+        Map.has_key?(conn.query_params, "no_colors") or Keyword.get(opts, :no_colors, false),
+      verbose: verbose,
+      host: log_host(),
+      ident: ref || "host",
+      buf: ""
+    }
+
+    conn =
+      conn
+      |> put_resp_header("x-first-cursor", "0")
+      |> put_resp_header("x-accel-buffering", "no")
+      |> put_resp_content_type("text/plain")
+      |> send_chunked(200)
+
+    case follow_source(ref, lines, verbose) do
+      :none ->
+        halt(conn)
+
+      {:native, logs_pid, backfill} ->
+        case write_backfill(conn, backfill, fmt) do
+          {:ok, conn} ->
+            stream_loop(conn, {:native, logs_pid}, fmt)
+
+          {:error, _reason} ->
+            teardown({:native, logs_pid})
+            halt(conn)
+        end
+
+      {:docker, _follow_pid} = source ->
+        stream_loop(conn, source, fmt)
+    end
+  end
+
+  defp follow_source(nil, _lines, _verbose), do: :none
+
+  defp follow_source(ref, lines, verbose) do
+    if Native.running?(ref) do
+      case Native.logs_server(ref) do
+        nil ->
+          :none
+
+        logs_pid ->
+          # Subscribe BEFORE tailing so no line is lost between backfill and
+          # live; both calls hit the SAME pid (not a fresh logs_server
+          # lookup — a broker restart between the two would split them
+          # across incarnations; Copilot review, PR #6) and serialize
+          # through that GenServer, so the worst case is one line appearing
+          # in both (preferred over a silent gap).
+          :ok = Broker.Logs.subscribe(logs_pid)
+          {:native, logs_pid, Broker.Logs.tail(logs_pid, lines)}
+      end
+    else
+      # Linked on purpose: if this request process dies abnormally, the link
+      # (plus the owner monitor inside Follow) guarantees the held docker
+      # connection dies with it. Backfill rides the docker stream (tail=N);
+      # verbose rides docker's per-line stamps (timestamps=true).
+      {:ok, pid} =
+        Logs.Follow.start_link(owner: self(), ref: ref, tail: lines, timestamps: verbose)
+
+      {:docker, pid}
+    end
+  end
+
+  defp write_backfill(conn, [], _fmt), do: {:ok, conn}
+
+  defp write_backfill(conn, lines, fmt) do
+    chunk(conn, Enum.map_join(lines, "", &render_line(&1, fmt)))
+  end
+
+  defp stream_loop(conn, source, fmt) do
+    receive do
+      {:log_chunk, data} ->
+        {out, fmt} = render_stream(data, fmt)
+        deliver_chunk(conn, out, source, fmt, _ack? = true)
+
+      {:broker_log, line} ->
+        deliver_chunk(conn, render_line(line, fmt), source, fmt, _ack? = false)
+
+      :log_eof ->
+        flush_tail(conn, fmt)
+    after
+      follow_idle_ms() ->
+        teardown(source)
+        flush_tail(conn, fmt)
+    end
+  end
+
+  # An all-buffered (verbose partial-line) chunk still needs its ack or the
+  # Follow process would stall waiting for one.
+  defp deliver_chunk(conn, "", source, fmt, ack?) do
+    if ack?, do: Logs.Follow.ack(source_pid(source))
+    stream_loop(conn, source, fmt)
+  end
+
+  defp deliver_chunk(conn, data, source, fmt, ack?) do
+    case chunk(conn, data) do
+      {:ok, conn} ->
+        if ack?, do: Logs.Follow.ack(source_pid(source))
+        stream_loop(conn, source, fmt)
+
+      {:error, _reason} ->
+        # The client hung up mid-stream — tear the source down so the held
+        # docker connection / broker subscription doesn't leak (risk #2).
+        teardown(source)
+        halt(conn)
+    end
+  end
+
+  # Verbose mode may hold a final partial line; write it before closing.
+  defp flush_tail(conn, %{buf: ""}), do: halt(conn)
+
+  defp flush_tail(conn, %{buf: buf} = fmt) do
+    case chunk(conn, render_line(buf, %{fmt | buf: ""})) do
+      {:ok, conn} -> halt(conn)
+      {:error, _reason} -> halt(conn)
+    end
+  end
+
+  defp source_pid({_kind, pid}), do: pid
+
+  defp teardown({:docker, pid}) do
+    GenServer.stop(pid, :normal, 1_000)
+  catch
+    :exit, _ -> :ok
+  end
+
+  # Best-effort like the docker branch: the broker (and its Logs process)
+  # can restart/stop while a follow is open — unsubscribing a dead server
+  # exits :noproc, and the subscription died with the server anyway.
+  defp teardown({:native, logs_pid}) do
+    Broker.Logs.unsubscribe(logs_pid)
+  catch
+    :exit, _ -> :ok
+  end
+
+  # Plain mode passes docker chunks through untouched (bar the ANSI strip —
+  # NOTE: an escape split across two chunks can evade it; cosmetic, accepted).
+  # Verbose mode line-buffers so the §A5 prefix lands on whole lines even
+  # when docker chunks split them; the buffered remainder is capped so a
+  # no-newline stream can't balloon memory.
+  defp render_stream(data, %{verbose: false} = fmt) do
+    {maybe_strip(data, fmt.no_colors), fmt}
+  end
+
+  defp render_stream(data, fmt) do
+    buffer = fmt.buf <> maybe_strip(data, fmt.no_colors)
+    parts = String.split(buffer, "\n")
+    {complete, [rest]} = Enum.split(parts, length(parts) - 1)
+
+    out =
+      Enum.map_join(complete, "", fn
+        "" -> "\n"
+        line -> render_line(line, fmt)
+      end)
+
+    if byte_size(rest) > Logs.max_pending() do
+      {out <> render_line(rest, fmt), %{fmt | buf: ""}}
+    else
+      {out, %{fmt | buf: rest}}
+    end
+  end
+
+  defp render_line(line, %{verbose: true} = fmt) do
+    Logs.verbose_line(line, fmt.host, fmt.ident) <> "\n"
+  end
+
+  defp render_line(line, _fmt), do: line <> "\n"
+
+  defp maybe_strip(data, true), do: Logs.strip_ansi(data)
+  defp maybe_strip(data, false), do: data
+
+  # Test seam: production keeps a quiet-but-healthy follow open for 15 min
+  # (aligned with Bandit's read_timeout, api/supervisor.ex); tests shrink it
+  # so the otherwise-endless native stream ends deterministically.
+  defp follow_idle_ms, do: Application.get_env(:vagus, :follow_idle_ms, 900_000)
 
   # -- stats helpers ---------------------------------------------------------
 

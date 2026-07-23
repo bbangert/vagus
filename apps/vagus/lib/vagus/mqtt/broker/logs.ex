@@ -39,6 +39,19 @@ defmodule Vagus.Mqtt.Broker.Logs do
   @spec tail(GenServer.server(), pos_integer()) :: [String.t()]
   def tail(server, n \\ 100), do: GenServer.call(server, {:tail, n})
 
+  @doc """
+  Subscribes the calling process to `{:broker_log, line}` messages, one per
+  appended log line (the live half of `/logs/follow`; use `tail/2` for the
+  backfill). The server monitors the caller and prunes it on `:DOWN`, so a
+  dead subscriber is never leaked — same seam as `Vagus.Runtime.Events`.
+  """
+  @spec subscribe(GenServer.server()) :: :ok
+  def subscribe(server \\ __MODULE__), do: GenServer.call(server, {:subscribe, self()})
+
+  @doc "Unsubscribes the calling process."
+  @spec unsubscribe(GenServer.server()) :: :ok
+  def unsubscribe(server \\ __MODULE__), do: GenServer.call(server, {:unsubscribe, self()})
+
   # Telemetry callback (remote capture — runs in the connection process).
   @doc false
   def handle_event(event, measurements, metadata, server) do
@@ -54,11 +67,19 @@ defmodule Vagus.Mqtt.Broker.Logs do
     # Detach first so a restart (where terminate/2 may not have run) can re-attach.
     _ = :telemetry.detach(handler_id)
     :ok = :telemetry.attach_many(handler_id, @events, &__MODULE__.handle_event/4, self())
-    {:ok, %{lines: [], handler_id: handler_id}}
+    {:ok, %{lines: [], handler_id: handler_id, subscribers: %{}}}
   end
 
   @impl GenServer
+  # DELIBERATE asymmetry with the docker follow path (which ack-gates its
+  # reads): this fan-out has no backpressure, so a slow /logs/follow client
+  # blocked in chunk/2 queues {:broker_log, _} in the request process's
+  # mailbox. Bounded in practice by this buffer's own event rate (broker
+  # telemetry, a few lines/sec at worst) and by dead-client teardown
+  # (chunk error / idle window) — an ack protocol here would buy nothing
+  # measurable for the complexity.
   def handle_cast({:append, line}, state) do
+    Enum.each(state.subscribers, fn {pid, _ref} -> send(pid, {:broker_log, line}) end)
     {:noreply, %{state | lines: Enum.take([line | state.lines], @max)}}
   end
 
@@ -66,6 +87,38 @@ defmodule Vagus.Mqtt.Broker.Logs do
   def handle_call({:tail, n}, _from, state) do
     {:reply, state.lines |> Enum.take(n) |> Enum.reverse(), state}
   end
+
+  def handle_call({:subscribe, pid}, _from, %{subscribers: subs} = state) do
+    subs =
+      if Map.has_key?(subs, pid) do
+        subs
+      else
+        Map.put(subs, pid, Process.monitor(pid))
+      end
+
+    {:reply, :ok, %{state | subscribers: subs}}
+  end
+
+  def handle_call({:unsubscribe, pid}, _from, %{subscribers: subs} = state) do
+    case Map.pop(subs, pid) do
+      {nil, ^subs} ->
+        {:reply, :ok, state}
+
+      {ref, rest} ->
+        Process.demonitor(ref, [:flush])
+        {:reply, :ok, %{state | subscribers: rest}}
+    end
+  end
+
+  @impl GenServer
+  def handle_info({:DOWN, ref, :process, pid, _reason}, %{subscribers: subs} = state) do
+    case Map.fetch(subs, pid) do
+      {:ok, ^ref} -> {:noreply, %{state | subscribers: Map.delete(subs, pid)}}
+      _ -> {:noreply, state}
+    end
+  end
+
+  def handle_info(_other, state), do: {:noreply, state}
 
   @impl GenServer
   def terminate(_reason, state) do
