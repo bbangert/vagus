@@ -35,6 +35,17 @@
   # router.ex maybe_verbose_body/3 is only called from container_logs'
   # {:ok, raw} branch, which the same Mint story marks dead.
   {"lib/vagus/api/router.ex", :unused_fun},
+  # Core.Lifecycle drives every op through Vagus.Runtime.Docker's unix-socket
+  # client, so the same "connect never succeeds" inference marks all its
+  # success branches dead (unused_fun for every helper past the first Docker
+  # call, pattern_match on the ok-tuples, no_return on the op entrypoints).
+  # Hermetic fake-engine tests + the device gate prove the behavior.
+  {"lib/vagus/core/lifecycle.ex", :no_return},
+  {"lib/vagus/core/lifecycle.ex", :pattern_match},
+  {"lib/vagus/core/lifecycle.ex", :unused_fun},
+  # Core.Boot's default_ping/0 wraps Docker.ping/0 — same cascade as
+  # boot_starter.ex below.
+  {"lib/vagus/core/boot.ex", :no_return},
   {"lib/vagus/addon/boot_starter.ex", :no_return},
   # default_ensure_network's `{:ok, _id} <- Network.ensure()` — same cascade as
   # manager.ex:pattern_match below: the stubbed socket makes dialyzer infer the

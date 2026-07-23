@@ -33,7 +33,7 @@ defmodule Vagus.API.Router do
   alias Vagus.API.{Envelope, StaticData}
   alias Vagus.Backend
   alias Vagus.Backups
-  alias Vagus.Core.TokenStore
+  alias Vagus.Core.{Health, Lifecycle, TokenStore, Versions}
   alias Vagus.Discovery
   alias Vagus.Mqtt.Broker
   alias Vagus.Runtime.{Docker, Logs, Stats}
@@ -121,8 +121,23 @@ defmodule Vagus.API.Router do
     Envelope.send_ok(conn, SupervisorInfo.build!(StaticData.supervisor_info()))
   end
 
+  # `version`/`version_latest`/`update_available` come from `Vagus.Core.Versions`
+  # (CL-P3-T2) — real state seeded by boot adoption / kept current by
+  # `update/2` — every other field is still `StaticData.core_info/0`'s Phase 2
+  # static value. `HomeAssistantInfo` declares both `version` and
+  # `version_latest` nullable, so a not-yet-adopted/offline `nil` from
+  # `Versions` is a valid response, not a fallback case.
   get "/core/info" do
-    Envelope.send_ok(conn, HomeAssistantInfo.build!(StaticData.core_info()))
+    server = core_versions_server()
+
+    attrs =
+      Map.merge(StaticData.core_info(), %{
+        version: Versions.installed(server),
+        version_latest: Versions.latest(server),
+        update_available: Versions.update_available?(server)
+      })
+
+    Envelope.send_ok(conn, HomeAssistantInfo.build!(attrs))
   end
 
   get "/os/info" do
@@ -778,6 +793,80 @@ defmodule Vagus.API.Router do
     handle_core_options(conn)
   end
 
+  # -- Core lifecycle (CL-P3-T1) ----------------------------------------------
+  #
+  # Every route here is supervisor-only (Core drives start/stop/restart/
+  # rebuild/check/update from the frontend's Core dashboard; an add-on never
+  # manages Core's lifecycle) — a non-supervisor caller gets a 403 before any
+  # `Lifecycle`/`Health` call, via `supervisor_only/2` (same guard as the
+  # `/backups...` routes).
+  #
+  # Every op funnels through `Vagus.Core.Lifecycle`'s single non-blocking
+  # `:global.trans` mutex (see that module's moduledoc "Serialization"
+  # section) — there is exactly one Core container, so a second lifecycle
+  # call arriving while one is already in flight gets `{:error, :busy}` back
+  # immediately rather than queueing; `core_lifecycle_error/2` maps that to
+  # 409 below. `:core_lifecycle`/`:core_health` are per-request config seams
+  # (default `Vagus.Core.Lifecycle`/`Vagus.Core.Health`), resolved the same
+  # way `core_container/0` resolves its config value — tests inject a stub
+  # module via `Application.put_env/3` instead of a real Docker socket/HTTP
+  # probe. `/homeassistant/*` are the contract's alias of `/core/*` (same
+  # convention as the logs routes above).
+  #
+  # `POST /core/update` can run for minutes — pulling a multi-GB Core image
+  # on a slow device, then the health gate — this is a synchronous v1 (no
+  # `background`/`job_id` job API yet, per the plan's "Locked decisions");
+  # Bandit's configured 900s `read_timeout` (`Vagus.API.Supervisor`) is what
+  # bounds how long a caller can wait, not anything in this router.
+
+  post "/core/start" do
+    core_lifecycle_action(conn, fn -> core_lifecycle().start() end)
+  end
+
+  post "/core/stop" do
+    core_lifecycle_action(conn, fn -> core_lifecycle().stop() end)
+  end
+
+  post "/core/restart" do
+    core_lifecycle_action(conn, fn -> core_lifecycle().restart() end)
+  end
+
+  post "/core/rebuild" do
+    core_lifecycle_action(conn, fn -> core_lifecycle().rebuild() end)
+  end
+
+  post "/core/check" do
+    core_check_action(conn)
+  end
+
+  post "/core/update" do
+    core_update_action(conn)
+  end
+
+  post "/homeassistant/start" do
+    core_lifecycle_action(conn, fn -> core_lifecycle().start() end)
+  end
+
+  post "/homeassistant/stop" do
+    core_lifecycle_action(conn, fn -> core_lifecycle().stop() end)
+  end
+
+  post "/homeassistant/restart" do
+    core_lifecycle_action(conn, fn -> core_lifecycle().restart() end)
+  end
+
+  post "/homeassistant/rebuild" do
+    core_lifecycle_action(conn, fn -> core_lifecycle().rebuild() end)
+  end
+
+  post "/homeassistant/check" do
+    core_check_action(conn)
+  end
+
+  post "/homeassistant/update" do
+    core_update_action(conn)
+  end
+
   post "/supervisor/options" do
     Envelope.send_ok(conn, %{})
   end
@@ -821,6 +910,116 @@ defmodule Vagus.API.Router do
     :ok = TokenStore.put_options(conn.body_params)
     Envelope.send_ok(conn, %{})
   end
+
+  # -- Core lifecycle helpers (CL-P3-T1) --------------------------------------
+
+  # `start`/`stop`/`restart`/`rebuild` all share this shape: no request body,
+  # `:ok` -> ok envelope, `{:error, reason}` -> mapped status below.
+  defp core_lifecycle_action(conn, fun) do
+    supervisor_only(conn, fn ->
+      case fun.() do
+        :ok -> Envelope.send_ok(conn, %{})
+        {:error, reason} -> send_core_lifecycle_error(conn, reason)
+      end
+    end)
+  end
+
+  defp core_check_action(conn) do
+    supervisor_only(conn, fn ->
+      case core_health().check() do
+        :healthy -> Envelope.send_ok(conn, %{})
+        :unhealthy -> Envelope.send_error(conn, "Core frontend probe failed", 400)
+      end
+    end)
+  end
+
+  # Body validated BEFORE touching `Lifecycle` — a malformed `version` must
+  # never reach the lock/pull machinery. Absent/`nil` -> `update(nil)`
+  # (`Lifecycle` resolves that to `Versions.latest/1`).
+  defp core_update_action(conn) do
+    supervisor_only(conn, fn ->
+      case validate_core_update_version(conn.body_params) do
+        {:ok, version} ->
+          case core_lifecycle().update(version) do
+            {:ok, installed} -> Envelope.send_ok(conn, %{version: installed})
+            {:error, reason} -> send_core_lifecycle_error(conn, reason)
+          end
+
+        {:error, message} ->
+          Envelope.send_error(conn, message, 400)
+      end
+    end)
+  end
+
+  @core_version_tag_re ~r/\A[A-Za-z0-9][A-Za-z0-9._-]*\z/
+  @core_version_max_len 128
+
+  defp validate_core_update_version(params) do
+    case Map.get(params, "version") do
+      nil ->
+        {:ok, nil}
+
+      version when is_binary(version) ->
+        if valid_core_version_tag?(version) do
+          {:ok, version}
+        else
+          {:error,
+           "version must be a docker-tag-shaped string (max #{@core_version_max_len} chars)"}
+        end
+
+      _not_a_string ->
+        {:error, "version must be a string"}
+    end
+  end
+
+  defp valid_core_version_tag?(version) do
+    byte_size(version) <= @core_version_max_len and Regex.match?(@core_version_tag_re, version)
+  end
+
+  # `:busy` (the single-key `:global.trans` mutex, `Lifecycle` moduledoc) is
+  # the one lifecycle error that isn't the caller's fault — a fast 409 tells
+  # it to retry, rather than the 400 family every other lifecycle error uses.
+  defp send_core_lifecycle_error(conn, :busy) do
+    Envelope.send_error(conn, "a Core lifecycle operation is already in progress", 409)
+  end
+
+  defp send_core_lifecycle_error(conn, reason) do
+    Envelope.send_error(conn, core_lifecycle_error_message(reason), 400)
+  end
+
+  defp core_lifecycle_error_message(:no_version), do: "No Core version is installed yet"
+
+  defp core_lifecycle_error_message(:version_installed),
+    do: "The requested version is already installed"
+
+  defp core_lifecycle_error_message(:health_timeout),
+    do: "Core did not become healthy in time"
+
+  defp core_lifecycle_error_message({:pull, reason}),
+    do: "Failed to pull the Core image: #{inspect(reason)}"
+
+  defp core_lifecycle_error_message({:health_timeout, :rolled_back}),
+    do: "Core update failed its health check; rolled back to the previous version"
+
+  defp core_lifecycle_error_message({:health_timeout, :no_rollback_version}),
+    do: "Core update failed its health check and there is no previous version to roll back to"
+
+  defp core_lifecycle_error_message({:rollback_failed, reason}),
+    do: "Core update failed its health check and the rollback also failed: #{inspect(reason)}"
+
+  defp core_lifecycle_error_message({:recreate_failed, reason, :rolled_back}),
+    do:
+      "Failed to start the new Core version (#{inspect(reason)}): rolled back to the previous version"
+
+  defp core_lifecycle_error_message({:recreate_failed, reason, :no_rollback_version}),
+    do:
+      "Failed to start the new Core version (#{inspect(reason)}): no previous version to roll back to"
+
+  defp core_lifecycle_error_message(reason), do: inspect(reason)
+
+  defp core_lifecycle, do: Application.get_env(:vagus, :core_lifecycle, Lifecycle)
+  defp core_health, do: Application.get_env(:vagus, :core_health, Health)
+  defp core_versions_server, do: Application.get_env(:vagus, :core_versions_server, Versions)
 
   # The response has already gone out by the time this runs (see the
   # moduledoc above the reboot/shutdown routes) — a failed backend call has
@@ -1372,8 +1571,10 @@ defmodule Vagus.API.Router do
 
   # -- backup helpers (M4-P6-T2; §A4) -----------------------------------------
 
-  # Shared supervisor-only-caller guard for every `/backups...` route — Core
-  # drives backups from the frontend, an add-on never manages backups.
+  # Shared supervisor-only-caller guard for every `/backups...` route and the
+  # `/core...`/`/homeassistant...` lifecycle routes above — Core drives
+  # backups and its own lifecycle from the frontend, an add-on never manages
+  # either.
   defp supervisor_only(conn, fun) do
     if conn.assigns.caller == :supervisor,
       do: fun.(),

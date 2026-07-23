@@ -20,6 +20,10 @@ config :vagus, :token_path, Path.expand("../.dev/supervisor_token", __DIR__)
 # restarts.
 config :vagus, :core_token_path, Path.expand("../.dev/core_token.json", __DIR__)
 
+# Installed/latest HA Core version state (CL-P2-T1). Same file-backed-JSON
+# pattern as :core_token_path above.
+config :vagus, :core_versions_path, Path.expand("../.dev/core.json", __DIR__)
+
 # Base URL Vagus.Core.Client/EventPusher use to reach Core itself (distinct
 # from :api_port above, which is the port THIS emulator listens on for
 # Core to call INTO). Real Home Assistant OS installs run Core and
