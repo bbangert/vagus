@@ -15,6 +15,20 @@ defmodule Vagus.Addon.Backend.Native.Sentinel do
   never mistaken for a crash. `watch/1`/`unwatch/1` no-op if the sentinel isn't
   running (isolated tests, `:host` without the full tree), matching the
   best-effort style of the manager's other side effects.
+
+  ## Revive (native watchdog, MQ-P6 follow-up)
+
+  Demotion alone left a `boot: auto` native add-on (the default MQTT broker)
+  dead until reboot — the container watchdog's die-event restart has no
+  native analog, and the broker child is deliberately `:temporary` under
+  `Native.Supervisor` (blast-radius containment). So after demoting, the
+  sentinel REVIVES a `boot: "auto"` add-on: a delayed `Manager.start/1`
+  (fresh token, options re-write, service/discovery re-publish, watch
+  re-armed via `Native.start`), retried on a fixed interval with no attempt
+  cap — same no-backoff philosophy as `Watchdog.Probe` (§B7.4), and safe
+  because each attempt is one supervised call, not a supervision-tree crash
+  loop. The revive is skipped if, by the time it fires, the add-on was
+  uninstalled or manually started (State is re-read first).
   """
 
   use GenServer
@@ -28,6 +42,11 @@ defmodule Vagus.Addon.Backend.Native.Sentinel do
   # DynamicSupervisor restarts near-instantly, so a live re-check this soon
   # after distinguishes "restarted" from "gave up".
   @recheck_ms 1_000
+
+  # Revive pacing: the first attempt waits out any lingering listener-socket
+  # release; failures retry on a fixed interval, uncapped (§B7.4 style).
+  @revive_delay_ms 5_000
+  @revive_retry_ms 30_000
 
   @doc "Starts the sentinel."
   @spec start_link(keyword()) :: GenServer.on_start()
@@ -57,7 +76,10 @@ defmodule Vagus.Addon.Backend.Native.Sentinel do
       by_ref: %{},
       by_id: %{},
       state_mod: Keyword.get(opts, :state_mod, State),
-      recheck_ms: Keyword.get(opts, :recheck_ms, @recheck_ms)
+      recheck_ms: Keyword.get(opts, :recheck_ms, @recheck_ms),
+      revive_fun: Keyword.get(opts, :revive_fun, &Vagus.Addon.Manager.start/1),
+      revive_delay_ms: Keyword.get(opts, :revive_delay_ms, @revive_delay_ms),
+      revive_retry_ms: Keyword.get(opts, :revive_retry_ms, @revive_retry_ms)
     }
 
     {:ok, state, {:continue, :reconcile}}
@@ -98,9 +120,37 @@ defmodule Vagus.Addon.Backend.Native.Sentinel do
       # OTP restarted it — resume watching, State stays :started.
       {:noreply, monitor(id, state)}
     else
-      demote(id, state.state_mod)
+      demote(id, state)
       {:noreply, state}
     end
+  end
+
+  def handle_info({:revive, id}, state) do
+    slug = Native.slug_from_id(id)
+
+    case state.state_mod.get(slug) do
+      # Still down and still installed — attempt the restart. Success
+      # re-arms the watch through Native.start inside Manager.start/1.
+      {:ok, %{state: :stopped, config: config}} ->
+        case state.revive_fun.(config) do
+          {:ok, _} ->
+            Logger.info("Vagus.Addon.Backend.Native.Sentinel: revived #{slug}")
+
+          {:error, reason} ->
+            Logger.warning(
+              "Vagus.Addon.Backend.Native.Sentinel: revive of #{slug} failed " <>
+                "(#{inspect(reason)}); retrying in #{state.revive_retry_ms}ms"
+            )
+
+            Process.send_after(self(), {:revive, id}, state.revive_retry_ms)
+        end
+
+      # Uninstalled, or someone started it manually in the meantime — drop.
+      _ ->
+        :ok
+    end
+
+    {:noreply, state}
   end
 
   defp monitor(id, state) do
@@ -131,19 +181,28 @@ defmodule Vagus.Addon.Backend.Native.Sentinel do
     %{state | by_ref: Map.delete(state.by_ref, ref), by_id: Map.delete(state.by_id, id)}
   end
 
-  defp demote(id, state_mod) do
+  defp demote(id, state) do
     slug = Native.slug_from_id(id)
 
-    case state_mod.get(slug) do
+    case state.state_mod.get(slug) do
       {:ok, %{config: config}} ->
         Logger.warning(
           "Vagus.Addon.Backend.Native.Sentinel: broker #{slug} did not restart — demoting to :stopped"
         )
 
-        state_mod.put(config, :stopped)
+        state.state_mod.put(config, :stopped)
+
+        if auto_boot?(config) do
+          Process.send_after(self(), {:revive, id}, state.revive_delay_ms)
+        end
 
       _ ->
         :ok
     end
   end
+
+  # Pattern-based (not struct-field access) so test fakes with opaque
+  # configs read as non-auto and never schedule a revive.
+  defp auto_boot?(%{boot: "auto"}), do: true
+  defp auto_boot?(_config), do: false
 end
