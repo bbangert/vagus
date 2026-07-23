@@ -368,8 +368,8 @@ defmodule Vagus.API.Router do
   end
 
   # -- Logs (§A5) — text/plain, one entry per line, X-First-Cursor +
-  # X-Accel-Buffering headers. One-shot (the frontend's tolerated legacy GET);
-  # live `/follow` streaming is a later add. Sourced from the engine's container
+  # X-Accel-Buffering headers. One-shot routes here; live `/follow`
+  # streaming in the section below. Sourced from the engine's container
   # logs; families without a container (host) are honestly empty. ------------
 
   get "/addons/:slug/logs" do
