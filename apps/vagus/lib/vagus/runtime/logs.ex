@@ -54,15 +54,20 @@ defmodule Vagus.Runtime.Logs do
   partial header or a header whose payload hasn't fully arrived) as the new
   `pending`. Unframed/TTY data — anything that can no longer be a frame
   header — passes straight through as payload. Returns
-  `{:error, :pending_overflow}` when the carried remainder exceeds
-  #{@max_pending} bytes; the caller should close the stream.
+  `{:error, :pending_overflow, salvaged}` when the carried remainder
+  exceeds #{@max_pending} bytes — `salvaged` carries any complete frames
+  peeled in the same call, so the caller can flush them before closing
+  the stream.
   """
   @spec demux_stream(binary(), binary()) ::
-          {iodata(), binary()} | {:error, :pending_overflow}
+          {iodata(), binary()} | {:error, :pending_overflow, iodata()}
   def demux_stream(pending, data) when is_binary(pending) and is_binary(data) do
     case do_demux_stream(pending <> data, []) do
-      {_payloads, rest} when byte_size(rest) > @max_pending -> {:error, :pending_overflow}
-      ok -> ok
+      {payloads, rest} when byte_size(rest) > @max_pending ->
+        {:error, :pending_overflow, payloads}
+
+      ok ->
+        ok
     end
   end
 

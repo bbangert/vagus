@@ -85,7 +85,15 @@ defmodule Vagus.Runtime.LogsTest do
       header = <<1, 0, 0, 0, 2_000_000::32>>
       {[], pending} = Logs.demux_stream("", header)
       big = :binary.copy(<<0>>, 1_100_000)
-      assert Logs.demux_stream(pending, big) == {:error, :pending_overflow}
+      assert Logs.demux_stream(pending, big) == {:error, :pending_overflow, []}
+    end
+
+    test "overflow salvages complete frames peeled in the same call" do
+      huge = <<1, 0, 0, 0, 2_000_000::32>> <> :binary.copy(<<0>>, 1_100_000)
+      data = frame(1, "ok\n") <> huge
+
+      assert {:error, :pending_overflow, salvaged} = Logs.demux_stream("", data)
+      assert IO.iodata_to_binary(salvaged) == "ok\n"
     end
   end
 

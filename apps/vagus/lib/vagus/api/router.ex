@@ -1095,7 +1095,14 @@ defmodule Vagus.API.Router do
     :exit, _ -> :ok
   end
 
-  defp teardown({:native, logs_pid}), do: Broker.Logs.unsubscribe(logs_pid)
+  # Best-effort like the docker branch: the broker (and its Logs process)
+  # can restart/stop while a follow is open — unsubscribing a dead server
+  # exits :noproc, and the subscription died with the server anyway.
+  defp teardown({:native, logs_pid}) do
+    Broker.Logs.unsubscribe(logs_pid)
+  catch
+    :exit, _ -> :ok
+  end
 
   # Plain mode passes docker chunks through untouched (bar the ANSI strip —
   # NOTE: an escape split across two chunks can evade it; cosmetic, accepted).

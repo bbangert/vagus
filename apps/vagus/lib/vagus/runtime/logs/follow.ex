@@ -192,12 +192,13 @@ defmodule Vagus.Runtime.Logs.Follow do
          terminal?
        ) do
     case Logs.demux_stream(state.pending, data) do
-      {:error, :pending_overflow} ->
+      {:error, :pending_overflow, salvaged} ->
         Logger.warning(
           "Vagus.Runtime.Logs.Follow: partial-frame buffer exceeded cap for #{state.ref}; closing stream"
         )
 
-        {%{state | pending: ""}, payloads, true}
+        # Flush the frames that DID decode in this call before closing.
+        {%{state | pending: ""}, payloads ++ [salvaged], true}
 
       {chunk_payloads, pending} ->
         {%{state | pending: pending}, payloads ++ [chunk_payloads], terminal?}

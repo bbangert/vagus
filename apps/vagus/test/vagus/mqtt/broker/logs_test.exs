@@ -39,12 +39,31 @@ defmodule Vagus.Mqtt.Broker.LogsTest do
       end)
 
     assert :ok = Task.await(task)
-    # Task process is dead; give the :DOWN a moment to be processed, then
-    # prove the map no longer holds it (append must not crash and state
-    # shows no subscribers).
+    # The monitor's :DOWN and our subsequent messages come from DIFFERENT
+    # senders, so there's no ordering guarantee — poll (bounded) instead of
+    # asserting immediately (Copilot review, PR #6; house flake lore).
+    wait_until(fn -> :sys.get_state(logs).subscribers == %{} end)
+    # And appending afterwards must not crash on the pruned map.
     append(logs, "after death")
-    assert %{subscribers: subs} = :sys.get_state(logs)
-    assert subs == %{}
+    assert %{subscribers: %{}} = :sys.get_state(logs)
+  end
+
+  defp wait_until(fun, timeout_ms \\ 2_000) do
+    do_wait_until(fun, System.monotonic_time(:millisecond) + timeout_ms)
+  end
+
+  defp do_wait_until(fun, deadline) do
+    cond do
+      fun.() ->
+        :ok
+
+      System.monotonic_time(:millisecond) > deadline ->
+        flunk("condition never became true")
+
+      true ->
+        Process.sleep(20)
+        do_wait_until(fun, deadline)
+    end
   end
 
   test "double subscribe is idempotent (single monitor, single delivery)", %{logs: logs} do
