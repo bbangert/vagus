@@ -31,13 +31,26 @@ defmodule Vagus.ImprovTest do
 
   describe "network_type/0 force-offline override" do
     test "app env forces :disconnected" do
+      # App env is global, but this stays async-safe: Vagus.Improv is the
+      # only reader of this key, and its tests all live in THIS module,
+      # whose tests run serially relative to each other.
       Application.put_env(:vagus, :improv_force_offline, true)
+      on_exit(fn -> Application.delete_env(:vagus, :improv_force_offline) end)
 
-      try do
-        assert Vagus.Improv.network_type() == :disconnected
-      after
-        Application.delete_env(:vagus, :improv_force_offline)
-      end
+      assert Vagus.Improv.network_type() == :disconnected
+    end
+  end
+
+  describe "parse_trigger/1" do
+    test "extracts the bracketed active trigger" do
+      assert Vagus.Improv.parse_trigger("none mmc0 [heartbeat] timer") == "heartbeat"
+      assert Vagus.Improv.parse_trigger("[none] mmc0 timer\n") == "none"
+    end
+
+    test "nil when nothing is bracketed or contents are malformed" do
+      assert Vagus.Improv.parse_trigger("none mmc0 timer") == nil
+      assert Vagus.Improv.parse_trigger("") == nil
+      assert Vagus.Improv.parse_trigger("[]") == nil
     end
   end
 

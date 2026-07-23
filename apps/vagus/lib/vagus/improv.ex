@@ -145,16 +145,18 @@ defmodule Vagus.Improv do
 
   # The LED's kernel trigger (mmc0 activity on the ACT LED) keeps rewriting
   # brightness underneath us, so park it on "none" for the blink and restore
-  # the original afterwards. All writes best-effort: sysfs paths are
-  # module-internal constants, and an unwritable LED must never crash the
-  # identify task.
+  # the original afterwards. If the original trigger can't be read/parsed,
+  # DON'T park at all: blinking against a live trigger just flickers, while
+  # parking with nothing to restore would leave the activity LED dead until
+  # reboot. All writes best-effort: sysfs paths are module-internal
+  # constants, and an unwritable LED must never crash the identify task.
   # sobelow_skip ["Traversal.FileModule"]
   defp blink(led_dir) do
     brightness = Path.join(led_dir, "brightness")
     trigger = Path.join(led_dir, "trigger")
     original_trigger = current_trigger(trigger)
 
-    _ = File.write(trigger, "none")
+    if original_trigger, do: _ = File.write(trigger, "none")
 
     for _ <- 1..@blink_count do
       _ = File.write(brightness, "1")
@@ -167,15 +169,26 @@ defmodule Vagus.Improv do
     :ok
   end
 
-  # The trigger file lists all triggers with the active one bracketed:
-  # "none mmc0 [heartbeat] ..." -> "heartbeat".
   # sobelow_skip ["Traversal.FileModule"]
   defp current_trigger(trigger_path) do
-    with {:ok, contents} <- File.read(trigger_path),
-         [_, active] <- Regex.run(~r/\[(\S+)\]/, contents) do
-      active
-    else
-      _ -> nil
+    case File.read(trigger_path) do
+      {:ok, contents} -> parse_trigger(contents)
+      {:error, _} -> nil
+    end
+  end
+
+  @doc """
+  Parses a sysfs LED `trigger` file's contents — every available trigger
+  space-separated, the active one bracketed (`"none mmc0 [heartbeat]"` →
+  `"heartbeat"`); `nil` when nothing is bracketed. Public (`@doc false`
+  would hide it, and the parse rules are worth documenting) purely so the
+  pure half of the LED handling is unit-testable.
+  """
+  @spec parse_trigger(String.t()) :: String.t() | nil
+  def parse_trigger(contents) do
+    case Regex.run(~r/\[(\S+)\]/, contents) do
+      [_, active] -> active
+      nil -> nil
     end
   end
 

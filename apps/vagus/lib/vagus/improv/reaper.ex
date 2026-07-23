@@ -115,15 +115,24 @@ defmodule Vagus.Improv.Reaper do
     state
   end
 
-  # `Improv.status/0` is a plain GenServer.call; when the group is already
-  # gone (reaped, or crashed mid-restart) the call exits — treat that as
-  # :disarmed, which makes a re-run reap idempotently.
+  # Belt-and-braces: improv 0.1.1's `status/1` already catches the
+  # not-running exit internally and answers `%{state: :disarmed, ...}`, so
+  # this outer catch is redundant today — kept because the reaper's
+  # idempotency must not silently depend on that library implementation
+  # detail surviving an upgrade.
   defp default_improv_state do
     Improv.status().state
   catch
     :exit, _ -> :disarmed
   end
 
+  # terminate_child + delete_child are two separate synchronous calls, not
+  # an atomic pair: a bluetoothd crash landing exactly between them can
+  # resurrect the group via the :rest_for_one cascade before the spec is
+  # deleted. That race self-heals — the same cascade also restarts THIS
+  # reaper (a :transient child's spec survives its :normal stop), and the
+  # fresh reaper re-checks and re-reaps — so it costs one extra cycle, not
+  # correctness.
   defp default_reap do
     case Supervisor.terminate_child(Vagus.Bluetooth, Improv.Supervisor) do
       :ok -> :ok = Supervisor.delete_child(Vagus.Bluetooth, Improv.Supervisor)

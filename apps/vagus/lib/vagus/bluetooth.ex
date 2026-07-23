@@ -87,11 +87,12 @@ defmodule Vagus.Bluetooth do
     daemon_children(opts) ++ improv_children(opts)
   end
 
+  # Explicit `false` match (not truthiness) so a future config-driven
+  # value like `nil`/`"false"` fails loudly instead of silently toggling.
   defp improv_children(opts) do
-    if Keyword.get(opts, :improv, true) do
-      [Vagus.Improv.supervisor_child(), Vagus.Improv.Reaper]
-    else
-      []
+    case Keyword.get(opts, :improv, true) do
+      false -> []
+      true -> [Vagus.Improv.supervisor_child(), Vagus.Improv.Reaper]
     end
   end
 

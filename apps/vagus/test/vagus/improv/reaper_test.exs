@@ -80,6 +80,25 @@ defmodule Vagus.Improv.ReaperTest do
     assert_receive :reaped, 500
   end
 
+  test "rapid duplicate :internet events still produce exactly one reap" do
+    conn = start_agent(:disconnected)
+    pid = start_reaper(self(), connection: fn -> Agent.get(conn, & &1) end)
+    ref = Process.monitor(pid)
+
+    Agent.update(conn, fn _ -> :internet end)
+    # Two events land inside one check window; the check_scheduled? guard
+    # coalesces them into a single timer chain. (The reap-count assertion
+    # can't catch every pileup regression — the process stops after the
+    # first reap regardless — but it pins the user-visible contract and
+    # documents the intent.)
+    send(pid, {VintageNet, ["connection"], :lan, :internet, %{}})
+    send(pid, {VintageNet, ["connection"], :lan, :internet, %{}})
+
+    assert_receive :reaped, 500
+    refute_receive :reaped, 100
+    assert_receive {:DOWN, ^ref, :process, ^pid, :normal}, 500
+  end
+
   test "unrelated VintageNet property changes are ignored" do
     pid = start_reaper(self(), connection: fn -> :disconnected end)
 
