@@ -105,11 +105,21 @@ defmodule Vagus.Addon.Backend.Native do
   """
   @spec logs(Vagus.Addon.Backend.id(), keyword()) :: [String.t()]
   def logs(id, opts \\ []) do
-    # "Logs" string segment matches how `Vagus.Mqtt.Broker` names the child.
-    case Process.whereis(Module.concat(broker_name(id), "Logs")) do
+    case logs_server(id) do
       pid when is_pid(pid) -> Broker.Logs.tail(pid, Keyword.get(opts, :lines, 100))
       nil -> []
     end
+  end
+
+  @doc """
+  The broker's `Broker.Logs` buffer process for a native add-on `id`, or
+  `nil` when the broker isn't running — the subscribe target for
+  `/logs/follow` (the router calls `Broker.Logs.subscribe/1` on it).
+  """
+  @spec logs_server(Vagus.Addon.Backend.id()) :: pid() | nil
+  def logs_server(id) do
+    # "Logs" string segment matches how `Vagus.Mqtt.Broker` names the child.
+    Process.whereis(Module.concat(broker_name(id), "Logs"))
   end
 
   @doc "The registered name of the broker subtree for a native add-on `id`."

@@ -194,7 +194,10 @@ defmodule Vagus.Runtime.Docker do
   @spec container_logs(String.t(), keyword()) :: {:ok, binary()} | {:error, term()}
   def container_logs(id, opts \\ []) do
     tail = Keyword.get(opts, :tail, 100)
-    query = [stdout: true, stderr: true, tail: tail]
+    # `timestamps: true` makes the daemon prefix each line with RFC3339Nano —
+    # the real per-line times the §A5 verbose format needs.
+    timestamps = Keyword.get(opts, :timestamps, false)
+    query = [stdout: true, stderr: true, tail: tail, timestamps: timestamps]
 
     with :ok <- ensure_ref(id) do
       case request(:get, "/containers/#{id}/logs", Keyword.merge(opts, query: query)) do

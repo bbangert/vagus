@@ -56,4 +56,68 @@ defmodule Vagus.API.LogsRouterTest do
     assert conn.status == 200
     assert Jason.decode!(conn.resp_body)["data"] == %{"identifiers" => []}
   end
+
+  describe "§A5 contract surface (P3)" do
+    test "an unsupported Accept header is a 400" do
+      conn =
+        conn(:get, "/host/logs")
+        |> sup()
+        |> put_req_header("accept", "application/json")
+        |> Vagus.API.Router.call(@opts)
+
+      assert conn.status == 400
+    end
+
+    test "text/plain, text/x-log, */* and absent Accept are all accepted" do
+      for accept <- ["text/plain", "text/x-log", "*/*", "text/plain; charset=utf-8"] do
+        conn =
+          conn(:get, "/host/logs")
+          |> sup()
+          |> put_req_header("accept", accept)
+          |> Vagus.API.Router.call(@opts)
+
+        assert conn.status == 200, "accept #{accept} should be 200"
+      end
+    end
+
+    test "sourceless families serve empty text/plain with headers" do
+      for path <- [
+            "/audio/logs",
+            "/audio/logs/latest",
+            "/dns/logs",
+            "/multicast/logs",
+            "/homeassistant/logs"
+          ] do
+        conn = conn(:get, path) |> sup() |> Vagus.API.Router.call(@opts)
+        assert conn.status == 200, path
+        assert conn.resp_body == "", path
+        assert get_resp_header(conn, "x-first-cursor") == ["0"], path
+      end
+    end
+
+    test "boots endpoints degrade honestly (single boot, no journal)" do
+      for path <- [
+            "/host/logs/boots/0",
+            "/host/logs/boots/-1",
+            "/core/logs/boots/0",
+            "/supervisor/logs/boots/17",
+            "/audio/logs/boots/0"
+          ] do
+        conn = conn(:get, path) |> sup() |> Vagus.API.Router.call(@opts)
+        assert conn.status == 200, path
+        assert conn.resp_body == "", path
+      end
+    end
+
+    test "an add-on may not read another add-on's boots logs" do
+      token = addon_token("boots-intruder")
+
+      conn =
+        conn(:get, "/addons/core_mosquitto/logs/boots/0")
+        |> put_req_header("x-supervisor-token", token)
+        |> Vagus.API.Router.call(@opts)
+
+      assert conn.status == 403
+    end
+  end
 end

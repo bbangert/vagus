@@ -26,6 +26,15 @@
   {"lib/vagus/core/api_socket.ex", :call},
   {"lib/vagus/core/api_socket.ex", :unused_fun},
   {"lib/vagus/core/api_socket.ex", :invalid_contract},
+  # Runtime.Logs.Follow speaks to the engine socket the same {:local, path}
+  # way (vagus-follow-logs): connect deemed "never succeeds" → the with-else
+  # branches and request_logs read as dead → same cascade as events.ex.
+  {"lib/vagus/runtime/logs/follow.ex", :call},
+  {"lib/vagus/runtime/logs/follow.ex", :pattern_match},
+  {"lib/vagus/runtime/logs/follow.ex", :unused_fun},
+  # router.ex maybe_verbose_body/3 is only called from container_logs'
+  # {:ok, raw} branch, which the same Mint story marks dead.
+  {"lib/vagus/api/router.ex", :unused_fun},
   {"lib/vagus/addon/boot_starter.ex", :no_return},
   # default_ensure_network's `{:ok, _id} <- Network.ensure()` — same cascade as
   # manager.ex:pattern_match below: the stubbed socket makes dialyzer infer the
