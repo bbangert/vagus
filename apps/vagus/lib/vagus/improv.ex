@@ -77,11 +77,15 @@ defmodule Vagus.Improv do
 
   @doc """
   Pure connectivity classification, host-testable. Values are vintage_net
-  connection statuses (`:disconnected | :lan | :internet`, `nil` when the
-  interface doesn't exist). `aggregate` is vintage_net's best-of-all-
-  interfaces `["connection"]` property — the catch-all for interfaces we
-  don't name (usb0, ...). Wifi wins over ethernet only for the label; the
-  arm gate cares solely about `:disconnected` vs anything else.
+  connection statuses (`:disconnected | :lan | :internet`). `nil` is
+  accepted defensively for direct callers, but the production path never
+  produces it: `connection/1` passes `:disconnected` as `VintageNet.get/2`'s
+  default, so an absent interface reads as `:disconnected` on target — and
+  the host stub deliberately mirrors that coalescing. `aggregate` is
+  vintage_net's best-of-all-interfaces `["connection"]` property — the
+  catch-all for interfaces we don't name (usb0, ...). Wifi wins over
+  ethernet only for the label; the arm gate cares solely about
+  `:disconnected` vs anything else.
   """
   @spec classify(atom() | nil, atom() | nil, atom() | nil) ::
           :disconnected | :wifi | :ethernet | :other
