@@ -109,10 +109,19 @@ config :vagus, :token_path, "/data/vagus/token"
 config :vagus, :addon_state_path, "/data/vagus/addons.json"
 config :vagus, :addon_boot_start, true
 
+# Boot-time Core adoption (CL-P1-T2) — see config/host.exs's :core_versions_path
+# comment for why these config-gated boot-reconciliation modules stay off on
+# :host/:test; only target enables the poll-then-adopt GenServer.
+config :vagus, :core_boot, true
+
 # Core-facing token handshake (P3-T1/T2) — see config/host.exs for the
 # rationale, identical on target.
 config :vagus, :core_token_path, "/data/vagus/core_token.json"
 config :vagus, :core_base_url, "http://localhost:8123"
+
+# Installed/latest HA Core version state (CL-P2-T1) — see config/host.exs
+# for the rationale, identical on target.
+config :vagus, :core_versions_path, "/data/vagus/core.json"
 
 # Add-on runtime (M4). The balena-engine daemon's control socket
 # (`Vagus.Engine.Manager`'s `--host`); `Vagus.Runtime.Docker` talks to it.

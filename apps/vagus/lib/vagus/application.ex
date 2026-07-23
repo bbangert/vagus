@@ -81,6 +81,14 @@ defmodule Vagus.Application do
           # isolation rationale.
           {Vagus.Core.Supervisor, []},
 
+          # Boot-time Core adoption (CL-P1-T2): polls the engine, then adopts
+          # (never creates) the HA Core container, same unconditional-child/
+          # config-gated-:ignore convention as `Vagus.Addon.BootStarter`
+          # above — see `Vagus.Core.Boot` for the poll/adopt rationale.
+          # Started after `Vagus.Core.Supervisor` so `Vagus.Core.Versions` (the
+          # seed target) is already up.
+          Vagus.Core.Boot,
+
           # Auto-installs + boots the default native provider (the mqttx broker,
           # M5-P5). `:ignore` unless `config :vagus, :default_native_addon` is set
           # (only target.exs sets it). Placed last so `Native.Supervisor`,

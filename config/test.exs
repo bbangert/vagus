@@ -41,6 +41,11 @@ config :vagus, :token_path, Path.join(System.tmp_dir!(), "vagus_test_supervisor_
 # Vagus.Core.EventPusher attempt a real connection during `mix test`).
 config :vagus, :core_token_path, Path.join(System.tmp_dir!(), "vagus_test_core_token.json")
 
+# Isolated from the real host dev-loop core.json, same rationale as
+# :core_token_path above. Tests that need per-test isolation (persistence
+# round-trips) pass :path directly instead of relying on this shared file.
+config :vagus, :core_versions_path, Path.join(System.tmp_dir!(), "vagus_test_core_versions.json")
+
 # Host-management backends (P4-T1): Mox mocks, not the host stubs directly
 # — `test/test_helper.exs` defines each mock and, via `Mox.stub_with/2`,
 # defaults it to delegate to the matching `Vagus.Backend.*.HostStub` (so
