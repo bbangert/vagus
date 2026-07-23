@@ -444,6 +444,167 @@ defmodule Vagus.Addon.Backend.NativeTest do
     end
   end
 
+  describe "Sentinel revive (native watchdog for boot:auto add-ons)" do
+    # A stateful fake: demote's put/2 updates the entry the later revive
+    # re-reads, so the skip-if-changed logic is exercised for real.
+    defmodule ReviveState do
+      @moduledoc false
+      def list, do: []
+      def get(_slug), do: :persistent_term.get({__MODULE__, :entry}, {:error, :not_found})
+
+      def put(config, s) do
+        send(:persistent_term.get(__MODULE__), {:state_put, config, s})
+        :persistent_term.put({__MODULE__, :entry}, {:ok, %{state: s, config: config}})
+        :ok
+      end
+    end
+
+    defp start_revive_sentinel(ctx_name, config, revive_fun) do
+      :persistent_term.put(ReviveState, self())
+      :persistent_term.put({ReviveState, :entry}, {:ok, %{state: :started, config: config}})
+
+      on_exit(fn ->
+        :persistent_term.erase(ReviveState)
+        :persistent_term.erase({ReviveState, :entry})
+      end)
+
+      start_supervised!(
+        Supervisor.child_spec(
+          {Native.Sentinel,
+           name: ctx_name,
+           state_mod: ReviveState,
+           recheck_ms: 50,
+           revive_delay_ms: 50,
+           revive_retry_ms: 50,
+           revive_fun: revive_fun},
+          id: ctx_name
+        )
+      )
+
+      ctx_name
+    end
+
+    defp kill_watched_broker(sentinel, id) do
+      {:ok, dummy} = Agent.start(fn -> :ok end, name: Native.broker_name(id))
+      watch_sync(sentinel, id)
+      Agent.stop(dummy)
+    end
+
+    test "revives a boot:auto add-on after demotion (watch re-armed by Manager path)" do
+      test = self()
+      id = unique_id()
+      slug = Native.slug_from_id(id)
+      config = %{boot: "auto", slug: slug}
+
+      sentinel =
+        start_revive_sentinel(:"rv_#{System.unique_integer([:positive])}", config, fn cfg ->
+          send(test, {:revive_called, cfg})
+          {:ok, %{id: id}}
+        end)
+
+      kill_watched_broker(sentinel, id)
+
+      assert_receive {:state_put, ^config, :stopped}, 1_000
+      assert_receive {:revive_called, ^config}, 1_000
+    end
+
+    test "a failed revive retries on the fixed interval" do
+      test = self()
+      id = unique_id()
+      config = %{boot: "auto", slug: Native.slug_from_id(id)}
+
+      sentinel =
+        start_revive_sentinel(:"rv_#{System.unique_integer([:positive])}", config, fn _cfg ->
+          send(test, :revive_attempt)
+          {:error, :port_busy}
+        end)
+
+      kill_watched_broker(sentinel, id)
+
+      assert_receive :revive_attempt, 1_000
+      # No cap, fixed interval: further attempts keep coming.
+      assert_receive :revive_attempt, 1_000
+      assert_receive :revive_attempt, 1_000
+    end
+
+    test "no revive when the add-on was manually started before the delay fired" do
+      test = self()
+      id = unique_id()
+      config = %{boot: "auto", slug: Native.slug_from_id(id)}
+
+      sentinel =
+        start_revive_sentinel(:"rv_#{System.unique_integer([:positive])}", config, fn cfg ->
+          send(test, {:revive_called, cfg})
+          {:ok, %{}}
+        end)
+
+      kill_watched_broker(sentinel, id)
+      assert_receive {:state_put, ^config, :stopped}, 1_000
+
+      # Someone starts it manually before the revive delay elapses.
+      :persistent_term.put({ReviveState, :entry}, {:ok, %{state: :started, config: config}})
+      refute_receive {:revive_called, _}, 400
+    end
+
+    test "no revive when boot flipped to manual after the demotion scheduled it" do
+      test = self()
+      id = unique_id()
+      config = %{boot: "auto", slug: Native.slug_from_id(id)}
+
+      sentinel =
+        start_revive_sentinel(:"rv_#{System.unique_integer([:positive])}", config, fn cfg ->
+          send(test, {:revive_called, cfg})
+          {:ok, %{}}
+        end)
+
+      kill_watched_broker(sentinel, id)
+      assert_receive {:state_put, ^config, :stopped}, 1_000
+
+      # Config edited (e.g. re-install) to boot: manual before the revive
+      # delay elapses — the CURRENT config must win.
+      manual = %{config | boot: "manual"}
+      :persistent_term.put({ReviveState, :entry}, {:ok, %{state: :stopped, config: manual}})
+      refute_receive {:revive_called, _}, 400
+    end
+
+    test "no revive when a manual stop raced the DOWN (State already :stopped at demote)" do
+      test = self()
+      id = unique_id()
+      config = %{boot: "auto", slug: Native.slug_from_id(id)}
+
+      sentinel =
+        start_revive_sentinel(:"rv_#{System.unique_integer([:positive])}", config, fn cfg ->
+          send(test, {:revive_called, cfg})
+          {:ok, %{}}
+        end)
+
+      # Manual-stop shape: Manager.stop recorded :stopped BEFORE the broker
+      # died, and the unwatch cast lost the race with the DOWN.
+      :persistent_term.put({ReviveState, :entry}, {:ok, %{state: :stopped, config: config}})
+      kill_watched_broker(sentinel, id)
+
+      # Demotion may still (redundantly) put :stopped, but no revive fires.
+      refute_receive {:revive_called, _}, 500
+    end
+
+    test "no revive for a non-auto add-on" do
+      test = self()
+      id = unique_id()
+      config = %{boot: "manual", slug: Native.slug_from_id(id)}
+
+      sentinel =
+        start_revive_sentinel(:"rv_#{System.unique_integer([:positive])}", config, fn cfg ->
+          send(test, {:revive_called, cfg})
+          {:ok, %{}}
+        end)
+
+      kill_watched_broker(sentinel, id)
+
+      assert_receive {:state_put, ^config, :stopped}, 1_000
+      refute_receive {:revive_called, _}, 400
+    end
+  end
+
   # ---------- helpers ----------
 
   defp container_config(slug) do
