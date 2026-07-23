@@ -188,14 +188,20 @@ defmodule Vagus.Addon.Backend.Native.Sentinel do
     slug = Native.slug_from_id(id)
 
     case state.state_mod.get(slug) do
-      {:ok, %{config: config}} ->
+      {:ok, %{config: config} = entry} ->
         Logger.warning(
           "Vagus.Addon.Backend.Native.Sentinel: broker #{slug} did not restart — demoting to :stopped"
         )
 
         state.state_mod.put(config, :stopped)
 
-        if auto_boot?(config) do
+        # Revive ONLY when State still read :started here — the signature
+        # of a genuine crash (demote exists to fix that staleness). A
+        # manual stop records :stopped BEFORE terminating the broker, and
+        # unwatch/2 is an async cast, so a DOWN/recheck racing the stop
+        # must not resurrect an add-on the user just stopped (Copilot
+        # review, PR #7 round 2).
+        if Map.get(entry, :state) == :started and auto_boot?(config) do
           Process.send_after(self(), {:revive, id}, state.revive_delay_ms)
         end
 

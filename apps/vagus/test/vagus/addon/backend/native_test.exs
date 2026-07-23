@@ -567,6 +567,26 @@ defmodule Vagus.Addon.Backend.NativeTest do
       refute_receive {:revive_called, _}, 400
     end
 
+    test "no revive when a manual stop raced the DOWN (State already :stopped at demote)" do
+      test = self()
+      id = unique_id()
+      config = %{boot: "auto", slug: Native.slug_from_id(id)}
+
+      sentinel =
+        start_revive_sentinel(:"rv_#{System.unique_integer([:positive])}", config, fn cfg ->
+          send(test, {:revive_called, cfg})
+          {:ok, %{}}
+        end)
+
+      # Manual-stop shape: Manager.stop recorded :stopped BEFORE the broker
+      # died, and the unwatch cast lost the race with the DOWN.
+      :persistent_term.put({ReviveState, :entry}, {:ok, %{state: :stopped, config: config}})
+      kill_watched_broker(sentinel, id)
+
+      # Demotion may still (redundantly) put :stopped, but no revive fires.
+      refute_receive {:revive_called, _}, 500
+    end
+
     test "no revive for a non-auto add-on" do
       test = self()
       id = unique_id()
