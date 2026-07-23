@@ -118,6 +118,15 @@ defmodule Vagus.MixProject do
       # consumer via the /run/dbus bind (see Vagus.Bluetooth).
       {:bluez, "~> 0.1.0"},
 
+      # Improv-over-BLE Wi-Fi provisioning (bluetooth phase 2): on an
+      # offline boot the Pi advertises the Improv service so the HA
+      # companion app can provision wlan0 before HA Core exists (the
+      # engine — and with it Core — is already gated on :internet by
+      # Vagus.Engine.Manager). Untargeted like :bluez: the host build
+      # needs it for the pure child-spec/gate tests; nothing starts it
+      # off-target. See Vagus.Improv.
+      {:improv, "~> 0.1.1"},
+
       # bluez's compile-time macro dep, overridden as a git checkout pinned
       # to its release tag: the hex package's mix.exs derives its version
       # from `git describe --always --tags` at compile time, and a hex dep
