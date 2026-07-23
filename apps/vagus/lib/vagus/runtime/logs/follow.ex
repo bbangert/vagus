@@ -131,12 +131,17 @@ defmodule Vagus.Runtime.Logs.Follow do
   end
 
   def handle_info(msg, %{conn: conn} = state) when not is_nil(conn) do
-    if state.awaiting_ack? do
+    case state do
       # Socket was re-armed exactly once by the previous stream/2 call, so
-      # only one message can land here; hold it until the owner acks.
-      {:noreply, %{state | stashed: msg}}
-    else
-      process_socket_msg(msg, state)
+      # exactly one message can land while awaiting the ack. Matching on
+      # `stashed: nil` makes a violation of that Mint invariant crash this
+      # :temporary process loudly (owner gets :DOWN via its link/monitor)
+      # instead of silently overwriting — and desyncing — the HTTP parse.
+      %{awaiting_ack?: true, stashed: nil} ->
+        {:noreply, %{state | stashed: msg}}
+
+      %{awaiting_ack?: false} ->
+        process_socket_msg(msg, state)
     end
   end
 

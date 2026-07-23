@@ -71,6 +71,13 @@ defmodule Vagus.Mqtt.Broker.Logs do
   end
 
   @impl GenServer
+  # DELIBERATE asymmetry with the docker follow path (which ack-gates its
+  # reads): this fan-out has no backpressure, so a slow /logs/follow client
+  # blocked in chunk/2 queues {:broker_log, _} in the request process's
+  # mailbox. Bounded in practice by this buffer's own event rate (broker
+  # telemetry, a few lines/sec at worst) and by dead-client teardown
+  # (chunk error / idle window) — an ack protocol here would buy nothing
+  # measurable for the complexity.
   def handle_cast({:append, line}, state) do
     Enum.each(state.subscribers, fn {pid, _ref} -> send(pid, {:broker_log, line}) end)
     {:noreply, %{state | lines: Enum.take([line | state.lines], @max)}}

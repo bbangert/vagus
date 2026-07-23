@@ -113,6 +113,25 @@ defmodule Vagus.Runtime.Logs.FollowTest do
     assert_receive :log_eof, 2_000
   end
 
+  test "eof arriving while awaiting ack is held, then delivered after the ack", %{
+    path: path,
+    listen: listen
+  } do
+    {:ok, pid} = Follow.start_link(owner: self(), ref: "addon_demo", socket: path)
+    {sock, _head} = accept_conn(listen)
+    send_headers(sock)
+
+    send_chunk(sock, frame(1, "last\n"))
+    assert_receive {:log_chunk, "last\n"}, 2_000
+
+    # Terminal chunk lands while un-acked: it must be stashed, not processed.
+    send_final_chunk(sock)
+    refute_receive :log_eof, 150
+
+    Follow.ack(pid)
+    assert_receive :log_eof, 2_000
+  end
+
   test "owner death closes the held docker connection (no leak)", %{
     path: path,
     listen: listen

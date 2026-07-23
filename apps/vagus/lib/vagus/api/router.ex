@@ -1117,7 +1117,7 @@ defmodule Vagus.API.Router do
         line -> render_line(line, fmt)
       end)
 
-    if byte_size(rest) > 1_048_576 do
+    if byte_size(rest) > Logs.max_pending() do
       {out <> render_line(rest, fmt), %{fmt | buf: ""}}
     else
       {out, %{fmt | buf: rest}}

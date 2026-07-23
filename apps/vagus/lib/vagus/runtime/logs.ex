@@ -40,6 +40,10 @@ defmodule Vagus.Runtime.Logs do
   # mirrors Vagus.Runtime.Events' pending-line cap.
   @max_pending 1_048_576
 
+  @doc "The partial-buffer cap shared by demux_stream/2 and the router's verbose line buffer."
+  @spec max_pending() :: pos_integer()
+  def max_pending, do: @max_pending
+
   @doc """
   Incremental sibling of `demux/1` for a live `--follow` stream, where a
   frame routinely straddles chunk boundaries (so `demux/1`, which needs the

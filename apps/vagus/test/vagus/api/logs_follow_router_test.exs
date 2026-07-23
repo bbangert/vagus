@@ -15,9 +15,12 @@ defmodule Vagus.API.LogsFollowRouterTest do
   defp sup(conn), do: put_req_header(conn, "authorization", "Bearer #{Vagus.API.Token.get()}")
 
   setup do
-    # Short idle window so native streams (which have no eof) end
-    # deterministically instead of holding for the production 15 min.
-    Application.put_env(:vagus, :follow_idle_ms, 300)
+    # Short idle window so streams without an eof end deterministically
+    # instead of holding for the production 15 min. 600ms (not lower): the
+    # idle-terminated tests are a POSITIVE race — subscribe/backfill/live
+    # delivery must all complete before the window fires — and this repo's
+    # CI has punished tight windows before.
+    Application.put_env(:vagus, :follow_idle_ms, 600)
     on_exit(fn -> Application.delete_env(:vagus, :follow_idle_ms) end)
     :ok
   end
@@ -248,6 +251,54 @@ defmodule Vagus.API.LogsFollowRouterTest do
 
     conn = Task.await(task, 5_000)
     assert conn.resp_body == "current-boot\n"
+  end
+
+  test "docker idle timeout tears down the Follow process and its engine conn" do
+    path = socket_path()
+    listen = start_fake_server(path)
+    with_docker_env(path)
+    test_pid = self()
+
+    task =
+      Task.async(fn ->
+        conn(:get, "/core/logs/follow") |> sup() |> Vagus.API.Router.call(@opts)
+      end)
+
+    {sock, _head} = accept_and_greet(listen)
+    send_frame(sock, "only-line\n")
+    # Then silence: the 600ms idle window must fire, stop the Follow, and
+    # the engine side must observe the connection close.
+    conn = Task.await(task, 5_000)
+    assert conn.status == 200
+    assert conn.resp_body == "only-line\n"
+
+    spawn(fn -> send(test_pid, {:recv, :gen_tcp.recv(sock, 0, 2_000)}) end)
+    assert_receive {:recv, {:error, :closed}}, 3_000
+  end
+
+  test "verbose reassembles a line split across two docker chunks" do
+    path = socket_path()
+    listen = start_fake_server(path)
+    with_docker_env(path)
+
+    task =
+      Task.async(fn ->
+        conn(:get, "/core/logs/follow?verbose") |> sup() |> Vagus.API.Router.call(@opts)
+      end)
+
+    {sock, _head} = accept_and_greet(listen)
+    # One log line, split mid-word across two chunked-transfer chunks —
+    # delivered as separate {:log_chunk, _} messages (the sleep defeats
+    # kernel coalescing); the router's line buffer must reassemble before
+    # applying the verbose prefix.
+    send_frame(sock, "2026-07-23T01:02:03Z hel")
+    Process.sleep(100)
+    send_frame(sock, "lo\n")
+    :gen_tcp.close(sock)
+
+    conn = Task.await(task, 5_000)
+    {:ok, host} = :inet.gethostname()
+    assert conn.resp_body == "2026-07-23 01:02:03.000 #{host} homeassistant: hello\n"
   end
 
   test "native follow with ?verbose prefixes host + ident (no source stamps)" do
