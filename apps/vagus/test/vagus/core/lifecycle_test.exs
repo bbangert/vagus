@@ -73,6 +73,27 @@ defmodule Vagus.Core.LifecycleTest do
     engine
   end
 
+  ## Deterministic "has a request reached the fake daemon yet" wait, for
+  ## tests that need to know a concurrent op is actually in flight (e.g.
+  ## holding the lock) before issuing a competing call — a bounded poll on
+  ## `FakeEngine.requests/1` instead of a fixed `Process.sleep/1` guess.
+  defp wait_until_request_logged(engine, deadline \\ nil) do
+    deadline = deadline || System.monotonic_time(:millisecond) + 1_000
+
+    case FakeEngine.requests(engine) do
+      [] ->
+        if System.monotonic_time(:millisecond) >= deadline do
+          flunk("Vagus.Test.FakeEngine: no request reached the fake daemon within 1s")
+        else
+          Process.sleep(10)
+          wait_until_request_logged(engine, deadline)
+        end
+
+      _requests ->
+        :ok
+    end
+  end
+
   ## adopt/1
 
   describe "adopt/1" do
@@ -467,6 +488,101 @@ defmodule Vagus.Core.LifecycleTest do
       assert rollback_create.body["Image"] == Container.image("2026.7.0")
     end
 
+    test "health-gate timeout, and the rollback recreate itself fails -> {:error, {:rollback_failed, _}}" do
+      engine =
+        start_engine([
+          pull_ok(),
+          {200, inspect_body(Container.image("2026.7.0"), true)},
+          {204, nil},
+          {204, nil},
+          create_ok("updated-id"),
+          {204, nil},
+          # rollback sequence: stop+remove the failed new container, then
+          # the recreate of the previous version fails (e.g. its image was
+          # pruned meanwhile).
+          {204, nil},
+          {204, nil},
+          {404, %{"message" => "No such image: home-assistant:2026.7.0"}}
+        ])
+
+      versions = start_versions("2026.7.0")
+
+      assert {:error, {:rollback_failed, _reason}} =
+               Lifecycle.update("2026.8.0",
+                 docker: [socket: engine.socket],
+                 versions: versions,
+                 health: health_fun(:timeout)
+               )
+
+      # set_installed already recorded the new (now-broken) version before
+      # the health gate ran; the rollback recreate failing means it never
+      # gets set back.
+      assert Versions.installed(versions) == "2026.8.0"
+
+      requests = FakeEngine.requests(engine)
+
+      assert Enum.map(requests, & &1.method) == [
+               :post,
+               :get,
+               :post,
+               :delete,
+               :post,
+               :post,
+               :post,
+               :delete,
+               :post
+             ]
+
+      rollback_create = Enum.at(requests, 8)
+      assert rollback_create.path == "/containers/create"
+      assert rollback_create.body["Image"] == Container.image("2026.7.0")
+    end
+
+    test "new-container create fails after the old one was removed -> rollback recreate succeeds" do
+      engine =
+        start_engine([
+          pull_ok(),
+          {200, inspect_body(Container.image("2026.7.0"), true)},
+          {204, nil},
+          {204, nil},
+          # the new container's create fails outright — it was never
+          # created, so the rollback recreate below skips straight to
+          # create+start of the previous version (nothing to remove).
+          {404, %{"message" => "No such image: home-assistant:2026.8.0"}},
+          create_ok("rollback-id"),
+          {204, nil}
+        ])
+
+      versions = start_versions("2026.7.0")
+
+      assert {:error, {:recreate_failed, _reason, :rolled_back}} =
+               Lifecycle.update("2026.8.0",
+                 docker: [socket: engine.socket],
+                 versions: versions,
+                 health: health_fun()
+               )
+
+      refute_receive :health_called, 100
+      assert Versions.installed(versions) == "2026.7.0"
+
+      requests = FakeEngine.requests(engine)
+
+      assert Enum.map(requests, & &1.method) == [
+               :post,
+               :get,
+               :post,
+               :delete,
+               :post,
+               :post,
+               :post
+             ]
+
+      rollback_create = Enum.at(requests, 5)
+      assert rollback_create.path == "/containers/create"
+      assert rollback_create.body["Image"] == Container.image("2026.7.0")
+      assert Enum.at(requests, 6).path == "/containers/rollback-id/start"
+    end
+
     test "same-version update -> {:error, :version_installed}, no requests" do
       engine = start_engine([])
       versions = start_versions("2026.7.0")
@@ -547,9 +663,11 @@ defmodule Vagus.Core.LifecycleTest do
         end)
 
       assert_receive :task_started, 1_000
-      # Give the task time to connect and be blocked inside the stalling
-      # response, well before its 300ms delay elapses.
-      Process.sleep(50)
+      # Wait for the task's request to actually reach the fake daemon (and
+      # therefore for the lock to actually be held) before firing the
+      # competing call — deterministic and immune to scheduler jitter,
+      # unlike a fixed sleep racing the same 300ms delay below.
+      wait_until_request_logged(engine)
 
       assert {:error, :busy} = Lifecycle.stop(docker: [socket: engine.socket])
 

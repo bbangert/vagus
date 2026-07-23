@@ -95,6 +95,22 @@ defmodule Vagus.Core.VersionsTest do
       versions = start_versions(path: path, fetch: never_fetch())
       assert Versions.installed(versions) == nil
     end
+
+    test "a corrupt/malformed-JSON file is treated like a missing one, and a later set_installed repairs it" do
+      path = tmp_path()
+      on_exit(fn -> File.rm(path) end)
+      :ok = File.mkdir_p(Path.dirname(path))
+      File.write!(path, "not json { at all")
+
+      versions1 = start_versions(path: path, fetch: never_fetch())
+      assert Versions.installed(versions1) == nil
+
+      assert :ok = Versions.set_installed("2026.7.4", versions1)
+      stop_supervised!(versions1)
+
+      versions2 = start_versions(path: path, fetch: never_fetch())
+      assert Versions.installed(versions2) == "2026.7.4"
+    end
   end
 
   describe "seed/2 only-if-nil semantics" do
@@ -231,6 +247,97 @@ defmodule Vagus.Core.VersionsTest do
     test "installed != latest -> true" do
       versions = with_versions("2026.7.0", {:ok, "2026.7.5"})
       assert Versions.update_available?(versions)
+    end
+  end
+
+  describe "the fetch runs off the server loop" do
+    test "installed/1 is not blocked by a slow in-flight latest fetch" do
+      path = tmp_path()
+      on_exit(fn -> File.rm(path) end)
+      test_pid = self()
+
+      # Blocks on a message from the test rather than a fixed sleep, so the
+      # test controls exactly when the fetch is allowed to resolve.
+      fetch = fn ->
+        send(test_pid, {:fetch_invoked, self()})
+
+        receive do
+          :release -> {:ok, "2026.7.9"}
+        end
+      end
+
+      versions = start_versions(path: path, fetch: fetch)
+
+      latest_task = Task.async(fn -> Versions.latest(versions) end)
+
+      assert_receive {:fetch_invoked, fetch_pid}, 1_000
+
+      # The fetch is now parked mid-flight; the server's own mailbox is
+      # free, so installed/1 must return immediately rather than queue
+      # behind it.
+      assert Versions.installed(versions) == nil
+
+      send(fetch_pid, :release)
+      assert Task.await(latest_task) == "2026.7.9"
+    end
+
+    test "two concurrent latest calls during one in-flight fetch produce exactly one fetch invocation" do
+      path = tmp_path()
+      on_exit(fn -> File.rm(path) end)
+      test_pid = self()
+      counter = start_counter()
+
+      fetch = fn ->
+        Agent.update(counter, &(&1 + 1))
+        send(test_pid, {:fetch_invoked, self()})
+
+        receive do
+          :release -> {:ok, "2026.7.9"}
+        end
+      end
+
+      versions = start_versions(path: path, fetch: fetch)
+
+      task1 = Task.async(fn -> Versions.latest(versions) end)
+      assert_receive {:fetch_invoked, fetch_pid}, 1_000
+
+      # task1's call has already been fully processed by the server (state
+      # updated with in_flight set) by the time this message arrives, so
+      # task2 is guaranteed to join the pending queue instead of racing a
+      # second fetch.
+      task2 = Task.async(fn -> Versions.latest(versions) end)
+
+      send(fetch_pid, :release)
+
+      assert Task.await(task1) == "2026.7.9"
+      assert Task.await(task2) == "2026.7.9"
+      assert count(counter) == 1
+    end
+
+    test "a fetch process crash (no result) still replies to queued waiters via the stale cache" do
+      path = tmp_path()
+      on_exit(fn -> File.rm(path) end)
+      test_pid = self()
+
+      fetch = fn ->
+        send(test_pid, {:fetch_invoked, self()})
+
+        receive do
+          :crash -> raise "boom"
+        end
+      end
+
+      versions = start_versions(path: path, fetch: fetch)
+
+      latest_task = Task.async(fn -> Versions.latest(versions) end)
+      assert_receive {:fetch_invoked, fetch_pid}, 1_000
+
+      send(fetch_pid, :crash)
+      assert Task.await(latest_task) == nil
+
+      # The server itself must have survived the crash (spawn_monitor, not
+      # a link) and still answers normally afterward.
+      assert Versions.installed(versions) == nil
     end
   end
 end

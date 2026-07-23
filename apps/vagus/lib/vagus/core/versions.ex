@@ -50,6 +50,38 @@ defmodule Vagus.Core.Versions do
   internet on this device class) rather than exceptional, so it does not
   warn.
 
+  ## The fetch never blocks the server loop
+
+  A cache-miss/stale fetch is a Finch HTTP request with a 10s
+  `receive_timeout`, but every caller reaches this GenServer via
+  `GenServer.call/2`'s default 5s timeout. Running the fetch inline inside
+  `handle_call/3` would let a slow/dead network wedge the *whole* server
+  for up to 10s: `installed/1`, `set_installed/2`, `seed/2`, and any other
+  in-flight `latest/1`/`update_available?/1` caller would all queue behind
+  one unrelated HTTP request, and the original caller would itself time
+  out at 5s while the server kept blocking.
+
+  So `handle_call(:latest, ...)` / `handle_call(:update_available?, ...)`
+  only ever reply synchronously from a *fresh* cache. On a stale/absent
+  cache they queue the caller's `from` (tagged with which reply shape it
+  wants) in `state.pending` and return `{:noreply, state}` — the mailbox
+  stays open for `installed/1` etc. in the meantime. The actual fetch runs
+  in a `spawn_monitor/1`-ed one-shot process (not a linked `Task`, so a
+  crash there can never take this GenServer down with it); the server
+  learns the outcome via an ordinary message plus a `:DOWN` for the crash
+  case, updates the cache exactly like the old inline path did, and then
+  `GenServer.reply/2`s every queued waiter — `update_available?` waiters
+  are computed from the *current* `state.installed` at reply time, not
+  whatever it was when they were queued. At most one fetch runs at a time:
+  a caller arriving while one is already in flight just joins the queue
+  instead of starting a second request. A crash (`:DOWN` with no prior
+  result message) falls back to the stale-cache-or-nil value for every
+  queued waiter, same as a `{:error, _}` from `fetch.()`.
+
+  `installed/1`, `set_installed/2`, and `seed/2` never touch `pending` or
+  `in_flight` — they always reply immediately regardless of what `latest`
+  is doing.
+
   ## Options (all injectable)
 
     * `:name` - GenServer name, defaults to `__MODULE__`.
@@ -59,8 +91,10 @@ defmodule Vagus.Core.Versions do
       to `System.monotonic_time(:millisecond)`. Tests inject a controllable
       clock to exercise the 24h cache without sleeping.
     * `:fetch` - zero-arity function performing the actual upstream fetch,
-      returning `{:ok, String.t()} | {:error, term()}`. Defaults to a Finch
-      GET through the `Vagus.Core.Finch` pool with a 10s receive timeout.
+      returning `{:ok, String.t()} | {:error, term()}`. Runs inside the
+      spawned fetch process, not the GenServer itself (see "The fetch
+      never blocks the server loop" above). Defaults to a Finch GET
+      through the `Vagus.Core.Finch` pool with a 10s receive timeout.
       Tests inject a stub so `latest/1` never makes a real HTTP call.
   """
 
@@ -134,7 +168,12 @@ defmodule Vagus.Core.Versions do
       now: Keyword.get(opts, :now, &default_now/0),
       fetch: Keyword.get(opts, :fetch, &default_fetch/0),
       # `nil` (never fetched) or `%{value: String.t() | nil, fetched_at: integer()}`.
-      latest_cache: nil
+      latest_cache: nil,
+      # Callers queued behind an in-flight fetch: `{GenServer.from(), :latest | :update_available?}`.
+      pending: [],
+      # `nil` or `%{pid: pid(), correlation_ref: reference(), monitor_ref: reference()}`
+      # for the one fetch process allowed to run at a time.
+      in_flight: nil
     }
 
     {:ok, state}
@@ -160,43 +199,102 @@ defmodule Vagus.Core.Versions do
     {:reply, :ok, %{state | installed: version}}
   end
 
-  def handle_call(:latest, _from, state) do
-    {value, new_state} = resolve_latest(state)
-    {:reply, value, new_state}
+  def handle_call(:latest, from, state) do
+    case fresh_cache_value(state) do
+      {:fresh, value} -> {:reply, value, state}
+      :stale -> {:noreply, enqueue_and_maybe_fetch(state, from, :latest)}
+    end
   end
 
-  def handle_call(:update_available?, _from, state) do
-    {latest_value, new_state} = resolve_latest(state)
+  def handle_call(:update_available?, from, state) do
+    case fresh_cache_value(state) do
+      {:fresh, value} -> {:reply, update_available_result(state.installed, value), state}
+      :stale -> {:noreply, enqueue_and_maybe_fetch(state, from, :update_available?)}
+    end
+  end
 
-    result =
-      is_binary(state.installed) and is_binary(latest_value) and latest_value != state.installed
+  @impl GenServer
+  def handle_info(
+        {:versions_fetch_result, ref, result},
+        %{in_flight: %{correlation_ref: ref, monitor_ref: monitor_ref}} = state
+      ) do
+    Process.demonitor(monitor_ref, [:flush])
+    state = apply_fetch_result(state, result)
+    reply_waiters(state)
+    {:noreply, %{state | pending: [], in_flight: nil}}
+  end
 
-    {:reply, result, new_state}
+  def handle_info(
+        {:DOWN, monitor_ref, :process, _pid, _reason},
+        %{in_flight: %{monitor_ref: monitor_ref}} = state
+      ) do
+    reply_waiters(state)
+    {:noreply, %{state | pending: [], in_flight: nil}}
+  end
+
+  def handle_info(msg, state) do
+    Logger.debug("Vagus.Core.Versions: unexpected message #{inspect(msg)}")
+    {:noreply, state}
   end
 
   ## Internals — latest/cache
 
-  defp resolve_latest(state) do
+  defp fresh_cache_value(state) do
     now_ms = state.now.()
 
     case state.latest_cache do
       %{value: value, fetched_at: fetched_at} when now_ms - fetched_at < @cache_ttl_ms ->
-        {value, state}
+        {:fresh, value}
 
       _stale_or_absent ->
-        do_fetch(state, now_ms)
+        :stale
     end
   end
 
-  defp do_fetch(state, now_ms) do
-    case state.fetch.() do
-      {:ok, version} ->
-        {version, %{state | latest_cache: %{value: version, fetched_at: now_ms}}}
+  defp enqueue_and_maybe_fetch(state, from, kind) do
+    state = %{state | pending: [{from, kind} | state.pending]}
+    if state.in_flight, do: state, else: start_fetch(state)
+  end
 
-      {:error, reason} ->
-        Logger.debug("Vagus.Core.Versions: latest fetch failed (#{inspect(reason)})")
-        {cached_value_or_nil(state.latest_cache), state}
-    end
+  defp start_fetch(state) do
+    correlation_ref = make_ref()
+    parent = self()
+    fetch = state.fetch
+
+    {pid, monitor_ref} =
+      spawn_monitor(fn ->
+        send(parent, {:versions_fetch_result, correlation_ref, fetch.()})
+      end)
+
+    %{
+      state
+      | in_flight: %{pid: pid, correlation_ref: correlation_ref, monitor_ref: monitor_ref}
+    }
+  end
+
+  defp apply_fetch_result(state, {:ok, version}) do
+    %{state | latest_cache: %{value: version, fetched_at: state.now.()}}
+  end
+
+  defp apply_fetch_result(state, {:error, reason}) do
+    Logger.debug("Vagus.Core.Versions: latest fetch failed (#{inspect(reason)})")
+    state
+  end
+
+  defp reply_waiters(state) do
+    latest_value = cached_value_or_nil(state.latest_cache)
+
+    Enum.each(state.pending, fn
+      {from, :latest} ->
+        GenServer.reply(from, latest_value)
+
+      {from, :update_available?} ->
+        GenServer.reply(from, update_available_result(state.installed, latest_value))
+    end)
+  end
+
+  defp update_available_result(installed, latest_value) do
+    is_binary(installed) and is_binary(latest_value) and latest_value != installed
   end
 
   defp cached_value_or_nil(%{value: value}), do: value

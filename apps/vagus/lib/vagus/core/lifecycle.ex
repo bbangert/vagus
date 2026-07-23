@@ -54,6 +54,27 @@ defmodule Vagus.Core.Lifecycle do
   doesn't have (its `rollback_version` capture has its own "no rollback
   version" issue path, `core.py:454-456`, which this mirrors).
 
+  A create/start failure recreating the **new** target version in
+  `update/2` (after the old container has already been stopped+removed) is
+  treated the same as a health-gate timeout: v1 attempts the same
+  rollback-recreate of the previous version, returning
+  `{:error, {:recreate_failed, reason, :rolled_back}}` on success or
+  `{:error, {:recreate_failed, reason, :no_rollback_version}}` when there's
+  nothing to roll back to (mirroring `rollback/2`'s own
+  `:no_rollback_version` case) — without this, a create/start failure at
+  that specific point would otherwise leave Core absent with no container
+  at all, unlike every other failure path in this module.
+
+  `start/1`'s tag-mismatch recreate and `rebuild/1`'s recreate do **not**
+  get the same rollback treatment: both recreate the container from the
+  *currently installed* version — there is no "previous version" different
+  from the one that just failed, so a rollback-recreate there would just
+  retry the identical create/start call and fail identically. A
+  create/start failure in either path deliberately leaves Core absent (no
+  landingpage fallback, matching the "no image pull" stance above); the op
+  is explicit and safely retryable once the underlying failure (bad image,
+  disk full, whatever) is fixed.
+
   ## The reuse-vs-recreate rule
 
   A container is only ever **reused** (plain `docker start`/`restart`, no
@@ -77,6 +98,23 @@ defmodule Vagus.Core.Lifecycle do
   not-running update just swaps image+version, the container isn't
   started, and the whole point of the health gate — verifying the new
   Core actually comes up — doesn't apply to a container that stays down).
+
+  ## Non-atomicity
+
+  The multi-step `update/2`/rollback sequence (stop → remove → create →
+  start → `set_installed` → health-gate → maybe-rollback) is **not
+  atomic** — it's a sequence of independent Engine-API calls plus a
+  `Versions.set_installed/2` persist, not a single transaction. A
+  mid-sequence BEAM restart (crash, deploy, power loss) can leave
+  `Vagus.Core.Versions.installed/1` and the actual container state
+  transiently out of sync — e.g. the version file already updated but the
+  container not yet started, or vice versa. v1's stance is
+  reconcile-on-next-op, not crash-safety: the next `start/1`, `rebuild/1`,
+  or `update/2` reads whatever `Versions.installed/1` and the container's
+  actual state are at that moment and heals from there — the same
+  reuse-vs-recreate drift-healing this module already does for
+  hand-edited/stale containers — rather than this module tracking or
+  resuming a partially-applied operation itself.
 
   ## Serialization — one non-blocking global mutex
 
@@ -201,7 +239,13 @@ defmodule Vagus.Core.Lifecycle do
   recreate+start the previous version, `set_installed/2` back to it —
   returning `{:error, {:health_timeout, :rolled_back}}`, or
   `{:error, {:rollback_failed, reason}}` if the rollback recreate itself
-  fails. Success returns `{:ok, version}`.
+  fails. If the new container's create/start itself fails (before the
+  health gate even runs), the same rollback-recreate is attempted:
+  `{:error, {:recreate_failed, reason, :rolled_back}}` on a successful
+  rollback, `{:error, {:rollback_failed, reason2}}` if that rollback also
+  fails, or `{:error, {:recreate_failed, reason, :no_rollback_version}}`
+  when there's no previous version to roll back to. Success returns
+  `{:ok, version}`.
   """
   @spec update(String.t() | nil, keyword()) :: {:ok, String.t()} | {:error, term()}
   def update(version \\ nil, opts \\ []) do
@@ -375,16 +419,37 @@ defmodule Vagus.Core.Lifecycle do
   end
 
   defp finish_update(true, target, rollback_version, opts) do
-    with {:ok, id} <- do_create(target, opts),
-         :ok <- Docker.start_container(id, docker_opts(opts)) do
-      Versions.set_installed(target, versions_server(opts))
-
-      case health_gate(opts) do
-        :ok -> {:ok, target}
-        {:error, :health_timeout} -> rollback(rollback_version, opts)
-      end
+    case do_create(target, opts) do
+      {:ok, id} -> finish_update_start(id, target, rollback_version, opts)
+      # Never created — nothing to remove before the rollback recreate.
+      {:error, reason} -> recreate_failed(reason, rollback_version, opts, remove_stale?: false)
     end
   end
+
+  defp finish_update_start(id, target, rollback_version, opts) do
+    case Docker.start_container(id, docker_opts(opts)) do
+      :ok ->
+        Versions.set_installed(target, versions_server(opts))
+
+        case health_gate(opts) do
+          :ok -> {:ok, target}
+          {:error, :health_timeout} -> rollback(rollback_version, opts)
+        end
+
+      {:error, reason} ->
+        # Created but never started — it's sitting under the fixed name and
+        # would conflict with the rollback recreate's own create call.
+        recreate_failed(reason, rollback_version, opts, remove_stale?: true)
+    end
+  end
+
+  ## Rollback — two triggers share the same "clean up the broken container,
+  ## recreate+start the previous version" mechanics (`recreate_previous/2`)
+  ## but return different error tags: a health-gate timeout (the new
+  ## container came up but failed its health check, so it's running and
+  ## needs a `stop` before it can be removed) vs. a create/start failure (the
+  ## new container never came up, so there's nothing to stop — and possibly
+  ## nothing to remove either, see `finish_update/4` above).
 
   defp rollback(nil, _opts) do
     {:error, {:health_timeout, :no_rollback_version}}
@@ -393,12 +458,36 @@ defmodule Vagus.Core.Lifecycle do
   defp rollback(rollback_version, opts) do
     with :ok <- Docker.stop_container(Container.name(), docker_opts(opts)),
          :ok <- Docker.remove_container(Container.name(), docker_opts(opts)),
-         {:ok, id} <- do_create(rollback_version, opts),
-         :ok <- Docker.start_container(id, docker_opts(opts)) do
-      Versions.set_installed(rollback_version, versions_server(opts))
+         :ok <- recreate_previous(rollback_version, opts) do
       {:error, {:health_timeout, :rolled_back}}
     else
       {:error, reason} -> {:error, {:rollback_failed, reason}}
+    end
+  end
+
+  defp recreate_failed(reason, nil, _opts, _remove_opt) do
+    {:error, {:recreate_failed, reason, :no_rollback_version}}
+  end
+
+  defp recreate_failed(reason, rollback_version, opts, remove_stale?: remove_stale?) do
+    with :ok <- maybe_remove_stale(remove_stale?, opts),
+         :ok <- recreate_previous(rollback_version, opts) do
+      {:error, {:recreate_failed, reason, :rolled_back}}
+    else
+      {:error, rollback_reason} -> {:error, {:rollback_failed, rollback_reason}}
+    end
+  end
+
+  defp maybe_remove_stale(false, _opts), do: :ok
+
+  defp maybe_remove_stale(true, opts),
+    do: Docker.remove_container(Container.name(), docker_opts(opts))
+
+  defp recreate_previous(rollback_version, opts) do
+    with {:ok, id} <- do_create(rollback_version, opts),
+         :ok <- Docker.start_container(id, docker_opts(opts)) do
+      Versions.set_installed(rollback_version, versions_server(opts))
+      :ok
     end
   end
 

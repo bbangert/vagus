@@ -795,6 +795,12 @@ defmodule Vagus.API.Router do
 
   # -- Core lifecycle (CL-P3-T1) ----------------------------------------------
   #
+  # Every route here is supervisor-only (Core drives start/stop/restart/
+  # rebuild/check/update from the frontend's Core dashboard; an add-on never
+  # manages Core's lifecycle) — a non-supervisor caller gets a 403 before any
+  # `Lifecycle`/`Health` call, via `supervisor_only/2` (same guard as the
+  # `/backups...` routes).
+  #
   # Every op funnels through `Vagus.Core.Lifecycle`'s single non-blocking
   # `:global.trans` mutex (see that module's moduledoc "Serialization"
   # section) — there is exactly one Core container, so a second lifecycle
@@ -910,33 +916,39 @@ defmodule Vagus.API.Router do
   # `start`/`stop`/`restart`/`rebuild` all share this shape: no request body,
   # `:ok` -> ok envelope, `{:error, reason}` -> mapped status below.
   defp core_lifecycle_action(conn, fun) do
-    case fun.() do
-      :ok -> Envelope.send_ok(conn, %{})
-      {:error, reason} -> send_core_lifecycle_error(conn, reason)
-    end
+    supervisor_only(conn, fn ->
+      case fun.() do
+        :ok -> Envelope.send_ok(conn, %{})
+        {:error, reason} -> send_core_lifecycle_error(conn, reason)
+      end
+    end)
   end
 
   defp core_check_action(conn) do
-    case core_health().check() do
-      :healthy -> Envelope.send_ok(conn, %{})
-      :unhealthy -> Envelope.send_error(conn, "Core frontend probe failed", 400)
-    end
+    supervisor_only(conn, fn ->
+      case core_health().check() do
+        :healthy -> Envelope.send_ok(conn, %{})
+        :unhealthy -> Envelope.send_error(conn, "Core frontend probe failed", 400)
+      end
+    end)
   end
 
   # Body validated BEFORE touching `Lifecycle` — a malformed `version` must
   # never reach the lock/pull machinery. Absent/`nil` -> `update(nil)`
   # (`Lifecycle` resolves that to `Versions.latest/1`).
   defp core_update_action(conn) do
-    case validate_core_update_version(conn.body_params) do
-      {:ok, version} ->
-        case core_lifecycle().update(version) do
-          {:ok, installed} -> Envelope.send_ok(conn, %{version: installed})
-          {:error, reason} -> send_core_lifecycle_error(conn, reason)
-        end
+    supervisor_only(conn, fn ->
+      case validate_core_update_version(conn.body_params) do
+        {:ok, version} ->
+          case core_lifecycle().update(version) do
+            {:ok, installed} -> Envelope.send_ok(conn, %{version: installed})
+            {:error, reason} -> send_core_lifecycle_error(conn, reason)
+          end
 
-      {:error, message} ->
-        Envelope.send_error(conn, message, 400)
-    end
+        {:error, message} ->
+          Envelope.send_error(conn, message, 400)
+      end
+    end)
   end
 
   @core_version_tag_re ~r/\A[A-Za-z0-9][A-Za-z0-9._-]*\z/
@@ -994,6 +1006,14 @@ defmodule Vagus.API.Router do
 
   defp core_lifecycle_error_message({:rollback_failed, reason}),
     do: "Core update failed its health check and the rollback also failed: #{inspect(reason)}"
+
+  defp core_lifecycle_error_message({:recreate_failed, reason, :rolled_back}),
+    do:
+      "Failed to start the new Core version (#{inspect(reason)}): rolled back to the previous version"
+
+  defp core_lifecycle_error_message({:recreate_failed, reason, :no_rollback_version}),
+    do:
+      "Failed to start the new Core version (#{inspect(reason)}): no previous version to roll back to"
 
   defp core_lifecycle_error_message(reason), do: inspect(reason)
 
@@ -1551,8 +1571,10 @@ defmodule Vagus.API.Router do
 
   # -- backup helpers (M4-P6-T2; §A4) -----------------------------------------
 
-  # Shared supervisor-only-caller guard for every `/backups...` route — Core
-  # drives backups from the frontend, an add-on never manages backups.
+  # Shared supervisor-only-caller guard for every `/backups...` route and the
+  # `/core...`/`/homeassistant...` lifecycle routes above — Core drives
+  # backups and its own lifecycle from the frontend, an add-on never manages
+  # either.
   defp supervisor_only(conn, fun) do
     if conn.assigns.caller == :supervisor,
       do: fun.(),

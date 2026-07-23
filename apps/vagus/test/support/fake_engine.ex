@@ -32,7 +32,13 @@ defmodule Vagus.Test.FakeEngine do
   log) directly, polling its mailbox between accepts — a supervised OTP
   process would outlive the one test that owns it for no benefit, and
   `stop/1` (called from each test's `on_exit`) is what actually bounds its
-  lifetime, exactly like `events_test.exs`'s fake listener.
+  lifetime, exactly like `events_test.exs`'s fake listener. A request is
+  logged (and its response popped off the script) as soon as it's fully
+  read — sending the response itself (honoring any scripted `delay:`)
+  happens in a separate, unlinked, fire-and-forget process per connection,
+  so a stalling response can't also delay `requests/1` from reflecting a
+  request that has already arrived, nor block the loop from accepting the
+  next connection.
 
   ## Usage
 
@@ -121,20 +127,27 @@ defmodule Vagus.Test.FakeEngine do
   end
 
   defp serve(sock, state) do
-    state =
-      case read_request(sock) do
-        {:ok, method, path, query, body} ->
-          {resp, responses} = pop_response(state.responses)
+    case read_request(sock) do
+      {:ok, method, path, query, body} ->
+        {resp, responses} = pop_response(state.responses)
+        entry = %{method: method, path: path, query: query, body: body}
+
+        # The response — including any scripted `delay:` — is sent from a
+        # short-lived spawned process, not this accept loop, so a stalling
+        # response can't also stall the request being recorded (`requests/1`
+        # reflects it immediately) or the loop's ability to keep polling its
+        # mailbox/accepting while that response is held open.
+        spawn(fn ->
           send_scripted(sock, resp)
-          entry = %{method: method, path: path, query: query, body: body}
-          %{state | responses: responses, log: [entry | state.log]}
+          :gen_tcp.close(sock)
+        end)
 
-        {:error, _reason} ->
-          state
-      end
+        %{state | responses: responses, log: [entry | state.log]}
 
-    :gen_tcp.close(sock)
-    state
+      {:error, _reason} ->
+        :gen_tcp.close(sock)
+        state
+    end
   end
 
   defp pop_response([next | rest]), do: {next, rest}

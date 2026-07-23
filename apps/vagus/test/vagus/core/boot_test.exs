@@ -53,7 +53,11 @@ defmodule Vagus.Core.BootTest do
         )
 
         assert_receive :adopt_called, 1_000
-        # give a moment to confirm adopt is NOT called again
+        # give a moment to confirm adopt is NOT called again — also long
+        # enough for the `Logger.info/1` call right after `adopt.()` returns
+        # (same process, so it runs synchronously, immediately after the
+        # message send) to land in the `capture_log` device before it's read
+        # below.
         Process.sleep(20)
       end)
 
@@ -107,6 +111,9 @@ defmodule Vagus.Core.BootTest do
         )
 
         assert_receive :adopt_called, 1_000
+        # Same reasoning as the "adopted" test above: `Logger.warning/1` runs
+        # synchronously right after `adopt.()` returns, in the same process;
+        # this just gives the capture_log device a moment to flush it.
         Process.sleep(20)
       end)
 

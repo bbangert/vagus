@@ -56,6 +56,7 @@ defmodule Vagus.API.CoreLifecycleRouterTest do
   use ExUnit.Case, async: false
   use Plug.Test
 
+  alias Vagus.Addon.Registry
   alias Vagus.API.CoreLifecycleRouterTest.{StubHealth, StubLifecycle}
   alias Vagus.API.{Router, Token}
   alias Vagus.Core.Versions
@@ -67,6 +68,24 @@ defmodule Vagus.API.CoreLifecycleRouterTest do
     stop: "/core/stop",
     restart: "/core/restart",
     rebuild: "/core/rebuild"
+  ]
+
+  # All 12 supervisor-only routes (6 `/core/...` + their `/homeassistant/...`
+  # aliases) — B1 fix: an `{:addon, _}` caller must 403 before either stub is
+  # touched.
+  @all_supervisor_only_routes [
+    "/core/start",
+    "/core/stop",
+    "/core/restart",
+    "/core/rebuild",
+    "/core/check",
+    "/core/update",
+    "/homeassistant/start",
+    "/homeassistant/stop",
+    "/homeassistant/restart",
+    "/homeassistant/rebuild",
+    "/homeassistant/check",
+    "/homeassistant/update"
   ]
 
   setup do
@@ -103,6 +122,25 @@ defmodule Vagus.API.CoreLifecycleRouterTest do
     conn = conn(:post, path, body && Jason.encode!(body))
     conn = if body, do: req_json(conn), else: conn
     conn |> authed() |> call()
+  end
+
+  # Same add-on-caller registration mechanism as
+  # `Vagus.API.BackupRouterTest`'s `addon_call/3`: a `Vagus.Addon.Registry`
+  # token resolves `conn.assigns.caller` to `{:addon, %{slug: ...}}` via the
+  # `x-supervisor-token` header, instead of the `Authorization: Bearer`
+  # supervisor token `authed/1` uses above.
+  defp addon_call(path) do
+    token = "tok-#{System.unique_integer([:positive])}"
+    slug = "core_forbidden_addon"
+
+    :ok =
+      Registry.register(token, %{slug: slug, services_role: %{}, auth_api: false, discovery: []})
+
+    on_exit(fn -> Registry.unregister_slug(slug) end)
+
+    conn(:post, path)
+    |> put_req_header("x-supervisor-token", token)
+    |> call()
   end
 
   defp stub_response(op, reply) do
@@ -151,6 +189,21 @@ defmodule Vagus.API.CoreLifecycleRouterTest do
       assert json_body(conn)["data"] == %{"version" => "2026.8.0"}
       assert_received {:core_lifecycle_call, :update, opts}
       assert Keyword.get(opts, :version) == "2026.8.0"
+    end
+  end
+
+  ## -- supervisor-only (B1) ----------------------------------------------------
+
+  describe "supervisor-only: an add-on caller is rejected before Lifecycle/Health is touched" do
+    for path <- @all_supervisor_only_routes do
+      test "POST #{path} -> 403 for an {:addon, _} caller, stub never called" do
+        conn = addon_call(unquote(path))
+
+        assert conn.status == 403
+        assert json_body(conn)["message"] == "unauthorized"
+        refute_received {:core_lifecycle_call, _op, _opts}
+        refute_received {:core_health_call, _opts}
+      end
     end
   end
 
@@ -304,6 +357,30 @@ defmodule Vagus.API.CoreLifecycleRouterTest do
 
       assert conn.status == 400
       assert json_body(conn)["message"] =~ "rollback also failed"
+    end
+
+    test "{:recreate_failed, reason, :rolled_back} -> 400" do
+      stub_response(
+        :update,
+        {:error, {:recreate_failed, {:http, 404, "no such image"}, :rolled_back}}
+      )
+
+      conn = post_("/core/update")
+
+      assert conn.status == 400
+      assert json_body(conn)["message"] =~ "rolled back to the previous version"
+    end
+
+    test "{:recreate_failed, reason, :no_rollback_version} -> 400" do
+      stub_response(
+        :update,
+        {:error, {:recreate_failed, {:http, 404, "no such image"}, :no_rollback_version}}
+      )
+
+      conn = post_("/core/update")
+
+      assert conn.status == 400
+      assert json_body(conn)["message"] =~ "no previous version to roll back to"
     end
 
     test "an unrecognized error term -> 400 with an inspected fallback message" do
