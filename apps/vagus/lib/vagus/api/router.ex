@@ -174,9 +174,11 @@ defmodule Vagus.API.Router do
   get "/host/disks/default/usage" do
     conn = fetch_query_params(conn)
 
+    # Clamped: the frontend asks for 3; deeper nesting only inflates the
+    # JSON (sizes are full-recursive regardless — see DiskBreakdown).
     max_depth =
       case Integer.parse(Map.get(conn.query_params, "max_depth", "1")) do
-        {depth, _rest} when depth > 0 -> depth
+        {depth, _rest} when depth > 0 -> min(depth, 8)
         _other -> 1
       end
 

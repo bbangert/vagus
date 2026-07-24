@@ -63,6 +63,12 @@ defmodule Vagus.API.HostHardwareRouterTest do
     assert json_data(conn)["id"] == "root"
   end
 
+  test "GET /host/disks/default/usage clamps an absurd max_depth" do
+    conn = get_authed("/host/disks/default/usage?max_depth=999999")
+    assert conn.status == 200
+    assert json_data(conn)["id"] == "root"
+  end
+
   test "GET /hardware/info returns devices + empty drives" do
     conn = get_authed("/hardware/info")
 
