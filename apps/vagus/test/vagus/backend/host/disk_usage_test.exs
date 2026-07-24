@@ -39,4 +39,37 @@ defmodule Vagus.Backend.Host.DiskUsageTest do
       assert DiskUsage.usage_gb("/definitely/not/a/real/path/xyz") == {0.0, 0.0, 0.0}
     end
   end
+
+  describe "parse_bytes/1" do
+    test "parses the two-line df -k form into {total_bytes, free_bytes}" do
+      output = """
+      Filesystem     1K-blocks    Used Available Use% Mounted on
+      /dev/mmcblk0p3  28893840 7548120  19873456  28% /root
+      """
+
+      assert DiskUsage.parse_bytes(output) ==
+               {28_893_840 * 1024, 19_873_456 * 1024}
+    end
+
+    test "falls back to {0, 0} on malformed output" do
+      assert DiskUsage.parse_bytes("") == {0, 0}
+      assert DiskUsage.parse_bytes("just one line") == {0, 0}
+      assert DiskUsage.parse_bytes("header\n/dev/x not numbers here\n") == {0, 0}
+      assert DiskUsage.parse_bytes("header\ntoo few\n") == {0, 0}
+    end
+  end
+
+  describe "usage_bytes/1" do
+    test "returns non-negative integers for a real path" do
+      {total, free} = DiskUsage.usage_bytes(".")
+
+      assert is_integer(total) and total > 0
+      assert is_integer(free) and free >= 0
+      assert free <= total
+    end
+
+    test "falls back to {0, 0} for a path df can't stat" do
+      assert DiskUsage.usage_bytes("/definitely/not/a/real/path/xyz") == {0, 0}
+    end
+  end
 end

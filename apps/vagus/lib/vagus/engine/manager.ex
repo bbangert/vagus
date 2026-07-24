@@ -106,6 +106,10 @@ defmodule Vagus.Engine.Manager do
   @spec daemon_args() :: [String.t()]
   def daemon_args, do: @daemon_args
 
+  @doc "The engine's --data-root (volumes live under `<data_root>/volumes`)."
+  @spec data_root() :: String.t()
+  def data_root, do: @data_root
+
   @impl GenServer
   def init(opts) do
     daemon_supervisor =

@@ -58,6 +58,10 @@ defmodule Vagus.Core.Container do
     Application.get_env(:vagus, :core_container) || @default_name
   end
 
+  @doc "The named docker volume holding Core's /config (see mounts/0)."
+  @spec config_volume() :: String.t()
+  def config_volume, do: "vagus-core-config"
+
   @doc "The Core image reference for `version`, e.g. `ghcr.io/home-assistant/home-assistant:2026.7.0`."
   @spec image(String.t()) :: String.t()
   def image(version) when is_binary(version), do: @image_repo <> ":" <> version
