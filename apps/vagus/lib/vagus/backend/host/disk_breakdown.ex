@@ -106,32 +106,8 @@ defmodule Vagus.Backend.Host.DiskBreakdown do
     case File.ls(path) do
       {:ok, entries} ->
         {size, children} =
-          Enum.reduce(entries, {0, []}, fn entry, {size, children} ->
-            child_path = Path.join(path, entry)
-
-            case File.lstat(child_path) do
-              {:ok, %File.Stat{type: :symlink}} ->
-                {size, children}
-
-              {:ok, %File.Stat{type: :directory}} ->
-                child = dir_sizes(child_path, depth - 1)
-
-                children =
-                  if child.used_bytes > 0 and depth > 1 do
-                    [Map.merge(%{id: entry, label: entry}, child) | children]
-                  else
-                    children
-                  end
-
-                {size + child.used_bytes, children}
-
-              {:ok, %File.Stat{size: file_size}} ->
-                {size + file_size, children}
-
-              # Raced deletion or unreadable entry — skip, like upstream.
-              {:error, _reason} ->
-                {size, children}
-            end
+          Enum.reduce(entries, {0, []}, fn entry, acc ->
+            add_entry(Path.join(path, entry), entry, depth, acc)
           end)
 
         if children == [] do
@@ -143,6 +119,32 @@ defmodule Vagus.Backend.Host.DiskBreakdown do
       # Missing/unlistable dir reports honest zero (upstream: not exists).
       {:error, _reason} ->
         %{used_bytes: 0}
+    end
+  end
+
+  defp add_entry(child_path, entry, depth, {size, children}) do
+    case File.lstat(child_path) do
+      {:ok, %File.Stat{type: :symlink}} ->
+        {size, children}
+
+      {:ok, %File.Stat{type: :directory}} ->
+        child = dir_sizes(child_path, depth - 1)
+
+        children =
+          if child.used_bytes > 0 and depth > 1 do
+            [Map.merge(%{id: entry, label: entry}, child) | children]
+          else
+            children
+          end
+
+        {size + child.used_bytes, children}
+
+      {:ok, %File.Stat{size: file_size}} ->
+        {size + file_size, children}
+
+      # Raced deletion or unreadable entry — skip, like upstream.
+      {:error, _reason} ->
+        {size, children}
     end
   end
 

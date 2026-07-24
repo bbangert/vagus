@@ -77,6 +77,11 @@ defmodule Vagus.Backend.Host.Hardware do
 
   # The kernel's own udev-property subset. DEVNAME here is what makes
   # dev_path honest for nested nodes (e.g. "input/event0").
+  #
+  # `sysfs` is built from /sys/class directory enumeration + symlink
+  # resolution — never request input — so no user-controlled traversal
+  # is possible.
+  # sobelow_skip ["Traversal.FileModule"]
   defp read_uevent(sysfs) do
     case File.read(Path.join(sysfs, "uevent")) do
       {:ok, contents} ->

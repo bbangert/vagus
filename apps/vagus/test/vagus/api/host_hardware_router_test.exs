@@ -11,6 +11,7 @@ defmodule Vagus.API.HostHardwareRouterTest do
   import Plug.Test
   import Plug.Conn
 
+  alias Vagus.Addon.Registry
   alias Vagus.API.{Router, Token}
 
   @opts Router.init([])
@@ -18,6 +19,20 @@ defmodule Vagus.API.HostHardwareRouterTest do
   defp get_authed(path) do
     conn(:get, path)
     |> put_req_header("authorization", "Bearer " <> Token.get())
+    |> Router.call(@opts)
+  end
+
+  defp get_as_addon(path) do
+    token = "tok-#{System.unique_integer([:positive])}"
+    slug = "host_hardware_test_addon"
+
+    :ok =
+      Registry.register(token, %{slug: slug, services_role: %{}, auth_api: false, discovery: []})
+
+    on_exit(fn -> Registry.unregister_slug(slug) end)
+
+    conn(:get, path)
+    |> put_req_header("x-supervisor-token", token)
     |> Router.call(@opts)
   end
 
@@ -56,12 +71,13 @@ defmodule Vagus.API.HostHardwareRouterTest do
     assert is_list(data["devices"])
     assert data["drives"] == []
 
-    # The dev machine's real /sys guarantees at least one device; every
-    # entry carries the full upstream device_struct key set.
-    assert [device | _rest] = data["devices"]
-
-    assert Map.keys(device) |> Enum.sort() ==
-             ~w(attributes by_id children dev_path name subsystem sysfs)
+    # This route reads the REAL /sys — a minimal CI sandbox may expose
+    # nothing, so the per-device shape assertion is conditional here (the
+    # fixture-backed Vagus.Backend.Host.HardwareTest pins it exactly).
+    for device <- Enum.take(data["devices"], 5) do
+      assert Map.keys(device) |> Enum.sort() ==
+               ~w(attributes by_id children dev_path name subsystem sysfs)
+    end
   end
 
   test "GET /os/datadisk/list returns honestly empty lists" do
@@ -80,5 +96,16 @@ defmodule Vagus.API.HostHardwareRouterTest do
       conn = conn(:get, path) |> Router.call(@opts)
       assert conn.status == 401, "#{path} did not 401 without a token"
     end
+  end
+
+  # Upstream role parity (supervisor api/middleware/security.py): the
+  # disks-usage and datadisk paths are manager-role/Core tier (`/host/.+`,
+  # `/os/...` are NOT in the default-role table) → supervisor_only here;
+  # /hardware/info matches the default-role `/.+/info` pattern → any
+  # API-enabled add-on may read it.
+  test "an {:addon, _} caller gets 403 on the supervisor-tier routes, 200 on hardware" do
+    assert get_as_addon("/host/disks/default/usage").status == 403
+    assert get_as_addon("/os/datadisk/list").status == 403
+    assert get_as_addon("/hardware/info").status == 200
   end
 end

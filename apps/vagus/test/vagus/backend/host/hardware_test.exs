@@ -54,6 +54,15 @@ defmodule Vagus.Backend.Host.HardwareTest do
     assert device.dev_path == Path.join(ctx.dev_root, "input/event0")
   end
 
+  test "malformed uevent lines are dropped; well-formed ones still parse", ctx do
+    add_device(ctx, "misc", "weird", "GOOD=value\nno-equals-line\nALSO_GOOD=a=b\n\n")
+
+    %{devices: [device]} = Hardware.info(sys_class: ctx.sys_class, dev_root: ctx.dev_root)
+
+    # parts: 2 keeps everything after the first "=" intact.
+    assert device.attributes == %{"GOOD" => "value", "ALSO_GOOD" => "a=b"}
+  end
+
   test "a device without DEVNAME gets a dev_path only when the node exists", ctx do
     add_device(ctx, "net", "eth0", "INTERFACE=eth0\nIFINDEX=2\n")
     add_device(ctx, "block", "mmcblk0", "")

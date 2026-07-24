@@ -151,9 +151,13 @@ defmodule Vagus.API.Router do
   end
 
   # Storage page's Move-data-disk dialog (CW survey P1) — honestly empty,
-  # see the model's moduledoc.
+  # see the model's moduledoc. supervisor_only: upstream allows
+  # `/os/(?!datadisk/wipe).+` to manager-role+ only, same tier note as
+  # /host/disks/default/usage above.
   get "/os/datadisk/list" do
-    Envelope.send_ok(conn, DatadiskList.build!(%{devices: [], disks: []}))
+    supervisor_only(conn, fn ->
+      Envelope.send_ok(conn, DatadiskList.build!(%{devices: [], disks: []}))
+    end)
   end
 
   get "/host/info" do
@@ -163,6 +167,10 @@ defmodule Vagus.API.Router do
   # Storage page breakdown chart + backup-settings UI (CW survey P1).
   # `max_depth` query param defaults to 1 like upstream; a non-integer
   # value falls back rather than erroring (upstream behavior).
+  # supervisor_only: upstream's security middleware allows this path to
+  # manager-role add-ons and Core only (`/host/.+` is NOT in the
+  # default-role table) — Vagus's v1 equivalent of that tier is the
+  # supervisor gate, same call the /backups routes made.
   get "/host/disks/default/usage" do
     conn = fetch_query_params(conn)
 
@@ -172,13 +180,18 @@ defmodule Vagus.API.Router do
         _other -> 1
       end
 
-    Envelope.send_ok(
-      conn,
-      HostDisksUsage.build!(Backend.Host.DiskBreakdown.usage(max_depth: max_depth))
-    )
+    supervisor_only(conn, fn ->
+      Envelope.send_ok(
+        conn,
+        HostDisksUsage.build!(Backend.Host.DiskBreakdown.usage(max_depth: max_depth))
+      )
+    end)
   end
 
-  # Settings → Hardware → "All hardware" dialog (CW survey P1).
+  # Settings → Hardware → "All hardware" dialog (CW survey P1). Plain
+  # token auth, NO supervisor gate: upstream's default-role pattern
+  # (`/.+/info`) admits any API-enabled add-on here — parity, not an
+  # oversight.
   get "/hardware/info" do
     Envelope.send_ok(conn, HardwareInfo.build!(Backend.Host.Hardware.info()))
   end
