@@ -125,7 +125,14 @@ defmodule Vagus.MixProject do
       # Vagus.Engine.Manager). Untargeted like :bluez: the host build
       # needs it for the pure child-spec/gate tests; nothing starts it
       # off-target. See Vagus.Improv.
-      {:improv, "~> 0.1.1"},
+      #
+      # >= 0.1.2 is required, not incidental: earlier versions hardcoded
+      # `key_mgmt: :wpa_psk`, so a WPA3 (SAE-only) network could never be
+      # provisioned — it associated and then failed the 4-way handshake,
+      # surfacing as a misleading "wrong password". 0.1.2 infers SAE vs PSK
+      # from the target SSID's live scan flags. Found on the Dragon Q6A
+      # (bbangert/improv#2).
+      {:improv, "~> 0.1.2"},
 
       # bluez's compile-time macro dep, overridden as a git checkout pinned
       # to its release tag: the hex package's mix.exs derives its version
