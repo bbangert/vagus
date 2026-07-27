@@ -3,16 +3,32 @@ erlang = "29.0.3"
 elixir = "1.20.2-otp-29"
 
 [env]
-MIX_TARGET = "rpi3"
+# The default build target. This was "rpi3" — a target that does not exist
+# in this project (the real one is "rpi3_64") — which went unnoticed while
+# nothing keyed off the value; `config/target.exs` now does
+# (`import_config "#{Mix.target()}.exs"`), so a wrong value is an immediate
+# hard failure at config load.
+#
+# WARNING: mise's shims re-inject this over an explicit `MIX_TARGET=... mix`
+# prefix on the command line, so prefixing does NOT reliably switch targets.
+# For per-target work use the tasks below, which set it inside the task:
+#
+#   mise run firmware -- dragon_q6a
+#   mise run mix-for -- dragon_q6a compile
+#
+# or bypass the shim entirely by invoking mix through `mise exec`.
+MIX_TARGET = "rpi3_64"
 
 [tasks.test]
 description = "Run tests with MIX_TARGET=host"
 run = "MIX_TARGET=host mix test"
 
+# Valid targets are the @all_targets in apps/vagus/mix.exs and
+# apps/vagus_platform/mix.exs: rpi3_64 and dragon_q6a.
 [tasks.firmware]
-description = "Build firmware for a target: mise run firmware -- rpi3"
+description = "Build firmware for a target: mise run firmware -- dragon_q6a"
 run = 'MIX_TARGET="{{arg(name="target")}}" mix firmware'
 
 [tasks.mix-for]
-description = "Run a mix task for a target: mise run mix-for -- rpi0 deps.get"
+description = "Run a mix task for a target: mise run mix-for -- dragon_q6a deps.get"
 run = 'MIX_TARGET="{{arg(name="target")}}" mix "{{arg(name="task")}}"'

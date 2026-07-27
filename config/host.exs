@@ -66,3 +66,9 @@ config :nerves_runtime,
        "a.nerves_fw_version" => "0.0.0",
        "a.nerves_fw_uuid" => "00000000-0000-0000-0000-000000000000"
      }}
+
+# Board identity reported by `Vagus.API.StaticData` (P3-T3). The host dev
+# loop emulates the rpi3_64 appliance against a real Core container, so it
+# reports that board's machine string. Per-target values live in
+# config/rpi3_64.exs and config/dragon_q6a.exs.
+config :vagus, :machine, "raspberrypi3-64"

@@ -4,7 +4,8 @@ defmodule Vagus.Backend.Network.VintageNet do
   property reads.
 
   `vintage_net` is a target-scoped-only dependency
-  (`apps/vagus/mix.exs`, `targets: [:rpi3_64]`) — it is genuinely absent
+  (`apps/vagus/mix.exs`, `targets: @all_targets` — every Nerves board, but
+  no `:host`) — it is genuinely absent
   from the `:host` build, so every `VintageNet.*` reference below must
   never reach the compiler when `Mix.target() == :host` (an "undefined
   remote function" warning, fatal under `--warnings-as-errors`). The

@@ -11,18 +11,37 @@ defmodule Vagus.API.StaticData do
   this module no longer defines them.
 
   Values follow the static defaults pinned in the Phase 2 plan: `healthy:
-  true`, `supported: true`, `machine: "raspberrypi3-64"`, `arch:
-  "aarch64"`, `state: "running"`, `channel: "stable"`, Supervisor version
+  true`, `supported: true`, `arch: "aarch64"`, `state: "running"`,
+  `channel: "stable"`, Supervisor version
   `"2026.07.3"`, Core version `"2026.7.2"` (`docs/contract-2026.7.md`,
   header). Fields the emulator has no real data for (and that the wire
   format allows to be `null`) are left `nil`; idle list-type fields are
   `[]`, never `nil`.
+
+  `machine` is the one board-varying value here and is read from config
+  (`config :vagus, :machine`) rather than pinned — `"raspberrypi3-64"` on
+  rpi3_64, `"generic-aarch64"` on dragon_q6a.
   """
 
   @supervisor_version "2026.07.3"
   @core_version "2026.7.2"
-  @machine "raspberrypi3-64"
   @arch "aarch64"
+
+  # The board identity, read at runtime (not a compile-time attribute) so
+  # each target — and :host/:test — sets it independently in config. See
+  # config/rpi3_64.exs ("raspberrypi3-64") and config/dragon_q6a.exs
+  # ("generic-aarch64"); both values are real HAOS machines, which matters
+  # because Supervisor validates add-on `machine:` allowlists against a
+  # fixed regex.
+  #
+  # `fetch_env!/2`, deliberately: there is NO default. A defaulted read would
+  # let a new board that forgets `config :vagus, :machine` silently report
+  # some other board's identity to Core — the exact failure this indirection
+  # exists to prevent. Every config path that can reach this code
+  # (rpi3_64, dragon_q6a, host, test) sets the key, so raising here means a
+  # genuine misconfiguration, not a missing convenience.
+  @spec machine() :: String.t()
+  defp machine, do: Application.fetch_env!(:vagus, :machine)
 
   @doc """
   Attrs for `Vagus.API.Models.RootInfo` (`GET info`).
@@ -45,7 +64,7 @@ defmodule Vagus.API.StaticData do
       hostname: hostname(),
       operating_system: "Vagus OS #{os_info[:version]}",
       features: [],
-      machine: @machine,
+      machine: machine(),
       machine_id: nil,
       arch: @arch,
       state: "running",
@@ -93,7 +112,7 @@ defmodule Vagus.API.StaticData do
       version: @core_version,
       version_latest: nil,
       update_available: false,
-      machine: @machine,
+      machine: machine(),
       ip_address: "127.0.0.1",
       arch: @arch,
       image: "ghcr.io/home-assistant/home-assistant",
