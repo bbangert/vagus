@@ -69,7 +69,18 @@ defmodule Vagus.Addon.Store.Assets do
     documentation: 262_144
   }
 
-  @kinds Map.keys(@filenames)
+  # Spelled out rather than `Map.keys(@filenames)`: map key order is an
+  # implementation detail, not a contract, so deriving it would make
+  # `kinds/0`'s documented ordering a promise the runtime never made.
+  @kinds [:icon, :logo, :changelog, :documentation]
+
+  # ...and this keeps the explicit list honest: adding a filename or a cap
+  # without adding the kind (or vice versa) fails the build rather than
+  # silently dropping an asset type.
+  if Enum.sort(@kinds) != Enum.sort(Map.keys(@filenames)) or
+       Enum.sort(@kinds) != Enum.sort(Map.keys(@caps)) do
+    raise "Vagus.Addon.Store.Assets: @kinds, @filenames and @caps disagree"
+  end
 
   @dir "store_assets"
 
@@ -197,8 +208,40 @@ defmodule Vagus.Addon.Store.Assets do
 
   defp do_get(id, kind, {:disk, root}) do
     case asset_dir(root, id, :existing) do
-      {:ok, dir} -> read(Path.join(dir, filename(kind)))
+      {:ok, dir} -> read_capped(Path.join(dir, filename(kind)), kind)
       {:error, _reason} -> :error
+    end
+  end
+
+  # The caps are enforced on write, so anything over one here was not written
+  # by us. Refusing rather than reading keeps a tampered-with or legacy
+  # oversized file from turning into a large allocation per request — Phase 4
+  # serves these unauthenticated, on the <1 GiB board `:disk` mode selects.
+  #
+  # `lstat` also means a *file*-level symlink is refused: `asset_dir/3` checks
+  # the directory components, but a symlink at `icon.png` itself would
+  # otherwise be followed and read out as root.
+  # sobelow_skip ["Traversal.FileModule"]
+  defp read_capped(path, kind) do
+    cap = max_bytes(kind)
+
+    case File.lstat(path) do
+      {:ok, %File.Stat{type: :regular, size: size}} when size <= cap ->
+        read(path)
+
+      {:ok, %File.Stat{type: :regular, size: size}} ->
+        Logger.warning(
+          "Vagus.Addon.Store.Assets: refusing to read #{path} (#{size} bytes, cap #{cap})"
+        )
+
+        :error
+
+      {:ok, %File.Stat{type: type}} ->
+        Logger.warning("Vagus.Addon.Store.Assets: refusing to read #{path} (#{inspect(type)})")
+        :error
+
+      {:error, _reason} ->
+        :error
     end
   end
 

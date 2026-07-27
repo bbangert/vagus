@@ -368,6 +368,51 @@ defmodule Vagus.Addon.Store.AssetsTest do
       assert :error = Assets.get(@mosquitto, :icon, assets)
     end
 
+    @tag :tmp_dir
+    test "an oversized file on disk is refused, not read", %{tmp_dir: tmp_dir} do
+      # Writes are capped, so anything over the cap here was put there by
+      # something else. Reading it would be a large allocation per request on
+      # the small board `:disk` mode exists for.
+      root = Path.join(tmp_dir, "store_assets")
+      dir = Path.join([root, "core", "mosquitto"])
+      File.mkdir_p!(dir)
+      File.write!(Path.join(dir, "icon.png"), :binary.copy("x", Assets.max_bytes(:icon) + 1))
+
+      assets = Assets.init(:disk, root: root)
+
+      log = capture_log(fn -> assert :error = Assets.get(@mosquitto, :icon, assets) end)
+      assert log =~ "refusing to read"
+    end
+
+    @tag :tmp_dir
+    test "a symlinked asset file is refused, not followed", %{tmp_dir: tmp_dir} do
+      # `asset_dir/3` guards the directory components; this guards the leaf.
+      # Without it a symlink at icon.png is an arbitrary file read as root,
+      # which phase 4 would serve unauthenticated.
+      root = Path.join(tmp_dir, "store_assets")
+      dir = Path.join([root, "core", "mosquitto"])
+      File.mkdir_p!(dir)
+      secret = Path.join(tmp_dir, "secret")
+      File.write!(secret, "not yours")
+      File.ln_s!(secret, Path.join(dir, "icon.png"))
+
+      assets = Assets.init(:disk, root: root)
+
+      log = capture_log(fn -> assert :error = Assets.get(@mosquitto, :icon, assets) end)
+      assert log =~ "refusing to read"
+      assert log =~ ":symlink"
+    end
+
+    @tag :tmp_dir
+    test "a file exactly at the cap is still readable", %{tmp_dir: tmp_dir} do
+      root = Path.join(tmp_dir, "store_assets")
+      assets = Assets.init(:disk, root: root)
+      at_cap = :binary.copy("x", Assets.max_bytes(:changelog))
+
+      assert :ok = Assets.put(@mosquitto, :changelog, at_cap, assets)
+      assert Assets.get(@mosquitto, :changelog, assets) == {:ok, at_cap}
+    end
+
     test "with no root to anchor under, degrades to memory with a warning" do
       # `:addon_state_path` is nil under config/test.exs, which is exactly the
       # host/dev situation this guard exists for.
@@ -391,6 +436,12 @@ defmodule Vagus.Addon.Store.AssetsTest do
 
     test "kinds/0 is exactly the four served endpoints" do
       assert Enum.sort(Assets.kinds()) == [:changelog, :documentation, :icon, :logo]
+    end
+
+    test "kinds/0 order is fixed, not derived from map key order" do
+      # The @doc promises a stable order; deriving it from `Map.keys/1` would
+      # make that a promise the runtime never made.
+      assert Assets.kinds() == [:icon, :logo, :changelog, :documentation]
     end
   end
 end
