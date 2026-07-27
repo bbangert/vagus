@@ -20,6 +20,11 @@
 # Scratch/dev-only working files, not part of the shipped tree.
 /.dev/
 
+# /phx:review stages the detected requirements source here before handing it
+# to the verifier agent — it's a verbatim copy of the plan (or a fetched
+# issue), so committing it duplicates a file already in the tree.
+.claude/plans/*/reviews/.requirements-input.md
+
 # If the VM crashes, it generates a dump, let's ignore it too.
 erl_crash.dump
 
