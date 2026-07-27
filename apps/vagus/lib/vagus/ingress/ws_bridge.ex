@@ -375,7 +375,16 @@ defmodule Vagus.Ingress.WSBridge.Upstream do
   a connection that never got this far has nothing to time out.
   """
   def init(%{parent: parent, ip: ip, port: port, path: path, protocols: protocols} = args) do
-    case Mint.HTTP.connect(:http, ip, port, mode: :active, protocols: [:http1]) do
+    connect_opts = [
+      mode: :active,
+      protocols: [:http1],
+      # Same source-address bind as the plain-HTTP leg (see
+      # `Vagus.Network.source_bind_opts/0`): add-ons that filter on client
+      # IP expect the supervisor anchor .2, not the bridge gateway .1.
+      transport_opts: Vagus.Network.source_bind_opts()
+    ]
+
+    case Mint.HTTP.connect(:http, ip, port, connect_opts) do
       {:error, reason} ->
         {:stop, {:connect_failed, reason}}
 

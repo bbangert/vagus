@@ -56,7 +56,17 @@ defmodule Vagus.API.Supervisor do
         port = Application.get_env(:vagus, :api_port, 8888)
 
         [
-          {Finch, name: Vagus.Ingress.Finch, pools: %{default: [size: 4]}},
+          {Finch,
+           name: Vagus.Ingress.Finch,
+           pools: %{
+             default: [
+               size: 4,
+               # Originate add-on connections from the supervisor anchor
+               # (.2), not the bridge gateway (.1) — see
+               # `Vagus.Network.source_bind_opts/0`. Empty on :host/:test.
+               conn_opts: [transport_opts: Vagus.Network.source_bind_opts()]
+             ]
+           }},
           {Bandit,
            plug: Vagus.API.Dispatcher,
            port: port,

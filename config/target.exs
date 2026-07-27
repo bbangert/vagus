@@ -146,6 +146,16 @@ config :vagus, :core_container, "homeassistant"
 # data-root (see Vagus.Engine.Manager) applies to bind sources.
 config :vagus, :addon_data_root, "/root/vagus/addons"
 
+# Ingress source address (found during the Q6A phase-4 gate, 2026-07-27).
+# Vagus runs on the host, so without this its connections to add-ons take
+# the hassio bridge's primary address (172.30.32.1, the gateway). In HAOS
+# the Supervisor is a container holding .2, and add-ons that filter on
+# client IP expect to see .2 — `core_configurator` rejected ingress with
+# `Client IP not within allowed networks` / 420 and banned .1, which Core
+# reported as a 502. Target-only: on :host/:test no .2 is bound and the
+# bind would fail :eaddrnotavail, so those configs leave this unset.
+config :vagus, :ingress_source_ip, "172.30.32.2"
+
 # Add-on DNS (M4-P1-T2). `Vagus.DNS` binds the hassio `dns` anchor
 # (172.30.32.3:53) and forwards names it doesn't own to this upstream
 # (`locals`); 1.1.1.1 keeps it a complete resolver for a host-networked Core
