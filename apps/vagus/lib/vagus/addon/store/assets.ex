@@ -299,13 +299,26 @@ defmodule Vagus.Addon.Store.Assets do
   # A failed write is logged and reported, never raised: a full or read-only
   # data partition must degrade to "this add-on has no icon", not take down a
   # store reload.
+  #
+  # The scratch file gets a random suffix and is created with `:exclusive`
+  # (O_CREAT|O_EXCL) rather than being a predictable `<path>.tmp` opened with
+  # `File.write/2`. Two reasons, both real:
+  #
+  #   * O_EXCL refuses to open through a pre-existing symlink. Without it, an
+  #     attacker who can create `<path>.tmp` under the asset root turns a
+  #     hostile repository's icon bytes into an arbitrary file overwrite —
+  #     this process runs as root on the device.
+  #   * A fixed name lets two writers of the same asset truncate or unlink
+  #     each other's scratch file mid-write. `reload/1` is serialized, so that
+  #     is belt-and-braces, but the cost is one random suffix.
+  #
   # sobelow_skip ["Traversal.FileModule"]
   defp write_atomic(path, binary) do
-    tmp = path <> ".tmp"
+    tmp = path <> ".tmp." <> Base.url_encode64(:crypto.strong_rand_bytes(9), padding: false)
 
     result =
       with :ok <- File.mkdir_p(Path.dirname(path)),
-           :ok <- File.write(tmp, binary) do
+           :ok <- write_exclusive(tmp, binary) do
         File.rename(tmp, path)
       end
 
@@ -315,7 +328,22 @@ defmodule Vagus.Addon.Store.Assets do
 
       {:error, reason} = error ->
         Logger.warning("Vagus.Addon.Store.Assets: failed to write #{path}: #{inspect(reason)}")
-        File.rm(tmp)
+        rm(tmp)
+        error
+    end
+  end
+
+  # sobelow_skip ["Traversal.FileModule"]
+  defp write_exclusive(tmp, binary) do
+    case File.open(tmp, [:write, :binary, :exclusive]) do
+      {:ok, io} ->
+        try do
+          IO.binwrite(io, binary)
+        after
+          File.close(io)
+        end
+
+      {:error, _reason} = error ->
         error
     end
   end

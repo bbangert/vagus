@@ -176,7 +176,15 @@ defmodule Vagus.Addon.StoreTest do
 
       # The bytes live in the handle, not the entry — the whole point of a
       # presence map on a device where the catalog is held in a GenServer.
-      refute catalog["core_mosquitto"] |> Map.values() |> Enum.any?(&(&1 == @png))
+      # Assert the entry's exact shape rather than hunting for @png among its
+      # values: a struct, a slug string and a booleans map can never compare
+      # equal to a binary, so that search would pass even if bytes had leaked.
+      entry = catalog["core_mosquitto"]
+      assert Enum.sort(Map.keys(entry)) == [:assets, :config, :repository]
+      assert Enum.all?(Map.values(entry.assets), &is_boolean/1)
+
+      # And nothing nested anywhere inside it holds the bytes either.
+      assert :binary.match(:erlang.term_to_binary(entry), @png) == :nomatch
     end
 
     test "assets are collected from the config file's own directory" do
@@ -258,6 +266,58 @@ defmodule Vagus.Addon.StoreTest do
       assert :error = Assets.get(@mosquitto, :icon, assets)
     end
 
+    test "two repos colliding into one store slug keep their own assets" do
+      # `core` + `mqtt_broker` and `core_mqtt` + `broker` both render the store
+      # slug "core_mqtt_broker", so the catalog's `Map.merge` keeps exactly one
+      # of the two configs. This drives that real collision path (not `Assets`
+      # in isolation) to prove the surviving entry's assets are its OWN — with
+      # store-slug-keyed storage the loser's icon could land on the winner's
+      # key and the store would serve one repo's config beside another's art.
+      defmodule CollidingFetcher do
+        @yaml """
+        name: MQTT broker
+        version: "1.0.0"
+        slug: SLUG
+        description: collision fixture
+        arch:
+          - aarch64
+        """
+
+        def fetch(%{slug: "core"}) do
+          {:ok,
+           [
+             {"mqtt_broker/config.yaml", String.replace(@yaml, "SLUG", "mqtt_broker")},
+             {"mqtt_broker/icon.png", "icon from core"}
+           ]}
+        end
+
+        def fetch(%{slug: "core_mqtt"}) do
+          {:ok,
+           [
+             {"broker/config.yaml", String.replace(@yaml, "SLUG", "broker")},
+             {"broker/icon.png", "icon from core_mqtt"}
+           ]}
+        end
+      end
+
+      assets = Assets.init(:memory)
+      repos = [%{slug: "core", url: "x"}, %{slug: "core_mqtt", url: "y"}]
+
+      catalog = Store.build_catalog(repos, CollidingFetcher, assets)
+
+      # One entry survives the collision — but which one is Map.merge's call,
+      # so assert the invariant that must hold either way.
+      assert map_size(catalog) == 1
+      entry = catalog["core_mqtt_broker"]
+      assert entry.assets.icon
+
+      assert Assets.get(Assets.id(entry), :icon, assets) == {:ok, "icon from #{entry.repository}"}
+
+      # Both repos' bytes survive independently; neither clobbered the other.
+      assert {:ok, "icon from core"} = Assets.get({"core", "mqtt_broker"}, :icon, assets)
+      assert {:ok, "icon from core_mqtt"} = Assets.get({"core_mqtt", "broker"}, :icon, assets)
+    end
+
     test "a repo that fails to fetch leaves the other repo's assets intact" do
       assets = Assets.init(:memory)
       repos = [%{slug: "broken", url: "x"} | @repos]
@@ -312,6 +372,48 @@ defmodule Vagus.Addon.StoreTest do
 
       revived = start_supervised!({Store, [asset_mode: :memory] ++ opts}, id: :revived)
       assert :error = Assets.get(@mosquitto, :icon, Store.assets(revived))
+    end
+
+    test "overlapping reloads are serialized, not interleaved" do
+      # Interleaving is what produces a torn store: one reload writes assets
+      # for its catalog while another prunes against a different one, and the
+      # survivor advertises `assets.icon == true` with no bytes behind it.
+      # The fetcher parks mid-fetch so the second caller's position is
+      # observable rather than timing-dependent. It gets the test's pid via
+      # the repo map because it runs in the *caller's* process, not the test's.
+      defmodule ParkingFetcher do
+        def fetch(%{slug: "core", test_pid: pid}) do
+          send(pid, {:fetch_started, self()})
+
+          receive do
+            :proceed -> :ok
+          after
+            5_000 -> :ok
+          end
+
+          {:ok, [{"esphome/config.yaml", Vagus.Addon.StoreTest.esphome_yaml()}]}
+        end
+      end
+
+      repos = [%{slug: "core", url: "x", test_pid: self()}]
+      srv = start_supervised!({Store, name: nil, fetcher: ParkingFetcher, repositories: repos})
+
+      first = Task.async(fn -> Store.reload(srv) end)
+      assert_receive {:fetch_started, first_caller}, 1_000
+
+      second = Task.async(fn -> Store.reload(srv) end)
+
+      # The second caller must be parked on the lock, not inside a fetch of
+      # its own — no second :fetch_started while the first still holds it.
+      refute_receive {:fetch_started, _other}, 300
+
+      send(first_caller, :proceed)
+      assert {:ok, 1} = Task.await(first, 5_000)
+
+      # Only once the first released does the second get to run at all.
+      assert_receive {:fetch_started, second_caller}, 1_000
+      send(second_caller, :proceed)
+      assert {:ok, 1} = Task.await(second, 5_000)
     end
 
     test "the ETS table dies with the Store that owned it" do

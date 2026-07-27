@@ -57,9 +57,28 @@ defmodule Vagus.Addon.Store do
   `Assets` handle is read from the snapshot and written to directly, so the
   server never blocks behind a filesystem write either. Only the finished
   catalog goes through the server.
+
+  Reloads are serialized against each other, though. Before assets existed,
+  overlapping reloads raced only on an idempotent catalog swap and the loser
+  was harmless. Now each reload *writes* assets before it swaps and *prunes*
+  after, so interleaving two produces a torn store — one call's prune deleting
+  the assets the other has just written and is about to advertise, leaving
+  `entry.assets.icon == true` with no bytes behind it until something reloads
+  again. A second caller therefore waits (`POST /store/reload` is already a
+  synchronous, network-bound request) rather than interleaving.
   """
   @spec reload(GenServer.server()) :: {:ok, non_neg_integer()}
   def reload(server \\ __MODULE__) do
+    # Blocking form, matching `Vagus.Addon.Manager`'s per-slug lock
+    # (`manager.ex`) rather than Core's `retries: 0` + `{:error, :busy}`:
+    # `reload/1`'s contract is `{:ok, count}` and its one router call site
+    # pattern-matches on it, so making it fail under contention would be an
+    # API change, not a fix. Keyed on the server so async tests running their
+    # own stores never serialize against each other.
+    :global.trans({{:store_reload, server}, self()}, fn -> do_reload(server) end, [node()])
+  end
+
+  defp do_reload(server) do
     {repositories, fetcher, assets} = GenServer.call(server, :snapshot)
     catalog = build_catalog(repositories, fetcher, assets)
     :ok = GenServer.call(server, {:put_catalog, catalog})
