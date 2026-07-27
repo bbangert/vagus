@@ -17,19 +17,23 @@ Core runs the generic `ghcr.io/home-assistant/home-assistant` image on both
 ```sh
 mise run firmware -- rpi3_64        # or: dragon_q6a
 mise run mix-for -- dragon_q6a deps.get
-MIX_TARGET=host mix test
+mise run test                       # host tests
 ```
 
-> **Trap: mise's shims re-inject `MIX_TARGET` over an explicit
-> `MIX_TARGET=… mix …` prefix**, so prefixing does *not* reliably switch
-> targets. Use the `mise run` tasks above (they set it inside the task), or
-> go through `mise exec`. `.mise.toml`'s `MIX_TARGET` is the default for
+> **Prefer the `mise run` tasks — they set `MIX_TARGET` *inside* the task, so
+> they always win.** An explicit `MIX_TARGET=… mix …` prefix is reliable only
+> once the environment is activated (`eval "$(mise env)"`); invoked through
+> mise's bare shims it can be re-injected from `.mise.toml` and silently build
+> the default target instead of the one you asked for. When in doubt use
+> `mise run`, or `mise exec`. `.mise.toml`'s `MIX_TARGET` is the default for
 > everything else.
 
-Nerves firmware assembly runs from the Nerves app, not the umbrella root:
+Nerves firmware assembly runs from the Nerves app, not the umbrella root, so
+it needs the `mix-for` task (or an activated shell) rather than a bare prefix:
 
 ```sh
-cd apps/vagus_platform && MIX_TARGET=dragon_q6a mix firmware
+cd apps/vagus_platform
+MIX_TARGET=dragon_q6a mix firmware       # after: eval "$(mise env)"
 MIX_TARGET=dragon_q6a mix upload <device-ip>
 ```
 
