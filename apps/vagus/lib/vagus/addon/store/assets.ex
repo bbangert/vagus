@@ -169,6 +169,10 @@ defmodule Vagus.Addon.Store.Assets do
     :ok
   end
 
+  # `root` is the configured asset root (derived from `:addon_state_path`),
+  # never request input — and the two slug segments below it are gated by
+  # `valid_slug?/1` in `put/4` and then component-checked by `asset_dir/3`.
+  # sobelow_skip ["Traversal.FileModule"]
   defp do_put(id, kind, binary, {:disk, root}) do
     with :ok <- File.mkdir_p(root),
          {:ok, dir} <- asset_dir(root, id, :create) do
