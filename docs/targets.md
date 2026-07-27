@@ -117,7 +117,19 @@ board.
 
 ### Ingress and the supervisor anchor
 
-Add-ons that filter on client IP expect ingress traffic from the supervisor
-anchor `172.30.32.2`. Vagus runs on the host, so without an explicit source
-bind its connections take the bridge gateway `172.30.32.1` and such add-ons
-reject them. See PR #14.
+Add-ons that filter on client IP expect ingress traffic to arrive from the
+supervisor anchor `172.30.32.2`. In HAOS that is free — the Supervisor is a
+container that genuinely holds `.2`. Vagus runs on the **host**, so without an
+explicit source bind its connections take the bridge's primary address
+(`172.30.32.1`, the gateway) and such add-ons reject them outright.
+
+`config :vagus, :ingress_source_ip` therefore sets the source address both
+ingress legs bind to — the plain-HTTP pool and the WebSocket bridge — via
+`Vagus.Network.source_bind_opts/0`. It is **target-only**: on `:host`/`:test`
+no `.2` is bound and binding would fail `:eaddrnotavail`, so those configs
+leave it unset and the helper returns `[]`. An unset or invalid value degrades
+to "no source bind" with a warning rather than raising, so a config typo
+cannot take ingress down.
+
+This bites any host-run Supervisor emulator, not just this board — it was
+found on the Q6A but rpi3_64 had the identical latent gap.
