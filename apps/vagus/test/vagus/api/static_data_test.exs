@@ -33,8 +33,8 @@ defmodule Vagus.API.StaticDataTest do
       # the key went missing (`StaticData.machine/0` raises now, and even
       # under the old defaulted read a nil `configured` could not match a
       # non-nil fallback). It exists purely to turn that into a one-line
-      # "you forgot config/test.exs" instead of a KeyError or a confusing
-      # nil-vs-string diff.
+      # "you forgot config/test.exs" instead of the ArgumentError
+      # `fetch_env!/2` raises, or a confusing nil-vs-string diff.
       refute is_nil(configured),
              "config :vagus, :machine must be set (see config/test.exs)"
 

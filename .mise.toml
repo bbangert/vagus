@@ -23,10 +23,12 @@ MIX_TARGET = "rpi3_64"
 description = "Run tests with MIX_TARGET=host"
 run = "MIX_TARGET=host mix test"
 
+# Valid targets are the @all_targets in apps/vagus/mix.exs and
+# apps/vagus_platform/mix.exs: rpi3_64 and dragon_q6a.
 [tasks.firmware]
-description = "Build firmware for a target: mise run firmware -- rpi3"
+description = "Build firmware for a target: mise run firmware -- dragon_q6a"
 run = 'MIX_TARGET="{{arg(name="target")}}" mix firmware'
 
 [tasks.mix-for]
-description = "Run a mix task for a target: mise run mix-for -- rpi0 deps.get"
+description = "Run a mix task for a target: mise run mix-for -- dragon_q6a deps.get"
 run = 'MIX_TARGET="{{arg(name="target")}}" mix "{{arg(name="task")}}"'
