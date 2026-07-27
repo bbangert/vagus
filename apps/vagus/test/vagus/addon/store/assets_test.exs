@@ -279,6 +279,95 @@ defmodule Vagus.Addon.Store.AssetsTest do
       assert File.ls!(root) == ["core"]
     end
 
+    @tag :tmp_dir
+    test "a symlinked repo directory can't be written through", %{tmp_dir: tmp_dir} do
+      # O_EXCL on the file alone does NOT stop this: the kernel traverses the
+      # directories first, and a freshly-random-named scratch file has never
+      # existed, so O_EXCL is satisfied while the write lands outside the root.
+      # `File.mkdir_p/1` follows symlinked components without complaint.
+      root = Path.join(tmp_dir, "store_assets")
+      escape = Path.join(tmp_dir, "ESCAPED")
+      File.mkdir_p!(root)
+      File.mkdir_p!(escape)
+      File.ln_s!(escape, Path.join(root, "core"))
+
+      assets = Assets.init(:disk, root: root)
+
+      assert {:error, {:unsafe_asset_dir, _dir, :symlink}} =
+               Assets.put(@mosquitto, :icon, @png, assets)
+
+      assert File.ls!(escape) == []
+      assert :error = Assets.get(@mosquitto, :icon, assets)
+    end
+
+    @tag :tmp_dir
+    test "a symlinked add-on directory can't be written through", %{tmp_dir: tmp_dir} do
+      root = Path.join(tmp_dir, "store_assets")
+      escape = Path.join(tmp_dir, "ESCAPED")
+      File.mkdir_p!(Path.join(root, "core"))
+      File.mkdir_p!(escape)
+      File.ln_s!(escape, Path.join([root, "core", "mosquitto"]))
+
+      assets = Assets.init(:disk, root: root)
+
+      assert {:error, {:unsafe_asset_dir, _dir, :symlink}} =
+               Assets.put(@mosquitto, :icon, @png, assets)
+
+      assert File.ls!(escape) == []
+    end
+
+    @tag :tmp_dir
+    test "reading through a symlinked component doesn't escape the root", %{tmp_dir: tmp_dir} do
+      # The read path matters as much as the write path: Phase 4 serves
+      # icon/logo unauthenticated, so this would be arbitrary file read as
+      # root over HTTP.
+      root = Path.join(tmp_dir, "store_assets")
+      secrets = Path.join(tmp_dir, "SECRETS")
+      File.mkdir_p!(root)
+      File.mkdir_p!(Path.join(secrets, "mosquitto"))
+      File.write!(Path.join([secrets, "mosquitto", "icon.png"]), "stolen")
+      File.ln_s!(secrets, Path.join(root, "core"))
+
+      assets = Assets.init(:disk, root: root)
+
+      assert :error = Assets.get(@mosquitto, :icon, assets)
+      assert :ok = Assets.delete(@mosquitto, :icon, assets)
+
+      # delete didn't reach through the link either.
+      assert File.read!(Path.join([secrets, "mosquitto", "icon.png"])) == "stolen"
+    end
+
+    @tag :tmp_dir
+    test "a plain file where a directory belongs is refused, not clobbered", %{tmp_dir: tmp_dir} do
+      root = Path.join(tmp_dir, "store_assets")
+      File.mkdir_p!(root)
+      File.write!(Path.join(root, "core"), "i am not a directory")
+
+      assets = Assets.init(:disk, root: root)
+
+      assert {:error, {:unsafe_asset_dir, _dir, :regular}} =
+               Assets.put(@mosquitto, :icon, @png, assets)
+
+      assert File.read!(Path.join(root, "core")) == "i am not a directory"
+    end
+
+    @tag :tmp_dir
+    test "an unwritable root returns an error rather than raising", %{tmp_dir: tmp_dir} do
+      # The module promises it never raises — a full or read-only data
+      # partition must degrade to "this add-on has no icon", not blow up a
+      # store reload. (`IO.binwrite/2` raises on Elixir 1.20 where
+      # `File.write/2` returned a tuple; hence `:raw` + `:file.write/2`.)
+      root = Path.join(tmp_dir, "store_assets")
+      File.mkdir_p!(root)
+      File.chmod!(root, 0o500)
+      on_exit(fn -> File.chmod(root, 0o700) end)
+
+      assets = Assets.init(:disk, root: root)
+
+      assert {:error, :eacces} = Assets.put(@mosquitto, :icon, @png, assets)
+      assert :error = Assets.get(@mosquitto, :icon, assets)
+    end
+
     test "with no root to anchor under, degrades to memory with a warning" do
       # `:addon_state_path` is nil under config/test.exs, which is exactly the
       # host/dev situation this guard exists for.

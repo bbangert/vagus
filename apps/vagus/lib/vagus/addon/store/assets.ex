@@ -170,7 +170,10 @@ defmodule Vagus.Addon.Store.Assets do
   end
 
   defp do_put(id, kind, binary, {:disk, root}) do
-    write_atomic(path(root, id, kind), binary)
+    with :ok <- File.mkdir_p(root),
+         {:ok, dir} <- asset_dir(root, id, :create) do
+      write_atomic(Path.join(dir, filename(kind)), binary)
+    end
   end
 
   @doc "The retained bytes for `id`'s `kind`, or `:error` if none."
@@ -189,7 +192,10 @@ defmodule Vagus.Addon.Store.Assets do
   end
 
   defp do_get(id, kind, {:disk, root}) do
-    read(path(root, id, kind))
+    case asset_dir(root, id, :existing) do
+      {:ok, dir} -> read(Path.join(dir, filename(kind)))
+      {:error, _reason} -> :error
+    end
   end
 
   @doc """
@@ -210,7 +216,10 @@ defmodule Vagus.Addon.Store.Assets do
   end
 
   defp do_delete(id, kind, {:disk, root}) do
-    rm(path(root, id, kind))
+    case asset_dir(root, id, :existing) do
+      {:ok, dir} -> rm(Path.join(dir, filename(kind)))
+      {:error, _reason} -> :ok
+    end
   end
 
   @doc """
@@ -284,7 +293,53 @@ defmodule Vagus.Addon.Store.Assets do
   defp valid_id?({repo, addon}), do: Config.valid_slug?(repo) and Config.valid_slug?(addon)
   defp valid_id?(_other), do: false
 
-  defp path(root, {repo, addon}, kind), do: Path.join([root, repo, addon, filename(kind)])
+  # Walks `<root>/<repo>/<addon>` one component at a time, refusing any
+  # component that is not a real directory.
+  #
+  # O_EXCL on the file itself is not enough. It protects the *final* path
+  # component only, and by the time the open happens the kernel has already
+  # traversed the directories — so a symlink at `<root>/<repo>` pointing at
+  # `/etc` sends a freshly-named (therefore never-existing, therefore
+  # O_EXCL-satisfying) write straight out of the asset root, as root.
+  # Verified: `File.mkdir_p/1` follows symlinked components without complaint.
+  #
+  # Checking each component with `lstat` (which does not follow) closes that.
+  # A TOCTOU window remains between the check and the open, but exploiting it
+  # already requires write access inside the asset root, which is the same
+  # precondition the whole class of attack needs.
+  #
+  # `:create` makes the directories (and refuses to adopt a non-directory that
+  # is already there); `:existing` only validates, for the read and delete
+  # paths — a symlinked component there is an arbitrary-file *read* as root,
+  # which Phase 4 would serve unauthenticated.
+  defp asset_dir(root, {repo, addon}, mode) do
+    Enum.reduce_while([repo, addon], {:ok, root}, fn segment, {:ok, parent} ->
+      dir = Path.join(parent, segment)
+
+      case ensure_real_dir(dir, mode) do
+        :ok -> {:cont, {:ok, dir}}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+  end
+
+  # sobelow_skip ["Traversal.FileModule"]
+  defp ensure_real_dir(dir, :create) do
+    case File.mkdir(dir) do
+      :ok -> :ok
+      {:error, :eexist} -> ensure_real_dir(dir, :existing)
+      {:error, _reason} = error -> error
+    end
+  end
+
+  # sobelow_skip ["Traversal.FileModule"]
+  defp ensure_real_dir(dir, :existing) do
+    case File.lstat(dir) do
+      {:ok, %File.Stat{type: :directory}} -> :ok
+      {:ok, %File.Stat{type: type}} -> {:error, {:unsafe_asset_dir, dir, type}}
+      {:error, _reason} = error -> error
+    end
+  end
 
   # `:store_assets` sits beside `addons.json` rather than under a config key
   # of its own: both are store/add-on state and neither should be able to
@@ -317,8 +372,7 @@ defmodule Vagus.Addon.Store.Assets do
     tmp = path <> ".tmp." <> Base.url_encode64(:crypto.strong_rand_bytes(9), padding: false)
 
     result =
-      with :ok <- File.mkdir_p(Path.dirname(path)),
-           :ok <- write_exclusive(tmp, binary) do
+      with :ok <- write_exclusive(tmp, binary) do
         File.rename(tmp, path)
       end
 
@@ -333,12 +387,20 @@ defmodule Vagus.Addon.Store.Assets do
     end
   end
 
+  # `:raw` + `:file.write/2` rather than `IO.binwrite/2`: on Elixir 1.20
+  # `IO.binwrite/2` **raises** on a write error (`:erlang.error(reason)`)
+  # where the `File.write/2` this replaced returned `{:error, reason}`.
+  # Using it would have turned a full or read-only data partition into an
+  # exception escaping `reload/1` — breaking this module's "never raises"
+  # contract and skipping the `rm(tmp)` cleanup on precisely the failure that
+  # cleanup exists for. Verified by probing both on this Elixir version.
+  #
   # sobelow_skip ["Traversal.FileModule"]
   defp write_exclusive(tmp, binary) do
-    case File.open(tmp, [:write, :binary, :exclusive]) do
+    case File.open(tmp, [:write, :binary, :exclusive, :raw]) do
       {:ok, io} ->
         try do
-          IO.binwrite(io, binary)
+          :file.write(io, binary)
         after
           File.close(io)
         end

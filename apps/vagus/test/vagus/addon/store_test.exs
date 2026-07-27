@@ -305,10 +305,15 @@ defmodule Vagus.Addon.StoreTest do
 
       catalog = Store.build_catalog(repos, CollidingFetcher, assets)
 
-      # One entry survives the collision — but which one is Map.merge's call,
-      # so assert the invariant that must hold either way.
+      # Exactly one entry survives, and which one is deterministic:
+      # `build_catalog/3` reduces with `Map.merge(acc, from_this_repo)`, and
+      # the right-hand side wins, so the *last* repo in the list takes the
+      # slug. Assert that rather than hedging — a change in merge order is
+      # something this test should catch, not tolerate.
       assert map_size(catalog) == 1
       entry = catalog["core_mqtt_broker"]
+      assert entry.repository == "core_mqtt"
+      assert entry.config.slug == "broker"
       assert entry.assets.icon
 
       assert Assets.get(Assets.id(entry), :icon, assets) == {:ok, "icon from #{entry.repository}"}
@@ -374,21 +379,28 @@ defmodule Vagus.Addon.StoreTest do
       assert :error = Assets.get(@mosquitto, :icon, Store.assets(revived))
     end
 
-    test "overlapping reloads are serialized, not interleaved" do
+    test "a reload during a reload is a no-op, not a wait and not an error" do
       # Interleaving is what produces a torn store: one reload writes assets
       # for its catalog while another prunes against a different one, and the
       # survivor advertises `assets.icon == true` with no bytes behind it.
-      # The fetcher parks mid-fetch so the second caller's position is
-      # observable rather than timing-dependent. It gets the test's pid via
-      # the repo map because it runs in the *caller's* process, not the test's.
+      #
+      # The second caller returns immediately rather than queueing — matching
+      # the real Supervisor, whose `GitRepo.pull` opens with
+      # `if self.lock.locked(): return False` and whose `StoreManager.reload`
+      # reports that as success, not an error. Blocking would pin a Bandit
+      # worker for a whole network-bound reload.
+      #
+      # The fetcher parks mid-fetch so the second call lands in a known window
+      # rather than a timing-dependent one. It gets the test's pid via the repo
+      # map because it runs in the *caller's* process, not the test's.
       defmodule ParkingFetcher do
         def fetch(%{slug: "core", test_pid: pid}) do
           send(pid, {:fetch_started, self()})
 
+          # No `after` clause: a hang must hang the test, not quietly resume
+          # and let it pass.
           receive do
             :proceed -> :ok
-          after
-            5_000 -> :ok
           end
 
           {:ok, [{"esphome/config.yaml", Vagus.Addon.StoreTest.esphome_yaml()}]}
@@ -399,21 +411,25 @@ defmodule Vagus.Addon.StoreTest do
       srv = start_supervised!({Store, name: nil, fetcher: ParkingFetcher, repositories: repos})
 
       first = Task.async(fn -> Store.reload(srv) end)
-      assert_receive {:fetch_started, first_caller}, 1_000
+      assert_receive {:fetch_started, first_caller}, 5_000
 
-      second = Task.async(fn -> Store.reload(srv) end)
+      # Returns straight away, while the first is still parked mid-fetch —
+      # and reports the catalog as it currently stands (empty; the first
+      # reload hasn't swapped yet).
+      log = capture_log(fn -> assert {:ok, 0} = Store.reload(srv) end)
+      assert log =~ "reload already in progress, skipping"
 
-      # The second caller must be parked on the lock, not inside a fetch of
-      # its own — no second :fetch_started while the first still holds it.
-      refute_receive {:fetch_started, _other}, 300
+      # It really was a no-op: it never entered a fetch of its own.
+      refute_received {:fetch_started, _other}
 
       send(first_caller, :proceed)
       assert {:ok, 1} = Task.await(first, 5_000)
 
-      # Only once the first released does the second get to run at all.
-      assert_receive {:fetch_started, second_caller}, 1_000
-      send(second_caller, :proceed)
-      assert {:ok, 1} = Task.await(second, 5_000)
+      # The lock is released, so a later reload works normally.
+      next = Task.async(fn -> Store.reload(srv) end)
+      assert_receive {:fetch_started, next_caller}, 5_000
+      send(next_caller, :proceed)
+      assert {:ok, 1} = Task.await(next, 5_000)
     end
 
     test "the ETS table dies with the Store that owned it" do

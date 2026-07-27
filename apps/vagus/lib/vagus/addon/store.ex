@@ -58,24 +58,40 @@ defmodule Vagus.Addon.Store do
   server never blocks behind a filesystem write either. Only the finished
   catalog goes through the server.
 
-  Reloads are serialized against each other, though. Before assets existed,
-  overlapping reloads raced only on an idempotent catalog swap and the loser
-  was harmless. Now each reload *writes* assets before it swaps and *prunes*
-  after, so interleaving two produces a torn store — one call's prune deleting
-  the assets the other has just written and is about to advertise, leaving
-  `entry.assets.icon == true` with no bytes behind it until something reloads
-  again. A second caller therefore waits (`POST /store/reload` is already a
-  synchronous, network-bound request) rather than interleaving.
+  Only one reload runs at a time. Before assets existed, overlapping reloads
+  raced only on an idempotent catalog swap and the loser was harmless. Now each
+  reload *writes* assets before it swaps and *prunes* after, so interleaving
+  two produces a torn store — one call's prune deleting the assets the other
+  has just written and is about to advertise, leaving `entry.assets.icon ==
+  true` with no bytes behind it until something reloads again.
+
+  A second caller **does not wait**: it logs and returns the current catalog
+  size, having changed nothing. That is what the real Supervisor does —
+  `GitRepo.pull` opens with `if self.lock.locked(): return False` ("There is
+  already a task in progress"), and `StoreManager.reload` reads that `False`
+  as "this repository wasn't updated", not as an error, so the HTTP caller
+  still gets a success. Blocking instead would pin a Bandit worker for the
+  length of a network-bound reload (up to `receive_timeout` per repository),
+  the same worker-exhaustion exposure `Vagus.Core.Lifecycle` designed around
+  with its `retries: 0` → `{:error, :busy}` → 409.
   """
   @spec reload(GenServer.server()) :: {:ok, non_neg_integer()}
   def reload(server \\ __MODULE__) do
-    # Blocking form, matching `Vagus.Addon.Manager`'s per-slug lock
-    # (`manager.ex`) rather than Core's `retries: 0` + `{:error, :busy}`:
-    # `reload/1`'s contract is `{:ok, count}` and its one router call site
-    # pattern-matches on it, so making it fail under contention would be an
-    # API change, not a fix. Keyed on the server so async tests running their
-    # own stores never serialize against each other.
-    :global.trans({{:store_reload, server}, self()}, fn -> do_reload(server) end, [node()])
+    # `retries: 0` — take the lock or give up immediately, never queue. Keyed
+    # on the server so async tests running their own stores never contend.
+    case :global.trans(
+           {{:store_reload, server}, self()},
+           fn -> do_reload(server) end,
+           [node()],
+           0
+         ) do
+      :aborted ->
+        Logger.warning("Vagus.Addon.Store: reload already in progress, skipping")
+        {:ok, map_size(catalog(server))}
+
+      result ->
+        result
+    end
   end
 
   defp do_reload(server) do
