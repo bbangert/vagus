@@ -32,9 +32,16 @@ defmodule Vagus.Improv do
 
   @force_offline_marker "/root/vagus/improv_force_offline"
 
+  # Board LEDs to blink for Improv's `identify`. First match wins; a board
+  # with none of these simply no-ops (see `identify/0`).
+  #
   # rpi3's green activity LED registers as "led0" ("ACT" and "PWR" cover
-  # other Pi revisions). First match wins.
-  @led_candidates ["led0", "ACT", "PWR"]
+  # other Pi revisions). "blue:indicator" is the Dragon Q6A's user LED --
+  # device-checked 2026-07-27, its /sys/class/leds holds exactly
+  # ["blue:indicator", "mmc1::", "mmc0::"], so without this entry identify
+  # was silently a no-op on that board. The mmc ones are deliberately left
+  # out: they are storage-activity LEDs, not user-facing indicators.
+  @led_candidates ["led0", "ACT", "PWR", "blue:indicator"]
   @blink_count 8
   @blink_half_period_ms 250
 

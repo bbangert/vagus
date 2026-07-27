@@ -52,17 +52,14 @@ config :nerves_ssh,
 # Update regulatory_domain to your 2-letter country code E.g., "US"
 #
 # See https://github.com/nerves-networking/vintage_net for more information
-config :vintage_net,
-  regulatory_domain: "00",
-  config: [
-    {"usb0", %{type: VintageNetDirect}},
-    {"eth0",
-     %{
-       type: VintageNetEthernet,
-       ipv4: %{method: :dhcp}
-     }},
-    {"wlan0", %{type: VintageNetWiFi}}
-  ]
+#
+# The interface list itself is board-specific (the Q6A has no USB gadget
+# controller, so no `usb0`) and lives in `config/<target>.exs`, imported at
+# the bottom of this file. Note `:config` is a list of `{binary, map}`
+# tuples, not a keyword list, so the per-target value REPLACES this one
+# rather than deep-merging into it — each board must list every interface
+# it wants.
+config :vintage_net, regulatory_domain: "00"
 
 config :mdns_lite,
   # The `hosts` key specifies what hostnames mdns_lite advertises.  `:hostname`
@@ -194,6 +191,9 @@ config :vagus, :backends, %{
 
 # Import target specific config. This must remain at the bottom
 # of this file so it overrides the configuration defined above.
-# Uncomment to use target specific configurations
-
-# import_config "#{Mix.target()}.exs"
+#
+# One file per entry in `@all_targets` (apps/vagus/mix.exs,
+# apps/vagus_platform/mix.exs) — currently config/rpi3_64.exs and
+# config/dragon_q6a.exs. A missing file for a selected target is a hard
+# failure at config load, so adding a board means adding its file here too.
+import_config "#{Mix.target()}.exs"

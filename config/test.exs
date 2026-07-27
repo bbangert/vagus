@@ -64,3 +64,9 @@ config :vagus, :backends, %{
 # device-reboot scenario to reconcile (M4-P8-T1).
 config :vagus, :addon_state_path, nil
 config :vagus, :addon_boot_start, false
+
+# Board identity reported by `Vagus.API.StaticData` (P3-T3). Pinned here so
+# tests assert against a configured value rather than the module's fallback
+# — a new target that forgets `config :vagus, :machine` must not silently
+# ship "raspberrypi3-64". See config/rpi3_64.exs and config/dragon_q6a.exs.
+config :vagus, :machine, "raspberrypi3-64"

@@ -3,7 +3,7 @@ defmodule VagusPlatform.MixProject do
 
   @app :vagus_platform
   @version "0.1.0"
-  @all_targets [:rpi3_64]
+  @all_targets [:rpi3_64, :dragon_q6a]
 
   def project do
     [
@@ -50,14 +50,21 @@ defmodule VagusPlatform.MixProject do
       # Dependencies for all targets except :host
       {:nerves_pack, "~> 0.7.1", targets: @all_targets},
 
-      # Vagus-owned aarch64 rpi3 Nerves system (nerves_system_vagus repo),
-      # consumed as a local path dependency during the runtime spike. Named
-      # `nerves_system_rpi3_64` (not `nerves_system_vagus_rpi3_64`) — the
-      # repo follows the bare `nerves_system_<target>` convention.
+      # Vagus-owned Nerves systems (nerves_system_vagus repo), consumed as
+      # local path dependencies. Named `nerves_system_<target>` (not
+      # `nerves_system_vagus_<target>`) — the repo follows the bare
+      # `nerves_system_<target>` convention. Path deps never enter mix.lock,
+      # so the two entries can't conflict; each is scoped by `targets:`, so
+      # only the selected board's system is fetched/compiled.
       {:nerves_system_rpi3_64,
        path: "../../../nerves_system_vagus/rpi3_64",
        runtime: false,
        targets: :rpi3_64,
+       nerves: [compile: true]},
+      {:nerves_system_dragon_q6a,
+       path: "../../../nerves_system_vagus/dragon_q6a",
+       runtime: false,
+       targets: :dragon_q6a,
        nerves: [compile: true]}
     ]
   end

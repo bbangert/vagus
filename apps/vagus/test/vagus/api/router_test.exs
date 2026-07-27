@@ -110,6 +110,23 @@ defmodule Vagus.API.RouterTest do
     end
   end
 
+  describe "board identity on the wire" do
+    # The key-set tests above only prove `machine` is PRESENT. This pins the
+    # value, so a board that ships the wrong identity fails the contract
+    # test too — not just StaticData's unit test. Reads the configured value
+    # rather than a literal: config/<target>.exs owns it per board
+    # ("raspberrypi3-64" on rpi3_64, "generic-aarch64" on dragon_q6a) and
+    # config/test.exs pins it for the suite.
+    for path <- ["/info", "/core/info"] do
+      test "GET #{path} reports the configured machine" do
+        conn = conn(:get, unquote(path)) |> authed() |> call()
+
+        assert json_body(conn)["data"]["machine"] ==
+                 Application.get_env(:vagus, :machine)
+      end
+    end
+  end
+
   describe "GET /network/info nested NetworkInterface shape" do
     test "each interface entry matches the pinned NetworkInterface key set" do
       conn = conn(:get, "/network/info") |> authed() |> call()
