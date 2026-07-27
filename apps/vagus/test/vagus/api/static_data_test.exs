@@ -4,7 +4,26 @@ defmodule Vagus.API.StaticDataTest do
   # at compile time.
   use ExUnit.Case, async: false
 
+  import Mox
+
   alias Vagus.API.StaticData
+
+  # `root_info/0` calls `Vagus.Backend.os().info()`, so this module needs a
+  # live OS mock. It cannot rely on the ambient `stub_with/2` delegation
+  # from test_helper.exs: Mox's global mode ties stub ownership to whichever
+  # process last called `set_mox_global/1`, and
+  # `Vagus.API.RouterBackendTest` re-claims it for itself (see its
+  # moduledoc). Both modules are `async: false`, so they share the sync
+  # phase and the ambient stubs are already dead if that module ran first —
+  # which is exactly how this failed in CI (seed 661416) while passing
+  # locally under a seed that ordered it the other way. Re-claiming
+  # ownership and re-stubbing here makes the module order-independent.
+  setup :set_mox_global
+
+  setup do
+    stub_with(Vagus.Backend.OSMock, Vagus.Backend.OS.HostStub)
+    :ok
+  end
 
   describe "machine (board identity)" do
     test "root_info/0 and core_info/0 report the CONFIGURED machine, not a literal" do
