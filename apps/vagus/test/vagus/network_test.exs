@@ -32,6 +32,31 @@ defmodule Vagus.NetworkTest do
       refute Network.source_bind_opts() == [ip: {172, 30, 32, 1}]
     end
 
+    test "wrong-typed config degrades to [] instead of raising" do
+      # Regression: the original `case` had only nil/binary/tuple clauses, so
+      # any other type raised CaseClauseError and took ingress connection
+      # setup down at runtime over a config typo (Copilot, PR #14).
+      for bad <- [42, [1, 2, 3], %{a: 1}, :atom, 1.5] do
+        Application.put_env(:vagus, :ingress_source_ip, bad)
+        assert Network.source_bind_opts() == [], "expected [] for #{inspect(bad)}"
+      end
+    end
+
+    test "rejects malformed tuples rather than deferring the failure to connect()" do
+      # These are tuples, so the old clause passed them straight through as
+      # socket opts; the failure then surfaced inside connect() as an opaque
+      # :einval. Wrong arity and an out-of-range octet must both be caught.
+      for bad <- [{1, 2}, {999, 0, 0, 1}, {-1, 0, 0, 1}, {:a, :b, :c, :d}] do
+        Application.put_env(:vagus, :ingress_source_ip, bad)
+        assert Network.source_bind_opts() == [], "expected [] for #{inspect(bad)}"
+      end
+    end
+
+    test "still accepts a valid IPv6 tuple" do
+      Application.put_env(:vagus, :ingress_source_ip, {0, 0, 0, 0, 0, 0, 0, 1})
+      assert Network.source_bind_opts() == [ip: {0, 0, 0, 0, 0, 0, 0, 1}]
+    end
+
     test "accepts a tuple as-is and ignores an unparseable string" do
       Application.put_env(:vagus, :ingress_source_ip, {172, 30, 32, 2})
       assert Network.source_bind_opts() == [ip: {172, 30, 32, 2}]

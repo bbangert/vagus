@@ -67,18 +67,43 @@ defmodule Vagus.Network do
   @spec source_bind_opts() :: [{:ip, :inet.ip_address()}]
   def source_bind_opts do
     case Application.get_env(:vagus, :ingress_source_ip) do
-      nil ->
-        []
-
-      ip when is_binary(ip) ->
-        case :inet.parse_address(String.to_charlist(ip)) do
-          {:ok, addr} -> [ip: addr]
-          {:error, _} -> []
-        end
-
-      ip when is_tuple(ip) ->
-        [ip: ip]
+      nil -> []
+      ip -> parse_source_ip(ip)
     end
+  end
+
+  defp parse_source_ip(ip) when is_binary(ip) do
+    case :inet.parse_address(String.to_charlist(ip)) do
+      {:ok, addr} -> [ip: addr]
+      {:error, _} -> invalid_source_ip(ip)
+    end
+  end
+
+  defp parse_source_ip(ip) when is_tuple(ip) do
+    # `:inet.ntoa/1` is the cheap real validator: it rejects wrong-sized
+    # tuples and out-of-range octets that would otherwise sail through here
+    # and only fail later, inside the socket connect, as an opaque :einval.
+    case :inet.ntoa(ip) do
+      {:error, :einval} -> invalid_source_ip(ip)
+      _charlist -> [ip: ip]
+    end
+  end
+
+  # Anything else (integer, list, map, atom...). Without this clause the
+  # `case` above raised CaseClauseError and took ingress connection setup
+  # down at runtime over a config typo.
+  defp parse_source_ip(other), do: invalid_source_ip(other)
+
+  # Degrade to "no source bind" rather than raising: ingress still works
+  # (from the gateway address), and the warning makes the misconfiguration
+  # diagnosable instead of fatal.
+  defp invalid_source_ip(value) do
+    Logger.warning(
+      "Vagus.Network: ignoring invalid :ingress_source_ip #{inspect(value)} — " <>
+        "expected an IP string or :inet.ip_address() tuple"
+    )
+
+    []
   end
 
   @doc """
