@@ -88,9 +88,24 @@ defmodule Vagus.Mqtt.BrokerTest do
     assert_receive {:mqtt_message, ["ret", "state"], ""}, 1_000
 
     # A FRESH subscriber gets nothing: the retained entry is gone.
-    late = connect_client!(port, "ret-late")
+    #
+    # This one gets an inbox of its own. Every other client in this test
+    # reports into the test process, and `assert_receive` matches
+    # *selectively* — the assertion above steps over any still-unconsumed
+    # "sticky" to match "". A wildcard `refute_receive` here would then pick
+    # that leftover up and blame it on `late`, which is a different (and
+    # racy) claim than "the late subscriber received nothing". QoS 1 is
+    # "at least once", so a duplicate delivery to `sub` is spec-legal and
+    # cannot be assumed away. Isolating the mailbox makes the assertion mean
+    # what its comment says.
+    late_inbox = start_inbox()
+    late = connect_client!(port, "ret-late", 4, late_inbox)
     {:ok, _} = MqttX.Client.subscribe(late, "ret/state", qos: 1)
-    refute_receive {:mqtt_message, ["ret", "state"], _}, 500
+
+    # Same wait `refute_receive` would have used, just against a mailbox only
+    # `late` can write to.
+    Process.sleep(500)
+    assert inbox_messages(late_inbox) == []
   end
 
   test "QoS 2 publish round-trips to a QoS 2 subscriber", %{port: port} do
@@ -140,7 +155,11 @@ defmodule Vagus.Mqtt.BrokerTest do
 
   # ---------- helpers ----------
 
-  defp connect_client!(port, tag, version \\ 4) do
+  # `owner` is where this client's deliveries land. It defaults to the test
+  # process (which is what almost every test wants — one mailbox, one
+  # `assert_receive`); pass `start_inbox/0` when an assertion must be about
+  # *this* client's deliveries and nothing else's.
+  defp connect_client!(port, tag, version \\ 4, owner \\ nil) do
     {:ok, client} =
       MqttX.Client.connect(
         host: "127.0.0.1",
@@ -150,11 +169,37 @@ defmodule Vagus.Mqtt.BrokerTest do
         clean_session: true,
         retry_interval: 100,
         handler: Collector,
-        handler_state: %{pid: self()}
+        handler_state: %{pid: owner || self()}
       )
 
     wait_connected!(client)
     client
+  end
+
+  # A mailbox only one client writes to. Linked, so it dies with the test.
+  defp start_inbox do
+    spawn_link(fn -> inbox_loop([]) end)
+  end
+
+  defp inbox_loop(received) do
+    receive do
+      {:dump, from} ->
+        send(from, {:inbox, Enum.reverse(received)})
+        inbox_loop(received)
+
+      message ->
+        inbox_loop([message | received])
+    end
+  end
+
+  defp inbox_messages(inbox) do
+    send(inbox, {:dump, self()})
+
+    receive do
+      {:inbox, messages} -> messages
+    after
+      1_000 -> flunk("inbox process never answered")
+    end
   end
 
   defp wait_connected!(client, tries \\ 100) do
