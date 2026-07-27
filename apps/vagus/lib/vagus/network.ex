@@ -49,6 +49,39 @@ defmodule Vagus.Network do
   def dns_ip, do: @anchors.dns
 
   @doc """
+  Socket options that make an outbound connection *originate from* the
+  supervisor anchor (`172.30.32.2`) instead of the bridge's primary address.
+
+  Vagus runs on the host, so a connection to an add-on on the `hassio`
+  bridge takes that bridge's primary source address (`172.30.32.1`, the
+  gateway) unless told otherwise. In HAOS the Supervisor is a container that
+  genuinely *holds* `.2`, so add-ons see `.2` as the client IP — and several
+  filter on it. Device-observed 2026-07-27: `core_configurator` answered
+  ingress with `Client IP not within allowed networks` / `420` and banned
+  `172.30.32.1`, surfacing to Core as a 502.
+
+  Returns `[]` unless `config :vagus, :ingress_source_ip` is set, so `:host`
+  and `:test` (where no `.2` is bound and binding would fail
+  `:eaddrnotavail`) are unaffected.
+  """
+  @spec source_bind_opts() :: [{:ip, :inet.ip_address()}]
+  def source_bind_opts do
+    case Application.get_env(:vagus, :ingress_source_ip) do
+      nil ->
+        []
+
+      ip when is_binary(ip) ->
+        case :inet.parse_address(String.to_charlist(ip)) do
+          {:ok, addr} -> [ip: addr]
+          {:error, _} -> []
+        end
+
+      ip when is_tuple(ip) ->
+        [ip: ip]
+    end
+  end
+
+  @doc """
   The Engine-API `/networks/create` payload for the `hassio` bridge. Exposed so
   the IP plan can be asserted without a daemon.
   """

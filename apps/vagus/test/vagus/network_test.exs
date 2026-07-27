@@ -4,6 +4,43 @@ defmodule Vagus.NetworkTest do
   alias Vagus.Network
   alias Vagus.Runtime.Docker
 
+  describe "source_bind_opts/0 (ingress client-IP parity)" do
+    # Regression guard for a device-found gap: Vagus runs on the host, so
+    # without an explicit bind its add-on connections originate from the
+    # bridge gateway .1 rather than the supervisor anchor .2. Add-ons that
+    # filter on client IP reject that (core_configurator answered 420 and
+    # banned .1, surfacing to Core as a 502).
+    setup do
+      original = Application.get_env(:vagus, :ingress_source_ip)
+      on_exit(fn -> Application.put_env(:vagus, :ingress_source_ip, original) end)
+      :ok
+    end
+
+    test "returns [] when unset, so :host/:test never bind a missing address" do
+      Application.delete_env(:vagus, :ingress_source_ip)
+      assert Network.source_bind_opts() == []
+    end
+
+    test "parses a configured string into an inet tuple" do
+      Application.put_env(:vagus, :ingress_source_ip, "172.30.32.2")
+      assert Network.source_bind_opts() == [ip: {172, 30, 32, 2}]
+    end
+
+    test "the configured value is the supervisor anchor, not the gateway" do
+      Application.put_env(:vagus, :ingress_source_ip, Network.supervisor_ip())
+      assert Network.source_bind_opts() == [ip: {172, 30, 32, 2}]
+      refute Network.source_bind_opts() == [ip: {172, 30, 32, 1}]
+    end
+
+    test "accepts a tuple as-is and ignores an unparseable string" do
+      Application.put_env(:vagus, :ingress_source_ip, {172, 30, 32, 2})
+      assert Network.source_bind_opts() == [ip: {172, 30, 32, 2}]
+
+      Application.put_env(:vagus, :ingress_source_ip, "not-an-ip")
+      assert Network.source_bind_opts() == []
+    end
+  end
+
   describe "IP plan (hermetic)" do
     test "config/0 pins the hassio subnet, gateway, dynamic range + bridge name" do
       cfg = Network.config()
