@@ -1,0 +1,307 @@
+defmodule Vagus.Addon.Store.AssetsTest do
+  @moduledoc """
+  P2-A P1: retention of store assets (icon/logo/changelog/documentation).
+
+  The property worth protecting is that `:memory` and `:disk` are
+  observationally identical through `get/3` — the mode is a retention
+  decision, not a behaviour switch — so the shared cases run against both.
+  """
+  use ExUnit.Case, async: true
+
+  import ExUnit.CaptureLog
+
+  alias Vagus.Addon.Store.Assets
+
+  # 1x1 PNG header. Real bytes rather than "png", so a test that
+  # accidentally round-trips through a text path fails loudly.
+  @png <<137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82>>
+
+  # Assets are addressed by `{repo_slug, addon_slug}`, never by store slug.
+  @mosquitto {"core", "mosquitto"}
+  @esphome {"core", "esphome"}
+  @gone {"core", "gone"}
+  @nope {"core", "nope"}
+
+  setup context do
+    assets =
+      case context[:mode] do
+        :disk -> Assets.init(:disk, root: Path.join(context.tmp_dir, "store_assets"))
+        :memory -> Assets.init(:memory)
+        nil -> Assets.init(:memory)
+      end
+
+    {:ok, assets: assets}
+  end
+
+  for mode <- [:memory, :disk] do
+    describe "#{mode} mode" do
+      @describetag :tmp_dir
+      @describetag mode: mode
+
+      test "put/get round-trips bytes verbatim", %{assets: assets} do
+        assert :ok = Assets.put(@mosquitto, :icon, @png, assets)
+        assert {:ok, @png} = Assets.get(@mosquitto, :icon, assets)
+      end
+
+      test "each kind is stored separately", %{assets: assets} do
+        for kind <- Assets.kinds() do
+          assert :ok = Assets.put(@mosquitto, kind, "#{kind} bytes", assets)
+        end
+
+        for kind <- Assets.kinds() do
+          assert Assets.get(@mosquitto, kind, assets) == {:ok, "#{kind} bytes"}
+        end
+      end
+
+      test "slugs don't collide", %{assets: assets} do
+        assert :ok = Assets.put(@mosquitto, :icon, "a", assets)
+        assert :ok = Assets.put(@esphome, :icon, "b", assets)
+
+        assert {:ok, "a"} = Assets.get(@mosquitto, :icon, assets)
+        assert {:ok, "b"} = Assets.get(@esphome, :icon, assets)
+      end
+
+      test "put replaces what was there", %{assets: assets} do
+        assert :ok = Assets.put(@mosquitto, :changelog, "old", assets)
+        assert :ok = Assets.put(@mosquitto, :changelog, "new", assets)
+        assert {:ok, "new"} = Assets.get(@mosquitto, :changelog, assets)
+      end
+
+      test "an unstored asset is :error, not a raise", %{assets: assets} do
+        assert :error = Assets.get(@nope, :icon, assets)
+      end
+
+      test "delete drops one kind and leaves the rest", %{assets: assets} do
+        assert :ok = Assets.put(@mosquitto, :icon, @png, assets)
+        assert :ok = Assets.put(@mosquitto, :logo, @png, assets)
+        assert :ok = Assets.delete(@mosquitto, :icon, assets)
+
+        assert :error = Assets.get(@mosquitto, :icon, assets)
+        assert {:ok, @png} = Assets.get(@mosquitto, :logo, assets)
+      end
+
+      test "deleting something absent is still :ok", %{assets: assets} do
+        assert :ok = Assets.delete(@nope, :icon, assets)
+      end
+
+      test "prune drops slugs outside the catalog and keeps the rest", %{assets: assets} do
+        for slug <- [@mosquitto, @esphome, @gone] do
+          assert :ok = Assets.put(slug, :icon, @png, assets)
+          assert :ok = Assets.put(slug, :changelog, "log", assets)
+        end
+
+        assert {:ok, 1} = Assets.prune([@mosquitto, @esphome], assets)
+
+        assert :error = Assets.get(@gone, :icon, assets)
+        assert :error = Assets.get(@gone, :changelog, assets)
+        assert {:ok, @png} = Assets.get(@mosquitto, :icon, assets)
+        assert {:ok, "log"} = Assets.get(@esphome, :changelog, assets)
+      end
+
+      test "prune with an empty catalog drops everything", %{assets: assets} do
+        assert :ok = Assets.put(@mosquitto, :icon, @png, assets)
+        assert {:ok, 1} = Assets.prune([], assets)
+        assert :error = Assets.get(@mosquitto, :icon, assets)
+      end
+
+      test "prune with nothing stored is a no-op", %{assets: assets} do
+        assert {:ok, 0} = Assets.prune([@mosquitto], assets)
+      end
+
+      test "an icon at the cap is retained", %{assets: assets} do
+        at_cap = :binary.copy("x", Assets.max_bytes(:icon))
+
+        assert :ok = Assets.put(@mosquitto, :icon, at_cap, assets)
+        assert Assets.get(@mosquitto, :icon, assets) == {:ok, at_cap}
+      end
+
+      test "one byte over the cap is refused and nothing is stored", %{assets: assets} do
+        over = :binary.copy("x", Assets.max_bytes(:icon) + 1)
+
+        assert {:error, :too_large} = Assets.put(@mosquitto, :icon, over, assets)
+        assert :error = Assets.get(@mosquitto, :icon, assets)
+      end
+
+      test "an over-cap put does not clobber the asset already stored", %{assets: assets} do
+        assert :ok = Assets.put(@mosquitto, :changelog, "good", assets)
+        over = :binary.copy("x", Assets.max_bytes(:changelog) + 1)
+
+        assert {:error, :too_large} = Assets.put(@mosquitto, :changelog, over, assets)
+        assert {:ok, "good"} = Assets.get(@mosquitto, :changelog, assets)
+      end
+
+      test "a traversal or otherwise invalid id is refused", %{assets: assets} do
+        bad = ["../escape", "core/mosquitto", "..", ".", "a/../../b", ""]
+
+        # Either half of the pair is enough to poison it.
+        ids =
+          Enum.flat_map(bad, &[{&1, "mosquitto"}, {"core", &1}]) ++
+            [{"core", nil}, "core_mosquitto"]
+
+        for id <- ids do
+          assert {:error, :invalid_id} = Assets.put(id, :icon, @png, assets)
+          assert :error = Assets.get(id, :icon, assets)
+        end
+      end
+    end
+  end
+
+  describe "caps" do
+    test "text assets have a tighter cap than images" do
+      assert Assets.max_bytes(:changelog) < Assets.max_bytes(:icon)
+      assert Assets.max_bytes(:changelog) == Assets.max_bytes(:documentation)
+      assert Assets.max_bytes(:icon) == Assets.max_bytes(:logo)
+    end
+  end
+
+  describe "id validation on disk" do
+    @tag :tmp_dir
+    test "a traversal segment never reaches the filesystem at all", %{tmp_dir: tmp_dir} do
+      root = Path.join(tmp_dir, "store_assets")
+      assets = Assets.init(:disk, root: root)
+
+      bad = ["../escape", "core/mosquitto", "..", "a/../../b"]
+
+      for segment <- bad, id <- [{segment, "mosquitto"}, {"core", segment}] do
+        assert {:error, :invalid_id} = Assets.put(id, :icon, @png, assets)
+      end
+
+      # Not "nothing landed where I guessed it would" — nothing was written,
+      # so the root was never even created.
+      refute File.exists?(root)
+      assert File.ls!(tmp_dir) == []
+    end
+
+    test "the charset the store's own slugs use is accepted" do
+      assets = Assets.init(:memory)
+
+      assert :ok = Assets.put({"a-repo", "an.addon"}, :icon, @png, assets)
+      assert :ok = Assets.put({"core_mqtt", "broker"}, :icon, @png, assets)
+    end
+
+    test "two repos that collide into one store slug keep separate assets" do
+      # Both of these render as the store slug "core_mqtt_broker". Keying on
+      # the pair is what stops one repo's icon from overwriting the other's.
+      assets = Assets.init(:memory)
+
+      assert :ok = Assets.put({"core", "mqtt_broker"}, :icon, "from core", assets)
+      assert :ok = Assets.put({"core_mqtt", "broker"}, :icon, "from core_mqtt", assets)
+
+      assert {:ok, "from core"} = Assets.get({"core", "mqtt_broker"}, :icon, assets)
+      assert {:ok, "from core_mqtt"} = Assets.get({"core_mqtt", "broker"}, :icon, assets)
+    end
+
+    @tag :tmp_dir
+    test "the same collision stays separate on disk", %{tmp_dir: tmp_dir} do
+      assets = Assets.init(:disk, root: Path.join(tmp_dir, "store_assets"))
+
+      assert :ok = Assets.put({"core", "mqtt_broker"}, :icon, "from core", assets)
+      assert :ok = Assets.put({"core_mqtt", "broker"}, :icon, "from core_mqtt", assets)
+
+      assert {:ok, "from core"} = Assets.get({"core", "mqtt_broker"}, :icon, assets)
+      assert {:ok, "from core_mqtt"} = Assets.get({"core_mqtt", "broker"}, :icon, assets)
+    end
+  end
+
+  describe "id/1" do
+    test "derives the pair from a catalog entry" do
+      entry = %{config: %{slug: "mosquitto"}, repository: "core", assets: %{}}
+      assert Assets.id(entry) == {"core", "mosquitto"}
+    end
+  end
+
+  describe ":none" do
+    test "retains nothing but still accepts the put" do
+      assets = Assets.none()
+
+      assert :ok = Assets.put(@mosquitto, :icon, @png, assets)
+      assert :error = Assets.get(@mosquitto, :icon, assets)
+      assert :ok = Assets.delete(@mosquitto, :icon, assets)
+      assert {:ok, 0} = Assets.prune([], assets)
+    end
+  end
+
+  describe ":disk layout" do
+    @tag :tmp_dir
+    test "is <root>/<repo_slug>/<addon_slug>/<upstream filename>", %{tmp_dir: tmp_dir} do
+      root = Path.join(tmp_dir, "store_assets")
+      assets = Assets.init(:disk, root: root)
+
+      for kind <- Assets.kinds(), do: :ok = Assets.put(@mosquitto, kind, "x", assets)
+
+      assert File.ls!(root) == ["core"]
+
+      assert Enum.sort(File.ls!(Path.join([root, "core", "mosquitto"]))) ==
+               ["CHANGELOG.md", "DOCS.md", "icon.png", "logo.png"]
+    end
+
+    @tag :tmp_dir
+    test "leaves no .tmp files behind", %{tmp_dir: tmp_dir} do
+      root = Path.join(tmp_dir, "store_assets")
+      assets = Assets.init(:disk, root: root)
+
+      assert :ok = Assets.put(@mosquitto, :icon, @png, assets)
+      assert File.ls!(Path.join([root, "core", "mosquitto"])) == ["icon.png"]
+    end
+
+    @tag :tmp_dir
+    test "a second handle over the same root reads the same bytes", %{tmp_dir: tmp_dir} do
+      root = Path.join(tmp_dir, "store_assets")
+
+      assert :ok = Assets.put(@mosquitto, :icon, @png, Assets.init(:disk, root: root))
+      assert {:ok, @png} = Assets.get(@mosquitto, :icon, Assets.init(:disk, root: root))
+    end
+
+    @tag :tmp_dir
+    test "prune leaves directories that aren't valid slugs alone", %{tmp_dir: tmp_dir} do
+      root = Path.join(tmp_dir, "store_assets")
+      assets = Assets.init(:disk, root: root)
+      assert :ok = Assets.put(@mosquitto, :icon, @png, assets)
+
+      strays = [Path.join(root, "not a repo"), Path.join([root, "core", "not an addon"])]
+      Enum.each(strays, &File.mkdir_p!/1)
+
+      assert {:ok, 0} = Assets.prune([@mosquitto], assets)
+      assert Enum.all?(strays, &File.exists?/1)
+    end
+
+    @tag :tmp_dir
+    test "prune removes a repository directory it emptied", %{tmp_dir: tmp_dir} do
+      root = Path.join(tmp_dir, "store_assets")
+      assets = Assets.init(:disk, root: root)
+
+      assert :ok = Assets.put(@mosquitto, :icon, @png, assets)
+      assert :ok = Assets.put({"esphome", "esphome"}, :icon, @png, assets)
+
+      assert {:ok, 1} = Assets.prune([@mosquitto], assets)
+
+      # The whole repository left the config, so its directory goes too.
+      assert File.ls!(root) == ["core"]
+    end
+
+    test "with no root to anchor under, degrades to memory with a warning" do
+      # `:addon_state_path` is nil under config/test.exs, which is exactly the
+      # host/dev situation this guard exists for.
+      assert Application.get_env(:vagus, :addon_state_path) == nil
+
+      {assets, log} = with_log(fn -> Assets.init(:disk) end)
+
+      assert log =~ "no :addon_state_path to anchor"
+      assert :ok = Assets.put(@mosquitto, :icon, @png, assets)
+      assert {:ok, @png} = Assets.get(@mosquitto, :icon, assets)
+    end
+  end
+
+  describe "upstream filenames" do
+    test "match what the real Supervisor reads out of a repository checkout" do
+      assert Assets.filename(:icon) == "icon.png"
+      assert Assets.filename(:logo) == "logo.png"
+      assert Assets.filename(:changelog) == "CHANGELOG.md"
+      assert Assets.filename(:documentation) == "DOCS.md"
+    end
+
+    test "kinds/0 is exactly the four served endpoints" do
+      assert Enum.sort(Assets.kinds()) == [:changelog, :documentation, :icon, :logo]
+    end
+  end
+end

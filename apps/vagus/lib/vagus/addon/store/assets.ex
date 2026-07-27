@@ -1,0 +1,348 @@
+defmodule Vagus.Addon.Store.Assets do
+  @moduledoc """
+  Storage for the four static files an add-on repository ships alongside each
+  `config.yaml` — `icon.png`, `logo.png`, `CHANGELOG.md`, `DOCS.md` — which
+  the frontend fetches from `/store/addons/{slug}/icon|logo|changelog|
+  documentation`.
+
+  The real Supervisor keeps a permanent `git clone` per repository and
+  re-reads these off disk per request, caching only existence booleans.
+  Vagus fetches tarballs and holds no checkout, so the bytes have to be
+  retained at catalog-build time or lost. Where they are retained is decided
+  once at boot by `Vagus.Addon.Store.AssetMode`:
+
+    * `:memory` — an ETS table owned by the `Vagus.Addon.Store` GenServer.
+      Dies with it and is rebuilt by the next reload. The default.
+    * `:disk` — `<dirname of :addon_state_path>/store_assets/<repo_slug>/
+      <addon_slug>/<file>`, written tmp+rename per file, mirroring
+      `Vagus.Addon.State`'s write discipline. For boards under 1 GiB, so a
+      large community repository's assets don't sit resident for the life of
+      the node.
+    * `:none` — retains nothing. `build_catalog/3`'s default, for callers
+      (tests, one-off catalog builds) that only want parsed configs. The
+      catalog's presence flags still report honestly what the repo carried;
+      only the bytes are dropped.
+
+  ## Why assets are keyed by `{repo_slug, addon_slug}`, not by store slug
+
+  A store slug is `"<repo>_<addon>"`, which is **not injective**: repository
+  `core` shipping `mqtt_broker` and repository `core_mqtt` shipping `broker`
+  both render as `core_mqtt_broker`. The catalog is a map keyed on that
+  string, so one of the two configs simply wins — but if assets were keyed the
+  same way, the *loser's* icon could overwrite the winner's, and the store
+  would serve one repository's config beside another's artwork. Keying on the
+  pair keeps every repository's bytes in their own namespace, so the read
+  path — which resolves the catalog entry first, and therefore knows which
+  repository won — always gets the matching assets.
+
+  Callers hold that pair as an `t:id/0`; `id/1` derives it from a catalog
+  entry, which is all a request handler needs after its catalog lookup.
+
+  ## Sizes are capped
+
+  Icons and logos are capped at 1 MB each, changelog and documentation at
+  256 KB each. An over-cap file is dropped with a log line and reported
+  absent, which downstream renders exactly like a repository that never
+  shipped one. The caps exist because these bytes are retained for the life
+  of the catalog on a device with no swap.
+
+  Every path is built from a `Vagus.Addon.Config.valid_slug?/1`-gated segment
+  and a compile-time filename constant. No request input reaches the
+  filesystem.
+  """
+
+  require Logger
+
+  alias Vagus.Addon.Config
+
+  @filenames %{
+    icon: "icon.png",
+    logo: "logo.png",
+    changelog: "CHANGELOG.md",
+    documentation: "DOCS.md"
+  }
+
+  @caps %{
+    icon: 1_048_576,
+    logo: 1_048_576,
+    changelog: 262_144,
+    documentation: 262_144
+  }
+
+  @kinds Map.keys(@filenames)
+
+  @dir "store_assets"
+
+  @typedoc "The four retained files."
+  @type kind :: :icon | :logo | :changelog | :documentation
+
+  @typedoc """
+  What a set of assets belongs to: `{repo_slug, addon_slug}`, e.g.
+  `{"core", "mosquitto"}`. Deliberately not the store slug — see the
+  moduledoc on why `"<repo>_<addon>"` is not a safe key.
+  """
+  @type id :: {String.t(), String.t()}
+
+  @typedoc """
+  Where assets go. Built by `init/2` and carried in the store's state — the
+  `:memory` variant holds the ETS table itself rather than a registered name,
+  so concurrent `Vagus.Addon.Store` instances (async tests) never collide.
+  """
+  @opaque t :: {:memory, :ets.table()} | {:disk, Path.t()} | :none
+
+  @doc "The retained kinds, in a stable order."
+  @spec kinds() :: [kind()]
+  def kinds, do: @kinds
+
+  @doc "The repository filename a kind is read from."
+  @spec filename(kind()) :: String.t()
+  def filename(kind) when kind in @kinds, do: Map.fetch!(@filenames, kind)
+
+  @doc "The size cap, in bytes, above which a kind is dropped."
+  @spec max_bytes(kind()) :: pos_integer()
+  def max_bytes(kind) when kind in @kinds, do: Map.fetch!(@caps, kind)
+
+  @doc "A handle that retains nothing."
+  @spec none() :: t()
+  def none, do: :none
+
+  @doc """
+  The asset id of a catalog entry — everything a request handler needs after
+  the catalog lookup it was going to do anyway.
+  """
+  @spec id(map()) :: id()
+  def id(%{repository: repo_slug, config: %{slug: addon_slug}}), do: {repo_slug, addon_slug}
+
+  @doc """
+  Builds the storage handle for `mode`, to be held in
+  `Vagus.Addon.Store`'s state. Call from the owning process: in `:memory`
+  mode the ETS table is owned by (and dies with) the caller.
+
+  `opts[:root]` overrides the disk root, for tests. `:disk` with no
+  resolvable root — no `:addon_state_path` configured, as on `:host` —
+  degrades to `:memory` with a warning rather than failing to boot the store.
+  """
+  @spec init(:memory | :disk | :none, keyword()) :: t()
+  def init(mode, opts \\ [])
+
+  def init(:none, _opts), do: :none
+
+  def init(:memory, _opts) do
+    {:memory, :ets.new(:vagus_store_assets, [:set, :public, read_concurrency: true])}
+  end
+
+  def init(:disk, opts) do
+    case Keyword.get(opts, :root) || configured_root() do
+      root when is_binary(root) ->
+        {:disk, root}
+
+      nil ->
+        Logger.warning(
+          "Vagus.Addon.Store.Assets: :disk mode but no :addon_state_path to anchor " <>
+            "#{@dir}/ under; retaining assets in memory instead"
+        )
+
+        init(:memory, opts)
+    end
+  end
+
+  @doc """
+  Retains `binary` as `id`'s `kind`, replacing whatever was there.
+
+  Returns `{:error, :too_large}` above the kind's cap so the caller can
+  report the asset absent, and `{:error, :invalid_id}` when either half of
+  the id would not be a safe path segment.
+  """
+  @spec put(id(), kind(), binary(), t()) :: :ok | {:error, term()}
+  def put(id, kind, binary, mode) when kind in @kinds and is_binary(binary) do
+    cond do
+      byte_size(binary) > max_bytes(kind) -> {:error, :too_large}
+      not valid_id?(id) -> {:error, :invalid_id}
+      true -> do_put(id, kind, binary, mode)
+    end
+  end
+
+  defp do_put(_id, _kind, _binary, :none), do: :ok
+
+  defp do_put({repo, addon}, kind, binary, {:memory, table}) do
+    true = :ets.insert(table, {{repo, addon, kind}, binary})
+    :ok
+  end
+
+  defp do_put(id, kind, binary, {:disk, root}) do
+    write_atomic(path(root, id, kind), binary)
+  end
+
+  @doc "The retained bytes for `id`'s `kind`, or `:error` if none."
+  @spec get(id(), kind(), t()) :: {:ok, binary()} | :error
+  def get(id, kind, mode) when kind in @kinds do
+    if valid_id?(id), do: do_get(id, kind, mode), else: :error
+  end
+
+  defp do_get(_id, _kind, :none), do: :error
+
+  defp do_get({repo, addon}, kind, {:memory, table}) do
+    case :ets.lookup(table, {repo, addon, kind}) do
+      [{_key, binary}] -> {:ok, binary}
+      [] -> :error
+    end
+  end
+
+  defp do_get(id, kind, {:disk, root}) do
+    read(path(root, id, kind))
+  end
+
+  @doc """
+  Drops `id`'s `kind`, if retained. Called when a reload finds an add-on no
+  longer shipping a file it used to, so a stale icon can't outlive the file
+  that produced it.
+  """
+  @spec delete(id(), kind(), t()) :: :ok
+  def delete(id, kind, mode) when kind in @kinds do
+    if valid_id?(id), do: do_delete(id, kind, mode), else: :ok
+  end
+
+  defp do_delete(_id, _kind, :none), do: :ok
+
+  defp do_delete({repo, addon}, kind, {:memory, table}) do
+    true = :ets.delete(table, {repo, addon, kind})
+    :ok
+  end
+
+  defp do_delete(id, kind, {:disk, root}) do
+    rm(path(root, id, kind))
+  end
+
+  @doc """
+  Drops every retained asset whose id is not in `ids`, and returns how many
+  ids were dropped.
+
+  Run after a catalog swap: an add-on removed from its repository (or a
+  repository removed from the config) otherwise leaks its assets for the life
+  of the node in `:memory` mode, and forever in `:disk` mode.
+  """
+  @spec prune([id()], t()) :: {:ok, non_neg_integer()}
+  def prune(ids, mode) do
+    {:ok, do_prune(MapSet.new(ids), mode)}
+  end
+
+  defp do_prune(_keep, :none), do: 0
+
+  defp do_prune(keep, {:memory, table}) do
+    stale =
+      :ets.foldl(
+        fn {{repo, addon, _kind}, _binary}, acc ->
+          id = {repo, addon}
+          if MapSet.member?(keep, id), do: acc, else: MapSet.put(acc, id)
+        end,
+        MapSet.new(),
+        table
+      )
+
+    for {repo, addon} <- stale, kind <- @kinds, do: :ets.delete(table, {repo, addon, kind})
+
+    MapSet.size(stale)
+  end
+
+  defp do_prune(keep, {:disk, root}) do
+    root
+    |> subdirs()
+    |> Enum.map(&prune_repo(root, &1, keep))
+    |> Enum.sum()
+  end
+
+  # Each repository directory is pruned add-on by add-on, then removed if
+  # that emptied it (`File.rmdir/1` refuses a non-empty directory, so this
+  # needs no emptiness check of its own).
+  defp prune_repo(root, repo, keep) do
+    dir = Path.join(root, repo)
+    dropped = Enum.count(subdirs(dir), &prune_addon(dir, repo, &1, keep))
+    rmdir(dir)
+    dropped
+  end
+
+  defp prune_addon(dir, repo, addon, keep) do
+    if MapSet.member?(keep, {repo, addon}) do
+      false
+    else
+      match?({:ok, _removed}, rm_rf(Path.join(dir, addon)))
+    end
+  end
+
+  # Only entries we could have written ourselves: anything that isn't a valid
+  # slug was put there by something else and is left alone rather than
+  # rm_rf'd along with whatever else shares the root.
+  defp subdirs(dir) do
+    case ls(dir) do
+      {:ok, entries} -> Enum.filter(entries, &Config.valid_slug?/1)
+      {:error, _reason} -> []
+    end
+  end
+
+  ## Filesystem internals — every path is root + validated slugs + constant
+
+  defp valid_id?({repo, addon}), do: Config.valid_slug?(repo) and Config.valid_slug?(addon)
+  defp valid_id?(_other), do: false
+
+  defp path(root, {repo, addon}, kind), do: Path.join([root, repo, addon, filename(kind)])
+
+  # `:store_assets` sits beside `addons.json` rather than under a config key
+  # of its own: both are store/add-on state and neither should be able to
+  # drift onto a different filesystem from the other.
+  defp configured_root do
+    case Application.get_env(:vagus, :addon_state_path) do
+      path when is_binary(path) -> Path.join(Path.dirname(path), @dir)
+      _other -> nil
+    end
+  end
+
+  # A failed write is logged and reported, never raised: a full or read-only
+  # data partition must degrade to "this add-on has no icon", not take down a
+  # store reload.
+  # sobelow_skip ["Traversal.FileModule"]
+  defp write_atomic(path, binary) do
+    tmp = path <> ".tmp"
+
+    result =
+      with :ok <- File.mkdir_p(Path.dirname(path)),
+           :ok <- File.write(tmp, binary) do
+        File.rename(tmp, path)
+      end
+
+    case result do
+      :ok ->
+        :ok
+
+      {:error, reason} = error ->
+        Logger.warning("Vagus.Addon.Store.Assets: failed to write #{path}: #{inspect(reason)}")
+        File.rm(tmp)
+        error
+    end
+  end
+
+  # sobelow_skip ["Traversal.FileModule"]
+  defp read(path) do
+    case File.read(path) do
+      {:ok, binary} -> {:ok, binary}
+      {:error, _reason} -> :error
+    end
+  end
+
+  # sobelow_skip ["Traversal.FileModule"]
+  defp rm(path) do
+    File.rm(path)
+    :ok
+  end
+
+  # sobelow_skip ["Traversal.FileModule"]
+  defp ls(root), do: File.ls(root)
+
+  # sobelow_skip ["Traversal.FileModule"]
+  defp rmdir(path) do
+    File.rmdir(path)
+    :ok
+  end
+
+  # sobelow_skip ["Traversal.FileModule"]
+  defp rm_rf(path), do: File.rm_rf(path)
+end

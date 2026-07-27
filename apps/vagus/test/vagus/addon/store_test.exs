@@ -2,7 +2,10 @@ defmodule Vagus.Addon.StoreTest do
   @moduledoc "P2-T3: the add-on store — catalog building, GenServer, and store views."
   use ExUnit.Case, async: true
 
+  import ExUnit.CaptureLog
+
   alias Vagus.Addon.{Store, StoreView}
+  alias Vagus.Addon.Store.Assets
 
   @mosquitto_yaml """
   name: Mosquitto broker
@@ -31,15 +34,33 @@ defmodule Vagus.Addon.StoreTest do
   ingress: true
   """
 
+  # 1x1 PNG header — real bytes, so a text-path round-trip would fail.
+  @png <<137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82>>
+
+  # Assets are addressed by `{repo_slug, addon_slug}`, not by the store slug
+  # the catalog is keyed on. See `Vagus.Addon.Store.Assets`.
+  @mosquitto {"core", "mosquitto"}
+  @esphome {"core", "esphome"}
+
   # A fetcher returning an in-memory repo tree (config.yaml at add-on dirs, plus
   # noise that must be ignored). Matches the `fetch/1` contract.
+  #
+  # Mosquitto ships all four store assets; ESPHome ships none — the pair that
+  # makes the catalog's presence flags worth asserting. The `CHANGELOG.md` at
+  # the repo root is deliberate: it is a sibling of nothing, and must not be
+  # picked up by either add-on.
   defmodule FixtureFetcher do
     def fetch(%{slug: "core"}) do
       {:ok,
        [
          {"README.md", "ignore me"},
+         {"CHANGELOG.md", "repo-level changelog, not an add-on's"},
          {"mosquitto/config.yaml", Vagus.Addon.StoreTest.mosquitto_yaml()},
          {"mosquitto/Dockerfile", "FROM scratch"},
+         {"mosquitto/icon.png", Vagus.Addon.StoreTest.png()},
+         {"mosquitto/logo.png", Vagus.Addon.StoreTest.png()},
+         {"mosquitto/CHANGELOG.md", "## 7.1.0\n"},
+         {"mosquitto/DOCS.md", "# Mosquitto\n"},
          {"esphome/config.yaml", Vagus.Addon.StoreTest.esphome_yaml()}
        ]}
     end
@@ -49,6 +70,7 @@ defmodule Vagus.Addon.StoreTest do
 
   def mosquitto_yaml, do: @mosquitto_yaml
   def esphome_yaml, do: @esphome_yaml
+  def png, do: @png
 
   @repos [%{slug: "core", url: "https://github.com/home-assistant/addons"}]
 
@@ -140,5 +162,169 @@ defmodule Vagus.Addon.StoreTest do
     assert d["apparmor"] in ["default", "disable", "profile"]
     assert d["detached"] == false
     assert d["installed"] == true
+  end
+
+  describe "store assets (P2-A P1)" do
+    test "the catalog entry carries presence booleans, never bytes" do
+      catalog = Store.build_catalog(@repos, FixtureFetcher, Assets.init(:memory))
+
+      assert catalog["core_mosquitto"].assets ==
+               %{icon: true, logo: true, changelog: true, documentation: true}
+
+      assert catalog["core_esphome"].assets ==
+               %{icon: false, logo: false, changelog: false, documentation: false}
+
+      # The bytes live in the handle, not the entry — the whole point of a
+      # presence map on a device where the catalog is held in a GenServer.
+      refute catalog["core_mosquitto"] |> Map.values() |> Enum.any?(&(&1 == @png))
+    end
+
+    test "assets are collected from the config file's own directory" do
+      assets = Assets.init(:memory)
+      Store.build_catalog(@repos, FixtureFetcher, assets)
+
+      assert {:ok, @png} = Assets.get(@mosquitto, :icon, assets)
+      assert {:ok, "## 7.1.0\n"} = Assets.get(@mosquitto, :changelog, assets)
+      assert {:ok, "# Mosquitto\n"} = Assets.get(@mosquitto, :documentation, assets)
+
+      # The repo-root CHANGELOG.md is nobody's sibling.
+      assert :error = Assets.get(@esphome, :changelog, assets)
+    end
+
+    @tag :tmp_dir
+    test "memory and disk modes are observationally identical", %{tmp_dir: tmp_dir} do
+      memory = Assets.init(:memory)
+      disk = Assets.init(:disk, root: Path.join(tmp_dir, "store_assets"))
+
+      from_memory = Store.build_catalog(@repos, FixtureFetcher, memory)
+      from_disk = Store.build_catalog(@repos, FixtureFetcher, disk)
+
+      assert from_memory == from_disk
+
+      for {_slug, entry} <- from_memory, kind <- Assets.kinds() do
+        id = Assets.id(entry)
+        assert Assets.get(id, kind, memory) == Assets.get(id, kind, disk)
+      end
+    end
+
+    test "an over-cap asset is dropped, logged, and reported absent" do
+      defmodule FatIconFetcher do
+        def fetch(%{slug: "core"}) do
+          over = :binary.copy("x", Vagus.Addon.Store.Assets.max_bytes(:icon) + 1)
+
+          {:ok,
+           [
+             {"mosquitto/config.yaml", Vagus.Addon.StoreTest.mosquitto_yaml()},
+             {"mosquitto/icon.png", over},
+             {"mosquitto/logo.png", Vagus.Addon.StoreTest.png()}
+           ]}
+        end
+      end
+
+      assets = Assets.init(:memory)
+
+      log =
+        capture_log(fn ->
+          catalog = Store.build_catalog(@repos, FatIconFetcher, assets)
+          send(self(), {:catalog, catalog})
+        end)
+
+      assert_received {:catalog, catalog}
+
+      # Indistinguishable, downstream, from a repo that shipped no icon —
+      # and the logo beside it is unaffected.
+      assert catalog["core_mosquitto"].assets.icon == false
+      assert catalog["core_mosquitto"].assets.logo == true
+      assert :error = Assets.get(@mosquitto, :icon, assets)
+      assert log =~ "dropping icon for core/mosquitto"
+      assert log =~ ":too_large"
+    end
+
+    test "an asset the repo stopped shipping is deleted, not left stale" do
+      defmodule DeicedFetcher do
+        def fetch(%{slug: "core"}) do
+          {:ok, [{"mosquitto/config.yaml", Vagus.Addon.StoreTest.mosquitto_yaml()}]}
+        end
+      end
+
+      assets = Assets.init(:memory)
+
+      Store.build_catalog(@repos, FixtureFetcher, assets)
+      assert {:ok, @png} = Assets.get(@mosquitto, :icon, assets)
+
+      catalog = Store.build_catalog(@repos, DeicedFetcher, assets)
+
+      assert catalog["core_mosquitto"].assets.icon == false
+      assert :error = Assets.get(@mosquitto, :icon, assets)
+    end
+
+    test "a repo that fails to fetch leaves the other repo's assets intact" do
+      assets = Assets.init(:memory)
+      repos = [%{slug: "broken", url: "x"} | @repos]
+
+      catalog = Store.build_catalog(repos, FixtureFetcher, assets)
+
+      assert map_size(catalog) == 2
+      assert {:ok, @png} = Assets.get(@mosquitto, :icon, assets)
+    end
+
+    test "reload prunes assets for add-ons that left the catalog" do
+      # Reads its answer from the *calling* process — which is this test,
+      # because `build_catalog/3` deliberately runs in the caller and not in
+      # the GenServer. That makes a two-reload script possible without
+      # reaching into the server's state, and keeps this test `async: true`.
+      defmodule ScriptedFetcher do
+        def fetch(%{slug: "core"}), do: Process.get(:next_fetch)
+      end
+
+      srv = start_supervised!({Store, name: nil, fetcher: ScriptedFetcher, repositories: @repos})
+      assets = Store.assets(srv)
+
+      Process.put(:next_fetch, FixtureFetcher.fetch(%{slug: "core"}))
+      assert {:ok, 2} = Store.reload(srv)
+      assert {:ok, @png} = Assets.get(@mosquitto, :icon, assets)
+
+      # Second reload: the repo no longer carries mosquitto at all.
+      Process.put(:next_fetch, {:ok, [{"esphome/config.yaml", esphome_yaml()}]})
+      log = capture_log(fn -> assert {:ok, 1} = Store.reload(srv) end)
+
+      assert :error = Assets.get(@mosquitto, :icon, assets)
+      assert log =~ "pruned assets for 1 add-on(s)"
+    end
+
+    @tag :tmp_dir
+    test "disk mode outlives the Store; memory mode does not", %{tmp_dir: tmp_dir} do
+      root = Path.join(tmp_dir, "store_assets")
+
+      opts = [name: nil, fetcher: FixtureFetcher, repositories: @repos]
+      disk = start_supervised!({Store, [asset_mode: :disk, root: root] ++ opts}, id: :store_disk)
+      assert {:ok, 2} = Store.reload(disk)
+      :ok = stop_supervised!(:store_disk)
+
+      # A fresh store over the same root serves the icon with no reload —
+      # which is the entire reason `:disk` mode exists on a small board.
+      reborn = start_supervised!({Store, [asset_mode: :disk, root: root] ++ opts}, id: :reborn)
+      assert {:ok, @png} = Assets.get(@mosquitto, :icon, Store.assets(reborn))
+
+      memory = start_supervised!({Store, [asset_mode: :memory] ++ opts}, id: :store_memory)
+      assert {:ok, 2} = Store.reload(memory)
+      :ok = stop_supervised!(:store_memory)
+
+      revived = start_supervised!({Store, [asset_mode: :memory] ++ opts}, id: :revived)
+      assert :error = Assets.get(@mosquitto, :icon, Store.assets(revived))
+    end
+
+    test "the ETS table dies with the Store that owned it" do
+      srv = start_supervised!({Store, name: nil, fetcher: FixtureFetcher, repositories: @repos})
+      assert {:ok, 2} = Store.reload(srv)
+      assets = Store.assets(srv)
+
+      ref = Process.monitor(srv)
+      :ok = stop_supervised!(Store)
+      assert_receive {:DOWN, ^ref, :process, _pid, _reason}
+
+      # Not merely empty — gone, so a leaked handle can't outlive its owner.
+      assert catch_error(Assets.get(@mosquitto, :icon, assets))
+    end
   end
 end

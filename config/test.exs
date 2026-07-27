@@ -65,6 +65,12 @@ config :vagus, :backends, %{
 config :vagus, :addon_state_path, nil
 config :vagus, :addon_boot_start, false
 
+# Store assets stay in memory during `mix test` regardless of how much RAM
+# the CI runner or dev box happens to have — `:auto` would make the store's
+# retention behaviour a property of the machine running the suite. Tests
+# that care about `:disk` pass the mode explicitly.
+config :vagus, :store_asset_mode, :memory
+
 # Board identity reported by `Vagus.API.StaticData` (P3-T3). Required, not
 # optional: `StaticData` reads it with `fetch_env!/2` and raises if it is
 # missing, so that a target which forgets to set it fails loudly instead of
