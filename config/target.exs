@@ -53,12 +53,15 @@ config :nerves_ssh,
 #
 # See https://github.com/nerves-networking/vintage_net for more information
 #
-# The interface list itself is board-specific (the Q6A has no USB gadget
-# controller, so no `usb0`) and lives in `config/<target>.exs`, imported at
-# the bottom of this file. Note `:config` is a list of `{binary, map}`
-# tuples, not a keyword list, so the per-target value REPLACES this one
-# rather than deep-merging into it — each board must list every interface
-# it wants.
+# Only `regulatory_domain` is shared. The interface list is board-specific
+# (the Q6A has no USB gadget controller, so no `usb0`) and is set ONLY in
+# `config/<target>.exs`, imported at the bottom of this file — there is
+# deliberately no shared `:config` default here.
+#
+# If you ever add one, note that `:config` is a list of `{binary, map}`
+# tuples, not a keyword list, so Elixir's Config deep-merge would not apply:
+# the per-target value would replace it wholesale rather than merging. Each
+# board listing every interface it wants is the intended design either way.
 config :vintage_net, regulatory_domain: "00"
 
 config :mdns_lite,

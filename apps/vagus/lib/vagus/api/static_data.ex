@@ -32,10 +32,16 @@ defmodule Vagus.API.StaticData do
   # config/rpi3_64.exs ("raspberrypi3-64") and config/dragon_q6a.exs
   # ("generic-aarch64"); both values are real HAOS machines, which matters
   # because Supervisor validates add-on `machine:` allowlists against a
-  # fixed regex. Every config file that can reach this code sets the key, so
-  # the default below should never be the value actually served.
+  # fixed regex.
+  #
+  # `fetch_env!/2`, deliberately: there is NO default. A defaulted read would
+  # let a new board that forgets `config :vagus, :machine` silently report
+  # some other board's identity to Core — the exact failure this indirection
+  # exists to prevent. Every config path that can reach this code
+  # (rpi3_64, dragon_q6a, host, test) sets the key, so raising here means a
+  # genuine misconfiguration, not a missing convenience.
   @spec machine() :: String.t()
-  defp machine, do: Application.get_env(:vagus, :machine, "raspberrypi3-64")
+  defp machine, do: Application.fetch_env!(:vagus, :machine)
 
   @doc """
   Attrs for `Vagus.API.Models.RootInfo` (`GET info`).

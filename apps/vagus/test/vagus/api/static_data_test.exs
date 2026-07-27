@@ -29,8 +29,12 @@ defmodule Vagus.API.StaticDataTest do
     test "root_info/0 and core_info/0 report the CONFIGURED machine, not a literal" do
       configured = Application.get_env(:vagus, :machine)
 
-      # Guard the guard: if config/test.exs ever stops setting the key, this
-      # test would otherwise pass vacuously against StaticData's fallback.
+      # Not a vacuous-pass guard — without it this test would still fail if
+      # the key went missing (`StaticData.machine/0` raises now, and even
+      # under the old defaulted read a nil `configured` could not match a
+      # non-nil fallback). It exists purely to turn that into a one-line
+      # "you forgot config/test.exs" instead of a KeyError or a confusing
+      # nil-vs-string diff.
       refute is_nil(configured),
              "config :vagus, :machine must be set (see config/test.exs)"
 
@@ -47,6 +51,17 @@ defmodule Vagus.API.StaticDataTest do
 
       assert StaticData.root_info()[:machine] == "generic-aarch64"
       assert StaticData.core_info()[:machine] == "generic-aarch64"
+    end
+
+    test "raises rather than reporting some other board when the key is missing" do
+      original = Application.get_env(:vagus, :machine)
+      Application.delete_env(:vagus, :machine)
+      on_exit(fn -> Application.put_env(:vagus, :machine, original) end)
+
+      # The point of the config indirection: a board that forgets to set
+      # :machine must fail loudly, not quietly claim to be a Raspberry Pi.
+      assert_raise ArgumentError, fn -> StaticData.root_info() end
+      assert_raise ArgumentError, fn -> StaticData.core_info() end
     end
 
     test "arch stays fixed across boards — both targets are aarch64" do
