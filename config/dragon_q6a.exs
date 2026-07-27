@@ -11,9 +11,11 @@ import Config
 
 # Network interfaces. No `usb0`: this board has no USB gadget controller, so
 # VintageNetDirect has nothing to bind. `eth0` is the RTL8125 2.5 GbE
-# (r8169); `wlan0` comes from the onboard AIC8800D80. Note vintage_net's
-# `:config` is a list of `{binary, map}` tuples, not a keyword list, so this
-# REPLACES the shared value rather than merging into it.
+# (r8169); `wlan0` comes from the onboard AIC8800D80. `config/target.exs`
+# deliberately sets no `:config` default, so this is the only source of the
+# interface list for this board — and it must stay that way: `:config` is a
+# list of `{binary, map}` tuples, not a keyword list, so Config's deep-merge
+# would not apply and a shared default would simply be replaced wholesale.
 config :vintage_net,
   config: [
     {"eth0",

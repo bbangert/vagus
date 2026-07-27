@@ -11,9 +11,11 @@ import Config
 
 # Network interfaces. `usb0` is the USB gadget (VintageNetDirect) the Pi
 # exposes over its OTG port — the Q6A has no gadget controller, which is why
-# this list is per-board rather than shared. Note vintage_net's `:config` is
-# a list of `{binary, map}` tuples, not a keyword list, so this REPLACES the
-# shared value rather than merging into it.
+# this list is per-board rather than shared. `config/target.exs` deliberately
+# sets no `:config` default, so this is the only source of the interface list
+# for this board — and it must stay that way: `:config` is a list of
+# `{binary, map}` tuples, not a keyword list, so Config's deep-merge would
+# not apply and a shared default would simply be replaced wholesale.
 config :vintage_net,
   config: [
     {"usb0", %{type: VintageNetDirect}},

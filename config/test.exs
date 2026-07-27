@@ -65,8 +65,9 @@ config :vagus, :backends, %{
 config :vagus, :addon_state_path, nil
 config :vagus, :addon_boot_start, false
 
-# Board identity reported by `Vagus.API.StaticData` (P3-T3). Pinned here so
-# tests assert against a configured value rather than the module's fallback
-# — a new target that forgets `config :vagus, :machine` must not silently
-# ship "raspberrypi3-64". See config/rpi3_64.exs and config/dragon_q6a.exs.
+# Board identity reported by `Vagus.API.StaticData` (P3-T3). Required, not
+# optional: `StaticData` reads it with `fetch_env!/2` and raises if it is
+# missing, so that a target which forgets to set it fails loudly instead of
+# silently reporting some other board. Pinned here so the suite has a known
+# value to assert against. See config/rpi3_64.exs and config/dragon_q6a.exs.
 config :vagus, :machine, "raspberrypi3-64"
