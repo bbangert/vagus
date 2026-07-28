@@ -46,6 +46,19 @@ defmodule Vagus.Addon.Store.Assets do
   shipped one. The caps exist because these bytes are retained for the life
   of the catalog on a device with no swap.
 
+  ## Icon/logo content is checked, not just retained
+
+  `put/4` refuses an `:icon`/`:logo` write whose bytes don't start with the
+  PNG signature. These bytes come from an add-on repository (attacker-
+  controlled, in the sense that any configured repository can ship anything)
+  and Phase 4 serves them **unauthenticated and same-origin with the HA
+  frontend**. HTML in `icon.png` that a browser content-sniffs past a wrong
+  or missing `Content-Type` is stored XSS with an HA token in reach. Checked
+  at write time, not read time, so a bad file never lands on disk in the
+  first place — `nosniff` + a restrictive CSP on the response is defence in
+  depth behind this, not a substitute for it. `changelog`/`documentation`
+  are served as `text/plain` and carry no such check.
+
   Every path is built from a `Vagus.Addon.Config.valid_slug?/1`-gated segment
   and a compile-time filename constant. No request input reaches the
   filesystem.
@@ -157,21 +170,35 @@ defmodule Vagus.Addon.Store.Assets do
     end
   end
 
+  # The 8-byte PNG signature (`\x89PNG\r\n\x1a\n`). `:icon`/`:logo` content
+  # must start with it; `:changelog`/`:documentation` aren't checked.
+  @png_signature <<0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A>>
+
   @doc """
   Retains `binary` as `id`'s `kind`, replacing whatever was there.
 
   Returns `{:error, :too_large}` above the kind's cap so the caller can
-  report the asset absent, and `{:error, :invalid_id}` when either half of
-  the id would not be a safe path segment.
+  report the asset absent, `{:error, :invalid_id}` when either half of the
+  id would not be a safe path segment, and `{:error, :invalid_content}` for
+  an `:icon`/`:logo` binary that doesn't start with the PNG signature (see
+  the moduledoc for why this is checked at write time).
   """
   @spec put(id(), kind(), binary(), t()) :: :ok | {:error, term()}
   def put(id, kind, binary, mode) when kind in @kinds and is_binary(binary) do
     cond do
       byte_size(binary) > max_bytes(kind) -> {:error, :too_large}
       not valid_id?(id) -> {:error, :invalid_id}
+      not valid_content?(kind, binary) -> {:error, :invalid_content}
       true -> do_put(id, kind, binary, mode)
     end
   end
+
+  defp valid_content?(kind, binary) when kind in [:icon, :logo] do
+    byte_size(binary) >= byte_size(@png_signature) and
+      binary_part(binary, 0, byte_size(@png_signature)) == @png_signature
+  end
+
+  defp valid_content?(_kind, _binary), do: true
 
   defp do_put(_id, _kind, _binary, :none), do: :ok
 

@@ -2,13 +2,15 @@ defmodule Vagus.API.Router do
   @moduledoc """
   The Supervisor-API emulator's HTTP surface.
 
-  Pipeline order: body parsing, then `Vagus.API.Auth` (no exempt routes —
-  every request, including ones that end up 404ing, must authenticate),
-  then routing. Every response — success, honest no-op, honest error, the
-  catch-all 404, or an exception raised anywhere in the pipeline (`use
-  Plug.ErrorHandler`, `handle_errors/2` below) — goes out through
-  `Vagus.API.Envelope` so a bare/default Plug response never leaks through
-  unwrapped.
+  Pipeline order: body parsing, then `Vagus.API.Auth` (every request,
+  including ones that end up 404ing, must authenticate — with one exemption
+  that `Vagus.API.Auth` decides for itself, see below), then routing. Every response — success, honest no-op,
+  honest error, the catch-all 404, or an exception raised anywhere in the
+  pipeline (`use Plug.ErrorHandler`, `handle_errors/2` below) — goes out
+  through `Vagus.API.Envelope` so a bare/default Plug response never leaks
+  through unwrapped, except the four store-asset routes, which are
+  intentionally raw (`image/png`/`text/plain`/`application/octet-stream`
+  bytes, not a JSON envelope — that's the upstream wire shape).
 
   Endpoints cover the green surface Home Assistant Core's `hassio`
   integration actually calls (`docs/contract-2026.7.md` §3): the main/
@@ -30,6 +32,7 @@ defmodule Vagus.API.Router do
 
   alias Vagus.Addon.Backend.Native
   alias Vagus.Addon.{Manager, OptionsSchema, State, Store, StoreView, Update}
+  alias Vagus.Addon.Store.Assets
   alias Vagus.API.{Envelope, StaticData}
   alias Vagus.Backend
   alias Vagus.Backups
@@ -97,6 +100,23 @@ defmodule Vagus.API.Router do
     length: 65_536
   )
 
+  # `Vagus.API.Auth` authenticates every request, with exactly one exemption
+  # that it decides for itself: GET of an add-on's icon/logo. That carve-out
+  # lives in `Vagus.API.Auth.unauthenticated?/1` — deliberately NOT in a
+  # pre-auth plug here setting a flag for Auth to honor, because a flag is a
+  # channel any plug could write, and B1's lesson is that a pre-auth plug
+  # doing more than it must is where this router got burned before. Nothing
+  # in this module can cause a request to skip authentication.
+  #
+  # The exemption is upstream contract, not a choice: Core's proxy forwards
+  # those GETs with NO Authorization header at all (`PATHS_NO_AUTH` in
+  # `homeassistant/components/hassio/http.py` — when it matches, the branch
+  # short-circuits before the header is set, for admins too), and Supervisor
+  # skips its own middleware for them (`no_security_check` splices in
+  # `_V1_FRONTEND_PATHS`, i.e. `|/(store/)?addons/<RE_SLUG>/(logo|icon)` —
+  # reading its literal alternatives alone will mislead you). Requiring a
+  # token here adds no security, since the proxy has none to attach; it just
+  # permanently breaks every add-on's icon in the frontend.
   plug(Vagus.API.Auth)
   plug(:match)
   plug(:dispatch)
@@ -113,6 +133,12 @@ defmodule Vagus.API.Router do
   def handle_errors(conn, %{reason: _reason}) do
     Envelope.send_error(conn, "internal server error", conn.status || 500)
   end
+
+  # Function plug (see the comment above its position in the pipeline). Only
+  # a GET against exactly `["addons", slug, "icon"|"logo"]` or `["store",
+  # "addons", slug, "icon"|"logo"]` sets the bypass; everything else — a
+  # different method on the same path, changelog/documentation, any other
+  # route — falls through untouched to `Vagus.API.Auth`.
 
   # -- Main coordinator (5 min) + one-time setup GETs -----------------------
 
@@ -274,6 +300,35 @@ defmodule Vagus.API.Router do
         Envelope.send_error(conn, "Addon #{slug} does not exist in the store", 404)
     end
   end
+
+  # -- Store assets: icon/logo/changelog/documentation (P2-A P4) ------------
+  #
+  # icon/logo are unauthenticated (see `Vagus.API.Auth.unauthenticated?/1` —
+  # plug pipeline) and mirror upstream's exact absent-asset shape — 400 +
+  # `application/octet-stream`, not a JSON envelope and not a 404. Neither
+  # handler touches `conn.assigns.caller`: the pre-auth plug never resolves
+  # one, so reading it here would crash instead of deny.
+  #
+  # changelog/documentation stay behind normal auth (`supervisor_only/2`) but
+  # are ALWAYS 200, even when absent — upstream's own comment is "Frontend
+  # can't handle error response here, need to return 200 and error as text
+  # for now". Matching each shape exactly is the point: a "consistent"
+  # implementation would break one of the two frontends.
+  #
+  # Both the `/store/addons/...` and legacy `/addons/...` forms resolve the
+  # same way: installed add-ons are recorded under the STORE slug
+  # (`handle_install` rewrites `config.slug` before persisting), so whichever
+  # form the request uses, `slug` is already a store slug and `Store.get/1`
+  # is the exact lookup — no scanning, no repo guessing.
+  get("/store/addons/:slug/icon", do: send_image_asset(conn, slug, :icon))
+  get("/store/addons/:slug/logo", do: send_image_asset(conn, slug, :logo))
+  get("/addons/:slug/icon", do: send_image_asset(conn, slug, :icon))
+  get("/addons/:slug/logo", do: send_image_asset(conn, slug, :logo))
+
+  get("/store/addons/:slug/changelog", do: send_text_asset(conn, slug, :changelog))
+  get("/store/addons/:slug/documentation", do: send_text_asset(conn, slug, :documentation))
+  get("/addons/:slug/changelog", do: send_text_asset(conn, slug, :changelog))
+  get("/addons/:slug/documentation", do: send_text_asset(conn, slug, :documentation))
 
   # Wire path is "mounts", NOT "/mounts/info" (§3, §20).
   get "/mounts" do
@@ -1502,6 +1557,86 @@ defmodule Vagus.API.Router do
   defp store_repositories do
     Enum.map(Store.repositories(), &StoreView.repository/1)
   end
+
+  # -- store asset helpers (P2-A P4) ------------------------------------------
+
+  # icon/logo: `image/png` + bytes, or upstream's exact absent shape.
+  defp send_image_asset(conn, slug, kind) do
+    conn = security_headers(conn, kind)
+
+    with {:ok, id, handle} <- resolve_asset(slug),
+         {:ok, binary} <- Assets.get(id, kind, handle) do
+      conn |> put_resp_content_type("image/png", nil) |> send_resp(200, binary) |> halt()
+    else
+      _not_found -> missing_image_asset(conn, kind, slug)
+    end
+  end
+
+  defp missing_image_asset(conn, kind, slug) do
+    conn
+    |> put_resp_content_type("application/octet-stream", nil)
+    |> send_resp(400, "No #{asset_label(kind)} found for addon #{slug}!")
+    |> halt()
+  end
+
+  # changelog/documentation: `text/plain`, ALWAYS 200 (see the route
+  # comments above for the upstream rationale).
+  defp send_text_asset(conn, slug, kind) do
+    supervisor_only(conn, fn ->
+      conn = security_headers(conn, kind)
+
+      with {:ok, id, handle} <- resolve_asset(slug),
+           {:ok, binary} <- Assets.get(id, kind, handle) do
+        conn |> put_resp_content_type("text/plain") |> send_resp(200, binary) |> halt()
+      else
+        _not_found -> missing_text_asset(conn, kind, slug)
+      end
+    end)
+  end
+
+  defp missing_text_asset(conn, kind, slug) do
+    conn
+    |> put_resp_content_type("text/plain")
+    |> send_resp(200, "No #{asset_label(kind)} found for addon #{slug}!")
+    |> halt()
+  end
+
+  defp asset_label(:icon), do: "icon"
+  defp asset_label(:logo), do: "logo"
+  defp asset_label(:changelog), do: "changelog"
+  defp asset_label(:documentation), do: "documentation"
+
+  # `X-Content-Type-Options: nosniff` on every asset response; icon/logo also
+  # get a restrictive CSP. Defence in depth behind `Assets.put/4`'s magic-byte
+  # check: `nosniff` alone doesn't help if the declared type is wrong, and the
+  # magic-byte check alone doesn't help against a PNG/HTML polyglot that still
+  # starts with a valid PNG signature.
+  defp security_headers(conn, kind) when kind in [:icon, :logo] do
+    conn
+    |> put_resp_header("x-content-type-options", "nosniff")
+    |> put_resp_header("content-security-policy", "default-src 'none'; sandbox")
+  end
+
+  defp security_headers(conn, _kind) do
+    put_resp_header(conn, "x-content-type-options", "nosniff")
+  end
+
+  # Installed add-ons are recorded under the STORE slug (`handle_install`
+  # rewrites `config.slug` before persisting — see `Vagus.Addon.Store`'s
+  # moduledoc), so `slug` here is already a store slug regardless of which of
+  # the four routes it came in on, and `Store.get/1` is the exact lookup.
+  # `Assets.id/1` then derives the `{repo_slug, addon_slug}` pair the asset
+  # store is actually keyed on from the resolved catalog entry.
+  #
+  # A detached add-on (installed, but its repository no longer lists it under
+  # this slug) simply isn't in the catalog, so this reports `:error` exactly
+  # like a slug that was never installed — matching upstream's `with_icon =
+  # False` when `app_store is None`. A bogus/traversal slug never reaches
+  # `Assets` at all: it just fails this `Store.get/1` lookup.
+  # One `Store` round-trip, not two — these routes take no token, so every
+  # request is unauthenticated load on the singleton. See
+  # `Vagus.Addon.Store.asset_lookup/2`.
+  defp resolve_asset(slug), do: Store.asset_lookup(slug)
 
   # -- addon lifecycle helpers ------------------------------------------------
 

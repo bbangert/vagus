@@ -16,6 +16,11 @@ defmodule Vagus.Addon.Store.AssetsTest do
   # accidentally round-trips through a text path fails loudly.
   @png <<137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82>>
 
+  # `:icon`/`:logo` content must start with the PNG signature (P2-A P4); a
+  # marker appended after it keeps distinct-content tests distinguishable
+  # without failing that check.
+  defp png(marker), do: @png <> marker
+
   # Assets are addressed by `{repo_slug, addon_slug}`, never by store slug.
   @mosquitto {"core", "mosquitto"}
   @esphome {"core", "esphome"}
@@ -45,20 +50,24 @@ defmodule Vagus.Addon.Store.AssetsTest do
 
       test "each kind is stored separately", %{assets: assets} do
         for kind <- Assets.kinds() do
-          assert :ok = Assets.put(@mosquitto, kind, "#{kind} bytes", assets)
+          content = if kind in [:icon, :logo], do: png("#{kind}"), else: "#{kind} bytes"
+          assert :ok = Assets.put(@mosquitto, kind, content, assets)
         end
 
         for kind <- Assets.kinds() do
-          assert Assets.get(@mosquitto, kind, assets) == {:ok, "#{kind} bytes"}
+          expected = if kind in [:icon, :logo], do: png("#{kind}"), else: "#{kind} bytes"
+          assert Assets.get(@mosquitto, kind, assets) == {:ok, expected}
         end
       end
 
       test "slugs don't collide", %{assets: assets} do
-        assert :ok = Assets.put(@mosquitto, :icon, "a", assets)
-        assert :ok = Assets.put(@esphome, :icon, "b", assets)
+        assert :ok = Assets.put(@mosquitto, :icon, png("a"), assets)
+        assert :ok = Assets.put(@esphome, :icon, png("b"), assets)
 
-        assert {:ok, "a"} = Assets.get(@mosquitto, :icon, assets)
-        assert {:ok, "b"} = Assets.get(@esphome, :icon, assets)
+        assert {:ok, png_a} = Assets.get(@mosquitto, :icon, assets)
+        assert {:ok, png_b} = Assets.get(@esphome, :icon, assets)
+        assert png_a == png("a")
+        assert png_b == png("b")
       end
 
       test "put replaces what was there", %{assets: assets} do
@@ -109,7 +118,8 @@ defmodule Vagus.Addon.Store.AssetsTest do
       end
 
       test "an icon at the cap is retained", %{assets: assets} do
-        at_cap = :binary.copy("x", Assets.max_bytes(:icon))
+        at_cap = png(:binary.copy("x", Assets.max_bytes(:icon) - byte_size(@png)))
+        assert byte_size(at_cap) == Assets.max_bytes(:icon)
 
         assert :ok = Assets.put(@mosquitto, :icon, at_cap, assets)
         assert Assets.get(@mosquitto, :icon, assets) == {:ok, at_cap}
@@ -128,6 +138,37 @@ defmodule Vagus.Addon.Store.AssetsTest do
 
         assert {:error, :too_large} = Assets.put(@mosquitto, :changelog, over, assets)
         assert {:ok, "good"} = Assets.get(@mosquitto, :changelog, assets)
+      end
+
+      # P2-A P4: the icon/logo leg is served unauthenticated and same-origin
+      # with the HA frontend, so HTML masquerading as `icon.png` that a
+      # browser content-sniffs would be stored XSS. Checked at write time so
+      # nothing unvalidated is ever on disk to be served.
+      test "a non-PNG icon/logo is refused, a non-PNG changelog/documentation is not",
+           %{assets: assets} do
+        html = "<script>alert(document.cookie)</script>"
+
+        assert {:error, :invalid_content} = Assets.put(@mosquitto, :icon, html, assets)
+        assert {:error, :invalid_content} = Assets.put(@mosquitto, :logo, html, assets)
+        assert :error = Assets.get(@mosquitto, :icon, assets)
+        assert :error = Assets.get(@mosquitto, :logo, assets)
+
+        # Text kinds carry no such check — they're served as `text/plain`,
+        # never sniffed as anything executable.
+        assert :ok = Assets.put(@mosquitto, :changelog, html, assets)
+        assert :ok = Assets.put(@mosquitto, :documentation, html, assets)
+        assert {:ok, ^html} = Assets.get(@mosquitto, :changelog, assets)
+        assert {:ok, ^html} = Assets.get(@mosquitto, :documentation, assets)
+      end
+
+      test "an over-cap put does not clobber the asset when both checks would fail",
+           %{assets: assets} do
+        # Size is checked before content, so an oversized non-PNG blob still
+        # reports :too_large, not :invalid_content — the caller only needs
+        # one reason, and :too_large is the more actionable one (it names a
+        # concrete limit; :invalid_content doesn't tell you how far off).
+        over_non_png = :binary.copy("x", Assets.max_bytes(:icon) + 1)
+        assert {:error, :too_large} = Assets.put(@mosquitto, :icon, over_non_png, assets)
       end
 
       test "a traversal or otherwise invalid id is refused", %{assets: assets} do
@@ -184,22 +225,22 @@ defmodule Vagus.Addon.Store.AssetsTest do
       # the pair is what stops one repo's icon from overwriting the other's.
       assets = Assets.init(:memory)
 
-      assert :ok = Assets.put({"core", "mqtt_broker"}, :icon, "from core", assets)
-      assert :ok = Assets.put({"core_mqtt", "broker"}, :icon, "from core_mqtt", assets)
+      assert :ok = Assets.put({"core", "mqtt_broker"}, :icon, png("from core"), assets)
+      assert :ok = Assets.put({"core_mqtt", "broker"}, :icon, png("from core_mqtt"), assets)
 
-      assert {:ok, "from core"} = Assets.get({"core", "mqtt_broker"}, :icon, assets)
-      assert {:ok, "from core_mqtt"} = Assets.get({"core_mqtt", "broker"}, :icon, assets)
+      assert {:ok, png("from core")} == Assets.get({"core", "mqtt_broker"}, :icon, assets)
+      assert {:ok, png("from core_mqtt")} == Assets.get({"core_mqtt", "broker"}, :icon, assets)
     end
 
     @tag :tmp_dir
     test "the same collision stays separate on disk", %{tmp_dir: tmp_dir} do
       assets = Assets.init(:disk, root: Path.join(tmp_dir, "store_assets"))
 
-      assert :ok = Assets.put({"core", "mqtt_broker"}, :icon, "from core", assets)
-      assert :ok = Assets.put({"core_mqtt", "broker"}, :icon, "from core_mqtt", assets)
+      assert :ok = Assets.put({"core", "mqtt_broker"}, :icon, png("from core"), assets)
+      assert :ok = Assets.put({"core_mqtt", "broker"}, :icon, png("from core_mqtt"), assets)
 
-      assert {:ok, "from core"} = Assets.get({"core", "mqtt_broker"}, :icon, assets)
-      assert {:ok, "from core_mqtt"} = Assets.get({"core_mqtt", "broker"}, :icon, assets)
+      assert {:ok, png("from core")} == Assets.get({"core", "mqtt_broker"}, :icon, assets)
+      assert {:ok, png("from core_mqtt")} == Assets.get({"core_mqtt", "broker"}, :icon, assets)
     end
   end
 
@@ -227,7 +268,10 @@ defmodule Vagus.Addon.Store.AssetsTest do
       root = Path.join(tmp_dir, "store_assets")
       assets = Assets.init(:disk, root: root)
 
-      for kind <- Assets.kinds(), do: :ok = Assets.put(@mosquitto, kind, "x", assets)
+      for kind <- Assets.kinds() do
+        content = if kind in [:icon, :logo], do: png("x"), else: "x"
+        assert :ok = Assets.put(@mosquitto, kind, content, assets)
+      end
 
       assert File.ls!(root) == ["core"]
 
