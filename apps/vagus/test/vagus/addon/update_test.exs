@@ -11,7 +11,7 @@ defmodule Vagus.Addon.UpdateTest do
 
   import ExUnit.CaptureLog
 
-  alias Vagus.Addon.{Config, State, Store, Update}
+  alias Vagus.Addon.{Config, Manager, State, Store, Update}
 
   # A backend that records every call in the CALLER's process dictionary and
   # fails whichever calls the test asked it to. Caller-process state is sound
@@ -67,6 +67,14 @@ defmodule Vagus.Addon.UpdateTest do
 
     @impl true
     def state(_id), do: {:ok, :running}
+
+    @impl true
+    def remove_image(image, _opts \\ []) do
+      Process.put(:removed_images, [image | Process.get(:removed_images, [])])
+      record(:remove_image)
+    end
+
+    def removed_images, do: Enum.reverse(Process.get(:removed_images, []))
   end
 
   defmodule FailingBackups do
@@ -302,7 +310,100 @@ defmodule Vagus.Addon.UpdateTest do
     end
   end
 
+  describe "reclaiming the superseded image" do
+    test "the old image is removed once the new version is running", ctx do
+      assert {:ok, _} = Update.update(@slug, ctx.opts)
+
+      # Only the OLD ref — removing the new one would delete what is running.
+      assert ["example/amd64-addon-updatable:1.0.0"] = ScriptedBackend.removed_images()
+    end
+
+    @tag installed_state: :stopped
+    test "also reclaimed when the add-on was not running", ctx do
+      assert {:ok, _} = Update.update(@slug, ctx.opts)
+      assert ["example/amd64-addon-updatable:1.0.0"] = ScriptedBackend.removed_images()
+    end
+
+    @tag fail: [:start]
+    test "nothing is reclaimed when the update rolled back", ctx do
+      # The old image is what the add-on was just restored onto — deleting it
+      # would turn a survivable failure into a broken add-on.
+      capture_log(fn -> Update.update(@slug, ctx.opts) end)
+      assert ScriptedBackend.removed_images() == []
+    end
+
+    @tag fail: [:remove_image]
+    test "a failed reclaim does not fail the update", ctx do
+      # Expected whenever another container still references the image; the
+      # update has already succeeded by this point.
+      log = capture_log(fn -> send(self(), {:result, Update.update(@slug, ctx.opts)}) end)
+      assert_received {:result, {:ok, _}}
+      assert log =~ "kept example/amd64-addon-updatable:1.0.0"
+    end
+
+    test "a native add-on has no image to reclaim", ctx do
+      # `Manager.image_ref/2` returns nil for `backend: :native`, which is the
+      # case the nil-guard exists for. (A *tag* that doesn't change is not
+      # reachable: the ref always ends in `:#{version}`, so a version bump
+      # always moves it.)
+      native = %{ctx.installed | backend: :native}
+      :ok = State.put(native, :started)
+
+      catalog_entry = %{
+        config: %{native | version: "2.0.0", slug: "updatable"},
+        repository: "core",
+        assets: %{}
+      }
+
+      :ok = GenServer.call(Store, {:put_catalog, Map.put(Store.catalog(), @slug, catalog_entry)})
+
+      assert {:ok, _} = Update.update(@slug, ctx.opts)
+      assert ScriptedBackend.removed_images() == []
+    end
+  end
+
   describe "serialization" do
+    test "Manager's holding-lock entry points really do skip the lock" do
+      # This is the property the whole design rests on. `Update` takes the
+      # per-slug lock ONCE and then calls `Manager.stop_holding_lock/2` /
+      # `start_holding_lock/2`. If those ever went back to acquiring it
+      # themselves, the nested release would drop `Update`'s lock mid-swap —
+      # `:global` locks are not counted, so a nested acquire is a no-op and
+      # the nested release deletes the resource outright.
+      #
+      # NOT a simulation of the race: the exposed window is a single
+      # `State.put` and `:global`'s blocking acquire is a retry-with-sleep
+      # loop, so a contender essentially never lands inside it. Driving the
+      # update and hoping to observe interleaving produces a test that passes
+      # against the broken code — verified. This pins the invariant directly
+      # instead.
+      parent = self()
+
+      holder =
+        spawn(fn ->
+          :global.trans(
+            {{:addon_lifecycle, @slug}, self()},
+            fn ->
+              send(parent, :held)
+              receive do: (:release -> :ok)
+            end,
+            [node()]
+          )
+        end)
+
+      on_exit(fn -> send(holder, :release) end)
+      assert_receive :held, 2_000
+
+      # A different requester holds the lock. The unlocked entry point must
+      # still proceed; the locking one must not.
+      unlocked = Task.async(fn -> Manager.stop_holding_lock(@slug, backend: ScriptedBackend) end)
+      assert :ok = Task.await(unlocked, 2_000)
+
+      locked = Task.async(fn -> Manager.stop(@slug, backend: ScriptedBackend) end)
+      assert Task.yield(locked, 500) == nil, "Manager.stop/2 should have blocked on the held lock"
+      Task.shutdown(locked, :brutal_kill)
+    end
+
     test "a concurrent update on the same slug is refused, not queued", ctx do
       # The lock is per-slug and non-blocking, matching Core: a second caller
       # gets :busy immediately rather than pinning a Bandit worker for the
@@ -324,10 +425,14 @@ defmodule Vagus.Addon.UpdateTest do
           )
         end)
 
+      # Released via on_exit, not inline: if the assertion below fails — the
+      # exact case this test guards — an inline release never runs and the
+      # holder keeps `{:addon_lifecycle, @slug}` for the rest of the file,
+      # turning one failure into a cascade of spurious `:busy` failures.
+      on_exit(fn -> send(holder, :release) end)
+
       assert_receive :locked, 2_000
       assert {:error, :busy} = Update.update(@slug, ctx.opts)
-
-      send(holder, :release)
     end
   end
 end

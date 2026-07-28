@@ -1567,9 +1567,14 @@ defmodule Vagus.API.Router do
           Envelope.send_error(conn, "Addon #{slug} does not exist", 404)
 
         # Upstream raises APIForbidden when an add-on asks to update itself.
-        # Unreachable through `supervisor_only/2` today (only Core's token
-        # gets past it), but the ban is part of the contract and costs
-        # nothing to state explicitly rather than rely on that.
+        #
+        # NOT REACHABLE, and deliberately kept anyway: `supervisor_only/2`
+        # above already rejects every add-on caller, so this cannot fire while
+        # that holds. It is also why there is no test for it — an add-on
+        # caller gets 403 from `supervisor_only/2` regardless, so such a test
+        # would pass with this clause deleted and prove nothing. Kept as an
+        # explicit statement of the contract in case this route's auth tier is
+        # ever widened.
         self_update?(conn, slug) ->
           Envelope.send_error(conn, "Addons can not update themselves", 403)
 
@@ -1618,6 +1623,9 @@ defmodule Vagus.API.Router do
 
   defp update_error_message({:pull, reason}),
     do: "Failed to pull the addon image: #{inspect(reason)}"
+
+  defp update_error_message({:stop, reason}),
+    do: "Failed to stop the addon before updating: #{inspect(reason)}"
 
   defp update_error_message({:backup_failed, reason}),
     do: "Pre-update backup failed, addon left untouched: #{inspect(reason)}"

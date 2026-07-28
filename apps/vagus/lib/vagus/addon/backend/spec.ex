@@ -28,7 +28,9 @@ defmodule Vagus.Addon.Backend.Spec do
 
   @type t :: %__MODULE__{
           name: String.t(),
-          image: String.t(),
+          # nil for `backend: :native` add-ons, which run in-VM and have no
+          # image (`Manager.image_ref/2` returns nil for them).
+          image: String.t() | nil,
           hostname: String.t() | nil,
           cmd: [String.t()] | nil,
           env: %{optional(String.t()) => String.t()} | [String.t()],

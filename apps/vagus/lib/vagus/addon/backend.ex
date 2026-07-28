@@ -39,4 +39,15 @@ defmodule Vagus.Addon.Backend do
 
   @doc "Coarse current state of the add-on."
   @callback state(id()) :: {:ok, state()} | {:error, term()}
+
+  @doc """
+  Removes an image by ref, once nothing needs it — `Vagus.Addon.Update` calls
+  this after a successful update so the superseded image doesn't sit on the
+  data partition forever.
+
+  Best-effort by contract: an image still referenced by another container is
+  expected to fail, and the caller treats that as normal rather than as an
+  update failure. Backends with no image concept (`Native`) return `:ok`.
+  """
+  @callback remove_image(image :: String.t(), opts :: keyword()) :: :ok | {:error, term()}
 end

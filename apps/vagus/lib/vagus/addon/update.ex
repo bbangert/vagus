@@ -21,7 +21,7 @@ defmodule Vagus.Addon.Update do
     8. stop if it was running (which also removes the container)
     9. commit the new config to `Vagus.Addon.State`
     10. start again **only if it was running** before
-    11. (not implemented — see "Old images" below)
+    11. remove the superseded image, but only when the tag actually changed
 
   ## Why the pull comes first
 
@@ -50,14 +50,20 @@ defmodule Vagus.Addon.Update do
   than faked. This can run for minutes; Bandit's 900 s `read_timeout` is what
   bounds the caller.
 
-  ## Old images
+  ## Old images are reclaimed, best-effort
 
-  Upstream removes the previous image once the new one is running. That needs
-  an image-removal callback the `Vagus.Addon.Backend` behaviour does not have
-  (and which is meaningless for the native backend, whose add-ons have no
-  image at all), so it is **not** done here: old add-on images accumulate on
-  disk until something else reclaims them. Called out in the plan's Risks as
-  a follow-up rather than silently widened into this change.
+  Add-on images run to hundreds of MB, so leaving the superseded one behind
+  would grow the data partition without bound across updates. After a
+  successful swap the old image ref is removed via
+  `Vagus.Addon.Backend.remove_image/2` — but only when the resolved ref
+  actually differs, since an add-on whose version moves without its image tag
+  changing would otherwise delete the image it is still running.
+
+  Failure is logged and ignored. The update has already succeeded by that
+  point, and the most likely failure is precisely the one that should not be
+  fatal: the image is still referenced by another container, so the engine
+  refuses. Turning that into an update error would report a failure that did
+  not happen.
   """
 
   require Logger
@@ -84,10 +90,15 @@ defmodule Vagus.Addon.Update do
   def update(slug, opts \\ []) when is_binary(slug) do
     # `retries: 0`, matching `Vagus.Core.Lifecycle` — a concurrent lifecycle
     # operation on this slug means "come back later" (409), not a queue of
-    # Bandit workers waiting behind a multi-minute update. Note
-    # `Manager.stop/1` and `Manager.start/2` re-take this same lock inside
-    # the update; `:global` locks are reentrant for the same requester, which
-    # is the property `Manager`'s own moduledoc relies on for start_slug.
+    # Bandit workers waiting behind a multi-minute update.
+    #
+    # Everything inside uses `Manager`'s **unlocked** entry points
+    # (`stop_holding_lock/2`, `start_holding_lock/2`). Calling the locking
+    # public functions here would be a real bug and not an obvious one:
+    # `:global` locks are not counted, so a nested acquire by the same
+    # requester is a no-op and the nested *release* deletes the resource,
+    # dropping this lock while the swap below is still mid-flight. Verified
+    # empirically; `Vagus.Core.Lifecycle` avoids it the same way.
     case :global.trans(
            {{:addon_lifecycle, slug}, self()},
            fn -> do_update(slug, opts) end,
@@ -181,7 +192,7 @@ defmodule Vagus.Addon.Update do
   defp stop_if_running(_slug, false, _opts), do: :ok
 
   defp stop_if_running(slug, true, opts) do
-    case Manager.stop(slug, manager_opts(opts)) do
+    case Manager.stop_holding_lock(slug, manager_opts(opts)) do
       :ok -> :ok
       {:error, reason} -> {:error, {:stop, reason}}
     end
@@ -195,13 +206,18 @@ defmodule Vagus.Addon.Update do
     State.put(target, :stopped, user_options: user_options)
   end
 
-  defp restart_if_running(slug, false, target, old_config, _user_options, _opts) do
+  defp restart_if_running(slug, false, target, old_config, _user_options, opts) do
+    reclaim_old_image(old_config, target, opts)
     {:ok, result(slug, old_config, target)}
   end
 
   defp restart_if_running(slug, true, target, old_config, user_options, opts) do
-    case Manager.start(target, Keyword.put(manager_opts(opts), :user_options, user_options)) do
+    case Manager.start_holding_lock(
+           target,
+           Keyword.put(manager_opts(opts), :user_options, user_options)
+         ) do
       {:ok, _started} ->
+        reclaim_old_image(old_config, target, opts)
         {:ok, result(slug, old_config, target)}
 
       {:error, reason} ->
@@ -216,7 +232,10 @@ defmodule Vagus.Addon.Update do
   defp rollback(slug, cause, old_config, user_options, opts) do
     State.put(old_config, :stopped, user_options: user_options)
 
-    case Manager.start(old_config, Keyword.put(manager_opts(opts), :user_options, user_options)) do
+    case Manager.start_holding_lock(
+           old_config,
+           Keyword.put(manager_opts(opts), :user_options, user_options)
+         ) do
       {:ok, _started} ->
         Logger.warning(
           "Vagus.Addon.Update: #{slug} failed to start on the new version " <>
@@ -234,6 +253,40 @@ defmodule Vagus.Addon.Update do
 
         {:error, {:rollback_failed, rollback_reason}}
     end
+  end
+
+  # Only after the new version is actually in place, and only when the ref
+  # really changed — `image_ref/2` resolves `{arch}` templating, so two
+  # different `version`s can still land on the same tag.
+  defp reclaim_old_image(old_config, target, opts) do
+    old_ref = Manager.build_spec(old_config, opts).image
+    new_ref = Manager.build_spec(target, opts).image
+
+    if old_ref && old_ref != new_ref do
+      case backend(opts).remove_image(old_ref, []) do
+        :ok ->
+          Logger.info("Vagus.Addon.Update: removed superseded image #{old_ref}")
+
+        {:error, reason} ->
+          # Expected when another add-on still references it. The update
+          # already succeeded; this is housekeeping, not a failure.
+          Logger.info(
+            "Vagus.Addon.Update: kept #{old_ref} (#{inspect(reason)}) — " <>
+              "still in use, or the engine declined"
+          )
+      end
+    end
+  rescue
+    # A backend with no image concept may raise (`Microvm` raises on every
+    # callback). Reclaiming is never worth undoing a completed update.
+    error ->
+      Logger.warning("Vagus.Addon.Update: image reclaim skipped: #{inspect(error)}")
+      :ok
+  end
+
+  defp backend(opts) do
+    Keyword.get(opts, :backend) ||
+      Application.get_env(:vagus, :addon_backend, Vagus.Addon.Backend.Container)
   end
 
   defp result(slug, %Config{version: from}, %Config{version: to}),
