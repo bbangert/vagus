@@ -262,8 +262,16 @@ defmodule Vagus.API.Router do
 
   get "/store/addons/:slug" do
     case Store.get(slug) do
-      {:ok, entry} -> Envelope.send_ok(conn, StoreView.detail(slug, entry, installed?(slug)))
-      :error -> Envelope.send_error(conn, "Addon #{slug} does not exist in the store", 404)
+      {:ok, entry} ->
+        installed = installed_entry(slug)
+
+        Envelope.send_ok(
+          conn,
+          StoreView.detail(slug, entry, installed?(installed), installed_version(installed))
+        )
+
+      :error ->
+        Envelope.send_error(conn, "Addon #{slug} does not exist in the store", 404)
     end
   end
 
@@ -320,7 +328,7 @@ defmodule Vagus.API.Router do
 
       Envelope.send_ok(
         conn,
-        Vagus.Addon.Info.render(config, state, options, ingress_settings(entry))
+        Vagus.Addon.Info.render(config, state, options, info_settings(entry))
       )
     else
       {:error, :forbidden} -> Envelope.send_error(conn, "Not authorized for this add-on", 403)
@@ -1426,12 +1434,46 @@ defmodule Vagus.API.Router do
 
   defp store_addon_summaries do
     Store.catalog()
-    |> Enum.map(fn {slug, entry} -> StoreView.summary(slug, entry, installed?(slug)) end)
+    |> Enum.map(fn {slug, entry} ->
+      installed = installed_entry(slug)
+      StoreView.summary(slug, entry, installed?(installed), installed_version(installed))
+    end)
   end
 
   # Store slugs and installed-state slugs share the same namespace
   # (`core_mosquitto` both in the catalog and in `Vagus.Addon.State`).
-  defp installed?(store_slug), do: match?({:ok, _}, State.get(store_slug))
+  # One `State` lookup per slug, not one per question. `GET /store/addons`
+  # renders the whole catalog, so asking twice per entry doubles the
+  # synchronous GenServer calls on the widest read path in the API.
+  defp installed_entry(store_slug) do
+    case State.get(store_slug) do
+      {:ok, entry} -> entry
+      :error -> nil
+    end
+  end
+
+  defp installed?(nil), do: false
+  defp installed?(_entry), do: true
+
+  # The version of the locally installed copy, or nil if it isn't installed.
+  #
+  # An installed entry's `config` is the one captured at install time —
+  # `Vagus.Addon.State` never refreshes it from the store catalog (every
+  # `State.put/3` call site outside install/update passes a config that came
+  # back out of `State`), so `config.version` is the installed version by
+  # construction, with no second field to keep in sync.
+  defp installed_version(nil), do: nil
+  defp installed_version(%{config: %{version: version}}), do: version
+
+  # What the store currently advertises for an installed add-on, or nil when
+  # it is detached (installed, but its repository no longer lists it) — which
+  # renders as "no update available" rather than as an error.
+  defp store_version(store_slug) do
+    case Store.get(store_slug) do
+      {:ok, %{config: %{version: version}}} -> version
+      :error -> nil
+    end
+  end
 
   # The Repository wire shape (slug/name/source/url/maintainer, all strings).
   defp store_repositories do
@@ -1450,13 +1492,16 @@ defmodule Vagus.API.Router do
         :error -> config.options
       end
 
-    Vagus.Addon.Info.render(config, state, options, ingress_settings(entry))
+    Vagus.Addon.Info.render(config, state, options, info_settings(entry))
   end
 
-  # `Vagus.Addon.Info.render/4`'s `settings` param is exactly the State
-  # entry's ingress/watchdog fields, minus `config`/`state`/`user_options`.
-  defp ingress_settings(entry) do
-    Map.take(entry, [:ingress_token, :ingress_port, :ingress_panel, :watchdog])
+  # `Vagus.Addon.Info.render/4`'s `settings` param: the State entry's
+  # ingress/watchdog fields (minus `config`/`state`/`user_options`), plus the
+  # store's current version so `update_available` can be real.
+  defp info_settings(%{config: config} = entry) do
+    entry
+    |> Map.take([:ingress_token, :ingress_port, :ingress_panel, :watchdog])
+    |> Map.put(:version_latest, store_version(config.slug))
   end
 
   defp handle_install(conn, slug) do
