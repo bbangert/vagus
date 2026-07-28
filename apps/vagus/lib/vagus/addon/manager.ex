@@ -149,7 +149,6 @@ defmodule Vagus.Addon.Manager do
       register_identity(config, token)
       record_state(config, :started, user_options: user_options)
       register_dns(config, id, opts)
-      maybe_push_panel(config)
       {:ok, %{id: id, access_token: token}}
     end
   end
@@ -185,7 +184,6 @@ defmodule Vagus.Addon.Manager do
         record_state(config, :stopped)
         stop_and_remove_container(config, opts)
         deregister_slug(config)
-        maybe_push_panel(config)
         :ok
     end
   end
@@ -275,10 +273,11 @@ defmodule Vagus.Addon.Manager do
         stop_and_remove_container(config, opts)
         remove_image_best_effort(config, opts)
         purge_side_state(config.slug)
-        # State entry is gone by now — `maybe_push_panel/1` resolves to a
+        # State entry is gone by now — `maybe_push_panel/2` resolves to a
         # DELETE push, mirroring upstream forcing `ingress_panel = false` +
-        # pushing on uninstall (§B4.2).
-        maybe_push_panel(config)
+        # pushing on uninstall (§B4.2). This is the only lifecycle op that
+        # pushes; see `maybe_push_panel/2` for why start/stop no longer do.
+        maybe_push_panel(config, opts)
         remove_data_dir(config.slug, opts)
     end
   end
@@ -727,20 +726,41 @@ defmodule Vagus.Addon.Manager do
       :ok
   end
 
-  # Best-effort Core sidebar-panel refresh on a lifecycle transition — a plan
-  # decision beyond §B4.4 (which only pushes on options-change/uninstall):
-  # keeping Core's panel list current across start/stop too costs nothing,
-  # since Core re-fetches the full list on every push rather than trusting
-  # its body (`Panels`' moduledoc) — an extra push here is harmless, not just
-  # tolerated. `Panels.update_hass_panel/2` already guards for an
-  # unreachable/absent Core client itself, so a bare call is fine here, same
-  # as `register_dns/3`'s `Process.whereis` style for its own side effect.
-  defp maybe_push_panel(%Config{ingress: true, slug: slug}) do
-    Panels.update_hass_panel(slug)
+  # Core sidebar-panel push, on uninstall only — §B4.4's set, not a superset
+  # of it.
+  #
+  # This used to fire on start/stop as well, on the theory that "an extra push
+  # is harmless, since Core re-fetches the full list rather than trusting the
+  # push body". The P2-A phase 5 device gate disproved the premise: Core
+  # answers `POST api/hassio_push/panel/{slug}` with **500** whenever the panel
+  # is already registered, and logs `ValueError: Overwriting panel {slug}` with
+  # a full traceback at ERROR. That is structural upstream, not a transient —
+  # HA's `components/hassio/addon_panel.py::_register_panel` calls
+  # `frontend.async_register_built_in_panel` without `update=True`, and
+  # `components/frontend/__init__.py` raises on overwrite. So every start of an
+  # ingress add-on wrote a traceback into the user's Core log.
+  #
+  # Upstream pushes from exactly three places, none of them a lifecycle
+  # transition: the options handler when `ingress_panel` is toggled
+  # (`supervisor/api/apps.py`), uninstall after forcing `ingress_panel = false`
+  # (`supervisor/apps/app.py`), and restore when the flag actually changed
+  # (`supervisor/apps/manager.py`). Vagus matches that: the options-change push
+  # lives in the router, this one covers uninstall, and restore never moves
+  # `ingress_panel` so it needs none. A start doesn't need one either — the
+  # flag defaults to false and only the options endpoint flips it, and Core
+  # registers every enabled panel itself at its own startup.
+  #
+  # `Panels.update_hass_panel/2` still guards for an unreachable/absent Core
+  # client, so a bare call is fine here — same as `register_dns/3`'s
+  # `Process.whereis` style for its own side effect.
+  defp maybe_push_panel(%Config{ingress: true, slug: slug}, opts) do
+    panels(opts).update_hass_panel(slug)
     :ok
   end
 
-  defp maybe_push_panel(_config), do: :ok
+  defp maybe_push_panel(_config, _opts), do: :ok
+
+  defp panels(opts), do: Keyword.get(opts, :panels, Panels)
 
   defp ensure_token(opts), do: Keyword.put_new(opts, :access_token, generate_token())
 

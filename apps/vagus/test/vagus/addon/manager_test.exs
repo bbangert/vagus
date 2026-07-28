@@ -476,14 +476,18 @@ defmodule Vagus.Addon.ManagerTest do
     end
   end
 
-  describe "ingress panel push hook on lifecycle transitions (IW-P2-T3, §B4.4 + plan decision)" do
+  describe "ingress panel push on lifecycle transitions (IW-P2-T3, §B4.4)" do
     # `Vagus.Ingress.Panels.update_hass_panel/2` is best-effort by design
     # (fire-and-forget `Task.start/1`, warning-not-raise on failure — see
-    # that module's tests for the push semantics themselves); this only
-    # proves `Manager`'s start/stop/uninstall hooks calling it never crash
-    # the lifecycle call itself, whether or not a reachable Core is behind
-    # the app's always-running default-named `Vagus.Core.Client` (there's no
-    # test-env gate for it, unlike `Vagus.Ingress`/`Vagus.DNS`).
+    # that module's tests for the push semantics themselves). What matters
+    # here is *which* lifecycle ops push at all: only uninstall does.
+    #
+    # start/stop deliberately don't, and that is load-bearing rather than an
+    # optimisation: the P2-A device gate caught Core answering a push for an
+    # already-registered panel with 500 + `ValueError: Overwriting panel` and
+    # an ERROR traceback, because HA's `_register_panel` omits `update=True`.
+    # Upstream pushes only on options-change, uninstall, and
+    # restore-when-the-flag-moved. See `maybe_push_panel/2`'s comment.
     setup do
       :persistent_term.put({__MODULE__.FakeBackend, :pid}, self())
 
@@ -530,6 +534,44 @@ defmodule Vagus.Addon.ManagerTest do
                  backend: __MODULE__.FakeBackend,
                  data_root: dr
                )
+    end
+
+    test "only uninstall pushes: start, stop and start_slug leave Core's panel list alone",
+         %{config: config, data_root: dr} do
+      opts = [backend: __MODULE__.FakeBackend, data_root: dr, panels: __MODULE__.PanelSpy]
+      :persistent_term.put({__MODULE__.PanelSpy, :pid}, self())
+
+      assert {:ok, _} = Manager.start(config, opts)
+      assert :ok = Manager.stop("panel_push_addon", opts)
+      assert {:ok, _} = Manager.start_slug("panel_push_addon", opts)
+
+      refute_received {:panel_push, _}
+
+      assert :ok = Manager.uninstall("panel_push_addon", opts)
+      assert_received {:panel_push, "panel_push_addon"}
+    end
+
+    test "a non-ingress add-on doesn't push even on uninstall", %{data_root: dr} do
+      {:ok, plain} =
+        Config.parse(%{
+          "name" => "Plain",
+          "version" => "1",
+          "slug" => "panel_push_plain",
+          "description" => "d",
+          "arch" => ["amd64"],
+          "image" => "homeassistant/{arch}-addon-plain",
+          "host_network" => true
+        })
+
+      on_exit(fn -> Vagus.Addon.State.delete("panel_push_plain") end)
+
+      opts = [backend: __MODULE__.FakeBackend, data_root: dr, panels: __MODULE__.PanelSpy]
+      :persistent_term.put({__MODULE__.PanelSpy, :pid}, self())
+
+      assert {:ok, _} = Manager.start(plain, opts)
+      assert :ok = Manager.uninstall("panel_push_plain", opts)
+
+      refute_received {:panel_push, _}
     end
   end
 
@@ -748,5 +790,18 @@ defmodule Vagus.Addon.ManagerTest do
 
     @impl true
     def state(_id), do: {:ok, :running}
+  end
+
+  # Stands in for `Vagus.Ingress.Panels` via `Manager`'s `:panels` opt — the
+  # same module-seam style as `:backend`. The real module's push semantics
+  # (POST vs DELETE, unreachable-Core tolerance) are covered in
+  # `Vagus.Ingress.PanelsTest`; all this needs to report is *whether* a
+  # lifecycle op reached it at all.
+  defmodule PanelSpy do
+    @moduledoc false
+    def update_hass_panel(slug) do
+      send(:persistent_term.get({__MODULE__, :pid}), {:panel_push, slug})
+      :ok
+    end
   end
 end
