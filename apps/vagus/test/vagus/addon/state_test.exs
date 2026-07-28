@@ -353,4 +353,54 @@ defmodule Vagus.Addon.StateTest do
       refute File.exists?(dir)
     end
   end
+
+  describe "the installed version (P2-A P2)" do
+    # `entry.config.version` IS the installed version — there is no separate
+    # persisted field, and this is what makes that safe. Every `State.put/3`
+    # call site outside install/update passes a config that came back out of
+    # `State` (Manager.start_slug, BootStarter, Watchdog all read it first),
+    # so a lifecycle transition cannot move the version. If that ever stops
+    # being true, this test is what should fail.
+    test "a lifecycle transition never moves it", %{config: c, s: s} do
+      :ok = State.put(c, :started, server: s)
+      assert {:ok, %{config: %{version: "7.1.0"}}} = State.get(c.slug, s)
+
+      # The shape of a stop: read the persisted config back, write it with a
+      # new lifecycle state. Exactly what Manager/BootStarter/Watchdog do.
+      {:ok, %{config: persisted}} = State.get(c.slug, s)
+      :ok = State.put(persisted, :stopped, server: s)
+      assert {:ok, %{config: %{version: "7.1.0"}, state: :stopped}} = State.get(c.slug, s)
+
+      {:ok, %{config: persisted2}} = State.get(c.slug, s)
+      :ok = State.put(persisted2, :started, server: s)
+      assert {:ok, %{config: %{version: "7.1.0"}, state: :started}} = State.get(c.slug, s)
+    end
+
+    test "an install/update of a new config does move it", %{config: c, s: s} do
+      # The other half of the invariant: writing a genuinely different config
+      # (what install and, later, update do) is the only thing that changes
+      # the reported version.
+      :ok = State.put(c, :started, server: s)
+      :ok = State.put(%{c | version: "7.2.0"}, :started, server: s)
+
+      assert {:ok, %{config: %{version: "7.2.0"}}} = State.get(c.slug, s)
+    end
+
+    test "it survives a round-trip through disk", %{config: c} do
+      path =
+        Path.join(
+          System.tmp_dir!(),
+          "vagus_state_version_#{System.unique_integer([:positive])}.json"
+        )
+
+      on_exit(fn -> File.rm(path) end)
+
+      first = start_supervised!({State, name: nil, persist_path: path}, id: :first)
+      :ok = State.put(c, :started, server: first)
+      :ok = stop_supervised!(:first)
+
+      revived = start_supervised!({State, name: nil, persist_path: path}, id: :revived)
+      assert {:ok, %{config: %{version: "7.1.0"}}} = State.get(c.slug, revived)
+    end
+  end
 end

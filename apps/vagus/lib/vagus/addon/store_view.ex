@@ -21,10 +21,26 @@ defmodule Vagus.Addon.StoreView do
   required `StoreAddon`/`StoreAddonComplete` field (found live in P5:
   Core 2026.7.2's aiohasupervisor raises `MissingField` without it, killing
   the whole hassio coordinator refresh).
+
+  `installed_version` is the version of the *locally installed* copy, or
+  `nil` when it isn't installed (or the caller has no state context). It is
+  what makes `update_available` real: the store entry's own `config.version`
+  is the latest, and these two differing is the entire signal the frontend
+  uses to offer an update.
   """
-  @spec summary(String.t(), %{config: Config.t(), repository: String.t()}, boolean()) :: map()
-  def summary(store_slug, %{config: config, repository: repo}, installed?) do
-    base_fields(store_slug, config, repo, installed?)
+  @spec summary(
+          String.t(),
+          %{config: Config.t(), repository: String.t()},
+          boolean(),
+          nil | String.t()
+        ) :: map()
+  def summary(
+        store_slug,
+        %{config: config, repository: repo},
+        installed?,
+        installed_version \\ nil
+      ) do
+    base_fields(store_slug, config, repo, installed?, installed_version)
   end
 
   @doc """
@@ -49,10 +65,23 @@ defmodule Vagus.Addon.StoreView do
     }
   end
 
-  @doc "The `StoreAddonComplete` detail for `GET /store/addons/{slug}`."
-  @spec detail(String.t(), %{config: Config.t(), repository: String.t()}, boolean()) :: map()
-  def detail(store_slug, %{config: config, repository: repo}, installed?) do
-    base_fields(store_slug, config, repo, installed?)
+  @doc """
+  The `StoreAddonComplete` detail for `GET /store/addons/{slug}`. See
+  `summary/4` for `installed_version`.
+  """
+  @spec detail(
+          String.t(),
+          %{config: Config.t(), repository: String.t()},
+          boolean(),
+          nil | String.t()
+        ) :: map()
+  def detail(
+        store_slug,
+        %{config: config, repository: repo},
+        installed?,
+        installed_version \\ nil
+      ) do
+    base_fields(store_slug, config, repo, installed?, installed_version)
     |> Map.merge(%{
       "apparmor" => if(config.apparmor, do: "default", else: "disable"),
       "auth_api" => config.auth_api,
@@ -73,7 +102,7 @@ defmodule Vagus.Addon.StoreView do
 
   # AddonInfoBaseFields + AddonInfoStoreBaseFields + installed, shared by
   # both shapes.
-  defp base_fields(store_slug, config, repo, installed?) do
+  defp base_fields(store_slug, config, repo, installed?, installed_version) do
     %{
       "advanced" => false,
       "available" => true,
@@ -87,10 +116,12 @@ defmodule Vagus.Addon.StoreView do
       "repository" => repo,
       "slug" => store_slug,
       "stage" => "stable",
-      "update_available" => false,
+      # The store entry's version IS the latest; `version` is what is running
+      # locally, which is only the same thing when nothing has moved on.
+      "update_available" => Vagus.Version.update_available?(installed_version, config.version),
       "url" => nil,
       "version_latest" => config.version,
-      "version" => config.version,
+      "version" => installed_version || config.version,
       "arch" => config.arch,
       "documentation" => false
     }

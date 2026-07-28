@@ -38,10 +38,25 @@ defmodule Vagus.Addon.Info do
       `Vagus.Ingress.dynamic_port/2` has allocated one.
     * `:ingress_panel` — the persisted sidebar-panel toggle (§B4.4).
     * `:watchdog` — the persisted watchdog enable/disable (§B8).
+    * `:version_latest` — the version the store currently advertises for this
+      add-on, which drives `version_latest` and `update_available`. Omitted
+      (or `nil`) means "not resolved": either the caller has no store context,
+      or the add-on is **detached** — installed, but its repository no longer
+      lists it. Both render as `version_latest == version` and
+      `update_available == false`, matching upstream, which cannot offer an
+      update it has no store entry for.
+
+  `version` always comes from `config`, which for an installed add-on is the
+  config captured at install time — `Vagus.Addon.State` never refreshes a
+  stored config from the store catalog, so it is the installed version by
+  construction. See `addon_state_test.exs`'s "start/stop never moves the
+  installed version" for the invariant that keeps that true.
   """
   @spec render(Config.t(), :started | :stopped, map(), map()) :: map()
   def render(%Config{} = config, state, options, settings \\ %{})
       when is_map(options) and is_map(settings) do
+    latest = Map.get(settings, :version_latest)
+
     %{
       # AddonInfoBaseFields
       "advanced" => false,
@@ -55,9 +70,9 @@ defmodule Vagus.Addon.Info do
       "repository" => "core",
       "slug" => config.slug,
       "stage" => "stable",
-      "update_available" => false,
+      "update_available" => Vagus.Version.update_available?(config.version, latest),
       "url" => nil,
-      "version_latest" => config.version,
+      "version_latest" => latest || config.version,
       "version" => config.version,
       # AddonInfoStoreBaseFields
       "arch" => config.arch,

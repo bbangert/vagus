@@ -358,4 +358,73 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
       assert body(conn)["data"]["addons"] == []
     end
   end
+
+  describe "version tracking on the wire (P2-A P2)" do
+    # Before this phase, `version`, `version_latest` and `update_available`
+    # were hardcoded (version == version_latest, update_available always
+    # false), so the frontend's update button could never appear.
+
+    test "a store version bump makes update_available true without touching the install" do
+      installed = fixture_config("verbump")
+      seed_store("core_verbump", installed)
+
+      conn = supervisor_call(:post, "/store/addons/core_verbump/install")
+      assert conn.status == 200
+
+      # Installed and store agree: nothing to update.
+      before = json(supervisor_call(:get, "/store/addons/core_verbump"))["data"]
+      assert before["version"] == installed.version
+      assert before["version_latest"] == installed.version
+      assert before["update_available"] == false
+
+      # The repository publishes a new version. Only the catalog moves.
+      seed_store("core_verbump", %{installed | version: "9.9.9"})
+
+      after_bump = json(supervisor_call(:get, "/store/addons/core_verbump"))["data"]
+      assert after_bump["version"] == installed.version
+      assert after_bump["version_latest"] == "9.9.9"
+      assert after_bump["update_available"] == true
+
+      # The installed add-on's own info route agrees.
+      info = json(supervisor_call(:get, "/addons/core_verbump/info"))["data"]
+      assert info["version"] == installed.version
+      assert info["version_latest"] == "9.9.9"
+      assert info["update_available"] == true
+
+      # And so does the list route, which renders through a different path.
+      listed =
+        json(supervisor_call(:get, "/store/addons"))["data"]["addons"]
+        |> Enum.find(&(&1["slug"] == "core_verbump"))
+
+      assert listed["version"] == installed.version
+      assert listed["version_latest"] == "9.9.9"
+      assert listed["update_available"] == true
+    end
+
+    test "an add-on detached from the store reports no update, not an error" do
+      installed = fixture_config("detached")
+      seed_store("core_detached", installed)
+      assert supervisor_call(:post, "/store/addons/core_detached/install").status == 200
+
+      # The repository drops it entirely — installed, but no store entry.
+      :ok = GenServer.call(Store, {:put_catalog, Map.delete(Store.catalog(), "core_detached")})
+
+      info = json(supervisor_call(:get, "/addons/core_detached/info"))["data"]
+      assert info["version"] == installed.version
+      assert info["version_latest"] == installed.version
+      assert info["update_available"] == false
+    end
+
+    test "an uninstalled store entry reports the store version and no update" do
+      seed_store("core_notinstalled", fixture_config("notinstalled"))
+
+      data = json(supervisor_call(:get, "/store/addons/core_notinstalled"))["data"]
+
+      assert data["installed"] == false
+      assert data["version"] == data["version_latest"]
+      assert data["update_available"] == false
+    end
+  end
+
+  defp json(conn), do: Jason.decode!(conn.resp_body)
 end

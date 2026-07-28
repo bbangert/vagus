@@ -315,8 +315,10 @@ defmodule Vagus.Core.Versions do
     end)
   end
 
+  # Delegates to the shared comparator so add-ons and Core can't drift apart
+  # on what "an update is available" means. Behaviour here is unchanged.
   defp update_available_result(installed, latest_value) do
-    is_binary(installed) and is_binary(latest_value) and latest_value != installed
+    Vagus.Version.update_available?(installed, latest_value)
   end
 
   defp cached_value_or_nil(%{value: value}), do: value
