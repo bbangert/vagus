@@ -359,6 +359,54 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
     end
   end
 
+  describe "GET /addons/:slug/info falls back to the store (V1 legacy routing)" do
+    # This one endpoint backs BOTH add-on pages in the frontend: opening a card
+    # from the store navigates to `/config/app/{slug}/info?store=true`, whose
+    # only fetch is this route. 404 here means every store card opens an
+    # "Error loading app" screen. Upstream serves it with a V1-only shim
+    # (`api/__init__.py::apps_app_info`) that falls through to the store detail
+    # payload plus `state`/`options`.
+
+    test "an uninstalled store add-on returns its store detail, not a 404" do
+      config = fixture_config("browsable")
+      seed_store("core_browsable", config)
+
+      conn = supervisor_call(:get, "/addons/core_browsable/info")
+      assert conn.status == 200
+
+      info = json(conn)["data"]
+      assert info["slug"] == "core_browsable"
+      assert info["name"] == config.name
+      assert info["installed"] == false
+      assert info["version_latest"] == config.version
+
+      # The two fields the store shape doesn't carry, grafted on by the shim.
+      assert info["state"] == "unknown"
+      assert info["options"] == config.options
+
+      # Store-detail extras the info page renders.
+      assert info["detached"] == false
+      assert Map.has_key?(info, "hassio_role")
+    end
+
+    test "an installed add-on still gets the installed shape, not the store's" do
+      config = fixture_config("realinstall")
+      seed_store("core_realinstall", config)
+      assert supervisor_call(:post, "/store/addons/core_realinstall/install").status == 200
+
+      info = json(supervisor_call(:get, "/addons/core_realinstall/info"))["data"]
+      assert info["state"] == "stopped"
+      # `hostname` only exists on the installed shape — proof of which branch ran.
+      assert info["hostname"] == "core-realinstall"
+    end
+
+    test "a slug in neither the store nor the install set is still a 404" do
+      conn = supervisor_call(:get, "/addons/core_nowhere/info")
+      assert conn.status == 404
+      assert json(conn)["result"] == "error"
+    end
+  end
+
   describe "version tracking on the wire (P2-A P2)" do
     # Before this phase, `version`, `version_latest` and `update_available`
     # were hardcoded (version == version_latest, update_available always

@@ -387,7 +387,39 @@ defmodule Vagus.API.Router do
       )
     else
       {:error, :forbidden} -> Envelope.send_error(conn, "Not authorized for this add-on", 403)
-      _ -> Envelope.send_error(conn, "Add-on #{slug} does not exist", 404)
+      _ -> uninstalled_addon_info(conn, slug)
+    end
+  end
+
+  # V1's legacy store fallback. `GET /addons/{slug}/info` is the ONLY call the
+  # frontend makes when you open an add-on page — from the store listing too
+  # (`_addonTapped` navigates to `/config/app/{slug}/info?store=true`, and
+  # `ha-config-app-dashboard._loadAddon` fetches this endpoint and shows an
+  # error screen if it fails). Upstream serves that by registering a shim on
+  # the V1 route only (`api/__init__.py::apps_app_info`): installed add-ons get
+  # the normal info, `APIAppNotInstalled` falls through to the store's detail
+  # payload with `state` and `options` grafted on, and a slug in neither still
+  # 404s. The V2 `/apps/{slug}/info` route keeps the strict behaviour.
+  #
+  # Without this an uninstalled store add-on's page is an "Error loading app"
+  # screen — every card in the store is unclickable.
+  #
+  # No new exposure for a default-role add-on caller: `options` here is the
+  # store config's *defaults* out of `config.yaml`, not another add-on's saved
+  # user options (those live in `State` and only the installed branch reads
+  # them).
+  defp uninstalled_addon_info(conn, slug) do
+    case Store.get(slug) do
+      {:ok, %{config: config} = entry} ->
+        detail =
+          slug
+          |> StoreView.detail(entry, false)
+          |> Map.merge(%{"state" => "unknown", "options" => config.options})
+
+        Envelope.send_ok(conn, detail)
+
+      :error ->
+        Envelope.send_error(conn, "Add-on #{slug} does not exist", 404)
     end
   end
 
