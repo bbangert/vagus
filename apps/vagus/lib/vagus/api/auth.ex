@@ -4,10 +4,14 @@ defmodule Vagus.API.Auth do
 
   Every request must carry a token — either `Authorization: Bearer <token>` or
   `X-Supervisor-Token: <token>` (bashio/add-ons use the latter) — with one
-  exception: `conn.assigns[:auth_bypass] == true`, set by
-  `Vagus.API.Router`'s `bypass_auth_for_asset_get/2` plug for the icon/logo
-  GETs Core's proxy forwards with no `Authorization` header at all. See that
-  plug's comment for the upstream citation; this module just honors the flag.
+  exception: the icon/logo GETs Core's proxy forwards with no `Authorization`
+  header at all, which this module recognises itself via `unauthenticated?/1`.
+
+  That decision is deliberately made HERE and nowhere else. An earlier
+  revision had the router set a `conn.assigns[:auth_bypass]` flag that this
+  module honored; assigns are a channel any plug can write, so trusting one
+  at the auth boundary meant a future plug could disable authentication for
+  any route by accident. There is now no flag to set.
   The token is resolved to a **caller**, assigned on `conn.assigns.caller`, so
   add-on-facing endpoints can authorize:
 

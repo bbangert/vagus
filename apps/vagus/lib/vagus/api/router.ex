@@ -2,11 +2,9 @@ defmodule Vagus.API.Router do
   @moduledoc """
   The Supervisor-API emulator's HTTP surface.
 
-  Pipeline order: body parsing, then `bypass_auth_for_asset_get/2` (the one
-  pre-auth exemption — see its comment above its position in the pipeline
-  for why icon/logo GETs must skip auth entirely), then `Vagus.API.Auth`
-  (every other request, including ones that end up 404ing, must
-  authenticate), then routing. Every response — success, honest no-op,
+  Pipeline order: body parsing, then `Vagus.API.Auth` (every request,
+  including ones that end up 404ing, must authenticate — with one exemption
+  that `Vagus.API.Auth` decides for itself, see below), then routing. Every response — success, honest no-op,
   honest error, the catch-all 404, or an exception raised anywhere in the
   pipeline (`use Plug.ErrorHandler`, `handle_errors/2` below) — goes out
   through `Vagus.API.Envelope` so a bare/default Plug response never leaks
@@ -102,24 +100,23 @@ defmodule Vagus.API.Router do
     length: 65_536
   )
 
-  # The one exemption to "no exempt routes" above `Vagus.API.Auth` — B1's
-  # lesson was that a pre-auth plug doing too much is dangerous, not that a
-  # pre-auth plug can never be justified. Icon/logo GETs are unauthenticated
-  # by upstream contract, not by choice: Core's own proxy forwards them with
-  # NO Authorization header at all — `PATHS_NO_AUTH =
-  # re.compile(r"^(?:|(store/)?addons/[^/]+/(logo|icon))$")` in
-  # `homeassistant/components/hassio/http.py` — and Supervisor's
-  # `no_security_check` regex skips its own auth middleware for the same
-  # paths. Requiring a token here doesn't add security, since the proxy never
-  # has one to attach; it just permanently breaks every add-on's icon in the
-  # frontend. `Vagus.API.Auth` checks `conn.assigns[:auth_bypass]` and
-  # returns early when this plug set it.
+  # `Vagus.API.Auth` authenticates every request, with exactly one exemption
+  # that it decides for itself: GET of an add-on's icon/logo. That carve-out
+  # lives in `Vagus.API.Auth.unauthenticated?/1` — deliberately NOT in a
+  # pre-auth plug here setting a flag for Auth to honor, because a flag is a
+  # channel any plug could write, and B1's lesson is that a pre-auth plug
+  # doing more than it must is where this router got burned before. Nothing
+  # in this module can cause a request to skip authentication.
   #
-  # The carve-out is kept as narrow as B1's incident argues a pre-auth plug
-  # should be: GET only, exact `path_info` **segment** match — never a regex
-  # over the raw request path, which would also match a `..`-mangled or
-  # doubly-encoded path a segment-list comparison can't be fooled by — and
-  # the slug is validated before anything downstream trusts it.
+  # The exemption is upstream contract, not a choice: Core's proxy forwards
+  # those GETs with NO Authorization header at all (`PATHS_NO_AUTH` in
+  # `homeassistant/components/hassio/http.py` — when it matches, the branch
+  # short-circuits before the header is set, for admins too), and Supervisor
+  # skips its own middleware for them (`no_security_check` splices in
+  # `_V1_FRONTEND_PATHS`, i.e. `|/(store/)?addons/<RE_SLUG>/(logo|icon)` —
+  # reading its literal alternatives alone will mislead you). Requiring a
+  # token here adds no security, since the proxy has none to attach; it just
+  # permanently breaks every add-on's icon in the frontend.
   plug(Vagus.API.Auth)
   plug(:match)
   plug(:dispatch)
@@ -306,7 +303,7 @@ defmodule Vagus.API.Router do
 
   # -- Store assets: icon/logo/changelog/documentation (P2-A P4) ------------
   #
-  # icon/logo are unauthenticated (see `bypass_auth_for_asset_get/2` above the
+  # icon/logo are unauthenticated (see `Vagus.API.Auth.unauthenticated?/1` —
   # plug pipeline) and mirror upstream's exact absent-asset shape — 400 +
   # `application/octet-stream`, not a JSON envelope and not a 404. Neither
   # handler touches `conn.assigns.caller`: the pre-auth plug never resolves
