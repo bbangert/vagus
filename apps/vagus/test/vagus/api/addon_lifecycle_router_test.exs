@@ -465,4 +465,124 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
   end
 
   defp json(conn), do: Jason.decode!(conn.resp_body)
+
+  describe "POST .../update (P2-A P3)" do
+    test "updates an installed add-on and reports the new version on the wire" do
+      installed = fixture_config("updrt")
+      seed_store("core_updrt", installed)
+      assert supervisor_call(:post, "/store/addons/core_updrt/install").status == 200
+
+      seed_store("core_updrt", %{installed | version: "9.9.9"})
+
+      conn = supervisor_call(:post, "/store/addons/core_updrt/update", %{})
+      assert conn.status == 200
+
+      info = json(supervisor_call(:get, "/addons/core_updrt/info"))["data"]
+      assert info["version"] == "9.9.9"
+      assert info["update_available"] == false
+    end
+
+    test "the legacy /addons/... alias and the ignored /version segment both work" do
+      # The legacy `/addons/...` alias has no `/version` form — only the
+      # `/store/addons/...` path does, matching upstream's route table.
+      for {slug, path} <- [
+            {"core_updalias", "/addons/core_updalias/update"},
+            {"core_updver", "/store/addons/core_updver/update/1.2.3"}
+          ] do
+        installed = fixture_config(slug)
+        seed_store(slug, installed)
+        assert supervisor_call(:post, "/store/addons/#{slug}/install").status == 200
+        seed_store(slug, %{installed | version: "9.9.9"})
+
+        # Upstream registers `/update/{version}` and never reads the segment —
+        # it always goes to the store's current version, which is what the
+        # 9.9.9 assertion below pins.
+        conn = supervisor_call(:post, path, %{})
+        assert conn.status == 200
+
+        assert json(supervisor_call(:get, "/addons/#{slug}/info"))["data"]["version"] == "9.9.9"
+      end
+    end
+
+    test "background: true is refused honestly rather than faked" do
+      installed = fixture_config("updbg")
+      seed_store("core_updbg", installed)
+      assert supervisor_call(:post, "/store/addons/core_updbg/install").status == 200
+      seed_store("core_updbg", %{installed | version: "9.9.9"})
+
+      conn = supervisor_call(:post, "/store/addons/core_updbg/update", %{"background" => true})
+
+      assert conn.status == 400
+      assert json(conn)["message"] =~ "background"
+      # Refused BEFORE doing anything: still on the old version.
+      assert json(supervisor_call(:get, "/addons/core_updbg/info"))["data"]["version"] ==
+               installed.version
+    end
+
+    test "background: false and an absent body both proceed" do
+      installed = fixture_config("updbgfalse")
+      seed_store("core_updbgfalse", installed)
+      assert supervisor_call(:post, "/store/addons/core_updbgfalse/install").status == 200
+      seed_store("core_updbgfalse", %{installed | version: "9.9.9"})
+
+      conn =
+        supervisor_call(:post, "/store/addons/core_updbgfalse/update", %{"background" => false})
+
+      assert conn.status == 200
+    end
+
+    test "unknown body keys are ignored (aiohttp tolerance)" do
+      installed = fixture_config("updunknown")
+      seed_store("core_updunknown", installed)
+      assert supervisor_call(:post, "/store/addons/core_updunknown/install").status == 200
+      seed_store("core_updunknown", %{installed | version: "9.9.9"})
+
+      conn =
+        supervisor_call(:post, "/store/addons/core_updunknown/update", %{"nonsense" => "ignored"})
+
+      assert conn.status == 200
+    end
+
+    test "an add-on with no update available is a 400, not a silent success" do
+      installed = fixture_config("updsame")
+      seed_store("core_updsame", installed)
+      assert supervisor_call(:post, "/store/addons/core_updsame/install").status == 200
+
+      conn = supervisor_call(:post, "/store/addons/core_updsame/update", %{})
+
+      assert conn.status == 400
+      assert json(conn)["message"] =~ "No update available"
+    end
+
+    test "an uninstalled slug is 404" do
+      seed_store("core_updghost", fixture_config("updghost"))
+
+      conn = supervisor_call(:post, "/store/addons/core_updghost/update", %{})
+
+      assert conn.status == 404
+      assert json(conn)["message"] =~ "not installed"
+    end
+
+    test "a detached add-on is 404, naming the store rather than the install" do
+      installed = fixture_config("upddetached")
+      seed_store("core_upddetached", installed)
+      assert supervisor_call(:post, "/store/addons/core_upddetached/install").status == 200
+      :ok = GenServer.call(Store, {:put_catalog, Map.delete(Store.catalog(), "core_upddetached")})
+
+      conn = supervisor_call(:post, "/store/addons/core_upddetached/update", %{})
+
+      assert conn.status == 404
+      assert json(conn)["message"] =~ "no longer available in the store"
+    end
+
+    test "a non-supervisor caller is refused" do
+      conn =
+        :post
+        |> conn("/store/addons/core_whatever/update", Jason.encode!(%{}))
+        |> put_req_header("content-type", "application/json")
+        |> Router.call(@opts)
+
+      assert conn.status == 401
+    end
+  end
 end
