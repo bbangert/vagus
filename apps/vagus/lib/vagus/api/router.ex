@@ -1689,11 +1689,32 @@ defmodule Vagus.API.Router do
   defp long_description(slug) do
     with {:ok, id, handle} <- resolve_asset(slug),
          {:ok, binary} <- Assets.get(id, :readme, handle) do
-      binary
+      utf8_scrub(binary)
     else
       _absent -> nil
     end
   end
+
+  # A README arrives as whatever bytes a third-party repository tarball
+  # carried, and this one goes into a **JSON** response — `Jason.encode!/1`
+  # raises on invalid UTF-8, which would turn one add-on's Latin-1 README into
+  # a 500 on its store page. The other text assets are served as `text/plain`
+  # and never hit an encoder, so this is the only read that needs it.
+  #
+  # Replace rather than reject: upstream reads the file with
+  # `errors="replace"` (`AppModel.long_description`), so a README with a few
+  # bad bytes still renders, minus those bytes. Dropping to `nil` would blank
+  # a page that upstream shows. One U+FFFD per bad byte, matching Python.
+  defp utf8_scrub(binary) when is_binary(binary) do
+    if String.valid?(binary), do: binary, else: binary |> scrub_bytes([])
+  end
+
+  defp scrub_bytes(<<>>, acc), do: acc |> Enum.reverse() |> IO.iodata_to_binary()
+
+  defp scrub_bytes(<<char::utf8, rest::binary>>, acc),
+    do: scrub_bytes(rest, [<<char::utf8>> | acc])
+
+  defp scrub_bytes(<<_bad::8, rest::binary>>, acc), do: scrub_bytes(rest, ["�" | acc])
 
   # -- addon lifecycle helpers ------------------------------------------------
 

@@ -288,6 +288,32 @@ defmodule Vagus.API.AddonAssetsRouterTest do
       assert data["long_description"] == readme
     end
 
+    test "a README with invalid UTF-8 is scrubbed, not a 500" do
+      # The bytes come from a third-party repository tarball and this field is
+      # JSON-encoded, so an add-on shipping a Latin-1 README would otherwise
+      # raise in `Jason.encode!/1` and 500 its own store page. Upstream reads
+      # with `errors="replace"`, so the page still renders.
+      id = seed_store("core_latin1readme")
+      put_asset(id, :readme, <<"# Caf", 0xE9, "\n\nBody.\n">>)
+
+      conn = supervisor_call(:get, "/store/addons/core_latin1readme")
+      assert conn.status == 200
+
+      assert Jason.decode!(conn.resp_body)["data"]["long_description"] ==
+               "# Caf�\n\nBody.\n"
+    end
+
+    test "a valid multi-byte README is passed through untouched" do
+      id = seed_store("core_utf8readme")
+      readme = "# Café ☕\n\nEmoji: 🎛️\n"
+      put_asset(id, :readme, readme)
+
+      data =
+        Jason.decode!(supervisor_call(:get, "/store/addons/core_utf8readme").resp_body)["data"]
+
+      assert data["long_description"] == readme
+    end
+
     test "an add-on shipping no README reports null, not an empty string" do
       seed_store("core_readmeless")
 
