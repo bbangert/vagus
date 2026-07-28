@@ -381,11 +381,7 @@ defmodule Vagus.API.Router do
 
     with {:ok, resolved} <- resolve_info_slug(slug, caller),
          {:ok, %{config: config, state: state} = entry} <- Vagus.Addon.State.get(resolved) do
-      options =
-        case read_addon_options(resolved) do
-          {:ok, opts} -> opts
-          :error -> config.options
-        end
+      options = live_options(entry)
 
       settings =
         entry
@@ -445,9 +441,22 @@ defmodule Vagus.API.Router do
       match?({:addon, _}, conn.assigns.caller) ->
         {:addon, %{slug: caller_slug}} = conn.assigns.caller
 
-        case read_addon_options(caller_slug) do
-          {:ok, options} -> Envelope.send_ok(conn, options)
-          :error -> Envelope.send_error(conn, "Invalid configuration data for the app", 400)
+        # Upstream answers `app.schema.validate(app.options)` — the same live
+        # merge, validated — not a file read, so an add-on calling
+        # `bashio::config` sees an option saved while it was running rather
+        # than the snapshot it booted with.
+        case Vagus.Addon.State.get(caller_slug) do
+          {:ok, %{config: config} = entry} ->
+            case OptionsSchema.validate(config.schema, live_options(entry)) do
+              {:ok, options} ->
+                Envelope.send_ok(conn, options)
+
+              {:error, _reason} ->
+                Envelope.send_error(conn, "Invalid configuration data for the app", 400)
+            end
+
+          :error ->
+            Envelope.send_error(conn, "Invalid configuration data for the app", 400)
         end
 
       true ->
@@ -1735,17 +1744,25 @@ defmodule Vagus.API.Router do
 
   # -- addon lifecycle helpers ------------------------------------------------
 
-  # `GET /addons` entry: the effective options (falling back to the config
-  # defaults, same as `/addons/{slug}/info`) rendered through
-  # `Vagus.Addon.Info.render/4`.
+  # `GET /addons` entry: the same live options `/addons/{slug}/info` reports,
+  # rendered through `Vagus.Addon.Info.render/4`.
   defp addon_list_entry(%{config: config, state: state} = entry) do
-    options =
-      case read_addon_options(config.slug) do
-        {:ok, opts} -> opts
-        :error -> config.options
-      end
+    Vagus.Addon.Info.render(config, state, live_options(entry), info_settings(entry))
+  end
 
-    Vagus.Addon.Info.render(config, state, options, info_settings(entry))
+  # What an add-on's options ARE right now: the config's defaults with the
+  # user's saved options merged over them (`App.options` upstream, same
+  # deepmerge).
+  #
+  # NOT `/data/options.json`. That file is an *output* — `Manager.start/2`
+  # writes it for the container — so reading it back reports whatever the
+  # add-on was last started with: the config defaults for an add-on that has
+  # never run, and stale values for one whose options changed since. The
+  # Configuration page re-renders from this field right after saving, so a
+  # save the user just made came back as the default and the form appeared to
+  # clear itself.
+  defp live_options(%{config: config, user_options: user_options}) do
+    OptionsSchema.merge(config.options, user_options || %{})
   end
 
   # `Vagus.Addon.Info.render/4`'s `settings` param: the State entry's
@@ -1914,9 +1931,9 @@ defmodule Vagus.API.Router do
         :error ->
           Envelope.send_error(conn, "Addon #{slug} does not exist", 404)
 
-        {:ok, %{config: config}} ->
+        {:ok, entry} ->
           conn
-          |> Envelope.send_ok(validate_options_report(config, conn.body_params, slug))
+          |> Envelope.send_ok(validate_options_report(entry, conn.body_params))
       end
     else
       Envelope.send_error(conn, "unauthorized", 403)
@@ -1927,22 +1944,12 @@ defmodule Vagus.API.Router do
   # the save path uses (`validate_options_key/2`), so the dry run and the real
   # write can never disagree — a "valid" answer followed by a 400 on save is
   # the one outcome this endpoint exists to prevent.
-  defp validate_options_report(config, body, slug) do
-    options = if is_map(body) and map_size(body) > 0, do: body, else: stored_options(config, slug)
+  defp validate_options_report(%{config: config} = entry, body) do
+    options = if is_map(body) and map_size(body) > 0, do: body, else: live_options(entry)
 
     case OptionsSchema.effective(config.schema, config.options, options) do
       {:ok, _validated} -> %{"valid" => true, "message" => "", "pwned" => false}
       {:error, message} -> %{"valid" => false, "message" => message, "pwned" => false}
-    end
-  end
-
-  # Upstream validates an empty body against the add-on's current options
-  # (`await request.json() or app.options`), which is what the frontend relies
-  # on to pre-flight an unchanged config.
-  defp stored_options(config, slug) do
-    case read_addon_options(slug) do
-      {:ok, options} -> options
-      :error -> config.options
     end
   end
 
@@ -2385,30 +2392,6 @@ defmodule Vagus.API.Router do
   # the value is safe both as a Docker ref suffix and a path component.
   defp valid_slug?(slug) do
     Regex.match?(~r/\A[A-Za-z0-9_.-]+\z/, slug) and not String.contains?(slug, "..")
-  end
-
-  # -- addon self-config helper ----------------------------------------------
-
-  # Reads the effective options `Manager.start` wrote to the add-on's
-  # `/data/options.json` (data root from `config :vagus, :addon_data_root`).
-  # path is internal/config-derived, not request input
-  # sobelow_skip ["Traversal.FileModule"]
-  defp read_addon_options(slug) do
-    path =
-      Path.join([
-        Application.get_env(:vagus, :addon_data_root, "/data"),
-        "addons",
-        "data",
-        slug,
-        "options.json"
-      ])
-
-    with {:ok, bin} <- File.read(path),
-         {:ok, options} when is_map(options) <- Jason.decode(bin) do
-      {:ok, options}
-    else
-      _ -> :error
-    end
   end
 
   # -- auth helpers ----------------------------------------------------------

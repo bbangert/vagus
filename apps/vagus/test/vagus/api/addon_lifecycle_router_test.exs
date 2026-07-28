@@ -388,6 +388,50 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
       assert {:ok, %{user_options: %{"greeting" => "hey"}}} = State.get("core_opts")
     end
 
+    test "a saved option is what the info payload reports back" do
+      # The Configuration page re-renders from `info.options` the moment a
+      # save returns. Reporting the config defaults here is what made a saved
+      # password look like it had cleared itself — the value was in State the
+      # whole time.
+      assert supervisor_call(:post, "/addons/core_opts/options", %{
+               "options" => %{"greeting" => "secret-value"}
+             }).status == 200
+
+      info = body(supervisor_call(:get, "/addons/core_opts/info"))["data"]
+      assert info["options"]["greeting"] == "secret-value"
+
+      # ...and through the list route, which renders by a different path.
+      listed =
+        body(supervisor_call(:get, "/addons"))["data"]["addons"]
+        |> Enum.find(&(&1["slug"] == "core_opts"))
+
+      assert listed["options"]["greeting"] == "secret-value"
+    end
+
+    test "options the user never touched keep their config defaults" do
+      {:ok, config} =
+        Config.parse(%{
+          "name" => "Test Addon",
+          "version" => "3",
+          "slug" => "core_partialopts",
+          "description" => "d",
+          "arch" => ["amd64"],
+          "image" => "homeassistant/{arch}-addon-test",
+          "options" => %{"greeting" => "hi", "untouched" => true},
+          "schema" => %{"greeting" => "str", "untouched" => "bool"}
+        })
+
+      :ok = State.put(config, :stopped)
+      on_exit(fn -> State.delete("core_partialopts") end)
+
+      assert supervisor_call(:post, "/addons/core_partialopts/options", %{
+               "options" => %{"greeting" => "hey"}
+             }).status == 200
+
+      info = body(supervisor_call(:get, "/addons/core_partialopts/info"))["data"]
+      assert info["options"] == %{"greeting" => "hey", "untouched" => true}
+    end
+
     test "an invalid options map -> 400, nothing stored" do
       conn =
         supervisor_call(:post, "/addons/core_opts/options", %{"options" => %{"greeting" => 5}})
