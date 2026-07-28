@@ -26,6 +26,13 @@ config :nerves, :firmware,
 
 config :nerves, source_date_epoch: "1784525674"
 
+# How `Vagus.Addon.Store` retains repository assets (icon/logo/changelog/
+# documentation): `:auto | :memory | :disk`. `:auto` decides at boot from
+# `MemTotal` — under 1 GiB goes to disk. Set here rather than per target so
+# detection is the default everywhere; a target file below can pin a mode if
+# a board is ever misjudged. See `Vagus.Addon.Store.AssetMode`.
+config :vagus, :store_asset_mode, :auto
+
 if Mix.target() == :host do
   import_config "host.exs"
 else
