@@ -14,10 +14,16 @@ defmodule Vagus.Addon.UpdateTest do
   alias Vagus.Addon.{Config, Manager, State, Store, Update}
 
   # A backend that records every call in the CALLER's process dictionary and
-  # fails whichever calls the test asked it to. Caller-process state is sound
-  # here (and keeps this file from needing a global fake) because `Update`,
-  # `Manager` and this backend all run in the test process — none of them
-  # spawn.
+  # fails whichever calls the test asked it to. Keeps this file from needing a
+  # global fake.
+  #
+  # The constraint that makes it sound is narrower than "nothing spawns" —
+  # this file does spawn, in the serialization tests. It is that `script/1`
+  # and the assertions on `calls/0`/`removed_images/0` must run in the SAME
+  # process that drives `Update.update/2`, because that is the process the
+  # backend callbacks execute in. A test that moves the update into a `Task`
+  # must read the recorded calls from inside that task, not from the test
+  # process.
   defmodule ScriptedBackend do
     @behaviour Vagus.Addon.Backend
 
