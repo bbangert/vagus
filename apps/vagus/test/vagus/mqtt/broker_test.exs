@@ -155,10 +155,10 @@ defmodule Vagus.Mqtt.BrokerTest do
 
   # ---------- helpers ----------
 
-  # `owner` is where this client's deliveries land. It defaults to the test
-  # process (which is what almost every test wants — one mailbox, one
-  # `assert_receive`); pass `start_inbox/0` when an assertion must be about
-  # *this* client's deliveries and nothing else's.
+  # `owner` is the pid this client's deliveries are sent to. It defaults to
+  # the test process (which is what almost every test wants — one mailbox,
+  # one `assert_receive`); pass the pid `start_inbox()` returns when an
+  # assertion must be about *this* client's deliveries and nothing else's.
   defp connect_client!(port, tag, version \\ 4, owner \\ nil) do
     {:ok, client} =
       MqttX.Client.connect(
