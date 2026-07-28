@@ -120,7 +120,10 @@ defmodule Vagus.Addon.Info do
       "options" => options,
       "schema" => nil,
       "machine" => [],
-      "network" => config.ports,
+      # Effective, not the config's defaults: this is what the Network card
+      # renders, so reporting the declared ports would show the user's saved
+      # remap reverting the moment the page reloads.
+      "network" => Vagus.Addon.Ports.effective(config, Map.get(settings, :ports) || %{}),
       "network_description" => nil,
       "host_ipc" => config.host_ipc,
       "host_uts" => config.host_uts,

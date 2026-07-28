@@ -31,7 +31,7 @@ defmodule Vagus.API.Router do
   require Logger
 
   alias Vagus.Addon.Backend.Native
-  alias Vagus.Addon.{Manager, OptionsSchema, State, Store, StoreView, Update}
+  alias Vagus.Addon.{Manager, OptionsSchema, Ports, State, Store, StoreView, Update}
   alias Vagus.Addon.Store.Assets
   alias Vagus.API.{Envelope, StaticData}
   alias Vagus.Backend
@@ -1759,6 +1759,7 @@ defmodule Vagus.API.Router do
     |> Map.take([:ingress_token, :ingress_port, :ingress_panel, :watchdog])
     |> Map.put(:version_latest, version_latest)
     |> Map.put(:assets, assets)
+    |> Map.put(:ports, Map.get(entry, :ports) || %{})
   end
 
   defp handle_install(conn, slug) do
@@ -1955,10 +1956,12 @@ defmodule Vagus.API.Router do
   defp apply_addon_options(conn, slug, config, body) do
     with {:ok, options_action} <- validate_options_key(body, config),
          {:ok, watchdog_action} <- validate_watchdog_key(body),
-         {:ok, ingress_panel_action} <- validate_ingress_panel_key(body) do
+         {:ok, ingress_panel_action} <- validate_ingress_panel_key(body),
+         {:ok, network_action} <- validate_network_key(body, config) do
       apply_options_action(slug, options_action)
       apply_watchdog_action(slug, config, watchdog_action)
       apply_ingress_panel_action(slug, ingress_panel_action)
+      apply_network_action(slug, network_action)
       Envelope.send_ok(conn, %{})
     else
       {:error, message} -> Envelope.send_error(conn, message, 400)
@@ -1992,6 +1995,36 @@ defmodule Vagus.API.Router do
   defp apply_options_action(_slug, :none), do: :ok
   defp apply_options_action(slug, :reset), do: State.put_options(slug, %{})
   defp apply_options_action(slug, {:set, options}), do: State.put_options(slug, options)
+
+  # The Network card posts `{"network": {"22/tcp": 2222}}` to this same
+  # endpoint. Before this it fell into the accept-and-ignore bucket with the
+  # unmodeled SCHEMA_OPTIONS keys, so the UI reported a successful save and
+  # the port never moved — worse than a 400, which the frontend would at
+  # least have surfaced.
+  #
+  # `null` resets to the config's defaults by dropping the overrides, matching
+  # upstream's setter (`self.persist.pop(ATTR_NETWORK)`); a map is narrowed by
+  # `Ports.sanitize/2`, which forgets ports the config doesn't declare and
+  # rejects a value that isn't a port.
+  defp validate_network_key(body, config) do
+    case Map.fetch(body, "network") do
+      :error ->
+        {:ok, :none}
+
+      {:ok, nil} ->
+        {:ok, :reset}
+
+      {:ok, posted} when is_map(posted) ->
+        with {:ok, p} <- Ports.sanitize(config, posted), do: {:ok, {:set, p}}
+
+      {:ok, _other} ->
+        {:error, "network must be an object or null"}
+    end
+  end
+
+  defp apply_network_action(_slug, :none), do: :ok
+  defp apply_network_action(slug, :reset), do: State.put_setting(slug, :ports, %{})
+  defp apply_network_action(slug, {:set, ports}), do: State.put_setting(slug, :ports, ports)
 
   # `watchdog` must be a boolean when present; no key at all is a no-op.
   defp validate_watchdog_key(body) do

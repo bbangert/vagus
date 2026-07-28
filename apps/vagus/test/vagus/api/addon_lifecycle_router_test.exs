@@ -220,6 +220,77 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
     end
   end
 
+  describe "POST /addons/:slug/options with a network key (the Network card)" do
+    # The card posts to the same options endpoint. `network` used to land in
+    # the accept-and-ignore bucket with the unmodeled SCHEMA_OPTIONS keys, so
+    # the save returned 200 and the port never moved.
+    setup do
+      {:ok, config} =
+        Config.parse(%{
+          "name" => "Test Addon",
+          "version" => "3",
+          "slug" => "core_netopts",
+          "description" => "d",
+          "arch" => ["amd64"],
+          "image" => "homeassistant/{arch}-addon-test",
+          "ports" => %{"22/tcp" => nil, "80/tcp" => 8080}
+        })
+
+      :ok = State.put(config, :stopped)
+      on_exit(fn -> State.delete("core_netopts") end)
+      %{config: config}
+    end
+
+    test "a posted port is persisted and reported back as the effective map" do
+      conn =
+        supervisor_call(:post, "/addons/core_netopts/options", %{
+          "network" => %{"22/tcp" => 2222, "80/tcp" => 8080}
+        })
+
+      assert conn.status == 200
+      assert {:ok, %{ports: %{"22/tcp" => 2222}}} = State.get("core_netopts")
+
+      # The info payload is what the card re-renders from — a default here
+      # would look to the user like the save silently reverted.
+      info = body(supervisor_call(:get, "/addons/core_netopts/info"))["data"]
+      assert info["network"] == %{"22/tcp" => 2222, "80/tcp" => 8080}
+    end
+
+    test "network: null resets to the config's declared defaults" do
+      :ok = State.put_setting("core_netopts", :ports, %{"22/tcp" => 2222})
+
+      conn = supervisor_call(:post, "/addons/core_netopts/options", %{"network" => nil})
+
+      assert conn.status == 200
+      assert {:ok, %{ports: %{}}} = State.get("core_netopts")
+
+      info = body(supervisor_call(:get, "/addons/core_netopts/info"))["data"]
+      assert info["network"] == %{"22/tcp" => nil, "80/tcp" => 8080}
+    end
+
+    test "a value that isn't a port is a 400, and nothing is written" do
+      conn =
+        supervisor_call(:post, "/addons/core_netopts/options", %{
+          "network" => %{"22/tcp" => "2222"}
+        })
+
+      assert conn.status == 400
+      assert body(conn)["message"] =~ "22/tcp"
+      assert {:ok, %{ports: %{}}} = State.get("core_netopts")
+    end
+
+    test "a bad network key rejects the whole body — options must not half-apply" do
+      conn =
+        supervisor_call(:post, "/addons/core_netopts/options", %{
+          "options" => %{"greeting" => "hey"},
+          "network" => %{"22/tcp" => "nope"}
+        })
+
+      assert conn.status == 400
+      assert {:ok, %{user_options: %{}, ports: %{}}} = State.get("core_netopts")
+    end
+  end
+
   describe "POST /addons/:slug/options/validate" do
     # The config page pre-flights every save through this and throws on
     # anything but `valid: true`, so a missing route makes Save fail for every
