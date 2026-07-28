@@ -380,6 +380,10 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
       assert info["installed"] == false
       assert info["version_latest"] == config.version
 
+      # The field the page switches on: nil means "not installed", which is
+      # what makes it render the Install button instead of the controls card.
+      assert info["version"] == nil
+
       # The two fields the store shape doesn't carry, grafted on by the shim.
       assert info["state"] == "unknown"
       assert info["options"] == config.options
@@ -501,13 +505,20 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
       assert info["update_available"] == true
     end
 
-    test "an uninstalled store entry reports the store version and no update" do
-      seed_store("core_notinstalled", fixture_config("notinstalled"))
+    test "an uninstalled store entry has no version, only a version_latest" do
+      config = fixture_config("notinstalled")
+      seed_store("core_notinstalled", config)
 
       data = json(supervisor_call(:get, "/store/addons/core_notinstalled"))["data"]
 
       assert data["installed"] == false
-      assert data["version"] == data["version_latest"]
+      # This used to assert `version == version_latest`, which matched the
+      # implementation and broke the UI: the frontend's add-on page treats a
+      # non-nil `version` as "installed" and renders the controls card instead
+      # of the Install button. Upstream sends `installed.version if installed
+      # else None`.
+      assert data["version"] == nil
+      assert data["version_latest"] == config.version
       assert data["update_available"] == false
     end
   end

@@ -136,7 +136,14 @@ defmodule Vagus.Addon.StoreView do
       "update_available" => Vagus.Version.update_available?(installed_version, config.version),
       "url" => config.url,
       "version_latest" => config.version,
-      "version" => installed_version || config.version,
+      # `nil` when the add-on isn't installed — upstream sends
+      # `installed.version if installed else None`, and the frontend's add-on
+      # page switches its entire layout on this one field: falsy renders the
+      # Install button and the store view, truthy renders the current-version
+      # line, state chip, controls card and uninstall menu. Defaulting it to
+      # the store's version made every uninstalled add-on's page claim to be
+      # installed.
+      "version" => installed_version,
       "arch" => config.arch,
       "documentation" => Map.get(assets, :documentation, false)
     }

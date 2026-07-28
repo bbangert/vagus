@@ -148,12 +148,25 @@ defmodule Vagus.Addon.StoreTest do
     assert s["slug"] == "core_mosquitto"
     assert s["repository"] == "core"
     assert s["name"] == "Mosquitto broker"
-    assert s["version"] == "7.1.0"
+    # Not installed, so no installed version — the frontend reads a non-nil
+    # `version` as "this add-on is installed" and renders the whole page that
+    # way. Upstream sends `installed.version if installed else None`.
+    assert s["version"] == nil
     assert s["version_latest"] == "7.1.0"
     assert s["arch"] == ["aarch64", "amd64"]
     assert s["build"] == false
     assert s["installed"] == false
     refute Map.has_key?(s, "auth_api")
+  end
+
+  test "StoreView.summary reports the installed version once there is one" do
+    catalog = Store.build_catalog(@repos, FixtureFetcher)
+    s = StoreView.summary("core_mosquitto", catalog["core_mosquitto"], true, "7.0.0")
+
+    assert s["version"] == "7.0.0"
+    assert s["version_latest"] == "7.1.0"
+    assert s["update_available"] == true
+    assert s["installed"] == true
   end
 
   describe "what the payload advertises (the frontend fetches nothing it isn't told about)" do
