@@ -305,6 +305,8 @@ defmodule Vagus.Addon.Backend.NativeTest do
       @moduledoc false
       @behaviour Vagus.Addon.Backend
       @impl true
+      def remove_image(_image, _opts \\ []), do: :ok
+      @impl true
       def pull(%{name: name}) do
         send(:persistent_term.get(FakeBackend), {:fake_pull, name})
         :ok

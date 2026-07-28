@@ -29,7 +29,7 @@ defmodule Vagus.API.Router do
   require Logger
 
   alias Vagus.Addon.Backend.Native
-  alias Vagus.Addon.{Manager, OptionsSchema, State, Store, StoreView}
+  alias Vagus.Addon.{Manager, OptionsSchema, State, Store, StoreView, Update}
   alias Vagus.API.{Envelope, StaticData}
   alias Vagus.Backend
   alias Vagus.Backups
@@ -381,6 +381,29 @@ defmodule Vagus.API.Router do
   # path for the same action.
   post "/addons/:slug/install" do
     handle_install(conn, slug)
+  end
+
+  # `POST .../update` can run for minutes — pulling an add-on image on a slow
+  # device, then stopping/recreating the container. Synchronous v1, exactly
+  # like `POST /core/update` above: there is no jobs API, so `background:
+  # true` is refused rather than faked, and Bandit's configured 900s
+  # `read_timeout` (`Vagus.API.Supervisor`) is what bounds how long a caller
+  # can wait — nothing in this router does.
+  post "/store/addons/:slug/update" do
+    handle_update(conn, slug)
+  end
+
+  # Upstream registers this route and its handler never reads the version
+  # segment — it always updates to whatever the store currently advertises.
+  # Matching the quirk beats inventing pinned-version semantics no client
+  # sends; the segment is accepted and ignored on purpose, not by oversight.
+  post "/store/addons/:slug/update/:version" do
+    handle_update(conn, slug)
+  end
+
+  # Legacy alias, same as the install routes above.
+  post "/addons/:slug/update" do
+    handle_update(conn, slug)
   end
 
   post "/addons/:slug/start" do
@@ -1533,6 +1556,94 @@ defmodule Vagus.API.Router do
   # Shared supervisor-only-caller + result-mapping wrapper for
   # start/stop/restart/uninstall — all four share the same
   # `:ok | {:ok, _} | {:error, :not_found} | {:error, reason}` result shape.
+  # `POST /store/addons/{slug}/update` (+ the `/update/{version}` and legacy
+  # `/addons/...` forms). Body is `{"backup": bool?, "background": bool?}`;
+  # unknown keys are ignored, matching the aiohttp tolerance the request
+  # parsing already assumes elsewhere in this router.
+  defp handle_update(conn, slug) do
+    supervisor_only(conn, fn ->
+      cond do
+        not valid_slug?(slug) ->
+          Envelope.send_error(conn, "Addon #{slug} does not exist", 404)
+
+        # Upstream raises APIForbidden when an add-on asks to update itself.
+        #
+        # NOT REACHABLE, and deliberately kept anyway: `supervisor_only/2`
+        # above already rejects every add-on caller, so this cannot fire while
+        # that holds. It is also why there is no test for it — an add-on
+        # caller gets 403 from `supervisor_only/2` regardless, so such a test
+        # would pass with this clause deleted and prove nothing. Kept as an
+        # explicit statement of the contract in case this route's auth tier is
+        # ever widened.
+        self_update?(conn, slug) ->
+          # Upstream's own wording, in its V1 "addon" form (dev-HEAD says
+          # "App" only because of the in-flight rename):
+          # `APIForbidden(f"App {app.slug} can't update itself!")`.
+          Envelope.send_error(conn, "Addon #{slug} can't update itself!", 403)
+
+        background?(conn) ->
+          Envelope.send_error(
+            conn,
+            "background updates are not supported; omit \"background\" or send false",
+            400
+          )
+
+        true ->
+          send_update_result(conn, slug, Update.update(slug, backup: backup?(conn)))
+      end
+    end)
+  end
+
+  defp self_update?(conn, slug), do: match?({:addon, %{slug: ^slug}}, conn.assigns.caller)
+
+  defp background?(conn), do: Map.get(conn.body_params, "background") == true
+  defp backup?(conn), do: Map.get(conn.body_params, "backup") == true
+
+  defp send_update_result(conn, _slug, {:ok, _result}), do: Envelope.send_ok(conn, %{})
+
+  # Mirrors `send_core_lifecycle_error/2`'s shape: `:busy` is the only 409,
+  # "it isn't there" is 404, everything else is a 400 with an honest message.
+  defp send_update_result(conn, slug, {:error, reason}) do
+    case reason do
+      :busy ->
+        Envelope.send_error(conn, "an operation is already in progress for #{slug}", 409)
+
+      :not_installed ->
+        Envelope.send_error(conn, "Addon #{slug} is not installed", 404)
+
+      :not_in_store ->
+        Envelope.send_error(conn, "Addon #{slug} is no longer available in the store", 404)
+
+      other ->
+        Envelope.send_error(conn, update_error_message(other), 400)
+    end
+  end
+
+  defp update_error_message(:no_update_available), do: "No update available for this addon"
+
+  # `reason` is already a human-readable string from `OptionsSchema`
+  # (`{:error, String.t()}`), so `inspect/1` would only wrap it in escaped
+  # quotes in the API response.
+  defp update_error_message({:invalid_options, reason}),
+    do: "Options are not valid for the new version: #{reason}"
+
+  defp update_error_message({:pull, reason}),
+    do: "Failed to pull the addon image: #{inspect(reason)}"
+
+  defp update_error_message({:stop, reason}),
+    do: "Failed to stop the addon before updating: #{inspect(reason)}"
+
+  defp update_error_message({:backup_failed, reason}),
+    do: "Pre-update backup failed, addon left untouched: #{inspect(reason)}"
+
+  defp update_error_message({:rolled_back, cause}),
+    do: "Update failed (#{inspect(cause)}); the previous version was restored"
+
+  defp update_error_message({:rollback_failed, reason}),
+    do: "Update failed AND the rollback failed (#{inspect(reason)}); the addon is stopped"
+
+  defp update_error_message(other), do: inspect(other)
+
   defp lifecycle_action(conn, slug, fun) do
     if conn.assigns.caller == :supervisor do
       case fun.() do

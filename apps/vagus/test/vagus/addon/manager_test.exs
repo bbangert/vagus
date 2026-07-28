@@ -643,6 +643,10 @@ defmodule Vagus.Addon.ManagerTest do
     @moduledoc false
     @behaviour Vagus.Addon.Backend
 
+    @impl true
+
+    def remove_image(_image, _opts \\ []), do: :ok
+
     defp notify(msg),
       do: send(:persistent_term.get({Vagus.Addon.ManagerTest.OrderingBackend, :pid}), msg)
 
@@ -672,6 +676,10 @@ defmodule Vagus.Addon.ManagerTest do
   defmodule SlowBackend do
     @moduledoc false
     @behaviour Vagus.Addon.Backend
+
+    @impl true
+
+    def remove_image(_image, _opts \\ []), do: :ok
 
     defp log(entry) do
       table = :persistent_term.get({Vagus.Addon.ManagerTest.SlowBackend, :log})
@@ -712,6 +720,10 @@ defmodule Vagus.Addon.ManagerTest do
 
   defmodule FakeBackend do
     @behaviour Vagus.Addon.Backend
+
+    @impl true
+
+    def remove_image(_image, _opts \\ []), do: :ok
 
     defp notify(msg),
       do: send(:persistent_term.get({Vagus.Addon.ManagerTest.FakeBackend, :pid}), msg)

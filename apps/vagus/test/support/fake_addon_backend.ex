@@ -105,5 +105,11 @@ defmodule Vagus.Addon.Backend.Fake do
   end
 
   @impl true
+  def remove_image(image, _opts \\ []) do
+    record({:remove_image, image})
+    :ok
+  end
+
+  @impl true
   def state(_id), do: {:ok, :running}
 end

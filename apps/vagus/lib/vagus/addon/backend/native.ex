@@ -72,6 +72,10 @@ defmodule Vagus.Addon.Backend.Native do
   @impl Vagus.Addon.Backend
   def remove(id, opts \\ []), do: stop(id, opts)
 
+  @impl true
+  # Native add-ons run in-VM; there is no image to reclaim.
+  def remove_image(_image, _opts \\ []), do: :ok
+
   @impl Vagus.Addon.Backend
   def state(id) do
     case Process.whereis(broker_name(id)) do

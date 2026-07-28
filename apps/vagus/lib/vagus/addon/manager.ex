@@ -382,6 +382,29 @@ defmodule Vagus.Addon.Manager do
   # body — see the moduledoc's "W6" section for why `:global.trans/3`
   # (reentrant per-process, node-local here) rather than a `GenServer`/
   # `Registry`-backed lock.
+  @doc false
+  # Unlocked `stop`/`start`, for a caller that ALREADY holds this slug's
+  # lock — today only `Vagus.Addon.Update`.
+  #
+  # Nesting `:global.trans/4` on the same resource id does NOT work, even for
+  # the same requester: `:global` locks are not counted, so the *inner*
+  # release deletes the resource outright and the outer critical section
+  # silently continues unlocked. Verified empirically — a different requester
+  # can then acquire it mid-flight. `Vagus.Core.Lifecycle` sidesteps the same
+  # trap by calling its own unlocked `do_*` helpers rather than its locking
+  # public functions; these two exist so `Update` can do the same.
+  #
+  # (`start/2` re-acquiring the lock from `start_slug/2` is fine by contrast:
+  # the outer function *returns into* the inner one and does nothing
+  # afterwards, so losing the lock at the inner release costs nothing.)
+  @spec stop_holding_lock(String.t(), keyword()) :: :ok | {:error, :not_found}
+  def stop_holding_lock(slug, opts \\ []), do: do_stop(slug, opts)
+
+  @doc false
+  @spec start_holding_lock(Config.t(), keyword()) ::
+          {:ok, %{id: String.t(), access_token: String.t()}} | {:error, term()}
+  def start_holding_lock(%Config{} = config, opts \\ []), do: do_start(config, opts)
+
   defp with_slug_lock(slug, fun) do
     :global.trans({{:addon_lifecycle, slug}, self()}, fun, [node()])
   end

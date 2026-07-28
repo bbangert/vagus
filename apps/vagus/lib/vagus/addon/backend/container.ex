@@ -46,6 +46,9 @@ defmodule Vagus.Addon.Backend.Container do
   def remove(id, opts \\ []), do: Docker.remove_container(id, opts)
 
   @impl true
+  def remove_image(image, opts \\ []), do: Docker.remove_image(image, opts)
+
+  @impl true
   def state(id) do
     case Docker.inspect_container(id) do
       {:ok, %{"State" => state}} -> {:ok, normalize_state(state)}
