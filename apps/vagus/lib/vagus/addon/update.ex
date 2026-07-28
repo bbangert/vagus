@@ -14,22 +14,29 @@ defmodule Vagus.Addon.Update do
     3. equal versions → `{:error, :no_update_available}`
     4. capture the old config **before any mutation** — it is the rollback
        target, exactly as Core captures `installed` up front
-    5. optional pre-update partial backup when `backup: true`
-    6. **pull the new image first** — a failed pull must leave the install
+    5. re-validate the persisted `user_options` against the *new* schema
+    6. optional pre-update partial backup when `backup: true`
+    7. **pull the new image** — a failed pull must leave the install
        completely untouched
-    7. re-validate the persisted `user_options` against the *new* schema
     8. stop if it was running (which also removes the container)
     9. commit the new config to `Vagus.Addon.State`
     10. start again **only if it was running** before
     11. remove the superseded image, but only when the tag actually changed
 
-  ## Why the pull comes first
+  ## Why the pull comes before any mutation
 
-  Steps 5-7 are all "can this update possibly work?" checks, and none of them
-  mutate the install. By the time anything is stopped, the new image is on
-  disk and the options are known-good. The failure mode this avoids is the
+  Steps 2-7 are all "can this update possibly work?" checks and none of them
+  touch the install. By the time anything is stopped, the new image is on disk
+  and the options are known-good. The failure mode this avoids is the
   expensive one: stopping a working add-on and *then* discovering the image
   can't be fetched.
+
+  Within that prefix the order is cheapest-first, which is why option
+  validation runs *before* the backup and the pull rather than after them as
+  the plan's numbering had it. All three are side-effect-free with respect to
+  the install, so the observable behaviour is identical either way — but
+  discovering unusable options after downloading several hundred MB, on a
+  device that may be on a metered or slow link, is pure waste.
 
   ## Options are re-validated — a deliberate divergence
 

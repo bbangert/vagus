@@ -1576,7 +1576,10 @@ defmodule Vagus.API.Router do
         # explicit statement of the contract in case this route's auth tier is
         # ever widened.
         self_update?(conn, slug) ->
-          Envelope.send_error(conn, "Addons can not update themselves", 403)
+          # Upstream's own wording, in its V1 "addon" form (dev-HEAD says
+          # "App" only because of the in-flight rename):
+          # `APIForbidden(f"App {app.slug} can't update itself!")`.
+          Envelope.send_error(conn, "Addon #{slug} can't update itself!", 403)
 
         background?(conn) ->
           Envelope.send_error(
@@ -1618,8 +1621,11 @@ defmodule Vagus.API.Router do
 
   defp update_error_message(:no_update_available), do: "No update available for this addon"
 
+  # `reason` is already a human-readable string from `OptionsSchema`
+  # (`{:error, String.t()}`), so `inspect/1` would only wrap it in escaped
+  # quotes in the API response.
   defp update_error_message({:invalid_options, reason}),
-    do: "Options are not valid for the new version: #{inspect(reason)}"
+    do: "Options are not valid for the new version: #{reason}"
 
   defp update_error_message({:pull, reason}),
     do: "Failed to pull the addon image: #{inspect(reason)}"
