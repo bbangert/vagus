@@ -49,8 +49,12 @@ defmodule Vagus.Addon.Info do
   `version` always comes from `config`, which for an installed add-on is the
   config captured at install time — `Vagus.Addon.State` never refreshes a
   stored config from the store catalog, so it is the installed version by
-  construction. See `addon_state_test.exs`'s "start/stop never moves the
-  installed version" for the invariant that keeps that true.
+  construction. The invariant that keeps it true — no lifecycle path re-reads
+  config from the store catalog — is pinned by
+  `addon_lifecycle_router_test.exs`'s "a real stop/start never adopts the
+  store's version", which drives the actual routes. (`state_test.exs` covers
+  the same ground at the `State.put/3` level, but only the router test would
+  notice if `Manager` started sourcing config from `Store`.)
   """
   @spec render(Config.t(), :started | :stopped, map(), map()) :: map()
   def render(%Config{} = config, state, options, settings \\ %{})

@@ -406,6 +406,13 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
       seed_store("core_detached", installed)
       assert supervisor_call(:post, "/store/addons/core_detached/install").status == 200
 
+      # First move the store ahead, so the "no update" below can only be
+      # caused by detachment — not by the store happening to match.
+      seed_store("core_detached", %{installed | version: "9.9.9"})
+      bumped = json(supervisor_call(:get, "/addons/core_detached/info"))["data"]
+      assert bumped["version_latest"] == "9.9.9"
+      assert bumped["update_available"] == true
+
       # The repository drops it entirely — installed, but no store entry.
       :ok = GenServer.call(Store, {:put_catalog, Map.delete(Store.catalog(), "core_detached")})
 
@@ -413,6 +420,37 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
       assert info["version"] == installed.version
       assert info["version_latest"] == installed.version
       assert info["update_available"] == false
+    end
+
+    test "a real stop/start never adopts the store's version" do
+      # THE test standing in for the dropped `installed_version` field.
+      #
+      # Deriving the installed version from `entry.config.version` is only
+      # safe while no lifecycle path re-reads config from the store catalog.
+      # Asserting that by calling `State.put/3` by hand proves nothing about
+      # `Manager` — so this drives the REAL routes, with the store parked on
+      # a different version than the install, and checks what got persisted.
+      # Rewire `Manager.do_start_slug/2` to source config from `Store` and
+      # this fails; the hand-driven `State` tests would not notice.
+      installed = fixture_config("lifecycleversion")
+      seed_store("core_lifecycleversion", installed)
+      assert supervisor_call(:post, "/store/addons/core_lifecycleversion/install").status == 200
+
+      seed_store("core_lifecycleversion", %{installed | version: "9.9.9"})
+
+      assert supervisor_call(:post, "/addons/core_lifecycleversion/stop").status == 200
+      assert {:ok, %{config: %{version: after_stop}}} = State.get("core_lifecycleversion")
+      assert after_stop == installed.version
+
+      assert supervisor_call(:post, "/addons/core_lifecycleversion/start").status == 200
+      assert {:ok, %{config: %{version: after_start}}} = State.get("core_lifecycleversion")
+      assert after_start == installed.version
+
+      # ...and the wire still separates the two cleanly.
+      info = json(supervisor_call(:get, "/addons/core_lifecycleversion/info"))["data"]
+      assert info["version"] == installed.version
+      assert info["version_latest"] == "9.9.9"
+      assert info["update_available"] == true
     end
 
     test "an uninstalled store entry reports the store version and no update" do

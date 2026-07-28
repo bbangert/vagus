@@ -356,11 +356,18 @@ defmodule Vagus.Addon.StateTest do
 
   describe "the installed version (P2-A P2)" do
     # `entry.config.version` IS the installed version — there is no separate
-    # persisted field, and this is what makes that safe. Every `State.put/3`
-    # call site outside install/update passes a config that came back out of
-    # `State` (Manager.start_slug, BootStarter, Watchdog all read it first),
-    # so a lifecycle transition cannot move the version. If that ever stops
-    # being true, this test is what should fail.
+    # persisted field. These tests cover the `State.put/3` level: writing back
+    # a config that was read out of `State` keeps the version, and only a
+    # genuinely different config moves it.
+    #
+    # They are NOT the guard against the invariant breaking. They drive
+    # `State.put/3` by hand, so they would pass unchanged if `Manager`,
+    # `BootStarter` or `Watchdog` started sourcing config from `Store`
+    # instead of `State` — verified by sabotaging `do_start_slug/2`, which
+    # these three did not notice. The real guard is
+    # `addon_lifecycle_router_test.exs`'s "a real stop/start never adopts the
+    # store's version", which drives the actual lifecycle routes and does
+    # fail under that sabotage.
     test "a lifecycle transition never moves it", %{config: c, s: s} do
       :ok = State.put(c, :started, server: s)
       assert {:ok, %{config: %{version: "7.1.0"}}} = State.get(c.slug, s)
