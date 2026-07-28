@@ -1,9 +1,11 @@
 defmodule Vagus.Addon.Store.Assets do
   @moduledoc """
-  Storage for the four static files an add-on repository ships alongside each
-  `config.yaml` — `icon.png`, `logo.png`, `CHANGELOG.md`, `DOCS.md` — which
-  the frontend fetches from `/store/addons/{slug}/icon|logo|changelog|
-  documentation`.
+  Storage for the static files an add-on repository ships alongside each
+  `config.yaml`. Four are fetched by the frontend from
+  `/store/addons/{slug}/icon|logo|changelog|documentation` — `icon.png`,
+  `logo.png`, `CHANGELOG.md`, `DOCS.md`. The fifth, `README.md`, has no route:
+  it is read for its **content** and rendered into an add-on's detail payload
+  as `long_description`, which is the whole body of the store page.
 
   The real Supervisor keeps a permanent `git clone` per repository and
   re-reads these off disk per request, caching only existence booleans.
@@ -72,20 +74,28 @@ defmodule Vagus.Addon.Store.Assets do
     icon: "icon.png",
     logo: "logo.png",
     changelog: "CHANGELOG.md",
-    documentation: "DOCS.md"
+    documentation: "DOCS.md",
+    readme: "README.md"
   }
 
   @caps %{
     icon: 1_048_576,
     logo: 1_048_576,
     changelog: 262_144,
-    documentation: 262_144
+    documentation: 262_144,
+    readme: 262_144
   }
 
   # Spelled out rather than `Map.keys(@filenames)`: map key order is an
   # implementation detail, not a contract, so deriving it would make
   # `kinds/0`'s documented ordering a promise the runtime never made.
-  @kinds [:icon, :logo, :changelog, :documentation]
+  #
+  # `:readme` is the odd one: it has no route of its own. It backs the
+  # `long_description` **string** in an add-on's detail payload — the body of
+  # the store page, which the frontend renders as markdown under the install
+  # card — so it is read for content rather than served as bytes, and its
+  # presence flag never reaches the wire.
+  @kinds [:icon, :logo, :changelog, :documentation, :readme]
 
   # ...and this keeps the explicit list honest: adding a filename or a cap
   # without adding the kind (or vice versa) fails the build rather than
@@ -97,8 +107,8 @@ defmodule Vagus.Addon.Store.Assets do
 
   @dir "store_assets"
 
-  @typedoc "The four retained files."
-  @type kind :: :icon | :logo | :changelog | :documentation
+  @typedoc "The retained files: four served as bytes, plus the README."
+  @type kind :: :icon | :logo | :changelog | :documentation | :readme
 
   @typedoc """
   What a set of assets belongs to: `{repo_slug, addon_slug}`, e.g.

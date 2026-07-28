@@ -271,4 +271,42 @@ defmodule Vagus.API.AddonAssetsRouterTest do
       assert conn.status == 403
     end
   end
+
+  describe "README.md as long_description (the body of the store page)" do
+    # Unlike the other four assets this one has no route: it is read for its
+    # content and rendered into the detail payload, which is where the
+    # frontend gets the markdown it shows under the install card.
+
+    test "the store detail carries the README's text" do
+      id = seed_store("core_readmeful")
+      readme = "# Test Addon\n\nEverything you never wanted to know.\n"
+      put_asset(id, :readme, readme)
+
+      data =
+        Jason.decode!(supervisor_call(:get, "/store/addons/core_readmeful").resp_body)["data"]
+
+      assert data["long_description"] == readme
+    end
+
+    test "an add-on shipping no README reports null, not an empty string" do
+      seed_store("core_readmeless")
+
+      data =
+        Jason.decode!(supervisor_call(:get, "/store/addons/core_readmeless").resp_body)["data"]
+
+      assert data["long_description"] == nil
+    end
+
+    test "the uninstalled-add-on info page gets it too — that page IS the store page" do
+      id = seed_store("core_readmeinfo")
+      readme = "# Readme Info\n"
+      put_asset(id, :readme, readme)
+
+      data =
+        Jason.decode!(supervisor_call(:get, "/addons/core_readmeinfo/info").resp_body)["data"]
+
+      assert data["long_description"] == readme
+      assert data["state"] == "unknown"
+    end
+  end
 end

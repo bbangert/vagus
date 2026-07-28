@@ -51,6 +51,11 @@ defmodule Vagus.Addon.Info do
       false, which is what the frontend needs to hear: it requests an asset
       only when the payload advertises one, so a detached add-on stops asking
       rather than showing a broken image.
+    * `:long_description` — the add-on's `README.md`, which the frontend
+      renders as markdown for the body of its page. Supplied only by the
+      single-add-on info route; `GET /addons` leaves it out, since reading one
+      README per installed add-on to render a list nothing displays is pure
+      cost (upstream's list route omits the field entirely).
 
   `version` always comes from `config`, which for an installed add-on is the
   config captured at install time — `Vagus.Addon.State` never refreshes a
@@ -97,7 +102,7 @@ defmodule Vagus.Addon.Info do
       "host_network" => config.host_network,
       "host_pid" => config.host_pid,
       "ingress" => config.ingress,
-      "long_description" => nil,
+      "long_description" => Map.get(settings, :long_description),
       "rating" => 5,
       "signed" => false,
       "hassio_api" => config.hassio_api,

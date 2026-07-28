@@ -293,7 +293,13 @@ defmodule Vagus.API.Router do
 
         Envelope.send_ok(
           conn,
-          StoreView.detail(slug, entry, installed?(installed), installed_version(installed))
+          StoreView.detail(
+            slug,
+            entry,
+            installed?(installed),
+            installed_version(installed),
+            long_description(slug)
+          )
         )
 
       :error ->
@@ -381,10 +387,12 @@ defmodule Vagus.API.Router do
           :error -> config.options
         end
 
-      Envelope.send_ok(
-        conn,
-        Vagus.Addon.Info.render(config, state, options, info_settings(entry))
-      )
+      settings =
+        entry
+        |> info_settings()
+        |> Map.put(:long_description, long_description(resolved))
+
+      Envelope.send_ok(conn, Vagus.Addon.Info.render(config, state, options, settings))
     else
       {:error, :forbidden} -> Envelope.send_error(conn, "Not authorized for this add-on", 403)
       _ -> uninstalled_addon_info(conn, slug)
@@ -413,7 +421,7 @@ defmodule Vagus.API.Router do
       {:ok, %{config: config} = entry} ->
         detail =
           slug
-          |> StoreView.detail(entry, false)
+          |> StoreView.detail(entry, false, nil, long_description(slug))
           |> Map.merge(%{"state" => "unknown", "options" => config.options})
 
         Envelope.send_ok(conn, detail)
@@ -1671,6 +1679,21 @@ defmodule Vagus.API.Router do
   # request is unauthenticated load on the singleton. See
   # `Vagus.Addon.Store.asset_lookup/2`.
   defp resolve_asset(slug), do: Store.asset_lookup(slug)
+
+  # The add-on's README.md as a string, for the `long_description` the frontend
+  # renders as the body of its page. Read per detail request rather than held
+  # in the catalog: it is the largest asset an add-on ships, only two routes
+  # want it, and in `:disk` mode holding 80 of them resident is exactly what
+  # that mode exists to avoid. A missing README (or a detached add-on, which
+  # has no store entry to look one up from) is `nil`, same as upstream.
+  defp long_description(slug) do
+    with {:ok, id, handle} <- resolve_asset(slug),
+         {:ok, binary} <- Assets.get(id, :readme, handle) do
+      binary
+    else
+      _absent -> nil
+    end
+  end
 
   # -- addon lifecycle helpers ------------------------------------------------
 

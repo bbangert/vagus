@@ -276,7 +276,7 @@ defmodule Vagus.Addon.Store.AssetsTest do
       assert File.ls!(root) == ["core"]
 
       assert Enum.sort(File.ls!(Path.join([root, "core", "mosquitto"]))) ==
-               ["CHANGELOG.md", "DOCS.md", "icon.png", "logo.png"]
+               ["CHANGELOG.md", "DOCS.md", "README.md", "icon.png", "logo.png"]
     end
 
     @tag :tmp_dir
@@ -478,14 +478,25 @@ defmodule Vagus.Addon.Store.AssetsTest do
       assert Assets.filename(:documentation) == "DOCS.md"
     end
 
-    test "kinds/0 is exactly the four served endpoints" do
-      assert Enum.sort(Assets.kinds()) == [:changelog, :documentation, :icon, :logo]
+    test "kinds/0 is the four served endpoints plus the README behind long_description" do
+      assert Enum.sort(Assets.kinds()) == [
+               :changelog,
+               :documentation,
+               :icon,
+               :logo,
+               :readme
+             ]
     end
 
     test "kinds/0 order is fixed, not derived from map key order" do
       # The @doc promises a stable order; deriving it from `Map.keys/1` would
       # make that a promise the runtime never made.
-      assert Assets.kinds() == [:icon, :logo, :changelog, :documentation]
+      assert Assets.kinds() == [:icon, :logo, :changelog, :documentation, :readme]
+    end
+
+    test "README.md is retained under its upstream filename" do
+      assert Assets.filename(:readme) == "README.md"
+      assert Assets.max_bytes(:readme) == 262_144
     end
   end
 end

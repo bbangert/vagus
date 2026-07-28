@@ -85,6 +85,7 @@ defmodule Vagus.Addon.StoreTest do
          {"mosquitto/logo.png", Vagus.Addon.StoreTest.png()},
          {"mosquitto/CHANGELOG.md", "## 7.1.0\n"},
          {"mosquitto/DOCS.md", "# Mosquitto\n"},
+         {"mosquitto/README.md", "# Mosquitto broker\n\nThe long description body.\n"},
          {"esphome/config.yaml", Vagus.Addon.StoreTest.esphome_yaml()}
        ]}
     end
@@ -200,6 +201,19 @@ defmodule Vagus.Addon.StoreTest do
       assert stable["advanced"] == false
       assert stable["url"] == nil
       assert stable["icon"] == true
+    end
+
+    test "long_description is the README the caller read, and nil when absent" do
+      catalog = Store.build_catalog(@repos, FixtureFetcher, Assets.init(:memory))
+      readme = "# Mosquitto broker\n\nThe long description body.\n"
+
+      d = StoreView.detail("core_mosquitto", catalog["core_mosquitto"], false, nil, readme)
+      assert d["long_description"] == readme
+
+      # No README retained (or a detached entry, which can't be looked up) —
+      # upstream returns None rather than an empty string.
+      assert StoreView.detail("core_esphome", catalog["core_esphome"], false)["long_description"] ==
+               nil
     end
 
     test "an entry with no :assets key at all renders every flag false" do
@@ -323,10 +337,10 @@ defmodule Vagus.Addon.StoreTest do
       catalog = Store.build_catalog(@repos, FixtureFetcher, Assets.init(:memory))
 
       assert catalog["core_mosquitto"].assets ==
-               %{icon: true, logo: true, changelog: true, documentation: true}
+               %{icon: true, logo: true, changelog: true, documentation: true, readme: true}
 
       assert catalog["core_esphome"].assets ==
-               %{icon: false, logo: false, changelog: false, documentation: false}
+               %{icon: false, logo: false, changelog: false, documentation: false, readme: false}
 
       # The bytes live in the handle, not the entry — the whole point of a
       # presence map on a device where the catalog is held in a GenServer.

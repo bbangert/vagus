@@ -73,13 +73,15 @@ defmodule Vagus.Addon.StoreView do
           String.t(),
           %{config: Config.t(), repository: String.t()},
           boolean(),
+          nil | String.t(),
           nil | String.t()
         ) :: map()
   def detail(
         store_slug,
         %{config: config, repository: repo} = entry,
         installed?,
-        installed_version \\ nil
+        installed_version \\ nil,
+        long_description \\ nil
       ) do
     base_fields(store_slug, config, repo, installed?, installed_version, assets(entry))
     |> Map.merge(%{
@@ -91,7 +93,11 @@ defmodule Vagus.Addon.StoreView do
       "host_network" => config.host_network,
       "host_pid" => config.host_pid,
       "ingress" => config.ingress,
-      "long_description" => nil,
+      # The add-on's README.md, rendered as markdown under the install card —
+      # the entire body of the store page. `nil` when the repository ships no
+      # README, or when the entry is detached (no store source to read one
+      # from), matching upstream's `long_description()`.
+      "long_description" => long_description,
       "rating" => 5,
       "signed" => false,
       "hassio_api" => config.hassio_api,
