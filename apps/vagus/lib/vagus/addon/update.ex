@@ -262,9 +262,14 @@ defmodule Vagus.Addon.Update do
     end
   end
 
-  # Only after the new version is actually in place, and only when the ref
-  # really changed — `image_ref/2` resolves `{arch}` templating, so two
-  # different `version`s can still land on the same tag.
+  # Only after the new version is actually in place, and only when there is an
+  # old ref to remove and it differs from the new one.
+  #
+  # In practice the refs always differ when the version does: `image_ref/2`
+  # ends every ref with `:#{version}`. The guard earns its keep on the nil
+  # side — `image_ref/2` returns nil for `backend: :native` add-ons, which run
+  # in-VM and have no image to reclaim. The inequality check is defensive
+  # against a future ref scheme that does not embed the version.
   defp reclaim_old_image(old_config, target, opts) do
     old_ref = Manager.build_spec(old_config, opts).image
     new_ref = Manager.build_spec(target, opts).image
