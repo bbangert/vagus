@@ -287,7 +287,7 @@ defmodule Vagus.Addon.StoreTest do
           {:ok,
            [
              {"mqtt_broker/config.yaml", String.replace(@yaml, "SLUG", "mqtt_broker")},
-             {"mqtt_broker/icon.png", "icon from core"}
+             {"mqtt_broker/icon.png", Vagus.Addon.StoreTest.png() <> "core"}
            ]}
         end
 
@@ -295,7 +295,7 @@ defmodule Vagus.Addon.StoreTest do
           {:ok,
            [
              {"broker/config.yaml", String.replace(@yaml, "SLUG", "broker")},
-             {"broker/icon.png", "icon from core_mqtt"}
+             {"broker/icon.png", Vagus.Addon.StoreTest.png() <> "core_mqtt"}
            ]}
         end
       end
@@ -316,11 +316,11 @@ defmodule Vagus.Addon.StoreTest do
       assert entry.config.slug == "broker"
       assert entry.assets.icon
 
-      assert Assets.get(Assets.id(entry), :icon, assets) == {:ok, "icon from #{entry.repository}"}
+      assert Assets.get(Assets.id(entry), :icon, assets) == {:ok, png() <> entry.repository}
 
       # Both repos' bytes survive independently; neither clobbered the other.
-      assert {:ok, "icon from core"} = Assets.get({"core", "mqtt_broker"}, :icon, assets)
-      assert {:ok, "icon from core_mqtt"} = Assets.get({"core_mqtt", "broker"}, :icon, assets)
+      assert {:ok, png() <> "core"} == Assets.get({"core", "mqtt_broker"}, :icon, assets)
+      assert {:ok, png() <> "core_mqtt"} == Assets.get({"core_mqtt", "broker"}, :icon, assets)
     end
 
     test "a repo that fails to fetch leaves the other repo's assets intact" do

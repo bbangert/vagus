@@ -3,9 +3,13 @@ defmodule Vagus.API.Auth do
   Token auth + caller resolution for the Supervisor-API emulator.
 
   Every request must carry a token — either `Authorization: Bearer <token>` or
-  `X-Supervisor-Token: <token>` (bashio/add-ons use the latter). There are no
-  exempt routes. The token is resolved to a **caller**, assigned on
-  `conn.assigns.caller`, so add-on-facing endpoints can authorize:
+  `X-Supervisor-Token: <token>` (bashio/add-ons use the latter) — with one
+  exception: `conn.assigns[:auth_bypass] == true`, set by
+  `Vagus.API.Router`'s `bypass_auth_for_asset_get/2` plug for the icon/logo
+  GETs Core's proxy forwards with no `Authorization` header at all. See that
+  plug's comment for the upstream citation; this module just honors the flag.
+  The token is resolved to a **caller**, assigned on `conn.assigns.caller`, so
+  add-on-facing endpoints can authorize:
 
     * the token `Vagus.API.Token` resolves (constant-time
       `Plug.Crypto.secure_compare/2`, checked first so Core's polling never
@@ -26,6 +30,8 @@ defmodule Vagus.API.Auth do
   def init(opts), do: opts
 
   @impl Plug
+  def call(%{assigns: %{auth_bypass: true}} = conn, _opts), do: conn
+
   def call(conn, _opts) do
     case token(conn) do
       nil -> unauthorized(conn)
