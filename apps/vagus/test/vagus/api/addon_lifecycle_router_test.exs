@@ -220,6 +220,87 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
     end
   end
 
+  describe "POST /addons/:slug/options/validate" do
+    # The config page pre-flights every save through this and throws on
+    # anything but `valid: true`, so a missing route makes Save fail for every
+    # add-on regardless of what the options endpoint does.
+    setup do
+      config = fixture_config("vopts") |> Map.put(:slug, "core_vopts")
+      :ok = State.put(config, :stopped)
+      on_exit(fn -> State.delete("core_vopts") end)
+      %{config: config}
+    end
+
+    test "valid options report valid: true with an empty message" do
+      conn =
+        supervisor_call(:post, "/addons/core_vopts/options/validate", %{"greeting" => "hey"})
+
+      assert conn.status == 200
+      assert body(conn)["data"] == %{"valid" => true, "message" => "", "pwned" => false}
+    end
+
+    test "invalid options are a 200 with valid: false, not an error status" do
+      # Upstream returns the verdict as data; a non-200 would surface in the
+      # frontend as a transport failure rather than a validation message.
+      conn = supervisor_call(:post, "/addons/core_vopts/options/validate", %{"greeting" => 5})
+
+      assert conn.status == 200
+      data = body(conn)["data"]
+      assert data["valid"] == false
+      assert data["message"] != ""
+      assert data["pwned"] == false
+    end
+
+    test "the body is the options map itself, not wrapped in an options key" do
+      # The *save* shape, carrying an inner value this schema rejects. Read
+      # directly (upstream's behaviour) the outer "options" key is unknown and
+      # dropped, the defaults stand, and the verdict is `true`. A handler that
+      # unwrapped `"options"` would see `greeting: 5` and answer `false` — so
+      # `true` here is what proves the body is taken as-is.
+      conn =
+        supervisor_call(:post, "/addons/core_vopts/options/validate", %{
+          "options" => %{"greeting" => 5}
+        })
+
+      assert conn.status == 200
+      assert body(conn)["data"]["valid"] == true
+    end
+
+    test "an empty body validates the add-on's stored options" do
+      conn = supervisor_call(:post, "/addons/core_vopts/options/validate", %{})
+
+      assert conn.status == 200
+      assert body(conn)["data"]["valid"] == true
+    end
+
+    test "the verdict matches what the save path actually does" do
+      # The two must never disagree: a `valid: true` followed by a 400 on save
+      # is exactly the failure this endpoint exists to prevent.
+      for options <- [%{"greeting" => "hey"}, %{"greeting" => 5}] do
+        verdict =
+          body(supervisor_call(:post, "/addons/core_vopts/options/validate", options))["data"][
+            "valid"
+          ]
+
+        saved =
+          supervisor_call(:post, "/addons/core_vopts/options", %{"options" => options}).status ==
+            200
+
+        assert verdict == saved
+      end
+    end
+
+    test "a never-installed slug is a 404" do
+      conn = supervisor_call(:post, "/addons/never_installed/options/validate", %{})
+      assert conn.status == 404
+    end
+
+    test "an add-on caller is refused with 403" do
+      conn = addon_call(:post, "/addons/core_vopts/options/validate", "some_other_addon")
+      assert conn.status == 403
+    end
+  end
+
   describe "POST /addons/:slug/options" do
     setup do
       config = fixture_config("opts") |> Map.put(:slug, "core_opts")

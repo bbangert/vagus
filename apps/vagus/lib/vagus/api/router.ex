@@ -536,6 +536,23 @@ defmodule Vagus.API.Router do
     handle_addon_options(conn, slug)
   end
 
+  # The frontend's config page calls this **before** every save and aborts on
+  # anything other than `valid: true`, so without it the Save button fails
+  # for every add-on — `supervisor-app-config.ts::_saveTapped` awaits
+  # `validateHassioAddonOption` and throws its message before it ever POSTs
+  # the options.
+  #
+  # Upstream shape (`api/apps.py::options_validate`): the body is the options
+  # map **itself**, not `{"options": …}`, and an empty body falls back to the
+  # add-on's stored options. Always HTTP 200 — invalid options are a `valid:
+  # false` payload, not an error status. `pwned` is always `false` here:
+  # upstream's have-i-been-pwned lookup needs an outbound API Vagus doesn't
+  # make, and reporting `null` (its "check failed" value) would make Core
+  # refuse the save whenever `sys_security.force` is on.
+  post "/addons/:slug/options/validate" do
+    handle_addon_options_validate(conn, slug)
+  end
+
   # -- Stats coordinator (60s) -----------------------------------------------
 
   get "/core/stats" do
@@ -1885,6 +1902,46 @@ defmodule Vagus.API.Router do
       end
     else
       Envelope.send_error(conn, "unauthorized", 403)
+    end
+  end
+
+  # Same auth and same lookup as `handle_addon_options/2` — this is a dry run
+  # of that route, so anything it would reject must be rejected here too.
+  defp handle_addon_options_validate(conn, slug) do
+    if conn.assigns.caller == :supervisor do
+      case State.get(slug) do
+        :error ->
+          Envelope.send_error(conn, "Addon #{slug} does not exist", 404)
+
+        {:ok, %{config: config}} ->
+          conn
+          |> Envelope.send_ok(validate_options_report(config, conn.body_params, slug))
+      end
+    else
+      Envelope.send_error(conn, "unauthorized", 403)
+    end
+  end
+
+  # Deliberately routed through the very same `OptionsSchema.effective/3` call
+  # the save path uses (`validate_options_key/2`), so the dry run and the real
+  # write can never disagree — a "valid" answer followed by a 400 on save is
+  # the one outcome this endpoint exists to prevent.
+  defp validate_options_report(config, body, slug) do
+    options = if is_map(body) and map_size(body) > 0, do: body, else: stored_options(config, slug)
+
+    case OptionsSchema.effective(config.schema, config.options, options) do
+      {:ok, _validated} -> %{"valid" => true, "message" => "", "pwned" => false}
+      {:error, message} -> %{"valid" => false, "message" => message, "pwned" => false}
+    end
+  end
+
+  # Upstream validates an empty body against the add-on's current options
+  # (`await request.json() or app.options`), which is what the frontend relies
+  # on to pre-flight an unchanged config.
+  defp stored_options(config, slug) do
+    case read_addon_options(slug) do
+      {:ok, options} -> options
+      :error -> config.options
     end
   end
 
