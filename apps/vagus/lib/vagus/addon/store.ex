@@ -41,6 +41,26 @@ defmodule Vagus.Addon.Store do
 
   @default_fetcher Vagus.Addon.Store.HTTPFetcher
 
+  # A repository's own display metadata, at the archive root. Upstream accepts
+  # the same three names (`FILE_SUFFIX_CONFIGURATION` against `repository`) and
+  # will not even treat a git repository as valid without one.
+  @repository_files ~w(repository.json repository.yaml repository.yml)
+
+  # Upstream's `supervisor/store/built-in.json`, in V1 wording. The core and
+  # local repositories are the two that ship no `repository.*` of their own —
+  # `home-assistant/addons` genuinely has none — so Supervisor carries their
+  # names in-tree rather than deriving them. Without this the frontend, which
+  # titles each store section with the repository's `name`, shows the slug.
+  #
+  # Only `name`/`maintainer`: upstream's table also carries a `url` (the docs
+  # page, distinct from the clone source), but Vagus renders `url` and `source`
+  # from where it actually fetches, and a display URL that isn't the source
+  # would make `source` lie.
+  @builtin_repository_meta %{
+    "core" => %{name: "Official add-ons", maintainer: "Home Assistant"},
+    "local" => %{name: "Local add-ons", maintainer: "you"}
+  }
+
   def start_link(opts \\ []) do
     GenServer.start_link(__MODULE__, opts, name: Keyword.get(opts, :name, __MODULE__))
   end
@@ -96,8 +116,9 @@ defmodule Vagus.Addon.Store do
 
   defp do_reload(server) do
     {repositories, fetcher, assets} = GenServer.call(server, :snapshot)
-    catalog = build_catalog(repositories, fetcher, assets)
+    {catalog, repository_meta} = build(repositories, fetcher, assets)
     :ok = GenServer.call(server, {:put_catalog, catalog})
+    :ok = GenServer.call(server, {:put_repository_meta, repository_meta})
 
     # After the swap, not before: until the new catalog is live, the old
     # entries are still the ones being served, and pruning their assets first
@@ -147,7 +168,24 @@ defmodule Vagus.Addon.Store do
     GenServer.call(server, {:get, slug})
   end
 
-  @doc "The configured repositories (`%{slug, url, ref}`)."
+  @doc """
+  The repositories as the wire sees them: **one entry per slug**, each carrying
+  `name`/`url`/`maintainer` resolved from the repository's own
+  `repository.{json,yaml,yml}`, then the built-in table, then defaults.
+
+  Deduplication is not cosmetic. Vagus can configure several *sources* under
+  one repository slug — the built-in mqtt repo rides `core` alongside
+  `home-assistant/addons`, which is what puts `core_mqtt` in the catalog — but
+  the frontend renders one titled section per entry in this list and fills it
+  by matching `addon.repository` against the slug. Two entries slugged `core`
+  therefore render the same add-ons twice, under two identical headings.
+  Upstream never hits this because only `core` and `local` get literal slugs;
+  every other repository is keyed by a hash of its URL.
+
+  The `url` for a slug is the first non-nil one across its sources, so the
+  built-in repo (which has none) doesn't blank out the git URL it shares a slug
+  with.
+  """
   @spec repositories(GenServer.server()) :: [map()]
   def repositories(server \\ __MODULE__) do
     GenServer.call(server, :repositories)
@@ -166,6 +204,7 @@ defmodule Vagus.Addon.Store do
       fetcher: Keyword.get(opts, :fetcher, configured_fetcher()),
       repositories: Keyword.get(opts, :repositories, configured_repositories()),
       catalog: %{},
+      repository_meta: %{},
       assets: Assets.init(mode, opts)
     }
 
@@ -193,9 +232,21 @@ defmodule Vagus.Addon.Store do
     {:reply, :ok, %{state | catalog: catalog}}
   end
 
+  # Its own message rather than a third element on `{:put_catalog, …}`:
+  # repository metadata is display-only and swapping it is independent of the
+  # catalog swap, so tests that seed a catalog by hand keep saying exactly what
+  # they mean. A reload sends both; a brief disagreement between them can only
+  # mistitle a store section for the width of two GenServer calls.
+  def handle_call({:put_repository_meta, repository_meta}, _from, state) do
+    {:reply, :ok, %{state | repository_meta: repository_meta}}
+  end
+
   def handle_call(:catalog, _from, state), do: {:reply, state.catalog, state}
   def handle_call({:get, slug}, _from, state), do: {:reply, Map.fetch(state.catalog, slug), state}
-  def handle_call(:repositories, _from, state), do: {:reply, state.repositories, state}
+
+  def handle_call(:repositories, _from, state) do
+    {:reply, repository_views(state.repositories, state.repository_meta), state}
+  end
 
   ## Catalog building (pure given the fetcher)
 
@@ -211,10 +262,31 @@ defmodule Vagus.Addon.Store do
   """
   @spec build_catalog([map()], module(), Assets.t()) :: %{optional(String.t()) => map()}
   def build_catalog(repositories, fetcher, assets \\ Assets.none()) do
-    Enum.reduce(repositories, %{}, fn repo, acc ->
+    repositories |> build(fetcher, assets) |> elem(0)
+  end
+
+  @doc """
+  `build_catalog/3` plus the repository display metadata parsed out of the very
+  same fetch: `{catalog, %{repo_slug => %{name, url, maintainer}}}`.
+
+  It rides the catalog build rather than getting its own pass because the
+  metadata lives in the archive the catalog was just built from — a second
+  fetch would double the network cost of every reload to read one small file
+  per repository.
+
+  A repository that ships no `repository.{json,yaml,yml}` contributes nothing
+  and falls back at render time (`repository_views/2`). That is the normal
+  case for the core repository, which genuinely has no such file upstream
+  either — hence Supervisor's in-tree `built-in.json`.
+  """
+  @spec build([map()], module(), Assets.t()) ::
+          {%{optional(String.t()) => map()}, %{optional(String.t()) => map()}}
+  def build(repositories, fetcher, assets \\ Assets.none()) do
+    Enum.reduce(repositories, {%{}, %{}}, fn repo, {catalog, meta} = acc ->
       case fetcher.fetch(repo) do
         {:ok, files} ->
-          Map.merge(acc, entries_from_files(files, repo, assets))
+          {Map.merge(catalog, entries_from_files(files, repo, assets)),
+           put_repository_meta(meta, repo, files)}
 
         {:error, reason} ->
           Logger.warning(
@@ -222,6 +294,59 @@ defmodule Vagus.Addon.Store do
           )
 
           acc
+      end
+    end)
+  end
+
+  # First parsed `repository.*` for a slug wins. Two configured repositories
+  # can share one slug (the built-in mqtt repo rides `core`), and only the
+  # git-backed one of the pair carries the file.
+  defp put_repository_meta(meta, repo, files) do
+    case repository_metadata(files) do
+      nil -> meta
+      parsed -> Map.put_new(meta, repo.slug, parsed)
+    end
+  end
+
+  # One view per distinct slug, first appearance wins for ordering. Metadata
+  # precedence: the repository's own file, then the built-in table, then the
+  # slug itself — `nil` fields in a parsed file fall through the same way, so a
+  # `repository.json` carrying only a name still gets its maintainer defaulted
+  # rather than rendering `null` into a required wire field.
+  defp repository_views(repositories, meta) do
+    by_slug = Enum.group_by(repositories, & &1.slug)
+
+    repositories
+    |> Enum.uniq_by(& &1.slug)
+    |> Enum.map(fn %{slug: slug} = repo ->
+      fields =
+        Map.merge(
+          Map.get(@builtin_repository_meta, slug, %{}),
+          reject_nils(Map.get(meta, slug, %{}))
+        )
+
+      %{
+        slug: slug,
+        ref: Map.get(repo, :ref),
+        url: by_slug |> Map.fetch!(slug) |> Enum.find_value(&Map.get(&1, :url)),
+        name: Map.get(fields, :name) || slug,
+        maintainer: Map.get(fields, :maintainer) || ""
+      }
+    end)
+  end
+
+  defp reject_nils(fields), do: Map.reject(fields, fn {_k, v} -> is_nil(v) end)
+
+  defp repository_metadata(files) do
+    Enum.find_value(files, fn {path, content} ->
+      if Path.basename(path) in @repository_files and Path.dirname(path) == "." do
+        case decode(path, content) do
+          {:ok, raw} when is_map(raw) ->
+            %{name: raw["name"], maintainer: raw["maintainer"]}
+
+          _ ->
+            nil
+        end
       end
     end)
   end

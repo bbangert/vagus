@@ -23,6 +23,9 @@ defmodule Vagus.Addon.StoreTest do
     - mqtt
   """
 
+  # Carries the display-only trio (`stage`/`advanced`/`url`) that the frontend
+  # renders as the experimental badge, the advanced-mode filter and the
+  # website link — the beta ESPHome entry is exactly where HAOS shows them.
   @esphome_yaml """
   name: ESPHome
   version: "2025.1.0"
@@ -32,6 +35,9 @@ defmodule Vagus.Addon.StoreTest do
     - aarch64
   image: esphome/{arch}-addon
   ingress: true
+  stage: experimental
+  advanced: true
+  url: https://esphome.io
   """
 
   # 1x1 PNG header — real bytes, so a text-path round-trip would fail.
@@ -50,6 +56,24 @@ defmodule Vagus.Addon.StoreTest do
   # the repo root is deliberate: it is a sibling of nothing, and must not be
   # picked up by either add-on.
   defmodule FixtureFetcher do
+    # Must precede the `%{slug: "core"}` clause — the built-in mqtt source
+    # shares that slug, which is the collision `repositories/1` collapses.
+    def fetch(%{slug: "core", builtin: :mqtt}), do: {:ok, []}
+
+    # The only fixture repo carrying its own `repository.json`, i.e. the one
+    # whose store section is titled by the repo rather than by the built-in
+    # table or its slug.
+    def fetch(%{slug: "community"}) do
+      {:ok,
+       [
+         {"repository.json",
+          ~s({"name": "Home Assistant Community Add-ons", "maintainer": "Franck Nijhof"})},
+         {"esphome/config.yaml", Vagus.Addon.StoreTest.esphome_yaml()}
+       ]}
+    end
+
+    def fetch(%{slug: "nameless"}), do: {:ok, []}
+
     def fetch(%{slug: "core"}) do
       {:ok,
        [
@@ -61,6 +85,7 @@ defmodule Vagus.Addon.StoreTest do
          {"mosquitto/logo.png", Vagus.Addon.StoreTest.png()},
          {"mosquitto/CHANGELOG.md", "## 7.1.0\n"},
          {"mosquitto/DOCS.md", "# Mosquitto\n"},
+         {"mosquitto/README.md", "# Mosquitto broker\n\nThe long description body.\n"},
          {"esphome/config.yaml", Vagus.Addon.StoreTest.esphome_yaml()}
        ]}
     end
@@ -124,12 +149,155 @@ defmodule Vagus.Addon.StoreTest do
     assert s["slug"] == "core_mosquitto"
     assert s["repository"] == "core"
     assert s["name"] == "Mosquitto broker"
-    assert s["version"] == "7.1.0"
+    # Not installed, so no installed version — the frontend reads a non-nil
+    # `version` as "this add-on is installed" and renders the whole page that
+    # way. Upstream sends `installed.version if installed else None`.
+    assert s["version"] == nil
     assert s["version_latest"] == "7.1.0"
     assert s["arch"] == ["aarch64", "amd64"]
     assert s["build"] == false
     assert s["installed"] == false
     refute Map.has_key?(s, "auth_api")
+  end
+
+  test "StoreView.summary reports the installed version once there is one" do
+    catalog = Store.build_catalog(@repos, FixtureFetcher)
+    s = StoreView.summary("core_mosquitto", catalog["core_mosquitto"], true, "7.0.0")
+
+    assert s["version"] == "7.0.0"
+    assert s["version_latest"] == "7.1.0"
+    assert s["update_available"] == true
+    assert s["installed"] == true
+  end
+
+  describe "what the payload advertises (the frontend fetches nothing it isn't told about)" do
+    test "StoreView.summary carries the entry's asset flags, not a hardcoded false" do
+      catalog = Store.build_catalog(@repos, FixtureFetcher)
+
+      with_assets = StoreView.summary("core_mosquitto", catalog["core_mosquitto"], false)
+      assert with_assets["icon"] == true
+      assert with_assets["logo"] == true
+      assert with_assets["changelog"] == true
+      assert with_assets["documentation"] == true
+
+      without = StoreView.summary("core_esphome", catalog["core_esphome"], false)
+      assert without["icon"] == false
+      assert without["logo"] == false
+      assert without["changelog"] == false
+      assert without["documentation"] == false
+    end
+
+    test "StoreView.detail carries them too, and stage/advanced/url come from the config" do
+      catalog = Store.build_catalog(@repos, FixtureFetcher)
+
+      d = StoreView.detail("core_esphome", catalog["core_esphome"], false)
+      assert d["stage"] == "experimental"
+      assert d["advanced"] == true
+      assert d["url"] == "https://esphome.io"
+
+      # The default when a config says nothing, which is most add-ons.
+      stable = StoreView.detail("core_mosquitto", catalog["core_mosquitto"], false)
+      assert stable["stage"] == "stable"
+      assert stable["advanced"] == false
+      assert stable["url"] == nil
+      assert stable["icon"] == true
+    end
+
+    test "long_description is the README the caller read, and nil when absent" do
+      catalog = Store.build_catalog(@repos, FixtureFetcher, Assets.init(:memory))
+      readme = "# Mosquitto broker\n\nThe long description body.\n"
+
+      d = StoreView.detail("core_mosquitto", catalog["core_mosquitto"], false, nil, readme)
+      assert d["long_description"] == readme
+
+      # No README retained (or a detached entry, which can't be looked up) —
+      # upstream returns None rather than an empty string.
+      assert StoreView.detail("core_esphome", catalog["core_esphome"], false)["long_description"] ==
+               nil
+    end
+
+    test "an entry with no :assets key at all renders every flag false" do
+      # Hand-built entries (tests, and anything predating asset retention)
+      # must not crash or claim assets they never retained.
+      {:ok, config} =
+        Vagus.Addon.Config.parse(%{
+          "name" => "X",
+          "version" => "1",
+          "slug" => "x",
+          "description" => "d",
+          "arch" => ["amd64"],
+          "image" => "x/y"
+        })
+
+      entry = %{config: config, repository: "core"}
+
+      s = StoreView.summary("core_x", entry, false)
+      assert s["icon"] == false
+      assert s["documentation"] == false
+    end
+  end
+
+  describe "repositories/1 — one wire entry per slug, titled the way HAOS titles it" do
+    @repos_with_dupe [
+      %{slug: "core", builtin: :mqtt},
+      %{slug: "core", url: "https://github.com/home-assistant/addons"},
+      %{slug: "community", url: "https://github.com/hassio-addons/repository"}
+    ]
+
+    test "two sources sharing a slug collapse into one entry keeping the non-nil url" do
+      srv =
+        start_supervised!(
+          {Store, name: nil, fetcher: FixtureFetcher, repositories: @repos_with_dupe}
+        )
+
+      {:ok, _} = Store.reload(srv)
+      repos = Store.repositories(srv)
+
+      assert Enum.map(repos, & &1.slug) == ["core", "community"]
+
+      core = Enum.find(repos, &(&1.slug == "core"))
+      assert core.url == "https://github.com/home-assistant/addons"
+    end
+
+    test "names come from repository.json, else the built-in table, else the slug" do
+      srv =
+        start_supervised!(
+          {Store,
+           name: nil,
+           fetcher: FixtureFetcher,
+           repositories: @repos_with_dupe ++ [%{slug: "nameless", url: "https://example.test"}]}
+        )
+
+      {:ok, _} = Store.reload(srv)
+      by_slug = Map.new(Store.repositories(srv), &{&1.slug, &1})
+
+      # Parsed from the repo's own file.
+      assert by_slug["community"].name == "Home Assistant Community Add-ons"
+      assert by_slug["community"].maintainer == "Franck Nijhof"
+
+      # From the built-in table: upstream's core repo ships no repository.json.
+      assert by_slug["core"].name == "Official add-ons"
+      assert by_slug["core"].maintainer == "Home Assistant"
+
+      # Neither: the slug, and an empty maintainer rather than a null.
+      assert by_slug["nameless"].name == "nameless"
+      assert by_slug["nameless"].maintainer == ""
+    end
+
+    test "metadata only appears after a reload has actually read the repositories" do
+      srv =
+        start_supervised!(
+          {Store, name: nil, fetcher: FixtureFetcher, repositories: @repos_with_dupe}
+        )
+
+      # Pre-reload there is no fetched metadata, but the built-in table still
+      # applies and the dedupe still holds — `GET /store` is reachable before
+      # any reload has run.
+      by_slug = Map.new(Store.repositories(srv), &{&1.slug, &1})
+      assert map_size(by_slug) == 2
+      assert by_slug["core"].name == "Official add-ons"
+      assert by_slug["community"].name == "community"
+    end
   end
 
   test "StoreView.repository maps a git repo (url present) to source=url" do
@@ -169,10 +337,10 @@ defmodule Vagus.Addon.StoreTest do
       catalog = Store.build_catalog(@repos, FixtureFetcher, Assets.init(:memory))
 
       assert catalog["core_mosquitto"].assets ==
-               %{icon: true, logo: true, changelog: true, documentation: true}
+               %{icon: true, logo: true, changelog: true, documentation: true, readme: true}
 
       assert catalog["core_esphome"].assets ==
-               %{icon: false, logo: false, changelog: false, documentation: false}
+               %{icon: false, logo: false, changelog: false, documentation: false, readme: false}
 
       # The bytes live in the handle, not the entry — the whole point of a
       # presence map on a device where the catalog is held in a GenServer.

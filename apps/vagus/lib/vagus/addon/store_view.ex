@@ -36,11 +36,11 @@ defmodule Vagus.Addon.StoreView do
         ) :: map()
   def summary(
         store_slug,
-        %{config: config, repository: repo},
+        %{config: config, repository: repo} = entry,
         installed?,
         installed_version \\ nil
       ) do
-    base_fields(store_slug, config, repo, installed?, installed_version)
+    base_fields(store_slug, config, repo, installed?, installed_version, assets(entry))
   end
 
   @doc """
@@ -73,15 +73,17 @@ defmodule Vagus.Addon.StoreView do
           String.t(),
           %{config: Config.t(), repository: String.t()},
           boolean(),
+          nil | String.t(),
           nil | String.t()
         ) :: map()
   def detail(
         store_slug,
-        %{config: config, repository: repo},
+        %{config: config, repository: repo} = entry,
         installed?,
-        installed_version \\ nil
+        installed_version \\ nil,
+        long_description \\ nil
       ) do
-    base_fields(store_slug, config, repo, installed?, installed_version)
+    base_fields(store_slug, config, repo, installed?, installed_version, assets(entry))
     |> Map.merge(%{
       "apparmor" => if(config.apparmor, do: "default", else: "disable"),
       "auth_api" => config.auth_api,
@@ -91,7 +93,11 @@ defmodule Vagus.Addon.StoreView do
       "host_network" => config.host_network,
       "host_pid" => config.host_pid,
       "ingress" => config.ingress,
-      "long_description" => nil,
+      # The add-on's README.md, rendered as markdown under the install card —
+      # the entire body of the store page. `nil` when the repository ships no
+      # README, or when the entry is detached (no store source to read one
+      # from), matching upstream's `long_description()`.
+      "long_description" => long_description,
       "rating" => 5,
       "signed" => false,
       "hassio_api" => config.hassio_api,
@@ -100,30 +106,52 @@ defmodule Vagus.Addon.StoreView do
     })
   end
 
+  # The catalog entry's asset presence flags (`Vagus.Addon.Store`'s
+  # `retain_assets/3`). Absent for an entry built before assets existed, and
+  # for hand-built entries in tests — `%{}` renders every flag false, which is
+  # the honest answer when nothing is known to be retained.
+  defp assets(entry), do: Map.get(entry, :assets) || %{}
+
   # AddonInfoBaseFields + AddonInfoStoreBaseFields + installed, shared by
   # both shapes.
-  defp base_fields(store_slug, config, repo, installed?, installed_version) do
+  #
+  # `icon`/`logo`/`changelog`/`documentation` are **not** decoration: the
+  # frontend requests an asset only when the payload says it exists
+  # (`addon.icon ? "/api/hassio/addons/<slug>/icon" : undefined` in
+  # `supervisor-apps-repository.ts` and `ha-config-apps-installed.ts`; the
+  # changelog and documentation links in `supervisor-app-info.ts` gate the
+  # same way). Hardcoding them false is what made P2-A's asset routes
+  # unreachable from the UI even though they served correct bytes.
+  defp base_fields(store_slug, config, repo, installed?, installed_version, assets) do
     %{
-      "advanced" => false,
+      "advanced" => config.advanced,
       "available" => true,
       "installed" => installed?,
       "build" => config.image == nil,
+      "changelog" => Map.get(assets, :changelog, false),
       "description" => config.description,
       "homeassistant" => nil,
-      "icon" => false,
-      "logo" => false,
+      "icon" => Map.get(assets, :icon, false),
+      "logo" => Map.get(assets, :logo, false),
       "name" => config.name,
       "repository" => repo,
       "slug" => store_slug,
-      "stage" => "stable",
+      "stage" => config.stage,
       # The store entry's version IS the latest; `version` is what is running
       # locally, which is only the same thing when nothing has moved on.
       "update_available" => Vagus.Version.update_available?(installed_version, config.version),
-      "url" => nil,
+      "url" => config.url,
       "version_latest" => config.version,
-      "version" => installed_version || config.version,
+      # `nil` when the add-on isn't installed — upstream sends
+      # `installed.version if installed else None`, and the frontend's add-on
+      # page switches its entire layout on this one field: falsy renders the
+      # Install button and the store view, truthy renders the current-version
+      # line, state chip, controls card and uninstall menu. Defaulting it to
+      # the store's version made every uninstalled add-on's page claim to be
+      # installed.
+      "version" => installed_version,
       "arch" => config.arch,
-      "documentation" => false
+      "documentation" => Map.get(assets, :documentation, false)
     }
   end
 end

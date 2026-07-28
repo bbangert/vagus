@@ -35,6 +35,7 @@ defmodule Vagus.Addon.Config do
   @boots ~w(auto manual manual_only)
   @roles ~w(default homeassistant backup manager admin)
   @backup_modes ~w(hot cold)
+  @stages ~w(stable experimental deprecated)
 
   @type mapping :: %{type: String.t(), read_only: boolean(), path: String.t() | nil}
 
@@ -129,7 +130,16 @@ defmodule Vagus.Addon.Config do
             backup_pre: nil,
             backup_post: nil,
             backup_exclude: [],
-            timeout: 10
+            timeout: 10,
+            # Display-only, but load-bearing in the frontend: `stage` drives the
+            # experimental/deprecated badge on a store card, `advanced` hides an
+            # add-on behind the user's "advanced mode" profile toggle, and `url`
+            # is the add-on's website link. Dropping them at parse time is why
+            # ESPHome's beta and dev entries rendered as ordinary stable
+            # add-ons in Vagus while HAOS badges them.
+            stage: "stable",
+            advanced: false,
+            url: nil
 
   @doc """
   Parses a decoded config map into a `%Vagus.Addon.Config{}`, applying defaults
@@ -229,7 +239,10 @@ defmodule Vagus.Addon.Config do
       "backup_pre" => c.backup_pre,
       "backup_post" => c.backup_post,
       "backup_exclude" => c.backup_exclude,
-      "timeout" => c.timeout
+      "timeout" => c.timeout,
+      "stage" => c.stage,
+      "advanced" => c.advanced,
+      "url" => c.url
     }
   end
 
@@ -286,6 +299,9 @@ defmodule Vagus.Addon.Config do
     |> put(:backup_post, opt_str(raw, "backup_post"))
     |> put(:backup_exclude, str_list(raw, "backup_exclude"))
     |> put(:timeout, int(raw, "timeout", 10))
+    |> put(:stage, enum(raw, "stage", @stages, "stable"))
+    |> put(:advanced, boolean(raw, "advanced", false))
+    |> put(:url, opt_str(raw, "url"))
   end
 
   defp put(config, key, value), do: Map.put(config, key, value)

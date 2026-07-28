@@ -293,7 +293,13 @@ defmodule Vagus.API.Router do
 
         Envelope.send_ok(
           conn,
-          StoreView.detail(slug, entry, installed?(installed), installed_version(installed))
+          StoreView.detail(
+            slug,
+            entry,
+            installed?(installed),
+            installed_version(installed),
+            long_description(slug)
+          )
         )
 
       :error ->
@@ -381,13 +387,47 @@ defmodule Vagus.API.Router do
           :error -> config.options
         end
 
-      Envelope.send_ok(
-        conn,
-        Vagus.Addon.Info.render(config, state, options, info_settings(entry))
-      )
+      settings =
+        entry
+        |> info_settings()
+        |> Map.put(:long_description, long_description(resolved))
+
+      Envelope.send_ok(conn, Vagus.Addon.Info.render(config, state, options, settings))
     else
       {:error, :forbidden} -> Envelope.send_error(conn, "Not authorized for this add-on", 403)
-      _ -> Envelope.send_error(conn, "Add-on #{slug} does not exist", 404)
+      _ -> uninstalled_addon_info(conn, slug)
+    end
+  end
+
+  # V1's legacy store fallback. `GET /addons/{slug}/info` is the ONLY call the
+  # frontend makes when you open an add-on page — from the store listing too
+  # (`_addonTapped` navigates to `/config/app/{slug}/info?store=true`, and
+  # `ha-config-app-dashboard._loadAddon` fetches this endpoint and shows an
+  # error screen if it fails). Upstream serves that by registering a shim on
+  # the V1 route only (`api/__init__.py::apps_app_info`): installed add-ons get
+  # the normal info, `APIAppNotInstalled` falls through to the store's detail
+  # payload with `state` and `options` grafted on, and a slug in neither still
+  # 404s. The V2 `/apps/{slug}/info` route keeps the strict behaviour.
+  #
+  # Without this an uninstalled store add-on's page is an "Error loading app"
+  # screen — every card in the store is unclickable.
+  #
+  # No new exposure for a default-role add-on caller: `options` here is the
+  # store config's *defaults* out of `config.yaml`, not another add-on's saved
+  # user options (those live in `State` and only the installed branch reads
+  # them).
+  defp uninstalled_addon_info(conn, slug) do
+    case Store.get(slug) do
+      {:ok, %{config: config} = entry} ->
+        detail =
+          slug
+          |> StoreView.detail(entry, false, nil, long_description(slug))
+          |> Map.merge(%{"state" => "unknown", "options" => config.options})
+
+        Envelope.send_ok(conn, detail)
+
+      :error ->
+        Envelope.send_error(conn, "Add-on #{slug} does not exist", 404)
     end
   end
 
@@ -1543,13 +1583,15 @@ defmodule Vagus.API.Router do
   defp installed_version(nil), do: nil
   defp installed_version(%{config: %{version: version}}), do: version
 
-  # What the store currently advertises for an installed add-on, or nil when
-  # it is detached (installed, but its repository no longer lists it) — which
-  # renders as "no update available" rather than as an error.
-  defp store_version(store_slug) do
+  # What the store currently advertises for an installed add-on: its version
+  # and its asset presence flags, in ONE catalog lookup. A detached add-on
+  # (installed, but its repository no longer lists it) yields `nil` + `%{}`,
+  # which renders as "no update available" and "no assets" rather than as an
+  # error.
+  defp store_facts(store_slug) do
     case Store.get(store_slug) do
-      {:ok, %{config: %{version: version}}} -> version
-      :error -> nil
+      {:ok, %{config: %{version: version}} = entry} -> {version, Map.get(entry, :assets) || %{}}
+      :error -> {nil, %{}}
     end
   end
 
@@ -1638,6 +1680,42 @@ defmodule Vagus.API.Router do
   # `Vagus.Addon.Store.asset_lookup/2`.
   defp resolve_asset(slug), do: Store.asset_lookup(slug)
 
+  # The add-on's README.md as a string, for the `long_description` the frontend
+  # renders as the body of its page. Read per detail request rather than held
+  # in the catalog: it is the largest asset an add-on ships, only two routes
+  # want it, and in `:disk` mode holding 80 of them resident is exactly what
+  # that mode exists to avoid. A missing README (or a detached add-on, which
+  # has no store entry to look one up from) is `nil`, same as upstream.
+  defp long_description(slug) do
+    with {:ok, id, handle} <- resolve_asset(slug),
+         {:ok, binary} <- Assets.get(id, :readme, handle) do
+      utf8_scrub(binary)
+    else
+      _absent -> nil
+    end
+  end
+
+  # A README arrives as whatever bytes a third-party repository tarball
+  # carried, and this one goes into a **JSON** response — `Jason.encode!/1`
+  # raises on invalid UTF-8, which would turn one add-on's Latin-1 README into
+  # a 500 on its store page. The other text assets are served as `text/plain`
+  # and never hit an encoder, so this is the only read that needs it.
+  #
+  # Replace rather than reject: upstream reads the file with
+  # `errors="replace"` (`AppModel.long_description`), so a README with a few
+  # bad bytes still renders, minus those bytes. Dropping to `nil` would blank
+  # a page that upstream shows. One U+FFFD per bad byte, matching Python.
+  defp utf8_scrub(binary) when is_binary(binary) do
+    if String.valid?(binary), do: binary, else: binary |> scrub_bytes([])
+  end
+
+  defp scrub_bytes(<<>>, acc), do: acc |> Enum.reverse() |> IO.iodata_to_binary()
+
+  defp scrub_bytes(<<char::utf8, rest::binary>>, acc),
+    do: scrub_bytes(rest, [<<char::utf8>> | acc])
+
+  defp scrub_bytes(<<_bad::8, rest::binary>>, acc), do: scrub_bytes(rest, ["�" | acc])
+
   # -- addon lifecycle helpers ------------------------------------------------
 
   # `GET /addons` entry: the effective options (falling back to the config
@@ -1655,11 +1733,15 @@ defmodule Vagus.API.Router do
 
   # `Vagus.Addon.Info.render/4`'s `settings` param: the State entry's
   # ingress/watchdog fields (minus `config`/`state`/`user_options`), plus the
-  # store's current version so `update_available` can be real.
+  # store's current version so `update_available` can be real and its asset
+  # flags so the frontend knows to fetch the icon.
   defp info_settings(%{config: config} = entry) do
+    {version_latest, assets} = store_facts(config.slug)
+
     entry
     |> Map.take([:ingress_token, :ingress_port, :ingress_panel, :watchdog])
-    |> Map.put(:version_latest, store_version(config.slug))
+    |> Map.put(:version_latest, version_latest)
+    |> Map.put(:assets, assets)
   end
 
   defp handle_install(conn, slug) do
