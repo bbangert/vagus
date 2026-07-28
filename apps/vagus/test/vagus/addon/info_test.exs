@@ -71,6 +71,59 @@ defmodule Vagus.Addon.InfoTest do
     c
   end
 
+  describe "asset advertisement (the installed-add-ons page fetches nothing it isn't told about)" do
+    test "the store entry's flags reach the payload", %{config: c} do
+      info =
+        Info.render(c, :started, %{}, %{
+          assets: %{icon: true, logo: true, changelog: true, documentation: false}
+        })
+
+      assert info["icon"] == true
+      assert info["logo"] == true
+      assert info["changelog"] == true
+      assert info["documentation"] == false
+    end
+
+    test "a detached add-on (no store entry, so no assets) advertises none", %{config: c} do
+      info = Info.render(c, :started, %{}, %{version_latest: nil, assets: %{}})
+
+      assert info["icon"] == false
+      assert info["logo"] == false
+      assert info["changelog"] == false
+      assert info["documentation"] == false
+    end
+
+    test "settings without an :assets key at all behave the same", %{config: c} do
+      info = Info.render(c, :started, %{})
+
+      assert info["icon"] == false
+      assert info["documentation"] == false
+    end
+
+    test "stage/advanced/url come from the installed config", %{config: c} do
+      # The install-time config is the source — an installed add-on's badge
+      # must not silently follow the store's newer entry.
+      assert Info.render(c, :started, %{})["stage"] == "stable"
+
+      {:ok, beta} =
+        Config.parse(%{
+          "name" => "ESPHome (beta)",
+          "version" => "1",
+          "slug" => "esphome_beta",
+          "description" => "d",
+          "arch" => ["aarch64"],
+          "stage" => "experimental",
+          "advanced" => true,
+          "url" => "https://beta.esphome.io/"
+        })
+
+      info = Info.render(beta, :started, %{})
+      assert info["stage"] == "experimental"
+      assert info["advanced"] == true
+      assert info["url"] == "https://beta.esphome.io/"
+    end
+  end
+
   describe "ingress rendering (§B3.4) + watchdog (§B8)" do
     test "ingress add-on with full settings renders entry/url/port/panel" do
       c = ingress_config(%{"ingress_entry" => "dashboard"})

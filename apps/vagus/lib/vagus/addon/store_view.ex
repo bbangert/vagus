@@ -36,11 +36,11 @@ defmodule Vagus.Addon.StoreView do
         ) :: map()
   def summary(
         store_slug,
-        %{config: config, repository: repo},
+        %{config: config, repository: repo} = entry,
         installed?,
         installed_version \\ nil
       ) do
-    base_fields(store_slug, config, repo, installed?, installed_version)
+    base_fields(store_slug, config, repo, installed?, installed_version, assets(entry))
   end
 
   @doc """
@@ -77,11 +77,11 @@ defmodule Vagus.Addon.StoreView do
         ) :: map()
   def detail(
         store_slug,
-        %{config: config, repository: repo},
+        %{config: config, repository: repo} = entry,
         installed?,
         installed_version \\ nil
       ) do
-    base_fields(store_slug, config, repo, installed?, installed_version)
+    base_fields(store_slug, config, repo, installed?, installed_version, assets(entry))
     |> Map.merge(%{
       "apparmor" => if(config.apparmor, do: "default", else: "disable"),
       "auth_api" => config.auth_api,
@@ -100,30 +100,45 @@ defmodule Vagus.Addon.StoreView do
     })
   end
 
+  # The catalog entry's asset presence flags (`Vagus.Addon.Store`'s
+  # `retain_assets/3`). Absent for an entry built before assets existed, and
+  # for hand-built entries in tests — `%{}` renders every flag false, which is
+  # the honest answer when nothing is known to be retained.
+  defp assets(entry), do: Map.get(entry, :assets) || %{}
+
   # AddonInfoBaseFields + AddonInfoStoreBaseFields + installed, shared by
   # both shapes.
-  defp base_fields(store_slug, config, repo, installed?, installed_version) do
+  #
+  # `icon`/`logo`/`changelog`/`documentation` are **not** decoration: the
+  # frontend requests an asset only when the payload says it exists
+  # (`addon.icon ? "/api/hassio/addons/<slug>/icon" : undefined` in
+  # `supervisor-apps-repository.ts` and `ha-config-apps-installed.ts`; the
+  # changelog and documentation links in `supervisor-app-info.ts` gate the
+  # same way). Hardcoding them false is what made P2-A's asset routes
+  # unreachable from the UI even though they served correct bytes.
+  defp base_fields(store_slug, config, repo, installed?, installed_version, assets) do
     %{
-      "advanced" => false,
+      "advanced" => config.advanced,
       "available" => true,
       "installed" => installed?,
       "build" => config.image == nil,
+      "changelog" => Map.get(assets, :changelog, false),
       "description" => config.description,
       "homeassistant" => nil,
-      "icon" => false,
-      "logo" => false,
+      "icon" => Map.get(assets, :icon, false),
+      "logo" => Map.get(assets, :logo, false),
       "name" => config.name,
       "repository" => repo,
       "slug" => store_slug,
-      "stage" => "stable",
+      "stage" => config.stage,
       # The store entry's version IS the latest; `version` is what is running
       # locally, which is only the same thing when nothing has moved on.
       "update_available" => Vagus.Version.update_available?(installed_version, config.version),
-      "url" => nil,
+      "url" => config.url,
       "version_latest" => config.version,
       "version" => installed_version || config.version,
       "arch" => config.arch,
-      "documentation" => false
+      "documentation" => Map.get(assets, :documentation, false)
     }
   end
 end

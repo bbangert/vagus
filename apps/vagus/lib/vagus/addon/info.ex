@@ -45,6 +45,12 @@ defmodule Vagus.Addon.Info do
       lists it. Both render as `version_latest == version` and
       `update_available == false`, matching upstream, which cannot offer an
       update it has no store entry for.
+    * `:assets` — the store entry's asset presence flags
+      (`%{icon:, logo:, changelog:, documentation:}`), same provenance as
+      `:version_latest` and absent in the same cases. `%{}` renders every flag
+      false, which is what the frontend needs to hear: it requests an asset
+      only when the payload advertises one, so a detached add-on stops asking
+      rather than showing a broken image.
 
   `version` always comes from `config`, which for an installed add-on is the
   config captured at install time — `Vagus.Addon.State` never refreshes a
@@ -60,27 +66,28 @@ defmodule Vagus.Addon.Info do
   def render(%Config{} = config, state, options, settings \\ %{})
       when is_map(options) and is_map(settings) do
     latest = Map.get(settings, :version_latest)
+    assets = Map.get(settings, :assets) || %{}
 
     %{
       # AddonInfoBaseFields
-      "advanced" => false,
+      "advanced" => config.advanced,
       "available" => true,
       "build" => false,
       "description" => config.description,
       "homeassistant" => nil,
-      "icon" => false,
-      "logo" => false,
+      "icon" => Map.get(assets, :icon, false),
+      "logo" => Map.get(assets, :logo, false),
       "name" => config.name,
       "repository" => "core",
       "slug" => config.slug,
-      "stage" => "stable",
+      "stage" => config.stage,
       "update_available" => Vagus.Version.update_available?(config.version, latest),
-      "url" => nil,
+      "url" => config.url,
       "version_latest" => latest || config.version,
       "version" => config.version,
       # AddonInfoStoreBaseFields
       "arch" => config.arch,
-      "documentation" => false,
+      "documentation" => Map.get(assets, :documentation, false),
       # AddonInfoStoreExtFields
       "apparmor" => if(config.apparmor, do: "default", else: "disable"),
       "auth_api" => config.auth_api,
@@ -114,7 +121,7 @@ defmodule Vagus.Addon.Info do
       "host_uts" => config.host_uts,
       "host_dbus" => config.host_dbus,
       "privileged" => config.privileged,
-      "changelog" => false,
+      "changelog" => Map.get(assets, :changelog, false),
       "stdin" => false,
       "gpio" => false,
       "usb" => false,

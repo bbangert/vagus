@@ -161,10 +161,13 @@
           {Credo.Check.Warning.RaiseInsideRescue, []},
           {Credo.Check.Warning.SpecWithStruct, []},
           # Vagus.Addon.Config's struct mirrors the upstream HAOS add-on
-          # config.yaml schema field-for-field (43 fields) — the count is
+          # config.yaml schema field-for-field (47 fields) — the count is
           # dictated by the contract, not a design smell, and can't be reduced
-          # without diverging from what aiohasupervisor expects.
-          {Credo.Check.Warning.StructFieldAmount, [max_fields: 45]},
+          # without diverging from what aiohasupervisor expects. It grows only
+          # when a config.yaml key we were dropping turns out to be
+          # load-bearing (`stage`/`advanced`/`url` were, for the frontend's
+          # badge, filter and website link).
+          {Credo.Check.Warning.StructFieldAmount, [max_fields: 50]},
           {Credo.Check.Warning.UnsafeExec, []},
           {Credo.Check.Warning.UnusedEnumOperation, []},
           {Credo.Check.Warning.UnusedFileOperation, []},

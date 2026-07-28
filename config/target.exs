@@ -175,10 +175,24 @@ config :vagus, :dns_upstream, "1.1.1.1"
 # `:default_native_addon`); both can't own `:1883`/the mqtt service at once.
 config :vagus, :store_fetcher, Vagus.Addon.Store.BuiltinFetcher
 
+# The default set mirrors upstream's `BuiltinRepository`
+# (`supervisor/store/const.py`) minus `local`, which needs a user-writable
+# add-on directory Vagus doesn't have yet. Note the two `core` entries are one
+# repository as far as the wire is concerned — the built-in mqtt source rides
+# the core slug so its catalog key is `core_mqtt` — and `Store.repositories/1`
+# collapses them into a single wire entry. Adding a source under a *new* slug
+# is cheap; changing an existing slug is not, because installed add-ons are
+# keyed by `<repo_slug>_<addon_slug>`.
 config :vagus, :store_repositories, [
   %{slug: "core", builtin: :mqtt},
   %{slug: "core", url: "https://github.com/home-assistant/addons", ref: "master"},
-  %{slug: "esphome", url: "https://github.com/esphome/home-assistant-addon", ref: "main"}
+  %{slug: "community", url: "https://github.com/hassio-addons/repository", ref: "master"},
+  %{slug: "esphome", url: "https://github.com/esphome/home-assistant-addon", ref: "main"},
+  %{
+    slug: "music_assistant",
+    url: "https://github.com/music-assistant/home-assistant-addon",
+    ref: "main"
+  }
 ]
 
 # Make the native mqttx broker the default MQTT provider (M5-P5):

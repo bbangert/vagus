@@ -1543,13 +1543,15 @@ defmodule Vagus.API.Router do
   defp installed_version(nil), do: nil
   defp installed_version(%{config: %{version: version}}), do: version
 
-  # What the store currently advertises for an installed add-on, or nil when
-  # it is detached (installed, but its repository no longer lists it) — which
-  # renders as "no update available" rather than as an error.
-  defp store_version(store_slug) do
+  # What the store currently advertises for an installed add-on: its version
+  # and its asset presence flags, in ONE catalog lookup. A detached add-on
+  # (installed, but its repository no longer lists it) yields `nil` + `%{}`,
+  # which renders as "no update available" and "no assets" rather than as an
+  # error.
+  defp store_facts(store_slug) do
     case Store.get(store_slug) do
-      {:ok, %{config: %{version: version}}} -> version
-      :error -> nil
+      {:ok, %{config: %{version: version}} = entry} -> {version, Map.get(entry, :assets) || %{}}
+      :error -> {nil, %{}}
     end
   end
 
@@ -1655,11 +1657,15 @@ defmodule Vagus.API.Router do
 
   # `Vagus.Addon.Info.render/4`'s `settings` param: the State entry's
   # ingress/watchdog fields (minus `config`/`state`/`user_options`), plus the
-  # store's current version so `update_available` can be real.
+  # store's current version so `update_available` can be real and its asset
+  # flags so the frontend knows to fetch the icon.
   defp info_settings(%{config: config} = entry) do
+    {version_latest, assets} = store_facts(config.slug)
+
     entry
     |> Map.take([:ingress_token, :ingress_port, :ingress_panel, :watchdog])
-    |> Map.put(:version_latest, store_version(config.slug))
+    |> Map.put(:version_latest, version_latest)
+    |> Map.put(:assets, assets)
   end
 
   defp handle_install(conn, slug) do
