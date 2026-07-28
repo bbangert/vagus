@@ -265,4 +265,135 @@ defmodule Vagus.Addon.OptionsSchemaTest do
       assert m =~ "must be one of"
     end
   end
+
+  describe "ui/1 — the form the Configuration page builds" do
+    # `nil` here is what drops the frontend into its YAML editor, which is
+    # what every add-on got while this was hardcoded.
+    defp node(schema, name), do: S.ui(schema) |> Enum.find(&(&1["name"] == name))
+
+    test "an add-on with no schema has no form" do
+      assert S.ui(false) == nil
+    end
+
+    test "an empty schema is a form with no fields, which is not the same thing" do
+      assert S.ui(%{}) == []
+    end
+
+    test "each token maps to the type the frontend knows how to render" do
+      schema = %{
+        "s" => "str",
+        "i" => "int",
+        "f" => "float",
+        "b" => "bool",
+        "p" => "password",
+        "e" => "email",
+        "u" => "url",
+        "port" => "port",
+        "m" => "match(^a.*$)",
+        "l" => "list(x|y|z)"
+      }
+
+      assert node(schema, "s")["type"] == "string"
+      assert node(schema, "i")["type"] == "integer"
+      assert node(schema, "f")["type"] == "float"
+      assert node(schema, "b")["type"] == "boolean"
+      assert node(schema, "port")["type"] == "integer"
+      assert node(schema, "m")["type"] == "string"
+
+      # Every emitted type must be in the frontend's SUPPORTED_UI_TYPES, or it
+      # silently falls back to YAML for the whole add-on.
+      supported = ~w(string select boolean integer float schema)
+      assert Enum.all?(S.ui(schema), &(&1["type"] in supported))
+    end
+
+    test "password, email and url are strings with a format" do
+      schema = %{"p" => "password", "e" => "email", "u" => "url"}
+
+      assert node(schema, "p") == %{
+               "name" => "p",
+               "type" => "string",
+               "format" => "password",
+               "required" => true
+             }
+
+      assert node(schema, "e")["format"] == "email"
+      assert node(schema, "u")["format"] == "url"
+    end
+
+    test "a list token becomes a select carrying its options" do
+      assert node(%{"l" => "list(debug|info|error)"}, "l") == %{
+               "name" => "l",
+               "type" => "select",
+               "options" => ["debug", "info", "error"],
+               "required" => true
+             }
+    end
+
+    test "bounds ride along as floats, the way upstream emits them" do
+      assert node(%{"s" => "str(1,10)"}, "s")["lengthMin"] === 1.0
+      assert node(%{"s" => "str(1,10)"}, "s")["lengthMax"] === 10.0
+      assert node(%{"i" => "int(0,100)"}, "i")["lengthMin"] === 0.0
+      assert node(%{"f" => "float(1.5,2.5)"}, "f")["lengthMax"] === 2.5
+
+      # An unbounded token carries neither key rather than nulls.
+      refute Map.has_key?(node(%{"s" => "str"}, "s"), "lengthMin")
+    end
+
+    test "the trailing ? is the required/optional split, and exactly one is set" do
+      required = node(%{"a" => "str"}, "a")
+      optional = node(%{"a" => "str?"}, "a")
+
+      assert required["required"] == true
+      refute Map.has_key?(required, "optional")
+      assert optional["optional"] == true
+      refute Map.has_key?(optional, "required")
+    end
+
+    test "a one-element list renders that element as multiple" do
+      assert node(%{"keys" => ["str"]}, "keys") == %{
+               "name" => "keys",
+               "type" => "string",
+               "multiple" => true,
+               "required" => true
+             }
+    end
+
+    test "a nested map becomes a schema node holding its children" do
+      assert node(%{"server" => %{"tcp_forwarding" => "bool?"}}, "server") == %{
+               "name" => "server",
+               "type" => "schema",
+               "optional" => true,
+               "multiple" => false,
+               "schema" => [
+                 %{"name" => "tcp_forwarding", "type" => "boolean", "optional" => true}
+               ]
+             }
+    end
+
+    test "an unrenderable token is skipped, not fatal to the rest of the form" do
+      # Upstream's `_single_ui_option` returns early on a regex miss. Losing
+      # one field beats losing the form.
+      ui = S.ui(%{"good" => "str", "bad" => "nonsense"})
+
+      assert Enum.map(ui, & &1["name"]) == ["good"]
+    end
+
+    test "the real Terminal & SSH schema renders every field" do
+      # The add-on that surfaced this: its form was a YAML editor because
+      # `schema` was hardcoded null.
+      schema = %{
+        "authorized_keys" => ["str"],
+        "apks" => ["str"],
+        "password" => "password?",
+        "server" => %{"tcp_forwarding" => "bool?"}
+      }
+
+      ui = S.ui(schema)
+      assert length(ui) == 4
+      assert node(schema, "password")["format"] == "password"
+      assert node(schema, "password")["optional"] == true
+      assert node(schema, "authorized_keys")["multiple"] == true
+      assert node(schema, "server")["type"] == "schema"
+    end
+  end
 end
