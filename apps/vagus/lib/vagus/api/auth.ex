@@ -29,10 +29,54 @@ defmodule Vagus.API.Auth do
   @impl Plug
   def init(opts), do: opts
 
-  @impl Plug
-  def call(%{assigns: %{auth_bypass: true}} = conn, _opts), do: conn
+  # Kinds served without a token. See `unauthenticated?/1`.
+  @unauthenticated_asset_kinds ~w(icon logo)
 
-  def call(conn, _opts) do
+  @impl Plug
+  def call(conn, opts)
+
+  def call(%Plug.Conn{} = conn, _opts) do
+    if unauthenticated?(conn), do: conn, else: authenticate(conn)
+  end
+
+  @doc """
+  Whether `conn` is one of the icon/logo GETs that must be served with no
+  token at all.
+
+  Computed here rather than read from an assign set by an earlier plug. An
+  assign is a channel any plug in the pipeline could write, so trusting one
+  at the auth boundary would mean a future plug could disable authentication
+  for *any* route by accident. Nothing outside this module decides that a
+  request skips auth.
+
+  The exemption is forced, not chosen: Core's proxy forwards these GETs with
+  no `Authorization` header at all (`homeassistant/components/hassio/http.py`
+  — when `PATHS_NO_AUTH` matches, the branch short-circuits before the header
+  is set, for admins too), and Supervisor skips its own middleware for them
+  (`no_security_check` splices in `_V1_FRONTEND_PATHS`, i.e.
+  `|/(store/)?addons/<RE_SLUG>/(logo|icon)`). Requiring a token here means
+  permanently broken images, whatever the frontend does.
+
+  Deliberately narrow: GET only, exact `path_info` segment match (never a
+  regex over the raw path), and a slug that passes
+  `Vagus.Addon.Config.valid_slug?/1`. Core itself 405s a non-GET on these
+  paths, so the method restriction matches upstream rather than merely being
+  cautious.
+  """
+  @spec unauthenticated?(Plug.Conn.t()) :: boolean()
+  def unauthenticated?(%Plug.Conn{method: "GET", path_info: path_info}),
+    do: asset_path?(path_info)
+
+  def unauthenticated?(%Plug.Conn{}), do: false
+
+  defp asset_path?(["addons", slug, kind]), do: asset?(kind, slug)
+  defp asset_path?(["store", "addons", slug, kind]), do: asset?(kind, slug)
+  defp asset_path?(_path_info), do: false
+
+  defp asset?(kind, slug),
+    do: kind in @unauthenticated_asset_kinds and Vagus.Addon.Config.valid_slug?(slug)
+
+  defp authenticate(conn) do
     case token(conn) do
       nil -> unauthorized(conn)
       token -> resolve(conn, token)

@@ -120,7 +120,6 @@ defmodule Vagus.API.Router do
   # over the raw request path, which would also match a `..`-mangled or
   # doubly-encoded path a segment-list comparison can't be fooled by — and
   # the slug is validated before anything downstream trusts it.
-  plug(:bypass_auth_for_asset_get)
   plug(Vagus.API.Auth)
   plug(:match)
   plug(:dispatch)
@@ -143,23 +142,6 @@ defmodule Vagus.API.Router do
   # "addons", slug, "icon"|"logo"]` sets the bypass; everything else — a
   # different method on the same path, changelog/documentation, any other
   # route — falls through untouched to `Vagus.API.Auth`.
-  @unauthenticated_asset_kinds ~w(icon logo)
-
-  defp bypass_auth_for_asset_get(conn, _opts) do
-    if conn.method == "GET" and unauthenticated_asset_path?(conn.path_info) do
-      assign(conn, :auth_bypass, true)
-    else
-      conn
-    end
-  end
-
-  defp unauthenticated_asset_path?(["addons", slug, kind]),
-    do: kind in @unauthenticated_asset_kinds and valid_slug?(slug)
-
-  defp unauthenticated_asset_path?(["store", "addons", slug, kind]),
-    do: kind in @unauthenticated_asset_kinds and valid_slug?(slug)
-
-  defp unauthenticated_asset_path?(_path_info), do: false
 
   # -- Main coordinator (5 min) + one-time setup GETs -----------------------
 
@@ -1585,8 +1567,8 @@ defmodule Vagus.API.Router do
   defp send_image_asset(conn, slug, kind) do
     conn = security_headers(conn, kind)
 
-    with {:ok, id} <- resolve_asset_id(slug),
-         {:ok, binary} <- Assets.get(id, kind, Store.assets()) do
+    with {:ok, id, handle} <- resolve_asset(slug),
+         {:ok, binary} <- Assets.get(id, kind, handle) do
       conn |> put_resp_content_type("image/png", nil) |> send_resp(200, binary) |> halt()
     else
       _not_found -> missing_image_asset(conn, kind, slug)
@@ -1606,8 +1588,8 @@ defmodule Vagus.API.Router do
     supervisor_only(conn, fn ->
       conn = security_headers(conn, kind)
 
-      with {:ok, id} <- resolve_asset_id(slug),
-           {:ok, binary} <- Assets.get(id, kind, Store.assets()) do
+      with {:ok, id, handle} <- resolve_asset(slug),
+           {:ok, binary} <- Assets.get(id, kind, handle) do
         conn |> put_resp_content_type("text/plain") |> send_resp(200, binary) |> halt()
       else
         _not_found -> missing_text_asset(conn, kind, slug)
@@ -1654,12 +1636,10 @@ defmodule Vagus.API.Router do
   # like a slug that was never installed — matching upstream's `with_icon =
   # False` when `app_store is None`. A bogus/traversal slug never reaches
   # `Assets` at all: it just fails this `Store.get/1` lookup.
-  defp resolve_asset_id(slug) do
-    case Store.get(slug) do
-      {:ok, entry} -> {:ok, Assets.id(entry)}
-      :error -> :error
-    end
-  end
+  # One `Store` round-trip, not two — these routes take no token, so every
+  # request is unauthenticated load on the singleton. See
+  # `Vagus.Addon.Store.asset_lookup/2`.
+  defp resolve_asset(slug), do: Store.asset_lookup(slug)
 
   # -- addon lifecycle helpers ------------------------------------------------
 

@@ -112,6 +112,21 @@ defmodule Vagus.Addon.Store do
   end
 
   @doc """
+  The asset id for `store_slug` and the handle to read it from, in ONE call.
+
+  Exists because the asset routes are the only unauthenticated surface in the
+  API: asking the singleton for the catalog entry and the handle separately
+  meant two synchronous `GenServer.call/2`s per token-less request, all
+  contending with the same process that serves `/store` and runs catalog
+  reloads. `:error` when the slug is not in the catalog — which is also how a
+  detached add-on and a bogus slug arrive here.
+  """
+  @spec asset_lookup(String.t(), GenServer.server()) :: {:ok, Assets.id(), Assets.t()} | :error
+  def asset_lookup(store_slug, server \\ __MODULE__) do
+    GenServer.call(server, {:asset_lookup, store_slug})
+  end
+
+  @doc """
   The store's asset handle, for reading retained icon/logo/changelog/
   documentation bytes (`Vagus.Addon.Store.Assets.get/3`).
   """
@@ -163,6 +178,16 @@ defmodule Vagus.Addon.Store do
   end
 
   def handle_call(:assets, _from, state), do: {:reply, state.assets, state}
+
+  def handle_call({:asset_lookup, slug}, _from, state) do
+    reply =
+      case Map.fetch(state.catalog, slug) do
+        {:ok, entry} -> {:ok, Assets.id(entry), state.assets}
+        :error -> :error
+      end
+
+    {:reply, reply, state}
+  end
 
   def handle_call({:put_catalog, catalog}, _from, state) do
     {:reply, :ok, %{state | catalog: catalog}}
