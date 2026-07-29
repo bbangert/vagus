@@ -23,12 +23,23 @@ defmodule Vagus.API.AddonInfoRouterTest do
     %{config: c}
   end
 
-  defp addon_token(slug) do
+  defp addon_token(slug, grants \\ %{}) do
     token = "tok-#{System.unique_integer([:positive])}"
 
-    :ok =
-      Registry.register(token, %{slug: slug, services_role: %{}, auth_api: true, discovery: []})
+    identity =
+      Map.merge(
+        %{
+          slug: slug,
+          services_role: %{},
+          auth_api: true,
+          discovery: [],
+          hassio_api: true,
+          hassio_role: "default"
+        },
+        grants
+      )
 
+    :ok = Registry.register(token, identity)
     on_exit(fn -> Registry.unregister_slug(slug) end)
     token
   end
@@ -137,6 +148,60 @@ defmodule Vagus.API.AddonInfoRouterTest do
       info = data(conn)
       assert info["ingress"] == true
       assert info["ingress_port"] == 6052
+    end
+  end
+
+  # Audit A8. Upstream's `info_data` gates ONLY `ATTR_OPTIONS`, on
+  # `expose_options` — "User options may contain secrets" — and redacts to an
+  # empty map rather than dropping the key, because the frontend's config form
+  # reads it unconditionally.
+  describe "options redaction (A8)" do
+    setup do
+      :ok = State.put_options("core_mosquitto", %{"password" => "hunter2"})
+      :ok
+    end
+
+    test "Core sees the real options" do
+      conn =
+        call("/addons/core_mosquitto/info", [
+          {"authorization", "Bearer #{Vagus.API.Token.get()}"}
+        ])
+
+      assert conn.status == 200
+      assert data(conn)["options"]["password"] == "hunter2"
+    end
+
+    test "the add-on itself sees its own options, by slug and via self" do
+      for path <- ["/addons/core_mosquitto/info", "/addons/self/info"] do
+        token = addon_token("core_mosquitto")
+        conn = call(path, [{"x-supervisor-token", token}])
+
+        assert conn.status == 200
+
+        assert data(conn)["options"]["password"] == "hunter2",
+               "#{path} redacted the add-on's own options"
+      end
+    end
+
+    # Vagus is stricter than upstream here and this is the proof: upstream
+    # would let a default-role add-on READ another add-on's info (with options
+    # redacted); `resolve_info_slug/2` refuses outright, so the redaction
+    # never even comes into play. If that guard is ever widened, the tests
+    # above and this one together say what must remain true.
+    test "another add-on cannot reach the info at all, redacted or otherwise" do
+      token = addon_token("core_nosy")
+      conn = call("/addons/core_mosquitto/info", [{"x-supervisor-token", token}])
+
+      assert conn.status == 403
+      refute conn.resp_body =~ "hunter2"
+    end
+
+    test "a manager-role add-on is refused too, for the same reason" do
+      token = addon_token("core_manager_nosy", %{hassio_role: "manager"})
+      conn = call("/addons/core_mosquitto/info", [{"x-supervisor-token", token}])
+
+      assert conn.status == 403
+      refute conn.resp_body =~ "hunter2"
     end
   end
 end

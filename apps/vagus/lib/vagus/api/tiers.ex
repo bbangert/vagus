@@ -305,6 +305,29 @@ defmodule Vagus.API.Tiers do
   def allows?(:default, requirement), do: requirement == :default
   def allows?(:none, _requirement), do: false
 
+  @doc """
+  May this caller see an add-on's effective `options` in an info payload?
+
+  Upstream's `expose_options` (`supervisor/api/apps.py::info_data`, "User
+  options may contain secrets"): Home Assistant Core and other non-app
+  internals, the add-on itself, or an add-on holding the manager/admin role.
+  Everyone else reads `%{}` — the key stays, empty, which is upstream's shape
+  and what the frontend's config form expects to find.
+
+  Lives here, taking explicit arguments, rather than as a private predicate in
+  the router — **because in Vagus the false branch is currently unreachable**.
+  `Vagus.API.Router`'s `resolve_info_slug/2` refuses an add-on any slug but its
+  own, so no caller ever reaches another add-on's info to have its options
+  redacted (Vagus is stricter than upstream, which admits any `/.+/info` at
+  default role). A rule that no route can exercise is a rule no end-to-end test
+  can pin: deleting it outright broke nothing. Exposed and unit-tested instead,
+  so widening that guard later cannot silently take the redaction with it.
+  """
+  @spec expose_options?(caller(), tier(), String.t()) :: boolean()
+  def expose_options?(:supervisor, _tier, _addon_slug), do: true
+  def expose_options?({:addon, %{slug: slug}}, _tier, slug), do: true
+  def expose_options?({:addon, _identity}, tier, _addon_slug), do: tier in [:manager, :admin]
+
   defp role_tier("admin"), do: :admin
   defp role_tier("manager"), do: :manager
   defp role_tier("backup"), do: :backup

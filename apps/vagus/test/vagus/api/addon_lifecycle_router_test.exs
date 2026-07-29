@@ -458,12 +458,16 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
       info = body(supervisor_call(:get, "/addons/core_opts/info"))["data"]
       assert info["options"]["greeting"] == "secret-value"
 
-      # ...and through the list route, which renders by a different path.
+      # NOT through the list route. The Configuration page re-renders from
+      # `info`, never from `/addons` — and upstream's list shape carries no
+      # `options` at all, because it would hand every caller every add-on's
+      # saved secrets (audit A7). This assertion used to be the opposite.
       listed =
         body(supervisor_call(:get, "/addons"))["data"]["addons"]
         |> Enum.find(&(&1["slug"] == "core_opts"))
 
-      assert listed["options"]["greeting"] == "secret-value"
+      refute Map.has_key?(listed, "options")
+      assert listed["slug"] == "core_opts"
     end
 
     test "options the user never touched keep their config defaults" do

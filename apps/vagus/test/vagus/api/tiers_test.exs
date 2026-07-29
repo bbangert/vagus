@@ -315,6 +315,59 @@ defmodule Vagus.API.TiersTest do
     end
   end
 
+  # Audit A8. These are the ONLY tests that can pin this rule: its false
+  # branch is unreachable through `GET /addons/{slug}/info`, because
+  # `resolve_info_slug/2` refuses an add-on any slug but its own long before
+  # the redaction is consulted. Deleting the redaction outright broke no
+  # end-to-end test — which is why the rule was moved here and given explicit
+  # arguments instead of reading `conn.assigns` in the router.
+  describe "expose_options?/3" do
+    defp addon(slug, hassio_role \\ "default") do
+      {:addon, identity_for(slug, hassio_role)}
+    end
+
+    defp identity_for(slug, hassio_role) do
+      %{
+        slug: slug,
+        services_role: %{},
+        auth_api: false,
+        discovery: [],
+        hassio_api: true,
+        hassio_role: hassio_role
+      }
+    end
+
+    test "Core and other non-add-on internals always see options" do
+      assert Tiers.expose_options?(:supervisor, :supervisor, "core_mosquitto")
+    end
+
+    test "an add-on sees its OWN options whatever its tier" do
+      for tier <- ~w(none default homeassistant backup manager admin)a do
+        assert Tiers.expose_options?(addon("core_mosquitto"), tier, "core_mosquitto"),
+               "#{tier} was denied its own options"
+      end
+    end
+
+    test "manager and admin see another add-on's options; nothing below does" do
+      other = addon("core_nosy")
+
+      assert Tiers.expose_options?(other, :manager, "core_mosquitto")
+      assert Tiers.expose_options?(other, :admin, "core_mosquitto")
+
+      for tier <- ~w(none default homeassistant backup)a do
+        refute Tiers.expose_options?(other, tier, "core_mosquitto"),
+               "#{tier} saw another add-on's options"
+      end
+    end
+
+    test "the match is on the resolved slug, not a prefix or a near-miss" do
+      # `core_mosquitto2` must not inherit `core_mosquitto`'s options.
+      refute Tiers.expose_options?(addon("core_mosquitto2"), :default, "core_mosquitto")
+      refute Tiers.expose_options?(addon("core_mosquitto"), :default, "core_mosquitto2")
+      refute Tiers.expose_options?(addon(""), :default, "core_mosquitto")
+    end
+  end
+
   describe "allows?/2 — the lattice" do
     # The full matrix, written out rather than computed, so a change to the
     # ordering has to be made here too.
