@@ -156,6 +156,20 @@ config :vagus, :addon_data_root, "/root/vagus/addons"
 # bind would fail :eaddrnotavail, so those configs leave this unset.
 config :vagus, :ingress_source_ip, "172.30.32.2"
 
+# Restrict who may talk to the Supervisor API (`Vagus.API.SourceGuard`).
+# Target-only: the listener is 0.0.0.0:80 on a host-networked device, so
+# unlike upstream's containerised Supervisor it is LAN-reachable — and P2-A
+# added a route that answers without a token. On :host/:test everything
+# arrives from 127.0.0.1 and the guard would be a no-op anyway.
+config :vagus, :api_source_guard, true
+
+# Fill the add-on store's catalog once after boot
+# (`Vagus.Addon.Store.Refresher`). Without it the catalog stays empty until
+# something calls `POST /store/reload`, so every reboot leaves a blank
+# add-on store and no icons. Target-only: :host/:test must not reach out to
+# github during a test run.
+config :vagus, :store_boot_refresh, true
+
 # Add-on DNS (M4-P1-T2). `Vagus.DNS` binds the hassio `dns` anchor
 # (172.30.32.3:53) and forwards names it doesn't own to this upstream
 # (`locals`); 1.1.1.1 keeps it a complete resolver for a host-networked Core

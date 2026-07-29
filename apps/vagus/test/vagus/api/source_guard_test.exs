@@ -1,0 +1,131 @@
+defmodule Vagus.API.SourceGuardTest do
+  @moduledoc """
+  `Vagus.API.SourceGuard` — who may talk to the Supervisor API.
+
+  The allowlist's shape is a measurement, not a deduction: Core is
+  host-networked and targets `172.30.32.2`, which suggests it arrives from the
+  bridge, and on hardware it does not — every socket the API accepted from
+  Core carried the board's **LAN** address. Hence "local addresses" being an
+  allowlist member at all, and hence the test below that pins it.
+  """
+  use ExUnit.Case, async: false
+
+  alias Vagus.API.SourceGuard
+
+  setup do
+    prev = Application.get_env(:vagus, :api_source_guard)
+    Application.put_env(:vagus, :api_source_guard, true)
+
+    # The guard's cache is owned by a process that only starts when the config
+    # is on, which it isn't in :test — seed it directly.
+    on_exit(fn ->
+      if prev,
+        do: Application.put_env(:vagus, :api_source_guard, prev),
+        else: Application.delete_env(:vagus, :api_source_guard)
+
+      :persistent_term.erase({SourceGuard, :local_addresses})
+    end)
+
+    :ok
+  end
+
+  defp seed_local(addresses) do
+    :persistent_term.put({SourceGuard, :local_addresses}, MapSet.new(addresses))
+  end
+
+  describe "allowed?/1 when the guard is on" do
+    test "loopback is allowed, v4 and v6" do
+      seed_local([])
+
+      assert SourceGuard.allowed?({127, 0, 0, 1})
+      assert SourceGuard.allowed?({127, 12, 3, 4})
+      assert SourceGuard.allowed?({0, 0, 0, 0, 0, 0, 0, 1})
+    end
+
+    test "the whole hassio /23 is allowed, before anything is bound" do
+      seed_local([])
+
+      assert SourceGuard.allowed?({172, 30, 32, 1})
+      assert SourceGuard.allowed?({172, 30, 32, 2})
+      # .33.x is the add-on half of the /23 — a mask that only covered .32.x
+      # would refuse every container.
+      assert SourceGuard.allowed?({172, 30, 33, 7})
+
+      refute SourceGuard.allowed?({172, 30, 34, 1})
+      refute SourceGuard.allowed?({172, 31, 32, 1})
+    end
+
+    test "this machine's own LAN address is allowed — that is where Core arrives from" do
+      seed_local([{192, 168, 2, 149}])
+
+      assert SourceGuard.allowed?({192, 168, 2, 149})
+    end
+
+    test "another host on the same LAN is refused" do
+      # The point of the guard: same subnet, different machine.
+      seed_local([{192, 168, 2, 149}])
+
+      refute SourceGuard.allowed?({192, 168, 2, 12})
+      refute SourceGuard.allowed?({10, 0, 0, 5})
+    end
+
+    test "an IPv4 peer seen through a dual-stack listener is judged as IPv4" do
+      # Plug hands over `::ffff:a.b.c.d` on an IPv6 socket. Every rule has to
+      # see through it or the same address would be admitted on one listener
+      # and refused on the other.
+      seed_local([{192, 168, 2, 149}])
+
+      assert SourceGuard.allowed?({0, 0, 0, 0, 0, 65_535, 0x7F00, 0x0001})
+      assert SourceGuard.allowed?({0, 0, 0, 0, 0, 65_535, 0xAC1E, 0x2002})
+      assert SourceGuard.allowed?({0, 0, 0, 0, 0, 65_535, 0xC0A8, 0x0295})
+      refute SourceGuard.allowed?({0, 0, 0, 0, 0, 65_535, 0xC0A8, 0x020C})
+    end
+
+    test "an empty address cache still admits loopback and the bridge" do
+      # `getifaddrs` failing must not lock Core out of a running device.
+      :persistent_term.erase({SourceGuard, :local_addresses})
+
+      assert SourceGuard.allowed?({127, 0, 0, 1})
+      assert SourceGuard.allowed?({172, 30, 32, 2})
+      refute SourceGuard.allowed?({192, 168, 2, 12})
+    end
+
+    test "a nil remote_ip is refused rather than treated as local" do
+      seed_local([{192, 168, 2, 149}])
+      refute SourceGuard.allowed?(nil)
+    end
+  end
+
+  describe "allowed?/1 when the guard is off" do
+    setup do
+      Application.put_env(:vagus, :api_source_guard, false)
+      :ok
+    end
+
+    test "everything is allowed, including a nil remote_ip" do
+      seed_local([])
+
+      assert SourceGuard.allowed?({192, 168, 2, 12})
+      assert SourceGuard.allowed?({8, 8, 8, 8})
+      assert SourceGuard.allowed?(nil)
+    end
+
+    test "start_link/1 declines to start" do
+      assert :ignore = SourceGuard.start_link([])
+    end
+  end
+
+  describe "the address cache" do
+    test "start_link/1 populates it from the real interfaces" do
+      pid = start_supervised!({SourceGuard, name: :source_guard_test})
+      assert is_pid(pid)
+
+      addresses = :persistent_term.get({SourceGuard, :local_addresses})
+      assert MapSet.size(addresses) > 0
+
+      # Whatever this machine's interfaces are, loopback is among them, and
+      # it is the one address every host has.
+      assert MapSet.member?(addresses, {127, 0, 0, 1})
+    end
+  end
+end

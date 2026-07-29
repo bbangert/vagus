@@ -64,6 +64,16 @@ defmodule Vagus.API.Router do
     SupervisorInfo
   }
 
+  # FIRST, before the body parser and before auth: who is allowed to talk to
+  # this API at all. The listener is `0.0.0.0:80` on a host-networked device,
+  # so unlike upstream's containerised Supervisor it is LAN-reachable, and
+  # P2-A added a route that answers without a token. `Vagus.API.SourceGuard`
+  # admits loopback, the `hassio` bridge, and this machine's own addresses —
+  # which is where Core's requests actually come from, measured rather than
+  # assumed (see that module). Ahead of `Plug.Parsers` deliberately: a
+  # refused caller must not get a body read on its behalf.
+  plug(:source_guard)
+
   # Supervisor-API payloads are all tiny (options posts, network configure);
   # `Plug.Parsers`' 8MB default would let an unauthenticated caller (auth
   # runs after parsing) pressure a 1GB device's memory just by posting a
@@ -132,6 +142,22 @@ defmodule Vagus.API.Router do
 
   def handle_errors(conn, %{reason: _reason}) do
     Envelope.send_error(conn, "internal server error", conn.status || 500)
+  end
+
+  # Function plug for the source allowlist. A refused request is halted here
+  # with a bare 403 and no envelope detail: telling a caller we don't answer
+  # *why* we won't answer costs nothing and volunteers nothing.
+  defp source_guard(conn, _opts) do
+    if Vagus.API.SourceGuard.allowed?(conn.remote_ip) do
+      conn
+    else
+      Logger.warning(
+        "Vagus.API.Router: refusing #{conn.method} #{conn.request_path} from " <>
+          "#{:inet.ntoa(conn.remote_ip)} (not loopback, hassio bridge or a local address)"
+      )
+
+      conn |> send_resp(403, "") |> halt()
+    end
   end
 
   # Function plug (see the comment above its position in the pipeline). Only

@@ -1,0 +1,159 @@
+defmodule Vagus.API.SourceGuard do
+  @moduledoc """
+  Refuses Supervisor-API requests that didn't originate from this machine or
+  the `hassio` bridge.
+
+  ## Why the API needs this at all
+
+  The API binds `0.0.0.0:80`, exactly as upstream does
+  (`web.TCPSite(runner, host="0.0.0.0", port=80)`), but the two are not
+  equally exposed: upstream's Supervisor is a **container**, so its `0.0.0.0`
+  is the docker namespace — reachable from Core and add-ons and nothing else.
+  Vagus is host-networked, so the same bind is reachable from the whole LAN.
+  Matching upstream's code does not match upstream's blast radius, and since
+  P2-A there is a route that answers without a token at all (an add-on's
+  icon/logo — see `Vagus.API.Auth.unauthenticated?/1`).
+
+  ## Why the allowlist is shaped the way it is
+
+  The obvious predicate — "inside `172.30.32.0/23` plus loopback" — was the
+  plan of record until it was measured, and it is **wrong**. Core runs
+  `NetworkMode: "host"` and targets `172.30.32.2`, so the reasoning went that
+  its packets carry a bridge address. On hardware they do not: every socket
+  the API accepted from Core carried the board's **LAN** address.
+
+      :erlang.ports()
+      |> Enum.map(&{:inet.peername(&1), :inet.sockname(&1)})
+      |> Enum.filter(&match?({{:ok, _}, {:ok, {_, 80}}}, &1))
+      #=> peer {192,168,2,149} on sockname {172,30,32,2}:80
+
+  `/proc/net/tcp` is no help here and actively misleads: the client row reads
+  `172.30.32.1:<port>` while the server row for the same port reads
+  `192.168.2.149:<port>`, i.e. something SNATs between the two sockets on one
+  host. The accepting socket's own view — which is what `conn.remote_ip` is —
+  is the only one that decides the request.
+
+  So the allowlist is **loopback + the hassio subnet + every address bound on
+  a local interface**. That admits Core, add-ons on the bridge, and anything
+  running on the board, and refuses the rest of the LAN, which is the entire
+  point.
+
+  ## Freshness
+
+  The local-address set is cached in `:persistent_term` and refreshed on a
+  timer. It is deliberately *not* refreshed on a miss: a miss is the hostile
+  case, and turning it into a syscall would hand a LAN attacker a cheap way
+  to make the device work. A newly-bound address is therefore admitted within
+  one refresh interval — fine for DHCP renewals and for the `hassio` bridge,
+  whose whole range is covered by the static subnet rule anyway.
+
+  Gated by `config :vagus, :api_source_guard`, so `:host` and `:test` (which
+  answer from `127.0.0.1` regardless) are unaffected and `start_link/1`
+  returns `:ignore` rather than running a timer nothing consults — the same
+  convention `Vagus.Addon.BootStarter` uses.
+  """
+
+  use GenServer
+
+  require Logger
+
+  @key {__MODULE__, :local_addresses}
+  @refresh_ms 30_000
+
+  def start_link(opts \\ []) do
+    if enabled?() do
+      GenServer.start_link(__MODULE__, opts, name: Keyword.get(opts, :name, __MODULE__))
+    else
+      :ignore
+    end
+  end
+
+  @doc "Whether the guard is switched on (`config :vagus, :api_source_guard`)."
+  @spec enabled?() :: boolean()
+  def enabled?, do: Application.get_env(:vagus, :api_source_guard, false) == true
+
+  @doc """
+  Whether `remote_ip` may talk to the API.
+
+  Answers `true` for everything when the guard is disabled, so the check is
+  safe to call unconditionally from the pipeline.
+  """
+  @spec allowed?(:inet.ip_address() | nil) :: boolean()
+  def allowed?(nil), do: not enabled?()
+
+  def allowed?(ip) do
+    not enabled?() or loopback?(ip) or hassio?(ip) or local?(ip)
+  end
+
+  defp loopback?({127, _, _, _}), do: true
+  defp loopback?({0, 0, 0, 0, 0, 0, 0, 1}), do: true
+  # An IPv4 loopback arriving over a dual-stack listener.
+  defp loopback?({0, 0, 0, 0, 0, 65_535, ab, cd}), do: loopback?(v4(ab, cd))
+  defp loopback?(_ip), do: false
+
+  # 172.30.32.0/23 — the /23 makes .32.x and .33.x both bridge addresses.
+  defp hassio?({172, 30, third, _fourth}) when third in [32, 33], do: true
+  defp hassio?({0, 0, 0, 0, 0, 65_535, ab, cd}), do: hassio?(v4(ab, cd))
+  defp hassio?(_ip), do: false
+
+  defp local?({0, 0, 0, 0, 0, 65_535, ab, cd} = ip) do
+    MapSet.member?(local_addresses(), ip) or local?(v4(ab, cd))
+  end
+
+  defp local?(ip), do: MapSet.member?(local_addresses(), ip)
+
+  # `::ffff:a.b.c.d` — an IPv4 peer seen through an IPv6 socket. Plug hands
+  # it over in that form, so every rule has to see through it or a
+  # dual-stack listener would refuse traffic the same rules admit on IPv4.
+  defp v4(ab, cd),
+    do: {Bitwise.bsr(ab, 8), Bitwise.band(ab, 0xFF), Bitwise.bsr(cd, 8), Bitwise.band(cd, 0xFF)}
+
+  defp local_addresses, do: :persistent_term.get(@key, MapSet.new())
+
+  ## GenServer
+
+  @impl GenServer
+  def init(_opts) do
+    refresh()
+    {:ok, %{}, {:continue, :schedule}}
+  end
+
+  @impl GenServer
+  def handle_continue(:schedule, state) do
+    schedule()
+    {:noreply, state}
+  end
+
+  @impl GenServer
+  def handle_info(:refresh, state) do
+    refresh()
+    schedule()
+    {:noreply, state}
+  end
+
+  defp schedule, do: Process.send_after(self(), :refresh, @refresh_ms)
+
+  # Only a write when the set actually changed: `:persistent_term.put/2`
+  # triggers a global scan, and on a quiet device this runs every 30s forever.
+  defp refresh do
+    addresses = read_addresses()
+
+    if addresses != local_addresses() do
+      :persistent_term.put(@key, addresses)
+      Logger.debug("Vagus.API.SourceGuard: #{MapSet.size(addresses)} local address(es)")
+    end
+  end
+
+  defp read_addresses do
+    case :inet.getifaddrs() do
+      {:ok, interfaces} ->
+        for {_name, opts} <- interfaces, {:addr, addr} <- opts, into: MapSet.new(), do: addr
+
+      {:error, reason} ->
+        # Keep whatever we had rather than emptying the set — an empty set
+        # would refuse Core until the next successful read.
+        Logger.warning("Vagus.API.SourceGuard: getifaddrs failed (#{inspect(reason)})")
+        local_addresses()
+    end
+  end
+end
