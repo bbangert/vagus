@@ -156,6 +156,16 @@ defmodule Vagus.Addon.OptionsSchema do
 
   ## Internals
 
+  # `optional: true` is hardcoded, and it is knowingly inconsistent with
+  # `validate/3`, which treats a nested-map key as **required** (only a token
+  # ending in `?`, or a one-element list of one, is optional). That asymmetry
+  # is upstream's, on both sides: `_nested_ui_dict` hardcodes the same
+  # `"optional": True`, while `_check_missing_options` raises for a missing
+  # key whose schema isn't a `str` ending in `?` — a dict never is. Marking
+  # these `required` would make our form differ from the one HAOS renders for
+  # the same add-on, which is the worse bug. In practice the key is present
+  # anyway: `effective/4` validates defaults-merged-with-user, so any add-on
+  # that ships a default for the nested block can't hit it.
   defp ui_element(element, key, multiple) when is_map(element) do
     [
       %{
