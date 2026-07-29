@@ -2283,31 +2283,22 @@ defmodule Vagus.API.Router do
   #
   # That requirement is `:backup`, NOT supervisor-only — it was the latter
   # until the 2026-07-29 audit's A4, and an earlier version of this comment
-  # still claimed `supervisor_only/2` gated the route. It does not. A
-  # `hassio_role: backup` add-on reaches here, which is upstream's own tier
-  # and deliberate, so the spool is bounded by `Backups.acquire_upload_slot/1`
-  # instead: one in-flight upload at a time, rather than N × 256MB of
-  # concurrent disk spooling on a 1GB device. The size limit itself is phase
-  # 4's to revisit against a real HAOS backup.
+  # still claimed `supervisor_only/2` gated the route. It does not: a
+  # `hassio_role: backup` add-on reaches here, which is upstream's own tier and
+  # deliberate.
+  #
+  # Nothing bounds concurrent uploads. A single-slot gate was tried and
+  # reverted (review round 2): holding a slot across a body read whose
+  # `read_timeout` resets per byte let one slow caller wedge every upload
+  # including Core's own — an unbounded availability risk in place of a
+  # bounded disk one — and it covered only this route while
+  # `/backups/new/partial`, `/restore/partial` and `/download` each hold a
+  # whole tar in caller memory too. Bounding this family is phase 4's job,
+  # alongside the 512/256MB caps it already owns; a gate on one of the four
+  # routes is not a bound, it just reads like one.
   # path is internal/config-derived, not request input
   # sobelow_skip ["Traversal.FileModule"]
   defp handle_backup_upload(conn) do
-    case Backups.acquire_upload_slot() do
-      :ok ->
-        try do
-          do_backup_upload(conn)
-        after
-          Backups.release_upload_slot()
-        end
-
-      :busy ->
-        Envelope.send_error(conn, "another backup upload is already in progress", 429)
-    end
-  end
-
-  # path is internal/config-derived, not request input
-  # sobelow_skip ["Traversal.FileModule"]
-  defp do_backup_upload(conn) do
     case parse_multipart(conn) do
       {:ok, conn} ->
         case first_upload(conn.body_params) do

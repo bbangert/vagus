@@ -35,29 +35,6 @@ defmodule Vagus.Backups do
   @spec dir(GenServer.server()) :: String.t()
   def dir(server \\ __MODULE__), do: GenServer.call(server, :dir)
 
-  @doc """
-  Claims the single upload slot, or `:busy`.
-
-  `POST /backups/new/upload` spools up to 256MB to disk per request. Until the
-  2026-07-29 audit's A4 that route was supervisor-only, so "one Core at a
-  time" bounded it implicitly; now a `hassio_role: backup` add-on can drive it,
-  and nothing else stops it firing concurrent uploads until a 1GB device runs
-  out of disk or file descriptors. Serialising them keeps the worst case at
-  one spool rather than N, without touching the size limit itself — that is
-  phase 4's call to make against a real HAOS backup.
-
-  The slot is monitored, so a caller that dies mid-parse frees it; callers
-  should still `release_upload_slot/1` in an `after`.
-  """
-  @spec acquire_upload_slot(GenServer.server()) :: :ok | :busy
-  def acquire_upload_slot(server \\ __MODULE__),
-    do: GenServer.call(server, {:acquire_upload, self()})
-
-  @doc "Releases the upload slot claimed by `acquire_upload_slot/1`."
-  @spec release_upload_slot(GenServer.server()) :: :ok
-  def release_upload_slot(server \\ __MODULE__),
-    do: GenServer.cast(server, {:release_upload, self()})
-
   @doc "All indexed backup entries (`%{backup, path, size_bytes}`)."
   @spec list(GenServer.server()) :: [map()]
   def list(server \\ __MODULE__), do: GenServer.call(server, :list)
@@ -202,21 +179,11 @@ defmodule Vagus.Backups do
   @impl GenServer
   def init(opts) do
     dir = Keyword.get(opts, :dir) || Path.join(data_root(opts), "backup")
-    {:ok, %{dir: dir, index: ensure_and_scan(dir), uploading: nil}}
+    {:ok, %{dir: dir, index: ensure_and_scan(dir)}}
   end
 
   @impl GenServer
   def handle_call(:dir, _from, %{dir: dir} = state), do: {:reply, dir, state}
-
-  # One in-flight upload at a time. The slot is held by a monitored pid, so a
-  # caller that crashes mid-parse (or whose connection dies) releases it
-  # without needing the router's `after` block to run.
-  def handle_call({:acquire_upload, pid}, _from, %{uploading: nil} = state) do
-    ref = Process.monitor(pid)
-    {:reply, :ok, %{state | uploading: {pid, ref}}}
-  end
-
-  def handle_call({:acquire_upload, _pid}, _from, state), do: {:reply, :busy, state}
 
   def handle_call(:list, _from, %{index: index} = state), do: {:reply, Map.values(index), state}
 
@@ -244,22 +211,6 @@ defmodule Vagus.Backups do
         {:reply, :error, state}
     end
   end
-
-  @impl GenServer
-  def handle_cast({:release_upload, pid}, %{uploading: {pid, ref}} = state) do
-    Process.demonitor(ref, [:flush])
-    {:noreply, %{state | uploading: nil}}
-  end
-
-  # Not the holder (a late release after a `:DOWN` already cleared it) — drop.
-  def handle_cast({:release_upload, _pid}, state), do: {:noreply, state}
-
-  @impl GenServer
-  def handle_info({:DOWN, ref, :process, pid, _reason}, %{uploading: {pid, ref}} = state) do
-    {:noreply, %{state | uploading: nil}}
-  end
-
-  def handle_info(_message, state), do: {:noreply, state}
 
   ## Internals — directory scan
 
@@ -568,9 +519,16 @@ defmodule Vagus.Backups do
   # bug the save-side validation was written to prevent, and the tar is the
   # less trustworthy of the two inputs: since the 2026-07-29 audit's A4 the
   # `/backups` family is reachable by a `hassio_role: backup` add-on, and both
-  # the tar's bytes and the slug it names are then caller-controlled. Without
-  # this, restoring a crafted tar wrote arbitrary options into a *peer*
-  # add-on and restarted it.
+  # the tar's bytes and the slug it names are then caller-controlled.
+  #
+  # Scope, stated precisely because an earlier version of this comment claimed
+  # more (review round 2). This closes the *options* half only, and only as
+  # far as the victim's own schema is narrow: `OptionsSchema.validate/3`
+  # returns options unchanged for `schema: false`, so an add-on that declares
+  # no schema still accepts anything — by its own declaration, and matching
+  # upstream. The larger half of a hostile restore is the `/data` swap in
+  # `swap_and_finish/5`, which this does not touch at all. Bounding *that*
+  # needs the restore surface itself gated, not the options validated.
   #
   # Invalid options are dropped with a warning rather than failing the
   # restore: the data dir has already been swapped by this point, and an

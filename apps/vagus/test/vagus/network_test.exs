@@ -77,11 +77,24 @@ defmodule Vagus.NetworkTest do
       # `172.30.32.1` and `10.x`/`192.168.x` are the addresses that MUST keep
       # the bind — a false positive here silently reintroduces the .1 problem
       # `source_bind_opts/0` exists to fix.
-      for ip <- ["172.30.32.1", "172.30.32.2", "192.168.2.149", "10.0.0.1", "128.0.0.1"] do
+      for ip <- [
+            "172.30.32.1",
+            "172.30.32.2",
+            "192.168.2.149",
+            "10.0.0.1",
+            "128.0.0.1",
+            # Near the boundary on purpose: a `String.starts_with?(ip, "127")`
+            # implementation passes every address above but fails these two.
+            "12.7.0.1",
+            "1.2.7.0"
+          ] do
         refute Network.loopback?(ip), "#{ip} was treated as loopback"
       end
 
-      assert Network.loopback?("127.0.0.1")
+      # …and the whole of 127/8 is loopback, not just 127.0.0.1.
+      for ip <- ["127.0.0.1", "127.0.0.2", "127.255.255.254", "127.1.1.1"] do
+        assert Network.loopback?(ip), "#{ip} was not treated as loopback"
+      end
     end
 
     test "rejects malformed tuples rather than deferring the failure to connect()" do

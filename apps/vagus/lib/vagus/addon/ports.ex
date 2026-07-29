@@ -31,17 +31,41 @@ defmodule Vagus.Addon.Ports do
   @doc """
   The effective map to publish and to hand the container runtime: `overrides`
   overlaid on `config.ports`, restricted to the ports the config declares.
+
+  A host port the host owns (`reserved_host_ports/0`) is dropped to `nil` —
+  declared but unpublished — wherever it comes from. `sanitize/2` refuses one
+  posted by a caller, but the add-on's **own `config.yaml` default** never goes
+  through `sanitize/2` at all: it arrives here straight from `Config.parse/1`.
+  Filtering only the posted path would have meant an add-on could claim
+  Vagus's API port simply by declaring it as its default and never posting
+  anything (review round 2). The rule is a property of the host, so it belongs
+  on every path into the container spec, not just the caller-facing one.
   """
   @spec effective(Config.t(), t()) :: t()
   def effective(%Config{ports: config_ports}, overrides)
       when is_map(config_ports) and is_map(overrides) do
     if map_size(config_ports) == 0 do
-      overrides
+      drop_reserved(overrides)
     else
-      Map.new(config_ports, fn {port, default} ->
-        {port, Map.get(overrides, port, default)}
-      end)
+      config_ports
+      |> Map.new(fn {port, default} -> {port, Map.get(overrides, port, default)} end)
+      |> drop_reserved()
     end
+  end
+
+  # Unpublish rather than raise: `effective/2` is on the container-start path,
+  # where a hard failure would make an add-on that ships a reserved default
+  # permanently uninstallable instead of merely unpublished on that port.
+  defp drop_reserved(ports) do
+    reserved = reserved_host_ports()
+
+    Map.new(ports, fn
+      {port, host_port} when is_integer(host_port) ->
+        if host_port in reserved, do: {port, nil}, else: {port, host_port}
+
+      {port, host_port} ->
+        {port, host_port}
+    end)
   end
 
   @doc """
@@ -105,8 +129,22 @@ defmodule Vagus.Addon.Ports do
   compile time — it differs between host (`8888`) and target (`80`).
   """
   @spec reserved_host_ports() :: [non_neg_integer()]
-  def reserved_host_ports do
-    [Application.get_env(:vagus, :api_port, 8888), @core_port]
+  def reserved_host_ports, do: reserved_host_ports(Application.get_env(:vagus, :api_port, 8888))
+
+  @doc """
+  `reserved_host_ports/0` for an explicit API port.
+
+  The arity exists so a test can vary the API port without `put_env` on the
+  global app env — which an `async: true` file cannot do. Asserting
+  `reserved_host_ports()` against `Application.get_env(:vagus, :api_port, …)`
+  is tautological: both read the same key with the same default, so a
+  hard-coded constant here would satisfy it and the host-vs-target difference
+  (8888 vs 80) would go untested. That was the shape of the first test written
+  for this, and it is why the arity is here.
+  """
+  @spec reserved_host_ports(term()) :: [non_neg_integer()]
+  def reserved_host_ports(api_port) do
+    [api_port, @core_port]
     |> Enum.filter(&is_integer/1)
     |> Enum.uniq()
   end

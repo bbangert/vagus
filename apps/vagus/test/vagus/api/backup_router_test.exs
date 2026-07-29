@@ -556,61 +556,6 @@ defmodule Vagus.API.BackupRouterTest do
     end
   end
 
-  # Audit W3. The 256MB disk-spooling multipart parse was bounded by
-  # "supervisor-only" until A4 widened the family to ROLE_BACKUP. Serialising
-  # uploads keeps the worst case at one spool rather than N.
-  describe "POST /backups/new/upload — one at a time" do
-    test "a second concurrent upload is refused with 429" do
-      parent = self()
-
-      holder =
-        spawn(fn ->
-          :ok = Backups.acquire_upload_slot()
-          send(parent, :held)
-          receive do: (:release -> Backups.release_upload_slot())
-        end)
-
-      assert_receive :held
-
-      conn =
-        multipart_conn("/backups/new/upload", [{:field, "note", "irrelevant"}])
-        |> put_req_header("authorization", "Bearer #{Vagus.API.Token.get()}")
-        |> Vagus.API.Router.call(@opts)
-
-      assert conn.status == 429
-      assert body(conn)["message"] =~ "already in progress"
-
-      send(holder, :release)
-    end
-
-    test "the slot is released when its holder dies, not leaked" do
-      parent = self()
-
-      holder =
-        spawn(fn ->
-          :ok = Backups.acquire_upload_slot()
-          send(parent, :held)
-          receive do: (:never -> :ok)
-        end)
-
-      assert_receive :held
-      ref = Process.monitor(holder)
-      Process.exit(holder, :kill)
-      assert_receive {:DOWN, ^ref, :process, ^holder, :killed}
-
-      # The monitor in Backups fires asynchronously; retry briefly rather than
-      # sleeping a fixed amount.
-      assert eventually(fn -> Backups.acquire_upload_slot() == :ok end)
-      Backups.release_upload_slot()
-    end
-
-    defp eventually(fun, attempts \\ 50) do
-      Enum.reduce_while(1..attempts, false, fn _i, _acc ->
-        if fun.(), do: {:halt, true}, else: {:cont, false}
-      end)
-    end
-  end
-
   describe "DELETE /backups/{slug}" do
     test "removes the backup", %{data_root: dr} do
       install("core_delete", dr)
