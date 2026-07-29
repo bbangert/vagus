@@ -127,5 +127,59 @@ defmodule Vagus.API.SourceGuardTest do
       # it is the one address every host has.
       assert MapSet.member?(addresses, {127, 0, 0, 1})
     end
+
+    test "what the writer stores is what the reader accepts" do
+      # Every other test in this file hand-seeds `:persistent_term`, which
+      # would keep passing if `read_addresses/0`'s stored shape ever drifted
+      # from the seeded shape while production denied everything. This is the
+      # one test that runs the real writer and the real reader end to end.
+      :persistent_term.erase({SourceGuard, :local_addresses})
+      start_supervised!({SourceGuard, name: :source_guard_shape})
+
+      stored = :persistent_term.get({SourceGuard, :local_addresses})
+
+      # Pick a non-loopback address the writer actually recorded, so this
+      # doesn't pass via the loopback rule. Skip the assertion on a host with
+      # no other interface rather than fail spuriously.
+      case Enum.find(stored, &(not match?({127, _, _, _}, &1) and tuple_size(&1) == 4)) do
+        nil -> assert MapSet.member?(stored, {127, 0, 0, 1})
+        address -> assert SourceGuard.allowed?(address)
+      end
+    end
+
+    test "refusals are counted and summarised, not logged one per request" do
+      import ExUnit.CaptureLog
+
+      start_supervised!({SourceGuard, name: SourceGuard})
+
+      log =
+        capture_log(fn ->
+          for _ <- 1..50, do: SourceGuard.record_refusal({192, 168, 2, 12})
+          # Force the periodic report rather than waiting out the interval.
+          send(SourceGuard, :refresh)
+          # Round-trip a call so the cast+info are both processed first.
+          _ = :sys.get_state(SourceGuard)
+        end)
+
+      assert log =~ "refused 50 request(s)"
+      assert log =~ "192.168.2.12"
+      # One summary line, not fifty.
+      assert length(String.split(log, "refused ")) == 2
+    end
+
+    test "a nil source in the summary doesn't crash the reporter" do
+      import ExUnit.CaptureLog
+
+      start_supervised!({SourceGuard, name: SourceGuard})
+
+      log =
+        capture_log(fn ->
+          SourceGuard.record_refusal(nil)
+          send(SourceGuard, :refresh)
+          _ = :sys.get_state(SourceGuard)
+        end)
+
+      assert log =~ "unknown"
+    end
   end
 end

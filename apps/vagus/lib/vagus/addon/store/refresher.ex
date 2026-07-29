@@ -88,6 +88,15 @@ defmodule Vagus.Addon.Store.Refresher do
     error ->
       Logger.warning("Vagus.Addon.Store.Refresher: reload raised #{inspect(error)}")
       retry(state)
+  catch
+    # `reload/1` opens with a `GenServer.call` to the store, so a device busy
+    # enough to blow the 5s default exits rather than raising — and an exit
+    # skips `rescue` entirely. Letting it crash would work (the supervisor
+    # restarts us) but throws away the backoff and restarts the initial delay,
+    # so a loaded boot would retry *sooner* and add load. Retry in place.
+    :exit, reason ->
+      Logger.warning("Vagus.Addon.Store.Refresher: reload exited #{inspect(reason)}")
+      retry(state)
   end
 
   defp done(state, count) do

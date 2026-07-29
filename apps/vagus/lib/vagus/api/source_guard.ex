@@ -64,9 +64,33 @@ defmodule Vagus.API.SourceGuard do
     if enabled?() do
       GenServer.start_link(__MODULE__, opts, name: Keyword.get(opts, :name, __MODULE__))
     else
+      # Say so out loud. The guard is off by default and only a target config
+      # turns it on, so a dropped key would otherwise leave a LAN-exposed API
+      # wide open with nothing in the boot log to show for it — the one
+      # fail-open this design has, and it is a configuration one.
+      Logger.info(
+        "Vagus.API.SourceGuard: DISABLED (:api_source_guard unset) — " <>
+          "the API answers any source address"
+      )
+
       :ignore
     end
   end
+
+  @doc """
+  Records a refused request for the periodic summary.
+
+  Counting rather than logging per refusal is deliberate: the caller is by
+  definition unauthorised and can repeat at will, so a line each would let
+  them push real evidence out of `RingLogger`'s ring. A `cast` also keeps the
+  refusal path off `:persistent_term`, whose writes trigger a global scan —
+  attacker-triggered global GC would be a worse bug than the noise.
+
+  Safe to call when the guard is disabled (the process isn't running):
+  `GenServer.cast/2` to an unregistered name is a no-op.
+  """
+  @spec record_refusal(:inet.ip_address() | nil) :: :ok
+  def record_refusal(ip), do: GenServer.cast(__MODULE__, {:refused, ip})
 
   @doc "Whether the guard is switched on (`config :vagus, :api_source_guard`)."
   @spec enabled?() :: boolean()
@@ -115,7 +139,13 @@ defmodule Vagus.API.SourceGuard do
   @impl GenServer
   def init(_opts) do
     refresh()
-    {:ok, %{}, {:continue, :schedule}}
+
+    Logger.info(
+      "Vagus.API.SourceGuard: enabled — allowing loopback, 172.30.32.0/23 and " <>
+        "#{MapSet.size(local_addresses())} local address(es)"
+    )
+
+    {:ok, %{refused: 0, sources: MapSet.new()}, {:continue, :schedule}}
   end
 
   @impl GenServer
@@ -125,11 +155,38 @@ defmodule Vagus.API.SourceGuard do
   end
 
   @impl GenServer
+  def handle_cast({:refused, ip}, state) do
+    # Cap the sampled sources: the count is the useful number, and an
+    # unbounded set is memory a spoofed-source flood could grow.
+    sources =
+      if MapSet.size(state.sources) < 5, do: MapSet.put(state.sources, ip), else: state.sources
+
+    {:noreply, %{state | refused: state.refused + 1, sources: sources}}
+  end
+
+  @impl GenServer
   def handle_info(:refresh, state) do
     refresh()
     schedule()
-    {:noreply, state}
+    {:noreply, report_refusals(state)}
   end
+
+  defp report_refusals(%{refused: 0} = state), do: state
+
+  defp report_refusals(state) do
+    Logger.warning(
+      "Vagus.API.SourceGuard: refused #{state.refused} request(s) from " <>
+        "#{Enum.map_join(state.sources, ", ", &format_ip/1)}" <>
+        if(MapSet.size(state.sources) >= 5, do: " and others", else: "")
+    )
+
+    %{state | refused: 0, sources: MapSet.new()}
+  end
+
+  # `:inet.ntoa/1` raises on nil, and a nil peer is a case `allowed?/1`
+  # already names — formatting it must not turn a decided 403 into a 500.
+  defp format_ip(nil), do: "unknown"
+  defp format_ip(ip), do: to_string(:inet.ntoa(ip))
 
   defp schedule, do: Process.send_after(self(), :refresh, @refresh_ms)
 
