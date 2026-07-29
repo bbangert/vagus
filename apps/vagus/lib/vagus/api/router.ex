@@ -31,7 +31,7 @@ defmodule Vagus.API.Router do
   require Logger
 
   alias Vagus.Addon.Backend.Native
-  alias Vagus.Addon.{Manager, OptionsSchema, State, Store, StoreView, Update}
+  alias Vagus.Addon.{Manager, OptionsSchema, Ports, State, Store, StoreView, Update}
   alias Vagus.Addon.Store.Assets
   alias Vagus.API.{Envelope, StaticData}
   alias Vagus.Backend
@@ -381,11 +381,7 @@ defmodule Vagus.API.Router do
 
     with {:ok, resolved} <- resolve_info_slug(slug, caller),
          {:ok, %{config: config, state: state} = entry} <- Vagus.Addon.State.get(resolved) do
-      options =
-        case read_addon_options(resolved) do
-          {:ok, opts} -> opts
-          :error -> config.options
-        end
+      options = live_options(entry)
 
       settings =
         entry
@@ -445,9 +441,22 @@ defmodule Vagus.API.Router do
       match?({:addon, _}, conn.assigns.caller) ->
         {:addon, %{slug: caller_slug}} = conn.assigns.caller
 
-        case read_addon_options(caller_slug) do
-          {:ok, options} -> Envelope.send_ok(conn, options)
-          :error -> Envelope.send_error(conn, "Invalid configuration data for the app", 400)
+        # Upstream answers `app.schema.validate(app.options)` — the same live
+        # merge, validated — not a file read, so an add-on calling
+        # `bashio::config` sees an option saved while it was running rather
+        # than the snapshot it booted with.
+        case Vagus.Addon.State.get(caller_slug) do
+          {:ok, %{config: config} = entry} ->
+            case OptionsSchema.validate(config.schema, live_options(entry)) do
+              {:ok, options} ->
+                Envelope.send_ok(conn, options)
+
+              {:error, _reason} ->
+                Envelope.send_error(conn, "Invalid configuration data for the app", 400)
+            end
+
+          :error ->
+            Envelope.send_error(conn, "Invalid configuration data for the app", 400)
         end
 
       true ->
@@ -534,6 +543,23 @@ defmodule Vagus.API.Router do
   # follow up with `.../restart` if it wants the new options live.
   post "/addons/:slug/options" do
     handle_addon_options(conn, slug)
+  end
+
+  # The frontend's config page calls this **before** every save and aborts on
+  # anything other than `valid: true`, so without it the Save button fails
+  # for every add-on — `supervisor-app-config.ts::_saveTapped` awaits
+  # `validateHassioAddonOption` and throws its message before it ever POSTs
+  # the options.
+  #
+  # Upstream shape (`api/apps.py::options_validate`): the body is the options
+  # map **itself**, not `{"options": …}`, and an empty body falls back to the
+  # add-on's stored options. Always HTTP 200 — invalid options are a `valid:
+  # false` payload, not an error status. `pwned` is always `false` here:
+  # upstream's have-i-been-pwned lookup needs an outbound API Vagus doesn't
+  # make, and reporting `null` (its "check failed" value) would make Core
+  # refuse the save whenever `sys_security.force` is on.
+  post "/addons/:slug/options/validate" do
+    handle_addon_options_validate(conn, slug)
   end
 
   # -- Stats coordinator (60s) -----------------------------------------------
@@ -1718,17 +1744,25 @@ defmodule Vagus.API.Router do
 
   # -- addon lifecycle helpers ------------------------------------------------
 
-  # `GET /addons` entry: the effective options (falling back to the config
-  # defaults, same as `/addons/{slug}/info`) rendered through
-  # `Vagus.Addon.Info.render/4`.
+  # `GET /addons` entry: the same live options `/addons/{slug}/info` reports,
+  # rendered through `Vagus.Addon.Info.render/4`.
   defp addon_list_entry(%{config: config, state: state} = entry) do
-    options =
-      case read_addon_options(config.slug) do
-        {:ok, opts} -> opts
-        :error -> config.options
-      end
+    Vagus.Addon.Info.render(config, state, live_options(entry), info_settings(entry))
+  end
 
-    Vagus.Addon.Info.render(config, state, options, info_settings(entry))
+  # What an add-on's options ARE right now: the config's defaults with the
+  # user's saved options merged over them (`App.options` upstream, same
+  # deepmerge).
+  #
+  # NOT `/data/options.json`. That file is an *output* — `Manager.start/2`
+  # writes it for the container — so reading it back reports whatever the
+  # add-on was last started with: the config defaults for an add-on that has
+  # never run, and stale values for one whose options changed since. The
+  # Configuration page re-renders from this field right after saving, so a
+  # save the user just made came back as the default and the form appeared to
+  # clear itself.
+  defp live_options(%{config: config, user_options: user_options}) do
+    OptionsSchema.merge(config.options, user_options || %{})
   end
 
   # `Vagus.Addon.Info.render/4`'s `settings` param: the State entry's
@@ -1742,6 +1776,7 @@ defmodule Vagus.API.Router do
     |> Map.take([:ingress_token, :ingress_port, :ingress_panel, :watchdog])
     |> Map.put(:version_latest, version_latest)
     |> Map.put(:assets, assets)
+    |> Map.put(:ports, Map.get(entry, :ports) || %{})
   end
 
   defp handle_install(conn, slug) do
@@ -1888,6 +1923,36 @@ defmodule Vagus.API.Router do
     end
   end
 
+  # Same auth and same lookup as `handle_addon_options/2` — this is a dry run
+  # of that route, so anything it would reject must be rejected here too.
+  defp handle_addon_options_validate(conn, slug) do
+    if conn.assigns.caller == :supervisor do
+      case State.get(slug) do
+        :error ->
+          Envelope.send_error(conn, "Addon #{slug} does not exist", 404)
+
+        {:ok, entry} ->
+          conn
+          |> Envelope.send_ok(validate_options_report(entry, conn.body_params))
+      end
+    else
+      Envelope.send_error(conn, "unauthorized", 403)
+    end
+  end
+
+  # Deliberately routed through the very same `OptionsSchema.effective/3` call
+  # the save path uses (`validate_options_key/2`), so the dry run and the real
+  # write can never disagree — a "valid" answer followed by a 400 on save is
+  # the one outcome this endpoint exists to prevent.
+  defp validate_options_report(%{config: config} = entry, body) do
+    options = if is_map(body) and map_size(body) > 0, do: body, else: live_options(entry)
+
+    case OptionsSchema.effective(config.schema, config.options, options) do
+      {:ok, _validated} -> %{"valid" => true, "message" => "", "pwned" => false}
+      {:error, message} -> %{"valid" => false, "message" => message, "pwned" => false}
+    end
+  end
+
   # Validates every known key present in the body *before* applying any of
   # them — a 400 from a bad `watchdog` must not leave a valid `options` half
   # -applied — then applies whichever of the three were present. A body with
@@ -1898,10 +1963,12 @@ defmodule Vagus.API.Router do
   defp apply_addon_options(conn, slug, config, body) do
     with {:ok, options_action} <- validate_options_key(body, config),
          {:ok, watchdog_action} <- validate_watchdog_key(body),
-         {:ok, ingress_panel_action} <- validate_ingress_panel_key(body) do
+         {:ok, ingress_panel_action} <- validate_ingress_panel_key(body),
+         {:ok, network_action} <- validate_network_key(body, config) do
       apply_options_action(slug, options_action)
       apply_watchdog_action(slug, config, watchdog_action)
       apply_ingress_panel_action(slug, ingress_panel_action)
+      apply_network_action(slug, network_action)
       Envelope.send_ok(conn, %{})
     else
       {:error, message} -> Envelope.send_error(conn, message, 400)
@@ -1935,6 +2002,36 @@ defmodule Vagus.API.Router do
   defp apply_options_action(_slug, :none), do: :ok
   defp apply_options_action(slug, :reset), do: State.put_options(slug, %{})
   defp apply_options_action(slug, {:set, options}), do: State.put_options(slug, options)
+
+  # The Network card posts `{"network": {"22/tcp": 2222}}` to this same
+  # endpoint. Before this it fell into the accept-and-ignore bucket with the
+  # unmodeled SCHEMA_OPTIONS keys, so the UI reported a successful save and
+  # the port never moved — worse than a 400, which the frontend would at
+  # least have surfaced.
+  #
+  # `null` resets to the config's defaults by dropping the overrides, matching
+  # upstream's setter (`self.persist.pop(ATTR_NETWORK)`); a map is narrowed by
+  # `Ports.sanitize/2`, which forgets ports the config doesn't declare and
+  # rejects a value that isn't a port.
+  defp validate_network_key(body, config) do
+    case Map.fetch(body, "network") do
+      :error ->
+        {:ok, :none}
+
+      {:ok, nil} ->
+        {:ok, :reset}
+
+      {:ok, posted} when is_map(posted) ->
+        with {:ok, p} <- Ports.sanitize(config, posted), do: {:ok, {:set, p}}
+
+      {:ok, _other} ->
+        {:error, "network must be an object or null"}
+    end
+  end
+
+  defp apply_network_action(_slug, :none), do: :ok
+  defp apply_network_action(slug, :reset), do: State.put_setting(slug, :ports, %{})
+  defp apply_network_action(slug, {:set, ports}), do: State.put_setting(slug, :ports, ports)
 
   # `watchdog` must be a boolean when present; no key at all is a no-op.
   defp validate_watchdog_key(body) do
@@ -2295,30 +2392,6 @@ defmodule Vagus.API.Router do
   # the value is safe both as a Docker ref suffix and a path component.
   defp valid_slug?(slug) do
     Regex.match?(~r/\A[A-Za-z0-9_.-]+\z/, slug) and not String.contains?(slug, "..")
-  end
-
-  # -- addon self-config helper ----------------------------------------------
-
-  # Reads the effective options `Manager.start` wrote to the add-on's
-  # `/data/options.json` (data root from `config :vagus, :addon_data_root`).
-  # path is internal/config-derived, not request input
-  # sobelow_skip ["Traversal.FileModule"]
-  defp read_addon_options(slug) do
-    path =
-      Path.join([
-        Application.get_env(:vagus, :addon_data_root, "/data"),
-        "addons",
-        "data",
-        slug,
-        "options.json"
-      ])
-
-    with {:ok, bin} <- File.read(path),
-         {:ok, options} when is_map(options) <- Jason.decode(bin) do
-      {:ok, options}
-    else
-      _ -> :error
-    end
   end
 
   # -- auth helpers ----------------------------------------------------------

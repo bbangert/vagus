@@ -18,9 +18,9 @@ defmodule Vagus.Addon.State do
 
   ## Per-install persisted settings (IW-P0-T2)
 
-  Four more fields ride alongside `user_options`, needed by the upcoming
-  ingress + watchdog features (`docs/contract-2026.7-m4b-ingress-watchdog.md`
-  §B3.1, §B8):
+  Five more fields ride alongside `user_options` — four for the ingress +
+  watchdog features (`docs/contract-2026.7-m4b-ingress-watchdog.md` §B3.1,
+  §B8), plus the network port overrides:
 
     * `ingress_token` — the real Supervisor generates this once at install
       time (`secrets.token_urlsafe()`) and never regenerates it — unlike
@@ -40,6 +40,11 @@ defmodule Vagus.Addon.State do
     * `watchdog` — boolean, default `false`. The persisted watchdog
       enable/disable (§B8) — there's no `config.yaml` default for this; it's
       purely a per-install setting.
+    * `ports` — `%{"<port>/<proto>" => host_port | nil}`, default `%{}`. The
+      user's host-port remaps from the frontend's Network card, kept apart
+      from `config.ports` (which declares *which* ports exist) and overlaid on
+      it by `Vagus.Addon.Ports.effective/2`. Persisted under the `"network"`
+      key, the name the wire uses.
 
   `put_setting/4` writes one of `ingress_port`/`ingress_panel`/`watchdog`
   for an already-tracked slug (`:error` if untracked); `ingress_token` has
@@ -60,7 +65,8 @@ defmodule Vagus.Addon.State do
   The file holds `{"version": 1, "addons": {"<slug>": {"config": <raw
   Config.to_persistable/1 map>, "state": "started"|"stopped",
   "user_options": {...}, "ingress_token": "...", "ingress_port":
-  null|<port>, "ingress_panel": bool, "watchdog": bool}}}`.
+  null|<port>, "ingress_panel": bool, "watchdog": bool, "network":
+  {"<port>/<proto>": <host_port>|null}}}}`.
   `Config.parse/1` — not this module — is the single validator on reload:
   each entry's `config` is re-parsed (and its key checked against the
   parsed slug) at `init/1`, and anything invalid/mismatched, or a file
@@ -70,7 +76,9 @@ defmodule Vagus.Addon.State do
   entry: a missing/non-string `ingress_token` gets a freshly generated one
   (old files predate the field), a missing/invalid `ingress_port` falls
   back to `nil`, and a missing/non-boolean `ingress_panel`/`watchdog` falls
-  back to `false` — the format is purely additive, so the version number
+  back to `false`; a missing/non-map `network` falls back to `%{}` and its
+  entries are re-checked individually (a hand-edited file reaches the
+  container spec too) — the format is purely additive, so the version number
   doesn't change. Writes are `mkdir_p` + write-to-`.tmp` + `File.rename`
   (atomic against a mid-write power loss) and best-effort: a write failure
   is logged and the lifecycle call still succeeds, since a flash write
@@ -90,7 +98,8 @@ defmodule Vagus.Addon.State do
           ingress_token: String.t(),
           ingress_port: nil | pos_integer(),
           ingress_panel: boolean(),
-          watchdog: boolean()
+          watchdog: boolean(),
+          ports: Vagus.Addon.Ports.t()
         }
 
   @persist_version 1
@@ -131,7 +140,7 @@ defmodule Vagus.Addon.State do
 
   @doc """
   Writes one persisted per-install setting for `slug` — `:ingress_port`,
-  `:ingress_panel`, or `:watchdog` (`ingress_token` has no setter; it's
+  `:ingress_panel`, `:watchdog`, or `:ports` (`ingress_token` has no setter; it's
   generated once and never changes). `:error` if `slug` isn't tracked (not
   installed). The guard clause is load-bearing: it's the only thing
   stopping a typo'd/unknown key from being written straight to the entry
@@ -139,13 +148,13 @@ defmodule Vagus.Addon.State do
   """
   @spec put_setting(
           String.t(),
-          :ingress_port | :ingress_panel | :watchdog,
+          :ingress_port | :ingress_panel | :watchdog | :ports,
           term(),
           GenServer.server()
         ) ::
           :ok | :error
   def put_setting(slug, key, value, server \\ __MODULE__)
-      when key in [:ingress_port, :ingress_panel, :watchdog] do
+      when key in [:ingress_port, :ingress_panel, :watchdog, :ports] do
     GenServer.call(server, {:put_setting, slug, key, value})
   end
 
@@ -245,16 +254,24 @@ defmodule Vagus.Addon.State do
         ingress_token: token,
         ingress_port: port,
         ingress_panel: panel,
-        watchdog: watchdog
+        watchdog: watchdog,
+        ports: ports
       } ->
-        %{ingress_token: token, ingress_port: port, ingress_panel: panel, watchdog: watchdog}
+        %{
+          ingress_token: token,
+          ingress_port: port,
+          ingress_panel: panel,
+          watchdog: watchdog,
+          ports: ports
+        }
 
       nil ->
         %{
           ingress_token: generate_ingress_token(),
           ingress_port: nil,
           ingress_panel: false,
-          watchdog: false
+          watchdog: false,
+          ports: %{}
         }
     end
   end
@@ -343,7 +360,8 @@ defmodule Vagus.Addon.State do
          ingress_token: decode_ingress_token(raw),
          ingress_port: decode_ingress_port(raw),
          ingress_panel: decode_bool_setting(raw, "ingress_panel"),
-         watchdog: decode_bool_setting(raw, "watchdog")
+         watchdog: decode_bool_setting(raw, "watchdog"),
+         ports: decode_ports(raw)
        }}
     else
       _ ->
@@ -392,6 +410,25 @@ defmodule Vagus.Addon.State do
     end
   end
 
+  # The user's host-port overrides, persisted under `"network"` to match the
+  # wire key the frontend posts. Absent on every file written before this
+  # setting existed, hence the `%{}` default — the same tolerant-load rule the
+  # other settings use, and why this needed no `@persist_version` bump.
+  # Values are re-checked here rather than trusted: the write path validates
+  # them, but a hand-edited `addons.json` reaches the container spec too.
+  defp decode_ports(raw) do
+    case Map.get(raw, "network") do
+      ports when is_map(ports) ->
+        Map.filter(ports, fn {port, host} ->
+          is_binary(port) and
+            (is_nil(host) or (is_integer(host) and host >= 0 and host <= 65_535))
+        end)
+
+      _ ->
+        %{}
+    end
+  end
+
   defp persist(nil, _entries), do: :ok
 
   # path is internal/config-derived, not request input
@@ -428,7 +465,8 @@ defmodule Vagus.Addon.State do
                                ingress_token: ingress_token,
                                ingress_port: ingress_port,
                                ingress_panel: ingress_panel,
-                               watchdog: watchdog
+                               watchdog: watchdog,
+                               ports: ports
                              }} ->
           {slug,
            %{
@@ -438,7 +476,8 @@ defmodule Vagus.Addon.State do
              "ingress_token" => ingress_token,
              "ingress_port" => ingress_port,
              "ingress_panel" => ingress_panel,
-             "watchdog" => watchdog
+             "watchdog" => watchdog,
+             "network" => ports
            }}
         end)
     }

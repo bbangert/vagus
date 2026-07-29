@@ -220,6 +220,158 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
     end
   end
 
+  describe "POST /addons/:slug/options with a network key (the Network card)" do
+    # The card posts to the same options endpoint. `network` used to land in
+    # the accept-and-ignore bucket with the unmodeled SCHEMA_OPTIONS keys, so
+    # the save returned 200 and the port never moved.
+    setup do
+      {:ok, config} =
+        Config.parse(%{
+          "name" => "Test Addon",
+          "version" => "3",
+          "slug" => "core_netopts",
+          "description" => "d",
+          "arch" => ["amd64"],
+          "image" => "homeassistant/{arch}-addon-test",
+          "ports" => %{"22/tcp" => nil, "80/tcp" => 8080}
+        })
+
+      :ok = State.put(config, :stopped)
+      on_exit(fn -> State.delete("core_netopts") end)
+      %{config: config}
+    end
+
+    test "a posted port is persisted and reported back as the effective map" do
+      conn =
+        supervisor_call(:post, "/addons/core_netopts/options", %{
+          "network" => %{"22/tcp" => 2222, "80/tcp" => 8080}
+        })
+
+      assert conn.status == 200
+      assert {:ok, %{ports: %{"22/tcp" => 2222}}} = State.get("core_netopts")
+
+      # The info payload is what the card re-renders from — a default here
+      # would look to the user like the save silently reverted.
+      info = body(supervisor_call(:get, "/addons/core_netopts/info"))["data"]
+      assert info["network"] == %{"22/tcp" => 2222, "80/tcp" => 8080}
+    end
+
+    test "network: null resets to the config's declared defaults" do
+      :ok = State.put_setting("core_netopts", :ports, %{"22/tcp" => 2222})
+
+      conn = supervisor_call(:post, "/addons/core_netopts/options", %{"network" => nil})
+
+      assert conn.status == 200
+      assert {:ok, %{ports: %{}}} = State.get("core_netopts")
+
+      info = body(supervisor_call(:get, "/addons/core_netopts/info"))["data"]
+      assert info["network"] == %{"22/tcp" => nil, "80/tcp" => 8080}
+    end
+
+    test "a value that isn't a port is a 400, and nothing is written" do
+      conn =
+        supervisor_call(:post, "/addons/core_netopts/options", %{
+          "network" => %{"22/tcp" => "2222"}
+        })
+
+      assert conn.status == 400
+      assert body(conn)["message"] =~ "22/tcp"
+      assert {:ok, %{ports: %{}}} = State.get("core_netopts")
+    end
+
+    test "a bad network key rejects the whole body — options must not half-apply" do
+      conn =
+        supervisor_call(:post, "/addons/core_netopts/options", %{
+          "options" => %{"greeting" => "hey"},
+          "network" => %{"22/tcp" => "nope"}
+        })
+
+      assert conn.status == 400
+      assert {:ok, %{user_options: %{}, ports: %{}}} = State.get("core_netopts")
+    end
+  end
+
+  describe "POST /addons/:slug/options/validate" do
+    # The config page pre-flights every save through this and throws on
+    # anything but `valid: true`, so a missing route makes Save fail for every
+    # add-on regardless of what the options endpoint does.
+    setup do
+      config = fixture_config("vopts") |> Map.put(:slug, "core_vopts")
+      :ok = State.put(config, :stopped)
+      on_exit(fn -> State.delete("core_vopts") end)
+      %{config: config}
+    end
+
+    test "valid options report valid: true with an empty message" do
+      conn =
+        supervisor_call(:post, "/addons/core_vopts/options/validate", %{"greeting" => "hey"})
+
+      assert conn.status == 200
+      assert body(conn)["data"] == %{"valid" => true, "message" => "", "pwned" => false}
+    end
+
+    test "invalid options are a 200 with valid: false, not an error status" do
+      # Upstream returns the verdict as data; a non-200 would surface in the
+      # frontend as a transport failure rather than a validation message.
+      conn = supervisor_call(:post, "/addons/core_vopts/options/validate", %{"greeting" => 5})
+
+      assert conn.status == 200
+      data = body(conn)["data"]
+      assert data["valid"] == false
+      assert data["message"] != ""
+      assert data["pwned"] == false
+    end
+
+    test "the body is the options map itself, not wrapped in an options key" do
+      # The *save* shape, carrying an inner value this schema rejects. Read
+      # directly (upstream's behaviour) the outer "options" key is unknown and
+      # dropped, the defaults stand, and the verdict is `true`. A handler that
+      # unwrapped `"options"` would see `greeting: 5` and answer `false` — so
+      # `true` here is what proves the body is taken as-is.
+      conn =
+        supervisor_call(:post, "/addons/core_vopts/options/validate", %{
+          "options" => %{"greeting" => 5}
+        })
+
+      assert conn.status == 200
+      assert body(conn)["data"]["valid"] == true
+    end
+
+    test "an empty body validates the add-on's stored options" do
+      conn = supervisor_call(:post, "/addons/core_vopts/options/validate", %{})
+
+      assert conn.status == 200
+      assert body(conn)["data"]["valid"] == true
+    end
+
+    test "the verdict matches what the save path actually does" do
+      # The two must never disagree: a `valid: true` followed by a 400 on save
+      # is exactly the failure this endpoint exists to prevent.
+      for options <- [%{"greeting" => "hey"}, %{"greeting" => 5}] do
+        verdict =
+          body(supervisor_call(:post, "/addons/core_vopts/options/validate", options))["data"][
+            "valid"
+          ]
+
+        saved =
+          supervisor_call(:post, "/addons/core_vopts/options", %{"options" => options}).status ==
+            200
+
+        assert verdict == saved
+      end
+    end
+
+    test "a never-installed slug is a 404" do
+      conn = supervisor_call(:post, "/addons/never_installed/options/validate", %{})
+      assert conn.status == 404
+    end
+
+    test "an add-on caller is refused with 403" do
+      conn = addon_call(:post, "/addons/core_vopts/options/validate", "some_other_addon")
+      assert conn.status == 403
+    end
+  end
+
   describe "POST /addons/:slug/options" do
     setup do
       config = fixture_config("opts") |> Map.put(:slug, "core_opts")
@@ -234,6 +386,50 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
 
       assert conn.status == 200
       assert {:ok, %{user_options: %{"greeting" => "hey"}}} = State.get("core_opts")
+    end
+
+    test "a saved option is what the info payload reports back" do
+      # The Configuration page re-renders from `info.options` the moment a
+      # save returns. Reporting the config defaults here is what made a saved
+      # password look like it had cleared itself — the value was in State the
+      # whole time.
+      assert supervisor_call(:post, "/addons/core_opts/options", %{
+               "options" => %{"greeting" => "secret-value"}
+             }).status == 200
+
+      info = body(supervisor_call(:get, "/addons/core_opts/info"))["data"]
+      assert info["options"]["greeting"] == "secret-value"
+
+      # ...and through the list route, which renders by a different path.
+      listed =
+        body(supervisor_call(:get, "/addons"))["data"]["addons"]
+        |> Enum.find(&(&1["slug"] == "core_opts"))
+
+      assert listed["options"]["greeting"] == "secret-value"
+    end
+
+    test "options the user never touched keep their config defaults" do
+      {:ok, config} =
+        Config.parse(%{
+          "name" => "Test Addon",
+          "version" => "3",
+          "slug" => "core_partialopts",
+          "description" => "d",
+          "arch" => ["amd64"],
+          "image" => "homeassistant/{arch}-addon-test",
+          "options" => %{"greeting" => "hi", "untouched" => true},
+          "schema" => %{"greeting" => "str", "untouched" => "bool"}
+        })
+
+      :ok = State.put(config, :stopped)
+      on_exit(fn -> State.delete("core_partialopts") end)
+
+      assert supervisor_call(:post, "/addons/core_partialopts/options", %{
+               "options" => %{"greeting" => "hey"}
+             }).status == 200
+
+      info = body(supervisor_call(:get, "/addons/core_partialopts/info"))["data"]
+      assert info["options"] == %{"greeting" => "hey", "untouched" => true}
     end
 
     test "an invalid options map -> 400, nothing stored" do

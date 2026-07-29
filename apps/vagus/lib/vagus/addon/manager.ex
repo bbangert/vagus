@@ -85,7 +85,7 @@ defmodule Vagus.Addon.Manager do
   require Logger
 
   alias Vagus.Addon.Backend.Spec
-  alias Vagus.Addon.{Config, OptionsSchema}
+  alias Vagus.Addon.{Config, OptionsSchema, Ports}
   alias Vagus.Ingress.Panels
   alias Vagus.Network
 
@@ -205,11 +205,16 @@ defmodule Vagus.Addon.Manager do
       :error ->
         {:error, :not_found}
 
-      {:ok, %{config: config, user_options: user_options}} ->
+      {:ok, %{config: config, user_options: user_options} = entry} ->
         # start/2 re-acquires the same slug's lock — reentrant for this
         # process (W6), so this doesn't deadlock against the lock
         # with_slug_lock/2 already holds above.
-        start(config, Keyword.put_new(opts, :user_options, user_options || %{}))
+        opts =
+          opts
+          |> Keyword.put_new(:user_options, user_options || %{})
+          |> Keyword.put_new(:ports, Map.get(entry, :ports) || %{})
+
+        start(config, opts)
     end
   end
 
@@ -368,7 +373,10 @@ defmodule Vagus.Addon.Manager do
       cap_add: config.privileged,
       tmpfs: if(config.host_ipc, do: %{}, else: %{"/dev/shm" => ""}),
       mounts: mounts(config, data_root),
-      ports: if(host?, do: %{}, else: config.ports),
+      # The user's persisted host-port overrides, overlaid on the config's
+      # declared ports (`Vagus.Addon.Ports`). A host-network add-on publishes
+      # nothing — its ports are the host's already.
+      ports: if(host?, do: %{}, else: Ports.effective(config, Keyword.get(opts, :ports, %{}))),
       pid_mode: if(not protected and config.host_pid, do: "host", else: nil),
       uts_mode: if(config.host_uts, do: "host", else: nil),
       platform: platform(arch)

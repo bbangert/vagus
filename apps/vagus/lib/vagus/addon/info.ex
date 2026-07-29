@@ -19,7 +19,7 @@ defmodule Vagus.Addon.Info do
   parse.
   """
 
-  alias Vagus.Addon.Config
+  alias Vagus.Addon.{Config, OptionsSchema}
 
   @doc """
   Builds the info map for `config` in lifecycle `state` (`:started`/`:stopped`)
@@ -118,9 +118,15 @@ defmodule Vagus.Addon.Info do
       "boot" => config.boot,
       "boot_config" => "auto",
       "options" => options,
-      "schema" => nil,
+      # The UI schema, not the raw config.yaml token map: the Configuration
+      # page builds its form from this and drops to a YAML editor when it is
+      # null, which is what every add-on got before.
+      "schema" => OptionsSchema.ui(config.schema),
       "machine" => [],
-      "network" => config.ports,
+      # Effective, not the config's defaults: this is what the Network card
+      # renders, so reporting the declared ports would show the user's saved
+      # remap reverting the moment the page reloads.
+      "network" => Vagus.Addon.Ports.effective(config, Map.get(settings, :ports) || %{}),
       "network_description" => nil,
       "host_ipc" => config.host_ipc,
       "host_uts" => config.host_uts,

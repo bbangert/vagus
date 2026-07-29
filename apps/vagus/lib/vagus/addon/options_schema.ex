@@ -115,7 +115,124 @@ defmodule Vagus.Addon.OptionsSchema do
     end
   end
 
+  @doc """
+  Renders the raw `config.yaml` schema into the **UI** schema the frontend's
+  Configuration form is built from — upstream's `app.schema_ui`
+  (`supervisor/apps/options.py::UiOptions`), a flat list of `ha-form` nodes
+  rather than the nested token map.
+
+  Lives here, next to `validate/3`, and shares its `parse_token/2` on purpose:
+  the form the user is shown and the rules their input is checked against are
+  the same grammar, so a type this can render is a type that validates.
+
+  `false` (an add-on that declares no schema, i.e. `schema: false`) renders as
+  `nil` — the field's "there is no form", which is what puts the frontend in
+  YAML mode. An empty map renders as an empty list, which is a form with no
+  fields; those are different things and the frontend treats them differently.
+
+  Element shapes, matching upstream key-for-key:
+
+    * a token (`"str"`, `"int(1,10)"`, `"list(a|b)"`, …) → one node carrying
+      `name`/`type`, plus `format` for password/email/url, `options` for a
+      select, `lengthMin`/`lengthMax` for a bounded token, and exactly one of
+      `required`/`optional` (the trailing `?`).
+    * a one-element list (`["str"]`) → that element's node with
+      `multiple: true`.
+    * a nested map → a `type: "schema"` node whose own `schema` key holds the
+      children's nodes.
+
+  A token this module can't parse is **skipped**, not raised on: upstream's
+  `_single_ui_option` returns early on a regex miss, and one unrenderable
+  field must not cost the user the whole form.
+  """
+  @spec ui(schema()) :: nil | [map()]
+  def ui(false), do: nil
+
+  def ui(schema) when is_map(schema) do
+    Enum.flat_map(schema, fn {key, element} -> ui_element(element, key, false) end)
+  end
+
+  def ui(_other), do: nil
+
   ## Internals
+
+  # `optional: true` is hardcoded, and it is knowingly inconsistent with
+  # `validate/3`, which treats a nested-map key as **required** (only a token
+  # ending in `?`, or a one-element list of one, is optional). That asymmetry
+  # is upstream's, on both sides: `_nested_ui_dict` hardcodes the same
+  # `"optional": True`, while `_check_missing_options` raises for a missing
+  # key whose schema isn't a `str` ending in `?` — a dict never is. Marking
+  # these `required` would make our form differ from the one HAOS renders for
+  # the same add-on, which is the worse bug. In practice the key is present
+  # anyway: `effective/4` validates defaults-merged-with-user, so any add-on
+  # that ships a default for the nested block can't hit it.
+  defp ui_element(element, key, multiple) when is_map(element) do
+    [
+      %{
+        "name" => key,
+        "type" => "schema",
+        "optional" => true,
+        "multiple" => multiple,
+        "schema" => Enum.flat_map(element, fn {k, v} -> ui_element(v, k, false) end)
+      }
+    ]
+  end
+
+  # `["str"]` is "a list of str". Upstream asserts the nesting never doubles
+  # up (a list inside a list), and renders the inner element as `multiple`.
+  defp ui_element([inner], key, false), do: ui_element(inner, key, true)
+
+  defp ui_element(token, key, multiple) when is_binary(token) do
+    case parse_ui_token(token) do
+      nil ->
+        []
+
+      node ->
+        node = Map.merge(%{"name" => key}, node)
+        node = if multiple, do: Map.put(node, "multiple", true), else: node
+
+        [
+          if(String.ends_with?(token, "?"),
+            do: Map.put(node, "optional", true),
+            else: Map.put(node, "required", true)
+          )
+        ]
+    end
+  end
+
+  defp ui_element(_other, _key, _multiple), do: []
+
+  defp parse_ui_token(token) do
+    token |> String.trim_trailing("?") |> parse_token("ui") |> ui_node()
+  catch
+    # `parse_token/2` throws on an unknown type. Upstream's equivalent is a
+    # regex miss returning early — the field vanishes from the form, the rest
+    # of it still renders.
+    {:invalid, _message} -> nil
+  end
+
+  # Bounds are emitted as floats because upstream does (`float(group_value)`),
+  # and the frontend compares them numerically either way.
+  defp ui_node(:bool), do: %{"type" => "boolean"}
+  defp ui_node(:email), do: %{"type" => "string", "format" => "email"}
+  defp ui_node(:url), do: %{"type" => "string", "format" => "url"}
+  defp ui_node(:port), do: %{"type" => "integer"}
+  defp ui_node({:device, _filter}), do: %{"type" => "select", "options" => []}
+  defp ui_node({:match, _regex}), do: %{"type" => "string"}
+  defp ui_node({:list, options}), do: %{"type" => "select", "options" => options}
+  defp ui_node({:str, min, max}), do: bounds(%{"type" => "string"}, min, max)
+
+  defp ui_node({:password, min, max}),
+    do: bounds(%{"type" => "string", "format" => "password"}, min, max)
+
+  defp ui_node({:int, min, max}), do: bounds(%{"type" => "integer"}, min, max)
+  defp ui_node({:float, min, max}), do: bounds(%{"type" => "float"}, min, max)
+
+  defp bounds(node, min, max) do
+    node
+    |> then(&if(is_nil(min), do: &1, else: Map.put(&1, "lengthMin", min / 1)))
+    |> then(&if(is_nil(max), do: &1, else: Map.put(&1, "lengthMax", max / 1)))
+  end
 
   defp validate_map(schema, value, path, secrets) when is_map(schema) do
     unless is_map(value), do: invalid("#{root(path)} must be an object")
