@@ -43,7 +43,7 @@ defmodule Vagus.API.Dispatcher do
 
   @behaviour Plug
 
-  alias Vagus.API.{IngressProxy, Router}
+  alias Vagus.API.{IngressProxy, Router, SourceGuard}
 
   # `Plug.Router.init/1`'s default implementation is the identity function
   # (no state to precompute); `IngressProxy.init/1` is likewise a plain
@@ -55,13 +55,42 @@ defmodule Vagus.API.Dispatcher do
   @impl Plug
   def init(opts), do: opts
 
+  # The source allowlist lives HERE, not in the router, because this is what
+  # Bandit is given (`Vagus.API.Supervisor`'s `plug:`) and the ingress clause
+  # below never reaches the router's pipeline. A guard installed as a router
+  # plug protects `/supervisor/ping` and leaves `/ingress/{token}/…` — an
+  # authenticated-by-cookie reverse proxy into an add-on's web UI, with a
+  # WebSocket upgrade — open to the whole LAN. That was the shape of this
+  # code for one commit; the device said `403` on the router path and `401`
+  # on the ingress path, which is how it was caught.
+  #
+  # Deciding it before either pipeline means a refused caller reaches neither
+  # `Plug.Parsers` nor the proxy's body streaming.
   @impl Plug
-  def call(%Plug.Conn{path_info: ["ingress", token | _rest]} = conn, _opts)
-      when token not in ["panels", "session", "validate_session"] do
+  def call(conn, opts) do
+    if SourceGuard.allowed?(conn.remote_ip) do
+      dispatch(conn, opts)
+    else
+      refuse(conn)
+    end
+  end
+
+  defp dispatch(%Plug.Conn{path_info: ["ingress", token | _rest]} = conn, _opts)
+       when token not in ["panels", "session", "validate_session"] do
     IngressProxy.call(conn, @proxy_opts)
   end
 
-  def call(conn, _opts) do
+  defp dispatch(conn, _opts) do
     Router.call(conn, @router_opts)
+  end
+
+  # Bare 403, no body: a caller we won't answer doesn't get told why. The
+  # refusal is *counted* rather than logged here — `SourceGuard` folds them
+  # into one periodic line, so a LAN attacker can't push real evidence out of
+  # the log ring by hammering the port.
+  defp refuse(conn) do
+    SourceGuard.record_refusal(conn.remote_ip)
+
+    conn |> Plug.Conn.send_resp(403, "") |> Plug.Conn.halt()
   end
 end

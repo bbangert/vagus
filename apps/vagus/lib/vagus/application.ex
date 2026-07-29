@@ -40,6 +40,20 @@ defmodule Vagus.Application do
         # `Vagus.Addon.State` so it never races the store it reads from.
         Vagus.Addon.BootStarter,
         Vagus.Addon.Store,
+
+        # Fills the store's catalog once after boot. Same config-gated
+        # `:ignore` convention as `BootStarter` above; without it the catalog
+        # stays empty until someone calls `POST /store/reload`, which means a
+        # blank add-on store (and no icons, since asset lookup goes through
+        # the catalog) after every reboot. After `Store`, whose GenServer it
+        # calls.
+        Vagus.Addon.Store.Refresher,
+
+        # Owns the API's source allowlist cache. Before `Vagus.API.Supervisor`
+        # so the set is populated by the time the listener accepts anything —
+        # an empty set refuses Core, and the guard deliberately doesn't
+        # refresh on a miss.
+        Vagus.API.SourceGuard,
         Vagus.Backups,
         Vagus.Services,
         Vagus.Discovery,
