@@ -217,6 +217,77 @@ defmodule Vagus.API.AuthTierGateTest do
     end
   end
 
+  # Audit A7. The tier gate (phase 1) closed `GET /addons` to a default-role
+  # add-on, but a `hassio_role: manager` one legitimately reaches it — so the
+  # payload itself must not carry secrets. `_list_apps_data/0` upstream emits
+  # none of these three to any caller.
+  describe "GET /addons carries no secrets (A7)" do
+    setup do
+      {:ok, config} =
+        Vagus.Addon.Config.parse(%{
+          "name" => "Secretful",
+          "version" => "1",
+          "slug" => "core_secretful",
+          "description" => "d",
+          "arch" => ["amd64"],
+          "image" => "x/y",
+          "ingress" => true,
+          "options" => %{"api_key" => "default"},
+          "schema" => %{"api_key" => "str"}
+        })
+
+      :ok = Vagus.Addon.State.put(config, :started)
+      :ok = Vagus.Addon.State.put_options("core_secretful", %{"api_key" => "s3cr3t"})
+      on_exit(fn -> Vagus.Addon.State.delete("core_secretful") end)
+      :ok
+    end
+
+    test "a manager add-on reading the list sees no options and no ingress token" do
+      token = addon_token("tier_gate_list", %{hassio_api: true, hassio_role: "manager"})
+      conn = call(:get, "/addons", token)
+
+      assert conn.status == 200
+
+      entry =
+        Enum.find(
+          Jason.decode!(conn.resp_body)["data"]["addons"],
+          &(&1["slug"] == "core_secretful")
+        )
+
+      refute Map.has_key?(entry, "options")
+      refute Map.has_key?(entry, "ingress_entry")
+      refute Map.has_key?(entry, "ingress_url")
+
+      # The whole body, not just the one entry — the token must not appear
+      # anywhere, and neither must the option value.
+      refute conn.resp_body =~ "s3cr3t"
+      {:ok, state} = Vagus.Addon.State.get("core_secretful")
+      refute conn.resp_body =~ state.ingress_token
+    end
+
+    test "Core is subject to the same list shape — the rule is unconditional" do
+      conn = call_as_core(:get, "/addons")
+
+      assert conn.status == 200
+      refute conn.resp_body =~ "s3cr3t"
+    end
+
+    test "the list still carries what the dashboard renders from" do
+      # Guards the trim: dropping three keys must not gut the entry.
+      conn = call_as_core(:get, "/addons")
+
+      entry =
+        Enum.find(
+          Jason.decode!(conn.resp_body)["data"]["addons"],
+          &(&1["slug"] == "core_secretful")
+        )
+
+      for key <- ~w(name slug version state icon logo repository update_available) do
+        assert Map.has_key?(entry, key), "the list lost #{key}"
+      end
+    end
+  end
+
   describe "ordering" do
     test "a missing token is still 401, decided before any tier is computed" do
       conn = conn(:get, "/store") |> Router.call(@opts)

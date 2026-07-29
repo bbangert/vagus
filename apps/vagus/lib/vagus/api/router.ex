@@ -33,7 +33,7 @@ defmodule Vagus.API.Router do
   alias Vagus.Addon.Backend.Native
   alias Vagus.Addon.{Manager, OptionsSchema, Ports, State, Store, StoreView, Update}
   alias Vagus.Addon.Store.Assets
-  alias Vagus.API.{Envelope, StaticData}
+  alias Vagus.API.{Envelope, StaticData, Tiers}
   alias Vagus.Backend
   alias Vagus.Backups
   alias Vagus.Core.{Health, Lifecycle, TokenStore, Versions}
@@ -361,6 +361,9 @@ defmodule Vagus.API.Router do
   # `InstalledAddon`) rather than a separate summary builder — `AddonsList`
   # only pins the outer `addons` key (`Vagus.API.Model`), so the extra fields
   # are harmless. Honestly empty with no add-ons installed.
+  #
+  # …with three exceptions, stripped in `addon_list_entry/1`: the superset was
+  # NOT harmless for `options`, `ingress_entry` and `ingress_url` (audit A7).
   get "/addons" do
     addons = Enum.map(State.list(), &addon_list_entry/1)
     Envelope.send_ok(conn, AddonsList.build!(%{addons: addons}))
@@ -381,7 +384,13 @@ defmodule Vagus.API.Router do
 
     with {:ok, resolved} <- resolve_info_slug(slug, caller),
          {:ok, %{config: config, state: state} = entry} <- Vagus.Addon.State.get(resolved) do
-      options = live_options(entry)
+      # Audit A8 — "User options may contain secrets". The rule lives in
+      # `Vagus.API.Tiers` because its false branch is unreachable from here;
+      # see that function's doc.
+      options =
+        if Tiers.expose_options?(conn.assigns.caller, conn.assigns.tier, resolved),
+          do: live_options(entry),
+          else: %{}
 
       settings =
         entry
@@ -1760,10 +1769,30 @@ defmodule Vagus.API.Router do
 
   # -- addon lifecycle helpers ------------------------------------------------
 
-  # `GET /addons` entry: the same live options `/addons/{slug}/info` reports,
-  # rendered through `Vagus.Addon.Info.render/4`.
+  # Keys `Vagus.Addon.Info.render/4` emits that upstream's LIST shape does not,
+  # and that carry a secret (audit A7):
+  #
+  #   * `options` — the effective, merged user options: saved passwords, API
+  #     keys, tokens.
+  #   * `ingress_entry`/`ingress_url` — both embed the add-on's live
+  #     `ingress_token`, the capability `/ingress/{token}/…` is authenticated
+  #     by. `GET /addons/{slug}/info` refuses to hand that over for another
+  #     add-on (`resolve_info_slug/2`); the plural route was handing over
+  #     everyone's.
+  #
+  # `_list_apps_data/0` (`supervisor/api/apps.py`) emits none of the three, to
+  # ANY caller, so this is unconditional rather than caller-dependent — one
+  # rule, no tier to get wrong. The rest of the superset stays: Vagus has
+  # shipped it on this route for months with Core healthy on both boards, so
+  # extra fields are proven harmless, whereas trimming to upstream's exact 18
+  # would be the risky direction for a frontend nobody has re-tested.
+  @list_secret_keys ~w(options ingress_entry ingress_url)
+
+  # `GET /addons` entry: `/addons/{slug}/info`'s shape minus the three above.
   defp addon_list_entry(%{config: config, state: state} = entry) do
-    Vagus.Addon.Info.render(config, state, live_options(entry), info_settings(entry))
+    config
+    |> Vagus.Addon.Info.render(state, live_options(entry), info_settings(entry))
+    |> Map.drop(@list_secret_keys)
   end
 
   # What an add-on's options ARE right now: the config's defaults with the
