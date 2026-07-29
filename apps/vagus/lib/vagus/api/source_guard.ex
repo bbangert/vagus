@@ -43,9 +43,15 @@ defmodule Vagus.API.SourceGuard do
   The local-address set is cached in `:persistent_term` and refreshed on a
   timer. It is deliberately *not* refreshed on a miss: a miss is the hostile
   case, and turning it into a syscall would hand a LAN attacker a cheap way
-  to make the device work. A newly-bound address is therefore admitted within
-  one refresh interval — fine for DHCP renewals and for the `hassio` bridge,
-  whose whole range is covered by the static subnet rule anyway.
+  to make the device work.
+
+  The interval is therefore how long a newly-bound address stays refused,
+  which matters most at boot, where it races DHCP. Measured on the Q6A: the
+  guard's first read saw 2 addresses, the next tick saw 11, and every
+  Core -> Supervisor call in between was refused. So the timer runs once a
+  second for the first minute of uptime and settles to every 30s after — a
+  syscall a second for a minute costs nothing, and the boot window closes to
+  about a second.
 
   Gated by `config :vagus, :api_source_guard`, so `:host` and `:test` (which
   answer from `127.0.0.1` regardless) are unaffected and `start_link/1`
@@ -59,6 +65,15 @@ defmodule Vagus.API.SourceGuard do
 
   @key {__MODULE__, :local_addresses}
   @refresh_ms 30_000
+
+  # A cold boot races DHCP: the guard's first read happens while the LAN
+  # interface may still be unconfigured, and until the address lands every
+  # Core -> Supervisor call is refused. Measured on the Q6A — `init` saw 2
+  # addresses, the 30s tick saw 11, and the refusals in between came from the
+  # board's own address. So poll fast for the first minute of uptime, then
+  # settle. This is a syscall, not a fetch; the cost is noise.
+  @boot_refresh_ms 1_000
+  @boot_fast_ticks 60
 
   def start_link(opts \\ []) do
     if enabled?() do
@@ -145,12 +160,13 @@ defmodule Vagus.API.SourceGuard do
         "#{MapSet.size(local_addresses())} local address(es)"
     )
 
-    {:ok, %{refused: 0, sources: MapSet.new()}, {:continue, :schedule}}
+    {:ok, %{refused: 0, sources: MapSet.new(), fast_ticks: @boot_fast_ticks},
+     {:continue, :schedule}}
   end
 
   @impl GenServer
   def handle_continue(:schedule, state) do
-    schedule()
+    schedule(state)
     {:noreply, state}
   end
 
@@ -167,7 +183,13 @@ defmodule Vagus.API.SourceGuard do
   @impl GenServer
   def handle_info(:refresh, state) do
     refresh()
-    schedule()
+    state = %{state | fast_ticks: max(state.fast_ticks - 1, 0)}
+    schedule(state)
+
+    # Summarised on every tick, including the fast boot ones. Refusals during
+    # the boot window are the most diagnostic thing this module emits — they
+    # are how the DHCP race above was found — so suppressing them to save a
+    # line would hide the signal that matters most.
     {:noreply, report_refusals(state)}
   end
 
@@ -188,7 +210,10 @@ defmodule Vagus.API.SourceGuard do
   defp format_ip(nil), do: "unknown"
   defp format_ip(ip), do: to_string(:inet.ntoa(ip))
 
-  defp schedule, do: Process.send_after(self(), :refresh, @refresh_ms)
+  defp schedule(%{fast_ticks: ticks}) when ticks > 0,
+    do: Process.send_after(self(), :refresh, @boot_refresh_ms)
+
+  defp schedule(_state), do: Process.send_after(self(), :refresh, @refresh_ms)
 
   # Only a write when the set actually changed: `:persistent_term.put/2`
   # triggers a global scan, and on a quiet device this runs every 30s forever.
