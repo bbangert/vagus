@@ -86,7 +86,14 @@ defmodule Vagus.Addon.Store.Refresher do
     # supervision tree down with it because github returned something odd
     # would be a worse bug than a stale store.
     error ->
-      Logger.warning("Vagus.Addon.Store.Refresher: reload raised #{inspect(error)}")
+      # With the stacktrace: this branch exists for the *unexpected*, and a
+      # bare message would leave a boot-time failure on a device with no
+      # attached console essentially undiagnosable.
+      Logger.warning(
+        "Vagus.Addon.Store.Refresher: reload raised\n" <>
+          Exception.format(:error, error, __STACKTRACE__)
+      )
+
       retry(state)
   catch
     # `reload/1` opens with a `GenServer.call` to the store, so a device busy
@@ -95,7 +102,11 @@ defmodule Vagus.Addon.Store.Refresher do
     # restarts us) but throws away the backoff and restarts the initial delay,
     # so a loaded boot would retry *sooner* and add load. Retry in place.
     :exit, reason ->
-      Logger.warning("Vagus.Addon.Store.Refresher: reload exited #{inspect(reason)}")
+      Logger.warning(
+        "Vagus.Addon.Store.Refresher: reload exited #{inspect(reason)}\n" <>
+          Exception.format_stacktrace(__STACKTRACE__)
+      )
+
       retry(state)
   end
 

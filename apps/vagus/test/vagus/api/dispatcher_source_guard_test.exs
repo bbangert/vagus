@@ -28,9 +28,12 @@ defmodule Vagus.API.DispatcherSourceGuardTest do
     :persistent_term.put({SourceGuard, :local_addresses}, MapSet.new([{127, 0, 0, 1}]))
 
     on_exit(fn ->
-      if prev,
-        do: Application.put_env(:vagus, :api_source_guard, prev),
-        else: Application.delete_env(:vagus, :api_source_guard)
+      # `is_nil/1`, not a truthiness check: an explicitly-`false` setting is a
+      # real value to restore, and `if prev` would delete it instead — leaking
+      # a config change into whatever runs next.
+      if is_nil(prev),
+        do: Application.delete_env(:vagus, :api_source_guard),
+        else: Application.put_env(:vagus, :api_source_guard, prev)
 
       :persistent_term.erase({SourceGuard, :local_addresses})
     end)
