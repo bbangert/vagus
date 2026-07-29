@@ -21,6 +21,24 @@ defmodule Vagus.API.Auth do
     * a token registered in `Vagus.Addon.Registry` (a running add-on's
       per-start token) → `{:addon, identity}`;
     * otherwise a 401 error envelope, halted before dispatch.
+
+  ## The role gate
+
+  An authenticated caller is then graded against `Vagus.API.Tiers`: its tier
+  is assigned on `conn.assigns.tier`, and a path demanding more than the
+  caller holds is refused with 403 (upstream raises `HTTPForbidden`) before
+  `:match` ever runs.
+
+  That check lives here rather than in a second router plug for the same
+  reason the icon/logo carve-out does. This module is the authorisation
+  boundary; splitting reachability across two plugs means two places to get it
+  wrong, and the audit that produced this gate found exactly that failure —
+  `supervisor_only/2` was applied by hand and 26 routes never got it. The
+  *table* is separate and diffable (`Vagus.API.Tiers`); applying it is not.
+
+  `conn.assigns.caller` is unchanged. Every existing handler guard still runs
+  — the gate is a coarse pre-filter, and the per-caller grants
+  (`services_role`, `discovery`, `resolve_info_slug/2`) remain the finer rule.
   """
 
   @behaviour Plug
@@ -28,7 +46,7 @@ defmodule Vagus.API.Auth do
   import Plug.Conn
 
   alias Vagus.Addon.Registry
-  alias Vagus.API.{Envelope, Token}
+  alias Vagus.API.{Envelope, Tiers, Token}
 
   @impl Plug
   def init(opts), do: opts
@@ -103,14 +121,35 @@ defmodule Vagus.API.Auth do
   defp resolve(conn, token) do
     cond do
       Plug.Crypto.secure_compare(token, Token.get()) ->
-        assign(conn, :caller, :supervisor)
+        authorize(conn, :supervisor)
 
       match?({:ok, _}, addon_identity(token)) ->
         {:ok, identity} = addon_identity(token)
-        assign(conn, :caller, {:addon, identity})
+        authorize(conn, {:addon, identity})
 
       true ->
         unauthorized(conn)
+    end
+  end
+
+  # Grade the caller, record both halves on the conn, and refuse a path it
+  # cannot reach. `:tier` is assigned even on the refusal path so a handler or
+  # a test observing a halted conn sees why.
+  defp authorize(conn, caller) do
+    tier = Tiers.caller_tier(caller)
+
+    conn =
+      conn
+      |> assign(:caller, caller)
+      |> assign(:tier, tier)
+
+    if Tiers.allows?(tier, Tiers.required(conn.path_info)) do
+      conn
+    else
+      # 403, matching upstream's `HTTPForbidden` for a token that resolves but
+      # has no role for the path (`security.py`'s final `raise`), and matching
+      # the router's own wrong-caller shape (`supervisor_only/2`).
+      Envelope.send_error(conn, "unauthorized", 403)
     end
   end
 

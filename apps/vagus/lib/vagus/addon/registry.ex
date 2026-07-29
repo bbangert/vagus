@@ -11,8 +11,17 @@ defmodule Vagus.Addon.Registry do
   supervisor token itself.
 
   Identity: `%{slug, services_role: %{service => role}, auth_api: bool,
-  discovery: [service]}` — derived from the add-on's `config.yaml`
-  (`services`/`auth_api`/`discovery`).
+  discovery: [service], hassio_api: bool, hassio_role: role}` — derived from
+  the add-on's `config.yaml`
+  (`services`/`auth_api`/`discovery`/`hassio_api`/`hassio_role`).
+
+  `hassio_api`/`hassio_role` are what `Vagus.API.Tiers` grades the caller with.
+  `Vagus.Addon.Config` has parsed both since M4, but this struct dropped them,
+  so the emulator's caller model was binary — supervisor or add-on — and every
+  route without a hand-placed guard was admin-tier to any installed add-on
+  (the 2026-07-29 audit's A1/A2). Carrying them is additive: nothing is
+  persisted from here, so a running add-on simply re-registers with the two
+  extra keys on its next start.
   """
 
   use GenServer
@@ -22,7 +31,9 @@ defmodule Vagus.Addon.Registry do
           slug: String.t(),
           services_role: %{optional(String.t()) => role()},
           auth_api: boolean(),
-          discovery: [String.t()]
+          discovery: [String.t()],
+          hassio_api: boolean(),
+          hassio_role: String.t()
         }
 
   def start_link(opts \\ []) do
@@ -70,7 +81,9 @@ defmodule Vagus.Addon.Registry do
       slug: config.slug,
       services_role: services_role,
       auth_api: config.auth_api,
-      discovery: config.discovery
+      discovery: config.discovery,
+      hassio_api: config.hassio_api,
+      hassio_role: config.hassio_role
     }
   end
 

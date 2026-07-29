@@ -104,6 +104,11 @@ defmodule Vagus.API.IngressProxyTest do
     start_supervised!(HitCounter)
     start_supervised!({Vagus.Ingress, []})
     start_supervised!({Finch, name: Vagus.Ingress.Finch})
+    # The unbound sibling pool. `Vagus.API.Supervisor` starts both on a real
+    # device, and the fake add-on here lives on 127.0.0.1 — i.e. exactly the
+    # loopback case `finch_for/1` routes to this pool, so without it every
+    # proxy test 500s on an unknown registry.
+    start_supervised!({Finch, name: Vagus.Ingress.LocalFinch})
     start_supervised!({Finch, name: @client_finch})
 
     addon_pid =
@@ -252,6 +257,30 @@ defmodule Vagus.API.IngressProxyTest do
   end
 
   ## 4. Header handling
+
+  # The fake add-on is on 127.0.0.1, so `finch_for/1` must route it to the
+  # UNBOUND pool. Every other test in this file starts both pools, and on
+  # `:host` they are configured identically (`source_bind_opts/0` is `[]` with
+  # no `:ingress_source_ip`) — so inverting `finch_for/1` would change nothing
+  # observable and the whole suite would still pass. That is exactly what
+  # review round 2 found.
+  #
+  # Stopping the BOUND pool makes the choice observable: if the proxy picks it
+  # for a loopback target, Finch raises on the unknown registry and the request
+  # 500s instead of 200ing. This is the only test that pins the routing rather
+  # than the rule (`Vagus.NetworkTest` covers `source_bind_opts/1` itself).
+  test "a loopback target is dialled through the unbound pool, not the anchor-bound one",
+       %{proxy_base: base, token: token} do
+    {:ok, session} = Vagus.Ingress.create_session()
+
+    :ok = stop_supervised(Vagus.Ingress.Finch)
+
+    resp = req(:get, "#{base}/ingress/#{token}/", [cookie_header(session)])
+
+    assert resp.status == 200,
+           "loopback target was not routed to Vagus.Ingress.LocalFinch " <>
+             "(got #{resp.status} — finch_for/1 picked the bound pool)"
+  end
 
   test "strips supervisor/hop-by-hop headers, appends x-forwarded-for, passes custom headers through",
        %{proxy_base: base, token: token} do

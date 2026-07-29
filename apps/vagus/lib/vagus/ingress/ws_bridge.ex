@@ -378,10 +378,12 @@ defmodule Vagus.Ingress.WSBridge.Upstream do
     connect_opts = [
       mode: :active,
       protocols: [:http1],
-      # Same source-address bind as the plain-HTTP leg (see
-      # `Vagus.Network.source_bind_opts/0`): add-ons that filter on client
-      # IP expect the supervisor anchor .2, not the bridge gateway .1.
-      transport_opts: Vagus.Network.source_bind_opts()
+      # Same source-address rule as the plain-HTTP leg: a bridge add-on that
+      # filters on client IP expects the supervisor anchor .2, not the bridge
+      # gateway .1 — but a `host_network: true` add-on is reached on loopback,
+      # where binding .2 makes it see a non-local peer and refuse. Keyed on
+      # the destination, so both hold (`Vagus.Network.source_bind_opts/1`).
+      transport_opts: Vagus.Network.source_bind_opts(ip)
     ]
 
     case Mint.HTTP.connect(:http, ip, port, connect_opts) do

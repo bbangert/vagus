@@ -22,7 +22,7 @@ defmodule Vagus.Backups do
 
   require Logger
 
-  alias Vagus.Addon.{Config, Manager, State}
+  alias Vagus.Addon.{Config, Manager, OptionsSchema, State}
   alias Vagus.Runtime.Docker
 
   @default_data_root "/data"
@@ -493,16 +493,74 @@ defmodule Vagus.Backups do
   # match, which would raise (surfacing as a 500) instead of the honest
   # partial-failure this already is.
   defp finish_restore(slug, addon, opts) do
-    case State.put_options(slug, get_in(addon, ["user", "options"]) || %{}) do
-      :ok ->
+    case restorable_options(slug, addon) do
+      {:ok, options} ->
+        case State.put_options(slug, options) do
+          :ok ->
+            maybe_start(slug, addon, opts)
+
+          :error ->
+            Logger.warning(
+              "Vagus.Backups: #{slug} was uninstalled mid-restore — options not restored, restart skipped"
+            )
+
+            :ok
+        end
+
+      :reject ->
         maybe_start(slug, addon, opts)
+    end
+  end
 
+  # The tar's `user.options` validated against the INSTALLED add-on's schema,
+  # exactly as `POST /addons/{slug}/options` validates a save
+  # (`Vagus.API.Router`'s `validate_options_key/2`). A save path and a restore
+  # path that disagree about what is a legal option map is the same class of
+  # bug the save-side validation was written to prevent, and the tar is the
+  # less trustworthy of the two inputs: since the 2026-07-29 audit's A4 the
+  # `/backups` family is reachable by a `hassio_role: backup` add-on, and both
+  # the tar's bytes and the slug it names are then caller-controlled.
+  #
+  # Scope, stated precisely because an earlier version of this comment claimed
+  # more (review round 2). This closes the *options* half only, and only as
+  # far as the victim's own schema is narrow: `OptionsSchema.validate/3`
+  # returns options unchanged for `schema: false`, so an add-on that declares
+  # no schema still accepts anything — by its own declaration, and matching
+  # upstream. The larger half of a hostile restore is the `/data` swap in
+  # `swap_and_finish/5`, which this does not touch at all. Bounding *that*
+  # needs the restore surface itself gated, not the options validated.
+  #
+  # Invalid options are dropped with a warning rather than failing the
+  # restore: the data dir has already been swapped by this point, and an
+  # add-on whose schema legitimately tightened between the backup and now
+  # (back up at v1, upgrade to v2, restore) must not be left half-restored by
+  # a hard failure. The add-on keeps the options it already had, which is the
+  # conservative end of both cases.
+  defp restorable_options(slug, addon) do
+    options = get_in(addon, ["user", "options"]) || %{}
+
+    case State.get(slug) do
+      # Not tracked in `State`. Pass through — `put_options/2` reports
+      # `:error` itself and the caller logs the uninstalled-mid-restore case.
       :error ->
-        Logger.warning(
-          "Vagus.Backups: #{slug} was uninstalled mid-restore — options not restored, restart skipped"
-        )
+        {:ok, options}
 
-        :ok
+      {:ok, %{config: config}} ->
+        case OptionsSchema.effective(config.schema, config.options, options) do
+          {:ok, _validated} ->
+            # Persist the RAW map, not the validated one — same as the save
+            # path, which stores what the caller sent and re-validates on
+            # every read.
+            {:ok, options}
+
+          {:error, reason} ->
+            Logger.warning(
+              "Vagus.Backups: #{slug}'s backed-up options do not validate against its " <>
+                "installed schema (#{reason}) — keeping the current options, restore continuing"
+            )
+
+            :reject
+        end
     end
   end
 

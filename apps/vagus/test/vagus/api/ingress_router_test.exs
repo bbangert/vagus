@@ -22,16 +22,27 @@ defmodule Vagus.API.IngressRouterTest do
     :ok
   end
 
-  defp addon_token(slug) do
+  # `grants` defaults to the closed shape a plain add-on registers with
+  # (`hassio_api: false`); pass `%{hassio_api: true, hassio_role: "admin"}` to
+  # exercise a caller that clears `Vagus.API.Tiers`' gate and reaches the
+  # handler's own guard.
+  defp addon_token(slug, grants \\ %{}) do
     token = "tok-#{System.unique_integer([:positive])}"
 
-    :ok =
-      Registry.register(token, %{
-        slug: slug,
-        services_role: %{},
-        auth_api: false,
-        discovery: []
-      })
+    identity =
+      Map.merge(
+        %{
+          slug: slug,
+          services_role: %{},
+          auth_api: false,
+          discovery: [],
+          hassio_api: false,
+          hassio_role: "default"
+        },
+        grants
+      )
+
+    :ok = Registry.register(token, identity)
 
     on_exit(fn -> Registry.unregister_slug(slug) end)
 
@@ -57,10 +68,22 @@ defmodule Vagus.API.IngressRouterTest do
       assert session =~ ~r/\A[0-9a-f]{128}\z/
     end
 
-    test "an add-on caller gets 401 (Core-only)" do
-      token = addon_token("core_esphome")
+    # Two layers, two statuses — upstream's order, not a contradiction:
+    # `/ingress/…` appears in no role below `role_access[admin]`, so a
+    # non-admin add-on never reaches the handler and the middleware's
+    # `HTTPForbidden` (403) is what it sees. An admin-role add-on clears that
+    # and then meets `@require_home_assistant`, which raises
+    # `HTTPUnauthorized` — the one place a wrong-caller rejection is a 401.
+    test "an admin-tier add-on caller gets 401 (Core-only)" do
+      token = addon_token("core_esphome", %{hassio_api: true, hassio_role: "admin"})
       conn = call(:post, "/ingress/session", token)
       assert conn.status == 401
+    end
+
+    test "a plain add-on caller gets 403 from the tier gate, before the handler" do
+      token = addon_token("core_esphome_plain")
+      conn = call(:post, "/ingress/session", token)
+      assert conn.status == 403
     end
 
     test "an optional session_data_user_id is accepted and ignored" do
@@ -96,13 +119,22 @@ defmodule Vagus.API.IngressRouterTest do
       assert conn.status == 400
     end
 
-    test "an add-on caller gets 401 (Core-only)" do
-      token = addon_token("core_esphome")
+    test "an admin-tier add-on caller gets 401 (Core-only)" do
+      token = addon_token("core_esphome", %{hassio_api: true, hassio_role: "admin"})
 
       conn =
         call(:post, "/ingress/validate_session", token, %{"session" => "whatever"})
 
       assert conn.status == 401
+    end
+
+    test "a plain add-on caller gets 403 from the tier gate, before the handler" do
+      token = addon_token("core_esphome_plain")
+
+      conn =
+        call(:post, "/ingress/validate_session", token, %{"session" => "whatever"})
+
+      assert conn.status == 403
     end
   end
 
@@ -182,8 +214,21 @@ defmodule Vagus.API.IngressRouterTest do
       refute Map.has_key?(body(conn)["data"]["panels"], "plain_panels")
     end
 
-    test "an add-on caller may also read it (not Core-only, unlike session routes)" do
+    # Audit A5. `no_security_check` exempts only the proxy path
+    # `/ingress/[-_A-Za-z0-9]+/.*`, so `/ingress/panels` falls through to the
+    # role table — where no role below `role_access[admin]` lists an
+    # `/ingress/…` alternative. Vagus served it to every installed add-on,
+    # which is an inventory of the others.
+    test "a plain add-on caller is refused — the route is admin-tier upstream" do
       token = addon_token("core_esphome_panels_reader")
+      conn = call(:get, "/ingress/panels", token)
+      assert conn.status == 403
+    end
+
+    test "an admin-tier add-on caller may read it" do
+      token =
+        addon_token("core_esphome_panels_admin", %{hassio_api: true, hassio_role: "admin"})
+
       conn = call(:get, "/ingress/panels", token)
       assert conn.status == 200
     end

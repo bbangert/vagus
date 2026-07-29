@@ -28,16 +28,23 @@ defmodule Vagus.API.AuthRouterTest do
     :ok
   end
 
-  defp addon_token(slug, auth_api) do
+  defp addon_token(slug, auth_api, grants \\ %{}) do
     token = "tok-#{System.unique_integer([:positive])}"
 
-    :ok =
-      Registry.register(token, %{
-        slug: slug,
-        services_role: %{},
-        auth_api: auth_api,
-        discovery: []
-      })
+    identity =
+      Map.merge(
+        %{
+          slug: slug,
+          services_role: %{},
+          auth_api: auth_api,
+          discovery: [],
+          hassio_api: false,
+          hassio_role: "default"
+        },
+        grants
+      )
+
+    :ok = Registry.register(token, identity)
 
     on_exit(fn -> Registry.unregister_slug(slug) end)
     token
@@ -128,14 +135,42 @@ defmodule Vagus.API.AuthRouterTest do
     assert conn.status == 403
   end
 
-  test "DELETE /auth/cache clears the cache for an auth_api add-on" do
-    token = addon_token("core_mosquitto", true)
+  # Audit A6/B2. `/auth/cache` is NOT part of the `auth_api` grant surface —
+  # upstream puts it in `role_access[manager]` (security.py L135) and its
+  # handler makes no `access_auth_api` check at all. Vagus had both halves
+  # backwards: an `auth_api: true` default-role add-on was let in, and Core
+  # itself was refused, so any Core-side cache reset failed.
+  describe "DELETE /auth/cache" do
+    test "Core's own token clears the cache" do
+      conn =
+        conn(:delete, "/auth/cache", "")
+        |> put_req_header("authorization", "Bearer #{Vagus.API.Token.get()}")
+        |> Vagus.API.Router.call(@opts)
 
-    conn =
-      conn(:delete, "/auth/cache", "")
-      |> put_req_header("x-supervisor-token", token)
-      |> Vagus.API.Router.call(@opts)
+      assert conn.status == 200
+    end
 
-    assert conn.status == 200
+    test "a manager-role add-on clears the cache" do
+      token =
+        addon_token("core_manager", false, %{hassio_api: true, hassio_role: "manager"})
+
+      conn =
+        conn(:delete, "/auth/cache", "")
+        |> put_req_header("x-supervisor-token", token)
+        |> Vagus.API.Router.call(@opts)
+
+      assert conn.status == 200
+    end
+
+    test "an auth_api add-on without the manager role is refused" do
+      token = addon_token("core_mosquitto", true, %{hassio_api: true, hassio_role: "default"})
+
+      conn =
+        conn(:delete, "/auth/cache", "")
+        |> put_req_header("x-supervisor-token", token)
+        |> Vagus.API.Router.call(@opts)
+
+      assert conn.status == 403
+    end
   end
 end

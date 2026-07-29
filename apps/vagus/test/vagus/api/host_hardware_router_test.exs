@@ -22,12 +22,17 @@ defmodule Vagus.API.HostHardwareRouterTest do
     |> Router.call(@opts)
   end
 
-  defp get_as_addon(path) do
+  defp get_as_addon(path, grants \\ %{hassio_api: true, hassio_role: "default"}) do
     token = "tok-#{System.unique_integer([:positive])}"
     slug = "host_hardware_test_addon"
 
-    :ok =
-      Registry.register(token, %{slug: slug, services_role: %{}, auth_api: false, discovery: []})
+    identity =
+      Map.merge(
+        %{slug: slug, services_role: %{}, auth_api: false, discovery: []},
+        grants
+      )
+
+    :ok = Registry.register(token, identity)
 
     on_exit(fn -> Registry.unregister_slug(slug) end)
 
@@ -113,5 +118,15 @@ defmodule Vagus.API.HostHardwareRouterTest do
     assert get_as_addon("/host/disks/default/usage").status == 403
     assert get_as_addon("/os/datadisk/list").status == 403
     assert get_as_addon("/hardware/info").status == 200
+  end
+
+  # `/.+/info` is `role_access[default]`, but upstream only consults
+  # `role_access` at all once `app.access_hassio_api` holds (security.py
+  # L360). An add-on that never asked for API access reads nothing — this is
+  # the half of audit A1 that the identity change exists to restore, and it
+  # was the reason every route without a hand-placed guard was open.
+  test "an add-on that declared no hassio_api reads nothing, not even a default-tier info" do
+    assert get_as_addon("/hardware/info", %{hassio_api: false, hassio_role: "admin"}).status ==
+             403
   end
 end

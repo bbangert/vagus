@@ -466,10 +466,15 @@ defmodule Vagus.API.Router do
 
   # -- Addon lifecycle (M4-P3-T1; §A1.1) -------------------------------------
   #
-  # Every route here is supervisor-only (Core drives install/start/stop from
-  # the frontend's addon dashboard; an add-on never manages its own or
-  # another's lifecycle) — a non-supervisor caller gets a 403 before any
-  # `Manager`/`Store` call.
+  # Install/update are supervisor-only (Core drives them from the frontend's
+  # addon dashboard) — a non-supervisor caller gets a 403 from
+  # `Vagus.API.Tiers` before any `Manager`/`Store` call. Upstream would admit
+  # `ROLE_MANAGER`; stricter is fine and these keep the tier they shipped
+  # with.
+  #
+  # start/stop/restart/uninstall/options additionally admit the literal slug
+  # `self`, matching upstream's `api_bypass` (`security.py` L97) — an add-on
+  # may manage *itself*, never another. See `lifecycle_action/3`.
 
   # Store slug is rewritten onto the parsed config (a store entry's own
   # `config.slug` is the add-on's bare slug, e.g. "mosquitto"; installed
@@ -511,22 +516,22 @@ defmodule Vagus.API.Router do
   end
 
   post "/addons/:slug/start" do
-    lifecycle_action(conn, slug, fn -> Manager.start_slug(slug) end)
+    lifecycle_action(conn, slug, &Manager.start_slug/1)
   end
 
   post "/addons/:slug/stop" do
-    lifecycle_action(conn, slug, fn -> Manager.stop(slug) end)
+    lifecycle_action(conn, slug, &Manager.stop/1)
   end
 
   post "/addons/:slug/restart" do
-    lifecycle_action(conn, slug, fn -> Manager.restart(slug) end)
+    lifecycle_action(conn, slug, &Manager.restart/1)
   end
 
   # `{"remove_config": bool}` is accepted (Core's `AddonsOptions`/uninstall
   # payload) and ignored — this emulator has no separate "keep config"
   # retention to honor; `Manager.uninstall/2` always purges the data dir.
   post "/addons/:slug/uninstall" do
-    lifecycle_action(conn, slug, fn -> Manager.uninstall(slug) end)
+    lifecycle_action(conn, slug, &Manager.uninstall/1)
   end
 
   # `POST /addons/{slug}/options` (SCHEMA_OPTIONS). Implements three keys:
@@ -717,11 +722,19 @@ defmodule Vagus.API.Router do
   # Raw-dict path in Core (no aiohasupervisor model) — `data["panels"]` is a
   # map of addon-slug → panel config. Backed by `Vagus.Ingress.Panels.list/1`
   # (IW-P2-T3; §B4.1) — one entry per installed ingress-capable add-on,
-  # `enable` reflecting its `ingress_panel` toggle. Auth is unchanged: §B1.4
-  # explicitly does NOT put this route in the ingress-proxy's
-  # no-security-check bypass, so it goes through the router's normal
-  # token-validation middleware like every other route (any authenticated
-  # caller, not just the supervisor/Core).
+  # `enable` reflecting its `ingress_panel` toggle. §B1.4 explicitly does NOT
+  # put this route in the ingress-proxy's no-security-check bypass — that
+  # covers only the per-request proxy path `/ingress/{token}/.*` — so it goes
+  # through normal token validation like every other route.
+  #
+  # It then needs `ROLE_ADMIN`, not merely a valid token (audit A5): upstream
+  # lists no `/ingress/…` alternative in any role below admin
+  # (`security.py` L129-158), so this falls through to `role_access[admin]`.
+  # `Vagus.API.Tiers`' catch-all is that fallthrough, which is why there is no
+  # entry for the route in its table and no guard here. The body carries no
+  # secrets — `Vagus.Ingress.Panels.list/1` emits title/icon/admin/enable only
+  # — but serving every installed add-on an inventory of the others is still a
+  # disclosure upstream does not make.
   get "/ingress/panels" do
     Envelope.send_ok(conn, %{panels: Vagus.Ingress.Panels.list()})
   end
@@ -840,62 +853,60 @@ defmodule Vagus.API.Router do
   # found"). aiohasupervisor `BackupList` requires only `backups`;
   # `GET /backups/info` (`BackupsInfo`) additionally requires
   # `days_until_stale` (Supervisor default: 30). Backed by `Vagus.Backups`
-  # (M4-P6-T2; §A4) — supervisor-caller only, same as the rest of the
-  # backup surface below.
+  # (M4-P6-T2; §A4).
+  #
+  # Auth is `Vagus.API.Tiers`' `:backup` requirement for the whole family —
+  # upstream's `ROLE_BACKUP` (`security.py` L123-128, `/backups.*`), which
+  # `ROLE_MANAGER`/`ROLE_ADMIN` and Core also satisfy. These routes were
+  # `supervisor_only/2` until the 2026-07-29 audit (finding A4): a backup
+  # add-on declaring `hassio_role: backup` exists precisely to drive them, and
+  # refusing it broke assumed behaviour. The two `/…/info` reads grade one
+  # step lower still (`role_access[default]`'s `/.+/info`), exactly as
+  # upstream does.
 
   get "/backups" do
-    supervisor_only(conn, fn ->
-      entries = Backups.list() |> Enum.map(&backup_list_entry/1)
-      Envelope.send_ok(conn, %{backups: entries})
-    end)
+    entries = Backups.list() |> Enum.map(&backup_list_entry/1)
+    Envelope.send_ok(conn, %{backups: entries})
   end
 
   get "/backups/info" do
-    supervisor_only(conn, fn ->
-      entries = Backups.list() |> Enum.map(&backup_list_entry/1)
-      Envelope.send_ok(conn, %{backups: entries, days_until_stale: 30})
-    end)
+    entries = Backups.list() |> Enum.map(&backup_list_entry/1)
+    Envelope.send_ok(conn, %{backups: entries, days_until_stale: 30})
   end
 
   get "/backups/:slug/info" do
-    supervisor_only(conn, fn ->
-      case Backups.get(slug) do
-        {:ok, entry} -> Envelope.send_ok(conn, backup_info(entry))
-        :error -> Envelope.send_error(conn, "Backup does not exist", 404)
-      end
-    end)
+    case Backups.get(slug) do
+      {:ok, entry} -> Envelope.send_ok(conn, backup_info(entry))
+      :error -> Envelope.send_error(conn, "Backup does not exist", 404)
+    end
   end
 
   post "/backups/new/partial" do
-    supervisor_only(conn, fn -> handle_backup_new_partial(conn, conn.body_params) end)
+    handle_backup_new_partial(conn, conn.body_params)
   end
 
   post "/backups/new/upload" do
-    supervisor_only(conn, fn -> handle_backup_upload(conn) end)
+    handle_backup_upload(conn)
   end
 
   post "/backups/:slug/restore/partial" do
-    supervisor_only(conn, fn -> handle_backup_restore(conn, slug, conn.body_params) end)
+    handle_backup_restore(conn, slug, conn.body_params)
   end
 
   get "/backups/:slug/download" do
-    supervisor_only(conn, fn -> handle_backup_download(conn, slug) end)
+    handle_backup_download(conn, slug)
   end
 
   delete "/backups/:slug" do
-    supervisor_only(conn, fn ->
-      case Backups.delete(slug) do
-        :ok -> Envelope.send_ok(conn, %{})
-        :error -> Envelope.send_error(conn, "Backup does not exist", 404)
-      end
-    end)
+    case Backups.delete(slug) do
+      :ok -> Envelope.send_ok(conn, %{})
+      :error -> Envelope.send_error(conn, "Backup does not exist", 404)
+    end
   end
 
   post "/backups/reload" do
-    supervisor_only(conn, fn ->
-      :ok = Backups.reload()
-      Envelope.send_ok(conn, %{})
-    end)
+    :ok = Backups.reload()
+    Envelope.send_ok(conn, %{})
   end
 
   # -- Add-on service registry (§A3.1) ---------------------------------------
@@ -962,13 +973,18 @@ defmodule Vagus.API.Router do
     handle_auth(conn)
   end
 
+  # Unlike `GET|POST /auth`, this is NOT an `auth_api` grant route. Upstream
+  # puts `/auth/cache` in `role_access[manager]` (`security.py` L135) and its
+  # handler (`api/auth.py::cache`) makes no `access_auth_api` check at all —
+  # so Core's own token works and a `hassio_role: default` add-on's does not,
+  # whatever its `auth_api` flag says. Vagus had it exactly inverted (audit
+  # A6/B2): an `auth_api: true` default-role add-on was admitted and Core was
+  # refused with 403, so any Core-side flow clearing the Supervisor auth cache
+  # failed. `Vagus.API.Tiers` now carries the whole check — `:manager` — and
+  # there is nothing left for the handler to decide.
   delete "/auth/cache" do
-    if match?({:addon, %{auth_api: true}}, conn.assigns.caller) do
-      :ok = Vagus.Auth.reset_cache()
-      Envelope.send_ok(conn, %{})
-    else
-      Envelope.send_error(conn, "Caller is not allowed to access the auth API", 403)
-    end
+    :ok = Vagus.Auth.reset_cache()
+    Envelope.send_ok(conn, %{})
   end
 
   # -- Entry setup (once) ----------------------------------------------------
@@ -1805,9 +1821,6 @@ defmodule Vagus.API.Router do
     end
   end
 
-  # Shared supervisor-only-caller + result-mapping wrapper for
-  # start/stop/restart/uninstall — all four share the same
-  # `:ok | {:ok, _} | {:error, :not_found} | {:error, reason}` result shape.
   # `POST /store/addons/{slug}/update` (+ the `/update/{version}` and legacy
   # `/addons/...` forms). Body is `{"backup": bool?, "background": bool?}`;
   # unknown keys are ignored, matching the aiohttp tolerance the request
@@ -1896,30 +1909,58 @@ defmodule Vagus.API.Router do
 
   defp update_error_message(other), do: inspect(other)
 
+  # Shared caller guard + result mapping for start/stop/restart/uninstall —
+  # all four share the same `:ok | {:ok, _} | {:error, :not_found} |
+  # {:error, reason}` result shape.
+  #
+  # `resolve_info_slug/2` rather than `supervisor_only/2` (audit A3): upstream's
+  # `api_bypass` is `/addons/self/(?!security|update)[^/]+` (`security.py`
+  # L97), so an add-on may start, stop, restart, reconfigure and uninstall
+  # **itself** using the literal slug `self`, and `Vagus.API.Tiers` admits
+  # exactly that path. Any other slug from an add-on caller is `:supervisor`
+  # in the table, so this resolver only ever sees `self` or Core — but it is
+  # what maps `self` onto the caller's own slug, and it is the guard if the
+  # table is ever widened. Core still reaches any slug.
   defp lifecycle_action(conn, slug, fun) do
-    if conn.assigns.caller == :supervisor do
-      case fun.() do
-        :ok -> Envelope.send_ok(conn, %{})
-        {:ok, _} -> Envelope.send_ok(conn, %{})
-        {:error, :not_found} -> Envelope.send_error(conn, "Addon #{slug} does not exist", 404)
-        {:error, reason} -> Envelope.send_error(conn, inspect(reason), 400)
-      end
-    else
-      Envelope.send_error(conn, "unauthorized", 403)
+    case resolve_info_slug(slug, conn.assigns.caller) do
+      {:ok, resolved} ->
+        case fun.(resolved) do
+          :ok ->
+            Envelope.send_ok(conn, %{})
+
+          {:ok, _} ->
+            Envelope.send_ok(conn, %{})
+
+          {:error, :not_found} ->
+            Envelope.send_error(conn, "Addon #{resolved} does not exist", 404)
+
+          {:error, reason} ->
+            Envelope.send_error(conn, inspect(reason), 400)
+        end
+
+      {:error, :forbidden} ->
+        Envelope.send_error(conn, "unauthorized", 403)
     end
   end
 
+  # Same `self`-resolution as `lifecycle_action/3` — `/addons/self/options` is
+  # one segment, so upstream bypasses it. Note the deliberate asymmetry with
+  # `handle_addon_options_validate/2` below, which stays supervisor-only:
+  # `/addons/self/options/validate` is *two* segments and so falls outside
+  # `[^/]+`. That is upstream's own shape, not an oversight here.
   defp handle_addon_options(conn, slug) do
-    if conn.assigns.caller == :supervisor do
-      case State.get(slug) do
-        :error ->
-          Envelope.send_error(conn, "Addon #{slug} does not exist", 404)
+    case resolve_info_slug(slug, conn.assigns.caller) do
+      {:ok, resolved} ->
+        case State.get(resolved) do
+          :error ->
+            Envelope.send_error(conn, "Addon #{resolved} does not exist", 404)
 
-        {:ok, %{config: config}} ->
-          apply_addon_options(conn, slug, config, conn.body_params)
-      end
-    else
-      Envelope.send_error(conn, "unauthorized", 403)
+          {:ok, %{config: config}} ->
+            apply_addon_options(conn, resolved, config, conn.body_params)
+        end
+
+      {:error, :forbidden} ->
+        Envelope.send_error(conn, "unauthorized", 403)
     end
   end
 
@@ -2091,10 +2132,16 @@ defmodule Vagus.API.Router do
 
   # -- backup helpers (M4-P6-T2; §A4) -----------------------------------------
 
-  # Shared supervisor-only-caller guard for every `/backups...` route and the
-  # `/core...`/`/homeassistant...` lifecycle routes above — Core drives
-  # backups and its own lifecycle from the frontend, an add-on never manages
-  # either.
+  # Shared supervisor-only-caller guard for the `/core...`/`/homeassistant...`
+  # lifecycle routes and the store install/update routes — Core drives its own
+  # lifecycle and the addon dashboard from the frontend, an add-on never
+  # manages either.
+  #
+  # Redundant with `Vagus.API.Tiers`' `:supervisor` requirement for the same
+  # paths, and deliberately kept: the table is a coarse pre-filter over
+  # `path_info`, this is the handler asserting its own contract. Belt and
+  # braces is the right posture for the routes that stop and rebuild Core.
+  # (The `/backups...` routes no longer use it — see audit A4.)
   defp supervisor_only(conn, fun) do
     if conn.assigns.caller == :supervisor,
       do: fun.(),
@@ -2227,13 +2274,28 @@ defmodule Vagus.API.Router do
   # the real Supervisor's tolerance of arbitrary multipart field naming.
   #
   # Multipart parsing happens HERE (B1), not on the router-wide
-  # `Plug.Parsers` — by the time this runs, `Vagus.API.Auth` and
-  # `supervisor_only/2` (this route's caller only reaches here through that
-  # wrapper) have already gated the request to an authenticated supervisor
-  # caller, so the 256MB/disk-spooling multipart parse only ever happens for
-  # that caller. The body is still unread at this point (the router-wide
-  # parser passed it through, `pass: ["*/*"]`), so `parse_multipart/1` is
-  # reading it for the first time.
+  # `Plug.Parsers` — by the time this runs, `Vagus.API.Auth` has authenticated
+  # the caller AND graded it against `Vagus.API.Tiers`, so the
+  # 256MB/disk-spooling multipart parse only ever happens for a caller that
+  # cleared the `/backups.*` requirement. The body is still unread at this
+  # point (the router-wide parser passed it through, `pass: ["*/*"]`), so
+  # `parse_multipart/1` is reading it for the first time.
+  #
+  # That requirement is `:backup`, NOT supervisor-only — it was the latter
+  # until the 2026-07-29 audit's A4, and an earlier version of this comment
+  # still claimed `supervisor_only/2` gated the route. It does not: a
+  # `hassio_role: backup` add-on reaches here, which is upstream's own tier and
+  # deliberate.
+  #
+  # Nothing bounds concurrent uploads. A single-slot gate was tried and
+  # reverted (review round 2): holding a slot across a body read whose
+  # `read_timeout` resets per byte let one slow caller wedge every upload
+  # including Core's own — an unbounded availability risk in place of a
+  # bounded disk one — and it covered only this route while
+  # `/backups/new/partial`, `/restore/partial` and `/download` each hold a
+  # whole tar in caller memory too. Bounding this family is phase 4's job,
+  # alongside the 512/256MB caps it already owns; a gate on one of the four
+  # routes is not a bound, it just reads like one.
   # path is internal/config-derived, not request input
   # sobelow_skip ["Traversal.FileModule"]
   defp handle_backup_upload(conn) do

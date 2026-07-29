@@ -55,7 +55,15 @@ defmodule Vagus.API.IngressProxy do
   alias Vagus.Addon.State
   alias Vagus.Network
 
+  # Two pools, differing only in whether they bind the supervisor anchor as
+  # the source address; `finch_for/1` picks per request. See
+  # `Vagus.Network.source_bind_opts/1` for why the choice is keyed on the
+  # destination — a bridge add-on filtering on client IP needs the `.2`
+  # origin, a `host_network: true` add-on reached on loopback is refused by
+  # it. Finch fixes `conn_opts` per pool at startup, so this cannot be a
+  # per-request option.
   @finch Vagus.Ingress.Finch
+  @local_finch Vagus.Ingress.LocalFinch
 
   # 15 minutes — matches the ingress session's sliding-window idle timeout
   # (`Vagus.Ingress` §B1.2) and `Vagus.API.Supervisor`'s Thousand Island
@@ -282,9 +290,13 @@ defmodule Vagus.API.IngressProxy do
     acc = %{conn: conn, ref: ref, resolved?: ref == nil, status: nil, mode: nil}
 
     request
-    |> Finch.stream_while(@finch, acc, &handle_event/2, receive_timeout: @receive_timeout)
+    |> Finch.stream_while(finch_for(ip), acc, &handle_event/2, receive_timeout: @receive_timeout)
     |> finish()
   end
+
+  # A loopback destination is a `host_network: true` add-on (`resolve_ip/2`),
+  # which must be dialled without the anchor bind.
+  defp finch_for(ip), do: if(Network.loopback?(ip), do: @local_finch, else: @finch)
 
   # [DEVIATION from the task brief's stated premise]: `path_info` segments
   # are **not** percent-decoded by the time they reach a plug — confirmed
