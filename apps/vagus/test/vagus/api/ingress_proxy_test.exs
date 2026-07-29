@@ -104,6 +104,11 @@ defmodule Vagus.API.IngressProxyTest do
     start_supervised!(HitCounter)
     start_supervised!({Vagus.Ingress, []})
     start_supervised!({Finch, name: Vagus.Ingress.Finch})
+    # The unbound sibling pool. `Vagus.API.Supervisor` starts both on a real
+    # device, and the fake add-on here lives on 127.0.0.1 — i.e. exactly the
+    # loopback case `finch_for/1` routes to this pool, so without it every
+    # proxy test 500s on an unknown registry.
+    start_supervised!({Finch, name: Vagus.Ingress.LocalFinch})
     start_supervised!({Finch, name: @client_finch})
 
     addon_pid =

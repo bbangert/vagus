@@ -72,6 +72,50 @@ defmodule Vagus.Network do
     end
   end
 
+  @doc """
+  `source_bind_opts/0`, narrowed to the destination being dialled: `[]` for a
+  loopback destination, the anchor bind for anything else.
+
+  A `host_network: true` add-on has no `hassio` bridge address at all — its
+  ingress port is bound on the host itself, so
+  `Vagus.API.IngressProxy.resolve_ip/2` resolves it to `127.0.0.1`. Binding a
+  *non-loopback* source for a *loopback* destination makes the add-on see a
+  peer that isn't local, and an add-on that filters on that refuses the
+  request.
+
+  Device-observed on the rpi3, 2026-07-29, against ESPHome's device builder
+  (`host_network: true`): byte-identical requests to `127.0.0.1:63642` got
+  `200 OK` from an unbound socket and `403 Forbidden` from one bound to
+  `172.30.32.2`. The whole dashboard was unreachable through ingress.
+
+  Note the two rules pull in opposite directions and both are real — the
+  bridge case in `source_bind_opts/0`'s docs is a different add-on
+  (`core_configurator`) banning `172.30.32.1`. Hence keying on the
+  destination rather than picking one globally.
+  """
+  @spec source_bind_opts(:inet.ip_address() | String.t()) :: [{:ip, :inet.ip_address()}]
+  def source_bind_opts(destination) do
+    if loopback?(destination), do: [], else: source_bind_opts()
+  end
+
+  @doc """
+  Whether `ip` (a tuple or a string) is a loopback address.
+
+  Unparseable input is `false` — a destination we can't read is treated as
+  remote, which keeps the anchor bind rather than silently dropping it.
+  """
+  @spec loopback?(:inet.ip_address() | String.t()) :: boolean()
+  def loopback?(ip) when is_binary(ip) do
+    case :inet.parse_address(String.to_charlist(ip)) do
+      {:ok, addr} -> loopback?(addr)
+      {:error, _reason} -> false
+    end
+  end
+
+  def loopback?({127, _, _, _}), do: true
+  def loopback?({0, 0, 0, 0, 0, 0, 0, 1}), do: true
+  def loopback?(_ip), do: false
+
   defp parse_source_ip(ip) when is_binary(ip) do
     case :inet.parse_address(String.to_charlist(ip)) do
       {:ok, addr} -> [ip: addr]

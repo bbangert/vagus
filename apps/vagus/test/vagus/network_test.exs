@@ -42,6 +42,48 @@ defmodule Vagus.NetworkTest do
       end
     end
 
+    # The other half of the same rule, and it pulls the opposite way. A
+    # `host_network: true` add-on has no bridge address, so the proxy reaches
+    # it on the host's own loopback — and binding a non-loopback source there
+    # makes the add-on see a peer that isn't local. Device-observed on the
+    # rpi3 2026-07-29: byte-identical requests to ESPHome's device builder on
+    # 127.0.0.1:63642 got 200 unbound and **403 Forbidden** bound to .2, so
+    # the whole dashboard was unreachable through ingress. Both add-ons are
+    # real and they want opposite things; the destination decides.
+    test "a loopback destination gets no bind, even when one is configured" do
+      Application.put_env(:vagus, :ingress_source_ip, "172.30.32.2")
+
+      for dest <- ["127.0.0.1", "127.1.2.3", {127, 0, 0, 1}, "::1", {0, 0, 0, 0, 0, 0, 0, 1}] do
+        assert Network.source_bind_opts(dest) == [], "expected no bind for #{inspect(dest)}"
+      end
+    end
+
+    test "a bridge destination keeps the anchor bind" do
+      Application.put_env(:vagus, :ingress_source_ip, "172.30.32.2")
+
+      for dest <- ["172.30.32.5", {172, 30, 32, 5}, "192.168.2.10"] do
+        assert Network.source_bind_opts(dest) == [ip: {172, 30, 32, 2}],
+               "expected the anchor bind for #{inspect(dest)}"
+      end
+    end
+
+    test "an unreadable destination keeps the bind rather than silently dropping it" do
+      Application.put_env(:vagus, :ingress_source_ip, "172.30.32.2")
+      assert Network.source_bind_opts("not-an-ip") == [ip: {172, 30, 32, 2}]
+      refute Network.loopback?("not-an-ip")
+    end
+
+    test "loopback?/1 does not mistake a non-loopback address for one" do
+      # `172.30.32.1` and `10.x`/`192.168.x` are the addresses that MUST keep
+      # the bind — a false positive here silently reintroduces the .1 problem
+      # `source_bind_opts/0` exists to fix.
+      for ip <- ["172.30.32.1", "172.30.32.2", "192.168.2.149", "10.0.0.1", "128.0.0.1"] do
+        refute Network.loopback?(ip), "#{ip} was treated as loopback"
+      end
+
+      assert Network.loopback?("127.0.0.1")
+    end
+
     test "rejects malformed tuples rather than deferring the failure to connect()" do
       # These are tuples, so the old clause passed them straight through as
       # socket opts; the failure then surfaced inside connect() as an opaque

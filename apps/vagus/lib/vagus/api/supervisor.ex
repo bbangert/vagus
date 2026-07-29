@@ -67,6 +67,16 @@ defmodule Vagus.API.Supervisor do
                conn_opts: [transport_opts: Vagus.Network.source_bind_opts()]
              ]
            }},
+          # The same pool with NO source bind, for `host_network: true`
+          # add-ons — they have no bridge address, so the proxy reaches them
+          # on the host's own loopback, and binding a non-loopback source
+          # there makes the add-on see a non-local peer and refuse (ESPHome's
+          # device builder answers `403 Forbidden`; device-observed
+          # 2026-07-29). Finch fixes `conn_opts` per pool at startup, so
+          # "bind for bridge targets, don't for loopback" cannot be a
+          # per-request option — it has to be a second instance.
+          # `Vagus.API.IngressProxy` picks between them per request.
+          {Finch, name: Vagus.Ingress.LocalFinch, pools: %{default: [size: 4]}},
           {Bandit,
            plug: Vagus.API.Dispatcher,
            port: port,
