@@ -47,14 +47,37 @@ defmodule Vagus.Addon.RegistryTest do
         "image" => "x/y",
         "services" => ["mqtt:provide"],
         "auth_api" => true,
-        "discovery" => ["mqtt"]
+        "discovery" => ["mqtt"],
+        "hassio_api" => true,
+        "hassio_role" => "manager"
       })
 
     assert Registry.identity_from_config(config) == %{
              slug: "core_mosquitto",
              services_role: %{"mqtt" => "provide"},
              auth_api: true,
-             discovery: ["mqtt"]
+             discovery: ["mqtt"],
+             hassio_api: true,
+             hassio_role: "manager"
            }
+  end
+
+  # `hassio_api`/`hassio_role` are what `Vagus.API.Tiers` grades a caller
+  # with, and `Vagus.Addon.Config`'s defaults are the closed ones. An add-on
+  # that declares neither must arrive here as "no API access, default role" —
+  # if this silently became `hassio_api: true`, every installed add-on would
+  # regain the manager-tier reach the 2026-07-29 audit found (A1/A2).
+  test "identity_from_config defaults an add-on that declares no API access to closed" do
+    {:ok, config} =
+      Config.parse(%{
+        "name" => "M",
+        "version" => "1",
+        "slug" => "quiet",
+        "description" => "d",
+        "arch" => ["amd64"],
+        "image" => "x/y"
+      })
+
+    assert %{hassio_api: false, hassio_role: "default"} = Registry.identity_from_config(config)
   end
 end

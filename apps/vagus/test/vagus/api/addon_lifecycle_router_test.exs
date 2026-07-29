@@ -81,15 +81,25 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
     |> Router.call(@opts)
   end
 
-  defp addon_call(method, path, slug) do
+  defp addon_call(method, path, slug, body \\ nil) do
     token = "tok-#{System.unique_integer([:positive])}"
 
     :ok =
-      Registry.register(token, %{slug: slug, services_role: %{}, auth_api: false, discovery: []})
+      Registry.register(token, %{
+        slug: slug,
+        services_role: %{},
+        auth_api: false,
+        discovery: [],
+        hassio_api: false,
+        hassio_role: "default"
+      })
 
     on_exit(fn -> Registry.unregister_slug(slug) end)
 
-    conn(method, path)
+    conn = conn(method, path, body && Jason.encode!(body))
+    conn = if body, do: put_req_header(conn, "content-type", "application/json"), else: conn
+
+    conn
     |> put_req_header("x-supervisor-token", token)
     |> Router.call(@opts)
   end
@@ -177,11 +187,52 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
       assert conn.status == 404
     end
 
-    test "start/stop/restart are supervisor-only (403 for an add-on caller)", %{config: config} do
+    test "start/stop/restart by slug are supervisor-only (403 for an add-on caller)",
+         %{config: config} do
       :ok = State.put(config, :stopped)
       assert addon_call(:post, "/addons/core_lifecycle/start", "core_lifecycle").status == 403
       assert addon_call(:post, "/addons/core_lifecycle/stop", "core_lifecycle").status == 403
       assert addon_call(:post, "/addons/core_lifecycle/restart", "core_lifecycle").status == 403
+    end
+
+    # Audit A3. Upstream's `api_bypass` is
+    # `/addons/self/(?!security|update)[^/]+` (security.py L97): the literal
+    # slug `self` — and only that — lets an add-on drive its own lifecycle,
+    # whatever its role. Vagus 403'd it, so `bashio::addon.restart`-style
+    # self-management was impossible. Note the asymmetry with the test above:
+    # an add-on naming its OWN slug explicitly is still refused, because
+    # upstream's bypass keys on the literal `self`, not on identity.
+    test "an add-on may start/stop/restart ITSELF via the literal slug `self`",
+         %{config: config} do
+      :ok = State.put(config, :stopped)
+
+      assert addon_call(:post, "/addons/self/start", "core_lifecycle").status == 200
+      assert {:ok, %{state: :started}} = State.get("core_lifecycle")
+
+      assert addon_call(:post, "/addons/self/stop", "core_lifecycle").status == 200
+      assert {:ok, %{state: :stopped}} = State.get("core_lifecycle")
+
+      assert addon_call(:post, "/addons/self/restart", "core_lifecycle").status == 200
+      assert {:ok, %{state: :started}} = State.get("core_lifecycle")
+    end
+
+    test "`self` resolves to the CALLER's slug, never the target's", %{config: config} do
+      :ok = State.put(config, :stopped)
+
+      # A different add-on saying `self` acts on itself — which is not
+      # installed — so it gets a 404 about its own slug and core_lifecycle is
+      # untouched.
+      conn = addon_call(:post, "/addons/self/start", "core_intruder")
+      assert conn.status == 404
+      assert body(conn)["message"] =~ "core_intruder"
+      assert {:ok, %{state: :stopped}} = State.get("core_lifecycle")
+    end
+
+    # `(?!security|update)` — the two segments upstream carves out of the
+    # bypass. Self-update stays supervisor-only, matching upstream's own
+    # `APIForbidden("App … can't update itself!")` posture.
+    test "`/addons/self/update` is NOT bypassed" do
+      assert addon_call(:post, "/addons/self/update", "core_lifecycle").status == 403
     end
   end
 
@@ -212,11 +263,18 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
       assert conn.status == 404
     end
 
-    test "uninstall is supervisor-only (403)" do
+    test "uninstall by slug is supervisor-only (403)" do
       assert addon_call(:post, "/addons/core_uninstallme/uninstall", "core_uninstallme").status ==
                403
 
       assert {:ok, _} = State.get("core_uninstallme")
+    end
+
+    # Audit A3 — `uninstall` is a single segment, so upstream's `self` bypass
+    # covers it just like start/stop/restart.
+    test "an add-on may uninstall ITSELF via `self`" do
+      assert addon_call(:post, "/addons/self/uninstall", "core_uninstallme").status == 200
+      assert :error = State.get("core_uninstallme")
     end
   end
 
@@ -459,8 +517,24 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
       assert conn.status == 404
     end
 
-    test "options is supervisor-only (403)" do
+    test "options by slug is supervisor-only (403)" do
       assert addon_call(:post, "/addons/core_opts/options", "core_opts").status == 403
+    end
+
+    # Audit A3. `/addons/self/options` is one segment ⇒ bypassed; but
+    # `/addons/self/options/validate` is two ⇒ still supervisor-only. That
+    # asymmetry between saving and dry-running is upstream's `[^/]+`, not an
+    # oversight here, so both halves are pinned.
+    test "an add-on may set ITS OWN options via `self`, but not dry-run them" do
+      conn =
+        addon_call(:post, "/addons/self/options", "core_opts", %{
+          "options" => %{"greeting" => "hi"}
+        })
+
+      assert conn.status == 200
+      assert {:ok, %{user_options: %{"greeting" => "hi"}}} = State.get("core_opts")
+
+      assert addon_call(:post, "/addons/self/options/validate", "core_opts").status == 403
     end
 
     test "watchdog: true is persisted" do

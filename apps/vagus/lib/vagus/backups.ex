@@ -22,7 +22,7 @@ defmodule Vagus.Backups do
 
   require Logger
 
-  alias Vagus.Addon.{Config, Manager, State}
+  alias Vagus.Addon.{Config, Manager, OptionsSchema, State}
   alias Vagus.Runtime.Docker
 
   @default_data_root "/data"
@@ -34,6 +34,29 @@ defmodule Vagus.Backups do
   @doc "The resolved backup directory (for callers that need the raw path)."
   @spec dir(GenServer.server()) :: String.t()
   def dir(server \\ __MODULE__), do: GenServer.call(server, :dir)
+
+  @doc """
+  Claims the single upload slot, or `:busy`.
+
+  `POST /backups/new/upload` spools up to 256MB to disk per request. Until the
+  2026-07-29 audit's A4 that route was supervisor-only, so "one Core at a
+  time" bounded it implicitly; now a `hassio_role: backup` add-on can drive it,
+  and nothing else stops it firing concurrent uploads until a 1GB device runs
+  out of disk or file descriptors. Serialising them keeps the worst case at
+  one spool rather than N, without touching the size limit itself — that is
+  phase 4's call to make against a real HAOS backup.
+
+  The slot is monitored, so a caller that dies mid-parse frees it; callers
+  should still `release_upload_slot/1` in an `after`.
+  """
+  @spec acquire_upload_slot(GenServer.server()) :: :ok | :busy
+  def acquire_upload_slot(server \\ __MODULE__),
+    do: GenServer.call(server, {:acquire_upload, self()})
+
+  @doc "Releases the upload slot claimed by `acquire_upload_slot/1`."
+  @spec release_upload_slot(GenServer.server()) :: :ok
+  def release_upload_slot(server \\ __MODULE__),
+    do: GenServer.cast(server, {:release_upload, self()})
 
   @doc "All indexed backup entries (`%{backup, path, size_bytes}`)."
   @spec list(GenServer.server()) :: [map()]
@@ -179,11 +202,21 @@ defmodule Vagus.Backups do
   @impl GenServer
   def init(opts) do
     dir = Keyword.get(opts, :dir) || Path.join(data_root(opts), "backup")
-    {:ok, %{dir: dir, index: ensure_and_scan(dir)}}
+    {:ok, %{dir: dir, index: ensure_and_scan(dir), uploading: nil}}
   end
 
   @impl GenServer
   def handle_call(:dir, _from, %{dir: dir} = state), do: {:reply, dir, state}
+
+  # One in-flight upload at a time. The slot is held by a monitored pid, so a
+  # caller that crashes mid-parse (or whose connection dies) releases it
+  # without needing the router's `after` block to run.
+  def handle_call({:acquire_upload, pid}, _from, %{uploading: nil} = state) do
+    ref = Process.monitor(pid)
+    {:reply, :ok, %{state | uploading: {pid, ref}}}
+  end
+
+  def handle_call({:acquire_upload, _pid}, _from, state), do: {:reply, :busy, state}
 
   def handle_call(:list, _from, %{index: index} = state), do: {:reply, Map.values(index), state}
 
@@ -211,6 +244,22 @@ defmodule Vagus.Backups do
         {:reply, :error, state}
     end
   end
+
+  @impl GenServer
+  def handle_cast({:release_upload, pid}, %{uploading: {pid, ref}} = state) do
+    Process.demonitor(ref, [:flush])
+    {:noreply, %{state | uploading: nil}}
+  end
+
+  # Not the holder (a late release after a `:DOWN` already cleared it) — drop.
+  def handle_cast({:release_upload, _pid}, state), do: {:noreply, state}
+
+  @impl GenServer
+  def handle_info({:DOWN, ref, :process, pid, _reason}, %{uploading: {pid, ref}} = state) do
+    {:noreply, %{state | uploading: nil}}
+  end
+
+  def handle_info(_message, state), do: {:noreply, state}
 
   ## Internals — directory scan
 
@@ -493,16 +542,67 @@ defmodule Vagus.Backups do
   # match, which would raise (surfacing as a 500) instead of the honest
   # partial-failure this already is.
   defp finish_restore(slug, addon, opts) do
-    case State.put_options(slug, get_in(addon, ["user", "options"]) || %{}) do
-      :ok ->
+    case restorable_options(slug, addon) do
+      {:ok, options} ->
+        case State.put_options(slug, options) do
+          :ok ->
+            maybe_start(slug, addon, opts)
+
+          :error ->
+            Logger.warning(
+              "Vagus.Backups: #{slug} was uninstalled mid-restore — options not restored, restart skipped"
+            )
+
+            :ok
+        end
+
+      :reject ->
         maybe_start(slug, addon, opts)
+    end
+  end
 
+  # The tar's `user.options` validated against the INSTALLED add-on's schema,
+  # exactly as `POST /addons/{slug}/options` validates a save
+  # (`Vagus.API.Router`'s `validate_options_key/2`). A save path and a restore
+  # path that disagree about what is a legal option map is the same class of
+  # bug the save-side validation was written to prevent, and the tar is the
+  # less trustworthy of the two inputs: since the 2026-07-29 audit's A4 the
+  # `/backups` family is reachable by a `hassio_role: backup` add-on, and both
+  # the tar's bytes and the slug it names are then caller-controlled. Without
+  # this, restoring a crafted tar wrote arbitrary options into a *peer*
+  # add-on and restarted it.
+  #
+  # Invalid options are dropped with a warning rather than failing the
+  # restore: the data dir has already been swapped by this point, and an
+  # add-on whose schema legitimately tightened between the backup and now
+  # (back up at v1, upgrade to v2, restore) must not be left half-restored by
+  # a hard failure. The add-on keeps the options it already had, which is the
+  # conservative end of both cases.
+  defp restorable_options(slug, addon) do
+    options = get_in(addon, ["user", "options"]) || %{}
+
+    case State.get(slug) do
+      # Not tracked in `State`. Pass through — `put_options/2` reports
+      # `:error` itself and the caller logs the uninstalled-mid-restore case.
       :error ->
-        Logger.warning(
-          "Vagus.Backups: #{slug} was uninstalled mid-restore — options not restored, restart skipped"
-        )
+        {:ok, options}
 
-        :ok
+      {:ok, %{config: config}} ->
+        case OptionsSchema.effective(config.schema, config.options, options) do
+          {:ok, _validated} ->
+            # Persist the RAW map, not the validated one — same as the save
+            # path, which stores what the caller sent and re-validates on
+            # every read.
+            {:ok, options}
+
+          {:error, reason} ->
+            Logger.warning(
+              "Vagus.Backups: #{slug}'s backed-up options do not validate against its " <>
+                "installed schema (#{reason}) — keeping the current options, restore continuing"
+            )
+
+            :reject
+        end
     end
   end
 

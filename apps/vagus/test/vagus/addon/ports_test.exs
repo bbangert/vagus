@@ -94,4 +94,48 @@ defmodule Vagus.Addon.PortsTest do
       assert {:ok, %{}} = Ports.sanitize(config(%{"22/tcp" => nil}), %{"9999/tcp" => "nope"})
     end
   end
+
+  # Stricter than upstream, deliberately: since the 2026-07-29 audit's A3,
+  # `POST /addons/self/options` and `POST /addons/self/restart` are both
+  # reachable by the add-on itself, so without this an add-on could rebind one
+  # of its own declared ports onto the Supervisor API and race the real
+  # listener, entirely self-service.
+  describe "sanitize/2 — reserved host ports" do
+    test "Vagus's own API port is refused" do
+      api_port = Application.get_env(:vagus, :api_port, 8888)
+
+      assert {:error, message} =
+               Ports.sanitize(config(%{"22/tcp" => nil}), %{"22/tcp" => api_port})
+
+      assert message =~ "reserved"
+      assert message =~ to_string(api_port)
+    end
+
+    test "Core's port is refused" do
+      assert {:error, message} = Ports.sanitize(config(%{"22/tcp" => nil}), %{"22/tcp" => 8123})
+      assert message =~ "reserved"
+    end
+
+    test "reserved_host_ports/0 tracks the configured API port, not a baked-in constant" do
+      # The API port is 8888 on host and 80 on target — a compile-time
+      # constant here would silently protect the wrong port on device.
+      assert Application.get_env(:vagus, :api_port, 8888) in Ports.reserved_host_ports()
+      assert 8123 in Ports.reserved_host_ports()
+    end
+
+    test "ordinary privileged ports are still allowed" do
+      # NOT a blanket `< 1024` ban: AdGuard publishes 53, NGINX 443, Mosquitto
+      # 1883. Refusing those would break real add-ons for no security gain.
+      c = config(%{"53/udp" => nil, "443/tcp" => nil, "1883/tcp" => nil})
+
+      assert {:ok, %{"53/udp" => 53, "443/tcp" => 443, "1883/tcp" => 1883}} =
+               Ports.sanitize(c, %{"53/udp" => 53, "443/tcp" => 443, "1883/tcp" => 1883})
+    end
+
+    test "an undeclared key naming a reserved port is still just dropped" do
+      # The declared-key filter runs first, so a stale tab posting junk never
+      # reaches the reserved check and never 400s.
+      assert {:ok, %{}} = Ports.sanitize(config(%{"22/tcp" => nil}), %{"9999/tcp" => 8123})
+    end
+  end
 end
