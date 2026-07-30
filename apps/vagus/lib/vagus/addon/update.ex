@@ -51,11 +51,20 @@ defmodule Vagus.Addon.Update do
   becomes un-updatable until its options are fixed. That is the safe
   direction to fail, and the error says which key.
 
-  ## Synchronous, like `POST /core/update`
+  ## Job progress
 
-  There is no jobs API, so `background: true` is refused by the router rather
-  than faked. This can run for minutes; Bandit's 900 s `read_timeout` is what
-  bounds the caller.
+  When the router passes `opts[:job]` (a `Vagus.Jobs` uuid), each step below
+  reports a stage transition — that is what moves the HA UI's progress bar,
+  since Core subscribes to `addon_manager_update` job events by name. The
+  numbers are coarse waypoints, not measurements: byte-level pull progress
+  needs the engine's layer stream and is an explicitly-recorded follow-up.
+  With no `:job` every report is a no-op, so the sync/background/untracked
+  paths run identical code. The router owns create/finish; this module only
+  reports stages.
+
+  This can run for minutes; on the sync path Bandit's 900 s `read_timeout` is
+  what bounds the caller, and with `background: true` the router answers
+  `{job_id}` immediately and runs this in a supervised task.
 
   ## Old images are reclaimed, best-effort
 
@@ -121,11 +130,23 @@ defmodule Vagus.Addon.Update do
     with {:ok, installed} <- fetch_installed(slug, opts),
          {:ok, target} <- fetch_target(slug, opts),
          :ok <- check_differs(installed.config.version, target.version),
+         :ok <- report_stage(opts, "validate_options", 5),
          :ok <- check_options(target, installed),
          :ok <- maybe_backup(slug, installed, opts),
+         :ok <- report_stage(opts, "pull_image", 20),
          :ok <- pull(target, opts) do
       swap(slug, installed, target, opts)
     end
+  end
+
+  # Stage waypoints for the job's progress bar (moduledoc "Job progress").
+  # Always `:ok`, so it can sit in a `with` chain without altering it.
+  defp report_stage(opts, stage, progress) do
+    Vagus.Jobs.update(
+      Keyword.get(opts, :job),
+      [stage: stage, progress: progress],
+      Keyword.get(opts, :jobs_server, Vagus.Jobs)
+    )
   end
 
   ## Resolution — nothing here mutates
@@ -160,6 +181,7 @@ defmodule Vagus.Addon.Update do
 
   defp maybe_backup(slug, installed, opts) do
     if Keyword.get(opts, :backup, false) do
+      :ok = report_stage(opts, "backup", 10)
       name = "addon_#{slug}_#{installed.config.version}"
 
       case backups().create_partial(name, [slug], backup_opts(opts)) do
@@ -188,6 +210,7 @@ defmodule Vagus.Addon.Update do
     user_options = installed.user_options
 
     with :ok <- stop_if_running(slug, was_running, opts) do
+      :ok = report_stage(opts, "commit", 80)
       commit(target, user_options, opts)
       restart_if_running(slug, was_running, target, old_config, user_options, opts)
     end
@@ -199,6 +222,8 @@ defmodule Vagus.Addon.Update do
   defp stop_if_running(_slug, false, _opts), do: :ok
 
   defp stop_if_running(slug, true, opts) do
+    :ok = report_stage(opts, "stop", 70)
+
     case Manager.stop_holding_lock(slug, manager_opts(opts)) do
       :ok -> :ok
       {:error, reason} -> {:error, {:stop, reason}}
@@ -219,6 +244,8 @@ defmodule Vagus.Addon.Update do
   end
 
   defp restart_if_running(slug, true, target, old_config, user_options, opts) do
+    :ok = report_stage(opts, "start", 90)
+
     case Manager.start_holding_lock(
            target,
            Keyword.put(manager_opts(opts), :user_options, user_options)

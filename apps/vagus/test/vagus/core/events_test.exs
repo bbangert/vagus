@@ -30,7 +30,11 @@ defmodule Vagus.Core.EventsTest do
   end
 
   describe "job/1" do
-    test "builds the flat WS-event shape: keeps parent_id, omits child_jobs, adds event" do
+    # The job dict rides NESTED under "data" — Core's hassio/jobs.py:160
+    # reads event["data"] and a flat union raises KeyError in its
+    # dispatcher. Device-proven 2026-07-29 (the phase-3 gate caught the
+    # flat shape erroring on every event).
+    test "nests the flat as_dict under data: keeps parent_id, omits child_jobs" do
       error = %{
         "type" => "SomeError",
         "message" => "boom",
@@ -52,15 +56,20 @@ defmodule Vagus.Core.EventsTest do
         "extra" => nil
       }
 
-      data = Events.job(job_map)
+      event = Events.job(job_map)
+
+      assert Map.keys(event) |> Enum.sort() == ["data", "event"]
+      assert event["event"] == "job"
+
+      data = event["data"]
 
       assert MapSet.new(Map.keys(data)) ==
                MapSet.new(
-                 ~w(event name reference uuid progress stage done parent_id errors created extra)
+                 ~w(name reference uuid progress stage done parent_id errors created extra)
                )
 
-      assert data["event"] == "job"
       refute Map.has_key?(data, "child_jobs")
+      refute Map.has_key?(data, "event")
       assert data["parent_id"] == nil
       assert data["errors"] == [error]
     end
@@ -75,7 +84,7 @@ defmodule Vagus.Core.EventsTest do
       }
 
       job_map = base_job(errors: [error])
-      assert [^error] = Events.job(job_map)["errors"]
+      assert [^error] = Events.job(job_map)["data"]["errors"]
     end
 
     test "raises when a required key is missing" do

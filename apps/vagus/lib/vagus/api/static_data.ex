@@ -139,15 +139,6 @@ defmodule Vagus.API.StaticData do
     }
   end
 
-  @doc "Attrs for `Vagus.API.Models.JobsInfo` (`GET jobs/info`)."
-  @spec jobs_info() :: map()
-  def jobs_info do
-    %{
-      ignore_conditions: [],
-      jobs: []
-    }
-  end
-
   @doc "Attrs for `Vagus.API.Models.AddonsList` (`GET addons`)."
   @spec addons_list() :: map()
   def addons_list do

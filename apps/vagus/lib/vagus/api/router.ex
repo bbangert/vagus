@@ -38,6 +38,7 @@ defmodule Vagus.API.Router do
   alias Vagus.Backups
   alias Vagus.Core.{Health, Lifecycle, TokenStore, Versions}
   alias Vagus.Discovery
+  alias Vagus.Jobs
   alias Vagus.Mqtt.Broker
   alias Vagus.Runtime.{Docker, Logs, Stats}
   alias Vagus.Services
@@ -348,8 +349,52 @@ defmodule Vagus.API.Router do
     Envelope.send_ok(conn, ResolutionInfo.build!(StaticData.resolution_info()))
   end
 
+  # Backed by the real registry (audit B2 — this was a static empty list).
+  # Declared before `GET /jobs/:uuid` below, or "info" would match as a uuid.
   get "/jobs/info" do
-    Envelope.send_ok(conn, JobsInfo.build!(StaticData.jobs_info()))
+    Envelope.send_ok(conn, JobsInfo.build!(Jobs.info(jobs_server())))
+  end
+
+  # `GET /jobs/{uuid}` — the REST tree shape (`as_dict()` minus `parent_id`
+  # plus `child_jobs`, contract §7). Audit B1: this was a live 404 while the
+  # backup routes handed out job ids that pointed here.
+  get "/jobs/:uuid" do
+    case Jobs.tree(uuid, jobs_server()) do
+      {:ok, tree} -> Envelope.send_ok(conn, tree)
+      :error -> Envelope.send_error(conn, "Job does not exist", 404)
+    end
+  end
+
+  # Upstream refuses to delete a job that is still running (`api/jobs.py`).
+  delete "/jobs/:uuid" do
+    case Jobs.delete(uuid, jobs_server()) do
+      :ok -> Envelope.send_ok(conn, %{})
+      {:error, :not_done} -> Envelope.send_error(conn, "Job #{uuid} is not done!", 400)
+      {:error, :not_found} -> Envelope.send_error(conn, "Job does not exist", 404)
+    end
+  end
+
+  # `ignore_conditions` is optional in upstream's schema; absent means "change
+  # nothing". Stored + echoed only — see `Vagus.Jobs`'s moduledoc.
+  post "/jobs/options" do
+    case Map.get(conn.body_params, "ignore_conditions") do
+      nil ->
+        Envelope.send_ok(conn, %{})
+
+      conditions ->
+        case Jobs.set_ignore_conditions(conditions, jobs_server()) do
+          :ok ->
+            Envelope.send_ok(conn, %{})
+
+          {:error, :invalid} ->
+            Envelope.send_error(conn, "ignore_conditions must be a list of strings", 400)
+        end
+    end
+  end
+
+  post "/jobs/reset" do
+    :ok = Jobs.reset(jobs_server())
+    Envelope.send_ok(conn, %{})
   end
 
   # -- Addon coordinator (15 min) -------------------------------------------
@@ -502,11 +547,11 @@ defmodule Vagus.API.Router do
   end
 
   # `POST .../update` can run for minutes — pulling an add-on image on a slow
-  # device, then stopping/recreating the container. Synchronous v1, exactly
-  # like `POST /core/update` above: there is no jobs API, so `background:
-  # true` is refused rather than faked, and Bandit's configured 900s
-  # `read_timeout` (`Vagus.API.Supervisor`) is what bounds how long a caller
-  # can wait — nothing in this router does.
+  # device, then stopping/recreating the container. Wrapped in an
+  # `addon_manager_update` job either way (see `run_addon_update/2`):
+  # `background: true` returns `{job_id}` immediately, and the sync path is
+  # bounded by Bandit's configured 900s `read_timeout`
+  # (`Vagus.API.Supervisor`) — nothing in this router does.
   post "/store/addons/:slug/update" do
     handle_update(conn, slug)
   end
@@ -1041,10 +1086,11 @@ defmodule Vagus.API.Router do
   # convention as the logs routes above).
   #
   # `POST /core/update` can run for minutes — pulling a multi-GB Core image
-  # on a slow device, then the health gate — this is a synchronous v1 (no
-  # `background`/`job_id` job API yet, per the plan's "Locked decisions");
-  # Bandit's configured 900s `read_timeout` (`Vagus.API.Supervisor`) is what
-  # bounds how long a caller can wait, not anything in this router.
+  # on a slow device, then the health gate. Wrapped in a
+  # `home_assistant_core_update` job (see `run_core_update/2`):
+  # `background: true` returns `{job_id}` immediately, and the sync path is
+  # bounded by Bandit's configured 900s `read_timeout`
+  # (`Vagus.API.Supervisor`), not anything in this router.
 
   post "/core/start" do
     core_lifecycle_action(conn, fn -> core_lifecycle().start() end)
@@ -1167,15 +1213,56 @@ defmodule Vagus.API.Router do
     supervisor_only(conn, fn ->
       case validate_core_update_version(conn.body_params) do
         {:ok, version} ->
-          case core_lifecycle().update(version) do
-            {:ok, installed} -> Envelope.send_ok(conn, %{version: installed})
-            {:error, reason} -> send_core_lifecycle_error(conn, reason)
-          end
+          run_core_update(conn, version)
 
         {:error, message} ->
           Envelope.send_error(conn, message, 400)
       end
     end)
+  end
+
+  # Same job-wrapping shape as `run_addon_update/2`: Core's update entity
+  # subscribes to `home_assistant_core_update` by name (contract §4), and
+  # `background: true` returns `{job_id}` with the multi-minute pull in a
+  # supervised task instead of holding the request open.
+  defp run_core_update(conn, version) do
+    job = Jobs.create("home_assistant_core_update", nil, server: jobs_server())
+    opts = [job: job, jobs_server: jobs_server()]
+
+    if background?(conn) do
+      result =
+        start_job_task(job, fn ->
+          finish_core_update_job(job, core_lifecycle().update(version, opts))
+        end)
+
+      send_job_task_result(conn, job, result)
+    else
+      result = run_with_job(job, fn -> core_lifecycle().update(version, opts) end)
+      finish_core_update_job(job, result)
+
+      case result do
+        {:ok, installed} -> Envelope.send_ok(conn, %{version: installed})
+        {:error, reason} -> send_core_lifecycle_error(conn, reason)
+      end
+    end
+  end
+
+  defp finish_core_update_job(job, {:ok, _installed}) do
+    Jobs.finish(job, [], jobs_server())
+  end
+
+  defp finish_core_update_job(job, {:error, reason}) do
+    message =
+      case reason do
+        :busy -> "a Core lifecycle operation is already in progress"
+        other -> core_lifecycle_error_message(other)
+      end
+
+    Jobs.finish(
+      job,
+      [errors: [Jobs.error_entry("HomeAssistantUpdateError", message)]],
+      jobs_server()
+    )
   end
 
   @core_version_tag_re ~r/\A[A-Za-z0-9][A-Za-z0-9._-]*\z/
@@ -1875,17 +1962,43 @@ defmodule Vagus.API.Router do
           # `APIForbidden(f"App {app.slug} can't update itself!")`.
           Envelope.send_error(conn, "Addon #{slug} can't update itself!", 403)
 
-        background?(conn) ->
-          Envelope.send_error(
-            conn,
-            "background updates are not supported; omit \"background\" or send false",
-            400
-          )
-
         true ->
-          send_update_result(conn, slug, Update.update(slug, backup: backup?(conn)))
+          run_addon_update(conn, slug)
       end
     end)
+  end
+
+  # The job wraps both the sync and the background path (upstream's decorator
+  # does the same): Core's update entity subscribes to `addon_manager_update`
+  # by name + slug reference regardless of who initiated the update, so the
+  # progress bar moves either way (audit B4/B5). `background: true` returns
+  # `{job_id}` immediately and the work runs in a supervised task — the 400 it
+  # replaces was locked as correct only while there was no jobs API.
+  defp run_addon_update(conn, slug) do
+    job = Jobs.create("addon_manager_update", slug, server: jobs_server())
+    opts = [backup: backup?(conn), job: job, jobs_server: jobs_server()]
+
+    if background?(conn) do
+      result =
+        start_job_task(job, fn ->
+          finish_addon_update_job(job, slug, Update.update(slug, opts))
+        end)
+
+      send_job_task_result(conn, job, result)
+    else
+      result = run_with_job(job, fn -> Update.update(slug, opts) end)
+      finish_addon_update_job(job, slug, result)
+      send_update_result(conn, slug, result)
+    end
+  end
+
+  defp finish_addon_update_job(job, _slug, {:ok, _result}) do
+    Jobs.finish(job, [], jobs_server())
+  end
+
+  defp finish_addon_update_job(job, slug, {:error, reason}) do
+    {_status, message} = update_failure(slug, reason)
+    Jobs.finish(job, [errors: [Jobs.error_entry("AddonsError", message)]], jobs_server())
   end
 
   defp self_update?(conn, slug), do: match?({:addon, %{slug: ^slug}}, conn.assigns.caller)
@@ -1895,23 +2008,24 @@ defmodule Vagus.API.Router do
 
   defp send_update_result(conn, _slug, {:ok, _result}), do: Envelope.send_ok(conn, %{})
 
+  defp send_update_result(conn, slug, {:error, reason}) do
+    {status, message} = update_failure(slug, reason)
+    Envelope.send_error(conn, message, status)
+  end
+
   # Mirrors `send_core_lifecycle_error/2`'s shape: `:busy` is the only 409,
   # "it isn't there" is 404, everything else is a 400 with an honest message.
-  defp send_update_result(conn, slug, {:error, reason}) do
-    case reason do
-      :busy ->
-        Envelope.send_error(conn, "an operation is already in progress for #{slug}", 409)
+  # Shared between the HTTP response and the job's error entry so the two
+  # never tell different stories about the same failure.
+  defp update_failure(slug, :busy),
+    do: {409, "an operation is already in progress for #{slug}"}
 
-      :not_installed ->
-        Envelope.send_error(conn, "Addon #{slug} is not installed", 404)
+  defp update_failure(slug, :not_installed), do: {404, "Addon #{slug} is not installed"}
 
-      :not_in_store ->
-        Envelope.send_error(conn, "Addon #{slug} is no longer available in the store", 404)
+  defp update_failure(slug, :not_in_store),
+    do: {404, "Addon #{slug} is no longer available in the store"}
 
-      other ->
-        Envelope.send_error(conn, update_error_message(other), 400)
-    end
-  end
+  defp update_failure(_slug, other), do: {400, update_error_message(other)}
 
   defp update_error_message(:no_update_available), do: "No update available for this addon"
 
@@ -2228,26 +2342,68 @@ defmodule Vagus.API.Router do
     }
   end
 
+  # Real jobs (audit B1/C1's first half): Core kicks off a backup and then
+  # polls `GET /jobs/{uuid}` with the returned id, so the id must resolve and
+  # the job must eventually read `done`. Stage granularity here is coarse
+  # (created → done) — phase 4 owns routing the backup internals through the
+  # job. `background: true` runs the tar in a supervised task; the sync path
+  # keeps returning `slug` alongside `job_id`.
   defp handle_backup_new_partial(conn, params) do
     with :ok <- reject_password(params),
          :ok <- reject_homeassistant(params, "Core backup not supported"),
          :ok <- reject_folders(params),
          :ok <- validate_filename(params),
          {:ok, addon_slugs} <- resolve_create_addon_slugs(params) do
-      case Backups.create_partial(Map.get(params, "name"), addon_slugs) do
-        {:ok, slug} ->
-          Envelope.send_ok(conn, %{slug: slug, job_id: new_job_id()})
+      job = Jobs.create("backup_manager_partial_backup", nil, server: jobs_server())
 
-        {:error, {:not_installed, addon_slug}} ->
-          Envelope.send_error(conn, "Addon #{addon_slug} is not installed", 400)
+      if background?(conn) do
+        result =
+          start_job_task(job, fn ->
+            finish_backup_new_job(
+              job,
+              Backups.create_partial(Map.get(params, "name"), addon_slugs)
+            )
+          end)
 
-        {:error, reason} ->
-          Envelope.send_error(conn, inspect(reason), 400)
+        send_job_task_result(conn, job, result)
+      else
+        result =
+          run_with_job(job, fn -> Backups.create_partial(Map.get(params, "name"), addon_slugs) end)
+
+        finish_backup_new_job(job, result)
+
+        case result do
+          {:ok, slug} ->
+            Envelope.send_ok(conn, %{slug: slug, job_id: job})
+
+          {:error, reason} ->
+            Envelope.send_error(conn, backup_new_error_message(reason), 400)
+        end
       end
     else
       {:error, message} -> Envelope.send_error(conn, message, 400)
     end
   end
+
+  # The finished backup's slug lands in the job's `reference` — that is where
+  # Core's backup flow reads it from when it ran with `background: true`.
+  defp finish_backup_new_job(job, {:ok, slug}) do
+    Jobs.update(job, [reference: slug], jobs_server())
+    Jobs.finish(job, [], jobs_server())
+  end
+
+  defp finish_backup_new_job(job, {:error, reason}) do
+    Jobs.finish(
+      job,
+      [errors: [Jobs.error_entry("BackupError", backup_new_error_message(reason))]],
+      jobs_server()
+    )
+  end
+
+  defp backup_new_error_message({:not_installed, addon_slug}),
+    do: "Addon #{addon_slug} is not installed"
+
+  defp backup_new_error_message(reason), do: inspect(reason)
 
   defp handle_backup_restore(conn, slug, params) do
     case Backups.get(slug) do
@@ -2259,21 +2415,49 @@ defmodule Vagus.API.Router do
              :ok <- reject_homeassistant(params, "Core restore not supported"),
              :ok <- reject_folders(params),
              {:ok, addon_slugs} <- require_addons_list(params) do
-          case Backups.restore_partial(slug, addon_slugs) do
-            :ok ->
-              Envelope.send_ok(conn, %{job_id: new_job_id()})
-
-            {:error, message} when is_binary(message) ->
-              Envelope.send_error(conn, message, 400)
-
-            {:error, reason} ->
-              Envelope.send_error(conn, inspect(reason), 400)
-          end
+          run_backup_restore(conn, slug, addon_slugs)
         else
           {:error, message} -> Envelope.send_error(conn, message, 400)
         end
     end
   end
+
+  defp run_backup_restore(conn, slug, addon_slugs) do
+    job = Jobs.create("backup_manager_partial_restore", slug, server: jobs_server())
+
+    if background?(conn) do
+      result =
+        start_job_task(job, fn ->
+          finish_restore_job(job, Backups.restore_partial(slug, addon_slugs))
+        end)
+
+      send_job_task_result(conn, job, result)
+    else
+      result = run_with_job(job, fn -> Backups.restore_partial(slug, addon_slugs) end)
+      finish_restore_job(job, result)
+
+      case result do
+        :ok ->
+          Envelope.send_ok(conn, %{job_id: job})
+
+        {:error, reason} ->
+          Envelope.send_error(conn, restore_error_message(reason), 400)
+      end
+    end
+  end
+
+  defp finish_restore_job(job, :ok), do: Jobs.finish(job, [], jobs_server())
+
+  defp finish_restore_job(job, {:error, reason}) do
+    Jobs.finish(
+      job,
+      [errors: [Jobs.error_entry("BackupError", restore_error_message(reason))]],
+      jobs_server()
+    )
+  end
+
+  defp restore_error_message(message) when is_binary(message), do: message
+  defp restore_error_message(reason), do: inspect(reason)
 
   # path is internal/config-derived, not request input
   # sobelow_skip ["Traversal.FileModule", "Traversal.SendFile"]
@@ -2435,10 +2619,84 @@ defmodule Vagus.API.Router do
     end
   end
 
-  # uuid4hex-shaped job id (32 lowercase hex chars) — mirrors
-  # `Vagus.Discovery`'s own uuid minting, not a validated RFC 4122 v4 (the
-  # wire only cares about the shape/uniqueness, never parses it back).
-  defp new_job_id, do: Base.encode16(:crypto.strong_rand_bytes(16), case: :lower)
+  # -- jobs helpers ----------------------------------------------------------
+
+  # Injectable like `core_lifecycle/0` above, so mutating router tests can
+  # point at an isolated registry instead of dirtying the global one.
+  defp jobs_server, do: Application.get_env(:vagus, :jobs_server, Jobs)
+
+  # Background job work runs under `Vagus.Jobs.TaskSupervisor` — never linked
+  # to the request process, which has already answered `{job_id}` and gone
+  # away. The supervisor's `max_children` (see `Vagus.Application`) is the
+  # concurrency bound; at the cap the job is finished with an honest error
+  # and the caller told to retry, rather than quietly queueing tar-holding
+  # work the board has no memory for.
+  defp start_job_task(job, fun) do
+    case Task.Supervisor.start_child(Vagus.Jobs.TaskSupervisor, fn -> run_with_job(job, fun) end) do
+      {:ok, _pid} ->
+        :ok
+
+      {:error, :max_children} ->
+        Jobs.finish(
+          job,
+          [errors: [Jobs.error_entry("JobStartError", "too many background jobs running")]],
+          jobs_server()
+        )
+
+        {:error, :max_children}
+
+      # Any other refusal (e.g. the supervisor mid-restart under its own
+      # budget): same discipline — the job must not be left un-`done` for
+      # Core to poll forever (Copilot, PR #29). Detail to the log, generic
+      # entry on the wire.
+      {:error, reason} ->
+        Logger.error("Vagus.API.Router: could not start job #{job}: #{inspect(reason)}")
+
+        Jobs.finish(
+          job,
+          [errors: [Jobs.error_entry("JobStartError", "failed to start the background job")]],
+          jobs_server()
+        )
+
+        {:error, :start_failed}
+    end
+  end
+
+  # Shared crash guard for BOTH the sync and background paths (review W2): a
+  # producer that raises/exits/throws must still leave its job `done` with an
+  # honest error — Core would otherwise poll it forever, since eviction only
+  # reaps done trees. `catch kind, reason` rather than `rescue` because a
+  # `GenServer.call` timeout is an exit, not an exception. The detail is
+  # logged, never stored in the job: exception payloads (`MatchError`,
+  # `KeyError`) can embed resolved add-on options, and job errors are
+  # readable at `:default` tier via `/jobs/info` (review W3).
+  defp run_with_job(job, fun) do
+    fun.()
+  catch
+    kind, reason ->
+      Logger.error(
+        "Vagus.API.Router: job #{job} crashed: " <>
+          Exception.format(kind, reason, __STACKTRACE__)
+      )
+
+      Jobs.finish(
+        job,
+        [errors: [Jobs.error_entry("UnexpectedError", "the operation crashed; see the log")]],
+        jobs_server()
+      )
+
+      :erlang.raise(kind, reason, __STACKTRACE__)
+  end
+
+  defp send_job_task_result(conn, job, :ok), do: Envelope.send_ok(conn, %{job_id: job})
+
+  defp send_job_task_result(conn, _job, {:error, :max_children}) do
+    Envelope.send_error(conn, "too many background jobs running; retry later", 429)
+  end
+
+  defp send_job_task_result(conn, _job, {:error, :start_failed}) do
+    Envelope.send_error(conn, "failed to start the background job; retry later", 500)
+  end
 
   # -- discovery helpers -----------------------------------------------------
 

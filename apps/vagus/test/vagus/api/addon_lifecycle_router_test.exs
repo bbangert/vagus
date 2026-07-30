@@ -106,6 +106,20 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
 
   defp body(conn), do: Jason.decode!(conn.resp_body)
 
+  # Bounded poll for background-task completion, the `boot_starter_test.exs`
+  # idiom: retries `fun` (a 0-arity predicate) until truthy or the window
+  # elapses — a genuinely-stuck job still fails the enclosing assert.
+  defp eventually(fun, attempts \\ 200) do
+    Enum.reduce_while(1..attempts, false, fn _, _ ->
+      if fun.() do
+        {:halt, true}
+      else
+        Process.sleep(25)
+        {:cont, false}
+      end
+    end)
+  end
+
   describe "POST /store/addons/:slug/install (+ legacy /addons/:slug/install alias)" do
     test "installs a store entry: config slug rewritten to the store slug, State records :stopped" do
       seed_store("core_testaddon", fixture_config("testaddon"))
@@ -837,7 +851,9 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
       end
     end
 
-    test "background: true is refused honestly rather than faked" do
+    # This pinned a 400 until the jobs subsystem existed (audit B4) — that
+    # decision was locked as correct only while there were no jobs.
+    test "background: true returns {job_id} and the update completes in a task" do
       installed = fixture_config("updbg")
       seed_store("core_updbg", installed)
       assert supervisor_call(:post, "/store/addons/core_updbg/install").status == 200
@@ -845,14 +861,79 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
 
       conn = supervisor_call(:post, "/store/addons/core_updbg/update", %{"background" => true})
 
-      assert conn.status == 400
-      assert json(conn)["message"] =~ "background"
-      # Refused BEFORE doing anything: still on the old version.
+      assert conn.status == 200
+      job_id = json(conn)["data"]["job_id"]
+      assert job_id =~ ~r/\A[0-9a-f]{32}\z/
+
+      # The work runs under Vagus.Jobs.TaskSupervisor; poll the job the way
+      # Core would.
+      assert eventually(fn ->
+               json(supervisor_call(:get, "/jobs/#{job_id}"))["data"]["done"] == true
+             end)
+
+      job = json(supervisor_call(:get, "/jobs/#{job_id}"))["data"]
+      assert job["name"] == "addon_manager_update"
+      assert job["reference"] == "core_updbg"
+      assert job["errors"] == []
+      assert job["progress"] == 100
+
       assert json(supervisor_call(:get, "/addons/core_updbg/info"))["data"]["version"] ==
-               installed.version
+               "9.9.9"
     end
 
-    test "background: false and an absent body both proceed" do
+    test "background: true at the task-supervisor cap is a 429, job finished with an error" do
+      installed = fixture_config("updbgcap")
+      seed_store("core_updbgcap", installed)
+      assert supervisor_call(:post, "/store/addons/core_updbgcap/install").status == 200
+      seed_store("core_updbgcap", %{installed | version: "9.9.9"})
+
+      # Saturate Vagus.Jobs.TaskSupervisor (max_children: 8) with parked
+      # tasks so start_job_task hits {:error, :max_children}.
+      parked =
+        for _ <- 1..8 do
+          {:ok, pid} =
+            Task.Supervisor.start_child(Vagus.Jobs.TaskSupervisor, fn ->
+              Process.sleep(:infinity)
+            end)
+
+          pid
+        end
+
+      on_exit(fn ->
+        Enum.each(parked, &Task.Supervisor.terminate_child(Vagus.Jobs.TaskSupervisor, &1))
+      end)
+
+      conn = supervisor_call(:post, "/store/addons/core_updbgcap/update", %{"background" => true})
+
+      assert conn.status == 429
+      assert json(conn)["message"] =~ "too many background jobs"
+
+      # The pre-created job was not leaked undone: it is finished with an
+      # honest error, so Core never polls a zombie.
+      jobs = json(supervisor_call(:get, "/jobs/info"))["data"]["jobs"]
+
+      assert [job] =
+               Enum.filter(
+                 jobs,
+                 &(&1["name"] == "addon_manager_update" and &1["reference"] == "core_updbgcap")
+               )
+
+      assert job["done"] == true
+      assert [%{"type" => "JobStartError"}] = job["errors"]
+
+      Enum.each(parked, &Task.Supervisor.terminate_child(Vagus.Jobs.TaskSupervisor, &1))
+
+      # With the slots free again the same request goes through.
+      conn = supervisor_call(:post, "/store/addons/core_updbgcap/update", %{"background" => true})
+      assert conn.status == 200
+      job_id = json(conn)["data"]["job_id"]
+
+      assert eventually(fn ->
+               json(supervisor_call(:get, "/jobs/#{job_id}"))["data"]["done"] == true
+             end)
+    end
+
+    test "background: false and an absent body both proceed synchronously" do
       installed = fixture_config("updbgfalse")
       seed_store("core_updbgfalse", installed)
       assert supervisor_call(:post, "/store/addons/core_updbgfalse/install").status == 200
@@ -862,6 +943,50 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
         supervisor_call(:post, "/store/addons/core_updbgfalse/update", %{"background" => false})
 
       assert conn.status == 200
+    end
+
+    test "a sync update is wrapped in a job too, done when the response lands" do
+      installed = fixture_config("updsyncjob")
+      seed_store("core_updsyncjob", installed)
+      assert supervisor_call(:post, "/store/addons/core_updsyncjob/install").status == 200
+      seed_store("core_updsyncjob", %{installed | version: "9.9.9"})
+
+      assert supervisor_call(:post, "/store/addons/core_updsyncjob/update", %{}).status == 200
+
+      jobs = json(supervisor_call(:get, "/jobs/info"))["data"]["jobs"]
+
+      assert [job] =
+               Enum.filter(
+                 jobs,
+                 &(&1["name"] == "addon_manager_update" and &1["reference"] == "core_updsyncjob")
+               )
+
+      assert job["done"] == true
+      assert job["errors"] == []
+      # The stage waypoints ran: the last one recorded is the restart.
+      assert job["stage"] in ["commit", "start"]
+    end
+
+    test "a failed update finishes its job with an honest error entry" do
+      seed_store("core_updjobfail", fixture_config("updjobfail"))
+      assert supervisor_call(:post, "/store/addons/core_updjobfail/install").status == 200
+      # No store version bump: the update 400s with "No update available".
+
+      conn = supervisor_call(:post, "/store/addons/core_updjobfail/update", %{})
+      assert conn.status == 400
+
+      jobs = json(supervisor_call(:get, "/jobs/info"))["data"]["jobs"]
+
+      assert [job] =
+               Enum.filter(
+                 jobs,
+                 &(&1["name"] == "addon_manager_update" and &1["reference"] == "core_updjobfail")
+               )
+
+      assert job["done"] == true
+      assert [error] = job["errors"]
+      assert error["type"] == "AddonsError"
+      assert error["message"] =~ "No update available"
     end
 
     test "unknown body keys are ignored (aiohttp tolerance)" do

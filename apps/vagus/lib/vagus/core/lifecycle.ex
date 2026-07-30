@@ -376,6 +376,7 @@ defmodule Vagus.Core.Lifecycle do
 
     with {:ok, target} <- resolve_target(version_arg, versions),
          :ok <- check_not_installed(target, installed),
+         :ok <- report_stage(opts, "pull_image", 10),
          :ok <- pull_target(target, opts) do
       case inspect_container(opts) do
         {:ok, info} -> update_existing(info, target, installed, opts)
@@ -383,6 +384,18 @@ defmodule Vagus.Core.Lifecycle do
         {:error, reason} -> {:error, reason}
       end
     end
+  end
+
+  # Stage waypoints for the `home_assistant_core_update` job the router
+  # creates (see `Vagus.Addon.Update`'s "Job progress" moduledoc section —
+  # same discipline: coarse transitions, no-op without `opts[:job]`, always
+  # `:ok` so it can sit in a `with` chain).
+  defp report_stage(opts, stage, progress) do
+    Vagus.Jobs.update(
+      Keyword.get(opts, :job),
+      [stage: stage, progress: progress],
+      Keyword.get(opts, :jobs_server, Vagus.Jobs)
+    )
   end
 
   defp resolve_target(nil, versions) do
@@ -406,6 +419,7 @@ defmodule Vagus.Core.Lifecycle do
 
   defp update_existing(info, target, rollback_version, opts) do
     was_running = running?(info)
+    :ok = report_stage(opts, "stop", 60)
 
     with :ok <- stop_existing(info, opts),
          :ok <- Docker.remove_container(Container.name(), docker_opts(opts)) do
@@ -419,6 +433,8 @@ defmodule Vagus.Core.Lifecycle do
   end
 
   defp finish_update(true, target, rollback_version, opts) do
+    :ok = report_stage(opts, "start", 75)
+
     case do_create(target, opts) do
       {:ok, id} -> finish_update_start(id, target, rollback_version, opts)
       # Never created — nothing to remove before the rollback recreate.
@@ -430,6 +446,7 @@ defmodule Vagus.Core.Lifecycle do
     case Docker.start_container(id, docker_opts(opts)) do
       :ok ->
         Versions.set_installed(target, versions_server(opts))
+        :ok = report_stage(opts, "health", 85)
 
         case health_gate(opts) do
           :ok -> {:ok, target}

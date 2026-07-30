@@ -54,6 +54,21 @@ defmodule Vagus.Application do
         # an empty set refuses Core, and the guard deliberately doesn't
         # refresh on a miss.
         Vagus.API.SourceGuard,
+
+        # The job registry (audit B1-B5) + the task pool background
+        # (`background: true`) job work runs under. Before
+        # `Vagus.API.Supervisor` so the routes can reach them from the first
+        # request; WS `job` events push through `Vagus.Core.EventPusher`,
+        # which starts later — a cast to a not-yet-registered name is
+        # silently dropped, and no producer can create a job before the HTTP
+        # surface is up anyway.
+        # `max_children` bounds how many background jobs can hold memory at
+        # once — the backup family tars in the calling process, so without a
+        # cap N cheap `background: true` POSTs would hold N tars in RAM
+        # (review W1). Per-family bounding of the backup routes stays phase
+        # 4's, alongside the size caps it owns.
+        Vagus.Jobs,
+        {Task.Supervisor, name: Vagus.Jobs.TaskSupervisor, max_children: 8},
         Vagus.Backups,
         Vagus.Services,
         Vagus.Discovery,

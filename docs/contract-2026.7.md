@@ -867,10 +867,17 @@ This raw dict is used in two different shapes on the wire, per `supervisor/api/j
   organized into a parent/child tree and `parent_id` is dropped because the tree structure
   already encodes it).
 - **`job` WS event** (`supervisor/homeassistant/websocket.py` →
-  `homeassistant/components/hassio/jobs.py`): the payload is the flat `as_dict()` **including
-  `parent_id`, with no `child_jobs` key at all** — Core's `jobs.py` manually unions in
-  `{"child_jobs": []}` before calling `aiohasupervisor.models.jobs.Job.from_dict(...)`, purely
-  so the shared `Job` dataclass (which requires the key) can deserialize a single flat event.
+  `homeassistant/components/hassio/jobs.py`): the event's payload is
+  `{"event": "job", "data": <flat as_dict()>}` — **the job dict rides nested under `"data"`,
+  never unioned with `"event"` at the top level**. Core's `jobs.py:160` reads
+  `event["data"]` and manually unions in `{"child_jobs": []}` before calling
+  `aiohasupervisor.models.jobs.Job.from_dict(...)`, purely so the shared `Job` dataclass
+  (which requires the key) can deserialize a single flat event. The nested dict keeps
+  `parent_id` and has no `child_jobs` key.
+  **CORRECTED 2026-07-29 (device-proven):** this doc previously said the payload was the flat
+  dict unioned with `"event"`; that shape auths and delivers fine (`SCHEMA_WEBSOCKET_EVENT`
+  only requires `"event"`) but raises `KeyError: 'data'` in Core's dispatcher on every event —
+  found live during the Vagus phase-3 jobs gate.
 
 **Field mismatch to flag for the emulator:** `SupervisorJobError.as_dict()` puts 5 keys on the
 wire (`type`, `message`, `stage`, `error_key`, `extra_fields`), but aiohasupervisor's `JobError`
