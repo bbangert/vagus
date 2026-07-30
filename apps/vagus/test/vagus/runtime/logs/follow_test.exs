@@ -56,6 +56,27 @@ defmodule Vagus.Runtime.Logs.FollowTest do
 
   defp send_final_chunk(sock), do: :ok = :gen_tcp.send(sock, "0\r\n\r\n")
 
+  # For tests where the client is EXPECTED to hang up as soon as it has
+  # seen the status line (the non-200 path): whether these writes land or
+  # hit the already-closed socket is a scheduler race — the close is the
+  # asserted behaviour, so both outcomes are legal. CI's slower scheduler
+  # loses this race reliably where a dev machine almost never does.
+  defp send_chunk_may_close(sock, binary) do
+    size_hex = binary |> byte_size() |> Integer.to_string(16)
+
+    case :gen_tcp.send(sock, size_hex <> "\r\n" <> binary <> "\r\n") do
+      :ok -> :ok
+      {:error, :closed} -> :ok
+    end
+  end
+
+  defp send_final_chunk_may_close(sock) do
+    case :gen_tcp.send(sock, "0\r\n\r\n") do
+      :ok -> :ok
+      {:error, :closed} -> :ok
+    end
+  end
+
   defp frame(type, payload), do: <<type, 0, 0, 0, byte_size(payload)::32, payload::binary>>
 
   defp setup_stream(_ctx) do
@@ -166,8 +187,8 @@ defmodule Vagus.Runtime.Logs.FollowTest do
     {sock, _head} = accept_conn(listen)
 
     send_headers(sock, "HTTP/1.1 404 Not Found")
-    send_chunk(sock, ~s({"message":"No such container"}))
-    send_final_chunk(sock)
+    send_chunk_may_close(sock, ~s({"message":"No such container"}))
+    send_final_chunk_may_close(sock)
 
     assert_receive :log_eof, 2_000
     refute_receive {:log_chunk, _}, 100
