@@ -35,6 +35,8 @@ defmodule Vagus.Addon.ConfigTest do
       assert c.map == []
       assert c.schema == %{}
       assert c.services == []
+      assert c.homeassistant == nil
+      assert c.machine == []
     end
 
     for field <- ~w(name version slug description arch) do
@@ -202,6 +204,69 @@ defmodule Vagus.Addon.ConfigTest do
     end
   end
 
+  describe "homeassistant + machine (phase 6 chunk A, audit G1)" do
+    test "homeassistant is nil by default and parses as an opaque version string" do
+      assert {:ok, c} = Config.parse(@required)
+      assert c.homeassistant == nil
+
+      assert {:ok, c} = Config.parse(Map.put(@required, "homeassistant", "2026.7.0"))
+      assert c.homeassistant == "2026.7.0"
+    end
+
+    test "a non-string homeassistant is rejected" do
+      assert {:error, msg} = Config.parse(Map.put(@required, "homeassistant", 2026))
+      assert msg =~ "homeassistant"
+    end
+
+    test "machine defaults to [] and parses as a plain string list, negated entries included" do
+      assert {:ok, c} = Config.parse(@required)
+      assert c.machine == []
+
+      raw = Map.put(@required, "machine", ["raspberrypi3-64", "!qemux86"])
+      assert {:ok, c} = Config.parse(raw)
+      assert c.machine == ["raspberrypi3-64", "!qemux86"]
+    end
+
+    test "a non-list machine is rejected" do
+      assert {:error, msg} = Config.parse(Map.put(@required, "machine", "raspberrypi3-64"))
+      assert msg =~ "machine"
+    end
+
+    test "round-trips through to_persistable/1 with homeassistant + machine set" do
+      raw =
+        Map.merge(@required, %{
+          "homeassistant" => "2026.7.0",
+          "machine" => ["raspberrypi3-64", "!qemux86"]
+        })
+
+      assert {:ok, c} = Config.parse(raw)
+      assert Config.parse(Config.to_persistable(c)) == {:ok, c}
+    end
+  end
+
+  describe "effective_boot/2 (audit E1)" do
+    defp boot_config(boot) do
+      {:ok, c} = Config.parse(Map.put(@required, "boot", boot))
+      c
+    end
+
+    test "no persisted override falls back to the config's own boot" do
+      assert Config.effective_boot(boot_config("auto"), nil) == "auto"
+      assert Config.effective_boot(boot_config("manual"), nil) == "manual"
+    end
+
+    test "a persisted auto/manual override wins over the config default" do
+      assert Config.effective_boot(boot_config("auto"), "manual") == "manual"
+      assert Config.effective_boot(boot_config("manual"), "auto") == "auto"
+    end
+
+    test "manual_only always wins, override or not" do
+      assert Config.effective_boot(boot_config("manual_only"), nil) == "manual"
+      assert Config.effective_boot(boot_config("manual_only"), "auto") == "manual"
+      assert Config.effective_boot(boot_config("manual_only"), "manual") == "manual"
+    end
+  end
+
   describe "valid_slug?/1 (W3 — the shared rm_rf/restore guard)" do
     test "accepts everything parse/1's own slug charset accepts" do
       assert Config.valid_slug?("core_mosquitto")
@@ -363,7 +428,9 @@ defmodule Vagus.Addon.ConfigTest do
         "backup_pre" => "pre.sh",
         "backup_post" => "post.sh",
         "backup_exclude" => ["**/*.log"],
-        "timeout" => 30
+        "timeout" => 30,
+        "homeassistant" => "2026.7.0",
+        "machine" => ["raspberrypi3-64", "!qemux86"]
       }
 
       assert {:ok, c} = Config.parse(raw)

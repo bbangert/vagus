@@ -38,13 +38,13 @@ defmodule Vagus.API.CoreLifecycleRouterTest.StubLifecycle do
   defp default_reply(_op), do: :ok
 end
 
-defmodule Vagus.API.CoreLifecycleRouterTest.StubHealth do
+defmodule Vagus.API.CoreLifecycleRouterTest.StubConfigCheck do
   @moduledoc false
-  # Router seam target (`config :vagus, :core_health`) — same
+  # Router seam target (`config :vagus, :core_config_check`) — same
   # self-messaging-stub shape as `StubLifecycle` above.
   def check(opts \\ []) do
-    send(self(), {:core_health_call, opts})
-    Application.get_env(:vagus, :stub_core_health_response, :healthy)
+    send(self(), {:core_config_check_call, opts})
+    Application.get_env(:vagus, :stub_core_config_check_response, :valid)
   end
 end
 
@@ -62,7 +62,7 @@ defmodule Vagus.API.CoreLifecycleRouterTest do
   use Plug.Test
 
   alias Vagus.Addon.Registry
-  alias Vagus.API.CoreLifecycleRouterTest.{StubHealth, StubLifecycle}
+  alias Vagus.API.CoreLifecycleRouterTest.{StubConfigCheck, StubLifecycle}
   alias Vagus.API.{Router, Token}
   alias Vagus.Core.Versions
 
@@ -95,24 +95,24 @@ defmodule Vagus.API.CoreLifecycleRouterTest do
 
   setup do
     prev_lifecycle = Application.get_env(:vagus, :core_lifecycle)
-    prev_health = Application.get_env(:vagus, :core_health)
+    prev_config_check = Application.get_env(:vagus, :core_config_check)
 
     Application.put_env(:vagus, :core_lifecycle, StubLifecycle)
-    Application.put_env(:vagus, :core_health, StubHealth)
+    Application.put_env(:vagus, :core_config_check, StubConfigCheck)
     Application.put_env(:vagus, :stub_core_lifecycle_response, %{})
-    Application.put_env(:vagus, :stub_core_health_response, :healthy)
+    Application.put_env(:vagus, :stub_core_config_check_response, :valid)
 
     on_exit(fn ->
       if prev_lifecycle,
         do: Application.put_env(:vagus, :core_lifecycle, prev_lifecycle),
         else: Application.delete_env(:vagus, :core_lifecycle)
 
-      if prev_health,
-        do: Application.put_env(:vagus, :core_health, prev_health),
-        else: Application.delete_env(:vagus, :core_health)
+      if prev_config_check,
+        do: Application.put_env(:vagus, :core_config_check, prev_config_check),
+        else: Application.delete_env(:vagus, :core_config_check)
 
       Application.delete_env(:vagus, :stub_core_lifecycle_response)
-      Application.delete_env(:vagus, :stub_core_health_response)
+      Application.delete_env(:vagus, :stub_core_config_check_response)
     end)
 
     :ok
@@ -166,12 +166,12 @@ defmodule Vagus.API.CoreLifecycleRouterTest do
       end
     end
 
-    test "POST /core/check (healthy) -> ok envelope" do
+    test "POST /core/check (valid) -> ok envelope" do
       conn = post_("/core/check")
 
       assert conn.status == 200
       assert json_body(conn) == %{"result" => "ok", "data" => %{}}
-      assert_received {:core_health_call, _opts}
+      assert_received {:core_config_check_call, _opts}
     end
 
     test "POST /core/update with no body -> update(nil), ok envelope with the returned version" do
@@ -199,7 +199,7 @@ defmodule Vagus.API.CoreLifecycleRouterTest do
 
   ## -- supervisor-only (B1) ----------------------------------------------------
 
-  describe "supervisor-only: an add-on caller is rejected before Lifecycle/Health is touched" do
+  describe "supervisor-only: an add-on caller is rejected before Lifecycle/ConfigCheck is touched" do
     for path <- @all_supervisor_only_routes do
       test "POST #{path} -> 403 for an {:addon, _} caller, stub never called" do
         conn = addon_call(unquote(path))
@@ -207,7 +207,7 @@ defmodule Vagus.API.CoreLifecycleRouterTest do
         assert conn.status == 403
         assert json_body(conn)["message"] == "unauthorized"
         refute_received {:core_lifecycle_call, _op, _opts}
-        refute_received {:core_health_call, _opts}
+        refute_received {:core_config_check_call, _opts}
       end
     end
   end
@@ -226,10 +226,10 @@ defmodule Vagus.API.CoreLifecycleRouterTest do
       end
     end
 
-    test "POST /homeassistant/check hits StubHealth" do
+    test "POST /homeassistant/check hits StubConfigCheck" do
       conn = post_("/homeassistant/check")
       assert conn.status == 200
-      assert_received {:core_health_call, _opts}
+      assert_received {:core_config_check_call, _opts}
     end
 
     test "POST /homeassistant/update hits StubLifecycle.update/2" do
@@ -280,6 +280,146 @@ defmodule Vagus.API.CoreLifecycleRouterTest do
       assert conn.status == 200
       assert_received {:core_lifecycle_call, :update, opts}
       assert Keyword.get(opts, :version) == nil
+    end
+  end
+
+  ## -- POST /core/update backup refusal (audit E4) ----------------------------
+
+  describe "POST /core/update backup: true is refused (audit E4)" do
+    test "backup: true -> 400, Lifecycle never touched" do
+      conn = post_("/core/update", %{"backup" => true})
+
+      assert conn.status == 400
+      assert json_body(conn)["message"] == "Core backup not supported"
+      refute_received {:core_lifecycle_call, :update, _opts}
+    end
+
+    test "backup: false -> update proceeds normally" do
+      stub_response(:update, {:ok, "2026.7.3"})
+      conn = post_("/core/update", %{"backup" => false})
+
+      assert conn.status == 200
+      assert_received {:core_lifecycle_call, :update, _opts}
+    end
+
+    test "backup absent -> update proceeds normally" do
+      stub_response(:update, {:ok, "2026.7.3"})
+      conn = post_("/core/update", %{})
+
+      assert conn.status == 200
+      assert_received {:core_lifecycle_call, :update, _opts}
+    end
+
+    test "a non-boolean backup -> 400" do
+      conn = post_("/core/update", %{"backup" => "yes"})
+
+      assert conn.status == 400
+      assert json_body(conn)["message"] =~ "boolean"
+      refute_received {:core_lifecycle_call, :update, _opts}
+    end
+
+    test "/homeassistant/update also refuses backup: true" do
+      conn = post_("/homeassistant/update", %{"backup" => true})
+
+      assert conn.status == 400
+      assert json_body(conn)["message"] == "Core backup not supported"
+      refute_received {:core_lifecycle_call, :update, _opts}
+    end
+  end
+
+  ## -- POST /core/{restart,rebuild} safe_mode/force body (audit E3) -----------
+
+  describe "POST /core/restart and /core/rebuild: safe_mode/force body validation" do
+    for {op, path} <- [restart: "/core/restart", rebuild: "/core/rebuild"] do
+      test "#{path}: safe_mode: true reaches Lifecycle.#{op}/1 as safe_mode: true" do
+        conn = post_(unquote(path), %{"safe_mode" => true})
+
+        assert conn.status == 200
+        assert_received {:core_lifecycle_call, unquote(op), opts}
+        assert Keyword.get(opts, :safe_mode) == true
+      end
+
+      test "#{path}: no body -> Lifecycle.#{op}/1 gets safe_mode: false" do
+        conn = post_(unquote(path))
+
+        assert conn.status == 200
+        assert_received {:core_lifecycle_call, unquote(op), opts}
+        assert Keyword.get(opts, :safe_mode) == false
+      end
+
+      test "#{path}: safe_mode: false -> safe_mode: false" do
+        conn = post_(unquote(path), %{"safe_mode" => false})
+
+        assert conn.status == 200
+        assert_received {:core_lifecycle_call, unquote(op), opts}
+        assert Keyword.get(opts, :safe_mode) == false
+      end
+
+      test "#{path}: force is accepted and ignored (never reaches Lifecycle)" do
+        conn = post_(unquote(path), %{"force" => true})
+
+        assert conn.status == 200
+        assert_received {:core_lifecycle_call, unquote(op), opts}
+        assert Keyword.get(opts, :safe_mode) == false
+        refute Keyword.has_key?(opts, :force)
+      end
+
+      test "#{path}: safe_mode + force together -> only safe_mode reaches Lifecycle" do
+        conn = post_(unquote(path), %{"safe_mode" => true, "force" => true})
+
+        assert conn.status == 200
+        assert_received {:core_lifecycle_call, unquote(op), opts}
+        assert Keyword.get(opts, :safe_mode) == true
+        refute Keyword.has_key?(opts, :force)
+      end
+
+      test "#{path}: a non-boolean safe_mode -> 400, Lifecycle never touched" do
+        conn = post_(unquote(path), %{"safe_mode" => "yes"})
+
+        assert conn.status == 400
+        assert json_body(conn)["message"] =~ "boolean"
+        refute_received {:core_lifecycle_call, unquote(op), _opts}
+      end
+
+      test "#{path}: a non-boolean force -> 400, Lifecycle never touched" do
+        conn = post_(unquote(path), %{"force" => "yes"})
+
+        assert conn.status == 400
+        assert json_body(conn)["message"] =~ "boolean"
+        refute_received {:core_lifecycle_call, unquote(op), _opts}
+      end
+
+      test "#{path}: an unknown key -> 400 (PREVENT_EXTRA), Lifecycle never touched" do
+        conn = post_(unquote(path), %{"bogus" => true})
+
+        assert conn.status == 400
+        assert json_body(conn)["message"] =~ "unknown keys"
+        refute_received {:core_lifecycle_call, unquote(op), _opts}
+      end
+    end
+
+    test "/homeassistant/restart also threads safe_mode through" do
+      conn = post_("/homeassistant/restart", %{"safe_mode" => true})
+
+      assert conn.status == 200
+      assert_received {:core_lifecycle_call, :restart, opts}
+      assert Keyword.get(opts, :safe_mode) == true
+    end
+
+    test "/homeassistant/rebuild also threads safe_mode through" do
+      conn = post_("/homeassistant/rebuild", %{"safe_mode" => true})
+
+      assert conn.status == 200
+      assert_received {:core_lifecycle_call, :rebuild, opts}
+      assert Keyword.get(opts, :safe_mode) == true
+    end
+
+    test "a safe-mode restart that fails to write the marker still maps through the normal error path" do
+      stub_response(:restart, {:error, {:safe_mode_marker, :eacces}})
+      conn = post_("/core/restart", %{"safe_mode" => true})
+
+      assert conn.status == 400
+      assert json_body(conn)["message"] =~ "safe_mode_marker"
     end
   end
 
@@ -488,12 +628,55 @@ defmodule Vagus.API.CoreLifecycleRouterTest do
       assert json_body(conn)["message"] =~ "something_weird"
     end
 
-    test "POST /core/check unhealthy -> 400 error envelope" do
-      Application.put_env(:vagus, :stub_core_health_response, :unhealthy)
+    test "POST /core/check invalid -> 400, message IS the check's log (G3)" do
+      Application.put_env(
+        :vagus,
+        :stub_core_config_check_response,
+        {:invalid, "some.yaml: invalid key\nhomeassistant.util.yaml.load: bad indent"}
+      )
+
       conn = post_("/core/check")
 
       assert conn.status == 400
-      assert json_body(conn)["message"] =~ "probe failed"
+      assert json_body(conn)["message"] =~ "homeassistant.util.yaml"
+    end
+
+    test "POST /core/check invalid, oversized log -> 400, message is truncated with a marker (W4)" do
+      oversized = String.duplicate("x", 100_000)
+
+      Application.put_env(
+        :vagus,
+        :stub_core_config_check_response,
+        {:invalid, oversized}
+      )
+
+      conn = post_("/core/check")
+      message = json_body(conn)["message"]
+
+      assert conn.status == 400
+      assert byte_size(message) < byte_size(oversized)
+      assert String.ends_with?(message, "... (truncated)")
+    end
+
+    test "POST /core/check while Core is not running -> 400, the deviation is documented in the message" do
+      Application.put_env(
+        :vagus,
+        :stub_core_config_check_response,
+        {:not_running, "cannot run config check while Core is not running"}
+      )
+
+      conn = post_("/core/check")
+
+      assert conn.status == 400
+      assert json_body(conn)["message"] =~ "not running"
+    end
+
+    test "POST /core/check a genuine ConfigCheck error -> 400, not a crash" do
+      Application.put_env(:vagus, :stub_core_config_check_response, {:error, :timeout})
+      conn = post_("/core/check")
+
+      assert conn.status == 400
+      assert json_body(conn)["message"] =~ "Config check failed"
     end
   end
 

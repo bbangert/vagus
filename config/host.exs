@@ -24,6 +24,10 @@ config :vagus, :core_token_path, Path.expand("../.dev/core_token.json", __DIR__)
 # pattern as :core_token_path above.
 config :vagus, :core_versions_path, Path.expand("../.dev/core.json", __DIR__)
 
+# Persisted POST supervisor/options fields (timezone/country/diagnostics,
+# audit E5). Same file-backed-JSON pattern as :core_token_path above.
+config :vagus, :supervisor_options_path, Path.expand("../.dev/supervisor_options.json", __DIR__)
+
 # Base URL Vagus.Core.Client/EventPusher use to reach Core itself (distinct
 # from :api_port above, which is the port THIS emulator listens on for
 # Core to call INTO). Real Home Assistant OS installs run Core and

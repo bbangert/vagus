@@ -62,6 +62,23 @@ defmodule Vagus.Core.Container do
   @spec config_volume() :: String.t()
   def config_volume, do: "vagus-core-config"
 
+  @doc """
+  Host path of Core's /config — the `vagus-core-config` named volume's
+  on-disk location, the docker "local" volume driver's fixed
+  `<data_root>/volumes/<name>/_data` layout (same convention
+  `Vagus.Backend.Host.DiskBreakdown` resolves for the disk-usage
+  breakdown's `homeassistant` node). `opts[:homeassistant_path]`
+  overrides the path outright — the real
+  `<Vagus.Engine.Manager.data_root()>/volumes/...` tree only exists on
+  target, so host tests point this at a tmp dir.
+  """
+  @spec config_path(keyword()) :: String.t()
+  def config_path(opts \\ []) do
+    Keyword.get_lazy(opts, :homeassistant_path, fn ->
+      Path.join([Vagus.Engine.Manager.data_root(), "volumes", config_volume(), "_data"])
+    end)
+  end
+
   @doc "The Core image reference for `version`, e.g. `ghcr.io/home-assistant/home-assistant:2026.7.0`."
   @spec image(String.t()) :: String.t()
   def image(version) when is_binary(version), do: @image_repo <> ":" <> version

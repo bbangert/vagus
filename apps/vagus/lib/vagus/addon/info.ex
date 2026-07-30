@@ -17,9 +17,18 @@ defmodule Vagus.Addon.Info do
   literal survives into the rendered value on purpose, see that call site.
   Core's hassio discovery only reads `.name`, but the whole payload must
   parse.
+
+  `boot`/`auto_update` (phase 6 chunk A, audit E1/E2) are the persisted
+  settings via `Config.effective_boot/2` and `settings[:auto_update]`
+  respectively — before this they were config-default `boot` and a
+  hardcoded `false` `auto_update`, so a `POST /addons/{slug}/options` save
+  of either 200'd and then reverted on the next read. `available`/
+  `machine`/`homeassistant` (audit G1) are computed by
+  `Vagus.Addon.Availability` / read straight off `config` — previously
+  `true`/`[]`/`nil` no matter what the add-on actually declared.
   """
 
-  alias Vagus.Addon.{Config, OptionsSchema}
+  alias Vagus.Addon.{Availability, Config, OptionsSchema}
 
   @doc """
   Builds the info map for `config` in lifecycle `state` (`:started`/`:stopped`)
@@ -38,6 +47,12 @@ defmodule Vagus.Addon.Info do
       `Vagus.Ingress.dynamic_port/2` has allocated one.
     * `:ingress_panel` — the persisted sidebar-panel toggle (§B4.4).
     * `:watchdog` — the persisted watchdog enable/disable (§B8).
+    * `:boot` — the persisted boot override, `nil | "auto" | "manual"`
+      (audit E1). Fed through `Config.effective_boot/2` alongside `config`,
+      so a `"manual_only"` config always wins regardless of what's here.
+    * `:auto_update` — the persisted auto-update toggle, `nil | boolean()`
+      (audit E2). `nil`/absent renders `false` — Vagus has no periodic
+      auto-updater, so this is reported honestly and never acted on.
     * `:version_latest` — the version the store currently advertises for this
       add-on, which drives `version_latest` and `update_available`. Omitted
       (or `nil`) means "not resolved": either the caller has no store context,
@@ -76,10 +91,10 @@ defmodule Vagus.Addon.Info do
     %{
       # AddonInfoBaseFields
       "advanced" => config.advanced,
-      "available" => true,
+      "available" => Availability.available?(config),
       "build" => false,
       "description" => config.description,
-      "homeassistant" => nil,
+      "homeassistant" => config.homeassistant,
       "icon" => Map.get(assets, :icon, false),
       "logo" => Map.get(assets, :logo, false),
       "name" => config.name,
@@ -115,14 +130,14 @@ defmodule Vagus.Addon.Info do
       "hostname" => String.replace(config.slug, "_", "-"),
       "dns" => [],
       "protected" => true,
-      "boot" => config.boot,
-      "boot_config" => "auto",
+      "boot" => Config.effective_boot(config, Map.get(settings, :boot)),
+      "boot_config" => config.boot,
       "options" => options,
       # The UI schema, not the raw config.yaml token map: the Configuration
       # page builds its form from this and drops to a YAML editor when it is
       # null, which is what every add-on got before.
       "schema" => OptionsSchema.ui(config.schema),
-      "machine" => [],
+      "machine" => config.machine,
       # Effective, not the config's defaults: this is what the Network card
       # renders, so reporting the declared ports would show the user's saved
       # remap reverting the moment the page reloads.
@@ -158,7 +173,7 @@ defmodule Vagus.Addon.Info do
       "ingress_panel" => ingress_panel(config, settings),
       "audio_input" => nil,
       "audio_output" => nil,
-      "auto_update" => false,
+      "auto_update" => Map.get(settings, :auto_update) || false,
       "ip_address" => "0.0.0.0",
       "watchdog" => Map.get(settings, :watchdog) || false,
       "devices" => [],

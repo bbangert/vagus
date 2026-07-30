@@ -74,6 +74,23 @@ defmodule Vagus.Core.ContainerTest do
     end
   end
 
+  describe "config_path/1" do
+    test "defaults to <engine data root>/volumes/<config_volume>/_data" do
+      assert Container.config_path() ==
+               Path.join([
+                 Vagus.Engine.Manager.data_root(),
+                 "volumes",
+                 Container.config_volume(),
+                 "_data"
+               ])
+    end
+
+    test "opts[:homeassistant_path] overrides the whole path" do
+      assert Container.config_path(homeassistant_path: "/tmp/fake-core-config") ==
+               "/tmp/fake-core-config"
+    end
+  end
+
   describe "image/1" do
     test "formats the generic Core image repo with the given version tag" do
       assert Container.image("2026.7.0") == "ghcr.io/home-assistant/home-assistant:2026.7.0"

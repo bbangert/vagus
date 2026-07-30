@@ -143,6 +143,10 @@ config :vagus, :core_base_url, "http://localhost:8123"
 # for the rationale, identical on target.
 config :vagus, :core_versions_path, "/data/vagus/core.json"
 
+# Persisted POST supervisor/options fields (audit E5) — see config/host.exs
+# for the rationale, identical on target.
+config :vagus, :supervisor_options_path, "/data/vagus/supervisor_options.json"
+
 # Add-on runtime (M4). The balena-engine daemon's control socket
 # (`Vagus.Engine.Manager`'s `--host`); `Vagus.Runtime.Docker` talks to it.
 config :vagus, :docker_socket, "/run/balena-engine.sock"

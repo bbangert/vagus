@@ -74,6 +74,14 @@ defmodule Vagus.Application do
         Vagus.Discovery,
         Vagus.Auth,
 
+        # Persisted POST /supervisor/options fields (timezone/country/
+        # diagnostics, audit E5) that GET /supervisor/info and GET /info
+        # read back live — same file-backed-JSON boot-reload convention as
+        # Vagus.Core.TokenStore. Started here, before Vagus.API.Supervisor,
+        # so the HTTP surface's very first request can already see a value
+        # posted before a restart.
+        Vagus.API.SupervisorOptions,
+
         # Holds the native "virtual add-on" BEAM subtrees (M5, the mqttx
         # broker) once `Vagus.Addon.Backend.Native.start/1` starts them —
         # mirrors `Vagus.Engine.DaemonSupervisor`. Started unconditionally on

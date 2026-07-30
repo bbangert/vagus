@@ -295,6 +295,93 @@ defmodule Vagus.Core.VersionsTest do
     end
   end
 
+  describe "call timeout exceeds the fetch's own receive timeout (G2)" do
+    test "a fetch slower than the GenServer.call/2 default (5s) but under @call_timeout (15s) still answers" do
+      path = tmp_path()
+      on_exit(fn -> File.rm(path) end)
+
+      # Comfortably above the plain-`GenServer.call/2` default of 5s (the
+      # exact bug: a caller with the bare default would `:exit :timeout`
+      # here even though this store is healthy and about to reply) and
+      # comfortably below the fetch's own 10s receive_timeout / this
+      # module's 15s @call_timeout.
+      fetch = fn ->
+        Process.sleep(5_500)
+        {:ok, "2026.7.9"}
+      end
+
+      versions = start_versions(path: path, fetch: fetch)
+
+      assert Versions.latest(versions) == "2026.7.9"
+    end
+  end
+
+  describe "invalidate/1 (G4)" do
+    test "forces the next latest/1 to re-fetch instead of serving the 24h cache" do
+      path = tmp_path()
+      on_exit(fn -> File.rm(path) end)
+      counter = start_counter()
+      clock = start_clock_agent()
+
+      versions =
+        start_versions(
+          path: path,
+          now: clock_fun(clock),
+          fetch: counting_fetch(counter, fn -> {:ok, "2026.7.5"} end)
+        )
+
+      assert Versions.latest(versions) == "2026.7.5"
+      assert count(counter) == 1
+
+      # Cache is still fresh (no clock advance) — without invalidate/1 this
+      # would be served from cache with no second fetch.
+      :ok = Versions.invalidate(versions)
+      assert Versions.latest(versions) == "2026.7.5"
+      assert count(counter) == 2
+    end
+
+    test "invalidating while a fetch is in flight doesn't strand the queued waiter" do
+      path = tmp_path()
+      on_exit(fn -> File.rm(path) end)
+      test_pid = self()
+      counter = start_counter()
+
+      fetch = fn ->
+        Agent.update(counter, &(&1 + 1))
+        send(test_pid, {:fetch_invoked, self()})
+
+        receive do
+          :release -> {:ok, "2026.7.9"}
+        end
+      end
+
+      versions = start_versions(path: path, fetch: fetch)
+
+      latest_task = Task.async(fn -> Versions.latest(versions) end)
+      assert_receive {:fetch_invoked, fetch_pid}, 1_000
+
+      # Arrives mid-fetch: must not cancel the in-flight fetch or drop the
+      # waiter already queued behind it.
+      :ok = Versions.invalidate(versions)
+
+      send(fetch_pid, :release)
+      assert Task.await(latest_task) == "2026.7.9"
+      assert count(counter) == 1
+    end
+
+    test "an idle invalidate (nothing cached yet) is a harmless no-op" do
+      path = tmp_path()
+      on_exit(fn -> File.rm(path) end)
+
+      versions = start_versions(path: path, fetch: never_fetch())
+      :ok = Versions.invalidate(versions)
+
+      # never_fetch/0 flunks if called — proves invalidate alone didn't
+      # trigger a fetch.
+      assert Versions.installed(versions) == nil
+    end
+  end
+
   describe "the fetch runs off the server loop" do
     test "installed/1 is not blocked by a slow in-flight latest fetch" do
       path = tmp_path()

@@ -21,11 +21,21 @@ defmodule Vagus.API.StaticData do
   `machine` is the one board-varying value here and is read from config
   (`config :vagus, :machine`) rather than pinned — `"raspberrypi3-64"` on
   rpi3_64, `"generic-aarch64"` on dragon_q6a.
+
+  `arch/0` and `machine/0` are public (not just used internally by
+  `root_info/0`/`core_info/0`) because `Vagus.Addon.Availability` (phase 6
+  chunk A, audit G1) needs this device's own facts to decide whether an
+  add-on can run here at all — the single source both call sites read from,
+  so a store card and `/info` can never disagree about what device this is.
   """
 
   @supervisor_version "2026.07.3"
   @core_version "2026.7.2"
   @arch "aarch64"
+
+  @doc "This device's emulated CPU architecture. See the moduledoc."
+  @spec arch() :: String.t()
+  def arch, do: @arch
 
   # The board identity, read at runtime (not a compile-time attribute) so
   # each target — and :host/:test — sets it independently in config. See
@@ -40,8 +50,9 @@ defmodule Vagus.API.StaticData do
   # exists to prevent. Every config path that can reach this code
   # (rpi3_64, dragon_q6a, host, test) sets the key, so raising here means a
   # genuine misconfiguration, not a missing convenience.
+  @doc "This device's board/machine identity. See the moduledoc."
   @spec machine() :: String.t()
-  defp machine, do: Application.fetch_env!(:vagus, :machine)
+  def machine, do: Application.fetch_env!(:vagus, :machine)
 
   @doc """
   Attrs for `Vagus.API.Models.RootInfo` (`GET info`).

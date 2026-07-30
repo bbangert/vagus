@@ -37,6 +37,36 @@ defmodule Vagus.Core.LifecycleTest do
 
   defp unique, do: System.unique_integer([:positive])
 
+  # `opts[:homeassistant_path]` override for the safe-mode marker tests
+  # below — a real writable dir standing in for the `vagus-core-config`
+  # volume's host path, which only exists on target.
+  defp tmp_config_dir do
+    dir = Path.join(System.tmp_dir!(), "vagus_test_lifecycle_config_#{unique()}")
+    File.mkdir_p!(dir)
+    on_exit(fn -> File.rm_rf!(dir) end)
+    dir
+  end
+
+  # A path that doesn't exist yet (unlike `tmp_config_dir/0`) — for the
+  # "mkdir_p creates a missing parent" tests. Not created here; the op
+  # under test is expected to create it.
+  defp tmp_uncreated_config_dir do
+    dir = Path.join(System.tmp_dir!(), "vagus_test_lifecycle_uncreated_#{unique()}")
+    on_exit(fn -> File.rm_rf!(dir) end)
+    dir
+  end
+
+  # A regular file standing where a directory needs to go — `File.mkdir_p/1`
+  # fails on this (`:enotdir`) the same way it would on a real permissions
+  # problem, so this is what now exercises the "abort on write failure"
+  # path (a merely-missing parent is no longer a failure — W1).
+  defp blocking_file do
+    path = Path.join(System.tmp_dir!(), "vagus_test_lifecycle_blocking_#{unique()}")
+    File.write!(path, "not a directory")
+    on_exit(fn -> File.rm(path) end)
+    path
+  end
+
   ## Health gate helper — a zero-arity fn that also counts its own calls via
   ## message-passing back to the test process (no Agent needed for a single
   ## counter the test process itself owns and reads via `assert_receive`).
@@ -393,6 +423,159 @@ defmodule Vagus.Core.LifecycleTest do
 
       assert {:error, :no_version} =
                Lifecycle.rebuild(docker: [socket: engine.socket], versions: versions)
+
+      assert FakeEngine.requests(engine) == []
+    end
+  end
+
+  ## safe_mode marker (audit E3) — restart/1 and rebuild/1
+
+  describe "restart/1 safe_mode marker" do
+    test "safe_mode: true touches an empty safe-mode file before the restart request" do
+      dir = tmp_config_dir()
+      engine = start_engine([{204, nil}])
+
+      assert :ok =
+               Lifecycle.restart(
+                 docker: [socket: engine.socket],
+                 health: health_fun(),
+                 safe_mode: true,
+                 homeassistant_path: dir
+               )
+
+      assert_receive :health_called
+      assert File.read!(Path.join(dir, "safe-mode")) == ""
+
+      assert [%{method: :post, path: "/containers/homeassistant/restart"}] =
+               FakeEngine.requests(engine)
+    end
+
+    test "safe_mode: false (the default) never touches the marker" do
+      dir = tmp_config_dir()
+      engine = start_engine([{204, nil}])
+
+      assert :ok = Lifecycle.restart(docker: [socket: engine.socket], health: health_fun())
+      assert_receive :health_called
+      refute File.exists?(Path.join(dir, "safe-mode"))
+    end
+
+    test "a nonexistent parent dir is created (W1) and the marker lands" do
+      dir = tmp_uncreated_config_dir()
+      refute File.exists?(dir)
+      engine = start_engine([{204, nil}])
+
+      assert :ok =
+               Lifecycle.restart(
+                 docker: [socket: engine.socket],
+                 health: health_fun(),
+                 safe_mode: true,
+                 homeassistant_path: dir
+               )
+
+      assert_receive :health_called
+      assert File.read!(Path.join(dir, "safe-mode")) == ""
+    end
+
+    test "a marker write failure aborts the restart before any Engine-API call reaches the daemon" do
+      blocking = blocking_file()
+      engine = start_engine([{204, nil}])
+
+      assert {:error, {:safe_mode_marker, _reason}} =
+               Lifecycle.restart(
+                 docker: [socket: engine.socket],
+                 safe_mode: true,
+                 homeassistant_path: blocking
+               )
+
+      assert FakeEngine.requests(engine) == []
+    end
+  end
+
+  describe "rebuild/1 safe_mode marker" do
+    test "safe_mode: true touches the marker after the version resolves, before stop/remove/create" do
+      dir = tmp_config_dir()
+
+      engine =
+        start_engine([
+          {200, inspect_body(Container.image("2026.6.0"), true)},
+          {204, nil},
+          {204, nil},
+          create_ok("rebuilt-id"),
+          {204, nil}
+        ])
+
+      versions = start_versions("2026.7.0")
+
+      assert :ok =
+               Lifecycle.rebuild(
+                 docker: [socket: engine.socket],
+                 versions: versions,
+                 health: health_fun(),
+                 safe_mode: true,
+                 homeassistant_path: dir
+               )
+
+      assert_receive :health_called
+      assert File.read!(Path.join(dir, "safe-mode")) == ""
+    end
+
+    test "no installed version -> {:error, :no_version}, marker never written" do
+      dir = tmp_config_dir()
+      engine = start_engine([])
+      versions = start_versions()
+
+      assert {:error, :no_version} =
+               Lifecycle.rebuild(
+                 docker: [socket: engine.socket],
+                 versions: versions,
+                 safe_mode: true,
+                 homeassistant_path: dir
+               )
+
+      refute File.exists?(Path.join(dir, "safe-mode"))
+      assert FakeEngine.requests(engine) == []
+    end
+
+    test "a nonexistent parent dir is created (W1) and the marker lands" do
+      dir = tmp_uncreated_config_dir()
+      refute File.exists?(dir)
+
+      engine =
+        start_engine([
+          {200, inspect_body(Container.image("2026.6.0"), true)},
+          {204, nil},
+          {204, nil},
+          create_ok("rebuilt-id"),
+          {204, nil}
+        ])
+
+      versions = start_versions("2026.7.0")
+
+      assert :ok =
+               Lifecycle.rebuild(
+                 docker: [socket: engine.socket],
+                 versions: versions,
+                 health: health_fun(),
+                 safe_mode: true,
+                 homeassistant_path: dir
+               )
+
+      assert_receive :health_called
+      assert File.read!(Path.join(dir, "safe-mode")) == ""
+    end
+
+    test "a marker write failure aborts before stop/remove/create reach the daemon" do
+      blocking = blocking_file()
+      engine = start_engine([{200, inspect_body(Container.image("2026.6.0"), true)}])
+      versions = start_versions("2026.7.0")
+
+      assert {:error, {:safe_mode_marker, _reason}} =
+               Lifecycle.rebuild(
+                 docker: [socket: engine.socket],
+                 versions: versions,
+                 safe_mode: true,
+                 homeassistant_path: blocking
+               )
 
       assert FakeEngine.requests(engine) == []
     end

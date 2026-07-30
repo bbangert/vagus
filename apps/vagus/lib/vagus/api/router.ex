@@ -30,13 +30,13 @@ defmodule Vagus.API.Router do
 
   require Logger
 
+  alias Vagus.Addon.{Availability, Manager, OptionsSchema, Ports, State, Store, StoreView, Update}
   alias Vagus.Addon.Backend.Native
-  alias Vagus.Addon.{Manager, OptionsSchema, Ports, State, Store, StoreView, Update}
   alias Vagus.Addon.Store.Assets
-  alias Vagus.API.{Envelope, StaticData, Tiers}
+  alias Vagus.API.{Envelope, StaticData, SupervisorOptions, Tiers}
   alias Vagus.Backend
   alias Vagus.Backups
-  alias Vagus.Core.{Health, Lifecycle, TokenStore, Versions}
+  alias Vagus.Core.{ConfigCheck, Lifecycle, TokenStore, Versions}
   alias Vagus.Discovery
   alias Vagus.Jobs
   alias Vagus.Mqtt.Broker
@@ -143,12 +143,34 @@ defmodule Vagus.API.Router do
 
   # -- Main coordinator (5 min) + one-time setup GETs -----------------------
 
+  # `homeassistant` and `timezone` are live-overlaid over
+  # `StaticData.root_info/0`'s compile-time defaults (audit G5/D1):
+  # upstream reads the identical `homeassistant` attribute for both this
+  # endpoint and `GET core/info`'s `version`, so serving `/info` from a
+  # separate static constant let the two disagree mid-request (observed
+  # live, 2026-07-29). `timezone` is `Vagus.API.SupervisorOptions`' persisted
+  # value from `POST supervisor/options` (audit E5), falling back to
+  # StaticData's `"UTC"` default when nothing has been posted yet.
   get "/info" do
-    Envelope.send_ok(conn, RootInfo.build!(StaticData.root_info()))
+    static = StaticData.root_info()
+
+    attrs =
+      static
+      |> Map.put(:homeassistant, live_homeassistant_version(static[:homeassistant]))
+      |> merge_present(%{timezone: SupervisorOptions.timezone()})
+
+    Envelope.send_ok(conn, RootInfo.build!(attrs))
   end
 
+  # `timezone`/`country`/`diagnostics` are `Vagus.API.SupervisorOptions`'
+  # persisted values from `POST supervisor/options` (audit E5) — everywhere
+  # else this endpoint still serves `StaticData.supervisor_info/0`'s Phase 2
+  # statics. `merge_present/2` only overlays a field when the persisted
+  # value is non-nil, so a field never posted stays exactly the static
+  # default (`nil` for all three today).
   get "/supervisor/info" do
-    Envelope.send_ok(conn, SupervisorInfo.build!(StaticData.supervisor_info()))
+    attrs = merge_present(StaticData.supervisor_info(), SupervisorOptions.get())
+    Envelope.send_ok(conn, SupervisorInfo.build!(attrs))
   end
 
   # `version`/`version_latest`/`update_available` come from `Vagus.Core.Versions`
@@ -1086,27 +1108,37 @@ defmodule Vagus.API.Router do
   # Every route here is supervisor-only (Core drives start/stop/restart/
   # rebuild/check/update from the frontend's Core dashboard; an add-on never
   # manages Core's lifecycle) — a non-supervisor caller gets a 403 before any
-  # `Lifecycle`/`Health` call, via `supervisor_only/2` (same guard as the
+  # `Lifecycle`/`ConfigCheck` call, via `supervisor_only/2` (same guard as the
   # `/backups...` routes).
   #
-  # Every op funnels through `Vagus.Core.Lifecycle`'s single non-blocking
-  # `:global.trans` mutex (see that module's moduledoc "Serialization"
-  # section) — there is exactly one Core container, so a second lifecycle
-  # call arriving while one is already in flight gets `{:error, :busy}` back
-  # immediately rather than queueing; `core_lifecycle_error/2` maps that to
-  # 409 below. `:core_lifecycle`/`:core_health` are per-request config seams
-  # (default `Vagus.Core.Lifecycle`/`Vagus.Core.Health`), resolved the same
-  # way `core_container/0` resolves its config value — tests inject a stub
-  # module via `Application.put_env/3` instead of a real Docker socket/HTTP
-  # probe. `/homeassistant/*` are the contract's alias of `/core/*` (same
-  # convention as the logs routes above).
+  # Every lifecycle op funnels through `Vagus.Core.Lifecycle`'s single
+  # non-blocking `:global.trans` mutex (see that module's moduledoc
+  # "Serialization" section) — there is exactly one Core container, so a
+  # second lifecycle call arriving while one is already in flight gets
+  # `{:error, :busy}` back immediately rather than queueing;
+  # `send_core_lifecycle_error/2` maps that to 409 below. `:core_lifecycle`/
+  # `:core_config_check` are per-request config seams (default
+  # `Vagus.Core.Lifecycle`/`Vagus.Core.ConfigCheck`), resolved the same way
+  # `core_container/0` resolves its config value — tests inject a stub module
+  # via `Application.put_env/3` instead of a real Docker socket/HTTP probe.
+  # `/homeassistant/*` are the contract's alias of `/core/*` (same convention
+  # as the logs routes above).
+  #
+  # `restart`/`rebuild` read the body for `safe_mode`/`force` (audit E3) —
+  # `handle_core_restart_or_rebuild/2` validates it before either `Lifecycle`
+  # function runs, mirroring `validate_core_update_version/1`'s "malformed
+  # input must never reach the lock/pull machinery" stance below. `start`/
+  # `stop` take no body, matching upstream (neither route's schema there
+  # accepts anything).
   #
   # `POST /core/update` can run for minutes — pulling a multi-GB Core image
   # on a slow device, then the health gate. Wrapped in a
   # `home_assistant_core_update` job (see `run_core_update/2`):
   # `background: true` returns `{job_id}` immediately, and the sync path is
   # bounded by Bandit's configured 900s `read_timeout`
-  # (`Vagus.API.Supervisor`), not anything in this router.
+  # (`Vagus.API.Supervisor`), not anything in this router. `backup: true` is
+  # refused (audit E4) rather than silently ignored — see
+  # `validate_core_update_backup/1`.
 
   post "/core/start" do
     core_lifecycle_action(conn, fn -> core_lifecycle().start() end)
@@ -1117,11 +1149,11 @@ defmodule Vagus.API.Router do
   end
 
   post "/core/restart" do
-    core_lifecycle_action(conn, fn -> core_lifecycle().restart() end)
+    handle_core_restart_or_rebuild(conn, fn opts -> core_lifecycle().restart(opts) end)
   end
 
   post "/core/rebuild" do
-    core_lifecycle_action(conn, fn -> core_lifecycle().rebuild() end)
+    handle_core_restart_or_rebuild(conn, fn opts -> core_lifecycle().rebuild(opts) end)
   end
 
   post "/core/check" do
@@ -1141,11 +1173,11 @@ defmodule Vagus.API.Router do
   end
 
   post "/homeassistant/restart" do
-    core_lifecycle_action(conn, fn -> core_lifecycle().restart() end)
+    handle_core_restart_or_rebuild(conn, fn opts -> core_lifecycle().restart(opts) end)
   end
 
   post "/homeassistant/rebuild" do
-    core_lifecycle_action(conn, fn -> core_lifecycle().rebuild() end)
+    handle_core_restart_or_rebuild(conn, fn opts -> core_lifecycle().rebuild(opts) end)
   end
 
   post "/homeassistant/check" do
@@ -1156,21 +1188,48 @@ defmodule Vagus.API.Router do
     core_update_action(conn)
   end
 
+  # Validated against upstream's declared vocabulary (PREVENT_EXTRA schema —
+  # an unknown key 400s, same C5/`reject_unknown_keys/2` pattern as the
+  # backup routes). `timezone`/`country`/`diagnostics` are persisted to
+  # `Vagus.API.SupervisorOptions` and read back by `GET supervisor/info`/
+  # `GET info` (audit E5); the rest (`channel`, `addons_repositories`,
+  # `wait_boot`, `debug`, `debug_block`, `logging`, `auto_update`,
+  # `detect_blocking_io`) are type/enum-checked then dropped — Vagus has no
+  # channel/debug/wait_boot machinery to apply them to, same
+  # "validate shape, then ignore" standing rule
+  # `Vagus.Backend.Network.WireConfig`'s moduledoc documents for its own
+  # unsupported fields.
   post "/supervisor/options" do
-    Envelope.send_ok(conn, %{})
+    case validate_supervisor_options(conn.body_params) do
+      {:ok, persisted} ->
+        :ok = SupervisorOptions.put(persisted)
+        Envelope.send_ok(conn, %{})
+
+      {:error, message} ->
+        Envelope.send_error(conn, message, 400)
+    end
   end
 
   # -- Honest no-ops (accepted, do nothing) -----------------------------------
 
+  # These three (audit G4) previously left `Vagus.Core.Versions`' 24h
+  # `latest` cache untouched — the frontend's "Check for updates" button
+  # calls `reload_updates` before every non-scheduled refresh, so on Vagus
+  # it "succeeded" while the version stayed stale for up to a day.
+  # `invalidate/1` expires the cache so the next read refetches; the
+  # response itself stays the same honest no-op envelope upstream returns.
   post "/supervisor/reload" do
+    Versions.invalidate(core_versions_server())
     Envelope.send_ok(conn, %{})
   end
 
   post "/refresh_updates" do
+    Versions.invalidate(core_versions_server())
     Envelope.send_ok(conn, %{})
   end
 
   post "/reload_updates" do
+    Versions.invalidate(core_versions_server())
     Envelope.send_ok(conn, %{})
   end
 
@@ -1200,10 +1259,171 @@ defmodule Vagus.API.Router do
     Envelope.send_ok(conn, %{})
   end
 
+  # -- Supervisor options (audit E5) ------------------------------------------
+
+  # Upstream's `SCHEMA_OPTIONS` (`supervisor/api/supervisor.py`), PREVENT_EXTRA.
+  @supervisor_options_keys ~w(
+    channel addons_repositories timezone country wait_boot debug debug_block
+    logging diagnostics auto_update detect_blocking_io
+  )
+  @supervisor_options_channels ~w(stable beta dev)
+  @supervisor_options_logging_levels ~w(debug info warning error critical)
+
+  # Validates every declared key's shape (types/enums), including the ones
+  # this emulator can't act on, then returns only the subset
+  # `Vagus.API.SupervisorOptions` persists. See the moduledoc note on the
+  # route above for why the rest are validated-then-dropped rather than
+  # rejected outright.
+  defp validate_supervisor_options(params) do
+    with :ok <- reject_unknown_keys(params, @supervisor_options_keys),
+         {:ok, _channel} <-
+           fetch_typed(params, "channel", &validate_enum(&1, @supervisor_options_channels)),
+         {:ok, _repos} <- fetch_typed(params, "addons_repositories", &validate_string_list/1),
+         {:ok, timezone} <- fetch_typed(params, "timezone", &validate_timezone/1),
+         {:ok, country} <- fetch_typed(params, "country", &validate_short_string/1),
+         {:ok, _wait_boot} <- fetch_typed(params, "wait_boot", &validate_integer/1),
+         {:ok, _debug} <- fetch_typed(params, "debug", &validate_boolean/1),
+         {:ok, _debug_block} <- fetch_typed(params, "debug_block", &validate_boolean/1),
+         {:ok, _logging} <-
+           fetch_typed(params, "logging", &validate_enum(&1, @supervisor_options_logging_levels)),
+         {:ok, diagnostics} <- fetch_typed(params, "diagnostics", &validate_boolean/1),
+         {:ok, _auto_update} <- fetch_typed(params, "auto_update", &validate_boolean/1),
+         {:ok, _detect_blocking_io} <-
+           fetch_typed(params, "detect_blocking_io", &validate_boolean/1) do
+      persisted =
+        %{}
+        |> put_if_present("timezone", timezone)
+        |> put_if_present("country", country)
+        |> put_if_present("diagnostics", diagnostics)
+
+      {:ok, persisted}
+    end
+  end
+
+  # Runs `validator` against `params[key]` when present, prefixing any error
+  # with the field name (so a 400 body reads e.g. "timezone must be a
+  # string" instead of just "must be a string"). Absent -> `{:ok, nil}`,
+  # never validated — every field here is optional.
+  defp fetch_typed(params, key, validator) do
+    case Map.fetch(params, key) do
+      :error -> {:ok, nil}
+      {:ok, value} -> validator.(value) |> prefix_type_error(key)
+    end
+  end
+
+  defp prefix_type_error({:ok, _} = ok, _key), do: ok
+  defp prefix_type_error({:error, msg}, key), do: {:error, "#{key} #{msg}"}
+
+  # `timezone` is served back to every `:default`-tier caller via
+  # `GET /supervisor/info`/`GET /info` and survives reboot
+  # (`Vagus.API.SupervisorOptions` persists it), so unlike a plain
+  # "must be a string" check, this one needed a bound (security-phase6.md
+  # W1). IANA tz names are short ASCII (e.g. "America/Los_Angeles");
+  # upstream validates the value against a real tz database
+  # (`voluptuous`'s zoneinfo check). Vagus has no tz database to check
+  # against, so this is the honest subset: printable, no control
+  # characters, ≤64 bytes — shape, not membership. `String.printable?/1`
+  # is not used for the control-character check: this Unicode data set
+  # treats several C0 codes (BEL, TAB, LF, CR, and notably ESC — the
+  # ANSI-escape lead byte) as "printable", so the check below is explicit
+  # rather than delegated to it.
+  @control_char_re ~r/[\x00-\x1F\x7F]/
+  defp validate_timezone(v) when is_binary(v) and byte_size(v) in 1..64 do
+    if Regex.match?(@control_char_re, v) do
+      {:error, "must not contain control characters"}
+    else
+      {:ok, v}
+    end
+  end
+
+  defp validate_timezone(_other),
+    do: {:error, "must be a string of 1-64 bytes with no control characters"}
+
+  # "Short" (audit's wording): not a real ISO-3166 check, just shape —
+  # upstream's own `country` schema is similarly loose (`vol.All(str,
+  # vol.Length(min=1))`, no allowlist). Control chars rejected for the
+  # same reason as timezone above: a 9-byte ANSI escape fits inside the
+  # 10-byte bound, and the value is served back to every default-tier
+  # caller.
+  defp validate_short_string(v) when is_binary(v) and byte_size(v) in 1..10 do
+    if Regex.match?(@control_char_re, v) do
+      {:error, "must not contain control characters"}
+    else
+      {:ok, v}
+    end
+  end
+
+  defp validate_short_string(_other), do: {:error, "must be a short (1-10 byte) string"}
+
+  defp validate_boolean(v) when is_boolean(v), do: {:ok, v}
+  defp validate_boolean(_other), do: {:error, "must be a boolean"}
+
+  defp validate_integer(v) when is_integer(v), do: {:ok, v}
+  defp validate_integer(_other), do: {:error, "must be an integer"}
+
+  defp validate_enum(v, allowed) when is_binary(v) do
+    if v in allowed do
+      {:ok, v}
+    else
+      {:error, "must be one of #{Enum.join(allowed, ", ")}"}
+    end
+  end
+
+  defp validate_enum(_other, allowed),
+    do: {:error, "must be one of #{Enum.join(allowed, ", ")}"}
+
+  defp validate_string_list(v) when is_list(v) do
+    if Enum.all?(v, &is_binary/1) do
+      {:ok, v}
+    else
+      {:error, "must be a list of strings"}
+    end
+  end
+
+  defp validate_string_list(_other), do: {:error, "must be a list of strings"}
+
+  defp put_if_present(map, _key, nil), do: map
+  defp put_if_present(map, key, value), do: Map.put(map, key, value)
+
+  # Overlays `overrides` onto `attrs`, skipping any `nil` value — used by
+  # `GET info`/`GET supervisor/info` so an unposted `Vagus.API.SupervisorOptions`
+  # field falls through to `StaticData`'s default instead of clobbering it
+  # with an explicit `nil`.
+  defp merge_present(attrs, overrides) do
+    present = overrides |> Enum.reject(fn {_k, v} -> is_nil(v) end) |> Map.new()
+    Map.merge(attrs, present)
+  end
+
+  # G5: `/info`'s `homeassistant` must read the same fact `/core/info`'s
+  # `version` does (`Vagus.Core.Versions.installed/1`) rather than a
+  # separate compile-time constant, or the two can disagree mid-poll.
+  # Tolerant of a `Versions.installed/1` exit — `/info` is the hassio
+  # coordinator's main poll and must never 500 the whole thing over a
+  # `Vagus.Core.Versions` hiccup (G2 raised its call timeout well above the
+  # fetch's own, but this is extra insurance for that specific endpoint).
+  defp live_homeassistant_version(static_fallback) do
+    case safe_versions_installed() do
+      {:ok, version} -> version
+      :error -> static_fallback
+    end
+  end
+
+  defp safe_versions_installed do
+    {:ok, Versions.installed(core_versions_server())}
+  catch
+    :exit, reason ->
+      Logger.warning(
+        "Vagus.API.Router: GET /info Versions.installed/1 exited (#{inspect(reason)}) " <>
+          "— falling back to the static Core version"
+      )
+
+      :error
+  end
+
   # -- Core lifecycle helpers (CL-P3-T1) --------------------------------------
 
-  # `start`/`stop`/`restart`/`rebuild` all share this shape: no request body,
-  # `:ok` -> ok envelope, `{:error, reason}` -> mapped status below.
+  # `start`/`stop` share this shape: no request body, `:ok` -> ok envelope,
+  # `{:error, reason}` -> mapped status below.
   defp core_lifecycle_action(conn, fun) do
     supervisor_only(conn, fn ->
       case fun.() do
@@ -1213,28 +1433,117 @@ defmodule Vagus.API.Router do
     end)
   end
 
-  defp core_check_action(conn) do
+  # `restart`/`rebuild`'s body-reading sibling of `core_lifecycle_action/2`
+  # (audit E3) — `fun` is `Lifecycle.restart/1` or `Lifecycle.rebuild/1`.
+  # Body validated BEFORE either function runs, same "malformed input never
+  # reaches the lock" stance `core_update_action/1` already takes for
+  # `version`.
+  defp handle_core_restart_or_rebuild(conn, fun) do
     supervisor_only(conn, fn ->
-      case core_health().check() do
-        :healthy -> Envelope.send_ok(conn, %{})
-        :unhealthy -> Envelope.send_error(conn, "Core frontend probe failed", 400)
-      end
-    end)
-  end
-
-  # Body validated BEFORE touching `Lifecycle` — a malformed `version` must
-  # never reach the lock/pull machinery. Absent/`nil` -> `update(nil)`
-  # (`Lifecycle` resolves that to `Versions.latest/1`).
-  defp core_update_action(conn) do
-    supervisor_only(conn, fn ->
-      case validate_core_update_version(conn.body_params) do
-        {:ok, version} ->
-          run_core_update(conn, version)
+      case validate_core_lifecycle_body(conn.body_params) do
+        {:ok, opts} ->
+          case fun.(opts) do
+            :ok -> Envelope.send_ok(conn, %{})
+            {:error, reason} -> send_core_lifecycle_error(conn, reason)
+          end
 
         {:error, message} ->
           Envelope.send_error(conn, message, 400)
       end
     end)
+  end
+
+  # Upstream's restart/rebuild schema, PREVENT_EXTRA:
+  # `{safe_mode: bool = false, force: bool = false}`. `force` is
+  # type-checked but never threaded into `opts` — `Lifecycle` has no gate
+  # for it to bypass (see that module's moduledoc "Safe mode" section).
+  @core_restart_keys ~w(force safe_mode)
+
+  defp validate_core_lifecycle_body(params) do
+    with :ok <- reject_unknown_keys(params, @core_restart_keys),
+         {:ok, safe_mode} <- validate_bool_key(params, "safe_mode"),
+         {:ok, _force} <- validate_bool_key(params, "force") do
+      {:ok, [safe_mode: safe_mode]}
+    end
+  end
+
+  defp validate_bool_key(params, key) do
+    case Map.fetch(params, key) do
+      :error -> {:ok, false}
+      {:ok, value} when is_boolean(value) -> {:ok, value}
+      {:ok, _other} -> {:error, "#{key} must be a boolean"}
+    end
+  end
+
+  defp core_check_action(conn) do
+    supervisor_only(conn, fn ->
+      case core_config_check().check() do
+        :valid ->
+          Envelope.send_ok(conn, %{})
+
+        {:invalid, log} ->
+          Envelope.send_error(conn, truncate_check_log(log), 400)
+
+        {:not_running, message} ->
+          Envelope.send_error(conn, message, 400)
+
+        {:error, reason} ->
+          Envelope.send_error(conn, "Config check failed: #{inspect(reason)}", 400)
+      end
+    end)
+  end
+
+  # `check_config`'s log is bounded only by `Docker.exec_capture/3`'s
+  # generic 16MB Engine-API response ceiling (security-phase6.md W3) —
+  # without this, a chatty custom-integration traceback becomes a 16MB
+  # JSON error body, with several unserialised copies (raw + demuxed +
+  # stripped + encoded) alive at once on a 1GB device. `String.byte_slice/3`,
+  # not `String.slice/3`: the bound is in bytes, so the cut must be too — a
+  # grapheme slice of a multibyte log can land several times over the
+  # stated bound (the same lesson `Vagus.Jobs.truncate_message/1` encodes
+  # for job-error messages, PR #29 review). `byte_slice` also drops any
+  # codepoint it would split, keeping the result valid UTF-8. Full length
+  # goes to the log at :debug — this only bounds what leaves over HTTP.
+  @max_check_log_bytes 65_536
+  defp truncate_check_log(log) when byte_size(log) <= @max_check_log_bytes, do: log
+
+  defp truncate_check_log(log) do
+    Logger.debug(
+      "Vagus.API.Router: check_config log truncated to #{@max_check_log_bytes} bytes " <>
+        "(was #{byte_size(log)})"
+    )
+
+    String.byte_slice(log, 0, @max_check_log_bytes) <> "... (truncated)"
+  end
+
+  # Body validated BEFORE touching `Lifecycle` — a malformed `version` must
+  # never reach the lock/pull machinery. Absent/`nil` -> `update(nil)`
+  # (`Lifecycle` resolves that to `Versions.latest/1`). `backup: true` is
+  # refused outright (audit E4) rather than threaded through: Vagus's
+  # backup format has no concept of a Core-config folder yet
+  # (`Vagus.Backup.create/1` always emits `"homeassistant" => nil,
+  # "folders" => []`) — the same gap `/backups/new/partial`'s
+  # `reject_homeassistant/2` already refuses for the general backup route,
+  # so shipping a `backup: true` that silently backs up nothing would be
+  # the more dangerous failure: a caller trusting the name gets unrecoverable
+  # data loss instead of an honest 400.
+  defp core_update_action(conn) do
+    supervisor_only(conn, fn ->
+      with {:ok, version} <- validate_core_update_version(conn.body_params),
+           :ok <- validate_core_update_backup(conn.body_params) do
+        run_core_update(conn, version)
+      else
+        {:error, message} -> Envelope.send_error(conn, message, 400)
+      end
+    end)
+  end
+
+  defp validate_core_update_backup(params) do
+    case Map.get(params, "backup", false) do
+      false -> :ok
+      true -> {:error, "Core backup not supported"}
+      _other -> {:error, "backup must be a boolean"}
+    end
   end
 
   # Same job-wrapping shape as `run_addon_update/2`: Core's update entity
@@ -1348,7 +1657,7 @@ defmodule Vagus.API.Router do
   defp core_lifecycle_error_message(reason), do: inspect(reason)
 
   defp core_lifecycle, do: Application.get_env(:vagus, :core_lifecycle, Lifecycle)
-  defp core_health, do: Application.get_env(:vagus, :core_health, Health)
+  defp core_config_check, do: Application.get_env(:vagus, :core_config_check, ConfigCheck)
   defp core_versions_server, do: Application.get_env(:vagus, :core_versions_server, Versions)
 
   # The response has already gone out by the time this runs (see the
@@ -1921,7 +2230,7 @@ defmodule Vagus.API.Router do
     {version_latest, assets} = store_facts(config.slug)
 
     entry
-    |> Map.take([:ingress_token, :ingress_port, :ingress_panel, :watchdog])
+    |> Map.take([:ingress_token, :ingress_port, :ingress_panel, :watchdog, :boot, :auto_update])
     |> Map.put(:version_latest, version_latest)
     |> Map.put(:assets, assets)
     |> Map.put(:ports, Map.get(entry, :ports) || %{})
@@ -1936,13 +2245,17 @@ defmodule Vagus.API.Router do
           # (e.g. "core_mosquitto" — see `Vagus.Addon.Store`'s moduledoc).
           config = %{entry_config | slug: slug}
 
-          case Manager.install(config) do
-            :ok ->
-              :ok = State.put(config, :stopped)
-              Envelope.send_ok(conn, %{})
+          case Availability.check(config) do
+            {true, nil} ->
+              do_install(conn, config)
 
-            {:error, reason} ->
-              Envelope.send_error(conn, inspect(reason), 400)
+            {false, reason} ->
+              # Refused BEFORE any image pull (audit G1) — upstream's own
+              # `_validate_availability` runs at the very top of install,
+              # for the same reason: a pull for the wrong architecture is a
+              # slow, confusing way to fail something `arch`/`machine`/
+              # `homeassistant` already answer for free.
+              Envelope.send_error(conn, reason, 400)
           end
 
         :error ->
@@ -1950,6 +2263,17 @@ defmodule Vagus.API.Router do
       end
     else
       Envelope.send_error(conn, "unauthorized", 403)
+    end
+  end
+
+  defp do_install(conn, config) do
+    case Manager.install(config) do
+      :ok ->
+        :ok = State.put(config, :stopped)
+        Envelope.send_ok(conn, %{})
+
+      {:error, reason} ->
+        Envelope.send_error(conn, inspect(reason), 400)
     end
   end
 
@@ -2155,20 +2479,29 @@ defmodule Vagus.API.Router do
 
   # Validates every known key present in the body *before* applying any of
   # them — a 400 from a bad `watchdog` must not leave a valid `options` half
-  # -applied — then applies whichever of the three were present. A body with
-  # none of `options`/`watchdog`/`ingress_panel` (or only unmodeled keys like
-  # `boot`) is accepted and ignored, matching the pre-existing
-  # accept-and-ignore behavior for SCHEMA_OPTIONS keys this emulator doesn't
-  # implement.
+  # -applied — then applies whichever were present. A body with none of
+  # `options`/`watchdog`/`ingress_panel`/`network`/`boot`/`auto_update` (or
+  # only genuinely-unmodeled keys like `audio_input`/`audio_output`) is
+  # accepted and ignored, matching the pre-existing accept-and-ignore
+  # behavior for SCHEMA_OPTIONS keys this emulator doesn't implement.
+  #
+  # `boot`/`auto_update` (phase 6 chunk A, audit E1/E2) used to fall into
+  # that accept-and-ignore bucket themselves: a save 200'd and the value
+  # reverted on the next read, because nothing persisted it — the same bug
+  # class `network` was previously fixed for, above.
   defp apply_addon_options(conn, slug, config, body) do
     with {:ok, options_action} <- validate_options_key(body, config),
          {:ok, watchdog_action} <- validate_watchdog_key(body),
          {:ok, ingress_panel_action} <- validate_ingress_panel_key(body),
-         {:ok, network_action} <- validate_network_key(body, config) do
+         {:ok, network_action} <- validate_network_key(body, config),
+         {:ok, boot_action} <- validate_boot_key(body, config),
+         {:ok, auto_update_action} <- validate_auto_update_key(body) do
       apply_options_action(slug, options_action)
       apply_watchdog_action(slug, config, watchdog_action)
       apply_ingress_panel_action(slug, ingress_panel_action)
       apply_network_action(slug, network_action)
+      apply_boot_action(slug, boot_action)
+      apply_auto_update_action(slug, auto_update_action)
       Envelope.send_ok(conn, %{})
     else
       {:error, message} -> Envelope.send_error(conn, message, 400)
@@ -2232,6 +2565,48 @@ defmodule Vagus.API.Router do
   defp apply_network_action(_slug, :none), do: :ok
   defp apply_network_action(slug, :reset), do: State.put_setting(slug, :ports, %{})
   defp apply_network_action(slug, {:set, ports}), do: State.put_setting(slug, :ports, ports)
+
+  # `boot` must be `"auto"` or `"manual"` when present (upstream's
+  # `SCHEMA_OPTIONS` coerces it to the 2-value `AppBoot` enum — `manual_only`
+  # is a config.yaml-only concept, never a valid POST value). An add-on whose
+  # CONFIG declares `manual_only` refuses ANY value here — upstream's
+  # `AppBootConfigCannotChangeError` — even a `"manual"` that would be a
+  # no-op, matching upstream's own unconditional check rather than trying to
+  # be more lenient than the real handler. No `boot` key at all is a no-op.
+  defp validate_boot_key(body, config) do
+    case Map.fetch(body, "boot") do
+      :error ->
+        {:ok, :none}
+
+      {:ok, _value} when config.boot == "manual_only" ->
+        {:error, "App #{config.name} boot option is set to manual_only so it cannot be changed"}
+
+      {:ok, value} when value in ["auto", "manual"] ->
+        {:ok, {:set, value}}
+
+      {:ok, _other} ->
+        {:error, "boot must be 'auto' or 'manual'"}
+    end
+  end
+
+  defp apply_boot_action(_slug, :none), do: :ok
+  defp apply_boot_action(slug, {:set, value}), do: State.put_setting(slug, :boot, value)
+
+  # `auto_update` must be a boolean when present; no key at all is a no-op.
+  # Persisted and reported honestly (`Vagus.Addon.Info.render/4`) — Vagus has
+  # no periodic auto-updater, so nothing here ever acts on the stored value.
+  defp validate_auto_update_key(body) do
+    case Map.fetch(body, "auto_update") do
+      :error -> {:ok, :none}
+      {:ok, value} when is_boolean(value) -> {:ok, {:set, value}}
+      {:ok, _other} -> {:error, "auto_update must be a boolean"}
+    end
+  end
+
+  defp apply_auto_update_action(_slug, :none), do: :ok
+
+  defp apply_auto_update_action(slug, {:set, value}),
+    do: State.put_setting(slug, :auto_update, value)
 
   # `watchdog` must be a boolean when present; no key at all is a no-op.
   defp validate_watchdog_key(body) do
