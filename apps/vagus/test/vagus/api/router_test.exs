@@ -306,13 +306,13 @@ defmodule Vagus.API.RouterTest do
       assert keys(json_body(conn)["data"]) == MapSet.new(@network_interface_keys)
     end
 
-    test "GET /network/interface/:ifname/info for an unknown interface -> 400 error envelope" do
+    test "GET /network/interface/:ifname/info for an unknown interface -> 404 error envelope" do
       conn = conn(:get, "/network/interface/bogus0/info") |> authed() |> call()
 
-      assert conn.status == 400
+      assert conn.status == 404
       body = json_body(conn)
       assert body["result"] == "error"
-      assert body["message"] =~ "not found"
+      assert body["message"] == "Interface bogus0 does not exist"
     end
 
     test "GET /network/interface/eth-host/accesspoints -> 400 (eth-host isn't wireless)" do
@@ -322,13 +322,11 @@ defmodule Vagus.API.RouterTest do
       assert json_body(conn)["message"] =~ "not a wireless interface"
     end
 
-    test "GET /network/interface/wlan0/accesspoints -> 200, empty valid accesspoints list" do
+    test "GET /network/interface/wlan0/accesspoints -> 404 (no wlan interface in the host stub)" do
       conn = conn(:get, "/network/interface/wlan0/accesspoints") |> authed() |> call()
 
-      assert conn.status == 200
-      body = json_body(conn)
-      assert keys(body["data"]) == MapSet.new(~w(accesspoints))
-      assert body["data"]["accesspoints"] == []
+      assert conn.status == 404
+      assert json_body(conn)["message"] == "Interface wlan0 does not exist"
     end
 
     test "POST /network/interface/eth-host/update with a supported field -> 200 ok, empty data" do
@@ -336,7 +334,7 @@ defmodule Vagus.API.RouterTest do
         conn(
           :post,
           "/network/interface/eth-host/update",
-          Jason.encode!(%{"ipv4" => %{"method" => "dhcp"}})
+          Jason.encode!(%{"ipv4" => %{"method" => "auto"}})
         )
         |> authed()
         |> req_json()
@@ -360,6 +358,56 @@ defmodule Vagus.API.RouterTest do
 
       assert conn.status == 400
       assert json_body(conn)["message"] =~ "vlan"
+    end
+
+    test "POST /network/interface/:ifname/update for an unknown interface -> 404 error envelope" do
+      conn =
+        conn(
+          :post,
+          "/network/interface/bogus0/update",
+          Jason.encode!(%{"ipv4" => %{"method" => "auto"}})
+        )
+        |> authed()
+        |> req_json()
+        |> call()
+
+      assert conn.status == 404
+      assert json_body(conn)["message"] == "Interface bogus0 does not exist"
+    end
+
+    test ~S(GET /network/interface/default/info resolves to "eth-host") do
+      conn = conn(:get, "/network/interface/default/info") |> authed() |> call()
+
+      assert conn.status == 200
+      assert json_body(conn)["data"]["interface"] == "eth-host"
+    end
+
+    test "POST /network/interface/eth-host/update with a literal {} body -> 400 the upstream empty-body message" do
+      conn =
+        conn(:post, "/network/interface/eth-host/update", Jason.encode!(%{}))
+        |> authed()
+        |> req_json()
+        |> call()
+
+      assert conn.status == 400
+      assert json_body(conn)["message"] == "You need to supply at least one option to update"
+    end
+
+    test "POST /network/interface/eth-host/update with a wifi body -> 400 (eth-host isn't wireless)" do
+      conn =
+        conn(
+          :post,
+          "/network/interface/eth-host/update",
+          Jason.encode!(%{
+            "wifi" => %{"ssid" => "X", "mode" => "infrastructure", "auth" => "open"}
+          })
+        )
+        |> authed()
+        |> req_json()
+        |> call()
+
+      assert conn.status == 400
+      assert json_body(conn)["message"] == "eth-host is not a wireless interface"
     end
 
     test "POST /host/reboot returns an ok envelope" do

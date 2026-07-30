@@ -3,12 +3,30 @@ defmodule Vagus.Backend.Host.Nerves do
   Target `Vagus.Backend.Host` for real Nerves hardware: hostname via
   `:inet.gethostname/0`, disk usage via `df -k /data`
   (`Vagus.Backend.Host.DiskUsage`, shared with `Vagus.Backend.Host.HostStub`),
-  kernel via `uname -r`, `operating_system` via `/etc/os-release`'s
-  `PRETTY_NAME`, and `reboot/0`/`shutdown/0` via `Nerves.Runtime`.
+  kernel via `/proc/sys/kernel/osrelease`, `operating_system` via
+  `/etc/os-release`, and `reboot/0`/`shutdown/0` via `Nerves.Runtime`.
+
+  `kernel/0` originally shelled out to `uname -r`, matching HAOS. The
+  Nerves rootfs ships no `uname` binary, so that call always failed and
+  `kernel` was silently `nil` on every real device. The kernel already
+  publishes its own release string at `/proc/sys/kernel/osrelease` (a
+  plain `"7.1.4\\n"`-shaped file) — reading it directly needs no shelled
+  command and works unconditionally.
+
+  `operating_system/0` originally looked only for `PRETTY_NAME` in
+  `/etc/os-release`, matching HAOS. Nerves' `/etc/os-release` has no
+  `PRETTY_NAME` — it's Buildroot-generated and instead carries `NAME`,
+  `NERVES_SYSTEM_NAME`, and `NERVES_SYSTEM_VERSION` (among other
+  Nerves-specific keys). `PRETTY_NAME` is still preferred when present
+  (e.g. a non-Nerves `:host` build's real os-release); otherwise the
+  three Nerves keys are composed, in that order, space-joined — e.g.
+  `"Nerves dragon_q6a 0.2.0"`. No `NAME` at all (an unreadable or
+  unrecognized file) stays honest-`nil` rather than fabricating a label.
 
   No `Mix.target()` compile guard needed: every function used here
-  (`Nerves.Runtime`, `System.cmd/2`, `File.read/1`, `:inet.gethostname/0`)
-  is available on `:host` too — this module is simply never *selected*
+  (`Nerves.Runtime`, `File.read/1`, `:inet.gethostname/0`,
+  `:erlang.statistics/1`) is available on `:host` too — this module is
+  simply never *selected*
   there (`config/host.exs` points at `Vagus.Backend.Host.HostStub`
   instead). Compare `Vagus.Backend.Network.VintageNet`, which DOES need a
   guard (its dependency, `vintage_net`, is target-scoped and genuinely
@@ -31,6 +49,9 @@ defmodule Vagus.Backend.Host.Nerves do
   alias Vagus.Backend.Host.DiskUsage
 
   @features ["reboot", "shutdown", "network"]
+
+  @osrelease_path "/proc/sys/kernel/osrelease"
+  @os_release_path "/etc/os-release"
 
   @impl true
   def info do
@@ -84,29 +105,53 @@ defmodule Vagus.Backend.Host.Nerves do
     end
   end
 
-  defp kernel do
-    case System.cmd("uname", ["-r"]) do
-      {output, 0} -> String.trim(output)
-      _error -> nil
-    end
-  rescue
-    ErlangError -> nil
-  end
-
-  defp operating_system do
-    case File.read("/etc/os-release") do
-      {:ok, contents} -> parse_pretty_name(contents)
+  # Public + @doc false (not @impl, not part of the Host behaviour) so
+  # tests can point these at fixture files instead of real system paths.
+  #
+  # `path` is never request input — `info/0` always calls these with the
+  # compile-time default; the argument exists only for test fixtures.
+  # sobelow_skip ["Traversal.FileModule"]
+  @doc false
+  def kernel(path \\ @osrelease_path) do
+    case File.read(path) do
+      {:ok, contents} -> String.trim(contents)
       {:error, _reason} -> nil
     end
   end
 
-  defp parse_pretty_name(contents) do
-    contents
-    |> String.split("\n", trim: true)
-    |> Enum.find_value(fn
-      "PRETTY_NAME=" <> rest -> String.trim(rest, "\"")
-      _other -> nil
-    end)
+  # sobelow_skip ["Traversal.FileModule"]
+  @doc false
+  def operating_system(path \\ @os_release_path) do
+    case File.read(path) do
+      {:ok, contents} -> parse_os_release(contents)
+      {:error, _reason} -> nil
+    end
+  end
+
+  defp parse_os_release(contents) do
+    fields =
+      contents
+      |> String.split("\n", trim: true)
+      |> Enum.flat_map(fn line ->
+        case String.split(line, "=", parts: 2) do
+          [key, value] -> [{key, String.trim(value, "\"")}]
+          _other -> []
+        end
+      end)
+      |> Map.new()
+
+    case fields do
+      %{"PRETTY_NAME" => pretty_name} ->
+        pretty_name
+
+      %{"NAME" => _name} ->
+        ["NAME", "NERVES_SYSTEM_NAME", "NERVES_SYSTEM_VERSION"]
+        |> Enum.flat_map(fn key -> List.wrap(fields[key]) end)
+        |> Enum.join(" ")
+
+      _no_name ->
+        nil
+    end
   end
 
   defp startup_time do

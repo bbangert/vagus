@@ -235,7 +235,7 @@ defmodule Vagus.API.Router do
   get "/network/interface/:ifname/info" do
     case Backend.network().interface_info(ifname) do
       {:ok, attrs} -> Envelope.send_ok(conn, NetworkInterface.build!(attrs))
-      {:error, message} -> Envelope.send_error(conn, message, 400)
+      {:error, reason} -> network_interface_error(conn, ifname, reason)
     end
   end
 
@@ -245,16 +245,32 @@ defmodule Vagus.API.Router do
         attrs = %{accesspoints: Enum.map(access_points, &AccessPoint.build!/1)}
         Envelope.send_ok(conn, AccessPointList.build!(attrs))
 
-      {:error, message} ->
-        Envelope.send_error(conn, message, 400)
+      {:error, reason} ->
+        network_interface_error(conn, ifname, reason)
     end
   end
 
   post "/network/interface/:ifname/update" do
     case Backend.network().configure(ifname, conn.body_params) do
       :ok -> Envelope.send_ok(conn, %{})
-      {:error, message} -> Envelope.send_error(conn, message, 400)
+      {:error, reason} -> network_interface_error(conn, ifname, reason)
     end
+  end
+
+  # Shared by the three /network/interface routes. `:not_found` is
+  # upstream's APINotFound (unknown name, or `default` with no primary
+  # interface) — its 404 message verbatim; any other reason is a plain
+  # 400. Must stay ONE shared helper rather than inline clauses: the
+  # compile-time-selected backend can be narrower than the `@callback`
+  # union (HostStub's `interface_info/1` only ever errors `:not_found`),
+  # and an inline clause for the other shape would then be provably dead
+  # under `--warnings-as-errors` on that build.
+  defp network_interface_error(conn, ifname, :not_found) do
+    Envelope.send_error(conn, "Interface #{ifname} does not exist", 404)
+  end
+
+  defp network_interface_error(conn, _ifname, message) do
+    Envelope.send_error(conn, message, 400)
   end
 
   # -- Host actions (P4-T4) --------------------------------------------------

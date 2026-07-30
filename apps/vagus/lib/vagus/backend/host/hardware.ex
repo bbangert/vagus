@@ -22,6 +22,22 @@ defmodule Vagus.Backend.Host.Hardware do
   `drives` is `[]` for v1: upstream sources it from UDisks2 over D-Bus,
   which Vagus doesn't run. The SD card still appears as `block`
   subsystem devices in `devices`.
+
+  Two upstream-parity filters from `_import_devices` (same file) are
+  applied before a device is reported. Without them the dev board's raw
+  sysfs enumeration is 737 devices at 161KB, 76% with no `/dev` node —
+  and the frontend's hardware table keys each row on `dev_path`, so all
+  those null-id rows collapse into one meaningless entry:
+
+    1. Devices with no `/dev` node are dropped (upstream: `if not
+       device.device_node: continue`) — a device the kernel exports but
+       never wires to a device file isn't something a user can act on.
+    2. Virtual ttys/block devices/vcs are dropped even though most of
+       them DO have a `/dev` node (upstream's `_RE_HIDE_SYSFS =
+       re.compile(r"/sys/devices/virtual/(?:tty|block|vc)/.*")`) —
+       these are kernel-internal plumbing (pty pairs, loop devices,
+       virtual consoles), not physical hardware, and upstream hides them
+       from the same dialog.
   """
 
   @doc """
@@ -30,6 +46,11 @@ defmodule Vagus.Backend.Host.Hardware do
   Options (injectable for tests): `:sys_class` (default `"/sys/class"`),
   `:dev_root` (default `"/dev"`).
   """
+  # Mirrors upstream's _RE_HIDE_SYSFS, matched against our resolved
+  # `sysfs` (which has no leading "/sys" — our fixtures build trees
+  # under an arbitrary tmp root) rather than the full canonical path.
+  @hide_virtual_sysfs ~r{/devices/virtual/(?:tty|block|vc)/}
+
   @spec info(keyword()) :: map()
   def info(opts \\ []) do
     sys_class = Keyword.get(opts, :sys_class, "/sys/class")
@@ -55,8 +76,17 @@ defmodule Vagus.Backend.Host.Hardware do
         children: []
       }
     end
+    |> Enum.filter(&keep_device?/1)
     |> Enum.sort_by(&{&1.subsystem, &1.name})
   end
+
+  # `_import_devices` parity: no /dev node means nothing for a user to
+  # act on; virtual tty/block/vc devices are kernel-internal plumbing
+  # (pty pairs, loop devices, virtual consoles), not physical hardware.
+  defp keep_device?(%{dev_path: nil}), do: false
+
+  defp keep_device?(%{sysfs: sysfs}),
+    do: not Regex.match?(@hide_virtual_sysfs, sysfs)
 
   defp ls(path) do
     case File.ls(path) do
