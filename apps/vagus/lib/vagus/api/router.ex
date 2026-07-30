@@ -2644,6 +2644,21 @@ defmodule Vagus.API.Router do
         )
 
         {:error, :max_children}
+
+      # Any other refusal (e.g. the supervisor mid-restart under its own
+      # budget): same discipline — the job must not be left un-`done` for
+      # Core to poll forever (Copilot, PR #29). Detail to the log, generic
+      # entry on the wire.
+      {:error, reason} ->
+        Logger.error("Vagus.API.Router: could not start job #{job}: #{inspect(reason)}")
+
+        Jobs.finish(
+          job,
+          [errors: [Jobs.error_entry("JobStartError", "failed to start the background job")]],
+          jobs_server()
+        )
+
+        {:error, :start_failed}
     end
   end
 
@@ -2677,6 +2692,10 @@ defmodule Vagus.API.Router do
 
   defp send_job_task_result(conn, _job, {:error, :max_children}) do
     Envelope.send_error(conn, "too many background jobs running; retry later", 429)
+  end
+
+  defp send_job_task_result(conn, _job, {:error, :start_failed}) do
+    Envelope.send_error(conn, "failed to start the background job; retry later", 500)
   end
 
   # -- discovery helpers -----------------------------------------------------
