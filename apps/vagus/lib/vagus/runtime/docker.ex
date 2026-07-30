@@ -260,6 +260,43 @@ defmodule Vagus.Runtime.Docker do
     end
   end
 
+  @doc """
+  `exec/3`'s sibling for a caller that needs the command's actual output,
+  not just its exit code — `POST /core/check`'s config-check log (G3) is
+  the first: a bare exit code can't distinguish "config invalid" from
+  "container busy", and without the log a 400 response would carry no
+  explanation, which is exactly the gap G3 flagged.
+
+  Starts the exec `Detach: false` instead of `exec/3`'s `Detach: true` —
+  the daemon holds the `/exec/{id}/start` response open and streams
+  stdout/stderr into it until the process exits, at which point it closes
+  the connection. `exec/3`'s moduledoc deviation note explains why a
+  *duplex* hijack (stdin attached too) doesn't fit `request/4`'s buffered
+  model; this exec never attaches stdin (`create_exec/3`'s body sets only
+  `AttachStdout`/`AttachStderr`), so the daemon has nothing to read from
+  the client — it is a one-way, close-delimited response, which
+  `request/4`'s `recv_all/4` already handles the same way it does for
+  `container_logs/2`. Still multiplexed (no `Tty` requested), so the
+  returned `output` carries the same 8-byte frame headers
+  `Vagus.Runtime.Logs.demux/1` strips — demuxing is the caller's job, the
+  same division `container_logs/2` uses.
+
+  Returns `{:ok, %{exit_code: integer(), output: binary()}}` for ANY exit
+  code, including nonzero — a failing command is a legitimate result to
+  report, not a client error; only a genuine Engine-API failure (create/
+  start/inspect never completing) returns `{:error, reason}`.
+  """
+  @spec exec_capture(String.t(), String.t(), keyword()) ::
+          {:ok, %{exit_code: integer(), output: binary()}} | {:error, term()}
+  def exec_capture(id, cmd, opts \\ []) do
+    with :ok <- ensure_ref(id),
+         {:ok, exec_id} <- create_exec(id, cmd, opts),
+         {:ok, output} <- start_exec_attached(exec_id, opts),
+         {:ok, exit_code} <- await_exec(exec_id, opts) do
+      {:ok, %{exit_code: exit_code, output: output}}
+    end
+  end
+
   ## Networks
 
   @doc "POST `/networks/create` with `config` (an Engine-API network config). Returns `{:ok, id}`."
@@ -385,6 +422,28 @@ defmodule Vagus.Runtime.Docker do
         {:error, reason}
     end
   end
+
+  # `exec_capture/3`'s non-detached start — blocks until the daemon closes
+  # the response (the process has exited), returning the raw captured
+  # body. A no-output run's body decodes to `%{}` (`decode_body/2`'s empty
+  # string clause), which `raw_output/1` normalizes back to `""`.
+  defp start_exec_attached(exec_id, opts) do
+    body = %{"Detach" => false}
+
+    case request(:post, "/exec/#{exec_id}/start", Keyword.merge(opts, body: body)) do
+      {:ok, %{status: s, body: raw}} when s in [200, 204] ->
+        {:ok, raw_output(raw)}
+
+      {:ok, %{status: status, body: body}} ->
+        {:error, {:exec_start_failed, status, message(body)}}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp raw_output(body) when is_binary(body), do: body
+  defp raw_output(_empty_map), do: ""
 
   # ~30s cap (150 * 200ms) — long enough for a reasonable backup_pre/post
   # hook, bounded so a hung command can't wedge a backup job forever.

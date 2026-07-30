@@ -108,6 +108,16 @@ defmodule Vagus.Core.Versions do
   @cache_ttl_ms 24 * 60 * 60 * 1_000
   @default_machine_key "default"
 
+  # G2 audit: `installed/1`/`latest/1`/`update_available?/1` are ordinary
+  # `GenServer.call/3`s, whose default 5s timeout is SHORTER than
+  # `@fetch_receive_timeout` above. A caller queued behind a 5-10s fetch
+  # (see "The fetch never blocks the server loop" above) would `:exit
+  # :timeout` at 5s even though this GenServer is healthy and about to
+  # reply — Plug.ErrorHandler then turns that into a 500, and `/core/info`
+  # makes three of these calls per request. Must stay greater than
+  # `@fetch_receive_timeout`, or this reintroduces the exact bug it fixes.
+  @call_timeout 15_000
+
   @doc """
   Starts the store.
 
@@ -118,10 +128,17 @@ defmodule Vagus.Core.Versions do
     GenServer.start_link(__MODULE__, opts, name: Keyword.get(opts, :name, __MODULE__))
   end
 
+  # `set_installed/2` and `seed/2` below deliberately keep the plain
+  # `GenServer.call/2` default (5s): per the moduledoc, their `handle_call/3`
+  # clauses never touch `pending`/`in_flight` and always reply immediately
+  # regardless of an in-flight `latest` fetch — they were never exposed to
+  # the G2 bug in the first place, so widening their timeout too would only
+  # mask a genuinely wedged server instead of surfacing it.
+
   @doc "Returns the persisted installed version, or `nil` if none is known yet."
   @spec installed(GenServer.server()) :: String.t() | nil
   def installed(server \\ __MODULE__) do
-    GenServer.call(server, :installed)
+    GenServer.call(server, :installed, @call_timeout)
   end
 
   @doc "Sets (and persists) the installed version, always overwriting any prior value."
@@ -147,13 +164,33 @@ defmodule Vagus.Core.Versions do
   """
   @spec latest(GenServer.server()) :: String.t() | nil
   def latest(server \\ __MODULE__) do
-    GenServer.call(server, :latest)
+    GenServer.call(server, :latest, @call_timeout)
   end
 
   @doc "`true` iff both an installed and a latest version are known and they differ."
   @spec update_available?(GenServer.server()) :: boolean()
   def update_available?(server \\ __MODULE__) do
-    GenServer.call(server, :update_available?)
+    GenServer.call(server, :update_available?, @call_timeout)
+  end
+
+  @doc """
+  Expires the cached `latest` value (audit G4): `POST reload_updates`/
+  `refresh_updates`/`supervisor/reload` are otherwise pure no-ops against a
+  24h cache with no invalidation entry point, so "Check for updates"
+  succeeded but the version could stay stale for up to a day. The *next*
+  `latest/1`/`update_available?/1` call sees a stale/absent cache and
+  triggers a fresh fetch.
+
+  A cast, not a call: the router replies `ok` immediately either way (same
+  as upstream), so nothing needs to wait for this to land. Deliberately
+  leaves `pending`/`in_flight` untouched — a fetch already running when
+  this arrives keeps running and still replies to whatever is queued
+  behind it; invalidating mid-fetch would either strand those waiters or
+  trigger a pointless second fetch for the same answer.
+  """
+  @spec invalidate(GenServer.server()) :: :ok
+  def invalidate(server \\ __MODULE__) do
+    GenServer.cast(server, :invalidate)
   end
 
   ## GenServer callbacks
@@ -211,6 +248,11 @@ defmodule Vagus.Core.Versions do
       {:fresh, value} -> {:reply, update_available_result(state.installed, value), state}
       :stale -> {:noreply, enqueue_and_maybe_fetch(state, from, :update_available?)}
     end
+  end
+
+  @impl GenServer
+  def handle_cast(:invalidate, state) do
+    {:noreply, %{state | latest_cache: nil}}
   end
 
   @impl GenServer

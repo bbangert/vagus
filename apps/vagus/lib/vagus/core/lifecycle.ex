@@ -116,6 +116,35 @@ defmodule Vagus.Core.Lifecycle do
   hand-edited/stale containers — rather than this module tracking or
   resuming a partially-applied operation itself.
 
+  ## Safe mode
+
+  `restart/1` and `rebuild/1` accept `opts[:safe_mode]` — the "Restart Home
+  Assistant → advanced → safe mode" recovery flow the frontend exposes for
+  a boot-looping custom integration (audit E3). Upstream
+  (`homeassistant/core.py`) touches an empty `safe-mode` file at the root
+  of Core's `/config` before the restart it triggers; Core's bootstrap
+  consumes (and deletes) that marker on its next boot, starting with
+  custom components disabled. This module does the same: `File.touch/1` on
+  `Vagus.Core.Container.config_path/1` joined with `"safe-mode"` —
+  Core's `/config` is the `vagus-core-config` named volume, and
+  `config_path/1` resolves its host-side directory (injectable via
+  `opts[:homeassistant_path]`, same key `Vagus.Backend.Host.DiskBreakdown`
+  uses for the same volume).
+
+  The write happens before any container-affecting Engine-API call, and a
+  write failure **aborts the whole op** (`{:error, {:safe_mode_marker,
+  reason}}`) rather than falling through to an ordinary restart — a
+  safe-mode request that silently restarts normally instead is exactly
+  the bug this closes, so a marker that can't be written must fail loud,
+  not degrade quietly.
+
+  `opts[:force]` is part of the same request body upstream defines
+  (`{safe_mode: bool, force: bool}`) but is accepted-and-ignored: upstream
+  uses it to bypass an in-progress offline database migration gate, and
+  Vagus has no such gate (nothing here blocks on one, audit D11). The
+  router validates `force`'s type but never threads it down to this
+  module.
+
   ## Serialization — one non-blocking global mutex
 
   Every public op wraps its body in
@@ -159,6 +188,7 @@ defmodule Vagus.Core.Lifecycle do
 
   @fallback_stop_timeout_s 260
   @gracetime_env_prefix "S6_SERVICES_GRACETIME="
+  @safe_mode_marker "safe-mode"
 
   @doc """
   Adopts the Core container by name, as-is — never creates.
@@ -204,6 +234,12 @@ defmodule Vagus.Core.Lifecycle do
   @doc """
   Restarts the Core container in place (`docker restart`, no recreate),
   then runs the health gate.
+
+  `opts[:safe_mode]` (default `false`) touches Core's `safe-mode` marker
+  (see the moduledoc "Safe mode" section) BEFORE issuing the restart —
+  Core's bootstrap consumes it on the boot this restart triggers.
+  `opts[:force]` is accepted by the router but has no effect here (see
+  moduledoc); this module never reads it.
   """
   @spec restart(keyword()) :: :ok | {:error, term()}
   def restart(opts \\ []) do
@@ -216,6 +252,11 @@ defmodule Vagus.Core.Lifecycle do
   recreates from the current spec, regardless of what was running before.
   An absent container still gets created+started (it's an explicit,
   user-requested op). `{:error, :no_version}` if nothing is installed yet.
+
+  `opts[:safe_mode]` (default `false`) behaves exactly as it does for
+  `restart/1` — the marker is written once the target version is
+  resolved (so a `:no_version` failure doesn't leave a stray marker
+  behind) and before the stop/remove/create/start sequence begins.
   """
   @spec rebuild(keyword()) :: :ok | {:error, term()}
   def rebuild(opts \\ []) do
@@ -345,7 +386,8 @@ defmodule Vagus.Core.Lifecycle do
   ## restart/1
 
   defp do_restart(opts) do
-    with :ok <- Docker.restart_container(Container.name(), docker_opts(opts)) do
+    with :ok <- maybe_write_safe_mode_marker(opts),
+         :ok <- Docker.restart_container(Container.name(), docker_opts(opts)) do
       health_gate(opts)
     end
   end
@@ -354,9 +396,43 @@ defmodule Vagus.Core.Lifecycle do
 
   defp do_rebuild(opts) do
     with {:ok, version} <- resolve_installed_version(opts),
+         :ok <- maybe_write_safe_mode_marker(opts),
          :ok <- stop_if_present(opts),
          :ok <- Docker.remove_container(Container.name(), docker_opts(opts)) do
       create_and_start(version, opts)
+    end
+  end
+
+  ## Safe mode — see moduledoc "Safe mode" section.
+
+  defp maybe_write_safe_mode_marker(opts) do
+    if Keyword.get(opts, :safe_mode, false) do
+      write_safe_mode_marker(opts)
+    else
+      :ok
+    end
+  end
+
+  # `mkdir_p` first: the volume's host-side directory (`Container.config_path/1`)
+  # may not exist yet (Core never adopted/created on this device), and
+  # `File.touch/1` alone does not create parents — without this, that
+  # ordinary case would abort the whole safe-mode op with `:enoent`
+  # (security-phase6.md S3). A failed `mkdir_p` still aborts, same as a
+  # failed `touch` — see the moduledoc's "fail loud" contract.
+  #
+  # The path is config-derived (`Container.config_path/1`: engine data_root
+  # + the constant volume name) joined with a constant filename — no
+  # request input reaches it; the `opts` seam is test-only (verified in
+  # security-phase6.md item 2).
+  # sobelow_skip ["Traversal.FileModule"]
+  defp write_safe_mode_marker(opts) do
+    path = Path.join(Container.config_path(opts), @safe_mode_marker)
+
+    with :ok <- File.mkdir_p(Path.dirname(path)),
+         :ok <- File.touch(path) do
+      :ok
+    else
+      {:error, reason} -> {:error, {:safe_mode_marker, reason}}
     end
   end
 

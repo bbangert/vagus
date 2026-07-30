@@ -18,6 +18,16 @@ defmodule Vagus.Addon.Config do
   ingress/panel config knobs alongside the pre-existing `ingress`/
   `ingress_port`; `ingress_port` additionally enforces the §B3.2
   dynamic-port/`ports:` collision guard at parse time.
+
+  `homeassistant`/`machine` (phase 6 chunk A, audit G1) feed
+  `Vagus.Addon.Availability`: `homeassistant` is a nilable version-floor
+  string (`opt_str`, same shape as `watchdog`/`webui`/`image` — an opaque
+  tag, not something this module orders); `machine` is a plain list of
+  strings (`str_list`, same shape as `discovery`/`privileged`/`devices` —
+  no charset enforcement here either, matching this module's existing
+  looseness on every other bare string-list field). Neither field is
+  otherwise interpreted by `parse/1` itself; `Availability` owns what they
+  mean.
   """
 
   @slug_re ~r/^[-_.A-Za-z0-9]+$/
@@ -83,7 +93,9 @@ defmodule Vagus.Addon.Config do
           backup_pre: String.t() | nil,
           backup_post: String.t() | nil,
           backup_exclude: [String.t()],
-          timeout: non_neg_integer()
+          timeout: non_neg_integer(),
+          homeassistant: String.t() | nil,
+          machine: [String.t()]
         }
 
   @enforce_keys [:name, :version, :slug, :description, :arch]
@@ -139,7 +151,12 @@ defmodule Vagus.Addon.Config do
             # add-ons in Vagus while HAOS badges them.
             stage: "stable",
             advanced: false,
-            url: nil
+            url: nil,
+            # Availability (G1): a nilable Core-version floor and a machine
+            # whitelist, both parsed but otherwise uninterpreted here — see
+            # `Vagus.Addon.Availability`.
+            homeassistant: nil,
+            machine: []
 
   @doc """
   Parses a decoded config map into a `%Vagus.Addon.Config{}`, applying defaults
@@ -174,6 +191,30 @@ defmodule Vagus.Addon.Config do
   end
 
   def valid_slug?(_slug), do: false
+
+  @doc """
+  The boot mode an add-on actually starts with (phase 6 chunk A, audit E1):
+  `config.boot` (`"auto"`/`"manual"`/`"manual_only"`, the config.yaml
+  default) overridden by `persisted` — the per-install `POST
+  /addons/{slug}/options` value (`Vagus.Addon.State`'s `:boot` field,
+  `nil | "auto" | "manual"`) — when the config allows an override at all.
+
+  A `"manual_only"` config always wins, regardless of `persisted`: real
+  Supervisor's `AppBootConfigCannotChangeError` refuses to ever persist an
+  override against it (`Vagus.API.Router.apply_addon_options/4` enforces
+  that same refusal at save time), so this reports `"manual"` for one even
+  if a hand-edited state file somehow disagrees. `nil` (never explicitly
+  set) falls back to `config.boot` itself.
+
+  Used both to render the wire `boot` field (`Vagus.Addon.Info.render/4`)
+  and to decide which persisted-`:started` add-ons actually restart at boot
+  (`Vagus.Addon.BootStarter`) — one function so the two can't drift apart on
+  what "boot: auto" means for a given add-on.
+  """
+  @spec effective_boot(t(), String.t() | nil) :: String.t()
+  def effective_boot(%__MODULE__{boot: "manual_only"}, _persisted), do: "manual"
+  def effective_boot(_config, persisted) when persisted in ["auto", "manual"], do: persisted
+  def effective_boot(%__MODULE__{boot: boot}, _persisted), do: boot
 
   @doc """
   The inverse of `parse/1`: renders `config` back to the raw, string-keyed
@@ -242,7 +283,9 @@ defmodule Vagus.Addon.Config do
       "timeout" => c.timeout,
       "stage" => c.stage,
       "advanced" => c.advanced,
-      "url" => c.url
+      "url" => c.url,
+      "homeassistant" => c.homeassistant,
+      "machine" => c.machine
     }
   end
 
@@ -302,6 +345,8 @@ defmodule Vagus.Addon.Config do
     |> put(:stage, enum(raw, "stage", @stages, "stable"))
     |> put(:advanced, boolean(raw, "advanced", false))
     |> put(:url, opt_str(raw, "url"))
+    |> put(:homeassistant, opt_str(raw, "homeassistant"))
+    |> put(:machine, str_list(raw, "machine"))
   end
 
   defp put(config, key, value), do: Map.put(config, key, value)

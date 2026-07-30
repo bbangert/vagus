@@ -40,6 +40,15 @@ defmodule Vagus.Addon.InfoTest do
     assert info["network"] == %{"1883/tcp" => 1883}
     assert info["watchdog"] == false
     assert info["ip_address"] == "0.0.0.0"
+    # G1: real, not the previous hardcoded true/[]/nil — see the "availability"
+    # describe block below for the full matrix.
+    assert info["available"] == true
+    assert info["machine"] == []
+    assert info["homeassistant"] == nil
+    # E1/E2: honest defaults with no settings supplied at all.
+    assert info["boot"] == "auto"
+    assert info["boot_config"] == "auto"
+    assert info["auto_update"] == false
     # wire alias keys (not the model's supervisor_* names)
     assert Map.has_key?(info, "hassio_api")
     assert Map.has_key?(info, "hassio_role")
@@ -243,6 +252,104 @@ defmodule Vagus.Addon.InfoTest do
       assert Info.render(c, :started, %{})["watchdog"] == false
       assert Info.render(c, :started, %{}, %{watchdog: true})["watchdog"] == true
       assert Info.render(c, :started, %{}, %{watchdog: false})["watchdog"] == false
+    end
+  end
+
+  describe "boot + auto_update (phase 6 chunk A, audit E1/E2)" do
+    test "boot reflects the persisted override, not just the config default", %{config: c} do
+      assert Info.render(c, :started, %{})["boot"] == "auto"
+      assert Info.render(c, :started, %{}, %{boot: "manual"})["boot"] == "manual"
+      assert Info.render(c, :started, %{}, %{boot: "auto"})["boot"] == "auto"
+    end
+
+    test "a manual_only config always reports boot: manual, override or not" do
+      {:ok, c} =
+        Config.parse(%{
+          "name" => "Locked Boot",
+          "version" => "1",
+          "slug" => "locked_boot",
+          "description" => "d",
+          "arch" => ["amd64"],
+          "boot" => "manual_only"
+        })
+
+      assert Info.render(c, :started, %{})["boot"] == "manual"
+      assert Info.render(c, :started, %{}, %{boot: "auto"})["boot"] == "manual"
+    end
+
+    test "boot_config always reports the config's raw 3-way value", %{config: c} do
+      assert Info.render(c, :started, %{})["boot_config"] == "auto"
+
+      {:ok, manual_only} =
+        Config.parse(%{
+          "name" => "Locked Boot",
+          "version" => "1",
+          "slug" => "locked_boot",
+          "description" => "d",
+          "arch" => ["amd64"],
+          "boot" => "manual_only"
+        })
+
+      assert Info.render(manual_only, :started, %{})["boot_config"] == "manual_only"
+    end
+
+    test "auto_update reflects the persisted setting; unset renders false, never fakes an updater",
+         %{config: c} do
+      assert Info.render(c, :started, %{})["auto_update"] == false
+      assert Info.render(c, :started, %{}, %{auto_update: true})["auto_update"] == true
+      assert Info.render(c, :started, %{}, %{auto_update: false})["auto_update"] == false
+    end
+  end
+
+  describe "availability (phase 6 chunk A, audit G1)" do
+    test "available/machine/homeassistant read off the config, not hardcoded", %{config: c} do
+      # Fixture config declares arch ["aarch64", "amd64"]; StaticData.arch/0
+      # is "aarch64" in :test, so this is available with no restrictions.
+      info = Info.render(c, :started, %{})
+      assert info["available"] == true
+      assert info["machine"] == []
+      assert info["homeassistant"] == nil
+    end
+
+    test "an arch this device doesn't have renders available: false" do
+      {:ok, c} =
+        Config.parse(%{
+          "name" => "x86 Only",
+          "version" => "1",
+          "slug" => "x86only",
+          "description" => "d",
+          "arch" => ["amd64"]
+        })
+
+      assert Info.render(c, :started, %{})["available"] == false
+    end
+
+    test "machine renders the config's real declared list, negated entries included" do
+      {:ok, c} =
+        Config.parse(%{
+          "name" => "Test",
+          "version" => "1",
+          "slug" => "test",
+          "description" => "d",
+          "arch" => ["amd64"],
+          "machine" => ["raspberrypi3-64", "!qemux86"]
+        })
+
+      assert Info.render(c, :started, %{})["machine"] == ["raspberrypi3-64", "!qemux86"]
+    end
+
+    test "homeassistant renders the config's declared floor verbatim" do
+      {:ok, c} =
+        Config.parse(%{
+          "name" => "Test",
+          "version" => "1",
+          "slug" => "test",
+          "description" => "d",
+          "arch" => ["amd64"],
+          "homeassistant" => "2026.7.0"
+        })
+
+      assert Info.render(c, :started, %{})["homeassistant"] == "2026.7.0"
     end
   end
 end

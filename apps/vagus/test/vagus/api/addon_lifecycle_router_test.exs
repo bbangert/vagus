@@ -42,6 +42,11 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
     :ok
   end
 
+  # `arch` includes "aarch64" (`config/test.exs`'s `:vagus, :machine` puts
+  # `Vagus.API.StaticData.arch/0` at the fixed "aarch64") so that, since
+  # phase 6 chunk A, this fixture stays *available* by default — the whole
+  # point of most of the describe blocks below is lifecycle mechanics, not
+  # G1's availability gate, which has its own dedicated tests.
   defp fixture_config(slug) do
     {:ok, config} =
       Config.parse(%{
@@ -49,7 +54,7 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
         "version" => "3",
         "slug" => slug,
         "description" => "d",
-        "arch" => ["amd64"],
+        "arch" => ["aarch64", "amd64"],
         "image" => "homeassistant/{arch}-addon-test",
         "host_network" => true,
         "options" => %{"greeting" => "hi"},
@@ -153,6 +158,28 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
       conn = addon_call(:post, "/store/addons/core_testaddon3/install", "some_addon")
       assert conn.status == 403
       assert :error = State.get("core_testaddon3")
+    end
+
+    # G1 (audit B2): before the availability gate, this 200'd and then
+    # failed LATE inside `Manager.install/2`'s image pull — a slower,
+    # more confusing way to say the exact same "wrong arch" thing.
+    test "an arch-mismatched store add-on is refused with the reason in the message, no install attempted" do
+      {:ok, config} =
+        Config.parse(%{
+          "name" => "x86 Only",
+          "version" => "1",
+          "slug" => "x86only",
+          "description" => "d",
+          "arch" => ["amd64"]
+        })
+
+      seed_store("core_x86only", config)
+
+      conn = supervisor_call(:post, "/store/addons/core_x86only/install")
+      assert conn.status == 400
+      assert body(conn)["message"] =~ "not supported on this platform"
+      assert body(conn)["message"] =~ "amd64"
+      assert :error = State.get("core_x86only")
     end
   end
 
@@ -524,10 +551,109 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
       assert {:ok, %{user_options: %{}}} = State.get("core_opts")
     end
 
-    test "unrelated SCHEMA_OPTIONS keys (boot, watchdog, ...) are accepted and ignored" do
-      conn = supervisor_call(:post, "/addons/core_opts/options", %{"boot" => "manual"})
+    test "unrelated SCHEMA_OPTIONS keys (audio_input, audio_output, ...) are accepted and ignored" do
+      conn =
+        supervisor_call(:post, "/addons/core_opts/options", %{
+          "audio_input" => "mic",
+          "audio_output" => "speaker"
+        })
+
       assert conn.status == 200
       assert {:ok, %{user_options: %{}}} = State.get("core_opts")
+    end
+
+    # boot/auto_update (phase 6 chunk A, audit E1/E2) used to be in the
+    # "accepted and ignored" bucket above — the exact bug: a save 200'd and
+    # the value reverted on the next read because nothing persisted it.
+    test "boot: manual is persisted and read back through the real route" do
+      conn = supervisor_call(:post, "/addons/core_opts/options", %{"boot" => "manual"})
+      assert conn.status == 200
+      assert {:ok, %{boot: "manual"}} = State.get("core_opts")
+
+      info = body(supervisor_call(:get, "/addons/core_opts/info"))["data"]
+      assert info["boot"] == "manual"
+    end
+
+    test "boot: auto is persisted and read back, overriding a previously-saved manual" do
+      :ok = State.put_setting("core_opts", :boot, "manual")
+
+      conn = supervisor_call(:post, "/addons/core_opts/options", %{"boot" => "auto"})
+      assert conn.status == 200
+      assert {:ok, %{boot: "auto"}} = State.get("core_opts")
+
+      info = body(supervisor_call(:get, "/addons/core_opts/info"))["data"]
+      assert info["boot"] == "auto"
+    end
+
+    test "an unset boot falls back to the config's own default in the info payload" do
+      # `fixture_config/1` doesn't set `boot`, so `Config.parse/1` defaults it
+      # to "auto" — nothing has ever been persisted for this slug either.
+      info = body(supervisor_call(:get, "/addons/core_opts/info"))["data"]
+      assert info["boot"] == "auto"
+    end
+
+    test "an invalid boot value -> 400, nothing persisted" do
+      conn = supervisor_call(:post, "/addons/core_opts/options", %{"boot" => "sometimes"})
+      assert conn.status == 400
+      assert body(conn)["message"] =~ "boot must be"
+      assert {:ok, %{boot: nil}} = State.get("core_opts")
+    end
+
+    test "an add-on whose CONFIG declares manual_only refuses ANY boot change (400)" do
+      config = fixture_config("mo") |> Map.put(:slug, "core_mo") |> Map.put(:boot, "manual_only")
+      :ok = State.put(config, :stopped)
+      on_exit(fn -> State.delete("core_mo") end)
+
+      # Even a value that would be a no-op (upstream's own unconditional
+      # check — see `validate_boot_key/2`'s comment).
+      conn = supervisor_call(:post, "/addons/core_mo/options", %{"boot" => "manual"})
+      assert conn.status == 400
+      assert body(conn)["message"] =~ "manual_only"
+      assert {:ok, %{boot: nil}} = State.get("core_mo")
+
+      # And it reports "manual" effectively regardless, per
+      # `Config.effective_boot/2`.
+      info = body(supervisor_call(:get, "/addons/core_mo/info"))["data"]
+      assert info["boot"] == "manual"
+    end
+
+    test "a bad boot alongside a valid options map -> 400, options NOT applied" do
+      conn =
+        supervisor_call(:post, "/addons/core_opts/options", %{
+          "boot" => "sometimes",
+          "options" => %{"greeting" => "hey"}
+        })
+
+      assert conn.status == 400
+      assert {:ok, %{user_options: %{}, boot: nil}} = State.get("core_opts")
+    end
+
+    test "auto_update: true is persisted and read back through the real route" do
+      conn = supervisor_call(:post, "/addons/core_opts/options", %{"auto_update" => true})
+      assert conn.status == 200
+      assert {:ok, %{auto_update: true}} = State.get("core_opts")
+
+      info = body(supervisor_call(:get, "/addons/core_opts/info"))["data"]
+      assert info["auto_update"] == true
+    end
+
+    test "auto_update: false is persisted" do
+      :ok = State.put_setting("core_opts", :auto_update, true)
+      conn = supervisor_call(:post, "/addons/core_opts/options", %{"auto_update" => false})
+      assert conn.status == 200
+      assert {:ok, %{auto_update: false}} = State.get("core_opts")
+    end
+
+    test "unset auto_update reports false, never fakes an updater" do
+      info = body(supervisor_call(:get, "/addons/core_opts/info"))["data"]
+      assert info["auto_update"] == false
+    end
+
+    test "a non-boolean auto_update -> 400, nothing persisted" do
+      conn = supervisor_call(:post, "/addons/core_opts/options", %{"auto_update" => "yes"})
+      assert conn.status == 400
+      assert body(conn)["message"] =~ "auto_update must be a boolean"
+      assert {:ok, %{auto_update: nil}} = State.get("core_opts")
     end
 
     test "options on a never-installed slug -> 404" do

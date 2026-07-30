@@ -195,20 +195,30 @@ defmodule Vagus.API.RouterTest do
   end
 
   describe "GET /ingress/panels" do
-    test "returns an empty panels map (no add-ons)" do
+    # Global emptiness cannot be asserted here: this file is async and the
+    # panels map projects the SHARED `Vagus.Addon.State`, which concurrent
+    # test files legitimately install add-ons into (seed-6 interleaving
+    # with auth_tier_gate_test's `core_secretful`, 2026-07-30). Content
+    # mapping is pinned with controlled slugs in ingress_router_test.exs
+    # and panels_test.exs; this test only guards route + envelope shape.
+    test "returns the ok envelope with a panels map" do
       conn = conn(:get, "/ingress/panels") |> authed() |> call()
       assert conn.status == 200
       assert json_body(conn)["result"] == "ok"
-      assert json_body(conn)["data"] == %{"panels" => %{}}
+      assert is_map(json_body(conn)["data"]["panels"])
     end
   end
 
   describe "GET /discovery" do
-    test "returns an empty discovery list + services index (no add-ons)" do
+    # Same async-vs-shared-state constraint as /ingress/panels above:
+    # discovery messages live in a shared store that discovery_router_test
+    # populates concurrently, so only route + shape are asserted here.
+    test "returns the ok envelope with a discovery list + services index" do
       conn = conn(:get, "/discovery") |> authed() |> call()
       assert conn.status == 200
       assert json_body(conn)["result"] == "ok"
-      assert json_body(conn)["data"] == %{"discovery" => [], "services" => %{}}
+      assert is_list(json_body(conn)["data"]["discovery"])
+      assert is_map(json_body(conn)["data"]["services"])
     end
   end
 

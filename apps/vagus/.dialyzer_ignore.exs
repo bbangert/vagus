@@ -60,6 +60,14 @@
   # through the same unix-socket Docker client — its {:ok, %{"State" => ...}}
   # branch reads as dead under the Mint story (vagus-core-watchdog CW-P3-T1).
   {"lib/vagus/core/watchdog/probe.ex", :pattern_match},
+  # Core.ConfigCheck (audit G3, phase 6) drives inspect_container +
+  # exec_capture through the same unix-socket Docker client — its {:ok, _}
+  # branches read as dead and every helper past the first Docker call as
+  # unused, the identical cascade as lifecycle.ex above. Hermetic
+  # fake-engine tests cover the behavior; real-daemon exec is a device-gate
+  # item.
+  {"lib/vagus/core/config_check.ex", :pattern_match},
+  {"lib/vagus/core/config_check.ex", :unused_fun},
   {"lib/vagus/api/ingress_proxy.ex", :pattern_match},
   {"lib/vagus/api/router.ex", :pattern_match},
   {"lib/vagus/api/router.ex", :pattern_match_cov},

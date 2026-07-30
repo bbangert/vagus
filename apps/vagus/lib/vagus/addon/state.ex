@@ -46,9 +46,31 @@ defmodule Vagus.Addon.State do
       it by `Vagus.Addon.Ports.effective/2`. Persisted under the `"network"`
       key, the name the wire uses.
 
-  `put_setting/4` writes one of `ingress_port`/`ingress_panel`/`watchdog`
-  for an already-tracked slug (`:error` if untracked); `ingress_token` has
-  no setter since nothing ever changes it once assigned.
+  Two more fields ride alongside those five (phase 6 chunk A, audit E1/E2)
+  — same additive pattern `ports` itself used, no version bump:
+
+    * `boot` — `nil | "auto" | "manual"`, default `nil`. The persisted
+      `POST /addons/{slug}/options` override; `nil` means "never explicitly
+      set", which `Vagus.Addon.Config.effective_boot/2` falls back from to
+      the add-on's own `config.boot` (itself `"auto"` by default, or
+      `"manual_only"` for an add-on whose config forbids autostart
+      entirely — see that function).
+    * `auto_update` — `nil | boolean()`, default `nil`, falling back to
+      `false` at render time (`Vagus.Addon.Info.render/4`). Vagus has **no**
+      periodic auto-updater — this is stored and reported honestly, purely
+      so the frontend's toggle reflects what the user actually saved, and is
+      never itself acted on.
+
+  Before this, `POST /addons/{slug}/options` accepted a `boot`/`auto_update`
+  key, 200'd, and silently discarded both — the exact bug class `network`
+  was previously fixed for (see that field's own note above): the toggle
+  animated, the save succeeded, and the value reverted on the next page
+  load because there was nowhere for it to persist to.
+
+  `put_setting/4` writes one of `ingress_port`/`ingress_panel`/`watchdog`/
+  `ports`/`boot`/`auto_update` for an already-tracked slug (`:error` if
+  untracked); `ingress_token` has no setter since nothing ever changes it
+  once assigned.
 
   ## Persistence (M4-P8-T1)
 
@@ -66,20 +88,24 @@ defmodule Vagus.Addon.State do
   Config.to_persistable/1 map>, "state": "started"|"stopped",
   "user_options": {...}, "ingress_token": "...", "ingress_port":
   null|<port>, "ingress_panel": bool, "watchdog": bool, "network":
-  {"<port>/<proto>": <host_port>|null}}}}`.
+  {"<port>/<proto>": <host_port>|null}, "boot": null|"auto"|"manual",
+  "auto_update": null|bool}}}`.
   `Config.parse/1` — not this module — is the single validator on reload:
   each entry's `config` is re-parsed (and its key checked against the
   parsed slug) at `init/1`, and anything invalid/mismatched, or a file
   that's missing/unreadable/not-JSON, is logged and dropped rather than
-  crashing boot — a corrupt state file must never brick the device. The
-  four new fields are decoded tolerantly rather than invalidating the whole
-  entry: a missing/non-string `ingress_token` gets a freshly generated one
-  (old files predate the field), a missing/invalid `ingress_port` falls
-  back to `nil`, and a missing/non-boolean `ingress_panel`/`watchdog` falls
-  back to `false`; a missing/non-map `network` falls back to `%{}` and its
-  entries are re-checked individually (a hand-edited file reaches the
-  container spec too) — the format is purely additive, so the version number
-  doesn't change. Writes are `mkdir_p` + write-to-`.tmp` + `File.rename`
+  crashing boot — a corrupt state file must never brick the device. Every
+  per-install field beyond `config`/`state`/`user_options` is decoded
+  tolerantly rather than invalidating the whole entry: a missing/non-string
+  `ingress_token` gets a freshly generated one (old files predate the
+  field), a missing/invalid `ingress_port` falls back to `nil`, a
+  missing/non-boolean `ingress_panel`/`watchdog` falls back to `false`, a
+  missing/non-map `network` falls back to `%{}` with its entries re-checked
+  individually (a hand-edited file reaches the container spec too), and a
+  missing/invalid `boot`/`auto_update` falls back to `nil` (not `false` for
+  `auto_update` — see that field's decoder) — the format is purely
+  additive, so the version number doesn't change. Writes are `mkdir_p` +
+  write-to-`.tmp` + `File.rename`
   (atomic against a mid-write power loss) and best-effort: a write failure
   is logged and the lifecycle call still succeeds, since a flash write
   failure is not a reason to fail an add-on start/stop.
@@ -99,7 +125,9 @@ defmodule Vagus.Addon.State do
           ingress_port: nil | pos_integer(),
           ingress_panel: boolean(),
           watchdog: boolean(),
-          ports: Vagus.Addon.Ports.t()
+          ports: Vagus.Addon.Ports.t(),
+          boot: nil | String.t(),
+          auto_update: nil | boolean()
         }
 
   @persist_version 1
@@ -148,13 +176,13 @@ defmodule Vagus.Addon.State do
   """
   @spec put_setting(
           String.t(),
-          :ingress_port | :ingress_panel | :watchdog | :ports,
+          :ingress_port | :ingress_panel | :watchdog | :ports | :boot | :auto_update,
           term(),
           GenServer.server()
         ) ::
           :ok | :error
   def put_setting(slug, key, value, server \\ __MODULE__)
-      when key in [:ingress_port, :ingress_panel, :watchdog, :ports] do
+      when key in [:ingress_port, :ingress_panel, :watchdog, :ports, :boot, :auto_update] do
     GenServer.call(server, {:put_setting, slug, key, value})
   end
 
@@ -255,14 +283,18 @@ defmodule Vagus.Addon.State do
         ingress_port: port,
         ingress_panel: panel,
         watchdog: watchdog,
-        ports: ports
+        ports: ports,
+        boot: boot,
+        auto_update: auto_update
       } ->
         %{
           ingress_token: token,
           ingress_port: port,
           ingress_panel: panel,
           watchdog: watchdog,
-          ports: ports
+          ports: ports,
+          boot: boot,
+          auto_update: auto_update
         }
 
       nil ->
@@ -271,7 +303,9 @@ defmodule Vagus.Addon.State do
           ingress_port: nil,
           ingress_panel: false,
           watchdog: false,
-          ports: %{}
+          ports: %{},
+          boot: nil,
+          auto_update: nil
         }
     end
   end
@@ -361,7 +395,9 @@ defmodule Vagus.Addon.State do
          ingress_port: decode_ingress_port(raw),
          ingress_panel: decode_bool_setting(raw, "ingress_panel"),
          watchdog: decode_bool_setting(raw, "watchdog"),
-         ports: decode_ports(raw)
+         ports: decode_ports(raw),
+         boot: decode_boot(raw),
+         auto_update: decode_maybe_bool_setting(raw, "auto_update")
        }}
     else
       _ ->
@@ -407,6 +443,29 @@ defmodule Vagus.Addon.State do
     case Map.get(raw, key) do
       value when is_boolean(value) -> value
       _ -> false
+    end
+  end
+
+  # Missing/invalid -> `"auto"`/`"manual"` are the only persistable values
+  # (a config-level `"manual_only"` can never land here — the router refuses
+  # to persist it, see `Vagus.API.Router.apply_addon_options/4`); anything
+  # else, including a hand-edited file's stray `"manual_only"`, decodes to
+  # `nil` ("never explicitly set") rather than being trusted verbatim.
+  defp decode_boot(raw) do
+    case Map.get(raw, "boot") do
+      value when value in ["auto", "manual"] -> value
+      _ -> nil
+    end
+  end
+
+  # Like `decode_bool_setting/2` but preserves "never set" as `nil` rather
+  # than defaulting to `false` — `auto_update`'s `nil` and `false` are both
+  # real, distinct states (`nil` = fall back to the config default at render
+  # time; `false` = the user explicitly turned it off).
+  defp decode_maybe_bool_setting(raw, key) do
+    case Map.get(raw, key) do
+      value when is_boolean(value) -> value
+      _ -> nil
     end
   end
 
@@ -466,7 +525,9 @@ defmodule Vagus.Addon.State do
                                ingress_port: ingress_port,
                                ingress_panel: ingress_panel,
                                watchdog: watchdog,
-                               ports: ports
+                               ports: ports,
+                               boot: boot,
+                               auto_update: auto_update
                              }} ->
           {slug,
            %{
@@ -477,7 +538,9 @@ defmodule Vagus.Addon.State do
              "ingress_port" => ingress_port,
              "ingress_panel" => ingress_panel,
              "watchdog" => watchdog,
-             "network" => ports
+             "network" => ports,
+             "boot" => boot,
+             "auto_update" => auto_update
            }}
         end)
     }

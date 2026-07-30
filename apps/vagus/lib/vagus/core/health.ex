@@ -15,7 +15,10 @@ defmodule Vagus.Core.Health do
   `STARTUP_API_RESPONSE_TIMEOUT`) elapses, using a monotonic-time bound —
   `Process.sleep/1` between attempts is fine here (unlike a GenServer, there
   is no message queue this would starve). `check/1` is a single immediate
-  probe, for `POST /core/check`.
+  probe, used as the Core watchdog's liveness check
+  (`Vagus.Core.Watchdog.Probe`). NOT what `POST /core/check` runs — that
+  route is a config validity check (`Vagus.Core.ConfigCheck`, audit G3), a
+  different question this module's plain up/down probe can't answer.
 
   Both accept an injectable `opts[:probe]` — a zero-arity function returning
   `:ok | {:error, term()}` — so tests never make a real HTTP call unless

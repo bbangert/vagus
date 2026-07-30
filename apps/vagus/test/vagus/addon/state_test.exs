@@ -78,7 +78,9 @@ defmodule Vagus.Addon.StateTest do
                 ingress_token: token,
                 ingress_port: nil,
                 ingress_panel: false,
-                watchdog: false
+                watchdog: false,
+                boot: nil,
+                auto_update: nil
               }} = State.get("core_mosquitto", s)
 
       assert is_binary(token)
@@ -140,6 +142,18 @@ defmodule Vagus.Addon.StateTest do
               }} = State.get("core_mosquitto", s)
     end
 
+    test "put_setting/4 writes boot and auto_update (phase 6 chunk A)", %{config: c, s: s} do
+      :ok = State.put(c, :started, server: s)
+
+      assert :ok = State.put_setting("core_mosquitto", :boot, "manual", s)
+      assert :ok = State.put_setting("core_mosquitto", :auto_update, true, s)
+
+      assert {:ok, %{boot: "manual", auto_update: true}} = State.get("core_mosquitto", s)
+
+      assert :ok = State.put_setting("core_mosquitto", :auto_update, false, s)
+      assert {:ok, %{auto_update: false}} = State.get("core_mosquitto", s)
+    end
+
     test "put_setting/4 preserves the other settings and user_options", %{config: c, s: s} do
       :ok = State.put(c, :started, server: s, user_options: %{"greeting" => "hi"})
       :ok = State.put_setting("core_mosquitto", :watchdog, true, s)
@@ -195,6 +209,8 @@ defmodule Vagus.Addon.StateTest do
       assert on_disk["addons"]["core_mosquitto"]["ingress_port"] == nil
       assert on_disk["addons"]["core_mosquitto"]["ingress_panel"] == false
       assert on_disk["addons"]["core_mosquitto"]["watchdog"] == false
+      assert on_disk["addons"]["core_mosquitto"]["boot"] == nil
+      assert on_disk["addons"]["core_mosquitto"]["auto_update"] == nil
     end
 
     test "put_setting persists across a reload, and the ingress_token survives the round-trip", %{
@@ -208,6 +224,8 @@ defmodule Vagus.Addon.StateTest do
       :ok = State.put_setting("core_mosquitto", :ingress_port, 62_001, s1)
       :ok = State.put_setting("core_mosquitto", :ingress_panel, true, s1)
       :ok = State.put_setting("core_mosquitto", :watchdog, true, s1)
+      :ok = State.put_setting("core_mosquitto", :boot, "manual", s1)
+      :ok = State.put_setting("core_mosquitto", :auto_update, true, s1)
       GenServer.stop(s1)
 
       s2 = start_persisted(path)
@@ -217,7 +235,9 @@ defmodule Vagus.Addon.StateTest do
                 ingress_token: ^token,
                 ingress_port: 62_001,
                 ingress_panel: true,
-                watchdog: true
+                watchdog: true,
+                boot: "manual",
+                auto_update: true
               }} = State.get("core_mosquitto", s2)
     end
 
@@ -249,10 +269,35 @@ defmodule Vagus.Addon.StateTest do
                 ingress_token: token,
                 ingress_port: nil,
                 ingress_panel: false,
-                watchdog: false
+                watchdog: false,
+                boot: nil,
+                auto_update: nil
               }} = State.get("core_mosquitto", s)
 
       assert is_binary(token)
+    end
+
+    test "a hand-edited file with garbage boot/auto_update values falls back to nil for both",
+         %{config: c, path: path} do
+      File.mkdir_p!(Path.dirname(path))
+
+      on_disk = %{
+        "version" => 1,
+        "addons" => %{
+          "core_mosquitto" => %{
+            "config" => Vagus.Addon.Config.to_persistable(c),
+            "state" => "started",
+            "user_options" => %{},
+            "boot" => "manual_only",
+            "auto_update" => "yes"
+          }
+        }
+      }
+
+      File.write!(path, Jason.encode!(on_disk))
+
+      s = start_persisted(path)
+      assert {:ok, %{boot: nil, auto_update: nil}} = State.get("core_mosquitto", s)
     end
 
     test "put_options and delete each re-persist the file", %{config: c, path: path} do

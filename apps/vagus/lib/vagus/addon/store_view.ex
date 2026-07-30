@@ -10,9 +10,17 @@ defmodule Vagus.Addon.StoreView do
   `hassio_api`/`hassio_role`, not the model's `supervisor_*` aliases) +
   `detached`. A store add-on isn't installed, so there's no state/options/
   hostname/network here (that's `InstalledAddonComplete`, see `Vagus.Addon.Info`).
+
+  `available`/`homeassistant` (audit G1) are computed by
+  `Vagus.Addon.Availability` / read off `config` — both were previously
+  hardcoded (`true`/`nil`), so an unavailable store add-on showed an
+  enabled Install button. `machine` is NOT emitted here: it's only on
+  `InstalledAddonComplete`
+  (`aiohasupervisor`'s `AddonInfoStoreBaseFields` doesn't carry it), which
+  is why `Vagus.Addon.Info` is the one that reports it.
   """
 
-  alias Vagus.Addon.Config
+  alias Vagus.Addon.{Availability, Config}
 
   @doc """
   The `StoreAddon` summary for `GET /store/addons` (and the `GET /store` list).
@@ -125,12 +133,12 @@ defmodule Vagus.Addon.StoreView do
   defp base_fields(store_slug, config, repo, installed?, installed_version, assets) do
     %{
       "advanced" => config.advanced,
-      "available" => true,
+      "available" => Availability.available?(config),
       "installed" => installed?,
       "build" => config.image == nil,
       "changelog" => Map.get(assets, :changelog, false),
       "description" => config.description,
-      "homeassistant" => nil,
+      "homeassistant" => config.homeassistant,
       "icon" => Map.get(assets, :icon, false),
       "logo" => Map.get(assets, :logo, false),
       "name" => config.name,

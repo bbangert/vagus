@@ -187,6 +187,61 @@ defmodule Vagus.Addon.BootStarterTest do
     assert Fake.calls_for("addon_#{slug}") == []
   end
 
+  # Phase 6 chunk A (audit E1): the persisted per-install `boot` override —
+  # not just `config.boot` — decides whether reconciliation restarts an
+  # add-on. Before `Config.effective_boot/2` was wired in here,
+  # reconciliation read `config.boot` directly and a user's explicit
+  # `manual` override on an `auto`-configured add-on was silently ignored
+  # on every reboot.
+  test "a persisted :boot override (manual) skips a config-boot:auto add-on, and an unoverridden auto add-on still starts" do
+    manual_slug = "boot_override_manual_#{System.unique_integer([:positive])}"
+    auto_slug = "boot_override_auto_#{System.unique_integer([:positive])}"
+
+    seed(manual_slug, :started, fixture_config(manual_slug, %{"boot" => "auto"}))
+    :ok = State.put_setting(manual_slug, :boot, "manual")
+
+    seed(auto_slug, :started, fixture_config(auto_slug, %{"boot" => "auto"}))
+
+    start_supervised!(
+      {BootStarter,
+       ping: fn -> :ok end, ensure_network: fn -> :ok end, interval: 1, max_attempts: 5, name: nil}
+    )
+
+    assert eventually(fn -> match?({:ok, %{state: :stopped}}, State.get(manual_slug)) end)
+    assert Fake.calls_for("addon_#{manual_slug}") == []
+
+    assert eventually(fn -> match?({:ok, %{state: :started}}, State.get(auto_slug)) end)
+    assert eventually(fn -> {:create, "addon_#{auto_slug}"} in Fake.calls() end)
+  end
+
+  test "a persisted :boot override (auto) starts a config-boot:manual add-on" do
+    slug = "boot_override_forces_auto_#{System.unique_integer([:positive])}"
+    seed(slug, :started, fixture_config(slug, %{"boot" => "manual"}))
+    :ok = State.put_setting(slug, :boot, "auto")
+
+    start_supervised!(
+      {BootStarter,
+       ping: fn -> :ok end, ensure_network: fn -> :ok end, interval: 1, max_attempts: 5, name: nil}
+    )
+
+    assert eventually(fn -> match?({:ok, %{state: :started}}, State.get(slug)) end)
+    assert eventually(fn -> {:create, "addon_#{slug}"} in Fake.calls() end)
+  end
+
+  test "a manual_only config always demotes, even with a persisted :boot override of auto" do
+    slug = "boot_manual_only_#{System.unique_integer([:positive])}"
+    seed(slug, :started, fixture_config(slug, %{"boot" => "manual_only"}))
+    :ok = State.put_setting(slug, :boot, "auto")
+
+    start_supervised!(
+      {BootStarter,
+       ping: fn -> :ok end, ensure_network: fn -> :ok end, interval: 1, max_attempts: 5, name: nil}
+    )
+
+    assert eventually(fn -> match?({:ok, %{state: :stopped}}, State.get(slug)) end)
+    assert Fake.calls_for("addon_#{slug}") == []
+  end
+
   test "a :stopped entry is left alone" do
     slug = "boot_stopped_#{System.unique_integer([:positive])}"
     seed(slug, :stopped, fixture_config(slug, %{"boot" => "auto"}))
