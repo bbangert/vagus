@@ -81,6 +81,17 @@ defmodule Vagus.API.StaticData do
     to_string(hostname)
   end
 
+  @doc """
+  The emulated Supervisor version — the one claim the whole wire agrees on
+  (`/info`, `/supervisor/info`, and since phase 4 every `backup.json`'s
+  `supervisor_version`). Public so `Vagus.Backups` reads THIS constant
+  rather than duplicating it: a restoring HAOS compares the tar's value
+  against its own Supervisor with AwesomeVersion, so it must be a real
+  version string, and it should be the same version the API reports.
+  """
+  @spec supervisor_version() :: String.t()
+  def supervisor_version, do: @supervisor_version
+
   @doc "Attrs for `Vagus.API.Models.SupervisorInfo` (`GET supervisor/info`)."
   @spec supervisor_info() :: map()
   def supervisor_info do

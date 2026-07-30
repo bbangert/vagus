@@ -2294,51 +2294,93 @@ defmodule Vagus.API.Router do
   defp mb(bytes), do: Float.round(bytes / 1_048_576, 2)
 
   # `GET /backups` / `GET /backups/info` list entry (pinned V1 shape).
+  # List/info read the backup's OWN `backup.json` values rather than
+  # hardcoding a Vagus-shaped answer (audit C4): an uploaded HAOS full,
+  # encrypted backup used to list as an unprotected partial with no Core
+  # content — and Core reads `protected` straight out of
+  # `location_attributes`, so the frontend offered a passwordless restore of
+  # an encrypted tar. Defaults below fire only for keys an old/foreign
+  # `backup.json` omits, and default to what Vagus itself always wrote.
   defp backup_list_entry(%{backup: b, size_bytes: size_bytes}) do
+    protected = b["protected"] == true
+
     %{
       slug: b["slug"],
       name: b["name"],
       date: b["date"],
-      type: "partial",
+      type: b["type"] || "partial",
       size: mb(size_bytes),
       size_bytes: size_bytes,
       location: nil,
       locations: [nil],
-      protected: false,
-      compressed: true,
-      location_attributes: %{".local" => %{protected: false, size_bytes: size_bytes}},
+      protected: protected,
+      compressed: b["compressed"] != false,
+      location_attributes: %{".local" => %{protected: protected, size_bytes: size_bytes}},
       content: %{
-        homeassistant: false,
-        addons: Enum.map(b["addons"] || [], & &1["slug"]),
-        folders: []
+        homeassistant: b["homeassistant"] != nil,
+        addons: backup_addon_slugs(b),
+        folders: b["folders"] || []
       }
     }
   end
 
+  # `backup.json`'s `addons` is caller-controlled on an uploaded tar, so
+  # neither of these may assume the wire shape: a non-list, or a list whose
+  # elements are strings/numbers, used to raise `FunctionClauseError` /
+  # `Protocol.UndefinedError` INSIDE the list handler — and because the boot
+  # rescan re-indexes the file, one such upload 500'd `GET /backups` for
+  # every caller (Core included) permanently, hiding the very slug needed to
+  # DELETE it. Non-map entries are dropped rather than errored: the rest of
+  # the listing is still true, and a backup nobody can list is worse than a
+  # backup listed with one entry missing.
+  defp backup_addon_slugs(b) do
+    b |> backup_addon_maps() |> Enum.map(& &1["slug"])
+  end
+
+  defp backup_addon_entries(b) do
+    b
+    |> backup_addon_maps()
+    |> Enum.map(fn a ->
+      %{slug: a["slug"], name: a["name"], version: a["version"], size: a["size"]}
+    end)
+  end
+
+  # A **binary `slug`** is required, not just map-ness: `content.addons` is a
+  # list of slug strings, and an entry without one would put `nil` in it —
+  # breaking any client that expects strings, and meaningless in `info`'s
+  # entry list too, since every consumer keys on the slug (Copilot, PR #30).
+  defp backup_addon_maps(%{"addons" => addons}) when is_list(addons) do
+    Enum.filter(addons, fn
+      %{"slug" => slug} -> is_binary(slug)
+      _not_a_map_or_no_slug -> false
+    end)
+  end
+
+  defp backup_addon_maps(_b), do: []
+
   # `GET /backups/{slug}/info` shape.
   defp backup_info(%{backup: b, size_bytes: size_bytes}) do
+    protected = b["protected"] == true
+
     %{
       slug: b["slug"],
-      type: "partial",
+      type: b["type"] || "partial",
       name: b["name"],
       date: b["date"],
       size: mb(size_bytes),
       size_bytes: size_bytes,
-      compressed: true,
-      protected: false,
-      location_attributes: %{".local" => %{protected: false, size_bytes: size_bytes}},
+      compressed: b["compressed"] != false,
+      protected: protected,
+      location_attributes: %{".local" => %{protected: protected, size_bytes: size_bytes}},
       supervisor_version: b["supervisor_version"],
-      homeassistant: nil,
+      homeassistant: b["homeassistant"],
       location: nil,
       locations: [nil],
-      addons:
-        Enum.map(b["addons"] || [], fn a ->
-          %{slug: a["slug"], name: a["name"], version: a["version"], size: a["size"]}
-        end),
-      repositories: [],
-      folders: [],
+      addons: backup_addon_entries(b),
+      repositories: b["repositories"] || [],
+      folders: b["folders"] || [],
       homeassistant_exclude_database: nil,
-      extra: %{}
+      extra: b["extra"] || %{}
     }
   end
 
@@ -2348,27 +2390,44 @@ defmodule Vagus.API.Router do
   # (created → done) — phase 4 owns routing the backup internals through the
   # job. `background: true` runs the tar in a supervised task; the sync path
   # keeps returning `slug` alongside `job_id`.
+  # Upstream's create schema is PREVENT_EXTRA: a genuinely unknown body key
+  # is a 400, not silently dropped (audit C5). The keys upstream declares
+  # but Vagus doesn't implement (`compressed`, `location`,
+  # `homeassistant_exclude_database`) stay accepted-and-ignored — that is
+  # upstream's own accepted vocabulary, and refusing it would break callers
+  # upstream tolerates.
+  @backup_new_keys ~w(addons background compressed extra filename folders
+                      homeassistant homeassistant_exclude_database location
+                      name password)
+
+  # Upstream's restore schema, same PREVENT_EXTRA discipline. Declared here
+  # (not next to its handler) because module attributes must precede their
+  # first use in source order.
+  @backup_restore_keys ~w(addons background folders homeassistant location password)
+
   defp handle_backup_new_partial(conn, params) do
-    with :ok <- reject_password(params),
+    with :ok <- reject_unknown_keys(params, @backup_new_keys),
+         :ok <- reject_password(params),
          :ok <- reject_homeassistant(params, "Core backup not supported"),
          :ok <- reject_folders(params),
          :ok <- validate_filename(params),
+         {:ok, extra} <- validate_extra(params),
          {:ok, addon_slugs} <- resolve_create_addon_slugs(params) do
       job = Jobs.create("backup_manager_partial_backup", nil, server: jobs_server())
+
+      create = fn ->
+        Backups.create_partial(Map.get(params, "name"), addon_slugs, extra: extra)
+      end
 
       if background?(conn) do
         result =
           start_job_task(job, fn ->
-            finish_backup_new_job(
-              job,
-              Backups.create_partial(Map.get(params, "name"), addon_slugs)
-            )
+            finish_backup_new_job(job, create.())
           end)
 
         send_job_task_result(conn, job, result)
       else
-        result =
-          run_with_job(job, fn -> Backups.create_partial(Map.get(params, "name"), addon_slugs) end)
+        result = run_with_job(job, create)
 
         finish_backup_new_job(job, result)
 
@@ -2411,7 +2470,8 @@ defmodule Vagus.API.Router do
         Envelope.send_error(conn, "Backup does not exist", 404)
 
       {:ok, _entry} ->
-        with :ok <- reject_password(params),
+        with :ok <- reject_unknown_keys(params, @backup_restore_keys),
+             :ok <- reject_password(params),
              :ok <- reject_homeassistant(params, "Core restore not supported"),
              :ok <- reject_folders(params),
              {:ok, addon_slugs} <- require_addons_list(params) do
@@ -2479,7 +2539,22 @@ defmodule Vagus.API.Router do
   # Memoized `Plug.Parsers.init/1` result for the route-local multipart parse
   # below — `init/1` only normalizes options into an opaque tuple, so
   # computing it once at compile time (rather than per-request) is safe.
-  @multipart_parser_opts Plug.Parsers.init(parsers: [{:multipart, length: 268_435_456}], pass: [])
+  # 2GB, up from 256MB (audit C6's cap revisit). The limit never protected
+  # RAM — `Plug.Parsers.MULTIPART` spools the part to a `Plug.Upload` temp
+  # FILE in 1MB reads and the handler above never loads it — so what it
+  # bounds is the spool filesystem.
+  #
+  # **Which is only true because that filesystem is now the data partition.**
+  # `/tmp` on both boards is a tmpfs sized at 10% of RAM (measured
+  # 2026-07-30: **96MB** on the rpi3), so with Plug's default spool location
+  # this cap WAS a RAM bound and an upload died around 96MB — below even the
+  # old 256MB limit. `config/target.exs` sets `PLUG_TMPDIR=/root/tmp` via
+  # erlinit, putting the spool on ext4 (28.8G, 17.5G free on the rpi3);
+  # 2GB then leaves room for the `File.cp/2` copy of the same tar beside it.
+  @multipart_parser_opts Plug.Parsers.init(
+                           parsers: [{:multipart, length: 2_147_483_648}],
+                           pass: []
+                         )
 
   # The uploaded tar's bytes are validated by `Backups.put_file/1` itself
   # (`Vagus.Backup.read/1`) — any field name is accepted (the first
@@ -2516,11 +2591,13 @@ defmodule Vagus.API.Router do
       {:ok, conn} ->
         case first_upload(conn.body_params) do
           {:ok, %Plug.Upload{path: path}} ->
-            with {:ok, tar} <- File.read(path),
-                 {:ok, slug} <- Backups.put_file(tar) do
-              Envelope.send_ok(conn, %{slug: slug})
-            else
-              _ -> Envelope.send_error(conn, "invalid backup file", 400)
+            # `put_path/1`, never `File.read` + `put_file` (audit C6): the
+            # multipart part is already spooled to disk by `Plug.Upload`, so
+            # only `backup.json` is parsed and the tar is `cp`'d — a real
+            # HAOS-sized backup no longer costs 2-3× its size in RAM.
+            case Backups.put_path(path) do
+              {:ok, slug} -> Envelope.send_ok(conn, %{slug: slug})
+              _error -> Envelope.send_error(conn, "invalid backup file", 400)
             end
 
           :error ->
@@ -2554,6 +2631,24 @@ defmodule Vagus.API.Router do
   end
 
   defp first_upload(_params), do: :error
+
+  # The C5 unknown-key 400 (upstream schemas default to PREVENT_EXTRA, so a
+  # typo'd key errors there rather than silently doing nothing).
+  defp reject_unknown_keys(params, allowed) do
+    case Map.keys(params) -- allowed do
+      [] -> :ok
+      unknown -> {:error, "unknown keys: #{Enum.join(Enum.sort(unknown), ", ")}"}
+    end
+  end
+
+  # `vol.Optional(ATTR_EXTRA): dict` — absent is fine, a non-map is a 400.
+  defp validate_extra(params) do
+    case Map.get(params, "extra") do
+      nil -> {:ok, nil}
+      extra when is_map(extra) -> {:ok, extra}
+      _other -> {:error, "extra must be a dict"}
+    end
+  end
 
   defp reject_password(params) do
     case Map.get(params, "password") do
