@@ -29,9 +29,12 @@ defmodule Vagus.Backend.Host.Hardware do
   and the frontend's hardware table keys each row on `dev_path`, so all
   those null-id rows collapse into one meaningless entry:
 
-    1. Devices with no `/dev` node are dropped (upstream: `if not
-       device.device_node: continue`) — a device the kernel exports but
-       never wires to a device file isn't something a user can act on.
+    1. Devices with no `dev_path` are dropped — no kernel-declared
+       `DEVNAME` in uevent and no `/dev/<name>` fallback on disk
+       (upstream: `if not device.device_node: continue`; like pyudev's
+       `device_node`, a declared `DEVNAME` is trusted without an
+       existence check). A device the kernel exports but never names a
+       device file for isn't something a user can act on.
     2. Virtual ttys/block devices/vcs are dropped even though most of
        them DO have a `/dev` node (upstream's `_RE_HIDE_SYSFS =
        re.compile(r"/sys/devices/virtual/(?:tty|block|vc)/.*")`) —
