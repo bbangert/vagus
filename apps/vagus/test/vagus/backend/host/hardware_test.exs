@@ -55,12 +55,21 @@ defmodule Vagus.Backend.Host.HardwareTest do
   end
 
   test "malformed uevent lines are dropped; well-formed ones still parse", ctx do
-    add_device(ctx, "misc", "weird", "GOOD=value\nno-equals-line\nALSO_GOOD=a=b\n\n")
+    add_device(
+      ctx,
+      "misc",
+      "weird",
+      "GOOD=value\nno-equals-line\nALSO_GOOD=a=b\nDEVNAME=weird\n\n"
+    )
 
     %{devices: [device]} = Hardware.info(sys_class: ctx.sys_class, dev_root: ctx.dev_root)
 
     # parts: 2 keeps everything after the first "=" intact.
-    assert device.attributes == %{"GOOD" => "value", "ALSO_GOOD" => "a=b"}
+    assert device.attributes == %{
+             "GOOD" => "value",
+             "ALSO_GOOD" => "a=b",
+             "DEVNAME" => "weird"
+           }
   end
 
   test "a device without DEVNAME gets a dev_path only when the node exists", ctx do
@@ -71,10 +80,55 @@ defmodule Vagus.Backend.Host.HardwareTest do
     %{devices: devices} = Hardware.info(sys_class: ctx.sys_class, dev_root: ctx.dev_root)
     by_name = Map.new(devices, &{&1.name, &1})
 
-    assert by_name["eth0"].dev_path == nil
+    # eth0 has no DEVNAME and no /dev/eth0 node, so dev_path is nil — and
+    # the dev_path filter drops it before it ever reaches by_name.
+    refute Map.has_key?(by_name, "eth0")
     assert by_name["mmcblk0"].dev_path == Path.join(ctx.dev_root, "mmcblk0")
     # Empty/absent uevent parses to an empty attribute map, not a crash.
     assert by_name["mmcblk0"].attributes == %{}
+  end
+
+  test "a device with no DEVNAME and no /dev node is dropped", ctx do
+    add_device(ctx, "platform", "orphan", "SOMETHING=else\n")
+
+    %{devices: devices} = Hardware.info(sys_class: ctx.sys_class, dev_root: ctx.dev_root)
+
+    refute Enum.any?(devices, &(&1.name == "orphan"))
+  end
+
+  # A virtual tty (like the udev-hidden ptmx pairs) resolves under
+  # .../devices/virtual/tty/... and DOES have a real /dev node — proving
+  # it's the sysfs-path filter, not the dev_path filter, dropping it.
+  defp add_virtual_device(%{root: root, sys_class: sys_class}, subsystem, kind, name, uevent) do
+    devices_dir = Path.join([root, "sys/devices/virtual", kind, name])
+    File.mkdir_p!(devices_dir)
+    File.write!(Path.join(devices_dir, "uevent"), uevent)
+
+    class_dir = Path.join(sys_class, subsystem)
+    File.mkdir_p!(class_dir)
+    relative = Path.relative_to(devices_dir, class_dir)
+    File.ln_s!(relative, Path.join(class_dir, name))
+    devices_dir
+  end
+
+  test "a virtual tty device is dropped even though it has a /dev node", ctx do
+    add_virtual_device(ctx, "tty", "tty", "tty5", "DEVNAME=tty5\n")
+    File.mkdir_p!(ctx.dev_root)
+    File.touch!(Path.join(ctx.dev_root, "tty5"))
+
+    %{devices: devices} = Hardware.info(sys_class: ctx.sys_class, dev_root: ctx.dev_root)
+
+    refute Enum.any?(devices, &(&1.name == "tty5"))
+  end
+
+  test "a virtual device outside tty|block|vc (e.g. net) is kept", ctx do
+    add_virtual_device(ctx, "net", "net", "lo", "DEVNAME=lo\nINTERFACE=lo\n")
+    File.mkdir_p!(ctx.dev_root)
+    File.touch!(Path.join(ctx.dev_root, "lo"))
+
+    %{devices: devices} = Hardware.info(sys_class: ctx.sys_class, dev_root: ctx.dev_root)
+
+    assert Enum.any?(devices, &(&1.name == "lo"))
   end
 
   test "devices are sorted by subsystem then name; missing sys_class is empty", ctx do

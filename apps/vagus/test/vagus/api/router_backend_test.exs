@@ -146,17 +146,15 @@ defmodule Vagus.API.RouterBackendTest do
       assert json_body(conn)["data"]["interface"] == "eth0"
     end
 
-    test "error tuple from the backend -> 400 error envelope" do
-      expect(NetworkMock, :interface_info, fn "bogus0" ->
-        {:error, "interface bogus0 not found"}
-      end)
+    test "unknown interface -> 404 with upstream's message" do
+      expect(NetworkMock, :interface_info, fn "bogus0" -> {:error, :not_found} end)
 
       conn = conn(:get, "/network/interface/bogus0/info") |> authed() |> call()
 
-      assert conn.status == 400
+      assert conn.status == 404
       body = json_body(conn)
       assert body["result"] == "error"
-      assert body["message"] == "interface bogus0 not found"
+      assert body["message"] == "Interface bogus0 does not exist"
     end
   end
 
@@ -191,6 +189,15 @@ defmodule Vagus.API.RouterBackendTest do
       assert conn.status == 400
       assert json_body(conn)["message"] =~ "not a wireless"
     end
+
+    test "unknown interface -> 404 with upstream's message" do
+      expect(NetworkMock, :access_points, fn "bogus0" -> {:error, :not_found} end)
+
+      conn = conn(:get, "/network/interface/bogus0/accesspoints") |> authed() |> call()
+
+      assert conn.status == 404
+      assert json_body(conn)["message"] == "Interface bogus0 does not exist"
+    end
   end
 
   describe "POST /network/interface/:ifname/update" do
@@ -211,19 +218,59 @@ defmodule Vagus.API.RouterBackendTest do
       assert json_body(conn)["data"] == %{}
     end
 
-    test "unsupported-field error from the backend -> 400 listing what's unsupported" do
-      expect(NetworkMock, :configure, fn "eth0", %{"ipv6" => %{}} ->
-        {:error, "unsupported field(s): ipv6"}
+    test "a full frontend-shaped body (ipv6 + enabled, previously 400'd) -> 200" do
+      body = %{
+        "ipv4" => %{"method" => "auto", "nameservers" => []},
+        "ipv6" => %{"method" => "auto", "nameservers" => []},
+        "enabled" => true
+      }
+
+      expect(NetworkMock, :configure, fn "eth0", ^body -> :ok end)
+
+      conn =
+        conn(:post, "/network/interface/eth0/update", Jason.encode!(body))
+        |> authed()
+        |> req_json()
+        |> call()
+
+      assert conn.status == 200
+      assert json_body(conn)["data"] == %{}
+    end
+
+    test "an error message from the backend -> 400 with that message" do
+      expect(NetworkMock, :configure, fn "eth0", %{"ipv4" => %{"method" => "dhcp"}} ->
+        {:error, ~s[invalid ipv4 method "dhcp" (expected disabled, static or auto)]}
       end)
 
       conn =
-        conn(:post, "/network/interface/eth0/update", Jason.encode!(%{"ipv6" => %{}}))
+        conn(
+          :post,
+          "/network/interface/eth0/update",
+          Jason.encode!(%{"ipv4" => %{"method" => "dhcp"}})
+        )
         |> authed()
         |> req_json()
         |> call()
 
       assert conn.status == 400
-      assert json_body(conn)["message"] == "unsupported field(s): ipv6"
+
+      assert json_body(conn)["message"] ==
+               ~s[invalid ipv4 method "dhcp" (expected disabled, static or auto)]
+    end
+
+    test "unknown interface -> 404 with upstream's message" do
+      expect(NetworkMock, :configure, fn "bogus0", %{"enabled" => true} ->
+        {:error, :not_found}
+      end)
+
+      conn =
+        conn(:post, "/network/interface/bogus0/update", Jason.encode!(%{"enabled" => true}))
+        |> authed()
+        |> req_json()
+        |> call()
+
+      assert conn.status == 404
+      assert json_body(conn)["message"] == "Interface bogus0 does not exist"
     end
   end
 

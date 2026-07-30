@@ -32,7 +32,7 @@ defmodule Vagus.Backend.Network.VintageNet do
   if Mix.target() != :host do
     @behaviour Vagus.Backend.Network
 
-    alias Vagus.Backend.Network.Builder
+    alias Vagus.Backend.Network.{Builder, WireConfig}
 
     @docker_network %{
       interface: "docker0",
@@ -60,45 +60,106 @@ defmodule Vagus.Backend.Network.VintageNet do
 
     @impl true
     def interface_info(ifname) do
-      if ifname in configured_interfaces() do
+      with {:ok, resolved} <- resolve_ifname(ifname) do
         best_connection = VintageNet.get(["connection"], :disconnected)
-        {:ok, Builder.build_interface(ifname, interface_properties(ifname), best_connection)}
-      else
-        {:error, "interface #{ifname} not found"}
+        {:ok, Builder.build_interface(resolved, interface_properties(resolved), best_connection)}
       end
     end
 
     @impl true
     def access_points(ifname) do
-      cond do
-        not String.starts_with?(ifname, "wlan") ->
-          {:error, "#{ifname} is not a wireless interface"}
-
-        ifname not in configured_interfaces() ->
-          {:error, "interface #{ifname} not found"}
-
-        true ->
-          {:ok, scan_access_points(ifname)}
+      # Resolution (404) happens BEFORE the wireless check — an unknown
+      # name is "this interface doesn't exist", not "it's not wireless".
+      with {:ok, resolved} <- resolve_ifname(ifname) do
+        if String.starts_with?(resolved, "wlan") do
+          {:ok, scan_access_points(resolved)}
+        else
+          {:error, "#{resolved} is not a wireless interface"}
+        end
       end
     end
 
     @impl true
     def configure(ifname, params) do
-      unsupported = params |> Map.keys() |> Enum.reject(&(&1 in ~w(ipv4 wifi)))
-
-      cond do
-        unsupported != [] ->
-          {:error, "unsupported field(s): #{Enum.join(unsupported, ", ")}"}
-
-        ifname not in configured_interfaces() ->
-          {:error, "interface #{ifname} not found"}
-
-        true ->
-          case VintageNet.configure(ifname, build_config(ifname, params)) do
-            :ok -> :ok
-            {:error, reason} -> {:error, inspect(reason)}
-          end
+      with {:ok, resolved} <- resolve_ifname(ifname),
+           {:ok, fragments} <- WireConfig.translate(params),
+           :ok <- check_wireless(resolved, fragments.wifi) do
+        apply_fragments(resolved, fragments)
       end
+    end
+
+    # `VintageNetEthernet.normalize/1` passes a foreign `vintage_net_wifi`
+    # key straight through into the persisted `source_config` (only the
+    # wireless stack hashes `psk` via `WPA2.to_psk/2` first) — a wifi
+    # fragment applied to a non-wireless interface would land the
+    # plaintext psk on flash and in the property table. Refuse before
+    # anything is built/applied, mirroring `access_points/1`'s check.
+    defp check_wireless(_resolved, nil), do: :ok
+
+    defp check_wireless(resolved, _wifi_fragment) do
+      if String.starts_with?(resolved, "wlan") do
+        :ok
+      else
+        {:error, "#{resolved} is not a wireless interface"}
+      end
+    end
+
+    # Nothing derived changed (params validated but had nothing this
+    # backend can act on, e.g. `%{"enabled" => true}` alone) — skip the
+    # `VintageNet.configure` call entirely rather than needlessly bounce
+    # the link by re-applying an unchanged config (the D3-empty-body
+    # cousin: a no-op body must be a no-op action, not a reconnect).
+    defp apply_fragments(_ifname, %{ipv4: nil, wifi: nil}), do: :ok
+
+    defp apply_fragments(ifname, fragments) do
+      merged =
+        ifname
+        |> current_config()
+        |> maybe_put_ipv4(fragments.ipv4)
+        |> maybe_put_wifi(fragments.wifi)
+
+      case VintageNet.configure(ifname, merged) do
+        :ok -> :ok
+        {:error, reason} -> {:error, inspect(reason)}
+      end
+    end
+
+    defp maybe_put_ipv4(config, nil), do: config
+    defp maybe_put_ipv4(config, ipv4_fragment), do: Map.put(config, :ipv4, ipv4_fragment)
+
+    defp maybe_put_wifi(config, nil), do: config
+
+    defp maybe_put_wifi(config, wifi_fragment),
+      do: Map.put(config, :vintage_net_wifi, %{networks: [wifi_fragment]})
+
+    # `"default"` (case-insensitive) resolves to the primary interface —
+    # the same rule `Builder.build_interface/3` uses to set `primary`:
+    # connected (not `:disconnected`) and matching the aggregate
+    # `["connection"]` value. Kept consistent with that function
+    # deliberately, since both answer "which interface is the box's main
+    # one" from the same underlying `vintage_net` state.
+    defp resolve_ifname(ifname) do
+      if String.downcase(ifname) == "default" do
+        case primary_interface() do
+          nil -> {:error, :not_found}
+          primary -> {:ok, primary}
+        end
+      else
+        if ifname in configured_interfaces() do
+          {:ok, ifname}
+        else
+          {:error, :not_found}
+        end
+      end
+    end
+
+    defp primary_interface do
+      best_connection = VintageNet.get(["connection"], :disconnected)
+
+      Enum.find(configured_interfaces(), fn ifname ->
+        connection = VintageNet.get(["interface", ifname, "connection"], :disconnected)
+        connection != :disconnected and connection == best_connection
+      end)
     end
 
     defp configured_interfaces, do: VintageNet.configured_interfaces()
@@ -134,38 +195,11 @@ defmodule Vagus.Backend.Network.VintageNet do
       end)
     end
 
-    defp build_config(ifname, params) do
-      ifname
-      |> current_config()
-      |> put_ipv4(params["ipv4"])
-      |> put_wifi(params["wifi"])
-    end
-
     defp current_config(ifname) do
       case VintageNet.get(["interface", ifname, "config"], %{}) do
         %{} = config -> config
         _other -> %{}
       end
-    end
-
-    defp put_ipv4(config, nil), do: config
-    defp put_ipv4(config, %{"method" => "dhcp"}), do: Map.put(config, :ipv4, %{method: :dhcp})
-
-    defp put_ipv4(config, %{"method" => "static"} = ipv4) do
-      Map.put(config, :ipv4, %{
-        method: :static,
-        address: Map.get(ipv4, "address"),
-        prefix_length: Map.get(ipv4, "prefix_length"),
-        gateway: Map.get(ipv4, "gateway")
-      })
-    end
-
-    defp put_wifi(config, nil), do: config
-
-    defp put_wifi(config, %{"ssid" => ssid, "psk" => psk}) do
-      Map.put(config, :vintage_net_wifi, %{
-        networks: [%{ssid: ssid, psk: psk, key_mgmt: :wpa_psk}]
-      })
     end
   end
 end

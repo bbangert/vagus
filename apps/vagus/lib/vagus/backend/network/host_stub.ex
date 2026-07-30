@@ -5,18 +5,23 @@ defmodule Vagus.Backend.Network.HostStub do
   deliberately not named `"eth0"` (nothing on a dev host really is a
   network interface by that name); the distinct name makes it obvious in
   logs/tests that this is the emulator's stand-in, not a real device
-  read. `access_points/1` and `configure/2` apply the same honest
+  read. `"eth-host"` is also this stub's only, and therefore primary,
+  interface, so `"default"`/`"DEFAULT"` (case-insensitive) resolves to
+  it. `access_points/1` and `configure/2` apply the same honest
   validation the real `Vagus.Backend.Network.VintageNet` backend does
-  (wireless-only for scans, whitelisted fields for configure) even though
-  this backend has no real hardware behind either — a dev/test caller
-  gets the same error shapes it would against a real device.
+  (interface resolution before the wireless check, full
+  `Vagus.Backend.Network.WireConfig` body validation) even though this
+  backend has no real hardware behind either — a dev/test caller gets the
+  same error shapes it would against a real device. `configure/2` never
+  actually applies anything (no `vintage_net` to apply to) — it validates
+  and logs, then no-ops.
   """
 
   @behaviour Vagus.Backend.Network
 
   require Logger
 
-  @configurable_fields ~w(ipv4 wifi)
+  alias Vagus.Backend.Network.WireConfig
 
   @impl true
   def info do
@@ -28,32 +33,74 @@ defmodule Vagus.Backend.Network.HostStub do
     }
   end
 
+  @spec interface_info(String.t()) :: {:ok, map()} | {:error, :not_found | String.t()}
   @impl true
-  def interface_info("eth-host"), do: {:ok, interface()}
-  def interface_info(ifname), do: {:error, "interface #{ifname} not found"}
+  def interface_info(ifname) do
+    with {:ok, _resolved} <- resolve_ifname(ifname) do
+      {:ok, interface()}
+    end
+  end
 
+  @spec access_points(String.t()) :: {:ok, [map()]} | {:error, :not_found | String.t()}
   @impl true
   def access_points(ifname) do
-    if String.starts_with?(ifname, "wlan") do
-      {:ok, []}
-    else
-      {:error, "#{ifname} is not a wireless interface"}
+    with {:ok, resolved} <- resolve_ifname(ifname) do
+      # `resolved` is always `"eth-host"` in practice (this stub's only
+      # interface, not wireless) — the `String.starts_with?/2` check below
+      # is dead at runtime, but it keeps this function's static return
+      # type genuinely `{:ok, _} | {:error, _}` rather than
+      # unconditionally erroring. A body that always errors makes the
+      # compiler's type checker treat this whole function's result as an
+      # error-only type FOR THIS COMPILE-TIME-SELECTED BACKEND, which
+      # would then flag `Vagus.API.Router`'s generic `{:ok, ...}` clause
+      # (needed for the real `Vagus.Backend.Network.VintageNet` backend,
+      # which genuinely can return access points) as unreachable dead
+      # code under `--warnings-as-errors` on a `:host` build. Same
+      # reasoning as `Vagus.Engine.Manager`'s `Mix.target()` split.
+      if String.starts_with?(resolved, "wlan") do
+        {:ok, []}
+      else
+        {:error, "#{resolved} is not a wireless interface"}
+      end
     end
   end
 
   @impl true
   def configure(ifname, params) do
-    unsupported = params |> Map.keys() |> Enum.reject(&(&1 in @configurable_fields))
-
-    if unsupported == [] do
+    with {:ok, resolved} <- resolve_ifname(ifname),
+         {:ok, fragments} <- WireConfig.translate(params),
+         :ok <- check_wireless(resolved, fragments.wifi) do
       Logger.info(
-        "Vagus.Backend.Network.HostStub: configure(#{ifname}, #{inspect(redact(params))}) — " <>
+        "Vagus.Backend.Network.HostStub: configure(#{resolved}, #{inspect(redact(params))}) — " <>
           "no-op on :host"
       )
 
       :ok
+    end
+  end
+
+  # eth-host is never wireless — mirrors the real `VintageNet` backend's
+  # check (and the wire reason: `VintageNetEthernet.normalize/1` would
+  # otherwise pass a foreign `vintage_net_wifi` key, plaintext psk
+  # included, straight into the persisted config on a real target) so
+  # dev/test callers see identical semantics.
+  defp check_wireless(_resolved, nil), do: :ok
+
+  defp check_wireless(resolved, _wifi_fragment) do
+    if String.starts_with?(resolved, "wlan") do
+      :ok
     else
-      {:error, "unsupported field(s): #{Enum.join(unsupported, ", ")}"}
+      {:error, "#{resolved} is not a wireless interface"}
+    end
+  end
+
+  # Only interface is "eth-host" (also the primary, so "default"
+  # resolves to it too); anything else is an honest 404.
+  defp resolve_ifname(ifname) do
+    if ifname == "eth-host" or String.downcase(ifname) == "default" do
+      {:ok, "eth-host"}
+    else
+      {:error, :not_found}
     end
   end
 
