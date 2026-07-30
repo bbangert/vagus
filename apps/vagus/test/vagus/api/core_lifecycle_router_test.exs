@@ -24,9 +24,14 @@ defmodule Vagus.API.CoreLifecycleRouterTest.StubLifecycle do
   defp respond(op, opts) do
     send(self(), {:core_lifecycle_call, op, opts})
 
-    :vagus
-    |> Application.get_env(:stub_core_lifecycle_response, %{})
-    |> Map.get(op, default_reply(op))
+    case :vagus
+         |> Application.get_env(:stub_core_lifecycle_response, %{})
+         |> Map.get(op, default_reply(op)) do
+      # Simulates a producer that raises instead of returning `{:error, _}` —
+      # exercises the router's `run_with_job/2` crash guard.
+      :__crash__ -> raise "stub lifecycle crash"
+      reply -> reply
+    end
   end
 
   defp default_reply(:update), do: {:ok, "unset"}
@@ -276,6 +281,98 @@ defmodule Vagus.API.CoreLifecycleRouterTest do
       assert_received {:core_lifecycle_call, :update, opts}
       assert Keyword.get(opts, :version) == nil
     end
+  end
+
+  describe "POST /core/update is wrapped in a home_assistant_core_update job (audit B1/B4)" do
+    setup do
+      name = :"core_update_jobs_#{System.unique_integer([:positive])}"
+      {:ok, _pid} = start_supervised({Vagus.Jobs, name: name})
+
+      prev = Application.get_env(:vagus, :jobs_server)
+      Application.put_env(:vagus, :jobs_server, name)
+
+      on_exit(fn ->
+        if prev,
+          do: Application.put_env(:vagus, :jobs_server, prev),
+          else: Application.delete_env(:vagus, :jobs_server)
+      end)
+
+      %{jobs: name}
+    end
+
+    test "the sync path passes the job to Lifecycle and finishes it done", %{jobs: jobs} do
+      stub_response(:update, {:ok, "2026.7.3"})
+
+      assert post_("/core/update", %{}).status == 200
+
+      assert_received {:core_lifecycle_call, :update, opts}
+      job = Keyword.get(opts, :job)
+      assert job =~ ~r/\A[0-9a-f]{32}\z/
+
+      assert {:ok, %{"name" => "home_assistant_core_update", "done" => true, "errors" => []}} =
+               Vagus.Jobs.get(job, jobs)
+    end
+
+    test "a failed sync update finishes the job with an error entry", %{jobs: jobs} do
+      stub_response(:update, {:error, :health_timeout})
+
+      assert post_("/core/update", %{}).status == 400
+
+      assert_received {:core_lifecycle_call, :update, opts}
+      assert {:ok, %{"done" => true, "errors" => [error]}} = Vagus.Jobs.get(opts[:job], jobs)
+      assert error["type"] == "HomeAssistantUpdateError"
+      assert error["message"] =~ "healthy"
+    end
+
+    test "background: true returns {job_id} immediately and the job completes", %{jobs: jobs} do
+      stub_response(:update, {:ok, "2026.7.3"})
+
+      conn = post_("/core/update", %{"background" => true})
+
+      assert conn.status == 200
+      job_id = json_body(conn)["data"]["job_id"]
+      assert job_id =~ ~r/\A[0-9a-f]{32}\z/
+
+      # The update ran in a task (its stub call-report goes to the task
+      # process, not this one), so poll the job for completion.
+      assert eventually(fn ->
+               match?({:ok, %{"done" => true}}, Vagus.Jobs.get(job_id, jobs))
+             end)
+
+      assert {:ok, %{"errors" => []}} = Vagus.Jobs.get(job_id, jobs)
+      refute_received {:core_lifecycle_call, :update, _opts}
+    end
+
+    test "a producer that RAISES still leaves its job done, with a generic error", %{jobs: jobs} do
+      stub_response(:update, :__crash__)
+
+      conn = post_("/core/update", %{"background" => true})
+      assert conn.status == 200
+      job_id = json_body(conn)["data"]["job_id"]
+
+      assert eventually(fn ->
+               match?({:ok, %{"done" => true}}, Vagus.Jobs.get(job_id, jobs))
+             end)
+
+      assert {:ok, %{"errors" => [error]}} = Vagus.Jobs.get(job_id, jobs)
+      assert error["type"] == "UnexpectedError"
+      # The exception detail stays in the log — it can embed resolved add-on
+      # options, and job errors are readable at :default tier (review W3).
+      refute error["message"] =~ "stub lifecycle crash"
+    end
+  end
+
+  # Bounded poll for background-task completion (the `boot_starter_test.exs`
+  # predicate idiom).
+  defp eventually(fun, attempts \\ 200) do
+    Enum.reduce_while(1..attempts, false, fn _, _ ->
+      if fun.() do
+        {:halt, true}
+      else
+        Process.sleep(25)
+        {:cont, false}
+      end
+    end)
   end
 
   ## -- busy -> 409 -------------------------------------------------------------

@@ -115,6 +115,19 @@ defmodule Vagus.API.BackupRouterTest do
 
   defp body(conn), do: Jason.decode!(conn.resp_body)
 
+  # Bounded poll for background-task completion (the `boot_starter_test.exs`
+  # predicate idiom).
+  defp eventually(fun, attempts \\ 200) do
+    Enum.reduce_while(1..attempts, false, fn _, _ ->
+      if fun.() do
+        {:halt, true}
+      else
+        Process.sleep(25)
+        {:cont, false}
+      end
+    end)
+  end
+
   # Builds a REAL `multipart/form-data` raw body (W4) — exercises the
   # route-local `Plug.Parsers` call `handle_backup_upload/1` makes (B1),
   # unlike a `Plug.Test.conn/3` map body (which bypasses `Plug.Parsers`
@@ -165,8 +178,43 @@ defmodule Vagus.API.BackupRouterTest do
       assert is_binary(data["job_id"])
       assert String.length(data["job_id"]) == 32
 
+      # The job_id is REAL now (audit B1/C1): it resolves, it is done, and
+      # its reference carries the backup slug — the thing Core polls for.
+      job_conn = supervisor_call(:get, "/jobs/#{data["job_id"]}")
+      assert job_conn.status == 200
+      job = body(job_conn)["data"]
+      assert job["name"] == "backup_manager_partial_backup"
+      assert job["reference"] == data["slug"]
+      assert job["done"] == true
+      assert job["errors"] == []
+
       assert {:ok, %{backup: b}} = Backups.get(data["slug"])
       assert Enum.any?(b["addons"], &(&1["slug"] == "core_partial"))
+    end
+
+    test "background: true returns {job_id} and the backup lands via the job", %{data_root: dr} do
+      install("core_partial_bg", dr)
+
+      conn =
+        supervisor_call(:post, "/backups/new/partial", %{
+          "addons" => ["core_partial_bg"],
+          "background" => true
+        })
+
+      assert conn.status == 200
+      job_id = body(conn)["data"]["job_id"]
+      # No slug on the background response — it isn't known yet; Core reads
+      # it off the finished job's reference.
+      refute Map.has_key?(body(conn)["data"], "slug")
+
+      assert eventually(fn ->
+               body(supervisor_call(:get, "/jobs/#{job_id}"))["data"]["done"] == true
+             end)
+
+      job = body(supervisor_call(:get, "/jobs/#{job_id}"))["data"]
+      assert job["errors"] == []
+      assert {:ok, %{backup: b}} = Backups.get(job["reference"])
+      assert Enum.any?(b["addons"], &(&1["slug"] == "core_partial_bg"))
     end
 
     test "a non-empty password -> 400" do
@@ -425,7 +473,15 @@ defmodule Vagus.API.BackupRouterTest do
         supervisor_call(:post, "/backups/#{slug}/restore/partial", %{"addons" => ["core_restore"]})
 
       assert conn.status == 200
-      assert is_binary(body(conn)["data"]["job_id"])
+
+      # Real restore job (audit B1/C1): resolves and reads done.
+      job_id = body(conn)["data"]["job_id"]
+      job = body(supervisor_call(:get, "/jobs/#{job_id}"))["data"]
+      assert job["name"] == "backup_manager_partial_restore"
+      assert job["reference"] == slug
+      assert job["done"] == true
+      assert job["errors"] == []
+
       assert File.read!(Path.join(data_dir, "f.txt")) == "hello"
     end
 

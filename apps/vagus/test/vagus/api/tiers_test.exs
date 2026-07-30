@@ -58,6 +58,12 @@ defmodule Vagus.API.TiersTest do
     {"/mounts", :manager},
     {"/resolution/info", :default},
     {"/jobs/info", :default},
+    # `/jobs/{uuid}` + the options/reset POSTs — `/jobs/.+` is plain
+    # `role_access` manager territory upstream; only the `/info` suffix above
+    # lands lower, via `/.+/info`.
+    {"/jobs/00112233445566778899aabbccddeeff", :manager},
+    {"/jobs/options", :manager},
+    {"/jobs/reset", :manager},
 
     # -- Add-ons --------------------------------------------------------------
     {"/addons", :manager},

@@ -43,16 +43,25 @@ defmodule Vagus.Core.Events do
   end
 
   @doc """
-  Builds the `data` map for a `job` WS event — the flat
-  `SupervisorJob.as_dict()` shape (contract §7), unioned with
-  `"event" => "job"` (the wire's only hard requirement,
-  `SCHEMA_WEBSOCKET_EVENT`, §4).
+  Builds the `data` map for a `job` WS event:
 
-  This is the WS-event shape, NOT the `/jobs/info` REST tree shape: it
-  KEEPS `parent_id` and OMITS `child_jobs` entirely (Core injects
-  `child_jobs: []` itself before parsing a single flat job event, §7) —
-  the opposite of the REST list, which drops `parent_id` and injects a
-  real `child_jobs` tree.
+      %{"event" => "job", "data" => job_map}
+
+  The flat `SupervisorJob.as_dict()` dict rides NESTED under `"data"`,
+  never unioned with `"event"` at the top level. **Device-proven
+  2026-07-29:** Core's `hassio/jobs.py:160` reads `event["data"]` before
+  `Job.from_dict/1`, and a flat union raises `KeyError: 'data'` in its
+  dispatcher — the phase-3 gate caught exactly this. (Contract §7's
+  "unioned with `event`" phrasing described the dict Core *parses*, not
+  the envelope it is delivered in; §4's `SCHEMA_WEBSOCKET_EVENT` only
+  requires `"event"`, which is why the wrong shape authed and delivered
+  fine while Core errored on every event.)
+
+  The nested dict is the WS-event shape, NOT the `/jobs/info` REST tree
+  shape: it KEEPS `parent_id` and OMITS `child_jobs` entirely (Core
+  injects `child_jobs: []` itself before parsing, §7) — the opposite of
+  the REST list, which drops `parent_id` and injects a real `child_jobs`
+  tree.
 
   `job_map` must supply exactly the ten `SupervisorJob.as_dict()` keys
   (`name`, `reference`, `uuid`, `progress`, `stage`, `done`, `parent_id`,
@@ -76,6 +85,6 @@ defmodule Vagus.Core.Events do
               "missing=#{inspect(MapSet.to_list(missing))} extra=#{inspect(MapSet.to_list(extra))}"
     end
 
-    Map.put(job_map, "event", "job")
+    %{"event" => "job", "data" => job_map}
   end
 end
