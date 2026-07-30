@@ -38,6 +38,17 @@ defmodule Vagus.Backup do
   @max_inner_uncompressed 268_435_456
   @max_backup_json 1_048_576
 
+  # The COMPRESSED allowance for an inner `<slug>.tar.gz` member, used only as
+  # a cheap pre-filter so a giant member is never read into memory.
+  # `@max_inner_uncompressed` would be the wrong bound here: gzip is not
+  # guaranteed to shrink its input — incompressible data grows by the header
+  # plus ~0.03% of stored-block overhead — so an add-on whose data legitimately
+  # inflates to just under the cap can have a compressed member just over it
+  # (Copilot, PR #30). The authoritative uncompressed guard remains
+  # `Vagus.Targz.extract_capped/2` during inflation; this only has to be
+  # generous enough never to reject something that guard would accept.
+  @max_inner_compressed @max_inner_uncompressed + 1_048_576
+
   # Heap ceiling for the tar-reading child processes (`bounded/1`), in WORDS
   # — 32M words ≈ 256MB on a 64-bit VM, matching `@max_inner_uncompressed`
   # (the largest member any read path legitimately materialises).
@@ -121,16 +132,16 @@ defmodule Vagus.Backup do
 
   @doc """
   `extract_addon/2` for an on-disk tar: only the one `<slug>.tar.gz` member
-  is loaded (size-capped at #{@max_inner_uncompressed} bytes — a compressed
-  member larger than the allowed *uncompressed* size cannot legally inflate
-  under the cap anyway), never the whole outer tar.
+  is loaded (pre-filtered at `@max_inner_compressed`, with
+  `Vagus.Targz.extract_capped/2` the authoritative uncompressed guard),
+  never the whole outer tar.
   """
   @spec extract_addon_file(Path.t(), String.t()) ::
           {:ok, %{addon: map(), data: [{String.t(), binary()}]}} | {:error, term()}
   def extract_addon_file(path, slug) do
     with {:ok, entries} <- table(path),
          {:ok, {name, size}} <- find_table_entry(entries, "#{slug}.tar.gz"),
-         :ok <- guard_member_size(size, @max_inner_uncompressed),
+         :ok <- guard_member_size(size, @max_inner_compressed),
          {:ok, inner_gz} <- extract_one(path, name) do
       decode_addon_inner(inner_gz)
     else

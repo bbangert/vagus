@@ -146,6 +146,33 @@ defmodule Vagus.BackupTest do
       assert {:error, :not_in_backup} = Backup.extract_addon_file(path, "core_ghost")
     end
 
+    # The compressed pre-filter must not be the uncompressed cap: gzip can
+    # exceed its input on incompressible data, so an add-on that inflates to
+    # just under 256MB can have a member just over it (Copilot, PR #30).
+    # Proven at small scale — random bytes are incompressible, so the gzipped
+    # member here is LARGER than its payload, and the read must still succeed.
+    test "an inner member whose gzip exceeds its payload still extracts" do
+      payload = :crypto.strong_rand_bytes(200_000)
+
+      inner =
+        build_tar(
+          [
+            {~c"./addon.json", ~s({"version":"1","state":"stopped"})},
+            {~c"./data/random.bin", payload}
+          ],
+          compressed: true
+        )
+
+      assert byte_size(inner) > byte_size(payload),
+             "expected incompressible data to grow under gzip"
+
+      path = write_raw([{~c"./grow.tar.gz", inner}])
+
+      assert {:ok, %{data: files}} = Backup.extract_addon_file(path, "grow")
+      assert Map.new(files)["random.bin"] == payload
+      File.rm(path)
+    end
+
     test "read_file/1 on a tar with no backup.json is a missing-member error" do
       path = write_raw([{~c"./nothing.txt", "x"}])
       assert {:error, {:missing_member, "backup.json"}} = Backup.read_file(path)

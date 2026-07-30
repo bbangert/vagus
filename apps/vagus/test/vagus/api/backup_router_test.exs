@@ -743,7 +743,11 @@ defmodule Vagus.API.BackupRouterTest do
             {"strings", ["poison"]},
             {"numbers", [42]},
             {"not a list", "poison"},
-            {"mixed", [%{"slug" => "real"}, "poison"]}
+            {"mixed", [%{"slug" => "real"}, "poison"]},
+            # A map with no slug, or a non-string one, must not put `nil`
+            # into `content.addons` — that list is slug STRINGS (Copilot).
+            {"map without slug", [%{"name" => "no slug here"}]},
+            {"non-string slug", [%{"slug" => 42}]}
           ] do
         slug = "hostile#{:erlang.phash2(label, 1000)}"
 
@@ -771,9 +775,16 @@ defmodule Vagus.API.BackupRouterTest do
         entry = Enum.find(body(conn)["data"]["backups"], &(&1["slug"] == slug))
         assert is_list(entry["content"]["addons"])
 
+        assert Enum.all?(entry["content"]["addons"], &is_binary/1),
+               "content.addons carried a non-string on #{label}: " <>
+                 inspect(entry["content"]["addons"])
+
         info = supervisor_call(:get, "/backups/#{slug}/info")
         assert info.status == 200, "GET info 500'd on #{label}"
         assert is_list(body(info)["data"]["addons"])
+
+        assert Enum.all?(body(info)["data"]["addons"], &is_binary(&1["slug"])),
+               "info addons carried a slugless entry on #{label}"
       end
     end
 

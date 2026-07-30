@@ -2345,8 +2345,16 @@ defmodule Vagus.API.Router do
     end)
   end
 
-  defp backup_addon_maps(%{"addons" => addons}) when is_list(addons),
-    do: Enum.filter(addons, &is_map/1)
+  # A **binary `slug`** is required, not just map-ness: `content.addons` is a
+  # list of slug strings, and an entry without one would put `nil` in it —
+  # breaking any client that expects strings, and meaningless in `info`'s
+  # entry list too, since every consumer keys on the slug (Copilot, PR #30).
+  defp backup_addon_maps(%{"addons" => addons}) when is_list(addons) do
+    Enum.filter(addons, fn
+      %{"slug" => slug} -> is_binary(slug)
+      _not_a_map_or_no_slug -> false
+    end)
+  end
 
   defp backup_addon_maps(_b), do: []
 
