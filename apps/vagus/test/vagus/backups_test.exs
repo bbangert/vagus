@@ -60,7 +60,13 @@ defmodule Vagus.BackupsTest do
       backup_dir: dir,
       server: server
     } do
-      spec = %{slug: "abc12345", name: "Direct backup", addons: []}
+      spec = %{
+        slug: "abc12345",
+        name: "Direct backup",
+        addons: [],
+        supervisor_version: "2026.07.3"
+      }
+
       {:ok, tar} = Vagus.Backup.create(spec, date: "2026-01-01T00:00:00Z")
       File.write!(Path.join(dir, "abc12345.tar"), tar)
 
@@ -288,6 +294,96 @@ defmodule Vagus.BackupsTest do
       # stopped/wiped just because `ghost` (checked second) fails pre-flight.
       assert @backend.calls() == []
       assert File.read!(Path.join(data_dir(dr, slug), "keep.txt")) == "original"
+    end
+  end
+
+  # The upstream restore contract, asserted on the tar directly — the schema
+  # IS the contract (plan P4-T7). A restoring HAOS coerces
+  # `supervisor_version` through AwesomeVersion and compares it
+  # (`backups/manager.py`), and validates each `addon.json` against
+  # `SCHEMA_APP_BACKUP`, whose `system` is the full add-on config schema
+  # plus a REQUIRED `repository` (`apps/validate.py`). These tests pin the
+  # exact fields those checks read.
+  describe "upstream restore contract (audit C2/C3/C5)" do
+    test "backup.json: version-shaped supervisor_version, extra round-trip, MB sizes", %{
+      data_root: dr,
+      server: server
+    } do
+      slug = "core_contract"
+      install(slug, dr)
+      File.write!(Path.join(data_dir(dr, slug), "f.txt"), "hello")
+
+      extra = %{"supervisor.backup_request_date" => "2026-07-30T00:00:00Z"}
+
+      {:ok, backup_slug} =
+        Backups.create_partial(nil, [slug], server: server, data_root: dr, extra: extra)
+
+      {:ok, %{backup: b, path: path}} = Backups.get(backup_slug, server)
+
+      # A real version string, not "vagus" (C2) — and the SAME version the
+      # API claims, so the tar and the wire tell one story.
+      assert b["supervisor_version"] == Vagus.API.StaticData.supervisor_version()
+      assert b["supervisor_version"] =~ ~r/^\d{4}\.\d{2}(\.\d+)?$/
+
+      # Core keys automatic-backup identity off extra (C5).
+      assert b["extra"] == extra
+
+      # Per-addon size is an MB float (C5) — strictly smaller than the byte
+      # count could ever be for a non-empty inner tar.
+      assert [%{"size" => size}] = b["addons"]
+      assert is_float(size) and size > 0 and size < 1
+
+      # And the tar's own copy agrees with the index.
+      {:ok, %{backup: from_disk}} = Vagus.Backup.read_file(path)
+      assert from_disk["supervisor_version"] == b["supervisor_version"]
+      assert from_disk["extra"] == extra
+    end
+
+    test "addon.json's system block satisfies SCHEMA_APP_SYSTEM's requirements", %{
+      data_root: dr,
+      server: server
+    } do
+      slug = "core_system"
+      install(slug, dr)
+      File.write!(Path.join(data_dir(dr, slug), "f.txt"), "x")
+
+      {:ok, backup_slug} = Backups.create_partial(nil, [slug], server: server, data_root: dr)
+      {:ok, %{path: path}} = Backups.get(backup_slug, server)
+      {:ok, %{addon: addon}} = Vagus.Backup.extract_addon_file(path, slug)
+
+      system = addon["system"]
+
+      # The base add-on config schema's required keys…
+      assert system["name"] == "Test Addon"
+      assert system["version"] == "1.0"
+      assert system["slug"] == slug
+      assert system["description"] == "d"
+      # …the shape-stable optionals a restore needs (availability + image)…
+      assert system["arch"] == ["amd64"]
+      assert system["image"] == "homeassistant/{arch}-addon-test"
+      # …and SCHEMA_APP_SYSTEM's own required addition. Not in any store
+      # repository here, so the detached fallback.
+      assert system["repository"] == "core"
+
+      # SCHEMA_APP_BACKUP's siblings.
+      assert addon["user"]["version"] == "1.0"
+      assert addon["state"] in ["started", "stopped"]
+    end
+
+    test "an old tar claiming supervisor_version \"vagus\" still indexes and lists", %{
+      backup_dir: dir,
+      server: server
+    } do
+      # Written by a pre-phase-4 Vagus — tolerated on read; it simply stays
+      # HAOS-unrestorable (scratchpad decision, 2026-07-30).
+      spec = %{slug: "0ldvagus", name: "Old tar", addons: [], supervisor_version: "vagus"}
+      {:ok, tar} = Vagus.Backup.create(spec, date: "2026-01-01T00:00:00Z")
+      File.write!(Path.join(dir, "0ldvagus.tar"), tar)
+
+      :ok = Backups.reload(server)
+
+      assert {:ok, %{backup: %{"supervisor_version" => "vagus"}}} =
+               Backups.get("0ldvagus", server)
     end
   end
 

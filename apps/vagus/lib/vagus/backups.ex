@@ -22,7 +22,8 @@ defmodule Vagus.Backups do
 
   require Logger
 
-  alias Vagus.Addon.{Config, Manager, OptionsSchema, State}
+  alias Vagus.Addon.{Config, Manager, OptionsSchema, State, Store}
+  alias Vagus.API.StaticData
   alias Vagus.Runtime.Docker
 
   @default_data_root "/data"
@@ -86,6 +87,30 @@ defmodule Vagus.Backups do
   end
 
   @doc """
+  `put_file/2` for a tar already on disk (the upload route's
+  `Plug.Upload` spool file — audit C6): validated via
+  `Vagus.Backup.read_file/1` (only `backup.json` is loaded, never the
+  multi-GB tar) and `File.cp/2`'d into the backup dir rather than read
+  into a BEAM binary and rewritten. The source file is the caller's to
+  clean up (Plug deletes its spool after the request).
+  """
+  @spec put_path(Path.t(), GenServer.server()) :: {:ok, String.t()} | {:error, term()}
+  # path is internal/config-derived, not request input
+  # sobelow_skip ["Traversal.FileModule"]
+  def put_path(src, server \\ __MODULE__) do
+    with {:ok, %{backup: backup}} <- Vagus.Backup.read_file(src),
+         slug <- backup["slug"],
+         :ok <- validate_slug(slug),
+         path <- Path.join(dir(server), "#{slug}.tar"),
+         :ok <- File.cp(src, path),
+         {:ok, %File.Stat{size: size}} <- File.stat(path) do
+      entry = %{backup: backup, path: path, size_bytes: size}
+      :ok = GenServer.call(server, {:put_index, slug, entry})
+      {:ok, slug}
+    end
+  end
+
+  @doc """
   Builds + stores a partial backup of `addon_slugs` (already resolved by the
   caller — `"ALL"` is a router-level concern). `name` defaults to `"Partial
   backup <ISO8601 date>"`. Each add-on must already be installed
@@ -114,7 +139,20 @@ defmodule Vagus.Backups do
       addon_specs = Enum.map(prepared, &build_addon_spec(&1, data_root))
       slug = derive_slug(date, name)
 
-      spec = %{slug: slug, name: name, addons: addon_specs, supervisor_version: "vagus"}
+      # `supervisor_version` is the emulated version the whole wire claims
+      # (`StaticData`, decided 2026-07-30 — see the plan scratchpad): a
+      # version-shaped string a restoring HAOS can compare, where the old
+      # `"vagus"` literal made its AwesomeVersion comparison raise (C2).
+      # `extra` (C5) is the caller's dict — Core keys automatic-backup
+      # identity + its own request date off it.
+      spec = %{
+        slug: slug,
+        name: name,
+        addons: addon_specs,
+        supervisor_version: StaticData.supervisor_version(),
+        extra: Keyword.get(opts, :extra)
+      }
+
       result = Vagus.Backup.create(spec, date: date)
 
       Enum.each(prepared, &end_backup(&1, opts))
@@ -164,8 +202,10 @@ defmodule Vagus.Backups do
 
     case get(backup_slug, server) do
       {:ok, %{path: path}} ->
-        with {:ok, tar} <- File.read(path),
-             {:ok, prepared} <- preflight_restore(tar, addon_slugs) do
+        # File-based extraction (audit C6): only each requested add-on's own
+        # inner tar is ever loaded, so restoring one add-on out of a
+        # multi-GB backup no longer reads the whole tar into memory.
+        with {:ok, prepared} <- preflight_restore(path, addon_slugs) do
           apply_restore(prepared, data_root, opts)
         end
 
@@ -239,12 +279,15 @@ defmodule Vagus.Backups do
     |> Enum.reduce(%{}, fn path, acc -> index_file(path, acc) end)
   end
 
+  # `read_file/1`, not `File.read` + `read/1` (audit C6): the boot-time scan
+  # used to load every tar in the directory into memory — with one real
+  # HAOS-sized backup on disk that was an OOM at `Vagus.Application` start.
   # path is internal/config-derived, not request input
   # sobelow_skip ["Traversal.FileModule"]
   defp index_file(path, acc) do
-    with {:ok, bin} <- File.read(path),
-         {:ok, %{backup: backup}} <- Vagus.Backup.read(bin) do
-      Map.put(acc, backup["slug"], %{backup: backup, path: path, size_bytes: byte_size(bin)})
+    with {:ok, %{backup: backup}} <- Vagus.Backup.read_file(path),
+         {:ok, %File.Stat{size: size}} <- File.stat(path) do
+      Map.put(acc, backup["slug"], %{backup: backup, path: path, size_bytes: size})
     else
       {:error, reason} ->
         Logger.warning("Vagus.Backups: skipping unreadable backup #{path}: #{inspect(reason)}")
@@ -279,9 +322,50 @@ defmodule Vagus.Backups do
       version: config.version,
       data_dir: Path.join([data_root, "addons", "data", config.slug]),
       user: %{"options" => user_options, "version" => config.version},
-      system: %{},
+      system: system_map(config),
       state: state_string(state)
     }
+  end
+
+  # The add-on's config as `addon.json`'s `system` block (audit C3). A
+  # restoring HAOS validates it against `SCHEMA_APP_SYSTEM` — the full
+  # add-on config schema plus a **required** `repository` — and needs it to
+  # availability-check and locate the image when the add-on isn't installed
+  # on the target. The old `%{}` failed the required keys outright.
+  #
+  # Built from the parsed `Config` struct (Vagus keeps no raw config map),
+  # emitting the required keys plus the optional ones whose struct shape IS
+  # the wire shape. Optional keys Vagus parses into different shapes
+  # (`ports`, `schema`, `options`, …) are deliberately omitted — upstream
+  # defaults them, and a wrong shape would fail the schema where an absent
+  # key cannot.
+  defp system_map(config) do
+    %{
+      "name" => config.name,
+      "version" => config.version,
+      "slug" => config.slug,
+      "description" => config.description,
+      "arch" => config.arch,
+      "startup" => config.startup,
+      "boot" => config.boot,
+      "init" => config.init,
+      "repository" => repository_of(config.slug)
+    }
+    |> put_if("image", config.image)
+  end
+
+  defp put_if(map, _key, nil), do: map
+  defp put_if(map, key, value), do: Map.put(map, key, value)
+
+  # Installed add-ons are keyed by store slug, so the store entry (when the
+  # add-on is still in a repository) carries the real repository slug; a
+  # detached add-on falls back to `"core"`, matching what the info payload
+  # already claims for every installed add-on (audit H1, deferred).
+  defp repository_of(slug) do
+    case Store.get(slug) do
+      {:ok, %{repository: repository}} when is_binary(repository) -> repository
+      _absent_or_unshaped -> "core"
+    end
   end
 
   defp state_string(:started), do: "started"
@@ -389,10 +473,10 @@ defmodule Vagus.Backups do
   # Validates every requested slug — charset, installed, present + parseable
   # in the backup — before returning; nothing has been stopped or written
   # yet at this point, whichever slug (if any) fails.
-  defp preflight_restore(tar, addon_slugs) do
+  defp preflight_restore(path, addon_slugs) do
     addon_slugs
     |> Enum.reduce_while({:ok, []}, fn slug, {:ok, acc} ->
-      case preflight_addon(tar, slug) do
+      case preflight_addon(path, slug) do
         {:ok, item} -> {:cont, {:ok, [item | acc]}}
         {:error, reason} -> {:halt, {:error, reason}}
       end
@@ -403,15 +487,16 @@ defmodule Vagus.Backups do
     end
   end
 
-  defp preflight_addon(tar, slug) do
+  defp preflight_addon(path, slug) do
     with :ok <- validate_slug(slug),
          {:ok, _entry} <- state_get(slug),
-         {:ok, %{addon: addon, data: files}} <- Vagus.Backup.extract_addon(tar, slug) do
+         {:ok, %{addon: addon, data: files}} <- Vagus.Backup.extract_addon_file(path, slug) do
       {:ok, {slug, addon, files}}
     else
       {:error, {:invalid_slug, _}} -> {:error, "Addon #{slug} not in backup"}
       {:error, :not_installed} -> {:error, "Addon #{slug} is not installed"}
       {:error, :not_in_backup} -> {:error, "Addon #{slug} not in backup"}
+      {:error, :too_large} -> {:error, "Addon #{slug}'s backup data exceeds the restore size cap"}
     end
   end
 
@@ -439,14 +524,38 @@ defmodule Vagus.Backups do
     end)
   end
 
+  # `Manager.stop/2`'s result is checked, not discarded: swapping the data
+  # dir out from under a still-running container gives the add-on a
+  # half-old/half-new view of its own `/data` and can corrupt what it writes
+  # next. `:not_running`/`:not_found` are the expected benign cases (the
+  # add-on was already stopped, or the container is gone) and proceed; a real
+  # engine failure aborts this slug before anything is touched.
   defp restore_one(slug, addon, files, data_root, opts) do
-    Manager.stop(slug, opts)
+    with :ok <- stop_for_restore(slug, opts) do
+      data_dir = Path.join([data_root, "addons", "data", slug])
 
-    data_dir = Path.join([data_root, "addons", "data", slug])
+      case stage_files(data_dir, files, slug) do
+        {:ok, staging_dir} -> swap_and_finish(slug, addon, data_dir, staging_dir, opts)
+        {:error, _reason} = error -> error
+      end
+    end
+  end
 
-    case stage_files(data_dir, files, slug) do
-      {:ok, staging_dir} -> swap_and_finish(slug, addon, data_dir, staging_dir, opts)
-      {:error, _reason} = error -> error
+  defp stop_for_restore(slug, opts) do
+    case Manager.stop(slug, opts) do
+      :ok ->
+        :ok
+
+      {:error, reason} when reason in [:not_running, :not_found] ->
+        :ok
+
+      {:error, reason} ->
+        Logger.error(
+          "Vagus.Backups: refusing to restore #{slug} — it could not be stopped " <>
+            "(#{inspect(reason)}); its data dir is untouched"
+        )
+
+        {:error, {:restore, slug, {:stop_failed, reason}}}
     end
   end
 

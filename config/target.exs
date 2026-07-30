@@ -24,7 +24,20 @@ config :nerves_runtime, startup_guard_enabled: true
 # configuring erlinit.
 
 # Advance the system clock on devices without a real-time clock.
-config :nerves, :erlinit, update_clock: true
+#
+# `PLUG_TMPDIR` moves `Plug.Upload`'s spool off `/tmp` onto the ext4 data
+# partition. `/tmp` here is a tmpfs sized at 10% of RAM (**96MB** on the
+# rpi3, measured 2026-07-30), so a backup upload spooling there is bounded by
+# RAM, not disk — `POST /backups/new/upload` died around 96MB and the
+# route's own multipart limit was meaningless. It must be set as an OS env
+# var at boot rather than from `Vagus.Application`: `Plug.Upload.Supervisor`
+# reads these vars in `init/1` when the `:plug` application starts, which
+# precedes ours. `env:` is a `:keep` switch in `Nerves.Erlinit`, so this
+# ADDS a line — the system's own `--env` entries (`LANG`, `ERL_INETRC`,
+# `ERL_CRASH_DUMP`) are preserved. `/root` is where erlinit mounts the
+# writable partition (`/data` is a symlink to it), and `Plug.Upload`
+# `mkdir_p`s the subdirectory itself.
+config :nerves, :erlinit, update_clock: true, env: "PLUG_TMPDIR=/root/tmp"
 
 # Configure the device for SSH IEx prompt access and firmware updates
 #

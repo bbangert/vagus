@@ -106,11 +106,163 @@ defmodule Vagus.BackupTest do
     s = %{
       slug: "b",
       name: "n",
+      supervisor_version: "2026.07.3",
       addons: [%{slug: "x", name: "X", version: "1.0", data_dir: "/nonexistent"}]
     }
 
     {:ok, tar} = Backup.create(s)
     {:ok, %{data: files}} = Backup.extract_addon(tar, "x")
     assert files == []
+  end
+
+  # The file API (audit C6) — nothing here may load the outer tar, and every
+  # guard has to hold against a tar the caller wrote (a `hassio_role: backup`
+  # add-on can upload one since phase 1).
+  describe "file API: read_file/1 + extract_addon_file/2" do
+    setup %{data: data} do
+      path =
+        Path.join(System.tmp_dir!(), "vagus-fileapi-#{System.unique_integer([:positive])}.tar")
+
+      {:ok, tar} = Backup.create(spec(data), date: "2026-07-30T00:00:00Z")
+      File.write!(path, tar)
+      on_exit(fn -> File.rm(path) end)
+      %{path: path}
+    end
+
+    test "read_file/1 matches read/1 without loading the tar", %{path: path} do
+      {:ok, %{backup: from_file, members: members}} = Backup.read_file(path)
+      {:ok, %{backup: from_binary}} = Backup.read(File.read!(path))
+
+      assert from_file == from_binary
+      assert "./backup.json" in members
+      assert "./core_mosquitto.tar.gz" in members
+    end
+
+    test "extract_addon_file/2 matches extract_addon/2, and 404s an absent add-on", %{path: path} do
+      {:ok, %{addon: addon, data: files}} = Backup.extract_addon_file(path, "core_mosquitto")
+      assert addon["version"] == "7.1.0"
+      assert Map.new(files)["options.json"] == ~s({"require_certificate":false})
+
+      assert {:error, :not_in_backup} = Backup.extract_addon_file(path, "core_ghost")
+    end
+
+    test "read_file/1 on a tar with no backup.json is a missing-member error" do
+      path = write_raw([{~c"./nothing.txt", "x"}])
+      assert {:error, {:missing_member, "backup.json"}} = Backup.read_file(path)
+      File.rm(path)
+    end
+
+    test "an oversized backup.json is refused by size, before extraction" do
+      # 1MB cap; 2MB of JSON never reaches Jason.
+      big = Jason.encode!(%{"slug" => "big", "pad" => String.duplicate("x", 2_000_000)})
+      path = write_raw([{~c"./backup.json", big}])
+
+      assert {:error, :too_large} = Backup.read_file(path)
+      File.rm(path)
+    end
+
+    # The bypass a first-match size check cannot see: `{:files, [name]}` is
+    # set membership applied to EVERY member, so a small first entry would
+    # otherwise let a huge same-named second one be materialised.
+    test "a duplicated member name is refused rather than size-checked once" do
+      path =
+        write_raw([
+          {~c"./backup.json", "{}"},
+          {~c"./backup.json", String.duplicate("x", 2_000_000)}
+        ])
+
+      assert {:error, {:duplicate_member, "backup.json"}} = Backup.read_file(path)
+      File.rm(path)
+    end
+
+    test "a non-regular member standing in for backup.json is refused" do
+      path = Path.join(System.tmp_dir!(), "vagus-link-#{System.unique_integer([:positive])}.tar")
+
+      real =
+        Path.join(System.tmp_dir!(), "vagus-link-target-#{System.unique_integer([:positive])}")
+
+      File.write!(real, "{}")
+      link = Path.join(System.tmp_dir!(), "backup.json")
+      File.rm(link)
+      :ok = File.ln_s(real, link)
+
+      {:ok, t} = :erl_tar.open(String.to_charlist(path), [:write])
+      :ok = :erl_tar.add(t, String.to_charlist(link), ~c"./backup.json", [])
+      :ok = :erl_tar.close(t)
+
+      assert {:error, {:not_a_regular_file, "backup.json"}} = Backup.read_file(path)
+
+      File.rm(path)
+      File.rm(link)
+      File.rm(real)
+    end
+
+    # A forged GNU longname ('L') header makes erl_tar materialise the
+    # claimed payload as a charlist (~16 bytes per byte) during the TABLE
+    # pass — measured at a 970MB heap delta for a 19MB payload, i.e. an OOM
+    # from a small upload. The read runs in a heap-capped process so the
+    # amplification is bounded to an error instead.
+    test "a long-name amplification bomb is bounded to an error, not an OOM" do
+      payload = 40_000_000
+      path = write_longname_bomb(payload)
+
+      assert {:error, {:tar_read_failed, _reason}} = Backup.read_file(path)
+      File.rm(path)
+    end
+  end
+
+  defp write_raw(members) do
+    path = Path.join(System.tmp_dir!(), "vagus-raw-#{System.unique_integer([:positive])}.tar")
+    {:ok, t} = :erl_tar.open(String.to_charlist(path), [:write])
+    Enum.each(members, fn {name, bin} -> :ok = :erl_tar.add(t, bin, name, []) end)
+    :ok = :erl_tar.close(t)
+    path
+  end
+
+  # Hand-forged tar: an `'L'` (GNU longname) header claiming `size` bytes of
+  # name payload. erl_tar resolves it inline on the table pass.
+  defp write_longname_bomb(size) do
+    path = Path.join(System.tmp_dir!(), "vagus-bomb-#{System.unique_integer([:positive])}.tar")
+
+    header =
+      fn name, sz, typeflag ->
+        prefix =
+          String.pad_trailing(name, 100, <<0>>) <>
+            String.pad_trailing("0000644", 8, <<0>>) <>
+            String.pad_trailing("0000000", 8, <<0>>) <>
+            String.pad_trailing("0000000", 8, <<0>>) <>
+            String.pad_trailing(to_string(:io_lib.format("~11.8.0B", [sz])), 12, <<0>>) <>
+            String.pad_trailing("00000000000", 12, <<0>>)
+
+        tail =
+          typeflag <>
+            String.duplicate(<<0>>, 100) <>
+            "ustar" <> <<0>> <> "00" <> String.duplicate(<<0>>, 247)
+
+        probe = binary_part(prefix <> String.duplicate(" ", 8) <> tail, 0, 512)
+        sum = probe |> :binary.bin_to_list() |> Enum.sum()
+
+        checksum =
+          String.pad_trailing(to_string(:io_lib.format("~6.8.0B", [sum])) <> <<0, 32>>, 8, <<0>>)
+
+        prefix <> checksum <> binary_part(probe, 156, 512 - 156)
+      end
+
+    pad = fn bin ->
+      case rem(byte_size(bin), 512) do
+        0 -> bin
+        r -> bin <> String.duplicate(<<0>>, 512 - r)
+      end
+    end
+
+    File.write!(
+      path,
+      header.("././@LongLink", size, "L") <>
+        pad.(String.duplicate("A", size)) <>
+        header.("shortname", 0, "0") <>
+        String.duplicate(<<0>>, 1024)
+    )
+
+    path
   end
 end

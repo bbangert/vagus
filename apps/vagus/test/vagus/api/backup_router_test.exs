@@ -115,6 +115,22 @@ defmodule Vagus.API.BackupRouterTest do
 
   defp body(conn), do: Jason.decode!(conn.resp_body)
 
+  # A hand-built outer tar (bypassing `Vagus.Backup.create/2`, which only
+  # writes Vagus's own shape) — how HAOS-authored metadata gets into tests.
+  defp raw_tar(members) do
+    path = Path.join(System.tmp_dir!(), "vagus-rawtar-#{System.unique_integer([:positive])}.tar")
+
+    :ok =
+      :erl_tar.create(
+        String.to_charlist(path),
+        Enum.map(members, fn {name, content} -> {String.to_charlist(name), content} end)
+      )
+
+    bin = File.read!(path)
+    File.rm!(path)
+    bin
+  end
+
   # Bounded poll for background-task completion (the `boot_starter_test.exs`
   # predicate idiom).
   defp eventually(fun, attempts \\ 200) do
@@ -387,7 +403,7 @@ defmodule Vagus.API.BackupRouterTest do
 
   describe "POST /backups/new/upload (real multipart, W4/B1)" do
     test "a real multipart upload with a valid tar -> {slug}" do
-      spec = %{slug: "up1", name: "Uploaded", addons: []}
+      spec = %{slug: "up1", name: "Uploaded", addons: [], supervisor_version: "2026.07.3"}
       {:ok, tar} = Vagus.Backup.create(spec, date: "2026-07-21T00:00:00Z")
 
       conn =
@@ -609,6 +625,210 @@ defmodule Vagus.API.BackupRouterTest do
       assert conn.status == 200
       assert File.read!(Path.join(data_dir, "f.txt")) == "hello"
       assert {:ok, %{user_options: %{"greeting" => 42}}} = State.get("core_sch_bad")
+    end
+  end
+
+  describe "metadata fidelity (audit C4/C5)" do
+    test "an uploaded HAOS-shaped full backup lists as what it IS, not as a Vagus partial" do
+      backup_json =
+        Jason.encode!(%{
+          "slug" => "haosfu11",
+          "type" => "full",
+          "name" => "HAOS full",
+          "date" => "2026-07-29T00:00:00+00:00",
+          "version" => 2,
+          "supervisor_version" => "2026.07.4",
+          "compressed" => true,
+          "protected" => true,
+          "homeassistant" => "2026.7.4",
+          "folders" => ["ssl", "share"],
+          "addons" => [],
+          "repositories" => ["https://github.com/hassio-addons/repository"],
+          "extra" => %{"supervisor.backup_request_date" => "2026-07-29T00:00:00+00:00"}
+        })
+
+      File.write!(
+        Path.join(Backups.dir(), "haosfu11.tar"),
+        raw_tar([{"./backup.json", backup_json}])
+      )
+
+      :ok = Backups.reload()
+
+      # The list entry: this used to claim an unprotected partial with no
+      # Core content — and Core reads `protected` from location_attributes,
+      # so the frontend offered a passwordless restore of an encrypted tar.
+      list = body(supervisor_call(:get, "/backups"))["data"]["backups"]
+      assert [entry] = Enum.filter(list, &(&1["slug"] == "haosfu11"))
+      assert entry["type"] == "full"
+      assert entry["protected"] == true
+      assert entry["compressed"] == true
+      assert entry["location_attributes"][".local"]["protected"] == true
+      assert entry["content"]["homeassistant"] == true
+      assert entry["content"]["folders"] == ["ssl", "share"]
+
+      info = body(supervisor_call(:get, "/backups/haosfu11/info"))["data"]
+      assert info["type"] == "full"
+      assert info["protected"] == true
+      assert info["homeassistant"] == "2026.7.4"
+      assert info["folders"] == ["ssl", "share"]
+      assert info["repositories"] == ["https://github.com/hassio-addons/repository"]
+      assert info["extra"] == %{"supervisor.backup_request_date" => "2026-07-29T00:00:00+00:00"}
+      assert info["supervisor_version"] == "2026.07.4"
+    end
+
+    test "extra round-trips create → info; the created tar claims the emulated version", %{
+      data_root: dr
+    } do
+      install("core_extra_rt", dr)
+
+      extra = %{"with_automatic_settings" => true}
+
+      conn =
+        supervisor_call(:post, "/backups/new/partial", %{
+          "addons" => ["core_extra_rt"],
+          "extra" => extra
+        })
+
+      assert conn.status == 200
+      slug = body(conn)["data"]["slug"]
+
+      info = body(supervisor_call(:get, "/backups/#{slug}/info"))["data"]
+      assert info["extra"] == extra
+      assert info["supervisor_version"] == Vagus.API.StaticData.supervisor_version()
+      # Per-addon size is an MB float now, not bytes (C5).
+      assert [%{"size" => size}] = info["addons"]
+      assert is_float(size) and size < 1
+    end
+
+    test "unknown body keys are a 400 on create and restore (PREVENT_EXTRA)", %{data_root: dr} do
+      install("core_unknownk", dr)
+
+      conn =
+        supervisor_call(:post, "/backups/new/partial", %{
+          "addons" => ["core_unknownk"],
+          "bogus" => 1
+        })
+
+      assert conn.status == 400
+      assert body(conn)["message"] =~ "unknown keys: bogus"
+
+      slug = create_backup("core_unknownk")
+
+      conn =
+        supervisor_call(:post, "/backups/#{slug}/restore/partial", %{
+          "addons" => ["core_unknownk"],
+          "nonsense" => true
+        })
+
+      assert conn.status == 400
+      assert body(conn)["message"] =~ "unknown keys: nonsense"
+
+      # The keys upstream declares but Vagus ignores stay accepted.
+      conn =
+        supervisor_call(:post, "/backups/new/partial", %{
+          "addons" => ["core_unknownk"],
+          "compressed" => false,
+          "location" => nil,
+          "homeassistant_exclude_database" => true
+        })
+
+      assert conn.status == 200
+    end
+
+    # One uploaded tar used to 500 `GET /backups` for EVERY caller, Core
+    # included — and permanently, since the boot rescan re-indexes the file
+    # and the crash hid the slug needed to DELETE it.
+    test "a hostile addons list cannot 500 the listing" do
+      for {label, addons} <- [
+            {"strings", ["poison"]},
+            {"numbers", [42]},
+            {"not a list", "poison"},
+            {"mixed", [%{"slug" => "real"}, "poison"]}
+          ] do
+        slug = "hostile#{:erlang.phash2(label, 1000)}"
+
+        backup_json =
+          Jason.encode!(%{
+            "slug" => slug,
+            "type" => "partial",
+            "name" => label,
+            "date" => "2026-07-30T00:00:00+00:00",
+            "version" => 2,
+            "supervisor_version" => "2026.07.3",
+            "addons" => addons
+          })
+
+        File.write!(
+          Path.join(Backups.dir(), "#{slug}.tar"),
+          raw_tar([{"./backup.json", backup_json}])
+        )
+
+        :ok = Backups.reload()
+
+        conn = supervisor_call(:get, "/backups")
+        assert conn.status == 200, "GET /backups 500'd on #{label}"
+
+        entry = Enum.find(body(conn)["data"]["backups"], &(&1["slug"] == slug))
+        assert is_list(entry["content"]["addons"])
+
+        info = supervisor_call(:get, "/backups/#{slug}/info")
+        assert info.status == 200, "GET info 500'd on #{label}"
+        assert is_list(body(info)["data"]["addons"])
+      end
+    end
+
+    # A `backup.json` from an older Vagus (or a hand-rolled one) omits these
+    # keys entirely — the defaults must fire, not nil out the wire.
+    test "a backup.json missing type/protected/compressed falls back to Vagus's own shape" do
+      backup_json =
+        Jason.encode!(%{
+          "slug" => "minim4l",
+          "name" => "Minimal",
+          "date" => "2026-07-30T00:00:00+00:00",
+          "version" => 2,
+          "supervisor_version" => "2026.07.3",
+          "addons" => []
+        })
+
+      File.write!(
+        Path.join(Backups.dir(), "minim4l.tar"),
+        raw_tar([{"./backup.json", backup_json}])
+      )
+
+      :ok = Backups.reload()
+
+      entry =
+        Enum.find(
+          body(supervisor_call(:get, "/backups"))["data"]["backups"],
+          &(&1["slug"] == "minim4l")
+        )
+
+      assert entry["type"] == "partial"
+      assert entry["protected"] == false
+      assert entry["compressed"] == true
+      assert entry["content"]["homeassistant"] == false
+      assert entry["content"]["folders"] == []
+
+      info = body(supervisor_call(:get, "/backups/minim4l/info"))["data"]
+      assert info["type"] == "partial"
+      assert info["protected"] == false
+      assert info["compressed"] == true
+      assert info["folders"] == []
+      assert info["repositories"] == []
+      assert info["extra"] == %{}
+    end
+
+    test "a non-map extra is a 400", %{data_root: dr} do
+      install("core_badextra", dr)
+
+      conn =
+        supervisor_call(:post, "/backups/new/partial", %{
+          "addons" => ["core_badextra"],
+          "extra" => "nope"
+        })
+
+      assert conn.status == 400
+      assert body(conn)["message"] =~ "extra must be a dict"
     end
   end
 
