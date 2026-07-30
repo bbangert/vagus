@@ -152,6 +152,17 @@ defmodule Vagus.API.RouterSupervisorOptionsTest do
       assert body["message"] =~ "timezone"
     end
 
+    # A 9-byte ANSI escape fits inside country's 10-byte bound — same
+    # leak class as the timezone case above, same rejection.
+    test "country with control characters (ANSI escape) -> 400" do
+      conn = post_options(%{"country" => "\e[31mEvil"})
+
+      assert conn.status == 400
+      body = json_body(conn)
+      assert body["result"] == "error"
+      assert body["message"] =~ "country"
+    end
+
     test "the 400 body never echoes the rejected value (phase-5 safe_inspect rule)" do
       conn = post_options(%{"timezone" => "\e[31mEvil"})
 

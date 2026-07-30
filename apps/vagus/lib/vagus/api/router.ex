@@ -1341,8 +1341,18 @@ defmodule Vagus.API.Router do
 
   # "Short" (audit's wording): not a real ISO-3166 check, just shape —
   # upstream's own `country` schema is similarly loose (`vol.All(str,
-  # vol.Length(min=1))`, no allowlist).
-  defp validate_short_string(v) when is_binary(v) and byte_size(v) in 1..10, do: {:ok, v}
+  # vol.Length(min=1))`, no allowlist). Control chars rejected for the
+  # same reason as timezone above: a 9-byte ANSI escape fits inside the
+  # 10-byte bound, and the value is served back to every default-tier
+  # caller.
+  defp validate_short_string(v) when is_binary(v) and byte_size(v) in 1..10 do
+    if Regex.match?(@control_char_re, v) do
+      {:error, "must not contain control characters"}
+    else
+      {:ok, v}
+    end
+  end
+
   defp validate_short_string(_other), do: {:error, "must be a short (1-10 byte) string"}
 
   defp validate_boolean(v) when is_boolean(v), do: {:ok, v}
