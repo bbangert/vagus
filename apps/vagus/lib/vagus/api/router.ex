@@ -1343,7 +1343,7 @@ defmodule Vagus.API.Router do
   # upstream's own `country` schema is similarly loose (`vol.All(str,
   # vol.Length(min=1))`, no allowlist).
   defp validate_short_string(v) when is_binary(v) and byte_size(v) in 1..10, do: {:ok, v}
-  defp validate_short_string(_other), do: {:error, "must be a short (1-10 char) string"}
+  defp validate_short_string(_other), do: {:error, "must be a short (1-10 byte) string"}
 
   defp validate_boolean(v) when is_boolean(v), do: {:ok, v}
   defp validate_boolean(_other), do: {:error, "must be a boolean"}
