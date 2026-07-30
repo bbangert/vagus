@@ -46,6 +46,12 @@ config :vagus, :core_token_path, Path.join(System.tmp_dir!(), "vagus_test_core_t
 # round-trips) pass :path directly instead of relying on this shared file.
 config :vagus, :core_versions_path, Path.join(System.tmp_dir!(), "vagus_test_core_versions.json")
 
+# Isolated from the real host dev-loop supervisor_options.json, same
+# rationale as :core_token_path above.
+config :vagus,
+       :supervisor_options_path,
+       Path.join(System.tmp_dir!(), "vagus_test_supervisor_options.json")
+
 # Host-management backends (P4-T1): Mox mocks, not the host stubs directly
 # — `test/test_helper.exs` defines each mock and, via `Mox.stub_with/2`,
 # defaults it to delegate to the matching `Vagus.Backend.*.HostStub` (so
