@@ -157,10 +157,18 @@ defmodule Vagus.JobsTest do
       assert job["extra"] == nil
     end
 
-    test "error_entry truncates oversized messages (review W3)" do
+    test "error_entry truncates oversized messages BY BYTES (review W3 + Copilot PR #29)" do
       entry = Jobs.error_entry("PullError", String.duplicate("x", 2000))
-      assert String.length(entry["message"]) == 513
-      assert String.ends_with?(entry["message"], "…")
+      assert entry["message"] == String.duplicate("x", 512) <> "…"
+
+      # Multibyte: the bound is bytes, not graphemes — 2000 × 3-byte
+      # codepoints must still cut at ≤512 bytes (plus the marker), on a
+      # valid UTF-8 boundary (512 ÷ 3 leaves a remainder, so a codepoint
+      # straddles the cut and is dropped).
+      multibyte = Jobs.error_entry("PullError", String.duplicate("€", 2000))
+      assert byte_size(multibyte["message"]) <= 512 + byte_size("…")
+      assert String.valid?(multibyte["message"])
+      assert String.ends_with?(multibyte["message"], "…")
 
       short = Jobs.error_entry("PullError", "small")
       assert short["message"] == "small"

@@ -11,8 +11,10 @@ defmodule Vagus.Jobs do
   finish — that is the whole point: Core's update entities subscribe to these
   by job *name*, contract §4), and serves the REST shapes:
 
-    * **WS event** — the flat ten-key dict (keeps `parent_id`, no
-      `child_jobs`), built by `Events.job/1`.
+    * **WS event** — `%{"event" => "job", "data" => job_map}`, built by
+      `Events.job/1`: the flat ten-key dict (keeps `parent_id`, no
+      `child_jobs`) rides nested under `"data"` — Core's `hassio/jobs.py`
+      reads `event["data"]`, device-proven 2026-07-29.
     * **REST** (`GET /jobs/info`, `GET /jobs/{uuid}`) — `as_dict()` minus
       `parent_id`, plus a recursive `child_jobs` tree in oldest-inserted
       order (§7's `_list_jobs`).
@@ -159,9 +161,13 @@ defmodule Vagus.Jobs do
   # Job errors are readable at `:default` tier via `/jobs/info`, and some
   # failure reasons `inspect` whole HTTP response bodies — bound what goes on
   # the wire; the full detail belongs in the log (review W3).
+  # `String.byte_slice/3`, not `String.slice/3`: the guard is in bytes, so
+  # the cut must be too — a grapheme slice of a multibyte message can leak
+  # several times the stated bound (Copilot, PR #29). `byte_slice` also
+  # drops any codepoint it would split, keeping the result valid UTF-8.
   @max_error_message 512
   defp truncate_message(message) when byte_size(message) <= @max_error_message, do: message
-  defp truncate_message(message), do: String.slice(message, 0, @max_error_message) <> "…"
+  defp truncate_message(message), do: String.byte_slice(message, 0, @max_error_message) <> "…"
 
   @doc "The flat ten-key job map (WS shape), or `:error`."
   @spec get(String.t(), GenServer.server()) :: {:ok, job()} | :error
