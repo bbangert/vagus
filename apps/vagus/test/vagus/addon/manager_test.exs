@@ -406,7 +406,7 @@ defmodule Vagus.Addon.ManagerTest do
       data_dir = Path.join([dr, "addons", "data", "life_addon"])
       assert File.dir?(data_dir)
 
-      {:ok, _message} = Vagus.Discovery.add("life_addon", "mqtt", %{})
+      {:ok, _message, :new} = Vagus.Discovery.add("life_addon", "mqtt", %{})
       :ok = Vagus.Services.set("mqtt", %{"host" => "h", "port" => 1}, "life_addon")
 
       assert :ok = Manager.uninstall("life_addon", backend: __MODULE__.FakeBackend, data_root: dr)

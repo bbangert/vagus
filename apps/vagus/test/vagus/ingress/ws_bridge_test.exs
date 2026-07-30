@@ -63,6 +63,12 @@ defmodule Vagus.Ingress.WSBridgeTest.FakeAddon do
   get "/ws" do
     test_pid = Application.fetch_env!(:vagus, :ws_bridge_test_pid)
 
+    # audit F1/B1: captured here, in the Plug/handshake phase, rather than
+    # inside `EchoHandler` — by the time a `WebSock` handler exists the
+    # original HTTP request (and its headers) are gone; `conn.req_headers`
+    # is only ever available on this side of the upgrade.
+    send(test_pid, {:ws_upgrade_headers, conn.req_headers})
+
     WebSockAdapter.upgrade(
       conn,
       EchoHandler,
@@ -333,6 +339,99 @@ defmodule Vagus.Ingress.WSBridgeTest do
     assert frame == {:text, "hello ingress"}
   end
 
+  ## 1b. Header forwarding on the WS leg (audit F1/B1)
+
+  test "the WS upgrade forwards the browser's filtered headers to the add-on verbatim", %{
+    proxy_host: host,
+    proxy_port: port,
+    token: token
+  } do
+    {:ok, session} = Vagus.Ingress.create_session()
+
+    {:ok, _client, _resp_headers} =
+      Client.connect(host, port, "/ingress/#{token}/ws", [
+        cookie_header(session),
+        {"x-ingress-path", "/api/hassio_ingress/#{token}"},
+        {"x-hass-source", "core.uso"},
+        {"x-forwarded-proto", "https"},
+        {"x-forwarded-host", "homeassistant.local"},
+        {"user-agent", "vagus-test-browser/1.0"},
+        # Must never reach the add-on — the auth/identity strip
+        # (`IngressProxy.strip_request_headers/1`) applies identically here.
+        {"x-supervisor-token", "should-never-arrive"},
+        {"x-hassio-key", "should-never-arrive"},
+        {"x-remote-user-id", "should-never-arrive"}
+      ])
+
+    assert_receive {:ws_upgrade_headers, headers}, 2_000
+
+    by_name =
+      Enum.reduce(headers, %{}, fn {k, v}, acc ->
+        Map.update(acc, String.downcase(k), [v], &(&1 ++ [v]))
+      end)
+
+    assert by_name["cookie"] == ["ingress_session=#{session}"]
+    assert by_name["x-ingress-path"] == ["/api/hassio_ingress/#{token}"]
+    assert by_name["x-hass-source"] == ["core.uso"]
+    assert by_name["x-forwarded-proto"] == ["https"]
+    assert by_name["x-forwarded-host"] == ["homeassistant.local"]
+    assert by_name["user-agent"] == ["vagus-test-browser/1.0"]
+    assert by_name["x-forwarded-for"] == ["127.0.0.1"]
+
+    refute Map.has_key?(by_name, "x-supervisor-token")
+    refute Map.has_key?(by_name, "x-hassio-key")
+    refute Map.has_key?(by_name, "x-remote-user-id")
+
+    # [VERIFIED]: `Mint.HTTP1.add_default_headers/2`
+    # (`deps/mint/lib/mint/http1.ex:1167-1170`) is `Headers.put_new("Host",
+    # "host", ...)` — it only fills in a `Host` when one isn't already
+    # present in the outgoing header list. Since `headers` (the forwarded
+    # set) already carries the browser's own `Host`, Mint's own upgrade
+    # request adds no second one — exactly one `host` header reaches the
+    # add-on, and it's the browser's value, not the upstream connection's
+    # own `ip:port` authority.
+    assert by_name["host"] != nil
+    assert length(by_name["host"]) == 1
+
+    # `Mint.WebSocket.upgrade/5` always prepends its own
+    # `connection`/`sec-websocket-*` handshake headers
+    # (`deps/mint_web_socket/lib/mint/web_socket/utils.ex`'s `headers/2`) —
+    # these must appear exactly once, not doubled with anything forwarded
+    # from the browser's own handshake to the proxy (which
+    # `strip_request_headers/1`'s hop-by-hop + `sec-websocket-` prefix strip
+    # already excludes from `headers` entirely).
+    assert by_name["connection"] == ["upgrade"]
+    assert length(by_name["sec-websocket-key"]) == 1
+    assert length(by_name["sec-websocket-version"]) == 1
+  end
+
+  test "an inbound x-forwarded-for is appended to, not overwritten, on the WS leg (audit B1/B2.2)",
+       %{proxy_host: host, proxy_port: port, token: token} do
+    {:ok, session} = Vagus.Ingress.create_session()
+
+    # testing-phase7.md Warning: the test above (and `ingress_proxy_test.exs`'s
+    # HTTP-leg equivalent, before its own fix) sends no inbound
+    # `x-forwarded-for` at all, so `append_forwarded_for/2`'s `existing <>
+    # ", " <> peer` branch — the actual audited multi-hop behavior — had
+    # zero coverage on either leg. `IngressProxy.build_request_headers/1` is
+    # the one function both legs share (this module's own moduledoc, and
+    # `upgrade_websocket/4`'s comment above it), so this pins it here too.
+    {:ok, _client, _resp_headers} =
+      Client.connect(host, port, "/ingress/#{token}/ws", [
+        cookie_header(session),
+        {"x-forwarded-for", "203.0.113.9"}
+      ])
+
+    assert_receive {:ws_upgrade_headers, headers}, 2_000
+
+    by_name =
+      Enum.reduce(headers, %{}, fn {k, v}, acc ->
+        Map.update(acc, String.downcase(k), [v], &(&1 ++ [v]))
+      end)
+
+    assert by_name["x-forwarded-for"] == ["203.0.113.9, 127.0.0.1"]
+  end
+
   ## 2. Binary echo round-trip — 100KB, sha256 verified intact
 
   test "a 100KB binary frame survives intact (sha256 match)", %{
@@ -485,6 +584,7 @@ defmodule Vagus.Ingress.WSBridgeTest do
         port: port,
         path: "/ws",
         protocols: [],
+        headers: [],
         pending_max_bytes: 5,
         pending_max_frames: 256,
         upgrade_deadline_ms: 60_000
@@ -506,6 +606,7 @@ defmodule Vagus.Ingress.WSBridgeTest do
         port: port,
         path: "/ws",
         protocols: [],
+        headers: [],
         pending_max_bytes: 1_000_000,
         pending_max_frames: 3,
         upgrade_deadline_ms: 60_000
@@ -529,6 +630,7 @@ defmodule Vagus.Ingress.WSBridgeTest do
         port: port,
         path: "/ws",
         protocols: [],
+        headers: [],
         upgrade_deadline_ms: 30
       }
 

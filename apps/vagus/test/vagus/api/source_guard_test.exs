@@ -184,5 +184,39 @@ defmodule Vagus.API.SourceGuardTest do
 
       assert log =~ "unknown"
     end
+
+    test "filtered requests are counted and summarised, not logged one per request" do
+      import ExUnit.CaptureLog
+
+      start_supervised!({SourceGuard, name: SourceGuard})
+      # Unique per test (testing-phase7.md's CaptureLog lesson): this module
+      # is `async: false`, which only protects against *other tests in this
+      # file* interleaving, not other test files' concurrent output landing
+      # in the same captured region — a distinctive marker keeps the
+      # assertion honest either way.
+      marker = "unique-sample-#{System.unique_integer([:positive])}"
+
+      log =
+        capture_log(fn ->
+          for _ <- 1..30, do: SourceGuard.record_filtered(:path, marker)
+          for _ <- 1..20, do: SourceGuard.record_filtered(:query, marker)
+          send(SourceGuard, :refresh)
+          _ = :sys.get_state(SourceGuard)
+        end)
+
+      assert log =~ "filtered 50 request(s)"
+      assert log =~ "path: 30"
+      assert log =~ "query: 20"
+      assert log =~ marker
+      # One summary line, not fifty.
+      assert length(String.split(log, "filtered ")) == 2
+    end
+
+    test "record_filtered/2 is a no-op when the guard isn't running" do
+      # No `start_supervised!` here — mirrors the existing "safe when
+      # disabled" property `record_refusal/1` already has: casting to an
+      # unregistered name must not raise.
+      assert SourceGuard.record_filtered(:path, "whatever") == :ok
+    end
   end
 end

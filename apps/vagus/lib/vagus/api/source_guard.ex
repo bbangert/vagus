@@ -107,6 +107,34 @@ defmodule Vagus.API.SourceGuard do
   @spec record_refusal(:inet.ip_address() | nil) :: :ok
   def record_refusal(ip), do: GenServer.cast(__MODULE__, {:refused, ip})
 
+  @doc """
+  Records a request `Vagus.API.ExploitFilter` blocked, for a periodic summary
+  alongside `record_refusal/1`'s.
+
+  Same reasoning, same primitive: `ExploitFilter` runs in `Dispatcher.call/2`
+  before the source check even completes for a refused caller, and before
+  any auth check for an admitted one — its caller is exactly as
+  unauthenticated-and-repeatable as the one `record_refusal/1` already
+  declines to log per request, so a per-request `Logger.warning` here would
+  be the same evidence-eviction primitive under a different name
+  (security-phase7.md H1).
+
+  `kind` distinguishes which half of the request tripped the filter (`:path`
+  vs `:query`), matching `Vagus.API.ExploitFilter.harmful_path?/1` and
+  `harmful_query?/1` being two separate checks. `sample` MUST already be
+  sanitized (truncated + control-byte-stripped — see
+  `Vagus.API.Dispatcher`'s `sanitize_for_log/1`) before it gets here: this
+  module only stores/logs whatever it's given, so an unsanitized caller
+  would defeat the entire point of routing this through a counter instead of
+  `Logger.warning/1` directly.
+
+  Safe to call when the guard is disabled, same as `record_refusal/1`.
+  """
+  @spec record_filtered(:path | :query, String.t()) :: :ok
+  def record_filtered(kind, sample) when kind in [:path, :query] and is_binary(sample) do
+    GenServer.cast(__MODULE__, {:filtered, kind, sample})
+  end
+
   @doc "Whether the guard is switched on (`config :vagus, :api_source_guard`)."
   @spec enabled?() :: boolean()
   def enabled?, do: Application.get_env(:vagus, :api_source_guard, false) == true
@@ -160,8 +188,21 @@ defmodule Vagus.API.SourceGuard do
         "#{MapSet.size(local_addresses())} local address(es)"
     )
 
-    {:ok, %{refused: 0, sources: MapSet.new(), fast_ticks: @boot_fast_ticks},
-     {:continue, :schedule}}
+    {:ok,
+     %{
+       refused: 0,
+       sources: MapSet.new(),
+       fast_ticks: @boot_fast_ticks,
+       # `ExploitFilter` counter bucket — see `record_filtered/2`. One
+       # retained sample (not a set like `sources` above): the count is the
+       # useful number for volume, and the sample exists only to answer
+       # "which shape tripped it", so keeping more than one buys nothing
+       # while giving an attacker-controlled string more room to grow
+       # between ticks.
+       filtered: 0,
+       filtered_by: %{path: 0, query: 0},
+       filtered_sample: nil
+     }, {:continue, :schedule}}
   end
 
   @impl GenServer
@@ -181,6 +222,14 @@ defmodule Vagus.API.SourceGuard do
   end
 
   @impl GenServer
+  def handle_cast({:filtered, kind, sample}, state) do
+    counts = Map.update!(state.filtered_by, kind, &(&1 + 1))
+
+    {:noreply,
+     %{state | filtered: state.filtered + 1, filtered_by: counts, filtered_sample: sample}}
+  end
+
+  @impl GenServer
   def handle_info(:refresh, state) do
     refresh()
     state = %{state | fast_ticks: max(state.fast_ticks - 1, 0)}
@@ -190,7 +239,7 @@ defmodule Vagus.API.SourceGuard do
     # the boot window are the most diagnostic thing this module emits — they
     # are how the DHCP race above was found — so suppressing them to save a
     # line would hide the signal that matters most.
-    {:noreply, report_refusals(state)}
+    {:noreply, state |> report_refusals() |> report_filtered()}
   end
 
   defp report_refusals(%{refused: 0} = state), do: state
@@ -203,6 +252,23 @@ defmodule Vagus.API.SourceGuard do
     )
 
     %{state | refused: 0, sources: MapSet.new()}
+  end
+
+  defp report_filtered(%{filtered: 0} = state), do: state
+
+  # One line per tick, however many requests it counted — the same
+  # count-then-summarise shape as `report_refusals/1`, for the same reason
+  # (security-phase7.md H1): the caller is unauthenticated and can repeat at
+  # will, so a line each would hand it back the exact ring-eviction primitive
+  # this module exists to deny.
+  defp report_filtered(state) do
+    Logger.warning(
+      "Vagus.API.SourceGuard: filtered #{state.filtered} request(s) " <>
+        "(path: #{state.filtered_by.path}, query: #{state.filtered_by.query}), " <>
+        "e.g. #{state.filtered_sample}"
+    )
+
+    %{state | filtered: 0, filtered_by: %{path: 0, query: 0}, filtered_sample: nil}
   end
 
   # `:inet.ntoa/1` raises on nil, and a nil peer is a case `allowed?/1`

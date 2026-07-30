@@ -910,8 +910,12 @@ defmodule Vagus.API.Router do
     with {:addon, %{slug: slug, discovery: declared}} <- conn.assigns.caller,
          {:ok, service, config} <- validate_discovery(conn.body_params),
          true <- service in declared do
-      {:ok, message} = Discovery.add(slug, service, config)
-      push_discovery(:post, message)
+      {:ok, message, outcome} = Discovery.add(slug, service, config)
+      # `:existing` means Core already has this exact (addon, service,
+      # config) record — pushing again would be the duplicate this dedup
+      # exists to prevent (audit B3). `:new`/`:updated` both need Core told,
+      # same as upstream telling it on every non-identical `send`.
+      if outcome != :existing, do: push_discovery(:post, message)
       Envelope.send_ok(conn, %{uuid: message.uuid})
     else
       {:error, message} -> Envelope.send_error(conn, message, 400)
@@ -3207,7 +3211,16 @@ defmodule Vagus.API.Router do
   # with the message minus `config` (`app`→`addon`). Shared with the native
   # broker's provider via `Vagus.Discovery.Push` — see that module for the
   # `no_refresh_token`/best-effort semantics.
-  defp push_discovery(method, message), do: Vagus.Discovery.Push.push(method, message)
+  #
+  # Resolved through `:discovery_push` (default `&Vagus.Discovery.Push.push/2`)
+  # rather than called directly, same seam shape as `core_lifecycle/0` etc.
+  # above — the router has no other way to observe whether a given
+  # `POST /discovery` actually reached Core, since `Push.push/2` always
+  # answers `:ok` immediately and does the real work in a detached `Task`.
+  defp push_discovery(method, message) do
+    push = Application.get_env(:vagus, :discovery_push, &Vagus.Discovery.Push.push/2)
+    push.(method, message)
+  end
 
   # Resolve the slug an info request may read: the supervisor (Core) may read
   # any slug; an add-on may read `self` or its own slug, nothing else. The

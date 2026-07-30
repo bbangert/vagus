@@ -77,10 +77,19 @@ defmodule Vagus.API.Supervisor do
           # per-request option — it has to be a second instance.
           # `Vagus.API.IngressProxy` picks between them per request.
           {Finch, name: Vagus.Ingress.LocalFinch, pools: %{default: [size: 4]}},
-          {Bandit,
-           plug: Vagus.API.Dispatcher,
-           port: port,
-           thousand_island_options: [num_acceptors: 2, read_timeout: 900_000]}
+          {
+            Bandit,
+            # Upstream's aiohttp server never negotiates response compression,
+            # and Bandit's compressor injects `vary: accept-encoding` into
+            # every response at the adapter layer — below `conn.resp_headers`,
+            # so `Vagus.API.IngressProxy`'s D8 header hygiene can't remove it.
+            # Disabling compression is therefore both upstream parity and the
+            # only complete fix for the vary half of audit finding D8 (F5).
+            plug: Vagus.API.Dispatcher,
+            port: port,
+            http_options: [compress: false],
+            thousand_island_options: [num_acceptors: 2, read_timeout: 900_000]
+          }
         ]
       else
         []
