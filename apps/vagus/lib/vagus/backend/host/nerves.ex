@@ -132,6 +132,9 @@ defmodule Vagus.Backend.Host.Nerves do
     fields =
       contents
       |> String.split("\n", trim: true)
+      # trim: tolerates CRLF line endings (a trailing \r would otherwise
+      # ride on every value) and stray indentation before a key.
+      |> Enum.map(&String.trim/1)
       |> Enum.flat_map(fn line ->
         case String.split(line, "=", parts: 2) do
           [key, value] -> [{key, String.trim(value, "\"")}]
