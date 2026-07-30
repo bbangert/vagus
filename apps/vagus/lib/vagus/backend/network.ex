@@ -16,8 +16,10 @@ defmodule Vagus.Backend.Network do
   Attrs for `Vagus.API.Models.NetworkInterface`
   (`GET network/interface/:ifname/info`). Implementations resolve the
   `default` alias (compared case-insensitively) to the primary
-  interface — the one whose `connection` matches the aggregate
-  `["connection"]` value — before lookup. Unknown/unresolvable `ifname`
+  interface — the one whose `connection` is not `:disconnected` AND
+  matches the aggregate `["connection"]` value, the same rule
+  `Builder.build_interface/3` uses for `primary` — before lookup.
+  Unknown/unresolvable `ifname`
   is `{:error, :not_found}` (the router turns that into upstream's 404
   `Interface {name} does not exist`); any other failure is
   `{:error, reason}` with a human-readable string suitable for the error
