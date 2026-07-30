@@ -109,4 +109,47 @@ defmodule Vagus.API.DispatcherSourceGuardTest do
 
     assert conn.status == 403
   end
+
+  describe "security-phase7.md H1: a filtered request still 400s under both guard configurations" do
+    test "guard enabled: still a bare 400, and the block is counted rather than logged" do
+      import ExUnit.CaptureLog
+
+      # This describe's own `setup` already turns the guard on; start the
+      # counter GenServer under a fixed name so `record_filtered/2` (cast to
+      # `Vagus.API.SourceGuard`, the module name) actually lands somewhere.
+      start_supervised!({SourceGuard, name: SourceGuard})
+
+      log =
+        capture_log(fn ->
+          conn = call("/ingress/sometoken/../../etc/passwd", @local)
+
+          assert conn.status == 400
+          assert conn.resp_body == "Bad Request"
+          assert conn.halted
+        end)
+
+      # No per-request line from `Dispatcher` itself when the guard is
+      # running — the block was counted, not logged, at this point in time
+      # (the periodic summary hasn't ticked).
+      refute log =~ "Vagus.API.Dispatcher: filtered"
+    end
+
+    test "guard disabled: still a bare 400, logged with the sanitized path (dev/host convention)" do
+      import ExUnit.CaptureLog
+
+      Application.put_env(:vagus, :api_source_guard, false)
+
+      log =
+        capture_log(fn ->
+          conn = call("/ingress/sometoken/../../etc/passwd", @foreign)
+
+          assert conn.status == 400
+          assert conn.resp_body == "Bad Request"
+          assert conn.halted
+        end)
+
+      assert log =~ "Vagus.API.Dispatcher: filtered a potential harmful request (path):"
+      assert log =~ "/ingress/sometoken/../../etc/passwd"
+    end
+  end
 end

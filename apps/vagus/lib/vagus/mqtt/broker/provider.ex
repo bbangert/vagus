@@ -18,18 +18,23 @@ defmodule Vagus.Mqtt.Broker.Provider do
        broker IP, `port`, `protocol: "3.1.1"`, `username: "addons"`, `password`.
        `Vagus.Mqtt.Broker.Auth`'s service-credentials path reads the same entry,
        so an add-on connecting as `addons`/`<password>` authenticates;
-    3. adds the `mqtt` discovery message (`Vagus.Discovery`) **and pushes it to
-       Core** via `Vagus.Discovery.Push`, exactly as a container add-on's
-       `POST /discovery` does — so Core live-configures the MQTT integration
+    3. adds the `mqtt` discovery message (`Vagus.Discovery`) — pushing it to
+       Core via `Vagus.Discovery.Push` only when `Discovery.add/4` says the
+       registry actually changed — exactly as a container add-on's
+       `POST /discovery` does, so Core live-configures the MQTT integration
        instead of only noticing on its next boot-time `GET /discovery` pull. If
        Core isn't up yet (the broker boots ahead of it) the push is a no-op and
        Core's boot pull covers it.
 
-  To stay idempotent across a broker **crash** (where `terminate` never ran and
-  a previous uuid was left orphaned in `Vagus.Discovery` and in Core), init
-  first clears any `mqtt` discovery still owned by this slug — pushing a delete
-  for each — before adding the fresh one, so Core always ends up with exactly
-  one entry rather than a duplicate.
+  Idempotency across a broker **crash** (where `terminate` never ran and a
+  previous uuid was left in `Vagus.Discovery`) no longer needs a manual
+  clear-then-add here: `Discovery.add/4` dedups on `(slug, service)` itself
+  (audit B3), so a fresh `init` for the same slug either finds the leftover
+  entry's config unchanged (`:existing` — nothing to push, nothing
+  duplicated) or changed (`:updated` — the *same* uuid is kept, `config` is
+  replaced in place, and exactly one push goes out). Either way there is
+  never more than one `mqtt` discovery for this slug, without this module
+  having to delete anything first.
 
   On `terminate` it deregisters the service and discovery (pushing the discovery
   delete to Core), so both follow broker liveness. Registry calls are
@@ -69,11 +74,6 @@ defmodule Vagus.Mqtt.Broker.Provider do
 
     password = load_or_generate_password(data_dir)
     payload = service_payload(host, port, password)
-
-    # A prior broker instance that crashed (no terminate) may have left an mqtt
-    # discovery orphaned here + in Core. Clear it first so we never publish a
-    # duplicate.
-    clear_stale_discovery(discovery, slug, push)
 
     publish_service(services, slug, payload)
     uuid = publish_discovery(discovery, slug, payload, push)
@@ -116,26 +116,22 @@ defmodule Vagus.Mqtt.Broker.Provider do
 
   defp publish_discovery(discovery, slug, payload, push) do
     if alive?(discovery) do
-      # Discovery.add/4 is speced `{:ok, message()}`; `best_effort` adds `:error`
-      # if the registry died mid-call, so match both.
+      # Discovery.add/4 is speced `{:ok, message(), outcome}`; `best_effort`
+      # adds `:error` if the registry died mid-call, so match both. Push only
+      # on `:new`/`:updated` — `:existing` means this exact (slug, service,
+      # config) triple is already in Core, so pushing again would recreate
+      # the duplicate the dedup exists to prevent (mirrors the router's
+      # `POST /discovery`, audit B3).
       case best_effort(fn -> Vagus.Discovery.add(slug, @service, payload, discovery) end) do
-        {:ok, %{uuid: uuid} = message} ->
+        {:ok, %{uuid: uuid} = message, outcome} when outcome in [:new, :updated] ->
           push.(:post, message)
+          uuid
+
+        {:ok, %{uuid: uuid}, :existing} ->
           uuid
 
         _ ->
           nil
-      end
-    end
-  end
-
-  # Push a delete for any mqtt discovery this slug still owns from a prior
-  # (crashed) broker instance, so a fresh publish never duplicates it in Core.
-  defp clear_stale_discovery(discovery, slug, push) do
-    if alive?(discovery) do
-      case best_effort(fn -> Vagus.Discovery.delete_by_slug(slug, discovery) end) do
-        {:ok, removed} -> Enum.each(removed, &push.(:delete, &1))
-        _ -> :ok
       end
     end
   end

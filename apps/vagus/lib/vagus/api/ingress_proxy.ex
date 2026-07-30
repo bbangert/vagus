@@ -32,20 +32,46 @@ defmodule Vagus.API.IngressProxy do
      process bridge described in the research doc §2 and that module's own
      moduledoc (§B2.3). Auth/target resolution above already happened by
      the time this branch runs; the bridge itself never touches either.
-  5. Otherwise, the plain-HTTP leg: stream the request body into `Finch`,
-     stream the response back out, following
-     `.claude/plans/vagus-m4-ingress-watchdog/research/proxy-approach.md`
-     §1 exactly (Finch/Mint's request/response streaming is
-     request-then-stream-response, never duplex — which is what makes the
-     "thread the final `conn` back out of the request-body stream" trick
-     below safe, see `build_request_body/1`). `path_info` segments are
-     joined back into the upstream path **verbatim** (see `build_url/4`'s
-     doc comment) — they arrive already percent-encoded exactly as the
-     browser sent them; `path_info` is never percent-decoded anywhere in
-     this stack.
+  5. Otherwise, the plain-HTTP leg. `path_info` segments are joined back
+     into the upstream path **verbatim** (see `build_url/4`'s doc comment)
+     — they arrive already percent-encoded exactly as the browser sent
+     them; `path_info` is never percent-decoded anywhere in this stack.
 
-  Never buffers a body. Per-chunk memory stays ~64KB either direction —
-  load-bearing on a 1GB device.
+  ## Request body: streamed only for POST + `ingress_stream` (audit F4)
+
+  Upstream (`api/ingress.py` `_handle_request`) only streams a request body
+  (`request.content`) for a `POST` whose add-on config declares
+  `ingress_stream: true`; every other body-carrying request is buffered
+  (`await request.read()`), which is what lets aiohttp compute a real
+  `Content-Length` for the outgoing request instead of forcing
+  `Transfer-Encoding: chunked` on it. This module mirrors that exactly —
+  see `build_request_body/2` — rather than always streaming: an add-on
+  server that doesn't decode chunked requests (stdlib
+  `BaseHTTPRequestHandler`, e.g. `core_configurator`) silently reads an
+  empty body from an always-chunked proxy, which is a real (not
+  theoretical) breakage.
+
+  The POST+`ingress_stream` path still streams via `Finch`/`Mint` following
+  `.claude/plans/vagus-m4-ingress-watchdog/research/proxy-approach.md` §1
+  exactly (Finch/Mint's request/response streaming is
+  request-then-stream-response, never duplex — which is what makes the
+  "thread the final `conn` back out of the request-body stream" trick below
+  safe, see `build_stream_body/1`), holding at most one 64KB chunk in memory
+  at a time. The buffered default path holds the whole body (up to the
+  16 MiB cap) in memory instead — the per-chunk ~64KB memory claim holds for
+  the streaming opt-in and for response bodies (still always streamed) only,
+  not for the buffered-request-body default.
+
+  Both `read_body/2` call sites below pass **both** `length: 64_000` and
+  `read_length: 64_000` (security-phase7.md W2) — `:read_length` alone is
+  only the per-socket-recv size; the real per-*call* ceiling is `:length`,
+  which defaults to 8_000_000. Passing only `read_length: 64_000` (this
+  module's shape before the fix) left every `read_body/2` call free to hand
+  back up to 8 MB in one `{:more, data, conn}`, 128x the documented chunk
+  size, and let the buffered path's cap check (which only runs between
+  calls) overshoot by the same 8 MB before the 413 fired. Pinning `:length`
+  to the same 64_000 makes both claims above literally true rather than
+  aspirational.
   """
 
   @behaviour Plug
@@ -101,6 +127,14 @@ defmodule Vagus.API.IngressProxy do
   # content-length/transfer-encoding verbatim would conflict with it.
   @response_strip_extra ~w(content-length transfer-encoding)
 
+  # audit F4 / upstream's aiohttp `MAX_CLIENT_SIZE`
+  # (`supervisor/api/__init__.py:48`) — the cap on a *buffered* request
+  # body (the default path below; the POST+`ingress_stream` opt-in streams
+  # regardless of size, same as upstream). Overridable via
+  # `config :vagus, :ingress_request_body_cap` so a test can exercise the
+  # 413 path without actually allocating 16 MiB.
+  @request_body_cap_bytes 16_777_216
+
   @impl Plug
   def init(opts), do: opts
 
@@ -112,7 +146,7 @@ defmodule Vagus.API.IngressProxy do
     with :ok <- check_session(conn),
          {:ok, slug} <- Vagus.Ingress.resolve_token(token),
          {:ok, {ip, port}} <- resolve_target(slug) do
-      proxy(conn, ip, port, rest)
+      proxy(conn, slug, ip, port, rest)
     else
       :unauthorized -> send_plain(conn, 401, "Unauthorized")
       :error -> send_plain(conn, 503, "Service Unavailable")
@@ -190,13 +224,35 @@ defmodule Vagus.API.IngressProxy do
     fun.(slug)
   end
 
+  defp resolve_ingress_stream(slug) do
+    fun = Application.get_env(:vagus, :ingress_stream_fun, &default_ingress_stream/1)
+    fun.(slug)
+  end
+
+  @doc """
+  Default `:ingress_stream_fun` — resolves `slug`'s config-declared
+  `ingress_stream` flag (`Vagus.Addon.Config`) from `Vagus.Addon.State`,
+  mirroring `default_target/1`'s own injectable-seam pattern so tests can
+  flip the flag without a real add-on config. `false` (buffer, don't
+  stream) for any slug this emulator doesn't have tracked — matching
+  upstream's own falsy default rather than guessing streaming is safe for
+  an add-on we know nothing about.
+  """
+  @spec default_ingress_stream(String.t()) :: boolean()
+  def default_ingress_stream(slug) do
+    case State.get(slug) do
+      {:ok, %{config: %{ingress_stream: flag}}} when is_boolean(flag) -> flag
+      _ -> false
+    end
+  end
+
   ## WS upgrade seam
 
-  defp proxy(conn, ip, port, rest) do
+  defp proxy(conn, slug, ip, port, rest) do
     if websocket_upgrade?(conn) do
       upgrade_websocket(conn, ip, port, rest)
     else
-      proxy_http(conn, ip, port, rest)
+      proxy_http(conn, slug, ip, port, rest)
     end
   end
 
@@ -224,11 +280,25 @@ defmodule Vagus.API.IngressProxy do
   defp upgrade_websocket(conn, ip, port, rest) do
     protocols = requested_subprotocols(conn)
     conn = maybe_negotiate_subprotocol(conn, protocols)
+    # audit F1/B1: the same filtered header set the HTTP leg forwards
+    # (`build_request_headers/1` — hop-by-hop strip, auth/identity strip,
+    # `X-Forwarded-For` append) also has to reach the add-on on the WS leg,
+    # or a cookie-authenticated WebSocket (e.g. behind an add-on's own
+    # session check) breaks. `sec-websocket-protocol` is deliberately not
+    # part of this set (see `strip_request_headers/1`'s `sec-websocket-`
+    # prefix strip) — it continues to travel via the separate `protocols`
+    # mechanism below, decided by `requested_subprotocols/1` above.
+    headers = build_request_headers(conn)
 
     WebSockAdapter.upgrade(
       conn,
       Vagus.Ingress.WSBridge,
-      %{target: {ip, port}, path: build_ws_path(rest, conn.query_string), protocols: protocols},
+      %{
+        target: {ip, port},
+        path: build_ws_path(rest, conn.query_string),
+        protocols: protocols,
+        headers: headers
+      },
       # `:timeout` here is WebSockAdapter/Bandit's *post-upgrade* idle
       # timeout — a knob entirely separate from Thousand Island's own
       # connection-level `read_timeout` (research §3's gotcha). Both are
@@ -281,17 +351,41 @@ defmodule Vagus.API.IngressProxy do
 
   ## Plain-HTTP leg
 
-  defp proxy_http(conn, ip, port, rest) do
+  defp proxy_http(conn, slug, ip, port, rest) do
     url = build_url(ip, port, rest, conn.query_string)
     headers = build_request_headers(conn)
-    {body, ref} = build_request_body(conn)
-    request = Finch.build(conn.method, url, headers, body)
 
-    acc = %{conn: conn, ref: ref, resolved?: ref == nil, status: nil, mode: nil}
+    case build_request_body(conn, slug) do
+      {:ok, conn, body, ref} ->
+        request = Finch.build(conn.method, url, headers, body)
+        acc = %{conn: conn, ref: ref, resolved?: ref == nil, status: nil, mode: nil}
 
-    request
-    |> Finch.stream_while(finch_for(ip), acc, &handle_event/2, receive_timeout: @receive_timeout)
-    |> finish()
+        request
+        |> Finch.stream_while(finch_for(ip), acc, &handle_event/2,
+          receive_timeout: @receive_timeout
+        )
+        |> finish()
+
+      {:error, conn, :too_large} ->
+        # Rejected before ever dialling the add-on (matches upstream's own
+        # `MAX_CLIENT_SIZE` 413 — `supervisor/api/__init__.py:48`). Sent
+        # through the `conn` `read_buffered/4` handed back on the overflow
+        # branch — NOT `proxy_http/5`'s original argument (security-phase7.md
+        # W1). Bandit's read state (`read_state`, `buffer`,
+        # `unread_content_length`) lives in the adapter that conn carries, so
+        # answering through the stale pre-read conn would tell Bandit the
+        # body was never touched; `Bandit.Pipeline.commit_response!/1`'s
+        # `ensure_completed/1` would then try to drain the *entire* declared
+        # body a second time on a connection that, on the ingress path, is
+        # one of Core's own pooled connections to this API (the browser
+        # reaches ingress through Core's pooled aiohttp client) — not the
+        # attacker's. With the correctly-threaded conn, whatever we didn't
+        # read is drained exactly once by Bandit's own `ensure_completed/1`
+        # after we respond, and that single drain never corrupts a
+        # keep-alive connection's framing — a claim that only holds for a
+        # correctly-threaded conn, which is the point of threading it here.
+        send_plain(conn, 413, "Request Entity Too Large")
+    end
   end
 
   # A loopback destination is a `host_network: true` add-on (`resolve_ip/2`),
@@ -380,10 +474,49 @@ defmodule Vagus.API.IngressProxy do
     end
   end
 
+  # audit F4: upstream only streams a request body for a `POST` whose
+  # add-on declared `ingress_stream: true` (`api/ingress.py`
+  # `_handle_request`'s `request.content` branch) — everything else
+  # (including a bodyless request) is buffered or, for GET/HEAD/etc, simply
+  # absent. Mirrored here rather than always streaming, because always
+  # streaming means Finch/Mint always frames the outgoing request
+  # `Transfer-Encoding: chunked` (no `Content-Length` to compute up front),
+  # and an add-on server that doesn't decode chunked requests (stdlib
+  # `BaseHTTPRequestHandler`, e.g. `core_configurator`) then silently reads
+  # an empty body.
+  #
+  # Returns `{:ok, conn, body, ref}` (`ref` non-nil only for the streamed
+  # path — see `resolve_conn/1`) or `{:error, conn, :too_large}` for a
+  # buffered body over `request_body_cap/0`. The `conn` in the error tuple is
+  # `read_buffered/4`'s own return, reflecting exactly how much of the body
+  # it actually consumed before bailing — propagated rather than discarded
+  # so `proxy_http/5` can answer the 413 through it (security-phase7.md W1).
+  defp build_request_body(conn, slug) do
+    cond do
+      not has_body?(conn) ->
+        {:ok, conn, nil, nil}
+
+      conn.method == "POST" and resolve_ingress_stream(slug) ->
+        {stream, ref} = build_stream_body(conn)
+        {:ok, conn, stream, ref}
+
+      true ->
+        case buffer_request_body(conn) do
+          {:ok, conn, body} -> {:ok, conn, body, nil}
+          {:error, conn, :too_large} -> {:error, conn, :too_large}
+        end
+    end
+  end
+
   # Streams the request body into Finch via `Stream.resource/3` over
-  # `Plug.Conn.read_body/2`, never holding more than one `read_length`
-  # (64KB) chunk in memory — the whole point of splitting this proxy out
-  # from underneath `Plug.Parsers` (research §3 gotcha 1).
+  # `Plug.Conn.read_body/2`, never holding more than one 64KB chunk in
+  # memory — the whole point of splitting this proxy out from underneath
+  # `Plug.Parsers` (research §3 gotcha 1). That claim needs BOTH `length:`
+  # and `read_length:` set to 64_000 below (see the moduledoc's W2 note) —
+  # `:read_length` alone bounds only the per-socket recv, not the per-call
+  # return, and would let a single call hand back up to `:length`'s 8 MB
+  # default. Only reached for a POST whose add-on declared
+  # `ingress_stream: true` (`build_request_body/2`).
   #
   # Plug requires using the conn `read_body/2` returns on every subsequent
   # call, but the stream's `next_fun` runs *inside* Finch (whichever
@@ -400,39 +533,75 @@ defmodule Vagus.API.IngressProxy do
   # fallback, not something expected to ever miss.) The process dictionary
   # would work as well; a message is preferred so nothing survives past
   # this one request if something above changes.
-  defp build_request_body(conn) do
-    if has_body?(conn) do
-      ref = make_ref()
-      parent = self()
+  defp build_stream_body(conn) do
+    ref = make_ref()
+    parent = self()
 
-      stream =
-        Stream.resource(
-          fn -> conn end,
-          fn
-            :done ->
-              {:halt, :done}
+    stream =
+      Stream.resource(
+        fn -> conn end,
+        fn
+          :done ->
+            {:halt, :done}
 
-            conn ->
-              case read_body(conn, read_length: 64_000) do
-                {:more, data, conn} ->
-                  {[data], conn}
+          conn ->
+            case read_body(conn, length: 64_000, read_length: 64_000) do
+              {:more, data, conn} ->
+                {[data], conn}
 
-                {:ok, data, conn} ->
-                  send(parent, {ref, conn})
-                  {[data], :done}
-              end
-          end,
-          fn
-            :done -> :ok
-            %Plug.Conn{} = leftover_conn -> send(parent, {ref, leftover_conn})
-          end
-        )
+              {:ok, data, conn} ->
+                send(parent, {ref, conn})
+                {[data], :done}
+            end
+        end,
+        fn
+          :done -> :ok
+          %Plug.Conn{} = leftover_conn -> send(parent, {ref, leftover_conn})
+        end
+      )
 
-      {{:stream, stream}, ref}
-    else
-      {nil, nil}
+    {{:stream, stream}, ref}
+  end
+
+  # audit F4: the default (non-streaming) request-body path. Buffers up to
+  # `request_body_cap/0` bytes — 16 MiB by default, matching upstream's
+  # aiohttp `MAX_CLIENT_SIZE` (`supervisor/api/__init__.py:48`) — via
+  # `Plug.Conn.read_body/2`, then hands Finch a plain binary so it computes
+  # a real `Content-Length` instead of forcing chunked framing. Runs
+  # entirely inside `call/2`'s own process, before `Finch.stream_while/5`
+  # is ever invoked, so — unlike `build_stream_body/1` — there is no need
+  # to thread the final `conn` back out via a message: the `conn` returned
+  # here already reflects the fully-read body.
+  defp buffer_request_body(conn) do
+    read_buffered(conn, request_body_cap(), [], 0)
+  end
+
+  defp read_buffered(conn, cap, acc, size) do
+    case read_body(conn, length: 64_000, read_length: 64_000) do
+      {:more, data, conn} ->
+        size = size + byte_size(data)
+
+        if size > cap,
+          # `conn` here — not the caller's original — is the whole point of
+          # this tuple shape (security-phase7.md W1): it's the one that
+          # reflects Bandit's adapter actually having consumed these bytes,
+          # which is what `send_plain/3`'s 413 must be answered through.
+          do: {:error, conn, :too_large},
+          else: read_buffered(conn, cap, [data | acc], size)
+
+      {:ok, data, conn} ->
+        size = size + byte_size(data)
+
+        if size > cap do
+          {:error, conn, :too_large}
+        else
+          {:ok, conn, acc |> Enum.reverse([data]) |> IO.iodata_to_binary()}
+        end
     end
   end
+
+  defp request_body_cap,
+    do: Application.get_env(:vagus, :ingress_request_body_cap, @request_body_cap_bytes)
 
   ## Response streaming (Finch.stream_while/5)
 
@@ -460,9 +629,25 @@ defmodule Vagus.API.IngressProxy do
 
   defp do_handle_event({:headers, headers}, acc) do
     conn =
-      headers
-      |> strip_response_headers()
-      |> Enum.reduce(acc.conn, fn {k, v}, c -> put_resp_header(c, k, v) end)
+      acc.conn
+      # audit F5/D8: `%Plug.Conn{}`'s own defaults (`cache-control:
+      # max-age=0, private, must-revalidate`, and a default `vary`) must
+      # not leak into a proxied response — upstream adds neither, and
+      # letting them through makes every add-on asset non-cacheable
+      # (measurable panel-reload regression on a 1GB board). Deleted
+      # *before* the merge below so an add-on's own `cache-control`/`vary`
+      # (if it sets one) passes through untouched.
+      |> delete_resp_header("cache-control")
+      |> delete_resp_header("vary")
+      # audit F2/B2: `prepend_resp_headers/2` (`headers ++ resp_headers`,
+      # per `deps/plug/lib/plug/conn.ex`) rather than a `put_resp_header/3`
+      # fold — the latter overrides same-name headers, collapsing multiple
+      # `Set-Cookie`/`Link`/`WWW-Authenticate`/`Vary` occurrences from the
+      # add-on down to one and breaking any add-on that sets a session +
+      # CSRF cookie in the same response. Mint's header names already
+      # arrive lowercased, and duplicates are preserved in the add-on's own
+      # order.
+      |> prepend_resp_headers(strip_response_headers(headers))
       |> put_resp_header("x-accel-buffering", "no")
 
     if empty_body_status?(acc.status) or conn.method == "HEAD" do
@@ -485,11 +670,43 @@ defmodule Vagus.API.IngressProxy do
   defp do_handle_event({:trailers, _trailers}, acc), do: {:cont, acc}
 
   defp strip_response_headers(headers) do
-    Enum.reject(headers, fn {k, _v} ->
+    Enum.reject(headers, fn {k, v} ->
       k = String.downcase(k)
-      k in @hop_by_hop or k in @response_strip_extra
+      k in @hop_by_hop or k in @response_strip_extra or ingress_session_cookie?(k, v)
     end)
   end
+
+  # [DIVERGENCE from upstream, deliberate — like the two hardenings recorded
+  # in the phase-1 scratchpad's "hardenings that are NOT upstream parity"]:
+  # F2 above (`prepend_resp_headers/2`) correctly preserves every
+  # multi-valued response header so an add-on's own session + CSRF cookies
+  # both survive — but that also means an add-on's own
+  # `Set-Cookie: ingress_session=<value>` now rides back through this proxy,
+  # through Core's ingress view, and into the browser, replacing the single
+  # `ingress_session` cookie EVERY add-on's ingress traffic authenticates
+  # with (security-phase7.md W3) — cross-add-on session fixation, since a
+  # malicious/compromised add-on can now hand the browser a session value it
+  # already knows. Upstream has the exact same hole (it preserves add-on
+  # cookies the same way and has no equivalent filter), which is why this is
+  # a Warning rather than a blocker on an otherwise parity-driven phase — but
+  # closing it here cannot break a legitimate add-on: no add-on has any
+  # legitimate reason to set Supervisor's own ingress session cookie.
+  #
+  # Parsed as the bytes before the first `=` — a cookie's NAME, per RFC 6265
+  # §4.1.1 — compared case-INsensitively even though the RFC's own name
+  # comparison is case-sensitive: being lenient here only ever drops MORE
+  # candidates for "this claims to be our session cookie", never fewer, so
+  # it can't be bypassed by an add-on sending `Ingress_Session=evil` instead.
+  # A cookie merely containing the string in its VALUE (e.g.
+  # `sid=ingress_session_backup`) is untouched — only the NAME is compared.
+  defp ingress_session_cookie?("set-cookie", value) do
+    case String.split(value, "=", parts: 2) do
+      [name, _rest] -> String.downcase(String.trim(name)) == "ingress_session"
+      _no_equals_sign -> false
+    end
+  end
+
+  defp ingress_session_cookie?(_key, _value), do: false
 
   defp empty_body_status?(status) when status in [204, 304], do: true
   defp empty_body_status?(status) when status >= 100 and status < 200, do: true
@@ -512,8 +729,15 @@ defmodule Vagus.API.IngressProxy do
     end
   end
 
+  # audit F5/D8: upstream's own refusals (401/503/502/413) are bare aiohttp
+  # text responses carrying neither `cache-control` nor `vary` — deleting
+  # both here (rather than only on the proxied-response path above) keeps
+  # every plain-text refusal this module sends wire-equivalent, not just
+  # the happy path.
   defp send_plain(conn, status, body) do
     conn
+    |> delete_resp_header("cache-control")
+    |> delete_resp_header("vary")
     |> put_resp_content_type("text/plain")
     |> send_resp(status, body)
   end

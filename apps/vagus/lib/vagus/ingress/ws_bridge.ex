@@ -117,7 +117,12 @@ defmodule Vagus.Ingress.WSBridge do
   @doc """
   `state` here is the map `Vagus.API.IngressProxy` passed to
   `WebSockAdapter.upgrade/4`: `%{target: {ip, port}, path: path, protocols:
-  protocols}`.
+  protocols, headers: headers}`. `headers` (audit F1/B1) is
+  `IngressProxy.build_request_headers/1`'s output — the same filtered
+  header set (hop-by-hop stripped, auth/identity stripped, `X-Forwarded-For`
+  appended) the plain-HTTP leg forwards, required here rather than optional
+  because there is no other source for it: this module never sees the
+  browser's original `conn`.
 
   Starts **and links** `B` (`Upstream`). `Process.flag(:trap_exit, true)`
   runs first so that link is a *message*-delivering link from the start —
@@ -132,10 +137,17 @@ defmodule Vagus.Ingress.WSBridge do
   `handle_info/2` may return), closing the browser side with 1011 without
   ever completing the upgrade to an *open* bridge.
   """
-  def init(%{target: {ip, port}, path: path, protocols: protocols}) do
+  def init(%{target: {ip, port}, path: path, protocols: protocols, headers: headers}) do
     Process.flag(:trap_exit, true)
 
-    upstream_args = %{parent: self(), ip: ip, port: port, path: path, protocols: protocols}
+    upstream_args = %{
+      parent: self(),
+      ip: ip,
+      port: port,
+      path: path,
+      protocols: protocols,
+      headers: headers
+    }
 
     case Upstream.start_link(upstream_args) do
       {:ok, pid} ->
@@ -285,6 +297,20 @@ defmodule Vagus.Ingress.WSBridge.Upstream do
   request ref as a websocket in the connection's private data), so a single
   `handle_info/2` clause serves both phases.
 
+  ## Header forwarding (audit F1/B1)
+
+  The upgrade request sent in `init/1` carries the exact same filtered
+  header set the plain-HTTP leg forwards
+  (`Vagus.API.IngressProxy.build_request_headers/1` — hop-by-hop strip,
+  auth/identity strip, `X-Forwarded-For` append) plus
+  `sec-websocket-protocol` appended separately (`protocol_headers/1`,
+  driven by `protocols`, not `headers`). Before this fix the upgrade
+  request carried *only* `sec-websocket-protocol` — no `Cookie`, no `Host`,
+  nothing — which silently broke any add-on gating its own WS endpoint on
+  the session cookie. `IngressProxy` builds `headers` from the browser's
+  `conn` and hands it in via `WSBridge.init/1`'s state map; this module has
+  no access to that `conn` and could not build the list itself.
+
   ## Buffering before the upgrade completes
 
   A browser frame can arrive (via `WSBridge.handle_in/2`'s cast) before the
@@ -347,6 +373,7 @@ defmodule Vagus.Ingress.WSBridge.Upstream do
           required(:port) => :inet.port_number(),
           required(:path) => String.t(),
           required(:protocols) => [String.t()],
+          required(:headers) => Mint.Types.headers(),
           optional(:pending_max_bytes) => pos_integer(),
           optional(:pending_max_frames) => pos_integer(),
           optional(:upgrade_deadline_ms) => pos_integer()
@@ -374,7 +401,10 @@ defmodule Vagus.Ingress.WSBridge.Upstream do
   Arms `:upgrade_deadline_ms` (review W3) here, on the success path only —
   a connection that never got this far has nothing to time out.
   """
-  def init(%{parent: parent, ip: ip, port: port, path: path, protocols: protocols} = args) do
+  def init(
+        %{parent: parent, ip: ip, port: port, path: path, protocols: protocols, headers: headers} =
+          args
+      ) do
     connect_opts = [
       mode: :active,
       protocols: [:http1],
@@ -391,9 +421,18 @@ defmodule Vagus.Ingress.WSBridge.Upstream do
         {:stop, {:connect_failed, reason}}
 
       {:ok, conn} ->
-        headers = protocol_headers(protocols)
+        # audit F1/B1: forward the browser's own filtered headers (cookie,
+        # host, x-ingress-path, x-forwarded-*, authorization, ...) verbatim
+        # on the upgrade request, same as the plain-HTTP leg — plus
+        # `sec-websocket-protocol`, which `headers` never carries (excluded
+        # by `IngressProxy.strip_request_headers/1`'s `sec-websocket-`
+        # prefix strip) since it's negotiated separately via `protocols`.
+        # Order doesn't matter to Mint/HTTP1, but appending keeps the
+        # general set first and the protocol negotiation header visually
+        # distinct.
+        upgrade_headers = headers ++ protocol_headers(protocols)
 
-        case Mint.WebSocket.upgrade(:ws, conn, path, headers) do
+        case Mint.WebSocket.upgrade(:ws, conn, path, upgrade_headers) do
           {:ok, conn, ref} ->
             upgrade_deadline_ms =
               Map.get(args, :upgrade_deadline_ms, @default_upgrade_deadline_ms)
