@@ -293,6 +293,14 @@ defmodule Vagus.API.CoreProxyWSTest do
   @opts Dispatcher.init([])
   @expected_core_token "core-access-token"
 
+  # Real-socket wait bound for every handshake/close frame. Deliberately
+  # generous: a terminal close code propagates over FOUR hops (Core → the
+  # `Upstream` GenServer → `WSBridge` → the caller socket), across two real
+  # Bandit servers, and a tighter 2s bound flaked on a loaded CI runner
+  # (never locally — 25× file repeats stayed green) on the Core-auth-failure
+  # close-propagation test. Nothing here should ever legitimately approach 5s.
+  @recv_timeout 5_000
+
   setup do
     start_supervised!(DialCounter)
     start_supervised!(CoreAuthScript)
@@ -379,7 +387,7 @@ defmodule Vagus.API.CoreProxyWSTest do
 
     {:ok, client, _headers} = Client.connect(host, port, "/core/websocket")
 
-    {{:text, raw}, client} = Client.next_frame(client, 2_000)
+    {{:text, raw}, client} = Client.next_frame(client, @recv_timeout)
     auth_required = Jason.decode!(raw)
     assert auth_required["type"] == "auth_required"
     assert Map.has_key?(auth_required, "ha_version")
@@ -388,22 +396,22 @@ defmodule Vagus.API.CoreProxyWSTest do
     # deliberately omitted here to prove that.
     client = Client.send_frame(client, {:text, Jason.encode!(%{"access_token" => token})})
 
-    {{:text, raw}, client} = Client.next_frame(client, 2_000)
+    {{:text, raw}, client} = Client.next_frame(client, @recv_timeout)
     auth_ok = Jason.decode!(raw)
     assert auth_ok["type"] == "auth_ok"
     assert Map.has_key?(auth_ok, "ha_version")
 
-    assert_receive {:core_init, _core_pid}, 2_000
+    assert_receive {:core_init, _core_pid}, @recv_timeout
     assert DialCounter.count() == 1
 
     client = Client.send_frame(client, {:text, "hello"})
-    {frame, client} = Client.next_frame(client, 2_000)
+    {frame, client} = Client.next_frame(client, @recv_timeout)
     assert frame == {:text, "world"}
 
     payload = :crypto.strong_rand_bytes(10_000)
     expected_sha = :crypto.hash(:sha256, payload)
     client = Client.send_frame(client, {:binary, payload})
-    {frame, _client} = Client.next_frame(client, 2_000)
+    {frame, _client} = Client.next_frame(client, @recv_timeout)
 
     assert {:binary, echoed} = frame
     assert :crypto.hash(:sha256, echoed) == expected_sha
@@ -416,15 +424,15 @@ defmodule Vagus.API.CoreProxyWSTest do
     proxy_port: port
   } do
     {:ok, client, _headers} = Client.connect(host, port, "/core/websocket")
-    {{:text, _auth_required}, client} = Client.next_frame(client, 2_000)
+    {{:text, _auth_required}, client} = Client.next_frame(client, @recv_timeout)
 
     client =
       Client.send_frame(client, {:text, Jason.encode!(%{"access_token" => "not-a-real-token"})})
 
-    {{:text, raw}, client} = Client.next_frame(client, 2_000)
+    {{:text, raw}, client} = Client.next_frame(client, @recv_timeout)
     assert decode_text({:text, raw})["type"] == "auth_invalid"
 
-    {frame, _client} = Client.next_frame(client, 2_000)
+    {frame, _client} = Client.next_frame(client, @recv_timeout)
     assert match?({:close, 1000, _}, frame)
     assert DialCounter.count() == 0
   end
@@ -433,14 +441,14 @@ defmodule Vagus.API.CoreProxyWSTest do
        %{proxy_host: host, proxy_port: port} do
     token = addon_token("cp_ws_no_flag")
     {:ok, client, _headers} = Client.connect(host, port, "/core/websocket")
-    {{:text, _auth_required}, client} = Client.next_frame(client, 2_000)
+    {{:text, _auth_required}, client} = Client.next_frame(client, @recv_timeout)
 
     client = Client.send_frame(client, {:text, Jason.encode!(%{"access_token" => token})})
 
-    {{:text, raw}, client} = Client.next_frame(client, 2_000)
+    {{:text, raw}, client} = Client.next_frame(client, @recv_timeout)
     assert decode_text({:text, raw})["type"] == "auth_invalid"
 
-    {frame, _client} = Client.next_frame(client, 2_000)
+    {frame, _client} = Client.next_frame(client, @recv_timeout)
     assert match?({:close, 1000, _}, frame)
     assert DialCounter.count() == 0
   end
@@ -448,14 +456,14 @@ defmodule Vagus.API.CoreProxyWSTest do
   test "the supervisor token -> auth_invalid then close (not special-cased — it simply doesn't resolve)",
        %{proxy_host: host, proxy_port: port} do
     {:ok, client, _headers} = Client.connect(host, port, "/core/websocket")
-    {{:text, _auth_required}, client} = Client.next_frame(client, 2_000)
+    {{:text, _auth_required}, client} = Client.next_frame(client, @recv_timeout)
 
     client = Client.send_frame(client, {:text, Jason.encode!(%{"access_token" => Token.get()})})
 
-    {{:text, raw}, client} = Client.next_frame(client, 2_000)
+    {{:text, raw}, client} = Client.next_frame(client, @recv_timeout)
     assert decode_text({:text, raw})["type"] == "auth_invalid"
 
-    {frame, _client} = Client.next_frame(client, 2_000)
+    {frame, _client} = Client.next_frame(client, @recv_timeout)
     assert match?({:close, 1000, _}, frame)
     assert DialCounter.count() == 0
   end
@@ -469,18 +477,18 @@ defmodule Vagus.API.CoreProxyWSTest do
     token = addon_token("cp_ws_api_password", %{homeassistant_api: true})
 
     {:ok, client, _headers} = Client.connect(host, port, "/core/websocket")
-    {{:text, _auth_required}, client} = Client.next_frame(client, 2_000)
+    {{:text, _auth_required}, client} = Client.next_frame(client, @recv_timeout)
 
     client = Client.send_frame(client, {:text, Jason.encode!(%{"api_password" => token})})
 
-    {{:text, raw}, _client} = Client.next_frame(client, 2_000)
+    {{:text, raw}, _client} = Client.next_frame(client, @recv_timeout)
     assert decode_text({:text, raw})["type"] == "auth_ok"
 
     # `DialCounter` is bumped by `FakeCore`'s route handler, which runs
     # before `CoreHandshakeHandler.init/1` sends `:core_init` — waiting for
     # that message is what makes the count assertion below race-free
     # instead of racing `Upstream`'s own asynchronous dial.
-    assert_receive {:core_init, _core_pid}, 2_000
+    assert_receive {:core_init, _core_pid}, @recv_timeout
     assert DialCounter.count() == 1
   end
 
@@ -496,12 +504,12 @@ defmodule Vagus.API.CoreProxyWSTest do
     Application.put_env(:vagus, :core_ws_auth_timeout, 100)
 
     {:ok, client, _headers} = Client.connect(host, port, "/core/websocket")
-    {{:text, _auth_required}, client} = Client.next_frame(client, 2_000)
+    {{:text, _auth_required}, client} = Client.next_frame(client, @recv_timeout)
 
-    {{:text, raw}, client} = Client.next_frame(client, 2_000)
+    {{:text, raw}, client} = Client.next_frame(client, @recv_timeout)
     assert decode_text({:text, raw})["type"] == "auth_invalid"
 
-    {frame, _client} = Client.next_frame(client, 2_000)
+    {frame, _client} = Client.next_frame(client, @recv_timeout)
     assert match?({:close, 1000, _}, frame)
     assert DialCounter.count() == 0
   end
@@ -515,12 +523,12 @@ defmodule Vagus.API.CoreProxyWSTest do
     token = addon_token("cp_ws_close_code", %{homeassistant_api: true})
 
     {:ok, client, _headers} = Client.connect(host, port, "/core/websocket")
-    {{:text, _auth_required}, client} = Client.next_frame(client, 2_000)
+    {{:text, _auth_required}, client} = Client.next_frame(client, @recv_timeout)
     client = Client.send_frame(client, {:text, Jason.encode!(%{"access_token" => token})})
-    {{:text, _auth_ok}, client} = Client.next_frame(client, 2_000)
+    {{:text, _auth_ok}, client} = Client.next_frame(client, @recv_timeout)
 
     client = Client.send_frame(client, {:text, "close:4002:bye"})
-    {frame, _client} = Client.next_frame(client, 2_000)
+    {frame, _client} = Client.next_frame(client, @recv_timeout)
 
     assert {:close, 4002, "bye"} = frame
   end
@@ -532,15 +540,15 @@ defmodule Vagus.API.CoreProxyWSTest do
     token = addon_token("cp_ws_caller_close", %{homeassistant_api: true})
 
     {:ok, client, _headers} = Client.connect(host, port, "/core/websocket")
-    {{:text, _auth_required}, client} = Client.next_frame(client, 2_000)
+    {{:text, _auth_required}, client} = Client.next_frame(client, @recv_timeout)
     client = Client.send_frame(client, {:text, Jason.encode!(%{"access_token" => token})})
-    {{:text, _auth_ok}, client} = Client.next_frame(client, 2_000)
+    {{:text, _auth_ok}, client} = Client.next_frame(client, @recv_timeout)
 
-    assert_receive {:core_init, _core_pid}, 2_000
+    assert_receive {:core_init, _core_pid}, @recv_timeout
 
     _client = Client.send_frame(client, :close)
 
-    assert_receive {:core_terminate, _reason}, 2_000
+    assert_receive {:core_terminate, _reason}, @recv_timeout
   end
 
   ## 6. Aliases
@@ -568,7 +576,7 @@ defmodule Vagus.API.CoreProxyWSTest do
 
   defp assert_receive_auth_required(host, port, path) do
     {:ok, client, _headers} = Client.connect(host, port, path)
-    {{:text, raw}, _client} = Client.next_frame(client, 2_000)
+    {{:text, raw}, _client} = Client.next_frame(client, @recv_timeout)
     assert Jason.decode!(raw)["type"] == "auth_required"
   end
 
@@ -599,16 +607,16 @@ defmodule Vagus.API.CoreProxyWSTest do
     token = addon_token("cp_ws_core_rejects", %{homeassistant_api: true})
 
     {:ok, client, _headers} = Client.connect(host, port, "/core/websocket")
-    {{:text, _auth_required}, client} = Client.next_frame(client, 2_000)
+    {{:text, _auth_required}, client} = Client.next_frame(client, @recv_timeout)
     client = Client.send_frame(client, {:text, Jason.encode!(%{"access_token" => token})})
 
-    {{:text, raw}, client} = Client.next_frame(client, 2_000)
+    {{:text, raw}, client} = Client.next_frame(client, @recv_timeout)
     assert Jason.decode!(raw)["type"] == "auth_ok"
 
-    assert_receive {:core_init, _core_pid}, 2_000
+    assert_receive {:core_init, _core_pid}, @recv_timeout
     assert DialCounter.count() == 1
 
-    {frame, _client} = Client.next_frame(client, 2_000)
+    {frame, _client} = Client.next_frame(client, @recv_timeout)
     assert match?({:close, 1011, _}, frame)
   end
 end
