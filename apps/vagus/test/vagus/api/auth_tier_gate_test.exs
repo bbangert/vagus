@@ -308,5 +308,77 @@ defmodule Vagus.API.AuthTierGateTest do
       conn = conn(:get, "/addons/core_mqtt/icon") |> Router.call(@opts)
       refute conn.status in [401, 403]
     end
+
+    # Audit B1 (phase 8). `/supervisor/ping` is now exempted the same way the
+    # icon/logo GETs are — no token, no tier — because upstream's
+    # `no_security_check` answers it before `token_validation` runs at all.
+    test "the ping exemption runs ahead of the gate with no token at all" do
+      conn = conn(:get, "/supervisor/ping") |> Router.call(@opts)
+      assert conn.status == 200
+      assert Jason.decode!(conn.resp_body)["result"] == "ok"
+    end
+
+    test "ping does not grade even a token that IS present" do
+      # Exactly upstream's `request[REQUEST_FROM] = None` on this path: the
+      # short-circuit happens BEFORE token handling, so a caller that does
+      # carry a token — genuine or garbage — still isn't graded. Looks wrong
+      # at a glance; it is what upstream does.
+      assert call(:get, "/supervisor/ping", Token.get()).status == 200
+      assert call(:get, "/supervisor/ping", "not-a-real-token").status == 200
+      assert call_as_core(:get, "/supervisor/ping").status == 200
+    end
+
+    test "a non-GET on the same path is NOT carved out" do
+      # Method IS consulted for the carve-out itself (unlike `Tiers.required/1`
+      # over the table) — `unauthenticated?/1` matches `method: "GET"`
+      # explicitly, mirroring the icon/logo exemption's same restriction.
+      conn = conn(:post, "/supervisor/ping") |> Router.call(@opts)
+      assert conn.status == 401
+    end
+  end
+
+  # Security review finding (phase 8, NEW — not from the 2026-07-29 audit).
+  # Upstream's `BLACKLIST` in `security.py` refuses these paths for every
+  # caller, Core included, before a token is even read. Vagus has no
+  # Core-API proxy yet, so nothing serves them today; the deny must predate
+  # the feature landing, or `Tiers.required/1`'s `:admin` catch-all would let
+  # an admin-role add-on reach a proxy hop that comes back as Core.
+  describe "BLACKLIST" do
+    @blacklisted ["/core/api/hassio/anything", "/homeassistant/api/hassio/x"]
+
+    test "refused with a supervisor token" do
+      for path <- @blacklisted do
+        assert call_as_core(:get, path).status == 403, "#{path} was reachable by Core"
+      end
+    end
+
+    test "refused with an add-on token" do
+      token = addon_token("blacklist_addon", %{hassio_api: true, hassio_role: "admin"})
+
+      for path <- @blacklisted do
+        assert call(:get, path, token).status == 403, "#{path} was reachable by an add-on"
+      end
+    end
+
+    test "refused with NO token — proof it runs before token validation" do
+      # The property that matters: an unauthenticated request to any other
+      # path gets 401 (see "a missing token is still 401" above). Getting
+      # 403 here instead, not 401, is the evidence that `Vagus.API.Auth.call/2`
+      # checked `Tiers.blacklisted?/1` before it ever tried to resolve a
+      # caller.
+      for path <- @blacklisted do
+        conn = conn(:get, path) |> Router.call(@opts)
+        assert conn.status == 403, "#{path} answered #{conn.status} with no token"
+      end
+    end
+
+    test "a near-miss is not blacklisted, with or without a token" do
+      for path <- ["/core/api/other", "/core/apixhassio"] do
+        refute call_as_core(:get, path).status == 403, "#{path} was wrongly blacklisted for Core"
+
+        conn = conn(:get, path) |> Router.call(@opts)
+        refute conn.status == 403, "#{path} was wrongly blacklisted with no token"
+      end
+    end
   end
 end

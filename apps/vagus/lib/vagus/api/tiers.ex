@@ -133,15 +133,17 @@ defmodule Vagus.API.Tiers do
     {["discovery", :*], :bypass},
     {["auth"], :bypass},
 
-    # -- no_security_check, minus what `Vagus.API.Auth` handles itself --------
-    # `/supervisor/ping` is a literal member of upstream's `no_security_check`
-    # (security.py L166) — served with no token at all. Vagus still requires
-    # one (audit B1, deferred to this plan's phase 8); until that changes, the
-    # route must at least not acquire a *role* on top of the token it should
-    # not be asking for. The icon/logo GETs are the other `no_security_check`
-    # members Vagus serves, and `Vagus.API.Auth.unauthenticated?/1` short-
-    # circuits those before this table is ever consulted.
-    {["supervisor", "ping"], :bypass},
+    # -- no_security_check ----------------------------------------------------
+    # `/supervisor/ping` WAS here as `:bypass` (audit B1's interim state: still
+    # token-gated, but not role-graded on top). Phase 8 made it genuinely
+    # token-free — `Vagus.API.Auth.unauthenticated?/1` now short-circuits it
+    # before this table is ever consulted, same as the icon/logo GETs, the
+    # other `no_security_check` member Vagus serves — so the row is DELETED
+    # rather than left behind: a route answered pre-table has no tier to pin,
+    # and a leftover `:bypass` entry reads as "still needs a token, just no
+    # role", which is no longer true. If you are diffing this file against
+    # `security.py` and expected to find `/supervisor/ping` here, it is not
+    # missing — see `Vagus.API.Auth`'s moduledoc instead.
 
     # -- Vagus stricter than upstream: supervisor-only (deliberate) -----------
     # Every entry here is a route the router already gated with
@@ -251,6 +253,59 @@ defmodule Vagus.API.Tiers do
     # `/ingress/panels` (audit A5) and `/reload_updates` are admin-tier here
     # for exactly this reason — neither appears in the V1 manager list.
   ]
+
+  # `security.py`'s `BLACKLIST`, checked before EVERYTHING else — before
+  # `no_security_check`, before `token_validation`'s Core-token branch, before
+  # a caller is even identified:
+  #
+  #     BLACKLIST: Final = re.compile(
+  #         r"^(?:/v2)?(?:"
+  #         r"|/homeassistant/api/hassio/.*"
+  #         r"|/core/api/hassio/.*"
+  #         r")$"
+  #     )
+  #     ...
+  #     if BLACKLIST.match(request.path):
+  #         _LOGGER.error("%s is blacklisted!", request.path)
+  #         raise HTTPForbidden
+  #
+  # These two paths are Supervisor's proxy *into* Core's REST API, and
+  # `api/hassio/...` inside Core is Core's proxy *back* to the Supervisor API,
+  # called with Core's own supervisor token. Left reachable once Vagus grows a
+  # Core-API proxy, a caller could loop through it and have the second hop
+  # arrive as Core — the highest tier, bypassing the whole lattice below. No
+  # live exposure today (Vagus has no Core-API proxy yet), but the deny must
+  # predate the feature, or `required/1`'s `:admin` catch-all is worse than
+  # upstream's default: `:admin` is satisfied by an admin-role add-on, where
+  # upstream's `BLACKLIST` refuses literally everyone.
+  #
+  # `:v2` prefixing is upstream's; Vagus serves only the V1 surface (see this
+  # module's moduledoc), so `path_info` never carries a leading `v2` segment
+  # and the patterns below omit it — nothing is served under it to blacklist.
+  @blacklist [
+    ["core", "api", "hassio", :*],
+    ["homeassistant", "api", "hassio", :*]
+  ]
+
+  @doc """
+  Whether `path_info` is one of upstream's `BLACKLIST` paths — refused for
+  EVERY caller, Core included, before a token is even read.
+
+  Deliberately a separate predicate, not a `requirement` fed through
+  `allows?/2`. `allows?(:supervisor, _requirement)` is that function's FIRST
+  clause — any requirement is satisfied by the supervisor caller — so a deny
+  expressed as a requirement would need its check inserted ABOVE that clause,
+  a lattice-ordering detail a future edit could reorder by accident without
+  the compiler ever complaining. Upstream itself checks `BLACKLIST` before
+  `token_validation` identifies a caller at all, i.e. structurally before the
+  lattice exists for this request; a separate predicate, checked first by
+  `Vagus.API.Auth.call/2`, is the same shape and cannot be weakened by a
+  change to `allows?/2`'s clause order.
+  """
+  @spec blacklisted?([String.t()]) :: boolean()
+  def blacklisted?(path_info) when is_list(path_info) do
+    Enum.any?(@blacklist, &match_path?(&1, path_info))
+  end
 
   @doc """
   The tier a request path demands.
