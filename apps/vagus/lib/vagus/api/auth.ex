@@ -59,7 +59,7 @@ defmodule Vagus.API.Auth do
   require Logger
 
   alias Vagus.Addon.Registry
-  alias Vagus.API.{Envelope, Tiers, Token}
+  alias Vagus.API.{Envelope, SourceGuard, Tiers, Token}
 
   @impl Plug
   def init(opts), do: opts
@@ -133,18 +133,38 @@ defmodule Vagus.API.Auth do
   defp asset?(kind, slug),
     do: kind in @unauthenticated_asset_kinds and Vagus.Addon.Config.valid_slug?(slug)
 
-  # Mirrors upstream's `_LOGGER.error("%s is blacklisted!", request.path)`,
-  # but deliberately without the path: an attacker-controlled path is exactly
-  # the per-request byte string phase 7 identified as a pre-auth
-  # RingLogger-flush primitive (`Vagus.API.SourceGuard`'s `record_refusal/1`
-  # doc; `Vagus.API.Dispatcher`'s `report_filtered/2` sanitizes for the same
-  # reason before it will log one). `Dispatcher`'s sanitizer is private to
-  # that module and reused nowhere else, so rather than exporting it for one
-  # call site, this logs a static message — which of the two blacklisted
-  # patterns matched carries no more information than the 403 itself already
-  # gives a prober, so nothing is lost by leaving it out.
+  # Upstream logs `_LOGGER.error("%s is blacklisted!", request.path)` per
+  # request. Vagus does NOT, and the path is only half the reason.
+  #
+  # Omitting the path is obvious: an attacker-controlled byte string in a
+  # pre-auth log line is the RingLogger-flush primitive phase 7 named
+  # (security-phase7.md H1). But a *static* message per request is still one
+  # ring slot per request from a caller that needs no credential and can
+  # repeat at will — the volume is the primitive, not just the content, and
+  # this shipped as `Logger.error` until review caught it (PR #34). Upstream
+  # can afford per-request logging because it logs to a container's rotated
+  # journald; RingLogger is fixed-size and is the only forensic record on a
+  # Nerves device.
+  #
+  # So this counts, exactly as `Vagus.API.Dispatcher`'s `report_filtered/2`
+  # does for the exploit filter, sharing that one counter and its single
+  # per-tick summary line. The label is a compile-time constant naming the
+  # family — never `conn.path_info` — so no sanitizer is needed and none is
+  # borrowed from `Dispatcher` (its own is private and reused nowhere else).
+  #
+  # The `enabled?/0` split matches `report_filtered/2`'s and is deliberate:
+  # on device the counter is running and the ring is worth protecting; on
+  # `:host`/`:test` the counter process does not exist (`start_link/1` returns
+  # `:ignore`) and there is no ring to flush, so a developer gets the line.
+  @blacklist_label "api/hassio proxy path"
+
   defp refuse_blacklisted(conn) do
-    Logger.error("Vagus.API.Auth: request path is blacklisted")
+    if SourceGuard.enabled?() do
+      SourceGuard.record_filtered(:blacklist, @blacklist_label)
+    else
+      Logger.warning("Vagus.API.Auth: refused a blacklisted #{@blacklist_label}")
+    end
+
     Envelope.send_error(conn, "unauthorized", 403)
   end
 

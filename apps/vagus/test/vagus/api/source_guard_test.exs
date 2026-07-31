@@ -212,6 +212,32 @@ defmodule Vagus.API.SourceGuardTest do
       assert length(String.split(log, "filtered ")) == 2
     end
 
+    # PR #34 review (Copilot): `Vagus.API.Tiers.blacklisted?/1` refusals shipped
+    # as a per-request `Logger.error` in `Vagus.API.Auth`, which is the same
+    # pre-auth ring-eviction primitive this counter exists to deny — the volume
+    # is the primitive, not only the content. They now share this counter, so
+    # the bucket has to survive alongside the filter's own two.
+    test "blacklist refusals share the counter and the single summary line" do
+      import ExUnit.CaptureLog
+
+      start_supervised!({SourceGuard, name: SourceGuard})
+      marker = "blacklist-sample-#{System.unique_integer([:positive])}"
+
+      log =
+        capture_log(fn ->
+          for _ <- 1..7, do: SourceGuard.record_filtered(:blacklist, marker)
+          for _ <- 1..2, do: SourceGuard.record_filtered(:path, marker)
+          send(SourceGuard, :refresh)
+          _ = :sys.get_state(SourceGuard)
+        end)
+
+      assert log =~ "filtered 9 request(s)"
+      assert log =~ "blacklist: 7"
+      assert log =~ "path: 2"
+      # Still ONE line for all nine, which is the whole point.
+      assert length(String.split(log, "filtered ")) == 2
+    end
+
     test "record_filtered/2 is a no-op when the guard isn't running" do
       # No `start_supervised!` here — mirrors the existing "safe when
       # disabled" property `record_refusal/1` already has: casting to an
