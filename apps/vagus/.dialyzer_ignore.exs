@@ -88,6 +88,13 @@
   {"lib/vagus/backend/host/nerves.ex", :pattern_match},
   {"lib/vagus/ingress/ws_bridge.ex", :pattern_match},
   {"lib/vagus/ingress/ws_bridge.ex", :unused_fun},
+  # core_proxy/ws_bridge.ex:589 is the SAME Mint.WebSocket.new opaque-type
+  # nitpick as ingress/ws_bridge.ex above — its `{:error, conn, _reason}`
+  # branch reads as unreachable because Mint types `new/4` as only ever
+  # succeeding. The Core-side WS leg (vagus-core-api-proxy) mirrors the
+  # ingress bridge's Upstream shape; same typing story, same non-defect. The
+  # REST module (`lib/vagus/api/core_proxy.ex`) is clean and needs no entry.
+  {"lib/vagus/api/core_proxy/ws_bridge.ex", :pattern_match},
   {"lib/vagus/core/events.ex", :call_without_opaque},
 
   # ── Root 3: benign dead defensive checks ────────────────────────────────

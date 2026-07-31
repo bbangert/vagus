@@ -49,7 +49,8 @@ defmodule Vagus.Addon.RegistryTest do
         "auth_api" => true,
         "discovery" => ["mqtt"],
         "hassio_api" => true,
-        "hassio_role" => "manager"
+        "hassio_role" => "manager",
+        "homeassistant_api" => true
       })
 
     assert Registry.identity_from_config(config) == %{
@@ -58,8 +59,29 @@ defmodule Vagus.Addon.RegistryTest do
              auth_api: true,
              discovery: ["mqtt"],
              hassio_api: true,
-             hassio_role: "manager"
+             hassio_role: "manager",
+             homeassistant_api: true
            }
+  end
+
+  # `.claude/plans/vagus-core-api-proxy/plan.md` phase 1: `homeassistant_api`
+  # is what the Core-API proxy's `_check_access` equivalent grades a caller
+  # with, and it's the same shape of gap `hassio_api`/`hassio_role` were
+  # before the 2026-07-29 audit — `Vagus.Addon.Config` parsed it, but
+  # `identity_from_config/1` dropped it because nothing consumed it yet.
+  test "identity_from_config carries homeassistant_api through" do
+    {:ok, config} =
+      Config.parse(%{
+        "name" => "M",
+        "version" => "1",
+        "slug" => "core_ha_api",
+        "description" => "d",
+        "arch" => ["amd64"],
+        "image" => "x/y",
+        "homeassistant_api" => true
+      })
+
+    assert %{homeassistant_api: true} = Registry.identity_from_config(config)
   end
 
   # `hassio_api`/`hassio_role` are what `Vagus.API.Tiers` grades a caller
@@ -78,6 +100,7 @@ defmodule Vagus.Addon.RegistryTest do
         "image" => "x/y"
       })
 
-    assert %{hassio_api: false, hassio_role: "default"} = Registry.identity_from_config(config)
+    assert %{hassio_api: false, hassio_role: "default", homeassistant_api: false} =
+             Registry.identity_from_config(config)
   end
 end

@@ -11,9 +11,10 @@ defmodule Vagus.Addon.Registry do
   supervisor token itself.
 
   Identity: `%{slug, services_role: %{service => role}, auth_api: bool,
-  discovery: [service], hassio_api: bool, hassio_role: role}` — derived from
-  the add-on's `config.yaml`
-  (`services`/`auth_api`/`discovery`/`hassio_api`/`hassio_role`).
+  discovery: [service], hassio_api: bool, hassio_role: role,
+  homeassistant_api: bool}` — derived from the add-on's `config.yaml`
+  (`services`/`auth_api`/`discovery`/`hassio_api`/`hassio_role`/
+  `homeassistant_api`).
 
   `hassio_api`/`hassio_role` are what `Vagus.API.Tiers` grades the caller with.
   `Vagus.Addon.Config` has parsed both since M4, but this struct dropped them,
@@ -22,6 +23,19 @@ defmodule Vagus.Addon.Registry do
   (the 2026-07-29 audit's A1/A2). Carrying them is additive: nothing is
   persisted from here, so a running add-on simply re-registers with the two
   extra keys on its next start.
+
+  `homeassistant_api` is the same shape of gap, found later: `Vagus.Addon.Config`
+  has parsed it since M4 too (`config.ex:67`'s typespec, `:116`'s `false`
+  default, `:315`'s parse clause), but this struct dropped it exactly the way
+  it dropped `hassio_api`/`hassio_role` before the audit's phase 1 — nothing
+  downstream consumed the flag, so nobody noticed the identity map didn't
+  carry it. Something now does: the Core-API proxy's `/core/api/*` auth model
+  (`.claude/plans/vagus-core-api-proxy/plan.md` fact 2) is the *inverse* of
+  every other add-on-facing route family — instead of grading a `hassio_role`
+  against `Vagus.API.Tiers`, it checks this one boolean directly, and an
+  add-on that never declared it must resolve to `false` (closed), never `nil`
+  (which `Map.get/3`'s default already guarantees for an identity built before
+  this field existed).
   """
 
   use GenServer
@@ -33,7 +47,8 @@ defmodule Vagus.Addon.Registry do
           auth_api: boolean(),
           discovery: [String.t()],
           hassio_api: boolean(),
-          hassio_role: String.t()
+          hassio_role: String.t(),
+          homeassistant_api: boolean()
         }
 
   def start_link(opts \\ []) do
@@ -83,7 +98,8 @@ defmodule Vagus.Addon.Registry do
       auth_api: config.auth_api,
       discovery: config.discovery,
       hassio_api: config.hassio_api,
-      hassio_role: config.hassio_role
+      hassio_role: config.hassio_role,
+      homeassistant_api: config.homeassistant_api
     }
   end
 
