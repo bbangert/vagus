@@ -832,16 +832,21 @@ defmodule Vagus.API.CoreProxyTest do
       assert find_header(resp.headers, "x-accel-buffering") == nil
     end
 
-    test "GET /core/api/stream: no request content-type -> application/octet-stream", %{
-      proxy_base: base
-    } do
+    test "GET /core/api/stream: no request content-type -> empty (upstream's raw-header quirk)",
+         %{
+           proxy_base: base
+         } do
       token = addon_token("cp_stream_ct_default", %{homeassistant_api: true})
       Script.set(200, [{"content-type", "application/json"}], "{}")
 
       {:ok, resp} = finch_req(:get, "#{base}/core/api/stream", [bearer(token)])
 
       assert resp.status == 200
-      assert find_header(resp.headers, "content-type") == "application/octet-stream"
+      # fact 7: upstream sets the `/stream` response content-type from the RAW
+      # request header, `request.headers.get(CONTENT_TYPE, "")` — so with no
+      # request content-type it is the empty string, NOT Core's own
+      # `application/json`. Mirrored verbatim, not "fixed" to octet-stream.
+      assert find_header(resp.headers, "content-type") == ""
     end
 
     test "POST /core/api/stream -> 405, fake Core never hit — the dedicated GET-only resource",

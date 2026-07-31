@@ -454,13 +454,17 @@ defmodule Vagus.API.CoreProxy do
 
   # fact 7's quirk, mirrored not fixed: upstream's `/core/api/stream` handler
   # sets the response `content_type` from the REQUEST's own `Content-Type`,
-  # never from Core's response. aiohttp's `request.content_type` defaults to
-  # `application/octet-stream` when the caller sent none at all — mirrored
-  # here rather than falling back to Core's declared type.
+  # never from Core's response — and specifically from the RAW header,
+  # `request.headers.get(CONTENT_TYPE, "")` (`supervisor/api/proxy.py`'s
+  # `stream()`), NOT aiohttp's parsed `request.content_type` property. So any
+  # `; charset=...` parameter the caller sent is preserved verbatim rather than
+  # stripped, and the no-`Content-Type` default is upstream's literal `""`
+  # (aiohttp then emits an empty `Content-Type` on the event stream — the quirk
+  # mirrored, not "fixed" up to `application/octet-stream`).
   defp request_content_type(conn) do
     case get_req_header(conn, "content-type") do
       [ct | _] -> ct
-      [] -> "application/octet-stream"
+      [] -> ""
     end
   end
 
@@ -745,7 +749,15 @@ defmodule Vagus.API.CoreProxy do
   # simply has no check for — the trust story is identical.
   # sobelow_skip ["XSS.SendResp"]
   defp send_buffered_response(acc) do
-    body = acc.data |> Enum.reverse() |> IO.iodata_to_binary()
+    # `acc.data` is the response chunks newest-first (O(1) prepend in the
+    # `{:data, _}` buffer clause); reversed it is a correctly-ordered iolist.
+    # Handed straight to `send_resp/3` (whose body is `iodata`) rather than
+    # flattened with `IO.iodata_to_binary/1`: this server runs Bandit with
+    # compression off (`Vagus.API.Supervisor`), so Bandit writes the iolist to
+    # the socket as-is — `IO.iodata_length/1` for the content-length, no copy
+    # (`deps/bandit/lib/bandit/adapter.ex` `send_resp/4`). Pre-flattening would
+    # be a redundant full-body allocation on every buffered proxied response.
+    body = Enum.reverse(acc.data)
 
     conn =
       acc.conn

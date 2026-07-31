@@ -694,8 +694,16 @@ defmodule Vagus.API.CoreProxy.WSBridge.Upstream do
 
   defp handle_frames([{:ping, data} | rest], state) do
     case do_send_frame(:pong, data, state) do
-      {:ok, state} -> handle_frames(rest, state)
-      {:error, state} -> {:stop, state}
+      {:ok, state} ->
+        handle_frames(rest, state)
+
+      # Same explicit-close discipline as every other terminal path here (and
+      # as `send_core_auth`'s failure branch): notify `WSBridge` with the
+      # 1011-mapped abnormal-loss message before stopping, rather than leaning
+      # on the process link's `{:EXIT, ...}` fallback to produce the close.
+      {:error, state} ->
+        send(state.parent, {:upstream_close, 1011, ""})
+        {:stop, state}
     end
   end
 

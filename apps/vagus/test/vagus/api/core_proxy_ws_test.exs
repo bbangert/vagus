@@ -549,7 +549,6 @@ defmodule Vagus.API.CoreProxyWSTest do
     proxy_host: host,
     proxy_port: port
   } do
-    {:ok, _client, _headers} = Client.connect(host, port, "/core/api/websocket")
     assert_receive_auth_required(host, port, "/core/api/websocket")
   end
 
