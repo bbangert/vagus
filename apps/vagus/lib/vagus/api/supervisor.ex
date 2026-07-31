@@ -77,6 +77,16 @@ defmodule Vagus.API.Supervisor do
           # per-request option — it has to be a second instance.
           # `Vagus.API.IngressProxy` picks between them per request.
           {Finch, name: Vagus.Ingress.LocalFinch, pools: %{default: [size: 4]}},
+          # `Vagus.API.CoreProxy`'s own pool, dedicated rather than sharing
+          # `Vagus.Core.Finch` — that pool's other users (the Core watchdog
+          # probe, `Vagus.Core.Client`'s token exchange) are frequent, cheap
+          # calls, and a proxied request routed through `CoreProxy` can hold a
+          # connection open for up to its own 300s REST timeout. Sharing a
+          # pool would let one slow proxied call starve either of those. No
+          # source bind here — Core is always reached on localhost, never the
+          # `hassio` bridge, so there's no bridge-vs-loopback split to make
+          # (unlike the two pools above).
+          {Finch, name: Vagus.API.CoreProxy.Finch, pools: %{default: [size: 4]}},
           {
             Bandit,
             # Upstream's aiohttp server never negotiates response compression,

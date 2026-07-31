@@ -40,6 +40,35 @@ defmodule Vagus.API.Dispatcher do
   forwarded with `rest == []` (the proxy builds the upstream root path `/`
   from that, see `Vagus.API.IngressProxy`).
 
+  `["core", "api" | rest]` and `["homeassistant", "api" | rest]`
+  (`.claude/plans/vagus-core-api-proxy/plan.md`) go through
+  `dispatch_core_proxy/2`, which checks `Vagus.API.Tiers.blacklisted?/1`
+  FIRST — against both the raw `path_info` and the percent-decoded path (see
+  `core_proxy_blacklisted?/1`'s own doc for why the decoded check exists) —
+  see that function's own doc and `Vagus.API.CoreProxy`'s moduledoc for why
+  this predates the proxy leg rather than living inside it — and only hands
+  an un-blacklisted request to `Vagus.API.CoreProxy`; a blacklisted one
+  goes to `Router` instead, so `Vagus.API.Auth.call/2`'s existing
+  `refuse_blacklisted/1` answers it (the counted-not-logged 403 envelope PR
+  #34 shipped and the device already proved). Duplicating that refusal here
+  would fork the same logic into two places that could drift.
+
+  `["core", "websocket"]` and `["homeassistant", "websocket"]` — the bare,
+  EXACT two-segment paths only, matching upstream's own route table (fact 9);
+  `/core/websocket/anything` is not a route upstream registers, so it falls
+  through to `Router` like any other unmatched path — also go through
+  `dispatch_core_proxy/2` to `Vagus.API.CoreProxy`. The blacklist check there
+  is a no-op for these paths (`Vagus.API.Tiers.blacklisted?/1` only matches
+  `.../hassio/.*`), but routing every `core`/`homeassistant` path through the
+  one `dispatch_core_proxy/2` entry point — rather than adding a second,
+  blacklist-free path just for WS — is the point: one place decides
+  "blacklisted or not" for this whole route family, so a future addition
+  here can't accidentally skip it. `CoreProxy.call/2` itself decides GET-only
+  and does the actual WS upgrade (`.../api/websocket` under
+  `["core"/"homeassistant", "api" | rest]` already reaches `CoreProxy`
+  through the clause above; only the bare two-segment alias needed a new
+  match here).
+
   ## The exploit filter runs here too, for the same reason
 
   `Vagus.API.ExploitFilter` (audit B6) is upstream's `aiohttp` middleware
@@ -84,14 +113,15 @@ defmodule Vagus.API.Dispatcher do
 
   require Logger
 
-  alias Vagus.API.{ExploitFilter, IngressProxy, Router, SourceGuard}
+  alias Vagus.API.{CoreProxy, ExploitFilter, IngressProxy, Router, SourceGuard, Tiers}
 
   # `Plug.Router.init/1`'s default implementation is the identity function
-  # (no state to precompute); `IngressProxy.init/1` is likewise a plain
-  # pass-through. Resolving both once at compile time keeps `call/2` free of
-  # any per-request `init/1` work.
+  # (no state to precompute); `IngressProxy.init/1`/`CoreProxy.init/1` are
+  # likewise plain pass-throughs. Resolving all three once at compile time
+  # keeps `call/2` free of any per-request `init/1` work.
   @router_opts Router.init([])
   @proxy_opts IngressProxy.init([])
+  @core_proxy_opts CoreProxy.init([])
 
   @impl Plug
   def init(opts), do: opts
@@ -177,8 +207,72 @@ defmodule Vagus.API.Dispatcher do
     IngressProxy.call(conn, @proxy_opts)
   end
 
+  defp dispatch(%Plug.Conn{path_info: ["core", "api" | _]} = conn, opts),
+    do: dispatch_core_proxy(conn, opts)
+
+  defp dispatch(%Plug.Conn{path_info: ["homeassistant", "api" | _]} = conn, opts),
+    do: dispatch_core_proxy(conn, opts)
+
+  defp dispatch(%Plug.Conn{path_info: ["core", "websocket"]} = conn, opts),
+    do: dispatch_core_proxy(conn, opts)
+
+  defp dispatch(%Plug.Conn{path_info: ["homeassistant", "websocket"]} = conn, opts),
+    do: dispatch_core_proxy(conn, opts)
+
   defp dispatch(conn, _opts) do
     Router.call(conn, @router_opts)
+  end
+
+  # The blacklist decision must precede `CoreProxy` — a blacklisted path must
+  # NEVER reach the proxy leg, since `Vagus.API.CoreProxy` has Core's admin
+  # credential and no blacklist check of its own (see its moduledoc). Handing
+  # a blacklisted request to `Router` instead of answering it here directly
+  # means `Vagus.API.Auth.call/2`'s existing `refuse_blacklisted/1` is the one
+  # and only place that refusal is implemented — the plan's risk note is
+  # explicit that this test must run against the real dispatcher path, not
+  # the predicate alone, which is exactly what `dispatch/2` above already
+  # guarantees for every other branch.
+  defp dispatch_core_proxy(conn, _opts) do
+    if core_proxy_blacklisted?(conn) do
+      Router.call(conn, @router_opts)
+    else
+      CoreProxy.call(conn, @core_proxy_opts)
+    end
+  end
+
+  # Upstream's `BLACKLIST` (`security.py`) matches the percent-DECODED
+  # `request.path` (yarl's `URL.path`), but `conn.path_info` is never
+  # decoded — Plug only splits on literal "/" bytes, same property
+  # `Vagus.API.IngressProxy.build_url/4`'s own `[DEVIATION ...]` note
+  # documents (no `URI.decode` anywhere in this stack) — and
+  # `CoreProxy.build_url/2` forwards the path to Core VERBATIM. Left as a
+  # literal-segment match alone, a caller could smuggle an encoded `hassio`
+  # segment straight past the deny — `GET /core/api/%68assio/config` or
+  # `GET /core/api/hassio%2fconfig` — only to have Core's own aiohttp
+  # percent-decode it back to `/api/hassio/...` and re-enter the Supervisor
+  # API as Core/admin, exactly the loop-back the blacklist exists to stop
+  # (security review Blocker).
+  #
+  # Checked against BOTH the raw and the decoded-then-resplit form. Raw
+  # catches the plain, unencoded `hassio` segment (what the existing tests
+  # already cover). Decoded catches every encoded spelling of it, INCLUDING
+  # an encoded slash (`%2f`), which decoding segment-by-segment would miss:
+  # a single decoded segment `"hassio/config"` does not match
+  # `["core","api","hassio",:*]`, but decoding the WHOLE path and
+  # re-splitting on "/" yields `["core","api","hassio","config"]`, which
+  # does — that is the entire reason this decodes the joined path rather
+  # than mapping `URI.decode/1` over `path_info` directly. Decoded exactly
+  # ONCE: `URI.decode/1` is lenient (an invalid `%zz` escape is left
+  # as-is, never raises) and, being a single pass, agrees with aiohttp/
+  # yarl's own single decode of the request line — `%2568` becomes `%68`
+  # on both sides, never `h` — so a caller cannot double-encode around this
+  # check any more than they can around upstream's.
+  defp core_proxy_blacklisted?(conn) do
+    Tiers.blacklisted?(conn.path_info) or Tiers.blacklisted?(decoded_path_segments(conn))
+  end
+
+  defp decoded_path_segments(conn) do
+    conn.request_path |> URI.decode() |> String.split("/", trim: true)
   end
 
   # Bare 403, no body: a caller we won't answer doesn't get told why. The
