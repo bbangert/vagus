@@ -72,15 +72,24 @@ defmodule Vagus.API.CoreProxyWSTest.CoreHandshakeHandler do
     do: {:push, {:binary, data}, state}
 
   defp handle_core_auth(token, state) do
-    if CoreAuthScript.get() == :invalid do
-      {:stop, :normal, {1000, ""}, [{:text, encode(%{"type" => "auth_invalid"})}], state}
-    else
-      if token == state.expected_token do
-        {:push, {:text, encode(%{"type" => "auth_ok", "ha_version" => "2026.7.3"})},
-         %{state | authed?: true}}
-      else
+    case CoreAuthScript.get() do
+      :invalid ->
         {:stop, :normal, {1000, ""}, [{:text, encode(%{"type" => "auth_invalid"})}], state}
-      end
+
+      # Consume the auth message but never reply `auth_ok` — holds
+      # `Vagus.API.CoreProxy.WSBridge.Upstream` in `ha_ready?: false` so the
+      # caller's frames pile up in `pending` (the pending-cap overflow test's
+      # window).
+      :stall ->
+        {:ok, state}
+
+      _ok ->
+        if token == state.expected_token do
+          {:push, {:text, encode(%{"type" => "auth_ok", "ha_version" => "2026.7.3"})},
+           %{state | authed?: true}}
+        else
+          {:stop, :normal, {1000, ""}, [{:text, encode(%{"type" => "auth_invalid"})}], state}
+        end
     end
   end
 
@@ -341,6 +350,8 @@ defmodule Vagus.API.CoreProxyWSTest do
       Application.delete_env(:vagus, :core_ws_test_pid)
       Application.delete_env(:vagus, :core_ws_expected_token)
       Application.delete_env(:vagus, :core_ws_auth_timeout)
+      Application.delete_env(:vagus, :core_ws_pending_max_frames)
+      Application.delete_env(:vagus, :core_ws_pending_max_bytes)
     end)
 
     %{proxy_host: "127.0.0.1", proxy_port: proxy_port}
@@ -615,6 +626,40 @@ defmodule Vagus.API.CoreProxyWSTest do
 
     assert_receive {:core_init, _core_pid}, @recv_timeout
     assert DialCounter.count() == 1
+
+    {frame, _client} = Client.next_frame(client, @recv_timeout)
+    assert match?({:close, 1011, _}, frame)
+  end
+
+  ## 9. Pending-buffer cap (review W3) — a caller flooding frames before Core
+  ## finishes its own handshake overflows the bounded `pending` buffer and is
+  ## closed 1011 rather than growing it without limit.
+
+  test "a flood before Core's auth_ok overflows the pending cap and closes the caller 1011",
+       %{proxy_host: host, proxy_port: port} do
+    # Core dials + upgrades but STALLS its `auth_ok`, so `Upstream` stays
+    # `ha_ready?: false` and every caller frame below buffers in `pending`.
+    CoreAuthScript.set(:stall)
+    # A tiny cap so a handful of frames overflow it; the 4th trips `frames > 3`.
+    Application.put_env(:vagus, :core_ws_pending_max_frames, 3)
+    token = addon_token("cp_ws_pending_flood", %{homeassistant_api: true})
+
+    {:ok, client, _headers} = Client.connect(host, port, "/core/websocket")
+    {{:text, _auth_required}, client} = Client.next_frame(client, @recv_timeout)
+    client = Client.send_frame(client, {:text, Jason.encode!(%{"access_token" => token})})
+
+    {{:text, raw}, client} = Client.next_frame(client, @recv_timeout)
+    assert Jason.decode!(raw)["type"] == "auth_ok"
+
+    assert_receive {:core_init, _core_pid}, @recv_timeout
+
+    # Exactly cap+1 frames: the 4th overflows and triggers the close. No frame
+    # is sent AFTER the overflow-triggering one, so no send races a socket the
+    # server is already tearing down.
+    client =
+      Enum.reduce(1..4, client, fn i, c ->
+        Client.send_frame(c, {:text, "flood-#{i}"})
+      end)
 
     {frame, _client} = Client.next_frame(client, @recv_timeout)
     assert match?({:close, 1011, _}, frame)

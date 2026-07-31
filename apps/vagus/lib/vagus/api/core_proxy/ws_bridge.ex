@@ -345,17 +345,17 @@ defmodule Vagus.API.CoreProxy.WSBridge.Upstream do
   those in `pending` (newest-first, flushed in order once `ha_ready?`
   flips) — the literal extension of `Vagus.Ingress.WSBridge.Upstream`'s own
   pending-buffer idiom the plan calls for, just gated on `ha_ready?` instead
-  of `upgraded?` alone. Unlike that module's own W3 hardening, this buffer
-  has no size/count cap. This is a DEFERRED FOLLOW-UP, not a permanent
-  design decision — `Vagus.Ingress.WSBridge.Upstream` only gained its W3
-  cap (`:pending_max_bytes`/`:pending_max_frames`) as a post-day-one review
-  finding, not at first ship, and this leg's caller is already an
-  authenticated add-on with `homeassistant_api: true` rather than an
-  anonymous browser, which narrows but does not eliminate the exposure (an
-  authorized-but-compromised or misbehaving add-on can still flood the
-  pre-`ha_ready?` window, bounded only by the shared ~10s auth deadline). A
-  future hardening pass should add the same size/frame cap here; no cap
-  code exists yet.
+  of `upgraded?` alone. It carries the same W3 cap as that module
+  (`:core_ws_pending_max_bytes` / `:core_ws_pending_max_frames`, defaulting to
+  4 MiB / 256): a cast that would push `pending` past either bound is folded
+  into the 1011-close path (`buffer_frame/3` → `:overflow`), so an
+  authorized-but-compromised or misbehaving add-on flooding the pre-`ha_ready?`
+  window cannot grow the buffer without limit and OOM a 1GB board. From the
+  caller's side a buffer-overflow disconnect and a transport-error disconnect
+  are indistinguishable, and needn't be. The window this bounds is already
+  short (the shared ~10s auth deadline), and the caller is an authenticated
+  `homeassistant_api: true` add-on rather than an anonymous browser — but the
+  cap costs nothing and closes the OOM primitive regardless.
 
   ## Heartbeat (fact 8's `heartbeat=30`)
 
@@ -387,6 +387,12 @@ defmodule Vagus.API.CoreProxy.WSBridge.Upstream do
   @heartbeat_interval_ms 30_000
   @core_ws_path "/api/websocket"
 
+  # review W3 defaults — see the moduledoc's "Pending caller frames" section.
+  # Mirrors `Vagus.Ingress.WSBridge.Upstream`'s own `:pending_max_bytes` /
+  # `:pending_max_frames`.
+  @default_pending_max_bytes 4 * 1024 * 1024
+  @default_pending_max_frames 256
+
   @typedoc "State for the Core-side Mint.WebSocket connection GenServer."
   @type state :: %{
           parent: pid(),
@@ -400,7 +406,13 @@ defmodule Vagus.API.CoreProxy.WSBridge.Upstream do
           ha_ready?: boolean(),
           # Newest-first (prepended on cast, reversed on flush) — same
           # convention as `Vagus.Ingress.WSBridge.Upstream`'s own `pending`.
-          pending: [{WebSock.data_opcode(), binary()}]
+          # `pending_frames`/`pending_bytes` track its size against the W3 cap
+          # without an O(n) recount per cast.
+          pending: [{WebSock.data_opcode(), binary()}],
+          pending_frames: non_neg_integer(),
+          pending_bytes: non_neg_integer(),
+          pending_max_bytes: pos_integer(),
+          pending_max_frames: pos_integer()
         }
 
   @spec start_link(%{required(:parent) => pid()}) :: {:ok, pid()} | {:error, term()}
@@ -442,7 +454,13 @@ defmodule Vagus.API.CoreProxy.WSBridge.Upstream do
            upgraded?: false,
            auth_sent?: false,
            ha_ready?: false,
-           pending: []
+           pending: [],
+           pending_frames: 0,
+           pending_bytes: 0,
+           pending_max_bytes:
+             Application.get_env(:vagus, :core_ws_pending_max_bytes, @default_pending_max_bytes),
+           pending_max_frames:
+             Application.get_env(:vagus, :core_ws_pending_max_frames, @default_pending_max_frames)
          }}
 
       {:error, reason} ->
@@ -480,10 +498,19 @@ defmodule Vagus.API.CoreProxy.WSBridge.Upstream do
   Buffered (see moduledoc's "Pending caller frames") until `ha_ready?`;
   sent immediately otherwise. A send failure is treated exactly like a
   decoded transport error from Core: notify `WSBridge` with the 1011-mapped
-  abnormal-loss message and stop.
+  abnormal-loss message and stop. Overflowing the W3 cap
+  (`:core_ws_pending_max_bytes` / `:core_ws_pending_max_frames`) folds into
+  that same 1011-close path — see `buffer_frame/3`.
   """
   def handle_cast({:frame, op, data}, %{ha_ready?: false} = state) do
-    {:noreply, %{state | pending: [{op, data} | state.pending]}}
+    case buffer_frame(op, data, state) do
+      {:ok, state} ->
+        {:noreply, state}
+
+      :overflow ->
+        send(state.parent, {:upstream_close, 1011, ""})
+        {:stop, :normal, state}
+    end
   end
 
   def handle_cast({:frame, op, data}, %{ha_ready?: true} = state) do
@@ -753,11 +780,36 @@ defmodule Vagus.API.CoreProxy.WSBridge.Upstream do
     end
   end
 
+  # review W3 (mirrors `Vagus.Ingress.WSBridge.Upstream.buffer_frame/3`):
+  # prepend the frame and track the running frame/byte totals, refusing with
+  # `:overflow` once either cap is exceeded rather than growing `pending`
+  # without bound. `byte_size(data)` only — the small per-frame opcode/tuple
+  # overhead isn't counted, exactly as the ingress cap doesn't; the 4 MiB /
+  # 256 defaults have ample headroom for that.
+  defp buffer_frame(op, data, state) do
+    frames = state.pending_frames + 1
+    bytes = state.pending_bytes + byte_size(data)
+
+    if frames > state.pending_max_frames or bytes > state.pending_max_bytes do
+      :overflow
+    else
+      {:ok,
+       %{
+         state
+         | pending: [{op, data} | state.pending],
+           pending_frames: frames,
+           pending_bytes: bytes
+       }}
+    end
+  end
+
   # Flushes frames buffered while `ha_ready?` was still false, in send
   # order (`pending` is newest-first — see moduledoc). Reuses the same
   # `{:continue, state} | {:stop, state}` protocol as `process_response/2`.
+  # Resets the W3 counters alongside `pending` — the buffer is drained here
+  # and every later frame goes straight out via `do_send_frame/3`.
   defp flush_pending(%{pending: pending} = state) do
-    fresh_state = %{state | pending: []}
+    fresh_state = %{state | pending: [], pending_frames: 0, pending_bytes: 0}
 
     result =
       pending

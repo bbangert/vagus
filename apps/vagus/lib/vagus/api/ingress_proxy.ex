@@ -566,8 +566,9 @@ defmodule Vagus.API.IngressProxy do
   # audit F4: the default (non-streaming) request-body path. Buffers up to
   # `request_body_cap/0` bytes — 16 MiB by default, matching upstream's
   # aiohttp `MAX_CLIENT_SIZE` (`supervisor/api/__init__.py:48`) — via
-  # `Plug.Conn.read_body/2`, then hands Finch a plain binary so it computes
-  # a real `Content-Length` instead of forcing chunked framing. Runs
+  # `Plug.Conn.read_body/2`, then hands Finch the accumulated chunks as
+  # iodata so it computes a real `Content-Length` (`IO.iodata_length/1`, no
+  # copy) instead of forcing chunked framing. Runs
   # entirely inside `call/2`'s own process, before `Finch.stream_while/5`
   # is ever invoked, so — unlike `build_stream_body/1` — there is no need
   # to thread the final `conn` back out via a message: the `conn` returned
@@ -595,7 +596,14 @@ defmodule Vagus.API.IngressProxy do
         if size > cap do
           {:error, conn, :too_large}
         else
-          {:ok, conn, acc |> Enum.reverse([data]) |> IO.iodata_to_binary()}
+          # `acc` is the earlier chunks newest-first; `Enum.reverse(acc,
+          # [data])` restores send order with `data` last, as an iolist.
+          # Handed to `Finch.build/4` (whose body is `iodata`) as-is rather
+          # than flattened with `IO.iodata_to_binary/1` — Finch/Mint derives
+          # the `Content-Length` via `IO.iodata_length/1` and writes the
+          # iolist to the socket, so the flatten was a redundant full-body
+          # copy on every buffered proxied request.
+          {:ok, conn, Enum.reverse(acc, [data])}
         end
     end
   end
