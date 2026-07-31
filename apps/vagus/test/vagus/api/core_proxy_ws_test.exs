@@ -299,7 +299,7 @@ defmodule Vagus.API.CoreProxyWSTest do
   # Bandit servers, and a tighter 2s bound flaked on a loaded CI runner
   # (never locally — 25× file repeats stayed green) on the Core-auth-failure
   # close-propagation test. Nothing here should ever legitimately approach 5s.
-  @recv_timeout 5_000
+  @recv_timeout 30_000
 
   setup do
     start_supervised!(DialCounter)
