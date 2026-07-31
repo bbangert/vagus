@@ -119,19 +119,27 @@ defmodule Vagus.API.SourceGuard do
   be the same evidence-eviction primitive under a different name
   (security-phase7.md H1).
 
-  `kind` distinguishes which half of the request tripped the filter (`:path`
-  vs `:query`), matching `Vagus.API.ExploitFilter.harmful_path?/1` and
-  `harmful_query?/1` being two separate checks. `sample` MUST already be
-  sanitized (truncated + control-byte-stripped — see
-  `Vagus.API.Dispatcher`'s `sanitize_for_log/1`) before it gets here: this
-  module only stores/logs whatever it's given, so an unsanitized caller
-  would defeat the entire point of routing this through a counter instead of
-  `Logger.warning/1` directly.
+  `kind` says what tripped: `:path` vs `:query` for
+  `Vagus.API.ExploitFilter.harmful_path?/1` and `harmful_query?/1` (two
+  separate checks, hence two buckets), and `:blacklist` for
+  `Vagus.API.Tiers.blacklisted?/1`. All three are **pre-auth** refusals with
+  the same repeat-at-will caller, so they share one counter and one summary
+  line rather than each growing its own logging policy — the blacklist
+  originally shipped a per-request `Logger.error` and was caught in review
+  (PR #34) for exactly the reason this function's first paragraph gives.
+
+  `sample` MUST already be safe to log. For `:path`/`:query` that means
+  sanitized (truncated + control-byte-stripped — see `Vagus.API.Dispatcher`'s
+  `sanitize_for_log/1`); for `:blacklist` it is a STATIC pattern label, never
+  request bytes. This module only stores/logs whatever it's given, so an
+  unsanitized caller would defeat the entire point of routing this through a
+  counter instead of `Logger.warning/1` directly.
 
   Safe to call when the guard is disabled, same as `record_refusal/1`.
   """
-  @spec record_filtered(:path | :query, String.t()) :: :ok
-  def record_filtered(kind, sample) when kind in [:path, :query] and is_binary(sample) do
+  @spec record_filtered(:path | :query | :blacklist, String.t()) :: :ok
+  def record_filtered(kind, sample)
+      when kind in [:path, :query, :blacklist] and is_binary(sample) do
     GenServer.cast(__MODULE__, {:filtered, kind, sample})
   end
 
@@ -200,7 +208,7 @@ defmodule Vagus.API.SourceGuard do
        # while giving an attacker-controlled string more room to grow
        # between ticks.
        filtered: 0,
-       filtered_by: %{path: 0, query: 0},
+       filtered_by: %{path: 0, query: 0, blacklist: 0},
        filtered_sample: nil
      }, {:continue, :schedule}}
   end
@@ -264,11 +272,16 @@ defmodule Vagus.API.SourceGuard do
   defp report_filtered(state) do
     Logger.warning(
       "Vagus.API.SourceGuard: filtered #{state.filtered} request(s) " <>
-        "(path: #{state.filtered_by.path}, query: #{state.filtered_by.query}), " <>
-        "e.g. #{state.filtered_sample}"
+        "(path: #{state.filtered_by.path}, query: #{state.filtered_by.query}, " <>
+        "blacklist: #{state.filtered_by.blacklist}), e.g. #{state.filtered_sample}"
     )
 
-    %{state | filtered: 0, filtered_by: %{path: 0, query: 0}, filtered_sample: nil}
+    %{
+      state
+      | filtered: 0,
+        filtered_by: %{path: 0, query: 0, blacklist: 0},
+        filtered_sample: nil
+    }
   end
 
   # `:inet.ntoa/1` raises on nil, and a nil peer is a case `allowed?/1`

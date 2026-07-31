@@ -2,10 +2,15 @@ defmodule Vagus.API.RouterTest do
   # async: true is required here: the whole suite runs under `Mox.set_mox_global()`
   # (test_helper), and this file only ever OBSERVES the global backend stubs —
   # forcing async: false makes ExUnit run it in the sync phase where those global
-  # stubs aren't in scope (Mox.UnexpectedCallError). It also only reads empty-state
-  # singleton data (never registers tokens/services), and ExUnit completes the
-  # async phase before the async:false sibling router tests mutate those globals,
-  # so the theoretically-flagged race does not actually occur.
+  # stubs aren't in scope (Mox.UnexpectedCallError). It only ever READS singleton
+  # data (never registers tokens/services).
+  #
+  # It used to also claim the race against those globals "does not actually
+  # occur", because ExUnit finished the async phase before the `async: false`
+  # sibling router tests mutated them. That is no longer true — later phases
+  # added *async* files that install add-ons, and the idle-list assertion below
+  # duly failed on a full-suite run. So: assert SHAPE here, never global
+  # emptiness. See that test's own comment.
   use ExUnit.Case, async: true
 
   import Plug.Test
@@ -172,7 +177,22 @@ defmodule Vagus.API.RouterTest do
       end
     end
 
-    test "jobs/info, addons, store, mounts, available_updates idle lists are []" do
+    # The bug class this guards is a list-typed field serialising as `null`
+    # instead of `[]` — which crashed Core's hassio coordinator once already
+    # (`/store`'s missing `installed`, session 6). `is_list/1` pins exactly
+    # that, and unlike `== []` it is race-free: every path below except
+    # `/mounts` projects SHARED singleton state (`Vagus.Addon.State`, the
+    # jobs registry) that concurrent async test files legitimately write to.
+    #
+    # This file's async-required header used to claim that race "does not
+    # actually occur" because the async phase finished before the
+    # `async: false` siblings ran. That stopped being true once later phases
+    # added async tests which install add-ons — this assertion failed on a
+    # full-suite run with a non-empty `/addons`. Same resolution the
+    # `/ingress/panels` and `/discovery` assertions in this file already
+    # took: global emptiness is not assertable here; content coverage lives
+    # in the per-family test files with controlled slugs.
+    test "jobs/info, addons, store, mounts, available_updates idle lists are lists" do
       for {path, field} <- [
             {"/jobs/info", "jobs"},
             {"/addons", "addons"},
@@ -181,8 +201,15 @@ defmodule Vagus.API.RouterTest do
             {"/available_updates", "available_updates"}
           ] do
         conn = conn(:get, path) |> authed() |> call()
-        assert json_body(conn)["data"][field] == []
+        assert is_list(json_body(conn)["data"][field]), "#{path} -> #{field} must be a list"
       end
+    end
+
+    # `/mounts` owns no mutable state — Vagus never mounts anything — so it
+    # is the one path here whose emptiness IS stable enough to pin.
+    test "mounts is honestly empty, not merely list-shaped" do
+      conn = conn(:get, "/mounts") |> authed() |> call()
+      assert json_body(conn)["data"]["mounts"] == []
     end
   end
 
@@ -457,6 +484,34 @@ defmodule Vagus.API.RouterTest do
       body = Jason.decode!(resp_body)
       assert body["result"] == "error"
       assert body["message"] =~ "invalid JSON"
+    end
+  end
+
+  describe "request body over the 64KB Plug.Parsers limit -> honest 413 envelope (audit E5/H3)" do
+    # Same reraise-under-Plug.Test shape as the malformed-JSON case above.
+    # Before this fix, `handle_errors/2`'s generic clause answered 413 with
+    # the message "internal server error" — the right status, a false
+    # message, since `Plug.Exception.status/1` resolves
+    # `Plug.Parsers.RequestTooLargeError` to 413 on its own.
+    test "POST with an oversized JSON body returns 413 with an honest message" do
+      oversized = Jason.encode!(%{"data" => String.duplicate("a", 70_000)})
+
+      conn =
+        conn(:post, "/core/options", oversized)
+        |> authed()
+        |> req_json()
+
+      {Plug.Adapters.Test.Conn, %{ref: ref}} = conn.adapter
+
+      assert_raise Plug.Parsers.RequestTooLargeError, fn -> call(conn) end
+
+      assert_received {^ref, {413, _headers, resp_body}}
+      body = Jason.decode!(resp_body)
+      assert body["result"] == "error"
+      assert body["message"] == "request body too large"
+      # The message never echoes the caller's byte count (phase 5: an error
+      # message is a leak channel) even though the body itself is on hand.
+      refute body["message"] =~ "70"
     end
   end
 

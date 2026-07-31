@@ -174,8 +174,20 @@ defmodule Vagus.API.DiscoveryRouterTest do
   end
 
   test "an add-on may not read the discovery list (Core-only)" do
+    # 401, not 403 (audit E3/H3): both discovery reads are `@require_home_
+    # assistant` upstream, and that wrapper raises `HTTPUnauthorized` —
+    # matching the `/ingress/session` precedent, not this router's usual
+    # wrong-caller 403.
     token = addon_token("core_mosquitto", ["mqtt"])
-    assert call(:get, "/discovery", token, nil).status == 403
+    assert call(:get, "/discovery", token, nil).status == 401
+  end
+
+  test "an add-on may not read a single discovery message either (Core-only)" do
+    owner = addon_token("core_mosquitto", ["mqtt"])
+    conn = call(:post, "/discovery", owner, %{"service" => "mqtt", "config" => %{}})
+    uuid = body(conn)["data"]["uuid"]
+
+    assert call(:get, "/discovery/#{uuid}", owner, nil).status == 401
   end
 
   test "delete is owner-only, then the record is gone" do

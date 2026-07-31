@@ -3,15 +3,26 @@ defmodule Vagus.API.Auth do
   Token auth + caller resolution for the Supervisor-API emulator.
 
   Every request must carry a token — either `Authorization: Bearer <token>` or
-  `X-Supervisor-Token: <token>` (bashio/add-ons use the latter) — with one
-  exception: the icon/logo GETs Core's proxy forwards with no `Authorization`
-  header at all, which this module recognises itself via `unauthenticated?/1`.
+  `X-Supervisor-Token: <token>` (bashio/add-ons use the latter) — with two
+  exceptions: the icon/logo GETs Core's proxy forwards with no `Authorization`
+  header at all, and `GET /supervisor/ping` (upstream's `no_security_check`
+  lists it literally — `security.py`'s `_V1_PATTERNS.no_security_check`
+  alternation — so it is answered before token validation and
+  `request[REQUEST_FROM]` is left `None`). Both carve-outs are recognised by
+  this module itself via `unauthenticated?/1`.
 
   That decision is deliberately made HERE and nowhere else. An earlier
   revision had the router set a `conn.assigns[:auth_bypass]` flag that this
   module honored; assigns are a channel any plug can write, so trusting one
   at the auth boundary meant a future plug could disable authentication for
   any route by accident. There is now no flag to set.
+
+  Before any of that, `call/2` checks upstream's `BLACKLIST` — every caller,
+  Core included, refused with 403 on `/core/api/hassio/…` and
+  `/homeassistant/api/hassio/…` regardless of token or role. See
+  `Vagus.API.Tiers.blacklisted?/1`'s doc for why this predates token
+  resolution and is not expressed as a tier requirement.
+
   The token is resolved to a **caller**, assigned on `conn.assigns.caller`, so
   add-on-facing endpoints can authorize:
 
@@ -45,8 +56,10 @@ defmodule Vagus.API.Auth do
 
   import Plug.Conn
 
+  require Logger
+
   alias Vagus.Addon.Registry
-  alias Vagus.API.{Envelope, Tiers, Token}
+  alias Vagus.API.{Envelope, SourceGuard, Tiers, Token}
 
   @impl Plug
   def init(opts), do: opts
@@ -57,13 +70,17 @@ defmodule Vagus.API.Auth do
   @impl Plug
   def call(conn, opts)
 
-  def call(%Plug.Conn{} = conn, _opts) do
-    if unauthenticated?(conn), do: conn, else: authenticate(conn)
+  def call(%Plug.Conn{path_info: path_info} = conn, _opts) do
+    cond do
+      Tiers.blacklisted?(path_info) -> refuse_blacklisted(conn)
+      unauthenticated?(conn) -> conn
+      true -> authenticate(conn)
+    end
   end
 
   @doc """
-  Whether `conn` is one of the icon/logo GETs that must be served with no
-  token at all.
+  Whether `conn` is one of the two GETs that must be served with no token at
+  all: an add-on's icon/logo, or `/supervisor/ping`.
 
   Computed here rather than read from an assign set by an earlier plug. An
   assign is a channel any plug in the pipeline could write, so trusting one
@@ -71,21 +88,39 @@ defmodule Vagus.API.Auth do
   for *any* route by accident. Nothing outside this module decides that a
   request skips auth.
 
-  The exemption is forced, not chosen: Core's proxy forwards these GETs with
-  no `Authorization` header at all (`homeassistant/components/hassio/http.py`
-  — when `PATHS_NO_AUTH` matches, the branch short-circuits before the header
-  is set, for admins too), and Supervisor skips its own middleware for them
-  (`no_security_check` splices in `_V1_FRONTEND_PATHS`, i.e.
-  `|/(store/)?addons/<RE_SLUG>/(logo|icon)`). Requiring a token here means
-  permanently broken images, whatever the frontend does.
+  The icon/logo exemption is forced, not chosen: Core's proxy forwards these
+  GETs with no `Authorization` header at all
+  (`homeassistant/components/hassio/http.py` — when `PATHS_NO_AUTH` matches,
+  the branch short-circuits before the header is set, for admins too), and
+  Supervisor skips its own middleware for them (`no_security_check` splices
+  in `_V1_FRONTEND_PATHS`, i.e. `|/(store/)?addons/<RE_SLUG>/(logo|icon)`).
+  Requiring a token here means permanently broken images, whatever the
+  frontend does.
 
-  Deliberately narrow: GET only, exact `path_info` segment match (never a
-  regex over the raw path), and a slug that passes
-  `Vagus.Addon.Config.valid_slug?/1`. Core itself 405s a non-GET on these
-  paths, so the method restriction matches upstream rather than merely being
-  cautious.
+  `/supervisor/ping` is exempted for the same upstream reason, via a
+  different member of the same set: it is listed literally in
+  `no_security_check` (`security.py` L166,
+  `_V1_PATTERNS.no_security_check`'s alternation), so upstream answers it
+  before `token_validation` runs at all and leaves `request[REQUEST_FROM]`
+  as `None`. Audit B1: Vagus previously routed this through the normal
+  token gate and 401ed a caller pinging before it holds one — a health-check
+  probe, a supervised-installer script, or `bashio::supervisor.ping` from an
+  add-on with `hassio_api: false`, all of which the real Supervisor answers
+  200. Because this short-circuits *before* token handling, exactly like
+  upstream, a ping that DOES carry a token is not graded either — no tier
+  check runs for it, matching `request[REQUEST_FROM] = None` rather than
+  resolving a caller. This does not widen LAN exposure: `Vagus.API.SourceGuard`
+  still fronts every route ahead of this plug, ping included.
+
+  Deliberately narrow: GET only, exact `path_info` match (never a regex over
+  the raw path), and for the asset case a slug that passes
+  `Vagus.Addon.Config.valid_slug?/1`. Core itself 405s a non-GET on either
+  family of paths, so the method restriction matches upstream rather than
+  merely being cautious.
   """
   @spec unauthenticated?(Plug.Conn.t()) :: boolean()
+  def unauthenticated?(%Plug.Conn{method: "GET", path_info: ["supervisor", "ping"]}), do: true
+
   def unauthenticated?(%Plug.Conn{method: "GET", path_info: path_info}),
     do: asset_path?(path_info)
 
@@ -97,6 +132,41 @@ defmodule Vagus.API.Auth do
 
   defp asset?(kind, slug),
     do: kind in @unauthenticated_asset_kinds and Vagus.Addon.Config.valid_slug?(slug)
+
+  # Upstream logs `_LOGGER.error("%s is blacklisted!", request.path)` per
+  # request. Vagus does NOT, and the path is only half the reason.
+  #
+  # Omitting the path is obvious: an attacker-controlled byte string in a
+  # pre-auth log line is the RingLogger-flush primitive phase 7 named
+  # (security-phase7.md H1). But a *static* message per request is still one
+  # ring slot per request from a caller that needs no credential and can
+  # repeat at will — the volume is the primitive, not just the content, and
+  # this shipped as `Logger.error` until review caught it (PR #34). Upstream
+  # can afford per-request logging because it logs to a container's rotated
+  # journald; RingLogger is fixed-size and is the only forensic record on a
+  # Nerves device.
+  #
+  # So this counts, exactly as `Vagus.API.Dispatcher`'s `report_filtered/2`
+  # does for the exploit filter, sharing that one counter and its single
+  # per-tick summary line. The label is a compile-time constant naming the
+  # family — never `conn.path_info` — so no sanitizer is needed and none is
+  # borrowed from `Dispatcher` (its own is private and reused nowhere else).
+  #
+  # The `enabled?/0` split matches `report_filtered/2`'s and is deliberate:
+  # on device the counter is running and the ring is worth protecting; on
+  # `:host`/`:test` the counter process does not exist (`start_link/1` returns
+  # `:ignore`) and there is no ring to flush, so a developer gets the line.
+  @blacklist_label "api/hassio proxy path"
+
+  defp refuse_blacklisted(conn) do
+    if SourceGuard.enabled?() do
+      SourceGuard.record_filtered(:blacklist, @blacklist_label)
+    else
+      Logger.warning("Vagus.API.Auth: refused a blacklisted #{@blacklist_label}")
+    end
+
+    Envelope.send_error(conn, "unauthorized", 403)
+  end
 
   defp authenticate(conn) do
     case token(conn) do

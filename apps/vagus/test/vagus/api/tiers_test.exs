@@ -191,7 +191,15 @@ defmodule Vagus.API.TiersTest do
     {"/auth/cache", :manager},
 
     # -- Entry setup / Core lifecycle -----------------------------------------
-    {"/supervisor/ping", :bypass},
+    # Phase 8 (audit B1): `GET /supervisor/ping` is now served with no token
+    # at all — `Vagus.API.Auth.unauthenticated?/1` short-circuits it before
+    # this table is ever consulted, same as the icon/logo GETs above, so the
+    # table's old `:bypass` row for it was deleted (see `@table`'s comment).
+    # What's pinned here is what a non-GET on the same path would demand: it
+    # falls through to the plain `/supervisor/.+` manager-family row below,
+    # not any special case — `/supervisor/ping` earns no table entry of its
+    # own precisely because it's never reached through the table.
+    {"/supervisor/ping", :manager},
     {"/core/options", :homeassistant},
     {"/homeassistant/options", :homeassistant},
     {"/core/start", :supervisor},
@@ -280,6 +288,29 @@ defmodule Vagus.API.TiersTest do
       assert Tiers.required(["info"]) == :bypass
       # …and `info` must be the LAST segment.
       assert Tiers.required(["host", "info", "extra"]) == :manager
+    end
+  end
+
+  # Upstream's `BLACKLIST` (security review finding, phase 8): refused for
+  # every caller regardless of token or tier, checked before `required/1` is
+  # even consulted. Vagus has no Core-API proxy yet, so nothing serves these
+  # paths — the predicate exists so a proxy landing tomorrow inherits the deny
+  # rather than opening it by default.
+  describe "blacklisted?/1" do
+    test "the two upstream families are blacklisted, with or without a suffix" do
+      assert Tiers.blacklisted?(["core", "api", "hassio"])
+      assert Tiers.blacklisted?(["core", "api", "hassio", "anything"])
+      assert Tiers.blacklisted?(["core", "api", "hassio", "deeply", "nested"])
+      assert Tiers.blacklisted?(["homeassistant", "api", "hassio"])
+      assert Tiers.blacklisted?(["homeassistant", "api", "hassio", "x"])
+    end
+
+    test "a near-miss is not blacklisted — the pattern is narrow, not a prefix match" do
+      refute Tiers.blacklisted?(["core", "api", "other"])
+      refute Tiers.blacklisted?(["core", "apixhassio"])
+      refute Tiers.blacklisted?(["core", "api"])
+      refute Tiers.blacklisted?(["homeassistant", "api", "other"])
+      refute Tiers.blacklisted?([])
     end
   end
 

@@ -131,6 +131,20 @@ defmodule Vagus.API.Router do
     Envelope.send_error(conn, "invalid JSON body", 400)
   end
 
+  # Audit E5/H3: a body over the 64KB `Plug.Parsers` limit above raises
+  # `Plug.Parsers.RequestTooLargeError` (`deps/plug/lib/plug/parsers.ex`,
+  # `plug_status: 413`), so `Plug.Exception.status/1` already resolves the
+  # right status onto `conn` — but without this clause it fell through to the
+  # generic one below and answered 413 with the message "internal server
+  # error", which is simply false. Never echo the caller's declared/actual
+  # byte count into the message (phase 5's lesson: an error message is a leak
+  # channel) — contrast aiohttp's own 413 body upstream, which does state
+  # both; `Vagus.API.IngressProxy`'s own 413 (`send_plain/3`, phase 7) keeps
+  # the same static-message discipline for the same reason.
+  def handle_errors(conn, %{reason: %Plug.Parsers.RequestTooLargeError{}}) do
+    Envelope.send_error(conn, "request body too large", 413)
+  end
+
   def handle_errors(conn, %{reason: _reason}) do
     Envelope.send_error(conn, "internal server error", conn.status || 500)
   end
@@ -876,6 +890,15 @@ defmodule Vagus.API.Router do
   # and pushes the message (minus `config`) to Core, which re-fetches the full
   # record here and drives a config flow. Core reads the list at every boot
   # (`@require_home_assistant` → the supervisor token); add-ons only write.
+  #
+  # Both reads are `@require_home_assistant` upstream, and that wrapper raises
+  # `HTTPUnauthorized` — **401**, not this router's usual 403-for-wrong-caller
+  # shape — same as the `/ingress/session`/`/ingress/validate_session` pair
+  # above (`supervisor/api/utils.py::require_home_assistant`). Audit E3/H3:
+  # these two were left at 403, the router's default for "wrong caller",
+  # because they were written before the ingress-session precedent existed.
+  # `POST /discovery` and `DELETE /discovery/:uuid` are a different upstream
+  # decorator (`APIForbidden`, genuinely 403) and must NOT be changed to match.
 
   get "/discovery" do
     if home_assistant?(conn.assigns.caller) do
@@ -891,7 +914,7 @@ defmodule Vagus.API.Router do
         services: services
       })
     else
-      Envelope.send_error(conn, "unauthorized", 403)
+      Envelope.send_error(conn, "unauthorized", 401)
     end
   end
 
@@ -902,7 +925,7 @@ defmodule Vagus.API.Router do
         :error -> Envelope.send_error(conn, "Discovery message not found", 404)
       end
     else
-      Envelope.send_error(conn, "unauthorized", 403)
+      Envelope.send_error(conn, "unauthorized", 401)
     end
   end
 
