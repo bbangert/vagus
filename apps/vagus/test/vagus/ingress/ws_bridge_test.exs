@@ -767,10 +767,18 @@ defmodule Vagus.Ingress.WSBridgeTest do
   # Same flood, but every call uses the SAME tight timeout `handle_in/2`
   # itself would use as its handoff timeout — the first call the wedged
   # send can't complete within that window raises `exit(:timeout, ...)`,
-  # caught here and returned as `:timeout`.
-  defp flood_until_call_timeout(pid, payload) do
+  # caught here and returned as `:timeout`. Bounded like
+  # `flood_until_wedged/3`: if the wedge somehow never establishes (kernel
+  # socket buffering differing from the small-recbuf assumption), return
+  # `:never_wedged` so the caller's assertion fails deterministically
+  # instead of the test hanging until ExUnit's own timeout.
+  defp flood_until_call_timeout(_pid, _payload, remaining \\ 500)
+
+  defp flood_until_call_timeout(_pid, _payload, 0), do: :never_wedged
+
+  defp flood_until_call_timeout(pid, payload, remaining) do
     GenServer.call(pid, {:frame, :binary, payload}, 200)
-    flood_until_call_timeout(pid, payload)
+    flood_until_call_timeout(pid, payload, remaining - 1)
   catch
     :exit, {:timeout, _} -> :timeout
   end
