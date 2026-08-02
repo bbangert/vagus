@@ -420,6 +420,18 @@ defmodule Vagus.API.CoreProxy do
   @spec ws_auth_timeout_ms() :: pos_integer()
   def ws_auth_timeout_ms, do: Application.get_env(:vagus, :core_ws_auth_timeout, 10_000)
 
+  @doc """
+  Bound on the caller-side `GenServer.call/3` `WSBridge.handle_in/2` makes to
+  `Upstream` for every relayed frame once past `:awaiting_auth` (issue #37) —
+  the backstop for a wedged Core-side send that the smaller
+  `:core_ws_send_timeout` (`Upstream`'s own Mint socket, resolved first in the
+  normal case) somehow didn't already resolve. `config
+  :vagus, :core_ws_handoff_timeout`, tests shrink it to exercise the backstop
+  path without a real 10s wait.
+  """
+  @spec ws_handoff_timeout_ms() :: pos_integer()
+  def ws_handoff_timeout_ms, do: Application.get_env(:vagus, :core_ws_handoff_timeout, 10_000)
+
   ## The proxied request itself
 
   # `rest == ["stream"]` (fact 7) gets `:infinity` instead of `@receive_timeout`

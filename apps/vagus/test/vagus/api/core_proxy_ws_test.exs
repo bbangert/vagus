@@ -28,7 +28,12 @@ defmodule Vagus.API.CoreProxyWSTest.CoreHandshakeHandler do
   `"world"` back (rather than an echo) so a passing round-trip proves the
   frame really crossed into this fake Core and back, not just an
   accidental local loop. `"close:<code>:<reason>"` closes with that exact
-  code (`Vagus.Ingress.WSBridgeTest.EchoHandler`'s own convention). Reports
+  code (`Vagus.Ingress.WSBridgeTest.EchoHandler`'s own convention).
+  `"stall"`, post-auth, parks the process in a `receive`-forever — the
+  steady-state-backpressure tests' way of making Core's own TCP socket
+  buffer fill up (Bandit stops reading once this handler stops returning
+  from `handle_in/2`), distinct from `CoreAuthScript`'s `:stall` (which
+  withholds `auth_ok` itself, the pre-`ha_ready?` pending-cap window). Reports
   init/terminate to the test process.
   """
   @behaviour WebSock
@@ -58,6 +63,12 @@ defmodule Vagus.API.CoreProxyWSTest.CoreHandshakeHandler do
     case String.split(rest, ":", parts: 2) do
       [code_str, reason] -> {:stop, :normal, {String.to_integer(code_str), reason}, state}
       _other -> {:push, {:text, "close:" <> rest}, state}
+    end
+  end
+
+  def handle_in({"stall", opcode: :text}, %{authed?: true} = state) do
+    receive do
+      :never_sent -> {:ok, state}
     end
   end
 
@@ -352,6 +363,8 @@ defmodule Vagus.API.CoreProxyWSTest do
       Application.delete_env(:vagus, :core_ws_auth_timeout)
       Application.delete_env(:vagus, :core_ws_pending_max_frames)
       Application.delete_env(:vagus, :core_ws_pending_max_bytes)
+      Application.delete_env(:vagus, :core_ws_handoff_timeout)
+      Application.delete_env(:vagus, :core_ws_send_timeout)
     end)
 
     %{proxy_host: "127.0.0.1", proxy_port: proxy_port}
@@ -663,5 +676,111 @@ defmodule Vagus.API.CoreProxyWSTest do
 
     {frame, _client} = Client.next_frame(client, @recv_timeout)
     assert match?({:close, 1011, _}, frame)
+  end
+
+  ## 10-11 (issue #37): steady-state backpressure — a stalled Core wedges the
+  ## Mint send, closing the caller with 1011 either via `Upstream`'s own
+  ## `send_timeout` (test 10, the normal resolution) or via `WSBridge`'s own
+  ## call timeout backstopping a send_timeout that hasn't fired yet (test 11).
+  ## Both need Core to actually stop reading — a dedicated `FakeCore` with
+  ## small kernel socket buffers, so the wedge establishes after a frame or
+  ## two rather than however much a default ~200KB buffer can absorb.
+
+  test "a stalled Core wedges the send; Upstream's own send_timeout closes the caller 1011", %{
+    proxy_host: host,
+    proxy_port: port
+  } do
+    start_stall_core()
+    Application.put_env(:vagus, :core_ws_send_timeout, 200)
+
+    token = addon_token("cp_ws_stall_send_timeout", %{homeassistant_api: true})
+
+    {:ok, client, _headers} = Client.connect(host, port, "/core/websocket")
+    {{:text, _auth_required}, client} = Client.next_frame(client, @recv_timeout)
+    client = Client.send_frame(client, {:text, Jason.encode!(%{"access_token" => token})})
+    {{:text, raw}, client} = Client.next_frame(client, @recv_timeout)
+    assert Jason.decode!(raw)["type"] == "auth_ok"
+
+    client = Client.send_frame(client, {:text, "stall"})
+
+    payload = :crypto.strong_rand_bytes(256 * 1024)
+    _client = flood_ignoring_send_errors(client, payload, 20)
+
+    {frame, _client} = Client.next_frame(client, @recv_timeout)
+    assert match?({:close, 1011, _}, frame)
+  end
+
+  test "a stalled Core wedges the send; WSBridge's own handoff timeout backstops it and closes the caller 1011",
+       %{proxy_host: host, proxy_port: port} do
+    start_stall_core()
+    Application.put_env(:vagus, :core_ws_send_timeout, 60_000)
+    Application.put_env(:vagus, :core_ws_handoff_timeout, 200)
+
+    token = addon_token("cp_ws_stall_handoff_timeout", %{homeassistant_api: true})
+
+    {:ok, client, _headers} = Client.connect(host, port, "/core/websocket")
+    {{:text, _auth_required}, client} = Client.next_frame(client, @recv_timeout)
+    client = Client.send_frame(client, {:text, Jason.encode!(%{"access_token" => token})})
+    {{:text, raw}, client} = Client.next_frame(client, @recv_timeout)
+    assert Jason.decode!(raw)["type"] == "auth_ok"
+
+    client = Client.send_frame(client, {:text, "stall"})
+
+    payload = :crypto.strong_rand_bytes(256 * 1024)
+    _client = flood_ignoring_send_errors(client, payload, 20)
+
+    {frame, _client} = Client.next_frame(client, @recv_timeout)
+    assert match?({:close, 1011, _}, frame)
+  end
+
+  # A dedicated `FakeCore` with small kernel socket buffers (recbuf/buffer
+  # 4096), so a stalled `CoreHandshakeHandler` wedges the Mint send after a
+  # frame or two rather than however much a default ~200KB buffer can absorb
+  # before backpressure reaches `Upstream`'s own `:gen_tcp.send`. Points
+  # `:core_base_url` at it for the rest of the test — the outer `setup`'s own
+  # `on_exit` already restores the pre-test value regardless of what a test
+  # itself later puts there.
+  defp start_stall_core do
+    stall_core_pid =
+      start_supervised!(
+        {Bandit,
+         plug: FakeCore,
+         port: 0,
+         thousand_island_options: [
+           num_acceptors: 1,
+           transport_options: [recbuf: 4096, buffer: 4096]
+         ]},
+        id: :stall_core_bandit
+      )
+
+    stall_core_port = listening_port(stall_core_pid)
+    Application.put_env(:vagus, :core_base_url, "http://127.0.0.1:#{stall_core_port}")
+    stall_core_port
+  end
+
+  # Sends up to `n` frames, one at a time, tolerating the connection closing
+  # partway through — once the wedged send trips a close, the caller-facing
+  # socket can itself start refusing writes (the cascading backpressure this
+  # whole test is about), and that's success, not a test failure: the
+  # `assert_receive`-equivalent `Client.next_frame/2` right after this call is
+  # what actually proves the close arrived.
+  defp flood_ignoring_send_errors(client, _payload, 0), do: client
+
+  defp flood_ignoring_send_errors(client, payload, n) do
+    case safe_send_frame(client, {:binary, payload}) do
+      {:ok, client} -> flood_ignoring_send_errors(client, payload, n - 1)
+      :error -> client
+    end
+  end
+
+  defp safe_send_frame(%Client{} = c, frame) do
+    {:ok, websocket, data} = Mint.WebSocket.encode(c.websocket, frame)
+
+    case Mint.WebSocket.stream_request_body(c.conn, c.ref, data) do
+      {:ok, conn} -> {:ok, %{c | conn: conn, websocket: websocket}}
+      {:error, _conn, _reason} -> :error
+    end
+  rescue
+    _ -> :error
   end
 end
