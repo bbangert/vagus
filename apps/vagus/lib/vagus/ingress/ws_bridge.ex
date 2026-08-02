@@ -94,9 +94,10 @@ defmodule Vagus.Ingress.WSBridge do
 
   ## Memory discipline
 
-  Every data frame is relayed one at a time — `handle_in/2` casts a single
-  frame to `B`; `B` decodes/encodes a single frame at a time from `Mint`'s
-  active-mode messages. Nothing is ever rebuffered beyond the frame
+  Every data frame is relayed one at a time — `handle_in/2` hands a single
+  frame to `B` via a bounded `GenServer.call/3` (`:ingress_ws_handoff_timeout`,
+  issue #37 — see below); `B` decodes/encodes a single frame at a time from
+  `Mint`'s active-mode messages. Nothing is ever rebuffered beyond the frame
   currently in flight (except the small pre-upgrade `pending` list in `B`,
   bounded only by how much the browser sends before the add-on's 101
   arrives — a local network hop, expected to be at most a few frames).
@@ -104,6 +105,26 @@ defmodule Vagus.Ingress.WSBridge do
   `websock`/Bandit on the browser leg (`max_frame_size` in
   `Vagus.API.IngressProxy`'s `WebSockAdapter.upgrade/4` call) and by
   `mint_web_socket`'s own frame assembly on the upstream leg.
+
+  ## Steady-state backpressure (issue #37)
+
+  `B`'s send path (`do_send_frame/3` → `Mint.WebSocket.stream_request_body/3`
+  → `:gen_tcp.send`) blocks if the add-on's own socket buffer is full. A
+  `cast` would let `A` keep accepting browser frames into `B`'s mailbox
+  without bound while `B` sits blocked — the steady-state vector the W3
+  pending cap doesn't cover (that cap only bounds the pre-upgrade window).
+  `handle_in/2` calls instead: `B`'s `handle_call/3` replies only once the
+  send returns, so `A`'s blocked call is what stops Bandit from reading the
+  browser's socket for as long as the send is wedged — TCP backpressure to
+  the browser instead of an unbounded mailbox. `B`'s own Mint socket
+  `send_timeout` (default 5s, `send_timeout_ms` — see `Upstream`'s
+  moduledoc) is what actually resolves a wedged send in the normal case,
+  well before `A`'s own (larger, 10s default, `:ingress_ws_handoff_timeout`)
+  call timeout would need to act as a backstop. Reverse-direction
+  `{:relay, ...}` frames queue in `A`'s mailbox for at most one call's
+  duration (normally µs; bounded by whichever timeout fires) — the bounded
+  head-of-line tradeoff the issue explicitly accepts in exchange for a
+  bounded mailbox.
   """
 
   @behaviour WebSock
@@ -161,15 +182,25 @@ defmodule Vagus.Ingress.WSBridge do
 
   @impl WebSock
   @doc """
-  Every browser data frame becomes a single `GenServer.cast/2` to `B` —
-  `handle_in/2` never blocks waiting for the upstream send to complete
-  (a `cast`, not a `call`); backpressure isn't a concern here since a
-  single ingress panel's frame rate is trivial next to a 1GB device's
-  other work.
+  Every browser data frame is handed to `B` via a bounded `GenServer.call/3`
+  (`handoff_timeout_ms/0`) — see moduledoc's "Steady-state backpressure"
+  section for why this deliberately DOES block `handle_in/2` on the upstream
+  send completing, rather than firing a fully async `cast`. A timeout closes
+  with 1011 directly (`B` never got the chance to notify anyone); any other
+  exit (`B` already stopped, normally or via a crash) is a no-op — the
+  faithful close code is already on its way through the existing
+  `{:upstream_close, ...}`/`{:EXIT, ...}` clauses in `handle_info/2` below,
+  and stamping 1011 here would race it.
   """
   def handle_in({data, opcode: op}, %{upstream: pid} = state) do
-    GenServer.cast(pid, {:frame, op, data})
+    :ok = GenServer.call(pid, {:frame, op, data}, handoff_timeout_ms())
     {:ok, state}
+  catch
+    :exit, {:timeout, _} ->
+      {:stop, :normal, {1011, ""}, %{state | closing?: true}}
+
+    :exit, _upstream_died_mid_call ->
+      {:ok, state}
   end
 
   @impl WebSock
@@ -258,6 +289,12 @@ defmodule Vagus.Ingress.WSBridge do
   end
 
   def terminate(_reason, _state), do: :ok
+
+  # issue #37: bound on the `GenServer.call/3` `handle_in/2` makes to `B` for
+  # every relayed frame — see moduledoc's "Steady-state backpressure". No
+  # args seam on this module (unlike `Upstream`'s `start_link/1` map), so an
+  # app env, same precedent as `:ingress_target_fun`.
+  defp handoff_timeout_ms, do: Application.get_env(:vagus, :ingress_ws_handoff_timeout, 10_000)
 end
 
 defmodule Vagus.Ingress.WSBridge.Upstream do
@@ -313,14 +350,29 @@ defmodule Vagus.Ingress.WSBridge.Upstream do
 
   ## Buffering before the upgrade completes
 
-  A browser frame can arrive (via `WSBridge.handle_in/2`'s cast) before the
+  A browser frame can arrive (via `WSBridge.handle_in/2`'s call) before the
   add-on's 101 response does — the browser doesn't wait for our upstream
-  handshake. Frames cast while `upgraded?` is `false` are prepended to
+  handshake. Frames received while `upgraded?` is `false` are prepended to
   `pending` (a stalling browser flooding frames must not force an O(n²)
-  `pending ++ [frame]` append on every cast) and flushed, in reverse (i.e.
+  `pending ++ [frame]` append on every call) and flushed, in reverse (i.e.
   back into send order), the moment `Mint.WebSocket.new/4` succeeds
   (`flush_pending/1`). This is the *only* rebuffering this module does;
   every other frame is relayed one at a time.
+
+  ## `send_timeout` on the Mint socket (issue #37)
+
+  `Mint.HTTP.connect/4`'s `transport_opts` carry `send_timeout` (default 5s,
+  `send_timeout_ms`) and `send_timeout_close: true`. Without it, a wedged
+  `:gen_tcp.send` (the add-on's socket buffer full) blocks forever — after
+  `WSBridge`'s own handoff timeout gives up and closes the browser leg,
+  `terminate/2`'s `GenServer.stop/3` can't be processed by a process stuck
+  inside `handle_call/3`, so this `GenServer` would leak (blocked, holding a
+  socket) indefinitely (a `:normal` exit signal doesn't kill a
+  non-trapping process). A timed-out send instead surfaces as
+  `stream_request_body`'s ordinary `{:error, conn, reason}` tuple, flowing
+  through the same 1011-close path as any other transport error — this is
+  the normal way a wedged send resolves, expected to fire well before
+  `WSBridge`'s own (larger) call timeout would need to act as a backstop.
 
   ## Pending cap + upgrade deadline (review W3)
 
@@ -331,7 +383,7 @@ defmodule Vagus.Ingress.WSBridge.Upstream do
   device well before any idle timeout notices. Two independent guards:
 
     * `:pending_max_bytes` (default 4 MiB) / `:pending_max_frames` (default
-      `256`) cap `pending`'s total size; a cast that would exceed either
+      `256`) cap `pending`'s total size; a call that would exceed either
       closes the browser side with 1011 (`{:upstream_close, 1011, ""}` to
       the parent) and stops, same as any other abnormal-loss path.
     * `:upgrade_deadline_ms` (default `10_000`), armed once in `init/1`: if
@@ -348,6 +400,8 @@ defmodule Vagus.Ingress.WSBridge.Upstream do
   @default_pending_max_bytes 4 * 1024 * 1024
   @default_pending_max_frames 256
   @default_upgrade_deadline_ms 10_000
+  # issue #37 default — see moduledoc's "`send_timeout` on the Mint socket".
+  @default_send_timeout_ms 5_000
 
   @typedoc "State for the upstream Mint.WebSocket connection GenServer."
   @type state :: %{
@@ -358,7 +412,7 @@ defmodule Vagus.Ingress.WSBridge.Upstream do
           resp_headers: Mint.Types.headers(),
           websocket: Mint.WebSocket.t() | nil,
           upgraded?: boolean(),
-          # Newest-first (prepended on cast, reversed on flush) — see
+          # Newest-first (prepended on each call, reversed on flush) — see
           # moduledoc.
           pending: [{WebSock.data_opcode(), binary()}],
           pending_frames: non_neg_integer(),
@@ -376,7 +430,8 @@ defmodule Vagus.Ingress.WSBridge.Upstream do
           required(:headers) => Mint.Types.headers(),
           optional(:pending_max_bytes) => pos_integer(),
           optional(:pending_max_frames) => pos_integer(),
-          optional(:upgrade_deadline_ms) => pos_integer()
+          optional(:upgrade_deadline_ms) => pos_integer(),
+          optional(:send_timeout_ms) => pos_integer()
         }) :: {:ok, pid()} | {:error, term()}
   def start_link(args), do: GenServer.start_link(__MODULE__, args)
 
@@ -405,6 +460,8 @@ defmodule Vagus.Ingress.WSBridge.Upstream do
         %{parent: parent, ip: ip, port: port, path: path, protocols: protocols, headers: headers} =
           args
       ) do
+    send_timeout_ms = Map.get(args, :send_timeout_ms, @default_send_timeout_ms)
+
     connect_opts = [
       mode: :active,
       protocols: [:http1],
@@ -413,7 +470,12 @@ defmodule Vagus.Ingress.WSBridge.Upstream do
       # gateway .1 — but a `host_network: true` add-on is reached on loopback,
       # where binding .2 makes it see a non-local peer and refuse. Keyed on
       # the destination, so both hold (`Vagus.Network.source_bind_opts/1`).
-      transport_opts: Vagus.Network.source_bind_opts(ip)
+      # `send_timeout`/`send_timeout_close` (issue #37) are appended rather
+      # than folded into that helper — they're unconditional, not
+      # destination-dependent.
+      transport_opts:
+        Vagus.Network.source_bind_opts(ip) ++
+          [send_timeout: send_timeout_ms, send_timeout_close: true]
     ]
 
     case Mint.HTTP.connect(:http, ip, port, connect_opts) do
@@ -469,37 +531,42 @@ defmodule Vagus.Ingress.WSBridge.Upstream do
 
   @impl GenServer
   @doc """
-  A frame cast from `A` (`WSBridge.handle_in/2`). Buffered, in order, until
-  the upgrade completes; sent immediately otherwise. A send failure
-  (`do_send_frame/3` returning `{:error, state}`) is treated exactly like a
-  decoded transport error from the add-on: notify the parent with the
-  1011-mapped abnormal-loss message and stop — see the moduledoc's
-  `Vagus.Ingress.WSBridge` "close-code propagation" path 2.
+  A frame called in from `A` (`WSBridge.handle_in/2`, issue #37 — see
+  `Vagus.Ingress.WSBridge`'s moduledoc for why a bounded call replaced the
+  original cast). Buffered, in order, until the upgrade completes; sent
+  immediately otherwise. A send failure (`do_send_frame/3` returning
+  `{:error, state}`) is treated exactly like a decoded transport error from
+  the add-on: notify the parent with the 1011-mapped abnormal-loss message
+  and stop — see the moduledoc's `Vagus.Ingress.WSBridge` "close-code
+  propagation" path 2. Every clause replies `:ok` before stopping on the
+  error/overflow paths too: the frame was genuinely accepted here, so `A`
+  must not see a spurious `:exit` for it — the real close still arrives via
+  `{:upstream_close, ...}`, same as it always has.
 
   Overflowing `:pending_max_bytes`/`:pending_max_frames` (review W3) is
   folded into the same 1011-close path — from the browser's perspective a
   buffer-overflow disconnect and a transport-error disconnect are
   indistinguishable, and shouldn't need to be.
   """
-  def handle_cast({:frame, op, data}, %{upgraded?: false} = state) do
+  def handle_call({:frame, op, data}, _from, %{upgraded?: false} = state) do
     case buffer_frame(op, data, state) do
       {:ok, state} ->
-        {:noreply, state}
+        {:reply, :ok, state}
 
       :overflow ->
         send(state.parent, {:upstream_close, 1011, ""})
-        {:stop, :normal, state}
+        {:stop, :normal, :ok, state}
     end
   end
 
-  def handle_cast({:frame, op, data}, %{upgraded?: true} = state) do
+  def handle_call({:frame, op, data}, _from, %{upgraded?: true} = state) do
     case do_send_frame(op, data, state) do
       {:ok, state} ->
-        {:noreply, state}
+        {:reply, :ok, state}
 
       {:error, state} ->
         send(state.parent, {:upstream_close, 1011, ""})
-        {:stop, :normal, state}
+        {:stop, :normal, :ok, state}
     end
   end
 
@@ -671,7 +738,7 @@ defmodule Vagus.Ingress.WSBridge.Upstream do
 
   # Flushes frames buffered while the upgrade was still pending, in send
   # order — `pending` is stored newest-first (`buffer_frame/3` prepends), so
-  # this reverses once here rather than paying an O(n²) append per cast.
+  # this reverses once here rather than paying an O(n²) append per call.
   # Reuses the same `{:continue, state} | {:stop, state}` protocol as
   # `process_response/2` so `process_responses/2`'s `:done` clause can
   # return its result directly.
@@ -755,8 +822,8 @@ defmodule Vagus.Ingress.WSBridge.Upstream do
 
   Not called for either of `init/1`'s own failure paths (see that
   function's doc) or for the two paths where this process stops *itself*
-  (`handle_cast`/`handle_info` returning `{:stop, :normal, state}` after
-  already notifying the parent and closing the Mint connection directly) —
+  (`handle_call`/`handle_info` stopping `:normal` after already notifying the
+  parent and closing the Mint connection directly) —
   in the latter two cases `terminate/2` *would* still run (its `init/1` did
   succeed), but the connection is already closed by then, so the encode/
   send below simply fails harmlessly against a dead socket.

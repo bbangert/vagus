@@ -59,16 +59,28 @@ defmodule Vagus.API.CoreProxy.WSBridge do
   questions, and upstream conflates them in exactly this order, not the
   other way round.
 
-  ## Once past `:awaiting_auth`, relaying is unconditional cast-and-forget
+  ## Once past `:awaiting_auth`, relaying is a bounded synchronous handoff
 
-  `handle_in/2` in the `:relaying` phase casts every frame to `Upstream`
-  regardless of whether CORE's own handshake has completed yet —
-  `Upstream` is the one that queues (see its moduledoc's "ready = WS-upgraded
-  AND Core-auth'd" section, the literal extension of
-  `Vagus.Ingress.WSBridge.Upstream`'s own pending-buffer shape the plan
-  calls for). This module has no separate "connecting" state of its own to
-  track: from the caller's point of view, once its own `auth_ok` has been
-  sent, every frame it sends just goes to `Upstream`, on the same terms as
+  `handle_in/2` in the `:relaying` phase hands every frame to `Upstream` via
+  `GenServer.call/3` (`ws_handoff_timeout_ms/0`), not a cast — regardless of
+  whether CORE's own handshake has completed yet, `Upstream` is still the one
+  that queues pre-`ha_ready?` frames (see its moduledoc's "ready =
+  WS-upgraded AND Core-auth'd" section). What the call changes is what
+  happens once `Upstream`'s own `do_send_frame/3` blocks on a wedged Core
+  socket (issue #37): a cast would let this process keep accepting caller
+  frames into `Upstream`'s mailbox without bound; the call instead makes
+  THIS process block, so Bandit stops reading the caller's socket and the
+  flood parks in the caller's own TCP window instead of a BEAM mailbox.
+  `Upstream`'s `send_timeout` (its own Mint socket option) is the normal way
+  a wedged send resolves; the call's timeout is only the backstop if that
+  somehow doesn't fire. A timeout here closes with 1011 directly, since
+  `Upstream` never got the chance to notify anyone; any other exit (the call
+  target already stopped, normally or via a crash) is a no-op — the faithful
+  close code is already in flight via `{:relay, ...}`/`{:upstream_close,
+  ...}`/`{:EXIT, ...}`, and stamping 1011 here would race it. This module has
+  no separate "connecting" state of its own to track: from the caller's
+  point of view, once its own `auth_ok` has been sent, every frame it sends
+  just goes to `Upstream`, on the same terms as
   `Vagus.Ingress.WSBridge.handle_in/2`.
 
   ## Heartbeat (fact 8's `heartbeat=30`)
@@ -140,9 +152,11 @@ defmodule Vagus.API.CoreProxy.WSBridge do
   `access_token`/`api_password` (fact 8 — no `"type"` requirement, see
   moduledoc); anything else (a binary frame, non-JSON, a JSON non-object, no
   token field at all) takes the same `auth_invalid` + close path as a bad
-  token. `:relaying`: every frame — text or binary — is cast to `Upstream`
-  unconditionally; see moduledoc for why this module doesn't itself track
-  whether Core's side of the handshake has completed yet.
+  token. `:relaying`: every frame — text or binary — is handed to `Upstream`
+  via a bounded `GenServer.call/3` (see moduledoc's "bounded synchronous
+  handoff" section for why a call and not a cast); a timeout closes with
+  1011 directly, any other exit is a no-op since the faithful close is
+  already on its way through `handle_info/2`.
   """
   def handle_in({data, opcode: :text}, %{phase: :awaiting_auth} = state) do
     case decode_caller_token(data) do
@@ -156,8 +170,21 @@ defmodule Vagus.API.CoreProxy.WSBridge do
   end
 
   def handle_in({data, opcode: op}, %{phase: :relaying, upstream: pid} = state) do
-    GenServer.cast(pid, {:frame, op, data})
+    :ok = GenServer.call(pid, {:frame, op, data}, CoreProxy.ws_handoff_timeout_ms())
     {:ok, state}
+  catch
+    :exit, {:timeout, _} ->
+      # Upstream wedged longer than the handoff timeout — same
+      # abnormal-loss close as every other stuck-relay path.
+      {:stop, :normal, {1011, ""}, %{state | closing?: true}}
+
+    :exit, _upstream_died_mid_call ->
+      # Upstream stopped (normally after already sending
+      # `{:upstream_close, ...}`, or crashed -> a trapped `{:EXIT, ...}`).
+      # Either message is already in / on its way to our own mailbox — let
+      # those clauses pick the faithful close code rather than stamping
+      # 1011 here.
+      {:ok, state}
   end
 
   @impl WebSock
@@ -339,23 +366,45 @@ defmodule Vagus.API.CoreProxy.WSBridge.Upstream do
 
   ## Pending caller frames
 
-  `WSBridge.handle_in/2` casts every caller frame here unconditionally once
-  the caller itself is past `:awaiting_auth` (see that module's moduledoc) —
-  including frames that arrive before `ha_ready?`. `handle_cast/2` buffers
-  those in `pending` (newest-first, flushed in order once `ha_ready?`
-  flips) — the literal extension of `Vagus.Ingress.WSBridge.Upstream`'s own
-  pending-buffer idiom the plan calls for, just gated on `ha_ready?` instead
-  of `upgraded?` alone. It carries the same W3 cap as that module
+  `WSBridge.handle_in/2` calls (`GenServer.call/3`, issue #37 — see that
+  module's moduledoc's "bounded synchronous handoff" section) here for every
+  caller frame once the caller itself is past `:awaiting_auth`, including
+  frames that arrive before `ha_ready?`. `handle_call/3` buffers those in
+  `pending` (newest-first, flushed in order once `ha_ready?` flips) — the
+  literal extension of `Vagus.Ingress.WSBridge.Upstream`'s own pending-buffer
+  idiom the plan calls for, just gated on `ha_ready?` instead of `upgraded?`
+  alone. It carries the same W3 cap as that module
   (`:core_ws_pending_max_bytes` / `:core_ws_pending_max_frames`, defaulting to
-  4 MiB / 256): a cast that would push `pending` past either bound is folded
-  into the 1011-close path (`buffer_frame/3` → `:overflow`), so an
-  authorized-but-compromised or misbehaving add-on flooding the pre-`ha_ready?`
-  window cannot grow the buffer without limit and OOM a 1GB board. From the
-  caller's side a buffer-overflow disconnect and a transport-error disconnect
-  are indistinguishable, and needn't be. The window this bounds is already
-  short (the shared ~10s auth deadline), and the caller is an authenticated
-  `homeassistant_api: true` add-on rather than an anonymous browser — but the
-  cap costs nothing and closes the OOM primitive regardless.
+  4 MiB / 256): a call that would push `pending` past either bound is folded
+  into the 1011-close path (`buffer_frame/3` → `:overflow`, replying `:ok`
+  then stopping — see "Steady-state backpressure" below for why the reply
+  comes first), so an authorized-but-compromised or misbehaving add-on
+  flooding the pre-`ha_ready?` window cannot grow the buffer without limit and
+  OOM a 1GB board. From the caller's side a buffer-overflow disconnect and a
+  transport-error disconnect are indistinguishable, and needn't be. The
+  window this bounds is already short (the shared ~10s auth deadline), and
+  the caller is an authenticated `homeassistant_api: true` add-on rather than
+  an anonymous browser — but the cap costs nothing and closes the OOM
+  primitive regardless.
+
+  ## Steady-state backpressure (issue #37)
+
+  Once `ha_ready?`, every caller frame is sent straight to Core
+  (`do_send_frame/3` → `Mint.WebSocket.stream_request_body/3` →
+  `:gen_tcp.send`), which **blocks** if Core's own socket buffer is full. A
+  `handle_call/3` clause replies only after that send returns (success or
+  error), so `WSBridge`'s blocked `GenServer.call/3` is what makes the
+  caller's `handle_in/2` stop reading its own socket for as long as the send
+  is wedged — TCP backpressure to the caller instead of an unbounded
+  `Upstream` mailbox. The Core-side Mint connection's own `send_timeout`
+  (5s default, `:core_ws_send_timeout`) is what actually resolves a wedged
+  send in the normal case, well before `WSBridge`'s own (larger, 10s default)
+  call timeout would need to act as a backstop — a timed-out send surfaces
+  as an ordinary `{:error, state}` from `do_send_frame/3`, same as any other
+  transport error. Reverse-direction `{:relay, ...}` frames queue in
+  `WSBridge`'s mailbox for at most one call's duration (normally µs; bounded
+  by whichever timeout fires) — the bounded head-of-line tradeoff the issue
+  explicitly accepts in exchange for a bounded mailbox.
 
   ## Heartbeat (fact 8's `heartbeat=30`)
 
@@ -404,10 +453,10 @@ defmodule Vagus.API.CoreProxy.WSBridge.Upstream do
           upgraded?: boolean(),
           auth_sent?: boolean(),
           ha_ready?: boolean(),
-          # Newest-first (prepended on cast, reversed on flush) — same
+          # Newest-first (prepended on each call, reversed on flush) — same
           # convention as `Vagus.Ingress.WSBridge.Upstream`'s own `pending`.
           # `pending_frames`/`pending_bytes` track its size against the W3 cap
-          # without an O(n) recount per cast.
+          # without an O(n) recount per call.
           pending: [{WebSock.data_opcode(), binary()}],
           pending_frames: non_neg_integer(),
           pending_bytes: non_neg_integer(),
@@ -473,7 +522,22 @@ defmodule Vagus.API.CoreProxy.WSBridge.Upstream do
     http_scheme = if uri.scheme == "https", do: :https, else: :http
     ws_scheme = if http_scheme == :https, do: :wss, else: :ws
 
-    case Mint.HTTP.connect(http_scheme, uri.host, uri.port, mode: :active, protocols: [:http1]) do
+    connect_opts = [
+      mode: :active,
+      protocols: [:http1],
+      # issue #37: without this, a wedged `:gen_tcp.send` (Core's socket
+      # buffer full) blocks forever — after `WSBridge`'s own handoff timeout
+      # gives up and closes the caller leg, `terminate/2`'s `GenServer.stop/3`
+      # can't be processed by a process stuck inside `handle_call/3`, so this
+      # GenServer would leak (blocked, holding a socket) indefinitely.
+      # `send_timeout_close: true` closes the socket outright on a timed-out
+      # send rather than leaving it half-open. A timed-out send surfaces as
+      # `stream_request_body`'s ordinary `{:error, conn, reason}` tuple, so it
+      # flows through the same path as any other transport error.
+      transport_opts: [send_timeout: core_ws_send_timeout_ms(), send_timeout_close: true]
+    ]
+
+    case Mint.HTTP.connect(http_scheme, uri.host, uri.port, connect_opts) do
       {:ok, conn} ->
         case Mint.WebSocket.upgrade(ws_scheme, conn, @core_ws_path, []) do
           {:ok, conn, ref} ->
@@ -491,7 +555,10 @@ defmodule Vagus.API.CoreProxy.WSBridge.Upstream do
 
   defp core_base_url, do: Application.get_env(:vagus, :core_base_url, "http://localhost:8123")
 
-  ## Caller frames (cast from `WSBridge.handle_in/2`)
+  # issue #37: the Mint socket's own `send_timeout` — see `connect_and_upgrade/0`.
+  defp core_ws_send_timeout_ms, do: Application.get_env(:vagus, :core_ws_send_timeout, 5_000)
+
+  ## Caller frames (called from `WSBridge.handle_in/2`)
 
   @impl GenServer
   @doc """
@@ -500,27 +567,31 @@ defmodule Vagus.API.CoreProxy.WSBridge.Upstream do
   decoded transport error from Core: notify `WSBridge` with the 1011-mapped
   abnormal-loss message and stop. Overflowing the W3 cap
   (`:core_ws_pending_max_bytes` / `:core_ws_pending_max_frames`) folds into
-  that same 1011-close path — see `buffer_frame/3`.
+  that same 1011-close path — see `buffer_frame/3`. Every clause replies
+  `:ok` before stopping on the error/overflow paths (not just the success
+  path): the frame was genuinely accepted here, so the caller must not see a
+  spurious `:exit` for it — the real close still arrives via
+  `{:upstream_close, ...}`, same as it always has.
   """
-  def handle_cast({:frame, op, data}, %{ha_ready?: false} = state) do
+  def handle_call({:frame, op, data}, _from, %{ha_ready?: false} = state) do
     case buffer_frame(op, data, state) do
       {:ok, state} ->
-        {:noreply, state}
+        {:reply, :ok, state}
 
       :overflow ->
         send(state.parent, {:upstream_close, 1011, ""})
-        {:stop, :normal, state}
+        {:stop, :normal, :ok, state}
     end
   end
 
-  def handle_cast({:frame, op, data}, %{ha_ready?: true} = state) do
+  def handle_call({:frame, op, data}, _from, %{ha_ready?: true} = state) do
     case do_send_frame(op, data, state) do
       {:ok, state} ->
-        {:noreply, state}
+        {:reply, :ok, state}
 
       {:error, state} ->
         send(state.parent, {:upstream_close, 1011, ""})
-        {:stop, :normal, state}
+        {:stop, :normal, :ok, state}
     end
   end
 

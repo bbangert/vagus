@@ -5,10 +5,13 @@ defmodule Vagus.Ingress.WSBridgeTest.EchoHandler do
   Echoes text/binary frames verbatim; a special text command
   `"close:<code>:<reason>"` makes it close the connection with that exact
   code, to exercise `Vagus.Ingress.WSBridge`'s faithful close-code
-  propagation. Reports its own lifecycle (`init/1`/`terminate/2`) to the
-  test process via whatever pid was baked into its `state` at upgrade time,
-  so the test can observe both ends of the two-hop relay deterministically
-  (no sleeps).
+  propagation. `"stall"` parks the process in a `receive`-forever, never
+  reading another frame — the steady-state-backpressure tests' way of
+  making the add-on's own TCP socket buffer fill up (Bandit stops reading
+  once this handler stops returning from `handle_in/2`). Reports its own
+  lifecycle (`init/1`/`terminate/2`) to the test process via whatever pid
+  was baked into its `state` at upgrade time, so the test can observe both
+  ends of the two-hop relay deterministically (no sleeps).
   """
   @behaviour WebSock
 
@@ -26,6 +29,12 @@ defmodule Vagus.Ingress.WSBridgeTest.EchoHandler do
 
       _other ->
         {:push, {:text, "close:" <> rest}, state}
+    end
+  end
+
+  def handle_in({"stall", opcode: :text}, state) do
+    receive do
+      :never_sent -> {:ok, state}
     end
   end
 
@@ -234,7 +243,23 @@ defmodule Vagus.Ingress.WSBridgeTest do
 
     addon_pid =
       start_supervised!(
-        {Bandit, plug: FakeAddon, port: 0, thousand_island_options: [num_acceptors: 1]},
+        {Bandit,
+         plug: FakeAddon,
+         port: 0,
+         thousand_island_options: [
+           num_acceptors: 1,
+           # Small on purpose (issue #37's steady-state-backpressure tests):
+           # shrinks how much unread data the kernel absorbs before a
+           # stalled `EchoHandler` (parked in a `receive`-forever) actually
+           # wedges `Upstream`'s `:gen_tcp.send` — a handful of 256 KiB
+           # frames trips it instead of however much a default ~200KB
+           # buffer could soak up first. Small enough to slow throughput,
+           # not correctness: TCP/Mint fragment larger frames across
+           # multiple reads/writes transparently either way, so the
+           # existing round-trip tests (100KB binary included) are
+           # unaffected.
+           transport_options: [recbuf: 4096, buffer: 4096]
+         ]},
         id: :fake_addon_bandit
       )
 
@@ -268,7 +293,8 @@ defmodule Vagus.Ingress.WSBridgeTest do
       slug: slug,
       token: entry.ingress_token,
       proxy_host: "127.0.0.1",
-      proxy_port: proxy_port
+      proxy_port: proxy_port,
+      addon_port: addon_port
     }
   end
 
@@ -593,13 +619,17 @@ defmodule Vagus.Ingress.WSBridgeTest do
       {:ok, pid} = Vagus.Ingress.WSBridge.Upstream.start_link(args)
       ref = Process.monitor(pid)
 
-      GenServer.cast(pid, {:frame, :binary, :binary.copy(<<0>>, 10)})
+      # issue #37: the overflow branch replies `:ok` before stopping (see
+      # moduledoc) — the frame genuinely was accepted-then-doomed, so the
+      # caller must not see a spurious `:exit` here; the real close still
+      # arrives via `{:upstream_close, ...}` below.
+      :ok = GenServer.call(pid, {:frame, :binary, :binary.copy(<<0>>, 10)})
 
       assert_receive {:upstream_close, 1011, ""}, 2_000
       assert_receive {:DOWN, ^ref, :process, ^pid, _reason}, 2_000
     end
 
-    test "casting more than :pending_max_frames closes the parent with 1011", %{port: port} do
+    test "calling more than :pending_max_frames closes the parent with 1011", %{port: port} do
       args = %{
         parent: self(),
         ip: "127.0.0.1",
@@ -615,7 +645,9 @@ defmodule Vagus.Ingress.WSBridgeTest do
       {:ok, pid} = Vagus.Ingress.WSBridge.Upstream.start_link(args)
       ref = Process.monitor(pid)
 
-      for _ <- 1..4, do: GenServer.cast(pid, {:frame, :text, "hi"})
+      # The 4th call overflows (see comment above); every call, including
+      # that one, still replies `:ok` — see moduledoc.
+      for _ <- 1..4, do: :ok = GenServer.call(pid, {:frame, :text, "hi"})
 
       assert_receive {:upstream_close, 1011, ""}, 2_000
       assert_receive {:DOWN, ^ref, :process, ^pid, _reason}, 2_000
@@ -639,6 +671,121 @@ defmodule Vagus.Ingress.WSBridgeTest do
 
       assert_receive {:upstream_close, 1011, ""}, 2_000
       assert_receive {:DOWN, ^ref, :process, ^pid, _reason}, 2_000
+    end
+  end
+
+  ## 10-11 (issue #37): Upstream driven directly against the real (small-buffer)
+  ## `FakeAddon`, whose `EchoHandler` can be told to stall post-upgrade —
+  ## steady-state backpressure, as opposed to the pre-upgrade W3 scenarios above.
+
+  describe "Upstream direct (issue #37: steady-state backpressure)" do
+    test "a send wedged on a stalled add-on trips send_timeout, closes the parent with 1011, and keeps the mailbox bounded",
+         %{addon_port: addon_port} do
+      args = %{
+        parent: self(),
+        ip: "127.0.0.1",
+        port: addon_port,
+        path: "/ws",
+        protocols: [],
+        headers: [],
+        send_timeout_ms: 200
+      }
+
+      {:ok, pid} = Vagus.Ingress.WSBridge.Upstream.start_link(args)
+      ref = Process.monitor(pid)
+
+      assert_receive {:echo_init, _path, _query}, 2_000
+      :ok = GenServer.call(pid, {:frame, :text, "stall"}, 2_000)
+
+      payload = :binary.copy(<<0>>, 256 * 1024)
+      queue_lens = flood_until_wedged(pid, payload, [])
+
+      # Every `assert_receive` bound in this suite is generous on purpose —
+      # see `Vagus.API.CoreProxyWSTest`'s `@recv_timeout` comment, the same
+      # CI-scheduler-starvation history applies here.
+      assert_receive {:upstream_close, 1011, ""}, 30_000
+      assert_receive {:DOWN, ^ref, :process, ^pid, _reason}, 30_000
+
+      # The regression check: the call-based handoff (issue #37), not an
+      # unbounded mailbox, is what absorbed the flood.
+      assert Enum.all?(queue_lens, &(&1 < 10))
+    end
+
+    test "a caller call with a tighter timeout than send_timeout exits :timeout — the handoff blocks rather than queuing",
+         %{addon_port: addon_port} do
+      args = %{
+        parent: self(),
+        ip: "127.0.0.1",
+        port: addon_port,
+        path: "/ws",
+        protocols: [],
+        headers: [],
+        # Large enough that Upstream's own send_timeout never resolves this
+        # within the test — the point is proving the CALLER's own (small)
+        # `GenServer.call` timeout is what bounds the wait, not Upstream's.
+        send_timeout_ms: 60_000
+      }
+
+      {:ok, pid} = Vagus.Ingress.WSBridge.Upstream.start_link(args)
+
+      assert_receive {:echo_init, _path, _query}, 2_000
+      :ok = GenServer.call(pid, {:frame, :text, "stall"}, 2_000)
+
+      payload = :binary.copy(<<0>>, 256 * 1024)
+
+      assert flood_until_call_timeout(pid, payload) == :timeout
+
+      # `pid` is left blocked inside a `:gen_tcp.send` that (by design, this
+      # test's whole point) won't resolve on its own for 60s — clean it up
+      # rather than let it linger for the rest of the suite. Unlink first:
+      # `start_link/1` linked it to this (non-trapping) test process, and the
+      # `:killed` exit signal would otherwise race the test's own completion
+      # report and kill the test with it.
+      Process.unlink(pid)
+      Process.exit(pid, :kill)
+    end
+  end
+
+  # Floods `pid` with `payload` frames via `GenServer.call/3` (generous
+  # per-call timeout — the point is proving the wedge resolves via
+  # `send_timeout`, not racing it) until the wedged send trips it and
+  # `Upstream` stops, sampling `:message_queue_len` after every accepted call
+  # along the way. Bounded to 500 iterations: on a healthy build the wedge
+  # trips within a handful of 256 KiB frames against this module's
+  # small-kernel-buffer `FakeAddon`.
+  defp flood_until_wedged(_pid, _payload, samples) when length(samples) >= 500, do: samples
+
+  defp flood_until_wedged(pid, payload, samples) do
+    if mailbox_has_upstream_close?() do
+      samples
+    else
+      :ok = GenServer.call(pid, {:frame, :binary, payload}, 5_000)
+      flood_until_wedged(pid, payload, [queue_len(pid) | samples])
+    end
+  end
+
+  # Same flood, but every call uses the SAME tight timeout `handle_in/2`
+  # itself would use as its handoff timeout — the first call the wedged
+  # send can't complete within that window raises `exit(:timeout, ...)`,
+  # caught here and returned as `:timeout`.
+  defp flood_until_call_timeout(pid, payload) do
+    GenServer.call(pid, {:frame, :binary, payload}, 200)
+    flood_until_call_timeout(pid, payload)
+  catch
+    :exit, {:timeout, _} -> :timeout
+  end
+
+  defp mailbox_has_upstream_close? do
+    case Process.info(self(), :messages) do
+      {:messages, msgs} -> Enum.any?(msgs, &match?({:upstream_close, 1011, ""}, &1))
+      nil -> false
+    end
+  end
+
+  defp queue_len(pid) do
+    case Process.info(pid, :message_queue_len) do
+      {:message_queue_len, n} -> n
+      nil -> 0
     end
   end
 end
