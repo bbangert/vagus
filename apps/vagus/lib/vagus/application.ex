@@ -135,6 +135,16 @@ defmodule Vagus.Application do
           # Versions before the first 120s probe tick could ever act).
           Vagus.Core.Watchdog.Supervisor,
 
+          # First-boot provisioning (issue #40): auto-expand /data + auto-
+          # install/start HA Core, so flash → power → network → the HA
+          # onboarding wizard needs zero console commands. Unconditional
+          # child, `:ignore` unless `config :vagus, :first_boot_provision` is
+          # set (only target.exs sets it — no real disk/Core to provision on
+          # :host/test). Placed after `Vagus.Core.Boot` so boot-time adoption
+          # seeds `Vagus.Core.Versions` first, keeping the already-installed
+          # path a cheap no-op.
+          Vagus.Provisioner,
+
           # Auto-installs + boots the default native provider (the mqttx broker,
           # M5-P5). `:ignore` unless `config :vagus, :default_native_addon` is set
           # (only target.exs sets it). Placed last so `Native.Supervisor`,
