@@ -112,11 +112,14 @@ defmodule Vagus.Host.Shutdown do
   `one_for_one` supervisor mid-shutdown-window: a crash-and-restart of the
   watchdog process during the stop stages must still see the flag, and a
   value living in the watchdog's own (about-to-be-replaced) process state
-  couldn't guarantee that. The flag is deliberately never cleared — the
-  reboot/poweroff this module was called to perform always follows the
-  stop stages (see "Availability over cleanliness"), so there is no
-  "shutdown aborted, resume normal watchdog behavior" state to return to;
-  the device is going down regardless of how the stop stages fared.
+  couldn't guarantee that. The flag stays set once the stop stages finish —
+  the reboot/poweroff this module was called to perform always follows
+  them (see "Availability over cleanliness"), so there is no "shutdown
+  aborted, resume normal watchdog behavior" state to return to in that
+  case. The one exception is `call_runtime/2` itself failing: if the
+  runtime delegate raises/exits/throws, the device is *not* going down, so
+  `do_run/2` erases the flag and re-raises — the watchdogs must resume on
+  a box that is still running.
 
   The Core lifecycle watchdog (paired event+probe checks on the HA Core
   container, not add-ons) needs no equivalent: its event half only counts
@@ -213,8 +216,10 @@ defmodule Vagus.Host.Shutdown do
   defp do_run(kind, opts) do
     started_at = System.monotonic_time(:millisecond)
     # Set BEFORE the stop stages begin — see moduledoc "Watchdog stand-down".
-    # Never cleared: the reboot/poweroff below always follows regardless of
-    # how the stop stages fared, so there is no "back to normal" state.
+    # Left set once the stop stages finish: the reboot/poweroff below always
+    # follows them, so there is no "back to normal" state — UNLESS
+    # call_runtime/2 itself fails below, in which case the device is not
+    # going down and the flag must come back off.
     :persistent_term.put({__MODULE__, :in_flight}, true)
     {addon_result, core_result} = bounded_stop_stages(kind, opts)
     {ok_count, total} = addon_result
@@ -225,7 +230,28 @@ defmodule Vagus.Host.Shutdown do
         "core #{inspect(core_result)}, elapsed #{elapsed}ms"
     )
 
-    call_runtime(kind, opts)
+    try do
+      call_runtime(kind, opts)
+    rescue
+      exception ->
+        Logger.error(
+          "Vagus.Host.Shutdown: runtime #{kind} call raised, device is NOT going down — " <>
+            "clearing in-flight flag (#{Exception.format(:error, exception, __STACKTRACE__)})"
+        )
+
+        :persistent_term.erase({__MODULE__, :in_flight})
+        reraise exception, __STACKTRACE__
+    catch
+      kind_caught, reason ->
+        Logger.error(
+          "Vagus.Host.Shutdown: runtime #{kind} call #{kind_caught}ed, device is NOT going " <>
+            "down — clearing in-flight flag (#{inspect(reason)})"
+        )
+
+        :persistent_term.erase({__MODULE__, :in_flight})
+        :erlang.raise(kind_caught, reason, __STACKTRACE__)
+    end
+
     :ok
   end
 

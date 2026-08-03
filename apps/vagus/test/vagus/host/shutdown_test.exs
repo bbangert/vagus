@@ -134,6 +134,7 @@ defmodule Vagus.Host.ShutdownTest do
     refute Shutdown.in_flight?()
     assert Shutdown.reboot(opts) == :ok
     assert_receive {:in_flight_during_core, true}
+    assert Shutdown.in_flight?()
   end
 
   ## 4: :busy retried, then succeeds
@@ -320,5 +321,45 @@ defmodule Vagus.Host.ShutdownTest do
 
     assert Shutdown.reboot(opts) == :ok
     assert_receive :runtime_called
+  end
+
+  ## 11: a raising :runtime_reboot propagates and clears the in-flight flag
+
+  test "a raising :runtime_reboot propagates out of reboot/1 and clears the in-flight flag" do
+    test_pid = self()
+
+    opts = [
+      addons: fn -> [] end,
+      stop_core: fn ->
+        send(test_pid, :core_stopped)
+        :ok
+      end,
+      runtime_reboot: fn -> raise "runtime exploded" end
+    ]
+
+    assert_raise RuntimeError, "runtime exploded", fn -> Shutdown.reboot(opts) end
+
+    assert_received :core_stopped
+    refute Shutdown.in_flight?()
+  end
+
+  ## 12: a throwing :runtime_poweroff propagates and clears the in-flight flag
+
+  test "a throwing :runtime_poweroff propagates out of poweroff/1 and clears the in-flight flag" do
+    test_pid = self()
+
+    opts = [
+      addons: fn -> [] end,
+      stop_core: fn ->
+        send(test_pid, :core_stopped)
+        :ok
+      end,
+      runtime_poweroff: fn -> throw(:boom) end
+    ]
+
+    assert catch_throw(Shutdown.poweroff(opts)) == :boom
+
+    assert_received :core_stopped
+    refute Shutdown.in_flight?()
   end
 end
