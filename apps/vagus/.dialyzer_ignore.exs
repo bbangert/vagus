@@ -46,6 +46,9 @@
   # Core.Boot's default_ping/0 wraps Docker.ping/0 — same cascade as
   # boot_starter.ex below.
   {"lib/vagus/core/boot.ex", :no_return},
+  # Provisioner's default_ping/0 wraps Docker.ping/0 — same cascade as
+  # boot.ex above (vagus-first-boot-provisioning, issue #40).
+  {"lib/vagus/provisioner.ex", :no_return},
   {"lib/vagus/addon/boot_starter.ex", :no_return},
   # default_ensure_network's `{:ok, _id} <- Network.ensure()` — same cascade as
   # manager.ex:pattern_match below: the stubbed socket makes dialyzer infer the

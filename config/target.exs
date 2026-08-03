@@ -134,6 +134,11 @@ config :vagus, :core_boot, true
 # the persisted TokenStore `watchdog` option (POST /core/options).
 config :vagus, :core_watchdog, true
 
+# First-boot provisioning (issue #40): auto-expand /data + auto-install/
+# start HA Core — see `Vagus.Provisioner` for the 4Kn/ordering rationale.
+# Same target-only `:ignore` convention as :core_boot/:core_watchdog above.
+config :vagus, :first_boot_provision, true
+
 # Core-facing token handshake (P3-T1/T2) — see config/host.exs for the
 # rationale, identical on target.
 config :vagus, :core_token_path, "/data/vagus/core_token.json"
