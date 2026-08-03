@@ -307,12 +307,15 @@ defmodule Vagus.Host.ShutdownTest do
 
   ## 10: crash resilience — a raising :addons fun still lets the runtime call happen
 
-  test "an :addons fun that raises still lets the runtime call happen (degraded, not blocked)" do
+  test "an :addons fun that raises still lets stop_core and the runtime call happen (degraded, not blocked)" do
     test_pid = self()
 
     opts = [
       addons: fn -> raise "boom" end,
-      stop_core: fn -> :ok end,
+      stop_core: fn ->
+        send(test_pid, :core_stopped)
+        :ok
+      end,
       runtime_reboot: fn ->
         send(test_pid, :runtime_called)
         :ok
@@ -320,6 +323,30 @@ defmodule Vagus.Host.ShutdownTest do
     ]
 
     assert Shutdown.reboot(opts) == :ok
+    assert_receive :core_stopped
+    assert_receive :runtime_called
+  end
+
+  ## 13: crash resilience — a throwing :stop_core still lets add-ons and the runtime call happen
+
+  test "a :stop_core fun that throws still lets add-ons and the runtime call happen (degraded, not blocked)" do
+    test_pid = self()
+
+    opts = [
+      addons: fn -> [docker_addon("a")] end,
+      stop_addon: fn name, _timeout_s ->
+        send(test_pid, {:addon_stopped, name})
+        :ok
+      end,
+      stop_core: fn -> throw(:boom) end,
+      runtime_reboot: fn ->
+        send(test_pid, :runtime_called)
+        :ok
+      end
+    ]
+
+    assert Shutdown.reboot(opts) == :ok
+    assert_receive {:addon_stopped, "addon_a"}
     assert_receive :runtime_called
   end
 

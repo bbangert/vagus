@@ -271,13 +271,17 @@ defmodule Vagus.Host.Shutdown do
   # try/rescue/catch too: `Vagus.Jobs.TaskSupervisor` not being available
   # (or any other setup failure before the task even starts) must still
   # fall through to the runtime call, never crash the caller out of the
-  # reboot it asked for.
+  # reboot it asked for. `stop_addons/1` is called through `safe_stop_addons/1`
+  # (mirroring `stop_core/1`'s own rescue/catch) so a crash in the add-on
+  # stage degrades only that stage's result instead of killing the whole
+  # task and skipping `stop_core/1` — the most corruption-sensitive stage —
+  # entirely.
   defp bounded_stop_stages(kind, opts) do
     total_budget_ms = Keyword.get(opts, :total_budget_ms, @total_budget_ms)
 
     task =
       Task.Supervisor.async_nolink(Vagus.Jobs.TaskSupervisor, fn ->
-        {stop_addons(opts), stop_core(opts)}
+        {safe_stop_addons(opts), stop_core(opts)}
       end)
 
     case Task.yield(task, total_budget_ms) || Task.shutdown(task, :brutal_kill) do
@@ -310,6 +314,28 @@ defmodule Vagus.Host.Shutdown do
   defp degraded_result, do: {{0, 0}, {:error, :not_run}}
 
   ## stop_addons/1
+
+  # Rescue/catch wrapper around `stop_addons/1` — see `bounded_stop_stages/2`
+  # for why: a crash there must degrade only the add-on result, not take
+  # `stop_core/1` down with it inside the shared task.
+  defp safe_stop_addons(opts) do
+    stop_addons(opts)
+  rescue
+    exception ->
+      Logger.warning(
+        "Vagus.Host.Shutdown: add-on stop stage raised, proceeding: " <>
+          "#{Exception.format(:error, exception, __STACKTRACE__)}"
+      )
+
+      {0, 0}
+  catch
+    kind_caught, reason ->
+      Logger.warning(
+        "Vagus.Host.Shutdown: add-on stop stage #{kind_caught}ed, proceeding: #{inspect(reason)}"
+      )
+
+      {0, 0}
+  end
 
   # Deliberately NOT `Vagus.Addon.Manager.stop/2` — that REMOVES the
   # container (upstream parity for user-initiated stops); a reboot must
@@ -406,6 +432,11 @@ defmodule Vagus.Host.Shutdown do
       )
 
       {:error, {:raised, exception}}
+  catch
+    kind_caught, reason ->
+      Logger.warning("Vagus.Host.Shutdown: core stop #{kind_caught}ed (#{inspect(reason)})")
+
+      {:error, {kind_caught, reason}}
   end
 
   defp stop_core_with_retry(stop_core_fun, stage_started_at, budget_ms, backoff_ms) do
