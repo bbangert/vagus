@@ -441,7 +441,13 @@ defmodule Vagus.Addon.Manager do
 
   defp put_backend(opts, %Config{}), do: opts
 
-  defp native_allowed?(slug) do
+  # Public (not private) because `Vagus.Host.Shutdown`'s add-on stop stage
+  # needs this exact allowlist check to skip container-less native add-ons
+  # (the in-BEAM mqttx broker has no `addon_<slug>` container to
+  # docker-stop) — shared logic, not a new rule.
+  @doc false
+  @spec native_allowed?(String.t()) :: boolean()
+  def native_allowed?(slug) do
     slug in Application.get_env(:vagus, :native_addon_slugs, ["core_mqtt"])
   end
 

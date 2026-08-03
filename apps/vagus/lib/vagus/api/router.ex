@@ -316,6 +316,12 @@ defmodule Vagus.API.Router do
   # decouples the side effect from this request's process entirely (rather
   # than calling it inline right after `send_ok`) so a real target reboot,
   # which may never return, can't be mistaken for blocking the response.
+  #
+  # The decoupled task now runs the graceful container-stop sequence
+  # (`Vagus.Host.Shutdown`, up to ~5 min) before the box drops. `Task.start/1`
+  # is unlinked and unsupervised, so nothing times it out or takes the
+  # request process down with it — clients polling after the 200 see a live
+  # API until the end, matching upstream Supervisor UX.
   post "/host/reboot" do
     conn = Envelope.send_ok(conn, %{})
     Task.start(fn -> run_host_action(:reboot, fn -> Backend.host().reboot() end) end)

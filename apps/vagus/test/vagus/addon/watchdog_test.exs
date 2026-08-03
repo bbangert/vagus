@@ -442,6 +442,49 @@ defmodule Vagus.Addon.WatchdogTest do
     refute_receive {:start_slug, ^slug}, 200
   end
 
+  ## 9 (issue #39): shutdown_check gates maybe_start_sequence/3
+
+  test "shutdown_check: true suppresses a die event for an otherwise-eligible slug — no restart sequence",
+       %{state_pid: state_pid} do
+    slug = unique_slug("wd")
+    seed(state_pid, slug, :started, true)
+    set_manager_result(always({:ok, %{}}))
+
+    pid =
+      start_watchdog(
+        state: state_pid,
+        manager: FakeManager,
+        running_check: fn _slug -> false end,
+        backoff_base_ms: 5,
+        shutdown_check: fn -> true end
+      )
+
+    send(pid, die_event(slug))
+
+    refute_receive {:start_slug, ^slug}, 200
+  end
+
+  test "shutdown_check: false (explicitly injected) leaves the same event free to restart", %{
+    state_pid: state_pid
+  } do
+    slug = unique_slug("wd")
+    seed(state_pid, slug, :started, true)
+    set_manager_result(always({:ok, %{}}))
+
+    pid =
+      start_watchdog(
+        state: state_pid,
+        manager: FakeManager,
+        running_check: fn _slug -> false end,
+        backoff_base_ms: 5,
+        shutdown_check: fn -> false end
+      )
+
+    send(pid, die_event(slug))
+
+    assert_receive {:start_slug, ^slug}, 500
+  end
+
   defmodule FakeManager do
     @moduledoc false
 

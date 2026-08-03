@@ -28,6 +28,21 @@ defmodule Vagus.Addon.Watchdog.Probe do
       after N tries" ladder here, because a fresh probe 120s later gets its
       own fair shot regardless of how the last restart went.
 
+  ## Watchdog stand-down (issue #39)
+
+  Like `Vagus.Addon.Watchdog`'s own third suppression, this module stands
+  down entirely while a host shutdown is actually in progress. A stopped
+  `host_network` add-on resolves `host_ip_fun` to `127.0.0.1` same as ever
+  (there's no "container gone" signal for host-networked add-ons the way
+  there is for bridge-mode ones — see "Host-IP resolution failure" above),
+  so every probe against it during `Vagus.Host.Shutdown`'s stop stage would
+  strike `:unhealthy` and, after two ticks, fire exactly the restart this
+  whole facade exists to prevent — see `Vagus.Host.Shutdown`'s moduledoc
+  "Watchdog stand-down" section for why the flag lives in
+  `:persistent_term` and is never cleared. `run_tick/1` checks
+  `:shutdown_check` before anything else and skips the entire tick (no
+  probing, no counter changes, no restarts) whenever it's true.
+
   Both watchdogs can be — and normally are — active simultaneously for the
   same add-on: the container-event watchdog catches a crash/OOM-kill almost
   instantly; this probe is the only thing that notices a container that's
@@ -117,6 +132,10 @@ defmodule Vagus.Addon.Watchdog.Probe do
       wedged restart task's `st.tasks` entry after this many ms regardless
       of what's hanging inside it (review W1), default `1_800_000` (30
       min) — mirrors `Vagus.Addon.Watchdog`'s identical failsafe.
+    * `:shutdown_check` — zero-arity `-> boolean`, default
+      `Vagus.Host.Shutdown.in_flight?/0`. Checked at the top of every tick;
+      `true` skips the entire tick (see moduledoc "Watchdog stand-down"
+      section, above).
 
   Gated in `Vagus.Application` by the same `config :vagus, :watchdog_enabled`
   flag as `Vagus.Addon.Watchdog` — both watchdog halves turn on/off together.
@@ -163,6 +182,7 @@ defmodule Vagus.Addon.Watchdog.Probe do
       attempt_timeout_ms: Keyword.get(opts, :attempt_timeout_ms, @default_attempt_timeout_ms),
       sequence_deadline_ms:
         Keyword.get(opts, :sequence_deadline_ms, @default_sequence_deadline_ms),
+      shutdown_check: Keyword.get(opts, :shutdown_check, &Vagus.Host.Shutdown.in_flight?/0),
       # slug -> consecutive-unhealthy-tick count. Entirely separate in-memory
       # state from Vagus.Addon.Watchdog's own counters (§B6.5).
       failures: %{},
@@ -240,12 +260,26 @@ defmodule Vagus.Addon.Watchdog.Probe do
   ## Tick
 
   defp run_tick(st) do
-    entries = State.list(st.state_server)
-    live_slugs = MapSet.new(entries, & &1.config.slug)
+    if st.shutdown_check.() do
+      # See moduledoc "Watchdog stand-down" — a host shutdown in progress
+      # means every started add-on's container is being (or about to be)
+      # `docker stop`ed by `Vagus.Host.Shutdown` without a matching `:stopped`
+      # write, so a probe run here would strike `:unhealthy` against
+      # containers that are supposed to be down and restart them straight
+      # into erlinit's SIGKILL. State is left untouched; the next tick
+      # re-checks (the flag itself is never cleared, but the device is going
+      # down regardless).
+      Logger.info("Vagus.Addon.Watchdog.Probe: host shutdown in flight; skipping probe tick")
 
-    st = %{st | failures: prune_failures(st.failures, live_slugs)}
+      st
+    else
+      entries = State.list(st.state_server)
+      live_slugs = MapSet.new(entries, & &1.config.slug)
 
-    Enum.reduce(entries, st, &maybe_probe/2)
+      st = %{st | failures: prune_failures(st.failures, live_slugs)}
+
+      Enum.reduce(entries, st, &maybe_probe/2)
+    end
   end
 
   defp prune_failures(failures, live_slugs) do
