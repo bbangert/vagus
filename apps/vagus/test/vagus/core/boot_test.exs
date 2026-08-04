@@ -121,6 +121,164 @@ defmodule Vagus.Core.BootTest do
     assert log =~ "nope"
   end
 
+  test "adopted container is running -> :start is NOT called, adopt log only" do
+    parent = self()
+
+    log =
+      capture_log(fn ->
+        start_supervised!(
+          {Boot,
+           ping: fn -> :ok end,
+           adopt: fn ->
+             {:adopted, %{"Id" => "abc123def456", "State" => %{"Running" => true}}}
+           end,
+           start: fn ->
+             send(parent, :start_called)
+             :ok
+           end,
+           interval: 1,
+           max_attempts: 5,
+           name: nil}
+        )
+
+        Process.sleep(50)
+      end)
+
+    refute_received :start_called
+    assert log =~ "adopted Core container abc123def456"
+    refute log =~ "starting"
+  end
+
+  test "adopted container is stopped -> :start is called, flow completes" do
+    parent = self()
+
+    log =
+      capture_log(fn ->
+        start_supervised!(
+          {Boot,
+           ping: fn -> :ok end,
+           adopt: fn ->
+             {:adopted, %{"Id" => "abc123def456", "State" => %{"Running" => false}}}
+           end,
+           start: fn ->
+             send(parent, :start_called)
+             :ok
+           end,
+           interval: 1,
+           max_attempts: 5,
+           name: nil}
+        )
+
+        assert_receive :start_called, 1_000
+        Process.sleep(20)
+      end)
+
+    assert log =~ "adopted Core container abc123def456"
+    assert log =~ "adopted stopped Core container abc123def456 — starting"
+    assert log =~ "issue #46"
+  end
+
+  test "adopted container's State is missing/odd shape -> treated as not running, :start called" do
+    parent = self()
+
+    log =
+      capture_log(fn ->
+        start_supervised!(
+          {Boot,
+           ping: fn -> :ok end,
+           adopt: fn ->
+             {:adopted, %{"Id" => "abc123def456"}}
+           end,
+           start: fn ->
+             send(parent, :start_called)
+             :ok
+           end,
+           interval: 1,
+           max_attempts: 5,
+           name: nil}
+        )
+
+        assert_receive :start_called, 1_000
+        Process.sleep(20)
+      end)
+
+    assert log =~ "adopted stopped Core container abc123def456 — starting"
+  end
+
+  test ":absent adopt result -> :start is NOT called" do
+    parent = self()
+
+    capture_log(fn ->
+      start_supervised!(
+        {Boot,
+         ping: fn -> :ok end,
+         adopt: fn -> :absent end,
+         start: fn ->
+           send(parent, :start_called)
+           :ok
+         end,
+         interval: 1,
+         max_attempts: 5,
+         name: nil}
+      )
+
+      Process.sleep(50)
+    end)
+
+    refute_received :start_called
+  end
+
+  test "{:error, reason} adopt result -> :start is NOT called" do
+    parent = self()
+
+    capture_log(fn ->
+      start_supervised!(
+        {Boot,
+         ping: fn -> :ok end,
+         adopt: fn -> {:error, :nope} end,
+         start: fn ->
+           send(parent, :start_called)
+           :ok
+         end,
+         interval: 1,
+         max_attempts: 5,
+         name: nil}
+      )
+
+      Process.sleep(50)
+    end)
+
+    refute_received :start_called
+  end
+
+  test "adopted stopped container whose :start returns {:error, :busy} -> logs a warning, no crash" do
+    parent = self()
+
+    log =
+      capture_log(fn ->
+        pid =
+          start_supervised!(
+            {Boot,
+             ping: fn -> :ok end,
+             adopt: fn ->
+               {:adopted, %{"Id" => "abc123def456", "State" => %{"Running" => false}}}
+             end,
+             start: fn -> {:error, :busy} end,
+             interval: 1,
+             max_attempts: 5,
+             name: nil}
+          )
+
+        Process.sleep(50)
+        send(parent, {:pid, pid})
+      end)
+
+    assert_received {:pid, pid}
+    assert Process.alive?(pid)
+    assert log =~ "start failed"
+    assert log =~ "busy"
+  end
+
   test "engine never ready (all pings fail) -> gives up with a warning, never adopts" do
     parent = self()
 
