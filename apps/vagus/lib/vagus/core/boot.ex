@@ -22,7 +22,19 @@ defmodule Vagus.Core.Boot do
 
     * `{:adopted, info}` → info log, including the container id (short
       form) — the hand-made/previously-running Core container was found
-      and adopted as-is.
+      and adopted as-is. If the adopted container is NOT running
+      (`info["State"]["Running"] != true`), a second info log follows and
+      `opts[:start]` (default `fn -> Vagus.Core.Lifecycle.start() end`) is
+      called to bring it up — a warning is logged if that returns
+      anything other than `:ok` (no retry loop in v1). This exists
+      because of issue #46: since #44's graceful-shutdown facade
+      (`Vagus.Host.Shutdown`) `docker stop`s Core before reboot, the
+      engine marks it manually-stopped, and its `unless-stopped` restart
+      policy deliberately never revives a manually-stopped container —
+      without this, every graceful reboot would leave Core `exited`
+      forever. Upstream Supervisor parity is to always bring Core up at
+      boot; a running adopted container keeps today's exact behavior (the
+      first info log only, no `:start` call).
     * `:absent` → **warning** log. This module NEVER creates the Core
       container itself — v1 deliberately leaves that to an explicit
       `POST /core/start` or `POST /core/update` call (Phase 3), so an
@@ -59,6 +71,7 @@ defmodule Vagus.Core.Boot do
     state = %{
       ping: Keyword.get(opts, :ping, &default_ping/0),
       adopt: Keyword.get(opts, :adopt, &default_adopt/0),
+      start: Keyword.get(opts, :start, &default_start/0),
       interval: Keyword.get(opts, :interval, @default_interval),
       max_attempts: Keyword.get(opts, :max_attempts, @default_max_attempts),
       attempt: 0
@@ -93,10 +106,11 @@ defmodule Vagus.Core.Boot do
     end
   end
 
-  defp adopt_once(%{adopt: adopt}) do
+  defp adopt_once(%{adopt: adopt, start: start}) do
     case adopt.() do
       {:adopted, info} ->
         Logger.info("Vagus.Core.Boot: adopted Core container #{short_id(info)}")
+        maybe_start_stopped(info, start)
 
       :absent ->
         Logger.warning(
@@ -109,10 +123,36 @@ defmodule Vagus.Core.Boot do
     end
   end
 
+  # A running adopted container is left exactly as-is — upstream `attach()`
+  # never reconciles a running container either (see moduledoc).
+  defp maybe_start_stopped(info, start) do
+    unless adopted_running?(info) do
+      Logger.info(
+        "Vagus.Core.Boot: adopted stopped Core container #{short_id(info)} — starting " <>
+          "(left stopped by the pre-reboot graceful shutdown, issue #46)"
+      )
+
+      case start.() do
+        :ok ->
+          :ok
+
+        other ->
+          Logger.warning(
+            "Vagus.Core.Boot: start failed for #{short_id(info)} (#{inspect(other)})"
+          )
+      end
+    end
+  end
+
+  defp adopted_running?(%{"State" => %{"Running" => true}}), do: true
+  defp adopted_running?(_info), do: false
+
   defp short_id(%{"Id" => id}) when is_binary(id), do: String.slice(id, 0, 12)
   defp short_id(_info), do: "unknown"
 
   defp default_ping, do: Vagus.Runtime.Docker.ping()
 
   defp default_adopt, do: Vagus.Core.Lifecycle.adopt()
+
+  defp default_start, do: Vagus.Core.Lifecycle.start()
 end
