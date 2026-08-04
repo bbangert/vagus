@@ -2,7 +2,7 @@ defmodule VagusPlatform.MixProject do
   use Mix.Project
 
   @app :vagus_platform
-  @version "0.1.0"
+  @version "0.4.0"
   @all_targets [:rpi3_64, :dragon_q6a]
 
   def project do

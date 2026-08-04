@@ -27,6 +27,15 @@ defmodule Vagus.Backend.OS.HostStub do
     }
   end
 
+  # Honest "latest = what's installed" — there is no update feed for a
+  # dev host, and inventing one would sprout an update button that can't
+  # work (same nil-safety stance as `Vagus.Version.update_available?/2`).
+  @impl true
+  def version_latest, do: FirmwareKV.version(FirmwareKV.active_slot())
+
+  @impl true
+  def update(_version), do: {:error, :not_supported}
+
   @impl true
   def datadisk_list, do: []
 end

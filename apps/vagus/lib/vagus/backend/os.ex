@@ -14,6 +14,25 @@ defmodule Vagus.Backend.OS do
   @callback info() :: map()
 
   @doc """
+  The latest OS/firmware version the update feed advertises, or `nil`
+  when unknown (updater disabled, or no check has completed yet) — the
+  caller falls back to the current version, which reads as an honest
+  "no update".
+  """
+  @callback version_latest() :: String.t() | nil
+
+  @doc """
+  Starts an OS/firmware update (`POST os/update`). `version` is the
+  optional requested tag from the request body — only the feed's latest
+  can actually be installed (`{:error, {:version_mismatch, latest}}`
+  otherwise; the underlying updater has no install-specific-version
+  API). Returns `:ok` once the asynchronous download → flash → reboot
+  pipeline is accepted. See `Vagus.OS.Updater.install/2` for the error
+  vocabulary.
+  """
+  @callback update(String.t() | nil) :: :ok | {:error, term()}
+
+  @doc """
   The data-disk device list (no dedicated route in this phase — exposed
   for a future `GET os/datadisk/list`; both implementations return an
   honest empty list since no data-disk enumeration is simulated yet).
