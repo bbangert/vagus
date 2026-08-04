@@ -18,6 +18,10 @@ defmodule Vagus.Backend.Host do
   before the box actually goes down, so implementations that don't return
   (a real target reboot) are fine; the router never waits on this call to
   respond.
+
+  Real (`Nerves`) implementations must route through `Vagus.Host.Shutdown`
+  — never call `Nerves.Runtime` directly — so Core + add-on containers are
+  always stopped gracefully before the hardware-watchdog reboot arms.
   """
   @callback reboot() :: :ok
 

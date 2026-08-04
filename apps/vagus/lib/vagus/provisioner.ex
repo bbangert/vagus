@@ -80,7 +80,11 @@ defmodule Vagus.Provisioner do
   def init(opts) do
     state = %{
       cmd: Keyword.get(opts, :cmd, &default_cmd/2),
-      reboot: Keyword.get(opts, :reboot, &Nerves.Runtime.reboot/0),
+      # On the expand-data first-boot path, no Core/add-ons are installed yet
+      # in practice, so the facade's stop stages no-op fast — routed through
+      # it anyway to keep the "no direct Nerves.Runtime reboot callers"
+      # invariant (issue #39).
+      reboot: Keyword.get(opts, :reboot, &Vagus.Host.Shutdown.reboot/0),
       sysfs_root: Keyword.get(opts, :sysfs_root, @sysfs_root),
       rootdisk: Keyword.get(opts, :rootdisk, @rootdisk),
       ops_fw: Keyword.get(opts, :ops_fw, @ops_fw),

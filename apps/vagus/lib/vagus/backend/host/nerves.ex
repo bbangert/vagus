@@ -4,7 +4,9 @@ defmodule Vagus.Backend.Host.Nerves do
   `:inet.gethostname/0`, disk usage via `df -k /data`
   (`Vagus.Backend.Host.DiskUsage`, shared with `Vagus.Backend.Host.HostStub`),
   kernel via `/proc/sys/kernel/osrelease`, `operating_system` via
-  `/etc/os-release`, and `reboot/0`/`shutdown/0` via `Nerves.Runtime`.
+  `/etc/os-release`, and `reboot/0`/`shutdown/0` via `Vagus.Host.Shutdown`,
+  which gracefully stops Core + add-on containers first, then delegates to
+  `Nerves.Runtime`.
 
   `kernel/0` originally shelled out to `uname -r`, matching HAOS. The
   Nerves rootfs ships no `uname` binary, so that call always failed and
@@ -87,14 +89,14 @@ defmodule Vagus.Backend.Host.Nerves do
   @impl true
   def reboot do
     Logger.warning("Vagus.Backend.Host.Nerves: reboot requested")
-    Nerves.Runtime.reboot()
+    Vagus.Host.Shutdown.reboot()
     :ok
   end
 
   @impl true
   def shutdown do
     Logger.warning("Vagus.Backend.Host.Nerves: shutdown requested")
-    Nerves.Runtime.poweroff()
+    Vagus.Host.Shutdown.poweroff()
     :ok
   end
 

@@ -45,6 +45,25 @@ defmodule Vagus.Addon.Watchdog do
   so a stale `:started` record left over from before a reboot is corrected
   before this watchdog ever sees a live event for it.
 
+  A third suppression covers the window the other two can't: a host
+  shutdown *actually in progress* (`Vagus.Host.Shutdown`, issue #39's
+  graceful-shutdown facade). That module's own add-on stop stage runs
+  ordinary `docker stop` calls against every started add-on, but
+  deliberately does **not** record `:stopped` in `State` — its whole point
+  is that `Vagus.Addon.BootStarter` sees `:started` and restarts these
+  add-ons on the next boot, so the W6 mechanism above cannot apply here
+  (there is no `:stopped` for `eligible?/2` to find). Left unhandled, every
+  one of those stops would look to this watchdog exactly like an
+  unexpected crash and trigger a restart sequence *during* the shutdown
+  window — racing the reboot/poweroff that follows and getting the
+  freshly-restarted container SIGKILLed by erlinit, the exact corruption
+  `Vagus.Host.Shutdown` exists to prevent. `maybe_start_sequence/3`
+  therefore checks `:shutdown_check` (default
+  `Vagus.Host.Shutdown.in_flight?/0`) ahead of `eligible?/2` and stands down
+  for the rest of the shutdown once it flips true — see that module's
+  moduledoc "Watchdog stand-down" section for why the flag lives in
+  `:persistent_term` rather than here.
+
   A duplicate event for a slug whose restart sequence is already in flight
   is ignored outright — the sequence itself re-checks liveness (and
   `State`) before every attempt, so there's nothing a second event would
@@ -126,6 +145,11 @@ defmodule Vagus.Addon.Watchdog do
       what's hanging inside it (review W1), default `1_800_000` (30 min) —
       comfortably above the worst-case legitimate sequence (5 bounded
       attempts + the 10/20/40/80s backoff gaps between them).
+    * `:shutdown_check` — zero-arity `-> boolean`, default
+      `Vagus.Host.Shutdown.in_flight?/0`. Checked ahead of `eligible?/2` in
+      `maybe_start_sequence/3`; `true` stands the watchdog down for the
+      triggering event (see the moduledoc "Triggering events" section's
+      third suppression, above).
 
   Gated in `Vagus.Application` by `config :vagus, :watchdog_enabled`
   (default `true`, `false` in `config/test.exs`) — same pattern as
@@ -177,6 +201,7 @@ defmodule Vagus.Addon.Watchdog do
       attempt_timeout_ms: Keyword.get(opts, :attempt_timeout_ms, @default_attempt_timeout_ms),
       sequence_deadline_ms:
         Keyword.get(opts, :sequence_deadline_ms, @default_sequence_deadline_ms),
+      shutdown_check: Keyword.get(opts, :shutdown_check, &Vagus.Host.Shutdown.in_flight?/0),
       # slug -> %Task{}, one in-flight restart sequence per slug (the whole
       # struct, not just its ref, so the review-W1 sequence-deadline failsafe
       # below can `Task.shutdown/2` it directly).
@@ -282,6 +307,13 @@ defmodule Vagus.Addon.Watchdog do
   defp maybe_start_sequence(slug, action_type, state) do
     cond do
       Map.has_key?(state.tasks, slug) ->
+        {:noreply, state}
+
+      state.shutdown_check.() ->
+        Logger.info(
+          "Vagus.Addon.Watchdog: host shutdown in flight; ignoring #{action_type} event for #{slug}"
+        )
+
         {:noreply, state}
 
       not eligible?(slug, state) ->

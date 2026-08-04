@@ -81,13 +81,13 @@
   # ── Root 2: intentional no-return / opaque-type nitpicks ────────────────
   # - backend/native + microvm: declared "not implemented" stubs that raise;
   #   dialyzer flags an always-raising fn as no_return vs its @spec.
-  # - backend/host/nerves: reboot/poweroff genuinely never return (they halt
-  #   the board) — no_return is correct; the pattern_match is downstream.
+  # - backend/host/nerves: reboot/poweroff route through Vagus.Host.Shutdown
+  #   (returns :ok) since issue #39, so the old :no_return entry is gone;
+  #   the pattern_match on the trailing `:ok` after the runtime call stays.
   # - ingress/ws_bridge + core/events: Mint.WebSocket / MapSet opaque-type
   #   pedantry (flush_pending IS called; the caller is only "unreachable"
   #   via the same Mint typing story). No behaviour issue.
   {"lib/vagus/addon/backend/microvm.ex", :no_return},
-  {"lib/vagus/backend/host/nerves.ex", :no_return},
   {"lib/vagus/backend/host/nerves.ex", :pattern_match},
   {"lib/vagus/ingress/ws_bridge.ex", :pattern_match},
   {"lib/vagus/ingress/ws_bridge.ex", :unused_fun},

@@ -60,6 +60,16 @@ if keys == [],
 config :nerves_ssh,
   authorized_keys: Enum.map(keys, &File.read!/1)
 
+# `ssh_subsystem_fwup`'s DEFAULT success_callback is
+# `{Nerves.Runtime, :reboot, []}`, so every OTA `mix upload` reboot would
+# bypass the graceful-stop facade and keep corrupting Core's .storage (issue
+# #39). Verified mechanism: `SSHSubsystemFwup.init/1` merges
+# `Application.get_all_env(:ssh_subsystem_fwup)` over its defaults
+# (deps/ssh_subsystem_fwup/lib/ssh_subsystem_fwup.ex init/1), and
+# nerves_ssh's default subsystem spec only carries `devpath`, so this
+# app-env key reaches the subsystem on target.
+config :ssh_subsystem_fwup, success_callback: {Vagus.Host.Shutdown, :ota_reboot, []}
+
 # Configure the network using vintage_net
 #
 # Update regulatory_domain to your 2-letter country code E.g., "US"

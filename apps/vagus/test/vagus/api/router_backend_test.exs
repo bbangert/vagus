@@ -275,40 +275,60 @@ defmodule Vagus.API.RouterBackendTest do
   end
 
   describe "POST /host/reboot" do
-    test "responds ok before the backend's reboot/0 side effect runs" do
+    test "response is fully sent while the backend's reboot/0 is still running" do
       test_pid = self()
 
+      # The graceful-shutdown facade (`Vagus.Host.Shutdown`) can now hold
+      # `Backend.host().reboot()` open for up to ~5 minutes. Park the mock in
+      # `receive` so it can't return until we say so — proving the 200
+      # envelope completes DURING the action, not merely "eventually, after
+      # it ran inline". A `send` immediately followed by `:ok` (the old
+      # shape) would also pass a test that only asserted eventual delivery.
       expect(HostMock, :reboot, fn ->
-        send(test_pid, :rebooted)
-        :ok
+        send(test_pid, {:reboot_started, self()})
+
+        receive do
+          :release -> :ok
+        end
       end)
 
       conn = conn(:post, "/host/reboot") |> authed() |> call()
 
+      # `call/1` already returned the full response above — while the mock
+      # is still parked in `receive` on its own Task.start/1 process — so
+      # this proves the envelope-then-action decoupling matches upstream
+      # Supervisor UX (a live API answering requests until the box drops).
       assert conn.status == 200
       assert json_body(conn)["result"] == "ok"
 
-      # The side effect is decoupled onto its own process (Task.start/1) —
-      # by the time we've already asserted the response above, it may not
-      # have run yet, proving it isn't blocking the reply.
-      assert_receive :rebooted, 500
+      assert_receive {:reboot_started, task_pid}, 500
+      ref = Process.monitor(task_pid)
+      send(task_pid, :release)
+      assert_receive {:DOWN, ^ref, :process, ^task_pid, _reason}, 500
     end
   end
 
   describe "POST /host/shutdown" do
-    test "responds ok before the backend's shutdown/0 side effect runs" do
+    test "response is fully sent while the backend's shutdown/0 is still running" do
       test_pid = self()
 
       expect(HostMock, :shutdown, fn ->
-        send(test_pid, :shutdown_called)
-        :ok
+        send(test_pid, {:shutdown_started, self()})
+
+        receive do
+          :release -> :ok
+        end
       end)
 
       conn = conn(:post, "/host/shutdown") |> authed() |> call()
 
       assert conn.status == 200
       assert json_body(conn)["result"] == "ok"
-      assert_receive :shutdown_called, 500
+
+      assert_receive {:shutdown_started, task_pid}, 500
+      ref = Process.monitor(task_pid)
+      send(task_pid, :release)
+      assert_receive {:DOWN, ^ref, :process, ^task_pid, _reason}, 500
     end
   end
 end

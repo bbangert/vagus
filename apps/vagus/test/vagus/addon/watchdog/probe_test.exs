@@ -327,6 +327,56 @@ defmodule Vagus.Addon.Watchdog.ProbeTest do
     assert_receive {:restart, ^slug}, 500
   end
 
+  ## 9 (issue #39): shutdown_check gates the whole tick
+
+  test "shutdown_check: true skips the whole tick — no probe, no restart, even for a slug already at 1 strike",
+       %{state_pid: state_pid} do
+    test_pid = self()
+    slug = unique_slug("probe")
+    seed(state_pid, slug, :started, true, %{"watchdog" => "tcp://[HOST]:1234"})
+
+    probe_fun = fn _spec ->
+      send(test_pid, :probe_called)
+      :unhealthy
+    end
+
+    pid =
+      start_probe(
+        state: state_pid,
+        manager: FakeManager,
+        host_ip_fun: fn _slug -> {:ok, "1.2.3.4"} end,
+        probe_fun: probe_fun,
+        shutdown_check: fn -> false end
+      )
+
+    # Bank one strike with the seam reading false, exactly like a real tick
+    # would — this proves the shutdown gate below isn't just "skip because
+    # nothing was eligible yet".
+    send(pid, :tick)
+    assert_receive :probe_called, 200
+    refute_receive {:restart, ^slug}, 100
+
+    :sys.replace_state(pid, fn st -> %{st | shutdown_check: fn -> true end} end)
+
+    # This tick would otherwise be strike 2 (restart) — the shutdown gate
+    # must suppress it entirely, including the probe call itself.
+    send(pid, :tick)
+    refute_receive :probe_called, 200
+    refute_receive {:restart, ^slug}, 100
+
+    :sys.replace_state(pid, fn st -> %{st | shutdown_check: fn -> false end} end)
+
+    # State was left untouched by the skipped tick: the failure counter is
+    # still at 1, so this next unhealthy tick is strike 2 and restarts.
+    send(pid, :tick)
+    assert_receive {:restart, ^slug}, 500
+  end
+
+  # No separate "shutdown_check: false leaves normal behavior intact" test:
+  # every other test in this file omits `:shutdown_check` entirely, so they
+  # already exercise the default seam (`Vagus.Host.Shutdown.in_flight?/0`,
+  # persistent_term unset -> false) end to end — see e.g. test 1 above.
+
   ## 8: default :probe_fun against real listening Bandit servers (§B7.3)
 
   describe "default probe_fun (hermetic, real sockets, no injected :probe_fun)" do
