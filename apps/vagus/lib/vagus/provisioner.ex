@@ -132,6 +132,11 @@ defmodule Vagus.Provisioner do
       retry_base: Keyword.get(opts, :retry_base, @retry_base),
       retry_cap: Keyword.get(opts, :retry_cap, @retry_cap),
       steps: Keyword.get(opts, :steps, @steps),
+      # Injectable like every other seam above — mainly so tests can make a
+      # step return something other than `:ok | :halt | :async` directly,
+      # to exercise `safe_run_step/2`'s normalization without needing a real
+      # step to misbehave.
+      run_step: Keyword.get(opts, :run_step, &default_run_step/2),
       retry_attempt: 0
     }
 
@@ -192,7 +197,18 @@ defmodule Vagus.Provisioner do
   # crashing step degrades to `:ok` — i.e. treated as done — so the runner
   # moves on to the next step rather than halting the whole pipeline.
   defp safe_run_step(step, state) do
-    run_step(step, state)
+    case state.run_step.(step, state) do
+      result when result in [:ok, :halt, :async] ->
+        result
+
+      other ->
+        Logger.error(
+          "Vagus.Provisioner: step #{inspect(step)} returned unexpected #{inspect(other)} — " <>
+            "treating as :ok"
+        )
+
+        :ok
+    end
   rescue
     exception ->
       Logger.error(
@@ -210,8 +226,8 @@ defmodule Vagus.Provisioner do
       :ok
   end
 
-  defp run_step(:expand_data, state), do: expand_data(state)
-  defp run_step(:provision_core, state), do: provision_core(state)
+  defp default_run_step(:expand_data, state), do: expand_data(state)
+  defp default_run_step(:provision_core, state), do: provision_core(state)
 
   # --- :expand_data -------------------------------------------------------
 
@@ -269,6 +285,10 @@ defmodule Vagus.Provisioner do
   # territory. `/root`'s mount source is ground truth for which partition is
   # actually in play, so check it against the assumed layout before touching
   # anything.
+  #
+  # `mounts_path` is the injectable seam (default `/proc/mounts`), always
+  # config/test-controlled, never request input.
+  # sobelow_skip ["Traversal.FileModule"]
   defp check_data_partition(state) do
     expected = state.rootdisk <> "p5"
 
@@ -495,14 +515,11 @@ defmodule Vagus.Provisioner do
     # Rescuing the shape (not enumerating reasons) and returning a fake
     # exit-127 ("command not found") tuple lets both call sites' existing
     # nonzero-status handling degrade this the same way it degrades a real
-    # failed command (issue #45 — rpi3_64 ships no `resize2fs`).
+    # failed command (issue #45 — rpi3_64 ships no `resize2fs`). No logging
+    # here — the reason is carried in the returned message, so each call
+    # site's existing nonzero-status log stays the single logging point.
     exception in [ErlangError] ->
       reason = exception.original
-
-      Logger.warning(
-        "Vagus.Provisioner: #{bin} failed to run (#{inspect(reason)}) — treating as missing"
-      )
-
       {"#{bin}: #{inspect(reason)}", 127}
   end
 

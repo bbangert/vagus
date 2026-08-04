@@ -491,7 +491,7 @@ defmodule Vagus.ProvisionerTest do
 
   # --- issue #45: crash isolation ---------------------------------------
 
-  test "default_cmd/2: nonexistent binary -> fake exit 127, warning logged, no raise" do
+  test "default_cmd/2: nonexistent binary -> fake exit 127 with message, no raise, no logging" do
     bin = "vagus-test-no-such-binary-#{System.unique_integer([:positive])}"
 
     log =
@@ -500,8 +500,11 @@ defmodule Vagus.ProvisionerTest do
         assert msg =~ bin
       end)
 
-    assert log =~ "Vagus.Provisioner"
-    assert log =~ bin
+    # `default_cmd/2` itself must not log — each caller's existing
+    # nonzero-status handling is the single logging point (it would
+    # otherwise double-log alongside e.g. `resize2fs`/`fwup`'s own
+    # nonzero-exit warning).
+    assert log == ""
   end
 
   @tag :tmp_dir
@@ -566,6 +569,35 @@ defmodule Vagus.ProvisionerTest do
       end)
 
     assert log =~ "step :provision_core crashed (caught throw: :boom)"
+  end
+
+  test "step returning unexpected value (not :ok/:halt/:async) -> normalized to :ok, " <>
+         "logged, remaining steps still run" do
+    parent = self()
+
+    run_step = fn
+      :expand_data, _state ->
+        send(parent, :expand_data_called)
+        :skip
+
+      :provision_core, _state ->
+        send(parent, :provision_core_called)
+        :ok
+    end
+
+    log =
+      capture_log(fn ->
+        pid =
+          start_supervised!(
+            {Provisioner, steps: [:expand_data, :provision_core], run_step: run_step, name: nil}
+          )
+
+        assert_receive :expand_data_called, 1_000
+        assert_receive :provision_core_called, 1_000
+        assert Process.alive?(pid)
+      end)
+
+    assert log =~ "step :expand_data returned unexpected :skip — treating as :ok"
   end
 
   # --- issue #41: data-partition identity gate --------------------------
