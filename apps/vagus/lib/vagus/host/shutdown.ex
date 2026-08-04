@@ -244,8 +244,8 @@ defmodule Vagus.Host.Shutdown do
     catch
       kind_caught, reason ->
         Logger.error(
-          "Vagus.Host.Shutdown: runtime #{kind} call #{kind_caught}ed, device is NOT going " <>
-            "down — clearing in-flight flag (#{inspect(reason)})"
+          "Vagus.Host.Shutdown: runtime #{kind} call failed (caught #{kind_caught}: " <>
+            "#{inspect(reason)}), device is NOT going down — clearing in-flight flag"
         )
 
         :persistent_term.erase({__MODULE__, :in_flight})
@@ -306,7 +306,9 @@ defmodule Vagus.Host.Shutdown do
       degraded_result()
   catch
     kind_caught, reason ->
-      Logger.error("Vagus.Host.Shutdown: stop stages #{kind_caught} (#{inspect(reason)})")
+      Logger.error(
+        "Vagus.Host.Shutdown: stop stages failed (caught #{kind_caught}: #{inspect(reason)})"
+      )
 
       degraded_result()
   end
@@ -331,7 +333,8 @@ defmodule Vagus.Host.Shutdown do
   catch
     kind_caught, reason ->
       Logger.warning(
-        "Vagus.Host.Shutdown: add-on stop stage #{kind_caught}ed, proceeding: #{inspect(reason)}"
+        "Vagus.Host.Shutdown: add-on stop stage failed (caught #{kind_caught}: " <>
+          "#{inspect(reason)}), proceeding"
       )
 
       {0, 0}
@@ -434,7 +437,9 @@ defmodule Vagus.Host.Shutdown do
       {:error, {:raised, exception}}
   catch
     kind_caught, reason ->
-      Logger.warning("Vagus.Host.Shutdown: core stop #{kind_caught}ed (#{inspect(reason)})")
+      Logger.warning(
+        "Vagus.Host.Shutdown: core stop failed (caught #{kind_caught}: #{inspect(reason)})"
+      )
 
       {:error, {kind_caught, reason}}
   end
