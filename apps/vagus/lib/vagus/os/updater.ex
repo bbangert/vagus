@@ -278,6 +278,12 @@ defmodule Vagus.OS.Updater do
         fun.()
 
       nil ->
+        # The library's Updater.init already mkdir_p!'s the download dir,
+        # and install/2 can't reach this line unless that GenServer is up
+        # — but `df` on a missing path reads as {0, 0} free (permanently
+        # blocking updates as :insufficient_space), so don't lean on that
+        # ordering invariant from another module (Copilot, PR #4).
+        _ = File.mkdir_p(@download_dir)
         {_total, free} = DiskUsage.usage_bytes(@download_dir)
         free
     end
