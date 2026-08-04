@@ -7,6 +7,9 @@
   "runArgs": ["--network=host"],
   "remoteUser": "ubuntu",
   "containerUser": "ubuntu",
+  "mounts": [
+    "source=claude-code-home,target=/home/ubuntu/.claude,type=volume"
+  ],
   "features": {
     "ghcr.io/devcontainers/features/common-utils:2": {
       "installZsh": true,
