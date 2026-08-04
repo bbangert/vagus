@@ -37,7 +37,7 @@ env:
   # artifacts AND the source ref the path deps are checked out at — the
   # artifact checksum is computed from the checked-out source, so these two
   # must be the same ref. Bump when the systems cut a new release.
-  SYSTEM_RELEASE_TAG: v0.3.1
+  SYSTEM_RELEASE_TAG: v0.3.2
   NERVES_DL_DIR: /home/runner/.nerves/dl
   GH_TOKEN: ${{ github.token }}
 
