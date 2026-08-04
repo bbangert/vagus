@@ -69,8 +69,15 @@ defmodule Vagus.Provisioner do
   as a real nonzero exit; and `run_steps/2` rescues/catches around each step
   individually, so a bug anywhere in one step (`:expand_data` say) can never
   cost the others their turn (`:provision_core` still runs) or the process
-  its life. A first-boot convenience must never be able to fight its way
-  into taking HA offline.
+  its life. The guarantee doesn't end at that synchronous pass: once
+  `:provision_core` goes `:async`, the `handle_info/2` continuation
+  (`:await_engine`'s ping, `:await_internet`'s connection check,
+  `:attempt_update`'s update/start/await-healthy chain) runs through
+  `safe_async/3`, the same rescue/catch shape — a raise anywhere in that
+  chain abandons first-boot provisioning for this boot (no reschedule)
+  instead of crash-looping the GenServer the next time `handle_info`
+  replays the same message and hits the same raise. A first-boot
+  convenience must never be able to fight its way into taking HA offline.
   """
 
   use GenServer
@@ -148,6 +155,18 @@ defmodule Vagus.Provisioner do
 
   @impl GenServer
   def handle_info(:await_engine, state) do
+    {:noreply, safe_async(:await_engine, state, &do_await_engine/1)}
+  end
+
+  def handle_info(:await_internet, state) do
+    {:noreply, safe_async(:await_internet, state, &do_await_internet/1)}
+  end
+
+  def handle_info(:attempt_update, state) do
+    {:noreply, safe_async(:attempt_update, state, &attempt_update/1)}
+  end
+
+  defp do_await_engine(state) do
     case state.ping.() do
       :ok ->
         Logger.info("Vagus.Provisioner: engine ready — awaiting internet connectivity")
@@ -157,10 +176,10 @@ defmodule Vagus.Provisioner do
         Process.send_after(self(), :await_engine, state.engine_interval)
     end
 
-    {:noreply, state}
+    state
   end
 
-  def handle_info(:await_internet, state) do
+  defp do_await_internet(state) do
     case state.connection.() do
       :internet ->
         Logger.info("Vagus.Provisioner: internet reachable — installing HA Core")
@@ -170,11 +189,38 @@ defmodule Vagus.Provisioner do
         Process.send_after(self(), :await_internet, state.net_interval)
     end
 
-    {:noreply, state}
+    state
   end
 
-  def handle_info(:attempt_update, state) do
-    {:noreply, attempt_update(state)}
+  # Extends the #45 crash-isolation guarantee past the synchronous step pass
+  # into the async continuation: once `:provision_core` goes `:async`, these
+  # `handle_info/2` handlers call injected/side-effecting fns
+  # (ping/connection/update/start/await_healthy) with no supervisor between
+  # them and the GenServer — an unguarded raise here would crash-loop it
+  # exactly like the original bug (the next `handle_info` for the same
+  # message hits the same raise, burning the restart budget). A crash
+  # abandons first-boot provisioning for this boot with NO reschedule —
+  # retrying the same crash on a timer is just a slower crash-loop; the
+  # next real boot gets a clean attempt instead.
+  defp safe_async(label, state, fun) do
+    fun.(state)
+  rescue
+    exception ->
+      Logger.error(
+        "Vagus.Provisioner: #{inspect(label)} crashed (" <>
+          Exception.format(:error, exception, __STACKTRACE__) <>
+          ") — abandoning first-boot provisioning for this boot"
+      )
+
+      state
+  catch
+    kind, reason ->
+      Logger.error(
+        "Vagus.Provisioner: #{inspect(label)} crashed (caught #{kind}: #{inspect(reason)}) — " <>
+          "abandoning first-boot provisioning for this boot"
+      )
+
+      state
   end
 
   # Runs `steps` in order. `:ok` continues to the next step; `:halt` stops
@@ -332,12 +378,21 @@ defmodule Vagus.Provisioner do
   # alias resolving to mmcblk0p5) correctly doesn't.
   defp same_device?(a, b), do: resolve_device(a) == resolve_device(b)
 
-  defp resolve_device(path) do
+  # `/proc/mounts` device fields aren't always absolute paths (`overlay`,
+  # `tmpfs`, `none`, ...) — only attempt the symlink hop on absolute names.
+  # `File.read_link/1` on a relative name resolves against the BEAM's CWD,
+  # which has nothing to do with device identity; resolving it anyway could
+  # coincidentally hit an unrelated symlink and produce a false match that
+  # lets expand-data run when it must skip. Non-absolute names are used
+  # as-is, so they simply never equal a `/dev/...` expected path — correct.
+  defp resolve_device("/" <> _ = path) do
     case File.read_link(path) do
       {:ok, target} -> Path.basename(target)
       {:error, _reason} -> Path.basename(path)
     end
   end
+
+  defp resolve_device(path), do: path
 
   defp parent_disk(rootdisk) do
     case File.read_link(rootdisk) do

@@ -683,6 +683,34 @@ defmodule Vagus.ProvisionerTest do
   end
 
   @tag :tmp_dir
+  test "data-partition gate: /root mounted from a non-absolute device (overlay-style) -> " <>
+         "no read_link attempted, mismatch-skip, :provision_core still runs",
+       %{tmp_dir: tmp_dir} do
+    parent = self()
+    rootdisk = Path.join(tmp_dir, "rootdisk0")
+    mounts_path = mounts_fixture(tmp_dir, "overlay")
+
+    log =
+      capture_log(fn ->
+        start_supervised!(
+          {Provisioner,
+           [
+             rootdisk: rootdisk,
+             mounts_path: mounts_path,
+             cmd: reporting_cmd(parent)
+           ] ++ quiet_provision_seams(parent) ++ [name: nil]}
+        )
+
+        assert_receive :installed_checked, 1_000
+        refute_received {:cmd, _bin, _args}
+      end)
+
+    assert log =~
+             "skipping expand-data (data partition is overlay, not #{rootdisk}p5 — " <>
+               "this target doesn't use the p5-data layout)"
+  end
+
+  @tag :tmp_dir
   test "data-partition gate: missing mounts file -> safe skip, resize2fs never invoked", %{
     tmp_dir: tmp_dir
   } do
@@ -731,6 +759,74 @@ defmodule Vagus.ProvisionerTest do
       end)
 
     assert log =~ "skipping expand-data (can't find /root in #{mounts_path})"
+  end
+
+  # --- issue #45 follow-up: async continuation crash isolation -----------
+
+  test ":ping raising in :await_engine -> process alive, crash logged, abandoned (no reschedule)" do
+    parent = self()
+
+    ping = fn ->
+      send(parent, :ping_called)
+      raise RuntimeError, "boom"
+    end
+
+    log =
+      capture_log(fn ->
+        pid =
+          start_supervised!(
+            {Provisioner,
+             steps: [:provision_core],
+             installed: fn -> nil end,
+             ping: ping,
+             engine_interval: 20,
+             name: nil}
+          )
+
+        assert_receive :ping_called, 1_000
+        # If the guard failed to prevent a reschedule, a second
+        # `:await_engine` message (and thus a second ping call) would land
+        # here after `engine_interval`.
+        refute_receive :ping_called, 150
+        assert Process.alive?(pid)
+      end)
+
+    assert log =~ "Vagus.Provisioner: :await_engine crashed"
+    assert log =~ "abandoning first-boot provisioning for this boot"
+  end
+
+  test ":update raising in :attempt_update -> process alive, crash logged, no retry scheduled" do
+    parent = self()
+
+    update = fn ->
+      send(parent, :update_called)
+      raise RuntimeError, "boom"
+    end
+
+    log =
+      capture_log(fn ->
+        pid =
+          start_supervised!(
+            {Provisioner,
+             steps: [:provision_core],
+             installed: fn -> nil end,
+             ping: fn -> :ok end,
+             connection: fn -> :internet end,
+             update: update,
+             retry_base: 10,
+             retry_cap: 40,
+             name: nil}
+          )
+
+        assert_receive :update_called, 1_000
+        # A retry (the {:error, reason} path) would resend :attempt_update
+        # after `retry_base`; a raise must not — it abandons instead.
+        refute_receive :update_called, 150
+        assert Process.alive?(pid)
+      end)
+
+    assert log =~ "Vagus.Provisioner: :attempt_update crashed"
+    assert log =~ "abandoning first-boot provisioning for this boot"
   end
 
   defp restore_env(key, nil), do: Application.delete_env(:vagus, key)
