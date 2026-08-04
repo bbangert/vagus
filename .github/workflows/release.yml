@@ -40,6 +40,12 @@ env:
   SYSTEM_RELEASE_TAG: v0.3.2
   NERVES_DL_DIR: /home/runner/.nerves/dl
   GH_TOKEN: ${{ github.token }}
+  # The operator's SSH public keys (newline-separated authorized_keys
+  # lines) baked into the firmware as `:nerves_ssh` authorized_keys —
+  # config/target.exs reads this env when ~/.ssh has no keys (CI). A repo
+  # Actions VARIABLE (not secret): public keys are public, and visibility
+  # makes "who can SSH into the fleet" auditable.
+  NERVES_AUTHORIZED_KEYS: ${{ vars.NERVES_AUTHORIZED_KEYS }}
 
 jobs:
   build:
@@ -64,6 +70,17 @@ jobs:
           repository: bbangert/nerves_system_vagus
           ref: ${{ env.SYSTEM_RELEASE_TAG }}
           path: nerves_system_vagus
+
+      # Fail fast (not at deps.get, and never silently) when the repo
+      # variable carrying the operator's SSH keys is missing — firmware
+      # without the right authorized_keys would strip SSH access on OTA.
+      - name: Verify authorized keys are configured
+        run: |
+          if [ -z "$NERVES_AUTHORIZED_KEYS" ]; then
+            echo "Repo Actions variable NERVES_AUTHORIZED_KEYS is unset/empty." >&2
+            echo "Set it to the operator's SSH public keys (newline-separated)." >&2
+            exit 1
+          fi
 
       # The tag becomes `nerves_fw_version` only if it matches the app
       # version — the device compares the two to decide update_available,
