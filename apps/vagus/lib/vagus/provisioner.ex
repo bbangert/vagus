@@ -16,6 +16,19 @@ defmodule Vagus.Provisioner do
   disk anyway, so there is genuinely nothing to expand there; skipping is
   correct, not just safe.
 
+  ## The p5-data layout assumption
+
+  `:expand_data` assumes the data partition is `<rootdisk>p5` — true on the
+  Q6A, but not universal: rpi3_64 mounts `/root` from `mmcblk0p7`, and its
+  p5 is an unrelated 133 MiB partition. The tail-size math above is only
+  meaningful on p5-data layouts; run it against the wrong partition and,
+  had rpi3_64's `ops.fw` ever grown an `expand-data` task, the GPT rewrite
+  would have eaten p6/p7 instead. The data-partition identity gate at the
+  top of `expand_data/1` checks `/root`'s actual mount source against the
+  assumed `<rootdisk>p5` before the unconditional `resize2fs` pass or the
+  sector/tail gates run at all — on a layout mismatch, the whole step is a
+  logged no-op.
+
   ## Ordering: expand before Core
 
   `:expand_data` must run (and complete, across the reboot it triggers)
@@ -40,6 +53,24 @@ defmodule Vagus.Provisioner do
   time (not compile time) — same convention as `Vagus.Core.Boot`. `:host`
   and `mix test` never enable it; `start_link/1` returns `:ignore` rather
   than starting a GenServer with nothing to do.
+
+  ## Crash isolation (issue #45)
+
+  This GenServer is a direct child of `Vagus.Supervisor` (`one_for_one`,
+  a small restart budget) sitting next to the engine, HA Core, and the API
+  — an instant crash-loop here exhausts that budget and takes the whole
+  `:vagus` app down with it, not just first-boot provisioning. Device-verified:
+  `resize2fs` isn't shipped on rpi3_64, and `System.cmd/3` doesn't return a
+  nonzero-status tuple for a missing binary — it *raises* `ErlangError`
+  (`:enoent`), which bypassed every `{output, status}` clause below and took
+  the app down on first boot. Two independent guards close this off: `cmd`'s
+  default implementation rescues that raise into a fake exit-127 tuple, so a
+  missing/unusable host binary degrades through the same log-and-skip path
+  as a real nonzero exit; and `run_steps/2` rescues/catches around each step
+  individually, so a bug anywhere in one step (`:expand_data` say) can never
+  cost the others their turn (`:provision_core` still runs) or the process
+  its life. A first-boot convenience must never be able to fight its way
+  into taking HA offline.
   """
 
   use GenServer
@@ -54,6 +85,7 @@ defmodule Vagus.Provisioner do
   @rootdisk "/dev/rootdisk0"
   @ops_fw "/usr/share/fwup/ops.fw"
   @sysfs_root "/sys"
+  @mounts_path "/proc/mounts"
 
   # fwup's expand-data task is worth running only if there's a meaningful
   # amount of unpartitioned tail left on the disk; below this, treat the
@@ -88,6 +120,7 @@ defmodule Vagus.Provisioner do
       sysfs_root: Keyword.get(opts, :sysfs_root, @sysfs_root),
       rootdisk: Keyword.get(opts, :rootdisk, @rootdisk),
       ops_fw: Keyword.get(opts, :ops_fw, @ops_fw),
+      mounts_path: Keyword.get(opts, :mounts_path, @mounts_path),
       ping: Keyword.get(opts, :ping, &default_ping/0),
       connection: Keyword.get(opts, :connection, &default_connection/0),
       installed: Keyword.get(opts, :installed, &default_installed/0),
@@ -146,11 +179,35 @@ defmodule Vagus.Provisioner do
   defp run_steps([], state), do: state
 
   defp run_steps([step | rest], state) do
-    case run_step(step, state) do
+    case safe_run_step(step, state) do
       :ok -> run_steps(rest, state)
       :halt -> state
       :async -> state
     end
+  end
+
+  # Isolates one step's crash from the rest of the pipeline (issue #45): a
+  # bug in `:expand_data` must not cost `:provision_core` its turn, same
+  # stage-isolation principle as `Vagus.Host.Shutdown.safe_stop_addons/1`. A
+  # crashing step degrades to `:ok` — i.e. treated as done — so the runner
+  # moves on to the next step rather than halting the whole pipeline.
+  defp safe_run_step(step, state) do
+    run_step(step, state)
+  rescue
+    exception ->
+      Logger.error(
+        "Vagus.Provisioner: step #{inspect(step)} crashed (" <>
+          Exception.format(:error, exception, __STACKTRACE__) <> ")"
+      )
+
+      :ok
+  catch
+    kind, reason ->
+      Logger.error(
+        "Vagus.Provisioner: step #{inspect(step)} crashed (caught #{kind}: #{inspect(reason)})"
+      )
+
+      :ok
   end
 
   defp run_step(:expand_data, state), do: expand_data(state)
@@ -159,10 +216,19 @@ defmodule Vagus.Provisioner do
   # --- :expand_data -------------------------------------------------------
 
   defp expand_data(state) do
+    case check_data_partition(state) do
+      :ok -> do_expand_data(state)
+      {:skip, reason} -> skip_expand_data(reason)
+    end
+  end
+
+  defp do_expand_data(state) do
     # Unconditional on every pass, regardless of the gates below: this is
     # the online ext4 grow that completes an expansion started by fwup on
     # a *previous* boot. It's a safe no-op when there's nothing to grow, so
     # there's no reason to gate it behind the same checks as the fwup call.
+    # (Gated on `check_data_partition/1` above, though — resize2fs-ing a
+    # partition that isn't actually the data partition is never a no-op.)
     p5 = state.rootdisk <> "p5"
 
     case state.cmd.("resize2fs", [p5]) do
@@ -186,9 +252,70 @@ defmodule Vagus.Provisioner do
         :ok
       end
     else
-      {:skip, reason} ->
-        Logger.info("Vagus.Provisioner: skipping expand-data (#{reason})")
+      {:skip, reason} -> skip_expand_data(reason)
+    end
+  end
+
+  defp skip_expand_data(reason) do
+    Logger.info("Vagus.Provisioner: skipping expand-data (#{reason})")
+    :ok
+  end
+
+  # Data-partition identity gate (issue #41): `<rootdisk>p5` is only the
+  # data partition on p5-data layouts like the Q6A's. On rpi3_64, p5 is a
+  # 133 MiB unrelated partition and the real data partition is p7 — nothing
+  # below this gate is meaningful there, and running it anyway would (once
+  # rpi3_64's ops.fw grows an expand-data task) rewrite the GPT into p6/p7's
+  # territory. `/root`'s mount source is ground truth for which partition is
+  # actually in play, so check it against the assumed layout before touching
+  # anything.
+  defp check_data_partition(state) do
+    expected = state.rootdisk <> "p5"
+
+    with {:ok, contents} <- File.read(state.mounts_path),
+         {:ok, actual} <- root_mount_device(contents) do
+      if same_device?(actual, expected) do
         :ok
+      else
+        {:skip,
+         "data partition is #{actual}, not #{expected} — this target doesn't use the " <>
+           "p5-data layout"}
+      end
+    else
+      {:error, reason} ->
+        {:skip, "can't read #{state.mounts_path}: #{inspect(reason)}"}
+
+      :error ->
+        {:skip, "can't find /root in #{state.mounts_path}"}
+    end
+  end
+
+  # `/proc/mounts` lines are "<device> <mountpoint> <fstype> <opts> <dump> <pass>"
+  # (fstab(5) format) — split on whitespace and match the mountpoint column
+  # exactly against "/root".
+  defp root_mount_device(contents) do
+    contents
+    |> String.split("\n", trim: true)
+    |> Enum.find_value(:error, fn line ->
+      case String.split(line) do
+        [device, "/root" | _rest] -> {:ok, device}
+        _other -> false
+      end
+    end)
+  end
+
+  # `/dev/rootdisk0*` names are udev symlink aliases for the real device
+  # (e.g. `/dev/mmcblk0p5`, `/dev/nvme0n1p5`) — resolve one `File.read_link/1`
+  # hop on each side and compare basenames so a real-device mount and a
+  # rootdisk-alias mount of the *same* partition still match, while a
+  # different partition (rpi3_64's mmcblk0p7 vs. a would-be rootdisk0p5
+  # alias resolving to mmcblk0p5) correctly doesn't.
+  defp same_device?(a, b), do: resolve_device(a) == resolve_device(b)
+
+  defp resolve_device(path) do
+    case File.read_link(path) do
+      {:ok, target} -> Path.basename(target)
+      {:error, _reason} -> Path.basename(path)
     end
   end
 
@@ -354,9 +481,30 @@ defmodule Vagus.Provisioner do
   # --- default seams ---------------------------------------------------
 
   # bin/args are the hardcoded fwup/resize2fs invocations above, not request
-  # input
+  # input. Public (not private) so it can be unit-tested directly against a
+  # nonexistent binary — same "@doc false, but def" precedent as
+  # `Vagus.Addon.Manager.native_allowed?/1`.
   # sobelow_skip ["CI.System"]
-  defp default_cmd(bin, args), do: System.cmd(bin, args, stderr_to_stdout: true)
+  @doc false
+  @spec default_cmd(String.t(), [String.t()]) :: {String.t(), non_neg_integer()}
+  def default_cmd(bin, args) do
+    System.cmd(bin, args, stderr_to_stdout: true)
+  rescue
+    # `System.cmd/3` doesn't return a nonzero-status tuple for a missing or
+    # unusable binary — it raises `ErlangError` (`:enoent`, `:eacces`, ...).
+    # Rescuing the shape (not enumerating reasons) and returning a fake
+    # exit-127 ("command not found") tuple lets both call sites' existing
+    # nonzero-status handling degrade this the same way it degrades a real
+    # failed command (issue #45 — rpi3_64 ships no `resize2fs`).
+    exception in [ErlangError] ->
+      reason = exception.original
+
+      Logger.warning(
+        "Vagus.Provisioner: #{bin} failed to run (#{inspect(reason)}) — treating as missing"
+      )
+
+      {"#{bin}: #{inspect(reason)}", 127}
+  end
 
   defp default_ping, do: Vagus.Runtime.Docker.ping()
 

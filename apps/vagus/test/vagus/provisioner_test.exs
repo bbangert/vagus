@@ -48,6 +48,25 @@ defmodule Vagus.ProvisionerTest do
     %{rootdisk: rootdisk, sysfs_root: Path.join(tmp_dir, "sys")}
   end
 
+  # Writes a `/proc/mounts`-shaped fixture (fstab(5) column layout) whose
+  # `/root` line's device field is `device` — the data-partition identity
+  # gate (issue #41) reads this to decide whether `<rootdisk>p5` is
+  # actually the mounted data partition. Extra unrelated lines around it
+  # (a `/` root-fs entry, an unrelated `/boot` entry) mirror a real mounts
+  # file so the "find the /root line" parsing is exercised, not just a
+  # single-line file.
+  defp mounts_fixture(tmp_dir, device) do
+    path = Path.join(tmp_dir, "proc_mounts")
+
+    File.write!(path, """
+    /dev/mmcblk0p2 / ext4 rw,relatime 0 0
+    /dev/mmcblk0p1 /boot vfat rw,relatime 0 0
+    #{device} /root ext4 rw,relatime 0 0
+    """)
+
+    path
+  end
+
   # No-op fwup/reboot/resize2fs `:cmd` fake that reports every invocation to
   # `parent` — used by expand-step tests that don't care about the exact
   # `cmd` args beyond observing whether fwup ran.
@@ -106,6 +125,7 @@ defmodule Vagus.ProvisionerTest do
            [
              rootdisk: fixture.rootdisk,
              sysfs_root: fixture.sysfs_root,
+             mounts_path: mounts_fixture(tmp_dir, fixture.rootdisk <> "p5"),
              ops_fw: "/usr/share/fwup/ops.fw",
              cmd: reporting_cmd(parent),
              reboot: fn -> send(parent, :reboot_called) end
@@ -140,6 +160,7 @@ defmodule Vagus.ProvisionerTest do
          [
            rootdisk: fixture.rootdisk,
            sysfs_root: fixture.sysfs_root,
+           mounts_path: mounts_fixture(tmp_dir, fixture.rootdisk <> "p5"),
            ops_fw: "/usr/share/fwup/ops.fw",
            cmd: reporting_cmd(parent),
            reboot: fn -> send(parent, :reboot_called) end
@@ -174,6 +195,7 @@ defmodule Vagus.ProvisionerTest do
            [
              rootdisk: fixture.rootdisk,
              sysfs_root: fixture.sysfs_root,
+             mounts_path: mounts_fixture(tmp_dir, fixture.rootdisk <> "p5"),
              ops_fw: ops_fw,
              cmd: reporting_cmd(parent),
              reboot: fn -> send(parent, :reboot_called) end
@@ -219,6 +241,7 @@ defmodule Vagus.ProvisionerTest do
            [
              rootdisk: fixture.rootdisk,
              sysfs_root: fixture.sysfs_root,
+             mounts_path: mounts_fixture(tmp_dir, fixture.rootdisk <> "p5"),
              ops_fw: "/usr/share/fwup/ops.fw",
              cmd: cmd,
              reboot: fn -> send(parent, :reboot_called) end
@@ -248,6 +271,7 @@ defmodule Vagus.ProvisionerTest do
          [
            rootdisk: fixture.rootdisk,
            sysfs_root: fixture.sysfs_root,
+           mounts_path: mounts_fixture(tmp_dir, fixture.rootdisk <> "p5"),
            ops_fw: ops_fw,
            cmd: reporting_cmd(parent),
            reboot: fn -> send(parent, :reboot_called) end
@@ -463,6 +487,218 @@ defmodule Vagus.ProvisionerTest do
       )
 
     assert Process.alive?(pid)
+  end
+
+  # --- issue #45: crash isolation ---------------------------------------
+
+  test "default_cmd/2: nonexistent binary -> fake exit 127, warning logged, no raise" do
+    bin = "vagus-test-no-such-binary-#{System.unique_integer([:positive])}"
+
+    log =
+      capture_log(fn ->
+        assert {msg, 127} = Provisioner.default_cmd(bin, ["--version"])
+        assert msg =~ bin
+      end)
+
+    assert log =~ "Vagus.Provisioner"
+    assert log =~ bin
+  end
+
+  @tag :tmp_dir
+  test "raising :cmd (ErlangError, real rpi3_64 shape) during :expand_data -> " <>
+         "process stays alive, :provision_core still runs",
+       %{tmp_dir: tmp_dir} do
+    parent = self()
+
+    rootdisk = Path.join(tmp_dir, "rootdisk0")
+    mounts_path = mounts_fixture(tmp_dir, rootdisk <> "p5")
+    cmd = fn "resize2fs", _args -> raise %ErlangError{original: :enoent} end
+
+    log =
+      capture_log(fn ->
+        pid =
+          start_supervised!(
+            {Provisioner,
+             rootdisk: rootdisk,
+             mounts_path: mounts_path,
+             cmd: cmd,
+             installed: fn ->
+               send(parent, :installed_checked)
+               "2026.7.3"
+             end,
+             name: nil}
+          )
+
+        assert_receive :installed_checked, 1_000
+        assert Process.alive?(pid)
+      end)
+
+    assert log =~ "step :expand_data crashed"
+    assert log =~ "already installed"
+  end
+
+  test ":installed raising RuntimeError in :provision_core -> process stays alive, crash logged" do
+    log =
+      capture_log(fn ->
+        pid =
+          start_supervised!(
+            {Provisioner,
+             steps: [:provision_core], installed: fn -> raise RuntimeError, "boom" end, name: nil}
+          )
+
+        Process.sleep(20)
+        assert Process.alive?(pid)
+      end)
+
+    assert log =~ "step :provision_core crashed"
+  end
+
+  test "throwing seam -> caught (not raised), logged with caught :throw, process stays alive" do
+    log =
+      capture_log(fn ->
+        pid =
+          start_supervised!(
+            {Provisioner, steps: [:provision_core], installed: fn -> throw(:boom) end, name: nil}
+          )
+
+        Process.sleep(20)
+        assert Process.alive?(pid)
+      end)
+
+    assert log =~ "step :provision_core crashed (caught throw: :boom)"
+  end
+
+  # --- issue #41: data-partition identity gate --------------------------
+
+  @tag :tmp_dir
+  test "data-partition gate: /root mounted from <rootdisk>p5 directly -> expand proceeds", %{
+    tmp_dir: tmp_dir
+  } do
+    parent = self()
+    rootdisk = Path.join(tmp_dir, "rootdisk0")
+    mounts_path = mounts_fixture(tmp_dir, rootdisk <> "p5")
+
+    capture_log(fn ->
+      start_supervised!(
+        {Provisioner,
+         [
+           rootdisk: rootdisk,
+           mounts_path: mounts_path,
+           cmd: reporting_cmd(parent)
+         ] ++ quiet_provision_seams(parent) ++ [name: nil]}
+      )
+
+      assert_receive {:cmd, "resize2fs", [p5]}, 1_000
+      assert p5 == rootdisk <> "p5"
+      assert_receive :installed_checked, 1_000
+    end)
+  end
+
+  @tag :tmp_dir
+  test "data-partition gate: /root mounted from the resolved rootdisk alias -> expand proceeds",
+       %{tmp_dir: tmp_dir} do
+    parent = self()
+    rootdisk = Path.join(tmp_dir, "rootdisk0")
+    rootdisk_p5 = rootdisk <> "p5"
+    # `/dev/rootdisk0p5` is itself a udev alias for the real partition device
+    # on the real target (q6a) — model that here instead of a direct-name
+    # match.
+    File.ln_s!("nvme0n1p5", rootdisk_p5)
+    mounts_path = mounts_fixture(tmp_dir, "/dev/nvme0n1p5")
+
+    capture_log(fn ->
+      start_supervised!(
+        {Provisioner,
+         [
+           rootdisk: rootdisk,
+           mounts_path: mounts_path,
+           cmd: reporting_cmd(parent)
+         ] ++ quiet_provision_seams(parent) ++ [name: nil]}
+      )
+
+      assert_receive {:cmd, "resize2fs", [p5]}, 1_000
+      assert p5 == rootdisk_p5
+      assert_receive :installed_checked, 1_000
+    end)
+  end
+
+  @tag :tmp_dir
+  test "data-partition gate: /root mounted from a different partition (rpi3_64 shape) -> " <>
+         "resize2fs never invoked, step ok, skip logged, :provision_core still runs",
+       %{tmp_dir: tmp_dir} do
+    parent = self()
+    rootdisk = Path.join(tmp_dir, "rootdisk0")
+    mounts_path = mounts_fixture(tmp_dir, "/dev/mmcblk0p7")
+
+    log =
+      capture_log(fn ->
+        start_supervised!(
+          {Provisioner,
+           [
+             rootdisk: rootdisk,
+             mounts_path: mounts_path,
+             cmd: reporting_cmd(parent)
+           ] ++ quiet_provision_seams(parent) ++ [name: nil]}
+        )
+
+        assert_receive :installed_checked, 1_000
+        refute_received {:cmd, _bin, _args}
+      end)
+
+    assert log =~
+             "skipping expand-data (data partition is /dev/mmcblk0p7, not #{rootdisk}p5 — " <>
+               "this target doesn't use the p5-data layout)"
+  end
+
+  @tag :tmp_dir
+  test "data-partition gate: missing mounts file -> safe skip, resize2fs never invoked", %{
+    tmp_dir: tmp_dir
+  } do
+    parent = self()
+    rootdisk = Path.join(tmp_dir, "rootdisk0")
+    mounts_path = Path.join(tmp_dir, "no_such_mounts_file")
+
+    log =
+      capture_log(fn ->
+        start_supervised!(
+          {Provisioner,
+           [
+             rootdisk: rootdisk,
+             mounts_path: mounts_path,
+             cmd: reporting_cmd(parent)
+           ] ++ quiet_provision_seams(parent) ++ [name: nil]}
+        )
+
+        assert_receive :installed_checked, 1_000
+        refute_received {:cmd, _bin, _args}
+      end)
+
+    assert log =~ "skipping expand-data (can't read #{mounts_path}"
+  end
+
+  @tag :tmp_dir
+  test "data-partition gate: mounts file with no /root line -> safe skip", %{tmp_dir: tmp_dir} do
+    parent = self()
+    rootdisk = Path.join(tmp_dir, "rootdisk0")
+    mounts_path = Path.join(tmp_dir, "proc_mounts")
+    File.write!(mounts_path, "/dev/mmcblk0p2 / ext4 rw,relatime 0 0\n")
+
+    log =
+      capture_log(fn ->
+        start_supervised!(
+          {Provisioner,
+           [
+             rootdisk: rootdisk,
+             mounts_path: mounts_path,
+             cmd: reporting_cmd(parent)
+           ] ++ quiet_provision_seams(parent) ++ [name: nil]}
+        )
+
+        assert_receive :installed_checked, 1_000
+        refute_received {:cmd, _bin, _args}
+      end)
+
+    assert log =~ "skipping expand-data (can't find /root in #{mounts_path})"
   end
 
   defp restore_env(key, nil), do: Application.delete_env(:vagus, key)
