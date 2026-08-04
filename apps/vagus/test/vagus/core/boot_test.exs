@@ -275,7 +275,7 @@ defmodule Vagus.Core.BootTest do
 
     assert_received {:pid, pid}
     assert Process.alive?(pid)
-    assert log =~ "start failed"
+    assert log =~ "start failed for abc123def456"
     assert log =~ "busy"
   end
 

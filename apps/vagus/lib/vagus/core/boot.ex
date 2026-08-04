@@ -137,7 +137,9 @@ defmodule Vagus.Core.Boot do
           :ok
 
         other ->
-          Logger.warning("Vagus.Core.Boot: start failed (#{inspect(other)})")
+          Logger.warning(
+            "Vagus.Core.Boot: start failed for #{short_id(info)} (#{inspect(other)})"
+          )
       end
     end
   end
