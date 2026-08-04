@@ -25,17 +25,27 @@ defmodule Vagus.Backend.OS.Nerves do
   def info do
     active = FirmwareKV.active_slot()
     version = FirmwareKV.version(active)
+    # nil until the updater's first successful check (or with the updater
+    # disabled) — falling back to the current version reads as an honest
+    # "no update" rather than inventing a feed answer we don't have.
+    latest = version_latest() || version
 
     %{
       version: version,
-      version_latest: version,
-      update_available: false,
+      version_latest: latest,
+      update_available: Vagus.Version.update_available?(version, latest),
       board: FirmwareKV.platform(active),
       boot: String.upcase(active),
       data_disk: data_disk_device(),
       boot_slots: FirmwareKV.boot_slots()
     }
   end
+
+  @impl true
+  def version_latest, do: Vagus.OS.Updater.version_latest()
+
+  @impl true
+  def update(version), do: Vagus.OS.Updater.install(version)
 
   @impl true
   def datadisk_list, do: []

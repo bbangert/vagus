@@ -101,6 +101,14 @@ defmodule Vagus.MixProject do
       # See config/host.exs for usage.
       {:nerves_runtime, "~> 0.13.12"},
 
+      # GitHub-releases OTA firmware updates (`Vagus.OS.Updater` wraps its
+      # Supervisor + check/install API behind the daily-cadence timer and
+      # the /os/update route). Deliberately NOT targets-scoped: it must
+      # compile on :host for the router/updater tests — its fwup/reboot
+      # side effects all sit behind injectable seams (:devpath_fn,
+      # :reboot_fn, ...), so nothing hardware touches the host build.
+      {:nerves_github_updater, "~> 0.1.1"},
+
       # Build-time only (`runtime: false`), never in a release: the globally
       # installed nerves_bootstrap archive (needed by vagus_platform's
       # firmware builds) injects a `nerves.bootstrap` step into

@@ -145,6 +145,16 @@ defmodule Vagus.Application do
           # path a cheap no-op.
           Vagus.Provisioner,
 
+          # Real /os/update (build-order #4): the GitHub-releases OTA
+          # updater + its daily check timer. Unconditional child, `:ignore`
+          # unless `config :vagus, :os_updater` is set (only target.exs
+          # sets it — no firmware to update on :host/test). After
+          # `Vagus.Core.Supervisor` so the Checker's event pushes find
+          # `Vagus.Core.EventPusher` registered (a cast to an unregistered
+          # name would be silently dropped — harmless, but the first check
+          # is minutes after boot anyway).
+          Vagus.OS.Updater,
+
           # Auto-installs + boots the default native provider (the mqttx broker,
           # M5-P5). `:ignore` unless `config :vagus, :default_native_addon` is set
           # (only target.exs sets it). Placed last so `Native.Supervisor`,

@@ -1,0 +1,133 @@
+name: release
+
+# Tag-driven firmware release: pushing a bare-semver tag (e.g. `0.4.0`)
+# builds `mix firmware` for every hardware target and attaches the .fw
+# files to the GitHub release for that tag. These assets are what
+# `Vagus.OS.Updater` (nerves_github_updater) feeds on — asset names are
+# `vagus_<target>.fw` and MUST stay in sync with its `:asset_matcher`.
+#
+# Tags are BARE semver (no `v` prefix) — nerves_github_updater's
+# VersionCompare parses tag names as semver directly.
+#
+# The Nerves SYSTEM is not built here (no Buildroot). The prebuilt system
+# artifact is downloaded from the nerves_system_vagus release pinned below
+# and pre-seeded into NERVES_DL_DIR. Pre-seeding (rather than letting the
+# `{:github_releases, ...}` artifact_site resolve it) is deliberate: the
+# resolver derives the download URL from the PACKAGE version
+# (`releases/download/v<pkg-version>/...`), but nerves_system_vagus attaches
+# every target's artifact to a single repo-level release tag, so per-target
+# package versions (e.g. rpi3_64 at 0.1.1) point at release tags that don't
+# exist. `mix nerves.artifact.get` checks NERVES_DL_DIR first, so a
+# pre-seeded archive (checksum-validated against the checked-out system
+# source) never hits the resolver.
+
+on:
+  push:
+    tags: ["[0-9]+.[0-9]+.[0-9]+"]
+
+permissions:
+  contents: write
+
+env:
+  # Must track .mise.toml (same pairing as ci.yml).
+  OTP_VERSION: "29.0.3"
+  ELIXIR_VERSION: "1.20.2-otp-29"
+  MIX_ENV: prod
+  # The nerves_system_vagus release that provides the prebuilt system
+  # artifacts AND the source ref the path deps are checked out at — the
+  # artifact checksum is computed from the checked-out source, so these two
+  # must be the same ref. Bump when the systems cut a new release.
+  SYSTEM_RELEASE_TAG: v0.3.1
+  NERVES_DL_DIR: /home/runner/.nerves/dl
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [rpi3_64, dragon_q6a]
+    defaults:
+      run:
+        working-directory: vagus
+    steps:
+      # The umbrella's system deps are path deps at ../../../nerves_system_vagus
+      # (relative to apps/vagus_platform), i.e. a SIBLING of the vagus checkout.
+      - uses: actions/checkout@v4
+        with:
+          path: vagus
+
+      - uses: actions/checkout@v4
+        with:
+          repository: bbangert/nerves_system_vagus
+          ref: ${{ env.SYSTEM_RELEASE_TAG }}
+          path: nerves_system_vagus
+
+      # The tag becomes `nerves_fw_version` only if it matches the app
+      # version — the device compares the two to decide update_available,
+      # so a mismatch would ship a firmware that never recognizes itself
+      # as up to date. Fail fast instead.
+      - name: Verify tag matches vagus_platform version
+        run: |
+          app_version="$(sed -n 's/^  @version "\(.*\)"$/\1/p' apps/vagus_platform/mix.exs)"
+          if [ "$app_version" != "$GITHUB_REF_NAME" ]; then
+            echo "Tag $GITHUB_REF_NAME != apps/vagus_platform/mix.exs @version $app_version" >&2
+            exit 1
+          fi
+
+      # squashfs-tools + fwup assemble the firmware image; libmnl-dev
+      # matches ci.yml (nerves_uevent's C port).
+      - name: Install native build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libmnl-dev squashfs-tools
+          curl -fsSL -o /tmp/fwup.deb \
+            https://github.com/fwup-home/fwup/releases/download/v1.15.0/fwup_1.15.0_amd64.deb
+          sudo dpkg -i /tmp/fwup.deb
+
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ env.OTP_VERSION }}
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+
+      - name: Pre-seed Nerves system artifact
+        run: |
+          mkdir -p "$NERVES_DL_DIR"
+          gh release download "$SYSTEM_RELEASE_TAG" \
+            --repo bbangert/nerves_system_vagus \
+            --pattern "nerves_system_${{ matrix.target }}-portable-*.tar.gz" \
+            --dir "$NERVES_DL_DIR"
+          ls -l "$NERVES_DL_DIR"
+
+      - name: Install hex, rebar, nerves_bootstrap
+        run: |
+          mix local.hex --force
+          mix local.rebar --force
+          mix archive.install hex nerves_bootstrap --force
+
+      - name: Fetch deps
+        run: mix deps.get
+        env:
+          MIX_TARGET: ${{ matrix.target }}
+
+      - name: Build firmware
+        run: mix firmware
+        working-directory: vagus/apps/vagus_platform
+        env:
+          MIX_TARGET: ${{ matrix.target }}
+
+      - name: Rename firmware asset
+        run: |
+          cp "_build/${{ matrix.target }}_prod/nerves/images/vagus_platform.fw" \
+            "vagus_${{ matrix.target }}.fw"
+
+      # Both matrix jobs race to create the release; the loser's create
+      # fails ("already exists") and falls through to the upload.
+      - name: Upload to GitHub release
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --verify-tag --title "$GITHUB_REF_NAME" --generate-notes || true
+          gh release upload "$GITHUB_REF_NAME" \
+            "vagus_${{ matrix.target }}.fw" --clobber

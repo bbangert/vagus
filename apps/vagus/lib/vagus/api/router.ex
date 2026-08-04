@@ -223,6 +223,21 @@ defmodule Vagus.API.Router do
     end)
   end
 
+  # Real OS/firmware update (build-order #4): fresh feed check → verified
+  # streaming download → fwup A/B upgrade → graceful reboot, via
+  # `Vagus.OS.Updater` behind `Backend.os().update/1`. No handler-level
+  # guard: `Vagus.API.Tiers`' `{["os", :+], :manager}` mirrors upstream's
+  # `role_access[manager]` `/os/(?!datadisk/wipe).+` exactly (verified
+  # against security.py 2026-08-04). Same job-wrapping shape as
+  # `run_core_update/2`; the job name mirrors upstream's
+  # `os_manager_update` (note: Core's OS update entity does NOT subscribe
+  # to job progress — unlike core/add-on updates it has no PROGRESS
+  # feature and is driven purely by `/os/info`'s version fields — so the
+  # job exists for `/jobs` observability, not the UI progress bar).
+  post "/os/update" do
+    os_update_action(conn)
+  end
+
   get "/host/info" do
     Envelope.send_ok(conn, HostInfo.build!(Backend.host().info()))
   end
@@ -1251,18 +1266,24 @@ defmodule Vagus.API.Router do
   # it "succeeded" while the version stayed stale for up to a day.
   # `invalidate/1` expires the cache so the next read refetches; the
   # response itself stays the same honest no-op envelope upstream returns.
+  # `Vagus.OS.Updater.check_now/1` (fire-and-forget cast; a no-op :ok on
+  # :host where the updater is disabled) refreshes the OS feed the same
+  # way, so the button also updates the OS entity's version_latest.
   post "/supervisor/reload" do
     Versions.invalidate(core_versions_server())
+    Vagus.OS.Updater.check_now()
     Envelope.send_ok(conn, %{})
   end
 
   post "/refresh_updates" do
     Versions.invalidate(core_versions_server())
+    Vagus.OS.Updater.check_now()
     Envelope.send_ok(conn, %{})
   end
 
   post "/reload_updates" do
     Versions.invalidate(core_versions_server())
+    Vagus.OS.Updater.check_now()
     Envelope.send_ok(conn, %{})
   end
 
@@ -1692,6 +1713,159 @@ defmodule Vagus.API.Router do
   defp core_lifecycle, do: Application.get_env(:vagus, :core_lifecycle, Lifecycle)
   defp core_config_check, do: Application.get_env(:vagus, :core_config_check, ConfigCheck)
   defp core_versions_server, do: Application.get_env(:vagus, :core_versions_server, Versions)
+
+  # -- OS update (build-order #4) ----------------------------------------------
+
+  # `POST /os/update` — see the route's comment for the auth/job-name
+  # rationale. Body: optional `{"version": tag}`, validated to the same
+  # tag shape as Core's (bare semver is a subset of docker-tag-shaped).
+  # Only the feed's latest can be installed — the underlying library has
+  # no install-specific-version API; `Vagus.OS.Updater.install/2`
+  # fresh-checks and refuses a mismatch, so the 400 below quotes the
+  # actual latest.
+  defp os_update_action(conn) do
+    case validate_core_update_version(conn.body_params) do
+      {:ok, version} -> run_os_update(conn, version)
+      {:error, message} -> Envelope.send_error(conn, message, 400)
+    end
+  end
+
+  defp run_os_update(conn, version) do
+    job = Jobs.create("os_manager_update", nil, server: jobs_server())
+
+    if background?(conn) do
+      result = start_job_task(job, fn -> run_os_install(job, version) end)
+      send_job_task_result(conn, job, result)
+    else
+      case run_with_job(job, fn -> run_os_install(job, version) end) do
+        :ok -> Envelope.send_ok(conn, %{})
+        {:error, reason} -> send_os_update_error(conn, reason)
+      end
+    end
+  end
+
+  # The updater's install pipeline is asynchronous (download → flash →
+  # graceful reboot inside the library's GenServer); this mirrors its
+  # phase transitions into the job as coarse stage waypoints — same
+  # discipline as `Vagus.Core.Lifecycle`'s `report_stage/3` — then
+  # finishes the job on a terminal phase. On success the board reboots
+  # minutes later and the job dies with the BEAM (same reality as
+  # upstream HAOS — the response/reboot race is acknowledged in the
+  # plan; the reboot only fires after the flash completes).
+  @os_update_poll_ms 2_000
+  @os_update_deadline_ms 30 * 60 * 1000
+
+  defp run_os_install(job, version) do
+    case os_backend().update(version) do
+      :ok ->
+        deadline = System.monotonic_time(:millisecond) + @os_update_deadline_ms
+        watch_os_install(job, nil, deadline)
+
+      {:error, reason} ->
+        finish_os_update_job(job, reason)
+        {:error, reason}
+    end
+  end
+
+  defp watch_os_install(job, last_stage, deadline) do
+    state = os_updater().state()
+
+    cond do
+      state.phase == :error ->
+        finish_os_update_job(job, {:install_failed, state.last_error})
+        {:error, {:install_failed, state.last_error}}
+
+      state.phase == :idle ->
+        Jobs.finish(job, [], jobs_server())
+        :ok
+
+      System.monotonic_time(:millisecond) >= deadline ->
+        finish_os_update_job(job, :install_timeout)
+        {:error, :install_timeout}
+
+      true ->
+        stage = os_install_stage(state.phase, last_stage)
+
+        if stage != last_stage do
+          Jobs.update(job, [stage: stage, progress: os_install_progress(stage)], jobs_server())
+        end
+
+        Process.sleep(@os_update_poll_ms)
+        watch_os_install(job, stage, deadline)
+    end
+  end
+
+  # `:installing` is the library's synthetic "state call timed out
+  # mid-install" phase — blind, so keep whatever stage was last reported.
+  defp os_install_stage(:installing, last_stage), do: last_stage
+  defp os_install_stage(:flashing, _last), do: "flash"
+  defp os_install_stage(_downloading_or_checking, _last), do: "download"
+
+  defp os_install_progress("download"), do: 25
+  defp os_install_progress("flash"), do: 75
+  defp os_install_progress(_other), do: 0
+
+  defp finish_os_update_job(job, reason) do
+    Jobs.finish(
+      job,
+      [errors: [Jobs.error_entry("HassOSUpdateError", os_update_error_message(reason))]],
+      jobs_server()
+    )
+  end
+
+  # `:busy` and `:no_release_cached` are retry-later states (409); the
+  # rest are the caller's-request/environment 400 family — same split as
+  # `send_core_lifecycle_error/2`.
+  defp send_os_update_error(conn, reason) when reason in [:busy, :no_release_cached] do
+    Envelope.send_error(conn, os_update_error_message(reason), 409)
+  end
+
+  defp send_os_update_error(conn, reason) do
+    Envelope.send_error(conn, os_update_error_message(reason), 400)
+  end
+
+  defp os_update_error_message(:busy), do: "an OS update operation is already in progress"
+
+  defp os_update_error_message(:no_release_cached),
+    do: "no firmware release is known yet; check for updates first"
+
+  defp os_update_error_message({:check_failed, reason}),
+    do: "the update check failed: #{inspect(reason)}"
+
+  defp os_update_error_message({:version_mismatch, latest}),
+    do: "only the latest version (#{latest}) can be installed"
+
+  defp os_update_error_message(:no_asset_for_target),
+    do: "the latest release has no firmware asset for this board"
+
+  defp os_update_error_message({:insufficient_space, needed, free}),
+    do: "not enough free disk space for the download (need #{needed} bytes, have #{free})"
+
+  defp os_update_error_message(:not_supported),
+    do: "os/update is not supported on this backend"
+
+  defp os_update_error_message({:install_failed, reason}),
+    do: "the firmware install failed: #{inspect(reason)}"
+
+  defp os_update_error_message(:install_timeout),
+    do: "the firmware install did not finish in time; see the log"
+
+  defp os_update_error_message(reason), do: inspect(reason)
+
+  # Same module seam `Vagus.OS.Updater` itself resolves — router tests
+  # stub the state/0 poll without starting the library GenServer. The
+  # default on :host/test (no server running) answers an idle-shaped
+  # snapshot, which reads as an already-finished install.
+  defp os_updater, do: Application.get_env(:vagus, :os_updater_mod, NervesGithubUpdater.Updater)
+
+  # Resolved at runtime (unlike every other `Backend.os()` call site,
+  # which is fine with the compile-time choice) — deliberately: with the
+  # compile-time module the type checker narrows a host build to
+  # `Vagus.Backend.OS.HostStub`, whose `update/1` only ever returns
+  # `{:error, :not_supported}`, and flags `run_os_install/2`'s `:ok`
+  # branch as unreachable. The runtime read keeps the dispatch dynamic
+  # (and doubles as a test seam, same shape as `core_lifecycle/0`).
+  defp os_backend, do: Application.get_env(:vagus, :os_backend, Backend.os())
 
   # The response has already gone out by the time this runs (see the
   # moduledoc above the reboot/shutdown routes) — a failed backend call has
