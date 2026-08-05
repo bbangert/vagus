@@ -179,7 +179,7 @@ defmodule Vagus.Addon.StoreTest do
   test "the Store GenServer reloads + serves the catalog" do
     srv = start_supervised!({Store, name: nil, fetcher: FixtureFetcher, repositories: @repos})
 
-    assert {:ok, 2} = Store.reload(srv)
+    assert {:ok, 2, _} = Store.reload(srv)
     assert {:ok, %{config: c}} = Store.get("core_mosquitto", srv)
     assert c.slug == "mosquitto"
     assert :error = Store.get("core_nope", srv)
@@ -294,7 +294,7 @@ defmodule Vagus.Addon.StoreTest do
           {Store, name: nil, fetcher: FixtureFetcher, repositories: @repos_with_dupe}
         )
 
-      {:ok, _} = Store.reload(srv)
+      {:ok, _, _} = Store.reload(srv)
       repos = Store.repositories(srv)
 
       assert Enum.map(repos, & &1.slug) == ["core", "community"]
@@ -312,7 +312,7 @@ defmodule Vagus.Addon.StoreTest do
            repositories: @repos_with_dupe ++ [%{slug: "nameless", url: "https://example.test"}]}
         )
 
-      {:ok, _} = Store.reload(srv)
+      {:ok, _, _} = Store.reload(srv)
       by_slug = Map.new(Store.repositories(srv), &{&1.slug, &1})
 
       # Parsed from the repo's own file.
@@ -573,15 +573,79 @@ defmodule Vagus.Addon.StoreTest do
       assets = Store.assets(srv)
 
       Process.put(:next_fetch, FixtureFetcher.fetch(%{slug: "core"}))
-      assert {:ok, 2} = Store.reload(srv)
+      assert {:ok, 2, _} = Store.reload(srv)
       assert {:ok, @png} = Assets.get(@mosquitto, :icon, assets)
 
       # Second reload: the repo no longer carries mosquitto at all.
       Process.put(:next_fetch, {:ok, [{"esphome/config.yaml", esphome_yaml()}]})
-      log = capture_log(fn -> assert {:ok, 1} = Store.reload(srv) end)
+      log = capture_log(fn -> assert {:ok, 1, _} = Store.reload(srv) end)
 
       assert :error = Assets.get(@mosquitto, :icon, assets)
       assert log =~ "pruned assets for 1 add-on(s)"
+    end
+
+    test "a repository that failed to fetch keeps its entries, assets and metadata" do
+      # Only a repository that came down may have its state replaced. A
+      # transient failure used to take the failed repo's catalog entries with
+      # it and then prune every asset behind them — on the reporting device,
+      # 78 add-ons' worth on a boot that raced DNS.
+      #
+      # Scripted per repository from the *calling* process, which is this
+      # test: reload builds the catalog in the caller, not in the GenServer.
+      defmodule HalfDarkFetcher do
+        def fetch(%{slug: slug}), do: Process.get({:fetch, slug})
+      end
+
+      repos = [
+        %{slug: "core", url: "https://github.com/home-assistant/addons"},
+        %{slug: "community", url: "https://github.com/hassio-addons/repository"}
+      ]
+
+      srv =
+        start_supervised!(
+          {Store, name: nil, asset_mode: :memory, fetcher: HalfDarkFetcher, repositories: repos}
+        )
+
+      assets = Store.assets(srv)
+
+      Process.put({:fetch, "core"}, FixtureFetcher.fetch(%{slug: "core"}))
+
+      Process.put(
+        {:fetch, "community"},
+        {:ok,
+         [
+           {"repository.json", ~s({"name": "Community add-ons", "maintainer": "Franck Nijhof"})},
+           {"mosquitto/config.yaml", mosquitto_yaml()},
+           {"mosquitto/icon.png", @png}
+         ]}
+      )
+
+      assert {:ok, 3, errors} = Store.reload(srv)
+      assert errors == %{}
+
+      # Second reload: community is dark, core still answers but no longer
+      # carries mosquitto.
+      Process.put({:fetch, "core"}, {:ok, [{"esphome/config.yaml", esphome_yaml()}]})
+      Process.put({:fetch, "community"}, {:error, :nxdomain})
+
+      log =
+        capture_log(fn -> assert {:ok, 2, %{"community" => :nxdomain}} = Store.reload(srv) end)
+
+      # The per-repository failure line is still the field-debug anchor.
+      assert log =~ ~s(fetch "community" failed)
+
+      # Community survives whole: entry, retained icon bytes, and the name
+      # its own repository.json gave the store section.
+      assert {:ok, %{config: %{slug: "mosquitto"}}} = Store.get("community_mosquitto", srv)
+      assert {:ok, @png} = Assets.get({"community", "mosquitto"}, :icon, assets)
+      community = Enum.find(Store.repositories(srv), &(&1.slug == "community"))
+      assert community.name == "Community add-ons"
+
+      # Core came down, so what it dropped really is gone — a failed repo's
+      # reprieve must not become a general stop-pruning.
+      assert :error = Store.get("core_mosquitto", srv)
+      assert :error = Assets.get(@mosquitto, :icon, assets)
+      assert {:ok, _} = Store.get("core_esphome", srv)
     end
 
     @tag :tmp_dir
@@ -590,7 +654,7 @@ defmodule Vagus.Addon.StoreTest do
 
       opts = [name: nil, fetcher: FixtureFetcher, repositories: @repos]
       disk = start_supervised!({Store, [asset_mode: :disk, root: root] ++ opts}, id: :store_disk)
-      assert {:ok, 2} = Store.reload(disk)
+      assert {:ok, 2, _} = Store.reload(disk)
       :ok = stop_supervised!(:store_disk)
 
       # A fresh store over the same root serves the icon with no reload —
@@ -599,7 +663,7 @@ defmodule Vagus.Addon.StoreTest do
       assert {:ok, @png} = Assets.get(@mosquitto, :icon, Store.assets(reborn))
 
       memory = start_supervised!({Store, [asset_mode: :memory] ++ opts}, id: :store_memory)
-      assert {:ok, 2} = Store.reload(memory)
+      assert {:ok, 2, _} = Store.reload(memory)
       :ok = stop_supervised!(:store_memory)
 
       revived = start_supervised!({Store, [asset_mode: :memory] ++ opts}, id: :revived)
@@ -643,25 +707,25 @@ defmodule Vagus.Addon.StoreTest do
       # Returns straight away, while the first is still parked mid-fetch —
       # and reports the catalog as it currently stands (empty; the first
       # reload hasn't swapped yet).
-      log = capture_log(fn -> assert {:ok, 0} = Store.reload(srv) end)
+      log = capture_log(fn -> assert {:ok, 0, _} = Store.reload(srv) end)
       assert log =~ "reload already in progress, skipping"
 
       # It really was a no-op: it never entered a fetch of its own.
       refute_received {:fetch_started, _other}
 
       send(first_caller, :proceed)
-      assert {:ok, 1} = Task.await(first, 5_000)
+      assert {:ok, 1, _} = Task.await(first, 5_000)
 
       # The lock is released, so a later reload works normally.
       next = Task.async(fn -> Store.reload(srv) end)
       assert_receive {:fetch_started, next_caller}, 5_000
       send(next_caller, :proceed)
-      assert {:ok, 1} = Task.await(next, 5_000)
+      assert {:ok, 1, _} = Task.await(next, 5_000)
     end
 
     test "the ETS table dies with the Store that owned it" do
       srv = start_supervised!({Store, name: nil, fetcher: FixtureFetcher, repositories: @repos})
-      assert {:ok, 2} = Store.reload(srv)
+      assert {:ok, 2, _} = Store.reload(srv)
       assets = Store.assets(srv)
 
       ref = Process.monitor(srv)
@@ -1110,7 +1174,7 @@ defmodule Vagus.Addon.StoreTest do
       refute File.exists?(path)
 
       send(first_caller, :proceed)
-      assert {:ok, 0} = Task.await(first, 5_000)
+      assert {:ok, 0, _} = Task.await(first, 5_000)
     end
   end
 

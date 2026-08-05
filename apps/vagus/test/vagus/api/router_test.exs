@@ -287,6 +287,17 @@ defmodule Vagus.API.RouterTest do
         assert json_body(conn)["data"] == %{}
       end
     end
+
+    test "POST /store/reload sends the whole envelope and nothing else" do
+      # `Store.reload/1` also reports which repositories failed to fetch.
+      # None of that is on the wire: upstream's `POST /store/reload` answers
+      # with a bare ok envelope whether or not every repository came down,
+      # and Core's client parses exactly that.
+      conn = conn(:post, "/store/reload", Jason.encode!(%{})) |> authed() |> req_json() |> call()
+
+      assert conn.status == 200
+      assert json_body(conn) == %{"result" => "ok", "data" => %{}}
+    end
   end
 
   describe "honest error POST endpoints (not supported yet)" do
