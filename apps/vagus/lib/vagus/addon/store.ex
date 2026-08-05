@@ -97,7 +97,21 @@ defmodule Vagus.Addon.Store do
   end
 
   @doc """
-  Re-fetches every repository and rebuilds the catalog. Returns `{:ok, count}`.
+  Re-fetches every repository and rebuilds the catalog. Returns
+  `{:ok, count, errors}`, where `errors` is `%{repo_slug => fetch error}` for
+  the repositories this reload could **not** bring down — empty when every
+  fetch succeeded.
+
+  Callers need that map because a partial reload is indistinguishable from a
+  complete one by the count alone: the built-in `core` mqtt source needs no
+  network, so a fully offline device still reports one add-on. The boot
+  refresher reads it as its retry signal.
+
+  A repository whose fetch failed keeps the catalog entries, repository
+  metadata and retained assets its last successful fetch left behind; only a
+  successful fetch may replace or prune a repository's own state. Fresh
+  entries win on a slug collision, so the source of a shared slug that *did*
+  come down still replaces its own half.
 
   The (slow, network-bound) fetch runs in the **caller's** process, not the
   GenServer — only a fast snapshot read and catalog swap touch the server — so a
@@ -126,15 +140,18 @@ defmodule Vagus.Addon.Store do
   the same worker-exhaustion exposure `Vagus.Core.Lifecycle` designed around
   with its `retries: 0` → `{:error, :busy}` → 409.
   """
-  @spec reload(GenServer.server()) :: {:ok, non_neg_integer()}
+  @spec reload(GenServer.server()) ::
+          {:ok, non_neg_integer(), %{optional(String.t()) => term()}}
   def reload(server \\ __MODULE__) do
     case with_reload_lock(server, fn -> do_reload(server) end) do
+      # No errors: this call fetched nothing, so it has nothing to report
+      # failed. The reload holding the lock logs its own.
       :aborted ->
         Logger.warning("Vagus.Addon.Store: reload already in progress, skipping")
-        {:ok, map_size(catalog(server))}
+        {:ok, map_size(catalog(server)), %{}}
 
-      {:ok, count, _errors} ->
-        {:ok, count}
+      {:ok, count, errors} ->
+        {:ok, count, errors}
     end
   end
 
@@ -168,25 +185,43 @@ defmodule Vagus.Addon.Store do
   end
 
   # `{:ok, count, errors}` — the per-repository fetch failures ride along for
-  # `repair_repository/2`, which is the only caller that needs to know whether
-  # *this* reload actually brought a given repository down. `reload/1` drops
-  # them.
+  # `repair_repository/2` (which needs to know whether *this* reload brought a
+  # given repository down) and for `reload/1`'s callers, which cannot tell a
+  # partial reload from a complete one by the count alone.
   defp do_reload(server) do
-    {repositories, fetcher, assets} = GenServer.call(server, :snapshot)
-    {catalog, repository_meta, errors} = build_with_errors(repositories, fetcher, assets)
+    snapshot = GenServer.call(server, :snapshot)
+
+    {fetched, fetched_meta, errors} =
+      build_with_errors(snapshot.repositories, snapshot.fetcher, snapshot.assets)
+
+    # A repository that didn't fetch keeps what its last successful fetch left
+    # behind — its entries here, its metadata below, and its assets by way of
+    # the prune list, which is derived from this catalog. Merging the fresh
+    # side second lets a source that DID come down replace its own half of a
+    # slug two sources share (the built-in mqtt repo rides `core`).
+    catalog = Map.merge(retained_entries(snapshot.catalog, Map.keys(errors)), fetched)
+
+    repository_meta =
+      Map.merge(Map.take(snapshot.repository_meta, Map.keys(errors)), fetched_meta)
+
     :ok = GenServer.call(server, {:put_catalog, catalog})
     :ok = GenServer.call(server, {:put_repository_meta, repository_meta})
 
     # After the swap, not before: until the new catalog is live, the old
     # entries are still the ones being served, and pruning their assets first
     # would blank icons for the length of the reload.
-    {:ok, pruned} = Assets.prune(Enum.map(catalog, fn {_slug, e} -> Assets.id(e) end), assets)
+    ids = Enum.map(catalog, fn {_slug, entry} -> Assets.id(entry) end)
+    {:ok, pruned} = Assets.prune(ids, snapshot.assets)
 
     if pruned > 0 do
       Logger.info("Vagus.Addon.Store: pruned assets for #{pruned} add-on(s) no longer in catalog")
     end
 
     {:ok, map_size(catalog), errors}
+  end
+
+  defp retained_entries(catalog, failed) do
+    Map.filter(catalog, fn {_slug, entry} -> Map.get(entry, :repository) in failed end)
   end
 
   @doc """
@@ -345,7 +380,7 @@ defmodule Vagus.Addon.Store do
   ## Repository mutation (caller-side; see the moduledoc)
 
   defp do_add_repository(server, repository_string) do
-    {repositories, fetcher, _assets} = GenServer.call(server, :snapshot)
+    %{repositories: repositories, fetcher: fetcher} = GenServer.call(server, :snapshot)
 
     with {:ok, entry} <- parse_candidate(repository_string),
          :ok <- refute_duplicate(entry, repositories),
@@ -523,9 +558,15 @@ defmodule Vagus.Addon.Store do
     {:ok, state}
   end
 
+  # Everything a caller-side reload or repository mutation reads from the
+  # server, in ONE call. The catalog and metadata ride along because a reload
+  # carries a failed repository's previous entries forward; reading them here
+  # rather than after the fetch is safe because the reload mutex serialises
+  # every writer of either.
   @impl GenServer
   def handle_call(:snapshot, _from, state) do
-    {:reply, {state.repositories, state.fetcher, state.assets}, state}
+    reply = Map.take(state, [:repositories, :fetcher, :assets, :catalog, :repository_meta])
+    {:reply, reply, state}
   end
 
   def handle_call(:assets, _from, state), do: {:reply, state.assets, state}

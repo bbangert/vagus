@@ -9,6 +9,8 @@ defmodule Vagus.Addon.Store.RefresherTest do
   """
   use ExUnit.Case, async: false
 
+  import ExUnit.CaptureLog
+
   alias Vagus.Addon.Store
   alias Vagus.Addon.Store.Refresher
 
@@ -16,6 +18,18 @@ defmodule Vagus.Addon.Store.RefresherTest do
   name: Test Addon
   version: "1"
   slug: test
+  description: d
+  arch:
+    - amd64
+  image: x/y
+  """
+
+  # The built-in mqtt add-on's stand-in: a second slug, so a catalog built
+  # from it alone is non-empty and distinguishable from the network repo's.
+  @builtin_config """
+  name: MQTT
+  version: "1"
+  slug: mqtt
   description: d
   arch:
     - amd64
@@ -49,17 +63,51 @@ defmodule Vagus.Addon.Store.RefresherTest do
     def attempts, do: :counters.get(counter(), 1)
   end
 
+  # The device's repository set in miniature: a built-in source that needs no
+  # network, sharing the `core` slug with a git source that does. Offline,
+  # this pair still reloads to a catalog of one — which is exactly why the
+  # catalog size cannot be the retry signal.
+  defmodule MixedFetcher do
+    def fetch(%{slug: "core", builtin: :mqtt}) do
+      {:ok, [{"mqtt/config.yaml", Vagus.Addon.Store.RefresherTest.builtin_config()}]}
+    end
+
+    def fetch(%{slug: "core"}) do
+      :counters.add(counter(), 1, 1)
+
+      if :persistent_term.get({__MODULE__, :online}, false) do
+        {:ok, [{"test/config.yaml", Vagus.Addon.Store.RefresherTest.config()}]}
+      else
+        {:error, :nxdomain}
+      end
+    end
+
+    def counter, do: :persistent_term.get({__MODULE__, :counter})
+
+    def reset_counter, do: :persistent_term.put({__MODULE__, :counter}, :counters.new(1, []))
+
+    def attempts, do: :counters.get(counter(), 1)
+  end
+
   def config, do: @config
+  def builtin_config, do: @builtin_config
 
   @repos [%{slug: "core", url: "https://example.test/repo"}]
+  @mixed_repos [
+    %{slug: "core", builtin: :mqtt},
+    %{slug: "core", url: "https://example.test/repo"}
+  ]
 
   setup do
     FlakyFetcher.reset_counter()
+    MixedFetcher.reset_counter()
 
     on_exit(fn ->
       :persistent_term.erase({FlakyFetcher, :online})
       :persistent_term.erase({FlakyFetcher, :raise})
       :persistent_term.erase({FlakyFetcher, :counter})
+      :persistent_term.erase({MixedFetcher, :online})
+      :persistent_term.erase({MixedFetcher, :counter})
     end)
 
     :ok
@@ -82,9 +130,10 @@ defmodule Vagus.Addon.Store.RefresherTest do
     assert eventually(fn -> map_size(Store.catalog(store)) == 1 end)
   end
 
-  test "an empty catalog is retried, and a later-arriving network still populates it" do
-    # `Store.reload/1` reports a failed repository as `{:ok, 0}`, not an
-    # error, so the retry has to key on the count.
+  test "a failed fetch is retried, and a later-arriving network still populates it" do
+    # `Store.reload/1` reports a failed repository as success (it logs and
+    # skips it), so the retry keys on the fetch errors it returns alongside
+    # the count.
     store = start_store()
 
     start_supervised!(
@@ -101,6 +150,63 @@ defmodule Vagus.Addon.Store.RefresherTest do
     :persistent_term.put({FlakyFetcher, :online}, true)
 
     assert eventually(fn -> map_size(Store.catalog(store)) == 1 end)
+  end
+
+  test "a failed repository is retried even though the built-in one filled the catalog" do
+    # The field bug: with `%{slug: "core", builtin: :mqtt}` in the repository
+    # set, a device that resolves nothing still reloads to a catalog of one,
+    # and a refresher keying on the count calls that a populated store. The
+    # signal is the per-repository fetch errors, not the size.
+    store =
+      start_supervised!({Store, name: nil, fetcher: MixedFetcher, repositories: @mixed_repos})
+
+    start_supervised!(
+      {Refresher,
+       force: true,
+       store: store,
+       initial_delay_ms: 0,
+       backoff_ms: List.duplicate(50, 40),
+       name: :refresher_partial}
+    )
+
+    assert eventually(fn -> map_size(Store.catalog(store)) == 1 end)
+    assert eventually(fn -> MixedFetcher.attempts() >= 2 end)
+
+    :persistent_term.put({MixedFetcher, :online}, true)
+    assert eventually(fn -> map_size(Store.catalog(store)) == 2 end)
+
+    # Nothing failed on that attempt, so the loop ends there rather than
+    # running out the remaining backoff.
+    attempts = MixedFetcher.attempts()
+    Process.sleep(150)
+    assert MixedFetcher.attempts() == attempts
+  end
+
+  test "out of retries, it names the repositories still failing and idles" do
+    store = start_store()
+
+    log =
+      capture_log(fn ->
+        start_supervised!(
+          {Refresher,
+           force: true,
+           store: store,
+           initial_delay_ms: 0,
+           backoff_ms: [10],
+           name: :refresher_giveup_log}
+        )
+
+        assert eventually(fn -> FlakyFetcher.attempts() == 2 end)
+        Process.sleep(50)
+      end)
+
+    assert log =~ "repositories still failing: core"
+    assert log =~ "out of retries"
+    assert log =~ "POST /store/reload"
+
+    # Idle, not dead — it stopped retrying, it didn't crash.
+    assert :refresher_giveup_log |> Process.whereis() |> Process.alive?()
+    assert FlakyFetcher.attempts() == 2
   end
 
   test "it gives up after the configured retries rather than fetching forever" do

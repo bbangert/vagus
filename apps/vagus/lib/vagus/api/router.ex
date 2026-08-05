@@ -1395,7 +1395,11 @@ defmodule Vagus.API.Router do
   # Fired by the addon coordinator on non-scheduled refreshes, before
   # re-listing addons (§3). Re-fetches the store repositories.
   post "/store/reload" do
-    {:ok, _count} = Store.reload()
+    # Per-repository fetch failures don't fail the call: upstream's
+    # `StoreManager.reload` reports a repository that didn't come down as
+    # "not updated", not as an error, and the surviving catalog is still
+    # served. They are logged, and the boot refresher retries on them.
+    {:ok, _count, _errors} = Store.reload()
     Envelope.send_ok(conn, %{})
   end
 

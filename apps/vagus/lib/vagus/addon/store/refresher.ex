@@ -30,12 +30,21 @@ defmodule Vagus.Addon.Store.Refresher do
   ## Retry
 
   A device that boots without a network yet — the normal case, since WiFi
-  association and DHCP race the supervision tree — gets an empty catalog on
-  the first attempt. `Store.reload/1` reports that as `{:ok, 0}` rather than
-  an error (it logs each repository's failure and skips it), so **an empty
-  catalog is the retry signal**, not a return value. Backoff is capped and
-  the attempts are finite: a device genuinely offline shouldn't re-attempt
-  forever, and one that is merely slow has minutes of grace.
+  association and DHCP race the supervision tree — cannot fetch any
+  repository. `Store.reload/1` reports that as success (it logs each
+  repository's failure, skips it and serves what it has), so the retry signal
+  is the **per-repository fetch errors** it returns alongside the count: any
+  repository that failed means another attempt is worth making.
+
+  The count is emphatically **not** the signal. The built-in `core` mqtt
+  repository is served without a network, so a device that can reach nothing
+  still reloads to a catalog of one — which the earlier "an empty catalog is
+  the retry signal" rule scored as success, pinning a board that booted
+  before DNS was ready at that single add-on until someone reloaded by hand.
+
+  Backoff is capped and the attempts are finite: a device genuinely offline
+  shouldn't re-attempt forever, and one that is merely slow has minutes of
+  grace.
 
   Gated by `config :vagus, :store_boot_refresh`, so `:host` and `:test` never
   reach out to github and `start_link/1` returns `:ignore` — the same
@@ -78,8 +87,8 @@ defmodule Vagus.Addon.Store.Refresher do
 
   defp attempt(state) do
     case Store.reload(state.store) do
-      {:ok, 0} -> retry(state)
-      {:ok, count} -> done(state, count)
+      {:ok, count, errors} when map_size(errors) == 0 -> done(state, count)
+      {:ok, _count, errors} -> retry(state, failed(errors))
     end
   rescue
     # `reload/1` shouldn't raise, but a boot-time helper that takes the
@@ -94,7 +103,7 @@ defmodule Vagus.Addon.Store.Refresher do
           Exception.format(:error, error, __STACKTRACE__)
       )
 
-      retry(state)
+      retry(state, "reload raised")
   catch
     # `reload/1` opens with a `GenServer.call` to the store, so a device busy
     # enough to blow the 5s default exits rather than raising — and an exit
@@ -107,7 +116,14 @@ defmodule Vagus.Addon.Store.Refresher do
           Exception.format_stacktrace(__STACKTRACE__)
       )
 
-      retry(state)
+      retry(state, "reload exited")
+  end
+
+  # The failing repositories by slug, not their reasons: `Store.reload/1` has
+  # already logged one line per repository with the full error, and this line
+  # only has to say what is still outstanding.
+  defp failed(errors) do
+    "repositories still failing: " <> Enum.join(Enum.sort(Map.keys(errors)), ", ")
   end
 
   defp done(state, count) do
@@ -115,17 +131,17 @@ defmodule Vagus.Addon.Store.Refresher do
     %{state | backoff: []}
   end
 
-  defp retry(%{backoff: []} = state) do
+  defp retry(%{backoff: []} = state, reason) do
     Logger.warning(
-      "Vagus.Addon.Store.Refresher: store still empty and out of retries — " <>
+      "Vagus.Addon.Store.Refresher: #{reason}, out of retries — " <>
         "POST /store/reload once the network is up"
     )
 
     state
   end
 
-  defp retry(%{backoff: [delay | rest]} = state) do
-    Logger.info("Vagus.Addon.Store.Refresher: store empty, retrying in #{div(delay, 1000)}s")
+  defp retry(%{backoff: [delay | rest]} = state, reason) do
+    Logger.info("Vagus.Addon.Store.Refresher: #{reason}, retrying in #{div(delay, 1000)}s")
     Process.send_after(self(), :refresh, delay)
     %{state | backoff: rest}
   end
