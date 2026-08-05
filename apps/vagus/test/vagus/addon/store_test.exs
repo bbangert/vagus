@@ -770,6 +770,29 @@ defmodule Vagus.Addon.StoreTest do
       assert log =~ invalid
       assert log =~ "123"
     end
+
+    test "an entry that parses but fails the safety gate (ensure_safe/1) is dropped, not just unparseable ones",
+         %{path: path} do
+      valid = "https://github.com/awesome-developer/awesome-repo"
+      not_github = "https://notgithub.com/a/b"
+      traversal = "https://github.com/home-assistant/addons#../../../x/y/tar.gz/main"
+      File.write!(path, Jason.encode!([valid, not_github, traversal]))
+
+      log =
+        capture_log(fn ->
+          started =
+            start_supervised!(
+              {Store, name: nil, path: path, fetcher: FixtureFetcher, repositories: @repos}
+            )
+
+          send(self(), {:started, started})
+        end)
+
+      assert_received {:started, srv}
+
+      assert Enum.map(Store.repositories(srv), & &1.slug) == ["core", "a474bbd1"]
+      assert log =~ not_github
+    end
   end
 
   describe "runtime add/remove/repair (issue #5, phase 3)" do

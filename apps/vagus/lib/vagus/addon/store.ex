@@ -830,10 +830,11 @@ defmodule Vagus.Addon.Store do
 
   # `%{slug, url, ref, source}` per persisted source string, ready to append
   # to `state.repositories` alongside the config-declared entries. A source
-  # was already validated by `RepositorySpec.parse/1` in `read_persisted/1`
-  # before it reached the persisted list, so this can't fail — but `parse/1`
-  # is called again rather than trusted-through, because the two functions
-  # have no shared state to prove that invariant across a refactor.
+  # was already validated by both `RepositorySpec.parse/1` and
+  # `RepositorySpec.ensure_safe/1` in `read_persisted/1` before it reached the
+  # persisted list, so this can't fail — but `parse/1` is called again rather
+  # than trusted-through, because the two functions have no shared state to
+  # prove that invariant across a refactor.
   defp derive_repositories(sources) do
     Enum.map(sources, fn source ->
       {:ok, spec} = RepositorySpec.parse(source)
@@ -865,14 +866,20 @@ defmodule Vagus.Addon.Store do
   # or partially written `store_repositories.json` is not trusted verbatim.
   # A non-binary entry, or a binary that doesn't parse as a repository
   # string, is dropped (logged) rather than reaching `derive_repositories/1`
-  # and crashing boot.
+  # and crashing boot. A binary that parses but fails `ensure_safe/1` (a
+  # non-github.com host, a path-traversal ref, or an over-length string) is
+  # dropped too — the same runtime safety gate `add_repository/2` applies to
+  # a fresh add must also apply here, or a hand-edited file could reintroduce
+  # the url/fetch decoupling that gate closes.
   defp decode_sources(decoded) do
     Enum.filter(decoded, fn entry ->
       case entry do
         source when is_binary(source) ->
-          case RepositorySpec.parse(source) do
-            {:ok, _} -> true
-            {:error, :invalid_format} -> log_dropped(entry)
+          with {:ok, spec} <- RepositorySpec.parse(source),
+               :ok <- RepositorySpec.ensure_safe(spec) do
+            true
+          else
+            _invalid_or_unsafe -> log_dropped(entry)
           end
 
         other ->
@@ -884,7 +891,7 @@ defmodule Vagus.Addon.Store do
   defp log_dropped(entry) do
     Logger.warning(
       "Vagus.Addon.Store: dropping persisted repository entry #{inspect(entry)} " <>
-        "(not a valid repository string)"
+        "(not a valid or allowed repository string)"
     )
 
     false
