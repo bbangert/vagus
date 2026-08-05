@@ -55,6 +55,13 @@ defmodule Vagus.API.TiersTest do
     {"/store/addons/core_mqtt/documentation", :supervisor},
     {"/addons/core_mqtt/changelog", :supervisor},
     {"/addons/core_mqtt/documentation", :supervisor},
+    # Issue #5 — no table entry of their own, method is not consulted (see
+    # this module's moduledoc), so GET/POST share one row per path and
+    # DELETE/POST-repair fall under the same `{["store", :*], :manager}`
+    # catch-all as every other `/store/...` path above.
+    {"/store/repositories", :manager},
+    {"/store/repositories/a474bbd1", :manager},
+    {"/store/repositories/a474bbd1/repair", :manager},
     {"/mounts", :manager},
     {"/resolution/info", :default},
     {"/jobs/info", :default},
