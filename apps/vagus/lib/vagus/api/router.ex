@@ -381,6 +381,111 @@ defmodule Vagus.API.Router do
     end
   end
 
+  # -- Store repositories (issue #5) ------------------------------------------
+  #
+  # The frontend's Apps → ⋮ → Repositories dialog. `store_repositories/0`
+  # (below, shared with `GET /store`) is already the wire's 5-key
+  # `Repository` shape — unlike every other GET here, upstream's `data` for
+  # the list route is a **bare array**, not a map wrapping one; `Envelope.ok/1`
+  # accepts a list for exactly this reason (see its own comment).
+  #
+  # Every mutation funnels through `Vagus.Addon.Store`'s single reload mutex
+  # (`add_repository/2`, `remove_repository/2`, `repair_repository/2` — see
+  # that module's moduledoc): a contended mutex is `{:error, :busy}`, mapped
+  # to 409 by `send_store_busy/1` below, same "second caller doesn't queue"
+  # shape as `send_core_lifecycle_error/2`.
+  get "/store/repositories" do
+    Envelope.send_ok(conn, store_repositories())
+  end
+
+  get "/store/repositories/:slug" do
+    case Enum.find(store_repositories(), &(&1.slug == slug)) do
+      nil -> repository_not_found(conn, slug)
+      repository -> Envelope.send_ok(conn, repository)
+    end
+  end
+
+  # Body schema is `{"repository": str}`, PREVENT_EXTRA (C5 convention) — a
+  # missing key and a non-string value both read as "no valid repository
+  # format!", upstream's own wording for a candidate that never reaches
+  # `RepositorySpec.parse/1` (D8: message-only envelope, no separate
+  # "required key" wording).
+  @store_add_repository_keys ~w(repository)
+
+  post "/store/repositories" do
+    case validate_add_repository(conn.body_params) do
+      {:ok, repository} ->
+        case Store.add_repository(repository) do
+          :ok ->
+            Envelope.send_ok(conn, %{})
+
+          {:error, {:duplicate, url}} ->
+            Envelope.send_error(conn, "Can't add #{url}, already in the store", 409)
+
+          {:error, :invalid_format} ->
+            Envelope.send_error(conn, "No valid repository format!", 400)
+
+          {:error, :repo_limit} ->
+            Envelope.send_error(conn, "Repository limit reached", 400)
+
+          {:error, {:invalid_repository, url}} ->
+            Envelope.send_error(conn, "#{url} is not a valid add-on repository", 400)
+
+          {:error, :busy} ->
+            send_store_busy(conn)
+        end
+
+      {:error, message} ->
+        Envelope.send_error(conn, message, 400)
+    end
+  end
+
+  delete "/store/repositories/:slug" do
+    case Store.remove_repository(slug) do
+      :ok ->
+        Envelope.send_ok(conn, %{})
+
+      {:error, :not_found} ->
+        repository_not_found(conn, slug)
+
+      {:error, :builtin} ->
+        Envelope.send_error(conn, "Can't remove built-in repositories!", 400)
+
+      {:error, {:in_use, source}} ->
+        Envelope.send_error(
+          conn,
+          "Can't remove '#{source}'. It's used by installed add-ons",
+          400
+        )
+
+      {:error, :busy} ->
+        send_store_busy(conn)
+    end
+  end
+
+  # Vagus holds no git checkout to repair — a repair *is* a full reload
+  # (`Store.repair_repository/2`'s moduledoc, D7) — so the only honest failure
+  # once the slug is known is "this reload still couldn't bring it down".
+  post "/store/repositories/:slug/repair" do
+    case Store.repair_repository(slug) do
+      :ok ->
+        Envelope.send_ok(conn, %{})
+
+      {:error, :not_found} ->
+        repository_not_found(conn, slug)
+
+      {:error, {:fetch_failed, reason}} ->
+        Envelope.send_error(
+          conn,
+          "Repository #{slug} could not be fetched: #{inspect(reason)}",
+          400
+        )
+
+      {:error, :busy} ->
+        send_store_busy(conn)
+    end
+  end
+
   # -- Store assets: icon/logo/changelog/documentation (P2-A P4) ------------
   #
   # icon/logo are unauthenticated (see `Vagus.API.Auth.unauthenticated?/1` —
@@ -2268,6 +2373,33 @@ defmodule Vagus.API.Router do
   # The Repository wire shape (slug/name/source/url/maintainer, all strings).
   defp store_repositories do
     Enum.map(Store.repositories(), &StoreView.repository/1)
+  end
+
+  # Shared by all three `/store/repositories/:slug...` routes — same message
+  # whether the slug never existed (GET/DELETE/repair) or was just removed.
+  defp repository_not_found(conn, slug) do
+    Envelope.send_error(conn, "Repository #{slug} does not exist in the store", 404)
+  end
+
+  # `{:error, :busy}` (the reload mutex `Vagus.Addon.Store`'s moduledoc
+  # documents, shared by `reload/1` and every repository mutation) — mirrors
+  # `send_core_lifecycle_error/2`'s "second caller doesn't queue" 409, not a
+  # per-mutation message, since none of the three ever ran.
+  defp send_store_busy(conn) do
+    Envelope.send_error(conn, "a store operation is already in progress", 409)
+  end
+
+  # `{"repository": str}`, PREVENT_EXTRA — same `reject_unknown_keys/2`
+  # convention `validate_supervisor_options/1` uses. A missing key and a
+  # non-string value share one message (D8): upstream's own wording for "not a
+  # repository string" is what the frontend surfaces either way.
+  defp validate_add_repository(params) do
+    with :ok <- reject_unknown_keys(params, @store_add_repository_keys) do
+      case Map.get(params, "repository") do
+        repository when is_binary(repository) -> {:ok, repository}
+        _other -> {:error, "No valid repository format!"}
+      end
+    end
   end
 
   # -- store asset helpers (P2-A P4) ------------------------------------------

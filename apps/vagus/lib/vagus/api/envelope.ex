@@ -13,8 +13,8 @@ defmodule Vagus.API.Envelope do
   import Plug.Conn
 
   @doc "Builds the ok envelope body."
-  @spec ok(map()) :: map()
-  def ok(data) when is_map(data), do: %{"result" => "ok", "data" => data}
+  @spec ok(map() | list()) :: map()
+  def ok(data) when is_map(data) or is_list(data), do: %{"result" => "ok", "data" => data}
 
   @doc "Builds the error envelope body."
   @spec error(String.t()) :: map()
@@ -33,8 +33,11 @@ defmodule Vagus.API.Envelope do
     |> halt()
   end
 
+  # `data` is usually a map, but `GET /store/repositories` (upstream contract)
+  # sends `data` as a bare JSON array — a list is valid `data`, not just the
+  # common case.
   @doc "Sends an ok envelope for `data` (default HTTP 200)."
-  @spec send_ok(Plug.Conn.t(), map(), non_neg_integer()) :: Plug.Conn.t()
+  @spec send_ok(Plug.Conn.t(), map() | list(), non_neg_integer()) :: Plug.Conn.t()
   def send_ok(conn, data, status \\ 200), do: send_json(conn, status, ok(data))
 
   @doc "Sends an error envelope with `message` at the given HTTP `status`."

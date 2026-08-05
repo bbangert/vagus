@@ -59,6 +59,12 @@ defmodule Vagus.Addon.StoreView do
   is null while `source` stays a non-null string (aiohasupervisor's `Repository`
   model requires it). Reading `repo.url` directly would `KeyError` on a built-in
   repo → `GET /store` 500 → the hassio config entry fails setup.
+
+  `source` prefers an explicit `:source` on the repo map — a runtime-added
+  repository (`Vagus.Addon.Store.RepositorySpec`) carries the original
+  `url#branch` string the user posted, which `url` alone would lose — then
+  falls back to `url`, then the slug, for the config-declared repos that
+  carry neither.
   """
   @spec repository(map()) :: map()
   def repository(repo) do
@@ -67,7 +73,7 @@ defmodule Vagus.Addon.StoreView do
     %{
       slug: repo.slug,
       name: Map.get(repo, :name, repo.slug),
-      source: url || repo.slug,
+      source: Map.get(repo, :source) || url || repo.slug,
       url: url,
       maintainer: Map.get(repo, :maintainer, "")
     }

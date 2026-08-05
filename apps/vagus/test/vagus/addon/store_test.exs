@@ -4,8 +4,8 @@ defmodule Vagus.Addon.StoreTest do
 
   import ExUnit.CaptureLog
 
-  alias Vagus.Addon.{Store, StoreView}
-  alias Vagus.Addon.Store.Assets
+  alias Vagus.Addon.{State, Store, StoreView}
+  alias Vagus.Addon.Store.{Assets, RepositorySpec}
 
   @mosquitto_yaml """
   name: Mosquitto broker
@@ -98,6 +98,50 @@ defmodule Vagus.Addon.StoreTest do
   def png, do: @png
 
   @repos [%{slug: "core", url: "https://github.com/home-assistant/addons"}]
+
+  # The runtime-mutation fixture. Matches on `url`, not `slug`: a
+  # runtime-added repository is slugged by a hash of the exact string the user
+  # posted, so `url` and `url#branch` are two slugs served by one fixture repo.
+  defmodule MutationFetcher do
+    def fetch(%{slug: "core"} = repo), do: Vagus.Addon.StoreTest.FixtureFetcher.fetch(repo)
+    def fetch(%{slug: "broken"}), do: {:error, :nxdomain}
+
+    def fetch(%{url: "https://github.com/awesome-developer/awesome-repo"}) do
+      {:ok,
+       [
+         {"repository.json", ~s({"name": "Awesome add-ons", "maintainer": "Awesome Dev"})},
+         {"esphome/config.yaml", Vagus.Addon.StoreTest.esphome_yaml()}
+       ]}
+    end
+
+    # Fetches fine, ships add-ons, but has no `repository.{json,yaml,yml}` —
+    # upstream's bar for "not an add-on repository". A github.com host so it
+    # clears `RepositorySpec.ensure_safe/1`'s host gate and actually reaches the
+    # fetch (the point under test).
+    def fetch(%{url: "https://github.com/example/no-repository-file"}) do
+      {:ok, [{"esphome/config.yaml", Vagus.Addon.StoreTest.esphome_yaml()}]}
+    end
+
+    def fetch(%{url: "https://github.com/example/gone"}), do: {:error, :nxdomain}
+  end
+
+  # A `Vagus.Addon.State` entry under `store_slug` — that is the key an
+  # installed add-on is really recorded under (`handle_install` rewrites
+  # `config.slug` to the store slug), which is what makes the catalog entry's
+  # `:repository` field readable as the in-use association.
+  defp install(state_server, store_slug) do
+    {:ok, config} =
+      Vagus.Addon.Config.parse(%{
+        "name" => "Installed",
+        "version" => "1.0.0",
+        "slug" => store_slug,
+        "description" => "an installed add-on",
+        "arch" => ["aarch64"],
+        "image" => "x/y"
+      })
+
+    :ok = State.put(config, :started, server: state_server)
+  end
 
   test "build_catalog parses each config.yaml into a store-slugged entry" do
     catalog = Store.build_catalog(@repos, FixtureFetcher)
@@ -318,6 +362,21 @@ defmodule Vagus.Addon.StoreTest do
     assert r.slug == "core"
     assert r.url == nil
     assert r.source == "core"
+  end
+
+  test "StoreView.repository prefers an explicit :source over the url (runtime-added repos)" do
+    # A runtime-added repository (Vagus.Addon.Store.RepositorySpec) carries
+    # the original `url#branch` string the user posted — `url` alone would
+    # lose the branch suffix.
+    r =
+      StoreView.repository(%{
+        slug: "a474bbd1",
+        url: "https://github.com/awesome-developer/awesome-repo",
+        source: "https://github.com/awesome-developer/awesome-repo#mybranch"
+      })
+
+    assert r.url == "https://github.com/awesome-developer/awesome-repo"
+    assert r.source == "https://github.com/awesome-developer/awesome-repo#mybranch"
   end
 
   test "StoreView.detail adds the ext fields (StoreAddonComplete)" do
@@ -612,5 +671,429 @@ defmodule Vagus.Addon.StoreTest do
       # Not merely empty — gone, so a leaked handle can't outlive its owner.
       assert catch_error(Assets.get(@mosquitto, :icon, assets))
     end
+  end
+
+  describe "file persistence across process restart (boot reload)" do
+    setup do
+      path =
+        Path.join(
+          System.tmp_dir!(),
+          "vagus_test_store_repositories_#{System.unique_integer([:positive])}.json"
+        )
+
+      on_exit(fn -> File.rm(path) end)
+      %{path: path}
+    end
+
+    test "a persisted repo is layered after config repos, and survives a restart on the same path",
+         %{path: path} do
+      source = "https://github.com/awesome-developer/awesome-repo"
+      File.write!(path, Jason.encode!([source]))
+
+      srv =
+        start_supervised!(
+          {Store, name: nil, path: path, fetcher: FixtureFetcher, repositories: @repos}
+        )
+
+      repos = Store.repositories(srv)
+      assert Enum.map(repos, & &1.slug) == ["core", "a474bbd1"]
+
+      persisted = Enum.find(repos, &(&1.slug == "a474bbd1"))
+      assert persisted.url == source
+      # Pre-reload, no repository.* has been fetched for it yet — same
+      # "meta needs a reload" invariant the config-declared repos observe.
+      assert persisted.name == "a474bbd1"
+
+      stop_supervised!(Store)
+
+      srv2 =
+        start_supervised!(
+          {Store, name: nil, path: path, fetcher: FixtureFetcher, repositories: @repos}
+        )
+
+      repos2 = Store.repositories(srv2)
+      assert Enum.map(repos2, & &1.slug) == ["core", "a474bbd1"]
+    end
+
+    test "a missing persisted file has no persisted repos, only config ones", %{path: path} do
+      refute File.exists?(path)
+
+      srv =
+        start_supervised!(
+          {Store, name: nil, path: path, fetcher: FixtureFetcher, repositories: @repos}
+        )
+
+      assert Enum.map(Store.repositories(srv), & &1.slug) == ["core"]
+    end
+
+    test "a corrupt/malformed-JSON file is tolerated: config repos only, no crash", %{path: path} do
+      File.write!(path, "not json { at all")
+
+      srv =
+        start_supervised!(
+          {Store, name: nil, path: path, fetcher: FixtureFetcher, repositories: @repos}
+        )
+
+      assert Enum.map(Store.repositories(srv), & &1.slug) == ["core"]
+    end
+
+    test "a JSON value that isn't a list is treated as corrupt: config repos only", %{path: path} do
+      File.write!(path, Jason.encode!(%{"not" => "a list"}))
+
+      srv =
+        start_supervised!(
+          {Store, name: nil, path: path, fetcher: FixtureFetcher, repositories: @repos}
+        )
+
+      assert Enum.map(Store.repositories(srv), & &1.slug) == ["core"]
+    end
+
+    test "wrong-typed and invalid-format entries are dropped; valid siblings still load, a warning is logged",
+         %{path: path} do
+      valid = "https://github.com/awesome-developer/awesome-repo"
+      invalid = "not-a-url-#{System.unique_integer([:positive])}"
+      File.write!(path, Jason.encode!([valid, 123, %{"a" => 1}, invalid]))
+
+      log =
+        capture_log(fn ->
+          started =
+            start_supervised!(
+              {Store, name: nil, path: path, fetcher: FixtureFetcher, repositories: @repos}
+            )
+
+          send(self(), {:started, started})
+        end)
+
+      assert_received {:started, srv}
+
+      assert Enum.map(Store.repositories(srv), & &1.slug) == ["core", "a474bbd1"]
+      assert log =~ invalid
+      assert log =~ "123"
+    end
+  end
+
+  describe "runtime add/remove/repair (issue #5, phase 3)" do
+    @awesome "https://github.com/awesome-developer/awesome-repo"
+    @awesome_slug "a474bbd1"
+
+    setup do
+      path =
+        Path.join(
+          System.tmp_dir!(),
+          "vagus_test_store_mutation_#{System.unique_integer([:positive])}.json"
+        )
+
+      on_exit(fn -> File.rm(path) end)
+      %{path: path}
+    end
+
+    test "add fetches, persists, and reloads before returning — catalog + meta are live",
+         %{path: path} do
+      srv = start_mutable_store(path)
+
+      assert :ok = Store.add_repository(srv, @awesome)
+
+      repos = Store.repositories(srv)
+      assert Enum.map(repos, & &1.slug) == ["core", @awesome_slug]
+
+      added = Enum.find(repos, &(&1.slug == @awesome_slug))
+      # From the added repo's own repository.json — only a completed reload
+      # could know it, which is the point of `add_repository/2` blocking on one.
+      assert added.name == "Awesome add-ons"
+      assert added.maintainer == "Awesome Dev"
+      assert added.ref == "HEAD"
+
+      # Its add-ons are in the catalog by the time `:ok` came back.
+      assert {:ok, %{repository: @awesome_slug}} = Store.get("#{@awesome_slug}_esphome", srv)
+
+      # The raw source string is what lands on disk (upstream parity, D4).
+      assert Jason.decode!(File.read!(path)) == [@awesome]
+
+      # And the wire view: the 5-key repository shape with `source` = the
+      # string the user posted.
+      assert StoreView.repository(added) == %{
+               slug: @awesome_slug,
+               name: "Awesome add-ons",
+               source: @awesome,
+               url: @awesome,
+               maintainer: "Awesome Dev"
+             }
+    end
+
+    test "a #branch suffix survives into ref, slug, and the wire's source", %{path: path} do
+      srv = start_mutable_store(path)
+      source = @awesome <> "#beta"
+
+      assert :ok = Store.add_repository(srv, source)
+
+      added = Enum.find(Store.repositories(srv), &(&1.slug == RepositorySpec.slug(source)))
+      assert added.slug != @awesome_slug
+      assert added.ref == "beta"
+      assert added.url == @awesome
+      assert StoreView.repository(added).source == source
+      assert Jason.decode!(File.read!(path)) == [source]
+    end
+
+    test "re-adding the same string is a duplicate by slug", %{path: path} do
+      srv = start_mutable_store(path)
+      assert :ok = Store.add_repository(srv, @awesome)
+
+      assert {:error, {:duplicate, @awesome}} = Store.add_repository(srv, @awesome)
+      assert Jason.decode!(File.read!(path)) == [@awesome]
+      assert Enum.map(Store.repositories(srv), & &1.slug) == ["core", @awesome_slug]
+    end
+
+    test "a decoupling payload (non-github host) is rejected on format, nothing persisted",
+         %{path: path} do
+      srv = start_mutable_store(path)
+
+      assert {:error, :invalid_format} = Store.add_repository(srv, "https://notgithub.com/a/b")
+      assert Enum.map(Store.repositories(srv), & &1.slug) == ["core"]
+      refute File.exists?(path)
+    end
+
+    test "a decoupling payload (ref path-traversal) is rejected on format, nothing persisted",
+         %{path: path} do
+      srv = start_mutable_store(path)
+
+      traversal = "https://github.com/home-assistant/addons/#../../../attacker/evil/tar.gz/main"
+      assert {:error, :invalid_format} = Store.add_repository(srv, traversal)
+      assert Enum.map(Store.repositories(srv), & &1.slug) == ["core"]
+      refute File.exists?(path)
+    end
+
+    test "trivial url variants collapse to one repo: …, …/ , and ….git are duplicates",
+         %{path: path} do
+      srv = start_mutable_store(path)
+      assert :ok = Store.add_repository(srv, @awesome)
+
+      # The dedupe fires before any fetch, so these variants never reach the
+      # fixture fetcher (which only matches the exact url).
+      assert {:error, {:duplicate, _}} = Store.add_repository(srv, @awesome <> "/")
+      assert {:error, {:duplicate, _}} = Store.add_repository(srv, @awesome <> ".git")
+
+      assert Enum.map(Store.repositories(srv), & &1.slug) == ["core", @awesome_slug]
+      assert Jason.decode!(File.read!(path)) == [@awesome]
+    end
+
+    test "adding beyond @max_repositories is rejected and nothing is persisted past the cap",
+         %{path: path} do
+      # Seed the persisted set at the cap (50) directly on disk — deriving these
+      # at boot doesn't fetch, so it's cheap and hermetic.
+      sources = for i <- 1..50, do: "https://github.com/o/r#{i}"
+      File.write!(path, Jason.encode!(sources))
+
+      srv = start_mutable_store(path)
+      # The wire view always carries a `source` key (nil for config repos), so
+      # count only the persisted (non-nil source) ones — the set the cap bounds.
+      assert Enum.count(Store.repositories(srv), &(&1.source != nil)) == 50
+
+      assert {:error, :repo_limit} = Store.add_repository(srv, @awesome)
+
+      # The 51st was never appended or written.
+      assert Jason.decode!(File.read!(path)) == sources
+      refute Enum.any?(Store.repositories(srv), &(&1.slug == @awesome_slug))
+    end
+
+    test "a built-in's URL is a duplicate however it is cased", %{path: path} do
+      # Vagus's built-ins keep human slugs where upstream hashes every URL into
+      # one, so only the URL comparison catches this (D3).
+      srv = start_mutable_store(path)
+
+      assert {:error, {:duplicate, _url}} =
+               Store.add_repository(srv, "HTTPS://GitHub.COM/Home-Assistant/Addons")
+
+      assert Enum.map(Store.repositories(srv), & &1.slug) == ["core"]
+      refute File.exists?(path)
+    end
+
+    test "garbage is rejected on format, before any fetch", %{path: path} do
+      srv = start_mutable_store(path)
+
+      assert {:error, :invalid_format} = Store.add_repository(srv, "not a repository at all")
+      assert {:error, :invalid_format} = Store.add_repository(srv, "#only-a-branch")
+      assert {:error, :invalid_format} = Store.add_repository(srv, "")
+      assert Enum.map(Store.repositories(srv), & &1.slug) == ["core"]
+      refute File.exists?(path)
+    end
+
+    test "a candidate that won't fetch is invalid_repository, and nothing is written",
+         %{path: path} do
+      srv = start_mutable_store(path)
+
+      log =
+        capture_log(fn ->
+          assert {:error, {:invalid_repository, "https://github.com/example/gone"}} =
+                   Store.add_repository(srv, "https://github.com/example/gone")
+        end)
+
+      assert log =~ "did not fetch"
+      assert Enum.map(Store.repositories(srv), & &1.slug) == ["core"]
+      refute File.exists?(path)
+    end
+
+    test "a candidate with no repository.{json,yaml,yml} is invalid_repository", %{path: path} do
+      srv = start_mutable_store(path)
+
+      assert {:error, {:invalid_repository, "https://github.com/example/no-repository-file"}} =
+               Store.add_repository(srv, "https://github.com/example/no-repository-file")
+
+      assert Enum.map(Store.repositories(srv), & &1.slug) == ["core"]
+      refute File.exists?(path)
+    end
+
+    test "remove drops the repo, its catalog entries, and its persisted line", %{path: path} do
+      srv = start_mutable_store(path)
+      assert :ok = Store.add_repository(srv, @awesome)
+
+      assert :ok = Store.remove_repository(srv, @awesome_slug)
+
+      assert Enum.map(Store.repositories(srv), & &1.slug) == ["core"]
+      assert :error = Store.get("#{@awesome_slug}_esphome", srv)
+      assert Jason.decode!(File.read!(path)) == []
+      # The reload that followed the removal still loaded the config repo.
+      assert {:ok, _} = Store.get("core_mosquitto", srv)
+    end
+
+    test "a config-declared repository is built-in and cannot be removed", %{path: path} do
+      srv = start_mutable_store(path)
+
+      assert {:error, :builtin} = Store.remove_repository(srv, "core")
+      assert Enum.map(Store.repositories(srv), & &1.slug) == ["core"]
+    end
+
+    test "an unknown slug is not_found", %{path: path} do
+      srv = start_mutable_store(path)
+      assert {:error, :not_found} = Store.remove_repository(srv, "deadbeef")
+    end
+
+    test "a repository an installed add-on came from is in_use, quoting its source",
+         %{path: path} do
+      addon_state = start_supervised!({State, name: nil, persist_path: nil})
+      srv = start_mutable_store(path, addon_state: addon_state)
+
+      assert :ok = Store.add_repository(srv, @awesome)
+      install(addon_state, "#{@awesome_slug}_esphome")
+
+      assert {:error, {:in_use, @awesome}} = Store.remove_repository(srv, @awesome_slug)
+      assert Enum.map(Store.repositories(srv), & &1.slug) == ["core", @awesome_slug]
+      assert Jason.decode!(File.read!(path)) == [@awesome]
+    end
+
+    test "an add-on installed from another repository does not hold this one back",
+         %{path: path} do
+      # The association is the catalog entry's `:repository` field, not the
+      # store slug's prefix: `core_mosquitto` is installed from `core` and says
+      # nothing about the runtime-added repo.
+      addon_state = start_supervised!({State, name: nil, persist_path: nil})
+      srv = start_mutable_store(path, addon_state: addon_state)
+
+      assert :ok = Store.add_repository(srv, @awesome)
+      install(addon_state, "core_mosquitto")
+
+      assert :ok = Store.remove_repository(srv, @awesome_slug)
+    end
+
+    test "repair reloads and reports the target repo as healthy", %{path: path} do
+      srv = start_mutable_store(path)
+      assert :ok = Store.add_repository(srv, @awesome)
+
+      assert :ok = Store.repair_repository(srv, @awesome_slug)
+      assert :ok = Store.repair_repository(srv, "core")
+      assert {:ok, _} = Store.get("#{@awesome_slug}_esphome", srv)
+    end
+
+    test "repairing an unknown slug is not_found", %{path: path} do
+      srv = start_mutable_store(path)
+      assert {:error, :not_found} = Store.repair_repository(srv, "deadbeef")
+    end
+
+    test "repair carries the real fetch error when the target repo won't come down",
+         %{path: path} do
+      srv =
+        start_supervised!(
+          {Store,
+           name: nil,
+           path: path,
+           fetcher: MutationFetcher,
+           repositories: @repos ++ [%{slug: "broken", url: "https://example.test/broken"}]}
+        )
+
+      log =
+        capture_log(fn ->
+          assert {:error, {:fetch_failed, :nxdomain}} = Store.repair_repository(srv, "broken")
+        end)
+
+      assert log =~ "fetch \"broken\" failed"
+
+      # The healthy repo in the same reload is unaffected, and reports so.
+      assert capture_log(fn -> assert :ok = Store.repair_repository(srv, "core") end) =~ "broken"
+    end
+
+    test "a repository that fetches but ships nothing is healthy, not fetch_failed",
+         %{path: path} do
+      # "Absent from the catalog" is not "failed to fetch" — the built-in mqtt
+      # source returns `{:ok, []}` and must not be reported as broken.
+      srv =
+        start_supervised!(
+          {Store,
+           name: nil,
+           path: path,
+           fetcher: FixtureFetcher,
+           repositories: [%{slug: "nameless", url: "https://example.test"}]}
+        )
+
+      assert :ok = Store.repair_repository(srv, "nameless")
+    end
+
+    test "a mutation contending with an in-flight reload is busy, never queued", %{path: path} do
+      # Same `retries: 0` mutex `reload/1` takes — but a mutation that did not
+      # happen cannot be reported as success, so it says so instead.
+      defmodule ParkingMutationFetcher do
+        def fetch(%{slug: "core", test_pid: pid}) do
+          send(pid, {:fetch_started, self()})
+
+          receive do
+            :proceed -> :ok
+          end
+
+          {:ok, []}
+        end
+      end
+
+      repos = [%{slug: "core", url: "https://github.com/home-assistant/addons", test_pid: self()}]
+
+      srv =
+        start_supervised!(
+          {Store, name: nil, path: path, fetcher: ParkingMutationFetcher, repositories: repos}
+        )
+
+      first = Task.async(fn -> Store.reload(srv) end)
+      assert_receive {:fetch_started, first_caller}, 5_000
+
+      log =
+        capture_log(fn ->
+          assert {:error, :busy} = Store.add_repository(srv, @awesome)
+          assert {:error, :busy} = Store.remove_repository(srv, @awesome_slug)
+          assert {:error, :busy} = Store.repair_repository(srv, "core")
+        end)
+
+      assert log =~ "add_repository skipped"
+      assert log =~ "remove_repository skipped"
+      assert log =~ "repair_repository skipped"
+
+      # None of the three got as far as a fetch or a write of its own.
+      refute_received {:fetch_started, _other}
+      refute File.exists?(path)
+
+      send(first_caller, :proceed)
+      assert {:ok, 0} = Task.await(first, 5_000)
+    end
+  end
+
+  defp start_mutable_store(path, opts \\ []) do
+    start_supervised!(
+      {Store, [name: nil, path: path, fetcher: MutationFetcher, repositories: @repos] ++ opts}
+    )
   end
 end

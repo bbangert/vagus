@@ -182,6 +182,12 @@ config :vagus, :core_versions_path, "/data/vagus/core.json"
 # for the rationale, identical on target.
 config :vagus, :supervisor_options_path, "/data/vagus/supervisor_options.json"
 
+# Persisted runtime-added store repositories (issue #5 / D4). Same
+# file-backed-JSON pattern as :supervisor_options_path above — a JSON list
+# of the source strings a user posted to `POST /store/repositories`, layered
+# after the config-declared :store_repositories on boot.
+config :vagus, :store_repositories_path, "/data/vagus/store_repositories.json"
+
 # Add-on runtime (M4). The balena-engine daemon's control socket
 # (`Vagus.Engine.Manager`'s `--host`); `Vagus.Runtime.Docker` talks to it.
 config :vagus, :docker_socket, "/run/balena-engine.sock"
