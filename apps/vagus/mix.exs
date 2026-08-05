@@ -101,6 +101,12 @@ defmodule Vagus.MixProject do
       # See config/host.exs for usage.
       {:nerves_runtime, "~> 0.13.12"},
 
+      # Vagus.Diagnostics.ring_grep/2 reads the RingLogger buffer directly
+      # (RingLogger.get/2), not just via vagus_platform's backend config.
+      # Same version constraint as vagus_platform's declaration so the
+      # umbrella resolves one shared version.
+      {:ring_logger, "~> 0.11.0"},
+
       # GitHub-releases OTA firmware updates (`Vagus.OS.Updater` wraps its
       # Supervisor + check/install API behind the daily-cadence timer and
       # the /os/update route). Deliberately NOT targets-scoped: it must
