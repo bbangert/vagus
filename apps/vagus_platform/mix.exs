@@ -3,7 +3,7 @@ defmodule VagusPlatform.MixProject do
 
   @app :vagus_platform
   @version "0.5.1"
-  @all_targets [:rpi3_64, :dragon_q6a]
+  @all_targets [:rpi3_64, :dragon_q6a, :rubik_pi3]
 
   def project do
     [
@@ -65,6 +65,11 @@ defmodule VagusPlatform.MixProject do
        path: "../../../nerves_system_vagus/dragon_q6a",
        runtime: false,
        targets: :dragon_q6a,
+       nerves: [compile: true]},
+      {:nerves_system_rubik_pi3,
+       path: "../../../nerves_system_vagus/rubik_pi3",
+       runtime: false,
+       targets: :rubik_pi3,
        nerves: [compile: true]}
     ]
   end
