@@ -27,6 +27,10 @@ run = "MIX_TARGET=host mix test"
 # apps/vagus_platform/mix.exs: rpi3_64, dragon_q6a, and rubik_pi3.
 [tasks.firmware]
 description = "Build firmware for a target: mise run firmware -- dragon_q6a"
+# `mix firmware` must run from the platform app: the umbrella root defines
+# no release (and no Nerves), so running it there fails. CI does the same
+# via `working-directory: vagus/apps/vagus_platform` in release.yml.
+dir = "apps/vagus_platform"
 run = 'MIX_TARGET="{{arg(name="target")}}" mix firmware'
 
 [tasks.mix-for]
