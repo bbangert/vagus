@@ -37,6 +37,8 @@ env:
   # artifacts AND the source ref the path deps are checked out at — the
   # artifact checksum is computed from the checked-out source, so these two
   # must be the same ref. Bump when the systems cut a new release.
+  # rubik_pi3 requires a system release tag whose release includes its
+  # prebuilt artifact — bumping the tag to cover it happens at release time.
   SYSTEM_RELEASE_TAG: v0.3.2
   NERVES_DL_DIR: /home/runner/.nerves/dl
   GH_TOKEN: ${{ github.token }}
@@ -54,7 +56,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [rpi3_64, dragon_q6a]
+        target: [rpi3_64, dragon_q6a, rubik_pi3]
     defaults:
       run:
         working-directory: vagus
