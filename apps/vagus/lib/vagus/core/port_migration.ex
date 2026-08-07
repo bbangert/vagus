@@ -56,7 +56,10 @@ defmodule Vagus.Core.PortMigration do
   (the `Vagus.Addon.State` idiom) so a power loss mid-write can never leave
   Core with a truncated store, and the original file's mode is carried onto
   the replacement — Core writes this store `private=True` (0600), and a
-  migration must not widen that.
+  migration must not widen that. The tmp file is chmod'd 0600 *before* the
+  JSON lands in it, not after: writing content first and narrowing the mode
+  second would leave that config world-readable, under a normal umask, for
+  the whole window in between — and for good if the process dies there.
 
   JSON is emitted 2-space-pretty because that is what Core itself writes
   (`homeassistant/helpers/json.py` encodes `.storage` with orjson's
@@ -122,8 +125,12 @@ defmodule Vagus.Core.PortMigration do
     * `:stat` - 1-arity `File.stat/1` seam. The mode-copy failure it exists
       to exercise (the store vanishing between the read and the stat) cannot
       be produced from a single-threaded test any other way, and what it
-      guards — never renaming a umask-mode file over Core's 0600 store — is
-      worth proving.
+      guards — never renaming an unverified-mode file over Core's 0600
+      store — is worth proving.
+    * `:write_tmp` - 2-arity `File.write/2` seam for the tmp file's content
+      write. Exists to prove the tmp file is already 0600 *before* this call
+      runs, the same way `:stat` proves a failure path a single thread can't
+      otherwise produce.
   """
 
   require Logger
@@ -367,16 +374,22 @@ defmodule Vagus.Core.PortMigration do
 
   # tmp-then-rename in the same directory (`Vagus.Addon.State`'s idiom):
   # `File.rename/2` within one filesystem is atomic, so Core can only ever
-  # observe the old store or the new one.
+  # observe the old store or the new one. The tmp file is chmod'd 0600 before
+  # any content is written to it, not after — Core's config (trusted
+  # proxies, SSL paths) must never sit world-readable, even for the window
+  # between a content write and a mode-copy, and even less so indefinitely
+  # if the process dies in that window.
   #
   # sobelow_skip ["Traversal.FileModule"]
   defp rewrite(path, stored, opts) do
     tmp = path <> @tmp_suffix
     updated = put_in(stored, ["data", "stable", "server_port"], @target_port)
+    write_tmp = Keyword.get(opts, :write_tmp, &File.write/2)
 
     result =
       with {:ok, json} <- Jason.encode(updated, pretty: true),
-           :ok <- File.write(tmp, json),
+           :ok <- create_restricted_tmp(tmp),
+           :ok <- write_tmp.(tmp, json),
            :ok <- copy_mode(path, tmp, opts) do
         File.rename(tmp, path)
       end
@@ -388,16 +401,22 @@ defmodule Vagus.Core.PortMigration do
   end
 
   # sobelow_skip ["Traversal.FileModule"]
+  defp create_restricted_tmp(tmp) do
+    with :ok <- File.touch(tmp) do
+      File.chmod(tmp, 0o600)
+    end
+  end
+
+  # sobelow_skip ["Traversal.FileModule"]
   defp cleanup(tmp, reason) do
     _ = File.rm(tmp)
     {:error, reason}
   end
 
-  # Core writes this store `private=True` (0600), and the tmp file was created
-  # under this process's umask (world-readable). A mode that cannot be copied
-  # therefore aborts the rewrite: renaming a umask-mode file over Core's store
-  # would widen it permanently, and the credentials-adjacent settings in there
-  # (trusted proxies, SSL paths) are exactly what 0600 protects.
+  # The tmp file is already 0600 (create_restricted_tmp/1); this copies the
+  # original's exact mode on top, and — via the :stat seam — a store that
+  # vanishes between the read and the stat aborts the rewrite rather than
+  # renaming a mode we never verified over Core's config.
   #
   # sobelow_skip ["Traversal.FileModule"]
   defp copy_mode(path, tmp, opts) do

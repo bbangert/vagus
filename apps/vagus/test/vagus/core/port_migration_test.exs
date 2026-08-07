@@ -145,6 +145,24 @@ defmodule Vagus.Core.PortMigrationTest do
       assert Bitwise.band(File.stat!(store_path(dir)).mode, 0o777) == 0o600
     end
 
+    test "the tmp file is 0600 before any content is written to it" do
+      dir = tmp_volume()
+      marker = tmp_marker()
+      write_store!(dir, store())
+
+      # A write function that checks the tmp file's mode before writing:
+      # proves the chmod-to-0600 happens first, so the store's contents
+      # (trusted proxies, SSL paths) are never on disk under a permissive
+      # mode, not even momentarily.
+      write_tmp = fn tmp, content ->
+        assert Bitwise.band(File.stat!(tmp).mode, 0o777) == 0o600
+        File.write(tmp, content)
+      end
+
+      assert :migrated = PortMigration.run(opts(dir, marker) ++ [write_tmp: write_tmp])
+      assert read_store!(dir)["data"]["stable"]["server_port"] == 80
+    end
+
     test "an absent \"pending\" key counts as no pending config" do
       dir = tmp_volume()
       marker = tmp_marker()
