@@ -134,10 +134,12 @@ defmodule Vagus.Core.Lifecycle do
   ## Core's stored port
 
   `start/1` runs `Vagus.Core.PortMigration.run/1` before anything else it
-  does — the one-shot rewrite of the port Core persisted for itself in
+  does — the rewrite of the port Core persisted for itself in
   `<config>/.storage/http`, which on an already-installed fleet board still
   says 8123 and which Core prefers over every default once it exists (see
-  that module for the full story).
+  that module for the full story). It re-runs on every start until Core has
+  actually been seen serving port 80, which is a fact only the HTTP-config
+  refresh above can establish.
 
   This is the choke point rather than each individual create/start call
   because it has to happen *before* Core comes up to take effect on that
@@ -410,7 +412,7 @@ defmodule Vagus.Core.Lifecycle do
   ## start/1
 
   defp do_start(opts) do
-    # Pre-start, once per device, ignored either way — see the moduledoc's
+    # Pre-start, idempotent, ignored either way — see the moduledoc's
     # "Core's stored port" section and `Vagus.Core.PortMigration`.
     _outcome = PortMigration.run(opts)
 

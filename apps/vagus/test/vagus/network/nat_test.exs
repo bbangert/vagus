@@ -56,11 +56,38 @@ defmodule Vagus.Network.NatTest do
 
   defp probe?(args), do: "-C" in args or "-S" in args
 
-  # Nothing is installed: every probe fails, every mutation succeeds.
-  defp absent, do: fn args -> if probe?(args), do: {"", 1}, else: {"", 0} end
+  # `iptables-legacy -t nat -S <hook>` as the real binary prints it: the
+  # chain policy, then one `-A` line per rule in evaluation order.
+  defp hook_of(["-t", "nat", "-S", hook]) when hook in ["PREROUTING", "OUTPUT"], do: hook
+  defp hook_of(_args), do: nil
 
-  # Everything is installed: every probe succeeds.
-  defp present, do: fn _args -> {"", 0} end
+  defp listing(hook, rules), do: {Enum.join(["-P #{hook} ACCEPT" | rules], "\n") <> "\n", 0}
+
+  defp ours(hook), do: "-A #{hook} -j VAGUS_NAT"
+
+  # balena-engine's own jump — the rule ours has to stay ahead of.
+  defp balena(hook), do: "-A #{hook} -m addrtype --dst-type LOCAL -j DOCKER"
+
+  # Nothing of ours is installed: chain/rule probes fail, the hooks hold only
+  # balena's jump, every mutation succeeds.
+  defp absent do
+    fn args ->
+      case hook_of(args) do
+        nil -> if probe?(args), do: {"", 1}, else: {"", 0}
+        hook -> listing(hook, [balena(hook)])
+      end
+    end
+  end
+
+  # The steady state: chain, rule, and both jumps at position 1.
+  defp present do
+    fn args ->
+      case hook_of(args) do
+        nil -> {"", 0}
+        hook -> listing(hook, [ours(hook), balena(hook)])
+      end
+    end
+  end
 
   defp opts(cmd), do: [enabled: true, cmd: cmd, ip: "172.30.32.2", port: 8888]
 
@@ -75,9 +102,9 @@ defmodule Vagus.Network.NatTest do
                {@bin, ["-t", "nat", "-N", "VAGUS_NAT"]},
                {@bin, ["-t", "nat", "-C", "VAGUS_NAT"] ++ @rule},
                {@bin, ["-t", "nat", "-A", "VAGUS_NAT"] ++ @rule},
-               {@bin, ["-t", "nat", "-C", "PREROUTING", "-j", "VAGUS_NAT"]},
+               {@bin, ["-t", "nat", "-S", "PREROUTING"]},
                {@bin, ["-t", "nat", "-I", "PREROUTING", "1", "-j", "VAGUS_NAT"]},
-               {@bin, ["-t", "nat", "-C", "OUTPUT", "-j", "VAGUS_NAT"]},
+               {@bin, ["-t", "nat", "-S", "OUTPUT"]},
                {@bin, ["-t", "nat", "-I", "OUTPUT", "1", "-j", "VAGUS_NAT"]}
              ]
     end
@@ -112,8 +139,8 @@ defmodule Vagus.Network.NatTest do
       assert calls.() == [
                {@bin, ["-t", "nat", "-S", "VAGUS_NAT"]},
                {@bin, ["-t", "nat", "-C", "VAGUS_NAT"] ++ @rule},
-               {@bin, ["-t", "nat", "-C", "PREROUTING", "-j", "VAGUS_NAT"]},
-               {@bin, ["-t", "nat", "-C", "OUTPUT", "-j", "VAGUS_NAT"]}
+               {@bin, ["-t", "nat", "-S", "PREROUTING"]},
+               {@bin, ["-t", "nat", "-S", "OUTPUT"]}
              ]
     end
 
@@ -121,10 +148,10 @@ defmodule Vagus.Network.NatTest do
       # The engine-restart failure mode this module exists for: the chain and
       # rule survive, a jump does not.
       responder = fn args ->
-        cond do
-          not probe?(args) -> {"", 0}
-          "OUTPUT" in args -> {"", 1}
-          true -> {"", 0}
+        case hook_of(args) do
+          "OUTPUT" -> listing("OUTPUT", [balena("OUTPUT")])
+          "PREROUTING" -> listing("PREROUTING", [ours("PREROUTING"), balena("PREROUTING")])
+          nil -> {"", 0}
         end
       end
 
@@ -134,6 +161,65 @@ defmodule Vagus.Network.NatTest do
 
       mutations = for {_bin, args} <- calls.(), not probe?(args), do: args
       assert mutations == [["-t", "nat", "-I", "OUTPUT", "1", "-j", "VAGUS_NAT"]]
+    end
+
+    test "a jump balena has overtaken is deleted and re-inserted at position 1" do
+      # `-C` would call this healthy: the jump IS in the chain, it just no
+      # longer sees the packets, because balena's dst-type LOCAL -> DOCKER
+      # jump now matches 172.30.32.2 first.
+      responder = fn args ->
+        case hook_of(args) do
+          nil -> {"", 0}
+          hook -> listing(hook, [balena(hook), ours(hook)])
+        end
+      end
+
+      {cmd, calls} = fake(responder)
+
+      assert Nat.ensure(opts(cmd)) == :ok
+
+      mutations = for {_bin, args} <- calls.(), not probe?(args), do: args
+
+      assert mutations == [
+               ["-t", "nat", "-D", "PREROUTING", "-j", "VAGUS_NAT"],
+               ["-t", "nat", "-I", "PREROUTING", "1", "-j", "VAGUS_NAT"],
+               ["-t", "nat", "-D", "OUTPUT", "-j", "VAGUS_NAT"],
+               ["-t", "nat", "-I", "OUTPUT", "1", "-j", "VAGUS_NAT"]
+             ]
+    end
+
+    test "a jump that is first is left alone even with rules behind it" do
+      responder = fn args ->
+        case hook_of(args) do
+          nil -> {"", 0}
+          hook -> listing(hook, [ours(hook), balena(hook), "-A #{hook} -j SOMETHING_ELSE"])
+        end
+      end
+
+      {cmd, calls} = fake(responder)
+
+      assert Nat.ensure(opts(cmd)) == :ok
+      assert Enum.all?(calls.(), fn {_bin, args} -> probe?(args) end)
+    end
+
+    test "another chain's jump at position 1 is not mistaken for ours" do
+      responder = fn args ->
+        case hook_of(args) do
+          nil -> {"", 0}
+          hook -> listing(hook, ["-A #{hook} -d 10.0.0.1/32 -j VAGUS_NAT_LOOKALIKE"])
+        end
+      end
+
+      {cmd, calls} = fake(responder)
+
+      assert Nat.ensure(opts(cmd)) == :ok
+
+      mutations = for {_bin, args} <- calls.(), not probe?(args), do: args
+
+      assert mutations == [
+               ["-t", "nat", "-I", "PREROUTING", "1", "-j", "VAGUS_NAT"],
+               ["-t", "nat", "-I", "OUTPUT", "1", "-j", "VAGUS_NAT"]
+             ]
     end
 
     test "an existing chain is not recreated" do

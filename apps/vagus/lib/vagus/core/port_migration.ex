@@ -39,7 +39,8 @@ defmodule Vagus.Core.PortMigration do
 
   Every condition must hold, and each is a reason to stay out of the way:
 
-    1. **The marker is absent.** One shot per device, forever — see below.
+    1. **The marker is absent**, i.e. Core has never been observed serving
+       #{80} on this device — see below.
     2. **The store exists and parses.** No store means a Core that has never
        run here, which will pick 80 from `default_server_port()` on its own.
     3. **`data.pending` is `null`.** A staged trial config is a decision the
@@ -65,7 +66,7 @@ defmodule Vagus.Core.PortMigration do
   mandatory: this file is the only thing standing between the device and a
   Core that will not start.
 
-  ## The marker, and when it is *not* written
+  ## The marker: written on confirmation, never on the rewrite
 
   The marker is a plain file on `/data` (`config :vagus,
   :core_port_migration_marker`, target-only — unset on host and in the test
@@ -74,20 +75,28 @@ defmodule Vagus.Core.PortMigration do
   not its contents, is the signal; it carries a one-line note purely so a
   device forensics session can see what happened and when.
 
-  It is written when the migration runs **and** when the stored port is
-  already #{80} — in the second case there is nothing left to migrate, so
-  recording it costs one `File.write/2` per device and buys back the
-  `File.read/2` of Core's store on every subsequent `start/1`.
+  `run/1` never writes it. Only `confirm/1` does, and only when Core has
+  been observed *serving* #{80} — `Vagus.Core.HttpConfig`'s socket pull
+  coming back with `port: #{80}` is the one fact that proves the store
+  edit actually took. Rewriting the store proves nothing: Core's own
+  bind-failure chain re-persists #{8123} if #{80} turns out to be taken,
+  and a Core that was already running when the rewrite landed overwrites
+  the file from its in-memory #{8123} config at its next persist. A marker
+  written at rewrite time would retire the migration permanently in both
+  of those cases and leave the device on #{8123} forever.
 
-  It is deliberately **not** written when the store is missing, unreadable,
-  unparseable, has a pending config, or holds some third port. Those are all
-  states that can change: a device whose Core has not been installed yet, or
-  whose user later reverts to the legacy port through the UI and thereby
-  re-persists a `stable` 8123, still gets its single migration when the
-  conditions are actually met. The "some other port" case is the load-bearing
-  one — writing the marker there would burn the one shot on a device whose
-  user had deliberately chosen, say, 8080, and it would be burnt at the exact
-  moment the migration could not have run anyway.
+  So until Core has served #{80} once, every `start/1` re-reads Core's store
+  and re-migrates if the fossil is back — idempotent, and a no-op in the
+  ordinary case where the store already says #{80} and Core simply has not
+  restarted yet. After the single confirmation the marker retires the check
+  for good, so a user who later chooses #{8123} (or anything else) through
+  the UI is never fought.
+
+  `run/1` is deliberately quiet in every other case too — a missing,
+  unreadable, unparseable or pending store, or a third port, all leave the
+  device exactly as it was. The "some other port" case is the load-bearing
+  one: that is a port somebody chose, and it must survive until the user
+  moves it back.
 
   ## Failure is always a no-op
 
@@ -136,6 +145,9 @@ defmodule Vagus.Core.PortMigration do
   """
   @type outcome :: :migrated | {:skipped, term()} | {:error, term()}
 
+  @typedoc "`:ok` when `confirm/1` wrote the marker, otherwise why it did not."
+  @type confirmation :: :ok | {:skipped, term()} | {:error, term()}
+
   @doc "The port Core is migrated *to* (`#{@target_port}`)."
   @spec target_port() :: pos_integer()
   def target_port, do: @target_port
@@ -165,7 +177,40 @@ defmodule Vagus.Core.PortMigration do
     end
   end
 
+  @doc """
+  Retires the migration, permanently — call this only when Core has been
+  observed serving `target_port/0`.
+
+  `Vagus.Core.HttpConfig.refresh/1` is the caller: a successful socket pull
+  reporting that port is the only proof the store edit took. Idempotent and
+  never raises; a marker that cannot be written just means the next start
+  re-checks Core's store, which is harmless.
+
+  Takes the same `:port_migration_marker` option as `run/1`.
+  """
+  @spec confirm(keyword()) :: confirmation()
+  def confirm(opts \\ []) do
+    case marker_path(opts) do
+      nil -> {:skipped, :disabled}
+      marker -> confirm_with_marker(marker)
+    end
+  end
+
   ## Internals
+
+  # sobelow_skip ["Traversal.FileModule"]
+  defp confirm_with_marker(marker) do
+    if File.exists?(marker) do
+      {:skipped, :already_confirmed}
+    else
+      Logger.info(
+        "Vagus.Core.PortMigration: Core is serving #{@target_port} — recording the marker, " <>
+          "the stored-port check stops running on this device"
+      )
+
+      write_marker(marker, "confirmed #{@target_port}")
+    end
+  end
 
   defp marker_path(opts) do
     Keyword.get_lazy(opts, :port_migration_marker, fn ->
@@ -173,21 +218,23 @@ defmodule Vagus.Core.PortMigration do
     end)
   end
 
-  # The marker check comes first so a disabled/already-migrated device never
+  # The marker check comes first so a disabled/already-confirmed device never
   # even resolves the engine data root, let alone reads Core's store.
+  #
+  # sobelow_skip ["Traversal.FileModule"]
   defp run_with_marker(marker, opts) do
     if File.exists?(marker) do
       {:skipped, :already_migrated}
     else
-      migrate(marker, Path.join(Container.config_path(opts), @store_relative_path))
+      migrate(Path.join(Container.config_path(opts), @store_relative_path))
     end
   end
 
-  defp migrate(marker, path) do
+  defp migrate(path) do
     with {:ok, body} <- read_store(path),
          {:ok, stored} <- decode_store(path, body),
          {:ok, port} <- stable_port(path, stored) do
-      apply_port(port, marker, path, stored)
+      apply_port(port, path, stored)
     end
   end
 
@@ -274,7 +321,7 @@ defmodule Vagus.Core.PortMigration do
   defp pending?(%{"pending" => _config}), do: true
   defp pending?(_data), do: false
 
-  defp apply_port(@legacy_port, marker, path, stored) do
+  defp apply_port(@legacy_port, path, stored) do
     case rewrite(path, stored) do
       :ok ->
         Logger.info(
@@ -283,7 +330,6 @@ defmodule Vagus.Core.PortMigration do
             "its next start"
         )
 
-        write_marker(marker, "migrated #{@legacy_port} -> #{@target_port}")
         :migrated
 
       {:error, reason} = error ->
@@ -296,20 +342,19 @@ defmodule Vagus.Core.PortMigration do
     end
   end
 
-  defp apply_port(@target_port, marker, _path, _stored) do
+  defp apply_port(@target_port, _path, _stored) do
     Logger.debug(
       "Vagus.Core.PortMigration: Core's stored stable server_port is already " <>
-        "#{@target_port} — recording the marker so this check stops running"
+        "#{@target_port} — nothing to rewrite, waiting for Core to actually serve it"
     )
 
-    write_marker(marker, "already #{@target_port}")
     {:skipped, :already_target}
   end
 
-  defp apply_port(port, _marker, _path, _stored) do
+  defp apply_port(port, _path, _stored) do
     Logger.info(
       "Vagus.Core.PortMigration: Core's stored stable server_port is #{port}, not " <>
-        "#{@legacy_port} — leaving it alone and NOT recording the marker (see the moduledoc)"
+        "#{@legacy_port} — leaving it alone (a port somebody chose)"
     )
 
     {:skipped, {:other_port, port}}
@@ -356,23 +401,19 @@ defmodule Vagus.Core.PortMigration do
     end
   end
 
-  # Always `:ok`: a marker that cannot be written means this runs again next
-  # boot, which is harmless — the rewritten store then hits the
-  # already-#{@target_port} branch.
-  #
   # sobelow_skip ["Traversal.FileModule"]
   defp write_marker(marker, note) do
     with :ok <- File.mkdir_p(Path.dirname(marker)),
          :ok <- File.write(marker, "#{note} at #{DateTime.to_iso8601(DateTime.utc_now())}\n") do
       :ok
     else
-      {:error, reason} ->
+      {:error, reason} = error ->
         Logger.warning(
           "Vagus.Core.PortMigration: could not write the marker #{marker} " <>
             "(#{inspect(reason)}) — Core's stored port will be re-checked at the next start"
         )
 
-        :ok
+        error
     end
   end
 end

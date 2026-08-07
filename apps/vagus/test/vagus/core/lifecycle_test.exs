@@ -1219,9 +1219,9 @@ defmodule Vagus.Core.LifecycleTest do
     end
   end
 
-  ## The one-shot Core port migration — `Vagus.Core.PortMigration` owns the
-  ## conditions and is unit-tested in full next door; these prove only that
-  ## `start/1` is the choke point that runs it, before Core comes up.
+  ## The Core port migration — `Vagus.Core.PortMigration` owns the conditions
+  ## and is unit-tested in full next door; these prove only that `start/1` is
+  ## the choke point that runs it, before Core comes up.
 
   # `Vagus.Core.PortMigration`'s fixtures, kept minimal here — that module's
   # own test owns the store's real shape and every condition.
@@ -1281,7 +1281,9 @@ defmodule Vagus.Core.LifecycleTest do
 
       assert_receive :health_called
       assert stored_core_port(dir) == 80
-      assert File.exists?(marker)
+      # `Vagus.Core.HttpConfig` writes the marker, and only once Core has
+      # actually served 80 — the rewrite itself confirms nothing.
+      refute File.exists?(marker)
     end
 
     test "start/1 on an already-running container still migrates (Core picks it up on its next restart)" do

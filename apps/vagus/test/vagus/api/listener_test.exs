@@ -193,6 +193,17 @@ defmodule Vagus.API.ListenerTest do
     end
   end
 
+  defp await_listener(manager, previous, deadline \\ 40) do
+    case :sys.get_state(manager) do
+      %{listener_pid: pid} when is_pid(pid) and pid != previous ->
+        pid
+
+      _not_yet when deadline > 0 ->
+        Process.sleep(25)
+        await_listener(manager, previous, deadline - 1)
+    end
+  end
+
   # `capture_log/1` swallows the return value; these tests need both.
   defp capture_log_returning(fun) do
     parent = self()
@@ -221,6 +232,47 @@ defmodule Vagus.API.ListenerTest do
       assert is_pid(bandit)
       assert {:ok, {{127, 0, 0, 1}, port}} = ThousandIsland.listener_info(bandit)
       assert port > 0
+    end
+
+    test "the DynamicSupervisor does not restart a crashed listener — this manager does" do
+      # Bandit's default child spec is `restart: :permanent`, which would have
+      # the supervisor put a replacement on the port behind the manager's
+      # back: the manager's own retry then hits :eaddrinuse forever while
+      # monitoring a pid nobody owns.
+      {:ok, sup} =
+        start_supervised({DynamicSupervisor, name: :vagus_listener_own_sup},
+          id: :vagus_listener_own_sup
+        )
+
+      manager =
+        capture_log_returning(fn ->
+          start_supervised!(
+            {Listener,
+             name: nil,
+             supervisor: sup,
+             ip: {127, 0, 0, 1},
+             port: 0,
+             plug: EchoPlug,
+             retry_ms: 400},
+            id: :vagus_listener_own
+          )
+        end)
+
+      assert %{listener_pid: first} = :sys.get_state(manager)
+      ref = Process.monitor(first)
+
+      capture_log(fn ->
+        Process.exit(first, :kill)
+        assert_receive {:DOWN, ^ref, :process, ^first, :killed}, 500
+
+        # Well inside :retry_ms, so anything back in the supervisor now would
+        # be the supervisor's own doing.
+        Process.sleep(100)
+        assert DynamicSupervisor.which_children(sup) == []
+
+        second = await_listener(manager, first)
+        assert [{:undefined, ^second, _type, [Bandit]}] = DynamicSupervisor.which_children(sup)
+      end)
     end
 
     test "an address that does not exist on this host never binds, and never crashes" do

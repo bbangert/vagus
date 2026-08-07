@@ -42,9 +42,12 @@ defmodule Vagus.Network.Nat do
   ## Idempotence
 
   `ensure/1` is safe to call repeatedly and re-asserts unconditionally
-  rather than diffing: every rule is `-C`-probed and only added when the
+  rather than diffing: the DNAT rule is `-C`-probed and only added when the
   probe fails, and the chain is created only when `-S` says it is missing.
-  That matters because the failure mode this guards against — a
+  The two jumps get a stricter check than `-C` can give — `-S <hook>` is
+  parsed and a jump that is present but no longer *first* is deleted and
+  re-inserted, since a jump sitting behind balena's is a jump that does
+  nothing. That matters because the failure mode this guards against — a
   balena-engine restart re-writing the `nat` table — is not observable from
   here, so the callers (`Vagus.Addon.BootStarter` at boot,
   `Vagus.Engine.Manager` after a daemon start) simply call it again and let
@@ -184,12 +187,54 @@ defmodule Vagus.Network.Nat do
     end
   end
 
+  # `-C` is not enough here: it matches the jump at *any* position, and this
+  # module's contract is position 1 (see @jump_chains). A jump that something
+  # else has since overtaken is therefore deleted and re-inserted rather than
+  # accepted.
   defp ensure_jump(cmd, hook) do
-    if run?(cmd, ["-t", @table, "-C", hook, "-j", @chain]) do
-      :ok
+    case jump_position(cmd, hook) do
+      :first ->
+        :ok
+
+      :absent ->
+        insert_jump(cmd, hook)
+
+      :later ->
+        with :ok <- run(cmd, ["-t", @table, "-D", hook, "-j", @chain]),
+             do: insert_jump(cmd, hook)
+    end
+  end
+
+  defp insert_jump(cmd, hook), do: run(cmd, ["-t", @table, "-I", hook, "1", "-j", @chain])
+
+  # `-S <hook>` is iptables-save syntax: the chain policy, then one `-A` line
+  # per rule in evaluation order. A hook we cannot list is reported `:absent`
+  # so the insert runs and reports the real failure.
+  defp jump_position(cmd, hook) do
+    with {out, 0} <- cmd.(@binary, ["-t", @table, "-S", hook]),
+         [_ | _] = rules <- rule_lines(out) do
+      cond do
+        jump?(hd(rules), hook) -> :first
+        Enum.any?(rules, &jump?(&1, hook)) -> :later
+        true -> :absent
+      end
     else
-      # Position 1, not `-A`: see @jump_chains.
-      run(cmd, ["-t", @table, "-I", hook, "1", "-j", @chain])
+      _no_rules_or_failure -> :absent
+    end
+  end
+
+  defp rule_lines(out) do
+    out
+    |> String.split("\n", trim: true)
+    |> Enum.filter(&String.starts_with?(&1, ["-A ", "-I "]))
+  end
+
+  # Exactly our jump and nothing else: a line carrying match criteria on the
+  # way to @chain is somebody else's rule.
+  defp jump?(line, hook) do
+    case String.split(line, " ", trim: true) do
+      [verb, ^hook, "-j", @chain] when verb in ["-A", "-I"] -> true
+      _other -> false
     end
   end
 

@@ -222,7 +222,15 @@ defmodule Vagus.API.Listener do
     "#{address}:#{Keyword.get(options, :port)}"
   end
 
+  # `restart: :temporary` makes this GenServer the sole restart owner. Under
+  # Bandit's default (`:permanent`) the DynamicSupervisor would put its own
+  # replacement on the port the moment the listener crashed, while this
+  # process — which also sees the `:DOWN` — retried against a port that is
+  # now taken, monitoring a dead pid and logging `:eaddrinuse` forever.
   defp default_start(supervisor, bandit_options) do
-    DynamicSupervisor.start_child(supervisor, {Bandit, bandit_options})
+    DynamicSupervisor.start_child(
+      supervisor,
+      Supervisor.child_spec({Bandit, bandit_options}, restart: :temporary)
+    )
   end
 end

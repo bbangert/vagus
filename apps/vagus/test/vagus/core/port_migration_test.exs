@@ -45,6 +45,15 @@ defmodule Vagus.Core.PortMigrationTest do
     path
   end
 
+  # A regular file where the marker's parent directory must go, so `mkdir_p`
+  # fails :enotdir regardless of uid.
+  defp unwritable_marker do
+    blocker = Path.join(System.tmp_dir!(), "vagus_test_port_migration_blocker_#{unique()}")
+    File.write!(blocker, "")
+    on_exit(fn -> File.rm_rf!(blocker) end)
+    Path.join(blocker, "core_port_migration")
+  end
+
   defp store_path(dir), do: Path.join(dir, @store_relative_path)
 
   defp store(data_overrides \\ %{}) do
@@ -90,8 +99,10 @@ defmodule Vagus.Core.PortMigrationTest do
 
   defp opts(dir, marker), do: [homeassistant_path: dir, port_migration_marker: marker]
 
+  defp marker_opts(marker), do: [port_migration_marker: marker]
+
   describe "the migration" do
-    test "rewrites data.stable.server_port 8123 -> 80 and nothing else, then marks it done" do
+    test "rewrites data.stable.server_port 8123 -> 80 and nothing else" do
       dir = tmp_volume()
       marker = tmp_marker()
       before = store()
@@ -104,7 +115,9 @@ defmodule Vagus.Core.PortMigrationTest do
       assert read_store!(dir) == put_in(before, ["data", "stable", "server_port"], 80)
       assert get_in(read_store!(dir), ["data", "stable", "server_port"]) == 80
 
-      assert File.read!(marker) =~ "migrated 8123 -> 80"
+      # The rewrite alone marks nothing: Core has not bound 80 yet, and might
+      # never (bind failure, or a running Core re-persisting its own 8123).
+      refute File.exists?(marker)
     end
 
     test "writes the store back as the 2-space-pretty JSON Core itself writes" do
@@ -139,7 +152,22 @@ defmodule Vagus.Core.PortMigrationTest do
 
       assert :migrated = PortMigration.run(opts(dir, marker))
       assert read_store!(dir)["data"]["stable"]["server_port"] == 80
-      assert File.exists?(marker)
+      refute File.exists?(marker)
+    end
+
+    test "a Core that re-persisted 8123 before ever serving 80 is migrated again" do
+      # The reason the marker is not written at rewrite time: Core's own
+      # bind-failure fallback, or a still-running Core saving its in-memory
+      # 8123, puts the fossil straight back.
+      dir = tmp_volume()
+      marker = tmp_marker()
+      write_store!(dir, store())
+
+      assert :migrated = PortMigration.run(opts(dir, marker))
+
+      write_store!(dir, store())
+      assert :migrated = PortMigration.run(opts(dir, marker))
+      assert read_store!(dir)["data"]["stable"]["server_port"] == 80
     end
   end
 
@@ -148,7 +176,10 @@ defmodule Vagus.Core.PortMigrationTest do
       dir = tmp_volume()
       marker = tmp_marker()
       File.mkdir_p!(Path.dirname(marker))
-      File.write!(marker, "migrated 8123 -> 80 at 2026-08-07T00:00:00Z\n")
+      File.write!(marker, "confirmed 80 at 2026-08-07T00:00:00Z\n")
+      # A user who has since moved Core back to the legacy port: the fossil
+      # shape is indistinguishable from the migration's trigger, which is
+      # exactly why a confirmed device stops looking.
       contents = write_store!(dir, store())
 
       assert {:skipped, :already_migrated} = PortMigration.run(opts(dir, marker))
@@ -178,20 +209,20 @@ defmodule Vagus.Core.PortMigrationTest do
       # ... and it really does still migrate once the fossil shows up.
       write_store!(dir, store())
       assert :migrated = PortMigration.run(opts(dir, marker))
-      assert File.exists?(marker)
+      assert read_store!(dir)["data"]["stable"]["server_port"] == 80
     end
 
-    test "stable port already 80 -> no-op but the marker IS written (migration is moot)" do
+    test "stable port already 80 -> no-op, and still no marker (the store is not proof)" do
       dir = tmp_volume()
       marker = tmp_marker()
       contents = write_store!(dir, with_stable_port(80))
 
       assert {:skipped, :already_target} = PortMigration.run(opts(dir, marker))
       assert File.read!(store_path(dir)) == contents
-      assert File.read!(marker) =~ "already 80"
+      refute File.exists?(marker)
 
-      # Which is the point: the next start stops reading Core's store at all.
-      assert {:skipped, :already_migrated} = PortMigration.run(opts(dir, marker))
+      # An unconfirmed device keeps re-checking, and keeps no-opping.
+      assert {:skipped, :already_target} = PortMigration.run(opts(dir, marker))
     end
 
     test "no marker path configured (host/test) -> disabled, nothing is read or written" do
@@ -303,27 +334,66 @@ defmodule Vagus.Core.PortMigrationTest do
       refute File.exists?(marker)
     end
 
-    test "a marker write failure still leaves the store migrated (it re-checks next start)" do
+    test "a marker write failure leaves the device unconfirmed, and that is survivable" do
       dir = tmp_volume()
-      # A regular file where the marker's parent directory must go: `mkdir_p`
-      # fails :enotdir regardless of uid.
-      blocker = Path.join(System.tmp_dir!(), "vagus_test_port_migration_blocker_#{unique()}")
-      File.write!(blocker, "")
-      on_exit(fn -> File.rm_rf!(blocker) end)
-      marker = Path.join(blocker, "core_port_migration")
+      marker = unwritable_marker()
       write_store!(dir, store())
+
+      assert :migrated = PortMigration.run(opts(dir, marker))
 
       log =
         capture_log(fn ->
-          assert :migrated = PortMigration.run(opts(dir, marker))
+          assert {:error, :enotdir} = PortMigration.confirm(marker_opts(marker))
         end)
 
       assert log =~ "could not write the marker"
-      assert read_store!(dir)["data"]["stable"]["server_port"] == 80
 
-      # Re-running is harmless: the store is already on the target port, and
-      # the branch that handles that is the one that tries the marker again.
+      # Re-checking costs one read of a store that is already on 80.
       assert {:skipped, :already_target} = PortMigration.run(opts(dir, marker))
+    end
+  end
+
+  describe "confirm/1 — the only thing that writes the marker" do
+    test "writes it once, then no-ops" do
+      marker = tmp_marker()
+
+      assert :ok = PortMigration.confirm(marker_opts(marker))
+      assert File.read!(marker) =~ "confirmed 80"
+
+      File.write!(marker, "untouched")
+      assert {:skipped, :already_confirmed} = PortMigration.confirm(marker_opts(marker))
+      assert File.read!(marker) == "untouched"
+    end
+
+    test "no marker path configured (host/test) -> disabled, nothing is written" do
+      assert {:skipped, :disabled} = PortMigration.confirm()
+    end
+
+    test "a confirmation that cannot be written is logged and dropped" do
+      marker = unwritable_marker()
+
+      log =
+        capture_log(fn ->
+          assert {:error, :enotdir} = PortMigration.confirm(marker_opts(marker))
+        end)
+
+      assert log =~ "could not write the marker"
+      refute File.exists?(marker)
+    end
+
+    test "a confirmed device never migrates again, whatever the store says" do
+      dir = tmp_volume()
+      marker = tmp_marker()
+      write_store!(dir, store())
+
+      assert :migrated = PortMigration.run(opts(dir, marker))
+      assert :ok = PortMigration.confirm(marker_opts(marker))
+
+      # The user moves Core back to 8123 through the UI — their decision.
+      contents = write_store!(dir, store())
+
+      assert {:skipped, :already_migrated} = PortMigration.run(opts(dir, marker))
+      assert File.read!(store_path(dir)) == contents
     end
   end
 
