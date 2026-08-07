@@ -170,6 +170,47 @@ check_container_name_is_not_production() {
   fi
 }
 
+# Waits for Core to (re)create the supervisor socket and chmod 666s it (see
+# the "Socket permissions" note above). Shared by `up` (after `docker run`)
+# and `restart` (after `docker restart`) — Core recreates the socket
+# root:root 0600 on every start, restart included, so the non-root host
+# emulator loses access unless this runs again post-restart too.
+wait_for_socket_and_chmod() {
+  echo "Waiting for Core to create the supervisor socket..."
+  socket_ready=0
+  for _ in $(seq 1 30); do
+    if docker exec "$CONTAINER_NAME" test -S "$CORE_SOCKET_PATH" 2>/dev/null; then
+      socket_ready=1
+      break
+    fi
+    sleep 2
+  done
+  if [[ "$socket_ready" -eq 1 ]]; then
+    # Core creates the socket root:root mode 0600 (its own hardening); chmod
+    # it from inside the container (root there) so a non-root host emulator
+    # can connect — no host sudo required. 660 + a shared group would be
+    # tighter, but there's no group the host emulator user and the
+    # container's root both belong to without extra chgrp/usermod setup
+    # (and devcontainer path-split makes that setup host-dependent — see
+    # the note above), so it'd need sudo or fragile gid-matching for no
+    # real dev-loop benefit. 666 stays, now that the guards above (W4)
+    # stop this from ever reaching a production socket.
+    docker exec "$CONTAINER_NAME" chmod 666 "$CORE_SOCKET_PATH"
+    echo "Supervisor socket: ${CORE_SOCKET_PATH} (in container) <- ${HOST_SOCKET_DIR} (docker daemon's view)."
+    echo "Start (or restart) the emulator with a matching socket path so it's preferred over TCP:"
+    echo "  export VAGUS_CORE_SOCKET=${SOCKET_PATH}"
+  else
+    echo "WARNING: socket didn't appear within 60s — Core may still be starting, or"
+    echo "         HOST_SOCKET_DIR may be wrong for this docker daemon (see the"
+    echo "         devcontainer/host path split note above). Once it exists, fix"
+    echo "         permissions yourself (dev-only — this opens the socket to any"
+    echo "         local user in the container; never run against a real device's"
+    echo "         Supervisor<->Core socket) and export the path:"
+    echo "  docker exec ${CONTAINER_NAME} chmod 666 ${CORE_SOCKET_PATH}"
+    echo "  export VAGUS_CORE_SOCKET=${SOCKET_PATH}"
+  fi
+}
+
 action="${1:-up}"
 
 case "$action" in
@@ -193,39 +234,7 @@ case "$action" in
       "$CORE_IMAGE"
     echo "Core ${CORE_VERSION} up: http://localhost:${HOST_PORT} — supervisor expected at ${SUPERVISOR_HOST}:${SUPERVISOR_PORT}"
     echo
-    echo "Waiting for Core to create the supervisor socket..."
-    socket_ready=0
-    for _ in $(seq 1 30); do
-      if docker exec "$CONTAINER_NAME" test -S "$CORE_SOCKET_PATH" 2>/dev/null; then
-        socket_ready=1
-        break
-      fi
-      sleep 2
-    done
-    if [[ "$socket_ready" -eq 1 ]]; then
-      # Core creates the socket root:root mode 0600 (its own hardening); chmod
-      # it from inside the container (root there) so a non-root host emulator
-      # can connect — no host sudo required. 660 + a shared group would be
-      # tighter, but there's no group the host emulator user and the
-      # container's root both belong to without extra chgrp/usermod setup
-      # (and devcontainer path-split makes that setup host-dependent — see
-      # the note above), so it'd need sudo or fragile gid-matching for no
-      # real dev-loop benefit. 666 stays, now that the guards above (W4)
-      # stop this from ever reaching a production socket.
-      docker exec "$CONTAINER_NAME" chmod 666 "$CORE_SOCKET_PATH"
-      echo "Supervisor socket: ${CORE_SOCKET_PATH} (in container) <- ${HOST_SOCKET_DIR} (docker daemon's view)."
-      echo "Start (or restart) the emulator with a matching socket path so it's preferred over TCP:"
-      echo "  export VAGUS_CORE_SOCKET=${SOCKET_PATH}"
-    else
-      echo "WARNING: socket didn't appear within 60s — Core may still be starting, or"
-      echo "         HOST_SOCKET_DIR may be wrong for this docker daemon (see the"
-      echo "         devcontainer/host path split note above). Once it exists, fix"
-      echo "         permissions yourself (dev-only — this opens the socket to any"
-      echo "         local user in the container; never run against a real device's"
-      echo "         Supervisor<->Core socket) and export the path:"
-      echo "  docker exec ${CONTAINER_NAME} chmod 666 ${CORE_SOCKET_PATH}"
-      echo "  export VAGUS_CORE_SOCKET=${SOCKET_PATH}"
-    fi
+    wait_for_socket_and_chmod
     if [[ "$HOST_PORT" != "8123" ]]; then
       echo
       echo "NOTE: Core is on host port ${HOST_PORT}, not 8123. Start the emulator with a matching"
@@ -243,6 +252,8 @@ case "$action" in
     ;;
   restart)
     docker restart "$CONTAINER_NAME"
+    echo
+    wait_for_socket_and_chmod
     ;;
   logs)
     docker logs -f "$CONTAINER_NAME"

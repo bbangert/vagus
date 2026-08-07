@@ -169,7 +169,8 @@ defmodule Vagus.Core.HttpConfig do
 
       {:skipped, :no_socket} = skipped ->
         Logger.debug(
-          "Vagus.Core.HttpConfig: no Supervisor↔Core socket — keeping #{inspect(@defaults)}"
+          "Vagus.Core.HttpConfig: no Supervisor↔Core socket — " <>
+            "keeping the previously cached config"
         )
 
         skipped
