@@ -26,17 +26,30 @@ defmodule Vagus.Core.EventPusher do
   This module is the manager half of a monitor+backoff pair — mirroring
   `Vagus.Engine.Manager`'s house pattern for supervising an external
   resource without ever letting its restart intensity threaten the parent
-  supervisor's budget. `Vagus.Core.EventPusher.Connection` (the `Fresh`
-  behaviour module) is started unlinked via `Fresh.start/4` and monitored
-  (`Process.monitor/1`), never added as a supervised child directly: an
-  ordinary reconnect (network blip) is absorbed entirely inside `Fresh`
-  itself (see `Connection`'s moduledoc), and only an outright crash of
-  that process reaches this manager as a `:DOWN` message, at which point
-  this GenServer's own capped-exponential backoff (5s -> 60s, doubling)
-  schedules a fresh connection attempt — exactly like `Engine.Manager`'s
-  `@retry_ms`/`:retry_daemon_start` dance, just with backoff instead of a
-  fixed interval. `SocketConnection` has no internal reconnect of its own,
-  so on that transport every loss takes this same `:DOWN` path.
+  supervisor's budget. Both connection modules are started unlinked
+  (`Fresh.start/4`, `SocketConnection.start/1`) and monitored
+  (`Process.monitor/1`), never added as supervised children directly.
+
+  **Neither leg ever reconnects on its own**: one connection attempt per
+  process, and every loss — blip, close frame, transport error, connect
+  failure — kills it. The `:DOWN` that follows is what re-enters this
+  GenServer's capped-exponential backoff (5s -> 60s, doubling) and, with
+  it, a fresh `Transport.current/0` resolution. A leg that healed itself
+  would keep dialling the endpoint it was born with and starve the
+  manager of the only moment it can change transports (see `Connection`'s
+  moduledoc for the port-80 wedge that taught us this).
+
+  ## Ready timeout
+
+  Every connection is given `config :vagus, :event_pusher_ready_timeout`
+  milliseconds (default 60_000) to report `:ready`. If it hasn't, the
+  manager kills it and takes the ordinary `:DOWN` path above.
+  Transport-agnostic belt-and-braces against any half-open wedge — a leg
+  that connects but never finishes the auth handshake, a TCP socket to a
+  port nothing answers on any more, a close frame the peer never echoes —
+  none of which the monitor alone can see, because the process is alive
+  and simply idle. The timer is re-armed on every `:connected` (which
+  resets `ready`) and cancelled the moment `:ready` lands.
 
   Lazy on the TCP transport: no connection is attempted until
   `Vagus.Core.TokenStore` has a refresh token (subscribed at `init/1`,
@@ -84,6 +97,7 @@ defmodule Vagus.Core.EventPusher do
   @backoff_initial 5_000
   @backoff_max 60_000
   @command_timeout 5_000
+  @ready_timeout 60_000
 
   # The caller's `GenServer.call/3` timeout must outlive the manager's own
   # per-request timer, or the call would exit with `:timeout` before the
@@ -101,6 +115,10 @@ defmodule Vagus.Core.EventPusher do
       `Vagus.Core.TokenStore`.
     * `:client` - the `Vagus.Core.Client` server the WS connection uses
       for access tokens, defaults to `Vagus.Core.Client`.
+    * `:ready_timeout` - milliseconds a connection may stay connected
+      without reporting `:ready` before the manager kills it, defaults to
+      `config :vagus, :event_pusher_ready_timeout` and then to
+      `#{@ready_timeout}`.
   """
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts \\ []) do
@@ -172,6 +190,8 @@ defmodule Vagus.Core.EventPusher do
       connection_pid: nil,
       monitor_ref: nil,
       retry_ref: nil,
+      ready_ref: nil,
+      ready_timeout_ms: ready_timeout(opts),
       ready: false,
       next_id: 1,
       pending: %{},
@@ -215,11 +235,13 @@ defmodule Vagus.Core.EventPusher do
   def handle_info({:event_pusher_connection, :connected, pid}, %{connection_pid: pid} = state) do
     # `next_id` deliberately survives — see the moduledoc's id-sequencing
     # section for why resetting it is what made stale timeouts dangerous.
-    {:noreply, %{fail_pending(state) | ready: false, backoff_ms: @backoff_initial}}
+    state = %{fail_pending(state) | ready: false, backoff_ms: @backoff_initial}
+
+    {:noreply, arm_ready_timeout(state, pid)}
   end
 
   def handle_info({:event_pusher_connection, :ready, pid}, %{connection_pid: pid} = state) do
-    {:noreply, flush(%{state | ready: true})}
+    {:noreply, flush(%{clear_ready_timeout(state) | ready: true})}
   end
 
   # Stale message from a connection pid that's no longer current - ignore.
@@ -255,10 +277,29 @@ defmodule Vagus.Core.EventPusher do
         "retrying in #{state.backoff_ms}ms"
     )
 
-    state = %{fail_pending(state) | connection_pid: nil, monitor_ref: nil, ready: false}
+    state =
+      %{fail_pending(state) | connection_pid: nil, monitor_ref: nil, ready: false}
+      |> clear_ready_timeout()
 
     {:noreply, schedule_retry(state)}
   end
+
+  # Connected but never ready: the process is alive, so the monitor will
+  # never speak up. Kill it and let the `:DOWN` above run the ordinary
+  # backoff + re-pick — no second retry path to keep in sync.
+  def handle_info({:ready_timeout, pid}, %{connection_pid: pid, ready: false} = state) do
+    Logger.warning(
+      "Vagus.Core.EventPusher: connection #{inspect(pid)} never became ready within " <>
+        "#{state.ready_timeout_ms}ms, killing it to force a fresh transport pick"
+    )
+
+    Process.exit(pid, :kill)
+
+    {:noreply, %{state | ready_ref: nil}}
+  end
+
+  # Ready, or for a connection that is no longer current - a stale timer.
+  def handle_info({:ready_timeout, _pid}, state), do: {:noreply, state}
 
   def handle_info(:retry_connect, %{connection_pid: nil} = state) do
     {:noreply, connect(state)}
@@ -343,18 +384,15 @@ defmodule Vagus.Core.EventPusher do
   end
 
   defp start_connection(state) do
-    # Two independent backoffs, not one reused value: `conn_opts` here are
-    # `Fresh`'s own internal reconnect options (real options it understands -
-    # see `vendor/fresh/lib/fresh/option.ex`), which absorb ordinary
-    # network-level reconnects entirely inside the `Connection` process.
-    # This module's own `@backoff_initial`/`next_backoff/1` (used in the
-    # `:DOWN` handler below) is unrelated - it only ever governs scheduling
-    # a fresh `start_connection/1` after the `Connection` process itself has
-    # died outright.
-    conn_opts = [backoff_initial: @backoff_initial, backoff_max: @backoff_max]
+    # No `backoff_initial`/`backoff_max` here even though `Fresh`
+    # understands them (`vendor/fresh/lib/fresh/option.ex`): they only
+    # govern `Fresh`'s *internal* reconnect, which `Connection` never
+    # asks for. Reconnect timing is this module's `@backoff_initial` /
+    # `next_backoff/1` alone, so that every wait is followed by a fresh
+    # transport resolution.
     conn_state = %{manager: self(), client: state.client}
 
-    case Fresh.start(state.ws_url, Connection, conn_state, conn_opts) do
+    case Fresh.start(state.ws_url, Connection, conn_state, []) do
       {:ok, pid} ->
         connected(state, pid, Connection)
 
@@ -369,13 +407,49 @@ defmodule Vagus.Core.EventPusher do
   end
 
   defp connected(state, pid, conn_mod) do
-    %{
+    state = %{
       clear_retry(state)
       | connection_pid: pid,
         conn_mod: conn_mod,
         monitor_ref: Process.monitor(pid),
         ready: false
     }
+
+    arm_ready_timeout(state, pid)
+  end
+
+  # At most one armed ready timer, same discipline as `retry_ref`: a
+  # connection can announce `:connected` more than once, and each one
+  # re-opens the window.
+  defp arm_ready_timeout(state, pid) do
+    state = clear_ready_timeout(state)
+    ref = Process.send_after(self(), {:ready_timeout, pid}, state.ready_timeout_ms)
+    %{state | ready_ref: ref}
+  end
+
+  defp clear_ready_timeout(%{ready_ref: nil} = state), do: state
+
+  defp clear_ready_timeout(%{ready_ref: ref} = state) do
+    # `cancel_timer/1` returning `false` means the message already went
+    # out and cannot be unsent — drain it rather than leave a
+    # `{:ready_timeout, _}` that would only be discarded later by the
+    # stale clause. Only ever one such message, since only one timer is
+    # armed at a time.
+    if Process.cancel_timer(ref) == false do
+      receive do
+        {:ready_timeout, _pid} -> :ok
+      after
+        0 -> :ok
+      end
+    end
+
+    %{state | ready_ref: nil}
+  end
+
+  defp ready_timeout(opts) do
+    Keyword.get_lazy(opts, :ready_timeout, fn ->
+      Application.get_env(:vagus, :event_pusher_ready_timeout, @ready_timeout)
+    end)
   end
 
   # At most one armed retry at a time: `:retry_connect` and a

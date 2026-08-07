@@ -20,18 +20,30 @@ defmodule Vagus.Core.EventPusher.Connection do
   correlating them with a waiting caller — or deciding a result is
   unmatched — is the manager's job, since only it holds the pending map.
 
-  Ordinary network-level reconnection (dropped socket, upgrade failure,
-  Core-initiated close) is handled entirely *inside* `Fresh` itself —
-  `handle_disconnect/3` and `handle_error/2` both unconditionally return
-  `:reconnect`, and the manager configures `backoff_initial`/`backoff_max`
-  (5s/60s) when starting this connection. That keeps the same long-lived
-  `gen_statem` process across many TCP-level reconnects, each one firing
-  `handle_connect/3` again (which is exactly the "new connection" signal
-  the manager resets its id counter on).
+  ## One connection attempt per process — never reconnect internally
 
-  Only an outright crash of this process (a bug, not a normal disconnect)
-  needs `Vagus.Core.EventPusher`'s own monitor+backoff restart — which is
-  why the manager starts this module with `Fresh.start/4` (unlinked), not
+  `handle_disconnect/3` and `handle_error/2` both return `:close`, which
+  in `Fresh.Connection` sets `reconnect: false` and turns into
+  `{:stop, :normal}` — this process dies on the first disconnect,
+  connect failure or transport error, every time.
+
+  That is load-bearing, not a style choice. `Fresh`'s other option,
+  `:reconnect`, re-dials **the URI this process was started with**, inside
+  this process, forever. The manager re-resolves the transport (unix
+  socket vs TCP) on every connection attempt, and it only gets to make
+  that decision when a connection process dies and its monitor fires
+  `:DOWN`. A self-healing TCP leg therefore pins the manager to TCP for
+  as long as it survives: a connection dialled at `localhost:8123` before
+  Core moved to `:80` kept retrying `:8123` and never let the manager
+  discover the unix socket that had appeared in the meantime — the
+  manager sat `ready: false` with a live `connection_pid` and no armed
+  retry, indefinitely. Dying is what hands the decision back.
+
+  Exiting `:normal` (rather than with the error) keeps an ordinary
+  network blip out of the crash-report log; `Fresh` has already logged
+  the disconnect code / error type by the time these callbacks run.
+
+  The manager starts this module with `Fresh.start/4` (unlinked), not
   `Fresh.start_link/4` or this module's `use Fresh`-generated
   `child_spec/1`: a link would propagate a crash here into the manager
   itself, and a supervised `child_spec` would spend `Vagus.Core.Supervisor`'s
@@ -68,11 +80,14 @@ defmodule Vagus.Core.EventPusher.Connection do
 
   def handle_in(_frame, state), do: {:ok, state}
 
+  # `:close` == `{:stop, :normal}` in `Fresh.Connection`. See the
+  # moduledoc: internal reconnection would pin the manager to the
+  # transport this process was started on.
   @impl Fresh
-  def handle_disconnect(_code, _reason, _state), do: :reconnect
+  def handle_disconnect(_code, _reason, _state), do: :close
 
   @impl Fresh
-  def handle_error(_error, _state), do: :reconnect
+  def handle_error(_error, _state), do: :close
 
   defp handle_decoded({:ok, %{"type" => "auth_required"}}, %{client: client} = state) do
     case Client.access_token(client) do
