@@ -187,6 +187,12 @@ config :vagus, :os_updater, true
 # Core-facing token handshake (P3-T1/T2) — see config/host.exs for the
 # rationale, identical on target.
 config :vagus, :core_token_path, "/data/vagus/core_token.json"
+
+# On-device, every 2026.8+ Core is reached over the unix socket
+# (`Vagus.Core.Transport`, socket-first), regardless of which TCP port it
+# bound — so this URL never carries traffic to a port-80 Core. It only
+# matters as a fallback to pre-2026.8 Cores, which predate
+# `SUPERVISOR_DEFAULT_PORT` and always bind 8123 — hence the fixed port.
 config :vagus, :core_base_url, "http://localhost:8123"
 
 # Installed/latest HA Core version state (CL-P2-T1) — see config/host.exs
