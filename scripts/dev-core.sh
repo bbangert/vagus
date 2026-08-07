@@ -223,6 +223,12 @@ esac
 case "$action" in
   up)
     mkdir -p "$SOCKET_DIR"
+    # Unlink any stale socket left behind by an unclean shutdown (e.g. a
+    # `docker rm -f` outside this script, or a crash that skipped `down`) so
+    # wait_for_socket_and_chmod below can only ever match the socket Core
+    # creates fresh after this `docker run` — see the restart case for the
+    # same hazard.
+    rm -f "$SOCKET_PATH"
     docker run -d --name "$CONTAINER_NAME" \
       -p "${HOST_PORT}:8123" \
       -e SUPERVISOR="${SUPERVISOR_HOST}:${SUPERVISOR_PORT}" \
@@ -251,6 +257,14 @@ case "$action" in
     rm -f "$SOCKET_PATH"
     ;;
   restart)
+    # Unlink the old socket file first: `docker restart` leaves the existing
+    # unix-socket directory entry in place until Core's HTTP server comes
+    # back up and recreates it, so without this wait_for_socket_and_chmod
+    # below could match the OLD (already-chmod'd) socket immediately, chmod
+    # a file Core is about to replace, and report success while Core then
+    # recreates the real socket root:root 0600 underneath — locking the
+    # non-root emulator out despite the "success" message.
+    rm -f "$SOCKET_PATH"
     docker restart "$CONTAINER_NAME"
     echo
     wait_for_socket_and_chmod
