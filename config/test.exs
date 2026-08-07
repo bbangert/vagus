@@ -15,6 +15,13 @@ config :vagus, :dns_enabled, false
 # start their own instance against a fake unix-socket server.
 config :vagus, :events_enabled, false
 
+# No Supervisor↔Core unix socket under `mix test`: `Vagus.Core.Transport`
+# would otherwise probe the on-device path (`/run/supervisor/core.sock`) and
+# whether it happens to exist on the machine running the suite would decide
+# which transport every Core client picks. `nil` pins the whole suite to the
+# TCP fallback; the socket-transport tests put_env their own tmp path.
+config :vagus, :core_socket_path, nil
+
 # Don't start the container-event watchdog during `mix test` — same
 # rationale as :events_enabled; watchdog unit tests start their own
 # instance with injected fakes.

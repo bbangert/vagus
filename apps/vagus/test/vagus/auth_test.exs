@@ -78,18 +78,31 @@ defmodule Vagus.AuthTest do
     end)
   end
 
-  test "when :core_api_socket is set, forward uses the socket, not the TCP client", %{
-    cache: cache
-  } do
-    # A bogus socket path makes ApiSocket.post fail to connect (→ false) — the
-    # point is that the TCP StubCore is NOT consulted (empty reply queue would
-    # crash it if it were), proving the socket branch is taken.
-    Application.put_env(:vagus, :core_api_socket, "/nonexistent/vagus-core.sock")
-    on_exit(fn -> Application.delete_env(:vagus, :core_api_socket) end)
+  test "when the Core socket exists, forward uses it, not the TCP client", %{cache: cache} do
+    # A plain file at the configured path is enough for
+    # `Vagus.Core.Transport` to resolve the socket transport, and makes
+    # ApiSocket.post fail to connect (→ false) — the point is that the TCP
+    # StubCore is NOT consulted (an empty reply queue would crash it if it
+    # were), proving the socket branch is taken.
+    path = Path.join(System.tmp_dir!(), "vagus_auth_socket_#{System.unique_integer([:positive])}")
+    File.write!(path, "")
+    Application.put_env(:vagus, :core_socket_path, path)
+
+    on_exit(fn ->
+      Application.put_env(:vagus, :core_socket_path, nil)
+      File.rm(path)
+    end)
 
     with_core([], fn ->
       refute Auth.check_login("alice", "secret", "m", server: cache, core_client: StubCore)
       assert core_calls() == []
+    end)
+  end
+
+  test "with no Core socket, forward falls back to the TCP client", %{cache: cache} do
+    with_core([{:ok, %{status: 200}}], fn ->
+      assert Auth.check_login("alice", "secret", "m", server: cache, core_client: StubCore)
+      assert length(core_calls()) == 1
     end)
   end
 

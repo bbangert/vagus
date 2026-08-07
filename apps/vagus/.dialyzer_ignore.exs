@@ -22,10 +22,10 @@
   {"lib/vagus/runtime/docker.ex", :invalid_contract},
   {"lib/vagus/runtime/events.ex", :no_return},
   {"lib/vagus/runtime/events.ex", :call},
-  {"lib/vagus/core/api_socket.ex", :no_return},
-  {"lib/vagus/core/api_socket.ex", :call},
-  {"lib/vagus/core/api_socket.ex", :unused_fun},
-  {"lib/vagus/core/api_socket.ex", :invalid_contract},
+  # (Vagus.Core.ApiSocket needs no entries: its connect address now comes
+  # from `Vagus.Core.Transport.connect_args/1`, whose return type is the
+  # general `Mint.Types.address()` rather than a literal `{:local, path}`, so
+  # the cascade below never starts there.)
   # Runtime.Logs.Follow speaks to the engine socket the same {:local, path}
   # way (vagus-follow-logs): connect deemed "never succeeds" → the with-else
   # branches and request_logs read as dead → same cascade as events.ex.
@@ -98,6 +98,9 @@
   # ingress bridge's Upstream shape; same typing story, same non-defect. The
   # REST module (`lib/vagus/api/core_proxy.ex`) is clean and needs no entry.
   {"lib/vagus/api/core_proxy/ws_bridge.ex", :pattern_match},
+  # Same `Mint.WebSocket.new/4` story again in the EventPusher's socket-transport
+  # WS client (core-socket-port80 A2), which mirrors that Upstream shape.
+  {"lib/vagus/core/event_pusher/socket_connection.ex", :pattern_match},
   {"lib/vagus/core/events.ex", :call_without_opaque},
 
   # ── Root 3: benign dead defensive checks ────────────────────────────────

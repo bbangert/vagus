@@ -278,12 +278,13 @@ config :vagus, :store_repositories, [
 # independent of the container engine.
 config :vagus, :default_native_addon, "core_mqtt"
 
-# Core's Supervisor unix socket (M4 /auth). Core is run with
-# SUPERVISOR_CORE_API_SOCKET=<this path> and its dir bind-mounted to the host;
-# `Vagus.Auth` reaches api/hassio_auth over it, authenticating as the
-# Supervisor user and bypassing Core's caller-IP check (which the host-net
-# emulator can't satisfy over TCP).
-config :vagus, :core_api_socket, "/run/vagus-core/core.sock"
+# NOTE: the Supervisor↔Core unix socket needs no config here. Its path is
+# `Vagus.Core.Container.socket_path/0` (`/run/supervisor/core.sock`, the
+# value of Core's own `SUPERVISOR_CORE_API_SOCKET` env and one half of its
+# bind mount), which `Vagus.Core.Transport` resolves by default on every
+# target. The old `:core_api_socket` key pointed at `/run/vagus-core/core.sock`
+# — a directory nothing ever created or mounted, so it never worked on a
+# device and every caller silently used its TCP fallback.
 
 # Host-management backends (P4-T1) — the real vintage_net/Nerves.Runtime-
 # backed implementations. See config/host.exs for the :host-side stubs and

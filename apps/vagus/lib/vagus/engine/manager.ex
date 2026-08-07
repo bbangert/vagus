@@ -16,6 +16,14 @@ defmodule Vagus.Engine.Manager do
 
   On the **first** transition into `:internet` this GenServer:
 
+    0. Creates `Vagus.Core.Container.socket_dir/0` (`/run/supervisor`), the
+       bind-mount source for the socket Core opens as
+       `SUPERVISOR_CORE_API_SOCKET`. `/run` is tmpfs, so the directory is
+       gone after every boot and must be back *before* the daemon starts:
+       the daemon immediately revives Core's `unless-stopped` container, and
+       a bind mount whose source is missing fails the container start
+       outright. Idempotent + best-effort (logged, non-blocking) like
+       `/run/resolv.conf` below.
     1. Writes `/run/resolv.conf` (`Vagus.Engine.ResolvConf`) from
        vintage_net's `["name_servers"]` property, with a static fallback —
        *before* starting the daemon, because balena-engine and the
@@ -55,6 +63,7 @@ defmodule Vagus.Engine.Manager do
 
   require Logger
 
+  alias Vagus.Core.Container
   alias Vagus.Engine.ResolvConf
 
   @connection_property ["connection"]
@@ -168,6 +177,7 @@ defmodule Vagus.Engine.Manager do
     Logger.info("Vagus.Engine.Manager: internet reached, starting balena-engine-daemon")
 
     make_root_shared()
+    ensure_core_socket_dir()
 
     case current_name_servers() |> ResolvConf.write() do
       :ok ->
@@ -213,6 +223,27 @@ defmodule Vagus.Engine.Manager do
     end
   rescue
     e -> Logger.warning("Vagus.Engine.Manager: make-rshared / errored: #{Exception.message(e)}")
+  end
+
+  # Core's container bind-mounts this directory to hand Vagus the socket it
+  # opens as SUPERVISOR_CORE_API_SOCKET (see `Vagus.Core.Container`). Best-
+  # effort like `make_root_shared/0`: a failure here breaks Core's start, but
+  # refusing to start the engine over it would break everything else too.
+  #
+  # The path is a module constant (`Vagus.Core.Container.socket_dir/0`), not
+  # request input — no caller can influence it.
+  # sobelow_skip ["Traversal.FileModule"]
+  defp ensure_core_socket_dir do
+    case File.mkdir_p(Container.socket_dir()) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Logger.error(
+          "Vagus.Engine.Manager: failed to create #{Container.socket_dir()} " <>
+            "(#{inspect(reason)}), Core's Supervisor socket mount will fail"
+        )
+    end
   end
 
   defp monitor_daemon(state, pid) do

@@ -482,6 +482,90 @@ defmodule Vagus.API.CoreProxyTest do
     end
   end
 
+  ## 3b. Socket transport + implicit auth (A2/A3)
+
+  describe "over the Supervisor↔Core unix socket" do
+    setup do
+      path =
+        Path.join(
+          System.tmp_dir!(),
+          "vagus_core_proxy_#{System.unique_integer([:positive])}.sock"
+        )
+
+      start_supervised!(
+        {Bandit,
+         plug: FakeCore,
+         port: 0,
+         thousand_island_options: [
+           num_acceptors: 1,
+           transport_options: [ip: {:local, path}]
+         ],
+         http_options: [compress: false]},
+        id: :fake_core_socket_bandit
+      )
+
+      # The TCP fake Core stays up on `:core_base_url`; picking the socket
+      # over it is the whole point, and `HitCounter`/`Recorder` are shared,
+      # so a request landing on the wrong listener would still be visible.
+      Application.put_env(:vagus, :core_socket_path, path)
+
+      on_exit(fn ->
+        Application.put_env(:vagus, :core_socket_path, nil)
+        File.rm(path)
+      end)
+
+      %{socket: path}
+    end
+
+    test "the request rides the socket and carries NO authorization header" do
+      token = addon_token("cp_socket", %{homeassistant_api: true})
+
+      # A token function that would blow up if it were consulted: on the
+      # socket path no credential is resolved at all.
+      Application.put_env(:vagus, :core_proxy_access_token_fun, fn ->
+        raise "access token resolved on the socket path"
+      end)
+
+      conn = call(:get, "/core/api/states?filter=a%20b", [bearer(token)])
+
+      assert conn.status == 200
+      assert HitCounter.count() == 1
+
+      last = Recorder.last()
+      assert last.path == "/api/states"
+      assert last.query == "filter=a%20b"
+      refute Map.has_key?(Map.new(last.headers), "authorization")
+    end
+
+    test "a missing refresh token no longer 502s a socket-borne request" do
+      token = addon_token("cp_socket_no_token", %{homeassistant_api: true})
+
+      Application.put_env(:vagus, :core_proxy_access_token_fun, fn ->
+        {:error, :no_refresh_token}
+      end)
+
+      assert call(:get, "/core/api/states", [bearer(token)]).status == 200
+    end
+
+    test "auth is still the add-on's own — an unflagged caller never reaches the socket" do
+      token = addon_token("cp_socket_unflagged")
+
+      assert call(:get, "/core/api/states", [bearer(token)]).status == 401
+      assert HitCounter.count() == 0
+    end
+
+    test "a socket that disappears falls straight back to the TCP base URL", %{socket: path} do
+      token = addon_token("cp_socket_gone", %{homeassistant_api: true})
+      File.rm!(path)
+
+      conn = call(:get, "/core/api/states", [bearer(token)])
+
+      assert conn.status == 200
+      # TCP again ⇒ the bearer credential is back.
+      assert Map.new(Recorder.last().headers)["authorization"] == "Bearer core-access-token"
+    end
+  end
+
   ## 4. Query forwarding
 
   describe "query forwarding" do

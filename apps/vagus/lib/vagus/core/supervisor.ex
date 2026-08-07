@@ -3,9 +3,11 @@ defmodule Vagus.Core.Supervisor do
   Isolated supervisor for the Core-facing token handshake and event-push
   machinery (P3), plus Core's version state (P2): `Vagus.Core.TokenStore`, a
   small `Finch` pool for outbound HTTP to Core, `Vagus.Core.Versions`
-  (installed/latest version persistence), `Vagus.Core.Client` (lazy
-  access-token exchange), `Vagus.Core.EventPusher` (persistent WS client
-  manager), and `Vagus.Core.Users` (cached admin lookups over that WS).
+  (installed/latest version persistence), `Vagus.Core.HttpConfig` (Core's
+  own reported port/ssl, pulled over the Supervisor↔Core socket),
+  `Vagus.Core.Client` (lazy access-token exchange), `Vagus.Core.EventPusher`
+  (persistent WS client manager), and `Vagus.Core.Users` (cached admin
+  lookups over that WS).
 
   Mirrors `Vagus.Engine.DaemonSupervisor`/`Vagus.API.Supervisor`'s
   isolation rationale: a crash anywhere in this subtree has its own
@@ -22,16 +24,22 @@ defmodule Vagus.Core.Supervisor do
   the pool — it has no dependency on `TokenStore` or `Client` and nothing
   downstream depends on it either, so its exact position among the
   Finch-dependent children doesn't matter beyond "after Finch".
+  `HttpConfig` sits right next to it for the same reason: its pull rides
+  the socket with no credential of any kind (`Vagus.Core.Transport`'s
+  implicit auth), so `Finch` is its only prerequisite too.
 
   `:rest_for_one`, not `:one_for_one`: a `TokenStore` restart wipes its
   in-memory subscriber set (`EventPusher`'s subscription among them), so
   `TokenStore` restarting must also restart every child listed after it
-  (`Finch`, `Versions`, `Client`, `EventPusher`, `Users`) — `EventPusher`'s `init/1`
+  (`Finch`, `Versions`, `HttpConfig`, `Client`, `EventPusher`, `Users`) —
+  `EventPusher`'s `init/1`
   then re-subscribes and re-reads the refresh token from the fresh
   `TokenStore`, instead of being left permanently unsubscribed. `Versions`
   restarting along with it just means its in-memory 24h latest-version
   cache is dropped (harmless — the next `latest/1` call simply re-fetches);
   its persisted installed version is re-read from disk at `init/1`.
+  `HttpConfig` drops back to its defaults the same way, and is re-pulled at
+  the next Core start/healthy transition (`Vagus.Core.Lifecycle`).
   """
 
   use Supervisor
@@ -48,6 +56,7 @@ defmodule Vagus.Core.Supervisor do
       Vagus.Core.TokenStore,
       {Finch, name: Vagus.Core.Finch, pools: %{default: [size: 2]}},
       Vagus.Core.Versions,
+      Vagus.Core.HttpConfig,
       Vagus.Core.Client,
       Vagus.Core.EventPusher,
       Vagus.Core.Users

@@ -191,8 +191,11 @@ defmodule Vagus.API.Router do
   # (CL-P3-T2) — real state seeded by boot adoption / kept current by
   # `update/2` — and `watchdog` from the persisted `Vagus.Core.TokenStore`
   # option (CW-P0-T3, so a `POST core/options {"watchdog": bool}` toggle
-  # round-trips honestly); every other field is still `StaticData.core_info/0`'s
-  # Phase 2 static value. `HomeAssistantInfo` declares both `version` and
+  # round-trips honestly). `port`/`ssl` are live too, but sourced inside
+  # `StaticData.core_info/0` itself (from `Vagus.Core.HttpConfig`, what Core
+  # reports over the Supervisor↔Core socket); every other field is still
+  # that function's Phase 2 static value.
+  # `HomeAssistantInfo` declares both `version` and
   # `version_latest` nullable, so a not-yet-adopted/offline `nil` from
   # `Versions` is a valid response, not a fallback case.
   get "/core/info" do

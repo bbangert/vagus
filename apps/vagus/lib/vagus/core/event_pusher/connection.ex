@@ -1,6 +1,11 @@
 defmodule Vagus.Core.EventPusher.Connection do
   @moduledoc """
-  The `Fresh` WebSocket client backing `Vagus.Core.EventPusher`.
+  The `Fresh` WebSocket client backing `Vagus.Core.EventPusher` on the TCP
+  fallback (`config :vagus, :core_base_url` — host dev, and any device
+  where Core's Supervisor socket isn't there). When the socket IS there,
+  `Vagus.Core.EventPusher.SocketConnection` takes this module's place; both
+  speak the same lifecycle/result messages back to the manager, and
+  `send_frame/2` is the call the manager makes on either.
 
   Owns only the Core WS auth handshake (`docs/contract-2026.7.md` §4/§5):
   wait for `auth_required`, fetch an access token from `Vagus.Core.Client`,
@@ -39,6 +44,14 @@ defmodule Vagus.Core.EventPusher.Connection do
   require Logger
 
   alias Vagus.Core.Client
+
+  @doc """
+  Sends one WS frame. Mirrors
+  `Vagus.Core.EventPusher.SocketConnection.send_frame/2` so the manager can
+  hold either client behind the same call.
+  """
+  @spec send_frame(pid(), {:text, binary()}) :: :ok
+  def send_frame(pid, frame), do: Fresh.send(pid, frame)
 
   @impl Fresh
   def handle_connect(_status, _headers, %{manager: manager} = state) do

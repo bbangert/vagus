@@ -121,7 +121,11 @@ defmodule Vagus.Core.BootTest do
     assert log =~ "nope"
   end
 
-  test "adopted container is running -> :start is NOT called, adopt log only" do
+  # Deviation from upstream `attach()` parity, on purpose: the engine's
+  # `unless-stopped` policy revives the OLD-spec Core before this module
+  # runs, so gating the reconcile on "stopped" would mean an OTA fleet never
+  # picks up a container-spec change (`Vagus.Core.Container.spec_fingerprint/1`).
+  test "adopted container is running -> :start IS still called (spec reconcile)" do
     parent = self()
 
     log =
@@ -141,12 +145,38 @@ defmodule Vagus.Core.BootTest do
            name: nil}
         )
 
-        Process.sleep(50)
+        assert_receive :start_called, 1_000
+        Process.sleep(20)
       end)
 
-    refute_received :start_called
     assert log =~ "adopted Core container abc123def456"
-    refute log =~ "starting"
+    assert log =~ "reconciling running Core container abc123def456"
+    # The stopped-container wording (and its issue-#46 note) is NOT what a
+    # running container gets.
+    refute log =~ "issue #46"
+  end
+
+  test "a running adopted container whose :start fails -> logs a warning, no crash" do
+    log =
+      capture_log(fn ->
+        pid =
+          start_supervised!(
+            {Boot,
+             ping: fn -> :ok end,
+             adopt: fn ->
+               {:adopted, %{"Id" => "abc123def456", "State" => %{"Running" => true}}}
+             end,
+             start: fn -> {:error, :busy} end,
+             interval: 1,
+             max_attempts: 5,
+             name: nil}
+          )
+
+        Process.sleep(50)
+        assert Process.alive?(pid)
+      end)
+
+    assert log =~ "start failed for abc123def456"
   end
 
   test "adopted container is stopped -> :start is called, flow completes" do

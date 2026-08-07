@@ -1,7 +1,27 @@
 defmodule Vagus.Core.EventPusher do
   @moduledoc """
   Persistent WS client manager for `supervisor/event` pushes to Core
-  (`docs/contract-2026.7.md` §4), built on the vendored `fresh`.
+  (`docs/contract-2026.7.md` §4).
+
+  ## Two transports, one manager (`Vagus.Core.Transport`)
+
+  Every connection attempt re-resolves the transport, so a socket that
+  isn't there yet at boot (Core creates it when it starts) is picked up by
+  the next attempt with nothing to invalidate:
+
+    * socket present → `Vagus.Core.EventPusher.SocketConnection` (raw
+      `Mint.WebSocket` over `{:local, path}`). Core authenticates the peer
+      as the Supervisor user, so there is **no** `auth_required`/`auth`
+      handshake and **no** access token — and therefore no reason to wait
+      for a refresh token before connecting at all.
+    * socket absent → `Vagus.Core.EventPusher.Connection` (the vendored
+      `fresh`), today's TCP flow unchanged: lazy until
+      `Vagus.Core.TokenStore` has a refresh token, then Core's own WS auth
+      handshake.
+
+  Both report the same lifecycle messages and take the same
+  `send_frame/2` call, so everything below this paragraph is transport-
+  agnostic.
 
   This module is the manager half of a monitor+backoff pair — mirroring
   `Vagus.Engine.Manager`'s house pattern for supervising an external
@@ -15,41 +35,50 @@ defmodule Vagus.Core.EventPusher do
   this GenServer's own capped-exponential backoff (5s -> 60s, doubling)
   schedules a fresh connection attempt — exactly like `Engine.Manager`'s
   `@retry_ms`/`:retry_daemon_start` dance, just with backoff instead of a
-  fixed interval.
+  fixed interval. `SocketConnection` has no internal reconnect of its own,
+  so on that transport every loss takes this same `:DOWN` path.
 
-  Lazy by design: no connection is attempted until
+  Lazy on the TCP transport: no connection is attempted until
   `Vagus.Core.TokenStore` has a refresh token (subscribed at `init/1`,
   also checked directly in case one is already present — e.g. this
-  process restarted after the token had already landed). `push/2` before
-  that point (or during any later disconnect) buffers into a bounded
-  queue (`@max_queue_size`, drop-oldest) since a lost event only means a
-  future poll will be a little late — never a hard requirement to
-  redeliver.
+  process restarted after the token had already landed). On the socket
+  transport there is nothing to be lazy about — the connection needs no
+  credential — so it is dialed straight away. When neither is available
+  (no socket yet, no token yet), a `:retry_connect` is armed on the same
+  backoff, which is what picks the socket up once Core creates it even if
+  a refresh token never arrives. `push/2` before a connection exists (or
+  during any later disconnect) buffers into a bounded queue
+  (`@max_queue_size`, drop-oldest) since a lost event only means a future
+  poll will be a little late — never a hard requirement to redeliver.
 
-  Per-connection id sequencing: Core's WS API requires strictly increasing
-  `id`s within one connection, but no relationship between connections —
-  so the id counter resets to `1` every time `Connection` reports a fresh
-  `handle_connect/3` (`{:event_pusher_connection, :connected, pid}`), and
-  the queue is flushed (assigning ids in send order) only once `auth_ok`
-  is reported (`{:event_pusher_connection, :ready, pid}`).
+  Id sequencing: Core's WS API requires strictly increasing `id`s within
+  one connection, but no relationship between connections. This counter is
+  therefore never reset — monotonic for the life of the manager, which
+  satisfies Core on every connection AND means an id can never name two
+  different requests over time. That is deliberate: with a per-connection
+  reset, an already-delivered `{:command_timeout, id}` sitting in this
+  process's mailbox (`Process.cancel_timer/1` cannot unsend one) could fail
+  a *new* request that happened to reuse the id. Timers are additionally
+  drained when `cancel_timer/1` reports the message already went out, so
+  neither half of that race depends on the other.
 
   `command/2` adds a request/response path over the same socket for the
-  commands that only exist on Core's WS API. Because the id counter resets
-  to `1` on every new connection, an id issued on one connection can name a
-  *different* request on the next one — so every in-flight request is
-  failed with `{:error, :disconnected}` and the pending map cleared at both
-  points where that reset happens (a fresh `handle_connect/3`, and the
-  connection process dying). Commands never enter the offline queue: a
-  buffered command whose caller has already given up is worthless, so they
-  fail fast with `{:error, :not_connected}` instead.
+  commands that only exist on Core's WS API. Every in-flight request is
+  still failed with `{:error, :disconnected}` and the pending map cleared
+  whenever the connection goes away (a fresh `handle_connect/3`, and the
+  connection process dying): the answer can only ever arrive on the
+  connection the request was issued on. Commands never enter the offline
+  queue: a buffered command whose caller has already given up is
+  worthless, so they fail fast with `{:error, :not_connected}` instead.
   """
 
   use GenServer
 
   require Logger
 
-  alias Vagus.Core.EventPusher.Connection
+  alias Vagus.Core.EventPusher.{Connection, SocketConnection}
   alias Vagus.Core.TokenStore
+  alias Vagus.Core.Transport
 
   @max_queue_size 50
   @backoff_initial 5_000
@@ -139,8 +168,10 @@ defmodule Vagus.Core.EventPusher do
       ws_url: Keyword.get(opts, :ws_url, ws_url()),
       token_store: token_store,
       client: Keyword.get(opts, :client, Vagus.Core.Client),
+      conn_mod: Connection,
       connection_pid: nil,
       monitor_ref: nil,
+      retry_ref: nil,
       ready: false,
       next_id: 1,
       pending: %{},
@@ -149,21 +180,14 @@ defmodule Vagus.Core.EventPusher do
       backoff_ms: @backoff_initial
     }
 
-    state =
-      if TokenStore.get_refresh_token(token_store) do
-        connect(state)
-      else
-        state
-      end
-
-    {:ok, state}
+    {:ok, connect(state)}
   end
 
   @impl GenServer
   def handle_call({:command, payload, timeout}, from, state) do
     if state.ready and state.connection_pid do
       id = state.next_id
-      Fresh.send(state.connection_pid, {:text, Jason.encode!(Map.put(payload, "id", id))})
+      send_frame(state, Map.put(payload, "id", id))
       timer = Process.send_after(self(), {:command_timeout, id}, timeout)
 
       {:noreply, %{state | next_id: id + 1, pending: Map.put(state.pending, id, {from, timer})}}
@@ -189,7 +213,9 @@ defmodule Vagus.Core.EventPusher do
   def handle_info({:token_store, :refresh_token_available}, state), do: {:noreply, state}
 
   def handle_info({:event_pusher_connection, :connected, pid}, %{connection_pid: pid} = state) do
-    {:noreply, %{fail_pending(state) | ready: false, next_id: 1, backoff_ms: @backoff_initial}}
+    # `next_id` deliberately survives — see the moduledoc's id-sequencing
+    # section for why resetting it is what made stale timeouts dangerous.
+    {:noreply, %{fail_pending(state) | ready: false, backoff_ms: @backoff_initial}}
   end
 
   def handle_info({:event_pusher_connection, :ready, pid}, %{connection_pid: pid} = state) do
@@ -206,7 +232,7 @@ defmodule Vagus.Core.EventPusher do
         {:noreply, state}
 
       {{from, timer}, pending} ->
-        Process.cancel_timer(timer)
+        cancel_timeout(timer, id)
         GenServer.reply(from, result)
         {:noreply, %{state | pending: pending}}
     end
@@ -229,16 +255,9 @@ defmodule Vagus.Core.EventPusher do
         "retrying in #{state.backoff_ms}ms"
     )
 
-    Process.send_after(self(), :retry_connect, state.backoff_ms)
+    state = %{fail_pending(state) | connection_pid: nil, monitor_ref: nil, ready: false}
 
-    {:noreply,
-     %{
-       fail_pending(state)
-       | connection_pid: nil,
-         monitor_ref: nil,
-         ready: false,
-         backoff_ms: next_backoff(state.backoff_ms)
-     }}
+    {:noreply, schedule_retry(state)}
   end
 
   def handle_info(:retry_connect, %{connection_pid: nil} = state) do
@@ -255,12 +274,29 @@ defmodule Vagus.Core.EventPusher do
   # Every id becomes ambiguous the moment the counter resets, so no pending
   # request may outlive the connection it was issued on.
   defp fail_pending(state) do
-    Enum.each(state.pending, fn {_id, {from, timer}} ->
-      Process.cancel_timer(timer)
+    Enum.each(state.pending, fn {id, {from, timer}} ->
+      cancel_timeout(timer, id)
       GenServer.reply(from, {:error, :disconnected})
     end)
 
     %{state | pending: %{}}
+  end
+
+  # `Process.cancel_timer/1` returning `false` means the timer had already
+  # fired and its `{:command_timeout, id}` is sitting in this process's
+  # mailbox — unsending it is impossible, so drain it here instead. Ids are
+  # monotonic (moduledoc), so a leaked one could only ever be a no-op
+  # anyway; this keeps the mailbox honest rather than relying on that.
+  defp cancel_timeout(timer, id) do
+    if Process.cancel_timer(timer) == false do
+      receive do
+        {:command_timeout, ^id} -> :ok
+      after
+        0 -> :ok
+      end
+    end
+
+    :ok
   end
 
   # Results nobody is waiting for are the norm on this socket: every
@@ -274,10 +310,35 @@ defmodule Vagus.Core.EventPusher do
     )
   end
 
+  # Re-resolved on every attempt, never cached: this is what picks up the
+  # socket Core creates when it starts (and drops back to TCP if a Core
+  # recreate takes it away).
   defp connect(state) do
+    case Transport.current() do
+      {:socket, path} -> start_socket_connection(state, path)
+      {:tcp, _base_url} -> connect_tcp(state)
+    end
+  end
+
+  defp connect_tcp(state) do
     case TokenStore.get_refresh_token(state.token_store) do
-      nil -> state
+      nil -> schedule_retry(state)
       _token -> start_connection(state)
+    end
+  end
+
+  defp start_socket_connection(state, path) do
+    case SocketConnection.start(%{manager: self(), socket: path}) do
+      {:ok, pid} ->
+        connected(state, pid, SocketConnection)
+
+      {:error, reason} ->
+        Logger.error(
+          "Vagus.Core.EventPusher: failed to open the Core socket WS connection " <>
+            "(#{inspect(reason)}), retrying in #{state.backoff_ms}ms"
+        )
+
+        schedule_retry(state)
     end
   end
 
@@ -295,13 +356,7 @@ defmodule Vagus.Core.EventPusher do
 
     case Fresh.start(state.ws_url, Connection, conn_state, conn_opts) do
       {:ok, pid} ->
-        %{
-          state
-          | connection_pid: pid,
-            monitor_ref: Process.monitor(pid),
-            ready: false,
-            next_id: 1
-        }
+        connected(state, pid, Connection)
 
       {:error, reason} ->
         Logger.error(
@@ -309,17 +364,46 @@ defmodule Vagus.Core.EventPusher do
             "(#{inspect(reason)}), retrying in #{state.backoff_ms}ms"
         )
 
-        Process.send_after(self(), :retry_connect, state.backoff_ms)
-        %{state | backoff_ms: next_backoff(state.backoff_ms)}
+        schedule_retry(state)
     end
+  end
+
+  defp connected(state, pid, conn_mod) do
+    %{
+      clear_retry(state)
+      | connection_pid: pid,
+        conn_mod: conn_mod,
+        monitor_ref: Process.monitor(pid),
+        ready: false
+    }
+  end
+
+  # At most one armed retry at a time: `:retry_connect` and a
+  # `:refresh_token_available` notification can both want one, and each
+  # failed attempt arms another, so without this the timers would multiply.
+  defp schedule_retry(state) do
+    state = clear_retry(state)
+    ref = Process.send_after(self(), :retry_connect, state.backoff_ms)
+    %{state | retry_ref: ref, backoff_ms: next_backoff(state.backoff_ms)}
+  end
+
+  defp clear_retry(%{retry_ref: nil} = state), do: state
+
+  defp clear_retry(%{retry_ref: ref} = state) do
+    Process.cancel_timer(ref)
+    %{state | retry_ref: nil}
   end
 
   defp next_backoff(current), do: min(current * 2, @backoff_max)
 
   defp send_now(event_data, state) do
     frame = %{"id" => state.next_id, "type" => "supervisor/event", "data" => event_data}
-    Fresh.send(state.connection_pid, {:text, Jason.encode!(frame)})
+    send_frame(state, frame)
     %{state | next_id: state.next_id + 1}
+  end
+
+  defp send_frame(state, frame) do
+    state.conn_mod.send_frame(state.connection_pid, {:text, Jason.encode!(frame)})
   end
 
   defp enqueue(state, event_data) do
