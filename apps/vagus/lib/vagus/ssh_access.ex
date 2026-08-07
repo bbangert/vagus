@@ -25,10 +25,14 @@ defmodule Vagus.SSHAccess do
 
   The private key is persisted unencrypted, so a key is only ever generated,
   loaded or served once the store file's mode has been set to `0600` **and
-  read back to confirm it**. If either step fails the server runs degraded:
-  no keypair at all, and every accessor answers `{:error, :unavailable}`.
-  It deliberately does not stop — this is a supervised child, and refusing
-  to boot over a chmod failure would take the whole device down.
+  read back to confirm it**.
+
+  Every way that can fail — the store directory cannot be created, the DETS
+  file will not open, the chmod errors, or the read-back shows another mode —
+  converges on one degraded state: the server starts and stays alive with no
+  keypair at all, and every accessor answers `{:error, :unavailable}`.
+  Startup never aborts on any of them — this is a supervised child, and
+  refusing to boot over a filesystem failure would boot-loop the device.
 
   Boot work (keygen, authorize) runs in `handle_continue/2` so a slow or
   not-yet-ready `nerves_ssh` daemon can't stall the supervisor; authorization
@@ -106,15 +110,14 @@ defmodule Vagus.SSHAccess do
   def init(opts) do
     table_name = Keyword.get(opts, :table, @default_table)
     path = Keyword.get(opts, :dets_path) || dets_path()
-    File.mkdir_p!(Path.dirname(path))
 
-    case :dets.open_file(table_name, file: to_charlist(path), type: :set) do
-      {:ok, table} ->
-        secure_store(table, path, opts)
-
-      {:error, reason} ->
-        Logger.error("SSH access store failed to open #{path}: #{inspect(reason)}")
-        {:stop, reason}
+    with :ok <- File.mkdir_p(Path.dirname(path)),
+         {:ok, table} <- :dets.open_file(table_name, file: to_charlist(path), type: :set) do
+      secure_store(table, path, opts)
+    else
+      # No table to close on either branch: mkdir_p runs before the open, and
+      # a failed open leaves nothing open.
+      {:error, reason} -> degrade(nil, path, "cannot create or open: #{inspect(reason)}")
     end
   end
 
@@ -136,18 +139,24 @@ defmodule Vagus.SSHAccess do
          0o600 <- band(mode, 0o777) do
       {:ok, %{table: table, keypair: nil}, {:continue, :ensure_key}}
     else
-      mode when is_integer(mode) -> degrade(table, path, "mode is 0#{Integer.to_string(mode, 8)}")
-      other -> degrade(table, path, inspect(other))
+      mode when is_integer(mode) ->
+        degrade(table, path, "0600 unproven: mode is 0#{Integer.to_string(mode, 8)}")
+
+      other ->
+        degrade(table, path, "0600 unproven: #{inspect(other)}")
     end
   end
 
+  # The one degraded path: alive, no keypair, no `:ensure_key` continuation,
+  # accessors answering `{:error, :unavailable}`. `table` is nil when there is
+  # nothing open to close.
   defp degrade(table, path, detail) do
     Logger.error(
-      "SSH access store #{path} could not be proven mode 0600 (#{detail}) — " <>
+      "SSH access store #{path} unusable (#{detail}) — " <>
         "refusing to generate or serve an SSH access key"
     )
 
-    :dets.close(table)
+    if table, do: :dets.close(table)
     {:ok, %{table: nil, keypair: nil}}
   end
 

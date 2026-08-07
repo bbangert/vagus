@@ -608,19 +608,30 @@ defmodule Vagus.API.Router do
   # the same precedence `Vagus.Ingress.Panels.list/1` and
   # `Vagus.Ingress.resolve_token/2` apply.
   #
-  # No extra guard beyond this route's existing auth/tier behaviour: Core's
-  # WS proxy whitelists `/addons/*/info` for non-admin users too, so a
-  # stricter check here would break the panel for Core itself. The panel's
-  # `admin: true` plus the ingress session are the gate on the content.
+  # The synthetic payload is supervisor-only. Its `ingress_url` embeds the
+  # panel's per-boot ingress token — a bearer capability for the device's SSH
+  # private key — so an add-on token must never reach it. Gating on
+  # `:supervisor` costs the frontend nothing: Core's `HassIO.send_command`
+  # proxies every WS `supervisor/api` call with `$SUPERVISOR_TOKEN`, so even a
+  # non-admin Home Assistant user's read arrives here as `:supervisor` (Core
+  # whitelists `/addons/*/info` in `WS_NO_ADMIN_ENDPOINTS`, which is why this
+  # must not require more than that).
   get "/addons/:slug/info" do
     caller = conn.assigns.caller
 
     if slug == AdminPanel.slug() do
-      Envelope.send_ok(conn, AdminPanel.info())
+      synthetic_info(conn, caller)
     else
       addon_info(conn, slug, caller)
     end
   end
+
+  # Non-supervisor callers get the byte-identical 403 a foreign slug produces,
+  # so the reserved slug is indistinguishable from any other unauthorized one.
+  defp synthetic_info(conn, :supervisor), do: Envelope.send_ok(conn, AdminPanel.info())
+
+  defp synthetic_info(conn, _caller),
+    do: Envelope.send_error(conn, "Not authorized for this add-on", 403)
 
   defp addon_info(conn, slug, caller) do
     with {:ok, resolved} <- resolve_info_slug(slug, caller),

@@ -174,6 +174,65 @@ defmodule Vagus.SSHAccessTest do
     end
   end
 
+  # A store that can't be created or opened at all lands in the same degraded
+  # state as one whose mode can't be proven — and equally must not stop, which
+  # under `Vagus.Application`'s supervisor would boot-loop the device.
+  describe "store that cannot be created or opened" do
+    test "an uncreatable store directory leaves the server alive with no key" do
+      # A regular file standing where the store's parent directory would go:
+      # `mkdir_p` fails with :enotdir. Deterministic, and needs no root.
+      blocker =
+        Path.join(System.tmp_dir!(), "ssh_access_blocker_#{System.unique_integer([:positive])}")
+
+      File.write!(blocker, "not a directory")
+      on_exit(fn -> File.rm_rf!(blocker) end)
+
+      name = start_unusable(Path.join([blocker, "store", "ssh_access.dets"]))
+
+      assert Process.alive?(GenServer.whereis(name))
+      assert SSHAccess.public_key(name) == {:error, :unavailable}
+      assert SSHAccess.private_key(name) == {:error, :unavailable}
+      assert SSHAccess.fingerprint(name) == {:error, :unavailable}
+    end
+
+    test "a store file that is not a DETS file leaves the server alive with no key" do
+      dir =
+        Path.join(System.tmp_dir!(), "ssh_access_notdets_#{System.unique_integer([:positive])}")
+
+      File.mkdir_p!(dir)
+      on_exit(fn -> File.rm_rf!(dir) end)
+
+      path = Path.join(dir, "ssh_access.dets")
+      File.write!(path, "definitely not a dets file")
+
+      name = start_unusable(path)
+
+      assert Process.alive?(GenServer.whereis(name))
+      assert SSHAccess.public_key(name) == {:error, :unavailable}
+      assert SSHAccess.private_key(name) == {:error, :unavailable}
+      assert SSHAccess.fingerprint(name) == {:error, :unavailable}
+    end
+  end
+
+  # Starts an instance against a store path that `init/1` cannot open.
+  # Returns the server name.
+  defp start_unusable(path) do
+    name = :"ssh_access_unusable_srv_#{System.unique_integer([:positive])}"
+    table = :"ssh_access_unusable_#{System.unique_integer([:positive])}"
+
+    {:ok, pid} = SSHAccess.start_link(name: name, table: table, dets_path: path)
+
+    on_exit(fn ->
+      try do
+        GenServer.stop(pid)
+      catch
+        :exit, _ -> :ok
+      end
+    end)
+
+    name
+  end
+
   # Starts an instance whose store the chmod-and-verify step will refuse,
   # via the `:chmod_fun` seam. Returns `{server_name, dets_path}`.
   defp start_degraded(chmod_fun) do

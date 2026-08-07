@@ -112,6 +112,31 @@ defmodule Vagus.API.AdminPanelTest do
     |> Router.call(@router_opts)
   end
 
+  defp addon_call(path, token) do
+    :get
+    |> conn(path)
+    |> put_req_header("x-supervisor-token", token)
+    |> Router.call(@router_opts)
+  end
+
+  # Registers an add-on token the auth plug will resolve to `{:addon, _}`.
+  defp addon_token(slug) do
+    token = "tok-#{System.unique_integer([:positive])}"
+
+    :ok =
+      Vagus.Addon.Registry.register(token, %{
+        slug: slug,
+        services_role: %{},
+        auth_api: true,
+        discovery: [],
+        hassio_api: true,
+        hassio_role: "default"
+      })
+
+    on_exit(fn -> Vagus.Addon.Registry.unregister_slug(slug) end)
+    token
+  end
+
   defp data(conn), do: Jason.decode!(conn.resp_body)["data"]
 
   describe "Vagus.Ingress.Panels.list/1" do
@@ -435,6 +460,24 @@ defmodule Vagus.API.AdminPanelTest do
     test "the advertised ingress_url carries the admin token", %{token: token} do
       info = data(supervisor_call("/addons/vagus/info"))
       assert info["ingress_url"] == "/api/hassio_ingress/#{token}/"
+    end
+
+    # That `ingress_url` is a bearer capability for the device's SSH private
+    # key, so the reserved slug is supervisor-only — and it denies exactly the
+    # way any other slug an add-on may not read does, leaking nothing by the
+    # shape of the refusal.
+    test "an add-on token is refused indistinguishably from a foreign slug", %{token: token} do
+      addon = addon_token("nosy_addon")
+
+      conn = addon_call("/addons/vagus/info", addon)
+      foreign = addon_call("/addons/core_mosquitto/info", addon)
+
+      assert conn.status == 403
+      assert foreign.status == 403
+      assert conn.resp_body == foreign.resp_body
+
+      refute conn.resp_body =~ "ingress_url"
+      refute conn.resp_body =~ token
     end
   end
 
