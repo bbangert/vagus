@@ -2,6 +2,7 @@ defmodule Vagus.Addon.ManagerTest do
   use ExUnit.Case, async: false
 
   alias Vagus.Addon.{Config, Manager}
+  alias Vagus.API.AdminPanel
 
   defp mosquitto_config do
     {:ok, c} =
@@ -155,6 +156,21 @@ defmodule Vagus.Addon.ManagerTest do
     test "install pulls via the backend", %{config: config, data_root: dr} do
       assert :ok = Manager.install(config, backend: __MODULE__.FakeBackend, data_root: dr)
       assert_received {:pull, %{image: "homeassistant/amd64-addon-test:3"}}
+    end
+
+    # `Vagus.API.Router`'s install handler overwrites the parsed config's slug
+    # with the one from the URL, so `Config.parse/1`'s reserved-slug rejection
+    # cannot cover installs — this is the choke point that does.
+    test "install refuses a slug Vagus reserves for itself, without pulling", %{
+      config: config,
+      data_root: dr
+    } do
+      reserved = %{config | slug: AdminPanel.slug()}
+
+      assert {:error, {:reserved_slug, "vagus"}} =
+               Manager.install(reserved, backend: __MODULE__.FakeBackend, data_root: dr)
+
+      refute_received {:pull, _spec}
     end
 
     test "start writes options.json, creates + starts, returns id + 112-char token",

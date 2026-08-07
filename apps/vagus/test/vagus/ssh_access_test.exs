@@ -37,7 +37,7 @@ defmodule Vagus.SSHAccessTest do
   end
 
   test "exposes an ed25519 OpenSSH public key", %{name: name} do
-    pub = SSHAccess.public_key(name)
+    {:ok, pub} = SSHAccess.public_key(name)
     assert String.starts_with?(pub, "ssh-ed25519 ")
 
     # The line parses as a valid OpenSSH authorized_keys entry.
@@ -46,23 +46,24 @@ defmodule Vagus.SSHAccessTest do
   end
 
   test "exposes a SHA256 fingerprint matching the public key", %{name: name} do
-    fp = SSHAccess.fingerprint(name)
+    {:ok, fp} = SSHAccess.fingerprint(name)
     assert String.starts_with?(fp, "SHA256:")
 
-    [{pub_rec, _}] = :ssh_file.decode(SSHAccess.public_key(name), :auth_keys)
+    {:ok, pub} = SSHAccess.public_key(name)
+    [{pub_rec, _}] = :ssh_file.decode(pub, :auth_keys)
     assert fp == to_string(:ssh.hostkey_fingerprint(:sha256, pub_rec))
   end
 
   test "exposes an unencrypted OpenSSH private key PEM", %{name: name} do
-    priv = SSHAccess.private_key(name)
+    {:ok, priv} = SSHAccess.private_key(name)
     assert String.starts_with?(priv, "-----BEGIN OPENSSH PRIVATE KEY-----\n")
     assert String.ends_with?(priv, "-----END OPENSSH PRIVATE KEY-----\n")
   end
 
   test "the private PEM body decodes to an openssh-key-v1 blob embedding the published public point",
        %{name: name} do
-    priv = SSHAccess.private_key(name)
-    pub = SSHAccess.public_key(name)
+    {:ok, priv} = SSHAccess.private_key(name)
+    {:ok, pub} = SSHAccess.public_key(name)
 
     [{{{:ECPoint, point}, {:namedCurve, _}}, _attrs}] = :ssh_file.decode(pub, :auth_keys)
 
@@ -89,13 +90,15 @@ defmodule Vagus.SSHAccessTest do
 
     if keygen do
       tmp = Path.join(System.tmp_dir!(), "ssh_rt_#{System.unique_integer([:positive])}")
-      File.write!(tmp, SSHAccess.private_key(name))
+      {:ok, priv} = SSHAccess.private_key(name)
+      File.write!(tmp, priv)
       File.chmod!(tmp, 0o600)
       on_exit(fn -> File.rm_rf!(tmp) end)
 
       {derived, 0} = System.cmd(keygen, ["-y", "-f", tmp])
       # Compare the "<type> <base64-blob>" prefix, ignoring the comment field.
-      [type, blob | _] = String.split(SSHAccess.public_key(name), " ")
+      {:ok, pub} = SSHAccess.public_key(name)
+      [type, blob | _] = String.split(pub, " ")
       assert String.starts_with?(String.trim(derived), "#{type} #{blob}")
     end
   end
@@ -133,6 +136,68 @@ defmodule Vagus.SSHAccessTest do
     # dead. A `GenServer.call` forces synchronization and proves it's alive
     # and responsive.
     assert Process.alive?(GenServer.whereis(name))
-    assert String.starts_with?(SSHAccess.public_key(name), "ssh-ed25519 ")
+    assert {:ok, "ssh-ed25519 " <> _rest} = SSHAccess.public_key(name)
+  end
+
+  # The private key is persisted unencrypted, so the store must be provably
+  # mode 0600 before any key is generated. When it can't be, the server must
+  # neither generate nor serve one — but must also stay alive: it is a
+  # supervised child of `Vagus.Application`, and stopping would boot-loop the
+  # device over a chmod failure.
+  describe "store whose 0600 mode cannot be proven" do
+    test "a failing chmod leaves the server alive with no key" do
+      {name, _path} = start_degraded(fn _path, _mode -> {:error, :eperm} end)
+
+      assert Process.alive?(GenServer.whereis(name))
+      assert SSHAccess.public_key(name) == {:error, :unavailable}
+      assert SSHAccess.private_key(name) == {:error, :unavailable}
+      assert SSHAccess.fingerprint(name) == {:error, :unavailable}
+    end
+
+    # A chmod that reports success but doesn't take: only reading the mode
+    # back catches it.
+    test "a chmod that reports :ok but leaves the wrong mode is caught by the read-back" do
+      {name, _path} = start_degraded(fn path, _mode -> File.chmod(path, 0o644) end)
+
+      assert Process.alive?(GenServer.whereis(name))
+      assert SSHAccess.fingerprint(name) == {:error, :unavailable}
+    end
+
+    test "no keypair is ever written to the store" do
+      {_name, path} = start_degraded(fn _path, _mode -> {:error, :eperm} end)
+
+      table = :"ssh_access_readback_#{System.unique_integer([:positive])}"
+      {:ok, ^table} = :dets.open_file(table, file: to_charlist(path), type: :set)
+      on_exit(fn -> :dets.close(table) end)
+
+      assert :dets.lookup(table, :keypair) == []
+    end
+  end
+
+  # Starts an instance whose store the chmod-and-verify step will refuse,
+  # via the `:chmod_fun` seam. Returns `{server_name, dets_path}`.
+  defp start_degraded(chmod_fun) do
+    dir =
+      Path.join(System.tmp_dir!(), "ssh_access_degraded_#{System.unique_integer([:positive])}")
+
+    File.mkdir_p!(dir)
+    path = Path.join(dir, "ssh_access.dets")
+    name = :"ssh_access_degraded_srv_#{System.unique_integer([:positive])}"
+    table = :"ssh_access_degraded_#{System.unique_integer([:positive])}"
+
+    {:ok, pid} =
+      SSHAccess.start_link(name: name, table: table, dets_path: path, chmod_fun: chmod_fun)
+
+    on_exit(fn ->
+      try do
+        GenServer.stop(pid)
+      catch
+        :exit, _ -> :ok
+      end
+
+      File.rm_rf!(dir)
+    end)
+
+    {name, path}
   end
 end

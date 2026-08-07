@@ -122,6 +122,39 @@ defmodule Vagus.Core.UsersTest do
                {:ok, false}
     end
 
+    # `group_ids` must be a real list to be consulted: a scalar string would
+    # otherwise read as membership if wrapped, handing the admin gate to any
+    # malformed record Core sends.
+    test "a scalar 'system-admin' group_ids is NOT admin" do
+      users = [user(%{"id" => "scalar", "group_ids" => "system-admin"})]
+      server = start_users()
+
+      assert Users.admin?("scalar", server: server, command_fun: always({:ok, users})) ==
+               {:ok, false}
+    end
+
+    for {label, value} <- [
+          {"nil", nil},
+          {"a map", %{"0" => "system-admin"}},
+          {"a bare atom", :system_admin}
+        ] do
+      test "#{label} group_ids is not admin" do
+        users = [user(%{"id" => "weird", "group_ids" => unquote(Macro.escape(value))})]
+        server = start_users()
+
+        assert Users.admin?("weird", server: server, command_fun: always({:ok, users})) ==
+                 {:ok, false}
+      end
+    end
+
+    test "an owner with malformed group_ids is still an admin (the owner branch is independent)" do
+      users = [user(%{"id" => "owner", "is_owner" => true, "group_ids" => "system-admin"})]
+      server = start_users()
+
+      assert Users.admin?("owner", server: server, command_fun: always({:ok, users})) ==
+               {:ok, true}
+    end
+
     test "issues the config/auth/list command (WS-only, no REST equivalent)" do
       server = start_users()
       _ = Users.admin?("owner", server: server, command_fun: always({:ok, []}))

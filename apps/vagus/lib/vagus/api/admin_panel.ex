@@ -190,9 +190,13 @@ defmodule Vagus.API.AdminPanel do
   # hint about which condition failed; the reason and user id go to the log
   # instead, where an operator diagnosing "why can't I see my key" can find
   # them.
+  #
+  # The request path is deliberately NOT logged: it embeds the per-boot
+  # ingress token, a bearer capability for this panel, and RingLogger
+  # persists what is written here. Same for the query string and headers.
   defp deny(conn, reason, user_id) do
     Logger.warning(
-      "vagus admin panel: denied #{conn.method} #{conn.request_path} " <>
+      "vagus admin panel: denied #{conn.method} " <>
         "(reason=#{inspect(reason)} user_id=#{inspect(user_id)})"
     )
 
@@ -275,8 +279,15 @@ defmodule Vagus.API.AdminPanel do
     end
   end
 
+  # Two distinct "no key" conditions collapse to the same 503: a dead/absent
+  # server (exit), and a live one running degraded — `Vagus.SSHAccess`
+  # answers `{:error, :unavailable}` when its store could not be proven mode
+  # 0600, so it holds no keypair at all.
   defp safely(fun) do
-    {:ok, fun.()}
+    case fun.() do
+      {:ok, value} -> {:ok, value}
+      {:error, _reason} -> :unavailable
+    end
   catch
     :exit, _reason -> :unavailable
   end

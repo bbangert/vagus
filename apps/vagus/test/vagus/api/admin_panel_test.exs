@@ -41,9 +41,17 @@ defmodule Vagus.API.AdminPanelTest do
     end
   end
 
-  setup do
+  setup context do
     start_supervised!({Vagus.Ingress, []})
-    start_ssh_access()
+
+    # `@tag :degraded_ssh` starts `Vagus.SSHAccess` with a store it can never
+    # prove is mode 0600, so it holds no keypair at all.
+    ssh_opts =
+      if context[:degraded_ssh],
+        do: [chmod_fun: fn _path, _mode -> {:error, :eperm} end],
+        else: []
+
+    start_ssh_access(ssh_opts)
 
     Application.put_env(:vagus, :core_users, StubUsers)
     on_exit(fn -> Application.delete_env(:vagus, :core_users) end)
@@ -59,17 +67,22 @@ defmodule Vagus.API.AdminPanelTest do
 
   defp admin_checks, do: Enum.reverse(Process.get(:admin_checked, []))
 
-  defp start_ssh_access do
+  defp start_ssh_access(opts \\ []) do
     dir = Path.join(System.tmp_dir!(), "admin_panel_test_#{System.unique_integer([:positive])}")
     File.mkdir_p!(dir)
     table = :"admin_panel_ssh_#{System.unique_integer([:positive])}"
 
     start_supervised!(
-      {Vagus.SSHAccess, table: table, dets_path: Path.join(dir, "ssh_access.dets")},
+      {Vagus.SSHAccess, [table: table, dets_path: Path.join(dir, "ssh_access.dets")] ++ opts},
       id: make_ref()
     )
 
     on_exit(fn -> File.rm_rf!(dir) end)
+  end
+
+  defp fingerprint do
+    {:ok, fingerprint} = Vagus.SSHAccess.fingerprint()
+    fingerprint
   end
 
   # Drives the real dispatch path `Vagus.API.Dispatcher` uses for
@@ -130,7 +143,7 @@ defmodule Vagus.API.AdminPanelTest do
 
       assert conn.status == 200
       assert ["text/html; charset=utf-8"] = get_resp_header(conn, "content-type")
-      assert conn.resp_body =~ Vagus.SSHAccess.fingerprint()
+      assert conn.resp_body =~ fingerprint()
       assert conn.resp_body =~ Vagus.SSHAccess.key_type()
       # The instructions must state the real target.exs posture.
       assert conn.resp_body =~ "chmod 600 vagus_key"
@@ -141,7 +154,7 @@ defmodule Vagus.API.AdminPanelTest do
       conn = ingress_call("/ingress/#{token}/index.html", session: session)
 
       assert conn.status == 200
-      assert conn.resp_body =~ Vagus.SSHAccess.fingerprint()
+      assert conn.resp_body =~ fingerprint()
     end
 
     test "builds the download href from Core's X-Ingress-Path header", %{
@@ -185,7 +198,7 @@ defmodule Vagus.API.AdminPanelTest do
 
       assert conn.status == 401
       refute conn.resp_body =~ "PRIVATE KEY"
-      refute conn.resp_body =~ Vagus.SSHAccess.fingerprint()
+      refute conn.resp_body =~ fingerprint()
     end
 
     test "no ingress_session cookie is 401 for the key download", %{token: token} do
@@ -214,7 +227,7 @@ defmodule Vagus.API.AdminPanelTest do
 
       page = ingress_call("/ingress/#{token}/", session: session)
       assert page.status == 200
-      assert page.resp_body =~ Vagus.SSHAccess.fingerprint()
+      assert page.resp_body =~ fingerprint()
 
       key = ingress_call("/ingress/#{token}/key", session: session)
       assert key.status == 200
@@ -237,7 +250,7 @@ defmodule Vagus.API.AdminPanelTest do
       conn = ingress_call("/ingress/#{token}/", session: session)
 
       assert conn.status == 403
-      refute conn.resp_body =~ Vagus.SSHAccess.fingerprint()
+      refute conn.resp_body =~ fingerprint()
       assert admin_checks() == [@admin_user]
     end
 
@@ -281,7 +294,7 @@ defmodule Vagus.API.AdminPanelTest do
 
         assert page.status == 403
         assert key.status == 403
-        refute page.resp_body =~ Vagus.SSHAccess.fingerprint()
+        refute page.resp_body =~ fingerprint()
         refute key.resp_body =~ "PRIVATE KEY"
       end
     end
@@ -336,6 +349,59 @@ defmodule Vagus.API.AdminPanelTest do
 
       assert conn.status == 502
       assert admin_checks() == []
+    end
+  end
+
+  # The denial log is written to RingLogger, which persists it — so anyone
+  # who can read the logs could otherwise replay the per-boot ingress token
+  # the request path embeds.
+  describe "denial logging" do
+    test "never records the ingress token", %{session: session, token: token} do
+      stub_admin({:ok, false})
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          ingress_call("/ingress/#{token}/key", session: session)
+        end)
+
+      assert log =~ "vagus admin panel: denied"
+      assert log =~ "not_admin"
+      assert log =~ @admin_user
+      refute log =~ token
+    end
+  end
+
+  # The store could not be proven mode 0600, so `Vagus.SSHAccess` refused to
+  # generate a key. An admin must see the existing "unavailable" 503, not a
+  # 500 from a crash on the missing keypair.
+  describe "degraded Vagus.SSHAccess" do
+    @tag :degraded_ssh
+    test "the page is 503", %{session: session, token: token} do
+      stub_admin({:ok, true})
+
+      conn = ingress_call("/ingress/#{token}/", session: session)
+
+      assert conn.status == 503
+      assert conn.resp_body == "SSH access key unavailable"
+    end
+
+    @tag :degraded_ssh
+    test "the key download is 503 and carries no key material", %{session: session, token: token} do
+      stub_admin({:ok, true})
+
+      conn = ingress_call("/ingress/#{token}/key", session: session)
+
+      assert conn.status == 503
+      refute conn.resp_body =~ "PRIVATE KEY"
+      assert get_resp_header(conn, "content-disposition") == []
+    end
+
+    @tag :degraded_ssh
+    test "a non-admin is still 403, not 503", %{session: session, token: token} do
+      stub_admin({:ok, false})
+
+      conn = ingress_call("/ingress/#{token}/key", session: session)
+      assert conn.status == 403
     end
   end
 

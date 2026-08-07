@@ -106,9 +106,24 @@ defmodule Vagus.Addon.Manager do
 
   @doc """
   Ensures the `hassio` bridge (for bridged add-ons) and pulls the add-on image.
+
+  Refuses a slug Vagus reserves for itself (`Config.reserved_slug?/1`) with
+  `{:error, {:reserved_slug, slug}}`. The check belongs here rather than only
+  in `Config.parse/1` because `Vagus.API.Router`'s install handler overwrites
+  the parsed config's slug with the one from the URL — this is the single
+  choke point every install path (`Vagus.Addon.Update`,
+  `Vagus.Addon.DefaultProvider`) goes through.
   """
   @spec install(Config.t(), keyword()) :: :ok | {:error, term()}
   def install(%Config{} = config, opts \\ []) do
+    if Config.reserved_slug?(config.slug) do
+      {:error, {:reserved_slug, config.slug}}
+    else
+      do_install(config, opts)
+    end
+  end
+
+  defp do_install(%Config{} = config, opts) do
     opts = put_backend(opts, config)
     spec = build_spec(config, ensure_token(opts))
 

@@ -117,10 +117,16 @@ defmodule Vagus.Core.Users do
         do: {id, admin_user?(user)}
   end
 
+  # `group_ids` must be a real list to be consulted at all: a malformed
+  # scalar (`"system-admin"`) would otherwise read as membership. Any other
+  # shape means "not in the admin group", never admin — the owner branch is
+  # independent of it, matching Core (an owner is admin regardless).
   defp admin_user?(user) do
+    group_ids = Map.get(user, "group_ids")
+
     Map.get(user, "is_owner") == true or
-      (Map.get(user, "is_active") == true and
-         @admin_group_id in List.wrap(Map.get(user, "group_ids")))
+      (Map.get(user, "is_active") == true and is_list(group_ids) and
+         @admin_group_id in group_ids)
   end
 
   defp cached(server), do: call(server, :fetch, :miss)

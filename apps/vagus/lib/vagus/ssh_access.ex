@@ -16,10 +16,19 @@ defmodule Vagus.SSHAccess do
   existing authorized keys.
 
   The keypair is generated once and reused across reboots and firmware
-  updates — it lives in a DETS file on the writable data partition
-  (`/data/ssh_access.dets`, mode `0600`) on Nerves, and under `_build/` on
-  the host for development. Regeneration is intentionally not exposed; the
+  updates — it lives in a DETS file whose path is config-driven
+  (`config :vagus, :ssh_access_path`; `/data/ssh_access.dets` on target,
+  under `.dev/` on the host). Regeneration is intentionally not exposed; the
   key is the device's stable access identity.
+
+  ## Invariant: the store must be provably `0600`
+
+  The private key is persisted unencrypted, so a key is only ever generated,
+  loaded or served once the store file's mode has been set to `0600` **and
+  read back to confirm it**. If either step fails the server runs degraded:
+  no keypair at all, and every accessor answers `{:error, :unavailable}`.
+  It deliberately does not stop — this is a supervised child, and refusing
+  to boot over a chmod failure would take the whole device down.
 
   Boot work (keygen, authorize) runs in `handle_continue/2` so a slow or
   not-yet-ready `nerves_ssh` daemon can't stall the supervisor; authorization
@@ -34,6 +43,8 @@ defmodule Vagus.SSHAccess do
   """
 
   use GenServer
+
+  import Bitwise, only: [band: 2]
 
   require Logger
 
@@ -56,16 +67,31 @@ defmodule Vagus.SSHAccess do
     GenServer.start_link(__MODULE__, opts, name: name)
   end
 
-  @doc "The OpenSSH `authorized_keys` line for the device's access key."
-  @spec public_key(GenServer.server()) :: String.t()
+  @doc """
+  The OpenSSH `authorized_keys` line for the device's access key.
+
+  `{:error, :unavailable}` when the server is running degraded — see the
+  moduledoc's `0600` invariant.
+  """
+  @spec public_key(GenServer.server()) :: {:ok, String.t()} | {:error, :unavailable}
   def public_key(server \\ __MODULE__), do: GenServer.call(server, :public_key)
 
-  @doc "The OpenSSH-format private key PEM. Sensitive — only stream on request."
-  @spec private_key(GenServer.server()) :: String.t()
+  @doc """
+  The OpenSSH-format private key PEM. Sensitive — only stream on request.
+
+  `{:error, :unavailable}` when the server is running degraded — see the
+  moduledoc's `0600` invariant.
+  """
+  @spec private_key(GenServer.server()) :: {:ok, String.t()} | {:error, :unavailable}
   def private_key(server \\ __MODULE__), do: GenServer.call(server, :private_key)
 
-  @doc "The `SHA256:...` fingerprint of the access key's public half."
-  @spec fingerprint(GenServer.server()) :: String.t()
+  @doc """
+  The `SHA256:...` fingerprint of the access key's public half.
+
+  `{:error, :unavailable}` when the server is running degraded — see the
+  moduledoc's `0600` invariant.
+  """
+  @spec fingerprint(GenServer.server()) :: {:ok, String.t()} | {:error, :unavailable}
   def fingerprint(server \\ __MODULE__), do: GenServer.call(server, :fingerprint)
 
   @doc "Algorithm name for display, e.g. `\"ed25519\"`."
@@ -84,14 +110,45 @@ defmodule Vagus.SSHAccess do
 
     case :dets.open_file(table_name, file: to_charlist(path), type: :set) do
       {:ok, table} ->
-        # Constrain perms: the private key lives here, unencrypted.
-        _ = File.chmod(path, 0o600)
-        {:ok, %{table: table, keypair: nil}, {:continue, :ensure_key}}
+        secure_store(table, path, opts)
 
       {:error, reason} ->
         Logger.error("SSH access store failed to open #{path}: #{inspect(reason)}")
         {:stop, reason}
     end
+  end
+
+  # The private key lives here unencrypted, so the mode is both set AND read
+  # back: a `File.chmod/2` that silently fails would otherwise leave a
+  # world-readable private key. Failing either step runs degraded (no
+  # keypair, accessors answer `{:error, :unavailable}`) rather than stopping
+  # — see the moduledoc's `0600` invariant.
+  #
+  # `:chmod_fun` is a test seam for exercising both failure branches.
+  #
+  # path is config-derived (start-up opts / app env), not request input
+  # sobelow_skip ["Traversal.FileModule"]
+  defp secure_store(table, path, opts) do
+    chmod_fun = Keyword.get(opts, :chmod_fun, &File.chmod/2)
+
+    with :ok <- chmod_fun.(path, 0o600),
+         {:ok, %File.Stat{mode: mode}} <- File.stat(path),
+         0o600 <- band(mode, 0o777) do
+      {:ok, %{table: table, keypair: nil}, {:continue, :ensure_key}}
+    else
+      mode when is_integer(mode) -> degrade(table, path, "mode is 0#{Integer.to_string(mode, 8)}")
+      other -> degrade(table, path, inspect(other))
+    end
+  end
+
+  defp degrade(table, path, detail) do
+    Logger.error(
+      "SSH access store #{path} could not be proven mode 0600 (#{detail}) — " <>
+        "refusing to generate or serve an SSH access key"
+    )
+
+    :dets.close(table)
+    {:ok, %{table: nil, keypair: nil}}
   end
 
   @impl true
@@ -107,13 +164,16 @@ defmodule Vagus.SSHAccess do
 
   @impl true
   def handle_call(:public_key, _from, state),
-    do: {:reply, state.keypair.public_key, state}
+    do: {:reply, field(state, :public_key), state}
 
   def handle_call(:private_key, _from, state),
-    do: {:reply, state.keypair.private_key, state}
+    do: {:reply, field(state, :private_key), state}
 
   def handle_call(:fingerprint, _from, state),
-    do: {:reply, state.keypair.fingerprint, state}
+    do: {:reply, field(state, :fingerprint), state}
+
+  defp field(%{keypair: %Keypair{} = keypair}, name), do: {:ok, Map.fetch!(keypair, name)}
+  defp field(_state, _name), do: {:error, :unavailable}
 
   @impl true
   def handle_info({:retry_authorize, public_key, attempt}, state) do
@@ -283,11 +343,12 @@ defmodule Vagus.SSHAccess do
     Application.get_env(:vagus, :ssh_access_path) || default_dets_path()
   end
 
+  # The real paths are config-driven (`:ssh_access_path`, set per environment
+  # in config/target.exs and config/host.exs), same as every other writable
+  # path in this app. This is only the last-resort fallback for the key being
+  # unset — `mix test` (which injects `:dets_path` per instance) and a bare
+  # `mix run` on the host.
   defp default_dets_path do
-    if File.dir?("/data") do
-      "/data/ssh_access.dets"
-    else
-      Path.join([File.cwd!(), "_build", "ssh_access.dets"])
-    end
+    Path.join([File.cwd!(), "_build", "ssh_access.dets"])
   end
 end
