@@ -337,6 +337,21 @@ defmodule Vagus.API.CoreProxy.WSBridge.Upstream do
   called with an empty header list, and the credential is a JSON message
   exchanged post-upgrade instead.
 
+  ## On the unix socket there is no Core-side handshake at all (A3)
+
+  When `Vagus.Core.Transport` resolves the Supervisor↔Core socket, Core
+  treats the connection as the Supervisor user from its first frame: it
+  sends no `auth_required` and expects no `auth`. So `ha_ready?` flips as
+  soon as the WS upgrade completes (`{:done, ref}`) and `pending` is
+  flushed right there — the `auth_sent?` step simply doesn't exist on that
+  path, and the shared deadline below degenerates into a
+  connect-through-upgrade bound. Defensively, an `auth_required`/`auth_ok`/
+  `auth_invalid` frame arriving before any real traffic on the socket path
+  is swallowed rather than relayed (`skip_auth_frames?`): the CALLER has
+  already been sent this proxy's own `auth_ok` by `WSBridge`, so leaking a
+  second handshake frame into that stream would corrupt a protocol the
+  caller is entitled to see exactly once.
+
   ## The three states, tracked as two booleans
 
     * `upgraded?` — Core's 101 response has arrived and
@@ -432,6 +447,7 @@ defmodule Vagus.API.CoreProxy.WSBridge.Upstream do
   use GenServer
 
   alias Vagus.API.CoreProxy
+  alias Vagus.Core.Transport
 
   @heartbeat_interval_ms 30_000
   @core_ws_path "/api/websocket"
@@ -453,6 +469,8 @@ defmodule Vagus.API.CoreProxy.WSBridge.Upstream do
           upgraded?: boolean(),
           auth_sent?: boolean(),
           ha_ready?: boolean(),
+          implicit_auth?: boolean(),
+          skip_auth_frames?: boolean(),
           # Newest-first (prepended on each call, reversed on flush) — same
           # convention as `Vagus.Ingress.WSBridge.Upstream`'s own `pending`.
           # `pending_frames`/`pending_bytes` track its size against the W3 cap
@@ -469,10 +487,12 @@ defmodule Vagus.API.CoreProxy.WSBridge.Upstream do
 
   @impl GenServer
   @doc """
-  Connects to Core (`config :vagus, :core_base_url`, the same key the REST
-  leg reads — Core is always local, never the `hassio` bridge, so unlike
-  `Vagus.Ingress.WSBridge.Upstream` there is no `Vagus.Network.
-  source_bind_opts/1` split to make here), then sends (but does not await)
+  Connects to Core over whatever `Vagus.Core.Transport` resolves — the
+  Supervisor↔Core unix socket, else TCP `config :vagus, :core_base_url`,
+  the same resolution the REST leg makes per request. Core is always local,
+  never the `hassio` bridge, so unlike `Vagus.Ingress.WSBridge.Upstream`
+  there is no `Vagus.Network.source_bind_opts/1` split to make here. Then
+  sends (but does not await)
   the WS upgrade request to `/api/websocket` — same "connect + send happen
   in `init/1`, the 101 itself arrives asynchronously" structure as
   `Vagus.Ingress.WSBridge.Upstream.init/1`, and the same reason: blocking
@@ -487,10 +507,14 @@ defmodule Vagus.API.CoreProxy.WSBridge.Upstream do
   close after `auth_ok` has already gone to the caller.
   """
   def init(%{parent: parent}) do
-    case connect_and_upgrade() do
+    transport = Transport.current()
+
+    case connect_and_upgrade(transport) do
       {:ok, conn, ref} ->
         Process.send_after(self(), :handshake_deadline, CoreProxy.ws_auth_timeout_ms())
         Process.send_after(self(), :heartbeat, @heartbeat_interval_ms)
+
+        implicit_auth? = Transport.implicit_auth?(transport)
 
         {:ok,
          %{
@@ -503,6 +527,8 @@ defmodule Vagus.API.CoreProxy.WSBridge.Upstream do
            upgraded?: false,
            auth_sent?: false,
            ha_ready?: false,
+           implicit_auth?: implicit_auth?,
+           skip_auth_frames?: implicit_auth?,
            pending: [],
            pending_frames: 0,
            pending_bytes: 0,
@@ -517,10 +543,9 @@ defmodule Vagus.API.CoreProxy.WSBridge.Upstream do
     end
   end
 
-  defp connect_and_upgrade do
-    uri = URI.parse(core_base_url())
-    http_scheme = if uri.scheme == "https", do: :https, else: :http
-    ws_scheme = if http_scheme == :https, do: :wss, else: :ws
+  defp connect_and_upgrade(transport) do
+    {http_scheme, address, port} = Transport.connect_args(transport)
+    ws_scheme = Transport.ws_scheme(transport)
 
     connect_opts = [
       mode: :active,
@@ -537,7 +562,9 @@ defmodule Vagus.API.CoreProxy.WSBridge.Upstream do
       transport_opts: [send_timeout: core_ws_send_timeout_ms(), send_timeout_close: true]
     ]
 
-    case Mint.HTTP.connect(http_scheme, uri.host, uri.port, connect_opts) do
+    connect_opts = connect_opts ++ Transport.connect_opts(transport)
+
+    case Mint.HTTP.connect(http_scheme, address, port, connect_opts) do
       {:ok, conn} ->
         case Mint.WebSocket.upgrade(ws_scheme, conn, @core_ws_path, []) do
           {:ok, conn, ref} ->
@@ -553,9 +580,7 @@ defmodule Vagus.API.CoreProxy.WSBridge.Upstream do
     end
   end
 
-  defp core_base_url, do: Application.get_env(:vagus, :core_base_url, "http://localhost:8123")
-
-  # issue #37: the Mint socket's own `send_timeout` — see `connect_and_upgrade/0`.
+  # issue #37: the Mint socket's own `send_timeout` — see `connect_and_upgrade/1`.
   defp core_ws_send_timeout_ms, do: Application.get_env(:vagus, :core_ws_send_timeout, 5_000)
 
   ## Caller frames (called from `WSBridge.handle_in/2`)
@@ -691,11 +716,18 @@ defmodule Vagus.API.CoreProxy.WSBridge.Upstream do
   defp process_response({:done, ref}, %{ref: ref, upgraded?: false} = state) do
     case Mint.WebSocket.new(state.conn, ref, state.status, state.resp_headers) do
       {:ok, conn, websocket} ->
-        # Deliberately NOT flushed yet, unlike `Vagus.Ingress.WSBridge.
-        # Upstream`'s own `:done` clause — `ha_ready?` (Core's own
-        # `auth_ok`), not `upgraded?` alone, is the real "ready" gate here.
-        # See moduledoc's "three states" section.
-        {:continue, %{state | conn: conn, websocket: websocket, upgraded?: true}}
+        # On TCP, deliberately NOT flushed yet, unlike `Vagus.Ingress.
+        # WSBridge.Upstream`'s own `:done` clause — `ha_ready?` (Core's own
+        # `auth_ok`), not `upgraded?` alone, is the real "ready" gate. On
+        # the socket there is no Core-side handshake to wait for, so the
+        # two gates coincide and this IS the flush point (see moduledoc).
+        upgraded = %{state | conn: conn, websocket: websocket, upgraded?: true}
+
+        if upgraded.implicit_auth? do
+          flush_pending(%{upgraded | ha_ready?: true})
+        else
+          {:continue, upgraded}
+        end
 
       {:error, conn, _reason} ->
         send(state.parent, {:upstream_close, 1011, ""})
@@ -772,6 +804,23 @@ defmodule Vagus.API.CoreProxy.WSBridge.Upstream do
     end
   end
 
+  # Socket path only (`skip_auth_frames?` is false everywhere else): swallow
+  # a handshake frame Core is not expected to send at all, rather than
+  # relaying a second `auth_required`/`auth_ok` into a caller stream that has
+  # already had its own (see moduledoc). The first frame that isn't one drops
+  # the filter for the rest of the connection, so this costs one extra
+  # `Jason.decode/1` on at most the first frames.
+  defp handle_frames(
+         [{:text, data} | rest] = frames,
+         %{ha_ready?: true, skip_auth_frames?: true} = state
+       ) do
+    if auth_frame?(data) do
+      handle_frames(rest, state)
+    else
+      handle_frames(frames, %{state | skip_auth_frames?: false})
+    end
+  end
+
   defp handle_frames([{:text, data} | rest], %{ha_ready?: true} = state) do
     send(state.parent, {:relay, :text, data})
     handle_frames(rest, state)
@@ -814,6 +863,13 @@ defmodule Vagus.API.CoreProxy.WSBridge.Upstream do
     state = ack_close(state, code || 1000)
     Mint.HTTP.close(state.conn)
     {:stop, state}
+  end
+
+  defp auth_frame?(data) do
+    case Jason.decode(data) do
+      {:ok, %{"type" => type}} -> type in ~w(auth_required auth_ok auth_invalid)
+      _not_a_handshake_frame -> false
+    end
   end
 
   defp send_core_auth(state) do

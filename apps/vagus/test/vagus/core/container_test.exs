@@ -17,11 +17,15 @@ defmodule Vagus.Core.ContainerTest do
       assert config == %{
                "Image" => "ghcr.io/home-assistant/home-assistant:2026.7.0",
                "Hostname" => "homeassistant",
+               "Labels" => %{
+                 Container.spec_fingerprint_label() => Container.spec_fingerprint(config)
+               },
                "Env" => [
                  "SUPERVISOR=#{@ip}",
                  "HASSIO=#{@ip}",
                  "SUPERVISOR_TOKEN=test-token",
                  "HASSIO_TOKEN=test-token",
+                 "SUPERVISOR_CORE_API_SOCKET=/run/supervisor/core.sock",
                  "TZ=UTC"
                ],
                "HostConfig" => %{
@@ -52,6 +56,12 @@ defmodule Vagus.Core.ContainerTest do
                      "ReadOnly" => true
                    },
                    %{
+                     "Type" => "bind",
+                     "Source" => "/run/supervisor",
+                     "Target" => "/run/supervisor",
+                     "ReadOnly" => false
+                   },
+                   %{
                      "Type" => "volume",
                      "Source" => "vagus-core-config",
                      "Target" => "/config"
@@ -71,6 +81,111 @@ defmodule Vagus.Core.ContainerTest do
       config = Container.create_config("2026.7.0")
 
       assert "SUPERVISOR_TOKEN=#{Vagus.API.Token.get()}" in config["Env"]
+    end
+  end
+
+  describe "the Supervisor socket (Phase A1)" do
+    test "socket_dir/0 + socket_path/0 are the upstream paths" do
+      assert Container.socket_dir() == "/run/supervisor"
+      assert Container.socket_path() == "/run/supervisor/core.sock"
+    end
+
+    test "the socket dir is bind-mounted writable, same path on both sides" do
+      config = Container.create_config("2026.7.0", token: "test-token")
+
+      assert %{
+               "Type" => "bind",
+               "Source" => "/run/supervisor",
+               "Target" => "/run/supervisor",
+               "ReadOnly" => false
+             } in config["HostConfig"]["Mounts"]
+    end
+
+    test "SUPERVISOR_CORE_API_SOCKET points at socket_path/0" do
+      config = Container.create_config("2026.7.0", token: "test-token")
+
+      assert "SUPERVISOR_CORE_API_SOCKET=#{Container.socket_path()}" in config["Env"]
+    end
+  end
+
+  describe "spec_fingerprint/1" do
+    test "is pure: the same spec always hashes to the same value" do
+      config = Container.create_config("2026.7.0", token: "test-token")
+
+      assert Container.spec_fingerprint(config) == Container.spec_fingerprint(config)
+
+      assert Container.spec_fingerprint(config) ==
+               Container.spec_fingerprint(
+                 Container.create_config("2026.7.0", token: "test-token")
+               )
+    end
+
+    test "is a lowercase hex digest" do
+      config = Container.create_config("2026.7.0", token: "test-token")
+
+      assert Container.spec_fingerprint(config) =~ ~r/\A[0-9a-f]{32}\z/
+    end
+
+    test "ignores the Labels key it is itself stamped into" do
+      config = Container.create_config("2026.7.0", token: "test-token")
+
+      assert Container.spec_fingerprint(Map.delete(config, "Labels")) ==
+               Container.spec_fingerprint(config)
+
+      assert Container.spec_fingerprint(Map.put(config, "Labels", %{"other" => "value"})) ==
+               Container.spec_fingerprint(config)
+    end
+
+    test "ignores map key ordering (canonicalized before hashing)" do
+      config = Container.create_config("2026.7.0", token: "test-token")
+
+      reordered =
+        config
+        |> Map.delete("HostConfig")
+        |> Map.put("HostConfig", config["HostConfig"])
+
+      assert Container.spec_fingerprint(reordered) == Container.spec_fingerprint(config)
+    end
+
+    test "changes with the image, env, and mounts" do
+      base = Container.create_config("2026.7.0", token: "test-token")
+      fingerprint = Container.spec_fingerprint(base)
+
+      refute Container.spec_fingerprint(Container.create_config("2026.8.0", token: "test-token")) ==
+               fingerprint
+
+      refute Container.spec_fingerprint(Container.create_config("2026.7.0", token: "other-token")) ==
+               fingerprint
+
+      refute Container.spec_fingerprint(
+               Container.create_config("2026.7.0", token: "test-token", tz: "Europe/Berlin")
+             ) == fingerprint
+
+      dropped_mount =
+        update_in(base, ["HostConfig", "Mounts"], fn [_socket | rest] -> rest end)
+
+      refute Container.spec_fingerprint(dropped_mount) == fingerprint
+    end
+
+    test "list order is significant (a reordered Env is a different spec)" do
+      config = Container.create_config("2026.7.0", token: "test-token")
+      reversed = Map.put(config, "Env", Enum.reverse(config["Env"]))
+
+      refute Container.spec_fingerprint(reversed) == Container.spec_fingerprint(config)
+    end
+  end
+
+  describe "create_config/2 fingerprint label" do
+    test "stamps the fingerprint of the spec it just built" do
+      config = Container.create_config("2026.7.0", token: "test-token")
+
+      assert config["Labels"] == %{
+               Container.spec_fingerprint_label() => Container.spec_fingerprint(config)
+             }
+    end
+
+    test "the label key is namespaced" do
+      assert Container.spec_fingerprint_label() == "io.vagus.spec-fingerprint"
     end
   end
 

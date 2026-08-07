@@ -46,6 +46,14 @@ defmodule Vagus.API.CoreProxy do
 
   ## Why the proxy calls Core as the Supervisor user (fact 3)
 
+  On the Supervisor↔Core unix socket (`Vagus.Core.Transport`) that
+  credential is the connection itself: Core reads every socket request as
+  the Supervisor user, so no `Authorization` header is sent and no access
+  token is resolved at all (the request no longer fails with 502 just
+  because no refresh token has been posted yet). On the TCP fallback the
+  bearer token below is still what makes the call Supervisor-privileged.
+  Either way the caller's own credential never reaches Core.
+
   Upstream issues the proxied request via `sys_homeassistant.api.make_request`
   — the Supervisor's own credentials, not the caller's. So an add-on holding
   `homeassistant_api: true` acts on Core's REST API **as the Supervisor**,
@@ -130,7 +138,7 @@ defmodule Vagus.API.CoreProxy do
   import Plug.Conn
 
   alias Vagus.Addon.Registry
-  alias Vagus.Core.{Client, Health}
+  alias Vagus.Core.{Client, Health, Transport}
 
   @finch Vagus.API.CoreProxy.Finch
 
@@ -189,13 +197,18 @@ defmodule Vagus.API.CoreProxy do
   # can intercept `rest == ["websocket"]` before it ever reaches
   # `check_route/2`'s generic clause.
   defp call_rest(conn, family, rest) do
+    # Resolved once per request and threaded through, so the URL, the
+    # credential decision and the pool can't disagree about which transport
+    # this request is on (`Vagus.Core.Transport`).
+    transport = Transport.current()
+
     with :ok <- check_route(conn, family, rest),
          {:ok, token} <- extract_token(conn),
          {:ok, identity} <- resolve_addon(token),
          :ok <- check_homeassistant_api(identity),
          :ok <- check_core_health(),
-         {:ok, access_token} <- core_access_token() do
-      proxy_request(conn, rest, access_token)
+         {:ok, credential} <- core_credential(transport) do
+      proxy_request(conn, rest, credential, transport)
     else
       {:error, :not_found} -> send_plain(conn, 404, "Not Found")
       {:error, :method_not_allowed} -> send_plain(conn, 405, "Method Not Allowed")
@@ -394,7 +407,12 @@ defmodule Vagus.API.CoreProxy do
   # cheap cached-token read) is the only thing borrowed from `Client`;
   # transport for the proxied request itself is a per-request
   # `Finch.stream_while/5` call, below.
-  defp core_access_token do
+  # A3: the socket IS the credential (implicit Supervisor-user auth), so
+  # there is nothing to resolve and nothing that can fail — `nil` here means
+  # "send no `authorization` header", not "unauthenticated".
+  defp core_credential({:socket, _path}), do: {:ok, nil}
+
+  defp core_credential({:tcp, _base_url}) do
     fun = Application.get_env(:vagus, :core_proxy_access_token_fun, &default_access_token/0)
 
     case fun.() do
@@ -438,11 +456,11 @@ defmodule Vagus.API.CoreProxy do
   # (upstream `timeout=None`) and is flagged in `acc` so `do_handle_event/2`
   # knows to force-stream with the request's own content-type rather than
   # deciding via Core's response (see moduledoc).
-  defp proxy_request(conn, rest, access_token) do
+  defp proxy_request(conn, rest, credential, transport) do
     {conn, body, ref} = build_request_body(conn)
-    url = build_url(rest, conn.query_string)
-    headers = build_request_headers(conn, access_token)
-    request = Finch.build(conn.method, url, headers, body)
+    path = build_path(rest, conn.query_string)
+    headers = build_request_headers(conn, credential)
+    request = Transport.build(transport, conn.method, path, headers, body)
     stream_route? = rest == ["stream"]
 
     acc = %{
@@ -480,21 +498,25 @@ defmodule Vagus.API.CoreProxy do
     end
   end
 
-  # `core_base_url()` <> "/api/" <> the `rest` segments, joined VERBATIM —
-  # never percent-decoded/re-encoded. Same [VERIFIED] reasoning as
+  # "/api/" <> the `rest` segments, joined VERBATIM — never
+  # percent-decoded/re-encoded. Same [VERIFIED] reasoning as
   # `Vagus.API.IngressProxy.build_url/4`: `path_info` arrives already exactly
   # as percent-encoded as the original request line (`Plug.Conn.Adapter`'s
   # `split_path/1` never calls `URI.decode`), so re-encoding here would
   # double-encode any existing `%XX` escape. `rest == []` joins to `""`,
   # giving Core the path `/api/` for `GET /core/api/` — matching fact 9's
-  # bare-root route exactly.
-  defp build_url(rest, query_string) do
-    base = core_base_url() <> "/api/" <> Enum.join(rest, "/")
-    if query_string == "", do: base, else: base <> "?" <> query_string
+  # bare-root route exactly. The origin (socket or `:core_base_url`) is
+  # `Vagus.Core.Transport.build/5`'s half of this.
+  defp build_path(rest, query_string) do
+    path = "/api/" <> Enum.join(rest, "/")
+    if query_string == "", do: path, else: path <> "?" <> query_string
   end
 
-  defp core_base_url, do: Application.get_env(:vagus, :core_base_url, "http://localhost:8123")
-
+  # One Finch instance, but Finch keys its pools by
+  # `{scheme, host, port, tag}` — and a `unix_socket:` request's host is
+  # `{:local, path}` — so socket-borne proxied requests get their own
+  # dedicated pool inside this same supervisor, never sharing connections
+  # with the TCP fallback's.
   defp finch_pool, do: Application.get_env(:vagus, :core_proxy_finch, @finch)
 
   # Fact 4's allowlist, plus `content-type` (passed separately upstream) plus
@@ -502,7 +524,7 @@ defmodule Vagus.API.CoreProxy do
   # `authorization`/`x-ha-access` is never in `@request_header_allowlist`, so
   # it is dropped here rather than forwarded — Core must only ever see the
   # Supervisor's own credential, never the caller's.
-  defp build_request_headers(conn, access_token) do
+  defp build_request_headers(conn, credential) do
     allowed =
       Enum.filter(conn.req_headers, fn {k, _v} -> k in @request_header_allowlist end)
 
@@ -512,7 +534,12 @@ defmodule Vagus.API.CoreProxy do
         [] -> []
       end
 
-    allowed ++ content_type ++ [{"authorization", "Bearer " <> access_token}]
+    # `nil` credential = the socket path's implicit Supervisor-user auth
+    # (fact 3 + A3): no header at all, exactly as upstream sends none.
+    authorization =
+      if credential, do: [{"authorization", "Bearer " <> credential}], else: []
+
+    allowed ++ content_type ++ authorization
   end
 
   # Same detection `Vagus.API.IngressProxy.has_body?/1` uses: an HTTP/1.1

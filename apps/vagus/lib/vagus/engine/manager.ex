@@ -16,6 +16,14 @@ defmodule Vagus.Engine.Manager do
 
   On the **first** transition into `:internet` this GenServer:
 
+    0. Creates `Vagus.Core.Container.socket_dir/0` (`/run/supervisor`), the
+       bind-mount source for the socket Core opens as
+       `SUPERVISOR_CORE_API_SOCKET`. `/run` is tmpfs, so the directory is
+       gone after every boot and must be back *before* the daemon starts:
+       the daemon immediately revives Core's `unless-stopped` container, and
+       a bind mount whose source is missing fails the container start
+       outright. Idempotent + best-effort (logged, non-blocking) like
+       `/run/resolv.conf` below.
     1. Writes `/run/resolv.conf` (`Vagus.Engine.ResolvConf`) from
        vintage_net's `["name_servers"]` property, with a static fallback —
        *before* starting the daemon, because balena-engine and the
@@ -55,6 +63,7 @@ defmodule Vagus.Engine.Manager do
 
   require Logger
 
+  alias Vagus.Core.Container
   alias Vagus.Engine.ResolvConf
 
   @connection_property ["connection"]
@@ -168,6 +177,7 @@ defmodule Vagus.Engine.Manager do
     Logger.info("Vagus.Engine.Manager: internet reached, starting balena-engine-daemon")
 
     make_root_shared()
+    ensure_core_socket_dir(Container.socket_dir())
 
     case current_name_servers() |> ResolvConf.write() do
       :ok ->
@@ -213,6 +223,56 @@ defmodule Vagus.Engine.Manager do
     end
   rescue
     e -> Logger.warning("Vagus.Engine.Manager: make-rshared / errored: #{Exception.message(e)}")
+  end
+
+  @doc """
+  Creates the `#{Container.socket_dir()}` bind-mount source Core opens its
+  `SUPERVISOR_CORE_API_SOCKET` in (see `Vagus.Core.Container`), mode `0700`.
+
+  Public for tests only — `start_daemon/1` calls it for the real
+  `Vagus.Core.Container.socket_dir/0` before the daemon comes up.
+
+  `mkdir_p`'s umask-derived default is `0755`, i.e. world-traversable, which
+  would leave the confidentiality of a socket that carries Home Assistant
+  passwords (`Vagus.Auth`) entirely to whatever mode Core happens to give
+  it. `0700` is a Vagus-side backstop that survives a Core-side chmod; root
+  on both sides of the mount namespace still reaches it.
+
+  Best-effort like `make_root_shared/0`: a failure here breaks Core's start,
+  but refusing to start the engine over it would break everything else too.
+  A failed chmod is logged and left — a `0755` socket dir is worse than
+  `0700`, not worse than no Core at all.
+  """
+  # The path is a module constant (`Vagus.Core.Container.socket_dir/0`), not
+  # request input — no caller can influence it. The arity-1 seam is called
+  # with a test temp dir, never with anything reaching a request.
+  # sobelow_skip ["Traversal.FileModule"]
+  @spec ensure_core_socket_dir(String.t()) :: :ok
+  def ensure_core_socket_dir(dir) do
+    case File.mkdir_p(dir) do
+      :ok ->
+        chmod_core_socket_dir(dir)
+
+      {:error, reason} ->
+        Logger.error(
+          "Vagus.Engine.Manager: failed to create #{dir} " <>
+            "(#{inspect(reason)}), Core's Supervisor socket mount will fail"
+        )
+    end
+  end
+
+  # sobelow_skip ["Traversal.FileModule"]
+  defp chmod_core_socket_dir(dir) do
+    case File.chmod(dir, 0o700) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Logger.error(
+          "Vagus.Engine.Manager: failed to chmod 0700 #{dir} (#{inspect(reason)}) — " <>
+            "the Supervisor↔Core socket directory is left world-traversable"
+        )
+    end
   end
 
   defp monitor_daemon(state, pid) do

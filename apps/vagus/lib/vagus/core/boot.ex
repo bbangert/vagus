@@ -22,19 +22,28 @@ defmodule Vagus.Core.Boot do
 
     * `{:adopted, info}` → info log, including the container id (short
       form) — the hand-made/previously-running Core container was found
-      and adopted as-is. If the adopted container is NOT running
-      (`info["State"]["Running"] != true`), a second info log follows and
-      `opts[:start]` (default `fn -> Vagus.Core.Lifecycle.start() end`) is
-      called to bring it up — a warning is logged if that returns
-      anything other than `:ok` (no retry loop in v1). This exists
-      because of issue #46: since #44's graceful-shutdown facade
-      (`Vagus.Host.Shutdown`) `docker stop`s Core before reboot, the
-      engine marks it manually-stopped, and its `unless-stopped` restart
-      policy deliberately never revives a manually-stopped container —
-      without this, every graceful reboot would leave Core `exited`
-      forever. Upstream Supervisor parity is to always bring Core up at
-      boot; a running adopted container keeps today's exact behavior (the
-      first info log only, no `:start` call).
+      and adopted. `opts[:start]` (default
+      `fn -> Vagus.Core.Lifecycle.start() end`) is then called
+      **unconditionally**, running or not — a warning is logged if it
+      returns anything other than `:ok` (no retry loop in v1). A stopped
+      container is what issue #46 is about: since #44's graceful-shutdown
+      facade (`Vagus.Host.Shutdown`) `docker stop`s Core before reboot,
+      the engine marks it manually-stopped, and its `unless-stopped`
+      restart policy deliberately never revives a manually-stopped
+      container — without this, every graceful reboot would leave Core
+      `exited` forever.
+
+      **Deviation from upstream `attach()` parity, deliberate**: upstream
+      never reconciles a container it found already running, and until
+      this change neither did this module. But `Vagus.Core.Lifecycle`'s
+      spec fingerprint (Phase A1 of the core-socket-port80 plan) is what
+      makes an env/mount change — the Supervisor socket mount, say —
+      actually reach a device, and the engine's own restart policy revives
+      the OLD-spec container before this module ever runs. Gating the
+      reconcile on "stopped" therefore meant a fleet on OTA would never
+      heal spec drift at all. `Lifecycle.start/1` on a running,
+      fingerprint-matching container is one `inspect` and `:ok`, so the
+      unconditional call costs a single Engine-API round trip per boot.
     * `:absent` → **warning** log. This module NEVER creates the Core
       container itself — v1 deliberately leaves that to an explicit
       `POST /core/start` or `POST /core/update` call (Phase 3), so an
@@ -110,7 +119,7 @@ defmodule Vagus.Core.Boot do
     case adopt.() do
       {:adopted, info} ->
         Logger.info("Vagus.Core.Boot: adopted Core container #{short_id(info)}")
-        maybe_start_stopped(info, start)
+        start_adopted(info, start)
 
       :absent ->
         Logger.warning(
@@ -123,24 +132,27 @@ defmodule Vagus.Core.Boot do
     end
   end
 
-  # A running adopted container is left exactly as-is — upstream `attach()`
-  # never reconciles a running container either (see moduledoc).
-  defp maybe_start_stopped(info, start) do
-    unless adopted_running?(info) do
-      Logger.info(
-        "Vagus.Core.Boot: adopted stopped Core container #{short_id(info)} — starting " <>
-          "(left stopped by the pre-reboot graceful shutdown, issue #46)"
-      )
+  # Runs for a running container too — see the moduledoc's "Deviation from
+  # upstream `attach()` parity" note.
+  defp start_adopted(info, start) do
+    Logger.info(start_message(info))
 
-      case start.() do
-        :ok ->
-          :ok
+    case start.() do
+      :ok ->
+        :ok
 
-        other ->
-          Logger.warning(
-            "Vagus.Core.Boot: start failed for #{short_id(info)} (#{inspect(other)})"
-          )
-      end
+      other ->
+        Logger.warning("Vagus.Core.Boot: start failed for #{short_id(info)} (#{inspect(other)})")
+    end
+  end
+
+  defp start_message(info) do
+    if adopted_running?(info) do
+      "Vagus.Core.Boot: reconciling running Core container #{short_id(info)} against " <>
+        "the current container spec"
+    else
+      "Vagus.Core.Boot: adopted stopped Core container #{short_id(info)} — starting " <>
+        "(left stopped by the pre-reboot graceful shutdown, issue #46)"
     end
   end
 

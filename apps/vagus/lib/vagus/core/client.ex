@@ -21,9 +21,27 @@ defmodule Vagus.Core.Client do
   returns `{:error, reason}` from `access_token/1`/`request/3`, including
   the case where no refresh token has been posted yet
   (`{:error, :no_refresh_token}`).
+
+  ## Transport (`Vagus.Core.Transport`)
+
+  Every request here — the token exchange included — rides the
+  Supervisor↔Core unix socket when it exists, and falls back to TCP
+  `:core_base_url` when it doesn't. The transport is resolved once per
+  request, so a socket that appears (Core started) or disappears (Core
+  recreated) is picked up by the next call with nothing to invalidate.
+
+  On the socket, Core authenticates the caller as the Supervisor user
+  implicitly: `request/3` sends **no** `Authorization` header at all, and
+  since there is no bearer token in play there is nothing to invalidate and
+  re-exchange, so the 401-retry-once dance is TCP-only — a socket-path 401
+  is returned to the caller as an ordinary response. The token machinery
+  itself stays live regardless (Core's WS API on the TCP fallback, and
+  `Vagus.API.CoreProxy`, still need real tokens).
   """
 
   use GenServer
+
+  alias Vagus.Core.Transport
 
   @default_finch Vagus.Core.Finch
 
@@ -67,10 +85,14 @@ defmodule Vagus.Core.Client do
   end
 
   @doc """
-  Issues an authenticated request against `{core_base}\#{path}`, retrying
-  exactly once on a `401` (clears the cached token, re-exchanges, retries
-  with the new token). Not called anywhere yet — a seam for future Core
-  calls that need auth (e.g. WS-adjacent REST calls).
+  Issues a request against `path` on whichever transport is live
+  (`Vagus.Core.Transport`).
+
+  Over the socket the request carries no credential at all (Core reads it
+  as the Supervisor user) and is issued exactly once. Over TCP it is
+  authenticated with the cached access token and retried exactly once on a
+  `401` (clears the cached token, re-exchanges, retries with the new
+  token).
 
   `opts`:
 
@@ -113,14 +135,38 @@ defmodule Vagus.Core.Client do
   end
 
   def handle_call({:request, method, path, headers, body}, _from, state) do
+    state
+    |> transport()
+    |> dispatch_request(method, path, headers, body, state)
+  end
+
+  @impl GenServer
+  def handle_cast(:invalidate, state) do
+    {:noreply, %{state | access_token: nil, issued_at: nil, expires_in: nil}}
+  end
+
+  ## Internals
+
+  # Socket: implicit Supervisor-user auth, so no token is fetched, none is
+  # sent, and a 401 (which can only mean something other than "our token
+  # went stale") is handed back as an ordinary response rather than
+  # triggering a re-exchange that has nothing to exchange.
+  defp dispatch_request({:socket, _path} = transport, method, path, headers, body, state) do
+    case do_request(transport, method, path, headers, body, nil, state) do
+      {:ok, response, new_state} -> {:reply, {:ok, response}, new_state}
+      {:error, reason, new_state} -> {:reply, {:error, reason}, new_state}
+    end
+  end
+
+  defp dispatch_request({:tcp, _base_url} = transport, method, path, headers, body, state) do
     case ensure_token(state) do
       {:error, reason, new_state} ->
         {:reply, {:error, reason}, new_state}
 
       {:ok, token, new_state} ->
-        case do_request(method, path, headers, body, token, new_state) do
-          {:unauthorized, retry_state} ->
-            retry_once(method, path, headers, body, retry_state)
+        case do_request(transport, method, path, headers, body, token, new_state) do
+          {:ok, %Finch.Response{status: 401}, retry_state} ->
+            retry_once(transport, method, path, headers, body, retry_state)
 
           {:ok, response, new_state2} ->
             {:reply, {:ok, response}, new_state2}
@@ -131,14 +177,7 @@ defmodule Vagus.Core.Client do
     end
   end
 
-  @impl GenServer
-  def handle_cast(:invalidate, state) do
-    {:noreply, %{state | access_token: nil, issued_at: nil, expires_in: nil}}
-  end
-
-  ## Internals
-
-  defp retry_once(method, path, headers, body, state) do
+  defp retry_once(transport, method, path, headers, body, state) do
     cleared = %{state | access_token: nil, issued_at: nil, expires_in: nil}
 
     case ensure_token(cleared) do
@@ -146,13 +185,20 @@ defmodule Vagus.Core.Client do
         {:reply, {:error, reason}, final_state}
 
       {:ok, token, final_state} ->
-        case do_request(method, path, headers, body, token, final_state) do
-          {:unauthorized, again_state} -> {:reply, {:error, :unauthorized}, again_state}
-          {:ok, response, again_state} -> {:reply, {:ok, response}, again_state}
-          {:error, reason, again_state} -> {:reply, {:error, reason}, again_state}
+        case do_request(transport, method, path, headers, body, token, final_state) do
+          {:ok, %Finch.Response{status: 401}, again_state} ->
+            {:reply, {:error, :unauthorized}, again_state}
+
+          {:ok, response, again_state} ->
+            {:reply, {:ok, response}, again_state}
+
+          {:error, reason, again_state} ->
+            {:reply, {:error, reason}, again_state}
         end
     end
   end
+
+  defp transport(state), do: Transport.current(base_url: state.core_base_url)
 
   defp ensure_token(state) do
     if valid?(state) do
@@ -181,9 +227,10 @@ defmodule Vagus.Core.Client do
       URI.encode_query(%{"grant_type" => "refresh_token", "refresh_token" => refresh_token})
 
     request =
-      Finch.build(
+      Transport.build(
+        transport(state),
         :post,
-        state.core_base_url <> "/auth/token",
+        "/auth/token",
         [{"content-type", "application/x-www-form-urlencoded"}],
         body
       )
@@ -225,19 +272,23 @@ defmodule Vagus.Core.Client do
     end
   end
 
-  defp do_request(method, path, headers, body, token, state) do
+  defp do_request(transport, method, path, headers, body, token, state) do
     request =
-      Finch.build(
-        method,
-        state.core_base_url <> path,
-        [{"authorization", "Bearer " <> token} | headers],
-        body
-      )
+      Transport.build(transport, method, path, auth_headers(transport, headers, token), body)
 
     case Finch.request(request, state.finch_name) do
-      {:ok, %Finch.Response{status: 401}} -> {:unauthorized, state}
       {:ok, response} -> {:ok, response, state}
       {:error, reason} -> {:error, reason, state}
+    end
+  end
+
+  # The A3 rule, in one place: a bearer token on TCP, nothing at all on the
+  # socket (Core reads the peer as the Supervisor user itself).
+  defp auth_headers(transport, headers, token) do
+    if Transport.implicit_auth?(transport) do
+      headers
+    else
+      [{"authorization", "Bearer " <> token} | headers]
     end
   end
 

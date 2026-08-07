@@ -119,6 +119,74 @@ defmodule Vagus.API.CoreProxyWSTest.CoreHandshakeHandler do
   defp encode(map), do: Jason.encode!(map)
 end
 
+defmodule Vagus.API.CoreProxyWSTest.CoreSocketHandler do
+  @moduledoc """
+  Core's `/api/websocket` as it behaves on the Supervisor unix socket (A3):
+  the peer is already the Supervisor user, so nothing is pushed on connect
+  and no `auth` message is expected — anything auth-shaped that arrives is
+  reported to the test process. `"hello"` answers `"world"` (same
+  crossed-the-bridge proof as `CoreHandshakeHandler`);
+  `"auth-then-hello"` pushes an `auth_ok` frame BEFORE `"world"`, so a test
+  can prove the bridge swallows a handshake frame instead of relaying a
+  second one to a caller that already had its own.
+  """
+  @behaviour WebSock
+
+  @impl WebSock
+  def init(%{test_pid: test_pid} = state) do
+    send(test_pid, {:core_socket_init, self()})
+    {:ok, state}
+  end
+
+  @impl WebSock
+  def handle_in({"hello", opcode: :text}, state), do: {:push, {:text, "world"}, state}
+
+  def handle_in({"auth-then-hello", opcode: :text}, state) do
+    auth_ok = Jason.encode!(%{"type" => "auth_ok", "ha_version" => "2026.8.0"})
+    {:push, [{:text, auth_ok}, {:text, "world"}], state}
+  end
+
+  def handle_in({data, opcode: :text}, %{test_pid: test_pid} = state) do
+    case Jason.decode(data) do
+      {:ok, %{"type" => "auth"}} -> send(test_pid, {:core_socket_unexpected_auth, data})
+      _other -> :ok
+    end
+
+    {:push, {:text, data}, state}
+  end
+
+  def handle_in({data, opcode: :binary}, state), do: {:push, {:binary, data}, state}
+
+  @impl WebSock
+  def handle_control(_frame, state), do: {:ok, state}
+
+  @impl WebSock
+  def handle_info(_msg, state), do: {:ok, state}
+
+  @impl WebSock
+  def terminate(_reason, _state), do: :ok
+end
+
+defmodule Vagus.API.CoreProxyWSTest.FakeCoreSocket do
+  @moduledoc "Routes `/api/websocket` to the handshake-free `CoreSocketHandler`."
+  use Plug.Router
+
+  alias Vagus.API.CoreProxyWSTest.{CoreSocketHandler, DialCounter}
+
+  plug(:match)
+  plug(:dispatch)
+
+  get "/api/websocket" do
+    DialCounter.bump()
+    test_pid = Application.fetch_env!(:vagus, :core_ws_test_pid)
+    WebSockAdapter.upgrade(conn, CoreSocketHandler, %{test_pid: test_pid}, timeout: 30_000)
+  end
+
+  match _ do
+    send_resp(conn, 404, "not found")
+  end
+end
+
 defmodule Vagus.API.CoreProxyWSTest.FakeCore do
   @moduledoc "Stands in for Home Assistant Core's WS API: the single `/api/websocket` route bumps `DialCounter` (proving a real dial happened) then upgrades to `CoreHandshakeHandler`."
   use Plug.Router
@@ -782,5 +850,118 @@ defmodule Vagus.API.CoreProxyWSTest do
     end
   rescue
     _ -> :error
+  end
+
+  ## 8. The Supervisor↔Core unix socket (A2/A3)
+
+  # Points `Vagus.Core.Transport` at a handshake-free fake Core on a real
+  # unix socket. The TCP fake Core from `setup` stays up on `:core_base_url`
+  # and shares `DialCounter`, so a dial landing on the wrong one would still
+  # be visible.
+  defp start_core_socket do
+    path =
+      Path.join(
+        System.tmp_dir!(),
+        "vagus_core_ws_#{System.unique_integer([:positive])}.sock"
+      )
+
+    start_supervised!(
+      {Bandit,
+       plug: Vagus.API.CoreProxyWSTest.FakeCoreSocket,
+       port: 0,
+       thousand_island_options: [num_acceptors: 1, transport_options: [ip: {:local, path}]]},
+      id: :fake_core_socket_bandit
+    )
+
+    Application.put_env(:vagus, :core_socket_path, path)
+
+    on_exit(fn ->
+      Application.put_env(:vagus, :core_socket_path, nil)
+      File.rm(path)
+    end)
+
+    path
+  end
+
+  # The caller-facing half is unchanged by the transport: this proxy still
+  # runs Core's handshake against the CALLER itself (fact 8).
+  defp authenticate_caller(host, port, token) do
+    {:ok, client, _headers} = Client.connect(host, port, "/core/websocket")
+    {{:text, raw}, client} = Client.next_frame(client, @recv_timeout)
+    assert Jason.decode!(raw)["type"] == "auth_required"
+
+    client = Client.send_frame(client, {:text, Jason.encode!(%{"access_token" => token})})
+    {{:text, raw}, client} = Client.next_frame(client, @recv_timeout)
+    assert Jason.decode!(raw)["type"] == "auth_ok"
+
+    client
+  end
+
+  test "on the socket the proxy relays without ever running Core's auth handshake", %{
+    proxy_host: host,
+    proxy_port: port
+  } do
+    start_core_socket()
+
+    # Would raise if the Core-side credential were resolved at all — on the
+    # socket it must not be.
+    Application.put_env(:vagus, :core_proxy_access_token_fun, fn ->
+      raise "access token resolved on the socket path"
+    end)
+
+    token = addon_token("cp_ws_socket", %{homeassistant_api: true})
+    client = authenticate_caller(host, port, token)
+
+    assert_receive {:core_socket_init, _core_pid}, @recv_timeout
+
+    client = Client.send_frame(client, {:text, "hello"})
+    {frame, client} = Client.next_frame(client, @recv_timeout)
+    assert frame == {:text, "world"}
+
+    payload = :crypto.strong_rand_bytes(4_096)
+    client = Client.send_frame(client, {:binary, payload})
+    {frame, _client} = Client.next_frame(client, @recv_timeout)
+    assert frame == {:binary, payload}
+
+    refute_received {:core_socket_unexpected_auth, _data}
+  end
+
+  test "a handshake frame Core sends on the socket anyway is swallowed, not relayed", %{
+    proxy_host: host,
+    proxy_port: port
+  } do
+    start_core_socket()
+    token = addon_token("cp_ws_socket_auth_frame", %{homeassistant_api: true})
+    client = authenticate_caller(host, port, token)
+
+    assert_receive {:core_socket_init, _core_pid}, @recv_timeout
+
+    client = Client.send_frame(client, {:text, "auth-then-hello"})
+
+    # The caller already had its own `auth_ok` from this proxy — the one
+    # Core just emitted must never reach it.
+    {frame, _client} = Client.next_frame(client, @recv_timeout)
+    assert frame == {:text, "world"}
+  end
+
+  test "frames sent before Core's socket upgrade completes are still delivered in order", %{
+    proxy_host: host,
+    proxy_port: port
+  } do
+    start_core_socket()
+    token = addon_token("cp_ws_socket_pending", %{homeassistant_api: true})
+    client = authenticate_caller(host, port, token)
+
+    # `auth_ok` is pushed to the caller before `Upstream` has upgraded, so
+    # these land in `pending` and are flushed on `{:done, ref}` — the socket
+    # path's flush point.
+    client = Client.send_frame(client, {:text, "one"})
+    client = Client.send_frame(client, {:text, "two"})
+
+    {frame1, client} = Client.next_frame(client, @recv_timeout)
+    {frame2, _client} = Client.next_frame(client, @recv_timeout)
+
+    assert frame1 == {:text, "one"}
+    assert frame2 == {:text, "two"}
   end
 end

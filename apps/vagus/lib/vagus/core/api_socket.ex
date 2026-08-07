@@ -11,32 +11,53 @@ defmodule Vagus.Core.ApiSocket do
   IP check is why a TCP call from the host-networked emulator (source = the LAN
   IP, not `172.30.32.2`) is rejected; the socket sidesteps it entirely.
 
-  The socket path is `config :vagus, :core_api_socket` (a host path the Core
-  container's socket dir is bind-mounted onto); `nil` means "no socket
-  configured" and callers fall back to their TCP path.
+  The socket is the shared one `Vagus.Core.Transport` resolves
+  (`Vagus.Core.Container.socket_path/0`, bind-mounted into both mount
+  namespaces by Core's own run spec); `path/0` is `nil` when it doesn't
+  exist right now and callers fall back to their TCP path.
 
-  Transport mirrors `Vagus.Runtime.Docker`: one short-lived passive Mint
-  connection per request, hard body cap, never raises.
+  This is the no-Finch half of the transport: `Vagus.Core.Client` and
+  friends ride the same socket through a Finch pool, but this one call runs
+  before/independently of that machinery, so it keeps its own short-lived
+  connection. Transport mirrors `Vagus.Runtime.Docker`: one short-lived
+  passive Mint connection per request, hard body cap, never raises.
   """
+
+  alias Vagus.Core.Transport
 
   @recv_timeout 30_000
   @max_body 1_048_576
 
-  @doc "The configured Core API socket path, or `nil`."
+  @doc "The Core API socket path if the socket exists right now, or `nil`."
   @spec path() :: String.t() | nil
-  def path, do: Application.get_env(:vagus, :core_api_socket)
+  def path, do: Transport.socket()
 
   @doc """
   POSTs `body` (a map → JSON) to `path` over the Core API socket. Returns
-  `{:ok, status}` or `{:error, reason}`. `opts[:socket]` overrides the path.
+  `{:ok, status}` or `{:error, reason}`.
+
+  `opts[:socket]` is the resolved socket path — callers that already
+  branched on `path/0` pass it so this call can't re-resolve to something
+  else (or to nothing) mid-request. Without it the path is resolved here,
+  and a resolution that comes back empty is `{:error, :no_socket}`: a
+  `nil` would otherwise reach `Mint.HTTP.connect(:http, {:local, nil}, 0)`,
+  which raises — this module never does.
   """
   @spec post(String.t(), map(), keyword()) :: {:ok, non_neg_integer()} | {:error, term()}
   def post(request_path, body, opts \\ []) when is_map(body) do
-    socket = Keyword.get(opts, :socket, path())
+    case Keyword.get(opts, :socket, path()) do
+      socket when is_binary(socket) -> do_post(request_path, body, socket)
+      _no_socket -> {:error, :no_socket}
+    end
+  end
+
+  defp do_post(request_path, body, socket) do
     payload = Jason.encode!(body)
     headers = [{"content-type", "application/json"}]
+    {scheme, address, port} = Transport.connect_args({:socket, socket})
+    connect_opts = [mode: :passive] ++ Transport.connect_opts({:socket, socket})
 
-    case Mint.HTTP.connect(:http, {:local, socket}, 0, mode: :passive, hostname: "localhost") do
+    case Mint.HTTP.connect(scheme, address, port, connect_opts) do
       {:ok, conn} ->
         try do
           with {:ok, conn, ref} <- Mint.HTTP.request(conn, "POST", request_path, headers, payload),

@@ -16,14 +16,25 @@ defmodule Vagus.Core.Container do
   no processes, no Engine-API calls. `Vagus.Core.Lifecycle` (a later phase)
   is what actually creates/starts/stops containers from this config.
 
+  ## The Supervisor socket (`/run/supervisor`)
+
+  `SUPERVISOR_CORE_API_SOCKET=/run/supervisor/core.sock` makes Core open a
+  unix socket at that path *inside* its container
+  (`homeassistant/components/http`), and the `/run/supervisor` bind-mount is
+  what puts that socket in Vagus's own mount namespace so Vagus can talk to
+  Core over it — the channel real HAOS uses (implicit Supervisor-user auth,
+  no bearer token).
+
+  The directory lives on tmpfs and is therefore gone after every boot, which
+  is correct: the socket is per-boot state. `Vagus.Engine.Manager` recreates
+  it before it starts the balena-engine daemon — the daemon revives Core's
+  `unless-stopped` container immediately, and a bind mount whose source is
+  missing fails the container start outright.
+
   ## Deliberate v1 omissions vs. upstream `docker/homeassistant.py`
 
   * **`/etc/machine-id` bind** — Nerves' `/etc` is read-only firmware, there
     is no writable machine-id file to bind in.
-  * **`/run/supervisor` bind** — upstream mounts a unix socket for Core's
-    in-process Supervisor API; Vagus has no such socket (Core talks to
-    Vagus over HTTP/`:8123`-adjacent host networking instead), so there is
-    nothing to bind.
   * **`Init` and `SecurityOpt: ["seccomp=unconfined"]`** — not part of the
     device-proven recipe; omitted rather than guessed at.
   * **landingpage** — upstream installs a de-privileged placeholder image
@@ -52,6 +63,12 @@ defmodule Vagus.Core.Container do
   @default_name "homeassistant"
   @default_tz "UTC"
 
+  @socket_dir "/run/supervisor"
+  @socket_path @socket_dir <> "/core.sock"
+
+  @spec_fingerprint_label "io.vagus.spec-fingerprint"
+  @spec_fingerprint_length 32
+
   @doc "The fixed Core container name (`homeassistant`) — upstream parity."
   @spec name() :: String.t()
   def name do
@@ -61,6 +78,28 @@ defmodule Vagus.Core.Container do
   @doc "The named docker volume holding Core's /config (see mounts/0)."
   @spec config_volume() :: String.t()
   def config_volume, do: "vagus-core-config"
+
+  @doc """
+  The bind-mounted directory holding Core's Supervisor socket
+  (`#{@socket_dir}`) — same path on both sides of the mount. Created per
+  boot by `Vagus.Engine.Manager` (see the moduledoc).
+  """
+  @spec socket_dir() :: String.t()
+  def socket_dir, do: @socket_dir
+
+  @doc """
+  The Supervisor socket Core opens (`#{@socket_path}`), i.e. the
+  `SUPERVISOR_CORE_API_SOCKET` value — a host path once `socket_dir/0` is
+  bind-mounted in.
+  """
+  @spec socket_path() :: String.t()
+  def socket_path, do: @socket_path
+
+  @doc """
+  The container label carrying `spec_fingerprint/1` (`#{@spec_fingerprint_label}`).
+  """
+  @spec spec_fingerprint_label() :: String.t()
+  def spec_fingerprint_label, do: @spec_fingerprint_label
 
   @doc """
   Host path of Core's /config — the `vagus-core-config` named volume's
@@ -100,13 +139,53 @@ defmodule Vagus.Core.Container do
     token = Keyword.get_lazy(opts, :token, &Token.get/0)
     tz = Keyword.get(opts, :tz, @default_tz)
 
-    %{
+    spec = %{
       "Image" => image(version),
       "Hostname" => @default_name,
       "Env" => env(ip, token, tz),
       "HostConfig" => host_config(ip)
     }
+
+    Map.put(spec, "Labels", %{@spec_fingerprint_label => spec_fingerprint(spec)})
   end
+
+  @doc """
+  A deterministic digest of everything in a `create_config/2` map that a
+  running container would have to be recreated to pick up — the whole spec
+  (image, env, host config, mounts) except the `"Labels"` key the digest
+  itself is stamped into.
+
+  `Vagus.Core.Lifecycle` stamps this on every container it creates and
+  compares it against the existing container's label before reusing one, so
+  a spec change here (a new mount, a new env var, a rotated token) triggers
+  the same recreate an image/version mismatch does — a *missing* label (a
+  container created before fingerprinting existed, or by hand) never matches
+  and so always recreates.
+
+  Pure: same spec in, same digest out. Nested maps are canonicalized to
+  key-sorted pairs first so the digest can't depend on map iteration order.
+  """
+  @spec spec_fingerprint(map()) :: String.t()
+  def spec_fingerprint(spec) when is_map(spec) do
+    digest =
+      spec
+      |> Map.delete("Labels")
+      |> canonical()
+      |> Jason.encode!()
+      |> then(&:crypto.hash(:sha256, &1))
+      |> Base.encode16(case: :lower)
+
+    binary_part(digest, 0, @spec_fingerprint_length)
+  end
+
+  defp canonical(map) when is_map(map) do
+    map
+    |> Enum.sort_by(fn {key, _value} -> key end)
+    |> Enum.map(fn {key, value} -> [key, canonical(value)] end)
+  end
+
+  defp canonical(list) when is_list(list), do: Enum.map(list, &canonical/1)
+  defp canonical(other), do: other
 
   defp env(ip, token, tz) do
     [
@@ -114,6 +193,7 @@ defmodule Vagus.Core.Container do
       "HASSIO=#{ip}",
       "SUPERVISOR_TOKEN=#{token}",
       "HASSIO_TOKEN=#{token}",
+      "SUPERVISOR_CORE_API_SOCKET=#{@socket_path}",
       "TZ=#{tz}"
     ]
   end
@@ -144,6 +224,14 @@ defmodule Vagus.Core.Container do
       },
       %{"Type" => "bind", "Source" => "/run/dbus", "Target" => "/run/dbus", "ReadOnly" => true},
       %{"Type" => "bind", "Source" => "/run/udev", "Target" => "/run/udev", "ReadOnly" => true},
+      # Writable: Core creates its Supervisor socket inside this directory
+      # (see the moduledoc's "The Supervisor socket" section).
+      %{
+        "Type" => "bind",
+        "Source" => @socket_dir,
+        "Target" => @socket_dir,
+        "ReadOnly" => false
+      },
       %{"Type" => "volume", "Source" => "vagus-core-config", "Target" => "/config"}
     ]
   end

@@ -1,5 +1,8 @@
 defmodule Vagus.Core.ClientTest do
-  use ExUnit.Case, async: true
+  # `async: false`: the socket-transport describe below moves
+  # `:core_socket_path` (process-global application env), which decides the
+  # transport for every Core client in the VM.
+  use ExUnit.Case, async: false
 
   alias Vagus.Core.{Client, TokenStore}
 
@@ -40,6 +43,12 @@ defmodule Vagus.Core.ClientTest do
         :default -> send_json(conn, 200, %{"ok" => true})
         {status, body} -> send_json(conn, status, body)
       end
+    end
+
+    # Echoes back what Core would actually see — the A3 socket-vs-TCP
+    # credential question in one route.
+    get "/echo-auth" do
+      send_json(conn, 200, %{"authorization" => Plug.Conn.get_req_header(conn, "authorization")})
     end
 
     match _ do
@@ -231,6 +240,110 @@ defmodule Vagus.Core.ClientTest do
       # left wedged by the earlier bad one.
       assert {:ok, token} = Client.access_token(client)
       assert is_binary(token)
+    end
+  end
+
+  describe "the Supervisor↔Core unix socket (A2/A3)" do
+    setup do
+      path =
+        Path.join(
+          System.tmp_dir!(),
+          "vagus_client_#{System.unique_integer([:positive])}.sock"
+        )
+
+      start_supervised!(
+        {Bandit,
+         plug: FakeCore,
+         port: 0,
+         thousand_island_options: [num_acceptors: 1, transport_options: [ip: {:local, path}]]},
+        id: :fake_core_socket
+      )
+
+      Application.put_env(:vagus, :core_socket_path, path)
+
+      on_exit(fn ->
+        Application.put_env(:vagus, :core_socket_path, nil)
+        File.rm(path)
+      end)
+
+      %{socket: path}
+    end
+
+    test "request/3 sends no authorization header and needs no refresh token" do
+      finch = finch_name()
+      start_supervised!({Finch, name: finch})
+      # No refresh token at all: on the socket there is nothing to exchange,
+      # so a request that would fail with :no_refresh_token on TCP succeeds.
+      token_store = start_token_store(nil)
+
+      client =
+        start_client(
+          core_base_url: "http://127.0.0.1:1",
+          finch_name: finch,
+          token_store: token_store
+        )
+
+      assert {:ok, %Finch.Response{status: 200, body: body}} =
+               Client.request(:get, "/echo-auth", server: client)
+
+      assert Jason.decode!(body) == %{"authorization" => []}
+    end
+
+    test "a 401 on the socket is returned as-is, never re-exchanged" do
+      finch = finch_name()
+      start_supervised!({Finch, name: finch})
+      token_store = start_token_store(nil)
+
+      client =
+        start_client(
+          core_base_url: "http://127.0.0.1:1",
+          finch_name: finch,
+          token_store: token_store
+        )
+
+      # Two 401s queued: the TCP path would consume both (retry-once) and
+      # answer {:error, :unauthorized}. The socket path consumes one.
+      script([{401, %{}}, {200, %{"second" => true}}])
+
+      assert {:ok, %Finch.Response{status: 401}} =
+               Client.request(:get, "/protected", server: client)
+
+      assert {:ok, %Finch.Response{status: 200, body: body}} =
+               Client.request(:get, "/protected", server: client)
+
+      assert Jason.decode!(body) == %{"second" => true}
+    end
+
+    test "the TCP fallback still sends the bearer token", %{socket: path, base_url: base_url} do
+      File.rm!(path)
+
+      finch = finch_name()
+      start_supervised!({Finch, name: finch})
+      token_store = start_token_store("refresh-for-tcp")
+
+      client =
+        start_client(core_base_url: base_url, finch_name: finch, token_store: token_store)
+
+      assert {:ok, %Finch.Response{status: 200, body: body}} =
+               Client.request(:get, "/echo-auth", server: client)
+
+      assert %{"authorization" => ["Bearer access-" <> _rest]} = Jason.decode!(body)
+    end
+
+    test "the token exchange itself also rides the socket" do
+      finch = finch_name()
+      start_supervised!({Finch, name: finch})
+      token_store = start_token_store("refresh-over-socket")
+
+      # An unreachable TCP base proves the exchange went over the socket.
+      client =
+        start_client(
+          core_base_url: "http://127.0.0.1:1",
+          finch_name: finch,
+          token_store: token_store
+        )
+
+      assert {:ok, "access-" <> _rest} = Client.access_token(client)
     end
   end
 

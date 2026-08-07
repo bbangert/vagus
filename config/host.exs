@@ -53,6 +53,20 @@ config :vagus,
        :core_base_url,
        System.get_env("VAGUS_CORE_BASE_URL") || "http://localhost:8123"
 
+# Supervisor↔Core unix socket (`Vagus.Core.Transport`, socket-first — see its
+# moduledoc). Real HAOS — and a vagus device — runs every Core call over it;
+# a bare workstation has no `/run/supervisor/core.sock`, so leaving this
+# unset means everything above stays on the TCP :core_base_url with today's
+# token auth, exactly as before the socket existed. `scripts/dev-core.sh up`
+# mkdirs a host directory, bind-mounts it into the dev Core container at
+# `/run/supervisor` (with `SUPERVISOR_CORE_API_SOCKET` set to match — the
+# same path `Vagus.Core.Container` uses on-device), and prints the
+# `VAGUS_CORE_SOCKET` export to start (or restart) the emulator with so
+# `Transport.current/1` finds the socket instead of falling back to TCP.
+if core_socket = System.get_env("VAGUS_CORE_SOCKET") do
+  config :vagus, :core_socket_path, core_socket
+end
+
 # Host-management backends (P4-T1) — plausible-but-honest stubs, some of
 # which (OS) read the same Nerves.Runtime.KV pre-populated below.
 config :vagus, :backends, %{

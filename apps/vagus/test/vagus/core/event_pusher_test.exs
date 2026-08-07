@@ -2,21 +2,27 @@ defmodule Vagus.Core.EventPusherTest do
   use ExUnit.Case, async: true
 
   alias Vagus.Core.EventPusher
+  alias Vagus.Core.EventPusher.Connection
 
   # These exercise handle_cast/2 and handle_info/2 directly against
   # hand-built state, with no live GenServer/Fresh connection involved —
   # mirrors Vagus.Engine.ManagerTest's approach for the same reason: the
   # pure state-machine transitions (id sequencing, queue bounding,
   # backoff) are fully testable this way without ever reaching
-  # Fresh.start/4's real network connection attempt.
+  # Fresh.start/4's real network connection attempt. `conn_mod` is the TCP
+  # client here, whose `send_frame/2` is a `Fresh.send/2` cast — which is
+  # what makes `received_frame/0` below work with `self()` standing in for
+  # the connection process.
   defp base_state(overrides \\ %{}) do
     Map.merge(
       %{
         ws_url: "ws://example.invalid/api/websocket",
         token_store: :irrelevant,
         client: :irrelevant,
+        conn_mod: Connection,
         connection_pid: nil,
         monitor_ref: nil,
+        retry_ref: nil,
         ready: false,
         next_id: 1,
         pending: %{},
@@ -99,7 +105,7 @@ defmodule Vagus.Core.EventPusherTest do
   end
 
   describe "handle_info({:event_pusher_connection, :connected, pid}, state)" do
-    test "resets ready, next_id and backoff for the current connection pid" do
+    test "resets ready and backoff, but never the id counter" do
       state =
         base_state(%{
           connection_pid: self(),
@@ -112,8 +118,10 @@ defmodule Vagus.Core.EventPusherTest do
                EventPusher.handle_info({:event_pusher_connection, :connected, self()}, state)
 
       assert new_state.ready == false
-      assert new_state.next_id == 1
       assert new_state.backoff_ms == 5_000
+      # Monotonic across connections: an id must never name two different
+      # requests over the manager's lifetime (stale-timeout race).
+      assert new_state.next_id == 7
     end
 
     test "is a no-op for a stale (no longer current) connection pid" do
@@ -336,7 +344,7 @@ defmodule Vagus.Core.EventPusherTest do
     end
   end
 
-  describe "in-flight commands are failed whenever ids reset" do
+  describe "in-flight commands are failed whenever the connection goes away" do
     test "a fresh connection replies {:error, :disconnected} to every pending request" do
       ref_a = make_ref()
       ref_b = make_ref()
@@ -357,7 +365,7 @@ defmodule Vagus.Core.EventPusherTest do
       assert_receive {^ref_a, {:error, :disconnected}}
       assert_receive {^ref_b, {:error, :disconnected}}
       assert new_state.pending == %{}
-      assert new_state.next_id == 1
+      assert new_state.next_id == 9
     end
 
     test "the connection dying replies {:error, :disconnected} to every pending request" do
@@ -379,6 +387,89 @@ defmodule Vagus.Core.EventPusherTest do
 
       assert_receive {^caller_ref, {:error, :disconnected}}
       assert new_state.pending == %{}
+    end
+  end
+
+  describe "stale {:command_timeout, id} messages (PR #13 review round 4)" do
+    # `Process.cancel_timer/1` cannot unsend a message that already went
+    # out, so a timeout for a request that has just been resolved can be
+    # sitting in the mailbox. Both halves of the fix are asserted here: the
+    # message is drained, and ids never repeat anyway.
+    defp already_fired_timer(id) do
+      timer = Process.send_after(self(), {:command_timeout, id}, 0)
+      assert_receive {:command_timeout, ^id}, 200
+      # Put it back: the manager is being driven inside THIS process, so
+      # this mailbox is the one `cancel_timeout/2` drains.
+      send(self(), {:command_timeout, id})
+      timer
+    end
+
+    test "fail_pending drains an already-delivered timeout instead of leaving it queued" do
+      caller_ref = make_ref()
+      timer = already_fired_timer(1)
+
+      state =
+        base_state(%{
+          connection_pid: self(),
+          ready: true,
+          next_id: 2,
+          pending: %{1 => {{self(), caller_ref}, timer}}
+        })
+
+      assert {:noreply, new_state} =
+               EventPusher.handle_info({:event_pusher_connection, :connected, self()}, state)
+
+      assert_receive {^caller_ref, {:error, :disconnected}}
+      assert new_state.pending == %{}
+      refute_received {:command_timeout, 1}
+    end
+
+    test "a resolved result drains its own already-delivered timeout" do
+      caller_ref = make_ref()
+      timer = already_fired_timer(4)
+      state = base_state(%{pending: %{4 => {{self(), caller_ref}, timer}}})
+
+      assert {:noreply, new_state} =
+               EventPusher.handle_info({:event_pusher_result, 4, {:ok, :done}}, state)
+
+      assert_receive {^caller_ref, {:ok, :done}}
+      assert new_state.pending == %{}
+      refute_received {:command_timeout, 4}
+    end
+
+    test "a command issued after a reconnect never reuses the previous id" do
+      caller_ref = make_ref()
+      timer = already_fired_timer(1)
+
+      state =
+        base_state(%{
+          connection_pid: self(),
+          ready: true,
+          next_id: 2,
+          pending: %{1 => {{self(), caller_ref}, timer}}
+        })
+
+      # Reconnect: pending fails, the id counter carries on.
+      {:noreply, state} =
+        EventPusher.handle_info({:event_pusher_connection, :connected, self()}, state)
+
+      assert_receive {^caller_ref, {:error, :disconnected}}
+
+      {:noreply, state} =
+        EventPusher.handle_info({:event_pusher_connection, :ready, self()}, state)
+
+      from = {self(), make_ref()}
+
+      assert {:noreply, new_state} =
+               EventPusher.handle_call(
+                 {:command, %{"type" => "config/auth/list"}, 5_000},
+                 from,
+                 state
+               )
+
+      assert received_frame()["id"] == 2
+      refute Map.has_key?(new_state.pending, 1)
+      assert Map.has_key?(new_state.pending, 2)
     end
   end
 

@@ -64,7 +64,7 @@ defmodule Vagus.API.CoreLifecycleRouterTest do
   alias Vagus.Addon.Registry
   alias Vagus.API.CoreLifecycleRouterTest.{StubConfigCheck, StubLifecycle}
   alias Vagus.API.{Router, Token}
-  alias Vagus.Core.Versions
+  alias Vagus.Core.{HttpConfig, Versions}
 
   @opts Router.init([])
 
@@ -752,8 +752,30 @@ defmodule Vagus.API.CoreLifecycleRouterTest do
       data = json_body(conn)["data"]
 
       assert data["image"] == "ghcr.io/home-assistant/home-assistant"
+      # `Vagus.Core.HttpConfig`'s default — nothing has been pulled from Core
+      # (no Supervisor↔Core socket under `mix test`), see the test below.
       assert data["port"] == 8123
+      assert data["ssl"] == false
       assert data["watchdog"] == true
+    end
+
+    test "port/ssl report what Vagus.Core.HttpConfig cached from Core (A4)" do
+      name = :"core_http_config_rt_#{System.unique_integer([:positive])}"
+
+      start_supervised!(%{
+        id: name,
+        start:
+          {HttpConfig, :start_link,
+           [[name: name, config: %{port: 80, ssl: true, server_host: "0.0.0.0"}]]}
+      })
+
+      Application.put_env(:vagus, :core_http_config_server, name)
+      on_exit(fn -> Application.delete_env(:vagus, :core_http_config_server) end)
+
+      data = conn(:get, "/core/info") |> authed() |> call() |> json_body() |> Map.fetch!("data")
+
+      assert data["port"] == 80
+      assert data["ssl"] == true
     end
   end
 end

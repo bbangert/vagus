@@ -8,7 +8,10 @@ defmodule Vagus.API.StaticData do
   touching `Vagus.API.Router` or the model layer at all. `os_info/0`,
   `host_info/0`, and `network_info/0` have already been replaced this way
   (P4) — see `Vagus.Backend` and `Vagus.Backend.{OS,Host,Network}` — so
-  this module no longer defines them.
+  this module no longer defines them. Individual *fields* get the same
+  treatment where a real source exists: `root_info/0`'s `hassos` reads the
+  OS backend, and `core_info/0`'s `port`/`ssl` read
+  `Vagus.Core.HttpConfig` (what Core reports about its own listener).
 
   Values follow the static defaults pinned in the Phase 2 plan: `healthy:
   true`, `supported: true`, `arch: "aarch64"`, `state: "running"`,
@@ -28,6 +31,8 @@ defmodule Vagus.API.StaticData do
   add-on can run here at all — the single source both call sites read from,
   so a store card and `/info` can never disagree about what device this is.
   """
+
+  alias Vagus.Core.HttpConfig
 
   @supervisor_version "2026.07.3"
   @core_version "2026.7.2"
@@ -87,6 +92,13 @@ defmodule Vagus.API.StaticData do
     }
   end
 
+  # Same test seam as the router's `:core_versions_server`: a test points
+  # this at a private `Vagus.Core.HttpConfig` instance instead of mutating
+  # the shared, app-supervised cache every other test reads.
+  defp http_config_server do
+    Application.get_env(:vagus, :core_http_config_server, HttpConfig)
+  end
+
   defp hostname do
     {:ok, hostname} = :inet.gethostname()
     to_string(hostname)
@@ -127,9 +139,20 @@ defmodule Vagus.API.StaticData do
     }
   end
 
-  @doc "Attrs for `Vagus.API.Models.HomeAssistantInfo` (`GET core/info`)."
+  @doc """
+  Attrs for `Vagus.API.Models.HomeAssistantInfo` (`GET core/info`).
+
+  `port`/`ssl` are Core's own live values, not statics: `Vagus.Core.HttpConfig`
+  caches what Core reports over the Supervisor↔Core socket
+  (`GET /api/core/http_config`), so a Core that bound something other than
+  8123 is reported honestly. With no socket (host dev) — or before the
+  first successful pull — that cache serves `HttpConfig.defaults/0`, which
+  is this endpoint's historical `port: 8123, ssl: false`.
+  """
   @spec core_info() :: map()
   def core_info do
+    http_config = HttpConfig.get(http_config_server())
+
     %{
       version: @core_version,
       version_latest: nil,
@@ -139,8 +162,8 @@ defmodule Vagus.API.StaticData do
       arch: @arch,
       image: "ghcr.io/home-assistant/home-assistant",
       boot: true,
-      port: 8123,
-      ssl: false,
+      port: http_config.port,
+      ssl: http_config.ssl,
       watchdog: true,
       audio_input: nil,
       audio_output: nil,

@@ -80,15 +80,46 @@ defmodule Vagus.Core.LifecycleTest do
     end
   end
 
+  # The A4 `Vagus.Core.HttpConfig.refresh/1` seam — `{:skipped, :no_socket}`
+  # is what the real one returns on the TCP fallback the suite runs under.
+  defp http_config_fun(result \\ {:skipped, :no_socket}) do
+    parent = self()
+
+    fn ->
+      send(parent, :http_config_refreshed)
+      result
+    end
+  end
+
   ## Fixture builders
 
+  # Labels carry the spec fingerprint the container was created with. The
+  # default is the fingerprint `Vagus.Core.Container` builds for this image
+  # *right now* — i.e. a container with no spec drift, which is what every
+  # pre-A1 test in here assumed implicitly. `inspect_body_labeled/3` is the
+  # seam for the drift/missing-label cases.
   defp inspect_body(image, running, env \\ []) do
+    inspect_body_labeled(image, running, %{fingerprint_label() => fingerprint(image)}, env)
+  end
+
+  defp inspect_body_labeled(image, running, labels, env \\ []) do
     %{
       "Id" => "existing-container-id",
-      "Config" => %{"Image" => image, "Env" => env},
+      "Config" => %{"Image" => image, "Env" => env, "Labels" => labels},
       "State" => %{"Running" => running}
     }
   end
+
+  defp fingerprint_label, do: Container.spec_fingerprint_label()
+
+  defp fingerprint(image) do
+    image
+    |> version_of()
+    |> Container.create_config()
+    |> Container.spec_fingerprint()
+  end
+
+  defp version_of(image), do: image |> String.split(":") |> List.last()
 
   defp not_found, do: {404, %{"message" => "No such container: homeassistant"}}
 
@@ -300,6 +331,159 @@ defmodule Vagus.Core.LifecycleTest do
     end
   end
 
+  ## start/1 spec-fingerprint drift (A1) — the reuse check is image tag AND
+  ## the `io.vagus.spec-fingerprint` label, so an env/mount change in
+  ## `Vagus.Core.Container` recreates the container the same way a version
+  ## bump does.
+
+  describe "start/1 spec fingerprint" do
+    test "matching tag + matching fingerprint, running -> :ok, no recreate" do
+      engine = start_engine([{200, inspect_body(Container.image("2026.7.0"), true)}])
+      versions = start_versions("2026.7.0")
+
+      assert :ok =
+               Lifecycle.start(
+                 docker: [socket: engine.socket],
+                 versions: versions,
+                 health: health_fun()
+               )
+
+      assert [%{method: :get}] = FakeEngine.requests(engine)
+    end
+
+    test "matching tag, DRIFTED fingerprint, running -> stop+remove+create+start" do
+      engine =
+        start_engine([
+          {200,
+           inspect_body_labeled(Container.image("2026.7.0"), true, %{
+             fingerprint_label() => "0000000000000000000000000000stale"
+           })},
+          {204, nil},
+          {204, nil},
+          create_ok("respec-id"),
+          {204, nil}
+        ])
+
+      versions = start_versions("2026.7.0")
+
+      assert :ok =
+               Lifecycle.start(
+                 docker: [socket: engine.socket],
+                 versions: versions,
+                 health: health_fun()
+               )
+
+      assert_receive :health_called
+
+      requests = FakeEngine.requests(engine)
+      assert Enum.map(requests, & &1.method) == [:get, :post, :delete, :post, :post]
+      assert Enum.at(requests, 3).path == "/containers/create"
+      assert Enum.at(requests, 4).path == "/containers/respec-id/start"
+    end
+
+    test "a MISSING label (pre-upgrade container) counts as drift -> recreate" do
+      engine =
+        start_engine([
+          {200, inspect_body_labeled(Container.image("2026.7.0"), true, %{})},
+          {204, nil},
+          {204, nil},
+          create_ok("respec-id"),
+          {204, nil}
+        ])
+
+      versions = start_versions("2026.7.0")
+
+      assert :ok =
+               Lifecycle.start(
+                 docker: [socket: engine.socket],
+                 versions: versions,
+                 health: health_fun()
+               )
+
+      requests = FakeEngine.requests(engine)
+      assert Enum.map(requests, & &1.method) == [:get, :post, :delete, :post, :post]
+    end
+
+    test "a null Labels map (no labels at all) counts as drift -> recreate" do
+      engine =
+        start_engine([
+          {200, inspect_body_labeled(Container.image("2026.7.0"), true, nil)},
+          {204, nil},
+          {204, nil},
+          create_ok("respec-id"),
+          {204, nil}
+        ])
+
+      versions = start_versions("2026.7.0")
+
+      assert :ok =
+               Lifecycle.start(
+                 docker: [socket: engine.socket],
+                 versions: versions,
+                 health: health_fun()
+               )
+
+      assert Enum.map(FakeEngine.requests(engine), & &1.method) ==
+               [:get, :post, :delete, :post, :post]
+    end
+
+    test "a drifted-but-stopped container is recreated, not plain-started" do
+      engine =
+        start_engine([
+          {200, inspect_body_labeled(Container.image("2026.7.0"), false, %{})},
+          {204, nil},
+          {204, nil},
+          create_ok("respec-id"),
+          {204, nil}
+        ])
+
+      versions = start_versions("2026.7.0")
+
+      assert :ok =
+               Lifecycle.start(
+                 docker: [socket: engine.socket],
+                 versions: versions,
+                 health: health_fun()
+               )
+
+      requests = FakeEngine.requests(engine)
+      assert Enum.any?(requests, &(&1.method == :delete))
+      assert Enum.at(requests, 3).path == "/containers/create"
+    end
+
+    test "the created container carries the fingerprint label + socket mount/env" do
+      engine =
+        start_engine([
+          not_found(),
+          create_ok("fresh-id"),
+          {204, nil}
+        ])
+
+      versions = start_versions("2026.7.0")
+
+      assert :ok =
+               Lifecycle.start(
+                 docker: [socket: engine.socket],
+                 versions: versions,
+                 health: health_fun()
+               )
+
+      create = Enum.at(FakeEngine.requests(engine), 1)
+
+      assert create.body["Labels"][fingerprint_label()] ==
+               fingerprint(Container.image("2026.7.0"))
+
+      assert "SUPERVISOR_CORE_API_SOCKET=#{Container.socket_path()}" in create.body["Env"]
+
+      assert %{
+               "Type" => "bind",
+               "Source" => Container.socket_dir(),
+               "Target" => Container.socket_dir(),
+               "ReadOnly" => false
+             } in create.body["HostConfig"]["Mounts"]
+    end
+  end
+
   ## stop/1
 
   describe "stop/1" do
@@ -341,6 +525,92 @@ defmodule Vagus.Core.LifecycleTest do
         start_engine([
           {200, inspect_body(Container.image("2026.7.0"), false, [])},
           {304, nil}
+        ])
+
+      assert :ok = Lifecycle.stop(docker: [socket: engine.socket])
+    end
+  end
+
+  ## The socket file outlives Core (W1)
+
+  describe "the Supervisor↔Core socket is unlinked when Core stops or is removed" do
+    setup do
+      prev = Application.get_env(:vagus, :core_socket_path)
+      on_exit(fn -> Application.put_env(:vagus, :core_socket_path, prev) end)
+      :ok
+    end
+
+    # A real AF_UNIX socket, left behind exactly as a dead Core leaves its
+    # own: closing the listener does not unlink the file.
+    defp stale_core_socket do
+      path = Path.join(System.tmp_dir!(), "vagus_lifecycle_core_#{unique()}.sock")
+      {:ok, listen} = :gen_tcp.listen(0, ifaddr: {:local, path})
+      :gen_tcp.close(listen)
+      on_exit(fn -> File.rm(path) end)
+
+      Application.put_env(:vagus, :core_socket_path, path)
+      path
+    end
+
+    test "stop/1 removes it, so the transport stops resolving a dead endpoint" do
+      path = stale_core_socket()
+      assert Vagus.Core.Transport.current() == {:socket, path}
+
+      engine =
+        start_engine([
+          {200, inspect_body(Container.image("2026.7.0"), true, [])},
+          {204, nil}
+        ])
+
+      assert :ok = Lifecycle.stop(docker: [socket: engine.socket])
+
+      refute File.exists?(path)
+      assert {:tcp, _base_url} = Vagus.Core.Transport.current()
+    end
+
+    test "a failed stop leaves it alone — Core is still running" do
+      path = stale_core_socket()
+
+      engine =
+        start_engine([
+          {200, inspect_body(Container.image("2026.7.0"), true, [])},
+          {500, %{"message" => "boom"}}
+        ])
+
+      assert {:error, _reason} = Lifecycle.stop(docker: [socket: engine.socket])
+      assert File.exists?(path)
+    end
+
+    test "rebuild/1's remove takes it too (the container that owned it is gone)" do
+      path = stale_core_socket()
+
+      engine =
+        start_engine([
+          {200, inspect_body(Container.image("2026.6.0"), true)},
+          {204, nil},
+          {204, nil},
+          create_ok("rebuilt-id"),
+          {204, nil}
+        ])
+
+      assert :ok =
+               Lifecycle.rebuild(
+                 docker: [socket: engine.socket],
+                 versions: start_versions("2026.7.0"),
+                 health: health_fun(),
+                 http_config: http_config_fun()
+               )
+
+      refute File.exists?(path)
+    end
+
+    test "an unset :core_socket_path is a no-op, not a crash" do
+      Application.put_env(:vagus, :core_socket_path, nil)
+
+      engine =
+        start_engine([
+          {200, inspect_body(Container.image("2026.7.0"), true, [])},
+          {204, nil}
         ])
 
       assert :ok = Lifecycle.stop(docker: [socket: engine.socket])
@@ -855,6 +1125,97 @@ defmodule Vagus.Core.LifecycleTest do
       assert {:error, :busy} = Lifecycle.stop(docker: [socket: engine.socket])
 
       assert {:adopted, _info} = Task.await(task, 1_000)
+    end
+  end
+
+  ## HTTP-config refresh (A4) — every point this module establishes that
+  ## Core is up re-pulls Core's own HTTP parameters
+  ## (`Vagus.Core.HttpConfig`), because Core's port can change across its
+  ## restarts. The pull itself is `http_config_test.exs`'s subject; here we
+  ## only prove WHERE it is triggered from.
+
+  describe "HTTP-config refresh" do
+    test "a passing health gate refreshes it" do
+      engine =
+        start_engine([
+          {200, inspect_body(Container.image("2026.7.0"), false)},
+          {204, nil}
+        ])
+
+      versions = start_versions("2026.7.0")
+
+      assert :ok =
+               Lifecycle.start(
+                 docker: [socket: engine.socket],
+                 versions: versions,
+                 health: health_fun(),
+                 http_config: http_config_fun()
+               )
+
+      assert_receive :http_config_refreshed
+    end
+
+    test "an already-running container (the boot reconcile no-op) refreshes it too" do
+      engine = start_engine([{200, inspect_body(Container.image("2026.7.0"), true)}])
+      versions = start_versions("2026.7.0")
+
+      assert :ok =
+               Lifecycle.start(
+                 docker: [socket: engine.socket],
+                 versions: versions,
+                 health: health_fun(),
+                 http_config: http_config_fun()
+               )
+
+      refute_receive :health_called, 100
+      assert_receive :http_config_refreshed
+    end
+
+    test "a restart refreshes it" do
+      engine = start_engine([{204, nil}])
+
+      assert :ok =
+               Lifecycle.restart(
+                 docker: [socket: engine.socket],
+                 health: health_fun(),
+                 http_config: http_config_fun()
+               )
+
+      assert_receive :http_config_refreshed
+    end
+
+    test "a health-gate timeout does not" do
+      engine =
+        start_engine([
+          not_found(),
+          create_ok("fresh-id"),
+          {204, nil}
+        ])
+
+      versions = start_versions("2026.7.0")
+
+      assert {:error, :health_timeout} =
+               Lifecycle.start(
+                 docker: [socket: engine.socket],
+                 versions: versions,
+                 health: health_fun(:timeout),
+                 http_config: http_config_fun()
+               )
+
+      refute_receive :http_config_refreshed, 100
+    end
+
+    test "a failed refresh never fails the op it was triggered from" do
+      engine = start_engine([{204, nil}])
+
+      assert :ok =
+               Lifecycle.restart(
+                 docker: [socket: engine.socket],
+                 health: health_fun(),
+                 http_config: http_config_fun({:error, {:http_error, 500}})
+               )
+
+      assert_receive :http_config_refreshed
     end
   end
 end

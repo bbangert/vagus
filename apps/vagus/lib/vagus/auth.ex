@@ -88,9 +88,16 @@ defmodule Vagus.Auth do
   defp forward(username, password, addon_slug, core_client) do
     body = %{"username" => username, "password" => password, "addon" => addon_slug}
 
+    # One resolution, threaded into the POST — `Vagus.Core.Transport`'s
+    # single-resolution discipline. Resolving a second time inside `post/3`
+    # would let a socket that vanishes in between (a Core recreate) turn an
+    # auth request into a connect against a `nil` path.
     case Vagus.Core.ApiSocket.path() do
-      nil -> forward_tcp(body, core_client)
-      _socket -> match?({:ok, 200}, Vagus.Core.ApiSocket.post("/api/hassio_auth", body))
+      nil ->
+        forward_tcp(body, core_client)
+
+      socket ->
+        match?({:ok, 200}, Vagus.Core.ApiSocket.post("/api/hassio_auth", body, socket: socket))
     end
   end
 

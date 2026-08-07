@@ -1,5 +1,7 @@
 defmodule Vagus.Core.HealthTest do
-  use ExUnit.Case, async: true
+  # `async: false`: the transport describes below move `:core_base_url` /
+  # `:core_socket_path` (process-global application env).
+  use ExUnit.Case, async: false
 
   alias Vagus.Core.Health
 
@@ -92,6 +94,79 @@ defmodule Vagus.Core.HealthTest do
 
       url = "http://127.0.0.1:#{port}/manifest.json"
       assert Health.check(url: url) == :unhealthy
+    end
+  end
+
+  describe "the Finch pool being down (HL1)" do
+    test "a probe against a pool that isn't running is :unhealthy, not a crash" do
+      # `Finch.request/3` RAISES (`ArgumentError`, unknown registry) rather
+      # than returning an error when its pool is gone — reachable whenever
+      # the `:rest_for_one` Core subtree restarts, which is exactly when the
+      # watchdog probes and when `Vagus.API.CoreProxy` health-gates a
+      # proxied request. A crash there means a 5xx instead of the documented
+      # 502, and a watchdog that dies instead of recovering Core.
+      down = :"never_started_finch_#{System.unique_integer([:positive])}"
+
+      assert Health.check(url: "http://127.0.0.1:1/manifest.json", finch: down) == :unhealthy
+
+      assert Health.await_healthy(
+               url: "http://127.0.0.1:1/manifest.json",
+               finch: down,
+               interval: 10,
+               deadline: 50
+             ) == :timeout
+    end
+  end
+
+  describe "default transport resolution (A2 — no hardcoded Core port)" do
+    setup do
+      prev_base = Application.get_env(:vagus, :core_base_url)
+
+      on_exit(fn ->
+        Application.put_env(:vagus, :core_socket_path, nil)
+
+        if is_nil(prev_base),
+          do: Application.delete_env(:vagus, :core_base_url),
+          else: Application.put_env(:vagus, :core_base_url, prev_base)
+      end)
+
+      :ok
+    end
+
+    test "with no socket, the probe follows :core_base_url rather than :8123" do
+      bandit = start_supervised!({Bandit, plug: __MODULE__.FakePlug, port: 0})
+      {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
+
+      Application.put_env(:vagus, :core_socket_path, nil)
+      Application.put_env(:vagus, :core_base_url, "http://127.0.0.1:#{port}")
+
+      assert Health.check() == :healthy
+    end
+
+    test "with the socket present, the probe rides it" do
+      path =
+        Path.join(System.tmp_dir!(), "vagus_health_#{System.unique_integer([:positive])}.sock")
+
+      on_exit(fn -> File.rm(path) end)
+
+      start_supervised!(
+        {Bandit,
+         plug: __MODULE__.FakePlug,
+         port: 0,
+         thousand_island_options: [num_acceptors: 1, transport_options: [ip: {:local, path}]]},
+        id: :fake_core_socket
+      )
+
+      # Nothing is listening on this TCP base — only the socket can answer.
+      Application.put_env(:vagus, :core_base_url, "http://127.0.0.1:1")
+      Application.put_env(:vagus, :core_socket_path, path)
+
+      assert Health.check() == :healthy
+
+      # Core going away (socket unlinked) falls back to the — here dead —
+      # TCP base rather than reporting a stale :healthy.
+      File.rm!(path)
+      assert Health.check() == :unhealthy
     end
   end
 end

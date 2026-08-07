@@ -19,6 +19,10 @@ defmodule Vagus.Core.Lifecycle do
       `Vagus.Core.Versions`.
     * `:health` - zero-arity fn `-> :healthy | :timeout`, the health gate.
       Defaults to `fn -> Vagus.Core.Health.await_healthy() end`.
+    * `:http_config` - zero-arity fn run whenever this module establishes
+      that Core is up, to re-pull Core's own HTTP parameters. Defaults to
+      `fn -> Vagus.Core.HttpConfig.refresh() end`; its return value is
+      ignored (see "HTTP-config refresh" below).
     * `:token` - threaded into `Vagus.Core.Container.create_config/2` when
       present (tests inject; production omits it, so `Container` falls back
       to its own real `Vagus.API.Token.get/0` default).
@@ -34,7 +38,7 @@ defmodule Vagus.Core.Lifecycle do
   | Op | Upstream (§1/§4) | v1 here |
   |---|---|---|
   | `adopt` | `attach()`: inspect by name, adopt as-is, no reconciliation | same — inspect by name, seed `Versions` from the running tag, never create |
-  | `start` | reuse if `ImageID` matches desired, else "extended start" (recreate) | reuse if `Config.Image` tag matches desired, else recreate; already-running is a no-op |
+  | `start` | reuse if `ImageID` matches desired, else "extended start" (recreate) | reuse if `Config.Image` tag AND spec fingerprint match desired, else recreate; already-running is a no-op |
   | `stop` | `docker stop` (S6 timeout), `remove_container=False` by default | identical — keeps the container |
   | `restart` | `docker restart`, no recreate | identical |
   | `rebuild` | stop-with-remove then start (recreates from current spec) | stop + remove + create(installed) + start — the drift healer |
@@ -79,14 +83,26 @@ defmodule Vagus.Core.Lifecycle do
 
   A container is only ever **reused** (plain `docker start`/`restart`, no
   create) when it already exists under the fixed name AND its
-  `Config.Image` equals `Vagus.Core.Container.image(desired_version)` —
+  `Config.Image` equals `Vagus.Core.Container.image(desired_version)` AND
+  its `Vagus.Core.Container.spec_fingerprint_label/0` label equals the
+  fingerprint of the spec `create_config/2` would build right now —
   otherwise every op that needs the container running recreates it: stop
   the old one (S6-derived timeout, keeping upstream's grace period),
   remove it, `create_config/2` a fresh one from the current spec, start it.
   This is exactly how drift gets healed: `adopt/1` never reconciles a
   running container's spec, so a hand-edited or stale-image container is
-  left alone until the next `rebuild/1` (explicit) or a version-mismatched
+  left alone until the next `rebuild/1` (explicit) or a mismatched
   `start/1`/`update/2` forces a recreate.
+
+  The fingerprint half is what makes that generic rather than
+  version-only. Upstream's own reuse check is image-identity, which silently
+  keeps a container running against a spec Vagus no longer builds — every
+  env/mount change we ship (the `/run/supervisor` socket mount being the
+  first) would otherwise need its own bespoke migration, or would simply
+  never take effect on an already-installed device until someone hit
+  `rebuild`. A container whose label is **absent** (created before
+  fingerprinting existed, or by hand) can never match, so the first
+  `start/1` after such an upgrade recreates it exactly once.
 
   ## Health gate placement
 
@@ -98,6 +114,35 @@ defmodule Vagus.Core.Lifecycle do
   not-running update just swaps image+version, the container isn't
   started, and the whole point of the health gate — verifying the new
   Core actually comes up — doesn't apply to a container that stays down).
+
+  ## HTTP-config refresh
+
+  Core's HTTP parameters (`Vagus.Core.HttpConfig` — the port it actually
+  listens on, ssl, server_host) are re-pulled at every point this module
+  establishes that Core is up: after a passing health gate, and on the
+  already-running no-op `start/1`. That no-op branch is not redundant —
+  `Vagus.Core.Boot` calls `start/1` unconditionally on every boot, so it is
+  the only hook that fires when Vagus restarts (an OTA, say) under a Core
+  that kept running, where no health gate ever runs.
+
+  The refresh cannot fail an op: `HttpConfig.refresh/1` returns
+  `{:skipped, :no_socket}` on the TCP fallback and `{:error, _}` on a pull
+  failure (logging it there), both of which are ignored here — a Core that
+  is demonstrably healthy is not "failed to start" because it wouldn't say
+  which port it is on.
+
+  ## The socket file outlives Core
+
+  Core never unlinks the `SUPERVISOR_CORE_API_SOCKET` it created
+  (`Vagus.Core.Container.socket_path/0`) — a unix socket's directory entry
+  survives the process that bound it. Left alone, that file keeps
+  `Vagus.Core.Transport` resolving `{:socket, _}` at an endpoint nothing is
+  listening on for as long as Core is down, so the TCP fallback never
+  engages and a plain file dropped there would pin the transport
+  indefinitely. Every op here that leaves Core stopped or removed therefore
+  unlinks it (mirroring `scripts/dev-core.sh down`), best-effort: the next
+  Core start recreates it, and a failed unlink is logged, never returned —
+  a `stop` that worked is not a failure because a stale file survived it.
 
   ## Non-atomicity
 
@@ -183,7 +228,9 @@ defmodule Vagus.Core.Lifecycle do
   reentrant call the way it would if one locked op called another.
   """
 
-  alias Vagus.Core.{Container, Health, Versions}
+  require Logger
+
+  alias Vagus.Core.{Container, Health, HttpConfig, Transport, Versions}
   alias Vagus.Runtime.Docker
 
   @fallback_stop_timeout_s 260
@@ -352,22 +399,37 @@ defmodule Vagus.Core.Lifecycle do
   end
 
   defp start_existing(info, version, opts) do
-    desired_image = Container.image(version)
+    desired_fingerprint = Container.spec_fingerprint(desired_spec(version, opts))
 
     cond do
-      image_of(info) == desired_image and running?(info) ->
-        :ok
+      image_of(info) != Container.image(version) ->
+        recreate(info, version, opts)
 
-      image_of(info) == desired_image ->
+      fingerprint_of(info) != desired_fingerprint ->
+        Logger.info(
+          "Vagus.Core.Lifecycle: Core container spec drift " <>
+            "(#{inspect(fingerprint_of(info))} != #{inspect(desired_fingerprint)}) — recreating"
+        )
+
+        recreate(info, version, opts)
+
+      running?(info) ->
+        # Nothing to do to the container — but this IS the boot-time
+        # reconcile hook (see "HTTP-config refresh" in the moduledoc), and
+        # Core may have picked a different port since we last asked.
+        refresh_http_config(opts)
+
+      true ->
         with :ok <- Docker.start_container(Container.name(), docker_opts(opts)) do
           health_gate(opts)
         end
+    end
+  end
 
-      true ->
-        with :ok <- stop_existing(info, opts),
-             :ok <- Docker.remove_container(Container.name(), docker_opts(opts)) do
-          create_and_start(version, opts)
-        end
+  defp recreate(info, version, opts) do
+    with :ok <- stop_existing(info, opts),
+         :ok <- remove_container(opts) do
+      create_and_start(version, opts)
     end
   end
 
@@ -380,7 +442,13 @@ defmodule Vagus.Core.Lifecycle do
         {:error, _reason} -> @fallback_stop_timeout_s
       end
 
-    Docker.stop_container(Container.name(), Keyword.merge(docker_opts(opts), timeout: timeout))
+    case Docker.stop_container(
+           Container.name(),
+           Keyword.merge(docker_opts(opts), timeout: timeout)
+         ) do
+      :ok -> unlink_core_socket()
+      {:error, reason} -> {:error, reason}
+    end
   end
 
   ## restart/1
@@ -398,7 +466,7 @@ defmodule Vagus.Core.Lifecycle do
     with {:ok, version} <- resolve_installed_version(opts),
          :ok <- maybe_write_safe_mode_marker(opts),
          :ok <- stop_if_present(opts),
-         :ok <- Docker.remove_container(Container.name(), docker_opts(opts)) do
+         :ok <- remove_container(opts) do
       create_and_start(version, opts)
     end
   end
@@ -498,7 +566,7 @@ defmodule Vagus.Core.Lifecycle do
     :ok = report_stage(opts, "stop", 60)
 
     with :ok <- stop_existing(info, opts),
-         :ok <- Docker.remove_container(Container.name(), docker_opts(opts)) do
+         :ok <- remove_container(opts) do
       finish_update(was_running, target, rollback_version, opts)
     end
   end
@@ -550,7 +618,7 @@ defmodule Vagus.Core.Lifecycle do
 
   defp rollback(rollback_version, opts) do
     with :ok <- Docker.stop_container(Container.name(), docker_opts(opts)),
-         :ok <- Docker.remove_container(Container.name(), docker_opts(opts)),
+         :ok <- remove_container(opts),
          :ok <- recreate_previous(rollback_version, opts) do
       {:error, {:health_timeout, :rolled_back}}
     else
@@ -574,7 +642,7 @@ defmodule Vagus.Core.Lifecycle do
   defp maybe_remove_stale(false, _opts), do: :ok
 
   defp maybe_remove_stale(true, opts),
-    do: Docker.remove_container(Container.name(), docker_opts(opts))
+    do: remove_container(opts)
 
   defp recreate_previous(rollback_version, opts) do
     with {:ok, id} <- do_create(rollback_version, opts),
@@ -588,9 +656,54 @@ defmodule Vagus.Core.Lifecycle do
 
   defp inspect_container(opts), do: Docker.inspect_container(Container.name(), docker_opts(opts))
 
+  # Every remove goes through here so the socket the removed container
+  # created can't outlive it — see the moduledoc's "The socket file outlives
+  # Core" section.
+  defp remove_container(opts) do
+    case Docker.remove_container(Container.name(), docker_opts(opts)) do
+      :ok -> unlink_core_socket()
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  # `nil` is `config :vagus, :core_socket_path` set explicitly to "there is
+  # never a socket here" (the test suite, host dev without one) — nothing to
+  # unlink. Always `:ok`: a stale file surviving is a degraded transport
+  # decision, not a failed lifecycle op.
+  #
+  # The path is config/module-derived (`Vagus.Core.Transport.socket_path/0`),
+  # never request input.
+  # sobelow_skip ["Traversal.FileModule"]
+  defp unlink_core_socket do
+    case Transport.socket_path() do
+      nil ->
+        :ok
+
+      path ->
+        log_unlink(path, File.rm(path))
+        :ok
+    end
+  end
+
+  defp log_unlink(_path, :ok), do: :ok
+  defp log_unlink(_path, {:error, :enoent}), do: :ok
+
+  defp log_unlink(path, {:error, reason}) do
+    Logger.warning(
+      "Vagus.Core.Lifecycle: could not unlink #{path} (#{inspect(reason)}) — " <>
+        "Vagus will keep resolving the socket transport while Core is down"
+    )
+  end
+
   defp do_create(version, opts) do
-    config = Container.create_config(version, create_config_opts(opts))
+    config = desired_spec(version, opts)
     Docker.create_container(config, Keyword.merge(docker_opts(opts), name: Container.name()))
+  end
+
+  # The spec a create would build right now — the fingerprint comparison in
+  # `start_existing/3` and the create itself must read the exact same one.
+  defp desired_spec(version, opts) do
+    Container.create_config(version, create_config_opts(opts))
   end
 
   defp create_and_start(version, opts) do
@@ -630,13 +743,29 @@ defmodule Vagus.Core.Lifecycle do
     health = Keyword.get(opts, :health, fn -> Health.await_healthy() end)
 
     case health.() do
-      :healthy -> :ok
+      :healthy -> refresh_http_config(opts)
       :timeout -> {:error, :health_timeout}
     end
   end
 
+  # Always `:ok` — see the moduledoc's "HTTP-config refresh" section for why
+  # a failed pull never fails the op that triggered it.
+  defp refresh_http_config(opts) do
+    refresh = Keyword.get(opts, :http_config, fn -> HttpConfig.refresh() end)
+    _result = refresh.()
+    :ok
+  end
+
   defp image_of(%{"Config" => %{"Image" => image}}), do: image
   defp image_of(_info), do: nil
+
+  # `nil` for a container created before spec fingerprinting existed (or by
+  # hand) — never equal to a real fingerprint, so it always recreates.
+  defp fingerprint_of(%{"Config" => %{"Labels" => labels}}) when is_map(labels) do
+    Map.get(labels, Container.spec_fingerprint_label())
+  end
+
+  defp fingerprint_of(_info), do: nil
 
   defp running?(%{"State" => %{"Running" => running}}), do: running == true
   defp running?(_info), do: false
