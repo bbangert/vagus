@@ -17,9 +17,10 @@ set -euo pipefail
 # the container-side port it is published FROM, i.e. the port Core itself
 # binds. Core 2026.8+ binds 80 (`SUPERVISOR_DEFAULT_PORT`) on a fresh
 # supervised install — which is what a vagus device gives it since Phase B
-# vacated :80 — and 8123 only as its bind-failure fallback, so exercising the
-# port-80 contract means `CORE_PORT=80`. CORE_PORT stays 8123 by default,
-# matching CORE_VERSION's own (pre-port-80) default.
+# vacated :80 — and 8123 only as its bind-failure fallback. Both defaults
+# now exercise that real contract out of the box: CORE_VERSION defaults to
+# 2026.8.0 and CORE_PORT to 80. Set CORE_PORT=8123 (alongside an older
+# CORE_VERSION) to exercise a pre-2026.8 image instead.
 #
 # Override HOST_PORT when the host port is already taken (e.g. a port-forward
 # to a real HA). Because the emulator's EventPusher/Client dial Core back at
@@ -81,10 +82,11 @@ set -euo pipefail
 #   # Example when host 8123 is occupied:
 #   HOST_PORT=8124 scripts/dev-core.sh up
 #
-#   # Example: a port-80 Core 2026.8 with its legacy-port stub published too,
-#   # i.e. what scripts/probe_onboarding.exs expects (after a `reset`):
-#   CORE_VERSION=2026.8.0 CORE_PORT=80 HOST_PORT=80 LEGACY_HOST_PORT=8123 \
-#     scripts/dev-core.sh up
+#   # Example: publish Core's legacy-port stub alongside the (now default)
+#   # port-80 web UI, i.e. what scripts/probe_onboarding.exs expects (after
+#   # a `reset`). HOST_PORT=80 requires the matching VAGUS_CORE_BASE_URL
+#   # export `up` prints (see the NOTE below) before starting the emulator:
+#   HOST_PORT=80 LEGACY_HOST_PORT=8123 scripts/dev-core.sh up
 #
 #   # Example from inside a docker-outside-of-docker devcontainer whose
 #   # workspace bind-mount source (on the real host) is /home/ben/src/vagus:
@@ -95,14 +97,14 @@ set -euo pipefail
 # hassio ConfigEntryNotReady (hassio self-heals on retry; the other two need a
 # Core `restart`). Emulator-first avoids the noise entirely.
 
-CORE_VERSION="${CORE_VERSION:-2026.7.2}"
+CORE_VERSION="${CORE_VERSION:-2026.8.0}"
 CORE_IMAGE="ghcr.io/home-assistant/home-assistant:${CORE_VERSION}"
 CONTAINER_NAME="${CONTAINER_NAME:-vagus-dev-core}"
 CONFIG_VOLUME="${CONFIG_VOLUME:-vagus-dev-core-config}"
 SUPERVISOR_HOST="${SUPERVISOR_HOST:-172.17.0.1}"
 SUPERVISOR_PORT="${SUPERVISOR_PORT:-8888}"
 HOST_PORT="${HOST_PORT:-8123}"
-CORE_PORT="${CORE_PORT:-8123}"
+CORE_PORT="${CORE_PORT:-80}"
 LEGACY_HOST_PORT="${LEGACY_HOST_PORT:-}"
 
 # In-container mount point + env var — matches Vagus.Core.Container's device

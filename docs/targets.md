@@ -14,6 +14,17 @@ All three are aarch64 on the same toolchain, so `arch` is `aarch64`
 everywhere and Core runs the generic `ghcr.io/home-assistant/home-assistant`
 image on all of them (no per-machine image).
 
+## Web UI port (0.6.0+)
+
+The HA web UI is at `http://<board>/` (port 80). During fresh-install
+onboarding, `:8123` serves a 307 redirect to it and stops listening once
+onboarding completes. Boards upgrading from ≤0.5.x move to port 80 at Core's
+first restart after the OTA — a one-shot supervisor-side migration of Core's
+stored port; the OTA itself forces one Core container recreate, so this
+happens automatically. The Supervisor API itself now listens only on
+`172.30.32.2:8888`, with a DNAT serving the add-on contract at
+`http://supervisor/`.
+
 ## Building
 
 ```sh
@@ -109,7 +120,7 @@ Full parity gate, 2026-07-27, on firmware built from merged `main`:
 | Capability | Status |
 | --- | --- |
 | Container engine (balenaEngine v25) | daemon self-starts, builds `hassio`/`bridge` networks, programs NAT |
-| HA Core cold start | 2.33 GB image pull → container running → `:healthy` on `:8123` |
+| HA Core cold start | 2.33 GB image pull → container running → `:healthy` on `:8123` (pre-0.6.0; Core binds `:80` since the port-80 move) |
 | hassio integration | all 20 coordinator endpoints 200; Core mints a `hassio_user`; `hassio: Supervisor` config entry `loaded` |
 | DNS | `Vagus.DNS` on `172.30.32.3:53`, resolves external and hassio-internal names |
 | Native MQTT (`core_mqtt`) | discovery → Core config entry "MQTT Broker (native)"; session stable over a 6+ minute soak with zero reconnects |

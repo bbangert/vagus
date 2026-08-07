@@ -1,7 +1,8 @@
 defmodule Vagus.Provisioner do
   @moduledoc """
   First-boot provisioning (issue #40): flash → power → network →
-  `http://board:8123` shows the HA onboarding wizard, zero console commands.
+  `http://board/` shows the HA onboarding wizard (`:8123` 307-redirects there
+  during onboarding), zero console commands.
   Runs an ordered, idempotent list of steps — today `[:expand_data,
   :provision_core]` — once per boot, retrying whatever isn't ready yet.
 
