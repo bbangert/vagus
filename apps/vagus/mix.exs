@@ -26,7 +26,18 @@ defmodule Vagus.MixProject do
       # .github/workflows/ci.yml: PLTs are deleted on any cache-key miss so
       # dialyxir rebuilds them against the current deps. Locally: delete
       # _build/*/dialyxir_* after changing deps.
-      dialyzer: [ignore_warnings: ".dialyzer_ignore.exs", list_unused_filters: true]
+      dialyzer: [
+        # :ssh isn't inferred as a PLT app from any dep — Vagus.SSHAccess
+        # calls straight into the OTP `:ssh`/`:public_key`/`:crypto`
+        # applications (`:ssh_file.encode/2`, `:ssh.hostkey_fingerprint/2`,
+        # `:crypto.generate_key/2`, the `{:ECPoint, _}`/`{:namedCurve, _}`
+        # public_key records) without a Hex dep pulling their PLT info in,
+        # so Dialyzer reports those as unknown/nonexistent functions unless
+        # the apps are added explicitly.
+        plt_add_apps: [:ssh, :public_key, :crypto],
+        ignore_warnings: ".dialyzer_ignore.exs",
+        list_unused_filters: true
+      ]
     ]
   end
 
