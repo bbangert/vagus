@@ -74,7 +74,18 @@ defmodule Vagus.API.ListenerTest do
       options = Listener.bandit_options()
 
       assert options[:http_options] == [compress: false]
-      assert options[:thousand_island_options] == [num_acceptors: 2, read_timeout: 900_000]
+
+      assert options[:thousand_island_options] == [
+               num_acceptors: 2,
+               read_timeout: 900_000,
+               supervisor_options: [name: Vagus.API.Listener.Bandit]
+             ]
+    end
+
+    test "the child registers a name, so a restarted manager can find it" do
+      options = Listener.bandit_options(listener_name: :some_listener)
+
+      assert options[:thousand_island_options][:supervisor_options] == [name: :some_listener]
     end
 
     test "explicit opts win over config" do
@@ -103,7 +114,15 @@ defmodule Vagus.API.ListenerTest do
     defp start_listener(opts) do
       start_supervised!(
         {Listener,
-         Keyword.merge([name: nil, supervisor: listener_supervisor(), retry_ms: 10], opts)},
+         Keyword.merge(
+           [
+             name: nil,
+             supervisor: listener_supervisor(),
+             listener_name: unique_listener_name(),
+             retry_ms: 10
+           ],
+           opts
+         )},
         id: {:listener, System.unique_integer([:positive])}
       )
     end
@@ -211,6 +230,11 @@ defmodule Vagus.API.ListenerTest do
     receive do: ({:returned, value} -> value)
   end
 
+  # Every real-socket test gets its own registered child name — the default
+  # is a single global atom, and adoption would otherwise make one test's
+  # listener visible to the next.
+  defp unique_listener_name, do: :"vagus_listener_test_#{System.unique_integer([:positive])}"
+
   describe "against a real socket" do
     test "the ip: option reaches the listening socket" do
       {:ok, sup} =
@@ -221,7 +245,13 @@ defmodule Vagus.API.ListenerTest do
       listener =
         capture_log_returning(fn ->
           start_supervised!(
-            {Listener, name: nil, supervisor: sup, ip: {127, 0, 0, 1}, port: 0, plug: EchoPlug},
+            {Listener,
+             name: nil,
+             supervisor: sup,
+             listener_name: unique_listener_name(),
+             ip: {127, 0, 0, 1},
+             port: 0,
+             plug: EchoPlug},
             id: :vagus_listener_real
           )
         end)
@@ -250,6 +280,7 @@ defmodule Vagus.API.ListenerTest do
             {Listener,
              name: nil,
              supervisor: sup,
+             listener_name: unique_listener_name(),
              ip: {127, 0, 0, 1},
              port: 0,
              plug: EchoPlug,
@@ -275,6 +306,72 @@ defmodule Vagus.API.ListenerTest do
       end)
     end
 
+    test "a crash of the manager leaves its listener adoptable, not orphaned" do
+      # `restart: :temporary` means nothing else will ever pick this child up:
+      # a replacement manager that could not find it would bind again and get
+      # :eaddrinuse forever, with the live listener unmonitored.
+      {:ok, sup} =
+        start_supervised({DynamicSupervisor, name: :vagus_listener_adopt_sup},
+          id: :vagus_listener_adopt_sup
+        )
+
+      name = unique_listener_name()
+      parent = self()
+
+      first =
+        capture_log_returning(fn ->
+          start_supervised!(
+            {Listener,
+             name: nil,
+             supervisor: sup,
+             listener_name: name,
+             ip: {127, 0, 0, 1},
+             port: 0,
+             plug: EchoPlug,
+             retry_ms: 50},
+            id: :vagus_listener_adopt_first,
+            restart: :temporary
+          )
+        end)
+
+      assert %{listener_pid: bandit} = :sys.get_state(first)
+      assert Process.whereis(name) == bandit
+
+      Process.exit(first, :kill)
+
+      starter = fn _sup, _options ->
+        send(parent, :bind_attempt)
+        {:error, :eaddrinuse}
+      end
+
+      log =
+        capture_log(fn ->
+          second =
+            start_supervised!(
+              {Listener,
+               name: nil,
+               supervisor: sup,
+               listener_name: name,
+               ip: {127, 0, 0, 1},
+               port: 0,
+               plug: EchoPlug,
+               retry_ms: 50,
+               starter: starter},
+              id: :vagus_listener_adopt_second
+            )
+
+          assert %{listener_pid: ^bandit} = :sys.get_state(second)
+          refute_receive :bind_attempt, 200
+
+          # The monitor is real, not just the pid in state: the adopted
+          # listener dying puts the replacement back on its retry loop.
+          Process.exit(bandit, :kill)
+          assert_receive :bind_attempt, 1_000
+        end)
+
+      assert log =~ "adopting the running listener"
+    end
+
     test "an address that does not exist on this host never binds, and never crashes" do
       # 192.0.2.0/24 is TEST-NET-1 — guaranteed not configured here, which is
       # exactly the state 172.30.32.2 is in until the hassio bridge is up.
@@ -290,6 +387,7 @@ defmodule Vagus.API.ListenerTest do
               {Listener,
                name: nil,
                supervisor: sup,
+               listener_name: unique_listener_name(),
                ip: {192, 0, 2, 1},
                port: 0,
                plug: EchoPlug,

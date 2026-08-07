@@ -1220,8 +1220,9 @@ defmodule Vagus.Core.LifecycleTest do
   end
 
   ## The Core port migration — `Vagus.Core.PortMigration` owns the conditions
-  ## and is unit-tested in full next door; these prove only that `start/1` is
-  ## the choke point that runs it, before Core comes up.
+  ## and is unit-tested in full next door; these prove only which ops run it,
+  ## i.e. that it lands whenever Core's process is about to (re)start and
+  ## never against a Core that is up.
 
   # `Vagus.Core.PortMigration`'s fixtures, kept minimal here — that module's
   # own test owns the store's real shape and every condition.
@@ -1286,7 +1287,10 @@ defmodule Vagus.Core.LifecycleTest do
       refute File.exists?(marker)
     end
 
-    test "start/1 on an already-running container still migrates (Core picks it up on its next restart)" do
+    test "start/1 on an already-running container leaves the store alone" do
+      # A live Core would not re-read the rewrite and would overwrite it from
+      # its in-memory config at its next persist — this device heals at its
+      # next actual restart, which is the only moment the edit can take.
       dir = tmp_config_dir()
       marker = migration_marker()
       write_core_store!(dir, 8123)
@@ -1304,6 +1308,84 @@ defmodule Vagus.Core.LifecycleTest do
                )
 
       refute_receive :health_called, 100
+      assert stored_core_port(dir) == 8123
+    end
+
+    test "restart/1 migrates — `docker restart` stops Core before it starts it" do
+      dir = tmp_config_dir()
+      marker = migration_marker()
+      write_core_store!(dir, 8123)
+
+      engine = start_engine([{204, nil}])
+
+      assert :ok =
+               Lifecycle.restart(
+                 docker: [socket: engine.socket],
+                 health: health_fun(),
+                 homeassistant_path: dir,
+                 port_migration_marker: marker
+               )
+
+      assert_receive :health_called
+      assert stored_core_port(dir) == 80
+    end
+
+    test "rebuild/1 migrates before the recreated container starts" do
+      dir = tmp_config_dir()
+      marker = migration_marker()
+      write_core_store!(dir, 8123)
+
+      engine =
+        start_engine([
+          {200, inspect_body(Container.image("2026.7.0"), true)},
+          {204, nil},
+          {204, nil},
+          create_ok("rebuilt-id"),
+          {204, nil}
+        ])
+
+      versions = start_versions("2026.7.0")
+
+      assert :ok =
+               Lifecycle.rebuild(
+                 docker: [socket: engine.socket],
+                 versions: versions,
+                 health: health_fun(),
+                 homeassistant_path: dir,
+                 port_migration_marker: marker
+               )
+
+      assert_receive :health_called
+      assert stored_core_port(dir) == 80
+    end
+
+    test "update/2 migrates before the new container starts" do
+      dir = tmp_config_dir()
+      marker = migration_marker()
+      write_core_store!(dir, 8123)
+
+      engine =
+        start_engine([
+          pull_ok(),
+          {200, inspect_body(Container.image("2026.7.0"), true)},
+          {204, nil},
+          {204, nil},
+          create_ok("updated-id"),
+          {204, nil}
+        ])
+
+      versions = start_versions("2026.7.0")
+
+      assert {:ok, "2026.8.0"} =
+               Lifecycle.update("2026.8.0",
+                 docker: [socket: engine.socket],
+                 versions: versions,
+                 health: health_fun(),
+                 homeassistant_path: dir,
+                 port_migration_marker: marker
+               )
+
+      assert_receive :health_called
       assert stored_core_port(dir) == 80
     end
 
@@ -1336,7 +1418,12 @@ defmodule Vagus.Core.LifecycleTest do
       dir = tmp_config_dir()
       write_core_store!(dir, 8123)
 
-      engine = start_engine([{200, inspect_body(Container.image("2026.7.0"), true)}])
+      engine =
+        start_engine([
+          {200, inspect_body(Container.image("2026.7.0"), false)},
+          {204, nil}
+        ])
+
       versions = start_versions("2026.7.0")
 
       assert :ok =

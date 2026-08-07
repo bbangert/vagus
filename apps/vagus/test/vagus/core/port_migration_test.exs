@@ -334,6 +334,30 @@ defmodule Vagus.Core.PortMigrationTest do
       refute File.exists?(marker)
     end
 
+    test "a mode that cannot be copied aborts the rewrite instead of widening the store" do
+      # The tmp file is created under this process's umask (world-readable);
+      # renaming it over Core's 0600 store would leak the settings that mode
+      # protects, so a failed stat/chmod must abort, not fall through.
+      dir = tmp_volume()
+      marker = tmp_marker()
+      contents = write_store!(dir, store())
+      File.chmod!(store_path(dir), 0o600)
+
+      log =
+        capture_log(fn ->
+          assert {:error, :enoent} =
+                   PortMigration.run(
+                     opts(dir, marker) ++ [stat: fn _path -> {:error, :enoent} end]
+                   )
+        end)
+
+      assert log =~ "could not rewrite"
+      assert File.read!(store_path(dir)) == contents
+      assert Bitwise.band(File.stat!(store_path(dir)).mode, 0o777) == 0o600
+      assert File.ls!(Path.join(dir, ".storage")) == ["http"]
+      refute File.exists?(marker)
+    end
+
     test "a marker write failure leaves the device unconfirmed, and that is survivable" do
       dir = tmp_volume()
       marker = unwritable_marker()

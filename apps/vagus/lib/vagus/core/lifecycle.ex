@@ -133,26 +133,30 @@ defmodule Vagus.Core.Lifecycle do
 
   ## Core's stored port
 
-  `start/1` runs `Vagus.Core.PortMigration.run/1` before anything else it
-  does — the rewrite of the port Core persisted for itself in
-  `<config>/.storage/http`, which on an already-installed fleet board still
-  says 8123 and which Core prefers over every default once it exists (see
-  that module for the full story). It re-runs on every start until Core has
-  actually been seen serving port 80, which is a fact only the HTTP-config
-  refresh above can establish.
+  `Vagus.Core.PortMigration.run/1` rewrites the port Core persisted for
+  itself in `<config>/.storage/http`, which on an already-installed fleet
+  board still says 8123 and which Core prefers over every default once it
+  exists (see that module for the full story). It re-runs until Core has
+  actually been seen serving port 80, a fact only the HTTP-config refresh
+  above can establish.
 
-  This is the choke point rather than each individual create/start call
-  because it has to happen *before* Core comes up to take effect on that
-  same start, and `start/1` is the one op guaranteed to run: `Vagus.Core.Boot`
-  calls it unconditionally on every boot, adopted-running or not. `rebuild/1`
-  and `update/2` deliberately do not get their own call — any device that can
-  reach them has already booted, and any device on which they create Core for
-  the very first time has no stored config for the migration to act on.
+  It hangs off the two places this module hands Core's process a fresh
+  start — `start_container/2` (every create+start, plain start and rollback
+  recreate) and `restart/1`'s in-place `docker restart` — because Core reads
+  that file once, at process start, and rewrites it from its in-memory
+  config whenever it persists. Writing while Core is live is therefore both
+  useless (it will not re-read) and lossy (its next persist wins, and the
+  read→rename here would drop any unrelated setting it wrote in between), so
+  the already-running no-op branch of `start_existing/3` deliberately leaves
+  the store alone; that device heals at its next actual restart, which is
+  the only moment the rewrite could take effect anyway.
 
-  The already-running no-op branch of `start_existing/3` is not an exception:
-  the rewrite still lands, and Core picks the new port up whenever it next
-  restarts. A migration that fails, for any reason, is logged and ignored —
-  it can never fail the start it was called from.
+  `restart/1` is the one write issued against a container that is still up.
+  It is safe for the same reason it is necessary: `docker restart` stops
+  Core before starting it, so the rewrite is what that boot reads.
+
+  A migration that fails, for any reason, is logged and ignored — it can
+  never fail the op it was called from.
 
   ## The socket file outlives Core
 
@@ -412,10 +416,6 @@ defmodule Vagus.Core.Lifecycle do
   ## start/1
 
   defp do_start(opts) do
-    # Pre-start, idempotent, ignored either way — see the moduledoc's
-    # "Core's stored port" section and `Vagus.Core.PortMigration`.
-    _outcome = PortMigration.run(opts)
-
     with {:ok, version} <- resolve_start_version(opts) do
       case inspect_container(opts) do
         {:ok, info} -> start_existing(info, version, opts)
@@ -443,11 +443,13 @@ defmodule Vagus.Core.Lifecycle do
       running?(info) ->
         # Nothing to do to the container — but this IS the boot-time
         # reconcile hook (see "HTTP-config refresh" in the moduledoc), and
-        # Core may have picked a different port since we last asked.
+        # Core may have picked a different port since we last asked. The
+        # stored-port migration deliberately does NOT run here: see "Core's
+        # stored port".
         refresh_http_config(opts)
 
       true ->
-        with :ok <- Docker.start_container(Container.name(), docker_opts(opts)) do
+        with :ok <- start_container(Container.name(), opts) do
           health_gate(opts)
         end
     end
@@ -482,6 +484,7 @@ defmodule Vagus.Core.Lifecycle do
 
   defp do_restart(opts) do
     with :ok <- maybe_write_safe_mode_marker(opts),
+         :ok <- migrate_stored_port(opts),
          :ok <- Docker.restart_container(Container.name(), docker_opts(opts)) do
       health_gate(opts)
     end
@@ -614,7 +617,7 @@ defmodule Vagus.Core.Lifecycle do
   end
 
   defp finish_update_start(id, target, rollback_version, opts) do
-    case Docker.start_container(id, docker_opts(opts)) do
+    case start_container(id, opts) do
       :ok ->
         Versions.set_installed(target, versions_server(opts))
         :ok = report_stage(opts, "health", 85)
@@ -673,7 +676,7 @@ defmodule Vagus.Core.Lifecycle do
 
   defp recreate_previous(rollback_version, opts) do
     with {:ok, id} <- do_create(rollback_version, opts),
-         :ok <- Docker.start_container(id, docker_opts(opts)) do
+         :ok <- start_container(id, opts) do
       Versions.set_installed(rollback_version, versions_server(opts))
       :ok
     end
@@ -727,6 +730,20 @@ defmodule Vagus.Core.Lifecycle do
     Docker.create_container(config, Keyword.merge(docker_opts(opts), name: Container.name()))
   end
 
+  # Every container start in this module goes through here, so the stored-port
+  # migration lands in the one window where it can take: the container is
+  # freshly created or stopped, never live. See "Core's stored port".
+  defp start_container(id, opts) do
+    :ok = migrate_stored_port(opts)
+    Docker.start_container(id, docker_opts(opts))
+  end
+
+  # Always `:ok` — a migration cannot fail the op it runs from.
+  defp migrate_stored_port(opts) do
+    _outcome = PortMigration.run(opts)
+    :ok
+  end
+
   # The spec a create would build right now — the fingerprint comparison in
   # `start_existing/3` and the create itself must read the exact same one.
   defp desired_spec(version, opts) do
@@ -735,7 +752,7 @@ defmodule Vagus.Core.Lifecycle do
 
   defp create_and_start(version, opts) do
     with {:ok, id} <- do_create(version, opts),
-         :ok <- Docker.start_container(id, docker_opts(opts)) do
+         :ok <- start_container(id, opts) do
       health_gate(opts)
     end
   end

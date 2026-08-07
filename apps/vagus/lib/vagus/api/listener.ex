@@ -36,6 +36,23 @@ defmodule Vagus.API.Listener do
 
   A `:api_bind_ip` that is unset (`:host`, `mix test`) means no `ip:`
   option, i.e. Bandit's wildcard default, and the first attempt succeeds.
+
+  ## Why the Bandit child is registered under a name
+
+  The child is `restart: :temporary`, so this GenServer is its only restart
+  owner — but that cuts both ways: if *this* process crashes, the Bandit it
+  started keeps serving, and the replacement started by
+  `Vagus.API.Supervisor` has no memory of it. Without a name there is no way
+  to find it, so the replacement would bind again, get `:eaddrinuse` for the
+  rest of uptime, and leave the live listener unmonitored and unowned.
+
+  So the child registers `#{inspect(__MODULE__)}.Bandit`
+  (`thousand_island_options[:supervisor_options][:name]` — Thousand Island
+  passes those straight to `Supervisor.start_link/3`, and the pid it names is
+  exactly the one `DynamicSupervisor.start_child/2` returns). A starting
+  listener looks that name up first and adopts what it finds, monitor and
+  all; only an unregistered name means nothing is serving and a fresh bind
+  is right.
   """
 
   use GenServer
@@ -47,6 +64,7 @@ defmodule Vagus.API.Listener do
 
   @default_port 8888
   @retry_ms 5_000
+  @listener_name __MODULE__.Bandit
 
   # A bind that keeps failing logs once, then once a minute (@retry_ms *
   # @loud_every) — enough to diagnose a device whose bridge never came up,
@@ -64,6 +82,9 @@ defmodule Vagus.API.Listener do
     * `:starter` — 2-arity `(supervisor, bandit_opts) -> DynamicSupervisor.on_start_child()`
       seam, so the retry/monitor logic is testable without a socket
     * `:retry_ms` — delay between attempts (default `#{@retry_ms}`)
+    * `:listener_name` — the name the Bandit child registers, and the one
+      this manager adopts by (default `#{inspect(@listener_name)}`); tests
+      give each instance its own so they can run against real sockets
     * `:port`, `:ip`, `:plug` — override the values `bandit_options/1`
       otherwise reads from config
   """
@@ -104,7 +125,11 @@ defmodule Vagus.API.Listener do
       # legitimately idle-but-open ingress connection (a long-polling panel
       # asset, a slow log tail) is never killed by the transport layer
       # before the session itself would time the client out.
-      thousand_island_options: [num_acceptors: 2, read_timeout: 900_000]
+      thousand_island_options: [
+        num_acceptors: 2,
+        read_timeout: 900_000,
+        supervisor_options: [name: listener_name(opts)]
+      ]
     ]
 
     case bind_ip(opts) do
@@ -114,6 +139,8 @@ defmodule Vagus.API.Listener do
   end
 
   defp configured_port, do: Application.get_env(:vagus, :api_port, @default_port)
+
+  defp listener_name(opts), do: Keyword.get(opts, :listener_name, @listener_name)
 
   defp bind_ip(opts) do
     case Keyword.get_lazy(opts, :ip, fn -> Application.get_env(:vagus, :api_bind_ip) end) do
@@ -142,6 +169,7 @@ defmodule Vagus.API.Listener do
       supervisor: Keyword.get(opts, :supervisor, Vagus.API.ListenerSupervisor),
       starter: Keyword.get(opts, :starter, &default_start/2),
       bandit_options: bandit_options(opts),
+      listener_name: listener_name(opts),
       retry_ms: Keyword.get(opts, :retry_ms, @retry_ms),
       listener_pid: nil,
       listener_ref: nil,
@@ -172,24 +200,45 @@ defmodule Vagus.API.Listener do
 
   def handle_info(_other, state), do: {:noreply, state}
 
+  # A registered listener is one this manager (or the one it replaced) already
+  # started — adopt it. Only an unregistered name means the port is free.
   defp listen(state) do
+    case Process.whereis(state.listener_name) do
+      nil -> bind(state)
+      pid -> adopt(state, pid)
+    end
+  end
+
+  defp bind(state) do
     case state.starter.(state.supervisor, state.bandit_options) do
       {:ok, pid} ->
         listening(state, pid)
 
-      # A fixed child name means this is a real, non-fatal outcome: something
-      # already started the listener, so adopt and monitor it rather than
-      # retrying forever against a port that is already served.
+      # Lost the race against something else registering the name between
+      # the lookup above and now — same adoption, not a failure.
       {:error, {:already_started, pid}} ->
-        listening(state, pid)
+        adopt(state, pid)
 
       {:error, reason} ->
         retry(state, reason)
     end
   end
 
+  defp adopt(state, pid) do
+    Logger.info(
+      "Vagus.API.Listener: adopting the running listener on " <>
+        "#{describe(state.bandit_options)} (#{inspect(pid)})"
+    )
+
+    monitored(state, pid)
+  end
+
   defp listening(state, pid) do
     Logger.info("Vagus.API.Listener: listening on #{describe(state.bandit_options)}")
+    monitored(state, pid)
+  end
+
+  defp monitored(state, pid) do
     %{state | listener_pid: pid, listener_ref: Process.monitor(pid), attempt: 0}
   end
 
@@ -226,7 +275,9 @@ defmodule Vagus.API.Listener do
   # Bandit's default (`:permanent`) the DynamicSupervisor would put its own
   # replacement on the port the moment the listener crashed, while this
   # process — which also sees the `:DOWN` — retried against a port that is
-  # now taken, monitoring a dead pid and logging `:eaddrinuse` forever.
+  # now taken, monitoring a dead pid and logging `:eaddrinuse` forever. The
+  # other half of that trade — surviving a crash of *this* process — is the
+  # registered name; see the moduledoc.
   defp default_start(supervisor, bandit_options) do
     DynamicSupervisor.start_child(
       supervisor,

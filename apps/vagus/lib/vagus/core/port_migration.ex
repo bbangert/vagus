@@ -119,6 +119,11 @@ defmodule Vagus.Core.PortMigration do
       `volumes/vagus-core-config/_data`), the same injection key
       `Vagus.Core.Lifecycle`'s safe-mode marker and
       `Vagus.Backend.Host.DiskBreakdown` use for that volume.
+    * `:stat` - 1-arity `File.stat/1` seam. The mode-copy failure it exists
+      to exercise (the store vanishing between the read and the stat) cannot
+      be produced from a single-threaded test any other way, and what it
+      guards — never renaming a umask-mode file over Core's 0600 store — is
+      worth proving.
   """
 
   require Logger
@@ -226,15 +231,15 @@ defmodule Vagus.Core.PortMigration do
     if File.exists?(marker) do
       {:skipped, :already_migrated}
     else
-      migrate(Path.join(Container.config_path(opts), @store_relative_path))
+      migrate(Path.join(Container.config_path(opts), @store_relative_path), opts)
     end
   end
 
-  defp migrate(path) do
+  defp migrate(path, opts) do
     with {:ok, body} <- read_store(path),
          {:ok, stored} <- decode_store(path, body),
          {:ok, port} <- stable_port(path, stored) do
-      apply_port(port, path, stored)
+      apply_port(port, path, stored, opts)
     end
   end
 
@@ -321,8 +326,8 @@ defmodule Vagus.Core.PortMigration do
   defp pending?(%{"pending" => _config}), do: true
   defp pending?(_data), do: false
 
-  defp apply_port(@legacy_port, path, stored) do
-    case rewrite(path, stored) do
+  defp apply_port(@legacy_port, path, stored, opts) do
+    case rewrite(path, stored, opts) do
       :ok ->
         Logger.info(
           "Vagus.Core.PortMigration: rewrote Core's stored stable server_port " <>
@@ -342,7 +347,7 @@ defmodule Vagus.Core.PortMigration do
     end
   end
 
-  defp apply_port(@target_port, _path, _stored) do
+  defp apply_port(@target_port, _path, _stored, _opts) do
     Logger.debug(
       "Vagus.Core.PortMigration: Core's stored stable server_port is already " <>
         "#{@target_port} — nothing to rewrite, waiting for Core to actually serve it"
@@ -351,7 +356,7 @@ defmodule Vagus.Core.PortMigration do
     {:skipped, :already_target}
   end
 
-  defp apply_port(port, _path, _stored) do
+  defp apply_port(port, _path, _stored, _opts) do
     Logger.info(
       "Vagus.Core.PortMigration: Core's stored stable server_port is #{port}, not " <>
         "#{@legacy_port} — leaving it alone (a port somebody chose)"
@@ -365,14 +370,14 @@ defmodule Vagus.Core.PortMigration do
   # observe the old store or the new one.
   #
   # sobelow_skip ["Traversal.FileModule"]
-  defp rewrite(path, stored) do
+  defp rewrite(path, stored, opts) do
     tmp = path <> @tmp_suffix
     updated = put_in(stored, ["data", "stable", "server_port"], @target_port)
 
     result =
       with {:ok, json} <- Jason.encode(updated, pretty: true),
            :ok <- File.write(tmp, json),
-           :ok <- copy_mode(path, tmp) do
+           :ok <- copy_mode(path, tmp, opts) do
         File.rename(tmp, path)
       end
 
@@ -388,16 +393,18 @@ defmodule Vagus.Core.PortMigration do
     {:error, reason}
   end
 
-  # Core writes this store `private=True` (0600). A replacement created under
-  # this process's umask would be world-readable, so the original's mode is
-  # carried over; a store we cannot stat is one we are about to fail on
-  # anyway, so that case just leaves the default mode alone.
+  # Core writes this store `private=True` (0600), and the tmp file was created
+  # under this process's umask (world-readable). A mode that cannot be copied
+  # therefore aborts the rewrite: renaming a umask-mode file over Core's store
+  # would widen it permanently, and the credentials-adjacent settings in there
+  # (trusted proxies, SSL paths) are exactly what 0600 protects.
   #
   # sobelow_skip ["Traversal.FileModule"]
-  defp copy_mode(path, tmp) do
-    case File.stat(path) do
-      {:ok, %File.Stat{mode: mode}} -> File.chmod(tmp, Bitwise.band(mode, 0o7777))
-      {:error, _reason} -> :ok
+  defp copy_mode(path, tmp, opts) do
+    stat = Keyword.get(opts, :stat, &File.stat/1)
+
+    with {:ok, %File.Stat{mode: mode}} <- stat.(path) do
+      File.chmod(tmp, Bitwise.band(mode, 0o7777))
     end
   end
 
