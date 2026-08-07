@@ -51,9 +51,12 @@ defmodule Vagus.Core.Container do
     (container/API watchdogs); Vagus v1 has no Core watchdog yet, so the
     engine's own restart policy covers the crash-loop case until one lands.
   * No `:8888`-style port suffix on the `SUPERVISOR`/`HASSIO` env IPs —
-    port 80 is implicit on this address (Vagus's Bandit listener), and an
-    explicit `:8888` suffix was device-proven to break Core during the
-    bluetooth work.
+    port 80 is implicit on this address, and an explicit suffix was
+    device-proven to break Core during the bluetooth work. Since the
+    Supervisor-API listener vacated port 80 for Core (`Vagus.API.Listener`
+    binds the anchor on `:api_port`), `172.30.32.2:80` is a destination
+    rewrite rather than a socket (`Vagus.Network.Nat`) — which is exactly
+    what keeps the bare form here correct, and why it must stay bare.
   """
 
   alias Vagus.API.Token

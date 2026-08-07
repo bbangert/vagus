@@ -67,6 +67,29 @@ defmodule Vagus.NetworkTest do
       end
     end
 
+    # `:ingress_source_ip` and `:api_bind_ip` are both the anchor on target and
+    # both now go through the same `parse_ip/1`, which makes them easy to
+    # conflate. They answer different questions — where ingress connections
+    # come FROM vs. where the Supervisor API listens — so the API's rebind onto
+    # an internal port must not drag the ingress source with it.
+    test "the source bind is its own key, unaffected by :api_bind_ip" do
+      prev = Application.get_env(:vagus, :api_bind_ip)
+
+      on_exit(fn ->
+        if is_nil(prev),
+          do: Application.delete_env(:vagus, :api_bind_ip),
+          else: Application.put_env(:vagus, :api_bind_ip, prev)
+      end)
+
+      Application.put_env(:vagus, :api_bind_ip, "10.9.9.9")
+
+      Application.put_env(:vagus, :ingress_source_ip, "172.30.32.2")
+      assert Network.source_bind_opts() == [ip: {172, 30, 32, 2}]
+
+      Application.delete_env(:vagus, :ingress_source_ip)
+      assert Network.source_bind_opts() == []
+    end
+
     test "an unreadable destination keeps the bind rather than silently dropping it" do
       Application.put_env(:vagus, :ingress_source_ip, "172.30.32.2")
       assert Network.source_bind_opts("not-an-ip") == [ip: {172, 30, 32, 2}]
@@ -118,6 +141,26 @@ defmodule Vagus.NetworkTest do
 
       Application.put_env(:vagus, :ingress_source_ip, "not-an-ip")
       assert Network.source_bind_opts() == []
+    end
+  end
+
+  describe "parse_ip/1 + format_ip/1 (shared by every address config key)" do
+    test "parses strings and passes tuples through" do
+      assert Network.parse_ip("172.30.32.2") == {:ok, {172, 30, 32, 2}}
+      assert Network.parse_ip("::1") == {:ok, {0, 0, 0, 0, 0, 0, 0, 1}}
+      assert Network.parse_ip({172, 30, 32, 2}) == {:ok, {172, 30, 32, 2}}
+    end
+
+    test "rejects everything that is not an address" do
+      for bad <- ["not-an-ip", "", 42, [1, 2, 3], %{a: 1}, :atom, {1, 2}, {999, 0, 0, 1}] do
+        assert Network.parse_ip(bad) == :error, "expected :error for #{inspect(bad)}"
+      end
+    end
+
+    test "format_ip/1 round-trips" do
+      assert Network.format_ip({172, 30, 32, 2}) == "172.30.32.2"
+      assert {:ok, ip} = Network.parse_ip(Network.supervisor_ip())
+      assert Network.format_ip(ip) == Network.supervisor_ip()
     end
   end
 

@@ -51,6 +51,12 @@ defmodule Vagus.Addon.ManagerTest do
     end
 
     test "hassio-bridge attach with injected hosts + CoreDNS resolver (P1-T3)", %{spec: s} do
+      # `supervisor`/`hassio` -> the bridge anchor is half of the add-on
+      # contract; the other half is that `http://supervisor/` means port 80 on
+      # it. The Supervisor-API listener vacated 80 for Core, so that port is
+      # now `Vagus.Network.Nat`'s DNAT — this mapping is what add-ons resolve
+      # to reach it, and it must stay the anchor and stay portless (a
+      # `host:port` value here is not even valid for `ExtraHosts`).
       assert s.network == :hassio
       assert s.extra_hosts == %{"supervisor" => "172.30.32.2", "hassio" => "172.30.32.2"}
       assert s.dns == ["172.30.32.3"]

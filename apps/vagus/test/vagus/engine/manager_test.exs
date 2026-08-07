@@ -122,4 +122,39 @@ defmodule Vagus.Engine.ManagerTest do
       assert Manager.handle_info(:retry_daemon_start, state) == {:noreply, state}
     end
   end
+
+  describe "supervisor DNAT re-assert" do
+    test ":assert_nat calls the seam and keeps the state untouched" do
+      parent = self()
+      state = %{nat_assert: fn -> send(parent, :asserted) && :ok end}
+
+      assert Manager.handle_info(:assert_nat, state) == {:noreply, state}
+      assert_receive :asserted
+    end
+
+    test "a failing re-assert is swallowed — the engine does not care" do
+      state = %{nat_assert: fn -> {:error, {["-t", "nat", "-N"], "boom", 1}} end}
+
+      assert Manager.handle_info(:assert_nat, state) == {:noreply, state}
+    end
+
+    test "init/1 defaults the seam to Vagus.Network.Nat and a post-start delay" do
+      assert {:ok, state, _continue_or_nothing} = maybe_continue(Manager.init([]))
+
+      assert state.nat_assert == (&Vagus.Network.Nat.ensure/0)
+      assert state.nat_assert_ms == 10_000
+    end
+
+    test "init/1 takes both seams from opts" do
+      seam = fn -> :ok end
+      assert {:ok, state, _} = maybe_continue(Manager.init(nat_assert: seam, nat_assert_ms: 1))
+
+      assert state.nat_assert == seam
+      assert state.nat_assert_ms == 1
+    end
+
+    # `init/1` returns `{:ok, state}` on :host (no VintageNet), so normalize.
+    defp maybe_continue({:ok, state}), do: {:ok, state, nil}
+    defp maybe_continue(other), do: other
+  end
 end

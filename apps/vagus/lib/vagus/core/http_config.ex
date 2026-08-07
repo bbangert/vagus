@@ -30,9 +30,9 @@ defmodule Vagus.Core.HttpConfig do
   cache therefore always holds `[String.t()]` (never a bare string) or
   `nil` — "Core has not told us", the same thing the defaults mean. Keeping
   the whole list rather than collapsing to the first entry is deliberate:
-  the question Phase B has to answer is whether Core *wildcard*-binds (and
-  so collides with our own `:80` listener), which the first element alone
-  cannot answer.
+  the question is whether Core *wildcard*-binds, which is what forced the
+  Supervisor-API listener off port 80 onto the bridge anchor
+  (`Vagus.API.Listener`), and the first element alone cannot answer it.
 
   Because the endpoint is socket-only, there is nothing to pull on the TCP
   fallback (host dev, `:core_base_url`): `refresh/1` returns

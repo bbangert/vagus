@@ -112,24 +112,60 @@ defmodule Vagus.Addon.PortsTest do
     end
 
     test "Core's port is refused" do
-      assert {:error, message} = Ports.sanitize(config(%{"22/tcp" => nil}), %{"22/tcp" => 8123})
+      c = config(%{"22/tcp" => nil})
+
+      # 80 is Core's on a supervised install (`SUPERVISOR_DEFAULT_PORT`), 8123
+      # is the fallback it keeps when that bind fails.
+      assert {:error, message} = Ports.sanitize(c, %{"22/tcp" => 80})
+      assert message =~ "reserved"
+
+      assert {:error, message} = Ports.sanitize(c, %{"22/tcp" => 8123})
       assert message =~ "reserved"
     end
 
+    test "80 stays reserved however the API port is configured" do
+      # Regression guard for the port-80 adoption: the Supervisor-API listener
+      # moved to an internal port (`:api_port`, 8888) so Core can bind 80, and
+      # 80 fell out of this set the moment it stopped being the API's own
+      # port. It has to be named as Core's instead — an add-on publishing host
+      # 80 collides with Core's wildcard bind, and 80 on the bridge anchor is
+      # also the add-on contract's `http://supervisor/`, DNAT'd to `:api_port`.
+      assert 80 in Ports.reserved_host_ports(8888)
+      assert 80 in Ports.reserved_host_ports(80)
+      assert 80 in Ports.reserved_host_ports(nil)
+    end
+
+    test "both ends of the DNAT are reserved: 80 and the internal API port" do
+      assert 8888 in Ports.reserved_host_ports(8888)
+      assert 80 in Ports.reserved_host_ports(8888)
+    end
+
     test "reserved_host_ports/1 tracks the API port it is given, not a baked-in constant" do
-      # The API port is 8888 on host and **80 on target**, so a hard-coded
-      # constant would silently protect the wrong port on a real device.
-      #
       # Asserted through the explicit arity on purpose: the first version of
       # this test compared `reserved_host_ports()` against
       # `Application.get_env(:vagus, :api_port, 8888)`, which is tautological —
       # both read the same key with the same default, so hard-coding 8888
       # passed it. This file is `async: true` and cannot `put_env`.
-      assert 80 in Ports.reserved_host_ports(80)
-      assert 8888 in Ports.reserved_host_ports(8888)
-      refute 80 in Ports.reserved_host_ports(8888)
-      # Core's port is reserved regardless of the API port.
-      assert 8123 in Ports.reserved_host_ports(80)
+      #
+      # 9999 rather than 80/8123: those are reserved unconditionally now, so
+      # only a port that is nothing else's can prove the argument is read.
+      assert 9999 in Ports.reserved_host_ports(9999)
+      refute 9999 in Ports.reserved_host_ports(8888)
+      # Core's ports are reserved regardless of the API port.
+      assert 8123 in Ports.reserved_host_ports(9999)
+      assert 80 in Ports.reserved_host_ports(9999)
+    end
+
+    test "a non-integer API port drops out instead of poisoning the set" do
+      assert Ports.reserved_host_ports(nil) == [80, 8123]
+      assert Ports.reserved_host_ports("8888") == [80, 8123]
+    end
+
+    test "the set is deduplicated when the API port IS one of Core's" do
+      # Option 2 of the port-80 decision (pin Core to 8123, keep the listener
+      # on 80) would produce exactly this overlap; a duplicate entry would not
+      # break `in/2` but would make the list a poor thing to log or render.
+      assert Ports.reserved_host_ports(80) == [80, 8123]
     end
 
     test "reserved_host_ports/0 delegates to the configured value" do

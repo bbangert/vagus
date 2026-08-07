@@ -13,12 +13,25 @@ set -euo pipefail
 # namespace is reachable via the docker0 gateway, hence the 172.17.0.1
 # default. Override SUPERVISOR_HOST if your bridge differs.
 #
-# HOST_PORT is the host-side port Core's web UI is published on (container
-# side is always 8123). Override it when host 8123 is already taken (e.g. a
-# port-forward to a real HA). Because the emulator's EventPusher/Client dial
-# Core back at `config :vagus, :core_base_url`, a non-8123 HOST_PORT also
-# requires the emulator to be started with a matching VAGUS_CORE_BASE_URL —
-# `up` prints the exact export to use (config/host.exs reads that env var).
+# HOST_PORT is the host-side port Core's web UI is published on; CORE_PORT is
+# the container-side port it is published FROM, i.e. the port Core itself
+# binds. Core 2026.8+ binds 80 (`SUPERVISOR_DEFAULT_PORT`) on a fresh
+# supervised install — which is what a vagus device gives it since Phase B
+# vacated :80 — and 8123 only as its bind-failure fallback, so exercising the
+# port-80 contract means `CORE_PORT=80`. CORE_PORT stays 8123 by default,
+# matching CORE_VERSION's own (pre-port-80) default.
+#
+# Override HOST_PORT when the host port is already taken (e.g. a port-forward
+# to a real HA). Because the emulator's EventPusher/Client dial Core back at
+# `config :vagus, :core_base_url`, a HOST_PORT that isn't 8123 also requires
+# the emulator to be started with a matching VAGUS_CORE_BASE_URL — `up` prints
+# the exact export to use (config/host.exs reads that env var).
+#
+# LEGACY_HOST_PORT, when set, additionally publishes container 8123. On a
+# fresh supervised 2026.8 install that port carries Core's legacy redirect
+# stub (a method-preserving 307 to the active port) until onboarding
+# completes, at which point Core tears the listener down — publishing it is
+# what lets scripts/probe_onboarding.exs assert both halves of that.
 #
 # Supervisor↔Core unix socket (Vagus.Core.Transport, socket-first): `up`
 # mkdirs a host directory for the socket (Vagus.Core.Container's own mkdir is
@@ -68,6 +81,11 @@ set -euo pipefail
 #   # Example when host 8123 is occupied:
 #   HOST_PORT=8124 scripts/dev-core.sh up
 #
+#   # Example: a port-80 Core 2026.8 with its legacy-port stub published too,
+#   # i.e. what scripts/probe_onboarding.exs expects (after a `reset`):
+#   CORE_VERSION=2026.8.0 CORE_PORT=80 HOST_PORT=80 LEGACY_HOST_PORT=8123 \
+#     scripts/dev-core.sh up
+#
 #   # Example from inside a docker-outside-of-docker devcontainer whose
 #   # workspace bind-mount source (on the real host) is /home/ben/src/vagus:
 #   HOST_SOCKET_DIR=/home/ben/src/vagus/.dev/core-socket scripts/dev-core.sh up
@@ -84,6 +102,8 @@ CONFIG_VOLUME="${CONFIG_VOLUME:-vagus-dev-core-config}"
 SUPERVISOR_HOST="${SUPERVISOR_HOST:-172.17.0.1}"
 SUPERVISOR_PORT="${SUPERVISOR_PORT:-8888}"
 HOST_PORT="${HOST_PORT:-8123}"
+CORE_PORT="${CORE_PORT:-8123}"
+LEGACY_HOST_PORT="${LEGACY_HOST_PORT:-}"
 
 # In-container mount point + env var — matches Vagus.Core.Container's device
 # paths (socket_dir/0, socket_path/0) so the dev loop exercises the same
@@ -229,8 +249,12 @@ case "$action" in
     # creates fresh after this `docker run` — see the restart case for the
     # same hazard.
     rm -f "$SOCKET_PATH"
+    publish=(-p "${HOST_PORT}:${CORE_PORT}")
+    if [[ -n "$LEGACY_HOST_PORT" && "$CORE_PORT" != "8123" ]]; then
+      publish+=(-p "${LEGACY_HOST_PORT}:8123")
+    fi
     docker run -d --name "$CONTAINER_NAME" \
-      -p "${HOST_PORT}:8123" \
+      "${publish[@]}" \
       -e SUPERVISOR="${SUPERVISOR_HOST}:${SUPERVISOR_PORT}" \
       -e SUPERVISOR_TOKEN="$(token)" \
       -e SUPERVISOR_CORE_API_SOCKET="${CORE_SOCKET_PATH}" \
@@ -238,7 +262,10 @@ case "$action" in
       -v "${CONFIG_VOLUME}:/config" \
       -v "${HOST_SOCKET_DIR}:${CORE_SOCKET_DIR}" \
       "$CORE_IMAGE"
-    echo "Core ${CORE_VERSION} up: http://localhost:${HOST_PORT} — supervisor expected at ${SUPERVISOR_HOST}:${SUPERVISOR_PORT}"
+    echo "Core ${CORE_VERSION} up: http://localhost:${HOST_PORT} (container :${CORE_PORT}) — supervisor expected at ${SUPERVISOR_HOST}:${SUPERVISOR_PORT}"
+    if [[ -n "$LEGACY_HOST_PORT" && "$CORE_PORT" != "8123" ]]; then
+      echo "Legacy port stub (until onboarding completes): http://localhost:${LEGACY_HOST_PORT} -> container :8123"
+    fi
     echo
     wait_for_socket_and_chmod
     if [[ "$HOST_PORT" != "8123" ]]; then

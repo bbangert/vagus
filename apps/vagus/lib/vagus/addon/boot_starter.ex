@@ -36,8 +36,11 @@ defmodule Vagus.Addon.BootStarter do
   network setup, so a native-only device (e.g. the native MQTT broker with
   Mosquitto uninstalled) had nothing standing the bridge up and Core could not
   reach the Supervisor at `172.30.32.2:80`. Binding here, engine-gated and
-  independent of any add-on, closes that gap. It is best-effort: a failure is
-  logged and reconciliation still proceeds.
+  independent of any add-on, closes that gap. The same step then asserts
+  `Vagus.Network.Nat`'s DNAT — since the listener vacated port 80 for Core,
+  `172.30.32.2:80` is a destination rewrite rather than a socket, and it has
+  to be (re-)installed on every boot for the same reason the anchors do.
+  Both are best-effort: a failure is logged and reconciliation still proceeds.
 
   It then walks `Vagus.Addon.State.list/0` (server ref
   `opts[:state]`, default `Vagus.Addon.State`) exactly once:
@@ -78,6 +81,7 @@ defmodule Vagus.Addon.BootStarter do
 
   alias Vagus.Addon.{Config, Manager, State}
   alias Vagus.Network
+  alias Vagus.Network.Nat
 
   @default_interval 5_000
   @default_max_attempts 60
@@ -167,19 +171,37 @@ defmodule Vagus.Addon.BootStarter do
 
   defp default_ping, do: Vagus.Runtime.Docker.ping()
 
-  # Stand up the hassio bridge and bind the host-served .2/.3 anchors, so a
-  # native-only device (no container add-on to do it as a side effect) still
-  # lets Core reach the Supervisor at 172.30.32.2:80. Best-effort — a failure
-  # is logged and boot reconciliation continues.
+  # Stand up the hassio bridge, bind the host-served .2/.3 anchors, and
+  # assert the DNAT that serves port 80 on .2 — so a native-only device (no
+  # container add-on to do it as a side effect) still lets Core and add-ons
+  # reach the Supervisor at 172.30.32.2:80, which is now a rewrite onto the
+  # listener's real port rather than a listener (`Vagus.Network.Nat`).
+  # Best-effort — a failure is logged and boot reconciliation continues.
   defp default_ensure_network do
     case Network.ensure() do
       {:ok, _id} ->
         Network.ensure_supervisor_ip()
+        ensure_nat()
 
       {:error, reason} ->
         Logger.warning(
           "Vagus.Addon.BootStarter: hassio bridge ensure failed (#{inspect(reason)}); " <>
             "supervisor/dns anchors not bound — Core/bridged add-ons may not reach the Supervisor"
+        )
+
+        :ok
+    end
+  end
+
+  defp ensure_nat do
+    case Nat.ensure() do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning(
+          "Vagus.Addon.BootStarter: supervisor DNAT ensure failed (#{inspect(reason)}); " <>
+            "add-ons may not reach http://supervisor/"
         )
 
         :ok

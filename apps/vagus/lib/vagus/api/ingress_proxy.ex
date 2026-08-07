@@ -101,7 +101,7 @@ defmodule Vagus.API.IngressProxy do
   @local_finch Vagus.Ingress.LocalFinch
 
   # 15 minutes — matches the ingress session's sliding-window idle timeout
-  # (`Vagus.Ingress` §B1.2) and `Vagus.API.Supervisor`'s Thousand Island
+  # (`Vagus.Ingress` §B1.2) and `Vagus.API.Listener`'s Thousand Island
   # `read_timeout`. A short default here would kill a legitimately
   # slow-but-alive upstream (e.g. a large firmware upload, or a
   # long-polling/log-tail response) well before the session itself would

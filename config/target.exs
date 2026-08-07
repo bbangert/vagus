@@ -133,9 +133,24 @@ config :mdns_lite,
   ]
 
 # Supervisor-API emulator (P2-T1/T2). Core's SUPERVISOR env var carries
-# host:port verbatim (docs/contract-2026.7.md §1) — real Supervisor
-# installs bind port 80.
-config :vagus, :api_port, 80
+# host:port verbatim (docs/contract-2026.7.md §1) and real Supervisor
+# installs bind port 80 — but Core 2026.8 wildcard-binds :80 itself on a
+# supervised install, and two sockets cannot share it. So the listener
+# moves to the hassio bridge anchor on an internal port, and port 80 on
+# that address is served by `Vagus.Network.Nat`'s DNAT instead, keeping
+# `http://supervisor/` (port 80 hardwired in the add-on contract) intact.
+#
+# :api_bind_ip is what actually frees the port: without it Bandit binds the
+# wildcard, and a wildcard :8888 would leave Core's :80 free but re-expose
+# the API on the LAN. The address only exists once the hassio bridge is up
+# — see `Vagus.API.Listener` for the retry that covers the boot race.
+config :vagus, :api_port, 8888
+config :vagus, :api_bind_ip, "172.30.32.2"
+
+# DNAT management for the port-80 add-on contract above
+# (`Vagus.Network.Nat`). Target-only: :host/:test have neither a
+# 172.30.32.2 nor an `iptables-legacy`.
+config :vagus, :supervisor_nat, true
 config :vagus, :token_path, "/data/vagus/token"
 
 # Add-on state persistence + boot reconciliation (M4-P8-T1). `/data` is a
@@ -221,10 +236,12 @@ config :vagus, :addon_data_root, "/root/vagus/addons"
 config :vagus, :ingress_source_ip, "172.30.32.2"
 
 # Restrict who may talk to the Supervisor API (`Vagus.API.SourceGuard`).
-# Target-only: the listener is 0.0.0.0:80 on a host-networked device, so
-# unlike upstream's containerised Supervisor it is LAN-reachable — and P2-A
-# added a route that answers without a token. On :host/:test everything
-# arrives from 127.0.0.1 and the guard would be a no-op anyway.
+# Defence in depth behind the :api_bind_ip isolation above, not the primary
+# control: 172.30.32.2 is bound in the host netns, so packets to it are
+# delivered locally and any LAN host that routes 172.30.32.0/23 via the board
+# still reaches the listener and the DNAT'd :80 — and an unparseable
+# :api_bind_ip degrades to the wildcard by design. Target-only: on :host/:test
+# everything arrives from 127.0.0.1 and the guard would be a no-op anyway.
 config :vagus, :api_source_guard, true
 
 # Fill the add-on store's catalog once after boot

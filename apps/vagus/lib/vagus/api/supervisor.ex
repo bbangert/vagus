@@ -10,6 +10,11 @@ defmodule Vagus.API.Supervisor do
   crash-loop must never escalate past this subtree and bring down the rest
   of `Vagus.Supervisor`.
 
+  Bandit itself is *not* a static child here: on target it binds an address
+  (`172.30.32.2`) that does not exist until balena-engine has created the
+  hassio bridge, so it is started — with retries — by `Vagus.API.Listener`
+  into `Vagus.API.ListenerSupervisor`. See that module for the race.
+
   Also holds `Vagus.Ingress.Finch`, the connection pool the ingress
   reverse-proxy leg (`Vagus.API.IngressProxy`) uses to reach add-on
   containers — started before Bandit so the pool exists the moment the
@@ -53,7 +58,6 @@ defmodule Vagus.API.Supervisor do
         # it — lazy first-request provisioning left /data/vagus/token absent
         # until the first Bearer-carrying request (found on device 2026-07-20).
         _token = Vagus.API.Token.get()
-        port = Application.get_env(:vagus, :api_port, 8888)
 
         [
           {Finch,
@@ -87,19 +91,18 @@ defmodule Vagus.API.Supervisor do
           # `hassio` bridge, so there's no bridge-vs-loopback split to make
           # (unlike the two pools above).
           {Finch, name: Vagus.API.CoreProxy.Finch, pools: %{default: [size: 4]}},
-          {
-            Bandit,
-            # Upstream's aiohttp server never negotiates response compression,
-            # and Bandit's compressor injects `vary: accept-encoding` into
-            # every response at the adapter layer — below `conn.resp_headers`,
-            # so `Vagus.API.IngressProxy`'s D8 header hygiene can't remove it.
-            # Disabling compression is therefore both upstream parity and the
-            # only complete fix for the vary half of audit finding D8 (F5).
-            plug: Vagus.API.Dispatcher,
-            port: port,
-            http_options: [compress: false],
-            thousand_island_options: [num_acceptors: 2, read_timeout: 900_000]
-          }
+
+          # Holds the Bandit listener once `Vagus.API.Listener` has managed to
+          # bind it. A dedicated `DynamicSupervisor` (rather than Bandit
+          # directly under this supervisor) is what lets the bind be retried
+          # with a backoff instead of crash-looping this subtree — same shape
+          # as `Vagus.Engine.DaemonSupervisor`/`Vagus.Engine.Manager`.
+          {DynamicSupervisor,
+           name: Vagus.API.ListenerSupervisor,
+           strategy: :one_for_one,
+           max_restarts: 5,
+           max_seconds: 30},
+          {Vagus.API.Listener, []}
         ]
       else
         []
