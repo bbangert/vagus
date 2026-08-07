@@ -14,6 +14,7 @@ defmodule Vagus.Ingress.PanelsTest do
   use ExUnit.Case, async: true
 
   alias Vagus.Addon.{Config, State}
+  alias Vagus.API.AdminPanel
   alias Vagus.Core.{Client, TokenStore}
   alias Vagus.Ingress.Panels
 
@@ -142,7 +143,10 @@ defmodule Vagus.Ingress.PanelsTest do
 
       panels = Panels.list(state)
 
-      assert Map.keys(panels) |> Enum.sort() == ["core_esphome", "core_other"]
+      # `vagus` is `Vagus.API.AdminPanel`'s synthetic entry, merged in
+      # independently of `State` — see `Vagus.API.AdminPanelTest` for its
+      # own shape assertions.
+      assert Map.keys(panels) |> Enum.sort() == ["core_esphome", "core_other", "vagus"]
 
       assert panels["core_esphome"] == %{
                "title" => "ESPHome Dashboard",
@@ -160,9 +164,9 @@ defmodule Vagus.Ingress.PanelsTest do
              }
     end
 
-    test "empty when no add-ons are installed" do
+    test "only the synthetic admin panel when no add-ons are installed" do
       state = start_state(:"state_#{System.unique_integer([:positive])}")
-      assert Panels.list(state) == %{}
+      assert Panels.list(state) == %{"vagus" => AdminPanel.panel_entry()}
     end
   end
 

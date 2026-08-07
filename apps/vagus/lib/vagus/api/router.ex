@@ -33,7 +33,7 @@ defmodule Vagus.API.Router do
   alias Vagus.Addon.{Availability, Manager, OptionsSchema, Ports, State, Store, StoreView, Update}
   alias Vagus.Addon.Backend.Native
   alias Vagus.Addon.Store.Assets
-  alias Vagus.API.{Envelope, StaticData, SupervisorOptions, Tiers}
+  alias Vagus.API.{AdminPanel, Envelope, StaticData, SupervisorOptions, Tiers}
   alias Vagus.Backend
   alias Vagus.Backups
   alias Vagus.Core.{ConfigCheck, Lifecycle, TokenStore, Versions}
@@ -602,9 +602,27 @@ defmodule Vagus.API.Router do
   # its own info gets its resolved dynamic `ingress_port` back exactly the way
   # `bashio::addon.ingress_port` expects (§B3.2 fact 5) — no separate path
   # needed for the self-read case.
+  # The reserved `vagus` slug is `Vagus.API.AdminPanel`'s synthetic panel,
+  # which has no `Vagus.Addon.State` entry to render from. It is matched on
+  # the literal URL segment and wins over any add-on that claims the slug —
+  # the same precedence `Vagus.Ingress.Panels.list/1` and
+  # `Vagus.Ingress.resolve_token/2` apply.
+  #
+  # No extra guard beyond this route's existing auth/tier behaviour: Core's
+  # WS proxy whitelists `/addons/*/info` for non-admin users too, so a
+  # stricter check here would break the panel for Core itself. The panel's
+  # `admin: true` plus the ingress session are the gate on the content.
   get "/addons/:slug/info" do
     caller = conn.assigns.caller
 
+    if slug == AdminPanel.slug() do
+      Envelope.send_ok(conn, AdminPanel.info())
+    else
+      addon_info(conn, slug, caller)
+    end
+  end
+
+  defp addon_info(conn, slug, caller) do
     with {:ok, resolved} <- resolve_info_slug(slug, caller),
          {:ok, %{config: config, state: state} = entry} <- Vagus.Addon.State.get(resolved) do
       # Audit A8 — "User options may contain secrets". The rule lives in

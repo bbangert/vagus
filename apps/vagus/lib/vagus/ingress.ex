@@ -56,14 +56,29 @@ defmodule Vagus.Ingress do
 
   ## Token → slug resolution (§B2.2 step 2)
 
-  `resolve_token/2` scans `State.list/1` for the add-on whose
-  `ingress_token` matches, on every call — **deliberately not cached**.
+  `resolve_token/2` first compares against the synthetic admin panel's token
+  (see "Admin panel token" below), then scans `State.list/1` for the add-on
+  whose `ingress_token` matches, on every call — **deliberately not cached**.
   Upstream rebuilds a `dict[ingress_token → slug]` once per
   `Ingress.load()`/`reload()` tick; this emulator's `State.list/1` is small
   (a handful of installed add-ons at most) and a scan is cheap enough that
   keeping a second, cacheable copy in sync across install/uninstall would
   be pure risk (a stale entry pointing at an uninstalled slug) for no
   measurable benefit.
+
+  ## Admin panel token
+
+  `Vagus.API.AdminPanel` is a synthetic ingress panel with no add-on and no
+  `Vagus.Addon.State` entry, so it has no `ingress_token` to be found by the
+  scan above. One is minted here at `init/1` instead and matched *first* by
+  `resolve_token/2`, so the reserved `vagus` slug can never be shadowed by
+  an add-on that happens to share it.
+
+  Like sessions, this token is **per-boot and in-memory only**: restarting
+  this GenServer mints a new one, which invalidates the previous panel URL.
+  An already-open panel iframe must then be reloaded so Core re-reads
+  `ingress_url` from `GET /addons/vagus/info` — the same self-healing blip
+  a dropped session already causes, and acceptable for the same reason.
 
   ## Injectable opts
 
@@ -88,6 +103,7 @@ defmodule Vagus.Ingress do
   use GenServer
 
   alias Vagus.Addon.State
+  alias Vagus.API.AdminPanel
   alias Vagus.Network
 
   @session_ttl_ms 15 * 60 * 1000
@@ -130,10 +146,28 @@ defmodule Vagus.Ingress do
   its slug — only add-ons whose config declares `ingress: true` resolve;
   everything else (unknown token, or a token belonging to a non-ingress
   add-on) is `:error`.
+
+  The synthetic admin panel's token (see the moduledoc) resolves to
+  `Vagus.API.AdminPanel.slug/0` and is checked before any add-on.
   """
   @spec resolve_token(String.t(), GenServer.server()) :: {:ok, String.t()} | :error
   def resolve_token(ingress_token, server \\ __MODULE__) when is_binary(ingress_token) do
     GenServer.call(server, {:resolve_token, ingress_token})
+  end
+
+  @doc """
+  The synthetic admin panel's ingress token, minted at `init/1` — the
+  `<token>` in `Vagus.API.AdminPanel`'s `ingress_url`.
+
+  `{:error, :unavailable}` when this GenServer isn't running
+  (`:ingress_enabled false`, e.g. host unit tests): callers render a panel
+  without an ingress URL rather than crashing on the exit.
+  """
+  @spec admin_token(GenServer.server()) :: {:ok, token()} | {:error, :unavailable}
+  def admin_token(server \\ __MODULE__) do
+    GenServer.call(server, :admin_token)
+  catch
+    :exit, _reason -> {:error, :unavailable}
   end
 
   @doc """
@@ -159,6 +193,13 @@ defmodule Vagus.Ingress do
   def init(opts) do
     state = %{
       sessions: %{},
+      # Same charset/entropy as an add-on's own `ingress_token` (32 random
+      # bytes, URL-safe base64, no padding), so it satisfies the
+      # `/ingress/[-_A-Za-z0-9]+/.*` route shape `Vagus.API.Dispatcher`
+      # relies on. Generated locally rather than borrowed from
+      # `Vagus.Addon.State` (whose generator is private) to keep this
+      # module free of a dependency it needs for nothing else.
+      admin_token: generate_ingress_token(),
       state_server: Keyword.get(opts, :state, State),
       clock: Keyword.get(opts, :clock, fn -> System.monotonic_time(:millisecond) end),
       port_probe: Keyword.get(opts, :port_probe, &default_port_probe/2),
@@ -192,21 +233,21 @@ defmodule Vagus.Ingress do
     end
   end
 
+  def handle_call(:admin_token, _from, state) do
+    {:reply, {:ok, state.admin_token}, state}
+  end
+
+  # The synthetic panel wins over any add-on that managed to claim the same
+  # slug — matching `Vagus.Ingress.Panels.list/1` and `Vagus.API.Router`'s
+  # own precedence for the reserved slug. Compared in constant time: this
+  # token is a bearer capability for a page that hands out the device's SSH
+  # private key.
   def handle_call({:resolve_token, ingress_token}, _from, state) do
-    result =
-      state.state_server
-      |> State.list()
-      |> Enum.find(fn entry ->
-        entry.config.ingress and entry.ingress_token == ingress_token
-      end)
-
-    reply =
-      case result do
-        %{config: %{slug: slug}} -> {:ok, slug}
-        nil -> :error
-      end
-
-    {:reply, reply, state}
+    if Plug.Crypto.secure_compare(ingress_token, state.admin_token) do
+      {:reply, {:ok, AdminPanel.slug()}, state}
+    else
+      {:reply, resolve_addon_token(ingress_token, state), state}
+    end
   end
 
   def handle_call({:dynamic_port, slug}, _from, state) do
@@ -239,12 +280,28 @@ defmodule Vagus.Ingress do
 
   ## Internals
 
+  defp resolve_addon_token(ingress_token, state) do
+    state.state_server
+    |> State.list()
+    |> Enum.find(fn entry ->
+      entry.config.ingress and entry.ingress_token == ingress_token
+    end)
+    |> case do
+      %{config: %{slug: slug}} -> {:ok, slug}
+      nil -> :error
+    end
+  end
+
   defp prune_expired(sessions, now) do
     Map.filter(sessions, fn {_token, expiry} -> expiry > now end)
   end
 
   defp generate_session_token do
     :crypto.strong_rand_bytes(64) |> Base.encode16(case: :lower)
+  end
+
+  defp generate_ingress_token do
+    Base.url_encode64(:crypto.strong_rand_bytes(32), padding: false)
   end
 
   defp other_assigned_ports(state_server) do
