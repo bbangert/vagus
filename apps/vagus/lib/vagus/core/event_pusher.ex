@@ -32,6 +32,16 @@ defmodule Vagus.Core.EventPusher do
   `handle_connect/3` (`{:event_pusher_connection, :connected, pid}`), and
   the queue is flushed (assigning ids in send order) only once `auth_ok`
   is reported (`{:event_pusher_connection, :ready, pid}`).
+
+  `command/2` adds a request/response path over the same socket for the
+  commands that only exist on Core's WS API. Because the id counter resets
+  to `1` on every new connection, an id issued on one connection can name a
+  *different* request on the next one — so every in-flight request is
+  failed with `{:error, :disconnected}` and the pending map cleared at both
+  points where that reset happens (a fresh `handle_connect/3`, and the
+  connection process dying). Commands never enter the offline queue: a
+  buffered command whose caller has already given up is worthless, so they
+  fail fast with `{:error, :not_connected}` instead.
   """
 
   use GenServer
@@ -44,6 +54,12 @@ defmodule Vagus.Core.EventPusher do
   @max_queue_size 50
   @backoff_initial 5_000
   @backoff_max 60_000
+  @command_timeout 5_000
+
+  # The caller's `GenServer.call/3` timeout must outlive the manager's own
+  # per-request timer, or the call would exit with `:timeout` before the
+  # manager can reply — leaving a pending entry the caller never sees.
+  @call_grace_ms 1_000
 
   @doc """
   Starts the manager.
@@ -72,6 +88,46 @@ defmodule Vagus.Core.EventPusher do
     GenServer.cast(server, {:push, event_data})
   end
 
+  @doc """
+  Sends `payload` as a WS command frame and blocks until Core answers with
+  the matching `result` envelope.
+
+  `payload` is the frame *minus* `"id"` (e.g. `%{"type" => "config/auth/list"}`)
+  — the manager assigns the id, since ids must be sequenced per connection.
+
+  Returns `{:ok, result}` (the envelope's `"result"` field) on
+  `success: true`, `{:error, {:core_error, error}}` on `success: false`,
+  and otherwise `{:error, reason}` where `reason` is one of:
+
+    * `:not_connected` - no live, authenticated connection right now
+      (returned immediately; commands are never buffered).
+    * `:disconnected` - the connection went away while this request was
+      in flight.
+    * `:timeout` - Core did not answer within `:timeout`.
+    * `:not_started` - the manager itself isn't running.
+
+  Options:
+
+    * `:server` - the manager, defaults to `__MODULE__`.
+    * `:timeout` - milliseconds to wait for the result, defaults to
+      `#{@command_timeout}`.
+  """
+  @spec command(map(), keyword()) :: {:ok, term()} | {:error, term()}
+  def command(payload, opts \\ []) when is_map(payload) do
+    server = Keyword.get(opts, :server, __MODULE__)
+    timeout = Keyword.get(opts, :timeout, @command_timeout)
+
+    call_command(server, payload, timeout)
+  end
+
+  defp call_command(server, payload, timeout) do
+    GenServer.call(server, {:command, payload, timeout}, timeout + @call_grace_ms)
+  catch
+    :exit, {:noproc, _} -> {:error, :not_started}
+    :exit, {:timeout, _} -> {:error, :timeout}
+    :exit, reason -> {:error, {:exit, reason}}
+  end
+
   ## GenServer callbacks
 
   @impl GenServer
@@ -87,6 +143,7 @@ defmodule Vagus.Core.EventPusher do
       monitor_ref: nil,
       ready: false,
       next_id: 1,
+      pending: %{},
       queue: :queue.new(),
       queue_size: 0,
       backoff_ms: @backoff_initial
@@ -100,6 +157,19 @@ defmodule Vagus.Core.EventPusher do
       end
 
     {:ok, state}
+  end
+
+  @impl GenServer
+  def handle_call({:command, payload, timeout}, from, state) do
+    if state.ready and state.connection_pid do
+      id = state.next_id
+      Fresh.send(state.connection_pid, {:text, Jason.encode!(Map.put(payload, "id", id))})
+      timer = Process.send_after(self(), {:command_timeout, id}, timeout)
+
+      {:noreply, %{state | next_id: id + 1, pending: Map.put(state.pending, id, {from, timer})}}
+    else
+      {:reply, {:error, :not_connected}, state}
+    end
   end
 
   @impl GenServer
@@ -119,7 +189,7 @@ defmodule Vagus.Core.EventPusher do
   def handle_info({:token_store, :refresh_token_available}, state), do: {:noreply, state}
 
   def handle_info({:event_pusher_connection, :connected, pid}, %{connection_pid: pid} = state) do
-    {:noreply, %{state | ready: false, next_id: 1, backoff_ms: @backoff_initial}}
+    {:noreply, %{fail_pending(state) | ready: false, next_id: 1, backoff_ms: @backoff_initial}}
   end
 
   def handle_info({:event_pusher_connection, :ready, pid}, %{connection_pid: pid} = state) do
@@ -128,6 +198,30 @@ defmodule Vagus.Core.EventPusher do
 
   # Stale message from a connection pid that's no longer current - ignore.
   def handle_info({:event_pusher_connection, _event, _pid}, state), do: {:noreply, state}
+
+  def handle_info({:event_pusher_result, id, result}, state) do
+    case Map.pop(state.pending, id) do
+      {nil, _pending} ->
+        log_unmatched(result, id)
+        {:noreply, state}
+
+      {{from, timer}, pending} ->
+        Process.cancel_timer(timer)
+        GenServer.reply(from, result)
+        {:noreply, %{state | pending: pending}}
+    end
+  end
+
+  def handle_info({:command_timeout, id}, state) do
+    case Map.pop(state.pending, id) do
+      {nil, _pending} ->
+        {:noreply, state}
+
+      {{from, _timer}, pending} ->
+        GenServer.reply(from, {:error, :timeout})
+        {:noreply, %{state | pending: pending}}
+    end
+  end
 
   def handle_info({:DOWN, ref, :process, _pid, reason}, %{monitor_ref: ref} = state) do
     Logger.warning(
@@ -139,7 +233,7 @@ defmodule Vagus.Core.EventPusher do
 
     {:noreply,
      %{
-       state
+       fail_pending(state)
        | connection_pid: nil,
          monitor_ref: nil,
          ready: false,
@@ -157,6 +251,28 @@ defmodule Vagus.Core.EventPusher do
   def handle_info(_other, state), do: {:noreply, state}
 
   ## Internals
+
+  # Every id becomes ambiguous the moment the counter resets, so no pending
+  # request may outlive the connection it was issued on.
+  defp fail_pending(state) do
+    Enum.each(state.pending, fn {_id, {from, timer}} ->
+      Process.cancel_timer(timer)
+      GenServer.reply(from, {:error, :disconnected})
+    end)
+
+    %{state | pending: %{}}
+  end
+
+  # Results nobody is waiting for are the norm on this socket: every
+  # fire-and-forget `push/2` frame is acked. Only a nack is worth a word.
+  defp log_unmatched({:ok, _result}, _id), do: :ok
+
+  defp log_unmatched({:error, reason}, id) do
+    Logger.warning(
+      "Vagus.Core.EventPusher: unmatched result for id #{inspect(id)} " <>
+        "nacked: #{inspect(reason)}"
+    )
+  end
 
   defp connect(state) do
     case TokenStore.get_refresh_token(state.token_store) do

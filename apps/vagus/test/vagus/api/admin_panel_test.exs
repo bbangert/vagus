@@ -12,6 +12,12 @@ defmodule Vagus.API.AdminPanelTest do
   `AdminPanel`/`IngressProxy` reach them in production (no injectable
   `server` arg on those call sites). `config/test.exs` disables the
   app-started instances of both, so there is nothing to clash with.
+
+  Core admin resolution is stubbed through the `:core_users` module seam.
+  `AdminPanel.serve/2` runs synchronously in the test process (it's a plain
+  Plug call), so the stub can take its answer from — and record its calls
+  in — the process dictionary, exactly like `auth_router_test.exs`'s
+  `StubCore`.
   """
   use ExUnit.Case, async: false
 
@@ -25,15 +31,33 @@ defmodule Vagus.API.AdminPanelTest do
   @proxy_opts IngressProxy.init([])
   @router_opts Router.init([])
 
+  @admin_user "01ab23cd45ef67890123456789abcdef"
+
+  defmodule StubUsers do
+    @moduledoc false
+    def admin?(user_id) do
+      Process.put(:admin_checked, [user_id | Process.get(:admin_checked, [])])
+      Process.get(:admin_result, {:ok, true})
+    end
+  end
+
   setup do
     start_supervised!({Vagus.Ingress, []})
     start_ssh_access()
 
-    {:ok, session} = Vagus.Ingress.create_session()
+    Application.put_env(:vagus, :core_users, StubUsers)
+    on_exit(fn -> Application.delete_env(:vagus, :core_users) end)
+
+    {:ok, session} = Vagus.Ingress.create_session(Vagus.Ingress, user_id: @admin_user)
     {:ok, token} = Vagus.Ingress.admin_token()
 
     %{session: session, token: token}
   end
+
+  # What the stub will answer for the rest of this test.
+  defp stub_admin(result), do: Process.put(:admin_result, result)
+
+  defp admin_checks, do: Enum.reverse(Process.get(:admin_checked, []))
 
   defp start_ssh_access do
     dir = Path.join(System.tmp_dir!(), "admin_panel_test_#{System.unique_integer([:positive])}")
@@ -176,6 +200,142 @@ defmodule Vagus.API.AdminPanelTest do
 
       assert conn.status == 401
       refute conn.resp_body =~ "PRIVATE KEY"
+    end
+  end
+
+  # Core's `/ingress/session` is in its own `WS_NO_ADMIN_ENDPOINTS` set, so a
+  # non-admin HA user mints a perfectly valid session by design — the cookie
+  # gate above proves authentication, never privilege. Everything below is
+  # the second gate: the session's recorded Core `user_id` resolved through
+  # the `:core_users` seam, fail-closed.
+  describe "admin enforcement" do
+    test "an admin sees the page and may download the key", %{session: session, token: token} do
+      stub_admin({:ok, true})
+
+      page = ingress_call("/ingress/#{token}/", session: session)
+      assert page.status == 200
+      assert page.resp_body =~ Vagus.SSHAccess.fingerprint()
+
+      key = ingress_call("/ingress/#{token}/key", session: session)
+      assert key.status == 200
+      assert String.starts_with?(key.resp_body, "-----BEGIN OPENSSH PRIVATE KEY-----")
+      assert get_resp_header(key, "content-type") == ["application/x-pem-file"]
+
+      assert get_resp_header(key, "content-disposition") == [
+               ~s(attachment; filename="vagus_ssh_key")
+             ]
+
+      assert admin_checks() == [@admin_user, @admin_user]
+    end
+
+    test "a non-admin is 403 on the page, with no fingerprint in the body", %{
+      session: session,
+      token: token
+    } do
+      stub_admin({:ok, false})
+
+      conn = ingress_call("/ingress/#{token}/", session: session)
+
+      assert conn.status == 403
+      refute conn.resp_body =~ Vagus.SSHAccess.fingerprint()
+      assert admin_checks() == [@admin_user]
+    end
+
+    test "a non-admin is 403 on the key download, with no key material", %{
+      session: session,
+      token: token
+    } do
+      stub_admin({:ok, false})
+
+      conn = ingress_call("/ingress/#{token}/key", session: session)
+
+      assert conn.status == 403
+      refute conn.resp_body =~ "BEGIN OPENSSH PRIVATE KEY"
+      refute conn.resp_body =~ "PRIVATE KEY"
+      assert get_resp_header(conn, "content-disposition") == []
+    end
+
+    # A session minted before this enforcement existed, or one Core created
+    # without a `user_id`. Nobody to ask Core about — deny without asking.
+    test "a session carrying no user id is 403 and never reaches Core", %{token: token} do
+      {:ok, anonymous} = Vagus.Ingress.create_session()
+
+      page = ingress_call("/ingress/#{token}/", session: anonymous)
+      key = ingress_call("/ingress/#{token}/key", session: anonymous)
+
+      assert page.status == 403
+      assert key.status == 403
+      refute key.resp_body =~ "PRIVATE KEY"
+      assert admin_checks() == []
+    end
+
+    for reason <- [:not_connected, :timeout, :disconnected, :not_started] do
+      test "resolution failing with #{inspect(reason)} is 403, not access", %{
+        session: session,
+        token: token
+      } do
+        stub_admin({:error, unquote(reason)})
+
+        page = ingress_call("/ingress/#{token}/", session: session)
+        key = ingress_call("/ingress/#{token}/key", session: session)
+
+        assert page.status == 403
+        assert key.status == 403
+        refute page.resp_body =~ Vagus.SSHAccess.fingerprint()
+        refute key.resp_body =~ "PRIVATE KEY"
+      end
+    end
+
+    test "an unknown sub-path under a non-admin session is still 403, not 404", %{
+      session: session,
+      token: token
+    } do
+      stub_admin({:ok, false})
+
+      conn = ingress_call("/ingress/#{token}/nope", session: session)
+      assert conn.status == 403
+    end
+
+    # The gate sits above the method check, so even a 405-shaped request from
+    # a non-admin is refused on privilege first — nothing about the panel's
+    # surface is observable without admin.
+    test "a non-GET method from a non-admin is 403, not 405", %{session: session, token: token} do
+      stub_admin({:ok, false})
+
+      conn = ingress_call("/ingress/#{token}/key", session: session, method: :post)
+      assert conn.status == 403
+    end
+
+    # The 401 gate must not be swallowed by the new 403 one: no cookie is
+    # still "not authenticated", answered by `IngressProxy` before this
+    # module is ever reached.
+    test "no session is still 401, and Core is never consulted", %{token: token} do
+      conn = ingress_call("/ingress/#{token}/key")
+
+      assert conn.status == 401
+      assert admin_checks() == []
+    end
+
+    # An ordinary add-on's ingress traffic must be untouched by any of this.
+    # The stub says "not an admin" and the target resolver refuses: a 502
+    # (not a 403) proves the request went down the add-on proxy leg, and the
+    # untouched call log proves Core was never asked about the user.
+    test "an add-on ingress request applies no admin check", %{session: session} do
+      stub_admin({:ok, false})
+
+      slug = "addon_regression_#{System.unique_integer([:positive])}"
+      :ok = State.put(ingress_config(slug), :started)
+      on_exit(fn -> State.delete(slug) end)
+
+      {:ok, %{ingress_token: addon_token}} = State.get(slug)
+
+      Application.put_env(:vagus, :ingress_target_fun, fn _slug -> {:error, :no_target} end)
+      on_exit(fn -> Application.delete_env(:vagus, :ingress_target_fun) end)
+
+      conn = ingress_call("/ingress/#{addon_token}/", session: session)
+
+      assert conn.status == 502
+      assert admin_checks() == []
     end
   end
 

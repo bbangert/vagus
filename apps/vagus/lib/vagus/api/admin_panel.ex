@@ -29,20 +29,52 @@ defmodule Vagus.API.AdminPanel do
   `InstalledAddonComplete`, ~60 required fields), and a synthetic entry
   there would break the whole add-on coordinator.
 
-  ## Security posture (known limitation)
+  ## Security posture
 
-  This page is reachable ONLY through the ingress path, whose sole
-  authorization gate is a valid `ingress_session` cookie
-  (`Vagus.API.IngressProxy`'s `check_session/1`, unchanged for this panel).
-  The sidebar panel is `admin: true`, so Core's frontend only offers it to
-  admin users. However Vagus's session check does not distinguish admin from
-  non-admin — Core sends a `user_id` in the `POST /ingress/session` body
-  that Vagus does not record — so a non-admin HA user who obtained the
-  ingress URL could reach this page and download the key. Binding sessions
-  to the admin flag is not implemented here.
+  Every route here hands out (or describes) a credential granting a root
+  shell, so `serve/2` gates on Core **administrator** status before it
+  dispatches anything — by construction, not per route.
+
+  Two independent gates stack:
+
+    * `Vagus.API.IngressProxy`'s `check_session/1` — a valid
+      `ingress_session` cookie, or 401. Unchanged for this panel.
+    * this module's own admin check — 403 for anything else.
+
+  The second gate is necessary because the first proves nothing about
+  privilege: Core's `/ingress/session` is in its `WS_NO_ADMIN_ENDPOINTS`
+  set, so **non-admin users legitimately mint ingress sessions**. Nor does
+  the proxied request itself carry any identity — Core adds only
+  `X-Hass-Source`/`X-Ingress-Path`/`X-Forwarded-*`. The caller is therefore
+  identified solely by mapping the cookie back to the `user_id` Core sent
+  when the session was created (`Vagus.Ingress.session_user/2`).
+
+  Admin status resolves through `Vagus.Core.Users.admin?/2` (swappable via
+  `config :vagus, :core_users`), which reads Core's WS `config/auth/list` —
+  the only surface that answers this; Core has no REST equivalent — and
+  derives the verdict exactly as Core itself does
+  (`homeassistant/auth/models.py`):
+
+      is_owner or (is_active and "system-admin" in group_ids)
+
+  Verdicts are cached for 30 seconds there, so a panel reload doesn't
+  hammer Core.
+
+  **Fail closed.** Access is granted on `{:ok, true}` and nothing else:
+  a missing cookie, an unknown/expired session, a session with no recorded
+  user (Core sent none, or it predates this being recorded), `{:ok, false}`,
+  and every `{:error, _}` — including Core being unreachable — are all 403.
+
+  This is a deliberate deviation from the real Supervisor, which does not
+  enforce admin on ingress at all (it only forwards `X-Remote-User-*`
+  headers to the add-on and lets the add-on decide). Upstream has no
+  Supervisor-owned panel handing out the host's root key, so it has nothing
+  to protect here; Vagus does.
   """
 
   import Plug.Conn
+
+  require Logger
 
   alias Vagus.SSHAccess
 
@@ -92,15 +124,82 @@ defmodule Vagus.API.AdminPanel do
   `Vagus.API.IngressProxy` splits it — so the panel root
   (`GET /ingress/<token>/`) arrives as `[]`.
 
-  The caller has already validated the `ingress_session` cookie; this
-  function performs no authorization of its own.
+  The caller has already validated the `ingress_session` cookie (401 on
+  failure). This function additionally requires the session's Core user to
+  be an administrator, ahead of *any* dispatch — see the moduledoc's
+  "Security posture" — and answers 403 if not.
   """
   @spec serve(Plug.Conn.t(), [String.t()]) :: Plug.Conn.t()
-  def serve(%Plug.Conn{method: method} = conn, rest) when method in ["GET", "HEAD"] do
+  def serve(conn, rest) do
+    case authorize(conn) do
+      :ok -> serve_authorized(conn, rest)
+      {:denied, reason, user_id} -> deny(conn, reason, user_id)
+    end
+  end
+
+  defp serve_authorized(%Plug.Conn{method: method} = conn, rest)
+       when method in ["GET", "HEAD"] do
     dispatch(conn, rest)
   end
 
-  def serve(conn, _rest), do: send_plain(conn, 405, "Method Not Allowed")
+  defp serve_authorized(conn, _rest), do: send_plain(conn, 405, "Method Not Allowed")
+
+  ## Authorization (see the moduledoc's "Security posture")
+
+  # `Vagus.API.IngressProxy.call/2` already ran `fetch_cookies/1` before
+  # dispatching here, but this is the gate on the device's root key — it
+  # calls it again rather than trusting an upstream plug to have done so.
+  # `fetch_cookies/1` is idempotent (`%Plug.Conn{cookies: %Unfetched{}}` is
+  # the only state it acts on), so the repeat costs nothing.
+  defp authorize(conn) do
+    case fetch_cookies(conn).cookies["ingress_session"] do
+      session when is_binary(session) -> authorize_session(session)
+      _missing -> {:denied, :no_session_cookie, nil}
+    end
+  end
+
+  defp authorize_session(session) do
+    case session_user(session) do
+      {:ok, user_id} when is_binary(user_id) -> authorize_user(user_id)
+      {:ok, nil} -> {:denied, :session_has_no_user, nil}
+      :error -> {:denied, :unknown_session, nil}
+    end
+  end
+
+  defp authorize_user(user_id) do
+    case users_mod().admin?(user_id) do
+      {:ok, true} -> :ok
+      {:ok, false} -> {:denied, :not_admin, user_id}
+      {:error, reason} -> {:denied, {:unresolved, reason}, user_id}
+      other -> {:denied, {:unresolved, {:unexpected_result, other}}, user_id}
+    end
+  end
+
+  # `Vagus.Ingress` is gated by `:ingress_enabled`, so — like `SSHAccess`
+  # above — a call to a dead name exits and would take the connection down.
+  # An absent session store can answer for no session, which is a denial.
+  defp session_user(session) do
+    Vagus.Ingress.session_user(session)
+  catch
+    :exit, _reason -> :error
+  end
+
+  defp users_mod, do: Application.get_env(:vagus, :core_users, Vagus.Core.Users)
+
+  # The body deliberately carries no fingerprint, no key material and no
+  # hint about which condition failed; the reason and user id go to the log
+  # instead, where an operator diagnosing "why can't I see my key" can find
+  # them.
+  defp deny(conn, reason, user_id) do
+    Logger.warning(
+      "vagus admin panel: denied #{conn.method} #{conn.request_path} " <>
+        "(reason=#{inspect(reason)} user_id=#{inspect(user_id)})"
+    )
+
+    send_plain(conn, 403, "Forbidden: Home Assistant administrators only")
+  end
+
+  ## Dispatch
 
   defp dispatch(conn, []), do: send_page(conn)
   defp dispatch(conn, [""]), do: send_page(conn)

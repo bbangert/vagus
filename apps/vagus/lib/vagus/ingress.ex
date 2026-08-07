@@ -15,6 +15,11 @@ defmodule Vagus.Ingress do
   another 15 minutes out from *now*. A session only expires after 15
   minutes of complete idleness, not 15 minutes after creation.
 
+  Each session also records the Core user id that `POST /ingress/session`
+  carried (`session_user/2`) — the only identity a later proxied request
+  can be attributed to, since Core's ingress proxy forwards no user
+  identity of its own. `Vagus.API.AdminPanel` is the one consumer.
+
   Deliberate deviations from upstream, both intentional for M4b:
 
     * **No disk persistence.** Real Supervisor persists `session`/
@@ -123,10 +128,22 @@ defmodule Vagus.Ingress do
   Creates a new ingress session, valid for 15 minutes from now. Returns
   `{:ok, token}` where `token` is 128 lowercase hex characters
   (§B1.1, `secrets.token_hex(64)`).
+
+  `opts[:user_id]` records the Core user id that `POST /ingress/session`
+  carried (§B1.1), so a later request authenticated by this session can be
+  attributed back to a Core user — see `session_user/2`. Anything other
+  than a binary (including the key being absent, which is legitimate: the
+  body is optional) records `nil`.
   """
-  @spec create_session(GenServer.server()) :: {:ok, token()}
-  def create_session(server \\ __MODULE__) do
-    GenServer.call(server, :create_session)
+  @spec create_session(GenServer.server(), keyword()) :: {:ok, token()}
+  def create_session(server \\ __MODULE__, opts \\ []) do
+    user_id =
+      case Keyword.get(opts, :user_id) do
+        id when is_binary(id) -> id
+        _absent_or_invalid -> nil
+      end
+
+    GenServer.call(server, {:create_session, user_id})
   end
 
   @doc """
@@ -181,6 +198,23 @@ defmodule Vagus.Ingress do
     GenServer.call(server, {:dynamic_port, slug})
   end
 
+  @doc """
+  The Core user id recorded on `token` at `create_session/2`, or `nil` when
+  the session carries none (Core sent no `user_id`, or the session predates
+  this being recorded). `:error` for an unknown or expired token.
+
+  Deliberately does **not** slide the session's expiry: this is an
+  inspection of an existing session, not a use of it. On the proxy path
+  `validate_session/2` has already slid the window earlier in the same
+  request, so sliding again here would be redundant — and letting a mere
+  lookup renew a session would mean an unrelated caller could keep one
+  alive indefinitely.
+  """
+  @spec session_user(token(), GenServer.server()) :: {:ok, String.t() | nil} | :error
+  def session_user(token, server \\ __MODULE__) when is_binary(token) do
+    GenServer.call(server, {:session_user, token})
+  end
+
   @doc "Number of currently-live (unexpired) sessions — tests/inspection only."
   @spec session_count(GenServer.server()) :: non_neg_integer()
   def session_count(server \\ __MODULE__) do
@@ -211,11 +245,11 @@ defmodule Vagus.Ingress do
   end
 
   @impl GenServer
-  def handle_call(:create_session, _from, state) do
+  def handle_call({:create_session, user_id}, _from, state) do
     now = state.clock.()
     sessions = prune_expired(state.sessions, now)
     token = generate_session_token()
-    sessions = Map.put(sessions, token, now + @session_ttl_ms)
+    sessions = Map.put(sessions, token, %{expiry: now + @session_ttl_ms, user_id: user_id})
     {:reply, {:ok, token}, %{state | sessions: sessions}}
   end
 
@@ -224,13 +258,29 @@ defmodule Vagus.Ingress do
     sessions = prune_expired(state.sessions, now)
 
     case Map.fetch(sessions, token) do
-      {:ok, expiry} when expiry > now ->
-        sessions = Map.put(sessions, token, now + @session_ttl_ms)
+      {:ok, %{expiry: expiry} = session} when expiry > now ->
+        sessions = Map.put(sessions, token, %{session | expiry: now + @session_ttl_ms})
         {:reply, :ok, %{state | sessions: sessions}}
 
       _expired_or_absent ->
         {:reply, :error, %{state | sessions: sessions}}
     end
+  end
+
+  # Read-only on purpose — `prune_expired/2`'s result is kept (an expired
+  # session must not answer) but the surviving sessions' expiries are
+  # untouched, so a lookup never renews. See `session_user/2`.
+  def handle_call({:session_user, token}, _from, state) do
+    now = state.clock.()
+    sessions = prune_expired(state.sessions, now)
+
+    reply =
+      case Map.fetch(sessions, token) do
+        {:ok, %{user_id: user_id}} -> {:ok, user_id}
+        :error -> :error
+      end
+
+    {:reply, reply, %{state | sessions: sessions}}
   end
 
   def handle_call(:admin_token, _from, state) do
@@ -293,7 +343,7 @@ defmodule Vagus.Ingress do
   end
 
   defp prune_expired(sessions, now) do
-    Map.filter(sessions, fn {_token, expiry} -> expiry > now end)
+    Map.filter(sessions, fn {_token, %{expiry: expiry}} -> expiry > now end)
   end
 
   defp generate_session_token do

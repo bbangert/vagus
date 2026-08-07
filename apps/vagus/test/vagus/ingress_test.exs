@@ -110,6 +110,79 @@ defmodule Vagus.IngressTest do
     end
   end
 
+  # The Core `user_id` from `POST /ingress/session` — the only identity a
+  # later proxied ingress request can be attributed to.
+  describe "create_session/2 + session_user/2" do
+    test "records the user id passed at creation" do
+      ingress = start_ingress()
+
+      {:ok, token} = Ingress.create_session(ingress, user_id: "user-abc")
+
+      assert {:ok, "user-abc"} = Ingress.session_user(token, ingress)
+    end
+
+    test "no opts records no user" do
+      ingress = start_ingress()
+
+      {:ok, token} = Ingress.create_session(ingress)
+
+      assert {:ok, nil} = Ingress.session_user(token, ingress)
+    end
+
+    test "a non-binary user id is recorded as nil, not stored verbatim" do
+      ingress = start_ingress()
+
+      {:ok, token} = Ingress.create_session(ingress, user_id: %{"nope" => true})
+
+      assert {:ok, nil} = Ingress.session_user(token, ingress)
+    end
+
+    test "an unknown token is :error" do
+      ingress = start_ingress()
+      assert :error = Ingress.session_user("deadbeef", ingress)
+    end
+
+    test "an expired token is :error" do
+      clock = start_clock()
+      ingress = start_ingress(clock: clock_fn(clock))
+
+      {:ok, token} = Ingress.create_session(ingress, user_id: "user-abc")
+      advance(clock, 15 * 60 * 1000 + 1_000)
+
+      assert :error = Ingress.session_user(token, ingress)
+    end
+
+    # Inspection, not use: a lookup must not renew the session (the proxy
+    # path already slid the window via `validate_session/2` earlier in the
+    # same request).
+    test "does not slide the expiry" do
+      clock = start_clock()
+      ingress = start_ingress(clock: clock_fn(clock))
+
+      {:ok, token} = Ingress.create_session(ingress, user_id: "user-abc")
+
+      advance(clock, 14 * 60 * 1000)
+      assert {:ok, "user-abc"} = Ingress.session_user(token, ingress)
+
+      # +15m from creation, only 1m after the lookup: still expired, which it
+      # would not be had the lookup renewed the window.
+      advance(clock, 61 * 1000)
+      assert :error = Ingress.validate_session(token, ingress)
+    end
+
+    test "validate_session/2 preserves the recorded user across a renewal" do
+      clock = start_clock()
+      ingress = start_ingress(clock: clock_fn(clock))
+
+      {:ok, token} = Ingress.create_session(ingress, user_id: "user-abc")
+
+      advance(clock, 10 * 60 * 1000)
+      assert :ok = Ingress.validate_session(token, ingress)
+
+      assert {:ok, "user-abc"} = Ingress.session_user(token, ingress)
+    end
+  end
+
   describe "resolve_token/2" do
     test "resolves an ingress-capable add-on's token to its slug" do
       state = start_state()

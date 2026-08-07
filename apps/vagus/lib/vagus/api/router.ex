@@ -1000,11 +1000,15 @@ defmodule Vagus.API.Router do
   # wrong-caller rejection isn't a 403.
   post "/ingress/session" do
     if conn.assigns.caller == :supervisor do
-      # `session_data_user_id` (§B1.1) would resolve an HA user via
-      # `sys_homeassistant.list_users()` to attach to the session; this
-      # emulator doesn't model HA users, so the key is accepted (no 400) and
-      # simply ignored.
-      {:ok, token} = Vagus.Ingress.create_session()
+      # Core sends the requesting user's id under the wire key `user_id`
+      # (`ATTR_SESSION_DATA_USER_ID`, `homeassistant/components/hassio/const.py`)
+      # — `session_data_user_id` is upstream's *constant name*, not the key,
+      # and is accepted here only as a compatibility alias. Recorded on the
+      # session (`Vagus.Ingress.session_user/2`) because it is the only
+      # identity a later proxied ingress request carries; the body is
+      # optional, and a request without it still gets a session (no 400).
+      user_id = conn.body_params["user_id"] || conn.body_params["session_data_user_id"]
+      {:ok, token} = Vagus.Ingress.create_session(Vagus.Ingress, user_id: user_id)
       Envelope.send_ok(conn, %{session: token})
     else
       Envelope.send_error(conn, "unauthorized", 401)
