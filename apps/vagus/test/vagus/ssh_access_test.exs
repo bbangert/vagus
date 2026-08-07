@@ -139,6 +139,13 @@ defmodule Vagus.SSHAccessTest do
     assert {:ok, "ssh-ed25519 " <> _rest} = SSHAccess.public_key(name)
   end
 
+  test "authorizes the public key it serves" do
+    {name, _path} = start_seamed(authorize_fun: authorize_spy())
+
+    {:ok, pub} = SSHAccess.public_key(name)
+    assert_received {:authorized, ^pub}
+  end
+
   # The private key is persisted unencrypted, so the store must be provably
   # mode 0600 before any key is generated. When it can't be, the server must
   # neither generate nor serve one — but must also stay alive: it is a
@@ -214,6 +221,90 @@ defmodule Vagus.SSHAccessTest do
     end
   end
 
+  # A key that could not be written would be gone at the next reboot, so one
+  # that cannot be persisted is never authorized and never served — it lands
+  # in the same degraded state as an unusable store.
+  describe "store that cannot be written" do
+    test "a failing persist leaves the server alive with no key" do
+      {name, _path} =
+        start_seamed(persist_fun: failing_persist_fun(), authorize_fun: authorize_spy())
+
+      assert Process.alive?(GenServer.whereis(name))
+      assert SSHAccess.public_key(name) == {:error, :unavailable}
+      assert SSHAccess.private_key(name) == {:error, :unavailable}
+      assert SSHAccess.fingerprint(name) == {:error, :unavailable}
+    end
+
+    test "nothing is authorized for ssh login" do
+      {name, _path} =
+        start_seamed(persist_fun: failing_persist_fun(), authorize_fun: authorize_spy())
+
+      # The accessor call synchronizes with the already-queued
+      # `handle_continue(:ensure_key, ...)`, so the hook has had its chance.
+      assert SSHAccess.public_key(name) == {:error, :unavailable}
+      refute_received {:authorized, _}
+    end
+  end
+
+  # Reports every authorization attempt to the test process. `authorize/1` is
+  # a no-op on the host (NervesSSH ships with nerves_pack, target-only), so
+  # without this seam there is nothing to observe.
+  defp authorize_spy do
+    test_pid = self()
+
+    fn public_key ->
+      send(test_pid, {:authorized, public_key})
+      :ok
+    end
+  end
+
+  # A persist that fails for real: `:dets.insert/2` into a table opened
+  # read-only answers `{:error, {:access_mode, path}}`. Deterministic, needs
+  # no root, and the error value comes from dets rather than being fabricated.
+  defp failing_persist_fun do
+    dir = Path.join(System.tmp_dir!(), "ssh_access_ro_#{System.unique_integer([:positive])}")
+    File.mkdir_p!(dir)
+    ro_path = to_charlist(Path.join(dir, "readonly.dets"))
+    ro_table = :"ssh_access_ro_#{System.unique_integer([:positive])}"
+
+    # `access: :read` only opens an existing, valid DETS file.
+    {:ok, ^ro_table} = :dets.open_file(ro_table, file: ro_path, type: :set)
+    :ok = :dets.close(ro_table)
+    {:ok, ^ro_table} = :dets.open_file(ro_table, file: ro_path, type: :set, access: :read)
+
+    on_exit(fn ->
+      :dets.close(ro_table)
+      File.rm_rf!(dir)
+    end)
+
+    fn _table, keypair -> :dets.insert(ro_table, {:keypair, Map.from_struct(keypair)}) end
+  end
+
+  # Starts an instance against a fresh tmp store, with extra start-up opts —
+  # the test seams. Returns `{server_name, dets_path}`.
+  defp start_seamed(opts) do
+    dir = Path.join(System.tmp_dir!(), "ssh_access_seam_#{System.unique_integer([:positive])}")
+
+    File.mkdir_p!(dir)
+    path = Path.join(dir, "ssh_access.dets")
+    name = :"ssh_access_seam_srv_#{System.unique_integer([:positive])}"
+    table = :"ssh_access_seam_#{System.unique_integer([:positive])}"
+
+    {:ok, pid} = SSHAccess.start_link([name: name, table: table, dets_path: path] ++ opts)
+
+    on_exit(fn ->
+      try do
+        GenServer.stop(pid)
+      catch
+        :exit, _ -> :ok
+      end
+
+      File.rm_rf!(dir)
+    end)
+
+    {name, path}
+  end
+
   # Starts an instance against a store path that `init/1` cannot open.
   # Returns the server name.
   defp start_unusable(path) do
@@ -235,28 +326,5 @@ defmodule Vagus.SSHAccessTest do
 
   # Starts an instance whose store the chmod-and-verify step will refuse,
   # via the `:chmod_fun` seam. Returns `{server_name, dets_path}`.
-  defp start_degraded(chmod_fun) do
-    dir =
-      Path.join(System.tmp_dir!(), "ssh_access_degraded_#{System.unique_integer([:positive])}")
-
-    File.mkdir_p!(dir)
-    path = Path.join(dir, "ssh_access.dets")
-    name = :"ssh_access_degraded_srv_#{System.unique_integer([:positive])}"
-    table = :"ssh_access_degraded_#{System.unique_integer([:positive])}"
-
-    {:ok, pid} =
-      SSHAccess.start_link(name: name, table: table, dets_path: path, chmod_fun: chmod_fun)
-
-    on_exit(fn ->
-      try do
-        GenServer.stop(pid)
-      catch
-        :exit, _ -> :ok
-      end
-
-      File.rm_rf!(dir)
-    end)
-
-    {name, path}
-  end
+  defp start_degraded(chmod_fun), do: start_seamed(chmod_fun: chmod_fun)
 end

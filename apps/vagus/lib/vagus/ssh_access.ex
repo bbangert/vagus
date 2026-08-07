@@ -21,16 +21,18 @@ defmodule Vagus.SSHAccess do
   under `.dev/` on the host). Regeneration is intentionally not exposed; the
   key is the device's stable access identity.
 
-  ## Invariant: the store must be provably `0600`
+  ## Invariant: the store must be provably `0600`, and provably written
 
   The private key is persisted unencrypted, so a key is only ever generated,
-  loaded or served once the store file's mode has been set to `0600` **and
-  read back to confirm it**.
+  authorized or served once the store file's mode has been set to `0600` **and
+  read back to confirm it**, and the keypair has been written to the store and
+  synced to disk.
 
   Every way that can fail — the store directory cannot be created, the DETS
-  file will not open, the chmod errors, or the read-back shows another mode —
-  converges on one degraded state: the server starts and stays alive with no
-  keypair at all, and every accessor answers `{:error, :unavailable}`.
+  file will not open, the chmod errors, the read-back shows another mode, or
+  the write itself fails — converges on one degraded state: the server starts
+  and stays alive with no keypair at all, nothing is added to
+  `authorized_keys`, and every accessor answers `{:error, :unavailable}`.
   Startup never aborts on any of them — this is a supervised child, and
   refusing to boot over a filesystem failure would boot-loop the device.
 
@@ -75,7 +77,7 @@ defmodule Vagus.SSHAccess do
   The OpenSSH `authorized_keys` line for the device's access key.
 
   `{:error, :unavailable}` when the server is running degraded — see the
-  moduledoc's `0600` invariant.
+  moduledoc's store invariant.
   """
   @spec public_key(GenServer.server()) :: {:ok, String.t()} | {:error, :unavailable}
   def public_key(server \\ __MODULE__), do: GenServer.call(server, :public_key)
@@ -84,7 +86,7 @@ defmodule Vagus.SSHAccess do
   The OpenSSH-format private key PEM. Sensitive — only stream on request.
 
   `{:error, :unavailable}` when the server is running degraded — see the
-  moduledoc's `0600` invariant.
+  moduledoc's store invariant.
   """
   @spec private_key(GenServer.server()) :: {:ok, String.t()} | {:error, :unavailable}
   def private_key(server \\ __MODULE__), do: GenServer.call(server, :private_key)
@@ -93,7 +95,7 @@ defmodule Vagus.SSHAccess do
   The `SHA256:...` fingerprint of the access key's public half.
 
   `{:error, :unavailable}` when the server is running degraded — see the
-  moduledoc's `0600` invariant.
+  moduledoc's store invariant.
   """
   @spec fingerprint(GenServer.server()) :: {:ok, String.t()} | {:error, :unavailable}
   def fingerprint(server \\ __MODULE__), do: GenServer.call(server, :fingerprint)
@@ -111,13 +113,24 @@ defmodule Vagus.SSHAccess do
     table_name = Keyword.get(opts, :table, @default_table)
     path = Keyword.get(opts, :dets_path) || dets_path()
 
+    state = %{
+      table: nil,
+      path: path,
+      keypair: nil,
+      # `:persist_fun` and `:authorize_fun` are test seams, as `:chmod_fun` is
+      # below: the store write and the `nerves_ssh` registration are the two
+      # effects this module cannot exercise on the host.
+      persist_fun: Keyword.get(opts, :persist_fun, &persist/2),
+      authorize_fun: Keyword.get(opts, :authorize_fun, &authorize/1)
+    }
+
     with :ok <- File.mkdir_p(Path.dirname(path)),
          {:ok, table} <- :dets.open_file(table_name, file: to_charlist(path), type: :set) do
-      secure_store(table, path, opts)
+      secure_store(%{state | table: table}, opts)
     else
       # No table to close on either branch: mkdir_p runs before the open, and
       # a failed open leaves nothing open.
-      {:error, reason} -> degrade(nil, path, "cannot create or open: #{inspect(reason)}")
+      {:error, reason} -> {:ok, degrade(state, "cannot create or open: #{inspect(reason)}")}
     end
   end
 
@@ -131,40 +144,47 @@ defmodule Vagus.SSHAccess do
   #
   # path is config-derived (start-up opts / app env), not request input
   # sobelow_skip ["Traversal.FileModule"]
-  defp secure_store(table, path, opts) do
+  defp secure_store(state, opts) do
     chmod_fun = Keyword.get(opts, :chmod_fun, &File.chmod/2)
 
-    with :ok <- chmod_fun.(path, 0o600),
-         {:ok, %File.Stat{mode: mode}} <- File.stat(path),
+    with :ok <- chmod_fun.(state.path, 0o600),
+         {:ok, %File.Stat{mode: mode}} <- File.stat(state.path),
          0o600 <- band(mode, 0o777) do
-      {:ok, %{table: table, keypair: nil}, {:continue, :ensure_key}}
+      {:ok, state, {:continue, :ensure_key}}
     else
       mode when is_integer(mode) ->
-        degrade(table, path, "0600 unproven: mode is 0#{Integer.to_string(mode, 8)}")
+        {:ok, degrade(state, "0600 unproven: mode is 0#{Integer.to_string(mode, 8)}")}
 
       other ->
-        degrade(table, path, "0600 unproven: #{inspect(other)}")
+        {:ok, degrade(state, "0600 unproven: #{inspect(other)}")}
     end
   end
 
-  # The one degraded path: alive, no keypair, no `:ensure_key` continuation,
-  # accessors answering `{:error, :unavailable}`. `table` is nil when there is
-  # nothing open to close.
-  defp degrade(table, path, detail) do
+  # The one degraded path, which every store failure converges on: alive, no
+  # keypair, nothing authorized, accessors answering `{:error, :unavailable}`.
+  # `state.table` is nil when there is nothing open to close, and is cleared
+  # here so it can never disagree with the table just closed — `terminate/2`
+  # closes whatever it still names.
+  defp degrade(state, detail) do
     Logger.error(
-      "SSH access store #{path} unusable (#{detail}) — " <>
+      "SSH access store #{state.path} unusable (#{detail}) — " <>
         "refusing to generate or serve an SSH access key"
     )
 
-    if table, do: :dets.close(table)
-    {:ok, %{table: nil, keypair: nil}}
+    if state.table, do: :dets.close(state.table)
+    %{state | table: nil, keypair: nil}
   end
 
   @impl true
   def handle_continue(:ensure_key, state) do
-    keypair = load_or_generate(state.table)
-    schedule_authorize(keypair.public_key, 1)
-    {:noreply, %{state | keypair: keypair}}
+    case load_or_generate(state) do
+      {:ok, keypair} ->
+        schedule_authorize(state, keypair.public_key, 1)
+        {:noreply, %{state | keypair: keypair}}
+
+      {:error, reason} ->
+        {:noreply, degrade(state, "write failed: #{inspect(reason)}")}
+    end
   end
 
   @impl true
@@ -186,7 +206,7 @@ defmodule Vagus.SSHAccess do
 
   @impl true
   def handle_info({:retry_authorize, public_key, attempt}, state) do
-    schedule_authorize(public_key, attempt)
+    schedule_authorize(state, public_key, attempt)
     {:noreply, state}
   end
 
@@ -194,26 +214,31 @@ defmodule Vagus.SSHAccess do
 
   # -- Persistence --
 
-  defp load_or_generate(table) do
-    case :dets.lookup(table, @key) do
+  # A freshly generated key that cannot be written to the store is discarded,
+  # never served. This deliberately deviates from the `universal_proxy`
+  # implementation this module was ported from, which serves it anyway
+  # ("usable this boot, regenerated next boot"): an honestly-unavailable key
+  # beats a silently-ephemeral credential that an operator may wire into their
+  # tooling and come to depend on, and `NERVES_AUTHORIZED_KEYS` remains the
+  # rescue path into the device.
+  defp load_or_generate(state) do
+    case :dets.lookup(state.table, @key) do
       [{@key, %{public_key: pub, private_key: priv, fingerprint: fp}}]
       when is_binary(pub) and is_binary(priv) and is_binary(fp) ->
         Logger.info("SSH access key loaded from store")
-        %Keypair{public_key: pub, private_key: priv, fingerprint: fp}
+        {:ok, %Keypair{public_key: pub, private_key: priv, fingerprint: fp}}
 
       _ ->
         keypair = generate_keypair()
 
-        case persist(table, keypair) do
+        case state.persist_fun.(state.table, keypair) do
           :ok ->
             Logger.info("SSH access key generated (#{keypair.fingerprint})")
+            {:ok, keypair}
 
           {:error, reason} ->
-            # Degraded: usable this boot, regenerated next boot.
-            Logger.error("SSH access key generated but NOT persisted: #{inspect(reason)}")
+            {:error, reason}
         end
-
-        keypair
     end
   end
 
@@ -302,8 +327,8 @@ defmodule Vagus.SSHAccess do
   # -- nerves_ssh wiring (target only) --
 
   # Try to authorize; on a not-yet-ready nerves_ssh daemon, retry a few times.
-  defp schedule_authorize(public_key, attempt) do
-    case authorize(public_key) do
+  defp schedule_authorize(state, public_key, attempt) do
+    case state.authorize_fun.(public_key) do
       :ok ->
         :ok
 
