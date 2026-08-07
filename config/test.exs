@@ -25,6 +25,11 @@ config :vagus, :watchdog_enabled, false
 # name, which would clash with an app-started one. Mirrors :watchdog_enabled.
 config :vagus, :ingress_enabled, false
 
+# Don't start the device SSH access key manager during `mix test` — SSH
+# access unit tests start their own instance with a private name/table/
+# dets_path. Mirrors :ingress_enabled.
+config :vagus, :ssh_access_enabled, false
+
 # Strict-mode Vagus.API.Model: an undeclared/missing key raises instead of
 # just being logged, so a drifted field list fails the test suite loudly.
 config :vagus, :model_strict, true
