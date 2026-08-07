@@ -13,6 +13,20 @@ Sources (exact refs used):
 All GitHub paths below are relative to these repo roots at these exact refs unless stated
 otherwise.
 
+**2026-08-07 correction:** the fleet's running Core build actually pins
+`aiohasupervisor==0.6.0`, not `0.5.0` — a live field dump straight off a
+device's Core container (`dataclasses.fields()` on each model class, not
+this doc) caught `OSInfo` gaining a new required field, `version_pending`,
+which this doc and every model built from it had missed (production
+incident: Core's hassio coordinator crashed every refresh with
+`mashumaro.exceptions.MissingField`). §13 below is corrected. The other 7
+models the coordinator gathers (`RootInfo`, `HomeAssistantInfo`,
+`SupervisorInfo`, `HostInfo`, `StoreInfo`, `NetworkInfo`, `MountsInfo`)
+were re-diffed against that same live dump and are unchanged between
+0.5.0 and 0.6.0. The rest of this document (addons/backups/etc.) has NOT
+been re-audited against 0.6.0 — treat sections other than §13 as
+still-0.5.0-verified only.
+
 ---
 
 ## 1. SUPERVISOR env + base URL (the port question)
@@ -495,6 +509,7 @@ be JSON `null` per the type hint.
 |---|---|---|---|
 | version | str \| None | Y | Y |
 | version_latest | str \| None | Y | Y |
+| version_pending | str \| None | Y | Y |
 | update_available | bool | N | Y |
 | board | str \| None | Y | Y |
 | boot | str \| None | Y | Y |

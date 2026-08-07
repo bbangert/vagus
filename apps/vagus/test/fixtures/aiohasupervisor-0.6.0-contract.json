@@ -1,0 +1,367 @@
+{
+  "root.RootInfo": [
+    {
+      "n": "supervisor",
+      "req": true
+    },
+    {
+      "n": "homeassistant",
+      "req": true
+    },
+    {
+      "n": "hassos",
+      "req": true
+    },
+    {
+      "n": "docker",
+      "req": true
+    },
+    {
+      "n": "hostname",
+      "req": true
+    },
+    {
+      "n": "operating_system",
+      "req": true
+    },
+    {
+      "n": "features",
+      "req": true
+    },
+    {
+      "n": "machine",
+      "req": true
+    },
+    {
+      "n": "machine_id",
+      "req": true
+    },
+    {
+      "n": "arch",
+      "req": true
+    },
+    {
+      "n": "state",
+      "req": true
+    },
+    {
+      "n": "supported_arch",
+      "req": true
+    },
+    {
+      "n": "supported",
+      "req": true
+    },
+    {
+      "n": "channel",
+      "req": true
+    },
+    {
+      "n": "logging",
+      "req": true
+    },
+    {
+      "n": "timezone",
+      "req": true
+    }
+  ],
+  "homeassistant.HomeAssistantInfo": [
+    {
+      "n": "version",
+      "req": true
+    },
+    {
+      "n": "version_latest",
+      "req": true
+    },
+    {
+      "n": "update_available",
+      "req": true
+    },
+    {
+      "n": "machine",
+      "req": true
+    },
+    {
+      "n": "ip_address",
+      "req": true
+    },
+    {
+      "n": "arch",
+      "req": true
+    },
+    {
+      "n": "image",
+      "req": true
+    },
+    {
+      "n": "boot",
+      "req": true
+    },
+    {
+      "n": "port",
+      "req": true
+    },
+    {
+      "n": "ssl",
+      "req": true
+    },
+    {
+      "n": "watchdog",
+      "req": true
+    },
+    {
+      "n": "audio_input",
+      "req": true
+    },
+    {
+      "n": "audio_output",
+      "req": true
+    },
+    {
+      "n": "backups_exclude_database",
+      "req": true
+    },
+    {
+      "n": "duplicate_log_file",
+      "req": true
+    }
+  ],
+  "supervisor.SupervisorInfo": [
+    {
+      "n": "version",
+      "req": true
+    },
+    {
+      "n": "version_latest",
+      "req": true
+    },
+    {
+      "n": "update_available",
+      "req": true
+    },
+    {
+      "n": "channel",
+      "req": true
+    },
+    {
+      "n": "arch",
+      "req": true
+    },
+    {
+      "n": "supported",
+      "req": true
+    },
+    {
+      "n": "healthy",
+      "req": true
+    },
+    {
+      "n": "ip_address",
+      "req": true
+    },
+    {
+      "n": "timezone",
+      "req": true
+    },
+    {
+      "n": "logging",
+      "req": true
+    },
+    {
+      "n": "debug",
+      "req": true
+    },
+    {
+      "n": "debug_block",
+      "req": true
+    },
+    {
+      "n": "diagnostics",
+      "req": true
+    },
+    {
+      "n": "auto_update",
+      "req": true
+    },
+    {
+      "n": "country",
+      "req": true
+    },
+    {
+      "n": "detect_blocking_io",
+      "req": true
+    },
+    {
+      "n": "feature_flags",
+      "req": true
+    }
+  ],
+  "os.OSInfo": [
+    {
+      "n": "version",
+      "req": true
+    },
+    {
+      "n": "version_latest",
+      "req": true
+    },
+    {
+      "n": "version_pending",
+      "req": true
+    },
+    {
+      "n": "update_available",
+      "req": true
+    },
+    {
+      "n": "board",
+      "req": true
+    },
+    {
+      "n": "boot",
+      "req": true
+    },
+    {
+      "n": "data_disk",
+      "req": true
+    },
+    {
+      "n": "boot_slots",
+      "req": true
+    }
+  ],
+  "host.HostInfo": [
+    {
+      "n": "agent_version",
+      "req": true
+    },
+    {
+      "n": "apparmor_version",
+      "req": true
+    },
+    {
+      "n": "chassis",
+      "req": true
+    },
+    {
+      "n": "virtualization",
+      "req": true
+    },
+    {
+      "n": "cpe",
+      "req": true
+    },
+    {
+      "n": "deployment",
+      "req": true
+    },
+    {
+      "n": "disk_free",
+      "req": true
+    },
+    {
+      "n": "disk_total",
+      "req": true
+    },
+    {
+      "n": "disk_used",
+      "req": true
+    },
+    {
+      "n": "disk_life_time",
+      "req": true
+    },
+    {
+      "n": "features",
+      "req": true
+    },
+    {
+      "n": "hostname",
+      "req": true
+    },
+    {
+      "n": "llmnr_hostname",
+      "req": true
+    },
+    {
+      "n": "kernel",
+      "req": true
+    },
+    {
+      "n": "operating_system",
+      "req": true
+    },
+    {
+      "n": "timezone",
+      "req": true
+    },
+    {
+      "n": "dt_utc",
+      "req": true
+    },
+    {
+      "n": "dt_synchronized",
+      "req": true
+    },
+    {
+      "n": "use_ntp",
+      "req": true
+    },
+    {
+      "n": "startup_time",
+      "req": true
+    },
+    {
+      "n": "boot_timestamp",
+      "req": true
+    },
+    {
+      "n": "broadcast_llmnr",
+      "req": true
+    },
+    {
+      "n": "broadcast_mdns",
+      "req": true
+    }
+  ],
+  "addons.StoreInfo": [
+    {
+      "n": "addons",
+      "req": true
+    },
+    {
+      "n": "repositories",
+      "req": true
+    }
+  ],
+  "network.NetworkInfo": [
+    {
+      "n": "interfaces",
+      "req": true
+    },
+    {
+      "n": "docker",
+      "req": true
+    },
+    {
+      "n": "host_internet",
+      "req": true
+    },
+    {
+      "n": "supervisor_internet",
+      "req": true
+    }
+  ],
+  "mounts.MountsInfo": [
+    {
+      "n": "default_backup_mount",
+      "req": true
+    },
+    {
+      "n": "mounts",
+      "req": true
+    }
+  ],
+  "_version": "0.6.0"
+}

@@ -33,6 +33,10 @@ defmodule Vagus.Backend.OS.Nerves do
     %{
       version: version,
       version_latest: latest,
+      # Always nil: updates install-and-reboot in one shot (Vagus.OS.Updater),
+      # so there's never a staged-but-not-yet-active version to report. See
+      # Vagus.API.Models.OSInfo's moduledoc.
+      version_pending: nil,
       update_available: Vagus.Version.update_available?(version, latest),
       board: FirmwareKV.platform(active),
       boot: String.upcase(active),
