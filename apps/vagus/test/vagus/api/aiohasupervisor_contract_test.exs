@@ -54,9 +54,12 @@ defmodule Vagus.API.AiohasupervisorContractTest do
   module (there isn't one in 0.6.0) — a naive `from aiohasupervisor.models
   import StoreInfo; print(StoreInfo.__module__)` is the way to re-confirm
   that if it ever needs re-checking. Save the output to
-  `test/fixtures/aiohasupervisor-0.6.0-contract.json` (rename the file to
-  match the new version), replacing the `-0.6.0-` in this module's alias
-  below.
+  `test/fixtures/aiohasupervisor-<new version>-contract.json` and update
+  `@fixture_path` below to match — `@client_version` derives from that
+  path, and the "records its own `_version`" test asserts it equals the
+  fixture's own `_version` key, so a fixture saved under the wrong
+  filename (or dumped from the wrong environment) fails loudly instead of
+  silently redefining the contract.
   """
 
   use ExUnit.Case, async: true
@@ -77,6 +80,16 @@ defmodule Vagus.API.AiohasupervisorContractTest do
                 ])
   @external_resource @fixture_path
   @fixture @fixture_path |> File.read!() |> Jason.decode!()
+
+  # Derived from the fixture's own versioned filename (e.g. "0.6.0" out of
+  # "aiohasupervisor-0.6.0-contract.json") so the two can be cross-checked
+  # below — a fixture regenerated from the wrong environment (a different
+  # aiohasupervisor than the filename claims) fails loudly instead of
+  # silently redefining the contract.
+  @client_version @fixture_path
+                  |> Path.basename()
+                  |> String.replace_prefix("aiohasupervisor-", "")
+                  |> String.replace_suffix("-contract.json", "")
 
   # {fixture key, router path}
   @model_endpoints [
@@ -125,5 +138,9 @@ defmodule Vagus.API.AiohasupervisorContractTest do
   test "the fixture itself covers exactly the 8 models Core's hassio coordinator gathers" do
     assert Map.keys(@fixture) |> Enum.reject(&(&1 == "_version")) |> Enum.sort() ==
              Enum.map(@model_endpoints, &elem(&1, 0)) |> Enum.sort()
+  end
+
+  test "the fixture records the aiohasupervisor version its filename claims" do
+    assert @fixture["_version"] == @client_version
   end
 end
