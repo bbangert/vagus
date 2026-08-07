@@ -131,6 +131,27 @@ defmodule Vagus.Core.Lifecycle do
   is demonstrably healthy is not "failed to start" because it wouldn't say
   which port it is on.
 
+  ## Core's stored port
+
+  `start/1` runs `Vagus.Core.PortMigration.run/1` before anything else it
+  does — the one-shot rewrite of the port Core persisted for itself in
+  `<config>/.storage/http`, which on an already-installed fleet board still
+  says 8123 and which Core prefers over every default once it exists (see
+  that module for the full story).
+
+  This is the choke point rather than each individual create/start call
+  because it has to happen *before* Core comes up to take effect on that
+  same start, and `start/1` is the one op guaranteed to run: `Vagus.Core.Boot`
+  calls it unconditionally on every boot, adopted-running or not. `rebuild/1`
+  and `update/2` deliberately do not get their own call — any device that can
+  reach them has already booted, and any device on which they create Core for
+  the very first time has no stored config for the migration to act on.
+
+  The already-running no-op branch of `start_existing/3` is not an exception:
+  the rewrite still lands, and Core picks the new port up whenever it next
+  restarts. A migration that fails, for any reason, is logged and ignored —
+  it can never fail the start it was called from.
+
   ## The socket file outlives Core
 
   Core never unlinks the `SUPERVISOR_CORE_API_SOCKET` it created
@@ -230,7 +251,7 @@ defmodule Vagus.Core.Lifecycle do
 
   require Logger
 
-  alias Vagus.Core.{Container, Health, HttpConfig, Transport, Versions}
+  alias Vagus.Core.{Container, Health, HttpConfig, PortMigration, Transport, Versions}
   alias Vagus.Runtime.Docker
 
   @fallback_stop_timeout_s 260
@@ -389,6 +410,10 @@ defmodule Vagus.Core.Lifecycle do
   ## start/1
 
   defp do_start(opts) do
+    # Pre-start, once per device, ignored either way — see the moduledoc's
+    # "Core's stored port" section and `Vagus.Core.PortMigration`.
+    _outcome = PortMigration.run(opts)
+
     with {:ok, version} <- resolve_start_version(opts) do
       case inspect_container(opts) do
         {:ok, info} -> start_existing(info, version, opts)

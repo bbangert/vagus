@@ -203,6 +203,16 @@ config :vagus, :supervisor_options_path, "/data/vagus/supervisor_options.json"
 # and no key is generated until that is proven.
 config :vagus, :ssh_access_path, "/data/ssh_access.dets"
 
+# One-shot marker for `Vagus.Core.PortMigration` (core-socket-port80 Phase
+# B): the rewrite of the 8123 Core persisted for itself in
+# `<config>/.storage/http` back when the Supervisor API still held port 80.
+# Target-only on purpose — an unset key disables the module outright, which
+# is exactly right for host dev and the test suite, where the engine volume
+# this reads through does not exist. Same `/data` writable-path convention as
+# the keys above; the file's existence is the whole signal, its one line of
+# content is for device forensics only.
+config :vagus, :core_port_migration_marker, "/data/vagus/core_port_migration"
+
 # Persisted runtime-added store repositories (issue #5 / D4). Same
 # file-backed-JSON pattern as :supervisor_options_path above — a JSON list
 # of the source strings a user posted to `POST /store/repositories`, layered

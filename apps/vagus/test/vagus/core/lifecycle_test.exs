@@ -1218,4 +1218,134 @@ defmodule Vagus.Core.LifecycleTest do
       assert_receive :http_config_refreshed
     end
   end
+
+  ## The one-shot Core port migration — `Vagus.Core.PortMigration` owns the
+  ## conditions and is unit-tested in full next door; these prove only that
+  ## `start/1` is the choke point that runs it, before Core comes up.
+
+  # `Vagus.Core.PortMigration`'s fixtures, kept minimal here — that module's
+  # own test owns the store's real shape and every condition.
+  defp write_core_store!(dir, port) do
+    File.mkdir_p!(Path.join(dir, ".storage"))
+
+    File.write!(
+      Path.join(dir, ".storage/http"),
+      Jason.encode!(%{
+        "version" => 2,
+        "minor_version" => 2,
+        "key" => "http",
+        "data" => %{
+          "stable" => %{"server_port" => port},
+          "pending" => nil,
+          "yaml_migration_done" => true
+        }
+      })
+    )
+  end
+
+  defp stored_core_port(dir) do
+    Path.join(dir, ".storage/http")
+    |> File.read!()
+    |> Jason.decode!()
+    |> get_in(~w(data stable server_port))
+  end
+
+  defp migration_marker do
+    path = Path.join(System.tmp_dir!(), "vagus_test_lifecycle_port_marker_#{unique()}")
+    on_exit(fn -> File.rm(path) end)
+    path
+  end
+
+  describe "Core port migration" do
+    test "start/1 migrates Core's stored 8123 before the container is started" do
+      dir = tmp_config_dir()
+      marker = migration_marker()
+      write_core_store!(dir, 8123)
+
+      engine =
+        start_engine([
+          {200, inspect_body(Container.image("2026.7.0"), false)},
+          {204, nil}
+        ])
+
+      versions = start_versions("2026.7.0")
+
+      assert :ok =
+               Lifecycle.start(
+                 docker: [socket: engine.socket],
+                 versions: versions,
+                 health: health_fun(),
+                 homeassistant_path: dir,
+                 port_migration_marker: marker
+               )
+
+      assert_receive :health_called
+      assert stored_core_port(dir) == 80
+      assert File.exists?(marker)
+    end
+
+    test "start/1 on an already-running container still migrates (Core picks it up on its next restart)" do
+      dir = tmp_config_dir()
+      marker = migration_marker()
+      write_core_store!(dir, 8123)
+
+      engine = start_engine([{200, inspect_body(Container.image("2026.7.0"), true)}])
+      versions = start_versions("2026.7.0")
+
+      assert :ok =
+               Lifecycle.start(
+                 docker: [socket: engine.socket],
+                 versions: versions,
+                 health: health_fun(),
+                 homeassistant_path: dir,
+                 port_migration_marker: marker
+               )
+
+      refute_receive :health_called, 100
+      assert stored_core_port(dir) == 80
+    end
+
+    test "a migration that cannot run never fails the start" do
+      dir = tmp_config_dir()
+
+      engine =
+        start_engine([
+          {200, inspect_body(Container.image("2026.7.0"), false)},
+          {204, nil}
+        ])
+
+      versions = start_versions("2026.7.0")
+
+      # No store file at all, and a marker under a path that is a regular
+      # file — every write this could attempt fails.
+      assert :ok =
+               Lifecycle.start(
+                 docker: [socket: engine.socket],
+                 versions: versions,
+                 health: health_fun(),
+                 homeassistant_path: dir,
+                 port_migration_marker: Path.join(blocking_file(), "marker")
+               )
+
+      assert_receive :health_called
+    end
+
+    test "an unconfigured marker (the suite's own default) leaves the store alone" do
+      dir = tmp_config_dir()
+      write_core_store!(dir, 8123)
+
+      engine = start_engine([{200, inspect_body(Container.image("2026.7.0"), true)}])
+      versions = start_versions("2026.7.0")
+
+      assert :ok =
+               Lifecycle.start(
+                 docker: [socket: engine.socket],
+                 versions: versions,
+                 health: health_fun(),
+                 homeassistant_path: dir
+               )
+
+      assert stored_core_port(dir) == 8123
+    end
+  end
 end

@@ -43,6 +43,11 @@ defmodule Vagus.Core.HttpConfig do
   defaults are deliberately NOT derived from `:core_base_url`: that URL is
   where *we* dial Core in dev, not something Core told us about itself.
 
+  A cached `port: 8123` from a *successful* pull means something else
+  entirely — that Core has 8123 written into its own config store, which it
+  prefers over any default. `Vagus.Core.PortMigration` is what unsticks
+  that.
+
   ## When it refreshes
 
   `Vagus.Core.Lifecycle` calls `refresh/1` at every point it establishes
