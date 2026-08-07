@@ -105,6 +105,7 @@ defmodule Vagus.Application do
         events_children() ++
         watchdog_children() ++
         ingress_children() ++
+        ssh_access_children() ++
         [
           # Supervisor-API emulator's HTTP surface (Bandit + Plug.Router),
           # isolated with its own restart budget so a crash there can't take
@@ -215,6 +216,15 @@ defmodule Vagus.Application do
   # app-started one.
   defp ingress_children do
     if Application.get_env(:vagus, :ingress_enabled, true), do: [Vagus.Ingress], else: []
+  end
+
+  # The device-managed SSH access key (keygen + authorize), gated by
+  # :ssh_access_enabled (false in test.exs) — mirrors :ingress_enabled. Runs
+  # on both :host and target (unlike :dns_enabled/:watchdog_enabled, this
+  # isn't target-only work) since the DETS-backed keypair is useful in dev
+  # too. Tests start their own instance with a private name/table/dets_path.
+  defp ssh_access_children do
+    if Application.get_env(:vagus, :ssh_access_enabled, true), do: [Vagus.SSHAccess], else: []
   end
 
   # List all child processes to be supervised

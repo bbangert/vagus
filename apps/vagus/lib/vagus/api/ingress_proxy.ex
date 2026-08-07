@@ -24,6 +24,12 @@ defmodule Vagus.API.IngressProxy do
   2. `{token}` (the path segment right after `/ingress/`) →
      `Vagus.Ingress.resolve_token/1` → add-on slug; unresolvable → 503
      (upstream: `HTTPServiceUnavailable`).
+  2b. The reserved `vagus` slug is `Vagus.API.AdminPanel`'s synthetic panel,
+     which has no container: it is served in-process by `AdminPanel.serve/2`
+     and skips steps 3–5 entirely. It is reached only *after* step 1, so the
+     session cookie gates it exactly like a real add-on — and it then
+     imposes an admin-only gate of its own on top (403), which no add-on
+     path has.
   3. slug → `{ip, port}` via `config :vagus, :ingress_target_fun` (default
      `&default_target/1`, injectable so tests can point at a fake add-on
      without a real docker daemon/container) → resolution failure → 502.
@@ -79,7 +85,10 @@ defmodule Vagus.API.IngressProxy do
   import Plug.Conn
 
   alias Vagus.Addon.State
+  alias Vagus.API.AdminPanel
   alias Vagus.Network
+
+  @admin_slug AdminPanel.slug()
 
   # Two pools, differing only in whether they bind the supervisor anchor as
   # the source address; `finch_for/1` picks per request. See
@@ -144,12 +153,26 @@ defmodule Vagus.API.IngressProxy do
     ["ingress", token | rest] = conn.path_info
 
     with :ok <- check_session(conn),
-         {:ok, slug} <- Vagus.Ingress.resolve_token(token),
-         {:ok, {ip, port}} <- resolve_target(slug) do
-      proxy(conn, slug, ip, port, rest)
+         {:ok, slug} <- Vagus.Ingress.resolve_token(token) do
+      route(conn, slug, rest)
     else
       :unauthorized -> send_plain(conn, 401, "Unauthorized")
       :error -> send_plain(conn, 503, "Service Unavailable")
+    end
+  end
+
+  # `Vagus.API.AdminPanel` is a synthetic panel with no container behind it,
+  # so it skips target resolution and the proxy leg entirely — but only
+  # AFTER `check_session/1` above, exactly as for a real add-on. Unlike a
+  # real add-on it then applies a *second* gate of its own (Core admin
+  # status, 403 — see that module's "Security posture"): a valid session
+  # proves authentication, not privilege, and this panel serves the device's
+  # root SSH key.
+  defp route(conn, @admin_slug, rest), do: AdminPanel.serve(conn, rest)
+
+  defp route(conn, slug, rest) do
+    case resolve_target(slug) do
+      {:ok, {ip, port}} -> proxy(conn, slug, ip, port, rest)
       {:error, _reason} -> send_plain(conn, 502, "Bad Gateway")
     end
   end

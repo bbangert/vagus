@@ -13,6 +13,14 @@ defmodule Vagus.Addon.Config do
   Config is untrusted (add-on-supplied), so `parse/1` returns
   `{:error, reason}` for anything malformed — never raises.
 
+  `parse/1` also rejects the slugs Vagus reserves for itself
+  (`reserved_slug?/1` — currently just `vagus`, the synthetic admin panel).
+  That covers a persisted entry too: `Vagus.Addon.State.decode_entry/2`
+  wraps `parse/1`, so a state file carrying a `vagus` add-on from before the
+  reservation is dropped with a warning and the rest of the file still
+  loads, per that module's "a corrupt state file must never brick the
+  device" invariant.
+
   `ingress_entry`/`ingress_stream`/`panel_icon`/`panel_title`/`panel_admin`
   (`docs/contract-2026.7-m4b-ingress-watchdog.md` §B3.1) round out the
   ingress/panel config knobs alongside the pre-existing `ingress`/
@@ -31,6 +39,11 @@ defmodule Vagus.Addon.Config do
   """
 
   @slug_re ~r/^[-_.A-Za-z0-9]+$/
+  # Slugs the Supervisor itself owns and no add-on may claim. A literal, not
+  # `Vagus.API.AdminPanel.slug()`: referencing that module here would close a
+  # compile-time cycle (Config <- Addon.State <- Ingress <- AdminPanel). The
+  # two are pinned together by a test instead.
+  @reserved_slugs ["vagus"]
   # Docker tag charset (W1) — `version:` becomes the tag half of the image
   # ref `Vagus.Addon.Manager.image_ref/2` builds (`"#{image}:#{version}"`)
   # and, unlike `slug`, previously had no charset validation at all even
@@ -191,6 +204,22 @@ defmodule Vagus.Addon.Config do
   end
 
   def valid_slug?(_slug), do: false
+
+  @doc """
+  Whether `slug` is reserved by Vagus itself (the synthetic `vagus` admin
+  panel, `Vagus.API.AdminPanel`) and so may not name an add-on.
+
+  Deliberately separate from `valid_slug?/1`, which is a *filesystem*-safety
+  guard (`Vagus.Addon.Manager.uninstall/2`'s `rm_rf`, `Vagus.Backups`):
+  a reserved slug that somehow got installed must still be cleanable, so
+  that check must keep accepting it.
+
+  `Vagus.Addon.Manager.install/2` uses this to reject an install whose slug
+  comes from the URL rather than from a parsed config.
+  """
+  @spec reserved_slug?(term()) :: boolean()
+  def reserved_slug?(slug) when is_binary(slug), do: slug in @reserved_slugs
+  def reserved_slug?(_slug), do: false
 
   @doc """
   The boot mode an add-on actually starts with (phase 6 chunk A, audit E1):
@@ -383,9 +412,11 @@ defmodule Vagus.Addon.Config do
   defp slug(raw) do
     slug = req_str(raw, "slug")
 
-    if Regex.match?(@slug_re, slug),
-      do: slug,
-      else: invalid("slug '#{slug}' has invalid characters")
+    cond do
+      not Regex.match?(@slug_re, slug) -> invalid("slug '#{slug}' has invalid characters")
+      slug in @reserved_slugs -> invalid("slug '#{slug}' is reserved")
+      true -> slug
+    end
   end
 
   defp version(raw) do

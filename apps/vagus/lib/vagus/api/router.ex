@@ -33,7 +33,7 @@ defmodule Vagus.API.Router do
   alias Vagus.Addon.{Availability, Manager, OptionsSchema, Ports, State, Store, StoreView, Update}
   alias Vagus.Addon.Backend.Native
   alias Vagus.Addon.Store.Assets
-  alias Vagus.API.{Envelope, StaticData, SupervisorOptions, Tiers}
+  alias Vagus.API.{AdminPanel, Envelope, StaticData, SupervisorOptions, Tiers}
   alias Vagus.Backend
   alias Vagus.Backups
   alias Vagus.Core.{ConfigCheck, Lifecycle, TokenStore, Versions}
@@ -602,9 +602,38 @@ defmodule Vagus.API.Router do
   # its own info gets its resolved dynamic `ingress_port` back exactly the way
   # `bashio::addon.ingress_port` expects (§B3.2 fact 5) — no separate path
   # needed for the self-read case.
+  # The reserved `vagus` slug is `Vagus.API.AdminPanel`'s synthetic panel,
+  # which has no `Vagus.Addon.State` entry to render from. It is matched on
+  # the literal URL segment and wins over any add-on that claims the slug —
+  # the same precedence `Vagus.Ingress.Panels.list/1` and
+  # `Vagus.Ingress.resolve_token/2` apply.
+  #
+  # The synthetic payload is supervisor-only. Its `ingress_url` embeds the
+  # panel's per-boot ingress token — a bearer capability for the device's SSH
+  # private key — so an add-on token must never reach it. Gating on
+  # `:supervisor` costs the frontend nothing: Core's `HassIO.send_command`
+  # proxies every WS `supervisor/api` call with `$SUPERVISOR_TOKEN`, so even a
+  # non-admin Home Assistant user's read arrives here as `:supervisor` (Core
+  # whitelists `/addons/*/info` in `WS_NO_ADMIN_ENDPOINTS`, which is why this
+  # must not require more than that).
   get "/addons/:slug/info" do
     caller = conn.assigns.caller
 
+    if slug == AdminPanel.slug() do
+      synthetic_info(conn, caller)
+    else
+      addon_info(conn, slug, caller)
+    end
+  end
+
+  # Non-supervisor callers get the byte-identical 403 a foreign slug produces,
+  # so the reserved slug is indistinguishable from any other unauthorized one.
+  defp synthetic_info(conn, :supervisor), do: Envelope.send_ok(conn, AdminPanel.info())
+
+  defp synthetic_info(conn, _caller),
+    do: Envelope.send_error(conn, "Not authorized for this add-on", 403)
+
+  defp addon_info(conn, slug, caller) do
     with {:ok, resolved} <- resolve_info_slug(slug, caller),
          {:ok, %{config: config, state: state} = entry} <- Vagus.Addon.State.get(resolved) do
       # Audit A8 — "User options may contain secrets". The rule lives in
@@ -982,11 +1011,15 @@ defmodule Vagus.API.Router do
   # wrong-caller rejection isn't a 403.
   post "/ingress/session" do
     if conn.assigns.caller == :supervisor do
-      # `session_data_user_id` (§B1.1) would resolve an HA user via
-      # `sys_homeassistant.list_users()` to attach to the session; this
-      # emulator doesn't model HA users, so the key is accepted (no 400) and
-      # simply ignored.
-      {:ok, token} = Vagus.Ingress.create_session()
+      # Core sends the requesting user's id under the wire key `user_id`
+      # (`ATTR_SESSION_DATA_USER_ID`, `homeassistant/components/hassio/const.py`)
+      # — `session_data_user_id` is upstream's *constant name*, not the key,
+      # and is accepted here only as a compatibility alias. Recorded on the
+      # session (`Vagus.Ingress.session_user/2`) because it is the only
+      # identity a later proxied ingress request carries; the body is
+      # optional, and a request without it still gets a session (no 400).
+      user_id = conn.body_params["user_id"] || conn.body_params["session_data_user_id"]
+      {:ok, token} = Vagus.Ingress.create_session(Vagus.Ingress, user_id: user_id)
       Envelope.send_ok(conn, %{session: token})
     else
       Envelope.send_error(conn, "unauthorized", 401)

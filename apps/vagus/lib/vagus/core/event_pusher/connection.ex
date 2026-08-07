@@ -10,7 +10,10 @@ defmodule Vagus.Core.EventPusher.Connection do
   lifecycle transitions back to it via plain messages
   (`{:event_pusher_connection, :connected | :ready, self()}`) so the
   manager can reset its per-connection id counter and flush its buffer at
-  the right times.
+  the right times. `result` envelopes are forwarded the same way
+  (`{:event_pusher_result, id, {:ok, result} | {:error, {:core_error, e}}}`);
+  correlating them with a waiting caller — or deciding a result is
+  unmatched — is the manager's job, since only it holds the pending map.
 
   Ordinary network-level reconnection (dropped socket, upgrade failure,
   Core-initiated close) is handled entirely *inside* `Fresh` itself —
@@ -89,12 +92,21 @@ defmodule Vagus.Core.EventPusher.Connection do
     {:ok, state}
   end
 
-  defp handle_decoded({:ok, %{"type" => "result", "success" => true}}, state) do
+  defp handle_decoded(
+         {:ok, %{"type" => "result", "id" => id, "success" => true} = msg},
+         %{manager: manager} = state
+       )
+       when is_integer(id) do
+    send(manager, {:event_pusher_result, id, {:ok, Map.get(msg, "result")}})
     {:ok, state}
   end
 
-  defp handle_decoded({:ok, %{"type" => "result", "success" => false} = msg}, state) do
-    Logger.warning("Vagus.Core.EventPusher.Connection: push result nacked: #{inspect(msg)}")
+  defp handle_decoded(
+         {:ok, %{"type" => "result", "id" => id, "success" => false} = msg},
+         %{manager: manager} = state
+       )
+       when is_integer(id) do
+    send(manager, {:event_pusher_result, id, {:error, {:core_error, Map.get(msg, "error")}}})
     {:ok, state}
   end
 

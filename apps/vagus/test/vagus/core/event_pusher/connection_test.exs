@@ -127,16 +127,46 @@ defmodule Vagus.Core.EventPusher.ConnectionTest do
   end
 
   describe "handle_in/2 - result acks" do
-    test "success:true is ignored" do
+    test "success:true is forwarded to the manager with its payload" do
       state = %{manager: self(), client: :irrelevant}
-      msg = Jason.encode!(%{"type" => "result", "id" => 1, "success" => true})
+
+      msg =
+        Jason.encode!(%{
+          "type" => "result",
+          "id" => 1,
+          "success" => true,
+          "result" => [%{"id" => "abc", "is_owner" => true}]
+        })
+
       assert {:ok, ^state} = Connection.handle_in({:text, msg}, state)
+      assert_receive {:event_pusher_result, 1, {:ok, [%{"id" => "abc", "is_owner" => true}]}}
     end
 
-    test "success:false is logged and ignored, not crashed on" do
+    test "success:true with no result key forwards a nil payload (a push ack)" do
       state = %{manager: self(), client: :irrelevant}
-      msg = Jason.encode!(%{"type" => "result", "id" => 1, "success" => false})
+      msg = Jason.encode!(%{"type" => "result", "id" => 1, "success" => true})
+
       assert {:ok, ^state} = Connection.handle_in({:text, msg}, state)
+      assert_receive {:event_pusher_result, 1, {:ok, nil}}
+    end
+
+    test "success:false is forwarded as a :core_error, not crashed on" do
+      state = %{manager: self(), client: :irrelevant}
+      error = %{"code" => "unauthorized", "message" => "Unauthorized"}
+
+      msg =
+        Jason.encode!(%{"type" => "result", "id" => 2, "success" => false, "error" => error})
+
+      assert {:ok, ^state} = Connection.handle_in({:text, msg}, state)
+      assert_receive {:event_pusher_result, 2, {:error, {:core_error, ^error}}}
+    end
+
+    test "a result frame without an id is ignored rather than forwarded" do
+      state = %{manager: self(), client: :irrelevant}
+      msg = Jason.encode!(%{"type" => "result", "success" => true})
+
+      assert {:ok, ^state} = Connection.handle_in({:text, msg}, state)
+      refute_receive {:event_pusher_result, _, _}, 20
     end
   end
 

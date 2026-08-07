@@ -13,6 +13,14 @@ defmodule Vagus.Ingress.Panels do
   `"enable"` reflects the per-install `ingress_panel` toggle and is present
   (`false`) even for an ingress add-on whose panel isn't enabled.
 
+  Plus `Vagus.API.AdminPanel`'s synthetic `vagus` entry, which has no add-on
+  behind it and so is merged in independently of `Vagus.Addon.State`.
+
+  All four keys (`title`/`icon`/`admin`/`enable`) must be present on every
+  entry: `aiohasupervisor` parses this response with a strict model, and one
+  missing key fails panel registration for **all** add-ons, not just the
+  offending one.
+
   ## Push to Core (§B4.2/§B4.4)
 
   `update_hass_panel/2` mirrors the real Supervisor's `Ingress.update_hass_panel`
@@ -40,12 +48,16 @@ defmodule Vagus.Ingress.Panels do
   require Logger
 
   alias Vagus.Addon.State
+  alias Vagus.API.AdminPanel
   alias Vagus.Core.Client
+
+  @admin_slug AdminPanel.slug()
 
   @doc """
   The §B4.1 panels map: `%{slug => %{"title", "icon", "admin", "enable"}}`,
-  one entry per installed add-on with `config.ingress == true`.
-  `panel_title` falls back to the add-on's `name` when unset.
+  one entry per installed add-on with `config.ingress == true`, plus
+  `Vagus.API.AdminPanel`'s synthetic entry. `panel_title` falls back to the
+  add-on's `name` when unset.
   """
   @spec list(GenServer.server()) :: %{String.t() => map()}
   def list(state_server \\ State) do
@@ -61,6 +73,12 @@ defmodule Vagus.Ingress.Panels do
          "enable" => ingress_panel
        }}
     end)
+    # Merged last, so the reserved slug always resolves to the synthetic
+    # panel even if an add-on claims it. Same precedence as
+    # `Vagus.Ingress.resolve_token/2` and `Vagus.API.Router`'s
+    # `/addons/:slug/info`: an add-on can never shadow `vagus`, in any of
+    # the three places the slug is interpreted.
+    |> Map.put(AdminPanel.slug(), AdminPanel.panel_entry())
   end
 
   @doc """
@@ -107,6 +125,11 @@ defmodule Vagus.Ingress.Panels do
       :error -> is_pid(Process.whereis(Client))
     end
   end
+
+  # Defensive: the synthetic panel has no `Vagus.Addon.State` entry, so the
+  # clause below would resolve it to a DELETE and un-register our own
+  # sidebar panel if anything ever pushed for this slug.
+  defp push_method(@admin_slug, _state_server), do: :post
 
   defp push_method(slug, state_server) do
     case State.get(slug, state_server) do

@@ -2,6 +2,7 @@ defmodule Vagus.Addon.ConfigTest do
   use ExUnit.Case, async: true
 
   alias Vagus.Addon.Config
+  alias Vagus.API.AdminPanel
 
   @required %{
     "name" => "Test",
@@ -264,6 +265,40 @@ defmodule Vagus.Addon.ConfigTest do
       assert Config.effective_boot(boot_config("manual_only"), nil) == "manual"
       assert Config.effective_boot(boot_config("manual_only"), "auto") == "manual"
       assert Config.effective_boot(boot_config("manual_only"), "manual") == "manual"
+    end
+  end
+
+  describe "reserved slugs" do
+    test "the synthetic panel's slug is rejected by parse/1" do
+      assert {:error, msg} = Config.parse(%{@required | "slug" => "vagus"})
+      assert msg =~ "reserved"
+    end
+
+    # `Vagus.Addon.Config` can't reference `Vagus.API.AdminPanel` (that would
+    # close a compile-time cycle Config <- Addon.State <- Ingress <-
+    # AdminPanel), so its reserved list is a literal. This is what keeps the
+    # two from drifting apart.
+    test "the reserved list covers Vagus.API.AdminPanel.slug/0" do
+      panel_slug = AdminPanel.slug()
+
+      assert Config.reserved_slug?(panel_slug)
+      assert {:error, msg} = Config.parse(%{@required | "slug" => panel_slug})
+      assert msg =~ "reserved"
+    end
+
+    test "ordinary slugs are unaffected" do
+      assert {:ok, c} = Config.parse(%{@required | "slug" => "core_mosquitto"})
+      assert c.slug == "core_mosquitto"
+      refute Config.reserved_slug?("core_mosquitto")
+      refute Config.reserved_slug?("vagus_something")
+      refute Config.reserved_slug?(nil)
+    end
+
+    # Deliberately NOT extended to `valid_slug?/1`: that guard gates
+    # `Manager.uninstall/2`'s `rm_rf`, so a pre-existing `vagus` add-on's
+    # data dir must stay cleanable.
+    test "valid_slug?/1 still accepts a reserved slug" do
+      assert Config.valid_slug?("vagus")
     end
   end
 

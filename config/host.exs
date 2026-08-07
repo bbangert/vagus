@@ -32,6 +32,11 @@ config :vagus, :supervisor_options_path, Path.expand("../.dev/supervisor_options
 # file-backed-JSON pattern as :core_token_path above.
 config :vagus, :store_repositories_path, Path.expand("../.dev/store_repositories.json", __DIR__)
 
+# Device-managed SSH access keypair (`Vagus.SSHAccess`). A DETS file rather
+# than JSON, but the same `__DIR__`-anchored .dev/ path idiom as
+# :core_token_path above; config/target.exs puts it on /data.
+config :vagus, :ssh_access_path, Path.expand("../.dev/ssh_access.dets", __DIR__)
+
 # Base URL Vagus.Core.Client/EventPusher use to reach Core itself (distinct
 # from :api_port above, which is the port THIS emulator listens on for
 # Core to call INTO). Real Home Assistant OS installs run Core and

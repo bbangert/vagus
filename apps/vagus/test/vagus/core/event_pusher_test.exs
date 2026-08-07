@@ -19,6 +19,7 @@ defmodule Vagus.Core.EventPusherTest do
         monitor_ref: nil,
         ready: false,
         next_id: 1,
+        pending: %{},
         queue: :queue.new(),
         queue_size: 0,
         backoff_ms: 5_000
@@ -204,6 +205,188 @@ defmodule Vagus.Core.EventPusherTest do
     test "unknown messages never crash the manager" do
       state = base_state()
       assert {:noreply, ^state} = EventPusher.handle_info({:something, :unexpected}, state)
+    end
+  end
+
+  describe "handle_call({:command, _, _}, from, state)" do
+    setup do
+      %{from: {self(), make_ref()}}
+    end
+
+    test "sends the frame with the manager-assigned id and stashes the caller", %{from: from} do
+      state = base_state(%{ready: true, connection_pid: self(), next_id: 4})
+
+      assert {:noreply, new_state} =
+               EventPusher.handle_call(
+                 {:command, %{"type" => "config/auth/list"}, 5_000},
+                 from,
+                 state
+               )
+
+      assert received_frame() == %{"id" => 4, "type" => "config/auth/list"}
+      assert new_state.next_id == 5
+      assert {^from, timer} = new_state.pending[4]
+      assert is_reference(timer)
+    end
+
+    test "replies {:error, :not_connected} immediately when not ready", %{from: from} do
+      state = base_state(%{ready: false, connection_pid: nil})
+
+      assert {:reply, {:error, :not_connected}, ^state} =
+               EventPusher.handle_call(
+                 {:command, %{"type" => "config/auth/list"}, 5_000},
+                 from,
+                 state
+               )
+    end
+
+    test "does not enter the offline queue", %{from: from} do
+      state = base_state(%{ready: false, connection_pid: nil})
+
+      assert {:reply, {:error, :not_connected}, new_state} =
+               EventPusher.handle_call({:command, %{"type" => "x"}, 5_000}, from, state)
+
+      assert new_state.queue_size == 0
+    end
+  end
+
+  describe "handle_info({:event_pusher_result, id, result}, state)" do
+    test "replies to the waiting caller and drops the pending entry" do
+      ref = make_ref()
+      timer = Process.send_after(self(), :never, 60_000)
+      state = base_state(%{pending: %{7 => {{self(), ref}, timer}}})
+
+      assert {:noreply, new_state} =
+               EventPusher.handle_info(
+                 {:event_pusher_result, 7, {:ok, [%{"id" => "abc"}]}},
+                 state
+               )
+
+      assert_receive {^ref, {:ok, [%{"id" => "abc"}]}}
+      assert new_state.pending == %{}
+    end
+
+    test "propagates a success:false envelope as an error to the caller" do
+      ref = make_ref()
+      timer = Process.send_after(self(), :never, 60_000)
+      state = base_state(%{pending: %{1 => {{self(), ref}, timer}}})
+
+      error = %{"code" => "unauthorized", "message" => "Unauthorized"}
+
+      assert {:noreply, new_state} =
+               EventPusher.handle_info(
+                 {:event_pusher_result, 1, {:error, {:core_error, error}}},
+                 state
+               )
+
+      assert_receive {^ref, {:error, {:core_error, ^error}}}
+      assert new_state.pending == %{}
+    end
+
+    test "a result for an id nobody is waiting on is ignored" do
+      state = base_state()
+
+      assert {:noreply, ^state} =
+               EventPusher.handle_info({:event_pusher_result, 99, {:ok, nil}}, state)
+    end
+
+    test "a late result for an already-replied id is ignored" do
+      ref = make_ref()
+      timer = Process.send_after(self(), :never, 60_000)
+      state = base_state(%{pending: %{3 => {{self(), ref}, timer}}})
+
+      {:noreply, replied} =
+        EventPusher.handle_info({:event_pusher_result, 3, {:ok, :first}}, state)
+
+      assert_receive {^ref, {:ok, :first}}
+
+      assert {:noreply, ^replied} =
+               EventPusher.handle_info({:event_pusher_result, 3, {:ok, :second}}, replied)
+
+      refute_receive {^ref, _}, 20
+    end
+  end
+
+  describe "handle_info({:command_timeout, id}, state)" do
+    test "replies {:error, :timeout} and leaves no pending entry" do
+      ref = make_ref()
+      timer = Process.send_after(self(), :never, 60_000)
+      state = base_state(%{pending: %{2 => {{self(), ref}, timer}}})
+
+      assert {:noreply, new_state} = EventPusher.handle_info({:command_timeout, 2}, state)
+
+      assert_receive {^ref, {:error, :timeout}}
+      assert new_state.pending == %{}
+    end
+
+    test "a timeout for an already-replied id is a no-op" do
+      state = base_state()
+      assert {:noreply, ^state} = EventPusher.handle_info({:command_timeout, 2}, state)
+    end
+
+    test "the timer fires end-to-end from handle_call/3 with a short timeout" do
+      from = {self(), make_ref()}
+      state = base_state(%{ready: true, connection_pid: self(), next_id: 1})
+
+      {:noreply, state} = EventPusher.handle_call({:command, %{"type" => "x"}, 5}, from, state)
+
+      assert_receive {:command_timeout, 1}, 200
+      assert {:noreply, new_state} = EventPusher.handle_info({:command_timeout, 1}, state)
+      assert new_state.pending == %{}
+    end
+  end
+
+  describe "in-flight commands are failed whenever ids reset" do
+    test "a fresh connection replies {:error, :disconnected} to every pending request" do
+      ref_a = make_ref()
+      ref_b = make_ref()
+      timer_a = Process.send_after(self(), :never, 60_000)
+      timer_b = Process.send_after(self(), :never, 60_000)
+
+      state =
+        base_state(%{
+          connection_pid: self(),
+          ready: true,
+          next_id: 9,
+          pending: %{1 => {{self(), ref_a}, timer_a}, 2 => {{self(), ref_b}, timer_b}}
+        })
+
+      assert {:noreply, new_state} =
+               EventPusher.handle_info({:event_pusher_connection, :connected, self()}, state)
+
+      assert_receive {^ref_a, {:error, :disconnected}}
+      assert_receive {^ref_b, {:error, :disconnected}}
+      assert new_state.pending == %{}
+      assert new_state.next_id == 1
+    end
+
+    test "the connection dying replies {:error, :disconnected} to every pending request" do
+      ref = Process.monitor(self())
+      caller_ref = make_ref()
+      timer = Process.send_after(self(), :never, 60_000)
+
+      state =
+        base_state(%{
+          connection_pid: self(),
+          monitor_ref: ref,
+          ready: true,
+          backoff_ms: 5,
+          pending: %{1 => {{self(), caller_ref}, timer}}
+        })
+
+      assert {:noreply, new_state} =
+               EventPusher.handle_info({:DOWN, ref, :process, self(), :killed}, state)
+
+      assert_receive {^caller_ref, {:error, :disconnected}}
+      assert new_state.pending == %{}
+    end
+  end
+
+  describe "command/2" do
+    test "returns {:error, :not_started} when the manager isn't running" do
+      assert EventPusher.command(%{"type" => "config/auth/list"},
+               server: :vagus_event_pusher_absent
+             ) == {:error, :not_started}
     end
   end
 end

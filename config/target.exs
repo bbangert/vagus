@@ -182,6 +182,12 @@ config :vagus, :core_versions_path, "/data/vagus/core.json"
 # for the rationale, identical on target.
 config :vagus, :supervisor_options_path, "/data/vagus/supervisor_options.json"
 
+# Device-managed SSH access keypair (`Vagus.SSHAccess`). A DETS file, not
+# JSON, but the same `/data` writable-path convention as the keys above;
+# the private key is stored unencrypted, so the file is held at mode 0600
+# and no key is generated until that is proven.
+config :vagus, :ssh_access_path, "/data/ssh_access.dets"
+
 # Persisted runtime-added store repositories (issue #5 / D4). Same
 # file-backed-JSON pattern as :supervisor_options_path above — a JSON list
 # of the source strings a user posted to `POST /store/repositories`, layered

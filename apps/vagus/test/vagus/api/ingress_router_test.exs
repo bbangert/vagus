@@ -86,12 +86,50 @@ defmodule Vagus.API.IngressRouterTest do
       assert conn.status == 403
     end
 
-    test "an optional session_data_user_id is accepted and ignored" do
+    # Core sends the requesting user under the wire key `user_id` — the
+    # `ATTR_SESSION_DATA_USER_ID` constant's *value*
+    # (`homeassistant/components/hassio/const.py`), not its name. Recorded on
+    # the session because it is the only identity a later proxied ingress
+    # request carries (`Vagus.API.AdminPanel` gates on it).
+    test "Core's user_id is recorded on the session" do
+      conn = call(:post, "/ingress/session", Token.get(), %{"user_id" => "some-user"})
+
+      assert conn.status == 200
+      session = body(conn)["data"]["session"]
+
+      assert {:ok, "some-user"} = Vagus.Ingress.session_user(session)
+    end
+
+    # The constant's *name* as a wire key: never sent by Core, accepted as a
+    # compatibility alias only.
+    test "session_data_user_id is accepted as an alias and also recorded" do
       conn =
         call(:post, "/ingress/session", Token.get(), %{"session_data_user_id" => "some-user"})
 
       assert conn.status == 200
-      assert body(conn)["data"]["session"] =~ ~r/\A[0-9a-f]{128}\z/
+      session = body(conn)["data"]["session"]
+
+      assert {:ok, "some-user"} = Vagus.Ingress.session_user(session)
+    end
+
+    test "user_id wins when both keys are present" do
+      conn =
+        call(:post, "/ingress/session", Token.get(), %{
+          "user_id" => "real-user",
+          "session_data_user_id" => "alias-user"
+        })
+
+      assert {:ok, "real-user"} = Vagus.Ingress.session_user(body(conn)["data"]["session"])
+    end
+
+    test "a body without either key still gets a session, carrying no user" do
+      conn = call(:post, "/ingress/session", Token.get(), %{})
+
+      assert conn.status == 200
+      session = body(conn)["data"]["session"]
+
+      assert session =~ ~r/\A[0-9a-f]{128}\z/
+      assert {:ok, nil} = Vagus.Ingress.session_user(session)
     end
   end
 

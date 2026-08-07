@@ -386,6 +386,48 @@ defmodule Vagus.Addon.StateTest do
       assert log =~ "dropping invalid/mismatched entry"
     end
 
+    # A state file written before `vagus` became a reserved slug. `Config.parse/1`
+    # now rejects it, which `decode_entry/2` already treats as a corrupt entry —
+    # so it is skipped with a warning and the rest of the file still loads,
+    # rather than bricking the boot.
+    test "a persisted entry for the reserved 'vagus' slug is dropped, and the rest still loads",
+         %{config: c, path: path} do
+      File.mkdir_p!(Path.dirname(path))
+
+      on_disk = %{
+        "version" => 1,
+        "addons" => %{
+          "vagus" => %{
+            "config" => %{
+              "name" => "Impostor",
+              "version" => "1.0.0",
+              "slug" => "vagus",
+              "description" => "installed before the slug was reserved",
+              "arch" => ["aarch64"]
+            },
+            "state" => "started"
+          },
+          "core_mosquitto" => %{
+            "config" => Config.to_persistable(c),
+            "state" => "started"
+          }
+        }
+      }
+
+      File.write!(path, Jason.encode!(on_disk))
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          s = start_persisted(path)
+
+          assert State.list(s) |> Enum.map(& &1.config.slug) == ["core_mosquitto"]
+          assert :error = State.get("vagus", s)
+        end)
+
+      assert log =~ "dropping invalid/mismatched entry"
+      assert log =~ "vagus"
+    end
+
     test "persist_path: nil never writes a file", %{config: c} do
       dir = Path.join(System.tmp_dir!(), "vagus-state-nil-#{System.unique_integer([:positive])}")
       on_exit(fn -> File.rm_rf(dir) end)

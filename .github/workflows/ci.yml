@@ -45,6 +45,10 @@ jobs:
       # _build cache also skips the (slow) first-run PLT build. vendor/** is
       # in the key because vendored path deps (mqttx, fresh) aren't in
       # mix.lock but must invalidate the PLT like any other dep change.
+      # The mix.exs files are in the key too: plt_add_apps lives in
+      # apps/vagus/mix.exs, and a PLT-affecting edit there must bust the
+      # cache so the drop-guard below fires and rebuilds the PLT against
+      # the current app set.
       - name: Cache deps and _build
         id: mix-cache
         uses: actions/cache@v4
@@ -52,7 +56,7 @@ jobs:
           path: |
             deps
             _build
-          key: mix-${{ runner.os }}-otp${{ env.OTP_VERSION }}-ex${{ env.ELIXIR_VERSION }}-${{ hashFiles('mix.lock', 'vendor/**') }}
+          key: mix-${{ runner.os }}-otp${{ env.OTP_VERSION }}-ex${{ env.ELIXIR_VERSION }}-${{ hashFiles('mix.lock', 'vendor/**', 'mix.exs', 'apps/*/mix.exs') }}
           restore-keys: |
             mix-${{ runner.os }}-otp${{ env.OTP_VERSION }}-ex${{ env.ELIXIR_VERSION }}-
 

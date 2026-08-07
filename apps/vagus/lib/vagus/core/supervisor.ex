@@ -4,8 +4,8 @@ defmodule Vagus.Core.Supervisor do
   machinery (P3), plus Core's version state (P2): `Vagus.Core.TokenStore`, a
   small `Finch` pool for outbound HTTP to Core, `Vagus.Core.Versions`
   (installed/latest version persistence), `Vagus.Core.Client` (lazy
-  access-token exchange), and `Vagus.Core.EventPusher` (persistent WS
-  client manager).
+  access-token exchange), `Vagus.Core.EventPusher` (persistent WS client
+  manager), and `Vagus.Core.Users` (cached admin lookups over that WS).
 
   Mirrors `Vagus.Engine.DaemonSupervisor`/`Vagus.API.Supervisor`'s
   isolation rationale: a crash anywhere in this subtree has its own
@@ -26,7 +26,7 @@ defmodule Vagus.Core.Supervisor do
   `:rest_for_one`, not `:one_for_one`: a `TokenStore` restart wipes its
   in-memory subscriber set (`EventPusher`'s subscription among them), so
   `TokenStore` restarting must also restart every child listed after it
-  (`Finch`, `Versions`, `Client`, `EventPusher`) — `EventPusher`'s `init/1`
+  (`Finch`, `Versions`, `Client`, `EventPusher`, `Users`) — `EventPusher`'s `init/1`
   then re-subscribes and re-reads the refresh token from the fresh
   `TokenStore`, instead of being left permanently unsubscribed. `Versions`
   restarting along with it just means its in-memory 24h latest-version
@@ -49,7 +49,8 @@ defmodule Vagus.Core.Supervisor do
       {Finch, name: Vagus.Core.Finch, pools: %{default: [size: 2]}},
       Vagus.Core.Versions,
       Vagus.Core.Client,
-      Vagus.Core.EventPusher
+      Vagus.Core.EventPusher,
+      Vagus.Core.Users
     ]
 
     Supervisor.init(children, strategy: :rest_for_one, max_restarts: 5, max_seconds: 30)
