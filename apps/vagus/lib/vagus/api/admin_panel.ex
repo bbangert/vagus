@@ -209,6 +209,8 @@ defmodule Vagus.API.AdminPanel do
 
   ## Responses
 
+  # every interpolated value goes through esc/1 (Plug.HTML.html_escape)
+  # sobelow_skip ["XSS.SendResp"]
   defp send_page(conn) do
     case ssh_facts() do
       {:ok, key_type, fingerprint} ->
@@ -222,6 +224,8 @@ defmodule Vagus.API.AdminPanel do
     end
   end
 
+  # a PEM download (application/x-pem-file, attachment), never HTML
+  # sobelow_skip ["XSS.SendResp"]
   defp send_key(conn) do
     case safely(&SSHAccess.private_key/0) do
       {:ok, pem} ->

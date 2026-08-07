@@ -75,6 +75,8 @@ defmodule Vagus.SSHAccess do
   # -- Server callbacks --
 
   @impl true
+  # path is config-derived (start-up opts / app env), not request input
+  # sobelow_skip ["Traversal.FileModule"]
   def init(opts) do
     table_name = Keyword.get(opts, :table, @default_table)
     path = Keyword.get(opts, :dets_path) || dets_path()
