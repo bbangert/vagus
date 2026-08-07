@@ -531,6 +531,92 @@ defmodule Vagus.Core.LifecycleTest do
     end
   end
 
+  ## The socket file outlives Core (W1)
+
+  describe "the Supervisor↔Core socket is unlinked when Core stops or is removed" do
+    setup do
+      prev = Application.get_env(:vagus, :core_socket_path)
+      on_exit(fn -> Application.put_env(:vagus, :core_socket_path, prev) end)
+      :ok
+    end
+
+    # A real AF_UNIX socket, left behind exactly as a dead Core leaves its
+    # own: closing the listener does not unlink the file.
+    defp stale_core_socket do
+      path = Path.join(System.tmp_dir!(), "vagus_lifecycle_core_#{unique()}.sock")
+      {:ok, listen} = :gen_tcp.listen(0, ifaddr: {:local, path})
+      :gen_tcp.close(listen)
+      on_exit(fn -> File.rm(path) end)
+
+      Application.put_env(:vagus, :core_socket_path, path)
+      path
+    end
+
+    test "stop/1 removes it, so the transport stops resolving a dead endpoint" do
+      path = stale_core_socket()
+      assert Vagus.Core.Transport.current() == {:socket, path}
+
+      engine =
+        start_engine([
+          {200, inspect_body(Container.image("2026.7.0"), true, [])},
+          {204, nil}
+        ])
+
+      assert :ok = Lifecycle.stop(docker: [socket: engine.socket])
+
+      refute File.exists?(path)
+      assert {:tcp, _base_url} = Vagus.Core.Transport.current()
+    end
+
+    test "a failed stop leaves it alone — Core is still running" do
+      path = stale_core_socket()
+
+      engine =
+        start_engine([
+          {200, inspect_body(Container.image("2026.7.0"), true, [])},
+          {500, %{"message" => "boom"}}
+        ])
+
+      assert {:error, _reason} = Lifecycle.stop(docker: [socket: engine.socket])
+      assert File.exists?(path)
+    end
+
+    test "rebuild/1's remove takes it too (the container that owned it is gone)" do
+      path = stale_core_socket()
+
+      engine =
+        start_engine([
+          {200, inspect_body(Container.image("2026.6.0"), true)},
+          {204, nil},
+          {204, nil},
+          create_ok("rebuilt-id"),
+          {204, nil}
+        ])
+
+      assert :ok =
+               Lifecycle.rebuild(
+                 docker: [socket: engine.socket],
+                 versions: start_versions("2026.7.0"),
+                 health: health_fun(),
+                 http_config: http_config_fun()
+               )
+
+      refute File.exists?(path)
+    end
+
+    test "an unset :core_socket_path is a no-op, not a crash" do
+      Application.put_env(:vagus, :core_socket_path, nil)
+
+      engine =
+        start_engine([
+          {200, inspect_body(Container.image("2026.7.0"), true, [])},
+          {204, nil}
+        ])
+
+      assert :ok = Lifecycle.stop(docker: [socket: engine.socket])
+    end
+  end
+
   ## restart/1
 
   describe "restart/1" do

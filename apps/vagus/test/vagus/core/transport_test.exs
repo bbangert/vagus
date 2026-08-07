@@ -6,6 +6,8 @@ defmodule Vagus.Core.TransportTest do
   """
   use ExUnit.Case, async: false
 
+  import ExUnit.CaptureLog
+
   alias Vagus.Core.{Container, Transport}
 
   defmodule EchoPlug do
@@ -51,7 +53,16 @@ defmodule Vagus.Core.TransportTest do
         "vagus_transport_#{System.unique_integer([:positive])}.sock"
       )
 
-    on_exit(fn -> File.rm(path) end)
+    on_exit(fn -> File.rm_rf(path) end)
+    path
+  end
+
+  # A real AF_UNIX socket with nothing listening on it: closing the listener
+  # does NOT unlink the file, which is exactly the on-device situation (Core
+  # never removes the socket it created). `File.lstat/1` reports `:other`.
+  defp bind_socket!(path) do
+    {:ok, listen} = :gen_tcp.listen(0, ifaddr: {:local, path})
+    :gen_tcp.close(listen)
     path
   end
 
@@ -73,8 +84,7 @@ defmodule Vagus.Core.TransportTest do
     end
 
     test "an existing socket file wins over the TCP base URL" do
-      path = socket_path()
-      File.write!(path, "")
+      path = bind_socket!(socket_path())
       Application.put_env(:vagus, :core_socket_path, path)
       Application.put_env(:vagus, :core_base_url, "http://core.invalid:8123")
 
@@ -91,7 +101,7 @@ defmodule Vagus.Core.TransportTest do
 
       # Core starting is exactly this: the socket shows up under an already
       # running Vagus.
-      File.write!(path, "")
+      bind_socket!(path)
       assert Transport.current() == {:socket, path}
 
       # ...and a Core container recreate takes it away again.
@@ -105,12 +115,101 @@ defmodule Vagus.Core.TransportTest do
     end
 
     test ":base_url and :socket options override the configured values" do
-      path = socket_path()
-      File.write!(path, "")
+      path = bind_socket!(socket_path())
       Application.put_env(:vagus, :core_socket_path, nil)
 
       assert Transport.current(socket: path) == {:socket, path}
       assert Transport.current(base_url: "http://elsewhere:1") == {:tcp, "http://elsewhere:1"}
+    end
+  end
+
+  describe "current/1 accepts only an actual unix socket (W1)" do
+    setup do
+      Application.put_env(:vagus, :core_base_url, "http://core.invalid:8123")
+      :ok
+    end
+
+    test "a regular file planted at the socket path does not pin the transport" do
+      path = socket_path()
+      File.write!(path, "")
+      Application.put_env(:vagus, :core_socket_path, path)
+
+      # This is also the stale-Core case: `create_unix_server` raises on a
+      # regular file, so a file here would otherwise wedge Vagus at a dead
+      # endpoint with no fallback.
+      assert Transport.current() == {:tcp, "http://core.invalid:8123"}
+      assert Transport.socket() == nil
+    end
+
+    test "a symlink to a real socket elsewhere is refused — lstat never follows it" do
+      target = bind_socket!(socket_path())
+      link = socket_path()
+      File.ln_s!(target, link)
+      Application.put_env(:vagus, :core_socket_path, link)
+
+      # Redirecting Supervisor→Core traffic (`Vagus.Auth` POSTs cleartext
+      # credentials down it) is what following a symlink would buy an
+      # attacker with write access to the socket directory.
+      assert Transport.current() == {:tcp, "http://core.invalid:8123"}
+    end
+
+    test "a directory at the socket path is not a socket" do
+      path = socket_path()
+      File.mkdir_p!(path)
+      Application.put_env(:vagus, :core_socket_path, path)
+
+      assert Transport.current() == {:tcp, "http://core.invalid:8123"}
+    end
+
+    test "a real unix socket is accepted" do
+      path = bind_socket!(socket_path())
+      Application.put_env(:vagus, :core_socket_path, path)
+
+      assert Transport.current() == {:socket, path}
+    end
+  end
+
+  describe "the socket→TCP downgrade is logged (W5)" do
+    setup do
+      prev_interval = Application.get_env(:vagus, :core_transport_downgrade_log_ms)
+
+      on_exit(fn ->
+        if is_nil(prev_interval),
+          do: Application.delete_env(:vagus, :core_transport_downgrade_log_ms),
+          else: Application.put_env(:vagus, :core_transport_downgrade_log_ms, prev_interval)
+      end)
+
+      :ok
+    end
+
+    # One test, not four: the rate limiter is shared node-wide state, so the
+    # window assertions only mean anything in a fixed order.
+    test "warns on the socket→TCP edge, stays quiet on the upgrade and inside the window" do
+      path = bind_socket!(socket_path())
+      Application.put_env(:vagus, :core_socket_path, path)
+      Application.put_env(:vagus, :core_base_url, "http://core.invalid:8123")
+      Application.put_env(:vagus, :core_transport_downgrade_log_ms, 0)
+
+      # Establish the socket as the current transport. Arriving AT the socket
+      # is not a downgrade.
+      assert capture_log(fn -> assert {:socket, ^path} = Transport.current() end) == ""
+
+      File.rm!(path)
+      log = capture_log(fn -> assert {:tcp, _base_url} = Transport.current() end)
+      assert log =~ "no Supervisor↔Core socket"
+      assert log =~ "bearer token in cleartext"
+
+      # Steady state on TCP is silent — only the edge warns.
+      assert capture_log(fn -> assert {:tcp, _base_url} = Transport.current() end) == ""
+
+      # A flapping socket can't flood the ring buffer: the second downgrade
+      # falls inside the (now 60s) window opened by the first.
+      Application.put_env(:vagus, :core_transport_downgrade_log_ms, 60_000)
+      bind_socket!(path)
+      assert {:socket, ^path} = Transport.current()
+      File.rm!(path)
+
+      assert capture_log(fn -> assert {:tcp, _base_url} = Transport.current() end) == ""
     end
   end
 

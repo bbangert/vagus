@@ -115,7 +115,71 @@ token() {
   cat "$token_file"
 }
 
-case "${1:-up}" in
+# Fail-closed guards (review finding W4): this script is dev-only BY
+# CONVENTION, not by anything that stops it from running against a real
+# device. It chmod 666s a Supervisor<->Core socket and does `docker rm -f` /
+# `docker volume rm` by container/volume name — all of which honor ambient
+# DOCKER_HOST and an overridable CONTAINER_NAME. Run against a real device's
+# docker daemon (e.g. over a DOCKER_HOST proxy) with CONTAINER_NAME left at
+# its on-device value, this would open or tear down the PRODUCTION
+# Supervisor<->Core channel. Both guards are called before any docker
+# command for every subcommand that mutates a container/socket/volume.
+check_docker_host_is_local() {
+  local host="${DOCKER_HOST:-}"
+  # Unset DOCKER_HOST talks to the local daemon via its default socket.
+  if [[ -z "$host" ]]; then
+    return 0
+  fi
+  case "$host" in
+    unix://*|tcp://127.0.0.1:*|tcp://localhost:*|tcp://\[::1\]:*)
+      return 0
+      ;;
+  esac
+  if [[ "${DEV_CORE_ALLOW_REMOTE_DOCKER:-}" == "1" ]]; then
+    echo "WARNING: DOCKER_HOST=${host} is not a local docker daemon, but" >&2
+    echo "         DEV_CORE_ALLOW_REMOTE_DOCKER=1 overrides the refusal. This" >&2
+    echo "         script chmod 666s a Supervisor<->Core socket and removes" >&2
+    echo "         containers/volumes by name — pointed at a real device's" >&2
+    echo "         daemon it can open or destroy the PRODUCTION" >&2
+    echo "         Supervisor<->Core channel. Make sure this really is a" >&2
+    echo "         trusted proxy to your own dev docker daemon." >&2
+    return 0
+  fi
+  echo "ERROR: DOCKER_HOST=${host} is not a local docker daemon." >&2
+  echo "       This script is dev-only by convention, not enforcement — it" >&2
+  echo "       chmod 666s a Supervisor<->Core socket and does 'docker rm -f'" >&2
+  echo "       / 'docker volume rm' by name. Pointed at a real device's" >&2
+  echo "       docker daemon it would open or tear down that device's" >&2
+  echo "       PRODUCTION Supervisor<->Core socket/container instead of a" >&2
+  echo "       throwaway dev one. Refusing to run." >&2
+  echo "       If you deliberately proxy docker to a trusted local dev" >&2
+  echo "       daemon, set DEV_CORE_ALLOW_REMOTE_DOCKER=1 to override." >&2
+  exit 1
+}
+
+check_container_name_is_not_production() {
+  if [[ "$CONTAINER_NAME" == "homeassistant" ]]; then
+    echo "ERROR: CONTAINER_NAME=homeassistant is the on-device production" >&2
+    echo "       Core container name. Refusing to run against it — this" >&2
+    echo "       script chmod 666s the container's Supervisor socket and can" >&2
+    echo "       'docker rm -f' the container. Use the default" >&2
+    echo "       (vagus-dev-core) or another name that can't collide with a" >&2
+    echo "       production container. (No override — this name is never" >&2
+    echo "       correct for this script.)" >&2
+    exit 1
+  fi
+}
+
+action="${1:-up}"
+
+case "$action" in
+  up|down|restart|reset)
+    check_docker_host_is_local
+    check_container_name_is_not_production
+    ;;
+esac
+
+case "$action" in
   up)
     mkdir -p "$SOCKET_DIR"
     docker run -d --name "$CONTAINER_NAME" \
@@ -141,7 +205,13 @@ case "${1:-up}" in
     if [[ "$socket_ready" -eq 1 ]]; then
       # Core creates the socket root:root mode 0600 (its own hardening); chmod
       # it from inside the container (root there) so a non-root host emulator
-      # can connect — no host sudo required.
+      # can connect — no host sudo required. 660 + a shared group would be
+      # tighter, but there's no group the host emulator user and the
+      # container's root both belong to without extra chgrp/usermod setup
+      # (and devcontainer path-split makes that setup host-dependent — see
+      # the note above), so it'd need sudo or fragile gid-matching for no
+      # real dev-loop benefit. 666 stays, now that the guards above (W4)
+      # stop this from ever reaching a production socket.
       docker exec "$CONTAINER_NAME" chmod 666 "$CORE_SOCKET_PATH"
       echo "Supervisor socket: ${CORE_SOCKET_PATH} (in container) <- ${HOST_SOCKET_DIR} (docker daemon's view)."
       echo "Start (or restart) the emulator with a matching socket path so it's preferred over TCP:"
@@ -150,7 +220,9 @@ case "${1:-up}" in
       echo "WARNING: socket didn't appear within 60s — Core may still be starting, or"
       echo "         HOST_SOCKET_DIR may be wrong for this docker daemon (see the"
       echo "         devcontainer/host path split note above). Once it exists, fix"
-      echo "         permissions yourself and export the path:"
+      echo "         permissions yourself (dev-only — this opens the socket to any"
+      echo "         local user in the container; never run against a real device's"
+      echo "         Supervisor<->Core socket) and export the path:"
       echo "  docker exec ${CONTAINER_NAME} chmod 666 ${CORE_SOCKET_PATH}"
       echo "  export VAGUS_CORE_SOCKET=${SOCKET_PATH}"
     fi

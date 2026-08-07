@@ -34,6 +34,21 @@ defmodule Vagus.Core.EventPusher.SocketConnection do
   transport error, an undecodable stream) stops it `:normal`, the manager
   sees `:DOWN` and reconnects on its existing capped-exponential backoff,
   re-resolving the transport as it does so.
+
+  ## `send_timeout` on the Mint socket (issue #37)
+
+  `Mint.HTTP.connect/4` carries `transport_opts: [send_timeout: ...,
+  send_timeout_close: true]` — the same option, from the same
+  `config :vagus, :core_ws_send_timeout` (default 5s), that
+  `Vagus.API.CoreProxy.WSBridge.Upstream` sets. Without it, a Core whose
+  socket receive buffer has filled (wedged or restarting mid-write) blocks
+  `send_frame_now/2`'s `:gen_tcp.send/2` **forever**: this GenServer would
+  never exit, so the manager's monitor never fires, `ready: true` would
+  persist, `push/2` casts would pile into a mailbox nobody drains and
+  `command/2` would answer `{:error, :timeout}` without ever triggering a
+  reconnect. With it, a stalled send surfaces as
+  `stream_request_body/3`'s ordinary `{:error, conn, reason}`, which stops
+  this process `:normal` and hands the manager its usual reconnect.
   """
 
   use GenServer
@@ -43,6 +58,7 @@ defmodule Vagus.Core.EventPusher.SocketConnection do
   alias Vagus.Core.Transport
 
   @ws_path "/api/websocket"
+  @default_send_timeout_ms 5_000
 
   @typedoc "State for the Core-side Mint.WebSocket connection over the unix socket."
   @type state :: %{
@@ -74,9 +90,8 @@ defmodule Vagus.Core.EventPusher.SocketConnection do
   def init(%{manager: manager, socket: socket}) do
     transport = {:socket, socket}
     {scheme, address, port} = Transport.connect_args(transport)
-    connect_opts = [mode: :active, protocols: [:http1]] ++ Transport.connect_opts(transport)
 
-    with {:ok, conn} <- Mint.HTTP.connect(scheme, address, port, connect_opts),
+    with {:ok, conn} <- Mint.HTTP.connect(scheme, address, port, mint_connect_opts(transport)),
          {:ok, conn, ref} <-
            Mint.WebSocket.upgrade(Transport.ws_scheme(transport), conn, @ws_path, []) do
       {:ok,
@@ -137,6 +152,21 @@ defmodule Vagus.Core.EventPusher.SocketConnection do
   end
 
   ## Internals
+
+  @doc false
+  @spec mint_connect_opts(Transport.t()) :: keyword()
+  def mint_connect_opts(transport) do
+    [
+      mode: :active,
+      protocols: [:http1],
+      # See the moduledoc's "`send_timeout` on the Mint socket" section.
+      transport_opts: [send_timeout: send_timeout_ms(), send_timeout_close: true]
+    ] ++ Transport.connect_opts(transport)
+  end
+
+  defp send_timeout_ms do
+    Application.get_env(:vagus, :core_ws_send_timeout, @default_send_timeout_ms)
+  end
 
   defp process_responses([], state), do: {:noreply, state}
 

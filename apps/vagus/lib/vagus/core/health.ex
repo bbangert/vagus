@@ -29,8 +29,8 @@ defmodule Vagus.Core.Health do
   they explicitly want to exercise the default Finch wiring (in which case
   `opts[:url]` pins the probe to one absolute TCP URL, e.g. a local stub
   server, bypassing transport resolution entirely). The default probe
-  issues a Finch GET through the `Vagus.Core.Finch` pool with a 5s receive
-  timeout.
+  issues a Finch GET through the `Vagus.Core.Finch` pool (`opts[:finch]`
+  overrides it) with a 5s receive timeout.
   """
 
   alias Vagus.Core.Transport
@@ -53,6 +53,8 @@ defmodule Vagus.Core.Health do
     * `:url` - absolute URL pinning the default probe to one TCP endpoint,
       bypassing `Vagus.Core.Transport`. Default: `/manifest.json` on the
       resolved transport. Ignored if `:probe` is given.
+    * `:finch` - the Finch pool the default probe uses, default
+      `#{inspect(@default_finch)}`. Ignored if `:probe` is given.
   """
   @spec await_healthy(keyword()) :: :healthy | :timeout
   def await_healthy(opts \\ []) do
@@ -97,7 +99,8 @@ defmodule Vagus.Core.Health do
     case Keyword.get(opts, :probe) do
       nil ->
         url = Keyword.get(opts, :url)
-        fn -> default_probe(url) end
+        finch = Keyword.get(opts, :finch, @default_finch)
+        fn -> default_probe(url, finch) end
 
       probe when is_function(probe, 0) ->
         probe
@@ -107,7 +110,7 @@ defmodule Vagus.Core.Health do
   # Resolved per probe, never cached: this runs on the Core watchdog's timer
   # and per proxied request, so it is also the fastest path to notice the
   # socket Core creates when it (re)starts.
-  defp default_probe(url) do
+  defp default_probe(url, finch) do
     request =
       if url do
         Finch.build(:get, url)
@@ -115,10 +118,18 @@ defmodule Vagus.Core.Health do
         Transport.build(Transport.current(), :get, @probe_path)
       end
 
-    case Finch.request(request, @default_finch, receive_timeout: @default_probe_timeout) do
+    case Finch.request(request, finch, receive_timeout: @default_probe_timeout) do
       {:ok, %Finch.Response{status: status}} when status in 200..299 -> :ok
       {:ok, %Finch.Response{status: status}} -> {:error, {:http_error, status}}
       {:error, reason} -> {:error, reason}
     end
+  rescue
+    # `Finch.request/3` raises (rather than returning an error) when its pool
+    # isn't running — reachable in the window where the `:rest_for_one` Core
+    # subtree is restarting, which is exactly when this probe runs most. Same
+    # rescue `Vagus.Core.HttpConfig.fetch/2` carries: an unhealthy answer (and
+    # the proxy's documented 502) rather than a crashed request worker or a
+    # watchdog probe that dies instead of recovering Core.
+    e in ArgumentError -> {:error, {:finch_unavailable, Exception.message(e)}}
   end
 end

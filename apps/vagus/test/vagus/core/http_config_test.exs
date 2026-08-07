@@ -206,6 +206,14 @@ defmodule Vagus.Core.HttpConfigTest do
       assert pull_server_host(cache, %{"host" => "0.0.0.0"}) == nil
       assert HttpConfig.get(cache).port == 8123
     end
+
+    test "the accepted list is capped — it is cached indefinitely (W3)", %{cache: cache} do
+      at_cap = List.duplicate("0.0.0.0", 32)
+      assert pull_server_host(cache, at_cap) == at_cap
+
+      assert pull_server_host(cache, List.duplicate("0.0.0.0", 33)) == nil
+      assert HttpConfig.get(cache).port == 8123
+    end
   end
 
   describe "refresh/1 with no socket (TCP fallback / host dev)" do
@@ -255,10 +263,28 @@ defmodule Vagus.Core.HttpConfigTest do
       assert HttpConfig.get(cache) == cached
     end
 
-    test "a body that isn't JSON", %{cache: cache, cached: cached} do
-      script({200, "<html>nope</html>"})
+    test "a body that isn't JSON is reported as a shape, never as the body (S3c)",
+         %{cache: cache, cached: cached} do
+      script({200, "<html>a-secret-looking-blob</html>"})
 
-      assert {:error, {:invalid_json, _reason}} = HttpConfig.refresh(server: cache)
+      # `inspect(reason)` goes straight into RingLogger — a
+      # `%Jason.DecodeError{}` would carry up to 4KB of Core's body with it.
+      assert {:error, {:invalid_json, {:position, position}} = reason} =
+               HttpConfig.refresh(server: cache)
+
+      assert is_integer(position)
+      refute inspect(reason) =~ "a-secret-looking-blob"
+      assert HttpConfig.get(cache) == cached
+    end
+
+    test "a body bigger than the cap is abandoned mid-stream (W3)",
+         %{cache: cache, cached: cached} do
+      # Otherwise-valid JSON, so the only thing rejecting it is the size cap:
+      # Core answering this endpoint with a multi-GB body must not be able to
+      # OOM a 512MB device.
+      script({200, Jason.encode!(%{"port" => 8080, "pad" => String.duplicate("x", 70_000)})})
+
+      assert HttpConfig.refresh(server: cache) == {:error, :response_too_large}
       assert HttpConfig.get(cache) == cached
     end
 

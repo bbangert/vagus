@@ -16,9 +16,9 @@ defmodule Vagus.Core.Transport do
 
   ## Presence is re-decided per request / per connection, never cached
 
-  `current/1` resolves the transport by asking the filesystem whether the
-  socket file exists (`File.exists?/1` — one `stat` per resolution, noise
-  next to the HTTP round trip that follows). Nothing memoizes the answer:
+  `current/1` resolves the transport by asking the filesystem whether an
+  actual unix socket sits at the socket path (one `lstat` per resolution,
+  noise next to the HTTP round trip that follows). Nothing memoizes the answer:
   Core creates the socket when it starts, so a socket that is absent at
   Vagus boot appears minutes later, and a Core recreate (`Vagus.Core.
   Lifecycle`) can take it away and put it back. Callers therefore resolve
@@ -43,7 +43,21 @@ defmodule Vagus.Core.Transport do
   `config/test.exs` sets so the suite is deterministic regardless of what
   happens to exist under `/run` on the machine running it.
   `config :vagus, :core_base_url` is the TCP fallback, unchanged.
+
+  ## The socket→TCP downgrade is logged
+
+  Falling back to TCP is a real loss of protection, not just a different
+  dial: the TCP leg sends Core's access token as a cleartext `Authorization`
+  header to `:core_base_url`, so anything that wins that port while Core is
+  down harvests a Supervisor-privileged credential. `current/1` therefore
+  emits one `Logger.warning` on each `{:socket, _} → {:tcp, _}` edge
+  (rate-limited to one per `config :vagus, :core_transport_downgrade_log_ms`,
+  default 60s) — RingLogger is the only forensic record a device keeps. The
+  steady state costs a single `:persistent_term.get/2`: the marker is only
+  written when the resolved transport actually changes kind.
   """
+
+  require Logger
 
   alias Vagus.Core.Container
 
@@ -60,6 +74,10 @@ defmodule Vagus.Core.Transport do
 
   @default_base_url "http://localhost:8123"
 
+  @last_transport_key {__MODULE__, :last_resolved_kind}
+  @last_downgrade_log_key {__MODULE__, :last_downgrade_log_ms}
+  @downgrade_log_interval_ms 60_000
+
   @doc """
   Resolves the transport to use for one request or one connection attempt.
 
@@ -75,12 +93,64 @@ defmodule Vagus.Core.Transport do
   def current(opts \\ []) do
     case Keyword.get(opts, :socket, socket_path()) do
       path when is_binary(path) ->
-        if File.exists?(path),
-          do: {:socket, path},
-          else: {:tcp, Keyword.get(opts, :base_url, base_url())}
+        if socket_live?(path),
+          do: resolved({:socket, path}),
+          else: resolved({:tcp, Keyword.get(opts, :base_url, base_url())})
 
       _no_socket_configured ->
-        {:tcp, Keyword.get(opts, :base_url, base_url())}
+        resolved({:tcp, Keyword.get(opts, :base_url, base_url())})
+    end
+  end
+
+  # `File.exists?/1` answers true for a regular file, a directory, or a
+  # symlink to anything — and `Vagus.Core.Container`'s spec bind-mounts the
+  # socket's directory into Core read-write, so whatever can write there
+  # would otherwise get to choose what Supervisor→Core traffic dials
+  # (`Vagus.Auth` POSTs cleartext credentials down this path). `lstat`
+  # never follows a symlink, and `:other` is the `File.Stat` type of an
+  # AF_UNIX socket — a regular file, a directory or a symlink to either is
+  # rejected, and the TCP fallback engages instead.
+  #
+  # The path is a module/app-env constant (`socket_path/0`), never request
+  # input.
+  # sobelow_skip ["Traversal.FileModule"]
+  defp socket_live?(path) do
+    match?({:ok, %File.Stat{type: :other}}, File.lstat(path))
+  end
+
+  ## The socket→TCP downgrade warning — see the moduledoc.
+
+  defp resolved({kind, _endpoint} = transport) do
+    case :persistent_term.get(@last_transport_key, nil) do
+      ^kind -> transport
+      previous -> note_transition(previous, kind, transport)
+    end
+  end
+
+  defp note_transition(previous, kind, transport) do
+    :persistent_term.put(@last_transport_key, kind)
+    if previous == :socket and kind == :tcp, do: warn_downgrade()
+    transport
+  end
+
+  defp warn_downgrade do
+    now = System.monotonic_time(:millisecond)
+
+    interval =
+      Application.get_env(:vagus, :core_transport_downgrade_log_ms, @downgrade_log_interval_ms)
+
+    case :persistent_term.get(@last_downgrade_log_key, nil) do
+      last when is_integer(last) and now - last < interval ->
+        :ok
+
+      _never_or_outside_the_window ->
+        :persistent_term.put(@last_downgrade_log_key, now)
+
+        Logger.warning(
+          "Vagus.Core.Transport: no Supervisor↔Core socket at " <>
+            "#{inspect(socket_path())} — falling back to TCP #{base_url()}, " <>
+            "where Core calls carry a bearer token in cleartext"
+        )
     end
   end
 

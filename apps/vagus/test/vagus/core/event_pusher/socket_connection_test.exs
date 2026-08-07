@@ -87,6 +87,7 @@ defmodule Vagus.Core.EventPusher.SocketConnectionTest do
   use ExUnit.Case, async: false
 
   alias Vagus.Core.{EventPusher, TokenStore}
+  alias Vagus.Core.EventPusher.SocketConnection
 
   setup do
     path =
@@ -184,6 +185,32 @@ defmodule Vagus.Core.EventPusher.SocketConnectionTest do
                     {:frame,
                      %{"type" => "supervisor/event", "data" => %{"event" => "test_event"}}}},
                    2_000
+  end
+
+  test "the Mint socket carries send_timeout/send_timeout_close (C2, issue #37)" do
+    prev = Application.get_env(:vagus, :core_ws_send_timeout)
+    Application.put_env(:vagus, :core_ws_send_timeout, 1_234)
+
+    on_exit(fn ->
+      if is_nil(prev),
+        do: Application.delete_env(:vagus, :core_ws_send_timeout),
+        else: Application.put_env(:vagus, :core_ws_send_timeout, prev)
+    end)
+
+    assert SocketConnection.mint_connect_opts({:socket, "/run/x.sock"})[:transport_opts] ==
+             [send_timeout: 1_234, send_timeout_close: true]
+
+    # ...and it actually reaches the socket the live connection is holding:
+    # without it, a Core whose receive buffer has filled blocks
+    # `send_frame_now/2` forever and this GenServer never exits, so the
+    # manager's monitor never fires and every EventPusher op deadlocks.
+    name = start_manager()
+    connection = :sys.get_state(name).connection_pid
+    socket = :sys.get_state(connection).conn.socket
+
+    assert {:ok, socket_opts} = :inet.getopts(socket, [:send_timeout, :send_timeout_close])
+    assert socket_opts[:send_timeout] == 1_234
+    assert socket_opts[:send_timeout_close] == true
   end
 
   test "a stray handshake frame from Core is ignored, not treated as a result" do

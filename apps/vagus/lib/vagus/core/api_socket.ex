@@ -34,11 +34,24 @@ defmodule Vagus.Core.ApiSocket do
 
   @doc """
   POSTs `body` (a map → JSON) to `path` over the Core API socket. Returns
-  `{:ok, status}` or `{:error, reason}`. `opts[:socket]` overrides the path.
+  `{:ok, status}` or `{:error, reason}`.
+
+  `opts[:socket]` is the resolved socket path — callers that already
+  branched on `path/0` pass it so this call can't re-resolve to something
+  else (or to nothing) mid-request. Without it the path is resolved here,
+  and a resolution that comes back empty is `{:error, :no_socket}`: a
+  `nil` would otherwise reach `Mint.HTTP.connect(:http, {:local, nil}, 0)`,
+  which raises — this module never does.
   """
   @spec post(String.t(), map(), keyword()) :: {:ok, non_neg_integer()} | {:error, term()}
   def post(request_path, body, opts \\ []) when is_map(body) do
-    socket = Keyword.get(opts, :socket, path())
+    case Keyword.get(opts, :socket, path()) do
+      socket when is_binary(socket) -> do_post(request_path, body, socket)
+      _no_socket -> {:error, :no_socket}
+    end
+  end
+
+  defp do_post(request_path, body, socket) do
     payload = Jason.encode!(body)
     headers = [{"content-type", "application/json"}]
     {scheme, address, port} = Transport.connect_args({:socket, socket})

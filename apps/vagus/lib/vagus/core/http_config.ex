@@ -58,6 +58,23 @@ defmodule Vagus.Core.HttpConfig do
   leaves the previous cache — including the defaults — in place. Nothing
   here ever raises into the lifecycle/health path it is called from.
 
+  ## Core is not fully trusted with this device's memory
+
+  The response is **streamed** (`Finch.stream_while/5`) and abandoned past
+  64KB — a real answer is under 200 bytes — rather than buffered whole: a
+  compromised or broken Core answering this endpoint with a multi-GB body
+  would otherwise OOM a 512MB device. For the same reason `server_host` is
+  only accepted up to 32 entries, since the accepted list is cached
+  indefinitely. An over-long body is an ordinary `{:error, _}` pull that
+  keeps the previous cache; an over-long `server_host` falls back to the
+  default the same way any other unreadable shape does.
+
+  Decode failures are logged as a *shape* (`{:invalid_json, {:position,
+  n}}`), never as the offending body: `%Jason.DecodeError{}` carries the
+  data it choked on, and `inspect/1` would spill up to 4KB of Core-controlled
+  bytes into the fixed-size ring buffer that is a device's only forensic
+  record.
+
   ## Why a process, and why the pull does not run inside it
 
   The cache is written by whoever drives Core's lifecycle (a router request
@@ -104,6 +121,8 @@ defmodule Vagus.Core.HttpConfig do
   @default_finch Vagus.Core.Finch
   @receive_timeout 5_000
   @max_port 65_535
+  @max_body 65_536
+  @max_server_hosts 32
 
   ## Public API
 
@@ -192,19 +211,37 @@ defmodule Vagus.Core.HttpConfig do
 
   defp fetch(transport, opts) do
     request = Transport.build(transport, :get, @endpoint)
+    acc = %{status: nil, body: [], size: 0}
 
-    case Finch.request(request, finch(opts), receive_timeout: @receive_timeout) do
-      {:ok, %Finch.Response{status: 200, body: body}} -> decode(body)
-      {:ok, %Finch.Response{status: status}} -> {:error, {:http_error, status}}
-      {:error, reason} -> {:error, reason}
+    stream =
+      Finch.stream_while(request, finch(opts), acc, &collect/2, receive_timeout: @receive_timeout)
+
+    case stream do
+      {:ok, %{size: size}} when size > @max_body -> {:error, :response_too_large}
+      {:ok, %{status: 200, body: body}} -> body |> IO.iodata_to_binary() |> decode()
+      {:ok, %{status: status}} -> {:error, {:http_error, status}}
+      {:error, reason, _acc} -> {:error, reason}
     end
   rescue
-    # `Finch.request/3` raises (rather than returning an error) when its
+    # `Finch.stream_while/5` raises (rather than returning an error) when its
     # pool isn't running — reachable in the window where the `:rest_for_one`
     # Core subtree is restarting around an in-flight lifecycle op. That must
     # not take the caller's health path down with it.
     e in ArgumentError -> {:error, {:finch_unavailable, Exception.message(e)}}
   end
+
+  # Streamed rather than buffered, and abandoned the moment Core has sent
+  # more than a sane answer could be — see the moduledoc. `:halt` leaves the
+  # over-limit size in the accumulator, which is what `fetch/2` matches on.
+  defp collect({:status, status}, acc), do: {:cont, %{acc | status: status}}
+
+  defp collect({:data, chunk}, acc) do
+    acc = %{acc | body: [acc.body, chunk], size: acc.size + byte_size(chunk)}
+
+    if acc.size > @max_body, do: {:halt, acc}, else: {:cont, acc}
+  end
+
+  defp collect(_headers_or_trailers, acc), do: {:cont, acc}
 
   defp store(config, opts) do
     GenServer.call(Keyword.get(opts, :server, __MODULE__), {:put, config})
@@ -232,9 +269,14 @@ defmodule Vagus.Core.HttpConfig do
         {:error, :invalid_response}
 
       {:error, reason} ->
-        {:error, {:invalid_json, reason}}
+        {:error, {:invalid_json, json_error_shape(reason)}}
     end
   end
+
+  # The position, never the data — see the moduledoc: `refresh/1` inspects
+  # this reason straight into RingLogger, and a `%Jason.DecodeError{}` would
+  # carry up to 4KB of Core's body along with it.
+  defp json_error_shape(%Jason.DecodeError{position: position}), do: {:position, position}
 
   defp ssl(%{"ssl" => ssl}) when is_boolean(ssl), do: ssl
   defp ssl(_decoded), do: @defaults.ssl
@@ -243,7 +285,11 @@ defmodule Vagus.Core.HttpConfig do
   # the scalar form upstream's schema still allows is normalized into one.
   defp server_host(%{"server_host" => host}) when is_binary(host), do: [host]
 
-  defp server_host(%{"server_host" => hosts}) when is_list(hosts) do
+  # The cap is memory hygiene, not protocol: the accepted list is held in
+  # GenServer state indefinitely, and no real bind list is anywhere near 32
+  # addresses (see the moduledoc).
+  defp server_host(%{"server_host" => hosts})
+       when is_list(hosts) and length(hosts) <= @max_server_hosts do
     if Enum.all?(hosts, &is_binary/1), do: hosts, else: @defaults.server_host
   end
 

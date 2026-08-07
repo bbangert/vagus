@@ -131,6 +131,19 @@ defmodule Vagus.Core.Lifecycle do
   is demonstrably healthy is not "failed to start" because it wouldn't say
   which port it is on.
 
+  ## The socket file outlives Core
+
+  Core never unlinks the `SUPERVISOR_CORE_API_SOCKET` it created
+  (`Vagus.Core.Container.socket_path/0`) — a unix socket's directory entry
+  survives the process that bound it. Left alone, that file keeps
+  `Vagus.Core.Transport` resolving `{:socket, _}` at an endpoint nothing is
+  listening on for as long as Core is down, so the TCP fallback never
+  engages and a plain file dropped there would pin the transport
+  indefinitely. Every op here that leaves Core stopped or removed therefore
+  unlinks it (mirroring `scripts/dev-core.sh down`), best-effort: the next
+  Core start recreates it, and a failed unlink is logged, never returned —
+  a `stop` that worked is not a failure because a stale file survived it.
+
   ## Non-atomicity
 
   The multi-step `update/2`/rollback sequence (stop → remove → create →
@@ -217,7 +230,7 @@ defmodule Vagus.Core.Lifecycle do
 
   require Logger
 
-  alias Vagus.Core.{Container, Health, HttpConfig, Versions}
+  alias Vagus.Core.{Container, Health, HttpConfig, Transport, Versions}
   alias Vagus.Runtime.Docker
 
   @fallback_stop_timeout_s 260
@@ -415,7 +428,7 @@ defmodule Vagus.Core.Lifecycle do
 
   defp recreate(info, version, opts) do
     with :ok <- stop_existing(info, opts),
-         :ok <- Docker.remove_container(Container.name(), docker_opts(opts)) do
+         :ok <- remove_container(opts) do
       create_and_start(version, opts)
     end
   end
@@ -429,7 +442,13 @@ defmodule Vagus.Core.Lifecycle do
         {:error, _reason} -> @fallback_stop_timeout_s
       end
 
-    Docker.stop_container(Container.name(), Keyword.merge(docker_opts(opts), timeout: timeout))
+    case Docker.stop_container(
+           Container.name(),
+           Keyword.merge(docker_opts(opts), timeout: timeout)
+         ) do
+      :ok -> unlink_core_socket()
+      {:error, reason} -> {:error, reason}
+    end
   end
 
   ## restart/1
@@ -447,7 +466,7 @@ defmodule Vagus.Core.Lifecycle do
     with {:ok, version} <- resolve_installed_version(opts),
          :ok <- maybe_write_safe_mode_marker(opts),
          :ok <- stop_if_present(opts),
-         :ok <- Docker.remove_container(Container.name(), docker_opts(opts)) do
+         :ok <- remove_container(opts) do
       create_and_start(version, opts)
     end
   end
@@ -547,7 +566,7 @@ defmodule Vagus.Core.Lifecycle do
     :ok = report_stage(opts, "stop", 60)
 
     with :ok <- stop_existing(info, opts),
-         :ok <- Docker.remove_container(Container.name(), docker_opts(opts)) do
+         :ok <- remove_container(opts) do
       finish_update(was_running, target, rollback_version, opts)
     end
   end
@@ -599,7 +618,7 @@ defmodule Vagus.Core.Lifecycle do
 
   defp rollback(rollback_version, opts) do
     with :ok <- Docker.stop_container(Container.name(), docker_opts(opts)),
-         :ok <- Docker.remove_container(Container.name(), docker_opts(opts)),
+         :ok <- remove_container(opts),
          :ok <- recreate_previous(rollback_version, opts) do
       {:error, {:health_timeout, :rolled_back}}
     else
@@ -623,7 +642,7 @@ defmodule Vagus.Core.Lifecycle do
   defp maybe_remove_stale(false, _opts), do: :ok
 
   defp maybe_remove_stale(true, opts),
-    do: Docker.remove_container(Container.name(), docker_opts(opts))
+    do: remove_container(opts)
 
   defp recreate_previous(rollback_version, opts) do
     with {:ok, id} <- do_create(rollback_version, opts),
@@ -636,6 +655,45 @@ defmodule Vagus.Core.Lifecycle do
   ## Shared internals
 
   defp inspect_container(opts), do: Docker.inspect_container(Container.name(), docker_opts(opts))
+
+  # Every remove goes through here so the socket the removed container
+  # created can't outlive it — see the moduledoc's "The socket file outlives
+  # Core" section.
+  defp remove_container(opts) do
+    case Docker.remove_container(Container.name(), docker_opts(opts)) do
+      :ok -> unlink_core_socket()
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  # `nil` is `config :vagus, :core_socket_path` set explicitly to "there is
+  # never a socket here" (the test suite, host dev without one) — nothing to
+  # unlink. Always `:ok`: a stale file surviving is a degraded transport
+  # decision, not a failed lifecycle op.
+  #
+  # The path is config/module-derived (`Vagus.Core.Transport.socket_path/0`),
+  # never request input.
+  # sobelow_skip ["Traversal.FileModule"]
+  defp unlink_core_socket do
+    case Transport.socket_path() do
+      nil ->
+        :ok
+
+      path ->
+        log_unlink(path, File.rm(path))
+        :ok
+    end
+  end
+
+  defp log_unlink(_path, :ok), do: :ok
+  defp log_unlink(_path, {:error, :enoent}), do: :ok
+
+  defp log_unlink(path, {:error, reason}) do
+    Logger.warning(
+      "Vagus.Core.Lifecycle: could not unlink #{path} (#{inspect(reason)}) — " <>
+        "Vagus will keep resolving the socket transport while Core is down"
+    )
+  end
 
   defp do_create(version, opts) do
     config = desired_spec(version, opts)

@@ -1,6 +1,8 @@
 defmodule Vagus.Engine.ManagerTest do
   use ExUnit.Case, async: true
 
+  import ExUnit.CaptureLog
+
   alias Vagus.Engine.Manager
 
   describe "daemon_args/0" do
@@ -20,6 +22,48 @@ defmodule Vagus.Engine.ManagerTest do
 
     test "includes --live-restore (containers survive daemon restarts)" do
       assert "--live-restore" in Manager.daemon_args()
+    end
+  end
+
+  describe "ensure_core_socket_dir/1 (W2)" do
+    defp tmp_dir do
+      dir = Path.join(System.tmp_dir!(), "vagus_socket_dir_#{System.unique_integer([:positive])}")
+      on_exit(fn -> File.rm_rf(dir) end)
+      dir
+    end
+
+    defp mode(dir) do
+      {:ok, %File.Stat{mode: mode}} = File.stat(dir)
+      Bitwise.band(mode, 0o777)
+    end
+
+    test "creates the bind-mount source 0700, not umask's 0755" do
+      dir = tmp_dir()
+
+      assert Manager.ensure_core_socket_dir(dir) == :ok
+      assert mode(dir) == 0o700
+    end
+
+    test "tightens a directory that already exists world-traversable" do
+      dir = tmp_dir()
+      File.mkdir_p!(dir)
+      File.chmod!(dir, 0o755)
+
+      assert Manager.ensure_core_socket_dir(dir) == :ok
+      assert mode(dir) == 0o700
+    end
+
+    test "a directory that can't be created is logged loudly, never raised" do
+      blocker =
+        Path.join(System.tmp_dir!(), "vagus_socket_blocker_#{System.unique_integer([:positive])}")
+
+      File.write!(blocker, "not a directory")
+      on_exit(fn -> File.rm(blocker) end)
+
+      log = capture_log(fn -> Manager.ensure_core_socket_dir(Path.join(blocker, "run")) end)
+
+      assert log =~ "failed to create"
+      assert log =~ "Core's Supervisor socket mount will fail"
     end
   end
 
