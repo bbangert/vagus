@@ -19,6 +19,9 @@ defmodule Vagus.Backend.OS.HostStub do
     %{
       version: version,
       version_latest: version,
+      # Always nil: updates install-and-reboot in one shot (real target has
+      # no staged-pending window either). See Vagus.API.Models.OSInfo.
+      version_pending: nil,
       update_available: false,
       board: FirmwareKV.platform(active),
       boot: String.upcase(active),

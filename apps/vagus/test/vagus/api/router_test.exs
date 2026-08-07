@@ -36,7 +36,8 @@ defmodule Vagus.API.RouterTest do
                      boot port ssl watchdog audio_input audio_output backups_exclude_database
                      duplicate_log_file)
 
-  @os_info_keys ~w(version version_latest update_available board boot data_disk boot_slots)
+  @os_info_keys ~w(version version_latest version_pending update_available board boot data_disk
+                   boot_slots)
 
   @host_info_keys ~w(agent_version apparmor_version chassis virtualization cpe deployment
                      disk_free disk_total disk_used disk_life_time features hostname
