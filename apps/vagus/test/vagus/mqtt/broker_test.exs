@@ -225,6 +225,52 @@ defmodule Vagus.Mqtt.BrokerTest do
     end
   end
 
+  # The Supervisor-API listener vacated port 80 for Core and moved to
+  # `172.30.32.2:<:api_port>`; the broker was deliberately left alone, and
+  # these pin that. `init/1` is the `Supervisor` callback and is pure — it
+  # builds child specs and returns them, starting nothing — so the defaults
+  # can be read without binding 1883.
+  describe "listener defaults (unchanged by the API's rebind)" do
+    test "the listen port is 1883 and does not follow the Supervisor API's config" do
+      assert listener_options([])[:port] == 1883
+
+      prev_port = Application.get_env(:vagus, :api_port)
+      prev_ip = Application.get_env(:vagus, :api_bind_ip)
+
+      on_exit(fn ->
+        restore(:api_port, prev_port)
+        restore(:api_bind_ip, prev_ip)
+      end)
+
+      Application.put_env(:vagus, :api_port, 4242)
+      Application.put_env(:vagus, :api_bind_ip, "10.1.2.3")
+
+      options = listener_options([])
+      assert options[:port] == 1883
+      refute options[:ip] == {10, 1, 2, 3}
+    end
+
+    test "the bind address is the compile-time default, not an API config key" do
+      # `Mix.target() == :host` here, so this is the loopback branch; on target
+      # the broker binds `0.0.0.0` on purpose (it starts before the hassio
+      # anchor exists — P6). Both are compile-time clauses in the broker with
+      # no config key between them, which is the property worth pinning: the
+      # API's `:api_bind_ip` cannot reach this.
+      assert listener_options([])[:ip] == {127, 0, 0, 1}
+      assert listener_options(ip: {0, 0, 0, 0})[:ip] == {0, 0, 0, 0}
+    end
+  end
+
+  defp listener_options(opts) do
+    {:ok, {_flags, children}} = Broker.init(opts)
+    listener = Enum.find(children, &match?(%{id: :listener}, &1))
+    {MqttX.Server, :start_link, [_handler, _handler_opts, transport_options]} = listener.start
+    transport_options
+  end
+
+  defp restore(key, nil), do: Application.delete_env(:vagus, key)
+  defp restore(key, value), do: Application.put_env(:vagus, key, value)
+
   defp free_port do
     {:ok, socket} = :gen_tcp.listen(0, ip: {127, 0, 0, 1})
     {:ok, port} = :inet.port(socket)

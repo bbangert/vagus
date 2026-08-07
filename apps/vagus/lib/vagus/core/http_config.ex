@@ -30,9 +30,9 @@ defmodule Vagus.Core.HttpConfig do
   cache therefore always holds `[String.t()]` (never a bare string) or
   `nil` — "Core has not told us", the same thing the defaults mean. Keeping
   the whole list rather than collapsing to the first entry is deliberate:
-  the question Phase B has to answer is whether Core *wildcard*-binds (and
-  so collides with our own `:80` listener), which the first element alone
-  cannot answer.
+  the question is whether Core *wildcard*-binds, which is what forced the
+  Supervisor-API listener off port 80 onto the bridge anchor
+  (`Vagus.API.Listener`), and the first element alone cannot answer it.
 
   Because the endpoint is socket-only, there is nothing to pull on the TCP
   fallback (host dev, `:core_base_url`): `refresh/1` returns
@@ -42,6 +42,15 @@ defmodule Vagus.Core.HttpConfig do
   Core's own `_DEFAULT_CONFIG_LEGACY_PORT` bind-failure fallback. The
   defaults are deliberately NOT derived from `:core_base_url`: that URL is
   where *we* dial Core in dev, not something Core told us about itself.
+
+  A cached `port: 8123` from a *successful* pull means something else
+  entirely — that Core has 8123 written into its own config store, which it
+  prefers over any default. `Vagus.Core.PortMigration` is what unsticks
+  that, and this module closes its loop: a successful pull reporting
+  `PortMigration.target_port/0` is the system's only proof that Core bound
+  the migrated port, so `refresh/1` calls `PortMigration.confirm/1` on it.
+  Nothing else may — the store rewrite alone proves nothing (see that
+  module).
 
   ## When it refreshes
 
@@ -103,15 +112,16 @@ defmodule Vagus.Core.HttpConfig do
 
   `refresh/1` additionally takes `:server` (which cache to write, default
   `#{inspect(__MODULE__)}`), `:transport` (a resolved `Vagus.Core.Transport.t()`,
-  default `Vagus.Core.Transport.current/1`) and `:finch` (the pool, default
-  `Vagus.Core.Finch`).
+  default `Vagus.Core.Transport.current/1`), `:finch` (the pool, default
+  `Vagus.Core.Finch`) and `:confirm` (the zero-arity port-migration
+  confirmation, default `&Vagus.Core.PortMigration.confirm/0`).
   """
 
   use GenServer
 
   require Logger
 
-  alias Vagus.Core.Transport
+  alias Vagus.Core.{PortMigration, Transport}
 
   @typedoc "Core's reported HTTP parameters."
   @type t :: %{port: pos_integer(), ssl: boolean(), server_host: [String.t()] | nil}
@@ -159,13 +169,13 @@ defmodule Vagus.Core.HttpConfig do
   `{:error, reason}` when the pull or the handover failed, in which case
   the previously cached value stays.
 
-  See the moduledoc for `:server`/`:transport`/`:finch`.
+  See the moduledoc for `:server`/`:transport`/`:finch`/`:confirm`.
   """
   @spec refresh(keyword()) :: :ok | {:skipped, :no_socket} | {:error, term()}
   def refresh(opts \\ []) do
     case pull(opts) do
       {:ok, config} ->
-        store(config, opts)
+        with :ok <- store(config, opts), do: confirm_port_migration(config, opts)
 
       {:skipped, :no_socket} = skipped ->
         Logger.debug(
@@ -243,6 +253,19 @@ defmodule Vagus.Core.HttpConfig do
   end
 
   defp collect(_headers_or_trailers, acc), do: {:cont, acc}
+
+  # A successful pull reporting the migration's target port is the only
+  # evidence anywhere in the system that Core really bound it, so this is
+  # where `Vagus.Core.PortMigration` gets retired (it writes its marker at
+  # most once, and never fails). Always `:ok`: the caller asked for a cache
+  # refresh, and the cache was refreshed.
+  defp confirm_port_migration(%{port: port}, opts) do
+    if port == PortMigration.target_port() do
+      _confirmation = Keyword.get(opts, :confirm, &PortMigration.confirm/0).()
+    end
+
+    :ok
+  end
 
   defp store(config, opts) do
     GenServer.call(Keyword.get(opts, :server, __MODULE__), {:put, config})

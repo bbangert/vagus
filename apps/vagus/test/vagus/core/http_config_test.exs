@@ -216,6 +216,56 @@ defmodule Vagus.Core.HttpConfigTest do
     end
   end
 
+  describe "the port-migration confirmation" do
+    setup do
+      path = start_socket_core(ok_body(%{"port" => 8123}))
+      Application.put_env(:vagus, :core_socket_path, path)
+      parent = self()
+
+      %{
+        cache: start_cache(),
+        confirm: fn -> send(parent, :confirmed) end
+      }
+    end
+
+    test "fires when Core reports the migration's target port", ctx do
+      script(ok_body(%{"port" => Vagus.Core.PortMigration.target_port()}))
+
+      assert HttpConfig.refresh(server: ctx.cache, confirm: ctx.confirm) == :ok
+      assert_received :confirmed
+    end
+
+    test "does not fire while Core is still on the legacy port", ctx do
+      assert HttpConfig.refresh(server: ctx.cache, confirm: ctx.confirm) == :ok
+      refute_received :confirmed
+    end
+
+    test "does not fire on a failed pull — an unstored config proves nothing", ctx do
+      script({500, "boom"})
+
+      assert {:error, {:http_error, 500}} =
+               HttpConfig.refresh(server: ctx.cache, confirm: ctx.confirm)
+
+      refute_received :confirmed
+    end
+
+    test "a confirmation that fails never fails the refresh", ctx do
+      script(ok_body(%{"port" => Vagus.Core.PortMigration.target_port()}))
+      confirm = fn -> {:error, :enotdir} end
+
+      assert HttpConfig.refresh(server: ctx.cache, confirm: confirm) == :ok
+      assert HttpConfig.get(ctx.cache).port == Vagus.Core.PortMigration.target_port()
+    end
+
+    test "the real default is a no-op in the suite (no marker configured)", ctx do
+      # `config/test.exs` pins `:core_port_migration_marker` to nil, so the
+      # un-injected path can't reach a filesystem from here.
+      script(ok_body(%{"port" => Vagus.Core.PortMigration.target_port()}))
+
+      assert HttpConfig.refresh(server: ctx.cache) == :ok
+    end
+  end
+
   describe "refresh/1 with no socket (TCP fallback / host dev)" do
     test "skips the pull entirely and keeps the defaults" do
       # A TCP listener that WOULD answer the endpoint: if the pull were

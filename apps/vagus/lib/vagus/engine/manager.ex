@@ -38,6 +38,16 @@ defmodule Vagus.Engine.Manager do
        dynamically to `Vagus.Engine.DaemonSupervisor` so a later daemon
        crash gets restarted (via the supervisor's normal `:permanent`
        restart) without needing to observe `:internet` again.
+    3. Schedules a `Vagus.Network.Nat.ensure/1` a few seconds after the
+       daemon comes up. The daemon owns the `nat` table too (`--iptables=true`)
+       and rewrites its own chains and jumps at startup, which can displace
+       or drop ours; re-asserting after every daemon start (not only the
+       first) is what heals a device whose add-ons would otherwise silently
+       lose `http://supervisor/` after an engine restart. Delayed rather
+       than immediate because the daemon does that table work during its own
+       initialisation, i.e. after `start_link` returns. The assert is
+       unconditional and idempotent — this side never learns whether the
+       daemon actually touched anything.
 
   The daemon's pid is monitored (`Process.monitor/1`) once started, and
   `DynamicSupervisor.start_child/2`'s result is never trusted to be `{:ok,
@@ -65,11 +75,16 @@ defmodule Vagus.Engine.Manager do
 
   alias Vagus.Core.Container
   alias Vagus.Engine.ResolvConf
+  alias Vagus.Network.Nat
 
   @connection_property ["connection"]
 
   # How long to wait before re-attempting a failed/lost daemon start.
   @retry_ms 5_000
+
+  # How long after a daemon start to re-assert the supervisor DNAT — long
+  # enough for the daemon to have finished its own `nat`-table setup.
+  @nat_assert_ms 10_000
 
   # Use the real mount path, NOT the `/data` symlink (→ `/root`): runc rejects a
   # container rootfs whose path contains a symlink component ("invalid rootfs:
@@ -105,6 +120,10 @@ defmodule Vagus.Engine.Manager do
       the `MuonTrap.Daemon` child under. Defaults to
       `Vagus.Engine.DaemonSupervisor`.
     * `:name` - GenServer name, defaults to `__MODULE__`.
+    * `:nat_assert` - 0-arity re-assert seam, defaults to
+      `Vagus.Network.Nat.ensure/0`.
+    * `:nat_assert_ms` - delay between a daemon start and that re-assert,
+      defaults to `#{@nat_assert_ms}`.
   """
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts \\ []) do
@@ -126,7 +145,13 @@ defmodule Vagus.Engine.Manager do
 
     subscribe_to_connection()
 
-    state = %{daemon_supervisor: daemon_supervisor, daemon_pid: nil, daemon_monitor_ref: nil}
+    state = %{
+      daemon_supervisor: daemon_supervisor,
+      daemon_pid: nil,
+      daemon_monitor_ref: nil,
+      nat_assert: Keyword.get(opts, :nat_assert, &Nat.ensure/0),
+      nat_assert_ms: Keyword.get(opts, :nat_assert_ms, @nat_assert_ms)
+    }
 
     # Handle the case where :internet was already reached before we
     # subscribed (e.g. this GenServer restarted after a crash).
@@ -170,6 +195,16 @@ defmodule Vagus.Engine.Manager do
   # Already started (or not our retry to act on) - no-op. Covers both the
   # "already started" no-double-start guard and stray retry messages.
   def handle_info(:retry_daemon_start, state), do: {:noreply, state}
+
+  # Scheduled by every successful daemon start (see the moduledoc): the
+  # daemon owns the same `nat` table, so the DNAT that serves
+  # `172.30.32.2:80` is re-asserted after it has settled. Idempotent, and
+  # its result is deliberately ignored — `Vagus.Network.Nat` logs its own
+  # failures, and there is nothing useful to do here about one.
+  def handle_info(:assert_nat, state) do
+    _ignored = state.nat_assert.()
+    {:noreply, state}
+  end
 
   def handle_info(_other, state), do: {:noreply, state}
 
@@ -276,6 +311,7 @@ defmodule Vagus.Engine.Manager do
   end
 
   defp monitor_daemon(state, pid) do
+    Process.send_after(self(), :assert_nat, state.nat_assert_ms)
     %{state | daemon_pid: pid, daemon_monitor_ref: Process.monitor(pid)}
   end
 

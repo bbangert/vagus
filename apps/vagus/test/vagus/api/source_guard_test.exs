@@ -64,6 +64,21 @@ defmodule Vagus.API.SourceGuardTest do
       assert SourceGuard.allowed?({192, 168, 2, 149})
     end
 
+    test "narrowing the allowlist to the hassio subnet would refuse Core" do
+      # The guard was reviewed for retirement/narrowing once the listener moved
+      # off `0.0.0.0:80` onto the bridge anchor. Narrowing is the trap: a DNAT
+      # rewrites the destination, not the source, so Core's packets still
+      # arrive from the board's LAN address and it is the local-address rule —
+      # not `hassio?/1` — that admits them. Seeding an empty cache is exactly
+      # what a bridge-only allowlist would behave like.
+      seed_local([])
+
+      refute SourceGuard.allowed?({192, 168, 2, 149})
+
+      seed_local([{192, 168, 2, 149}])
+      assert SourceGuard.allowed?({192, 168, 2, 149})
+    end
+
     test "another host on the same LAN is refused" do
       # The point of the guard: same subnet, different machine.
       seed_local([{192, 168, 2, 149}])

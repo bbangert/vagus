@@ -1,6 +1,6 @@
 defmodule Vagus.API.Dispatcher do
   @moduledoc """
-  The Bandit entry-point plug (`Vagus.API.Supervisor`'s `plug:`), split out
+  The Bandit entry-point plug (`Vagus.API.Listener`'s `plug:`), split out
   from `Vagus.API.Router` so the ingress reverse-proxy leg
   (`docs/contract-2026.7-m4b-ingress-watchdog.md` §B2) can run with **no**
   `Plug.Parsers` in front of it.
@@ -127,7 +127,7 @@ defmodule Vagus.API.Dispatcher do
   def init(opts), do: opts
 
   # The source allowlist lives HERE, not in the router, because this is what
-  # Bandit is given (`Vagus.API.Supervisor`'s `plug:`) and the ingress clause
+  # Bandit is given (`Vagus.API.Listener`'s `plug:`) and the ingress clause
   # below never reaches the router's pipeline. A guard installed as a router
   # plug protects `/supervisor/ping` and leaves `/ingress/{token}/…` — an
   # authenticated-by-cookie reverse proxy into an add-on's web UI, with a

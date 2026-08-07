@@ -34,10 +34,20 @@ defmodule Vagus.DNSTest do
   defp tail_addr(_resp, 0), do: nil
   defp tail_addr(resp, _), do: :binary.part(resp, byte_size(resp), -4) |> :binary.bin_to_list()
 
+  # The name half of the add-on contract: `http://supervisor/` resolves here
+  # and then dials port 80 on the answer. The Supervisor-API listener vacated
+  # 80 for Core and 80 on the anchor is a DNAT now (`Vagus.Network.Nat`), so
+  # this record has to keep pointing at the anchor the rewrite matches on —
+  # a zone A record carries no port, which is precisely why the DNAT and not a
+  # second listener is what serves it.
   test "resolves the supervisor anchor to .2", %{sock: s, port: p} do
     r = ask(s, p, "supervisor")
     assert r.ancount == 1
     assert r.addr == [172, 30, 32, 2]
+  end
+
+  test "the hassio alias answers the same anchor", %{sock: s, port: p} do
+    assert ask(s, p, "hassio").addr == [172, 30, 32, 2]
   end
 
   test "resolves the .local.hass.io suffixed form too", %{sock: s, port: p} do

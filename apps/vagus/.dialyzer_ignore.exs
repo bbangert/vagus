@@ -54,6 +54,9 @@
   # manager.ex:pattern_match below: the stubbed socket makes dialyzer infer the
   # success branch dead on host. Device-proven; not a defect.
   {"lib/vagus/addon/boot_starter.ex", :pattern_match},
+  # ...and ensure_nat/0 (the supervisor-DNAT assert) is only called from inside
+  # that same branch, so it inherits the cascade as unused_fun.
+  {"lib/vagus/addon/boot_starter.ex", :unused_fun},
   {"lib/vagus/addon/backend/container.ex", :no_return},
   {"lib/vagus/addon/backend/container.ex", :pattern_match},
   {"lib/vagus/addon/manager.ex", :pattern_match},

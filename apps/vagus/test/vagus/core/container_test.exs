@@ -84,6 +84,36 @@ defmodule Vagus.Core.ContainerTest do
     end
   end
 
+  describe "the add-on/Core contract address" do
+    # The Supervisor-API listener no longer holds port 80: it binds
+    # `172.30.32.2:<:api_port>` (`Vagus.API.Listener`) and 80 on that same
+    # address is a DNAT (`Vagus.Network.Nat`). Core has no way to be told a
+    # port — upstream reads `SUPERVISOR` as a bare host and dials 80 — so the
+    # bare form below is what makes the rewrite load-bearing. Growing a
+    # `:8888` suffix here would point Core at a port that answers today and
+    # bypasses the contract, and an explicit suffix was device-proven to break
+    # Core outright during the bluetooth work.
+    test "SUPERVISOR/HASSIO carry the bare anchor — never a port suffix" do
+      config = Container.create_config("2026.7.0", token: "test-token")
+
+      assert "SUPERVISOR=172.30.32.2" in config["Env"]
+      assert "HASSIO=172.30.32.2" in config["Env"]
+
+      refute Enum.any?(config["Env"], &(&1 =~ ~r/\A(SUPERVISOR|HASSIO)=[^=]*:\d+\z/))
+    end
+
+    test "ExtraHosts maps `supervisor` to the anchor, portless by construction" do
+      config = Container.create_config("2026.7.0", token: "test-token")
+
+      assert config["HostConfig"]["ExtraHosts"] == ["supervisor:172.30.32.2"]
+    end
+
+    test "the anchor the env carries is Vagus.Network's, not a second copy" do
+      assert Vagus.Network.supervisor_ip() == "172.30.32.2"
+      assert "SUPERVISOR=#{Vagus.Network.supervisor_ip()}" in Container.create_config("x")["Env"]
+    end
+  end
+
   describe "the Supervisor socket (Phase A1)" do
     test "socket_dir/0 + socket_path/0 are the upstream paths" do
       assert Container.socket_dir() == "/run/supervisor"

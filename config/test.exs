@@ -22,6 +22,14 @@ config :vagus, :events_enabled, false
 # TCP fallback; the socket-transport tests put_env their own tmp path.
 config :vagus, :core_socket_path, nil
 
+# No Core port migration under `mix test` either (`Vagus.Core.PortMigration`,
+# set on target only): `nil` is what disables the module, and pinning it here
+# means a suite run with MIX_TARGET set — where config/target.exs loads
+# first — still can't reach for `/data` or the engine's volume tree.
+# `Vagus.Core.Lifecycle.start/1` calls the migration on every op; its tests
+# inject their own tmp marker/store paths.
+config :vagus, :core_port_migration_marker, nil
+
 # Don't start the container-event watchdog during `mix test` — same
 # rationale as :events_enabled; watchdog unit tests start their own
 # instance with injected fakes.

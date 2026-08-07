@@ -116,27 +116,49 @@ defmodule Vagus.Network do
   def loopback?({0, 0, 0, 0, 0, 0, 0, 1}), do: true
   def loopback?(_ip), do: false
 
-  defp parse_source_ip(ip) when is_binary(ip) do
+  @doc """
+  Parses an IP-address config value into an `:inet.ip_address()` tuple.
+
+  Accepts either a string (`"172.30.32.2"`, `"::1"`) or an already-parsed
+  tuple; `:error` for anything else — including a wrong-sized tuple or an
+  out-of-range octet, which would otherwise sail through and only fail later
+  inside a socket call as an opaque `:einval`.
+
+  Shared by every config key that names an address (`:ingress_source_ip`,
+  `:api_bind_ip`, `Vagus.Network.Nat`'s DNAT destination) so they cannot
+  drift on what they accept.
+  """
+  @spec parse_ip(term()) :: {:ok, :inet.ip_address()} | :error
+  def parse_ip(ip) when is_binary(ip) do
     case :inet.parse_address(String.to_charlist(ip)) do
-      {:ok, addr} -> [ip: addr]
-      {:error, _} -> invalid_source_ip(ip)
+      {:ok, addr} -> {:ok, addr}
+      {:error, _reason} -> :error
     end
   end
 
-  defp parse_source_ip(ip) when is_tuple(ip) do
-    # `:inet.ntoa/1` is the cheap real validator: it rejects wrong-sized
-    # tuples and out-of-range octets that would otherwise sail through here
-    # and only fail later, inside the socket connect, as an opaque :einval.
+  def parse_ip(ip) when is_tuple(ip) do
+    # `:inet.ntoa/1` is the cheap real validator for a tuple.
     case :inet.ntoa(ip) do
-      {:error, :einval} -> invalid_source_ip(ip)
-      _charlist -> [ip: ip]
+      {:error, :einval} -> :error
+      _charlist -> {:ok, ip}
     end
   end
 
   # Anything else (integer, list, map, atom...). Without this clause the
-  # `case` above raised CaseClauseError and took ingress connection setup
-  # down at runtime over a config typo.
-  defp parse_source_ip(other), do: invalid_source_ip(other)
+  # `case` in `parse_source_ip/1` raised CaseClauseError and took ingress
+  # connection setup down at runtime over a config typo.
+  def parse_ip(_other), do: :error
+
+  @doc "Renders an `:inet.ip_address()` tuple back as a string."
+  @spec format_ip(:inet.ip_address()) :: String.t()
+  def format_ip(ip), do: to_string(:inet.ntoa(ip))
+
+  defp parse_source_ip(value) do
+    case parse_ip(value) do
+      {:ok, addr} -> [ip: addr]
+      :error -> invalid_source_ip(value)
+    end
+  end
 
   # Degrade to "no source bind" rather than raising: ingress still works
   # (from the gateway address), and the warning makes the misconfiguration
@@ -186,11 +208,16 @@ defmodule Vagus.Network do
   @doc """
   Binds the host-served anchor IPs — supervisor `172.30.32.2` and dns
   `172.30.32.3` — to the host `hassio` bridge interface, so the host-networked
-  emulator (Bandit on `0.0.0.0`, `Vagus.DNS` on `0.0.0.0:53`) answers there:
+  emulator (Bandit on `.2`, `Vagus.DNS` on `0.0.0.0:53`) answers there:
   `.2` is where bridged add-ons reach `http://supervisor` and `.3` is the
   resolver they're configured with (§A6). The bridge driver already puts the
   gateway `.1` on the interface; these are added beside it once the interface
   exists (i.e. after `ensure/1` created the network).
+
+  `.2` is also the address the API listener itself binds
+  (`Vagus.API.Listener`, `config :vagus, :api_bind_ip`) — it is added here,
+  well after `Vagus.Application` starts that listener, which is why the
+  listener retries its bind rather than requiring the address up front.
 
   Idempotent + best-effort: an address already present (`ip` prints
   "File exists"), a missing interface, or a missing `ip` tool is logged and

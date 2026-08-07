@@ -3,16 +3,43 @@ defmodule Vagus.API.SourceGuard do
   Refuses Supervisor-API requests that didn't originate from this machine or
   the `hassio` bridge.
 
-  ## Why the API needs this at all
+  ## Why the API still needs this
 
-  The API binds `0.0.0.0:80`, exactly as upstream does
-  (`web.TCPSite(runner, host="0.0.0.0", port=80)`), but the two are not
-  equally exposed: upstream's Supervisor is a **container**, so its `0.0.0.0`
-  is the docker namespace — reachable from Core and add-ons and nothing else.
-  Vagus is host-networked, so the same bind is reachable from the whole LAN.
-  Matching upstream's code does not match upstream's blast radius, and since
-  P2-A there is a route that answers without a token at all (an add-on's
-  icon/logo — see `Vagus.API.Auth.unauthenticated?/1`).
+  The guard was written when the API wildcard-bound port 80 the way upstream
+  does (`web.TCPSite(runner, host="0.0.0.0", port=80)`), which is safe there
+  and was not here: upstream's Supervisor is a **container**, so its
+  `0.0.0.0` is the docker namespace — reachable from Core and add-ons and
+  nothing else — whereas Vagus is host-networked, so the same bind answered
+  the whole LAN. Matching upstream's code did not match upstream's blast
+  radius, and since P2-A there is a route that answers without a token at all
+  (an add-on's icon/logo — see `Vagus.API.Auth.unauthenticated?/1`).
+
+  That bind is gone: the listener now binds `172.30.32.2:<:api_port>` and
+  nothing else (`Vagus.API.Listener`), with port 80 on that same address
+  served by a destination rewrite (`Vagus.Network.Nat`). The isolation is
+  therefore the primary control now, and this module is defence in depth
+  behind it — kept, not retired, for three reasons:
+
+    * **The anchor is not unreachable, only unrouted.** `172.30.32.2` is
+      bound in the *host* network namespace of a host-networked device.
+      Packets addressed to it are delivered locally, so they never traverse
+      `FORWARD` and no balena/docker filter rule applies: a LAN host that
+      adds a route for `172.30.32.0/23` via the board reaches both the
+      listener and the DNAT'd port 80. Unrouted by default is a good deal
+      weaker than unreachable.
+    * **A degraded bind falls back to the wildcard.** An unset or
+      unparseable `:api_bind_ip` makes `Vagus.API.Listener` bind `0.0.0.0`
+      deliberately — "no API at all" is the worse failure — which puts the
+      listener straight back on the LAN. This module is what keeps that
+      degradation from being an exposure.
+    * **It is also the counter.** `record_refusal/1` and `record_filtered/2`
+      are how `Vagus.API.Dispatcher`'s exploit filter and
+      `Vagus.API.Auth`'s blacklist report pre-auth refusals without handing
+      an unauthenticated caller a `RingLogger` eviction primitive; that
+      accounting is independent of who binds what.
+
+  Its cost in the steady state is one `:persistent_term` read per request
+  plus a timer, so there is nothing to win by removing it.
 
   ## Why the allowlist is shaped the way it is
 
@@ -37,6 +64,13 @@ defmodule Vagus.API.SourceGuard do
   a local interface**. That admits Core, add-ons on the bridge, and anything
   running on the board, and refuses the rest of the LAN, which is the entire
   point.
+
+  The measurement above predates the move off port 80 (hence the `80` in the
+  filter), and the DNAT that replaced it changes nothing about it: a
+  destination rewrite rewrites the destination, so Core's packets still
+  arrive with the board's LAN address as their source. **Narrowing the
+  allowlist to the hassio subnet would therefore refuse Core** — the
+  "locally-bound address" rule is the one admitting it, not the subnet rule.
 
   ## Freshness
 

@@ -113,20 +113,39 @@ defmodule Vagus.Addon.Ports do
     end)
   end
 
-  # Home Assistant Core's well-known port. Core's port is user-settable via
-  # `POST /core/options`, but `Vagus.Core.TokenStore` exposes no reader for
-  # it, and adding one — plus a `GenServer.call` on every option save — buys
-  # little: an add-on squatting a *moved* Core port is a nuisance, whereas
-  # squatting Vagus's own API port is how it would sit in front of the
+  # Home Assistant Core's two host ports. A supervised install binds 80
+  # (`SUPERVISOR_DEFAULT_PORT`) and falls back to 8123
+  # (`_DEFAULT_CONFIG_LEGACY_PORT`) when that bind fails, keeping the fallback
+  # in its config store afterwards — so both are Core's, and 8123 is a state a
+  # real device reaches rather than a historical value.
+  #
+  # 80 is spoken for twice over: it is also the port the add-on contract
+  # hardwires (`http://supervisor/`, and Core's bare `SUPERVISOR` env), served
+  # on the bridge anchor by `Vagus.Network.Nat`'s DNAT onto the API's internal
+  # port rather than by a listener. Publishing a container port on host 80
+  # collides with Core's own wildcard bind either way, which is why it is
+  # named here as Core's.
+  #
+  # Core's port is user-settable via `POST /core/options`, and since the
+  # socket transport `Vagus.Core.HttpConfig` even caches the port Core reports
+  # it is serving — but these stay constants: reading that cache would put a
+  # `GenServer.call` on the container-start path (`effective/2`) for a
+  # nuisance case. An add-on squatting a *moved* Core port is a nuisance,
+  # whereas squatting Vagus's own API port is how it would sit in front of the
   # Supervisor API itself, and that one is read from config exactly.
-  @core_port 8123
+  @core_port 80
+  @core_legacy_port 8123
 
   @doc """
-  Host ports an add-on may not bind: Vagus's own Supervisor-API listener and
-  Home Assistant Core's well-known port.
+  Host ports an add-on may not bind: Vagus's own Supervisor-API listener plus
+  Core's port (`#{@core_port}`) and its legacy fallback (`#{@core_legacy_port}`).
 
   The API port is read from config at call time rather than baked in at
-  compile time — it differs between host (`8888`) and target (`80`).
+  compile time. Note it is the *internal* port the listener actually holds
+  (`:api_port`, 8888), which is not the port add-ons dial: they reach the API
+  at `http://supervisor/`, i.e. 80 on the bridge anchor, through
+  `Vagus.Network.Nat`'s DNAT. Both ends of that rewrite are reserved — 80 as
+  Core's above, the internal port here.
   """
   @spec reserved_host_ports() :: [non_neg_integer()]
   def reserved_host_ports, do: reserved_host_ports(Application.get_env(:vagus, :api_port, 8888))
@@ -138,13 +157,13 @@ defmodule Vagus.Addon.Ports do
   global app env — which an `async: true` file cannot do. Asserting
   `reserved_host_ports()` against `Application.get_env(:vagus, :api_port, …)`
   is tautological: both read the same key with the same default, so a
-  hard-coded constant here would satisfy it and the host-vs-target difference
-  (8888 vs 80) would go untested. That was the shape of the first test written
-  for this, and it is why the arity is here.
+  hard-coded constant here would satisfy it and a configured port would go
+  untested. That was the shape of the first test written for this, and it is
+  why the arity is here.
   """
   @spec reserved_host_ports(term()) :: [non_neg_integer()]
   def reserved_host_ports(api_port) do
-    [api_port, @core_port]
+    [api_port, @core_port, @core_legacy_port]
     |> Enum.filter(&is_integer/1)
     |> Enum.uniq()
   end

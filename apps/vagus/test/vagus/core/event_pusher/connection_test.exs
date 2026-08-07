@@ -189,12 +189,63 @@ defmodule Vagus.Core.EventPusher.ConnectionTest do
   end
 
   describe "handle_disconnect/3 and handle_error/2" do
-    test "handle_disconnect/3 always reconnects (Fresh's own backoff takes over)" do
-      assert Connection.handle_disconnect(1006, "abnormal closure", %{}) == :reconnect
+    # The whole point of the port-80 wedge fix: `:close` is the only
+    # return that makes `Fresh.Connection` stop the process
+    # (`reconnect: false` -> `{:stop, :normal}`), and only a dead
+    # connection lets the manager re-resolve the transport. Anything
+    # `:reconnect`-shaped keeps re-dialling the original URI forever.
+    test "handle_disconnect/3 closes rather than reconnecting internally" do
+      assert Connection.handle_disconnect(1006, "abnormal closure", %{}) == :close
     end
 
-    test "handle_error/2 always reconnects" do
-      assert Connection.handle_error({:streaming_failed, :closed}, %{}) == :reconnect
+    test "handle_disconnect/3 closes on a clean server-initiated close too" do
+      assert Connection.handle_disconnect(1000, "normal closure", %{}) == :close
+      assert Connection.handle_disconnect(nil, nil, %{manager: self()}) == :close
+    end
+
+    test "handle_error/2 closes on a connect failure" do
+      assert Connection.handle_error({:connecting_failed, :econnrefused}, %{}) == :close
+    end
+
+    test "handle_error/2 closes on every other transport error shape" do
+      for error <- [
+            {:upgrading_failed, :nxdomain},
+            {:streaming_failed, :closed},
+            {:establishing_failed, :not_upgraded},
+            {:processing_failed, :whatever},
+            {:decoding_failed, :bad_frame},
+            {:encoding_failed, :bad_frame},
+            {:casting_failed, :closed}
+          ] do
+        assert Connection.handle_error(error, %{}) == :close
+      end
+    end
+  end
+
+  describe "process lifecycle under Fresh" do
+    # The callback assertions above only pin the return value; this pins
+    # what `Fresh` does with it. Port 1 refuses instantly, so this is the
+    # `{:connecting_failed, :econnrefused}` path — which used to hand
+    # `Fresh` a `:reconnect` and leave the process retrying that same
+    # URI forever, starving the manager of the `:DOWN` it re-picks the
+    # transport on.
+    test "a connection whose endpoint refuses dies instead of retrying internally" do
+      state = %{manager: self(), client: :irrelevant}
+
+      {:ok, pid} =
+        Fresh.start("ws://127.0.0.1:1/api/websocket", Connection, state, error_logging: false)
+
+      ref = Process.monitor(pid)
+
+      # Fresh's own default backoff is 250ms, so an internally
+      # reconnecting process is comfortably still alive at 2s.
+      # `:noproc` rather than `:normal` when the refusal beat the monitor
+      # — the connect attempt runs after `:gen_statem.start/3` has
+      # already returned. Either way the process is gone, which is the
+      # whole assertion; the manager's `:DOWN` handler treats both the
+      # same.
+      assert_receive {:DOWN, ^ref, :process, ^pid, reason}, 2_000
+      assert reason in [:normal, :noproc]
     end
   end
 end

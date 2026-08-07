@@ -11,8 +11,8 @@ defmodule Vagus.Core.Health do
   any 2xx status as healthy. The probe rides whatever
   `Vagus.Core.Transport` resolves: the Supervisor↔Core unix socket when it
   exists, `:core_base_url` otherwise. Nothing here knows Core's TCP port
-  any more — that was the last hardcoded `:8123` on this path, and Core
-  moves to port 80 in a later phase of this plan.
+  any more — that was the last hardcoded `:8123` on this path, which matters
+  because a supervised Core binds 80 and only falls back to 8123.
 
   `await_healthy/1` polls every `opts[:interval]` (default `5_000`ms) until
   healthy or `opts[:deadline]` (default `600_000`ms = 10min, upstream's

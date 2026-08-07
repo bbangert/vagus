@@ -1,8 +1,11 @@
 defmodule Vagus.Core.EventPusherTest do
   use ExUnit.Case, async: true
 
+  import ExUnit.CaptureLog
+
   alias Vagus.Core.EventPusher
   alias Vagus.Core.EventPusher.Connection
+  alias Vagus.Core.TokenStore
 
   # These exercise handle_cast/2 and handle_info/2 directly against
   # hand-built state, with no live GenServer/Fresh connection involved —
@@ -23,6 +26,8 @@ defmodule Vagus.Core.EventPusherTest do
         connection_pid: nil,
         monitor_ref: nil,
         retry_ref: nil,
+        ready_ref: nil,
+        ready_timeout_ms: 60_000,
         ready: false,
         next_id: 1,
         pending: %{},
@@ -198,6 +203,235 @@ defmodule Vagus.Core.EventPusherTest do
 
       assert {:noreply, ^state} =
                EventPusher.handle_info({:DOWN, unrelated_ref, :process, self(), :noproc}, state)
+    end
+  end
+
+  describe "ready timeout" do
+    defp forever_pid do
+      pid = spawn(fn -> Process.sleep(:infinity) end)
+      on_exit(fn -> Process.exit(pid, :kill) end)
+      pid
+    end
+
+    test "a :connected notification (re)arms the ready timer" do
+      state = base_state(%{connection_pid: self(), ready: true, ready_ref: nil})
+
+      assert {:noreply, new_state} =
+               EventPusher.handle_info({:event_pusher_connection, :connected, self()}, state)
+
+      assert is_reference(new_state.ready_ref)
+      assert new_state.ready == false
+    end
+
+    test "becoming ready cancels the timer" do
+      state =
+        base_state(%{
+          connection_pid: self(),
+          ready_ref: Process.send_after(self(), {:ready_timeout, self()}, 60_000)
+        })
+
+      assert {:noreply, new_state} =
+               EventPusher.handle_info({:event_pusher_connection, :ready, self()}, state)
+
+      assert new_state.ready == true
+      assert new_state.ready_ref == nil
+    end
+
+    test "becoming ready drains an already-delivered {:ready_timeout, _}" do
+      # `Process.cancel_timer/1` can't unsend it; the stale-timer
+      # discipline says drain rather than rely on the guard clause.
+      ref = Process.send_after(self(), {:ready_timeout, self()}, 0)
+      assert_receive {:ready_timeout, _pid}, 200
+      send(self(), {:ready_timeout, self()})
+
+      state = base_state(%{connection_pid: self(), ready_ref: ref})
+
+      assert {:noreply, new_state} =
+               EventPusher.handle_info({:event_pusher_connection, :ready, self()}, state)
+
+      assert new_state.ready_ref == nil
+      refute_received {:ready_timeout, _}
+    end
+
+    test "a connection that never becomes ready is killed, and the :DOWN arms a retry" do
+      pid = forever_pid()
+      monitor_ref = Process.monitor(pid)
+
+      state =
+        base_state(%{
+          connection_pid: pid,
+          monitor_ref: monitor_ref,
+          ready: false,
+          backoff_ms: 5,
+          ready_ref: Process.send_after(self(), {:ready_timeout, pid}, 60_000)
+        })
+
+      {{:noreply, killed_state}, log} =
+        with_log(fn -> EventPusher.handle_info({:ready_timeout, pid}, state) end)
+
+      assert log =~ "never became ready"
+      assert killed_state.ready_ref == nil
+
+      # The kill is the whole mechanism: it turns an invisible half-open
+      # wedge into the ordinary `:DOWN` the manager already knows how to
+      # recover from, transport re-pick and all.
+      assert_receive {:DOWN, ^monitor_ref, :process, ^pid, :killed}, 1_000
+      refute Process.alive?(pid)
+
+      assert {:noreply, down_state} =
+               EventPusher.handle_info(
+                 {:DOWN, monitor_ref, :process, pid, :killed},
+                 killed_state
+               )
+
+      assert down_state.connection_pid == nil
+      assert down_state.ready_ref == nil
+      assert is_reference(down_state.retry_ref)
+      assert_receive :retry_connect, 200
+    end
+
+    test "a ready connection is never killed by a stale timer" do
+      pid = forever_pid()
+      state = base_state(%{connection_pid: pid, ready: true, ready_ref: nil})
+
+      assert {:noreply, ^state} = EventPusher.handle_info({:ready_timeout, pid}, state)
+      assert Process.alive?(pid)
+    end
+
+    test "a timeout naming a connection that is no longer current is a no-op" do
+      current = forever_pid()
+      previous = forever_pid()
+      state = base_state(%{connection_pid: current, ready: false})
+
+      assert {:noreply, ^state} = EventPusher.handle_info({:ready_timeout, previous}, state)
+      assert Process.alive?(previous)
+      assert Process.alive?(current)
+    end
+
+    test "the :DOWN handler clears the ready timer" do
+      ref = Process.monitor(self())
+
+      state =
+        base_state(%{
+          connection_pid: self(),
+          monitor_ref: ref,
+          backoff_ms: 5,
+          ready_ref: Process.send_after(self(), {:ready_timeout, self()}, 60_000)
+        })
+
+      assert {:noreply, new_state} =
+               EventPusher.handle_info({:DOWN, ref, :process, self(), :killed}, state)
+
+      assert new_state.ready_ref == nil
+    end
+  end
+
+  # The Gate-B wedge, whole: a leg that connects at the TCP level and then
+  # hears nothing back (Core gone from the port it was dialled on) used to
+  # leave the manager with a live `connection_pid`, `ready: false` and no
+  # armed retry — forever, because the process stayed alive and the monitor
+  # had nothing to report. Driven through the real GenServer against a
+  # listener that accepts and never answers.
+  describe "wedged connection, end to end" do
+    setup do
+      {:ok, listen} =
+        :gen_tcp.listen(0, [:binary, active: false, reuseaddr: true, ip: {127, 0, 0, 1}])
+
+      {:ok, port} = :inet.port(listen)
+      test = self()
+      acceptor = spawn_link(fn -> accept_loop(listen, test) end)
+
+      on_exit(fn ->
+        Process.exit(acceptor, :kill)
+        :gen_tcp.close(listen)
+      end)
+
+      %{ws_url: "ws://127.0.0.1:#{port}/api/websocket"}
+    end
+
+    defp accept_loop(listen, test) do
+      case :gen_tcp.accept(listen) do
+        {:ok, socket} ->
+          # Deliberately never replied to: the WS upgrade can't complete,
+          # so the connection never reports `:connected` or `:ready`.
+          send(test, {:accepted, socket})
+          accept_loop(listen, test)
+
+        {:error, _reason} ->
+          :ok
+      end
+    end
+
+    defp start_token_store_with_refresh_token do
+      name = :"wedge_ts_#{System.unique_integer([:positive])}"
+
+      path =
+        Path.join(System.tmp_dir!(), "vagus_wedge_ts_#{System.unique_integer([:positive])}.json")
+
+      start_supervised!(%{id: name, start: {TokenStore, :start_link, [[name: name, path: path]]}})
+      :ok = TokenStore.put_options(%{"refresh_token" => "wedge-refresh-token"}, name)
+      on_exit(fn -> File.rm(path) end)
+
+      name
+    end
+
+    test "the manager kills the wedged leg and dials again", %{ws_url: ws_url} do
+      token_store = start_token_store_with_refresh_token()
+      name = :"wedge_pusher_#{System.unique_integer([:positive])}"
+
+      pusher =
+        start_supervised!(%{
+          id: name,
+          start:
+            {EventPusher, :start_link,
+             [
+               [
+                 name: name,
+                 ws_url: ws_url,
+                 token_store: token_store,
+                 client: :irrelevant,
+                 ready_timeout: 500
+               ]
+             ]}
+        })
+
+      assert_receive {:accepted, _socket}, 2_000
+
+      %{connection_pid: wedged} = :sys.get_state(pusher)
+      assert is_pid(wedged)
+      wedged_ref = Process.monitor(wedged)
+
+      # Wedged exactly as observed on device: alive, connected, not ready.
+      assert %{ready: false} = :sys.get_state(pusher)
+
+      assert_receive {:DOWN, ^wedged_ref, :process, ^wedged, _reason}, 2_000
+
+      # And the manager is back in its ordinary recovery path rather than
+      # sitting on a live-but-useless connection.
+      assert %{connection_pid: nil, ready: false, retry_ref: retry_ref} =
+               eventually_state(pusher, &(&1.connection_pid == nil))
+
+      assert is_reference(retry_ref)
+
+      # The retry re-runs transport selection and dials afresh (5s backoff;
+      # the retry timer itself is covered by the :DOWN tests above).
+      assert_receive {:accepted, _socket}, 10_000
+    end
+
+    defp eventually_state(pusher, fun, attempts \\ 100) do
+      state = :sys.get_state(pusher)
+
+      cond do
+        fun.(state) ->
+          state
+
+        attempts == 0 ->
+          flunk("manager never reached the expected state: #{inspect(state)}")
+
+        true ->
+          Process.sleep(20)
+          eventually_state(pusher, fun, attempts - 1)
+      end
     end
   end
 
