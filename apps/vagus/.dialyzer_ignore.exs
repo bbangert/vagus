@@ -90,7 +90,7 @@
   # - ingress/ws_bridge + core/events: Mint.WebSocket / MapSet opaque-type
   #   pedantry (flush_pending IS called; the caller is only "unreachable"
   #   via the same Mint typing story). No behaviour issue.
-  # - mint_http1_leftover/1 (all three WS bridges): drains Mint.HTTP1's
+  # - take_mint_http1_leftover/1 (all three WS bridges): drains Mint.HTTP1's
   #   stranded parse buffer after Mint.WebSocket.new/4, since mint_web_socket
   #   takes over the transport post-upgrade and never revisits it — bytes
   #   bundled with the 101 response would otherwise be lost. Dialyzer marks it

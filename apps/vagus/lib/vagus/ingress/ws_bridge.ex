@@ -414,6 +414,9 @@ defmodule Vagus.Ingress.WSBridge.Upstream do
           resp_headers: Mint.Types.headers(),
           websocket: Mint.WebSocket.t() | nil,
           upgraded?: boolean(),
+          # Raw bytes from `{:data, ^ref, _}` responses seen while
+          # `upgraded?: false` — see `process_response/2`'s `:done` clause.
+          pre_upgrade_data: binary(),
           # Newest-first (prepended on each call, reversed on flush) — see
           # moduledoc.
           pending: [{WebSock.data_opcode(), binary()}],
@@ -517,6 +520,7 @@ defmodule Vagus.Ingress.WSBridge.Upstream do
                resp_headers: [],
                websocket: nil,
                upgraded?: false,
+               pre_upgrade_data: <<>>,
                pending: [],
                pending_frames: 0,
                pending_bytes: 0,
@@ -538,11 +542,15 @@ defmodule Vagus.Ingress.WSBridge.Upstream do
 
   # Reaches into Mint.HTTP1's own struct on purpose (see `process_response/2`'s
   # `:done` clause) — guarded so an upstream struct change degrades to a no-op
-  # (treated as "no leftover") rather than crashing.
-  defp mint_http1_leftover(conn) do
+  # (treated as "no leftover", `conn` returned untouched) rather than
+  # crashing. Clears the buffer in the same step it's read: on a
+  # `{:tcp_closed, _}` message `Mint.WebSocket.stream/2` falls through to
+  # `Mint.HTTP.stream/2`, which WOULD consult a stale buffer and could
+  # surface a bogus HTTP parse error in place of a clean close.
+  defp take_mint_http1_leftover(conn) do
     case conn do
-      %{buffer: bin} when is_binary(bin) and bin != <<>> -> bin
-      _ -> <<>>
+      %{buffer: bin} when is_binary(bin) and bin != <<>> -> {bin, %{conn | buffer: <<>>}}
+      _ -> {<<>>, conn}
     end
   end
 
@@ -671,23 +679,46 @@ defmodule Vagus.Ingress.WSBridge.Upstream do
   # mint_web_socket's post-`new/4` stream takes over the raw transport and
   # never revisits Mint.HTTP1's own parse buffer — any bytes the add-on wrote
   # bundled with (or immediately behind) the 101 response are stranded there
-  # forever unless drained here, once, right after `new/4`.
+  # forever unless drained here, once, right after `new/4`. Bytes can also
+  # reach us as an ordinary `{:data, ^ref, _}` response *before* this `:done`
+  # in the very same batch (Mint.HTTP1 treats a 101's body as "whatever's
+  # left in this read", RFC7230-legal since a 101 has no framed body) —
+  # `pre_upgrade_data` (accumulated below, `upgraded?: false`) catches that
+  # case, since `conn`'s own buffer is already empty by the time the bytes
+  # were parsed out as that `:data` response.
   defp process_response({:done, ref}, %{ref: ref, upgraded?: false} = state) do
     case Mint.WebSocket.new(state.conn, ref, state.status, state.resp_headers) do
       {:ok, conn, websocket} ->
+        {buffered, conn} = take_mint_http1_leftover(conn)
+        leftover = state.pre_upgrade_data <> buffered
         upgraded = %{state | conn: conn, websocket: websocket, upgraded?: true}
-        leftover = mint_http1_leftover(conn)
 
-        case {flush_pending(upgraded), leftover} do
-          {{:continue, state}, <<>>} -> {:continue, state}
-          {{:continue, state}, bin} -> process_response({:data, ref, bin}, state)
-          {{:stop, state}, _leftover} -> {:stop, state}
+        # Decode the leftover BEFORE flushing (the "connection is now
+        # usable" side effect): a Close or malformed leftover must stop the
+        # connection without flushing, so the peer's real close code isn't
+        # masked by a later 1011.
+        case leftover do
+          <<>> ->
+            flush_pending(upgraded)
+
+          bin ->
+            case process_response({:data, ref, bin}, upgraded) do
+              {:continue, state} -> flush_pending(state)
+              {:stop, state} -> {:stop, state}
+            end
         end
 
       {:error, conn, _reason} ->
         send(state.parent, {:upstream_close, 1011, ""})
         {:stop, %{state | conn: conn}}
     end
+  end
+
+  # Pre-upgrade: see the `:done` clause's comment on `pre_upgrade_data` —
+  # nothing to decode with yet (no `websocket` codec state exists until
+  # `new/4` runs), so just accumulate in arrival order.
+  defp process_response({:data, ref, data}, %{ref: ref, upgraded?: false} = state) do
+    {:continue, %{state | pre_upgrade_data: state.pre_upgrade_data <> data}}
   end
 
   # Post-upgrade: raw bytes needing WS frame decoding.

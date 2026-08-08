@@ -616,6 +616,79 @@ defmodule Vagus.Ingress.WSBridgeTest do
     assert_receive {:echo_init, "/ws", "foo=bar&baz=1"}, 2_000
   end
 
+  ## fix/ws-1011-flake: a peer that bundles its 101 response with further WS
+  ## bytes in the SAME transport write. `mint_web_socket`'s post-`new/4`
+  ## stream never revisits Mint.HTTP1's own parse buffer, and (for a 101,
+  ## which RFC7230 says has no framed body) Mint.HTTP1 itself hands any
+  ## bytes trailing the headers back as an ordinary pre-upgrade `{:data,
+  ## ...}` response instead — either way, without `Upstream` explicitly
+  ## draining/accumulating and decoding them once, right after `new/4`,
+  ## they're lost. Every other fake add-on in this file is Bandit/
+  ## `WebSockAdapter`, which always flushes the 101 in its own TCP segment
+  ## and can never reproduce the bug; only a raw, hand-rolled HTTP/1.1
+  ## responder controls the write boundary.
+
+  describe "Upstream direct (fix/ws-1011-flake: leftover bundled with the 101)" do
+    test "a text frame bundled with the 101 in one TCP write is relayed, not stranded" do
+      port = start_raw_fake_addon(extra: raw_text_frame("leftover hello"))
+
+      args = %{
+        parent: self(),
+        ip: "127.0.0.1",
+        port: port,
+        path: "/ws",
+        protocols: [],
+        headers: []
+      }
+
+      {:ok, pid} = Vagus.Ingress.WSBridge.Upstream.start_link(args)
+      Process.monitor(pid)
+
+      assert_receive {:relay, :text, "leftover hello"}, 5_000
+    end
+
+    test "a Close frame bundled with the 101 propagates its own code, without flushing a frame queued before the upgrade completed (Part A ordering)" do
+      port = start_raw_fake_addon(extra: raw_close_frame(4321, "bye"), sync?: true)
+
+      args = %{
+        parent: self(),
+        ip: "127.0.0.1",
+        port: port,
+        path: "/ws",
+        protocols: [],
+        headers: []
+      }
+
+      {:ok, pid} = Vagus.Ingress.WSBridge.Upstream.start_link(args)
+      ref = Process.monitor(pid)
+
+      assert_receive {:raw_fake_addon_ready, fake_pid}, 5_000
+
+      # Buffered in `pending` — the upgrade hasn't completed (the fake is
+      # deliberately parked below, waiting for `:send_response`), so this
+      # can't reach the wire yet. Under the pre-fix ordering `flush_pending`
+      # ran BEFORE the leftover was decoded, so this frame would reach the
+      # add-on anyway, even though the very next bytes are a Close — an
+      # add-on-facing side effect the connection had no business performing
+      # on its way to stopping.
+      :ok = GenServer.call(pid, {:frame, :text, "queued-before-upgrade"})
+
+      send(fake_pid, :send_response)
+
+      assert_receive {:upstream_close, 4321, "bye"}, 5_000
+      assert_receive {:DOWN, ^ref, :process, ^pid, _reason}, 5_000
+
+      # The discriminating assertion. `terminate/2` best-effort sends its
+      # OWN close(1000) frame to the add-on on every stop where `upgraded?`
+      # was true — irrespective of this fix — so bytes arriving here at all
+      # is expected; what must never happen is the queued text frame
+      # arriving FIRST. Only a frame header's low nibble is needed to tell
+      # them apart (opcode 0x1 text vs 0x8 close).
+      assert_receive {:raw_fake_addon_after_upgrade, {:ok, <<first_byte, _rest::binary>>}}, 2_000
+      assert Bitwise.band(first_byte, 0x0F) == 0x08
+    end
+  end
+
   ## 8-9 (W3): Upstream driven directly — pending-buffer cap + upgrade
   ## deadline, against a raw listener that accepts but never upgrades.
 
@@ -868,5 +941,82 @@ defmodule Vagus.Ingress.WSBridgeTest do
       {:message_queue_len, n} -> n
       nil -> 0
     end
+  end
+
+  # Starts a raw `:gen_tcp` listener standing in for the add-on's own HTTP
+  # server, accepts exactly one connection, and replies to the WS upgrade
+  # request with a 101 response glued to `extra` in a SINGLE
+  # `:gen_tcp.send/2` — the one write boundary no Bandit-backed fake in this
+  # file can produce, and the drain bug's exact trigger.
+  #
+  # `sync?: true` parks the fake right after parsing the request (sending
+  # `{:raw_fake_addon_ready, self()}` to this test process) until told
+  # `:send_response`, so a test can deterministically queue an `Upstream`
+  # frame into `pending` *before* the 101 (and its bundled leftover) can
+  # possibly arrive — otherwise the two would race. It then reports whatever
+  # (if anything) arrives afterward as `{:raw_fake_addon_after_upgrade,
+  # result}`, the discriminating signal for the Part A ordering test.
+  defp start_raw_fake_addon(opts) do
+    {:ok, listen} = :gen_tcp.listen(0, [:binary, active: false, reuseaddr: true])
+    {:ok, port} = :inet.port(listen)
+
+    extra = Keyword.fetch!(opts, :extra)
+    sync? = Keyword.get(opts, :sync?, false)
+    test_pid = self()
+
+    spawn_link(fn ->
+      {:ok, socket} = :gen_tcp.accept(listen, 5_000)
+      request = recv_raw_http_headers(socket, "")
+      accept = raw_ws_accept(extract_sec_websocket_key(request))
+
+      if sync? do
+        send(test_pid, {:raw_fake_addon_ready, self()})
+        receive(do: (:send_response -> :ok))
+      end
+
+      response =
+        "HTTP/1.1 101 Switching Protocols\r\n" <>
+          "Upgrade: websocket\r\n" <>
+          "Connection: Upgrade\r\n" <>
+          "Sec-WebSocket-Accept: #{accept}\r\n\r\n"
+
+      :ok = :gen_tcp.send(socket, response <> extra)
+
+      if sync? do
+        send(test_pid, {:raw_fake_addon_after_upgrade, :gen_tcp.recv(socket, 0, 2_000)})
+      end
+
+      :gen_tcp.close(socket)
+    end)
+
+    on_exit(fn -> :gen_tcp.close(listen) end)
+
+    port
+  end
+
+  defp recv_raw_http_headers(socket, acc) do
+    if String.contains?(acc, "\r\n\r\n") do
+      acc
+    else
+      {:ok, data} = :gen_tcp.recv(socket, 0, 5_000)
+      recv_raw_http_headers(socket, acc <> data)
+    end
+  end
+
+  defp extract_sec_websocket_key(request) do
+    [_, key] = Regex.run(~r/[Ss]ec-[Ww]eb[Ss]ocket-[Kk]ey:\s*([^\r\n]+)/, request)
+    key
+  end
+
+  defp raw_ws_accept(key) do
+    :crypto.hash(:sha, key <> "258EAFA5-E914-47DA-95CA-C5AB0DC85B11") |> Base.encode64()
+  end
+
+  # Server->client frames are unmasked (RFC 6455 §5.1) — small enough
+  # payloads here that the 1-byte length form always applies.
+  defp raw_text_frame(payload), do: <<0x81, byte_size(payload)>> <> payload
+
+  defp raw_close_frame(code, reason) do
+    <<0x88, 2 + byte_size(reason)>> <> <<code::16>> <> reason
   end
 end

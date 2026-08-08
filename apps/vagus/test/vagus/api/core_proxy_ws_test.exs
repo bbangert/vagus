@@ -1043,4 +1043,140 @@ defmodule Vagus.API.CoreProxyWSTest do
     assert frame1 == {:text, "one"}
     assert frame2 == {:text, "two"}
   end
+
+  ## fix/ws-1011-flake: `Vagus.API.CoreProxy.WSBridge.Upstream` driven
+  ## directly against a raw `:gen_tcp` fake Core (over the SAME unix-socket
+  ## transport `start_core_socket/0` above uses, so `implicit_auth?` is
+  ## true — the branch these two tests exercise) that bundles its 101
+  ## response with further WS bytes in a SINGLE `:gen_tcp.send/2`. No
+  ## Bandit-backed fake (every other fake Core in this file) can produce
+  ## that write boundary; see `Vagus.Ingress.WSBridgeTest`'s equivalent
+  ## describe block for the full mechanism this reproduces.
+
+  describe "Upstream direct (fix/ws-1011-flake: leftover bundled with the 101)" do
+    setup do
+      prev_socket_path = Application.get_env(:vagus, :core_socket_path)
+
+      on_exit(fn ->
+        if is_nil(prev_socket_path),
+          do: Application.delete_env(:vagus, :core_socket_path),
+          else: Application.put_env(:vagus, :core_socket_path, prev_socket_path)
+      end)
+
+      :ok
+    end
+
+    test "a text frame bundled with the 101 in one TCP write is relayed, not stranded" do
+      path = start_raw_fake_core(raw_text_frame("leftover hello"))
+      Application.put_env(:vagus, :core_socket_path, path)
+
+      {:ok, pid} = Vagus.API.CoreProxy.WSBridge.Upstream.start_link(%{parent: self()})
+      Process.monitor(pid)
+
+      assert_receive {:relay, :text, "leftover hello"}, 5_000
+    end
+
+    test "a Close frame bundled with the 101 propagates its own code, without flushing a frame queued before the upgrade completed (Part A ordering, implicit auth)" do
+      path = start_raw_fake_core(raw_close_frame(4321, "bye"), sync?: true)
+      Application.put_env(:vagus, :core_socket_path, path)
+
+      {:ok, pid} = Vagus.API.CoreProxy.WSBridge.Upstream.start_link(%{parent: self()})
+      ref = Process.monitor(pid)
+
+      assert_receive {:raw_fake_core_ready, fake_pid}, 5_000
+
+      # Buffered in `pending` — `ha_ready?` isn't flipped until `:done`
+      # fires below, which the fake is deliberately parked before. Under
+      # the pre-fix ordering, `implicit_auth?` meant `flush_pending` ran
+      # BEFORE the leftover was decoded, so this would reach Core anyway,
+      # even though the very next bytes are a Close.
+      :ok = GenServer.call(pid, {:frame, :text, "queued-before-upgrade"})
+
+      send(fake_pid, :send_response)
+
+      assert_receive {:upstream_close, 4321, "bye"}, 5_000
+      assert_receive {:DOWN, ^ref, :process, ^pid, _reason}, 5_000
+
+      # `terminate/2` best-effort sends its OWN close(1000) frame on every
+      # stop where `upgraded?` was true, regardless of this fix — so bytes
+      # arriving here at all is expected; what must never happen is the
+      # queued text frame arriving FIRST (opcode 0x1 text vs 0x8 close).
+      assert_receive {:raw_fake_core_after_upgrade, {:ok, <<first_byte, _rest::binary>>}}, 2_000
+      assert Bitwise.band(first_byte, 0x0F) == 0x08
+    end
+  end
+
+  # Same raw-`:gen_tcp` technique as `Vagus.Ingress.WSBridgeTest.
+  # start_raw_fake_addon/1`, but as a unix-domain listener (matching
+  # `start_core_socket/0`'s transport) since only the implicit-auth branch
+  # exercises the Part A ordering this file's second test targets. Returns
+  # the socket path (for `:core_socket_path`), not a port.
+  defp start_raw_fake_core(extra, opts \\ []) do
+    path =
+      Path.join(System.tmp_dir!(), "vagus_core_ws_raw_#{System.unique_integer([:positive])}.sock")
+
+    {:ok, listen} =
+      :gen_tcp.listen(0, [:binary, active: false, reuseaddr: true, ip: {:local, path}, port: 0])
+
+    sync? = Keyword.get(opts, :sync?, false)
+    test_pid = self()
+
+    spawn_link(fn ->
+      {:ok, socket} = :gen_tcp.accept(listen, 5_000)
+      request = recv_raw_http_headers(socket, "")
+      accept = raw_ws_accept(extract_sec_websocket_key(request))
+
+      if sync? do
+        send(test_pid, {:raw_fake_core_ready, self()})
+        receive(do: (:send_response -> :ok))
+      end
+
+      response =
+        "HTTP/1.1 101 Switching Protocols\r\n" <>
+          "Upgrade: websocket\r\n" <>
+          "Connection: Upgrade\r\n" <>
+          "Sec-WebSocket-Accept: #{accept}\r\n\r\n"
+
+      :ok = :gen_tcp.send(socket, response <> extra)
+
+      if sync? do
+        send(test_pid, {:raw_fake_core_after_upgrade, :gen_tcp.recv(socket, 0, 2_000)})
+      end
+
+      :gen_tcp.close(socket)
+    end)
+
+    on_exit(fn ->
+      :gen_tcp.close(listen)
+      File.rm(path)
+    end)
+
+    path
+  end
+
+  defp recv_raw_http_headers(socket, acc) do
+    if String.contains?(acc, "\r\n\r\n") do
+      acc
+    else
+      {:ok, data} = :gen_tcp.recv(socket, 0, 5_000)
+      recv_raw_http_headers(socket, acc <> data)
+    end
+  end
+
+  defp extract_sec_websocket_key(request) do
+    [_, key] = Regex.run(~r/[Ss]ec-[Ww]eb[Ss]ocket-[Kk]ey:\s*([^\r\n]+)/, request)
+    key
+  end
+
+  defp raw_ws_accept(key) do
+    :crypto.hash(:sha, key <> "258EAFA5-E914-47DA-95CA-C5AB0DC85B11") |> Base.encode64()
+  end
+
+  # Server->client frames are unmasked (RFC 6455 §5.1) — small enough
+  # payloads here that the 1-byte length form always applies.
+  defp raw_text_frame(payload), do: <<0x81, byte_size(payload)>> <> payload
+
+  defp raw_close_frame(code, reason) do
+    <<0x88, 2 + byte_size(reason)>> <> <<code::16>> <> reason
+  end
 end
