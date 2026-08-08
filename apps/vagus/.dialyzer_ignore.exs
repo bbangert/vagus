@@ -90,6 +90,12 @@
   # - ingress/ws_bridge + core/events: Mint.WebSocket / MapSet opaque-type
   #   pedantry (flush_pending IS called; the caller is only "unreachable"
   #   via the same Mint typing story). No behaviour issue.
+  # - mint_http1_leftover/1 (all three WS bridges): drains Mint.HTTP1's
+  #   stranded parse buffer after Mint.WebSocket.new/4, since mint_web_socket
+  #   takes over the transport post-upgrade and never revisits it — bytes
+  #   bundled with the 101 response would otherwise be lost. Dialyzer marks it
+  #   unused_fun because it already deems the new/4 success branch dead, same
+  #   cascade as the pattern_match entries below.
   {"lib/vagus/addon/backend/microvm.ex", :no_return},
   {"lib/vagus/backend/host/nerves.ex", :pattern_match},
   {"lib/vagus/ingress/ws_bridge.ex", :pattern_match},
@@ -101,9 +107,11 @@
   # ingress bridge's Upstream shape; same typing story, same non-defect. The
   # REST module (`lib/vagus/api/core_proxy.ex`) is clean and needs no entry.
   {"lib/vagus/api/core_proxy/ws_bridge.ex", :pattern_match},
+  {"lib/vagus/api/core_proxy/ws_bridge.ex", :unused_fun},
   # Same `Mint.WebSocket.new/4` story again in the EventPusher's socket-transport
   # WS client (core-socket-port80 A2), which mirrors that Upstream shape.
   {"lib/vagus/core/event_pusher/socket_connection.ex", :pattern_match},
+  {"lib/vagus/core/event_pusher/socket_connection.ex", :unused_fun},
   {"lib/vagus/core/events.ex", :call_without_opaque},
 
   # ── Root 3: benign dead defensive checks ────────────────────────────────

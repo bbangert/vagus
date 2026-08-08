@@ -583,6 +583,16 @@ defmodule Vagus.API.CoreProxy.WSBridge.Upstream do
   # issue #37: the Mint socket's own `send_timeout` — see `connect_and_upgrade/1`.
   defp core_ws_send_timeout_ms, do: Application.get_env(:vagus, :core_ws_send_timeout, 5_000)
 
+  # Reaches into Mint.HTTP1's own struct on purpose (see `process_response/2`'s
+  # `:done` clause) — guarded so an upstream struct change degrades to a no-op
+  # (treated as "no leftover") rather than crashing.
+  defp mint_http1_leftover(conn) do
+    case conn do
+      %{buffer: bin} when is_binary(bin) and bin != <<>> -> bin
+      _ -> <<>>
+    end
+  end
+
   ## Caller frames (called from `WSBridge.handle_in/2`)
 
   @impl GenServer
@@ -713,6 +723,10 @@ defmodule Vagus.API.CoreProxy.WSBridge.Upstream do
     {:continue, %{state | resp_headers: headers}}
   end
 
+  # mint_web_socket's post-`new/4` `stream_http1/3` takes over the raw
+  # transport and never revisits Mint.HTTP1's own parse buffer — any bytes
+  # Core wrote bundled with (or immediately behind) the 101 response are
+  # stranded there forever unless drained here, once, right after `new/4`.
   defp process_response({:done, ref}, %{ref: ref, upgraded?: false} = state) do
     case Mint.WebSocket.new(state.conn, ref, state.status, state.resp_headers) do
       {:ok, conn, websocket} ->
@@ -722,11 +736,19 @@ defmodule Vagus.API.CoreProxy.WSBridge.Upstream do
         # the socket there is no Core-side handshake to wait for, so the
         # two gates coincide and this IS the flush point (see moduledoc).
         upgraded = %{state | conn: conn, websocket: websocket, upgraded?: true}
+        leftover = mint_http1_leftover(conn)
 
-        if upgraded.implicit_auth? do
-          flush_pending(%{upgraded | ha_ready?: true})
-        else
-          {:continue, upgraded}
+        result =
+          if upgraded.implicit_auth? do
+            flush_pending(%{upgraded | ha_ready?: true})
+          else
+            {:continue, upgraded}
+          end
+
+        case {result, leftover} do
+          {{:continue, state}, <<>>} -> {:continue, state}
+          {{:continue, state}, bin} -> process_response({:data, ref, bin}, state)
+          {{:stop, state}, _leftover} -> {:stop, state}
         end
 
       {:error, conn, _reason} ->

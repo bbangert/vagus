@@ -117,7 +117,7 @@ defmodule Vagus.Ingress.WSBridge do
   send returns, so `A`'s blocked call is what stops Bandit from reading the
   browser's socket for as long as the send is wedged — TCP backpressure to
   the browser instead of an unbounded mailbox. `B`'s own Mint socket
-  `send_timeout` (default 5s, `send_timeout_ms` — see `Upstream`'s
+  `send_timeout` (5s default, `:ingress_ws_send_timeout` — see `Upstream`'s
   moduledoc) is what actually resolves a wedged send in the normal case,
   well before `A`'s own (larger, 10s default, `:ingress_ws_handoff_timeout`)
   call timeout would need to act as a backstop. Reverse-direction
@@ -361,8 +361,10 @@ defmodule Vagus.Ingress.WSBridge.Upstream do
 
   ## `send_timeout` on the Mint socket (issue #37)
 
-  `Mint.HTTP.connect/4`'s `transport_opts` carry `send_timeout` (default 5s,
-  `send_timeout_ms`) and `send_timeout_close: true`. Without it, a wedged
+  `Mint.HTTP.connect/4`'s `transport_opts` carry `send_timeout` (5s default,
+  `config :vagus, :ingress_ws_send_timeout` — args-map `send_timeout_ms`
+  still wins when a caller passes one, e.g. tests exercising this deadline
+  directly) and `send_timeout_close: true`. Without it, a wedged
   `:gen_tcp.send` (the add-on's socket buffer full) blocks forever — after
   `WSBridge`'s own handoff timeout gives up and closes the browser leg,
   `terminate/2`'s `GenServer.stop/3` can't be processed by a process stuck
@@ -460,7 +462,12 @@ defmodule Vagus.Ingress.WSBridge.Upstream do
         %{parent: parent, ip: ip, port: port, path: path, protocols: protocols, headers: headers} =
           args
       ) do
-    send_timeout_ms = Map.get(args, :send_timeout_ms, @default_send_timeout_ms)
+    send_timeout_ms =
+      Map.get(
+        args,
+        :send_timeout_ms,
+        Application.get_env(:vagus, :ingress_ws_send_timeout, @default_send_timeout_ms)
+      )
 
     connect_opts = [
       mode: :active,
@@ -528,6 +535,16 @@ defmodule Vagus.Ingress.WSBridge.Upstream do
 
   defp protocol_headers(protocols),
     do: [{"sec-websocket-protocol", Enum.join(protocols, ", ")}]
+
+  # Reaches into Mint.HTTP1's own struct on purpose (see `process_response/2`'s
+  # `:done` clause) — guarded so an upstream struct change degrades to a no-op
+  # (treated as "no leftover") rather than crashing.
+  defp mint_http1_leftover(conn) do
+    case conn do
+      %{buffer: bin} when is_binary(bin) and bin != <<>> -> bin
+      _ -> <<>>
+    end
+  end
 
   @impl GenServer
   @doc """
@@ -651,10 +668,21 @@ defmodule Vagus.Ingress.WSBridge.Upstream do
     {:continue, %{state | resp_headers: headers}}
   end
 
+  # mint_web_socket's post-`new/4` stream takes over the raw transport and
+  # never revisits Mint.HTTP1's own parse buffer — any bytes the add-on wrote
+  # bundled with (or immediately behind) the 101 response are stranded there
+  # forever unless drained here, once, right after `new/4`.
   defp process_response({:done, ref}, %{ref: ref, upgraded?: false} = state) do
     case Mint.WebSocket.new(state.conn, ref, state.status, state.resp_headers) do
       {:ok, conn, websocket} ->
-        flush_pending(%{state | conn: conn, websocket: websocket, upgraded?: true})
+        upgraded = %{state | conn: conn, websocket: websocket, upgraded?: true}
+        leftover = mint_http1_leftover(conn)
+
+        case {flush_pending(upgraded), leftover} do
+          {{:continue, state}, <<>>} -> {:continue, state}
+          {{:continue, state}, bin} -> process_response({:data, ref, bin}, state)
+          {{:stop, state}, _leftover} -> {:stop, state}
+        end
 
       {:error, conn, _reason} ->
         send(state.parent, {:upstream_close, 1011, ""})

@@ -21,7 +21,8 @@ defmodule Vagus.API.CoreProxyWSTest.CoreHandshakeHandler do
   A `WebSock` handler standing in for Core's own `/api/websocket` endpoint —
   plays the SERVER side of fact 8's `_websocket_client` handshake that
   `Vagus.API.CoreProxy.WSBridge.Upstream` runs as the CLIENT: pushes
-  `auth_required` on init, expects `{"type":"auth","access_token":T}`,
+  `auth_required` shortly after init (see `init/1` — not synchronously
+  from init's own return), expects `{"type":"auth","access_token":T}`,
   replies `auth_ok` (or, per `CoreAuthScript`, `auth_invalid` regardless of
   whether `T` is actually correct — the Core-side-failure test's knob) then
   echoes further frames — except the literal text `"hello"`, which gets
@@ -44,8 +45,16 @@ defmodule Vagus.API.CoreProxyWSTest.CoreHandshakeHandler do
   def init(%{test_pid: test_pid, expected_token: expected_token}) do
     send(test_pid, {:core_init, self()})
 
+    # issue #1: Bandit 1.12.0 can silently lose a frame pushed straight from
+    # `WebSock.init/1`'s own return under CPU starvation
+    # (`Bandit.WebSocket.Socket.send_frame/3` discards the send result) —
+    # that's what stranded this fake's `auth_required` push and produced the
+    # flake's `{:close, 1011, ""}`. Pushing from the first `handle_info` tick
+    # instead is outside that window.
+    Process.send_after(self(), :push_auth_required, 0)
+
     state = %{test_pid: test_pid, expected_token: expected_token, authed?: false}
-    {:push, {:text, encode(%{"type" => "auth_required", "ha_version" => "2026.7.3"})}, state}
+    {:ok, state}
   end
 
   @impl WebSock
@@ -108,6 +117,10 @@ defmodule Vagus.API.CoreProxyWSTest.CoreHandshakeHandler do
   def handle_control(_frame, state), do: {:ok, state}
 
   @impl WebSock
+  def handle_info(:push_auth_required, state) do
+    {:push, {:text, encode(%{"type" => "auth_required", "ha_version" => "2026.7.3"})}, state}
+  end
+
   def handle_info(_msg, state), do: {:ok, state}
 
   @impl WebSock
@@ -179,7 +192,12 @@ defmodule Vagus.API.CoreProxyWSTest.FakeCoreSocket do
   get "/api/websocket" do
     DialCounter.bump()
     test_pid = Application.fetch_env!(:vagus, :core_ws_test_pid)
-    WebSockAdapter.upgrade(conn, CoreSocketHandler, %{test_pid: test_pid}, timeout: 30_000)
+    # 30s sat exactly at the bridges' 30s heartbeat interval — a knife-edge
+    # idle race under CI starvation (the fake's own idle close can fire
+    # first) plus a real bound for wedge/flood tests that legitimately
+    # starve this receive path; 900_000 matches the production listeners'
+    # own idle bound instead.
+    WebSockAdapter.upgrade(conn, CoreSocketHandler, %{test_pid: test_pid}, timeout: 900_000)
   end
 
   match _ do
@@ -205,7 +223,7 @@ defmodule Vagus.API.CoreProxyWSTest.FakeCore do
       conn,
       CoreHandshakeHandler,
       %{test_pid: test_pid, expected_token: expected_token},
-      timeout: 30_000
+      timeout: 900_000
     )
   end
 
@@ -252,7 +270,17 @@ defmodule Vagus.API.CoreProxyWSTest.Client do
       # silently dropping the first frame.
       {websocket, frames} = decode_all(websocket, ref, responses)
 
-      {:ok, %__MODULE__{conn: conn, ref: ref, websocket: websocket, queue: frames}, resp_headers}
+      # mint_web_socket's post-`new/4` stream never revisits Mint.HTTP1's own
+      # parse buffer — bytes bundled with (or immediately behind) the 101
+      # response, distinct from the same-batch `{:data, ...}` entries
+      # `decode_all/3` above already handles, are stranded there unless
+      # drained here, once, right after `new/4`.
+      leftover = mint_http1_leftover(conn)
+      {websocket, leftover_frames} = decode_all(websocket, ref, [{:data, ref, leftover}])
+
+      {:ok,
+       %__MODULE__{conn: conn, ref: ref, websocket: websocket, queue: frames ++ leftover_frames},
+       resp_headers}
     else
       {:error, status, conn}
     end
@@ -266,8 +294,8 @@ defmodule Vagus.API.CoreProxyWSTest.Client do
   end
 
   @spec next_frame(t(), timeout()) :: {Mint.WebSocket.frame(), t()}
-  def next_frame(%__MODULE__{queue: [frame | rest]} = c, _timeout) do
-    {frame, %{c | queue: rest}}
+  def next_frame(%__MODULE__{queue: [frame | rest]} = c, timeout) do
+    handle_frame(frame, %{c | queue: rest}, timeout)
   end
 
   def next_frame(%__MODULE__{queue: []} = c, timeout) do
@@ -291,7 +319,7 @@ defmodule Vagus.API.CoreProxyWSTest.Client do
 
         case frames do
           [] -> next_frame(c, timeout)
-          [frame | rest] -> {frame, %{c | queue: rest}}
+          [frame | rest] -> handle_frame(frame, %{c | queue: rest}, timeout)
         end
 
       # Not a message belonging to this connection's own request — per
@@ -304,6 +332,24 @@ defmodule Vagus.API.CoreProxyWSTest.Client do
     end
   end
 
+  # `WSBridge` heartbeats every 30s for the connection's life (fact 8) —
+  # a starved test run can stretch past that, so ping/pong control traffic
+  # must be answered/absorbed here (as a real WS client's transport layer
+  # would) rather than handed to a caller's data-frame assertion. Recursing
+  # resets the wait window on each control frame — acceptable in tests,
+  # where the bound is "a data frame eventually arrives", not a hard deadline.
+  defp handle_frame({:ping, data}, c, timeout) do
+    next_frame(send_frame(c, {:pong, data}), timeout)
+  end
+
+  defp handle_frame({:pong, _data}, c, timeout) do
+    next_frame(c, timeout)
+  end
+
+  defp handle_frame(frame, c, _timeout) do
+    {frame, c}
+  end
+
   defp decode_all(websocket, ref, responses) do
     Enum.reduce(responses, {websocket, []}, fn
       {:data, r, data}, {ws, acc} when r == ref ->
@@ -313,6 +359,16 @@ defmodule Vagus.API.CoreProxyWSTest.Client do
       _other, acc ->
         acc
     end)
+  end
+
+  # Reaches into Mint.HTTP1's own struct on purpose (see `connect/4`) —
+  # guarded so an upstream struct change degrades to a no-op (treated as
+  # "no leftover") rather than crashing.
+  defp mint_http1_leftover(conn) do
+    case conn do
+      %{buffer: bin} when is_binary(bin) and bin != <<>> -> bin
+      _ -> <<>>
+    end
   end
 
   defp await_done(conn, ref, acc) do
@@ -374,6 +430,11 @@ defmodule Vagus.API.CoreProxyWSTest do
   use ExUnit.Case, async: false
   use Plug.Test
 
+  # issue #1: the suite's WS deadlines already baseline at 60s (config/test.exs)
+  # for starved-CI headroom — ExUnit's own 60s default per-test timeout must
+  # sit above that, not equal to it.
+  @moduletag timeout: 120_000
+
   alias Vagus.Addon.Registry
   alias Vagus.API.CoreProxyWSTest.{Client, CoreAuthScript, DialCounter, FakeCore}
   alias Vagus.API.{Dispatcher, Token}
@@ -420,19 +481,37 @@ defmodule Vagus.API.CoreProxyWSTest do
       {:ok, @expected_core_token}
     end)
 
+    # issue #1: these three carry a config/test.exs baseline (60_000, not the
+    # library default) — `delete_env` would strip that baseline for the rest
+    # of the suite after this file's first test runs, not just restore the
+    # library default. Save/restore-prior instead, same discipline as
+    # `prev_base_url` above.
+    prev_auth_timeout = Application.get_env(:vagus, :core_ws_auth_timeout)
+    prev_handoff_timeout = Application.get_env(:vagus, :core_ws_handoff_timeout)
+    prev_send_timeout = Application.get_env(:vagus, :core_ws_send_timeout)
+
     on_exit(fn ->
       if is_nil(prev_base_url),
         do: Application.delete_env(:vagus, :core_base_url),
         else: Application.put_env(:vagus, :core_base_url, prev_base_url)
 
+      if is_nil(prev_auth_timeout),
+        do: Application.delete_env(:vagus, :core_ws_auth_timeout),
+        else: Application.put_env(:vagus, :core_ws_auth_timeout, prev_auth_timeout)
+
+      if is_nil(prev_handoff_timeout),
+        do: Application.delete_env(:vagus, :core_ws_handoff_timeout),
+        else: Application.put_env(:vagus, :core_ws_handoff_timeout, prev_handoff_timeout)
+
+      if is_nil(prev_send_timeout),
+        do: Application.delete_env(:vagus, :core_ws_send_timeout),
+        else: Application.put_env(:vagus, :core_ws_send_timeout, prev_send_timeout)
+
       Application.delete_env(:vagus, :core_proxy_access_token_fun)
       Application.delete_env(:vagus, :core_ws_test_pid)
       Application.delete_env(:vagus, :core_ws_expected_token)
-      Application.delete_env(:vagus, :core_ws_auth_timeout)
       Application.delete_env(:vagus, :core_ws_pending_max_frames)
       Application.delete_env(:vagus, :core_ws_pending_max_bytes)
-      Application.delete_env(:vagus, :core_ws_handoff_timeout)
-      Application.delete_env(:vagus, :core_ws_send_timeout)
     end)
 
     %{proxy_host: "127.0.0.1", proxy_port: proxy_port}

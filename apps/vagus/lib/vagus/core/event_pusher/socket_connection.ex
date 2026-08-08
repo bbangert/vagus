@@ -168,6 +168,16 @@ defmodule Vagus.Core.EventPusher.SocketConnection do
     Application.get_env(:vagus, :core_ws_send_timeout, @default_send_timeout_ms)
   end
 
+  # Reaches into Mint.HTTP1's own struct on purpose (see `process_response/2`'s
+  # `:done` clause) — guarded so an upstream struct change degrades to a no-op
+  # (treated as "no leftover") rather than crashing.
+  defp mint_http1_leftover(conn) do
+    case conn do
+      %{buffer: bin} when is_binary(bin) and bin != <<>> -> bin
+      _ -> <<>>
+    end
+  end
+
   defp process_responses([], state), do: {:noreply, state}
 
   defp process_responses([response | rest], state) do
@@ -185,13 +195,23 @@ defmodule Vagus.Core.EventPusher.SocketConnection do
     {:continue, %{state | resp_headers: headers}}
   end
 
+  # mint_web_socket's post-`new/4` stream takes over the raw transport and
+  # never revisits Mint.HTTP1's own parse buffer — Core's first frame,
+  # bundled with (or immediately behind) the 101 response, would be stranded
+  # there forever unless drained here, once, right after `new/4`.
   defp process_response({:done, ref}, %{ref: ref, upgraded?: false} = state) do
     case Mint.WebSocket.new(state.conn, ref, state.status, state.resp_headers) do
       {:ok, conn, websocket} ->
         # Implicitly authenticated: both signals at once (see moduledoc).
         send(state.manager, {:event_pusher_connection, :connected, self()})
         send(state.manager, {:event_pusher_connection, :ready, self()})
-        {:continue, %{state | conn: conn, websocket: websocket, upgraded?: true}}
+        upgraded = %{state | conn: conn, websocket: websocket, upgraded?: true}
+        leftover = mint_http1_leftover(conn)
+
+        case leftover do
+          <<>> -> {:continue, upgraded}
+          bin -> process_response({:data, ref, bin}, upgraded)
+        end
 
       {:error, conn, reason} ->
         Logger.warning(
