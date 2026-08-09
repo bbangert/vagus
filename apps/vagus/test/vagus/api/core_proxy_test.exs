@@ -185,8 +185,8 @@ defmodule Vagus.API.CoreProxyTest do
   use Plug.Test
 
   alias Vagus.Addon.Registry
-  alias Vagus.API.CoreProxyTest.{FakeCore, HitCounter, Recorder, Script, SSEGate}
   alias Vagus.API.{CoreProxy, Dispatcher, Token}
+  alias Vagus.API.CoreProxyTest.{FakeCore, HitCounter, Recorder, Script, SSEGate}
 
   @opts Dispatcher.init([])
   @client_finch Vagus.API.CoreProxyTest.ClientFinch
