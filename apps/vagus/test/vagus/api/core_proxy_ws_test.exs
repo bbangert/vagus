@@ -548,6 +548,23 @@ defmodule Vagus.API.CoreProxyWSTest do
 
   defp decode_text({:text, data}), do: Jason.decode!(data)
 
+  # A caller that has completed both handshakes and is in `:relaying` — the
+  # inline version of section 1's first half, for tests whose subject is what
+  # happens to frames afterwards.
+  defp relaying_client(host, port, slug) do
+    token = addon_token(slug, %{homeassistant_api: true})
+
+    {:ok, client, _headers} = Client.connect(host, port, "/core/websocket")
+    {{:text, _auth_required}, client} = Client.next_frame(client, @recv_timeout)
+
+    client = Client.send_frame(client, {:text, Jason.encode!(%{"access_token" => token})})
+    {{:text, raw}, client} = Client.next_frame(client, @recv_timeout)
+    assert Jason.decode!(raw)["type"] == "auth_ok"
+
+    assert_receive {:core_init, _core_pid}, @recv_timeout
+    client
+  end
+
   ## 1. Accept: full handshake + text/binary relay both ways
 
   test "a caller with a flagged add-on token completes the handshake and relays both ways", %{
@@ -586,6 +603,95 @@ defmodule Vagus.API.CoreProxyWSTest do
 
     assert {:binary, echoed} = frame
     assert :crypto.hash(:sha256, echoed) == expected_sha
+  end
+
+  ## 1b. Core's reserved `hassio*` commands are refused here, never relayed
+  ##
+  ## `Upstream` authenticates to Core as the Supervisor, so a relayed
+  ## `hassio/*` frame passes Core's own `only_supervisor` / `is_admin` gates
+  ## truthfully — `hassio/api` would call the Supervisor API with Core's
+  ## token and hand the caller the `:supervisor` tier. `Vagus.Core.Reserved`
+  ## has the full chain.
+
+  test "supervisor/api is refused with an unauthorized result and never reaches Core", %{
+    proxy_host: host,
+    proxy_port: port
+  } do
+    client = relaying_client(host, port, "cp_ws_reserved_api")
+
+    client =
+      Client.send_frame(
+        client,
+        {:text,
+         Jason.encode!(%{
+           "id" => 7,
+           "type" => "supervisor/api",
+           "endpoint" => "/addons/evil/install",
+           "method" => "post"
+         })}
+      )
+
+    {{:text, raw}, client} = Client.next_frame(client, @recv_timeout)
+
+    assert %{
+             "id" => 7,
+             "type" => "result",
+             "success" => false,
+             "error" => %{"code" => "unauthorized"}
+           } = Jason.decode!(raw)
+
+    # Had the frame been relayed, the fake Core's echo of it would be sitting
+    # in the queue ahead of this round trip — so `"world"` arriving proves
+    # the frame died here rather than merely being answered here.
+    client = Client.send_frame(client, {:text, "hello"})
+    {frame, _client} = Client.next_frame(client, @recv_timeout)
+    assert frame == {:text, "world"}
+  end
+
+  test "supervisor/event is refused too — the whole prefix is reserved, not one command", %{
+    proxy_host: host,
+    proxy_port: port
+  } do
+    client = relaying_client(host, port, "cp_ws_reserved_event")
+
+    client =
+      Client.send_frame(
+        client,
+        {:text, Jason.encode!(%{"id" => 1, "type" => "supervisor/event", "data" => %{}})}
+      )
+
+    {{:text, raw}, _client} = Client.next_frame(client, @recv_timeout)
+    assert %{"success" => false, "error" => %{"code" => "unauthorized"}} = Jason.decode!(raw)
+  end
+
+  # The reason `reserved_command/1` always decodes instead of pre-filtering
+  # on a raw "hassio" substring: these bytes contain no such substring, and
+  # Core's own JSON decoder resolves them straight back to `hassio/api`.
+  test "a JSON-escaped command type is refused — matched after decoding, like Core matches it", %{
+    proxy_host: host,
+    proxy_port: port
+  } do
+    client = relaying_client(host, port, "cp_ws_reserved_escaped")
+
+    escaped = ~s({"id":2,"type":"\\u0073upervisor/api","endpoint":"/addons","method":"get"})
+    refute String.contains?(escaped, "supervisor")
+
+    client = Client.send_frame(client, {:text, escaped})
+    {{:text, raw}, _client} = Client.next_frame(client, @recv_timeout)
+    assert %{"success" => false, "error" => %{"code" => "unauthorized"}} = Jason.decode!(raw)
+  end
+
+  test "an ordinary Core command still relays untouched", %{
+    proxy_host: host,
+    proxy_port: port
+  } do
+    client = relaying_client(host, port, "cp_ws_reserved_control")
+
+    command = Jason.encode!(%{"id" => 3, "type" => "get_states"})
+    client = Client.send_frame(client, {:text, command})
+
+    {frame, _client} = Client.next_frame(client, @recv_timeout)
+    assert frame == {:text, command}
   end
 
   ## 2. Rejections at the caller handshake — fake Core never dialed

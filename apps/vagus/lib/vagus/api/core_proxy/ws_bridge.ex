@@ -59,6 +59,18 @@ defmodule Vagus.API.CoreProxy.WSBridge do
   questions, and upstream conflates them in exactly this order, not the
   other way round.
 
+  ## `supervisor/*` and `hassio/*` commands are refused, not relayed
+
+  Everything below assumes frames pass through untouched. One class does
+  not: a caller frame naming a command in Core's reserved domains is
+  answered here with Core's own `unauthorized` result envelope and never
+  reaches `Upstream`. `Upstream` authenticates to Core as the Supervisor, so
+  those commands — `supervisor/api` above all, which calls the SUPERVISOR
+  API with Core's token and would hand the caller the `:supervisor` tier —
+  would otherwise pass Core's own "is this the Supervisor" gates truthfully.
+  See `Vagus.Core.Reserved` for the reservation this is one half of, and
+  `reserved_command/1` below for the mechanics.
+
   ## Once past `:awaiting_auth`, relaying is a bounded synchronous handoff
 
   `handle_in/2` in the `:relaying` phase hands every frame to `Upstream` via
@@ -112,7 +124,7 @@ defmodule Vagus.API.CoreProxy.WSBridge do
 
   alias Vagus.API.CoreProxy
   alias Vagus.API.CoreProxy.WSBridge.Upstream
-  alias Vagus.Core.Versions
+  alias Vagus.Core.{Reserved, Versions}
 
   @heartbeat_interval_ms 30_000
 
@@ -156,7 +168,8 @@ defmodule Vagus.API.CoreProxy.WSBridge do
   via a bounded `GenServer.call/3` (see moduledoc's "bounded synchronous
   handoff" section for why a call and not a cast); a timeout closes with
   1011 directly, any other exit is a no-op since the faithful close is
-  already on its way through `handle_info/2`.
+  already on its way through `handle_info/2`. The one exception is a
+  `hassio*` command, refused here — see `reserved_command/1`.
   """
   def handle_in({data, opcode: :text}, %{phase: :awaiting_auth} = state) do
     case decode_caller_token(data) do
@@ -169,23 +182,14 @@ defmodule Vagus.API.CoreProxy.WSBridge do
     auth_invalid_and_close(state)
   end
 
-  def handle_in({data, opcode: op}, %{phase: :relaying, upstream: pid} = state) do
-    :ok = GenServer.call(pid, {:frame, op, data}, CoreProxy.ws_handoff_timeout_ms())
-    {:ok, state}
-  catch
-    :exit, {:timeout, _} ->
-      # Upstream wedged longer than the handoff timeout — same
-      # abnormal-loss close as every other stuck-relay path.
-      {:stop, :normal, {1011, ""}, %{state | closing?: true}}
-
-    :exit, _upstream_died_mid_call ->
-      # Upstream stopped (normally after already sending
-      # `{:upstream_close, ...}`, or crashed -> a trapped `{:EXIT, ...}`).
-      # Either message is already in / on its way to our own mailbox — let
-      # those clauses pick the faithful close code rather than stamping
-      # 1011 here.
-      {:ok, state}
+  def handle_in({data, opcode: :text} = frame, %{phase: :relaying} = state) do
+    case reserved_command(data) do
+      {:reserved, id} -> {:push, {:text, unauthorized_result(id)}, state}
+      :allowed -> relay(frame, state)
+    end
   end
+
+  def handle_in(frame, %{phase: :relaying} = state), do: relay(frame, state)
 
   @impl WebSock
   @doc "Ping/pong from the caller: no-op, same reasoning as `Vagus.Ingress.WSBridge.handle_control/2` — `WebSock`/Bandit already auto-answered before this callback ran."
@@ -260,6 +264,69 @@ defmodule Vagus.API.CoreProxy.WSBridge do
   def terminate(_reason, _state), do: :ok
 
   ## Internals
+
+  defp relay({data, opcode: op}, %{upstream: pid} = state) do
+    :ok = GenServer.call(pid, {:frame, op, data}, CoreProxy.ws_handoff_timeout_ms())
+    {:ok, state}
+  catch
+    :exit, {:timeout, _} ->
+      # Upstream wedged longer than the handoff timeout — same
+      # abnormal-loss close as every other stuck-relay path.
+      {:stop, :normal, {1011, ""}, %{state | closing?: true}}
+
+    :exit, _upstream_died_mid_call ->
+      # Upstream stopped (normally after already sending
+      # `{:upstream_close, ...}`, or crashed -> a trapped `{:EXIT, ...}`).
+      # Either message is already in / on its way to our own mailbox — let
+      # those clauses pick the faithful close code rather than stamping
+      # 1011 here.
+      {:ok, state}
+  end
+
+  # `Vagus.Core.Reserved`, applied to the WS leg. `Upstream` authenticates to
+  # Core with VAGUS's credential (fact 8 / A3), so every frame relayed from
+  # here arrives at Core as the Supervisor user — which is exactly what
+  # Core's own command guards test for. `supervisor/api`
+  # (`websocket_api.py`) takes an arbitrary endpoint + method and calls the
+  # Supervisor API with Core's token, so relaying it would hand an add-on
+  # the `:supervisor` tier — the whole `Vagus.API.Tiers` lattice, bypassed;
+  # `supervisor/event` (`ws_require_user(only_supervisor=True)`) would let it
+  # forge Supervisor events onto Core's bus. Core cannot defend itself here:
+  # its checks ask "is this the Supervisor", and by the time a frame reaches
+  # Core the answer is truthfully yes.
+  #
+  # Refused with Core's own `unauthorized` result envelope rather than by
+  # closing the socket: that is what Core answers an unpermitted command
+  # with, so a caller sees the shape it would have seen anyway, and one
+  # rejected frame doesn't tear down a working tunnel.
+  #
+  # ALWAYS decodes. The tempting fast path — skip the JSON parse when the
+  # raw frame has no "hassio" substring — is exactly the encoded-segment
+  # hole `Vagus.API.Dispatcher.core_proxy_blacklisted?/1` documents on the
+  # REST side, one encoding down: `{"type":"hassio/api"}` contains no
+  # literal `hassio` and would sail past, only for Core's own JSON decoder
+  # to resolve it back to the reserved command.
+  defp reserved_command(data) do
+    case Jason.decode(data) do
+      {:ok, %{"type" => type} = msg} when is_binary(type) ->
+        if Reserved.command?(type), do: {:reserved, Map.get(msg, "id")}, else: :allowed
+
+      _not_a_command ->
+        :allowed
+    end
+  end
+
+  defp unauthorized_result(id) do
+    encode(%{
+      "id" => id,
+      "type" => "result",
+      "success" => false,
+      "error" => %{
+        "code" => "unauthorized",
+        "message" => "Supervisor-only commands are not available through this proxy"
+      }
+    })
+  end
 
   # Fact 8: `msg.get("access_token") or msg.get("api_password")` — no
   # `"type"` field is ever checked. `{:ok, %{} = msg}` requires the decoded

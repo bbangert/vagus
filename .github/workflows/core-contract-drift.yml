@@ -1,0 +1,55 @@
+name: Core contract drift
+
+# Nothing in this repo pins a Core version — Vagus.Core.Versions reports
+# whatever version.home-assistant.io/stable.json currently serves — so the
+# reserved-namespace fixture cannot notice Core growing a new Supervisor-only
+# view or WS command. This job is what notices: it re-derives the surface from
+# the Core release a device would actually install today and diffs it against
+# the fixture the test suite pins.
+#
+# A failure here is not a break. It means Core moved and the fixture is stale:
+# regenerate with scripts/core-hassio-surface.sh <tag>, confirm the new entries
+# are covered by Vagus.Core.Reserved, and commit. A new name OUTSIDE the
+# reserved prefixes is the case worth stopping for — see that module's "why a
+# namespace, not a list".
+
+on:
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+jobs:
+  drift:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve the Core release a device would install
+        id: core
+        run: |
+          version=$(curl -sfL https://version.home-assistant.io/stable.json | jq -r '.homeassistant.default')
+          [ -n "$version" ] && [ "$version" != "null" ] || { echo "::error::could not resolve Core stable version"; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Diff Core's reserved surface against the pinned fixture
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CORE_VERSION: ${{ steps.core.outputs.version }}
+        run: |
+          fixture=$(ls apps/vagus/test/fixtures/core-*-hassio-views.json)
+          pinned_version=$(jq -r '._core_version' "$fixture")
+          echo "fixture pins Core $pinned_version; stable is $CORE_VERSION"
+
+          ./scripts/core-hassio-surface.sh "$CORE_VERSION" > /tmp/current.json
+
+          # Compare the surface only. A Core release that adds no view and no
+          # command is not drift, so a version bump alone must not fail this.
+          if diff <(jq -S '{urls, ws_commands}' "$fixture") \
+                  <(jq -S '{urls, ws_commands}' /tmp/current.json); then
+            echo "no drift: Core $CORE_VERSION exposes the same reserved surface as $pinned_version"
+          else
+            echo "::error::Core $CORE_VERSION changed its Supervisor-reserved surface (diff above). Regenerate: scripts/core-hassio-surface.sh $CORE_VERSION > apps/vagus/test/fixtures/core-$CORE_VERSION-hassio-views.json, then point @fixture_path in reserved_contract_test.exs at it."
+            exit 1
+          fi

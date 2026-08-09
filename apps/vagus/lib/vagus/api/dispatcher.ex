@@ -60,8 +60,9 @@ defmodule Vagus.API.Dispatcher do
   `dispatch_core_proxy/2` to `Vagus.API.CoreProxy`. The blacklist check there
   is a no-op for these paths (`Vagus.API.Tiers.blacklisted?/1` only matches
   Core's `/api/hassio…` namespace, and a WS caller addresses Core by typed
-  command rather than by path at all), but routing every `core`/`homeassistant`
-  path through the
+  command rather than by path at all — that leg's half of the same
+  reservation lives in `Vagus.API.CoreProxy.WSBridge`), but routing every
+  `core`/`homeassistant` path through the
   one `dispatch_core_proxy/2` entry point — rather than adding a second,
   blacklist-free path just for WS — is the point: one place decides
   "blacklisted or not" for this whole route family, so a future addition

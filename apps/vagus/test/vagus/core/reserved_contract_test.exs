@@ -14,28 +14,31 @@ defmodule Vagus.Core.ReservedContractTest do
   to us would have stayed green through all of it, so this one checks the
   rule against a fixture dumped from Core's source instead.
 
+  ## What tells us Core moved
+
+  Nothing in this repo pins a Core version — `Vagus.Core.Versions` reports
+  whatever `version.home-assistant.io/stable.json` currently serves — so
+  this fixture cannot detect drift on its own, and a test asserting only
+  that it agrees with its own filename would go stale silently along with
+  it. `.github/workflows/core-contract-drift.yml` is the part that notices:
+  weekly (and on demand), it re-derives both lists from whatever Core stable
+  serves *today* and fails when they differ from this fixture.
+
   ## Regenerating the fixture
 
-  Required on every Core version bump (`Vagus.Core.Versions`' pinned
-  `"default"`). From this devcontainer, against the tag being adopted:
+  `scripts/core-hassio-surface.sh <tag>` prints the JSON — the same script
+  the drift workflow runs, so a regeneration cannot disagree with the check
+  that demanded it. Save as `test/fixtures/core-<tag>-hassio-views.json` and
+  point `@fixture_path` at it.
 
-  ```
-  TAG=2026.7.4
-  gh api "repos/home-assistant/core/git/trees/$TAG?recursive=1" --jq '.tree[].path' \\
-    | grep -E '^homeassistant/components/hassio/.*\\.py$' \\
-    | while read -r p; do curl -sf "https://raw.githubusercontent.com/home-assistant/core/$TAG/$p"; done \\
-    | grep -oE 'url = "/api/[^"]+"' | sed 's/url = //' | tr -d '"' | sort -u
-  ```
+  Scanning Core's source rather than a running instance is deliberate: it
+  needs no device, it is reproducible from a tag by anyone, and a view
+  registered but never exercised still shows up.
 
-  Save as `test/fixtures/core-<TAG>-hassio-views.json` and point
-  `@fixture_path` at it. Scanning Core's source rather than a running
-  instance is deliberate — it needs no device, it is reproducible from a tag
-  by anyone, and a view registered but never exercised still shows up.
-
-  A NEW url appearing here that this test then refuses is the normal case and
-  needs no action beyond regenerating. A new url that this test FAILS on
-  means Core has put a Supervisor-only view outside the `hassio` prefix, and
-  the namespace rule no longer describes reality — that is a design question
+  A new url or command appearing that this test then refuses is the normal
+  case and needs nothing beyond regenerating. One that this test FAILS on
+  means Core has put a Supervisor-privileged endpoint outside the reserved
+  names, and the reservation no longer describes reality — a design question
   (`Vagus.Core.Reserved`'s "why a namespace, not a list"), not a fixture
   update.
   """
@@ -50,11 +53,12 @@ defmodule Vagus.Core.ReservedContractTest do
                   "..",
                   "..",
                   "fixtures",
-                  "core-2026.7.3-hassio-views.json"
+                  "core-2026.8.1-hassio-views.json"
                 ])
   @external_resource @fixture_path
   @fixture @fixture_path |> File.read!() |> Jason.decode!()
   @urls @fixture["urls"]
+  @ws_commands @fixture["ws_commands"]
 
   # Same cross-check the aiohasupervisor contract test uses: a fixture saved
   # under a filename that disagrees with the version it was dumped from
@@ -124,6 +128,31 @@ defmodule Vagus.Core.ReservedContractTest do
       assert Reserved.view?(path)
       assert Tiers.blacklisted?(["core" | path])
       assert Tiers.blacklisted?(["homeassistant" | path])
+    end
+  end
+
+  describe "every Core hassio WS command" do
+    test "is reserved" do
+      for command <- @ws_commands do
+        assert Reserved.command?(command), "#{command} would be relayed to Core as the Supervisor"
+      end
+    end
+
+    # This list is why the fixture exists. Reading
+    # `@websocket_api.ws_require_user(only_supervisor=True)` above
+    # `websocket_supervisor_event` suggests the command is `hassio/event`;
+    # the type string it actually dispatches on is `WS_TYPE_EVENT`, i.e.
+    # `supervisor/event`. A rule written from the handler names alone reads
+    # correct and blocks nothing.
+    test "the escalating command is in Core's `supervisor` domain, not `hassio`" do
+      assert "supervisor/api" in @ws_commands
+      refute "hassio/api" in @ws_commands
+    end
+
+    test "ordinary Core commands are untouched" do
+      for command <- ["get_states", "call_service", "config/auth/list", "subscribe_events"] do
+        refute Reserved.command?(command)
+      end
     end
   end
 end

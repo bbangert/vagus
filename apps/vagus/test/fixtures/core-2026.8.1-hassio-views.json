@@ -1,0 +1,21 @@
+{
+  "_core_version": "2026.8.1",
+  "_source": "homeassistant/components/hassio/**/*.py at tag 2026.8.1",
+  "urls": [
+    "/api/hassio/{path:.+}",
+    "/api/hassio_auth",
+    "/api/hassio_auth/password_reset",
+    "/api/hassio_ingress/{token}/{path:.*}",
+    "/api/hassio_push/discovery/{uuid}",
+    "/api/hassio_push/panel/{addon}"
+  ],
+  "ws_commands": [
+    "hassio/update/addon",
+    "hassio/update/config/info",
+    "hassio/update/config/update",
+    "hassio/update/core",
+    "supervisor/api",
+    "supervisor/event",
+    "supervisor/subscribe"
+  ]
+}

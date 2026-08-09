@@ -243,13 +243,16 @@ defmodule Vagus.Core.Transport do
 
   Takes no `origin` deliberately, unlike `build/6`: the WS legs
   (`Vagus.API.CoreProxy.WSBridge.Upstream` proxied, `Vagus.Core.EventPusher`
-  internal) address Core by typed command messages, not by path, so
-  `Vagus.Core.Reserved` has nothing to judge here and a tag would be a
-  parameter that never decides anything. What keeps a proxied WS caller from
-  reaching Core's privileged commands is Core's own per-command gating
-  (`@require_admin`, `connection.user.is_owner`) — not anything in this
-  module. Worth knowing before assuming this leg inherits the REST leg's
-  namespace guard.
+  internal) address Core by typed command messages, not by path, so there is
+  no path here for `Vagus.Core.Reserved` to judge and a tag would be a
+  parameter that never decides anything.
+
+  That does NOT mean the WS leg is unguarded, and it emphatically does not
+  mean Core guards it: Core's `supervisor/*` commands gate on "is this the
+  Supervisor user", which a proxied frame truthfully IS, so the credential
+  swap satisfies the check rather than failing it. The reservation is
+  enforced one layer up instead, per relayed frame, by
+  `Vagus.API.CoreProxy.WSBridge`'s `reserved_command/1`.
   """
   @spec connect_args(t()) :: {Mint.Types.scheme(), Mint.Types.address(), :inet.port_number()}
   def connect_args({:socket, socket}), do: {:http, {:local, socket}, 0}
