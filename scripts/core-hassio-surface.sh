@@ -18,15 +18,22 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SRC="$(mktemp -d)"
 trap 'rm -rf "$SRC"' EXIT
 
+COMPONENT="homeassistant/components/hassio"
+
+# Mirrored under their path relative to the component root, NOT flattened to
+# basenames: a subpackage would collide every `__init__.py` (and any second
+# `websocket_api.py`), silently dropping one module's whole surface.
 gh api "repos/home-assistant/core/git/trees/${TAG}?recursive=1" --jq '.tree[].path' \
-  | grep -E '^homeassistant/components/hassio/.*\.py$' \
+  | grep -E "^${COMPONENT}/.*\.py$" \
   | while read -r path; do
-      curl -sfL "${RAW}/${path}" -o "${SRC}/$(basename "$path")"
+      dest="${SRC}/${path#"${COMPONENT}/"}"
+      mkdir -p "$(dirname "$dest")"
+      curl -sfL "${RAW}/${path}" -o "$dest"
     done
 
 # A tag whose tree we could not read leaves an empty dir; failing here beats
 # emitting an empty surface that reads as "Core registers nothing".
-if ! compgen -G "${SRC}/*.py" > /dev/null; then
+if [ -z "$(find "$SRC" -name '*.py' -print -quit)" ]; then
   echo "no hassio sources fetched for tag ${TAG}" >&2
   exit 1
 fi
