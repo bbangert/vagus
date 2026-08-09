@@ -467,6 +467,9 @@ defmodule Vagus.API.CoreProxy.WSBridge.Upstream do
           resp_headers: Mint.Types.headers(),
           websocket: Mint.WebSocket.t() | nil,
           upgraded?: boolean(),
+          # Raw bytes from `{:data, ^ref, _}` responses seen while
+          # `upgraded?: false` — see `process_response/2`'s `:done` clause.
+          pre_upgrade_data: binary(),
           auth_sent?: boolean(),
           ha_ready?: boolean(),
           implicit_auth?: boolean(),
@@ -525,6 +528,7 @@ defmodule Vagus.API.CoreProxy.WSBridge.Upstream do
            resp_headers: [],
            websocket: nil,
            upgraded?: false,
+           pre_upgrade_data: <<>>,
            auth_sent?: false,
            ha_ready?: false,
            implicit_auth?: implicit_auth?,
@@ -582,6 +586,20 @@ defmodule Vagus.API.CoreProxy.WSBridge.Upstream do
 
   # issue #37: the Mint socket's own `send_timeout` — see `connect_and_upgrade/1`.
   defp core_ws_send_timeout_ms, do: Application.get_env(:vagus, :core_ws_send_timeout, 5_000)
+
+  # Reaches into Mint.HTTP1's own struct on purpose (see `process_response/2`'s
+  # `:done` clause) — guarded so an upstream struct change degrades to a no-op
+  # (treated as "no leftover", `conn` returned untouched) rather than
+  # crashing. Clears the buffer in the same step it's read: on a
+  # `{:tcp_closed, _}` message `Mint.WebSocket.stream/2` falls through to
+  # `Mint.HTTP.stream/2`, which WOULD consult a stale buffer and could
+  # surface a bogus HTTP parse error in place of a clean close.
+  defp take_mint_http1_leftover(conn) do
+    case conn do
+      %{buffer: bin} when is_binary(bin) and bin != <<>> -> {bin, %{conn | buffer: <<>>}}
+      _ -> {<<>>, conn}
+    end
+  end
 
   ## Caller frames (called from `WSBridge.handle_in/2`)
 
@@ -713,26 +731,55 @@ defmodule Vagus.API.CoreProxy.WSBridge.Upstream do
     {:continue, %{state | resp_headers: headers}}
   end
 
+  # mint_web_socket's post-`new/4` `stream_http1/3` takes over the raw
+  # transport and never revisits Mint.HTTP1's own parse buffer — any bytes
+  # Core wrote bundled with (or immediately behind) the 101 response are
+  # stranded there forever unless drained here, once, right after `new/4`.
+  # Bytes can also reach us as an ordinary `{:data, ^ref, _}` response
+  # *before* this `:done` in the very same batch (Mint.HTTP1 treats a 101's
+  # body as "whatever's left in this read", RFC7230-legal since a 101 has no
+  # framed body) — `pre_upgrade_data` (accumulated below, `upgraded?: false`)
+  # catches that case, since `conn`'s own buffer is already empty by the
+  # time the bytes were parsed out as that `:data` response.
   defp process_response({:done, ref}, %{ref: ref, upgraded?: false} = state) do
     case Mint.WebSocket.new(state.conn, ref, state.status, state.resp_headers) do
       {:ok, conn, websocket} ->
-        # On TCP, deliberately NOT flushed yet, unlike `Vagus.Ingress.
-        # WSBridge.Upstream`'s own `:done` clause — `ha_ready?` (Core's own
-        # `auth_ok`), not `upgraded?` alone, is the real "ready" gate. On
-        # the socket there is no Core-side handshake to wait for, so the
-        # two gates coincide and this IS the flush point (see moduledoc).
+        {buffered, conn} = take_mint_http1_leftover(conn)
+        leftover = state.pre_upgrade_data <> buffered
         upgraded = %{state | conn: conn, websocket: websocket, upgraded?: true}
 
-        if upgraded.implicit_auth? do
-          flush_pending(%{upgraded | ha_ready?: true})
-        else
-          {:continue, upgraded}
+        # `ha_ready?` (Core's own `auth_ok`), not `upgraded?` alone, is the
+        # real "ready" gate — on the socket there's no Core-side handshake
+        # to wait for, so the two gates coincide and this remains the flush
+        # point (see moduledoc). But the flush — the "connection is now
+        # usable" side effect — must wait until AFTER the leftover is
+        # decoded: a Close or malformed leftover has to stop the connection
+        # without flushing, so the peer's real close code isn't masked by a
+        # later 1011.
+        base = if upgraded.implicit_auth?, do: %{upgraded | ha_ready?: true}, else: upgraded
+
+        decoded =
+          case leftover do
+            <<>> -> {:continue, base}
+            bin -> process_response({:data, ref, bin}, base)
+          end
+
+        case decoded do
+          {:continue, state} when upgraded.implicit_auth? -> flush_pending(state)
+          _ -> decoded
         end
 
       {:error, conn, _reason} ->
         send(state.parent, {:upstream_close, 1011, ""})
         {:stop, %{state | conn: conn}}
     end
+  end
+
+  # Pre-upgrade: see the `:done` clause's comment on `pre_upgrade_data` —
+  # nothing to decode with yet (no `websocket` codec state exists until
+  # `new/4` runs), so just accumulate in arrival order.
+  defp process_response({:data, ref, data}, %{ref: ref, upgraded?: false} = state) do
+    {:continue, %{state | pre_upgrade_data: state.pre_upgrade_data <> data}}
   end
 
   defp process_response({:data, ref, data}, %{ref: ref, upgraded?: true} = state) do

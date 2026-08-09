@@ -33,6 +33,14 @@ defmodule Vagus.Ingress.WSBridgeTest.EchoHandler do
   end
 
   def handle_in({"stall", opcode: :text}, state) do
+    # Round 8 fix: signals the frame actually crossed the wire and reached
+    # this handler — proves the client-side `Upstream` upgrade is complete,
+    # closing the race where a flood test's frames land in the pre-upgrade
+    # `pending` buffer instead of the post-upgrade send path they're meant
+    # to exercise (only `assert_receive {:echo_init, ...}` proved the SERVER
+    # side had upgraded, not the client's `Upstream`).
+    send(state.test_pid, :echo_stalled)
+
     receive do
       :never_sent -> {:ok, state}
     end
@@ -78,11 +86,15 @@ defmodule Vagus.Ingress.WSBridgeTest.FakeAddon do
     # is only ever available on this side of the upgrade.
     send(test_pid, {:ws_upgrade_headers, conn.req_headers})
 
+    # 30s raced this fake's own idle-close under CI starvation, and the
+    # flood/wedge tests deliberately starve `Upstream`'s receive path for
+    # that long or more; 900_000 matches the production listeners' own idle
+    # bound instead.
     WebSockAdapter.upgrade(
       conn,
       EchoHandler,
       %{test_pid: test_pid, path: conn.request_path, query: conn.query_string},
-      timeout: 30_000
+      timeout: 900_000
     )
   end
 
@@ -115,7 +127,16 @@ defmodule Vagus.Ingress.WSBridgeTest.Client do
 
     if status == 101 do
       {:ok, conn, websocket} = Mint.WebSocket.new(conn, ref, status, resp_headers)
-      {:ok, %__MODULE__{conn: conn, ref: ref, websocket: websocket}, resp_headers}
+
+      # mint_web_socket's post-`new/4` stream never revisits Mint.HTTP1's own
+      # parse buffer — bytes bundled with (or immediately behind) the 101
+      # response are stranded there unless drained here, once, right after
+      # `new/4`.
+      leftover = mint_http1_leftover(conn)
+      {websocket, leftover_frames} = decode_all(websocket, ref, [{:data, ref, leftover}])
+
+      {:ok, %__MODULE__{conn: conn, ref: ref, websocket: websocket, queue: leftover_frames},
+       resp_headers}
     else
       {:error, status, conn}
     end
@@ -217,6 +238,16 @@ defmodule Vagus.Ingress.WSBridgeTest.Client do
       _ -> nil
     end)
   end
+
+  # Reaches into Mint.HTTP1's own struct on purpose (see `connect/4`) —
+  # guarded so an upstream struct change degrades to a no-op (treated as
+  # "no leftover") rather than crashing.
+  defp mint_http1_leftover(conn) do
+    case conn do
+      %{buffer: bin} when is_binary(bin) and bin != <<>> -> bin
+      _ -> <<>>
+    end
+  end
 end
 
 defmodule Vagus.Ingress.WSBridgeTest do
@@ -231,6 +262,11 @@ defmodule Vagus.Ingress.WSBridgeTest do
   fourth, the hand-rolled `Client` above standing in for the browser.
   """
   use ExUnit.Case, async: false
+
+  # issue #1: the suite's WS deadlines already baseline at 60s (config/test.exs)
+  # for starved-CI headroom — ExUnit's own 60s default per-test timeout must
+  # sit above that, not equal to it.
+  @moduletag timeout: 120_000
 
   alias Vagus.Addon.{Config, State}
   alias Vagus.Ingress.WSBridgeTest.{Client, FakeAddon}
@@ -580,6 +616,79 @@ defmodule Vagus.Ingress.WSBridgeTest do
     assert_receive {:echo_init, "/ws", "foo=bar&baz=1"}, 2_000
   end
 
+  ## fix/ws-1011-flake: a peer that bundles its 101 response with further WS
+  ## bytes in the SAME transport write. `mint_web_socket`'s post-`new/4`
+  ## stream never revisits Mint.HTTP1's own parse buffer, and (for a 101,
+  ## which RFC7230 says has no framed body) Mint.HTTP1 itself hands any
+  ## bytes trailing the headers back as an ordinary pre-upgrade `{:data,
+  ## ...}` response instead — either way, without `Upstream` explicitly
+  ## draining/accumulating and decoding them once, right after `new/4`,
+  ## they're lost. Every other fake add-on in this file is Bandit/
+  ## `WebSockAdapter`, which always flushes the 101 in its own TCP segment
+  ## and can never reproduce the bug; only a raw, hand-rolled HTTP/1.1
+  ## responder controls the write boundary.
+
+  describe "Upstream direct (fix/ws-1011-flake: leftover bundled with the 101)" do
+    test "a text frame bundled with the 101 in one TCP write is relayed, not stranded" do
+      port = start_raw_fake_addon(extra: raw_text_frame("leftover hello"))
+
+      args = %{
+        parent: self(),
+        ip: "127.0.0.1",
+        port: port,
+        path: "/ws",
+        protocols: [],
+        headers: []
+      }
+
+      {:ok, pid} = Vagus.Ingress.WSBridge.Upstream.start_link(args)
+      Process.monitor(pid)
+
+      assert_receive {:relay, :text, "leftover hello"}, 5_000
+    end
+
+    test "a Close frame bundled with the 101 propagates its own code, without flushing a frame queued before the upgrade completed (Part A ordering)" do
+      port = start_raw_fake_addon(extra: raw_close_frame(4321, "bye"), sync?: true)
+
+      args = %{
+        parent: self(),
+        ip: "127.0.0.1",
+        port: port,
+        path: "/ws",
+        protocols: [],
+        headers: []
+      }
+
+      {:ok, pid} = Vagus.Ingress.WSBridge.Upstream.start_link(args)
+      ref = Process.monitor(pid)
+
+      assert_receive {:raw_fake_addon_ready, fake_pid}, 5_000
+
+      # Buffered in `pending` — the upgrade hasn't completed (the fake is
+      # deliberately parked below, waiting for `:send_response`), so this
+      # can't reach the wire yet. Under the pre-fix ordering `flush_pending`
+      # ran BEFORE the leftover was decoded, so this frame would reach the
+      # add-on anyway, even though the very next bytes are a Close — an
+      # add-on-facing side effect the connection had no business performing
+      # on its way to stopping.
+      :ok = GenServer.call(pid, {:frame, :text, "queued-before-upgrade"})
+
+      send(fake_pid, :send_response)
+
+      assert_receive {:upstream_close, 4321, "bye"}, 5_000
+      assert_receive {:DOWN, ^ref, :process, ^pid, _reason}, 5_000
+
+      # The discriminating assertion. `terminate/2` best-effort sends its
+      # OWN close(1000) frame to the add-on on every stop where `upgraded?`
+      # was true — irrespective of this fix — so bytes arriving here at all
+      # is expected; what must never happen is the queued text frame
+      # arriving FIRST. Only a frame header's low nibble is needed to tell
+      # them apart (opcode 0x1 text vs 0x8 close).
+      assert_receive {:raw_fake_addon_after_upgrade, {:ok, <<first_byte, _rest::binary>>}}, 2_000
+      assert Bitwise.band(first_byte, 0x0F) == 0x08
+    end
+  end
+
   ## 8-9 (W3): Upstream driven directly — pending-buffer cap + upgrade
   ## deadline, against a raw listener that accepts but never upgrades.
 
@@ -697,6 +806,14 @@ defmodule Vagus.Ingress.WSBridgeTest do
       assert_receive {:echo_init, _path, _query}, 2_000
       :ok = GenServer.call(pid, {:frame, :text, "stall"}, 2_000)
 
+      # Round 8 fix: `{:echo_init, ...}` only proves the SERVER (add-on) side
+      # upgraded — under CPU starvation `Upstream`'s own (client-side)
+      # upgrade can still be pending when the priming "stall" call above
+      # lands, sending it into the pre-upgrade `pending` buffer instead of
+      # the post-upgrade path this test means to exercise. Waiting for the
+      # handler to actually report the frame closes that race.
+      assert_receive :echo_stalled, 30_000
+
       payload = :binary.copy(<<0>>, 256 * 1024)
       queue_lens = flood_until_wedged(pid, payload, [])
 
@@ -727,13 +844,19 @@ defmodule Vagus.Ingress.WSBridgeTest do
       }
 
       {:ok, pid} = Vagus.Ingress.WSBridge.Upstream.start_link(args)
+      ref = Process.monitor(pid)
 
-      assert_receive {:echo_init, _path, _query}, 2_000
-      :ok = GenServer.call(pid, {:frame, :text, "stall"}, 2_000)
+      # Generous per `Vagus.API.CoreProxyWSTest`'s `@recv_timeout` comment —
+      # same CI-scheduler-starvation history applies here.
+      assert_receive {:echo_init, _path, _query}, 30_000
+      :ok = GenServer.call(pid, {:frame, :text, "stall"}, 30_000)
+
+      # Round 8 fix — see the same comment in the test above.
+      assert_receive :echo_stalled, 30_000
 
       payload = :binary.copy(<<0>>, 256 * 1024)
 
-      assert flood_until_call_timeout(pid, payload) == :timeout
+      assert flood_until_call_timeout(pid, payload, ref) == :timeout
 
       # `pid` is left blocked inside a `:gen_tcp.send` that (by design, this
       # test's whole point) won't resolve on its own for 60s — clean it up
@@ -756,7 +879,7 @@ defmodule Vagus.Ingress.WSBridgeTest do
   defp flood_until_wedged(_pid, _payload, samples) when length(samples) >= 500, do: samples
 
   defp flood_until_wedged(pid, payload, samples) do
-    if mailbox_has_upstream_close?() do
+    if upstream_close_message() do
       samples
     else
       :ok = GenServer.call(pid, {:frame, :binary, payload}, 5_000)
@@ -772,21 +895,44 @@ defmodule Vagus.Ingress.WSBridgeTest do
   # socket buffering differing from the small-recbuf assumption), return
   # `:never_wedged` so the caller's assertion fails deterministically
   # instead of the test hanging until ExUnit's own timeout.
-  defp flood_until_call_timeout(_pid, _payload, remaining \\ 500)
+  #
+  # issue #1: a CI-only flake had `Upstream` already dead (`exit(:noproc,
+  # ...)`) almost immediately into the flood — every send-error path in
+  # `Upstream` stops `:normal` right after notifying `parent`, so a bare
+  # `(EXIT) no process` gave no clue which path fired. `ref` (the caller's
+  # monitor) turns that dead end into a diagnosis instead of a guess.
+  defp flood_until_call_timeout(_pid, _payload, _ref, remaining \\ 500)
 
-  defp flood_until_call_timeout(_pid, _payload, 0), do: :never_wedged
+  defp flood_until_call_timeout(_pid, _payload, _ref, 0), do: :never_wedged
 
-  defp flood_until_call_timeout(pid, payload, remaining) do
+  defp flood_until_call_timeout(pid, payload, ref, remaining) do
     GenServer.call(pid, {:frame, :binary, payload}, 200)
-    flood_until_call_timeout(pid, payload, remaining - 1)
+    flood_until_call_timeout(pid, payload, ref, remaining - 1)
   catch
-    :exit, {:timeout, _} -> :timeout
+    :exit, {:timeout, _} ->
+      :timeout
+
+    :exit, {:noproc, _} ->
+      down_reason =
+        receive do
+          {:DOWN, ^ref, :process, ^pid, reason} -> reason
+        after
+          1_000 -> :no_down_message_received
+        end
+
+      flunk("""
+      Upstream died mid-flood (exit :noproc) instead of the caller's call \
+      timing out — see the comment above `flood_until_call_timeout/4`.
+      completed flood iterations: #{500 - remaining}
+      monitor DOWN reason: #{inspect(down_reason)}
+      mailbox {:upstream_close, ...}: #{inspect(upstream_close_message())}
+      """)
   end
 
-  defp mailbox_has_upstream_close? do
+  defp upstream_close_message do
     case Process.info(self(), :messages) do
-      {:messages, msgs} -> Enum.any?(msgs, &match?({:upstream_close, 1011, ""}, &1))
-      nil -> false
+      {:messages, msgs} -> Enum.find(msgs, &match?({:upstream_close, _code, _reason}, &1))
+      nil -> nil
     end
   end
 
@@ -795,5 +941,82 @@ defmodule Vagus.Ingress.WSBridgeTest do
       {:message_queue_len, n} -> n
       nil -> 0
     end
+  end
+
+  # Starts a raw `:gen_tcp` listener standing in for the add-on's own HTTP
+  # server, accepts exactly one connection, and replies to the WS upgrade
+  # request with a 101 response glued to `extra` in a SINGLE
+  # `:gen_tcp.send/2` — the one write boundary no Bandit-backed fake in this
+  # file can produce, and the drain bug's exact trigger.
+  #
+  # `sync?: true` parks the fake right after parsing the request (sending
+  # `{:raw_fake_addon_ready, self()}` to this test process) until told
+  # `:send_response`, so a test can deterministically queue an `Upstream`
+  # frame into `pending` *before* the 101 (and its bundled leftover) can
+  # possibly arrive — otherwise the two would race. It then reports whatever
+  # (if anything) arrives afterward as `{:raw_fake_addon_after_upgrade,
+  # result}`, the discriminating signal for the Part A ordering test.
+  defp start_raw_fake_addon(opts) do
+    {:ok, listen} = :gen_tcp.listen(0, [:binary, active: false, reuseaddr: true])
+    {:ok, port} = :inet.port(listen)
+
+    extra = Keyword.fetch!(opts, :extra)
+    sync? = Keyword.get(opts, :sync?, false)
+    test_pid = self()
+
+    spawn_link(fn ->
+      {:ok, socket} = :gen_tcp.accept(listen, 5_000)
+      request = recv_raw_http_headers(socket, "")
+      accept = raw_ws_accept(extract_sec_websocket_key(request))
+
+      if sync? do
+        send(test_pid, {:raw_fake_addon_ready, self()})
+        receive(do: (:send_response -> :ok))
+      end
+
+      response =
+        "HTTP/1.1 101 Switching Protocols\r\n" <>
+          "Upgrade: websocket\r\n" <>
+          "Connection: Upgrade\r\n" <>
+          "Sec-WebSocket-Accept: #{accept}\r\n\r\n"
+
+      :ok = :gen_tcp.send(socket, response <> extra)
+
+      if sync? do
+        send(test_pid, {:raw_fake_addon_after_upgrade, :gen_tcp.recv(socket, 0, 2_000)})
+      end
+
+      :gen_tcp.close(socket)
+    end)
+
+    on_exit(fn -> :gen_tcp.close(listen) end)
+
+    port
+  end
+
+  defp recv_raw_http_headers(socket, acc) do
+    if String.contains?(acc, "\r\n\r\n") do
+      acc
+    else
+      {:ok, data} = :gen_tcp.recv(socket, 0, 5_000)
+      recv_raw_http_headers(socket, acc <> data)
+    end
+  end
+
+  defp extract_sec_websocket_key(request) do
+    [_, key] = Regex.run(~r/[Ss]ec-[Ww]eb[Ss]ocket-[Kk]ey:\s*([^\r\n]+)/, request)
+    key
+  end
+
+  defp raw_ws_accept(key) do
+    :crypto.hash(:sha, key <> "258EAFA5-E914-47DA-95CA-C5AB0DC85B11") |> Base.encode64()
+  end
+
+  # Server->client frames are unmasked (RFC 6455 §5.1) — small enough
+  # payloads here that the 1-byte length form always applies.
+  defp raw_text_frame(payload), do: <<0x81, byte_size(payload)>> <> payload
+
+  defp raw_close_frame(code, reason) do
+    <<0x88, 2 + byte_size(reason)>> <> <<code::16>> <> reason
   end
 end

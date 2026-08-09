@@ -68,7 +68,10 @@ defmodule Vagus.Core.EventPusher.SocketConnection do
           status: Mint.Types.status() | nil,
           resp_headers: Mint.Types.headers(),
           websocket: Mint.WebSocket.t() | nil,
-          upgraded?: boolean()
+          upgraded?: boolean(),
+          # Raw bytes from `{:data, ^ref, _}` responses seen while
+          # `upgraded?: false` — see `process_response/2`'s `:done` clause.
+          pre_upgrade_data: binary()
         }
 
   @doc """
@@ -102,7 +105,8 @@ defmodule Vagus.Core.EventPusher.SocketConnection do
          status: nil,
          resp_headers: [],
          websocket: nil,
-         upgraded?: false
+         upgraded?: false,
+         pre_upgrade_data: <<>>
        }}
     else
       {:error, reason} ->
@@ -168,6 +172,20 @@ defmodule Vagus.Core.EventPusher.SocketConnection do
     Application.get_env(:vagus, :core_ws_send_timeout, @default_send_timeout_ms)
   end
 
+  # Reaches into Mint.HTTP1's own struct on purpose (see `process_response/2`'s
+  # `:done` clause) — guarded so an upstream struct change degrades to a no-op
+  # (treated as "no leftover", `conn` returned untouched) rather than
+  # crashing. Clears the buffer in the same step it's read: on a
+  # `{:tcp_closed, _}` message `Mint.WebSocket.stream/2` falls through to
+  # `Mint.HTTP.stream/2`, which WOULD consult a stale buffer and could
+  # surface a bogus HTTP parse error in place of a clean close.
+  defp take_mint_http1_leftover(conn) do
+    case conn do
+      %{buffer: bin} when is_binary(bin) and bin != <<>> -> {bin, %{conn | buffer: <<>>}}
+      _ -> {<<>>, conn}
+    end
+  end
+
   defp process_responses([], state), do: {:noreply, state}
 
   defp process_responses([response | rest], state) do
@@ -185,13 +203,43 @@ defmodule Vagus.Core.EventPusher.SocketConnection do
     {:continue, %{state | resp_headers: headers}}
   end
 
+  # mint_web_socket's post-`new/4` stream takes over the raw transport and
+  # never revisits Mint.HTTP1's own parse buffer — Core's first frame,
+  # bundled with (or immediately behind) the 101 response, would be stranded
+  # there forever unless drained here, once, right after `new/4`. It can also
+  # reach us as an ordinary `{:data, ^ref, _}` response *before* this `:done`
+  # in the very same batch (Mint.HTTP1 treats a 101's body as "whatever's
+  # left in this read", RFC7230-legal since a 101 has no framed body) —
+  # `pre_upgrade_data` (accumulated below, `upgraded?: false`) catches that
+  # case, since `conn`'s own buffer is already empty by the time the bytes
+  # were parsed out as that `:data` response.
   defp process_response({:done, ref}, %{ref: ref, upgraded?: false} = state) do
     case Mint.WebSocket.new(state.conn, ref, state.status, state.resp_headers) do
       {:ok, conn, websocket} ->
-        # Implicitly authenticated: both signals at once (see moduledoc).
-        send(state.manager, {:event_pusher_connection, :connected, self()})
-        send(state.manager, {:event_pusher_connection, :ready, self()})
-        {:continue, %{state | conn: conn, websocket: websocket, upgraded?: true}}
+        {buffered, conn} = take_mint_http1_leftover(conn)
+        leftover = state.pre_upgrade_data <> buffered
+        upgraded = %{state | conn: conn, websocket: websocket, upgraded?: true}
+
+        decoded =
+          case leftover do
+            <<>> -> {:continue, upgraded}
+            bin -> process_response({:data, ref, bin}, upgraded)
+          end
+
+        # Decode the leftover BEFORE announcing readiness — implicit auth
+        # means both signals fire at once (see moduledoc), but only once
+        # decoding confirms the connection is actually usable; a Close or
+        # malformed leftover must stop it without ever announcing
+        # :connected/:ready to the manager.
+        case decoded do
+          {:continue, state} ->
+            send(state.manager, {:event_pusher_connection, :connected, self()})
+            send(state.manager, {:event_pusher_connection, :ready, self()})
+            {:continue, state}
+
+          {:stop, state} ->
+            {:stop, state}
+        end
 
       {:error, conn, reason} ->
         Logger.warning(
@@ -200,6 +248,13 @@ defmodule Vagus.Core.EventPusher.SocketConnection do
 
         {:stop, %{state | conn: conn}}
     end
+  end
+
+  # Pre-upgrade: see the `:done` clause's comment on `pre_upgrade_data` —
+  # nothing to decode with yet (no `websocket` codec state exists until
+  # `new/4` runs), so just accumulate in arrival order.
+  defp process_response({:data, ref, data}, %{ref: ref, upgraded?: false} = state) do
+    {:continue, %{state | pre_upgrade_data: state.pre_upgrade_data <> data}}
   end
 
   defp process_response({:data, ref, data}, %{ref: ref, upgraded?: true} = state) do

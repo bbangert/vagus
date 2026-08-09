@@ -111,3 +111,14 @@ config :vagus, :store_asset_mode, :memory
 # silently reporting some other board. Pinned here so the suite has a known
 # value to assert against. See config/rpi3_64.exs and config/dragon_q6a.exs.
 config :vagus, :machine, "raspberrypi3-64"
+
+# issue #1: production-sized WS deadlines (10s/5s) fire mid-test on a
+# CPU-starved CI runner once wall-clock stretches past them — the bridges
+# then correctly stamp their 1011 abnormal-loss close, just earlier than the
+# test expected. 60s outlasts any starved test; individual tests still
+# `put_env` their own small overrides to exercise the deadline paths.
+config :vagus, :core_ws_auth_timeout, 60_000
+config :vagus, :core_ws_handoff_timeout, 60_000
+config :vagus, :core_ws_send_timeout, 60_000
+config :vagus, :ingress_ws_handoff_timeout, 60_000
+config :vagus, :ingress_ws_send_timeout, 60_000

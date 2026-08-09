@@ -70,7 +70,10 @@ defmodule Vagus.Core.EventPusher.SocketConnectionTest.FakeCore do
 
   get "/api/websocket" do
     test_pid = Application.fetch_env!(:vagus, :event_pusher_socket_test_pid)
-    WebSockAdapter.upgrade(conn, Handler, %{test_pid: test_pid}, timeout: 30_000)
+    # 30s raced this fake's own idle-close under CI starvation, and tests
+    # exercising a wedged/idle connection can legitimately go quiet for that
+    # long or more; 900_000 matches the production listeners' own idle bound.
+    WebSockAdapter.upgrade(conn, Handler, %{test_pid: test_pid}, timeout: 900_000)
   end
 
   match _ do
