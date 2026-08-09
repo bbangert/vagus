@@ -59,7 +59,7 @@ defmodule Vagus.Core.Transport do
 
   require Logger
 
-  alias Vagus.Core.Container
+  alias Vagus.Core.{Container, Reserved}
 
   @typedoc """
   A resolved transport: the unix socket path, or the TCP base URL to prefix
@@ -184,29 +184,75 @@ defmodule Vagus.Core.Transport do
 
   @doc """
   Builds a `Finch.Request` for `path` (an absolute path, query string
-  included) on `transport`.
+  included) on `transport`, speaking as the Supervisor on behalf of `origin`.
+
+  `origin` has no default on purpose. Whichever branch this function takes,
+  the request that comes out is Supervisor-privileged — the socket
+  authenticates by connection, the TCP leg by the bearer its caller attaches
+  — so this is the point where Vagus's authority is conferred on somebody
+  else's request, and every call site has to say whose request it is:
+
+    * `:internal` — Vagus acting for itself (`Vagus.Core.Client`,
+      `Vagus.Core.Health`, `Vagus.Core.HttpConfig`). Core's reserved
+      `/api/hassio*` namespace is legitimately ours to call; `Vagus.Auth`
+      validating an add-on login against `/api/hassio_auth` is the whole
+      point of it.
+    * `:proxied` — `Vagus.API.CoreProxy` relaying an add-on's own request.
+      Reserved paths raise `Vagus.Core.Reserved.Error` rather than being
+      built, because reaching them this way is the confused-deputy bug
+      `Vagus.Core.Reserved` documents.
+
+  A new default would silently make the escalating case the easy one, so
+  there isn't one: a call site added tomorrow does not compile until it
+  decides. That is the property the check is here for at all —
+  `Vagus.API.Dispatcher` already refuses these paths with a proper 403 long
+  before this function sees them, so this branch is unreachable unless
+  routing regresses or a future leg reaches Core without passing through the
+  dispatcher.
   """
+  @type origin :: :internal | :proxied
+
   @spec build(
           t(),
+          origin(),
           Finch.Request.method(),
           String.t(),
           Finch.Request.headers(),
           Finch.Request.body()
         ) ::
           Finch.Request.t()
-  def build(transport, method, path, headers \\ [], body \\ nil)
+  def build(transport, origin, method, path, headers \\ [], body \\ nil)
 
-  def build({:socket, socket}, method, path, headers, body) do
+  def build(transport, :proxied, method, path, headers, body) do
+    if Reserved.path?(path), do: raise(Reserved.Error, path: path)
+
+    build(transport, :internal, method, path, headers, body)
+  end
+
+  def build({:socket, socket}, :internal, method, path, headers, body) do
     Finch.build(method, @socket_origin <> path, headers, body, unix_socket: socket)
   end
 
-  def build({:tcp, base_url}, method, path, headers, body) do
+  def build({:tcp, base_url}, :internal, method, path, headers, body) do
     Finch.build(method, base_url <> path, headers, body)
   end
 
   @doc """
   `Mint.HTTP.connect/4`'s first three arguments for `transport` — the unix
   socket is an ordinary Mint address (`{:local, path}` on port 0).
+
+  Takes no `origin` deliberately, unlike `build/6`: the WS legs
+  (`Vagus.API.CoreProxy.WSBridge.Upstream` proxied, `Vagus.Core.EventPusher`
+  internal) address Core by typed command messages, not by path, so there is
+  no path here for `Vagus.Core.Reserved` to judge and a tag would be a
+  parameter that never decides anything.
+
+  That does NOT mean the WS leg is unguarded, and it emphatically does not
+  mean Core guards it: Core's `supervisor/*` commands gate on "is this the
+  Supervisor user", which a proxied frame truthfully IS, so the credential
+  swap satisfies the check rather than failing it. The reservation is
+  enforced one layer up instead, per relayed frame, by
+  `Vagus.API.CoreProxy.WSBridge`'s `reserved_command/1`.
   """
   @spec connect_args(t()) :: {Mint.Types.scheme(), Mint.Types.address(), :inet.port_number()}
   def connect_args({:socket, socket}), do: {:http, {:local, socket}, 0}

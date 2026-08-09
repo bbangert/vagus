@@ -115,7 +115,7 @@ defmodule Vagus.Core.Health do
       if url do
         Finch.build(:get, url)
       else
-        Transport.build(Transport.current(), :get, @probe_path)
+        Transport.build(Transport.current(), :internal, :get, @probe_path)
       end
 
     case Finch.request(request, finch, receive_timeout: @default_probe_timeout) do

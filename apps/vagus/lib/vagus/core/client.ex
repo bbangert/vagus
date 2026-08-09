@@ -229,6 +229,7 @@ defmodule Vagus.Core.Client do
     request =
       Transport.build(
         transport(state),
+        :internal,
         :post,
         "/auth/token",
         [{"content-type", "application/x-www-form-urlencoded"}],
@@ -274,7 +275,14 @@ defmodule Vagus.Core.Client do
 
   defp do_request(transport, method, path, headers, body, token, state) do
     request =
-      Transport.build(transport, method, path, auth_headers(transport, headers, token), body)
+      Transport.build(
+        transport,
+        :internal,
+        method,
+        path,
+        auth_headers(transport, headers, token),
+        body
+      )
 
     case Finch.request(request, state.finch_name) do
       {:ok, response} -> {:ok, response, state}
