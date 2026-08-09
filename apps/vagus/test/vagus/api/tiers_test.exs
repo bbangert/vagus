@@ -300,9 +300,8 @@ defmodule Vagus.API.TiersTest do
 
   # Upstream's `BLACKLIST` (security review finding, phase 8): refused for
   # every caller regardless of token or tier, checked before `required/1` is
-  # even consulted. Vagus has no Core-API proxy yet, so nothing serves these
-  # paths — the predicate exists so a proxy landing tomorrow inherits the deny
-  # rather than opening it by default.
+  # even consulted. Now expressed as `Vagus.Core.Reserved`'s namespace
+  # reservation rather than a list of paths — see that module for why.
   describe "blacklisted?/1" do
     test "the two upstream families are blacklisted, with or without a suffix" do
       assert Tiers.blacklisted?(["core", "api", "hassio"])
@@ -312,12 +311,42 @@ defmodule Vagus.API.TiersTest do
       assert Tiers.blacklisted?(["homeassistant", "api", "hassio", "x"])
     end
 
-    test "a near-miss is not blacklisted — the pattern is narrow, not a prefix match" do
+    # The upstream account-takeover: `hassio_auth` is a sibling VIEW of
+    # `hassio`, not a path under it, so a deny that matched `hassio/` let an
+    # add-on reset any HA user's password — owner included — through the
+    # proxy, as the Supervisor. Whole-namespace matching is what closes it.
+    test "the `hassio_`-prefixed views are blacklisted too, not just `hassio/`" do
+      assert Tiers.blacklisted?(["core", "api", "hassio_auth"])
+      assert Tiers.blacklisted?(["core", "api", "hassio_auth", "password_reset"])
+      assert Tiers.blacklisted?(["homeassistant", "api", "hassio_auth"])
+      assert Tiers.blacklisted?(["homeassistant", "api", "hassio_auth", "password_reset"])
+      assert Tiers.blacklisted?(["core", "api", "hassio_push", "discovery", "uuid"])
+      assert Tiers.blacklisted?(["core", "api", "hassio_ingress", "token", "path"])
+    end
+
+    # Deliberately wider than upstream's `hassio(?:/|_)`: the whole prefix is
+    # reserved, so a view Core has not shipped yet is refused on the day it
+    # ships rather than the day somebody notices.
+    test "an unshipped `hassio`-prefixed view is blacklisted by the reservation alone" do
+      assert Tiers.blacklisted?(["core", "api", "hassiofoo"])
+      assert Tiers.blacklisted?(["core", "api", "hassio_not_invented_yet", "x"])
+    end
+
+    test "a near-miss is not blacklisted — the reservation starts at Core's view name" do
       refute Tiers.blacklisted?(["core", "api", "other"])
       refute Tiers.blacklisted?(["core", "apixhassio"])
       refute Tiers.blacklisted?(["core", "api"])
       refute Tiers.blacklisted?(["homeassistant", "api", "other"])
       refute Tiers.blacklisted?([])
+
+      # `hassio` is only reserved as Core's view name, i.e. straight after
+      # `api` — deeper down it is an ordinary path segment on an ordinary
+      # Core endpoint, and refusing those would break real add-ons.
+      refute Tiers.blacklisted?(["core", "api", "states", "sensor.hassio_cpu"])
+      refute Tiers.blacklisted?(["core", "api", "config", "hassio_auth"])
+
+      # Not a proxy family: `/supervisor/...` and friends never reach Core.
+      refute Tiers.blacklisted?(["supervisor", "api", "hassio_auth"])
     end
   end
 

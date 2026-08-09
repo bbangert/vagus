@@ -186,7 +186,7 @@ defmodule Vagus.API.CoreProxyTest do
 
   alias Vagus.Addon.Registry
   alias Vagus.API.CoreProxyTest.{FakeCore, HitCounter, Recorder, Script, SSEGate}
-  alias Vagus.API.{Dispatcher, Token}
+  alias Vagus.API.{CoreProxy, Dispatcher, Token}
 
   @opts Dispatcher.init([])
   @client_finch Vagus.API.CoreProxyTest.ClientFinch
@@ -242,8 +242,8 @@ defmodule Vagus.API.CoreProxyTest do
     port
   end
 
-  defp call(method, path, headers \\ []) do
-    conn = Plug.Test.conn(method, path)
+  defp call(method, path, headers \\ [], body \\ nil) do
+    conn = Plug.Test.conn(method, path, body)
     conn = Enum.reduce(headers, conn, fn {k, v}, c -> Plug.Conn.put_req_header(c, k, v) end)
     Dispatcher.call(conn, @opts)
   end
@@ -373,6 +373,63 @@ defmodule Vagus.API.CoreProxyTest do
       assert HitCounter.count() == 0
     end
 
+    # The upstream add-on → owner account takeover, end to end: an add-on
+    # holding `homeassistant_api: true` POSTs a new password for any HA user
+    # and, because this proxy speaks to Core as the Supervisor, Core's
+    # `HassIOPasswordReset` applies it with no owner check of its own. A deny
+    # matching `hassio/` alone never saw this path — `hassio_auth` is a
+    # sibling view, not a child. Fake Core must never be hit.
+    test "POST /core/api/hassio_auth/password_reset -> 403, fake Core never hit" do
+      token = addon_token("cp_blacklist_password_reset", %{homeassistant_api: true})
+
+      conn =
+        call(:post, "/core/api/hassio_auth/password_reset", [bearer(token)], %{
+          "username" => "owner",
+          "password" => "attacker"
+        })
+
+      assert conn.status == 403
+      assert Jason.decode!(conn.resp_body) == %{"result" => "error", "message" => "unauthorized"}
+      assert HitCounter.count() == 0
+    end
+
+    test "GET /core/api/hassio_auth (the password oracle) -> 403, fake Core never hit" do
+      token = addon_token("cp_blacklist_hassio_auth", %{homeassistant_api: true})
+      conn = call(:get, "/core/api/hassio_auth", [bearer(token)])
+
+      assert conn.status == 403
+      assert HitCounter.count() == 0
+    end
+
+    test "GET /homeassistant/api/hassio_auth -> 403, fake Core never hit" do
+      token = addon_token("cp_blacklist_ha_hassio_auth", %{homeassistant_api: true})
+      conn = call(:get, "/homeassistant/api/hassio_auth", [bearer(token)])
+
+      assert conn.status == 403
+      assert HitCounter.count() == 0
+    end
+
+    # The backstop, exercised the only way it can be: by SKIPPING the
+    # dispatcher and handing this module the request directly, which is what
+    # a routing regression — or a future leg that reaches Core without going
+    # through `Vagus.API.Dispatcher` — would amount to. Everything up to the
+    # credential resolves normally (real token, `homeassistant_api: true`,
+    # healthy Core); `Vagus.Core.Transport.build/6` refuses at the point the
+    # request would be built as `:proxied`, so Core is still never hit.
+    test "reaching this module directly with a reserved path raises rather than proxying" do
+      token = addon_token("cp_reserved_backstop", %{homeassistant_api: true})
+
+      conn =
+        Plug.Test.conn(:post, "/core/api/hassio_auth/password_reset", %{
+          "username" => "owner",
+          "password" => "attacker"
+        })
+        |> Plug.Conn.put_req_header("authorization", "Bearer #{token}")
+
+      assert_raise Vagus.Core.Reserved.Error, fn -> CoreProxy.call(conn, CoreProxy.init([])) end
+      assert HitCounter.count() == 0
+    end
+
     # security review Blocker: `%68assio` percent-decodes to `hassio`, which
     # is exactly the segment the blacklist exists to deny. A literal-segment
     # match alone lets this straight through to Core with the Supervisor's
@@ -423,6 +480,21 @@ defmodule Vagus.API.CoreProxyTest do
       assert conn.status == 200
       assert HitCounter.count() == 1
       assert Recorder.last().path == "/api/st%61tes"
+    end
+
+    # The other positive control, for the widening from `hassio/` to the
+    # whole `hassio*` namespace: the reservation covers Core's VIEW name —
+    # the segment straight after `api` — and nothing deeper. An entity whose
+    # id happens to start with `hassio` is an ordinary state on an ordinary
+    # endpoint, and a rule that refused it would break real add-ons for a
+    # substring match.
+    test "GET /core/api/states/sensor.hassio_cpu still proxies through — `hassio` deeper in the path is ordinary" do
+      token = addon_token("cp_reserved_false_positive", %{homeassistant_api: true})
+      conn = call(:get, "/core/api/states/sensor.hassio_cpu", [bearer(token)])
+
+      assert conn.status == 200
+      assert HitCounter.count() == 1
+      assert Recorder.last().path == "/api/states/sensor.hassio_cpu"
     end
 
     # `URI.decode/1` is lenient — a bare, dangling `%` with no following hex

@@ -59,16 +59,26 @@ defmodule Vagus.API.CoreProxy do
   `homeassistant_api: true` acts on Core's REST API **as the Supervisor**,
   i.e. with admin rights, regardless of what tier that add-on would otherwise
   hold. That is the entire reason `Vagus.API.Tiers.blacklisted?/1` denies
-  `/core/api/hassio/.*` and `/homeassistant/api/hassio/.*` (PR #34, landed
-  before this feature so the deny could not be forgotten): those two paths are
-  Core's own proxy *back* into the Supervisor API, called with Core's
-  supervisor token, and this module has no idea it's blacklisted — that check
-  runs entirely in `Vagus.API.Dispatcher` (`dispatch_core_proxy/2`), BEFORE
-  this module is ever reached, using the same `Vagus.API.Auth`-shaped 403 every
-  other blacklisted request gets. If a blacklisted path somehow arrived here,
-  this module would proxy it to Core with an admin credential and let a
-  caller loop straight back into the Supervisor API as Core — this module
-  performs no blacklist check of its own and must never be handed one.
+  Core's whole `/api/hassio…` namespace (PR #34, landed before this feature so
+  the deny could not be forgotten; widened from the two literal `hassio/`
+  paths to the namespace after the upstream `hassio_auth/password_reset`
+  account-takeover — see `Vagus.Core.Reserved`). This module still has no idea
+  a path is blacklisted: that check runs entirely in `Vagus.API.Dispatcher`
+  (`dispatch_core_proxy/2`), BEFORE this module is ever reached, using the same
+  `Vagus.API.Auth`-shaped 403 every other blacklisted request gets, and it
+  stays there — a second policy check *here* would be the same rule
+  reimplemented in a second place, free to drift.
+
+  What DOES back it up is one layer further in, at
+  `Vagus.Core.Transport.build/6`: this module builds its request with
+  `origin: :proxied`, and a reserved path built under that tag raises rather
+  than reaching Core. That is not a policy decision duplicated — it is the
+  same rule asserted where Vagus's credential is actually conferred, so a
+  routing regression, or some future leg that reaches Core without passing
+  through `Vagus.API.Dispatcher` at all, fails loudly instead of silently
+  handing an add-on the Supervisor's identity. Upstream reached the same
+  shape from the other direction, adding a `CORE_API_DENY` guard inside
+  `APIProxy.api` after its own blacklist proved to have a hole in it.
 
   ## Response handling: buffer, SSE-stream, or the dedicated `/stream` leg (facts 6, 7)
 
@@ -460,7 +470,7 @@ defmodule Vagus.API.CoreProxy do
     {conn, body, ref} = build_request_body(conn)
     path = build_path(rest, conn.query_string)
     headers = build_request_headers(conn, credential)
-    request = Transport.build(transport, conn.method, path, headers, body)
+    request = Transport.build(transport, :proxied, conn.method, path, headers, body)
     stream_route? = rest == ["stream"]
 
     acc = %{

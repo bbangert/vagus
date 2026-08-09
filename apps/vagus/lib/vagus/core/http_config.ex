@@ -221,7 +221,7 @@ defmodule Vagus.Core.HttpConfig do
   end
 
   defp fetch(transport, opts) do
-    request = Transport.build(transport, :get, @endpoint)
+    request = Transport.build(transport, :internal, :get, @endpoint)
     acc = %{status: nil, body: [], size: 0}
 
     stream =

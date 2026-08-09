@@ -59,7 +59,9 @@ defmodule Vagus.API.Dispatcher do
   through to `Router` like any other unmatched path — also go through
   `dispatch_core_proxy/2` to `Vagus.API.CoreProxy`. The blacklist check there
   is a no-op for these paths (`Vagus.API.Tiers.blacklisted?/1` only matches
-  `.../hassio/.*`), but routing every `core`/`homeassistant` path through the
+  Core's `/api/hassio…` namespace, and a WS caller addresses Core by typed
+  command rather than by path at all), but routing every `core`/`homeassistant`
+  path through the
   one `dispatch_core_proxy/2` entry point — rather than adding a second,
   blacklist-free path just for WS — is the point: one place decides
   "blacklisted or not" for this whole route family, so a future addition
@@ -249,18 +251,18 @@ defmodule Vagus.API.Dispatcher do
   # literal-segment match alone, a caller could smuggle an encoded `hassio`
   # segment straight past the deny — `GET /core/api/%68assio/config` or
   # `GET /core/api/hassio%2fconfig` — only to have Core's own aiohttp
-  # percent-decode it back to `/api/hassio/...` and re-enter the Supervisor
-  # API as Core/admin, exactly the loop-back the blacklist exists to stop
-  # (security review Blocker).
+  # percent-decode it back to `/api/hassio/...` and reach Core's private
+  # Supervisor RPC surface wearing OUR identity, exactly what the blacklist
+  # exists to stop (security review Blocker).
   #
   # Checked against BOTH the raw and the decoded-then-resplit form. Raw
   # catches the plain, unencoded `hassio` segment (what the existing tests
   # already cover). Decoded catches every encoded spelling of it, INCLUDING
   # an encoded slash (`%2f`), which decoding segment-by-segment would miss:
-  # a single decoded segment `"hassio/config"` does not match
-  # `["core","api","hassio",:*]`, but decoding the WHOLE path and
+  # a single decoded segment `"hassio/config"` is not the `hassio` segment
+  # `Vagus.Core.Reserved.view?/1` looks for, but decoding the WHOLE path and
   # re-splitting on "/" yields `["core","api","hassio","config"]`, which
-  # does — that is the entire reason this decodes the joined path rather
+  # is — that is the entire reason this decodes the joined path rather
   # than mapping `URI.decode/1` over `path_info` directly. Decoded exactly
   # ONCE: `URI.decode/1` is lenient (an invalid `%zz` escape is left
   # as-is, never raises) and, being a single pass, agrees with aiohttp/

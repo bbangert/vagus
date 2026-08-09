@@ -213,9 +213,10 @@ defmodule Vagus.Core.TransportTest do
     end
   end
 
-  describe "build/5" do
+  describe "build/6" do
     test "TCP prefixes the base URL" do
-      request = Transport.build({:tcp, "http://core.invalid:8123"}, :get, "/api/states?x=1")
+      request =
+        Transport.build({:tcp, "http://core.invalid:8123"}, :internal, :get, "/api/states?x=1")
 
       assert request.host == "core.invalid"
       assert request.port == 8123
@@ -225,13 +226,58 @@ defmodule Vagus.Core.TransportTest do
     end
 
     test "socket keeps the path verbatim and dials the socket" do
-      request = Transport.build({:socket, "/run/x.sock"}, :post, "/api/states?x=1", [], "body")
+      request =
+        Transport.build({:socket, "/run/x.sock"}, :internal, :post, "/api/states?x=1", [], "body")
 
       assert request.unix_socket == "/run/x.sock"
       assert request.scheme == :http
       assert request.path == "/api/states"
       assert request.query == "x=1"
       assert request.body == "body"
+    end
+
+    test "an ordinary path builds the same request either way" do
+      internal = Transport.build({:socket, "/run/x.sock"}, :internal, :get, "/api/states")
+      proxied = Transport.build({:socket, "/run/x.sock"}, :proxied, :get, "/api/states")
+
+      assert internal == proxied
+    end
+  end
+
+  # `Vagus.API.Dispatcher` answers these with a 403 long before a request is
+  # built, so reaching here at all means routing regressed — see
+  # `Vagus.Core.Reserved`. The raise is the backstop, not the policy.
+  describe "build/6 refuses Core's reserved namespace to a proxied caller" do
+    test "the account-takeover path raises" do
+      assert_raise Vagus.Core.Reserved.Error, ~r{/api/hassio_auth/password_reset}, fn ->
+        Transport.build(
+          {:socket, "/run/x.sock"},
+          :proxied,
+          :post,
+          "/api/hassio_auth/password_reset"
+        )
+      end
+    end
+
+    test "an encoded spelling raises too — decoded once, like Core decodes it" do
+      for path <- ["/api/%68assio_auth", "/api/hassio%2fapp", "/api/hassio_auth?x=1"] do
+        assert_raise Vagus.Core.Reserved.Error, fn ->
+          Transport.build({:socket, "/run/x.sock"}, :proxied, :get, path)
+        end
+      end
+    end
+
+    test "double-encoding does not sneak past — `%2568` stays `%68` on both sides" do
+      request = Transport.build({:socket, "/run/x.sock"}, :proxied, :get, "/api/%2568assio_auth")
+
+      assert request.path == "/api/%2568assio_auth"
+    end
+
+    test "the same paths are still ours to call internally" do
+      request =
+        Transport.build({:socket, "/run/x.sock"}, :internal, :post, "/api/hassio_auth")
+
+      assert request.path == "/api/hassio_auth"
     end
   end
 
@@ -276,7 +322,7 @@ defmodule Vagus.Core.TransportTest do
 
       response =
         {:socket, path}
-        |> Transport.build(:get, "/api/states?filter=a%2Fb")
+        |> Transport.build(:internal, :get, "/api/states?filter=a%2Fb")
         |> Finch.request(__MODULE__.Finch)
 
       assert {:ok, %Finch.Response{status: 200, body: body}} = response
