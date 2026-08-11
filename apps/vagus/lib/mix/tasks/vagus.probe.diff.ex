@@ -12,7 +12,9 @@ defmodule Mix.Tasks.Vagus.Probe.Diff do
   scripts is what keeps that true.
 
   Prints each divergence grouped by top-level section and exits non-zero when
-  there is any, so it can gate a capture as well as be read by hand.
+  there is any, so it can gate a capture as well as be read by hand. Values on a
+  credential-shaped path are withheld from the output; the divergence itself is
+  still reported.
   """
 
   use Mix.Task
@@ -20,6 +22,8 @@ defmodule Mix.Tasks.Vagus.Probe.Diff do
   alias Vagus.ProbeParity.Canon
 
   @default_allowlist "test/fixtures/haos-container-fingerprint.volatile.json"
+
+  @credential_key ~r/token|secret|password|private|key|cookie|credential/i
 
   @impl Mix.Task
   def run(argv) do
@@ -30,7 +34,11 @@ defmodule Mix.Tasks.Vagus.Probe.Diff do
     # Canon lives in :vagus, so the app has to be compiled and configured before
     # it can be called; nothing here needs the supervision tree running.
     Mix.Task.run("app.config")
-    {:ok, _started} = Application.ensure_all_started(:jason)
+
+    case Application.ensure_all_started(:jason) do
+      {:ok, _started} -> :ok
+      {:error, reason} -> Mix.raise("cannot start :jason: #{inspect(reason)}")
+    end
 
     allowlist = Canon.load_allowlist!(opts[:volatile] || default_allowlist())
 
@@ -60,9 +68,15 @@ defmodule Mix.Tasks.Vagus.Probe.Diff do
   end
 
   defp read!(file) do
-    case File.read(file) do
-      {:ok, body} -> Jason.decode!(body)
-      {:error, reason} -> Mix.raise("cannot read #{file}: #{inspect(reason)}")
+    with {:ok, body} <- File.read(file),
+         {:ok, capture} <- Jason.decode(body) do
+      capture
+    else
+      {:error, %Jason.DecodeError{} = error} ->
+        Mix.raise("cannot parse #{file}: #{Exception.message(error)}")
+
+      {:error, reason} ->
+        Mix.raise("cannot read #{file}: #{inspect(reason)}")
     end
   end
 
@@ -80,13 +94,25 @@ defmodule Mix.Tasks.Vagus.Probe.Diff do
     Mix.raise("#{length(divergences)} divergence(s)")
   end
 
-  defp section(%{path: path}), do: path |> String.split("/", parts: 2) |> hd()
+  defp section(%{path: [section | _rest]}), do: section
+  defp section(%{path: []}), do: ""
 
   defp format(divergence, left, right) do
     """
-      #{divergence.path}
-        #{Path.basename(left)}: #{inspect(divergence.left)}
-        #{Path.basename(right)}: #{inspect(divergence.right)}\
+      #{Canon.path_to_string(divergence.path)}
+        #{Path.basename(left)}: #{value(divergence.path, divergence.left)}
+        #{Path.basename(right)}: #{value(divergence.path, divergence.right)}\
     """
+  end
+
+  # The probe redacts credential-shaped env values at capture time, so this only
+  # bites on a hand-made or future capture that skipped that: such a leaf is
+  # still reported as diverging, just without printing what it diverged to.
+  defp value(path, value) do
+    cond do
+      value == :absent -> ":absent"
+      Enum.any?(path, &(&1 =~ @credential_key)) -> "<withheld>"
+      true -> inspect(value)
+    end
   end
 end

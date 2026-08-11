@@ -15,6 +15,20 @@ defmodule Vagus.ProbeParity.Canon do
   `mounts` sorted by target and `interfaces` sorted by name; re-sorting here
   keeps a hand-edited or hand-merged fixture comparable, since list positions are
   part of the diff path.
+
+  ## Paths and patterns
+
+  Captures contain keys that are themselves paths — `well_known` is keyed by
+  `"/data"`, `"/ssl"` — so a slash-joined string cannot be split back into the
+  segments it came from. Paths are therefore lists of segments everywhere in
+  this API, including `t:divergence/0`; `path_to_string/1` renders one for
+  display and is deliberately one-way.
+
+  Allowlist patterns stay slash-separated strings, because the allowlist file is
+  human-authored. One pattern segment matches one whole key, which means a key
+  containing a slash is only reachable through `*`: `well_known/*/mode`, never
+  `well_known//data/mode`. Rather than leave that as a pattern that silently
+  matches nothing, an empty segment is rejected at load time.
   """
 
   @sentinel "<volatile>"
@@ -27,13 +41,20 @@ defmodule Vagus.ProbeParity.Canon do
     ["fingerprint", "interfaces"] => "name"
   }
 
+  @type path :: [String.t()]
   @type entry :: %{path: String.t(), reason: String.t()}
   @type allowlist :: [entry | String.t()]
-  @type divergence :: %{path: String.t(), left: term(), right: term()}
+  @type divergence :: %{path: path(), left: term(), right: term()}
 
   @doc "The value every allowlisted field is replaced with."
   @spec sentinel() :: String.t()
   def sentinel, do: @sentinel
+
+  @doc """
+  Renders a path for humans. One-way: a segment may itself contain a slash.
+  """
+  @spec path_to_string(path()) :: String.t()
+  def path_to_string(path), do: Enum.join(path, "/")
 
   @doc """
   Reads a volatile-field allowlist: a JSON list of `{"path": ..., "reason": ...}`.
@@ -44,7 +65,7 @@ defmodule Vagus.ProbeParity.Canon do
   """
   @spec load_allowlist!(Path.t()) :: [entry]
   def load_allowlist!(file) do
-    case file |> File.read!() |> Jason.decode!() do
+    case decode!(file) do
       entries when is_list(entries) -> Enum.map(entries, &entry!(&1, file))
       other -> raise ArgumentError, "#{file}: expected a JSON list, got #{inspect(other)}"
     end
@@ -60,7 +81,7 @@ defmodule Vagus.ProbeParity.Canon do
   """
   @spec canonicalize(map(), allowlist()) :: map()
   def canonicalize(capture, allowlist) when is_map(capture) do
-    walk(capture, [], Enum.map(allowlist, &segments/1))
+    walk(capture, [], Enum.map(allowlist, &pattern!/1))
   end
 
   @doc """
@@ -74,9 +95,8 @@ defmodule Vagus.ProbeParity.Canon do
     left_leaves = leaves(left)
     right_leaves = leaves(right)
 
-    left_leaves
-    |> Map.merge(right_leaves)
-    |> Map.keys()
+    (Map.keys(left_leaves) ++ Map.keys(right_leaves))
+    |> Enum.uniq()
     |> Enum.sort()
     |> Enum.flat_map(fn path ->
       left_value = Map.get(left_leaves, path, :absent)
@@ -93,7 +113,7 @@ defmodule Vagus.ProbeParity.Canon do
     cond do
       String.trim(path) == "" -> raise ArgumentError, "#{file}: entry with a blank path"
       String.trim(reason) == "" -> raise ArgumentError, "#{file}: #{path} has a blank reason"
-      true -> %{path: path, reason: reason}
+      true -> %{path: parsable!(path, file), reason: reason}
     end
   end
 
@@ -101,9 +121,41 @@ defmodule Vagus.ProbeParity.Canon do
     raise ArgumentError, "#{file}: entry needs a path and a reason, got #{inspect(entry)}"
   end
 
-  defp segments(%{path: path}), do: String.split(path, "/")
-  defp segments(%{"path" => path}), do: String.split(path, "/")
-  defp segments(path) when is_binary(path), do: String.split(path, "/")
+  defp decode!(file) do
+    with {:ok, body} <- File.read(file),
+         {:ok, decoded} <- Jason.decode(body) do
+      decoded
+    else
+      {:error, %Jason.DecodeError{} = error} ->
+        raise ArgumentError, "#{file}: invalid JSON: #{Exception.message(error)}"
+
+      {:error, reason} ->
+        raise ArgumentError, "#{file}: cannot read: #{inspect(reason)}"
+    end
+  end
+
+  defp pattern!(%{path: path}), do: segments!(path, "")
+  defp pattern!(%{"path" => path}), do: segments!(path, "")
+  defp pattern!(path) when is_binary(path), do: segments!(path, "")
+
+  # Parsing a pattern the loader will only use later is what turns an
+  # unmatchable pattern into a load-time error naming the file it came from.
+  defp parsable!(path, file) do
+    segments!(path, "#{file}: ")
+    path
+  end
+
+  defp segments!(path, prefix) do
+    segments = String.split(path, "/")
+
+    if "" in segments do
+      raise ArgumentError,
+            "#{prefix}#{path}: a pattern segment matches a whole key, so a key that " <>
+              "contains a slash (well_known's \"/data\") is reachable only through *"
+    end
+
+    segments
+  end
 
   defp walk(value, path, patterns) do
     if Enum.any?(patterns, &matches?(&1, path)),
@@ -125,10 +177,15 @@ defmodule Vagus.ProbeParity.Canon do
 
   defp descend(value, _path, _patterns), do: value
 
+  # Entries missing the sort key sort last in file order, rather than first as
+  # term ordering would have it (nil < any binary): a malformed capture then
+  # cannot shove its broken entries in front and renumber everything after them.
   defp sort(list, path) do
     case Map.fetch(@sorted, path) do
       {:ok, key} ->
-        if Enum.all?(list, &is_map/1), do: Enum.sort_by(list, &Map.get(&1, key)), else: list
+        if Enum.all?(list, &is_map/1),
+          do: Enum.sort_by(list, &{Map.get(&1, key) == nil, Map.get(&1, key)}),
+          else: list
 
       :error ->
         list
@@ -154,5 +211,5 @@ defmodule Vagus.ProbeParity.Canon do
 
   # An empty map or list is itself the leaf: "no mounts at all" has to be able
   # to diff against "some mounts".
-  defp collect(value, path), do: [{path |> Enum.reverse() |> Enum.join("/"), value}]
+  defp collect(value, path), do: [{Enum.reverse(path), value}]
 end

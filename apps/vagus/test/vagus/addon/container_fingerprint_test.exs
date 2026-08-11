@@ -60,8 +60,10 @@ defmodule Vagus.Addon.ContainerFingerprintTest do
   @fingerprint @fixture["fingerprint"]
   @identity @fixture["identity"]
 
-  # The bench host's zone, passed back in as the `:tz` opt so the env assertion
-  # measures pass-through rather than which zone the bench happens to sit in.
+  # The bench host's zone, fed back in as the `:tz` opt. The TZ assertion below
+  # is therefore a round trip of the fixture's own value — it measures that Spec
+  # passes the opt through, not that Vagus derives the right zone, which nothing
+  # in the capture could tell us.
   @tz @fingerprint["env"]["TZ"]
 
   # Mount targets every container on this engine has, whoever created it: the
@@ -98,6 +100,15 @@ defmodule Vagus.Addon.ContainerFingerprintTest do
     # host's. Known gap, tracked as VAGUS-1.
     "/dev" => "wholesale ro /dev bind upstream gives every add-on; Vagus does not create it"
   }
+
+  @credential_key ~r/token|secret|password|private|key|cookie|credential|auth/i
+  @redacted ~r/^<redacted \d+ bytes>$/
+
+  # A run long and dense enough to be a key, a token or a hash. Slashes, dots,
+  # colons and dashes end a run, which is what keeps host paths, version strings
+  # and IPv6 addresses out of it.
+  @entropy_run ~r/[A-Za-z0-9+=]{32,}/
+  @container_id ~r/^[0-9a-f]{64}$/
 
   @accepted_dns_options %{
     # Not produced by `build_spec/2`, and not obviously the Supervisor's either:
@@ -203,24 +214,28 @@ defmodule Vagus.Addon.ContainerFingerprintTest do
     assert spec.extra_hosts["supervisor"] == Network.supervisor_ip()
   end
 
+  # A target can appear more than once: the fixture witnessed two `/dev/shm`
+  # entries, the engine's own plus the Supervisor's tmpfs stacked over it. Both
+  # of the mount tests below therefore check every entry sharing the target, so
+  # one of a duplicated pair regressing cannot hide behind the other.
   test "Spec's tmpfs entries exist as tmpfs in the container", %{spec: spec} do
     for target <- Map.keys(spec.tmpfs) do
       mounts = Enum.filter(@fingerprint["mounts"], &(&1["target"] == target))
 
       assert mounts != [], "Spec mounts tmpfs at #{target}, absent from the real mount table"
-      assert Enum.any?(mounts, &(&1["fstype"] == "tmpfs"))
+      assert Enum.all?(mounts, &(&1["fstype"] == "tmpfs"))
     end
   end
 
   test "every mount Spec declares is present in the container", %{spec: spec} do
     for %{target: target} = mount <- spec.mounts do
-      fixture_mount = Enum.find(@fingerprint["mounts"], &(&1["target"] == target))
+      fixture_mounts = Enum.filter(@fingerprint["mounts"], &(&1["target"] == target))
 
-      assert fixture_mount, "Spec mounts #{target}, absent from the real mount table"
+      assert fixture_mounts != [], "Spec mounts #{target}, absent from the real mount table"
 
       # Sources are host paths and differ by machine and data-root layout; the
       # comparable facts are that the target exists and its writability agrees.
-      assert fixture_mount["ro"] == Map.get(mount, :read_only, false)
+      assert Enum.all?(fixture_mounts, &(&1["ro"] == Map.get(mount, :read_only, false)))
     end
   end
 
@@ -270,6 +285,63 @@ defmodule Vagus.Addon.ContainerFingerprintTest do
     assert host_config["Init"] == false
     assert @fingerprint["proc"]["pid1_comm"] == "beam.smp"
   end
+
+  test "every credential-shaped env var was committed redacted" do
+    keys = @fingerprint["env"] |> Map.keys() |> Enum.filter(&(&1 =~ @credential_key))
+
+    # The probe redacts by its own key regex, which is narrower than this one.
+    # An unredacted value reaching git is the thing to catch, and it would reach
+    # it through a key the probe's regex missed.
+    assert keys != []
+
+    for key <- keys do
+      assert @fingerprint["env"][key] =~ @redacted,
+             "#{key} was committed with a value the probe did not redact"
+    end
+  end
+
+  test "the fixture carries no high-entropy string beyond the engine's container id" do
+    unexplained =
+      @fixture
+      |> strings([])
+      |> Enum.flat_map(fn {path, value} ->
+        @entropy_run |> Regex.scan(value) |> Enum.map(fn [run] -> {path, run} end)
+      end)
+      |> Enum.reject(&container_id?/1)
+
+    assert unexplained == [], """
+    The fixture carries strings dense enough to be keys or tokens:
+
+    #{inspect(unexplained)}
+
+    A capture is committed to git, so anything here is public. Either the probe
+    failed to redact it, or this scan needs a narrower reason to allow it.
+    """
+  end
+
+  # The daemon names each container's config directory after the container's
+  # 64-hex id, so its own bind sources carry one. It names a container on a
+  # bench box that no longer exists, and is not a secret.
+  defp container_id?({path, run}) do
+    String.starts_with?(path, "fingerprint/mounts/") and String.ends_with?(path, "/source") and
+      run =~ @container_id
+  end
+
+  defp strings(value, path) when is_map(value) do
+    Enum.flat_map(value, fn {key, child} -> strings(child, [key | path]) end)
+  end
+
+  defp strings(value, path) when is_list(value) do
+    value
+    |> Enum.with_index()
+    |> Enum.flat_map(fn {child, index} -> strings(child, [Integer.to_string(index) | path]) end)
+  end
+
+  defp strings(value, path) when is_binary(value) do
+    [{path |> Enum.reverse() |> Enum.join("/"), value}]
+  end
+
+  defp strings(_value, _path), do: []
 
   defp engine_baseline?(target) do
     target in @engine_baseline or

@@ -4,7 +4,8 @@ defmodule Vagus.ProbeParity.CanonTest do
   fingerprint fixture exists yet, and once one does, a test built on it would
   measure the capture rather than the rules. The one thing checked against the
   real artifact is that the committed volatile allowlist loads and every entry
-  carries a reason.
+  carries a reason; whether those entries still mask anything is
+  `Vagus.ProbeParity.VolatileAllowlistTest`.
   """
 
   use ExUnit.Case, async: true
@@ -21,9 +22,11 @@ defmodule Vagus.ProbeParity.CanonTest do
   @external_resource @allowlist_path
 
   describe "load_allowlist!/1" do
-    test "reads path/reason pairs" do
+    @describetag :tmp_dir
+
+    test "reads path/reason pairs", %{tmp_dir: tmp_dir} do
       file =
-        write_json([
+        write_json(tmp_dir, [
           %{"path" => "fingerprint/hostname", "reason" => "slug-derived"},
           %{"path" => "fingerprint/mounts/*/source", "reason" => "host layout"}
         ])
@@ -34,9 +37,9 @@ defmodule Vagus.ProbeParity.CanonTest do
              ]
     end
 
-    test "rejects a blank reason, naming the offending path" do
+    test "rejects a blank reason, naming the offending path", %{tmp_dir: tmp_dir} do
       file =
-        write_json([
+        write_json(tmp_dir, [
           %{"path" => "fingerprint/hostname", "reason" => "slug-derived"},
           %{"path" => "fingerprint/ids/uid", "reason" => "   "}
         ])
@@ -46,10 +49,40 @@ defmodule Vagus.ProbeParity.CanonTest do
       end
     end
 
-    test "rejects a missing reason" do
-      file = write_json([%{"path" => "fingerprint/ids/uid"}])
+    test "rejects a missing reason", %{tmp_dir: tmp_dir} do
+      file = write_json(tmp_dir, [%{"path" => "fingerprint/ids/uid"}])
 
       assert_raise ArgumentError, ~r/needs a path and a reason/, fn ->
+        Canon.load_allowlist!(file)
+      end
+    end
+
+    test "rejects a pattern whose literal segment would be a slash-bearing key", %{
+      tmp_dir: tmp_dir
+    } do
+      file =
+        write_json(tmp_dir, [
+          %{"path" => "fingerprint/well_known//data/mode", "reason" => "per-machine"}
+        ])
+
+      assert_raise ArgumentError, ~r/reachable only through \*/, fn ->
+        Canon.load_allowlist!(file)
+      end
+    end
+
+    test "names the file when the JSON is malformed", %{tmp_dir: tmp_dir} do
+      file = Path.join(tmp_dir, "broken.json")
+      File.write!(file, "[{\"path\": ")
+
+      assert_raise ArgumentError, ~r/#{Regex.escape(file)}: invalid JSON/, fn ->
+        Canon.load_allowlist!(file)
+      end
+    end
+
+    test "names the file when it cannot be read", %{tmp_dir: tmp_dir} do
+      file = Path.join(tmp_dir, "absent.json")
+
+      assert_raise ArgumentError, ~r/#{Regex.escape(file)}: cannot read/, fn ->
         Canon.load_allowlist!(file)
       end
     end
@@ -82,6 +115,18 @@ defmodule Vagus.ProbeParity.CanonTest do
                  "/ssl" => %{"uid" => Canon.sentinel()}
                }
              }
+    end
+
+    test "a slash-bearing key is a single path segment, reachable only through *" do
+      capture = %{"well_known" => %{"/data" => %{"mode" => "0755"}}}
+
+      assert canon(capture, ["well_known/*/mode"]) == %{
+               "well_known" => %{"/data" => %{"mode" => Canon.sentinel()}}
+             }
+
+      assert_raise ArgumentError, ~r/reachable only through \*/, fn ->
+        canon(capture, ["well_known//data/mode"])
+      end
     end
 
     test "* matches any list index" do
@@ -130,7 +175,11 @@ defmodule Vagus.ProbeParity.CanonTest do
       absent = canon(%{"fingerprint" => %{"interfaces" => [%{"name" => "eth0"}]}}, allowlist)
 
       assert Canon.diff(present, absent) == [
-               %{path: "fingerprint/interfaces/0/hwaddr", left: Canon.sentinel(), right: :absent}
+               %{
+                 path: ["fingerprint", "interfaces", "0", "hwaddr"],
+                 left: Canon.sentinel(),
+                 right: :absent
+               }
              ]
     end
 
@@ -151,6 +200,20 @@ defmodule Vagus.ProbeParity.CanonTest do
              ]
 
       assert canonical["fingerprint"]["interfaces"] == [%{"name" => "eth0"}, %{"name" => "lo"}]
+    end
+
+    test "entries missing the sort key keep file order, after the sorted ones" do
+      capture = %{
+        "fingerprint" => %{
+          "mounts" => [%{"fstype" => "proc"}, %{"target" => "/ssl"}, %{"fstype" => "sysfs"}]
+        }
+      }
+
+      assert canon(capture, [])["fingerprint"]["mounts"] == [
+               %{"target" => "/ssl"},
+               %{"fstype" => "proc"},
+               %{"fstype" => "sysfs"}
+             ]
     end
 
     test "leaves other lists in file order" do
@@ -185,15 +248,15 @@ defmodule Vagus.ProbeParity.CanonTest do
       right = %{"versions" => %{"supervisor" => "2026.07.5", "machine" => "green"}}
 
       assert Canon.diff(left, right) == [
-               %{path: "versions/channel", left: "stable", right: :absent},
-               %{path: "versions/machine", left: :absent, right: "green"}
+               %{path: ["versions", "channel"], left: "stable", right: :absent},
+               %{path: ["versions", "machine"], left: :absent, right: "green"}
              ]
     end
 
     test "an empty collection is a leaf, so it diffs against a populated one" do
       assert Canon.diff(%{"mounts" => []}, %{"mounts" => [%{"target" => "/data"}]}) == [
-               %{path: "mounts", left: [], right: :absent},
-               %{path: "mounts/0/target", left: :absent, right: "/data"}
+               %{path: ["mounts"], left: [], right: :absent},
+               %{path: ["mounts", "0", "target"], left: :absent, right: "/data"}
              ]
     end
 
@@ -201,13 +264,14 @@ defmodule Vagus.ProbeParity.CanonTest do
       left = %{"b" => 1, "a" => %{"z" => 1, "y" => 1}}
       right = %{"b" => 2, "a" => %{"z" => 2, "y" => 2}}
 
-      assert Enum.map(Canon.diff(left, right), & &1.path) == ["a/y", "a/z", "b"]
+      assert Enum.map(Canon.diff(left, right), & &1.path) == [["a", "y"], ["a", "z"], ["b"]]
     end
 
-    test "canonicalize then diff reports only the real divergence" do
+    @tag :tmp_dir
+    test "canonicalize then diff reports only the real divergence", %{tmp_dir: tmp_dir} do
       allowlist =
         Canon.load_allowlist!(
-          write_json([
+          write_json(tmp_dir, [
             %{"path" => "fingerprint/mounts/*/source", "reason" => "host layout"},
             %{"path" => "fingerprint/interfaces/*/hwaddr", "reason" => "engine-assigned"}
           ])
@@ -216,9 +280,15 @@ defmodule Vagus.ProbeParity.CanonTest do
       haos = fingerprint("/mnt/data/supervisor/addons/data/probe", "02:42:ac:1e:20:05", "0755")
       vagus = fingerprint("/root/vagus/addons/data/probe", "02:42:ac:1e:20:63", "0700")
 
+      divergence = %{path: ["fingerprint", "well_known", "/data", "mode"]}
+
       assert Canon.diff(canon(haos, allowlist), canon(vagus, allowlist)) == [
-               %{path: "fingerprint/well_known//data/mode", left: "0755", right: "0700"}
+               Map.merge(divergence, %{left: "0755", right: "0700"})
              ]
+
+      # The slash-bearing key survives the round trip only in the segment list;
+      # rendered, it is the ambiguous "fingerprint/well_known//data/mode".
+      assert Canon.path_to_string(divergence.path) == "fingerprint/well_known//data/mode"
     end
   end
 
@@ -251,15 +321,9 @@ defmodule Vagus.ProbeParity.CanonTest do
     }
   end
 
-  defp write_json(term) do
-    file =
-      Path.join(
-        System.tmp_dir!(),
-        "canon-allowlist-#{System.unique_integer([:positive])}.json"
-      )
-
+  defp write_json(tmp_dir, term) do
+    file = Path.join(tmp_dir, "allowlist-#{System.unique_integer([:positive])}.json")
     File.write!(file, Jason.encode!(term))
-    on_exit(fn -> File.rm(file) end)
 
     file
   end

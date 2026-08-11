@@ -120,7 +120,22 @@
   # typed as a map). Correct, defensive, not worth churning. (The analogous
   # ingress_proxy `query_string` dead-nil check was fixed at the source rather
   # than ignored — `in [nil, ""]` → `== ""`, since Plug guarantees a binary.)
-  {"lib/vagus/addon/manager.ex", :guard_fail}
+  {"lib/vagus/addon/manager.ex", :guard_fail},
+
+  # ── Root 5: Mix is absent from the PLT, so Mix tasks look nonexistent ───
+  # `Mix.Task.run/1`, `Mix.raise/1`, `Mix.shell/0` and `Mix.Project.apps_paths/0`
+  # all resolve at task-run time, but :mix is not an application dependency of
+  # :vagus (and must not become one — it would ship in firmware), so the PLT
+  # carries no info about it and every call reads as unknown_function.
+  #
+  # `plt_add_apps: [:mix]` does NOT fix this, verified rather than assumed:
+  # dialyxir's `plt_add_apps/0` is `config[:plt_add_apps] || [] |> load_apps()`,
+  # and `|>` binds tighter than `||`, so when the key IS set the apps are never
+  # `Application.load/1`ed and never reach the PLT. (:ssh/:public_key/:crypto
+  # are in the PLT only because deps load them anyway — that entry is inert.)
+  # Confirmed with `:dialyzer.plt_info/1`: 0 mix beams, 43 ssh beams.
+  {"lib/mix/tasks/vagus.probe.diff.ex", :callback_info_missing},
+  {"lib/mix/tasks/vagus.probe.diff.ex", :unknown_function}
 
   # ── (removed) Root 4: mqttx type/callback info gaps ─────────────────────
   # The three mqttx-related filters (handler.ex :callback_info_missing,
