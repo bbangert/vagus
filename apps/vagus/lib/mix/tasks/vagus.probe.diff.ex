@@ -23,8 +23,6 @@ defmodule Mix.Tasks.Vagus.Probe.Diff do
 
   @default_allowlist "test/fixtures/haos-container-fingerprint.volatile.json"
 
-  @credential_key ~r/token|secret|password|private|key|cookie|credential/i
-
   @impl Mix.Task
   def run(argv) do
     {opts, args} = OptionParser.parse!(argv, strict: [volatile: :string])
@@ -108,10 +106,12 @@ defmodule Mix.Tasks.Vagus.Probe.Diff do
   # The probe redacts credential-shaped env values at capture time, so this only
   # bites on a hand-made or future capture that skipped that: such a leaf is
   # still reported as diverging, just without printing what it diverged to.
+  # `Canon.credential_key/0` rather than a literal here so this and the
+  # fixture-hygiene test cannot disagree about what counts as a credential.
   defp value(path, value) do
     cond do
       value == :absent -> ":absent"
-      Enum.any?(path, &(&1 =~ @credential_key)) -> "<withheld>"
+      Enum.any?(path, &(&1 =~ Canon.credential_key())) -> "<withheld>"
       true -> inspect(value)
     end
   end

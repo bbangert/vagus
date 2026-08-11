@@ -41,6 +41,7 @@ defmodule Vagus.Addon.ContainerFingerprintTest do
   alias Vagus.Addon.Backend.Container
   alias Vagus.Addon.{Config, Manager}
   alias Vagus.Network
+  alias Vagus.ProbeParity.Canon
 
   @fixture_path Path.join([
                   __DIR__,
@@ -69,11 +70,10 @@ defmodule Vagus.Addon.ContainerFingerprintTest do
   # Mount targets every container on this engine has, whoever created it: the
   # overlay root, the masked/read-only `/proc` and `/sys` subtrees runc applies,
   # the standard `/dev` device mounts, the three files the daemon binds in
-  # (`/etc/hostname`, `/etc/hosts`, `/etc/resolv.conf`), the engine's own
-  # `/dev/shm`, and `/run/cid` (the Supervisor's cid file, bound by upstream for
-  # every add-on — an add-on-visible file, not a container knob Vagus sets).
-  # `/proc/*` and `/sys/*` are matched by prefix: the exact set of masked paths
-  # is a runc version detail and pinning it would make this a runc test.
+  # (`/etc/hostname`, `/etc/hosts`, `/etc/resolv.conf`) and the engine's own
+  # `/dev/shm`. `/proc/*` and `/sys/*` are matched by prefix: the exact set of
+  # masked paths is a runc version detail and pinning it would make this a runc
+  # test.
   @engine_baseline [
     "/",
     "/dev/hugepages",
@@ -84,7 +84,6 @@ defmodule Vagus.Addon.ContainerFingerprintTest do
     "/etc/hosts",
     "/etc/resolv.conf",
     "/proc",
-    "/run/cid",
     "/sys"
   ]
   @engine_baseline_prefixes ["/proc/", "/sys/"]
@@ -98,10 +97,15 @@ defmodule Vagus.Addon.ContainerFingerprintTest do
     # granted without a per-device mount. Vagus creates no such mount, which
     # means device-touching add-ons see an image-provided `/dev` instead of the
     # host's. Known gap, tracked as VAGUS-1.
-    "/dev" => "wholesale ro /dev bind upstream gives every add-on; Vagus does not create it"
+    "/dev" => "wholesale ro /dev bind upstream gives every add-on; Vagus does not create it",
+
+    # Upstream writes a cid file per add-on under the Supervisor's
+    # `cid_files/` and binds it read-only at `/run/cid`, so an add-on can read
+    # the id of the container it is running in. `mounts/2` creates no such
+    # file, so a Vagus add-on that reads `/run/cid` finds nothing.
+    "/run/cid" => "ro bind of a per-add-on cid file upstream writes; Vagus creates none"
   }
 
-  @credential_key ~r/token|secret|password|private|key|cookie|credential|auth/i
   @redacted ~r/^<redacted \d+ bytes>$/
 
   # A run long and dense enough to be a key, a token or a hash. Slashes, dots,
@@ -219,6 +223,15 @@ defmodule Vagus.Addon.ContainerFingerprintTest do
   # of the mount tests below therefore check every entry sharing the target, so
   # one of a duplicated pair regressing cannot hide behind the other.
   test "Spec's tmpfs entries exist as tmpfs in the container", %{spec: spec} do
+    # Named before the loop, because a Spec that stopped declaring tmpfs would
+    # iterate nothing and pass, and `/dev/shm` is in @engine_baseline besides,
+    # so the reverse test would not notice either.
+    assert Map.has_key?(spec.tmpfs, "/dev/shm")
+
+    # Both halves of the duplicate, so the Supervisor's tmpfs vanishing on a
+    # regenerated fixture cannot hide behind the engine's own.
+    assert length(Enum.filter(@fingerprint["mounts"], &(&1["target"] == "/dev/shm"))) == 2
+
     for target <- Map.keys(spec.tmpfs) do
       mounts = Enum.filter(@fingerprint["mounts"], &(&1["target"] == target))
 
@@ -261,11 +274,18 @@ defmodule Vagus.Addon.ContainerFingerprintTest do
     """
   end
 
-  test "the accepted mount gap is still exactly what was accepted" do
+  test "the accepted mount gaps are still exactly what was accepted" do
     dev = Enum.find(@fingerprint["mounts"], &(&1["target"] == "/dev"))
 
     assert dev["fstype"] == "devtmpfs"
     assert dev["ro"] == true
+
+    cid = Enum.find(@fingerprint["mounts"], &(&1["target"] == "/run/cid"))
+
+    # The source is what proves this is the Supervisor's doing and not the
+    # engine's, which is the whole reason it counts as a Vagus gap.
+    assert cid["source"] =~ ~r{/supervisor/cid_files/.+\.cid$}
+    assert cid["ro"] == true
   end
 
   test "OomScoreAdj, seccomp and pid 1 match what the backend stamps", %{
@@ -287,7 +307,10 @@ defmodule Vagus.Addon.ContainerFingerprintTest do
   end
 
   test "every credential-shaped env var was committed redacted" do
-    keys = @fingerprint["env"] |> Map.keys() |> Enum.filter(&(&1 =~ @credential_key))
+    # Shared with `mix vagus.probe.diff`, which withholds values on a
+    # credential-shaped path: what this test demands be redacted and what that
+    # task refuses to print have to be the same set of keys.
+    keys = @fingerprint["env"] |> Map.keys() |> Enum.filter(&(&1 =~ Canon.credential_key()))
 
     # The probe redacts by its own key regex, which is narrower than this one.
     # An unredacted value reaching git is the thing to catch, and it would reach

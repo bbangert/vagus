@@ -34,6 +34,8 @@ defmodule Vagus.ProbeParity.Canon do
   @sentinel "<volatile>"
   @wildcard "*"
 
+  @credential_key ~r/token|secret|password|private|key|cookie|credential|auth/i
+
   # Lists whose element order carries no meaning, and the key that orders them.
   # Kept in sync with the probe's own sort so positions line up either way.
   @sorted %{
@@ -49,6 +51,17 @@ defmodule Vagus.ProbeParity.Canon do
   @doc "The value every allowlisted field is replaced with."
   @spec sentinel() :: String.t()
   def sentinel, do: @sentinel
+
+  @doc """
+  Key fragments that make a capture's key credential-shaped.
+
+  One definition because the callers must agree: the fixture-hygiene test uses
+  it to demand a value was redacted, and `mix vagus.probe.diff` uses it to
+  withhold a value from its output. A fragment in one and not the other means a
+  key the hygiene test calls a credential gets printed verbatim by the task.
+  """
+  @spec credential_key() :: Regex.t()
+  def credential_key, do: @credential_key
 
   @doc """
   Renders a path for humans. One-way: a segment may itself contain a slash.
