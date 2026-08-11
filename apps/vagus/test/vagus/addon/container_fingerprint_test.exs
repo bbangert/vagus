@@ -106,6 +106,19 @@ defmodule Vagus.Addon.ContainerFingerprintTest do
     "/run/cid" => "ro bind of a per-add-on cid file upstream writes; Vagus creates none"
   }
 
+  # Every flag the probe reports, on every mount, true or false. A fixed and
+  # complete key set is what lets the volatile allowlist mask the atime family:
+  # Canon substitutes a sentinel rather than deleting, so a flag that were
+  # merely absent when off would mask as `:absent` on one side and `<volatile>`
+  # on the other.
+  @mount_flags ~w(dirsync lazytime noatime nodev nodiratime noexec nosuid nosymfollow
+                  relatime strictatime sync)
+
+  # The flags an add-on can escalate through. Deliberately not in the volatile
+  # allowlist: masking these is how a Vagus capture with an suid-enabled or
+  # executable mount would have compared equal to a locked-down HAOS one.
+  @policy_flags ~w(nodev noexec nosuid)
+
   @redacted ~r/^<redacted \d+ bytes>$/
 
   # A run long and dense enough to be a key, a token or a hash. Slashes, dots,
@@ -232,6 +245,16 @@ defmodule Vagus.Addon.ContainerFingerprintTest do
     # regenerated fixture cannot hide behind the engine's own.
     assert length(Enum.filter(@fingerprint["mounts"], &(&1["target"] == "/dev/shm"))) == 2
 
+    # Open question, unverified. The two `/dev/shm` entries disagree on noexec:
+    # the engine's own has it, the Supervisor's tmpfs stacked over it does not.
+    # Vagus asks for `%{"/dev/shm" => ""}` — an empty option string — which
+    # leaves the engine to apply its own defaults, and those conventionally
+    # include noexec. If that is what happens, a Vagus add-on that execs out of
+    # /dev/shm breaks where an upstream one works. Nothing here can settle it:
+    # it needs a container fingerprint captured from a Vagus device, which does
+    # not exist yet, and comparing that capture's `/dev/shm` flags against this
+    # fixture's is the whole answer.
+
     for target <- Map.keys(spec.tmpfs) do
       mounts = Enum.filter(@fingerprint["mounts"], &(&1["target"] == target))
 
@@ -272,6 +295,31 @@ defmodule Vagus.Addon.ContainerFingerprintTest do
     A new one is the point of this test: either Vagus should create it, or it
     belongs in @accepted_mounts with a reason.
     """
+  end
+
+  test "the mount table's security flags survived as comparable structure" do
+    mounts = @fingerprint["mounts"]
+
+    for mount <- mounts do
+      assert Map.keys(mount["flags"]) |> Enum.sort() == @mount_flags,
+             "#{mount["target"]} reports #{inspect(Map.keys(mount["flags"]))}, not the full set"
+    end
+
+    # Non-vacuity, without pinning totals that any upstream mount addition would
+    # churn: the bench witnessed each of these somewhere, so a fixture where one
+    # is nowhere true has lost hardening rather than gained a mount.
+    for flag <- @policy_flags do
+      assert Enum.any?(mounts, & &1["flags"][flag]),
+             "no mount carries #{flag}; the real Supervisor's add-on had several"
+    end
+
+    # Ties the booleans to the string they were extracted from, which is what
+    # keeps them from being stubbed: masking options is only safe while the
+    # flags still say everything the option string said.
+    for mount <- mounts, flag <- @mount_flags do
+      assert mount["flags"][flag] == flag in String.split(mount["options"], ","),
+             "#{mount["target"]}: flags.#{flag} disagrees with options #{mount["options"]}"
+    end
   end
 
   test "the accepted mount gaps are still exactly what was accepted" do

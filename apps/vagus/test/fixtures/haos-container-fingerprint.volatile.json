@@ -17,7 +17,27 @@
   },
   {
     "path": "fingerprint/mounts/*/options",
-    "reason": "Per-mount option string as the kernel reports it, which varies with kernel version and filesystem driver (relatime/noatime defaults, propagation-adjacent flags) rather than with anything Vagus chooses. The one option that is a decision, read-only versus read-write, is reported separately as ro and stays comparable."
+    "reason": "The raw option string as the kernel renders it, which carries driver-specific noise no policy depends on (overlay's lowerdir/upperdir, tmpfs size and mode, per-filesystem tuning) and reorders or renames with the kernel version. Masking it costs nothing now that the probe extracts the option bits that are decisions into flags, where nosuid, nodev, noexec, sync, dirsync and nosymfollow are each compared on their own; read-only versus read-write is likewise reported separately as ro."
+  },
+  {
+    "path": "fingerprint/mounts/*/flags/relatime",
+    "reason": "The kernel's default atime policy since 2.6.30, applied when a mount names no atime option at all — which every mount here does. It is a property of how the host booted and how the underlying filesystem was mounted, propagated into the bind, not of anything the Supervisor or Vagus asks for."
+  },
+  {
+    "path": "fingerprint/mounts/*/flags/noatime",
+    "reason": "Suppressing access-time updates outright is host storage tuning: an image or data partition mounted noatime pushes that flag into every bind taken from it, so a Vagus board with a differently tuned /data would diverge here for a reason that has no add-on-facing consequence."
+  },
+  {
+    "path": "fingerprint/mounts/*/flags/nodiratime",
+    "reason": "The directory-only half of noatime, set by the same host mount tuning and inherited by binds the same way. Masked alongside noatime so a fleet that tunes one and not the other does not diverge twice for one storage decision."
+  },
+  {
+    "path": "fingerprint/mounts/*/flags/strictatime",
+    "reason": "Opts a mount back out of relatime into full POSIX atime accounting. Nothing in the add-on contract reads atime, so which of the three atime policies a mount landed on records the host's storage configuration and kernel defaults rather than a difference an add-on could observe."
+  },
+  {
+    "path": "fingerprint/mounts/*/flags/lazytime",
+    "reason": "Defers writing timestamp updates to disk. Purely a durability-versus-wear tradeoff the host makes per filesystem — visible in the mount table, invisible to an add-on, and expected to differ between a Home Assistant Green's eMMC and Vagus boards on NVMe or UFS."
   },
   {
     "path": "fingerprint/interfaces/*/hwaddr",

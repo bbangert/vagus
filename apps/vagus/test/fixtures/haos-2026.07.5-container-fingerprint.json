@@ -124,7 +124,7 @@
             "prefix_or_mask": "ffff:ffff:ffff::"
           },
           {
-            "addr": "fe80::d45a:3dff:fe58:166c",
+            "addr": "fe80::a4c8:29ff:fed1:ecd9",
             "family": "inet6",
             "prefix_or_mask": "ffff:ffff:ffff:ffff::"
           }
@@ -135,7 +135,7 @@
           "running",
           "up"
         ],
-        "hwaddr": "d6:5a:3d:58:16:6c",
+        "hwaddr": "a6:c8:29:d1:ec:d9",
         "name": "eth0"
       },
       {
@@ -162,6 +162,19 @@
     ],
     "mounts": [
       {
+        "flags": {
+          "dirsync": false,
+          "lazytime": false,
+          "noatime": false,
+          "nodev": false,
+          "nodiratime": false,
+          "noexec": false,
+          "nosuid": false,
+          "nosymfollow": false,
+          "relatime": true,
+          "strictatime": false,
+          "sync": false
+        },
         "fstype": "overlay",
         "options": "rw,relatime",
         "ro": false,
@@ -169,6 +182,19 @@
         "target": "/"
       },
       {
+        "flags": {
+          "dirsync": false,
+          "lazytime": false,
+          "noatime": false,
+          "nodev": false,
+          "nodiratime": false,
+          "noexec": false,
+          "nosuid": false,
+          "nosymfollow": false,
+          "relatime": true,
+          "strictatime": false,
+          "sync": false
+        },
         "fstype": "ext4",
         "options": "rw,relatime",
         "ro": false,
@@ -176,6 +202,19 @@
         "target": "/data"
       },
       {
+        "flags": {
+          "dirsync": false,
+          "lazytime": false,
+          "noatime": false,
+          "nodev": false,
+          "nodiratime": false,
+          "noexec": false,
+          "nosuid": false,
+          "nosymfollow": false,
+          "relatime": true,
+          "strictatime": false,
+          "sync": false
+        },
         "fstype": "devtmpfs",
         "options": "ro,relatime",
         "ro": true,
@@ -183,6 +222,19 @@
         "target": "/dev"
       },
       {
+        "flags": {
+          "dirsync": false,
+          "lazytime": false,
+          "noatime": false,
+          "nodev": true,
+          "nodiratime": false,
+          "noexec": false,
+          "nosuid": true,
+          "nosymfollow": false,
+          "relatime": true,
+          "strictatime": false,
+          "sync": false
+        },
         "fstype": "hugetlbfs",
         "options": "rw,nosuid,nodev,relatime",
         "ro": false,
@@ -190,6 +242,19 @@
         "target": "/dev/hugepages"
       },
       {
+        "flags": {
+          "dirsync": false,
+          "lazytime": false,
+          "noatime": false,
+          "nodev": true,
+          "nodiratime": false,
+          "noexec": true,
+          "nosuid": true,
+          "nosymfollow": false,
+          "relatime": true,
+          "strictatime": false,
+          "sync": false
+        },
         "fstype": "mqueue",
         "options": "rw,nosuid,nodev,noexec,relatime",
         "ro": false,
@@ -197,6 +262,19 @@
         "target": "/dev/mqueue"
       },
       {
+        "flags": {
+          "dirsync": false,
+          "lazytime": false,
+          "noatime": false,
+          "nodev": false,
+          "nodiratime": false,
+          "noexec": true,
+          "nosuid": true,
+          "nosymfollow": false,
+          "relatime": true,
+          "strictatime": false,
+          "sync": false
+        },
         "fstype": "devpts",
         "options": "rw,nosuid,noexec,relatime",
         "ro": false,
@@ -204,6 +282,19 @@
         "target": "/dev/pts"
       },
       {
+        "flags": {
+          "dirsync": false,
+          "lazytime": false,
+          "noatime": false,
+          "nodev": true,
+          "nodiratime": false,
+          "noexec": false,
+          "nosuid": true,
+          "nosymfollow": false,
+          "relatime": false,
+          "strictatime": false,
+          "sync": false
+        },
         "fstype": "tmpfs",
         "options": "rw,nosuid,nodev",
         "ro": false,
@@ -211,6 +302,19 @@
         "target": "/dev/shm"
       },
       {
+        "flags": {
+          "dirsync": false,
+          "lazytime": false,
+          "noatime": false,
+          "nodev": true,
+          "nodiratime": false,
+          "noexec": true,
+          "nosuid": true,
+          "nosymfollow": false,
+          "relatime": true,
+          "strictatime": false,
+          "sync": false
+        },
         "fstype": "tmpfs",
         "options": "rw,nosuid,nodev,noexec,relatime",
         "ro": false,
@@ -218,27 +322,79 @@
         "target": "/dev/shm"
       },
       {
+        "flags": {
+          "dirsync": false,
+          "lazytime": false,
+          "noatime": false,
+          "nodev": false,
+          "nodiratime": false,
+          "noexec": false,
+          "nosuid": false,
+          "nosymfollow": false,
+          "relatime": true,
+          "strictatime": false,
+          "sync": false
+        },
         "fstype": "ext4",
         "options": "rw,relatime",
         "ro": false,
-        "source": "/dev/mmcblk0p8/docker/containers/e03fe51e1757ad844eece371c7950df1c3f94b98b80f07545f057d184fc79a27/hostname",
+        "source": "/dev/mmcblk0p8/docker/containers/86e0658121e60e3d9c1cbc64b5ce443072b313b08074d41921c8872dec7333b1/hostname",
         "target": "/etc/hostname"
       },
       {
+        "flags": {
+          "dirsync": false,
+          "lazytime": false,
+          "noatime": false,
+          "nodev": false,
+          "nodiratime": false,
+          "noexec": false,
+          "nosuid": false,
+          "nosymfollow": false,
+          "relatime": true,
+          "strictatime": false,
+          "sync": false
+        },
         "fstype": "ext4",
         "options": "rw,relatime",
         "ro": false,
-        "source": "/dev/mmcblk0p8/docker/containers/e03fe51e1757ad844eece371c7950df1c3f94b98b80f07545f057d184fc79a27/hosts",
+        "source": "/dev/mmcblk0p8/docker/containers/86e0658121e60e3d9c1cbc64b5ce443072b313b08074d41921c8872dec7333b1/hosts",
         "target": "/etc/hosts"
       },
       {
+        "flags": {
+          "dirsync": false,
+          "lazytime": false,
+          "noatime": false,
+          "nodev": false,
+          "nodiratime": false,
+          "noexec": false,
+          "nosuid": false,
+          "nosymfollow": false,
+          "relatime": true,
+          "strictatime": false,
+          "sync": false
+        },
         "fstype": "ext4",
         "options": "rw,relatime",
         "ro": false,
-        "source": "/dev/mmcblk0p8/docker/containers/e03fe51e1757ad844eece371c7950df1c3f94b98b80f07545f057d184fc79a27/resolv.conf",
+        "source": "/dev/mmcblk0p8/docker/containers/86e0658121e60e3d9c1cbc64b5ce443072b313b08074d41921c8872dec7333b1/resolv.conf",
         "target": "/etc/resolv.conf"
       },
       {
+        "flags": {
+          "dirsync": false,
+          "lazytime": false,
+          "noatime": false,
+          "nodev": true,
+          "nodiratime": false,
+          "noexec": true,
+          "nosuid": true,
+          "nosymfollow": false,
+          "relatime": true,
+          "strictatime": false,
+          "sync": false
+        },
         "fstype": "proc",
         "options": "rw,nosuid,nodev,noexec,relatime",
         "ro": false,
@@ -246,6 +402,19 @@
         "target": "/proc"
       },
       {
+        "flags": {
+          "dirsync": false,
+          "lazytime": false,
+          "noatime": false,
+          "nodev": false,
+          "nodiratime": false,
+          "noexec": false,
+          "nosuid": false,
+          "nosymfollow": false,
+          "relatime": true,
+          "strictatime": false,
+          "sync": false
+        },
         "fstype": "tmpfs",
         "options": "ro,relatime",
         "ro": true,
@@ -253,6 +422,19 @@
         "target": "/proc/asound"
       },
       {
+        "flags": {
+          "dirsync": false,
+          "lazytime": false,
+          "noatime": false,
+          "nodev": true,
+          "nodiratime": false,
+          "noexec": true,
+          "nosuid": true,
+          "nosymfollow": false,
+          "relatime": true,
+          "strictatime": false,
+          "sync": false
+        },
         "fstype": "proc",
         "options": "ro,nosuid,nodev,noexec,relatime",
         "ro": true,
@@ -260,6 +442,19 @@
         "target": "/proc/bus"
       },
       {
+        "flags": {
+          "dirsync": false,
+          "lazytime": false,
+          "noatime": false,
+          "nodev": true,
+          "nodiratime": false,
+          "noexec": true,
+          "nosuid": true,
+          "nosymfollow": false,
+          "relatime": true,
+          "strictatime": false,
+          "sync": false
+        },
         "fstype": "proc",
         "options": "ro,nosuid,nodev,noexec,relatime",
         "ro": true,
@@ -267,6 +462,19 @@
         "target": "/proc/fs"
       },
       {
+        "flags": {
+          "dirsync": false,
+          "lazytime": false,
+          "noatime": false,
+          "nodev": false,
+          "nodiratime": false,
+          "noexec": false,
+          "nosuid": false,
+          "nosymfollow": false,
+          "relatime": true,
+          "strictatime": false,
+          "sync": false
+        },
         "fstype": "devtmpfs",
         "options": "ro,relatime",
         "ro": true,
@@ -274,6 +482,19 @@
         "target": "/proc/interrupts"
       },
       {
+        "flags": {
+          "dirsync": false,
+          "lazytime": false,
+          "noatime": false,
+          "nodev": true,
+          "nodiratime": false,
+          "noexec": true,
+          "nosuid": true,
+          "nosymfollow": false,
+          "relatime": true,
+          "strictatime": false,
+          "sync": false
+        },
         "fstype": "proc",
         "options": "ro,nosuid,nodev,noexec,relatime",
         "ro": true,
@@ -281,6 +502,19 @@
         "target": "/proc/irq"
       },
       {
+        "flags": {
+          "dirsync": false,
+          "lazytime": false,
+          "noatime": false,
+          "nodev": false,
+          "nodiratime": false,
+          "noexec": false,
+          "nosuid": false,
+          "nosymfollow": false,
+          "relatime": true,
+          "strictatime": false,
+          "sync": false
+        },
         "fstype": "devtmpfs",
         "options": "ro,relatime",
         "ro": true,
@@ -288,6 +522,19 @@
         "target": "/proc/keys"
       },
       {
+        "flags": {
+          "dirsync": false,
+          "lazytime": false,
+          "noatime": false,
+          "nodev": false,
+          "nodiratime": false,
+          "noexec": false,
+          "nosuid": false,
+          "nosymfollow": false,
+          "relatime": true,
+          "strictatime": false,
+          "sync": false
+        },
         "fstype": "tmpfs",
         "options": "ro,relatime",
         "ro": true,
@@ -295,6 +542,19 @@
         "target": "/proc/scsi"
       },
       {
+        "flags": {
+          "dirsync": false,
+          "lazytime": false,
+          "noatime": false,
+          "nodev": true,
+          "nodiratime": false,
+          "noexec": true,
+          "nosuid": true,
+          "nosymfollow": false,
+          "relatime": true,
+          "strictatime": false,
+          "sync": false
+        },
         "fstype": "proc",
         "options": "ro,nosuid,nodev,noexec,relatime",
         "ro": true,
@@ -302,6 +562,19 @@
         "target": "/proc/sys"
       },
       {
+        "flags": {
+          "dirsync": false,
+          "lazytime": false,
+          "noatime": false,
+          "nodev": true,
+          "nodiratime": false,
+          "noexec": true,
+          "nosuid": true,
+          "nosymfollow": false,
+          "relatime": true,
+          "strictatime": false,
+          "sync": false
+        },
         "fstype": "proc",
         "options": "ro,nosuid,nodev,noexec,relatime",
         "ro": true,
@@ -309,6 +582,19 @@
         "target": "/proc/sysrq-trigger"
       },
       {
+        "flags": {
+          "dirsync": false,
+          "lazytime": false,
+          "noatime": false,
+          "nodev": false,
+          "nodiratime": false,
+          "noexec": false,
+          "nosuid": false,
+          "nosymfollow": false,
+          "relatime": true,
+          "strictatime": false,
+          "sync": false
+        },
         "fstype": "devtmpfs",
         "options": "ro,relatime",
         "ro": true,
@@ -316,6 +602,19 @@
         "target": "/proc/timer_list"
       },
       {
+        "flags": {
+          "dirsync": false,
+          "lazytime": false,
+          "noatime": false,
+          "nodev": false,
+          "nodiratime": false,
+          "noexec": false,
+          "nosuid": false,
+          "nosymfollow": false,
+          "relatime": true,
+          "strictatime": false,
+          "sync": false
+        },
         "fstype": "ext4",
         "options": "ro,relatime",
         "ro": true,
@@ -323,6 +622,19 @@
         "target": "/run/cid"
       },
       {
+        "flags": {
+          "dirsync": false,
+          "lazytime": false,
+          "noatime": false,
+          "nodev": true,
+          "nodiratime": false,
+          "noexec": true,
+          "nosuid": true,
+          "nosymfollow": false,
+          "relatime": true,
+          "strictatime": false,
+          "sync": false
+        },
         "fstype": "sysfs",
         "options": "ro,nosuid,nodev,noexec,relatime",
         "ro": true,
@@ -330,6 +642,19 @@
         "target": "/sys"
       },
       {
+        "flags": {
+          "dirsync": false,
+          "lazytime": false,
+          "noatime": false,
+          "nodev": false,
+          "nodiratime": false,
+          "noexec": false,
+          "nosuid": false,
+          "nosymfollow": false,
+          "relatime": true,
+          "strictatime": false,
+          "sync": false
+        },
         "fstype": "tmpfs",
         "options": "ro,relatime",
         "ro": true,
@@ -337,6 +662,19 @@
         "target": "/sys/firmware"
       },
       {
+        "flags": {
+          "dirsync": false,
+          "lazytime": false,
+          "noatime": false,
+          "nodev": true,
+          "nodiratime": false,
+          "noexec": true,
+          "nosuid": true,
+          "nosymfollow": false,
+          "relatime": true,
+          "strictatime": false,
+          "sync": false
+        },
         "fstype": "cgroup2",
         "options": "ro,nosuid,nodev,noexec,relatime",
         "ro": true,
@@ -415,7 +753,7 @@
     "hassio_role": "default",
     "homeassistant_api": true,
     "slug": "693fb154_elixir_probe",
-    "version": "0.5.0"
+    "version": "0.7.0"
   },
   "versions": {
     "arch": "aarch64",

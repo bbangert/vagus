@@ -61,6 +61,24 @@ defmodule Vagus.ProbeParity.VolatileAllowlistTest do
     """
   end
 
+  # The converse of the check above, for the one field where a too-broad entry
+  # is a security hole rather than a lost measurement: masking mounts/*/options
+  # wholesale once suppressed these too, so a capture with an suid-enabled or
+  # executable mount compared equal to a locked-down one.
+  test "the allowlist leaves the mount security flags comparable" do
+    allowlist = Canon.load_allowlist!(@allowlist_path)
+    canonical = Canon.canonicalize(@fixture, allowlist)
+
+    for flag <- ~w(nodev noexec nosuid sync dirsync nosymfollow),
+        index <- 0..(length(@fixture["fingerprint"]["mounts"]) - 1) do
+      path = ["fingerprint", "mounts", Access.at(index), "flags", flag]
+      flipped = update_in(@fixture, path, &(not &1))
+
+      assert Canon.diff(canonical, Canon.canonicalize(flipped, allowlist)) != [],
+             "flipping #{flag} on mount #{index} is invisible through the allowlist"
+    end
+  end
+
   test "masking is what makes the fixture compare equal to a differently-sited copy" do
     allowlist = Canon.load_allowlist!(@allowlist_path)
     elsewhere = put_in(@fixture, ["versions", "machine"], "rpi3-64")
