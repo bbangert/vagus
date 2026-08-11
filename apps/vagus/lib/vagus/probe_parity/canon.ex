@@ -121,6 +121,9 @@ defmodule Vagus.ProbeParity.Canon do
     raise ArgumentError, "#{file}: entry needs a path and a reason, got #{inspect(entry)}"
   end
 
+  # `file` is a fixture or allowlist path named by a test or by the operator
+  # running `mix vagus.probe.diff` — bench tooling, never request input.
+  # sobelow_skip ["Traversal.FileModule"]
   defp decode!(file) do
     with {:ok, body} <- File.read(file),
          {:ok, decoded} <- Jason.decode(body) do
