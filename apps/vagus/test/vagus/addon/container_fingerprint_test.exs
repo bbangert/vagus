@@ -1,0 +1,278 @@
+defmodule Vagus.Addon.ContainerFingerprintTest do
+  @moduledoc """
+  Does an add-on Vagus starts *look from the inside* like one a real Supervisor
+  started?
+
+  `Manager.build_spec/2` and `Backend.Container.build_config/1` were written
+  against upstream's `docker/addon.py`, and the tests around them assert the
+  Docker JSON matches what we believe upstream asks for. Belief is the weak
+  part: every one of those assertions restates our own reading of upstream back
+  to itself, so a misread stays green forever. This compares instead against
+  `test/fixtures/haos-2026.07.5-container-fingerprint.json` — captured from
+  inside an add-on container on a real Home Assistant Green by reading its
+  `/proc`, `/etc/hosts`, `/etc/resolv.conf`, environment and mount table.
+
+  ## What is compared, and what deliberately is not
+
+  Only facts the fixture actually witnessed, and only in the direction that
+  carries information:
+
+    * Env is asserted one-way (Spec's keys ⊆ the container's). The rest of the
+      environment — `BINDIR`, `EMU`, `MIX_ENV`, `PATH` — belongs to the image
+      and its base OS, not to the Supervisor, so requiring the reverse would
+      gate Vagus on the probe add-on's Dockerfile.
+    * Token *values* are never compared. The probe redacts them to
+      `"<redacted N bytes>"`; that the key arrived with a redacted value is the
+      whole assertion (injection happened), and a fixture carrying live
+      Supervisor tokens would be a secret in git.
+    * Mounts are asserted both ways, because that direction is where upstream
+      grows things silently. A fixture mount nothing explains fails the test.
+
+  ## Regenerating the fixture
+
+  Requires the bench: install the `probe_*` add-ons from the bench add-on
+  repository, then `POST /eval` with `Jason.encode!(fingerprint_report())` on
+  the Elixir probe and pipe the response through `jq -S .`. The report records
+  the Supervisor version it came from, and the filename must agree with it.
+  """
+
+  use ExUnit.Case, async: true
+
+  alias Vagus.Addon.Backend.Container
+  alias Vagus.Addon.{Config, Manager}
+  alias Vagus.Network
+
+  @fixture_path Path.join([
+                  __DIR__,
+                  "..",
+                  "..",
+                  "fixtures",
+                  "haos-2026.07.5-container-fingerprint.json"
+                ])
+  @external_resource @fixture_path
+  @fixture @fixture_path |> File.read!() |> Jason.decode!()
+
+  @supervisor_version @fixture_path
+                      |> Path.basename()
+                      |> String.replace_prefix("haos-", "")
+                      |> String.replace_suffix("-container-fingerprint.json", "")
+
+  @fingerprint @fixture["fingerprint"]
+  @identity @fixture["identity"]
+
+  # The bench host's zone, passed back in as the `:tz` opt so the env assertion
+  # measures pass-through rather than which zone the bench happens to sit in.
+  @tz @fingerprint["env"]["TZ"]
+
+  # Mount targets every container on this engine has, whoever created it: the
+  # overlay root, the masked/read-only `/proc` and `/sys` subtrees runc applies,
+  # the standard `/dev` device mounts, the three files the daemon binds in
+  # (`/etc/hostname`, `/etc/hosts`, `/etc/resolv.conf`), the engine's own
+  # `/dev/shm`, and `/run/cid` (the Supervisor's cid file, bound by upstream for
+  # every add-on — an add-on-visible file, not a container knob Vagus sets).
+  # `/proc/*` and `/sys/*` are matched by prefix: the exact set of masked paths
+  # is a runc version detail and pinning it would make this a runc test.
+  @engine_baseline [
+    "/",
+    "/dev/hugepages",
+    "/dev/mqueue",
+    "/dev/pts",
+    "/dev/shm",
+    "/etc/hostname",
+    "/etc/hosts",
+    "/etc/resolv.conf",
+    "/proc",
+    "/run/cid",
+    "/sys"
+  ]
+  @engine_baseline_prefixes ["/proc/", "/sys/"]
+
+  # Divergences reviewed and accepted. Same discipline as
+  # `Vagus.API.PermissionMatrixTest`: an entry is a decision with a reason, not
+  # a silenced failure, and anything not listed fails loudly.
+  @accepted_mounts %{
+    # Upstream binds the host's whole `/dev` read-only into every add-on
+    # (`docker/addon.py` MOUNT_DEV), so an add-on can open a device node it was
+    # granted without a per-device mount. Vagus creates no such mount, which
+    # means device-touching add-ons see an image-provided `/dev` instead of the
+    # host's. Known gap, tracked as VAGUS-1.
+    "/dev" => "wholesale ro /dev bind upstream gives every add-on; Vagus does not create it"
+  }
+
+  @accepted_dns_options %{
+    # Not produced by `build_spec/2`, and not obviously the Supervisor's either:
+    # libnetwork writes `options ndots:0` into the resolv.conf of a container it
+    # serves with embedded DNS, which fits the `127.0.0.11` nameserver beside it.
+    # Recorded rather than chased, because "add ndots:0 to Spec" would be a
+    # guess: if the engine writes it, Vagus gets it for free, and if upstream
+    # sets it, Spec is missing it. Pending investigation.
+    "ndots:0" => "observed in HAOS resolv.conf; likely engine embedded-DNS, not Spec — unverified"
+  }
+
+  setup_all do
+    {:ok, config} =
+      Config.parse(%{
+        "name" => "Elixir probe",
+        "version" => @identity["version"],
+        "slug" => @identity["slug"],
+        "description" => "bench probe",
+        "arch" => [@fixture["versions"]["arch"]],
+        "image" => "ghcr.io/bbangert/ha-bench-addons/elixir_probe",
+        "init" => false,
+        "boot" => "manual",
+        "startup" => "application",
+        "homeassistant_api" => @identity["homeassistant_api"],
+        "hassio_api" => @identity["hassio_api"],
+        "ports" => %{"4000/tcp" => 4000}
+      })
+
+    spec =
+      Manager.build_spec(config,
+        access_token: "fingerprint-token",
+        arch: @fixture["versions"]["arch"],
+        data_root: "/mnt/data/supervisor",
+        tz: @tz
+      )
+
+    %{spec: spec, host_config: Container.build_config(spec)["HostConfig"]}
+  end
+
+  test "the fixture records the Supervisor version its filename claims" do
+    assert @fixture["versions"]["supervisor"] == @supervisor_version
+  end
+
+  test "every env var Spec injects reached the container", %{spec: spec} do
+    env = @fingerprint["env"]
+
+    for key <- Map.keys(spec.env) do
+      assert Map.has_key?(env, key), "Spec injects #{key}, but the real add-on had no such var"
+    end
+
+    assert env["TZ"] == spec.env["TZ"]
+
+    # The probe redacts token values, so this proves the tokens were injected
+    # and non-empty without the fixture ever carrying one.
+    for key <- ["SUPERVISOR_TOKEN", "HASSIO_TOKEN"] do
+      assert String.starts_with?(env[key], "<redacted ")
+    end
+  end
+
+  test "the container's hostname is the slug with underscores dashed", %{spec: spec} do
+    expected = String.replace(@identity["slug"], "_", "-")
+
+    assert @fingerprint["hostname"] == expected
+    assert spec.hostname == expected
+  end
+
+  test "resolver search domain and options match, ndots aside", %{spec: spec} do
+    resolv = @fingerprint["resolv_conf"]
+
+    assert spec.dns_search == resolv["search"]
+
+    # The fixture's only nameserver is 127.0.0.11 — the engine's embedded DNS
+    # resolver, which forwards to whatever `--dns` the container was created
+    # with. `Spec.dns` (the Supervisor DNS plugin address, 172.30.32.3) is that
+    # upstream, and is invisible from inside the container, so comparing the two
+    # would be comparing an engine artifact to a Vagus setting.
+    assert resolv["nameservers"] == ["127.0.0.11"]
+
+    for option <- spec.dns_options do
+      assert option in resolv["options"], "Spec sets #{option}, absent from the real resolv.conf"
+    end
+
+    unexplained =
+      Enum.reject(resolv["options"] -- spec.dns_options, &Map.has_key?(@accepted_dns_options, &1))
+
+    assert unexplained == [], """
+    The real add-on's resolv.conf carries options Spec does not set and the
+    ledger does not explain: #{inspect(unexplained)}
+    """
+  end
+
+  test "supervisor and hassio resolve to the bridge anchor", %{spec: spec} do
+    for {name, ip} <- spec.extra_hosts do
+      entry = Enum.find(@fingerprint["etc_hosts"], &(name in &1["names"]))
+
+      assert entry, "Spec injects host #{name}, absent from the real /etc/hosts"
+      assert entry["ip"] == ip
+    end
+
+    # Guards the assertion above against passing vacuously if Spec ever stops
+    # injecting these: they are half the add-on contract (`http://supervisor/`).
+    assert Map.keys(spec.extra_hosts) |> Enum.sort() == ["hassio", "supervisor"]
+    assert spec.extra_hosts["supervisor"] == Network.supervisor_ip()
+  end
+
+  test "Spec's tmpfs entries exist as tmpfs in the container", %{spec: spec} do
+    for target <- Map.keys(spec.tmpfs) do
+      mounts = Enum.filter(@fingerprint["mounts"], &(&1["target"] == target))
+
+      assert mounts != [], "Spec mounts tmpfs at #{target}, absent from the real mount table"
+      assert Enum.any?(mounts, &(&1["fstype"] == "tmpfs"))
+    end
+  end
+
+  test "every mount Spec declares is present in the container", %{spec: spec} do
+    for %{target: target} = mount <- spec.mounts do
+      fixture_mount = Enum.find(@fingerprint["mounts"], &(&1["target"] == target))
+
+      assert fixture_mount, "Spec mounts #{target}, absent from the real mount table"
+
+      # Sources are host paths and differ by machine and data-root layout; the
+      # comparable facts are that the target exists and its writability agrees.
+      assert fixture_mount["ro"] == Map.get(mount, :read_only, false)
+    end
+  end
+
+  test "every mount the container has is explained", %{spec: spec} do
+    explained = Map.keys(spec.tmpfs) ++ Enum.map(spec.mounts, & &1.target)
+
+    unexplained =
+      @fingerprint["mounts"]
+      |> Enum.map(& &1["target"])
+      |> Enum.uniq()
+      |> Enum.reject(fn target ->
+        target in explained or engine_baseline?(target) or
+          Map.has_key?(@accepted_mounts, target)
+      end)
+
+    assert unexplained == [], """
+    The real add-on has mounts neither Spec nor the engine baseline explains:
+
+    #{inspect(unexplained)}
+
+    A new one is the point of this test: either Vagus should create it, or it
+    belongs in @accepted_mounts with a reason.
+    """
+  end
+
+  test "the accepted mount gap is still exactly what was accepted" do
+    dev = Enum.find(@fingerprint["mounts"], &(&1["target"] == "/dev"))
+
+    assert dev["fstype"] == "devtmpfs"
+    assert dev["ro"] == true
+  end
+
+  test "OomScoreAdj, seccomp and pid 1 match what the backend stamps", %{
+    spec: spec,
+    host_config: host_config
+  } do
+    assert @fingerprint["proc"]["oom_score_adj"] == host_config["OomScoreAdj"]
+
+    # /proc/self/status Seccomp: 0 is SECCOMP_MODE_DISABLED — the observable
+    # consequence of `seccomp=unconfined`, which is what the backend stamps.
+    assert @fingerprint["status"]["Seccomp"] == "0"
+    assert "seccomp=unconfined" in host_config["SecurityOpt"]
+
+    # `init: false` means no docker-init shim, so the image's own entrypoint is
+    # pid 1 — beam.smp here, which is only true if nothing was injected above it.
+    assert spec.init == false
+    assert host_config["Init"] == false
+    assert @fingerprint["proc"]["pid1_comm"] == "beam.smp"
+  end
+
+  defp engine_baseline?(target) do
+    target in @engine_baseline or
+      Enum.any?(@engine_baseline_prefixes, &String.starts_with?(target, &1))
+  end
+end

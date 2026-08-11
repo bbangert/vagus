@@ -1,0 +1,38 @@
+[
+  {
+    "path": "versions/machine",
+    "reason": "The board the capture ran on. The HAOS bench is a Home Assistant Green and Vagus runs on different hardware by construction, so this can never match; masking it keeps the rest of versions/ (arch, channel, supervisor, homeassistant) comparable, and arch staying comparable is what warns a reviewer that a cross-architecture comparison has invalidated the capability and mount rows."
+  },
+  {
+    "path": "versions/hassos",
+    "reason": "The OS build of the box. Vagus is not HAOS, so this is a permanent divergence carrying no information about the add-on-facing contract. The Supervisor and Core versions the capture came from stay comparable, which is where provenance actually matters."
+  },
+  {
+    "path": "fingerprint/env/TZ",
+    "reason": "Supervisor injects the host's configured timezone. That it is injected at all is contract and is still measured (a missing TZ diffs sentinel against :absent), but the value is per-installation configuration."
+  },
+  {
+    "path": "fingerprint/mounts/*/source",
+    "reason": "Host-side device or path for each bind. Per-machine storage layout by design (data disk device node, addon data directory root). target, fstype and ro stay comparable, and those carry the policy."
+  },
+  {
+    "path": "fingerprint/mounts/*/options",
+    "reason": "Per-mount option string as the kernel reports it, which varies with kernel version and filesystem driver (relatime/noatime defaults, propagation-adjacent flags) rather than with anything Vagus chooses. The one option that is a decision, read-only versus read-write, is reported separately as ro and stays comparable."
+  },
+  {
+    "path": "fingerprint/interfaces/*/hwaddr",
+    "reason": "MAC addresses, assigned by the container engine per container."
+  },
+  {
+    "path": "fingerprint/interfaces/*/addrs/*/addr",
+    "reason": "Addresses assigned to the container (DHCP from the engine's network, and IPv6 link-local derived from the volatile MAC). Only the address itself is masked: family and prefix_or_mask stay comparable, so the hassio network's fixed 172.30.32.0/23 shape is still measured."
+  },
+  {
+    "path": "fingerprint/etc_hosts/*/ip",
+    "reason": "The container's own /etc/hosts entry carries its assigned address, and a positional pattern cannot single that line out from the localhost lines. The names on every entry stay comparable, so the entry set is still measured, and the address contract that matters — the DNS plugin's address — is measured through resolv_conf/nameservers, which is deliberately not masked."
+  },
+  {
+    "path": "fingerprint/cgroup/self",
+    "reason": "The cgroup path embeds the container id, which is new on every start. The three cgroup limits alongside it stay comparable since those are values the Supervisor sets."
+  }
+]
