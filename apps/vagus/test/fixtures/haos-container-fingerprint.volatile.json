@@ -1,0 +1,54 @@
+[
+  {
+    "path": "versions/machine",
+    "reason": "The board the capture ran on. The HAOS bench is a Home Assistant Green and Vagus runs on different hardware by construction, so this can never match; masking it keeps the rest of versions/ (arch, channel, supervisor, homeassistant) comparable, and arch staying comparable is what warns a reviewer that a cross-architecture comparison has invalidated the capability and mount rows."
+  },
+  {
+    "path": "versions/hassos",
+    "reason": "The OS build of the box. Vagus is not HAOS, so this is a permanent divergence carrying no information about the add-on-facing contract. The Supervisor and Core versions the capture came from stay comparable, which is where provenance actually matters."
+  },
+  {
+    "path": "fingerprint/env/TZ",
+    "reason": "Supervisor injects the host's configured timezone. That it is injected at all is contract and is still measured (a missing TZ diffs sentinel against :absent), but the value is per-installation configuration."
+  },
+  {
+    "path": "fingerprint/mounts/*/source",
+    "reason": "Host-side device or path for each bind. Per-machine storage layout by design (data disk device node, addon data directory root). target, fstype and ro stay comparable, and those carry the policy."
+  },
+  {
+    "path": "fingerprint/mounts/*/options",
+    "reason": "The raw option string as the kernel renders it, which carries driver-specific noise no policy depends on (overlay's lowerdir/upperdir, tmpfs size and mode, per-filesystem tuning) and reorders or renames with the kernel version. Masking it costs nothing now that the probe extracts the option bits that are decisions into flags, where nosuid, nodev, noexec, sync, dirsync and nosymfollow are each compared on their own; read-only versus read-write is likewise reported separately as ro."
+  },
+  {
+    "path": "fingerprint/mounts/*/flags/relatime",
+    "reason": "The kernel's default atime policy since 2.6.30, applied when a mount names no atime option at all — which every mount here does. It is a property of how the host booted and how the underlying filesystem was mounted, propagated into the bind, not of anything the Supervisor or Vagus asks for."
+  },
+  {
+    "path": "fingerprint/mounts/*/flags/noatime",
+    "reason": "Suppressing access-time updates outright is host storage tuning: an image or data partition mounted noatime pushes that flag into every bind taken from it, so a Vagus board with a differently tuned /data would diverge here for a reason that has no add-on-facing consequence."
+  },
+  {
+    "path": "fingerprint/mounts/*/flags/nodiratime",
+    "reason": "The directory-only half of noatime, set by the same host mount tuning and inherited by binds the same way. Masked alongside noatime so a fleet that tunes one and not the other does not diverge twice for one storage decision."
+  },
+  {
+    "path": "fingerprint/mounts/*/flags/strictatime",
+    "reason": "Opts a mount back out of relatime into full POSIX atime accounting. Nothing in the add-on contract reads atime, so which of the three atime policies a mount landed on records the host's storage configuration and kernel defaults rather than a difference an add-on could observe."
+  },
+  {
+    "path": "fingerprint/mounts/*/flags/lazytime",
+    "reason": "Defers writing timestamp updates to disk. Purely a durability-versus-wear tradeoff the host makes per filesystem — visible in the mount table, invisible to an add-on, and expected to differ between a Home Assistant Green's eMMC and Vagus boards on NVMe or UFS."
+  },
+  {
+    "path": "fingerprint/interfaces/*/hwaddr",
+    "reason": "MAC addresses, assigned by the container engine per container."
+  },
+  {
+    "path": "fingerprint/interfaces/*/addrs/*/addr",
+    "reason": "Addresses assigned to the container: the engine hands out the IPv4 and IPv6 global addresses from its pool, and the link-local one is derived from the volatile MAC. The address itself is therefore not compared at all — only family and prefix_or_mask are, and prefix_or_mask is just the mask, so a wrong prefix length diverges while an address on an entirely different network under the same 255.255.254.0 does not. The pattern is positional and so masks the fixed loopback addresses too, which it cannot single out. What an add-on actually depends on — that supervisor and hassio answer at 172.30.32.2 — is compared through etc_hosts, which is deliberately not masked."
+  },
+  {
+    "path": "fingerprint/cgroup/self",
+    "reason": "The cgroup path embeds the container id, which is new on every start. The three cgroup limits alongside it stay comparable since those are values the Supervisor sets."
+  }
+]

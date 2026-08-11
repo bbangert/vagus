@@ -61,19 +61,24 @@ defmodule Vagus.Runtime.Logs.FollowTest do
   # hit the already-closed socket is a scheduler race — the close is the
   # asserted behaviour, so both outcomes are legal. CI's slower scheduler
   # loses this race reliably where a dev machine almost never does.
+  #
+  # Which errno the loser gets is itself unstable: :closed once the port is
+  # gone, :enotconn when the FD outlives the connection, :epipe when the peer
+  # sent RST. They all mean the same thing here, so any send error passes —
+  # naming one of them made CI red for a race the test deliberately allows.
   defp send_chunk_may_close(sock, binary) do
     size_hex = binary |> byte_size() |> Integer.to_string(16)
 
     case :gen_tcp.send(sock, size_hex <> "\r\n" <> binary <> "\r\n") do
       :ok -> :ok
-      {:error, :closed} -> :ok
+      {:error, _peer_hung_up} -> :ok
     end
   end
 
   defp send_final_chunk_may_close(sock) do
     case :gen_tcp.send(sock, "0\r\n\r\n") do
       :ok -> :ok
-      {:error, :closed} -> :ok
+      {:error, _peer_hung_up} -> :ok
     end
   end
 

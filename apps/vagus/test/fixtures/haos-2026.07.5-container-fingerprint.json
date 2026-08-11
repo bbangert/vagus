@@ -1,0 +1,766 @@
+{
+  "fingerprint": {
+    "cgroup": {
+      "cpu_max": "max 100000",
+      "memory_max": "max",
+      "pids_max": "4279",
+      "self": [
+        "0::/"
+      ]
+    },
+    "env": {
+      "BINDIR": "/usr/local/lib/erlang/erts-15.2.7.12/bin",
+      "EMU": "beam",
+      "HASSIO_TOKEN": "<redacted 112 bytes>",
+      "HOME": "/root",
+      "HOSTNAME": "693fb154-elixir-probe",
+      "MIX_ENV": "prod",
+      "PATH": "/usr/local/lib/erlang/erts-15.2.7.12/bin:/usr/local/lib/erlang/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+      "PROGNAME": "erl",
+      "PWD": "/app",
+      "ROOTDIR": "/usr/local/lib/erlang",
+      "SHLVL": "2",
+      "SUPERVISOR_TOKEN": "<redacted 112 bytes>",
+      "TZ": "America/Los_Angeles"
+    },
+    "etc_hosts": [
+      {
+        "ip": "127.0.0.1",
+        "names": [
+          "localhost"
+        ]
+      },
+      {
+        "ip": "::1",
+        "names": [
+          "localhost",
+          "ip6-localhost",
+          "ip6-loopback"
+        ]
+      },
+      {
+        "ip": "fe00::",
+        "names": [
+          "ip6-localnet"
+        ]
+      },
+      {
+        "ip": "ff00::",
+        "names": [
+          "ip6-mcastprefix"
+        ]
+      },
+      {
+        "ip": "ff02::1",
+        "names": [
+          "ip6-allnodes"
+        ]
+      },
+      {
+        "ip": "ff02::2",
+        "names": [
+          "ip6-allrouters"
+        ]
+      },
+      {
+        "ip": "172.30.32.2",
+        "names": [
+          "supervisor"
+        ]
+      },
+      {
+        "ip": "172.30.32.2",
+        "names": [
+          "hassio"
+        ]
+      },
+      {
+        "ip": "172.30.33.0",
+        "names": [
+          "693fb154-elixir-probe.local.hass.io",
+          "693fb154-elixir-probe"
+        ]
+      },
+      {
+        "ip": "fd0c:ac1e:2100::7",
+        "names": [
+          "693fb154-elixir-probe.local.hass.io",
+          "693fb154-elixir-probe"
+        ]
+      }
+    ],
+    "hostname": "693fb154-elixir-probe",
+    "ids": {
+      "egid": 0,
+      "euid": 0,
+      "gid": 0,
+      "groups": [
+        0,
+        0,
+        1,
+        2,
+        3,
+        4,
+        6,
+        10,
+        11,
+        20,
+        26,
+        27
+      ],
+      "uid": 0
+    },
+    "interfaces": [
+      {
+        "addrs": [
+          {
+            "addr": "172.30.33.0",
+            "family": "inet",
+            "prefix_or_mask": "255.255.254.0"
+          },
+          {
+            "addr": "fd0c:ac1e:2100::7",
+            "family": "inet6",
+            "prefix_or_mask": "ffff:ffff:ffff::"
+          },
+          {
+            "addr": "fe80::a4c8:29ff:fed1:ecd9",
+            "family": "inet6",
+            "prefix_or_mask": "ffff:ffff:ffff:ffff::"
+          }
+        ],
+        "flags": [
+          "broadcast",
+          "multicast",
+          "running",
+          "up"
+        ],
+        "hwaddr": "a6:c8:29:d1:ec:d9",
+        "name": "eth0"
+      },
+      {
+        "addrs": [
+          {
+            "addr": "127.0.0.1",
+            "family": "inet",
+            "prefix_or_mask": "255.0.0.0"
+          },
+          {
+            "addr": "::1",
+            "family": "inet6",
+            "prefix_or_mask": "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff"
+          }
+        ],
+        "flags": [
+          "loopback",
+          "running",
+          "up"
+        ],
+        "hwaddr": "00:00:00:00:00:00",
+        "name": "lo"
+      }
+    ],
+    "mounts": [
+      {
+        "flags": {
+          "dirsync": false,
+          "lazytime": false,
+          "noatime": false,
+          "nodev": false,
+          "nodiratime": false,
+          "noexec": false,
+          "nosuid": false,
+          "nosymfollow": false,
+          "relatime": true,
+          "strictatime": false,
+          "sync": false
+        },
+        "fstype": "overlay",
+        "options": "rw,relatime",
+        "ro": false,
+        "source": "overlay",
+        "target": "/"
+      },
+      {
+        "flags": {
+          "dirsync": false,
+          "lazytime": false,
+          "noatime": false,
+          "nodev": false,
+          "nodiratime": false,
+          "noexec": false,
+          "nosuid": false,
+          "nosymfollow": false,
+          "relatime": true,
+          "strictatime": false,
+          "sync": false
+        },
+        "fstype": "ext4",
+        "options": "rw,relatime",
+        "ro": false,
+        "source": "/dev/mmcblk0p8/supervisor/apps/data/693fb154_elixir_probe",
+        "target": "/data"
+      },
+      {
+        "flags": {
+          "dirsync": false,
+          "lazytime": false,
+          "noatime": false,
+          "nodev": false,
+          "nodiratime": false,
+          "noexec": false,
+          "nosuid": false,
+          "nosymfollow": false,
+          "relatime": true,
+          "strictatime": false,
+          "sync": false
+        },
+        "fstype": "devtmpfs",
+        "options": "ro,relatime",
+        "ro": true,
+        "source": "devtmpfs",
+        "target": "/dev"
+      },
+      {
+        "flags": {
+          "dirsync": false,
+          "lazytime": false,
+          "noatime": false,
+          "nodev": true,
+          "nodiratime": false,
+          "noexec": false,
+          "nosuid": true,
+          "nosymfollow": false,
+          "relatime": true,
+          "strictatime": false,
+          "sync": false
+        },
+        "fstype": "hugetlbfs",
+        "options": "rw,nosuid,nodev,relatime",
+        "ro": false,
+        "source": "hugetlbfs",
+        "target": "/dev/hugepages"
+      },
+      {
+        "flags": {
+          "dirsync": false,
+          "lazytime": false,
+          "noatime": false,
+          "nodev": true,
+          "nodiratime": false,
+          "noexec": true,
+          "nosuid": true,
+          "nosymfollow": false,
+          "relatime": true,
+          "strictatime": false,
+          "sync": false
+        },
+        "fstype": "mqueue",
+        "options": "rw,nosuid,nodev,noexec,relatime",
+        "ro": false,
+        "source": "mqueue",
+        "target": "/dev/mqueue"
+      },
+      {
+        "flags": {
+          "dirsync": false,
+          "lazytime": false,
+          "noatime": false,
+          "nodev": false,
+          "nodiratime": false,
+          "noexec": true,
+          "nosuid": true,
+          "nosymfollow": false,
+          "relatime": true,
+          "strictatime": false,
+          "sync": false
+        },
+        "fstype": "devpts",
+        "options": "rw,nosuid,noexec,relatime",
+        "ro": false,
+        "source": "devpts",
+        "target": "/dev/pts"
+      },
+      {
+        "flags": {
+          "dirsync": false,
+          "lazytime": false,
+          "noatime": false,
+          "nodev": true,
+          "nodiratime": false,
+          "noexec": false,
+          "nosuid": true,
+          "nosymfollow": false,
+          "relatime": false,
+          "strictatime": false,
+          "sync": false
+        },
+        "fstype": "tmpfs",
+        "options": "rw,nosuid,nodev",
+        "ro": false,
+        "source": "tmpfs",
+        "target": "/dev/shm"
+      },
+      {
+        "flags": {
+          "dirsync": false,
+          "lazytime": false,
+          "noatime": false,
+          "nodev": true,
+          "nodiratime": false,
+          "noexec": true,
+          "nosuid": true,
+          "nosymfollow": false,
+          "relatime": true,
+          "strictatime": false,
+          "sync": false
+        },
+        "fstype": "tmpfs",
+        "options": "rw,nosuid,nodev,noexec,relatime",
+        "ro": false,
+        "source": "tmpfs",
+        "target": "/dev/shm"
+      },
+      {
+        "flags": {
+          "dirsync": false,
+          "lazytime": false,
+          "noatime": false,
+          "nodev": false,
+          "nodiratime": false,
+          "noexec": false,
+          "nosuid": false,
+          "nosymfollow": false,
+          "relatime": true,
+          "strictatime": false,
+          "sync": false
+        },
+        "fstype": "ext4",
+        "options": "rw,relatime",
+        "ro": false,
+        "source": "/dev/mmcblk0p8/docker/containers/86e0658121e60e3d9c1cbc64b5ce443072b313b08074d41921c8872dec7333b1/hostname",
+        "target": "/etc/hostname"
+      },
+      {
+        "flags": {
+          "dirsync": false,
+          "lazytime": false,
+          "noatime": false,
+          "nodev": false,
+          "nodiratime": false,
+          "noexec": false,
+          "nosuid": false,
+          "nosymfollow": false,
+          "relatime": true,
+          "strictatime": false,
+          "sync": false
+        },
+        "fstype": "ext4",
+        "options": "rw,relatime",
+        "ro": false,
+        "source": "/dev/mmcblk0p8/docker/containers/86e0658121e60e3d9c1cbc64b5ce443072b313b08074d41921c8872dec7333b1/hosts",
+        "target": "/etc/hosts"
+      },
+      {
+        "flags": {
+          "dirsync": false,
+          "lazytime": false,
+          "noatime": false,
+          "nodev": false,
+          "nodiratime": false,
+          "noexec": false,
+          "nosuid": false,
+          "nosymfollow": false,
+          "relatime": true,
+          "strictatime": false,
+          "sync": false
+        },
+        "fstype": "ext4",
+        "options": "rw,relatime",
+        "ro": false,
+        "source": "/dev/mmcblk0p8/docker/containers/86e0658121e60e3d9c1cbc64b5ce443072b313b08074d41921c8872dec7333b1/resolv.conf",
+        "target": "/etc/resolv.conf"
+      },
+      {
+        "flags": {
+          "dirsync": false,
+          "lazytime": false,
+          "noatime": false,
+          "nodev": true,
+          "nodiratime": false,
+          "noexec": true,
+          "nosuid": true,
+          "nosymfollow": false,
+          "relatime": true,
+          "strictatime": false,
+          "sync": false
+        },
+        "fstype": "proc",
+        "options": "rw,nosuid,nodev,noexec,relatime",
+        "ro": false,
+        "source": "proc",
+        "target": "/proc"
+      },
+      {
+        "flags": {
+          "dirsync": false,
+          "lazytime": false,
+          "noatime": false,
+          "nodev": false,
+          "nodiratime": false,
+          "noexec": false,
+          "nosuid": false,
+          "nosymfollow": false,
+          "relatime": true,
+          "strictatime": false,
+          "sync": false
+        },
+        "fstype": "tmpfs",
+        "options": "ro,relatime",
+        "ro": true,
+        "source": "tmpfs",
+        "target": "/proc/asound"
+      },
+      {
+        "flags": {
+          "dirsync": false,
+          "lazytime": false,
+          "noatime": false,
+          "nodev": true,
+          "nodiratime": false,
+          "noexec": true,
+          "nosuid": true,
+          "nosymfollow": false,
+          "relatime": true,
+          "strictatime": false,
+          "sync": false
+        },
+        "fstype": "proc",
+        "options": "ro,nosuid,nodev,noexec,relatime",
+        "ro": true,
+        "source": "proc/bus",
+        "target": "/proc/bus"
+      },
+      {
+        "flags": {
+          "dirsync": false,
+          "lazytime": false,
+          "noatime": false,
+          "nodev": true,
+          "nodiratime": false,
+          "noexec": true,
+          "nosuid": true,
+          "nosymfollow": false,
+          "relatime": true,
+          "strictatime": false,
+          "sync": false
+        },
+        "fstype": "proc",
+        "options": "ro,nosuid,nodev,noexec,relatime",
+        "ro": true,
+        "source": "proc/fs",
+        "target": "/proc/fs"
+      },
+      {
+        "flags": {
+          "dirsync": false,
+          "lazytime": false,
+          "noatime": false,
+          "nodev": false,
+          "nodiratime": false,
+          "noexec": false,
+          "nosuid": false,
+          "nosymfollow": false,
+          "relatime": true,
+          "strictatime": false,
+          "sync": false
+        },
+        "fstype": "devtmpfs",
+        "options": "ro,relatime",
+        "ro": true,
+        "source": "devtmpfs/null",
+        "target": "/proc/interrupts"
+      },
+      {
+        "flags": {
+          "dirsync": false,
+          "lazytime": false,
+          "noatime": false,
+          "nodev": true,
+          "nodiratime": false,
+          "noexec": true,
+          "nosuid": true,
+          "nosymfollow": false,
+          "relatime": true,
+          "strictatime": false,
+          "sync": false
+        },
+        "fstype": "proc",
+        "options": "ro,nosuid,nodev,noexec,relatime",
+        "ro": true,
+        "source": "proc/irq",
+        "target": "/proc/irq"
+      },
+      {
+        "flags": {
+          "dirsync": false,
+          "lazytime": false,
+          "noatime": false,
+          "nodev": false,
+          "nodiratime": false,
+          "noexec": false,
+          "nosuid": false,
+          "nosymfollow": false,
+          "relatime": true,
+          "strictatime": false,
+          "sync": false
+        },
+        "fstype": "devtmpfs",
+        "options": "ro,relatime",
+        "ro": true,
+        "source": "devtmpfs/null",
+        "target": "/proc/keys"
+      },
+      {
+        "flags": {
+          "dirsync": false,
+          "lazytime": false,
+          "noatime": false,
+          "nodev": false,
+          "nodiratime": false,
+          "noexec": false,
+          "nosuid": false,
+          "nosymfollow": false,
+          "relatime": true,
+          "strictatime": false,
+          "sync": false
+        },
+        "fstype": "tmpfs",
+        "options": "ro,relatime",
+        "ro": true,
+        "source": "tmpfs",
+        "target": "/proc/scsi"
+      },
+      {
+        "flags": {
+          "dirsync": false,
+          "lazytime": false,
+          "noatime": false,
+          "nodev": true,
+          "nodiratime": false,
+          "noexec": true,
+          "nosuid": true,
+          "nosymfollow": false,
+          "relatime": true,
+          "strictatime": false,
+          "sync": false
+        },
+        "fstype": "proc",
+        "options": "ro,nosuid,nodev,noexec,relatime",
+        "ro": true,
+        "source": "proc/sys",
+        "target": "/proc/sys"
+      },
+      {
+        "flags": {
+          "dirsync": false,
+          "lazytime": false,
+          "noatime": false,
+          "nodev": true,
+          "nodiratime": false,
+          "noexec": true,
+          "nosuid": true,
+          "nosymfollow": false,
+          "relatime": true,
+          "strictatime": false,
+          "sync": false
+        },
+        "fstype": "proc",
+        "options": "ro,nosuid,nodev,noexec,relatime",
+        "ro": true,
+        "source": "proc/sysrq-trigger",
+        "target": "/proc/sysrq-trigger"
+      },
+      {
+        "flags": {
+          "dirsync": false,
+          "lazytime": false,
+          "noatime": false,
+          "nodev": false,
+          "nodiratime": false,
+          "noexec": false,
+          "nosuid": false,
+          "nosymfollow": false,
+          "relatime": true,
+          "strictatime": false,
+          "sync": false
+        },
+        "fstype": "devtmpfs",
+        "options": "ro,relatime",
+        "ro": true,
+        "source": "devtmpfs/null",
+        "target": "/proc/timer_list"
+      },
+      {
+        "flags": {
+          "dirsync": false,
+          "lazytime": false,
+          "noatime": false,
+          "nodev": false,
+          "nodiratime": false,
+          "noexec": false,
+          "nosuid": false,
+          "nosymfollow": false,
+          "relatime": true,
+          "strictatime": false,
+          "sync": false
+        },
+        "fstype": "ext4",
+        "options": "ro,relatime",
+        "ro": true,
+        "source": "/dev/mmcblk0p8/supervisor/cid_files/app_693fb154_elixir_probe.cid",
+        "target": "/run/cid"
+      },
+      {
+        "flags": {
+          "dirsync": false,
+          "lazytime": false,
+          "noatime": false,
+          "nodev": true,
+          "nodiratime": false,
+          "noexec": true,
+          "nosuid": true,
+          "nosymfollow": false,
+          "relatime": true,
+          "strictatime": false,
+          "sync": false
+        },
+        "fstype": "sysfs",
+        "options": "ro,nosuid,nodev,noexec,relatime",
+        "ro": true,
+        "source": "sysfs",
+        "target": "/sys"
+      },
+      {
+        "flags": {
+          "dirsync": false,
+          "lazytime": false,
+          "noatime": false,
+          "nodev": false,
+          "nodiratime": false,
+          "noexec": false,
+          "nosuid": false,
+          "nosymfollow": false,
+          "relatime": true,
+          "strictatime": false,
+          "sync": false
+        },
+        "fstype": "tmpfs",
+        "options": "ro,relatime",
+        "ro": true,
+        "source": "tmpfs",
+        "target": "/sys/firmware"
+      },
+      {
+        "flags": {
+          "dirsync": false,
+          "lazytime": false,
+          "noatime": false,
+          "nodev": true,
+          "nodiratime": false,
+          "noexec": true,
+          "nosuid": true,
+          "nosymfollow": false,
+          "relatime": true,
+          "strictatime": false,
+          "sync": false
+        },
+        "fstype": "cgroup2",
+        "options": "ro,nosuid,nodev,noexec,relatime",
+        "ro": true,
+        "source": "cgroup",
+        "target": "/sys/fs/cgroup"
+      }
+    ],
+    "proc": {
+      "oom_score_adj": 200,
+      "pid1_comm": "beam.smp"
+    },
+    "resolv_conf": {
+      "nameservers": [
+        "127.0.0.11"
+      ],
+      "options": [
+        "timeout:10",
+        "ndots:0"
+      ],
+      "search": [
+        "local.hass.io"
+      ]
+    },
+    "status": {
+      "CapAmb": "0000000000000000",
+      "CapBnd": "00000000a80425fb",
+      "CapEff": "00000000a80425fb",
+      "CapInh": "0000000000000000",
+      "CapPrm": "00000000a80425fb",
+      "NoNewPrivs": "0",
+      "Seccomp": "0"
+    },
+    "well_known": {
+      "/addon_configs": {
+        "exists": false
+      },
+      "/addons": {
+        "exists": false
+      },
+      "/backup": {
+        "exists": false
+      },
+      "/config": {
+        "exists": false
+      },
+      "/data": {
+        "exists": true,
+        "gid": 0,
+        "mode": "0755",
+        "type": "directory",
+        "uid": 0,
+        "writable": true
+      },
+      "/homeassistant": {
+        "exists": false
+      },
+      "/media": {
+        "exists": true,
+        "gid": 0,
+        "mode": "0755",
+        "type": "directory",
+        "uid": 0,
+        "writable": true
+      },
+      "/share": {
+        "exists": false
+      },
+      "/ssl": {
+        "exists": false
+      }
+    }
+  },
+  "identity": {
+    "auth_api": false,
+    "hassio_api": false,
+    "hassio_role": "default",
+    "homeassistant_api": true,
+    "slug": "693fb154_elixir_probe",
+    "version": "0.7.0"
+  },
+  "versions": {
+    "arch": "aarch64",
+    "channel": "stable",
+    "hassos": "18.2",
+    "homeassistant": "2026.8.1",
+    "machine": "green",
+    "supervisor": "2026.07.5"
+  }
+}
