@@ -1,0 +1,1860 @@
+{
+  "_capture": "per add-on: POST /eval with `Jason.encode!(report())`",
+  "_source": "HA Green bench, captured from inside add-on containers",
+  "_supervisor": "2026.07.5",
+  "paths": [
+    "/addons",
+    "/addons/_slug/info",
+    "/addons/_slug/logs",
+    "/addons/_slug/options",
+    "/addons/_slug/security",
+    "/addons/self/info",
+    "/addons/self/logs",
+    "/addons/self/options",
+    "/addons/self/options/config",
+    "/addons/self/stats",
+    "/audio/info",
+    "/auth",
+    "/auth/cache",
+    "/available_updates",
+    "/backups",
+    "/backups/info",
+    "/cli/info",
+    "/core/api/",
+    "/core/api/config",
+    "/core/api/states",
+    "/core/info",
+    "/core/logs",
+    "/core/stats",
+    "/core/websocket",
+    "/discovery",
+    "/dns/info",
+    "/docker/info",
+    "/hardware/info",
+    "/homeassistant/api/config",
+    "/homeassistant/info",
+    "/host/disks/default/usage",
+    "/host/info",
+    "/info",
+    "/ingress/panels",
+    "/jobs/info",
+    "/mounts",
+    "/multicast/info",
+    "/network/info",
+    "/observer/info",
+    "/os/datadisk/list",
+    "/os/datadisk/wipe",
+    "/os/info",
+    "/refresh_updates",
+    "/resolution/info",
+    "/security/info",
+    "/services",
+    "/services/mqtt",
+    "/store",
+    "/store/addons",
+    "/store/addons/_slug/changelog",
+    "/store/addons/_slug/documentation",
+    "/supervisor/info",
+    "/supervisor/logs",
+    "/supervisor/stats"
+  ],
+  "variants": {
+    "hassio_api=false,role=default,homeassistant_api=false,auth_api=false": {
+      "addon": "probe_none",
+      "matrix": {
+        "/addons": {
+          "class": "refused",
+          "status": 403
+        },
+        "/addons/_slug/info": {
+          "class": "refused",
+          "status": 403
+        },
+        "/addons/_slug/logs": {
+          "class": "refused",
+          "status": 403
+        },
+        "/addons/_slug/options": {
+          "class": "refused",
+          "status": 403
+        },
+        "/addons/_slug/security": {
+          "class": "refused",
+          "status": 403
+        },
+        "/addons/self/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/addons/self/logs": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/addons/self/options": {
+          "class": "method",
+          "status": 405
+        },
+        "/addons/self/options/config": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/addons/self/stats": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/audio/info": {
+          "class": "refused",
+          "status": 403
+        },
+        "/auth": {
+          "class": "rejected",
+          "message": "Can't use Home Assistant auth!",
+          "status": 403
+        },
+        "/auth/cache": {
+          "class": "refused",
+          "status": 403
+        },
+        "/available_updates": {
+          "class": "refused",
+          "status": 403
+        },
+        "/backups": {
+          "class": "refused",
+          "status": 403
+        },
+        "/backups/info": {
+          "class": "refused",
+          "status": 403
+        },
+        "/cli/info": {
+          "class": "refused",
+          "status": 403
+        },
+        "/core/api/": {
+          "class": "refused",
+          "status": 401
+        },
+        "/core/api/config": {
+          "class": "refused",
+          "status": 401
+        },
+        "/core/api/states": {
+          "class": "refused",
+          "status": 401
+        },
+        "/core/info": {
+          "class": "refused",
+          "status": 403
+        },
+        "/core/logs": {
+          "class": "refused",
+          "status": 403
+        },
+        "/core/stats": {
+          "class": "refused",
+          "status": 403
+        },
+        "/core/websocket": {
+          "class": "other",
+          "status": 400
+        },
+        "/discovery": {
+          "class": "refused",
+          "status": 401
+        },
+        "/dns/info": {
+          "class": "refused",
+          "status": 403
+        },
+        "/docker/info": {
+          "class": "refused",
+          "status": 403
+        },
+        "/hardware/info": {
+          "class": "refused",
+          "status": 403
+        },
+        "/homeassistant/api/config": {
+          "class": "refused",
+          "status": 401
+        },
+        "/homeassistant/info": {
+          "class": "refused",
+          "status": 403
+        },
+        "/host/disks/default/usage": {
+          "class": "refused",
+          "status": 403
+        },
+        "/host/info": {
+          "class": "refused",
+          "status": 403
+        },
+        "/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/ingress/panels": {
+          "class": "refused",
+          "status": 403
+        },
+        "/jobs/info": {
+          "class": "refused",
+          "status": 403
+        },
+        "/mounts": {
+          "class": "refused",
+          "status": 403
+        },
+        "/multicast/info": {
+          "class": "refused",
+          "status": 403
+        },
+        "/network/info": {
+          "class": "refused",
+          "status": 403
+        },
+        "/observer/info": {
+          "class": "refused",
+          "status": 403
+        },
+        "/os/datadisk/list": {
+          "class": "refused",
+          "status": 403
+        },
+        "/os/datadisk/wipe": {
+          "class": "refused",
+          "status": 403
+        },
+        "/os/info": {
+          "class": "refused",
+          "status": 403
+        },
+        "/refresh_updates": {
+          "class": "refused",
+          "status": 403
+        },
+        "/resolution/info": {
+          "class": "refused",
+          "status": 403
+        },
+        "/security/info": {
+          "class": "refused",
+          "status": 403
+        },
+        "/services": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/services/mqtt": {
+          "class": "rejected",
+          "message": "No access to mqtt service!",
+          "status": 403
+        },
+        "/store": {
+          "class": "refused",
+          "status": 403
+        },
+        "/store/addons": {
+          "class": "refused",
+          "status": 403
+        },
+        "/store/addons/_slug/changelog": {
+          "class": "refused",
+          "status": 403
+        },
+        "/store/addons/_slug/documentation": {
+          "class": "refused",
+          "status": 403
+        },
+        "/supervisor/info": {
+          "class": "refused",
+          "status": 403
+        },
+        "/supervisor/logs": {
+          "class": "refused",
+          "status": 403
+        },
+        "/supervisor/stats": {
+          "class": "refused",
+          "status": 403
+        }
+      }
+    },
+    "hassio_api=false,role=default,homeassistant_api=true,auth_api=false": {
+      "addon": "probe_core_api",
+      "matrix": {
+        "/addons": {
+          "class": "refused",
+          "status": 403
+        },
+        "/addons/_slug/info": {
+          "class": "refused",
+          "status": 403
+        },
+        "/addons/_slug/logs": {
+          "class": "refused",
+          "status": 403
+        },
+        "/addons/_slug/options": {
+          "class": "refused",
+          "status": 403
+        },
+        "/addons/_slug/security": {
+          "class": "refused",
+          "status": 403
+        },
+        "/addons/self/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/addons/self/logs": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/addons/self/options": {
+          "class": "method",
+          "status": 405
+        },
+        "/addons/self/options/config": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/addons/self/stats": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/audio/info": {
+          "class": "refused",
+          "status": 403
+        },
+        "/auth": {
+          "class": "rejected",
+          "message": "Can't use Home Assistant auth!",
+          "status": 403
+        },
+        "/auth/cache": {
+          "class": "refused",
+          "status": 403
+        },
+        "/available_updates": {
+          "class": "refused",
+          "status": 403
+        },
+        "/backups": {
+          "class": "refused",
+          "status": 403
+        },
+        "/backups/info": {
+          "class": "refused",
+          "status": 403
+        },
+        "/cli/info": {
+          "class": "refused",
+          "status": 403
+        },
+        "/core/api/": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/core/api/config": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/core/api/states": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/core/info": {
+          "class": "refused",
+          "status": 403
+        },
+        "/core/logs": {
+          "class": "refused",
+          "status": 403
+        },
+        "/core/stats": {
+          "class": "refused",
+          "status": 403
+        },
+        "/core/websocket": {
+          "class": "other",
+          "status": 400
+        },
+        "/discovery": {
+          "class": "refused",
+          "status": 401
+        },
+        "/dns/info": {
+          "class": "refused",
+          "status": 403
+        },
+        "/docker/info": {
+          "class": "refused",
+          "status": 403
+        },
+        "/hardware/info": {
+          "class": "refused",
+          "status": 403
+        },
+        "/homeassistant/api/config": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/homeassistant/info": {
+          "class": "refused",
+          "status": 403
+        },
+        "/host/disks/default/usage": {
+          "class": "refused",
+          "status": 403
+        },
+        "/host/info": {
+          "class": "refused",
+          "status": 403
+        },
+        "/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/ingress/panels": {
+          "class": "refused",
+          "status": 403
+        },
+        "/jobs/info": {
+          "class": "refused",
+          "status": 403
+        },
+        "/mounts": {
+          "class": "refused",
+          "status": 403
+        },
+        "/multicast/info": {
+          "class": "refused",
+          "status": 403
+        },
+        "/network/info": {
+          "class": "refused",
+          "status": 403
+        },
+        "/observer/info": {
+          "class": "refused",
+          "status": 403
+        },
+        "/os/datadisk/list": {
+          "class": "refused",
+          "status": 403
+        },
+        "/os/datadisk/wipe": {
+          "class": "refused",
+          "status": 403
+        },
+        "/os/info": {
+          "class": "refused",
+          "status": 403
+        },
+        "/refresh_updates": {
+          "class": "refused",
+          "status": 403
+        },
+        "/resolution/info": {
+          "class": "refused",
+          "status": 403
+        },
+        "/security/info": {
+          "class": "refused",
+          "status": 403
+        },
+        "/services": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/services/mqtt": {
+          "class": "rejected",
+          "message": "No access to mqtt service!",
+          "status": 403
+        },
+        "/store": {
+          "class": "refused",
+          "status": 403
+        },
+        "/store/addons": {
+          "class": "refused",
+          "status": 403
+        },
+        "/store/addons/_slug/changelog": {
+          "class": "refused",
+          "status": 403
+        },
+        "/store/addons/_slug/documentation": {
+          "class": "refused",
+          "status": 403
+        },
+        "/supervisor/info": {
+          "class": "refused",
+          "status": 403
+        },
+        "/supervisor/logs": {
+          "class": "refused",
+          "status": 403
+        },
+        "/supervisor/stats": {
+          "class": "refused",
+          "status": 403
+        }
+      }
+    },
+    "hassio_api=true,role=admin,homeassistant_api=false,auth_api=false": {
+      "addon": "probe_admin",
+      "matrix": {
+        "/addons": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/addons/_slug/info": {
+          "class": "rejected",
+          "message": "App _slug does not exist",
+          "status": 404
+        },
+        "/addons/_slug/logs": {
+          "class": "not_found",
+          "status": 404
+        },
+        "/addons/_slug/options": {
+          "class": "method",
+          "status": 405
+        },
+        "/addons/_slug/security": {
+          "class": "method",
+          "status": 405
+        },
+        "/addons/self/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/addons/self/logs": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/addons/self/options": {
+          "class": "method",
+          "status": 405
+        },
+        "/addons/self/options/config": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/addons/self/stats": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/audio/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/auth": {
+          "class": "rejected",
+          "message": "Can't use Home Assistant auth!",
+          "status": 403
+        },
+        "/auth/cache": {
+          "class": "method",
+          "status": 405
+        },
+        "/available_updates": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/backups": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/backups/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/cli/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/core/api/": {
+          "class": "refused",
+          "status": 401
+        },
+        "/core/api/config": {
+          "class": "refused",
+          "status": 401
+        },
+        "/core/api/states": {
+          "class": "refused",
+          "status": 401
+        },
+        "/core/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/core/logs": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/core/stats": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/core/websocket": {
+          "class": "other",
+          "status": 400
+        },
+        "/discovery": {
+          "class": "refused",
+          "status": 401
+        },
+        "/dns/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/docker/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/hardware/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/homeassistant/api/config": {
+          "class": "refused",
+          "status": 401
+        },
+        "/homeassistant/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/host/disks/default/usage": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/host/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/ingress/panels": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/jobs/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/mounts": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/multicast/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/network/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/observer/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/os/datadisk/list": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/os/datadisk/wipe": {
+          "class": "method",
+          "status": 405
+        },
+        "/os/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/refresh_updates": {
+          "class": "method",
+          "status": 405
+        },
+        "/resolution/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/security/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/services": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/services/mqtt": {
+          "class": "rejected",
+          "message": "No access to mqtt service!",
+          "status": 403
+        },
+        "/store": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/store/addons": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/store/addons/_slug/changelog": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/store/addons/_slug/documentation": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/supervisor/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/supervisor/logs": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/supervisor/stats": {
+          "class": "allowed",
+          "status": 200
+        }
+      }
+    },
+    "hassio_api=true,role=backup,homeassistant_api=false,auth_api=false": {
+      "addon": "probe_backup",
+      "matrix": {
+        "/addons": {
+          "class": "refused",
+          "status": 403
+        },
+        "/addons/_slug/info": {
+          "class": "rejected",
+          "message": "App _slug does not exist",
+          "status": 404
+        },
+        "/addons/_slug/logs": {
+          "class": "refused",
+          "status": 403
+        },
+        "/addons/_slug/options": {
+          "class": "refused",
+          "status": 403
+        },
+        "/addons/_slug/security": {
+          "class": "refused",
+          "status": 403
+        },
+        "/addons/self/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/addons/self/logs": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/addons/self/options": {
+          "class": "method",
+          "status": 405
+        },
+        "/addons/self/options/config": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/addons/self/stats": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/audio/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/auth": {
+          "class": "rejected",
+          "message": "Can't use Home Assistant auth!",
+          "status": 403
+        },
+        "/auth/cache": {
+          "class": "refused",
+          "status": 403
+        },
+        "/available_updates": {
+          "class": "refused",
+          "status": 403
+        },
+        "/backups": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/backups/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/cli/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/core/api/": {
+          "class": "refused",
+          "status": 401
+        },
+        "/core/api/config": {
+          "class": "refused",
+          "status": 401
+        },
+        "/core/api/states": {
+          "class": "refused",
+          "status": 401
+        },
+        "/core/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/core/logs": {
+          "class": "refused",
+          "status": 403
+        },
+        "/core/stats": {
+          "class": "refused",
+          "status": 403
+        },
+        "/core/websocket": {
+          "class": "other",
+          "status": 400
+        },
+        "/discovery": {
+          "class": "refused",
+          "status": 401
+        },
+        "/dns/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/docker/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/hardware/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/homeassistant/api/config": {
+          "class": "refused",
+          "status": 401
+        },
+        "/homeassistant/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/host/disks/default/usage": {
+          "class": "refused",
+          "status": 403
+        },
+        "/host/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/ingress/panels": {
+          "class": "refused",
+          "status": 403
+        },
+        "/jobs/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/mounts": {
+          "class": "refused",
+          "status": 403
+        },
+        "/multicast/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/network/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/observer/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/os/datadisk/list": {
+          "class": "refused",
+          "status": 403
+        },
+        "/os/datadisk/wipe": {
+          "class": "refused",
+          "status": 403
+        },
+        "/os/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/refresh_updates": {
+          "class": "refused",
+          "status": 403
+        },
+        "/resolution/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/security/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/services": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/services/mqtt": {
+          "class": "rejected",
+          "message": "No access to mqtt service!",
+          "status": 403
+        },
+        "/store": {
+          "class": "refused",
+          "status": 403
+        },
+        "/store/addons": {
+          "class": "refused",
+          "status": 403
+        },
+        "/store/addons/_slug/changelog": {
+          "class": "refused",
+          "status": 403
+        },
+        "/store/addons/_slug/documentation": {
+          "class": "refused",
+          "status": 403
+        },
+        "/supervisor/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/supervisor/logs": {
+          "class": "refused",
+          "status": 403
+        },
+        "/supervisor/stats": {
+          "class": "refused",
+          "status": 403
+        }
+      }
+    },
+    "hassio_api=true,role=default,homeassistant_api=false,auth_api=false": {
+      "addon": "probe_default",
+      "matrix": {
+        "/addons": {
+          "class": "refused",
+          "status": 403
+        },
+        "/addons/_slug/info": {
+          "class": "rejected",
+          "message": "App _slug does not exist",
+          "status": 404
+        },
+        "/addons/_slug/logs": {
+          "class": "refused",
+          "status": 403
+        },
+        "/addons/_slug/options": {
+          "class": "refused",
+          "status": 403
+        },
+        "/addons/_slug/security": {
+          "class": "refused",
+          "status": 403
+        },
+        "/addons/self/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/addons/self/logs": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/addons/self/options": {
+          "class": "method",
+          "status": 405
+        },
+        "/addons/self/options/config": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/addons/self/stats": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/audio/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/auth": {
+          "class": "rejected",
+          "message": "Can't use Home Assistant auth!",
+          "status": 403
+        },
+        "/auth/cache": {
+          "class": "refused",
+          "status": 403
+        },
+        "/available_updates": {
+          "class": "refused",
+          "status": 403
+        },
+        "/backups": {
+          "class": "refused",
+          "status": 403
+        },
+        "/backups/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/cli/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/core/api/": {
+          "class": "refused",
+          "status": 401
+        },
+        "/core/api/config": {
+          "class": "refused",
+          "status": 401
+        },
+        "/core/api/states": {
+          "class": "refused",
+          "status": 401
+        },
+        "/core/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/core/logs": {
+          "class": "refused",
+          "status": 403
+        },
+        "/core/stats": {
+          "class": "refused",
+          "status": 403
+        },
+        "/core/websocket": {
+          "class": "other",
+          "status": 400
+        },
+        "/discovery": {
+          "class": "refused",
+          "status": 401
+        },
+        "/dns/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/docker/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/hardware/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/homeassistant/api/config": {
+          "class": "refused",
+          "status": 401
+        },
+        "/homeassistant/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/host/disks/default/usage": {
+          "class": "refused",
+          "status": 403
+        },
+        "/host/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/ingress/panels": {
+          "class": "refused",
+          "status": 403
+        },
+        "/jobs/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/mounts": {
+          "class": "refused",
+          "status": 403
+        },
+        "/multicast/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/network/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/observer/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/os/datadisk/list": {
+          "class": "refused",
+          "status": 403
+        },
+        "/os/datadisk/wipe": {
+          "class": "refused",
+          "status": 403
+        },
+        "/os/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/refresh_updates": {
+          "class": "refused",
+          "status": 403
+        },
+        "/resolution/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/security/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/services": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/services/mqtt": {
+          "class": "rejected",
+          "message": "No access to mqtt service!",
+          "status": 403
+        },
+        "/store": {
+          "class": "refused",
+          "status": 403
+        },
+        "/store/addons": {
+          "class": "refused",
+          "status": 403
+        },
+        "/store/addons/_slug/changelog": {
+          "class": "refused",
+          "status": 403
+        },
+        "/store/addons/_slug/documentation": {
+          "class": "refused",
+          "status": 403
+        },
+        "/supervisor/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/supervisor/logs": {
+          "class": "refused",
+          "status": 403
+        },
+        "/supervisor/stats": {
+          "class": "refused",
+          "status": 403
+        }
+      }
+    },
+    "hassio_api=true,role=default,homeassistant_api=false,auth_api=true": {
+      "addon": "probe_auth",
+      "matrix": {
+        "/addons": {
+          "class": "refused",
+          "status": 403
+        },
+        "/addons/_slug/info": {
+          "class": "rejected",
+          "message": "App _slug does not exist",
+          "status": 404
+        },
+        "/addons/_slug/logs": {
+          "class": "refused",
+          "status": 403
+        },
+        "/addons/_slug/options": {
+          "class": "refused",
+          "status": 403
+        },
+        "/addons/_slug/security": {
+          "class": "refused",
+          "status": 403
+        },
+        "/addons/self/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/addons/self/logs": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/addons/self/options": {
+          "class": "method",
+          "status": 405
+        },
+        "/addons/self/options/config": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/addons/self/stats": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/audio/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/auth": {
+          "class": "refused",
+          "status": 401
+        },
+        "/auth/cache": {
+          "class": "refused",
+          "status": 403
+        },
+        "/available_updates": {
+          "class": "refused",
+          "status": 403
+        },
+        "/backups": {
+          "class": "refused",
+          "status": 403
+        },
+        "/backups/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/cli/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/core/api/": {
+          "class": "refused",
+          "status": 401
+        },
+        "/core/api/config": {
+          "class": "refused",
+          "status": 401
+        },
+        "/core/api/states": {
+          "class": "refused",
+          "status": 401
+        },
+        "/core/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/core/logs": {
+          "class": "refused",
+          "status": 403
+        },
+        "/core/stats": {
+          "class": "refused",
+          "status": 403
+        },
+        "/core/websocket": {
+          "class": "other",
+          "status": 400
+        },
+        "/discovery": {
+          "class": "refused",
+          "status": 401
+        },
+        "/dns/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/docker/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/hardware/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/homeassistant/api/config": {
+          "class": "refused",
+          "status": 401
+        },
+        "/homeassistant/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/host/disks/default/usage": {
+          "class": "refused",
+          "status": 403
+        },
+        "/host/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/ingress/panels": {
+          "class": "refused",
+          "status": 403
+        },
+        "/jobs/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/mounts": {
+          "class": "refused",
+          "status": 403
+        },
+        "/multicast/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/network/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/observer/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/os/datadisk/list": {
+          "class": "refused",
+          "status": 403
+        },
+        "/os/datadisk/wipe": {
+          "class": "refused",
+          "status": 403
+        },
+        "/os/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/refresh_updates": {
+          "class": "refused",
+          "status": 403
+        },
+        "/resolution/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/security/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/services": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/services/mqtt": {
+          "class": "rejected",
+          "message": "No access to mqtt service!",
+          "status": 403
+        },
+        "/store": {
+          "class": "refused",
+          "status": 403
+        },
+        "/store/addons": {
+          "class": "refused",
+          "status": 403
+        },
+        "/store/addons/_slug/changelog": {
+          "class": "refused",
+          "status": 403
+        },
+        "/store/addons/_slug/documentation": {
+          "class": "refused",
+          "status": 403
+        },
+        "/supervisor/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/supervisor/logs": {
+          "class": "refused",
+          "status": 403
+        },
+        "/supervisor/stats": {
+          "class": "refused",
+          "status": 403
+        }
+      }
+    },
+    "hassio_api=true,role=homeassistant,homeassistant_api=false,auth_api=false": {
+      "addon": "probe_homeassistant",
+      "matrix": {
+        "/addons": {
+          "class": "refused",
+          "status": 403
+        },
+        "/addons/_slug/info": {
+          "class": "rejected",
+          "message": "App _slug does not exist",
+          "status": 404
+        },
+        "/addons/_slug/logs": {
+          "class": "refused",
+          "status": 403
+        },
+        "/addons/_slug/options": {
+          "class": "refused",
+          "status": 403
+        },
+        "/addons/_slug/security": {
+          "class": "refused",
+          "status": 403
+        },
+        "/addons/self/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/addons/self/logs": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/addons/self/options": {
+          "class": "method",
+          "status": 405
+        },
+        "/addons/self/options/config": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/addons/self/stats": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/audio/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/auth": {
+          "class": "rejected",
+          "message": "Can't use Home Assistant auth!",
+          "status": 403
+        },
+        "/auth/cache": {
+          "class": "refused",
+          "status": 403
+        },
+        "/available_updates": {
+          "class": "refused",
+          "status": 403
+        },
+        "/backups": {
+          "class": "refused",
+          "status": 403
+        },
+        "/backups/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/cli/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/core/api/": {
+          "class": "refused",
+          "status": 401
+        },
+        "/core/api/config": {
+          "class": "refused",
+          "status": 401
+        },
+        "/core/api/states": {
+          "class": "refused",
+          "status": 401
+        },
+        "/core/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/core/logs": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/core/stats": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/core/websocket": {
+          "class": "other",
+          "status": 400
+        },
+        "/discovery": {
+          "class": "refused",
+          "status": 401
+        },
+        "/dns/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/docker/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/hardware/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/homeassistant/api/config": {
+          "class": "refused",
+          "status": 401
+        },
+        "/homeassistant/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/host/disks/default/usage": {
+          "class": "refused",
+          "status": 403
+        },
+        "/host/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/ingress/panels": {
+          "class": "refused",
+          "status": 403
+        },
+        "/jobs/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/mounts": {
+          "class": "refused",
+          "status": 403
+        },
+        "/multicast/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/network/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/observer/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/os/datadisk/list": {
+          "class": "refused",
+          "status": 403
+        },
+        "/os/datadisk/wipe": {
+          "class": "refused",
+          "status": 403
+        },
+        "/os/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/refresh_updates": {
+          "class": "refused",
+          "status": 403
+        },
+        "/resolution/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/security/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/services": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/services/mqtt": {
+          "class": "rejected",
+          "message": "No access to mqtt service!",
+          "status": 403
+        },
+        "/store": {
+          "class": "refused",
+          "status": 403
+        },
+        "/store/addons": {
+          "class": "refused",
+          "status": 403
+        },
+        "/store/addons/_slug/changelog": {
+          "class": "refused",
+          "status": 403
+        },
+        "/store/addons/_slug/documentation": {
+          "class": "refused",
+          "status": 403
+        },
+        "/supervisor/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/supervisor/logs": {
+          "class": "refused",
+          "status": 403
+        },
+        "/supervisor/stats": {
+          "class": "refused",
+          "status": 403
+        }
+      }
+    },
+    "hassio_api=true,role=manager,homeassistant_api=false,auth_api=false": {
+      "addon": "probe_manager",
+      "matrix": {
+        "/addons": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/addons/_slug/info": {
+          "class": "rejected",
+          "message": "App _slug does not exist",
+          "status": 404
+        },
+        "/addons/_slug/logs": {
+          "class": "not_found",
+          "status": 404
+        },
+        "/addons/_slug/options": {
+          "class": "method",
+          "status": 405
+        },
+        "/addons/_slug/security": {
+          "class": "refused",
+          "status": 403
+        },
+        "/addons/self/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/addons/self/logs": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/addons/self/options": {
+          "class": "method",
+          "status": 405
+        },
+        "/addons/self/options/config": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/addons/self/stats": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/audio/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/auth": {
+          "class": "rejected",
+          "message": "Can't use Home Assistant auth!",
+          "status": 403
+        },
+        "/auth/cache": {
+          "class": "method",
+          "status": 405
+        },
+        "/available_updates": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/backups": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/backups/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/cli/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/core/api/": {
+          "class": "refused",
+          "status": 401
+        },
+        "/core/api/config": {
+          "class": "refused",
+          "status": 401
+        },
+        "/core/api/states": {
+          "class": "refused",
+          "status": 401
+        },
+        "/core/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/core/logs": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/core/stats": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/core/websocket": {
+          "class": "other",
+          "status": 400
+        },
+        "/discovery": {
+          "class": "refused",
+          "status": 401
+        },
+        "/dns/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/docker/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/hardware/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/homeassistant/api/config": {
+          "class": "refused",
+          "status": 401
+        },
+        "/homeassistant/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/host/disks/default/usage": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/host/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/ingress/panels": {
+          "class": "refused",
+          "status": 403
+        },
+        "/jobs/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/mounts": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/multicast/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/network/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/observer/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/os/datadisk/list": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/os/datadisk/wipe": {
+          "class": "refused",
+          "status": 403
+        },
+        "/os/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/refresh_updates": {
+          "class": "method",
+          "status": 405
+        },
+        "/resolution/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/security/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/services": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/services/mqtt": {
+          "class": "rejected",
+          "message": "No access to mqtt service!",
+          "status": 403
+        },
+        "/store": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/store/addons": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/store/addons/_slug/changelog": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/store/addons/_slug/documentation": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/supervisor/info": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/supervisor/logs": {
+          "class": "allowed",
+          "status": 200
+        },
+        "/supervisor/stats": {
+          "class": "allowed",
+          "status": 200
+        }
+      }
+    }
+  },
+  "versions": {
+    "arch": "aarch64",
+    "channel": "stable",
+    "hassos": "18.2",
+    "homeassistant": "2026.8.1",
+    "machine": "green",
+    "supervisor": "2026.07.5"
+  }
+}
