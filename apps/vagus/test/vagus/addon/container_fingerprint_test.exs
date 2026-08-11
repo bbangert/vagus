@@ -178,9 +178,13 @@ defmodule Vagus.Addon.ContainerFingerprintTest do
 
     assert env["TZ"] == spec.env["TZ"]
 
-    # The probe redacts token values, so this proves the tokens were injected
-    # and non-empty without the fixture ever carrying one.
+    # Both sides, because either alone passes vacuously: the loop above stops
+    # checking a key Spec stopped injecting, and the fixture's redaction only
+    # ever witnesses what the bench's Supervisor did. Values cannot be compared
+    # — the probe redacts them — so non-empty on the Spec side plus redacted on
+    # the container side is the most the pair can say.
     for key <- ["SUPERVISOR_TOKEN", "HASSIO_TOKEN"] do
+      assert Map.get(spec.env, key) not in [nil, ""], "Spec no longer injects #{key}"
       assert String.starts_with?(env[key], "<redacted ")
     end
   end

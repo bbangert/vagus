@@ -16,6 +16,17 @@ defmodule Vagus.ProbeParity.Canon do
   keeps a hand-edited or hand-merged fixture comparable, since list positions are
   part of the diff path.
 
+  Those sort keys are not unique — a mount table carries two `/dev/shm` entries,
+  the engine's and the Supervisor's tmpfs stacked over it, and they disagree on
+  `noexec` — and `Enum.sort_by/2` is stable, so entries sharing a key would keep
+  whatever order the capture reported them in and diff against each other. Ties
+  are therefore broken on the whole entry, *after* masking, which makes ordering
+  an equal-key group a multiset comparison of that group written as an order.
+  Masking first is the load-bearing half: a tie-break over raw entries would
+  order duplicates by `source` or `options`, the very fields the allowlist masks
+  because they differ per machine, and two equivalent captures from two machines
+  would order their duplicates differently and diverge again.
+
   ## Paths and patterns
 
   Captures contain keys that are themselves paths — `well_known` is keyed by
@@ -189,24 +200,33 @@ defmodule Vagus.ProbeParity.Canon do
     |> Enum.with_index(fn child, index ->
       walk(child, path ++ [Integer.to_string(index)], patterns)
     end)
+    |> resolve_ties(path)
   end
 
   defp descend(value, _path, _patterns), do: value
 
-  # Entries missing the sort key sort last in file order, rather than first as
-  # term ordering would have it (nil < any binary): a malformed capture then
-  # cannot shove its broken entries in front and renumber everything after them.
-  defp sort(list, path) do
+  # Sorted before walking, so the index a pattern matches on is the index the
+  # diff will report.
+  defp sort(list, path), do: order(list, path, &sort_key/2)
+
+  # Runs on canonicalised entries: an equal-key group is ordered by what the
+  # allowlist left comparable and never by what it masked.
+  defp resolve_ties(list, path), do: order(list, path, &{sort_key(&1, &2), &1})
+
+  defp order(list, path, by) do
     case Map.fetch(@sorted, path) do
       {:ok, key} ->
-        if Enum.all?(list, &is_map/1),
-          do: Enum.sort_by(list, &{Map.get(&1, key) == nil, Map.get(&1, key)}),
-          else: list
+        if Enum.all?(list, &is_map/1), do: Enum.sort_by(list, &by.(&1, key)), else: list
 
       :error ->
         list
     end
   end
+
+  # Entries missing the sort key sort last in file order, rather than first as
+  # term ordering would have it (nil < any binary): a malformed capture then
+  # cannot shove its broken entries in front and renumber everything after them.
+  defp sort_key(entry, key), do: {Map.get(entry, key) == nil, Map.get(entry, key)}
 
   defp matches?([], []), do: true
   defp matches?([@wildcard | patterns], [_segment | path]), do: matches?(patterns, path)

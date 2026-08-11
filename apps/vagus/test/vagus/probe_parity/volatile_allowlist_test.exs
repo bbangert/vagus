@@ -34,6 +34,10 @@ defmodule Vagus.ProbeParity.VolatileAllowlistTest do
 
   @fixture @fixture_path |> File.read!() |> Jason.decode!()
 
+  # The engine's own /dev/shm and the Supervisor's tmpfs stacked over it: same
+  # target, different noexec. The only duplicated sort key in the capture.
+  @shm Enum.filter(@fixture["fingerprint"]["mounts"], &(&1["target"] == "/dev/shm"))
+
   # Entries that legitimately match nothing in the HAOS capture — a field only a
   # Vagus capture carries, say. Exempting by name keeps the rest of the check
   # sharp; deleting the entry or loosening the assertion would not.
@@ -79,6 +83,25 @@ defmodule Vagus.ProbeParity.VolatileAllowlistTest do
     end
   end
 
+  test "the duplicated /dev/shm target compares equal however a capture ordered it" do
+    [engine, supervisor] = @shm
+
+    # Sources differ as well as order. Ordering the pair by anything the
+    # allowlist masks — source, options — would put them back in step here and
+    # out of step between two machines, which is the failure this pins.
+    assert diff(
+             with_shm([source(engine, "tmpfs"), source(supervisor, "tmpfs")]),
+             with_shm([source(supervisor, "shm"), source(engine, "/run/shm")])
+           ) == []
+  end
+
+  test "a duplicated target still diverges when one of the pair really differs" do
+    [engine, supervisor] = @shm
+    relaxed = put_in(supervisor, ["flags", "noexec"], false)
+
+    assert diff(with_shm([engine, supervisor]), with_shm([relaxed, engine])) != []
+  end
+
   test "masking is what makes the fixture compare equal to a differently-sited copy" do
     allowlist = Canon.load_allowlist!(@allowlist_path)
     elsewhere = put_in(@fixture, ["versions", "machine"], "rpi3-64")
@@ -90,4 +113,18 @@ defmodule Vagus.ProbeParity.VolatileAllowlistTest do
              Canon.canonicalize(elsewhere, allowlist)
            ) == []
   end
+
+  defp diff(left, right) do
+    allowlist = Canon.load_allowlist!(@allowlist_path)
+
+    Canon.diff(Canon.canonicalize(left, allowlist), Canon.canonicalize(right, allowlist))
+  end
+
+  defp with_shm(mounts) do
+    others = Enum.reject(@fixture["fingerprint"]["mounts"], &(&1["target"] == "/dev/shm"))
+
+    put_in(@fixture, ["fingerprint", "mounts"], others ++ mounts)
+  end
+
+  defp source(mount, source), do: %{mount | "source" => source}
 end

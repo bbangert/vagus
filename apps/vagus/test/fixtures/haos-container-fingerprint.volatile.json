@@ -45,11 +45,7 @@
   },
   {
     "path": "fingerprint/interfaces/*/addrs/*/addr",
-    "reason": "Addresses assigned to the container (DHCP from the engine's network, and IPv6 link-local derived from the volatile MAC). Only the address itself is masked: family and prefix_or_mask stay comparable, so the hassio network's fixed 172.30.32.0/23 shape is still measured."
-  },
-  {
-    "path": "fingerprint/etc_hosts/*/ip",
-    "reason": "The container's own /etc/hosts entry carries its assigned address, and a positional pattern cannot single that line out from the localhost lines. The names on every entry stay comparable, so the entry set is still measured, and the address contract that matters — the DNS plugin's address — is measured through resolv_conf/nameservers, which is deliberately not masked."
+    "reason": "Addresses assigned to the container: the engine hands out the IPv4 and IPv6 global addresses from its pool, and the link-local one is derived from the volatile MAC. The address itself is therefore not compared at all — only family and prefix_or_mask are, and prefix_or_mask is just the mask, so a wrong prefix length diverges while an address on an entirely different network under the same 255.255.254.0 does not. The pattern is positional and so masks the fixed loopback addresses too, which it cannot single out. What an add-on actually depends on — that supervisor and hassio answer at 172.30.32.2 — is compared through etc_hosts, which is deliberately not masked."
   },
   {
     "path": "fingerprint/cgroup/self",

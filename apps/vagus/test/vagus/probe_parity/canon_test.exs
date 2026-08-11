@@ -1,11 +1,11 @@
 defmodule Vagus.ProbeParity.CanonTest do
   @moduledoc """
-  Exercises the canonicaliser on synthetic captures, deliberately: no real
-  fingerprint fixture exists yet, and once one does, a test built on it would
-  measure the capture rather than the rules. The one thing checked against the
-  real artifact is that the committed volatile allowlist loads and every entry
-  carries a reason; whether those entries still mask anything is
-  `Vagus.ProbeParity.VolatileAllowlistTest`.
+  Exercises the canonicaliser on synthetic captures, deliberately: a test built
+  on the committed HAOS fingerprint would measure what that bench happened to
+  report, where these measure the rules. The one thing checked against the real
+  artifact is that the committed volatile allowlist loads and every entry
+  carries a reason; whether those entries still mask anything, and how the rules
+  behave on the real capture, is `Vagus.ProbeParity.VolatileAllowlistTest`.
   """
 
   use ExUnit.Case, async: true
@@ -200,6 +200,19 @@ defmodule Vagus.ProbeParity.CanonTest do
              ]
 
       assert canonical["fingerprint"]["interfaces"] == [%{"name" => "eth0"}, %{"name" => "lo"}]
+    end
+
+    test "entries sharing a sort key order by canonical content, not by a masked one" do
+      allowlist = ["fingerprint/mounts/*/source"]
+
+      shm = fn source, noexec ->
+        %{"target" => "/dev/shm", "source" => source, "flags" => %{"noexec" => noexec}}
+      end
+
+      left = %{"fingerprint" => %{"mounts" => [shm.("tmpfs", true), shm.("shm", false)]}}
+      right = %{"fingerprint" => %{"mounts" => [shm.("/run/shm", false), shm.("none", true)]}}
+
+      assert Canon.diff(canon(left, allowlist), canon(right, allowlist)) == []
     end
 
     test "entries missing the sort key keep file order, after the sorted ones" do
