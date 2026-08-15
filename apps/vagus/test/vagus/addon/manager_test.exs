@@ -83,6 +83,25 @@ defmodule Vagus.Addon.ManagerTest do
       assert share.propagation == "rslave"
     end
 
+    test "mounts: every add-on gets the host /dev read-only (MOUNT_DEV parity)", %{spec: s} do
+      dev = Enum.find(s.mounts, &(&1.target == "/dev"))
+
+      assert dev.source == "/dev"
+      # Not a preference: `Vagus.Addon.Devices`' cgroup rule is what grants
+      # access, and the container-fingerprint gate pins this against a real
+      # HAOS capture whose /dev is ro.
+      assert dev.read_only == true
+      assert dev.system == true
+
+      # Unconditional — mosquitto declares no `devices:` and gets it anyway,
+      # because a bind without a cgroup rule grants nothing.
+      assert s.device_cgroup_rules == []
+
+      # The /dev/shm tmpfs stacks over the bind rather than being swallowed by
+      # it, the same duplicate-target pair the real Supervisor produces.
+      assert Map.has_key?(s.tmpfs, "/dev/shm")
+    end
+
     test "mounts: host_dbus add-on gets /run/dbus read-only; default does not", %{spec: s} do
       # default (mosquitto fixture has no host_dbus)
       refute Enum.any?(s.mounts, &(&1.target == "/run/dbus"))
@@ -129,6 +148,45 @@ defmodule Vagus.Addon.ManagerTest do
       assert s.hostname == nil
       assert s.ports == %{}
     end
+
+    test "device_cgroup_rules: declared devices resolve; none declared stays empty", %{spec: s} do
+      assert s.device_cgroup_rules == []
+
+      dev_spec = Manager.build_spec(device_config(devices: ["/dev/null"]), arch: "amd64")
+      assert dev_spec.device_cgroup_rules == ["c 1:3 rwm"]
+    end
+
+    test "device_cgroup_rules: full_access is gated on protection, like pid_mode" do
+      cfg = device_config(full_access: true, host_pid: true)
+
+      protected = Manager.build_spec(cfg, arch: "amd64")
+      assert protected.device_cgroup_rules == []
+      assert protected.pid_mode == nil
+
+      # `protected: false` is the same switch that makes `host_pid` reachable —
+      # both gates are `build_spec/2`'s, and until Phase 4 no caller flips it.
+      unprotected = Manager.build_spec(cfg, arch: "amd64", protected: false)
+      assert unprotected.device_cgroup_rules == ["b *:* rwm", "c *:* rwm"]
+      assert unprotected.pid_mode == "host"
+    end
+  end
+
+  defp device_config(extra) do
+    raw =
+      Map.merge(
+        %{
+          "name" => "N",
+          "version" => "1",
+          "slug" => "device_addon",
+          "description" => "d",
+          "arch" => ["amd64"],
+          "image" => "x/y"
+        },
+        Map.new(extra, fn {k, v} -> {to_string(k), v} end)
+      )
+
+    {:ok, cfg} = Config.parse(raw)
+    cfg
   end
 
   describe "install + start orchestration (fake backend)" do

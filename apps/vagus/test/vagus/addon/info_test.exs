@@ -80,6 +80,51 @@ defmodule Vagus.Addon.InfoTest do
     c
   end
 
+  describe "security reporting (devices + rating)" do
+    defp secure_config(raw) do
+      {:ok, c} =
+        Config.parse(
+          Map.merge(
+            %{
+              "name" => "N",
+              "version" => "1",
+              "slug" => "sec_addon",
+              "description" => "d",
+              "arch" => ["amd64"],
+              "image" => "x/y"
+            },
+            raw
+          )
+        )
+
+      c
+    end
+
+    test "devices are reported as declared, not as an empty list" do
+      # This field is the consent surface. It was a hardcoded `[]` while
+      # `devices:` was inert; now that the entries become real cgroup rules,
+      # an empty literal here would understate what the add-on asked for.
+      info =
+        Info.render(secure_config(%{"devices" => ["/dev/ttyUSB0", "/dev/mem"]}), :stopped, %{})
+
+      assert info["devices"] == ["/dev/ttyUSB0", "/dev/mem"]
+    end
+
+    test "an add-on declaring nothing still reports an empty device list" do
+      assert Info.render(secure_config(%{}), :stopped, %{})["devices"] == []
+    end
+
+    test "rating is computed, not a hardcoded 5" do
+      assert Info.render(secure_config(%{}), :stopped, %{})["rating"] == 5
+      assert Info.render(secure_config(%{"host_pid" => true}), :stopped, %{})["rating"] == 3
+      assert Info.render(secure_config(%{"full_access" => true}), :stopped, %{})["rating"] == 1
+    end
+
+    test "rating stays in the 1..8 the model requires", %{config: c} do
+      assert Info.render(c, :started, %{})["rating"] in 1..8
+    end
+  end
+
   describe "asset advertisement (the installed-add-ons page fetches nothing it isn't told about)" do
     test "the store entry's flags reach the payload", %{config: c} do
       info =

@@ -130,6 +130,16 @@ defmodule Vagus.Addon.Backend.ContainerTest do
       assert cfg["OpenStdin"] == true
     end
 
+    test "device_cgroup_rules reach DeviceCgroupRules, and the key is always present" do
+      cfg = Container.build_config(mosquitto_spec(device_cgroup_rules: ["c 1:3 rwm"]))
+      assert cfg["HostConfig"]["DeviceCgroupRules"] == ["c 1:3 rwm"]
+
+      # `[]` rather than an absent key: an add-on granted nothing must still say
+      # so explicitly, same as CapAdd/Dns (D-C).
+      empty = Container.build_config(mosquitto_spec())
+      assert empty["HostConfig"]["DeviceCgroupRules"] == []
+    end
+
     test "hostname set but empty dns → no Domainname" do
       cfg = Container.build_config(mosquitto_spec(dns: []))
       refute Map.has_key?(cfg, "Domainname")

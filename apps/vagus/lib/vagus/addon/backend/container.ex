@@ -95,7 +95,11 @@ defmodule Vagus.Addon.Backend.Container do
       "DnsSearch" => spec.dns_search,
       "DnsOptions" => spec.dns_options,
       "Mounts" => Enum.map(spec.mounts, &mount/1),
-      "Tmpfs" => spec.tmpfs
+      "Tmpfs" => spec.tmpfs,
+      # Additive only: these ALLOW nodes the engine's default device policy
+      # denies. They cannot revoke anything, which is why an add-on granting
+      # nothing still emits the key rather than omitting it.
+      "DeviceCgroupRules" => spec.device_cgroup_rules
     }
     |> maybe_put("PortBindings", port_bindings(spec, host?))
     |> maybe_put("PidMode", spec.pid_mode)
