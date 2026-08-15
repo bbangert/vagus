@@ -49,6 +49,10 @@ defmodule Vagus.Addon.SystemDisk do
   `:mounts_path` and `:sysfs_block` are injectable so this is testable against
   a fixture rather than the host's real storage.
   """
+  # `mounts_path` is the `/proc/mounts` constant or a test-injected fixture,
+  # never request input — an add-on's `devices:` strings reach `File.stat` in
+  # `Vagus.Addon.Devices`, never this read.
+  # sobelow_skip ["Traversal.FileModule"]
   @spec devnums(keyword()) :: devnums() | :unknown
   def devnums(opts \\ []) do
     mounts_path = Keyword.get(opts, :mounts_path, @mounts_path)
@@ -151,6 +155,10 @@ defmodule Vagus.Addon.SystemDisk do
 
   # sysfs `dev` files hold "major:minor\n" — the kernel's own statement of the
   # pair, independent of the stat(2) path used elsewhere.
+  #
+  # `path` is built from the sysfs root and directory entries the kernel
+  # published there, not from anything an add-on supplies.
+  # sobelow_skip ["Traversal.FileModule"]
   defp put_dev_file(acc, path) do
     with {:ok, contents} <- File.read(path),
          [major, minor] <- String.split(String.trim(contents), ":"),
