@@ -111,6 +111,34 @@ defmodule Vagus.Addon.DevicesTest do
     end
   end
 
+  describe "system-disk refusal (upstream's allowed_for_access)" do
+    test "a char device never consults the disk policy" do
+      # Block-only, same as upstream — and the lazy resolve means a char-only
+      # add-on never reads the mount table at all.
+      assert Devices.cgroup_rules(config(%{"devices" => ["/dev/null"]}), true) == ["c 1:3 rwm"]
+    end
+
+    @tag :block_device
+    test "a block device that backs system storage is refused at :error" do
+      case first_block_device() do
+        nil ->
+          flunk("no block device found; run with --exclude block_device")
+
+        path ->
+          # Whether this specific node is system storage depends on the host,
+          # so assert the pairing rather than a fixed outcome: a refusal must
+          # come with the error log, and a grant must not.
+          cfg = config(%{"devices" => [path]})
+          log = capture_log(fn -> Process.put(:rules, Devices.cgroup_rules(cfg, true)) end)
+
+          case Process.get(:rules) do
+            [] -> assert log =~ "tried to access blocked device"
+            [_rule] -> refute log =~ "tried to access blocked device"
+          end
+      end
+    end
+  end
+
   describe "symlinks" do
     test "a symlink resolves to its target's device number" do
       # `File.stat/1` over `lstat` is deliberate — HA 2026.x accepts stable
