@@ -84,6 +84,37 @@ defmodule Vagus.Addon.SystemDiskTest do
       assert SystemDisk.devnums(mounts_path: path, sysfs_block: sysfs) == MapSet.new()
     end
 
+    test "a system mount sysfs cannot map collapses the whole answer to :unknown", %{sysfs: sysfs} do
+      # The dangerous case: returning the partial set here would turn a
+      # resolver failure into an allow decision for the very disk that failed
+      # to resolve.
+      path =
+        mounts([
+          "/dev/mmcblk0p5 /root ext4 rw 0 0",
+          "/dev/mysteryblk /boot ext4 rw 0 0"
+        ])
+
+      log =
+        capture_log(fn ->
+          assert SystemDisk.devnums(mounts_path: path, sysfs_block: sysfs) == :unknown
+        end)
+
+      assert log =~ "sysfs has no entry"
+      assert log =~ "refusing all block devices"
+    end
+
+    test "a malformed dev file collapses to :unknown", %{sysfs: sysfs} do
+      File.write!(Path.join([sysfs, "mmcblk0", "mmcblk0p1", "dev"]), "not-a-devnum\n")
+      path = mounts(["/dev/mmcblk0p5 /root ext4 rw 0 0"])
+
+      log =
+        capture_log(fn ->
+          assert SystemDisk.devnums(mounts_path: path, sysfs_block: sysfs) == :unknown
+        end)
+
+      assert log =~ "cannot read a devnum"
+    end
+
     test "an unreadable mount table is :unknown, and :unknown blocks everything" do
       log =
         capture_log(fn ->

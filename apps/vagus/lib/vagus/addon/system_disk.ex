@@ -23,10 +23,14 @@ defmodule Vagus.Addon.SystemDisk do
   partition of the boot disk is still refused here, where upstream would hand
   it over.
 
-  Fail-closed: if the mount table cannot be read, every block device is treated
-  as system storage. An unreadable `/proc/mounts` means the answer is unknown,
-  and "unknown" must not resolve to "grant the disk". Character devices are
-  never affected — upstream's check is block-only, and so is this.
+  Fail-closed at **every** unresolved step, not just the obvious one: an
+  unreadable mount table, a matched mount sysfs cannot map, an unreadable or
+  malformed `dev` file, an unlistable disk directory — each collapses the whole
+  answer to `:unknown`, which `blocked?/3` reads as "refuse every block
+  device". Returning the partial set instead would turn a resolver failure into
+  an allow decision, and the half that failed to resolve is exactly where the
+  system partition would be hiding. Character devices are never affected —
+  upstream's check is block-only, and so is this.
   """
 
   require Logger
@@ -60,7 +64,14 @@ defmodule Vagus.Addon.SystemDisk do
 
     case File.read(mounts_path) do
       {:ok, contents} ->
-        contents |> system_mount_devices() |> Enum.reduce(MapSet.new(), &add_disk(&1, &2, sysfs))
+        contents
+        |> system_mount_devices()
+        |> Enum.reduce_while(MapSet.new(), fn device, acc ->
+          case add_disk(device, acc, sysfs) do
+            :unknown -> {:halt, :unknown}
+            devnums -> {:cont, devnums}
+          end
+        end)
 
       {:error, reason} ->
         Logger.error("Vagus.Addon.SystemDisk: cannot read #{mounts_path} (#{inspect(reason)})")
@@ -116,17 +127,15 @@ defmodule Vagus.Addon.SystemDisk do
       |> put_dev_file(Path.join(part_dir, "dev"))
       |> union_disk_family(part_dir)
     else
-      Logger.warning(
-        "Vagus.Addon.SystemDisk: #{name} mounts a system path but sysfs has no entry"
-      )
-
-      acc
+      unresolvable("#{name} mounts a system path but sysfs has no entry for it")
     end
   end
 
   # `/sys/class/block/<part>` symlinks into the device tree, so `..` is the
   # disk's own directory — that is what makes the parent reachable without
   # parsing partition names (`mmcblk0p5` vs `sda5` vs `nvme0n1p5` differ).
+  defp union_disk_family(:unknown, _part_dir), do: :unknown
+
   defp union_disk_family(acc, part_dir) do
     if File.exists?(Path.join(part_dir, "partition")) do
       disk_dir = Path.join(part_dir, "..")
@@ -140,10 +149,20 @@ defmodule Vagus.Addon.SystemDisk do
     end
   end
 
+  defp union_partitions(:unknown, _disk_dir), do: :unknown
+
   defp union_partitions(acc, disk_dir) do
     case File.ls(disk_dir) do
-      {:ok, entries} -> Enum.reduce(entries, acc, &add_partition(Path.join(disk_dir, &1), &2))
-      {:error, _reason} -> acc
+      {:ok, entries} ->
+        Enum.reduce_while(entries, acc, fn entry, inner ->
+          case add_partition(Path.join(disk_dir, entry), inner) do
+            :unknown -> {:halt, :unknown}
+            devnums -> {:cont, devnums}
+          end
+        end)
+
+      {:error, reason} ->
+        unresolvable("cannot list #{disk_dir} (#{inspect(reason)})")
     end
   end
 
@@ -153,11 +172,25 @@ defmodule Vagus.Addon.SystemDisk do
       else: acc
   end
 
+  # Any gap in the picture means the picture is not usable. Half a disk family
+  # is not a safe answer — the unresolved half is exactly where the system
+  # partition would hide — so a partial resolve collapses to `:unknown`, which
+  # `blocked?/3` reads as "refuse every block device".
+  defp unresolvable(why) do
+    Logger.error("Vagus.Addon.SystemDisk: #{why} — refusing all block devices")
+    :unknown
+  end
+
   # sysfs `dev` files hold "major:minor\n" — the kernel's own statement of the
   # pair, independent of the stat(2) path used elsewhere.
-  #
+  defp put_dev_file(:unknown, _path), do: :unknown
+
   # `path` is built from the sysfs root and directory entries the kernel
   # published there, not from anything an add-on supplies.
+  #
+  # The annotation binds to the *next* function definition, so it has to sit on
+  # the clause holding the `File.read` — above the `:unknown` clause it waives
+  # nothing and Sobelow fails the build.
   # sobelow_skip ["Traversal.FileModule"]
   defp put_dev_file(acc, path) do
     with {:ok, contents} <- File.read(path),
@@ -166,7 +199,7 @@ defmodule Vagus.Addon.SystemDisk do
          {minor, ""} <- Integer.parse(minor) do
       MapSet.put(acc, {major, minor})
     else
-      _other -> acc
+      _other -> unresolvable("cannot read a devnum from #{path}")
     end
   end
 end

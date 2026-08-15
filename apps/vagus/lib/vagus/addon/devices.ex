@@ -72,10 +72,16 @@ defmodule Vagus.Addon.Devices do
   at `:error` for the same reason upstream does it — an add-on asking for the
   boot medium is a config the operator needs to see, not a crash.
   """
-  @spec cgroup_rules(Config.t(), boolean()) :: [String.t()]
-  def cgroup_rules(%Config{} = config, protected?) when is_boolean(protected?) do
+  @spec cgroup_rules(Config.t(), boolean(), keyword()) :: [String.t()]
+  def cgroup_rules(%Config{} = config, protected?, opts \\ []) when is_boolean(protected?) do
+    # `:system_disk` pre-supplies what `SystemDisk.devnums/0` would resolve, so
+    # a test can pin the refusal without depending on which block nodes the
+    # host happens to have. Absent (the only production path) it stays
+    # `:unresolved` and is read lazily on the first block device.
+    initial = Keyword.get(opts, :system_disk, :unresolved)
+
     {rules, _blocked} =
-      Enum.reduce(config.devices, {[], :unresolved}, fn path, {acc, blocked} ->
+      Enum.reduce(config.devices, {[], initial}, fn path, {acc, blocked} ->
         {emitted, blocked} = rule(path, blocked)
         {[emitted | acc], blocked}
       end)

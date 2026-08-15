@@ -125,17 +125,44 @@ defmodule Vagus.Addon.DevicesTest do
           flunk("no block device found; run with --exclude block_device")
 
         path ->
-          # Whether this specific node is system storage depends on the host,
-          # so assert the pairing rather than a fixed outcome: a refusal must
-          # come with the error log, and a grant must not.
+          # The policy is injected, so this pins the refusal itself rather than
+          # whatever storage layout the host happens to have. An earlier
+          # version asserted only a refused/granted *pairing* and so passed
+          # down either branch, pinning nothing.
+          {major, minor} = devnum(path)
           cfg = config(%{"devices" => [path]})
-          log = capture_log(fn -> Process.put(:rules, Devices.cgroup_rules(cfg, true)) end)
 
-          case Process.get(:rules) do
-            [] -> assert log =~ "tried to access blocked device"
-            [_rule] -> refute log =~ "tried to access blocked device"
-          end
+          log =
+            capture_log(fn ->
+              assert Devices.cgroup_rules(cfg, true, system_disk: MapSet.new([{major, minor}])) ==
+                       []
+            end)
+
+          assert log =~ "tried to access blocked device"
       end
+    end
+
+    @tag :block_device
+    test "the same block device is granted when it is not system storage" do
+      case first_block_device() do
+        nil ->
+          flunk("no block device found; run with --exclude block_device")
+
+        path ->
+          {major, minor} = devnum(path)
+          cfg = config(%{"devices" => [path]})
+
+          assert Devices.cgroup_rules(cfg, true, system_disk: MapSet.new()) ==
+                   ["b #{major}:#{minor} rwm"]
+      end
+    end
+
+    test "an :unknown policy refuses every block device, and no char device" do
+      # `SystemDisk.devnums/1` collapses to `:unknown` on any unresolved step;
+      # this is the consuming half of that contract.
+      char = config(%{"devices" => ["/dev/null"]})
+
+      assert Devices.cgroup_rules(char, true, system_disk: :unknown) == ["c 1:3 rwm"]
     end
   end
 
@@ -182,7 +209,15 @@ defmodule Vagus.Addon.DevicesTest do
           flunk("no block device found; run with --exclude block_device")
 
         path ->
-          assert ["b " <> majmin] = Devices.cgroup_rules(config(%{"devices" => [path]}), true)
+          # Empty policy injected on purpose: this test is about char/block
+          # classification and the devnum decode, and without the injection it
+          # fails on any board whose first block node IS system storage — the
+          # rule list would correctly be empty.
+          assert ["b " <> majmin] =
+                   Devices.cgroup_rules(config(%{"devices" => [path]}), true,
+                     system_disk: MapSet.new()
+                   )
+
           assert [pair, "rwm"] = String.split(majmin, " ")
 
           # sysfs is the kernel's own statement of the pair, derived from a
@@ -190,6 +225,25 @@ defmodule Vagus.Addon.DevicesTest do
           # check rather than a restatement.
           assert File.exists?("/sys/dev/block/#{pair}")
       end
+    end
+  end
+
+  # Independent of the module under test: reads the pair from sysfs rather than
+  # from `cgroup_rules/2`'s own output, so injecting it cannot make the
+  # assertion circular.
+  defp devnum(path) do
+    name = Path.basename(path)
+
+    case File.read("/sys/class/block/#{name}/dev") do
+      {:ok, contents} ->
+        [major, minor] = contents |> String.trim() |> String.split(":")
+        {String.to_integer(major), String.to_integer(minor)}
+
+      {:error, _reason} ->
+        # A node with no sysfs entry (e.g. a hand-mknod'd one) — fall back to
+        # the kernel's rdev, which is the same number by a different route.
+        {:ok, %File.Stat{minor_device: rdev}} = File.stat(path)
+        {Bitwise.band(Bitwise.bsr(rdev, 8), 0xFFF), Bitwise.band(rdev, 0xFF)}
     end
   end
 
