@@ -28,7 +28,7 @@ defmodule Vagus.Addon.Info do
   `true`/`[]`/`nil` no matter what the add-on actually declared.
   """
 
-  alias Vagus.Addon.{Availability, Config, OptionsSchema}
+  alias Vagus.Addon.{Availability, Config, OptionsSchema, Rating}
 
   @doc """
   Builds the info map for `config` in lifecycle `state` (`:started`/`:stopped`)
@@ -118,7 +118,7 @@ defmodule Vagus.Addon.Info do
       "host_pid" => config.host_pid,
       "ingress" => config.ingress,
       "long_description" => Map.get(settings, :long_description),
-      "rating" => 5,
+      "rating" => Rating.score(config),
       "signed" => false,
       "hassio_api" => config.hassio_api,
       "hassio_role" => config.hassio_role,
@@ -176,7 +176,10 @@ defmodule Vagus.Addon.Info do
       "auto_update" => Map.get(settings, :auto_update) || false,
       "ip_address" => "0.0.0.0",
       "watchdog" => Map.get(settings, :watchdog) || false,
-      "devices" => [],
+      # The real list, not `[]`: since `Vagus.Addon.Devices` these entries are
+      # granted cgroup rules, so an empty literal here would be the consent
+      # surface understating what the add-on asked for.
+      "devices" => config.devices,
       "system_managed" => false,
       "system_managed_config_entry" => nil
     }

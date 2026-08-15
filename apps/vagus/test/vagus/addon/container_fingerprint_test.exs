@@ -92,13 +92,6 @@ defmodule Vagus.Addon.ContainerFingerprintTest do
   # `Vagus.API.PermissionMatrixTest`: an entry is a decision with a reason, not
   # a silenced failure, and anything not listed fails loudly.
   @accepted_mounts %{
-    # Upstream binds the host's whole `/dev` read-only into every add-on
-    # (`docker/addon.py` MOUNT_DEV), so an add-on can open a device node it was
-    # granted without a per-device mount. Vagus creates no such mount, which
-    # means device-touching add-ons see an image-provided `/dev` instead of the
-    # host's. Known gap, tracked as VAGUS-1.
-    "/dev" => "wholesale ro /dev bind upstream gives every add-on; Vagus does not create it",
-
     # Upstream writes a cid file per add-on under the Supervisor's
     # `cid_files/` and binds it read-only at `/run/cid`, so an add-on can read
     # the id of the container it is running in. `mounts/2` creates no such
@@ -268,6 +261,9 @@ defmodule Vagus.Addon.ContainerFingerprintTest do
   end
 
   test "every mount Spec declares is present in the container", %{spec: spec} do
+    # This is what pins the `/dev` bind read-only: the fixture's `/dev` is
+    # `ro: true`, so a Spec that bound it writable would fail here rather than
+    # anywhere device-specific. Intended coupling, not incidental.
     for %{target: target} = mount <- spec.mounts do
       fixture_mounts = Enum.filter(@fingerprint["mounts"], &(&1["target"] == target))
 
@@ -326,12 +322,12 @@ defmodule Vagus.Addon.ContainerFingerprintTest do
     end
   end
 
+  # `/dev` left this ledger when `mounts/2` started binding it. One assertion
+  # did NOT survive the move: the fixture's `/dev` is `devtmpfs`, and no Spec
+  # test can check that, because Spec has no `fstype` — the test above compares
+  # target and `ro` only. Accepted: a bind of the host's `/dev` reports the
+  # source fs's type, so there is nothing Vagus chooses here to regress.
   test "the accepted mount gaps are still exactly what was accepted" do
-    dev = Enum.find(@fingerprint["mounts"], &(&1["target"] == "/dev"))
-
-    assert dev["fstype"] == "devtmpfs"
-    assert dev["ro"] == true
-
     cid = Enum.find(@fingerprint["mounts"], &(&1["target"] == "/run/cid"))
 
     # The source is what proves this is the Supervisor's doing and not the

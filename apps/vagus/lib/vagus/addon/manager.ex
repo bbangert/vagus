@@ -85,7 +85,7 @@ defmodule Vagus.Addon.Manager do
   require Logger
 
   alias Vagus.Addon.Backend.Spec
-  alias Vagus.Addon.{Config, OptionsSchema, Ports}
+  alias Vagus.Addon.{Config, Devices, OptionsSchema, Ports}
   alias Vagus.Ingress.Panels
   alias Vagus.Network
 
@@ -360,7 +360,20 @@ defmodule Vagus.Addon.Manager do
 
   defp ingress_server(opts), do: Keyword.get(opts, :ingress_server, Vagus.Ingress)
 
-  @doc "Builds the runtime-neutral `Backend.Spec` for `config`. Pure given `opts`."
+  @doc """
+  Builds the runtime-neutral `Backend.Spec` for `config`.
+
+  Deterministic given `opts`, but **not** filesystem-free: resolving a
+  `devices:` entry to a cgroup rule means `stat`-ing the node
+  (`Vagus.Addon.Devices`), because the major:minor pair only exists on the
+  device itself. The alternative — resolving in `do_start/2` and passing rules
+  through `opts` — keeps purity but lets `build_spec/2` emit a spec that
+  silently lacks its device rules, which is the worse failure.
+
+  An add-on declaring neither `devices:` nor `full_access:` touches the
+  filesystem not at all, so the hermetic callers (`image_ref/2`, the
+  container-fingerprint gate) stay filesystem-free in practice.
+  """
   @spec build_spec(Config.t(), keyword()) :: Spec.t()
   def build_spec(%Config{} = config, opts) do
     arch = Keyword.get(opts, :arch, default_arch())
@@ -388,6 +401,7 @@ defmodule Vagus.Addon.Manager do
       cap_add: config.privileged,
       tmpfs: if(config.host_ipc, do: %{}, else: %{"/dev/shm" => ""}),
       mounts: mounts(config, data_root),
+      device_cgroup_rules: Devices.cgroup_rules(config, protected),
       # The user's persisted host-port overrides, overlaid on the config's
       # declared ports (`Vagus.Addon.Ports`). A host-network add-on publishes
       # nothing — its ports are the host's already.
@@ -530,8 +544,36 @@ defmodule Vagus.Addon.Manager do
     mapped =
       config.map |> Enum.map(&map_mount(&1, data_root, config.slug)) |> Enum.reject(&is_nil/1)
 
-    [data_mount | mapped] ++ host_dbus_mount(config)
+    [data_mount | mapped] ++ host_dbus_mount(config) ++ [dev_mount()]
   end
+
+  # Real-Supervisor parity (MOUNT_DEV): every add-on gets the host's whole /dev
+  # bound read-only, unconditionally — upstream does not key this on `devices:`.
+  #
+  # The bind grants *visibility*; `Vagus.Addon.Devices`' cgroup rule grants
+  # *access*. That model is only true for device numbers the engine denies by
+  # default — every block device, which is the case that matters for
+  # `devices:`. It is NOT true for the nodes moby's default policy already
+  # allows: `c 1:3/1:5/1:7/1:8/1:9`, `c 5:0`, `c 5:1` (/dev/console), `c 5:2`,
+  # and `c 136:*` (pty slaves). For those the bind alone IS access, with no
+  # rule from us — measured on docker 29.6.1, cgroup v2: `open("/dev/console")`
+  # and `open("/dev/pts/N")` both succeed in a container with no device rules,
+  # and the host's ptys are listed at /dev/pts (a container without the bind
+  # gets runc's private, empty devpts instead). On Nerves /dev/console is the
+  # root IEx, so this is a sharper edge here than on HAOS's login getty.
+  # Whether the boards' balenaEngine v25 behaves the same is UNVERIFIED — the
+  # captured HAOS fingerprint shows a private (rw) /dev/pts, so it may not.
+  # Phase 7's device gate measures it; do not assume either way.
+  #
+  # Read-only buys node create/unlink protection on the host's /dev and nothing
+  # more — it is not a security control on the nodes themselves. Writes to a
+  # char/block node bypass the mount check (Linux gates it on
+  # `!special_file(inode->i_mode)`), as do `connect()` to a unix socket and any
+  # `ioctl` on a granted node.
+  #
+  # `system: true` keeps `ensure_mount_sources/1` from ever mkdir-ing into `/`.
+  defp dev_mount,
+    do: %{source: "/dev", target: "/dev", read_only: true, propagation: nil, system: true}
 
   # Real-Supervisor parity (MOUNT_DBUS): a `host_dbus: true` add-on gets the
   # host system-bus socket dir bound read-only, same as HA Core's container.

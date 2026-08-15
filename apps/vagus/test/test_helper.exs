@@ -19,4 +19,9 @@ Mox.stub_with(Vagus.Backend.OSMock, Vagus.Backend.OS.HostStub)
 
 # Tests tagged `:docker` need a running Docker/balena-engine daemon on the
 # host socket; they're opt-in via `mix test --include docker`.
-ExUnit.start(exclude: [:docker])
+#
+# `:block_device` needs a real block node under /dev, which the dev container
+# has none of (only /dev/null, /dev/zero and friends). Opt-in via
+# `mix test --include block_device` on a board or any host with a disk; when
+# included with no node present it flunks rather than passing vacuously.
+ExUnit.start(exclude: [:docker, :block_device])
