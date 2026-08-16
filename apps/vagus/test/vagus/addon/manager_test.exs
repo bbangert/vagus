@@ -94,11 +94,11 @@ defmodule Vagus.Addon.ManagerTest do
       assert dev.system == true
 
       # Unconditional — mosquitto declares no `devices:` and gets the bind
-      # anyway. That is safe for the nodes it is meant to cover: every block
-      # device is denied by default, so `Vagus.Addon.Devices`' rule is what
-      # grants them. It is NOT a blanket "the bind grants nothing" — moby's
-      # default allowlist already permits `c 5:1` and `c 136:*`, which is why
-      # `console_mask/0` exists (docs/divergences.md).
+      # anyway. Safe for the nodes it is meant to cover: every block device is
+      # denied by default, so `Vagus.Addon.Devices`' rule is what grants them.
+      # NOT a blanket "the bind grants nothing" — moby's default allowlist
+      # already permits `c 5:1` and `c 136:*`, and those are reachable by
+      # devnum with or without this mount (docs/divergences.md).
       assert s.device_cgroup_rules == []
 
       # Upstream's MOUNT_DEV sets this; measured on-device it changes nothing
@@ -110,19 +110,13 @@ defmodule Vagus.Addon.ManagerTest do
       assert Map.has_key?(s.tmpfs, "/dev/shm")
     end
 
-    test "mounts: the host console is masked with /dev/null (deliberate divergence)", %{spec: s} do
-      mask = Enum.find(s.mounts, &(&1.target == "/dev/console"))
-
-      # The mask only works if it lands AFTER the /dev bind — the engine
-      # depth-sorts, so /dev/console (depth 2) follows /dev (depth 1). Assert
-      # the ordering too, since a reordering would silently unmask the console.
-      assert mask.source == "/dev/null"
-      assert mask.system == true
-
-      targets = Enum.map(s.mounts, & &1.target)
-
-      assert Enum.find_index(targets, &(&1 == "/dev")) <
-               Enum.find_index(targets, &(&1 == "/dev/console"))
+    test "mounts: no /dev/console mask — masking a path does not revoke a devnum", %{spec: s} do
+      # A `/dev/null` bind over `/dev/console` was tried and removed: verified
+      # on-device, an add-on just runs `mknod c 5 1` and reads/writes the host
+      # console through its own node. `CAP_MKNOD` is in the default set and the
+      # cgroup allows `c 5:1` with the `m` bit, so the mount was never the
+      # enforcement point. Pinned so the theatre does not come back.
+      refute Enum.any?(s.mounts, &(&1.target == "/dev/console"))
     end
 
     test "mounts: host_dbus add-on gets /run/dbus read-only; default does not", %{spec: s} do

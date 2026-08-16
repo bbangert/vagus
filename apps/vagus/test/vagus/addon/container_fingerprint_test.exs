@@ -93,17 +93,12 @@ defmodule Vagus.Addon.ContainerFingerprintTest do
   # a silenced failure, and anything not listed fails loudly.
   # The other direction: mounts VAGUS declares that the real Supervisor does
   # not. Same discipline as `@accepted_mounts` — a decision with a reason, and
-  # anything not listed fails loudly. Kept separate because these are
-  # deliberate divergences, not gaps to close.
-  @vagus_only_mounts %{
-    # /dev/null bound over /dev/console. The whole-/dev bind exposes the host
-    # console to every add-on (moby allows `c 5:1` by default and
-    # DeviceCgroupRules cannot revoke it). Upstream accepts that; Vagus masks
-    # it because a HAOS console is a login getty while this one carries the
-    # BEAM's output. Measured on-device: masking makes the node read 1:3
-    # instead of 5:1. See docs/divergences.md.
-    "/dev/console" => "ro /dev/null mask over the host console; upstream leaves it exposed"
-  }
+  # anything not listed fails loudly. Empty on purpose: Vagus currently adds no
+  # mount upstream lacks. A `/dev/null` mask over `/dev/console` briefly lived
+  # here and was removed once it was shown that `mknod` walks around it
+  # (docs/divergences.md), which is exactly the kind of claim this ledger
+  # exists to stop being made casually.
+  @vagus_only_mounts %{}
 
   @accepted_mounts %{
     # Upstream writes a cid file per add-on under the Supervisor's

@@ -138,7 +138,7 @@ docker 29.6.1 leaked the same way.
 | Option | Effect | Verdict |
 |---|---|---|
 | `BindOptions.ReadOnlyNonRecursive` | no change to the leak (A ≡ B) | do it anyway — upstream parity, we're missing it |
-| Bind `/dev/null` → `/dev/console` | console reads **1:3** instead of **5:1** — mask works | cheap, effective, small divergence |
+| Bind `/dev/null` → `/dev/console` | masks the **path** only | **REJECTED — see Result 6.** One `mknod c 5 1` walks around it |
 | `BindOptions.NonRecursive` | host `/dev/pts` gone, but **PTMX_FAIL** | **reject** — breaks pty allocation, so the SSH/Terminal add-on dies |
 
 No measured option closes the `/dev/pts` exposure without breaking ptys. That
@@ -146,11 +146,60 @@ half is upstream's behaviour too.
 
 ## Status
 
+Read Result 6 before acting on Results 2 and 5 — it supersedes their
+conclusions.
+
 - Phase 7 "q6a positive / negative control" for `devices:` — **PASSED** (Result 1).
-- Phase 7 bind-exposure control — **FAILED** (Result 2). Added to the plan after
-  PR #24's review; it is the reason that item exists.
+- Phase 7 bind-exposure control — **ran, and the finding was reclassified.** The
+  bind exposes host console and ptys at their usual paths (Result 2), but does
+  not *grant* anything: the same devices are reachable by `mknod` with no bind
+  at all (Result 6). Not a release blocker, and not introduced by PR #24.
 - Not yet run: rpi3_64 whole-fleet add-on regression, protection-mode gate
   (needs Phase 4), dsp bind (needs Phase 6).
 
-**`main` must not be released while the bind is unconditional and unmitigated.**
-No fleet is exposed today — no shipped firmware carries the bind.
+**No release blocker from this gate.** The console/pty exposure is pre-existing
+on shipped firmware, identical upstream, and independent of the `/dev` bind.
+`CapDrop: ["MKNOD"]` is the only measured lever and is a separate, fleet-wide
+decision (see `divergences.md`).
+
+---
+
+## Result 6 — the console exposure predates the `/dev` bind (added after review)
+
+Copilot pointed out on #26 that masking a pathname does not revoke a device
+number. It is right, and chasing it invalidated the framing of Results 2 and 5.
+
+Shipping config (bind + `ReadOnlyNonRecursive` + `/dev/null` over
+`/dev/console`), default capabilities:
+
+```
+masked=1:3        <- the pathname mask does work
+MKNOD_OK
+recreated=5:1     <- the add-on makes its own node
+BYPASS_READ_OK  BYPASS_WRITE_OK
+BLOCK_BYPASS_DENIED   <- block devices still denied; the cgroup is doing its job
+```
+
+With `CapDrop: ["MKNOD"]` the bypass closes (`MKNOD_DENIED`).
+
+**Then the control that mattered — a container with NO `/dev` bind at all**,
+i.e. every add-on on shipped firmware, before PR #24 existed:
+
+```
+devlist=fd full mqueue null ptmx pts random shm stderr stdin stdout tty urandom zero
+MKNOD_OK   CONSOLE_READ_OK   CONSOLE_WRITE_OK
+```
+
+**So the bind never granted this.** `CAP_MKNOD` plus the default `c 5:1` allow
+did, and has on every shipped firmware. The bind changes convenience only.
+
+Consequences, recorded plainly:
+
+* "The `/dev` bind is a release blocker" (Result 2's conclusion) was **wrong**.
+* The `/dev/null` mask was removed rather than shipped.
+* This is an **existing** fleet exposure, not one PR #24 introduced, and
+  upstream HAOS has it identically.
+
+The error in Result 2 was reasoning from visible nodes to reachability without
+asking whether the node was the enforcement point. The earlier security review
+had already said it was not.

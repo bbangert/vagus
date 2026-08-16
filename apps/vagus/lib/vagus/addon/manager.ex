@@ -544,7 +544,7 @@ defmodule Vagus.Addon.Manager do
     mapped =
       config.map |> Enum.map(&map_mount(&1, data_root, config.slug)) |> Enum.reject(&is_nil/1)
 
-    [data_mount | mapped] ++ host_dbus_mount(config) ++ [dev_mount(), console_mask()]
+    [data_mount | mapped] ++ host_dbus_mount(config) ++ [dev_mount()]
   end
 
   # Real-Supervisor parity (MOUNT_DEV): every add-on gets the host's whole /dev
@@ -574,7 +574,15 @@ defmodule Vagus.Addon.Manager do
   # keystrokes typed at the LOCAL console and spoofing its output. Writing a
   # pty slave sends output; it does not inject input.
   #
-  # `console_mask/0` below closes the console half. See docs/divergences.md.
+  # **The bind is not what grants any of this, and masking a path does not
+  # revoke it.** A cgroup rule names a device NUMBER, not a path, and
+  # `CAP_MKNOD` is in the default capability set — so a container with no
+  # `/dev` bind at all can `mknod c 5 1` and read and write the host console
+  # just the same. Verified on-device, including against a container with no
+  # bind: the exposure predates this mount and is upstream's too. Only
+  # dropping `MKNOD` closes it, which upstream does not do. See
+  # docs/divergences.md — a `/dev/null` mask over `/dev/console` was tried and
+  # removed because one `mknod` walks around it.
   #
   # Read-only buys node create/unlink protection on the host's /dev and nothing
   # more — it is not a security control on the nodes themselves. Writes to a
@@ -596,31 +604,6 @@ defmodule Vagus.Addon.Manager do
       read_only: true,
       propagation: nil,
       read_only_non_recursive: true,
-      system: true
-    }
-
-  # DIVERGENCE from upstream, deliberate — see docs/divergences.md.
-  #
-  # The `/dev` bind hands every add-on the host's `/dev/console`, because
-  # moby's default device cgroup already allows `c 5:1` and no cgroup rule can
-  # revoke it (`DeviceCgroupRules` is additive). Upstream has the same hole and
-  # accepts it; a HAOS console is a login getty, while this one carries the
-  # BEAM's output, so spoofed writes there are more misleading here.
-  #
-  # Binding `/dev/null` over it is the whole mitigation: measured on-device,
-  # the node reads `1:3` instead of `5:1` afterwards. Writes still succeed and
-  # are discarded — a char device bypasses the mount's read-only check — so an
-  # add-on that logs to `/dev/console` keeps working.
-  #
-  # This does NOT close the `/dev/pts` half. Nothing measured does without
-  # breaking pty allocation (`BindOptions.NonRecursive` removes the host devpts
-  # but `/dev/ptmx` then fails, which would kill the SSH/Terminal add-on).
-  defp console_mask,
-    do: %{
-      source: "/dev/null",
-      target: "/dev/console",
-      read_only: true,
-      propagation: nil,
       system: true
     }
 

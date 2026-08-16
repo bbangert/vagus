@@ -12,58 +12,63 @@ mount-level ledgers enforced by
 
 ---
 
-## `/dev/console` is masked with `/dev/null` in every add-on container
+## NOT a divergence: the host console and ptys are reachable from any add-on
 
-**Upstream:** binds the host's whole `/dev` read-only into every add-on
-(`MOUNT_DEV` in `supervisor/docker/const.py`) and leaves `/dev/console`
-reachable.
+Recorded here because it looks like one, was nearly "fixed" like one, and the
+attempted fix was theatre.
 
-**Vagus:** does the same bind, then binds `/dev/null` over `/dev/console`.
+**The facts, all measured** (balenaEngine v25.0.14, both boards — see
+[`device-gate-2026-08-16.md`](device-gate-2026-08-16.md)):
 
-**Why.** moby's default device cgroup allows `c 5:1` (console) and `c 136:*`
-(pty slaves) for every container, because containers need their own console and
-ptys. The `/dev` bind replaces the container's private `/dev` with the host's,
-so those default allows now resolve to *host* devices. `DeviceCgroupRules` is
-additive and cannot revoke a default allow, so this cannot be fixed with a
-cgroup rule — it is a mount-namespace problem.
+moby's default device cgroup allows `c 5:1` (console) and `c 136:*` (pty
+slaves) for every container, because containers need a console and ptys.
+`DeviceCgroupRules` is additive and cannot revoke a default allow. `CAP_MKNOD`
+is in the default capability set, and the `m` bit on those allows permits
+node creation.
 
-Measured on both boards (balenaEngine v25.0.14, `Tty: false` so the container
-owns no pty, no device rules at all):
+**A cgroup rule names a device number, not a path.** So a container with **no
+`/dev` bind at all** — every add-on on every shipped Vagus firmware — can do
+this:
 
-| | with `/dev` bind | control, no bind |
-|---|---|---|
-| `/dev/console` | `5:1` — the host's | absent |
-| `/dev/pts/0` | `136:0` — the host's | absent |
-| `/dev/tty1`, `/dev/tty0`, `/dev/ttyAMA0` | denied | — |
+```
+devlist=fd full mqueue null ptmx pts random shm stderr stdin stdout tty urandom zero
+MKNOD_OK   CONSOLE_READ_OK   CONSOLE_WRITE_OK      # after `mknod /tmp/c c 5 1`
+```
 
-Upstream's own `bind_options=MountBindOptions(read_only_non_recursive=True)`
-does **not** avoid this: the engine honours the field (it round-trips in
-`inspect`, while a bogus field is dropped) and the result is byte-identical.
-Docker 29.6.1 behaves the same, so this is neither a balena-engine limitation
-nor something switching runtimes would fix. **Upstream HAOS has the same
-exposure.**
+The `MOUNT_DEV` bind therefore changes **convenience, not reachability**. It
+puts `/dev/console` at its usual path instead of requiring one `mknod`.
 
-**So why diverge at all?** What sits on the node differs. A HAOS console is a
-login getty; this one carries the BEAM's output, so spoofed writes there are
-more misleading. The mask is cheap and measured: afterwards the node reads
-`1:3` instead of `5:1`. Writes still succeed and are discarded, because a
-character device bypasses a mount's read-only check — so an add-on that logs to
-`/dev/console` keeps working.
+**A `/dev/null` mask over `/dev/console` was implemented and then removed.** It
+worked at the pathname level — the node read `1:3` instead of `5:1` — and was
+defeated in one command:
 
-**What this does NOT fix.** The `/dev/pts` half is untouched. An add-on can
-still open the host's pty slaves, which on this platform means the BEAM's nbtty
-pty — reading it captures keystrokes typed at the *local* console, writing it
-spoofs that display. It is not command injection: writing to a pty **slave**
-sends output to the terminal, it does not inject input. The IEx VT itself
-(`/dev/tty1`, per `erlinit --ctty tty1`) is denied by the device cgroup.
+```
+masked=1:3   MKNOD_OK   recreated=5:1   BYPASS_READ_OK   BYPASS_WRITE_OK
+```
 
-Nothing measured closes the pts half without breaking pty allocation:
-`BindOptions.NonRecursive` removes the host devpts but then `/dev/ptmx` fails,
-which would kill the SSH/Terminal add-on. Left as upstream parity.
+Shipping it would have added an upstream divergence, a ledger entry and a test,
+in exchange for nothing but false confidence.
 
-**Evidence:** [`device-gate-2026-08-16.md`](device-gate-2026-08-16.md) — the
-full run against boards 192.168.2.149 (rpi3_64) and 192.168.2.58 (dragon_q6a),
-including the negative controls.
+**Upstream is identical.** Its `MOUNT_DEV` sets
+`bind_options=MountBindOptions(read_only_non_recursive=True)`; the engine
+honours the field and behaviour is byte-identical, and upstream does not drop
+`MKNOD` either. Docker 29.6.1 behaves the same, so this is neither a
+balena-engine limitation nor something switching runtimes would fix.
+
+**What the exposure is worth.** The IEx shell is **not** reachable: `erlinit
+--ctty tty1` puts it on `/dev/tty1`, and `c 4:*` is not in the default
+allowlist — `/dev/tty1`, `/dev/tty0` and `/dev/ttyAMA0` are all denied, as is
+every block device without an explicit rule. `/dev/pts/0` is PID 1's stdio (the
+BEAM's nbtty pty), so an add-on can read keystrokes typed at the *local*
+console and spoof its output. Writing a pty **slave** sends output; it does not
+inject input, so this is disclosure and spoofing, not command injection.
+
+**The only measured fix is `CapDrop: ["MKNOD"]`**, verified to close the
+recreation path. Not adopted: upstream does not do it, it would break an add-on
+that legitimately creates device nodes, and it is **unverified** against a
+device node shipped inside an add-on's own image layers. If the local-console
+exposure is ever judged unacceptable, that is the lever — and it is a fleet-wide
+decision, not a property of the `/dev` bind.
 
 ---
 
