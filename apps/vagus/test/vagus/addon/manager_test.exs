@@ -93,13 +93,30 @@ defmodule Vagus.Addon.ManagerTest do
       assert dev.read_only == true
       assert dev.system == true
 
-      # Unconditional — mosquitto declares no `devices:` and gets it anyway,
-      # because a bind without a cgroup rule grants nothing.
+      # Unconditional — mosquitto declares no `devices:` and gets the bind
+      # anyway. Safe for the nodes it is meant to cover: every block device is
+      # denied by default, so `Vagus.Addon.Devices`' rule is what grants them.
+      # NOT a blanket "the bind grants nothing" — moby's default allowlist
+      # already permits `c 5:1` and `c 136:*`, and those are reachable by
+      # devnum with or without this mount (docs/divergences.md).
       assert s.device_cgroup_rules == []
+
+      # Upstream's MOUNT_DEV sets this; measured on-device it changes nothing
+      # about isolation, so it is carried for parity rather than protection.
+      assert dev.read_only_non_recursive == true
 
       # The /dev/shm tmpfs stacks over the bind rather than being swallowed by
       # it, the same duplicate-target pair the real Supervisor produces.
       assert Map.has_key?(s.tmpfs, "/dev/shm")
+    end
+
+    test "mounts: no /dev/console mask — masking a path does not revoke a devnum", %{spec: s} do
+      # A `/dev/null` bind over `/dev/console` was tried and removed: verified
+      # on-device, an add-on just runs `mknod c 5 1` and reads/writes the host
+      # console through its own node. `CAP_MKNOD` is in the default set and the
+      # cgroup allows `c 5:1` with the `m` bit, so the mount was never the
+      # enforcement point. Pinned so the theatre does not come back.
+      refute Enum.any?(s.mounts, &(&1.target == "/dev/console"))
     end
 
     test "mounts: host_dbus add-on gets /run/dbus read-only; default does not", %{spec: s} do

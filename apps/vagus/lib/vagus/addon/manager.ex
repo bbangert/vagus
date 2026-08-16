@@ -556,14 +556,33 @@ defmodule Vagus.Addon.Manager do
   # `devices:`. It is NOT true for the nodes moby's default policy already
   # allows: `c 1:3/1:5/1:7/1:8/1:9`, `c 5:0`, `c 5:1` (/dev/console), `c 5:2`,
   # and `c 136:*` (pty slaves). For those the bind alone IS access, with no
-  # rule from us — measured on docker 29.6.1, cgroup v2: `open("/dev/console")`
-  # and `open("/dev/pts/N")` both succeed in a container with no device rules,
-  # and the host's ptys are listed at /dev/pts (a container without the bind
-  # gets runc's private, empty devpts instead). On Nerves /dev/console is the
-  # root IEx, so this is a sharper edge here than on HAOS's login getty.
-  # Whether the boards' balenaEngine v25 behaves the same is UNVERIFIED — the
-  # captured HAOS fingerprint shows a private (rw) /dev/pts, so it may not.
-  # Phase 7's device gate measures it; do not assume either way.
+  # rule from us. Measured on BOTH boards (balenaEngine v25.0.14, cgroup v2,
+  # `Tty: false` so the container owns no pty, no device rules at all):
+  # `/dev/console` reads `5:1` and `/dev/pts/0` reads `136:0` — the host's
+  # numbers exactly — while a container without the bind gets runc's private,
+  # empty devpts and no console. Both open.
+  #
+  # Upstream has the same exposure: its `MOUNT_DEV` sets
+  # `read_only_non_recursive`, the engine honours the field, and the result is
+  # byte-identical. Docker 29.6.1 behaves the same, so this is neither a
+  # balena-engine limitation nor something a different runtime would fix.
+  #
+  # The IEx shell is NOT reachable: `erlinit --ctty tty1` puts it on
+  # `/dev/tty1`, and `c 4:*` is not in moby's default allowlist — `/dev/tty1`,
+  # `/dev/tty0` and `/dev/ttyAMA0` are all denied. `/dev/pts/0` is PID 1's
+  # stdio (the BEAM's nbtty pty), so the residual exposure is reading
+  # keystrokes typed at the LOCAL console and spoofing its output. Writing a
+  # pty slave sends output; it does not inject input.
+  #
+  # **The bind is not what grants any of this, and masking a path does not
+  # revoke it.** A cgroup rule names a device NUMBER, not a path, and
+  # `CAP_MKNOD` is in the default capability set — so a container with no
+  # `/dev` bind at all can `mknod c 5 1` and read and write the host console
+  # just the same. Verified on-device, including against a container with no
+  # bind: the exposure predates this mount and is upstream's too. Only
+  # dropping `MKNOD` closes it, which upstream does not do. See
+  # docs/divergences.md — a `/dev/null` mask over `/dev/console` was tried and
+  # removed because one `mknod` walks around it.
   #
   # Read-only buys node create/unlink protection on the host's /dev and nothing
   # more — it is not a security control on the nodes themselves. Writes to a
@@ -572,8 +591,21 @@ defmodule Vagus.Addon.Manager do
   # `ioctl` on a granted node.
   #
   # `system: true` keeps `ensure_mount_sources/1` from ever mkdir-ing into `/`.
+  #
+  # `read_only_non_recursive` matches upstream's `MOUNT_DEV` exactly
+  # (`docker/const.py`). Measured on balenaEngine v25.0.14: the engine honours
+  # the field, and it changes nothing about what is reachable — it governs
+  # whether read-only is forced onto `/dev`'s submounts, not isolation. Carried
+  # for parity, not for protection.
   defp dev_mount,
-    do: %{source: "/dev", target: "/dev", read_only: true, propagation: nil, system: true}
+    do: %{
+      source: "/dev",
+      target: "/dev",
+      read_only: true,
+      propagation: nil,
+      read_only_non_recursive: true,
+      system: true
+    }
 
   # Real-Supervisor parity (MOUNT_DBUS): a `host_dbus: true` add-on gets the
   # host system-bus socket dir bound read-only, same as HA Core's container.

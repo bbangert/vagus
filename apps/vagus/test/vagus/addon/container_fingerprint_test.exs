@@ -91,6 +91,15 @@ defmodule Vagus.Addon.ContainerFingerprintTest do
   # Divergences reviewed and accepted. Same discipline as
   # `Vagus.API.PermissionMatrixTest`: an entry is a decision with a reason, not
   # a silenced failure, and anything not listed fails loudly.
+  # The other direction: mounts VAGUS declares that the real Supervisor does
+  # not. Same discipline as `@accepted_mounts` — a decision with a reason, and
+  # anything not listed fails loudly. Empty on purpose: Vagus currently adds no
+  # mount upstream lacks. A `/dev/null` mask over `/dev/console` briefly lived
+  # here and was removed once it was shown that `mknod` walks around it
+  # (docs/divergences.md), which is exactly the kind of claim this ledger
+  # exists to stop being made casually.
+  @vagus_only_mounts %{}
+
   @accepted_mounts %{
     # Upstream writes a cid file per add-on under the Supervisor's
     # `cid_files/` and binds it read-only at `/run/cid`, so an add-on can read
@@ -264,7 +273,8 @@ defmodule Vagus.Addon.ContainerFingerprintTest do
     # This is what pins the `/dev` bind read-only: the fixture's `/dev` is
     # `ro: true`, so a Spec that bound it writable would fail here rather than
     # anywhere device-specific. Intended coupling, not incidental.
-    for %{target: target} = mount <- spec.mounts do
+    for %{target: target} = mount <- spec.mounts,
+        not Map.has_key?(@vagus_only_mounts, target) do
       fixture_mounts = Enum.filter(@fingerprint["mounts"], &(&1["target"] == target))
 
       assert fixture_mounts != [], "Spec mounts #{target}, absent from the real mount table"
@@ -327,6 +337,19 @@ defmodule Vagus.Addon.ContainerFingerprintTest do
   # test can check that, because Spec has no `fstype` — the test above compares
   # target and `ro` only. Accepted: a bind of the host's `/dev` reports the
   # source fs's type, so there is nothing Vagus chooses here to regress.
+  test "each declared divergence is still real — declared by Spec, absent upstream", %{spec: spec} do
+    # Without this the ledger rots: an entry for a mount Spec stopped
+    # declaring, or one upstream has since adopted, would silently keep
+    # excusing itself in the test above.
+    for {target, reason} <- @vagus_only_mounts do
+      assert Enum.any?(spec.mounts, &(&1.target == target)),
+             "#{target} is ledgered as a Vagus-only mount but Spec no longer declares it"
+
+      refute Enum.any?(@fingerprint["mounts"], &(&1["target"] == target)),
+             "#{target} is ledgered as a divergence (#{reason}) but the real add-on has it too"
+    end
+  end
+
   test "the accepted mount gaps are still exactly what was accepted" do
     cid = Enum.find(@fingerprint["mounts"], &(&1["target"] == "/run/cid"))
 

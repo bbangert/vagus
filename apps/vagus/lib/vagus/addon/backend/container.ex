@@ -150,11 +150,26 @@ defmodule Vagus.Addon.Backend.Container do
       "Target" => m.target,
       "ReadOnly" => Map.get(m, :read_only, false)
     }
-    |> maybe_put("BindOptions", bind_options(Map.get(m, :propagation)))
+    |> maybe_put("BindOptions", bind_options(m))
   end
 
-  defp bind_options(nil), do: nil
-  defp bind_options(propagation), do: %{"Propagation" => propagation}
+  # Omitted entirely when empty: an add-on mount that asks for neither
+  # propagation nor the recursive-ro opt-out must serialize exactly as before,
+  # or every existing mount's JSON changes shape.
+  defp bind_options(m) do
+    %{}
+    |> maybe_put("Propagation", Map.get(m, :propagation))
+    |> maybe_put("ReadOnlyNonRecursive", nilify(Map.get(m, :read_only_non_recursive)))
+    |> case do
+      empty when map_size(empty) == 0 -> nil
+      opts -> opts
+    end
+  end
+
+  # `false` is not worth sending — the engine's default — and `maybe_put` only
+  # drops `nil`.
+  defp nilify(true), do: true
+  defp nilify(_other), do: nil
 
   defp normalize_env(env) when is_list(env), do: Enum.sort(env)
 
