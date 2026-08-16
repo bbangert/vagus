@@ -708,12 +708,23 @@ defmodule Vagus.Addon.Manager do
   # (e.g. `user_options:` on a start; omitted on a stop, so the prior
   # user options are preserved — see `Vagus.Addon.State.put/3`).
   # Defaults `true` on every uncertain path — a slug that isn't tracked yet
-  # (a brand-new install starts before `record_state/3` writes its entry), and
-  # the isolated unit tests where `State` isn't running at all.
+  # (a brand-new install starts before `record_state/3` writes its entry), the
+  # isolated unit tests where `State` isn't running at all, and a stored value
+  # that isn't a boolean.
+  #
+  # That last clause is the same fail-closed rule `State.decode_protected/1`
+  # applies to a corrupt state file, restated at the *read* end because this is
+  # where a bad value would do damage: `Devices.cgroup_rules/3` guards on
+  # `is_boolean`, so a non-boolean here crashes the start with a
+  # FunctionClauseError. Guarding `State.put_setting/4` instead would leave
+  # `preserved_settings/2` free to copy a bad value forward, and would make
+  # `:protected` the only one of that setter's seven keys to type-check its
+  # value.
   defp stored_protected(slug) do
     with true <- is_pid(Process.whereis(Vagus.Addon.State)),
-         {:ok, entry} <- Vagus.Addon.State.get(slug) do
-      Map.get(entry, :protected, true)
+         {:ok, entry} <- Vagus.Addon.State.get(slug),
+         value when is_boolean(value) <- Map.get(entry, :protected, true) do
+      value
     else
       _ -> true
     end

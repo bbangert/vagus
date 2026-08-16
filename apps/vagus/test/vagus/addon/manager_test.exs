@@ -372,6 +372,34 @@ defmodule Vagus.Addon.ManagerTest do
       assert_received {:create, spec}
       assert spec.device_cgroup_rules == []
     end
+
+    # `Devices.cgroup_rules/3` guards on `is_boolean`, so a non-boolean reaching
+    # it crashes the start outright. `put_setting/4` type-checks no key's value,
+    # so the read end fails closed instead — the same rule
+    # `State.decode_protected/1` applies to a corrupt file on disk.
+    test "a non-boolean stored `protected` reads as protected, it does not crash the start", %{
+      data_root: dr
+    } do
+      {:ok, cfg} =
+        Config.parse(%{
+          "name" => "Priv3",
+          "version" => "1",
+          "slug" => "priv_addon_3",
+          "description" => "d",
+          "arch" => ["amd64"],
+          "image" => "x/y",
+          "host_network" => true,
+          "full_access" => true
+        })
+
+      :ok = State.put(cfg, :stopped)
+      :ok = State.put_setting("priv_addon_3", :protected, "false")
+      on_exit(fn -> State.delete("priv_addon_3") end)
+
+      assert {:ok, _} = Manager.start(cfg, backend: __MODULE__.FakeBackend, data_root: dr)
+      assert_received {:create, spec}
+      assert spec.device_cgroup_rules == []
+    end
   end
 
   describe "ingress dynamic port allocation (IW-P2-T2, §B3.2)" do
