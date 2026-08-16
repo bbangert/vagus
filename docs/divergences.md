@@ -61,8 +61,9 @@ Nothing measured closes the pts half without breaking pty allocation:
 `BindOptions.NonRecursive` removes the host devpts but then `/dev/ptmx` fails,
 which would kill the SSH/Terminal add-on. Left as upstream parity.
 
-**Evidence:** `.claude/plans/vagus-cairn-enablement/device-gate-transcript.md`
-(2026-08-16, boards 192.168.2.149 rpi3_64 and 192.168.2.58 dragon_q6a).
+**Evidence:** [`device-gate-2026-08-16.md`](device-gate-2026-08-16.md) — the
+full run against boards 192.168.2.149 (rpi3_64) and 192.168.2.58 (dragon_q6a),
+including the negative controls.
 
 ---
 

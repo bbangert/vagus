@@ -93,8 +93,12 @@ defmodule Vagus.Addon.ManagerTest do
       assert dev.read_only == true
       assert dev.system == true
 
-      # Unconditional — mosquitto declares no `devices:` and gets it anyway,
-      # because a bind without a cgroup rule grants nothing.
+      # Unconditional — mosquitto declares no `devices:` and gets the bind
+      # anyway. That is safe for the nodes it is meant to cover: every block
+      # device is denied by default, so `Vagus.Addon.Devices`' rule is what
+      # grants them. It is NOT a blanket "the bind grants nothing" — moby's
+      # default allowlist already permits `c 5:1` and `c 136:*`, which is why
+      # `console_mask/0` exists (docs/divergences.md).
       assert s.device_cgroup_rules == []
 
       # Upstream's MOUNT_DEV sets this; measured on-device it changes nothing
