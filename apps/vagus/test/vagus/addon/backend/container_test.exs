@@ -140,6 +140,26 @@ defmodule Vagus.Addon.Backend.ContainerTest do
       assert empty["HostConfig"]["DeviceCgroupRules"] == []
     end
 
+    test "BindOptions carries propagation and ReadOnlyNonRecursive, and is omitted when neither applies" do
+      cfg =
+        Container.build_config(
+          mosquitto_spec(
+            mounts: [
+              %{source: "/a", target: "/a", read_only: true},
+              %{source: "/dev", target: "/dev", read_only: true, read_only_non_recursive: true},
+              %{source: "/b", target: "/b", read_only: false, propagation: "rslave"}
+            ]
+          )
+        )
+
+      [plain, dev, prop] = cfg["HostConfig"]["Mounts"]
+
+      # Omitted, not empty: an existing mount's JSON must not change shape.
+      refute Map.has_key?(plain, "BindOptions")
+      assert dev["BindOptions"] == %{"ReadOnlyNonRecursive" => true}
+      assert prop["BindOptions"] == %{"Propagation" => "rslave"}
+    end
+
     test "hostname set but empty dns → no Domainname" do
       cfg = Container.build_config(mosquitto_spec(dns: []))
       refute Map.has_key?(cfg, "Domainname")

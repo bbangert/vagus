@@ -544,7 +544,7 @@ defmodule Vagus.Addon.Manager do
     mapped =
       config.map |> Enum.map(&map_mount(&1, data_root, config.slug)) |> Enum.reject(&is_nil/1)
 
-    [data_mount | mapped] ++ host_dbus_mount(config) ++ [dev_mount()]
+    [data_mount | mapped] ++ host_dbus_mount(config) ++ [dev_mount(), console_mask()]
   end
 
   # Real-Supervisor parity (MOUNT_DEV): every add-on gets the host's whole /dev
@@ -572,8 +572,46 @@ defmodule Vagus.Addon.Manager do
   # `ioctl` on a granted node.
   #
   # `system: true` keeps `ensure_mount_sources/1` from ever mkdir-ing into `/`.
+  #
+  # `read_only_non_recursive` matches upstream's `MOUNT_DEV` exactly
+  # (`docker/const.py`). Measured on balenaEngine v25.0.14: the engine honours
+  # the field, and it changes nothing about what is reachable — it governs
+  # whether read-only is forced onto `/dev`'s submounts, not isolation. Carried
+  # for parity, not for protection.
   defp dev_mount,
-    do: %{source: "/dev", target: "/dev", read_only: true, propagation: nil, system: true}
+    do: %{
+      source: "/dev",
+      target: "/dev",
+      read_only: true,
+      propagation: nil,
+      read_only_non_recursive: true,
+      system: true
+    }
+
+  # DIVERGENCE from upstream, deliberate — see docs/divergences.md.
+  #
+  # The `/dev` bind hands every add-on the host's `/dev/console`, because
+  # moby's default device cgroup already allows `c 5:1` and no cgroup rule can
+  # revoke it (`DeviceCgroupRules` is additive). Upstream has the same hole and
+  # accepts it; a HAOS console is a login getty, while this one carries the
+  # BEAM's output, so spoofed writes there are more misleading here.
+  #
+  # Binding `/dev/null` over it is the whole mitigation: measured on-device,
+  # the node reads `1:3` instead of `5:1` afterwards. Writes still succeed and
+  # are discarded — a char device bypasses the mount's read-only check — so an
+  # add-on that logs to `/dev/console` keeps working.
+  #
+  # This does NOT close the `/dev/pts` half. Nothing measured does without
+  # breaking pty allocation (`BindOptions.NonRecursive` removes the host devpts
+  # but `/dev/ptmx` then fails, which would kill the SSH/Terminal add-on).
+  defp console_mask,
+    do: %{
+      source: "/dev/null",
+      target: "/dev/console",
+      read_only: true,
+      propagation: nil,
+      system: true
+    }
 
   # Real-Supervisor parity (MOUNT_DBUS): a `host_dbus: true` add-on gets the
   # host system-bus socket dir bound read-only, same as HA Core's container.

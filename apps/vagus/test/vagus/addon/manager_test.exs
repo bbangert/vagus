@@ -97,9 +97,28 @@ defmodule Vagus.Addon.ManagerTest do
       # because a bind without a cgroup rule grants nothing.
       assert s.device_cgroup_rules == []
 
+      # Upstream's MOUNT_DEV sets this; measured on-device it changes nothing
+      # about isolation, so it is carried for parity rather than protection.
+      assert dev.read_only_non_recursive == true
+
       # The /dev/shm tmpfs stacks over the bind rather than being swallowed by
       # it, the same duplicate-target pair the real Supervisor produces.
       assert Map.has_key?(s.tmpfs, "/dev/shm")
+    end
+
+    test "mounts: the host console is masked with /dev/null (deliberate divergence)", %{spec: s} do
+      mask = Enum.find(s.mounts, &(&1.target == "/dev/console"))
+
+      # The mask only works if it lands AFTER the /dev bind — the engine
+      # depth-sorts, so /dev/console (depth 2) follows /dev (depth 1). Assert
+      # the ordering too, since a reordering would silently unmask the console.
+      assert mask.source == "/dev/null"
+      assert mask.system == true
+
+      targets = Enum.map(s.mounts, & &1.target)
+
+      assert Enum.find_index(targets, &(&1 == "/dev")) <
+               Enum.find_index(targets, &(&1 == "/dev/console"))
     end
 
     test "mounts: host_dbus add-on gets /run/dbus read-only; default does not", %{spec: s} do

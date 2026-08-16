@@ -18,11 +18,16 @@ defmodule Vagus.Addon.Backend.Spec do
   # created by Vagus.Bluetooth), not by the add-on manager: the manager must
   # never create it, so a missing source fails the add-on start loudly
   # instead of silently binding an empty directory.
+  # `:read_only_non_recursive` maps to the Engine API's
+  # `BindOptions.ReadOnlyNonRecursive` — read-only applies to the bind itself
+  # but is not forced onto submounts. Only `/dev` needs it (see `Manager`), and
+  # it exists because upstream's `MOUNT_DEV` sets it.
   @type mount :: %{
           required(:source) => String.t(),
           required(:target) => String.t(),
           optional(:read_only) => boolean(),
           optional(:propagation) => String.t() | nil,
+          optional(:read_only_non_recursive) => boolean(),
           optional(:system) => boolean()
         }
 
