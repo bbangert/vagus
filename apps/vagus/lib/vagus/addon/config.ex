@@ -41,7 +41,9 @@ defmodule Vagus.Addon.Config do
 
   `dsp: true` binds the host's `/usr/lib/dsp` (the Hexagon DSP skeleton
   libraries the system image ships) read-only into the container, so a QNN
-  workload can reach the CDSP. `_SCHEMA_APP_CONFIG` has no such key, and
+  workload can reach the CDSP, and grants the fastrpc/DMA-heap device rules
+  that bind is inert without (`Vagus.Addon.Devices`).
+  `_SCHEMA_APP_CONFIG` has no such key, and
   upstream has **no precedent at all** for host-mounting vendor accelerator
   libraries — this rests on analogy to `kernel_modules`, which exists for the
   same reason: the payload has to match the kernel/firmware the running system

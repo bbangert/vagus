@@ -205,6 +205,14 @@ defmodule Vagus.Addon.ManagerTest do
       assert dsp.system == true
     end
 
+    test "dsp: true still resolves the declared devices:" do
+      # Membership, not equality: on a board with fastrpc nodes the spec also
+      # carries their rules, and this test has no seam to inject through.
+      spec = Manager.build_spec(device_config(dsp: true, devices: ["/dev/null"]), arch: "amd64")
+
+      assert "c 1:3 rwm" in spec.device_cgroup_rules
+    end
+
     # The flag must not disturb the mount every add-on already gets.
     test "dsp: true leaves the unconditional /dev bind alone" do
       spec = Manager.build_spec(device_config(dsp: true), arch: "amd64")
