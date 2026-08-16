@@ -555,8 +555,34 @@ defmodule Vagus.Addon.Manager do
     mapped =
       config.map |> Enum.map(&map_mount(&1, data_root, config.slug)) |> Enum.reject(&is_nil/1)
 
-    [data_mount | mapped] ++ host_dbus_mount(config) ++ [dev_mount()]
+    [data_mount | mapped] ++ host_dbus_mount(config) ++ dsp_mount(config) ++ [dev_mount()]
   end
+
+  # `dsp: true` — the host's Hexagon DSP skeleton libraries, read-only. Vagus
+  # only; upstream has no equivalent key (see `Vagus.Addon.Config`'s moduledoc
+  # for why this is a host mount rather than something baked into the add-on
+  # image).
+  #
+  # `system: true` is doing real work here, unlike on `/dev` where the source
+  # always exists. The skel has to match the CDSP firmware the *system image*
+  # ships — a mismatched pair degrades silently, with QNN falling back to CPU
+  # for the whole session and never erroring. If `ensure_mount_sources/1`
+  # mkdir_p'd this, a firmware built without the overlay would bind an empty
+  # directory and the add-on would start, run slowly, and report success. The
+  # engine rejecting the missing bind source is the loud failure that case
+  # needs.
+  defp dsp_mount(%Config{dsp: true}),
+    do: [
+      %{
+        source: "/usr/lib/dsp",
+        target: "/usr/lib/dsp",
+        read_only: true,
+        propagation: nil,
+        system: true
+      }
+    ]
+
+  defp dsp_mount(_config), do: []
 
   # Real-Supervisor parity (MOUNT_DEV): every add-on gets the host's whole /dev
   # bound read-only, unconditionally — upstream does not key this on `devices:`.

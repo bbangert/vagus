@@ -186,6 +186,33 @@ defmodule Vagus.Addon.ManagerTest do
       assert unprotected.device_cgroup_rules == ["b *:* rwm", "c *:* rwm"]
       assert unprotected.pid_mode == "host"
     end
+
+    test "dsp: false declares no /usr/lib/dsp mount", %{spec: s} do
+      refute Enum.any?(s.mounts, &(&1.target == "/usr/lib/dsp"))
+    end
+
+    test "dsp: true declares the skel bind, read-only and system-owned" do
+      spec = Manager.build_spec(device_config(dsp: true), arch: "amd64")
+
+      assert dsp = Enum.find(spec.mounts, &(&1.target == "/usr/lib/dsp"))
+      assert dsp.source == "/usr/lib/dsp"
+      assert dsp.read_only == true
+
+      # `system: true` is the whole failure model: it stops
+      # `ensure_mount_sources/1` creating the directory, so a firmware without
+      # the skel overlay fails container-create instead of binding an empty dir
+      # and letting QNN fall back to CPU silently.
+      assert dsp.system == true
+    end
+
+    # The flag must not disturb the mount every add-on already gets.
+    test "dsp: true leaves the unconditional /dev bind alone" do
+      spec = Manager.build_spec(device_config(dsp: true), arch: "amd64")
+
+      assert dev = Enum.find(spec.mounts, &(&1.target == "/dev"))
+      assert dev.read_only == true
+      assert dev.system == true
+    end
   end
 
   defp device_config(extra) do
@@ -371,6 +398,37 @@ defmodule Vagus.Addon.ManagerTest do
 
       assert_received {:create, spec}
       assert spec.device_cgroup_rules == []
+    end
+
+    # `ensure_mount_sources/1` mkdir_p's every non-`system:` bind source, and
+    # the `/data` assertion below is the control proving it ran at all — without
+    # it, "the dsp dir wasn't created" would pass just as well if the whole
+    # function had been skipped.
+    test "a dsp: true start creates its data dir but never mkdir_p's /usr/lib/dsp", %{
+      data_root: dr
+    } do
+      refute File.exists?("/usr/lib/dsp"),
+             "this host already has /usr/lib/dsp — the assertion below cannot distinguish " <>
+               "'never created' from 'was already there'"
+
+      {:ok, cfg} =
+        Config.parse(%{
+          "name" => "Dsp",
+          "version" => "1",
+          "slug" => "dsp_addon",
+          "description" => "d",
+          "arch" => ["amd64"],
+          "image" => "x/y",
+          "host_network" => true,
+          "dsp" => true
+        })
+
+      on_exit(fn -> State.delete("dsp_addon") end)
+
+      assert {:ok, _} = Manager.start(cfg, backend: __MODULE__.FakeBackend, data_root: dr)
+
+      assert File.dir?(Path.join([dr, "addons", "data", "dsp_addon"]))
+      refute File.exists?("/usr/lib/dsp")
     end
 
     # `Devices.cgroup_rules/3` guards on `is_boolean`, so a non-boolean reaching

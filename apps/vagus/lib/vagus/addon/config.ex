@@ -36,6 +36,21 @@ defmodule Vagus.Addon.Config do
   looseness on every other bare string-list field). Neither field is
   otherwise interpreted by `parse/1` itself; `Availability` owns what they
   mean.
+
+  ## `dsp:` — a Vagus-only key with no upstream counterpart
+
+  `dsp: true` binds the host's `/usr/lib/dsp` (the Hexagon DSP skeleton
+  libraries the system image ships) read-only into the container, so a QNN
+  workload can reach the CDSP. `_SCHEMA_APP_CONFIG` has no such key, and
+  upstream has **no precedent at all** for host-mounting vendor accelerator
+  libraries — this rests on analogy to `kernel_modules`, which exists for the
+  same reason: the payload has to match the kernel/firmware the running system
+  image ships, so baking it into the add-on image would couple the add-on to a
+  system version it cannot see.
+
+  Deliberately absent from `GET /addons/{slug}/info` (plan D-D): that payload
+  is contract-shaped for `aiohasupervisor`, and a Vagus-only key inside an
+  upstream-shaped response is new divergence with no caller asking for it.
   """
 
   @slug_re ~r/^[-_.A-Za-z0-9]+$/
@@ -90,6 +105,7 @@ defmodule Vagus.Addon.Config do
           privileged: [String.t()],
           full_access: boolean(),
           devices: [String.t()],
+          dsp: boolean(),
           apparmor: boolean(),
           ingress: boolean(),
           ingress_port: non_neg_integer(),
@@ -139,6 +155,7 @@ defmodule Vagus.Addon.Config do
             privileged: [],
             full_access: false,
             devices: [],
+            dsp: false,
             apparmor: true,
             ingress: false,
             ingress_port: 8099,
@@ -293,6 +310,7 @@ defmodule Vagus.Addon.Config do
       "privileged" => c.privileged,
       "full_access" => c.full_access,
       "devices" => c.devices,
+      "dsp" => c.dsp,
       "apparmor" => c.apparmor,
       "ingress" => c.ingress,
       "ingress_port" => c.ingress_port,
@@ -354,6 +372,7 @@ defmodule Vagus.Addon.Config do
     |> put(:privileged, str_list(raw, "privileged"))
     |> put(:full_access, boolean(raw, "full_access", false))
     |> put(:devices, str_list(raw, "devices"))
+    |> put(:dsp, boolean(raw, "dsp", false))
     |> put(:apparmor, boolean(raw, "apparmor", true))
     |> put(:ingress, boolean(raw, "ingress", false))
     |> put_ingress_port(raw)
