@@ -86,6 +86,7 @@ defmodule Vagus.Addon.Manager do
 
   alias Vagus.Addon.Backend.Spec
   alias Vagus.Addon.{Config, Devices, OptionsSchema, Ports}
+  alias Vagus.DSP
   alias Vagus.Ingress.Panels
   alias Vagus.Network
 
@@ -166,6 +167,7 @@ defmodule Vagus.Addon.Manager do
     user_options = Keyword.get(opts, :user_options, %{})
 
     with :ok <- ensure_mount_sources(spec),
+         :ok <- ensure_dsp_store(config),
          :ok <- write_options(config, data_root, user_options),
          :ok <- maybe_ensure_network(config, opts),
          :ok <- remove_stale_container(spec, opts),
@@ -558,19 +560,38 @@ defmodule Vagus.Addon.Manager do
     [data_mount | mapped] ++ host_dbus_mount(config) ++ dsp_mount(config) ++ [dev_mount()]
   end
 
-  # `dsp: true` — the host's Hexagon DSP skeleton libraries, read-only. Vagus
-  # only; upstream has no equivalent key (see `Vagus.Addon.Config`'s moduledoc
-  # for why this is a host mount rather than something baked into the add-on
-  # image).
+  # `dsp: true` — two read-only binds, because reaching the Hexagon DSP needs
+  # two payloads with two different owners. Vagus only; upstream has no
+  # equivalent key (see `Vagus.Addon.Config`'s moduledoc for why these are host
+  # mounts rather than something baked into the add-on image).
   #
-  # `system: true` is doing real work here, unlike on `/dev` where the source
-  # always exists. The skel has to match the CDSP firmware the *system image*
-  # ships — a mismatched pair degrades silently, with QNN falling back to CPU
-  # for the whole session and never erroring. If `ensure_mount_sources/1`
-  # mkdir_p'd this, a firmware built without the overlay would bind an empty
-  # directory and the add-on would start, run slowly, and report success. The
-  # engine rejecting the missing bind source is the loud failure that case
-  # needs.
+  # `/usr/lib/dsp` carries the fastrpc *shells* the system image ships;
+  # `Vagus.DSP.root()` carries the operator-uploaded skel, which Qualcomm does
+  # not permit redistributing and so can never be in any image. Measured on
+  # dragon_q6a: skel without shells fails `0x80000600` (the session never
+  # opens), shells without skel fails `0x80000406` (it opens and the skel load
+  # fails). Independently required, and each failing distinctly.
+  #
+  # Two directories, not one: `libcdsprpc.so.1` searches a built-in path *list*
+  # (`/usr/lib/dsp/cdsp;/usr/lib/dsp/adsp;/usr/lib/rfsa/adsp;/usr/lib/dsp`), so
+  # nothing has to compose them. `/usr/lib/rfsa/adsp` is on that list and the
+  # system image never populates it, so the two binds cannot collide — measured
+  # with the skels bound only there running on the DSP, and the control of the
+  # same files bound off the list failing.
+  #
+  # `system: true` on both, meaning something different on each: the firmware
+  # owns `/usr/lib/dsp`, while Vagus owns the store and the operator may simply
+  # not have filled it yet. Neither may be mkdir_p'd by
+  # `ensure_mount_sources/1` — an empty bind is an add-on that starts, falls
+  # back to CPU for the whole session, and reports success forever, which is
+  # the silent failure this flag exists to prevent. A create-time refusal is
+  # the loud alternative, and for the store half `ensure_dsp_store/1` turns it
+  # into a sentence naming the panel first; the engine stays the backstop.
+  #
+  # A board with no DSP has no `root()` and gets no store bind, rather than one
+  # with a `nil` source. `/usr/lib/dsp` is absent there too and fails on its
+  # own, which is the honest answer for an add-on asking for hardware the board
+  # does not have.
   defp dsp_mount(%Config{dsp: true}),
     do: [
       %{
@@ -580,9 +601,23 @@ defmodule Vagus.Addon.Manager do
         propagation: nil,
         system: true
       }
+      | skel_mount(DSP.root())
     ]
 
   defp dsp_mount(_config), do: []
+
+  defp skel_mount(nil), do: []
+
+  defp skel_mount(root),
+    do: [
+      %{
+        source: root,
+        target: "/usr/lib/rfsa/adsp",
+        read_only: true,
+        propagation: nil,
+        system: true
+      }
+    ]
 
   # Real-Supervisor parity (MOUNT_DEV): every add-on gets the host's whole /dev
   # bound read-only, unconditionally — upstream does not key this on `devices:`.
@@ -695,6 +730,31 @@ defmodule Vagus.Addon.Manager do
         end
     end)
   end
+
+  # The store bind is `system: true`, so an unsupplied skel is already a failed
+  # container create — but the engine's error for it is a missing bind source,
+  # which names a path the operator has never heard of for a problem they fix
+  # by uploading a file. This says that instead, and only for `dsp: true`.
+  #
+  # `DSP.state/0`, not `DSP.status/0`: a start must not pay the whole-file
+  # version rescan, and `Vagus.Addon.Watchdog` can drive starts in a loop.
+  defp ensure_dsp_store(%Config{dsp: true}) do
+    case DSP.state() do
+      :configured ->
+        :ok
+
+      :not_configured ->
+        {:error,
+         {:dsp_not_configured,
+          "no DSP skeleton library has been supplied — upload one from the QAIRT SDK " <>
+            "on the Vagus admin panel"}}
+
+      :unsupported ->
+        {:error, {:dsp_unsupported, "this device has no Hexagon DSP"}}
+    end
+  end
+
+  defp ensure_dsp_store(_config), do: :ok
 
   # Validate merged options against the add-on schema and write /data/options.json
   # (the per-add-on data dir is the /data bind source).

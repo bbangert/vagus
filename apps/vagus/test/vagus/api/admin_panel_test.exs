@@ -26,12 +26,14 @@ defmodule Vagus.API.AdminPanelTest do
 
   alias Vagus.Addon.{Config, State}
   alias Vagus.API.{AdminPanel, IngressProxy, Router, Token}
+  alias Vagus.DSP
   alias Vagus.Ingress.Panels
 
   @proxy_opts IngressProxy.init([])
   @router_opts Router.init([])
 
   @admin_user "01ab23cd45ef67890123456789abcdef"
+  @boundary "vagus-panel-dsp-boundary"
 
   defmodule StubUsers do
     @moduledoc false
@@ -88,7 +90,7 @@ defmodule Vagus.API.AdminPanelTest do
   # Drives the real dispatch path `Vagus.API.Dispatcher` uses for
   # `["ingress", token | rest]`.
   defp ingress_call(path, opts \\ []) do
-    conn = conn(Keyword.get(opts, :method, :get), path)
+    conn = conn(Keyword.get(opts, :method, :get), path, Keyword.get(opts, :body))
 
     conn =
       case Keyword.get(opts, :session) do
@@ -100,6 +102,12 @@ defmodule Vagus.API.AdminPanelTest do
       case Keyword.get(opts, :ingress_path) do
         nil -> conn
         value -> put_req_header(conn, "x-ingress-path", value)
+      end
+
+    conn =
+      case Keyword.get(opts, :content_type) do
+        nil -> conn
+        value -> put_req_header(conn, "content-type", value)
       end
 
     IngressProxy.call(conn, @proxy_opts)
@@ -505,6 +513,397 @@ defmodule Vagus.API.AdminPanelTest do
     end
   end
 
+  # The one route on this panel that writes. Its whole shape is the B1 rule:
+  # `serve/2`'s admin check runs first, so the disk-spooling multipart parse
+  # is only ever reached by an admin.
+  describe "POST /ingress/<admin token>/dsp" do
+    setup do
+      dir = Path.join(System.tmp_dir!(), "vagus_panel_dsp_#{System.unique_integer([:positive])}")
+      Application.put_env(:vagus, :dsp_root, dir)
+
+      on_exit(fn ->
+        Application.delete_env(:vagus, :dsp_root)
+        File.rm_rf!(dir)
+      end)
+
+      %{dsp_dir: dir}
+    end
+
+    test "a valid skel is stored and the page reports it", %{session: session, token: token} do
+      conn = upload(token, session, part("skel", "libQnnHtpV68Skel.so", skel("V68")))
+
+      assert conn.status == 200
+      assert ["text/html; charset=utf-8"] = get_resp_header(conn, "content-type")
+      assert conn.resp_body =~ "Stored."
+      assert conn.resp_body =~ "libQnnHtpV68Skel.so"
+      assert conn.resp_body =~ "V68"
+      assert conn.resp_body =~ "2.48.40"
+
+      assert {:configured, %{filename: "libQnnHtpV68Skel.so", arch: "V68"}} = DSP.status()
+      # The SSH section is on the same page and must survive the re-render.
+      assert conn.resp_body =~ fingerprint()
+    end
+
+    test "the field name is irrelevant, as on the backup route", %{session: session, token: token} do
+      conn = upload(token, session, part("whatever", "x.bin", skel("V73")))
+
+      assert conn.status == 200
+      assert {:configured, %{arch: "V73"}} = DSP.status()
+    end
+
+    test "a host library re-renders with a reason and stores nothing", %{
+      session: session,
+      token: token,
+      dsp_dir: dir
+    } do
+      body = elf(class: 2, machine: 62) <> "libQnnHtpV68Skel.so"
+      conn = upload(token, session, part("skel", "libQnnHtp.so", body))
+
+      assert conn.status == 400
+      assert ["text/html; charset=utf-8"] = get_resp_header(conn, "content-type")
+      assert conn.resp_body =~ "aarch64 stub sits one directory away from the skeleton"
+      # Still the page, not a bare 400 — the operator needs the form again.
+      assert conn.resp_body =~ ~s(enctype="multipart/form-data")
+
+      assert DSP.status() == :not_configured
+      assert Path.wildcard(Path.join(dir, "*")) == []
+    end
+
+    # The discriminating case: the body is malformed multipart, so a handler
+    # that parsed before authorizing would answer 400. A clean 403 is what
+    # proves the parse never ran — and with it, that no non-admin can make
+    # this device spool a file to disk.
+    test "a non-admin is 403 before anything is parsed or written", %{
+      session: session,
+      token: token,
+      dsp_dir: dir
+    } do
+      stub_admin({:ok, false})
+
+      conn =
+        ingress_call("/ingress/#{token}/dsp",
+          method: :post,
+          session: session,
+          body: "not multipart at all",
+          content_type: "multipart/form-data; boundary=#{@boundary}"
+        )
+
+      assert conn.status == 403
+      assert conn.resp_body == "Forbidden: Home Assistant administrators only"
+      assert DSP.status() == :not_configured
+      refute File.exists?(dir)
+    end
+
+    test "a body with no file in it is refused cleanly", %{session: session, token: token} do
+      field =
+        "--#{@boundary}\r\n" <>
+          ~s(content-disposition: form-data; name="note"\r\n\r\n) <>
+          "hello\r\n--#{@boundary}--\r\n"
+
+      conn = upload(token, session, field)
+
+      assert conn.status == 400
+      assert conn.resp_body =~ "No file was attached."
+      assert DSP.status() == :not_configured
+    end
+
+    test "a malformed body is refused cleanly, not with a 500", %{session: session, token: token} do
+      conn =
+        ingress_call("/ingress/#{token}/dsp",
+          method: :post,
+          session: session,
+          body: "not multipart at all",
+          content_type: "multipart/form-data; boundary=#{@boundary}"
+        )
+
+      assert conn.status == 400
+      assert conn.resp_body =~ "could not be read as a file submission"
+    end
+
+    # `Plug.Parsers.MULTIPART` re-raises this one instead of wrapping it, so
+    # without its own rescue clause a client could turn any 400 on this panel
+    # into a 500 just by sending non-UTF-8 bytes in a plain form field.
+    test "a part with invalid UTF-8 is refused cleanly, not with a 500", %{
+      session: session,
+      token: token
+    } do
+      field =
+        "--#{@boundary}\r\n" <>
+          ~s(content-disposition: form-data; name="note"\r\n\r\n) <>
+          <<0xFF, 0xFE, 0xFD>> <> "\r\n--#{@boundary}--\r\n"
+
+      conn = upload(token, session, field)
+
+      assert conn.status == 400
+      assert conn.resp_body =~ "could not be read as a file submission"
+      assert DSP.status() == :not_configured
+    end
+
+    # `Plug.Upload` resolves its spool roots once at application start into a
+    # `:persistent_term`, so this is the only honest way to make
+    # `random_file!/1` fail — a regular file as the tmp root makes its
+    # `File.mkdir_p` return `:enotdir` for root as well, which permission
+    # bits would not. No seam in the panel itself.
+    test "an upload the device cannot spool is 507, not a 500 and not a 400", %{
+      session: session,
+      token: token
+    } do
+      {roots, suffix} = :persistent_term.get(Plug.Upload)
+
+      blocker =
+        Path.join(System.tmp_dir!(), "vagus_no_spool_#{System.unique_integer([:positive])}")
+
+      File.write!(blocker, "")
+
+      :persistent_term.put(Plug.Upload, {[blocker], suffix})
+
+      on_exit(fn ->
+        :persistent_term.put(Plug.Upload, {roots, suffix})
+        File.rm_rf!(blocker)
+      end)
+
+      conn = upload(token, session, part("skel", "libQnnHtpV68Skel.so", skel("V68")))
+
+      assert conn.status == 507
+      assert conn.resp_body =~ "data partition is most likely"
+      # The sentence must not send the operator back to the SDK tree.
+      refute conn.resp_body =~ "aarch64 stub"
+      assert DSP.status() == :not_configured
+    end
+
+    test "a non-multipart content type is refused cleanly", %{session: session, token: token} do
+      conn =
+        ingress_call("/ingress/#{token}/dsp",
+          method: :post,
+          session: session,
+          body: skel("V68"),
+          content_type: "application/octet-stream"
+        )
+
+      assert conn.status == 400
+      assert conn.resp_body =~ "could not be read as a file submission"
+    end
+
+    # The parser cap is `Vagus.DSP.max_bytes/0` itself, so the SDK archive an
+    # operator might submit instead of the extracted `.so` dies here rather
+    # than after being spooled whole.
+    test "a body over the cap is refused and names the mistake", %{
+      session: session,
+      token: token
+    } do
+      oversize = String.duplicate("x", DSP.max_bytes() + 1024)
+      conn = upload(token, session, part("skel", "qairt.zip", oversize))
+
+      assert conn.status == 400
+      assert conn.resp_body =~ "larger than #{div(DSP.max_bytes(), 1024 * 1024)} MB"
+      assert conn.resp_body =~ "SDK archive you downloaded it in"
+      assert DSP.status() == :not_configured
+    end
+
+    test "the panel renders on a target with no DSP at all", %{session: session, token: token} do
+      Application.delete_env(:vagus, :dsp_root)
+
+      conn = ingress_call("/ingress/#{token}/", session: session)
+
+      assert conn.status == 200
+      assert conn.resp_body =~ "no Hexagon DSP"
+      refute conn.resp_body =~ "multipart/form-data"
+    end
+
+    test "the form posts back to the ingress-absolute /dsp path", %{
+      session: session,
+      token: token
+    } do
+      conn =
+        ingress_call("/ingress/#{token}/",
+          session: session,
+          ingress_path: "/api/hassio_ingress/#{token}"
+        )
+
+      assert conn.resp_body =~ ~s(action="/api/hassio_ingress/#{token}/dsp")
+    end
+  end
+
+  # The instructions are the deliverable: an operator has to find one file
+  # inside a 2.4 GB SDK tree, and a path that does not exist in the download
+  # would fail the feature at its only user-facing step.
+  describe "the DSP section" do
+    setup do
+      dir = Path.join(System.tmp_dir!(), "vagus_dsp_ui_#{System.unique_integer([:positive])}")
+      Application.put_env(:vagus, :dsp_root, dir)
+      # Both Qualcomm boards set this beside :dsp_root; QCS6490 is Hexagon v68.
+      Application.put_env(:vagus, :dsp_arch, "V68")
+
+      on_exit(fn ->
+        Application.delete_env(:vagus, :dsp_root)
+        Application.delete_env(:vagus, :dsp_arch)
+        File.rm_rf!(dir)
+      end)
+
+      :ok
+    end
+
+    test "not configured names the exact file and where it sits in the SDK", %{
+      session: session,
+      token: token
+    } do
+      conn = ingress_call("/ingress/#{token}/", session: session)
+
+      assert conn.status == 200
+      assert conn.resp_body =~ "lib/hexagon-v68/unsigned/libQnnHtpV68Skel.so"
+      assert conn.resp_body =~ "Qualcomm AI Runtime (QAIRT) SDK"
+      assert conn.resp_body =~ "Qualcomm account"
+      assert conn.resp_body =~ ~s(enctype="multipart/form-data")
+      assert conn.resp_body =~ fingerprint()
+    end
+
+    # The three ways to pick the wrong file, each of which an operator reaches
+    # by looking in a plausible place.
+    test "not configured warns off lib-safe, the aarch64 stub and the archive", %{
+      session: session,
+      token: token
+    } do
+      body = ingress_call("/ingress/#{token}/", session: session).resp_body
+
+      assert body =~ "lib-safe/"
+      assert body =~ "lib/aarch64-oe-linux-gcc11.2/libQnnHtpV68Stub.so"
+      assert body =~ "2.4&nbsp;GB"
+    end
+
+    test "configured reports the stored file", %{session: session, token: token} do
+      {:ok, info} = DSP.store(write_tmp(skel("V68")))
+
+      conn = ingress_call("/ingress/#{token}/", session: session)
+
+      assert conn.status == 200
+      assert conn.resp_body =~ "libQnnHtpV68Skel.so"
+      assert conn.resp_body =~ "V68"
+      assert conn.resp_body =~ "2.48.40"
+      assert conn.resp_body =~ "#{info.size} bytes"
+      assert conn.resp_body =~ to_string(info.stored_at)
+      refute conn.resp_body =~ "wrong DSP"
+      assert conn.resp_body =~ fingerprint()
+    end
+
+    # Warn, never refuse — a V73 skel on a v68 DSP is the silent-CPU-fallback
+    # failure this whole feature defends against, but `:dsp_arch` being wrong
+    # for a board must not strand the operator.
+    test "a skel for another Hexagon version warns and is still reported as stored", %{
+      session: session,
+      token: token
+    } do
+      {:ok, _info} = DSP.store(write_tmp(skel("V73")))
+
+      conn = ingress_call("/ingress/#{token}/", session: session)
+
+      assert conn.status == 200
+      assert conn.resp_body =~ "wrong DSP"
+      assert conn.resp_body =~ "falls back"
+      assert conn.resp_body =~ "libQnnHtpV73Skel.so"
+      assert conn.resp_body =~ "stored all the same"
+      assert {:configured, %{arch: "V73"}} = DSP.status()
+      assert conn.resp_body =~ fingerprint()
+    end
+
+    test "configured says the two version numbers cannot be compared", %{
+      session: session,
+      token: token
+    } do
+      {:ok, _info} = DSP.store(write_tmp(skel("V68")))
+
+      body = ingress_call("/ingress/#{token}/", session: session).resp_body
+
+      assert body =~ "cDSP firmware"
+      assert body =~ "cannot be compared"
+      assert body =~ "add-on author's contract"
+    end
+
+    # No cdsp remoteproc on a host or on `rpi3_64` — the row reads as unknown
+    # rather than blanking or crashing the page that hands out the root key.
+    test "an unreadable cDSP firmware version renders as unknown", %{
+      session: session,
+      token: token
+    } do
+      {:ok, _info} = DSP.store(write_tmp(skel("V68")))
+
+      body = ingress_call("/ingress/#{token}/", session: session).resp_body
+
+      assert body =~ ~s(<dt>cDSP firmware</dt><dd class="mono">unknown</dd>)
+    end
+
+    test "a skel carrying no AISW_VERSION reads as not detected", %{
+      session: session,
+      token: token
+    } do
+      body = elf() <> String.duplicate("\0", 64) <> "libQnnHtpV68Skel.so"
+      {:ok, %{version: nil}} = DSP.store(write_tmp(body))
+
+      page = ingress_call("/ingress/#{token}/", session: session)
+
+      assert page.status == 200
+      assert page.resp_body =~ ~s(<dt>Skeleton version</dt><dd class="mono">not detected</dd>)
+      assert page.resp_body =~ "libQnnHtpV68Skel.so"
+    end
+
+    test "a target with no DSP gets neither instructions nor a form", %{
+      session: session,
+      token: token
+    } do
+      Application.delete_env(:vagus, :dsp_root)
+
+      conn = ingress_call("/ingress/#{token}/", session: session)
+
+      assert conn.status == 200
+      assert conn.resp_body =~ "no Hexagon DSP"
+      refute conn.resp_body =~ "multipart/form-data"
+      refute conn.resp_body =~ "Qualcomm AI Runtime"
+      refute conn.resp_body =~ "hexagon-v68"
+      assert conn.resp_body =~ fingerprint()
+    end
+  end
+
+  # The method gate is the outer guard. Narrowing it for one path must not
+  # let it decay into `dispatch/2`'s 404 for anything else.
+  describe "the narrowed method gate" do
+    for method <- [:put, :delete, :patch] do
+      test "#{method} on the upload path is still 405", %{session: session, token: token} do
+        conn = ingress_call("/ingress/#{token}/dsp", method: unquote(method), session: session)
+        assert conn.status == 405
+      end
+    end
+
+    for path <- ["key", "", "index.html", "nope"] do
+      test "POST to #{inspect(path)} is 405, not 404", %{session: session, token: token} do
+        conn = ingress_call("/ingress/#{token}/#{unquote(path)}", method: :post, session: session)
+        assert conn.status == 405
+      end
+    end
+
+    # The UI lives on the index page; there is deliberately nothing to GET
+    # here.
+    test "GET on the upload path is 404", %{session: session, token: token} do
+      conn = ingress_call("/ingress/#{token}/dsp", session: session)
+      assert conn.status == 404
+    end
+  end
+
+  # Panel-only and admin-gated by design: a `/dsp` route on the Supervisor API
+  # would be a new mutating surface for `Vagus.API.Tiers` to grade, with no
+  # caller that exists.
+  describe "the Supervisor API has no DSP route" do
+    for method <- [:get, :post] do
+      test "#{method} /dsp is 404" do
+        conn =
+          unquote(method)
+          |> conn("/dsp")
+          |> put_req_header("authorization", "Bearer #{Token.get()}")
+          |> Router.call(@router_opts)
+
+        assert conn.status == 404
+      end
+    end
+  end
+
   ## Fixtures
 
   defp start_state do
@@ -524,5 +923,46 @@ defmodule Vagus.API.AdminPanelTest do
       })
 
     config
+  end
+
+  defp upload(token, session, body) do
+    ingress_call("/ingress/#{token}/dsp",
+      method: :post,
+      session: session,
+      body: body,
+      content_type: "multipart/form-data; boundary=#{@boundary}"
+    )
+  end
+
+  defp part(field, filename, contents) do
+    "--#{@boundary}\r\n" <>
+      ~s(content-disposition: form-data; name="#{field}"; filename="#{filename}"\r\n) <>
+      "content-type: application/octet-stream\r\n\r\n" <>
+      contents <> "\r\n--#{@boundary}--\r\n"
+  end
+
+  # Same synthesis as `Vagus.DSPTest` — the real skel cannot be redistributed,
+  # so there is no fixture binary to point at.
+  defp elf(opts \\ []) do
+    class = Keyword.get(opts, :class, 1)
+    data = Keyword.get(opts, :data, 1)
+    type = Keyword.get(opts, :type, 3)
+    machine = Keyword.get(opts, :machine, 164)
+
+    <<0x7F, "ELF", class, data, 1, 0::size(72), type::little-16, machine::little-16>>
+  end
+
+  defp skel(arch) do
+    elf() <>
+      <<0::size(512)>> <>
+      "AISW_VERSION: 2.48.40\0" <>
+      "libQnnHtpV#{String.trim_leading(arch, "V")}Skel.so\0"
+  end
+
+  defp write_tmp(contents) do
+    path = Path.join(System.tmp_dir!(), "vagus_dsp_ui_src_#{System.unique_integer([:positive])}")
+    File.write!(path, contents)
+    on_exit(fn -> File.rm_rf!(path) end)
+    path
   end
 end

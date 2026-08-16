@@ -39,10 +39,12 @@ defmodule Vagus.Addon.Config do
 
   ## `dsp:` — a Vagus-only key with no upstream counterpart
 
-  `dsp: true` binds the host's `/usr/lib/dsp` (the Hexagon DSP skeleton
-  libraries the system image ships) read-only into the container, so a QNN
-  workload can reach the CDSP, and grants the fastrpc/DMA-heap device rules
-  that bind is inert without (`Vagus.Addon.Devices`).
+  `dsp: true` binds two directories read-only into the container so a QNN
+  workload can reach the CDSP — the system image's fastrpc shells
+  (`/usr/lib/dsp`) and the operator-supplied Hexagon skel (`Vagus.DSP`) — and
+  grants the fastrpc/DMA-heap device rules both are inert without
+  (`Vagus.Addon.Devices`). All three parts are required; see
+  `Vagus.Addon.Manager`'s `dsp_mount/1` for what each supplies.
   `_SCHEMA_APP_CONFIG` has no such key, and
   upstream has **no precedent at all** for host-mounting vendor accelerator
   libraries — this rests on analogy to `kernel_modules`, which exists for the

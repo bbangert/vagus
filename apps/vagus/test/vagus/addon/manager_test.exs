@@ -187,22 +187,56 @@ defmodule Vagus.Addon.ManagerTest do
       assert unprotected.pid_mode == "host"
     end
 
-    test "dsp: false declares no /usr/lib/dsp mount", %{spec: s} do
-      refute Enum.any?(s.mounts, &(&1.target == "/usr/lib/dsp"))
+    test "dsp: false declares neither dsp mount", %{spec: s} do
+      refute Enum.any?(s.mounts, &(&1.target in ["/usr/lib/dsp", "/usr/lib/rfsa/adsp"]))
     end
 
-    test "dsp: true declares the skel bind, read-only and system-owned" do
+    test "dsp: true declares both binds, read-only and system-owned" do
+      dsp_root = configure_dsp_root()
       spec = Manager.build_spec(device_config(dsp: true), arch: "amd64")
 
-      assert dsp = Enum.find(spec.mounts, &(&1.target == "/usr/lib/dsp"))
-      assert dsp.source == "/usr/lib/dsp"
-      assert dsp.read_only == true
+      # The shells the system image ships. Measured as independently required
+      # from the skel — without them the fastrpc session never opens.
+      assert shells = Enum.find(spec.mounts, &(&1.target == "/usr/lib/dsp"))
+      assert shells.source == "/usr/lib/dsp"
+      assert shells.read_only == true
+      assert shells.system == true
+
+      # The operator's skel, at the one entry on `libcdsprpc`'s built-in search
+      # list the system image never populates — so the two binds cannot collide.
+      assert skel = Enum.find(spec.mounts, &(&1.target == "/usr/lib/rfsa/adsp"))
+      assert skel.source == dsp_root
+      assert skel.read_only == true
 
       # `system: true` is the whole failure model: it stops
-      # `ensure_mount_sources/1` creating the directory, so a firmware without
-      # the skel overlay fails container-create instead of binding an empty dir
-      # and letting QNN fall back to CPU silently.
-      assert dsp.system == true
+      # `ensure_mount_sources/1` creating the store, so an add-on whose operator
+      # never uploaded a skel fails container-create instead of binding an empty
+      # dir and letting QNN fall back to CPU silently.
+      assert skel.system == true
+    end
+
+    # Pinned against the config rather than the literal: the store bind and
+    # `Vagus.DSP`'s own reads must name one directory, and a `:dsp_root` change
+    # that desynced them would otherwise pass every other assertion here.
+    test "the store bind's source is exactly Vagus.DSP.root/0" do
+      configure_dsp_root()
+      spec = Manager.build_spec(device_config(dsp: true), arch: "amd64")
+
+      assert %{source: source} = Enum.find(spec.mounts, &(&1.target == "/usr/lib/rfsa/adsp"))
+      assert source == Vagus.DSP.root()
+    end
+
+    # rpi3_64 sets no `:dsp_root` — `nil` is that target's "no DSP here".
+    test "with :dsp_root unset, dsp: true declares only the shells bind" do
+      put_dsp_root(nil)
+      spec = Manager.build_spec(device_config(dsp: true), arch: "amd64")
+
+      assert Enum.any?(spec.mounts, &(&1.target == "/usr/lib/dsp"))
+      refute Enum.any?(spec.mounts, &(&1.target == "/usr/lib/rfsa/adsp"))
+
+      # A mount with a nil source binds nothing and reads as a bug at the
+      # engine, not here.
+      refute Enum.any?(spec.mounts, &is_nil(&1.source))
     end
 
     test "dsp: true still resolves the declared devices:" do
@@ -221,6 +255,52 @@ defmodule Vagus.Addon.ManagerTest do
       assert dev.read_only == true
       assert dev.system == true
     end
+  end
+
+  # `:dsp_root` is set per board (`config/dragon_q6a.exs`), so it is genuinely
+  # present when this suite runs on-board — snapshot and restore rather than
+  # leaving a tmp path, or `nil`, behind for everything after.
+  defp put_dsp_root(value) do
+    previous = Application.fetch_env(:vagus, :dsp_root)
+
+    on_exit(fn ->
+      case previous do
+        {:ok, root} -> Application.put_env(:vagus, :dsp_root, root)
+        :error -> Application.delete_env(:vagus, :dsp_root)
+      end
+    end)
+
+    case value do
+      nil -> Application.delete_env(:vagus, :dsp_root)
+      root -> Application.put_env(:vagus, :dsp_root, root)
+    end
+
+    value
+  end
+
+  # A path this test owns, so every assertion about it holds on any host —
+  # the lesson of the `/usr/lib/dsp` absence assertion that failed on a q6a.
+  # Not created: whether it exists is the thing under test.
+  defp configure_dsp_root do
+    put_dsp_root(
+      Path.join(System.tmp_dir!(), "vagus-mgr-dsp-#{System.unique_integer([:positive])}")
+    )
+  end
+
+  defp cfg_dsp(slug) do
+    {:ok, cfg} =
+      Config.parse(%{
+        "name" => "Dsp",
+        "version" => "1",
+        "slug" => slug,
+        "description" => "d",
+        "arch" => ["amd64"],
+        "image" => "x/y",
+        "host_network" => true,
+        "dsp" => true
+      })
+
+    cfg
   end
 
   defp device_config(extra) do
@@ -425,25 +505,55 @@ defmodule Vagus.Addon.ManagerTest do
       data_root: dr
     } do
       dsp_existed? = File.exists?("/usr/lib/dsp")
-
-      {:ok, cfg} =
-        Config.parse(%{
-          "name" => "Dsp",
-          "version" => "1",
-          "slug" => "dsp_addon",
-          "description" => "d",
-          "arch" => ["amd64"],
-          "image" => "x/y",
-          "host_network" => true,
-          "dsp" => true
-        })
+      dsp_root = configure_dsp_root()
+      File.mkdir_p!(dsp_root)
+      File.write!(Path.join(dsp_root, "libQnnHtpV68Skel.so"), "")
+      on_exit(fn -> File.rm_rf!(dsp_root) end)
 
       on_exit(fn -> State.delete("dsp_addon") end)
 
-      assert {:ok, _} = Manager.start(cfg, backend: __MODULE__.FakeBackend, data_root: dr)
+      assert {:ok, _} =
+               Manager.start(cfg_dsp("dsp_addon"), backend: __MODULE__.FakeBackend, data_root: dr)
 
       assert File.dir?(Path.join([dr, "addons", "data", "dsp_addon"]))
       assert File.exists?("/usr/lib/dsp") == dsp_existed?
+
+      # Nothing was written into the store either — the operator's file is the
+      # only thing that belongs there.
+      assert File.ls!(dsp_root) == ["libQnnHtpV68Skel.so"]
+    end
+
+    # The `system: true` half of the failure model, asserted where it is not a
+    # tautology: the store path is one this test owns and deliberately did not
+    # create, so "still absent" means `ensure_mount_sources/1` genuinely skipped
+    # it. The `/data` dir is the control proving that function ran at all.
+    test "a dsp: true start with nothing stored fails naming the panel", %{data_root: dr} do
+      dsp_root = configure_dsp_root()
+      refute File.exists?(dsp_root)
+      on_exit(fn -> State.delete("dsp_unstored") end)
+
+      assert {:error, {:dsp_not_configured, message}} =
+               Manager.start(cfg_dsp("dsp_unstored"),
+                 backend: __MODULE__.FakeBackend,
+                 data_root: dr
+               )
+
+      assert message =~ "Vagus admin panel"
+
+      assert File.dir?(Path.join([dr, "addons", "data", "dsp_unstored"]))
+      refute File.exists?(dsp_root)
+    end
+
+    # Distinct from the above on purpose: nothing an operator uploads fixes a
+    # board with no DSP, so the sentence must not send them to the panel.
+    test "a dsp: true start on a board with no DSP says so instead", %{data_root: dr} do
+      put_dsp_root(nil)
+      on_exit(fn -> State.delete("dsp_nodsp") end)
+
+      assert {:error, {:dsp_unsupported, message}} =
+               Manager.start(cfg_dsp("dsp_nodsp"), backend: __MODULE__.FakeBackend, data_root: dr)
+
+      assert message =~ "no Hexagon DSP"
     end
 
     # `Devices.cgroup_rules/3` guards on `is_boolean`, so a non-boolean reaching

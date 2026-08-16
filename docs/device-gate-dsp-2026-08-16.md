@@ -87,11 +87,30 @@ That kills the plan's stated cost for outcome B (Phase 5's "re-compose when the
 system shells change", and the OTA-staleness hazard behind it).
 
 `libcdsprpc`'s default list has an entry the system image never populates —
-`/usr/lib/rfsa/adsp` — which is a natural mount target for the store, leaving
-the existing `/usr/lib/dsp` bind exactly as it is. **Unverified for QNN
-specifically:** it follows only if QNN's skel lookup goes through
-`apps_std_fopen_with_env` like the shell lookup does. Phase 6 must confirm it
-with a real QNN load rather than inherit it from this result.
+`/usr/lib/rfsa/adsp` — which makes a natural mount target for the store,
+leaving the existing `/usr/lib/dsp` bind exactly as it is.
+
+**Measured, not assumed.** Skels bound *only* at `/usr/lib/rfsa/adsp`, with
+`DSP_LIBRARY_PATH` pointing somewhere else entirely and shells at
+`/usr/lib/dsp`:
+
+```
+##### K: skels at /usr/lib/rfsa/adsp #####    ##### L: control, skels at /opt/skels #####
+Sum = 499500                                   ERROR 0x80000406: Failed to compute sum
+Max value = 999                                ERROR 0x80000406: Unable to create
+[PASS] libcalculator.so                          FastRPC session on domain 3
+exit=0                                         exit=3
+```
+
+The control is what makes this mean something: move the same files off the
+search list and the skel-load code `0x80000406` comes back. So the default list
+resolves **skels**, not merely shells, and `/usr/lib/rfsa/adsp` is a working
+store target.
+
+**Still inherited rather than proven for QNN:** this is fastrpc's loader doing
+the lookup. QNN's skel resolution is believed to go through the same
+`apps_std_fopen_with_env` search, but Phase 6 must confirm it with a real QNN
+load.
 
 ## Result 2 — `dsp: true` grants no device access, and cannot work without it ❌
 
