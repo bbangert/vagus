@@ -123,6 +123,17 @@ defmodule Vagus.Addon.InfoTest do
     test "rating stays in the 1..8 the model requires", %{config: c} do
       assert Info.render(c, :started, %{})["rating"] in 1..8
     end
+
+    test "protected reflects the persisted setting, and absent reads as protected" do
+      # Absent must be `true`, not `false`: this field is what the frontend's
+      # protection toggle renders, and reporting an add-on as unprotected when
+      # nothing said so invites the user to grant on top of a wrong baseline.
+      c = secure_config(%{"full_access" => true})
+
+      assert Info.render(c, :started, %{})["protected"] == true
+      assert Info.render(c, :started, %{}, %{protected: false})["protected"] == false
+      assert Info.render(c, :started, %{}, %{protected: true})["protected"] == true
+    end
   end
 
   describe "asset advertisement (the installed-add-ons page fetches nothing it isn't told about)" do

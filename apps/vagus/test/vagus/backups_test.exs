@@ -211,6 +211,35 @@ defmodule Vagus.BackupsTest do
       assert Enum.any?(calls, &match?({:start, _}, &1))
     end
 
+    # Intended, not incidental: `protected` is a per-install security setting,
+    # not add-on data, so a restore of the add-on's `/data` must not silently
+    # re-grant (or revoke) device access the user set independently. Only
+    # `POST /addons/{slug}/security` moves it — `finish_restore/3` reaches
+    # `State.put_options/2` alone.
+    test "a restore leaves the add-on's protection mode untouched", %{
+      data_root: dr,
+      server: server
+    } do
+      slug = "core_restore_protected"
+      install(slug, dr, :stopped, %{"greet" => "hi"})
+      File.write!(Path.join(data_dir(dr, slug), "f.txt"), "x")
+
+      {:ok, backup_slug} = Backups.create_partial(nil, [slug], server: server, data_root: dr)
+
+      # Turned off AFTER the backup was taken — the restore must not roll it
+      # back to the protected default the tar knows nothing about.
+      :ok = State.put_setting(slug, :protected, false)
+
+      assert :ok =
+               Backups.restore_partial(backup_slug, [slug],
+                 server: server,
+                 data_root: dr,
+                 backend: @backend
+               )
+
+      assert {:ok, %{protected: false, user_options: %{"greet" => "hi"}}} = State.get(slug)
+    end
+
     test "a stopped-at-backup-time add-on is not restarted on restore", %{
       data_root: dr,
       server: server

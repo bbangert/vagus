@@ -747,6 +747,57 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
     end
   end
 
+  describe "POST /addons/:slug/security" do
+    setup do
+      config = fixture_config("sec") |> Map.put(:slug, "core_sec")
+      :ok = State.put(config, :stopped)
+      on_exit(fn -> State.delete("core_sec") end)
+      %{config: config}
+    end
+
+    test "protected: false is persisted" do
+      conn = supervisor_call(:post, "/addons/core_sec/security", %{"protected" => false})
+      assert conn.status == 200
+      assert {:ok, %{protected: false}} = State.get("core_sec")
+    end
+
+    test "protected: true puts it back" do
+      :ok = State.put_setting("core_sec", :protected, false)
+
+      assert supervisor_call(:post, "/addons/core_sec/security", %{"protected" => true}).status ==
+               200
+
+      assert {:ok, %{protected: true}} = State.get("core_sec")
+    end
+
+    test "the info payload reports what was stored" do
+      assert supervisor_call(:post, "/addons/core_sec/security", %{"protected" => false}).status ==
+               200
+
+      info = body(supervisor_call(:get, "/addons/core_sec/info"))["data"]
+      assert info["protected"] == false
+    end
+
+    test "a body without the key is a 200 no-op (SCHEMA_SECURITY marks it optional)" do
+      :ok = State.put_setting("core_sec", :protected, false)
+      conn = supervisor_call(:post, "/addons/core_sec/security", %{"unrelated" => 1})
+      assert conn.status == 200
+      assert {:ok, %{protected: false}} = State.get("core_sec")
+    end
+
+    test "a non-boolean protected -> 400, nothing stored" do
+      conn = supervisor_call(:post, "/addons/core_sec/security", %{"protected" => "false"})
+      assert conn.status == 400
+      assert body(conn)["message"] =~ "protected must be a boolean"
+      assert {:ok, %{protected: true}} = State.get("core_sec")
+    end
+
+    test "an unknown slug -> 404" do
+      conn = supervisor_call(:post, "/addons/core_nope/security", %{"protected" => false})
+      assert conn.status == 404
+    end
+  end
+
   describe "GET /addons" do
     test "reflects installed add-ons from State" do
       config = fixture_config("listed") |> Map.put(:slug, "core_listed")

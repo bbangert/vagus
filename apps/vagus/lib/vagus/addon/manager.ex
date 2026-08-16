@@ -148,7 +148,18 @@ defmodule Vagus.Addon.Manager do
 
   defp do_start(%Config{} = config, opts) do
     token = generate_token()
-    opts = opts |> put_backend(config) |> Keyword.put(:access_token, token)
+
+    # `protected` is resolved here rather than in `do_start_slug/2` because
+    # `Vagus.Addon.Update`, `Vagus.Addon.DefaultProvider` and the router's
+    # install path all reach `do_start/2` with a bare `Config` — resolving it
+    # a level up would silently run those starts protected regardless of what
+    # `POST /addons/{slug}/security` stored.
+    opts =
+      opts
+      |> put_backend(config)
+      |> Keyword.put(:access_token, token)
+      |> Keyword.put_new(:protected, stored_protected(config.slug))
+
     spec = build_spec(config, opts)
     data_root = data_root(opts)
 
@@ -696,6 +707,18 @@ defmodule Vagus.Addon.Manager do
   # running (isolated unit tests). `state_opts` forwards to `State.put/3`
   # (e.g. `user_options:` on a start; omitted on a stop, so the prior
   # user options are preserved — see `Vagus.Addon.State.put/3`).
+  # Defaults `true` on every uncertain path — a slug that isn't tracked yet
+  # (a brand-new install starts before `record_state/3` writes its entry), and
+  # the isolated unit tests where `State` isn't running at all.
+  defp stored_protected(slug) do
+    with true <- is_pid(Process.whereis(Vagus.Addon.State)),
+         {:ok, entry} <- Vagus.Addon.State.get(slug) do
+      Map.get(entry, :protected, true)
+    else
+      _ -> true
+    end
+  end
+
   defp record_state(config, state, state_opts \\ []) do
     if Process.whereis(Vagus.Addon.State), do: Vagus.Addon.State.put(config, state, state_opts)
     :ok
