@@ -404,12 +404,19 @@ defmodule Vagus.Addon.ManagerTest do
     # the `/data` assertion below is the control proving it ran at all — without
     # it, "the dsp dir wasn't created" would pass just as well if the whole
     # function had been skipped.
+    #
+    # Asserted as "the start did not CHANGE /usr/lib/dsp", not "/usr/lib/dsp
+    # does not exist": this suite also runs on-board (phase 7 runs it with
+    # `--include block_device`), and a dragon_q6a target ships that directory —
+    # so an absence assertion would fail on the exact hardware the flag exists
+    # for. The trade is honest rather than free: where the directory already
+    # exists the `mkdir_p` would be a no-op and this degrades to a tautology.
+    # It bites on every host that lacks it, which is dev and CI — and the spec
+    # -level `system: true` assertion above is the one that holds everywhere.
     test "a dsp: true start creates its data dir but never mkdir_p's /usr/lib/dsp", %{
       data_root: dr
     } do
-      refute File.exists?("/usr/lib/dsp"),
-             "this host already has /usr/lib/dsp — the assertion below cannot distinguish " <>
-               "'never created' from 'was already there'"
+      dsp_existed? = File.exists?("/usr/lib/dsp")
 
       {:ok, cfg} =
         Config.parse(%{
@@ -428,7 +435,7 @@ defmodule Vagus.Addon.ManagerTest do
       assert {:ok, _} = Manager.start(cfg, backend: __MODULE__.FakeBackend, data_root: dr)
 
       assert File.dir?(Path.join([dr, "addons", "data", "dsp_addon"]))
-      refute File.exists?("/usr/lib/dsp")
+      assert File.exists?("/usr/lib/dsp") == dsp_existed?
     end
 
     # `Devices.cgroup_rules/3` guards on `is_boolean`, so a non-boolean reaching
