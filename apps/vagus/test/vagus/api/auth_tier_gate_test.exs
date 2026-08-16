@@ -217,6 +217,46 @@ defmodule Vagus.API.AuthTierGateTest do
     end
   end
 
+  # `protected` is what gates `full_access`/`host_pid`/`docker_api`, so an
+  # add-on that could clear its own would be escalating, not configuring. Two
+  # independent guards say no, and both are pinned here: `Tiers` refuses the
+  # `self` spelling for any add-on, and `handle_addon_security/2` is
+  # supervisor-only — which is what closes the by-own-slug spelling an
+  # `hassio_role: admin` add-on otherwise clears the table with.
+  describe "POST /addons/:slug/security is unreachable from an add-on token" do
+    setup do
+      {:ok, config} =
+        Vagus.Addon.Config.parse(%{
+          "name" => "Sec",
+          "version" => "1",
+          "slug" => "tier_gate_sec_admin",
+          "description" => "d",
+          "arch" => ["amd64"],
+          "image" => "x/y"
+        })
+
+      :ok = Vagus.Addon.State.put(config, :stopped)
+      on_exit(fn -> Vagus.Addon.State.delete("tier_gate_sec_admin") end)
+      :ok
+    end
+
+    test "an admin-role add-on is refused on both spellings, and nothing is stored" do
+      token =
+        addon_token("tier_gate_sec_admin", %{hassio_api: true, hassio_role: "admin"})
+
+      assert call(:post, "/addons/self/security", token).status == 403
+      assert call(:post, "/addons/tier_gate_sec_admin/security", token).status == 403
+      assert {:ok, %{protected: true}} = Vagus.Addon.State.get("tier_gate_sec_admin")
+    end
+
+    test "a plain add-on is refused too" do
+      token = addon_token("tier_gate_sec_plain")
+
+      assert call(:post, "/addons/self/security", token).status == 403
+      assert call(:post, "/addons/tier_gate_sec_admin/security", token).status == 403
+    end
+  end
+
   # Audit A7. The tier gate (phase 1) closed `GET /addons` to a default-role
   # add-on, but a `hassio_role: manager` one legitimately reaches it — so the
   # payload itself must not carry secrets. `_list_apps_data/0` upstream emits

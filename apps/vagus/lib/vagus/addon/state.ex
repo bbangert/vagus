@@ -61,6 +61,17 @@ defmodule Vagus.Addon.State do
       so the frontend's toggle reflects what the user actually saved, and is
       never itself acted on.
 
+  And one more alongside those, for the device-passthrough work
+  (`docs/contract-2026.7-m4-addendum.md` §A1.5):
+
+    * `protected` — boolean, default **`true`**. The add-on's protection
+      mode, set by `POST /addons/{slug}/security`. Unlike every other
+      setting here it defaults to `true` and decodes tolerantly *to* `true`:
+      it is the gate on `full_access`/`host_pid`/`docker_api`, so a missing
+      or corrupt field has to land on the restrictive side. Read at start
+      time by `Vagus.Addon.Manager.build_spec/2`; it takes effect on the
+      next container create, not immediately.
+
   Before this, `POST /addons/{slug}/options` accepted a `boot`/`auto_update`
   key, 200'd, and silently discarded both — the exact bug class `network`
   was previously fixed for (see that field's own note above): the toggle
@@ -68,9 +79,9 @@ defmodule Vagus.Addon.State do
   load because there was nowhere for it to persist to.
 
   `put_setting/4` writes one of `ingress_port`/`ingress_panel`/`watchdog`/
-  `ports`/`boot`/`auto_update` for an already-tracked slug (`:error` if
-  untracked); `ingress_token` has no setter since nothing ever changes it
-  once assigned.
+  `ports`/`boot`/`auto_update`/`protected` for an already-tracked slug
+  (`:error` if untracked); `ingress_token` has no setter since nothing ever
+  changes it once assigned.
 
   ## Persistence (M4-P8-T1)
 
@@ -89,7 +100,7 @@ defmodule Vagus.Addon.State do
   "user_options": {...}, "ingress_token": "...", "ingress_port":
   null|<port>, "ingress_panel": bool, "watchdog": bool, "network":
   {"<port>/<proto>": <host_port>|null}, "boot": null|"auto"|"manual",
-  "auto_update": null|bool}}}`.
+  "auto_update": null|bool, "protected": bool}}}`.
   `Config.parse/1` — not this module — is the single validator on reload:
   each entry's `config` is re-parsed (and its key checked against the
   parsed slug) at `init/1`, and anything invalid/mismatched, or a file
@@ -103,7 +114,9 @@ defmodule Vagus.Addon.State do
   missing/non-map `network` falls back to `%{}` with its entries re-checked
   individually (a hand-edited file reaches the container spec too), and a
   missing/invalid `boot`/`auto_update` falls back to `nil` (not `false` for
-  `auto_update` — see that field's decoder) — the format is purely
+  `auto_update` — see that field's decoder), and a missing/non-boolean
+  `protected` falls back to `true` (the *safe* side, unlike every other
+  boolean here) — the format is purely
   additive, so the version number doesn't change. Writes are `mkdir_p` +
   write-to-`.tmp` + `File.rename`
   (atomic against a mid-write power loss) and best-effort: a write failure
@@ -127,7 +140,8 @@ defmodule Vagus.Addon.State do
           watchdog: boolean(),
           ports: Vagus.Addon.Ports.t(),
           boot: nil | String.t(),
-          auto_update: nil | boolean()
+          auto_update: nil | boolean(),
+          protected: boolean()
         }
 
   @persist_version 1
@@ -168,7 +182,8 @@ defmodule Vagus.Addon.State do
 
   @doc """
   Writes one persisted per-install setting for `slug` — `:ingress_port`,
-  `:ingress_panel`, `:watchdog`, or `:ports` (`ingress_token` has no setter; it's
+  `:ingress_panel`, `:watchdog`, `:ports`, `:boot`, `:auto_update` or
+  `:protected` (`ingress_token` has no setter; it's
   generated once and never changes). `:error` if `slug` isn't tracked (not
   installed). The guard clause is load-bearing: it's the only thing
   stopping a typo'd/unknown key from being written straight to the entry
@@ -176,13 +191,27 @@ defmodule Vagus.Addon.State do
   """
   @spec put_setting(
           String.t(),
-          :ingress_port | :ingress_panel | :watchdog | :ports | :boot | :auto_update,
+          :ingress_port
+          | :ingress_panel
+          | :watchdog
+          | :ports
+          | :boot
+          | :auto_update
+          | :protected,
           term(),
           GenServer.server()
         ) ::
           :ok | :error
   def put_setting(slug, key, value, server \\ __MODULE__)
-      when key in [:ingress_port, :ingress_panel, :watchdog, :ports, :boot, :auto_update] do
+      when key in [
+             :ingress_port,
+             :ingress_panel,
+             :watchdog,
+             :ports,
+             :boot,
+             :auto_update,
+             :protected
+           ] do
     GenServer.call(server, {:put_setting, slug, key, value})
   end
 
@@ -285,7 +314,8 @@ defmodule Vagus.Addon.State do
         watchdog: watchdog,
         ports: ports,
         boot: boot,
-        auto_update: auto_update
+        auto_update: auto_update,
+        protected: protected
       } ->
         %{
           ingress_token: token,
@@ -294,7 +324,8 @@ defmodule Vagus.Addon.State do
           watchdog: watchdog,
           ports: ports,
           boot: boot,
-          auto_update: auto_update
+          auto_update: auto_update,
+          protected: protected
         }
 
       nil ->
@@ -305,7 +336,8 @@ defmodule Vagus.Addon.State do
           watchdog: false,
           ports: %{},
           boot: nil,
-          auto_update: nil
+          auto_update: nil,
+          protected: true
         }
     end
   end
@@ -397,7 +429,8 @@ defmodule Vagus.Addon.State do
          watchdog: decode_bool_setting(raw, "watchdog"),
          ports: decode_ports(raw),
          boot: decode_boot(raw),
-         auto_update: decode_maybe_bool_setting(raw, "auto_update")
+         auto_update: decode_maybe_bool_setting(raw, "auto_update"),
+         protected: decode_protected(raw)
        }}
     else
       _ ->
@@ -469,6 +502,17 @@ defmodule Vagus.Addon.State do
     end
   end
 
+  # Deliberately not `decode_bool_setting/2`: that one's documented default is
+  # `false`, which is the *unsafe* side here. `protected` gates `full_access`,
+  # `host_pid` and `docker_api`, so an old state file written before the field
+  # existed — or a hand-edited/corrupt one — must come back protected.
+  defp decode_protected(raw) do
+    case Map.get(raw, "protected") do
+      value when is_boolean(value) -> value
+      _ -> true
+    end
+  end
+
   # The user's host-port overrides, persisted under `"network"` to match the
   # wire key the frontend posts. Absent on every file written before this
   # setting existed, hence the `%{}` default — the same tolerant-load rule the
@@ -527,7 +571,8 @@ defmodule Vagus.Addon.State do
                                watchdog: watchdog,
                                ports: ports,
                                boot: boot,
-                               auto_update: auto_update
+                               auto_update: auto_update,
+                               protected: protected
                              }} ->
           {slug,
            %{
@@ -540,7 +585,8 @@ defmodule Vagus.Addon.State do
              "watchdog" => watchdog,
              "network" => ports,
              "boot" => boot,
-             "auto_update" => auto_update
+             "auto_update" => auto_update,
+             "protected" => protected
            }}
         end)
     }

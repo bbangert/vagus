@@ -96,8 +96,10 @@ defmodule Vagus.API.Tiers do
     # Any installed add-on's token, `hassio_api` or not. The two negative
     # lookaheads come first because first-match-wins is how they are expressed
     # here; both land on `:supervisor` rather than falling through, since
-    # Vagus keeps self-update supervisor-only (see `handle_update/2`) and has
-    # no `/addons/{slug}/security` route at all.
+    # Vagus keeps self-update supervisor-only (see `handle_update/2`) and its
+    # `/addons/{slug}/security` handler is supervisor-only too — an add-on
+    # must never be able to turn off its own protection, by either spelling
+    # (see `Vagus.API.Router.handle_addon_security/2`).
     {["addons", "self", "security"], :supervisor},
     {["addons", "self", "update"], :supervisor},
     # `[^/]+` is a *single* segment: `/addons/self/logs` is bypassed,

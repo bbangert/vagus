@@ -53,6 +53,10 @@ defmodule Vagus.Addon.Info do
     * `:auto_update` — the persisted auto-update toggle, `nil | boolean()`
       (audit E2). `nil`/absent renders `false` — Vagus has no periodic
       auto-updater, so this is reported honestly and never acted on.
+    * `:protected` — the persisted protection mode (§A1.5), set by
+      `POST /addons/{slug}/security`. Absent renders `true`: this gates
+      `full_access`/`host_pid`/`docker_api`, so an unknown value must read as
+      protected rather than advertise privileges the add-on doesn't have.
     * `:version_latest` — the version the store currently advertises for this
       add-on, which drives `version_latest` and `update_available`. Omitted
       (or `nil`) means "not resolved": either the caller has no store context,
@@ -129,7 +133,7 @@ defmodule Vagus.Addon.Info do
       # InstalledAddonComplete
       "hostname" => String.replace(config.slug, "_", "-"),
       "dns" => [],
-      "protected" => true,
+      "protected" => Map.get(settings, :protected, true),
       "boot" => Config.effective_boot(config, Map.get(settings, :boot)),
       "boot_config" => config.boot,
       "options" => options,

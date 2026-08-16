@@ -1,7 +1,7 @@
 defmodule Vagus.Addon.ManagerTest do
   use ExUnit.Case, async: false
 
-  alias Vagus.Addon.{Config, Manager}
+  alias Vagus.Addon.{Config, Manager, State}
   alias Vagus.API.AdminPanel
 
   defp mosquitto_config do
@@ -306,6 +306,71 @@ defmodule Vagus.Addon.ManagerTest do
                Manager.start(bad, backend: __MODULE__.FakeBackend, data_root: dr)
 
       refute_received {:create, _}
+    end
+
+    # The plumbing that makes protection mode real: without it `build_spec/2`
+    # defaults `protected: true` forever and `POST /addons/{slug}/security` is
+    # a setting nothing reads.
+    test "start reads the stored `protected` and it reaches the spec", %{data_root: dr} do
+      {:ok, cfg} =
+        Config.parse(%{
+          "name" => "Priv",
+          "version" => "1",
+          "slug" => "priv_addon",
+          "description" => "d",
+          "arch" => ["amd64"],
+          "image" => "x/y",
+          "host_network" => true,
+          "full_access" => true,
+          "host_pid" => true
+        })
+
+      :ok = State.put(cfg, :stopped)
+      on_exit(fn -> State.delete("priv_addon") end)
+
+      assert {:ok, _} = Manager.start(cfg, backend: __MODULE__.FakeBackend, data_root: dr)
+      assert_received {:create, protected_spec}
+      assert protected_spec.device_cgroup_rules == []
+      assert protected_spec.pid_mode == nil
+
+      :ok = State.put_setting("priv_addon", :protected, false)
+
+      assert {:ok, _} = Manager.start(cfg, backend: __MODULE__.FakeBackend, data_root: dr)
+      assert_received {:create, unprotected_spec}
+      assert unprotected_spec.device_cgroup_rules == ["b *:* rwm", "c *:* rwm"]
+      assert unprotected_spec.pid_mode == "host"
+    end
+
+    # `Update`/`DefaultProvider`/the install path all reach `do_start/2` with a
+    # bare `Config` and no `:protected` opt — an explicit one must still win,
+    # or the resolution would have to move a level up and those callers would
+    # silently run protected.
+    test "an explicit :protected opt wins over the stored value", %{data_root: dr} do
+      {:ok, cfg} =
+        Config.parse(%{
+          "name" => "Priv2",
+          "version" => "1",
+          "slug" => "priv_addon_2",
+          "description" => "d",
+          "arch" => ["amd64"],
+          "image" => "x/y",
+          "host_network" => true,
+          "full_access" => true
+        })
+
+      :ok = State.put(cfg, :stopped)
+      :ok = State.put_setting("priv_addon_2", :protected, false)
+      on_exit(fn -> State.delete("priv_addon_2") end)
+
+      assert {:ok, _} =
+               Manager.start(cfg,
+                 backend: __MODULE__.FakeBackend,
+                 data_root: dr,
+                 protected: true
+               )
+
+      assert_received {:create, spec}
+      assert spec.device_cgroup_rules == []
     end
   end
 

@@ -80,11 +80,39 @@ defmodule Vagus.Addon.StateTest do
                 ingress_panel: false,
                 watchdog: false,
                 boot: nil,
-                auto_update: nil
+                auto_update: nil,
+                protected: true
               }} = State.get("core_mosquitto", s)
 
       assert is_binary(token)
       assert token =~ ~r/^[-_A-Za-z0-9]+$/
+    end
+
+    test "protected survives a stop/start cycle once turned off", %{config: c, s: s} do
+      # `handle_call({:put, ...})` rebuilds the entry on every lifecycle
+      # transition. If `protected` were not in `preserved_settings/2`, a stop
+      # would silently re-protect the add-on and its `full_access` grants
+      # would vanish on the next start.
+      :ok = State.put(c, :started, server: s)
+      :ok = State.put_setting("core_mosquitto", :protected, false, s)
+
+      :ok = State.put(c, :stopped, server: s)
+      assert {:ok, %{protected: false}} = State.get("core_mosquitto", s)
+
+      :ok = State.put(c, :started, server: s)
+      assert {:ok, %{protected: false}} = State.get("core_mosquitto", s)
+    end
+
+    test "put_setting on an unknown key is a FunctionClauseError, not a silent write", %{s: s} do
+      # The atom is built at runtime on purpose: Elixir 1.20's type checker
+      # rejects a *literal* bad atom against the `key in [...]` guard at
+      # compile time, so a direct call would fail the build rather than the
+      # assertion.
+      typo = String.to_atom("protecte_d")
+
+      assert_raise FunctionClauseError, fn ->
+        State.put_setting("core_mosquitto", typo, false, s)
+      end
     end
 
     test "the ingress_token is generated once and stable across a later put/3", %{
@@ -211,6 +239,7 @@ defmodule Vagus.Addon.StateTest do
       assert on_disk["addons"]["core_mosquitto"]["watchdog"] == false
       assert on_disk["addons"]["core_mosquitto"]["boot"] == nil
       assert on_disk["addons"]["core_mosquitto"]["auto_update"] == nil
+      assert on_disk["addons"]["core_mosquitto"]["protected"] == true
     end
 
     test "put_setting persists across a reload, and the ingress_token survives the round-trip", %{
@@ -226,6 +255,7 @@ defmodule Vagus.Addon.StateTest do
       :ok = State.put_setting("core_mosquitto", :watchdog, true, s1)
       :ok = State.put_setting("core_mosquitto", :boot, "manual", s1)
       :ok = State.put_setting("core_mosquitto", :auto_update, true, s1)
+      :ok = State.put_setting("core_mosquitto", :protected, false, s1)
       GenServer.stop(s1)
 
       s2 = start_persisted(path)
@@ -237,7 +267,8 @@ defmodule Vagus.Addon.StateTest do
                 ingress_panel: true,
                 watchdog: true,
                 boot: "manual",
-                auto_update: true
+                auto_update: true,
+                protected: false
               }} = State.get("core_mosquitto", s2)
     end
 
@@ -271,10 +302,36 @@ defmodule Vagus.Addon.StateTest do
                 ingress_panel: false,
                 watchdog: false,
                 boot: nil,
-                auto_update: nil
+                auto_update: nil,
+                protected: true
               }} = State.get("core_mosquitto", s)
 
       assert is_binary(token)
+    end
+
+    test "a hand-edited protected field that isn't a boolean falls back to true, not false", %{
+      config: c,
+      path: path
+    } do
+      # The opposite direction from every other tolerant decoder here: garbage
+      # must fail *closed*, since this field is what gates `full_access`.
+      File.mkdir_p!(Path.dirname(path))
+
+      File.write!(
+        path,
+        Jason.encode!(%{
+          "version" => 1,
+          "addons" => %{
+            "core_mosquitto" => %{
+              "config" => Vagus.Addon.Config.to_persistable(c),
+              "state" => "started",
+              "protected" => "false"
+            }
+          }
+        })
+      )
+
+      assert {:ok, %{protected: true}} = State.get("core_mosquitto", start_persisted(path))
     end
 
     test "a hand-edited file with garbage boot/auto_update values falls back to nil for both",

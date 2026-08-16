@@ -814,6 +814,13 @@ defmodule Vagus.API.Router do
     handle_addon_options(conn, slug)
   end
 
+  # `POST /addons/{slug}/security` (SCHEMA_SECURITY) — the protection-mode
+  # setter. `{"protected": bool}`; the key is optional upstream, so a body
+  # without it is a 200 no-op rather than a 400.
+  post "/addons/:slug/security" do
+    handle_addon_security(conn, slug)
+  end
+
   # The frontend's config page calls this **before** every save and aborts on
   # anything other than `valid: true`, so without it the Save button fails
   # for every add-on — `supervisor-app-config.ts::_saveTapped` awaits
@@ -2609,7 +2616,15 @@ defmodule Vagus.API.Router do
     {version_latest, assets} = store_facts(config.slug)
 
     entry
-    |> Map.take([:ingress_token, :ingress_port, :ingress_panel, :watchdog, :boot, :auto_update])
+    |> Map.take([
+      :ingress_token,
+      :ingress_port,
+      :ingress_panel,
+      :watchdog,
+      :boot,
+      :auto_update,
+      :protected
+    ])
     |> Map.put(:version_latest, version_latest)
     |> Map.put(:assets, assets)
     |> Map.put(:ports, Map.get(entry, :ports) || %{})
@@ -2842,6 +2857,55 @@ defmodule Vagus.API.Router do
       Envelope.send_error(conn, "unauthorized", 403)
     end
   end
+
+  # `POST /addons/{slug}/security`, the `protected` setter (§A1.5).
+  #
+  # Supervisor-only, deliberately stricter than upstream's admin role. The
+  # obvious alternative — `resolve_info_slug/2`, as `handle_addon_options/2`
+  # uses — would let an `hassio_role: admin` add-on turn off *its own*
+  # protection by naming its own slug, which is the one direction that is a
+  # privilege escalation rather than a convenience: protection is what gates
+  # `full_access`, `host_pid` and `docker_api`. `Vagus.API.Tiers` already
+  # refuses the `/addons/self/security` spelling for every add-on token
+  # (`tiers.ex`'s first `api_bypass` override); resolving by slug here would
+  # have made that guard trivially bypassable.
+  #
+  # The stored value takes effect on the **next container create**, not
+  # immediately — same as upstream, which re-reads `App.protected` when it
+  # builds the container. A running add-on keeps whatever it started with
+  # until the caller restarts it.
+  defp handle_addon_security(conn, slug) do
+    supervisor_only(conn, fn ->
+      case State.get(slug) do
+        :error ->
+          Envelope.send_error(conn, "Addon #{slug} does not exist", 404)
+
+        {:ok, _entry} ->
+          case validate_protected_key(conn.body_params) do
+            {:ok, action} ->
+              apply_protected_action(slug, action)
+              Envelope.send_ok(conn, %{})
+
+            {:error, message} ->
+              Envelope.send_error(conn, message, 400)
+          end
+      end
+    end)
+  end
+
+  # `protected` must be a boolean when present; no key at all is a no-op —
+  # upstream's `SCHEMA_SECURITY` marks it optional, so a body carrying only
+  # keys Vagus doesn't model must not 400.
+  defp validate_protected_key(body) do
+    case Map.fetch(body, "protected") do
+      :error -> {:ok, :none}
+      {:ok, value} when is_boolean(value) -> {:ok, {:set, value}}
+      {:ok, _other} -> {:error, "protected must be a boolean"}
+    end
+  end
+
+  defp apply_protected_action(_slug, :none), do: :ok
+  defp apply_protected_action(slug, {:set, value}), do: State.put_setting(slug, :protected, value)
 
   # Deliberately routed through the very same `OptionsSchema.effective/3` call
   # the save path uses (`validate_options_key/2`), so the dry run and the real
