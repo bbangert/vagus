@@ -119,7 +119,10 @@ defmodule Vagus.API.IngressProxy do
   # content-length/encoding for the outgoing request), the WebSocket
   # handshake headers (irrelevant on the plain-HTTP leg; the WS branch
   # never reaches here), and the auth/identity headers that must never leak
-  # from the browser session into the add-on's view of the request.
+  # from the browser session into the add-on's view of the request. The
+  # `x-remote-user-*` set among them is re-injected from the session itself
+  # by `append_identity/2`, so an add-on only ever sees Vagus's answer to
+  # "who is this", never the client's claim.
   #
   # `cookie` and an inbound `x-forwarded-for` are deliberately NOT in this
   # list — contract parity with §B2.2, whose strip list omits both, and with
@@ -135,6 +138,15 @@ defmodule Vagus.API.IngressProxy do
   # `send_resp`/`send_chunked`+`chunk`, so forwarding the upstream's raw
   # content-length/transfer-encoding verbatim would conflict with it.
   @response_strip_extra ~w(content-length transfer-encoding)
+
+  # The bound on the Core lookup behind the `X-Remote-User-Name`/
+  # `-Display-Name` headers, deliberately a small fraction of
+  # `Vagus.Core.Users`'s own 5s default: those two headers are cosmetic
+  # enrichment on a request path, the id an add-on actually identifies the
+  # caller by is already sent without them, and a Core that is connected but
+  # slow would otherwise stall every cache-missing ingress request — the
+  # path the admin panel and every add-on UI ride on — for seconds.
+  @names_timeout_ms 500
 
   # audit F4 / upstream's aiohttp `MAX_CLIENT_SIZE`
   # (`supervisor/api/__init__.py:48`) — the cap on a *buffered* request
@@ -309,9 +321,11 @@ defmodule Vagus.API.IngressProxy do
     conn = maybe_negotiate_subprotocol(conn, protocols)
     # audit F1/B1: the same filtered header set the HTTP leg forwards
     # (`build_request_headers/1` — hop-by-hop strip, auth/identity strip,
-    # `X-Forwarded-For` append) also has to reach the add-on on the WS leg,
-    # or a cookie-authenticated WebSocket (e.g. behind an add-on's own
-    # session check) breaks. `sec-websocket-protocol` is deliberately not
+    # `X-Remote-User-*` injection, `X-Forwarded-For` append) also has to
+    # reach the add-on on the WS leg, or a cookie-authenticated WebSocket
+    # (e.g. behind an add-on's own session check) breaks — as does an add-on
+    # whose UI is websocket-heavy and reads the caller's identity.
+    # `sec-websocket-protocol` is deliberately not
     # part of this set (see `strip_request_headers/1`'s `sec-websocket-`
     # prefix strip) — it continues to travel via the separate `protocols`
     # mechanism below, decided by `requested_subprotocols/1` above.
@@ -447,6 +461,7 @@ defmodule Vagus.API.IngressProxy do
   defp build_request_headers(conn) do
     conn.req_headers
     |> strip_request_headers()
+    |> append_identity(conn)
     |> append_forwarded_for(conn)
   end
 
@@ -458,6 +473,69 @@ defmodule Vagus.API.IngressProxy do
         String.starts_with?(k, "sec-websocket-") or
         String.starts_with?(k, "x-remote-user-")
     end)
+  end
+
+  # Upstream's `api/ingress.py` `_init_header`: `X-Remote-User-Id` whenever
+  # the session has a user, plus `X-Remote-User-Name`/
+  # `X-Remote-User-Display-Name` only when Core actually has those (both are
+  # nullable). An add-on reads these to decide who it is talking to —
+  # Music Assistant looks the id up in Core's user list to check admin
+  # status — so an empty value is worse than an absent header.
+  #
+  # MUST stay downstream of `strip_request_headers/1` in
+  # `build_request_headers/1`: that strip is the only thing removing an
+  # `x-remote-user-*` the *browser* sent, so injecting before it would let
+  # our value be stripped right back out, and reordering the two would let a
+  # client-forged identity ride to the add-on alongside (or instead of)
+  # ours. The ordering is the whole security property.
+  defp append_identity(headers, conn) do
+    case session_user_id(conn) do
+      user_id when is_binary(user_id) ->
+        headers ++ [{"x-remote-user-id", user_id}] ++ name_headers(user_id)
+
+      _no_user ->
+        headers
+    end
+  end
+
+  defp session_user_id(conn) do
+    with session when is_binary(session) <- conn.cookies["ingress_session"],
+         {:ok, user_id} <- Vagus.Ingress.session_user(session) do
+      user_id
+    else
+      _no_session_or_user -> nil
+    end
+  end
+
+  # The id above comes from the session alone; only the names need Core, and
+  # Core being unreachable (or answering nothing about this user) must cost
+  # an add-on the names, never the id and never the request — hence a
+  # best-effort lookup whose every failure mode, raise included, is just
+  # "no name headers".
+  defp name_headers(user_id) do
+    case lookup_names(user_id) do
+      {:ok, names} ->
+        for {header, key} <- [
+              {"x-remote-user-name", :username},
+              {"x-remote-user-display-name", :name}
+            ],
+            value = Map.get(names, key),
+            is_binary(value),
+            do: {header, value}
+
+      _unavailable ->
+        []
+    end
+  end
+
+  defp lookup_names(user_id) do
+    Application.get_env(:vagus, :core_users, Vagus.Core.Users).names(user_id,
+      timeout: @names_timeout_ms
+    )
+  rescue
+    _error -> :error
+  catch
+    :exit, _reason -> :error
   end
 
   # Existing value (if any) + ", " + the browser's peer IP as seen by this

@@ -62,6 +62,18 @@ defmodule Vagus.Ingress.WSBridgeTest.EchoHandler do
   end
 end
 
+defmodule Vagus.Ingress.WSBridgeTest.StubUsers do
+  @moduledoc """
+  Stands in for `Vagus.Core.Users` on the proxy's `:core_users` seam. The
+  answer lives in the app env, not the process dictionary: the proxy calls
+  this from a Bandit connection process, not the test process.
+  """
+
+  def names(_user_id, _opts) do
+    Application.get_env(:vagus, :ws_bridge_test_names, {:error, :not_connected})
+  end
+end
+
 defmodule Vagus.Ingress.WSBridgeTest.FakeAddon do
   @moduledoc """
   Stands in for the add-on's own HTTP server: the single `/ws` route
@@ -465,6 +477,41 @@ defmodule Vagus.Ingress.WSBridgeTest do
     assert by_name["connection"] == ["upgrade"]
     assert length(by_name["sec-websocket-key"]) == 1
     assert length(by_name["sec-websocket-version"]) == 1
+  end
+
+  # The identity headers are injected in `build_request_headers/1`, the one
+  # builder both legs share — and Music Assistant's UI is websocket-heavy,
+  # so an add-on that reads them on the HTTP leg only would still be half
+  # broken.
+  test "the WS upgrade carries the session's identity headers, and the client's are replaced",
+       %{proxy_host: host, proxy_port: port, token: token} do
+    {:ok, session} = Vagus.Ingress.create_session(Vagus.Ingress, user_id: "real-user")
+
+    Application.put_env(:vagus, :core_users, Vagus.Ingress.WSBridgeTest.StubUsers)
+    Application.put_env(:vagus, :ws_bridge_test_names, {:ok, %{username: "ben", name: nil}})
+
+    on_exit(fn ->
+      Application.delete_env(:vagus, :core_users)
+      Application.delete_env(:vagus, :ws_bridge_test_names)
+    end)
+
+    {:ok, _client, _resp_headers} =
+      Client.connect(host, port, "/ingress/#{token}/ws", [
+        cookie_header(session),
+        {"x-remote-user-id", "forged-admin"},
+        {"x-remote-user-display-name", "Forged"}
+      ])
+
+    assert_receive {:ws_upgrade_headers, headers}, 2_000
+
+    by_name =
+      Enum.reduce(headers, %{}, fn {k, v}, acc ->
+        Map.update(acc, String.downcase(k), [v], &(&1 ++ [v]))
+      end)
+
+    assert by_name["x-remote-user-id"] == ["real-user"]
+    assert by_name["x-remote-user-name"] == ["ben"]
+    refute Map.has_key?(by_name, "x-remote-user-display-name")
   end
 
   test "an inbound x-forwarded-for is appended to, not overwritten, on the WS leg (audit B1/B2.2)",

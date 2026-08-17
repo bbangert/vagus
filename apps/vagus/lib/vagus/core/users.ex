@@ -1,7 +1,8 @@
 defmodule Vagus.Core.Users do
   @moduledoc """
-  Answers "is this Core user an administrator?", for gating
-  Supervisor-owned panels.
+  Answers "is this Core user an administrator?" (gating Supervisor-owned
+  panels) and "what is this Core user called?" (the ingress identity
+  headers) from one cached fetch.
 
   Core exposes its user records **only** over the WebSocket API — the
   `config/auth/list` command (`homeassistant/components/config/auth.py`),
@@ -11,15 +12,17 @@ defmodule Vagus.Core.Users do
   socket. Vagus's Core token belongs to the Supervisor system user, which
   Core creates in the admin group, so it satisfies `require_admin`.
 
-  The derived `user_id => admin?` map is cached for 30 seconds so a panel
-  that asks repeatedly doesn't hammer Core. Only successful fetches
-  are cached; an error never displaces a good answer nor poisons the next
-  call. A cached map is authoritative for ids it doesn't contain too — the
-  fetch returns *every* user, so an absent id is a known non-admin, not a
-  cache miss.
+  The derived `user_id => %{admin?, username, name}` map is cached for 30
+  seconds so a panel that asks repeatedly doesn't hammer Core. Only
+  successful fetches are cached; an error never displaces a good answer nor
+  poisons the next call. A cached map is authoritative for ids it doesn't
+  contain too — the fetch returns *every* user, so an absent id is a known
+  non-admin with no known names, not a cache miss.
 
   Swappable by consumers via `Application.get_env(:vagus, :core_users,
-  Vagus.Core.Users)` — any module exporting `admin?/1` is a drop-in.
+  Vagus.Core.Users)` — a drop-in need only export what its consumer calls
+  (`admin?/1` for `Vagus.API.AdminPanel`, `names/2` for
+  `Vagus.API.IngressProxy`, which passes its own short `:timeout`).
   """
 
   use GenServer
@@ -39,6 +42,10 @@ defmodule Vagus.Core.Users do
   # Note the asymmetry: an owner is an admin even while inactive, whereas a
   # group member is not.
   @admin_group_id "system-admin"
+
+  # What a successful fetch says about an id it doesn't contain: known, and
+  # known to be nothing. Never an error — see the moduledoc.
+  @absent_user %{admin?: false, username: nil, name: nil}
 
   @doc """
   Starts the admin-status cache.
@@ -74,11 +81,26 @@ defmodule Vagus.Core.Users do
   """
   @spec admin?(String.t(), keyword()) :: {:ok, boolean()} | {:error, term()}
   def admin?(user_id, opts \\ []) when is_binary(user_id) do
-    server = Keyword.get(opts, :server, __MODULE__)
+    case lookup(user_id, opts) do
+      {:ok, user} -> {:ok, user.admin?}
+      {:error, reason} -> {:error, reason}
+    end
+  end
 
-    case cached(server) do
-      {:ok, admins} -> {:ok, Map.get(admins, user_id, false)}
-      :miss -> fetch(user_id, server, opts)
+  @doc """
+  Returns `{:ok, %{username: ..., name: ...}}` — Core's login name and
+  display name for `user_id`, either of which is `nil` when Core has none
+  (both are nullable there) or when `user_id` is absent from the list.
+
+  Takes the same options as `admin?/2`, and shares its cached fetch: asking
+  for both costs one Core round-trip, not two.
+  """
+  @spec names(String.t(), keyword()) ::
+          {:ok, %{username: String.t() | nil, name: String.t() | nil}} | {:error, term()}
+  def names(user_id, opts \\ []) when is_binary(user_id) do
+    case lookup(user_id, opts) do
+      {:ok, user} -> {:ok, Map.take(user, [:username, :name])}
+      {:error, reason} -> {:error, reason}
     end
   end
 
@@ -90,15 +112,24 @@ defmodule Vagus.Core.Users do
 
   ## Internals
 
+  defp lookup(user_id, opts) do
+    server = Keyword.get(opts, :server, __MODULE__)
+
+    case cached(server) do
+      {:ok, users} -> {:ok, Map.get(users, user_id, @absent_user)}
+      :miss -> fetch(user_id, server, opts)
+    end
+  end
+
   defp fetch(user_id, server, opts) do
     command_fun = Keyword.get(opts, :command_fun, default_command_fun())
     timeout = Keyword.get(opts, :timeout, @command_timeout)
 
     case command_fun.(@list_command, timeout: timeout) do
       {:ok, users} when is_list(users) ->
-        admins = derive(users)
-        call(server, {:put, admins}, :ok)
-        {:ok, Map.get(admins, user_id, false)}
+        users = derive(users)
+        call(server, {:put, users}, :ok)
+        {:ok, Map.get(users, user_id, @absent_user)}
 
       {:error, reason} ->
         {:error, reason}
@@ -114,7 +145,25 @@ defmodule Vagus.Core.Users do
         id = Map.get(user, "id"),
         is_binary(id),
         into: %{},
-        do: {id, admin_user?(user)}
+        do:
+          {id,
+           %{
+             admin?: admin_user?(user),
+             username: name_field(user, "username"),
+             name: name_field(user, "name")
+           }}
+  end
+
+  # Both fields are nullable in Core, and a consumer that only forwards them
+  # (`Vagus.API.IngressProxy`'s identity headers) must be able to tell
+  # "Core has no name for this user" from a real one: an empty or
+  # non-string value is indistinguishable from absent downstream, so it
+  # reads as absent here.
+  defp name_field(user, key) do
+    case Map.get(user, key) do
+      value when is_binary(value) and value != "" -> value
+      _absent_null_or_malformed -> nil
+    end
   end
 
   # `group_ids` must be a real list to be consulted at all: a malformed
@@ -147,24 +196,24 @@ defmodule Vagus.Core.Users do
 
   @impl GenServer
   def init(opts) do
-    {:ok, %{admins: nil, expires_at: 0, ttl_ms: Keyword.get(opts, :ttl_ms, @ttl_ms)}}
+    {:ok, %{users: nil, expires_at: 0, ttl_ms: Keyword.get(opts, :ttl_ms, @ttl_ms)}}
   end
 
   @impl GenServer
   def handle_call(:fetch, _from, state) do
-    if not is_nil(state.admins) and now_ms() < state.expires_at do
-      {:reply, {:ok, state.admins}, state}
+    if not is_nil(state.users) and now_ms() < state.expires_at do
+      {:reply, {:ok, state.users}, state}
     else
       {:reply, :miss, state}
     end
   end
 
-  def handle_call({:put, admins}, _from, state) do
-    {:reply, :ok, %{state | admins: admins, expires_at: now_ms() + state.ttl_ms}}
+  def handle_call({:put, users}, _from, state) do
+    {:reply, :ok, %{state | users: users, expires_at: now_ms() + state.ttl_ms}}
   end
 
   def handle_call(:invalidate, _from, state) do
-    {:reply, :ok, %{state | admins: nil, expires_at: 0}}
+    {:reply, :ok, %{state | users: nil, expires_at: 0}}
   end
 
   defp now_ms, do: System.monotonic_time(:millisecond)

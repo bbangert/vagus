@@ -7,6 +7,33 @@ defmodule Vagus.API.IngressProxyTest.HitCounter do
   def count, do: Agent.get(__MODULE__, & &1)
 end
 
+defmodule Vagus.API.IngressProxyTest.StubUsers do
+  @moduledoc """
+  Stands in for `Vagus.Core.Users` on the proxy's `:core_users` seam. The
+  answer lives in the app env, not the process dictionary: the proxy calls
+  this from a Bandit connection process, not the test process.
+  """
+
+  def names(_user_id, opts) do
+    case Application.get_env(:vagus, :ingress_proxy_test_names, {:error, :not_connected}) do
+      :raise ->
+        raise "core users blew up"
+
+      # A Core that is reachable but slow, standing in for the real client's
+      # own honouring of the `:timeout` it is handed — which is what makes
+      # the bound the proxy passes observable at all.
+      :slow ->
+        timeout = Keyword.fetch!(opts, :timeout)
+        Application.put_env(:vagus, :ingress_proxy_test_seen_timeout, timeout)
+        Process.sleep(timeout)
+        {:error, :timeout}
+
+      result ->
+        result
+    end
+  end
+end
+
 defmodule Vagus.API.IngressProxyTest.FakeAddon do
   @moduledoc """
   Stands in for an ingress-enabled add-on's own HTTP server: no
@@ -155,7 +182,7 @@ defmodule Vagus.API.IngressProxyTest do
   use ExUnit.Case, async: false
 
   alias Vagus.Addon.{Config, State}
-  alias Vagus.API.IngressProxyTest.{FakeAddon, HitCounter}
+  alias Vagus.API.IngressProxyTest.{FakeAddon, HitCounter, StubUsers}
   alias Vagus.API.Token
 
   @client_finch Vagus.API.IngressProxyTest.ClientFinch
@@ -614,6 +641,157 @@ defmodule Vagus.API.IngressProxyTest do
     by_name = headers_by_name(json(resp))
 
     refute Map.has_key?(by_name, "content-encoding")
+  end
+
+  ## 4b. Identity headers (upstream `api/ingress.py` `_init_header`)
+
+  # Points the proxy's `:core_users` seam at `StubUsers` and scripts what it
+  # answers. The id never depends on this — it comes from the session — so
+  # every test below can also say what happens when Core says nothing.
+  defp stub_names(result) do
+    Application.put_env(:vagus, :core_users, StubUsers)
+    Application.put_env(:vagus, :ingress_proxy_test_names, result)
+
+    on_exit(fn ->
+      Application.delete_env(:vagus, :core_users)
+      Application.delete_env(:vagus, :ingress_proxy_test_names)
+      Application.delete_env(:vagus, :ingress_proxy_test_seen_timeout)
+    end)
+  end
+
+  defp session_for(user_id), do: Vagus.Ingress.create_session(Vagus.Ingress, user_id: user_id)
+
+  test "the session's user reaches the add-on as x-remote-user-*", %{
+    proxy_base: base,
+    token: token
+  } do
+    {:ok, session} = session_for("a7c1ee3bb6824969975e78e9cb35dbd7")
+    stub_names({:ok, %{username: "ben", name: "Ben Bangert"}})
+
+    resp = req(:get, "#{base}/ingress/#{token}/echo-headers", [cookie_header(session)])
+
+    assert resp.status == 200
+    by_name = headers_by_name(json(resp))
+
+    assert by_name["x-remote-user-id"] == ["a7c1ee3bb6824969975e78e9cb35dbd7"]
+    assert by_name["x-remote-user-name"] == ["ben"]
+    assert by_name["x-remote-user-display-name"] == ["Ben Bangert"]
+  end
+
+  # The reason `strip_request_headers/1` must run BEFORE the injection: a
+  # browser can send whatever it likes, and an add-on that trusts these
+  # headers (Music Assistant checks admin status with them) would be handed
+  # a forged identity. One occurrence each, and it is ours.
+  test "a client-supplied x-remote-user-* is replaced, not merged", %{
+    proxy_base: base,
+    token: token
+  } do
+    {:ok, session} = session_for("real-user")
+    stub_names({:ok, %{username: nil, name: nil}})
+
+    resp =
+      req(:get, "#{base}/ingress/#{token}/echo-headers", [
+        cookie_header(session),
+        {"x-remote-user-id", "forged-admin"},
+        {"x-remote-user-name", "forged"},
+        {"x-remote-user-display-name", "Forged"}
+      ])
+
+    assert resp.status == 200
+    by_name = headers_by_name(json(resp))
+
+    assert by_name["x-remote-user-id"] == ["real-user"]
+    # Core knows no names for this user, so the client's own must not
+    # survive to fill the gap.
+    refute Map.has_key?(by_name, "x-remote-user-name")
+    refute Map.has_key?(by_name, "x-remote-user-display-name")
+  end
+
+  # Upstream sets each name header only when Core has that field, and an
+  # empty header value is exactly the failure this whole path exists to
+  # avoid (an add-on reading "" as a user id).
+  test "a name Core doesn't have is an absent header, not an empty one", %{
+    proxy_base: base,
+    token: token
+  } do
+    {:ok, session} = session_for("real-user")
+    stub_names({:ok, %{username: "ben", name: nil}})
+
+    resp = req(:get, "#{base}/ingress/#{token}/echo-headers", [cookie_header(session)])
+
+    assert resp.status == 200
+    by_name = headers_by_name(json(resp))
+
+    assert by_name["x-remote-user-name"] == ["ben"]
+    refute Map.has_key?(by_name, "x-remote-user-display-name")
+  end
+
+  test "a session with no user id sends no identity headers at all", %{
+    proxy_base: base,
+    token: token
+  } do
+    {:ok, session} = Vagus.Ingress.create_session()
+    stub_names({:ok, %{username: "ben", name: "Ben Bangert"}})
+
+    resp = req(:get, "#{base}/ingress/#{token}/echo-headers", [cookie_header(session)])
+
+    assert resp.status == 200
+    by_name = headers_by_name(json(resp))
+
+    refute Map.has_key?(by_name, "x-remote-user-id")
+    refute Map.has_key?(by_name, "x-remote-user-name")
+    refute Map.has_key?(by_name, "x-remote-user-display-name")
+  end
+
+  # The id needs no Core call, so a Core outage must cost the add-on the
+  # names only — an add-on that only reads the id keeps working.
+  for {label, stub} <- [
+        {"Core is unreachable", {:error, :not_connected}},
+        {"the lookup raises", :raise}
+      ] do
+    test "the id still goes out and the request still proxies when #{label}", %{
+      proxy_base: base,
+      token: token
+    } do
+      {:ok, session} = session_for("real-user")
+      stub_names(unquote(Macro.escape(stub)))
+
+      resp = req(:get, "#{base}/ingress/#{token}/echo-headers", [cookie_header(session)])
+
+      assert resp.status == 200
+      by_name = headers_by_name(json(resp))
+
+      assert by_name["x-remote-user-id"] == ["real-user"]
+      refute Map.has_key?(by_name, "x-remote-user-name")
+      refute Map.has_key?(by_name, "x-remote-user-display-name")
+    end
+  end
+
+  # A slow-but-connected Core is the dangerous case: ingress carries the
+  # admin panel and every add-on UI, so the name lookup must be bounded far
+  # below `Vagus.Core.Users`'s own 5s default. The duration bound below is
+  # deliberately loose — it only has to separate "the proxy passed its own
+  # short timeout" from "the proxy passed (or defaulted to) 5s", a 4.5s gap
+  # no CI starvation closes — while the real assertion is the exact bound
+  # the stub was handed.
+  test "a slow Core costs the names, not the request", %{proxy_base: base, token: token} do
+    {:ok, session} = session_for("real-user")
+    stub_names(:slow)
+
+    {elapsed_us, resp} =
+      :timer.tc(fn ->
+        req(:get, "#{base}/ingress/#{token}/echo-headers", [cookie_header(session)])
+      end)
+
+    assert resp.status == 200
+    by_name = headers_by_name(json(resp))
+
+    assert by_name["x-remote-user-id"] == ["real-user"]
+    refute Map.has_key?(by_name, "x-remote-user-name")
+    refute Map.has_key?(by_name, "x-remote-user-display-name")
+
+    assert Application.get_env(:vagus, :ingress_proxy_test_seen_timeout) == 500
+    assert elapsed_us < 2_500_000
   end
 
   ## 5. Sliding renewal

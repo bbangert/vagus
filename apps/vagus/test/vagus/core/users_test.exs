@@ -173,6 +173,72 @@ defmodule Vagus.Core.UsersTest do
     end
   end
 
+  describe "names/2" do
+    test "returns Core's login name and display name" do
+      users = [user(%{"id" => "u1", "username" => "ben", "name" => "Ben Bangert"})]
+      server = start_users()
+
+      assert Users.names("u1", server: server, command_fun: always({:ok, users})) ==
+               {:ok, %{username: "ben", name: "Ben Bangert"}}
+    end
+
+    # Core nulls both fields routinely (a system-generated user has no
+    # username; a user may have no display name), and a consumer forwarding
+    # them must be able to tell that from a real value.
+    for {label, value} <- [{"null", nil}, {"an empty string", ""}, {"a non-string", 42}] do
+      test "#{label} username/name reads as nil" do
+        users = [
+          user(%{
+            "id" => "u1",
+            "username" => unquote(Macro.escape(value)),
+            "name" => unquote(Macro.escape(value))
+          })
+        ]
+
+        server = start_users()
+
+        assert Users.names("u1", server: server, command_fun: always({:ok, users})) ==
+                 {:ok, %{username: nil, name: nil}}
+      end
+    end
+
+    test "missing keys read as nil" do
+      users = [%{"id" => "u1"}]
+      server = start_users()
+
+      assert Users.names("u1", server: server, command_fun: always({:ok, users})) ==
+               {:ok, %{username: nil, name: nil}}
+    end
+
+    test "an id absent from the list is nil names, not an error" do
+      users = [user(%{"id" => "someone-else"})]
+      server = start_users()
+
+      assert Users.names("nobody", server: server, command_fun: always({:ok, users})) ==
+               {:ok, %{username: nil, name: nil}}
+    end
+
+    test "a command error propagates as {:error, reason}" do
+      server = start_users()
+
+      assert Users.names("u1", server: server, command_fun: always({:error, :not_connected})) ==
+               {:error, :not_connected}
+    end
+
+    test "shares admin?/2's cached fetch — both answers cost one command" do
+      users = [user(%{"id" => "u1", "is_owner" => true, "username" => "ben", "name" => "Ben"})]
+      server = start_users()
+      command_fun = scripted([{:ok, users}])
+
+      assert Users.admin?("u1", server: server, command_fun: command_fun) == {:ok, true}
+
+      assert Users.names("u1", server: server, command_fun: command_fun) ==
+               {:ok, %{username: "ben", name: "Ben"}}
+
+      assert call_count() == 1
+    end
+  end
+
   describe "admin?/2 failures" do
     test "a command error propagates as {:error, reason}" do
       server = start_users()
