@@ -98,6 +98,50 @@ Character devices are unaffected, matching upstream's block-only check.
 
 ---
 
+## A `host_network` add-on's address is decided, not assumed
+
+**Upstream:** `supervisor/docker/app.py`'s `ip_address` returns the `hassio`
+bridge gateway for any `host_network: true` add-on, unconditionally. Ingress
+and the watchdog both consume that one property.
+
+**Vagus:** connects to the ingress port on loopback and uses it if something
+is listening; otherwise the gateway (`Vagus.Network.host_network_ip/1`).
+
+**Why upstream's rule cannot simply be adopted.** The two addresses are not
+interchangeable *to the add-ons*, and each of the two host-network add-ons in
+this fleet needs a different one — both device-measured:
+
+| add-on | `127.0.0.1:<port>` | gateway `172.30.32.1:<port>` |
+|---|---|---|
+| ESPHome | listening → **200** | listening → **403** |
+| Music Assistant | **econnrefused** | listening → serves |
+
+ESPHome listens on `0.0.0.0` and refuses anything that did not arrive on
+loopback. That was reproduced with and without the supervisor-anchor source
+bind, with `Host` rewritten, and with `X-HA-Ingress`, `X-Ingress-Path`,
+`X-Hass-Source` and `X-Forwarded-For` set — only the peer address unlocks it.
+Music Assistant binds `0.0.0.0` for its LAN UI and streams but its *ingress*
+port to the gateway alone, deliberately keeping ingress off the LAN.
+
+So gateway-only would have fixed Music Assistant and broken ESPHome.
+
+**Why upstream never has to choose.** Its Supervisor is a container on the
+bridge, so loopback is that container's own and is not an option; the gateway
+is the only address it can offer. Vagus's supervisor is the host BEAM process,
+so loopback is genuinely available and is strictly more local. This divergence
+exists because Vagus's supervisor is host-networked, not because upstream is
+wrong.
+
+**Only a connection-level failure falls back.** An add-on answering 403, 404
+or 500 has connected, and that status is its answer — not evidence of a wrong
+address. Retrying such a response elsewhere would mask real add-on errors.
+
+Deliberately uncached: a refused loopback connect costs a syscall with no
+network hop, while a cached answer goes stale the moment an add-on rebinds,
+and a stale answer here is a 502 for the whole panel.
+`Vagus.Addon.Watchdog.Probe` uses the same helper — a watchdog that disagreed
+with the proxy would probe a live add-on dead and restart-loop it.
+
 ## `dsp:` — a config key, two host mounts, and an operator setup step, none with upstream precedent
 
 This is the largest divergence in the ledger, and it is three at once: a schema
