@@ -51,6 +51,7 @@ defmodule Vagus.DSP do
           :unsupported
           | :too_large
           | :truncated
+          | :incomplete_elf
           | :not_elf
           | :not_hexagon
           | :not_32bit
@@ -129,16 +130,38 @@ defmodule Vagus.DSP do
   """
   @spec store(Path.t()) :: {:ok, info()} | {:error, reason()}
   def store(source) do
-    with {:ok, dir} <- configured_root(),
-         :ok <- check_size(source),
+    case configured_root() do
+      {:ok, dir} -> with_store_lock(dir, fn -> do_store(dir, source) end)
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp do_store(dir, source) do
+    with :ok <- check_size(source),
          :ok <- validate(source),
          {:ok, contents} <- read_file(source),
+         :ok <- check_tables(contents),
          {:ok, filename, arch} <- derive_name(contents),
          :ok <- install(dir, filename, contents) do
       version = version_in(contents)
       Logger.info("Vagus.DSP: stored #{filename} (#{arch}, version #{version || "not detected"})")
       describe(Path.join(dir, filename), arch, version)
     end
+  end
+
+  # Two concurrent uploads corrupt the store, and a unique temp name does not
+  # fix it: same arch, both writes land on one `.tmp` and interleave; different
+  # arch, each `sweep/2` deletes the other's just-renamed result and the store
+  # can end up empty. Both need validate → write → rename → sweep to be one
+  # step, so the whole thing takes a mutex keyed by the store directory.
+  #
+  # Same call shape and the same reasoning as `Vagus.Addon.Manager`'s per-slug
+  # lock: `[node()]` scopes it here, and `:global.trans` is used for its
+  # reentrant local mutex behaviour, not for distribution. It blocks rather
+  # than erroring, so a second uploader waits instead of needing a "locked"
+  # answer rendered to a human.
+  defp with_store_lock(dir, fun) do
+    :global.trans({{:dsp_store, dir}, self()}, fun, [node()])
   end
 
   @doc """
@@ -292,6 +315,38 @@ defmodule Vagus.DSP do
 
   defp check_header(<<0x7F, "ELF", _short::binary>>), do: {:error, :truncated}
   defp check_header(_header), do: {:error, :not_elf}
+
+  # A partial download keeps its first 20 bytes and can keep the marker too —
+  # a 150-byte file passes both checks, stores, reports as configured, and then
+  # fails inside the DSP loader where nothing reports it. The header's own
+  # table extents are what catch that: they name offsets the rest of the file
+  # has to contain. `e_phnum == 0` is the same failure wearing an intact
+  # header — an `ET_DYN` object with no program headers tells the loader
+  # nothing to map, so it is not loadable regardless of how much of it arrived.
+  #
+  # Deliberately stops at the tables: individual segments are not walked. The
+  # DSP loader validates the object for real, and a second loader living in an
+  # upload path would be a large surface for no further answer. That is also
+  # why this is a step in `store/1` rather than growth in `validate/1`, whose
+  # contract is the 20-byte prefix and nothing more.
+  defp check_tables(
+         <<_ident_to_entry::binary-size(28), phoff::little-32, shoff::little-32,
+           _flags::little-32, _ehsize::little-16, phentsize::little-16, phnum::little-16,
+           shentsize::little-16, shnum::little-16, _shstrndx::little-16, _rest::binary>> =
+           contents
+       ) do
+    size = byte_size(contents)
+
+    if phoff > 0 and phnum > 0 and phoff + phnum * phentsize <= size and
+         shoff + shnum * shentsize <= size do
+      :ok
+    else
+      {:error, :incomplete_elf}
+    end
+  end
+
+  # Shorter than the 52-byte ELF32 header it claims to be.
+  defp check_tables(_contents), do: {:error, :incomplete_elf}
 
   # One distinct marker is the file naming itself. None means this is not a
   # skel at all; more than one means the content cannot say which name the

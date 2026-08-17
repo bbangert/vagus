@@ -168,6 +168,31 @@ defmodule Vagus.Addon.DevicesTest do
     end
   end
 
+  describe "unresolved_dsp_nodes/1" do
+    test "names what does not resolve, and only that" do
+      assert Devices.unresolved_dsp_nodes(
+               required_dsp_nodes: ["/dev/null", "/dev/vagus-no-such-dsp-node"]
+             ) == ["/dev/vagus-no-such-dsp-node"]
+
+      assert Devices.unresolved_dsp_nodes(required_dsp_nodes: ["/dev/null", "/dev/zero"]) == []
+    end
+
+    # Same bar `cgroup_rules/3` sets: a path that stats but is not a device
+    # node emits no rule, so reporting it as resolved would promise access the
+    # container never gets.
+    test "a path that is not a device node does not resolve" do
+      assert Devices.unresolved_dsp_nodes(required_dsp_nodes: ["/etc/hosts"]) == ["/etc/hosts"]
+    end
+
+    # The shipped list is the pair the device gate measured as load-bearing;
+    # `/dev/fastrpc-cdsp` is carried by `cgroup_rules/3` but nothing requires
+    # it. On a host this resolves nothing, which is the rpi3_64/CI case.
+    test "the shipped list is the gate's measured minimum" do
+      assert Devices.unresolved_dsp_nodes() --
+               ["/dev/fastrpc-cdsp-secure", "/dev/dma_heap/system"] == []
+    end
+  end
+
   describe "system-disk refusal (upstream's allowed_for_access)" do
     test "a char device never consults the disk policy" do
       # Block-only, same as upstream — and the lazy resolve means a char-only

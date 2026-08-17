@@ -35,6 +35,12 @@ defmodule Vagus.API.AdminPanelTest do
   @admin_user "01ab23cd45ef67890123456789abcdef"
   @boundary "vagus-panel-dsp-boundary"
 
+  # ELF32 header size and the table entry sizes a Hexagon object uses.
+  @ehsize 52
+  @phentsize 32
+  @shentsize 40
+  @shnum 3
+
   defmodule StubUsers do
     @moduledoc false
     def admin?(user_id) do
@@ -684,14 +690,26 @@ defmodule Vagus.API.AdminPanelTest do
       assert conn.resp_body =~ "could not be read as a file submission"
     end
 
-    # The parser cap is `Vagus.DSP.max_bytes/0` itself, so the SDK archive an
-    # operator might submit instead of the extracted `.so` dies here rather
-    # than after being spooled whole.
+    # The parser cap bounds the whole body where `DSP.max_bytes/0` bounds the
+    # file, so it sits a fixed framing allowance above it — a skel at the file
+    # cap must still reach `store/1`, which owns the size rule and the sentence
+    # that goes with it.
+    test "the parser cap leaves room for multipart framing above the file cap" do
+      headroom = AdminPanel.dsp_body_limit() - DSP.max_bytes()
+
+      assert headroom > 0
+      assert headroom <= 1024 * 1024
+    end
+
+    # The SDK archive an operator might submit instead of the extracted `.so`
+    # dies in the parser rather than after being spooled whole. One body of
+    # this size in the suite is enough; the file cap itself is `Vagus.DSPTest`'s
+    # to pin.
     test "a body over the cap is refused and names the mistake", %{
       session: session,
       token: token
     } do
-      oversize = String.duplicate("x", DSP.max_bytes() + 1024)
+      oversize = String.duplicate("x", AdminPanel.dsp_body_limit() + 1024)
       conn = upload(token, session, part("skel", "qairt.zip", oversize))
 
       assert conn.status == 400
@@ -942,14 +960,20 @@ defmodule Vagus.API.AdminPanelTest do
   end
 
   # Same synthesis as `Vagus.DSPTest` — the real skel cannot be redistributed,
-  # so there is no fixture binary to point at.
+  # so there is no fixture binary to point at. Complete 52-byte header plus the
+  # tables it points at, since `store/1` rejects an object that describes more
+  # of itself than it carries.
   defp elf(opts \\ []) do
     class = Keyword.get(opts, :class, 1)
     data = Keyword.get(opts, :data, 1)
     type = Keyword.get(opts, :type, 3)
     machine = Keyword.get(opts, :machine, 164)
 
-    <<0x7F, "ELF", class, data, 1, 0::size(72), type::little-16, machine::little-16>>
+    <<0x7F, "ELF", class, data, 1, 0::size(72), type::little-16, machine::little-16, 1::little-32,
+      0::little-32, @ehsize::little-32, @ehsize + @phentsize::little-32, 0::little-32,
+      @ehsize::little-16, @phentsize::little-16, 1::little-16, @shentsize::little-16,
+      @shnum::little-16, 2::little-16>> <>
+      :binary.copy(<<0>>, @phentsize + @shentsize * @shnum)
   end
 
   defp skel(arch) do

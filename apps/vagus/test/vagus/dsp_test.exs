@@ -17,6 +17,16 @@ defmodule Vagus.DSPTest do
   @cdsp_blob "qcom/qcs6490/cdsp.mbn"
   @cdsp_version "CDSP.HT.2.5.c3-00134-KODIAK-1_20260305_004044"
 
+  # The measured shape of the real cdsp.mbn — see `firmware/1`.
+  @firmware_bytes 3_641_344
+  @marker_offset 2_506_808
+
+  # ELF32 header size and the table entry sizes a Hexagon object uses.
+  @ehsize 52
+  @phentsize 32
+  @shentsize 40
+  @shnum 3
+
   setup do
     dir = Path.join(System.tmp_dir!(), "vagus_dsp_#{System.unique_integer([:positive])}")
     Application.put_env(:vagus, :dsp_root, dir)
@@ -67,6 +77,27 @@ defmodule Vagus.DSPTest do
     test "rejects input too short to carry a header" do
       assert {:error, :truncated} = DSP.store(write_tmp(binary_part(elf(), 0, 19)))
       assert {:error, :not_elf} = DSP.store(write_tmp("<html>Sign in to download</html>"))
+      assert nothing_stored?()
+    end
+
+    # The gap a 20-byte prefix check cannot see: a partial download keeps the
+    # prefix, can keep the marker, and would store, report configured, and fail
+    # inside the DSP loader where nothing reports it.
+    test "rejects an object whose header describes more file than arrived" do
+      marker = "libQnnHtpV68Skel.so\0"
+
+      bodies = [
+        # A program-header table starting past EOF.
+        elf(phoff: 1_048_576) <> marker,
+        # Intact header, no program headers at all — an ET_DYN with nothing for
+        # the loader to map.
+        elf(phnum: 0) <> marker,
+        # Cut off inside the header itself, so no marker survives to reach.
+        binary_part(elf(), 0, 40)
+      ]
+
+      for body <- bodies, do: assert({:error, :incomplete_elf} = DSP.store(write_tmp(body)))
+
       assert nothing_stored?()
     end
 
@@ -121,6 +152,31 @@ defmodule Vagus.DSPTest do
       assert {:ok, _v73} = DSP.store(write_tmp(skel("V73")))
 
       assert Path.wildcard(Path.join(dir, "*")) == [Path.join(dir, "libQnnHtpV73Skel.so")]
+    end
+
+    # Different arches, so the writes and renames do not collide — what
+    # collides is each store's sweep, which removes every skel it did not just
+    # write. Unserialized, one can land after another's rename and leave the
+    # store with no skel at all while its uploader was told `{:ok, _}`. Sources
+    # are written from the test process: `write_tmp/1` registers an `on_exit`.
+    test "concurrent stores leave exactly one intact skel", %{dir: dir} do
+      bodies = Map.new(~w(V68 V69 V73 V75), &{&1, skel(&1)})
+      sources = Map.new(bodies, fn {arch, body} -> {arch, write_tmp(body)} end)
+
+      results =
+        sources
+        |> Task.async_stream(fn {arch, source} -> {arch, DSP.store(source)} end, ordered: false)
+        |> Enum.map(fn {:ok, pair} -> pair end)
+
+      for {arch, result} <- results do
+        assert {:ok, info} = result
+        assert info.filename == "libQnnHtp#{arch}Skel.so"
+        # Whole, not half of another arch's body interleaved into this one.
+        assert info.size == byte_size(bodies[arch])
+      end
+
+      assert [survivor] = Path.wildcard(Path.join(dir, "*"))
+      assert File.read!(survivor) in Map.values(bodies)
     end
   end
 
@@ -284,22 +340,39 @@ defmodule Vagus.DSPTest do
     on_exit(fn -> File.rm_rf!(base) end)
   end
 
-  # The real string sits ~69% into a 3.6 MB blob, so it is buried here too —
-  # nothing about this may depend on a bounded read.
+  # The real string sits at byte 2,506,808 of a 3,641,344-byte blob, so the
+  # fixture is that size with the marker at that offset: at any smaller scale a
+  # regression to a bounded read would pass this suite and return `nil` on a
+  # board.
   defp firmware(version) do
-    <<0::size(8192)>> <> "QC_IMAGE_VERSION_STRING=#{version}\0" <> <<0::size(8192)>>
+    marker = "QC_IMAGE_VERSION_STRING=#{version}\0"
+
+    :binary.copy(<<0>>, @marker_offset) <>
+      marker <> :binary.copy(<<0>>, @firmware_bytes - @marker_offset - byte_size(marker))
   end
 
   # The measured prefix of the real file: magic, EI_CLASS = 1 (32-bit),
   # EI_DATA = 1 (LSB), EI_VERSION = 1, nine padding bytes, then e_type = 3
   # (ET_DYN) and e_machine = 164 (EM_QDSP6), both little-endian.
+  #
+  # The whole 52-byte header follows, plus the tables it points at, so a
+  # fixture is structurally complete and not merely correctly prefixed —
+  # `store/1` rejects a header describing more file than it was given, and
+  # every positive fixture here is built from this one.
   defp elf(opts \\ []) do
     class = Keyword.get(opts, :class, 1)
     data = Keyword.get(opts, :data, 1)
     type = Keyword.get(opts, :type, 3)
     machine = Keyword.get(opts, :machine, 164)
+    phnum = Keyword.get(opts, :phnum, 1)
+    phoff = Keyword.get(opts, :phoff, @ehsize)
+    shoff = @ehsize + @phentsize * phnum
 
-    <<0x7F, "ELF", class, data, 1, 0::size(72), type::little-16, machine::little-16>>
+    <<0x7F, "ELF", class, data, 1, 0::size(72), type::little-16, machine::little-16, 1::little-32,
+      0::little-32, phoff::little-32, shoff::little-32, 0::little-32, @ehsize::little-16,
+      @phentsize::little-16, phnum::little-16, @shentsize::little-16, @shnum::little-16,
+      2::little-16>> <>
+      :binary.copy(<<0>>, @phentsize * phnum + @shentsize * @shnum)
   end
 
   defp skel(arch, opts \\ []) do

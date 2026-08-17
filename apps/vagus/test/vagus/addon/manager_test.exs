@@ -4,6 +4,11 @@ defmodule Vagus.Addon.ManagerTest do
   alias Vagus.Addon.{Config, Manager, State}
   alias Vagus.API.AdminPanel
 
+  # No CI machine has a Hexagon DSP, and `dsp: true` now refuses a start whose
+  # required nodes do not resolve — so a start that is testing anything else
+  # aims the check at char devices every Linux host has.
+  @host_dsp_nodes ["/dev/null", "/dev/zero"]
+
   defp mosquitto_config do
     {:ok, c} =
       Config.parse(%{
@@ -513,7 +518,11 @@ defmodule Vagus.Addon.ManagerTest do
       on_exit(fn -> State.delete("dsp_addon") end)
 
       assert {:ok, _} =
-               Manager.start(cfg_dsp("dsp_addon"), backend: __MODULE__.FakeBackend, data_root: dr)
+               Manager.start(cfg_dsp("dsp_addon"),
+                 backend: __MODULE__.FakeBackend,
+                 data_root: dr,
+                 required_dsp_nodes: @host_dsp_nodes
+               )
 
       assert File.dir?(Path.join([dr, "addons", "data", "dsp_addon"]))
       assert File.exists?("/usr/lib/dsp") == dsp_existed?
@@ -544,14 +553,59 @@ defmodule Vagus.Addon.ManagerTest do
       refute File.exists?(dsp_root)
     end
 
+    # The mount and the skel are both in place, so this isolates the device
+    # nodes: without a cgroup rule for them the container starts and dies at
+    # `ERROR 0x68` inside the add-on, which reads to an operator as the add-on
+    # being broken rather than the board being wrong.
+    test "a dsp: true start whose required node is missing fails naming it", %{data_root: dr} do
+      dsp_root = configure_dsp_root()
+      File.mkdir_p!(dsp_root)
+      File.write!(Path.join(dsp_root, "libQnnHtpV68Skel.so"), "")
+      on_exit(fn -> File.rm_rf!(dsp_root) end)
+      on_exit(fn -> State.delete("dsp_nonode") end)
+
+      assert {:error, {:dsp_devices_unavailable, message}} =
+               Manager.start(cfg_dsp("dsp_nonode"),
+                 backend: __MODULE__.FakeBackend,
+                 data_root: dr,
+                 required_dsp_nodes: ["/dev/null", "/dev/vagus-no-such-dsp-node"]
+               )
+
+      assert message =~ "/dev/vagus-no-such-dsp-node"
+      # Only the unresolvable one is named — the sentence has to point at what
+      # is actually absent.
+      refute message =~ "/dev/null"
+      refute_received {:create, _spec}
+    end
+
+    # The check is `dsp: true`'s alone: an add-on that never asked for the DSP
+    # cannot be failed by a node it has no interest in.
+    test "a dsp: false start ignores the same missing node", %{config: config, data_root: dr} do
+      assert {:ok, _} =
+               Manager.start(config,
+                 backend: __MODULE__.FakeBackend,
+                 data_root: dr,
+                 required_dsp_nodes: ["/dev/vagus-no-such-dsp-node"]
+               )
+
+      assert_received {:create, _spec}
+    end
+
     # Distinct from the above on purpose: nothing an operator uploads fixes a
-    # board with no DSP, so the sentence must not send them to the panel.
+    # board with no DSP, so the sentence must not send them to the panel. The
+    # node list is deliberately unresolvable here too: a board with no DSP has
+    # no fastrpc nodes either, and naming one would be a true answer to the
+    # wrong question.
     test "a dsp: true start on a board with no DSP says so instead", %{data_root: dr} do
       put_dsp_root(nil)
       on_exit(fn -> State.delete("dsp_nodsp") end)
 
       assert {:error, {:dsp_unsupported, message}} =
-               Manager.start(cfg_dsp("dsp_nodsp"), backend: __MODULE__.FakeBackend, data_root: dr)
+               Manager.start(cfg_dsp("dsp_nodsp"),
+                 backend: __MODULE__.FakeBackend,
+                 data_root: dr,
+                 required_dsp_nodes: ["/dev/vagus-no-such-dsp-node"]
+               )
 
       assert message =~ "no Hexagon DSP"
     end

@@ -168,6 +168,7 @@ defmodule Vagus.Addon.Manager do
 
     with :ok <- ensure_mount_sources(spec),
          :ok <- ensure_dsp_store(config),
+         :ok <- ensure_dsp_devices(config, opts),
          :ok <- write_options(config, data_root, user_options),
          :ok <- maybe_ensure_network(config, opts),
          :ok <- remove_stale_container(spec, opts),
@@ -755,6 +756,30 @@ defmodule Vagus.Addon.Manager do
   end
 
   defp ensure_dsp_store(_config), do: :ok
+
+  # Ordered after `ensure_dsp_store/1` on purpose: a board with no DSP has no
+  # fastrpc nodes either, and "a device node is missing" would be a true but
+  # useless answer to "this device has no Hexagon DSP".
+  #
+  # Fail-closed for the same reason the store check is. Without a rule for
+  # these the container starts, allocates nothing, and dies at `ERROR 0x68`
+  # inside the add-on — a failure the operator sees as the add-on being broken.
+  # `Vagus.Addon.Devices` skips a node it cannot resolve, which is right for an
+  # author's `devices:` and wrong for the two `dsp: true` cannot work without.
+  defp ensure_dsp_devices(%Config{dsp: true}, opts) do
+    case Devices.unresolved_dsp_nodes(opts) do
+      [] ->
+        :ok
+
+      missing ->
+        {:error,
+         {:dsp_devices_unavailable,
+          "this device's DSP nodes are not available (#{Enum.join(missing, ", ")}) — " <>
+            "the add-on could not use the DSP even if it started"}}
+    end
+  end
+
+  defp ensure_dsp_devices(_config, _opts), do: :ok
 
   # Validate merged options against the add-on schema and write /data/options.json
   # (the per-add-on data dir is the /data bind source).

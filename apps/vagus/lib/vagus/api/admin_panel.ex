@@ -224,15 +224,28 @@ defmodule Vagus.API.AdminPanel do
 
   ## DSP skel upload
 
+  # Plug's `:length` bounds the whole request body — boundaries, part headers,
+  # any other fields — where `DSP.max_bytes/0` bounds the file alone. Setting
+  # the two equal refuses a legal skel at the cap for the framing wrapped
+  # around it, and blames the operator's file for it. So the parser gets a
+  # fixed framing allowance on top, and the size rule stays `store/1`'s: an
+  # oversize upload is then refused by the module that owns the number and can
+  # say which file to pick instead. The parser cap still earns its keep by
+  # stopping a 2.4 GB SDK archive before it is spooled to disk.
+  @multipart_framing 64 * 1024
+
   # `Plug.Parsers.init/1` only normalizes options into an opaque tuple, so
-  # computing it once at compile time is safe. The cap is `Vagus.DSP`'s own,
-  # not a second number beside it: the parser must refuse what `store/1`
-  # would refuse anyway, and the two drifting apart would spool a file to
-  # disk only to reject it.
+  # computing it once at compile time is safe.
   @dsp_parser_opts Plug.Parsers.init(
-                     parsers: [{:multipart, length: DSP.max_bytes()}],
+                     parsers: [{:multipart, length: DSP.max_bytes() + @multipart_framing}],
                      pass: []
                    )
+
+  @doc false
+  # Exposed only so the panel's own test can pin the two caps' relationship
+  # without pushing a body of either size through the parser to observe it.
+  @spec dsp_body_limit() :: pos_integer()
+  def dsp_body_limit, do: DSP.max_bytes() + @multipart_framing
 
   # Multipart is parsed HERE (B1), not upstream: `Vagus.API.Dispatcher` sends
   # the ingress leg nowhere near the router's `Plug.Parsers`, and
@@ -731,6 +744,13 @@ defmodule Vagus.API.AdminPanel do
 
   defp reason_sentence(:truncated),
     do: "That file is too short to be a library — the upload or the extraction was cut off."
+
+  # The file is the right one; only part of it arrived. Sending the operator
+  # back to the SDK tree to pick a different file would be the wrong advice.
+  defp reason_sentence(:incomplete_elf) do
+    "That library is cut short — it describes more of itself than the file " <>
+      "contains. Extract it from the SDK archive again and upload the whole file."
+  end
 
   defp reason_sentence(:not_32bit),
     do: "That claims to be a Hexagon object but is 64-bit, so it is not a DSP skeleton."
