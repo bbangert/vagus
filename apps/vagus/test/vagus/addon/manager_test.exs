@@ -216,7 +216,8 @@ defmodule Vagus.Addon.ManagerTest do
       # `system: true` is the whole failure model: it stops
       # `ensure_mount_sources/1` creating the store, so an add-on whose operator
       # never uploaded a skel fails container-create instead of binding an empty
-      # dir and letting QNN fall back to CPU silently.
+      # dir and hitting a QNN device-creation failure at start (or, for a
+      # wrapper with its own CPU fallback, running silently on the CPU).
       assert skel.system == true
     end
 

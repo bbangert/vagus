@@ -803,9 +803,9 @@ defmodule Vagus.API.AdminPanelTest do
       assert conn.resp_body =~ fingerprint()
     end
 
-    # Warn, never refuse — a V73 skel on a v68 DSP is the silent-CPU-fallback
-    # failure this whole feature defends against, but `:dsp_arch` being wrong
-    # for a board must not strand the operator.
+    # Warn, never refuse — a V73 skel on a v68 DSP will most likely fail the
+    # add-on's start rather than degrade it, but `:dsp_arch` being wrong for a
+    # board must not strand the operator.
     test "a skel for another Hexagon version warns and is still reported as stored", %{
       session: session,
       token: token
@@ -816,7 +816,7 @@ defmodule Vagus.API.AdminPanelTest do
 
       assert conn.status == 200
       assert conn.resp_body =~ "wrong DSP"
-      assert conn.resp_body =~ "falls back"
+      assert conn.resp_body =~ "fail to start"
       assert conn.resp_body =~ "libQnnHtpV73Skel.so"
       assert conn.resp_body =~ "stored all the same"
       assert {:configured, %{arch: "V73"}} = DSP.status()

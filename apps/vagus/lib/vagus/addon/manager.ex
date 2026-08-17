@@ -583,9 +583,11 @@ defmodule Vagus.Addon.Manager do
   # `system: true` on both, meaning something different on each: the firmware
   # owns `/usr/lib/dsp`, while Vagus owns the store and the operator may simply
   # not have filled it yet. Neither may be mkdir_p'd by
-  # `ensure_mount_sources/1` — an empty bind is an add-on that starts, falls
-  # back to CPU for the whole session, and reports success forever, which is
-  # the silent failure this flag exists to prevent. A create-time refusal is
+  # `ensure_mount_sources/1` — an empty bind means direct QNN dies at device
+  # creation on start; an add-on that instead wraps QNN with its own CPU
+  # fallback would run the whole session silently on the CPU reporting
+  # success. Either way the operator sees a broken add-on, not missing setup,
+  # which is the failure this flag exists to prevent. A create-time refusal is
   # the loud alternative, and for the store half `ensure_dsp_store/1` turns it
   # into a sentence naming the panel first; the engine stays the backstop.
   #

@@ -306,9 +306,12 @@ boards afterwards.
    missing skel. PR #29 is still open, so the gate caught it before it shipped
    — which is the outcome a gate exists for. It answered a design question and
    found a bug on the way.
-4. ~~**Phase 6 still owes a QNN-level run.**~~ **Delivered — Result 4.** A real
-   QNN graph prepared and executed on the DSP with the skel supplied only from
-   `/usr/lib/rfsa/adsp`, and the no-skel control failed outright rather than
-   degrading. What Phase 6 still owes is the *Vagus-mediated* path: the same
-   thing driven through the panel upload and `dsp: true` on deployed firmware,
-   plus OTA survival and the `rpi3_64` regression.
+4. ~~**Phase 6 still owes a QNN-level run.**~~ **Delivered — Result 4, then
+   Result 5.** A real QNN graph prepared and executed on the DSP with the skel
+   supplied only from `/usr/lib/rfsa/adsp`, the no-skel control failed outright
+   rather than degrading, and Result 5 drove the whole thing — `dsp: true` on
+   deployed firmware, OTA survival, the `rpi3_64` regression — through
+   `Manager.build_spec/2` rather than a hand-written config. What it still owes
+   is narrower: that skel was stored via `Vagus.DSP.store/1` directly, not
+   through the panel's HTTP multipart upload — that half is covered by
+   hermetic tests, not on-device.

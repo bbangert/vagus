@@ -151,9 +151,11 @@ devices with dynamically allocated minors, measured `10:262` on one
 
 **Why a missing skel fails the start rather than degrading.** Both mounts carry
 `system: true`, so `ensure_mount_sources/1` never creates them. An empty bind
-would be an add-on that starts, falls back to CPU for the whole session, and
-reports success forever. `ensure_dsp_store/1` turns the refusal into a sentence
-naming the panel; the engine remains the backstop.
+means direct QNN dies at device creation rather than degrading — confirmed on
+device, see below; only a framework that wraps QNN with its own CPU fallback
+would instead run the whole session silently on the CPU. `ensure_dsp_store/1`
+turns the refusal into a sentence naming the panel; the engine remains the
+backstop.
 
 **Inert on `rpi3_64`**, where `:dsp_root` is unset — `Vagus.DSP.status/0`
 reports `:unsupported`, the panel section says so and offers no form, and no

@@ -55,6 +55,7 @@ config :vagus, :dsp_root, "/root/vagus/dsp"
 # QCS6490 (Kodiak) is Hexagon v68. Only the admin panel reads it, and only to
 # name the right one of the SDK's seven `hexagon-v*/unsigned/` directories in
 # the operator instructions and to warn when the stored skel is for another
-# version — a skel that does not load makes QNN fall back to the CPU silently,
-# so upload time is the only place it is visible.
+# version — a skel that does not load makes a DSP add-on fail to start rather
+# than fall back to the CPU silently, so upload time is still the best place
+# to catch it.
 config :vagus, :dsp_arch, "V68"

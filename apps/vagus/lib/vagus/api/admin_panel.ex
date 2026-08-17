@@ -654,10 +654,12 @@ defmodule Vagus.API.AdminPanel do
     """
   end
 
-  # A skeleton for another Hexagon version does not load, and QNN then falls
-  # back to the CPU reporting nothing — so the upload is the only place this
-  # is ever visible. It warns and keeps the file: `:dsp_arch` being wrong for
-  # a board must not be able to lock the operator out of storing anything.
+  # A skeleton for another Hexagon version does not load, so QNN will most
+  # likely fail to start rather than degrade — it has no CPU fallback of its
+  # own; that belongs to frameworks that wrap QNN with one. Warn here anyway:
+  # a failed start is a worse discovery than a warning at upload time. It
+  # keeps the file regardless: `:dsp_arch` being wrong for a board must not be
+  # able to lock the operator out of storing anything.
   defp arch_warning_html(%{arch: arch}) do
     case DSP.expected_arch() do
       nil -> ""
@@ -671,11 +673,12 @@ defmodule Vagus.API.AdminPanel do
     <div class="warn">
       <strong>This skeleton library is for the wrong DSP.</strong>
       It is #{esc(stored)}; this device's DSP is #{esc(expected)}. A skeleton
-      built for another Hexagon version does not load, and QNN then falls back
-      to the CPU <strong>without reporting an error</strong> — the add-on still
-      runs, just far slower. Upload <code>#{esc(skel_path())}</code> instead.
-      The file described below is stored all the same, and is still what a DSP
-      add-on will be given.
+      built for another Hexagon version does not load, so a DSP add-on will
+      most likely fail to start rather than run slowly; an add-on that wraps
+      QNN with its own CPU fallback may instead run far slower
+      <strong>without reporting an error</strong>. Upload
+      <code>#{esc(skel_path())}</code> instead. The file described below is
+      stored all the same, and is still what a DSP add-on will be given.
     </div>
     """
   end
