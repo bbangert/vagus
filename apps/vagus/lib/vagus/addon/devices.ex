@@ -51,12 +51,54 @@ defmodule Vagus.Addon.Devices do
   # whole disk included. Upstream has the same hammer and gates it the same way.
   @blanket ["b *:* rwm", "c *:* rwm"]
 
+  # `dsp: true`'s nodes. Measured on `dragon_q6a`: the `/usr/lib/dsp` bind on
+  # its own dies at `ERROR 0x68: memory alloc failed`, before fastrpc is
+  # reached. Vagus binds the whole host `/dev` into every container, so the
+  # nodes are visible — visibility is not access, and only a rule grants that.
+  #
+  # `-secure` names the *channel*, not the signed/unsigned protection domain
+  # (`fastrpc_test -U` picks that, orthogonally). Granting `/dev/fastrpc-cdsp`
+  # in its place failed exactly like granting nothing; it is listed anyway
+  # because it is the same compute DSP through the other channel and which node
+  # a runtime opens is the runtime's business — QNN's pick is unverified.
+  # `/dev/fastrpc-adsp` is deliberately absent: that is the *audio* DSP, a
+  # different device, outside what `dsp:` means.
+  #
+  # Paths, not numbers, because the minors are dynamically allocated and differ
+  # between two boards of the same model (`fastrpc-cdsp-secure` measured 10:262
+  # and 10:260 the same day) — a hardcoded rule passes on one and silently
+  # grants nothing on the other. A target with no fastrpc nodes (rpi3_64) needs
+  # no special case: every path skips as ENOENT and `dsp: true` emits nothing.
+  @dsp_nodes [
+    "/dev/fastrpc-cdsp-secure",
+    "/dev/fastrpc-cdsp",
+    "/dev/dma_heap/system"
+  ]
+
+  # The two the device gate measured as load-bearing: granting neither dies at
+  # `ERROR 0x68` before fastrpc is reached, and granting either alone at
+  # `ERROR 0x72`. Unlike a `devices:` entry — an author's declaration, best-
+  # effort by design — these are the flag's own precondition, so their absence
+  # is a start that cannot work rather than one rule fewer.
+  # `/dev/fastrpc-cdsp` is not here: it is the same DSP through the other
+  # channel, carried in case a runtime opens it, and nothing needs it.
+  @required_dsp_nodes [
+    "/dev/fastrpc-cdsp-secure",
+    "/dev/dma_heap/system"
+  ]
+
   @doc """
   The rules for `config`, given whether the add-on is still protected.
 
   `full_access: true` contributes the blanket pair only once protection is off;
   while protected it contributes nothing, and only the `devices:` entries
   resolve.
+
+  `dsp: true` contributes its nodes after the `devices:` entries, resolved the
+  same way — the mount that flag also implies is useless without them. The
+  subset it cannot work without is not merely skipped when it fails to
+  resolve: `unresolved_dsp_nodes/1` is what refuses that start, before a
+  container is created with rules this would have quietly left short.
 
   Every rule is full `rwm`: upstream does no per-device permission filtering,
   and the `devices:` value format carries no permission field to filter on.
@@ -79,9 +121,10 @@ defmodule Vagus.Addon.Devices do
     # host happens to have. Absent (the only production path) it stays
     # `:unresolved` and is read lazily on the first block device.
     initial = Keyword.get(opts, :system_disk, :unresolved)
+    paths = config.devices ++ dsp_nodes(config, opts)
 
     {rules, _blocked} =
-      Enum.reduce(config.devices, {[], initial}, fn path, {acc, blocked} ->
+      Enum.reduce(paths, {[], initial}, fn path, {acc, blocked} ->
         {emitted, blocked} = rule(path, blocked)
         {[emitted | acc], blocked}
       end)
@@ -89,8 +132,45 @@ defmodule Vagus.Addon.Devices do
     blanket(config.full_access, protected?) ++ (rules |> Enum.reverse() |> List.flatten())
   end
 
+  @doc """
+  Which of `dsp: true`'s required nodes do not resolve to a device node.
+
+  `cgroup_rules/3` skips what it cannot resolve, which is right for an
+  author's `devices:` and wrong for these — see `@required_dsp_nodes`. Rule
+  building has no error channel and should not grow one, so the question is
+  answered separately and `Vagus.Addon.Manager` refuses the start, beside the
+  same fail-closed check it already makes for a missing skel.
+
+  `:required_dsp_nodes` is injectable for the same reason `cgroup_rules/3`'s
+  `:dsp_nodes` is: no CI machine has a Hexagon DSP.
+  """
+  @spec unresolved_dsp_nodes(keyword()) :: [String.t()]
+  def unresolved_dsp_nodes(opts \\ []) do
+    opts
+    |> Keyword.get(:required_dsp_nodes, @required_dsp_nodes)
+    |> Enum.reject(&resolves?/1)
+  end
+
+  # The same bar `rule/2` sets before it emits: stattable, and a char or block
+  # node. Anything else produces no rule, so accepting it here would report a
+  # node as present that the container is still not granted.
+  defp resolves?(path) when is_binary(path) do
+    case File.stat(path) do
+      {:ok, %File.Stat{mode: mode}} -> device_type(mode) != nil
+      {:error, _reason} -> false
+    end
+  end
+
+  defp resolves?(_path), do: false
+
   defp blanket(true, false), do: @blanket
   defp blanket(_full_access, _protected?), do: []
+
+  # `:dsp_nodes` is `:system_disk`'s counterpart: injectable only so a test can
+  # aim resolution at a node that exists on every host, since no CI machine has
+  # a Hexagon DSP.
+  defp dsp_nodes(%Config{dsp: true}, opts), do: Keyword.get(opts, :dsp_nodes, @dsp_nodes)
+  defp dsp_nodes(_config, _opts), do: []
 
   defp rule(path, blocked) when is_binary(path) do
     case File.stat(path) do

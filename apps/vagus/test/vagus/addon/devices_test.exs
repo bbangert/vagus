@@ -111,6 +111,88 @@ defmodule Vagus.Addon.DevicesTest do
     end
   end
 
+  describe "cgroup_rules/3 — dsp" do
+    test "dsp: true on a host without the nodes emits nothing and does not raise" do
+      # The rpi3_64/CI case. Injected rather than trusting the real nodes to be
+      # absent, so the assertion also holds when the suite runs on a q6a.
+      cfg = config(%{"dsp" => true})
+
+      log =
+        capture_log(fn ->
+          assert Devices.cgroup_rules(cfg, true, dsp_nodes: ["/dev/vagus-no-such-dsp-node"]) == []
+        end)
+
+      assert log =~ "no such node"
+    end
+
+    test "the shipped node list resolves through the same path on any host" do
+      # No injection: on x86 this resolves nothing, on a q6a it resolves the
+      # real fastrpc/heap nodes. Either way the shipped list must survive
+      # resolution and can only ever produce char rules.
+      capture_log(fn ->
+        for rule <- Devices.cgroup_rules(config(%{"dsp" => true}), true) do
+          assert rule =~ ~r/^c \d+:\d+ rwm$/
+        end
+      end)
+    end
+
+    test "an injected node resolves to the number the kernel reports for it" do
+      # /dev/null is a char device on every Linux host, so this exercises the
+      # real stat + rdev decode without needing a Hexagon DSP or `mknod`.
+      {major, minor} = char_devnum("/dev/null")
+
+      assert Devices.cgroup_rules(config(%{"dsp" => true}), true, dsp_nodes: ["/dev/null"]) ==
+               ["c #{major}:#{minor} rwm"]
+
+      # sysfs states the same pair by a different route than stat(2), so the
+      # expectation isn't just the module's own arithmetic played back.
+      assert File.exists?("/sys/dev/char/#{major}:#{minor}")
+    end
+
+    test "dsp: false resolves no node, whatever the list says" do
+      cfg = config(%{"dsp" => false})
+      assert Devices.cgroup_rules(cfg, true, dsp_nodes: ["/dev/null", "/dev/zero"]) == []
+      assert Devices.cgroup_rules(cfg, false, dsp_nodes: ["/dev/null", "/dev/zero"]) == []
+    end
+
+    test "dsp rules are additive — devices: and full_access keep their behaviour" do
+      cfg = config(%{"dsp" => true, "devices" => ["/dev/null"], "full_access" => true})
+      opts = [dsp_nodes: ["/dev/zero"]]
+
+      # Protected: full_access still contributes nothing, and dsp lands after
+      # the declared device rather than replacing it.
+      assert Devices.cgroup_rules(cfg, true, opts) == ["c 1:3 rwm", "c 1:5 rwm"]
+
+      assert Devices.cgroup_rules(cfg, false, opts) ==
+               ["b *:* rwm", "c *:* rwm", "c 1:3 rwm", "c 1:5 rwm"]
+    end
+  end
+
+  describe "unresolved_dsp_nodes/1" do
+    test "names what does not resolve, and only that" do
+      assert Devices.unresolved_dsp_nodes(
+               required_dsp_nodes: ["/dev/null", "/dev/vagus-no-such-dsp-node"]
+             ) == ["/dev/vagus-no-such-dsp-node"]
+
+      assert Devices.unresolved_dsp_nodes(required_dsp_nodes: ["/dev/null", "/dev/zero"]) == []
+    end
+
+    # Same bar `cgroup_rules/3` sets: a path that stats but is not a device
+    # node emits no rule, so reporting it as resolved would promise access the
+    # container never gets.
+    test "a path that is not a device node does not resolve" do
+      assert Devices.unresolved_dsp_nodes(required_dsp_nodes: ["/etc/hosts"]) == ["/etc/hosts"]
+    end
+
+    # The shipped list is the pair the device gate measured as load-bearing;
+    # `/dev/fastrpc-cdsp` is carried by `cgroup_rules/3` but nothing requires
+    # it. On a host this resolves nothing, which is the rpi3_64/CI case.
+    test "the shipped list is the gate's measured minimum" do
+      assert Devices.unresolved_dsp_nodes() --
+               ["/dev/fastrpc-cdsp-secure", "/dev/dma_heap/system"] == []
+    end
+  end
+
   describe "system-disk refusal (upstream's allowed_for_access)" do
     test "a char device never consults the disk policy" do
       # Block-only, same as upstream — and the lazy resolve means a char-only
@@ -245,6 +327,13 @@ defmodule Vagus.Addon.DevicesTest do
         {:ok, %File.Stat{minor_device: rdev}} = File.stat(path)
         {Bitwise.band(Bitwise.bsr(rdev, 8), 0xFFF), Bitwise.band(rdev, 0xFF)}
     end
+  end
+
+  defp char_devnum(path) do
+    %File.Stat{minor_device: rdev} = File.stat!(path)
+
+    {Bitwise.band(Bitwise.bsr(rdev, 8), 0xFFF),
+     Bitwise.bor(Bitwise.band(rdev, 0xFF), Bitwise.band(Bitwise.bsr(rdev, 12), 0xFFF00))}
   end
 
   defp first_block_device do

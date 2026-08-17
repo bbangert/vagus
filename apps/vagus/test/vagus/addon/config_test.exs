@@ -29,6 +29,7 @@ defmodule Vagus.Addon.ConfigTest do
       assert c.panel_title == nil
       assert c.panel_admin == true
       assert c.apparmor == true
+      assert c.dsp == false
       assert c.backup == "hot"
       assert c.timeout == 10
       assert c.image == nil
@@ -447,6 +448,7 @@ defmodule Vagus.Addon.ConfigTest do
         "privileged" => ["SYS_ADMIN", "NET_ADMIN"],
         "full_access" => true,
         "devices" => ["/dev/ttyUSB0"],
+        "dsp" => true,
         "apparmor" => false,
         "ingress" => true,
         "ingress_port" => 8123,

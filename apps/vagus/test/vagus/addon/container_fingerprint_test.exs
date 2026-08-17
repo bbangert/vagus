@@ -93,11 +93,17 @@ defmodule Vagus.Addon.ContainerFingerprintTest do
   # a silenced failure, and anything not listed fails loudly.
   # The other direction: mounts VAGUS declares that the real Supervisor does
   # not. Same discipline as `@accepted_mounts` — a decision with a reason, and
-  # anything not listed fails loudly. Empty on purpose: Vagus currently adds no
-  # mount upstream lacks. A `/dev/null` mask over `/dev/console` briefly lived
-  # here and was removed once it was shown that `mknod` walks around it
-  # (docs/divergences.md), which is exactly the kind of claim this ledger
-  # exists to stop being made casually.
+  # anything not listed fails loudly. A `/dev/null` mask over `/dev/console`
+  # briefly lived here and was removed once it was shown that `mknod` walks
+  # around it (docs/divergences.md), which is exactly the kind of claim this
+  # ledger exists to stop being made casually.
+  #
+  # Empty because every mount this fixture's spec declares is one upstream has
+  # too — NOT because Vagus adds none. `dsp: true` adds two (`/usr/lib/dsp` and
+  # the skel store at `/usr/lib/rfsa/adsp`), and they cannot be ledgered here:
+  # the fixture is a real Supervisor add-on, which has no `dsp:`, so the spec
+  # under test never declares them and the "still real" assertion below would
+  # fail on the entry. They are ledgered in docs/divergences.md instead.
   @vagus_only_mounts %{}
 
   @accepted_mounts %{

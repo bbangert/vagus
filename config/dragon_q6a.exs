@@ -38,3 +38,24 @@ config :vintage_net,
 # which is exactly this board's boot model (EDK2 → GRUB arm64-efi). A custom
 # string would be unknown to that regex and render as an unknown board.
 config :vagus, :machine, "generic-aarch64"
+
+# Where the operator-supplied QNN Hexagon skel is stored (`Vagus.DSP`).
+#
+# Board-specific rather than shared, because unset is the answer for a target
+# with no Hexagon DSP: `status/0` reads `nil` as :unsupported, so rpi3_64 needs
+# no separate capability check.
+#
+# The REAL mount path (`/root`), not the `/data` symlink — this directory is
+# bound into a container as a mount source and runc rejects a symlinked path,
+# the same reason `:addon_data_root` reads the way it does (target.exs:239).
+config :vagus, :dsp_root, "/root/vagus/dsp"
+
+# The Hexagon architecture of this board's DSP (`Vagus.DSP.expected_arch/0`).
+#
+# QCS6490 (Kodiak) is Hexagon v68. Only the admin panel reads it, and only to
+# name the right one of the SDK's seven `hexagon-v*/unsigned/` directories in
+# the operator instructions and to warn when the stored skel is for another
+# version — a skel that does not load makes a DSP add-on fail to start rather
+# than fall back to the CPU silently, so upload time is still the best place
+# to catch it.
+config :vagus, :dsp_arch, "V68"
