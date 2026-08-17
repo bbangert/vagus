@@ -107,10 +107,7 @@ search list and the skel-load code `0x80000406` comes back. So the default list
 resolves **skels**, not merely shells, and `/usr/lib/rfsa/adsp` is a working
 store target.
 
-**Still inherited rather than proven for QNN:** this is fastrpc's loader doing
-the lookup. QNN's skel resolution is believed to go through the same
-`apps_std_fopen_with_env` search, but Phase 6 must confirm it with a real QNN
-load.
+**Confirmed at QNN level too** — see Result 4.
 
 ## Result 2 — `dsp: true` grants no device access, and cannot work without it ❌
 
@@ -161,6 +158,143 @@ treatment despite matching here.
 `Vagus.Addon.Devices` already carries a comment warning that a rule is a device
 number and not a path — this is that hazard arriving for real.
 
+## Result 4 — a real QNN graph ran on the DSP from the store path ✅
+
+Everything above is fastrpc's loader. This is QNN's, and it is the result the
+plan's defining risk rests on.
+
+Built for the occasion, since the SDK ships no runnable model: the example
+`qnn_model_8bit_quantized` (an InceptionV3 conv+relu slice) cross-compiled to
+aarch64, run by the SDK's own `qnn-net-run` against `libQnnHtp.so` in a
+container. The **only** source of the skel was a directory bound at
+`/usr/lib/rfsa/adsp` — exactly where `Manager.dsp_mount/1` binds the Vagus
+store. Device rules were the measured minimum from Result 2.
+
+```
+##### A: skel at /usr/lib/rfsa/adsp #####      ##### B: control, nothing stored #####
+Composing Graphs                                Device Creation failure
+Finalizing Graphs                               EXIT=11
+  Graph Optimizations      (12640 us)           (no output tensor)
+  Graph Sequencing for Target (940 us)
+  VTCM Allocation           (269 us)
+  ====== DDR bandwidth summary ======
+  write_total_bytes=739328 read_total_bytes=309248
+Executing Graphs
+Finished Executing Graphs
+EXIT=0
+--- outputs ---
+InceptionV3_InceptionV3_Conv2d_1a_3x3_Relu_0.raw
+```
+
+VTCM allocation and a DDR-bandwidth summary are Hexagon-side facts — they do
+not exist for a CPU run — and the graph both prepared and **executed**,
+writing a real output tensor.
+
+**This also disposes of the silent-CPU-fallback worry on this path.** There is
+no quiet degradation to detect: with `--backend libQnnHtp.so` and no skel, QNN
+fails at `QnnDevice_create` and exits 11. Removing the skel does not make the
+workload slow, it makes it stop. Silent fallback remains a hazard for
+*frameworks* that wrap QNN with a CPU backend (a TFLite delegate will fall
+back); it is not one for the layout this feature ships.
+
+### Two traps worth recording
+
+**`libQnnHtpV68Stub.so` has a `NEEDED` of `libcdsprpc.so` — with no `.1`.**
+Shipping only the sonamed `libcdsprpc.so.1` makes the stub fail to load, and
+the symptom is a bare `Device Creation failure` with **no DSP-level error at
+all**, at any log level. That is indistinguishable from "no skel" until you
+read the stub's `NEEDED`. An add-on image must carry the unsuffixed name.
+
+**Offline-prepared context binaries did not load** (`Create From Binary
+failure`, exit 16), with and without `O`/`vtcm_mb`/`pd_session` set. On-device
+preparation from the model `.so` worked first time. Unresolved, and out of
+scope — it is a property of the hand-built artifact and of offline/SoC
+matching, not of anything Vagus mounts. Recorded so the next person does not
+read it as a Vagus failure.
+
+## Result 5 — the whole thing, through Vagus, on deployed firmware ✅
+
+Everything above was measured with hand-written container configs. This is the
+shipping path: firmware built from this branch and OTA'd to .58 (0.5.1 →
+0.6.1), and **every DSP mount and device rule below was taken verbatim from
+`Manager.build_spec/2`** rather than written by hand.
+
+`Vagus.DSP` on the board, before anything was stored:
+
+```
+root()          "/root/vagus/dsp"     <- the real path, not the /data symlink
+expected_arch() "V68"
+status()        :not_configured
+```
+
+**Negative, with the store absent** — `Manager.start/2` refuses before the
+engine is ever called, and the message is the deliverable:
+
+```
+{:error, {:dsp_not_configured,
+  "no DSP skeleton library has been supplied — upload one from the QAIRT SDK on the Vagus admin panel"}}
+```
+
+**Storing the real 10,240,928-byte skel** through `Vagus.DSP.store/1`:
+
+```
+filename  "libQnnHtpV68Skel.so"   <- derived from the file's own content
+arch      "V68"     version "2.48.40"     size 10240928
+store dir ["libQnnHtpV68Skel.so"]         <- exactly one file
+cdsp_version()  "CDSP.HT.2.5.c3-00134-KODIAK-1"
+```
+
+**The spec Vagus then emits**, on this board:
+
+```
+/usr/lib/dsp    -> /usr/lib/dsp        ro=true system=true
+/root/vagus/dsp -> /usr/lib/rfsa/adsp  ro=true system=true
+rules: ["c 10:262 rwm", "c 10:263 rwm", "c 251:0 rwm"]
+```
+
+Those minors are **this** board's — the same code emits `10:260`/`10:261` on
+.87. Resolution at create time is doing exactly the work Result 3 said it must.
+
+**A QNN graph run in a container built from that spec:**
+
+```
+--- skel visible at the spec target ---
+-rw------- 1 root root 10240928 libQnnHtpV68Skel.so      <- via Vagus's own mount
+--- shells visible ---
+example_image.so  fastrpc_shell_3  fastrpc_shell_unsigned_3
+Composing Graphs / Finalizing Graphs
+  Graph Optimizations (11371 us)   VTCM Allocation (240 us)
+  ====== DDR bandwidth summary ======  write=739328 read=309248
+Executing Graphs
+Finished Executing Graphs
+EXIT=0
+--- output tensor ---
+InceptionV3_InceptionV3_Conv2d_1a_3x3_Relu_0.raw
+```
+
+**OTA survival.** A second OTA, then `wall_clock` = 124 s confirming the board
+really rebooted rather than no-op'd:
+
+```
+status() {:configured, %{..., stored_at: ~U[2026-08-17 00:20:42Z]}}
+```
+
+`stored_at` is the **pre-OTA** timestamp, so this is the same file rather than
+a re-created one — which is the whole reason the store lives on `/data`.
+
+**`rpi3_64` regression**, also OTA'd (.149):
+
+```
+{root: nil, expected_arch: nil, status: :unsupported, cdsp_version: nil}
+ssh_facts()  {:ok, "ed25519", "SHA256:M2w00x…"}
+```
+
+`cdsp_version/0` returning `nil` rather than raising is the case worth naming:
+that board has no `cdsp` remoteproc for the sysfs walk to find. The SSH section
+still resolves, so the page renders 200 rather than the 503 a degraded
+`SSHAccess` produces. Core, ESPHome, SSH and matter-server all running on both
+boards afterwards.
+
 ## Consequences for the plan
 
 1. **Phase 0 answers B**, but the delta is smaller than the plan budgeted: two
@@ -172,6 +306,9 @@ number and not a path — this is that hazard arriving for real.
    missing skel. PR #29 is still open, so the gate caught it before it shipped
    — which is the outcome a gate exists for. It answered a design question and
    found a bug on the way.
-4. **Phase 6 still owes a QNN-level run.** This gate proves the fastrpc
-   mechanism and the layout; it does not prove QNN's skel lookup uses the same
-   search path, and it says nothing about silent CPU fallback.
+4. ~~**Phase 6 still owes a QNN-level run.**~~ **Delivered — Result 4.** A real
+   QNN graph prepared and executed on the DSP with the skel supplied only from
+   `/usr/lib/rfsa/adsp`, and the no-skel control failed outright rather than
+   degrading. What Phase 6 still owes is the *Vagus-mediated* path: the same
+   thing driven through the panel upload and `dsp: true` on deployed firmware,
+   plus OTA survival and the `rpi3_64` regression.

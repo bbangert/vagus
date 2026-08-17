@@ -95,3 +95,77 @@ unresolved step (unreadable mount table, a mount sysfs cannot map, a malformed
 failed to resolve is exactly where the system partition would hide.
 
 Character devices are unaffected, matching upstream's block-only check.
+
+---
+
+## `dsp:` — a config key, two host mounts, and an operator setup step, none with upstream precedent
+
+This is the largest divergence in the ledger, and it is three at once: a schema
+key upstream does not have, host mounts of vendor accelerator libraries
+upstream has no analogue for, and a **post-install step a human must perform**
+— something upstream's add-on model has nowhere to put.
+
+**Upstream:** no equivalent. `_SCHEMA_ADDON_CONFIG` has no accelerator key, and
+the Supervisor never host-mounts vendor runtime libraries into an add-on. The
+closest thing in spirit is `kernel_modules`, which exists for the same reason
+this does — a payload that must match the running system image and therefore
+cannot be baked into an add-on image.
+
+**Vagus:** `dsp: true` grants an add-on access to the Qualcomm Hexagon DSP via
+two read-only binds and two device cgroup rules.
+
+**Why it cannot be an add-on image instead.** Two payloads, two owners:
+
+| payload | owner | why it cannot live in the add-on image |
+|---|---|---|
+| fastrpc shells (`/usr/lib/dsp`) | system image | must match the CDSP firmware — the shell embeds `cdsp.mbn`'s `QC_IMAGE_VERSION_STRING` verbatim, and an OTA moves both together |
+| `libQnnHtpV<NN>Skel.so` (the store) | **the operator** | Qualcomm does not permit redistributing it |
+
+The second row is the unusual part and the reason for the setup step. Nothing
+Vagus or an add-on author ships may contain that file, so the only lawful path
+is for the operator to fetch it from the QAIRT SDK themselves. The Vagus admin
+panel takes the upload — chosen because it is already the admin-gated page an
+operator visits for post-install setup (SSH access), and its gate is *stronger*
+than the Supervisor API's supervisor-only.
+
+**Why two mounts and not one composed directory.** `libcdsprpc.so.1` resolves
+both shells and skels along a built-in path *list*
+(`/usr/lib/dsp/cdsp;/usr/lib/dsp/adsp;/usr/lib/rfsa/adsp;/usr/lib/dsp`), so
+they need not share a directory. The store binds at `/usr/lib/rfsa/adsp` — on
+that list, and never populated by the system image, so the two binds cannot
+collide. Composing a directory was the alternative and would have meant
+re-composing whenever an OTA replaced the shells under a store the operator
+never touched.
+
+**Why device rules are part of the flag.** The binds alone reach nothing.
+Vagus binds the whole host `/dev` into every container, so the fastrpc nodes
+are *visible* without any grant — but visibility is not access, and without
+rules the container dies at `ERROR 0x68: memory alloc failed` before fastrpc is
+reached. Measured minimum: `/dev/fastrpc-cdsp-secure` and
+`/dev/dma_heap/system`. Note **not** `/dev/fastrpc-cdsp` — granting that one
+instead fails identically to granting nothing, because "secure" names the
+channel and is orthogonal to the signed/unsigned protection domain. Both are
+resolved by stat at container-create time, never as literals: they are misc
+devices with dynamically allocated minors, measured `10:262` on one
+`dragon_q6a` and `10:260` on another the same day.
+
+**Why a missing skel fails the start rather than degrading.** Both mounts carry
+`system: true`, so `ensure_mount_sources/1` never creates them. An empty bind
+would be an add-on that starts, falls back to CPU for the whole session, and
+reports success forever. `ensure_dsp_store/1` turns the refusal into a sentence
+naming the panel; the engine remains the backstop.
+
+**Inert on `rpi3_64`**, where `:dsp_root` is unset — `Vagus.DSP.status/0`
+reports `:unsupported`, the panel section says so and offers no form, and no
+mount or rule is emitted.
+
+All of the above is measured, not reasoned: see
+[`device-gate-dsp-2026-08-16.md`](device-gate-dsp-2026-08-16.md), including a
+real QNN graph preparing and executing on the DSP with the skel supplied only
+from the store path, and the no-skel control failing outright.
+
+**Not machine-checked by `container_fingerprint_test.exs`.** Its
+`@vagus_only_mounts` ledger compares against a fixture captured from a real
+Supervisor add-on, which has no `dsp:` — so these two mounts never appear in
+that spec and cannot be registered there without failing its "each declared
+divergence is still real" assertion. They are ledgered here instead.
