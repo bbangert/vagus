@@ -23,6 +23,14 @@ defmodule Vagus.Network do
   @ip_range "172.30.33.0/24"
   @prefix "23"
 
+  @loopback {127, 0, 0, 1}
+
+  # A loopback connect either completes or is refused within a syscall — no
+  # network hop, no ARP, no route. The timeout only exists so a *dropped*
+  # (rather than refused) SYN can't stall an ingress request for the OS
+  # connect timeout.
+  @loopback_probe_timeout_ms 250
+
   @anchors %{
     gateway: "172.30.32.1",
     supervisor: "172.30.32.2",
@@ -40,6 +48,10 @@ defmodule Vagus.Network do
   @spec anchors() :: %{atom() => String.t()}
   def anchors, do: @anchors
 
+  @doc "The bridge gateway (`172.30.32.1`) — the host's own address on the `hassio` bridge."
+  @spec gateway() :: String.t()
+  def gateway, do: @anchors.gateway
+
   @doc "Supervisor's bridge IP (`172.30.32.2`) — where bridged containers reach the emulator."
   @spec supervisor_ip() :: String.t()
   def supervisor_ip, do: @anchors.supervisor
@@ -47,6 +59,49 @@ defmodule Vagus.Network do
   @doc "The DNS server IP (`172.30.32.3`) — erldns, injected as containers' nameserver."
   @spec dns_ip() :: String.t()
   def dns_ip, do: @anchors.dns
+
+  @doc """
+  Which host address a `host_network: true` add-on's `port` is reached on:
+  loopback when something is listening there, the bridge gateway otherwise.
+
+  Upstream (`docker/app.py`) answers the gateway unconditionally for these
+  add-ons, and has no alternative — its Supervisor is itself a container on
+  the bridge, where loopback is that container's own. Vagus's supervisor is
+  the host BEAM process, so loopback is genuinely available to it and is
+  strictly more local. It has to be preferred, because the two addresses are
+  not interchangeable to the add-ons themselves (both device-observed):
+
+    * ESPHome listens on `0.0.0.0` but refuses anything that did not arrive
+      on loopback with a `403` — reproduced with and without the anchor bind,
+      with `Host` rewritten, and with `X-HA-Ingress`/`X-Ingress-Path`/
+      `X-Hass-Source`/`X-Forwarded-For` set. Only the peer address unlocks it.
+    * Music Assistant binds its ingress port to the gateway alone
+      (`0.0.0.0` for its LAN UI, gateway-only for ingress — deliberately
+      keeping ingress off the LAN), so loopback is refused outright.
+
+  Hence a connect decides, and **only** a connection-level failure falls back:
+  an add-on answering `403`/`404`/`500` on loopback has connected, and that
+  status is its answer rather than evidence of a wrong address.
+
+  Deliberately uncached: the fallback path costs one refused loopback connect
+  (a syscall, no network hop), while a cached answer goes stale the moment an
+  add-on rebinds or restarts — and a stale answer here is a 502 for the whole
+  panel.
+  """
+  @spec host_network_ip(:inet.port_number()) :: String.t()
+  def host_network_ip(port) do
+    # `active: false` so a chatty add-on's greeting can never land in the
+    # mailbox of whatever process is deciding — on the ingress path that's
+    # Bandit's own connection handler.
+    case :gen_tcp.connect(@loopback, port, [active: false], @loopback_probe_timeout_ms) do
+      {:ok, socket} ->
+        :gen_tcp.close(socket)
+        format_ip(@loopback)
+
+      {:error, _refused_or_unreachable} ->
+        gateway()
+    end
+  end
 
   @doc """
   Socket options that make an outbound connection *originate from* the
@@ -76,12 +131,11 @@ defmodule Vagus.Network do
   `source_bind_opts/0`, narrowed to the destination being dialled: `[]` for a
   loopback destination, the anchor bind for anything else.
 
-  A `host_network: true` add-on has no `hassio` bridge address at all — its
-  ingress port is bound on the host itself, so
-  `Vagus.API.IngressProxy.resolve_ip/2` resolves it to `127.0.0.1`. Binding a
-  *non-loopback* source for a *loopback* destination makes the add-on see a
-  peer that isn't local, and an add-on that filters on that refuses the
-  request.
+  A `host_network: true` add-on has no `hassio` bridge address at all — it is
+  reached on the host itself, on loopback whenever it listens there
+  (`host_network_ip/1`). Binding a *non-loopback* source for a *loopback*
+  destination makes the add-on see a peer that isn't local, and an add-on
+  that filters on that refuses the request.
 
   Device-observed on the rpi3, 2026-07-29, against ESPHome's device builder
   (`host_network: true`): byte-identical requests to `127.0.0.1:63642` got

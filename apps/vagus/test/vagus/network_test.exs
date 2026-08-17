@@ -144,6 +144,28 @@ defmodule Vagus.NetworkTest do
     end
   end
 
+  describe "host_network_ip/1 (which host address a host_network add-on answers on)" do
+    # Hermetic on purpose: `172.30.32.1` doesn't exist on a CI host, so the
+    # fallback case asserts the *decision*, never a connection to it.
+    test "a listening loopback port resolves to loopback" do
+      {:ok, listen} = :gen_tcp.listen(0, [:binary, ip: {127, 0, 0, 1}, active: false])
+      on_exit(fn -> :gen_tcp.close(listen) end)
+      {:ok, port} = :inet.port(listen)
+
+      assert Network.host_network_ip(port) == "127.0.0.1"
+    end
+
+    test "a refused loopback port falls back to the bridge gateway" do
+      # Bound then closed, so the port is real, unused, and refuses rather
+      # than being some unrelated service a fixed number might have hit.
+      {:ok, listen} = :gen_tcp.listen(0, [:binary, ip: {127, 0, 0, 1}, active: false])
+      {:ok, port} = :inet.port(listen)
+      :ok = :gen_tcp.close(listen)
+
+      assert Network.host_network_ip(port) == Network.gateway()
+    end
+  end
+
   describe "parse_ip/1 + format_ip/1 (shared by every address config key)" do
     test "parses strings and passes tuples through" do
       assert Network.parse_ip("172.30.32.2") == {:ok, {172, 30, 32, 2}}
@@ -187,6 +209,7 @@ defmodule Vagus.NetworkTest do
                observer: "172.30.32.6"
              }
 
+      assert Network.gateway() == "172.30.32.1"
       assert Network.supervisor_ip() == "172.30.32.2"
       assert Network.dns_ip() == "172.30.32.3"
       assert Network.name() == "hassio"

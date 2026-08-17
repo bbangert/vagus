@@ -67,6 +67,16 @@ defmodule Vagus.Addon.Watchdog.ProbeTest do
     start_supervised!({Probe, Keyword.merge([name: name, interval: 3_600_000], opts)})
   end
 
+  # A `:probe_fun` that reports the spec it was handed (`[HOST]` already
+  # substituted) back to the test, so the default `:host_ip_fun`'s decision is
+  # observable without dialling anything.
+  defp probe_spy(pid) do
+    fn spec ->
+      send(pid, {:spec, spec})
+      :healthy
+    end
+  end
+
   defp eventually(fun, attempts \\ 200) do
     Enum.reduce_while(1..attempts, false, fn _, _ ->
       if fun.() do
@@ -499,6 +509,65 @@ defmodule Vagus.Addon.Watchdog.ProbeTest do
       send(pid, :tick)
       send(pid, :tick)
       refute_receive {:restart, ^slug}, 200
+    end
+  end
+
+  ## 9: default :host_ip_fun (no injected one) — must reach the identical
+  ## loopback-or-gateway verdict `Vagus.API.IngressProxy.resolve_ip/3` does,
+  ## or a host-networked add-on bound only to the gateway is probed on
+  ## loopback, looks dead every tick, and gets restart-looped.
+
+  describe "default host_ip_fun (host_network add-ons, hermetic)" do
+    test "resolves loopback when the watchdog port listens there", %{state_pid: state_pid} do
+      {:ok, listen} = :gen_tcp.listen(0, [:binary, ip: {127, 0, 0, 1}, active: false])
+      on_exit(fn -> :gen_tcp.close(listen) end)
+      {:ok, port} = :inet.port(listen)
+      slug = unique_slug("probe")
+
+      seed(state_pid, slug, :started, true, %{
+        "host_network" => true,
+        "watchdog" => "tcp://[HOST]:#{port}"
+      })
+
+      pid = start_probe(state: state_pid, manager: FakeManager, probe_fun: probe_spy(self()))
+      send(pid, :tick)
+
+      assert_receive {:spec, %{host: "127.0.0.1", port: ^port}}, 500
+    end
+
+    test "falls back to the bridge gateway when loopback refuses", %{state_pid: state_pid} do
+      # `172.30.32.1` doesn't exist on a CI host; the injected `:probe_fun`
+      # means it is never dialled, only decided upon.
+      {:ok, listen} = :gen_tcp.listen(0, [:binary, ip: {127, 0, 0, 1}, active: false])
+      {:ok, port} = :inet.port(listen)
+      :ok = :gen_tcp.close(listen)
+      slug = unique_slug("probe")
+
+      seed(state_pid, slug, :started, true, %{
+        "host_network" => true,
+        "watchdog" => "tcp://[HOST]:#{port}"
+      })
+
+      pid = start_probe(state: state_pid, manager: FakeManager, probe_fun: probe_spy(self()))
+      send(pid, :tick)
+
+      gateway = Vagus.Network.gateway()
+      assert_receive {:spec, %{host: ^gateway, port: ^port}}, 500
+    end
+
+    test "a bridge-mode add-on still resolves through the container lookup", %{
+      state_pid: state_pid
+    } do
+      slug = unique_slug("probe")
+      seed(state_pid, slug, :started, true, %{"watchdog" => "tcp://[HOST]:1234"})
+
+      pid = start_probe(state: state_pid, manager: FakeManager, probe_fun: probe_spy(self()))
+      send(pid, :tick)
+
+      # No `addon_<slug>` container exists, so the inspect fails and the tick
+      # is skipped — proving the host-address shortcut wasn't taken.
+      refute_receive {:spec, _}, 200
+      refute_receive {:restart, ^slug}, 100
     end
   end
 

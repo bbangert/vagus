@@ -191,7 +191,7 @@ defmodule Vagus.API.IngressProxy do
 
       {:ok, entry} ->
         with {:ok, port} <- resolve_port(entry),
-             {:ok, ip} <- resolve_ip(slug, entry) do
+             {:ok, ip} <- resolve_ip(slug, entry, port) do
           {:ok, {ip, port}}
         end
     end
@@ -208,13 +208,17 @@ defmodule Vagus.API.IngressProxy do
 
   defp resolve_port(_entry), do: {:error, :no_ingress_port}
 
-  # A `host_network: true` add-on (e.g. ESPHome) has no `hassio` bridge IP —
-  # its ingress port is bound on the host itself, i.e. this emulator's
-  # loopback. Same rule as `Vagus.Addon.Watchdog.Probe`'s default
-  # `:host_ip_fun` (§B7).
-  defp resolve_ip(_slug, %{config: %{host_network: true}}), do: {:ok, "127.0.0.1"}
+  # A `host_network: true` add-on has no `hassio` bridge IP — it binds on the
+  # host itself — but *which* host address it answers on differs per add-on
+  # (ESPHome: loopback only; Music Assistant: gateway only), so the ingress
+  # port decides: `Vagus.Network.host_network_ip/1`. Same rule, same helper,
+  # as `Vagus.Addon.Watchdog.Probe`'s default `:host_ip_fun` (§B7) — a
+  # watchdog that disagreed with this would probe a live add-on dead and
+  # restart-loop it.
+  defp resolve_ip(_slug, %{config: %{host_network: true}}, port),
+    do: {:ok, Network.host_network_ip(port)}
 
-  defp resolve_ip(slug, _entry) do
+  defp resolve_ip(slug, _entry, _port) do
     id = "addon_#{slug}"
 
     with {:ok, %{"NetworkSettings" => %{"Networks" => networks}}} <-
@@ -411,8 +415,10 @@ defmodule Vagus.API.IngressProxy do
     end
   end
 
-  # A loopback destination is a `host_network: true` add-on (`resolve_ip/2`),
-  # which must be dialled without the anchor bind.
+  # Only a `host_network: true` add-on that listens on loopback resolves there
+  # (`resolve_ip/3`), and it must be dialled without the anchor bind.
+  # Everything else — bridge add-ons, and a host-networked add-on answering on
+  # the gateway instead — keeps it.
   defp finch_for(ip), do: if(Network.loopback?(ip), do: @local_finch, else: @finch)
 
   # [DEVIATION from the task brief's stated premise]: `path_info` segments

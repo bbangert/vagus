@@ -32,9 +32,9 @@ defmodule Vagus.Addon.Watchdog.Probe do
 
   Like `Vagus.Addon.Watchdog`'s own third suppression, this module stands
   down entirely while a host shutdown is actually in progress. A stopped
-  `host_network` add-on resolves `host_ip_fun` to `127.0.0.1` same as ever
-  (there's no "container gone" signal for host-networked add-ons the way
-  there is for bridge-mode ones — see "Host-IP resolution failure" above),
+  `host_network` add-on still resolves `host_ip_fun` to a host address same
+  as ever (there's no "container gone" signal for host-networked add-ons the
+  way there is for bridge-mode ones — see "Host-IP resolution failure" above),
   so every probe against it during `Vagus.Host.Shutdown`'s stop stage would
   strike `:unhealthy` and, after two ticks, fire exactly the restart this
   whole facade exists to prevent — see `Vagus.Host.Shutdown`'s moduledoc
@@ -116,11 +116,11 @@ defmodule Vagus.Addon.Watchdog.Probe do
       3xx usually means "fine" everywhere else). Any timeout/connect
       error/exception is `:unhealthy`.
     * `:host_ip_fun` — arity-1 `slug -> {:ok, ip} | :error`. Default: for a
-      `host_network: true` add-on, `{:ok, "127.0.0.1"}` — this emulator
-      process is itself host-networked, so `localhost` reaches a
-      host-networked add-on's published ports the same way real
-      Supervisor's `self.ip_address` resolves to the host/gateway for such
-      add-ons. For a bridge-mode add-on, inspects `"addon_" <> slug` via
+      `host_network: true` add-on, whichever host address its watchdog port
+      actually answers on — loopback if it listens there, else the bridge
+      gateway (`Vagus.Network.host_network_ip/1`, the same helper the ingress
+      proxy resolves through, deliberately). For a bridge-mode add-on,
+      inspects `"addon_" <> slug` via
       `Vagus.Runtime.Docker.inspect_container/1` and reads its
       `NetworkSettings.Networks[Vagus.Network.name()].IPAddress` — the same
       lookup `Vagus.Addon.Manager.register_dns/3` already does for DNS
@@ -420,22 +420,37 @@ defmodule Vagus.Addon.Watchdog.Probe do
 
   ## Default :host_ip_fun
 
-  # host_network add-ons publish their ports on the host itself; this
-  # emulator process is host-networked too, so localhost reaches them the
-  # same way real Supervisor's ip_address resolves to the host/gateway for
-  # such add-ons (§B7.2's watchdog host_network branch, applied one level
-  # up — at IP resolution rather than port lookup — since there's no bridge
-  # IP to speak of at all for these).
+  # host_network add-ons publish their ports on the host itself, and this
+  # emulator process is host-networked too — but loopback and the bridge
+  # gateway are not interchangeable to the add-ons (see
+  # `Vagus.Network.host_network_ip/1`), so the probed port decides. That must
+  # be the identical decision `Vagus.API.IngressProxy.resolve_ip/3` makes:
+  # an add-on bound only to the gateway, probed on loopback, looks dead every
+  # tick and gets restart-looped forever. (§B7.2's watchdog host_network
+  # branch, applied one level up — at IP resolution rather than port lookup —
+  # since there's no bridge IP to speak of at all for these.)
   defp default_host_ip_fun(slug, state_server) do
     case State.get(slug, state_server) do
-      {:ok, %{config: %{host_network: true}}} ->
-        {:ok, "127.0.0.1"}
+      {:ok, %{config: %{host_network: true} = config, user_options: options}} ->
+        {:ok, host_network_ip(config, options)}
 
       {:ok, _entry} ->
         bridge_ip(slug)
 
       :error ->
         :error
+    end
+  end
+
+  # The port about to be probed comes from the same template `probe_slug/4`
+  # renders a moment later; the `[HOST]` passed here is discarded, only the
+  # §B7.2 port asymmetry matters. A missing or unparseable template is
+  # `probe_slug/4`'s own skip to log, and the address returned here is then
+  # never dialled — upstream's unconditional gateway answer stands in.
+  defp host_network_ip(config, options) do
+    case config.watchdog && ProbeURL.watchdog_spec(config.watchdog, config, options, "") do
+      {:ok, %{port: port}} -> Network.host_network_ip(port)
+      _no_probable_port -> Network.gateway()
     end
   end
 

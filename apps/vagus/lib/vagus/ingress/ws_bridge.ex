@@ -477,8 +477,8 @@ defmodule Vagus.Ingress.WSBridge.Upstream do
       protocols: [:http1],
       # Same source-address rule as the plain-HTTP leg: a bridge add-on that
       # filters on client IP expects the supervisor anchor .2, not the bridge
-      # gateway .1 — but a `host_network: true` add-on is reached on loopback,
-      # where binding .2 makes it see a non-local peer and refuse. Keyed on
+      # gateway .1 — but a `host_network: true` add-on reached on loopback
+      # sees a non-local peer if .2 is bound, and refuses. Keyed on
       # the destination, so both hold (`Vagus.Network.source_bind_opts/1`).
       # `send_timeout`/`send_timeout_close` (issue #37) are appended rather
       # than folded into that helper — they're unconditional, not
