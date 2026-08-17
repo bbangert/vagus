@@ -33,6 +33,16 @@ env:
   OTP_VERSION: "29.0.3"
   ELIXIR_VERSION: "1.20.2-otp-29"
   MIX_ENV: prod
+  # Pinned, because this archive decides whether artifacts get downloaded at
+  # all. 1.17.0 (2026-08-10) split alias injection into Nerves 1.x and 2.x
+  # paths, and only the 1.x path appends `nerves.deps.get` — the task that
+  # fetches prebuilt toolchain/system artifacts. On this umbrella 1.17.0 takes
+  # the other path, so `mix deps.get` succeeds, downloads no toolchain, and
+  # `mix firmware` then dies with "the following Nerves packages need to be
+  # built" for every target. 0.6.1 released fine on 1.16.0 the day before
+  # 1.17.0 shipped; nothing in this repo changed. Floating it also made the
+  # release build unreproducible while OTP and Elixir beside it were pinned.
+  NERVES_BOOTSTRAP_VERSION: "1.16.0"
   # The nerves_system_vagus release that provides the prebuilt system
   # artifacts AND the source ref the path deps are checked out at — the
   # artifact checksum is computed from the checked-out source, so these two
@@ -124,7 +134,7 @@ jobs:
         run: |
           mix local.hex --force
           mix local.rebar --force
-          mix archive.install hex nerves_bootstrap --force
+          mix archive.install hex nerves_bootstrap "$NERVES_BOOTSTRAP_VERSION" --force
 
       - name: Fetch deps
         run: mix deps.get
