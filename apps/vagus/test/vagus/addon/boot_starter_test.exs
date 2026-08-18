@@ -11,6 +11,8 @@ defmodule Vagus.Addon.BootStarterTest do
   """
   use ExUnit.Case, async: false
 
+  import ExUnit.CaptureLog
+
   alias Vagus.Addon.{Backend.Fake, BootStarter, Config, State}
 
   setup do
@@ -73,6 +75,11 @@ defmodule Vagus.Addon.BootStarterTest do
     config
   end
 
+  defp forward_forever(parent) do
+    receive do: (message -> send(parent, {:listener_got, message}))
+    forward_forever(parent)
+  end
+
   # Retries `fun` (a 0-arity predicate) until it returns truthy or `attempts`
   # is exhausted — the polling GenServer under test does its work on its own
   # process/timer, so assertions can't just run once right after start.
@@ -107,7 +114,12 @@ defmodule Vagus.Addon.BootStarterTest do
 
     start_supervised!(
       {BootStarter,
-       ping: ping, ensure_network: fn -> :ok end, interval: 1, max_attempts: 20, name: nil}
+       api_ready: fn -> true end,
+       ping: ping,
+       ensure_network: fn -> :ok end,
+       interval: 1,
+       max_attempts: 20,
+       name: nil}
     )
 
     assert eventually(fn -> match?({:ok, %{state: :started}}, State.get(slug)) end)
@@ -130,6 +142,7 @@ defmodule Vagus.Addon.BootStarterTest do
 
     start_supervised!(
       {BootStarter,
+       api_ready: fn -> true end,
        ping: fn -> :ok end,
        ensure_network: ensure_network,
        interval: 1,
@@ -166,7 +179,12 @@ defmodule Vagus.Addon.BootStarterTest do
 
     start_supervised!(
       {BootStarter,
-       ping: fn -> :ok end, ensure_network: fn -> :ok end, interval: 1, max_attempts: 5, name: nil}
+       api_ready: fn -> true end,
+       ping: fn -> :ok end,
+       ensure_network: fn -> :ok end,
+       interval: 1,
+       max_attempts: 5,
+       name: nil}
     )
 
     assert eventually(fn -> match?({:ok, %{state: :stopped}}, State.get(slug)) end)
@@ -180,7 +198,12 @@ defmodule Vagus.Addon.BootStarterTest do
 
     start_supervised!(
       {BootStarter,
-       ping: fn -> :ok end, ensure_network: fn -> :ok end, interval: 1, max_attempts: 5, name: nil}
+       api_ready: fn -> true end,
+       ping: fn -> :ok end,
+       ensure_network: fn -> :ok end,
+       interval: 1,
+       max_attempts: 5,
+       name: nil}
     )
 
     assert eventually(fn -> match?({:ok, %{state: :stopped}}, State.get(slug)) end)
@@ -204,7 +227,12 @@ defmodule Vagus.Addon.BootStarterTest do
 
     start_supervised!(
       {BootStarter,
-       ping: fn -> :ok end, ensure_network: fn -> :ok end, interval: 1, max_attempts: 5, name: nil}
+       api_ready: fn -> true end,
+       ping: fn -> :ok end,
+       ensure_network: fn -> :ok end,
+       interval: 1,
+       max_attempts: 5,
+       name: nil}
     )
 
     assert eventually(fn -> match?({:ok, %{state: :stopped}}, State.get(manual_slug)) end)
@@ -221,7 +249,12 @@ defmodule Vagus.Addon.BootStarterTest do
 
     start_supervised!(
       {BootStarter,
-       ping: fn -> :ok end, ensure_network: fn -> :ok end, interval: 1, max_attempts: 5, name: nil}
+       api_ready: fn -> true end,
+       ping: fn -> :ok end,
+       ensure_network: fn -> :ok end,
+       interval: 1,
+       max_attempts: 5,
+       name: nil}
     )
 
     assert eventually(fn -> match?({:ok, %{state: :started}}, State.get(slug)) end)
@@ -235,7 +268,12 @@ defmodule Vagus.Addon.BootStarterTest do
 
     start_supervised!(
       {BootStarter,
-       ping: fn -> :ok end, ensure_network: fn -> :ok end, interval: 1, max_attempts: 5, name: nil}
+       api_ready: fn -> true end,
+       ping: fn -> :ok end,
+       ensure_network: fn -> :ok end,
+       interval: 1,
+       max_attempts: 5,
+       name: nil}
     )
 
     assert eventually(fn -> match?({:ok, %{state: :stopped}}, State.get(slug)) end)
@@ -249,6 +287,7 @@ defmodule Vagus.Addon.BootStarterTest do
     pid =
       start_supervised!(
         {BootStarter,
+         api_ready: fn -> true end,
          ping: fn -> :ok end,
          ensure_network: fn -> :ok end,
          interval: 1,
@@ -269,7 +308,12 @@ defmodule Vagus.Addon.BootStarterTest do
     seed(slug, :started, fixture_config(slug, %{"boot" => "auto"}))
 
     start_supervised!(
-      {BootStarter, ping: fn -> {:error, :nope} end, interval: 1, max_attempts: 3, name: nil}
+      {BootStarter,
+       api_ready: fn -> true end,
+       ping: fn -> {:error, :nope} end,
+       interval: 1,
+       max_attempts: 3,
+       name: nil}
     )
 
     # 3 attempts * 1ms interval should exhaust well within this budget.
@@ -277,5 +321,176 @@ defmodule Vagus.Addon.BootStarterTest do
 
     assert {:ok, %{state: :started}} = State.get(slug)
     assert Fake.calls_for("addon_#{slug}") == []
+  end
+
+  # The HA base image's s6 init calls /addons/self/info before the add-on's
+  # own service; a refused connection kills the container for the rest of the
+  # boot, so reconciliation waits for the API as well as the engine.
+  describe "the API gate" do
+    test "no add-on is started while the API is not accepting, and one is once it flips" do
+      slug = "boot_api_gate_#{System.unique_integer([:positive])}"
+      seed(slug, :started, fixture_config(slug, %{"boot" => "auto"}))
+
+      {:ok, accepting} = Agent.start_link(fn -> false end)
+
+      start_supervised!(
+        {BootStarter,
+         ping: fn -> :ok end,
+         api_ready: fn -> Agent.get(accepting, & &1) end,
+         ensure_network: fn -> :ok end,
+         interval: 1,
+         max_attempts: 500,
+         name: nil}
+      )
+
+      # No backend call at all: the reconcile pass that would create/start
+      # this add-on has not run while the probe says the API is closed.
+      Process.sleep(30)
+      assert Fake.calls_for("addon_#{slug}") == []
+
+      Agent.update(accepting, fn _ -> true end)
+
+      assert eventually(fn -> {:create, "addon_#{slug}"} in Fake.calls() end)
+      assert eventually(fn -> match?({:ok, %{state: :started}}, State.get(slug)) end)
+    end
+
+    test "the anchors are bound while the API wait is still running" do
+      parent = self()
+      slug = "boot_api_anchor_#{System.unique_integer([:positive])}"
+      seed(slug, :started, fixture_config(slug, %{"boot" => "manual"}))
+
+      # Deferring ensure_network behind the API wait would deadlock: the
+      # listener binds 172.30.32.2, which only exists once this has run.
+      start_supervised!(
+        {BootStarter,
+         ping: fn -> :ok end,
+         api_ready: fn -> false end,
+         ensure_network: fn -> send(parent, :ensured) end,
+         interval: 1,
+         max_attempts: 500,
+         name: nil}
+      )
+
+      assert_receive :ensured, 500
+      # ...and the manual entry is still :started, i.e. reconcile did not run.
+      assert {:ok, %{state: :started}} = State.get(slug)
+    end
+
+    test "an API that never accepts gives up with its own warning, distinct from the engine's" do
+      slug = "boot_api_never_#{System.unique_integer([:positive])}"
+      seed(slug, :started, fixture_config(slug, %{"boot" => "auto"}))
+
+      log =
+        capture_log(fn ->
+          start_supervised!(
+            {BootStarter,
+             ping: fn -> :ok end,
+             api_ready: fn -> false end,
+             ensure_network: fn -> :ok end,
+             interval: 1,
+             max_attempts: 3,
+             name: nil}
+          )
+
+          Process.sleep(100)
+        end)
+
+      assert log =~ "Supervisor API not accepting connections after 3 attempts"
+      refute log =~ "engine not ready"
+      assert {:ok, %{state: :started}} = State.get(slug)
+      assert Fake.calls_for("addon_#{slug}") == []
+    end
+
+    test "the listener is nudged the moment the anchor is bound" do
+      parent = self()
+
+      # Nothing runs under the listener's name in `mix test`, so standing in
+      # for it here is what proves the nudge is actually sent — and sent with
+      # the anchor already up, since ensure_network ran first.
+      assert Process.whereis(Vagus.API.Listener) == nil
+
+      fake = spawn_link(fn -> forward_forever(parent) end)
+      Process.register(fake, Vagus.API.Listener)
+
+      start_supervised!(
+        {BootStarter,
+         ping: fn -> :ok end,
+         api_ready: fn -> false end,
+         ensure_network: fn -> send(parent, :ensured) end,
+         interval: 1,
+         max_attempts: 500,
+         name: nil}
+      )
+
+      assert_receive :ensured, 500
+      assert_receive {:listener_got, :retry_listen}, 500
+
+      # Released here rather than in on_exit: the name is global, and the
+      # sibling test asserting nothing holds it may run next.
+      Process.unregister(Vagus.API.Listener)
+    end
+
+    test "reconciliation still happens with nothing listening for the nudge" do
+      slug = "boot_api_no_listener_#{System.unique_integer([:positive])}"
+      seed(slug, :started, fixture_config(slug, %{"boot" => "auto"}))
+
+      # The nudge is an optimisation: with no listener registered it goes
+      # nowhere, and the poll gate alone still has to get add-ons started.
+      assert Process.whereis(Vagus.API.Listener) == nil
+
+      polls = :counters.new(1, [])
+
+      api_ready = fn ->
+        n = :counters.get(polls, 1)
+        :counters.add(polls, 1, 1)
+        n >= 3
+      end
+
+      start_supervised!(
+        {BootStarter,
+         ping: fn -> :ok end,
+         api_ready: api_ready,
+         ensure_network: fn -> :ok end,
+         interval: 1,
+         max_attempts: 500,
+         name: nil}
+      )
+
+      assert eventually(fn -> {:create, "addon_#{slug}"} in Fake.calls() end)
+    end
+
+    test "a slow engine does not spend the API's attempts" do
+      slug = "boot_api_budget_#{System.unique_integer([:positive])}"
+      seed(slug, :started, fixture_config(slug, %{"boot" => "auto"}))
+
+      pings = :counters.new(1, [])
+      api = :counters.new(1, [])
+
+      ping = fn ->
+        n = :counters.get(pings, 1)
+        :counters.add(pings, 1, 1)
+        if n < 4, do: {:error, :not_ready}, else: :ok
+      end
+
+      api_ready = fn ->
+        n = :counters.get(api, 1)
+        :counters.add(api, 1, 1)
+        n >= 4
+      end
+
+      # max_attempts: 5 is exhausted by neither wait alone but would be by
+      # the two sharing one counter.
+      start_supervised!(
+        {BootStarter,
+         ping: ping,
+         api_ready: api_ready,
+         ensure_network: fn -> :ok end,
+         interval: 1,
+         max_attempts: 5,
+         name: nil}
+      )
+
+      assert eventually(fn -> {:create, "addon_#{slug}"} in Fake.calls() end)
+    end
   end
 end

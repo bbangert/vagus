@@ -71,6 +71,12 @@ defmodule Vagus.API.Listener do
   # without a warning every 5s for the rest of uptime.
   @loud_every 12
 
+  # `accepting?/1` only ever probes an address on this host, where the kernel
+  # answers at once with a handshake or ECONNREFUSED; the timeout bounds only
+  # the pathological case (a bridge that is up but wedged), and the caller is
+  # a poll loop, not a request path.
+  @probe_ms 500
+
   @doc """
   Starts the listener manager.
 
@@ -135,6 +141,62 @@ defmodule Vagus.API.Listener do
     case bind_ip(opts) do
       nil -> options
       ip -> Keyword.put(options, :ip, ip)
+    end
+  end
+
+  @doc """
+  Asks the manager named `name` to attempt its bind now instead of at its
+  next `:retry_ms` tick.
+
+  Purely an optimisation, and deliberately one-directional:
+  `Vagus.Addon.BootStarter` knows the instant the anchor this listener binds
+  appears, and without a nudge up to `:retry_ms` of every boot is spent
+  waiting for an attempt that would now succeed. A dropped, raced or ignored
+  signal costs nothing — the retry timer still guarantees the bind and
+  `accepting?/1` still gates anyone waiting on it, so no caller may treat
+  this as the thing that makes the listener ready.
+
+  A name with nothing registered under it (`:host`, `mix test`,
+  `:api_server_enabled` false) is a no-op: there is no listener to hurry.
+  """
+  @spec retry_now(GenServer.name()) :: :ok
+  def retry_now(name \\ __MODULE__) do
+    case GenServer.whereis(name) do
+      nil -> :ok
+      pid -> send(pid, :retry_listen)
+    end
+
+    :ok
+  end
+
+  @doc """
+  Whether the API is accepting connections on its configured bind.
+
+  Proves it by connecting: a live `Vagus.API.Listener` process, or even a
+  registered Bandit, only answers "something exists" — the question callers
+  actually have (`Vagus.Addon.BootStarter`) is whether an add-on's bashio
+  can reach `/addons/self/info` *now*. The bind comes from
+  `bandit_options/1` so the probe cannot drift from what is bound.
+
+  An unset `:api_bind_ip` (`:host`, `mix test`) means Bandit holds the
+  wildcard, which loopback reaches — so that is where the probe connects.
+  """
+  @spec accepting?(keyword()) :: boolean()
+  def accepting?(opts \\ []) do
+    options = bandit_options(opts)
+
+    case :gen_tcp.connect(
+           Keyword.get(options, :ip) || {127, 0, 0, 1},
+           Keyword.fetch!(options, :port),
+           [active: false],
+           @probe_ms
+         ) do
+      {:ok, socket} ->
+        :gen_tcp.close(socket)
+        true
+
+      {:error, _reason} ->
+        false
     end
   end
 

@@ -100,6 +100,78 @@ defmodule Vagus.API.ListenerTest do
     end
   end
 
+  describe "retry_now/1" do
+    test "an unregistered name is a quiet no-op, not an exit" do
+      # :host, mix test and :api_server_enabled false all leave the name free.
+      assert Listener.retry_now(:vagus_listener_never_started) == :ok
+    end
+
+    test "a manager that has not bound yet attempts again immediately" do
+      parent = self()
+
+      starter = fn _sup, _options ->
+        send(parent, :attempt)
+        {:error, :eaddrnotavail}
+      end
+
+      capture_log(fn ->
+        # A retry interval far longer than this test: any second attempt can
+        # only be the nudge, never the timer.
+        manager = start_listener(starter: starter, retry_ms: 60_000, name: nil)
+
+        assert_receive :attempt, 500
+        refute_receive :attempt, 100
+
+        assert Listener.retry_now(manager) == :ok
+        assert_receive :attempt, 500
+      end)
+    end
+
+    test "a manager that is already listening ignores it" do
+      parent = self()
+
+      starter = fn _sup, _options ->
+        send(parent, :attempt)
+        {:ok, spawn(fn -> Process.sleep(:infinity) end)}
+      end
+
+      capture_log(fn ->
+        manager = start_listener(starter: starter, retry_ms: 60_000, name: nil)
+
+        assert_receive :attempt, 500
+        assert Listener.retry_now(manager) == :ok
+        refute_receive :attempt, 200
+      end)
+    end
+  end
+
+  describe "accepting?/1" do
+    # An ephemeral loopback socket, not 172.30.32.2 — that address exists on
+    # a device with the hassio bridge up and nowhere else.
+    test "true against a socket that is listening, false once it is not" do
+      {:ok, socket} = :gen_tcp.listen(0, ip: {127, 0, 0, 1}, active: false)
+      {:ok, port} = :inet.port(socket)
+
+      assert Listener.accepting?(ip: {127, 0, 0, 1}, port: port)
+
+      :ok = :gen_tcp.close(socket)
+      refute Listener.accepting?(ip: {127, 0, 0, 1}, port: port)
+    end
+
+    test "with no :api_bind_ip it probes Bandit's wildcard bind on loopback" do
+      Application.delete_env(:vagus, :api_bind_ip)
+
+      {:ok, socket} = :gen_tcp.listen(0, active: false)
+      {:ok, port} = :inet.port(socket)
+      Application.put_env(:vagus, :api_port, port)
+
+      assert Listener.accepting?()
+
+      :ok = :gen_tcp.close(socket)
+      refute Listener.accepting?()
+    end
+  end
+
   describe "the .2-appears-late race" do
     defp listener_supervisor do
       {:ok, pid} =
