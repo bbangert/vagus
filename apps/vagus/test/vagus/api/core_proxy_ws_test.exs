@@ -436,6 +436,7 @@ defmodule Vagus.API.CoreProxyWSTest do
   @moduletag timeout: 120_000
 
   alias Vagus.Addon.Registry
+  alias Vagus.API.CoreProxy.WSBridge
   alias Vagus.API.CoreProxyWSTest.{Client, CoreAuthScript, DialCounter, FakeCore}
   alias Vagus.API.{Dispatcher, Token}
 
@@ -1148,6 +1149,62 @@ defmodule Vagus.API.CoreProxyWSTest do
 
     assert frame1 == {:text, "one"}
     assert frame2 == {:text, "two"}
+  end
+
+  ## 9. `auth_required` is pushed a message after `init/1` (see `WSBridge`'s
+  ## "Why the prompt is one message late"). The interleaving that deferral
+  ## newly allows — the caller answering before the prompt runs — is driven
+  ## through the callbacks directly rather than by racing a real socket: a
+  ## timing-based version would only sometimes hit the window it claims to
+  ## cover.
+
+  test "the deferred prompt still precedes auth_ok, and nothing prompts again after it", %{
+    proxy_host: host,
+    proxy_port: port
+  } do
+    token = addon_token("cp_ws_prompt_order", %{homeassistant_api: true})
+
+    {:ok, client, _headers} = Client.connect(host, port, "/core/websocket")
+    {{:text, raw}, client} = Client.next_frame(client, @recv_timeout)
+    assert Jason.decode!(raw)["type"] == "auth_required"
+
+    client = Client.send_frame(client, {:text, Jason.encode!(%{"access_token" => token})})
+    {{:text, raw}, client} = Client.next_frame(client, @recv_timeout)
+    assert Jason.decode!(raw)["type"] == "auth_ok"
+
+    # A late prompt would be ordered ahead of this round trip on the same
+    # socket, so `"world"` arriving next is proof there wasn't one.
+    client = Client.send_frame(client, {:text, "hello"})
+    {frame, _client} = Client.next_frame(client, @recv_timeout)
+    assert frame == {:text, "world"}
+  end
+
+  test "a caller that answers before the deferred prompt runs authenticates, and is never prompted" do
+    token = addon_token("cp_ws_prompt_early_auth", %{homeassistant_api: true})
+
+    assert {:ok, state} = WSBridge.init([])
+    assert_receive :push_auth_required, @recv_timeout
+
+    assert {:push, {:text, raw}, state} =
+             WSBridge.handle_in(
+               {Jason.encode!(%{"access_token" => token}), [opcode: :text]},
+               state
+             )
+
+    assert Jason.decode!(raw)["type"] == "auth_ok"
+    assert state.phase == :relaying
+
+    assert WSBridge.handle_info(:push_auth_required, state) == {:ok, state}
+
+    WSBridge.terminate(:normal, state)
+  end
+
+  test "the deferred prompt is a no-op once relaying, and once closing" do
+    relaying = %{phase: :relaying, upstream: nil, ha_version: "2026.7.3", closing?: false}
+    assert WSBridge.handle_info(:push_auth_required, relaying) == {:ok, relaying}
+
+    closing = %{phase: :awaiting_auth, upstream: nil, ha_version: "2026.7.3", closing?: true}
+    assert WSBridge.handle_info(:push_auth_required, closing) == {:ok, closing}
   end
 
   ## fix/ws-1011-flake: `Vagus.API.CoreProxy.WSBridge.Upstream` driven

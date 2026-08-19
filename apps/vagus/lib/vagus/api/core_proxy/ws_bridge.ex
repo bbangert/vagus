@@ -21,10 +21,12 @@ defmodule Vagus.API.CoreProxy.WSBridge do
   OWN auth handshake against the caller itself, over the socket, after the
   upgrade has already completed:
 
-  1. `init/1` pushes `{"type":"auth_required","ha_version":V}` (`V` =
+  1. The caller is sent `{"type":"auth_required","ha_version":V}` (`V` =
      `Vagus.Core.Versions.installed/0`, `nil` → JSON `null` — this only
      happens pre-first-boot; a real device always has an installed Core by
-     the time anything calls this route) and arms a deadline
+     the time anything calls this route) — from the first `handle_info/2`
+     tick, not from `init/1`'s own return; see "Why the prompt is one
+     message late" below. `init/1` arms a deadline
      (`Vagus.API.CoreProxy.ws_auth_timeout_ms/0`, shared with `Upstream`'s
      own Core-side deadline per fact 8's "10s for both").
   2. The caller's first frame is expected to be a JSON object carrying
@@ -44,6 +46,37 @@ defmodule Vagus.API.CoreProxy.WSBridge do
      normal close, no per-attempt logging (same RingLogger-ring discipline
      `Vagus.API.CoreProxy`'s own moduledoc documents for the REST leg — an
      unauthenticated caller can repeat this at will).
+
+  ## Why the prompt is one message late
+
+  Returned as `{:push, ...}` from `WebSock.init/1`, this frame goes missing
+  under CPU starvation: it was observed never to leave the box while the
+  connection stayed healthy (only the 101's bytes ever arrived), and the
+  caller then hung until the deadline closed it with 1011. So `init/1`
+  returns `{:ok, state}` and arms an immediate self-message instead, and the
+  push happens from `handle_info/2`.
+
+  **This is a timing workaround, and the mechanism behind it is not
+  established.** Deferring is what was measured to work — pushing from
+  `init/1` lost the frame on the first starved repeat, deferring survived 31
+  consecutive ones — but it does not make the send any more reportable.
+  Bandit routes both callbacks' returns through the same
+  `handle_continutation/3`, and `Bandit.WebSocket.Socket.send_frame/3`
+  discards `do_send_frame/2`'s result either way, so a failure from
+  `handle_info/2` is exactly as silent as one from `init/1`. Whatever the
+  window is, it closes when the frame is no longer part of the continuation
+  that completes the upgrade — that is an observation about timing, not a
+  claim about error handling.
+
+  Folding this push back into `init/1`'s return reintroduces the loss.
+
+  Being a message late makes an interleaving possible that couldn't happen
+  before: fact 8 lets a caller send its token without waiting for the
+  prompt, and `handle_in/2`'s `:awaiting_auth` clause accepts it, so the
+  phase may already be `:relaying` (or closing) when the deferred message
+  arrives. It is dropped in that case rather than sent late — a prompt for a
+  handshake that already answered itself is worse than no prompt, and a
+  caller that authenticated unprompted has proven it never needed one.
 
   ## `auth_ok` is sent before Core is known to be reachable at all
 
@@ -138,9 +171,12 @@ defmodule Vagus.API.CoreProxy.WSBridge do
 
   @impl WebSock
   @doc """
-  Starts in `:awaiting_auth`: pushes `auth_required` immediately, arms the
-  shared handshake deadline (`CoreProxy.ws_auth_timeout_ms/0`) and the 30s
-  heartbeat. `Process.flag(:trap_exit, true)` runs even though `Upstream`
+  Starts in `:awaiting_auth`, arming three timers and pushing nothing: the
+  `auth_required` prompt as an immediate self-message (see the moduledoc's
+  "Why the prompt is one message late" — returning it as a `{:push, ...}`
+  from here is where Bandit can lose it), the shared handshake deadline
+  (`CoreProxy.ws_auth_timeout_ms/0`), and the 30s heartbeat.
+  `Process.flag(:trap_exit, true)` runs even though `Upstream`
   doesn't exist yet — it will, by the time `:awaiting_auth` ends, and
   arming it up front (same as `Vagus.Ingress.WSBridge.init/1`) means there is
   never a window where a link to `Upstream` could kill this process
@@ -150,12 +186,11 @@ defmodule Vagus.API.CoreProxy.WSBridge do
     Process.flag(:trap_exit, true)
 
     ha_version = Versions.installed()
+    Process.send_after(self(), :push_auth_required, 0)
     Process.send_after(self(), :auth_deadline, CoreProxy.ws_auth_timeout_ms())
     Process.send_after(self(), :heartbeat, @heartbeat_interval_ms)
 
-    state = %{phase: :awaiting_auth, upstream: nil, ha_version: ha_version, closing?: false}
-
-    {:push, {:text, encode(%{"type" => "auth_required", "ha_version" => ha_version})}, state}
+    {:ok, %{phase: :awaiting_auth, upstream: nil, ha_version: ha_version, closing?: false}}
   end
 
   @impl WebSock
@@ -197,6 +232,10 @@ defmodule Vagus.API.CoreProxy.WSBridge do
 
   @impl WebSock
   @doc """
+  `:push_auth_required` fires immediately after `init/1` and carries the
+  handshake prompt (moduledoc, "Why the prompt is one message late");
+  anything but a still-open `:awaiting_auth` means the caller answered
+  before it ran, and the prompt is dropped rather than sent late.
   `:auth_deadline` fires once, 10s (default) after `init/1` — a no-op if
   the caller already authenticated by then. `:heartbeat` repeats every 30s
   (fact 8) for the life of the connection, pushing a `:ping` control frame;
@@ -209,6 +248,13 @@ defmodule Vagus.API.CoreProxy.WSBridge do
   applies here unchanged since `Upstream` produces the identical message
   shapes.
   """
+  def handle_info(:push_auth_required, %{phase: :awaiting_auth, closing?: false} = state) do
+    prompt = encode(%{"type" => "auth_required", "ha_version" => state.ha_version})
+    {:push, {:text, prompt}, state}
+  end
+
+  def handle_info(:push_auth_required, state), do: {:ok, state}
+
   def handle_info(:auth_deadline, %{phase: :awaiting_auth} = state) do
     auth_invalid_and_close(state)
   end
