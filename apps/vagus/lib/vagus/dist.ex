@@ -120,9 +120,6 @@ defmodule Vagus.Dist do
   @retry_max_ms 60_000
   @retry_attempts 10
   @epmd_kill_retry_ms 250
-  # Bounded because these run INSIDE the GenServer: an unbounded wedge would
-  # block status/0 and disable/0, not merely the caller that asked.
-  @epmd_timeout_ms 5_000
 
   @type status :: %{
           alive?: boolean(),
@@ -1244,21 +1241,21 @@ defmodule Vagus.Dist do
   # Not injectable: the binary is `:code.root_dir()`-relative and every
   # argument this module passes is a literal.
   #
-  # MuonTrap rather than `System.cmd/3`, for two reasons that matter here.
-  # `System.cmd/3` cannot be bounded, and these run INSIDE the GenServer — a
-  # wedged epmd blocks the server itself, so the caller's 30s timeout abandons
-  # the `GenServer.call` while `status/0` and `disable/0` stay unavailable
-  # indefinitely. And MuonTrap kills the child rather than orphaning it, which
-  # closing a port does not guarantee. On timeout it answers
-  # `{output, :timeout}`, which the callers treat as a distinct outcome from any
-  # exit status epmd itself produces.
+  # `System.cmd/3` deliberately, NOT MuonTrap. MEASURED on a dragon_q6a:
+  # `MuonTrap.cmd/3` hangs unbounded on `epmd -kill` when there is no daemon to
+  # kill — and its `:timeout` does not fire, though the same option bounds
+  # `sleep 30` on the same board. Because MuonTrap ties the child's lifetime to
+  # the port OWNER, that hang lasts as long as the owning process: harmless in a
+  # short-lived probe, fatal in a GenServer, where it wedged this module and took
+  # the whole application down. Under `System.cmd/3` all four epmd cases are
+  # milliseconds.
+  #
+  # Unbounded is acceptable here only because enabling and disabling are
+  # reboot-gated, so these run once at boot rather than on a call path — see the
+  # moduledoc.
   # sobelow_skip ["CI.System"]
   defp default_epmd(args, env) do
-    MuonTrap.cmd(epmd_path(), args,
-      env: env,
-      stderr_to_stdout: true,
-      timeout: @epmd_timeout_ms
-    )
+    System.cmd(epmd_path(), args, env: env, stderr_to_stdout: true)
   end
 
   defp epmd_path do
