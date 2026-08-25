@@ -166,7 +166,11 @@ defmodule Vagus.DistTest do
     test "mints a 0600 cookie, returns what you need to connect, and reboots", ctx do
       pid = start_dist(ctx)
 
-      assert {:ok, %{cookie: cookie, node: nil, ports: 9100..9105}} = Dist.enable(pid)
+      # The name the board WILL take: after the reboot the session that asked is
+      # gone, so a cookie with nowhere to point it is useless.
+      assert {:ok, %{cookie: cookie, node: :"vagus@192.168.2.58", ports: 9100..9105}} =
+               Dist.enable(pid)
+
       assert String.match?(cookie, ~r/^[0-9a-f]{64}$/)
       assert File.read!(ctx.path) == cookie
       assert mode(ctx.path) == 0o600
@@ -188,6 +192,11 @@ defmodule Vagus.DistTest do
 
       assert {:ok, %{cookie: @cookie, node: :"vagus@192.168.2.58"}} = Dist.enable(pid)
       refute_received {:step, :reboot}
+    end
+
+    test "reports no node name when the board has no reachable address yet", ctx do
+      pid = start_dist(ctx, ifaddrs_fun: fn -> [@loopback] end)
+      assert {:ok, %{node: nil}} = Dist.enable(pid)
     end
 
     test "a cookie problem is reported and nothing reboots", ctx do

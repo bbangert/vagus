@@ -182,7 +182,15 @@ defmodule Vagus.Dist do
     # which is what keeps this call unable to wedge the server.
     case read_or_mint(state) do
       {:ok, cookie} ->
-        reply = %{node: state.node, cookie: cookie, ports: @port_min..@port_max}
+        # The name has to come back NOW: after the reboot the SSH session that
+        # asked is gone, and without it the caller has a cookie and nowhere to
+        # point it.
+        reply = %{
+          node: state.node || planned_node(state),
+          cookie: cookie,
+          ports: @port_min..@port_max
+        }
+
         {:reply, {:ok, reply}, reboot_unless_alive(state)}
 
       {:error, reason} ->
@@ -464,6 +472,15 @@ defmodule Vagus.Dist do
 
   # sobelow_skip ["DOS.BinToAtom"]
   defp node_name(address), do: :"vagus@#{address |> :inet.ntoa() |> to_string()}"
+
+  # What the board will call itself after the reboot. nil only when it has no
+  # reachable address yet — the same condition the boot path retries on.
+  defp planned_node(state) do
+    case address(state) do
+      {:ok, address} -> node_name(address)
+      {:error, _reason} -> nil
+    end
+  end
 
   defp reboot_unless_alive(state) do
     unless state.seams.alive_fun.(), do: state.seams.reboot_fun.()
