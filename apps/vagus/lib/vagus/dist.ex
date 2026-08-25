@@ -120,6 +120,9 @@ defmodule Vagus.Dist do
   @retry_max_ms 60_000
   @retry_attempts 10
   @epmd_kill_retry_ms 250
+  # Bounded because these run INSIDE the GenServer: an unbounded wedge would
+  # block status/0 and disable/0, not merely the caller that asked.
+  @epmd_timeout_ms 5_000
 
   @type status :: %{
           alive?: boolean(),
@@ -705,9 +708,24 @@ defmodule Vagus.Dist do
     with {:ok, ifname, address} <- resolve_address(state),
          :ok <- pin_ports(state),
          :ok <- state.seams.put_env_fun.(:inet_dist_use_interface, address),
-         :ok <- start_epmd(state, address),
-         :ok <- seed_erlang_cookie(state, cookie),
-         name = node_name(address),
+         :ok <- start_epmd(state, address) do
+      finish_bring_up(state, cookie, ifname, address)
+    else
+      {:error, reason} -> {:error, reason}
+      other -> {:error, other}
+    end
+  end
+
+  # Split so the rollback has one boundary: everything below runs with an epmd
+  # THIS module started, and every exit that is not a live node has to put it
+  # back. Otherwise an ordinary failure — an unwritable `$HOME/.erlang.cookie`,
+  # a refused `net_kernel.start` — retries to the 10-attempt give-up and leaves
+  # the last epmd listening on the pinned address forever, on a board whose
+  # `status/0` says there is no node.
+  defp finish_bring_up(state, cookie, ifname, address) do
+    name = node_name(address)
+
+    with :ok <- seed_erlang_cookie(state, cookie),
          {:ok, _pid} <- state.seams.net_kernel_start_fun.(name, %{name_domain: :longnames}),
          :ok <- apply_cookie(state, cookie) do
       advertise(state)
@@ -715,13 +733,25 @@ defmodule Vagus.Dist do
       {:ok, %{state | node: name, address: address, ifname: ifname, drift: nil}}
     else
       # Measured: net_kernel answers this even under a DIFFERENT name, so a
-      # restart that also changed address lands here. Retrying it to the
-      # 10-attempt give-up while status/0 calls a live node down is the
-      # permanent desync this replaces.
+      # restart that also changed address lands here. The node is UP, so epmd
+      # stays — this is the one non-error exit.
       {:error, {:already_started, _pid}} -> reconcile(state, cookie)
-      {:error, reason} -> {:error, reason}
-      other -> {:error, other}
+      {:error, reason} -> roll_back(state, reason)
+      other -> roll_back(state, other)
     end
+  rescue
+    exception ->
+      kill_epmd(state)
+      reraise exception, __STACKTRACE__
+  catch
+    kind, reason ->
+      kill_epmd(state)
+      :erlang.raise(kind, reason, __STACKTRACE__)
+  end
+
+  defp roll_back(state, reason) do
+    kill_epmd(state)
+    {:error, reason}
   end
 
   # `Node.self/0` is authoritative here, not anything this module remembers:
@@ -934,12 +964,32 @@ defmodule Vagus.Dist do
   # prior `enable/0`, possibly at a different address; the node is not alive
   # (checked above), so `-kill` should be accepted.
   defp clear_foreign_epmd(state) do
-    {output, _status} = state.seams.epmd_fun.(["-names"], [])
-    if epmd_running?(output), do: kill_foreign_epmd(state), else: :ok
+    case epmd_probe(state) do
+      :running ->
+        kill_foreign_epmd(state)
+
+      :absent ->
+        :ok
+
+      # A probe that timed out tells us nothing, and "nothing" is not "no epmd".
+      # Starting behind a daemon that might be wildcard-bound is the exposure
+      # the pinning exists to prevent, so refuse rather than assume.
+      :unknown ->
+        {:error, {:epmd_probe_failed, :timeout}}
+    end
   end
 
   # The exit status of `epmd -names` is not consistent across OTP versions when
-  # it cannot reach a daemon, so match the banner it prints when it can.
+  # it cannot reach a daemon, so match the banner it prints when it can. A
+  # `:timeout` status comes from MuonTrap, not from epmd, and means the probe
+  # never got an answer at all.
+  defp epmd_probe(state) do
+    case state.seams.epmd_fun.(["-names"], []) do
+      {_output, :timeout} -> :unknown
+      {output, _status} -> if epmd_running?(output), do: :running, else: :absent
+    end
+  end
+
   defp epmd_running?(output), do: String.contains?(output, "up and running")
 
   defp kill_foreign_epmd(state) do
@@ -1051,12 +1101,10 @@ defmodule Vagus.Dist do
   # is exactly the corrupt-cookie state whose documented recovery is `disable/0`
   # then `enable/0`.
   defp kill_epmd(state) do
-    if epmd_present?(state), do: do_kill_epmd(state), else: :ok
-  end
-
-  defp epmd_present?(state) do
-    {output, _status} = state.seams.epmd_fun.(["-names"], [])
-    epmd_running?(output)
+    # `:unknown` tries the kill rather than skipping it: on the teardown side the
+    # conservative move is to attempt it and report failure, not to assume there
+    # was nothing to stop.
+    if epmd_probe(state) == :absent, do: :ok, else: do_kill_epmd(state)
   end
 
   defp do_kill_epmd(state) do
@@ -1195,9 +1243,22 @@ defmodule Vagus.Dist do
 
   # Not injectable: the binary is `:code.root_dir()`-relative and every
   # argument this module passes is a literal.
+  #
+  # MuonTrap rather than `System.cmd/3`, for two reasons that matter here.
+  # `System.cmd/3` cannot be bounded, and these run INSIDE the GenServer — a
+  # wedged epmd blocks the server itself, so the caller's 30s timeout abandons
+  # the `GenServer.call` while `status/0` and `disable/0` stay unavailable
+  # indefinitely. And MuonTrap kills the child rather than orphaning it, which
+  # closing a port does not guarantee. On timeout it answers
+  # `{output, :timeout}`, which the callers treat as a distinct outcome from any
+  # exit status epmd itself produces.
   # sobelow_skip ["CI.System"]
   defp default_epmd(args, env) do
-    System.cmd(epmd_path(), args, env: env, stderr_to_stdout: true)
+    MuonTrap.cmd(epmd_path(), args,
+      env: env,
+      stderr_to_stdout: true,
+      timeout: @epmd_timeout_ms
+    )
   end
 
   defp epmd_path do

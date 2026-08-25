@@ -608,12 +608,39 @@ defmodule Vagus.DistTest do
       assert status.node == :"vagus@192.168.2.58"
     end
 
-    test "refuses when $HOME cannot be derived", ctx do
+    test "refuses when $HOME cannot be derived, and rolls epmd back", ctx do
       # Writing the pre-seed to a relative path would leave `auth` reading a
       # different file and the node up under an OTP-minted cookie.
+      #
+      # epmd is already running by this point, so the failure has to put it
+      # back. Otherwise an ordinary error retries to the 10-attempt give-up and
+      # leaves the last epmd listening on the pinned address forever, on a board
+      # whose status/0 says there is no node.
       pid = start_dist!(ctx, erlang_cookie_path_fun: fn -> {:error, :no_home} end)
 
       assert {:error, {:erlang_cookie_path, :no_home}} = Dist.enable(pid)
+      refute_received {:step, :net_kernel_start, _, _}
+
+      assert_received {:step, :epmd, ["-daemon"], _env}
+      assert_received {:step, :epmd, ["-kill"], []}
+    end
+
+    test "refuses to start when the epmd probe times out", ctx do
+      # A probe that timed out tells us nothing, and "nothing" is not "no epmd".
+      # Starting behind a daemon that might be wildcard-bound is exactly the
+      # exposure the pinning exists to prevent.
+      test = self()
+
+      pid =
+        start_dist!(ctx,
+          epmd_fun: fn args, env ->
+            record(test, {:epmd, args, env})
+            if args == ["-names"], do: {"", :timeout}, else: {"", 0}
+          end
+        )
+
+      assert {:error, {:epmd_probe_failed, :timeout}} = Dist.enable(pid)
+      refute_received {:step, :epmd, ["-daemon"], _env}
       refute_received {:step, :net_kernel_start, _, _}
     end
   end
@@ -1011,6 +1038,30 @@ defmodule Vagus.DistTest do
       refute Dist.status(pid).alive?
 
       assert :ok = Dist.disable(pid)
+      refute File.exists?(ctx.path)
+    end
+
+    test "still attempts the kill when the probe times out", ctx do
+      # On teardown the conservative move is to try and report failure, not to
+      # read an unanswered probe as "there was nothing to stop".
+      seed_cookie!(ctx)
+      test = self()
+
+      pid =
+        start_dist!(ctx,
+          epmd_fun: fn args, env ->
+            record(test, {:epmd, args, env})
+
+            case args do
+              ["-names"] -> {"", :timeout}
+              ["-kill"] -> {"Killed\n", 0}
+              _daemon -> {"", 0}
+            end
+          end
+        )
+
+      assert :ok = Dist.disable(pid)
+      assert_received {:step, :epmd, ["-kill"], []}
       refute File.exists?(ctx.path)
     end
 
