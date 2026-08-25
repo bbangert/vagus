@@ -62,7 +62,11 @@ defmodule Vagus.Addon.Manager do
   is single-node, there's no cluster to coordinate the lock across, so
   `:global`'s cross-node broadcast/consensus machinery would be pure
   overhead here — `:global.trans` is used purely for its **reentrant local
-  mutex** behavior, not its distribution). Reentrant matters because
+  mutex** behavior, not its distribution). `Vagus.Dist` can now take the
+  node distributed at runtime, so "single-node" is a fact about how the
+  fleet is deployed rather than something the runtime guarantees — the
+  `[node()]` scoping is what keeps the lock local either way, here and at
+  every other `:global.trans` site in this app. Reentrant matters because
   `restart/2` calls `stop/2` then `start_slug/2`, and `start_slug/2` calls
   `start/2` — all from the same process, which must not deadlock against
   its own outer lock. `:global.set_lock/2` (which `:global.trans` uses
