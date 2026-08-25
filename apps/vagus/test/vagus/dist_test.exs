@@ -652,18 +652,38 @@ defmodule Vagus.DistTest do
       assert {:error, {:cookie_not_applied, :still_alive}} = Dist.enable(pid)
     end
 
-    test "a raising set_cookie leaves the board idle and the process alive", ctx do
-      # On the BOOT path, where a raise would otherwise reach the supervisor and
-      # take the whole app down — on a fresh flash, a crash loop and a
-      # startup_guard rollback across the fleet.
+    test "a raising set_cookie stops the node it already started", ctx do
+      # Two things at once. On the BOOT path a raise must not reach the
+      # supervisor — on a fresh flash that is a crash loop and a startup_guard
+      # rollback across the fleet. And because net_kernel is ALREADY live by the
+      # time set_cookie runs, the raise must not walk past the read-back and
+      # leave distribution up under a cookie nobody verified: asserting only
+      # `refute status.alive?` would pass on a live node, because state.node is
+      # still nil at that point.
       seed_cookie!(ctx)
 
-      pid =
-        start_dist!(ctx, set_cookie_fun: fn _cookie -> raise "set_cookie/1 blew up" end)
+      pid = start_dist!(ctx, set_cookie_fun: fn _cookie -> raise "set_cookie/1 blew up" end)
 
       refute Dist.status(pid).alive?
       assert Process.alive?(pid)
       assert :sys.get_state(pid).attempt == 1
+
+      # The node it started was stopped, and the stop took.
+      assert_received {:step, :net_kernel_start, :"vagus@192.168.2.58", _opts}
+      assert_received {:step, :net_kernel_stop}
+      refute :sys.get_state(pid).seams.alive_fun.()
+    end
+
+    test "an exiting get_cookie also stops the node", ctx do
+      # The other seam on the same stretch, and an exit rather than a raise.
+      seed_cookie!(ctx)
+
+      pid = start_dist!(ctx, get_cookie_fun: fn -> exit(:noproc) end)
+
+      refute Dist.status(pid).alive?
+      assert Process.alive?(pid)
+      assert_received {:step, :net_kernel_stop}
+      refute :sys.get_state(pid).seams.alive_fun.()
     end
 
     test "the real seam defaults cannot pass the read-back on an undistributed VM", ctx do

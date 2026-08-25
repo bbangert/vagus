@@ -826,6 +826,20 @@ defmodule Vagus.Dist do
     else
       abandon(state)
     end
+  rescue
+    exception ->
+      # Stop FIRST, then let it propagate unchanged: `guarded/1` still logs it
+      # with the cookie redacted and schedules the retry, and an interactive
+      # `enable/0` caller still sees the raise. Only one thing changes — a raise
+      # from a seam can no longer walk past the read-back and leave distribution
+      # live under a cookie nobody verified while `state.node` stays nil and
+      # `status/0` calls the board idle.
+      stop_unverified(state)
+      reraise exception, __STACKTRACE__
+  catch
+    kind, reason ->
+      stop_unverified(state)
+      :erlang.raise(kind, reason, __STACKTRACE__)
   end
 
   # Discarding the stop here would be the same fail-open B3 fixed in
@@ -834,12 +848,24 @@ defmodule Vagus.Dist do
   # survive, so a stop that did not take has to say so rather than be reported
   # as a clean refusal.
   defp abandon(state) do
+    case stop_unverified(state) do
+      :stopped -> {:error, :cookie_not_applied}
+      :still_alive -> {:error, {:cookie_not_applied, :still_alive}}
+    end
+  end
+
+  # The single exit through which every failure after `net_kernel.start` leaves,
+  # whether it arrived as a mismatch or as a raise. Verifies the stop rather
+  # than assuming it, because a node that outlived the stop is the one thing
+  # worth shouting about here.
+  defp stop_unverified(state) do
     state.seams.net_kernel_stop_fun.()
 
     if state.seams.alive_fun.() do
-      {:error, {:cookie_not_applied, :still_alive}}
+      Logger.error("Vagus.Dist: node still alive after abandoning an unverified cookie")
+      :still_alive
     else
-      {:error, :cookie_not_applied}
+      :stopped
     end
   end
 
