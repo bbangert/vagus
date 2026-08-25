@@ -242,52 +242,49 @@ wrote down becomes a surprise later.
 
 **What is done about it instead.**
 
-*Off unless asked for, and both transitions cost a reboot.* No cookie file, no
-distribution. `Vagus.Dist.enable/0` writes the cookie and `disable/0` deletes
-it; the next boot is what brings the node up or leaves it down. Neither touches
-a running node.
+*Off unless asked for, and both transitions reboot.* No cookie file, no
+distribution. `Vagus.Dist.enable/0` writes the cookie and reboots;
+`disable/0` deletes it and reboots. Neither touches a running node — the
+restart is what applies the change.
 
-That is deliberate. Flipping a *live* board means stopping `net_kernel`, killing
-epmd and withdrawing the mDNS advertisement, then threading every one of those
-failures back to the caller without ever leaving a node alive under a secret
-that has already been deleted. This is a test mode toggled a handful of times,
-so a reboot buys the same end state for none of that machinery — and it keeps
-every external command on the boot path, where nothing is waiting on a
+That is deliberate. Flipping a *live* board means stopping `net_kernel` and
+killing epmd, then threading every one of those failures back to the caller
+without ever leaving a node alive under a secret that has already been deleted.
+This is a test mode toggled a handful of times in a board's life, so a reboot
+reaches the same end state and none of that machinery has to exist. It also
+keeps every external command on the boot path, where nothing is waiting on a
 `GenServer.call` that can time out while the server stays blocked.
 
-The operational consequence is worth stating plainly: **after `disable/0`
-returns `:ok`, the node is still up until the board reboots.** The gate is shut
-for every future boot, and the secret is gone from disk, but the process
-listening on the LAN is still listening. Reboot if that matters. The capability
-is observably inert on a board nobody enabled: `:nonode@nohost`, nothing
-listening.
+`disable/0` reboots only once both cookie files are gone; if one cannot be
+removed it reports that and does **not** reboot, since restarting with the gate
+still open would bring distribution straight back. The capability is observably
+inert on a board nobody enabled: `:nonode@nohost`, nothing listening.
 
-*Cookie secrecy is the control that keeps add-ons out.* This is the one that
-matters most on this device, and it is worth being exact about which control
-does the work. `/data/vagus.cookie` is 0600 root-owned, and `/data` is not among
-the paths bound into add-on containers — the add-on data root is
-`/root/vagus/addons`. An add-on therefore cannot read the secret, and without it
-the distribution port answers nothing.
+*Cookie secrecy is the whole control.* `/data/vagus.cookie` is 0600 root-owned,
+and `/data` is not among the paths bound into add-on containers — the add-on
+data root is `/root/vagus/addons`. An add-on cannot read the secret, and without
+it the distribution port answers nothing.
 
-*Bound to one physical address, never the wildcard.*
-`:inet_dist_use_interface` pins the listener to a single VintageNet-managed
-`eth*`/`wlan*`/`usb*` address, and `ERL_EPMD_ADDRESS` pins epmd to the same one.
-**What this buys is narrower than it looks, and this doc used to overstate it.**
-It keeps the listener off every other address the board holds and collapses the
-exposure to one `{address, port-range}` pair that can be firewalled — it does
-**not** make the port unreachable from an add-on container. This repo already
-documents why, in `Vagus.API.SourceGuard`: a packet from a `hassio`-bridge
-container addressed to the board's own LAN IP is delivered **locally**, so it
-never traverses `FORWARD`, and `Vagus.Network.Nat` writes only the `nat` table —
-there is no `filter` rule anywhere that drops it. A container that dials the LAN
-address reaches the dist port. It is the cookie it cannot get.
+*The listener binds `0.0.0.0`, deliberately.* An earlier version pinned it to a
+single VintageNet-managed interface, and this doc credited that with keeping
+add-on containers out. **That was false**, and this repo already documents why
+in `Vagus.API.SourceGuard`: a packet from a `hassio`-bridge container addressed
+to the board's own LAN IP is delivered **locally**, so it never traverses
+`FORWARD`, and `Vagus.Network.Nat` writes only the `nat` table — no `filter`
+rule drops it. A container that dials the LAN address reached the pinned port
+anyway. Measured on a dragon_q6a, not reasoned: from inside a running add-on,
+both 4369 and the dist port were reachable while neither cookie file was
+visible.
 
-Overlay interfaces (Tailscale, WireGuard, anything later) are excluded by
-construction rather than by a denylist: they are brought up by their own daemons
-and never appear in `VintageNet.configured_interfaces/0`.
+So the pinning bought a narrower listener and an interface-ranking apparatus to
+choose it, against a surface the cookie already protects. It is gone. A board
+with this mode on is a board whose operator is on the LAN and owns the exposure;
+what they are handed by `enable/0` is the only thing that opens it.
 
-*Predictable ports.* 4369 plus 9100-9105, pinned, so the range can be
-firewalled at the LAN edge rather than discovered.
+*Predictable ports.* 4369 plus 9100-9105, pinned, so the range can be firewalled
+at the LAN edge rather than discovered. Nothing is advertised: there is no mDNS
+record, and `enable/0` hands back the node name, cookie and port range over the
+SSH session that called it.
 
 *The cookie is 32 bytes of `:crypto.strong_rand_bytes/1`*, written 0600 with the
 mode read back and verified before anything starts — an unverifiable-mode cookie

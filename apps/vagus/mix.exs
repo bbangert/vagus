@@ -175,15 +175,6 @@ defmodule Vagus.MixProject do
       # vagus_platform's nerves_pack dependency).
       {:vintage_net, "~> 0.13.12", targets: @all_targets},
 
-      # `Vagus.Dist` adds/removes the epmd advertisement at runtime, so the
-      # ad is true exactly while the node is up. Declared HERE and not just
-      # inherited through vagus_platform's nerves_pack: an umbrella child
-      # only gets its own declared deps on its compile path, so without this
-      # `MdnsLite` is undefined in every target build of this app — a
-      # warning the MIX_TARGET=host CI gate structurally cannot see.
-      # Targets-only, same as vintage_net above.
-      {:mdns_lite, "~> 0.9.2", targets: @all_targets},
-
       # Test-only: Vagus.Backend.{Network,Host,OS} behaviours are mocked in
       # config/test.exs so handler tests can assert the router calls the
       # configured backend without exercising real hardware.
