@@ -199,6 +199,22 @@ defmodule Vagus.DistTest do
       assert {:ok, %{node: nil}} = Dist.enable(pid)
     end
 
+    test "the reply is delivered BEFORE the reboot", ctx do
+      # The board really does go away, so a reboot evaluated while building the
+      # reply tuple loses the cookie the caller needs — on hardware that showed
+      # up only as a GenServer.call timeout.
+      test = self()
+
+      pid =
+        start_dist(ctx,
+          reboot_fun: fn -> record(test, {:reboot}) && Process.exit(self(), :kill) end
+        )
+
+      assert {:ok, %{cookie: cookie}} = Dist.enable(pid)
+      assert String.match?(cookie, ~r/^[0-9a-f]{64}$/)
+      assert_received {:step, :reboot}
+    end
+
     test "a cookie problem is reported and nothing reboots", ctx do
       seed_cookie!(ctx, "not-a-valid-cookie")
       pid = start_dist(ctx)

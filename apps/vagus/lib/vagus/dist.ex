@@ -176,6 +176,11 @@ defmodule Vagus.Dist do
   @impl GenServer
   def handle_continue(:boot, state), do: {:noreply, boot(state)}
 
+  def handle_continue(:reboot, state) do
+    state.seams.reboot_fun.()
+    {:noreply, state}
+  end
+
   @impl GenServer
   def handle_call(:enable, _from, state) do
     # Writes a file, then reboots. Nothing here can block on the outside world,
@@ -191,7 +196,16 @@ defmodule Vagus.Dist do
           ports: @port_min..@port_max
         }
 
-        {:reply, {:ok, reply}, reboot_unless_alive(state)}
+        # {:continue, :reboot}, NOT a reboot while building this tuple: the
+        # third element is evaluated before gen_server sends the reply, so
+        # rebooting there killed the board with the cookie still in flight and
+        # the caller saw only a call timeout. handle_continue/2 runs after the
+        # reply is on the wire.
+        if state.seams.alive_fun.() do
+          {:reply, {:ok, reply}, state}
+        else
+          {:reply, {:ok, reply}, state, {:continue, :reboot}}
+        end
 
       {:error, reason} ->
         {:reply, {:error, reason}, state}
@@ -200,11 +214,11 @@ defmodule Vagus.Dist do
 
   def handle_call(:disable, _from, state) do
     case Enum.find([delete_cookie(state), delete_erlang_cookie(state)], &(&1 != :ok)) do
-      # Only reboot once the gate is actually shut. Rebooting with a cookie
-      # still on disk would bring distribution straight back.
+      # Only reboot once the gate is actually shut — restarting with a cookie
+      # still on disk would bring distribution straight back — and only after
+      # the reply is sent, for the same reason enable/1 does.
       nil ->
-        state.seams.reboot_fun.()
-        {:reply, :ok, state}
+        {:reply, :ok, state, {:continue, :reboot}}
 
       {:error, reason} ->
         {:reply, {:error, reason}, state}
@@ -480,11 +494,6 @@ defmodule Vagus.Dist do
       {:ok, address} -> node_name(address)
       {:error, _reason} -> nil
     end
-  end
-
-  defp reboot_unless_alive(state) do
-    unless state.seams.alive_fun.(), do: state.seams.reboot_fun.()
-    state
   end
 
   ## Cookie store
