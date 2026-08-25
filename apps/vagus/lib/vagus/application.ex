@@ -161,7 +161,16 @@ defmodule Vagus.Application do
           # (only target.exs sets it). Placed last so `Native.Supervisor`,
           # `Services`, `Discovery`, and `Vagus.DNS` are all up before it installs
           # + starts the broker (which needs none of the container engine).
-          Vagus.Addon.DefaultProvider
+          Vagus.Addon.DefaultProvider,
+
+          # Runtime Erlang distribution, gated by the presence of the cookie
+          # file (`Vagus.Dist`). Last in the list: it depends on nothing here
+          # and nothing here depends on it. Unconditional child, `:ignore`
+          # unless `config :vagus, :dist_cookie_path` is set (target.exs
+          # only) — the gate is the CONFIGURED PATH, not the file: without a
+          # live process there would be nothing for `Vagus.Dist.enable/0` to
+          # call into, which is the whole point of the feature.
+          Vagus.Dist
         ] ++ target_children()
 
     # Explicit restart budget (was the OTP default 3/5s): the top level now

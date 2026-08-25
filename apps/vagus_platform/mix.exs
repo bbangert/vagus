@@ -79,7 +79,14 @@ defmodule VagusPlatform.MixProject do
       overwrite: true,
       # Erlang distribution is not started automatically.
       # See https://nerves-pack.hexdocs.pm/readme.html#erlang-distribution
-      cookie: "#{@app}_cookie",
+      #
+      # Random per build, not "#{@app}_cookie": that value is derived from a
+      # name in a public repo, so it is a published secret the moment any
+      # board goes distributed. Defence in depth only — `Vagus.Dist` calls
+      # `:erlang.set_cookie/1` from its own file before starting net_kernel,
+      # so this baked value never authenticates anything in practice. Nothing
+      # in the release, OTA, or CI path reads it.
+      cookie: Base.url_encode64(:crypto.strong_rand_bytes(40)),
       include_erts: &Nerves.Release.erts/0,
       steps: [&Nerves.Release.init/1, :assemble],
       strip_beams: Mix.env() == :prod or [keep: ["Docs"]]
