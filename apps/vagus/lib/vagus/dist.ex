@@ -255,7 +255,11 @@ defmodule Vagus.Dist do
 
   def handle_call(:status, _from, state) do
     status = %{
-      alive?: state.node != nil,
+      # Both halves, because either can be false on its own: `state.node` is nil
+      # before a start, and it outlives a `net_kernel` stopped from anywhere
+      # else on the board. `node` is still reported so a stale name remains
+      # diagnosable rather than vanishing.
+      alive?: state.node != nil and state.seams.alive_fun.(),
       node: state.node,
       cookie_present?: File.exists?(state.cookie_path),
       address: state.address,
@@ -644,10 +648,26 @@ defmodule Vagus.Dist do
 
   ## Start / stop sequence
 
-  # Idempotent but not blind: being up already is no reason to report a cookie as
-  # applied when the live node does not accept it.
+  # Idempotent but not blind, in two ways. Being up already is no reason to
+  # report a cookie as applied when the live node does not accept it — and
+  # `state.node` can outlive the node itself, because `net_kernel` can be
+  # stopped from anywhere on the board. MEASURED after a runtime-started node is
+  # stopped: `Node.alive?/0` false, `Node.self/0` `:nonode@nohost`,
+  # `:erlang.get_cookie/0` `:nocookie`. So trusting the cached name here made
+  # `enable/0` answer `:cookie_mismatch` — blaming the secret for a node that
+  # had simply died — and never bring distribution back.
   defp start_distribution(%{node: node} = state, cookie) when node != nil do
-    if cookie_mismatch?(state, cookie), do: {:cookie_mismatch, state}, else: {:ok, state}
+    cond do
+      not state.seams.alive_fun.() ->
+        Logger.warning("Vagus.Dist: #{node} is no longer alive; bringing distribution back up")
+        bring_up(cleared(state), cookie)
+
+      cookie_mismatch?(state, cookie) ->
+        {:cookie_mismatch, state}
+
+      true ->
+        {:ok, state}
+    end
   end
 
   defp start_distribution(state, cookie) do

@@ -51,9 +51,14 @@ defmodule Vagus.DistTest do
     {:ok, view} =
       Agent.start_link(fn -> Keyword.get(opts, :interfaces, %{"eth0" => {:lan, @eth0_addrs}}) end)
 
-    # The VM's cookie, as OTP models it: get_cookie/0 answers whatever
-    # set_cookie/1 was last given, and :nocookie before anything was.
-    {:ok, vm} = Agent.start_link(fn -> :nocookie end)
+    # The VM's distribution state, as OTP models it and as MEASURED on a
+    # runtime-started node: net_kernel.start makes it alive, net_kernel.stop
+    # makes it not AND resets the cookie to :nocookie, and get_cookie/0
+    # otherwise answers whatever set_cookie/1 was last given. A fake that let a
+    # "started" node report not-alive — or a stopped one keep its cookie —
+    # could not express a node dying underneath us, which is exactly the state
+    # this module has to notice.
+    {:ok, vm} = Agent.start_link(fn -> %{cookie: :nocookie, node: nil} end)
 
     # And epmd as the board really behaves — measured on a dragon_q6a:
     #   no daemon:  {"epmd: Cannot connect to local epmd\n", 1}
@@ -88,10 +93,10 @@ defmodule Vagus.DistTest do
         put_env_fun: fn key, value -> record(test, {:put_env, key, value}) end,
         set_cookie_fun:
           Keyword.get(opts, :set_cookie_fun, fn cookie ->
-            Agent.update(vm, fn _previous -> cookie end)
+            Agent.update(vm, &%{&1 | cookie: cookie})
             record(test, {:set_cookie, cookie})
           end),
-        get_cookie_fun: Keyword.get(opts, :get_cookie_fun, fn -> Agent.get(vm, & &1) end),
+        get_cookie_fun: Keyword.get(opts, :get_cookie_fun, fn -> Agent.get(vm, & &1.cookie) end),
         # NEVER defaulted: the real seam derives $HOME, and a test that let it
         # would overwrite the developer's own Erlang cookie at mode 0400.
         erlang_cookie_path_fun:
@@ -99,10 +104,14 @@ defmodule Vagus.DistTest do
         net_kernel_start_fun:
           Keyword.get(opts, :net_kernel_start_fun, fn name, kernel_opts ->
             record(test, {:net_kernel_start, name, kernel_opts})
+            Agent.update(vm, &%{&1 | node: name})
             {:ok, self()}
           end),
         net_kernel_stop_fun:
-          Keyword.get(opts, :net_kernel_stop_fun, fn -> record(test, {:net_kernel_stop}) end),
+          Keyword.get(opts, :net_kernel_stop_fun, fn ->
+            Agent.update(vm, fn _ -> %{cookie: :nocookie, node: nil} end)
+            record(test, {:net_kernel_stop})
+          end),
         epmd_fun:
           Keyword.get(opts, :epmd_fun, fn args, env ->
             record(test, {:epmd, args, env})
@@ -123,11 +132,12 @@ defmodule Vagus.DistTest do
             end
           end),
         sleep_fun: fn ms -> record(test, {:sleep, ms}) end,
-        # Left at their real defaults unless a test names them: on this
-        # undistributed VM `Node.alive?/0` and `Node.self/0` answer false and
-        # :nonode@nohost, which is the truth the module is entitled to assume.
-        alive_fun: Keyword.get(opts, :alive_fun, &Node.alive?/0),
-        self_node_fun: Keyword.get(opts, :self_node_fun, &Node.self/0)
+        # Read from the same model, so aliveness and the node name cannot drift
+        # apart from whether net_kernel was "started". The real defaults are
+        # pinned separately, by the read-back test below.
+        alive_fun: Keyword.get(opts, :alive_fun, fn -> Agent.get(vm, & &1.node) != nil end),
+        self_node_fun:
+          Keyword.get(opts, :self_node_fun, fn -> Agent.get(vm, & &1.node) || :nonode@nohost end)
       )
 
     on_exit(fn -> stop(pid) end)
@@ -509,6 +519,45 @@ defmodule Vagus.DistTest do
       assert_received {:step, :home_cookie, {:ok, ^cookie}}
     end
 
+    test "enable/0 brings the node back when net_kernel was stopped from elsewhere", ctx do
+      # net_kernel can be stopped from anywhere on the board, and state.node
+      # outlives it. MEASURED on a runtime-started node after a stop:
+      # Node.alive?/0 false, Node.self/0 :nonode@nohost, get_cookie/0 :nocookie
+      # — so trusting the cached name made enable/0 answer :cookie_mismatch,
+      # blaming the secret for a node that had simply died.
+      {:ok, vm} = Agent.start_link(fn -> %{node: nil, cookie: :nocookie} end)
+      on_exit(fn -> if Process.alive?(vm), do: Agent.stop(vm) end)
+      test = self()
+
+      pid =
+        start_dist!(ctx,
+          net_kernel_start_fun: fn name, kernel_opts ->
+            record(test, {:net_kernel_start, name, kernel_opts})
+            Agent.update(vm, &%{&1 | node: name})
+            {:ok, self()}
+          end,
+          set_cookie_fun: fn cookie -> Agent.update(vm, &%{&1 | cookie: cookie}) end,
+          get_cookie_fun: fn -> Agent.get(vm, & &1.cookie) end,
+          alive_fun: fn -> Agent.get(vm, & &1.node) != nil end,
+          self_node_fun: fn -> Agent.get(vm, & &1.node) || :nonode@nohost end
+        )
+
+      assert {:ok, %{node: :"vagus@192.168.2.58"}} = Dist.enable(pid)
+      assert Dist.status(pid).alive?
+      flush()
+
+      # Whatever stopped it, the measured after-state is the same.
+      Agent.update(vm, fn _ -> %{node: nil, cookie: :nocookie} end)
+
+      # status/0 must stop claiming a dead node is up...
+      refute Dist.status(pid).alive?
+
+      # ...and enable/0 must bring it back rather than blaming the cookie.
+      assert {:ok, %{node: :"vagus@192.168.2.58"}} = Dist.enable(pid)
+      assert_received {:step, :net_kernel_start, :"vagus@192.168.2.58", _opts}
+      assert Dist.status(pid).alive?
+    end
+
     test "is idempotent — a second enable restarts nothing", ctx do
       pid = start_dist!(ctx)
       assert {:ok, %{node: node}} = Dist.enable(pid)
@@ -692,6 +741,9 @@ defmodule Vagus.DistTest do
               record(test, {:net_kernel_start, name, kernel_opts})
               {:error, {:already_started, self()}}
             end,
+            # The premise of this whole path: the node really is up, which is
+            # why net_kernel answers already_started.
+            alive_fun: fn -> true end,
             self_node_fun: fn -> live end,
             get_cookie_fun: fn -> @cookie_atom end
           ],
