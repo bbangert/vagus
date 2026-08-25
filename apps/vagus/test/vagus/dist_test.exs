@@ -88,8 +88,6 @@ defmodule Vagus.DistTest do
           end),
         mdns_add_fun:
           Keyword.get(opts, :mdns_add_fun, fn service -> record(test, {:mdns_add, service}) end),
-        mdns_remove_fun:
-          Keyword.get(opts, :mdns_remove_fun, fn id -> record(test, {:mdns_remove, id}) end),
         put_env_fun: fn key, value -> record(test, {:put_env, key, value}) end,
         set_cookie_fun:
           Keyword.get(opts, :set_cookie_fun, fn cookie ->
@@ -147,6 +145,14 @@ defmodule Vagus.DistTest do
   defp start_dist!(ctx, opts \\ []) do
     {pid, _view} = start_dist(ctx, opts)
     pid
+  end
+
+  # enable/0 no longer starts anything, so the BOOT path drives the start
+  # sequence: a valid cookie on disk at start_link time. status/0 reports the
+  # outcome, and `last_error` carries the reason a start refused.
+  defp boot!(ctx, opts \\ []) do
+    seed_cookie!(ctx)
+    start_dist!(ctx, opts)
   end
 
   defp seed_cookie!(ctx, cookie \\ @cookie) do
@@ -231,17 +237,29 @@ defmodule Vagus.DistTest do
   describe "cookie store" do
     test "mints a 0600 cookie, seeds $HOME/.erlang.cookie at 0400, and proves both", ctx do
       pid = start_dist!(ctx)
-      assert {:ok, %{cookie: cookie, node: node}} = Dist.enable(pid)
+      assert {:ok, %{cookie: cookie, node: node, reboot_required: true}} = Dist.enable(pid)
 
+      # The name the board WILL take, since nothing has started yet.
       assert node == :"vagus@192.168.2.58"
       assert String.match?(cookie, ~r/^[0-9a-f]{64}$/)
       assert File.read!(ctx.path) == cookie
       assert mode(ctx.path) == 0o600
 
-      # Two files at two modes on purpose: this module re-reads its own store,
-      # and `auth:read_cookie/0` refuses anything looser than 0400.
-      assert File.read!(ctx.home) == cookie
+      # $HOME/.erlang.cookie is the BOOT path's job, seeded immediately before
+      # net_kernel.start because that is when `auth` reads it — so enable/0 has
+      # not written it yet.
+      refute File.exists?(ctx.home)
+    end
+
+    test "the boot seeds $HOME/.erlang.cookie at 0400 with the same value", ctx do
+      # Two files at two modes on purpose: this module re-reads its own store at
+      # 0600, and `auth:read_cookie/0` refuses anything looser than 0400.
+      pid = boot!(ctx)
+
+      assert Dist.status(pid).alive?
+      assert File.read!(ctx.home) == @cookie
       assert mode(ctx.home) == 0o400
+      assert mode(ctx.path) == 0o600
     end
 
     test "refuses to start when the mode cannot be read back, and leaves nothing behind", ctx do
@@ -383,14 +401,14 @@ defmodule Vagus.DistTest do
   describe "address resolution" do
     test "prefers eth0 over a wlan0 that reached :internet", ctx do
       pid =
-        start_dist!(ctx,
+        boot!(ctx,
           interfaces: %{
             "wlan0" => {:internet, [%{address: {10, 0, 0, 9}, family: :inet}]},
             "eth0" => {:lan, @eth0_addrs}
           }
         )
 
-      assert {:ok, %{node: :"vagus@192.168.2.58"}} = Dist.enable(pid)
+      assert Dist.status(pid).node == :"vagus@192.168.2.58"
       assert Dist.status(pid).ifname == "eth0"
     end
 
@@ -398,28 +416,28 @@ defmodule Vagus.DistTest do
       wlan = %{"wlan0" => {:lan, [%{address: {10, 0, 0, 9}, family: :inet}]}}
       usb = %{"usb0" => {:lan, [%{address: {172, 31, 36, 1}, family: :inet}]}}
 
-      pid = start_dist!(ctx, interfaces: Map.merge(wlan, usb))
-      assert {:ok, %{node: :"vagus@10.0.0.9"}} = Dist.enable(pid)
+      pid = boot!(ctx, interfaces: Map.merge(wlan, usb))
+      assert Dist.status(pid).node == :"vagus@10.0.0.9"
 
-      usb_only = start_dist!(ctx, cookie_path: Path.join(ctx.dir, "usb.cookie"), interfaces: usb)
+      usb_only = boot!(ctx, cookie_path: Path.join(ctx.dir, "usb.cookie"), interfaces: usb)
       assert {:ok, %{node: :"vagus@172.31.36.1"}} = Dist.enable(usb_only)
     end
 
     test "skips a disconnected interface", ctx do
       pid =
-        start_dist!(ctx,
+        boot!(ctx,
           interfaces: %{
             "eth0" => {:disconnected, @eth0_addrs},
             "wlan0" => {:lan, [%{address: {10, 0, 0, 9}, family: :inet}]}
           }
         )
 
-      assert {:ok, %{node: :"vagus@10.0.0.9"}} = Dist.enable(pid)
+      assert Dist.status(pid).node == :"vagus@10.0.0.9"
     end
 
     test "takes IPv4 over IPv6 and skips loopback and link-local", ctx do
       pid =
-        start_dist!(ctx,
+        boot!(ctx,
           interfaces: %{
             "eth0" =>
               {:lan,
@@ -432,7 +450,7 @@ defmodule Vagus.DistTest do
           }
         )
 
-      assert {:ok, %{node: :"vagus@192.168.2.58"}} = Dist.enable(pid)
+      assert Dist.status(pid).node == :"vagus@192.168.2.58"
     end
 
     test "ignores an unmanaged overlay interface even when it is the only address", ctx do
@@ -441,11 +459,11 @@ defmodule Vagus.DistTest do
       # name filter as well keeps it failing closed if someone ever hands
       # VintageNet a tunnel to manage.
       pid =
-        start_dist!(ctx,
+        boot!(ctx,
           interfaces: %{"tailscale0" => {:internet, [%{address: {100, 64, 0, 7}, family: :inet}]}}
         )
 
-      assert {:error, :no_address} = Dist.enable(pid)
+      assert Dist.status(pid).last_error == :no_address
       refute_received {:step, :net_kernel_start, _, _}
     end
 
@@ -454,18 +472,18 @@ defmodule Vagus.DistTest do
       # ERL_EPMD_ADDRESS would bind every address on the board while looking
       # like a pin.
       pid =
-        start_dist!(ctx,
+        boot!(ctx,
           interfaces: %{"eth0" => {:lan, [%{address: {0, 0, 0, 0}, family: :inet}]}}
         )
 
-      assert {:error, :no_address} = Dist.enable(pid)
+      assert Dist.status(pid).last_error == :no_address
       refute_received {:step, :put_env, :inet_dist_use_interface, _}
     end
 
     test "no qualifying address means no net_kernel call at all", ctx do
-      pid = start_dist!(ctx, interfaces: %{"eth0" => {:lan, []}})
+      pid = boot!(ctx, interfaces: %{"eth0" => {:lan, []}})
 
-      assert {:error, :no_address} = Dist.enable(pid)
+      assert Dist.status(pid).last_error == :no_address
       refute_received {:step, :epmd, _, _}
       refute_received {:step, :set_cookie, _}
       refute_received {:step, :net_kernel_start, _, _}
@@ -475,8 +493,8 @@ defmodule Vagus.DistTest do
   describe "start sequence" do
     test "pins ports and interface and starts epmd before net_kernel, then applies the cookie",
          ctx do
-      pid = start_dist!(ctx)
-      assert {:ok, _} = Dist.enable(pid)
+      pid = boot!(ctx)
+      assert Dist.status(pid).alive?
 
       # Order is the point, and `assert_received` consumes in mailbox order, so
       # these assertions passing in sequence IS the ordering proof. A
@@ -507,7 +525,7 @@ defmodule Vagus.DistTest do
       test = self()
 
       pid =
-        start_dist!(ctx,
+        boot!(ctx,
           net_kernel_start_fun: fn name, opts ->
             record(test, {:home_cookie, File.read(ctx.home)})
             record(test, {:net_kernel_start, name, opts})
@@ -515,11 +533,14 @@ defmodule Vagus.DistTest do
           end
         )
 
-      assert {:ok, %{cookie: cookie}} = Dist.enable(pid)
-      assert_received {:step, :home_cookie, {:ok, ^cookie}}
+      # Sync on the boot having run, then assert the ORDERING, which is the
+      # point: the file was already on disk when net_kernel was called.
+      refute Dist.status(pid).alive?
+      assert_received {:step, :home_cookie, {:ok, @cookie}}
+      assert_received {:step, :net_kernel_start, :"vagus@192.168.2.58", _opts}
     end
 
-    test "enable/0 brings the node back when net_kernel was stopped from elsewhere", ctx do
+    test "status/0 stops claiming a node that died underneath us", ctx do
       # net_kernel can be stopped from anywhere on the board, and state.node
       # outlives it. MEASURED on a runtime-started node after a stop:
       # Node.alive?/0 false, Node.self/0 :nonode@nohost, get_cookie/0 :nocookie
@@ -530,7 +551,7 @@ defmodule Vagus.DistTest do
       test = self()
 
       pid =
-        start_dist!(ctx,
+        boot!(ctx,
           net_kernel_start_fun: fn name, kernel_opts ->
             record(test, {:net_kernel_start, name, kernel_opts})
             Agent.update(vm, &%{&1 | node: name})
@@ -542,20 +563,21 @@ defmodule Vagus.DistTest do
           self_node_fun: fn -> Agent.get(vm, & &1.node) || :nonode@nohost end
         )
 
-      assert {:ok, %{node: :"vagus@192.168.2.58"}} = Dist.enable(pid)
+      assert Dist.status(pid).node == :"vagus@192.168.2.58"
       assert Dist.status(pid).alive?
       flush()
 
       # Whatever stopped it, the measured after-state is the same.
       Agent.update(vm, fn _ -> %{node: nil, cookie: :nocookie} end)
 
-      # status/0 must stop claiming a dead node is up...
+      # status/0 must stop claiming a dead node is up — state.node alone would
+      # still say yes.
       refute Dist.status(pid).alive?
 
-      # ...and enable/0 must bring it back rather than blaming the cookie.
-      assert {:ok, %{node: :"vagus@192.168.2.58"}} = Dist.enable(pid)
-      assert_received {:step, :net_kernel_start, :"vagus@192.168.2.58", _opts}
-      assert Dist.status(pid).alive?
+      # Recovery is a reboot, not a call: enable/0 confirms the cookie is still
+      # in place and says so.
+      assert {:ok, %{reboot_required: true}} = Dist.enable(pid)
+      refute_received {:step, :net_kernel_start, _name, _opts}
     end
 
     test "is idempotent — a second enable restarts nothing", ctx do
@@ -572,14 +594,14 @@ defmodule Vagus.DistTest do
       test = self()
 
       pid =
-        start_dist!(ctx,
+        boot!(ctx,
           epmd_fun: fn args, env ->
             record(test, {:epmd, args, env})
             if args == ["-daemon"], do: {"cannot bind", 1}, else: {"", 0}
           end
         )
 
-      assert {:error, {:epmd_failed, 1, "cannot bind"}} = Dist.enable(pid)
+      assert Dist.status(pid).last_error == {:epmd_failed, 1, "cannot bind"}
       refute_received {:step, :net_kernel_start, _, _}
     end
 
@@ -591,14 +613,14 @@ defmodule Vagus.DistTest do
       test = self()
 
       pid =
-        start_dist!(ctx,
+        boot!(ctx,
           mdns_add_fun: fn _service ->
             record(test, {:mdns_attempted})
             exit(:noproc)
           end
         )
 
-      assert {:ok, %{node: :"vagus@192.168.2.58"}} = Dist.enable(pid)
+      assert Dist.status(pid).node == :"vagus@192.168.2.58"
       assert_received {:step, :mdns_attempted}
 
       # Degraded, not broken: the runbook connects by bare IPv4 longname and
@@ -616,9 +638,9 @@ defmodule Vagus.DistTest do
       # back. Otherwise an ordinary error retries to the 10-attempt give-up and
       # leaves the last epmd listening on the pinned address forever, on a board
       # whose status/0 says there is no node.
-      pid = start_dist!(ctx, erlang_cookie_path_fun: fn -> {:error, :no_home} end)
+      pid = boot!(ctx, erlang_cookie_path_fun: fn -> {:error, :no_home} end)
 
-      assert {:error, {:erlang_cookie_path, :no_home}} = Dist.enable(pid)
+      assert Dist.status(pid).last_error == {:erlang_cookie_path, :no_home}
       refute_received {:step, :net_kernel_start, _, _}
 
       assert_received {:step, :epmd, ["-daemon"], _env}
@@ -632,14 +654,14 @@ defmodule Vagus.DistTest do
       test = self()
 
       pid =
-        start_dist!(ctx,
+        boot!(ctx,
           epmd_fun: fn args, env ->
             record(test, {:epmd, args, env})
             if args == ["-names"], do: {"", :timeout}, else: {"", 0}
           end
         )
 
-      assert {:error, {:epmd_probe_failed, :timeout}} = Dist.enable(pid)
+      assert Dist.status(pid).last_error == {:epmd_probe_failed, :timeout}
       refute_received {:step, :epmd, ["-daemon"], _env}
       refute_received {:step, :net_kernel_start, _, _}
     end
@@ -650,9 +672,9 @@ defmodule Vagus.DistTest do
       # Exactly what a pre-seed written to a path `auth` does not read looks
       # like from here. A node alive under a cookie that is not ours is the one
       # state this must never leave behind.
-      pid = start_dist!(ctx, get_cookie_fun: fn -> @other_cookie_atom end)
+      pid = boot!(ctx, get_cookie_fun: fn -> @other_cookie_atom end)
 
-      assert {:error, :cookie_not_applied} = Dist.enable(pid)
+      assert Dist.status(pid).last_error == :cookie_not_applied
       assert_received {:step, :net_kernel_stop}
       refute Dist.status(pid).alive?
       refute_received {:step, :mdns_add, _}
@@ -666,7 +688,7 @@ defmodule Vagus.DistTest do
       on_exit(fn -> if Process.alive?(alive), do: Agent.stop(alive) end)
 
       pid =
-        start_dist!(ctx,
+        boot!(ctx,
           alive_fun: fn -> Agent.get(alive, & &1) end,
           net_kernel_start_fun: fn _name, _opts ->
             Agent.update(alive, fn _ -> true end)
@@ -676,7 +698,7 @@ defmodule Vagus.DistTest do
           get_cookie_fun: fn -> @other_cookie_atom end
         )
 
-      assert {:error, {:cookie_not_applied, :still_alive}} = Dist.enable(pid)
+      assert Dist.status(pid).last_error == {:cookie_not_applied, :still_alive}
     end
 
     test "a raising set_cookie stops the node it already started", ctx do
@@ -719,12 +741,12 @@ defmodule Vagus.DistTest do
       # cannot answer our minted cookie, so the read-back MUST fire. A default
       # that echoed set_cookie/1 back would make this test fail.
       pid =
-        start_dist!(ctx,
+        boot!(ctx,
           get_cookie_fun: &:erlang.get_cookie/0,
           set_cookie_fun: fn _cookie -> :ok end
         )
 
-      assert {:error, :cookie_not_applied} = Dist.enable(pid)
+      assert Dist.status(pid).last_error == :cookie_not_applied
     end
 
     test "the default $HOME derivation is the file `auth` actually reads" do
@@ -837,10 +859,11 @@ defmodule Vagus.DistTest do
       refute_received {:step, :net_kernel_stop}
     end
 
-    test "enable/0 refuses to hand back a cookie the live node will not accept", ctx do
-      # No cookie file at start_link, so boot stays idle and enable/0 drives the
-      # reconcile path directly — the shape of rotating the secret under a
-      # running node.
+    test "enable/0 reports the cookie the NEXT boot will use, not the live one", ctx do
+      # Rotating the secret under a running node used to need a :cookie_mismatch
+      # refusal, because enable/0 claimed to have applied what it returned. It
+      # no longer applies anything: the file it wrote is what the next boot
+      # authenticates with, so returning it is simply true.
       pid =
         start_dist!(ctx,
           cookie_path: Path.join(ctx.dir, "rotate.cookie"),
@@ -849,23 +872,10 @@ defmodule Vagus.DistTest do
           get_cookie_fun: fn -> @other_cookie_atom end
         )
 
-      refute Dist.status(pid).alive?
-
       File.write!(Path.join(ctx.dir, "rotate.cookie"), @cookie)
       File.chmod!(Path.join(ctx.dir, "rotate.cookie"), 0o600)
 
-      # Reporting {:ok, cookie: <file value>} here would tell an operator the
-      # rotation worked while the retired cookie stayed valid on the LAN.
-      assert {:error, :cookie_mismatch} = Dist.enable(pid)
-
-      # The bookkeeping is still repaired, which is the B4 half of this path.
-      status = Dist.status(pid)
-      assert status.alive?
-      assert status.node == :"vagus@192.168.2.58"
-      assert status.drift =~ "cookie"
-
-      # And a second call must not slip through the idempotence guard.
-      assert {:error, :cookie_mismatch} = Dist.enable(pid)
+      assert {:ok, %{cookie: @cookie, reboot_required: true}} = Dist.enable(pid)
     end
 
     test "re-advertises mDNS, which is what repairs a failed advertisement", ctx do
@@ -918,9 +928,9 @@ defmodule Vagus.DistTest do
 
     test "kills an epmd it did not launch before starting its own", ctx do
       test = self()
-      pid = start_dist!(ctx, epmd_fun: epmd_seam(test, 0))
+      pid = boot!(ctx, epmd_fun: epmd_seam(test, 0))
 
-      assert {:ok, _} = Dist.enable(pid)
+      assert Dist.status(pid).alive?
 
       # `epmd -daemon` exits 0 when another epmd already holds the port: it
       # does nothing at all, ERL_EPMD_ADDRESS is ignored, and the survivor may
@@ -932,9 +942,13 @@ defmodule Vagus.DistTest do
 
     test "refuses to start behind an epmd it cannot replace", ctx do
       test = self()
-      pid = start_dist!(ctx, epmd_fun: epmd_seam(test, 1))
+      pid = boot!(ctx, epmd_fun: epmd_seam(test, 1))
 
-      assert {:error, {:epmd_not_ours, {:epmd_kill_failed, 1, _output}}} = Dist.enable(pid)
+      assert match?(
+               {:epmd_not_ours, {:epmd_kill_failed, 1, _output}},
+               Dist.status(pid).last_error
+             )
+
       # Better idle than silently bound to the wildcard the pinning exists to
       # prevent.
       refute_received {:step, :net_kernel_start, _, _}
@@ -960,8 +974,8 @@ defmodule Vagus.DistTest do
         end
       end
 
-      pid = start_dist!(ctx, epmd_fun: epmd)
-      assert {:ok, _} = Dist.enable(pid)
+      pid = boot!(ctx, epmd_fun: epmd)
+      assert Dist.status(pid).alive?
 
       assert_received {:step, :epmd, ["-kill"], []}
       assert_received {:step, :sleep, 250}
@@ -970,126 +984,48 @@ defmodule Vagus.DistTest do
   end
 
   describe "disable/1" do
-    test "withdraws mDNS, stops net_kernel, kills epmd, and deletes BOTH cookie files", ctx do
-      pid = start_dist!(ctx)
-      assert {:ok, _} = Dist.enable(pid)
+    test "deletes both cookie files so the next boot stays down", ctx do
+      pid = boot!(ctx)
+      assert Dist.status(pid).alive?
+      assert File.exists?(ctx.path)
       assert File.exists?(ctx.home)
+
+      assert :ok = Dist.disable(pid)
+
+      refute File.exists?(ctx.path)
+      refute File.exists?(ctx.home)
+    end
+
+    test "leaves the running node alone — the reboot is what stops it", ctx do
+      # Tearing a live node down in place is what required threading
+      # net_kernel/epmd/mDNS failures through every path. The gate is shut for
+      # every future boot the moment the files are gone; the node itself is the
+      # reboot's problem.
+      pid = boot!(ctx)
+      assert Dist.status(pid).alive?
       flush()
 
       assert :ok = Dist.disable(pid)
 
-      assert_received {:step, :mdns_remove, :vagus_epmd}
-      assert_received {:step, :net_kernel_stop}
-      assert_received {:step, :epmd, ["-kill"], []}
-      refute File.exists?(ctx.path)
-      refute File.exists?(ctx.home)
-
-      status = Dist.status(pid)
-      refute status.alive?
-      refute status.cookie_present?
-      assert status.node == nil
-    end
-
-    test "keeps both cookie files when the node is still alive, and stays truthful", ctx do
-      # The worst outcome in the review: status/0 reporting the gate shut over
-      # a live, reachable node whose secret has just been deleted.
-      seed_cookie!(ctx)
-
-      pid =
-        start_dist!(ctx,
-          alive_fun: fn -> true end,
-          self_node_fun: fn -> :"vagus@192.168.2.58" end,
-          get_cookie_fun: fn -> @cookie_atom end
-        )
-
       assert Dist.status(pid).alive?
-
-      assert {:error, {:disable_incomplete, [{:still_alive, _}]}} = Dist.disable(pid)
-      assert File.exists?(ctx.path)
-      assert Dist.status(pid).alive?
-      assert Dist.status(pid).node == :"vagus@192.168.2.58"
+      refute_received {:step, :epmd, ["-kill"], []}
+      refute_received {:step, :net_kernel_start, _, _}
     end
 
-    test "reports an epmd that would not die, and keeps the cookies", ctx do
-      test = self()
-      pid = start_dist!(ctx, epmd_fun: epmd_seam(test, 1))
-      seed_cookie!(ctx)
-
-      assert {:error, {:disable_incomplete, [{:epmd_kill_failed, 1, _}]}} = Dist.disable(pid)
-      assert File.exists?(ctx.path)
-    end
-
-    test "reports a cookie file it could not delete", ctx do
+    test "reports a cookie file it could not delete, because that boot comes back up", ctx do
+      # While a cookie file survives, the next boot re-enables distribution — so
+      # a failed delete is the one thing here worth reporting.
       File.mkdir_p!(ctx.path)
+      on_exit(fn -> File.rm_rf!(ctx.path) end)
 
       pid = start_dist!(ctx)
 
-      assert {:error, {:disable_incomplete, [{:cookie_not_removed, _path, _reason}]}} =
-               Dist.disable(pid)
-    end
-
-    test "succeeds when epmd was never started — the corrupt-cookie recovery path", ctx do
-      # A board that refused its cookie never started epmd, so `epmd -kill`
-      # exits non-zero. Treating that as failure kept the corrupt file on disk
-      # and made the documented disable/0-then-enable/0 recovery impossible.
-      seed_cookie!(ctx, "not-a-valid-cookie")
-
-      pid = start_dist!(ctx)
-      refute Dist.status(pid).alive?
-
-      assert :ok = Dist.disable(pid)
-      refute File.exists?(ctx.path)
-    end
-
-    test "still attempts the kill when the probe times out", ctx do
-      # On teardown the conservative move is to try and report failure, not to
-      # read an unanswered probe as "there was nothing to stop".
-      seed_cookie!(ctx)
-      test = self()
-
-      pid =
-        start_dist!(ctx,
-          epmd_fun: fn args, env ->
-            record(test, {:epmd, args, env})
-
-            case args do
-              ["-names"] -> {"", :timeout}
-              ["-kill"] -> {"Killed\n", 0}
-              _daemon -> {"", 0}
-            end
-          end
-        )
-
-      assert :ok = Dist.disable(pid)
-      assert_received {:step, :epmd, ["-kill"], []}
-      refute File.exists?(ctx.path)
+      assert {:error, {:cookie_not_removed, _path, _reason}} = Dist.disable(pid)
     end
 
     test "a missing cookie file is not a failure", ctx do
       pid = start_dist!(ctx)
       assert :ok = Dist.disable(pid)
-    end
-
-    test "a failed mDNS withdrawal fails disable/0 and keeps the cookies", ctx do
-      seed_cookie!(ctx)
-      pid = start_dist!(ctx, mdns_remove_fun: fn _id -> {:error, :table_gone} end)
-
-      # The doc promises disable_incomplete covers the withdrawal; dropping this
-      # result made that promise unkeepable.
-      assert {:error, {:disable_incomplete, [:table_gone]}} = Dist.disable(pid)
-      assert File.exists?(ctx.path)
-    end
-
-    test "an mDNS withdrawal that exits is reported, not propagated", ctx do
-      # MdnsLite.remove_mdns_service/1 exits when its TableServer is down, which
-      # would otherwise kill the caller mid-teardown — after net_kernel is
-      # already stopped and before the cookies are dealt with.
-      pid = start_dist!(ctx, mdns_remove_fun: fn _id -> exit(:noproc) end)
-
-      assert {:error, {:disable_incomplete, [{:mdns_not_withdrawn, :exit, :noproc}]}} =
-               Dist.disable(pid)
-
-      assert Process.alive?(pid)
     end
   end
 
@@ -1222,8 +1158,8 @@ defmodule Vagus.DistTest do
 
   describe "address churn" do
     test "warns and surfaces drift rather than renaming a live node", ctx do
-      pid = start_dist!(ctx)
-      {:ok, %{node: node}} = Dist.enable(pid)
+      pid = boot!(ctx)
+      node = Dist.status(pid).node
       flush()
 
       # The node name embeds the address and is immutable; a silent rename
@@ -1238,8 +1174,9 @@ defmodule Vagus.DistTest do
     end
 
     test "reports drift when the resolved address moves under a live node", ctx do
+      seed_cookie!(ctx)
       {pid, view} = start_dist(ctx)
-      {:ok, %{node: node}} = Dist.enable(pid)
+      node = Dist.status(pid).node
       flush()
 
       Agent.update(view, fn _ ->
@@ -1255,8 +1192,9 @@ defmodule Vagus.DistTest do
     end
 
     test "reports drift when every physical address disappears", ctx do
+      seed_cookie!(ctx)
       {pid, view} = start_dist(ctx)
-      {:ok, _} = Dist.enable(pid)
+      assert Dist.status(pid).alive?
       flush()
 
       Agent.update(view, fn _ -> %{"eth0" => {:disconnected, []}} end)

@@ -49,16 +49,34 @@ defmodule Vagus.Dist do
   wildcard-binds; what keeps an add-on container out is the cookie's secrecy,
   not the bind — see `docs/divergences.md`.
 
+  ## Enabling costs a reboot, on purpose
+
+  `enable/0` writes the cookie files; the next boot brings the node up.
+  `disable/0` deletes them; the next boot leaves it down. Neither touches a
+  running node.
+
+  That is a deliberate trade. Transitioning a *live* board means stopping
+  `net_kernel`, killing epmd and withdrawing the mDNS advertisement, then
+  threading every one of those failures back to the caller without ever leaving
+  a node alive under a secret that has been deleted. This is a test mode toggled
+  a handful of times; a reboot buys the same end state for none of that
+  machinery, and it keeps every external command on the boot path, where nothing
+  is waiting on a `GenServer.call`.
+
   ## Agent runbook
 
-  **1. Open the gate**, over the SSH access you already have:
+  **1. Open the gate**, over the SSH access you already have, then reboot:
 
       iex> Vagus.Dist.enable()
-      {:ok, %{node: :"vagus@192.168.2.58", cookie: "a1b2c3..."}}
+      {:ok, %{node: :"vagus@192.168.2.58", cookie: "a1b2c3...", reboot_required: true}}
+      iex> Nerves.Runtime.reboot()
 
-  `status/0` answers the same question at any point, including before you
-  start: `alive?`, `node`, `cookie_present?`, `address`, `ifname`, `ports`,
-  and `drift`.
+  `node` is the name the board *will* take — it embeds the address, so it is
+  `nil` if no physical interface has one yet. `reboot_required` is false when
+  the node is already up, which is what makes a second `enable/0` a no-op.
+
+  `status/0` answers what is true now, at any point: `alive?`, `node`,
+  `cookie_present?`, `address`, `ifname`, `ports`, and `drift`.
 
   **2. Connect from the dev host.** TCP 4369 (epmd) and 9100-9105 (the pinned
   distribution range) must be open to the board; nothing else is needed, and
@@ -78,15 +96,19 @@ defmodule Vagus.Dist do
   buffer flow-control and blow its own timeout — see `run/1`. A small MFA
   does not need it.
 
-  **4. Close the gate** when the work is done. Distribution is an
+  **4. Close the gate** when the work is done, and reboot. Distribution is an
   unauthenticated-root-equivalent surface on the LAN segment (see
   `docs/divergences.md`); leaving it open is the mistake this call exists to
-  prevent. `disable/0` can fail — `{:error, {:disable_incomplete, _}}` means
-  the node may still be up and **both cookie files are still on disk**, which
-  is deliberate: see `stop_distribution/1`.
+  prevent.
 
       iex> Vagus.Dist.disable()
       :ok
+      iex> Nerves.Runtime.reboot()
+
+  **The node stays up until that reboot.** `disable/0` only removes the files,
+  so the gate is shut for every future boot the moment it returns `:ok` — but
+  the secret is gone while the node it authenticates is still listening. If that
+  matters, reboot immediately.
 
   The node name embeds the address, so it is fixed at start. If the address
   changes the node keeps its old name; `status/0` reports the drift. Give
@@ -128,7 +150,8 @@ defmodule Vagus.Dist do
           address: :inet.ip4_address() | nil,
           ifname: String.t() | nil,
           ports: Range.t(),
-          drift: String.t() | nil
+          drift: String.t() | nil,
+          last_error: term() | nil
         }
 
   @doc """
@@ -153,25 +176,28 @@ defmodule Vagus.Dist do
   end
 
   @doc """
-  Mints the cookie if absent, then brings the node up. Idempotent.
+  Mints the cookie if absent and returns it. **Takes effect on the next boot.**
+
+  Writes `/data/vagus.cookie` and reports the node name the board will take. It
+  does not touch epmd or `net_kernel`: bringing distribution up is the boot
+  path's job, once, which is why nothing here can block on an external command.
+  `$HOME/.erlang.cookie` is seeded there too, immediately before
+  `net_kernel.start`, because that is when `auth` reads it. Idempotent — calling
+  it twice returns the same cookie.
   """
   @spec enable(GenServer.server()) ::
-          {:ok, %{node: node(), cookie: String.t()}} | {:error, term()}
+          {:ok, %{node: node() | nil, cookie: String.t(), reboot_required: boolean()}}
+          | {:error, term()}
   def enable(server \\ __MODULE__), do: GenServer.call(server, :enable, 30_000)
 
   @doc """
-  Closes the gate: withdraws the mDNS advertisement, stops `net_kernel`,
-  kills epmd, and deletes both cookie files.
+  Closes the gate by deleting both cookie files. **Takes effect on the next
+  boot**, which is when the node goes away.
 
-  `{:error, {:disable_incomplete, _}}` means at least one of those did not
-  happen, and `status/0` keeps reporting the node as up if it still is.
-
-  It does **not** guarantee both cookie files survive. If the teardown itself
-  failed, nothing is deleted — that is the case the ordering exists for, since
-  deleting the secret over a live node destroys the only record of what still
-  authenticates it. But once teardown succeeds, both removals are attempted and
-  either can fail on its own, so a `disable_incomplete` carrying only a
-  `:cookie_not_removed` can leave exactly one file behind. Read the reason.
+  `{:error, {:cookie_not_removed, path, reason}}` means a file is still there —
+  and while it is, the next boot will bring distribution back up. Nothing else
+  can fail, because nothing else is attempted: the running node is left alone
+  and the reboot is what stops it.
   """
   @spec disable(GenServer.server()) :: :ok | {:error, term()}
   def disable(server \\ __MODULE__), do: GenServer.call(server, :disable, 30_000)
@@ -212,6 +238,7 @@ defmodule Vagus.Dist do
       address: nil,
       ifname: nil,
       drift: nil,
+      last_error: nil,
       attempt: 0,
       retry_ref: nil,
       gave_up?: false,
@@ -229,43 +256,55 @@ defmodule Vagus.Dist do
 
   @impl GenServer
   def handle_call(:enable, _from, state) do
-    # Deliberately NOT wrapped the way try_boot_start/1 is: an interactive
-    # caller should see a raise, and a crash here restarts a GenServer whose
-    # supervisor did not ask the app to come down.
-    with {:ok, cookie} <- read_or_mint(state),
-         {:ok, state} <- start_distribution(state, cookie) do
-      state = state |> settled() |> ensure_subscribed()
-      {:reply, {:ok, %{node: state.node, cookie: cookie}}, state}
-    else
-      # The bookkeeping IS repaired — state.node names the live node and
-      # status/0 carries the drift — but the caller must not be handed a cookie
-      # that will not authenticate. Rotating the secret under a running node
-      # takes disable/0 then enable/0; the node name is immutable anyway.
-      {:cookie_mismatch, state} -> {:reply, {:error, :cookie_mismatch}, state}
-      {:error, reason} -> {:reply, {:error, reason}, state}
+    # Writes files and nothing else. Everything that can block on the outside
+    # world — epmd, net_kernel, mDNS — belongs to the boot path, which runs it
+    # once. That is what keeps this call unable to wedge the server.
+    case read_or_mint(state) do
+      {:ok, cookie} ->
+        reply = %{
+          node: state.node || planned_node(state),
+          cookie: cookie,
+          # From the live VM, not from state.node: a node that died underneath
+          # us leaves the name cached, and answering "no reboot needed" off that
+          # would send an operator away from the one thing that fixes it.
+          reboot_required: not alive?(state)
+        }
+
+        {:reply, {:ok, reply}, state}
+
+      {:error, reason} ->
+        {:reply, {:error, reason}, state}
     end
   end
 
+  # The running node is deliberately left alone: stopping it in place is what
+  # required threading net_kernel/epmd/mDNS teardown through every failure mode,
+  # and for a mode toggled a handful of times a reboot buys the same result for
+  # none of the machinery. While a cookie file remains, the next boot brings
+  # distribution back — so a failed delete is the one thing worth reporting.
   def handle_call(:disable, _from, state) do
-    case stop_distribution(state) do
-      {:ok, state} -> {:reply, :ok, state}
-      {:error, reason, state} -> {:reply, {:error, {:disable_incomplete, reason}}, state}
+    case Enum.find([delete_cookie(state), delete_erlang_cookie(state)], &(&1 != :ok)) do
+      nil -> {:reply, :ok, state}
+      {:error, reason} -> {:reply, {:error, reason}, state}
     end
   end
 
   def handle_call(:status, _from, state) do
     status = %{
-      # Both halves, because either can be false on its own: `state.node` is nil
-      # before a start, and it outlives a `net_kernel` stopped from anywhere
-      # else on the board. `node` is still reported so a stale name remains
+      # `node` is still reported when this is false, so a stale name remains
       # diagnosable rather than vanishing.
-      alive?: state.node != nil and state.seams.alive_fun.(),
+      alive?: alive?(state),
       node: state.node,
       cookie_present?: File.exists?(state.cookie_path),
       address: state.address,
       ifname: state.ifname,
       ports: @port_min..@port_max,
-      drift: state.drift
+      drift: state.drift,
+      # Why the board is not distributed, for an operator who would otherwise
+      # have to grep the logs. `enable/0` used to answer this by returning the
+      # start's error; it no longer starts anything, so this is the only window
+      # onto a boot that refused.
+      last_error: state.last_error
     }
 
     {:reply, status, state}
@@ -322,7 +361,7 @@ defmodule Vagus.Dist do
 
       {:error, reason} ->
         Logger.warning("Vagus.Dist: cookie unusable (#{inspect(reason)}), staying idle")
-        state
+        %{state | last_error: reason}
     end
   end
 
@@ -359,7 +398,7 @@ defmodule Vagus.Dist do
   end
 
   defp schedule_retry(state, reason) do
-    state = cancel_retry(state)
+    state = %{cancel_retry(state) | last_error: reason}
     attempt = state.attempt + 1
 
     if attempt > @retry_attempts do
@@ -400,7 +439,8 @@ defmodule Vagus.Dist do
     %{state | retry_ref: nil}
   end
 
-  defp settled(state), do: %{cancel_retry(state) | attempt: 0, gave_up?: false}
+  defp settled(state),
+    do: %{cancel_retry(state) | attempt: 0, gave_up?: false, last_error: nil}
 
   # An address event either starts a node that has not started yet, or —
   # once alive — reports drift. The node name embeds the address and is
@@ -835,6 +875,21 @@ defmodule Vagus.Dist do
     |> Enum.find(&match?({:ok, ^address}, first_ipv4(addresses(state, &1))))
   end
 
+  # What the board will call itself after the reboot. nil when no physical
+  # address resolves yet: the name embeds the address, so it cannot be known
+  # before one does.
+  # Both halves, because either can be false on its own: `state.node` is nil
+  # before a start, and it outlives a `net_kernel` stopped from anywhere else on
+  # the board.
+  defp alive?(state), do: state.node != nil and state.seams.alive_fun.()
+
+  defp planned_node(state) do
+    case resolve_address(state) do
+      {:ok, _ifname, address} -> node_name(address)
+      {:error, _reason} -> nil
+    end
+  end
+
   defp node_address(name) do
     with [_vagus, host] <- String.split(Atom.to_string(name), "@", parts: 2),
          {:ok, ip} <- :inet.parse_ipv4_address(String.to_charlist(host)) do
@@ -1022,60 +1077,6 @@ defmodule Vagus.Dist do
     end
   end
 
-  # Deliberately NOT gated on `state.node`: after a GenServer crash-restart the
-  # node can be live while state.node is nil, and disable/0 is then the only
-  # way back. Keep it ungated.
-  defp stop_distribution(state) do
-    mdns = withdraw(state)
-    net_kernel = state.seams.net_kernel_stop_fun.()
-    epmd = kill_epmd(state)
-
-    # `Node.alive?/0` decides, not either return value: `net_kernel.stop/0`
-    # answers `{:error, not_allowed | not_found}` and this module used to
-    # hard-code `:ok` over it, and `epmd -kill` exits non-zero on the
-    # deregistration race kill_epmd/1 retries through.
-    alive? = state.seams.alive_fun.()
-
-    errors =
-      [if(alive?, do: {:still_alive, net_kernel}), reason_of(epmd), reason_of(mdns)]
-      |> Enum.reject(&is_nil/1)
-
-    finish_stop(errors, if(alive?, do: state, else: cleared(state)))
-  end
-
-  # Both cookie files go LAST and only on a clean stop. Deleting them over a
-  # node that is still up destroys the only record of the secret that still
-  # authenticates it, while status/0 reports the gate shut — the worst
-  # available outcome, and the one this ordering exists to prevent.
-  defp finish_stop([], state) do
-    [delete_cookie(state), delete_erlang_cookie(state)]
-    |> Enum.map(&reason_of/1)
-    |> Enum.reject(&is_nil/1)
-    |> case do
-      [] -> {:ok, state}
-      errors -> {:error, errors, state}
-    end
-  end
-
-  defp finish_stop(errors, state) do
-    Logger.warning("Vagus.Dist: disable incomplete (#{inspect(errors)}); cookies left in place")
-    {:error, errors, state}
-  end
-
-  defp reason_of(:ok), do: nil
-  defp reason_of({:error, reason}), do: reason
-
-  # `disable/0` promises `{:error, {:disable_incomplete, _}}` covers the
-  # withdrawal, so the result has to be threaded rather than dropped — and
-  # `MdnsLite.remove_mdns_service/1` exits when its `TableServer` is down, which
-  # would otherwise take out the caller mid-teardown, after net_kernel has
-  # already been stopped.
-  defp withdraw(state) do
-    state.seams.mdns_remove_fun.(@mdns_service_id)
-  catch
-    kind, reason -> {:error, {:mdns_not_withdrawn, kind, reason}}
-  end
-
   defp cleared(state) do
     %{
       cancel_retry(state)
@@ -1088,15 +1089,10 @@ defmodule Vagus.Dist do
     }
   end
 
-  # Safe only after net_kernel deregistered: epmd refuses to die while a node
-  # is still registered with it, and that deregistration is asynchronous, so
-  # the first attempt losing the race is normal rather than a failure.
-  #
-  # No epmd at all is SUCCESS, not failure. `epmd -kill` exits non-zero when it
-  # cannot connect, and treating that as an error made `disable/0` refuse — and
-  # therefore keep the cookie files — on a board that never started epmd, which
-  # is exactly the corrupt-cookie state whose documented recovery is `disable/0`
-  # then `enable/0`.
+  # Only reachable from the boot-path rollback now that disable/0 leaves the
+  # running node to the reboot. Probing first keeps it off `epmd -kill` with
+  # nothing to kill, which is both pointless and — measured — the one epmd
+  # invocation that can hang under a supervising wrapper.
   defp kill_epmd(state) do
     # `:unknown` tries the kill rather than skipping it: on the teardown side the
     # conservative move is to attempt it and report failure, not to assume there
@@ -1185,7 +1181,6 @@ defmodule Vagus.Dist do
       vintage_net_fun: Keyword.get(opts, :vintage_net_fun, &default_property/2),
       subscribe_fun: Keyword.get(opts, :subscribe_fun, &default_subscribe/1),
       mdns_add_fun: Keyword.get(opts, :mdns_add_fun, &default_mdns_add/1),
-      mdns_remove_fun: Keyword.get(opts, :mdns_remove_fun, &default_mdns_remove/1),
       put_env_fun: Keyword.get(opts, :put_env_fun, &default_put_env/2),
       set_cookie_fun: Keyword.get(opts, :set_cookie_fun, &default_set_cookie/1),
       get_cookie_fun: Keyword.get(opts, :get_cookie_fun, &:erlang.get_cookie/0),
@@ -1275,12 +1270,10 @@ defmodule Vagus.Dist do
     defp default_property(_property, default), do: default
     defp default_subscribe(_property), do: :ok
     defp default_mdns_add(_service), do: :ok
-    defp default_mdns_remove(_id), do: :ok
   else
     defp default_configured_interfaces, do: VintageNet.configured_interfaces()
     defp default_property(property, default), do: VintageNet.get(property, default)
     defp default_subscribe(property), do: VintageNet.subscribe(property)
     defp default_mdns_add(service), do: MdnsLite.add_mdns_service(service)
-    defp default_mdns_remove(id), do: MdnsLite.remove_mdns_service(id)
   end
 end

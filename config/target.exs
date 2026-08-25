@@ -222,8 +222,10 @@ config :vagus, :ssh_access_path, "/data/ssh_access.dets"
 # Anything on disk that enable/0 did not write is corruption and is refused —
 # the board stays idle. Adopting such a file once yielded a live node with the
 # cookie `:''`, which is unauthenticated root-equivalent LAN access.
-# `Vagus.Dist` also owns `/root/.erlang.cookie` (0400, same value), which it
-# seeds before `net_kernel` starts and deletes on `disable/0`.
+# `Vagus.Dist` also owns `/root/.erlang.cookie` (0400, same value), seeded at
+# boot immediately before `net_kernel` starts and deleted by `disable/0`. Both
+# `enable/0` and `disable/0` take effect on the NEXT boot — they write and
+# remove these files, never a running node.
 config :vagus, :dist_cookie_path, "/data/vagus.cookie"
 
 # One-shot marker for `Vagus.Core.PortMigration` (core-socket-port80 Phase
