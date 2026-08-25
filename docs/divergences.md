@@ -222,17 +222,21 @@ divergence is still real" assertion. They are ledgered here instead.
 
 `Vagus.Dist` can take a board's BEAM distributed at runtime — an agent with the
 SSH access it already has runs one function call and gets a node name plus a
-cookie back, with no firmware build and no reboot. That capability ships in
-every release; the gate is the presence of `/data/vagus.cookie`, so no board
-has it on until someone turns it on.
+cookie back, with no firmware build and no OTA. That capability ships in every
+release; the gate is the presence of `/data/vagus.cookie`, so no board has it on
+until someone turns it on — and turning it on or off takes effect at the next
+reboot, not immediately (see below).
 
 **This diverges from published guidance, not from upstream Supervisor.** Home
 Assistant's Supervisor has no equivalent to diverge from — it is a Python
 container. What is diverged from is the [EEF Security WG's position on
 distribution](https://security.erlef.org/secure_coding_and_deployment_hardening/distribution.html):
-cookie-only distribution over a LAN is stated to be insufficient. The cookie is
-a shared secret sent in the clear, there is no MITM protection, and epmd hands
-out the node's name and port to anyone who asks, unauthenticated. Recording it
+cookie-only distribution over a LAN is stated to be insufficient. Not because
+the cookie travels: the handshake is challenge-response over a digest, so the
+secret itself is never put on the wire. The problem is everything after it —
+without `inet_tls_dist` the session is unencrypted and unauthenticated beyond
+that first exchange, so there is no protection against a man in the middle, and
+epmd hands out the node's name and port to anyone who asks. Recording it
 here because "we accepted the risk" is not an argument, and a divergence nobody
 wrote down becomes a surprise later.
 

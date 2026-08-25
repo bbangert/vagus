@@ -264,10 +264,14 @@ defmodule Vagus.Dist do
         reply = %{
           node: state.node || planned_node(state),
           cookie: cookie,
-          # From the live VM, not from state.node: a node that died underneath
-          # us leaves the name cached, and answering "no reboot needed" off that
-          # would send an operator away from the one thing that fixes it.
-          reboot_required: not alive?(state)
+          # Asked of the VM only, never of state.node: the question is whether
+          # the cookie just written is already in effect, and this module's
+          # bookkeeping does not decide that — it is nil for a whole live node
+          # between a GenServer restart and the next reconcile. A reboot is owed
+          # when nothing is running, or when something is running under a
+          # DIFFERENT cookie, which is what disable/0-then-enable/0 on a live
+          # board produces.
+          reboot_required: not state.seams.alive_fun.() or cookie_mismatch?(state, cookie)
         }
 
         {:reply, {:ok, reply}, state}
@@ -315,8 +319,12 @@ defmodule Vagus.Dist do
     {:noreply, on_address_event(state)}
   end
 
+  # Through boot/1, NOT straight to try_boot_start/1: boot/1 is where the
+  # cookie-presence gate lives. Skipping it meant a retry pending when
+  # disable/0 ran would find :enoent, MINT a fresh cookie, and silently
+  # re-enable the next boot — undoing the disable that had just reported :ok.
   def handle_info(:retry_start, %{node: nil} = state) do
-    {:noreply, try_boot_start(%{state | retry_ref: nil})}
+    {:noreply, boot(%{state | retry_ref: nil})}
   end
 
   # Already up — a retry raced a successful address event.
@@ -404,7 +412,8 @@ defmodule Vagus.Dist do
     if attempt > @retry_attempts do
       Logger.warning(
         "Vagus.Dist: giving up after #{@retry_attempts} attempts (#{inspect(reason)}); " <>
-          "an address event or Vagus.Dist.enable/0 can still start it"
+          "an address event still retries, otherwise reboot — enable/0 only " <>
+          "writes the cookie and will not start it"
       )
 
       %{state | attempt: attempt, gave_up?: true}
@@ -561,23 +570,33 @@ defmodule Vagus.Dist do
   #
   # path is config-derived (app env) or $HOME-derived, not request input
   # sobelow_skip ["Traversal.FileModule"]
+  # `:raw` + `:file.write/2` rather than `IO.binwrite/2`, for the same reason
+  # `Vagus.Addon.Store.Assets.write_exclusive/2` does it: on Elixir 1.20
+  # `IO.binwrite/2` **raises** on a write error instead of returning
+  # `{:error, reason}`. Here that would turn a full `/data` into an exception
+  # escaping the never-crash boot path, and skip the `File.rm(tmp)` cleanup on
+  # precisely the failure that cleanup exists for.
+  #
+  # `File.close/1` is still checked: with buffered writes that is where an
+  # `:enospc` surfaces, and without it a truncated cookie gets renamed into
+  # place with only its MODE proven.
   defp write_secret(state, path, contents, mode) do
     tmp = path <> ".tmp"
     _ = File.rm(tmp)
 
-    case File.open(tmp, [:write, :exclusive, :binary]) do
+    case File.open(tmp, [:write, :binary, :exclusive, :raw]) do
       {:ok, io} ->
-        # `File.close/1` is where a buffered write actually fails (`:enospc` on
-        # /data), so its result is part of the write, not cleanup: without it a
-        # truncated cookie gets renamed into place and only its MODE is proven.
         written =
-          with :ok <- state.seams.chmod_fun.(tmp, mode),
-               :ok <- IO.binwrite(io, contents) do
-            File.close(io)
-          else
-            error ->
+          try do
+            with :ok <- state.seams.chmod_fun.(tmp, mode),
+                 :ok <- :file.write(io, contents) do
               File.close(io)
-              error
+            end
+          after
+            # Belt and braces: releases the fd even if a seam raises. Closing
+            # twice on the success path answers {:error, :einval} and is
+            # discarded — the close that carries the error is the one above.
+            File.close(io)
           end
 
         place_secret(written, tmp, path)
@@ -786,9 +805,14 @@ defmodule Vagus.Dist do
       :erlang.raise(kind, reason, __STACKTRACE__)
   end
 
+  # The cleanup failure travels WITH the original reason. Discarding it meant a
+  # give-up could leave epmd listening while `last_error` said only why the
+  # bring-up failed, never that the rollback had failed too.
   defp roll_back(state, reason) do
-    kill_epmd(state)
-    {:error, reason}
+    case kill_epmd(state) do
+      :ok -> {:error, reason}
+      {:error, cleanup} -> {:error, {reason, {:rollback_failed, cleanup}}}
+    end
   end
 
   # `Node.self/0` is authoritative here, not anything this module remembers:

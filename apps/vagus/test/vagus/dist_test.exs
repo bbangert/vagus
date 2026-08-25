@@ -859,6 +859,32 @@ defmodule Vagus.DistTest do
       refute_received {:step, :net_kernel_stop}
     end
 
+    test "a live node on a different cookie still needs the reboot", ctx do
+      # disable/0 then enable/0 on a running board: the new cookie cannot
+      # authenticate until the reboot, so saying reboot_required: false would
+      # send the operator away with a cookie that does not work.
+      pid =
+        start_dist!(ctx,
+          alive_fun: fn -> true end,
+          self_node_fun: fn -> :"vagus@192.168.2.58" end,
+          get_cookie_fun: fn -> @other_cookie_atom end
+        )
+
+      assert {:ok, %{reboot_required: true}} = Dist.enable(pid)
+    end
+
+    test "a second enable on a matching live node needs no reboot", ctx do
+      pid =
+        start_dist!(ctx,
+          alive_fun: fn -> true end,
+          self_node_fun: fn -> :"vagus@192.168.2.58" end,
+          get_cookie_fun: fn -> @cookie_atom end
+        )
+
+      seed_cookie!(ctx)
+      assert {:ok, %{reboot_required: false}} = Dist.enable(pid)
+    end
+
     test "enable/0 reports the cookie the NEXT boot will use, not the live one", ctx do
       # Rotating the secret under a running node used to need a :cookie_mismatch
       # refusal, because enable/0 claimed to have applied what it returned. It
@@ -1021,6 +1047,27 @@ defmodule Vagus.DistTest do
       pid = start_dist!(ctx)
 
       assert {:error, {:cookie_not_removed, _path, _reason}} = Dist.disable(pid)
+    end
+
+    test "a retry pending across disable/1 must not re-mint the cookie", ctx do
+      # The retry used to call try_boot_start/1 directly, skipping boot/1 where
+      # the cookie-presence gate lives. read_or_mint/1 then saw :enoent, MINTED
+      # a fresh cookie, and silently re-enabled the next boot — undoing the
+      # disable that had just answered :ok.
+      seed_cookie!(ctx)
+      {pid, _view} = start_dist(ctx, interfaces: %{"eth0" => {:disconnected, []}})
+
+      refute Dist.status(pid).alive?
+      assert is_reference(:sys.get_state(pid).retry_ref)
+
+      assert :ok = Dist.disable(pid)
+      refute File.exists?(ctx.path)
+
+      # Fire the pending retry by hand — the gate must hold.
+      send(pid, :retry_start)
+      refute Dist.status(pid).alive?
+      refute File.exists?(ctx.path)
+      refute File.exists?(ctx.home)
     end
 
     test "a missing cookie file is not a failure", ctx do
