@@ -124,12 +124,11 @@ config :mdns_lite,
       protocol: "sftp-ssh",
       transport: "tcp",
       port: 22
-    },
-    %{
-      protocol: "epmd",
-      transport: "tcp",
-      port: 4369
     }
+
+    # No static `epmd` entry: epmd only exists while `Vagus.Dist` has the
+    # node up, and it adds/removes the advertisement at runtime so the ad is
+    # true exactly when the service is there.
   ]
 
 # Supervisor-API emulator (P2-T1/T2). Core's SUPERVISOR env var carries
@@ -208,6 +207,24 @@ config :vagus, :supervisor_options_path, "/data/vagus/supervisor_options.json"
 # the private key is stored unencrypted, so the file is held at mode 0600
 # and no key is generated until that is proven.
 config :vagus, :ssh_access_path, "/data/ssh_access.dets"
+
+# The gate for runtime Erlang distribution (`Vagus.Dist`). Its PRESENCE is
+# the switch — the file holds the cookie, and no cookie file means the board
+# stays `:nonode@nohost`. A config flag would need a firmware build and an
+# OTA to flip (there is no config/runtime.exs here), which is the exact cost
+# this feature exists to avoid. Same `/data` writable-path convention as the
+# keys above; the mode is held at 0600 and proven before anything starts.
+# Deliberately unset in host.exs/test.exs — an unset key makes the child
+# `:ignore`.
+#
+# Because presence is the switch, `touch`ing this file is a supported gesture:
+# an empty one mints a fresh cookie over itself. Content that is not 64
+# lowercase hex characters is REFUSED and the board stays idle — adopting it
+# once yielded a live node with the cookie `:''`, which is unauthenticated
+# root-equivalent LAN access. `Vagus.Dist` also owns `/root/.erlang.cookie`
+# (0400, same value), which it seeds before `net_kernel` starts and deletes on
+# `disable/0`.
+config :vagus, :dist_cookie_path, "/data/vagus.cookie"
 
 # One-shot marker for `Vagus.Core.PortMigration` (core-socket-port80 Phase
 # B): the rewrite of the 8123 Core persisted for itself in

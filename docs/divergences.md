@@ -215,3 +215,91 @@ from the store path, and the no-skel control failing outright.
 Supervisor add-on, which has no `dsp:` — so these two mounts never appear in
 that spec and cannot be registered there without failing its "each declared
 divergence is still real" assertion. They are ledgered here instead.
+
+---
+
+## Cookie-only Erlang distribution, on a LAN, off by default
+
+`Vagus.Dist` can take a board's BEAM distributed at runtime — an agent with the
+SSH access it already has runs one function call and gets a node name plus a
+cookie back, with no firmware build and no reboot. That capability ships in
+every release; the gate is the presence of `/data/vagus.cookie`, so no board
+has it on until someone turns it on.
+
+**This diverges from published guidance, not from upstream Supervisor.** Home
+Assistant's Supervisor has no equivalent to diverge from — it is a Python
+container. What is diverged from is the [EEF Security WG's position on
+distribution](https://security.erlef.org/secure_coding_and_deployment_hardening/distribution.html):
+cookie-only distribution over a LAN is stated to be insufficient. The cookie is
+a shared secret sent in the clear, there is no MITM protection, and epmd hands
+out the node's name and port to anyone who asks, unauthenticated. Recording it
+here because "we accepted the risk" is not an argument, and a divergence nobody
+wrote down becomes a surprise later.
+
+**What is done about it instead.**
+
+*Off unless asked for.* No cookie file, no distribution. `Vagus.Dist.disable/0`
+deletes both cookie files, stops `net_kernel`, kills epmd, and withdraws the
+mDNS advertisement, so the gate closes as completely as it opened — or reports
+`{:error, {:disable_incomplete, _}}` and deletes nothing, because a cookie file
+removed while the node is still up destroys the only record of the secret that
+still authenticates it. The capability is observably inert on a board nobody
+enabled it on: `:nonode@nohost`, nothing listening.
+
+*Cookie secrecy is the control that keeps add-ons out.* This is the one that
+matters most on this device, and it is worth being exact about which control
+does the work. `/data/vagus.cookie` is 0600 root-owned, and `/data` is not among
+the paths bound into add-on containers — the add-on data root is
+`/root/vagus/addons`. An add-on therefore cannot read the secret, and without it
+the distribution port answers nothing.
+
+*Bound to one physical address, never the wildcard.*
+`:inet_dist_use_interface` pins the listener to a single VintageNet-managed
+`eth*`/`wlan*`/`usb*` address, and `ERL_EPMD_ADDRESS` pins epmd to the same one.
+**What this buys is narrower than it looks, and this doc used to overstate it.**
+It keeps the listener off every other address the board holds and collapses the
+exposure to one `{address, port-range}` pair that can be firewalled — it does
+**not** make the port unreachable from an add-on container. This repo already
+documents why, in `Vagus.API.SourceGuard`: a packet from a `hassio`-bridge
+container addressed to the board's own LAN IP is delivered **locally**, so it
+never traverses `FORWARD`, and `Vagus.Network.Nat` writes only the `nat` table —
+there is no `filter` rule anywhere that drops it. A container that dials the LAN
+address reaches the dist port. It is the cookie it cannot get.
+
+Overlay interfaces (Tailscale, WireGuard, anything later) are excluded by
+construction rather than by a denylist: they are brought up by their own daemons
+and never appear in `VintageNet.configured_interfaces/0`.
+
+*Predictable ports.* 4369 plus 9100-9105, pinned, so the range can be
+firewalled at the LAN edge rather than discovered.
+
+*The cookie is 32 bytes of `:crypto.strong_rand_bytes/1`*, written 0600 with the
+mode read back and verified before anything starts — an unverifiable-mode cookie
+file refuses to start distribution at all, and a file whose contents are not
+what `Vagus.Dist` mints is refused without being read. An empty file is the
+documented `touch` gesture and mints a fresh cookie; anything else non-empty is
+`{:error, :cookie_malformed}`, because adopting it once produced a live node
+with the cookie `:''`.
+
+`:erlang.set_cookie/1` cannot run before `net_kernel` — it raises
+`:distribution_not_started` — so the ordering is: **seed `$HOME/.erlang.cookie`
+(0400) with our value, start `net_kernel`, call `set_cookie/1`, then read
+`get_cookie/0` back and stop the node if it disagrees.** `auth:init_cookie/0`
+reads that seeded file, so the node is never live under a secret we did not
+choose, and the release-baked `releases/COOKIE` never applies. That baked value
+used to be `vagus_platform_cookie`, derived from a name in a public repo; it is
+now random per build as defence in depth.
+
+*On-disk secrets this creates:* `/data/vagus.cookie` (0600) and
+`/root/.erlang.cookie` (0400). The second is deliberate. A `.erlang.cookie` was
+always going to exist under `$HOME` once distribution started — the only choice
+is between one OTP mints behind our back and one we own, can verify, and can
+delete.
+
+**What has not been done.** TLS distribution (`inet_tls_dist`) is the hardening
+that would actually close this: `-proto_dist inet_tls`, ssl in the boot script,
+`-ssl_dist_optfile` and a certificate per board. It is rated moderate overhead
+and is a realistic later step rather than a blocker for a dev fleet on a
+trusted LAN, and it is filed as such. Until then, treat an enabled board as
+equivalent to an unauthenticated root shell open to its LAN segment, and turn
+it off when the work is done.
