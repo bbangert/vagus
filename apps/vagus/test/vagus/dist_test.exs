@@ -55,6 +55,15 @@ defmodule Vagus.DistTest do
     # set_cookie/1 was last given, and :nocookie before anything was.
     {:ok, vm} = Agent.start_link(fn -> :nocookie end)
 
+    # And epmd as the board really behaves — measured on a dragon_q6a:
+    #   no daemon:  {"epmd: Cannot connect to local epmd\n", 1}
+    #   running:    {"epmd: up and running on port 4369 with data:\n", 0}
+    #   -kill:      {"Killed\n", 0}
+    # A fake that answered `-names` identically either way could not express
+    # "nothing to kill", which is the state the corrupt-cookie recovery hits.
+    {:ok, epmd} = Agent.start_link(fn -> false end)
+    on_exit(fn -> if Process.alive?(epmd), do: Agent.stop(epmd) end)
+
     on_exit(fn -> if Process.alive?(view), do: Agent.stop(view) end)
     on_exit(fn -> if Process.alive?(vm), do: Agent.stop(vm) end)
 
@@ -96,7 +105,21 @@ defmodule Vagus.DistTest do
         epmd_fun:
           Keyword.get(opts, :epmd_fun, fn args, env ->
             record(test, {:epmd, args, env})
-            {"", 0}
+
+            case args do
+              ["-daemon"] ->
+                Agent.update(epmd, fn _ -> true end)
+                {"", 0}
+
+              ["-kill"] ->
+                Agent.update(epmd, fn _ -> false end)
+                {"Killed\n", 0}
+
+              ["-names"] ->
+                if Agent.get(epmd, & &1),
+                  do: {"epmd: up and running on port 4369 with data:\n", 0},
+                  else: {"epmd: Cannot connect to local epmd\n", 1}
+            end
           end),
         sleep_fun: fn ms -> record(test, {:sleep, ms}) end,
         # Left at their real defaults unless a test names them: on this
@@ -413,6 +436,19 @@ defmodule Vagus.DistTest do
 
       assert {:error, :no_address} = Dist.enable(pid)
       refute_received {:step, :net_kernel_start, _, _}
+    end
+
+    test "refuses the unspecified address instead of wildcard-binding", ctx do
+      # 0.0.0.0 IS the wildcard. Passing it to :inet_dist_use_interface and
+      # ERL_EPMD_ADDRESS would bind every address on the board while looking
+      # like a pin.
+      pid =
+        start_dist!(ctx,
+          interfaces: %{"eth0" => {:lan, [%{address: {0, 0, 0, 0}, family: :inet}]}}
+        )
+
+      assert {:error, :no_address} = Dist.enable(pid)
+      refute_received {:step, :put_env, :inet_dist_use_interface, _}
     end
 
     test "no qualifying address means no net_kernel call at all", ctx do
@@ -856,6 +892,19 @@ defmodule Vagus.DistTest do
                Dist.disable(pid)
     end
 
+    test "succeeds when epmd was never started — the corrupt-cookie recovery path", ctx do
+      # A board that refused its cookie never started epmd, so `epmd -kill`
+      # exits non-zero. Treating that as failure kept the corrupt file on disk
+      # and made the documented disable/0-then-enable/0 recovery impossible.
+      seed_cookie!(ctx, "not-a-valid-cookie")
+
+      pid = start_dist!(ctx)
+      refute Dist.status(pid).alive?
+
+      assert :ok = Dist.disable(pid)
+      refute File.exists?(ctx.path)
+    end
+
     test "a missing cookie file is not a failure", ctx do
       pid = start_dist!(ctx)
       assert :ok = Dist.disable(pid)
@@ -1068,31 +1117,32 @@ defmodule Vagus.DistTest do
   end
 
   describe "run/1" do
-    test "evaluates the fun in a separate process that already has async_dist set" do
-      test_pid = self()
+    test "sets async_dist on the CALLING process — the one that sends over distribution" do
+      # Under :erpc.call/5 the caller is the erpc-spawned process, and the
+      # payload leaves the node as ITS exit reason (erpc.erl execute_call/4
+      # ends in exit(Reply)). Running the fun in a child Task and flagging the
+      # child would flag a process whose only send is local to Task.await/2,
+      # leaving the remote reply unflagged — the whole point of run/1, lost.
+      previous = Process.flag(:async_dist, false)
+      caller = self()
 
-      {previous_flag, runner} =
+      {flag_while_running, runner} =
         Dist.run(fn -> {:erlang.process_flag(:async_dist, true), self()} end)
 
-      # process_flag returns the PREVIOUS value, so `true` proves run/1 set it
-      # before the fun ran.
-      assert previous_flag
-      refute runner == test_pid
+      # process_flag returns the PREVIOUS value: true proves run/1 set it before
+      # the fun ran, and runner == caller proves it set it on the right process.
+      assert flag_while_running
+      assert runner == caller
+
+      Process.flag(:async_dist, previous)
     end
 
-    test "a raise inside the fun reaches the caller, because the task is linked" do
-      # The linking is deliberate — the task's lifetime has to stay tied to the
-      # erpc caller, which is why this does NOT run under
-      # Vagus.Jobs.TaskSupervisor.
-      Process.flag(:trap_exit, true)
-
-      assert {{%RuntimeError{message: "boom"}, _stacktrace}, {Task, :await, _args}} =
-               catch_exit(Dist.run(fn -> raise "boom" end))
+    test "a raise inside the fun propagates to the caller unchanged" do
+      assert_raise RuntimeError, "boom", fn -> Dist.run(fn -> raise "boom" end) end
     end
 
-    test "an exit inside the fun reaches the caller too" do
-      Process.flag(:trap_exit, true)
-      assert {:nope, {Task, :await, _args}} = catch_exit(Dist.run(fn -> exit(:nope) end))
+    test "an exit inside the fun propagates to the caller unchanged" do
+      assert :nope == catch_exit(Dist.run(fn -> exit(:nope) end))
     end
   end
 end

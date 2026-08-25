@@ -164,9 +164,14 @@ defmodule Vagus.Dist do
   kills epmd, and deletes both cookie files.
 
   `{:error, {:disable_incomplete, _}}` means at least one of those did not
-  happen. The cookie files are then left in place on purpose — see
-  `stop_distribution/1` — and `status/0` keeps reporting the node as up if it
-  still is.
+  happen, and `status/0` keeps reporting the node as up if it still is.
+
+  It does **not** guarantee both cookie files survive. If the teardown itself
+  failed, nothing is deleted — that is the case the ordering exists for, since
+  deleting the secret over a live node destroys the only record of what still
+  authenticates it. But once teardown succeeds, both removals are attempted and
+  either can fail on its own, so a `disable_incomplete` carrying only a
+  `:cookie_not_removed` can leave exactly one file behind. Read the reason.
   """
   @spec disable(GenServer.server()) :: :ok | {:error, term()}
   def disable(server \\ __MODULE__), do: GenServer.call(server, :disable, 30_000)
@@ -175,21 +180,28 @@ defmodule Vagus.Dist do
   def status(server \\ __MODULE__), do: GenServer.call(server, :status)
 
   @doc """
-  Runs `fun` in a process flagged `async_dist`, returning its value.
+  Flags the CALLING process `async_dist`, then runs `fun` and returns its value.
 
   Distribution buffer flow-control suspends a sending process when the
   outbound buffer fills, which can defer a long `:erpc.call` past its
   timeout — the failure mode for the multi-minute, multi-megabyte runs this
   feature exists to serve. `async_dist` makes those sends buffer instead of
   blocking. Wrap bulk transfers in it; a small MFA does not need it.
+
+  The flag is process-local and must sit on whichever process actually puts
+  the bytes on the wire. Under `:erpc.call/5` that is the process running
+  this function: `erpc` spawns it via `spawn_request/5` and returns the
+  result as its **exit reason** (`erpc.erl` `execute_call/4` ends in
+  `exit(Reply)`), so the payload leaves the node with this process, not with
+  anything it spawned. Running `fun` in a child Task and flagging the child
+  therefore flags a process whose only send is local to `Task.await/2` — the
+  remote reply still goes out unflagged, which is the bug this note exists
+  to prevent from coming back.
   """
   @spec run((-> result)) :: result when result: term()
   def run(fun) when is_function(fun, 0) do
-    Task.async(fn ->
-      Process.flag(:async_dist, true)
-      fun.()
-    end)
-    |> Task.await(:infinity)
+    Process.flag(:async_dist, true)
+    fun.()
   end
 
   @impl GenServer
@@ -622,6 +634,10 @@ defmodule Vagus.Dist do
     end
   end
 
+  # `0.0.0.0` is the wildcard itself: handing it to `:inet_dist_use_interface`
+  # and `ERL_EPMD_ADDRESS` would bind every address on the board while looking
+  # like a pin. Rejected explicitly rather than trusted not to appear.
+  defp routable?({0, 0, 0, 0}), do: false
   defp routable?({127, _, _, _}), do: false
   defp routable?({169, 254, _, _}), do: false
   defp routable?(_ip), do: true
@@ -958,7 +974,22 @@ defmodule Vagus.Dist do
   # Safe only after net_kernel deregistered: epmd refuses to die while a node
   # is still registered with it, and that deregistration is asynchronous, so
   # the first attempt losing the race is normal rather than a failure.
+  #
+  # No epmd at all is SUCCESS, not failure. `epmd -kill` exits non-zero when it
+  # cannot connect, and treating that as an error made `disable/0` refuse — and
+  # therefore keep the cookie files — on a board that never started epmd, which
+  # is exactly the corrupt-cookie state whose documented recovery is `disable/0`
+  # then `enable/0`.
   defp kill_epmd(state) do
+    if epmd_present?(state), do: do_kill_epmd(state), else: :ok
+  end
+
+  defp epmd_present?(state) do
+    {output, _status} = state.seams.epmd_fun.(["-names"], [])
+    epmd_running?(output)
+  end
+
+  defp do_kill_epmd(state) do
     case state.seams.epmd_fun.(["-kill"], []) do
       {_output, 0} ->
         :ok

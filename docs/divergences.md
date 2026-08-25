@@ -241,10 +241,13 @@ wrote down becomes a surprise later.
 *Off unless asked for.* No cookie file, no distribution. `Vagus.Dist.disable/0`
 deletes both cookie files, stops `net_kernel`, kills epmd, and withdraws the
 mDNS advertisement, so the gate closes as completely as it opened — or reports
-`{:error, {:disable_incomplete, _}}` and deletes nothing, because a cookie file
-removed while the node is still up destroys the only record of the secret that
-still authenticates it. The capability is observably inert on a board nobody
-enabled it on: `:nonode@nohost`, nothing listening.
+`{:error, {:disable_incomplete, _}}`. If the **teardown** failed, nothing is
+deleted: a cookie removed while the node is still up destroys the only record
+of the secret that still authenticates it. If teardown succeeded and only a
+removal failed, the reason says which file, and exactly one may be left behind —
+so treat `disable_incomplete` as "read the reason and check the disk", not as
+"nothing changed". The capability is observably inert on a board nobody enabled
+it on: `:nonode@nohost`, nothing listening.
 
 *Cookie secrecy is the control that keeps add-ons out.* This is the one that
 matters most on this device, and it is worth being exact about which control
