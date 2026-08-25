@@ -81,7 +81,8 @@ defmodule Vagus.DistTest do
           Keyword.get(opts, :subscribe_fun, fn property ->
             record(test, {:subscribe, property})
           end),
-        mdns_add_fun: fn service -> record(test, {:mdns_add, service}) end,
+        mdns_add_fun:
+          Keyword.get(opts, :mdns_add_fun, fn service -> record(test, {:mdns_add, service}) end),
         mdns_remove_fun:
           Keyword.get(opts, :mdns_remove_fun, fn id -> record(test, {:mdns_remove, id}) end),
         put_env_fun: fn key, value -> record(test, {:put_env, key, value}) end,
@@ -533,6 +534,31 @@ defmodule Vagus.DistTest do
       refute_received {:step, :net_kernel_start, _, _}
     end
 
+    test "a TableServer-down mDNS advertisement does not cost us the live node", ctx do
+      # MdnsLite.add_mdns_service/1 exits when its TableServer is down, and this
+      # runs AFTER net_kernel is live. Letting that exit fail the bring-up left
+      # the node up while the boot guard retried into reconcile/2, which used
+      # not to advertise — live and unadvertised, permanently.
+      test = self()
+
+      pid =
+        start_dist!(ctx,
+          mdns_add_fun: fn _service ->
+            record(test, {:mdns_attempted})
+            exit(:noproc)
+          end
+        )
+
+      assert {:ok, %{node: :"vagus@192.168.2.58"}} = Dist.enable(pid)
+      assert_received {:step, :mdns_attempted}
+
+      # Degraded, not broken: the runbook connects by bare IPv4 longname and
+      # does no lookup.
+      status = Dist.status(pid)
+      assert status.alive?
+      assert status.node == :"vagus@192.168.2.58"
+    end
+
     test "refuses when $HOME cannot be derived", ctx do
       # Writing the pre-seed to a relative path would leave `auth` reading a
       # different file and the node up under an OTP-minted cookie.
@@ -741,6 +767,17 @@ defmodule Vagus.DistTest do
 
       # And a second call must not slip through the idempotence guard.
       assert {:error, :cookie_mismatch} = Dist.enable(pid)
+    end
+
+    test "re-advertises mDNS, which is what repairs a failed advertisement", ctx do
+      # Reached after a GenServer restart AND after a bring-up whose ad failed;
+      # MdnsLite may also have restarted and lost the entry.
+      pid = already_started(ctx, :"vagus@192.168.2.58")
+
+      assert Dist.status(pid).alive?
+
+      assert_received {:step, :mdns_add,
+                       %{id: :vagus_epmd, protocol: "epmd", transport: "tcp", port: 4369}}
     end
 
     test "an alive VM short-circuits the whole bring-up", ctx do

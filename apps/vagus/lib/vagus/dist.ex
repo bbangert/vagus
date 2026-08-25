@@ -725,6 +725,13 @@ defmodule Vagus.Dist do
             drift: reconcile_drift(state, live, mismatch?)
         }
 
+        # Re-advertise. This path is reached both after a GenServer restart and
+        # after a bring-up whose advertisement failed, and MdnsLite may itself
+        # have restarted and lost the entry — without this, a node that came up
+        # while the TableServer was down stays live and unadvertised forever.
+        # Re-adding the same id replaces, so it is safe when the ad is present.
+        advertise(state)
+
         Logger.info("Vagus.Dist: reconciled to already-live node #{live}")
         if mismatch?, do: {:cookie_mismatch, state}, else: {:ok, state}
     end
@@ -825,15 +832,32 @@ defmodule Vagus.Dist do
   # sobelow_skip ["DOS.BinToAtom"]
   defp node_name(address), do: :"vagus@#{ip_to_string(address)}"
 
+  # Only after the node is up: advertising a node that is not listening yet
+  # invites a connection that cannot be served.
+  #
+  # Non-fatal on purpose. mDNS here is discovery convenience, not a control —
+  # the runbook connects by bare IPv4 longname and does no lookup — so a board
+  # that is up without an advertisement is degraded, not broken. Tearing down
+  # working distribution because `MdnsLite`'s TableServer is down would be the
+  # worse trade, and it would hand a fresh failure mode to the boot path.
+  # Repair is reconcile/2, which advertises again.
   defp advertise(state) do
-    # Only after the node is up: advertising a node that is not listening yet
-    # invites a connection that cannot be served.
     state.seams.mdns_add_fun.(%{
       id: @mdns_service_id,
       protocol: "epmd",
       transport: "tcp",
       port: @epmd_port
     })
+
+    :ok
+  rescue
+    exception ->
+      Logger.warning("Vagus.Dist: mDNS not advertised (#{Exception.message(exception)})")
+      :ok
+  catch
+    kind, reason ->
+      Logger.warning("Vagus.Dist: mDNS not advertised (#{kind} #{inspect(reason)})")
+      :ok
   end
 
   # Pinned so the range is firewallable and the device gate can assert on it;
