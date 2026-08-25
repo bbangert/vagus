@@ -14,12 +14,20 @@ defmodule Vagus.Dist do
   feature exists to avoid. The cookie file is both the secret and the gate:
   present means distribute, absent means stay a single node.
 
-  Presence is the switch, so `touch`ing the file is a gesture this module has
-  to answer for. An **empty or whitespace-only** file mints a fresh cookie
-  over itself, which is what that gesture is asking for. A file with content
-  that is not 64 lowercase hex characters is **refused** —
-  `{:error, :cookie_malformed}`, board stays idle — rather than adopted,
-  because adopting it once yielded a live node with the cookie `:''`.
+  **`enable/0` is the only thing that ever creates this file.** It is not an
+  operator-editable file and hand-creating one is not a way to turn
+  distribution on — `enable/0` mints the cookie, writes it, and returns it.
+  Anything on disk that is not what `enable/0` writes is therefore corruption,
+  and is refused rather than adopted: empty is `{:error, :cookie_empty}`,
+  content that is not 64 lowercase hex characters is
+  `{:error, :cookie_malformed}`, and a file whose mode is not 0600 is refused
+  without being read. Adopting such a file once yielded a live node with the
+  cookie `:''` — unauthenticated root-equivalent access to the LAN segment.
+
+  To recover from a corrupt file, `disable/0` (which removes both cookie
+  files) then `enable/0`. Nothing overwrites a cookie file in place: a silent
+  replacement would strand a node that is still authenticating with the old
+  value.
 
   ## Two cookie files, two modes
 
@@ -421,12 +429,13 @@ defmodule Vagus.Dist do
   # sobelow_skip ["Traversal.FileModule"]
   defp read_or_mint(state) do
     case File.stat(state.cookie_path) do
-      # `touch /data/vagus.cookie` is the exact gesture the moduledoc and
-      # config/target.exs invite by calling the file's presence the switch, so
-      # an empty file mints — whatever its mode, because there is no secret in
-      # it to adopt.
-      {:ok, %File.Stat{size: 0}} -> mint(state)
+      # Only enable/0 creates this file, so an empty one is corruption — a
+      # truncated write, an interrupted transfer, a hand-made file — never a
+      # request to start. Distinct from :cookie_malformed so the log line can
+      # say which.
+      {:ok, %File.Stat{size: 0}} -> {:error, :cookie_empty}
       {:ok, %File.Stat{mode: mode}} -> read_existing(state, band(mode, 0o777))
+      # The one place a cookie is minted: enable/0 reaching a path with no file.
       {:error, :enoent} -> mint(state)
       {:error, reason} -> {:error, {:cookie_unreadable, reason}}
     end
@@ -447,11 +456,10 @@ defmodule Vagus.Dist do
     end
   end
 
-  # Whitespace-only is the same operator gesture as an empty file. Anything
-  # else that is not what mint/1 writes is refused rather than guessed at: it
-  # would otherwise reach `String.to_atom/1` on the never-crash boot path,
+  # Anything that is not what mint/1 writes is refused rather than guessed at:
+  # it would otherwise reach `String.to_atom/1` on the never-crash boot path,
   # where the 255-character atom limit is a `SystemLimitError`.
-  defp validate(state, ""), do: mint(state)
+  defp validate(_state, ""), do: {:error, :cookie_empty}
 
   defp validate(_state, cookie) do
     if Regex.match?(@cookie_format, cookie),

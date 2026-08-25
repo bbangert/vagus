@@ -217,13 +217,13 @@ config :vagus, :ssh_access_path, "/data/ssh_access.dets"
 # Deliberately unset in host.exs/test.exs — an unset key makes the child
 # `:ignore`.
 #
-# Because presence is the switch, `touch`ing this file is a supported gesture:
-# an empty one mints a fresh cookie over itself. Content that is not 64
-# lowercase hex characters is REFUSED and the board stays idle — adopting it
-# once yielded a live node with the cookie `:''`, which is unauthenticated
-# root-equivalent LAN access. `Vagus.Dist` also owns `/root/.erlang.cookie`
-# (0400, same value), which it seeds before `net_kernel` starts and deletes on
-# `disable/0`.
+# `Vagus.Dist.enable/0` is the ONLY thing that creates this file; it is not
+# operator-editable, and hand-creating one does not turn distribution on.
+# Anything on disk that enable/0 did not write is corruption and is refused —
+# the board stays idle. Adopting such a file once yielded a live node with the
+# cookie `:''`, which is unauthenticated root-equivalent LAN access.
+# `Vagus.Dist` also owns `/root/.erlang.cookie` (0400, same value), which it
+# seeds before `net_kernel` starts and deletes on `disable/0`.
 config :vagus, :dist_cookie_path, "/data/vagus.cookie"
 
 # One-shot marker for `Vagus.Core.PortMigration` (core-socket-port80 Phase

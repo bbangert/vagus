@@ -238,24 +238,41 @@ defmodule Vagus.DistTest do
       assert_received {:step, :set_cookie, @cookie_atom}
     end
 
-    test "an empty cookie file mints rather than refusing — `touch` is the documented gesture",
-         ctx do
+    test "an empty cookie file is corruption, not a request to start", ctx do
+      # enable/0 is the only writer, so a zero-byte file is a truncated write or
+      # a hand-made one — never a signal. Refusing keeps the file's provenance
+      # single: if it exists and is valid, enable/0 put it there.
       File.write!(ctx.path, "")
 
       pid = start_dist!(ctx)
-      assert {:ok, %{cookie: cookie}} = Dist.enable(pid)
-
-      assert String.match?(cookie, ~r/^[0-9a-f]{64}$/)
-      assert mode(ctx.path) == 0o600
+      assert {:error, :cookie_empty} = Dist.enable(pid)
+      refute Dist.status(pid).alive?
+      refute_received {:step, :net_kernel_start, _, _}
+      # Not silently replaced either — overwriting in place would strand a node
+      # still authenticating with whatever the previous value was.
+      assert File.read!(ctx.path) == ""
     end
 
-    test "a whitespace-only cookie file mints too", ctx do
+    test "a whitespace-only cookie file is refused too", ctx do
       File.write!(ctx.path, "\n  \n")
       File.chmod!(ctx.path, 0o600)
 
       pid = start_dist!(ctx)
+      assert {:error, :cookie_empty} = Dist.enable(pid)
+      refute Dist.status(pid).alive?
+    end
+
+    test "enable/0 is the only thing that creates the file", ctx do
+      refute File.exists?(ctx.path)
+
+      pid = start_dist!(ctx)
+      # Starting the GenServer alone must not mint: the gate is the file, and
+      # creating it is enable/0's job, not boot's.
+      refute File.exists?(ctx.path)
+
       assert {:ok, %{cookie: cookie}} = Dist.enable(pid)
-      assert String.match?(cookie, ~r/^[0-9a-f]{64}$/)
+      assert File.read!(ctx.path) == cookie
+      assert mode(ctx.path) == 0o600
     end
 
     test "a malformed cookie is refused, not adopted", ctx do

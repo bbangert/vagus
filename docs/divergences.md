@@ -275,11 +275,11 @@ firewalled at the LAN edge rather than discovered.
 
 *The cookie is 32 bytes of `:crypto.strong_rand_bytes/1`*, written 0600 with the
 mode read back and verified before anything starts — an unverifiable-mode cookie
-file refuses to start distribution at all, and a file whose contents are not
-what `Vagus.Dist` mints is refused without being read. An empty file is the
-documented `touch` gesture and mints a fresh cookie; anything else non-empty is
-`{:error, :cookie_malformed}`, because adopting it once produced a live node
-with the cookie `:''`.
+file refuses to start distribution at all. `Vagus.Dist.enable/0` is the only
+thing that ever writes it, so anything else on disk is corruption and is
+refused rather than adopted — a wrong mode without being read, an empty file as
+`{:error, :cookie_empty}`, non-hex content as `{:error, :cookie_malformed}`.
+Adopting such a file once produced a live node with the cookie `:''`.
 
 `:erlang.set_cookie/1` cannot run before `net_kernel` — it raises
 `:distribution_not_started` — so the ordering is: **seed `$HOME/.erlang.cookie`
