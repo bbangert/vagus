@@ -201,7 +201,11 @@ defmodule Vagus.Dist do
         # rebooting there killed the board with the cookie still in flight and
         # the caller saw only a call timeout. handle_continue/2 runs after the
         # reply is on the wire.
-        if state.seams.alive_fun.() do
+        # Alive is not enough. disable/0-then-enable/0 on a running board leaves
+        # a node up under the OLD cookie, and returning the new one without
+        # rebooting hands the caller a secret that cannot authenticate until
+        # something restarts.
+        if applied?(state, cookie) do
           {:reply, {:ok, reply}, state}
         else
           {:reply, {:ok, reply}, state, {:continue, :reboot}}
@@ -353,35 +357,60 @@ defmodule Vagus.Dist do
   #   * the `get_cookie` read-back LAST, because a node alive under a cookie
   #     that is not ours is the one state this must never leave behind.
   defp bring_up(state, cookie) do
+    # Split at the point epmd becomes ours, so "did this attempt acquire it?" is
+    # answered by WHERE the failure happened rather than by probing afterwards.
+    # A probe cannot tell our daemon from a foreign one, and killing a daemon we
+    # never started is not a rollback.
     with {:ok, address} <- address(state),
          :ok <- pin_ports(state),
-         :ok <- start_epmd(state),
-         :ok <- seed_erlang_cookie(state, cookie),
-         name = node_name(address),
+         :ok <- start_epmd(state) do
+      finish_bring_up(state, cookie, address)
+    else
+      {:error, reason} -> retry(state, reason)
+      other -> retry(state, other)
+    end
+  end
+
+  defp finish_bring_up(state, cookie, address) do
+    name = node_name(address)
+
+    with :ok <- seed_erlang_cookie(state, cookie),
          {:ok, _pid} <- state.seams.net_kernel_start_fun.(name, %{name_domain: :longnames}),
          :ok <- apply_cookie(state, cookie) do
       Logger.info("Vagus.Dist: #{name} alive, dist ports #{@port_min}-#{@port_max}")
       %{cancel_retry(state) | node: name, last_error: nil}
     else
       # Measured: net_kernel answers this even under a DIFFERENT name, so a
-      # restart that also changed address lands here. The node is UP.
+      # restart that also changed address lands here. The node is UP, so epmd
+      # stays — this is the one exit that is not a failure.
       {:error, {:already_started, _pid}} ->
         %{cancel_retry(state) | node: state.seams.self_node_fun.(), last_error: nil}
 
       {:error, reason} ->
-        retry(roll_back(state, reason), reason)
+        retry(state, roll_back(state, reason))
 
       other ->
-        retry(roll_back(state, other), other)
+        retry(state, roll_back(state, other))
     end
+  rescue
+    exception ->
+      kill_epmd(state)
+      reraise exception, __STACKTRACE__
+  catch
+    kind, reason ->
+      kill_epmd(state)
+      :erlang.raise(kind, reason, __STACKTRACE__)
   end
 
-  # Nothing this function started may outlive the failure: an epmd left
-  # listening on a board whose status/0 says there is no node is a port open for
-  # no reason.
-  defp roll_back(state, _reason) do
-    kill_epmd(state)
-    state
+  # Reached only from finish_bring_up/3, so epmd is ours by construction. The
+  # cleanup failure travels WITH the original reason: dropping it let a give-up
+  # leave epmd listening while last_error named only the bring-up failure — the
+  # one field an operator would consult.
+  defp roll_back(state, reason) do
+    case kill_epmd(state) do
+      :ok -> reason
+      {:error, cleanup} -> {reason, {:rollback_failed, cleanup}}
+    end
   end
 
   # The node name carries an address so connecting needs no lookup — that is its
@@ -390,6 +419,7 @@ defmodule Vagus.Dist do
   # LAN the operator is calling from; nothing else is ranked or preferred.
   defp address(state) do
     state.seams.ifaddrs_fun.()
+    |> Enum.reject(fn {ifname, _opts} -> container_bridge?(ifname) end)
     |> Enum.find_value(fn {_ifname, opts} ->
       Enum.find(Keyword.get_values(opts, :addr), &reachable?/1)
     end)
@@ -399,9 +429,17 @@ defmodule Vagus.Dist do
     end
   end
 
+  # By NAME, not by address range. `172.16/12` is RFC1918 in its entirety, so
+  # excluding it would strand a board on a perfectly ordinary `172.20.x.x` LAN
+  # in a forever-retry against a reachable address. These are the bridges this
+  # device actually creates.
+  defp container_bridge?(ifname) do
+    name = to_string(ifname)
+    name in ["hassio", "balena0", "docker0"] or String.starts_with?(name, "br-")
+  end
+
   defp reachable?({127, _, _, _}), do: false
   defp reachable?({169, 254, _, _}), do: false
-  defp reachable?({172, b, _, _}) when b >= 16 and b <= 31, do: false
   defp reachable?({0, 0, 0, 0}), do: false
   defp reachable?({_, _, _, _}), do: true
   defp reachable?(_not_ipv4), do: false
@@ -489,6 +527,13 @@ defmodule Vagus.Dist do
 
   # What the board will call itself after the reboot. nil only when it has no
   # reachable address yet — the same condition the boot path retries on.
+  # The cookie on disk is in effect only if a node is up AND authenticating with
+  # it. Asked of the VM, never of state.node, which is nil for a whole live node
+  # between a GenServer restart and the next boot.
+  defp applied?(state, cookie) do
+    state.seams.alive_fun.() and state.seams.get_cookie_fun.() == cookie_atom(cookie)
+  end
+
   defp planned_node(state) do
     case address(state) do
       {:ok, address} -> node_name(address)

@@ -126,9 +126,9 @@ config :mdns_lite,
       port: 22
     }
 
-    # No static `epmd` entry: epmd only exists while `Vagus.Dist` has the
-    # node up, and it adds/removes the advertisement at runtime so the ad is
-    # true exactly when the service is there.
+    # No `epmd` entry: `Vagus.Dist` advertises nothing. The node name, cookie
+    # and port range come back from `enable/0`, over the SSH session that
+    # called it.
   ]
 
 # Supervisor-API emulator (P2-T1/T2). Core's SUPERVISOR env var carries

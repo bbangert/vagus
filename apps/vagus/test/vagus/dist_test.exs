@@ -215,6 +215,38 @@ defmodule Vagus.DistTest do
       assert_received {:step, :reboot}
     end
 
+    test "reboots when a live node is authenticating with a DIFFERENT cookie", ctx do
+      # disable/0-then-enable/0 on a running board: the node is up, but under
+      # the old secret. Returning the new one without rebooting hands the caller
+      # a cookie that cannot authenticate until something restarts.
+      test = self()
+
+      pid =
+        start_dist(ctx,
+          alive_fun: fn -> true end,
+          self_node_fun: fn -> :"vagus@192.168.2.58" end,
+          get_cookie_fun: fn -> @other_cookie_atom end,
+          reboot_fun: fn -> record(test, {:reboot}) end
+        )
+
+      seed_cookie!(ctx)
+      assert {:ok, %{cookie: @cookie}} = Dist.enable(pid)
+      assert_received {:step, :reboot}
+    end
+
+    test "does not reboot when the live node already has that cookie", ctx do
+      pid =
+        start_dist(ctx,
+          alive_fun: fn -> true end,
+          self_node_fun: fn -> :"vagus@192.168.2.58" end,
+          get_cookie_fun: fn -> @cookie_atom end
+        )
+
+      seed_cookie!(ctx)
+      assert {:ok, %{cookie: @cookie}} = Dist.enable(pid)
+      refute_received {:step, :reboot}
+    end
+
     test "a cookie problem is reported and nothing reboots", ctx do
       seed_cookie!(ctx, "not-a-valid-cookie")
       pid = start_dist(ctx)
@@ -348,6 +380,49 @@ defmodule Vagus.DistTest do
       assert_received {:step, :epmd, ["-daemon"], []}
     end
 
+    test "does not kill an epmd this attempt never started", ctx do
+      # A failure BEFORE epmd is touched used to roll back anyway, killing a
+      # daemon this module had not started.
+      test = self()
+
+      epmd = fn args, env ->
+        record(test, {:epmd, args, env})
+        if args == ["-names"], do: {@epmd_down, 1}, else: {"", 0}
+      end
+
+      # No reachable address, so the sequence fails before start_epmd/1.
+      pid = boot!(ctx, ifaddrs_fun: fn -> [@loopback] end, epmd_fun: epmd)
+
+      assert Dist.status(pid).last_error == :no_address
+      refute_received {:step, :epmd, ["-kill"], []}
+    end
+
+    test "a rollback that could not kill epmd says so in last_error", ctx do
+      # Otherwise a give-up leaves epmd listening while last_error names only
+      # the bring-up failure — the one field an operator would consult.
+      test = self()
+
+      {:ok, started} = Agent.start_link(fn -> false end)
+      on_exit(fn -> if Process.alive?(started), do: Agent.stop(started) end)
+
+      epmd = fn args, env ->
+        record(test, {:epmd, args, env})
+
+        case args do
+          # Not running until we start it, so the sequence gets PAST start_epmd
+          # and the failure lands where epmd is genuinely ours.
+          ["-names"] -> if Agent.get(started, & &1), do: {@epmd_up, 0}, else: {@epmd_down, 1}
+          ["-daemon"] -> Agent.update(started, fn _ -> true end) && {"", 0}
+          ["-kill"] -> {"living nodes in database", 1}
+        end
+      end
+
+      pid = boot!(ctx, epmd_fun: epmd, erlang_cookie_path_fun: fn -> {:error, :no_home} end)
+
+      assert {{:erlang_cookie_path, :no_home}, {:rollback_failed, {:epmd_kill_failed, 1, _}}} =
+               Dist.status(pid).last_error
+    end
+
     test "a failing epmd -daemon stops the sequence", ctx do
       test = self()
 
@@ -374,7 +449,7 @@ defmodule Vagus.DistTest do
       assert Dist.status(pid).node == :"vagus@192.168.2.58"
     end
 
-    test "skips loopback, link-local, container and wildcard addresses", ctx do
+    test "skips loopback, link-local, wildcard, and container bridges by name", ctx do
       # A name on any of these is unreachable from the LAN the operator is
       # calling from. Nothing else is ranked or preferred.
       unusable = [
@@ -382,13 +457,29 @@ defmodule Vagus.DistTest do
         {~c"lo2", [addr: {0, 0, 0, 0}]},
         {~c"wlan9", [addr: {169, 254, 3, 4}]},
         {~c"hassio", [addr: {172, 30, 32, 2}]},
-        {~c"balena0", [addr: {172, 17, 0, 1}]}
+        {~c"balena0", [addr: {172, 17, 0, 1}]},
+        {~c"docker0", [addr: {10, 1, 2, 3}]},
+        {~c"br-abc123", [addr: {10, 4, 5, 6}]}
       ]
 
       pid = boot!(ctx, ifaddrs_fun: fn -> unusable end)
 
       assert Dist.status(pid).last_error == :no_address
       refute_received {:step, :net_kernel_start, _, _}
+    end
+
+    test "does not strand a board on an ordinary 172.16/12 LAN", ctx do
+      # Excluding the whole RFC1918 middle block would retry forever against a
+      # perfectly reachable address. Container bridges are excluded by NAME.
+      ifaddrs = [
+        @loopback,
+        {~c"hassio", [addr: {172, 30, 32, 2}]},
+        {~c"balena0", [addr: {172, 17, 0, 1}]},
+        {~c"eth0", [addr: {172, 20, 1, 5}]}
+      ]
+
+      pid = boot!(ctx, ifaddrs_fun: fn -> ifaddrs end)
+      assert Dist.status(pid).node == :"vagus@172.20.1.5"
     end
 
     test "retries until an address appears, and never gives up", ctx do
