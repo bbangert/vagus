@@ -124,13 +124,20 @@ defmodule Vagus.DistTest do
 
   # Narrow: catching every exit reason would swallow a genuine crash during
   # cleanup and report the run green.
+  # Cleanup races the process's own termination: by the time on_exit runs, the
+  # link from the test process may already have taken it down. Narrow to the
+  # already-going-down reasons — catching every exit would swallow a genuine
+  # crash during cleanup and report the run green — but include the BARE atoms,
+  # not just the {reason, call} shapes. Missing bare :shutdown made this suite
+  # flake roughly one run in ten.
+  @already_down [:noproc, :normal, :shutdown]
+
   defp stop(pid) do
-    GenServer.stop(pid)
+    if Process.alive?(pid), do: GenServer.stop(pid, :normal, 5_000)
+    :ok
   catch
-    :exit, :noproc -> :ok
-    :exit, {:noproc, _call} -> :ok
-    :exit, {:normal, _call} -> :ok
-    :exit, {:shutdown, _call} -> :ok
+    :exit, reason when reason in @already_down -> :ok
+    :exit, {reason, _call} when reason in @already_down -> :ok
   end
 
   # `assert_received` does a SELECTIVE receive: it scans the whole mailbox for
@@ -229,15 +236,25 @@ defmodule Vagus.DistTest do
       # The board really does go away, so a reboot evaluated while building the
       # reply tuple loses the cookie the caller needs — on hardware that showed
       # up only as a GenServer.call timeout.
+      # `:normal`, not `:kill`. The GenServer is LINKED to this process, so a
+      # kill sends the signal straight back here and raced these assertions —
+      # the suite flaked about one run in ten. A :normal exit still makes the
+      # board "go away" (a reboot evaluated before the reply would leave this
+      # call exiting instead of returning) without taking the test with it.
       test = self()
 
       pid =
         start_dist(ctx,
-          reboot_fun: fn -> record(test, {:reboot}) && Process.exit(self(), :kill) end
+          reboot_fun: fn -> record(test, {:reboot}) && Process.exit(self(), :normal) end
         )
 
+      ref = Process.monitor(pid)
       assert {:ok, %{cookie: cookie}} = Dist.enable(pid)
       assert String.match?(cookie, ~r/^[0-9a-f]{64}$/)
+
+      # Same barrier problem: the reboot follows the reply. Wait for the board
+      # to actually "go away" rather than draining and hoping.
+      assert_receive {:DOWN, ^ref, :process, ^pid, :normal}, 1_000
       assert_received {:step, :reboot}
     end
 
@@ -330,6 +347,12 @@ defmodule Vagus.DistTest do
       flush()
 
       assert :ok = Dist.disable(pid)
+
+      # The reboot runs from {:continue, :reboot}, i.e. AFTER the reply — so
+      # draining here without a barrier races it. status/0 is a synchronous
+      # round-trip through the same mailbox and cannot be answered until the
+      # continue has run.
+      Dist.status(pid)
       assert [{:net_kernel_stop, nil}, {:reboot, nil}] == step_order()
     end
 
