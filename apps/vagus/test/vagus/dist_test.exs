@@ -14,6 +14,11 @@ defmodule Vagus.DistTest do
   that hides the defect it was cut for, so the VM model here tracks aliveness
   and the cookie together, exactly as a real node does.
 
+  **One seam default is executed by no test: `default_epmd/2`.** Every test
+  injects `epmd_fun`, so `System.cmd/3` against the real binary never runs here
+  — that gap is what let a MuonTrap hang reach hardware once. The device gate is
+  the only thing that covers it; nothing in this file can.
+
   `async: false` is required, not habitual: the supervision test reads the
   global `node()` and `Process.whereis/1`.
   """
@@ -126,6 +131,27 @@ defmodule Vagus.DistTest do
     :exit, {:noproc, _call} -> :ok
     :exit, {:normal, _call} -> :ok
     :exit, {:shutdown, _call} -> :ok
+  end
+
+  # `assert_received` does a SELECTIVE receive: it scans the whole mailbox for
+  # its own pattern and removes only that match. A sequence of them therefore
+  # proves every step HAPPENED and nothing about the order they happened in.
+  # MEASURED: sending the five boot steps in exact reverse still passes five
+  # sequential `assert_received` calls. Drain and compare the sequence instead.
+  defp recorded_steps do
+    receive do
+      msg when is_tuple(msg) and elem(msg, 0) == :step -> [msg | recorded_steps()]
+    after
+      0 -> []
+    end
+  end
+
+  defp step_order do
+    Enum.map(recorded_steps(), fn
+      {:step, name} -> {name, nil}
+      {:step, name, arg} -> {name, arg}
+      {:step, name, arg, _extra} -> {name, arg}
+    end)
   end
 
   defp flush do
@@ -285,9 +311,26 @@ defmodule Vagus.DistTest do
       refute_received {:step, :reboot}
     end
 
-    test "a missing cookie file is not a failure", ctx do
+    test "a missing cookie file is not a failure, and does NOT reboot", ctx do
+      # remove/1 answers :ok for :enoent, so both deletes "succeed" on a board
+      # that was never enabled. Rebooting on that turns a fleet-wide disable/0
+      # sweep into a fleet-wide power cycle.
       pid = start_dist(ctx)
+
       assert :ok = Dist.disable(pid)
+      refute_received {:step, :reboot}
+    end
+
+    test "reboots when there WAS something to shut, and stops the node first", ctx do
+      # The graceful reboot stops add-ons and Core before restarting, so the
+      # window between "secret deleted" and "board down" is minutes. The node
+      # must not keep distributing under a cookie nobody can name.
+      pid = boot!(ctx)
+      assert Dist.status(pid).alive?
+      flush()
+
+      assert :ok = Dist.disable(pid)
+      assert [{:net_kernel_stop, nil}, {:reboot, nil}] == step_order()
     end
 
     test "a retry pending across disable/1 must not re-mint the cookie", ctx do
@@ -312,19 +355,18 @@ defmodule Vagus.DistTest do
       pid = boot!(ctx)
       assert Dist.status(pid).node == :"vagus@192.168.2.58"
 
-      # Order is the point, and assert_received consumes in mailbox order, so
-      # these passing in sequence IS the ordering proof. inet_tcp_dist reads the
-      # port range from the kernel app env at LISTEN time.
-      assert_received {:step, :put_env, :inet_dist_listen_min, 9100}
-      assert_received {:step, :put_env, :inet_dist_listen_max, 9105}
-      assert_received {:step, :epmd, ["-names"], []}
-      assert_received {:step, :epmd, ["-daemon"], []}
-
-      assert_received {:step, :net_kernel_start, :"vagus@192.168.2.58",
-                       %{name_domain: :longnames}}
-
-      # AFTER net_kernel, because set_cookie/1 before it raises.
-      assert_received {:step, :set_cookie, @cookie_atom}
+      # Order is the whole point, so compare the SEQUENCE. `inet_tcp_dist` reads
+      # the port range from the kernel app env at LISTEN time, epmd has to exist
+      # before net_kernel, and set_cookie/1 must come AFTER net_kernel because
+      # before it raises :distribution_not_started.
+      assert [
+               {:put_env, :inet_dist_listen_min},
+               {:put_env, :inet_dist_listen_max},
+               {:epmd, ["-names"]},
+               {:epmd, ["-daemon"]},
+               {:net_kernel_start, :"vagus@192.168.2.58"},
+               {:set_cookie, @cookie_atom}
+             ] == step_order()
     end
 
     test "no ERL_EPMD_ADDRESS and no interface pin — the listener is the wildcard", ctx do
@@ -423,6 +465,17 @@ defmodule Vagus.DistTest do
                Dist.status(pid).last_error
     end
 
+    test "a RAISING epmd call is caught, not escalated", ctx do
+      # `default_epmd/2` is `System.cmd/3`, which RAISES if the binary is
+      # missing — an ERTS-path mismatch after an OTA would do it. Every other
+      # epmd fake returns a tuple, so this shape had no coverage at all.
+      pid = boot!(ctx, epmd_fun: fn _args, _env -> raise ArgumentError, "no such file" end)
+
+      refute Dist.status(pid).alive?
+      assert Process.alive?(pid)
+      assert {:crashed, :error, {ArgumentError, _}} = Dist.status(pid).last_error
+    end
+
     test "a failing epmd -daemon stops the sequence", ctx do
       test = self()
 
@@ -514,18 +567,30 @@ defmodule Vagus.DistTest do
       assert_received {:step, :net_kernel_stop}
     end
 
-    test "a crash on the boot path never writes the cookie to the log", ctx do
-      # MEASURED: an Erlang stacktrace carries a frame's ARGUMENTS for
-      # function_clause and BIF badarg, and the cookie is an argument the whole
-      # length of the start. Formatting one verbatim printed the secret.
-      log =
-        capture_log(fn ->
-          pid = boot!(ctx, set_cookie_fun: fn :never_matches -> :ok end)
-          refute Dist.status(pid).alive?
-        end)
+    test "a crash on the boot path never writes the cookie to the log OR to status", ctx do
+      # MEASURED: BadArityError, CaseClauseError, MatchError and
+      # BadFunctionError all carry the offending TERM in the struct, so
+      # Exception.message/1, format_banner/2 and inspect/1 each render the
+      # cookie. FunctionClauseError and RuntimeError do not — and an earlier
+      # version of this test used FunctionClauseError, so it passed while the
+      # leaking shapes went unchecked. Drive the ones that leak.
+      for {name, seam} <- [
+            {"BadArityError", fn _cookie -> (fn _a, _b -> :ok end).(@cookie_atom) end},
+            {"CaseClauseError", fn _cookie -> case @cookie_atom, do: (:nope -> :ok) end},
+            {"MatchError", fn _cookie -> :nope = @cookie_atom end}
+          ] do
+        log =
+          capture_log(fn ->
+            pid = boot!(ctx, set_cookie_fun: seam)
+            refute Dist.status(pid).alive?
 
-      assert log =~ "FunctionClauseError"
-      refute log =~ @cookie
+            # status/0 serves last_error to anyone who asks, so it is a
+            # disclosure surface in its own right.
+            refute inspect(Dist.status(pid).last_error, limit: :infinity) =~ @cookie
+          end)
+
+        refute log =~ @cookie, "#{name} leaked the cookie into the log"
+      end
     end
 
     test "the real seam defaults cannot pass the read-back on an undistributed VM" do

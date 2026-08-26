@@ -136,8 +136,11 @@ defmodule Vagus.Dist do
   @spec disable(GenServer.server()) :: :ok | {:error, term()}
   def disable(server \\ __MODULE__), do: GenServer.call(server, :disable, 30_000)
 
+  # Same budget as enable/disable. On the default 5s a caller polling status
+  # would get a surprise exit(:timeout) whenever the boot path is mid-`epmd`,
+  # even though the server is healthy and about to answer.
   @spec status(GenServer.server()) :: status()
-  def status(server \\ __MODULE__), do: GenServer.call(server, :status)
+  def status(server \\ __MODULE__), do: GenServer.call(server, :status, 30_000)
 
   @doc """
   Flags the CALLING process `async_dist`, then runs `fun` and returns its value.
@@ -185,7 +188,9 @@ defmodule Vagus.Dist do
   def handle_call(:enable, _from, state) do
     # Writes a file, then reboots. Nothing here can block on the outside world,
     # which is what keeps this call unable to wedge the server.
-    case read_or_mint(state) do
+    # Guarded like the boot path: identical code, and a raise here would crash
+    # the GenServer mid-call with the cookie an argument the whole way down.
+    case guarded(fn -> read_or_mint(state) end) do
       {:ok, cookie} ->
         # The name has to come back NOW: after the reboot the SSH session that
         # asked is gone, and without it the caller has a cookie and nowhere to
@@ -217,12 +222,27 @@ defmodule Vagus.Dist do
   end
 
   def handle_call(:disable, _from, state) do
+    # Whether there was anything to shut, decided BEFORE deleting.
+    was_enabled? = File.exists?(state.cookie_path) or state.seams.alive_fun.()
+
     case Enum.find([delete_cookie(state), delete_erlang_cookie(state)], &(&1 != :ok)) do
-      # Only reboot once the gate is actually shut — restarting with a cookie
-      # still on disk would bring distribution straight back — and only after
-      # the reply is sent, for the same reason enable/1 does.
       nil ->
-        {:reply, :ok, state, {:continue, :reboot}}
+        # Reboot only if this call actually changed something. Rebooting a board
+        # that was never enabled turns a fleet-wide `disable/0` sweep into a
+        # fleet-wide power cycle. And only after the reply is sent, for the same
+        # reason enable/1 does.
+        if was_enabled? do
+          # Stop the node BEFORE the reboot. `Vagus.Host.Shutdown.reboot/0`
+          # stops add-on containers and Core first, so it is bounded in minutes
+          # rather than milliseconds — and for all of that window the node would
+          # still be distributing under a secret now deleted from both files,
+          # which nobody can even name to stop. One call, no error threading:
+          # the reboot is coming either way.
+          state.seams.net_kernel_stop_fun.()
+          {:reply, :ok, state, {:continue, :reboot}}
+        else
+          {:reply, :ok, state}
+        end
 
       {:error, reason} ->
         {:reply, {:error, reason}, state}
@@ -279,16 +299,30 @@ defmodule Vagus.Dist do
       # so the banner is built without the stacktrace and every frame is reduced
       # to its arity before formatting.
       Logger.error(
-        "Vagus.Dist: #{Exception.format_banner(:error, exception)}\n" <>
+        "Vagus.Dist: #{inspect(exception.__struct__)}: #{safe_message(exception)}\n" <>
           Exception.format_stacktrace(redact(__STACKTRACE__))
       )
 
-      {:error, {:crashed, :error, exception}}
+      {:error, {:crashed, :error, {exception.__struct__, safe_message(exception)}}}
   catch
     kind, reason ->
-      Logger.error("Vagus.Dist: boot path #{kind} #{inspect(reason)}")
-      {:error, {:crashed, kind, reason}}
+      scrubbed = scrub(inspect(reason, limit: 20))
+      Logger.error("Vagus.Dist: boot path #{kind} #{scrubbed}")
+      {:error, {:crashed, kind, scrubbed}}
   end
+
+  defp safe_message(exception), do: exception |> Exception.message() |> scrub()
+
+  # The cookie has exactly one shape — 64 lowercase hex — so it can be scrubbed
+  # out of any rendering without knowing which value is in play.
+  #
+  # MEASURED, and the reason this exists: `BadArityError`, `CaseClauseError`,
+  # `MatchError` and `BadFunctionError` all carry the offending TERM in the
+  # struct, so `Exception.message/1`, `format_banner/2` and `inspect/1` each
+  # render the cookie. `FunctionClauseError` and `RuntimeError` do not.
+  # Redacting only the stacktrace was half a fix — and the test that proved that
+  # fix used `FunctionClauseError`, one of the two shapes that never leaked.
+  defp scrub(string), do: Regex.replace(~r/[0-9a-f]{64}/, string, "<redacted>")
 
   defp redact(stacktrace) do
     Enum.map(stacktrace, fn
@@ -328,8 +362,6 @@ defmodule Vagus.Dist do
   end
 
   ## Start sequence
-
-  defp start(%{node: node} = state, _cookie) when node != nil, do: state
 
   defp start(state, cookie) do
     # A GenServer crash-restart rebuilds state.node as nil while net_kernel
@@ -762,11 +794,11 @@ defmodule Vagus.Dist do
     ])
   end
 
-  if Mix.target() == :host do
-    # Nerves.Runtime is targets-only; `:dist_cookie_path` is unset on host too,
-    # so start_link/1 returns :ignore and this never runs outside tests.
-    defp default_reboot, do: :ok
-  else
-    defp default_reboot, do: Nerves.Runtime.reboot()
-  end
+  # `Vagus.Host.Shutdown.reboot/0`, NOT `Nerves.Runtime.reboot/0`. This repo
+  # keeps no direct Nerves.Runtime reboot callers (see
+  # `Vagus.Provisioner`'s note) because the sanctioned path stops add-on
+  # containers and HA Core first — cutting Core mid-write is what corrupts its
+  # `.storage`. It is bounded and always answers `:ok`, and a shutdown already
+  # in flight makes it a no-op.
+  defp default_reboot, do: Vagus.Host.Shutdown.reboot()
 end
