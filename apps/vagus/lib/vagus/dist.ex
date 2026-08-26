@@ -10,8 +10,9 @@ defmodule Vagus.Dist do
 
   The session is recorded in the `:vagus_dist` ETS table, created at application
   start and seeded `:not_requested`. Repeat calls return the same node and
-  cookie instead of starting distribution twice. It is memory only, so a reboot
-  drops it.
+  cookie instead of starting distribution twice. It is memory only — dropped by
+  a reboot, and by a `:vagus` restart, which is why `enable/0` can meet a live
+  node with no record and has to recover.
 
   The listener binds `0.0.0.0` and the cookie is the only control. Ports are
   pinned to 9100-9105 so the range is firewallable at the LAN edge. Treat an

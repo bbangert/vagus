@@ -126,8 +126,10 @@ config :mdns_lite,
       port: 22
     }
 
-    # No `epmd` entry: `Vagus.Dist` advertises nothing. The node name, cookie
-    # and port range come back from `enable/0`, over the SSH session that
+    # No `epmd` entry: `Vagus.Dist` announces nothing over mDNS. It does run
+    # epmd on 4369 once enabled, and epmd answers the node name and port to
+    # anyone who asks — the cookie gates access, not obscurity. `enable/0`
+    # hands the node, cookie and port range back over the SSH session that
     # called it.
   ]
 
