@@ -86,10 +86,10 @@ defmodule Vagus.Dist do
   """
   @spec enable(keyword()) :: {:ok, session()} | {:error, term()}
   def enable(opts \\ []) do
-    seams = seams(opts)
+    system = system(opts)
 
-    case seams.session_get_fun.() do
-      :not_requested -> bring_up(seams)
+    case system.session_get_fun.() do
+      :not_requested -> bring_up(system)
       session -> {:ok, session}
     end
   end
@@ -123,13 +123,13 @@ defmodule Vagus.Dist do
           ports: Range.t()
         }
   def status(opts \\ []) do
-    seams = seams(opts)
-    alive? = seams.alive_fun.()
+    system = system(opts)
+    alive? = system.alive_fun.()
 
     %{
-      enabled?: seams.session_get_fun.() != :not_requested,
+      enabled?: system.session_get_fun.() != :not_requested,
       alive?: alive?,
-      node: if(alive?, do: seams.self_node_fun.()),
+      node: if(alive?, do: system.self_node_fun.()),
       ports: @port_min..@port_max
     }
   end
@@ -174,11 +174,11 @@ defmodule Vagus.Dist do
   # was never a security problem — a cookie OTP invented is unknown to everyone,
   # which is strictly more secret than ours. It was a correctness problem, and
   # the read-back already catches it.
-  defp bring_up(seams) do
-    with {:ok, address} <- address(seams),
-         :ok <- pin_ports(seams),
-         :ok <- start_epmd(seams) do
-      start_node(seams, node_name(address))
+  defp bring_up(system) do
+    with {:ok, address} <- address(system),
+         :ok <- pin_ports(system),
+         :ok <- start_epmd(system) do
+      start_node(system, node_name(address))
     end
   end
 
@@ -186,19 +186,19 @@ defmodule Vagus.Dist do
   # happened before our own `net_kernel.start` returned. Stopping the node from
   # those paths would be stopping one this call did not start — the `alive?`
   # check at the top of `enable/1` is not a lock.
-  defp start_node(seams, name) do
+  defp start_node(system, name) do
     cookie = :crypto.strong_rand_bytes(32) |> Base.encode16(case: :lower)
 
-    case seams.net_kernel_start_fun.(name, %{name_domain: :longnames}) do
+    case system.net_kernel_start_fun.(name, %{name_domain: :longnames}) do
       {:ok, _pid} ->
-        case apply_cookie(seams, cookie) do
+        case apply_cookie(system, cookie) do
           :ok ->
             session = %{node: name, cookie: cookie, ports: @port_min..@port_max}
-            seams.session_put_fun.(session)
+            system.session_put_fun.(session)
             {:ok, session}
 
           {:error, reason} ->
-            {:error, stop_node(seams, reason)}
+            {:error, stop_node(system, reason)}
         end
 
       # We lost the record, not the node. Nothing else on a Nerves board starts
@@ -209,7 +209,7 @@ defmodule Vagus.Dist do
       # distributed on the LAN right now, so re-record what it is actually
       # using instead.
       {:error, {:already_started, _pid}} ->
-        adopt(seams)
+        adopt(system)
 
       {:error, reason} ->
         {:error, reason}
@@ -219,14 +219,14 @@ defmodule Vagus.Dist do
     end
   end
 
-  defp adopt(seams) do
+  defp adopt(system) do
     session = %{
-      node: seams.self_node_fun.(),
-      cookie: to_string(seams.get_cookie_fun.()),
+      node: system.self_node_fun.(),
+      cookie: to_string(system.get_cookie_fun.()),
       ports: @port_min..@port_max
     }
 
-    seams.session_put_fun.(session)
+    system.session_put_fun.(session)
     {:ok, session}
   end
 
@@ -235,11 +235,11 @@ defmodule Vagus.Dist do
   # DIRECTLY above the clause: sobelow binds it to the next function clause, so
   # inserting anything between the two silently moves the skip.
   # sobelow_skip ["DOS.StringToAtom"]
-  defp apply_cookie(seams, cookie) do
+  defp apply_cookie(system, cookie) do
     atom = String.to_atom(cookie)
-    seams.set_cookie_fun.(atom)
+    system.set_cookie_fun.(atom)
 
-    if seams.get_cookie_fun.() == atom, do: :ok, else: {:error, :cookie_not_applied}
+    if system.get_cookie_fun.() == atom, do: :ok, else: {:error, :cookie_not_applied}
   end
 
   # The only thing worth undoing. epmd is deliberately left alone: it serves an
@@ -248,17 +248,17 @@ defmodule Vagus.Dist do
   # daemon this call did not create, for no gain. A node left alive under an
   # unverified cookie is the one thing that genuinely must not survive, so
   # `Node.alive?/0` decides rather than `net_kernel.stop/0`'s return.
-  defp stop_node(seams, reason) do
-    stopped = seams.net_kernel_stop_fun.()
-    if seams.alive_fun.(), do: {reason, {:still_alive, stopped}}, else: reason
+  defp stop_node(system, reason) do
+    stopped = system.net_kernel_stop_fun.()
+    if system.alive_fun.(), do: {reason, {:still_alive, stopped}}, else: reason
   end
 
   ## Naming
 
   # The node name carries an address so connecting needs no lookup — that is its
   # only job, since the listener binds the wildcard.
-  defp address(seams) do
-    seams.ifaddrs_fun.()
+  defp address(system) do
+    system.ifaddrs_fun.()
     |> Enum.reject(fn {ifname, opts} -> container_bridge?(ifname) or down?(opts) end)
     |> Enum.find_value(fn {_ifname, opts} ->
       Enum.find(Keyword.get_values(opts, :addr), &reachable?/1)
@@ -295,9 +295,9 @@ defmodule Vagus.Dist do
 
   # `Application.put_env/3` returns `:ok` unconditionally, so there is no failure
   # to thread here.
-  defp pin_ports(seams) do
-    seams.put_env_fun.(:inet_dist_listen_min, @port_min)
-    seams.put_env_fun.(:inet_dist_listen_max, @port_max)
+  defp pin_ports(system) do
+    system.put_env_fun.(:inet_dist_listen_min, @port_min)
+    system.put_env_fun.(:inet_dist_listen_max, @port_max)
     :ok
   end
 
@@ -306,20 +306,18 @@ defmodule Vagus.Dist do
   # call and reusing it is correct. No `ERL_EPMD_ADDRESS`: the listener binds
   # the wildcard, so pinning epmd to one address would only make it disagree
   # with the node it serves.
-  defp start_epmd(seams) do
-    case seams.epmd_fun.(["-daemon"], []) do
+  defp start_epmd(system) do
+    case system.epmd_fun.(["-daemon"], []) do
       {_output, 0} -> :ok
       {output, status} -> {:error, {:epmd_failed, status, output}}
     end
   end
 
-  ## Seams
-  #
-  # Every OS-touching edge is injectable so this is provable on host without
+  # Every OS-touching call is injectable so this is provable on host without
   # ever starting real distribution. Passed per call rather than held anywhere,
-  # because nothing here has state to hold them in.
+  # because nothing here has state to hold it in.
 
-  defp seams(opts) do
+  defp system(opts) do
     %{
       ifaddrs_fun: Keyword.get(opts, :ifaddrs_fun, &default_ifaddrs/0),
       put_env_fun: Keyword.get(opts, :put_env_fun, &default_put_env/2),
