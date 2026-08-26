@@ -1,0 +1,379 @@
+defmodule Vagus.DistTest do
+  use ExUnit.Case, async: true
+
+  alias Vagus.Dist
+
+  @cookie_re ~r/\A[0-9a-f]{64}\z/
+
+  setup do
+    # Models the VM's distribution state. Every override reads or writes THIS
+    # rather than the real node, so the suite can prove bring-up ordering and
+    # the cookie read-back without ever starting distribution.
+    {:ok, vm} =
+      Agent.start_link(fn ->
+        %{node: nil, cookie: :nocookie, steps: [], session: :not_requested, peers: []}
+      end)
+
+    {:ok, vm: vm}
+  end
+
+  defp record(vm, step), do: Agent.update(vm, &%{&1 | steps: &1.steps ++ [step]})
+  defp steps(vm), do: Agent.get(vm, & &1.steps)
+
+  # Fakes that CAN fail: every call takes an override so a test can make one
+  # of them return an error without loosening the others.
+  defp system(vm, overrides \\ []) do
+    defaults = [
+      ifaddrs_fun: fn -> [{~c"eth0", [flags: [:up, :running], addr: {192, 168, 2, 58}]}] end,
+      put_env_fun: fn key, value ->
+        record(vm, {:put_env, key, value})
+        :ok
+      end,
+      epmd_fun: fn args, _env ->
+        record(vm, {:epmd, args})
+        {"", 0}
+      end,
+      net_kernel_start_fun: fn name, opts ->
+        record(vm, {:net_kernel_start, name, opts})
+
+        if Agent.get(vm, & &1.node) do
+          # OTP refuses a second start; a fake that quietly succeeded here would
+          # hide every lost-record path.
+          {:error, {:already_started, self()}}
+        else
+          # Starting the node mints a cookie we did not choose.
+          Agent.update(vm, &%{&1 | node: name, cookie: :"otp-minted-random"})
+          {:ok, self()}
+        end
+      end,
+      set_cookie_fun: fn cookie ->
+        record(vm, {:set_cookie, cookie})
+        Agent.update(vm, &%{&1 | cookie: cookie})
+        :ok
+      end,
+      get_cookie_fun: fn -> Agent.get(vm, & &1.cookie) end,
+      alive_fun: fn -> Agent.get(vm, &(&1.node != nil)) end,
+      connected_nodes_fun: fn -> Agent.get(vm, & &1.peers) end,
+      disconnect_fun: fn peer ->
+        record(vm, {:disconnect, peer})
+        Agent.update(vm, &%{&1 | peers: &1.peers -- [peer]})
+        true
+      end,
+      net_kernel_stop_fun: fn ->
+        record(vm, :net_kernel_stop)
+        Agent.update(vm, &%{&1 | node: nil, cookie: :nocookie})
+        :ok
+      end,
+      self_node_fun: fn -> Agent.get(vm, & &1.node) end,
+      # get_and_update is atomic, which is what makes this a faithful stand-in
+      # for :ets.select_replace/2 rather than a check-then-set that would hide
+      # the very race the real one exists to close.
+      session_claim_fun: fn ->
+        Agent.get_and_update(vm, fn st ->
+          case st.session do
+            :not_requested -> {:claimed, %{st | session: :starting}}
+            :starting -> {:starting, st}
+            session -> {{:recorded, session}, st}
+          end
+        end)
+      end,
+      # Replaces the :vagus_dist table, which is global and would break
+      # async: true isolation across the suite.
+      session_get_fun: fn -> Agent.get(vm, & &1.session) end,
+      session_reset_fun: fn ->
+        record(vm, :session_reset)
+        Agent.update(vm, &%{&1 | session: :not_requested})
+        :ok
+      end,
+      session_put_fun: fn session ->
+        record(vm, {:session_put, session.node})
+        Agent.update(vm, &%{&1 | session: session})
+        :ok
+      end
+    ]
+
+    Keyword.merge(defaults, overrides)
+  end
+
+  describe "enable/1" do
+    test "returns the node, a fresh cookie, and the pinned port range", %{vm: vm} do
+      assert {:ok, result} = Dist.enable(system(vm))
+
+      assert result.node == :"vagus@192.168.2.58"
+      assert result.cookie =~ @cookie_re
+      assert result.ports == 9100..9105
+    end
+
+    test "the returned cookie is the one the VM is actually using", %{vm: vm} do
+      {:ok, %{cookie: cookie}} = Dist.enable(system(vm))
+
+      assert Agent.get(vm, & &1.cookie) == String.to_atom(cookie)
+    end
+
+    test "mints a different cookie on a fresh boot", %{vm: vm} do
+      {:ok, %{cookie: first}} = Dist.enable(system(vm))
+      # A reboot drops the record and the node with it.
+      Agent.update(vm, &%{&1 | node: nil, cookie: :nocookie, session: :not_requested})
+      {:ok, %{cookie: second}} = Dist.enable(system(vm))
+
+      refute first == second
+    end
+
+    test "records the session so a second call does not start anything", %{vm: vm} do
+      {:ok, first} = Dist.enable(system(vm))
+      before = steps(vm)
+
+      assert {:ok, ^first} = Dist.enable(system(vm))
+      assert steps(vm) == before
+    end
+
+    test "repeat calls return the SAME cookie, not a fresh one", %{vm: vm} do
+      {:ok, %{cookie: first}} = Dist.enable(system(vm))
+      {:ok, %{cookie: again}} = Dist.enable(system(vm))
+
+      assert first == again
+    end
+
+    test "ports are pinned BEFORE net_kernel starts", %{vm: vm} do
+      {:ok, _} = Dist.enable(system(vm))
+      recorded = steps(vm)
+
+      min_at = Enum.find_index(recorded, &match?({:put_env, :inet_dist_listen_min, 9100}, &1))
+      max_at = Enum.find_index(recorded, &match?({:put_env, :inet_dist_listen_max, 9105}, &1))
+      start_at = Enum.find_index(recorded, &match?({:net_kernel_start, _, _}, &1))
+
+      assert min_at < start_at
+      assert max_at < start_at
+    end
+
+    test "epmd is started BEFORE net_kernel", %{vm: vm} do
+      {:ok, _} = Dist.enable(system(vm))
+      recorded = steps(vm)
+
+      assert Enum.find_index(recorded, &match?({:epmd, ["-daemon"]}, &1)) <
+               Enum.find_index(recorded, &match?({:net_kernel_start, _, _}, &1))
+    end
+
+    test "the cookie is set AFTER net_kernel starts", %{vm: vm} do
+      # Not cosmetic: MEASURED on OTP 29, set_cookie/1 raises before
+      # distribution is up.
+      {:ok, _} = Dist.enable(system(vm))
+      recorded = steps(vm)
+
+      assert Enum.find_index(recorded, &match?({:net_kernel_start, _, _}, &1)) <
+               Enum.find_index(recorded, &match?({:set_cookie, _}, &1))
+    end
+
+    test "starts a longname node named for the chosen address", %{vm: vm} do
+      {:ok, _} = Dist.enable(system(vm))
+
+      assert {:net_kernel_start, :"vagus@192.168.2.58", %{name_domain: :longnames}} =
+               Enum.find(steps(vm), &match?({:net_kernel_start, _, _}, &1))
+    end
+
+    test "passes no ERL_EPMD_ADDRESS, so epmd agrees with the wildcard listener", %{vm: vm} do
+      overrides = [
+        epmd_fun: fn args, env ->
+          record(vm, {:epmd_env, args, env})
+          {"", 0}
+        end
+      ]
+
+      {:ok, _} = Dist.enable(system(vm, overrides))
+
+      assert {:epmd_env, ["-daemon"], []} = Enum.find(steps(vm), &match?({:epmd_env, _, _}, &1))
+    end
+  end
+
+  describe "every failure stops distribution and raises" do
+    # Caught in the calling process, so it does not matter that IEx catches the
+    # exception afterwards and keeps its evaluator alive — our catch runs first.
+    defp fails_with(vm, overrides) do
+      assert_raise MatchError, fn -> Dist.enable(system(vm, overrides)) end
+    end
+
+    test "no usable address", %{vm: vm} do
+      fails_with(vm, ifaddrs_fun: fn -> [] end)
+      refute Enum.any?(steps(vm), &match?({:epmd, _}, &1))
+    end
+
+    test "epmd will not start", %{vm: vm} do
+      fails_with(vm, epmd_fun: fn _args, _env -> {"port 4369 in use", 1} end)
+      refute Enum.any?(steps(vm), &match?({:net_kernel_start, _, _}, &1))
+    end
+
+    test "net_kernel refuses to start", %{vm: vm} do
+      assert_raise CaseClauseError, fn ->
+        Dist.enable(system(vm, net_kernel_start_fun: fn _n, _o -> {:error, :einval} end))
+      end
+    end
+
+    test "the cookie does not take", %{vm: vm} do
+      # The one state that must never survive: a node alive under a cookie the
+      # caller was not handed.
+      fails_with(vm, set_cookie_fun: fn _ -> :ok end)
+
+      assert :net_kernel_stop in steps(vm)
+      refute Agent.get(vm, & &1.node)
+    end
+
+    test "the claim is released, so a retry needs no reboot", %{vm: vm} do
+      fails_with(vm, ifaddrs_fun: fn -> [] end)
+      assert Agent.get(vm, & &1.session) == :not_requested
+
+      assert {:ok, %{node: :"vagus@192.168.2.58"}} = Dist.enable(system(vm))
+    end
+
+    test "a recorded session whose node is gone is reported, not honoured", %{vm: vm} do
+      # Only a deliberate :net_kernel.stop/0 produces this; the tester reboots.
+      {:ok, _} = Dist.enable(system(vm))
+      Agent.update(vm, &%{&1 | node: nil, cookie: :nocookie})
+
+      assert {:error, :node_gone} = Dist.enable(system(vm))
+    end
+
+    test "epmd is started exactly once and never killed", %{vm: vm} do
+      {:ok, _} = Dist.enable(system(vm))
+
+      assert Enum.filter(steps(vm), &match?({:epmd, _}, &1)) == [{:epmd, ["-daemon"]}]
+    end
+  end
+
+  describe "the bootstrap-cookie window" do
+    # A peer that authenticated under the cookie OTP invented stays attached
+    # after set_cookie/1, which gates new handshakes only.
+    defp attacker_attaches(vm) do
+      [
+        set_cookie_fun: fn cookie ->
+          record(vm, {:set_cookie, cookie})
+          Agent.update(vm, &%{&1 | cookie: cookie, peers: [:"attacker@10.0.0.9"]})
+          :ok
+        end
+      ]
+    end
+
+    test "peers attached before we owned the cookie are dropped", %{vm: vm} do
+      {:ok, _} = Dist.enable(system(vm, attacker_attaches(vm)))
+
+      assert {:disconnect, :"attacker@10.0.0.9"} in steps(vm)
+      assert Agent.get(vm, & &1.peers) == []
+    end
+
+    test "the drop happens AFTER the cookie is ours", %{vm: vm} do
+      {:ok, _} = Dist.enable(system(vm, attacker_attaches(vm)))
+      recorded = steps(vm)
+
+      assert Enum.find_index(recorded, &match?({:set_cookie, _}, &1)) <
+               Enum.find_index(recorded, &match?({:disconnect, _}, &1))
+    end
+
+    test "hidden peers are disconnected too", %{vm: vm} do
+      # Node.list/0 defaults to :visible, so a peer attached with -hidden would
+      # survive the sweep.
+      overrides = [
+        set_cookie_fun: fn cookie ->
+          record(vm, {:set_cookie, cookie})
+          Agent.update(vm, &%{&1 | cookie: cookie, peers: [:"hidden@10.0.0.9"]})
+          :ok
+        end,
+        connected_nodes_fun: fn -> Agent.get(vm, & &1.peers) end
+      ]
+
+      {:ok, _} = Dist.enable(system(vm, overrides))
+
+      assert {:disconnect, :"hidden@10.0.0.9"} in steps(vm)
+    end
+
+    test "a failure after net_kernel started stops it", %{vm: vm} do
+      # The exposure is the live listener: after net_kernel.start the node
+      # answers under the cookie OTP invented.
+      assert_raise MatchError, fn ->
+        Dist.enable(system(vm, set_cookie_fun: fn _ -> :ok end))
+      end
+
+      assert :net_kernel_stop in steps(vm)
+    end
+  end
+
+  describe "concurrent callers" do
+    test "a second caller does not race the first into net_kernel", %{vm: vm} do
+      # Claiming is atomic, so only the winner reaches bring-up. Without it the
+      # loser hits already_started before the winner has set its cookie and
+      # records one that never authenticates.
+      Agent.update(vm, &%{&1 | session: :starting})
+
+      assert {:error, :starting} = Dist.enable(system(vm))
+      assert steps(vm) == []
+    end
+  end
+
+  describe "override validation" do
+    test "an unknown or misspelt key raises instead of silently defaulting", %{vm: vm} do
+      assert_raise ArgumentError, fn ->
+        Dist.status(Keyword.put(system(vm), :alive_func, fn -> true end))
+      end
+    end
+  end
+
+  describe "the real :vagus_dist table" do
+    # The overrides above prove the logic; this proves the DEFAULT wiring, which no
+    # faked test would catch if create_session_table/0 were never called.
+    test "is created at application start, seeded :not_requested" do
+      assert :ets.lookup(:vagus_dist, :session) == [{:session, :not_requested}]
+    end
+
+    test "is what status/0 reads when no overrides are injected" do
+      assert %{enabled?: false, alive?: false, node: nil, ports: 9100..9105} = Dist.status()
+    end
+  end
+
+  describe "status/1" do
+    test "reports a board nobody enabled", %{vm: vm} do
+      assert %{enabled?: false, alive?: false, node: nil, ports: 9100..9105} =
+               Dist.status(system(vm))
+    end
+
+    test "reports the node enable/1 produced", %{vm: vm} do
+      {:ok, %{node: node}} = Dist.enable(system(vm))
+
+      assert %{enabled?: true, alive?: true, node: ^node} = Dist.status(system(vm))
+    end
+
+    test "does not call a board with a lost record 'off' while it answers", %{vm: vm} do
+      # Reporting only the record here would be a lie with a live LAN listener
+      # behind it.
+      {:ok, %{node: node}} = Dist.enable(system(vm))
+      Agent.update(vm, &%{&1 | session: :not_requested})
+
+      assert %{enabled?: false, alive?: true, node: ^node} = Dist.status(system(vm))
+    end
+
+    test "does not repeat the cookie", %{vm: vm} do
+      {:ok, _} = Dist.enable(system(vm))
+
+      refute Map.has_key?(Dist.status(system(vm)), :cookie)
+    end
+  end
+
+  describe "run/1" do
+    test "returns the function's value" do
+      assert Dist.run(fn -> {:collected, 42} end) == {:collected, 42}
+    end
+
+    test "flags the process that calls it, not the one that spawned that process" do
+      task =
+        Task.async(fn ->
+          Dist.run(fn -> Process.info(self(), :async_dist) end)
+        end)
+
+      assert {:async_dist, true} = Task.await(task)
+    end
+
+    test "does not flag the caller's caller" do
+      # Process-local by design; a leak here would change unrelated processes.
+      Task.async(fn -> Dist.run(fn -> :ok end) end) |> Task.await()
+
+      assert {:async_dist, false} = Process.info(self(), :async_dist)
+    end
+  end
+end

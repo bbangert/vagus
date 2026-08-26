@@ -124,12 +124,13 @@ config :mdns_lite,
       protocol: "sftp-ssh",
       transport: "tcp",
       port: 22
-    },
-    %{
-      protocol: "epmd",
-      transport: "tcp",
-      port: 4369
     }
+
+    # No `epmd` entry: `Vagus.Dist` announces nothing over mDNS. It does run
+    # epmd on 4369 once enabled, and epmd answers the node name and port to
+    # anyone who asks — the cookie gates access, not obscurity. `enable/0`
+    # hands the node, cookie and port range back over the SSH session that
+    # called it.
   ]
 
 # Supervisor-API emulator (P2-T1/T2). Core's SUPERVISOR env var carries
