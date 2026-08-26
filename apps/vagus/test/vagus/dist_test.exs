@@ -59,6 +59,23 @@ defmodule Vagus.DistTest do
       get_cookie_fun: fn -> Agent.get(vm, & &1.cookie) end,
       alive_fun: fn -> Agent.get(vm, &(&1.node != nil)) end,
       self_node_fun: fn -> Agent.get(vm, & &1.node) end,
+      # get_and_update is atomic, which is what makes this a faithful stand-in
+      # for :ets.select_replace/2 rather than a check-then-set that would hide
+      # the very race the real one exists to close.
+      session_claim_fun: fn ->
+        Agent.get_and_update(vm, fn st ->
+          case st.session do
+            :not_requested -> {:claimed, %{st | session: :starting}}
+            :starting -> {:starting, st}
+            session -> {{:recorded, session}, st}
+          end
+        end)
+      end,
+      session_reset_fun: fn ->
+        record(vm, :session_reset)
+        Agent.update(vm, &%{&1 | session: :not_requested})
+        :ok
+      end,
       # Replaces the :vagus_dist table, which is global and would break
       # async: true isolation across the suite.
       session_get_fun: fn -> Agent.get(vm, & &1.session) end,
@@ -203,11 +220,12 @@ defmodule Vagus.DistTest do
       refute Enum.any?(steps(vm), &match?({:net_kernel_start, _, _}, &1))
     end
 
-    test "no usable address never starts epmd", %{vm: vm} do
+    test "no usable address never starts epmd or net_kernel", %{vm: vm} do
       overrides = [ifaddrs_fun: fn -> [] end]
 
       assert {:error, :no_address} = Dist.enable(system(vm, overrides))
-      assert steps(vm) == []
+      # Only the claim being released; nothing was started to roll back.
+      assert steps(vm) == [:session_reset]
     end
 
     test "a net_kernel start failure is returned as-is", %{vm: vm} do
@@ -216,14 +234,12 @@ defmodule Vagus.DistTest do
       assert {:error, :einval} = Dist.enable(system(vm, overrides))
     end
 
-    test "epmd is deliberately left running after a failure", %{vm: vm} do
-      # Killing it risks stopping a daemon this call did not create; a reboot
-      # clears it and it serves an empty name list meanwhile.
-      overrides = [set_cookie_fun: fn _ -> :ok end]
+    test "epmd is started exactly once and never killed", %{vm: vm} do
+      # dist.ex issues no epmd command other than -daemon; assert on the call
+      # log itself rather than on the absence of a call it could never make.
+      {:error, _} = Dist.enable(system(vm, set_cookie_fun: fn _ -> :ok end))
 
-      {:error, _} = Dist.enable(system(vm, overrides))
-
-      refute Enum.any?(steps(vm), &match?({:epmd, ["-kill"]}, &1))
+      assert Enum.filter(steps(vm), &match?({:epmd, _}, &1)) == [{:epmd, ["-daemon"]}]
     end
   end
 
@@ -358,31 +374,36 @@ defmodule Vagus.DistTest do
   describe "a live node whose record was lost" do
     # MEASURED on host: Application.stop(:vagus) destroys the :vagus_dist table
     # (its owner is the application master) while net_kernel, owned by :kernel,
-    # stays up still using the cookie we minted.
-    test "is re-recorded rather than refused", %{vm: vm} do
+    # stays up.
+    test "is recovered rather than refused", %{vm: vm} do
       {:ok, first} = Dist.enable(system(vm))
       Agent.update(vm, &%{&1 | session: :not_requested})
 
       assert {:ok, recovered} = Dist.enable(system(vm))
-      assert recovered == first
+      assert recovered.node == first.node
     end
 
-    test "hands back the cookie the node is ACTUALLY using", %{vm: vm} do
-      {:ok, _} = Dist.enable(system(vm))
-      Agent.update(vm, &%{&1 | session: :not_requested})
+    test "gets a FRESH cookie, never the one already in place", %{vm: vm} do
+      # The cookie in place may be the weak one OTP invented, left by a caller
+      # that died mid-bring-up. Handing it back would launder a bad credential
+      # into a recorded session.
+      {:ok, first} = Dist.enable(system(vm))
+      Agent.update(vm, &%{&1 | session: :not_requested, cookie: :"otp-minted-random"})
 
       {:ok, recovered} = Dist.enable(system(vm))
+
+      refute recovered.cookie == first.cookie
+      refute recovered.cookie == "otp-minted-random"
       assert String.to_atom(recovered.cookie) == Agent.get(vm, & &1.cookie)
     end
 
-    test "does not restart or tear down the running node", %{vm: vm} do
+    test "does not tear the running node down", %{vm: vm} do
       {:ok, _} = Dist.enable(system(vm))
       Agent.update(vm, &%{&1 | session: :not_requested, steps: []})
 
       {:ok, _} = Dist.enable(system(vm))
 
       refute :net_kernel_stop in steps(vm)
-      refute Enum.any?(steps(vm), &match?({:set_cookie, _}, &1))
     end
 
     test "records the recovery, so the next call is a plain record hit", %{vm: vm} do
@@ -393,6 +414,40 @@ defmodule Vagus.DistTest do
 
       assert {:ok, ^recovered} = Dist.enable(system(vm))
       assert steps(vm) == before
+    end
+  end
+
+  describe "concurrent callers" do
+    test "a second caller does not race the first into net_kernel", %{vm: vm} do
+      # Claiming is atomic, so only the winner reaches bring-up. Without it the
+      # loser hits already_started before the winner has set its cookie and
+      # records one that never authenticates.
+      Agent.update(vm, &%{&1 | session: :starting})
+
+      assert {:error, :starting} = Dist.enable(system(vm))
+      assert steps(vm) == []
+    end
+
+    test "the claim is released when bring-up fails, so a retry works", %{vm: vm} do
+      assert {:error, :no_address} = Dist.enable(system(vm, ifaddrs_fun: fn -> [] end))
+      assert Agent.get(vm, & &1.session) == :not_requested
+
+      assert {:ok, %{node: :"vagus@192.168.2.58"}} = Dist.enable(system(vm))
+    end
+
+    test "the claim is released when the cookie read-back fails", %{vm: vm} do
+      assert {:error, :cookie_not_applied} =
+               Dist.enable(system(vm, set_cookie_fun: fn _ -> :ok end))
+
+      assert Agent.get(vm, & &1.session) == :not_requested
+    end
+  end
+
+  describe "override validation" do
+    test "an unknown or misspelt key raises instead of silently defaulting", %{vm: vm} do
+      assert_raise ArgumentError, fn ->
+        Dist.status(Keyword.put(system(vm), :alive_func, fn -> true end))
+      end
     end
   end
 
@@ -441,7 +496,7 @@ defmodule Vagus.DistTest do
       assert Dist.run(fn -> {:collected, 42} end) == {:collected, 42}
     end
 
-    test "flags the CALLING process, which is the one erpc sends the reply from" do
+    test "flags the process that calls it, not the one that spawned that process" do
       task =
         Task.async(fn ->
           Dist.run(fn -> Process.info(self(), :async_dist) end)
