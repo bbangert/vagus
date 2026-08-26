@@ -51,6 +51,10 @@ defmodule Vagus.Dist do
 
   @port_min 9100
   @port_max 9105
+  # Bounds both how long the caller waits and how long the guard lets a stalled
+  # worker hold the claim — `epmd -daemon` through `System.cmd/3` has no timeout
+  # of its own.
+  @bring_up_timeout :timer.seconds(30)
   @table :vagus_dist
   @session_key :session
 
@@ -145,27 +149,46 @@ defmodule Vagus.Dist do
     fun.()
   end
 
-  # Nothing is rolled back and almost nothing is handled. This is a test-mode
-  # tool on a test board: the fail case for every step here is "restart the
-  # board", which reseeds the table, stops the node and returns a known
-  # non-distributed boot for free. So each step asserts, and the guard turns any
-  # crash — including the caller being killed — into a reboot.
+  # Bring-up runs in a WORKER, and the guard watches the worker rather than the
+  # caller. That distinction is load-bearing and was got wrong once: an
+  # interactive IEx session catches `MatchError` and keeps its evaluator alive,
+  # so a guard watching the caller never fires. DEVICE-MEASURED on a
+  # dragon_q6a — `iex> Vagus.Dist.enable(...)` with a failing cookie left the
+  # node up as `vagus@...` under the 20-letter LCG cookie, the row stuck at
+  # `:starting`, and no reboot. Nobody can rescue a worker, so its exit reason
+  # is an honest signal.
   #
-  # What makes that mandatory rather than merely tidy: after `net_kernel.start`
-  # the node is live under the cookie OTP invented, and that is weak.
-  # DEVICE-MEASURED on a dragon_q6a, `/root/.erlang.cookie` is 20 uppercase
-  # letters — `auth.erl` `random_cookie/3`'s LCG — because this target passes no
-  # `-setcookie`. Leaving that answering on a LAN is the one outcome to avoid.
+  # Nothing is rolled back. This is a test-mode tool on a test board: the fail
+  # case for every step is "restart the board", which reseeds the table, stops
+  # the node and returns a known non-distributed boot for free. So each step
+  # asserts, and the guard turns any abnormal exit into a reboot.
   defp bring_up(system) do
-    guard = arm_guard(system)
+    parent = self()
+    ref = make_ref()
 
+    worker = spawn(fn -> send(parent, {ref, start_distribution(system)}) end)
+    arm_guard(system, worker)
+
+    receive do
+      {^ref, session} -> {:ok, session}
+    after
+      @bring_up_timeout -> {:error, :timeout}
+    end
+  end
+
+  # Ordering is load-bearing and not the obvious one:
+  #
+  #   * ports first — `inet_tcp_dist` reads the range from the kernel app env at
+  #     LISTEN time.
+  #   * epmd next — it only auto-starts when the VM was booted with
+  #     `-name`/`-sname`, and Nerves deliberately passes neither.
+  #   * the cookie last, because `set_cookie/1` raises `:distribution_not_started`
+  #     before `net_kernel` is up. MEASURED on OTP 29.
+  defp start_distribution(system) do
     {:ok, address} = address(system)
     :ok = pin_ports(system)
     :ok = start_epmd(system)
-    session = start_node(system, node_name(address))
-
-    send(guard, :done)
-    {:ok, session}
+    start_node(system, node_name(address))
   end
 
   defp start_node(system, name) do
@@ -193,9 +216,8 @@ defmodule Vagus.Dist do
     # `set_cookie/1` gates NEW handshakes only, so a peer that authenticated
     # during the window above is still attached under the cookie OTP invented
     # and would keep root-equivalent access despite the read-back succeeding.
-    # Nothing legitimate is connected this early — on the recovery path the
-    # cookie has just been rotated out from under anyone who was, and they can
-    # reconnect with what `enable/0` returns.
+    # `:connected` rather than the default `:visible`, or a peer that attached
+    # with `-hidden` survives the sweep.
     Enum.each(system.connected_nodes_fun.(), &system.disconnect_fun.(&1))
 
     session = %{node: system.self_node_fun.(), cookie: cookie, ports: @port_min..@port_max}
@@ -203,32 +225,34 @@ defmodule Vagus.Dist do
     session
   end
 
-  # Unlinked, so killing the caller cannot kill it, and it watches from before
-  # the first step rather than from some armed point partway in. The caller CAN
-  # be killed mid-bring-up: `vm.args` sets `+Bc`, so Ctrl-C kills the IEx
-  # evaluator, and an `:erpc.call` timeout kills its process.
-  defp arm_guard(system) do
-    caller = self()
-
+  # Watches the worker. A `:normal` exit means the session was recorded; any
+  # other exit, or no exit inside the timeout, means the board may be sitting on
+  # the LAN under the bootstrap cookie.
+  #
+  # `net_kernel` is stopped BEFORE the reboot is requested: `Shutdown.reboot/0`
+  # is the graceful path and is budgeted in minutes while it stops workloads,
+  # and the exposure is the live listener, not the slow shutdown.
+  defp arm_guard(system, worker) do
     spawn(fn ->
-      ref = Process.monitor(caller)
+      ref = Process.monitor(worker)
 
       receive do
-        :done ->
+        {:DOWN, ^ref, :process, ^worker, :normal} ->
           :ok
 
-        {:DOWN, ^ref, :process, ^caller, reason} ->
-          # Stop the node FIRST. `Shutdown.reboot/0` is the graceful path and is
-          # budgeted in minutes while it stops workloads; until it completes the
-          # listener would still be answering under the bootstrap cookie. This
-          # closes that in milliseconds and is fire-and-forget — the reboot is
-          # what actually guarantees the clean state.
-          system.net_kernel_stop_fun.()
-
-          Logger.error("Vagus.Dist: bring-up failed (#{inspect(reason)}); rebooting")
-          system.reboot_fun.()
+        {:DOWN, ^ref, :process, ^worker, reason} ->
+          shut_down(system, "bring-up failed (#{inspect(reason)})")
+      after
+        @bring_up_timeout ->
+          shut_down(system, "bring-up stalled")
       end
     end)
+  end
+
+  defp shut_down(system, why) do
+    system.net_kernel_stop_fun.()
+    Logger.error("Vagus.Dist: #{why}; rebooting")
+    system.reboot_fun.()
   end
 
   # One atom per call, from a value `take_ownership/1` generated as 64 lowercase
@@ -314,7 +338,7 @@ defmodule Vagus.Dist do
       set_cookie_fun: &default_set_cookie/1,
       get_cookie_fun: &:erlang.get_cookie/0,
       alive_fun: &Node.alive?/0,
-      connected_nodes_fun: &Node.list/0,
+      connected_nodes_fun: fn -> Node.list(:connected) end,
       disconnect_fun: &Node.disconnect/1,
       net_kernel_stop_fun: &:net_kernel.stop/0,
       reboot_fun: &Shutdown.reboot/0,
@@ -377,8 +401,9 @@ defmodule Vagus.Dist do
   #
   # `System.cmd/3` deliberately, NOT MuonTrap. MEASURED on a dragon_q6a:
   # `MuonTrap.cmd/3` hangs unbounded on `epmd -kill` with no daemon to kill and
-  # its `:timeout` does not fire. Unbounded is tolerable here only because this
-  # runs in the spawned bring-up process, not in the caller's shell.
+  # its `:timeout` does not fire. Unbounded is tolerable because this runs in the
+  # spawned worker, and the guard reboots if that worker stalls past
+  # `@bring_up_timeout`.
   # sobelow_skip ["CI.System"]
   defp default_epmd(args, env) do
     System.cmd(epmd_path(), args, env: env, stderr_to_stdout: true)

@@ -187,13 +187,20 @@ defmodule Vagus.DistTest do
     defp reboot_on(vm, overrides) do
       test_pid = self()
 
-      caller =
-        spawn(fn ->
+      # The caller RESCUES, standing in for an IEx evaluator, which catches the
+      # exception and stays alive. DEVICE-MEASURED: a guard watching the caller
+      # never fires here, leaving the node up under the bootstrap cookie and the
+      # row stuck at :starting. The guard watches the worker instead.
+      spawn(fn ->
+        try do
           Dist.enable(system(vm, overrides ++ [reboot_fun: fn -> send(test_pid, :rebooted) end]))
-        end)
+        rescue
+          _ -> :swallowed
+        catch
+          _, _ -> :swallowed
+        end
+      end)
 
-      ref = Process.monitor(caller)
-      assert_receive {:DOWN, ^ref, :process, ^caller, _}, 2_000
       assert_receive :rebooted, 2_000
     end
 
@@ -217,9 +224,46 @@ defmodule Vagus.DistTest do
       reboot_on(vm, set_cookie_fun: fn _ -> :ok end)
     end
 
-    test "the caller is killed mid-bring-up", %{vm: vm} do
-      # +Bc Ctrl-C on the IEx evaluator, or an erpc timeout killing its process.
+    test "the worker is killed mid-bring-up", %{vm: vm} do
       reboot_on(vm, set_cookie_fun: fn _ -> Process.exit(self(), :kill) end)
+    end
+
+    test "a caller that survives the failure still gets the board rebooted", %{vm: vm} do
+      # The regression this structure exists for: IEx catches MatchError and
+      # keeps evaluating, so caller survival must not suppress the guard.
+      test_pid = self()
+
+      caller =
+        spawn(fn ->
+          Dist.enable(
+            system(vm,
+              set_cookie_fun: fn _ -> :ok end,
+              reboot_fun: fn -> send(test_pid, :rebooted) end
+            )
+          )
+        end)
+
+      # The reboot is driven entirely by the worker's exit, so it lands while
+      # the caller is still sitting in its receive — exactly the case a
+      # caller-watching guard missed.
+      assert_receive :rebooted, 2_000
+      assert Process.alive?(caller)
+    end
+
+    test "a stalled worker does not hold the claim forever", %{vm: vm} do
+      test_pid = self()
+
+      spawn(fn ->
+        Dist.enable(
+          system(vm,
+            epmd_fun: fn _args, _env -> Process.sleep(:infinity) end,
+            reboot_fun: fn -> send(test_pid, :rebooted) end
+          )
+        )
+      end)
+
+      # The guard's timeout is the backstop for an unbounded System.cmd.
+      assert_receive :rebooted, 40_000
     end
 
     test "a recorded session whose node is gone", %{vm: vm} do
@@ -444,25 +488,38 @@ defmodule Vagus.DistTest do
                Enum.find_index(recorded, &match?({:disconnect, _}, &1))
     end
 
+    test "hidden peers are disconnected too", %{vm: vm} do
+      # Node.list/0 defaults to :visible, so a peer attached with -hidden would
+      # survive the sweep.
+      overrides = [
+        set_cookie_fun: fn cookie ->
+          record(vm, {:set_cookie, cookie})
+          Agent.update(vm, &%{&1 | cookie: cookie, peers: [:"hidden@10.0.0.9"]})
+          :ok
+        end,
+        connected_nodes_fun: fn -> Agent.get(vm, & &1.peers) end
+      ]
+
+      {:ok, _} = Dist.enable(system(vm, overrides))
+
+      assert {:disconnect, :"hidden@10.0.0.9"} in steps(vm)
+    end
+
     test "the guard stops the node before asking for a reboot", %{vm: vm} do
       # Shutdown.reboot/0 is the graceful path and is budgeted in minutes; the
       # listener must not stay up under the bootstrap cookie for that long.
       test_pid = self()
 
-      caller =
-        spawn(fn ->
-          Dist.enable(
-            system(vm,
-              set_cookie_fun: fn _ -> Process.exit(self(), :kill) end,
-              reboot_fun: fn -> send(test_pid, :rebooted) end
-            )
+      spawn(fn ->
+        Dist.enable(
+          system(vm,
+            set_cookie_fun: fn _ -> Process.exit(self(), :kill) end,
+            reboot_fun: fn -> send(test_pid, :rebooted) end
           )
-        end)
+        )
+      end)
 
-      ref = Process.monitor(caller)
-      assert_receive {:DOWN, ^ref, :process, ^caller, :killed}, 2_000
       assert_receive :rebooted, 2_000
-
       recorded = steps(vm)
       assert :net_kernel_stop in recorded
       refute Agent.get(vm, & &1.node)
