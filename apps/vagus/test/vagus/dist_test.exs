@@ -250,6 +250,63 @@ defmodule Vagus.DistTest do
       assert Process.alive?(caller)
     end
 
+    test "a successful bring-up never reboots, even when the worker wins the race", %{vm: vm} do
+      # The guard creates the worker with spawn_monitor/1. Spawning separately
+      # and monitoring afterwards loses this race: a worker that finishes first
+      # is already dead, Process.monitor/1 reports :noproc, and a SUCCESSFUL
+      # enable gets misread as a failure. Repeated because it is a race.
+      for _ <- 1..20 do
+        {:ok, vm2} =
+          Agent.start_link(fn ->
+            %{node: nil, cookie: :nocookie, steps: [], session: :not_requested, peers: []}
+          end)
+
+        assert {:ok, _} = Dist.enable(system(vm2))
+
+        # enable/0 returns the moment the worker sends its result, which is
+        # BEFORE the guard has observed the exit. Asserting here would pass
+        # against a guard that reboots a microsecond later — the assertion has
+        # to outlive the guard's decision.
+        Process.sleep(50)
+
+        refute :reboot in steps(vm2)
+        refute :net_kernel_stop in steps(vm2)
+      end
+    end
+
+    test "a caller that dies after a successful bring-up does not reboot", %{vm: vm} do
+      # The board is fine: the session is recorded and retrievable. Rebooting
+      # because nobody was listening would be gratuitous.
+      caller = spawn(fn -> Dist.enable(system(vm)) end)
+      ref = Process.monitor(caller)
+      assert_receive {:DOWN, ^ref, :process, ^caller, :normal}, 2_000
+
+      refute :reboot in steps(vm)
+      assert %{node: _} = Agent.get(vm, & &1.session)
+    end
+
+    test "a stalled worker is killed before the node is stopped", %{vm: vm} do
+      # Otherwise epmd could return after the deadline and walk into
+      # net_kernel.start behind the shutdown, reopening the listener.
+      test_pid = self()
+
+      spawn(fn ->
+        Dist.enable(
+          system(vm,
+            epmd_fun: fn _args, _env ->
+              send(test_pid, {:worker, self()})
+              Process.sleep(:infinity)
+            end,
+            reboot_fun: fn -> send(test_pid, :rebooted) end
+          )
+        )
+      end)
+
+      assert_receive {:worker, worker}, 2_000
+      assert_receive :rebooted, 40_000
+      refute Process.alive?(worker)
+    end
+
     test "a stalled worker does not hold the claim forever", %{vm: vm} do
       test_pid = self()
 

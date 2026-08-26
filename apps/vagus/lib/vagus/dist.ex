@@ -55,6 +55,10 @@ defmodule Vagus.Dist do
   # worker hold the claim — `epmd -daemon` through `System.cmd/3` has no timeout
   # of its own.
   @bring_up_timeout :timer.seconds(30)
+
+  # Only bounds how long the guard waits for a killed worker to actually die,
+  # so it never delays the reboot meaningfully.
+  @kill_timeout :timer.seconds(5)
   @table :vagus_dist
   @session_key :session
 
@@ -67,6 +71,11 @@ defmodule Vagus.Dist do
   later call hands back that same session without touching `net_kernel` again.
   A caller that arrives while a claim is in flight gets `{:error, :starting}`
   rather than racing it.
+
+  Losing the caller is not itself a failure. Bring-up runs in its own process,
+  so a caller that dies mid-call leaves a board that either finished correctly —
+  session recorded, retrievable by calling this again — or is rebooting. What is
+  guaranteed is the outcome, not that anyone is still listening for it.
   """
   @spec enable(keyword()) :: {:ok, session()} | {:error, term()}
   def enable(opts \\ []) do
@@ -166,8 +175,7 @@ defmodule Vagus.Dist do
     parent = self()
     ref = make_ref()
 
-    worker = spawn(fn -> send(parent, {ref, start_distribution(system)}) end)
-    arm_guard(system, worker)
+    spawn(fn -> guard(system, parent, ref) end)
 
     receive do
       {^ref, session} -> {:ok, session}
@@ -225,28 +233,40 @@ defmodule Vagus.Dist do
     session
   end
 
-  # Watches the worker. A `:normal` exit means the session was recorded; any
-  # other exit, or no exit inside the timeout, means the board may be sitting on
-  # the LAN under the bootstrap cookie.
+  # The guard CREATES the worker, via `spawn_monitor/1`, so the monitor is
+  # installed atomically with the spawn. Spawning the worker separately and
+  # monitoring it afterwards loses a race: a worker that finishes first is
+  # already dead, `Process.monitor/1` then reports `:noproc`, and a SUCCESSFUL
+  # bring-up gets misread as a failure and reboots the board.
   #
-  # `net_kernel` is stopped BEFORE the reboot is requested: `Shutdown.reboot/0`
-  # is the graceful path and is budgeted in minutes while it stops workloads,
-  # and the exposure is the live listener, not the slow shutdown.
-  defp arm_guard(system, worker) do
-    spawn(fn ->
-      ref = Process.monitor(worker)
+  # A `:normal` exit means the session was recorded. Anything else, or a worker
+  # still running at the deadline, means the board may be sitting on the LAN
+  # under the bootstrap cookie.
+  defp guard(system, parent, ref) do
+    {worker, monitor} =
+      spawn_monitor(fn -> send(parent, {ref, start_distribution(system)}) end)
 
-      receive do
-        {:DOWN, ^ref, :process, ^worker, :normal} ->
-          :ok
+    receive do
+      {:DOWN, ^monitor, :process, ^worker, :normal} ->
+        :ok
 
-        {:DOWN, ^ref, :process, ^worker, reason} ->
-          shut_down(system, "bring-up failed (#{inspect(reason)})")
-      after
-        @bring_up_timeout ->
-          shut_down(system, "bring-up stalled")
-      end
-    end)
+      {:DOWN, ^monitor, :process, ^worker, reason} ->
+        shut_down(system, "bring-up failed (#{inspect(reason)})")
+    after
+      @bring_up_timeout ->
+        # Kill it and WAIT. A worker stalled in `epmd` could otherwise return
+        # after the deadline and walk into `net_kernel.start` behind our back,
+        # reopening the listener during a graceful reboot that takes minutes.
+        Process.exit(worker, :kill)
+
+        receive do
+          {:DOWN, ^monitor, :process, ^worker, _reason} -> :ok
+        after
+          @kill_timeout -> :ok
+        end
+
+        shut_down(system, "bring-up stalled")
+    end
   end
 
   defp shut_down(system, why) do
