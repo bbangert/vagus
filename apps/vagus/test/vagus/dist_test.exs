@@ -484,7 +484,8 @@ defmodule Vagus.DistTest do
 
       pid = boot!(ctx, epmd_fun: epmd, erlang_cookie_path_fun: fn -> {:error, :no_home} end)
 
-      assert {{:erlang_cookie_path, :no_home}, {:rollback_failed, {:epmd_kill_failed, 1, _}}} =
+      assert {{:erlang_cookie_path, :no_home},
+              {:tear_down_incomplete, [{:epmd_kill_failed, 1, _}]}} =
                Dist.status(pid).last_error
     end
 
@@ -497,6 +498,54 @@ defmodule Vagus.DistTest do
       refute Dist.status(pid).alive?
       assert Process.alive?(pid)
       assert {:crashed, :error, {ArgumentError, _}} = Dist.status(pid).last_error
+    end
+
+    test "a PERMANENT failure goes idle instead of looping epmd every 5s", ctx do
+      # $HOME cannot appear by waiting. Retrying it forever meant starting and
+      # killing epmd on a loop, and rewriting the home cookie each pass.
+      pid = boot!(ctx, erlang_cookie_path_fun: fn -> {:error, :no_home} end)
+
+      assert Dist.status(pid).last_error == {:erlang_cookie_path, :no_home}
+      refute Dist.status(pid).alive?
+      # Idle: no timer armed, so nothing repeats.
+      assert :sys.get_state(pid).retry_ref == nil
+    end
+
+    test "a TRANSIENT failure still retries", ctx do
+      # The contrast that makes the classification meaningful rather than a
+      # blanket "stop trying".
+      pid = boot!(ctx, ifaddrs_fun: fn -> [@loopback] end)
+
+      assert Dist.status(pid).last_error == :no_address
+      assert is_reference(:sys.get_state(pid).retry_ref)
+    end
+
+    test "a stop that did not take is reported, not hidden", ctx do
+      # apply_cookie/2 used to discard net_kernel.stop/0's outcome and never
+      # check liveness, so a read-back failure could leave the node live under
+      # the very cookie the read-back exists to reject.
+      # Alive must be FALSE at the pre-check (or start/2 short-circuits into
+      # reconcile and apply_cookie never runs) and TRUE afterwards, with a stop
+      # that answers :ok without taking.
+      {:ok, vm} = Agent.start_link(fn -> nil end)
+      on_exit(fn -> if Process.alive?(vm), do: Agent.stop(vm) end)
+
+      pid =
+        boot!(ctx,
+          net_kernel_start_fun: fn name, _opts ->
+            Agent.update(vm, fn _ -> name end)
+            {:ok, self()}
+          end,
+          alive_fun: fn -> Agent.get(vm, & &1) != nil end,
+          self_node_fun: fn -> Agent.get(vm, & &1) || :nonode@nohost end,
+          get_cookie_fun: fn -> @other_cookie_atom end,
+          net_kernel_stop_fun: fn -> :ok end
+        )
+
+      assert {:cookie_not_applied, {:tear_down_incomplete, residue}} =
+               Dist.status(pid).last_error
+
+      assert {:still_alive, _} = List.keyfind(residue, :still_alive, 0)
     end
 
     test "a failing epmd -daemon stops the sequence", ctx do
@@ -530,12 +579,12 @@ defmodule Vagus.DistTest do
       # calling from. Nothing else is ranked or preferred.
       unusable = [
         @loopback,
-        {~c"lo2", [addr: {0, 0, 0, 0}]},
-        {~c"wlan9", [addr: {169, 254, 3, 4}]},
-        {~c"hassio", [addr: {172, 30, 32, 2}]},
-        {~c"balena0", [addr: {172, 17, 0, 1}]},
-        {~c"docker0", [addr: {10, 1, 2, 3}]},
-        {~c"br-abc123", [addr: {10, 4, 5, 6}]}
+        {~c"lo2", [flags: [:up], addr: {0, 0, 0, 0}]},
+        {~c"wlan9", [flags: [:up], addr: {169, 254, 3, 4}]},
+        {~c"hassio", [flags: [:up], addr: {172, 30, 32, 2}]},
+        {~c"balena0", [flags: [:up], addr: {172, 17, 0, 1}]},
+        {~c"docker0", [flags: [:up], addr: {10, 1, 2, 3}]},
+        {~c"br-abc123", [flags: [:up], addr: {10, 4, 5, 6}]}
       ]
 
       pid = boot!(ctx, ifaddrs_fun: fn -> unusable end)
@@ -549,13 +598,28 @@ defmodule Vagus.DistTest do
       # perfectly reachable address. Container bridges are excluded by NAME.
       ifaddrs = [
         @loopback,
-        {~c"hassio", [addr: {172, 30, 32, 2}]},
-        {~c"balena0", [addr: {172, 17, 0, 1}]},
-        {~c"eth0", [addr: {172, 20, 1, 5}]}
+        {~c"hassio", [flags: [:up], addr: {172, 30, 32, 2}]},
+        {~c"balena0", [flags: [:up], addr: {172, 17, 0, 1}]},
+        {~c"eth0", [flags: [:up], addr: {172, 20, 1, 5}]}
       ]
 
       pid = boot!(ctx, ifaddrs_fun: fn -> ifaddrs end)
       assert Dist.status(pid).node == :"vagus@172.20.1.5"
+    end
+
+    test "ignores an address on a DOWN interface", ctx do
+      # A configured address on a down interface is still an address, and
+      # choosing it fails invisibly: distribution starts, enable/0 hands back a
+      # name that answers nowhere, and the retry never repairs it because the
+      # node IS alive. Down interface listed FIRST so a scan that ignores flags
+      # picks it.
+      ifaddrs = [
+        {~c"eth1", [flags: [:broadcast], addr: {10, 9, 9, 9}]},
+        {~c"eth0", [flags: [:up, :running], addr: {192, 168, 2, 58}]}
+      ]
+
+      pid = boot!(ctx, ifaddrs_fun: fn -> ifaddrs end)
+      assert Dist.status(pid).node == :"vagus@192.168.2.58"
     end
 
     test "retries until an address appears, and never gives up", ctx do

@@ -81,8 +81,10 @@ defmodule Vagus.Dist do
   @cookie_mode 0o600
   @erlang_cookie_mode 0o400
 
-  # Flat, not exponential, and it never gives up: the only thing worth waiting
-  # for is an address, and a board that gets one at minute ten should come up.
+  # Flat, not exponential, and it never gives up — but only for failures that
+  # waiting can fix. A board that gets an address at minute ten should come up;
+  # a board with no writable $HOME will still have none in five seconds, and
+  # retrying that forever means starting and killing epmd on a loop.
   @retry_ms 5_000
 
   @type status :: %{
@@ -280,10 +282,28 @@ defmodule Vagus.Dist do
   # flash that is a crash loop and a `startup_guard` rollback across the fleet.
   defp boot(state) do
     case guarded(fn -> attempt_boot(state) end) do
-      {:error, reason} -> retry(state, reason)
+      {:error, reason} -> reschedule(state, reason)
       booted -> booted
     end
   end
+
+  # Waiting only helps if what failed can change on its own. An address can
+  # appear; a missing $HOME or a cookie path that cannot be written will not,
+  # and looping on those burns an epmd start and kill every five seconds
+  # forever. Permanent failures go idle with `last_error` set, so `status/0`
+  # still explains the board — an address change or a reboot revisits them.
+  defp reschedule(state, reason) do
+    if retryable?(reason), do: retry(state, reason), else: idle(state, reason)
+  end
+
+  defp retryable?(:no_address), do: true
+  defp retryable?({:epmd_failed, _status, _output}), do: true
+  defp retryable?({:epmd_kill_failed, _status, _output}), do: true
+  defp retryable?({:crashed, _kind, _reason}), do: true
+  # A tear-down that did not complete deserves another attempt only if the thing
+  # that failed underneath it does: epmd may yet die, a missing $HOME will not.
+  defp retryable?({reason, {:tear_down_incomplete, _residue}}), do: retryable?(reason)
+  defp retryable?(_permanent), do: false
 
   defp attempt_boot(state) do
     if File.exists?(state.cookie_path) do
@@ -404,8 +424,8 @@ defmodule Vagus.Dist do
          :ok <- start_epmd(state) do
       finish_bring_up(state, cookie, address)
     else
-      {:error, reason} -> retry(state, reason)
-      other -> retry(state, other)
+      {:error, reason} -> reschedule(state, reason)
+      other -> reschedule(state, other)
     end
   end
 
@@ -425,31 +445,23 @@ defmodule Vagus.Dist do
         %{cancel_retry(state) | node: state.seams.self_node_fun.(), last_error: nil}
 
       {:error, reason} ->
-        retry(state, roll_back(state, reason))
+        reschedule(state, roll_back(state, reason))
 
       other ->
-        retry(state, roll_back(state, other))
+        reschedule(state, roll_back(state, other))
     end
   rescue
     exception ->
-      kill_epmd(state)
+      tear_down(state, {:crashed, :error, exception.__struct__})
       reraise exception, __STACKTRACE__
   catch
     kind, reason ->
-      kill_epmd(state)
+      tear_down(state, {:crashed, kind, :thrown})
       :erlang.raise(kind, reason, __STACKTRACE__)
   end
 
-  # Reached only from finish_bring_up/3, so epmd is ours by construction. The
-  # cleanup failure travels WITH the original reason: dropping it let a give-up
-  # leave epmd listening while last_error named only the bring-up failure — the
-  # one field an operator would consult.
-  defp roll_back(state, reason) do
-    case kill_epmd(state) do
-      :ok -> reason
-      {:error, cleanup} -> {reason, {:rollback_failed, cleanup}}
-    end
-  end
+  # Reached only from finish_bring_up/3, so epmd is ours by construction.
+  defp roll_back(state, reason), do: tear_down(state, reason)
 
   # The node name carries an address so connecting needs no lookup — that is its
   # only job, since the listener binds the wildcard. Container and link-local
@@ -457,7 +469,7 @@ defmodule Vagus.Dist do
   # LAN the operator is calling from; nothing else is ranked or preferred.
   defp address(state) do
     state.seams.ifaddrs_fun.()
-    |> Enum.reject(fn {ifname, _opts} -> container_bridge?(ifname) end)
+    |> Enum.reject(fn {ifname, opts} -> container_bridge?(ifname) or down?(opts) end)
     |> Enum.find_value(fn {_ifname, opts} ->
       Enum.find(Keyword.get_values(opts, :addr), &reachable?/1)
     end)
@@ -475,6 +487,11 @@ defmodule Vagus.Dist do
     name = to_string(ifname)
     name in ["hassio", "balena0", "docker0"] or String.starts_with?(name, "br-")
   end
+
+  # A configured address on a DOWN interface is still an address, and picking it
+  # fails invisibly: distribution starts, enable/0 hands back a node name that
+  # answers nowhere, and the retry never repairs it because the node IS alive.
+  defp down?(opts), do: :up not in Keyword.get(opts, :flags, [])
 
   defp reachable?({127, _, _, _}), do: false
   defp reachable?({169, 254, _, _}), do: false
@@ -533,27 +550,53 @@ defmodule Vagus.Dist do
     end
   end
 
+  # Reports only. Tearing down here as well as in finish_bring_up/3 wrapped the
+  # reason twice and killed epmd twice — "one exit" has to mean one. Every way
+  # out of this function lands in finish_bring_up/3: the mismatch through its
+  # `else`, a raise through its `rescue`, both of which tear down.
   defp apply_cookie(state, cookie) do
     atom = cookie_atom(cookie)
     state.seams.set_cookie_fun.(atom)
 
-    if state.seams.get_cookie_fun.() == atom do
-      :ok
-    else
-      state.seams.net_kernel_stop_fun.()
-      {:error, :cookie_not_applied}
-    end
-  rescue
-    exception ->
-      # Stop first, then propagate: a raise from a seam must not walk past the
-      # read-back and leave distribution live under an unverified cookie.
-      state.seams.net_kernel_stop_fun.()
-      reraise exception, __STACKTRACE__
-  catch
-    kind, reason ->
-      state.seams.net_kernel_stop_fun.()
-      :erlang.raise(kind, reason, __STACKTRACE__)
+    if state.seams.get_cookie_fun.() == atom,
+      do: :ok,
+      else: {:error, :cookie_not_applied}
   end
+
+  # THE single exit for every failure after net_kernel has started. Stopping and
+  # killing epmd were open-coded on four separate paths, and three review rounds
+  # running found one of them discarding its result — the same defect fixed and
+  # reintroduced by successive rewrites. There is now no site left to miss:
+  # anything that fails past `net_kernel.start` comes through here, and whatever
+  # could not be undone travels back attached to the original reason.
+  defp tear_down(state, reason) do
+    stopped = state.seams.net_kernel_stop_fun.()
+
+    residue =
+      [
+        # `Node.alive?/0` decides, not net_kernel.stop/0's return: a stop that
+        # did not take leaves the node live under a cookie nobody verified,
+        # which is the one state the read-back exists to prevent.
+        if(state.seams.alive_fun.(), do: {:still_alive, stopped}),
+        reason_of(kill_epmd(state))
+      ]
+      |> Enum.reject(&is_nil/1)
+
+    case residue do
+      [] ->
+        reason
+
+      _ ->
+        Logger.error(
+          "Vagus.Dist: incomplete tear-down after #{inspect(reason)}: #{inspect(residue)}"
+        )
+
+        {reason, {:tear_down_incomplete, residue}}
+    end
+  end
+
+  defp reason_of(:ok), do: nil
+  defp reason_of({:error, reason}), do: reason
 
   # One atom per boot, from a file this module minted and matched against
   # @cookie_format, so the 255-character limit is unreachable.
