@@ -179,6 +179,12 @@ defmodule Vagus.Dist do
   @impl GenServer
   def handle_continue(:boot, state), do: {:noreply, boot(state)}
 
+  # Blocks the server for as long as the shutdown takes — MEASURED at 24s on a
+  # dragon_q6a, bounded by `Vagus.Host.Shutdown`'s own budget — so `status/0`
+  # exits with a timeout for that window. Deliberate: running the shutdown from
+  # a spawned process would keep status answering, at the cost of a reboot that
+  # can be lost if that process dies. A board on its way down is the one time
+  # unavailability is the cheaper failure.
   def handle_continue(:reboot, state) do
     state.seams.reboot_fun.()
     {:noreply, state}
