@@ -2,6 +2,13 @@ defmodule Vagus.Dist do
   @moduledoc """
   Runtime Erlang distribution for test and diagnostic work, on request only.
 
+  > #### Test boards only {: .warning}
+  >
+  > This is not for a board anyone depends on. Enabling it opens an
+  > unauthenticated-root-equivalent surface on the LAN segment, and **any
+  > failure while enabling reboots the board** — there is no rollback, because
+  > restarting is the cleanest way back to a known non-distributed state.
+
   `enable/0` starts distribution and returns the node, cookie and port range.
   Nothing is enabled until someone asks, and a reboot turns it back off — there
   is no gate file, no config flag and no supervised process, so there is also no
@@ -40,15 +47,12 @@ defmodule Vagus.Dist do
 
   require Logger
 
+  alias Vagus.Host.Shutdown
+
   @port_min 9100
   @port_max 9105
   @table :vagus_dist
   @session_key :session
-
-  # Generous: it only bounds how long the CALLER waits. Bring-up continues in
-  # its own process regardless, so a timeout costs a retry, never a half-started
-  # node.
-  @bring_up_timeout :timer.seconds(30)
 
   @type session :: %{node: node(), cookie: String.t(), ports: Range.t()}
 
@@ -65,9 +69,22 @@ defmodule Vagus.Dist do
     system = system(opts)
 
     case system.session_claim_fun.() do
-      :claimed -> bring_up(system)
-      :starting -> {:error, :starting}
-      {:recorded, session} -> {:ok, session}
+      :claimed ->
+        bring_up(system)
+
+      :starting ->
+        {:error, :starting}
+
+      # A record with no live node behind it is corruption — only a deliberate
+      # `:net_kernel.stop/0` produces it — and handing back a session whose
+      # listener is gone would send an operator to a dead port.
+      {:recorded, session} ->
+        if system.alive_fun.() do
+          {:ok, session}
+        else
+          Logger.error("Vagus.Dist: recorded session but no live node; rebooting")
+          system.reboot_fun.()
+        end
     end
   end
 
@@ -127,52 +144,27 @@ defmodule Vagus.Dist do
     fun.()
   end
 
-  # Deliberately UNLINKED. Between `net_kernel.start` returning and
-  # `set_cookie/1` completing, the node is live under a cookie OTP invented —
-  # `auth.erl` `create_cookie/1` builds it from `random_cookie(20, Seed, [])`, a
-  # 20-letter LCG seeded off `monotonic_time`, which is not a credential to
-  # leave answering on a LAN. If the caller dies in that window the work must
-  # still finish, and the caller CAN die there: `vm.args` sets `+Bc`, so Ctrl-C
-  # kills the IEx evaluator, and an `:erpc.call` timeout kills its process.
-  defp bring_up(system) do
-    parent = self()
-    ref = make_ref()
-    {pid, monitor} = spawn_monitor(fn -> send(parent, {ref, start_distribution(system)}) end)
-
-    receive do
-      {^ref, result} ->
-        Process.demonitor(monitor, [:flush])
-        result
-
-      {:DOWN, ^monitor, :process, ^pid, reason} ->
-        system.session_reset_fun.()
-        {:error, {:bring_up_crashed, reason}}
-    after
-      @bring_up_timeout ->
-        # No reset: the claim stays held because that process is still running.
-        Process.demonitor(monitor, [:flush])
-        {:error, :timeout}
-    end
-  end
-
-  # Ordering is load-bearing and not the obvious one:
+  # Nothing is rolled back and almost nothing is handled. This is a test-mode
+  # tool on a test board: the fail case for every step here is "restart the
+  # board", which reseeds the table, stops the node and returns a known
+  # non-distributed boot for free. So each step asserts, and the guard turns any
+  # crash — including the caller being killed — into a reboot.
   #
-  #   * ports first — `inet_tcp_dist` reads the range from the kernel app env at
-  #     LISTEN time.
-  #   * epmd next — it only auto-starts when the VM was booted with
-  #     `-name`/`-sname`, and Nerves deliberately passes neither.
-  #   * the cookie last, because `set_cookie/1` raises `:distribution_not_started`
-  #     before `net_kernel` is up. MEASURED on OTP 29.
-  defp start_distribution(system) do
-    with {:ok, address} <- address(system),
-         :ok <- pin_ports(system),
-         :ok <- start_epmd(system) do
-      start_node(system, node_name(address))
-    else
-      {:error, reason} ->
-        system.session_reset_fun.()
-        {:error, reason}
-    end
+  # What makes that mandatory rather than merely tidy: after `net_kernel.start`
+  # the node is live under the cookie OTP invented, and that is weak.
+  # DEVICE-MEASURED on a dragon_q6a, `/root/.erlang.cookie` is 20 uppercase
+  # letters — `auth.erl` `random_cookie/3`'s LCG — because this target passes no
+  # `-setcookie`. Leaving that answering on a LAN is the one outcome to avoid.
+  defp bring_up(system) do
+    guard = arm_guard(system)
+
+    {:ok, address} = address(system)
+    :ok = pin_ports(system)
+    :ok = start_epmd(system)
+    session = start_node(system, node_name(address))
+
+    send(guard, :done)
+    {:ok, session}
   end
 
   defp start_node(system, name) do
@@ -187,32 +179,39 @@ defmodule Vagus.Dist do
       # of a board that is distributed right now.
       {:error, {:already_started, _pid}} ->
         take_ownership(system)
-
-      {:error, reason} ->
-        system.session_reset_fun.()
-        {:error, reason}
     end
   end
 
-  # Always mints, never adopts the cookie already in place. On the recovery path
-  # above, that cookie may be the weak one OTP invented — from a caller that
-  # died mid-bring-up — and handing it back would launder a bad credential into
-  # a recorded session. So the invariant is unconditional: after a successful
-  # `enable/0` the node uses a cookie this function generated, verified by
-  # reading it back.
+  # Always mints, never adopts the cookie already in place: on the recovery path
+  # that cookie may be the weak one OTP invented, and handing it back would
+  # launder a bad credential into a recorded session.
   defp take_ownership(system) do
     cookie = :crypto.strong_rand_bytes(32) |> Base.encode16(case: :lower)
+    :ok = apply_cookie(system, cookie)
+    session = %{node: system.self_node_fun.(), cookie: cookie, ports: @port_min..@port_max}
+    :ok = system.session_put_fun.(session)
+    session
+  end
 
-    case apply_cookie(system, cookie) do
-      :ok ->
-        session = %{node: system.self_node_fun.(), cookie: cookie, ports: @port_min..@port_max}
-        system.session_put_fun.(session)
-        {:ok, session}
+  # Unlinked, so killing the caller cannot kill it, and it watches from before
+  # the first step rather than from some armed point partway in. The caller CAN
+  # be killed mid-bring-up: `vm.args` sets `+Bc`, so Ctrl-C kills the IEx
+  # evaluator, and an `:erpc.call` timeout kills its process.
+  defp arm_guard(system) do
+    caller = self()
 
-      {:error, reason} ->
-        system.session_reset_fun.()
-        {:error, stop_node(system, reason)}
-    end
+    spawn(fn ->
+      ref = Process.monitor(caller)
+
+      receive do
+        :done ->
+          :ok
+
+        {:DOWN, ^ref, :process, ^caller, reason} ->
+          Logger.error("Vagus.Dist: bring-up failed (#{inspect(reason)}); rebooting")
+          system.reboot_fun.()
+      end
+    end)
   end
 
   # One atom per call, from a value `take_ownership/1` generated as 64 lowercase
@@ -225,26 +224,6 @@ defmodule Vagus.Dist do
     system.set_cookie_fun.(atom)
 
     if system.get_cookie_fun.() == atom, do: :ok, else: {:error, :cookie_not_applied}
-  end
-
-  # A node alive under a cookie the caller was not handed is the one state this
-  # must never leave behind, so `Node.alive?/0` decides rather than
-  # `net_kernel.stop/0`'s return value. epmd is left alone: it serves an empty
-  # name list, a reboot clears it, and killing it risks stopping a daemon this
-  # call did not create.
-  defp stop_node(system, reason) do
-    stopped = system.net_kernel_stop_fun.()
-
-    if system.alive_fun.() do
-      Logger.error(
-        "Vagus.Dist: node still alive after #{inspect(reason)}; " <>
-          "net_kernel.stop returned #{inspect(stopped)}"
-      )
-
-      {reason, {:still_alive, stopped}}
-    else
-      reason
-    end
   end
 
   # The node name carries an address so connecting needs no lookup — its only
@@ -315,15 +294,14 @@ defmodule Vagus.Dist do
       put_env_fun: &default_put_env/2,
       epmd_fun: &default_epmd/2,
       net_kernel_start_fun: &:net_kernel.start/2,
-      net_kernel_stop_fun: &:net_kernel.stop/0,
       set_cookie_fun: &default_set_cookie/1,
       get_cookie_fun: &:erlang.get_cookie/0,
       alive_fun: &Node.alive?/0,
+      reboot_fun: &Shutdown.reboot/0,
       self_node_fun: &Node.self/0,
       session_claim_fun: &default_session_claim/0,
       session_get_fun: &default_session_get/0,
-      session_put_fun: &default_session_put/1,
-      session_reset_fun: &default_session_reset/0
+      session_put_fun: &default_session_put/1
     )
     |> Map.new()
   end
@@ -357,11 +335,6 @@ defmodule Vagus.Dist do
 
   defp default_session_put(session) do
     :ets.insert(@table, {@session_key, session})
-    :ok
-  end
-
-  defp default_session_reset do
-    :ets.insert(@table, {@session_key, :not_requested})
     :ok
   end
 

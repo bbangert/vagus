@@ -46,11 +46,6 @@ defmodule Vagus.DistTest do
           {:ok, self()}
         end
       end,
-      net_kernel_stop_fun: fn ->
-        record(vm, :net_kernel_stop)
-        Agent.update(vm, &%{&1 | node: nil, cookie: :nocookie})
-        :ok
-      end,
       set_cookie_fun: fn cookie ->
         record(vm, {:set_cookie, cookie})
         Agent.update(vm, &%{&1 | cookie: cookie})
@@ -58,6 +53,7 @@ defmodule Vagus.DistTest do
       end,
       get_cookie_fun: fn -> Agent.get(vm, & &1.cookie) end,
       alive_fun: fn -> Agent.get(vm, &(&1.node != nil)) end,
+      reboot_fun: fn -> record(vm, :reboot) end,
       self_node_fun: fn -> Agent.get(vm, & &1.node) end,
       # get_and_update is atomic, which is what makes this a faithful stand-in
       # for :ets.select_replace/2 rather than a check-then-set that would hide
@@ -70,11 +66,6 @@ defmodule Vagus.DistTest do
             session -> {{:recorded, session}, st}
           end
         end)
-      end,
-      session_reset_fun: fn ->
-        record(vm, :session_reset)
-        Agent.update(vm, &%{&1 | session: :not_requested})
-        :ok
       end,
       # Replaces the :vagus_dist table, which is global and would break
       # async: true isolation across the suite.
@@ -128,16 +119,6 @@ defmodule Vagus.DistTest do
       assert first == again
     end
 
-    test "nothing is recorded when bring-up fails, so a retry can still work", %{vm: vm} do
-      fail = [set_cookie_fun: fn _ -> :ok end]
-      assert {:error, :cookie_not_applied} = Dist.enable(system(vm, fail))
-      assert %{enabled?: false} = Dist.status(system(vm))
-
-      assert {:ok, %{node: :"vagus@192.168.2.58"}} = Dist.enable(system(vm))
-    end
-  end
-
-  describe "bring-up ordering" do
     test "ports are pinned BEFORE net_kernel starts", %{vm: vm} do
       {:ok, _} = Dist.enable(system(vm))
       recorded = steps(vm)
@@ -189,55 +170,59 @@ defmodule Vagus.DistTest do
     end
   end
 
-  describe "the cookie read-back" do
-    test "a node left under a cookie the caller was not handed is stopped", %{vm: vm} do
-      # The whole safety property of this module.
-      overrides = [set_cookie_fun: fn _ -> :ok end]
+  describe "every failure reboots" do
+    # A test-mode tool on a test board: restarting is the fail case for all of
+    # it, and it reseeds the table and stops the node for free.
+    defp reboot_on(vm, overrides) do
+      test_pid = self()
 
-      assert {:error, :cookie_not_applied} = Dist.enable(system(vm, overrides))
-      assert :net_kernel_stop in steps(vm)
-      refute Agent.get(vm, & &1.node)
+      caller =
+        spawn(fn ->
+          Dist.enable(system(vm, overrides ++ [reboot_fun: fn -> send(test_pid, :rebooted) end]))
+        end)
+
+      ref = Process.monitor(caller)
+      assert_receive {:DOWN, ^ref, :process, ^caller, _}, 2_000
+      assert_receive :rebooted, 2_000
     end
 
-    test "trusts Node.alive? over net_kernel.stop's return value", %{vm: vm} do
-      # stop/0 claiming :ok while the node is still up is the case that must not
-      # be reported as a clean rollback.
-      overrides = [
-        set_cookie_fun: fn _ -> :ok end,
-        net_kernel_stop_fun: fn -> :ok end
-      ]
-
-      assert {:error, {:cookie_not_applied, {:still_alive, :ok}}} =
-               Dist.enable(system(vm, overrides))
+    test "no usable address", %{vm: vm} do
+      reboot_on(vm, ifaddrs_fun: fn -> [] end)
+      refute Enum.any?(steps(vm), &match?({:epmd, _}, &1))
     end
-  end
 
-  describe "failure before the node exists" do
-    test "an epmd failure never starts net_kernel", %{vm: vm} do
-      overrides = [epmd_fun: fn _args, _env -> {"port 4369 in use", 1} end]
-
-      assert {:error, {:epmd_failed, 1, "port 4369 in use"}} = Dist.enable(system(vm, overrides))
+    test "epmd will not start", %{vm: vm} do
+      reboot_on(vm, epmd_fun: fn _args, _env -> {"port 4369 in use", 1} end)
       refute Enum.any?(steps(vm), &match?({:net_kernel_start, _, _}, &1))
     end
 
-    test "no usable address never starts epmd or net_kernel", %{vm: vm} do
-      overrides = [ifaddrs_fun: fn -> [] end]
-
-      assert {:error, :no_address} = Dist.enable(system(vm, overrides))
-      # Only the claim being released; nothing was started to roll back.
-      assert steps(vm) == [:session_reset]
+    test "net_kernel refuses to start", %{vm: vm} do
+      reboot_on(vm, net_kernel_start_fun: fn _name, _opts -> {:error, :einval} end)
     end
 
-    test "a net_kernel start failure is returned as-is", %{vm: vm} do
-      overrides = [net_kernel_start_fun: fn _name, _opts -> {:error, :einval} end]
+    test "the cookie does not take", %{vm: vm} do
+      # The one state that must never survive: a node alive under a cookie the
+      # caller was not handed.
+      reboot_on(vm, set_cookie_fun: fn _ -> :ok end)
+    end
 
-      assert {:error, :einval} = Dist.enable(system(vm, overrides))
+    test "the caller is killed mid-bring-up", %{vm: vm} do
+      # +Bc Ctrl-C on the IEx evaluator, or an erpc timeout killing its process.
+      reboot_on(vm, set_cookie_fun: fn _ -> Process.exit(self(), :kill) end)
+    end
+
+    test "a recorded session whose node is gone", %{vm: vm} do
+      # Only a deliberate :net_kernel.stop/0 produces this.
+      {:ok, _} = Dist.enable(system(vm))
+      Agent.update(vm, &%{&1 | node: nil, cookie: :nocookie})
+
+      test_pid = self()
+      Dist.enable(system(vm, reboot_fun: fn -> send(test_pid, :rebooted) end))
+      assert_receive :rebooted, 2_000
     end
 
     test "epmd is started exactly once and never killed", %{vm: vm} do
-      # dist.ex issues no epmd command other than -daemon; assert on the call
-      # log itself rather than on the absence of a call it could never make.
-      {:error, _} = Dist.enable(system(vm, set_cookie_fun: fn _ -> :ok end))
+      {:ok, _} = Dist.enable(system(vm))
 
       assert Enum.filter(steps(vm), &match?({:epmd, _}, &1)) == [{:epmd, ["-daemon"]}]
     end
@@ -397,13 +382,13 @@ defmodule Vagus.DistTest do
       assert String.to_atom(recovered.cookie) == Agent.get(vm, & &1.cookie)
     end
 
-    test "does not tear the running node down", %{vm: vm} do
+    test "does not reboot or restart the running node", %{vm: vm} do
       {:ok, _} = Dist.enable(system(vm))
       Agent.update(vm, &%{&1 | session: :not_requested, steps: []})
 
       {:ok, _} = Dist.enable(system(vm))
 
-      refute :net_kernel_stop in steps(vm)
+      refute :reboot in steps(vm)
     end
 
     test "records the recovery, so the next call is a plain record hit", %{vm: vm} do
@@ -426,20 +411,6 @@ defmodule Vagus.DistTest do
 
       assert {:error, :starting} = Dist.enable(system(vm))
       assert steps(vm) == []
-    end
-
-    test "the claim is released when bring-up fails, so a retry works", %{vm: vm} do
-      assert {:error, :no_address} = Dist.enable(system(vm, ifaddrs_fun: fn -> [] end))
-      assert Agent.get(vm, & &1.session) == :not_requested
-
-      assert {:ok, %{node: :"vagus@192.168.2.58"}} = Dist.enable(system(vm))
-    end
-
-    test "the claim is released when the cookie read-back fails", %{vm: vm} do
-      assert {:error, :cookie_not_applied} =
-               Dist.enable(system(vm, set_cookie_fun: fn _ -> :ok end))
-
-      assert Agent.get(vm, & &1.session) == :not_requested
     end
   end
 
