@@ -11,7 +11,7 @@ defmodule Vagus.DistTest do
     # the cookie read-back without ever starting distribution.
     {:ok, vm} =
       Agent.start_link(fn ->
-        %{node: nil, cookie: :nocookie, steps: [], session: :not_requested}
+        %{node: nil, cookie: :nocookie, steps: [], session: :not_requested, peers: []}
       end)
 
     {:ok, vm: vm}
@@ -54,6 +54,17 @@ defmodule Vagus.DistTest do
       get_cookie_fun: fn -> Agent.get(vm, & &1.cookie) end,
       alive_fun: fn -> Agent.get(vm, &(&1.node != nil)) end,
       reboot_fun: fn -> record(vm, :reboot) end,
+      connected_nodes_fun: fn -> Agent.get(vm, & &1.peers) end,
+      disconnect_fun: fn peer ->
+        record(vm, {:disconnect, peer})
+        Agent.update(vm, &%{&1 | peers: &1.peers -- [peer]})
+        true
+      end,
+      net_kernel_stop_fun: fn ->
+        record(vm, :net_kernel_stop)
+        Agent.update(vm, &%{&1 | node: nil, cookie: :nocookie})
+        :ok
+      end,
       self_node_fun: fn -> Agent.get(vm, & &1.node) end,
       # get_and_update is atomic, which is what makes this a faithful stand-in
       # for :ets.select_replace/2 rather than a check-then-set that would hide
@@ -217,7 +228,10 @@ defmodule Vagus.DistTest do
       Agent.update(vm, &%{&1 | node: nil, cookie: :nocookie})
 
       test_pid = self()
-      Dist.enable(system(vm, reboot_fun: fn -> send(test_pid, :rebooted) end))
+
+      assert {:error, :node_gone} =
+               Dist.enable(system(vm, reboot_fun: fn -> send(test_pid, :rebooted) end))
+
       assert_receive :rebooted, 2_000
     end
 
@@ -399,6 +413,59 @@ defmodule Vagus.DistTest do
 
       assert {:ok, ^recovered} = Dist.enable(system(vm))
       assert steps(vm) == before
+    end
+  end
+
+  describe "the bootstrap-cookie window" do
+    # A peer that authenticated under the cookie OTP invented stays attached
+    # after set_cookie/1, which gates new handshakes only.
+    defp attacker_attaches(vm) do
+      [
+        set_cookie_fun: fn cookie ->
+          record(vm, {:set_cookie, cookie})
+          Agent.update(vm, &%{&1 | cookie: cookie, peers: [:"attacker@10.0.0.9"]})
+          :ok
+        end
+      ]
+    end
+
+    test "peers attached before we owned the cookie are dropped", %{vm: vm} do
+      {:ok, _} = Dist.enable(system(vm, attacker_attaches(vm)))
+
+      assert {:disconnect, :"attacker@10.0.0.9"} in steps(vm)
+      assert Agent.get(vm, & &1.peers) == []
+    end
+
+    test "the drop happens AFTER the cookie is ours", %{vm: vm} do
+      {:ok, _} = Dist.enable(system(vm, attacker_attaches(vm)))
+      recorded = steps(vm)
+
+      assert Enum.find_index(recorded, &match?({:set_cookie, _}, &1)) <
+               Enum.find_index(recorded, &match?({:disconnect, _}, &1))
+    end
+
+    test "the guard stops the node before asking for a reboot", %{vm: vm} do
+      # Shutdown.reboot/0 is the graceful path and is budgeted in minutes; the
+      # listener must not stay up under the bootstrap cookie for that long.
+      test_pid = self()
+
+      caller =
+        spawn(fn ->
+          Dist.enable(
+            system(vm,
+              set_cookie_fun: fn _ -> Process.exit(self(), :kill) end,
+              reboot_fun: fn -> send(test_pid, :rebooted) end
+            )
+          )
+        end)
+
+      ref = Process.monitor(caller)
+      assert_receive {:DOWN, ^ref, :process, ^caller, :killed}, 2_000
+      assert_receive :rebooted, 2_000
+
+      recorded = steps(vm)
+      assert :net_kernel_stop in recorded
+      refute Agent.get(vm, & &1.node)
     end
   end
 

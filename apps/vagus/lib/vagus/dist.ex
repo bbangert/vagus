@@ -84,6 +84,7 @@ defmodule Vagus.Dist do
         else
           Logger.error("Vagus.Dist: recorded session but no live node; rebooting")
           system.reboot_fun.()
+          {:error, :node_gone}
         end
     end
   end
@@ -188,6 +189,15 @@ defmodule Vagus.Dist do
   defp take_ownership(system) do
     cookie = :crypto.strong_rand_bytes(32) |> Base.encode16(case: :lower)
     :ok = apply_cookie(system, cookie)
+
+    # `set_cookie/1` gates NEW handshakes only, so a peer that authenticated
+    # during the window above is still attached under the cookie OTP invented
+    # and would keep root-equivalent access despite the read-back succeeding.
+    # Nothing legitimate is connected this early — on the recovery path the
+    # cookie has just been rotated out from under anyone who was, and they can
+    # reconnect with what `enable/0` returns.
+    Enum.each(system.connected_nodes_fun.(), &system.disconnect_fun.(&1))
+
     session = %{node: system.self_node_fun.(), cookie: cookie, ports: @port_min..@port_max}
     :ok = system.session_put_fun.(session)
     session
@@ -208,6 +218,13 @@ defmodule Vagus.Dist do
           :ok
 
         {:DOWN, ^ref, :process, ^caller, reason} ->
+          # Stop the node FIRST. `Shutdown.reboot/0` is the graceful path and is
+          # budgeted in minutes while it stops workloads; until it completes the
+          # listener would still be answering under the bootstrap cookie. This
+          # closes that in milliseconds and is fire-and-forget — the reboot is
+          # what actually guarantees the clean state.
+          system.net_kernel_stop_fun.()
+
           Logger.error("Vagus.Dist: bring-up failed (#{inspect(reason)}); rebooting")
           system.reboot_fun.()
       end
@@ -297,6 +314,9 @@ defmodule Vagus.Dist do
       set_cookie_fun: &default_set_cookie/1,
       get_cookie_fun: &:erlang.get_cookie/0,
       alive_fun: &Node.alive?/0,
+      connected_nodes_fun: &Node.list/0,
+      disconnect_fun: &Node.disconnect/1,
+      net_kernel_stop_fun: &:net_kernel.stop/0,
       reboot_fun: &Shutdown.reboot/0,
       self_node_fun: &Node.self/0,
       session_claim_fun: &default_session_claim/0,
