@@ -359,9 +359,10 @@ defmodule Vagus.Dist do
   #
   # `System.cmd/3` deliberately, NOT MuonTrap. MEASURED on a dragon_q6a:
   # `MuonTrap.cmd/3` hangs unbounded on `epmd -kill` with no daemon to kill and
-  # its `:timeout` does not fire. Unbounded is tolerable because this runs in the
-  # spawned worker, and the guard reboots if that worker stalls past
-  # `@bring_up_timeout`.
+  # its `:timeout` does not fire. This one has no deadline either, so an epmd
+  # that never returns blocks the caller's shell with the claim still held. That
+  # is accepted: bounding it needs a process to enforce the bound from, and this
+  # is a test mode where the answer to "it did not come up" is a reboot.
   # sobelow_skip ["CI.System"]
   defp default_epmd(args, env) do
     System.cmd(epmd_path(), args, env: env, stderr_to_stdout: true)

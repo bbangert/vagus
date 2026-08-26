@@ -316,13 +316,13 @@ defmodule Vagus.DistTest do
   end
 
   describe "the real :vagus_dist table" do
-    # The system above prove the logic; this proves the DEFAULT wiring, which no
+    # The overrides above prove the logic; this proves the DEFAULT wiring, which no
     # faked test would catch if create_session_table/0 were never called.
     test "is created at application start, seeded :not_requested" do
       assert :ets.lookup(:vagus_dist, :session) == [{:session, :not_requested}]
     end
 
-    test "is what status/0 reads when no system are injected" do
+    test "is what status/0 reads when no overrides are injected" do
       assert %{enabled?: false, alive?: false, node: nil, ports: 9100..9105} = Dist.status()
     end
   end
