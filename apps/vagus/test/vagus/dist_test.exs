@@ -233,21 +233,23 @@ defmodule Vagus.DistTest do
       # keeps evaluating, so caller survival must not suppress the guard.
       test_pid = self()
 
-      caller =
-        spawn(fn ->
+      spawn(fn ->
+        outcome =
           Dist.enable(
             system(vm,
               set_cookie_fun: fn _ -> :ok end,
               reboot_fun: fn -> send(test_pid, :rebooted) end
             )
           )
-        end)
 
-      # The reboot is driven entirely by the worker's exit, so it lands while
-      # the caller is still sitting in its receive — exactly the case a
-      # caller-watching guard missed.
+        send(test_pid, {:outcome, outcome})
+      end)
+
+      # The reboot is driven by the worker's exit, not the caller's — exactly
+      # the case a caller-watching guard missed — and the caller is told what
+      # actually happened rather than being left to time out.
       assert_receive :rebooted, 2_000
-      assert Process.alive?(caller)
+      assert_receive {:outcome, {:error, {:bring_up_failed, _}}}, 2_000
     end
 
     test "a successful bring-up never reboots, even when the worker wins the race", %{vm: vm} do
@@ -305,6 +307,18 @@ defmodule Vagus.DistTest do
       assert_receive {:worker, worker}, 2_000
       assert_receive :rebooted, 40_000
       refute Process.alive?(worker)
+    end
+
+    test "the caller is told what the guard observed, never a spurious timeout", %{vm: vm} do
+      # Two independent timers on the same deadline let the caller's fire first
+      # and report {:error, :timeout} for a bring-up that went on to succeed.
+      # The guard owns the only deadline and reports the outcome it acted on.
+      test_pid = self()
+
+      spawn(fn -> send(test_pid, {:outcome, Dist.enable(system(vm))}) end)
+
+      assert_receive {:outcome, {:ok, %{node: :"vagus@192.168.2.58"}}}, 2_000
+      refute :reboot in steps(vm)
     end
 
     test "a stalled worker does not hold the claim forever", %{vm: vm} do

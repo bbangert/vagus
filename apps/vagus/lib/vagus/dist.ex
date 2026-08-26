@@ -59,6 +59,10 @@ defmodule Vagus.Dist do
   # Only bounds how long the guard waits for a killed worker to actually die,
   # so it never delays the reboot meaningfully.
   @kill_timeout :timer.seconds(5)
+
+  # Never expected to fire: the guard always reports an outcome, and its own
+  # deadline is shorter. Here so a lost guard cannot hang an operator's shell.
+  @caller_backstop @bring_up_timeout + @kill_timeout + :timer.seconds(10)
   @table :vagus_dist
   @session_key :session
 
@@ -177,10 +181,14 @@ defmodule Vagus.Dist do
 
     spawn(fn -> guard(system, parent, ref) end)
 
+    # No deadline here. The guard owns the only one and reports the outcome it
+    # actually observed — two independent timers on the same deadline let the
+    # caller's fire first and return `{:error, :timeout}` for a bring-up that
+    # went on to succeed, with no reboot to match the reported failure.
     receive do
-      {^ref, session} -> {:ok, session}
+      {^ref, outcome} -> outcome
     after
-      @bring_up_timeout -> {:error, :timeout}
+      @caller_backstop -> {:error, :guard_lost}
     end
   end
 
@@ -239,18 +247,26 @@ defmodule Vagus.Dist do
   # already dead, `Process.monitor/1` then reports `:noproc`, and a SUCCESSFUL
   # bring-up gets misread as a failure and reboots the board.
   #
-  # A `:normal` exit means the session was recorded. Anything else, or a worker
-  # still running at the deadline, means the board may be sitting on the LAN
-  # under the bootstrap cookie.
+  # It is also the single source of the caller's outcome, so what `enable/0`
+  # returns always matches what the guard did about it.
   defp guard(system, parent, ref) do
+    me = self()
+
     {worker, monitor} =
-      spawn_monitor(fn -> send(parent, {ref, start_distribution(system)}) end)
+      spawn_monitor(fn -> send(me, {:result, start_distribution(system)}) end)
 
     receive do
       {:DOWN, ^monitor, :process, ^worker, :normal} ->
-        :ok
+        # The worker's send happens-before its exit and signals from one process
+        # arrive in order, so the result is already in the mailbox here.
+        receive do
+          {:result, session} -> send(parent, {ref, {:ok, session}})
+        after
+          0 -> send(parent, {ref, {:error, :no_result}})
+        end
 
       {:DOWN, ^monitor, :process, ^worker, reason} ->
+        send(parent, {ref, {:error, {:bring_up_failed, reason}}})
         shut_down(system, "bring-up failed (#{inspect(reason)})")
     after
       @bring_up_timeout ->
@@ -265,6 +281,7 @@ defmodule Vagus.Dist do
           @kill_timeout -> :ok
         end
 
+        send(parent, {ref, {:error, :timeout}})
         shut_down(system, "bring-up stalled")
     end
   end
