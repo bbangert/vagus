@@ -24,6 +24,11 @@ defmodule Vagus.Application do
 
   @impl true
   def start(_type, _args) do
+    # Owned by this process, which is the application master's and outlives every
+    # request and SSH session. Seeded `:not_requested` so `Vagus.Dist` reads a
+    # value rather than inferring "off" from an absent table.
+    Vagus.Dist.create_session_table()
+
     children =
       [
         # Add-on identity + service registries (M4). Started before the HTTP
