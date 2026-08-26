@@ -5,9 +5,9 @@ defmodule Vagus.Dist do
   > #### Test boards only {: .warning}
   >
   > This is not for a board anyone depends on. Enabling it opens an
-  > unauthenticated-root-equivalent surface on the LAN segment, and **any
-  > failure while enabling reboots the board** — there is no rollback, because
-  > restarting is the cleanest way back to a known non-distributed state.
+  > unauthenticated-root-equivalent surface on the LAN segment. A failed
+  > `enable/0` stops distribution and raises; **reboot the board** rather than
+  > reasoning about what a half-finished attempt left behind.
 
   `enable/0` starts distribution and returns the node, cookie and port range.
   Nothing is enabled until someone asks, and a reboot turns it back off — there
@@ -47,22 +47,8 @@ defmodule Vagus.Dist do
 
   require Logger
 
-  alias Vagus.Host.Shutdown
-
   @port_min 9100
   @port_max 9105
-  # Bounds both how long the caller waits and how long the guard lets a stalled
-  # worker hold the claim — `epmd -daemon` through `System.cmd/3` has no timeout
-  # of its own.
-  @bring_up_timeout :timer.seconds(30)
-
-  # Only bounds how long the guard waits for a killed worker to actually die,
-  # so it never delays the reboot meaningfully.
-  @kill_timeout :timer.seconds(5)
-
-  # Never expected to fire: the guard always reports an outcome, and its own
-  # deadline is shorter. Here so a lost guard cannot hang an operator's shell.
-  @caller_backstop @bring_up_timeout + @kill_timeout + :timer.seconds(10)
   @table :vagus_dist
   @session_key :session
 
@@ -76,12 +62,10 @@ defmodule Vagus.Dist do
   A caller that arrives while a claim is in flight gets `{:error, :starting}`
   rather than racing it.
 
-  Losing the caller is not itself a failure. Bring-up runs in its own process,
-  so a caller that dies mid-call leaves a board that either finished correctly —
-  session recorded, retrievable by calling this again — or is rebooting. What is
-  guaranteed is the outcome, not that anyone is still listening for it.
+  Raises if bring-up fails, having stopped distribution first. Reboot rather
+  than retrying into a state nobody has reasoned about.
   """
-  @spec enable(keyword()) :: {:ok, session()} | {:error, term()}
+  @spec enable(keyword()) :: {:ok, session()} | {:error, :starting | :node_gone}
   def enable(opts \\ []) do
     system = system(opts)
 
@@ -96,13 +80,7 @@ defmodule Vagus.Dist do
       # `:net_kernel.stop/0` produces it — and handing back a session whose
       # listener is gone would send an operator to a dead port.
       {:recorded, session} ->
-        if system.alive_fun.() do
-          {:ok, session}
-        else
-          Logger.error("Vagus.Dist: recorded session but no live node; rebooting")
-          system.reboot_fun.()
-          {:error, :node_gone}
-        end
+        if system.alive_fun.(), do: {:ok, session}, else: {:error, :node_gone}
     end
   end
 
@@ -162,34 +140,31 @@ defmodule Vagus.Dist do
     fun.()
   end
 
-  # Bring-up runs in a WORKER, and the guard watches the worker rather than the
-  # caller. That distinction is load-bearing and was got wrong once: an
-  # interactive IEx session catches `MatchError` and keeps its evaluator alive,
-  # so a guard watching the caller never fires. DEVICE-MEASURED on a
-  # dragon_q6a — `iex> Vagus.Dist.enable(...)` with a failing cookie left the
-  # node up as `vagus@...` under the 20-letter LCG cookie, the row stuck at
-  # `:starting`, and no reboot. Nobody can rescue a worker, so its exit reason
-  # is an honest signal.
+  # Failures are caught HERE, in the calling process, rather than watched from
+  # outside it. That is the whole reason this is simple: an earlier version
+  # spawned a worker and a monitoring guard because an interactive IEx session
+  # catches `MatchError` and keeps its evaluator alive, so nothing outside could
+  # tell that a step had failed. Our own `catch` runs first, before IEx ever
+  # sees the exception, so watching from outside was never necessary.
   #
-  # Nothing is rolled back. This is a test-mode tool on a test board: the fail
-  # case for every step is "restart the board", which reseeds the table, stops
-  # the node and returns a known non-distributed boot for free. So each step
-  # asserts, and the guard turns any abnormal exit into a reboot.
+  # The steps themselves assert. The only cleanup that matters is stopping
+  # `net_kernel`: after it starts, the node is live under the cookie OTP
+  # invented, and that is weak — DEVICE-MEASURED on a dragon_q6a,
+  # `/root/.erlang.cookie` is 20 uppercase letters, `auth.erl`
+  # `random_cookie/3`'s LCG, because this target passes no `-setcookie`.
+  # Everything else a failure leaves behind is cleared by the reboot the tester
+  # does next.
   defp bring_up(system) do
-    parent = self()
-    ref = make_ref()
-
-    spawn(fn -> guard(system, parent, ref) end)
-
-    # No deadline here. The guard owns the only one and reports the outcome it
-    # actually observed — two independent timers on the same deadline let the
-    # caller's fire first and return `{:error, :timeout}` for a bring-up that
-    # went on to succeed, with no reboot to match the reported failure.
-    receive do
-      {^ref, outcome} -> outcome
-    after
-      @caller_backstop -> {:error, :guard_lost}
-    end
+    {:ok, address} = address(system)
+    :ok = pin_ports(system)
+    :ok = start_epmd(system)
+    {:ok, start_node(system, node_name(address))}
+  catch
+    kind, reason ->
+      system.net_kernel_stop_fun.()
+      system.session_reset_fun.()
+      Logger.error("Vagus.Dist: bring-up failed; distribution stopped")
+      :erlang.raise(kind, reason, __STACKTRACE__)
   end
 
   # Ordering is load-bearing and not the obvious one:
@@ -200,13 +175,6 @@ defmodule Vagus.Dist do
   #     `-name`/`-sname`, and Nerves deliberately passes neither.
   #   * the cookie last, because `set_cookie/1` raises `:distribution_not_started`
   #     before `net_kernel` is up. MEASURED on OTP 29.
-  defp start_distribution(system) do
-    {:ok, address} = address(system)
-    :ok = pin_ports(system)
-    :ok = start_epmd(system)
-    start_node(system, node_name(address))
-  end
-
   defp start_node(system, name) do
     case system.net_kernel_start_fun.(name, %{name_domain: :longnames}) do
       {:ok, _pid} ->
@@ -230,8 +198,7 @@ defmodule Vagus.Dist do
     :ok = apply_cookie(system, cookie)
 
     # `set_cookie/1` gates NEW handshakes only, so a peer that authenticated
-    # during the window above is still attached under the cookie OTP invented
-    # and would keep root-equivalent access despite the read-back succeeding.
+    # during the window above is still attached under the cookie OTP invented.
     # `:connected` rather than the default `:visible`, or a peer that attached
     # with `-hidden` survives the sweep.
     Enum.each(system.connected_nodes_fun.(), &system.disconnect_fun.(&1))
@@ -239,57 +206,6 @@ defmodule Vagus.Dist do
     session = %{node: system.self_node_fun.(), cookie: cookie, ports: @port_min..@port_max}
     :ok = system.session_put_fun.(session)
     session
-  end
-
-  # The guard CREATES the worker, via `spawn_monitor/1`, so the monitor is
-  # installed atomically with the spawn. Spawning the worker separately and
-  # monitoring it afterwards loses a race: a worker that finishes first is
-  # already dead, `Process.monitor/1` then reports `:noproc`, and a SUCCESSFUL
-  # bring-up gets misread as a failure and reboots the board.
-  #
-  # It is also the single source of the caller's outcome, so what `enable/0`
-  # returns always matches what the guard did about it.
-  defp guard(system, parent, ref) do
-    me = self()
-
-    {worker, monitor} =
-      spawn_monitor(fn -> send(me, {:result, start_distribution(system)}) end)
-
-    receive do
-      {:DOWN, ^monitor, :process, ^worker, :normal} ->
-        # The worker's send happens-before its exit and signals from one process
-        # arrive in order, so the result is already in the mailbox here.
-        receive do
-          {:result, session} -> send(parent, {ref, {:ok, session}})
-        after
-          0 -> send(parent, {ref, {:error, :no_result}})
-        end
-
-      {:DOWN, ^monitor, :process, ^worker, reason} ->
-        send(parent, {ref, {:error, {:bring_up_failed, reason}}})
-        shut_down(system, "bring-up failed (#{inspect(reason)})")
-    after
-      @bring_up_timeout ->
-        # Kill it and WAIT. A worker stalled in `epmd` could otherwise return
-        # after the deadline and walk into `net_kernel.start` behind our back,
-        # reopening the listener during a graceful reboot that takes minutes.
-        Process.exit(worker, :kill)
-
-        receive do
-          {:DOWN, ^monitor, :process, ^worker, _reason} -> :ok
-        after
-          @kill_timeout -> :ok
-        end
-
-        send(parent, {ref, {:error, :timeout}})
-        shut_down(system, "bring-up stalled")
-    end
-  end
-
-  defp shut_down(system, why) do
-    system.net_kernel_stop_fun.()
-    Logger.error("Vagus.Dist: #{why}; rebooting")
-    system.reboot_fun.()
   end
 
   # One atom per call, from a value `take_ownership/1` generated as 64 lowercase
@@ -378,11 +294,11 @@ defmodule Vagus.Dist do
       connected_nodes_fun: fn -> Node.list(:connected) end,
       disconnect_fun: &Node.disconnect/1,
       net_kernel_stop_fun: &:net_kernel.stop/0,
-      reboot_fun: &Shutdown.reboot/0,
       self_node_fun: &Node.self/0,
       session_claim_fun: &default_session_claim/0,
       session_get_fun: &default_session_get/0,
-      session_put_fun: &default_session_put/1
+      session_put_fun: &default_session_put/1,
+      session_reset_fun: &default_session_reset/0
     )
     |> Map.new()
   end
@@ -416,6 +332,11 @@ defmodule Vagus.Dist do
 
   defp default_session_put(session) do
     :ets.insert(@table, {@session_key, session})
+    :ok
+  end
+
+  defp default_session_reset do
+    :ets.insert(@table, {@session_key, :not_requested})
     :ok
   end
 

@@ -53,7 +53,6 @@ defmodule Vagus.DistTest do
       end,
       get_cookie_fun: fn -> Agent.get(vm, & &1.cookie) end,
       alive_fun: fn -> Agent.get(vm, &(&1.node != nil)) end,
-      reboot_fun: fn -> record(vm, :reboot) end,
       connected_nodes_fun: fn -> Agent.get(vm, & &1.peers) end,
       disconnect_fun: fn peer ->
         record(vm, {:disconnect, peer})
@@ -81,6 +80,11 @@ defmodule Vagus.DistTest do
       # Replaces the :vagus_dist table, which is global and would break
       # async: true isolation across the suite.
       session_get_fun: fn -> Agent.get(vm, & &1.session) end,
+      session_reset_fun: fn ->
+        record(vm, :session_reset)
+        Agent.update(vm, &%{&1 | session: :not_requested})
+        :ok
+      end,
       session_put_fun: fn session ->
         record(vm, {:session_put, session.node})
         Agent.update(vm, &%{&1 | session: session})
@@ -181,353 +185,57 @@ defmodule Vagus.DistTest do
     end
   end
 
-  describe "every failure reboots" do
-    # A test-mode tool on a test board: restarting is the fail case for all of
-    # it, and it reseeds the table and stops the node for free.
-    defp reboot_on(vm, overrides) do
-      test_pid = self()
-
-      # The caller RESCUES, standing in for an IEx evaluator, which catches the
-      # exception and stays alive. DEVICE-MEASURED: a guard watching the caller
-      # never fires here, leaving the node up under the bootstrap cookie and the
-      # row stuck at :starting. The guard watches the worker instead.
-      spawn(fn ->
-        try do
-          Dist.enable(system(vm, overrides ++ [reboot_fun: fn -> send(test_pid, :rebooted) end]))
-        rescue
-          _ -> :swallowed
-        catch
-          _, _ -> :swallowed
-        end
-      end)
-
-      assert_receive :rebooted, 2_000
+  describe "every failure stops distribution and raises" do
+    # Caught in the calling process, so it does not matter that IEx catches the
+    # exception afterwards and keeps its evaluator alive — our catch runs first.
+    defp fails_with(vm, overrides) do
+      assert_raise MatchError, fn -> Dist.enable(system(vm, overrides)) end
     end
 
     test "no usable address", %{vm: vm} do
-      reboot_on(vm, ifaddrs_fun: fn -> [] end)
+      fails_with(vm, ifaddrs_fun: fn -> [] end)
       refute Enum.any?(steps(vm), &match?({:epmd, _}, &1))
     end
 
     test "epmd will not start", %{vm: vm} do
-      reboot_on(vm, epmd_fun: fn _args, _env -> {"port 4369 in use", 1} end)
+      fails_with(vm, epmd_fun: fn _args, _env -> {"port 4369 in use", 1} end)
       refute Enum.any?(steps(vm), &match?({:net_kernel_start, _, _}, &1))
     end
 
     test "net_kernel refuses to start", %{vm: vm} do
-      reboot_on(vm, net_kernel_start_fun: fn _name, _opts -> {:error, :einval} end)
+      assert_raise CaseClauseError, fn ->
+        Dist.enable(system(vm, net_kernel_start_fun: fn _n, _o -> {:error, :einval} end))
+      end
     end
 
     test "the cookie does not take", %{vm: vm} do
       # The one state that must never survive: a node alive under a cookie the
       # caller was not handed.
-      reboot_on(vm, set_cookie_fun: fn _ -> :ok end)
+      fails_with(vm, set_cookie_fun: fn _ -> :ok end)
+
+      assert :net_kernel_stop in steps(vm)
+      refute Agent.get(vm, & &1.node)
     end
 
-    test "the worker is killed mid-bring-up", %{vm: vm} do
-      reboot_on(vm, set_cookie_fun: fn _ -> Process.exit(self(), :kill) end)
+    test "the claim is released, so a retry needs no reboot", %{vm: vm} do
+      fails_with(vm, ifaddrs_fun: fn -> [] end)
+      assert Agent.get(vm, & &1.session) == :not_requested
+
+      assert {:ok, %{node: :"vagus@192.168.2.58"}} = Dist.enable(system(vm))
     end
 
-    test "a caller that survives the failure still gets the board rebooted", %{vm: vm} do
-      # The regression this structure exists for: IEx catches MatchError and
-      # keeps evaluating, so caller survival must not suppress the guard.
-      test_pid = self()
-
-      spawn(fn ->
-        outcome =
-          Dist.enable(
-            system(vm,
-              set_cookie_fun: fn _ -> :ok end,
-              reboot_fun: fn -> send(test_pid, :rebooted) end
-            )
-          )
-
-        send(test_pid, {:outcome, outcome})
-      end)
-
-      # The reboot is driven by the worker's exit, not the caller's — exactly
-      # the case a caller-watching guard missed — and the caller is told what
-      # actually happened rather than being left to time out.
-      assert_receive :rebooted, 2_000
-      assert_receive {:outcome, {:error, {:bring_up_failed, _}}}, 2_000
-    end
-
-    test "a successful bring-up never reboots, even when the worker wins the race", %{vm: vm} do
-      # The guard creates the worker with spawn_monitor/1. Spawning separately
-      # and monitoring afterwards loses this race: a worker that finishes first
-      # is already dead, Process.monitor/1 reports :noproc, and a SUCCESSFUL
-      # enable gets misread as a failure. Repeated because it is a race.
-      for _ <- 1..20 do
-        {:ok, vm2} =
-          Agent.start_link(fn ->
-            %{node: nil, cookie: :nocookie, steps: [], session: :not_requested, peers: []}
-          end)
-
-        assert {:ok, _} = Dist.enable(system(vm2))
-
-        # enable/0 returns the moment the worker sends its result, which is
-        # BEFORE the guard has observed the exit. Asserting here would pass
-        # against a guard that reboots a microsecond later — the assertion has
-        # to outlive the guard's decision.
-        Process.sleep(50)
-
-        refute :reboot in steps(vm2)
-        refute :net_kernel_stop in steps(vm2)
-      end
-    end
-
-    test "a caller that dies after a successful bring-up does not reboot", %{vm: vm} do
-      # The board is fine: the session is recorded and retrievable. Rebooting
-      # because nobody was listening would be gratuitous.
-      caller = spawn(fn -> Dist.enable(system(vm)) end)
-      ref = Process.monitor(caller)
-      assert_receive {:DOWN, ^ref, :process, ^caller, :normal}, 2_000
-
-      refute :reboot in steps(vm)
-      assert %{node: _} = Agent.get(vm, & &1.session)
-    end
-
-    test "a stalled worker is killed before the node is stopped", %{vm: vm} do
-      # Otherwise epmd could return after the deadline and walk into
-      # net_kernel.start behind the shutdown, reopening the listener.
-      test_pid = self()
-
-      spawn(fn ->
-        Dist.enable(
-          system(vm,
-            epmd_fun: fn _args, _env ->
-              send(test_pid, {:worker, self()})
-              Process.sleep(:infinity)
-            end,
-            reboot_fun: fn -> send(test_pid, :rebooted) end
-          )
-        )
-      end)
-
-      assert_receive {:worker, worker}, 2_000
-      assert_receive :rebooted, 40_000
-      refute Process.alive?(worker)
-    end
-
-    test "the caller is told what the guard observed, never a spurious timeout", %{vm: vm} do
-      # Two independent timers on the same deadline let the caller's fire first
-      # and report {:error, :timeout} for a bring-up that went on to succeed.
-      # The guard owns the only deadline and reports the outcome it acted on.
-      test_pid = self()
-
-      spawn(fn -> send(test_pid, {:outcome, Dist.enable(system(vm))}) end)
-
-      assert_receive {:outcome, {:ok, %{node: :"vagus@192.168.2.58"}}}, 2_000
-      refute :reboot in steps(vm)
-    end
-
-    test "a stalled worker does not hold the claim forever", %{vm: vm} do
-      test_pid = self()
-
-      spawn(fn ->
-        Dist.enable(
-          system(vm,
-            epmd_fun: fn _args, _env -> Process.sleep(:infinity) end,
-            reboot_fun: fn -> send(test_pid, :rebooted) end
-          )
-        )
-      end)
-
-      # The guard's timeout is the backstop for an unbounded System.cmd.
-      assert_receive :rebooted, 40_000
-    end
-
-    test "a recorded session whose node is gone", %{vm: vm} do
-      # Only a deliberate :net_kernel.stop/0 produces this.
+    test "a recorded session whose node is gone is reported, not honoured", %{vm: vm} do
+      # Only a deliberate :net_kernel.stop/0 produces this; the tester reboots.
       {:ok, _} = Dist.enable(system(vm))
       Agent.update(vm, &%{&1 | node: nil, cookie: :nocookie})
 
-      test_pid = self()
-
-      assert {:error, :node_gone} =
-               Dist.enable(system(vm, reboot_fun: fn -> send(test_pid, :rebooted) end))
-
-      assert_receive :rebooted, 2_000
+      assert {:error, :node_gone} = Dist.enable(system(vm))
     end
 
     test "epmd is started exactly once and never killed", %{vm: vm} do
       {:ok, _} = Dist.enable(system(vm))
 
       assert Enum.filter(steps(vm), &match?({:epmd, _}, &1)) == [{:epmd, ["-daemon"]}]
-    end
-  end
-
-  describe "address selection" do
-    test "skips interfaces that are not up", %{vm: vm} do
-      # A configured address on a DOWN interface fails invisibly: the node
-      # starts and the name answers nowhere.
-      overrides = [
-        ifaddrs_fun: fn ->
-          [
-            {~c"eth0", [flags: [:broadcast], addr: {10, 0, 0, 5}]},
-            {~c"wlan0", [flags: [:up, :running], addr: {192, 168, 2, 58}]}
-          ]
-        end
-      ]
-
-      assert {:ok, %{node: :"vagus@192.168.2.58"}} = Dist.enable(system(vm, overrides))
-    end
-
-    for bridge <- ["hassio", "balena0", "br-a1b2c3"] do
-      test "skips the #{bridge} container bridge", %{vm: vm} do
-        overrides = [
-          ifaddrs_fun: fn ->
-            [
-              {~c"#{unquote(bridge)}", [flags: [:up, :running], addr: {172, 30, 32, 1}]},
-              {~c"eth0", [flags: [:up, :running], addr: {192, 168, 2, 58}]}
-            ]
-          end
-        ]
-
-        assert {:ok, %{node: :"vagus@192.168.2.58"}} = Dist.enable(system(vm, overrides))
-      end
-    end
-
-    test "skips an interface that is up but has no addresses", %{vm: vm} do
-      # OBSERVED on a dragon_q6a: wlan0 is up/running with addrs=[]. An
-      # address-less interface reports an EMPTY list, which is why there is no
-      # 0.0.0.0 case to reject.
-      overrides = [
-        ifaddrs_fun: fn ->
-          [
-            {~c"wlan0", [flags: [:up, :broadcast, :running, :multicast]]},
-            {~c"eth0", [flags: [:up, :broadcast, :running, :multicast], addr: {192, 168, 2, 58}]}
-          ]
-        end
-      ]
-
-      assert {:ok, %{node: :"vagus@192.168.2.58"}} = Dist.enable(system(vm, overrides))
-    end
-
-    test "picks eth0 out of a real dragon_q6a interface list", %{vm: vm} do
-      # Captured verbatim from :inet.getifaddrs() on 192.168.2.58 rather than
-      # invented: loopback first, an address-less wlan0, and both container
-      # bridges the engine actually creates.
-      overrides = [
-        ifaddrs_fun: fn ->
-          [
-            {~c"lo",
-             [
-               flags: [:up, :loopback, :running],
-               addr: {127, 0, 0, 1},
-               addr: {0, 0, 0, 0, 0, 0, 0, 1}
-             ]},
-            {~c"eth0",
-             [
-               flags: [:up, :broadcast, :running, :multicast],
-               addr: {192, 168, 2, 58},
-               addr: {64_862, 45_261, 12_257, 16_468, 584, 21_759, 65_057, 24_056},
-               addr: {65_152, 0, 0, 0, 584, 21_759, 65_057, 24_056}
-             ]},
-            {~c"wlan0", [flags: [:up, :broadcast, :running, :multicast]]},
-            {~c"hassio",
-             [
-               flags: [:up, :broadcast, :running, :multicast],
-               addr: {172, 30, 32, 1},
-               addr: {172, 30, 32, 2},
-               addr: {172, 30, 32, 3}
-             ]},
-            {~c"balena0", [flags: [:up, :broadcast, :running, :multicast], addr: {172, 17, 0, 1}]}
-          ]
-        end
-      ]
-
-      assert {:ok, %{node: :"vagus@192.168.2.58"}} = Dist.enable(system(vm, overrides))
-    end
-
-    test "keeps a real LAN address inside 172.16/12", %{vm: vm} do
-      # Excluding the range instead of the bridge NAMES would strand this board.
-      overrides = [
-        ifaddrs_fun: fn -> [{~c"eth0", [flags: [:up, :running], addr: {172, 20, 5, 9}]}] end
-      ]
-
-      assert {:ok, %{node: :"vagus@172.20.5.9"}} = Dist.enable(system(vm, overrides))
-    end
-
-    for {label, addr} <- [
-          loopback: {127, 0, 0, 1},
-          link_local: {169, 254, 1, 1}
-        ] do
-      test "skips a #{label} address", %{vm: vm} do
-        overrides = [
-          ifaddrs_fun: fn ->
-            [
-              {~c"lo", [flags: [:up, :running], addr: unquote(Macro.escape(addr))]},
-              {~c"eth0", [flags: [:up, :running], addr: {192, 168, 2, 58}]}
-            ]
-          end
-        ]
-
-        assert {:ok, %{node: :"vagus@192.168.2.58"}} = Dist.enable(system(vm, overrides))
-      end
-    end
-
-    test "skips IPv6 addresses", %{vm: vm} do
-      overrides = [
-        ifaddrs_fun: fn ->
-          [
-            {~c"eth0",
-             [
-               flags: [:up, :running],
-               addr: {8193, 3512, 0, 0, 0, 0, 0, 1},
-               addr: {192, 168, 2, 58}
-             ]}
-          ]
-        end
-      ]
-
-      assert {:ok, %{node: :"vagus@192.168.2.58"}} = Dist.enable(system(vm, overrides))
-    end
-  end
-
-  describe "a live node whose record was lost" do
-    # MEASURED on host: Application.stop(:vagus) destroys the :vagus_dist table
-    # (its owner is the application master) while net_kernel, owned by :kernel,
-    # stays up.
-    test "is recovered rather than refused", %{vm: vm} do
-      {:ok, first} = Dist.enable(system(vm))
-      Agent.update(vm, &%{&1 | session: :not_requested})
-
-      assert {:ok, recovered} = Dist.enable(system(vm))
-      assert recovered.node == first.node
-    end
-
-    test "gets a FRESH cookie, never the one already in place", %{vm: vm} do
-      # The cookie in place may be the weak one OTP invented, left by a caller
-      # that died mid-bring-up. Handing it back would launder a bad credential
-      # into a recorded session.
-      {:ok, first} = Dist.enable(system(vm))
-      Agent.update(vm, &%{&1 | session: :not_requested, cookie: :"otp-minted-random"})
-
-      {:ok, recovered} = Dist.enable(system(vm))
-
-      refute recovered.cookie == first.cookie
-      refute recovered.cookie == "otp-minted-random"
-      assert String.to_atom(recovered.cookie) == Agent.get(vm, & &1.cookie)
-    end
-
-    test "does not reboot or restart the running node", %{vm: vm} do
-      {:ok, _} = Dist.enable(system(vm))
-      Agent.update(vm, &%{&1 | session: :not_requested, steps: []})
-
-      {:ok, _} = Dist.enable(system(vm))
-
-      refute :reboot in steps(vm)
-    end
-
-    test "records the recovery, so the next call is a plain record hit", %{vm: vm} do
-      {:ok, _} = Dist.enable(system(vm))
-      Agent.update(vm, &%{&1 | session: :not_requested})
-      {:ok, recovered} = Dist.enable(system(vm))
-      before = steps(vm)
-
-      assert {:ok, ^recovered} = Dist.enable(system(vm))
-      assert steps(vm) == before
     end
   end
 
@@ -576,24 +284,14 @@ defmodule Vagus.DistTest do
       assert {:disconnect, :"hidden@10.0.0.9"} in steps(vm)
     end
 
-    test "the guard stops the node before asking for a reboot", %{vm: vm} do
-      # Shutdown.reboot/0 is the graceful path and is budgeted in minutes; the
-      # listener must not stay up under the bootstrap cookie for that long.
-      test_pid = self()
+    test "a failure after net_kernel started stops it", %{vm: vm} do
+      # The exposure is the live listener: after net_kernel.start the node
+      # answers under the cookie OTP invented.
+      assert_raise MatchError, fn ->
+        Dist.enable(system(vm, set_cookie_fun: fn _ -> :ok end))
+      end
 
-      spawn(fn ->
-        Dist.enable(
-          system(vm,
-            set_cookie_fun: fn _ -> Process.exit(self(), :kill) end,
-            reboot_fun: fn -> send(test_pid, :rebooted) end
-          )
-        )
-      end)
-
-      assert_receive :rebooted, 2_000
-      recorded = steps(vm)
-      assert :net_kernel_stop in recorded
-      refute Agent.get(vm, & &1.node)
+      assert :net_kernel_stop in steps(vm)
     end
   end
 
