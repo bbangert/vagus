@@ -22,11 +22,17 @@ defmodule Vagus.Host.Swap do
   ## Compression belongs to whoever created the device
 
   zswap is a compressed cache in front of a *disk-backed* swap device, so it
-  is written `Y` only on the swapfile path. Leaving it on in front of zram
-  would compress every page twice, spending CPU to make pages bigger. The
-  zram path therefore writes `N` explicitly rather than assuming the
-  kernel's default (`ZSWAP_DEFAULT_ON` is off today, but that is a build
-  option, not a guarantee).
+  is written `Y` only on the swapfile path — and there it is a precondition
+  rather than a finishing touch: without it the swapfile is plain
+  uncompressed disk swap, which is not the trade this module exists to make.
+  So `configure_swapfile/3` enables zswap first, before it measures or
+  creates anything, and a kernel that offers no zswap parameters skips the
+  path with nothing written.
+
+  Leaving zswap on in front of zram would instead compress every page twice,
+  spending CPU to make pages bigger. The zram path therefore writes `N`
+  explicitly rather than assuming the kernel's default (`ZSWAP_DEFAULT_ON`
+  is off today, but that is a build option, not a guarantee).
 
   ## Swappiness
 
@@ -72,6 +78,12 @@ defmodule Vagus.Host.Swap do
   time, so on the boot after `fwup expand-data` this module can measure the
   filesystem before it has grown. That skip alone schedules a single retry
   five minutes out; every other outcome is terminal.
+
+  Each path is gated on the kernel actually providing its compressor: no
+  `zram0` in sysfs skips the zram path, no zswap parameters skips the
+  swapfile path. Until the system release that builds both reaches a board,
+  every board therefore skips — enabling the config switch ahead of that
+  release changes nothing.
   """
 
   use GenServer
@@ -392,13 +404,32 @@ defmodule Vagus.Host.Swap do
   # --- swapfile -----------------------------------------------------------
 
   defp configure_swapfile(state, mem_total, disk) do
-    with {:ok, mountpoint} <- data_mountpoint(state, disk),
+    with :ok <- enable_zswap(state),
+         {:ok, mountpoint} <- data_mountpoint(state, disk),
          size = swapfile_size(mem_total),
          :ok <- ensure_swapfile(state, mountpoint, size) do
       swapon_swapfile(state, size)
     else
       {:skip, reason} -> skip(reason)
       {:error, reason} -> fail(reason)
+    end
+  end
+
+  # Enabling zswap is what makes writing gigabytes of swap to flash
+  # defensible (see the moduledoc), so it happens before anything is
+  # measured or created and a kernel without it gets no swapfile at all —
+  # not a 1-4 GiB uncompressed one nobody asked for.
+  defp enable_zswap(state) do
+    path = Path.join(state.zswap_param_dir, "enabled")
+
+    if exists?(path) do
+      case write_file(path, "Y") do
+        :ok -> :ok
+        {:error, reason} -> {:error, "can't enable zswap at #{path}: #{inspect(reason)}"}
+      end
+    else
+      {:skip,
+       "kernel has no zswap (#{path} missing) — waiting for the memory-tuning system release"}
     end
   end
 
@@ -653,7 +684,6 @@ defmodule Vagus.Host.Swap do
   defp swapon(state), do: state.cmd.("swapon", [state.swapfile_path])
 
   defp finish_swapfile(state, size) do
-    write_zswap(state, "Y")
     write_sysctl(state, "swappiness", "10")
 
     mib = mib(size)

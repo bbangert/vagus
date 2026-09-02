@@ -335,7 +335,19 @@ defmodule Vagus.Host.SwapTest do
   } do
     parent = self()
     opts = fixture(tmp_dir, disk: "sda", mount_device: "/dev/sda5")
-    cmd = scripted_cmd(parent, [{"swapon", {"swapon: read swap header failed", 255}}])
+    enabled = Path.join(opts[:zswap_param_dir], "enabled")
+    scripted = scripted_cmd(parent, [{"swapon", {"swapon: read swap header failed", 255}}])
+
+    # Reading the parameter from inside `dd` dates the zswap write: the
+    # swapfile must not exist before zswap is on.
+    cmd = fn
+      "dd", args ->
+        send(parent, {:zswap_at_dd, read!(enabled)})
+        scripted.("dd", args)
+
+      bin, args ->
+        scripted.(bin, args)
+    end
 
     log =
       capture_log(fn ->
@@ -343,6 +355,7 @@ defmodule Vagus.Host.SwapTest do
                  start_swap([{:cmd, cmd}, {:df, fn _mp -> {:ok, 8 * @gib} end} | opts])
       end)
 
+    assert_received {:zswap_at_dd, "Y"}
     swapfile = opts[:swapfile_path]
 
     assert collect_cmds() == [
@@ -605,7 +618,7 @@ defmodule Vagus.Host.SwapTest do
   end
 
   @tag :tmp_dir
-  test "/root on a different disk than rootdisk -> skipped, nothing touched", %{tmp_dir: tmp_dir} do
+  test "/root on a different disk than rootdisk -> skipped, no swapfile", %{tmp_dir: tmp_dir} do
     parent = self()
     opts = fixture(tmp_dir, disk: "nvme0n1", mount_device: "/dev/nvme1n1p5")
 
@@ -622,7 +635,9 @@ defmodule Vagus.Host.SwapTest do
 
     assert collect_cmds() == []
     refute File.exists?(opts[:swapfile_path])
-    assert read!(Path.join(opts[:zswap_param_dir], "enabled")) == "N"
+    # zswap precedes the disk-identity check: a kernel knob with nothing to
+    # compress until some swap device exists.
+    assert read!(Path.join(opts[:zswap_param_dir], "enabled")) == "Y"
     assert read!(Path.join([tmp_dir, "proc", "sys", "vm", "swappiness"])) == "60"
   end
 
@@ -664,6 +679,57 @@ defmodule Vagus.Host.SwapTest do
       assert reason =~ "not on the root disk sda"
     end)
 
+    assert collect_cmds() == []
+    refute File.exists?(opts[:swapfile_path])
+  end
+
+  @tag :tmp_dir
+  test "no zswap parameters -> swapfile path skipped before any disk is touched", %{
+    tmp_dir: tmp_dir
+  } do
+    parent = self()
+    opts = fixture(tmp_dir, disk: "sda", mount_device: "/dev/sda5")
+    File.rm!(Path.join(opts[:zswap_param_dir], "enabled"))
+
+    capture_log(fn ->
+      assert {_pid, {:skipped, reason}} =
+               start_swap([
+                 {:cmd, scripted_cmd(parent)},
+                 {:df, fn _mp -> {:ok, 8 * @gib} end} | opts
+               ])
+
+      assert reason =~ "zswap"
+    end)
+
+    assert collect_cmds() == []
+    refute File.exists?(opts[:swapfile_path])
+    refute File.exists?(opts[:swapfile_path] <> ".tmp")
+  end
+
+  @tag :tmp_dir
+  test "zswap enabled can't be written -> {:failed, _}, no commands, no swapfile", %{
+    tmp_dir: tmp_dir
+  } do
+    parent = self()
+    opts = fixture(tmp_dir, disk: "sda", mount_device: "/dev/sda5")
+    enabled = Path.join(opts[:zswap_param_dir], "enabled")
+    # A directory where the kernel would put the parameter: `File.write`
+    # fails with :eisdir, the shape of a sysfs write the kernel refuses.
+    File.rm!(enabled)
+    File.mkdir!(enabled)
+
+    log =
+      capture_log(fn ->
+        assert {_pid, {:failed, reason}} =
+                 start_swap([
+                   {:cmd, scripted_cmd(parent)},
+                   {:df, fn _mp -> {:ok, 8 * @gib} end} | opts
+                 ])
+
+        assert reason =~ "can't enable zswap"
+      end)
+
+    assert log =~ ":eisdir"
     assert collect_cmds() == []
     refute File.exists?(opts[:swapfile_path])
   end
