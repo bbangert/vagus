@@ -17,6 +17,12 @@ defmodule Vagus.Diagnostics do
   against the real map shape and hands back the matching strings.
   """
 
+  @meminfo_path "/proc/meminfo"
+  @pressure_path "/proc/pressure/memory"
+  @thp_path "/sys/kernel/mm/transparent_hugepage/enabled"
+  @lru_gen_path "/sys/kernel/mm/lru_gen/enabled"
+  @swaps_path "/proc/swaps"
+
   @doc """
   Returns messages from the `RingLogger` buffer whose text matches `pattern`.
 
@@ -46,5 +52,97 @@ defmodule Vagus.Diagnostics do
     end
   rescue
     _ -> []
+  end
+
+  @doc """
+  Everything about the board's memory state in one map, for
+  `ssh <board> 'Vagus.Diagnostics.memory()'` during a gate run.
+
+  Any field whose source can't be read or parsed is `:unavailable` rather
+  than an error or a raise — a partial answer over SSH is worth more than a
+  stack trace, and two of these fields are legitimately absent today:
+
+    * `:thp` — stock Nerves kernels (the rpi targets, x86_64) are built
+      without transparent huge pages, so the sysfs file simply does not
+      exist there.
+    * `:pressure` — no board's kernel has `CONFIG_PSI` yet; it starts
+      reporting with the memory-tuning system release.
+
+  `opts` are path seams for tests (`:meminfo`, `:pressure`, `:thp_enabled`,
+  `:lru_gen_enabled`, `:swaps`).
+  """
+  @spec memory(keyword()) :: %{
+          mem_total_bytes: non_neg_integer() | :unavailable,
+          mem_available_bytes: non_neg_integer() | :unavailable,
+          swap: %{total: non_neg_integer(), free: non_neg_integer()} | :unavailable,
+          pressure: Vagus.Platform.Pressure.t() | :unavailable,
+          thp: String.t() | :unavailable,
+          lru_gen: String.t() | :unavailable,
+          swaps: [String.t()] | :unavailable
+        }
+  def memory(opts \\ []) do
+    meminfo = Keyword.get(opts, :meminfo, @meminfo_path)
+
+    %{
+      mem_total_bytes: available(Vagus.Platform.Memory.total_bytes(meminfo)),
+      mem_available_bytes: available(Vagus.Platform.Memory.available_bytes(meminfo)),
+      swap: available(Vagus.Platform.Memory.swap_bytes(meminfo)),
+      pressure:
+        available(Vagus.Platform.Pressure.memory(Keyword.get(opts, :pressure, @pressure_path))),
+      thp: selection(Keyword.get(opts, :thp_enabled, @thp_path)),
+      lru_gen: trimmed(Keyword.get(opts, :lru_gen_enabled, @lru_gen_path)),
+      swaps: swaps(Keyword.get(opts, :swaps, @swaps_path))
+    }
+  end
+
+  defp available({:ok, value}), do: value
+  defp available(:error), do: :unavailable
+
+  # sysfs "choice" files print every option with the active one bracketed
+  # (`always [madvise] never`), and only the choice is interesting here.
+  defp selection(path) do
+    with {:ok, contents} <- read(path) do
+      contents
+      |> String.split()
+      |> Enum.find_value(:unavailable, fn token ->
+        case Regex.run(~r/^\[(.+)\]$/, token) do
+          [_token, choice] -> choice
+          nil -> nil
+        end
+      end)
+    end
+  end
+
+  # `lru_gen/enabled` is a bitmask (`0x0007`) whose meaning is version
+  # dependent, so it is reported verbatim rather than decoded here.
+  defp trimmed(path) do
+    case read(path) do
+      {:ok, contents} -> blank_to_unavailable(String.trim(contents))
+      :unavailable -> :unavailable
+    end
+  end
+
+  defp blank_to_unavailable(""), do: :unavailable
+  defp blank_to_unavailable(trimmed), do: trimmed
+
+  # Entries are absolute paths, so filtering on the leading slash drops the
+  # `Filename Type Size Used Priority` header without depending on it being
+  # exactly one line (same read as `Vagus.Host.Swap`'s active-swap check).
+  defp swaps(path) do
+    with {:ok, contents} <- read(path) do
+      contents
+      |> String.split("\n", trim: true)
+      |> Enum.filter(&String.starts_with?(&1, "/"))
+      |> Enum.map(&(&1 |> String.split() |> hd()))
+    end
+  end
+
+  # paths are module attributes or test seams, not request input
+  # sobelow_skip ["Traversal.FileModule"]
+  defp read(path) do
+    case File.read(path) do
+      {:ok, contents} -> {:ok, contents}
+      {:error, _reason} -> :unavailable
+    end
   end
 end
