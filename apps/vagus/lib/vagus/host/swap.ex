@@ -14,10 +14,10 @@ defmodule Vagus.Host.Swap do
 
   On SD/eMMC, a disk-backed swapfile would write the flash to death — those
   cards have no wear levelling worth the name and are the boot medium as
-  well. zram costs RAM to save RAM (roughly 2-3x compression on BEAM heaps)
-  but touches no flash. UFS and NVMe survive the writes and are big enough
-  to hand out gigabytes, which buys far more headroom than compressing the
-  same RAM in place.
+  well. zram costs RAM to save RAM (the kernel's zram docs say to expect
+  about 2:1) but touches no flash. UFS and NVMe survive the writes and are
+  big enough to hand out gigabytes, which buys far more headroom than
+  compressing the same RAM in place.
 
   ## Compression belongs to whoever created the device
 
@@ -247,9 +247,10 @@ defmodule Vagus.Host.Swap do
     end
   end
 
-  # Half of RAM: zram pages still live in RAM, so the disksize is a ceiling
-  # on how much *compressed* data may be held, not an allocation. At ~2-3x
-  # compression this buys roughly a third of RAM back at worst.
+  # Half of RAM is the device's *uncompressed* capacity, not an allocation:
+  # RAM is consumed only as pages are swapped in, at their compressed size,
+  # so a full 50 % device costs about 25 % of RAM at the 2:1 the kernel docs
+  # expect. 50 % is the appliance consensus (Armbian, zram-generator).
   defp init_zram(state, zram_dir, disksize) do
     case write_file(Path.join(zram_dir, "disksize"), to_string(disksize)) do
       :ok ->
@@ -396,9 +397,10 @@ defmodule Vagus.Host.Swap do
   defp parent_disk("vd" <> _ = name), do: String.replace(name, ~r/\d+$/, "")
   defp parent_disk(name), do: name
 
-  # A third of RAM, clamped: below 1 GiB the file is too small to absorb
-  # anything worth the setup, above 4 GiB the kernel's own page tables for
-  # it start costing more than the headroom is worth on these boards.
+  # HAOS's haos-swapfile formula verbatim: a third of RAM clamped to 1-4 GiB
+  # (below 1 GiB there is too little to absorb a spike; above 4 GiB the file
+  # is disk and time spent zeroing it for headroom nothing here uses), then
+  # rounded down to whole 4 KiB blocks so `dd`'s count is exact.
   defp swapfile_size(mem_total) do
     mem_total
     |> Kernel.*(@swapfile_fraction)
