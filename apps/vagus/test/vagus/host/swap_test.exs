@@ -36,6 +36,7 @@ defmodule Vagus.Host.SwapTest do
     swaps = Keyword.get(opts, :swaps, "Filename\t\t\t\tType\t\tSize\tUsed\tPriority\n")
     mount_device = Keyword.get(opts, :mount_device, "/dev/#{disk}p5")
     mountpoint = Keyword.get(opts, :mountpoint, "/root")
+    mounts = Keyword.get(opts, :mounts, [{mount_device, mountpoint}])
 
     zram_dir = Path.join([tmp_dir, "sys", "block", "zram0"])
     zswap_dir = Path.join([tmp_dir, "sys", "module", "zswap", "parameters"])
@@ -57,11 +58,14 @@ defmodule Vagus.Host.SwapTest do
     File.write!(Path.join(proc_dir, "swaps"), swaps)
     File.write!(Path.join(proc_dir, "meminfo"), "MemTotal:       #{mem_kb} kB\nMemFree: 1 kB\n")
 
-    File.write!(Path.join(proc_dir, "mounts"), """
-    /dev/#{disk}p2 / ext4 rw,relatime 0 0
-    /dev/#{disk}p1 /boot vfat rw,relatime 0 0
-    #{mount_device} #{mountpoint} ext4 rw,relatime 0 0
-    """)
+    File.write!(
+      Path.join(proc_dir, "mounts"),
+      """
+      /dev/#{disk}p2 / ext4 rw,relatime 0 0
+      /dev/#{disk}p1 /boot vfat rw,relatime 0 0
+      """ <>
+        Enum.map_join(mounts, fn {device, mp} -> "#{device} #{mp} ext4 rw,relatime 0 0\n" end)
+    )
 
     rootdisk = Path.join(tmp_dir, "rootdisk0")
     File.ln_s!(disk, rootdisk)
@@ -342,13 +346,15 @@ defmodule Vagus.Host.SwapTest do
     swapfile = opts[:swapfile_path]
 
     assert collect_cmds() == [
-             {"dd", ["if=/dev/zero", "of=#{swapfile}", "bs=4k", "count=262144"]},
+             {"dd", ["if=/dev/zero", "of=#{swapfile}.tmp", "bs=4k", "count=262144"]},
              {"swapon", [swapfile]},
              {"mkswap", [swapfile]},
              {"swapon", [swapfile]}
            ]
 
+    # Only the completed file is renamed into place, at 0600.
     assert (File.stat!(swapfile).mode &&& 0o777) == 0o600
+    refute File.exists?(swapfile <> ".tmp")
 
     assert read!(Path.join(opts[:zswap_param_dir], "enabled")) == "Y"
     assert read!(Path.join([tmp_dir, "proc", "sys", "vm", "swappiness"])) == "10"
@@ -378,7 +384,9 @@ defmodule Vagus.Host.SwapTest do
 
     swapfile = opts[:swapfile_path]
 
-    assert [{"dd", ["if=/dev/zero", "of=" <> ^swapfile, "bs=4k", "count=1048576"]} | _rest] =
+    tmp = swapfile <> ".tmp"
+
+    assert [{"dd", ["if=/dev/zero", "of=" <> ^tmp, "bs=4k", "count=1048576"]} | _rest] =
              collect_cmds()
   end
 
@@ -401,10 +409,10 @@ defmodule Vagus.Host.SwapTest do
       assert mib == div(expected_size, @mib)
     end)
 
-    swapfile = opts[:swapfile_path]
+    tmp = opts[:swapfile_path] <> ".tmp"
     count = "count=#{div(expected_size, 4096)}"
 
-    assert [{"dd", ["if=/dev/zero", "of=" <> ^swapfile, "bs=4k", ^count]} | _rest] =
+    assert [{"dd", ["if=/dev/zero", "of=" <> ^tmp, "bs=4k", ^count]} | _rest] =
              collect_cmds()
   end
 
@@ -451,12 +459,116 @@ defmodule Vagus.Host.SwapTest do
     end)
 
     swapfile = opts[:swapfile_path]
+    tmp = swapfile <> ".tmp"
     cmds = collect_cmds()
 
-    assert [{"dd", ["if=/dev/zero", "of=" <> ^swapfile, "bs=4k", "count=262144"]} | _rest] = cmds
+    assert [{"dd", ["if=/dev/zero", "of=" <> ^tmp, "bs=4k", "count=262144"]} | _rest] = cmds
     # The stale file is gone: the dd fake writes nothing, so what's on disk
     # is the empty file `touch_swapfile/1` created.
     assert File.stat!(swapfile).size == 0
+  end
+
+  @tag :tmp_dir
+  test "dd fails -> {:failed, _} and neither the swapfile nor its tmp is left behind", %{
+    tmp_dir: tmp_dir
+  } do
+    parent = self()
+    opts = fixture(tmp_dir, disk: "sda", mount_device: "/dev/sda5")
+    cmd = scripted_cmd(parent, [{"dd", {"dd: No space left on device", 1}}])
+
+    log =
+      capture_log(fn ->
+        assert {_pid, {:failed, reason}} =
+                 start_swap([{:cmd, cmd}, {:df, fn _mp -> {:ok, 8 * @gib} end} | opts])
+
+        assert reason =~ "dd exited 1"
+        refute reason =~ "could not remove"
+      end)
+
+    swapfile = opts[:swapfile_path]
+
+    # Nothing is formatted or swapon'd after a failed dd.
+    assert collect_cmds() == [
+             {"dd", ["if=/dev/zero", "of=#{swapfile}.tmp", "bs=4k", "count=262144"]}
+           ]
+
+    refute File.exists?(swapfile)
+    refute File.exists?(swapfile <> ".tmp")
+    assert log =~ "No space left"
+  end
+
+  @tag :tmp_dir
+  test "a leftover .tmp is removed, not extended, before dd runs", %{tmp_dir: tmp_dir} do
+    parent = self()
+    opts = fixture(tmp_dir, disk: "sda", mount_device: "/dev/sda5")
+    tmp = opts[:swapfile_path] <> ".tmp"
+    # What a killed dd leaves: near the target size, so it would pass the
+    # reuse slack if it ever reached the real path.
+    stub_size(tmp, @gib - 8 * @mib)
+
+    log =
+      capture_log(fn ->
+        assert {_pid, {:swapfile, 1024}} =
+                 start_swap([
+                   {:cmd, scripted_cmd(parent)},
+                   {:df, fn _mp -> {:ok, 8 * @gib} end} | opts
+                 ])
+      end)
+
+    assert log =~ "removing leftover"
+
+    assert [{"dd", ["if=/dev/zero", "of=" <> ^tmp, "bs=4k", "count=262144"]} | _rest] =
+             collect_cmds()
+
+    # The dd fake writes nothing, so a zero-length file at the real path
+    # proves the leftover was replaced rather than renamed into place.
+    assert File.stat!(opts[:swapfile_path]).size == 0
+    refute File.exists?(tmp)
+  end
+
+  @tag :tmp_dir
+  test "dd fails and its tmp can't be removed -> the error names the leftover", %{
+    tmp_dir: tmp_dir
+  } do
+    parent = self()
+    dir = Path.join(tmp_dir, "readonly")
+    File.mkdir!(dir)
+    # Clearing the directory's write bit is the only way to make `File.rm`
+    # fail without a real filesystem, and root ignores it.
+    on_exit(fn -> File.chmod(dir, 0o700) end)
+
+    opts =
+      tmp_dir
+      |> fixture(disk: "sda", mount_device: "/dev/sda5")
+      |> Keyword.put(:swapfile_path, Path.join(dir, "swapfile"))
+
+    cmd = fn
+      "dd", args ->
+        send(parent, {:cmd, "dd", args})
+        File.chmod!(dir, 0o500)
+        {"dd: No space left on device", 1}
+
+      bin, args ->
+        send(parent, {:cmd, bin, args})
+        {"", 0}
+    end
+
+    log =
+      capture_log(fn ->
+        assert {_pid, {:failed, reason}} =
+                 start_swap([{:cmd, cmd}, {:df, fn _mp -> {:ok, 8 * @gib} end} | opts])
+
+        assert reason =~ "dd exited 1"
+
+        if root?() do
+          refute reason =~ "could not remove"
+        else
+          assert reason =~ "could not remove"
+          assert reason =~ "swapfile.tmp"
+        end
+      end)
+
+    assert log =~ "No space left"
   end
 
   @tag :tmp_dir
@@ -482,7 +594,7 @@ defmodule Vagus.Host.SwapTest do
     swapfile = opts[:swapfile_path]
 
     assert collect_cmds() == [
-             {"dd", ["if=/dev/zero", "of=#{swapfile}", "bs=4k", "count=262144"]},
+             {"dd", ["if=/dev/zero", "of=#{swapfile}.tmp", "bs=4k", "count=262144"]},
              {"swapon", [swapfile]},
              {"mkswap", [swapfile]},
              {"swapon", [swapfile]}
@@ -528,6 +640,32 @@ defmodule Vagus.Host.SwapTest do
                  {:df, fn "/data" -> {:ok, 8 * @gib} end} | opts
                ])
     end)
+  end
+
+  @tag :tmp_dir
+  test "/data and /root both mounted -> /data decides where the swapfile would go", %{
+    tmp_dir: tmp_dir
+  } do
+    parent = self()
+
+    opts =
+      fixture(tmp_dir, disk: "sda", mounts: [{"/dev/sda5", "/root"}, {"/dev/nvme0n1p1", "/data"}])
+
+    capture_log(fn ->
+      assert {_pid, {:skipped, reason}} =
+               start_swap([
+                 {:cmd, scripted_cmd(parent)},
+                 {:df, fn _mp -> {:ok, 8 * @gib} end} | opts
+               ])
+
+      # `/root` is on the root disk and would have proceeded — only the
+      # `/data` entry can produce this skip.
+      assert reason =~ "/data is on nvme0n1"
+      assert reason =~ "not on the root disk sda"
+    end)
+
+    assert collect_cmds() == []
+    refute File.exists?(opts[:swapfile_path])
   end
 
   @tag :tmp_dir
@@ -673,6 +811,108 @@ defmodule Vagus.Host.SwapTest do
     assert File.dir?(opts[:swapfile_path])
   end
 
+  # --- retry after a free-space skip ---------------------------------------
+
+  @tag :tmp_dir
+  test "free-space skip -> one retry, which succeeds once /data has grown", %{tmp_dir: tmp_dir} do
+    parent = self()
+    opts = fixture(tmp_dir, disk: "sda", mount_device: "/dev/sda5")
+    table = df_table(100 * @mib)
+
+    log =
+      capture_log(fn ->
+        assert {pid, {:skipped, reason}} =
+                 start_swap([
+                   {:cmd, scripted_cmd(parent)},
+                   {:df, table_df(table)},
+                   {:retry_after, 60_000} | opts
+                 ])
+
+        assert reason =~ "free space"
+        assert collect_cmds() == []
+
+        # What `resize2fs` does to `/data` a moment after we measured it.
+        :ets.insert(table, {:free, 8 * @gib})
+        send(pid, :retry)
+        assert :sys.get_state(pid).result == {:swapfile, 1024}
+      end)
+
+    assert log =~ "retrying in 60 s"
+    tmp = opts[:swapfile_path] <> ".tmp"
+
+    assert [{"dd", ["if=/dev/zero", "of=" <> ^tmp, "bs=4k", "count=262144"]}] =
+             Enum.filter(collect_cmds(), fn {bin, _args} -> bin == "dd" end)
+  end
+
+  @tag :tmp_dir
+  test "still no free space on the retry -> no dd, and a further :retry is a no-op", %{
+    tmp_dir: tmp_dir
+  } do
+    parent = self()
+    opts = fixture(tmp_dir, disk: "sda", mount_device: "/dev/sda5")
+    table = df_table(100 * @mib)
+
+    capture_log(fn ->
+      assert {pid, {:skipped, _reason}} =
+               start_swap([
+                 {:cmd, scripted_cmd(parent)},
+                 {:df, table_df(table)},
+                 {:retry_after, 60_000} | opts
+               ])
+
+      send(pid, :retry)
+      assert {:skipped, _reason} = :sys.get_state(pid).result
+      assert df_calls(table) == 2
+
+      # The budget is one retry: a third message runs nothing at all.
+      send(pid, :retry)
+      assert {:skipped, _reason} = :sys.get_state(pid).result
+      assert df_calls(table) == 2
+    end)
+
+    assert collect_cmds() == []
+    refute File.exists?(opts[:swapfile_path])
+  end
+
+  @tag :tmp_dir
+  test "a skip that is not about free space schedules nothing", %{tmp_dir: tmp_dir} do
+    parent = self()
+    opts = fixture(tmp_dir, disk: "sda", mount_device: "/dev/sda5")
+    table = df_table(0)
+
+    df = fn _mountpoint ->
+      :ets.update_counter(table, :calls, 1)
+      :error
+    end
+
+    capture_log(fn ->
+      assert {pid, {:skipped, reason}} =
+               start_swap([{:cmd, scripted_cmd(parent)}, {:df, df}, {:retry_after, 10} | opts])
+
+      assert reason =~ "can't measure free space"
+      # Ten times the retry delay: a scheduled retry would have fired.
+      Process.sleep(100)
+      assert :sys.get_state(pid).result == {:skipped, reason}
+      assert df_calls(table) == 1
+    end)
+
+    assert collect_cmds() == []
+  end
+
+  @tag :tmp_dir
+  test "an unexpected message is ignored, not a crash", %{tmp_dir: tmp_dir} do
+    parent = self()
+    opts = fixture(tmp_dir, disk: "mmcblk0")
+
+    capture_log(fn ->
+      assert {pid, {:zram, 473}} = start_swap([{:cmd, scripted_cmd(parent)} | opts])
+
+      send(pid, {:tcp_closed, :nothing_we_own})
+      assert :sys.get_state(pid).result == {:zram, 473}
+      assert Process.alive?(pid)
+    end)
+  end
+
   # --- classification + crash isolation ------------------------------------
 
   @tag :tmp_dir
@@ -754,6 +994,23 @@ defmodule Vagus.Host.SwapTest do
 
     assert {"df", ["-Pk", "/root"]} in collect_cmds()
   end
+
+  # A `df` seam answering from ETS, so a test can grow the filesystem between
+  # the first run and the retry, and count how often it was consulted.
+  defp df_table(free) do
+    table = :ets.new(:swap_df, [:public, :set])
+    :ets.insert(table, [{:free, free}, {:calls, 0}])
+    table
+  end
+
+  defp table_df(table) do
+    fn _mountpoint ->
+      :ets.update_counter(table, :calls, 1)
+      {:ok, :ets.lookup_element(table, :free, 2)}
+    end
+  end
+
+  defp df_calls(table), do: :ets.lookup_element(table, :calls, 2)
 
   defp root? do
     {uid, 0} = System.cmd("id", ["-u"])
