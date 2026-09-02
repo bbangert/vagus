@@ -63,10 +63,15 @@ defmodule Vagus.Host.Swap do
   otherwise), like `Vagus.Provisioner`. `init/1` returns immediately with
   `{:continue, :run}` so nothing blocks the supervisor. The whole run is
   wrapped in a rescue/catch: a bug here must never crash-loop a
-  `:permanent` child and take `:vagus` down over a memory optimisation. The
-  process then idles forever — swap is configured once per boot, and an
+  `:permanent` child and take `:vagus` down over a memory optimisation.
+
+  One run configures swap for the boot and the process then idles — an
   already-active `/proc/swaps` short-circuits the whole flow, so a restart
-  is a no-op.
+  is a no-op. The one exception is the free-space skip: `Vagus.Provisioner`
+  grows `/data` with `resize2fs` from a sibling child started at the same
+  time, so on the boot after `fwup expand-data` this module can measure the
+  filesystem before it has grown. That skip alone schedules a single retry
+  five minutes out; every other outcome is terminal.
   """
 
   use GenServer
@@ -94,6 +99,12 @@ defmodule Vagus.Host.Swap do
   # Core's recorder and the add-on store — worse than having no swap at all.
   @swapfile_headroom 536_870_912
   @block_size 4096
+
+  # The only skip worth a second look, matched as a prefix so no other skip
+  # reason can trigger the retry. Five minutes is longer than a `resize2fs`
+  # of a multi-GiB `/data` and still inside the boot it belongs to.
+  @no_space "not enough free space on"
+  @retry_after 300_000
 
   @type result ::
           :already_active
@@ -132,6 +143,8 @@ defmodule Vagus.Host.Swap do
       meminfo_path: Keyword.get(opts, :meminfo_path, @meminfo_path),
       swapfile_path: swapfile_path,
       zswap_param_dir: Keyword.get(opts, :zswap_param_dir, @zswap_param_dir),
+      retry_after: Keyword.get(opts, :retry_after, @retry_after),
+      retries_left: 1,
       result: nil
     }
 
@@ -139,7 +152,39 @@ defmodule Vagus.Host.Swap do
   end
 
   @impl GenServer
-  def handle_continue(:run, state), do: {:noreply, %{state | result: safe_run(state)}}
+  def handle_continue(:run, state), do: {:noreply, store(state, safe_run(state))}
+
+  # `retries_left` is spent on arrival rather than on scheduling, so a stray
+  # `:retry` cannot buy an extra run. Re-running is safe at any time: the
+  # flow re-reads `/proc/swaps` first and stops there once swap is on.
+  @impl GenServer
+  def handle_info(:retry, %{retries_left: 0} = state), do: {:noreply, state}
+
+  def handle_info(:retry, state) do
+    {:noreply, store(%{state | retries_left: state.retries_left - 1}, safe_run(state))}
+  end
+
+  def handle_info(message, state) do
+    Logger.debug("Vagus.Host.Swap: ignoring unexpected message #{inspect(message)}")
+    {:noreply, state}
+  end
+
+  defp store(state, result), do: maybe_retry(%{state | result: result})
+
+  # `/data` may still be growing under us on the boot after `fwup
+  # expand-data` (see the moduledoc's Lifecycle).
+  defp maybe_retry(%{result: {:skipped, @no_space <> _reason}, retries_left: left} = state)
+       when left > 0 do
+    Logger.info(
+      "Vagus.Host.Swap: retrying in #{div(state.retry_after, 1000)} s — " <>
+        "/data may still be expanding"
+    )
+
+    Process.send_after(self(), :retry, state.retry_after)
+    state
+  end
+
+  defp maybe_retry(state), do: state
 
   # A raise anywhere below becomes one logged line and an idle process. The
   # alternative — letting it crash — is a `:permanent` child restarting into
@@ -381,14 +426,15 @@ defmodule Vagus.Host.Swap do
   end
 
   # Nerves mounts the application partition at `/root` with `/data` as a
-  # symlink to it on some boards and as a real mount on others, so only one
-  # of the two appears in `/proc/mounts`. Lines are fstab(5) columns.
+  # symlink to it on some boards and mounts `/data` itself on others. `/data`
+  # is where the swapfile goes, so its own entry wins whenever it has one and
+  # `/root` only covers the symlink case. Lines are fstab(5) columns.
   defp find_data_mount(contents) do
     lines = String.split(contents, "\n", trim: true)
 
     Enum.find_value(
-      ["/root", "/data"],
-      {:skip, "found neither /root nor /data in the mount table"},
+      ["/data", "/root"],
+      {:skip, "found neither /data nor /root in the mount table"},
       fn mountpoint ->
         Enum.find_value(lines, fn line ->
           case String.split(line) do
@@ -438,7 +484,7 @@ defmodule Vagus.Host.Swap do
   # `File.lstat/1` rather than `stat` on purpose: a symlink at the swapfile
   # path must be refused, not followed to whatever it points at.
   defp ensure_swapfile(state, mountpoint, size) do
-    case lstat_swapfile(state) do
+    case lstat(state.swapfile_path) do
       {:ok, %File.Stat{type: :regular, size: existing}} ->
         reuse_or_recreate(state, mountpoint, size, existing)
 
@@ -459,7 +505,7 @@ defmodule Vagus.Host.Swap do
     if abs(existing - size) <= @swapfile_slack do
       reuse(state, existing)
     else
-      case rm_swapfile(state) do
+      case rm_file(state.swapfile_path) do
         :ok ->
           create_swapfile(state, mountpoint, size)
 
@@ -500,37 +546,81 @@ defmodule Vagus.Host.Swap do
             "have #{mib(free)} MiB"
         )
 
-        {:skip, "not enough free space on #{mountpoint}"}
+        {:skip, "#{@no_space} #{mountpoint}"}
 
       :error ->
         {:skip, "can't measure free space on #{mountpoint}"}
     end
   end
 
+  # `dd` writes to `<path>.tmp` and only a complete file is renamed into
+  # place: a partial one left at the real path can fall within the reuse
+  # slack and be swapon'd at the wrong size a boot later. An untrappable
+  # `:kill` mid-`dd` orphans the port's `dd` — the BEAM does not reap it —
+  # but the orphan writes to the tmp file, which the next run clears.
   defp dd_swapfile(state, size) do
-    blocks = div(size, @block_size)
+    tmp = state.swapfile_path <> ".tmp"
 
-    case touch_swapfile(state) do
-      :ok -> run_dd(state, blocks)
-      {:error, reason} -> {:error, reason}
+    with :ok <- clear_tmp(tmp),
+         :ok <- touch_file(tmp),
+         :ok <- run_dd(state, tmp, div(size, @block_size)) do
+      rename_tmp(state, tmp)
     end
   end
 
-  # An untrappable `:kill` mid-`dd` orphans the port's `dd` — the BEAM does
-  # not reap it. The restart sees a size mismatch and unlinks-then-recreates,
-  # which is safe (the orphan keeps writing to the unlinked inode) and costs
-  # one wasted pass of flash I/O.
-  defp run_dd(state, blocks) do
-    args = ["if=/dev/zero", "of=#{state.swapfile_path}", "bs=4k", "count=#{blocks}"]
+  defp clear_tmp(tmp) do
+    case lstat(tmp) do
+      {:ok, %File.Stat{type: :regular}} ->
+        Logger.info("Vagus.Host.Swap: removing leftover #{tmp}")
+        remove_tmp(tmp)
 
-    case state.cmd.("dd", args) do
-      {_output, 0} ->
+      {:ok, %File.Stat{type: type}} ->
+        {:skip, "#{tmp} exists and is not a regular file (#{type}) — refusing to touch it"}
+
+      {:error, :enoent} ->
         :ok
 
-      {output, status} ->
-        # A partial file would swapon at the wrong size on the next boot.
-        rm_swapfile(state)
-        {:error, "dd exited #{status}: #{inspect(output)}"}
+      {:error, reason} ->
+        {:skip, "can't stat #{tmp}: #{inspect(reason)}"}
+    end
+  end
+
+  defp remove_tmp(tmp) do
+    case rm_file(tmp) do
+      :ok -> :ok
+      {:error, reason} -> {:error, "can't remove #{tmp}: #{inspect(reason)}"}
+    end
+  end
+
+  defp run_dd(state, tmp, blocks) do
+    args = ["if=/dev/zero", "of=#{tmp}", "bs=4k", "count=#{blocks}"]
+
+    case state.cmd.("dd", args) do
+      {_output, 0} -> :ok
+      {output, status} -> {:error, dd_failed(tmp, output, status)}
+    end
+  end
+
+  # A leftover the cleanup could not remove is named in the error rather than
+  # dropped: the next run refuses to start over on a tmp file it can't clear,
+  # and that would otherwise read as an unexplained skip a boot later.
+  defp dd_failed(tmp, output, status) do
+    message = "dd exited #{status}: #{inspect(output)}"
+
+    case rm_file(tmp) do
+      :ok -> message
+      {:error, reason} -> message <> "; could not remove #{tmp}: #{inspect(reason)}"
+    end
+  end
+
+  defp rename_tmp(state, tmp) do
+    case rename(tmp, state.swapfile_path) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        rm_file(tmp)
+        {:error, "can't rename #{tmp} to #{state.swapfile_path}: #{inspect(reason)}"}
     end
   end
 
@@ -659,10 +749,13 @@ defmodule Vagus.Host.Swap do
   defp dir?(path), do: File.dir?(path)
 
   # sobelow_skip ["Traversal.FileModule"]
-  defp lstat_swapfile(state), do: File.lstat(state.swapfile_path)
+  defp lstat(path), do: File.lstat(path)
 
   # sobelow_skip ["Traversal.FileModule"]
-  defp rm_swapfile(state), do: File.rm(state.swapfile_path)
+  defp rm_file(path), do: File.rm(path)
+
+  # sobelow_skip ["Traversal.FileModule"]
+  defp rename(source, target), do: File.rename(source, target)
 
   # sobelow_skip ["Traversal.FileModule"]
   defp chmod_swapfile(state), do: File.chmod(state.swapfile_path, 0o600)
@@ -670,12 +763,12 @@ defmodule Vagus.Host.Swap do
   # Mode before content: the file will hold RAM contents, so there must be
   # no window in which it is world-readable.
   # sobelow_skip ["Traversal.FileModule"]
-  defp touch_swapfile(state) do
-    with :ok <- File.write(state.swapfile_path, ""),
-         :ok <- File.chmod(state.swapfile_path, 0o600) do
+  defp touch_file(path) do
+    with :ok <- File.write(path, ""),
+         :ok <- File.chmod(path, 0o600) do
       :ok
     else
-      {:error, reason} -> {:error, "can't create #{state.swapfile_path}: #{inspect(reason)}"}
+      {:error, reason} -> {:error, "can't create #{path}: #{inspect(reason)}"}
     end
   end
 end
