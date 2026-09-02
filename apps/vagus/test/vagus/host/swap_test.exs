@@ -275,6 +275,54 @@ defmodule Vagus.Host.SwapTest do
     assert read!(Path.join([tmp_dir, "proc", "sys", "vm", "swappiness"])) == "60"
   end
 
+  @tag :tmp_dir
+  test "zram disksize write fails -> {:failed, _}, no commands, lz4 still selected", %{
+    tmp_dir: tmp_dir
+  } do
+    parent = self()
+    opts = fixture(tmp_dir, disk: "mmcblk0")
+    zram_dir = Path.join([tmp_dir, "sys", "block", "zram0"])
+    # A directory where the kernel would put an attribute: `File.write` fails
+    # with :eisdir, which is the shape of a write to a real read-only sysfs.
+    File.rm!(Path.join(zram_dir, "disksize"))
+    File.mkdir!(Path.join(zram_dir, "disksize"))
+
+    log =
+      capture_log(fn ->
+        assert {pid, {:failed, reason}} = start_swap([{:cmd, scripted_cmd(parent)} | opts])
+        assert reason =~ "can't set zram disksize"
+        assert Process.alive?(pid)
+      end)
+
+    assert log =~ "leaving zram0 alone until reboot"
+    assert collect_cmds() == []
+    # comp_algorithm precedes disksize — the kernel only accepts it while the
+    # device is uninitialised — so it is written even on this path.
+    assert read!(Path.join(zram_dir, "comp_algorithm")) == "lz4"
+  end
+
+  @tag :tmp_dir
+  test "unreadable comp_algorithm -> warning, zram still initialised", %{tmp_dir: tmp_dir} do
+    parent = self()
+    opts = fixture(tmp_dir, disk: "mmcblk0")
+    zram_dir = Path.join([tmp_dir, "sys", "block", "zram0"])
+    File.rm!(Path.join(zram_dir, "comp_algorithm"))
+
+    log =
+      capture_log(fn ->
+        assert {_pid, {:zram, 473}} = start_swap([{:cmd, scripted_cmd(parent)} | opts])
+      end)
+
+    assert log =~ "can't read"
+    assert log =~ "comp_algorithm"
+    assert read!(Path.join(zram_dir, "disksize")) == to_string(div(@pi_bytes, 2))
+
+    assert collect_cmds() == [
+             {"mkswap", ["/dev/zram0"]},
+             {"swapon", ["-p", "100", "/dev/zram0"]}
+           ]
+  end
+
   # --- swapfile ------------------------------------------------------------
 
   @tag :tmp_dir
@@ -431,9 +479,15 @@ defmodule Vagus.Host.SwapTest do
         assert Process.alive?(pid)
       end)
 
-    cmds = collect_cmds()
-    assert Enum.count(cmds, fn {bin, _args} -> bin == "mkswap" end) == 1
-    assert Enum.count(cmds, fn {bin, _args} -> bin == "swapon" end) == 2
+    swapfile = opts[:swapfile_path]
+
+    assert collect_cmds() == [
+             {"dd", ["if=/dev/zero", "of=#{swapfile}", "bs=4k", "count=262144"]},
+             {"swapon", [swapfile]},
+             {"mkswap", [swapfile]},
+             {"swapon", [swapfile]}
+           ]
+
     assert log =~ "still nope"
     assert read!(Path.join([tmp_dir, "proc", "sys", "vm", "swappiness"])) == "60"
   end
@@ -519,6 +573,82 @@ defmodule Vagus.Host.SwapTest do
     assert log =~ "need 1024 MiB + 512 MiB headroom, have 1124 MiB"
     assert collect_cmds() == []
     refute File.exists?(opts[:swapfile_path])
+  end
+
+  @tag :tmp_dir
+  test "df can't measure the create path -> skipped, no dd", %{tmp_dir: tmp_dir} do
+    parent = self()
+    opts = fixture(tmp_dir, disk: "sda", mount_device: "/dev/sda5")
+
+    capture_log(fn ->
+      assert {_pid, {:skipped, reason}} =
+               start_swap([{:cmd, scripted_cmd(parent)}, {:df, fn _mp -> :error end} | opts])
+
+      assert reason =~ "can't measure free space"
+    end)
+
+    assert collect_cmds() == []
+    refute File.exists?(opts[:swapfile_path])
+  end
+
+  @tag :tmp_dir
+  test "unreadable /proc/mounts -> skipped, no swapfile", %{tmp_dir: tmp_dir} do
+    parent = self()
+    opts = fixture(tmp_dir, disk: "sda", mount_device: "/dev/sda5")
+    File.rm!(opts[:mounts_path])
+
+    capture_log(fn ->
+      assert {_pid, {:skipped, reason}} =
+               start_swap([
+                 {:cmd, scripted_cmd(parent)},
+                 {:df, fn _mp -> {:ok, 8 * @gib} end} | opts
+               ])
+
+      assert reason =~ "can't read"
+      assert reason =~ "mounts"
+    end)
+
+    assert collect_cmds() == []
+    refute File.exists?(opts[:swapfile_path])
+  end
+
+  @tag :tmp_dir
+  test "rm of a stale swapfile fails -> {:failed, _}, nothing formatted", %{tmp_dir: tmp_dir} do
+    parent = self()
+    dir = Path.join(tmp_dir, "locked")
+    File.mkdir!(dir)
+    swapfile = Path.join(dir, "swapfile")
+    stub_size(swapfile, 128 * @mib)
+
+    opts =
+      tmp_dir
+      |> fixture(disk: "sda", mount_device: "/dev/sda5")
+      |> Keyword.put(:swapfile_path, swapfile)
+
+    # Clearing the directory's write bit is the only way to make `File.rm`
+    # fail without a real filesystem, and root ignores it — so under root
+    # there is no failure to observe and only the fixture holds.
+    File.chmod!(dir, 0o500)
+    on_exit(fn -> File.chmod(dir, 0o700) end)
+
+    if root?() do
+      assert File.stat!(swapfile).size == 128 * @mib
+    else
+      log =
+        capture_log(fn ->
+          assert {_pid, {:failed, reason}} =
+                   start_swap([
+                     {:cmd, scripted_cmd(parent)},
+                     {:df, fn _mp -> {:ok, 8 * @gib} end} | opts
+                   ])
+
+          assert reason =~ "can't remove stale swapfile"
+        end)
+
+      assert log =~ ":eacces"
+      assert collect_cmds() == []
+      assert File.stat!(swapfile).size == 128 * @mib
+    end
   end
 
   @tag :tmp_dir
@@ -623,6 +753,11 @@ defmodule Vagus.Host.SwapTest do
     end)
 
     assert {"df", ["-Pk", "/root"]} in collect_cmds()
+  end
+
+  defp root? do
+    {uid, 0} = System.cmd("id", ["-u"])
+    String.trim(uid) == "0"
   end
 
   # Grows `path` to `size` without writing `size` bytes — the tests care
