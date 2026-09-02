@@ -117,7 +117,13 @@ defmodule Vagus.Application do
         # retries itself once for exactly that case. On a first boot the
         # swapfile `dd` may still be running when the engine starts, which is
         # fine — the Core image pull takes minutes anyway.
-        Vagus.Host.Swap
+        Vagus.Host.Swap,
+
+        # Logs a memory sample (PSI, swap, MemAvailable) every five minutes
+        # — the soak data the swap tuning above was never measured against.
+        # Same `:ignore` gate convention (`config :vagus, :memory_monitor`,
+        # target only) and the same never-crash discipline.
+        Vagus.Host.MemoryMonitor
       ] ++
         dns_children() ++
         events_children() ++
