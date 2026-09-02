@@ -326,6 +326,11 @@ defmodule Vagus.Host.Swap do
   defp init_zram(state, zram_dir, disksize) do
     case write_file(Path.join(zram_dir, "disksize"), to_string(disksize)) do
       :ok ->
+        # Off before the device is ever mkswap'd or swapon'd: a kernel built
+        # with ZSWAP_DEFAULT_ON would otherwise double-compress pages during
+        # the window between swapon and the write. Ours ships with it off,
+        # so this is belt-and-braces, not a bug fix.
+        write_zswap(state, "N")
         swapon_zram(state, disksize)
 
       {:error, reason} ->
@@ -392,7 +397,6 @@ defmodule Vagus.Host.Swap do
   end
 
   defp finish_zram(state, disksize) do
-    write_zswap(state, "N")
     write_sysctl(state, "swappiness", "150")
     write_sysctl(state, "page-cluster", "0")
 

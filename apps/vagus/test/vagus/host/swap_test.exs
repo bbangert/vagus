@@ -205,11 +205,29 @@ defmodule Vagus.Host.SwapTest do
   } do
     parent = self()
     opts = fixture(tmp_dir, disk: "mmcblk0")
+    enabled = Path.join(opts[:zswap_param_dir], "enabled")
+    # Seeded on, unlike the fixture's default "N", so the read at mkswap
+    # time can only come back "N" if the write actually ran first.
+    File.write!(enabled, "Y")
+    scripted = scripted_cmd(parent)
+
+    # Reading the parameter from inside `mkswap` dates the zswap write: it
+    # must be off before the device is ever mkswap'd.
+    cmd = fn
+      "mkswap", args ->
+        send(parent, {:zswap_at_mkswap, read!(enabled)})
+        scripted.("mkswap", args)
+
+      bin, args ->
+        scripted.(bin, args)
+    end
 
     log =
       capture_log(fn ->
-        assert {_pid, {:zram, 473}} = start_swap([{:cmd, scripted_cmd(parent)} | opts])
+        assert {_pid, {:zram, 473}} = start_swap([{:cmd, cmd} | opts])
       end)
+
+    assert_received {:zswap_at_mkswap, "N"}
 
     zram_dir = Path.join([tmp_dir, "sys", "block", "zram0"])
     assert read!(Path.join(zram_dir, "comp_algorithm")) == "lz4"
@@ -222,7 +240,7 @@ defmodule Vagus.Host.SwapTest do
 
     assert read!(Path.join([tmp_dir, "proc", "sys", "vm", "swappiness"])) == "150"
     assert read!(Path.join([tmp_dir, "proc", "sys", "vm", "page-cluster"])) == "0"
-    assert read!(Path.join(opts[:zswap_param_dir], "enabled")) == "N"
+    assert read!(enabled) == "N"
     assert log =~ "zram 473 MiB active, swappiness 150"
   end
 
