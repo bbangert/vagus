@@ -135,10 +135,26 @@ defmodule Vagus.Host.SwapTest do
     assert Process.whereis(Swap) == nil
   end
 
-  test "swapfile_path not named \"swapfile\" -> init raises" do
-    assert_raise ArgumentError, ~r/swapfile/, fn ->
-      Swap.init(swapfile_path: "/data/etc-shadow")
-    end
+  @tag :tmp_dir
+  test "swapfile_path not named \"swapfile\" -> {:failed, _}, nothing read or run", %{
+    tmp_dir: tmp_dir
+  } do
+    parent = self()
+
+    opts =
+      tmp_dir
+      |> fixture(disk: "sda", mount_device: "/dev/sda5")
+      |> Keyword.put(:swapfile_path, Path.join(tmp_dir, "etc-shadow"))
+
+    log =
+      capture_log(fn ->
+        assert {pid, {:failed, reason}} = start_swap([{:cmd, scripted_cmd(parent)} | opts])
+        assert reason =~ "must be named swapfile"
+        assert Process.alive?(pid)
+      end)
+
+    assert log =~ "etc-shadow"
+    assert collect_cmds() == []
   end
 
   # --- already-active short circuit ----------------------------------------
@@ -159,6 +175,21 @@ defmodule Vagus.Host.SwapTest do
 
     assert log =~ "already active"
     assert log =~ "/dev/zram0"
+    assert collect_cmds() == []
+  end
+
+  @tag :tmp_dir
+  test "unreadable /proc/swaps -> skipped, never reaches mkswap", %{tmp_dir: tmp_dir} do
+    parent = self()
+    opts = fixture(tmp_dir, disk: "mmcblk0")
+    File.rm!(opts[:swaps_path])
+
+    capture_log(fn ->
+      assert {_pid, {:skipped, reason}} = start_swap([{:cmd, scripted_cmd(parent)} | opts])
+      assert reason =~ "can't read"
+      assert reason =~ "swaps"
+    end)
+
     assert collect_cmds() == []
   end
 
@@ -330,20 +361,31 @@ defmodule Vagus.Host.SwapTest do
   end
 
   @tag :tmp_dir
-  test "existing swapfile within slack -> reused, no dd, no mkswap", %{tmp_dir: tmp_dir} do
+  test "existing swapfile within slack -> reused at 0600, no dd, no df", %{tmp_dir: tmp_dir} do
     parent = self()
     opts = fixture(tmp_dir, disk: "sda", mount_device: "/dev/sda5")
     # 8 MiB under the 1 GiB target, inside the 32 MiB slack.
     stub_size(opts[:swapfile_path], @gib - 8 * @mib)
+    File.chmod!(opts[:swapfile_path], 0o644)
+
+    df = fn _mp ->
+      send(parent, :df_called)
+      :error
+    end
 
     log =
       capture_log(fn ->
         assert {_pid, {:swapfile, 1024}} =
-                 start_swap([{:cmd, scripted_cmd(parent)}, {:df, fn _mp -> :error end} | opts])
+                 start_swap([{:cmd, scripted_cmd(parent)}, {:df, df} | opts])
       end)
 
     assert collect_cmds() == [{"swapon", [opts[:swapfile_path]]}]
     assert log =~ "reusing existing swapfile"
+    # The mode is tightened before the file the module didn't create is
+    # handed to swapon.
+    assert (File.stat!(opts[:swapfile_path]).mode &&& 0o777) == 0o600
+    # Nothing is written, so free space is never consulted.
+    refute_received :df_called
   end
 
   @tag :tmp_dir
@@ -452,6 +494,29 @@ defmodule Vagus.Host.SwapTest do
 
     assert log =~ "not enough free space"
     assert log =~ "have 100 MiB"
+    assert collect_cmds() == []
+    refute File.exists?(opts[:swapfile_path])
+  end
+
+  @tag :tmp_dir
+  test "free space without the headroom -> skipped, headroom named in the log", %{
+    tmp_dir: tmp_dir
+  } do
+    parent = self()
+    opts = fixture(tmp_dir, disk: "sda", mount_device: "/dev/sda5")
+
+    log =
+      capture_log(fn ->
+        assert {_pid, {:skipped, reason}} =
+                 start_swap([
+                   {:cmd, scripted_cmd(parent)},
+                   {:df, fn _mp -> {:ok, @gib + 100 * @mib} end} | opts
+                 ])
+
+        assert reason =~ "free space"
+      end)
+
+    assert log =~ "need 1024 MiB + 512 MiB headroom, have 1124 MiB"
     assert collect_cmds() == []
     refute File.exists?(opts[:swapfile_path])
   end

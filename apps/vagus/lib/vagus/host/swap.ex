@@ -46,11 +46,16 @@ defmodule Vagus.Host.Swap do
 
   The `.87` near-miss (a `mkfs` that nearly ran against a mounted `/data`)
   is why `mkswap/2` is a two-clause function matching literally `/dev/zram0`
-  or the configured swapfile, and why `init/1` refuses a `swapfile_path`
+  or the configured swapfile, and why the run refuses a `swapfile_path`
   not named `swapfile`. Any other argument is a `FunctionClauseError` — a
   loud crash beats a quiet reformat. The swapfile path is additionally
   required to be a regular file or absent; a directory, symlink or device
-  node there means we touch nothing at all.
+  node there means we touch nothing at all. That `lstat` leaves a window
+  before the write, but only root-owned processes write directly under
+  `/data` — add-on mounts map subdirectories of it, never the data root
+  itself — so nothing hostile is in a position to race it. The accepted
+  residual is the swapfile itself: a snapshot of RAM persisting on the
+  unencrypted `/data` across reboots, the same trade HAOS makes.
 
   ## Lifecycle
 
@@ -85,6 +90,9 @@ defmodule Vagus.Host.Swap do
   # the target moves with `MemTotal`, which can shift slightly across kernel
   # versions, and rewriting gigabytes to chase a few MiB is pure flash wear.
   @swapfile_slack 33_554_432
+  # Space `dd` must leave behind: a `/data` filled to the last byte breaks
+  # Core's recorder and the add-on store — worse than having no swap at all.
+  @swapfile_headroom 536_870_912
   @block_size 4096
 
   @type result ::
@@ -112,7 +120,6 @@ defmodule Vagus.Host.Swap do
   def init(opts) do
     cmd = Keyword.get(opts, :cmd, &Vagus.Host.Cmd.run/2)
     swapfile_path = Keyword.get(opts, :swapfile_path, @swapfile_path)
-    validate_swapfile_path!(swapfile_path)
 
     state = %{
       cmd: cmd,
@@ -160,13 +167,23 @@ defmodule Vagus.Host.Swap do
   end
 
   defp run(state) do
+    case validate_swapfile_path(state.swapfile_path) do
+      :ok -> run_unless_active(state)
+      {:error, reason} -> fail(reason)
+    end
+  end
+
+  defp run_unless_active(state) do
     case active_swaps(state) do
-      [] ->
+      {:ok, []} ->
         configure(state)
 
-      names ->
+      {:ok, names} ->
         Logger.info("Vagus.Host.Swap: swap already active (#{Enum.join(names, ", ")})")
         :already_active
+
+      {:skip, reason} ->
+        skip(reason)
     end
   end
 
@@ -196,21 +213,19 @@ defmodule Vagus.Host.Swap do
   # `/proc/swaps` opens with a `Filename Type Size Used Priority` header;
   # every real entry is an absolute path. Any entry at all means someone
   # (a previous run of this module, most likely) already configured swap.
+  # A procfs read failure is not a state worth acting on: guessing "no swap"
+  # is guessing toward `mkswap`, against a file the kernel may be paging to.
   defp active_swaps(state) do
     case read_file(state.swaps_path) do
       {:ok, contents} ->
-        contents
-        |> String.split("\n", trim: true)
-        |> Enum.filter(&String.starts_with?(&1, "/"))
-        |> Enum.map(&(&1 |> String.split() |> hd()))
+        {:ok,
+         contents
+         |> String.split("\n", trim: true)
+         |> Enum.filter(&String.starts_with?(&1, "/"))
+         |> Enum.map(&(&1 |> String.split() |> hd()))}
 
       {:error, reason} ->
-        Logger.debug(
-          "Vagus.Host.Swap: can't read #{state.swaps_path} (#{inspect(reason)}) — " <>
-            "assuming no swap is active"
-        )
-
-        []
+        {:skip, "can't read #{state.swaps_path}: #{inspect(reason)}"}
     end
   end
 
@@ -303,21 +318,30 @@ defmodule Vagus.Host.Swap do
     |> Enum.map(&(&1 |> String.trim_leading("[") |> String.trim_trailing("]")))
   end
 
+  defp swapon_zram(state, disksize) do
+    case mkswap(state, @zram_dev) do
+      {_output, 0} -> zram_swapon(state, disksize)
+      {output, status} -> fail("mkswap exited #{status}: #{inspect(output)}")
+    end
+  end
+
   # Priority 100 so zram always outranks any disk-backed swap the kernel
   # picked up on its own.
-  defp swapon_zram(state, disksize) do
-    with {_output, 0} <- mkswap(state, @zram_dev),
-         {_output, 0} <- state.cmd.("swapon", ["-p", "100", @zram_dev]) do
-      write_zswap(state, "N")
-      write_sysctl(state, "swappiness", "150")
-      write_sysctl(state, "page-cluster", "0")
-
-      mib = mib(disksize)
-      Logger.info("Vagus.Host.Swap: zram #{mib} MiB active, swappiness 150")
-      {:zram, mib}
-    else
-      {output, status} -> fail("zram setup exited #{status}: #{inspect(output)}")
+  defp zram_swapon(state, disksize) do
+    case state.cmd.("swapon", ["-p", "100", @zram_dev]) do
+      {_output, 0} -> finish_zram(state, disksize)
+      {output, status} -> fail("swapon exited #{status}: #{inspect(output)}")
     end
+  end
+
+  defp finish_zram(state, disksize) do
+    write_zswap(state, "N")
+    write_sysctl(state, "swappiness", "150")
+    write_sysctl(state, "page-cluster", "0")
+
+    mib = mib(disksize)
+    Logger.info("Vagus.Host.Swap: zram #{mib} MiB active, swappiness 150")
+    {:zram, mib}
   end
 
   # --- swapfile -----------------------------------------------------------
@@ -433,11 +457,7 @@ defmodule Vagus.Host.Swap do
 
   defp reuse_or_recreate(state, mountpoint, size, existing) do
     if abs(existing - size) <= @swapfile_slack do
-      Logger.info(
-        "Vagus.Host.Swap: reusing existing swapfile #{state.swapfile_path} (#{mib(existing)} MiB)"
-      )
-
-      :ok
+      reuse(state, existing)
     else
       case rm_swapfile(state) do
         :ok ->
@@ -449,17 +469,35 @@ defmodule Vagus.Host.Swap do
     end
   end
 
+  # A file this module did not create — an older firmware's, a restored
+  # image's — must never be swapon'd while others can read it: it is about
+  # to hold RAM contents.
+  defp reuse(state, existing) do
+    case chmod_swapfile(state) do
+      :ok ->
+        Logger.info(
+          "Vagus.Host.Swap: reusing existing swapfile #{state.swapfile_path} (#{mib(existing)} MiB)"
+        )
+
+        :ok
+
+      {:error, reason} ->
+        {:error, "can't chmod #{state.swapfile_path}: #{inspect(reason)}"}
+    end
+  end
+
   # Checking free space first because `dd` filling `/data` to the last byte
   # would break HA Core (and the add-on store) far worse than having no swap.
   defp create_swapfile(state, mountpoint, size) do
     case state.df.(mountpoint) do
-      {:ok, free} when free >= size ->
+      {:ok, free} when free >= size + @swapfile_headroom ->
         dd_swapfile(state, size)
 
       {:ok, free} ->
         Logger.error(
           "Vagus.Host.Swap: not enough free space on #{mountpoint}: " <>
-            "need #{mib(size)} MiB, have #{mib(free)} MiB"
+            "need #{mib(size)} MiB + #{mib(@swapfile_headroom)} MiB headroom, " <>
+            "have #{mib(free)} MiB"
         )
 
         {:skip, "not enough free space on #{mountpoint}"}
@@ -478,6 +516,10 @@ defmodule Vagus.Host.Swap do
     end
   end
 
+  # An untrappable `:kill` mid-`dd` orphans the port's `dd` — the BEAM does
+  # not reap it. The restart sees a size mismatch and unlinks-then-recreates,
+  # which is safe (the orphan keeps writing to the unlinked inode) and costs
+  # one wasted pass of flash I/O.
   defp run_dd(state, blocks) do
     args = ["if=/dev/zero", "of=#{state.swapfile_path}", "bs=4k", "count=#{blocks}"]
 
@@ -505,11 +547,16 @@ defmodule Vagus.Host.Swap do
   end
 
   defp mkswap_then_swapon(state, size) do
-    with {_output, 0} <- mkswap(state, state.swapfile_path),
-         {_output, 0} <- swapon(state) do
-      finish_swapfile(state, size)
-    else
-      {output, status} -> fail("swapfile setup exited #{status}: #{inspect(output)}")
+    case mkswap(state, state.swapfile_path) do
+      {_output, 0} -> retry_swapon(state, size)
+      {output, status} -> fail("mkswap exited #{status}: #{inspect(output)}")
+    end
+  end
+
+  defp retry_swapon(state, size) do
+    case swapon(state) do
+      {_output, 0} -> finish_swapfile(state, size)
+      {output, status} -> fail("swapon exited #{status}: #{inspect(output)}")
     end
   end
 
@@ -533,10 +580,11 @@ defmodule Vagus.Host.Swap do
   defp mkswap(%{cmd: cmd}, @zram_dev), do: cmd.("mkswap", [@zram_dev])
   defp mkswap(%{cmd: cmd, swapfile_path: path}, path), do: cmd.("mkswap", [path])
 
-  defp validate_swapfile_path!(path) do
-    if Path.basename(path) != "swapfile" do
-      raise ArgumentError,
-            "swapfile_path must be named \"swapfile\", got #{inspect(path)}"
+  defp validate_swapfile_path(path) do
+    if Path.basename(path) == "swapfile" do
+      :ok
+    else
+      {:error, "refusing swapfile_path #{inspect(path)} — must be named swapfile"}
     end
   end
 
@@ -549,6 +597,11 @@ defmodule Vagus.Host.Swap do
 
     if exists?(path) do
       warn_on_error(write_file(path, value), "can't set zswap enabled=#{value}")
+    else
+      Logger.info(
+        "Vagus.Host.Swap: zswap parameters absent at #{state.zswap_param_dir} — " <>
+          "kernel without CONFIG_ZSWAP?"
+      )
     end
   end
 
@@ -610,6 +663,9 @@ defmodule Vagus.Host.Swap do
 
   # sobelow_skip ["Traversal.FileModule"]
   defp rm_swapfile(state), do: File.rm(state.swapfile_path)
+
+  # sobelow_skip ["Traversal.FileModule"]
+  defp chmod_swapfile(state), do: File.chmod(state.swapfile_path, 0o600)
 
   # Mode before content: the file will hold RAM contents, so there must be
   # no window in which it is world-readable.
