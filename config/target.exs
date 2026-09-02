@@ -193,6 +193,13 @@ config :vagus, :first_boot_provision, true
 # builds both in.
 config :vagus, :host_swap, true
 
+# Memory soak sampler (`Vagus.Host.MemoryMonitor` — :ignore when unset, same
+# target-only convention). The swappiness and zram size above come from
+# kernel documentation and appliance convention, never from a measurement of
+# a board running Home Assistant; this is where that measurement comes from,
+# and RingLogger is the only history a board keeps.
+config :vagus, :memory_monitor, true
+
 # Real /os/update (build-order #4): GitHub-releases OTA firmware updates
 # (`Vagus.OS.Updater` — :ignore when unset, same target-only convention
 # as :core_boot/:core_watchdog/:first_boot_provision above; there is no

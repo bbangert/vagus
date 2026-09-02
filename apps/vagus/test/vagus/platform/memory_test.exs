@@ -1,5 +1,5 @@
 defmodule Vagus.Platform.MemoryTest do
-  @moduledoc "P2-A P0: `MemTotal` parsing out of /proc/meminfo."
+  @moduledoc "Field parsing out of /proc/meminfo."
   use ExUnit.Case, async: true
 
   alias Vagus.Platform.Memory
@@ -15,6 +15,14 @@ defmodule Vagus.Platform.MemoryTest do
   Buffers:            8192 kB
   Cached:           142336 kB
   """
+
+  # The same board once `Vagus.Host.Swap` has brought zram up.
+  @rpi3_with_swap @rpi3_meminfo <>
+                    """
+                    SwapCached:         1024 kB
+                    SwapTotal:        485320 kB
+                    SwapFree:         480000 kB
+                    """
 
   defp fixture(contents) do
     path = Path.join(System.tmp_dir!(), "vagus_meminfo_#{System.unique_integer([:positive])}")
@@ -66,6 +74,76 @@ defmodule Vagus.Platform.MemoryTest do
     if File.exists?("/proc/meminfo") do
       assert {:ok, bytes} = Memory.total_bytes()
       assert bytes > 0
+    end
+  end
+
+  describe "available_bytes/1" do
+    test "parses MemAvailable from a real rpi3 /proc/meminfo" do
+      assert Memory.available_bytes(fixture(@rpi3_meminfo)) == {:ok, 801_920 * 1024}
+    end
+
+    test "does not confuse MemAvailable with MemTotal or MemFree" do
+      path = fixture(@rpi3_meminfo)
+      assert Memory.available_bytes(path) != Memory.total_bytes(path)
+      refute Memory.available_bytes(path) == {:ok, 612_340 * 1024}
+    end
+
+    test "a zero MemAvailable parses rather than failing" do
+      assert {:ok, 0} = Memory.available_bytes(fixture("MemAvailable: 0 kB\n"))
+    end
+
+    test "a file with no MemAvailable line is :error" do
+      assert :error = Memory.available_bytes(fixture("MemTotal: 2048 kB\n"))
+    end
+
+    test "a missing file is :error" do
+      assert :error = Memory.available_bytes(Path.join(System.tmp_dir!(), "vagus_no_meminfo"))
+    end
+
+    test "a non-numeric MemAvailable is :error" do
+      assert :error = Memory.available_bytes(fixture("MemAvailable: plenty kB\n"))
+    end
+  end
+
+  describe "swap_bytes/1" do
+    test "parses SwapTotal and SwapFree" do
+      assert Memory.swap_bytes(fixture(@rpi3_with_swap)) ==
+               {:ok, %{total: 485_320 * 1024, free: 480_000 * 1024}}
+    end
+
+    # The normal case on every board until the memory-tuning system release
+    # lands: swap exists as fields, at size zero.
+    test "zero swap parses as zero, not :error" do
+      assert Memory.swap_bytes(fixture(@rpi3_meminfo <> "SwapTotal: 0 kB\nSwapFree: 0 kB\n")) ==
+               {:ok, %{total: 0, free: 0}}
+    end
+
+    test "does not confuse SwapCached with SwapFree" do
+      assert {:ok, %{free: free}} = Memory.swap_bytes(fixture(@rpi3_with_swap))
+      assert free == 480_000 * 1024
+    end
+
+    test "a missing SwapFree line is :error" do
+      assert :error = Memory.swap_bytes(fixture("SwapTotal: 100 kB\n"))
+    end
+
+    test "a missing SwapTotal line is :error" do
+      assert :error = Memory.swap_bytes(fixture("SwapFree: 100 kB\n"))
+    end
+
+    test "a missing file is :error" do
+      assert :error = Memory.swap_bytes(Path.join(System.tmp_dir!(), "vagus_no_meminfo"))
+    end
+
+    test "a garbage SwapTotal is :error" do
+      assert :error = Memory.swap_bytes(fixture("SwapTotal: lots kB\nSwapFree: 1 kB\n"))
+    end
+
+    test "reads the real /proc/meminfo on Linux" do
+      if File.exists?("/proc/meminfo") do
+        assert {:ok, %{total: total, free: free}} = Memory.swap_bytes()
+        assert total >= 0 and free >= 0
+      end
     end
   end
 end
