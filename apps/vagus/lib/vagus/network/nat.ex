@@ -289,23 +289,13 @@ defmodule Vagus.Network.Nat do
 
   defp runner(opts), do: Keyword.get(opts, :cmd, &default_cmd/2)
 
-  # The binary and every argument are module constants or config-derived
-  # addresses/ports — no request input reaches this. Public (not private) so
-  # a test can exercise the missing-binary path directly, the same
-  # "@doc false, but def" seam `Vagus.Provisioner.default_cmd/2` uses.
-  # sobelow_skip ["CI.System"]
+  # `Vagus.Host.Cmd.run/2` carries the missing-binary rescue (a real
+  # possibility on a system built without the legacy userland). Public (not
+  # private) so a test can drive that path through this seam, the same
+  # "@doc false, but def" arrangement `Vagus.Provisioner.default_cmd/2` uses.
   @doc false
   @spec default_cmd(String.t(), [String.t()]) :: {String.t(), non_neg_integer()}
-  def default_cmd(bin, args) do
-    System.cmd(bin, args, stderr_to_stdout: true)
-  rescue
-    # `System.cmd/3` raises (rather than returning a status) when the binary
-    # is missing or unusable — a real possibility on a system built without
-    # the legacy userland. Exit 127 ("command not found") routes it into the
-    # same nonzero-status handling as a rule that failed to apply.
-    exception in [ErlangError] ->
-      {"#{bin}: #{inspect(exception.original)}", 127}
-  end
+  def default_cmd(bin, args), do: Vagus.Host.Cmd.run(bin, args)
 
   ## Config
 

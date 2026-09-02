@@ -556,28 +556,13 @@ defmodule Vagus.Provisioner do
 
   # --- default seams ---------------------------------------------------
 
-  # bin/args are the hardcoded fwup/resize2fs invocations above, not request
-  # input. Public (not private) so it can be unit-tested directly against a
-  # nonexistent binary — same "@doc false, but def" precedent as
-  # `Vagus.Addon.Manager.native_allowed?/1`.
-  # sobelow_skip ["CI.System"]
+  # Delegates to `Vagus.Host.Cmd.run/2` (which carries the issue-#45
+  # missing-binary rescue) but stays here as a public function so
+  # `ProvisionerTest`'s nonexistent-binary test and the `:cmd` seam default
+  # keep the same names.
   @doc false
   @spec default_cmd(String.t(), [String.t()]) :: {String.t(), non_neg_integer()}
-  def default_cmd(bin, args) do
-    System.cmd(bin, args, stderr_to_stdout: true)
-  rescue
-    # `System.cmd/3` doesn't return a nonzero-status tuple for a missing or
-    # unusable binary — it raises `ErlangError` (`:enoent`, `:eacces`, ...).
-    # Rescuing the shape (not enumerating reasons) and returning a fake
-    # exit-127 ("command not found") tuple lets both call sites' existing
-    # nonzero-status handling degrade this the same way it degrades a real
-    # failed command (issue #45 — rpi3_64 ships no `resize2fs`). No logging
-    # here — the reason is carried in the returned message, so each call
-    # site's existing nonzero-status log stays the single logging point.
-    exception in [ErlangError] ->
-      reason = exception.original
-      {"#{bin}: #{inspect(reason)}", 127}
-  end
+  def default_cmd(bin, args), do: Vagus.Host.Cmd.run(bin, args)
 
   defp default_ping, do: Vagus.Runtime.Docker.ping()
 

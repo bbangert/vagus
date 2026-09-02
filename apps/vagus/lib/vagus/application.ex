@@ -104,7 +104,20 @@ defmodule Vagus.Application do
         # subtree to `:stopped` if OTP supervision exhausts its restart budget
         # (no Docker `die` event fires for a BEAM crash). Started after the
         # DynamicSupervisor it watches children of, and after `Vagus.Addon.State`.
-        Vagus.Addon.Backend.Native.Sentinel
+        Vagus.Addon.Backend.Native.Sentinel,
+
+        # Boot-time swap (zram or a /data swapfile, per root medium — see
+        # `Vagus.Host.Swap`). Unconditional child, `:ignore` unless
+        # `config :vagus, :host_swap` is set (only target.exs sets it; there
+        # is no board medium to classify on :host/:test). `init/1` only
+        # returns `{:continue, :run}`, so it never blocks the supervisor start
+        # (same StartupGuard safety as `Vagus.Provisioner`) — which also means
+        # it runs concurrently with the Provisioner rather than after it, and
+        # can measure a `/data` that `resize2fs` has not finished growing; it
+        # retries itself once for exactly that case. On a first boot the
+        # swapfile `dd` may still be running when the engine starts, which is
+        # fine — the Core image pull takes minutes anyway.
+        Vagus.Host.Swap
       ] ++
         dns_children() ++
         events_children() ++

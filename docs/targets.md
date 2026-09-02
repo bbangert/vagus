@@ -4,11 +4,13 @@ Vagus builds for three Nerves targets. **All three are first-class** —
 `dragon_q6a` and `rubik_pi3` were added alongside `rpi3_64`, not as
 replacements for it.
 
-| Target | Board | Kernel | Boot chain | `machine` reported to Core |
-| --- | --- | --- | --- | --- |
-| `rpi3_64` | Raspberry Pi 3 A+/B/B+ (64-bit) | 6.18 | bootcode → `config.txt` → A/B | `raspberrypi3-64` |
-| `dragon_q6a` | Radxa Dragon Q6A (QCS6490) | 7.1.4 | EDK2 UEFI → GRUB arm64-efi → A/B | `generic-aarch64` |
-| `rubik_pi3` | Thundercomm Rubik Pi 3 (QCS6490) | 7.1 (mainline) | PBL → XBL (SPI NOR) → EDK2 UEFI → GRUB (ESP on UFS) → kernel | `generic-aarch64` |
+| Target | Board | Kernel | Swap | Boot chain | `machine` reported to Core |
+| --- | --- | --- | --- | --- | --- |
+| `rpi3_64` | Raspberry Pi 3 A+/B/B+ (64-bit) | 6.18 | zram (SD root, `mmcblk*`) | bootcode → `config.txt` → A/B | `raspberrypi3-64` |
+| `dragon_q6a` | Radxa Dragon Q6A (QCS6490) | 7.1.4 | `/data` swapfile + zswap (UFS/NVMe root) | EDK2 UEFI → GRUB arm64-efi → A/B | `generic-aarch64` |
+| `rubik_pi3` | Thundercomm Rubik Pi 3 (QCS6490) | 7.1 (mainline) | `/data` swapfile + zswap (UFS root) | PBL → XBL (SPI NOR) → EDK2 UEFI → GRUB (ESP on UFS) → kernel | `generic-aarch64` |
+
+Swap is configured at boot by `Vagus.Host.Swap` based on the root medium: `mmcblk*` roots get zram (sized at 50% of RAM with LZ4 compression and `vm.swappiness=150`/`vm.page-cluster=0`), while `sd*`/`nvme*`/`vd*` roots use `/data/swapfile` (33% of RAM, clamped to 1–4 GiB, with zswap and `vm.swappiness=10`). The kernel builds both backends on every target but activates neither by default, so a board running a vagus release without `Vagus.Host.Swap` has no swap at all. The swapfile counts toward `/host/disks/default/usage` (the same `df -k /data` figure as on HAOS), but never appears in add-on backups — they tar per-add-on data directories, not `/data` wholesale.
 
 All three are aarch64 on the same toolchain, so `arch` is `aarch64`
 everywhere and Core runs the generic `ghcr.io/home-assistant/home-assistant`

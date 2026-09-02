@@ -179,6 +179,20 @@ config :vagus, :core_watchdog, true
 # Same target-only `:ignore` convention as :core_boot/:core_watchdog above.
 config :vagus, :first_boot_provision, true
 
+# Boot-time swap (`Vagus.Host.Swap` — :ignore when unset, same target-only
+# convention as :first_boot_provision above). Which backing store to use
+# can't be decided here: it follows the root medium (zram on SD/eMMC, a
+# /data swapfile + zswap on UFS/NVMe/USB), which only the running board
+# knows. This is also where vm.swappiness is set now — the system's
+# sysctl.conf no longer carries it.
+#
+# On today's boards this is still dark: each path is gated on the kernel
+# providing its compressor, so with no zram0 device the zram path skips and
+# with no zswap parameters the swapfile path skips before it measures or
+# writes anything. Swap starts appearing only with the system release that
+# builds both in.
+config :vagus, :host_swap, true
+
 # Real /os/update (build-order #4): GitHub-releases OTA firmware updates
 # (`Vagus.OS.Updater` — :ignore when unset, same target-only convention
 # as :core_boot/:core_watchdog/:first_boot_provision above; there is no
