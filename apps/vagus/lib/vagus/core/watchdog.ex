@@ -72,6 +72,7 @@ defmodule Vagus.Core.Watchdog do
 
   require Logger
 
+  alias Vagus.{BoundedCall, Resubscribe}
   alias Vagus.Core.{Container, Lifecycle, TokenStore}
 
   @die_window_ms 10 * 60 * 1_000
@@ -94,10 +95,12 @@ defmodule Vagus.Core.Watchdog do
   @impl GenServer
   def init(opts) do
     events = Keyword.get(opts, :events, Vagus.Runtime.Events)
-    maybe_subscribe(events)
 
     st = %{
       events: events,
+      # Monitor on the events server we subscribed to (nil: not subscribed)
+      # — see `Vagus.Resubscribe`.
+      events_ref: maybe_subscribe(events),
       token_store: Keyword.get(opts, :token_store, TokenStore),
       rebuild: Keyword.get(opts, :rebuild, fn -> Lifecycle.rebuild() end),
       clock: Keyword.get(opts, :clock, &default_clock/0),
@@ -124,6 +127,17 @@ defmodule Vagus.Core.Watchdog do
   end
 
   def handle_info({:docker_event, _event}, st), do: {:noreply, st}
+
+  # The events server restarted with an empty subscriber set: subscribe to
+  # its replacement once it is back (`Vagus.Resubscribe`).
+  def handle_info({:DOWN, ref, :process, _pid, _reason}, %{events_ref: ref} = st) do
+    {:noreply, %{st | events_ref: Resubscribe.down(st.events, :resubscribe_events)}}
+  end
+
+  def handle_info(:resubscribe_events, st) do
+    ref = Resubscribe.retry(st.events, &Vagus.Runtime.Events.subscribe/1, :resubscribe_events)
+    {:noreply, %{st | events_ref: ref}}
+  end
 
   # Completed rebuild Task — see the probe half for the identical
   # reply/:DOWN/deadline trio.
@@ -262,13 +276,7 @@ defmodule Vagus.Core.Watchdog do
   # take the watchdog down with it (same shape as the probe half).
   @doc false
   def run_rebuild(fun, attempt_timeout_ms) do
-    inner = Task.async(fun)
-
-    case Task.yield(inner, attempt_timeout_ms) || Task.shutdown(inner, :brutal_kill) do
-      {:ok, result} -> result
-      {:exit, reason} -> {:error, {:exit, reason}}
-      nil -> {:error, :attempt_timeout}
-    end
+    BoundedCall.run(fun, attempt_timeout_ms)
   rescue
     e ->
       Logger.error(
@@ -286,25 +294,19 @@ defmodule Vagus.Core.Watchdog do
   ## Defaults
 
   defp maybe_subscribe(events) do
-    if server_alive?(events) do
-      try do
-        Vagus.Runtime.Events.subscribe(events)
-      catch
-        :exit, _reason -> :ok
-      end
-    else
-      Logger.debug(
-        "Vagus.Core.Watchdog: events server not running; crash-loop detection idle " <>
-          "(the API probe half is unaffected)"
-      )
+    case Resubscribe.subscribe(events, &Vagus.Runtime.Events.subscribe/1) do
+      nil ->
+        Logger.debug(
+          "Vagus.Core.Watchdog: events server not running; crash-loop detection idle " <>
+            "(the API probe half is unaffected)"
+        )
+
+        nil
+
+      ref ->
+        ref
     end
-
-    :ok
   end
-
-  defp server_alive?(pid) when is_pid(pid), do: Process.alive?(pid)
-  defp server_alive?(name) when is_atom(name), do: is_pid(Process.whereis(name))
-  defp server_alive?(_other), do: false
 
   # The store can be briefly down (mid-restart) when a die event arrives; a
   # crashed watchdog would drop the whole crash window. Fall back to the

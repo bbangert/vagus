@@ -157,8 +157,9 @@ defmodule Vagus.DNS do
     end
   end
 
-  # Relay the raw query to the upstream resolver from a throwaway process so a
-  # slow upstream never blocks the server; the answer goes back out our socket.
+  # Relay the raw query to the upstream resolver from a throwaway (supervised,
+  # so a crash is logged) task so a slow upstream never blocks the server; the
+  # answer goes back out our socket.
   # Bounded by `@max_inflight` (drop over the cap) so a flood of misses can't
   # exhaust processes/FDs; the ephemeral socket is always closed (`try/after`),
   # and `:forward_done` decrements the in-flight counter when the relay ends.
@@ -167,7 +168,7 @@ defmodule Vagus.DNS do
   defp forward(packet, host, port, %{socket: socket, upstream: upstream} = state) do
     server = self()
 
-    spawn(fn ->
+    relay = fn ->
       try do
         case :gen_udp.open(0, [:binary, active: false]) do
           {:ok, s} ->
@@ -186,9 +187,13 @@ defmodule Vagus.DNS do
       after
         send(server, :forward_done)
       end
-    end)
+    end
 
-    %{state | inflight: state.inflight + 1}
+    case Task.Supervisor.start_child(Vagus.TaskSupervisor, relay) do
+      {:ok, _pid} -> %{state | inflight: state.inflight + 1}
+      # No relay started, so no :forward_done will come: drop the query.
+      {:error, _reason} -> state
+    end
   end
 
   defp reply(nil, _host, _port, _packet), do: :ok

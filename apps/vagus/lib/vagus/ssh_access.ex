@@ -110,6 +110,9 @@ defmodule Vagus.SSHAccess do
   # path is config-derived (start-up opts / app env), not request input
   # sobelow_skip ["Traversal.FileModule"]
   def init(opts) do
+    # So a supervisor shutdown runs terminate/2 and the DETS table is closed
+    # (flushed) rather than left for the auto-repair path at next open.
+    Process.flag(:trap_exit, true)
     table_name = Keyword.get(opts, :table, @default_table)
     path = Keyword.get(opts, :dets_path) || dets_path()
 

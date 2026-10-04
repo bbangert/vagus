@@ -63,6 +63,10 @@ defmodule Vagus.Mqtt.Broker.Logs do
 
   @impl GenServer
   def init(opts) do
+    # So a supervisor shutdown (the broker being stopped) runs terminate/2
+    # and detaches the telemetry handler, instead of leaving it attached to
+    # a dead process until the next start happens to replace it.
+    Process.flag(:trap_exit, true)
     handler_id = {__MODULE__, Keyword.get(opts, :name, __MODULE__)}
     # Detach first so a restart (where terminate/2 may not have run) can re-attach.
     _ = :telemetry.detach(handler_id)

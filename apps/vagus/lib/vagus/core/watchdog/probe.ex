@@ -105,6 +105,7 @@ defmodule Vagus.Core.Watchdog.Probe do
 
   require Logger
 
+  alias Vagus.{BoundedCall, Resubscribe}
   alias Vagus.Core.{Container, Health, Lifecycle, TokenStore}
   alias Vagus.Runtime.Docker
 
@@ -131,12 +132,15 @@ defmodule Vagus.Core.Watchdog.Probe do
   @impl GenServer
   def init(opts) do
     token_store = Keyword.get(opts, :token_store, TokenStore)
-    maybe_subscribe(token_store)
     interval = Keyword.get(opts, :interval, @default_interval)
 
     st = %{
       interval: interval,
       token_store: token_store,
+      # Monitor on the store we subscribed to (nil: not subscribed) — a store
+      # restart drops its subscriber set, which would silently break the
+      # toggle-revive path; see `Vagus.Resubscribe`.
+      token_store_ref: Resubscribe.subscribe(token_store, &TokenStore.subscribe/1),
       check: Keyword.get(opts, :check, fn -> Health.check() end),
       restart: Keyword.get(opts, :restart, fn -> Lifecycle.restart() end),
       rebuild: Keyword.get(opts, :rebuild, fn -> Lifecycle.rebuild() end),
@@ -174,6 +178,17 @@ defmodule Vagus.Core.Watchdog.Probe do
     end
 
     {:noreply, %{st | misses: 0, reanimations: 0, healthy_streak: 0, given_up: false}}
+  end
+
+  # The store restarted with an empty subscriber set: subscribe to its
+  # replacement once it is back (`Vagus.Resubscribe`).
+  def handle_info({:DOWN, ref, :process, _pid, _reason}, %{token_store_ref: ref} = st) do
+    {:noreply, %{st | token_store_ref: Resubscribe.down(st.token_store, :resubscribe)}}
+  end
+
+  def handle_info(:resubscribe, st) do
+    ref = Resubscribe.retry(st.token_store, &TokenStore.subscribe/1, :resubscribe)
+    {:noreply, %{st | token_store_ref: ref}}
   end
 
   # A completed action Task's reply — the ladder is advanced here, not at
@@ -363,40 +378,13 @@ defmodule Vagus.Core.Watchdog.Probe do
   # Same bounded-call shape as Vagus.Addon.Watchdog.bounded_manager_call/2 —
   # see that function's doc for why brutal-killing the inner Task cannot
   # orphan a :global.trans lock it was still waiting on.
-  defp bounded_call(timeout_ms, fun) do
-    inner = Task.async(fun)
-
-    case Task.yield(inner, timeout_ms) || Task.shutdown(inner, :brutal_kill) do
-      {:ok, result} -> result
-      {:exit, reason} -> {:error, {:exit, reason}}
-      nil -> {:error, :attempt_timeout}
-    end
-  end
+  defp bounded_call(timeout_ms, fun), do: BoundedCall.run(fun, timeout_ms)
 
   ## Defaults
 
-  # Same tolerate-absent-server shape as Vagus.Addon.Watchdog's events
-  # subscription: the store may not be running in an isolated unit test, and
-  # the subscribe call itself may race its startup.
-  defp maybe_subscribe(token_store) do
-    if server_alive?(token_store) do
-      try do
-        TokenStore.subscribe(token_store)
-      catch
-        :exit, _reason -> :ok
-      end
-    end
-
-    :ok
-  end
-
-  defp server_alive?(pid) when is_pid(pid), do: Process.alive?(pid)
-  defp server_alive?(name) when is_atom(name), do: is_pid(Process.whereis(name))
-  defp server_alive?(_other), do: false
-
   # The store can be briefly down (mid-restart) exactly when a tick fires;
   # a crashed probe would reset the whole ladder. Fall back to the upstream
-  # `true` default instead — same tolerance maybe_subscribe/1 already has.
+  # `true` default instead — same tolerance the subscription has.
   defp watchdog_on?(token_store) do
     TokenStore.get_watchdog(token_store)
   catch

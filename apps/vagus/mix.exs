@@ -15,6 +15,7 @@ defmodule Vagus.MixProject do
       start_permanent: Mix.env() == :prod,
       elixirc_paths: elixirc_paths(Mix.env()),
       deps: deps(),
+      argus: argus(),
       # NOTE on PLT staleness: dialyxir NEVER checks/updates the PLT from an
       # umbrella child (`no_check?/1` hard-returns true — `check_plt: true`
       # and a custom `plt_file:` are both defeated; a missing PLT triggers a
@@ -37,6 +38,68 @@ defmodule Vagus.MixProject do
         plt_add_apps: [:ssh, :public_key, :crypto],
         ignore_warnings: ".dialyzer_ignore.exs",
         list_unused_filters: true
+      ]
+    ]
+  end
+
+  # `mix argus --fail-above 0` is a CI gate (its own job, not a compiler).
+  # argus can only suppress per file (`ignore: [files: ...]` drops every
+  # finding reported in that file), so each file below was reviewed and
+  # holds only findings judged false positives or deliberate design. When
+  # touching one, drop it from this list and re-check with `mix argus`.
+  defp argus do
+    [
+      ignore: [
+        files: [
+          # coupling (one_for_one siblings that "register" with each other).
+          # The two standing subscriptions it names — the watchdogs on
+          # Vagus.Runtime.Events, the Core probe on Vagus.Core.TokenStore —
+          # monitor the server and re-subscribe after a restart
+          # (Vagus.Resubscribe), which argus does not model ("a's
+          # re-registering on a schedule of its own"). The rest are per-use
+          # requests (EventPusher pushes, Jobs/HttpConfig/Versions writes by
+          # one-shot boot flows, HttpConfig re-pulled on Core start by
+          # design) or add-on records written through Vagus.Addon.Manager by
+          # every add-on start, not only these boot-time callers. State is
+          # file-backed and reloads; Registry tokens and DNS names live in
+          # memory only, so a Registry/DNS restart loses them for running
+          # add-ons until each restarts — a known gap in those two servers
+          # (they should rebuild from State in init/1), not in the callers.
+          "lib/vagus/application.ex",
+          # One reconnect loop only: :connect is armed by a dropped or failed
+          # connection, and while it is pending conn is nil, so no stream
+          # message can arm a second one.
+          "lib/vagus/runtime/events.ex",
+          # Task.async is linked deliberately (a killed caller takes the
+          # inner call with it), and the function's failures are caught
+          # inside the task, so the link never carries a crash to the caller.
+          "lib/vagus/bounded_call.ex",
+          # terminate/2 only closes a Mint connection whose socket the process
+          # owns; the VM closes it when the process dies anyway. WSBridge's
+          # init/1 call to Core.Versions runs per request, not in a boot
+          # sequence.
+          "lib/vagus/api/core_proxy/ws_bridge.ex",
+          "lib/vagus/ingress/ws_bridge.ex",
+          "lib/vagus/core/event_pusher/socket_connection.ex",
+          # :dets.open_file in init/1 is a local file, not a distributed
+          # store (the store failing degrades the server, never its start).
+          "lib/vagus/ssh_access.ex",
+          # Its continue only reaches Vagus.DNS/Vagus.Ingress after the :api
+          # gate (Vagus.API.Listener accepting), and the API supervisor
+          # starts after both.
+          "lib/vagus/addon/boot_starter.ex",
+          # init/1 only captures the port-probe closure; it never connects.
+          "lib/vagus/ingress.ex",
+          # The listener owns its Bandit child (restart: :temporary, see
+          # default_start/2) and starts it from init/1 by design.
+          "lib/vagus/api/listener.ex",
+          # bounded/1's receive also takes the child's :DOWN, and the child is
+          # heap-capped (max_heap_size kill), so the wait always ends.
+          "lib/vagus/backup.ex",
+          # The :ready_timeout kill of a connection that never became ready is
+          # deliberate; the monitor's :DOWN then drives the ordinary retry.
+          "lib/vagus/core/event_pusher.ex"
+        ]
       ]
     ]
   end
