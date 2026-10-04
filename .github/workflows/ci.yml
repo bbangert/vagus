@@ -1,11 +1,14 @@
 name: ci
 
-# Host-side gate for the emulator (apps/vagus): compile, format, tests, the
-# three static analyzers (Credo, Dialyzer, Sobelow), a dependency audit, and
-# Argus (separate job — it needs Souffle). Everything runs at
-# MIX_TARGET=host — the Nerves system / firmware build is target-only
-# (targets:-gated deps) and lives in the nerves_system_vagus repo's own CI,
-# so nothing here pulls Buildroot.
+# Host-side gates for the emulator (apps/vagus), one parallel job each:
+# compile (warnings as errors) + format, tests, Credo, Dialyzer, Sobelow, a
+# dependency audit, and Argus. Everything runs at MIX_TARGET=host — the
+# Nerves system / firmware build is target-only (targets:-gated deps) and
+# lives in the nerves_system_vagus repo's own CI, so nothing here pulls
+# Buildroot.
+#
+# Every job repeats the same setup (native build deps, BEAM, hex/rebar/
+# nerves_bootstrap, deps cache under its own key prefix, deps.get).
 
 on:
   push:
@@ -24,7 +27,8 @@ env:
   MIX_TARGET: host
 
 jobs:
-  check:
+  build:
+    name: Compile + format
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -42,14 +46,6 @@ jobs:
           otp-version: ${{ env.OTP_VERSION }}
           elixir-version: ${{ env.ELIXIR_VERSION }}
 
-      # deps + build caches. The Dialyzer PLT lives under _build, so a warm
-      # _build cache also skips the (slow) first-run PLT build. vendor/** is
-      # in the key because vendored path deps (mqttx, fresh) aren't in
-      # mix.lock but must invalidate the PLT like any other dep change.
-      # The mix.exs files are in the key too: plt_add_apps lives in
-      # apps/vagus/mix.exs, and a PLT-affecting edit there must bust the
-      # cache so the drop-guard below fires and rebuilds the PLT against
-      # the current app set.
       - name: Cache deps and _build
         id: mix-cache
         uses: actions/cache@v4
@@ -57,9 +53,166 @@ jobs:
           path: |
             deps
             _build
-          key: mix-${{ runner.os }}-otp${{ env.OTP_VERSION }}-ex${{ env.ELIXIR_VERSION }}-${{ hashFiles('mix.lock', 'vendor/**', 'mix.exs', 'apps/*/mix.exs') }}
+          key: mix-build-${{ runner.os }}-otp${{ env.OTP_VERSION }}-ex${{ env.ELIXIR_VERSION }}-${{ hashFiles('mix.lock', 'vendor/**', 'mix.exs', 'apps/*/mix.exs') }}
           restore-keys: |
-            mix-${{ runner.os }}-otp${{ env.OTP_VERSION }}-ex${{ env.ELIXIR_VERSION }}-
+            mix-build-${{ runner.os }}-otp${{ env.OTP_VERSION }}-ex${{ env.ELIXIR_VERSION }}-
+
+      - name: Install hex, rebar, nerves_bootstrap
+        run: |
+          mix local.hex --force
+          mix local.rebar --force
+          # nerves_bootstrap injects a nerves.bootstrap step into deps.* for
+          # every project in the umbrella; the apps declare {:nerves,
+          # runtime: false} so it's satisfied at MIX_TARGET=host. Matches the
+          # local dev/toolchain setup.
+          mix archive.install hex nerves_bootstrap --force
+
+      - name: Fetch deps
+        run: mix deps.get
+
+      - name: Compile (warnings as errors)
+        run: mix compile --warnings-as-errors
+
+      - name: Format check
+        run: mix format --check-formatted
+
+  test:
+    name: Tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # nerves_uevent compiles a C port that #includes <libmnl/libmnl.h>, and
+      # it's pulled into the host build too — the runner needs the netlink dev
+      # headers (build-essential is already on the image).
+      - name: Install native build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libmnl-dev
+
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ env.OTP_VERSION }}
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+
+      - name: Cache deps and _build
+        id: mix-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            deps
+            _build
+          key: mix-test-${{ runner.os }}-otp${{ env.OTP_VERSION }}-ex${{ env.ELIXIR_VERSION }}-${{ hashFiles('mix.lock', 'vendor/**', 'mix.exs', 'apps/*/mix.exs') }}
+          restore-keys: |
+            mix-test-${{ runner.os }}-otp${{ env.OTP_VERSION }}-ex${{ env.ELIXIR_VERSION }}-
+
+      - name: Install hex, rebar, nerves_bootstrap
+        run: |
+          mix local.hex --force
+          mix local.rebar --force
+          # nerves_bootstrap injects a nerves.bootstrap step into deps.* for
+          # every project in the umbrella; the apps declare {:nerves,
+          # runtime: false} so it's satisfied at MIX_TARGET=host. Matches the
+          # local dev/toolchain setup.
+          mix archive.install hex nerves_bootstrap --force
+
+      - name: Fetch deps
+        run: mix deps.get
+
+      # Full suite — no exclusions. The former `@tag :flaky` quarantine
+      # (BootStarterTest's global-Fake assertions, WatchdogTest's wall-clock
+      # backoff-ratio test) was resolved by hardening: BootStarter now scopes
+      # to `Fake.calls_for/1` (per-add-on, immune to a foreign writer) and the
+      # watchdog backoff asserts the computed schedule via an injected `:sleep`
+      # instead of measured time.
+      - name: Tests
+        run: mix test
+
+  credo:
+    name: Credo
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # nerves_uevent compiles a C port that #includes <libmnl/libmnl.h>, and
+      # it's pulled into the host build too — the runner needs the netlink dev
+      # headers (build-essential is already on the image).
+      - name: Install native build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libmnl-dev
+
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ env.OTP_VERSION }}
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+
+      - name: Cache deps and _build
+        id: mix-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            deps
+            _build
+          key: mix-credo-${{ runner.os }}-otp${{ env.OTP_VERSION }}-ex${{ env.ELIXIR_VERSION }}-${{ hashFiles('mix.lock', 'vendor/**', 'mix.exs', 'apps/*/mix.exs') }}
+          restore-keys: |
+            mix-credo-${{ runner.os }}-otp${{ env.OTP_VERSION }}-ex${{ env.ELIXIR_VERSION }}-
+
+      - name: Install hex, rebar, nerves_bootstrap
+        run: |
+          mix local.hex --force
+          mix local.rebar --force
+          # nerves_bootstrap injects a nerves.bootstrap step into deps.* for
+          # every project in the umbrella; the apps declare {:nerves,
+          # runtime: false} so it's satisfied at MIX_TARGET=host. Matches the
+          # local dev/toolchain setup.
+          mix archive.install hex nerves_bootstrap --force
+
+      - name: Fetch deps
+        run: mix deps.get
+
+      # Credo / Dialyzer / Sobelow / Argus are declared in apps/vagus (that's
+      # where the code + their configs live). Run them from there.
+      - name: Credo
+        working-directory: apps/vagus
+        run: mix credo --strict
+
+  dialyzer:
+    name: Dialyzer
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # nerves_uevent compiles a C port that #includes <libmnl/libmnl.h>, and
+      # it's pulled into the host build too — the runner needs the netlink dev
+      # headers (build-essential is already on the image).
+      - name: Install native build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libmnl-dev
+
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ env.OTP_VERSION }}
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+
+      # The Dialyzer PLT lives under _build, so a warm _build cache also skips
+      # the (slow) first-run PLT build. vendor/** is in the key because
+      # vendored path deps (mqttx, fresh) aren't in mix.lock but must
+      # invalidate the PLT like any other dep change. The mix.exs files are in
+      # the key too: plt_add_apps lives in apps/vagus/mix.exs, and a
+      # PLT-affecting edit there must bust the cache so the drop-guard below
+      # fires and rebuilds the PLT against the current app set.
+      - name: Cache deps and _build
+        id: mix-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            deps
+            _build
+          key: mix-dialyzer-${{ runner.os }}-otp${{ env.OTP_VERSION }}-ex${{ env.ELIXIR_VERSION }}-${{ hashFiles('mix.lock', 'vendor/**', 'mix.exs', 'apps/*/mix.exs') }}
+          restore-keys: |
+            mix-dialyzer-${{ runner.os }}-otp${{ env.OTP_VERSION }}-ex${{ env.ELIXIR_VERSION }}-
 
       # PLT staleness guard: dialyxir never checks/updates a PLT from an
       # umbrella child (apps/vagus), so a PLT restored via restore-keys
@@ -71,6 +224,100 @@ jobs:
       - name: Drop stale Dialyzer PLTs on cache-key miss
         if: steps.mix-cache.outputs.cache-hit != 'true'
         run: rm -f _build/*/dialyxir_*.plt _build/*/dialyxir_*.plt.hash
+
+      - name: Install hex, rebar, nerves_bootstrap
+        run: |
+          mix local.hex --force
+          mix local.rebar --force
+          # nerves_bootstrap injects a nerves.bootstrap step into deps.* for
+          # every project in the umbrella; the apps declare {:nerves,
+          # runtime: false} so it's satisfied at MIX_TARGET=host. Matches the
+          # local dev/toolchain setup.
+          mix archive.install hex nerves_bootstrap --force
+
+      - name: Fetch deps
+        run: mix deps.get
+
+      - name: Dialyzer
+        working-directory: apps/vagus
+        run: mix dialyzer
+
+  sobelow:
+    name: Sobelow
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # nerves_uevent compiles a C port that #includes <libmnl/libmnl.h>, and
+      # it's pulled into the host build too — the runner needs the netlink dev
+      # headers (build-essential is already on the image).
+      - name: Install native build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libmnl-dev
+
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ env.OTP_VERSION }}
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+
+      - name: Cache deps and _build
+        id: mix-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            deps
+            _build
+          key: mix-sobelow-${{ runner.os }}-otp${{ env.OTP_VERSION }}-ex${{ env.ELIXIR_VERSION }}-${{ hashFiles('mix.lock', 'vendor/**', 'mix.exs', 'apps/*/mix.exs') }}
+          restore-keys: |
+            mix-sobelow-${{ runner.os }}-otp${{ env.OTP_VERSION }}-ex${{ env.ELIXIR_VERSION }}-
+
+      - name: Install hex, rebar, nerves_bootstrap
+        run: |
+          mix local.hex --force
+          mix local.rebar --force
+          # nerves_bootstrap injects a nerves.bootstrap step into deps.* for
+          # every project in the umbrella; the apps declare {:nerves,
+          # runtime: false} so it's satisfied at MIX_TARGET=host. Matches the
+          # local dev/toolchain setup.
+          mix archive.install hex nerves_bootstrap --force
+
+      - name: Fetch deps
+        run: mix deps.get
+
+      - name: Sobelow
+        working-directory: apps/vagus
+        run: mix sobelow
+
+  audit:
+    name: Hex audit
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # nerves_uevent compiles a C port that #includes <libmnl/libmnl.h>, and
+      # it's pulled into the host build too — the runner needs the netlink dev
+      # headers (build-essential is already on the image).
+      - name: Install native build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libmnl-dev
+
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ env.OTP_VERSION }}
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+
+      - name: Cache deps and _build
+        id: mix-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            deps
+            _build
+          key: mix-audit-${{ runner.os }}-otp${{ env.OTP_VERSION }}-ex${{ env.ELIXIR_VERSION }}-${{ hashFiles('mix.lock', 'vendor/**', 'mix.exs', 'apps/*/mix.exs') }}
+          restore-keys: |
+            mix-audit-${{ runner.os }}-otp${{ env.OTP_VERSION }}-ex${{ env.ELIXIR_VERSION }}-
 
       - name: Install hex, rebar, nerves_bootstrap
         run: |
@@ -107,65 +354,27 @@ jobs:
           mv nerves_system_vagus ../nerves_system_vagus
           mix deps.unlock --check-unused
 
-      - name: Compile (warnings as errors)
-        run: mix compile --warnings-as-errors
-
-      - name: Format check
-        run: mix format --check-formatted
-
-      # Full suite — no exclusions. The former `@tag :flaky` quarantine
-      # (BootStarterTest's global-Fake assertions, WatchdogTest's wall-clock
-      # backoff-ratio test) was resolved by hardening: BootStarter now scopes
-      # to `Fake.calls_for/1` (per-add-on, immune to a foreign writer) and the
-      # watchdog backoff asserts the computed schedule via an injected `:sleep`
-      # instead of measured time.
-      - name: Tests
-        run: mix test
-
-      # Credo / Dialyzer / Sobelow are declared in apps/vagus (that's where
-      # the code + their configs live). Run them from there.
-      - name: Credo
-        working-directory: apps/vagus
-        run: mix credo --strict
-
-      - name: Dialyzer
-        working-directory: apps/vagus
-        run: mix dialyzer
-
-      - name: Sobelow
-        working-directory: apps/vagus
-        run: mix sobelow
-
-  # Argus: whole-program OTP/supervision analysis over the compiled beams.
-  # Its own job because it needs Souffle, whose PPA package depends on
-  # libffi7 — absent on Ubuntu 24.04, hence 22.04 here. Declared in
-  # apps/vagus like the other analyzers (`targets: :host`), so it runs there.
   argus:
+    name: Argus
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
 
-      # Same native build deps as `check` (nerves_uevent's libmnl C port).
+      # nerves_uevent compiles a C port that #includes <libmnl/libmnl.h>, and
+      # it's pulled into the host build too — the runner needs the netlink dev
+      # headers (build-essential is already on the image).
       - name: Install native build deps
         run: |
           sudo apt-get update
           sudo apt-get install -y libmnl-dev
-
-      - name: Install Souffle
-        run: |
-          sudo wget https://souffle-lang.github.io/ppa/souffle-key.public -O /usr/share/keyrings/souffle-archive-keyring.gpg
-          echo "deb [signed-by=/usr/share/keyrings/souffle-archive-keyring.gpg] https://souffle-lang.github.io/ppa/ubuntu/ stable main" | sudo tee /etc/apt/sources.list.d/souffle.list
-          sudo apt-get update
-          sudo apt-get install -y souffle
 
       - uses: erlef/setup-beam@v1
         with:
           otp-version: ${{ env.OTP_VERSION }}
           elixir-version: ${{ env.ELIXIR_VERSION }}
 
-      # Separate key prefix from `check`: different runner image (22.04),
-      # and this job never needs the Dialyzer PLT.
       - name: Cache deps and _build
+        id: mix-cache
         uses: actions/cache@v4
         with:
           path: |
@@ -175,15 +384,29 @@ jobs:
           restore-keys: |
             mix-argus-${{ runner.os }}-otp${{ env.OTP_VERSION }}-ex${{ env.ELIXIR_VERSION }}-
 
+      # Argus needs Souffle, whose PPA package depends on libffi7 — absent on
+      # Ubuntu 24.04, hence 22.04 for this job.
+      - name: Install Souffle
+        run: |
+          sudo wget https://souffle-lang.github.io/ppa/souffle-key.public -O /usr/share/keyrings/souffle-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/souffle-archive-keyring.gpg] https://souffle-lang.github.io/ppa/ubuntu/ stable main" | sudo tee /etc/apt/sources.list.d/souffle.list
+          sudo apt-get update
+          sudo apt-get install -y souffle
+
       - name: Install hex, rebar, nerves_bootstrap
         run: |
           mix local.hex --force
           mix local.rebar --force
+          # nerves_bootstrap injects a nerves.bootstrap step into deps.* for
+          # every project in the umbrella; the apps declare {:nerves,
+          # runtime: false} so it's satisfied at MIX_TARGET=host. Matches the
+          # local dev/toolchain setup.
           mix archive.install hex nerves_bootstrap --force
 
       - name: Fetch deps
         run: mix deps.get
 
+      # Whole-program OTP/supervision analysis over the compiled beams.
       - name: Argus
         working-directory: apps/vagus
         run: mix argus --fail-above 0
