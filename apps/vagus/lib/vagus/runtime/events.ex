@@ -216,19 +216,28 @@ defmodule Vagus.Runtime.Events do
   # `backoff_ms` back to the floor first (see handle_response/2), so a stream
   # that dies after actually talking to the daemon starts its next retry at
   # 1s rather than continuing to escalate.
-  defp schedule_reconnect(reason, state) do
+  #
+  # One drop is scheduled once: when a retry is already pending (e.g.
+  # handle_responses/2 saw `:done`/`:error` and the stream error that carried
+  # it lands here too), only the connection fields are cleared — no second
+  # warning, no second timer, no extra backoff doubling. Public (`@doc false`)
+  # for its unit test.
+  @doc false
+  @spec schedule_reconnect(term(), map()) :: map()
+  def schedule_reconnect(_reason, %{reconnect_timer: timer} = state) when timer != nil do
+    %{state | conn: nil, request_ref: nil, buffer: ""}
+  end
+
+  def schedule_reconnect(reason, state) do
     delay = state.backoff_ms
 
     Logger.warning(
       "Vagus.Runtime.Events: docker-events stream dropped (#{inspect(reason)}); reconnecting in #{delay}ms"
     )
 
-    # A retry already pending stays the only one.
-    timer = state.reconnect_timer || Process.send_after(self(), :connect, delay)
-
     %{
       state
-      | reconnect_timer: timer,
+      | reconnect_timer: Process.send_after(self(), :connect, delay),
         conn: nil,
         request_ref: nil,
         buffer: "",

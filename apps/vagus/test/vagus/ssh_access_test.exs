@@ -120,6 +120,44 @@ defmodule Vagus.SSHAccessTest do
     assert SSHAccess.fingerprint(name2) == first.fingerprint
   end
 
+  # A supervisor shutdown only runs terminate/2 (which closes the DETS
+  # table) because the server traps exits; otherwise it is killed outright
+  # and the table is left to DETS's own owner-exit cleanup.
+  test "a supervisor shutdown closes the table before the server is gone", %{path: path} do
+    table = :"ssh_access_sup_#{System.unique_integer([:positive])}"
+    sup_path = path <> ".sup"
+    name = :"ssh_access_sup_srv_#{System.unique_integer([:positive])}"
+
+    start_supervised!(
+      {SSHAccess, name: name, table: table, dets_path: sup_path},
+      id: :supervised_ssh_access
+    )
+
+    {:ok, public_key} = SSHAccess.public_key(name)
+    assert :dets.info(table) != :undefined
+
+    # Trace the server's own :dets.close/1 call: the deterministic signal that
+    # terminate/2 ran (without it, DETS's owner-exit cleanup closes the table
+    # anyway, just asynchronously).
+    server = Process.whereis(name)
+    :erlang.trace_pattern({:dets, :close, 1}, true, [:local])
+    :erlang.trace(server, true, [:call])
+
+    on_exit(fn -> :erlang.trace_pattern({:dets, :close, 1}, false, [:local]) end)
+
+    :ok = stop_supervised!(:supervised_ssh_access)
+
+    assert_receive {:trace, ^server, :call, {:dets, :close, [^table]}}
+    # Closed by the time the supervisor reports the child stopped.
+    assert :dets.info(table) == :undefined
+
+    # And flushed: a fresh server on the same file serves the same key.
+    restarted = :"ssh_access_sup_srv_#{System.unique_integer([:positive])}"
+    {:ok, pid} = SSHAccess.start_link(name: restarted, table: table, dets_path: sup_path)
+    assert SSHAccess.public_key(restarted) == {:ok, public_key}
+    GenServer.stop(pid)
+  end
+
   test "generate_keypair/0 produces distinct keys each call" do
     a = SSHAccess.generate_keypair()
     b = SSHAccess.generate_keypair()

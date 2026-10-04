@@ -289,4 +289,36 @@ defmodule Vagus.Runtime.EventsTest do
     Process.sleep(100)
     assert Process.alive?(events_pid)
   end
+
+  describe "schedule_reconnect/2" do
+    import ExUnit.CaptureLog
+
+    defp drop_state(backoff_ms) do
+      %{
+        conn: :conn,
+        request_ref: make_ref(),
+        buffer: "x",
+        backoff_ms: backoff_ms,
+        reconnect_timer: nil
+      }
+    end
+
+    # handle_responses/2 can schedule on `:done`/`:error` and the stream-error
+    # branch then schedules the same drop again: that must arm one timer,
+    # warn once and advance the backoff once.
+    test "a second schedule for the same drop is a no-op beyond clearing the connection" do
+      {state, log} =
+        with_log(fn ->
+          state = Events.schedule_reconnect(:stream_ended, drop_state(1_000))
+          Events.schedule_reconnect({:closed, :again}, %{state | conn: :conn})
+        end)
+
+      assert state.backoff_ms == 2_000
+      assert is_reference(state.reconnect_timer)
+      assert state.conn == nil
+      assert length(Regex.scan(~r/docker-events stream dropped/, log)) == 1
+
+      Process.cancel_timer(state.reconnect_timer)
+    end
+  end
 end
