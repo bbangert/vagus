@@ -91,4 +91,18 @@ defmodule Vagus.Mqtt.Broker.LogsTest do
     assert_receive {:broker_log, "b"}
     assert Logs.tail(logs, 10) == ["a", "b"]
   end
+
+  # terminate/2 only runs on a supervisor shutdown because Logs traps exits;
+  # without it the telemetry handler would stay attached to a dead process.
+  test "a supervisor shutdown detaches the telemetry handler", ctx do
+    handler_id = {Logs, ctx.test}
+    assert handler_attached?(handler_id)
+
+    :ok = stop_supervised!(Logs)
+
+    refute handler_attached?(handler_id)
+  end
+
+  defp handler_attached?(handler_id),
+    do: Enum.any?(:telemetry.list_handlers([]), &(&1.id == handler_id))
 end

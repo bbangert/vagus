@@ -390,9 +390,14 @@ defmodule Vagus.Backup do
   # Runs `fun` in a throwaway process the VM kills if it exceeds
   # `@tar_read_heap_words`, so no amount of header forgery inside `:erl_tar`
   # can exhaust the node, nor wedge it past `@tar_read_timeout_ms` — the
-  # caller gets `{:error, {:tar_read_failed, _}}` instead. The returned binary is not copied out of the child (refc
-  # binaries are shared), so this costs a process spawn, not a data copy.
-  defp bounded(fun) do
+  # caller gets `{:error, {:tar_read_failed, _}}` instead. The returned binary
+  # is not copied out of the child (refc binaries are shared), so this costs a
+  # process spawn, not a data copy. Public (`@doc false`) only so the timeout
+  # path can be tested with a short deadline.
+  @doc false
+  @spec bounded((-> result), timeout()) :: result | {:error, {:tar_read_failed, term()}}
+        when result: term()
+  def bounded(fun, timeout_ms \\ @tar_read_timeout_ms) do
     parent = self()
     ref = make_ref()
 
@@ -410,9 +415,26 @@ defmodule Vagus.Backup do
       {:DOWN, ^monitor, :process, ^pid, reason} ->
         {:error, {:tar_read_failed, reason}}
     after
-      @tar_read_timeout_ms ->
+      timeout_ms ->
+        # The child may have sent its result between the timeout firing and
+        # the kill landing: wait for it to be gone, then drop any such late
+        # result so it never reaches the caller's mailbox.
         Process.exit(pid, :kill)
-        Process.demonitor(monitor, [:flush])
+
+        # A :kill cannot be trapped, so the :DOWN follows promptly; the
+        # `after` only keeps this wait bounded on principle.
+        receive do
+          {:DOWN, ^monitor, :process, ^pid, _reason} -> :ok
+        after
+          5_000 -> Process.demonitor(monitor, [:flush])
+        end
+
+        receive do
+          {^ref, _late} -> :ok
+        after
+          0 -> :ok
+        end
+
         {:error, {:tar_read_failed, :timeout}}
     end
   end

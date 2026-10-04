@@ -35,4 +35,28 @@ defmodule Vagus.BoundedCallTest do
     assert_receive {:task, pid}
     refute Process.alive?(pid)
   end
+
+  # Why the task stays linked: a caller killed mid-call (the watchdogs'
+  # deadline failsafe brutal-kills their sequence task) must take the inner
+  # call with it rather than leave it running orphaned.
+  test "killing the caller takes the in-flight inner call down with it" do
+    test = self()
+
+    caller =
+      spawn(fn ->
+        BoundedCall.run(
+          fn ->
+            send(test, {:inner, self()})
+            Process.sleep(:infinity)
+          end,
+          :infinity
+        )
+      end)
+
+    assert_receive {:inner, inner}
+    ref = Process.monitor(inner)
+    Process.exit(caller, :kill)
+
+    assert_receive {:DOWN, ^ref, :process, ^inner, :killed}
+  end
 end

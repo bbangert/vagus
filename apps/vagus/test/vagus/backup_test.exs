@@ -292,4 +292,21 @@ defmodule Vagus.BackupTest do
 
     path
   end
+
+  describe "bounded/2 deadline" do
+    test "a read past the deadline is killed and reported as a timeout" do
+      test = self()
+
+      assert Backup.bounded(
+               fn ->
+                 send(test, {:reader, self()})
+                 Process.sleep(:infinity)
+               end,
+               20
+             ) == {:error, {:tar_read_failed, :timeout}}
+
+      assert_received {:reader, reader}
+      refute Process.alive?(reader)
+    end
+  end
 end
