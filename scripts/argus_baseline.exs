@@ -3,8 +3,11 @@
 # Why: `argus: [ignore: [files: ...]]` hides every future finding in a file.
 # This script instead accepts only individually reviewed findings, listed in
 # `.argus-baseline.exs`, each with a `reason:` (false positive or deliberate
-# design). Any finding not in the baseline fails; baseline entries that no
-# longer occur are reported as warnings so they get pruned.
+# design). Any finding not in the baseline fails, and so does any baseline
+# entry that no longer occurs (stale): a leftover entry would otherwise be a
+# spare allowance that silently accepts a future, unreviewed finding with
+# the same fingerprint. Remove stale entries in the same change that fixes
+# or removes their finding.
 #
 # Usage (plain `elixir`, no deps; needs Elixir >= 1.18 for the JSON module):
 #
@@ -35,13 +38,16 @@
 # label of the finding's own line, `null` when it has none) and `detail`.
 # A JSON `null` and a baseline entry without `at_label:` are both `nil`.
 # Line numbers are never part of the fingerprint, so edits elsewhere in the
-# file don't invalidate the baseline; any `:N`/`line N` reference inside
-# `at_label` or `detail` is normalised away for the same reason.
+# file don't invalidate the baseline; a source location inside `at_label`
+# or `detail` (a `.ex`/`.exs`/`.erl`/`.hrl`/`.eex`/`.heex` path's `:N` or
+# `:N:M` suffix, or `line N` text) is normalised away for the same reason.
+# Other colon-numbers (ports, tuples) stay part of the fingerprint.
 #
 # Findings and entries are compared as multisets: argus can report the same
 # fingerprint at several places in one file, and each baseline entry accepts
 # exactly one occurrence. A third identical finding against two entries is
-# new; two entries against one remaining finding leave one stale.
+# new; two entries against one remaining finding leave one stale, which
+# fails the check.
 
 defmodule ArgusBaseline do
   @keys [:analysis, :file, :title, :at_label, :detail]
@@ -66,8 +72,8 @@ defmodule ArgusBaseline do
     for entry <- stale do
       IO.puts(
         :stderr,
-        "::warning::stale argus baseline entry (no longer reported), remove it: " <>
-          describe(entry)
+        "::error::stale argus baseline entry (no longer reported); remove it from " <>
+          "#{baseline_path}: " <> describe(entry)
       )
     end
 
@@ -83,7 +89,7 @@ defmodule ArgusBaseline do
         "#{length(new)} new, #{length(stale)} stale"
     )
 
-    if new != [], do: System.halt(1)
+    if verdict(new, stale) == :fail, do: System.halt(1)
   end
 
   def main(_) do
@@ -94,6 +100,10 @@ defmodule ArgusBaseline do
 
     System.halt(2)
   end
+
+  # Both unreviewed findings and stale entries fail the check.
+  def verdict([], []), do: :ok
+  def verdict(_new, _stale), do: :fail
 
   # Multiset difference: each baseline entry accepts one occurrence of its
   # fingerprint. Returns {unaccepted finding fingerprints, unused entries}.
@@ -183,6 +193,11 @@ defmodule ArgusBaseline do
       {"a duplicate finding beyond the entries is new",
        compare([fp, fp, fp], [entry, entry]) == {[fp], []}},
       {"an entry beyond the findings is stale", compare([fp], [entry, entry]) == {[], [entry]}},
+      {"matching findings and entries pass", verdict([], []) == :ok},
+      {"an unreviewed finding fails", verdict([fp], []) == :fail},
+      {"a stale entry fails", verdict([], [entry]) == :fail},
+      {"one of two duplicate occurrences disappearing fails",
+       compare([fp], [entry, entry]) |> then(fn {n, st} -> verdict(n, st) end) == :fail},
       {"different detail is a different finding",
        compare([fingerprint(g)], [entry]) == {[fingerprint(g)], [entry]}},
       {"different at_label is a different finding",
@@ -194,6 +209,18 @@ defmodule ArgusBaseline do
        compare([fingerprint(%{f | at_label: "sent at lib/x.ex:7"})], [
          Map.take(%{f | at_label: "sent at lib/x.ex:70"}, @keys)
        ]) == {[], []}},
+      {"file:line:col and \"line N\" text normalise",
+       fingerprint(%{f | detail: "M.f/1 at lib/x.ex:12:3, see line 40"}) ==
+         fingerprint(%{f | detail: "M.f/1 at lib/x.ex:98:1, see line 7"})},
+      {"other path extensions normalise",
+       fingerprint(%{f | detail: "at src/x.erl:5 and include/x.hrl:6 and t.html.heex:7"}) ==
+         fingerprint(%{f | detail: "at src/x.erl:50 and include/x.hrl:60 and t.html.heex:70"})},
+      {"non-location numbers stay significant",
+       fingerprint(%{f | detail: "dials localhost:4000"}) !=
+         fingerprint(%{f | detail: "dials localhost:5000"})},
+      {"a source path keeps its name when normalised",
+       fingerprint(%{f | detail: "at lib/x.ex:12"}) !=
+         fingerprint(%{f | detail: "at lib/y.ex:12"})},
       {"null at_label matches an entry without at_label",
        compare([fingerprint(unlabelled)], [nil_entry]) == {[], []}},
       {"null at_label does not match a labelled entry",
@@ -223,8 +250,13 @@ defmodule ArgusBaseline do
 
   defp fingerprint(f), do: Enum.map(@keys, &normalise(&1, Map.get(f, &1)))
 
+  # Only source locations are normalised: a source file path's `:N` / `:N:M`
+  # suffix (the path itself is kept) and `line N` / `lines N` text. Other
+  # colon-numbers (`localhost:4000`, `{:a, 1}:2`) stay significant.
+  @location ~r/(\.(?:exs?|erl|hrl|h?eex)):\d+(?::\d+)?\b|\blines? \d+\b/
+
   defp normalise(key, text) when key in [:at_label, :detail] and is_binary(text),
-    do: Regex.replace(~r/(:\d+(:\d+)?\b|\blines? \d+)/, text, "")
+    do: Regex.replace(@location, text, "\\1")
 
   defp normalise(_key, value), do: value
 
