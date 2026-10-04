@@ -7,13 +7,14 @@
 #                site is waived at the source with a justification comment.
 # exit: "low"  — fail (non-zero) on any unskipped finding at low severity or
 #                above, so CI genuinely gates on it.
+# private: true — skip the external version-update check on every run.
 [
   exit: "low",
   format: "txt",
   ignore_files: [],
   ignore: [],
   out: nil,
-  private: false,
+  private: true,
   router: nil,
   skip: true,
   threshold: :low,
