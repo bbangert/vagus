@@ -11,10 +11,12 @@ defmodule Vagus.Resubscribe do
   that monitor fires, retries (`down/2` + `retry/3`) until the
   name-registered server is back.
 
-  Only a subscription that once succeeded is retried, and only against a
-  registered name: a server that was never running (a unit test without
-  one, `:events_enabled` off) stays the documented "idle" case, and a dead
-  pid can never come back.
+  Retries only ever target a registered name (a dead pid can never come
+  back). At start-up (`start/4`) the caller says whether the server is
+  *expected*: an expected server that isn't registered yet — it may be
+  mid-restart while the subscriber's own supervisor is still starting it —
+  is retried like a dropped one, while an unexpected one (a unit test
+  without it, `:events_enabled` off) stays the documented "idle" case.
   """
 
   @retry_ms 1_000
@@ -42,6 +44,19 @@ defmodule Vagus.Resubscribe do
 
       nil ->
         nil
+    end
+  end
+
+  @doc """
+  The initial subscription: `subscribe/2`, and when that fails for a server
+  the caller `expected?` to be running, the same `msg` retry `down/2` arms.
+  """
+  @spec start(GenServer.server(), (GenServer.server() -> term()), term(), boolean()) ::
+          reference() | nil
+  def start(server, subscribe_fun, msg, expected?) do
+    case subscribe(server, subscribe_fun) do
+      nil when expected? -> down(server, msg)
+      ref -> ref
     end
   end
 

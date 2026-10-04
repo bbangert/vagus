@@ -100,7 +100,8 @@ defmodule Vagus.Core.Watchdog do
       events: events,
       # Monitor on the events server we subscribed to (nil: not subscribed)
       # — see `Vagus.Resubscribe`.
-      events_ref: maybe_subscribe(events),
+      events_ref:
+        maybe_subscribe(events, Keyword.get(opts, :events_expected, events_expected?(events))),
       token_store: Keyword.get(opts, :token_store, TokenStore),
       rebuild: Keyword.get(opts, :rebuild, fn -> Lifecycle.rebuild() end),
       clock: Keyword.get(opts, :clock, &default_clock/0),
@@ -293,9 +294,14 @@ defmodule Vagus.Core.Watchdog do
 
   ## Defaults
 
-  defp maybe_subscribe(events) do
-    case Resubscribe.subscribe(events, &Vagus.Runtime.Events.subscribe/1) do
-      nil ->
+  defp maybe_subscribe(events, expected?) do
+    case Resubscribe.start(
+           events,
+           &Vagus.Runtime.Events.subscribe/1,
+           :resubscribe_events,
+           expected?
+         ) do
+      nil when not expected? ->
         Logger.debug(
           "Vagus.Core.Watchdog: events server not running; crash-loop detection idle " <>
             "(the API probe half is unaffected)"
@@ -303,10 +309,15 @@ defmodule Vagus.Core.Watchdog do
 
         nil
 
-      ref ->
-        ref
+      ref_or_retrying ->
+        ref_or_retrying
     end
   end
+
+  # Same rule as Vagus.Addon.Watchdog: the app's own events server is
+  # expected whenever `:events_enabled` is on.
+  defp events_expected?(events),
+    do: events == Vagus.Runtime.Events and Application.get_env(:vagus, :events_enabled, true)
 
   # The store can be briefly down (mid-restart) when a die event arrives; a
   # crashed watchdog would drop the whole crash window. Fall back to the

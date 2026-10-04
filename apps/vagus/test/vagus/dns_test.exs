@@ -84,6 +84,34 @@ defmodule Vagus.DNSTest do
     assert r.ancount == 0
   end
 
+  test "a relay that cannot start (task supervisor down) drops the query, not the server" do
+    port = 17_400 + rem(System.unique_integer([:positive]), 2000)
+
+    server =
+      start_supervised!(
+        {DNS,
+         name: nil,
+         ip: {127, 0, 0, 1},
+         port: port,
+         upstream: "127.0.0.1",
+         task_supervisor: :vagus_dns_test_no_such_supervisor},
+        id: :no_task_supervisor
+      )
+
+    {:ok, sock} = :gen_udp.open(0, [:binary, active: false])
+    on_exit(fn -> :gen_udp.close(sock) end)
+    :ok = DNS.register("kept-addon", {172, 30, 33, 9}, server)
+
+    # A miss with an upstream configured goes to the relay path, which fails.
+    query = <<0x3333::16, 0x0100::16, 1::16, 0::16, 0::16, 0::16, 7, "unknown", 0, 1::16, 1::16>>
+    :ok = :gen_udp.send(sock, {127, 0, 0, 1}, port, query)
+    assert {:error, :timeout} = :gen_udp.recv(sock, 0, 200)
+
+    # Same process, dynamic records intact.
+    assert Process.alive?(server)
+    assert ask(sock, port, "kept-addon").addr == [172, 30, 33, 9]
+  end
+
   test "unknown name with no upstream → NXDOMAIN", %{sock: s, port: p} do
     r = ask(s, p, "nonexistent-thing")
     assert r.ancount == 0

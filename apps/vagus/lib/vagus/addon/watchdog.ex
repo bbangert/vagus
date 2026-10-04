@@ -191,7 +191,13 @@ defmodule Vagus.Addon.Watchdog do
       events: events,
       # Monitor on the events server we subscribed to (nil: not subscribed)
       # — see `Vagus.Resubscribe`.
-      events_ref: subscribe_events(events),
+      events_ref:
+        Resubscribe.start(
+          events,
+          &Vagus.Runtime.Events.subscribe/1,
+          :resubscribe_events,
+          Keyword.get(opts, :events_expected, events_expected?(events))
+        ),
       state_server: Keyword.get(opts, :state, State),
       manager: Keyword.get(opts, :manager, Vagus.Addon.Manager),
       running_check: Keyword.get(opts, :running_check, &default_running_check/1),
@@ -487,8 +493,11 @@ defmodule Vagus.Addon.Watchdog do
 
   ## Defaults
 
-  defp subscribe_events(events),
-    do: Resubscribe.subscribe(events, &Vagus.Runtime.Events.subscribe/1)
+  # The app's own events server is expected whenever `:events_enabled` is on
+  # (Vagus.Application), so its absence at start is a restart in progress to
+  # wait out, not the idle case.
+  defp events_expected?(events),
+    do: events == Vagus.Runtime.Events and Application.get_env(:vagus, :events_enabled, true)
 
   # Liveness for the restart sequence. A native "virtual add-on" has no container
   # to inspect (MQ-P3-T4) — a live broker subtree registered under `broker_name`

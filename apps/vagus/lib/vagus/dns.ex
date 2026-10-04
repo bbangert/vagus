@@ -72,6 +72,8 @@ defmodule Vagus.DNS do
       static: static_zone(),
       dynamic: %{},
       inflight: 0,
+      # Where upstream relays run (a test seam for the supervisor-down path).
+      task_supervisor: Keyword.get(opts, :task_supervisor, Vagus.TaskSupervisor),
       upstream:
         parse_upstream(Keyword.get(opts, :upstream, Application.get_env(:vagus, :dns_upstream)))
     }
@@ -189,11 +191,29 @@ defmodule Vagus.DNS do
       end
     end
 
-    case Task.Supervisor.start_child(Vagus.TaskSupervisor, relay) do
-      {:ok, _pid} -> %{state | inflight: state.inflight + 1}
-      # No relay started, so no :forward_done will come: drop the query.
-      {:error, _reason} -> state
+    start_relay(state, relay)
+  end
+
+  # No relay started means no :forward_done will come: drop the query and
+  # leave the in-flight count alone. start_child *exits* (rather than
+  # returning an error) when the task supervisor isn't running — e.g.
+  # mid-restart, as a one_for_one sibling — and that must drop one query, not
+  # crash this server and lose its dynamic records.
+  defp start_relay(state, relay) do
+    case Task.Supervisor.start_child(state.task_supervisor, relay) do
+      {:ok, _pid} ->
+        %{state | inflight: state.inflight + 1}
+
+      {:error, reason} ->
+        relay_not_started(reason, state)
     end
+  catch
+    :exit, reason -> relay_not_started(reason, state)
+  end
+
+  defp relay_not_started(reason, state) do
+    Logger.warning("Vagus.DNS: upstream relay not started (#{inspect(reason)}); query dropped")
+    state
   end
 
   defp reply(nil, _host, _port, _packet), do: :ok

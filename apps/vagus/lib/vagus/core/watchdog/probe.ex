@@ -140,7 +140,15 @@ defmodule Vagus.Core.Watchdog.Probe do
       # Monitor on the store we subscribed to (nil: not subscribed) — a store
       # restart drops its subscriber set, which would silently break the
       # toggle-revive path; see `Vagus.Resubscribe`.
-      token_store_ref: Resubscribe.subscribe(token_store, &TokenStore.subscribe/1),
+      # The app's own store (always started, under Vagus.Core.Supervisor) is
+      # expected: if it is mid-restart right now, keep retrying.
+      token_store_ref:
+        Resubscribe.start(
+          token_store,
+          &TokenStore.subscribe/1,
+          :resubscribe,
+          Keyword.get(opts, :token_store_expected, token_store == TokenStore)
+        ),
       check: Keyword.get(opts, :check, fn -> Health.check() end),
       restart: Keyword.get(opts, :restart, fn -> Lifecycle.restart() end),
       rebuild: Keyword.get(opts, :rebuild, fn -> Lifecycle.rebuild() end),
