@@ -31,6 +31,10 @@ defmodule Vagus.Application do
 
     children =
       [
+        # Fire-and-forget and bounded work that must not be a bare spawn
+        # (crash visibility): `Vagus.DNS`'s upstream relays.
+        {Task.Supervisor, name: Vagus.TaskSupervisor},
+
         # Add-on identity + service registries (M4). Started before the HTTP
         # surface so `Vagus.API.Auth` can resolve add-on tokens and the
         # `/services` endpoints have their store the moment requests arrive.

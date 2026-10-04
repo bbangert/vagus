@@ -419,6 +419,9 @@ jobs:
         working-directory: apps/vagus
         run: mix argus --format json > argus.json
 
+      - name: Self-test the baseline checker
+        run: elixir scripts/argus_baseline.exs --self-test
+
       - name: Check findings against the reviewed baseline
         working-directory: apps/vagus
         run: elixir ../../scripts/argus_baseline.exs argus.json .argus-baseline.exs

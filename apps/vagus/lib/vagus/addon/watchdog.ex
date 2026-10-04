@@ -161,6 +161,7 @@ defmodule Vagus.Addon.Watchdog do
   require Logger
 
   alias Vagus.Addon.State
+  alias Vagus.{BoundedCall, Resubscribe}
   alias Vagus.Runtime.Docker
 
   @default_backoff_base_ms 10_000
@@ -185,10 +186,18 @@ defmodule Vagus.Addon.Watchdog do
   @impl GenServer
   def init(opts) do
     events = Keyword.get(opts, :events, Vagus.Runtime.Events)
-    maybe_subscribe(events)
 
     state = %{
       events: events,
+      # Monitor on the events server we subscribed to (nil: not subscribed)
+      # — see `Vagus.Resubscribe`.
+      events_ref:
+        Resubscribe.start(
+          events,
+          &Vagus.Runtime.Events.subscribe/1,
+          :resubscribe_events,
+          Keyword.get(opts, :events_expected, events_expected?(events))
+        ),
       state_server: Keyword.get(opts, :state, State),
       manager: Keyword.get(opts, :manager, Vagus.Addon.Manager),
       running_check: Keyword.get(opts, :running_check, &default_running_check/1),
@@ -236,6 +245,17 @@ defmodule Vagus.Addon.Watchdog do
         Process.demonitor(ref, [:flush])
         {:noreply, %{state | tasks: Map.delete(tasks, slug)}}
     end
+  end
+
+  # The events server restarted with an empty subscriber set: subscribe to
+  # its replacement once it is back (`Vagus.Resubscribe`).
+  def handle_info({:DOWN, ref, :process, _pid, _reason}, %{events_ref: ref} = state) do
+    {:noreply, %{state | events_ref: Resubscribe.down(state.events, :resubscribe_events)}}
+  end
+
+  def handle_info(:resubscribe_events, state) do
+    ref = Resubscribe.retry(state.events, &Vagus.Runtime.Events.subscribe/1, :resubscribe_events)
+    {:noreply, %{state | events_ref: ref}}
   end
 
   # The monitor half of Task.async/1's reply — arrives right after the
@@ -453,15 +473,7 @@ defmodule Vagus.Addon.Watchdog do
   # to a process that has actually entered the critical section. A process
   # still queued waiting for the lock holds nothing to release — killing it
   # is exactly as safe as it dying any other way while still waiting.
-  defp bounded_manager_call(cfg, fun) do
-    inner = Task.async(fun)
-
-    case Task.yield(inner, cfg.attempt_timeout_ms) || Task.shutdown(inner, :brutal_kill) do
-      {:ok, result} -> result
-      {:exit, reason} -> {:error, {:exit, reason}}
-      nil -> {:error, :attempt_timeout}
-    end
-  end
+  defp bounded_manager_call(cfg, fun), do: BoundedCall.run(fun, cfg.attempt_timeout_ms)
 
   defp backoff_ms(attempt, cfg), do: cfg.backoff_base_ms * round(:math.pow(2, attempt - 1))
 
@@ -481,21 +493,11 @@ defmodule Vagus.Addon.Watchdog do
 
   ## Defaults
 
-  defp maybe_subscribe(events) do
-    if event_server_alive?(events) do
-      try do
-        Vagus.Runtime.Events.subscribe(events)
-      catch
-        :exit, _reason -> :ok
-      end
-    end
-
-    :ok
-  end
-
-  defp event_server_alive?(pid) when is_pid(pid), do: Process.alive?(pid)
-  defp event_server_alive?(name) when is_atom(name), do: is_pid(Process.whereis(name))
-  defp event_server_alive?(_other), do: false
+  # The app's own events server is expected whenever `:events_enabled` is on
+  # (Vagus.Application), so its absence at start is a restart in progress to
+  # wait out, not the idle case.
+  defp events_expected?(events),
+    do: events == Vagus.Runtime.Events and Application.get_env(:vagus, :events_enabled, true)
 
   # Liveness for the restart sequence. A native "virtual add-on" has no container
   # to inspect (MQ-P3-T4) — a live broker subtree registered under `broker_name`

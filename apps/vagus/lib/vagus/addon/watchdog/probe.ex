@@ -146,7 +146,7 @@ defmodule Vagus.Addon.Watchdog.Probe do
   require Logger
 
   alias Vagus.Addon.{ProbeURL, State}
-  alias Vagus.Network
+  alias Vagus.{BoundedCall, Network}
   alias Vagus.Runtime.Docker
 
   @default_interval 120_000
@@ -408,15 +408,7 @@ defmodule Vagus.Addon.Watchdog.Probe do
   # shape any other manager failure already returns here (there's no
   # backoff/retry ladder in this module — see moduledoc — so nothing further
   # distinguishes "timed out" from "returned an error" downstream).
-  defp bounded_call(timeout_ms, fun) do
-    inner = Task.async(fun)
-
-    case Task.yield(inner, timeout_ms) || Task.shutdown(inner, :brutal_kill) do
-      {:ok, result} -> result
-      {:exit, reason} -> {:error, {:exit, reason}}
-      nil -> {:error, :attempt_timeout}
-    end
-  end
+  defp bounded_call(timeout_ms, fun), do: BoundedCall.run(fun, timeout_ms)
 
   ## Default :host_ip_fun
 
@@ -487,7 +479,12 @@ defmodule Vagus.Addon.Watchdog.Probe do
       _ -> :unhealthy
     end
   rescue
-    _ -> :unhealthy
+    # Whatever the probe hit (a malformed host, a Mint edge), the add-on
+    # didn't answer healthily — a miss, not a watchdog crash. Logged so the
+    # cause isn't lost.
+    e ->
+      Logger.debug("Vagus.Addon.Watchdog.Probe: probe raised (#{Exception.message(e)})")
+      :unhealthy
   catch
     _kind, _reason -> :unhealthy
   end

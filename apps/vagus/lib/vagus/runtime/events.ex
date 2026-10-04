@@ -108,7 +108,10 @@ defmodule Vagus.Runtime.Events do
       request_ref: nil,
       buffer: "",
       subscribers: %{},
-      backoff_ms: @initial_backoff_ms
+      backoff_ms: @initial_backoff_ms,
+      # The pending :connect retry timer, if any — kept so a second drop can
+      # never arm a second retry loop beside it.
+      reconnect_timer: nil
     }
 
     {:ok, state, {:continue, :connect}}
@@ -145,7 +148,7 @@ defmodule Vagus.Runtime.Events do
   # when the drop that scheduled it happened (see schedule_reconnect/2).
   def handle_info(:connect, state) do
     Logger.debug("Vagus.Runtime.Events: attempting to (re)connect to #{state.socket}")
-    {:noreply, do_connect(state)}
+    {:noreply, do_connect(%{state | reconnect_timer: nil})}
   end
 
   def handle_info({:DOWN, ref, :process, pid, _reason}, %{subscribers: subs} = state) do
@@ -213,18 +216,29 @@ defmodule Vagus.Runtime.Events do
   # `backoff_ms` back to the floor first (see handle_response/2), so a stream
   # that dies after actually talking to the daemon starts its next retry at
   # 1s rather than continuing to escalate.
-  defp schedule_reconnect(reason, state) do
+  #
+  # One drop is scheduled once: when a retry is already pending (e.g.
+  # handle_responses/2 saw `:done`/`:error` and the stream error that carried
+  # it lands here too), only the connection fields are cleared — no second
+  # warning, no second timer, no extra backoff doubling. Public (`@doc false`)
+  # for its unit test.
+  @doc false
+  @spec schedule_reconnect(term(), map()) :: map()
+  def schedule_reconnect(_reason, %{reconnect_timer: timer} = state) when timer != nil do
+    %{state | conn: nil, request_ref: nil, buffer: ""}
+  end
+
+  def schedule_reconnect(reason, state) do
     delay = state.backoff_ms
 
     Logger.warning(
       "Vagus.Runtime.Events: docker-events stream dropped (#{inspect(reason)}); reconnecting in #{delay}ms"
     )
 
-    Process.send_after(self(), :connect, delay)
-
     %{
       state
-      | conn: nil,
+      | reconnect_timer: Process.send_after(self(), :connect, delay),
+        conn: nil,
         request_ref: nil,
         buffer: "",
         backoff_ms: min(delay * 2, @max_backoff_ms)
