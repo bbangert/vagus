@@ -17,12 +17,21 @@ defmodule Vagus.DNS do
 
   Bind address/port and upstream are configurable (`opts`/`config :vagus, :dns_*`)
   so the server is unit-testable on loopback without `CAP_NET_BIND_SERVICE`.
+
+  The per-add-on records live in memory only, so on (re)start `init/1`
+  continues into a rebuild: every add-on `Vagus.Addon.State.running/1`
+  (`opts[:addon_state]`, default `Vagus.Addon.State`) lists gets the record
+  `Vagus.Addon.Manager.dns_record/3` gives it (a Docker inspect of its
+  container, `opts[:docker]` the inspect options) — so a crash here no
+  longer leaves running add-ons nameless until each restarts. On the normal
+  boot path `State` lists nothing running yet and the rebuild is a no-op.
   """
 
   use GenServer
 
   require Logger
 
+  alias Vagus.Addon.Manager
   alias Vagus.DNS.Message
   alias Vagus.Network
 
@@ -80,7 +89,28 @@ defmodule Vagus.DNS do
         parse_upstream(Keyword.get(opts, :upstream, Application.get_env(:vagus, :dns_upstream)))
     }
 
-    {:ok, try_bind(state)}
+    rebuild = {:rebuild, Keyword.get(opts, :addon_state, Vagus.Addon.State), opts[:docker] || []}
+    {:ok, try_bind(state), {:continue, rebuild}}
+  end
+
+  @impl GenServer
+  def handle_continue({:rebuild, addon_state, docker_opts}, state) do
+    dynamic =
+      for {config, _token} <- running_addons(addon_state),
+          {:ok, host, ip} <-
+            [Manager.dns_record(config, Manager.container_name(config.slug), docker_opts)],
+          into: state.dynamic,
+          do: {String.downcase(host), to_ip(ip)}
+
+    {:noreply, %{state | dynamic: dynamic}}
+  end
+
+  # Best-effort: `State` not running (isolated tests) or exiting mid-call
+  # leaves nothing to rebuild.
+  defp running_addons(addon_state) do
+    if GenServer.whereis(addon_state), do: Vagus.Addon.State.running(addon_state), else: []
+  catch
+    :exit, _reason -> []
   end
 
   defp try_bind(%{ip: ip, port: port} = state) do

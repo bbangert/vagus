@@ -1,7 +1,7 @@
 defmodule Vagus.Addon.RegistryTest do
   use ExUnit.Case, async: true
 
-  alias Vagus.Addon.{Config, Registry}
+  alias Vagus.Addon.{Config, Registry, State}
 
   setup do
     reg = start_supervised!({Registry, name: :"reg_#{System.unique_integer([:positive])}"})
@@ -102,5 +102,54 @@ defmodule Vagus.Addon.RegistryTest do
 
     assert %{hassio_api: false, hassio_role: "default", homeassistant_api: false} =
              Registry.identity_from_config(config)
+  end
+
+  describe "rebuild from State on (re)start" do
+    setup do
+      {:ok, config} =
+        Config.parse(%{
+          "name" => "M",
+          "version" => "1",
+          "slug" => "core_mosquitto",
+          "description" => "d",
+          "arch" => ["amd64"],
+          "image" => "x/y",
+          "services" => ["mqtt:provide"],
+          "hassio_api" => true
+        })
+
+      %{config: config, st: start_supervised!({State, name: nil})}
+    end
+
+    defp start_registry(st) do
+      start_supervised!({Registry, name: nil, state: st}, id: make_ref())
+    end
+
+    test "re-registers every running add-on's current token", %{config: c, st: st} do
+      :ok = State.put(c, :started, server: st, access_token: "tok-running")
+      reg = start_registry(st)
+
+      assert {:ok, identity} = Registry.identity_for_token("tok-running", reg)
+      assert identity == Registry.identity_from_config(c)
+
+      # The rebuilt slug → token index works like a registered one.
+      :ok = Registry.register("tok-next", identity, reg)
+      assert :error = Registry.identity_for_token("tok-running", reg)
+    end
+
+    test "skips stopped add-ons", %{config: c, st: st} do
+      :ok = State.put(c, :started, server: st, access_token: "tok-old")
+      :ok = State.put(c, :stopped, server: st)
+      reg = start_registry(st)
+
+      assert :error = Registry.identity_for_token("tok-old", reg)
+    end
+
+    test "starts empty when State isn't running" do
+      missing = :"no_state_#{System.unique_integer([:positive])}"
+      reg = start_supervised!({Registry, name: nil, state: missing}, id: make_ref())
+
+      assert :error = Registry.identity_for_token("anything", reg)
+    end
   end
 end

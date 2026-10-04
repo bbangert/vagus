@@ -169,4 +169,86 @@ defmodule Vagus.DNSTest do
     assert {:ok, {172, 30, 32, 3}} = DNS.resolve("dns", srv)
     assert :error = DNS.resolve("whatever", srv)
   end
+
+  describe "rebuild from Vagus.Addon.State on (re)start" do
+    alias Vagus.Addon.{Config, State}
+    alias Vagus.Test.FakeEngine
+
+    defp addon(slug, extra) do
+      {:ok, config} =
+        Config.parse(
+          Map.merge(
+            %{
+              "name" => slug,
+              "version" => "1",
+              "slug" => slug,
+              "description" => "d",
+              "arch" => ["amd64"],
+              "image" => "x/y"
+            },
+            extra
+          )
+        )
+
+      config
+    end
+
+    defp start_dns(st, docker) do
+      start_supervised!(
+        {DNS,
+         name: nil,
+         ip: {127, 0, 0, 1},
+         port: 15_300 + rem(System.unique_integer([:positive]), 2000),
+         upstream: nil,
+         addon_state: st,
+         docker: docker},
+        id: make_ref()
+      )
+    end
+
+    test "re-registers running add-ons: bridge IP, native anchor, host network skipped" do
+      st = start_supervised!({State, name: nil}, id: :addon_state)
+
+      for {config, tok} <- [
+            {addon("bridged_one", %{}), "t1"},
+            {addon("native_one", %{"backend" => "native"}), "t2"},
+            {addon("host_one", %{"host_network" => true}), "t3"}
+          ] do
+        :ok = State.put(config, :started, server: st, access_token: tok)
+      end
+
+      # A stopped add-on is never inspected.
+      :ok = State.put(addon("stopped_one", %{}), :stopped, server: st)
+
+      engine =
+        FakeEngine.start([
+          {200,
+           %{"NetworkSettings" => %{"Networks" => %{"hassio" => %{"IPAddress" => "172.30.33.7"}}}}}
+        ])
+
+      on_exit(fn -> FakeEngine.stop(engine) end)
+
+      srv = start_dns(st, socket: engine.socket)
+
+      assert {:ok, {172, 30, 33, 7}} = DNS.resolve("bridged-one", srv)
+      assert {:ok, {172, 30, 32, 2}} = DNS.resolve("native-one", srv)
+      assert :error = DNS.resolve("host-one", srv)
+      assert :error = DNS.resolve("stopped-one", srv)
+
+      assert [%{method: :get, path: "/containers/addon_bridged_one/json"}] =
+               FakeEngine.requests(engine)
+    end
+
+    test "a failed inspect leaves just that add-on out" do
+      st = start_supervised!({State, name: nil}, id: :addon_state)
+      :ok = State.put(addon("bridged_two", %{}), :started, server: st, access_token: "t")
+
+      engine = FakeEngine.start([{404, %{"message" => "no such container"}}])
+      on_exit(fn -> FakeEngine.stop(engine) end)
+
+      srv = start_dns(st, socket: engine.socket)
+      assert :error = DNS.resolve("bridged-two", srv)
+      assert {:ok, {172, 30, 32, 3}} = DNS.resolve("dns", srv)
+    end
+  end
 end

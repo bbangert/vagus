@@ -202,6 +202,54 @@ defmodule Vagus.Addon.StateTest do
     assert State.list(s) == []
   end
 
+  describe "running/1 (access tokens, memory only)" do
+    test "lists a :started add-on with the token its start recorded", %{config: c, s: s} do
+      :ok = State.put(c, :started, server: s, access_token: "tok-1")
+      assert [{^c, "tok-1"}] = State.running(s)
+
+      # A later :started put without a token (no restart) keeps it; a new
+      # start's token replaces it.
+      :ok = State.put(c, :started, server: s)
+      assert [{^c, "tok-1"}] = State.running(s)
+      :ok = State.put(c, :started, server: s, access_token: "tok-2")
+      assert [{^c, "tok-2"}] = State.running(s)
+    end
+
+    test "a :stopped put or delete drops the token", %{config: c, s: s} do
+      :ok = State.put(c, :started, server: s, access_token: "tok")
+      :ok = State.put(c, :stopped, server: s)
+      assert State.running(s) == []
+
+      # Started again without a token: nothing to rebuild from.
+      :ok = State.put(c, :started, server: s)
+      assert State.running(s) == []
+
+      :ok = State.put(c, :started, server: s, access_token: "tok")
+      :ok = State.delete(c.slug, s)
+      assert State.running(s) == []
+    end
+
+    test "a :started entry never started with a token isn't running", %{config: c, s: s} do
+      :ok = State.put(c, :started, server: s)
+      assert State.running(s) == []
+    end
+
+    test "the token is never persisted, so a reload lists nothing running", %{config: c} do
+      dir = Path.join(System.tmp_dir!(), "vagus-state-tok-#{System.unique_integer([:positive])}")
+      on_exit(fn -> File.rm_rf(dir) end)
+      path = Path.join(dir, "addons.json")
+
+      first = start_supervised!({State, name: nil, persist_path: path}, id: :first)
+      :ok = State.put(c, :started, server: first, access_token: "secret-token")
+      refute File.read!(path) =~ "secret-token"
+      :ok = stop_supervised!(:first)
+
+      revived = start_supervised!({State, name: nil, persist_path: path}, id: :revived)
+      assert {:ok, %{state: :started}} = State.get(c.slug, revived)
+      assert State.running(revived) == []
+    end
+  end
+
   describe "persistence (M4-P8-T1)" do
     setup do
       dir = Path.join(System.tmp_dir!(), "vagus-state-#{System.unique_integer([:positive])}")

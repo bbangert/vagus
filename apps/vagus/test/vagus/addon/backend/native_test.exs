@@ -240,7 +240,7 @@ defmodule Vagus.Addon.Backend.NativeTest do
       config = mqtt_config()
       assert :ok = Manager.install(config, data_root: dr)
       :ok = State.put(config, :stopped)
-      assert {:ok, _} = Manager.start(config, data_root: dr)
+      assert {:ok, %{access_token: token}} = Manager.start(config, data_root: dr)
 
       on_exit(fn ->
         Manager.uninstall(@slug, data_root: dr)
@@ -250,7 +250,7 @@ defmodule Vagus.Addon.Backend.NativeTest do
         restore_env(:addon_data_root, prev_root)
       end)
 
-      %{port: port, dr: dr}
+      %{port: port, dr: dr, token: token}
     end
 
     test "stats are process-derived while running and zero when stopped", %{dr: dr} do
@@ -271,6 +271,24 @@ defmodule Vagus.Addon.Backend.NativeTest do
     end
 
     test "DNS advertises the broker at the supervisor anchor IP" do
+      assert {:ok, {172, 30, 32, 2}} = Vagus.DNS.resolve("core-mqtt", Vagus.DNS)
+    end
+
+    # Both hold the start's registrations in memory only; a restart rebuilds
+    # them from `State.running/1` rather than waiting for the add-on's next
+    # start.
+    test "a Registry or DNS restart keeps the running add-on's token and name", %{
+      token: token
+    } do
+      for name <- [Vagus.Addon.Registry, Vagus.DNS] do
+        pid = Process.whereis(name)
+        ref = Process.monitor(pid)
+        Process.exit(pid, :kill)
+        assert_receive {:DOWN, ^ref, :process, ^pid, :killed}
+        eventually(fn -> Process.whereis(name) end, &(is_pid(&1) and &1 != pid))
+      end
+
+      assert {:ok, %{slug: @slug}} = Vagus.Addon.Registry.identity_for_token(token)
       assert {:ok, {172, 30, 32, 2}} = Vagus.DNS.resolve("core-mqtt", Vagus.DNS)
     end
 

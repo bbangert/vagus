@@ -36,6 +36,17 @@ defmodule Vagus.Addon.Registry do
   add-on that never declared it must resolve to `false` (closed), never `nil`
   (which `Map.get/3`'s default already guarantees for an identity built before
   this field existed).
+
+  ## Restarts
+
+  Registrations live in memory only, so on (re)start `init/1` continues
+  into a rebuild from `Vagus.Addon.State.running/1` (`opts[:state]`, default
+  `Vagus.Addon.State`), which holds every running add-on's config and
+  current token: a crash here no longer leaves running add-ons
+  unauthenticated until each is restarted. On the normal boot path that is
+  a no-op — `State` starts after this server, and holds no tokens until an
+  add-on starts. `Vagus.Addon.Manager.start/2` records the token in `State`
+  before registering it here, so a restart racing a start can't lose it.
   """
 
   use GenServer
@@ -106,23 +117,32 @@ defmodule Vagus.Addon.Registry do
   ## GenServer
 
   @impl GenServer
-  def init(_opts), do: {:ok, %{by_token: %{}, token_by_slug: %{}}}
+  def init(opts) do
+    state_server = Keyword.get(opts, :state, Vagus.Addon.State)
+    {:ok, %{by_token: %{}, token_by_slug: %{}}, {:continue, {:rebuild, state_server}}}
+  end
 
   @impl GenServer
-  def handle_call({:register, token, %{slug: slug} = identity}, _from, state) do
-    # Drop any previous token for this slug so a restart's fresh token replaces it.
-    by_token =
-      case Map.get(state.token_by_slug, slug) do
-        nil -> state.by_token
-        old -> Map.delete(state.by_token, old)
-      end
+  def handle_continue({:rebuild, state_server}, state) do
+    state =
+      Enum.reduce(running(state_server), state, fn {config, token}, acc ->
+        put_token(acc, token, identity_from_config(config))
+      end)
 
-    {:reply, :ok,
-     %{
-       state
-       | by_token: Map.put(by_token, token, identity),
-         token_by_slug: Map.put(state.token_by_slug, slug, token)
-     }}
+    {:noreply, state}
+  end
+
+  # Best-effort: `State` not running (boot, isolated tests) or exiting
+  # mid-call leaves nothing to rebuild.
+  defp running(state_server) do
+    if GenServer.whereis(state_server), do: Vagus.Addon.State.running(state_server), else: []
+  catch
+    :exit, _reason -> []
+  end
+
+  @impl GenServer
+  def handle_call({:register, token, identity}, _from, state) do
+    {:reply, :ok, put_token(state, token, identity)}
   end
 
   def handle_call({:unregister_slug, slug}, _from, state) do
@@ -138,5 +158,20 @@ defmodule Vagus.Addon.Registry do
 
   def handle_call({:lookup, token}, _from, state) do
     {:reply, Map.fetch(state.by_token, token), state}
+  end
+
+  defp put_token(state, token, %{slug: slug} = identity) do
+    # Drop any previous token for this slug so a restart's fresh token replaces it.
+    by_token =
+      case Map.get(state.token_by_slug, slug) do
+        nil -> state.by_token
+        old -> Map.delete(state.by_token, old)
+      end
+
+    %{
+      state
+      | by_token: Map.put(by_token, token, identity),
+        token_by_slug: Map.put(state.token_by_slug, slug, token)
+    }
   end
 end

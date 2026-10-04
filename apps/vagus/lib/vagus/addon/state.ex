@@ -122,6 +122,21 @@ defmodule Vagus.Addon.State do
   (atomic against a mid-write power loss) and best-effort: a write failure
   is logged and the lifecycle call still succeeds, since a flash write
   failure is not a reason to fail an add-on start/stop.
+
+  ## Running add-ons' access tokens (memory only)
+
+  `Vagus.Addon.Registry` (token → identity) and `Vagus.DNS` (add-on
+  hostname → IP) hold what `Vagus.Addon.Manager.start/2` registers in
+  memory only, so either restarting would drop it for every running
+  add-on. `running/1` is what they rebuild from: each `:started` add-on's
+  config plus the per-start `access_token` the start recorded here
+  (`put/3`'s `opts[:access_token]`).
+
+  The token is kept in this process's memory and never written to the
+  state file: it's reissued on every start, and an entry reloaded from disk
+  at boot belongs to a container the previous boot ran, so `running/1` is
+  empty after a boot until each add-on starts again — the rebuild is a
+  no-op on the normal boot path. A `:stopped` put or a `delete/2` drops it.
   """
 
   use GenServer
@@ -156,13 +171,16 @@ defmodule Vagus.Addon.State do
   user options already stored for this slug are preserved (a start/stop
   transition must not wipe out previously-configured options) — a genuinely
   new install starts with no entry, so it correctly defaults to `%{}`.
+  `opts[:access_token]` records a `:started` add-on's per-start token for
+  `running/1` (memory only, see the moduledoc); a `:stopped` put drops it.
   `opts[:server]` overrides the target GenServer (default `#{inspect(__MODULE__)}`).
   """
   @spec put(Config.t(), :started | :stopped, keyword()) :: :ok
   def put(%Config{} = config, state \\ :started, opts \\ []) do
     server = Keyword.get(opts, :server, __MODULE__)
     user_options = Keyword.get(opts, :user_options)
-    GenServer.call(server, {:put, config, state, user_options})
+    access_token = Keyword.get(opts, :access_token)
+    GenServer.call(server, {:put, config, state, user_options, access_token})
   end
 
   @doc "Returns the `%{config, state, user_options}` entry for `slug`, or `:error` if unknown."
@@ -227,18 +245,28 @@ defmodule Vagus.Addon.State do
     GenServer.call(server, :list)
   end
 
+  @doc """
+  Lists `{config, access_token}` for every `:started` add-on whose start
+  recorded a token in this process's lifetime — what `Vagus.Addon.Registry`
+  and `Vagus.DNS` rebuild from after a restart (see the moduledoc).
+  """
+  @spec running(GenServer.server()) :: [{Config.t(), String.t()}]
+  def running(server \\ __MODULE__) do
+    GenServer.call(server, :running)
+  end
+
   ## GenServer
 
   @impl GenServer
   def init(opts) do
     path = persist_path(opts)
     entries = if path, do: load_entries(path), else: %{}
-    {:ok, %{path: path, entries: entries}}
+    {:ok, %{path: path, entries: entries, tokens: %{}}}
   end
 
   @impl GenServer
   def handle_call(
-        {:put, %Config{slug: slug} = config, state, user_options},
+        {:put, %Config{slug: slug} = config, state, user_options, access_token},
         _from,
         %{
           entries: entries
@@ -252,7 +280,7 @@ defmodule Vagus.Addon.State do
 
     entries = Map.put(entries, slug, entry)
     persist(s.path, entries)
-    {:reply, :ok, %{s | entries: entries}}
+    {:reply, :ok, %{s | entries: entries, tokens: put_token(s.tokens, slug, state, access_token)}}
   end
 
   def handle_call({:get, slug}, _from, %{entries: entries} = s) do
@@ -286,12 +314,27 @@ defmodule Vagus.Addon.State do
   def handle_call({:delete, slug}, _from, %{entries: entries} = s) do
     entries = Map.delete(entries, slug)
     persist(s.path, entries)
-    {:reply, :ok, %{s | entries: entries}}
+    {:reply, :ok, %{s | entries: entries, tokens: Map.delete(s.tokens, slug)}}
   end
 
   def handle_call(:list, _from, %{entries: entries} = s) do
     {:reply, Map.values(entries), s}
   end
+
+  def handle_call(:running, _from, %{entries: entries, tokens: tokens} = s) do
+    running =
+      for {slug, token} <- tokens,
+          %{state: :started, config: config} <- [Map.get(entries, slug)],
+          do: {config, token}
+
+    {:reply, running, s}
+  end
+
+  # A `:started` put without a token (none of today's callers make one) keeps
+  # the token of the start still running.
+  defp put_token(tokens, slug, :stopped, _token), do: Map.delete(tokens, slug)
+  defp put_token(tokens, _slug, :started, nil), do: tokens
+  defp put_token(tokens, slug, :started, token), do: Map.put(tokens, slug, token)
 
   defp existing_user_options(entries, slug) do
     case Map.get(entries, slug) do
