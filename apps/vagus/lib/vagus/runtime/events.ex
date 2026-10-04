@@ -108,7 +108,10 @@ defmodule Vagus.Runtime.Events do
       request_ref: nil,
       buffer: "",
       subscribers: %{},
-      backoff_ms: @initial_backoff_ms
+      backoff_ms: @initial_backoff_ms,
+      # The pending :connect retry timer, if any — kept so a second drop can
+      # never arm a second retry loop beside it.
+      reconnect_timer: nil
     }
 
     {:ok, state, {:continue, :connect}}
@@ -145,7 +148,7 @@ defmodule Vagus.Runtime.Events do
   # when the drop that scheduled it happened (see schedule_reconnect/2).
   def handle_info(:connect, state) do
     Logger.debug("Vagus.Runtime.Events: attempting to (re)connect to #{state.socket}")
-    {:noreply, do_connect(state)}
+    {:noreply, do_connect(%{state | reconnect_timer: nil})}
   end
 
   def handle_info({:DOWN, ref, :process, pid, _reason}, %{subscribers: subs} = state) do
@@ -220,11 +223,13 @@ defmodule Vagus.Runtime.Events do
       "Vagus.Runtime.Events: docker-events stream dropped (#{inspect(reason)}); reconnecting in #{delay}ms"
     )
 
-    Process.send_after(self(), :connect, delay)
+    # A retry already pending stays the only one.
+    timer = state.reconnect_timer || Process.send_after(self(), :connect, delay)
 
     %{
       state
-      | conn: nil,
+      | reconnect_timer: timer,
+        conn: nil,
         request_ref: nil,
         buffer: "",
         backoff_ms: min(delay * 2, @max_backoff_ms)
