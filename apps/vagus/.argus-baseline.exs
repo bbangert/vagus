@@ -6,6 +6,7 @@
     analysis: "startup",
     file: "lib/vagus/addon/boot_starter.ex",
     title: "handle_continue races a later sibling",
+    at_label: "the racing call originates here",
     detail:
       "Vagus.Addon.BootStarter sync-calls Vagus.DNS, a later sibling, from handle_continue under Vagus.Application. The continue runs concurrently with the supervisor's start sequence, so whether Vagus.DNS is alive when the call lands is a boot-time race — it works on the fast machine and fails in CI.",
     reason:
@@ -15,6 +16,7 @@
     analysis: "startup",
     file: "lib/vagus/addon/boot_starter.ex",
     title: "handle_continue races a later sibling",
+    at_label: "the racing call originates here",
     detail:
       "Vagus.Addon.BootStarter sync-calls Vagus.Ingress, a later sibling, from handle_continue under Vagus.Application. The continue runs concurrently with the supervisor's start sequence, so whether Vagus.Ingress is alive when the call lands is a boot-time race — it works on the fast machine and fails in CI.",
     reason:
@@ -24,6 +26,7 @@
     analysis: "shutdown",
     file: "lib/vagus/api/core_proxy/ws_bridge.ex",
     title: "terminate/2 does work a supervisor shutdown will skip",
+    at_label: "a supervisor shutdown skips this",
     detail:
       "Vagus.API.CoreProxy.WSBridge.Upstream does not trap exits, so a GenServer shutdown from its supervisor kills it outright and terminate/2 never runs. Vagus.API.CoreProxy.WSBridge.Upstream.terminate/2 calls Mint.HTTP.close/1, which the effect model cannot classify — so this cannot say WHAT is skipped, only that terminate/2 does more than log and none of it will happen on the normal stop path. If that call releases a lease, closes a session or flushes a buffer, it is silently not happening in production.",
     reason:
@@ -33,6 +36,7 @@
     analysis: "coupling",
     file: "lib/vagus/application.ex",
     title: "Coupled children under one_for_one",
+    at_label: "supervision tree defined here",
     detail:
       "Vagus.Addon.BootStarter registers with Vagus.Addon.Registry when it starts, and Vagus.Addon.Registry keeps it in its state. Both are children of the one_for_one supervisor Vagus.Application, which restarts either alone. When Vagus.Addon.Registry restarts, its init/1 starts it afresh without what Vagus.Addon.BootStarter put there, and Vagus.Addon.BootStarter, which is not restarted with it, never registers again. When Vagus.Addon.BootStarter restarts, it registers a second time beside what its old process left.",
     reason:
@@ -42,6 +46,7 @@
     analysis: "coupling",
     file: "lib/vagus/application.ex",
     title: "Coupled children under one_for_one",
+    at_label: "supervision tree defined here",
     detail:
       "Vagus.Addon.BootStarter registers with Vagus.Addon.State when it starts, and Vagus.Addon.State keeps it in its state. Both are children of the one_for_one supervisor Vagus.Application, which restarts either alone. When Vagus.Addon.State restarts, its init/1 starts it afresh without what Vagus.Addon.BootStarter put there, and Vagus.Addon.BootStarter, which is not restarted with it, never registers again. When Vagus.Addon.BootStarter restarts, it registers a second time beside what its old process left.",
     reason:
@@ -51,6 +56,7 @@
     analysis: "coupling",
     file: "lib/vagus/application.ex",
     title: "Coupled children under one_for_one",
+    at_label: "supervision tree defined here",
     detail:
       "Vagus.Addon.BootStarter registers with Vagus.DNS when it starts, and Vagus.DNS keeps it in its state. Both are children of the one_for_one supervisor Vagus.Application, which restarts either alone. When Vagus.DNS restarts, its init/1 starts it afresh without what Vagus.Addon.BootStarter put there, and Vagus.Addon.BootStarter, which is not restarted with it, never registers again. When Vagus.Addon.BootStarter restarts, it registers a second time beside what its old process left.",
     reason:
@@ -60,6 +66,7 @@
     analysis: "coupling",
     file: "lib/vagus/application.ex",
     title: "Coupled children under one_for_one",
+    at_label: "supervision tree defined here",
     detail:
       "Vagus.Addon.DefaultProvider registers with Vagus.Addon.Registry when it starts, and Vagus.Addon.Registry keeps it in its state. Both are children of the one_for_one supervisor Vagus.Application, which restarts either alone. When Vagus.Addon.Registry restarts, its init/1 starts it afresh without what Vagus.Addon.DefaultProvider put there, and Vagus.Addon.DefaultProvider, which is not restarted with it, never registers again. When Vagus.Addon.DefaultProvider restarts, it registers a second time beside what its old process left.",
     reason:
@@ -69,6 +76,7 @@
     analysis: "coupling",
     file: "lib/vagus/application.ex",
     title: "Coupled children under one_for_one",
+    at_label: "supervision tree defined here",
     detail:
       "Vagus.Addon.DefaultProvider registers with Vagus.Addon.State when it starts, and Vagus.Addon.State keeps it in its state. Both are children of the one_for_one supervisor Vagus.Application, which restarts either alone. When Vagus.Addon.State restarts, its init/1 starts it afresh without what Vagus.Addon.DefaultProvider put there, and Vagus.Addon.DefaultProvider, which is not restarted with it, never registers again. When Vagus.Addon.DefaultProvider restarts, it registers a second time beside what its old process left.",
     reason:
@@ -78,6 +86,7 @@
     analysis: "coupling",
     file: "lib/vagus/application.ex",
     title: "Coupled children under one_for_one",
+    at_label: "supervision tree defined here",
     detail:
       "Vagus.Addon.DefaultProvider registers with Vagus.DNS when it starts, and Vagus.DNS keeps it in its state. Both are children of the one_for_one supervisor Vagus.Application, which restarts either alone. When Vagus.DNS restarts, its init/1 starts it afresh without what Vagus.Addon.DefaultProvider put there, and Vagus.Addon.DefaultProvider, which is not restarted with it, never registers again. When Vagus.Addon.DefaultProvider restarts, it registers a second time beside what its old process left.",
     reason:
@@ -87,6 +96,7 @@
     analysis: "coupling",
     file: "lib/vagus/application.ex",
     title: "Coupled children under one_for_one",
+    at_label: "supervision tree defined here",
     detail:
       "Vagus.Addon.Watchdog registers with Vagus.Runtime.Events when it starts, and Vagus.Runtime.Events keeps a monitor or link for it. Both are children of the one_for_one supervisor Vagus.Application, which restarts either alone. When Vagus.Runtime.Events restarts, its init/1 starts it afresh without what Vagus.Addon.Watchdog put there, and Vagus.Addon.Watchdog, which is not restarted with it, never registers again. When Vagus.Addon.Watchdog restarts, it registers a second time beside what its old process left.",
     reason:
@@ -96,6 +106,7 @@
     analysis: "coupling",
     file: "lib/vagus/application.ex",
     title: "Coupled children under one_for_one",
+    at_label: "supervision tree defined here",
     detail:
       "Vagus.Core.Boot registers with Vagus.Core.HttpConfig when it starts, and Vagus.Core.HttpConfig keeps it in its state. Both are children of the one_for_one supervisor Vagus.Application, which restarts either alone. When Vagus.Core.HttpConfig restarts, its init/1 starts it afresh without what Vagus.Core.Boot put there, and Vagus.Core.Boot, which is not restarted with it, never registers again. When Vagus.Core.Boot restarts, it registers a second time beside what its old process left.",
     reason:
@@ -105,6 +116,7 @@
     analysis: "coupling",
     file: "lib/vagus/application.ex",
     title: "Coupled children under one_for_one",
+    at_label: "supervision tree defined here",
     detail:
       "Vagus.Core.Watchdog registers with Vagus.Runtime.Events when it starts, and Vagus.Runtime.Events keeps a monitor or link for it. Both are children of the one_for_one supervisor Vagus.Application, which restarts either alone. When Vagus.Runtime.Events restarts, its init/1 starts it afresh without what Vagus.Core.Watchdog put there, and Vagus.Core.Watchdog, which is not restarted with it, never registers again. When Vagus.Core.Watchdog restarts, it registers a second time beside what its old process left.",
     reason:
@@ -114,6 +126,7 @@
     analysis: "coupling",
     file: "lib/vagus/application.ex",
     title: "Coupled children under one_for_one",
+    at_label: "supervision tree defined here",
     detail:
       "Vagus.Core.Watchdog.Probe registers with Vagus.Core.TokenStore when it starts, and Vagus.Core.TokenStore keeps it in its state. Both are children of the one_for_one supervisor Vagus.Application, which restarts either alone. When Vagus.Core.TokenStore restarts, its init/1 starts it afresh without what Vagus.Core.Watchdog.Probe put there, and Vagus.Core.Watchdog.Probe, which is not restarted with it, never registers again. When Vagus.Core.Watchdog.Probe restarts, it registers a second time beside what its old process left.",
     reason:
@@ -123,6 +136,7 @@
     analysis: "coupling",
     file: "lib/vagus/application.ex",
     title: "Coupled children under one_for_one",
+    at_label: "supervision tree defined here",
     detail:
       "Vagus.OS.Updater.Checker registers with Vagus.Core.EventPusher when it starts, and Vagus.Core.EventPusher keeps it in its state. Both are children of the one_for_one supervisor Vagus.Application, which restarts either alone. When Vagus.Core.EventPusher restarts, its init/1 starts it afresh without what Vagus.OS.Updater.Checker put there, and Vagus.OS.Updater.Checker, which is not restarted with it, never registers again. When Vagus.OS.Updater.Checker restarts, it registers a second time beside what its old process left.",
     reason:
@@ -132,6 +146,7 @@
     analysis: "coupling",
     file: "lib/vagus/application.ex",
     title: "Coupled children under one_for_one",
+    at_label: "supervision tree defined here",
     detail:
       "Vagus.Provisioner registers with Vagus.Core.HttpConfig when it starts, and Vagus.Core.HttpConfig keeps it in its state. Both are children of the one_for_one supervisor Vagus.Application, which restarts either alone. When Vagus.Core.HttpConfig restarts, its init/1 starts it afresh without what Vagus.Provisioner put there, and Vagus.Provisioner, which is not restarted with it, never registers again. When Vagus.Provisioner restarts, it registers a second time beside what its old process left.",
     reason:
@@ -141,6 +156,7 @@
     analysis: "coupling",
     file: "lib/vagus/application.ex",
     title: "Coupled children under one_for_one",
+    at_label: "supervision tree defined here",
     detail:
       "Vagus.Provisioner registers with Vagus.Core.Versions when it starts, and Vagus.Core.Versions keeps it in its state. Both are children of the one_for_one supervisor Vagus.Application, which restarts either alone. When Vagus.Core.Versions restarts, its init/1 starts it afresh without what Vagus.Provisioner put there, and Vagus.Provisioner, which is not restarted with it, never registers again. When Vagus.Provisioner restarts, it registers a second time beside what its old process left.",
     reason:
@@ -150,6 +166,7 @@
     analysis: "coupling",
     file: "lib/vagus/application.ex",
     title: "Coupled children under one_for_one",
+    at_label: "supervision tree defined here",
     detail:
       "Vagus.Provisioner registers with Vagus.Jobs when it starts, and Vagus.Jobs keeps it in its state. Both are children of the one_for_one supervisor Vagus.Application, which restarts either alone. When Vagus.Jobs restarts, its init/1 starts it afresh without what Vagus.Provisioner put there, and Vagus.Provisioner, which is not restarted with it, never registers again. When Vagus.Provisioner restarts, it registers a second time beside what its old process left.",
     reason:
@@ -159,6 +176,7 @@
     analysis: "mailbox",
     file: "lib/vagus/bounded_call.ex",
     title: "Task.yield on a linked task cannot see it crash",
+    at_label: "linked task started here",
     detail:
       "Vagus.BoundedCall.run/2 starts a task with Task.async (or Task.Supervisor.async), which links it to the caller, and collects it with Task.yield. yield's {:exit, reason} result is documented for a crashed task, but the link delivers the crash to this process first: unless it traps exits, the branch handling a failed task never runs — the caller is already down.",
     reason:
@@ -168,6 +186,7 @@
     analysis: "shutdown",
     file: "lib/vagus/core/event_pusher/socket_connection.ex",
     title: "terminate/2 does work a supervisor shutdown will skip",
+    at_label: "a supervisor shutdown skips this",
     detail:
       "Vagus.Core.EventPusher.SocketConnection does not trap exits, so a GenServer shutdown from its supervisor kills it outright and terminate/2 never runs. Vagus.Core.EventPusher.SocketConnection.terminate/2 calls Mint.HTTP.close/1, which the effect model cannot classify — so this cannot say WHAT is skipped, only that terminate/2 does more than log and none of it will happen on the normal stop path. If that call releases a lease, closes a session or flushes a buffer, it is silently not happening in production.",
     reason:
@@ -177,6 +196,7 @@
     analysis: "startup",
     file: "lib/vagus/ingress.ex",
     title: "init/1 connects with no reconnect path",
+    at_label: "connects from here",
     detail:
       "Vagus.Ingress's init/1 reaches :gen_tcp.connect/4, and nothing in the module arms a timer or continues after init to try again. When the dependency is not there yet, init fails, the supervisor restarts the child at once, and after max_restarts the tree — usually the application — goes down at boot.",
     reason:
@@ -186,6 +206,7 @@
     analysis: "shutdown",
     file: "lib/vagus/ingress/ws_bridge.ex",
     title: "terminate/2 does work a supervisor shutdown will skip",
+    at_label: "a supervisor shutdown skips this",
     detail:
       "Vagus.Ingress.WSBridge.Upstream does not trap exits, so a GenServer shutdown from its supervisor kills it outright and terminate/2 never runs. Vagus.Ingress.WSBridge.Upstream.terminate/2 calls Mint.HTTP.close/1, which the effect model cannot classify — so this cannot say WHAT is skipped, only that terminate/2 does more than log and none of it will happen on the normal stop path. If that call releases a lease, closes a session or flushes a buffer, it is silently not happening in production.",
     reason:
@@ -195,6 +216,7 @@
     analysis: "startup",
     file: "lib/vagus/ssh_access.ex",
     title: "Distributed operation in init/1",
+    at_label: "remote operation during init/1",
     detail:
       "Vagus.SSHAccess.init/1 performs open_file during init, while the supervisor's start sequence waits. A slow or partitioned peer stalls local startup.",
     reason:
@@ -204,6 +226,7 @@
     analysis: "startup",
     file: "lib/vagus/api/core_proxy/ws_bridge.ex",
     title: "init/1 blocks on a synchronous call",
+    at_label: "this init blocks the start sequence",
     detail:
       "Vagus.API.CoreProxy.WSBridge.init/1 makes a synchronous call to Vagus.Core.Versions (directly or transitively) on every init. init runs inside the supervisor's start sequence, so the tree's startup stalls for as long as Vagus.Core.Versions takes to answer. Argus could not establish where Vagus.Core.Versions runs relative to this init — its child spec is built at runtime — so this is a note, not a diagnosis; a proven startup deadlock is reported separately as an error.",
     reason:
@@ -213,6 +236,7 @@
     analysis: "startup",
     file: "lib/vagus/api/listener.ex",
     title: "init/1 makes a synchronous supervisor call",
+    at_label: "this call blocks init until the supervisor answers",
     detail:
       "Vagus.API.Listener.init/1 reaches DynamicSupervisor.start_child on a supervisor chosen at runtime. Every supervisor management call is a GenServer.call into the supervisor; start_child in particular does not return until the new child's init/1 has, so those inits now run inside this one, on the tree's startup path. A child that calls back into Vagus.API.Listener, or into anything not yet started, deadlocks the boot; terminate_child waits for the whole shutdown of the child.",
     reason:
@@ -222,6 +246,7 @@
     analysis: "startup",
     file: "lib/vagus/backup.ex",
     title: "init/1 waits on another process with no timeout",
+    at_label: "waits until the other process answers or exits",
     detail:
       "Vagus.Backup.bounded/1 has a `receive` with no `after`, and init/1 reaches it in its own process. The wait takes the exit of the process it waits on, so it ends if that process dies; while it lives and does not answer, the process is not started: its supervisor's start, and whoever called start_child, wait with it.",
     reason:
@@ -231,6 +256,7 @@
     analysis: "mailbox",
     file: "lib/vagus/bounded_call.ex",
     title: "Task.async in library code links to an unknown caller",
+    at_label: "linked task started in library code",
     detail:
       "Vagus.BoundedCall.run/2 is a plain function, not a process callback, so the task it starts with Task.async is linked to whichever process called it. A caller that traps exits then receives the task's exit as an {:EXIT, pid, :normal} message that Task.await never consumes, and a crashing task takes the caller down with it.",
     reason:
@@ -240,6 +266,7 @@
     analysis: "failure",
     file: "lib/vagus/core/event_pusher.ex",
     title: "Process.exit inside a GenServer callback",
+    at_label: "sends an exit signal from a callback",
     detail:
       "Vagus.Core.EventPusher.handle_info/2 sends an exit signal to a process it holds as a value from inside a callback. This is often deliberate — process-manager handoff, registry name-conflict resolution, an ownership watcher killing dependents — but killing a process imperatively bypasses the supervisor that started it, so it is worth confirming the target is meant to be torn down this way rather than stopped through its own protocol.",
     reason:
