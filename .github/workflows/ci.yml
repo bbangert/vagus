@@ -406,7 +406,19 @@ jobs:
       - name: Fetch deps
         run: mix deps.get
 
-      # Whole-program OTP/supervision analysis over the compiled beams.
+      # Whole-program OTP/supervision analysis over the compiled beams. No
+      # file-level ignores: every finding must be fixed or carry a reviewed
+      # entry in apps/vagus/.argus-baseline.exs (see
+      # scripts/argus_baseline.exs). Compile first so build output never
+      # mixes into the JSON report.
+      - name: Compile
+        working-directory: apps/vagus
+        run: mix compile
+
       - name: Argus
         working-directory: apps/vagus
-        run: mix argus --fail-above 0
+        run: mix argus --format json > argus.json
+
+      - name: Check findings against the reviewed baseline
+        working-directory: apps/vagus
+        run: elixir ../../scripts/argus_baseline.exs argus.json .argus-baseline.exs
