@@ -362,12 +362,11 @@ defmodule Vagus.Runtime.Docker do
         # try/after so the socket is always closed — including when a *raise*
         # (not just an error tuple) escapes the request/recv path.
         try do
-          with {:ok, conn, ref} <- Mint.HTTP.request(conn, method, full_path, headers, body || ""),
+          with {:ok, conn, ref} <- Mint.HTTP.request(conn, method, full_path, headers, body),
                {:ok, _conn, responses} <- recv_all(conn, ref) do
             {:ok, assemble(responses, ref)}
           else
             {:error, _conn, reason} -> {:error, reason}
-            {:error, reason} -> {:error, reason}
           end
         after
           Mint.HTTP.close(conn)
