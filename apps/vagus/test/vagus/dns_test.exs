@@ -112,6 +112,53 @@ defmodule Vagus.DNSTest do
     assert ask(sock, port, "kept-addon").addr == [172, 30, 33, 9]
   end
 
+  test "a relay killed from outside is counted out of the in-flight set" do
+    port = 17_400 + rem(System.unique_integer([:positive]), 2000)
+    sup = start_supervised!({Task.Supervisor, name: :vagus_dns_test_relays})
+
+    # TEST-NET-1 upstream: the query goes out but no answer ever comes, so
+    # the relay sits in its recv until killed.
+    server =
+      start_supervised!(
+        {DNS,
+         name: nil,
+         ip: {127, 0, 0, 1},
+         port: port,
+         upstream: "192.0.2.1",
+         task_supervisor: :vagus_dns_test_relays},
+        id: :relay_kill
+      )
+
+    {:ok, sock} = :gen_udp.open(0, [:binary, active: false])
+    on_exit(fn -> :gen_udp.close(sock) end)
+
+    query = <<0x4444::16, 0x0100::16, 1::16, 0::16, 0::16, 0::16, 7, "unknown", 0, 1::16, 1::16>>
+    :ok = :gen_udp.send(sock, {127, 0, 0, 1}, port, query)
+
+    assert [relay] = wait_for(fn -> Task.Supervisor.children(sup) end, &(length(&1) == 1))
+    assert map_size(:sys.get_state(server).relays) == 1
+
+    # An external kill skips the relay's own cleanup; the monitor still sees it.
+    Process.exit(relay, :kill)
+    assert wait_for(fn -> map_size(:sys.get_state(server).relays) end, &(&1 == 0)) == 0
+  end
+
+  defp wait_for(fun, done?, tries \\ 50) do
+    value = fun.()
+
+    cond do
+      done?.(value) ->
+        value
+
+      tries == 0 ->
+        value
+
+      true ->
+        Process.sleep(20)
+        wait_for(fun, done?, tries - 1)
+    end
+  end
+
   test "unknown name with no upstream → NXDOMAIN", %{sock: s, port: p} do
     r = ask(s, p, "nonexistent-thing")
     assert r.ancount == 0

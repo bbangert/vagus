@@ -243,16 +243,6 @@
       "Deliberate and off the start path: Listener.init/1 returns {:continue, :listen} and the Bandit start_child runs in handle_continue/2. The listener owns its Bandit child (restart: :temporary, see default_start/2 and the moduledoc) and retries the bind itself."
   },
   %{
-    analysis: "startup",
-    file: "lib/vagus/backup.ex",
-    title: "init/1 waits on another process with no timeout",
-    at_label: "waits until the other process answers or exits",
-    detail:
-      "Vagus.Backup.bounded/1 has a `receive` with no `after`, and init/1 reaches it in its own process. The wait takes the exit of the process it waits on, so it ends if that process dies; while it lives and does not answer, the process is not started: its supervisor's start, and whoever called start_child, wait with it.",
-    reason:
-      "Backups.init/1 scans backup tars through Backup.bounded/1, which monitors a heap-capped child (max_heap_size with kill) reading a local file: the receive also takes the child's :DOWN, so it ends when the child returns, crashes or is killed for memory."
-  },
-  %{
     analysis: "mailbox",
     file: "lib/vagus/bounded_call.ex",
     title: "Task.async in library code links to an unknown caller",

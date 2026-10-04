@@ -71,7 +71,9 @@ defmodule Vagus.DNS do
       port: Keyword.get(opts, :port, Application.get_env(:vagus, :dns_port, 53)),
       static: static_zone(),
       dynamic: %{},
-      inflight: 0,
+      # Monitor ref -> relay pid for each upstream relay in flight; its size
+      # is the in-flight count (see forward/4).
+      relays: %{},
       # Where upstream relays run (a test seam for the supervisor-down path).
       task_supervisor: Keyword.get(opts, :task_supervisor, Vagus.TaskSupervisor),
       upstream:
@@ -115,8 +117,11 @@ defmodule Vagus.DNS do
     {:noreply, handle_packet(packet, host, port, state)}
   end
 
-  def handle_info(:forward_done, state) do
-    {:noreply, %{state | inflight: max(state.inflight - 1, 0)}}
+  # A relay ended — normally, crashed, or killed from outside (a task
+  # supervisor restart kills its children without running their `after`).
+  def handle_info({:DOWN, ref, :process, _pid, _reason}, %{relays: relays} = state)
+      when is_map_key(relays, ref) do
+    {:noreply, %{state | relays: Map.delete(relays, ref)}}
   end
 
   def handle_info(:retry_bind, %{socket: nil} = state), do: {:noreply, try_bind(state)}
@@ -163,46 +168,42 @@ defmodule Vagus.DNS do
   # so a crash is logged) task so a slow upstream never blocks the server; the
   # answer goes back out our socket.
   # Bounded by `@max_inflight` (drop over the cap) so a flood of misses can't
-  # exhaust processes/FDs; the ephemeral socket is always closed (`try/after`),
-  # and `:forward_done` decrements the in-flight counter when the relay ends.
-  defp forward(_packet, _host, _port, %{inflight: n} = state) when n >= @max_inflight, do: state
+  # exhaust processes/FDs; the ephemeral socket is always closed (`try/after`,
+  # and the port dies with the relay if it is killed). The server monitors
+  # each relay and counts it out on its `:DOWN`, however it ended.
+  defp forward(_packet, _host, _port, %{relays: relays} = state)
+       when map_size(relays) >= @max_inflight,
+       do: state
 
   defp forward(packet, host, port, %{socket: socket, upstream: upstream} = state) do
-    server = self()
-
     relay = fn ->
-      try do
-        case :gen_udp.open(0, [:binary, active: false]) do
-          {:ok, s} ->
-            try do
-              with :ok <- :gen_udp.send(s, upstream, 53, packet),
-                   {:ok, {_ip, _p, resp}} <- :gen_udp.recv(s, 0, @forward_timeout) do
-                :gen_udp.send(socket, host, port, resp)
-              end
-            after
-              :gen_udp.close(s)
+      case :gen_udp.open(0, [:binary, active: false]) do
+        {:ok, s} ->
+          try do
+            with :ok <- :gen_udp.send(s, upstream, 53, packet),
+                 {:ok, {_ip, _p, resp}} <- :gen_udp.recv(s, 0, @forward_timeout) do
+              :gen_udp.send(socket, host, port, resp)
             end
+          after
+            :gen_udp.close(s)
+          end
 
-          {:error, _reason} ->
-            :ok
-        end
-      after
-        send(server, :forward_done)
+        {:error, _reason} ->
+          :ok
       end
     end
 
     start_relay(state, relay)
   end
 
-  # No relay started means no :forward_done will come: drop the query and
-  # leave the in-flight count alone. start_child *exits* (rather than
+  # No relay started means nothing to count: drop the query. start_child *exits* (rather than
   # returning an error) when the task supervisor isn't running — e.g.
   # mid-restart, as a one_for_one sibling — and that must drop one query, not
   # crash this server and lose its dynamic records.
   defp start_relay(state, relay) do
     case Task.Supervisor.start_child(state.task_supervisor, relay) do
-      {:ok, _pid} ->
-        %{state | inflight: state.inflight + 1}
+      {:ok, pid} ->
+        %{state | relays: Map.put(state.relays, Process.monitor(pid), pid)}
 
       {:error, reason} ->
         relay_not_started(reason, state)

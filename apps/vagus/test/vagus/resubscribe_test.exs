@@ -96,6 +96,19 @@ defmodule Vagus.ResubscribeTest do
     refute_receive {:retry_tick, _}, 1_200
   end
 
+  test "registered-name forms other than a local atom are resolved and retried" do
+    name = {:global, unique_name()}
+    {:ok, first} = GenServer.start(Server, self(), name: name)
+    on_exit(fn -> Process.exit(first, :kill) end)
+
+    ref = Resubscribe.subscribe(name, &Server.subscribe/1)
+    assert is_reference(ref)
+    assert_receive {:subscribed, ^first, _}
+
+    assert Resubscribe.down(name, :retry) == nil
+    assert_receive :retry, 1_500
+  end
+
   test "a dead pid is never retried" do
     pid = spawn(fn -> :ok end)
     ref = Process.monitor(pid)

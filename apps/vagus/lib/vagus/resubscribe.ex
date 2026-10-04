@@ -11,8 +11,8 @@ defmodule Vagus.Resubscribe do
   that monitor fires, retries (`down/2` + `retry/3`) until the
   name-registered server is back.
 
-  Retries only ever target a registered name (a dead pid can never come
-  back). At start-up (`start/4`) the caller says whether the server is
+  Retries only ever target a registered name — a local atom, `{:global, _}`,
+  `{:via, _, _}` or `{name, node}` (a dead pid can never come back). At start-up (`start/4`) the caller says whether the server is
   *expected*: an expected server that isn't registered yet — it may be
   mid-restart while the subscriber's own supervisor is still starting it —
   is retried like a dropped one, while an unexpected one (a unit test
@@ -29,9 +29,12 @@ defmodule Vagus.Resubscribe do
   @spec subscribe(GenServer.server(), (GenServer.server() -> term())) :: reference() | nil
   def subscribe(server, subscribe_fun) do
     case whereis(server) do
-      pid when is_pid(pid) ->
+      nil ->
+        nil
+
+      target ->
         # Monitor first so a death between the two calls still reaches us.
-        ref = Process.monitor(pid)
+        ref = Process.monitor(target)
 
         try do
           subscribe_fun.(server)
@@ -41,9 +44,6 @@ defmodule Vagus.Resubscribe do
             Process.demonitor(ref, [:flush])
             nil
         end
-
-      nil ->
-        nil
     end
   end
 
@@ -66,7 +66,7 @@ defmodule Vagus.Resubscribe do
   """
   @spec down(GenServer.server(), term()) :: nil
   def down(server, msg) do
-    if is_atom(server), do: Process.send_after(self(), msg, @retry_ms)
+    if is_atom(server) or is_tuple(server), do: Process.send_after(self(), msg, @retry_ms)
     nil
   end
 
@@ -83,7 +83,10 @@ defmodule Vagus.Resubscribe do
     end
   end
 
+  # A local pid must be alive; any registered-name form resolves through
+  # GenServer.whereis/1 (a remote `{name, node}` comes back as-is and is
+  # monitored directly).
   defp whereis(pid) when is_pid(pid), do: if(Process.alive?(pid), do: pid)
-  defp whereis(name) when is_atom(name), do: Process.whereis(name)
+  defp whereis(name) when is_atom(name) or is_tuple(name), do: GenServer.whereis(name)
   defp whereis(_other), do: nil
 end

@@ -53,6 +53,12 @@ defmodule Vagus.Backup do
   # — 32M words ≈ 256MB on a 64-bit VM, matching `@max_inner_uncompressed`
   # (the largest member any read path legitimately materialises).
   @tar_read_heap_words 32 * 1024 * 1024
+  # Wall-clock cap on one bounded/1 tar read (a full scan of a max-size
+  # 512 MiB outer tar on slow SD storage, with headroom), so a read wedged in
+  # file I/O can never stall `Vagus.Backups.init/1` — and so the app's boot —
+  # indefinitely. Past it the reader is killed and the backup reads as
+  # unreadable.
+  @tar_read_timeout_ms 120_000
 
   @type addon_spec :: %{
           slug: String.t(),
@@ -383,8 +389,8 @@ defmodule Vagus.Backup do
 
   # Runs `fun` in a throwaway process the VM kills if it exceeds
   # `@tar_read_heap_words`, so no amount of header forgery inside `:erl_tar`
-  # can exhaust the node — the caller gets `{:error, {:tar_read_failed, _}}`
-  # instead. The returned binary is not copied out of the child (refc
+  # can exhaust the node, nor wedge it past `@tar_read_timeout_ms` — the
+  # caller gets `{:error, {:tar_read_failed, _}}` instead. The returned binary is not copied out of the child (refc
   # binaries are shared), so this costs a process spawn, not a data copy.
   defp bounded(fun) do
     parent = self()
@@ -403,6 +409,11 @@ defmodule Vagus.Backup do
 
       {:DOWN, ^monitor, :process, ^pid, reason} ->
         {:error, {:tar_read_failed, reason}}
+    after
+      @tar_read_timeout_ms ->
+        Process.exit(pid, :kill)
+        Process.demonitor(monitor, [:flush])
+        {:error, {:tar_read_failed, :timeout}}
     end
   end
 
