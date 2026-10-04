@@ -185,7 +185,11 @@ defmodule Vagus.MixProject do
       # though this app is Plug/Bandit, not Phoenix.
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false, targets: :host},
       {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false, targets: :host},
-      {:sobelow, "~> 0.13", only: [:dev, :test], runtime: false, targets: :host}
+      {:sobelow, "~> 0.13", only: [:dev, :test], runtime: false, targets: :host},
+      # Whole-program OTP/supervision analysis over the compiled beams
+      # (`mix argus`). Needs Souffle on PATH; run as its own CI job rather
+      # than a compiler so a missing Souffle never breaks `mix compile`.
+      {:argus_beam, "~> 0.20", only: [:dev, :test], runtime: false, targets: :host}
     ]
   end
 end
