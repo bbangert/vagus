@@ -70,7 +70,7 @@ defmodule Vagus.MixProject do
       # WebSocket client to Core).
       {:plug, "~> 1.20"},
       {:bandit, "~> 1.12"},
-      {:finch, "~> 0.23.0"},
+      {:finch, "~> 0.24.0"},
       # Ingress reverse proxy (M4b): websock_adapter provides the
       # Plug-side WebSocket upgrade (`WebSockAdapter.upgrade/4`) for the
       # browser leg of the ingress WS bridge; mint_web_socket (previously
@@ -124,7 +124,7 @@ defmodule Vagus.MixProject do
       # compile on :host for the router/updater tests — its fwup/reboot
       # side effects all sit behind injectable seams (:devpath_fn,
       # :reboot_fn, ...), so nothing hardware touches the host build.
-      {:nerves_github_updater, "~> 0.1.1"},
+      {:nerves_github_updater, "~> 0.2.0"},
 
       # Build-time only (`runtime: false`), never in a release: the globally
       # installed nerves_bootstrap archive (needed by vagus_platform's
@@ -141,7 +141,7 @@ defmodule Vagus.MixProject do
       # BlueZ stack bring-up (dbus-daemon + bluetoothd under MuonTrap).
       # Vagus starts only the daemon slice of its tree — HA Core is the BLE
       # consumer via the /run/dbus bind (see Vagus.Bluetooth).
-      {:bluez, "~> 0.1.0"},
+      {:bluez, "~> 0.2.0"},
 
       # Improv-over-BLE Wi-Fi provisioning (bluetooth phase 2): on an
       # offline boot the Pi advertises the Improv service so the HA
@@ -157,7 +157,7 @@ defmodule Vagus.MixProject do
       # surfacing as a misleading "wrong password". 0.1.2 infers SAE vs PSK
       # from the target SSID's live scan flags. Found on the Dragon Q6A
       # (bbangert/improv#2).
-      {:improv, "~> 0.1.2"},
+      {:improv, "~> 0.1.3"},
 
       # bluez's compile-time macro dep, overridden as a git checkout pinned
       # to its release tag: the hex package's mix.exs derives its version

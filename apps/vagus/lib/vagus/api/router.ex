@@ -1996,6 +1996,11 @@ defmodule Vagus.API.Router do
   defp os_update_error_message(:not_supported),
     do: "os/update is not supported on this backend"
 
+  # nerves_github_updater >= 0.2 refuses to re-flash the version already
+  # running (a no-op that would still download, flash and reboot).
+  defp os_update_error_message({:install_failed, {:reinstall_refused, tag}}),
+    do: "the firmware install failed: version #{tag} is already installed"
+
   defp os_update_error_message({:install_failed, reason}),
     do: "the firmware install failed: #{inspect(reason)}"
 

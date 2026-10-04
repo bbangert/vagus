@@ -204,6 +204,19 @@ defmodule Vagus.API.OSUpdateRouterTest do
       assert error["type"] == "HassOSUpdateError"
       assert error["message"] =~ "install failed"
     end
+
+    test "a refused same-version reinstall names the installed version", %{jobs: jobs} do
+      expect(OSMock, :update, fn nil -> :ok end)
+      stub_updater_state(%{phase: :error, last_error: {:reinstall_refused, "0.9.0"}})
+
+      conn = post_("/os/update")
+
+      assert conn.status == 400
+      assert json_body(conn)["message"] =~ "version 0.9.0 is already installed"
+
+      assert [error] = only_job(jobs)["errors"]
+      assert error["message"] =~ "version 0.9.0 is already installed"
+    end
   end
 
   ## -- backend error mapping -----------------------------------------------------
