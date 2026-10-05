@@ -42,14 +42,20 @@ defmodule Vagus.Addon.Registry do
   Registrations live in memory only, so on (re)start `init/1` continues
   into a rebuild from `Vagus.Addon.State.running/1` (`opts[:state]`, default
   `Vagus.Addon.State`), which holds every running add-on's config and
-  current token: a crash here no longer leaves running add-ons
-  unauthenticated until each is restarted. On the normal boot path that is
-  a no-op — `State` starts after this server, and holds no tokens until an
-  add-on starts. `Vagus.Addon.Manager.start/2` records the token in `State`
-  before registering it here, so a restart racing a start can't lose it.
+  current token, so running add-ons stay authenticated across a crash here.
+  At boot there is nothing to rebuild: `State` starts after this server.
+  `Vagus.Addon.Manager.start/2` records the token in `State` before
+  registering it here, so a restart racing a start can't lose it. The
+  rebuild is only as good as `State`'s memory — see the limits in its
+  moduledoc.
+
+  Tokens are bearer credentials, so `format_status/1` keeps them out of
+  crash reports.
   """
 
   use GenServer
+
+  require Logger
 
   @type role :: String.t()
   @type identity :: %{
@@ -132,12 +138,39 @@ defmodule Vagus.Addon.Registry do
     {:noreply, state}
   end
 
-  # Best-effort: `State` not running (boot, isolated tests) or exiting
-  # mid-call leaves nothing to rebuild.
+  # Best-effort: `State` not running is the boot order (and isolated tests),
+  # so it stays quiet; any other exit is running add-ons left unauthenticated.
   defp running(state_server) do
-    if GenServer.whereis(state_server), do: Vagus.Addon.State.running(state_server), else: []
+    Vagus.Addon.State.running(state_server)
   catch
-    :exit, _reason -> []
+    :exit, {:noproc, _call} ->
+      []
+
+    :exit, reason ->
+      Logger.warning("Vagus.Addon.Registry: rebuild from State failed: #{inspect(reason)}")
+      []
+  end
+
+  @impl GenServer
+  def format_status(status) do
+    Map.new(status, fn
+      {:state, %{by_token: by_token, token_by_slug: token_by_slug} = state} ->
+        {:state,
+         %{
+           state
+           | by_token: Map.values(by_token),
+             token_by_slug: Map.new(token_by_slug, fn {slug, _token} -> {slug, :redacted} end)
+         }}
+
+      {:message, {:register, _token, identity}} ->
+        {:message, {:register, :redacted, identity}}
+
+      {:message, {:lookup, _token}} ->
+        {:message, {:lookup, :redacted}}
+
+      other ->
+        other
+    end)
   end
 
   @impl GenServer

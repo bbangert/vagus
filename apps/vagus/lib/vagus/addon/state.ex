@@ -134,9 +134,15 @@ defmodule Vagus.Addon.State do
 
   The token is kept in this process's memory and never written to the
   state file: it's reissued on every start, and an entry reloaded from disk
-  at boot belongs to a container the previous boot ran, so `running/1` is
-  empty after a boot until each add-on starts again — the rebuild is a
-  no-op on the normal boot path. A `:stopped` put or a `delete/2` drops it.
+  belongs to a container an earlier boot ran. `running/1` is therefore
+  empty after a boot until each add-on starts again — and equally after
+  this process alone restarts: the tokens die with it, so a Registry or
+  DNS restart after that rebuilds nothing until each add-on is restarted.
+  A `:stopped` put or a `delete/2` drops the token.
+
+  Tokens are bearer credentials and crash reports land in RingLogger, so
+  `format_status/1` redacts them and `put/3` sends the token inside a
+  closure.
   """
 
   use GenServer
@@ -179,7 +185,9 @@ defmodule Vagus.Addon.State do
   def put(%Config{} = config, state \\ :started, opts \\ []) do
     server = Keyword.get(opts, :server, __MODULE__)
     user_options = Keyword.get(opts, :user_options)
-    access_token = Keyword.get(opts, :access_token)
+    # A call that times out exits with its arguments in the reason; a closure
+    # prints as `#Function<...>`, never the token.
+    access_token = wrap_token(Keyword.get(opts, :access_token))
     GenServer.call(server, {:put, config, state, user_options, access_token})
   end
 
@@ -265,6 +273,20 @@ defmodule Vagus.Addon.State do
   end
 
   @impl GenServer
+  def format_status(status) do
+    Map.new(status, fn
+      {:state, %{tokens: tokens} = s} ->
+        {:state, %{s | tokens: Map.new(tokens, fn {slug, _token} -> {slug, :redacted} end)}}
+
+      {:message, {:put, config, state, user_options, _token}} ->
+        {:message, {:put, config, state, user_options, :redacted}}
+
+      other ->
+        other
+    end)
+  end
+
+  @impl GenServer
   def handle_call(
         {:put, %Config{slug: slug} = config, state, user_options, access_token},
         _from,
@@ -280,7 +302,8 @@ defmodule Vagus.Addon.State do
 
     entries = Map.put(entries, slug, entry)
     persist(s.path, entries)
-    {:reply, :ok, %{s | entries: entries, tokens: put_token(s.tokens, slug, state, access_token)}}
+    tokens = put_token(s.tokens, slug, state, unwrap_token(access_token))
+    {:reply, :ok, %{s | entries: entries, tokens: tokens}}
   end
 
   def handle_call({:get, slug}, _from, %{entries: entries} = s) do
@@ -330,11 +353,17 @@ defmodule Vagus.Addon.State do
     {:reply, running, s}
   end
 
-  # A `:started` put without a token (none of today's callers make one) keeps
-  # the token of the start still running.
+  # A `:started` put without a token keeps the token of the start still
+  # running.
   defp put_token(tokens, slug, :stopped, _token), do: Map.delete(tokens, slug)
   defp put_token(tokens, _slug, :started, nil), do: tokens
   defp put_token(tokens, slug, :started, token), do: Map.put(tokens, slug, token)
+
+  defp wrap_token(nil), do: nil
+  defp wrap_token(token), do: fn -> token end
+
+  defp unwrap_token(nil), do: nil
+  defp unwrap_token(fun), do: fun.()
 
   defp existing_user_options(entries, slug) do
     case Map.get(entries, slug) do

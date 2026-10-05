@@ -1,6 +1,8 @@
 defmodule Vagus.Addon.RegistryTest do
   use ExUnit.Case, async: true
 
+  import ExUnit.CaptureLog
+
   alias Vagus.Addon.{Config, Registry, State}
 
   setup do
@@ -145,11 +147,57 @@ defmodule Vagus.Addon.RegistryTest do
       assert :error = Registry.identity_for_token("tok-old", reg)
     end
 
-    test "starts empty when State isn't running" do
+    test "starts empty, quietly, when State isn't running" do
       missing = :"no_state_#{System.unique_integer([:positive])}"
-      reg = start_supervised!({Registry, name: nil, state: missing}, id: make_ref())
 
-      assert :error = Registry.identity_for_token("anything", reg)
+      log =
+        capture_log(fn ->
+          assert :error = Registry.identity_for_token("anything", start_registry(missing))
+        end)
+
+      refute log =~ "rebuild from State failed"
+    end
+
+    test "a State call that exits is logged and rebuilds nothing" do
+      # Dies on the call itself, so the exit is never the quiet `:noproc`.
+      dying =
+        spawn(fn ->
+          receive do
+            {:"$gen_call", _from, :running} -> exit(:state_went_away)
+          end
+        end)
+
+      log =
+        capture_log(fn ->
+          assert :error = Registry.identity_for_token("anything", start_registry(dying))
+        end)
+
+      assert log =~ "Vagus.Addon.Registry: rebuild from State failed"
+    end
+  end
+
+  describe "format_status/1 (tokens are bearer credentials)" do
+    @token "tok-must-not-print"
+
+    test ":sys.get_status/1 shows the slug, never the token", %{reg: reg} do
+      id = %{slug: "shown_slug", services_role: %{}, auth_api: false, discovery: []}
+      :ok = Registry.register(@token, id, reg)
+
+      status = inspect(:sys.get_status(reg), limit: :infinity, printable_limit: :infinity)
+      refute status =~ @token
+      assert status =~ "shown_slug"
+    end
+
+    test "a crash report's last message carries no token" do
+      for message <- [{:register, @token, %{slug: "shown_slug"}}, {:lookup, @token}] do
+        formatted = Registry.format_status(%{message: message, reason: :boom})
+
+        refute inspect(formatted, limit: :infinity) =~ @token
+        assert formatted.reason == :boom
+      end
+
+      assert %{message: {:unregister_slug, "shown_slug"}} =
+               Registry.format_status(%{message: {:unregister_slug, "shown_slug"}})
     end
   end
 end

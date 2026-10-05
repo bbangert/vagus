@@ -229,6 +229,54 @@ defmodule Vagus.Addon.StateTest do
       assert State.running(s) == []
     end
 
+    test "a delete drops the token, so a reinstall started without one isn't running", %{
+      config: c,
+      s: s
+    } do
+      :ok = State.put(c, :started, server: s, access_token: "tok")
+      :ok = State.delete(c.slug, s)
+
+      :ok = State.put(c, :started, server: s)
+      assert State.running(s) == []
+    end
+
+    test ":sys.get_status/1 shows the slug, never the token", %{config: c, s: s} do
+      :ok = State.put(c, :started, server: s, access_token: "tok-must-not-print")
+
+      status = inspect(:sys.get_status(s), limit: :infinity, printable_limit: :infinity)
+      refute status =~ "tok-must-not-print"
+      assert status =~ c.slug
+    end
+
+    test "a crash report's last message carries no token", %{config: c} do
+      message = {:put, c, :started, nil, "tok-must-not-print"}
+      formatted = State.format_status(%{message: message, reason: :boom})
+
+      refute inspect(formatted, limit: :infinity) =~ "tok-must-not-print"
+      assert %{message: {:put, ^c, :started, nil, :redacted}, reason: :boom} = formatted
+    end
+
+    test "put/3 never sends the raw token, so a timed-out call can't print it", %{config: c} do
+      test = self()
+
+      # Stands in for a State too slow to answer: it shows the request the
+      # caller's exit reason would carry.
+      server =
+        spawn(fn ->
+          receive do
+            {:"$gen_call", from, request} ->
+              send(test, {:request, request})
+              GenServer.reply(from, :ok)
+          end
+        end)
+
+      :ok = State.put(c, :started, server: server, access_token: "tok-must-not-print")
+
+      assert_receive {:request, {:put, ^c, :started, nil, wrapped} = request}
+      refute inspect(request, limit: :infinity) =~ "tok-must-not-print"
+      assert wrapped.() == "tok-must-not-print"
+    end
+
     test "a :started entry never started with a token isn't running", %{config: c, s: s} do
       :ok = State.put(c, :started, server: s)
       assert State.running(s) == []

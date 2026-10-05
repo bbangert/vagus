@@ -813,13 +813,27 @@ defmodule Vagus.Addon.Manager do
 
   # Register the running add-on's token → identity/grants so the emulator's
   # add-on-facing endpoints can authorize it. Best-effort: skipped if the
-  # registry isn't running (e.g. isolated unit tests).
+  # registry isn't running (e.g. isolated unit tests), and a call that exits
+  # (Registry restarting under us) is logged, never raised — `State` already
+  # holds the token, so the restarted Registry's rebuild registers it. The
+  # exit reason carries the call's arguments, token included, so only its
+  # tag is logged.
   defp register_identity(config, token) do
     if Process.whereis(Vagus.Addon.Registry) do
       Vagus.Addon.Registry.register(token, Vagus.Addon.Registry.identity_from_config(config))
     end
 
     :ok
+  catch
+    :exit, reason ->
+      tag =
+        case reason do
+          {tag, _call} when is_atom(tag) -> tag
+          _other -> :exit
+        end
+
+      Logger.warning("Vagus.Addon.Manager: Registry register for #{config.slug} failed: #{tag}")
+      :ok
   end
 
   # Record the add-on's lifecycle state so `GET /addons/{slug}/info` (and the
@@ -972,12 +986,8 @@ defmodule Vagus.Addon.Manager do
   end
 
   @doc """
-  The DNS record a running add-on gets: `{:ok, "<slug-with-dashes>", ip}`,
-  or `:none`. Bridged containers get their hassio-bridge IP (Docker inspect
-  of `id`); host-networked add-ons get none; native add-ons get the
-  supervisor anchor. Shared by `start/2` and `Vagus.DNS`'s rebuild after a
-  restart. Best-effort: any inspect failure is logged and yields `:none`
-  (the add-on still runs).
+  Shared by `start/2` and `Vagus.DNS`'s rebuild so both give an add-on the
+  same record. A failed inspect yields `:none`: the add-on still runs.
   """
   @spec dns_record(Config.t(), String.t(), keyword()) ::
           {:ok, String.t(), String.t() | :inet.ip4_address()} | :none
@@ -1004,7 +1014,7 @@ defmodule Vagus.Addon.Manager do
       :none
   end
 
-  @doc "The container name `start/2` gives `slug`'s add-on."
+  @doc false
   @spec container_name(String.t()) :: String.t()
   def container_name(slug), do: "addon_#{slug}"
 
