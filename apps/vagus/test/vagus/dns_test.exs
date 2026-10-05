@@ -384,17 +384,107 @@ defmodule Vagus.DNSTest do
       refute log =~ "rebuild from State failed"
     end
 
-    test "with no task supervisor running, the rebuild runs inline" do
-      st = start_supervised!({State, name: nil}, id: :addon_state)
+    # Stands in front of `State`, holding each `running/1` read until the
+    # test lets it go: the test sees every rebuild attempt and decides when
+    # it proceeds, whatever the retry timer does.
+    defp gated_state(st) do
+      test = self()
+      spawn_link(fn -> gated_state_loop(st, test) end)
+    end
 
-      :ok =
-        State.put(addon("native_two", %{"backend" => "native"}), :started,
-          server: st,
-          access_token: "t"
+    defp gated_state_loop(st, test) do
+      receive do
+        {:"$gen_call", from, :running} ->
+          send(test, {:state_read, self()})
+
+          receive do
+            :release -> GenServer.reply(from, State.running(st))
+          end
+
+          gated_state_loop(st, test)
+      end
+    end
+
+    defp next_attempt do
+      assert_receive {:state_read, gate}, 5_000
+      gate
+    end
+
+    defp no_supervisor, do: :"no_sup_#{System.unique_integer([:positive])}"
+
+    test "a rebuild task that can't start is retried off the server, never run inline" do
+      st = start_supervised!({State, name: nil}, id: :addon_state)
+      :ok = State.put(addon("bridged_late", %{}), :started, server: st, access_token: "t")
+
+      # Gated, so an inspect made on the server process would hold it.
+      engine = FakeEngine.start([{200, bridged_ip("172.30.33.11"), gate: self()}])
+      on_exit(fn -> FakeEngine.stop(engine) end)
+
+      sup = no_supervisor()
+
+      srv =
+        start_dns(gated_state(st), [socket: engine.socket],
+          task_supervisor: sup,
+          rebuild_retry_ms: 1
         )
 
-      srv = start_dns(st, [], task_supervisor: :"no_sup_#{System.unique_integer([:positive])}")
-      assert {:ok, {172, 30, 32, 2}} = DNS.resolve("native-two", srv)
+      capture_log(fn ->
+        # Queued behind the first attempt, so it is served the moment that
+        # attempt's failed task start returns.
+        first = next_attempt()
+        query = :gen_server.send_request(srv, {:resolve, "dns"})
+        release(first)
+        assert {:reply, {:ok, {172, 30, 32, 3}}} = :gen_server.receive_response(query, 500)
+
+        retry = next_attempt()
+        assert [] = FakeEngine.requests(engine)
+
+        start_supervised!({Task.Supervisor, name: sup}, id: :late_sup)
+        release(retry)
+      end)
+
+      assert_receive {:fake_engine_held, responder}, 5_000
+      release(responder)
+      await_rebuild(srv, sup)
+      assert {:ok, {172, 30, 33, 11}} = DNS.resolve("bridged-late", srv)
+    end
+
+    test "a rebuild task that never starts is given up on after a bounded retry" do
+      st = start_supervised!({State, name: nil}, id: :addon_state)
+      :ok = State.put(addon("bridged_never", %{}), :started, server: st, access_token: "t")
+
+      engine = FakeEngine.start([{200, bridged_ip("172.30.33.12"), gate: self()}])
+      on_exit(fn -> FakeEngine.stop(engine) end)
+
+      srv =
+        start_dns(gated_state(st), [socket: engine.socket],
+          task_supervisor: no_supervisor(),
+          rebuild_retry_ms: 0
+        )
+
+      log =
+        capture_log(fn ->
+          for _attempt <- 1..5, do: release(next_attempt())
+
+          # Two round trips: a sixth attempt would be queued by the end of the
+          # first and holding the server at the gate during the second.
+          _ = :sys.get_state(srv)
+          assert :error = GenServer.call(srv, {:resolve, "bridged-never"}, 500)
+        end)
+
+      refute_received {:state_read, _gate}
+      assert log =~ "giving up"
+      assert Process.alive?(srv)
+      assert [] = FakeEngine.requests(engine)
+    end
+
+    test "the rebuild task dies with its server", %{sup: sup} do
+      {srv, _responder} = held_rebuild(sup)
+      assert [task] = Task.Supervisor.children(sup)
+      ref = Process.monitor(task)
+
+      Process.exit(srv, :kill)
+      assert_receive {:DOWN, ^ref, :process, ^task, :killed}, 5_000
     end
   end
 end

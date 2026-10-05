@@ -32,7 +32,9 @@ defmodule Vagus.DNS do
   hung engine never stops the server answering queries or taking
   `register/3`/`unregister/2` calls. A name registered or unregistered while
   the rebuild is in flight keeps that newer outcome when the task's records
-  are merged in.
+  are merged in. A task that can't be started (the supervisor is restarting)
+  is retried a few times, `opts[:rebuild_retry_ms]` apart, from a fresh
+  `running/1` read; the inspects never run on the server process.
   """
 
   use GenServer
@@ -47,6 +49,8 @@ defmodule Vagus.DNS do
   # Cap concurrent upstream relays so a flood of un-owned queries can't exhaust
   # processes/file descriptors.
   @max_inflight 64
+  @rebuild_attempts 5
+  @rebuild_retry_ms 1_000
 
   def start_link(opts \\ []) do
     GenServer.start_link(__MODULE__, opts, name: Keyword.get(opts, :name, __MODULE__))
@@ -94,34 +98,85 @@ defmodule Vagus.DNS do
       # The in-flight post-restart rebuild: its task ref plus the names
       # unregistered since it started, which its records must not resurrect.
       rebuild: nil,
-      # Where upstream relays run (a test seam for the supervisor-down path).
+      rebuild_retry_ms: Keyword.get(opts, :rebuild_retry_ms, @rebuild_retry_ms),
+      # Where upstream relays and the rebuild run (a test seam for the
+      # supervisor-down path).
       task_supervisor: Keyword.get(opts, :task_supervisor, Vagus.TaskSupervisor),
       upstream:
         parse_upstream(Keyword.get(opts, :upstream, Application.get_env(:vagus, :dns_upstream)))
     }
 
-    rebuild = {:rebuild, Keyword.get(opts, :addon_state, Vagus.Addon.State), opts[:docker] || []}
+    addon_state = Keyword.get(opts, :addon_state, Vagus.Addon.State)
+    rebuild = {:rebuild, addon_state, opts[:docker] || [], @rebuild_attempts}
     {:ok, try_bind(state), {:continue, rebuild}}
   end
 
   @impl GenServer
-  def handle_continue({:rebuild, addon_state, docker_opts}, state) do
+  def handle_continue({:rebuild, _state, _docker, _attempts} = rebuild, state),
+    do: {:noreply, rebuild(rebuild, state)}
+
+  # Each attempt reads `State` afresh: an add-on stopped since the last one is
+  # recorded `:stopped` there before it is unregistered here, and with no
+  # rebuild in flight that unregister leaves no tombstone to exclude it.
+  defp rebuild({:rebuild, addon_state, docker_opts, attempts_left}, state) do
     case running_addons(addon_state) do
-      [] -> {:noreply, state}
-      running -> {:noreply, start_rebuild(fn -> addon_records(running, docker_opts) end, state)}
+      [] ->
+        state
+
+      running ->
+        retry = {:rebuild, addon_state, docker_opts, attempts_left - 1}
+        start_rebuild(running, docker_opts, retry, state)
     end
   end
 
   # Docker inspects can each take up to the client's receive timeout, so they
-  # run off the server process; with no task supervisor (it's restarting),
-  # fall back to doing them inline rather than dropping the rebuild.
-  defp start_rebuild(fun, state) do
-    task = Task.Supervisor.async_nolink(state.task_supervisor, fun)
+  # only ever run off the server process. `async_nolink` *exits* when the task
+  # supervisor isn't running (mid-restart, as a one_for_one sibling).
+  defp start_rebuild(running, docker_opts, retry, state) do
+    owner = self()
+
+    task =
+      Task.Supervisor.async_nolink(state.task_supervisor, fn ->
+        die_with(owner)
+        addon_records(running, docker_opts)
+      end)
+
     %{state | rebuild: %{ref: task.ref, unregistered: MapSet.new()}}
   catch
-    :exit, reason ->
-      Logger.warning("Vagus.DNS: rebuild task not started (#{inspect(reason)}), running inline")
-      merge_rebuild(fun.(), MapSet.new(), state)
+    :exit, reason -> retry_rebuild(reason, retry, state)
+  end
+
+  # A task outliving its server lets spaced restarts pile up hung inspects.
+  # Linked to the task, never the server: the server doesn't trap exits, and a
+  # crashed task must not take it down. A normal task exit doesn't propagate
+  # over the link, hence the monitor.
+  defp die_with(owner) do
+    task = self()
+
+    spawn_link(fn ->
+      owner_ref = Process.monitor(owner)
+      task_ref = Process.monitor(task)
+
+      receive do
+        {:DOWN, ^owner_ref, :process, _pid, _reason} -> Process.exit(task, :kill)
+        {:DOWN, ^task_ref, :process, _pid, _reason} -> :ok
+      end
+    end)
+  end
+
+  defp retry_rebuild(reason, {:rebuild, _state, _docker, 0}, state) do
+    Logger.warning("Vagus.DNS: rebuild task not started (#{inspect(reason)}), giving up")
+    state
+  end
+
+  defp retry_rebuild(reason, rebuild, state) do
+    Logger.warning(
+      "Vagus.DNS: rebuild task not started (#{inspect(reason)}), " <>
+        "retrying in #{state.rebuild_retry_ms}ms"
+    )
+
+    Process.send_after(self(), rebuild, state.rebuild_retry_ms)
+    state
   end
 
   defp addon_records(running, docker_opts) do
@@ -207,6 +262,9 @@ defmodule Vagus.DNS do
     Logger.warning("Vagus.DNS: add-on record rebuild failed: #{inspect(reason)}")
     {:noreply, %{state | rebuild: nil}}
   end
+
+  def handle_info({:rebuild, _state, _docker, _attempts} = rebuild, state),
+    do: {:noreply, rebuild(rebuild, state)}
 
   def handle_info(:retry_bind, %{socket: nil} = state), do: {:noreply, try_bind(state)}
   def handle_info(:retry_bind, state), do: {:noreply, state}
