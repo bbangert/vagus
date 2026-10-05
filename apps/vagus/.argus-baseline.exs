@@ -40,7 +40,7 @@
     detail:
       "Vagus.Addon.BootStarter registers with Vagus.Addon.Registry when it starts, and Vagus.Addon.Registry keeps it in its state. Both are children of the one_for_one supervisor Vagus.Application, which restarts either alone. When Vagus.Addon.Registry restarts, its init/1 starts it afresh without what Vagus.Addon.BootStarter put there, and Vagus.Addon.BootStarter, which is not restarted with it, never registers again. When Vagus.Addon.BootStarter restarts, it registers a second time beside what its old process left.",
     reason:
-      "Misattributed: Vagus.Addon.Manager registers each add-on's per-start token on every start (boot reconciliation, the router, the watchdog), not this boot-time caller specifically, and the token is minted per start, so a re-register is only possible by restarting the add-on. Known design gap, tracked as a follow-up: Vagus.Addon.Registry should rebuild from Vagus.Addon.State in init/1."
+      "Misattributed: Vagus.Addon.Manager registers each add-on's per-start token on every start (boot reconciliation, the router, the watchdog), not this boot-time caller specifically, and the token is minted per start, so a re-register is only possible by restarting the add-on. Vagus.Addon.Registry rebuilds every running add-on's token from Vagus.Addon.State.running/1 (each start's token, kept in State's memory) in handle_continue after a restart, which argus does not model."
   },
   %{
     analysis: "coupling",
@@ -60,7 +60,7 @@
     detail:
       "Vagus.Addon.BootStarter registers with Vagus.DNS when it starts, and Vagus.DNS keeps it in its state. Both are children of the one_for_one supervisor Vagus.Application, which restarts either alone. When Vagus.DNS restarts, its init/1 starts it afresh without what Vagus.Addon.BootStarter put there, and Vagus.Addon.BootStarter, which is not restarted with it, never registers again. When Vagus.Addon.BootStarter restarts, it registers a second time beside what its old process left.",
     reason:
-      "Misattributed: Vagus.Addon.Manager registers each add-on's DNS name (container bridge IP) on every start, not this boot-time caller specifically. Known design gap, tracked as a follow-up: Vagus.DNS should rebuild its dynamic names for running add-ons after a restart."
+      "Misattributed: Vagus.Addon.Manager registers each add-on's DNS name (container bridge IP) on every start, not this boot-time caller specifically. Vagus.DNS rebuilds the dynamic names of running add-ons from Vagus.Addon.State.running/1 and Vagus.Addon.Manager.dns_record/3 in handle_continue after a restart, which argus does not model."
   },
   %{
     analysis: "coupling",
@@ -70,7 +70,7 @@
     detail:
       "Vagus.Addon.DefaultProvider registers with Vagus.Addon.Registry when it starts, and Vagus.Addon.Registry keeps it in its state. Both are children of the one_for_one supervisor Vagus.Application, which restarts either alone. When Vagus.Addon.Registry restarts, its init/1 starts it afresh without what Vagus.Addon.DefaultProvider put there, and Vagus.Addon.DefaultProvider, which is not restarted with it, never registers again. When Vagus.Addon.DefaultProvider restarts, it registers a second time beside what its old process left.",
     reason:
-      "Misattributed: Vagus.Addon.Manager registers each add-on's per-start token on every start (boot reconciliation, the router, the watchdog), not this boot-time caller specifically, and the token is minted per start, so a re-register is only possible by restarting the add-on. Known design gap, tracked as a follow-up: Vagus.Addon.Registry should rebuild from Vagus.Addon.State in init/1."
+      "Misattributed: Vagus.Addon.Manager registers each add-on's per-start token on every start (boot reconciliation, the router, the watchdog), not this boot-time caller specifically, and the token is minted per start, so a re-register is only possible by restarting the add-on. Vagus.Addon.Registry rebuilds every running add-on's token from Vagus.Addon.State.running/1 (each start's token, kept in State's memory) in handle_continue after a restart, which argus does not model."
   },
   %{
     analysis: "coupling",
@@ -90,7 +90,7 @@
     detail:
       "Vagus.Addon.DefaultProvider registers with Vagus.DNS when it starts, and Vagus.DNS keeps it in its state. Both are children of the one_for_one supervisor Vagus.Application, which restarts either alone. When Vagus.DNS restarts, its init/1 starts it afresh without what Vagus.Addon.DefaultProvider put there, and Vagus.Addon.DefaultProvider, which is not restarted with it, never registers again. When Vagus.Addon.DefaultProvider restarts, it registers a second time beside what its old process left.",
     reason:
-      "Misattributed: Vagus.Addon.Manager registers each add-on's DNS name (container bridge IP) on every start, not this boot-time caller specifically. Known design gap, tracked as a follow-up: Vagus.DNS should rebuild its dynamic names for running add-ons after a restart."
+      "Misattributed: Vagus.Addon.Manager registers each add-on's DNS name (container bridge IP) on every start, not this boot-time caller specifically. Vagus.DNS rebuilds the dynamic names of running add-ons from Vagus.Addon.State.running/1 and Vagus.Addon.Manager.dns_record/3 in handle_continue after a restart, which argus does not model."
   },
   %{
     analysis: "coupling",

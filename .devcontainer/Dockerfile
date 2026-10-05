@@ -33,6 +33,16 @@ RUN FWUP_VERSION="1.15.0" && \
     dpkg -i /tmp/fwup.deb && \
     rm /tmp/fwup.deb
 
+# Souffle is the Datalog solver `mix argus` shells out to. Its PPA package
+# links against libffi7, which Ubuntu dropped after 20.04, so that build is
+# installed first (checksum-pinned). Mirrors .github/workflows/ci.yml.
+RUN curl -fsSLo /tmp/libffi7.deb http://archive.ubuntu.com/ubuntu/pool/main/libf/libffi/libffi7_3.3-4_amd64.deb && \
+    echo "4584aa8fef1bf5086168ce2f7078cd2ebd78fdc4cc0d86d958d795d4e0b0f50d  /tmp/libffi7.deb" | sha256sum -c - && \
+    curl -fsSLo /usr/share/keyrings/souffle-archive-keyring.gpg https://souffle-lang.github.io/ppa/souffle-key.public && \
+    echo "deb [signed-by=/usr/share/keyrings/souffle-archive-keyring.gpg] https://souffle-lang.github.io/ppa/ubuntu/ stable main" > /etc/apt/sources.list.d/souffle.list && \
+    apt-get update && apt-get install -y /tmp/libffi7.deb souffle && \
+    rm -rf /tmp/libffi7.deb /var/lib/apt/lists/*
+
 RUN id ubuntu &>/dev/null || useradd -m -s /bin/bash ubuntu \
     && mkdir -p /workspaces && chown ubuntu:ubuntu /workspaces
 

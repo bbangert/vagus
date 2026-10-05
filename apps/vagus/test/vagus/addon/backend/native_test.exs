@@ -240,7 +240,7 @@ defmodule Vagus.Addon.Backend.NativeTest do
       config = mqtt_config()
       assert :ok = Manager.install(config, data_root: dr)
       :ok = State.put(config, :stopped)
-      assert {:ok, _} = Manager.start(config, data_root: dr)
+      assert {:ok, %{access_token: token}} = Manager.start(config, data_root: dr)
 
       on_exit(fn ->
         Manager.uninstall(@slug, data_root: dr)
@@ -250,7 +250,7 @@ defmodule Vagus.Addon.Backend.NativeTest do
         restore_env(:addon_data_root, prev_root)
       end)
 
-      %{port: port, dr: dr}
+      %{port: port, dr: dr, token: token}
     end
 
     test "stats are process-derived while running and zero when stopped", %{dr: dr} do
@@ -271,6 +271,35 @@ defmodule Vagus.Addon.Backend.NativeTest do
     end
 
     test "DNS advertises the broker at the supervisor anchor IP" do
+      assert {:ok, {172, 30, 32, 2}} = Vagus.DNS.resolve("core-mqtt", Vagus.DNS)
+    end
+
+    # Both hold the start's registrations in memory only; a restart rebuilds
+    # them from `State.running/1` rather than waiting for the add-on's next
+    # start.
+    test "a Registry or DNS restart keeps the running add-on's token and name", %{
+      token: token
+    } do
+      {:ok, test_sup} = ExUnit.fetch_test_supervisor()
+
+      # Same `init/1` → rebuild as after a crash, without spending the
+      # supervisor's restart intensity the way a kill does.
+      for {sup, id} <- [{Vagus.Supervisor, Vagus.Addon.Registry}, {test_sup, Vagus.DNS}] do
+        :ok = Supervisor.terminate_child(sup, id)
+        assert {:ok, _pid} = Supervisor.restart_child(sup, id)
+      end
+
+      assert {:ok, %{slug: @slug}} = Vagus.Addon.Registry.identity_for_token(token)
+
+      # The DNS rebuild runs in a task, started before this call is served;
+      # its reply precedes its exit, so the record is in once it is down.
+      _ = :sys.get_state(Vagus.DNS)
+
+      for pid <- Task.Supervisor.children(Vagus.TaskSupervisor) do
+        ref = Process.monitor(pid)
+        assert_receive {:DOWN, ^ref, :process, ^pid, _reason}, 5_000
+      end
+
       assert {:ok, {172, 30, 32, 2}} = Vagus.DNS.resolve("core-mqtt", Vagus.DNS)
     end
 

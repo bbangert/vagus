@@ -1,0 +1,16 @@
+{
+  "enabledPlugins": {
+    "elixir-phoenix@oliver-kriska": true,
+    "ecto@oliver-kriska": true,
+    "lv@oliver-kriska": true
+  },
+  "extraKnownMarketplaces": {
+    "oliver-kriska": {
+      "source": {
+        "source": "github",
+        "repo": "oliver-kriska/claude-elixir-phoenix",
+        "ref": "v3.1.3"
+      }
+    }
+  }
+}

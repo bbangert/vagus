@@ -179,8 +179,11 @@ defmodule Vagus.Addon.Manager do
          :ok <- maybe_allocate_ingress_port(config, opts),
          {:ok, id} <- backend(opts).create(spec),
          :ok <- start_or_cleanup(id, opts) do
+      # State first: `Vagus.Addon.Registry`/`Vagus.DNS` rebuild from
+      # `State.running/1` when they restart, so a restart either sees this
+      # start's token there or comes before the registrations below.
+      record_state(config, :started, user_options: user_options, access_token: token)
       register_identity(config, token)
-      record_state(config, :started, user_options: user_options)
       register_dns(config, id, opts)
       {:ok, %{id: id, access_token: token}}
     end
@@ -401,7 +404,7 @@ defmodule Vagus.Addon.Manager do
     host? = config.host_network
 
     %Spec{
-      name: "addon_#{config.slug}",
+      name: container_name(config.slug),
       image: image_ref(config, arch),
       hostname: if(host?, do: nil, else: hostname(config.slug)),
       env: %{
@@ -810,13 +813,27 @@ defmodule Vagus.Addon.Manager do
 
   # Register the running add-on's token → identity/grants so the emulator's
   # add-on-facing endpoints can authorize it. Best-effort: skipped if the
-  # registry isn't running (e.g. isolated unit tests).
+  # registry isn't running (e.g. isolated unit tests), and a call that exits
+  # (Registry restarting under us) is logged, never raised — `State` already
+  # holds the token, so the restarted Registry's rebuild registers it. The
+  # exit reason carries the call's arguments, token included, so only its
+  # tag is logged.
   defp register_identity(config, token) do
     if Process.whereis(Vagus.Addon.Registry) do
       Vagus.Addon.Registry.register(token, Vagus.Addon.Registry.identity_from_config(config))
     end
 
     :ok
+  catch
+    :exit, reason ->
+      tag =
+        case reason do
+          {tag, _call} when is_atom(tag) -> tag
+          _other -> :exit
+        end
+
+      Logger.warning("Vagus.Addon.Manager: Registry register for #{config.slug} failed: #{tag}")
+      :ok
   end
 
   # Record the add-on's lifecycle state so `GET /addons/{slug}/info` (and the
@@ -866,7 +883,7 @@ defmodule Vagus.Addon.Manager do
   # host devcontainer) must not block deregistration/state bookkeeping either
   # — this is best-effort the same way DNS/registry side effects are.
   defp stop_and_remove_container(config, opts) do
-    id = "addon_#{config.slug}"
+    id = container_name(config.slug)
 
     case backend(opts).stop(id, opts) do
       :ok ->
@@ -947,38 +964,59 @@ defmodule Vagus.Addon.Manager do
     end
   end
 
-  # Register `<slug-with-dashes>` → the container's hassio-bridge IP in the DNS
-  # server (§A6) so Core / other add-ons resolve the add-on by name. Best-effort:
-  # only for bridged add-ons, only when the DNS server + Docker inspect are
-  # available; any failure is logged and ignored (the add-on still runs).
-  defp register_dns(%Config{host_network: true}, _id, _opts), do: :ok
-  # A native add-on has no container/bridge IP to inspect (MQ-P3-T3). Advertise
-  # the supervisor anchor IP — the in-BEAM broker listens there and it's
-  # reachable from every bridged add-on + Core, same as the injected
-  # `supervisor`/`hassio` host entries. Best-effort, like the container path.
-  defp register_dns(%Config{backend: :native, slug: slug}, _id, _opts) do
-    if is_pid(Process.whereis(Vagus.DNS)) do
-      Vagus.DNS.register(String.replace(slug, "_", "-"), Network.supervisor_ip())
+  # Register `<slug-with-dashes>` → the add-on's IP in the DNS server (§A6) so
+  # Core / other add-ons resolve the add-on by name. Best-effort: only when
+  # the DNS server is running and `dns_record/3` finds an IP, and a call that
+  # exits (DNS restarting under us) is logged, never raised — by now the
+  # container is running and recorded `:started`, so the start must succeed.
+  defp register_dns(config, id, opts) do
+    with true <- is_pid(Process.whereis(Vagus.DNS)),
+         {:ok, host, ip} <- dns_record(config, id, opts) do
+      Vagus.DNS.register(host, ip)
     end
 
     :ok
+  catch
+    :exit, reason ->
+      Logger.warning(
+        "Vagus.Addon.Manager: DNS register for #{config.slug} failed: #{inspect(reason)}"
+      )
+
+      :ok
   end
 
-  defp register_dns(%Config{slug: slug}, id, opts) do
-    with true <- is_pid(Process.whereis(Vagus.DNS)),
-         {:ok, %{"NetworkSettings" => %{"Networks" => networks}}} <-
+  @doc """
+  Shared by `start/2` and `Vagus.DNS`'s rebuild so both give an add-on the
+  same record. A failed inspect yields `:none`: the add-on still runs.
+  """
+  @spec dns_record(Config.t(), String.t(), keyword()) ::
+          {:ok, String.t(), String.t() | :inet.ip4_address()} | :none
+  def dns_record(%Config{host_network: true}, _id, _opts), do: :none
+  # A native add-on has no container/bridge IP to inspect (MQ-P3-T3). Advertise
+  # the supervisor anchor IP — the in-BEAM broker listens there and it's
+  # reachable from every bridged add-on + Core, same as the injected
+  # `supervisor`/`hassio` host entries.
+  def dns_record(%Config{backend: :native, slug: slug}, _id, _opts),
+    do: {:ok, hostname(slug), Network.supervisor_ip()}
+
+  def dns_record(%Config{slug: slug}, id, opts) do
+    with {:ok, %{"NetworkSettings" => %{"Networks" => networks}}} <-
            Vagus.Runtime.Docker.inspect_container(id, network_opts(opts)),
          %{"IPAddress" => ip} when is_binary(ip) and ip != "" <-
            Map.get(networks, Network.name()) do
-      Vagus.DNS.register(String.replace(slug, "_", "-"), ip)
+      {:ok, hostname(slug), ip}
     else
-      _ -> :ok
+      _ -> :none
     end
   rescue
     e ->
       Logger.warning("Vagus.Addon.Manager: DNS register for #{slug} failed: #{inspect(e)}")
-      :ok
+      :none
   end
+
+  @doc false
+  @spec container_name(String.t()) :: String.t()
+  def container_name(slug), do: "addon_#{slug}"
 
   # Core sidebar-panel push, on uninstall only — §B4.4's set, not a superset
   # of it.
