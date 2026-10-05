@@ -32,7 +32,10 @@ erl_crash.dump
 /.elixir_ls/
 .claude/home-backup/
 
-# Local-only working docs — never commit (stripped from history 2026-08-04)
-.claude/
+# Local-only working docs — never commit (stripped from history 2026-08-04).
+# Only the shared project settings (the pinned elixir-phoenix plugin) are
+# tracked; plans, reviews and everything else under .claude stay local.
+**/.claude/*
+!/.claude/settings.json
 handoff.md
 vagus_spike/
