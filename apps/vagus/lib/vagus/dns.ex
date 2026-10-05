@@ -25,6 +25,12 @@ defmodule Vagus.DNS do
   container, `opts[:docker]` the inspect options) — so a crash here no
   longer leaves running add-ons nameless until each restarts. On the normal
   boot path `State` lists nothing running yet and the rebuild is a no-op.
+
+  The inspects run in a task under the relay task supervisor, so a slow or
+  hung engine never stops the server answering queries or taking
+  `register/3`/`unregister/2` calls. A name registered or unregistered while
+  the rebuild is in flight keeps that newer outcome when the task's records
+  are merged in.
   """
 
   use GenServer
@@ -83,6 +89,9 @@ defmodule Vagus.DNS do
       # Monitor ref -> relay pid for each upstream relay in flight; its size
       # is the in-flight count (see forward/4).
       relays: %{},
+      # The in-flight post-restart rebuild: its task ref plus the names
+      # (un)registered since it started, which its records must not overwrite.
+      rebuild: nil,
       # Where upstream relays run (a test seam for the supervisor-down path).
       task_supervisor: Keyword.get(opts, :task_supervisor, Vagus.TaskSupervisor),
       upstream:
@@ -95,15 +104,43 @@ defmodule Vagus.DNS do
 
   @impl GenServer
   def handle_continue({:rebuild, addon_state, docker_opts}, state) do
-    dynamic =
-      for {config, _token} <- running_addons(addon_state),
-          {:ok, host, ip} <-
-            [Manager.dns_record(config, Manager.container_name(config.slug), docker_opts)],
-          into: state.dynamic,
-          do: {String.downcase(host), to_ip(ip)}
-
-    {:noreply, %{state | dynamic: dynamic}}
+    case running_addons(addon_state) do
+      [] -> {:noreply, state}
+      running -> {:noreply, start_rebuild(fn -> addon_records(running, docker_opts) end, state)}
+    end
   end
+
+  # Docker inspects can each take up to the client's receive timeout, so they
+  # run off the server process; with no task supervisor (it's restarting),
+  # fall back to doing them inline rather than dropping the rebuild.
+  defp start_rebuild(fun, state) do
+    task = Task.Supervisor.async_nolink(state.task_supervisor, fun)
+    %{state | rebuild: %{ref: task.ref, touched: MapSet.new()}}
+  catch
+    :exit, reason ->
+      Logger.warning("Vagus.DNS: rebuild task not started (#{inspect(reason)}), running inline")
+      merge_rebuild(fun.(), MapSet.new(), state)
+  end
+
+  defp addon_records(running, docker_opts) do
+    for {config, _token} <- running,
+        {:ok, host, ip} <-
+          [Manager.dns_record(config, Manager.container_name(config.slug), docker_opts)],
+        into: %{},
+        do: {String.downcase(host), to_ip(ip)}
+  end
+
+  # Names (un)registered since the rebuild started already hold their newer
+  # outcome, so the rebuilt records never overwrite or resurrect them.
+  defp merge_rebuild(records, touched, state) do
+    records = Map.drop(records, MapSet.to_list(touched))
+    %{state | dynamic: Map.merge(records, state.dynamic), rebuild: nil}
+  end
+
+  defp touch(%{rebuild: %{touched: touched} = rebuild} = state, host),
+    do: %{state | rebuild: %{rebuild | touched: MapSet.put(touched, host)}}
+
+  defp touch(state, _host), do: state
 
   # Best-effort: `State` not running (isolated tests) or exiting mid-call
   # leaves nothing to rebuild.
@@ -131,11 +168,11 @@ defmodule Vagus.DNS do
 
   @impl GenServer
   def handle_call({:register, host, ip}, _from, state) do
-    {:reply, :ok, %{state | dynamic: Map.put(state.dynamic, host, ip)}}
+    {:reply, :ok, touch(%{state | dynamic: Map.put(state.dynamic, host, ip)}, host)}
   end
 
   def handle_call({:unregister, host}, _from, state) do
-    {:reply, :ok, %{state | dynamic: Map.delete(state.dynamic, host)}}
+    {:reply, :ok, touch(%{state | dynamic: Map.delete(state.dynamic, host)}, host)}
   end
 
   def handle_call({:resolve, name}, _from, state) do
@@ -152,6 +189,16 @@ defmodule Vagus.DNS do
   def handle_info({:DOWN, ref, :process, _pid, _reason}, %{relays: relays} = state)
       when is_map_key(relays, ref) do
     {:noreply, %{state | relays: Map.delete(relays, ref)}}
+  end
+
+  def handle_info({ref, records}, %{rebuild: %{ref: ref, touched: touched}} = state) do
+    Process.demonitor(ref, [:flush])
+    {:noreply, merge_rebuild(records, touched, state)}
+  end
+
+  def handle_info({:DOWN, ref, :process, _pid, reason}, %{rebuild: %{ref: ref}} = state) do
+    Logger.warning("Vagus.DNS: add-on record rebuild failed: #{inspect(reason)}")
+    {:noreply, %{state | rebuild: nil}}
   end
 
   def handle_info(:retry_bind, %{socket: nil} = state), do: {:noreply, try_bind(state)}

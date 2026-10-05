@@ -952,7 +952,9 @@ defmodule Vagus.Addon.Manager do
 
   # Register `<slug-with-dashes>` → the add-on's IP in the DNS server (§A6) so
   # Core / other add-ons resolve the add-on by name. Best-effort: only when
-  # the DNS server is running and `dns_record/3` finds an IP.
+  # the DNS server is running and `dns_record/3` finds an IP, and a call that
+  # exits (DNS restarting under us) is logged, never raised — by now the
+  # container is running and recorded `:started`, so the start must succeed.
   defp register_dns(config, id, opts) do
     with true <- is_pid(Process.whereis(Vagus.DNS)),
          {:ok, host, ip} <- dns_record(config, id, opts) do
@@ -960,6 +962,13 @@ defmodule Vagus.Addon.Manager do
     end
 
     :ok
+  catch
+    :exit, reason ->
+      Logger.warning(
+        "Vagus.Addon.Manager: DNS register for #{config.slug} failed: #{inspect(reason)}"
+      )
+
+      :ok
   end
 
   @doc """

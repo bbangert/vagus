@@ -193,17 +193,54 @@ defmodule Vagus.DNSTest do
       config
     end
 
-    defp start_dns(st, docker) do
+    defp start_dns(st, docker, opts \\ []) do
       start_supervised!(
         {DNS,
-         name: nil,
-         ip: {127, 0, 0, 1},
-         port: 15_300 + rem(System.unique_integer([:positive]), 2000),
-         upstream: nil,
-         addon_state: st,
-         docker: docker},
+         [
+           name: nil,
+           ip: {127, 0, 0, 1},
+           port: 15_300 + rem(System.unique_integer([:positive]), 2000),
+           upstream: nil,
+           addon_state: st,
+           docker: docker
+         ] ++ opts},
         id: make_ref()
       )
+    end
+
+    # The rebuild runs in a task; wait until its records are merged in.
+    defp await_rebuild(srv, tries \\ 100) do
+      cond do
+        :sys.get_state(srv).rebuild == nil -> :ok
+        tries == 0 -> flunk("DNS rebuild never finished")
+        true -> Process.sleep(20) && await_rebuild(srv, tries - 1)
+      end
+    end
+
+    defp bridged_ip(ip),
+      do: %{"NetworkSettings" => %{"Networks" => %{"hassio" => %{"IPAddress" => ip}}}}
+
+    # One bridged add-on whose inspect the engine holds for `delay` ms.
+    defp slow_rebuild(delay, opts \\ []) do
+      st = start_supervised!({State, name: nil}, id: :addon_state)
+      :ok = State.put(addon("bridged_slow", %{}), :started, server: st, access_token: "t")
+
+      engine = FakeEngine.start([{200, bridged_ip("172.30.33.9"), delay: delay}])
+      on_exit(fn -> FakeEngine.stop(engine) end)
+
+      srv = start_dns(st, [socket: engine.socket], opts)
+      eventually(fn -> FakeEngine.requests(engine) end, &(&1 != []))
+      srv
+    end
+
+    defp eventually(fun, pred, tries \\ 100) do
+      value = fun.()
+
+      cond do
+        pred.(value) -> value
+        tries == 0 -> value
+        true -> Process.sleep(10) && eventually(fun, pred, tries - 1)
+      end
     end
 
     test "re-registers running add-ons: bridge IP, native anchor, host network skipped" do
@@ -220,15 +257,12 @@ defmodule Vagus.DNSTest do
       # A stopped add-on is never inspected.
       :ok = State.put(addon("stopped_one", %{}), :stopped, server: st)
 
-      engine =
-        FakeEngine.start([
-          {200,
-           %{"NetworkSettings" => %{"Networks" => %{"hassio" => %{"IPAddress" => "172.30.33.7"}}}}}
-        ])
+      engine = FakeEngine.start([{200, bridged_ip("172.30.33.7")}])
 
       on_exit(fn -> FakeEngine.stop(engine) end)
 
       srv = start_dns(st, socket: engine.socket)
+      :ok = await_rebuild(srv)
 
       assert {:ok, {172, 30, 33, 7}} = DNS.resolve("bridged-one", srv)
       assert {:ok, {172, 30, 32, 2}} = DNS.resolve("native-one", srv)
@@ -247,8 +281,64 @@ defmodule Vagus.DNSTest do
       on_exit(fn -> FakeEngine.stop(engine) end)
 
       srv = start_dns(st, socket: engine.socket)
+      :ok = await_rebuild(srv)
       assert :error = DNS.resolve("bridged-two", srv)
       assert {:ok, {172, 30, 32, 3}} = DNS.resolve("dns", srv)
+    end
+
+    test "a slow engine doesn't block queries or registrations meanwhile" do
+      srv = slow_rebuild(1_000)
+
+      # The inspect is still held by the engine; the server answers anyway.
+      assert {:ok, {172, 30, 32, 3}} = DNS.resolve("dns", srv)
+      assert :ok = DNS.register("other-addon", {172, 30, 33, 2}, srv)
+      assert :error = DNS.resolve("bridged-slow", srv)
+
+      :ok = await_rebuild(srv)
+      assert {:ok, {172, 30, 33, 9}} = DNS.resolve("bridged-slow", srv)
+      assert {:ok, {172, 30, 33, 2}} = DNS.resolve("other-addon", srv)
+    end
+
+    test "a register during the rebuild wins over the rebuilt record" do
+      srv = slow_rebuild(300)
+      :ok = DNS.register("bridged-slow", {172, 30, 33, 50}, srv)
+
+      :ok = await_rebuild(srv)
+      assert {:ok, {172, 30, 33, 50}} = DNS.resolve("bridged-slow", srv)
+    end
+
+    test "an unregister during the rebuild isn't undone by it" do
+      srv = slow_rebuild(300)
+      :ok = DNS.unregister("bridged-slow", srv)
+
+      :ok = await_rebuild(srv)
+      assert :error = DNS.resolve("bridged-slow", srv)
+    end
+
+    test "a crashed rebuild task leaves the server up with what it has" do
+      sup = start_supervised!({Task.Supervisor, name: nil}, id: :rebuild_sup)
+      srv = slow_rebuild(5_000, task_supervisor: sup)
+      :ok = DNS.register("other-addon", {172, 30, 33, 2}, srv)
+
+      for pid <- Task.Supervisor.children(sup), do: Process.exit(pid, :kill)
+
+      :ok = await_rebuild(srv)
+      assert Process.alive?(srv)
+      assert :error = DNS.resolve("bridged-slow", srv)
+      assert {:ok, {172, 30, 33, 2}} = DNS.resolve("other-addon", srv)
+    end
+
+    test "with no task supervisor running, the rebuild runs inline" do
+      st = start_supervised!({State, name: nil}, id: :addon_state)
+
+      :ok =
+        State.put(addon("native_two", %{"backend" => "native"}), :started,
+          server: st,
+          access_token: "t"
+        )
+
+      srv = start_dns(st, [], task_supervisor: :"no_sup_#{System.unique_integer([:positive])}")
+      assert {:ok, {172, 30, 32, 2}} = DNS.resolve("native-two", srv)
     end
   end
 end

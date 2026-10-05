@@ -289,7 +289,12 @@ defmodule Vagus.Addon.Backend.NativeTest do
       end
 
       assert {:ok, %{slug: @slug}} = Vagus.Addon.Registry.identity_for_token(token)
-      assert {:ok, {172, 30, 32, 2}} = Vagus.DNS.resolve("core-mqtt", Vagus.DNS)
+      # The DNS rebuild runs in a task, so the name comes back shortly after.
+      assert {:ok, {172, 30, 32, 2}} =
+               eventually(
+                 fn -> Vagus.DNS.resolve("core-mqtt", Vagus.DNS) end,
+                 &match?({:ok, _}, &1)
+               )
     end
 
     test "logs capture broker activity as text/plain lines", %{port: port} do
