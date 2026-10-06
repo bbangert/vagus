@@ -1230,13 +1230,17 @@ defmodule Vagus.Addon.ManagerTest do
 
     # terminate + restart, never a kill: a kill counts toward
     # `Vagus.Supervisor`'s restart intensity, and exceeding it stops the app.
-    defp take_registry_down do
-      :ok = Supervisor.terminate_child(Vagus.Supervisor, Vagus.Addon.Registry)
-      on_exit(&bring_registry_up/0)
+    defp take_registry_down, do: take_down(Vagus.Addon.Registry)
+    defp bring_registry_up, do: bring_up(Vagus.Addon.Registry)
+    defp cycle_registry, do: cycle(Vagus.Addon.Registry)
+
+    defp take_down(child) do
+      :ok = Supervisor.terminate_child(Vagus.Supervisor, child)
+      on_exit(fn -> bring_up(child) end)
     end
 
-    defp bring_registry_up do
-      case Supervisor.restart_child(Vagus.Supervisor, Vagus.Addon.Registry) do
+    defp bring_up(child) do
+      case Supervisor.restart_child(Vagus.Supervisor, child) do
         {:ok, _pid} ->
           :ok
 
@@ -1245,13 +1249,13 @@ defmodule Vagus.Addon.ManagerTest do
 
         {:error, {:already_started, stub}} ->
           kill(stub)
-          bring_registry_up()
+          bring_up(child)
       end
     end
 
-    defp cycle_registry do
-      :ok = Supervisor.terminate_child(Vagus.Supervisor, Vagus.Addon.Registry)
-      bring_registry_up()
+    defp cycle(child) do
+      :ok = Supervisor.terminate_child(Vagus.Supervisor, child)
+      bring_up(child)
     end
 
     # The default-named DNS checkpoints, so a file from an earlier test would
@@ -1648,6 +1652,154 @@ defmodule Vagus.Addon.ManagerTest do
 
       assert result == :ok
       assert stub_calls(Vagus.Addon.Registry) == List.duplicate(:unregister_slug, 3)
+    end
+
+    # The application's own Discovery, as its child spec starts it.
+    test "the default-named Discovery keeps a message, uuid and all, across its restart", %{
+      slug: slug
+    } do
+      on_exit(fn -> Vagus.Discovery.delete_by_slug(slug) end)
+      # Registered after the cleanup above, so it runs first.
+      on_exit(fn -> bring_up(Vagus.Discovery) end)
+
+      {:ok, message, :new} = Vagus.Discovery.add(slug, "mqtt", %{"host" => "h"})
+
+      cycle(Vagus.Discovery)
+
+      assert {:ok, ^message} = Vagus.Discovery.get(message.uuid)
+    end
+
+    test "uninstall/2 waits out a Services that is briefly absent, and the service stays gone", %{
+      config: c,
+      slug: slug,
+      opts: opts
+    } do
+      assert {:ok, _started} = Manager.start(c, opts)
+      service = "service_#{slug}"
+      :ok = Vagus.Services.set(service, %{"host" => "h"}, slug)
+      on_exit(fn -> Vagus.Services.delete_by_slug(slug) end)
+
+      take_down(Vagus.Services)
+      stub = stub_server(Vagus.Services, fn _request -> exit(:shutdown) end)
+
+      uninstall =
+        Task.async(fn -> Manager.uninstall(slug, [deregister_retry: @slack_retry] ++ opts) end)
+
+      assert_receive {:stub_call, Vagus.Services, {:delete_by_slug, ^slug}}, 5_000
+      await_down(stub)
+      # Comes back holding the entry: its checkpoint predates the delete.
+      bring_up(Vagus.Services)
+
+      assert :ok = Task.await(uninstall, 60_000)
+      assert :error = Vagus.Services.get(service)
+      assert :error = State.get(slug)
+
+      cycle(Vagus.Services)
+      assert :error = Vagus.Services.get(service)
+    end
+
+    test "uninstall/2 waits out a Discovery that is briefly absent, and the message stays gone",
+         %{config: c, slug: slug, opts: opts} do
+      assert {:ok, _started} = Manager.start(c, opts)
+      {:ok, %{uuid: uuid}, :new} = Vagus.Discovery.add(slug, "mqtt", %{})
+      on_exit(fn -> Vagus.Discovery.delete_by_slug(slug) end)
+
+      take_down(Vagus.Discovery)
+      stub = stub_server(Vagus.Discovery, fn _request -> exit(:shutdown) end)
+
+      uninstall =
+        Task.async(fn -> Manager.uninstall(slug, [deregister_retry: @slack_retry] ++ opts) end)
+
+      assert_receive {:stub_call, Vagus.Discovery, {:delete_by_slug, ^slug}}, 5_000
+      await_down(stub)
+      # Comes back holding the message: its checkpoint predates the delete.
+      bring_up(Vagus.Discovery)
+
+      assert :ok = Task.await(uninstall, 60_000)
+      assert :error = Vagus.Discovery.get(uuid)
+      assert :error = State.get(slug)
+
+      cycle(Vagus.Discovery)
+      assert :error = Vagus.Discovery.get(uuid)
+    end
+
+    test "uninstall/2 still succeeds when Discovery and Services stay absent, and logs what it left",
+         %{config: c, slug: slug, opts: opts} do
+      assert {:ok, _started} = Manager.start(c, opts)
+      take_down(Vagus.Discovery)
+      take_down(Vagus.Services)
+
+      {result, log} =
+        with_log(fn -> Manager.uninstall(slug, [deregister_retry: @tiny_retry] ++ opts) end)
+
+      assert result == :ok
+      assert :error = State.get(slug)
+      assert log =~ "[error] Vagus.Addon.Manager: Discovery purge for #{slug} failed (noproc)"
+      assert log =~ "[error] Vagus.Addon.Manager: Services purge for #{slug} failed (noproc)"
+    end
+
+    # Each purge can take its whole budget; a token valid for that long
+    # belongs to an add-on that is already stopped.
+    test "uninstall/2 has revoked the token by the time it purges Discovery", %{
+      config: c,
+      slug: slug,
+      opts: opts
+    } do
+      assert {:ok, %{access_token: token}} = Manager.start(c, opts)
+      on_exit(fn -> bring_up(Vagus.Discovery) end)
+      take_down(Vagus.Discovery)
+
+      stub =
+        stub_server(Vagus.Discovery, fn {:delete_by_slug, _slug} ->
+          receive do
+            :release -> {:reply, {:ok, []}}
+          end
+        end)
+
+      uninstall =
+        Task.async(fn ->
+          Manager.uninstall(slug, [registration_call_timeout: @held_call_timeout] ++ opts)
+        end)
+
+      assert_receive {:stub_call, Vagus.Discovery, {:delete_by_slug, ^slug}}, 5_000
+      assert :error = Vagus.Addon.Registry.identity_for_token(token)
+
+      send(stub, :release)
+      assert :ok = Task.await(uninstall, @held_call_timeout)
+    end
+
+    test "uninstall/2 gives a Discovery or Services that holds the call one call timeout each",
+         %{config: c, slug: slug, opts: opts} do
+      assert {:ok, _started} = Manager.start(c, opts)
+      _start_calls = drain()
+
+      stubs =
+        for server <- [Vagus.Discovery, Vagus.Services] do
+          take_down(server)
+          stub_server(server, fn _request -> :noreply end)
+        end
+
+      started = System.monotonic_time(:millisecond)
+
+      {result, log} =
+        with_log(fn ->
+          Manager.uninstall(
+            slug,
+            [registration_call_timeout: 100, deregister_retry: {5, 1}] ++ opts
+          )
+        end)
+
+      # Two 100 ms calls; either one on the default timeout alone takes 5 s.
+      assert System.monotonic_time(:millisecond) - started < 5_000
+      assert result == :ok
+      assert log =~ "Discovery purge for #{slug} failed (timeout)"
+      assert log =~ "Services purge for #{slug} failed (timeout)"
+
+      Enum.each(stubs, &sync/1)
+      calls = for {:stub_call, server, request} <- drain(), do: {server, elem(request, 0)}
+
+      assert Enum.sort(calls) ==
+               [{Vagus.Discovery, :delete_by_slug}, {Vagus.Services, :delete_by_slug}]
     end
   end
 

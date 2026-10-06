@@ -37,13 +37,33 @@ defmodule Vagus.Mqtt.Broker.Provider do
   having to delete anything first.
 
   On `terminate` it deregisters the service and discovery (pushing the discovery
-  delete to Core), so both follow broker liveness. Registry calls are
-  best-effort — a missing registry (isolated test) is not fatal.
+  delete to Core), so both follow broker liveness.
+
+  Every registry call waits out a registry that is briefly absent
+  (`Vagus.AbsentRetry`). A publish skipped while one restarts would leave the
+  broker running with no `mqtt` service, so its service credentials are
+  refused; both registries reload their checkpoint on restart, so a delete
+  skipped then would leave the entry published for a broker that is gone. A
+  registry that stays absent is logged as an error and never fails the
+  broker: `init` still starts it and `terminate` still completes.
+  `opts[:registry_retry]` (`{attempts, delay_ms}`) overrides the budget, and
+  `opts[:deregister_call_timeout]` (ms) the `terminate` call timeout.
   """
 
   use GenServer
 
   require Logger
+
+  alias Vagus.AbsentRetry
+
+  # `{attempts, delay_ms}` for a registry call that finds its server absent.
+  #
+  # `terminate/2` has the child's 5 s shutdown timeout for two deletes, each
+  # one call plus this budget's sleeps (200 ms). A registry that holds the
+  # first call for a default 5 s would get the provider killed before the
+  # Discovery delete and its Core push.
+  @registry_retry {5, 50}
+  @deregister_call_timeout 1_000
 
   @service "mqtt"
   @user "addons"
@@ -75,25 +95,58 @@ defmodule Vagus.Mqtt.Broker.Provider do
     password = load_or_generate_password(data_dir)
     payload = service_payload(host, port, password)
 
-    publish_service(services, slug, payload)
-    uuid = publish_discovery(discovery, slug, payload, push)
+    retry = Keyword.get(opts, :registry_retry, @registry_retry)
 
-    {:ok, %{slug: slug, services: services, discovery: discovery, push: push, uuid: uuid}}
+    publish_service(services, slug, payload, retry)
+    uuid = publish_discovery(discovery, slug, payload, push, retry)
+
+    {:ok,
+     %{
+       slug: slug,
+       services: services,
+       discovery: discovery,
+       push: push,
+       uuid: uuid,
+       retry: retry,
+       call_timeout: Keyword.get(opts, :deregister_call_timeout, @deregister_call_timeout)
+     }}
   end
 
   @impl GenServer
-  def terminate(_reason, state) do
-    if alive?(state.services),
-      do: best_effort(fn -> Vagus.Services.delete(@service, state.slug, state.services) end)
+  def terminate(_reason, %{slug: slug, retry: retry, call_timeout: timeout} = state) do
+    services = fn -> Vagus.Services.delete(@service, slug, state.services, timeout) end
 
-    if state.uuid && alive?(state.discovery) do
-      case best_effort(fn -> Vagus.Discovery.delete(state.uuid, state.slug, state.discovery) end) do
-        {:ok, message} -> state.push.(:delete, message)
-        _ -> :ok
+    case AbsentRetry.call(services, retry) do
+      {:ok, _reply} -> :ok
+      {:error, tag} -> log_left(slug, "Services", tag)
+    end
+
+    if state.uuid do
+      discovery = fn -> Vagus.Discovery.delete(state.uuid, slug, state.discovery, timeout) end
+
+      case AbsentRetry.call(discovery, retry) do
+        {:ok, {:ok, message}} -> state.push.(:delete, message)
+        {:ok, _not_deleted} -> :ok
+        {:error, tag} -> log_left(slug, "Discovery", tag)
       end
     end
 
     :ok
+  end
+
+  defp log_left(slug, registry, tag) do
+    Logger.error(
+      "Vagus.Mqtt.Broker.Provider: #{registry} delete for #{slug} failed (#{tag}); " <>
+        "its entry may stay until a reboot"
+    )
+  end
+
+  # The tag only: the exit reason holds the payload, password included.
+  defp log_unpublished(slug, registry, tag) do
+    Logger.error(
+      "Vagus.Mqtt.Broker.Provider: #{registry} publish for #{slug} failed (#{tag}); " <>
+        "the broker runs without it"
+    )
   end
 
   ## Internals
@@ -109,30 +162,32 @@ defmodule Vagus.Mqtt.Broker.Provider do
     }
   end
 
-  defp publish_service(services, slug, payload) do
-    if alive?(services),
-      do: best_effort(fn -> Vagus.Services.set(@service, payload, slug, services) end)
+  defp publish_service(services, slug, payload, retry) do
+    case AbsentRetry.call(fn -> Vagus.Services.set(@service, payload, slug, services) end, retry) do
+      {:ok, _set_or_already_provided} -> :ok
+      {:error, tag} -> log_unpublished(slug, "Services", tag)
+    end
   end
 
-  defp publish_discovery(discovery, slug, payload, push) do
-    if alive?(discovery) do
-      # Discovery.add/4 is speced `{:ok, message(), outcome}`; `best_effort`
-      # adds `:error` if the registry died mid-call, so match both. Push only
-      # on `:new`/`:updated` — `:existing` means this exact (slug, service,
-      # config) triple is already in Core, so pushing again would recreate
-      # the duplicate the dedup exists to prevent (mirrors the router's
-      # `POST /discovery`, audit B3).
-      case best_effort(fn -> Vagus.Discovery.add(slug, @service, payload, discovery) end) do
-        {:ok, %{uuid: uuid} = message, outcome} when outcome in [:new, :updated] ->
-          push.(:post, message)
-          uuid
+  # Push only on `:new`/`:updated` — `:existing` means this exact (slug,
+  # service, config) triple is already in Core, so pushing again would
+  # recreate the duplicate the dedup exists to prevent (mirrors the router's
+  # `POST /discovery`, audit B3).
+  defp publish_discovery(discovery, slug, payload, push, retry) do
+    case AbsentRetry.call(
+           fn -> Vagus.Discovery.add(slug, @service, payload, discovery) end,
+           retry
+         ) do
+      {:ok, {:ok, %{uuid: uuid} = message, outcome}} when outcome in [:new, :updated] ->
+        push.(:post, message)
+        uuid
 
-        {:ok, %{uuid: uuid}, :existing} ->
-          uuid
+      {:ok, {:ok, %{uuid: uuid}, :existing}} ->
+        uuid
 
-        _ ->
-          nil
-      end
+      {:error, tag} ->
+        log_unpublished(slug, "Discovery", tag)
+        nil
     end
   end
 
@@ -175,21 +230,5 @@ defmodule Vagus.Mqtt.Broker.Provider do
   defp data_dir(slug) do
     root = Application.get_env(:vagus, :addon_data_root, "/data")
     Path.join([root, "addons", "data", slug])
-  end
-
-  defp alive?(server) when is_atom(server), do: is_pid(Process.whereis(server))
-  defp alive?(server) when is_pid(server), do: Process.alive?(server)
-
-  # Registry calls are best-effort in two layers: `alive?/1` skips a registry
-  # that was never started (isolated tests), and this swallows an `:exit` should
-  # the registry crash *between* that check and the call (the TOCTOU) — so a
-  # registry blip never propagates out of the Provider and restarts the whole
-  # broker subtree. Returns the fun's value, or `:error` on exit.
-  defp best_effort(fun) do
-    fun.()
-  catch
-    :exit, reason ->
-      Logger.debug("Vagus.Mqtt.Broker.Provider: registry call skipped (exit #{inspect(reason)})")
-      :error
   end
 end

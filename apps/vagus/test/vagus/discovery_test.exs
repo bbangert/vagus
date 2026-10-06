@@ -71,4 +71,199 @@ defmodule Vagus.DiscoveryTest do
     assert removed == [a]
     assert [%{addon: "b"}] = Discovery.list(d)
   end
+
+  describe "format_status/1 (a message's config can carry a password)" do
+    @password "pw-must-not-print"
+
+    test ":sys.get_status/1 shows the uuid, add-on and service, never the config", %{d: d} do
+      {:ok, %{uuid: uuid}, :new} =
+        Discovery.add("shown_slug", "shown_service", %{"password" => @password}, d)
+
+      status = inspect(:sys.get_status(d), limit: :infinity, printable_limit: :infinity)
+      refute status =~ @password
+      assert status =~ uuid
+      assert status =~ "shown_slug"
+      assert status =~ "shown_service"
+    end
+
+    test "a crash report's last message carries no config" do
+      message = {:add, "shown_slug", "mqtt", %{"password" => @password}}
+      formatted = Discovery.format_status(%{message: message, reason: :boom})
+
+      assert formatted == %{message: {:add, "shown_slug", "mqtt", :redacted}, reason: :boom}
+
+      assert %{message: {:delete_by_slug, "shown_slug"}} =
+               Discovery.format_status(%{message: {:delete_by_slug, "shown_slug"}})
+    end
+  end
+
+  describe "checkpoint" do
+    setup do
+      dir = Path.join(System.tmp_dir!(), "vagus-disc-#{System.unique_integer([:positive])}")
+      File.mkdir_p!(dir)
+      on_exit(fn -> File.rm_rf(dir) end)
+
+      path = Path.join(dir, "discovery.term")
+      %{path: path, d: start_checkpointed(path)}
+    end
+
+    defp start_checkpointed(path),
+      do: start_supervised!({Discovery, name: nil, path: path}, id: :checkpointed)
+
+    defp restart_checkpointed(path) do
+      :ok = stop_supervised!(:checkpointed)
+      start_checkpointed(path)
+    end
+
+    test "a message is still there after a restart on the same path", %{d: d, path: path} do
+      {:ok, msg, :new} = Discovery.add("s", "mqtt", %{"host" => "h"}, d)
+
+      d = restart_checkpointed(path)
+
+      assert {:ok, ^msg} = Discovery.get(msg.uuid, d)
+      assert [^msg] = Discovery.list(d)
+    end
+
+    # A fresh uuid here would give Core a second config flow for the add-on.
+    test "a repeat add after a restart is :existing under the same uuid", %{d: d, path: path} do
+      {:ok, msg, :new} = Discovery.add("s", "mqtt", %{"host" => "h"}, d)
+
+      d = restart_checkpointed(path)
+
+      assert {:ok, ^msg, :existing} = Discovery.add("s", "mqtt", %{"host" => "h"}, d)
+    end
+
+    test "a changed config after a restart is :updated under the same uuid, and is kept", %{
+      d: d,
+      path: path
+    } do
+      {:ok, %{uuid: uuid}, :new} = Discovery.add("s", "mqtt", %{"host" => "h1"}, d)
+
+      d = restart_checkpointed(path)
+
+      assert {:ok, %{uuid: ^uuid} = updated, :updated} =
+               Discovery.add("s", "mqtt", %{"host" => "h2"}, d)
+
+      d = restart_checkpointed(path)
+
+      assert {:ok, ^updated} = Discovery.get(uuid, d)
+    end
+
+    test "a deleted message stays gone after a restart", %{d: d, path: path} do
+      {:ok, gone, :new} = Discovery.add("gone", "mqtt", %{}, d)
+      {:ok, other, :new} = Discovery.add("other", "mqtt", %{}, d)
+      {:ok, ^gone} = Discovery.delete(gone.uuid, "gone", d)
+
+      d = restart_checkpointed(path)
+
+      assert [^other] = Discovery.list(d)
+    end
+
+    test "a slug's purged messages stay gone after a restart", %{d: d, path: path} do
+      {:ok, gone, :new} = Discovery.add("gone", "mqtt", %{}, d)
+      {:ok, other, :new} = Discovery.add("other", "mqtt", %{}, d)
+      {:ok, [^gone]} = Discovery.delete_by_slug("gone", d)
+
+      d = restart_checkpointed(path)
+
+      assert [^other] = Discovery.list(d)
+    end
+
+    test "a call that changes nothing does not save", %{d: d, path: path} do
+      {:ok, kept, :new} = Discovery.add("kept", "mqtt", %{"host" => "h"}, d)
+
+      File.mkdir_p!(path <> ".tmp")
+      assert {:ok, ^kept, :existing} = Discovery.add("kept", "mqtt", %{"host" => "h"}, d)
+      assert {:error, :not_owner} = Discovery.delete(kept.uuid, "someone_else", d)
+      assert {:error, :not_found} = Discovery.delete("no-such-uuid", "kept", d)
+
+      d = restart_checkpointed(path)
+
+      assert [^kept] = Discovery.list(d)
+    end
+
+    # A save can fail, and a failed save drops the checkpoint.
+    test "a delete_by_slug that removes nothing does not save", %{d: d, path: path} do
+      {:ok, kept, :new} = Discovery.add("kept", "mqtt", %{}, d)
+
+      File.mkdir_p!(path <> ".tmp")
+      assert {:ok, []} = Discovery.delete_by_slug("someone_else", d)
+
+      d = restart_checkpointed(path)
+
+      assert [^kept] = Discovery.list(d)
+    end
+
+    # A privately-named instance falling back to the default path would read
+    # and overwrite the application Discovery's checkpoint.
+    test "a privately-named instance without a :path keeps nothing across a restart" do
+      name = :"disc_#{System.unique_integer([:positive])}"
+
+      d = start_supervised!({Discovery, name: name}, id: :pathless)
+      {:ok, _msg, :new} = Discovery.add("memory_only", "mqtt", %{}, d)
+
+      :ok = stop_supervised!(:pathless)
+      d = start_supervised!({Discovery, name: name}, id: :pathless)
+
+      assert [] = Discovery.list(d)
+    end
+
+    test "an unusable file starts it empty and working, naming only the path", %{
+      path: path
+    } do
+      uuid = String.duplicate("a", 32)
+      stale = %{uuid: uuid, addon: "stale", service: "mqtt", config: %{"password" => "pw-stale"}}
+      not_hex = String.duplicate("A", 32)
+      short = String.duplicate("a", 31)
+
+      for content <- [
+            "not a term",
+            :erlang.term_to_binary(:nope),
+            :erlang.term_to_binary(%{uuid => :nope}),
+            :erlang.term_to_binary(%{uuid => %{stale | config: "pw-stale"}}),
+            :erlang.term_to_binary(%{uuid => Map.delete(stale, :service)}),
+            :erlang.term_to_binary(%{String.duplicate("b", 32) => stale}),
+            :erlang.term_to_binary(%{not_hex => %{stale | uuid: not_hex}}),
+            :erlang.term_to_binary(%{(uuid <> "/..") => %{stale | uuid: uuid <> "/.."}}),
+            :erlang.term_to_binary(%{("../" <> uuid) => %{stale | uuid: "../" <> uuid}}),
+            :erlang.term_to_binary(%{(uuid <> "\n") => %{stale | uuid: uuid <> "\n"}}),
+            :erlang.term_to_binary(%{short => %{stale | uuid: short}}),
+            :erlang.term_to_binary(%{"" => %{stale | uuid: ""}}),
+            :erlang.term_to_binary(%{uuid => %{stale | addon: :stale}}),
+            :erlang.term_to_binary(%{uuid => %{stale | service: nil}}),
+            :erlang.term_to_binary(%URI{}),
+            :erlang.term_to_binary(MapSet.new())
+          ] do
+        :ok = stop_supervised!(:checkpointed)
+        File.write!(path, content)
+        {d, log} = ExUnit.CaptureLog.with_log(fn -> start_checkpointed(path) end)
+
+        assert log =~ "run state #{path} unusable"
+        refute log =~ "pw-stale"
+        assert [] = Discovery.list(d)
+        assert {:ok, %{uuid: uuid}, :new} = Discovery.add("stale", "mqtt", %{}, d)
+        assert [%{uuid: ^uuid}] = Discovery.list(d)
+      end
+    end
+
+    # An older checkpoint surviving a failed save would bring a deleted
+    # message back on the next restart.
+    @tag :capture_log
+    test "a failed save leaves the next start empty, not on the older checkpoint", %{
+      d: d,
+      path: path
+    } do
+      {:ok, gone, :new} = Discovery.add("gone", "mqtt", %{}, d)
+      {:ok, bystander, :new} = Discovery.add("bystander", "mqtt", %{}, d)
+
+      # The save writes `path <> ".tmp"` first; a directory there fails it.
+      File.mkdir_p!(path <> ".tmp")
+      assert {:ok, ^gone} = Discovery.delete(gone.uuid, "gone", d)
+      assert [^bystander] = Discovery.list(d)
+
+      d = restart_checkpointed(path)
+
+      assert [] = Discovery.list(d)
+    end
+  end
 end

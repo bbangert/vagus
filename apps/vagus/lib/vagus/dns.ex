@@ -104,7 +104,7 @@ defmodule Vagus.DNS do
   defp load_dynamic(path) do
     dynamic = RunState.load(path, %{})
 
-    if is_map(dynamic) and Enum.all?(dynamic, &record?/1) do
+    if is_map(dynamic) and not is_struct(dynamic) and Enum.all?(dynamic, &record?/1) do
       dynamic
     else
       Logger.warning("run state #{path} unusable: :wrong_shape")

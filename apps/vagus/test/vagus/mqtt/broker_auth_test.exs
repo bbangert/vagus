@@ -68,6 +68,39 @@ defmodule Vagus.Mqtt.Broker.AuthTest do
       assert :error = Auth.authenticate("svcuser", "nope", config)
     end
 
+    # The application's own Services, as its child spec starts it: the one a
+    # real broker authenticates against.
+    test "service credentials still authenticate after Vagus.Services restarts", %{cache: cache} do
+      config = Auth.config(slug: "core_mqtt", auth_opts: [server: cache, core_client: StubCore])
+      slug = "auth_restart_#{System.unique_integer([:positive])}"
+      held = Vagus.Services.get("mqtt")
+
+      on_exit(fn ->
+        Vagus.Services.delete_by_slug(slug)
+
+        with {:ok, %{"addon" => holder} = data} <- held do
+          Vagus.Services.set("mqtt", Map.delete(data, "addon"), holder)
+        end
+      end)
+
+      # Registered after the cleanup above, so it runs first.
+      on_exit(fn ->
+        case Supervisor.restart_child(Vagus.Supervisor, Vagus.Services) do
+          {:ok, _pid} -> :ok
+          {:error, :running} -> :ok
+        end
+      end)
+
+      with {:ok, %{"addon" => holder}} <- held, do: Vagus.Services.delete_by_slug(holder)
+      :ok = Vagus.Services.set("mqtt", %{"username" => "svcuser", "password" => "svcpass"}, slug)
+      assert :ok = Auth.authenticate("svcuser", "svcpass", config)
+
+      :ok = Supervisor.terminate_child(Vagus.Supervisor, Vagus.Services)
+      {:ok, _pid} = Supervisor.restart_child(Vagus.Supervisor, Vagus.Services)
+
+      assert :ok = Auth.authenticate("svcuser", "svcpass", config)
+    end
+
     test "accepts a static broker options login", %{config: config} do
       assert :ok = Auth.authenticate("optuser", "optpass", config)
     end
