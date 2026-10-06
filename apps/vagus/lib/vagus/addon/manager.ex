@@ -88,6 +88,7 @@ defmodule Vagus.Addon.Manager do
 
   require Logger
 
+  alias Vagus.AbsentRetry
   alias Vagus.Addon.Backend.Spec
   alias Vagus.Addon.{Config, Devices, OptionsSchema, Ports}
   alias Vagus.DSP
@@ -168,7 +169,8 @@ defmodule Vagus.Addon.Manager do
 
   `opts[:register_retry]`/`opts[:deregister_retry]` (`{attempts, delay_ms}`)
   and `opts[:registration_call_timeout]` (ms) override the Registry/DNS call
-  budgets, here and in `stop/2`/`uninstall/2`.
+  budgets, here and in `stop/2`/`uninstall/2`; `uninstall/2` spends the
+  deregister budget on Discovery and Services too.
   """
   @spec start(Config.t(), keyword()) ::
           {:ok, %{id: String.t(), access_token: String.t()}} | {:error, term()}
@@ -867,8 +869,8 @@ defmodule Vagus.Addon.Manager do
       Vagus.Addon.Registry.register(token, identity, Vagus.Addon.Registry, timeout)
     end
 
-    case call_retrying_absent(register, Keyword.get(opts, :register_retry, @register_retry)) do
-      :ok ->
+    case AbsentRetry.call(register, Keyword.get(opts, :register_retry, @register_retry)) do
+      {:ok, _reply} ->
         :ok
 
       {:error, tag} ->
@@ -876,40 +878,6 @@ defmodule Vagus.Addon.Manager do
         {:error, {:registration_failed, :registry}}
     end
   end
-
-  # Retries for the whole budget only while the server is absent or going
-  # away; a lookup is not liveness, so it calls and catches the exit. A crash
-  # is retried once: if the call itself is what crashes the server, every
-  # further attempt spends one of `Vagus.Supervisor`'s restarts. A timeout is
-  # not retried: the server is alive, and each further attempt would hold the
-  # slug lock for another full call timeout.
-  #
-  # Only the exit's tag is returned: the reason carries the call's arguments,
-  # bearer token included.
-  defp call_retrying_absent(fun, {attempts, delay_ms}, crashed? \\ false) do
-    fun.()
-    :ok
-  catch
-    :exit, reason ->
-      case exit_tag(reason) do
-        :timeout ->
-          {:error, :timeout}
-
-        tag when attempts <= 1 or (tag == :server_down and crashed?) ->
-          {:error, tag}
-
-        tag ->
-          Process.sleep(delay_ms)
-          call_retrying_absent(fun, {attempts - 1, delay_ms}, tag == :server_down)
-      end
-  end
-
-  @absent_exits [:noproc, :normal, :shutdown, :killed]
-
-  defp exit_tag({:timeout, _call}), do: :timeout
-  defp exit_tag({tag, _call}) when tag in @absent_exits, do: tag
-  defp exit_tag({{:shutdown, _}, _call}), do: :shutdown
-  defp exit_tag(_crash), do: :server_down
 
   defp call_timeout(opts),
     do: Keyword.get(opts, :registration_call_timeout, @registration_call_timeout)
@@ -982,8 +950,8 @@ defmodule Vagus.Addon.Manager do
   end
 
   defp deregister(slug, server, retry, fun) do
-    case call_retrying_absent(fun, retry) do
-      :ok ->
+    case AbsentRetry.call(fun, retry) do
+      {:ok, _reply} ->
         :ok
 
       {:error, tag} ->
@@ -1052,15 +1020,37 @@ defmodule Vagus.Addon.Manager do
     ArgumentError -> :error
   end
 
-  # Purge every other subsystem's record of `slug` on uninstall. The
-  # `Process.whereis` touches are best-effort — an uninstall must complete
-  # even in an isolated test that never started the full app.
+  # Purge every other subsystem's record of `slug` on uninstall. Discovery
+  # and Services get the deregister budget: both reload their checkpoint on
+  # restart, so a delete skipped while one is absent would come back with it.
   defp purge_side_state(slug, opts) do
-    if Process.whereis(Vagus.Discovery), do: Vagus.Discovery.delete_by_slug(slug)
-    if Process.whereis(Vagus.Services), do: Vagus.Services.delete_by_slug(slug)
+    retry = Keyword.get(opts, :deregister_retry, @deregister_retry)
+    timeout = call_timeout(opts)
+
+    purge(slug, "Discovery", retry, fn ->
+      Vagus.Discovery.delete_by_slug(slug, Vagus.Discovery, timeout)
+    end)
+
+    purge(slug, "Services", retry, fn ->
+      Vagus.Services.delete_by_slug(slug, Vagus.Services, timeout)
+    end)
+
     deregister_slug(slug, opts)
     if Process.whereis(Vagus.Addon.State), do: Vagus.Addon.State.delete(slug)
     :ok
+  end
+
+  defp purge(slug, server, retry, fun) do
+    case AbsentRetry.call(fun, retry) do
+      {:ok, _reply} ->
+        :ok
+
+      {:error, tag} ->
+        Logger.error(
+          "Vagus.Addon.Manager: #{server} purge for #{slug} failed (#{tag}); " <>
+            "its entries may stay until a reboot"
+        )
+    end
   end
 
   # path is internal/config-derived, not request input
@@ -1086,7 +1076,7 @@ defmodule Vagus.Addon.Manager do
          {:ok, host, ip} <- dns_record(config, id, opts),
          register = fn -> Vagus.DNS.register(host, ip, Vagus.DNS, call_timeout(opts)) end,
          {:error, tag} <-
-           call_retrying_absent(register, Keyword.get(opts, :register_retry, @register_retry)) do
+           AbsentRetry.call(register, Keyword.get(opts, :register_retry, @register_retry)) do
       Logger.error("Vagus.Addon.Manager: DNS register for #{config.slug} failed: #{tag}")
       {:error, {:registration_failed, :dns}}
     else

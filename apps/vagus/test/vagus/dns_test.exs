@@ -241,7 +241,9 @@ defmodule Vagus.DNSTest do
             :erlang.term_to_binary(:nope),
             :erlang.term_to_binary(%{"stale-addon" => "172.30.33.99"}),
             :erlang.term_to_binary(%{stale: {172, 30, 33, 99}}),
-            :erlang.term_to_binary(%{"stale-addon" => {172, 30, 33}})
+            :erlang.term_to_binary(%{"stale-addon" => {172, 30, 33}}),
+            :erlang.term_to_binary(%URI{}),
+            :erlang.term_to_binary(MapSet.new())
           ] do
         :ok = stop_supervised!(:checkpointed)
         File.write!(path, content)

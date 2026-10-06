@@ -35,22 +35,28 @@ defmodule Vagus.Mqtt.Broker.ProviderTest do
     %{services: services, discovery: discovery, data_dir: data_dir, push: push}
   end
 
-  defp start_provider(ctx) do
+  defp start_provider(ctx, overrides \\ []) do
     name = :"provider_#{System.unique_integer([:positive])}"
 
     start_supervised!(
       {Provider,
-       [
-         slug: @slug,
-         host: @host,
-         port: @port,
-         services: ctx.services,
-         discovery: ctx.discovery,
-         push: ctx.push,
-         data_dir: ctx.data_dir,
-         name: name
-       ]},
-      id: name
+       Keyword.merge(
+         [
+           slug: @slug,
+           host: @host,
+           port: @port,
+           services: ctx.services,
+           discovery: ctx.discovery,
+           push: ctx.push,
+           data_dir: ctx.data_dir,
+           name: name
+         ],
+         overrides
+       )},
+      id: name,
+      # The absent-registry tests stop it themselves; a restart would
+      # publish again.
+      restart: :temporary
     )
 
     name
@@ -129,5 +135,203 @@ defmodule Vagus.Mqtt.Broker.ProviderTest do
     assert_receive {:push, :delete, %{uuid: ^uuid}}
     assert Discovery.list(ctx.discovery) == []
     assert Services.get("mqtt", ctx.services) == :error
+  end
+
+  describe "terminate with a registry that is absent" do
+    # Wide enough that bringing the registry back always lands inside it.
+    @slack_retry {2_000, 5}
+    @tiny_retry {2, 1}
+
+    # Named and checkpointed, so a restart under the same name reloads what
+    # the provider published, as the application's registries do.
+    setup ctx do
+      uniq = System.unique_integer([:positive])
+      File.mkdir_p!(ctx.data_dir)
+
+      registries = %{
+        services: {Services, :"services_named_#{uniq}", Path.join(ctx.data_dir, "services.term")},
+        discovery:
+          {Discovery, :"discovery_named_#{uniq}", Path.join(ctx.data_dir, "discovery.term")}
+      }
+
+      Enum.each(registries, fn {id, _spec} -> start_registry(registries, id) end)
+
+      %{
+        registries: registries,
+        slug: "absent_#{uniq}",
+        services: elem(registries.services, 1),
+        discovery: elem(registries.discovery, 1)
+      }
+    end
+
+    defp start_registry(registries, id) do
+      {module, name, path} = Map.fetch!(registries, id)
+      start_supervised!({module, name: name, path: path}, id: id)
+    end
+
+    # Holds `name` like a registry that goes down on the first call it gets.
+    defp dying_stub(name) do
+      test = self()
+
+      pid =
+        spawn(fn ->
+          receive do
+            {:"$gen_call", _from, request} ->
+              send(test, {:stub_call, name, request})
+              exit(:shutdown)
+          end
+        end)
+
+      Process.register(pid, name)
+      on_exit(fn -> Process.exit(pid, :kill) end)
+      pid
+    end
+
+    # Holds `name` like a registry that is alive and never answers.
+    defp holding_stub(name) do
+      test = self()
+
+      pid =
+        spawn(fn ->
+          receive do
+            {:"$gen_call", _from, request} -> send(test, {:held, request})
+          end
+
+          Process.sleep(:infinity)
+        end)
+
+      Process.register(pid, name)
+      on_exit(fn -> Process.exit(pid, :kill) end)
+    end
+
+    # A dead process has released its name by the time its monitor fires.
+    defp await_down(pid) do
+      ref = Process.monitor(pid)
+
+      receive do
+        {:DOWN, ^ref, :process, ^pid, _reason} -> :ok
+      end
+    end
+
+    test "waits out a Services that is briefly absent, and the service stays deregistered",
+         %{slug: slug} = ctx do
+      provider = start_provider(ctx, slug: slug, deregister_retry: @slack_retry)
+      assert {:ok, %{"addon" => ^slug}} = Services.get("mqtt", ctx.services)
+
+      :ok = stop_supervised!(:services)
+      stub = dying_stub(ctx.services)
+      stop = Task.async(fn -> GenServer.stop(provider, :shutdown) end)
+
+      assert_receive {:stub_call, _name, {:delete, "mqtt", ^slug}}, 5_000
+      await_down(stub)
+      # Comes back holding the entry: its checkpoint predates the delete.
+      start_registry(ctx.registries, :services)
+
+      assert :ok = Task.await(stop, 60_000)
+      assert :error = Services.get("mqtt", ctx.services)
+    end
+
+    test "waits out a Discovery that is briefly absent, and the delete still reaches Core",
+         %{slug: slug} = ctx do
+      provider = start_provider(ctx, slug: slug, deregister_retry: @slack_retry)
+      assert [%{uuid: uuid}] = Discovery.list(ctx.discovery)
+
+      :ok = stop_supervised!(:discovery)
+      stub = dying_stub(ctx.discovery)
+      stop = Task.async(fn -> GenServer.stop(provider, :shutdown) end)
+
+      assert_receive {:stub_call, _name, {:delete, ^uuid, ^slug}}, 5_000
+      await_down(stub)
+      # Comes back holding the message: its checkpoint predates the delete.
+      start_registry(ctx.registries, :discovery)
+
+      assert :ok = Task.await(stop, 60_000)
+      assert [] = Discovery.list(ctx.discovery)
+      assert_receive {:push, :delete, %{uuid: ^uuid}}
+    end
+
+    # A registry that holds the first call for the whole shutdown timeout
+    # would get the provider killed before it reaches the second.
+    test "a Services that holds the call costs one call timeout, and Discovery is still deleted",
+         %{slug: slug} = ctx do
+      provider = start_provider(ctx, slug: slug, deregister_call_timeout: 50)
+      assert [%{uuid: uuid}] = Discovery.list(ctx.discovery)
+
+      :ok = stop_supervised!(:services)
+      holding_stub(ctx.services)
+
+      stop =
+        Task.async(fn ->
+          ExUnit.CaptureLog.with_log(fn -> GenServer.stop(provider, :shutdown) end)
+        end)
+
+      # Well under one default call timeout.
+      assert {:ok, {:ok, log}} = Task.yield(stop, 2_500) || Task.shutdown(stop, :brutal_kill)
+      assert_received {:held, {:delete, "mqtt", ^slug}}
+      assert log =~ "Services delete for #{slug} failed (timeout)"
+      assert [] = Discovery.list(ctx.discovery)
+      assert_received {:push, :delete, %{uuid: ^uuid}}
+    end
+
+    test "a Discovery that holds the call costs one call timeout", %{slug: slug} = ctx do
+      provider = start_provider(ctx, slug: slug, deregister_call_timeout: 50)
+      assert [%{uuid: uuid}] = Discovery.list(ctx.discovery)
+
+      :ok = stop_supervised!(:discovery)
+      holding_stub(ctx.discovery)
+
+      stop =
+        Task.async(fn ->
+          ExUnit.CaptureLog.with_log(fn -> GenServer.stop(provider, :shutdown) end)
+        end)
+
+      assert {:ok, {:ok, log}} = Task.yield(stop, 2_500) || Task.shutdown(stop, :brutal_kill)
+      assert_received {:held, {:delete, ^uuid, ^slug}}
+      assert log =~ "Discovery delete for #{slug} failed (timeout)"
+      assert :error = Services.get("mqtt", ctx.services)
+    end
+
+    test "a registry that goes down on init's call is logged by tag, without the password",
+         %{slug: slug} = ctx do
+      password = "pw-#{System.unique_integer([:positive])}-must-not-print"
+
+      File.write!(
+        Path.join(ctx.data_dir, "broker_state.json"),
+        Jason.encode!(%{"addons_password" => password})
+      )
+
+      :ok = stop_supervised!(:services)
+      stub = dying_stub(ctx.services)
+
+      {_provider, log} =
+        ExUnit.CaptureLog.with_log(fn -> start_provider(ctx, slug: slug) end)
+
+      assert_received {:stub_call, _name, {:set, "mqtt", %{"password" => ^password}, ^slug}}
+      await_down(stub)
+      assert log =~ "Vagus.Mqtt.Broker.Provider: registry call skipped (exit shutdown)"
+      refute log =~ password
+    end
+
+    test "still terminates when both stay absent, and logs what it left without the password",
+         %{slug: slug} = ctx do
+      provider = start_provider(ctx, slug: slug, deregister_retry: @tiny_retry)
+      {:ok, %{"password" => password}} = Services.get("mqtt", ctx.services)
+
+      :ok = stop_supervised!(:services)
+      :ok = stop_supervised!(:discovery)
+
+      {result, log} = ExUnit.CaptureLog.with_log(fn -> GenServer.stop(provider, :shutdown) end)
+
+      assert result == :ok
+
+      assert log =~
+               "[error] Vagus.Mqtt.Broker.Provider: Services delete for #{slug} failed (noproc)"
+
+      assert log =~
+               "[error] Vagus.Mqtt.Broker.Provider: Discovery delete for #{slug} failed (noproc)"
+
+      refute log =~ password
+      refute_received {:push, :delete, _message}
+    end
   end
 end

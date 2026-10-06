@@ -37,13 +37,29 @@ defmodule Vagus.Mqtt.Broker.Provider do
   having to delete anything first.
 
   On `terminate` it deregisters the service and discovery (pushing the discovery
-  delete to Core), so both follow broker liveness. Registry calls are
-  best-effort — a missing registry (isolated test) is not fatal.
+  delete to Core), so both follow broker liveness. Registry calls on `init`
+  are best-effort — a missing registry (isolated test) is skipped.
+
+  The `terminate` deletes wait out a registry that is briefly absent
+  (`Vagus.AbsentRetry`): both registries reload their checkpoint on restart,
+  so a delete skipped then would leave the entry published for a broker that
+  is gone. One that stays absent is logged as an error and `terminate` still
+  completes. `opts[:deregister_retry]` (`{attempts, delay_ms}`) and
+  `opts[:deregister_call_timeout]` (ms) override the budget.
   """
 
   use GenServer
 
   require Logger
+
+  alias Vagus.AbsentRetry
+
+  # `terminate/2` has the child's 5 s shutdown timeout for two deletes, each
+  # one call plus this budget's sleeps (200 ms). A registry that holds the
+  # first call for a default 5 s would get the provider killed before the
+  # Discovery delete and its Core push.
+  @deregister_retry {5, 50}
+  @deregister_call_timeout 1_000
 
   @service "mqtt"
   @user "addons"
@@ -78,22 +94,45 @@ defmodule Vagus.Mqtt.Broker.Provider do
     publish_service(services, slug, payload)
     uuid = publish_discovery(discovery, slug, payload, push)
 
-    {:ok, %{slug: slug, services: services, discovery: discovery, push: push, uuid: uuid}}
+    {:ok,
+     %{
+       slug: slug,
+       services: services,
+       discovery: discovery,
+       push: push,
+       uuid: uuid,
+       deregister_retry: Keyword.get(opts, :deregister_retry, @deregister_retry),
+       call_timeout: Keyword.get(opts, :deregister_call_timeout, @deregister_call_timeout)
+     }}
   end
 
   @impl GenServer
-  def terminate(_reason, state) do
-    if alive?(state.services),
-      do: best_effort(fn -> Vagus.Services.delete(@service, state.slug, state.services) end)
+  def terminate(_reason, %{slug: slug, deregister_retry: retry, call_timeout: timeout} = state) do
+    services = fn -> Vagus.Services.delete(@service, slug, state.services, timeout) end
 
-    if state.uuid && alive?(state.discovery) do
-      case best_effort(fn -> Vagus.Discovery.delete(state.uuid, state.slug, state.discovery) end) do
-        {:ok, message} -> state.push.(:delete, message)
-        _ -> :ok
+    case AbsentRetry.call(services, retry) do
+      {:ok, _reply} -> :ok
+      {:error, tag} -> log_left(slug, "Services", tag)
+    end
+
+    if state.uuid do
+      discovery = fn -> Vagus.Discovery.delete(state.uuid, slug, state.discovery, timeout) end
+
+      case AbsentRetry.call(discovery, retry) do
+        {:ok, {:ok, message}} -> state.push.(:delete, message)
+        {:ok, _not_deleted} -> :ok
+        {:error, tag} -> log_left(slug, "Discovery", tag)
       end
     end
 
     :ok
+  end
+
+  defp log_left(slug, registry, tag) do
+    Logger.error(
+      "Vagus.Mqtt.Broker.Provider: #{registry} delete for #{slug} failed (#{tag}); " <>
+        "its entry may stay until a reboot"
+    )
   end
 
   ## Internals
@@ -189,7 +228,11 @@ defmodule Vagus.Mqtt.Broker.Provider do
     fun.()
   catch
     :exit, reason ->
-      Logger.debug("Vagus.Mqtt.Broker.Provider: registry call skipped (exit #{inspect(reason)})")
+      # The tag only: the reason holds the call's arguments, password included.
+      Logger.debug(
+        "Vagus.Mqtt.Broker.Provider: registry call skipped (exit #{AbsentRetry.tag(reason)})"
+      )
+
       :error
   end
 end
