@@ -2637,39 +2637,57 @@ defmodule Vagus.API.Router do
 
   defp handle_install(conn, slug) do
     if conn.assigns.caller == :supervisor do
-      case Store.get(slug) do
-        {:ok, %{config: entry_config}} ->
-          # The store entry's own `config.slug` is the add-on's bare slug
-          # (e.g. "mosquitto"); installed add-ons run under the store slug
-          # (e.g. "core_mosquitto" — see `Vagus.Addon.Store`'s moduledoc).
-          config = %{entry_config | slug: slug}
-
-          case Availability.check(config) do
-            {true, nil} ->
-              do_install(conn, config)
-
-            {false, reason} ->
-              # Refused BEFORE any image pull (audit G1) — upstream's own
-              # `_validate_availability` runs at the very top of install,
-              # for the same reason: a pull for the wrong architecture is a
-              # slow, confusing way to fail something `arch`/`machine`/
-              # `homeassistant` already answer for free.
-              Envelope.send_error(conn, reason, 400)
-          end
-
-        :error ->
-          Envelope.send_error(conn, "Addon #{slug} does not exist in the store", 404)
-      end
+      install_unless_installed(conn, slug)
     else
       Envelope.send_error(conn, "unauthorized", 403)
     end
   end
 
+  # Answers an installed slug before the store is consulted, as upstream
+  # does. `Manager.install_new/2` is what holds against a concurrent install.
+  defp install_unless_installed(conn, slug) do
+    case State.get(slug) do
+      {:ok, %{config: installed}} -> send_already_installed(conn, installed)
+      :error -> install_from_store(conn, slug)
+    end
+  end
+
+  defp send_already_installed(conn, installed),
+    do: Envelope.send_error(conn, "Addon #{installed.name} is already installed", 400)
+
+  defp install_from_store(conn, slug) do
+    case Store.get(slug) do
+      {:ok, %{config: entry_config}} ->
+        # The store entry's own `config.slug` is the add-on's bare slug
+        # (e.g. "mosquitto"); installed add-ons run under the store slug
+        # (e.g. "core_mosquitto" — see `Vagus.Addon.Store`'s moduledoc).
+        config = %{entry_config | slug: slug}
+
+        case Availability.check(config) do
+          {true, nil} ->
+            do_install(conn, config)
+
+          {false, reason} ->
+            # Refused BEFORE any image pull (audit G1) — upstream's own
+            # `_validate_availability` runs at the very top of install,
+            # for the same reason: a pull for the wrong architecture is a
+            # slow, confusing way to fail something `arch`/`machine`/
+            # `homeassistant` already answer for free.
+            Envelope.send_error(conn, reason, 400)
+        end
+
+      :error ->
+        Envelope.send_error(conn, "Addon #{slug} does not exist in the store", 404)
+    end
+  end
+
   defp do_install(conn, config) do
-    case Manager.install(config) do
+    case Manager.install_new(config) do
       :ok ->
-        :ok = State.put(config, :stopped)
         Envelope.send_ok(conn, %{})
+
+      {:error, {:already_installed, installed}} ->
+        send_already_installed(conn, installed)
 
       {:error, reason} ->
         Envelope.send_error(conn, inspect(reason), 400)

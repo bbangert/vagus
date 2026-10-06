@@ -69,12 +69,13 @@ defmodule Vagus.Addon.BootStarter do
   `opts[:state]`, default `Vagus.Addon.State`) exactly once:
 
     * `state: :started`, effective boot `"auto"` → `Vagus.Addon.Manager.start_slug/2`,
-      serially. A `{:error, reason}` demotes the entry to `:stopped` (via
-      the same `opts[:state]` ref) rather than leaving a stale `:started`
+      serially. A `{:error, reason}` demotes the entry to `:stopped`
+      (`Vagus.Addon.Manager.demote/2`) rather than leaving a stale `:started`
       record for an add-on that isn't actually running.
     * `state: :started`, effective boot `"manual"` → demoted to `:stopped`
       without starting — real Supervisor does not auto-start manual-boot
-      add-ons either.
+      add-ons either. One that something else has started since is left
+      `:started`.
     * `state: :stopped` → left alone.
 
   "Effective boot" (`Vagus.Addon.Config.effective_boot/2`) is the entry's
@@ -89,9 +90,9 @@ defmodule Vagus.Addon.BootStarter do
   After that single pass the GenServer is idle; it does no further polling
   or reconciliation for the rest of this boot.
 
-  `opts[:state]` only redirects *this module's* `list/0`/`put/3` calls.
-  `Vagus.Addon.Manager.start_slug/2` itself always resolves the add-on's
-  config via the real, globally-named `Vagus.Addon.State` (it has no
+  `opts[:state]` only redirects *this module's* `list/0` call.
+  `Vagus.Addon.Manager.start_slug/2` and `demote/2` always resolve the add-on
+  via the real, globally-named `Vagus.Addon.State` (they have no
   server-ref option) — so a test that wants `start_slug/2` to actually see
   the seeded entries must seed the real global `Vagus.Addon.State` (as
   `test/vagus/addon/manager_test.exs`'s lifecycle tests already do), not a
@@ -199,10 +200,10 @@ defmodule Vagus.Addon.BootStarter do
   defp reconcile(%{state_server: server}) do
     server
     |> State.list()
-    |> Enum.each(&reconcile_entry(&1, server))
+    |> Enum.each(&reconcile_entry/1)
   end
 
-  defp reconcile_entry(%{state: :started, config: config} = entry, server) do
+  defp reconcile_entry(%{state: :started, config: config} = entry) do
     if Config.effective_boot(config, entry[:boot]) == "auto" do
       case Manager.start_slug(config.slug) do
         {:ok, _result} ->
@@ -214,16 +215,25 @@ defmodule Vagus.Addon.BootStarter do
               "(#{inspect(reason)}), demoting to :stopped"
           )
 
-          State.put(config, :stopped, server: server)
+          demote(config.slug)
       end
     else
       # Effective boot is "manual" (persisted override, or config default/
       # manual_only) — demoted without starting, same as real Supervisor.
-      State.put(config, :stopped, server: server)
+      demote(config.slug)
     end
   end
 
-  defp reconcile_entry(%{state: :stopped}, _server), do: :ok
+  defp reconcile_entry(%{state: :stopped}), do: :ok
+
+  # A failure here would restart this process, and its next pass would start
+  # every `:started` add-on again.
+  defp demote(slug) do
+    Manager.demote(slug)
+  catch
+    kind, _reason when kind in [:error, :exit] ->
+      Logger.error("Vagus.Addon.BootStarter: demoting #{slug} failed; it may stay :started")
+  end
 
   defp default_ping, do: Vagus.Runtime.Docker.ping()
 

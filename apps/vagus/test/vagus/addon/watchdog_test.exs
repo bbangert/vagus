@@ -4,7 +4,8 @@ defmodule Vagus.Addon.WatchdogTest do
   test injects `:manager`, `:running_check`, `:state`, and `:clock` so
   nothing here touches a real docker daemon, the real `Vagus.Addon.State`
   singleton, or a real clock — same hermetic-injection style as
-  `boot_starter_test.exs`.
+  `boot_starter_test.exs`. The tests that give up through the real
+  `Vagus.Addon.Manager` use the real `State`, the only one it reads.
 
   `Vagus.Addon.WatchdogTest.FakeManager` (bottom of file) is the module
   passed as `:manager`; since its functions run inside the watchdog's own
@@ -19,7 +20,9 @@ defmodule Vagus.Addon.WatchdogTest do
 
   use ExUnit.Case, async: false
 
-  alias Vagus.Addon.{Config, State, Watchdog}
+  import ExUnit.CaptureLog
+
+  alias Vagus.Addon.{Backend.Fake, Config, Registry, State, Watchdog}
   alias Vagus.Addon.WatchdogTest.FakeManager
 
   @thirty_min_ms 30 * 60 * 1_000
@@ -94,6 +97,66 @@ defmodule Vagus.Addon.WatchdogTest do
   defp always(result), do: fn _kind, _slug -> result end
 
   defp set_manager_result(fun), do: Application.put_env(:vagus, :watchdog_test_result_fun, fun)
+  defp set_demote(fun), do: Application.put_env(:vagus, :watchdog_test_demote_fun, fun)
+
+  # What `Vagus.Addon.Manager.demote/2` does to the real `State`, against the
+  # private one the Watchdog under test reads.
+  defp demote_in(state_pid, slug) do
+    with {:ok, %{config: config}} <- State.get(slug, state_pid) do
+      State.put(config, :stopped, server: state_pid)
+    end
+
+    :ok
+  end
+
+  # The real `State` and `Registry`, with a token registered for the add-on.
+  defp seed_real(slug) do
+    config = fixture_config(slug)
+    :ok = State.put(config, :started)
+    :ok = State.put_setting(slug, :watchdog, true)
+    token = "token-#{slug}"
+    :ok = Registry.register(token, Registry.identity_from_config(config))
+
+    Fake.reset_calls()
+
+    on_exit(fn ->
+      State.delete(slug)
+      Registry.unregister_slug(slug)
+    end)
+
+    set_demote(fn slug -> Vagus.Addon.Manager.demote(slug, backend: Fake) end)
+    token
+  end
+
+  # A `:sleep` that parks the sequence at each backoff, so the test learns
+  # its pid while it is still alive.
+  defp parking_sleep do
+    test = self()
+
+    fn _ms ->
+      send(test, {:backoff, self()})
+
+      receive do
+        :resume -> :ok
+      end
+    end
+  end
+
+  # Walks a parked sequence through its four backoffs and returns the reason
+  # it went down with.
+  defp run_to_give_up do
+    assert_receive {:backoff, sequence}, 5_000
+    ref = Process.monitor(sequence)
+    send(sequence, :resume)
+
+    for _ <- 2..4 do
+      assert_receive {:backoff, ^sequence}, 5_000
+      send(sequence, :resume)
+    end
+
+    assert_receive {:DOWN, ^ref, :process, ^sequence, reason}, 5_000
+    reason
+  end
 
   # Retries `fun` (a 0-arity predicate) until truthy or attempts exhausted —
   # the restart sequence runs in its own Task on its own schedule.
@@ -114,9 +177,12 @@ defmodule Vagus.Addon.WatchdogTest do
     on_exit(fn ->
       Application.delete_env(:vagus, :watchdog_test_pid)
       Application.delete_env(:vagus, :watchdog_test_result_fun)
+      Application.delete_env(:vagus, :watchdog_test_demote_fun)
     end)
 
-    %{state_pid: start_state()}
+    state_pid = start_state()
+    set_demote(&demote_in(state_pid, &1))
+    %{state_pid: state_pid}
   end
 
   ## 1: die -> start_slug
@@ -252,6 +318,84 @@ defmodule Vagus.Addon.WatchdogTest do
     assert eventually(fn -> match?({:ok, %{state: :stopped}}, State.get(slug, state_pid)) end)
     # Exactly four backoffs — the sequence gave up on attempt 5, not slept again.
     refute_received {:backoff, _}
+  end
+
+  test "giving up records a dead add-on :stopped and revokes its token" do
+    slug = unique_slug("wd")
+    token = seed_real(slug)
+    set_manager_result(always({:error, :boom}))
+
+    pid =
+      start_watchdog(
+        manager: FakeManager,
+        running_check: fn _slug -> false end,
+        sleep: parking_sleep()
+      )
+
+    send(pid, die_event(slug))
+    assert_receive {:start_slug, ^slug}, 5_000
+    assert {:ok, %{slug: ^slug}} = Registry.identity_for_token(token)
+
+    assert run_to_give_up() == :normal
+    assert {:ok, %{state: :stopped}} = State.get(slug)
+    assert :error = Registry.identity_for_token(token)
+  end
+
+  # Something else started it after the last failed attempt.
+  test "giving up leaves an add-on that is running after all :started, with its token" do
+    slug = unique_slug("wd")
+    token = seed_real(slug)
+    :ok = Fake.start("addon_#{slug}")
+    set_manager_result(always({:error, :boom}))
+
+    pid =
+      start_watchdog(
+        manager: FakeManager,
+        running_check: fn _slug -> false end,
+        sleep: parking_sleep()
+      )
+
+    send(pid, die_event(slug))
+
+    log = capture_log(fn -> assert run_to_give_up() == :normal end)
+
+    assert_received {:demote, ^slug}
+    assert {:ok, %{state: :started}} = State.get(slug)
+    assert {:ok, %{slug: ^slug}} = Registry.identity_for_token(token)
+    assert log =~ "#{slug} is running after all"
+  end
+
+  for {name, demote, logged} <- [
+        {"hangs", quote(do: fn _slug -> receive(do: (:never -> :ok)) end), "timed out"},
+        {"exits", quote(do: fn _slug -> exit(:boom) end), "failed"},
+        {"raises", quote(do: fn _slug -> raise "boom" end), "failed"},
+        {"returns an error", quote(do: fn _slug -> {:error, :boom} end), "failed"}
+      ] do
+    test "a demotion that #{name} is logged as such, and the sequence still ends", %{
+      state_pid: state_pid
+    } do
+      slug = unique_slug("wd")
+      seed(state_pid, slug, :started, true)
+      set_manager_result(always({:error, :boom}))
+      set_demote(unquote(demote))
+
+      pid =
+        start_watchdog(
+          state: state_pid,
+          manager: FakeManager,
+          running_check: fn _slug -> false end,
+          sleep: parking_sleep(),
+          attempt_timeout_ms: 200
+        )
+
+      send(pid, die_event(slug))
+
+      log = capture_log(fn -> assert run_to_give_up() == :normal end)
+
+      assert_received {:demote, ^slug}
+      assert log =~ "demoting #{slug} #{unquote(logged)};"
+      refute log =~ "boom"
+    end
   end
 
   ## 4b (W1): a manager call that never returns is bounded, not wedged
@@ -491,7 +635,12 @@ defmodule Vagus.Addon.WatchdogTest do
     def start_slug(slug, opts), do: dispatch(:start_slug, slug, opts)
     def restart(slug, opts), do: dispatch(:restart, slug, opts)
 
-    defp dispatch(kind, slug, _opts) do
+    def demote(slug, _opts) do
+      notify(:demote, slug)
+      Application.get_env(:vagus, :watchdog_test_demote_fun, fn _slug -> :ok end).(slug)
+    end
+
+    defp notify(kind, slug) do
       case Application.get_env(:vagus, :watchdog_test_pid) do
         pid when is_pid(pid) ->
           send(pid, {kind, slug})
@@ -499,6 +648,10 @@ defmodule Vagus.Addon.WatchdogTest do
         _ ->
           :ok
       end
+    end
+
+    defp dispatch(kind, slug, _opts) do
+      notify(kind, slug)
 
       fun =
         Application.get_env(:vagus, :watchdog_test_result_fun, fn _kind, _slug ->

@@ -46,7 +46,11 @@ defmodule Vagus.Addon.Backend.Fake do
     if :ets.whereis(@table) == :undefined do
       []
     else
-      @table |> :ets.tab2list() |> Enum.sort_by(&elem(&1, 0)) |> Enum.map(&elem(&1, 1))
+      @table
+      |> :ets.tab2list()
+      |> Enum.filter(&is_integer(elem(&1, 0)))
+      |> Enum.sort_by(&elem(&1, 0))
+      |> Enum.map(&elem(&1, 1))
     end
   end
 
@@ -89,19 +93,26 @@ defmodule Vagus.Addon.Backend.Fake do
   @impl true
   def start(id) do
     record({:start, id})
+    if :ets.whereis(@table) != :undefined, do: :ets.insert(@table, {{:running, id}, true})
     :ok
   end
 
   @impl true
   def stop(id, _opts \\ []) do
     record({:stop, id})
+    not_running(id)
     :ok
   end
 
   @impl true
   def remove(id, _opts \\ []) do
     record({:remove, id})
+    not_running(id)
     :ok
+  end
+
+  defp not_running(id) do
+    if :ets.whereis(@table) != :undefined, do: :ets.delete(@table, {:running, id})
   end
 
   @impl true
@@ -110,6 +121,13 @@ defmodule Vagus.Addon.Backend.Fake do
     :ok
   end
 
+  # Follows start/stop/remove, because `Manager.demote/2` acts on the answer.
+  # Kept with the recorded calls, so only after a `reset_calls/0`, which also
+  # clears it.
   @impl true
-  def state(_id), do: {:ok, :running}
+  def state(id) do
+    if :ets.whereis(@table) != :undefined and :ets.member(@table, {:running, id}),
+      do: {:ok, :running},
+      else: {:ok, :stopped}
+  end
 end

@@ -111,6 +111,27 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
 
   defp body(conn), do: Jason.decode!(conn.resp_body)
 
+  defmodule GatedPull do
+    @moduledoc false
+    def pull(_spec) do
+      send(:persistent_term.get(__MODULE__), {:pulling, self()})
+
+      receive do
+        :pulled -> :ok
+      end
+    end
+  end
+
+  # An installed slug refuses a second install, so every install is undone.
+  defp install!(slug) do
+    on_exit(fn ->
+      State.delete(slug)
+      Registry.unregister_slug(slug)
+    end)
+
+    assert supervisor_call(:post, "/store/addons/#{slug}/install").status == 200
+  end
+
   # Bounded poll for background-task completion, the `boot_starter_test.exs`
   # idiom: retries `fun` (a 0-arity predicate) until truthy or the window
   # elapses — a genuinely-stuck job still fails the enclosing assert.
@@ -145,6 +166,85 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
       conn = supervisor_call(:post, "/addons/core_testaddon2/install")
       assert conn.status == 200
       assert {:ok, %{state: :stopped}} = State.get("core_testaddon2")
+    end
+
+    for {state, title} <- [started: "a running", stopped: "a stopped"] do
+      test "an install of an already-installed add-on is refused: #{title} one" do
+        slug = "core_reinstall_#{System.unique_integer([:positive])}"
+        installed = %{fixture_config("reinstall") | slug: slug, name: "Installed Name"}
+        seed_store(slug, %{installed | name: "Store Name", version: "4"})
+        :ok = State.put(installed, unquote(state))
+        on_exit(fn -> State.delete(slug) end)
+        Vagus.Addon.Backend.Fake.reset_calls()
+
+        conn = supervisor_call(:post, "/store/addons/#{slug}/install")
+
+        assert conn.status == 400
+        assert body(conn)["message"] == "Addon Installed Name is already installed"
+        assert {:ok, %{state: unquote(state), config: ^installed}} = State.get(slug)
+        assert Vagus.Addon.Backend.Fake.calls_for("addon_#{slug}") == []
+      end
+    end
+
+    test "the legacy install alias refuses an already-installed add-on the same way" do
+      slug = "core_reinstall_legacy_#{System.unique_integer([:positive])}"
+      config = %{fixture_config("reinstall") | slug: slug}
+      seed_store(slug, config)
+      :ok = State.put(config, :stopped)
+      on_exit(fn -> State.delete(slug) end)
+
+      conn = supervisor_call(:post, "/addons/#{slug}/install")
+
+      assert conn.status == 400
+      assert body(conn)["message"] == "Addon Test Addon is already installed"
+    end
+
+    test "an installed add-on its repository no longer lists is still 'already installed'" do
+      slug = "core_reinstall_detached_#{System.unique_integer([:positive])}"
+      :ok = State.put(%{fixture_config("reinstall") | slug: slug}, :stopped)
+      on_exit(fn -> State.delete(slug) end)
+
+      conn = supervisor_call(:post, "/store/addons/#{slug}/install")
+
+      assert conn.status == 400
+      assert body(conn)["message"] == "Addon Test Addon is already installed"
+    end
+
+    # Whether a slug is installed is not an add-on's to learn.
+    test "an add-on caller gets the 403 for an installed slug too" do
+      slug = "core_reinstall_403_#{System.unique_integer([:positive])}"
+      config = %{fixture_config("reinstall") | slug: slug}
+      seed_store(slug, config)
+      :ok = State.put(config, :stopped)
+      on_exit(fn -> State.delete(slug) end)
+
+      conn = addon_call(:post, "/store/addons/#{slug}/install", "some_addon")
+
+      assert conn.status == 403
+      assert body(conn)["message"] == "unauthorized"
+    end
+
+    # It found no entry when it looked; another install recorded one, and the
+    # add-on was started, while this one was pulling.
+    test "an install that finds the add-on installed once it has pulled is refused" do
+      slug = "core_overlap_#{System.unique_integer([:positive])}"
+      config = %{fixture_config("overlap") | slug: slug}
+      seed_store(slug, config)
+      on_exit(fn -> State.delete(slug) end)
+      :persistent_term.put(__MODULE__.GatedPull, self())
+      on_exit(fn -> :persistent_term.erase(__MODULE__.GatedPull) end)
+      Application.put_env(:vagus, :addon_backend, __MODULE__.GatedPull)
+
+      install = Task.async(fn -> supervisor_call(:post, "/store/addons/#{slug}/install") end)
+      assert_receive {:pulling, puller}, 5_000
+      :ok = State.put(config, :started)
+
+      send(puller, :pulled)
+      conn = Task.await(install, 60_000)
+
+      assert conn.status == 400
+      assert body(conn)["message"] == "Addon Test Addon is already installed"
+      assert {:ok, %{state: :started}} = State.get(slug)
     end
 
     test "an unknown store slug -> 404" do
@@ -861,7 +961,7 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
     test "an installed add-on still gets the installed shape, not the store's" do
       config = fixture_config("realinstall")
       seed_store("core_realinstall", config)
-      assert supervisor_call(:post, "/store/addons/core_realinstall/install").status == 200
+      install!("core_realinstall")
 
       info = json(supervisor_call(:get, "/addons/core_realinstall/info"))["data"]
       assert info["state"] == "stopped"
@@ -885,8 +985,7 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
       installed = fixture_config("verbump")
       seed_store("core_verbump", installed)
 
-      conn = supervisor_call(:post, "/store/addons/core_verbump/install")
-      assert conn.status == 200
+      install!("core_verbump")
 
       # Installed and store agree: nothing to update.
       before = json(supervisor_call(:get, "/store/addons/core_verbump"))["data"]
@@ -921,7 +1020,7 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
     test "an add-on detached from the store reports no update, not an error" do
       installed = fixture_config("detached")
       seed_store("core_detached", installed)
-      assert supervisor_call(:post, "/store/addons/core_detached/install").status == 200
+      install!("core_detached")
 
       # First move the store ahead, so the "no update" below can only be
       # caused by detachment — not by the store happening to match.
@@ -951,7 +1050,7 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
       # this fails; the hand-driven `State` tests would not notice.
       installed = fixture_config("lifecycleversion")
       seed_store("core_lifecycleversion", installed)
-      assert supervisor_call(:post, "/store/addons/core_lifecycleversion/install").status == 200
+      install!("core_lifecycleversion")
 
       seed_store("core_lifecycleversion", %{installed | version: "9.9.9"})
 
@@ -994,7 +1093,7 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
     test "updates an installed add-on and reports the new version on the wire" do
       installed = fixture_config("updrt")
       seed_store("core_updrt", installed)
-      assert supervisor_call(:post, "/store/addons/core_updrt/install").status == 200
+      install!("core_updrt")
 
       seed_store("core_updrt", %{installed | version: "9.9.9"})
 
@@ -1015,7 +1114,7 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
           ] do
         installed = fixture_config(slug)
         seed_store(slug, installed)
-        assert supervisor_call(:post, "/store/addons/#{slug}/install").status == 200
+        install!(slug)
         seed_store(slug, %{installed | version: "9.9.9"})
 
         # Upstream registers `/update/{version}` and never reads the segment —
@@ -1033,7 +1132,7 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
     test "background: true returns {job_id} and the update completes in a task" do
       installed = fixture_config("updbg")
       seed_store("core_updbg", installed)
-      assert supervisor_call(:post, "/store/addons/core_updbg/install").status == 200
+      install!("core_updbg")
       seed_store("core_updbg", %{installed | version: "9.9.9"})
 
       conn = supervisor_call(:post, "/store/addons/core_updbg/update", %{"background" => true})
@@ -1061,7 +1160,7 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
     test "background: true at the task-supervisor cap is a 429, job finished with an error" do
       installed = fixture_config("updbgcap")
       seed_store("core_updbgcap", installed)
-      assert supervisor_call(:post, "/store/addons/core_updbgcap/install").status == 200
+      install!("core_updbgcap")
       seed_store("core_updbgcap", %{installed | version: "9.9.9"})
 
       # Saturate Vagus.Jobs.TaskSupervisor (max_children: 8) with parked
@@ -1113,7 +1212,7 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
     test "background: false and an absent body both proceed synchronously" do
       installed = fixture_config("updbgfalse")
       seed_store("core_updbgfalse", installed)
-      assert supervisor_call(:post, "/store/addons/core_updbgfalse/install").status == 200
+      install!("core_updbgfalse")
       seed_store("core_updbgfalse", %{installed | version: "9.9.9"})
 
       conn =
@@ -1125,7 +1224,7 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
     test "a sync update is wrapped in a job too, done when the response lands" do
       installed = fixture_config("updsyncjob")
       seed_store("core_updsyncjob", installed)
-      assert supervisor_call(:post, "/store/addons/core_updsyncjob/install").status == 200
+      install!("core_updsyncjob")
       seed_store("core_updsyncjob", %{installed | version: "9.9.9"})
 
       assert supervisor_call(:post, "/store/addons/core_updsyncjob/update", %{}).status == 200
@@ -1146,7 +1245,7 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
 
     test "a failed update finishes its job with an honest error entry" do
       seed_store("core_updjobfail", fixture_config("updjobfail"))
-      assert supervisor_call(:post, "/store/addons/core_updjobfail/install").status == 200
+      install!("core_updjobfail")
       # No store version bump: the update 400s with "No update available".
 
       conn = supervisor_call(:post, "/store/addons/core_updjobfail/update", %{})
@@ -1169,7 +1268,7 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
     test "unknown body keys are ignored (aiohttp tolerance)" do
       installed = fixture_config("updunknown")
       seed_store("core_updunknown", installed)
-      assert supervisor_call(:post, "/store/addons/core_updunknown/install").status == 200
+      install!("core_updunknown")
       seed_store("core_updunknown", %{installed | version: "9.9.9"})
 
       conn =
@@ -1181,7 +1280,7 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
     test "an add-on with no update available is a 400, not a silent success" do
       installed = fixture_config("updsame")
       seed_store("core_updsame", installed)
-      assert supervisor_call(:post, "/store/addons/core_updsame/install").status == 200
+      install!("core_updsame")
 
       conn = supervisor_call(:post, "/store/addons/core_updsame/update", %{})
 
@@ -1201,7 +1300,7 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
     test "a detached add-on is 404, naming the store rather than the install" do
       installed = fixture_config("upddetached")
       seed_store("core_upddetached", installed)
-      assert supervisor_call(:post, "/store/addons/core_upddetached/install").status == 200
+      install!("core_upddetached")
       :ok = GenServer.call(Store, {:put_catalog, Map.delete(Store.catalog(), "core_upddetached")})
 
       conn = supervisor_call(:post, "/store/addons/core_upddetached/update", %{})

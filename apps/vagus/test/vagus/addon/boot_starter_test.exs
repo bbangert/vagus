@@ -13,7 +13,7 @@ defmodule Vagus.Addon.BootStarterTest do
 
   import ExUnit.CaptureLog
 
-  alias Vagus.Addon.{Backend.Fake, BootStarter, Config, State}
+  alias Vagus.Addon.{Backend.Fake, BootStarter, Config, Registry, State}
 
   setup do
     prev_backend = Application.get_env(:vagus, :addon_backend)
@@ -208,6 +208,112 @@ defmodule Vagus.Addon.BootStarterTest do
 
     assert eventually(fn -> match?({:ok, %{state: :stopped}}, State.get(slug)) end)
     assert Fake.calls_for("addon_#{slug}") == []
+  end
+
+  # A token registered for the add-on before the pass reaches it.
+  defp register_dead_token(config) do
+    token = "dead-#{config.slug}"
+    :ok = Registry.register(token, Registry.identity_from_config(config))
+    on_exit(fn -> Registry.unregister_slug(config.slug) end)
+    token
+  end
+
+  # Reconciliation runs in `handle_continue`, so any reply comes after it.
+  defp reconcile_now do
+    pid =
+      start_supervised!(
+        {BootStarter,
+         api_ready: fn -> true end,
+         ping: fn -> :ok end,
+         ensure_network: fn -> :ok end,
+         interval: 1,
+         max_attempts: 5,
+         name: nil}
+      )
+
+    :sys.get_state(pid)
+  end
+
+  test "a start failure revokes the token of the add-on it demotes" do
+    slug = "boot_fail_revoke_#{System.unique_integer([:positive])}"
+
+    # Fails in option validation, before a start revokes anything itself.
+    config =
+      fixture_config(slug, %{
+        "boot" => "auto",
+        "schema" => %{"port" => "port"},
+        "options" => %{"port" => 70_000}
+      })
+
+    seed(slug, :started, config)
+    token = register_dead_token(config)
+    assert {:ok, %{slug: ^slug}} = Registry.identity_for_token(token)
+
+    capture_log(fn -> reconcile_now() end)
+
+    assert {:ok, %{state: :stopped}} = State.get(slug)
+    assert :error = Registry.identity_for_token(token)
+  end
+
+  test "a boot: manual demotion revokes the add-on's token" do
+    slug = "boot_manual_revoke_#{System.unique_integer([:positive])}"
+    config = seed(slug, :started, fixture_config(slug, %{"boot" => "manual"}))
+    token = register_dead_token(config)
+    assert {:ok, %{slug: ^slug}} = Registry.identity_for_token(token)
+
+    reconcile_now()
+
+    assert {:ok, %{state: :stopped}} = State.get(slug)
+    assert :error = Registry.identity_for_token(token)
+  end
+
+  # Started through the API after the pass took its snapshot of `State`.
+  test "a boot: manual add-on that is running is left :started, with its token" do
+    slug = "boot_manual_running_#{System.unique_integer([:positive])}"
+    config = seed(slug, :started, fixture_config(slug, %{"boot" => "manual"}))
+    token = register_dead_token(config)
+    :ok = Fake.start("addon_#{slug}")
+
+    reconcile_now()
+
+    assert {:ok, %{state: :started}} = State.get(slug)
+    assert {:ok, %{slug: ^slug}} = Registry.identity_for_token(token)
+  end
+
+  # A restart would run the pass again, and start every `:started` add-on.
+  for {name, backend} <- [{"exits", ExitingBackend}, {"raises", RaisingBackend}] do
+    test "a demotion that #{name} does not take the BootStarter down" do
+      slug = "boot_demote_fails_#{System.unique_integer([:positive])}"
+      seed(slug, :started, fixture_config(slug, %{"boot" => "manual"}))
+      Application.put_env(:vagus, :addon_backend, Module.concat(__MODULE__, unquote(backend)))
+
+      log = capture_log(fn -> assert %{phase: :api} = reconcile_now() end)
+
+      assert log =~ "demoting #{slug} failed"
+      assert {:ok, %{state: :started}} = State.get(slug)
+    end
+  end
+
+  # `Fake`, but for the liveness answer: the pass also starts whatever
+  # `:started` entries other tests left in the shared State.
+  defmodule ExitingBackend do
+    @moduledoc false
+    defdelegate pull(spec), to: Fake
+    defdelegate create(spec), to: Fake
+    defdelegate start(id), to: Fake
+    defdelegate stop(id, opts), to: Fake
+    defdelegate remove(id, opts), to: Fake
+    def state(_id), do: exit(:engine_gone)
+  end
+
+  defmodule RaisingBackend do
+    @moduledoc false
+    defdelegate pull(spec), to: Fake
+    defdelegate create(spec), to: Fake
+    defdelegate start(id), to: Fake
+    defdelegate stop(id, opts), to: Fake
+    defdelegate remove(id, opts), to: Fake
+    def state(_id), do: raise("no state for this backend")
   end
 
   # Phase 6 chunk A (audit E1): the persisted per-install `boot` override —

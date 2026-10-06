@@ -279,6 +279,51 @@ defmodule Vagus.Addon.Backend.NativeTest do
       refute Native.running?(@id)
     end
 
+    # `Vagus.Addon.DefaultProvider` starts the broker whatever its boot
+    # setting, and `BootStarter` reconciles after it.
+    test "boot reconciliation leaves a running manual-boot broker :started, token and name intact",
+         %{token: token} do
+      :ok = State.put_setting(@slug, :boot, "manual")
+      prev = Application.get_env(:vagus, :addon_boot_start)
+      Application.put_env(:vagus, :addon_boot_start, true)
+      on_exit(fn -> restore_env(:addon_boot_start, prev) end)
+
+      starter =
+        start_supervised!(
+          {Vagus.Addon.BootStarter,
+           name: nil,
+           ping: fn -> :ok end,
+           api_ready: fn -> true end,
+           ensure_network: fn -> :ok end}
+        )
+
+      # Reconciliation runs in `handle_continue`, so any reply comes after it.
+      :sys.get_state(starter)
+
+      assert {:ok, %{state: :started}} = State.get(@slug)
+      assert Native.running?(@id)
+      assert {:ok, %{slug: @slug}} = Vagus.Addon.Registry.identity_for_token(token)
+      assert {:ok, _ip} = Vagus.DNS.resolve("core-mqtt", Vagus.DNS)
+    end
+
+    test "a restart that fails after stopping the broker revokes the token it ran with", %{
+      dr: dr,
+      token: token
+    } do
+      # Over an empty State of its own, so it has no entry to allocate for.
+      empty = start_supervised!({State, name: :native_empty_state, persist_path: nil})
+      start_supervised!({Vagus.Ingress, name: :native_failing_ingress, state: empty})
+      ingress = %{mqtt_config() | ingress: true, ingress_port: 0}
+      assert {:ok, %{slug: @slug}} = Vagus.Addon.Registry.identity_for_token(token)
+
+      assert {:error, {:ingress_port, :not_found}} =
+               Manager.start(ingress, data_root: dr, ingress_server: :native_failing_ingress)
+
+      refute Native.running?(@id)
+      assert :error = Vagus.Addon.Registry.identity_for_token(token)
+      assert :error = Vagus.DNS.resolve("core-mqtt", Vagus.DNS)
+    end
+
     test "DNS advertises the broker at the supervisor anchor IP" do
       assert {:ok, {172, 30, 32, 2}} = Vagus.DNS.resolve("core-mqtt", Vagus.DNS)
     end
@@ -415,7 +460,12 @@ defmodule Vagus.Addon.Backend.NativeTest do
       :persistent_term.put(FakeState, self())
       on_exit(fn -> :persistent_term.erase(FakeState) end)
       name = :"sentinel_#{System.unique_integer([:positive])}"
-      start_supervised!({Native.Sentinel, name: name, state_mod: FakeState, recheck_ms: 100})
+
+      start_supervised!(
+        {Native.Sentinel,
+         name: name, state_mod: FakeState, demote_fun: demote_in(FakeState), recheck_ms: 100}
+      )
+
       %{sentinel: name}
     end
 
@@ -469,7 +519,11 @@ defmodule Vagus.Addon.Backend.NativeTest do
       # under the default (module) id.
       start_supervised!(
         Supervisor.child_spec(
-          {Native.Sentinel, name: name, state_mod: ReconcileState, recheck_ms: 100},
+          {Native.Sentinel,
+           name: name,
+           state_mod: ReconcileState,
+           demote_fun: demote_in(ReconcileState),
+           recheck_ms: 100},
           id: name
         )
       )
@@ -497,7 +551,7 @@ defmodule Vagus.Addon.Backend.NativeTest do
       end
     end
 
-    defp start_revive_sentinel(ctx_name, config, revive_fun) do
+    defp start_revive_sentinel(ctx_name, config, revive_fun, demote_fun \\ demote_in(ReviveState)) do
       :persistent_term.put(ReviveState, self())
       :persistent_term.put({ReviveState, :entry}, {:ok, %{state: :started, config: config}})
 
@@ -511,6 +565,7 @@ defmodule Vagus.Addon.Backend.NativeTest do
           {Native.Sentinel,
            name: ctx_name,
            state_mod: ReviveState,
+           demote_fun: demote_fun,
            recheck_ms: 50,
            revive_delay_ms: 50,
            revive_retry_ms: 50,
@@ -625,6 +680,74 @@ defmodule Vagus.Addon.Backend.NativeTest do
       refute_receive {:revive_called, _}, 500
     end
 
+    # The fake records `:stopped` all the same, so a revive that was scheduled
+    # would find nothing to stop it.
+    test "no revive when the demotion found the add-on running" do
+      test = self()
+      id = unique_id()
+      config = %{boot: "auto", slug: Native.slug_from_id(id)}
+      put = demote_in(ReviveState)
+
+      sentinel =
+        start_revive_sentinel(
+          :"rv_#{System.unique_integer([:positive])}",
+          config,
+          fn cfg ->
+            send(test, {:revive_called, cfg})
+            {:ok, %{}}
+          end,
+          fn slug ->
+            put.(slug)
+            {:error, :running}
+          end
+        )
+
+      kill_watched_broker(sentinel, id)
+
+      assert_receive {:state_put, ^config, :stopped}, 1_000
+      refute_receive {:revive_called, _}, 400
+    end
+
+    # Exits once `:stopped` is recorded, so the revive can act; the recheck it
+    # arms again is what repeats a demotion that got less far.
+    test "a demotion that exits neither stops the Sentinel nor loses the revive" do
+      test = self()
+      id = unique_id()
+      slug = Native.slug_from_id(id)
+      config = %{boot: "auto", slug: slug}
+      put = demote_in(ReviveState)
+      name = :"rv_#{System.unique_integer([:positive])}"
+      attempts = :counters.new(1, [])
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          sentinel =
+            start_revive_sentinel(
+              name,
+              config,
+              fn cfg ->
+                send(test, {:revive_called, cfg})
+                {:error, :not_yet}
+              end,
+              fn slug ->
+                :counters.add(attempts, 1, 1)
+                send(test, {:demote_attempt, :counters.get(attempts, 1)})
+                put.(slug)
+                if :counters.get(attempts, 1) == 1, do: exit(:boom)
+              end
+            )
+
+          pid = Process.whereis(sentinel)
+          kill_watched_broker(sentinel, id)
+
+          assert_receive {:revive_called, ^config}, 1_000
+          assert_receive {:demote_attempt, 2}, 1_000
+          assert Process.whereis(sentinel) == pid
+        end)
+
+      assert log =~ "demoting #{slug} failed"
+    end
+
     test "no revive for a non-auto add-on" do
       test = self()
       id = unique_id()
@@ -643,7 +766,135 @@ defmodule Vagus.Addon.Backend.NativeTest do
     end
   end
 
+  describe "Sentinel demoting through Manager.demote/1 (real State and Registry)" do
+    setup do
+      id = unique_id()
+      slug = Native.slug_from_id(id)
+      prev = Application.get_env(:vagus, :native_addon_slugs)
+      Application.put_env(:vagus, :native_addon_slugs, [slug])
+      config = rogue_native_config(slug)
+      :ok = State.put(config, :started)
+      token = "token-#{slug}"
+
+      :ok =
+        Vagus.Addon.Registry.register(token, Vagus.Addon.Registry.identity_from_config(config))
+
+      on_exit(fn ->
+        restore_env(:native_addon_slugs, prev)
+        State.delete(slug)
+        Vagus.Addon.Registry.unregister_slug(slug)
+      end)
+
+      %{id: id, slug: slug, token: token}
+    end
+
+    # Rechecks only when told to, and never really revives.
+    defp start_real_sentinel(opts) do
+      name = :"sentinel_real_#{System.unique_integer([:positive])}"
+
+      start_supervised!(
+        {Native.Sentinel,
+         Keyword.merge(
+           [name: name, recheck_ms: 3_600_000, revive_fun: fn _config -> {:ok, %{}} end],
+           opts
+         )}
+      )
+
+      name
+    end
+
+    # Replies once the recheck, and any demotion it led to, has returned.
+    defp recheck_sync(sentinel, id) do
+      send(Process.whereis(sentinel), {:recheck, id})
+      :sys.get_state(sentinel)
+    end
+
+    test "a broker that did not come back is recorded :stopped and its token revoked", %{
+      id: id,
+      slug: slug,
+      token: token
+    } do
+      sentinel = start_real_sentinel([])
+      assert {:ok, %{slug: ^slug}} = Vagus.Addon.Registry.identity_for_token(token)
+
+      recheck_sync(sentinel, id)
+
+      assert {:ok, %{state: :stopped}} = State.get(slug)
+      assert :error = Vagus.Addon.Registry.identity_for_token(token)
+    end
+
+    for {name, failure} <- [
+          {"exits", quote(do: exit(:state_gone))},
+          {"raises", quote(do: raise("no state"))}
+        ] do
+      test "a demotion that #{name} before recording anything is made again", %{
+        id: id,
+        slug: slug,
+        token: token
+      } do
+        test = self()
+        attempts = :counters.new(1, [])
+
+        sentinel =
+          start_real_sentinel(
+            recheck_ms: 10,
+            demote_fun: fn slug ->
+              :counters.add(attempts, 1, 1)
+              if :counters.get(attempts, 1) == 1, do: unquote(failure)
+              result = Manager.demote(slug)
+              send(test, {:demoted, result})
+              result
+            end
+          )
+
+        pid = Process.whereis(sentinel)
+
+        log =
+          ExUnit.CaptureLog.capture_log(fn ->
+            recheck_sync(sentinel, id)
+            assert_receive {:demoted, :ok}, 5_000
+          end)
+
+        assert log =~ "demoting #{slug} failed"
+        assert Process.whereis(sentinel) == pid
+        assert {:ok, %{state: :stopped}} = State.get(slug)
+        assert :error = Vagus.Addon.Registry.identity_for_token(token)
+      end
+    end
+
+    test "a broker started between the recheck and the demotion stays :started, with its token",
+         %{id: id, slug: slug, token: token} do
+      test = self()
+
+      sentinel =
+        start_real_sentinel(
+          demote_fun: fn slug ->
+            {:ok, broker} = Agent.start(fn -> :ok end, name: Native.broker_name(id))
+            result = Manager.demote(slug)
+            send(test, {:demoted, result, broker})
+            result
+          end
+        )
+
+      recheck_sync(sentinel, id)
+
+      assert_received {:demoted, {:error, :running}, broker}
+      on_exit(fn -> Process.exit(broker, :kill) end)
+      assert {:ok, %{state: :started}} = State.get(slug)
+      assert {:ok, %{slug: ^slug}} = Vagus.Addon.Registry.identity_for_token(token)
+    end
+  end
+
   # ---------- helpers ----------
+
+  # What `Manager.demote/1` does to the real State, for a Sentinel reading a
+  # fake one.
+  defp demote_in(state_mod) do
+    fn slug ->
+      {:ok, %{config: config}} = state_mod.get(slug)
+      state_mod.put(config, :stopped)
+    end
+  end
 
   defp container_config(slug) do
     {:ok, config} =

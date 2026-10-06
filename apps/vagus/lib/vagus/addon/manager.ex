@@ -54,7 +54,7 @@ defmodule Vagus.Addon.Manager do
   restart that started *before* the stop that should have won).
 
   Every public lifecycle function (`start/2`, `start_slug/2`, `stop/2`,
-  `restart/2`, `uninstall/2`) therefore wraps its body in
+  `restart/2`, `uninstall/2`, `demote/2`) therefore wraps its body in
   `:global.trans({{:addon_lifecycle, slug}, self()}, fun, [node()])` — a
   mutex keyed by slug. `:global.trans/3` blocks (rather than erroring) a
   second caller until the first releases, so callers never need to handle
@@ -96,13 +96,17 @@ defmodule Vagus.Addon.Manager do
   alias Vagus.Network
 
   @default_backend Vagus.Addon.Backend.Container
+
+  # The `Vagus.Addon.Backend.state/0` values `demote/2` leaves alone.
+  @alive_states [:running, :restarting]
   @default_data_root "/data"
 
   # `{attempts, delay_ms}` for a Registry/DNS call that finds its server
   # absent; the delay is slept between attempts, under the slug lock.
   # Registering gives up after 200 ms; a stop waits 4.9 s, because giving up
-  # there leaves a stopped add-on's token valid. A start that gives up
-  # deregisters on the register budget: the server has had that long already.
+  # there leaves a stopped add-on's token valid. A start deregisters on the
+  # register budget, for the previous start's token and when it gives up: it
+  # holds the slug lock.
   #
   # A call that times out is outside these budgets: it is not retried, and
   # costs one `@registration_call_timeout`.
@@ -155,6 +159,36 @@ defmodule Vagus.Addon.Manager do
   # start/stop/restart/uninstall the way they race each other).
 
   @doc """
+  `install/2` for a slug with no `Vagus.Addon.State` entry, recording it
+  `:stopped`; `{:error, {:already_installed, config}}` with the installed
+  config otherwise.
+
+  The entry is looked for again, and recorded, under the slug lock: of two
+  overlapping installs the later would otherwise record `:stopped` over an
+  add-on started since the earlier. The pull stays outside the lock, where
+  every other lifecycle call for the slug would wait behind it.
+
+  Exits if `Vagus.Addon.State` is not there to ask or to record in.
+  """
+  @spec install_new(Config.t(), keyword()) ::
+          :ok | {:error, {:already_installed, Config.t()}} | {:error, term()}
+  def install_new(%Config{slug: slug} = config, opts \\ []) do
+    with :ok <- not_installed(slug),
+         :ok <- install(config, opts) do
+      with_slug_lock(slug, fn ->
+        with :ok <- not_installed(slug), do: Vagus.Addon.State.put(config, :stopped)
+      end)
+    end
+  end
+
+  defp not_installed(slug) do
+    case Vagus.Addon.State.get(slug) do
+      {:ok, %{config: installed}} -> {:error, {:already_installed, installed}}
+      :error -> :ok
+    end
+  end
+
+  @doc """
   Starts the add-on: fresh token → validated `/data/options.json` → bind-source
   dirs → create + start. Returns `{:ok, %{id: id, access_token: token}}`.
 
@@ -166,6 +200,11 @@ defmodule Vagus.Addon.Manager do
   That failure leaves `Vagus.Addon.State` as the start found it, so an add-on
   that was `:started` is still one `Vagus.Addon.Watchdog` and
   `Vagus.Addon.BootStarter` will start.
+
+  The previous start's token and DNS record are revoked once its container is
+  confirmed removed, within the register budget, so a start that fails after
+  that point does not leave them valid. One that fails earlier, or could not
+  remove the container, leaves both: that container may still be running.
 
   `opts[:register_retry]`/`opts[:deregister_retry]` (`{attempts, delay_ms}`)
   and `opts[:registration_call_timeout]` (ms) override the Registry/DNS call
@@ -202,7 +241,8 @@ defmodule Vagus.Addon.Manager do
          :ok <- ensure_dsp_devices(config, opts),
          :ok <- write_options(config, data_root, user_options),
          :ok <- maybe_ensure_network(config, opts),
-         :ok <- remove_stale_container(spec, opts),
+         removal <- remove_stale_container(spec, opts),
+         :ok <- revoke_previous_start(removal, config.slug, opts),
          :ok <- maybe_allocate_ingress_port(config, opts),
          {:ok, id} <- backend(opts).create(spec),
          :ok <- start_or_cleanup(id, opts) do
@@ -223,6 +263,17 @@ defmodule Vagus.Addon.Manager do
       end
     end
   end
+
+  # With its container removed, the registered token must not outlive a start
+  # that fails from here on. A container that could not be removed may still
+  # be running, and keeps it. On the register budget because the slug lock is
+  # held.
+  defp revoke_previous_start(:removed, slug, opts) do
+    retry = Keyword.get(opts, :register_retry, @register_retry)
+    deregister_slug(slug, Keyword.put(opts, :deregister_retry, retry))
+  end
+
+  defp revoke_previous_start(:not_removed, _slug, _opts), do: :ok
 
   # A failed registration says nothing about whether the add-on should run,
   # and a `:stopped` left behind would end the Watchdog's remaining attempts
@@ -270,6 +321,51 @@ defmodule Vagus.Addon.Manager do
     record_state(config, :stopped)
     stop_and_remove_container(config, opts)
     deregister_slug(config.slug, opts)
+  end
+
+  @doc """
+  Records `slug` `:stopped` and revokes its token and DNS record, for a caller
+  that has concluded the add-on is dead without stopping it.
+
+  That conclusion is re-checked under the slug lock, since a start may have
+  completed after it was drawn: an add-on its backend reports running is left
+  as it is and `{:error, :running}` returned. A slug with no
+  `Vagus.Addon.State` entry, or no `State` to ask, is left alone too (`:ok`).
+
+  A caller killed between the record and the revoke leaves a `:stopped` add-on
+  with a valid token until its next start. Not for a caller that holds the
+  lock already (see `stop_holding_lock/2`). Takes the options `stop/2` does.
+  """
+  @spec demote(String.t(), keyword()) :: :ok | {:error, :running}
+  def demote(slug, opts \\ []) do
+    with_slug_lock(slug, fn -> do_demote(slug, opts) end)
+  end
+
+  defp do_demote(slug, opts) do
+    case fetch_entry(slug) do
+      {:ok, %{config: config}} ->
+        opts = put_backend(opts, config)
+
+        if running?(config, opts) do
+          {:error, :running}
+        else
+          record_state(config, :stopped)
+          deregister_slug(slug, opts)
+        end
+
+      _none ->
+        :ok
+    end
+  end
+
+  # A check that cannot answer reads as not running: a demoter has decided the
+  # add-on should not be recorded as running, and the alternative leaves a
+  # dead add-on registered.
+  defp running?(config, opts) do
+    case backend(opts).state(container_name(config.slug)) do
+      {:ok, state} -> state in @alive_states
+      {:error, _reason} -> false
+    end
   end
 
   @doc """
@@ -377,10 +473,17 @@ defmodule Vagus.Addon.Manager do
   # name. The real Supervisor's `DockerInterface.run` stops+removes any
   # existing container before creating (§A1.4 — no restart policy, the manager
   # owns the lifecycle), so do the same, tolerantly (absent/not-running is fine).
+  #
+  # A failure of either is tolerated here too: `create` then fails on the name.
+  # `remove` answers `:ok` for an absent container, so only `:ok` says it is
+  # gone.
   defp remove_stale_container(spec, opts) do
     _ = backend(opts).stop(spec.name, [])
-    _ = backend(opts).remove(spec.name, [])
-    :ok
+
+    case backend(opts).remove(spec.name, []) do
+      :ok -> :removed
+      {:error, _reason} -> :not_removed
+    end
   end
 
   # Start the created container; if start fails, remove it (best-effort) so a
@@ -910,6 +1013,10 @@ defmodule Vagus.Addon.Manager do
     else
       _ -> true
     end
+  end
+
+  defp fetch_entry(slug) do
+    if Process.whereis(Vagus.Addon.State), do: Vagus.Addon.State.get(slug), else: :absent
   end
 
   defp record_state(config, state, state_opts \\ []) do

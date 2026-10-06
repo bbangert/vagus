@@ -85,9 +85,11 @@ defmodule Vagus.Addon.Watchdog do
   and `State` (a manual stop mid-sequence must abort it, same rule as
   above) — either one failing ends the sequence quietly, no further log.
   Five failed attempts give up: logged, and the entry is demoted to
-  `:stopped` (`Vagus.Addon.State.put/3`) — an honest record for an add-on
+  `:stopped` — an honest record for an add-on
   the watchdog could not bring back up, mirroring `BootStarter`'s same
-  demote-on-failure move.
+  demote-on-failure move — through `manager.demote/2`, which also revokes the
+  dead container's token and leaves alone an add-on that turns out to be
+  running.
 
   A task that raises/exits is caught inside the task itself (never
   propagated through the `Task.async/1` link back to this GenServer — a
@@ -127,8 +129,8 @@ defmodule Vagus.Addon.Watchdog do
       default `Vagus.Runtime.Events`.
     * `:state` — the `Vagus.Addon.State` server, default
       `Vagus.Addon.State`.
-    * `:manager` — a module implementing `start_slug/2` + `restart/2`,
-      default `Vagus.Addon.Manager`.
+    * `:manager` — a module implementing `start_slug/2`, `restart/2` and
+      `demote/2`, default `Vagus.Addon.Manager`.
     * `:running_check` — arity-1 `slug -> boolean`, default inspects the
       live container via `Vagus.Runtime.Docker.inspect_container/1`
       (`"addon_" <> slug`); any error (including a 404-shaped "not found"
@@ -137,7 +139,8 @@ defmodule Vagus.Addon.Watchdog do
     * `:clock` — zero-arity monotonic-ms fun, default
       `System.monotonic_time(:millisecond)`.
     * `:attempt_timeout_ms` — bounds each individual `manager.start_slug/2`/
-      `manager.restart/2` call inside the sequence (review W1), default
+      `manager.restart/2`/`manager.demote/2` call inside the
+      sequence (review W1), default
       `120_000` — generous next to `docker stop`'s own ~10s budget, since a
       slow-but-legitimate stop/start still needs to finish inside it.
     * `:sequence_deadline_ms` — GenServer-side failsafe: force-clears a
@@ -483,13 +486,28 @@ defmodule Vagus.Addon.Watchdog do
         "giving up and demoting to :stopped"
     )
 
-    case State.get(slug, cfg.state_server) do
-      {:ok, %{config: config}} -> State.put(config, :stopped, server: cfg.state_server)
-      :error -> :ok
+    # Bounded because the demotion queues on the slug lock, and a sequence
+    # that cannot end blocks every later one for the slug.
+    case bounded_manager_call(cfg, fn -> cfg.manager.demote(slug, []) end) do
+      :ok ->
+        :ok
+
+      {:error, :running} ->
+        Logger.error("Vagus.Addon.Watchdog: #{slug} is running after all; left :started")
+
+      error ->
+        Logger.error(
+          "Vagus.Addon.Watchdog: demoting #{slug} #{demote_failure(error)}; it may stay " <>
+            ":started, or keep a valid token, until its next start or a reboot"
+        )
     end
 
     :ok
   end
+
+  # The reason can carry call arguments, so only which kind it was is logged.
+  defp demote_failure({:error, :attempt_timeout}), do: "timed out"
+  defp demote_failure(_error), do: "failed"
 
   ## Defaults
 
