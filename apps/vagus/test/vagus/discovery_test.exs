@@ -169,6 +169,19 @@ defmodule Vagus.DiscoveryTest do
       assert [^other] = Discovery.list(d)
     end
 
+    test "a call that changes nothing does not save", %{d: d, path: path} do
+      {:ok, kept, :new} = Discovery.add("kept", "mqtt", %{"host" => "h"}, d)
+
+      File.mkdir_p!(path <> ".tmp")
+      assert {:ok, ^kept, :existing} = Discovery.add("kept", "mqtt", %{"host" => "h"}, d)
+      assert {:error, :not_owner} = Discovery.delete(kept.uuid, "someone_else", d)
+      assert {:error, :not_found} = Discovery.delete("no-such-uuid", "kept", d)
+
+      d = restart_checkpointed(path)
+
+      assert [^kept] = Discovery.list(d)
+    end
+
     # A save can fail, and a failed save drops the checkpoint.
     test "a delete_by_slug that removes nothing does not save", %{d: d, path: path} do
       {:ok, kept, :new} = Discovery.add("kept", "mqtt", %{}, d)
@@ -201,6 +214,7 @@ defmodule Vagus.DiscoveryTest do
       uuid = String.duplicate("a", 32)
       stale = %{uuid: uuid, addon: "stale", service: "mqtt", config: %{"password" => "pw-stale"}}
       not_hex = String.duplicate("A", 32)
+      short = String.duplicate("a", 31)
 
       for content <- [
             "not a term",
@@ -211,6 +225,12 @@ defmodule Vagus.DiscoveryTest do
             :erlang.term_to_binary(%{String.duplicate("b", 32) => stale}),
             :erlang.term_to_binary(%{not_hex => %{stale | uuid: not_hex}}),
             :erlang.term_to_binary(%{(uuid <> "/..") => %{stale | uuid: uuid <> "/.."}}),
+            :erlang.term_to_binary(%{("../" <> uuid) => %{stale | uuid: "../" <> uuid}}),
+            :erlang.term_to_binary(%{(uuid <> "\n") => %{stale | uuid: uuid <> "\n"}}),
+            :erlang.term_to_binary(%{short => %{stale | uuid: short}}),
+            :erlang.term_to_binary(%{"" => %{stale | uuid: ""}}),
+            :erlang.term_to_binary(%{uuid => %{stale | addon: :stale}}),
+            :erlang.term_to_binary(%{uuid => %{stale | service: nil}}),
             :erlang.term_to_binary(%URI{}),
             :erlang.term_to_binary(MapSet.new())
           ] do

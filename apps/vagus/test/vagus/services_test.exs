@@ -127,6 +127,19 @@ defmodule Vagus.ServicesTest do
       assert :error = Services.get("mqtt", svc)
     end
 
+    test "a call that changes nothing does not save", %{svc: svc, path: path} do
+      :ok = Services.set("mqtt", @mqtt, "core_mosquitto", svc)
+
+      File.mkdir_p!(path <> ".tmp")
+      assert {:error, :already_provided} = Services.set("mqtt", @mqtt, "other", svc)
+      assert {:error, :not_provider} = Services.delete("mqtt", "other", svc)
+      assert :ok = Services.delete("unprovided", "core_mosquitto", svc)
+
+      svc = restart_checkpointed(path)
+
+      assert {:ok, %{"addon" => "core_mosquitto"}} = Services.get("mqtt", svc)
+    end
+
     # A save can fail, and a failed save drops the checkpoint.
     test "a delete_by_slug that removes nothing does not save", %{svc: svc, path: path} do
       :ok = Services.set("mqtt", @mqtt, "core_mosquitto", svc)

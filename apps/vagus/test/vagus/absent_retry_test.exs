@@ -59,11 +59,38 @@ defmodule Vagus.AbsentRetryTest do
     assert attempts() == 2
   end
 
-  test "an absence between two crashes gives the second crash its own retry" do
-    reasons = [:boom, :noproc, :boom, :boom, :boom]
+  # A call that crashes its server every time sees crash, absence, crash:
+  # each crash it is allowed to cause spends one of the supervisor's restarts.
+  test "a second crash ends the call, however many absences came between" do
+    reasons = [:boom, :noproc, :boom, :noproc, :boom]
 
     assert {:error, :server_down} = AbsentRetry.call(failing_with(reasons), {9, 0})
+    assert attempts() == 3
+  end
+
+  test "absences after a crash are still waited out" do
+    assert {:ok, :done} = AbsentRetry.call(failing_with([:boom, :noproc, :noproc]), {9, 0})
     assert attempts() == 4
+  end
+
+  test "an error or throw in the fun propagates after one attempt" do
+    test = self()
+
+    raising = fn ->
+      send(test, :attempt)
+      raise ArgumentError, "not an exit"
+    end
+
+    throwing = fn ->
+      send(test, :attempt)
+      throw(:not_an_exit)
+    end
+
+    assert_raise ArgumentError, "not an exit", fn -> AbsentRetry.call(raising, {5, 0}) end
+    assert attempts() == 1
+
+    assert catch_throw(AbsentRetry.call(throwing, {5, 0})) == :not_an_exit
+    assert attempts() == 1
   end
 
   test "does not retry a timeout" do

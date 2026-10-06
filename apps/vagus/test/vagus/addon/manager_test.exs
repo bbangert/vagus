@@ -1654,6 +1654,21 @@ defmodule Vagus.Addon.ManagerTest do
       assert stub_calls(Vagus.Addon.Registry) == List.duplicate(:unregister_slug, 3)
     end
 
+    # The application's own Discovery, as its child spec starts it.
+    test "the default-named Discovery keeps a message, uuid and all, across its restart", %{
+      slug: slug
+    } do
+      on_exit(fn -> Vagus.Discovery.delete_by_slug(slug) end)
+      # Registered after the cleanup above, so it runs first.
+      on_exit(fn -> bring_up(Vagus.Discovery) end)
+
+      {:ok, message, :new} = Vagus.Discovery.add(slug, "mqtt", %{"host" => "h"})
+
+      cycle(Vagus.Discovery)
+
+      assert {:ok, ^message} = Vagus.Discovery.get(message.uuid)
+    end
+
     test "uninstall/2 waits out a Services that is briefly absent, and the service stays gone", %{
       config: c,
       slug: slug,

@@ -6,9 +6,10 @@ defmodule Vagus.AbsentRetry do
 
     * absent or going away (`:noproc`, `:normal`, `:shutdown`,
       `{:shutdown, _}`, `:killed`) — retried for the whole budget;
-    * any other crash (`:server_down`) — retried once: if the call itself is
-      what crashes the server, every further attempt spends one of its
-      supervisor's restarts;
+    * any other crash (`:server_down`) — retried once per `call/2`, however
+      many absences come between: if the call itself is what crashes the
+      server, it alternates crash and absence, and every further attempt
+      spends one of its supervisor's restarts;
     * `:timeout` — never retried: the server is alive, and the caller would
       wait a full call timeout again.
 
@@ -38,10 +39,11 @@ defmodule Vagus.AbsentRetry do
 
         tag ->
           Process.sleep(delay_ms)
-          call(fun, attempts - 1, delay_ms, tag == :server_down)
+          call(fun, attempts - 1, delay_ms, crashed? or tag == :server_down)
       end
   end
 
+  @doc false
   @spec tag(term()) :: tag()
   def tag({:timeout, _call}), do: :timeout
   def tag({tag, _call}) when tag in @absent, do: tag
