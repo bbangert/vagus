@@ -889,6 +889,45 @@ defmodule Vagus.Addon.Backend.NativeTest do
       assert {:ok, %{slug: ^slug}} = Vagus.Addon.Registry.identity_for_token(token)
     end
 
+    test "a broker gone again by the time it would be watched is demoted by a later recheck", %{
+      id: id,
+      slug: slug,
+      token: token
+    } do
+      test = self()
+      attempts = :counters.new(1, [])
+
+      sentinel =
+        start_real_sentinel(
+          recheck_ms: 10,
+          demote_fun: fn slug ->
+            :counters.add(attempts, 1, 1)
+
+            if :counters.get(attempts, 1) == 1 do
+              # Up when the demotion looked, dead before it returned.
+              {:ok, broker} = Agent.start(fn -> :ok end, name: Native.broker_name(id))
+              ref = Process.monitor(broker)
+              Process.exit(broker, :kill)
+
+              receive do
+                {:DOWN, ^ref, :process, ^broker, _reason} -> {:error, :running}
+              end
+            else
+              result = Manager.demote(slug)
+              send(test, {:demoted, result})
+              result
+            end
+          end
+        )
+
+      recheck_sync(sentinel, id)
+
+      assert_receive {:demoted, :ok}, 5_000
+      :sys.get_state(sentinel)
+      assert {:ok, %{state: :stopped}} = State.get(slug)
+      assert :error = Vagus.Addon.Registry.identity_for_token(token)
+    end
+
     # Brought up here without `Native.start/1`, so nothing else asks for it
     # to be watched.
     test "a broker the demotion found running is watched: its death is demoted", %{

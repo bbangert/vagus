@@ -117,11 +117,10 @@ defmodule Vagus.Addon.Backend.Native.Sentinel do
   end
 
   def handle_info({:recheck, id}, state) do
-    if is_pid(Process.whereis(Native.broker_name(id))) do
+    case Process.whereis(Native.broker_name(id)) do
       # OTP restarted it — resume watching, State stays :started.
-      {:noreply, monitor(id, state)}
-    else
-      {:noreply, demote(id, state)}
+      pid when is_pid(pid) -> {:noreply, monitor_pid(id, pid, state)}
+      nil -> {:noreply, demote(id, state)}
     end
   end
 
@@ -157,16 +156,18 @@ defmodule Vagus.Addon.Backend.Native.Sentinel do
   end
 
   defp monitor(id, state) do
-    state = demonitor(id, state)
-
     case Process.whereis(Native.broker_name(id)) do
-      nil ->
-        state
-
-      pid ->
-        ref = Process.monitor(pid)
-        %{state | by_ref: Map.put(state.by_ref, ref, id), by_id: Map.put(state.by_id, id, ref)}
+      nil -> demonitor(id, state)
+      pid -> monitor_pid(id, pid, state)
     end
+  end
+
+  # For a caller acting on one lookup: a pid that has died since still gets
+  # its `:DOWN`, where a second lookup would find nothing and watch nothing.
+  defp monitor_pid(id, pid, state) do
+    state = demonitor(id, state)
+    ref = Process.monitor(pid)
+    %{state | by_ref: Map.put(state.by_ref, ref, id), by_id: Map.put(state.by_id, id, ref)}
   end
 
   defp demonitor(id, state) do
@@ -195,9 +196,18 @@ defmodule Vagus.Addon.Backend.Native.Sentinel do
 
         case demote_slug(id, slug, state) do
           # `Native.start/1` casts a watch for every broker it brings up; this
-          # does not depend on that cast being behind this message.
+          # does not depend on that cast being behind this message. A broker
+          # gone again already left nothing to watch, so the recheck is what
+          # demotes it.
           {:error, :running} ->
-            monitor(id, state)
+            case Process.whereis(Native.broker_name(id)) do
+              nil ->
+                Process.send_after(self(), {:recheck, id}, state.recheck_ms)
+                state
+
+              pid ->
+                monitor_pid(id, pid, state)
+            end
 
           _demoted_or_failed ->
             # Revive ONLY when State still read :started here — the signature
