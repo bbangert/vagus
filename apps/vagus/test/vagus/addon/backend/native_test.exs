@@ -231,8 +231,13 @@ defmodule Vagus.Addon.Backend.NativeTest do
       dr = tmp_dir()
       Application.put_env(:vagus, :addon_data_root, dr)
 
-      # A DNS server under the global name so Manager.register_dns finds it
-      # (the app doesn't start one in :test — dns_enabled is false).
+      # A DNS server under the global name, and `:dns_enabled` on so the
+      # Manager registers with it (the app doesn't start one in :test). The
+      # default-named server checkpoints, so an earlier test's file goes first.
+      prev_dns = Application.get_env(:vagus, :dns_enabled)
+      Application.put_env(:vagus, :dns_enabled, true)
+      File.rm(Vagus.RunState.path(:dns))
+
       start_supervised!(
         {Vagus.DNS, name: Vagus.DNS, ip: {127, 0, 0, 1}, port: free_port(), upstream: nil}
       )
@@ -243,6 +248,10 @@ defmodule Vagus.Addon.Backend.NativeTest do
       assert {:ok, %{access_token: token}} = Manager.start(config, data_root: dr)
 
       on_exit(fn ->
+        # First: the supervised DNS is already gone, and with DNS still
+        # enabled the uninstall would wait out its whole retry budget.
+        restore_env(:dns_enabled, prev_dns)
+        File.rm(Vagus.RunState.path(:dns))
         Manager.uninstall(@slug, data_root: dr)
         Vagus.Services.delete_by_slug(@slug)
         Vagus.Discovery.delete_by_slug(@slug)
@@ -274,32 +283,30 @@ defmodule Vagus.Addon.Backend.NativeTest do
       assert {:ok, {172, 30, 32, 2}} = Vagus.DNS.resolve("core-mqtt", Vagus.DNS)
     end
 
-    # Both hold the start's registrations in memory only; a restart rebuilds
-    # them from `State.running/1` rather than waiting for the add-on's next
-    # start.
+    # Both run under their default names here, as in production, so this is
+    # what notices a default-named instance that does not checkpoint.
     test "a Registry or DNS restart keeps the running add-on's token and name", %{
       token: token
     } do
       {:ok, test_sup} = ExUnit.fetch_test_supervisor()
 
-      # Same `init/1` → rebuild as after a crash, without spending the
-      # supervisor's restart intensity the way a kill does.
+      # A failure between the terminate and the restart below must not leave
+      # the application without its Registry for every later test.
+      on_exit(fn ->
+        case Supervisor.restart_child(Vagus.Supervisor, Vagus.Addon.Registry) do
+          {:ok, _pid} -> :ok
+          {:error, :running} -> :ok
+        end
+      end)
+
+      # Same `init/1` as after a crash, without spending the supervisor's
+      # restart intensity the way a kill does.
       for {sup, id} <- [{Vagus.Supervisor, Vagus.Addon.Registry}, {test_sup, Vagus.DNS}] do
         :ok = Supervisor.terminate_child(sup, id)
         assert {:ok, _pid} = Supervisor.restart_child(sup, id)
       end
 
       assert {:ok, %{slug: @slug}} = Vagus.Addon.Registry.identity_for_token(token)
-
-      # The DNS rebuild runs in a task, started before this call is served;
-      # its reply precedes its exit, so the record is in once it is down.
-      _ = :sys.get_state(Vagus.DNS)
-
-      for pid <- Task.Supervisor.children(Vagus.TaskSupervisor) do
-        ref = Process.monitor(pid)
-        assert_receive {:DOWN, ^ref, :process, ^pid, _reason}, 5_000
-      end
-
       assert {:ok, {172, 30, 32, 2}} = Vagus.DNS.resolve("core-mqtt", Vagus.DNS)
     end
 

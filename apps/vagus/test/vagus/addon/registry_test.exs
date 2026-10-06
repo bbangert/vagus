@@ -1,9 +1,7 @@
 defmodule Vagus.Addon.RegistryTest do
   use ExUnit.Case, async: true
 
-  import ExUnit.CaptureLog
-
-  alias Vagus.Addon.{Config, Registry, State}
+  alias Vagus.Addon.{Config, Registry}
 
   setup do
     reg = start_supervised!({Registry, name: :"reg_#{System.unique_integer([:positive])}"})
@@ -106,76 +104,6 @@ defmodule Vagus.Addon.RegistryTest do
              Registry.identity_from_config(config)
   end
 
-  describe "rebuild from State on (re)start" do
-    setup do
-      {:ok, config} =
-        Config.parse(%{
-          "name" => "M",
-          "version" => "1",
-          "slug" => "core_mosquitto",
-          "description" => "d",
-          "arch" => ["amd64"],
-          "image" => "x/y",
-          "services" => ["mqtt:provide"],
-          "hassio_api" => true
-        })
-
-      %{config: config, st: start_supervised!({State, name: nil})}
-    end
-
-    defp start_registry(st) do
-      start_supervised!({Registry, name: nil, state: st}, id: make_ref())
-    end
-
-    test "re-registers every running add-on's current token", %{config: c, st: st} do
-      :ok = State.put(c, :started, server: st, access_token: "tok-running")
-      reg = start_registry(st)
-
-      assert {:ok, identity} = Registry.identity_for_token("tok-running", reg)
-      assert identity == Registry.identity_from_config(c)
-
-      # The rebuilt slug → token index works like a registered one.
-      :ok = Registry.register("tok-next", identity, reg)
-      assert :error = Registry.identity_for_token("tok-running", reg)
-    end
-
-    test "skips stopped add-ons", %{config: c, st: st} do
-      :ok = State.put(c, :started, server: st, access_token: "tok-old")
-      :ok = State.put(c, :stopped, server: st)
-      reg = start_registry(st)
-
-      assert :error = Registry.identity_for_token("tok-old", reg)
-    end
-
-    test "starts empty, quietly, when State isn't running" do
-      missing = :"no_state_#{System.unique_integer([:positive])}"
-
-      log =
-        capture_log(fn ->
-          assert :error = Registry.identity_for_token("anything", start_registry(missing))
-        end)
-
-      refute log =~ "rebuild from State failed"
-    end
-
-    test "a State call that exits is logged and rebuilds nothing" do
-      # Dies on the call itself, so the exit is never the quiet `:noproc`.
-      dying =
-        spawn(fn ->
-          receive do
-            {:"$gen_call", _from, :running} -> exit(:state_went_away)
-          end
-        end)
-
-      log =
-        capture_log(fn ->
-          assert :error = Registry.identity_for_token("anything", start_registry(dying))
-        end)
-
-      assert log =~ "Vagus.Addon.Registry: rebuild from State failed"
-    end
-  end
-
   describe "format_status/1 (tokens are bearer credentials)" do
     @token "tok-must-not-print"
 
@@ -198,6 +126,117 @@ defmodule Vagus.Addon.RegistryTest do
 
       assert %{message: {:unregister_slug, "shown_slug"}} =
                Registry.format_status(%{message: {:unregister_slug, "shown_slug"}})
+    end
+  end
+
+  describe "checkpoint" do
+    setup do
+      dir = Path.join(System.tmp_dir!(), "vagus-reg-#{System.unique_integer([:positive])}")
+      File.mkdir_p!(dir)
+      on_exit(fn -> File.rm_rf(dir) end)
+
+      path = Path.join(dir, "registry.term")
+      %{path: path, reg: start_checkpointed(path)}
+    end
+
+    defp start_checkpointed(path),
+      do: start_supervised!({Registry, name: nil, path: path}, id: :checkpointed)
+
+    defp restart_checkpointed(path) do
+      :ok = stop_supervised!(:checkpointed)
+      start_checkpointed(path)
+    end
+
+    defp identity(slug), do: %{slug: slug, services_role: %{}, auth_api: false, discovery: []}
+
+    test "a registered token resolves after a restart on the same path", %{reg: reg, path: path} do
+      :ok = Registry.register("tok-kept", identity("kept"), reg)
+
+      reg = restart_checkpointed(path)
+
+      assert {:ok, %{slug: "kept"}} = Registry.identity_for_token("tok-kept", reg)
+    end
+
+    test "a replaced token stays replaced after a restart", %{reg: reg, path: path} do
+      :ok = Registry.register("tok-old", identity("rotated"), reg)
+      :ok = Registry.register("tok-new", identity("rotated"), reg)
+
+      reg = restart_checkpointed(path)
+
+      assert :error = Registry.identity_for_token("tok-old", reg)
+      assert {:ok, %{slug: "rotated"}} = Registry.identity_for_token("tok-new", reg)
+    end
+
+    test "an unregistered slug's token stays gone after a restart", %{reg: reg, path: path} do
+      :ok = Registry.register("tok-gone", identity("gone"), reg)
+      :ok = Registry.register("tok-other", identity("other"), reg)
+      :ok = Registry.unregister_slug("gone", reg)
+
+      reg = restart_checkpointed(path)
+
+      assert :error = Registry.identity_for_token("tok-gone", reg)
+      assert {:ok, %{slug: "other"}} = Registry.identity_for_token("tok-other", reg)
+    end
+
+    # A privately-named instance falling back to the default path would read
+    # and overwrite the application Registry's checkpoint.
+    test "a privately-named instance without a :path keeps nothing across a restart" do
+      name = :"reg_#{System.unique_integer([:positive])}"
+      token = "tok-memory-only-#{System.unique_integer([:positive])}"
+
+      reg = start_supervised!({Registry, name: name}, id: :pathless)
+      :ok = Registry.register(token, identity("memory_only"), reg)
+      assert {:ok, _identity} = Registry.identity_for_token(token, reg)
+
+      :ok = stop_supervised!(:pathless)
+      reg = start_supervised!({Registry, name: name}, id: :pathless)
+
+      assert :error = Registry.identity_for_token(token, reg)
+    end
+
+    test "an unusable file starts the registry empty and working, naming only the path", %{
+      path: path
+    } do
+      stale = %{"tok-stale" => identity("stale")}
+
+      for content <- [
+            "not a term",
+            :erlang.term_to_binary(:nope),
+            :erlang.term_to_binary(%{by_token: 1}),
+            :erlang.term_to_binary(%{by_token: stale}),
+            :erlang.term_to_binary(%{by_token: stale, token_by_slug: :nope})
+          ] do
+        :ok = stop_supervised!(:checkpointed)
+        File.write!(path, content)
+        {reg, log} = ExUnit.CaptureLog.with_log(fn -> start_checkpointed(path) end)
+
+        assert log =~ "run state #{path} unusable"
+        refute log =~ "tok-stale"
+        assert :error = Registry.identity_for_token("tok-stale", reg)
+        assert :ok = Registry.register("tok-fresh", identity("stale"), reg)
+        assert {:ok, %{slug: "stale"}} = Registry.identity_for_token("tok-fresh", reg)
+      end
+    end
+
+    # An older checkpoint surviving a failed save would bring a revoked token
+    # back on the next restart.
+    @tag :capture_log
+    test "a failed save leaves the next start empty, not on the older checkpoint", %{
+      reg: reg,
+      path: path
+    } do
+      :ok = Registry.register("tok-revoked", identity("revoked"), reg)
+      :ok = Registry.register("tok-bystander", identity("bystander"), reg)
+
+      # The save writes `path <> ".tmp"` first; a directory there fails it.
+      File.mkdir_p!(path <> ".tmp")
+      assert :ok = Registry.unregister_slug("revoked", reg)
+      assert {:ok, _identity} = Registry.identity_for_token("tok-bystander", reg)
+
+      reg = restart_checkpointed(path)
+
+      assert :error = Registry.identity_for_token("tok-revoked", reg)
+      assert :error = Registry.identity_for_token("tok-bystander", reg)
     end
   end
 end

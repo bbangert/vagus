@@ -102,3 +102,7 @@ config :nerves_runtime,
 # reports that board's machine string. Per-target values live in
 # config/rpi3_64.exs and config/dragon_q6a.exs.
 config :vagus, :machine, "raspberrypi3-64"
+
+# Keyed by OS pid so two concurrent `mix` runs never wipe each other's
+# directory; `Vagus.RunState.reset_dir/0` empties it at every app start.
+config :vagus, :run_state_dir, Path.join(System.tmp_dir!(), "vagus-run-#{System.pid()}")

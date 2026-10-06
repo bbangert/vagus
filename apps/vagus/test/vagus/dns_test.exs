@@ -2,8 +2,6 @@ defmodule Vagus.DNSTest do
   @moduledoc "DNS server — static anchors, dynamic add-on records, NXDOMAIN, over UDP loopback."
   use ExUnit.Case, async: false
 
-  import ExUnit.CaptureLog
-
   alias Vagus.DNS
   alias Vagus.DNS.Message
 
@@ -172,319 +170,133 @@ defmodule Vagus.DNSTest do
     assert :error = DNS.resolve("whatever", srv)
   end
 
-  describe "rebuild from Vagus.Addon.State on (re)start" do
-    alias Vagus.Addon.{Config, State}
-    alias Vagus.Test.FakeEngine
+  describe "checkpoint" do
+    setup do
+      dir = Path.join(System.tmp_dir!(), "vagus-dns-#{System.unique_integer([:positive])}")
+      File.mkdir_p!(dir)
+      on_exit(fn -> File.rm_rf(dir) end)
 
-    defp addon(slug, extra) do
-      {:ok, config} =
-        Config.parse(
-          Map.merge(
-            %{
-              "name" => slug,
-              "version" => "1",
-              "slug" => slug,
-              "description" => "d",
-              "arch" => ["amd64"],
-              "image" => "x/y"
-            },
-            extra
-          )
-        )
-
-      config
+      path = Path.join(dir, "dns.term")
+      port = free_udp_port()
+      %{path: path, cp_port: port, cp: start_checkpointed(path, port)}
     end
 
-    defp start_dns(st, docker, opts \\ []) do
+    defp free_udp_port do
+      {:ok, sock} = :gen_udp.open(0, ip: {127, 0, 0, 1})
+      {:ok, port} = :inet.port(sock)
+      :gen_udp.close(sock)
+      port
+    end
+
+    defp start_checkpointed(path, port) do
       start_supervised!(
-        {DNS,
-         [
-           name: nil,
-           ip: {127, 0, 0, 1},
-           port: 15_300 + rem(System.unique_integer([:positive]), 2000),
-           upstream: nil,
-           addon_state: st,
-           docker: docker
-         ] ++ opts},
-        id: make_ref()
+        {DNS, name: nil, ip: {127, 0, 0, 1}, port: port, upstream: nil, path: path},
+        id: :checkpointed
       )
     end
 
-    # The rebuild task's reply precedes its exit, so once the test has seen
-    # the task down the server's mailbox holds the outcome ahead of the next
-    # call. A killed task's `:DOWN` reaches the test and the server
-    # independently, hence asking again rather than once.
-    defp await_rebuild(srv, sup) do
-      # `handle_continue` runs before this call is served: the task exists.
-      _ = :sys.get_state(srv)
-
-      for pid <- Task.Supervisor.children(sup) do
-        ref = Process.monitor(pid)
-        assert_receive {:DOWN, ^ref, :process, ^pid, _reason}, 5_000
-      end
-
-      assert Enum.any?(1..1_000, fn _ -> :sys.get_state(srv).rebuild == nil end),
-             "DNS rebuild never finished"
+    defp restart_checkpointed(path, port) do
+      :ok = stop_supervised!(:checkpointed)
+      start_checkpointed(path, port)
     end
 
-    defp bridged_ip(ip),
-      do: %{"NetworkSettings" => %{"Networks" => %{"hassio" => %{"IPAddress" => ip}}}}
-
-    # One bridged add-on whose inspect the engine holds until `release/1`:
-    # the rebuild is provably in flight for as long as the test wants.
-    defp held_rebuild(sup) do
-      st = start_supervised!({State, name: nil}, id: :addon_state)
-      :ok = State.put(addon("bridged_slow", %{}), :started, server: st, access_token: "t")
-
-      engine = FakeEngine.start([{200, bridged_ip("172.30.33.9"), gate: self()}])
-      on_exit(fn -> FakeEngine.stop(engine) end)
-
-      srv = start_dns(st, [socket: engine.socket], task_supervisor: sup)
-      assert_receive {:fake_engine_held, responder}, 5_000
-      {srv, responder}
-    end
-
-    defp release(responder), do: send(responder, :release)
-
-    # Dies on the `running/1` call itself, so the caller's exit is never the
-    # quiet `:noproc` of a State that isn't there.
-    defp dying_state do
-      spawn(fn ->
-        receive do
-          {:"$gen_call", _from, :running} -> exit(:state_went_away)
-        end
-      end)
-    end
-
-    setup do
-      %{sup: start_supervised!({Task.Supervisor, name: nil}, id: :rebuild_sup)}
-    end
-
-    test "re-registers running add-ons: bridge IP, native anchor, host network skipped", %{
-      sup: sup
+    test "a registered name resolves after a restart on the same path", %{
+      cp: cp,
+      path: path,
+      cp_port: port,
+      sock: sock
     } do
-      st = start_supervised!({State, name: nil}, id: :addon_state)
+      :ok = DNS.register("kept-addon", {172, 30, 33, 7}, cp)
 
-      for {config, tok} <- [
-            {addon("bridged_one", %{}), "t1"},
-            {addon("native_one", %{"backend" => "native"}), "t2"},
-            {addon("host_one", %{"host_network" => true}), "t3"}
+      cp = restart_checkpointed(path, port)
+
+      assert {:ok, {172, 30, 33, 7}} = DNS.resolve("kept-addon", cp)
+      assert ask(sock, port, "kept-addon").addr == [172, 30, 33, 7]
+    end
+
+    test "an unregistered name stays gone after a restart", %{
+      cp: cp,
+      path: path,
+      cp_port: port,
+      sock: sock
+    } do
+      :ok = DNS.register("gone-addon", {172, 30, 33, 8}, cp)
+      :ok = DNS.register("other-addon", {172, 30, 33, 9}, cp)
+      :ok = DNS.unregister("gone-addon", cp)
+
+      cp = restart_checkpointed(path, port)
+
+      assert :error = DNS.resolve("gone-addon", cp)
+      assert ask(sock, port, "gone-addon").rcode == 3
+      assert ask(sock, port, "other-addon").addr == [172, 30, 33, 9]
+    end
+
+    test "an unusable file starts the server with no dynamic records, and working", %{
+      path: path,
+      cp_port: port,
+      sock: sock
+    } do
+      for content <- [
+            "not a term",
+            :erlang.term_to_binary(:nope),
+            :erlang.term_to_binary(%{"stale-addon" => "172.30.33.99"}),
+            :erlang.term_to_binary(%{stale: {172, 30, 33, 99}}),
+            :erlang.term_to_binary(%{"stale-addon" => {172, 30, 33}})
           ] do
-        :ok = State.put(config, :started, server: st, access_token: tok)
-      end
+        :ok = stop_supervised!(:checkpointed)
+        File.write!(path, content)
 
-      # A stopped add-on is never inspected.
-      :ok = State.put(addon("stopped_one", %{}), :stopped, server: st)
+        {cp, log} = ExUnit.CaptureLog.with_log(fn -> start_checkpointed(path, port) end)
 
-      engine = FakeEngine.start([{200, bridged_ip("172.30.33.7")}])
-
-      on_exit(fn -> FakeEngine.stop(engine) end)
-
-      srv = start_dns(st, [socket: engine.socket], task_supervisor: sup)
-      await_rebuild(srv, sup)
-
-      assert {:ok, {172, 30, 33, 7}} = DNS.resolve("bridged-one", srv)
-      assert {:ok, {172, 30, 32, 2}} = DNS.resolve("native-one", srv)
-      assert :error = DNS.resolve("host-one", srv)
-      assert :error = DNS.resolve("stopped-one", srv)
-
-      assert [%{method: :get, path: "/containers/addon_bridged_one/json"}] =
-               FakeEngine.requests(engine)
-    end
-
-    test "a failed inspect leaves just that add-on out", %{sup: sup} do
-      st = start_supervised!({State, name: nil}, id: :addon_state)
-      :ok = State.put(addon("bridged_bad", %{}), :started, server: st, access_token: "t1")
-      :ok = State.put(addon("bridged_good", %{}), :started, server: st, access_token: "t2")
-
-      engine =
-        FakeEngine.start([
-          {404, %{"message" => "no such container"}},
-          {200, bridged_ip("172.30.33.8")}
-        ])
-
-      on_exit(fn -> FakeEngine.stop(engine) end)
-
-      srv = start_dns(st, [socket: engine.socket], task_supervisor: sup)
-      await_rebuild(srv, sup)
-
-      # The script is positional, so pin which add-on got the 404.
-      assert [
-               %{path: "/containers/addon_bridged_bad/json"},
-               %{path: "/containers/addon_bridged_good/json"}
-             ] = FakeEngine.requests(engine)
-
-      assert :error = DNS.resolve("bridged-bad", srv)
-      assert {:ok, {172, 30, 33, 8}} = DNS.resolve("bridged-good", srv)
-    end
-
-    test "a held inspect doesn't block queries or registrations meanwhile", %{sup: sup} do
-      {srv, responder} = held_rebuild(sup)
-
-      # Short timeouts: a server doing the inspect itself can't answer until
-      # the release below.
-      assert {:ok, {172, 30, 32, 3}} = GenServer.call(srv, {:resolve, "dns"}, 500)
-      assert :ok = GenServer.call(srv, {:register, "other-addon", {172, 30, 33, 2}}, 500)
-      assert :error = GenServer.call(srv, {:resolve, "bridged-slow"}, 500)
-
-      release(responder)
-      await_rebuild(srv, sup)
-      assert {:ok, {172, 30, 33, 9}} = DNS.resolve("bridged-slow", srv)
-      assert {:ok, {172, 30, 33, 2}} = DNS.resolve("other-addon", srv)
-    end
-
-    test "a register during the rebuild wins over the rebuilt record", %{sup: sup} do
-      {srv, responder} = held_rebuild(sup)
-      :ok = DNS.register("bridged-slow", {172, 30, 33, 50}, srv)
-
-      release(responder)
-      await_rebuild(srv, sup)
-      assert {:ok, {172, 30, 33, 50}} = DNS.resolve("bridged-slow", srv)
-    end
-
-    test "an unregister during the rebuild isn't undone by it", %{sup: sup} do
-      {srv, responder} = held_rebuild(sup)
-      :ok = DNS.unregister("bridged-slow", srv)
-
-      release(responder)
-      await_rebuild(srv, sup)
-      assert :error = DNS.resolve("bridged-slow", srv)
-    end
-
-    test "a crashed rebuild task leaves the server up with what it has", %{sup: sup} do
-      {srv, _responder} = held_rebuild(sup)
-      :ok = DNS.register("other-addon", {172, 30, 33, 2}, srv)
-
-      log =
-        capture_log(fn ->
-          for pid <- Task.Supervisor.children(sup), do: Process.exit(pid, :kill)
-          await_rebuild(srv, sup)
-        end)
-
-      assert log =~ "add-on record rebuild failed"
-      assert Process.alive?(srv)
-      assert :error = DNS.resolve("bridged-slow", srv)
-      assert {:ok, {172, 30, 33, 2}} = DNS.resolve("other-addon", srv)
-    end
-
-    test "a State call that exits is logged and rebuilds nothing" do
-      log =
-        capture_log(fn ->
-          assert :error = DNS.resolve("anything", start_dns(dying_state(), []))
-        end)
-
-      assert log =~ "Vagus.DNS: rebuild from State failed"
-    end
-
-    test "a State that isn't running rebuilds nothing, quietly" do
-      missing = :"no_state_#{System.unique_integer([:positive])}"
-
-      log = capture_log(fn -> assert :error = DNS.resolve("anything", start_dns(missing, [])) end)
-
-      refute log =~ "rebuild from State failed"
-    end
-
-    # Stands in front of `State`, holding each `running/1` read until the
-    # test lets it go: the test sees every rebuild attempt and decides when
-    # it proceeds, whatever the retry timer does.
-    defp gated_state(st) do
-      test = self()
-      spawn_link(fn -> gated_state_loop(st, test) end)
-    end
-
-    defp gated_state_loop(st, test) do
-      receive do
-        {:"$gen_call", from, :running} ->
-          send(test, {:state_read, self()})
-
-          receive do
-            :release -> GenServer.reply(from, State.running(st))
-          end
-
-          gated_state_loop(st, test)
+        assert log =~ "run state #{path} unusable"
+        refute log =~ "stale"
+        assert :error = DNS.resolve("stale-addon", cp)
+        assert :error = DNS.resolve("fresh-addon", cp)
+        assert :ok = DNS.register("fresh-addon", {172, 30, 33, 10}, cp)
+        assert ask(sock, port, "fresh-addon").addr == [172, 30, 33, 10]
       end
     end
 
-    defp next_attempt do
-      assert_receive {:state_read, gate}, 5_000
-      gate
+    # A privately-named instance falling back to the default path would read
+    # and overwrite the application DNS's checkpoint.
+    test "a privately-named instance without a :path keeps nothing across a restart" do
+      name = :"dns_#{System.unique_integer([:positive])}"
+      host = "memory-only-#{System.unique_integer([:positive])}"
+      spec = {DNS, name: name, ip: {127, 0, 0, 1}, port: free_udp_port(), upstream: nil}
+
+      dns = start_supervised!(spec, id: :pathless)
+      :ok = DNS.register(host, {172, 30, 33, 13}, dns)
+      assert {:ok, _ip} = DNS.resolve(host, dns)
+
+      :ok = stop_supervised!(:pathless)
+      dns = start_supervised!(spec, id: :pathless)
+
+      assert :error = DNS.resolve(host, dns)
     end
 
-    defp no_supervisor, do: :"no_sup_#{System.unique_integer([:positive])}"
+    # An older checkpoint surviving a failed save would point a name at a
+    # container that is gone.
+    @tag :capture_log
+    test "a failed save leaves the next start empty, not on the older checkpoint", %{
+      cp: cp,
+      path: path,
+      cp_port: port,
+      sock: sock
+    } do
+      :ok = DNS.register("dropped-addon", {172, 30, 33, 11}, cp)
+      :ok = DNS.register("bystander-addon", {172, 30, 33, 12}, cp)
 
-    test "a rebuild task that can't start is retried off the server, never run inline" do
-      st = start_supervised!({State, name: nil}, id: :addon_state)
-      :ok = State.put(addon("bridged_late", %{}), :started, server: st, access_token: "t")
+      # The save writes `path <> ".tmp"` first; a directory there fails it.
+      File.mkdir_p!(path <> ".tmp")
+      assert :ok = DNS.unregister("dropped-addon", cp)
+      assert {:ok, {172, 30, 33, 12}} = DNS.resolve("bystander-addon", cp)
 
-      # Gated, so an inspect made on the server process would hold it.
-      engine = FakeEngine.start([{200, bridged_ip("172.30.33.11"), gate: self()}])
-      on_exit(fn -> FakeEngine.stop(engine) end)
+      cp = restart_checkpointed(path, port)
 
-      sup = no_supervisor()
-
-      srv =
-        start_dns(gated_state(st), [socket: engine.socket],
-          task_supervisor: sup,
-          rebuild_retry_ms: 1
-        )
-
-      capture_log(fn ->
-        # Queued behind the first attempt, so it is served the moment that
-        # attempt's failed task start returns.
-        first = next_attempt()
-        query = :gen_server.send_request(srv, {:resolve, "dns"})
-        release(first)
-        assert {:reply, {:ok, {172, 30, 32, 3}}} = :gen_server.receive_response(query, 500)
-
-        retry = next_attempt()
-        assert [] = FakeEngine.requests(engine)
-
-        start_supervised!({Task.Supervisor, name: sup}, id: :late_sup)
-        release(retry)
-      end)
-
-      assert_receive {:fake_engine_held, responder}, 5_000
-      release(responder)
-      await_rebuild(srv, sup)
-      assert {:ok, {172, 30, 33, 11}} = DNS.resolve("bridged-late", srv)
-    end
-
-    test "a rebuild task that never starts is given up on after a bounded retry" do
-      st = start_supervised!({State, name: nil}, id: :addon_state)
-      :ok = State.put(addon("bridged_never", %{}), :started, server: st, access_token: "t")
-
-      engine = FakeEngine.start([{200, bridged_ip("172.30.33.12"), gate: self()}])
-      on_exit(fn -> FakeEngine.stop(engine) end)
-
-      srv =
-        start_dns(gated_state(st), [socket: engine.socket],
-          task_supervisor: no_supervisor(),
-          rebuild_retry_ms: 0
-        )
-
-      log =
-        capture_log(fn ->
-          for _attempt <- 1..5, do: release(next_attempt())
-
-          # Two round trips: a sixth attempt would be queued by the end of the
-          # first and holding the server at the gate during the second.
-          _ = :sys.get_state(srv)
-          assert :error = GenServer.call(srv, {:resolve, "bridged-never"}, 500)
-        end)
-
-      refute_received {:state_read, _gate}
-      assert log =~ "giving up"
-      assert Process.alive?(srv)
-      assert [] = FakeEngine.requests(engine)
-    end
-
-    test "the rebuild task dies with its server", %{sup: sup} do
-      {srv, _responder} = held_rebuild(sup)
-      assert [task] = Task.Supervisor.children(sup)
-      ref = Process.monitor(task)
-
-      Process.exit(srv, :kill)
-      assert_receive {:DOWN, ^ref, :process, ^task, :killed}, 5_000
+      assert :error = DNS.resolve("dropped-addon", cp)
+      assert :error = DNS.resolve("bystander-addon", cp)
+      assert ask(sock, port, "dropped-addon").rcode == 3
+      assert ask(sock, port, "bystander-addon").rcode == 3
     end
   end
 end

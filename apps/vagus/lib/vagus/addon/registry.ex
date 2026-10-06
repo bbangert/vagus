@@ -20,9 +20,9 @@ defmodule Vagus.Addon.Registry do
   `Vagus.Addon.Config` has parsed both since M4, but this struct dropped them,
   so the emulator's caller model was binary — supervisor or add-on — and every
   route without a hand-placed guard was admin-tier to any installed add-on
-  (the 2026-07-29 audit's A1/A2). Carrying them is additive: nothing is
-  persisted from here, so a running add-on simply re-registers with the two
-  extra keys on its next start.
+  (the 2026-07-29 audit's A1/A2). Carrying them is additive: nothing
+  registered here outlives the application run, so a running add-on simply
+  re-registers with the two extra keys on its next start.
 
   `homeassistant_api` is the same shape of gap, found later: `Vagus.Addon.Config`
   has parsed it since M4 too (`config.ex:67`'s typespec, `:116`'s `false`
@@ -39,15 +39,16 @@ defmodule Vagus.Addon.Registry do
 
   ## Restarts
 
-  Registrations live in memory only, so on (re)start `init/1` continues
-  into a rebuild from `Vagus.Addon.State.running/1` (`opts[:state]`, default
-  `Vagus.Addon.State`), which holds every running add-on's config and
-  current token, so running add-ons stay authenticated across a crash here.
-  At boot there is nothing to rebuild: `State` starts after this server.
-  `Vagus.Addon.Manager.start/2` records the token in `State` before
-  registering it here, so a restart racing a start can't lose it. The
-  rebuild is only as good as `State`'s memory — see the limits in its
-  moduledoc.
+  Every registration is checkpointed to `Vagus.RunState` (`opts[:path]`) and
+  read back in `init/1`, so running add-ons stay authenticated across a
+  crash here. `init/1` loads synchronously — the file is tiny and in RAM —
+  so no caller ever sees a registry that is up but not yet filled. The
+  checkpoint lives one application run: the directory is wiped at app start
+  and sits on tmpfs, so neither an app restart nor a reboot can revive a
+  token whose container is gone.
+
+  Only the default-named instance checkpoints unless `:path` is given, so a
+  privately-named one stays memory-only.
 
   Tokens are bearer credentials, so `format_status/1` keeps them out of
   crash reports.
@@ -56,6 +57,8 @@ defmodule Vagus.Addon.Registry do
   use GenServer
 
   require Logger
+
+  alias Vagus.RunState
 
   @type role :: String.t()
   @type identity :: %{
@@ -69,19 +72,20 @@ defmodule Vagus.Addon.Registry do
         }
 
   def start_link(opts \\ []) do
-    GenServer.start_link(__MODULE__, opts, name: Keyword.get(opts, :name, __MODULE__))
+    name = Keyword.get(opts, :name, __MODULE__)
+    GenServer.start_link(__MODULE__, Keyword.put(opts, :name, name), name: name)
   end
 
   @doc "Registers `token` → `identity` (idempotent; replaces any prior token for the slug)."
-  @spec register(String.t(), identity(), GenServer.server()) :: :ok
-  def register(token, identity, server \\ __MODULE__) do
-    GenServer.call(server, {:register, token, identity})
+  @spec register(String.t(), identity(), GenServer.server(), timeout()) :: :ok
+  def register(token, identity, server \\ __MODULE__, timeout \\ 5_000) do
+    GenServer.call(server, {:register, token, identity}, timeout)
   end
 
   @doc "Removes an add-on's registration by slug (e.g. on stop/uninstall)."
-  @spec unregister_slug(String.t(), GenServer.server()) :: :ok
-  def unregister_slug(slug, server \\ __MODULE__) do
-    GenServer.call(server, {:unregister_slug, slug})
+  @spec unregister_slug(String.t(), GenServer.server(), timeout()) :: :ok
+  def unregister_slug(slug, server \\ __MODULE__, timeout \\ 5_000) do
+    GenServer.call(server, {:unregister_slug, slug}, timeout)
   end
 
   @doc "Resolves a token to its add-on identity, `:error` if unknown."
@@ -122,33 +126,31 @@ defmodule Vagus.Addon.Registry do
 
   ## GenServer
 
+  @empty %{by_token: %{}, token_by_slug: %{}}
+
   @impl GenServer
   def init(opts) do
-    state_server = Keyword.get(opts, :state, Vagus.Addon.State)
-    {:ok, %{by_token: %{}, token_by_slug: %{}}, {:continue, {:rebuild, state_server}}}
+    path = Keyword.get_lazy(opts, :path, fn -> default_path(opts[:name]) end)
+    {:ok, Map.put(load(path), :path, path)}
   end
 
-  @impl GenServer
-  def handle_continue({:rebuild, state_server}, state) do
-    state =
-      Enum.reduce(running(state_server), state, fn {config, token}, acc ->
-        put_token(acc, token, identity_from_config(config))
-      end)
+  defp default_path(__MODULE__), do: RunState.path(:registry)
+  defp default_path(_name), do: nil
 
-    {:noreply, state}
+  defp load(path) do
+    case RunState.load(path, @empty) do
+      %{by_token: %{} = by_token, token_by_slug: %{} = token_by_slug} ->
+        %{by_token: by_token, token_by_slug: token_by_slug}
+
+      _wrong_shape ->
+        Logger.warning("run state #{path} unusable: :wrong_shape")
+        @empty
+    end
   end
 
-  # Best-effort: `State` not running is the boot order (and isolated tests),
-  # so it stays quiet; any other exit is running add-ons left unauthenticated.
-  defp running(state_server) do
-    Vagus.Addon.State.running(state_server)
-  catch
-    :exit, {:noproc, _call} ->
-      []
-
-    :exit, reason ->
-      Logger.warning("Vagus.Addon.Registry: rebuild from State failed: #{inspect(reason)}")
-      []
+  defp save(state) do
+    RunState.save(state.path, Map.take(state, [:by_token, :token_by_slug]))
+    state
   end
 
   @impl GenServer
@@ -175,7 +177,7 @@ defmodule Vagus.Addon.Registry do
 
   @impl GenServer
   def handle_call({:register, token, identity}, _from, state) do
-    {:reply, :ok, put_token(state, token, identity)}
+    {:reply, :ok, state |> put_token(token, identity) |> save()}
   end
 
   def handle_call({:unregister_slug, slug}, _from, state) do
@@ -184,8 +186,13 @@ defmodule Vagus.Addon.Registry do
         {:reply, :ok, state}
 
       {token, token_by_slug} ->
-        {:reply, :ok,
-         %{state | by_token: Map.delete(state.by_token, token), token_by_slug: token_by_slug}}
+        state = %{
+          state
+          | by_token: Map.delete(state.by_token, token),
+            token_by_slug: token_by_slug
+        }
+
+        {:reply, :ok, save(state)}
     end
   end
 
