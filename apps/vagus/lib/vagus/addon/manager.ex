@@ -989,7 +989,7 @@ defmodule Vagus.Addon.Manager do
       {:error, tag} ->
         Logger.error(
           "Vagus.Addon.Manager: #{server} unregister for #{slug} failed (#{tag}); " <>
-            "its registration stays until a reboot or the add-on's next start, if any"
+            "its registration may stay until a reboot or the add-on's next start, if any"
         )
     end
   end
