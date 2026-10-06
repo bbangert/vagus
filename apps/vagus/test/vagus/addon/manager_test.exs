@@ -797,16 +797,6 @@ defmodule Vagus.Addon.ManagerTest do
       assert :error = Vagus.Addon.Registry.identity_for_token("does-not-matter")
     end
 
-    test "stop drops the start's token from State.running/1", %{config: config, data_root: dr} do
-      assert {:ok, %{access_token: token}} =
-               Manager.start(config, backend: __MODULE__.FakeBackend, data_root: dr)
-
-      assert {config, token} in State.running()
-
-      assert :ok = Manager.stop("life_addon", backend: __MODULE__.FakeBackend)
-      refute Enum.any?(State.running(), fn {c, _token} -> c.slug == "life_addon" end)
-    end
-
     test "start_slug on an unknown slug is :not_found" do
       assert {:error, :not_found} =
                Manager.start_slug("no-such-#{System.unique_integer([:positive])}")
@@ -1015,120 +1005,6 @@ defmodule Vagus.Addon.ManagerTest do
     end
   end
 
-  describe "start/2 against a Registry or DNS that is restarting" do
-    setup do
-      :persistent_term.put({__MODULE__.FakeBackend, :pid}, self())
-      slug = "sibling_down_#{System.unique_integer([:positive])}"
-
-      data_root =
-        Path.join(System.tmp_dir!(), "vagus-mgr-sibling-#{System.unique_integer([:positive])}")
-
-      # Native, so `dns_record/3` gives a record without a Docker inspect.
-      {:ok, config} =
-        Config.parse(%{
-          "name" => "Test",
-          "version" => "1",
-          "slug" => slug,
-          "description" => "d",
-          "arch" => ["amd64"],
-          "backend" => "native"
-        })
-
-      on_exit(fn ->
-        File.rm_rf(data_root)
-        State.delete(slug)
-      end)
-
-      %{config: config, slug: slug, opts: [backend: __MODULE__.FakeBackend, data_root: data_root]}
-    end
-
-    # Answers calls under a global name with `handler`'s result, reporting
-    # each request to the test first; a handler that exits takes the stub
-    # down mid-call, which is what a restarting server looks like to its
-    # caller.
-    defp stub_server(name, handler) do
-      test = self()
-      pid = spawn(fn -> stub_loop(test, name, handler) end)
-      Process.register(pid, name)
-      pid
-    end
-
-    defp stub_loop(test, name, handler) do
-      receive do
-        {:"$gen_call", from, request} ->
-          send(test, {:stub_call, name, request})
-          GenServer.reply(from, handler.(request))
-          stub_loop(test, name, handler)
-      end
-    end
-
-    # terminate + restart rather than a kill: neither counts toward
-    # `Vagus.Supervisor`'s restart intensity. The add-on leaves State before
-    # the restart so the real Registry's rebuild finds nothing of this test's.
-    defp stub_registry(slug, handler) do
-      :ok = Supervisor.terminate_child(Vagus.Supervisor, Vagus.Addon.Registry)
-      pid = stub_server(Vagus.Addon.Registry, handler)
-
-      on_exit(fn ->
-        Process.exit(pid, :kill)
-        State.delete(slug)
-        restart_registry()
-      end)
-
-      pid
-    end
-
-    # The killed stub may still hold the name for an instant.
-    defp restart_registry(tries \\ 1_000) do
-      case Supervisor.restart_child(Vagus.Supervisor, Vagus.Addon.Registry) do
-        {:ok, _pid} -> :ok
-        {:error, :running} -> :ok
-        {:error, {:already_started, _stub}} when tries > 0 -> restart_registry(tries - 1)
-      end
-    end
-
-    test "a DNS register that exits doesn't fail the start", %{config: c, slug: slug, opts: opts} do
-      stub = stub_server(Vagus.DNS, fn {:register, _host, _ip} -> exit(:dns_restarting) end)
-      on_exit(fn -> Process.exit(stub, :kill) end)
-
-      log = capture_log(fn -> assert {:ok, _} = Manager.start(c, opts) end)
-
-      assert_received {:stub_call, Vagus.DNS, {:register, _host, _ip}}
-      assert log =~ "DNS register for #{slug} failed"
-      assert {:ok, %{state: :started}} = State.get(slug)
-    end
-
-    test "a Registry register that exits doesn't fail the start, or log the token", %{
-      config: c,
-      slug: slug,
-      opts: opts
-    } do
-      stub_registry(slug, fn {:register, _token, _identity} -> exit(:registry_restarting) end)
-
-      {result, log} = with_log(fn -> Manager.start(c, opts) end)
-
-      assert {:ok, %{access_token: token}} = result
-      assert_received {:stub_call, Vagus.Addon.Registry, {:register, ^token, _identity}}
-      assert log =~ "Registry register for #{slug} failed"
-      refute log =~ token
-      # What the restarted Registry rebuilds from.
-      assert {c, token} in State.running()
-    end
-
-    test "the token is in State before it is registered", %{config: c, slug: slug, opts: opts} do
-      test = self()
-
-      stub_registry(slug, fn {:register, token, _identity} ->
-        send(test, {:running_at_register, token, State.running()})
-        :ok
-      end)
-
-      assert {:ok, %{access_token: token}} = Manager.start(c, opts)
-      assert_received {:running_at_register, ^token, running}
-      assert {c, token} in running
-    end
-  end
-
   describe "W6 — record-:stopped-before-container-touch + per-slug serialization" do
     setup do
       slug = "w6_addon_#{System.unique_integer([:positive])}"
@@ -1235,6 +1111,546 @@ defmodule Vagus.Addon.ManagerTest do
     end
   end
 
+  describe "registration with the application's Registry and a default-named DNS" do
+    # Wide enough that bringing the server back always lands inside it; a
+    # start that finds its server returns at once.
+    @slack_retry {2_000, 5}
+    @tiny_retry {2, 1}
+    # Outlasts any hold a test keeps on a stubbed call.
+    @held_call_timeout 60_000
+
+    setup do
+      :persistent_term.put({__MODULE__.OrderingBackend, :pid}, self())
+      slug = "registration_#{System.unique_integer([:positive])}"
+
+      data_root =
+        Path.join(
+          System.tmp_dir!(),
+          "vagus-mgr-registration-#{System.unique_integer([:positive])}"
+        )
+
+      # Native, so its DNS record needs no Docker inspect.
+      {:ok, config} =
+        Config.parse(%{
+          "name" => "Test",
+          "version" => "1",
+          "slug" => slug,
+          "description" => "d",
+          "arch" => ["amd64"],
+          "backend" => "native"
+        })
+
+      on_exit(fn ->
+        File.rm_rf(data_root)
+        State.delete(slug)
+        Vagus.Addon.Registry.unregister_slug(slug)
+      end)
+
+      %{
+        config: config,
+        slug: slug,
+        id: "addon_#{slug}",
+        host: String.replace(slug, "_", "-"),
+        opts: [backend: __MODULE__.OrderingBackend, data_root: data_root]
+      }
+    end
+
+    # Holds `name` like the real server: reports each call to the test, then
+    # replies with `handler`'s `{:reply, term}`, stays silent on `:noreply`,
+    # or goes down mid-call when `handler` exits.
+    defp stub_server(name, handler) do
+      test = self()
+      pid = spawn(fn -> stub_loop(test, name, handler) end)
+      Process.register(pid, name)
+      on_exit(fn -> kill(pid) end)
+      pid
+    end
+
+    defp stub_loop(test, name, handler) do
+      receive do
+        {:"$gen_call", from, request} ->
+          send(test, {:stub_call, name, request})
+
+          case handler.(request) do
+            {:reply, reply} -> GenServer.reply(from, reply)
+            :noreply -> :ok
+          end
+
+          stub_loop(test, name, handler)
+
+        {:sync, from} ->
+          send(from, {:synced, self()})
+          stub_loop(test, name, handler)
+      end
+    end
+
+    # The stub takes its mailbox in order, so once it answers, every call
+    # sent to it before this one has been reported to the test.
+    defp sync(stub) do
+      send(stub, {:sync, self()})
+      assert_receive {:synced, ^stub}, 5_000
+    end
+
+    # Holds `name` like a server that goes down with `reason` on every call
+    # and is restarted. The successor has the name before the caller sees the
+    # exit, so each of the caller's attempts reaches a stub. Cleaned up by
+    # `bring_registry_up/0`, so only for the Registry's name.
+    defp dying_server(name, reason) do
+      test = self()
+      Process.register(spawn(fn -> dying_loop(test, name, reason) end), name)
+    end
+
+    defp dying_loop(test, name, reason) do
+      receive do
+        {:"$gen_call", _from, request} ->
+          send(test, {:stub_call, name, request})
+          Process.unregister(name)
+          Process.register(spawn(fn -> dying_loop(test, name, reason) end), name)
+          exit(reason)
+      end
+    end
+
+    defp stub_calls(name) do
+      for {:stub_call, ^name, request} <- drain(), do: elem(request, 0)
+    end
+
+    # A dead process has released its name by the time its monitor fires.
+    defp await_down(pid) do
+      ref = Process.monitor(pid)
+
+      receive do
+        {:DOWN, ^ref, :process, ^pid, _reason} -> :ok
+      end
+    end
+
+    defp kill(pid) do
+      Process.exit(pid, :kill)
+      await_down(pid)
+    end
+
+    # terminate + restart, never a kill: a kill counts toward
+    # `Vagus.Supervisor`'s restart intensity, and exceeding it stops the app.
+    defp take_registry_down do
+      :ok = Supervisor.terminate_child(Vagus.Supervisor, Vagus.Addon.Registry)
+      on_exit(&bring_registry_up/0)
+    end
+
+    defp bring_registry_up do
+      case Supervisor.restart_child(Vagus.Supervisor, Vagus.Addon.Registry) do
+        {:ok, _pid} ->
+          :ok
+
+        {:error, :running} ->
+          :ok
+
+        {:error, {:already_started, stub}} ->
+          kill(stub)
+          bring_registry_up()
+      end
+    end
+
+    defp cycle_registry do
+      :ok = Supervisor.terminate_child(Vagus.Supervisor, Vagus.Addon.Registry)
+      bring_registry_up()
+    end
+
+    # The default-named DNS checkpoints, so a file from an earlier test would
+    # hand its records to the one started here.
+    defp enable_dns do
+      prev = Application.get_env(:vagus, :dns_enabled)
+      Application.put_env(:vagus, :dns_enabled, true)
+      File.rm(Vagus.RunState.path(:dns))
+
+      on_exit(fn ->
+        Application.put_env(:vagus, :dns_enabled, prev)
+        File.rm(Vagus.RunState.path(:dns))
+      end)
+    end
+
+    defp start_dns do
+      {:ok, sock} = :gen_udp.open(0, ip: {127, 0, 0, 1})
+      {:ok, port} = :inet.port(sock)
+      :gen_udp.close(sock)
+
+      start_supervised!(
+        {Vagus.DNS, name: Vagus.DNS, ip: {127, 0, 0, 1}, port: port, upstream: nil}
+      )
+    end
+
+    # The Watchdog only restarts an add-on whose `watchdog` setting is on.
+    defp watch(config) do
+      :ok = State.put(config, :stopped)
+      :ok = State.put_setting(config.slug, :watchdog, true)
+    end
+
+    defp start_watchdog(watchdog_opts \\ []) do
+      :persistent_term.put({__MODULE__.WatchdogSpy, :pid}, self())
+
+      start_supervised!(
+        {Vagus.Addon.Watchdog,
+         [name: nil, manager: __MODULE__.WatchdogSpy, running_check: fn _slug -> false end]
+         |> Keyword.merge(watchdog_opts)}
+      )
+    end
+
+    defp die_event(id) do
+      {:docker_event,
+       %{action: "die", name: id, id: "id", exit_code: 137, time_nano: 0, attributes: %{}}}
+    end
+
+    defp drain(acc \\ []) do
+      receive do
+        message -> drain([message | acc])
+      after
+        0 -> Enum.reverse(acc)
+      end
+    end
+
+    # A start first stops and removes any stale same-name container, so only
+    # the backend calls after the create belong to the start's own cleanup.
+    defp split_at_create(messages) do
+      {_stale, [{:create, spec} | after_create]} =
+        Enum.split_while(messages, &(not match?({:create, _spec}, &1)))
+
+      {spec, after_create}
+    end
+
+    test "start/2 waits out a Registry that is briefly absent", %{
+      config: c,
+      slug: slug,
+      opts: opts
+    } do
+      take_registry_down()
+      stub = stub_server(Vagus.Addon.Registry, fn _request -> exit(:shutdown) end)
+
+      start = Task.async(fn -> Manager.start(c, [register_retry: @slack_retry] ++ opts) end)
+
+      assert_receive {:stub_call, Vagus.Addon.Registry, {:register, token, _identity}}, 5_000
+      await_down(stub)
+      bring_registry_up()
+
+      assert {:ok, %{access_token: ^token}} = Task.await(start, 60_000)
+      assert {:ok, %{slug: ^slug}} = Vagus.Addon.Registry.identity_for_token(token)
+    end
+
+    test "start/2 gives up on an absent Registry: the add-on is stopped and the token stays out of the log",
+         %{config: c, slug: slug, id: id, opts: opts} do
+      :ok = State.put(c, :stopped)
+      take_registry_down()
+
+      {result, log} =
+        with_log(fn ->
+          Manager.start(c, [register_retry: @tiny_retry, deregister_retry: @tiny_retry] ++ opts)
+        end)
+
+      assert {:error, {:registration_failed, :registry}} = result
+
+      {spec, after_create} = split_at_create(drain())
+      assert [{:stop_saw_state, {:ok, %{state: :stopped}}}, {:remove, ^id}] = after_create
+      assert {:ok, %{state: :stopped}} = State.get(slug)
+
+      # The exit reason of a failed call carries the call's arguments.
+      assert log =~ "Registry register for #{slug} failed: noproc"
+      assert log =~ "Registry unregister for #{slug} failed (noproc)"
+      refute log =~ spec.env["SUPERVISOR_TOKEN"]
+    end
+
+    # A failed registration is no verdict on whether the add-on should run:
+    # `:stopped` would end the Watchdog's retries and survive a reboot.
+    test "a failed registration leaves an add-on that was :started as :started", %{
+      config: c,
+      slug: slug,
+      id: id,
+      opts: opts
+    } do
+      :ok = State.put(c, :started)
+      # Enabled with no server: the Registry takes the token, then DNS fails.
+      enable_dns()
+
+      {result, _log} = with_log(fn -> Manager.start(c, [register_retry: @tiny_retry] ++ opts) end)
+
+      assert {:error, {:registration_failed, :dns}} = result
+
+      {spec, after_create} = split_at_create(drain())
+      assert [{:stop_saw_state, {:ok, %{state: :stopped}}}, {:remove, ^id}] = after_create
+      assert {:ok, %{state: :started}} = State.get(slug)
+      assert :error = Vagus.Addon.Registry.identity_for_token(spec.env["SUPERVISOR_TOKEN"])
+    end
+
+    test "the Watchdog's next attempt follows a failed registration, and succeeds", %{
+      config: c,
+      slug: slug,
+      id: id,
+      opts: opts
+    } do
+      test = self()
+      watch(c)
+      :ok = State.put(c, :started)
+      take_registry_down()
+
+      :persistent_term.put(
+        {__MODULE__.RetryingManager, :opts},
+        [register_retry: @tiny_retry] ++ opts
+      )
+
+      # Parks the sequence between attempts until the Registry is back.
+      park = fn ms ->
+        send(test, {:backoff, self(), ms})
+
+        receive do
+          :resume -> :ok
+        end
+      end
+
+      with_log(fn ->
+        watchdog =
+          start_watchdog(manager: __MODULE__.RetryingManager, sleep: park, backoff_base_ms: 1)
+
+        send(watchdog, die_event(id))
+
+        assert_receive {:watchdog_started, ^slug, {:error, {:registration_failed, :registry}}},
+                       5_000
+
+        assert_receive {:backoff, sequence, 1}, 5_000
+        assert {:ok, %{state: :started}} = State.get(slug)
+        bring_registry_up()
+        send(sequence, :resume)
+
+        assert_receive {:watchdog_started, ^slug, {:ok, %{access_token: token}}}, 5_000
+        assert {:ok, %{slug: ^slug}} = Vagus.Addon.Registry.identity_for_token(token)
+        assert {:ok, %{state: :started}} = State.get(slug)
+      end)
+    end
+
+    # A call that crashes its server would otherwise spend one of
+    # `Vagus.Supervisor`'s restarts per attempt.
+    test "a call that crashes the Registry is retried once, not for the whole budget", %{
+      config: c,
+      opts: opts
+    } do
+      take_registry_down()
+      dying_server(Vagus.Addon.Registry, :boom)
+
+      {result, log} = with_log(fn -> Manager.start(c, [register_retry: {50, 1}] ++ opts) end)
+
+      assert {:error, {:registration_failed, :registry}} = result
+      assert log =~ "failed: server_down"
+
+      assert stub_calls(Vagus.Addon.Registry) ==
+               [:register, :register, :unregister_slug, :unregister_slug]
+    end
+
+    # The failed server has had the register budget already, and all of it is
+    # spent under the slug lock.
+    test "a start that gives up deregisters on the register budget", %{config: c, opts: opts} do
+      take_registry_down()
+      dying_server(Vagus.Addon.Registry, :shutdown)
+
+      {result, _log} =
+        with_log(fn ->
+          Manager.start(c, [register_retry: {3, 1}, deregister_retry: {7, 1}] ++ opts)
+        end)
+
+      assert {:error, {:registration_failed, :registry}} = result
+
+      assert stub_calls(Vagus.Addon.Registry) ==
+               List.duplicate(:register, 3) ++ List.duplicate(:unregister_slug, 3)
+    end
+
+    test "an add-on whose registration is still in flight is :started, so its die is acted on", %{
+      config: c,
+      slug: slug,
+      id: id,
+      opts: opts
+    } do
+      watch(c)
+      take_registry_down()
+
+      stub =
+        stub_server(Vagus.Addon.Registry, fn {:register, _token, _identity} ->
+          receive do
+            :release -> {:reply, :ok}
+          end
+        end)
+
+      start =
+        Task.async(fn ->
+          Manager.start(c, [registration_call_timeout: @held_call_timeout] ++ opts)
+        end)
+
+      assert_receive {:stub_call, Vagus.Addon.Registry, {:register, token, _identity}}, 5_000
+
+      assert {:ok, %{state: :started}} = State.get(slug)
+      send(start_watchdog(), die_event(id))
+      assert_receive {:watchdog_start_slug, ^slug}, 5_000
+
+      send(stub, :release)
+      assert {:ok, %{access_token: ^token}} = Task.await(start, @held_call_timeout)
+    end
+
+    test "start/2 waits out a DNS that is briefly absent", %{
+      config: c,
+      slug: slug,
+      host: host,
+      opts: opts
+    } do
+      enable_dns()
+      stub = stub_server(Vagus.DNS, fn _request -> exit(:shutdown) end)
+
+      start = Task.async(fn -> Manager.start(c, [register_retry: @slack_retry] ++ opts) end)
+
+      assert_receive {:stub_call, Vagus.DNS, {:register, ^host, _ip}}, 5_000
+      await_down(stub)
+      start_dns()
+
+      assert {:ok, %{access_token: token}} = Task.await(start, 60_000)
+      assert {:ok, {172, 30, 32, 2}} = Vagus.DNS.resolve(host, Vagus.DNS)
+      assert {:ok, %{slug: ^slug}} = Vagus.Addon.Registry.identity_for_token(token)
+    end
+
+    test "start/2 gives up on an absent DNS and revokes the token it had registered", %{
+      config: c,
+      slug: slug,
+      id: id,
+      host: host,
+      opts: opts
+    } do
+      enable_dns()
+
+      stub =
+        stub_server(Vagus.DNS, fn _request ->
+          receive do
+            :go_down -> exit(:shutdown)
+          end
+        end)
+
+      start =
+        Task.async(fn ->
+          with_log(fn ->
+            Manager.start(
+              c,
+              [
+                register_retry: @tiny_retry,
+                deregister_retry: @tiny_retry,
+                registration_call_timeout: @held_call_timeout
+              ] ++ opts
+            )
+          end)
+        end)
+
+      assert_receive {:create, spec}, 5_000
+      assert_receive {:stub_call, Vagus.DNS, {:register, ^host, _ip}}, 5_000
+      token = spec.env["SUPERVISOR_TOKEN"]
+      assert {:ok, %{slug: ^slug}} = Vagus.Addon.Registry.identity_for_token(token)
+      _stale_container_calls = drain()
+
+      send(stub, :go_down)
+      {result, log} = Task.await(start, @held_call_timeout)
+
+      assert {:error, {:registration_failed, :dns}} = result
+      assert [{:stop_saw_state, {:ok, %{state: :stopped}}}, {:remove, ^id}] = drain()
+      assert {:ok, %{state: :stopped}} = State.get(slug)
+      assert :error = Vagus.Addon.Registry.identity_for_token(token)
+      assert log =~ "DNS register for #{slug} failed: noproc"
+      refute log =~ token
+    end
+
+    # Each retry of a call that timed out would hold the slug lock for
+    # another full call timeout.
+    @tag :capture_log
+    test "a registration call that times out is not retried", %{config: c, opts: opts} do
+      take_registry_down()
+      stub = stub_server(Vagus.Addon.Registry, fn _request -> :noreply end)
+
+      result =
+        Manager.start(c, [registration_call_timeout: 100, register_retry: {5, 1}] ++ opts)
+
+      assert {:error, {:registration_failed, :registry}} = result
+
+      sync(stub)
+      assert stub_calls(Vagus.Addon.Registry) == [:register, :unregister_slug]
+    end
+
+    test "stop/2 waits out a Registry that is briefly absent, and the token stays revoked", %{
+      config: c,
+      slug: slug,
+      opts: opts
+    } do
+      assert {:ok, %{access_token: token}} = Manager.start(c, opts)
+      assert {:ok, %{slug: ^slug}} = Vagus.Addon.Registry.identity_for_token(token)
+
+      take_registry_down()
+      stub = stub_server(Vagus.Addon.Registry, fn _request -> exit(:shutdown) end)
+
+      stop = Task.async(fn -> Manager.stop(slug, [deregister_retry: @slack_retry] ++ opts) end)
+
+      assert_receive {:stub_call, Vagus.Addon.Registry, {:unregister_slug, ^slug}}, 5_000
+      await_down(stub)
+      # Comes back holding the token: its checkpoint predates the unregister.
+      bring_registry_up()
+
+      assert :ok = Task.await(stop, 60_000)
+      assert :error = Vagus.Addon.Registry.identity_for_token(token)
+
+      cycle_registry()
+      assert :error = Vagus.Addon.Registry.identity_for_token(token)
+    end
+
+    test "stop/2 still succeeds when the Registry stays absent, and logs the token left valid",
+         %{config: c, slug: slug, opts: opts} do
+      assert {:ok, %{access_token: token}} = Manager.start(c, opts)
+      take_registry_down()
+
+      {result, log} =
+        with_log(fn -> Manager.stop(slug, [deregister_retry: @tiny_retry] ++ opts) end)
+
+      assert result == :ok
+      assert {:ok, %{state: :stopped}} = State.get(slug)
+      assert log =~ "[error] Vagus.Addon.Manager: Registry unregister for #{slug} failed (noproc)"
+      refute log =~ token
+    end
+
+    test "uninstall/2 waits out a Registry that is briefly absent, and the token is revoked", %{
+      config: c,
+      slug: slug,
+      opts: opts
+    } do
+      assert {:ok, %{access_token: token}} = Manager.start(c, opts)
+
+      take_registry_down()
+      stub = stub_server(Vagus.Addon.Registry, fn _request -> exit(:shutdown) end)
+
+      uninstall =
+        Task.async(fn -> Manager.uninstall(slug, [deregister_retry: @slack_retry] ++ opts) end)
+
+      assert_receive {:stub_call, Vagus.Addon.Registry, {:unregister_slug, ^slug}}, 5_000
+      await_down(stub)
+      bring_registry_up()
+
+      assert :ok = Task.await(uninstall, 60_000)
+      assert :error = Vagus.Addon.Registry.identity_for_token(token)
+      assert :error = State.get(slug)
+    end
+
+    test "uninstall/2 deregisters on its caller's retry budget", %{
+      config: c,
+      slug: slug,
+      opts: opts
+    } do
+      assert {:ok, _started} = Manager.start(c, opts)
+
+      take_registry_down()
+      dying_server(Vagus.Addon.Registry, :shutdown)
+      _start_calls = drain()
+
+      {result, _log} =
+        with_log(fn -> Manager.uninstall(slug, [deregister_retry: {3, 1}] ++ opts) end)
+
+      assert result == :ok
+      assert stub_calls(Vagus.Addon.Registry) == List.duplicate(:unregister_slug, 3)
+    end
+  end
+
   defmodule OrderingBackend do
     @moduledoc false
     @behaviour Vagus.Addon.Backend
@@ -1250,7 +1666,10 @@ defmodule Vagus.Addon.ManagerTest do
     def pull(_spec), do: :ok
 
     @impl true
-    def create(_spec), do: {:ok, "fake-id"}
+    def create(spec) do
+      notify({:create, spec})
+      {:ok, "fake-id"}
+    end
 
     @impl true
     def start(_id), do: :ok
@@ -1263,7 +1682,10 @@ defmodule Vagus.Addon.ManagerTest do
     end
 
     @impl true
-    def remove(_id, _opts \\ []), do: :ok
+    def remove(id, _opts \\ []) do
+      notify({:remove, id})
+      :ok
+    end
 
     @impl true
     def state(_id), do: {:ok, :running}
@@ -1344,6 +1766,30 @@ defmodule Vagus.Addon.ManagerTest do
 
     @impl true
     def state(_id), do: {:ok, :running}
+  end
+
+  defmodule WatchdogSpy do
+    @moduledoc false
+    def start_slug(slug, _opts) do
+      send(:persistent_term.get({__MODULE__, :pid}), {:watchdog_start_slug, slug})
+      {:ok, %{}}
+    end
+  end
+
+  # The Watchdog calls `start_slug(slug, [])`; this is the real Manager with
+  # the test's backend and retry budget, reporting each attempt's result.
+  defmodule RetryingManager do
+    @moduledoc false
+    def start_slug(slug, _opts) do
+      result = Vagus.Addon.Manager.start_slug(slug, :persistent_term.get({__MODULE__, :opts}))
+
+      send(
+        :persistent_term.get({Vagus.Addon.ManagerTest.WatchdogSpy, :pid}),
+        {:watchdog_started, slug, result}
+      )
+
+      result
+    end
   end
 
   # Stands in for `Vagus.Ingress.Panels` via `Manager`'s `:panels` opt — the

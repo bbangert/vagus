@@ -9,10 +9,7 @@ defmodule Vagus.Test.FakeEngine do
 
   `start/1` takes an ordered list of canned responses — `{status, body}` (or
   `{status, body, delay: ms}` to hold the connection open before replying,
-  for lock-contention tests that need an op to stay "in flight", or
-  `{status, body, gate: pid}` to hold it until the test lets go: `pid` gets
-  `{:fake_engine_held, responder}` when the request arrives and the reply is
-  sent once `responder` receives `:release`), `body` a
+  for lock-contention tests that need an op to stay "in flight"), `body` a
   map (JSON-encoded), a binary (sent raw — used for `/images/create`'s
   non-JSON streamed status lines), or `nil` (empty body) — consumed strictly
   in request-arrival order. Since every `Vagus.Core.Lifecycle` op issues a
@@ -166,24 +163,7 @@ defmodule Vagus.Test.FakeEngine do
       ms -> Process.sleep(ms)
     end
 
-    case Keyword.get(opts, :gate) do
-      nil -> :ok
-      pid -> hold(pid)
-    end
-
     send_response(sock, status, body)
-  end
-
-  # Also let go when the gate's owner dies, so an unreleased responder never
-  # outlives its test.
-  defp hold(pid) do
-    ref = Process.monitor(pid)
-    send(pid, {:fake_engine_held, self()})
-
-    receive do
-      :release -> Process.demonitor(ref, [:flush])
-      {:DOWN, ^ref, :process, _pid, _reason} -> :ok
-    end
   end
 
   ## Request parsing

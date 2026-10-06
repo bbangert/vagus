@@ -29,6 +29,11 @@ defmodule Vagus.Application do
     # value rather than inferring "off" from an absent table.
     Vagus.Dist.create_session_table()
 
+    # The run-state files describe this application run's add-ons and none is
+    # registered yet, so wiping loses nothing valid and guarantees no file is
+    # older than the app instance that reads it.
+    Vagus.RunState.reset_dir()
+
     children =
       [
         # Fire-and-forget and bounded work that must not be a bare spawn

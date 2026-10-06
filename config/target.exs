@@ -162,6 +162,10 @@ config :vagus, :token_path, "/data/vagus/token"
 config :vagus, :addon_state_path, "/data/vagus/addons.json"
 config :vagus, :addon_boot_start, true
 
+# tmpfs checkpoint of add-on registrations so a process restart loses nothing;
+# `Vagus.Application` wipes it at every app start (see `Vagus.RunState`).
+config :vagus, :run_state_dir, "/run/vagus"
+
 # Boot-time Core adoption (CL-P1-T2) — see config/host.exs's :core_versions_path
 # comment for why these config-gated boot-reconciliation modules stay off on
 # :host/:test; only target enables the poll-then-adopt GenServer.

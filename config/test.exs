@@ -99,6 +99,10 @@ config :vagus, :backends, %{
 config :vagus, :addon_state_path, nil
 config :vagus, :addon_boot_start, false
 
+# Per-run tmp dir, set here too because under a MIX_TARGET config/target.exs
+# loads first and would point the suite at the real `/run/vagus`.
+config :vagus, :run_state_dir, Path.join(System.tmp_dir!(), "vagus-run-#{System.pid()}")
+
 # Store assets stay in memory during `mix test` regardless of how much RAM
 # the CI runner or dev box happens to have — `:auto` would make the store's
 # retention behaviour a property of the machine running the suite. Tests
