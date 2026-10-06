@@ -330,31 +330,47 @@ defmodule Vagus.Addon.Manager do
   That conclusion is re-checked under the slug lock, since a start may have
   completed after it was drawn: an add-on its backend reports running is left
   as it is and `{:error, :running}` returned. A slug with no
-  `Vagus.Addon.State` entry, or no `State` to ask, is left alone too (`:ok`).
+  `Vagus.Addon.State` entry is left alone too (`:ok`).
+
+  The token is revoked only once `:stopped` is recorded. With no `State` to
+  read or record in for the register budget, nothing is revoked and
+  `{:error, :state_unavailable}` returned.
 
   A caller killed between the record and the revoke leaves a `:stopped` add-on
   with a valid token until its next start. Not for a caller that holds the
   lock already (see `stop_holding_lock/2`). Takes the options `stop/2` does.
   """
-  @spec demote(String.t(), keyword()) :: :ok | {:error, :running}
+  @spec demote(String.t(), keyword()) :: :ok | {:error, :running | :state_unavailable}
   def demote(slug, opts \\ []) do
     with_slug_lock(slug, fn -> do_demote(slug, opts) end)
   end
 
   defp do_demote(slug, opts) do
-    case fetch_entry(slug) do
-      {:ok, %{config: config}} ->
+    retry = Keyword.get(opts, :register_retry, @register_retry)
+
+    case AbsentRetry.call(fn -> Vagus.Addon.State.get(slug) end, retry) do
+      {:ok, {:ok, %{config: config}}} ->
         opts = put_backend(opts, config)
 
-        if running?(config, opts) do
-          {:error, :running}
-        else
-          record_state(config, :stopped)
-          deregister_slug(slug, opts)
-        end
+        if running?(config, opts),
+          do: {:error, :running},
+          else: record_stopped_then_revoke(config, retry, opts)
 
-      _none ->
+      {:ok, :error} ->
         :ok
+
+      {:error, _tag} ->
+        {:error, :state_unavailable}
+    end
+  end
+
+  # Not `record_state/3`, which skips the write when `State` is absent: a
+  # token revoked for an add-on still recorded `:started` is restarted by the
+  # Watchdog, and its record is the only thing saying so.
+  defp record_stopped_then_revoke(config, retry, opts) do
+    case AbsentRetry.call(fn -> Vagus.Addon.State.put(config, :stopped) end, retry) do
+      {:ok, :ok} -> deregister_slug(config.slug, opts)
+      {:error, _tag} -> {:error, :state_unavailable}
     end
   end
 
@@ -1013,10 +1029,6 @@ defmodule Vagus.Addon.Manager do
     else
       _ -> true
     end
-  end
-
-  defp fetch_entry(slug) do
-    if Process.whereis(Vagus.Addon.State), do: Vagus.Addon.State.get(slug), else: :absent
   end
 
   defp record_state(config, state, state_opts \\ []) do

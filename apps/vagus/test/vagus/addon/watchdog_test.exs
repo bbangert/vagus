@@ -369,7 +369,9 @@ defmodule Vagus.Addon.WatchdogTest do
         {"hangs", quote(do: fn _slug -> receive(do: (:never -> :ok)) end), "timed out"},
         {"exits", quote(do: fn _slug -> exit(:boom) end), "failed"},
         {"raises", quote(do: fn _slug -> raise "boom" end), "failed"},
-        {"returns an error", quote(do: fn _slug -> {:error, :boom} end), "failed"}
+        {"returns an error", quote(do: fn _slug -> {:error, :boom} end), "failed"},
+        {"finds no State", quote(do: fn _slug -> {:error, :state_unavailable} end),
+         "found no State to record it in"}
       ] do
     test "a demotion that #{name} is logged as such, and the sequence still ends", %{
       state_pid: state_pid

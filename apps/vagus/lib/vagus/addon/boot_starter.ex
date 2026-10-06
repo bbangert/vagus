@@ -229,7 +229,9 @@ defmodule Vagus.Addon.BootStarter do
   # A failure here would restart this process, and its next pass would start
   # every `:started` add-on again.
   defp demote(slug) do
-    Manager.demote(slug)
+    with {:error, :state_unavailable} <- Manager.demote(slug) do
+      Logger.error("Vagus.Addon.BootStarter: no State to demote #{slug} in; it stays :started")
+    end
   catch
     kind, _reason when kind in [:error, :exit] ->
       Logger.error("Vagus.Addon.BootStarter: demoting #{slug} failed; it may stay :started")

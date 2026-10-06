@@ -825,7 +825,8 @@ defmodule Vagus.Addon.Backend.NativeTest do
 
     for {name, failure} <- [
           {"exits", quote(do: exit(:state_gone))},
-          {"raises", quote(do: raise("no state"))}
+          {"raises", quote(do: raise("no state"))},
+          {"finds no State", quote(do: {:error, :state_unavailable})}
         ] do
       test "a demotion that #{name} before recording anything is made again", %{
         id: id,
@@ -840,10 +841,14 @@ defmodule Vagus.Addon.Backend.NativeTest do
             recheck_ms: 10,
             demote_fun: fn slug ->
               :counters.add(attempts, 1, 1)
-              if :counters.get(attempts, 1) == 1, do: unquote(failure)
-              result = Manager.demote(slug)
-              send(test, {:demoted, result})
-              result
+
+              if :counters.get(attempts, 1) == 1 do
+                unquote(failure)
+              else
+                result = Manager.demote(slug)
+                send(test, {:demoted, result})
+                result
+              end
             end
           )
 
@@ -882,6 +887,42 @@ defmodule Vagus.Addon.Backend.NativeTest do
       on_exit(fn -> Process.exit(broker, :kill) end)
       assert {:ok, %{state: :started}} = State.get(slug)
       assert {:ok, %{slug: ^slug}} = Vagus.Addon.Registry.identity_for_token(token)
+    end
+
+    # Brought up here without `Native.start/1`, so nothing else asks for it
+    # to be watched.
+    test "a broker the demotion found running is watched: its death is demoted", %{
+      id: id,
+      slug: slug,
+      token: token
+    } do
+      test = self()
+      attempts = :counters.new(1, [])
+
+      sentinel =
+        start_real_sentinel(
+          recheck_ms: 10,
+          demote_fun: fn slug ->
+            :counters.add(attempts, 1, 1)
+
+            if :counters.get(attempts, 1) == 1,
+              do: {:ok, _broker} = Agent.start(fn -> :ok end, name: Native.broker_name(id))
+
+            result = Manager.demote(slug)
+            send(test, {:demoted, result})
+            result
+          end
+        )
+
+      recheck_sync(sentinel, id)
+      assert_received {:demoted, {:error, :running}}
+
+      Agent.stop(Process.whereis(Native.broker_name(id)))
+
+      assert_receive {:demoted, :ok}, 5_000
+      :sys.get_state(sentinel)
+      assert {:ok, %{state: :stopped}} = State.get(slug)
+      assert :error = Vagus.Addon.Registry.identity_for_token(token)
     end
   end
 

@@ -294,6 +294,38 @@ defmodule Vagus.Addon.BootStarterTest do
     end
   end
 
+  test "a demotion that finds no State to record in is logged, and the pass goes on" do
+    # Emptied first: an entry another test left `:started` would be started
+    # after this one, with State already gone.
+    :ok = Supervisor.terminate_child(Vagus.Supervisor, State)
+    {:ok, _pid} = Supervisor.restart_child(Vagus.Supervisor, State)
+
+    slug = "boot_demote_no_state_#{System.unique_integer([:positive])}"
+    seed(slug, :started, fixture_config(slug, %{"boot" => "manual"}))
+    # Registered after the seed's cleanup, so it runs before it.
+    on_exit(fn -> Supervisor.restart_child(Vagus.Supervisor, State) end)
+    Application.put_env(:vagus, :addon_backend, __MODULE__.StateStoppingBackend)
+
+    log = capture_log(fn -> assert %{phase: :api} = reconcile_now() end)
+
+    assert log =~ "no State to demote #{slug} in"
+  end
+
+  # Takes State away between the demotion's read and its write.
+  defmodule StateStoppingBackend do
+    @moduledoc false
+    defdelegate pull(spec), to: Fake
+    defdelegate create(spec), to: Fake
+    defdelegate start(id), to: Fake
+    defdelegate stop(id, opts), to: Fake
+    defdelegate remove(id, opts), to: Fake
+
+    def state(_id) do
+      Supervisor.terminate_child(Vagus.Supervisor, Vagus.Addon.State)
+      {:ok, :stopped}
+    end
+  end
+
   # `Fake`, but for the liveness answer: the pass also starts whatever
   # `:started` entries other tests left in the shared State.
   defmodule ExitingBackend do

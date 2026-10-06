@@ -507,6 +507,7 @@ defmodule Vagus.Addon.Watchdog do
 
   # The reason can carry call arguments, so only which kind it was is logged.
   defp demote_failure({:error, :attempt_timeout}), do: "timed out"
+  defp demote_failure({:error, :state_unavailable}), do: "found no State to record it in"
   defp demote_failure(_error), do: "failed"
 
   ## Defaults

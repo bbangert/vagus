@@ -121,8 +121,7 @@ defmodule Vagus.Addon.Backend.Native.Sentinel do
       # OTP restarted it — resume watching, State stays :started.
       {:noreply, monitor(id, state)}
     else
-      demote(id, state)
-      {:noreply, state}
+      {:noreply, demote(id, state)}
     end
   end
 
@@ -194,21 +193,28 @@ defmodule Vagus.Addon.Backend.Native.Sentinel do
           "Vagus.Addon.Backend.Native.Sentinel: broker #{slug} did not restart — demoting to :stopped"
         )
 
-        demoted = demote_slug(id, slug, state)
+        case demote_slug(id, slug, state) do
+          # `Native.start/1` casts a watch for every broker it brings up; this
+          # does not depend on that cast being behind this message.
+          {:error, :running} ->
+            monitor(id, state)
 
-        # Revive ONLY when State still read :started here — the signature
-        # of a genuine crash (demote exists to fix that staleness). A
-        # manual stop records :stopped BEFORE terminating the broker, and
-        # unwatch/2 is an async cast, so a DOWN/recheck racing the stop
-        # must not resurrect an add-on the user just stopped (Copilot
-        # review, PR #7 round 2).
-        if demoted != {:error, :running} and Map.get(entry, :state) == :started and
-             auto_boot?(config) do
-          Process.send_after(self(), {:revive, id}, state.revive_delay_ms)
+          _demoted_or_failed ->
+            # Revive ONLY when State still read :started here — the signature
+            # of a genuine crash (demote exists to fix that staleness). A
+            # manual stop records :stopped BEFORE terminating the broker, and
+            # unwatch/2 is an async cast, so a DOWN/recheck racing the stop
+            # must not resurrect an add-on the user just stopped (Copilot
+            # review, PR #7 round 2).
+            if Map.get(entry, :state) == :started and auto_boot?(config) do
+              Process.send_after(self(), {:revive, id}, state.revive_delay_ms)
+            end
+
+            state
         end
 
       _ ->
-        :ok
+        state
     end
   end
 
@@ -217,16 +223,21 @@ defmodule Vagus.Addon.Backend.Native.Sentinel do
   # recorded anything, and a revive only acts on `:stopped`, so the recheck is
   # armed again to repeat it.
   defp demote_slug(id, slug, state) do
-    state.demote_fun.(slug)
+    with {:error, :state_unavailable} <- state.demote_fun.(slug) do
+      retry_demotion(id, slug, state)
+    end
   catch
-    kind, _reason when kind in [:error, :exit] ->
-      Logger.error(
-        "Vagus.Addon.Backend.Native.Sentinel: demoting #{slug} failed; " <>
-          "retrying in #{state.recheck_ms}ms"
-      )
+    kind, _reason when kind in [:error, :exit] -> retry_demotion(id, slug, state)
+  end
 
-      Process.send_after(self(), {:recheck, id}, state.recheck_ms)
-      :failed
+  defp retry_demotion(id, slug, state) do
+    Logger.error(
+      "Vagus.Addon.Backend.Native.Sentinel: demoting #{slug} failed; " <>
+        "retrying in #{state.recheck_ms}ms"
+    )
+
+    Process.send_after(self(), {:recheck, id}, state.recheck_ms)
+    :failed
   end
 
   # Pattern-based (not struct-field access) so test fakes with opaque

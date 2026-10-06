@@ -1985,7 +1985,7 @@ defmodule Vagus.Addon.ManagerTest do
       assert {:ok, %{slug: ^slug}} = Vagus.Addon.Registry.identity_for_token(token)
     end
 
-    test "demote/2 revokes nothing while there is no State to ask", %{
+    test "demote/2 revokes nothing when State stays absent, and says so", %{
       config: c,
       slug: slug,
       opts: opts
@@ -1994,8 +1994,69 @@ defmodule Vagus.Addon.ManagerTest do
       assert {:ok, %{access_token: token}} = Manager.start(c, opts)
       take_down(Vagus.Addon.State)
 
-      assert :ok = Manager.demote(slug, opts)
+      assert {:error, :state_unavailable} =
+               Manager.demote(slug, [register_retry: @tiny_retry] ++ opts)
 
+      assert {:ok, %{slug: ^slug}} = Vagus.Addon.Registry.identity_for_token(token)
+    end
+
+    # The app's State keeps nothing across a restart in this environment, so
+    # this one is given a file to come back from.
+    test "demote/2 waits out a State that is briefly absent", %{
+      config: c,
+      slug: slug,
+      opts: opts
+    } do
+      path = Path.join(System.tmp_dir!(), "vagus-state-#{slug}.json")
+      prev = Application.get_env(:vagus, :addon_state_path)
+      Application.put_env(:vagus, :addon_state_path, path)
+
+      on_exit(fn ->
+        Application.put_env(:vagus, :addon_state_path, prev)
+        cycle(Vagus.Addon.State)
+        File.rm(path)
+      end)
+
+      cycle(Vagus.Addon.State)
+      opts = script(opts, state: {:ok, :stopped})
+      assert {:ok, %{access_token: token}} = Manager.start(c, opts)
+
+      take_down(Vagus.Addon.State)
+      stub = stub_server(Vagus.Addon.State, fn _request -> exit(:shutdown) end)
+
+      demote = Task.async(fn -> Manager.demote(slug, [register_retry: @slack_retry] ++ opts) end)
+
+      assert_receive {:stub_call, Vagus.Addon.State, {:get, ^slug}}, 5_000
+      await_down(stub)
+      bring_up(Vagus.Addon.State)
+
+      assert :ok = Task.await(demote, 60_000)
+      assert {:ok, %{state: :stopped}} = State.get(slug)
+      assert :error = Vagus.Addon.Registry.identity_for_token(token)
+    end
+
+    # Revoked without the record, the add-on would read `:started` with no
+    # token once State is back.
+    test "demote/2 revokes nothing when :stopped could not be recorded", %{
+      config: c,
+      slug: slug,
+      opts: opts
+    } do
+      token = register_dead_token(c)
+      take_down(Vagus.Addon.State)
+
+      stub_server(Vagus.Addon.State, fn
+        {:get, ^slug} -> {:reply, {:ok, %{config: c, state: :started, user_options: %{}}}}
+        {:put, _config, :stopped, _user_options} -> exit(:shutdown)
+      end)
+
+      assert {:error, :state_unavailable} =
+               Manager.demote(
+                 slug,
+                 [register_retry: @tiny_retry] ++ script(opts, state: {:ok, :stopped})
+               )
+
+      assert_received {:stub_call, Vagus.Addon.State, {:put, ^c, :stopped, _user_options}}
       assert {:ok, %{slug: ^slug}} = Vagus.Addon.Registry.identity_for_token(token)
     end
 
