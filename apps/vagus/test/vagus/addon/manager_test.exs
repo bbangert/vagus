@@ -1738,6 +1738,36 @@ defmodule Vagus.Addon.ManagerTest do
       assert log =~ "[error] Vagus.Addon.Manager: Services purge for #{slug} failed (noproc)"
     end
 
+    # Each purge can take its whole budget; a token valid for that long
+    # belongs to an add-on that is already stopped.
+    test "uninstall/2 has revoked the token by the time it purges Discovery", %{
+      config: c,
+      slug: slug,
+      opts: opts
+    } do
+      assert {:ok, %{access_token: token}} = Manager.start(c, opts)
+      on_exit(fn -> bring_up(Vagus.Discovery) end)
+      take_down(Vagus.Discovery)
+
+      stub =
+        stub_server(Vagus.Discovery, fn {:delete_by_slug, _slug} ->
+          receive do
+            :release -> {:reply, {:ok, []}}
+          end
+        end)
+
+      uninstall =
+        Task.async(fn ->
+          Manager.uninstall(slug, [registration_call_timeout: @held_call_timeout] ++ opts)
+        end)
+
+      assert_receive {:stub_call, Vagus.Discovery, {:delete_by_slug, ^slug}}, 5_000
+      assert :error = Vagus.Addon.Registry.identity_for_token(token)
+
+      send(stub, :release)
+      assert :ok = Task.await(uninstall, @held_call_timeout)
+    end
+
     test "uninstall/2 gives a Discovery or Services that holds the call one call timeout each",
          %{config: c, slug: slug, opts: opts} do
       assert {:ok, _started} = Manager.start(c, opts)

@@ -1023,9 +1023,14 @@ defmodule Vagus.Addon.Manager do
   # Purge every other subsystem's record of `slug` on uninstall. Discovery
   # and Services get the deregister budget: both reload their checkpoint on
   # restart, so a delete skipped while one is absent would come back with it.
+  #
+  # The token and DNS record go first: revoking a credential must not wait on
+  # side-state cleanup.
   defp purge_side_state(slug, opts) do
     retry = Keyword.get(opts, :deregister_retry, @deregister_retry)
     timeout = call_timeout(opts)
+
+    deregister_slug(slug, opts)
 
     purge(slug, "Discovery", retry, fn ->
       Vagus.Discovery.delete_by_slug(slug, Vagus.Discovery, timeout)
@@ -1035,7 +1040,6 @@ defmodule Vagus.Addon.Manager do
       Vagus.Services.delete_by_slug(slug, Vagus.Services, timeout)
     end)
 
-    deregister_slug(slug, opts)
     if Process.whereis(Vagus.Addon.State), do: Vagus.Addon.State.delete(slug)
     :ok
   end
