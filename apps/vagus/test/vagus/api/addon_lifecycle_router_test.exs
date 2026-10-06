@@ -210,6 +210,59 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
       assert body(conn)["message"] == "Addon Test Addon is already installed"
     end
 
+    # Goes down on every call like a server that crashes and is restarted;
+    # that is retried once, where an absent one is waited on for seconds.
+    defp crashing_registry do
+      Process.register(spawn(&crash_on_call/0), Registry)
+    end
+
+    defp crash_on_call do
+      receive do
+        {:"$gen_call", _from, _request} ->
+          Process.unregister(Registry)
+          crashing_registry()
+          exit(:boom)
+      end
+    end
+
+    defp restore_registry do
+      case Supervisor.restart_child(Vagus.Supervisor, Registry) do
+        {:ok, _pid} ->
+          :ok
+
+        {:error, :running} ->
+          :ok
+
+        {:error, {:already_started, stub}} ->
+          ref = Process.monitor(stub)
+          Process.exit(stub, :kill)
+          assert_receive {:DOWN, ^ref, :process, ^stub, _reason}, 5_000
+          restore_registry()
+      end
+    end
+
+    test "an install the Registry cannot clear a leftover token for is a 503, and records nothing" do
+      slug = "core_noregistry_#{System.unique_integer([:positive])}"
+      seed_store(slug, %{fixture_config("noregistry") | slug: slug})
+      on_exit(fn -> State.delete(slug) end)
+      :ok = Supervisor.terminate_child(Vagus.Supervisor, Registry)
+      on_exit(&restore_registry/0)
+      crashing_registry()
+
+      {conn, log} =
+        ExUnit.CaptureLog.with_log(fn ->
+          supervisor_call(:post, "/store/addons/#{slug}/install")
+        end)
+
+      assert conn.status == 503
+
+      assert body(conn)["message"] ==
+               "Addon Test Addon could not be installed: the add-on registry is unavailable, try again"
+
+      assert :error = State.get(slug)
+      assert log =~ "Registry unregister for #{slug} failed (server_down)"
+    end
+
     # Whether a slug is installed is not an add-on's to learn.
     test "an add-on caller gets the 403 for an installed slug too" do
       slug = "core_reinstall_403_#{System.unique_integer([:positive])}"

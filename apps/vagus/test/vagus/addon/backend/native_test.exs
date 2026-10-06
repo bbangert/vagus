@@ -562,7 +562,13 @@ defmodule Vagus.Addon.Backend.NativeTest do
       end
     end
 
-    defp start_revive_sentinel(ctx_name, config, revive_fun, demote_fun \\ demote_in(ReviveState)) do
+    defp start_revive_sentinel(
+           ctx_name,
+           config,
+           revive_fun,
+           demote_fun \\ demote_in(ReviveState),
+           overrides \\ []
+         ) do
       :persistent_term.put(ReviveState, self())
       :persistent_term.put({ReviveState, :entry}, {:ok, %{state: :started, config: config}})
 
@@ -574,13 +580,18 @@ defmodule Vagus.Addon.Backend.NativeTest do
       start_supervised!(
         Supervisor.child_spec(
           {Native.Sentinel,
-           name: ctx_name,
-           state_mod: ReviveState,
-           demote_fun: demote_fun,
-           recheck_ms: 50,
-           revive_delay_ms: 50,
-           revive_retry_ms: 50,
-           revive_fun: revive_fun},
+           Keyword.merge(
+             [
+               name: ctx_name,
+               state_mod: ReviveState,
+               demote_fun: demote_fun,
+               recheck_ms: 50,
+               revive_delay_ms: 50,
+               revive_retry_ms: 50,
+               revive_fun: revive_fun
+             ],
+             overrides
+           )},
           id: ctx_name
         )
       )
@@ -627,6 +638,82 @@ defmodule Vagus.Addon.Backend.NativeTest do
 
       assert_receive :revive_attempt, 1_000
       # No cap, fixed interval: further attempts keep coming.
+      assert_receive :revive_attempt, 1_000
+      assert_receive :revive_attempt, 1_000
+    end
+
+    # Demoted, with a revive owed that only the test can deliver.
+    defp demoted_with_revive_owed(id, config) do
+      test = self()
+
+      sentinel =
+        start_revive_sentinel(
+          :"rv_#{System.unique_integer([:positive])}",
+          config,
+          fn cfg ->
+            send(test, {:revive_called, cfg})
+            {:ok, %{}}
+          end,
+          demote_in(ReviveState),
+          revive_delay_ms: 3_600_000
+        )
+
+      kill_watched_broker(sentinel, id)
+      assert_receive {:state_put, ^config, :stopped}, 1_000
+      assert %{revives: %{^id => ref}} = :sys.get_state(sentinel)
+      {sentinel, ref}
+    end
+
+    defp deliver_revive(sentinel, id, ref) do
+      send(Process.whereis(sentinel), {:revive, id, ref})
+      :sys.get_state(sentinel)
+    end
+
+    # The stop leaves the entry as the demotion did: `:stopped`, boot auto.
+    test "a manual stop before the revive fires calls it off" do
+      id = unique_id()
+      config = %{boot: "auto", slug: Native.slug_from_id(id)}
+      {sentinel, ref} = demoted_with_revive_owed(id, config)
+
+      Native.Sentinel.unwatch(id, sentinel)
+      assert %{revives: revives} = deliver_revive(sentinel, id, ref)
+
+      assert revives == %{}
+      refute_received {:revive_called, _config}
+    end
+
+    test "a revive message that is not the one owed is ignored, and the one owed revives once" do
+      id = unique_id()
+      config = %{boot: "auto", slug: Native.slug_from_id(id)}
+      {sentinel, ref} = demoted_with_revive_owed(id, config)
+
+      deliver_revive(sentinel, id, make_ref())
+      refute_received {:revive_called, _config}
+
+      deliver_revive(sentinel, id, ref)
+      assert_received {:revive_called, ^config}
+
+      deliver_revive(sentinel, id, ref)
+      refute_received {:revive_called, _config}
+    end
+
+    # `Manager.start/1` stops the stale broker before it starts a new one,
+    # from inside the Sentinel.
+    test "the stop a revive makes itself does not call off its retry" do
+      test = self()
+      id = unique_id()
+      config = %{boot: "auto", slug: Native.slug_from_id(id)}
+      name = :"rv_#{System.unique_integer([:positive])}"
+
+      sentinel =
+        start_revive_sentinel(name, config, fn _cfg ->
+          Native.Sentinel.unwatch(id, name)
+          send(test, :revive_attempt)
+          {:error, :port_busy}
+        end)
+
+      kill_watched_broker(sentinel, id)
+
       assert_receive :revive_attempt, 1_000
       assert_receive :revive_attempt, 1_000
     end

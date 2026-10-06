@@ -32,7 +32,9 @@ defmodule Vagus.Addon.Backend.Native.Sentinel do
   cap — same no-backoff philosophy as `Watchdog.Probe` (§B7.4), and safe
   because each attempt is one supervised call, not a supervision-tree crash
   loop. The revive is skipped if, by the time it fires, the add-on was
-  uninstalled or manually started (State is re-read first).
+  uninstalled or manually started (State is re-read first), and called off
+  by a stop or a start from anyone else in the meantime: a manual stop leaves
+  the same `:stopped` entry the demotion did.
   """
 
   use GenServer
@@ -64,14 +66,23 @@ defmodule Vagus.Addon.Backend.Native.Sentinel do
   @doc "Begin watching native add-on `id`'s broker subtree for permanent death."
   @spec watch(Vagus.Addon.Backend.id(), GenServer.server()) :: :ok
   def watch(id, server \\ __MODULE__) do
-    if Process.whereis(server), do: GenServer.cast(server, {:watch, id})
-    :ok
+    notify(server, :watch, id)
   end
 
   @doc "Stop watching `id` (an intentional stop/remove, not a crash)."
   @spec unwatch(Vagus.Addon.Backend.id(), GenServer.server()) :: :ok
   def unwatch(id, server \\ __MODULE__) do
-    if Process.whereis(server), do: GenServer.cast(server, {:unwatch, id})
+    notify(server, :unwatch, id)
+  end
+
+  # Says whether the Sentinel itself is calling: its revive goes through
+  # `Manager.start/1`, which stops the stale broker and watches the new one,
+  # and neither is the user's stop or start that calls a revive off.
+  defp notify(server, op, id) do
+    with pid when is_pid(pid) <- Process.whereis(server) do
+      GenServer.cast(pid, {op, id, if(pid == self(), do: :own, else: :other)})
+    end
+
     :ok
   end
 
@@ -84,6 +95,8 @@ defmodule Vagus.Addon.Backend.Native.Sentinel do
       by_id: %{},
       # id => %{failures:, revive?:} for a demotion being repeated.
       pending: %{},
+      # id => the ref of the one revive owed; a `:revive` with another is stale.
+      revives: %{},
       state_mod: Keyword.get(opts, :state_mod, State),
       recheck_ms: Keyword.get(opts, :recheck_ms, @recheck_ms),
       revive_fun: Keyword.get(opts, :revive_fun, &Vagus.Addon.Manager.start/1),
@@ -110,10 +123,11 @@ defmodule Vagus.Addon.Backend.Native.Sentinel do
   end
 
   @impl GenServer
-  def handle_cast({:watch, id}, state), do: {:noreply, monitor(id, forget(state, id))}
+  def handle_cast({:watch, id, origin}, state),
+    do: {:noreply, monitor(id, call_off(state, id, origin))}
 
-  # Forgotten too: a revive decided before a manual stop must not follow it.
-  def handle_cast({:unwatch, id}, state), do: {:noreply, demonitor(id, forget(state, id))}
+  def handle_cast({:unwatch, id, origin}, state),
+    do: {:noreply, demonitor(id, call_off(state, id, origin))}
 
   @impl GenServer
   def handle_info({:DOWN, ref, :process, _pid, _reason}, state) do
@@ -135,7 +149,13 @@ defmodule Vagus.Addon.Backend.Native.Sentinel do
     end
   end
 
-  def handle_info({:revive, id}, state) do
+  def handle_info({:revive, id, ref}, state) do
+    if Map.get(state.revives, id) == ref,
+      do: {:noreply, revive(id, ref, state)},
+      else: {:noreply, state}
+  end
+
+  defp revive(id, ref, state) do
     slug = Native.slug_from_id(id)
 
     case guarded(fn -> state.state_mod.get(slug) end) do
@@ -148,6 +168,7 @@ defmodule Vagus.Addon.Backend.Native.Sentinel do
         case state.revive_fun.(config) do
           {:ok, _} ->
             Logger.info("Vagus.Addon.Backend.Native.Sentinel: revived #{slug}")
+            %{state | revives: Map.delete(state.revives, id)}
 
           {:error, reason} ->
             Logger.warning(
@@ -155,19 +176,19 @@ defmodule Vagus.Addon.Backend.Native.Sentinel do
                 "(#{inspect(reason)}); retrying in #{state.revive_retry_ms}ms"
             )
 
-            Process.send_after(self(), {:revive, id}, state.revive_retry_ms)
+            Process.send_after(self(), {:revive, id, ref}, state.revive_retry_ms)
+            state
         end
 
       # `State` is mid-restart: the revive is still owed.
       :failed ->
-        Process.send_after(self(), {:revive, id}, state.revive_retry_ms)
+        Process.send_after(self(), {:revive, id, ref}, state.revive_retry_ms)
+        state
 
       # Uninstalled, or someone started it manually in the meantime — drop.
       _ ->
-        :ok
+        %{state | revives: Map.delete(state.revives, id)}
     end
-
-    {:noreply, state}
   end
 
   defp monitor(id, state) do
@@ -202,6 +223,20 @@ defmodule Vagus.Addon.Backend.Native.Sentinel do
 
   defp forget(state, id), do: %{state | pending: Map.delete(state.pending, id)}
 
+  # A stop or a start by anyone else wins over a revive that is owed or being
+  # decided: the entry a stopped add-on leaves reads exactly like the one the
+  # demotion left, so the revive cannot tell them apart by reading `State`.
+  defp call_off(state, id, :other),
+    do: forget(%{state | revives: Map.delete(state.revives, id)}, id)
+
+  defp call_off(state, _id, :own), do: state
+
+  defp schedule_revive(id, state) do
+    ref = make_ref()
+    Process.send_after(self(), {:revive, id, ref}, state.revive_delay_ms)
+    %{state | revives: Map.put(state.revives, id, ref)}
+  end
+
   defp demote(id, state) do
     slug = Native.slug_from_id(id)
 
@@ -211,8 +246,8 @@ defmodule Vagus.Addon.Backend.Native.Sentinel do
           "Vagus.Addon.Backend.Native.Sentinel: broker #{slug} is gone; demoted to :stopped"
         )
 
-        if revive?, do: Process.send_after(self(), {:revive, id}, state.revive_delay_ms)
-        forget(state, id)
+        state = forget(state, id)
+        if revive?, do: schedule_revive(id, state), else: state
 
       # `Native.start/1` casts a watch for every broker it brings up; this
       # does not depend on that cast being behind this message. A broker

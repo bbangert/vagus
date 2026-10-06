@@ -175,23 +175,32 @@ defmodule Vagus.Addon.Manager do
   every other lifecycle call for the slug would wait behind it.
 
   A token still registered for the slug is removed before the record: an
-  entry that vanished without an uninstall must not hand its registration to
-  the next install.
+  entry that vanished without an uninstall must not hand its registration,
+  and the grants it carries, to the next install. With no `Registry` to
+  confirm that for the deregister budget, nothing is recorded and
+  `{:error, {:registry_unavailable, tag}}` returned; the image stays pulled.
 
   Exits if `Vagus.Addon.State` is not there to ask or to record in.
   """
   @spec install_new(Config.t(), keyword()) ::
-          :ok | {:error, {:already_installed, Config.t()}} | {:error, term()}
+          :ok
+          | {:error, {:already_installed, Config.t()}}
+          | {:error, {:registry_unavailable, AbsentRetry.tag()}}
+          | {:error, term()}
   def install_new(%Config{slug: slug} = config, opts \\ []) do
     with :ok <- not_installed(slug),
          :ok <- install(config, opts) do
       with_slug_lock(slug, fn ->
-        with :ok <- not_installed(slug) do
-          revoke_token(slug, Keyword.put(opts, :deregister_retry, register_retry(opts)))
+        with :ok <- not_installed(slug),
+             :ok <- revoke_leftover_token(slug, opts) do
           Vagus.Addon.State.put(config, :stopped)
         end
       end)
     end
+  end
+
+  defp revoke_leftover_token(slug, opts) do
+    with {:error, tag} <- revoke_token(slug, opts), do: {:error, {:registry_unavailable, tag}}
   end
 
   defp not_installed(slug) do
@@ -500,7 +509,7 @@ defmodule Vagus.Addon.Manager do
         opts = put_backend(opts, config)
         # First, and its only revocation: the stop and the image delete can
         # each take seconds, and the add-on is not owed the API for them.
-        revoke_token(config.slug, opts)
+        _ = revoke_token(config.slug, opts)
         record_state(config, :stopped)
         stop_and_remove_container(config, opts)
         remove_image_best_effort(config, opts)
@@ -1111,6 +1120,8 @@ defmodule Vagus.Addon.Manager do
           "Vagus.Addon.Manager: #{server} unregister for #{slug} failed (#{tag}); " <>
             "its registration may stay until a reboot or the add-on's next start, if any"
         )
+
+        {:error, tag}
     end
   end
 

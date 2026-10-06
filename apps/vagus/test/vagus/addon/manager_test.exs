@@ -2457,13 +2457,63 @@ defmodule Vagus.Addon.ManagerTest do
       slug: slug,
       opts: opts
     } do
-      identity = Vagus.Addon.Registry.identity_from_config(c)
-      :ok = Vagus.Addon.Registry.register("left-#{slug}", identity)
-      assert {:ok, %{slug: ^slug}} = Vagus.Addon.Registry.identity_for_token("left-#{slug}")
+      token = register_leftover_token(c)
+      assert {:ok, %{slug: ^slug}} = Vagus.Addon.Registry.identity_for_token(token)
 
       assert :ok = Manager.install_new(c, script(opts))
 
-      assert :error = Vagus.Addon.Registry.identity_for_token("left-#{slug}")
+      assert :error = Vagus.Addon.Registry.identity_for_token(token)
+    end
+
+    defp register_leftover_token(config) do
+      token = "left-#{config.slug}"
+
+      :ok =
+        Vagus.Addon.Registry.register(token, Vagus.Addon.Registry.identity_from_config(config))
+
+      token
+    end
+
+    # Recorded all the same, the token would authenticate as the new
+    # installation once the Registry is back.
+    test "install_new/2 records nothing when the Registry cannot confirm a leftover token gone",
+         %{config: c, slug: slug, opts: opts} do
+      token = register_leftover_token(c)
+      take_registry_down()
+
+      {result, log} =
+        with_log(fn ->
+          Manager.install_new(c, [deregister_retry: @tiny_retry] ++ script(opts))
+        end)
+
+      assert {:error, {:registry_unavailable, :noproc}} = result
+      assert :error = State.get(slug)
+      assert log =~ "Registry unregister for #{slug} failed (noproc)"
+
+      bring_registry_up()
+      assert {:ok, %{slug: ^slug}} = Vagus.Addon.Registry.identity_for_token(token)
+    end
+
+    test "install_new/2 waits out a Registry that is briefly absent", %{
+      config: c,
+      slug: slug,
+      opts: opts
+    } do
+      token = register_leftover_token(c)
+      take_registry_down()
+      stub = stub_server(Vagus.Addon.Registry, fn _request -> exit(:shutdown) end)
+      opts = [deregister_retry: @slack_retry] ++ script(opts)
+
+      install = Task.async(fn -> Manager.install_new(c, opts) end)
+
+      assert_receive {:stub_call, Vagus.Addon.Registry, {:unregister_slug, ^slug}}, 5_000
+      await_down(stub)
+      # Comes back holding the token: its checkpoint predates the unregister.
+      bring_registry_up()
+
+      assert :ok = Task.await(install, 60_000)
+      assert :error = Vagus.Addon.Registry.identity_for_token(token)
+      assert {:ok, %{state: :stopped}} = State.get(slug)
     end
 
     test "install_new/2 refuses an installed slug, pulling nothing and recording nothing", %{

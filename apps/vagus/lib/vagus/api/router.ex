@@ -2689,6 +2689,14 @@ defmodule Vagus.API.Router do
       {:error, {:already_installed, installed}} ->
         send_already_installed(conn, installed)
 
+      # Nothing was recorded, and the same request succeeds once it is back.
+      {:error, {:registry_unavailable, _tag}} ->
+        Envelope.send_error(
+          conn,
+          "Addon #{config.name} could not be installed: the add-on registry is unavailable, try again",
+          503
+        )
+
       {:error, reason} ->
         Envelope.send_error(conn, inspect(reason), 400)
     end
