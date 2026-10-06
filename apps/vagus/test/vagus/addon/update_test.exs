@@ -207,6 +207,65 @@ defmodule Vagus.Addon.UpdateTest do
     end
   end
 
+  describe "the token and the DNS record across an update" do
+    # Native, so its DNS record needs no Docker inspect. The default-named
+    # DNS checkpoints, so an earlier test's file goes first.
+    setup ctx do
+      native = %{ctx.installed | backend: :native}
+      entry = %{config: %{native | version: "2.0.0", slug: "updatable"}, repository: "core"}
+      catalog = Map.put(Store.catalog(), @slug, Map.put(entry, :assets, %{}))
+      :ok = GenServer.call(Store, {:put_catalog, catalog})
+
+      prev = Application.get_env(:vagus, :dns_enabled)
+      Application.put_env(:vagus, :dns_enabled, true)
+      File.rm(Vagus.RunState.path(:dns))
+
+      on_exit(fn ->
+        Application.put_env(:vagus, :dns_enabled, prev)
+        File.rm(Vagus.RunState.path(:dns))
+        Vagus.Addon.Registry.unregister_slug(@slug)
+      end)
+
+      {:ok, sock} = :gen_udp.open(0, ip: {127, 0, 0, 1})
+      {:ok, port} = :inet.port(sock)
+      :gen_udp.close(sock)
+
+      start_supervised!(
+        {Vagus.DNS, name: Vagus.DNS, ip: {127, 0, 0, 1}, port: port, upstream: nil}
+      )
+
+      assert {:ok, %{access_token: token}} = Manager.start(native, ctx.opts)
+      assert {:ok, %{slug: @slug}} = Vagus.Addon.Registry.identity_for_token(token)
+      assert {:ok, _ip} = Vagus.DNS.resolve("core-updatable", Vagus.DNS)
+
+      %{token: token}
+    end
+
+    test "a running add-on ends with a new token and a DNS record", ctx do
+      # The start registers the same address again, so the record it replaces
+      # is given another.
+      :ok = Vagus.DNS.register("core-updatable", {172, 30, 33, 9}, Vagus.DNS)
+
+      assert {:ok, %{to: "2.0.0"}} = Update.update(@slug, ctx.opts)
+
+      assert :error = Vagus.Addon.Registry.identity_for_token(ctx.token)
+      %{token_by_slug: %{@slug => new_token}} = :sys.get_state(Vagus.Addon.Registry)
+      assert {:ok, %{slug: @slug}} = Vagus.Addon.Registry.identity_for_token(new_token)
+      assert {:ok, {172, 30, 32, 2}} = Vagus.DNS.resolve("core-updatable", Vagus.DNS)
+    end
+
+    test "a stopped add-on keeps its token and gets no DNS record", ctx do
+      assert :ok = Manager.stop(@slug, ctx.opts)
+      assert :error = Vagus.DNS.resolve("core-updatable", Vagus.DNS)
+
+      assert {:ok, %{to: "2.0.0"}} = Update.update(@slug, ctx.opts)
+
+      assert installed_entry().state == :stopped
+      assert {:ok, %{slug: @slug}} = Vagus.Addon.Registry.identity_for_token(ctx.token)
+      assert :error = Vagus.DNS.resolve("core-updatable", Vagus.DNS)
+    end
+  end
+
   describe "refusals that touch nothing" do
     @tag store_version: "1.0.0"
     test "equal versions", ctx do

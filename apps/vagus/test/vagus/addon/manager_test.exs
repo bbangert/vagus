@@ -784,9 +784,11 @@ defmodule Vagus.Addon.ManagerTest do
       assert {:error, :not_found} = Manager.stop("no-such-#{System.unique_integer([:positive])}")
     end
 
-    test "stop: backend stop+remove called, State -> :stopped, registry/DNS deregistered",
+    test "stop: backend stop+remove called, State -> :stopped, token kept",
          %{config: config, data_root: dr} do
-      assert {:ok, _} = Manager.start(config, backend: __MODULE__.FakeBackend, data_root: dr)
+      assert {:ok, %{access_token: token}} =
+               Manager.start(config, backend: __MODULE__.FakeBackend, data_root: dr)
+
       assert {:ok, %{state: :started}} = Vagus.Addon.State.get("life_addon")
 
       assert :ok = Manager.stop("life_addon", backend: __MODULE__.FakeBackend)
@@ -794,7 +796,8 @@ defmodule Vagus.Addon.ManagerTest do
       assert_received {:remove, "addon_life_addon"}
 
       assert {:ok, %{state: :stopped}} = Vagus.Addon.State.get("life_addon")
-      assert :error = Vagus.Addon.Registry.identity_for_token("does-not-matter")
+
+      assert {:ok, %{slug: "life_addon"}} = Vagus.Addon.Registry.identity_for_token(token)
     end
 
     test "start_slug on an unknown slug is :not_found" do
@@ -806,10 +809,13 @@ defmodule Vagus.Addon.ManagerTest do
       assert {:ok, %{access_token: token1}} =
                Manager.start(config, backend: __MODULE__.FakeBackend, data_root: dr)
 
+      assert {:ok, %{slug: "life_addon"}} = Vagus.Addon.Registry.identity_for_token(token1)
+
       assert {:ok, %{access_token: token2}} =
                Manager.restart("life_addon", backend: __MODULE__.FakeBackend, data_root: dr)
 
-      assert token1 != token2
+      assert :error = Vagus.Addon.Registry.identity_for_token(token1)
+      assert {:ok, %{slug: "life_addon"}} = Vagus.Addon.Registry.identity_for_token(token2)
       assert_received {:stop, "addon_life_addon"}
       assert_received {:remove, "addon_life_addon"}
       assert_received {:create, _spec}
@@ -1112,12 +1118,13 @@ defmodule Vagus.Addon.ManagerTest do
   end
 
   describe "registration with the application's Registry and a default-named DNS" do
-    # Wide enough that bringing the server back always lands inside it; a
-    # start that finds its server returns at once.
-    @slack_retry {2_000, 5}
+    # Wide enough that bringing the server back always lands inside it, in
+    # steps short enough that the wait ends as soon as it is back.
+    @slack_retry {20_000, 1}
     @tiny_retry {2, 1}
     # Outlasts any hold a test keeps on a stubbed call.
     @held_call_timeout 60_000
+    @dead_ip {172, 30, 33, 9}
 
     setup do
       :persistent_term.put({__MODULE__.OrderingBackend, :pid}, self())
@@ -1193,11 +1200,14 @@ defmodule Vagus.Addon.ManagerTest do
 
     # Holds `name` like a server that goes down with `reason` on every call
     # and is restarted. The successor has the name before the caller sees the
-    # exit, so each of the caller's attempts reaches a stub. Cleaned up by
-    # `bring_registry_up/0`, so only for the Registry's name.
+    # exit, so each of the caller's attempts reaches a stub.
     defp dying_server(name, reason) do
       test = self()
       Process.register(spawn(fn -> dying_loop(test, name, reason) end), name)
+
+      on_exit(fn ->
+        with pid when is_pid(pid) <- Process.whereis(name), do: kill(pid)
+      end)
     end
 
     defp dying_loop(test, name, reason) do
@@ -1281,6 +1291,16 @@ defmodule Vagus.Addon.ManagerTest do
       )
     end
 
+    defp with_dns do
+      enable_dns()
+      start_dns()
+    end
+
+    # The record of a container that died without a stop.
+    defp register_dead_record(host) do
+      :ok = Vagus.DNS.register(host, @dead_ip, Vagus.DNS)
+    end
+
     # The Watchdog only restarts an add-on whose `watchdog` setting is on.
     defp watch(config) do
       :ok = State.put(config, :stopped)
@@ -1325,12 +1345,7 @@ defmodule Vagus.Addon.ManagerTest do
       opts: opts
     } do
       take_registry_down()
-
-      stub =
-        stub_server(Vagus.Addon.Registry, fn
-          {:unregister_slug, _slug} -> {:reply, :ok}
-          _request -> exit(:shutdown)
-        end)
+      stub = stub_server(Vagus.Addon.Registry, fn _request -> exit(:shutdown) end)
 
       start = Task.async(fn -> Manager.start(c, [register_retry: @slack_retry] ++ opts) end)
 
@@ -1348,9 +1363,7 @@ defmodule Vagus.Addon.ManagerTest do
       take_registry_down()
 
       {result, log} =
-        with_log(fn ->
-          Manager.start(c, [register_retry: @tiny_retry, deregister_retry: @tiny_retry] ++ opts)
-        end)
+        with_log(fn -> Manager.start(c, [register_retry: @tiny_retry] ++ opts) end)
 
       assert {:error, {:registration_failed, :registry}} = result
 
@@ -1360,9 +1373,7 @@ defmodule Vagus.Addon.ManagerTest do
 
       # The exit reason of a failed call carries the call's arguments.
       assert log =~ "Registry register for #{slug} failed: noproc"
-      # Once for the previous start's token, once on giving up.
-      unregister_failures = ~r/Registry unregister for #{slug} failed \(noproc\)/
-      assert length(Regex.scan(unregister_failures, log)) == 2
+      refute log =~ "Registry unregister for #{slug}"
       refute log =~ spec.env["SUPERVISOR_TOKEN"]
     end
 
@@ -1385,7 +1396,10 @@ defmodule Vagus.Addon.ManagerTest do
       {spec, after_create} = split_at_create(drain())
       assert [{:stop_saw_state, {:ok, %{state: :stopped}}}, {:remove, ^id}] = after_create
       assert {:ok, %{state: :started}} = State.get(slug)
-      assert :error = Vagus.Addon.Registry.identity_for_token(spec.env["SUPERVISOR_TOKEN"])
+
+      # Registered before DNS failed, and a start's token lasts until the next.
+      assert {:ok, %{slug: ^slug}} =
+               Vagus.Addon.Registry.identity_for_token(spec.env["SUPERVISOR_TOKEN"])
     end
 
     test "the Watchdog's next attempt follows a failed registration, and succeeds", %{
@@ -1447,28 +1461,25 @@ defmodule Vagus.Addon.ManagerTest do
       assert {:error, {:registration_failed, :registry}} = result
       assert log =~ "failed: server_down"
 
-      assert stub_calls(Vagus.Addon.Registry) ==
-               [:unregister_slug, :unregister_slug, :register, :register] ++
-                 [:unregister_slug, :unregister_slug]
+      assert stub_calls(Vagus.Addon.Registry) == [:register, :register]
     end
 
-    # All of it is spent under the slug lock, and the failed server has had
-    # the register budget already.
-    test "a start deregisters on the register budget, before it registers and when it gives up",
+    # All of it is spent under the slug lock.
+    test "a start drops DNS records on the register budget, before it registers and when it gives up",
          %{config: c, opts: opts} do
-      take_registry_down()
-      dying_server(Vagus.Addon.Registry, :shutdown)
+      enable_dns()
+      dying_server(Vagus.DNS, :shutdown)
 
       {result, _log} =
         with_log(fn ->
           Manager.start(c, [register_retry: {3, 1}, deregister_retry: {7, 1}] ++ opts)
         end)
 
-      assert {:error, {:registration_failed, :registry}} = result
+      assert {:error, {:registration_failed, :dns}} = result
 
-      assert stub_calls(Vagus.Addon.Registry) ==
-               List.duplicate(:unregister_slug, 3) ++
-                 List.duplicate(:register, 3) ++ List.duplicate(:unregister_slug, 3)
+      assert stub_calls(Vagus.DNS) ==
+               List.duplicate(:unregister, 3) ++
+                 List.duplicate(:register, 3) ++ List.duplicate(:unregister, 3)
     end
 
     test "an add-on whose registration is still in flight is :started, so its die is acted on", %{
@@ -1481,14 +1492,10 @@ defmodule Vagus.Addon.ManagerTest do
       take_registry_down()
 
       stub =
-        stub_server(Vagus.Addon.Registry, fn
-          {:unregister_slug, _slug} ->
-            {:reply, :ok}
-
-          {:register, _token, _identity} ->
-            receive do
-              :release -> {:reply, :ok}
-            end
+        stub_server(Vagus.Addon.Registry, fn {:register, _token, _identity} ->
+          receive do
+            :release -> {:reply, :ok}
+          end
         end)
 
       start =
@@ -1531,7 +1538,7 @@ defmodule Vagus.Addon.ManagerTest do
       assert {:ok, %{slug: ^slug}} = Vagus.Addon.Registry.identity_for_token(token)
     end
 
-    test "start/2 gives up on an absent DNS and revokes the token it had registered", %{
+    test "start/2 gives up on an absent DNS, and the token it had registered stays", %{
       config: c,
       slug: slug,
       id: id,
@@ -1577,7 +1584,7 @@ defmodule Vagus.Addon.ManagerTest do
       assert {:error, {:registration_failed, :dns}} = result
       assert [{:stop_saw_state, {:ok, %{state: :stopped}}}, {:remove, ^id}] = drain()
       assert {:ok, %{state: :stopped}} = State.get(slug)
-      assert :error = Vagus.Addon.Registry.identity_for_token(token)
+      assert {:ok, %{slug: ^slug}} = Vagus.Addon.Registry.identity_for_token(token)
       assert log =~ "DNS register for #{slug} failed: noproc"
       refute log =~ token
     end
@@ -1595,49 +1602,201 @@ defmodule Vagus.Addon.ManagerTest do
       assert {:error, {:registration_failed, :registry}} = result
 
       sync(stub)
-      assert stub_calls(Vagus.Addon.Registry) == [:unregister_slug, :register, :unregister_slug]
+      assert stub_calls(Vagus.Addon.Registry) == [:register]
     end
 
-    test "stop/2 waits out a Registry that is briefly absent, and the token stays revoked", %{
+    test "a second start replaces the token", %{config: c, slug: slug, opts: opts} do
+      assert {:ok, %{access_token: first}} = Manager.start(c, opts)
+      assert {:ok, %{slug: ^slug}} = Vagus.Addon.Registry.identity_for_token(first)
+      assert {:ok, %{access_token: second}} = Manager.start(c, opts)
+
+      assert :error = Vagus.Addon.Registry.identity_for_token(first)
+      assert {:ok, %{slug: ^slug}} = Vagus.Addon.Registry.identity_for_token(second)
+    end
+
+    test "stop/2 drops the DNS record and keeps the token", %{
+      config: c,
+      slug: slug,
+      host: host,
+      opts: opts
+    } do
+      with_dns()
+      assert {:ok, %{access_token: token}} = Manager.start(c, opts)
+      assert {:ok, _ip} = Vagus.DNS.resolve(host, Vagus.DNS)
+
+      assert :ok = Manager.stop(slug, opts)
+
+      assert {:ok, %{state: :stopped}} = State.get(slug)
+      assert :error = Vagus.DNS.resolve(host, Vagus.DNS)
+      assert {:ok, %{slug: ^slug}} = Vagus.Addon.Registry.identity_for_token(token)
+    end
+
+    test "restart/2 replaces the token and the DNS record", %{
+      config: c,
+      slug: slug,
+      host: host,
+      opts: opts
+    } do
+      with_dns()
+      assert {:ok, %{access_token: first}} = Manager.start(c, opts)
+      assert {:ok, %{slug: ^slug}} = Vagus.Addon.Registry.identity_for_token(first)
+      # The start registers the same address again, so the record it replaces
+      # is given another.
+      register_dead_record(host)
+
+      assert {:ok, %{access_token: second}} = Manager.restart(slug, opts)
+
+      assert :error = Vagus.Addon.Registry.identity_for_token(first)
+      assert {:ok, %{slug: ^slug}} = Vagus.Addon.Registry.identity_for_token(second)
+      assert {:ok, {172, 30, 32, 2}} = Vagus.DNS.resolve(host, Vagus.DNS)
+    end
+
+    test "with DNS disabled, no lifecycle call reaches the DNS server", %{
       config: c,
       slug: slug,
       opts: opts
     } do
+      prev = Application.get_env(:vagus, :dns_enabled)
+      Application.put_env(:vagus, :dns_enabled, false)
+      on_exit(fn -> Application.put_env(:vagus, :dns_enabled, prev) end)
+      stub = stub_server(Vagus.DNS, fn _request -> {:reply, :ok} end)
+      opts = script(opts, state: {:ok, :stopped})
+
+      assert {:ok, _started} = Manager.start(c, opts)
+      assert :ok = Manager.stop(slug, opts)
+      assert {:ok, _started} = Manager.start(c, opts)
+      assert :ok = Manager.demote(slug, opts)
+      assert :ok = Manager.uninstall(slug, opts)
+
+      sync(stub)
+      assert stub_calls(Vagus.DNS) == []
+    end
+
+    test "the start after a stop replaces the token the stop left", %{
+      config: c,
+      slug: slug,
+      opts: opts
+    } do
+      assert {:ok, %{access_token: first}} = Manager.start(c, opts)
+      assert :ok = Manager.stop(slug, opts)
+      assert {:ok, %{slug: ^slug}} = Vagus.Addon.Registry.identity_for_token(first)
+
+      assert {:ok, %{access_token: second}} = Manager.start_slug(slug, opts)
+
+      assert :error = Vagus.Addon.Registry.identity_for_token(first)
+      assert {:ok, %{slug: ^slug}} = Vagus.Addon.Registry.identity_for_token(second)
+    end
+
+    test "stop/2 makes no call to the Registry", %{config: c, slug: slug, opts: opts} do
       assert {:ok, %{access_token: token}} = Manager.start(c, opts)
-      assert {:ok, %{slug: ^slug}} = Vagus.Addon.Registry.identity_for_token(token)
 
       take_registry_down()
-      stub = stub_server(Vagus.Addon.Registry, fn _request -> exit(:shutdown) end)
+      stub = stub_server(Vagus.Addon.Registry, fn _request -> {:reply, :ok} end)
+      _start_calls = drain()
+
+      assert :ok = Manager.stop(slug, opts)
+
+      sync(stub)
+      assert stub_calls(Vagus.Addon.Registry) == []
+
+      bring_registry_up()
+      assert {:ok, %{slug: ^slug}} = Vagus.Addon.Registry.identity_for_token(token)
+    end
+
+    test "stop/2 waits out a DNS that is briefly absent, and the record stays gone", %{
+      config: c,
+      slug: slug,
+      host: host,
+      opts: opts
+    } do
+      with_dns()
+      assert {:ok, _started} = Manager.start(c, opts)
+      assert {:ok, _ip} = Vagus.DNS.resolve(host, Vagus.DNS)
+      # What the restarted DNS comes back holding the record from.
+      assert File.exists?(Vagus.RunState.path(:dns))
+
+      :ok = stop_supervised(Vagus.DNS)
+      stub = stub_server(Vagus.DNS, fn _request -> exit(:shutdown) end)
 
       stop = Task.async(fn -> Manager.stop(slug, [deregister_retry: @slack_retry] ++ opts) end)
 
-      assert_receive {:stub_call, Vagus.Addon.Registry, {:unregister_slug, ^slug}}, 5_000
+      assert_receive {:stub_call, Vagus.DNS, {:unregister, ^host}}, 5_000
       await_down(stub)
-      # Comes back holding the token: its checkpoint predates the unregister.
-      bring_registry_up()
+      # Comes back holding the record: its checkpoint predates the unregister.
+      start_dns()
 
       assert :ok = Task.await(stop, 60_000)
-      assert :error = Vagus.Addon.Registry.identity_for_token(token)
+      assert :error = Vagus.DNS.resolve(host, Vagus.DNS)
 
-      cycle_registry()
-      assert :error = Vagus.Addon.Registry.identity_for_token(token)
+      :ok = stop_supervised(Vagus.DNS)
+      start_dns()
+      assert :error = Vagus.DNS.resolve(host, Vagus.DNS)
     end
 
-    test "stop/2 still succeeds when the Registry stays absent, and logs the token left valid",
-         %{config: c, slug: slug, opts: opts} do
-      assert {:ok, %{access_token: token}} = Manager.start(c, opts)
-      take_registry_down()
+    test "stop/2 still succeeds when DNS stays absent, and logs the record left", %{
+      config: c,
+      slug: slug,
+      opts: opts
+    } do
+      assert {:ok, _started} = Manager.start(c, opts)
+      # Enabled with no server.
+      enable_dns()
 
       {result, log} =
         with_log(fn -> Manager.stop(slug, [deregister_retry: @tiny_retry] ++ opts) end)
 
       assert result == :ok
       assert {:ok, %{state: :stopped}} = State.get(slug)
-      assert log =~ "[error] Vagus.Addon.Manager: Registry unregister for #{slug} failed (noproc)"
-      refute log =~ token
+      assert log =~ "[error] Vagus.Addon.Manager: DNS unregister for #{slug} failed (noproc)"
     end
 
-    test "uninstall/2 waits out a Registry that is briefly absent, and the token is revoked", %{
+    test "stop/2 drops the DNS record on its caller's deregister budget", %{
+      config: c,
+      slug: slug,
+      opts: opts
+    } do
+      assert {:ok, _started} = Manager.start(c, opts)
+      enable_dns()
+      dying_server(Vagus.DNS, :shutdown)
+      _start_calls = drain()
+
+      {result, _log} =
+        with_log(fn ->
+          Manager.stop(slug, [register_retry: {5, 1}, deregister_retry: {3, 1}] ++ opts)
+        end)
+
+      assert result == :ok
+      assert stub_calls(Vagus.DNS) == List.duplicate(:unregister, 3)
+    end
+
+    test "uninstall/2 removes the token, the DNS record and the State entry", %{
+      config: c,
+      slug: slug,
+      host: host,
+      opts: opts
+    } do
+      with_dns()
+      assert {:ok, %{access_token: token}} = Manager.start(c, opts)
+      assert {:ok, _ip} = Vagus.DNS.resolve(host, Vagus.DNS)
+
+      assert :ok = Manager.uninstall(slug, opts)
+
+      assert :error = Vagus.Addon.Registry.identity_for_token(token)
+      assert :error = Vagus.DNS.resolve(host, Vagus.DNS)
+      assert :error = State.get(slug)
+    end
+
+    test "uninstall/2 removes the token a stop left", %{config: c, slug: slug, opts: opts} do
+      assert {:ok, %{access_token: token}} = Manager.start(c, opts)
+      assert :ok = Manager.stop(slug, opts)
+      assert {:ok, %{slug: ^slug}} = Vagus.Addon.Registry.identity_for_token(token)
+
+      assert :ok = Manager.uninstall(slug, opts)
+
+      assert :error = Vagus.Addon.Registry.identity_for_token(token)
+    end
+
+    test "uninstall/2 waits out a Registry that is briefly absent, and the token is removed", %{
       config: c,
       slug: slug,
       opts: opts
@@ -1657,6 +1816,23 @@ defmodule Vagus.Addon.ManagerTest do
       assert :ok = Task.await(uninstall, 60_000)
       assert :error = Vagus.Addon.Registry.identity_for_token(token)
       assert :error = State.get(slug)
+
+      cycle_registry()
+      assert :error = Vagus.Addon.Registry.identity_for_token(token)
+    end
+
+    test "uninstall/2 still succeeds when the Registry stays absent, and logs the token left valid",
+         %{config: c, slug: slug, opts: opts} do
+      assert {:ok, %{access_token: token}} = Manager.start(c, opts)
+      take_registry_down()
+
+      {result, log} =
+        with_log(fn -> Manager.uninstall(slug, [deregister_retry: @tiny_retry] ++ opts) end)
+
+      assert result == :ok
+      assert :error = State.get(slug)
+      assert log =~ "[error] Vagus.Addon.Manager: Registry unregister for #{slug} failed (noproc)"
+      refute log =~ token
     end
 
     test "uninstall/2 deregisters on its caller's retry budget", %{
@@ -1761,15 +1937,34 @@ defmodule Vagus.Addon.ManagerTest do
       assert log =~ "[error] Vagus.Addon.Manager: Services purge for #{slug} failed (noproc)"
     end
 
+    test "uninstall/2 has removed the token by the time it drops the DNS record", %{
+      config: c,
+      slug: slug,
+      host: host,
+      opts: opts
+    } do
+      test = self()
+      assert {:ok, %{access_token: token}} = Manager.start(c, opts)
+      enable_dns()
+
+      stub_server(Vagus.DNS, fn {:unregister, ^host} ->
+        send(test, {:token_at_unregister, Vagus.Addon.Registry.identity_for_token(token)})
+        {:reply, :ok}
+      end)
+
+      assert :ok = Manager.uninstall(slug, opts)
+
+      assert_received {:token_at_unregister, :error}
+    end
+
     # Each purge can take its whole budget; a token valid for that long
-    # belongs to an add-on that is already stopped.
-    test "uninstall/2 has revoked the token by the time it purges Discovery", %{
+    # belongs to an add-on that is already gone.
+    test "uninstall/2 has removed the token by the time it purges Discovery", %{
       config: c,
       slug: slug,
       opts: opts
     } do
       assert {:ok, %{access_token: token}} = Manager.start(c, opts)
-      on_exit(fn -> bring_up(Vagus.Discovery) end)
       take_down(Vagus.Discovery)
 
       stub =
@@ -1789,6 +1984,51 @@ defmodule Vagus.Addon.ManagerTest do
 
       send(stub, :release)
       assert :ok = Task.await(uninstall, @held_call_timeout)
+    end
+
+    # Each step reports what was still there when it ran.
+    test "uninstall/2 removes the token, stops the container, then drops DNS, Discovery, Services and State, in that order",
+         %{config: c, slug: slug, opts: opts} do
+      assert {:ok, %{access_token: token}} = Manager.start(c, opts)
+      assert {:ok, %{slug: ^slug}} = Vagus.Addon.Registry.identity_for_token(token)
+      steps = start_supervised!({Agent, fn -> [] end})
+
+      saw = fn step ->
+        token? = match?({:ok, _identity}, Vagus.Addon.Registry.identity_for_token(token))
+        entry? = match?({:ok, _entry}, State.get(slug))
+        Agent.update(steps, &[{step, token: token?, entry: entry?} | &1])
+      end
+
+      enable_dns()
+      take_down(Vagus.Discovery)
+      take_down(Vagus.Services)
+
+      for {server, step, reply} <- [
+            {Vagus.DNS, :dns, :ok},
+            {Vagus.Discovery, :discovery, {:ok, []}},
+            {Vagus.Services, :services, :ok}
+          ] do
+        stub_server(server, fn _request ->
+          saw.(step)
+          {:reply, reply}
+        end)
+      end
+
+      stop = fn ->
+        saw.(:container_stop)
+        :ok
+      end
+
+      assert :ok = Manager.uninstall(slug, script(opts, stop: stop))
+
+      assert Enum.reverse(Agent.get(steps, & &1)) == [
+               container_stop: [token: false, entry: true],
+               dns: [token: false, entry: true],
+               discovery: [token: false, entry: true],
+               services: [token: false, entry: true]
+             ]
+
+      assert :error = State.get(slug)
     end
 
     test "uninstall/2 gives a Discovery or Services that holds the call one call timeout each",
@@ -1837,14 +2077,6 @@ defmodule Vagus.Addon.ManagerTest do
       Keyword.put(opts, :backend, __MODULE__.ScriptedBackend)
     end
 
-    # A token whose container died without a stop.
-    defp register_dead_token(config) do
-      token = "dead-#{config.slug}"
-      identity = Vagus.Addon.Registry.identity_from_config(config)
-      :ok = Vagus.Addon.Registry.register(token, identity)
-      token
-    end
-
     # Spins until `task` is inside `:global.trans` (queued for the lock, or
     # holding it), has returned, or has reached a gated backend call. Each is a
     # state it stays in until the test moves it on, so the answer does not
@@ -1891,113 +2123,104 @@ defmodule Vagus.Addon.ManagerTest do
       config
     end
 
-    test "demote/2 records a dead add-on :stopped and drops its token and DNS record", %{
+    test "demote/2 records a dead add-on :stopped and drops its DNS record, keeping its token", %{
       config: c,
       slug: slug,
       host: host,
       opts: opts
     } do
-      enable_dns()
-      start_dns()
+      with_dns()
       opts = script(opts, state: {:ok, :stopped})
       assert {:ok, %{access_token: token}} = Manager.start(c, opts)
-      assert {:ok, %{slug: ^slug}} = Vagus.Addon.Registry.identity_for_token(token)
       assert {:ok, _ip} = Vagus.DNS.resolve(host, Vagus.DNS)
 
       assert :ok = Manager.demote(slug, opts)
 
       assert {:ok, %{state: :stopped}} = State.get(slug)
-      assert :error = Vagus.Addon.Registry.identity_for_token(token)
       assert :error = Vagus.DNS.resolve(host, Vagus.DNS)
+      assert {:ok, %{slug: ^slug}} = Vagus.Addon.Registry.identity_for_token(token)
     end
 
     # The demoter's verdict can predate a start that has since completed.
-    test "demote/2 leaves an add-on its backend reports running", %{
-      config: c,
-      slug: slug,
-      host: host,
-      opts: opts
-    } do
-      enable_dns()
-      start_dns()
-      opts = script(opts, state: {:ok, :running})
-      assert {:ok, %{access_token: token}} = Manager.start(c, opts)
+    for state <- [:running, :restarting] do
+      test "demote/2 leaves an add-on its backend reports #{state}", %{
+        config: c,
+        slug: slug,
+        host: host,
+        opts: opts
+      } do
+        with_dns()
+        opts = script(opts, state: {:ok, unquote(state)})
+        assert {:ok, _started} = Manager.start(c, opts)
 
-      assert {:error, :running} = Manager.demote(slug, opts)
+        assert {:error, :running} = Manager.demote(slug, opts)
 
-      assert {:ok, %{state: :started}} = State.get(slug)
-      assert {:ok, %{slug: ^slug}} = Vagus.Addon.Registry.identity_for_token(token)
-      assert {:ok, _ip} = Vagus.DNS.resolve(host, Vagus.DNS)
+        assert {:ok, %{state: :started}} = State.get(slug)
+        assert {:ok, _ip} = Vagus.DNS.resolve(host, Vagus.DNS)
+      end
     end
 
     test "demote/2 goes ahead when the backend cannot say whether the add-on runs", %{
       config: c,
       slug: slug,
+      host: host,
       opts: opts
     } do
+      with_dns()
       opts = script(opts, state: {:error, :engine_unreachable})
-      assert {:ok, %{access_token: token}} = Manager.start(c, opts)
+      assert {:ok, _started} = Manager.start(c, opts)
+      assert {:ok, _ip} = Vagus.DNS.resolve(host, Vagus.DNS)
 
       assert :ok = Manager.demote(slug, opts)
 
       assert {:ok, %{state: :stopped}} = State.get(slug)
-      assert :error = Vagus.Addon.Registry.identity_for_token(token)
+      assert :error = Vagus.DNS.resolve(host, Vagus.DNS)
     end
 
-    test "demote/2 leaves an add-on its backend reports restarting", %{
+    test "demote/2 drops the DNS record of an add-on already recorded :stopped", %{
       config: c,
       slug: slug,
+      host: host,
       opts: opts
     } do
-      opts = script(opts, state: {:ok, :restarting})
-      assert {:ok, %{access_token: token}} = Manager.start(c, opts)
-
-      assert {:error, :running} = Manager.demote(slug, opts)
-
-      assert {:ok, %{state: :started}} = State.get(slug)
-      assert {:ok, %{slug: ^slug}} = Vagus.Addon.Registry.identity_for_token(token)
-    end
-
-    test "demote/2 revokes the token of an add-on already recorded :stopped", %{
-      config: c,
-      slug: slug,
-      opts: opts
-    } do
+      with_dns()
       :ok = State.put(c, :stopped)
-      token = register_dead_token(c)
-      assert {:ok, %{slug: ^slug}} = Vagus.Addon.Registry.identity_for_token(token)
+      register_dead_record(host)
 
       assert :ok = Manager.demote(slug, script(opts, state: {:ok, :stopped}))
 
-      assert :error = Vagus.Addon.Registry.identity_for_token(token)
+      assert :error = Vagus.DNS.resolve(host, Vagus.DNS)
     end
 
-    test "demote/2 revokes nothing for a slug with no State entry", %{
-      config: c,
+    test "demote/2 drops nothing for a slug with no State entry", %{
       slug: slug,
+      host: host,
       opts: opts
     } do
-      token = register_dead_token(c)
+      with_dns()
+      register_dead_record(host)
 
       assert :ok = Manager.demote(slug, script(opts, state: {:ok, :stopped}))
 
       assert :error = State.get(slug)
-      assert {:ok, %{slug: ^slug}} = Vagus.Addon.Registry.identity_for_token(token)
+      assert {:ok, @dead_ip} = Vagus.DNS.resolve(host, Vagus.DNS)
     end
 
-    test "demote/2 revokes nothing when State stays absent, and says so", %{
+    test "demote/2 drops nothing when State stays absent, and says so", %{
       config: c,
       slug: slug,
+      host: host,
       opts: opts
     } do
+      with_dns()
       opts = script(opts, state: {:ok, :stopped})
-      assert {:ok, %{access_token: token}} = Manager.start(c, opts)
+      assert {:ok, _started} = Manager.start(c, opts)
       take_down(Vagus.Addon.State)
 
       assert {:error, :state_unavailable} =
-               Manager.demote(slug, [register_retry: @tiny_retry] ++ opts)
+               Manager.demote(slug, [deregister_retry: @tiny_retry] ++ opts)
 
-      assert {:ok, %{slug: ^slug}} = Vagus.Addon.Registry.identity_for_token(token)
+      assert {:ok, _ip} = Vagus.DNS.resolve(host, Vagus.DNS)
     end
 
     # The app's State keeps nothing across a restart in this environment, so
@@ -2005,6 +2228,7 @@ defmodule Vagus.Addon.ManagerTest do
     test "demote/2 waits out a State that is briefly absent", %{
       config: c,
       slug: slug,
+      host: host,
       opts: opts
     } do
       path = Path.join(System.tmp_dir!(), "vagus-state-#{slug}.json")
@@ -2018,13 +2242,16 @@ defmodule Vagus.Addon.ManagerTest do
       end)
 
       cycle(Vagus.Addon.State)
+      with_dns()
       opts = script(opts, state: {:ok, :stopped})
-      assert {:ok, %{access_token: token}} = Manager.start(c, opts)
+      assert {:ok, _started} = Manager.start(c, opts)
+      assert {:ok, _ip} = Vagus.DNS.resolve(host, Vagus.DNS)
 
       take_down(Vagus.Addon.State)
       stub = stub_server(Vagus.Addon.State, fn _request -> exit(:shutdown) end)
 
-      demote = Task.async(fn -> Manager.demote(slug, [register_retry: @slack_retry] ++ opts) end)
+      demote =
+        Task.async(fn -> Manager.demote(slug, [deregister_retry: @slack_retry] ++ opts) end)
 
       assert_receive {:stub_call, Vagus.Addon.State, {:get, ^slug}}, 5_000
       await_down(stub)
@@ -2032,17 +2259,19 @@ defmodule Vagus.Addon.ManagerTest do
 
       assert :ok = Task.await(demote, 60_000)
       assert {:ok, %{state: :stopped}} = State.get(slug)
-      assert :error = Vagus.Addon.Registry.identity_for_token(token)
+      assert :error = Vagus.DNS.resolve(host, Vagus.DNS)
     end
 
-    # Revoked without the record, the add-on would read `:started` with no
-    # token once State is back.
-    test "demote/2 revokes nothing when :stopped could not be recorded", %{
+    # Its caller would take the add-on for demoted while it reads `:started`
+    # once State is back.
+    test "demote/2 drops nothing when :stopped could not be recorded", %{
       config: c,
       slug: slug,
+      host: host,
       opts: opts
     } do
-      token = register_dead_token(c)
+      with_dns()
+      register_dead_record(host)
       take_down(Vagus.Addon.State)
 
       stub_server(Vagus.Addon.State, fn
@@ -2053,21 +2282,37 @@ defmodule Vagus.Addon.ManagerTest do
       assert {:error, :state_unavailable} =
                Manager.demote(
                  slug,
-                 [register_retry: @tiny_retry] ++ script(opts, state: {:ok, :stopped})
+                 [deregister_retry: @tiny_retry] ++ script(opts, state: {:ok, :stopped})
                )
 
       assert_received {:stub_call, Vagus.Addon.State, {:put, ^c, :stopped, _user_options}}
-      assert {:ok, %{slug: ^slug}} = Vagus.Addon.Registry.identity_for_token(token)
+      assert {:ok, @dead_ip} = Vagus.DNS.resolve(host, Vagus.DNS)
     end
 
-    # Killed between the two, a demotion must leave `:stopped` with a token
-    # rather than `:started` without one, which the Watchdog would restart.
-    test "demote/2 records :stopped before it revokes", %{config: c, slug: slug, opts: opts} do
+    # A blip in State must not cost the demotion, which nothing repeats.
+    test "demote/2 reads State on its caller's deregister budget", %{slug: slug, opts: opts} do
+      take_down(Vagus.Addon.State)
+      dying_server(Vagus.Addon.State, :shutdown)
+
+      assert {:error, :state_unavailable} =
+               Manager.demote(slug, [register_retry: {5, 1}, deregister_retry: {3, 1}] ++ opts)
+
+      assert stub_calls(Vagus.Addon.State) == [:get, :get, :get]
+    end
+
+    # Killed between the two, a demotion must leave `:stopped` with a record,
+    # which the next start replaces, rather than `:started` without its name.
+    test "demote/2 records :stopped before it drops the DNS record", %{
+      config: c,
+      slug: slug,
+      host: host,
+      opts: opts
+    } do
       test = self()
       :ok = State.put(c, :started)
-      take_registry_down()
+      enable_dns()
 
-      stub_server(Vagus.Addon.Registry, fn {:unregister_slug, slug} ->
+      stub_server(Vagus.DNS, fn {:unregister, ^host} ->
         send(test, {:state_at_unregister, State.get(slug)})
         {:reply, :ok}
       end)
@@ -2104,26 +2349,27 @@ defmodule Vagus.Addon.ManagerTest do
           {"create", [create: {:error, :refused}], :refused},
           {"start", [start: {:error, :refused}], {:start_failed, :refused}}
         ] do
-      test "a start that fails in #{step}, its previous container removed, revokes the previous token",
-           %{config: c, slug: slug, opts: opts} do
+      test "a start that fails in #{step}, its previous container removed, leaves the previous token and drops its DNS record",
+           %{config: c, slug: slug, host: host, opts: opts} do
+        with_dns()
         assert {:ok, %{access_token: token}} = Manager.start(c, opts)
-        assert {:ok, %{slug: ^slug}} = Vagus.Addon.Registry.identity_for_token(token)
+        assert {:ok, _ip} = Vagus.DNS.resolve(host, Vagus.DNS)
 
         assert {:error, unquote(Macro.escape(error))} =
                  Manager.start(c, script(opts, unquote(overrides)))
 
-        assert :error = Vagus.Addon.Registry.identity_for_token(token)
+        assert {:ok, %{slug: ^slug}} = Vagus.Addon.Registry.identity_for_token(token)
+        assert :error = Vagus.DNS.resolve(host, Vagus.DNS)
       end
     end
 
-    test "a start that fails allocating its ingress port revokes the previous token", %{
-      slug: slug,
-      opts: opts
-    } do
+    test "a start that fails allocating its ingress port leaves the previous token and drops its DNS record",
+         %{slug: slug, host: host, opts: opts} do
+      with_dns()
       c = ingress_variant(slug)
       no_ingress = [ingress_server: :"no_ingress_#{slug}"] ++ opts
       assert {:ok, %{access_token: token}} = Manager.start(c, no_ingress)
-      assert {:ok, %{slug: ^slug}} = Vagus.Addon.Registry.identity_for_token(token)
+      assert {:ok, _ip} = Vagus.DNS.resolve(host, Vagus.DNS)
 
       # Over an empty State of its own, so it has no entry to allocate for.
       empty = start_supervised!({State, name: :"empty_state_#{slug}", persist_path: nil})
@@ -2133,27 +2379,25 @@ defmodule Vagus.Addon.ManagerTest do
       assert {:error, {:ingress_port, :not_found}} =
                Manager.start(c, [ingress_server: ingress] ++ opts)
 
-      assert :error = Vagus.Addon.Registry.identity_for_token(token)
+      assert {:ok, %{slug: ^slug}} = Vagus.Addon.Registry.identity_for_token(token)
+      assert :error = Vagus.DNS.resolve(host, Vagus.DNS)
     end
 
     # It may still be running: the engine did not act.
-    test "a start that could not remove its previous container leaves the previous token", %{
-      config: c,
-      slug: slug,
-      opts: opts
-    } do
+    test "a start that could not remove its previous container leaves its token and DNS record",
+         %{config: c, slug: slug, host: host, opts: opts} do
+      with_dns()
       assert {:ok, %{access_token: token}} = Manager.start(c, opts)
 
       scripted = script(opts, remove: {:error, :engine_down}, create: {:error, :name_conflict})
       assert {:error, :name_conflict} = Manager.start(c, scripted)
 
       assert {:ok, %{slug: ^slug}} = Vagus.Addon.Registry.identity_for_token(token)
+      assert {:ok, _ip} = Vagus.DNS.resolve(host, Vagus.DNS)
     end
 
-    test "a start that fails before the previous container is touched leaves its token", %{
-      slug: slug,
-      opts: opts
-    } do
+    test "a start that fails before the previous container is touched leaves its token and DNS record",
+         %{slug: slug, host: host, opts: opts} do
       {:ok, c} =
         Config.parse(%{
           "name" => "Test",
@@ -2166,6 +2410,7 @@ defmodule Vagus.Addon.ManagerTest do
           "options" => %{"port" => 1883}
         })
 
+      with_dns()
       assert {:ok, %{access_token: token}} = Manager.start(c, opts)
       _first_start = drain()
 
@@ -2174,14 +2419,11 @@ defmodule Vagus.Addon.ManagerTest do
 
       assert drain() == []
       assert {:ok, %{slug: ^slug}} = Vagus.Addon.Registry.identity_for_token(token)
+      assert {:ok, _ip} = Vagus.DNS.resolve(host, Vagus.DNS)
     end
 
-    test "a start whose revoke of the previous token fails still starts and registers", %{
-      config: c,
-      slug: slug,
-      host: host,
-      opts: opts
-    } do
+    test "a start that cannot drop its removed container's DNS record still starts and registers",
+         %{config: c, slug: slug, host: host, opts: opts} do
       enable_dns()
 
       stub_server(Vagus.DNS, fn
@@ -2207,6 +2449,21 @@ defmodule Vagus.Addon.ManagerTest do
 
       assert_received {:pulled, _spec}
       assert {:ok, %{state: :stopped, config: ^c}} = State.get(slug)
+    end
+
+    # Its State entry vanished without an uninstall.
+    test "install_new/2 removes a token left registered for the slug", %{
+      config: c,
+      slug: slug,
+      opts: opts
+    } do
+      identity = Vagus.Addon.Registry.identity_from_config(c)
+      :ok = Vagus.Addon.Registry.register("left-#{slug}", identity)
+      assert {:ok, %{slug: ^slug}} = Vagus.Addon.Registry.identity_for_token("left-#{slug}")
+
+      assert :ok = Manager.install_new(c, script(opts))
+
+      assert :error = Vagus.Addon.Registry.identity_for_token("left-#{slug}")
     end
 
     test "install_new/2 refuses an installed slug, pulling nothing and recording nothing", %{
@@ -2286,8 +2543,9 @@ defmodule Vagus.Addon.ManagerTest do
     end
   end
 
-  # Each callback answers from the script the test last set: a result, or
-  # `:gate` to report its caller to the test and return what the test sends.
+  # Each callback answers from the script the test last set: a result, a
+  # zero-arity function to call for one, or `:gate` to report its caller to
+  # the test and return what the test sends.
   defmodule ScriptedBackend do
     @moduledoc false
     @behaviour Vagus.Addon.Backend
@@ -2302,6 +2560,9 @@ defmodule Vagus.Addon.ManagerTest do
           receive do
             {:result, result} -> result
           end
+
+        fun when is_function(fun, 0) ->
+          fun.()
 
         result ->
           result
@@ -2325,7 +2586,7 @@ defmodule Vagus.Addon.ManagerTest do
     def start(_id), do: run(:start, :ok)
 
     @impl true
-    def stop(_id, _opts \\ []), do: :ok
+    def stop(_id, _opts \\ []), do: run(:stop, :ok)
 
     @impl true
     def remove(_id, _opts \\ []), do: run(:remove, :ok)

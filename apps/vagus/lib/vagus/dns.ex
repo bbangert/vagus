@@ -6,8 +6,9 @@ defmodule Vagus.DNS do
   Serves `A` records for the fixed anchors (supervisor/hassio → `.2`,
   homeassistant/home-assistant → gateway `.1`, dns → `.3`, observer → `.6`,
   localhost → `127.0.0.1`), each also under the `.local.hass.io` search suffix,
-  plus per-add-on records (`<slug-with-dashes>`) registered/removed on
-  start/stop. Names we don't own are forwarded verbatim to the configured
+  plus per-add-on records (`<slug-with-dashes>`), registered when the add-on
+  starts and removed when it stops, is demoted, or has its previous container
+  removed by a start. Names we don't own are forwarded verbatim to the configured
   upstream resolver (`locals`); with no upstream we answer `NXDOMAIN`.
 
   Bridged add-ons already get `Dns=[172.30.32.3]` injected into their

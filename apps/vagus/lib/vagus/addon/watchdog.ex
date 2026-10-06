@@ -40,10 +40,11 @@ defmodule Vagus.Addon.Watchdog do
   always finds `state: :stopped` here and is ignored, exactly like real
   Supervisor's `_manual_stop` flag would suppress it. Host-reboot
   suppression falls out the same way, for free: `Vagus.Addon.BootStarter`
-  demotes any `:started` entry that isn't a `boot: auto` add-on (and any
-  `boot: auto` entry that fails to actually restart) to `:stopped` at boot,
-  so a stale `:started` record left over from before a reboot is corrected
-  before this watchdog ever sees a live event for it.
+  demotes a `:started` entry that isn't a `boot: auto` add-on, unless it
+  finds it running, and a `boot: auto` entry that fails to actually restart,
+  to `:stopped` at boot, so a stale `:started` record left over from before
+  a reboot is corrected before this watchdog sees a live event for it — bar a
+  demotion that fails, which is logged and leaves the entry.
 
   A third suppression covers the window the other two can't: a host
   shutdown *actually in progress* (`Vagus.Host.Shutdown`, issue #39's
@@ -87,8 +88,8 @@ defmodule Vagus.Addon.Watchdog do
   Five failed attempts give up: logged, and the entry is demoted to
   `:stopped` — an honest record for an add-on
   the watchdog could not bring back up, mirroring `BootStarter`'s same
-  demote-on-failure move — through `manager.demote/2`, which also revokes the
-  dead container's token and leaves alone an add-on that turns out to be
+  demote-on-failure move — through `manager.demote/2`, which also drops the
+  dead container's DNS record and leaves alone an add-on that turns out to be
   running.
 
   A task that raises/exits is caught inside the task itself (never
@@ -481,24 +482,21 @@ defmodule Vagus.Addon.Watchdog do
   defp backoff_ms(attempt, cfg), do: cfg.backoff_base_ms * round(:math.pow(2, attempt - 1))
 
   defp give_up(slug, cfg) do
-    Logger.error(
-      "Vagus.Addon.Watchdog: #{slug} failed to restart after #{@max_attempts} attempts; " <>
-        "giving up and demoting to :stopped"
-    )
+    gave_up = "Vagus.Addon.Watchdog: #{slug} failed to restart after #{@max_attempts} attempts"
 
     # Bounded because the demotion queues on the slug lock, and a sequence
     # that cannot end blocks every later one for the slug.
     case bounded_manager_call(cfg, fn -> cfg.manager.demote(slug, []) end) do
       :ok ->
-        :ok
+        Logger.error("#{gave_up}; gave up and demoted it to :stopped")
 
       {:error, :running} ->
-        Logger.error("Vagus.Addon.Watchdog: #{slug} is running after all; left :started")
+        Logger.error("#{gave_up}, but #{slug} is running after all; left :started")
 
       error ->
         Logger.error(
-          "Vagus.Addon.Watchdog: demoting #{slug} #{demote_failure(error)}; it may stay " <>
-            ":started, or keep a valid token, until its next start or a reboot"
+          "#{gave_up}; demoting #{slug} #{demote_failure(error)}, so it may stay " <>
+            ":started, or keep its DNS record, until its next start or a reboot"
         )
     end
 

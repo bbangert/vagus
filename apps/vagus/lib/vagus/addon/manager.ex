@@ -28,16 +28,19 @@ defmodule Vagus.Addon.Manager do
 
     * `stop/2` — docker-stop then remove the container (the real
       Supervisor's `stop` removes the container; `start` always re-creates),
-      deregister the token + DNS record, record `:stopped`;
+      drop the DNS record, record `:stopped`;
     * `start_slug/2` — re-`start/2` a previously-installed slug using its
       `Vagus.Addon.State`-stored config + user options;
     * `restart/2` — `stop/2` (tolerating any failure but `:not_found`) then
       `start_slug/2`;
-    * `uninstall/2` — stop+remove the container and image (both
-      best-effort), purge the slug's discovery/service registrations, drop
-      its `Registry`/`DNS`/`State` entries, and `File.rm_rf` its data dir —
+    * `uninstall/2` — revoke the token, stop+remove the container and image
+      (both best-effort), purge the slug's discovery/service registrations,
+      drop its `DNS`/`State` entries, and `File.rm_rf` its data dir —
       gated on the slug matching a safe directory-name charset, since the
-      slug is interpolated into that rm_rf path.
+      slug is interpolated into that rm_rf path;
+    * `demote/2` — record `:stopped` and drop the DNS record of an add-on
+      its caller found dead;
+    * `install_new/2` — `install/2` for a slug that is not installed yet.
 
   ## W6 — per-slug serialization (IW-P1-T2)
 
@@ -70,14 +73,15 @@ defmodule Vagus.Addon.Manager do
   `restart/2` calls `stop/2` then `start_slug/2`, and `start_slug/2` calls
   `start/2` — all from the same process, which must not deadlock against
   its own outer lock. `:global.set_lock/2` (which `:global.trans` uses
-  internally) already guarantees this: a second `set_lock` call for the
-  same `{LockId, RequesterId}` pair from the *same requester* (here,
-  `self()`) increments a counter rather than blocking, so nested calls
-  from one process compose safely while a genuinely different process
-  calling with the same slug still queues behind the outer holder. No
-  extra supervision is needed — `:global` is already part of the runtime
-  (`:kernel`), there is nothing here for `Vagus.Application` to start or
-  own.
+  internally) lets the *same requester* (here, `self()`) take a lock it
+  already holds without blocking, while a different process calling with
+  the same slug queues. The lock is not counted, though: the inner release
+  frees it, and the rest of the outer body runs unlocked (see
+  `stop_holding_lock/2`). `restart/2` is therefore locked across its stop
+  and across its start, not between them — a call queued for the slug can
+  run in that gap, and finds the add-on `:stopped`. No extra supervision is
+  needed — `:global` is already part of the runtime (`:kernel`), there is
+  nothing here for `Vagus.Application` to start or own.
 
   `stop/2` and `uninstall/2` additionally record `Vagus.Addon.State`'s
   `:stopped` state **before** touching the container (see each function's
@@ -97,16 +101,19 @@ defmodule Vagus.Addon.Manager do
 
   @default_backend Vagus.Addon.Backend.Container
 
-  # The `Vagus.Addon.Backend.state/0` values `demote/2` leaves alone.
-  @alive_states [:running, :restarting]
   @default_data_root "/data"
 
-  # `{attempts, delay_ms}` for a Registry/DNS call that finds its server
-  # absent; the delay is slept between attempts, under the slug lock.
-  # Registering gives up after 200 ms; a stop waits 4.9 s, because giving up
-  # there leaves a stopped add-on's token valid. A start deregisters on the
-  # register budget, for the previous start's token and when it gives up: it
-  # holds the slug lock.
+  # `{attempts, delay_ms}` for a Registry, DNS or State call that finds its
+  # server absent; the delay is slept between attempts, under the slug lock.
+  # Registering gives up after 200 ms. A stop, a demotion and an uninstall
+  # wait 4.9 s per server: giving up leaves a stopped add-on's name resolving
+  # to an address the engine can hand to another container, a dead add-on
+  # recorded `:started`, or an uninstalled add-on's token valid. A demotion
+  # spends that on State and on DNS; an uninstall on the Registry, DNS,
+  # Discovery and Services, so 19.6 s with all four absent. A start drops a
+  # DNS record on the register budget, for the container it removed and when
+  # it gives up, so that a failing start is not held under the lock for
+  # seconds more.
   #
   # A call that times out is outside these budgets: it is not retried, and
   # costs one `@registration_call_timeout`.
@@ -145,6 +152,9 @@ defmodule Vagus.Addon.Manager do
     end
   end
 
+  # Not under W6's lock: it never touches a running container — only image
+  # pull + bridge setup — so it can't race start/stop/restart/uninstall the
+  # way they race each other.
   defp do_install(%Config{} = config, opts) do
     opts = put_backend(opts, config)
     spec = build_spec(config, ensure_token(opts))
@@ -153,10 +163,6 @@ defmodule Vagus.Addon.Manager do
       backend(opts).pull(spec)
     end
   end
-
-  # install/2 isn't part of W6's lock (it never touches a running
-  # container — only image pull + bridge setup — so it can't race
-  # start/stop/restart/uninstall the way they race each other).
 
   @doc """
   `install/2` for a slug with no `Vagus.Addon.State` entry, recording it
@@ -168,6 +174,10 @@ defmodule Vagus.Addon.Manager do
   add-on started since the earlier. The pull stays outside the lock, where
   every other lifecycle call for the slug would wait behind it.
 
+  A token still registered for the slug is removed before the record: an
+  entry that vanished without an uninstall must not hand its registration to
+  the next install.
+
   Exits if `Vagus.Addon.State` is not there to ask or to record in.
   """
   @spec install_new(Config.t(), keyword()) ::
@@ -176,7 +186,10 @@ defmodule Vagus.Addon.Manager do
     with :ok <- not_installed(slug),
          :ok <- install(config, opts) do
       with_slug_lock(slug, fn ->
-        with :ok <- not_installed(slug), do: Vagus.Addon.State.put(config, :stopped)
+        with :ok <- not_installed(slug) do
+          revoke_token(slug, Keyword.put(opts, :deregister_retry, register_retry(opts)))
+          Vagus.Addon.State.put(config, :stopped)
+        end
       end)
     end
   end
@@ -201,15 +214,17 @@ defmodule Vagus.Addon.Manager do
   that was `:started` is still one `Vagus.Addon.Watchdog` and
   `Vagus.Addon.BootStarter` will start.
 
-  The previous start's token and DNS record are revoked once its container is
-  confirmed removed, within the register budget, so a start that fails after
-  that point does not leave them valid. One that fails earlier, or could not
-  remove the container, leaves both: that container may still be running.
+  The token replaces the add-on's previous one when it registers; a start that
+  fails leaves the previous one valid. The previous DNS record is dropped once
+  its container is confirmed removed, within the register budget. A start
+  that fails earlier, or could not remove the container, leaves the record:
+  that container may still be running.
 
-  `opts[:register_retry]`/`opts[:deregister_retry]` (`{attempts, delay_ms}`)
-  and `opts[:registration_call_timeout]` (ms) override the Registry/DNS call
-  budgets, here and in `stop/2`/`uninstall/2`; `uninstall/2` spends the
-  deregister budget on Discovery and Services too.
+  `opts[:register_retry]` (`{attempts, delay_ms}`) overrides the budget of
+  every Registry/DNS call a start makes, its DNS drops included.
+  `opts[:deregister_retry]` overrides the one `stop/2`, `demote/2` and
+  `uninstall/2` spend. `opts[:registration_call_timeout]` (ms) applies to all
+  of them.
   """
   @spec start(Config.t(), keyword()) ::
           {:ok, %{id: String.t(), access_token: String.t()}} | {:error, term()}
@@ -241,8 +256,8 @@ defmodule Vagus.Addon.Manager do
          :ok <- ensure_dsp_devices(config, opts),
          :ok <- write_options(config, data_root, user_options),
          :ok <- maybe_ensure_network(config, opts),
-         removal <- remove_stale_container(spec, opts),
-         :ok <- revoke_previous_start(removal, config.slug, opts),
+         removal = remove_stale_container(spec, opts),
+         _ = drop_removed_dns_record(removal, config.slug, opts),
          :ok <- maybe_allocate_ingress_port(config, opts),
          {:ok, id} <- backend(opts).create(spec),
          :ok <- start_or_cleanup(id, opts) do
@@ -264,24 +279,24 @@ defmodule Vagus.Addon.Manager do
     end
   end
 
-  # With its container removed, the registered token must not outlive a start
-  # that fails from here on. A container that could not be removed may still
-  # be running, and keeps it. On the register budget because the slug lock is
-  # held.
-  defp revoke_previous_start(:removed, slug, opts) do
-    retry = Keyword.get(opts, :register_retry, @register_retry)
-    deregister_slug(slug, Keyword.put(opts, :deregister_retry, retry))
+  # The engine can hand a removed container's address to another one, so its
+  # record must not outlive a start that fails from here on. A container that
+  # could not be removed may still be running, and keeps it.
+  defp drop_removed_dns_record(:removed, slug, opts) do
+    drop_dns_record(slug, Keyword.put(opts, :deregister_retry, register_retry(opts)))
   end
 
-  defp revoke_previous_start(:not_removed, _slug, _opts), do: :ok
+  defp drop_removed_dns_record(:not_removed, _slug, _opts), do: :ok
 
   # A failed registration says nothing about whether the add-on should run,
   # and a `:stopped` left behind would end the Watchdog's remaining attempts
-  # and keep `BootStarter` from starting it at the next boot. `:stopped` still
-  # covers the removal, so the `die` it causes is not taken for a crash.
+  # and keep `BootStarter` from starting it at the next boot. `:stopped` is
+  # recorded across the removal; a `die` the Watchdog reads only once
+  # `:started` is back gets the restart that record asks for.
+  #
+  # A token that registered before DNS failed stays, as any start's does.
   defp undo_start(config, prior, opts) do
-    retry = Keyword.get(opts, :register_retry, @register_retry)
-    stop_config(config, Keyword.put(opts, :deregister_retry, retry))
+    stop_config(config, Keyword.put(opts, :deregister_retry, register_retry(opts)))
     if prior == :started, do: record_state(config, :started)
     :ok
   end
@@ -289,11 +304,18 @@ defmodule Vagus.Addon.Manager do
   @doc """
   Stops `slug`: docker-stop then remove the container (§A1.1 — the real
   Supervisor's `stop` removes the container, and `start` always re-creates
-  one), deregister its token (`Registry.unregister_slug/1`) and DNS record
-  (`DNS.unregister/1`), and record `:stopped` (preserving any stored user
-  options). Idempotent: a backend error stopping/removing an
-  already-stopped/absent container is logged and tolerated, never surfaced
-  as a failure — only an unknown (never-installed) `slug` is an error.
+  one), drop its DNS record (`DNS.unregister/1`), and record `:stopped`
+  (preserving any stored user options). Idempotent: a backend error
+  stopping/removing an already-stopped/absent container is logged and
+  tolerated, never surfaced as a failure — only an unknown (never-installed)
+  `slug` is an error.
+
+  The token stays registered, as the real Supervisor's does: the next start
+  replaces it and `uninstall/2` removes it. The DNS record cannot stay, since
+  the engine can hand the container's address to another one. With
+  `Vagus.DNS` absent for the whole deregister budget the stop still succeeds,
+  logs an error, and the record may stay until the add-on's next start or a
+  reboot.
 
   W6: `record_state(config, :stopped)` runs **before**
   `stop_and_remove_container/2`, not after — the docker `die` event this
@@ -320,33 +342,40 @@ defmodule Vagus.Addon.Manager do
   defp stop_config(config, opts) do
     record_state(config, :stopped)
     stop_and_remove_container(config, opts)
-    deregister_slug(config.slug, opts)
+    drop_dns_record(config.slug, opts)
   end
 
   @doc """
-  Records `slug` `:stopped` and revokes its token and DNS record, for a caller
-  that has concluded the add-on is dead without stopping it.
+  Records `slug` `:stopped` and drops its DNS record, for a caller that has
+  concluded the add-on is dead without stopping it. Its token stays, as after
+  a `stop/2`.
 
   That conclusion is re-checked under the slug lock, since a start may have
-  completed after it was drawn: an add-on its backend reports running is left
-  as it is and `{:error, :running}` returned. A slug with no
-  `Vagus.Addon.State` entry is left alone too (`:ok`).
+  completed after it was drawn: an add-on its backend reports running or
+  restarting is left as it is and `{:error, :running}` returned. A slug with
+  no `Vagus.Addon.State` entry is left alone too (`:ok`).
 
-  The token is revoked only once `:stopped` is recorded. With no `State` to
-  read or record in for the register budget, nothing is revoked and
+  The record is dropped only once `:stopped` is recorded. With no `State` to
+  read or record in for the deregister budget, nothing is dropped and
   `{:error, :state_unavailable}` returned.
 
-  A caller killed between the record and the revoke leaves a `:stopped` add-on
-  with a valid token until its next start. Not for a caller that holds the
-  lock already (see `stop_holding_lock/2`). Takes the options `stop/2` does.
+  A caller killed between the two, or a `Vagus.DNS` absent for the whole
+  budget (logged; still `:ok`), leaves a `:stopped` add-on with a DNS record
+  until its next start or a reboot. Not for a caller that holds the lock
+  already (see `stop_holding_lock/2`). Takes the options `stop/2` does.
   """
   @spec demote(String.t(), keyword()) :: :ok | {:error, :running | :state_unavailable}
   def demote(slug, opts \\ []) do
     with_slug_lock(slug, fn -> do_demote(slug, opts) end)
   end
 
+  # The `Vagus.Addon.Backend.state/0` values `demote/2` leaves alone.
+  @alive_states [:running, :restarting]
+
   defp do_demote(slug, opts) do
-    retry = Keyword.get(opts, :register_retry, @register_retry)
+    # Not the register budget: no caller is waiting on a demotion, and one
+    # that gives up on State leaves a dead add-on `:started` for good.
+    retry = deregister_retry(opts)
 
     case AbsentRetry.call(fn -> Vagus.Addon.State.get(slug) end, retry) do
       {:ok, {:ok, %{config: config}}} ->
@@ -354,7 +383,7 @@ defmodule Vagus.Addon.Manager do
 
         if running?(config, opts),
           do: {:error, :running},
-          else: record_stopped_then_revoke(config, retry, opts)
+          else: record_stopped_then_drop_dns(config, retry, opts)
 
       {:ok, :error} ->
         :ok
@@ -364,19 +393,18 @@ defmodule Vagus.Addon.Manager do
     end
   end
 
-  # Not `record_state/3`, which skips the write when `State` is absent: a
-  # token revoked for an add-on still recorded `:started` is restarted by the
-  # Watchdog, and its record is the only thing saying so.
-  defp record_stopped_then_revoke(config, retry, opts) do
+  # Not `record_state/3`, which skips the write when `State` is absent: the
+  # caller would take an add-on still recorded `:started` for demoted.
+  defp record_stopped_then_drop_dns(config, retry, opts) do
     case AbsentRetry.call(fn -> Vagus.Addon.State.put(config, :stopped) end, retry) do
-      {:ok, :ok} -> deregister_slug(config.slug, opts)
+      {:ok, :ok} -> drop_dns_record(config.slug, opts)
       {:error, _tag} -> {:error, :state_unavailable}
     end
   end
 
   # A check that cannot answer reads as not running: a demoter has decided the
   # add-on should not be recorded as running, and the alternative leaves a
-  # dead add-on registered.
+  # dead add-on's name resolving.
   defp running?(config, opts) do
     case backend(opts).state(container_name(config.slug)) do
       {:ok, state} -> state in @alive_states
@@ -470,6 +498,9 @@ defmodule Vagus.Addon.Manager do
 
       {:ok, %{config: config}} ->
         opts = put_backend(opts, config)
+        # First, and its only revocation: the stop and the image delete can
+        # each take seconds, and the add-on is not owed the API for them.
+        revoke_token(config.slug, opts)
         record_state(config, :stopped)
         stop_and_remove_container(config, opts)
         remove_image_best_effort(config, opts)
@@ -978,7 +1009,7 @@ defmodule Vagus.Addon.Manager do
     end
   end
 
-  # Register the running add-on's token → identity/grants so the emulator's
+  # Register the add-on's token → identity/grants so the emulator's
   # add-on-facing endpoints can authorize it.
   defp register_identity(config, token, opts) do
     identity = Vagus.Addon.Registry.identity_from_config(config)
@@ -988,7 +1019,7 @@ defmodule Vagus.Addon.Manager do
       Vagus.Addon.Registry.register(token, identity, Vagus.Addon.Registry, timeout)
     end
 
-    case AbsentRetry.call(register, Keyword.get(opts, :register_retry, @register_retry)) do
+    case AbsentRetry.call(register, register_retry(opts)) do
       {:ok, _reply} ->
         :ok
 
@@ -1045,28 +1076,30 @@ defmodule Vagus.Addon.Manager do
     end
   end
 
-  # Drop a stopped/uninstalled add-on's token + DNS record, waiting out a
-  # restart of either server. Running out of budget is a double fault, not an
-  # impossibility: a supervisor is a single process, so a sibling with a slow
-  # `init/1` can delay Registry's restart past any budget while the app is
-  # healthy. The token then stays valid until a reboot or the add-on's next
-  # start, so it is logged as an error; the stop itself still succeeded.
-  defp deregister_slug(slug, opts) do
-    retry = Keyword.get(opts, :deregister_retry, @deregister_retry)
-    timeout = call_timeout(opts)
-
-    deregister(slug, "Registry", retry, fn ->
-      Vagus.Addon.Registry.unregister_slug(slug, Vagus.Addon.Registry, timeout)
+  # Both wait out a restart of their server. Running out of budget is a
+  # double fault, not an impossibility: a supervisor is a single process, so a
+  # sibling with a slow `init/1` can delay a restart past any budget while the
+  # app is healthy. The registration then stays until a reboot or, if the
+  # add-on is still installed, its next start, so it is logged as an error;
+  # the caller still succeeds.
+  defp revoke_token(slug, opts) do
+    deregister(slug, "Registry", deregister_retry(opts), fn ->
+      Vagus.Addon.Registry.unregister_slug(slug, Vagus.Addon.Registry, call_timeout(opts))
     end)
+  end
 
+  defp drop_dns_record(slug, opts) do
     if dns_enabled?() do
-      deregister(slug, "DNS", retry, fn ->
-        Vagus.DNS.unregister(hostname(slug), Vagus.DNS, timeout)
+      deregister(slug, "DNS", deregister_retry(opts), fn ->
+        Vagus.DNS.unregister(hostname(slug), Vagus.DNS, call_timeout(opts))
       end)
     end
 
     :ok
   end
+
+  defp deregister_retry(opts), do: Keyword.get(opts, :deregister_retry, @deregister_retry)
+  defp register_retry(opts), do: Keyword.get(opts, :register_retry, @register_retry)
 
   defp deregister(slug, server, retry, fun) do
     case AbsentRetry.call(fun, retry) do
@@ -1142,14 +1175,11 @@ defmodule Vagus.Addon.Manager do
   # Purge every other subsystem's record of `slug` on uninstall. Discovery
   # and Services get the deregister budget: both reload their checkpoint on
   # restart, so a delete skipped while one is absent would come back with it.
-  #
-  # The token and DNS record go first: revoking a credential must not wait on
-  # side-state cleanup.
   defp purge_side_state(slug, opts) do
-    retry = Keyword.get(opts, :deregister_retry, @deregister_retry)
+    retry = deregister_retry(opts)
     timeout = call_timeout(opts)
 
-    deregister_slug(slug, opts)
+    drop_dns_record(slug, opts)
 
     purge(slug, "Discovery", retry, fn ->
       Vagus.Discovery.delete_by_slug(slug, Vagus.Discovery, timeout)
@@ -1198,8 +1228,7 @@ defmodule Vagus.Addon.Manager do
     with true <- dns_enabled?(),
          {:ok, host, ip} <- dns_record(config, id, opts),
          register = fn -> Vagus.DNS.register(host, ip, Vagus.DNS, call_timeout(opts)) end,
-         {:error, tag} <-
-           AbsentRetry.call(register, Keyword.get(opts, :register_retry, @register_retry)) do
+         {:error, tag} <- AbsentRetry.call(register, register_retry(opts)) do
       Logger.error("Vagus.Addon.Manager: DNS register for #{config.slug} failed: #{tag}")
       {:error, {:registration_failed, :dns}}
     else

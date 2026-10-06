@@ -211,11 +211,34 @@ defmodule Vagus.Addon.BootStarterTest do
   end
 
   # A token registered for the add-on before the pass reaches it.
-  defp register_dead_token(config) do
-    token = "dead-#{config.slug}"
+  defp register_token(config) do
+    token = "token-#{config.slug}"
     :ok = Registry.register(token, Registry.identity_from_config(config))
     on_exit(fn -> Registry.unregister_slug(config.slug) end)
     token
+  end
+
+  # A DNS under the default name, the only one the Manager talks to, holding
+  # a record for the add-on's container. The default-named server
+  # checkpoints, so an earlier test's file goes first.
+  defp seed_dns_record(slug) do
+    prev = Application.get_env(:vagus, :dns_enabled)
+    Application.put_env(:vagus, :dns_enabled, true)
+    File.rm(Vagus.RunState.path(:dns))
+
+    on_exit(fn ->
+      Application.put_env(:vagus, :dns_enabled, prev)
+      File.rm(Vagus.RunState.path(:dns))
+    end)
+
+    {:ok, sock} = :gen_udp.open(0, ip: {127, 0, 0, 1})
+    {:ok, port} = :inet.port(sock)
+    :gen_udp.close(sock)
+    start_supervised!({Vagus.DNS, name: Vagus.DNS, ip: {127, 0, 0, 1}, port: port, upstream: nil})
+
+    host = String.replace(slug, "_", "-")
+    :ok = Vagus.DNS.register(host, {172, 30, 33, 9}, Vagus.DNS)
+    host
   end
 
   # Reconciliation runs in `handle_continue`, so any reply comes after it.
@@ -234,10 +257,10 @@ defmodule Vagus.Addon.BootStarterTest do
     :sys.get_state(pid)
   end
 
-  test "a start failure revokes the token of the add-on it demotes" do
-    slug = "boot_fail_revoke_#{System.unique_integer([:positive])}"
+  test "a start failure drops the DNS record of the add-on it demotes, and keeps its token" do
+    slug = "boot_fail_demote_#{System.unique_integer([:positive])}"
 
-    # Fails in option validation, before a start revokes anything itself.
+    # Fails in option validation, before a start drops anything itself.
     config =
       fixture_config(slug, %{
         "boot" => "auto",
@@ -246,38 +269,40 @@ defmodule Vagus.Addon.BootStarterTest do
       })
 
     seed(slug, :started, config)
-    token = register_dead_token(config)
-    assert {:ok, %{slug: ^slug}} = Registry.identity_for_token(token)
+    token = register_token(config)
+    host = seed_dns_record(slug)
 
     capture_log(fn -> reconcile_now() end)
 
     assert {:ok, %{state: :stopped}} = State.get(slug)
-    assert :error = Registry.identity_for_token(token)
+    assert :error = Vagus.DNS.resolve(host, Vagus.DNS)
+    assert {:ok, %{slug: ^slug}} = Registry.identity_for_token(token)
   end
 
-  test "a boot: manual demotion revokes the add-on's token" do
-    slug = "boot_manual_revoke_#{System.unique_integer([:positive])}"
+  test "a boot: manual demotion drops the add-on's DNS record, and keeps its token" do
+    slug = "boot_manual_demote_#{System.unique_integer([:positive])}"
     config = seed(slug, :started, fixture_config(slug, %{"boot" => "manual"}))
-    token = register_dead_token(config)
-    assert {:ok, %{slug: ^slug}} = Registry.identity_for_token(token)
+    token = register_token(config)
+    host = seed_dns_record(slug)
 
     reconcile_now()
 
     assert {:ok, %{state: :stopped}} = State.get(slug)
-    assert :error = Registry.identity_for_token(token)
+    assert :error = Vagus.DNS.resolve(host, Vagus.DNS)
+    assert {:ok, %{slug: ^slug}} = Registry.identity_for_token(token)
   end
 
   # Started through the API after the pass took its snapshot of `State`.
-  test "a boot: manual add-on that is running is left :started, with its token" do
+  test "a boot: manual add-on that is running is left :started, with its DNS record" do
     slug = "boot_manual_running_#{System.unique_integer([:positive])}"
-    config = seed(slug, :started, fixture_config(slug, %{"boot" => "manual"}))
-    token = register_dead_token(config)
+    seed(slug, :started, fixture_config(slug, %{"boot" => "manual"}))
+    host = seed_dns_record(slug)
     :ok = Fake.start("addon_#{slug}")
 
     reconcile_now()
 
     assert {:ok, %{state: :started}} = State.get(slug)
-    assert {:ok, %{slug: ^slug}} = Registry.identity_for_token(token)
+    assert {:ok, _ip} = Vagus.DNS.resolve(host, Vagus.DNS)
   end
 
   # A restart would run the pass again, and start every `:started` add-on.

@@ -3,18 +3,22 @@ defmodule Vagus.Addon.Backend.Native.Sentinel do
   Keeps `Vagus.Addon.State` honest for `:native` add-ons (M5, MQ-P2-T3).
 
   A containerized add-on's crash/restart is tracked by `Vagus.Addon.Watchdog`
-  via Docker `die` events; a native add-on (a BEAM subtree) never emits one, and
-  OTP supervision restarts it in-process without touching `State`. That's the
-  right behaviour for the *stay-alive* concern — but if the subtree's restart
-  budget is exhausted and the `DynamicSupervisor` gives up, the process is gone
-  while `State` still reads `:started`. This sentinel closes that gap: it
-  monitors each started broker and, when one dies **without** OTP bringing it
-  back, demotes its `State` entry to `:stopped` — mirroring `Watchdog.give_up/2`.
+  via Docker `die` events; a native add-on (a BEAM subtree) never emits one.
+  The broker's own supervisor restarts its children without touching `State`,
+  which is right for the *stay-alive* concern — but once that supervisor
+  exhausts its restart budget the broker is gone for good (it is a
+  `:temporary` child of `Native.Supervisor`) while `State` still reads
+  `:started`. This sentinel closes that gap: it monitors each started broker
+  and, when one dies and nothing has started it again by the recheck, has
+  `Vagus.Addon.Manager.demote/2` record it `:stopped` — mirroring
+  `Watchdog.give_up/2`. A demotion that fails is repeated on the recheck
+  interval, a bounded number of times.
 
-  A manual `stop`/`remove` calls `unwatch/1` first, so an intentional teardown is
-  never mistaken for a crash. `watch/1`/`unwatch/1` no-op if the sentinel isn't
-  running (isolated tests, `:host` without the full tree), matching the
-  best-effort style of the manager's other side effects.
+  A manual `stop`/`remove` calls `unwatch/1` first. That cast can lose to the
+  `:DOWN`, so what keeps an intentional teardown from being revived is that it
+  recorded `:stopped` before the broker went down. `watch/1`/`unwatch/1` no-op
+  if the sentinel isn't running (isolated tests, `:host` without the full
+  tree), matching the best-effort style of the manager's other side effects.
 
   ## Revive (native watchdog, MQ-P6 follow-up)
 
@@ -38,10 +42,13 @@ defmodule Vagus.Addon.Backend.Native.Sentinel do
   alias Vagus.Addon.Backend.Native
   alias Vagus.Addon.State
 
-  # Grace period after a DOWN before deciding a restart didn't happen — the
-  # DynamicSupervisor restarts near-instantly, so a live re-check this soon
-  # after distinguishes "restarted" from "gave up".
+  # Delay after a DOWN before demoting: nothing restarts a broker by itself,
+  # but a start already under way gets to bring it back first.
   @recheck_ms 1_000
+
+  # A demotion that still fails after this many repeats is given up on: what
+  # keeps failing that long is not a State restart.
+  @demote_retries 5
 
   # Revive pacing: the first attempt waits out any lingering listener-socket
   # release; failures retry on a fixed interval, uncapped (§B7.4 style).
@@ -75,6 +82,8 @@ defmodule Vagus.Addon.Backend.Native.Sentinel do
     state = %{
       by_ref: %{},
       by_id: %{},
+      # id => %{failures:, revive?:} for a demotion being repeated.
+      pending: %{},
       state_mod: Keyword.get(opts, :state_mod, State),
       recheck_ms: Keyword.get(opts, :recheck_ms, @recheck_ms),
       revive_fun: Keyword.get(opts, :revive_fun, &Vagus.Addon.Manager.start/1),
@@ -101,8 +110,10 @@ defmodule Vagus.Addon.Backend.Native.Sentinel do
   end
 
   @impl GenServer
-  def handle_cast({:watch, id}, state), do: {:noreply, monitor(id, state)}
-  def handle_cast({:unwatch, id}, state), do: {:noreply, demonitor(id, state)}
+  def handle_cast({:watch, id}, state), do: {:noreply, monitor(id, forget(state, id))}
+
+  # Forgotten too: a revive decided before a manual stop must not follow it.
+  def handle_cast({:unwatch, id}, state), do: {:noreply, demonitor(id, forget(state, id))}
 
   @impl GenServer
   def handle_info({:DOWN, ref, :process, _pid, _reason}, state) do
@@ -118,8 +129,8 @@ defmodule Vagus.Addon.Backend.Native.Sentinel do
 
   def handle_info({:recheck, id}, state) do
     case Process.whereis(Native.broker_name(id)) do
-      # OTP restarted it — resume watching, State stays :started.
-      pid when is_pid(pid) -> {:noreply, monitor_pid(id, pid, state)}
+      # Something has started it since — resume watching, State stays :started.
+      pid when is_pid(pid) -> {:noreply, monitor_pid(id, pid, forget(state, id))}
       nil -> {:noreply, demote(id, state)}
     end
   end
@@ -127,13 +138,13 @@ defmodule Vagus.Addon.Backend.Native.Sentinel do
   def handle_info({:revive, id}, state) do
     slug = Native.slug_from_id(id)
 
-    case state.state_mod.get(slug) do
+    case guarded(fn -> state.state_mod.get(slug) end) do
       # Still down, still installed, and STILL boot:auto on the current
       # config (it may have been flipped to manual since the demotion
-      # scheduled this — re-checked here and again on every retry;
-      # Copilot review, PR #7) — attempt the restart. Success re-arms the
-      # watch through Native.start inside Manager.start/1.
-      {:ok, %{state: :stopped, config: %{boot: "auto"} = config}} ->
+      # scheduled this — re-checked here and again on every retry) —
+      # attempt the restart. Success re-arms the watch through Native.start
+      # inside Manager.start/1.
+      {:ok, {:ok, %{state: :stopped, config: %{boot: "auto"} = config}}} ->
         case state.revive_fun.(config) do
           {:ok, _} ->
             Logger.info("Vagus.Addon.Backend.Native.Sentinel: revived #{slug}")
@@ -146,6 +157,10 @@ defmodule Vagus.Addon.Backend.Native.Sentinel do
 
             Process.send_after(self(), {:revive, id}, state.revive_retry_ms)
         end
+
+      # `State` is mid-restart: the revive is still owed.
+      :failed ->
+        Process.send_after(self(), {:revive, id}, state.revive_retry_ms)
 
       # Uninstalled, or someone started it manually in the meantime — drop.
       _ ->
@@ -185,69 +200,104 @@ defmodule Vagus.Addon.Backend.Native.Sentinel do
     %{state | by_ref: Map.delete(state.by_ref, ref), by_id: Map.delete(state.by_id, id)}
   end
 
+  defp forget(state, id), do: %{state | pending: Map.delete(state.pending, id)}
+
   defp demote(id, state) do
     slug = Native.slug_from_id(id)
 
-    case state.state_mod.get(slug) do
-      {:ok, %{config: config} = entry} ->
+    case attempt_demotion(id, slug, state) do
+      {:demoted, revive?} ->
         Logger.warning(
-          "Vagus.Addon.Backend.Native.Sentinel: broker #{slug} did not restart — demoting to :stopped"
+          "Vagus.Addon.Backend.Native.Sentinel: broker #{slug} is gone; demoted to :stopped"
         )
 
-        case demote_slug(id, slug, state) do
-          # `Native.start/1` casts a watch for every broker it brings up; this
-          # does not depend on that cast being behind this message. A broker
-          # gone again already left nothing to watch, so the recheck is what
-          # demotes it.
-          {:error, :running} ->
-            case Process.whereis(Native.broker_name(id)) do
-              nil ->
-                Process.send_after(self(), {:recheck, id}, state.recheck_ms)
-                state
+        if revive?, do: Process.send_after(self(), {:revive, id}, state.revive_delay_ms)
+        forget(state, id)
 
-              pid ->
-                monitor_pid(id, pid, state)
-            end
+      # `Native.start/1` casts a watch for every broker it brings up; this
+      # does not depend on that cast being behind this message. A broker
+      # gone again already left nothing to watch, so the recheck is what
+      # demotes it.
+      :running ->
+        case Process.whereis(Native.broker_name(id)) do
+          nil ->
+            Process.send_after(self(), {:recheck, id}, state.recheck_ms)
+            forget(state, id)
 
-          _demoted_or_failed ->
-            # Revive ONLY when State still read :started here — the signature
-            # of a genuine crash (demote exists to fix that staleness). A
-            # manual stop records :stopped BEFORE terminating the broker, and
-            # unwatch/2 is an async cast, so a DOWN/recheck racing the stop
-            # must not resurrect an add-on the user just stopped (Copilot
-            # review, PR #7 round 2).
-            if Map.get(entry, :state) == :started and auto_boot?(config) do
-              Process.send_after(self(), {:revive, id}, state.revive_delay_ms)
-            end
-
-            state
+          pid ->
+            monitor_pid(id, pid, forget(state, id))
         end
 
-      _ ->
-        state
+      {:failed, revive?} ->
+        retry_demotion(id, slug, revive?, state)
+
+      :not_installed ->
+        forget(state, id)
     end
   end
 
-  # A restarted Sentinel watches nothing for an add-on already recorded
-  # `:stopped`, so a failure must not take it down. The demotion may not have
-  # recorded anything, and a revive only acts on `:stopped`, so the recheck is
-  # armed again to repeat it.
-  defp demote_slug(id, slug, state) do
-    with {:error, :state_unavailable} <- state.demote_fun.(slug) do
-      retry_demotion(id, slug, state)
+  # Both steps are guarded: either can exit while `State` restarts, and a
+  # Sentinel that went down with it comes back watching nothing for a
+  # `:started` add-on whose broker is gone.
+  defp attempt_demotion(id, slug, state) do
+    case guarded(fn -> state.state_mod.get(slug) end) do
+      {:ok, {:ok, entry}} ->
+        revive? = revive?(id, entry, state)
+
+        case guarded(fn -> state.demote_fun.(slug) end) do
+          {:ok, :ok} -> {:demoted, revive?}
+          {:ok, {:error, :running}} -> :running
+          _failed -> {:failed, revive?}
+        end
+
+      {:ok, _no_entry} ->
+        :not_installed
+
+      :failed ->
+        {:failed, get_in(state.pending, [id, :revive?])}
     end
+  end
+
+  defp guarded(fun) do
+    {:ok, fun.()}
   catch
-    kind, _reason when kind in [:error, :exit] -> retry_demotion(id, slug, state)
+    kind, _reason when kind in [:error, :exit] -> :failed
   end
 
-  defp retry_demotion(id, slug, state) do
-    Logger.error(
-      "Vagus.Addon.Backend.Native.Sentinel: demoting #{slug} failed; " <>
-        "retrying in #{state.recheck_ms}ms"
-    )
+  # Decided by the first read after the death and kept across repeats: a
+  # failed demotion can have recorded `:stopped` already, and one revive per
+  # death is all that may be scheduled.
+  #
+  # Revive ONLY when State still read :started — the signature of a genuine
+  # crash. A manual stop records :stopped BEFORE terminating the broker, and
+  # unwatch/2 is an async cast, so a DOWN/recheck racing the stop must not
+  # resurrect an add-on the user just stopped.
+  defp revive?(id, entry, state) do
+    case get_in(state.pending, [id, :revive?]) do
+      nil -> Map.get(entry, :state) == :started and auto_boot?(Map.get(entry, :config))
+      decided -> decided
+    end
+  end
 
-    Process.send_after(self(), {:recheck, id}, state.recheck_ms)
-    :failed
+  defp retry_demotion(id, slug, revive?, state) do
+    failures = get_in(state.pending, [id, :failures]) || 0
+
+    if failures < @demote_retries do
+      Logger.error(
+        "Vagus.Addon.Backend.Native.Sentinel: demoting #{slug} failed; " <>
+          "retrying in #{state.recheck_ms}ms"
+      )
+
+      Process.send_after(self(), {:recheck, id}, state.recheck_ms)
+      %{state | pending: Map.put(state.pending, id, %{failures: failures + 1, revive?: revive?})}
+    else
+      Logger.error(
+        "Vagus.Addon.Backend.Native.Sentinel: demoting #{slug} failed " <>
+          "#{failures + 1} times; giving up, it may stay :started with no broker"
+      )
+
+      forget(state, id)
+    end
   end
 
   # Pattern-based (not struct-field access) so test fakes with opaque

@@ -128,6 +128,29 @@ defmodule Vagus.Addon.WatchdogTest do
     token
   end
 
+  # A DNS under the default name, the only one the Manager talks to, holding
+  # a record for the add-on's container. The default-named server
+  # checkpoints, so an earlier test's file goes first.
+  defp seed_dns_record(slug) do
+    prev = Application.get_env(:vagus, :dns_enabled)
+    Application.put_env(:vagus, :dns_enabled, true)
+    File.rm(Vagus.RunState.path(:dns))
+
+    on_exit(fn ->
+      Application.put_env(:vagus, :dns_enabled, prev)
+      File.rm(Vagus.RunState.path(:dns))
+    end)
+
+    {:ok, sock} = :gen_udp.open(0, ip: {127, 0, 0, 1})
+    {:ok, port} = :inet.port(sock)
+    :gen_udp.close(sock)
+    start_supervised!({Vagus.DNS, name: Vagus.DNS, ip: {127, 0, 0, 1}, port: port, upstream: nil})
+
+    host = String.replace(slug, "_", "-")
+    :ok = Vagus.DNS.register(host, {172, 30, 33, 9}, Vagus.DNS)
+    host
+  end
+
   # A `:sleep` that parks the sequence at each backoff, so the test learns
   # its pid while it is still alive.
   defp parking_sleep do
@@ -320,9 +343,10 @@ defmodule Vagus.Addon.WatchdogTest do
     refute_received {:backoff, _}
   end
 
-  test "giving up records a dead add-on :stopped and revokes its token" do
+  test "giving up records a dead add-on :stopped, drops its DNS record and keeps its token" do
     slug = unique_slug("wd")
     token = seed_real(slug)
+    host = seed_dns_record(slug)
     set_manager_result(always({:error, :boom}))
 
     pid =
@@ -334,18 +358,21 @@ defmodule Vagus.Addon.WatchdogTest do
 
     send(pid, die_event(slug))
     assert_receive {:start_slug, ^slug}, 5_000
-    assert {:ok, %{slug: ^slug}} = Registry.identity_for_token(token)
+    assert {:ok, _ip} = Vagus.DNS.resolve(host, Vagus.DNS)
 
     assert run_to_give_up() == :normal
     assert {:ok, %{state: :stopped}} = State.get(slug)
-    assert :error = Registry.identity_for_token(token)
+    assert :error = Vagus.DNS.resolve(host, Vagus.DNS)
+    assert {:ok, %{slug: ^slug}} = Registry.identity_for_token(token)
   end
 
   # Something else started it after the last failed attempt.
-  test "giving up leaves an add-on that is running after all :started, with its token" do
+  test "giving up leaves an add-on that is running after all :started, with its DNS record" do
     slug = unique_slug("wd")
-    token = seed_real(slug)
+    seed_real(slug)
+    host = seed_dns_record(slug)
     :ok = Fake.start("addon_#{slug}")
+    on_exit(&Fake.reset_calls/0)
     set_manager_result(always({:error, :boom}))
 
     pid =
@@ -361,7 +388,7 @@ defmodule Vagus.Addon.WatchdogTest do
 
     assert_received {:demote, ^slug}
     assert {:ok, %{state: :started}} = State.get(slug)
-    assert {:ok, %{slug: ^slug}} = Registry.identity_for_token(token)
+    assert {:ok, _ip} = Vagus.DNS.resolve(host, Vagus.DNS)
     assert log =~ "#{slug} is running after all"
   end
 
@@ -395,7 +422,7 @@ defmodule Vagus.Addon.WatchdogTest do
       log = capture_log(fn -> assert run_to_give_up() == :normal end)
 
       assert_received {:demote, ^slug}
-      assert log =~ "demoting #{slug} #{unquote(logged)};"
+      assert log =~ "demoting #{slug} #{unquote(logged)},"
       refute log =~ "boom"
     end
   end

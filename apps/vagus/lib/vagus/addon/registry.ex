@@ -1,6 +1,6 @@
 defmodule Vagus.Addon.Registry do
   @moduledoc """
-  Maps a running add-on's per-start Supervisor token to its identity + API
+  Maps an installed add-on's per-start Supervisor token to its identity + API
   grants, so the emulator can resolve who is calling the add-on-facing
   endpoints (`/services`, `/discovery`, `/auth`) and what they're allowed to do
   (`docs/contract-2026.7-m4-addendum.md` §A3 — the Supervisor's `REQUEST_FROM`
@@ -40,12 +40,14 @@ defmodule Vagus.Addon.Registry do
   ## Restarts
 
   Every registration is checkpointed to `Vagus.RunState` (`opts[:path]`) and
-  read back in `init/1`, so running add-ons stay authenticated across a
-  crash here. `init/1` loads synchronously — the file is tiny and in RAM —
-  so no caller ever sees a registry that is up but not yet filled. The
-  checkpoint lives one application run: the directory is wiped at app start
-  and sits on tmpfs, so neither an app restart nor a reboot can revive a
-  token whose container is gone.
+  read back in `init/1`, so add-ons stay authenticated across a crash here.
+  `init/1` loads synchronously — the file is tiny and in RAM — so no caller
+  ever sees a registry that is up but not yet filled.
+
+  A registration lasts for the application run: the add-on's next start
+  replaces its token, and only its uninstall removes it — not a stop, as in
+  the real Supervisor. The checkpoint directory is wiped at app start and
+  sits on tmpfs, and add-ons get new tokens when they start.
 
   Only the default-named instance checkpoints unless `:path` is given, so a
   privately-named one stays memory-only.
@@ -82,7 +84,7 @@ defmodule Vagus.Addon.Registry do
     GenServer.call(server, {:register, token, identity}, timeout)
   end
 
-  @doc "Removes an add-on's registration by slug (e.g. on stop/uninstall)."
+  @doc "Removes an add-on's registration by slug (on uninstall)."
   @spec unregister_slug(String.t(), GenServer.server(), timeout()) :: :ok
   def unregister_slug(slug, server \\ __MODULE__, timeout \\ 5_000) do
     GenServer.call(server, {:unregister_slug, slug}, timeout)
