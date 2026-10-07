@@ -57,8 +57,8 @@ defmodule Vagus.Resource.Harness do
   @doc """
   Starts the whole subtree. Options: `:controllers`; `:kinds`, for kinds no
   controller owns; `:resync` (default `:infinity`); `:runtime`, further
-  `Vagus.Resource.Runtime` options; `:context`; `:lanes`; `:path` and
-  `:persist` for the store; `:faults`, see `Vagus.Resource.Harness.Faults`.
+  `Vagus.Resource.Runtime` options; `:context`; `:lanes`; `:pulls`; `:path`
+  and `:persist` for the store; `:faults`, see `Vagus.Resource.Harness.Faults`.
 
   Steps that crash are retried after 1 to 8 ms unless `:runtime` sets
   `:backoff`, and verdicts are checked strictly. The system is settled when
@@ -108,7 +108,7 @@ defmodule Vagus.Resource.Harness do
         runtime: runtime,
         kinds: Keyword.get(opts, :kinds, %{}),
         lanes: Keyword.get(opts, :lanes)
-      ] ++ Keyword.take(opts, [:path, :persist])
+      ] ++ Keyword.take(opts, [:path, :persist, :pulls])
 
     start_supervised!(Supervisor.child_spec({Resource.Supervisor, tree}, id: instance))
 

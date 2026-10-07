@@ -22,23 +22,39 @@ defmodule Vagus.Runtime.Events do
   Engine-API versions silently ignore filters anyway): only
   `Type == "container"` events whose Actor attributes carry the
   `supervisor_managed` label key, whose container name starts with
-  `addon_`, or whose name equals `Vagus.Core.Container.name()` (the
+  `app_` or `addon_`, or whose name equals `Vagus.Core.Container.name()` (the
   adopted Core container carries no Vagus label until its first rebuild —
-  name is its only stable identity) are ever sent to a subscriber. A
-  daemon that ignores the server-side filter entirely still can't flood
-  subscribers with unrelated host-container noise.
+  name is its only stable identity) are ever sent to a subscriber
+  (`managed?/2`). A daemon that ignores the server-side filter entirely still
+  can't flood subscribers with unrelated host-container noise.
 
   ## Reconnect
 
   A dropped stream (the request's `:done`, a transport error/close, or a
   failed connect) is followed by a reconnect with exponential backoff — 1s,
   2s, 4s, ... capped at 30s — so a daemon restart or a momentary socket
-  hiccup doesn't spin. The backoff resets to 1s as soon as a connection
-  makes it far enough to receive an HTTP status/headers (i.e. the daemon
-  really was there and responding); a connection that never gets that far
-  keeps escalating. Each drop is logged once at `warning`; the retry ticks
+  hiccup doesn't spin. The retry is a timer in this process: a daemon that
+  is away costs no restart of it, however long. The backoff returns to 1s
+  once a stream has stayed up for ten seconds; a daemon that accepts and
+  then drops every connection is therefore retried at the capped pace too,
+  not once a second. Each drop is logged once at `warning`; the retry ticks
   themselves log at `debug` so a prolonged outage doesn't spam the log at
   warning level once per attempt.
+
+  ## What a drop loses
+
+  A reconnect asks for the events `since` the newest one it had seen, and
+  the daemon replays what it still holds. It holds the last 256 events of
+  every type, in memory, and says nothing when the ones asked for are gone,
+  so the replay narrows the gap and cannot close it. Subscribers are
+  therefore sent `{:docker_events, :gap}` each time a stream is established,
+  ahead of anything it carries, and one that subscribes to a stream already
+  established is sent it at once: from then on it sees events, and what
+  happened before it has to be found by looking.
+
+  The replay starts at the newest event seen, inclusive, so that event comes
+  again. It is recognised and dropped here: a subscriber that counts events
+  (crashes within a window) must not be handed the same crash twice.
 
   ## Bounded memory
 
@@ -62,6 +78,8 @@ defmodule Vagus.Runtime.Events do
 
   @initial_backoff_ms 1_000
   @max_backoff_ms 30_000
+  @stable_ms 10_000
+  @name_prefixes ["app_", "addon_"]
   # Caps the pending (no-newline-yet) line buffer so a corrupt/adversarial
   # stream can't exhaust memory on a 1GB device.
   @max_buffer_bytes 1_048_576
@@ -78,12 +96,19 @@ defmodule Vagus.Runtime.Events do
 
   ## Public API
 
+  @doc """
+  Options: `:name`, `:socket`, `:backoff` (`{initial_ms, max_ms}`) and
+  `:stable_after` (milliseconds a stream must last before the backoff
+  returns to its initial value).
+  """
+  @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts \\ []) do
     GenServer.start_link(__MODULE__, opts, name: Keyword.get(opts, :name, __MODULE__))
   end
 
   @doc """
-  Subscribes the calling process to `{:docker_event, event}` messages. The
+  Subscribes the calling process to `{:docker_event, event}` messages, and
+  to `{:docker_events, :gap}` (see the moduledoc). The
   server monitors the caller and drops it from the subscriber list on
   `:DOWN` — a crashed/dead subscriber is pruned automatically, never leaked.
   """
@@ -98,17 +123,39 @@ defmodule Vagus.Runtime.Events do
     GenServer.call(server, {:unsubscribe, self()})
   end
 
+  @doc """
+  Whether a container is one of ours: it carries the `supervisor_managed`
+  label, is named as an app container (`app_`, and `addon_` for those made
+  before the rename), or is Core's.
+  """
+  @spec managed?(String.t() | nil, map()) :: boolean()
+  def managed?(name, labels) do
+    Map.has_key?(labels, "supervisor_managed") or
+      (is_binary(name) and
+         (String.starts_with?(name, @name_prefixes) or name == Vagus.Core.Container.name()))
+  end
+
   ## GenServer
 
   @impl GenServer
   def init(opts) do
+    {initial, max} = Keyword.get(opts, :backoff, {@initial_backoff_ms, @max_backoff_ms})
+
     state = %{
       socket: Keyword.get(opts, :socket, Docker.socket_path()),
       conn: nil,
       request_ref: nil,
       buffer: "",
       subscribers: %{},
-      backoff_ms: @initial_backoff_ms,
+      backoff: {initial, max},
+      backoff_ms: initial,
+      stable_after: Keyword.get(opts, :stable_after, @stable_ms),
+      # True between a 200 and the drop of that stream.
+      streaming?: false,
+      # The newest `timeNano` seen on any stream, and the events seen with
+      # exactly that time: what a replay `since` it will send again.
+      last_nano: nil,
+      seen_at_last: MapSet.new(),
       # The pending :connect retry timer, if any — kept so a second drop can
       # never arm a second retry loop beside it.
       reconnect_timer: nil
@@ -126,6 +173,8 @@ defmodule Vagus.Runtime.Events do
       if Map.has_key?(subs, pid) do
         subs
       else
+        # It has seen nothing of a stream already running.
+        if state.streaming?, do: send(pid, {:docker_events, :gap})
         Map.put(subs, pid, Process.monitor(pid))
       end
 
@@ -150,6 +199,13 @@ defmodule Vagus.Runtime.Events do
     Logger.debug("Vagus.Runtime.Events: attempting to (re)connect to #{state.socket}")
     {:noreply, do_connect(%{state | reconnect_timer: nil})}
   end
+
+  # The request ref is the token: a timer armed for a stream since dropped
+  # must not reset the backoff of its successor's retries.
+  def handle_info({:stable, ref}, %{request_ref: ref, backoff: {initial, _max}} = state),
+    do: {:noreply, %{state | backoff_ms: initial}}
+
+  def handle_info({:stable, _ref}, state), do: {:noreply, state}
 
   def handle_info({:DOWN, ref, :process, pid, _reason}, %{subscribers: subs} = state) do
     case Map.fetch(subs, pid) do
@@ -191,7 +247,7 @@ defmodule Vagus.Runtime.Events do
   defp do_connect(state) do
     filters = URI.encode_www_form(Jason.encode!(%{"type" => ["container"]}))
 
-    path = "/events?filters=" <> filters
+    path = "/events?filters=" <> filters <> since(state.last_nano)
 
     case Mint.HTTP.connect(:http, {:local, state.socket}, 0, hostname: "localhost", mode: :active) do
       {:ok, conn} ->
@@ -209,13 +265,20 @@ defmodule Vagus.Runtime.Events do
     end
   end
 
+  # Nothing before the first event: there is nothing to resume from, and
+  # without `since` the daemon replays nothing. Seconds with a nine-digit
+  # fraction is the form the daemon parses to the nanosecond.
+  defp since(nil), do: ""
+
+  defp since(nano) do
+    fraction = nano |> rem(1_000_000_000) |> Integer.to_string() |> String.pad_leading(9, "0")
+    "&since=#{div(nano, 1_000_000_000)}.#{fraction}"
+  end
+
   # Logs the drop exactly once (warning) and arms the retry timer; the retry
   # tick itself (handle_info(:connect, ...)) logs at debug. Backoff for the
-  # *next* schedule_reconnect/2 call is always doubled (capped) here — but a
-  # connection that got at least a status/headers response resets
-  # `backoff_ms` back to the floor first (see handle_response/2), so a stream
-  # that dies after actually talking to the daemon starts its next retry at
-  # 1s rather than continuing to escalate.
+  # *next* schedule_reconnect/2 call is always doubled (capped) here; a
+  # stream that lasted (`:stable_after`) has put it back to the floor first.
   #
   # One drop is scheduled once: when a retry is already pending (e.g.
   # handle_responses/2 saw `:done`/`:error` and the stream error that carried
@@ -225,11 +288,12 @@ defmodule Vagus.Runtime.Events do
   @doc false
   @spec schedule_reconnect(term(), map()) :: map()
   def schedule_reconnect(_reason, %{reconnect_timer: timer} = state) when timer != nil do
-    %{state | conn: nil, request_ref: nil, buffer: ""}
+    %{state | conn: nil, request_ref: nil, buffer: "", streaming?: false}
   end
 
   def schedule_reconnect(reason, state) do
     delay = state.backoff_ms
+    {_initial, max} = state.backoff
 
     Logger.warning(
       "Vagus.Runtime.Events: docker-events stream dropped (#{inspect(reason)}); reconnecting in #{delay}ms"
@@ -241,7 +305,8 @@ defmodule Vagus.Runtime.Events do
         conn: nil,
         request_ref: nil,
         buffer: "",
-        backoff_ms: min(delay * 2, @max_backoff_ms)
+        streaming?: false,
+        backoff_ms: min(delay * 2, max)
     }
   end
 
@@ -249,17 +314,13 @@ defmodule Vagus.Runtime.Events do
 
   defp handle_responses(responses, state), do: Enum.reduce(responses, state, &handle_response/2)
 
-  defp handle_response({:status, ref, status}, state) do
-    if ref == state.request_ref do
-      Logger.debug("Vagus.Runtime.Events: connected, status #{status}")
-      %{state | backoff_ms: @initial_backoff_ms}
-    else
-      state
-    end
-  end
-
-  defp handle_response({:headers, ref, _headers}, state) do
-    if ref == state.request_ref, do: %{state | backoff_ms: @initial_backoff_ms}, else: state
+  defp handle_response({:status, ref, 200}, %{request_ref: ref} = state) do
+    Logger.debug("Vagus.Runtime.Events: connected")
+    Process.send_after(self(), {:stable, ref}, state.stable_after)
+    # Before any event of this stream: the same sender to the same receiver,
+    # so a subscriber reads the notice first and the replay after it.
+    for {pid, _monitor} <- state.subscribers, do: send(pid, {:docker_events, :gap})
+    %{state | streaming?: true}
   end
 
   defp handle_response({:data, ref, data}, state) do
@@ -290,7 +351,7 @@ defmodule Vagus.Runtime.Events do
 
   defp process_data(data, state) do
     {lines, remainder} = split_lines(state.buffer <> data)
-    Enum.each(lines, &handle_line(&1, state))
+    state = Enum.reduce(lines, state, &handle_line/2)
     %{state | buffer: cap_buffer(remainder)}
   end
 
@@ -315,15 +376,44 @@ defmodule Vagus.Runtime.Events do
     end
   end
 
-  defp handle_line("", _state), do: :ok
+  defp handle_line("", state), do: state
 
   defp handle_line(line, state) do
     case Jason.decode(line) do
-      {:ok, event} ->
-        dispatch(event, state)
+      {:ok, %{} = event} ->
+        case fresh(event, state) do
+          {:fresh, state} ->
+            dispatch(event, state)
+            state
 
-      {:error, reason} ->
-        Logger.debug("Vagus.Runtime.Events: malformed event line skipped (#{inspect(reason)})")
+          :replayed ->
+            state
+        end
+
+      _not_an_event ->
+        Logger.debug("Vagus.Runtime.Events: malformed event line skipped")
+        state
+    end
+  end
+
+  # Every event moves the resume point, whether or not it is one of ours:
+  # the daemon's replay is by time, not by container.
+  defp fresh(event, %{last_nano: last} = state) do
+    key = {get_in(event, ["Actor", "ID"]), Map.get(event, "Action")}
+
+    case Map.get(event, "timeNano") do
+      nano when is_integer(nano) and (last == nil or nano > last) ->
+        {:fresh, %{state | last_nano: nano, seen_at_last: MapSet.new([key])}}
+
+      ^last when is_integer(last) ->
+        if MapSet.member?(state.seen_at_last, key),
+          do: :replayed,
+          else: {:fresh, %{state | seen_at_last: MapSet.put(state.seen_at_last, key)}}
+
+      # Older than the newest seen (the daemon stamps an event before it
+      # queues it, so two can swap), or carrying no time at all.
+      _older_or_untimed ->
+        {:fresh, state}
     end
   end
 
@@ -335,12 +425,7 @@ defmodule Vagus.Runtime.Events do
     # Core-name pass-through: the adopted Core container has no Vagus label
     # (and won't until a rebuild), so its fixed name is its identity here.
     # Container.name/0 is an Application.get_env read — cheap per event.
-    managed? =
-      Map.has_key?(attributes, "supervisor_managed") or
-        (is_binary(name) and
-           (String.starts_with?(name, "addon_") or name == Vagus.Core.Container.name()))
-
-    if Map.get(event, "Type") == "container" and managed? do
+    if Map.get(event, "Type") == "container" and managed?(name, attributes) do
       payload = %{
         action: Map.get(event, "Action"),
         name: name,

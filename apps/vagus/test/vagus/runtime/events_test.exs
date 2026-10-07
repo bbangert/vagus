@@ -290,6 +290,280 @@ defmodule Vagus.Runtime.EventsTest do
     assert Process.alive?(events_pid)
   end
 
+  describe "gaps, resuming and replays (FakeEngine model)" do
+    alias Vagus.Test.FakeEngine
+    alias Vagus.Test.FakeEngine.Model
+
+    @describetag :capture_log
+
+    setup do
+      engine = FakeEngine.start_model(ring: 4)
+      on_exit(fn -> FakeEngine.stop(engine) end)
+      %{engine: engine}
+    end
+
+    # Retries within milliseconds, and never treats a stream as settled.
+    defp start_resuming(engine, opts \\ []) do
+      name = unique_name()
+      opts = Keyword.merge([backoff: {5, 20}, stable_after: 60_000], opts)
+      pid = start_supervised!({Events, [name: name, socket: engine.socket] ++ opts})
+      :ok = Events.subscribe(name)
+      assert_receive {:docker_events, :gap}, 2_000
+      pid
+    end
+
+    # Drops the stream and returns once the worker is on a new one.
+    defp reconnect(engine) do
+      Model.drop_event_streams(engine)
+      assert_receive {:docker_events, :gap}, 2_000
+    end
+
+    defp event_requests(engine),
+      do: for(%{path: "/events"} = request <- FakeEngine.requests(engine), do: request.query)
+
+    defp received_events do
+      receive do
+        {:docker_event, event} -> [{event.action, event.name} | received_events()]
+      after
+        100 -> []
+      end
+    end
+
+    test "a subscriber is told of a gap once when the first stream is established", %{
+      engine: engine
+    } do
+      start_resuming(engine)
+      refute_receive {:docker_events, :gap}, 100
+    end
+
+    test "a subscriber joining an established stream is told of a gap at once", %{engine: engine} do
+      pid = start_resuming(engine)
+
+      task =
+        Task.async(fn ->
+          :ok = Events.subscribe(pid)
+
+          receive do
+            {:docker_events, :gap} -> :told
+          after
+            2_000 -> :not_told
+          end
+        end)
+
+      assert Task.await(task) == :told
+    end
+
+    test "every reconnect is followed by a gap notice", %{engine: engine} do
+      start_resuming(engine)
+
+      reconnect(engine)
+      reconnect(engine)
+
+      assert length(event_requests(engine)) == 3
+    end
+
+    test "the first request asks for no replay; a reconnect asks since the newest event seen", %{
+      engine: engine
+    } do
+      start_resuming(engine)
+      nano = Model.emit(engine, "start", "app_a")
+      assert_receive {:docker_event, %{time_nano: ^nano}}, 2_000
+
+      reconnect(engine)
+
+      assert [first, second] = event_requests(engine)
+      refute is_map_key(first, "since")
+
+      fraction = nano |> rem(1_000_000_000) |> Integer.to_string() |> String.pad_leading(9, "0")
+      assert second["since"] == "#{div(nano, 1_000_000_000)}.#{fraction}"
+    end
+
+    test "an event missed while disconnected is replayed, after the gap notice", %{engine: engine} do
+      start_resuming(engine)
+      Model.emit(engine, "start", "app_a")
+      assert_receive {:docker_event, %{action: "start"}}, 2_000
+
+      Model.drop_event_streams(engine)
+      Model.emit(engine, "die", "app_a", %{"exitCode" => "3"})
+
+      # Both come from the worker, so the order they are read in is the
+      # order it sent them.
+      first =
+        receive do
+          {:docker_events, :gap} -> :gap
+          {:docker_event, %{action: "die"}} -> :event
+        after
+          2_000 -> flunk("neither a gap notice nor the replayed event")
+        end
+
+      assert first == :gap
+      assert_receive {:docker_event, %{action: "die", name: "app_a", exit_code: 3}}, 2_000
+    end
+
+    test "the replay's copy of an event already delivered is not delivered again", %{
+      engine: engine
+    } do
+      start_resuming(engine)
+      Model.emit(engine, "die", "app_a")
+      assert_receive {:docker_event, %{action: "die"}}, 2_000
+
+      reconnect(engine)
+      Model.emit(engine, "start", "app_a")
+
+      # The engine replayed the die (its replay is inclusive); only what is
+      # new comes through.
+      assert_receive {:docker_event, %{action: "start"}}, 2_000
+      assert received_events() == []
+    end
+
+    test "what the engine's ring has dropped is lost, and the gap notice still comes", %{
+      engine: engine
+    } do
+      start_resuming(engine)
+      Model.emit(engine, "start", "app_seen")
+      assert_receive {:docker_event, %{name: "app_seen"}}, 2_000
+
+      Model.drop_event_streams(engine)
+      for n <- 1..6, do: Model.emit(engine, "die", "app_#{n}")
+
+      assert_receive {:docker_events, :gap}, 2_000
+      # The ring holds four.
+      assert received_events() == for(n <- 3..6, do: {"die", "app_#{n}"})
+    end
+
+    test "events for app_, addon_ and Core's container are forwarded, others are not", %{
+      engine: engine
+    } do
+      start_resuming(engine)
+
+      for name <- [
+            "bystander",
+            "app_new",
+            "my_app_x",
+            "addon_old",
+            "application",
+            "homeassistant"
+          ],
+          do: Model.emit(engine, "start", name)
+
+      assert received_events() == [
+               {"start", "app_new"},
+               {"start", "addon_old"},
+               {"start", "homeassistant"}
+             ]
+    end
+
+    test "a restart by the engine's policy arrives as die, then start", %{engine: engine} do
+      start_resuming(engine)
+      Model.put_container(engine, "homeassistant", restart_policy: "unless-stopped")
+
+      Model.crash(engine, "homeassistant", 1)
+
+      assert received_events() == [{"die", "homeassistant"}, {"start", "homeassistant"}]
+    end
+
+    test "managed?/2 is the label, the two prefixes, or Core's name" do
+      assert Events.managed?("app_x", %{})
+      assert Events.managed?("addon_x", %{})
+      assert Events.managed?(Vagus.Core.Container.name(), %{})
+      assert Events.managed?("anything", %{"supervisor_managed" => ""})
+
+      refute Events.managed?("application", %{})
+      refute Events.managed?("my_app_x", %{})
+      refute Events.managed?("homeassistant2", %{})
+      refute Events.managed?(nil, %{})
+    end
+
+    test "a stream that drops before it has lasted leaves the back-off raised", %{engine: engine} do
+      pid = start_resuming(engine, backoff: {5, 1_000})
+
+      reconnect(engine)
+      reconnect(engine)
+
+      # 5 ms and 10 ms were waited; the next wait is 20 ms.
+      assert :sys.get_state(pid).backoff_ms == 20
+    end
+
+    test "a stream that has lasted puts the back-off back to its start", %{engine: engine} do
+      pid = start_resuming(engine, backoff: {5, 1_000}, stable_after: 60_000)
+      reconnect(engine)
+      assert :sys.get_state(pid).backoff_ms == 10
+
+      # The timer's message for the stream now open, without the wait.
+      send(pid, {:stable, :sys.get_state(pid).request_ref})
+      assert :sys.get_state(pid).backoff_ms == 5
+    end
+
+    test "the lasted-timer of a stream since dropped resets nothing", %{engine: engine} do
+      pid = start_resuming(engine, backoff: {5, 1_000})
+      stale = :sys.get_state(pid).request_ref
+      reconnect(engine)
+
+      send(pid, {:stable, stale})
+      assert :sys.get_state(pid).backoff_ms == 10
+    end
+
+    test "an engine that is away is retried by the same process, at a capped pace" do
+      name = unique_name()
+      missing = "/tmp/vagus-ev-none-#{System.unique_integer([:positive])}.sock"
+
+      pid = start_supervised!({Events, name: name, socket: missing, backoff: {1, 4}})
+      :erlang.trace(pid, true, [:receive])
+
+      for _ <- 1..6, do: assert_receive({:trace, ^pid, :receive, :connect}, 2_000)
+
+      assert Process.whereis(name) == pid
+      assert :sys.get_state(pid).backoff_ms == 4
+    end
+  end
+
+  describe "events that share a time (inline daemon)" do
+    defp timed(action, id, nano) do
+      Jason.encode!(%{
+        "Action" => action,
+        "Type" => "container",
+        "Actor" => %{"ID" => id, "Attributes" => %{"name" => "app_" <> id}},
+        "timeNano" => nano
+      }) <> "\n"
+    end
+
+    setup %{path: path, listen: listen} do
+      start_events(unique_name(), path)
+      {sock, _head} = accept_conn(listen)
+      send_ok_headers(sock)
+      %{sock: sock}
+    end
+
+    test "two different events with one timeNano are both delivered", %{sock: sock} do
+      send_chunk(sock, timed("die", "a", 5) <> timed("die", "b", 5) <> timed("start", "a", 5))
+
+      assert_receive {:docker_event, %{action: "die", name: "app_a"}}, 1_000
+      assert_receive {:docker_event, %{action: "die", name: "app_b"}}, 1_000
+      assert_receive {:docker_event, %{action: "start", name: "app_a"}}, 1_000
+    end
+
+    test "an event stamped earlier than the newest seen is delivered", %{sock: sock} do
+      send_chunk(sock, timed("start", "a", 9) <> timed("die", "b", 7))
+
+      assert_receive {:docker_event, %{action: "start", name: "app_a"}}, 1_000
+      assert_receive {:docker_event, %{action: "die", name: "app_b"}}, 1_000
+    end
+
+    test "an event with no time is delivered, each time it comes", %{sock: sock} do
+      line =
+        Jason.encode!(%{
+          "Action" => "die",
+          "Type" => "container",
+          "Actor" => %{"ID" => "a", "Attributes" => %{"name" => "app_a"}}
+        }) <> "\n"
+
+      send_chunk(sock, line <> line)
+
+      assert_receive {:docker_event, %{action: "die", time_nano: nil}}, 1_000
+      assert_receive {:docker_event, %{action: "die", time_nano: nil}}, 1_000
+    end
+  end
+
   describe "schedule_reconnect/2" do
     import ExUnit.CaptureLog
 
@@ -298,7 +572,9 @@ defmodule Vagus.Runtime.EventsTest do
         conn: :conn,
         request_ref: make_ref(),
         buffer: "x",
+        backoff: {1_000, 30_000},
         backoff_ms: backoff_ms,
+        streaming?: true,
         reconnect_timer: nil
       }
     end
@@ -319,6 +595,17 @@ defmodule Vagus.Runtime.EventsTest do
       assert length(Regex.scan(~r/docker-events stream dropped/, log)) == 1
 
       Process.cancel_timer(state.reconnect_timer)
+    end
+
+    test "each drop doubles the wait for the next, up to the cap" do
+      waits =
+        Enum.map_reduce(1..5, %{drop_state(1_000) | backoff: {1_000, 4_000}}, fn _drop, state ->
+          {state, _log} = with_log(fn -> Events.schedule_reconnect(:stream_ended, state) end)
+          Process.cancel_timer(state.reconnect_timer)
+          {state.backoff_ms, %{state | reconnect_timer: nil}}
+        end)
+
+      assert elem(waits, 0) == [2_000, 4_000, 4_000, 4_000, 4_000]
     end
   end
 end

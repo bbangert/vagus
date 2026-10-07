@@ -28,9 +28,10 @@ defmodule Vagus.Resource.Runtime do
 
   Controllers are level-triggered, so a notification is only a hint to look.
   Whatever one missed is found by a resync, which looks at every resource of
-  the kind: at start, every `:resync` milliseconds, and on `resync/2`, which
-  the engine's event stream calls after each reconnect because it cannot say
-  what it dropped.
+  the kind: at start, every `:resync` milliseconds, and on `resync/2`, for
+  the engine's event stream after each reconnect because it cannot say
+  what it dropped. `enqueue/3` is the hint for one resource, from a source
+  the store does not announce.
 
   While the host is shutting down (`:shutdown?`) no step starts and a step
   in flight stops before its next write or action: the containers the
@@ -108,6 +109,17 @@ defmodule Vagus.Resource.Runtime do
   @spec resync(module(), keyword()) :: :ok
   def resync(controller, opts \\ []),
     do: GenServer.cast(name(instance(opts), controller), :resync)
+
+  @doc """
+  Looks at one resource again. For whoever knows that something outside the
+  store changed for it, which no notification announces: an engine event
+  about its container, a pull it waits for that has ended. A name the kind
+  does not hold is forgotten at once, and with no runtime nothing is lost:
+  its replacement looks at everything.
+  """
+  @spec enqueue(module(), Resource.name(), keyword()) :: :ok
+  def enqueue(controller, name, opts \\ []),
+    do: GenServer.cast(name(instance(opts), controller), {:enqueue, name})
 
   @spec info(module(), keyword()) :: info()
   def info(controller, opts \\ []), do: GenServer.call(name(instance(opts), controller), :info)
@@ -230,6 +242,8 @@ defmodule Vagus.Resource.Runtime do
   @impl true
   def handle_cast(:resync, state), do: {:noreply, state |> look_again() |> settle()}
 
+  def handle_cast({:enqueue, name}, state), do: {:noreply, state |> queue(name) |> settle()}
+
   @impl true
   def handle_info({Watch, _event, _meta}, %{deliver_events: false} = state),
     do: {:noreply, state}
@@ -239,7 +253,7 @@ defmodule Vagus.Resource.Runtime do
 
     state.refs_in
     |> Map.get({kind, name}, [])
-    |> Enum.reduce(state, &enqueue(&2, &1))
+    |> Enum.reduce(state, &queue(&2, &1))
     |> settle()
     |> noreply()
   end
@@ -253,7 +267,7 @@ defmodule Vagus.Resource.Runtime do
   def handle_info({:requeue, name, uid, token}, state) do
     case record(state, name, uid) do
       %{timer: {_timer, ^token}} = record ->
-        {:noreply, state |> put_record(name, %{record | timer: nil}) |> enqueue(name) |> settle()}
+        {:noreply, state |> put_record(name, %{record | timer: nil}) |> queue(name) |> settle()}
 
       _stale ->
         {:noreply, state}
@@ -349,7 +363,7 @@ defmodule Vagus.Resource.Runtime do
   end
 
   defp own(state, :changed, %{name: name, uid: uid}),
-    do: state |> seen(name, uid) |> enqueue(name)
+    do: state |> seen(name, uid) |> queue(name)
 
   # Only what was known of the resource that went: a removal read late must
   # not cost its successor anything.
@@ -375,7 +389,7 @@ defmodule Vagus.Resource.Runtime do
 
     state =
       Enum.reduce(listed, state, fn {name, uid}, state ->
-        state |> seen(name, uid) |> enqueue(name)
+        state |> seen(name, uid) |> queue(name)
       end)
 
     # What a missed removal notice left behind.
@@ -407,7 +421,7 @@ defmodule Vagus.Resource.Runtime do
     %{state | watched: Enum.into(kinds, state.watched)}
   end
 
-  defp enqueue(state, name) do
+  defp queue(state, name) do
     cond do
       not is_map_key(state.in_flight, name) or state.double_step ->
         %{state | queued: MapSet.put(state.queued, name)}
@@ -485,7 +499,7 @@ defmodule Vagus.Resource.Runtime do
       # ended or crashed and whether or not the notices have been read.
       # Nothing it found is true of this one, which is only looked at.
       %Resource{uid: other} when other != uid ->
-        state |> seen(name, other) |> enqueue(name)
+        state |> seen(name, other) |> queue(name)
 
       %Resource{} ->
         state = disarm(state, name, uid)
@@ -511,7 +525,7 @@ defmodule Vagus.Resource.Runtime do
   # the step's read and that commit. The cost is that a real change during
   # a failing step waits for the back-off, at most its cap.
   defp again?(state, name, dirty?, new_reference?, carried?) do
-    if new_reference? or (dirty? and not carried?), do: enqueue(state, name), else: state
+    if new_reference? or (dirty? and not carried?), do: queue(state, name), else: state
   end
 
   # Each returns whether it armed a timer that is to carry the next pass.
@@ -527,7 +541,7 @@ defmodule Vagus.Resource.Runtime do
 
       case next do
         :rest -> {put_record(state, name, record), false}
-        :now -> {state |> put_record(name, record) |> enqueue(name), false}
+        :now -> {state |> put_record(name, record) |> queue(name), false}
         {:after, ms} -> {arm(state, name, record, ms), false}
       end
     end
@@ -553,10 +567,10 @@ defmodule Vagus.Resource.Runtime do
 
     if record.failures > 0,
       do: {paced(state, name, record), true},
-      else: {state |> put_record(name, %{record | failures: 1}) |> enqueue(name), false}
+      else: {state |> put_record(name, %{record | failures: 1}) |> queue(name), false}
   end
 
-  defp outcome(state, name, _uid, %{outcome: :gated}), do: {enqueue(state, name), false}
+  defp outcome(state, name, _uid, %{outcome: :gated}), do: {queue(state, name), false}
   defp outcome(state, _name, _uid, %{outcome: :gone}), do: {state, false}
 
   defp outcome(state, name, uid, crashed) do

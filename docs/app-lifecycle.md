@@ -6,13 +6,14 @@ reconciliation model: desired state is stored, observed state is derived, and
 controllers close the gap. This page is the vocabulary for that model, on
 the `redesign/app-lifecycle` branch; each change there keeps it current.
 
-What exists so far is the generic machinery under `Vagus.Resource`: the
+What exists so far is the generic machinery under `Vagus.Resource` (the
 resource, the store, and everything in "Controllers and runtimes",
-"Verdicts", "Clocks" and the generic half of "Deletion and collection".
-The rest is the design it is built for and has no code yet: the App kind and
-its controllers, Update and Backup, the pull worker and the engine's event
-stream, and the commands. No controller is configured, and apps and Core
-still run on the code this replaces.
+"Verdicts", "Clocks" and the generic half of "Deletion and collection") and
+"The engine layer" a controller will act through. The rest is the design
+they are built for and has no code yet: the App kind and its controllers,
+Update and Backup, and the commands. No controller is configured, nothing
+calls the engine layer's new parts, and apps and Core still run on the code
+this replaces.
 
 The HTTP wire toward Core is unchanged: routes stay `/addons`, keys stay
 `addon`, job names keep their upstream names. Only internal names say "app".
@@ -177,15 +178,18 @@ event that woke them, so a missed event is repaired by the next observation.
 The engine's event stream is lossy, and that is the drift a resync exists
 for: a gap in the stream (signalled after every reconnect, `Runtime.resync`),
 a runtime start and a five-minute timer each have every resource of the kind
-looked at again.
+looked at again. `Runtime.enqueue` has one resource looked at again, for a
+change the store does not announce: an event about its container, the end of
+a pull it waits for.
 
 `Vagus.Resource.Lanes` holds a counting semaphore per action class: pulls 1,
 engine calls 4. Only running actions count, and the wait is in the step's
 task, so a waiting app holds nothing and the runtime never waits. The next
 slot goes to the lowest `priority/1` waiting, then to whoever asked first;
 that is all priority orders, since steps themselves all start at once. A
-pull runs in a keyed pull worker whose state `observe` reads; it never
-occupies the app's queue slot, and a stop during a pull cancels it.
+pull is not an action: it runs in the pull worker, whose state `observe`
+reads, so it never occupies the app's queue slot, and a stop during a pull
+cancels it (see "The engine layer").
 
 While the host is shutting down every runtime rests and writes nothing;
 otherwise the containers the shutdown stops would be read as crashes. While
@@ -200,6 +204,8 @@ Vagus.Resource.Supervisor        :rest_for_one
 ├─ Watch                         Registry, duplicate keys
 ├─ Store                         single writer, persistence
 ├─ Lanes                         action semaphores
+├─ App.Pulls                     which pulls run, who waits, their state table
+├─ Task.Supervisor               the pulls
 └─ Controllers.Supervisor        :one_for_one
    └─ one per controller         :one_for_all
       ├─ Task.Supervisor
@@ -208,7 +214,58 @@ Vagus.Resource.Supervisor        :rest_for_one
 
 Each pair is `:one_for_all` because steps are `async_nolink` tasks: one in
 flight would otherwise outlive its runtime, and the replacement could start a
-second action for the same key. There is no per-app process.
+second action for the same key. There is no per-app process. The pull worker
+stands before its tasks for the same reason, and before the runtimes because
+their resources are the waiters a new worker has forgotten: they start
+again and look at everything.
+
+## The engine layer
+
+**Client.** `Vagus.Runtime.Docker` makes one connection per call. Its 60 s
+receive timeout is how long the engine may stay silent, not a deadline, and
+a call can pass its own (`:recv_timeout`). `stop` needs that: the engine
+answers a stop only when the container has exited, so the call waits the
+grace plus 15 s, and a call that gives up does not stop the stop.
+`Docker.failure/1` puts any error of the client into one shape:
+`{:unreachable, reason}` (nothing at the socket), `{:timeout, which}`,
+`{:status, status, message}` with the engine's own text, `{:stream,
+message}` (a pull that answered 200 and then failed), `{:transport, reason}`.
+
+**Events.** `Vagus.Runtime.Events` holds the engine's event stream and passes
+on the events of our containers: those labelled `supervisor_managed`, named
+`app_…` or `addon_…`, or named as Core's. A dropped stream is retried from a
+timer in that process, 1 s doubling to 30 s. The reconnect asks for the
+events `since` the newest one seen and the engine replays what it still has:
+its last 256 events of any kind, with no mark when the ones asked for are
+gone. So each time a stream is established subscribers get
+`{:docker_events, :gap}` before anything it carries, and a subscriber that
+joins a running stream gets it at once. The replay begins with the event
+already seen; that copy is dropped, because a subscriber that counts crashes
+must not count one twice.
+
+**Backends.** `Vagus.App.Backend` is what a controller's `observe/2` and
+`act/3` call: `observe` (by container name: `:absent`, or the instance's id,
+state, exit code, start time, restart count, health, image, labels,
+environment and address), `image_present?`, and the actions `create`,
+`start`, `stop`, `remove`, `remove_image`, each one engine call. An action
+succeeds when its end state already holds, except `create` on a name in use
+(`:already_exists`), since what is there was made from another config. With
+the engine away `observe` is `{:unavailable, :engine_unavailable}`, never
+`:absent`. `Backend.Container.list/1` is the one call that says which of our
+containers exist. `Backend.Native` runs the MQTT broker as a `:temporary`
+subtree of the supervisor that holds native apps: `:absent` or `:running`,
+nothing to create and no image.
+
+**Pulls.** `Vagus.App.Pulls` runs one pull per image reference, each in a
+task holding the `:pull` lane. `request` returns at once and a second
+request for the reference joins the pull; `state` is a table read: `:idle`,
+`{:pulling, progress}` or `{:failed, reason, stamp}`. A failure is kept, with
+when, until the next request, and is not retried by the worker: spacing
+retries is the controller's. A waiter is `{controller, resource name}`; the
+end of a pull (success, failure or cancel) is a `Runtime.enqueue` for each.
+`cancel` withdraws a waiter and, with none left, kills the task, which closes
+the connection, which stops the engine pulling. Progress is summarised in
+the task and passed on at most twice a second.
 
 ## Verdicts
 

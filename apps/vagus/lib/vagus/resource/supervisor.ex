@@ -6,13 +6,20 @@ defmodule Vagus.Resource.Supervisor do
   `:rest_for_one` because each child's replacement invalidates the ones
   after it and none before: new tables mean an empty store, a new `Watch`
   registry has forgotten every subscriber, a new store has forgotten who
-  registered for which kind, and new lanes have forgotten who holds a slot.
+  registered for which kind, new lanes have forgotten who holds a slot, and
+  a new pull worker has forgotten which resources wait for which image.
   A store that restarts alone finds its rows in `Tables` and its subscribers
   in `Watch`; the runtimes, which hold the registrations, restart with it.
+
+  The pull worker comes before the task supervisor its pulls run under, so
+  that the tasks end with it: left running, a pull would hold the lane and
+  an engine connection for a worker that no longer knows of it, beside the
+  second pull its replacement starts for the same image.
   """
 
   use Supervisor
 
+  alias Vagus.App.Pulls
   alias Vagus.Resource
   alias Vagus.Resource.{Controller, Controllers, Lanes, Store, Tables, Watch}
 
@@ -23,6 +30,7 @@ defmodule Vagus.Resource.Supervisor do
       owning one contributes its kind to the store's `:kinds`.
     * `:runtime`, options for every `Vagus.Resource.Runtime`.
     * `:lanes`, `Vagus.Resource.Lanes` caps.
+    * `:pulls`, options for `Vagus.App.Pulls`.
 
   `:path` and `:controllers` default to `config :vagus, :resources_path` and
   `config :vagus, :controllers`, and only for the application's instance.
@@ -46,7 +54,7 @@ defmodule Vagus.Resource.Supervisor do
         opts
       end
 
-    {own, store} = Keyword.split(opts, [:controllers, :runtime, :lanes])
+    {own, store} = Keyword.split(opts, [:controllers, :runtime, :lanes, :pulls])
     # Every controller is asked what it declares here, once. A declaration
     # that raises fails this start with its name, and nothing started below
     # has to call a controller to know its kind or its conditions.
@@ -62,6 +70,10 @@ defmodule Vagus.Resource.Supervisor do
       Watch.child_spec(instance),
       {Store, Keyword.merge(store, instance: instance, kinds: kinds)},
       {Lanes, instance: instance, caps: Keyword.get(own, :lanes)},
+      {Pulls, [instance: instance] ++ Keyword.get(own, :pulls, [])},
+      # No `:max_children`: one task per image being pulled, and those are
+      # the images of the apps installed.
+      {Task.Supervisor, name: Pulls.tasks(instance)},
       {Controllers.Supervisor,
        instance: instance, controllers: declarations, runtime: Keyword.get(own, :runtime, [])}
     ]

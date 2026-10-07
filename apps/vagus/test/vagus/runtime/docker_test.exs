@@ -3,6 +3,7 @@ defmodule Vagus.Runtime.DockerTest do
 
   alias Vagus.Runtime.{Docker, Logs}
   alias Vagus.Test.FakeEngine
+  alias Vagus.Test.FakeEngine.Model
 
   # An 8-byte-framed multiplex record (`Vagus.Runtime.Logs.demux/1`'s
   # counterpart) — `stream` 1 = stdout, 2 = stderr, matching what a
@@ -157,6 +158,365 @@ defmodule Vagus.Runtime.DockerTest do
                Docker.exec_capture("homeassistant", "echo hi", socket: engine.socket)
 
       assert length(FakeEngine.requests(engine)) == 1
+    end
+  end
+
+  describe "receive timeout (hermetic — FakeEngine)" do
+    setup do
+      previous = Application.fetch_env(:vagus, :docker_recv_timeout)
+
+      on_exit(fn ->
+        case previous do
+          {:ok, value} -> Application.put_env(:vagus, :docker_recv_timeout, value)
+          :error -> Application.delete_env(:vagus, :docker_recv_timeout)
+        end
+      end)
+
+      :ok
+    end
+
+    # An engine that holds its answer to a stop for longer than the default
+    # receive timeout, which is cut to 50 ms so that "longer" is 400 ms.
+    defp slow_stop do
+      Application.put_env(:vagus, :docker_recv_timeout, 50)
+      engine = FakeEngine.start([{204, nil, delay: 400}])
+      on_exit(fn -> FakeEngine.stop(engine) end)
+      engine
+    end
+
+    test "the default is 60 s when nothing configures it" do
+      Application.delete_env(:vagus, :docker_recv_timeout)
+      assert Docker.default_recv_timeout() == 60_000
+    end
+
+    test "a stop the engine holds past the default receive timeout fails as a timeout" do
+      engine = slow_stop()
+
+      assert {:error, %Mint.TransportError{reason: :timeout}} =
+               Docker.stop_container("core", socket: engine.socket, timeout: 300)
+    end
+
+    test "the same stop succeeds with a receive timeout of its own" do
+      engine = slow_stop()
+
+      assert :ok =
+               Docker.stop_container("core",
+                 socket: engine.socket,
+                 timeout: 300,
+                 recv_timeout: 5_000
+               )
+
+      assert [%{method: :post, path: "/containers/core/stop", query: %{"t" => "300"}}] =
+               FakeEngine.requests(engine)
+    end
+  end
+
+  describe "pull_image_stream/4 (hermetic — FakeEngine)" do
+    defp scripted(responses, opts \\ []) do
+      engine = FakeEngine.start(responses, opts)
+      on_exit(fn -> FakeEngine.stop(engine) end)
+      engine
+    end
+
+    defp collect(engine, opts \\ []) do
+      Docker.pull_image_stream(
+        "repo/img:1",
+        [],
+        &[&1 | &2],
+        [socket: engine.socket] ++ opts
+      )
+    end
+
+    defp status(text), do: %{"status" => text}
+
+    test "hands every progress line to the function, in order, and returns its accumulator" do
+      lines = [status("Pulling from repo/img"), Model.downloading("l1", 1, 2), status("Digest")]
+      engine = scripted([{:stream, 200, Enum.map(lines, &{:line, &1})}])
+
+      assert {:ok, seen} = collect(engine)
+      assert Enum.reverse(seen) == lines
+
+      assert [%{path: "/images/create", query: %{"fromImage" => "repo/img", "tag" => "1"}}] =
+               FakeEngine.requests(engine)
+    end
+
+    test "a line split across two chunks is one line" do
+      line = Jason.encode!(status("Extracting")) <> "\n"
+      {head, tail} = String.split_at(line, 9)
+      engine = scripted([{:stream, 200, [{:chunk, head}, {:chunk, tail}]}])
+
+      assert {:ok, [%{"status" => "Extracting"}]} = collect(engine)
+    end
+
+    test "an error line after the 200 fails the pull with the engine's message" do
+      engine =
+        scripted([
+          {:stream, 200,
+           [
+             {:line, status("Pulling from repo/img")},
+             {:line,
+              %{
+                "errorDetail" => %{"message" => "manifest unknown"},
+                "error" => "manifest unknown"
+              }},
+             {:line, status("never read")}
+           ]}
+        ])
+
+      assert {:error, {:pull_failed, "manifest unknown"}} = collect(engine)
+    end
+
+    test "an error line with no errorDetail fails the pull too" do
+      engine = scripted([{:stream, 200, [{:line, %{"error" => "toomanyrequests"}}]}])
+
+      assert {:error, {:pull_failed, "toomanyrequests"}} = collect(engine)
+    end
+
+    test "an errorDetail with no error key fails the pull too" do
+      engine =
+        scripted([{:stream, 200, [{:line, %{"errorDetail" => %{"message" => "no space left"}}}]}])
+
+      assert {:error, {:pull_failed, "no space left"}} = collect(engine)
+    end
+
+    test "a refusal before the stream is the status and the engine's body" do
+      engine = scripted([{404, %{"message" => "pull access denied"}}])
+
+      assert {:error, {:pull_failed, {404, %{"message" => "pull access denied"}}}} =
+               collect(engine)
+    end
+
+    test "silence longer than the idle timeout ends the pull, with what came before it" do
+      test = self()
+      engine = scripted([{:stream, 200, [{:line, status("first")}, {:wait, 2_000}]}])
+
+      assert {:error, {:pull_timeout, :idle}} =
+               Docker.pull_image_stream(
+                 "repo/img:1",
+                 nil,
+                 fn line, nil -> send(test, {:line, line}) && nil end,
+                 socket: engine.socket,
+                 idle_timeout: 50
+               )
+
+      assert_received {:line, %{"status" => "first"}}
+    end
+
+    test "a stream that never falls silent still ends at the total timeout" do
+      steps = Enum.flat_map(1..100, &[{:line, status("#{&1}")}, {:wait, 20}])
+      engine = scripted([{:stream, 200, steps}])
+
+      assert {:error, {:pull_timeout, :total}} =
+               collect(engine, idle_timeout: 10_000, total_timeout: 100)
+    end
+
+    test "killing the caller closes the connection" do
+      test = self()
+      engine = scripted([{:stream, 200, [{:line, status("first")}, :stall]}], notify: self())
+
+      pulling = fn _line, nil -> send(test, :pulling) && nil end
+
+      {caller, monitor} =
+        spawn_monitor(fn ->
+          Docker.pull_image_stream("repo/img:1", nil, pulling, socket: engine.socket)
+        end)
+
+      assert_receive :pulling, 2_000
+      Process.exit(caller, :kill)
+      assert_receive {:DOWN, ^monitor, :process, ^caller, :killed}, 2_000
+
+      assert_receive {:fake_engine, :client_closed, "/images/create"}, 2_000
+    end
+
+    test "a stream larger than a buffered response may be is read through, none of it kept" do
+      line = status(String.duplicate("x", 500_000))
+      stream = {:stream, 200, List.duplicate({:line, line}, 36)}
+      engine = scripted([stream, stream])
+
+      count = fn %{"status" => text}, {lines, bytes} -> {lines + 1, bytes + byte_size(text)} end
+
+      assert {:ok, {36, 18_000_000}} =
+               Docker.pull_image_stream("repo/img:1", {0, 0}, count, socket: engine.socket)
+
+      # The same stream through the call that buffers it.
+      assert {:error, :response_too_large} =
+               Docker.pull_image("repo/img:1", socket: engine.socket)
+    end
+
+    test "a line with no end is refused once it passes a megabyte" do
+      engine = scripted([{:stream, 200, [{:chunk, String.duplicate("x", 1_100_000)}]}])
+
+      assert {:error, {:pull_failed, "progress line over" <> _}} = collect(engine)
+    end
+  end
+
+  describe "listing, images and failure shapes (hermetic — FakeEngine model)" do
+    setup do
+      engine = FakeEngine.start_model()
+      on_exit(fn -> FakeEngine.stop(engine) end)
+
+      managed = %{"supervisor_managed" => ""}
+      Model.put_container(engine, "app_a", labels: managed, image: "repo/a:1")
+
+      Model.put_container(engine, "addon_b",
+        labels: Map.put(managed, "tier", "x"),
+        state: "exited"
+      )
+
+      Model.put_container(engine, "homeassistant", state: "exited")
+      Model.put_container(engine, "bystander")
+
+      %{engine: engine, opts: [socket: engine.socket]}
+    end
+
+    defp names(containers),
+      do: containers |> Enum.flat_map(&Docker.summary(&1).names) |> Enum.sort()
+
+    test "without all, only running containers are listed", %{opts: opts} do
+      assert {:ok, listed} = Docker.list_containers(opts)
+      assert names(listed) == ["app_a", "bystander"]
+    end
+
+    test "all: true lists stopped containers as well", %{opts: opts} do
+      assert {:ok, listed} = Docker.list_containers([all: true] ++ opts)
+      assert names(listed) == ["addon_b", "app_a", "bystander", "homeassistant"]
+    end
+
+    test "a label filter keeps the containers carrying the label", %{opts: opts} do
+      filters = %{label: ["supervisor_managed"]}
+      assert {:ok, listed} = Docker.list_containers([all: true, filters: filters] ++ opts)
+      assert names(listed) == ["addon_b", "app_a"]
+    end
+
+    test "a label filter with a value asks for that value", %{opts: opts} do
+      assert {:ok, listed} =
+               Docker.list_containers([all: true, filters: %{label: ["tier=x"]}] ++ opts)
+
+      assert names(listed) == ["addon_b"]
+    end
+
+    test "name filters are alternatives, each matched as an expression", %{opts: opts} do
+      filters = %{name: ["^app_", "^homeassistant$"]}
+      assert {:ok, listed} = Docker.list_containers([all: true, filters: filters] ++ opts)
+      assert names(listed) == ["app_a", "homeassistant"]
+    end
+
+    test "filters travel as one JSON map in the query", %{engine: engine, opts: opts} do
+      {:ok, _} =
+        Docker.list_containers([all: true, filters: %{label: ["l"], name: ["n"]}] ++ opts)
+
+      assert [%{path: "/containers/json", query: %{"all" => "true", "filters" => filters}}] =
+               FakeEngine.requests(engine)
+
+      assert Jason.decode!(filters) == %{"label" => ["l"], "name" => ["n"]}
+    end
+
+    test "no filters, no filters parameter", %{engine: engine, opts: opts} do
+      {:ok, _} = Docker.list_containers(opts)
+      assert [%{query: query}] = FakeEngine.requests(engine)
+      refute is_map_key(query, "filters")
+    end
+
+    test "summary/1 is the listing's id, names, image, state, status and labels", %{opts: opts} do
+      {:ok, listed} = Docker.list_containers([filters: %{name: ["^app_a$"]}] ++ opts)
+
+      assert [
+               %{
+                 id: "id" <> _,
+                 names: ["app_a"],
+                 image: "repo/a:1",
+                 state: "running",
+                 status: "running",
+                 labels: %{"supervisor_managed" => ""}
+               }
+             ] = Enum.map(listed, &Docker.summary/1)
+    end
+
+    test "inspect_image/2 finds a present image and reports an absent one as 404", %{
+      engine: engine,
+      opts: opts
+    } do
+      Model.put_image(engine, "ghcr.io/org/img:1")
+
+      assert {:ok, %{"RepoTags" => ["ghcr.io/org/img:1"]}} =
+               Docker.inspect_image("ghcr.io/org/img:1", opts)
+
+      assert {:error, {:http, 404, "No such image: ghcr.io/org/none:1"}} =
+               Docker.inspect_image("ghcr.io/org/none:1", opts)
+
+      assert {:error, {:invalid_ref, "../x"}} = Docker.inspect_image("../x", opts)
+    end
+
+    test "failure/1: no socket is unreachable" do
+      missing = "/tmp/vagus-none-#{System.unique_integer([:positive])}.sock"
+      assert {:error, reason} = Docker.inspect_container("x", socket: missing)
+      assert Docker.failure(reason) == {:unreachable, :enoent}
+    end
+
+    test "failure/1: a socket nobody listens on is unreachable" do
+      path = "/tmp/vagus-dead-#{System.unique_integer([:positive])}.sock"
+      {:ok, listen} = :gen_tcp.listen(0, [:binary, {:ifaddr, {:local, path}}])
+      :ok = :gen_tcp.close(listen)
+      on_exit(fn -> File.rm(path) end)
+
+      assert {:error, reason} = Docker.inspect_container("x", socket: path)
+      assert Docker.failure(reason) == {:unreachable, :econnrefused}
+    end
+
+    test "failure/1: an engine that stays silent is a timeout" do
+      engine = FakeEngine.start([{200, %{}, delay: 400}])
+      on_exit(fn -> FakeEngine.stop(engine) end)
+
+      assert {:error, reason} =
+               Docker.inspect_container("x", socket: engine.socket, recv_timeout: 30)
+
+      assert Docker.failure(reason) == {:timeout, :recv}
+    end
+
+    test "failure/1: a missing container is the 404 with the engine's message", %{opts: opts} do
+      assert {:error, reason} = Docker.inspect_container("nobody", opts)
+      assert Docker.failure(reason) == {:status, 404, "No such container: nobody"}
+    end
+
+    test "failure/1: a name in use is the 409 with the engine's message", %{
+      engine: engine,
+      opts: opts
+    } do
+      Model.put_image(engine, "repo/a:1")
+
+      assert {:error, reason} =
+               Docker.create_container(%{"Image" => "repo/a:1"}, [name: "app_a"] ++ opts)
+
+      assert {:status, 409, "Conflict. The container name" <> _} = Docker.failure(reason)
+    end
+
+    test "start reports a refusal as before, and with the message when asked for detail", %{
+      engine: engine,
+      opts: opts
+    } do
+      message = "driver failed programming external connectivity: port is already allocated"
+      Model.put_container(engine, "app_p", state: "created", fail_start: message)
+
+      assert {:error, {:http, 500}} = Docker.start_container("app_p", opts)
+      assert Docker.failure({:http, 500}) == {:status, 500, nil}
+
+      assert {:error, {:http, 500, ^message} = reason} =
+               Docker.start_container("app_p", [detail: true] ++ opts)
+
+      assert Docker.failure(reason) == {:status, 500, message}
+    end
+
+    test "failure/1: the other shapes this module returns" do
+      assert Docker.failure({:pull_failed, "manifest unknown"}) == {:stream, "manifest unknown"}
+
+      assert Docker.failure({:pull_failed, {404, %{"message" => "denied"}}}) ==
+               {:status, 404, "denied"}
+
+      assert Docker.failure({:pull_timeout, :idle}) == {:timeout, :idle}
+      assert Docker.failure({:remove_failed, 409, "in progress"}) == {:status, 409, "in progress"}
+      assert Docker.failure(%Mint.TransportError{reason: :closed}) == {:transport, :closed}
+      assert Docker.failure({:invalid_ref, "a/b"}) == {:invalid, {:invalid_ref, "a/b"}}
+      assert Docker.failure(:response_too_large) == {:other, :response_too_large}
     end
   end
 
