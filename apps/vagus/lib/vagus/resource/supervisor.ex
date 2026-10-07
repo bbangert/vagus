@@ -9,6 +9,13 @@ defmodule Vagus.Resource.Supervisor do
   registered for which kind, and new lanes have forgotten who holds a slot.
   A store that restarts alone finds its rows in `Tables` and its subscribers
   in `Watch`; the runtimes, which hold the registrations, restart with it.
+
+  `:services` are children a controller's actions use and that hold lane
+  slots or remember who among the resources waits for them. They stand
+  after the lanes and before the controllers, in the order given, so each
+  is replaced with the lanes and the services before it, and the runtimes
+  with any of them: a runtime that starts looks at every resource, which is
+  how a service that has forgotten its waiters hears from them again.
   """
 
   use Supervisor
@@ -23,6 +30,8 @@ defmodule Vagus.Resource.Supervisor do
       owning one contributes its kind to the store's `:kinds`.
     * `:runtime`, options for every `Vagus.Resource.Runtime`.
     * `:lanes`, `Vagus.Resource.Lanes` caps.
+    * `:services`, child specs started after `Vagus.Resource.Lanes` and
+      before the controllers.
 
   `:path` and `:controllers` default to `config :vagus, :resources_path` and
   `config :vagus, :controllers`, and only for the application's instance.
@@ -46,7 +55,7 @@ defmodule Vagus.Resource.Supervisor do
         opts
       end
 
-    {own, store} = Keyword.split(opts, [:controllers, :runtime, :lanes])
+    {own, store} = Keyword.split(opts, [:controllers, :runtime, :lanes, :services])
     # Every controller is asked what it declares here, once. A declaration
     # that raises fails this start with its name, and nothing started below
     # has to call a controller to know its kind or its conditions.
@@ -57,14 +66,18 @@ defmodule Vagus.Resource.Supervisor do
     # store reads its file before any controller exists to register a kind.
     kinds = Map.merge(Map.new(Keyword.get(store, :kinds, %{})), Controller.kinds(declarations))
 
-    children = [
-      {Tables, instance},
-      Watch.child_spec(instance),
-      {Store, Keyword.merge(store, instance: instance, kinds: kinds)},
-      {Lanes, instance: instance, caps: Keyword.get(own, :lanes)},
-      {Controllers.Supervisor,
-       instance: instance, controllers: declarations, runtime: Keyword.get(own, :runtime, [])}
-    ]
+    children =
+      [
+        {Tables, instance},
+        Watch.child_spec(instance),
+        {Store, Keyword.merge(store, instance: instance, kinds: kinds)},
+        {Lanes, instance: instance, caps: Keyword.get(own, :lanes)}
+      ] ++
+        Keyword.get(own, :services, []) ++
+        [
+          {Controllers.Supervisor,
+           instance: instance, controllers: declarations, runtime: Keyword.get(own, :runtime, [])}
+        ]
 
     # None of these children waits on anything outside the VM, so a crash is
     # a bug to escalate, on the budget the application's other subtrees use.

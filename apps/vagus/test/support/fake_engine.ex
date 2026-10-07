@@ -40,6 +40,23 @@ defmodule Vagus.Test.FakeEngine do
   request that has already arrived, nor block the loop from accepting the
   next connection.
 
+  ## Streams
+
+  A response may also be `{:stream, status, steps}`: chunked, written as the
+  steps say and then ended. A step is `{:line, map}` (one JSON line),
+  `{:chunk, binary}`, `{:raw, binary}` (bytes written as they are, outside
+  the chunk framing), `{:wait, ms}`, `{:run, fun}` (called in the process
+  that writes the response), `:abort` (close without ending the body) or
+  `:stall`: send nothing more and wait for the client to close,
+  then tell the `:notify` process given to `start/2`
+  `{:fake_engine, :client_closed, path}`.
+
+  ## A model instead of a script
+
+  `start_model/1` starts an engine that keeps containers, images and an
+  event ring and answers from them, for code whose calls no script can
+  list in advance. See `Vagus.Test.FakeEngine.Model`.
+
   ## Usage
 
       engine =
@@ -57,12 +74,16 @@ defmodule Vagus.Test.FakeEngine do
   """
 
   @doc "Starts the fake daemon; returns a handle for `requests/1`/`stop/1`."
-  @spec start([
-          {pos_integer(), map() | binary() | nil}
-          | {pos_integer(), map() | binary() | nil, keyword()}
-        ]) ::
+  @spec start(
+          [
+            {pos_integer(), map() | binary() | nil}
+            | {pos_integer(), map() | binary() | nil, keyword()}
+            | {:stream, pos_integer(), [term()]}
+          ],
+          keyword()
+        ) ::
           map()
-  def start(responses) when is_list(responses) do
+  def start(responses, opts \\ []) when is_list(responses) do
     path = socket_path()
     # A leftover socket file from a previous run collides (:eaddrinuse) —
     # same precaution `events_test.exs` takes.
@@ -77,13 +98,27 @@ defmodule Vagus.Test.FakeEngine do
         backlog: 128
       ])
 
-    pid = spawn_link(fn -> loop(listen, %{responses: responses, log: []}) end)
+    pid =
+      spawn_link(fn ->
+        loop(listen, %{responses: responses, log: [], notify: opts[:notify]})
+      end)
 
     %{socket: path, listen: listen, pid: pid}
   end
 
+  @doc "Starts `Vagus.Test.FakeEngine.Model`; the handle works with `requests/1` and `stop/1` too."
+  @spec start_model(keyword()) :: map()
+  def start_model(opts \\ []) do
+    path = Keyword.get_lazy(opts, :socket, &socket_path/0)
+    _ = File.rm(path)
+    {:ok, model} = __MODULE__.Model.start_link(Keyword.put(opts, :socket, path))
+    %{socket: path, model: model}
+  end
+
   @doc "Recorded requests, oldest first: `%{method:, path:, query:, body:}`."
   @spec requests(map()) :: [map()]
+  def requests(%{model: model}), do: GenServer.call(model, :requests)
+
   def requests(%{pid: pid}) do
     send(pid, {:get_requests, self()})
 
@@ -96,6 +131,20 @@ defmodule Vagus.Test.FakeEngine do
 
   @doc "Stops the fake daemon and removes its socket file."
   @spec stop(map()) :: :ok
+  def stop(%{model: model, socket: path}) do
+    # Unlinked first: the caller may be the test this is linked to.
+    Process.unlink(model)
+    ref = Process.monitor(model)
+    Process.exit(model, :kill)
+
+    receive do
+      {:DOWN, ^ref, :process, _pid, _reason} -> :ok
+    end
+
+    File.rm(path)
+    :ok
+  end
+
   def stop(%{listen: listen, socket: path, pid: pid}) do
     :gen_tcp.close(listen)
     Process.exit(pid, :kill)
@@ -137,8 +186,10 @@ defmodule Vagus.Test.FakeEngine do
         # response can't also stall the request being recorded (`requests/1`
         # reflects it immediately) or the loop's ability to keep polling its
         # mailbox/accepting while that response is held open.
+        notify = state.notify
+
         spawn(fn ->
-          send_scripted(sock, resp)
+          send_scripted(sock, resp, path, notify)
           :gen_tcp.close(sock)
         end)
 
@@ -155,9 +206,12 @@ defmodule Vagus.Test.FakeEngine do
   defp pop_response([]),
     do: {{500, %{"message" => "Vagus.Test.FakeEngine: response script exhausted"}}, []}
 
-  defp send_scripted(sock, {status, body}), do: send_response(sock, status, body)
+  defp send_scripted(sock, {:stream, status, steps}, path, notify),
+    do: stream(sock, status, steps, path, notify)
 
-  defp send_scripted(sock, {status, body, opts}) do
+  defp send_scripted(sock, {status, body}, _path, _notify), do: send_response(sock, status, body)
+
+  defp send_scripted(sock, {status, body, opts}, _path, _notify) do
     case Keyword.get(opts, :delay) do
       nil -> :ok
       ms -> Process.sleep(ms)
@@ -166,9 +220,50 @@ defmodule Vagus.Test.FakeEngine do
     send_response(sock, status, body)
   end
 
+  ## Streams
+
+  @doc false
+  def stream(sock, status, steps, path, notify) do
+    :gen_tcp.send(
+      sock,
+      "HTTP/1.1 #{status} #{reason_phrase(status)}\r\n" <>
+        "Content-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n"
+    )
+
+    steps(sock, steps, path, notify)
+  end
+
+  defp steps(sock, [], _path, _notify), do: :gen_tcp.send(sock, "0\r\n\r\n")
+  defp steps(_sock, [:abort | _rest], _path, _notify), do: :ok
+
+  defp steps(sock, [:stall | _rest], path, notify) do
+    # Nothing is expected from the client, so the read returns when it closes.
+    _ = :gen_tcp.recv(sock, 0)
+    if notify, do: send(notify, {:fake_engine, :client_closed, path})
+    :ok
+  end
+
+  defp steps(sock, [step | rest], path, notify) do
+    case step do
+      {:line, map} -> chunk(sock, Jason.encode!(map) <> "\n")
+      {:chunk, binary} -> chunk(sock, binary)
+      {:raw, binary} -> :gen_tcp.send(sock, binary)
+      {:wait, ms} -> Process.sleep(ms)
+      {:run, fun} -> fun.()
+    end
+
+    steps(sock, rest, path, notify)
+  end
+
+  @doc false
+  def chunk(sock, binary) do
+    :gen_tcp.send(sock, Integer.to_string(byte_size(binary), 16) <> "\r\n" <> binary <> "\r\n")
+  end
+
   ## Request parsing
 
-  defp read_request(sock) do
+  @doc false
+  def read_request(sock) do
     case read_head(sock, "") do
       {:ok, head, leftover} ->
         [request_line | header_lines] = String.split(head, "\r\n")
@@ -265,12 +360,15 @@ defmodule Vagus.Test.FakeEngine do
 
   ## Response writing
 
-  defp send_response(sock, status, nil), do: send_raw(sock, status, "text/plain", "")
+  @doc false
+  def send_response(sock, status, body)
 
-  defp send_response(sock, status, body) when is_binary(body),
+  def send_response(sock, status, nil), do: send_raw(sock, status, "text/plain", "")
+
+  def send_response(sock, status, body) when is_binary(body),
     do: send_raw(sock, status, "text/plain", body)
 
-  defp send_response(sock, status, body) when is_map(body),
+  def send_response(sock, status, body) when is_map(body) or is_list(body),
     do: send_raw(sock, status, "application/json", Jason.encode!(body))
 
   defp send_raw(sock, status, content_type, body) do
@@ -288,10 +386,17 @@ defmodule Vagus.Test.FakeEngine do
   defp reason_phrase(204), do: "No Content"
   defp reason_phrase(304), do: "Not Modified"
   defp reason_phrase(404), do: "Not Found"
+  defp reason_phrase(409), do: "Conflict"
   defp reason_phrase(500), do: "Internal Server Error"
   defp reason_phrase(_status), do: "Unknown"
 
-  defp socket_path do
-    Path.join(System.tmp_dir!(), "vagus-core-engine-#{System.unique_integer([:positive])}.sock")
+  @doc "A socket path nothing listens at, and that no other test run will pick."
+  @spec socket_path() :: String.t()
+  def socket_path do
+    # The OS pid: two test runs at once, in two checkouts, count from one each.
+    Path.join(
+      System.tmp_dir!(),
+      "vagus-engine-#{System.pid()}-#{System.unique_integer([:positive])}.sock"
+    )
   end
 end
