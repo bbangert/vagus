@@ -151,6 +151,20 @@ defmodule Vagus.Resource.StoreTest do
       assert fields == %{[:holds, "y"] => :y}
     end
 
+    test "a writer named false owns what it writes like any other", %{i: i} do
+      assert {:ok, %{managed_fields: %{[:a] => false}}} =
+               Store.create(:thing, "t", %{a: 1}, [writer: false] ++ i)
+
+      assert {:ok, %{managed_fields: %{[:a] => false, [:b] => false}}} =
+               Store.update_spec(:thing, "t", %{b: 1}, [writer: false] ++ i)
+
+      assert {:error, {:conflict, [:a], false}} =
+               Store.update_spec(:thing, "t", %{a: 2}, [writer: :other] ++ i)
+
+      assert {:error, {:conflict, [:b], false}} =
+               Store.update_spec(:thing, "t", %{b: 2}, [writer: :other] ++ i)
+    end
+
     test "owning a path refuses another writer anything beneath it", %{i: i} do
       {:ok, _} = Store.create(:thing, "t", %{}, i)
       {:ok, _} = Store.update_spec(:thing, "t", %{a: %{}}, [writer: :ctl] ++ i)
@@ -509,6 +523,32 @@ defmodule Vagus.Resource.StoreTest do
       assert {:error, {:bad_op, {:put, [:a | :b], 1}}} =
                Store.update_spec(:thing, "t", [{:put, [:a | :b], 1}], i)
 
+      assert same_store?(instance, store)
+    end
+
+    test "counting starts from an absent path, not from a nil someone put there",
+         %{i: i, instance: instance, store: store} do
+      {:ok, _} = Store.update_spec(:thing, "t", %{blank: nil, deep: %{"blank" => nil}}, i)
+
+      assert {:error, {:bad_op, {:inc, [:blank]}}} =
+               Store.update_spec(:thing, "t", [{:inc, [:blank]}], i)
+
+      assert {:error, {:bad_op, {:inc, [:deep, "blank"]}}} =
+               Store.update_spec(:thing, "t", [{:inc, [:deep, "blank"]}], i)
+
+      # Nor from beneath a value that is not a map: `a` is 1, not a place.
+      assert {:error, {:bad_op, {:inc, [:a, "n"]}}} =
+               Store.update_spec(:thing, "t", [{:inc, [:a, "n"]}], i)
+
+      assert {:ok, %{spec: %{fresh: 1, deep: deep, new: %{"n" => 1}}}} =
+               Store.update_spec(
+                 :thing,
+                 "t",
+                 [{:inc, [:fresh]}, {:inc, [:deep, "fresh"]}, {:inc, [:new, "n"]}],
+                 i
+               )
+
+      assert deep == %{"blank" => nil, "fresh" => 1}
       assert same_store?(instance, store)
     end
 

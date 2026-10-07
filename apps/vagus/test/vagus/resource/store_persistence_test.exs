@@ -421,6 +421,22 @@ defmodule Vagus.Resource.StorePersistenceTest do
       assert refused(path) == {:unknown_atom, "zz_not_an_atom_yet"}
     end
 
+    test "a finalizer that is not an atom", %{path: path} do
+      i = start!(path)
+      {:ok, _} = Store.create(:thing, "t", %{}, [finalizers: [:tidy]] ++ i)
+      :ok = stop_supervised(i[:instance])
+
+      for finalizer <- ["tidy", 7] do
+        rewrite(path, fn document ->
+          Map.update!(document, "resources", fn [resource] ->
+            [%{resource | "finalizers" => [finalizer]}]
+          end)
+        end)
+
+        assert refused(path) == :malformed
+      end
+    end
+
     test "a kind whose decode hook raises", %{path: path} do
       i = start!(path)
       {:ok, _} = Store.create(:thing, "t", %{a: 1}, i)

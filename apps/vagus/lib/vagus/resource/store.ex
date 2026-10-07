@@ -522,7 +522,7 @@ defmodule Vagus.Resource.Store do
         finalizers: finalizers,
         owner_refs: owner_refs,
         managed_fields:
-          if(writer, do: Map.new(spec, fn {key, _} -> {[key], writer} end), else: %{})
+          if(writer != nil, do: Map.new(spec, fn {key, _} -> {[key], writer} end), else: %{})
       }
 
       put(%{txn | next_uid: txn.next_uid + 1}, resource)
@@ -779,10 +779,15 @@ defmodule Vagus.Resource.Store do
   end
 
   defp apply_spec_op({:inc, path} = op, spec, managed, writer, force?) do
-    case get_path(spec, path) do
-      nil -> apply_spec_op({:put, path, 1}, spec, managed, writer, force?)
-      n when is_integer(n) -> apply_spec_op({:put, path, n + 1}, spec, managed, writer, force?)
-      _not_a_counter -> {:error, {:bad_op, op}}
+    case fetch_path(spec, path) do
+      :error ->
+        apply_spec_op({:put, path, 1}, spec, managed, writer, force?)
+
+      {:ok, n} when is_integer(n) ->
+        apply_spec_op({:put, path, n + 1}, spec, managed, writer, force?)
+
+      {:ok, _not_a_counter} ->
+        {:error, {:bad_op, op}}
     end
   end
 
@@ -807,16 +812,19 @@ defmodule Vagus.Resource.Store do
 
       rivals ->
         managed = Map.drop(managed, Enum.map(rivals, &elem(&1, 0)))
-        {:ok, if(writer, do: Map.put(managed, path, writer), else: managed)}
+        {:ok, if(writer != nil, do: Map.put(managed, path, writer), else: managed)}
     end
   end
 
-  defp get_path(spec, path) do
-    Enum.reduce_while(path, spec, fn
-      key, %{} = map -> {:cont, Map.get(map, key)}
-      _key, _leaf -> {:halt, nil}
-    end)
+  # `:error` only for a path that is not there: a counter starts from
+  # absence, and a `nil` someone put is a value like any other.
+  defp fetch_path(%{} = map, [key]), do: Map.fetch(map, key)
+
+  defp fetch_path(%{} = map, [key | rest]) do
+    with {:ok, inner} <- Map.fetch(map, key), do: fetch_path(inner, rest)
   end
+
+  defp fetch_path(leaf, _beneath), do: {:ok, {:not_a_map, leaf}}
 
   defp put_path(map, [key], value), do: Map.put(map, key, value)
 

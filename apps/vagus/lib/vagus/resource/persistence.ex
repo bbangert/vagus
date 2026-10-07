@@ -214,7 +214,7 @@ defmodule Vagus.Resource.Persistence do
          uid: uid,
          generation: generation,
          deleting?: deleting?,
-         finalizers: Enum.map(finalizers, &decode_term/1),
+         finalizers: Enum.map(finalizers, &decode_finalizer/1),
          owner_refs: owner_refs,
          managed_fields:
            Map.new(managed_fields, fn
@@ -232,6 +232,15 @@ defmodule Vagus.Resource.Persistence do
   end
 
   defp decode_resource(_entry, _by_name), do: {:error, :malformed}
+
+  # Only an atom can be released again, so anything else would hold a
+  # deleting resource for ever.
+  defp decode_finalizer(term) do
+    case decode_term(term) do
+      finalizer when is_atom(finalizer) -> finalizer
+      _other -> throw(:malformed)
+    end
+  end
 
   defp decode_refs(refs, by_name) do
     Enum.reduce_while(refs, {:ok, []}, fn
