@@ -215,20 +215,6 @@ instant is a `%Vagus.Resource.Stamp{incarnation, at}`: a monotonic reading
 and the incarnation it was taken in. An instant from another incarnation
 reads as age zero, so a restart can lengthen a deadline but never skip one.
 
-## Deliberate exemptions from the OTP review rubric
-
-The rubric at `.github/skills/code-review/SKILL.md` is unchanged. The sites
-below trip it by name and are exempt on purpose; each carries a comment
-saying so. Anything else the rubric flags on this branch is a real finding.
-
-| The rubric says no | Site here | Why its reason does not apply |
-|---|---|---|
-| Reconciler | The controllers themselves | The rule targets compensation for process lifetime owned in the wrong tree. These reconcile an external system, containers that outlive the BEAM, against a durable record; no controller starts, stops or restarts another process. The attached controllers, Update and Backup reconcile store records rather than the engine: same model, same exemption. |
-| Explicit stop signal | `expected_exit: <container id>`, recorded in the verdict before a stop or remove action so that exit is not counted as a crash | The rule relies on an exit reason telling a stop from a crash. A container exit carries no Erlang exit reason, only an exit code. |
-| Reaper | Collection by owner reference; retention of one-shot kinds | It reaps records, not process lifetimes, and the owner is a durable declared field. |
-| Periodic sweep | The five-minute resync, and the one after a stream gap | It has a named external source of drift: the engine's event stream drops events. |
-| Reconcile-on-restart, retry | A runtime lists every resource when it starts; a crashed step is retried with back-off | These are durable recovery and transient external failure, which the rubric allows. Listed because a reviewer meets the mechanisms by name. |
-
 ## Commands
 
 | Command | Returns when | Background |
