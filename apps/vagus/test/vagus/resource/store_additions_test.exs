@@ -292,11 +292,35 @@ defmodule Vagus.Resource.StoreAdditionsTest do
       end)
     end
 
+    # Returns once `registry` has the waiter's monitor. That the waiter has
+    # asked for it, which its first read shows, is not enough: a monitor is
+    # a signal to the registry, and a kill from this process can reach the
+    # registry ahead of it, when the waiter is told `:noproc` and not why
+    # the registry died. Nothing announces the signal's arrival, so it is
+    # looked for; the registry answers this in a few tries or never.
+    defp monitored!(registry, waiter, tries \\ 100_000) do
+      {:monitored_by, monitors} = Process.info(registry, :monitored_by)
+
+      cond do
+        waiter in monitors ->
+          :ok
+
+        tries == 0 ->
+          flunk("the waiter never monitored the registry")
+
+        true ->
+          :erlang.yield()
+          monitored!(registry, waiter, tries - 1)
+      end
+    end
+
     test "ends with the registry: the waiter exits as every subscriber does", %{i: i} do
       {waiter, monitor} = waiter(i, false)
       assert_receive :reading, 1_000
+      registry = Process.whereis(Watch.name(i[:instance]))
+      monitored!(registry, waiter)
 
-      Process.exit(Process.whereis(Watch.name(i[:instance])), :kill)
+      Process.exit(registry, :kill)
       assert_receive {:DOWN, ^monitor, :process, ^waiter, reason}, 1_000
 
       # By its link to the registry or by noticing first that it is gone:
@@ -313,10 +337,21 @@ defmodule Vagus.Resource.StoreAdditionsTest do
 
       {waiter, monitor} = waiter([instance: instance], true)
       assert_receive :reading, 1_000
+      monitored!(registry, waiter)
 
       Process.exit(registry, :kill)
       assert_receive {:DOWN, ^monitor, :process, ^waiter, {:watch_down, :killed}}, 1_000
       refute_received {:waited, _result}
+    end
+
+    test "with no registry when it is called, it exits as for one that goes during the wait" do
+      instance = TestInstance.name()
+      start_supervised!({Vagus.Resource.Tables, instance})
+
+      assert catch_exit(Store.await(:part, "p", &{:halt, &1}, instance: instance)) ==
+               {:watch_down, :noproc}
+
+      refute_received {:DOWN, _monitor, :process, _registry, _reason}
     end
 
     test "goes on through a store restart, and hears the write made after it", %{i: i} do

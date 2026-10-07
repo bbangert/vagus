@@ -290,7 +290,8 @@ defmodule Vagus.Resource.Store do
   whole subtree, the caller goes with it as every subscriber does: by its
   link to the registry, with the registry's reason, or by an exit from here
   with `{:watch_down, reason}`, whichever comes first. A caller that traps
-  exits gets the second. A wait that went on without a subscription would
+  exits gets the second. The reason is the registry's, or `:noproc` for one
+  that was already gone, or went, as the wait began. A wait that went on without a subscription would
   end as a timeout that says nothing of why.
 
   The caller must hold no subscription of its own to the same object; the
@@ -307,7 +308,7 @@ defmodule Vagus.Resource.Store do
     # For the caller that traps exits, whom the link to the registry only
     # sends a message.
     registry = Process.monitor(Watch.name(instance(opts)))
-    :ok = Watch.subscribe(key, watch)
+    subscribe(key, watch, registry)
 
     try do
       await_loop({kind, name}, fun, {deadline, Keyword.get(opts, :poll, 1_000), registry}, opts)
@@ -317,6 +318,16 @@ defmodule Vagus.Resource.Store do
       behind_dispatch(opts)
       drop_notifications(kind, name)
     end
+  end
+
+  # With no registry there is nothing to subscribe to and nothing to wait
+  # for: the same end as for one that goes during the wait.
+  defp subscribe(key, watch, registry) do
+    Watch.subscribe(key, watch)
+  rescue
+    ArgumentError ->
+      Process.demonitor(registry, [:flush])
+      exit({:watch_down, :noproc})
   end
 
   # With the registry gone there is nothing to withdraw, and raising here

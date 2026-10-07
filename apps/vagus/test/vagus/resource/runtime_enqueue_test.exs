@@ -92,6 +92,47 @@ defmodule Vagus.Resource.RuntimeEnqueueTest do
     end
   end
 
+  test "the pass an enqueue brings takes the place of the failed pass's timer" do
+    # An engine that is away arms a retry far off; the first pass is parked
+    # before it finds that out.
+    sys = start_system(controllers: [Probe], runtime: [unavailable_retry: 600_000])
+    runtime = Process.whereis(Runtime.name(sys.instance, Probe))
+    put_fact(sys, :engine, :down)
+    put_fact(sys, {:observe, "p"}, :block)
+
+    # Every timer the runtime arms, with the message it is to deliver.
+    :erlang.trace_pattern({:erlang, :send_after, 4}, true, [])
+    on_exit(fn -> :erlang.trace_pattern({:erlang, :send_after, 4}, false, []) end)
+    :erlang.trace(runtime, true, [:call])
+
+    {:ok, _} = Store.create(:probe, "p", %{}, sys.i)
+    assert_receive {:observing, "p", failing}, sys.wait
+    :ok = Runtime.enqueue(Probe, "p", sys.i)
+    assert %{hinted: ["p"]} = Runtime.info(Probe, sys.i)
+
+    send(failing, :go)
+    assert_receive {:observing, "p", hinted}, sys.wait
+
+    assert_receive {:trace, ^runtime, :call,
+                    {:erlang, :send_after, [600_000, ^runtime, {:requeue, "p", _, _} = retry, _]}},
+                   sys.wait
+
+    :erlang.trace(runtime, false, [:call])
+    assert %{timers: [], hinted: [], in_flight: %{"p" => ^hinted}} = Runtime.info(Probe, sys.i)
+
+    # The timer's message all the same, as if it had fired before it could
+    # be cancelled: it is no longer anyone's, and marks nothing.
+    send(runtime, retry)
+    assert %{dirty: [], queued: [], timers: []} = Runtime.info(Probe, sys.i)
+
+    put_fact(sys, :engine, :up)
+    put_fact(sys, {:observe, "p"}, nil)
+    send(hinted, :go)
+    await!(sys, :probe, "p", :ready)
+    settle(sys)
+    assert journal(sys) == [{{Probe, "p"}, {:visit, 1}}]
+  end
+
   test "enqueue of a name the kind does not hold starts nothing and is not kept" do
     sys = followers(["f1"])
     %{steps: steps} = Runtime.info(Follower, sys.i)

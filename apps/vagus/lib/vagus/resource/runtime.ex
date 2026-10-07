@@ -531,7 +531,9 @@ defmodule Vagus.Resource.Runtime do
         {state, new_reference?} = learn(state, name, uid, result)
         {state, carried?} = outcome(state, name, uid, result)
         state = again?(state, name, dirty?, new_reference?, carried?)
-        if hinted?, do: queue(state, name), else: state
+        # The hint's pass is the one the timer would have brought: left
+        # armed, the timer would fire into that pass and bring another.
+        if hinted?, do: state |> disarm(name, uid) |> queue(name), else: state
     end
   end
 
