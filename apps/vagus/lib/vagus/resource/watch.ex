@@ -10,6 +10,11 @@ defmodule Vagus.Resource.Watch do
   for one resource can be answered by one read. `meta` exists for what can no
   longer be read: a removed resource still says whom it belonged to.
 
+  A subscriber to `:store` receives `{Vagus.Resource.Watch, :restarted}`
+  when a store has replaced another. Its predecessor may have written a
+  change to the tables and not lived to announce it, so whoever keeps
+  anything built from announcements looks at everything again.
+
   With the registry gone the whole `Vagus.Resource.Supervisor` subtree is
   restarting, and `subscribe/2` raises. Subscribing links the subscriber to
   the registry, so one that does not trap exits goes down with it, and a
@@ -30,6 +35,7 @@ defmodule Vagus.Resource.Watch do
           {:object, Resource.kind(), Resource.name()}
           | {:kind, Resource.kind()}
           | {:owner, Resource.kind(), Resource.name()}
+          | :store
 
   @type meta :: %{
           kind: Resource.kind(),
@@ -75,6 +81,14 @@ defmodule Vagus.Resource.Watch do
     end
 
     :ok
+  end
+
+  @doc false
+  @spec restarted(instance()) :: :ok
+  def restarted(instance) do
+    Registry.dispatch(name(instance), :store, fn subscribers ->
+      for {pid, _value} <- subscribers, do: send(pid, {__MODULE__, :restarted})
+    end)
   end
 
   defp instance(opts), do: Keyword.get(opts, :instance, Resource)

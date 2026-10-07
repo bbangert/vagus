@@ -162,10 +162,10 @@ defmodule Vagus.Resource.StoreRestartTest do
     assert_receive {:DOWN, ^ref, :process, ^holder, :killed}, 1_000
     assert Store.claimant(:thing, "t", i) == holder
 
-    {:ok, store} = Supervisor.restart_child(supervisor, Store)
+    {:ok, _its_supervisor} = Supervisor.restart_child(supervisor, Store)
     # The store monitored a dead pid while starting, so its `DOWN` is
     # already ahead of this call.
-    :sys.get_state(store)
+    :sys.get_state(Process.whereis(Store.name(instance)))
 
     assert Store.claimant(:thing, "t", i) == nil
     assert :ok = Store.claim(:thing, "t", i)

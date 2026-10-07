@@ -3,16 +3,26 @@ defmodule Vagus.Resource.Supervisor do
   The resource store, what it stands on, and the controllers that run
   against it.
 
-  `:rest_for_one` because the replacement of most children invalidates the
-  ones after it and none before: new tables mean an empty store, a new
-  `Watch` registry has forgotten every subscriber, and new lanes have
-  forgotten who holds a slot. The store is the exception: restarted, it
-  finds its rows in `Tables`, its subscribers in `Watch` and who owns what
-  in its start options, and announces whatever its file holds that the
-  tables did not. The children after it are replaced with it all the same,
-  because it has to stand after what it needs and before everything that
-  must not start against a store that has not loaded. That costs the steps
-  in flight and a listing.
+  `:rest_for_one` because a child's replacement invalidates the ones after
+  it and none before: new tables mean an empty store, a new `Watch`
+  registry has forgotten every subscriber, and new lanes have forgotten who
+  holds a slot.
+
+  The store is the exception, and stands in that order under a supervisor
+  of its own, which absorbs its restart: a new store finds its rows and the
+  claims in `Tables`, its subscribers in `Watch` and who owns what in its
+  start options, and it stops on purpose when it cannot tell whether a write
+  reached flash. Replacing the runtimes with it would end every step in the
+  middle of an engine call and cancel the running pulls. Those who outlive
+  it see a write that exits and may have been applied (for a step a crashed
+  pass, retried with back-off), reads that go on, and the new store's word
+  that it is new (`Vagus.Resource.Watch`), on which each runtime looks at
+  everything.
+
+  That supervisor allows three restarts in thirty seconds. One replacement
+  is the recovery, since it reads the file again; a store that keeps
+  stopping is flash that keeps failing, or a defect, and then that
+  supervisor ends and everything after it is replaced with it.
 
   `:services` are children a controller's actions use and that hold lane
   slots or remember who among the resources waits for them. They stand
@@ -27,13 +37,18 @@ defmodule Vagus.Resource.Supervisor do
   alias Vagus.Resource
   alias Vagus.Resource.{Controller, Controllers, Lanes, Store, Tables, Watch}
 
+  @doc "The name of the supervisor that holds the store alone."
+  @spec store_supervisor(atom()) :: atom()
+  def store_supervisor(instance), do: Module.concat(instance, StoreSupervisor)
+
   @doc """
   Options are `Vagus.Resource.Store.start_link/1`'s, and:
 
     * `:controllers`, the `Vagus.Resource.Controller` modules to run. Each
       owning one contributes its kind to the store's `:kinds`, with who
       owns it and who writes which condition type. A list that cannot run
-      fails this start (`Vagus.Resource.Controller.kinds/1`).
+      fails this start (`Vagus.Resource.Controller.kinds/1`), as does a
+      kind given in `:kinds` that a controller owns.
     * `:runtime`, options for every `Vagus.Resource.Runtime`.
     * `:lanes`, `Vagus.Resource.Lanes` caps.
     * `:services`, child specs started after `Vagus.Resource.Lanes` and
@@ -70,13 +85,33 @@ defmodule Vagus.Resource.Supervisor do
 
     # Derived here and given to the store as a start option: the store reads
     # its file, and checks who may write status, before any runtime exists.
-    kinds = Map.merge(Map.new(Keyword.get(store, :kinds, %{})), Controller.kinds(declarations))
+    given = Map.new(Keyword.get(store, :kinds, %{}))
+    derived = Controller.kinds(declarations)
+
+    # Merged, the controller's kind would silently replace the given one.
+    for {kind, %{owner: owner}} <- derived, is_map_key(given, kind) do
+      raise ArgumentError,
+            "kind #{inspect(kind)} is given in :kinds and owned by #{inspect(owner)}"
+    end
+
+    store = Keyword.merge(store, instance: instance, kinds: Map.merge(given, derived))
+
+    alone = [
+      strategy: :one_for_one,
+      max_restarts: 3,
+      max_seconds: 30,
+      name: store_supervisor(instance)
+    ]
 
     children =
       [
         {Tables, instance},
         Watch.child_spec(instance),
-        {Store, Keyword.merge(store, instance: instance, kinds: kinds)},
+        %{
+          id: Store,
+          type: :supervisor,
+          start: {Supervisor, :start_link, [[{Store, store}], alone]}
+        },
         {Lanes, instance: instance, caps: Keyword.get(own, :lanes)}
       ] ++
         Keyword.get(own, :services, []) ++
@@ -85,8 +120,9 @@ defmodule Vagus.Resource.Supervisor do
            instance: instance, controllers: declarations, runtime: Keyword.get(own, :runtime, [])}
         ]
 
-    # None of these children waits on anything outside the VM, so a crash is
-    # a bug to escalate, on the budget the application's other subtrees use.
+    # What fails outside the VM, flash or the engine, reaches a caller as an
+    # error, not as a child's exit; the store, which does stop over it, has
+    # its own budget. A child that ends here is a defect to escalate.
     Supervisor.init(children, strategy: :rest_for_one, max_restarts: 5, max_seconds: 30)
   end
 end

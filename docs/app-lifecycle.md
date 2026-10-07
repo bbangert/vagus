@@ -126,7 +126,7 @@ is in three parts, which keeps the decision a pure function a table can test:
 
 The other callbacks are declarations: `kind/0`, `condition_types/0`, and
 optionally `validate/1` (admission), `references/1` (resources whose changes
-concern this one), `priority/1` (lower is served first by a lane),
+concern this one),
 `retention/0`, `owned_conditions/0`, `finalizer/0`, `action_class/1` (the
 lane an action runs in), `writer_entries/0`, and the codec hooks
 `encode_spec/1`, `decode_spec/1`, `encode_progress/1`, `decode_progress/1`
@@ -154,16 +154,21 @@ key that waits keeps its place whatever else asks for it, and one whose
 step has ended and is wanted again goes to the back, so none is starved.
 Steps run in tasks, and so do the callbacks that take a resource: the
 runtime handles data only, and a callback that raises or exits costs one
-resource one step. One that hangs also keeps one of the steps in flight, so
-what bounds a step is the timeout of the calls it makes. The declarations,
+resource one step. A step keeps its place among those in flight until it
+ends, a wait for a lane and the action included: a stop holds one for the
+grace it gives plus a margin, so four long actions leave the rest of the
+kind unobserved meanwhile, and what bounds a step is the timeout of the
+calls it makes. The declarations,
 which take no argument, are evaluated once when the subtree starts, and one
 that raises fails that start with its name.
 
 A step is one pass: one commit, of the verdict and every store write
 `reconcile/2` returned, then at most one action, and then the resource is
-observed again. So a crash falls after the commit or after the action,
-never inside either, and nothing is decided from what an action has since
-changed. Create and start, stop and remove, and each hook are therefore
+observed again, so nothing is decided from what an action has since
+changed. A pass can still be cut anywhere, inside the action or with a
+commit whose outcome its caller never learns, which is why an action has to
+be idempotent against observation: the next pass looks and carries on.
+Create and start, stop and remove, and each hook are therefore
 separate passes. The commit expects the uid the step read, and what a step
 reports is believed only of that uid: a resource created under the name
 meanwhile starts clean. What `reconcile/2` returns is checked whole before
@@ -174,8 +179,9 @@ error ends its step; the next one runs at once and is told of the failure,
 because a failed pull leaves nothing to observe. Counting failures and
 spacing retries is the controller's decision, kept in status. Two things
 the runtime paces by itself, with the same back-off: steps that keep ending
-in a failed action, and steps that perform the same action as the step
-before, since an action that changes nothing observable would otherwise
+in a failed action, and steps that perform the action the step before
+performed (by name, whatever its arguments, until a step performs none),
+since an action that changes nothing observable would otherwise
 repeat without pause. Such a timer holds back only the dirty mark made
 while the failing step was in flight, because that mark may be the step's
 own status write, which is announced like any other and cannot be told
@@ -204,11 +210,12 @@ per app per controller. One engine observer does it instead (see "The
 engine layer"), and wakes only the apps that changed.
 
 `Vagus.Resource.Lanes` holds a counting semaphore per action class: pulls 1,
-engine calls 4. Only running actions count, and the wait is in the step's
-task, so a waiting app holds nothing and the runtime never waits. The next
-slot goes to the lowest `priority/1` waiting, then to whoever asked first;
-that is all priority orders: steps start in the order their resources were
-queued. A pull is not an action: it runs in the pull worker, whose state `observe`
+engine calls 4. Only running actions count, and the wait is in the task
+that asks, so no runtime waits; a step that waits for a lane holds no lane
+slot, but does hold one of its runtime's steps in flight. The next slot
+goes to the lowest priority waiting, then to whoever asked first. Pulls ask
+with a priority. Steps do not: the order of steps is their runtime's queue,
+and a controller has no say in it. A pull is not an action: it runs in the pull worker, whose state `observe`
 reads, so it never occupies the app's queue slot, and a stop during a pull
 cancels it (see "The engine layer").
 
@@ -223,7 +230,8 @@ runtime looks again a few seconds later: every boot starts that way.
 Vagus.Resource.Supervisor        :rest_for_one
 ├─ Tables                        owns the ETS tables
 ├─ Watch                         Registry, duplicate keys
-├─ Store                         single writer, persistence
+├─ store supervisor              :one_for_one, 3 restarts in 30 s
+│  └─ Store                      single writer, persistence
 ├─ Lanes                         action semaphores
 ├─ services                      what controllers stand on, in this order:
 │  ├─ App.Pulls                  which pulls run, who waits, their state
@@ -235,6 +243,21 @@ Vagus.Resource.Supervisor        :rest_for_one
       ├─ Task.Supervisor
       └─ Runtime
 ```
+
+The store stands alone under a supervisor of its own, so its restart is
+absorbed there. Nothing after it holds anything a new store lacks: rows and
+claims are in the tables, subscribers in `Watch`, ownership in its start
+options. And it stops on purpose when it cannot tell whether a write
+reached flash; replacing the runtimes with it would end every step in the
+middle of an engine call and cancel the running pulls. Those who outlive it
+see this: a write that was waiting, or is made while there is no store,
+exits and may have been applied, and a step whose commit exits is a
+crashed pass, retried with back-off; reads go on; the new store announces
+what its file holds that the tables did not, and tells `:store`
+subscribers that it is new, on which every runtime looks at everything, for
+a change the old store wrote to the tables and did not live to announce.
+A store that is replaced more than three times in thirty seconds ends its
+supervisor, and then everything after it is replaced as well.
 
 Each pair is `:one_for_all` because steps are `async_nolink` tasks: one in
 flight would otherwise outlive its runtime, and the replacement could start a
@@ -281,16 +304,16 @@ succeeds when its end state already holds, except `create` on a name in use
 action returns an id: the instance's id is `observe`'s to report. With the
 engine away `observe` is `{:unavailable, :engine_unavailable}`, never
 `:absent`. `Backend.Container.list/1` is the one call that says which of our
-containers exist. `Backend.Native` runs the MQTT broker as a `:transient`
+containers exist. `Backend.Native` runs the MQTT broker as a `:temporary`
 subtree of the supervisor that holds native apps: `:absent` or `:running`,
-nothing to create and no image. The split for a process in the VM is that
-supervision recovers from a crash at once and reconciliation decides
-whether the app runs: a subtree that ends abnormally is restarted by that
-supervisor, as a new instance with a new id; one stopped through the
-backend is forgotten by it; and a broker whose own supervisor has given up
-ends with `:shutdown`, is not restarted, and is observed as `:absent`,
-which leaves a broker that cannot stay up to the controller's restart
-policy instead of to the budget every native app shares.
+nothing to create and no image. Supervision owns the broker's internal
+recovery: its own supervisor restarts its children. The subtree itself
+ending is handed to reconciliation: it stays down and is observed as
+`:absent`, and the controller starts it again with its back-off. A restart
+by the holding supervisor would race the dead subtree's children for their
+names and the port, and its failed tries would spend the budget every
+native app shares. The engine observer monitors the subtree and wakes the
+app when it ends, so the hand-over is immediate.
 
 **Pulls.** `Vagus.App.Pulls` runs one pull per image reference, each in a
 task holding the `:pull` lane. A pull exists for its waiters, each a
@@ -315,8 +338,8 @@ An event about a container becomes a `Runtime.enqueue` for that one app.
 On every gap, at its own start and on a periodic tick it makes one filtered
 container list, compares it with the snapshot it kept of the last, and
 enqueues only the apps whose row changed. It also monitors the native
-broker's subtree and enqueues the app when that exits, so a restart by the
-supervisor is seen at once. This is the drift repair of the App kind:
+broker's subtree and enqueues the app when that exits, which is what makes
+its recovery immediate: nothing else restarts it. This is the drift repair of the App kind:
 neither a gap nor a timer has every app observed by every controller.
 
 ## Verdicts

@@ -16,20 +16,22 @@ defmodule Vagus.Resource.Runtime do
   flight marks the name dirty and it runs once more afterwards, however many
   changes there were: notifications become set members, never queued work.
 
-  The queue is served first come, first served, by the time a name was
-  first asked for: one already waiting keeps its place whatever else asks
-  for it, and one whose step has ended and is wanted again goes to the
-  back. So every name waits for at most the names ahead of it, and none can
-  be held back by another that keeps coming round. The bound is on steps,
-  observations included, which the lanes do not count: without it a start
-  would observe every resource of the kind at once. A step that never ends
-  keeps its place among them, so what bounds a step is the timeout of the
-  calls it makes.
+  The queue is first come, first served: a name already waiting keeps its
+  place whatever else asks for it, and one whose step has ended and is
+  wanted again goes to the back, so none is held back by another that keeps
+  coming round. The bound is on steps, observations included, which the
+  lanes do not count: without it a start would observe every resource of
+  the kind at once. A step holds its place until it ends, a wait for a lane
+  and the action included: a stop holds one for its grace plus a margin, so
+  as many long actions as the bound leave the rest of the kind unobserved
+  meanwhile, and what bounds a step is the timeout of the calls it makes.
 
   A step that crashes frees its name and is retried with back-off. The same
   back-off spaces passes that keep ending in a failed action, and passes
-  that keep performing the same action: an action that succeeds without
-  changing what is observed would otherwise be repeated without pause.
+  that keep performing the action of the same name, whatever its arguments:
+  an action that succeeds without changing what is observed would otherwise
+  be repeated without pause. A pass that performs none in between ends the
+  run.
 
   What such a timer holds back is only the dirty mark made while the failing
   step was in flight: that mark may be the step's own write, announced like
@@ -49,7 +51,8 @@ defmodule Vagus.Resource.Runtime do
 
   **When this process is absent** nothing reconciles the kind for this
   controller. Its supervisor replaces it together with its task supervisor,
-  and the replacement starts from a listing.
+  and the replacement starts from a listing. A new store leaves this
+  process as it is, and has it look at everything again.
 
   ## Options
 
@@ -209,8 +212,7 @@ defmodule Vagus.Resource.Runtime do
         context: Keyword.get(opts, :context, %{}),
         boundary: Keyword.get(opts, :boundary),
         types: declaration.conditions,
-        retention: declaration.retention,
-        priority: 0
+        retention: declaration.retention
       },
       # In the order to be served. A list: a kind has tens of resources.
       queued: [],
@@ -240,6 +242,7 @@ defmodule Vagus.Resource.Runtime do
   @impl true
   def handle_continue(:start, state) do
     :ok = Watch.subscribe({:kind, state.kind}, state.i)
+    :ok = Watch.subscribe(:store, state.i)
     {:noreply, state |> schedule_resync() |> relist() |> dispatch()}
   end
 
@@ -264,6 +267,9 @@ defmodule Vagus.Resource.Runtime do
     |> settle()
     |> noreply()
   end
+
+  def handle_info({Watch, :restarted}, state),
+    do: {:noreply, state |> look_again() |> settle()}
 
   def handle_info(:resync, state),
     do: {:noreply, state |> schedule_resync() |> look_again() |> settle()}
@@ -320,8 +326,8 @@ defmodule Vagus.Resource.Runtime do
   end
 
   # What is remembered about a resource is about that resource, not about
-  # its name: a failure count, a failed action, the action of the last
-  # pass, a pending timer and the references it reported. `record/3` is the
+  # its name: a failure count, a failed action, the name of the action the
+  # last pass performed, a pending timer and the references it reported. `record/3` is the
   # only way to read it and `put_record/3` the only way to write it, both by
   # name and uid, so that nothing remembered of a deleted resource is ever
   # read as, or added to, what is known of a later one of the same name.
@@ -559,13 +565,16 @@ defmodule Vagus.Resource.Runtime do
   # Each returns whether it armed a timer that is to carry the next pass.
   defp outcome(state, name, uid, %{outcome: {:ok, next}, action: action}) do
     record = %{record(state, name, uid) | failed: nil}
+    # By name: arguments that differ each time, a counter or a stamp, would
+    # make every repeat look new.
+    acted = action && elem(action, 0)
 
-    if action != nil and record.acted == action do
+    if acted != nil and record.acted == acted do
       # The same action as the pass before, which therefore changed nothing
       # that this pass could observe.
       {paced(state, name, record), true}
     else
-      record = %{record | failures: 0, acted: action}
+      record = %{record | failures: 0, acted: acted}
 
       case next do
         :rest -> {put_record(state, name, record), false}
@@ -584,14 +593,14 @@ defmodule Vagus.Resource.Runtime do
         _other -> state.unavailable_retry
       end
 
-    {arm(state, name, record(state, name, uid), ms), true}
+    {arm(state, name, %{record(state, name, uid) | acted: nil}, ms), true}
   end
 
   # The controller counts these and paces its own retries, so the next pass
   # is at once, to let its verdict say what happened. Should that pass end
   # the same way, nothing is pacing them, and the back-off does.
   defp outcome(state, name, uid, %{outcome: {:action_failed, failure}}) do
-    record = %{record(state, name, uid) | failed: failure}
+    record = %{record(state, name, uid) | failed: failure, acted: nil}
 
     if record.failures > 0,
       do: {paced(state, name, record), true},

@@ -77,8 +77,6 @@ defmodule Vagus.Resource.Toys do
     @impl true
     def validate(spec), do: {:ok, Map.put_new(spec, "n", 1)}
     @impl true
-    def priority(%{spec: spec}), do: Map.get(spec, "priority", 0)
-    @impl true
     def action_class(:fetch), do: :pull
     def action_class(_other), do: nil
 
@@ -504,9 +502,12 @@ defmodule Vagus.Resource.Toys do
     itself. `"effect"`: `"refused"` writes to a resource that is not there,
     `"bad_act"` has an action return nonsense, `"non_effect"` returns a
     status write, `"two_actions"` and `"op_after_action"` return what their
-    names say, each with a write to the spec, `"no_pair"` returns no pair at
-    all, `"requeues"` asks to be looked at after three delays, `"noop"`
-    writes what is already there.
+    names say, each with a write to the spec, `"op_after_requeue"` an action,
+    a re-queue and then a write, `"no_pair"` returns no pair at all,
+    `"expect_generation"` expects a generation the resource does not have,
+    `"requeue_after_action"` returns a `:fine` action, which tells the test
+    `{:fine, name}`, and then a re-queue, `"requeues"` asks to be looked at
+    after three delays, `"noop"` writes what is already there.
     """
     @behaviour Vagus.Resource.Controller
 
@@ -542,6 +543,9 @@ defmodule Vagus.Resource.Toys do
           "non_effect" -> [written, {:status, %{}}]
           "two_actions" -> [written, nonsense, nonsense]
           "op_after_action" -> [nonsense, written]
+          "op_after_requeue" -> [nonsense, {:requeue_after, 5}, written]
+          "expect_generation" -> [{:expect, :wild, name, generation: 99}]
+          "requeue_after_action" -> [{:action, :fine, nil}, {:requeue_after, 600_000}]
           "requeues" -> for(ms <- [600_000, 300_000, 900_000], do: {:requeue_after, ms})
           "noop" -> noop(name)
           nil -> []
@@ -561,6 +565,11 @@ defmodule Vagus.Resource.Toys do
 
     @impl true
     def act(:nonsense, nil, _context), do: :done
+
+    def act(:fine, nil, %{resource: %{name: name}} = context) do
+      send(context.test, {:fine, name})
+      :ok
+    end
   end
 
   defmodule Solo do
@@ -636,7 +645,12 @@ defmodule Vagus.Resource.Toys do
   end
 
   defmodule Idle do
-    @moduledoc "Owns `:idle`: every pass performs the same action, which changes nothing it observes."
+    @moduledoc """
+    Owns `:idle`: every pass nudges, with an argument that differs each
+    time, and decides nothing from what the nudge changed. With the fact
+    `:engine` set to `:down` it cannot observe, and asks to be looked at
+    again after `spec["requeue"]`, if that is set.
+    """
     @behaviour Vagus.Resource.Controller
 
     alias Vagus.Resource.Harness
@@ -645,14 +659,91 @@ defmodule Vagus.Resource.Toys do
     def kind, do: :idle
     @impl true
     def condition_types, do: [:ready]
-    @impl true
-    def observe(_idle, _context), do: %{}
-    @impl true
-    def reconcile(_idle, _observed), do: {:no_verdict, [{:action, :nudge, 1}]}
 
     @impl true
-    def act(:nudge, 1, %{resource: %{name: name}} = context),
-      do: Harness.record(context, {__MODULE__, name}, :nudge)
+    def observe(%{name: name}, context) do
+      if Harness.fact(context, :engine) == :down,
+        do: {:unavailable, :engine_unavailable},
+        else: %{nudges: Harness.fact(context, {:nudges, name}) || 0}
+    end
+
+    @impl true
+    def reconcile(%{spec: spec}, {:unavailable, _reason}),
+      do: {:no_verdict, for(ms <- List.wrap(spec["requeue"]), do: {:requeue_after, ms})}
+
+    def reconcile(_idle, %{nudges: nudges}), do: {:no_verdict, [{:action, :nudge, nudges}]}
+
+    @impl true
+    def act(:nudge, nudges, %{resource: %{name: name}} = context) do
+      Harness.record(context, {__MODULE__, name}, :nudge)
+      Harness.put_fact(context, {:nudges, name}, nudges + 1)
+    end
+  end
+
+  defmodule Spinner do
+    @moduledoc """
+    Owns `:spinner`: every pass acts, under a name that alternates so that
+    no pass repeats the one before, and tells the test `{:spun, name}`. It
+    comes to rest only once the fact `:stop` is set.
+    """
+    @behaviour Vagus.Resource.Controller
+
+    alias Vagus.Resource.Harness
+
+    @impl true
+    def kind, do: :spinner
+    @impl true
+    def condition_types, do: [:ready]
+
+    @impl true
+    def observe(%{name: name}, context) do
+      %{turns: Harness.fact(context, {:turns, name}) || 0, stop?: Harness.fact(context, :stop)}
+    end
+
+    @impl true
+    def reconcile(_spinner, %{stop?: true}), do: {:no_verdict, []}
+
+    def reconcile(_spinner, %{turns: turns}),
+      do: {:no_verdict, [{:action, if(rem(turns, 2) == 0, do: :tick, else: :tock), turns}]}
+
+    @impl true
+    def act(_tick_or_tock, turns, %{resource: %{name: name}} = context) do
+      send(context.test, {:spun, name})
+      Harness.put_fact(context, {:turns, name}, turns + 1)
+    end
+  end
+
+  defmodule Finisher do
+    @moduledoc """
+    Owns `:finisher`: every resource is finished as soon as it is seen, and
+    is swept once, which is an action. Keeps one.
+    """
+    @behaviour Vagus.Resource.Controller
+
+    alias Vagus.Resource.Harness
+
+    @impl true
+    def kind, do: :finisher
+    @impl true
+    def condition_types, do: [:done]
+    @impl true
+    def retention, do: %{keep: 1, ttl_ms: :infinity}
+
+    @impl true
+    def observe(%{name: name}, context),
+      do: %{swept?: Harness.fact(context, {:swept, name}) == true}
+
+    @impl true
+    def reconcile(_finisher, %{swept?: swept?}) do
+      {Verdict.new([done: {true, :done}], terminal?: true),
+       if(swept?, do: [], else: [{:action, :sweep, nil}])}
+    end
+
+    @impl true
+    def act(:sweep, nil, %{resource: %{name: name}} = context) do
+      Harness.record(context, {__MODULE__, name}, :sweep)
+      Harness.put_fact(context, {:swept, name}, true)
+    end
   end
 
   defmodule Mute do

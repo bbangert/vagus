@@ -20,7 +20,8 @@ defmodule Vagus.Resource.Store do
 
   This process keeps nothing in its own memory that a restart loses: the
   rows and the claims are in the tables, and who may write what is in the
-  kinds it is started with (`Vagus.Resource.Kind`).
+  kinds it is started with (`Vagus.Resource.Kind`). So nothing is replaced
+  with it (`Vagus.Resource.Supervisor`).
 
   All functions take `instance: name` to address a store other than the
   application's.
@@ -399,6 +400,8 @@ defmodule Vagus.Resource.Store do
          {:ok, contents} <- load(state) do
       restore(state, contents)
       remonitor(state.claims)
+      # After the tables are right. At a first start nobody listens yet.
+      Watch.restarted(instance)
       {:ok, state}
     else
       {:error, reason} ->

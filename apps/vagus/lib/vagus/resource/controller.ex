@@ -26,11 +26,12 @@ defmodule Vagus.Resource.Controller do
   remove, and each hook of a sequence are separate passes, each decided
   from what the pass before left to observe.
 
-  A crash therefore falls after the commit or after the action, and **an
-  action must be idempotent against observation**: the pass after a crash
-  observes what the action already did and carries on from there. Nothing
-  but `observe/2` tells a pass that an action ran. The commit is made
-  before it, and a pass cut between the two has the one without the other.
+  A pass can be cut anywhere: a commit whose call exits may have been
+  applied, and a step that dies with its runtime dies inside `act/3`. So
+  **an action must be idempotent against observation**: the pass after
+  observes whatever the action did and carries on from there. Nothing but
+  `observe/2` tells a pass that an action ran. The commit is made before
+  it, and a pass cut between the two has the one without the other.
 
   There is no status effect. Status is written by the runtime, from the
   `Vagus.Resource.Verdict`, and by nothing else.
@@ -47,8 +48,8 @@ defmodule Vagus.Resource.Controller do
   leaves nothing behind for `observe/2` to see; counting it and spacing the
   retries is the controller's to do, with `{:requeue_after, ms}`. Passes
   that keep ending in a failed action are spaced like crashed ones, and so
-  is a pass that performs the same action as the pass before: an action
-  must change what `observe/2` sees.
+  is a pass that performs the action the pass before performed, compared by
+  name: an action must change what `observe/2` sees.
 
   ## Where a controller's code runs
 
@@ -57,7 +58,7 @@ defmodule Vagus.Resource.Controller do
   `writer_entries/0`) are evaluated once, by `declare/1`, while
   `Vagus.Resource.Supervisor` starts: one that raises fails that start,
   with its name. `observe/2`, `reconcile/2`, `act/3`, `references/1`,
-  `priority/1` and `action_class/1` run in the pass's task, where one that
+  `action_class/1` run in the pass's task, where one that
   raises or exits costs its resource that pass and nothing beyond it. One
   that never returns also keeps one of the passes its runtime may have in
   flight, so every call a callback makes needs a timeout. `validate/1` and
@@ -138,13 +139,6 @@ defmodule Vagus.Resource.Controller do
   @callback references(Resource.t()) :: [Resource.key()]
 
   @doc """
-  The resource's place among the actions waiting for a lane: lower is served
-  first. Default 0. It orders nothing else: passes start in the order their
-  resources were queued.
-  """
-  @callback priority(Resource.t()) :: integer()
-
-  @doc """
   For a kind whose resources finish: how many finished ones to keep, and for
   how long. The count is the bound that always holds; an age is only known
   within one incarnation.
@@ -174,7 +168,6 @@ defmodule Vagus.Resource.Controller do
 
   @optional_callbacks validate: 1,
                       references: 1,
-                      priority: 1,
                       retention: 0,
                       owned_conditions: 0,
                       finalizer: 0,

@@ -33,7 +33,7 @@ defmodule Vagus.Resource.TestInstance do
   @spec restart_store(atom()) :: pid()
   def restart_store(instance) do
     old = Process.whereis(Store.name(instance))
-    kill_observed(old, Process.whereis(Module.concat(instance, Supervisor)))
+    kill_observed(old, Process.whereis(Vagus.Resource.Supervisor.store_supervisor(instance)))
     new = Process.whereis(Store.name(instance))
     true = is_pid(new) and new != old
     new

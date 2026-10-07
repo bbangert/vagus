@@ -35,8 +35,6 @@ defmodule Vagus.Resource.RuntimeIsolationTest do
     @impl true
     def references(_watched), do: []
     @impl true
-    def priority(_watched), do: 1
-    @impl true
     def action_class(:touch), do: :engine
 
     @impl true
@@ -103,7 +101,6 @@ defmodule Vagus.Resource.RuntimeIsolationTest do
           :encode_spec,
           :decode_spec,
           :references,
-          :priority,
           :action_class,
           :observe,
           :reconcile,

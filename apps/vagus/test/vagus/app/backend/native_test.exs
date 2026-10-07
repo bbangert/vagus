@@ -4,6 +4,7 @@ defmodule Vagus.App.Backend.NativeTest do
   use ExUnit.Case, async: false
 
   alias Vagus.App.Backend.Native
+  alias Vagus.Resource.TestInstance
 
   @moduletag :capture_log
 
@@ -22,7 +23,7 @@ defmodule Vagus.App.Backend.NativeTest do
   end
 
   setup do
-    # As the application's.
+    # As the application's: a DynamicSupervisor of `:temporary` subtrees.
     supervisor =
       start_supervised!(
         {DynamicSupervisor, strategy: :one_for_one, max_restarts: 5, max_seconds: 30}
@@ -66,7 +67,7 @@ defmodule Vagus.App.Backend.NativeTest do
     assert %{active: 1} = DynamicSupervisor.count_children(opts[:supervisor])
   end
 
-  test "stop/3 ends the broker for good, and is :ok again when it is gone", %{
+  test "stop/3 ends the broker, and is :ok again when it is gone", %{
     slug: slug,
     port: port,
     opts: opts
@@ -75,7 +76,6 @@ defmodule Vagus.App.Backend.NativeTest do
 
     assert Native.stop(slug, 10, opts) == :ok
     assert Native.observe(slug, opts) == {:ok, :absent}
-    # No spec either: the supervisor has nothing left to start again.
     assert %{active: 0, specs: 0} = DynamicSupervisor.count_children(opts[:supervisor])
     refute connects?(port)
 
@@ -100,80 +100,38 @@ defmodule Vagus.App.Backend.NativeTest do
     assert second != first
   end
 
-  test "a broker that ends abnormally comes back under the supervisor, as a new instance", %{
-    slug: slug,
-    port: port,
-    opts: opts
-  } do
-    :ok = Native.start(slug, opts)
-    {:ok, %{id: first}} = Native.observe(slug, opts)
-    broker = Process.whereis(Native.broker_name(slug))
-    monitor = Process.monitor(broker)
-
-    # Its own supervisor's way of ending for a reason that is not a stop,
-    # children first, so the port is free when the restart binds it.
-    :ok = Supervisor.stop(broker, :crashed)
-    assert_receive {:DOWN, ^monitor, :process, ^broker, :crashed}, 5_000
-
-    # A barrier: the supervisor restarts the child while it handles the exit.
-    assert %{active: 1, specs: 1} = DynamicSupervisor.count_children(opts[:supervisor])
-    assert {:ok, %{state: :running, id: second}} = Native.observe(slug, opts)
-    assert second != first
-    assert connects?(port)
-  end
-
-  test "a broker whose own supervisor gave up stays down, and is :absent", %{
+  test "a broker that is killed is :absent, and is not started again by anyone", %{
     slug: slug,
     opts: opts
   } do
     :ok = Native.start(slug, opts)
     broker = Process.whereis(Native.broker_name(slug))
-    monitor = Process.monitor(broker)
 
-    # What a supervisor that has spent its restarts ends with.
-    :ok = Supervisor.stop(broker, :shutdown)
-    assert_receive {:DOWN, ^monitor, :process, ^broker, :shutdown}, 5_000
+    # Returns once the supervisor has dealt with the exit.
+    TestInstance.kill_observed(broker, opts[:supervisor])
 
+    assert DynamicSupervisor.which_children(opts[:supervisor]) == []
     assert %{active: 0, specs: 0} = DynamicSupervisor.count_children(opts[:supervisor])
     assert Native.observe(slug, opts) == {:ok, :absent}
   end
 
-  test "a holding supervisor that spent its restarts is replaced empty, and reads :absent", %{
-    slug: slug,
-    port: port
-  } do
-    holding = :"holding_#{slug}"
+  test "the holding supervisor outlives ten brokers killed in a row", %{opts: opts} do
+    holding = opts[:supervisor]
 
-    parent =
-      start_supervised!(%{
-        id: :parent,
-        type: :supervisor,
-        start:
-          {Supervisor, :start_link,
-           [
-             [{DynamicSupervisor, name: holding, strategy: :one_for_one, max_restarts: 0}],
-             [strategy: :one_for_one]
-           ]}
-      })
+    for n <- 1..10 do
+      # Each its own name and port: what a killed broker leaves dying must
+      # not be what fails the next start.
+      slug = "killed_#{n}_#{System.unique_integer([:positive])}"
+      opts = Keyword.put(opts, :port, free_port())
+      :ok = Native.start(slug, opts)
 
-    opts = [supervisor: holding, port: port, provider: nil]
-    :ok = Native.start(slug, opts)
-    spent = Process.whereis(holding)
-    broker = Process.whereis(Native.broker_name(slug))
+      TestInstance.kill_observed(Process.whereis(Native.broker_name(slug)), holding)
 
-    :erlang.trace(parent, true, [:receive])
-    :ok = Supervisor.stop(broker, :crashed)
-    assert_receive {:trace, ^parent, :receive, {:EXIT, ^spent, :shutdown}}, 5_000
-    :erlang.trace(parent, false, [:receive])
+      assert Native.observe(slug, opts) == {:ok, :absent}
+    end
 
-    # A barrier: the parent has put the replacement in place once it answers.
-    assert [{^holding, replacement, :supervisor, _modules}] =
-             Supervisor.which_children(parent)
-
-    assert replacement != spent
-    assert %{active: 0, specs: 0} = DynamicSupervisor.count_children(holding)
-    assert Native.observe(slug, opts) == {:ok, :absent}
-    refute connects?(port)
+    assert Process.alive?(holding)
+    assert DynamicSupervisor.which_children(holding) == []
   end
 
   test "a process under the broker's name that the supervisor does not hold is not the instance",

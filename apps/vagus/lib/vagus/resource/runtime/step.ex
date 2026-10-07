@@ -2,15 +2,16 @@ defmodule Vagus.Resource.Runtime.Step do
   @moduledoc """
   One pass over one resource: read, collect, observe, reconcile, commit,
   act. Everything here runs in the step's task, never in the runtime, so a
-  callback that raises or an engine call that hangs costs the runtime
-  nothing but that key.
+  callback that raises costs the runtime nothing but that pass, and an
+  engine call that hangs costs it that key and one of its steps in flight.
 
   A pass makes one commit of its own, the verdict's status with every op
   `reconcile/2` returned, and then performs at most one action. What it
-  collects is apart from that: a release or a delete owed to a resource
-  that is gone is the whole pass, and a finished resource the kind no
-  longer retains is deleted in a commit of its own, since each is another
-  resource with its own uid to expect.
+  collects is apart from that. A release or a delete owed to a resource
+  that is gone is the whole pass. The finished resources the kind no longer
+  retains are deleted last, after the action, each in a commit of its own
+  since each is another resource with its own uid to expect: that is
+  housekeeping for others, and this resource's action does not wait on it.
 
   The task's result says what the resource it was given refers to, the
   action the pass performed, and its outcome:
@@ -51,7 +52,6 @@ defmodule Vagus.Resource.Runtime.Step do
   # is how the runtime knows whose pass it is even if the pass crashes.
   @spec run(map()) :: result()
   def run(%{resource: %Resource{} = resource} = step) do
-    step = %{step | priority: priority(step, resource)}
     result = %{refs: references(step, resource), action: nil, outcome: nil}
 
     case if(collects?(step), do: Collector.ops(resource, step.i), else: []) do
@@ -64,16 +64,6 @@ defmodule Vagus.Resource.Runtime.Step do
       # decision is left to the next one.
       ops ->
         %{result | outcome: with(:ok <- commit(step, resource, ops), do: {:ok, :now})}
-    end
-  end
-
-  defp priority(step, resource) do
-    case Controller.optional(step.controller, :priority, [resource], 0) do
-      priority when is_integer(priority) ->
-        priority
-
-      other ->
-        raise ArgumentError, "#{inspect(step.controller)}.priority/1 returned #{inspect(other)}"
     end
   end
 
@@ -117,8 +107,11 @@ defmodule Vagus.Resource.Runtime.Step do
 
     outcome =
       with :ok <- commit(step, resource, status_ops(step, resource, verdict, now) ++ ops),
+           acted = act(step, action, Map.put(context, :resource, resource)),
+           # Whatever the action came to: a failing one would otherwise
+           # keep the kind's finished resources for as long as it fails.
            :ok <- retain(step, verdict, now),
-           :ok <- act(step, action, Map.put(context, :resource, resource)) do
+           :ok <- acted do
         next =
           cond do
             # An action changed the world and no event is promised for it.
@@ -254,7 +247,10 @@ defmodule Vagus.Resource.Runtime.Step do
         {:ok, _resources, changed?} ->
           boundary(step, if(changed?, do: :commit, else: :idle_commit))
 
-        {:error, {:precondition, {^kind, ^name}, _field}} ->
+        # A new resource under the name, or none. Any other expectation
+        # that fails was the controller's own, about a resource that is
+        # still the one read, and is a commit refused like any other.
+        {:error, {:precondition, {^kind, ^name}, field}} when field in [:uid, :not_found] ->
           :gone
 
         {:error, reason} ->
@@ -264,7 +260,7 @@ defmodule Vagus.Resource.Runtime.Step do
   end
 
   # After the pass's own commit, which is what stamps this resource as
-  # finished and so puts it in the listing.
+  # finished and so puts it in the listing, and after its action.
   defp retain(
          %{retention: %{} = retention, skip_collector: false} = step,
          %Verdict{terminal?: true},
@@ -306,7 +302,7 @@ defmodule Vagus.Resource.Runtime.Step do
     result =
       case Controller.optional(step.controller, :action_class, [name], nil) do
         nil -> run.()
-        class -> Lanes.run(class, [instance: step.instance, priority: step.priority], run)
+        class -> Lanes.run(class, [instance: step.instance], run)
       end
 
     case result do

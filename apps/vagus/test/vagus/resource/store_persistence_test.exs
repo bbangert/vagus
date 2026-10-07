@@ -330,8 +330,12 @@ defmodule Vagus.Resource.StorePersistenceTest do
     @describetag :capture_log
 
     defp refused(path, opts \\ []) do
-      assert {:error, {{:shutdown, {:failed_to_start_child, Store, reason}}, _spec}} =
+      # Twice: the store's start fails its own supervisor's, which fails the
+      # subtree's.
+      assert {:error, {{:shutdown, {:failed_to_start_child, Store, its_own}}, _spec}} =
                TestInstance.start([path: path] ++ opts)
+
+      assert {:shutdown, {:failed_to_start_child, Store, reason}} = its_own
 
       reason
     end
