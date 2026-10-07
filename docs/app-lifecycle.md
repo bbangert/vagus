@@ -141,8 +141,10 @@ Each controller has its own `Vagus.Resource.Runtime`, so a wedged controller
 blocks no other and several can work one kind. The runtime keeps a queue
 keyed by resource with at most one step in flight per key; a change arriving
 mid-step marks the key dirty and it runs again. Steps run in tasks, and so
-does every callback of the controller: the runtime handles data only, and a
+do the callbacks that take a resource: the runtime handles data only, and a
 callback that raises, exits or hangs costs one resource one step. The
+declarations, which take no argument, are evaluated once when the subtree
+starts, and one that raises fails that start with its name. The
 effects between two actions are grouped into one commit, so a crash can fall
 between a commit and an action but never inside a group. Every commit of a
 step expects the uid the step read, and what a step reports is believed
@@ -155,10 +157,11 @@ spacing retries is the controller's decision, kept in status. Two things
 the runtime paces by itself, with the same back-off: steps that keep ending
 in a failed action, and steps that perform the same actions as the step
 before, since an action that changes nothing observable would otherwise
-repeat without pause. While such a timer is armed, it alone brings the next
-step: a change arriving during the failed step waits for it, because the
-step's own status write is announced like any other and cannot be told
-apart.
+repeat without pause. Such a timer holds back only the dirty mark made
+while the failing step was in flight, because that mark may be the step's
+own status write, which is announced like any other and cannot be told
+apart. A change that arrives after the step has ended starts a step at once,
+whatever timer is armed.
 
 A runtime indexes what each resource refers to: its `references/1`, its
 owners and the resources that wrote fields of its spec, as each step reports

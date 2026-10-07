@@ -174,7 +174,19 @@ defmodule Vagus.Resource.Store do
   op left it. One rejected op rejects the commit and nothing changes.
   """
   @spec commit([op()], keyword()) :: {:ok, [Resource.t()]} | {:error, term()}
-  def commit(ops, opts \\ []) when is_list(ops), do: call(opts, {:commit, ops})
+  def commit(ops, opts \\ []) when is_list(ops) do
+    with {:ok, resources, _changed?} <- commit_changed(ops, opts), do: {:ok, resources}
+  end
+
+  @doc """
+  As `commit/2`, and also whether the commit changed anything: a resource,
+  or the uid counter, which a create and delete of one resource moves
+  without leaving a row. A commit that changed nothing wrote nothing and
+  told nobody.
+  """
+  @spec commit_changed([op()], keyword()) ::
+          {:ok, [Resource.t()], changed? :: boolean()} | {:error, term()}
+  def commit_changed(ops, opts \\ []) when is_list(ops), do: call(opts, {:commit, ops})
 
   @doc """
   Options: `:owner_refs`, `:finalizers`, and `:writer` to own the spec keys
@@ -399,13 +411,14 @@ defmodule Vagus.Resource.Store do
 
   @impl true
   def handle_call({:commit, ops}, _from, state) do
-    txn = %{state: state, rows: %{}, removed: [], next_uid: next_uid(state.table)}
+    next_uid = next_uid(state.table)
+    txn = %{state: state, rows: %{}, removed: [], next_uid: next_uid}
 
     with {:ok, results, txn} <- run_all(ops, [], txn),
          changes = changes(state.table, txn),
          :ok <- persist(state, txn, changes) do
       apply_changes(state, txn, changes)
-      {:reply, {:ok, results}, state}
+      {:reply, {:ok, results, changes != [] or txn.next_uid != next_uid}, state}
     else
       {:error, _reason} = error ->
         {:reply, error, state}

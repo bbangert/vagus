@@ -5,9 +5,10 @@ defmodule Vagus.Resource.RuntimeRulesTest do
   import Vagus.Resource.Harness
 
   alias Vagus.Resource
-  alias Vagus.Resource.{Lanes, Runtime, Store, TestInstance}
+  alias Vagus.Resource.{Controller, Lanes, Runtime, Store, TestInstance}
 
   alias Vagus.Resource.Toys.{
+    Broken,
     Clasher,
     Echo,
     Flaky,
@@ -200,6 +201,20 @@ defmodule Vagus.Resource.RuntimeRulesTest do
       assert {:ok, _instance} = TestInstance.start(controllers: [Kept, Kept], kinds: %{})
     end
 
+    test "a declaration that raises fails the start, naming the controller and the callback" do
+      assert {:error, reason} = TestInstance.start(controllers: [Kept, Broken], kinds: %{})
+
+      assert inspect(reason) =~
+               "Vagus.Resource.Toys.Broken.retention/0 failed: ** (RuntimeError) no idea"
+
+      assert_raise ArgumentError, ~r/Broken.retention\/0 failed/, fn ->
+        Controller.declare(Broken)
+      end
+
+      assert %{kind: :kept, owner?: true, conditions: [:ready], finalizer: :kept, retention: nil} =
+               Controller.declare(Kept)
+    end
+
     test "a registration the store refuses stops the runtime with that reason" do
       instance = TestInstance.start!()
       i = [instance: instance]
@@ -207,7 +222,10 @@ defmodule Vagus.Resource.RuntimeRulesTest do
       Process.flag(:trap_exit, true)
 
       {:ok, runtime} =
-        Runtime.start_link([controller: Squatter, tasks: Runtime.tasks(instance, Squatter)] ++ i)
+        Runtime.start_link(
+          [declaration: Controller.declare(Squatter), tasks: Runtime.tasks(instance, Squatter)] ++
+            i
+        )
 
       assert_receive {:EXIT, ^runtime,
                       {:registration_refused, Squatter, {:kind_owned, Somebody}}},
@@ -281,6 +299,25 @@ defmodule Vagus.Resource.RuntimeRulesTest do
       settle(sys)
       assert fact(sys, {:seen, "s"}) == 40
       assert notes(sys) == []
+    end
+  end
+
+  describe "a commit that changes nothing" do
+    test "is told apart at the boundary, whatever ops it is made of" do
+      test = self()
+      boundary = fn info -> send(test, {:boundary, info.after}) end
+      sys = start_system(controllers: [Wild], runtime: [boundary: boundary])
+
+      # The first pass writes the verdict beside its three idle ops.
+      given_ready(sys, {:wild, "w", %{"effect" => "noop"}})
+      assert_received {:boundary, :commit}
+
+      # From then on the verdict is there too, and nothing is new.
+      resync(sys, Wild)
+      settle(sys)
+      assert_received {:boundary, :idle_commit}
+      refute_received {:boundary, :commit}
+      assert Store.get(:wild, "w", sys.i).generation == 1
     end
   end
 

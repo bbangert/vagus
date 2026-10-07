@@ -19,7 +19,11 @@ defmodule Vagus.Resource.Controllers.Supervisor do
 
   alias Vagus.Resource.Runtime
 
-  @doc "Options: `:instance`, `:controllers`, and `:runtime`, options given to every runtime."
+  @doc """
+  Options: `:instance`, `:controllers` (their
+  `t:Vagus.Resource.Controller.declaration/0`s), and `:runtime`, options
+  given to every runtime.
+  """
   @spec start_link(keyword()) :: Supervisor.on_start()
   def start_link(opts) do
     Supervisor.start_link(__MODULE__, opts, name: name(Keyword.fetch!(opts, :instance)))
@@ -38,14 +42,14 @@ defmodule Vagus.Resource.Controllers.Supervisor do
     runtime = Keyword.get(opts, :runtime, [])
 
     children =
-      for controller <- Keyword.get(opts, :controllers, []) do
+      for %{controller: controller} = declaration <- Keyword.get(opts, :controllers, []) do
         tasks = Runtime.tasks(instance, controller)
 
         pair = [
           # No `:max_children`: the runtime starts one step per resource of
           # the kind at most.
           {Task.Supervisor, name: tasks},
-          {Runtime, [instance: instance, controller: controller, tasks: tasks] ++ runtime}
+          {Runtime, [instance: instance, declaration: declaration, tasks: tasks] ++ runtime}
         ]
 
         # `:one_for_all` because a step is an `async_nolink` task, and such a

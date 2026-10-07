@@ -38,9 +38,18 @@ defmodule Vagus.Resource.Controller do
   spaced like crashed ones, and so are passes that perform the same actions
   as the pass before: an action must change what `observe/2` sees.
 
-  Every callback runs in the pass's task, `references/1` and `priority/1`
-  included. One that raises, exits or never returns costs its resource that
-  pass and nothing beyond it.
+  ## Where a controller's code runs
+
+  Nowhere in the runtime. The callbacks that take no argument (`kind/0`,
+  `condition_types/0`, `owned_conditions/0`, `retention/0`, `finalizer/0`,
+  `finalize_after/0`, `writer_entries/0`) are evaluated once, by
+  `declare/1`, while `Vagus.Resource.Supervisor` starts: one that raises
+  fails that start, with its name. `observe/2`, `reconcile/2`, `act/3`,
+  `references/1`, `priority/1` and `action_class/1` run in the pass's task,
+  where one that raises, exits or never returns costs its resource that pass
+  and nothing beyond it. `validate/1` and the codec hooks run in the store,
+  on each write to the kind: what they raise refuses the write, and they
+  must not block, since every write waits behind them.
 
   ## What `observe/2` cannot reach
 
@@ -181,45 +190,101 @@ defmodule Vagus.Resource.Controller do
       else: default
   end
 
+  @typedoc """
+  What a controller declares about itself, as data. Every callback that
+  takes no resource is evaluated into one of these, once, before anything
+  starts, so that no process has to call the controller to know it.
+  """
+  @type declaration :: %{
+          controller: module(),
+          kind: Resource.kind(),
+          owner?: boolean(),
+          conditions: [atom()],
+          retention: %{keep: non_neg_integer(), ttl_ms: non_neg_integer() | :infinity} | nil,
+          finalizer: atom() | nil,
+          finalize_after: [atom()],
+          writer_entries: [Resource.path()]
+        }
+
+  @doc """
+  Evaluates the controller's declarations. Raises, naming the controller
+  and the callback, if one of them does.
+  """
+  @spec declare(module()) :: declaration()
+  def declare(controller) do
+    Code.ensure_loaded!(controller)
+    owner? = owner?(controller)
+
+    %{
+      controller: controller,
+      kind: declared(controller, :kind, :required),
+      owner?: owner?,
+      conditions:
+        declared(controller, if(owner?, do: :condition_types, else: :owned_conditions), :required),
+      retention: declared(controller, :retention, nil),
+      finalizer: declared(controller, :finalizer, nil),
+      finalize_after: declared(controller, :finalize_after, []),
+      writer_entries: declared(controller, :writer_entries, [])
+    }
+  end
+
+  defp declared(controller, callback, default) do
+    if default == :required or exports?(controller, callback, 0),
+      do: apply(controller, callback, []),
+      else: default
+  catch
+    kind, reason ->
+      raise ArgumentError,
+            "#{inspect(controller)}.#{callback}/0 failed: " <>
+              Exception.format_banner(kind, reason, __STACKTRACE__)
+  end
+
   @doc """
   The kinds the store is started with, one per owning controller, each with
-  the finalizers of every controller on it.
+  the finalizers of every controller on it. Takes controllers or their
+  declarations.
 
   Raises on a list the store would later refuse a registration from: two
   owners of one kind, a controller attached to a kind nobody owns, condition
   types that are not atoms, or one condition type or one finalizer declared
-  by two controllers of a kind. None of these can run, and found here they fail the
-  start with a name instead of a runtime that can never register.
+  by two controllers of a kind. None of these can run, and found here they
+  fail the start with a name instead of a runtime that can never register.
   """
-  @spec kinds([module()]) :: %{Resource.kind() => Kind.t()}
+  @spec kinds([module() | declaration()]) :: %{Resource.kind() => Kind.t()}
   def kinds(controllers) do
-    {owners, attached} = controllers |> Enum.uniq() |> Enum.split_with(&owner?/1)
+    {owners, attached} =
+      controllers
+      |> Enum.uniq()
+      |> Enum.map(&if(is_atom(&1), do: declare(&1), else: &1))
+      |> Enum.split_with(& &1.owner?)
 
     owned =
       Enum.reduce(owners, %{}, fn owner, owned ->
-        Map.update(owned, owner.kind(), owner, fn rival ->
+        Map.update(owned, owner.kind, owner, fn rival ->
           raise ArgumentError,
-                "#{inspect(rival)} and #{inspect(owner)} both own kind #{inspect(owner.kind())}"
+                "#{inspect(rival.controller)} and #{inspect(owner.controller)} both own kind " <>
+                  inspect(owner.kind)
         end)
       end)
 
-    for controller <- attached, not is_map_key(owned, controller.kind()) do
+    for %{controller: controller, kind: kind} <- attached, not is_map_key(owned, kind) do
       raise ArgumentError,
-            "#{inspect(controller)} attaches to #{inspect(controller.kind())}, " <>
-              "which no controller owns"
+            "#{inspect(controller)} attaches to #{inspect(kind)}, which no controller owns"
     end
 
-    Map.new(owned, fn {kind, owner} ->
-      on_kind = [owner | Enum.filter(attached, &(&1.kind() == kind))]
+    Map.new(owned, fn {kind, %{controller: owner} = declaration} ->
+      on_kind = [declaration | Enum.filter(attached, &(&1.kind == kind))]
       distinct_conditions!(kind, on_kind)
       finalizers = distinct_finalizers!(kind, on_kind)
 
+      # The validator and the hooks are the controller's code, run by the
+      # store on each write. It takes what they raise as a refusal.
       {kind,
        Kind.new(
          [
            validators: if(exports?(owner, :validate, 1), do: [&owner.validate/1], else: []),
            finalizers: finalizers,
-           writer_entries: optional(owner, :writer_entries, [], [])
+           writer_entries: declaration.writer_entries
          ] ++
            for(
              hook <- @hooks,
@@ -233,8 +298,11 @@ defmodule Vagus.Resource.Controller do
   # A resource holds a finalizer once. Shared, the first controller to finish
   # would release it for both, and the resource could go before the other
   # had cleaned up.
-  defp distinct_finalizers!(kind, controllers) do
-    held = for c <- controllers, exports?(c, :finalizer, 0), do: {c.finalizer(), c}
+  defp distinct_finalizers!(kind, declarations) do
+    held =
+      for %{finalizer: finalizer, controller: c} <- declarations,
+          finalizer != nil,
+          do: {finalizer, c}
 
     held
     |> Enum.reduce([], fn {finalizer, controller}, seen ->
@@ -251,10 +319,8 @@ defmodule Vagus.Resource.Controller do
     |> Enum.map(&elem(&1, 0))
   end
 
-  defp distinct_conditions!(kind, controllers) do
-    Enum.reduce(controllers, %{}, fn controller, declared ->
-      types = conditions(controller)
-
+  defp distinct_conditions!(kind, declarations) do
+    Enum.reduce(declarations, %{}, fn %{controller: controller, conditions: types}, declared ->
       with [_ | _] <- Enum.reject(List.wrap(types), &is_atom/1) do
         raise ArgumentError,
               "#{inspect(controller)} declares condition types #{inspect(types)}, not a list of atoms"

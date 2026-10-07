@@ -47,11 +47,15 @@ defmodule Vagus.Resource.Supervisor do
       end
 
     {own, store} = Keyword.split(opts, [:controllers, :runtime, :lanes])
-    controllers = own |> Keyword.get(:controllers, []) |> Enum.uniq()
+    # Every controller is asked what it declares here, once. A declaration
+    # that raises fails this start with its name, and nothing started below
+    # has to call a controller to know its kind or its conditions.
+    declarations =
+      own |> Keyword.get(:controllers, []) |> Enum.uniq() |> Enum.map(&Controller.declare/1)
 
     # Derived here and given to the store as a start option because the
     # store reads its file before any controller exists to register a kind.
-    kinds = Map.merge(Map.new(Keyword.get(store, :kinds, %{})), Controller.kinds(controllers))
+    kinds = Map.merge(Map.new(Keyword.get(store, :kinds, %{})), Controller.kinds(declarations))
 
     children = [
       {Tables, instance},
@@ -59,7 +63,7 @@ defmodule Vagus.Resource.Supervisor do
       {Store, Keyword.merge(store, instance: instance, kinds: kinds)},
       {Lanes, instance: instance, caps: Keyword.get(own, :lanes)},
       {Controllers.Supervisor,
-       instance: instance, controllers: controllers, runtime: Keyword.get(own, :runtime, [])}
+       instance: instance, controllers: declarations, runtime: Keyword.get(own, :runtime, [])}
     ]
 
     # None of these children waits on anything outside the VM, so a crash is

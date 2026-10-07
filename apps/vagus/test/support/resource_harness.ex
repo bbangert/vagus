@@ -424,9 +424,9 @@ defmodule Vagus.Resource.Harness.Faults do
 
   A step has a boundary after each action and after each commit that
   changed something: the places a crash can fall, since a commit is all or
-  none. A commit that changed nothing is not one: the store is as it was
-  before the pass, so a kill there is a kill before the pass, which is the
-  boundary before. Leaving those out is also what makes a scenario cross the
+  none. A commit that changed nothing, as the store reports it, is not one:
+  the store is as it was before the pass, so a kill there is a kill before
+  the pass, which is the boundary before. Leaving those out is also what makes a scenario cross the
   same boundaries each time, since how many passes find nothing to write
   depends on how the notifications happened to fall. A boundary is named by
   the controller, the resource and which of the two it follows, and by how

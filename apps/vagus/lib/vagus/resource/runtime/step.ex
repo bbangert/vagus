@@ -261,21 +261,22 @@ defmodule Vagus.Resource.Runtime.Step do
 
   defp group(_step, _resource, []), do: :ok
 
-  defp group(step, resource, ops),
-    do: commit(step, resource, ops, if(idle?(resource, ops), do: :idle_commit, else: :commit))
+  defp group(step, resource, ops), do: commit(step, resource, ops)
 
   # Every write of a step: not during a shutdown, only to the resource that
   # was read, and failing the step on anything else the store refuses.
   # `:gone` when `target` is no longer that resource.
-  defp commit(step, %{kind: kind, name: name, uid: uid}, ops, boundary) do
+  defp commit(step, %{kind: kind, name: name, uid: uid}, ops) do
     if step.shutdown?.() do
       :gated
     else
       # The uid, so that what was decided about a resource never lands on a
       # namesake created after it was deleted.
-      case Store.commit([{:expect, kind, name, uid: uid} | ops], step.i) do
-        {:ok, _resources} ->
-          boundary(step, boundary)
+      case Store.commit_changed([{:expect, kind, name, uid: uid} | ops], step.i) do
+        # A commit that changed nothing is told apart for whoever watches
+        # the boundaries: the store is as it was before the pass.
+        {:ok, _resources, changed?} ->
+          boundary(step, if(changed?, do: :commit, else: :idle_commit))
 
         {:error, {:precondition, {^kind, ^name}, _field}} ->
           :gone
@@ -294,7 +295,7 @@ defmodule Vagus.Resource.Runtime.Step do
     step.kind
     |> Collector.expired(retention, now, step.i)
     |> Enum.reduce_while(:ok, fn expired, :ok ->
-      case commit(step, expired, [{:delete, expired.kind, expired.name}], :commit) do
+      case commit(step, expired, [{:delete, expired.kind, expired.name}]) do
         # Deleted, or replaced under its name since it was listed, which
         # leaves nothing of it to delete.
         done when done in [:ok, :gone] -> {:cont, :ok}
@@ -351,20 +352,6 @@ defmodule Vagus.Resource.Runtime.Step do
       other -> raise ArgumentError, "#{inspect(step.controller)}.act/3 returned #{inspect(other)}"
     end
   end
-
-  # Whether a commit could not have changed anything: it wrote only the
-  # status the pass had already read. Judged from the pass's own read, so
-  # that it does not depend on who else wrote meanwhile.
-  defp idle?(%Resource{kind: kind, name: name, status: status}, [
-         {:patch_status, kind, name, patch, _opts}
-       ]) do
-    {conditions, rest} = Map.pop(patch, :conditions, [])
-    held = Map.get(status, :conditions, %{})
-
-    Map.take(status, Map.keys(rest)) == rest and Enum.all?(conditions, &(held[&1.type] == &1))
-  end
-
-  defp idle?(_resource, _ops), do: false
 
   defp boundary(%{boundary: nil}, _kind), do: :ok
 

@@ -32,6 +32,51 @@ defmodule Vagus.Resource.StoreAdditionsTest do
     end
   end
 
+  describe "commit_changed" do
+    test "says no for a commit that left everything as it was", %{i: i} do
+      {:ok, %{uid: uid}} = Store.create(:part, "p", %{"a" => 1}, i)
+      :ok = Store.register_kind(:part, Owner, [conditions: [:ready]] ++ i)
+      ready = %{conditions: [Resource.condition(:ready, true, :fine, 1)], note: "x"}
+      {:ok, before} = Store.patch_status(:part, "p", ready, [writer: Owner] ++ i)
+      :ok = Watch.subscribe({:kind, :part}, i)
+
+      for ops <- [
+            [],
+            [{:expect, :part, "p", uid: uid, generation: 1}],
+            [{:update_spec, :part, "p", %{"a" => 1}, []}],
+            [{:update_spec, :part, "p", [{:release, ["a"]}], [writer: :nobody]}],
+            [{:release_writer, :part, "p", :nobody}],
+            [{:patch_status, :part, "p", ready, [writer: Owner]}],
+            [{:remove_finalizer, :part, "p", :absent}]
+          ] do
+        assert {:ok, resources, false} = Store.commit_changed(ops, i)
+        assert length(resources) == length(ops)
+      end
+
+      assert Store.get(:part, "p", i) == before
+      refute_received {Watch, _event, _meta}
+    end
+
+    test "says yes for a change to a resource, and for a uid that was used up", %{i: i} do
+      {:ok, _} = Store.create(:part, "p", %{"a" => 1}, i)
+
+      assert {:ok, [_], true} =
+               Store.commit_changed([{:update_spec, :part, "p", %{"a" => 2}, []}], i)
+
+      assert {:ok, [_], true} = Store.commit_changed([{:add_finalizer, :part, "p", :tidy}], i)
+
+      # Created and deleted in one commit: no row, and a uid never given again.
+      assert {:ok, [%{uid: used}, _], true} =
+               Store.commit_changed([{:create, :part, "q", %{}, []}, {:delete, :part, "q"}], i)
+
+      assert Store.get(:part, "q", i) == nil
+      assert {:ok, %{uid: next}} = Store.create(:part, "r", %{}, i)
+      assert next > used
+
+      assert {:error, :not_found} = Store.commit_changed([{:delete, :part, "ghost"}], i)
+    end
+  end
+
   describe "expect" do
     test "rejects the whole commit when the uid or the generation is another", %{i: i} do
       {:ok, %{uid: uid}} = Store.create(:part, "p", %{"a" => 1}, i)

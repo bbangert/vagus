@@ -487,7 +487,8 @@ defmodule Vagus.Resource.Toys do
     in `references/1`, `"hang"` never returns from it, `"self"` refers to
     itself. `"effect"`: `"refused"` writes to a resource that is not there,
     `"bad_act"` has an action return nonsense, `"non_effect"` returns a
-    status write, `"requeues"` asks to be looked at after three delays.
+    status write, `"requeues"` asks to be looked at after three delays,
+    `"noop"` writes what is already there.
     """
     @behaviour Vagus.Resource.Controller
 
@@ -517,10 +518,20 @@ defmodule Vagus.Resource.Toys do
           "bad_act" -> [{:action, :nonsense, nil}]
           "non_effect" -> [{:status, %{}}]
           "requeues" -> for(ms <- [600_000, 300_000, 900_000], do: {:requeue_after, ms})
+          "noop" -> noop(name)
           nil -> []
         end
 
       {Verdict.new(ready: {true, :fine}), effects}
+    end
+
+    # Three ops that the store accepts and that change nothing.
+    defp noop(name) do
+      [
+        {:expect, :wild, name, []},
+        {:update_spec, :wild, name, %{"effect" => "noop"}, []},
+        {:release_writer, :wild, name, :nobody}
+      ]
     end
 
     @impl true
@@ -720,6 +731,24 @@ defmodule Vagus.Resource.Toys do
     def observe(_kept, _context), do: %{}
     @impl true
     def reconcile(_kept, _observed), do: {:no_verdict, []}
+    @impl true
+    def act(_action, _args, _context), do: :ok
+  end
+
+  defmodule Broken do
+    @moduledoc "Owns `:broken`, and raises when asked what it retains."
+    @behaviour Vagus.Resource.Controller
+
+    @impl true
+    def kind, do: :broken
+    @impl true
+    def condition_types, do: [:ready]
+    @impl true
+    def retention, do: raise("no idea")
+    @impl true
+    def observe(_broken, _context), do: %{}
+    @impl true
+    def reconcile(_broken, _observed), do: {:no_verdict, []}
     @impl true
     def act(_action, _args, _context), do: :ok
   end

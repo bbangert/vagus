@@ -17,9 +17,13 @@ defmodule Vagus.Resource.Runtime do
   A step that crashes frees its name and is retried with back-off. The same
   back-off spaces passes that keep ending in a failed action, and passes
   that keep performing the same actions: an action that succeeds without
-  changing what is observed would otherwise be repeated without pause. While
-  such a timer is armed it alone brings the next pass: a change that arrives
-  during the failing step waits for it.
+  changing what is observed would otherwise be repeated without pause.
+
+  What such a timer holds back is only the dirty mark made while the failing
+  step was in flight: that mark may be the step's own write, announced like
+  any other, and a step that writes and then fails must not bring itself
+  back. A change that arrives after the step has ended starts a pass at
+  once, timer or no timer, since by then it can only be news.
 
   Controllers are level-triggered, so a notification is only a hint to look.
   Whatever one missed is found by a resync, which looks at every resource of
@@ -39,7 +43,9 @@ defmodule Vagus.Resource.Runtime do
 
   ## Options
 
-    * `:instance`, `:controller`, `:tasks` (the task supervisor's name)
+    * `:instance`, `:declaration` (the controller's
+      `t:Vagus.Resource.Controller.declaration/0`), `:tasks` (the task
+      supervisor's name)
     * `:context`, a map merged into what `observe/2` and `act/3` are given
     * `:clock`, `:shutdown?` (default `Vagus.Host.Shutdown.in_flight?/0`)
     * `:resync`, milliseconds or `:infinity` (default five minutes)
@@ -68,7 +74,7 @@ defmodule Vagus.Resource.Runtime do
 
   alias Vagus.Host.Shutdown
   alias Vagus.Resource
-  alias Vagus.Resource.{Clock, Controller, Store, Watch}
+  alias Vagus.Resource.{Clock, Store, Watch}
   alias Vagus.Resource.Runtime.Step
 
   @type info :: %{
@@ -83,7 +89,7 @@ defmodule Vagus.Resource.Runtime do
 
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts) do
-    name = name(instance(opts), Keyword.fetch!(opts, :controller))
+    name = name(instance(opts), Keyword.fetch!(opts, :declaration).controller)
     GenServer.start_link(__MODULE__, opts, name: name)
   end
 
@@ -128,10 +134,11 @@ defmodule Vagus.Resource.Runtime do
   @impl true
   def init(opts) do
     instance = instance(opts)
-    controller = Keyword.fetch!(opts, :controller)
-    Code.ensure_loaded!(controller)
-    kind = controller.kind()
-    owner? = Controller.owner?(controller)
+    # Data: what the controller declares was evaluated before this process
+    # existed, and nothing here or below calls the controller.
+    %{controller: controller, kind: kind, owner?: owner?} =
+      declaration = Keyword.fetch!(opts, :declaration)
+
     clock = Keyword.get(opts, :clock, Clock.System)
     shutdown? = Keyword.get(opts, :shutdown?, &Shutdown.in_flight?/0)
 
@@ -168,9 +175,9 @@ defmodule Vagus.Resource.Runtime do
             Application.get_env(:vagus, :strict_verdicts, false)
           end),
         boundary: Keyword.get(opts, :boundary),
-        types: Controller.conditions(controller),
-        retention: Controller.optional(controller, :retention, [], nil),
-        finalize_after: Controller.optional(controller, :finalize_after, [], []),
+        types: declaration.conditions,
+        retention: declaration.retention,
+        finalize_after: declaration.finalize_after,
         priority: 0
       },
       queued: MapSet.new(),
