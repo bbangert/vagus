@@ -144,7 +144,8 @@ defmodule Vagus.Application do
         ingress_children() ++
         ssh_access_children() ++
         [
-          # The resource store (tables, watch registry, single writer). Before
+          # The resource store (tables, watch registry, single writer) and
+          # the runtimes of `config :vagus, :controllers`. Before
           # `Vagus.API.Supervisor` so the tables exist before the first
           # request at boot, and a resource file that cannot be read fails the
           # application start here, before anything acts on an empty store.

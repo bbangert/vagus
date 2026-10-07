@@ -6,12 +6,60 @@ defmodule VagusUmbrella.MixProject do
       apps_path: "apps",
       version: "0.1.0",
       start_permanent: Mix.env() == :prod,
-      deps: deps()
+      deps: deps(),
+      aliases: [{:"test.mutations", &test_mutations/1}]
     ]
   end
 
   def cli do
     [preferred_targets: [run: :host, test: :host]]
+  end
+
+  # Proves that the resource runtime's scenario tests can fail. Each run takes
+  # one mechanism away from every runtime the tests start (see
+  # `Vagus.Resource.Harness`) and must end in failed tests; a suite that
+  # stays green without change notifications, say, is passing for some other
+  # reason. `resync` is run against the tests that are about resync alone,
+  # since with notifications gone too every other scenario fails regardless.
+  @mutations [
+    {"deliver_events", "scenario"},
+    {"resync", "scenario:resync"},
+    {"ignore_dirty", "scenario"},
+    {"skip_collector", "scenario"}
+  ]
+
+  defp test_mutations(_args) do
+    # Unmutated first: a suite that fails by itself proves nothing below.
+    if scenarios(nil, "scenario") != 0,
+      do: Mix.raise("the scenario tests fail without a mutation")
+
+    survivors =
+      for {mutation, only} <- @mutations,
+          status = scenarios(mutation, only),
+          # 2 is ExUnit's "tests failed"; anything else did not run them.
+          status != 2,
+          do: "#{mutation} (exit #{status})"
+
+    if survivors != [],
+      do: Mix.raise("no scenario test failed under: #{Enum.join(survivors, ", ")}")
+
+    Mix.shell().info(
+      "every mutation was caught: #{Enum.map_join(@mutations, ", ", &elem(&1, 0))}"
+    )
+  end
+
+  defp scenarios(mutation, only) do
+    Mix.shell().info("==> scenario tests, mutation: #{mutation || "none"}")
+
+    env =
+      [{"MIX_ENV", "test"}] ++ if(mutation, do: [{"VAGUS_RESOURCE_MUTATION", mutation}], else: [])
+
+    args = ["test", "apps/vagus/test/vagus/resource", "--only", only]
+
+    {_output, status} =
+      System.cmd("mix", args, env: env, into: IO.stream(), stderr_to_stdout: true)
+
+    status
   end
 
   # Dependencies listed here are available only for this project

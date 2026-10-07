@@ -75,7 +75,17 @@ Core is not a separate mechanism. It is a resource of kind App named
   someone else owns is a conflict. An Update claims its app's `version` this
   way, so a user's write to it mid-update is refused instead of raced.
 - `Store.commit(ops)` applies writes to several resources all or none,
-  persists once and notifies once.
+  persists once and notifies once. An `{:expect, kind, name, uid: n}` op
+  rejects the commit unless the resource is still that one; `generation:`
+  can be expected too. Whoever decided from a read uses the uid, so that a
+  decision about a deleted resource never lands on a new one of its name.
+- A kind can name finalizers that every resource of it holds from creation,
+  and spec paths whose entries belong to their writer (`writer_entries`, an
+  app's `holds`). `Store.release_writer` gives up everything a writer owned
+  on a resource: its entries are deleted, any other value stays, unowned.
+- `Store.await` blocks its caller until a function of one resource halts. It
+  subscribes before its first read, reads again on every notification and
+  once a second regardless, and gives up at a deadline.
 - The store keeps one in-memory operation claim per app. A command takes it;
   a second mutating command on that app fails as busy. The claim ends when
   its holder releases it or dies, and outlives a store restart.
@@ -104,32 +114,55 @@ is in three parts, which keeps the decision a pure function a table can test:
 
 The other callbacks are declarations: `kind/0`, `condition_types/0`, and
 optionally `validate/1` (admission), `references/1` (resources whose changes
-concern this one), `priority/1` (queue order), `retention/0`,
-`owned_conditions/0` and `finalize_after/0`. One controller owns a kind and
-writes its verdict; others attach and write only the conditions they declare.
+concern this one), `priority/1` (lower first), `retention/0`,
+`owned_conditions/0`, `finalizer/0`, `finalize_after/0`, `action_class/1`
+(the lane an action runs in), `writer_entries/0`, and the codec hooks
+`encode_spec/1`, `decode_spec/1`, `encode_progress/1`, `decode_progress/1`
+that a spec with atoms needs to get through JSON.
+
+Controllers are listed in `config :vagus, :controllers`. One controller owns
+a kind and writes its verdict; one that exports `owned_conditions/0` is
+attached to a kind another owns and writes only those conditions. The
+store's kinds are derived from the list: each owner contributes its kind,
+with its admission and codec and the finalizers of every controller on it.
 
 Each controller has its own `Vagus.Resource.Runtime`, so a wedged controller
 blocks no other and several can work one kind. The runtime keeps a queue
 keyed by resource with at most one step in flight per key; a change arriving
 mid-step marks the key dirty and it runs again. Steps run in tasks. The
 effects between two actions are grouped into one commit, so a crash can fall
-between a commit and an action but never inside a group.
+between a commit and an action but never inside a group. Every commit of a
+step expects the uid the step read.
+
+A step that crashes is retried with back-off. An action that returns an
+error ends its step; the next one runs at once and is told of the failure,
+because a failed pull leaves nothing to observe. Counting failures and
+spacing retries is the controller's decision, kept in status.
+
+A runtime indexes what each resource refers to: its `references/1`, its
+owners and the resources that wrote fields of its spec. A change to one of
+those runs the resources that refer to it, and no others.
 
 Controllers are level-triggered: they act on what they observe, not on the
 event that woke them, so a missed event is repaired by the next observation.
 The engine's event stream is lossy, and that is the drift a resync exists
-for: a gap in the stream (signalled after every reconnect), a runtime start
-and a five-minute timer each trigger one filtered container list.
+for: a gap in the stream (signalled after every reconnect, `Runtime.resync`),
+a runtime start and a five-minute timer each have every resource of the kind
+looked at again.
 
 `Vagus.Resource.Lanes` holds a counting semaphore per action class: pulls 1,
-engine calls 4. Only action tasks count, so a waiting app holds nothing. A
+engine calls 4. Only running actions count, and the wait is in the step's
+task, so a waiting app holds nothing and the runtime never waits. The next
+slot goes to the lowest priority waiting, then to whoever asked first. A
 pull runs in a keyed pull worker whose state `observe` reads; it never
 occupies the app's queue slot, and a stop during a pull cancels it.
 
 While the host is shutting down every runtime rests and writes nothing;
 otherwise the containers the shutdown stops would be read as crashes. While
-the engine is unreachable the verdict is Progressing with reason
-`:engine_unavailable` and no failure is counted: every boot starts that way.
+the engine is unreachable `observe/2` returns `{:unavailable,
+:engine_unavailable}`, `reconcile/2` is given that and answers Progressing
+with that reason, no failure is counted, and the runtime looks again a few
+seconds later: every boot starts that way.
 
 ```
 Vagus.Resource.Supervisor        :rest_for_one
@@ -151,13 +184,21 @@ second action for the same key. There is no per-app process.
 
 `reconcile/2` returns `{%Verdict{} | :no_verdict, effects}`. A
 `Vagus.Resource.Verdict` holds a condition for every type the controller
-lists in `condition_types/0`, never a subset. `:no_verdict` is for a pass
+lists in `condition_types/0`, never a subset. The owner's verdict may also
+carry other status (the running instance, a diary of what it has counted)
+and say that the resource has finished for good. `:no_verdict` is for a pass
 with nothing to report.
 
 Status is not an effect. Only the runtime writes status, from the verdict, in
 the same commit that marks the generation observed, so a generation cannot be
 marked observed beside a condition left over from the previous one. The
 store rejects a condition type its writer does not own.
+
+A verdict that leaves out a declared type, or carries an undeclared one, is
+refused by the runtime: the step fails in tests (`config :vagus,
+:strict_verdicts`), and elsewhere the verdict is logged and not written
+while the effects still apply. One contract test, over a table of
+`(resource, observation)` rows, holds every controller to this.
 
 ## The App kind
 
@@ -225,15 +266,29 @@ Four controllers attach to the App kind, each with its own runtime:
 ## Deletion and collection
 
 Deleting a resource only sets `deleting?`. Each controller with something to
-clean up holds a finalizer and releases it when the cleanup is done; the
-resource disappears when all are released. The App's own finalizer runs
-after AuthIndex's, declared in `finalize_after/0`, so the token row is gone
-before the container is touched; the rest run in any order.
+clean up declares a finalizer and releases it when the cleanup is done; the
+resource disappears when all are released. Every resource holds the
+finalizers of all its kind's controllers from creation, so a delete cannot
+arrive before a controller has attached its own. The App's own finalizer
+runs after AuthIndex's, declared in `finalize_after/0`: the App controller
+is not shown a deleting app until that finalizer is gone, so the token row
+is removed before the container is touched. The rest run in any order.
 
 Owned resources are collected through their declared `owner_refs`, never by
 inferring ownership from a name: an uninstalled app's publications go with
-it. One-shot kinds such as Update and Backup declare `retention/0`, a keep
-count and then a TTL. Collection is an ordinary delete, so finalizers run.
+it. Ownership is by uid, so a new resource under an old name owns nothing
+its predecessor did, and a resource with several owners goes with the last.
+A field written by a resource (a Backup's hold, an Update's claim on
+`version`) is released when that resource is gone. Both are checked from the
+resource that depends, at the start of each of its steps, by the runtime of
+its kind; a resync finds whatever a missed notice left.
+
+One-shot kinds such as Update and Backup declare `retention/0`, a keep count
+and a TTL. A resource with a terminal verdict gets a finished stamp; the
+newest `keep` by uid remain, and of those any finished longer ago than the
+TTL goes too. The count is the bound that always holds: the stamp is status
+and starts again after a reboot. Collection is an ordinary delete, so
+finalizers run.
 
 ## Clocks
 
