@@ -60,7 +60,14 @@ defmodule Vagus.Resource.Controllers.Supervisor do
           max_seconds: 30
         ]
 
-        %{id: controller, type: :supervisor, start: {Supervisor, :start_link, [pair, options]}}
+        # `:infinity` as for any supervisor: killed after a timeout, the pair
+        # would leave its task supervisor, and the steps under it, running.
+        %{
+          id: controller,
+          type: :supervisor,
+          shutdown: :infinity,
+          start: {Supervisor, :start_link, [pair, options]}
+        }
       end
 
     Supervisor.init(children, strategy: :one_for_one, max_restarts: 5, max_seconds: 30)

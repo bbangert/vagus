@@ -354,7 +354,11 @@ defmodule Vagus.Resource.Harness do
   def put_fact(%{world: world}, key, value),
     do: Agent.update(world, &put_in(&1.facts[key], value))
 
-  @doc "Adds an action to the journal, under the resource it was done for."
+  @doc """
+  Adds an action to the journal, under the resource it was done for: `key`
+  is `{controller, name}`, which is how the fault harness knows whose
+  actions an interruption may have repeated.
+  """
   @spec record(%{world: pid()}, term(), term()) :: :ok
   def record(%{world: world}, key, action),
     do: Agent.update(world, &%{&1 | journal: [{key, action} | &1.journal]})
@@ -451,6 +455,15 @@ defmodule Vagus.Resource.Harness.Faults do
   is then empty. The reference is taken as it is: what it repeats, the
   interrupted run must repeat.
 
+  A replay is allowed only in the resources of the controller that was
+  killed. Every other controller's actions must be exactly the reference's:
+  its runtime lost nothing, and what it acts on is what it observes, which a
+  replayed action, being idempotent, does not change. If such a controller
+  repeats or adds an action after another was interrupted, it is acting on
+  something that the interruption made visible for longer or that a replay
+  disturbed, and either is a defect in one of the two, not a tolerance to
+  grant.
+
   Only the order within one resource is compared: independent runtimes
   interleave differently on every run, interrupted or not. And a boundary is
   never inside `act/3`: an action that is itself several steps, and breaks
@@ -476,7 +489,7 @@ defmodule Vagus.Resource.Harness.Faults do
   for what it needs; `:system`, `Vagus.Resource.Harness.start_system/1`
   options; `:normalize`, applied to each final store before comparing;
   `:equivalent`, a function of one resource's reference and interrupted
-  actions in place of `replay?/2`.
+  actions in place of `replay?/2`, for the killed controller's resources.
 
   Returns the undisturbed run: `store`, `journal` (actions per resource) and
   `boundaries` (labels in the order crossed).
@@ -497,7 +510,7 @@ defmodule Vagus.Resource.Harness.Faults do
           nth <- 1..crossed,
           do: {label, nth}
 
-    for {{_controller, _name, kind} = label, nth} = target <- Enum.sort(targets) do
+    for {{killed, _name, kind} = label, nth} = target <- Enum.sort(targets) do
       interrupted = run(system, {:kill_at, target}, scenario, normalize)
       where = "killed after #{inspect(label)} ##{nth}"
 
@@ -512,7 +525,12 @@ defmodule Vagus.Resource.Harness.Faults do
       for key <- Enum.uniq(Map.keys(reference.journal) ++ Map.keys(interrupted.journal)) do
         {expected, found} = {reference.journal[key] || [], interrupted.journal[key] || []}
 
-        assert equivalent.(expected, found), """
+        same? =
+          if match?({^killed, _name}, key),
+            do: equivalent.(expected, found),
+            else: expected == found
+
+        assert same?, """
         #{where}: the actions for #{inspect(key)} differ.
         undisturbed: #{inspect(expected)}
         interrupted: #{inspect(found)}

@@ -60,8 +60,8 @@ defmodule Vagus.Resource.Toys do
 
     Facts: `{:observe, name}` is `:block` (parks `observe/2` after telling
     the test `{:observing, name, pid}`) or `:raise`; `:engine` set to `:down`
-    makes it unavailable, and with `:act_when_down` it asks for a visit even
-    so; `{:act, name}` is `:block` (parks after `{:acting, name, n, pid}`,
+    makes it unavailable, and with `:act_when_down` it asks for visits even
+    so, with writes to its spec around them; `{:act, name}` is `:block` (parks after `{:acting, name, n, pid}`,
     which every attempt sends, until `:go` or `{:fail, reason}`), `:raise` or
     `{:error, reason}`; `{:requeue, name}` is a delay to ask for once seen.
     """
@@ -102,8 +102,18 @@ defmodule Vagus.Resource.Toys do
     end
 
     @impl true
-    def reconcile(_probe, {:unavailable, :acting_anyway}),
-      do: {verdict(false, true, :engine_unavailable), [{:action, :visit, 0}]}
+    def reconcile(%{name: name}, {:unavailable, :acting_anyway}) do
+      note = &{:update_spec, :probe, name, %{&1 => true}, []}
+
+      {verdict(false, true, :engine_unavailable),
+       [
+         note.("before"),
+         {:action, :visit, 0},
+         note.("between"),
+         {:action, :visit, 0},
+         note.("after")
+       ]}
+    end
 
     def reconcile(_probe, {:unavailable, reason}), do: {verdict(false, true, reason), []}
 
@@ -142,7 +152,7 @@ defmodule Vagus.Resource.Toys do
           if order == :raise, do: raise("probe #{name} was told to")
 
           with :ok <- if(order == :block, do: Toys.wait(), else: :ok) do
-            Harness.record(context, {:probe, name}, {action, n})
+            Harness.record(context, {__MODULE__, name}, {action, n})
             Harness.put_fact(context, {:seen, name}, n)
           end
       end
@@ -191,7 +201,7 @@ defmodule Vagus.Resource.Toys do
       if action == :unmake and Harness.fact(context, {:unmake, name}) == :block,
         do: Toys.parked(context, {:unmaking, name, self()})
 
-      Harness.record(context, {:kept, name}, action)
+      Harness.record(context, {__MODULE__, name}, action)
       Harness.put_fact(context, {:made, name}, action == :make)
     end
   end
@@ -237,7 +247,7 @@ defmodule Vagus.Resource.Toys do
       if action == :untag and Harness.fact(context, {:untag, name}) == :block,
         do: Toys.parked(context, {:untagging, name, self()})
 
-      Harness.record(context, {:tagger, name}, action)
+      Harness.record(context, {__MODULE__, name}, action)
       Harness.put_fact(context, {:tag, name}, action == :tag)
     end
   end
@@ -318,7 +328,7 @@ defmodule Vagus.Resource.Toys do
     @impl true
     def condition_types, do: [:done]
     @impl true
-    def retention, do: %{keep: 2, ttl_ms: 1_000}
+    def retention, do: %{keep: 2, ttl_ms: 100_000}
     @impl true
     def observe(_oneshot, _context), do: %{}
     @impl true
@@ -349,7 +359,7 @@ defmodule Vagus.Resource.Toys do
 
     @impl true
     def act(:poke, nil, %{resource: %{name: name}} = context) do
-      Harness.record(context, {:sloppy, name}, :poke)
+      Harness.record(context, {__MODULE__, name}, :poke)
       Harness.put_fact(context, {:poked, name}, true)
     end
   end
@@ -393,7 +403,7 @@ defmodule Vagus.Resource.Toys do
     def act(:mark, n, %{resource: %{name: name}} = context) do
       status = Vagus.Resource.Store.get(:batch, name, instance: context.instance).status
       Harness.note(context, {:status_at_mark, n, status})
-      Harness.record(context, {:batch, name}, {:mark, n})
+      Harness.record(context, {__MODULE__, name}, {:mark, n})
       Harness.put_fact(context, {:mark, name}, n)
     end
   end
@@ -606,7 +616,7 @@ defmodule Vagus.Resource.Toys do
 
     @impl true
     def act(:nudge, 1, %{resource: %{name: name}} = context),
-      do: Harness.record(context, {:idle, name}, :nudge)
+      do: Harness.record(context, {__MODULE__, name}, :nudge)
   end
 
   defmodule Last do
@@ -750,8 +760,46 @@ defmodule Vagus.Resource.Toys do
 
     @impl true
     def act(action, nil, %{resource: %{name: name}} = context) do
-      Harness.record(context, {:twisted, name}, action)
+      Harness.record(context, {__MODULE__, name}, action)
       Harness.put_fact(context, {action, name}, true)
+    end
+  end
+
+  defmodule Copycat do
+    @moduledoc """
+    Owns `:copycat`. Copies once for every count `Fragile` has made for the
+    resource named in `spec["target"]`, so it does twice what `Fragile`
+    did twice.
+    """
+    @behaviour Vagus.Resource.Controller
+
+    alias Vagus.Resource.Harness
+
+    @impl true
+    def kind, do: :copycat
+    @impl true
+    def condition_types, do: [:ready]
+    @impl true
+    def references(%{spec: %{"target" => target}}), do: [{:fragile, target}]
+
+    @impl true
+    def observe(%{name: name, spec: %{"target" => target}}, context) do
+      %{
+        count: Harness.fact(context, {:count, target}) || 0,
+        copied: Harness.fact(context, {:copied, name}) || 0
+      }
+    end
+
+    @impl true
+    def reconcile(_copycat, %{count: count, copied: copied}) do
+      {Verdict.new(ready: {copied == count, :copying}),
+       if(copied < count, do: [{:action, :copy, copied + 1}], else: [])}
+    end
+
+    @impl true
+    def act(:copy, n, %{resource: %{name: name}} = context) do
+      Harness.record(context, {__MODULE__, name}, :copy)
+      Harness.put_fact(context, {:copied, name}, n)
     end
   end
 
@@ -783,7 +831,7 @@ defmodule Vagus.Resource.Toys do
 
     @impl true
     def act(:count, nil, %{resource: %{name: name}} = context) do
-      Harness.record(context, {:fragile, name}, :count)
+      Harness.record(context, {__MODULE__, name}, :count)
       Harness.put_fact(context, {:count, name}, (Harness.fact(context, {:count, name}) || 0) + 1)
     end
   end

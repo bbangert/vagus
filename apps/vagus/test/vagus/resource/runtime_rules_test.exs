@@ -157,6 +157,28 @@ defmodule Vagus.Resource.RuntimeRulesTest do
     end
   end
 
+  describe "supervision" do
+    test "every supervisor in the subtree is given all the time it needs to stop" do
+      sys = start_system(controllers: [Probe])
+      controllers = Vagus.Resource.Controllers.Supervisor.name(sys.instance)
+      pair = Vagus.Resource.Controllers.Supervisor.pair(sys.instance, Probe)
+
+      assert {:ok, %{type: :supervisor, shutdown: :infinity, restart: :permanent}} =
+               :supervisor.get_childspec(controllers, Probe)
+
+      assert {:ok, %{type: :supervisor, shutdown: :infinity}} =
+               :supervisor.get_childspec(pair, Runtime.tasks(sys.instance, Probe))
+
+      assert {:ok, %{type: :worker, shutdown: 5_000}} = :supervisor.get_childspec(pair, Runtime)
+
+      assert {:ok, %{type: :supervisor, shutdown: :infinity}} =
+               :supervisor.get_childspec(
+                 Module.concat(sys.instance, Supervisor),
+                 Vagus.Resource.Controllers.Supervisor
+               )
+    end
+  end
+
   describe "registration" do
     test "two controllers declaring one condition type fail the start, by name" do
       assert {:error, reason} = TestInstance.start(controllers: [Kept, Clasher], kinds: %{})
@@ -213,7 +235,7 @@ defmodule Vagus.Resource.RuntimeRulesTest do
       settle(sys)
 
       # The first is followed at once, as any pass that acted is.
-      assert journal(sys) == [{{:idle, "i"}, :nudge}, {{:idle, "i"}, :nudge}]
+      assert journal(sys) == [{{Idle, "i"}, :nudge}, {{Idle, "i"}, :nudge}]
       assert %{steps: 2, timers: ["i"]} = Runtime.info(Idle, sys.i)
     end
 

@@ -6,7 +6,7 @@ defmodule Vagus.Resource.HarnessTest do
   alias Vagus.Resource
   alias Vagus.Resource.Harness.Faults
   alias Vagus.Resource.{Runtime, Store, TestInstance}
-  alias Vagus.Resource.Toys.{Fragile, Kept, Linker, Probe, Tagger, Twisted}
+  alias Vagus.Resource.Toys.{Copycat, Fragile, Kept, Linker, Probe, Tagger, Twisted}
 
   @moduletag :capture_log
   @moduletag :scenario
@@ -41,9 +41,9 @@ defmodule Vagus.Resource.HarnessTest do
       assert [%Resource{kind: :link, name: "l"}] = reference.store
 
       assert reference.journal == %{
-               {:probe, "p"} => [visit: 1, visit: 2],
-               {:kept, "k"} => [:make, :unmake],
-               {:tagger, "k"} => [:tag, :untag]
+               {Probe, "p"} => [visit: 1, visit: 2],
+               {Kept, "k"} => [:make, :unmake],
+               {Tagger, "k"} => [:tag, :untag]
              }
     end
 
@@ -69,7 +69,7 @@ defmodule Vagus.Resource.HarnessTest do
           end
 
         assert error.message =~ ~s(killed after {Vagus.Resource.Toys.Twisted, "t", :commit} #1)
-        assert error.message =~ ~s(the actions for {:twisted, "t"} differ)
+        assert error.message =~ ~s(the actions for {Vagus.Resource.Toys.Twisted, "t"} differ)
         assert error.message =~ "undisturbed: [:a, :b]"
         assert error.message =~ "interrupted: #{unquote(interrupted)}"
       end
@@ -97,6 +97,30 @@ defmodule Vagus.Resource.HarnessTest do
                    end
     end
 
+    test "fails on the actions when a controller that was not killed repeats one" do
+      # `Fragile` counts twice when cut after its action; `Copycat` copies
+      # each count. Only the first of the two was interrupted.
+      scenario = fn sys ->
+        given_ready(sys, {:copycat, "c", %{"target" => "f"}})
+        given_ready(sys, {:fragile, "f", %{}})
+        await!(sys, :copycat, "c", :ready)
+      end
+
+      error =
+        assert_raise ExUnit.AssertionError, fn ->
+          Faults.each_boundary(
+            system: [controllers: [Copycat, Fragile]],
+            scenario: scenario,
+            normalize: fn _store -> :same end
+          )
+        end
+
+      assert error.message =~ ~s(killed after {Vagus.Resource.Toys.Fragile, "f", :action} #1)
+      assert error.message =~ ~s(the actions for {Vagus.Resource.Toys.Copycat, "c"} differ)
+      assert error.message =~ "undisturbed: [:copy]"
+      assert error.message =~ "interrupted: [:copy, :copy]"
+    end
+
     test "fails a scenario that crosses no boundary" do
       assert_raise ExUnit.AssertionError, ~r/crosses no boundary/, fn ->
         Faults.each_boundary(system: [controllers: [Probe]], scenario: fn _sys -> :ok end)
@@ -107,7 +131,7 @@ defmodule Vagus.Resource.HarnessTest do
       scenario = fn sys -> given_ready(sys, {:twisted, "t", %{"twist" => "extra"}}) end
       anything = fn _reference, _interrupted -> true end
 
-      assert %{journal: %{{:twisted, "t"} => [:a, :b]}} =
+      assert %{journal: %{{Twisted, "t"} => [:a, :b]}} =
                Faults.each_boundary(
                  system: [controllers: [Twisted]],
                  scenario: scenario,

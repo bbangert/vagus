@@ -51,9 +51,8 @@ defmodule Vagus.Resource.Collector do
   end
 
   @doc """
-  One commit for each finished resource of `kind` that `retention` no
-  longer keeps. Each expects the uid that was listed: by the time it is
-  deleted, the name may be another resource's.
+  The finished resources of `kind` that `retention` no longer keeps, each
+  by uid: by the time one is deleted, its name may be another resource's.
 
   Newest is highest uid. A finished stamp is status, so after a reboot it is
   taken again and tells nothing of the order things finished in; the uid
@@ -64,7 +63,7 @@ defmodule Vagus.Resource.Collector do
           %{keep: non_neg_integer(), ttl_ms: non_neg_integer() | :infinity},
           Stamp.t(),
           keyword()
-        ) :: [[Store.op()]]
+        ) :: [Resource.ref()]
   def expired(kind, %{keep: keep, ttl_ms: ttl}, %Stamp{} = now, opts \\ []) do
     finished =
       for %Resource{deleting?: false, status: %{finished: %Stamp{}}} = resource <-
@@ -74,9 +73,7 @@ defmodule Vagus.Resource.Collector do
     {kept, beyond} = finished |> Enum.sort_by(& &1.uid, :desc) |> Enum.split(keep)
     old = Enum.filter(kept, &(ttl != :infinity and Stamp.age(&1.status.finished, now) > ttl))
 
-    for %Resource{name: name, uid: uid} <- beyond ++ old do
-      [{:expect, kind, name, uid: uid}, {:delete, kind, name}]
-    end
+    Enum.map(beyond ++ old, &Resource.ref/1)
   end
 
   defp writers(resource) do

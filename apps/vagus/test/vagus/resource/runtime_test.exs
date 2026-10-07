@@ -47,7 +47,7 @@ defmodule Vagus.Resource.RuntimeTest do
       await!(sys, :probe, "p", :ready)
       settle(sys)
       assert fact(sys, {:seen, "p"}) == 4
-      assert journal(sys) == [{{:probe, "p"}, {:visit, 1}}, {{:probe, "p"}, {:visit, 4}}]
+      assert journal(sys) == [{{Probe, "p"}, {:visit, 1}}, {{Probe, "p"}, {:visit, 4}}]
     end
 
     test "a crashed step frees its key and backs off, and the runtime survives" do
@@ -279,7 +279,7 @@ defmodule Vagus.Resource.RuntimeTest do
       send(holder, :go)
       settle(sys)
 
-      assert journal(sys) == [{{:probe, "a"}, {:fetch, 1}}]
+      assert journal(sys) == [{{Probe, "a"}, {:fetch, 1}}]
       refute_received {:acting, "b", 1, _step}
       assert %{pull: %{held: [], waiting: 0}} = Lanes.info(sys.i)
 
@@ -304,7 +304,7 @@ defmodule Vagus.Resource.RuntimeTest do
       settle(sys)
       assert %{status: true, reason: :made} = condition(sys, :kept, "k", :ready)
       assert %{status: true, reason: :tagged} = condition(sys, :kept, "k", :tagged)
-      assert Enum.count(journal(sys), &(&1 == {{:tagger, "k"}, :tag})) == 2
+      assert Enum.count(journal(sys), &(&1 == {{Tagger, "k"}, :tag})) == 2
 
       # And only the owner about this; the generation observed is the owner's.
       put_fact(sys, {:made, "k"}, false)
@@ -313,7 +313,7 @@ defmodule Vagus.Resource.RuntimeTest do
       kept = Store.get(:kept, "k", sys.i)
       assert kept.status.observed_generation == kept.generation
       assert Enum.sort(Map.keys(kept.status.conditions)) == [:ready, :tagged]
-      assert Enum.count(journal(sys), &(&1 == {{:kept, "k"}, :make})) == 2
+      assert Enum.count(journal(sys), &(&1 == {{Kept, "k"}, :make})) == 2
     end
 
     test "a verdict missing a declared condition type fails the step and writes nothing" do
@@ -340,7 +340,7 @@ defmodule Vagus.Resource.RuntimeTest do
       assert %{failures: failures} = Runtime.info(Sloppy, sys.i)
       assert failures == %{}
       assert Store.get(:sloppy, "s", sys.i) == created
-      assert journal(sys) == [{{:sloppy, "s"}, :poke}]
+      assert journal(sys) == [{{Sloppy, "s"}, :poke}]
     end
   end
 
@@ -371,7 +371,7 @@ defmodule Vagus.Resource.RuntimeTest do
       assert %{spec: %{"a" => true, "b" => true, "c" => true, "d" => true}, generation: 5} =
                Store.get(:batch, "b", sys.i)
 
-      assert journal(sys) == [{{:batch, "b"}, {:mark, 1}}, {{:batch, "b"}, {:mark, 2}}]
+      assert journal(sys) == [{{Batch, "b"}, {:mark, 1}}, {{Batch, "b"}, {:mark, 2}}]
 
       # The verdict went with the first group: it is there before any action.
       assert [{:status_at_mark, 1, at_first}, {:status_at_mark, 2, _status}] = notes(sys)
@@ -486,7 +486,7 @@ defmodule Vagus.Resource.RuntimeTest do
       await!(sys, :probe, "p", :ready)
     end
 
-    test "has none of the actions decided from it performed" do
+    test "has none of the actions decided from it performed, and every write around them made" do
       sys = start_system(controllers: [Probe], runtime: [unavailable_retry: 600_000])
       put_fact(sys, :engine, :down)
       put_fact(sys, :act_when_down, true)
@@ -494,13 +494,20 @@ defmodule Vagus.Resource.RuntimeTest do
       log =
         capture_log(fn ->
           {:ok, _} = Store.create(:probe, "p", %{}, sys.i)
-          await!(sys, :probe, "p", :progressing)
+          await!(sys, :probe, "p", &(&1.status != %{}))
           settle(sys)
         end)
 
-      assert log =~ "probe/p could not be observed; not performing [visit: 0]"
+      assert log =~ "probe/p could not be observed; not performing [visit: 0, visit: 0]"
       assert journal(sys) == []
       refute_received {:acting, "p", _n, _step}
+
+      # The writes before, between and after the two actions, with the
+      # verdict, as the one group they are once nothing separates them.
+      assert %{spec: %{"before" => true, "between" => true, "after" => true}, generation: 4} =
+               Store.get(:probe, "p", sys.i)
+
+      assert %{reason: :engine_unavailable} = condition(sys, :probe, "p", :progressing)
       assert %{timers: ["p"], steps: 1} = Runtime.info(Probe, sys.i)
     end
   end

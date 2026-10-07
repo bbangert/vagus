@@ -131,7 +131,7 @@ defmodule Vagus.Resource.Runtime.Step do
     {verdict, effects} = step.controller.reconcile(resource, observation)
     verdict = admitted(step, resource, verdict)
     {[first | acts], requeue} = plan(effects)
-    acts = performable(step, resource, acts, unavailable?)
+    {first, acts} = performable(step, resource, first, acts, unavailable?)
     requeue = sooner(requeue, expiry(step, resource, verdict, now))
 
     outcome =
@@ -155,17 +155,18 @@ defmodule Vagus.Resource.Runtime.Step do
 
   # With nothing observed there is nothing an action could rightly be
   # decided from, and one that failed against an absent engine would be
-  # counted against the resource.
-  defp performable(_step, _resource, acts, false), do: acts
-  defp performable(_step, _resource, [], true), do: []
+  # counted against the resource. Only the actions go: the ops around them
+  # are still written, as one group now that nothing separates them.
+  defp performable(_step, _resource, first, acts, false), do: {first, acts}
+  defp performable(_step, _resource, first, [], true), do: {first, []}
 
-  defp performable(step, resource, acts, true) do
+  defp performable(step, resource, first, acts, true) do
     Logger.warning(
       "#{inspect(step.controller)}: #{resource.kind}/#{resource.name} could not be observed; " <>
         "not performing #{inspect(Enum.map(acts, &elem(&1, 0)))}"
     )
 
-    []
+    {first ++ Enum.flat_map(acts, &elem(&1, 1)), []}
   end
 
   defp sooner(nil, ms), do: ms
@@ -260,7 +261,13 @@ defmodule Vagus.Resource.Runtime.Step do
 
   defp group(_step, _resource, []), do: :ok
 
-  defp group(step, %Resource{kind: kind, name: name, uid: uid} = resource, ops) do
+  defp group(step, resource, ops),
+    do: commit(step, resource, ops, if(idle?(resource, ops), do: :idle_commit, else: :commit))
+
+  # Every write of a step: not during a shutdown, only to the resource that
+  # was read, and failing the step on anything else the store refuses.
+  # `:gone` when `target` is no longer that resource.
+  defp commit(step, %{kind: kind, name: name, uid: uid}, ops, boundary) do
     if step.shutdown?.() do
       :gated
     else
@@ -268,7 +275,7 @@ defmodule Vagus.Resource.Runtime.Step do
       # namesake created after it was deleted.
       case Store.commit([{:expect, kind, name, uid: uid} | ops], step.i) do
         {:ok, _resources} ->
-          boundary(step, if(idle?(resource, ops), do: :idle_commit, else: :commit))
+          boundary(step, boundary)
 
         {:error, {:precondition, {^kind, ^name}, _field}} ->
           :gone
@@ -284,15 +291,16 @@ defmodule Vagus.Resource.Runtime.Step do
          %Verdict{terminal?: true},
          now
        ) do
-    if step.shutdown?.() do
-      :gated
-    else
-      for ops <- Collector.expired(step.kind, retention, now, step.i) do
-        Store.commit(ops, step.i)
+    step.kind
+    |> Collector.expired(retention, now, step.i)
+    |> Enum.reduce_while(:ok, fn expired, :ok ->
+      case commit(step, expired, [{:delete, expired.kind, expired.name}], :commit) do
+        # Deleted, or replaced under its name since it was listed, which
+        # leaves nothing of it to delete.
+        done when done in [:ok, :gone] -> {:cont, :ok}
+        :gated -> {:halt, :gated}
       end
-
-      :ok
-    end
+    end)
   end
 
   defp retain(_step, _verdict, _now), do: :ok
