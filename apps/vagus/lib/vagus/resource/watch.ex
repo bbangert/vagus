@@ -12,7 +12,10 @@ defmodule Vagus.Resource.Watch do
 
   With the registry gone the whole `Vagus.Resource.Supervisor` subtree is
   restarting, and `subscribe/2` raises. Subscribing links the subscriber to
-  the registry, so one that does not trap exits goes down with it.
+  the registry, so one that does not trap exits goes down with it, and a
+  subscription never outlives the registry it was made in: a subscriber
+  that traps exits is left with none and has to end or subscribe again.
+  `Vagus.Resource.Store.await/4` ends.
   """
 
   alias Vagus.Resource

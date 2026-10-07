@@ -92,7 +92,10 @@ Core is not a separate mechanism. It is a resource of kind App named
   on a resource: its entries are deleted, any other value stays, unowned.
 - `Store.await` blocks its caller until a function of one resource halts. It
   subscribes before its first read, reads again on every notification and
-  once a second regardless, and gives up at a deadline.
+  once a second regardless, and gives up at a deadline. A store restart
+  during the wait costs it nothing, the subscription being in `Watch`. A
+  `Watch` restart, which replaces the whole subtree, ends the wait with an
+  exit, as it ends every subscriber.
 - The store keeps one in-memory operation claim per app. A command takes it;
   a second mutating command on that app fails as busy. The claim ends when
   its holder releases it or dies, and outlives a store restart.

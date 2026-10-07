@@ -280,8 +280,18 @@ defmodule Vagus.Resource.Store do
 
   The caller subscribes to the object before the first read, so no change
   falls between the two, and reads again on every notification. It also
-  reads every `:poll` (1 s): a subscription does not outlive the `Watch`
-  registry, and the wait must not hang on a notification nobody sent.
+  reads every `:poll` (1 s), for the notification that never comes: one the
+  store did not live to send, or a wait for something that is not a change
+  to the resource at all. A store that restarts during the wait costs
+  nothing else: the subscription is in `Vagus.Resource.Watch`, which
+  outlives it.
+
+  **The wait does not outlive `Watch`.** When the registry goes, with the
+  whole subtree, the caller goes with it as every subscriber does: by its
+  link to the registry, with the registry's reason, or by an exit from here
+  with `{:watch_down, reason}`, whichever comes first. A caller that traps
+  exits gets the second. A wait that went on without a subscription would
+  end as a timeout that says nothing of why.
 
   The caller must hold no subscription of its own to the same object; the
   notifications left in its mailbox when this returns are dropped. To be
@@ -294,15 +304,27 @@ defmodule Vagus.Resource.Store do
     watch = Keyword.take(opts, [:instance])
     key = {:object, kind, name}
     deadline = System.monotonic_time(:millisecond) + Keyword.get(opts, :timeout, 5_000)
+    # For the caller that traps exits, whom the link to the registry only
+    # sends a message.
+    registry = Process.monitor(Watch.name(instance(opts)))
     :ok = Watch.subscribe(key, watch)
 
     try do
-      await_loop({kind, name}, fun, deadline, Keyword.get(opts, :poll, 1_000), opts)
+      await_loop({kind, name}, fun, {deadline, Keyword.get(opts, :poll, 1_000), registry}, opts)
     after
-      Watch.unsubscribe(key, watch)
+      Process.demonitor(registry, [:flush])
+      withdraw(key, watch)
       behind_dispatch(opts)
       drop_notifications(kind, name)
     end
+  end
+
+  # With the registry gone there is nothing to withdraw, and raising here
+  # would replace the exit that says so.
+  defp withdraw(key, watch) do
+    Watch.unsubscribe(key, watch)
+  rescue
+    ArgumentError -> :ok
   end
 
   # The store may have read the subscription, for a notification it is about
@@ -322,7 +344,7 @@ defmodule Vagus.Resource.Store do
     :exit, _reason -> :ok
   end
 
-  defp await_loop({kind, name} = key, fun, deadline, poll, opts) do
+  defp await_loop({kind, name} = key, fun, {deadline, poll, registry} = timing, opts) do
     resource = get(kind, name, opts)
 
     case fun.(resource) do
@@ -337,11 +359,12 @@ defmodule Vagus.Resource.Store do
           remaining ->
             receive do
               {Watch, _event, %{kind: ^kind, name: ^name}} -> :ok
+              {:DOWN, ^registry, :process, _pid, reason} -> exit({:watch_down, reason})
             after
               min(remaining, poll) -> :ok
             end
 
-            await_loop(key, fun, deadline, poll, opts)
+            await_loop(key, fun, timing, opts)
         end
     end
   end

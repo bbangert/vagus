@@ -275,6 +275,62 @@ defmodule Vagus.Resource.StoreAdditionsTest do
       assert Registry.keys(Watch.name(instance), self()) == []
     end
 
+    # A waiter that tells the test when it has read once, which is after it
+    # subscribed, and what its wait came to.
+    defp waiter(i, trap_exits?) do
+      test = self()
+
+      spawn_monitor(fn ->
+        Process.flag(:trap_exit, trap_exits?)
+
+        halt = fn resource ->
+          send(test, :reading)
+          if resource && resource.spec["go"], do: {:halt, :went}, else: :cont
+        end
+
+        send(test, {:waited, Store.await(:part, "p", halt, [timeout: 60_000, poll: 60_000] ++ i)})
+      end)
+    end
+
+    test "ends with the registry: the waiter exits as every subscriber does", %{i: i} do
+      {waiter, monitor} = waiter(i, false)
+      assert_receive :reading, 1_000
+
+      Process.exit(Process.whereis(Watch.name(i[:instance])), :kill)
+      assert_receive {:DOWN, ^monitor, :process, ^waiter, reason}, 1_000
+
+      # By its link to the registry or by noticing first that it is gone:
+      # the two race, and either way the wait is over and nothing returned.
+      assert reason in [:killed, {:watch_down, :killed}]
+      refute_received {:waited, _result}
+    end
+
+    test "ends with the registry for a waiter that traps exits too, and says why" do
+      # Not restarted, so that the wait ends with no registry to tidy up in.
+      instance = TestInstance.name()
+      start_supervised!({Vagus.Resource.Tables, instance})
+      registry = start_supervised!(Map.put(Watch.child_spec(instance), :restart, :temporary))
+
+      {waiter, monitor} = waiter([instance: instance], true)
+      assert_receive :reading, 1_000
+
+      Process.exit(registry, :kill)
+      assert_receive {:DOWN, ^monitor, :process, ^waiter, {:watch_down, :killed}}, 1_000
+      refute_received {:waited, _result}
+    end
+
+    test "goes on through a store restart, and hears the write made after it", %{i: i} do
+      {:ok, _} = Store.create(:part, "p", %{}, i)
+      {waiter, monitor} = waiter(i, false)
+      assert_receive :reading, 1_000
+
+      TestInstance.restart_store(i[:instance])
+      {:ok, _} = Store.update_spec(:part, "p", %{"go" => true}, i)
+
+      assert_receive {:waited, {:ok, :went}}, 1_000
+      assert_receive {:DOWN, ^monitor, :process, ^waiter, :normal}, 1_000
+    end
+
     test "gives up at the deadline with what it last saw, and leaves nothing behind", %{i: i} do
       {:ok, created} = Store.create(:part, "p", %{}, i)
 
