@@ -18,6 +18,20 @@ defmodule Vagus.Resource.StorePersistenceTest do
     end
   end
 
+  # Writes for real, then does `then` if the test left a marker beside the
+  # file, so one chosen write of a store's life goes wrong.
+  defp marked(then) do
+    fn path, data ->
+      result = Persistence.write(path, data)
+      if File.rm(path <> ".marker") == :ok, do: then.(), else: result
+    end
+  end
+
+  defp mark(path), do: File.write!(path <> ".marker", "")
+
+  defp rewrite(path, fun),
+    do: File.write!(path, path |> File.read!() |> Jason.decode!() |> fun.() |> Jason.encode!())
+
   defp start!(path, opts \\ []) do
     instance = TestInstance.start!([path: path] ++ opts)
     i = [instance: instance]
@@ -31,19 +45,46 @@ defmodule Vagus.Resource.StorePersistenceTest do
   end
 
   describe "what reaches flash" do
-    test "status, claims and registrations never do", %{path: path} do
+    test "status never does, nor a write that changes nothing", %{path: path} do
       i = start!(path, persist: counting(self()))
       {:ok, _} = Store.create(:thing, "t", %{a: 1}, i)
       assert_received {:persisted, ^path}
 
       status = %{conditions: [Resource.condition(:ready, true, :running, 1)], instance: "c1"}
-      {:ok, _} = Store.patch_status(:thing, "t", status, [writer: Owner] ++ i)
-      :ok = Store.claim(:thing, "t", i)
-      :ok = Store.release_claim(:thing, "t", i)
-      :ok = Store.register_writer(:thing, Dns, [conditions: [:dns_ready]] ++ i)
+
+      {:ok, %{status: %{instance: "c1"}}} =
+        Store.patch_status(:thing, "t", status, [writer: Owner] ++ i)
+
       {:ok, _} = Store.update_spec(:thing, "t", %{a: 1}, i)
 
       refute_received {:persisted, _}
+    end
+
+    test "progress, a finalizer and a deletion each do, by themselves", %{path: path} do
+      i = start!(path, persist: counting(self()))
+      {:ok, _} = Store.create(:thing, "t", %{a: 1}, i)
+      assert_received {:persisted, ^path}
+
+      {:ok, _} = Store.put_progress(:thing, "t", %{phase: :applied}, [writer: Owner] ++ i)
+      assert_received {:persisted, ^path}
+
+      {:ok, _} = Store.add_finalizer(:thing, "t", :tidy, i)
+      assert_received {:persisted, ^path}
+
+      {:ok, %{deleting?: true}} = Store.delete(:thing, "t", i)
+      assert_received {:persisted, ^path}
+
+      refute_received {:persisted, _}
+    end
+
+    test "a create and delete in one commit still writes the spent uid", %{path: path} do
+      i = start!(path, persist: counting(self()))
+      {:ok, _} = Store.commit([{:create, :part, "p", %{}, []}, {:delete, :part, "p"}], i)
+      assert_received {:persisted, ^path}
+
+      i = restart!(i, path)
+
+      assert {:ok, %{uid: 2}} = Store.create(:part, "p", %{}, i)
     end
 
     test "a commit that changes specs is written exactly once", %{path: path} do
@@ -129,6 +170,48 @@ defmodule Vagus.Resource.StorePersistenceTest do
 
       assert Store.get(:thing, "t", i) == nil
       refute_received {Watch, _, _}
+    end
+
+    @tag :capture_log
+    test "a flash write that fails after its rename stops the store, and the next has it",
+         %{path: path} do
+      i = start!(path, persist: marked(fn -> {:unknown, :eio} end))
+      {:ok, _} = Store.create(:thing, "t", %{a: 1}, i)
+      :ok = Watch.subscribe({:object, :thing, "t"}, i)
+
+      mark(path)
+
+      assert {{:persist_outcome_unknown, :eio}, _call} =
+               catch_exit(Store.update_spec(:thing, "t", %{a: 2}, i))
+
+      assert_receive {Watch, :changed, %{name: "t", generation: 2}}, 1_000
+      assert %Resource{spec: %{a: 2}} = Store.get(:thing, "t", i)
+    end
+
+    test "a write that fails before the rename leaves the file and no temporary",
+         %{path: path} do
+      :ok = Persistence.write(path, "first")
+
+      assert {:error, :badarg} = Persistence.write(path, [:not_iodata])
+
+      assert File.read!(path) == "first"
+      assert File.ls!(Path.dirname(path)) == ["resources.json"]
+    end
+
+    test "a write that fails after the rename says the outcome is unknown", %{tmp_dir: dir} do
+      locked = Path.join(dir, "locked")
+      path = Path.join(locked, "resources.json")
+      :ok = Persistence.write(path, "first")
+
+      # Entries can still be made and renamed; the directory cannot be
+      # opened, which is what syncing it needs.
+      File.chmod!(locked, 0o300)
+      on_exit(fn -> File.chmod!(locked, 0o700) end)
+
+      assert {:unknown, :eacces} = Persistence.write(path, "second")
+
+      File.chmod!(locked, 0o700)
+      assert File.read!(path) == "second"
     end
 
     test "a write replaces the file whole and leaves no temporary behind", %{tmp_dir: dir} do
@@ -220,6 +303,23 @@ defmodule Vagus.Resource.StorePersistenceTest do
       assert {:ok, %{uid: 3}} = Store.create(:thing, "c", %{}, i)
     end
 
+    test "a path can be given up on a spec the kind would no longer admit", %{path: path} do
+      i = start!(path)
+      {:ok, _} = Store.create(:thing, "t", %{a: 1}, [writer: :ctl] ++ i)
+      :ok = stop_supervised(i[:instance])
+
+      stricter = put_in(TestInstance.kinds(), [:thing, :validators], [fn _ -> {:error, :no} end])
+      i = start!(path, kinds: stricter)
+
+      assert {:error, {:invalid, :no}} =
+               Store.update_spec(:thing, "t", %{a: 2}, [writer: :ctl] ++ i)
+
+      assert {:ok, %{spec: %{a: 1}, managed_fields: fields}} =
+               Store.update_spec(:thing, "t", [{:release, [:a]}], [writer: :ctl] ++ i)
+
+      assert fields == %{}
+    end
+
     test "a missing file is an empty store", %{path: path} do
       i = start!(path)
 
@@ -232,9 +332,9 @@ defmodule Vagus.Resource.StorePersistenceTest do
   describe "a file that cannot be trusted fails the start" do
     @describetag :capture_log
 
-    defp refused(path) do
+    defp refused(path, opts \\ []) do
       assert {:error, {{:shutdown, {:failed_to_start_child, Store, reason}}, _spec}} =
-               TestInstance.start(path: path)
+               TestInstance.start([path: path] ++ opts)
 
       reason
     end
@@ -276,26 +376,133 @@ defmodule Vagus.Resource.StorePersistenceTest do
 
       assert refused(path) == :malformed
     end
+
+    test "no uid counter", %{path: path} do
+      i = start!(path)
+      {:ok, _} = Store.create(:thing, "t", %{}, i)
+      :ok = stop_supervised(i[:instance])
+
+      rewrite(path, &Map.delete(&1, "next_uid"))
+      assert refused(path) == :malformed
+    end
+
+    test "something other than an object", %{path: path} do
+      File.write!(path, "[]")
+      assert refused(path) == :malformed
+    end
+
+    test "an owner reference of the wrong shape", %{path: path} do
+      i = start!(path)
+      {:ok, app} = Store.create(:thing, "app", %{}, i)
+      {:ok, _} = Store.create(:part, "p", %{}, [owner_refs: [Resource.ref(app)]] ++ i)
+      :ok = stop_supervised(i[:instance])
+
+      rewrite(path, fn document ->
+        Map.update!(document, "resources", fn resources ->
+          Enum.map(resources, fn resource ->
+            Map.update!(
+              resource,
+              "owner_refs",
+              &Enum.map(&1, fn ref -> %{ref | "uid" => nil} end)
+            )
+          end)
+        end)
+      end)
+
+      assert refused(path) == :malformed
+    end
+
+    test "an atom this build has never used", %{path: path} do
+      i = start!(path)
+      {:ok, _} = Store.create(:thing, "t", %{}, [finalizers: [:tidy]] ++ i)
+      :ok = stop_supervised(i[:instance])
+
+      File.write!(path, path |> File.read!() |> String.replace(":tidy", ":zz_not_an_atom_yet"))
+      assert refused(path) == {:unknown_atom, "zz_not_an_atom_yet"}
+    end
+
+    test "a kind whose decode hook raises", %{path: path} do
+      i = start!(path)
+      {:ok, _} = Store.create(:thing, "t", %{a: 1}, i)
+      :ok = stop_supervised(i[:instance])
+
+      raising = put_in(TestInstance.kinds(), [:thing, :decode_spec], fn _ -> raise "boom" end)
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert refused(path, kinds: raising) ==
+                   {:hook_failed, :decode_spec, {:thing, "t"}, "boom"}
+        end)
+
+      assert log =~ "cannot start"
+    end
   end
 
-  describe "a store that dies between its flash write and its ETS write" do
+  describe "a store replaced while its file was ahead of ETS" do
     @describetag :capture_log
 
-    test "is replaced by one that takes the file and tells subscribers", %{path: path} do
-      dying = fn path, data ->
-        :ok = Persistence.write(path, data)
-        if IO.iodata_to_binary(data) =~ ~s("a": 2), do: exit(:kill), else: :ok
-      end
-
-      i = start!(path, persist: dying)
+    setup %{path: path} do
+      i = start!(path, persist: marked(fn -> exit(:kill) end))
       {:ok, _} = Store.create(:thing, "t", %{a: 1}, i)
       {:ok, _} = Store.patch_status(:thing, "t", %{instance: "c1"}, [writer: Owner] ++ i)
       :ok = Watch.subscribe({:object, :thing, "t"}, i)
+      %{i: i}
+    end
 
+    test "a changed resource is taken from the file, keeps its status, and is announced",
+         %{path: path, i: i} do
+      mark(path)
       assert catch_exit(Store.update_spec(:thing, "t", %{a: 2}, i))
 
-      assert_receive {Watch, :changed, %{name: "t", generation: 2}}
+      assert_receive {Watch, :changed, %{name: "t", generation: 2}}, 1_000
       assert %Resource{spec: %{a: 2}, status: %{instance: "c1"}} = Store.get(:thing, "t", i)
+    end
+
+    test "a resource the file no longer has is removed and announced", %{path: path, i: i} do
+      mark(path)
+      assert catch_exit(Store.delete(:thing, "t", i))
+
+      assert_receive {Watch, :removed, %{name: "t", uid: 1}}, 1_000
+      assert Store.get(:thing, "t", i) == nil
+    end
+
+    test "a name the file gives another uid is the file's, without the old one's status",
+         %{path: path, i: i} do
+      mark(path)
+
+      assert catch_exit(
+               Store.commit([{:delete, :thing, "t"}, {:create, :thing, "t", %{a: 9}, []}], i)
+             )
+
+      assert_receive {Watch, :changed, %{name: "t", uid: 2}}, 1_000
+      assert %Resource{uid: 2, spec: %{a: 9}, status: status} = Store.get(:thing, "t", i)
+      assert status == %{}
+    end
+
+    test "nothing is announced when the file and ETS agree, and status stays", %{i: i} do
+      before = Store.get(:thing, "t", i)
+
+      TestInstance.restart_store(i[:instance])
+      # The new store's answer follows anything it sent while starting.
+      :ok = Store.register_kind(:thing, Owner, [conditions: [:ready]] ++ i)
+
+      refute_received {Watch, _, _}
+      assert Store.get(:thing, "t", i) == before
+      assert before.status == %{instance: "c1"}
+    end
+
+    test "the uid counter is the highest of the file's, the table's and the uids",
+         %{path: path, i: i} do
+      {:ok, %{uid: 2}} = Store.create(:thing, "u", %{}, i)
+      {:ok, _} = Store.delete(:thing, "u", i)
+      supervisor = Module.concat(i[:instance], Supervisor)
+      :ok = Supervisor.terminate_child(supervisor, Store)
+
+      # Now only the table remembers that uid 2 was given out.
+      rewrite(path, &Map.put(&1, "next_uid", 1))
+      {:ok, _pid} = Supervisor.restart_child(supervisor, Store)
+
+      assert {:ok, %{uid: 3}} = Store.create(:thing, "u", %{}, i)
     end
   end
 end

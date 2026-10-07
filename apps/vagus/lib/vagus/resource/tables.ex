@@ -10,7 +10,9 @@ defmodule Vagus.Resource.Tables do
 
   With this process itself gone the whole `Vagus.Resource.Supervisor` subtree
   is restarting: the tables die with the store and a read raises
-  `ArgumentError` until the new store is up.
+  `ArgumentError` until the new store is up. The new claims table is empty,
+  so a holder that is still alive has lost its claim without knowing; that
+  takes this process crashing, which does nothing, and is not engineered for.
   """
 
   use GenServer
@@ -27,7 +29,7 @@ defmodule Vagus.Resource.Tables do
   @spec resources(instance()) :: atom()
   def resources(instance), do: Module.concat(instance, Resources)
 
-  @doc "The table of `{{kind, name}, pid}` operation claims."
+  @doc "The table of `{{kind, name}, pid, monitor}` operation claims."
   @spec claims(instance()) :: atom()
   def claims(instance), do: Module.concat(instance, Claims)
 

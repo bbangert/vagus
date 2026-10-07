@@ -2,14 +2,14 @@ defmodule Vagus.Resource.StoreTest do
   use ExUnit.Case, async: true
 
   alias Vagus.Resource
-  alias Vagus.Resource.{Store, TestInstance, Watch}
+  alias Vagus.Resource.{Store, Tables, TestInstance, Watch}
 
   setup do
     instance = TestInstance.start!()
     i = [instance: instance]
     :ok = Store.register_kind(:thing, Owner, [conditions: [:ready]] ++ i)
     :ok = Store.register_writer(:thing, Dns, [conditions: [:dns_ready]] ++ i)
-    %{i: i, store: Process.whereis(Store.name(instance))}
+    %{i: i, instance: instance, store: Process.whereis(Store.name(instance))}
   end
 
   describe "create" do
@@ -40,13 +40,18 @@ defmodule Vagus.Resource.StoreTest do
       assert Store.fetch(:thing, "t", i) == {:error, :not_found}
     end
 
-    test "the owner's registered validators run after the kind's own", %{i: i} do
-      odd = fn spec -> if spec[:a] == 3, do: {:error, :three}, else: {:ok, spec} end
-      :ok = Store.register_kind(:thing, Owner, [validators: [odd], conditions: [:ready]] ++ i)
+    test "validators run in the order the kind lists them, each on the last one's spec" do
+      first = &{:ok, Map.put(&1, "first", true)}
 
-      assert {:error, {:invalid, :three}} = Store.create(:thing, "t", %{a: 3}, i)
-      assert {:ok, %{spec: %{holds: %{}}}} = Store.create(:thing, "t", %{a: 4}, i)
-      assert {:error, {:invalid, :three}} = Store.update_spec(:thing, "t", %{a: 3}, i)
+      second = fn
+        %{"first" => true} = spec -> {:ok, Map.put(spec, "second", true)}
+        _spec -> {:error, :out_of_order}
+      end
+
+      i = [instance: TestInstance.start!(kinds: %{part: [validators: [first, second]]})]
+
+      assert {:ok, %{spec: %{"first" => true, "second" => true}}} =
+               Store.create(:part, "p", %{}, i)
     end
 
     test "a kind the store was not started with is refused", %{i: i} do
@@ -54,10 +59,19 @@ defmodule Vagus.Resource.StoreTest do
       assert {:error, {:unknown_kind, :ghost}} = Store.register_kind(:ghost, Owner, i)
     end
 
-    test "a spec that could not be written to flash is refused with no file configured",
-         %{i: i} do
-      assert {:error, {:not_persistable, _}} = Store.create(:part, "p", %{pid: self()}, i)
+    test "a spec JSON cannot hold is refused with no file configured", %{i: i} do
+      assert {:error, {:not_persistable, _}} = Store.create(:part, "p", %{"pid" => self()}, i)
       assert Store.get(:part, "p", i) == nil
+    end
+
+    test "a spec that would not read back the same is refused with no file configured",
+         %{i: i} do
+      # `:part` has no hooks, and JSON returns an atom key as a string.
+      assert {:error, {:not_round_trippable, {:part, "p"}}} =
+               Store.create(:part, "p", %{n: 1}, i)
+
+      assert Store.get(:part, "p", i) == nil
+      assert {:ok, %{spec: %{"n" => 1}}} = Store.create(:part, "p", %{"n" => 1}, i)
     end
   end
 
@@ -135,6 +149,53 @@ defmodule Vagus.Resource.StoreTest do
 
       assert holds == %{"y" => true}
       assert fields == %{[:holds, "y"] => :y}
+    end
+
+    test "owning a path refuses another writer anything beneath it", %{i: i} do
+      {:ok, _} = Store.create(:thing, "t", %{}, i)
+      {:ok, _} = Store.update_spec(:thing, "t", %{a: %{}}, [writer: :ctl] ++ i)
+
+      assert {:error, {:conflict, [:a], :ctl}} =
+               Store.update_spec(:thing, "t", [{:put, [:a, :b], 1}], [writer: :other] ++ i)
+    end
+
+    test "force without a writer takes ownership away and gives it to nobody", %{i: i} do
+      {:ok, _} = Store.create(:thing, "t", %{a: 1}, [writer: :ctl] ++ i)
+
+      assert {:ok, %{spec: %{a: 2}, managed_fields: fields}} =
+               Store.update_spec(:thing, "t", %{a: 2}, [force: true] ++ i)
+
+      assert fields == %{}
+    end
+
+    test "a release by someone who does not own the path changes nothing", %{i: i} do
+      {:ok, before} = Store.create(:thing, "t", %{a: 1}, [writer: :ctl] ++ i)
+
+      assert {:ok, ^before} =
+               Store.update_spec(:thing, "t", [{:release, [:a]}], [writer: :other] ++ i)
+
+      assert {:ok, ^before} = Store.update_spec(:thing, "t", [{:release, [:a]}], i)
+    end
+
+    test "deleting a path gives up everything the writer owned beneath it", %{i: i} do
+      {:ok, _} = Store.create(:thing, "t", %{}, i)
+      x = [writer: :x] ++ i
+
+      {:ok, %{managed_fields: fields}} =
+        Store.update_spec(
+          :thing,
+          "t",
+          [{:put, [:holds, "x", "a"], 1}, {:put, [:holds, "x", "b"], 2}, {:put, [:a], 1}],
+          x
+        )
+
+      assert map_size(fields) == 3
+
+      assert {:ok, %{spec: %{holds: holds}, managed_fields: fields}} =
+               Store.update_spec(:thing, "t", [{:delete, [:holds, "x"]}], x)
+
+      assert holds == %{}
+      assert fields == %{[:a] => :x}
     end
 
     test "a deleting resource takes nothing new, but a writer can still let go", %{i: i} do
@@ -223,7 +284,19 @@ defmodule Vagus.Resource.StoreTest do
 
     test "a kind has one owner, who may register again", %{i: i} do
       assert {:error, {:kind_owned, Owner}} = Store.register_kind(:thing, Usurper, i)
-      assert :ok = Store.register_kind(:thing, Owner, [conditions: [:ready, :failed]] ++ i)
+      {:ok, _} = Store.create(:thing, "t", %{}, i)
+      failed = %{conditions: [Resource.condition(:failed, true, :crashed, 1)]}
+      owner = [writer: Owner] ++ i
+
+      assert {:error, {:not_owner, :failed, Owner}} =
+               Store.patch_status(:thing, "t", failed, owner)
+
+      assert :ok = Store.register_kind(:thing, Owner, [conditions: [:failed]] ++ i)
+      assert {:ok, _} = Store.patch_status(:thing, "t", failed, owner)
+
+      # The second registration replaced the first; it did not add to it.
+      ready = %{conditions: [Resource.condition(:ready, true, :running, 1)]}
+      assert {:error, {:not_owner, :ready, Owner}} = Store.patch_status(:thing, "t", ready, owner)
     end
 
     test "a condition type has one writer per kind", %{i: i} do
@@ -308,6 +381,53 @@ defmodule Vagus.Resource.StoreTest do
       assert Store.owned_by(Resource.ref(second), i) == []
     end
 
+    test "a uid is not given out again once its resource is gone", %{i: i} do
+      {:ok, %{uid: 1}} = Store.create(:part, "a", %{}, i)
+      {:ok, %{uid: 2}} = Store.create(:part, "b", %{}, i)
+      {:ok, _} = Store.delete(:part, "b", i)
+
+      assert {:ok, %{uid: 3}} = Store.create(:part, "b", %{}, i)
+    end
+
+    test "created and deleted in one commit: the uid is spent and nobody is told", %{i: i} do
+      :ok = Watch.subscribe({:kind, :part}, i)
+
+      assert {:ok, [%{uid: 1}, %{uid: 1, deleting?: true}]} =
+               Store.commit([{:create, :part, "p", %{}, []}, {:delete, :part, "p"}], i)
+
+      assert Store.get(:part, "p", i) == nil
+      assert {:ok, %{uid: 2}} = Store.create(:part, "p", %{}, i)
+
+      assert_received {Watch, :changed, %{name: "p", uid: 2}}
+      refute_received {Watch, _, _}
+    end
+
+    test "deleted and created again in one commit: the old one is announced gone", %{i: i} do
+      {:ok, %{uid: 1}} = Store.create(:part, "p", %{}, i)
+      :ok = Watch.subscribe({:kind, :part}, i)
+
+      assert {:ok, [_, %{uid: 2}]} =
+               Store.commit([{:delete, :part, "p"}, {:create, :part, "p", %{}, []}], i)
+
+      assert_received {Watch, :removed, %{name: "p", uid: 1}}
+      assert_received {Watch, :changed, %{name: "p", uid: 2}}
+    end
+
+    test "an owner reference of the wrong shape is refused before it is written", %{i: i} do
+      for ref <- [
+            %{kind: :thing, name: "x", uid: nil},
+            %{kind: :thing, name: :x, uid: 1},
+            %{kind: :thing, name: "x", uid: 1, extra: true},
+            {:thing, "x", 1}
+          ] do
+        assert {:error, {:bad_owner_ref, ^ref}} =
+                 Store.create(:part, "p", %{}, [owner_refs: [ref]] ++ i)
+      end
+
+      assert {:error, {:bad_owner_ref, :not_a_list}} =
+               Store.create(:part, "p", %{}, [owner_refs: :not_a_list] ++ i)
+    end
+
     test "an owner reference to a kind the store does not have is refused", %{i: i} do
       ghost = %{kind: :ghost, name: "g", uid: 1}
 
@@ -366,10 +486,93 @@ defmodule Vagus.Resource.StoreTest do
       assert {:error, {:bad_op, {:frobnicate, :thing}}} =
                Store.commit([{:frobnicate, :thing}], i)
 
-      {:ok, _} = Store.create(:thing, "t", %{}, i)
+      assert {:error, {:bad_op, :tail}} =
+               Store.commit([{:create, :part, "p", %{}, []} | :tail], i)
 
-      assert {:error, {:bad_op, {:set, [:a], 1}}} =
-               Store.update_spec(:thing, "t", [{:set, [:a], 1}], i)
+      assert Store.get(:part, "p", i) == nil
+    end
+  end
+
+  describe "input the store must survive" do
+    setup %{i: i} do
+      {:ok, _} = Store.create(:thing, "t", %{a: 1, word: "x"}, i)
+      :ok
+    end
+
+    defp same_store?(instance, store), do: Process.whereis(Store.name(instance)) == store
+
+    test "a spec op that is not one", %{i: i, instance: instance, store: store} do
+      for op <- [{:set, [:a], 1}, {:put, [], 1}, {:delete, []}, {:put, :a, 1}, {:inc, []}, :put] do
+        assert {:error, {:bad_op, ^op}} = Store.update_spec(:thing, "t", [op], i)
+      end
+
+      assert {:error, {:bad_op, {:put, [:a | :b], 1}}} =
+               Store.update_spec(:thing, "t", [{:put, [:a | :b], 1}], i)
+
+      assert same_store?(instance, store)
+    end
+
+    test "counting on a path that holds no number", %{i: i, instance: instance, store: store} do
+      assert {:error, {:bad_op, {:inc, [:word]}}} =
+               Store.update_spec(:thing, "t", [{:inc, [:word]}], i)
+
+      assert {:ok, %{spec: %{a: 2, fresh: 1}}} =
+               Store.update_spec(:thing, "t", [{:inc, [:a]}, {:inc, [:fresh]}], i)
+
+      assert same_store?(instance, store)
+    end
+
+    test "spec ops that are neither a map nor a list",
+         %{i: i, instance: instance, store: store} do
+      assert {:error, {:bad_op, :nope}} = Store.update_spec(:thing, "t", :nope, i)
+
+      assert {:error, {:bad_op, :tail}} =
+               Store.update_spec(:thing, "t", [{:inc, [:a]} | :tail], i)
+
+      assert same_store?(instance, store)
+    end
+
+    test "conditions that are not a list of conditions",
+         %{i: i, instance: instance, store: store} do
+      owner = [writer: Owner] ++ i
+
+      for conditions <- [
+            :ready,
+            [%{type: :ready}],
+            [Resource.condition(:ready, true, :ok, 1) | :x]
+          ] do
+        assert {:error, {:bad_op, {:patch_status, :thing, "t", %{conditions: ^conditions}, _}}} =
+                 Store.patch_status(:thing, "t", %{conditions: conditions}, owner)
+      end
+
+      assert same_store?(instance, store)
+    end
+
+    test "finalizers and condition types that are not atoms",
+         %{i: i, instance: instance, store: store} do
+      for finalizers <- [:tidy, ["tidy"]] do
+        assert {:error, {:bad_op, {:create, :part, "p", _, _}}} =
+                 Store.create(:part, "p", %{}, [finalizers: finalizers] ++ i)
+      end
+
+      assert {:error, {:bad_op, {:add_finalizer, :thing, "t", "tidy"}}} =
+               Store.add_finalizer(:thing, "t", "tidy", i)
+
+      assert {:error, {:bad_op, {:remove_finalizer, :thing, "t", "tidy"}}} =
+               Store.remove_finalizer(:thing, "t", "tidy", i)
+
+      assert {:error, {:bad_conditions, :ready}} =
+               Store.register_writer(:thing, Late, [conditions: :ready] ++ i)
+
+      assert same_store?(instance, store)
+    end
+
+    test "a message nobody should have sent it", %{i: i, instance: instance, store: store} do
+      send(store, :stray)
+      :sys.get_state(store)
+
+      assert same_store?(instance, store)
+      assert {:ok, _} = Store.update_spec(:thing, "t", %{a: 2}, i)
     end
   end
 
@@ -379,45 +582,57 @@ defmodule Vagus.Resource.StoreTest do
       {:ok, app} = Store.create(:thing, "app", %{}, i)
       {:ok, _} = Store.create(:thing, "other", %{}, i)
       test = self()
+      keys = [{:object, :thing, "app"}, {:kind, :part}, {:owner, :thing, "app"}]
 
-      for key <- [{:object, :thing, "app"}, {:kind, :part}, {:owner, :thing, "app"}] do
+      # Every relay also watches a sentinel. The store sends to a relay in
+      # order, so once the sentinel has come through, everything the store
+      # sent that relay before it has too, and the list is complete.
+      for key <- keys do
         spawn_link(fn ->
           :ok = Watch.subscribe(key, i)
+          :ok = Watch.subscribe({:object, :thing, "sentinel"}, i)
           send(test, {:subscribed, key})
-
-          receive do
-            {Watch, event, meta} -> send(test, {key, event, meta.name})
-          end
-
-          receive do
-            :stop -> :ok
-          end
+          relay(test, key)
         end)
 
-        assert_receive {:subscribed, ^key}
+        assert_receive {:subscribed, ^key}, 1_000
       end
 
       {:ok, _} = Store.update_spec(:thing, "other", %{a: 1}, i)
       {:ok, _} = Store.create(:part, "p", %{}, [owner_refs: [Resource.ref(app)]] ++ i)
+      {:ok, _} = Store.create(:part, "stranger", %{}, [owner_refs: [Resource.ref(app)]] ++ i)
       {:ok, _} = Store.update_spec(:thing, "app", %{a: 1}, i)
+      {:ok, _} = Store.delete(:part, "stranger", i)
+      {:ok, _} = Store.create(:thing, "sentinel", %{}, i)
 
-      assert_receive {{:kind, :part}, :changed, "p"}
-      assert_receive {{:owner, :thing, "app"}, :changed, "p"}
-      assert_receive {{:object, :thing, "app"}, :changed, "app"}
+      assert relayed({:object, :thing, "app"}) == [changed: "app"]
+
+      assert relayed({:kind, :part}) ==
+               [changed: "p", changed: "stranger", removed: "stranger"]
+
+      assert relayed({:owner, :thing, "app"}) ==
+               [changed: "p", changed: "stranger", removed: "stranger"]
     end
 
-    test "a write that changes nothing is not announced", %{i: i} do
+    test "a write that changes nothing is not announced, nor anything after unsubscribing",
+         %{i: i} do
       {:ok, _} = Store.create(:thing, "t", %{a: 1}, i)
       status = %{conditions: [Resource.condition(:ready, true, :running, 1)]}
-      {:ok, _} = Store.patch_status(:thing, "t", status, [writer: Owner] ++ i)
       :ok = Watch.subscribe({:object, :thing, "t"}, i)
 
       {:ok, _} = Store.patch_status(:thing, "t", status, [writer: Owner] ++ i)
+      assert_received {Watch, :changed, %{name: "t", generation: 1}}
+
+      {:ok, _} = Store.patch_status(:thing, "t", status, [writer: Owner] ++ i)
       {:ok, _} = Store.update_spec(:thing, "t", %{a: 1}, i)
+      {:ok, _} = Store.update_spec(:thing, "t", [{:release, [:a]}], [writer: :nobody] ++ i)
       refute_received {Watch, _, _}
 
-      :ok = Watch.unsubscribe({:object, :thing, "t"}, i)
       {:ok, _} = Store.update_spec(:thing, "t", %{a: 2}, i)
+      assert_received {Watch, :changed, %{name: "t", generation: 2}}
+
+      :ok = Watch.unsubscribe({:object, :thing, "t"}, i)
+      {:ok, _} = Store.update_spec(:thing, "t", %{a: 3}, i)
       refute_received {Watch, _, _}
     end
 
@@ -436,9 +651,16 @@ defmodule Vagus.Resource.StoreTest do
       assert_receive {:trace_delivered, ^store, ^delivered}
 
       {:messages, messages} = Process.info(self(), :messages)
+      table = Tables.resources(i[:instance])
 
       inserted =
-        Enum.find_index(messages, &match?({:trace, ^store, :call, {:ets, :insert, _}}, &1))
+        Enum.find_index(messages, fn
+          {:trace, ^store, :call, {:ets, :insert, [^table, rows]}} ->
+            Enum.any?(rows, &match?({{:thing, "t"}, %Resource{generation: 2}}, &1))
+
+          _other ->
+            false
+        end)
 
       told =
         Enum.find_index(
@@ -482,8 +704,8 @@ defmodule Vagus.Resource.StoreTest do
     test "a claimant that dies gives its claim up", %{i: i, store: store} do
       test = self()
 
-      {pid, ref} =
-        spawn_monitor(fn ->
+      pid =
+        spawn(fn ->
           :ok = Store.claim(:thing, "t", i)
           send(test, :claimed)
 
@@ -492,15 +714,30 @@ defmodule Vagus.Resource.StoreTest do
           end
         end)
 
-      assert_receive :claimed
+      assert_receive :claimed, 1_000
       assert Store.claim(:thing, "t", i) == {:error, :busy}
 
-      Process.exit(pid, :kill)
-      assert_receive {:DOWN, ^ref, :process, ^pid, :killed}
-      :sys.get_state(store)
+      TestInstance.kill_observed(pid, store)
 
       assert Store.claimant(:thing, "t", i) == nil
       assert :ok = Store.claim(:thing, "t", i)
+    end
+  end
+
+  defp relay(test, key) do
+    receive do
+      {Watch, event, meta} -> send(test, {key, event, meta.name})
+    end
+
+    relay(test, key)
+  end
+
+  defp relayed(key, seen \\ []) do
+    receive do
+      {^key, _event, "sentinel"} -> Enum.reverse(seen)
+      {^key, event, name} -> relayed(key, [{event, name} | seen])
+    after
+      1_000 -> flunk("#{inspect(key)} never saw the sentinel; so far: #{inspect(seen)}")
     end
   end
 end

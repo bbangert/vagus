@@ -12,9 +12,19 @@ defmodule Vagus.Resource.Store do
   the file is rewritten if a durable field changed, then ETS is written, then
   `Vagus.Resource.Watch` subscribers are told.
 
+  **A write whose call exits may have been applied.** That is a timeout as
+  much as the store dying: the store may still be inside the flash write, or
+  have died after it. When the store cannot tell whether a flash write will
+  survive a power cut, it stops rather than answer, and its replacement
+  takes whatever the file holds. The caller reads to find out.
+
   What this process keeps in its own memory, and so loses when it restarts,
   is who registered for which kind. Everyone who registers is a later child
-  of `Vagus.Resource.Supervisor`, which restarts them with the store.
+  of `Vagus.Resource.Supervisor`, which restarts them with the store. Until
+  an owner has registered again, status and progress writes for its kind are
+  refused, since nobody owns them; spec writes are admitted as always,
+  because the validators are part of the kind the store was started with and
+  not of any registration.
 
   All functions take `instance: name` to address a store other than the
   application's.
@@ -50,8 +60,17 @@ defmodule Vagus.Resource.Store do
 
   @type result :: {:ok, Resource.t()} | {:error, term()}
 
-  @typedoc "`(path, data)`; replaced in tests to count or fail flash writes."
-  @type persist :: (Path.t(), iodata() -> :ok | {:error, term()})
+  @typedoc """
+  `(path, data)`, with `Vagus.Resource.Persistence.write/2`'s results;
+  replaced in tests to count or fail flash writes.
+  """
+  @type persist :: (Path.t(), iodata() -> :ok | {:error, term()} | {:unknown, term()})
+
+  # A commit is two fsyncs on flash that image pulls are writing to at the
+  # same time, and it queues behind every commit ahead of it. The default 5 s
+  # would turn a busy disk into callers that gave up on writes that then
+  # happened.
+  @write_timeout 30_000
 
   @doc """
   Options: `:instance`, `:kinds` (`%{kind => Vagus.Resource.Kind}` fields),
@@ -119,8 +138,8 @@ defmodule Vagus.Resource.Store do
 
   @doc """
   Makes `owner` the owner of `kind`: the only writer of its `progress` and of
-  status outside conditions. Options: `:validators`, run after the kind's
-  own, and `:conditions`, the condition types `owner` writes.
+  status outside conditions. `:conditions` are the condition types `owner`
+  writes.
 
   The same owner may register again (its runtime restarted); a different one
   is refused.
@@ -130,8 +149,9 @@ defmodule Vagus.Resource.Store do
           | {:error, {:unknown_kind, Resource.kind()}}
           | {:error, {:kind_owned, Resource.writer()}}
           | {:error, {:condition_owned, atom(), Resource.writer()}}
+          | {:error, {:bad_conditions, term()}}
   def register_kind(kind, owner, opts \\ []) do
-    call(opts, {:register, kind, owner, Keyword.take(opts, [:validators, :conditions]), true})
+    call(opts, {:register, kind, owner, Keyword.get(opts, :conditions, []), true})
   end
 
   @doc "Declares the condition types (`:conditions`) an attached writer owns on `kind`."
@@ -139,8 +159,9 @@ defmodule Vagus.Resource.Store do
           :ok
           | {:error, {:unknown_kind, Resource.kind()}}
           | {:error, {:condition_owned, atom(), Resource.writer()}}
+          | {:error, {:bad_conditions, term()}}
   def register_writer(kind, writer, opts \\ []) do
-    call(opts, {:register, kind, writer, Keyword.take(opts, [:conditions]), false})
+    call(opts, {:register, kind, writer, Keyword.get(opts, :conditions, []), false})
   end
 
   @doc """
@@ -164,8 +185,8 @@ defmodule Vagus.Resource.Store do
   to anything above or below a path, that another writer owns is
   `{:error, {:conflict, path, owner}}` unless `force: true` takes it over. A
   write without `:writer` owns nothing, so a user cannot block a controller
-  but a controller can block a user. The generation moves only when the spec
-  does.
+  but a controller can block a user. Deleting a path also gives up everything
+  the writer owned beneath it. The generation moves only when the spec does.
   """
   @spec update_spec(Resource.kind(), Resource.name(), [spec_op()] | map(), keyword()) :: result()
   def update_spec(kind, name, ops, opts \\ []),
@@ -215,7 +236,7 @@ defmodule Vagus.Resource.Store do
 
   defp instance(opts), do: Keyword.get(opts, :instance, Resource)
   defp table(opts), do: Tables.resources(instance(opts))
-  defp call(opts, request), do: GenServer.call(name(instance(opts)), request)
+  defp call(opts, request), do: GenServer.call(name(instance(opts)), request, @write_timeout)
 
   defp one(op, opts) do
     with {:ok, [resource]} <- commit([op], opts), do: {:ok, resource}
@@ -241,9 +262,7 @@ defmodule Vagus.Resource.Store do
       persist: Keyword.get(opts, :persist, &Persistence.write/2),
       kinds: kinds,
       registrations:
-        Map.new(kinds, fn {kind, _fields} ->
-          {kind, %{owner: nil, validators: [], conditions: %{}}}
-        end)
+        Map.new(kinds, fn {kind, _fields} -> {kind, %{owner: nil, conditions: %{}}} end)
     }
 
     with :ok <- Tables.take(instance),
@@ -262,28 +281,28 @@ defmodule Vagus.Resource.Store do
   def handle_call({:commit, ops}, _from, state) do
     txn = %{state: state, rows: %{}, removed: [], next_uid: next_uid(state.table)}
 
-    with {:ok, results, txn} <- run_all(ops, txn),
+    with {:ok, results, txn} <- run_all(ops, [], txn),
          changes = changes(state.table, txn),
          :ok <- persist(state, txn, changes) do
       apply_changes(state, txn, changes)
       {:reply, {:ok, results}, state}
     else
-      {:error, _reason} = error -> {:reply, error, state}
+      {:error, _reason} = error ->
+        {:reply, error, state}
+
+      # The file holds the commit and ETS does not. Answering either way
+      # would be a guess, so the call exits and the next store reads the file.
+      {:unknown, reason} ->
+        {:stop, {:persist_outcome_unknown, reason}, state}
     end
   end
 
-  def handle_call({:register, kind, writer, opts, owner?}, _from, state) do
+  def handle_call({:register, kind, writer, types, owner?}, _from, state) do
     with {:ok, registration} <- registration(state, kind),
          :ok <- free_for(registration, writer, owner?),
-         {:ok, conditions} <-
-           declare(registration.conditions, writer, Keyword.get(opts, :conditions, [])) do
+         {:ok, conditions} <- declare(registration.conditions, writer, types) do
       registration = %{registration | conditions: conditions}
-
-      registration =
-        if owner?,
-          do: %{registration | owner: writer, validators: Keyword.get(opts, :validators, [])},
-          else: registration
-
+      registration = if owner?, do: %{registration | owner: writer}, else: registration
       {:reply, :ok, put_in(state.registrations[kind], registration)}
     else
       {:error, _reason} = error -> {:reply, error, state}
@@ -323,6 +342,8 @@ defmodule Vagus.Resource.Store do
   # arrive here afterwards.
   def handle_info({:"ETS-TRANSFER", _table, _from, _data}, state), do: {:noreply, state}
 
+  def handle_info(_other, state), do: {:noreply, state}
+
   defp load(%{path: nil}), do: {:ok, nil}
   defp load(%{path: path, kinds: kinds}), do: Persistence.read(path, kinds)
 
@@ -332,10 +353,10 @@ defmodule Vagus.Resource.Store do
     :ok
   end
 
-  # The file wins over the rows a previous store left in ETS. They differ
-  # only when that store died between its flash write and its ETS write, and
-  # then nobody was told about the change either, so it is announced now.
-  # Status is not in the file; it stays with the same resource.
+  # The file wins over the rows a previous store left in ETS. That store
+  # wrote flash first, so wherever the two differ it stopped or died before
+  # its ETS write, and nobody was told about the change either: it is
+  # announced now. Status is not in the file; it stays with the same resource.
   defp restore(%{table: table} = state, %{resources: resources, next_uid: next_uid}) do
     stale = Map.new(all(table), &{key(&1), &1})
 
@@ -382,18 +403,16 @@ defmodule Vagus.Resource.Store do
 
   defp key(%Resource{kind: kind, name: name}), do: {kind, name}
 
-  defp run_all(ops, txn) do
-    Enum.reduce_while(ops, {:ok, [], txn}, fn op, {:ok, results, txn} ->
-      case run(op, txn) do
-        {:ok, resource, txn} -> {:cont, {:ok, [resource | results], txn}}
-        {:error, _reason} = error -> {:halt, error}
-      end
-    end)
-    |> case do
-      {:ok, results, txn} -> {:ok, Enum.reverse(results), txn}
+  defp run_all([], results, txn), do: {:ok, Enum.reverse(results), txn}
+
+  defp run_all([op | ops], results, txn) do
+    case run(op, txn) do
+      {:ok, resource, txn} -> run_all(ops, [resource | results], txn)
       {:error, _reason} = error -> error
     end
   end
+
+  defp run_all(not_a_list, _results, _txn), do: {:error, {:bad_op, not_a_list}}
 
   defp changes(table, txn) do
     Enum.flat_map(txn.rows, fn {key, new} ->
@@ -404,8 +423,11 @@ defmodule Vagus.Resource.Store do
     end)
   end
 
+  # The counter is durable too: a create and delete of one resource in one
+  # commit changes no row, and its uid must still never be given out again.
   defp persist(state, txn, changes) do
-    if Enum.any?(changes, fn {_key, old, new} -> durable(old) != durable(new) end) do
+    if txn.next_uid != next_uid(state.table) or
+         Enum.any?(changes, fn {_key, old, new} -> durable(old) != durable(new) end) do
       resources =
         state.table
         |> all()
@@ -415,8 +437,8 @@ defmodule Vagus.Resource.Store do
         |> Enum.sort()
         |> Enum.map(&elem(&1, 1))
 
-      # Encoded even with no file to write, so a spec that flash would refuse
-      # is refused on the host and in tests too.
+      # Encoded, and read back, even with no file to write, so what flash
+      # would refuse or return changed is refused on the host and in tests too.
       with {:ok, data} <-
              Persistence.encode(%{resources: resources, next_uid: txn.next_uid}, state.kinds) do
         write(state, data)
@@ -429,9 +451,17 @@ defmodule Vagus.Resource.Store do
   defp write(%{path: nil}, _data), do: :ok
 
   defp write(%{path: path, persist: persist}, data) do
-    with {:error, reason} <- persist.(path, data) do
-      Logger.error("resource store #{path} not written: #{inspect(reason)}")
-      {:error, {:persist_failed, reason}}
+    case persist.(path, data) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Logger.error("resource store #{path} not written: #{inspect(reason)}")
+        {:error, {:persist_failed, reason}}
+
+      {:unknown, reason} ->
+        Logger.error("resource store #{path} written but not synced: #{inspect(reason)}")
+        {:unknown, reason}
     end
   end
 
@@ -440,26 +470,31 @@ defmodule Vagus.Resource.Store do
 
   # Flash, then ETS, then subscribers.
   #
-  # Flash before ETS: a failed or interrupted flash write leaves ETS alone,
-  # so no reader ever acts on desired state a reboot would take back. The
-  # failure this order tolerates is the store dying after the file is renamed
-  # and before the insert: readers then see less than flash holds until the
-  # next store reads the file (`restore/2`), and the caller, whose call
-  # exited, cannot know which way it went.
+  # Flash before ETS: ETS is written only once flash holds the commit, so no
+  # reader ever acts on desired state a reboot would take back. The failure
+  # this order tolerates is the file holding a commit ETS never got: the
+  # store died between the two, or stopped because the write failed after
+  # its rename. Readers then see less than flash holds until the next store
+  # reads the file (`restore/2`), and the caller, whose call exited, cannot
+  # know which way it went.
   #
   # ETS before subscribers: a subscriber that reads when woken finds a row at
   # least as new as the change that woke it.
   defp apply_changes(state, txn, changes) do
-    if changes != [] do
-      :ets.insert(state.table, [
-        {:next_uid, txn.next_uid} | for({key, _old, %Resource{} = new} <- changes, do: {key, new})
-      ])
+    # Only what a reader could have seen is announced as gone; a resource
+    # created and deleted inside this commit never was.
+    removed =
+      for %Resource{uid: uid} = resource <- Enum.reverse(txn.removed),
+          match?(%Resource{uid: ^uid}, row(state.table, key(resource))),
+          do: resource
 
-      for {key, _old, nil} <- changes, do: :ets.delete(state.table, key)
-    end
+    :ets.insert(state.table, [
+      {:next_uid, txn.next_uid} | for({key, _old, %Resource{} = new} <- changes, do: {key, new})
+    ])
 
-    for resource <- Enum.reverse(txn.removed),
-        do: Watch.notify(state.instance, :removed, resource)
+    for {key, _old, nil} <- changes, do: :ets.delete(state.table, key)
+
+    for resource <- removed, do: Watch.notify(state.instance, :removed, resource)
 
     for {_key, _old, %Resource{} = new} <- changes,
         do: Watch.notify(state.instance, :changed, new)
@@ -467,11 +502,14 @@ defmodule Vagus.Resource.Store do
     :ok
   end
 
-  defp run({:create, kind, name, spec, opts}, txn) when is_binary(name) and is_map(spec) do
+  defp run({:create, kind, name, spec, opts} = op, txn)
+       when is_binary(name) and is_map(spec) and is_list(opts) do
     owner_refs = Keyword.get(opts, :owner_refs, [])
+    finalizers = Keyword.get(opts, :finalizers, [])
 
     with {:ok, _registration} <- registration(txn.state, kind),
          :ok <- absent(txn, {kind, name}),
+         :ok <- if(every?(finalizers, &is_atom/1), do: :ok, else: {:error, {:bad_op, op}}),
          :ok <- known_refs(txn.state, owner_refs),
          {:ok, admitted} <- admit(txn.state, kind, spec) do
       writer = opts[:writer]
@@ -481,7 +519,7 @@ defmodule Vagus.Resource.Store do
         name: name,
         uid: txn.next_uid,
         spec: admitted,
-        finalizers: Keyword.get(opts, :finalizers, []),
+        finalizers: finalizers,
         owner_refs: owner_refs,
         managed_fields:
           if(writer, do: Map.new(spec, fn {key, _} -> {[key], writer} end), else: %{})
@@ -491,9 +529,9 @@ defmodule Vagus.Resource.Store do
     end
   end
 
-  defp run({:update_spec, kind, name, ops, opts}, txn) do
+  defp run({:update_spec, kind, name, ops, opts}, txn) when is_list(opts) do
     with {:ok, resource} <- lookup(txn, {kind, name}),
-         ops = spec_ops(ops),
+         {:ok, ops} <- spec_ops(ops),
          :ok <- writable(resource, ops),
          {:ok, spec, managed} <-
            apply_spec_ops(ops, resource, opts[:writer], opts[:force] == true),
@@ -505,18 +543,21 @@ defmodule Vagus.Resource.Store do
     end
   end
 
-  defp run({:patch_status, kind, name, patch, opts}, txn) when is_map(patch) do
+  defp run({:patch_status, kind, name, patch, opts} = op, txn)
+       when is_map(patch) and is_list(opts) do
     {conditions, rest} = Map.pop(patch, :conditions, [])
 
     with {:ok, resource} <- lookup(txn, {kind, name}),
          {:ok, registration} <- registration(txn.state, kind),
+         :ok <- if(every?(conditions, &condition?/1), do: :ok, else: {:error, {:bad_op, op}}),
          :ok <- owns_status(registration, conditions, rest, opts[:writer]) do
       resource = %{resource | status: Map.merge(resource.status, rest)}
       put(txn, Enum.reduce(conditions, resource, &Resource.put_condition(&2, &1)))
     end
   end
 
-  defp run({:put_progress, kind, name, progress, opts}, txn) when is_map(progress) do
+  defp run({:put_progress, kind, name, progress, opts}, txn)
+       when is_map(progress) and is_list(opts) do
     with {:ok, resource} <- lookup(txn, {kind, name}),
          {:ok, registration} <- registration(txn.state, kind),
          :ok <- owner(registration, :progress, opts[:writer]) do
@@ -524,7 +565,7 @@ defmodule Vagus.Resource.Store do
     end
   end
 
-  defp run({:add_finalizer, kind, name, finalizer}, txn) do
+  defp run({:add_finalizer, kind, name, finalizer}, txn) when is_atom(finalizer) do
     case lookup(txn, {kind, name}) do
       # Cleanup that was not owed when deletion began cannot be added to it.
       {:ok, %Resource{deleting?: true}} ->
@@ -538,7 +579,7 @@ defmodule Vagus.Resource.Store do
     end
   end
 
-  defp run({:remove_finalizer, kind, name, finalizer}, txn) do
+  defp run({:remove_finalizer, kind, name, finalizer}, txn) when is_atom(finalizer) do
     with {:ok, resource} <- lookup(txn, {kind, name}) do
       put(txn, %{resource | finalizers: resource.finalizers -- [finalizer]})
     end
@@ -600,15 +641,48 @@ defmodule Vagus.Resource.Store do
     end
   end
 
+  # A reference that is not exactly this shape would be written and then
+  # fail the next load.
   defp known_refs(state, refs) do
-    case Enum.reject(
-           refs,
-           &match?(%{kind: kind, name: _, uid: _} when is_map_key(state.kinds, kind), &1)
-         ) do
-      [] -> :ok
-      [ref | _] -> {:error, {:bad_owner_ref, ref}}
+    known? = fn ref ->
+      match?(
+        %{kind: kind, name: name, uid: uid}
+        when map_size(ref) == 3 and is_map_key(state.kinds, kind) and is_binary(name) and
+               is_integer(uid) and uid > 0,
+        ref
+      )
+    end
+
+    case first_bad(refs, known?) do
+      :none -> :ok
+      {:bad, ref} -> {:error, {:bad_owner_ref, ref}}
     end
   end
+
+  # Not `Enum`: that raises on what is not a proper list, and this is asked
+  # of whatever a caller sent.
+  defp first_bad([], _ok?), do: :none
+
+  defp first_bad([head | tail], ok?),
+    do: if(ok?.(head), do: first_bad(tail, ok?), else: {:bad, head})
+
+  defp first_bad(not_a_list, _ok?), do: {:bad, not_a_list}
+
+  defp every?(list, ok?), do: first_bad(list, ok?) == :none
+
+  defp condition?(condition) do
+    match?(
+      %{type: type, status: status, reason: reason, observed_generation: generation}
+      when is_atom(type) and is_boolean(status) and is_atom(reason) and is_integer(generation),
+      condition
+    )
+  end
+
+  defp path?([key]), do: path_key?(key)
+  defp path?([key | rest]), do: path_key?(key) and path?(rest)
+  defp path?(_other), do: false
+
+  defp path_key?(key), do: is_atom(key) or is_binary(key) or is_integer(key)
 
   defp free_for(%{owner: owner}, writer, true) when owner not in [nil, writer],
     do: {:error, {:kind_owned, owner}}
@@ -618,9 +692,13 @@ defmodule Vagus.Resource.Store do
   defp declare(conditions, writer, types) do
     others = Map.reject(conditions, fn {_type, owner} -> owner == writer end)
 
-    case Enum.find(types, &is_map_key(others, &1)) do
-      nil -> {:ok, Map.merge(others, Map.new(types, &{&1, writer}))}
-      type -> {:error, {:condition_owned, type, others[type]}}
+    if every?(types, &is_atom/1) do
+      case Enum.find(types, &is_map_key(others, &1)) do
+        nil -> {:ok, Map.merge(others, Map.new(types, &{&1, writer}))}
+        type -> {:error, {:condition_owned, type, others[type]}}
+      end
+    else
+      {:error, {:bad_conditions, types}}
     end
   end
 
@@ -639,9 +717,7 @@ defmodule Vagus.Resource.Store do
   defp owner(_registration, field, writer), do: {:error, {:not_owner, field, writer}}
 
   defp admit(state, kind, spec) do
-    validators = state.kinds[kind].validators ++ state.registrations[kind].validators
-
-    Enum.reduce_while(validators, {:ok, spec}, fn validator, {:ok, spec} ->
+    Enum.reduce_while(state.kinds[kind].validators, {:ok, spec}, fn validator, {:ok, spec} ->
       case validator.(spec) do
         {:ok, %{} = spec} -> {:cont, {:ok, spec}}
         {:error, reason} -> {:halt, {:error, {:invalid, reason}}}
@@ -653,8 +729,19 @@ defmodule Vagus.Resource.Store do
   defp readmit(_state, %Resource{spec: spec}, spec), do: {:ok, spec}
   defp readmit(state, %Resource{kind: kind}, spec), do: admit(state, kind, spec)
 
-  defp spec_ops(%{} = puts), do: Enum.map(puts, fn {key, value} -> {:put, [key], value} end)
-  defp spec_ops(ops) when is_list(ops), do: ops
+  defp spec_ops(%{} = puts),
+    do: {:ok, Enum.map(puts, fn {key, value} -> {:put, [key], value} end)}
+
+  defp spec_ops(ops) do
+    case first_bad(ops, &spec_op?/1) do
+      :none -> {:ok, ops}
+      {:bad, op} -> {:error, {:bad_op, op}}
+    end
+  end
+
+  defp spec_op?({name, path}) when name in [:inc, :delete, :release], do: path?(path)
+  defp spec_op?({:put, path, _value}), do: path?(path)
+  defp spec_op?(_other), do: false
 
   # Nothing new may be asked of a resource on its way out, but a writer can
   # still let go of what it holds there.
@@ -682,24 +769,28 @@ defmodule Vagus.Resource.Store do
       else: {:ok, spec, managed}
   end
 
-  defp apply_spec_op({:delete, [_ | _] = path}, spec, managed, writer, force?) do
+  # Whatever was owned under the path went with it. After `own/4` those
+  # entries are all this writer's: a rival's is a conflict or was forced out.
+  defp apply_spec_op({:delete, path}, spec, managed, writer, force?) do
     with {:ok, managed} <- own(managed, path, writer, force?) do
-      {:ok, delete_path(spec, path), Map.delete(managed, path)}
+      {:ok, delete_path(spec, path),
+       Map.reject(managed, fn {owned, _owner} -> List.starts_with?(owned, path) end)}
     end
   end
 
-  defp apply_spec_op({:inc, path}, spec, managed, writer, force?) do
-    value = (get_path(spec, path) || 0) + 1
-    apply_spec_op({:put, path, value}, spec, managed, writer, force?)
+  defp apply_spec_op({:inc, path} = op, spec, managed, writer, force?) do
+    case get_path(spec, path) do
+      nil -> apply_spec_op({:put, path, 1}, spec, managed, writer, force?)
+      n when is_integer(n) -> apply_spec_op({:put, path, n + 1}, spec, managed, writer, force?)
+      _not_a_counter -> {:error, {:bad_op, op}}
+    end
   end
 
-  defp apply_spec_op({:put, [_ | _] = path, value}, spec, managed, writer, force?) do
+  defp apply_spec_op({:put, path, value}, spec, managed, writer, force?) do
     with {:ok, managed} <- own(managed, path, writer, force?) do
       {:ok, put_path(spec, path, value), managed}
     end
   end
-
-  defp apply_spec_op(op, _spec, _managed, _writer, _force?), do: {:error, {:bad_op, op}}
 
   # Ownership is of a subtree: owning `[:a]` and writing `[:a, :b]` collide
   # either way round.

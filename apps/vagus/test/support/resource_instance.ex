@@ -25,27 +25,55 @@ defmodule Vagus.Resource.TestInstance do
   @spec name() :: atom()
   def name, do: Module.concat(__MODULE__, "I#{System.unique_integer([:positive])}")
 
-  @doc """
-  Kills the store and returns once the supervisor has replaced it.
-  """
+  @doc "Kills the store and returns its replacement."
   @spec restart_store(atom()) :: pid()
   def restart_store(instance) do
     old = Process.whereis(Store.name(instance))
-    ref = Process.monitor(old)
-    Process.exit(old, :kill)
-
-    receive do
-      {:DOWN, ^ref, :process, ^old, :killed} -> :ok
-    after
-      1_000 -> raise "store did not die"
-    end
-
-    # A call the supervisor answers only after it has handled the exit,
-    # which is where it restarts the child.
-    children = Supervisor.which_children(Module.concat(instance, Supervisor))
-    {Store, new, :worker, _modules} = List.keyfind(children, Store, 0)
+    kill_observed(old, Process.whereis(Module.concat(instance, Supervisor)))
+    new = Process.whereis(Store.name(instance))
     true = is_pid(new) and new != old
     new
+  end
+
+  @doc """
+  Kills `victim` and returns once `observer`, which links to or monitors it,
+  has dealt with its death.
+
+  The test's own `DOWN` says nothing about when the observer's copy lands:
+  signals to two receivers are not ordered. So the observer's mailbox is
+  traced until the `EXIT` or `DOWN` is seen arriving there, and only then
+  is it sent a call, which queues behind it.
+  """
+  @spec kill_observed(pid(), pid()) :: :ok
+  def kill_observed(victim, observer) do
+    :erlang.trace(observer, true, [:receive])
+    Process.exit(victim, :kill)
+
+    receive do
+      {:trace, ^observer, :receive, {:DOWN, _ref, :process, ^victim, _reason}} -> :ok
+      {:trace, ^observer, :receive, {:EXIT, ^victim, _reason}} -> :ok
+    after
+      5_000 -> raise "#{inspect(observer)} never heard that #{inspect(victim)} died"
+    end
+
+    :erlang.trace(observer, false, [:receive])
+    :sys.get_state(observer)
+
+    delivered = :erlang.trace_delivered(observer)
+
+    receive do
+      {:trace_delivered, ^observer, ^delivered} -> drop_traces(observer)
+    after
+      5_000 -> raise "trace of #{inspect(observer)} never drained"
+    end
+  end
+
+  defp drop_traces(observer) do
+    receive do
+      {:trace, ^observer, :receive, _message} -> drop_traces(observer)
+    after
+      0 -> :ok
+    end
   end
 
   @doc """
@@ -79,8 +107,10 @@ defmodule Vagus.Resource.TestInstance do
     end)
   end
 
-  defp decode_progress(%{"phase" => phase, "started" => %Stamp{} = started}),
-    do: %{phase: String.to_existing_atom(phase), started: started}
-
-  defp decode_progress(progress) when progress == %{}, do: %{}
+  defp decode_progress(progress) do
+    Map.new(progress, fn
+      {"phase", phase} -> {:phase, String.to_existing_atom(phase)}
+      {"started", %Stamp{} = started} -> {:started, started}
+    end)
+  end
 end

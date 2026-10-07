@@ -145,9 +145,11 @@ defmodule Vagus.Application do
         ssh_access_children() ++
         [
           # The resource store (tables, watch registry, single writer). Before
-          # `Vagus.API.Supervisor` so a request never finds its tables
-          # missing, and a resource file that cannot be read fails the
+          # `Vagus.API.Supervisor` so the tables exist before the first
+          # request at boot, and a resource file that cannot be read fails the
           # application start here, before anything acts on an empty store.
+          # Only at boot: this supervisor is `:one_for_one`, so the API keeps
+          # serving while this subtree restarts, and a read then raises.
           {Vagus.Resource.Supervisor, []},
 
           # Supervisor-API emulator's HTTP surface (Bandit + Plug.Router),

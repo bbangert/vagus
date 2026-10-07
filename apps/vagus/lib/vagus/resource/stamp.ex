@@ -21,6 +21,8 @@ defmodule Vagus.Resource.Stamp do
   def age(%__MODULE__{}, %__MODULE__{}), do: 0
 
   # The tag keeps a stamp recognisable among plain maps in the resource file.
+  # A map with this as its only key is therefore reserved: `revive/1` turns
+  # it into a stamp wherever it appears.
   @tag "$stamp"
 
   @doc false

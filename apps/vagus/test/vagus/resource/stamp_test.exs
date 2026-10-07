@@ -20,15 +20,23 @@ defmodule Vagus.Resource.StampTest do
              %{"phase" => "applied", "seen" => [stamp], "started" => stamp}
   end
 
+  test "a reading earlier than the stamp is age zero, not a negative age" do
+    assert Stamp.age(%Stamp{incarnation: 4, at: 1_000}, %Stamp{incarnation: 4, at: 400}) == 0
+  end
+
   test "the system clock keeps one incarnation, and setting it up again changes nothing" do
     first = Clock.now()
     :ok = Clock.System.ensure_incarnation()
-    second = Clock.now(Clock.System)
 
-    assert is_integer(first.incarnation)
-    assert second.incarnation == first.incarnation
-    assert Stamp.age(first, second) >= 0
-    assert second.at >= first.at
+    assert Clock.now(Clock.System).incarnation == first.incarnation
+  end
+
+  test "the system clock reads monotonic milliseconds" do
+    before = System.monotonic_time(:millisecond)
+    %Stamp{at: at} = Clock.now()
+
+    assert at >= before
+    assert at <= System.monotonic_time(:millisecond)
   end
 
   test "the manual clock moves only when told, and a restart zeroes every earlier age" do

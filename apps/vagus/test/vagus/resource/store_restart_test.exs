@@ -27,7 +27,58 @@ defmodule Vagus.Resource.StoreRestartTest do
     refute_received {Watch, _, _}
 
     assert {:ok, %{generation: 2}} = Store.update_spec(:thing, "t", %{a: 2}, i)
-    assert_receive {Watch, :changed, %{name: "t", generation: 2}}
+    assert_received {Watch, :changed, %{name: "t", generation: 2}}
+  end
+
+  test "a restarted store has no owners: status fails closed, specs are still validated",
+       %{i: i, instance: instance} do
+    {:ok, _} = Store.create(:thing, "t", %{a: 1}, i)
+    owner = [writer: Owner] ++ i
+    ready = %{conditions: [Resource.condition(:ready, true, :running, 1)]}
+    {:ok, _} = Store.patch_status(:thing, "t", Map.put(ready, :instance, "c1"), owner)
+
+    TestInstance.restart_store(instance)
+
+    assert {:error, {:not_owner, :ready, Owner}} = Store.patch_status(:thing, "t", ready, owner)
+
+    assert {:error, {:not_owner, :instance, Owner}} =
+             Store.patch_status(:thing, "t", %{instance: "c2"}, owner)
+
+    assert {:error, {:not_owner, :progress, Owner}} =
+             Store.put_progress(:thing, "t", %{phase: :applied}, owner)
+
+    assert {:error, {:invalid, :bad}} = Store.create(:thing, "u", %{bad: true}, i)
+    assert {:error, {:invalid, :bad}} = Store.update_spec(:thing, "t", %{bad: true}, i)
+
+    :ok = Store.register_kind(:thing, Owner, [conditions: [:ready]] ++ i)
+    assert {:ok, _} = Store.patch_status(:thing, "t", %{instance: "c2"}, owner)
+  end
+
+  test "killing the tables' owner replaces the registry and the store with it",
+       %{instance: instance} do
+    [tables, watch, store] =
+      for name <- [Tables.name(instance), Watch.name(instance), Store.name(instance)] do
+        pid = Process.whereis(name)
+        {pid, Process.monitor(pid)}
+      end
+
+    supervisor = Process.whereis(Module.concat(instance, Supervisor))
+    TestInstance.kill_observed(elem(tables, 0), supervisor)
+
+    for {pid, ref} <- [tables, watch, store] do
+      assert_receive {:DOWN, ^ref, :process, ^pid, _reason}, 1_000
+    end
+
+    for {name, {old, _ref}} <- [
+          {Tables.name(instance), tables},
+          {Watch.name(instance), watch},
+          {Store.name(instance), store}
+        ] do
+      new = Process.whereis(name)
+      assert is_pid(new) and new != old
+    end
+
+    assert Store.list(:thing, instance: instance) == []
   end
 
   test "uids keep rising across a store restart with no file", %{i: i, instance: instance} do
@@ -67,12 +118,11 @@ defmodule Vagus.Resource.StoreRestartTest do
     assert {:noproc, _} = catch_exit(Store.update_spec(:thing, "t", %{a: 2}, i))
   end
 
-  test "a claim outlives a store restart, and its holder's death still ends it",
-       %{i: i, instance: instance} do
+  defp holder(i) do
     test = self()
 
-    {holder, ref} =
-      spawn_monitor(fn ->
+    pid =
+      spawn(fn ->
         :ok = Store.claim(:thing, "t", i)
         send(test, :claimed)
 
@@ -81,16 +131,40 @@ defmodule Vagus.Resource.StoreRestartTest do
         end
       end)
 
-    assert_receive :claimed
+    assert_receive :claimed, 1_000
+    pid
+  end
+
+  test "a claim outlives a store restart, and its holder's death still ends it",
+       %{i: i, instance: instance} do
+    holder = holder(i)
     store = TestInstance.restart_store(instance)
 
     assert Store.claimant(:thing, "t", i) == holder
     assert Store.claim(:thing, "t", i) == {:error, :busy}
 
+    TestInstance.kill_observed(holder, store)
+
+    assert :ok = Store.claim(:thing, "t", i)
+  end
+
+  test "a holder that died while the store was down has lost its claim when it is back",
+       %{i: i, instance: instance} do
+    holder = holder(i)
+    ref = Process.monitor(holder)
+    supervisor = Module.concat(instance, Supervisor)
+    :ok = Supervisor.terminate_child(supervisor, Store)
+
     Process.exit(holder, :kill)
-    assert_receive {:DOWN, ^ref, :process, ^holder, :killed}
+    assert_receive {:DOWN, ^ref, :process, ^holder, :killed}, 1_000
+    assert Store.claimant(:thing, "t", i) == holder
+
+    {:ok, store} = Supervisor.restart_child(supervisor, Store)
+    # The store monitored a dead pid while starting, so its `DOWN` is
+    # already ahead of this call.
     :sys.get_state(store)
 
+    assert Store.claimant(:thing, "t", i) == nil
     assert :ok = Store.claim(:thing, "t", i)
   end
 
