@@ -55,9 +55,12 @@ defmodule Vagus.Resource.Harness do
         }
 
   @doc """
-  Starts the whole subtree. Options: `:controllers`; `:kinds`, for kinds no
+  Starts the whole subtree. Options: `:controllers`, each a module or
+  `{module, runtime_options}`; `:kinds`, for kinds no
   controller owns; `:resync` (default `:infinity`); `:runtime`, further
-  `Vagus.Resource.Runtime` options; `:context`; `:lanes`; `:pulls`; `:path`
+  `Vagus.Resource.Runtime` options; `:context`; `:lanes`; `:pulls`;
+  `:services`, a function of the instance that returns child specs to start
+  after the pull worker and before the controllers; `:path`
   and `:persist` for the store; `:faults`, see `Vagus.Resource.Harness.Faults`.
 
   Steps that crash are retried after 1 to 8 ms unless `:runtime` sets
@@ -66,7 +69,13 @@ defmodule Vagus.Resource.Harness do
   @spec start_system(keyword()) :: system()
   def start_system(opts \\ []) do
     instance = TestInstance.name()
-    controllers = Keyword.get(opts, :controllers, [])
+    entries = Keyword.get(opts, :controllers, [])
+
+    controllers =
+      for entry <- entries do
+        with {controller, _options} <- entry, do: controller
+      end
+
     clock = start_supervised!(Supervisor.child_spec(TestClock, id: {instance, :clock}))
 
     world =
@@ -102,11 +111,16 @@ defmodule Vagus.Resource.Harness do
     tree =
       [
         instance: instance,
-        controllers: controllers,
+        controllers: entries,
         runtime: runtime,
         kinds: Keyword.get(opts, :kinds, %{}),
         lanes: Keyword.get(opts, :lanes)
-      ] ++ Keyword.take(opts, [:path, :persist]) ++ services(instance, opts[:pulls])
+      ] ++
+        Keyword.take(opts, [:path, :persist]) ++
+        [
+          services:
+            pulls(instance, opts[:pulls]) ++ Keyword.get(opts, :services, &none/1).(instance)
+        ]
 
     start_supervised!(Supervisor.child_spec({Resource.Supervisor, tree}, id: instance))
 
@@ -129,10 +143,10 @@ defmodule Vagus.Resource.Harness do
   end
 
   # `Vagus.App.Pulls` as the application runs it, for a test that asks for it.
-  defp services(_instance, nil), do: []
+  defp pulls(_instance, nil), do: []
+  defp pulls(instance, pulls), do: Vagus.App.Pulls.child_specs([instance: instance] ++ pulls)
 
-  defp services(instance, pulls),
-    do: [services: Vagus.App.Pulls.child_specs([instance: instance] ++ pulls)]
+  defp none(_instance), do: []
 
   @spec stop_system(system()) :: :ok
   def stop_system(sys) do

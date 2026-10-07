@@ -35,6 +35,7 @@ config :vagus, :store_asset_mode, :auto
 
 # The `Vagus.Resource.Controller` modules that `Vagus.Resource.Supervisor`
 # runs, one runtime each. The resource store's kinds follow from this list.
+# An entry is a module, or `{module, options}` for that runtime alone.
 config :vagus, :controllers, []
 
 # How many steps one controller's runtime has in flight at once. A step

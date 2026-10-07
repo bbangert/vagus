@@ -8,7 +8,9 @@ defmodule Vagus.Test.FakeEngine.Model do
   What it models, because the code under test depends on it:
 
     * `GET /containers/json` with `all` and the `label` and `name` filters,
-      a name pattern matched against the bare name, as moby does;
+      a name pattern matched against the bare name, as moby does. `Status`
+      is the engine's sentence, with a duration that differs in every
+      listing and the health in brackets;
     * `GET /events` holds the response open and carries what happens from
       then on. Nothing is replayed;
     * `POST /containers/{name}/stop` answers only after `:stop_delay` ms,
@@ -114,6 +116,7 @@ defmodule Vagus.Test.FakeEngine.Model do
        pulls: %{},
        streams: [],
        tick: 0,
+       listings: 0,
        log: []
      }}
   end
@@ -307,11 +310,11 @@ defmodule Vagus.Test.FakeEngine.Model do
             "Names" => ["/" <> container.name],
             "Image" => container.image,
             "State" => container.state,
-            "Status" => status_text(container),
+            "Status" => status_text(container, state.listings),
             "Labels" => container.labels
           }
 
-    {{200, listed}, state}
+    {{200, listed}, %{state | listings: state.listings + 1}}
   end
 
   defp route(:get, ["containers", ref, "json"], _entry, _pid, state) do
@@ -538,16 +541,23 @@ defmodule Vagus.Test.FakeEngine.Model do
   defp line(event), do: Jason.encode!(event) <> "\n"
 
   # As the engine words it: a sentence for people, not a state.
-  defp status_text(%{state: "running"}), do: "Up 3 seconds"
-  defp status_text(%{state: "created"}), do: "Created"
-  defp status_text(%{state: "paused"}), do: "Up 3 seconds (Paused)"
-  defp status_text(%{state: "removing"}), do: "Removal In Progress"
-  defp status_text(%{state: "dead"}), do: "Dead"
+  # The durations grow with every listing, as they do with time.
+  defp status_text(%{state: "running", health: {health, _streak}}, age),
+    do: "Up #{age + 3} seconds (#{health_text(health)})"
 
-  defp status_text(%{state: "restarting"} = container),
-    do: "Restarting (#{container.exit_code}) 1 second ago"
+  defp status_text(%{state: "running"}, age), do: "Up #{age + 3} seconds"
+  defp status_text(%{state: "created"}, _age), do: "Created"
+  defp status_text(%{state: "paused"}, age), do: "Up #{age + 3} seconds (Paused)"
+  defp status_text(%{state: "removing"}, _age), do: "Removal In Progress"
+  defp status_text(%{state: "dead"}, _age), do: "Dead"
 
-  defp status_text(container), do: "Exited (#{container.exit_code}) 2 seconds ago"
+  defp status_text(%{state: "restarting"} = container, age),
+    do: "Restarting (#{container.exit_code}) #{age + 1} seconds ago"
+
+  defp status_text(container, age), do: "Exited (#{container.exit_code}) #{age + 2} seconds ago"
+
+  defp health_text("starting"), do: "health: starting"
+  defp health_text(health), do: health
 
   # Label values are all required; name values are alternatives, each a
   # regular expression matched anywhere in the name.

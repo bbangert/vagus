@@ -160,6 +160,15 @@ defmodule Vagus.Resource.Runtime do
   def info_probe(reply_to, ref) when is_pid(reply_to) and is_reference(ref),
     do: {__MODULE__, :info, reply_to, ref}
 
+  @doc """
+  The options one controller's runtime may be given apart from the others'
+  (`Vagus.Resource.Supervisor`): how often it looks at everything, how many
+  steps it has in flight, its pacing, and what its callbacks are handed.
+  """
+  @spec controller_options() :: [atom()]
+  def controller_options,
+    do: [:resync, :max_in_flight_steps, :context, :backoff, :unavailable_retry, :gate_poll]
+
   defp instance(opts), do: Keyword.get(opts, :instance, Resource)
 
   @impl true

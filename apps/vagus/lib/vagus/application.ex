@@ -152,10 +152,11 @@ defmodule Vagus.Application do
           # Only at boot: this supervisor is `:one_for_one`, so the API keeps
           # serving while this subtree restarts, and a read then raises.
           #
-          # The pull worker and its tasks are this instance's services:
-          # after the lanes its pulls wait in, before the runtimes whose
-          # resources wait for it.
-          {Vagus.Resource.Supervisor, [services: Vagus.App.Pulls.child_specs()]},
+          # The pull worker with its tasks, and the token table, are this
+          # instance's services: after the lanes the pulls wait in, before
+          # the runtimes whose resources each has forgotten when replaced.
+          {Vagus.Resource.Supervisor,
+           [services: Vagus.App.Pulls.child_specs() ++ [Vagus.App.AuthIndex]]},
 
           # Supervisor-API emulator's HTTP surface (Bandit + Plug.Router),
           # isolated with its own restart budget so a crash there can't take
