@@ -443,6 +443,38 @@ defmodule Vagus.Runtime.DockerTest do
       assert Enum.reverse(seen) == [status("a"), status("é"), status("b")]
     end
 
+    for reference <- [
+          "",
+          "repo@",
+          "repo:tag@",
+          "@sha256:abc",
+          ":tag",
+          "repo:",
+          "repo/:tag",
+          "repo/",
+          "repo@sha256",
+          "repo@sha256:",
+          "repo@:abc",
+          "repo@sha256:abc@sha256:def",
+          "repo@sha256:abc@def",
+          "host:5000/@sha256:abc"
+        ] do
+      test "#{inspect(reference)} is refused, streamed or buffered, and nothing is asked of the engine" do
+        engine = scripted([{:stream, 200, []}, {:stream, 200, []}])
+        refused = {:error, {:invalid_ref, unquote(reference)}}
+
+        assert Docker.pull_image_stream(unquote(reference), [], &[&1 | &2], socket: engine.socket) ==
+                 refused
+
+        assert Docker.pull_image(unquote(reference), socket: engine.socket) == refused
+
+        assert Docker.failure({:invalid_ref, unquote(reference)}) ==
+                 {:invalid, {:invalid_ref, unquote(reference)}}
+
+        assert FakeEngine.requests(engine) == []
+      end
+    end
+
     test "a refusal that is not JSON keeps its text" do
       engine = scripted([{500, "something broke\n"}])
 

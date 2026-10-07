@@ -118,16 +118,21 @@ defmodule Vagus.Runtime.Docker do
   `{:error, {:pull_failed, detail}}` if the stream carries an `errorDetail`.
 
   `opts[:platform]` sets the `platform` query (e.g. `"linux/arm64"`).
+
+  A reference with an empty repository, tag or digest, or a digest that is
+  not `algorithm:hash`, is `{:error, {:invalid_ref, image}}` and nothing is
+  asked of the engine.
   """
   @spec pull_image(String.t(), keyword()) :: :ok | {:error, term()}
   def pull_image(image, opts \\ []) when is_binary(image) do
-    {repo, tag} = split_image(image)
-    query = [fromImage: repo, tag: tag] ++ platform_query(opts)
+    with {:ok, {repo, tag}} <- split_image(image) do
+      query = [fromImage: repo, tag: tag] ++ platform_query(opts)
 
-    case request(:post, "/images/create", Keyword.merge(opts, query: query, body: "")) do
-      {:ok, %{status: 200, body: body}} -> check_pull_stream(body)
-      {:ok, %{status: status, body: body}} -> {:error, {:pull_failed, {status, body}}}
-      {:error, reason} -> {:error, reason}
+      case request(:post, "/images/create", Keyword.merge(opts, query: query, body: "")) do
+        {:ok, %{status: 200, body: body}} -> check_pull_stream(body)
+        {:ok, %{status: status, body: body}} -> {:error, {:pull_failed, {status, body}}}
+        {:error, reason} -> {:error, reason}
+      end
     end
   end
 
@@ -159,7 +164,11 @@ defmodule Vagus.Runtime.Docker do
         when acc: var
   def pull_image_stream(image, acc, fun, opts \\ [])
       when is_binary(image) and is_function(fun, 2) do
-    {repo, tag} = split_image(image)
+    with {:ok, {repo, tag}} <- split_image(image),
+         do: pull_stream(repo, tag, acc, fun, opts)
+  end
+
+  defp pull_stream(repo, tag, acc, fun, opts) do
     path = "/images/create" <> encode_query([fromImage: repo, tag: tag] ++ platform_query(opts))
 
     pull = %{
@@ -920,18 +929,40 @@ defmodule Vagus.Runtime.Docker do
   #
   # A digest goes where the tag goes: the engine's `tag` parameter takes
   # either, and a reference carrying both is pulled by its digest.
+  #
+  # A reference with a part named and left empty is refused here. Sent on,
+  # the empty part would simply be missing from the request, and the engine
+  # would pull something other than what was asked for: `repo@` as `repo`.
   defp split_image(image) do
-    case String.split(image, "@", parts: 2) do
-      [name, digest] -> {elem(split_tag(name), 0), digest}
-      [name] -> split_tag(name)
+    split =
+      case String.split(image, "@") do
+        [name, digest] -> {split_tag(name), String.split(digest, ":")}
+        [name] -> {split_tag(name), :none}
+        _several_digests -> :malformed
+      end
+
+    case split do
+      {{repo, tag}, :none} when repo != "" and tag != "" ->
+        {:ok, {repo, tag}}
+
+      {{repo, tag}, [algorithm, hash]}
+      when repo != "" and tag != "" and algorithm != "" and hash != "" ->
+        {:ok, {repo, algorithm <> ":" <> hash}}
+
+      _empty_part ->
+        {:error, {:invalid_ref, image}}
     end
   end
 
+  # The repository is empty for a name with nothing before its tag or
+  # nothing after its last slash.
   defp split_tag(name) do
     last_segment = name |> String.split("/") |> List.last()
 
     case String.split(last_segment, ":", parts: 2) do
+      ["", _tag] -> {"", ""}
       [_name, tag] -> {String.replace_suffix(name, ":" <> tag, ""), tag}
+      [""] -> {"", ""}
       [_name] -> {name, "latest"}
     end
   end
