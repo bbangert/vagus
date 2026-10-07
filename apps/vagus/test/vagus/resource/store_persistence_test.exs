@@ -1,0 +1,301 @@
+defmodule Vagus.Resource.StorePersistenceTest do
+  use ExUnit.Case, async: true
+
+  alias Vagus.Resource
+  alias Vagus.Resource.{Persistence, Stamp, Store, TestInstance, Watch}
+
+  @moduletag :tmp_dir
+
+  setup %{tmp_dir: dir} do
+    %{path: Path.join(dir, "resources.json")}
+  end
+
+  # Writes for real and reports each flash write to the test.
+  defp counting(test) do
+    fn path, data ->
+      send(test, {:persisted, path})
+      Persistence.write(path, data)
+    end
+  end
+
+  defp start!(path, opts \\ []) do
+    instance = TestInstance.start!([path: path] ++ opts)
+    i = [instance: instance]
+    :ok = Store.register_kind(:thing, Owner, [conditions: [:ready]] ++ i)
+    i
+  end
+
+  defp restart!(i, path) do
+    :ok = stop_supervised(i[:instance])
+    start!(path)
+  end
+
+  describe "what reaches flash" do
+    test "status, claims and registrations never do", %{path: path} do
+      i = start!(path, persist: counting(self()))
+      {:ok, _} = Store.create(:thing, "t", %{a: 1}, i)
+      assert_received {:persisted, ^path}
+
+      status = %{conditions: [Resource.condition(:ready, true, :running, 1)], instance: "c1"}
+      {:ok, _} = Store.patch_status(:thing, "t", status, [writer: Owner] ++ i)
+      :ok = Store.claim(:thing, "t", i)
+      :ok = Store.release_claim(:thing, "t", i)
+      :ok = Store.register_writer(:thing, Dns, [conditions: [:dns_ready]] ++ i)
+      {:ok, _} = Store.update_spec(:thing, "t", %{a: 1}, i)
+
+      refute_received {:persisted, _}
+    end
+
+    test "a commit that changes specs is written exactly once", %{path: path} do
+      i = start!(path, persist: counting(self()))
+
+      {:ok, _} =
+        Store.commit(
+          [{:create, :thing, "a", %{v: 1}, []}, {:create, :thing, "b", %{v: 1}, []}],
+          i
+        )
+
+      assert_received {:persisted, ^path}
+      refute_received {:persisted, _}
+
+      {:ok, _} =
+        Store.commit(
+          [
+            {:update_spec, :thing, "a", %{v: 2}, []},
+            {:patch_status, :thing, "a", %{instance: "c1"}, [writer: Owner]},
+            {:update_spec, :thing, "b", %{v: 2}, []}
+          ],
+          i
+        )
+
+      assert_received {:persisted, ^path}
+      refute_received {:persisted, _}
+    end
+
+    test "the file is readable JSON and holds no status", %{path: path} do
+      i = start!(path)
+      {:ok, _} = Store.create(:thing, "t", %{a: 1}, i)
+      {:ok, _} = Store.patch_status(:thing, "t", %{instance: "sekrit"}, [writer: Owner] ++ i)
+      {:ok, _} = Store.update_spec(:thing, "t", %{a: 2}, i)
+
+      content = File.read!(path)
+      refute content =~ "sekrit"
+      refute content =~ "status"
+      assert content =~ "\n"
+
+      assert %{
+               "version" => 1,
+               "resources" => [%{"kind" => "thing", "name" => "t", "spec" => spec}]
+             } =
+               Jason.decode!(content)
+
+      assert spec == %{"a" => 2, "holds" => %{}}
+    end
+
+    test "a rejected commit leaves the store, the file and every subscriber alone",
+         %{path: path} do
+      i = start!(path, persist: counting(self()))
+      {:ok, a} = Store.create(:thing, "a", %{v: 1}, i)
+      {:ok, b} = Store.create(:thing, "b", %{v: 1}, [writer: :ctl] ++ i)
+      before = File.read!(path)
+      :ok = Watch.subscribe({:kind, :thing}, i)
+      assert_received {:persisted, ^path}
+      assert_received {:persisted, ^path}
+
+      assert {:error, {:conflict, [:v], :ctl}} =
+               Store.commit(
+                 [
+                   {:update_spec, :thing, "a", %{v: 2}, []},
+                   {:delete, :thing, "a"},
+                   {:update_spec, :thing, "b", %{v: 2}, []}
+                 ],
+                 i
+               )
+
+      assert Store.get(:thing, "a", i) == a
+      assert Store.get(:thing, "b", i) == b
+      assert File.read!(path) == before
+      refute_received {:persisted, _}
+      refute_received {Watch, _, _}
+    end
+
+    test "a flash write that fails rejects the commit", %{path: path} do
+      i = start!(path, persist: fn _path, _data -> {:error, :enospc} end)
+      :ok = Watch.subscribe({:kind, :thing}, i)
+
+      assert ExUnit.CaptureLog.capture_log(fn ->
+               assert {:error, {:persist_failed, :enospc}} = Store.create(:thing, "t", %{}, i)
+             end) =~ "not written"
+
+      assert Store.get(:thing, "t", i) == nil
+      refute_received {Watch, _, _}
+    end
+
+    test "a write replaces the file whole and leaves no temporary behind", %{tmp_dir: dir} do
+      path = Path.join([dir, "made", "on", "demand", "resources.json"])
+
+      assert :ok = Persistence.write(path, "first, and rather longer")
+      assert :ok = Persistence.write(path, ["sec", "ond"])
+
+      assert File.read!(path) == "second"
+      assert File.ls!(Path.dirname(path)) == ["resources.json"]
+    end
+  end
+
+  describe "reload" do
+    test "restores every durable field exactly, and no status", %{path: path} do
+      i = start!(path)
+      started = %Stamp{incarnation: 77, at: -5_000}
+
+      {:ok, app} =
+        Store.create(:thing, "app", %{mode: :fast, a: 1}, [finalizers: [:auth, :tidy]] ++ i)
+
+      {:ok, _} =
+        Store.commit(
+          [
+            {:update_spec, :thing, "app", [{:put, [:holds, ":odd"], true}],
+             [writer: {:backup, "b1"}]},
+            {:update_spec, :thing, "app", %{a: 2}, [writer: Owner]},
+            {:put_progress, :thing, "app", %{phase: :applied, started: started}, [writer: Owner]},
+            {:patch_status, :thing, "app", %{instance: "c1"}, [writer: Owner]},
+            {:create, :part, "p", %{"n" => 1},
+             [owner_refs: [Resource.ref(app)], finalizers: [:tidy]]},
+            {:delete, :part, "p"}
+          ],
+          i
+        )
+
+      before = Store.get(:thing, "app", i)
+      part = Store.get(:part, "p", i)
+      assert before.status == %{instance: "c1"}
+      assert part.deleting?
+
+      i = restart!(i, path)
+
+      assert Store.get(:thing, "app", i) == %{before | status: %{}}
+      assert Store.get(:part, "p", i) == part
+
+      assert %Resource{
+               uid: 1,
+               generation: 3,
+               spec: %{mode: :fast, a: 2, holds: %{":odd" => true}},
+               progress: %{phase: :applied, started: ^started},
+               finalizers: [:auth, :tidy],
+               managed_fields: %{[:holds, ":odd"] => {:backup, "b1"}, [:a] => Owner}
+             } = Store.get(:thing, "app", i)
+
+      assert %Resource{
+               deleting?: true,
+               finalizers: [:tidy],
+               owner_refs: [%{kind: :thing, name: "app", uid: 1}]
+             } =
+               part
+    end
+
+    test "uids continue above every uid ever given, deleted ones included", %{path: path} do
+      i = start!(path)
+      {:ok, %{uid: 1}} = Store.create(:thing, "a", %{}, i)
+      {:ok, %{uid: 2}} = Store.create(:thing, "b", %{}, i)
+      {:ok, %{uid: 3}} = Store.create(:thing, "c", %{}, i)
+      {:ok, _} = Store.delete(:thing, "c", i)
+
+      i = restart!(i, path)
+
+      assert {:ok, %{uid: 4}} = Store.create(:thing, "c", %{}, i)
+    end
+
+    test "a file whose counter is behind its resources still gives a fresh uid", %{path: path} do
+      i = start!(path)
+      {:ok, %{uid: 1}} = Store.create(:thing, "a", %{}, i)
+      {:ok, %{uid: 2}} = Store.create(:thing, "b", %{}, i)
+      :ok = stop_supervised(i[:instance])
+
+      File.write!(
+        path,
+        path |> File.read!() |> Jason.decode!() |> Map.put("next_uid", 1) |> Jason.encode!()
+      )
+
+      i = start!(path)
+
+      assert {:ok, %{uid: 3}} = Store.create(:thing, "c", %{}, i)
+    end
+
+    test "a missing file is an empty store", %{path: path} do
+      i = start!(path)
+
+      assert Store.list(:thing, i) == []
+      assert {:ok, %{uid: 1}} = Store.create(:thing, "t", %{}, i)
+      assert File.exists?(path)
+    end
+  end
+
+  describe "a file that cannot be trusted fails the start" do
+    @describetag :capture_log
+
+    defp refused(path) do
+      assert {:error, {{:shutdown, {:failed_to_start_child, Store, reason}}, _spec}} =
+               TestInstance.start(path: path)
+
+      reason
+    end
+
+    test "unparseable", %{path: path} do
+      File.write!(path, ~s({"version": 1, "resources": [))
+      assert {:unparseable, _} = refused(path)
+    end
+
+    test "another version", %{path: path} do
+      File.write!(path, ~s({"version": 99, "next_uid": 1, "resources": []}))
+      assert refused(path) == {:unsupported_version, 99}
+    end
+
+    test "a resource of a kind nobody defined", %{path: path} do
+      i = start!(path)
+      {:ok, _} = Store.create(:thing, "t", %{}, i)
+      {:ok, _} = Store.create(:part, "p", %{}, i)
+      :ok = stop_supervised(i[:instance])
+
+      File.write!(
+        path,
+        path |> File.read!() |> String.replace(~s("kind": "part"), ~s("kind": "ghost"))
+      )
+
+      assert refused(path) == {:unknown_kind, "ghost"}
+    end
+
+    test "unreadable", %{path: path} do
+      File.mkdir_p!(path)
+      assert refused(path) == {:unreadable, :eisdir}
+    end
+
+    test "a resource missing a field", %{path: path} do
+      File.write!(
+        path,
+        ~s({"version": 1, "next_uid": 2, "resources": [{"kind": "thing", "name": "t"}]})
+      )
+
+      assert refused(path) == :malformed
+    end
+  end
+
+  describe "a store that dies between its flash write and its ETS write" do
+    @describetag :capture_log
+
+    test "is replaced by one that takes the file and tells subscribers", %{path: path} do
+      dying = fn path, data ->
+        :ok = Persistence.write(path, data)
+        if IO.iodata_to_binary(data) =~ ~s("a": 2), do: exit(:kill), else: :ok
+      end
+
+      i = start!(path, persist: dying)
+      {:ok, _} = Store.create(:thing, "t", %{a: 1}, i)
+      {:ok, _} = Store.patch_status(:thing, "t", %{instance: "c1"}, [writer: Owner] ++ i)
+      :ok = Watch.subscribe({:object, :thing, "t"}, i)
+
+      assert catch_exit(Store.update_spec(:thing, "t", %{a: 2}, i))
+
+      assert_receive {Watch, :changed, %{name: "t", generation: 2}}
+      assert %Resource{spec: %{a: 2}, status: %{instance: "c1"}} = Store.get(:thing, "t", i)
+    end
+  end
+end

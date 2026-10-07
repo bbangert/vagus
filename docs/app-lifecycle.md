@@ -50,13 +50,28 @@ Core is not a separate mechanism. It is a resource of kind App named
 - One file, `/data/vagus/resources.json`, holds the persisted fields. It is
   rewritten only when one of them changed, so status churn costs no flash
   writes: temp file, fsync, rename, directory fsync.
+- Kinds are static and given to the store when it starts
+  (`Vagus.Resource.Kind`): the validators that admit a spec, and the hooks
+  that carry the kind's own shapes through JSON. The file is loaded before
+  the store's start returns. A missing file is an empty store; one that
+  cannot be read or parsed, has another version, or holds a kind or atom this
+  build does not know fails the start, because loading it as empty would
+  read as "nothing installed".
+- A write goes to flash, then to ETS, then to subscribers. A reader never
+  acts on desired state a reboot would take back. A store that dies between
+  the first two leaves readers behind flash; its replacement re-reads the
+  file and announces the difference.
 - `managed_fields` gives each spec path one owning writer; a write to a path
   someone else owns is a conflict. An Update claims its app's `version` this
   way, so a user's write to it mid-update is refused instead of raced.
 - `Store.commit(ops)` applies writes to several resources all or none,
   persists once and notifies once.
 - The store keeps one in-memory operation claim per app. A command takes it;
-  a second mutating command on that app fails as busy.
+  a second mutating command on that app fails as busy. The claim ends when
+  its holder releases it or dies, and outlives a store restart.
+- A kind has one owner, the only writer of its `progress` and of status
+  outside conditions. Every writer declares the condition types it owns, and
+  a type has one writer.
 - `Vagus.Resource.Watch` is a duplicate-key `Registry`, so subscriptions
   outlast a store restart. They are by object, kind or owner:
   `{:object, kind, name}`, `{:kind, kind}`, `{:owner, kind, name}`. ETS is

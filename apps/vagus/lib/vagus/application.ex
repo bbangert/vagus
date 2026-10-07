@@ -34,6 +34,10 @@ defmodule Vagus.Application do
     # older than the app instance that reads it.
     Vagus.RunState.reset_dir()
 
+    # Here rather than on first use so that one process sets it before anyone
+    # reads a clock.
+    Vagus.Resource.Clock.System.ensure_incarnation()
+
     children =
       [
         # Fire-and-forget and bounded work that must not be a bare spawn
@@ -140,6 +144,12 @@ defmodule Vagus.Application do
         ingress_children() ++
         ssh_access_children() ++
         [
+          # The resource store (tables, watch registry, single writer). Before
+          # `Vagus.API.Supervisor` so a request never finds its tables
+          # missing, and a resource file that cannot be read fails the
+          # application start here, before anything acts on an empty store.
+          {Vagus.Resource.Supervisor, []},
+
           # Supervisor-API emulator's HTTP surface (Bandit + Plug.Router),
           # isolated with its own restart budget so a crash there can't take
           # down the rest of the app. Started on both :host and real targets

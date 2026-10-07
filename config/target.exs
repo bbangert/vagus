@@ -162,6 +162,10 @@ config :vagus, :token_path, "/data/vagus/token"
 config :vagus, :addon_state_path, "/data/vagus/addons.json"
 config :vagus, :addon_boot_start, true
 
+# Desired state of every resource (`Vagus.Resource.Store`), beside the files
+# above on the application partition both firmware slots share.
+config :vagus, :resources_path, "/data/vagus/resources.json"
+
 # tmpfs checkpoint of add-on registrations so a process restart loses nothing;
 # `Vagus.Application` wipes it at every app start (see `Vagus.RunState`).
 config :vagus, :run_state_dir, "/run/vagus"
