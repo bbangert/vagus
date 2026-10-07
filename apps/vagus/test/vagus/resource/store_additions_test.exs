@@ -10,7 +10,7 @@ defmodule Vagus.Resource.StoreAdditionsTest do
         held: [finalizers: [:auth, :tidy], writer_entries: [["holds"]]]
       })
 
-    instance = TestInstance.start!(kinds: kinds)
+    instance = TestInstance.start!(kinds: kinds, owned: %{part: [{Owner, [:ready]}]})
     %{i: [instance: instance]}
   end
 
@@ -35,7 +35,6 @@ defmodule Vagus.Resource.StoreAdditionsTest do
   describe "commit_changed" do
     test "says no for a commit that left everything as it was", %{i: i} do
       {:ok, %{uid: uid}} = Store.create(:part, "p", %{"a" => 1}, i)
-      :ok = Store.register_kind(:part, Owner, [conditions: [:ready]] ++ i)
       ready = %{conditions: [Resource.condition(:ready, true, :fine, 1)], note: "x"}
       {:ok, before} = Store.patch_status(:part, "p", ready, [writer: Owner] ++ i)
       :ok = Watch.subscribe({:kind, :part}, i)

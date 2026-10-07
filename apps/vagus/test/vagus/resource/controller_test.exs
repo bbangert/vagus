@@ -28,15 +28,27 @@ defmodule Vagus.Resource.ControllerTest do
   end
 
   defmodule Chatty do
-    @moduledoc "Returns a status write as an effect."
+    @moduledoc "Returns what the resource it is given says, as its effects."
     @behaviour Vagus.Resource.Controller
     def kind, do: :chatty
     def condition_types, do: [:ready]
     def observe(_resource, _context), do: nil
     def act(_action, _args, _context), do: :ok
 
-    def reconcile(_resource, _observed),
-      do: {Verdict.new(ready: {true, :ok}), [{:status, %{count: 1}}]}
+    def reconcile(%{name: name}, _observed) do
+      op = {:delete, :chatty, name}
+      act = {:action, :say, nil}
+
+      effects =
+        case name do
+          "status" -> [{:status, %{count: 1}}]
+          "twice" -> [op, act, {:requeue_after, 5}, act]
+          "after" -> [act, op]
+          "fine" -> [{:requeue_after, 5}, op, act, {:requeue_after, 9}]
+        end
+
+      {Verdict.new(ready: {true, :ok}), effects}
+    end
   end
 
   describe "the kinds derived from controllers" do
@@ -45,6 +57,8 @@ defmodule Vagus.Resource.ControllerTest do
                Controller.kinds([Kept, Tagger, Atomic])
 
       assert kept.finalizers == [:kept, :tagged]
+      assert kept.owner == Kept
+      assert kept.conditions == %{ready: Kept, tagged: Tagger}
       assert kept.writer_entries == [["holds"]]
       assert kept.validators == []
       assert kept.encode_spec.(%{a: 1}) == %{a: 1}
@@ -54,6 +68,7 @@ defmodule Vagus.Resource.ControllerTest do
       assert atomic.encode_spec.(%{mode: :on}) == %{"mode" => "on"}
       assert atomic.decode_spec.(%{"mode" => "on"}) == %{mode: :on}
       assert atomic.finalizers == []
+      assert {atomic.owner, atomic.conditions} == {Atomic, %{ready: Atomic}}
     end
 
     test "two owners of one kind, or an attachment to a kind nobody owns, cannot start" do
@@ -219,8 +234,18 @@ defmodule Vagus.Resource.ControllerTest do
       end
 
       assert_raise ExUnit.AssertionError, ~r/non-effect/, fn ->
-        assert_verdict_contract(Chatty, [{resource(:chatty, "c", %{}), nil}])
+        assert_verdict_contract(Chatty, [{resource(:chatty, "status", %{}), nil}])
       end
+    end
+
+    test "catches a second action and an op after the action, wherever a re-queue stands" do
+      for name <- ["twice", "after"] do
+        assert_raise ExUnit.AssertionError, ~r/more than one action, or an op after/, fn ->
+          assert_verdict_contract(Chatty, [{resource(:chatty, name, %{}), nil}])
+        end
+      end
+
+      assert_verdict_contract(Chatty, [{resource(:chatty, "fine", %{}), nil}])
     end
   end
 end

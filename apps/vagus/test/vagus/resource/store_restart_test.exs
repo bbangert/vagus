@@ -7,10 +7,8 @@ defmodule Vagus.Resource.StoreRestartTest do
   @moduletag :capture_log
 
   setup do
-    instance = TestInstance.start!()
-    i = [instance: instance]
-    :ok = Store.register_kind(:thing, Owner, [conditions: [:ready]] ++ i)
-    %{i: i, instance: instance}
+    instance = TestInstance.start!(owned: %{thing: [{Owner, [:ready]}, {Dns, [:dns_ready]}]})
+    %{i: [instance: instance], instance: instance}
   end
 
   test "a killed store: status and subscriptions outlive it, and its replacement is heard",
@@ -30,28 +28,33 @@ defmodule Vagus.Resource.StoreRestartTest do
     assert_received {Watch, :changed, %{name: "t", generation: 2}}
   end
 
-  test "a restarted store has no owners: status fails closed, specs are still validated",
+  test "a restarted store knows who owns what from its first message, with no runtime",
        %{i: i, instance: instance} do
     {:ok, _} = Store.create(:thing, "t", %{a: 1}, i)
     owner = [writer: Owner] ++ i
     ready = %{conditions: [Resource.condition(:ready, true, :running, 1)]}
-    {:ok, _} = Store.patch_status(:thing, "t", Map.put(ready, :instance, "c1"), owner)
 
     TestInstance.restart_store(instance)
 
-    assert {:error, {:not_owner, :ready, Owner}} = Store.patch_status(:thing, "t", ready, owner)
+    assert {:ok, %{status: %{instance: "c1", conditions: %{ready: %{status: true}}}}} =
+             Store.patch_status(:thing, "t", Map.put(ready, :instance, "c1"), owner)
 
-    assert {:error, {:not_owner, :instance, Owner}} =
-             Store.patch_status(:thing, "t", %{instance: "c2"}, owner)
-
-    assert {:error, {:not_owner, :progress, Owner}} =
+    assert {:ok, %{progress: %{phase: :applied}}} =
              Store.put_progress(:thing, "t", %{phase: :applied}, owner)
 
-    assert {:error, {:invalid, :bad}} = Store.create(:thing, "u", %{bad: true}, i)
-    assert {:error, {:invalid, :bad}} = Store.update_spec(:thing, "t", %{bad: true}, i)
+    dns = %{conditions: [Resource.condition(:dns_ready, true, :ok, 1)]}
+    assert {:ok, _} = Store.patch_status(:thing, "t", dns, [writer: Dns] ++ i)
 
-    :ok = Store.register_kind(:thing, Owner, [conditions: [:ready]] ++ i)
-    assert {:ok, _} = Store.patch_status(:thing, "t", %{instance: "c2"}, owner)
+    assert {:error, {:not_owner, :ready, Dns}} =
+             Store.patch_status(:thing, "t", ready, [writer: Dns] ++ i)
+
+    assert {:error, {:not_owner, :instance, Dns}} =
+             Store.patch_status(:thing, "t", %{instance: "c2"}, [writer: Dns] ++ i)
+
+    assert {:error, {:not_owner, :progress, Dns}} =
+             Store.put_progress(:thing, "t", %{phase: :applied}, [writer: Dns] ++ i)
+
+    assert {:error, {:invalid, :bad}} = Store.update_spec(:thing, "t", %{bad: true}, i)
   end
 
   test "killing the tables' owner replaces the registry and the store with it",

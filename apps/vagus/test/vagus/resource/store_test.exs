@@ -5,10 +5,8 @@ defmodule Vagus.Resource.StoreTest do
   alias Vagus.Resource.{Store, Tables, TestInstance, Watch}
 
   setup do
-    instance = TestInstance.start!()
+    instance = TestInstance.start!(owned: %{thing: [{Owner, [:ready]}, {Dns, [:dns_ready]}]})
     i = [instance: instance]
-    :ok = Store.register_kind(:thing, Owner, [conditions: [:ready]] ++ i)
-    :ok = Store.register_writer(:thing, Dns, [conditions: [:dns_ready]] ++ i)
     %{i: i, instance: instance, store: Process.whereis(Store.name(instance))}
   end
 
@@ -56,7 +54,6 @@ defmodule Vagus.Resource.StoreTest do
 
     test "a kind the store was not started with is refused", %{i: i} do
       assert {:error, {:unknown_kind, :ghost}} = Store.create(:ghost, "g", %{}, i)
-      assert {:error, {:unknown_kind, :ghost}} = Store.register_kind(:ghost, Owner, i)
     end
 
     test "a spec JSON cannot hold is refused with no file configured", %{i: i} do
@@ -296,32 +293,27 @@ defmodule Vagus.Resource.StoreTest do
                Store.put_progress(:thing, "t", %{phase: :applied}, [writer: Owner] ++ i)
     end
 
-    test "a kind has one owner, who may register again", %{i: i} do
-      assert {:error, {:kind_owned, Owner}} = Store.register_kind(:thing, Usurper, i)
-      {:ok, _} = Store.create(:thing, "t", %{}, i)
-      failed = %{conditions: [Resource.condition(:failed, true, :crashed, 1)]}
-      owner = [writer: Owner] ++ i
-
-      assert {:error, {:not_owner, :failed, Owner}} =
-               Store.patch_status(:thing, "t", failed, owner)
-
-      assert :ok = Store.register_kind(:thing, Owner, [conditions: [:failed]] ++ i)
-      assert {:ok, _} = Store.patch_status(:thing, "t", failed, owner)
-
-      # The second registration replaced the first; it did not add to it.
-      ready = %{conditions: [Resource.condition(:ready, true, :running, 1)]}
-      assert {:error, {:not_owner, :ready, Owner}} = Store.patch_status(:thing, "t", ready, owner)
-    end
-
-    test "a condition type has one writer per kind", %{i: i} do
-      assert {:error, {:condition_owned, :ready, Owner}} =
-               Store.register_writer(:thing, Ingress, [conditions: [:ingress_ready, :ready]] ++ i)
-
+    test "a condition type no writer declared is nobody's, and a kind with no owner takes no status",
+         %{i: i} do
       {:ok, _} = Store.create(:thing, "t", %{}, i)
       ingress = %{conditions: [Resource.condition(:ingress_ready, true, :ok, 1)]}
 
-      assert {:error, {:not_owner, :ingress_ready, Ingress}} =
-               Store.patch_status(:thing, "t", ingress, [writer: Ingress] ++ i)
+      for writer <- [Ingress, Owner] do
+        assert {:error, {:not_owner, :ingress_ready, ^writer}} =
+                 Store.patch_status(:thing, "t", ingress, [writer: writer] ++ i)
+      end
+
+      {:ok, _} = Store.create(:part, "p", %{}, i)
+      ready = %{conditions: [Resource.condition(:ready, true, :ok, 1)]}
+
+      assert {:error, {:not_owner, :ready, Owner}} =
+               Store.patch_status(:part, "p", ready, [writer: Owner] ++ i)
+
+      assert {:error, {:not_owner, :note, Owner}} =
+               Store.patch_status(:part, "p", %{note: "x"}, [writer: Owner] ++ i)
+
+      assert {:error, {:not_owner, :progress, Owner}} =
+               Store.put_progress(:part, "p", %{}, [writer: Owner] ++ i)
     end
   end
 
@@ -599,7 +591,7 @@ defmodule Vagus.Resource.StoreTest do
       assert same_store?(instance, store)
     end
 
-    test "finalizers and condition types that are not atoms",
+    test "finalizers that are not atoms",
          %{i: i, instance: instance, store: store} do
       for finalizers <- [:tidy, ["tidy"]] do
         assert {:error, {:bad_op, {:create, :part, "p", _, _}}} =
@@ -611,9 +603,6 @@ defmodule Vagus.Resource.StoreTest do
 
       assert {:error, {:bad_op, {:remove_finalizer, :thing, "t", "tidy"}}} =
                Store.remove_finalizer(:thing, "t", "tidy", i)
-
-      assert {:error, {:bad_conditions, :ready}} =
-               Store.register_writer(:thing, Late, [conditions: :ready] ++ i)
 
       assert same_store?(instance, store)
     end
@@ -649,15 +638,6 @@ defmodule Vagus.Resource.StoreTest do
 
       assert {:error, {:bad_op, {:put, [{:a, 1}], 1}}} =
                Store.update_spec(:thing, "t", %{{:a, 1} => 1}, i)
-
-      assert same_store?(instance, store)
-    end
-
-    test "a registration in nobody's name", %{i: i, instance: instance, store: store} do
-      assert {:error, {:bad_writer, nil}} = Store.register_kind(:part, nil, i)
-
-      assert {:error, {:bad_writer, nil}} =
-               Store.register_writer(:thing, nil, [conditions: [:late]] ++ i)
 
       assert same_store?(instance, store)
     end

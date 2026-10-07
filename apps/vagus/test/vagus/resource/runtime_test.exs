@@ -14,6 +14,16 @@ defmodule Vagus.Resource.RuntimeTest do
   defp condition(sys, kind, name, type),
     do: Resource.get_condition(Store.get(kind, name, sys.i), type)
 
+  # Those that changed something, in order, from the mailbox.
+  defp boundaries(seen \\ []) do
+    receive do
+      {:boundary, :idle_commit} -> boundaries(seen)
+      {:boundary, crossed} -> boundaries([crossed | seen])
+    after
+      0 -> Enum.reverse(seen)
+    end
+  end
+
   describe "the queue" do
     test "a change that arrives during a step is not lost: the key runs once more" do
       sys = start_system(controllers: [Probe])
@@ -198,7 +208,7 @@ defmodule Vagus.Resource.RuntimeTest do
       assert fact(sys, {:seen, "p"}) == 1
     end
 
-    test "after a store restart every runtime has registered again and writes status" do
+    test "a store restart replaces every runtime, and each writes its status as before" do
       sys = start_system(controllers: [Kept, Tagger])
       given_ready(sys, {:kept, "k", %{}})
 
@@ -328,23 +338,12 @@ defmodule Vagus.Resource.RuntimeTest do
       assert %{failures: %{"s" => 1}, steps: 1} = Runtime.info(Sloppy, sys.i)
       assert journal(sys) == []
     end
-
-    test "outside strict mode such a verdict is dropped and the effects still happen" do
-      sys = start_system(controllers: [Sloppy], runtime: [strict_verdicts: false])
-
-      {:ok, created} = Store.create(:sloppy, "s", %{}, sys.i)
-      settle(sys)
-
-      assert %{failures: failures} = Runtime.info(Sloppy, sys.i)
-      assert failures == %{}
-      assert Store.get(:sloppy, "s", sys.i) == created
-      assert journal(sys) == [{{Sloppy, "s"}, :poke}]
-    end
   end
 
-  describe "effect groups" do
+  describe "a pass" do
     @tag :tmp_dir
-    test "the effects between two actions are one commit", %{tmp_dir: dir} do
+    test "is one commit of its ops and its verdict, made before its one action",
+         %{tmp_dir: dir} do
       test = self()
 
       persist = fn path, data ->
@@ -356,12 +355,17 @@ defmodule Vagus.Resource.RuntimeTest do
         start_system(
           controllers: [Batch],
           path: Path.join(dir, "resources.json"),
-          persist: persist
+          persist: persist,
+          runtime: [boundary: fn info -> send(test, {:boundary, info.after}) end]
         )
 
       given_ready(sys, {:batch, "b", %{}})
 
-      # The create, then one write per group: `a` with the progress and the
+      # Two passes that write and act, one that writes, and one more for the
+      # generation that one made: a commit each, whatever it holds.
+      assert boundaries() == [:commit, :action, :commit, :action, :commit, :commit]
+
+      # The create, then one write per pass: `a` with the progress and the
       # verdict, `b` with `c`, and `d`. Status alone never reaches the file.
       for _commit <- 1..4, do: assert_received(:persisted)
       refute_received :persisted
@@ -371,7 +375,7 @@ defmodule Vagus.Resource.RuntimeTest do
 
       assert journal(sys) == [{{Batch, "b"}, {:mark, 1}}, {{Batch, "b"}, {:mark, 2}}]
 
-      # The verdict went with the first group: it is there before any action.
+      # The verdict went with the commit: it is there before the action.
       assert [{:status_at_mark, 1, at_first}, {:status_at_mark, 2, _status}] = notes(sys)
       assert %{observed_generation: 1, conditions: %{ready: %{reason: :marking}}} = at_first
     end
@@ -484,7 +488,7 @@ defmodule Vagus.Resource.RuntimeTest do
       await!(sys, :probe, "p", :ready)
     end
 
-    test "has none of the actions decided from it performed, and every write around them made" do
+    test "has the action decided from it withheld, and the ops and the verdict written" do
       sys = start_system(controllers: [Probe], runtime: [unavailable_retry: 600_000])
       put_fact(sys, :engine, :down)
       put_fact(sys, :act_when_down, true)
@@ -496,14 +500,11 @@ defmodule Vagus.Resource.RuntimeTest do
           settle(sys)
         end)
 
-      assert log =~ "probe/p could not be observed; not performing [visit: 0, visit: 0]"
+      assert log =~ "probe/p could not be observed; not performing :visit"
       assert journal(sys) == []
       refute_received {:acting, "p", _n, _step}
 
-      # The writes before, between and after the two actions, with the
-      # verdict, as the one group they are once nothing separates them.
-      assert %{spec: %{"before" => true, "between" => true, "after" => true}, generation: 4} =
-               Store.get(:probe, "p", sys.i)
+      assert %{spec: %{"noted" => true}, generation: 2} = Store.get(:probe, "p", sys.i)
 
       assert %{reason: :engine_unavailable} = condition(sys, :probe, "p", :progressing)
       assert %{timers: ["p"], steps: 1} = Runtime.info(Probe, sys.i)

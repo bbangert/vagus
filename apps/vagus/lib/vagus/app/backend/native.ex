@@ -11,9 +11,21 @@ defmodule Vagus.App.Backend.Native do
   no id. Its `id` names the subtree's process and so differs for every
   start.
 
-  The subtree is a `:temporary` child: the broker's own supervisor absorbs
-  its children's crashes, and one that gives up stays down and is observed
-  as `:absent`. Whether to start it again is the controller's decision.
+  The subtree is a `:transient` child. Recovering from a crash at once is
+  supervision's: the broker's own supervisor restarts its children, and the
+  holding supervisor restarts the subtree when it ends abnormally, as a new
+  instance with a new `id`. Whether the app runs, and what to do about one
+  that keeps failing, is the controller's: a broker whose own supervisor
+  has given up ends with `:shutdown`, which `:transient` does not restart,
+  so it is observed as `:absent`. `:permanent` would restart that too, and
+  have a broker that cannot stay up spend the holding supervisor's budget,
+  which every native app shares.
+
+  `stop/3` ends the subtree through the holding supervisor, which forgets
+  the child: nothing starts it again but `start/2`. A subtree that ends
+  abnormally at the very moment of a stop is restarted behind it, the stop
+  having found no name, or a pid the supervisor no longer holds; the pass
+  after observes it running and stops it.
 
   `start/2` of a running instance is `:ok`. When the name the subtree
   registers is held by a process the supervisor does not hold, nothing can
@@ -22,7 +34,8 @@ defmodule Vagus.App.Backend.Native do
 
   With the holding supervisor away, `observe/2` is `{:unavailable,
   :native_supervisor_down}`, `start/2` exits, and `stop/3` and `remove/2`
-  exit when there is a subtree to end.
+  exit when there is a subtree to end. One that spent its budget is
+  replaced empty by its own supervisor, and every instance is `:absent`.
 
   The subtree registers the name the backend this one replaces uses for the
   same app, so the two cannot each run a broker on the port; one started by
@@ -67,7 +80,7 @@ defmodule Vagus.App.Backend.Native do
          port: Keyword.get_lazy(opts, :port, &default_port/0),
          auth: [slug: slug],
          provider: Keyword.get(opts, :provider, slug: slug)},
-        restart: :temporary
+        restart: :transient
       )
 
     case DynamicSupervisor.start_child(supervisor(opts), spec) do
@@ -94,9 +107,9 @@ defmodule Vagus.App.Backend.Native do
         :ok
 
       pid ->
-        # The supervisor decides: `:ok` once the subtree has ended, and
-        # `{:error, :not_found}` for a pid that is not, or no longer, its
-        # child, which is the same end state.
+        # The supervisor decides: `:ok` once the subtree has ended and the
+        # child is forgotten, and `{:error, :not_found}` for a pid that is
+        # not, or no longer, its child.
         _ = DynamicSupervisor.terminate_child(supervisor(opts), pid)
         :ok
     end

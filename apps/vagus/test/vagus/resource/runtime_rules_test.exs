@@ -5,7 +5,7 @@ defmodule Vagus.Resource.RuntimeRulesTest do
   import Vagus.Resource.Harness
 
   alias Vagus.Resource
-  alias Vagus.Resource.{Controller, Lanes, Runtime, Store, TestInstance}
+  alias Vagus.Resource.{Controller, Kind, Lanes, Runtime, Store, TestInstance}
 
   alias Vagus.Resource.Toys.{
     Bare,
@@ -17,7 +17,6 @@ defmodule Vagus.Resource.RuntimeRulesTest do
     Grabber,
     Idle,
     Kept,
-    Last,
     Mute,
     Probe,
     Shapeless,
@@ -28,16 +27,6 @@ defmodule Vagus.Resource.RuntimeRulesTest do
 
   @moduletag :capture_log
   @moduletag :scenario
-
-  defmodule Squatter do
-    @moduledoc "Wants to own `:thing`."
-    @behaviour Vagus.Resource.Controller
-    def kind, do: :thing
-    def condition_types, do: [:ready]
-    def observe(_resource, _context), do: nil
-    def reconcile(_resource, _observed), do: {:no_verdict, []}
-    def act(_action, _args, _context), do: :ok
-  end
 
   defp runtime(sys, controller), do: Process.whereis(Runtime.name(sys.instance, controller))
 
@@ -182,7 +171,7 @@ defmodule Vagus.Resource.RuntimeRulesTest do
       # Everything there is to remember: a repeated pass being paced, a
       # failed action, timers, references.
       assert %{known: %{"a" => a, "b" => b}, refs_in: %{{:probe, "old"} => [_, _]}} = known.()
-      assert %{failures: 1, acted: [nudge: false], timer: {_, _}, refs: [probe: "old"]} = a
+      assert %{failures: 1, acted: {:nudge, false}, timer: {_, _}, refs: [probe: "old"]} = a
       assert %{failures: 2, failed: %{reason: :stuck}, timer: {_, _}, refs: [probe: "old"]} = b
 
       for name <- ["a", "b"] do
@@ -194,7 +183,7 @@ defmodule Vagus.Resource.RuntimeRulesTest do
       shutdown(sys, true)
       resync(sys, Sticky)
       settle(sys)
-      fresh = &%{uid: &1, failures: 0, failed: nil, acted: [], timer: nil, refs: []}
+      fresh = &%{uid: &1, failures: 0, failed: nil, acted: nil, timer: nil, refs: []}
 
       assert known.() == %{
                known: Map.new(Store.list(:sticky, sys.i), &{&1.name, fresh.(&1.uid)}),
@@ -255,7 +244,7 @@ defmodule Vagus.Resource.RuntimeRulesTest do
     end
   end
 
-  describe "registration" do
+  describe "what the controllers declare" do
     test "two controllers declaring one condition type fail the start, by name" do
       assert {:error, reason} = TestInstance.start(controllers: [Kept, Clasher], kinds: %{})
 
@@ -306,7 +295,6 @@ defmodule Vagus.Resource.RuntimeRulesTest do
             {:retention, %{keep: -1, ttl_ms: 0}, "%{keep: count, ttl_ms: ms | :infinity}"},
             {:retention, [keep: 1, ttl_ms: 1], "%{keep: count, ttl_ms: ms | :infinity}"},
             {:finalizer, "shapeless", "an atom other than nil"},
-            {:finalize_after, :auth, "a list of atoms"},
             {:writer_entries, ["holds"], "a list of spec paths"},
             {:writer_entries, %{}, "a list of spec paths"}
           ] do
@@ -324,21 +312,17 @@ defmodule Vagus.Resource.RuntimeRulesTest do
                Controller.declare(Shapeless)
     end
 
-    test "a registration the store refuses stops the runtime with that reason" do
-      instance = TestInstance.start!()
-      i = [instance: instance]
-      :ok = Store.register_kind(:thing, Somebody, [conditions: [:ready]] ++ i)
-      Process.flag(:trap_exit, true)
+    test "who owns a kind and who writes which condition is the store's from its start" do
+      sys = start_system(controllers: [Kept, Mute, Echo])
+      store = :sys.get_state(Process.whereis(Store.name(sys.instance)))
 
-      {:ok, runtime} =
-        Runtime.start_link(
-          [declaration: Controller.declare(Squatter), tasks: Runtime.tasks(instance, Squatter)] ++
-            i
-        )
+      assert %{kept: %Kind{owner: Kept, conditions: %{ready: Kept}}} = store.kinds
+      assert %Kind{owner: Mute, conditions: %{ready: Mute, heard: Echo}} = store.kinds.mute
+    end
 
-      assert_receive {:EXIT, ^runtime,
-                      {:registration_refused, Squatter, {:kind_owned, Somebody}}},
-                     5_000
+    test "something that is no controller fails the start, by name" do
+      assert {:error, reason} = TestInstance.start(controllers: [nil], kinds: %{})
+      assert inspect(reason) =~ "could not load module nil"
     end
   end
 
@@ -367,7 +351,7 @@ defmodule Vagus.Resource.RuntimeRulesTest do
       assert %{steps: 1, failures: %{"f" => 1}, timers: ["f"]} = Runtime.info(Flaky, sys.i)
     end
 
-    test "a pass that performs the same actions as the pass before is spaced out" do
+    test "a pass that performs the same action as the pass before is spaced out" do
       sys = start_system(controllers: [Idle], runtime: [backoff: {60_000, 60_000}])
 
       {:ok, _} = Store.create(:idle, "i", %{}, sys.i)
@@ -436,8 +420,7 @@ defmodule Vagus.Resource.RuntimeRulesTest do
 
     for {effect, logged} <- [
           {"refused", ":commit_refused, {:wild, \"w\"}, :not_found"},
-          {"bad_act", "Vagus.Resource.Toys.Wild.act/3 returned :done"},
-          {"non_effect", "not effects: [status: %{}]"}
+          {"bad_act", "Vagus.Resource.Toys.Wild.act/3 returned :done"}
         ] do
       test "fails and is retried when its controller returns #{effect}", %{sys: sys} do
         before = runtime(sys, Wild)
@@ -451,6 +434,28 @@ defmodule Vagus.Resource.RuntimeRulesTest do
         assert log =~ unquote(logged)
         assert %{failures: %{"w" => 1}, timers: ["w"], steps: 1} = Runtime.info(Wild, sys.i)
         assert runtime(sys, Wild) == before
+      end
+    end
+
+    for {effect, logged} <- [
+          {"non_effect", "not effects: [status: %{}]"},
+          {"two_actions", "more than one action in a pass, or an op after the action"},
+          {"op_after_action", "more than one action in a pass, or an op after the action"},
+          {"no_pair", "Vagus.Resource.Toys.Wild.reconcile/2 returned :nothing"}
+        ] do
+      test "fails with nothing written or done when its controller returns #{effect}",
+           %{sys: sys} do
+        log =
+          capture_log(fn ->
+            {:ok, created} = Store.create(:wild, "w", %{"effect" => unquote(effect)}, sys.i)
+            settle(sys)
+            # Neither the verdict nor the op that came before what was wrong.
+            assert Store.get(:wild, "w", sys.i) == created
+          end)
+
+        assert log =~ unquote(logged)
+        refute log =~ "act/3 returned"
+        assert %{failures: %{"w" => 1}, timers: ["w"], steps: 1} = Runtime.info(Wild, sys.i)
       end
     end
 
@@ -488,24 +493,6 @@ defmodule Vagus.Resource.RuntimeRulesTest do
       assert log =~ "verdict on mute/m refused: [:status_not_owned]"
       assert Store.get(:mute, "m", sys.i).status == %{}
       assert %{failures: %{"m" => 1}} = Runtime.info(Echo, sys.i)
-    end
-  end
-
-  describe "finalize_after" do
-    test "holds a controller back until every finalizer it names is gone, and only when deleting" do
-      sys = start_system(controllers: [Last])
-      given_ready(sys, {:last, "l", %{}}, finalizers: [:a, :b])
-
-      {:ok, _} = Store.delete(:last, "l", sys.i)
-      settle(sys)
-      assert %Resource{finalizers: [:last, :a, :b]} = Store.get(:last, "l", sys.i)
-
-      {:ok, _} = Store.remove_finalizer(:last, "l", :a, sys.i)
-      settle(sys)
-      assert %Resource{finalizers: [:last, :b]} = Store.get(:last, "l", sys.i)
-
-      {:ok, _} = Store.remove_finalizer(:last, "l", :b, sys.i)
-      await!(sys, :last, "l", :gone)
     end
   end
 

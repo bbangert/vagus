@@ -46,8 +46,8 @@ defmodule Vagus.Resource.Controllers.Supervisor do
         tasks = Runtime.tasks(instance, controller)
 
         pair = [
-          # No `:max_children`: the runtime starts one step per resource of
-          # the kind at most.
+          # No `:max_children`: the runtime bounds the steps it has in
+          # flight (`:max_in_flight_steps`).
           {Task.Supervisor, name: tasks},
           {Runtime, [instance: instance, declaration: declaration, tasks: tasks] ++ runtime}
         ]

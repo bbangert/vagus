@@ -291,7 +291,7 @@ defmodule Vagus.Resource.CollectorTest do
       assert {:tagger_saw_deleting, "k"} in notes(sys)
     end
 
-    test "a controller is not shown a deleting resource before the finalizers it waits for are gone" do
+    test "a controller that waits for another's finalizer is brought back by its removal" do
       sys = start_system(controllers: [Kept, Tagger])
       given_ready(sys, {:kept, "k", %{}})
       await!(sys, :kept, "k", :tagged)

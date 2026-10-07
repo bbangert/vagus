@@ -11,7 +11,7 @@ defmodule Vagus.Resource.HarnessTest do
   @moduletag :capture_log
   @moduletag :scenario
 
-  describe "killing a runtime at every effect-group boundary" do
+  describe "killing a runtime at every boundary of a pass" do
     test "a lifecycle across four controllers ends the same wherever it is interrupted" do
       scenario = fn sys ->
         owner = given_ready(sys, {:probe, "p", %{}})
@@ -47,7 +47,7 @@ defmodule Vagus.Resource.HarnessTest do
              }
     end
 
-    test "finds a controller whose action is only safe if the commit after it happens" do
+    test "finds a controller whose commit is not safe to make again before its action" do
       scenario = fn sys -> given_ready(sys, {:fragile, "f", %{}}) end
 
       assert_raise ExUnit.AssertionError, ~r/the store ends differently/, fn ->
@@ -98,8 +98,8 @@ defmodule Vagus.Resource.HarnessTest do
     end
 
     test "fails on the actions when a controller that was not killed repeats one" do
-      # `Fragile` counts twice when cut after its action; `Copycat` copies
-      # each count. Only the first of the two was interrupted.
+      # `Fragile` counts a try twice when cut between its commit and its
+      # action; `Copycat` copies each try. Only the first was interrupted.
       scenario = fn sys ->
         given_ready(sys, {:copycat, "c", %{"target" => "f"}})
         given_ready(sys, {:fragile, "f", %{}})
@@ -115,7 +115,7 @@ defmodule Vagus.Resource.HarnessTest do
           )
         end
 
-      assert error.message =~ ~s(killed after {Vagus.Resource.Toys.Fragile, "f", :action} #1)
+      assert error.message =~ ~s(killed after {Vagus.Resource.Toys.Fragile, "f", :commit} #1)
       assert error.message =~ ~s(the actions for {Vagus.Resource.Toys.Copycat, "c"} differ)
       assert error.message =~ "undisturbed: [:copy]"
       assert error.message =~ "interrupted: [:copy, :copy]"
@@ -155,18 +155,18 @@ defmodule Vagus.Resource.HarnessTest do
   end
 
   describe "journal equivalence" do
-    test "an interrupted journal is the reference with one replay in it" do
+    test "an interrupted journal is the reference, or the reference with one action done twice" do
       reference = [:a, :b, :c]
 
-      for replay <- [[:a, :b, :c], [:a, :a, :b, :c], [:a, :b, :b, :c], [:a, :b, :a, :b, :c]] do
-        assert Faults.replay?(reference, replay), inspect(replay)
+      for repeat <- [[:a, :b, :c], [:a, :a, :b, :c], [:a, :b, :b, :c], [:a, :b, :c, :c]] do
+        assert Faults.replay?(reference, repeat), inspect(repeat)
       end
 
-      assert Faults.replay?([:a, :b, :c], [:a, :b, :c, :a, :b, :c])
+      assert Faults.replay?([:visit, :visit], [:visit, :visit, :visit])
       assert Faults.replay?([], [])
     end
 
-    test "nothing may be missing, added or moved, and a repeat must be a re-run" do
+    test "nothing may be missing, added or moved, and one repeat is all there may be" do
       reference = [:a, :b, :c]
 
       for other <- [
@@ -178,7 +178,9 @@ defmodule Vagus.Resource.HarnessTest do
             [:a, :x, :b, :c],
             [:b, :a, :c],
             [:a, :b, :c, :a],
-            [:a, :a, :b, :b, :c]
+            [:a, :b, :a, :b, :c],
+            [:a, :a, :b, :b, :c],
+            [:a, :a, :a, :b, :c]
           ] do
         refute Faults.replay?(reference, other), inspect(other)
       end

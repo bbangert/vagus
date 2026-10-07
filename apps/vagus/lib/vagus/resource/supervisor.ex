@@ -3,12 +3,16 @@ defmodule Vagus.Resource.Supervisor do
   The resource store, what it stands on, and the controllers that run
   against it.
 
-  `:rest_for_one` because each child's replacement invalidates the ones
-  after it and none before: new tables mean an empty store, a new `Watch`
-  registry has forgotten every subscriber, a new store has forgotten who
-  registered for which kind, and new lanes have forgotten who holds a slot.
-  A store that restarts alone finds its rows in `Tables` and its subscribers
-  in `Watch`; the runtimes, which hold the registrations, restart with it.
+  `:rest_for_one` because the replacement of most children invalidates the
+  ones after it and none before: new tables mean an empty store, a new
+  `Watch` registry has forgotten every subscriber, and new lanes have
+  forgotten who holds a slot. The store is the exception: restarted, it
+  finds its rows in `Tables`, its subscribers in `Watch` and who owns what
+  in its start options, and announces whatever its file holds that the
+  tables did not. The children after it are replaced with it all the same,
+  because it has to stand after what it needs and before everything that
+  must not start against a store that has not loaded. That costs the steps
+  in flight and a listing.
 
   `:services` are children a controller's actions use and that hold lane
   slots or remember who among the resources waits for them. They stand
@@ -27,7 +31,9 @@ defmodule Vagus.Resource.Supervisor do
   Options are `Vagus.Resource.Store.start_link/1`'s, and:
 
     * `:controllers`, the `Vagus.Resource.Controller` modules to run. Each
-      owning one contributes its kind to the store's `:kinds`.
+      owning one contributes its kind to the store's `:kinds`, with who
+      owns it and who writes which condition type. A list that cannot run
+      fails this start (`Vagus.Resource.Controller.kinds/1`).
     * `:runtime`, options for every `Vagus.Resource.Runtime`.
     * `:lanes`, `Vagus.Resource.Lanes` caps.
     * `:services`, child specs started after `Vagus.Resource.Lanes` and
@@ -62,8 +68,8 @@ defmodule Vagus.Resource.Supervisor do
     declarations =
       own |> Keyword.get(:controllers, []) |> Enum.uniq() |> Enum.map(&Controller.declare/1)
 
-    # Derived here and given to the store as a start option because the
-    # store reads its file before any controller exists to register a kind.
+    # Derived here and given to the store as a start option: the store reads
+    # its file, and checks who may write status, before any runtime exists.
     kinds = Map.merge(Map.new(Keyword.get(store, :kinds, %{})), Controller.kinds(declarations))
 
     children =

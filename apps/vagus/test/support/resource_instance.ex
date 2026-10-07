@@ -8,7 +8,11 @@ defmodule Vagus.Resource.TestInstance do
 
   alias Vagus.Resource.{Stamp, Store}
 
-  @doc "Starts the whole subtree and returns the instance name."
+  @doc """
+  Starts the whole subtree and returns the instance name. Options are
+  `Vagus.Resource.Supervisor`'s, and `:owned`, as `owned/2` takes it, for a
+  store with no controllers that is to take status writes.
+  """
   @spec start!(keyword()) :: atom()
   def start!(opts \\ []) do
     instance = Keyword.get_lazy(opts, :instance, &name/0)
@@ -92,8 +96,28 @@ defmodule Vagus.Resource.TestInstance do
     }
   end
 
+  @doc """
+  `kinds` with who may write their status, as a list of controllers would
+  have declared it: `writers` is `%{kind => [{writer, condition_types}]}`,
+  and the first writer of a kind is its owner.
+  """
+  @spec owned(map(), %{optional(atom()) => [{term(), [atom()]}]}) :: map()
+  def owned(kinds, writers) do
+    Enum.reduce(writers, Map.new(kinds), fn {kind, [{owner, _types} | _] = declared}, kinds ->
+      conditions = for {writer, types} <- declared, type <- types, into: %{}, do: {type, writer}
+      fields = kinds |> Map.fetch!(kind) |> Map.new()
+      Map.put(kinds, kind, Map.merge(fields, %{owner: owner, conditions: conditions}))
+    end)
+  end
+
   defp spec(instance, opts) do
-    opts = opts |> Keyword.put(:instance, instance) |> Keyword.put_new(:kinds, kinds())
+    {writers, opts} = Keyword.pop(opts, :owned, %{})
+
+    opts =
+      opts
+      |> Keyword.put(:instance, instance)
+      |> Keyword.update(:kinds, owned(kinds(), writers), &owned(&1, writers))
+
     Supervisor.child_spec({Vagus.Resource.Supervisor, opts}, id: instance)
   end
 

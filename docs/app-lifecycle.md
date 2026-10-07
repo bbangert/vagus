@@ -11,9 +11,9 @@ resource, the store, and everything in "Controllers and runtimes",
 "Verdicts", "Clocks" and the generic half of "Deletion and collection") and
 "The engine layer" a controller will act through. The rest is the design
 they are built for and has no code yet: the App kind and its controllers,
-Update and Backup, and the commands. No controller is configured, nothing
-calls the engine layer's new parts, and apps and Core still run on the code
-this replaces.
+the engine observer, the token table, Update and Backup, and the commands.
+No controller is configured, nothing calls the engine layer's new parts,
+and apps and Core still run on the code this replaces.
 
 The HTTP wire toward Core is unchanged: routes stay `/addons`, keys stay
 `addon`, job names keep their upstream names. Only internal names say "app".
@@ -45,7 +45,7 @@ record that it is, say, rolling back; lost at a reboot, the update would
 apply the new version again. Only that kind's own controller writes it.
 
 Core is not a separate mechanism. It is a resource of kind App named
-`homeassistant` with different lifecycle settings (table below).
+`homeassistant` with the Core lifecycle profile (table below).
 
 ## The store
 
@@ -54,15 +54,17 @@ Core is not a separate mechanism. It is a resource of kind App named
 - The ETS tables belong to a separate process, `Vagus.Resource.Tables`,
   which names itself heir and gives them to the store. A read is a plain ETS
   lookup: it never enters a mailbox and it survives a store restart. With
-  the store absent, reads work and writes exit.
+  the store absent, reads work and writes exit. While the whole subtree is
+  being replaced the tables are gone too, and a read raises (see
+  "Commands").
 - One file, `/data/vagus/resources.json`, holds the persisted fields. It is
   rewritten only when one of them changed, so status churn costs no flash
   writes: temp file, fsync, rename, directory fsync.
 - Kinds are static and given to the store when it starts
-  (`Vagus.Resource.Kind`): the validators that admit a spec, and the hooks
-  that carry the kind's own shapes through JSON. Admission is only ever
-  these validators; nothing registers one later. The file is loaded before
-  the store's start returns. A missing file is an empty store; one that
+  (`Vagus.Resource.Kind`): the validators that admit a spec, the hooks
+  that carry the kind's own shapes through JSON, and who may write its
+  status. Nothing is added to a kind while the store runs. The file is
+  loaded before the store's start returns. A missing file is an empty store; one that
   cannot be read or parsed, has another version, or holds a kind or atom this
   build does not know fails the start, because loading it as empty would
   read as "nothing installed". So a file written by a newer build that added
@@ -101,10 +103,9 @@ Core is not a separate mechanism. It is a resource of kind App named
   a second mutating command on that app fails as busy. The claim ends when
   its holder releases it or dies, and outlives a store restart.
 - A kind has one owner, the only writer of its `progress` and of status
-  outside conditions. Every writer declares the condition types it owns, and
-  a type has one writer. Registrations are lost when the store restarts;
-  until an owner registers again its status and progress writes are refused,
-  while spec writes are admitted by the kind's validators as always.
+  outside conditions, and each condition type has one writer. Both are part
+  of the kind, so the store checks them from its first message and the same
+  after each of its restarts; no process registers anything.
 - `Vagus.Resource.Watch` is a duplicate-key `Registry`, so subscriptions
   outlast a store restart. They are by object, kind or owner:
   `{:object, kind, name}`, `{:kind, kind}`, `{:owner, kind, name}`. ETS is
@@ -126,46 +127,60 @@ is in three parts, which keeps the decision a pure function a table can test:
 The other callbacks are declarations: `kind/0`, `condition_types/0`, and
 optionally `validate/1` (admission), `references/1` (resources whose changes
 concern this one), `priority/1` (lower is served first by a lane),
-`retention/0`,
-`owned_conditions/0`, `finalizer/0`, `finalize_after/0`, `action_class/1`
-(the lane an action runs in), `writer_entries/0`, and the codec hooks
+`retention/0`, `owned_conditions/0`, `finalizer/0`, `action_class/1` (the
+lane an action runs in), `writer_entries/0`, and the codec hooks
 `encode_spec/1`, `decode_spec/1`, `encode_progress/1`, `decode_progress/1`
 that a spec with atoms needs to get through JSON.
 
 Controllers are listed in `config :vagus, :controllers`. One controller owns
 a kind and writes its verdict; one that exports `owned_conditions/0` is
 attached to a kind another owns and writes only those conditions. The
-store's kinds are derived from the list: each owner contributes its kind,
-with its admission and codec and the finalizers of every controller on it.
-A list that could not register (two owners of a kind, an attachment to a
-kind nobody owns, one condition type declared twice on a kind) fails the
-start of the subtree with an error that names the controllers.
+store's kinds are derived from the list, before the store starts: each
+owner contributes its kind, with its admission and codec, the finalizers of
+every controller on it, its owner and the writer of each condition type. A
+list that cannot run (two owners of a kind, an attachment to a kind nobody
+owns, one condition type or one finalizer declared twice on a kind) fails
+the start of the subtree with an error that names the controllers.
 
 Each controller has its own `Vagus.Resource.Runtime`, so a wedged controller
 blocks no other and several can work one kind. The runtime keeps a queue
 keyed by resource with at most one step in flight per key; a change arriving
-mid-step marks the key dirty and it runs again. Steps run in tasks, and so
-do the callbacks that take a resource: the runtime handles data only, and a
-callback that raises, exits or hangs costs one resource one step. The
-declarations, which take no argument, are evaluated once when the subtree
-starts, and one that raises fails that start with its name. The
-effects between two actions are grouped into one commit, so a crash can fall
-between a commit and an action but never inside a group. Every commit of a
-step expects the uid the step read, and what a step reports is believed
-only of that uid: a resource created under the name meanwhile starts clean.
+mid-step marks the key dirty and it runs again. It has at most
+`max_in_flight_steps` steps in flight at once (4), observations included,
+which the lanes do not count: a start looks at every resource of the kind,
+and several controllers on one kind would otherwise each observe every app
+at the same moment. The rest wait in the order they were first asked for; a
+key that waits keeps its place whatever else asks for it, and one whose
+step has ended and is wanted again goes to the back, so none is starved.
+Steps run in tasks, and so do the callbacks that take a resource: the
+runtime handles data only, and a callback that raises or exits costs one
+resource one step. One that hangs also keeps one of the steps in flight, so
+what bounds a step is the timeout of the calls it makes. The declarations,
+which take no argument, are evaluated once when the subtree starts, and one
+that raises fails that start with its name.
+
+A step is one pass: one commit, of the verdict and every store write
+`reconcile/2` returned, then at most one action, and then the resource is
+observed again. So a crash falls after the commit or after the action,
+never inside either, and nothing is decided from what an action has since
+changed. Create and start, stop and remove, and each hook are therefore
+separate passes. The commit expects the uid the step read, and what a step
+reports is believed only of that uid: a resource created under the name
+meanwhile starts clean. What `reconcile/2` returns is checked whole before
+any of it is applied (see "Verdicts").
 
 A step that crashes is retried with back-off. An action that returns an
 error ends its step; the next one runs at once and is told of the failure,
 because a failed pull leaves nothing to observe. Counting failures and
 spacing retries is the controller's decision, kept in status. Two things
 the runtime paces by itself, with the same back-off: steps that keep ending
-in a failed action, and steps that perform the same actions as the step
+in a failed action, and steps that perform the same action as the step
 before, since an action that changes nothing observable would otherwise
 repeat without pause. Such a timer holds back only the dirty mark made
 while the failing step was in flight, because that mark may be the step's
 own status write, which is announced like any other and cannot be told
-apart. A change that arrives after the step has ended starts a step at once,
-whatever timer is armed.
+apart. A change that arrives after the step has ended queues the resource
+at once, whatever timer is armed.
 
 A runtime indexes what each resource refers to: its `references/1`, its
 owners and the resources that wrote fields of its spec, as each step reports
@@ -175,21 +190,25 @@ change that came before the index knew of it.
 
 Controllers are level-triggered: they act on what they observe, not on the
 event that woke them, so a missed event is repaired by the next observation.
-The engine's event stream is lossy, and that is the drift a resync exists
-for: a gap in the stream (signalled after every reconnect, `Runtime.resync`),
-a runtime start and a five-minute timer each have every resource of the kind
-looked at again. `Runtime.enqueue` has one resource looked at again, for a
-change the store does not announce: an event about its container, the end of
-a pull it waits for. Arriving during the resource's step it gets a step of
-its own right after, even where a store change would wait for a back-off:
-it cannot be the step's own write.
+A runtime looks at every resource of its kind when it starts, on a timer
+(five minutes, or never), and when told to (`Runtime.resync`).
+`Runtime.enqueue` has one resource looked at again, for a change the store
+does not announce: an event about its container, the end of a pull it waits
+for. Arriving during the resource's step it gets a step of its own right
+after, even where a store change would wait for a back-off: it cannot be
+the step's own write.
+
+For the App kind, looking at everything is not how drift in the engine is
+repaired: with several controllers on the kind it would be one engine call
+per app per controller. One engine observer does it instead (see "The
+engine layer"), and wakes only the apps that changed.
 
 `Vagus.Resource.Lanes` holds a counting semaphore per action class: pulls 1,
 engine calls 4. Only running actions count, and the wait is in the step's
 task, so a waiting app holds nothing and the runtime never waits. The next
 slot goes to the lowest `priority/1` waiting, then to whoever asked first;
-that is all priority orders, since steps themselves all start at once. A
-pull is not an action: it runs in the pull worker, whose state `observe`
+that is all priority orders: steps start in the order their resources were
+queued. A pull is not an action: it runs in the pull worker, whose state `observe`
 reads, so it never occupies the app's queue slot, and a stop during a pull
 cancels it (see "The engine layer").
 
@@ -206,9 +225,11 @@ Vagus.Resource.Supervisor        :rest_for_one
 ├─ Watch                         Registry, duplicate keys
 ├─ Store                         single writer, persistence
 ├─ Lanes                         action semaphores
-├─ services                      what actions use: for the application's
-│  ├─ App.Pulls                  instance, which pulls run, who waits, and
-│  └─ Task.Supervisor            their state table; then the pulls
+├─ services                      what controllers stand on, in this order:
+│  ├─ App.Pulls                  which pulls run, who waits, their state
+│  ├─ Task.Supervisor            the pulls themselves
+│  ├─ token table                (planned) what API auth reads
+│  └─ engine observer            (planned) engine events and inventory
 └─ Controllers.Supervisor        :one_for_one
    └─ one per controller         :one_for_all
       ├─ Task.Supervisor
@@ -219,10 +240,10 @@ Each pair is `:one_for_all` because steps are `async_nolink` tasks: one in
 flight would otherwise outlive its runtime, and the replacement could start a
 second action for the same key. There is no per-app process. The resource
 supervisor knows nothing of apps: services are child specs it is given and
-places after the lanes and before the controllers. The pull worker stands
-before its tasks for the reason above, and before the runtimes because
-their resources are the waiters a new worker has forgotten: they start
-again and look at everything.
+places after the lanes and before the controllers. Each stands before the
+runtimes because a new one has forgotten what the resources had told it:
+the pull worker its waiters, the token table its tokens. The runtimes start
+again with it and look at everything, which tells it again.
 
 ## The engine layer
 
@@ -260,9 +281,16 @@ succeeds when its end state already holds, except `create` on a name in use
 action returns an id: the instance's id is `observe`'s to report. With the
 engine away `observe` is `{:unavailable, :engine_unavailable}`, never
 `:absent`. `Backend.Container.list/1` is the one call that says which of our
-containers exist. `Backend.Native` runs the MQTT broker as a `:temporary`
+containers exist. `Backend.Native` runs the MQTT broker as a `:transient`
 subtree of the supervisor that holds native apps: `:absent` or `:running`,
-nothing to create and no image.
+nothing to create and no image. The split for a process in the VM is that
+supervision recovers from a crash at once and reconciliation decides
+whether the app runs: a subtree that ends abnormally is restarted by that
+supervisor, as a new instance with a new id; one stopped through the
+backend is forgotten by it; and a broker whose own supervisor has given up
+ends with `:shutdown`, is not restarted, and is observed as `:absent`,
+which leaves a broker that cannot stay up to the controller's restart
+policy instead of to the budget every native app shares.
 
 **Pulls.** `Vagus.App.Pulls` runs one pull per image reference, each in a
 task holding the `:pull` lane. A pull exists for its waiters, each a
@@ -279,6 +307,18 @@ function each waiter may have given. The functions run in the task, so one
 may be called once more, for a summary already on its way, after it was
 replaced or its waiter withdrew, and never for a later one.
 
+**Engine observer** (planned). One process, placed before the controllers,
+is the only subscriber to `Vagus.Runtime.Events` and the only reader of the
+engine's inventory. It monitors the events worker and subscribes again when
+that is replaced, since the worker keeps its subscribers in its own memory.
+An event about a container becomes a `Runtime.enqueue` for that one app.
+On every gap, at its own start and on a periodic tick it makes one filtered
+container list, compares it with the snapshot it kept of the last, and
+enqueues only the apps whose row changed. It also monitors the native
+broker's subtree and enqueues the app when that exits, so a restart by the
+supervisor is seen at once. This is the drift repair of the App kind:
+neither a gap nor a timer has every app observed by every controller.
+
 ## Verdicts
 
 `reconcile/2` returns `{%Verdict{} | :no_verdict, effects}`. A
@@ -293,10 +333,13 @@ the same commit that marks the generation observed, so a generation cannot be
 marked observed beside a condition left over from the previous one. The
 store rejects a condition type its writer does not own.
 
-A verdict that leaves out a declared type, or carries an undeclared one, is
-refused by the runtime: the step fails in tests (`config :vagus,
-:strict_verdicts`), and elsewhere the verdict is logged and not written
-while the effects still apply. One contract test, over a table of
+A verdict that leaves out a declared type or carries an undeclared one, a
+return that is no verdict, a term among the effects that is no effect, a
+second action, and a store write after the action all fail the step, before
+anything is written or done. Such a return is a defect in the controller,
+and applying the part of it that is well-formed would act on the engine or
+the store with no status to show for it. The step's task is the isolation
+and the back-off the pacing. One contract test, over a table of
 `(resource, observation)` rows, holds every controller to this.
 
 ## The App kind
@@ -304,11 +347,17 @@ while the effects still apply. One contract test, over a table of
 An App's spec holds `config` (the parsed manifest), `version`, `options`,
 `settings`, `ingress_port`, `run`, `restart_counter`, `start_counter`,
 `holds` and `lifecycle`. The app should run when `run` is true and `holds` is
-empty. `lifecycle` is what tells the three app types apart.
+empty.
 
-### Lifecycle settings per app type
+### Lifecycle profiles
 
-| Field | Ordinary app | Core | Native broker |
+`lifecycle` names one of three profiles: `:container`, `:core` or
+`:native`. A profile is a pure module that answers the questions in the
+table for one app; admission accepts the three names and nothing else. The
+settings are not fields to combine freely: the controller is tested against
+three profiles, not against every combination of their answers.
+
+| Question | `:container` | `:core` | `:native` |
 |---|---|---|---|
 | `backend` | `:container` | `:container` | `:native` |
 | `container_name` | `app_<slug>` | `homeassistant` | n/a |
@@ -329,26 +378,40 @@ must still find Core after a revert; only apps become `app_<slug>`. A lower
 `wave` starts first: an app waits while an earlier wave is still progressing,
 for at most its own `wave_wait_ms`, then starts anyway.
 
-### Start sequence and gates
+### Start sequence
 
-A gate is a condition another controller sets before the App may proceed.
+One action per pass, each decided from what the pass before left to
+observe:
 
-1. Pull the image, in the pull worker.
+1. Pull the image, in the pull worker; the app's passes wait for its end.
 2. Create the container, minting the token into its environment.
-3. Status publishes the instance: container id, address, token.
-4. Gates `:auth_ready` and `:ingress_ready` must name that instance id; a
-   condition left from a previous instance opens nothing.
-5. Start the container and wait for readiness, as `readiness` defines it.
-6. Gate `:dns_ready`, then Ready.
+3. Put the token in the token table. Status publishes the instance:
+   container id, address.
+4. Start the container.
+5. Wait for readiness, as the profile defines it.
+6. Gate `:dns_ready`, a condition the Dns controller sets and that must
+   name this instance id, then Ready.
 
-The invariant: a container never runs before auth knows its token. The token
-is never written to flash; after a restart it is re-read from the engine.
+The invariant: a container never runs before auth knows its token. It holds
+because both are the App controller's own actions, in that order: start is
+decided only by a pass that observes the token in the table, which is
+after the put has returned. The token is never written to flash; after a
+restart it is re-read from the engine. A Core hook is an action too, and so
+a pass of its own.
 
-Four controllers attach to the App kind, each with its own runtime:
+Auth is not a controller. A small process owns the token table, which API
+auth reads directly, and offers an idempotent put and remove. It stands
+before the App runtime, so its replacement, which has an empty table,
+restarts that runtime: every app is observed again, found without its
+token, and put back. Uninstall removes the token before it touches the
+container.
 
-- AuthIndex owns `:auth_ready` and the token table that API auth reads.
-- Dns owns `:dns_ready`.
-- Ingress owns `:ingress_ready`, ingress sessions and the panel push to Core.
+Three controllers attach to the App kind, each with its own runtime:
+
+- Dns owns `:dns_ready`, the one gate, and the last step before Ready.
+- Ingress owns `:ingress_ready`, ingress sessions and the panel push to
+  Core. It gates nothing: the ingress port is assigned at admission, and
+  sessions and the panel follow the app eventually.
 - Publications turns Services and Discovery entries into resources owned by
   the publishing app.
 
@@ -368,10 +431,11 @@ Deleting a resource only sets `deleting?`. Each controller with something to
 clean up declares a finalizer and releases it when the cleanup is done; the
 resource disappears when all are released. Every resource holds the
 finalizers of all its kind's controllers from creation, so a delete cannot
-arrive before a controller has attached its own. The App's own finalizer
-runs after AuthIndex's, declared in `finalize_after/0`: the App controller
-is not shown a deleting app until that finalizer is gone, so the token row
-is removed before the container is touched. The rest run in any order.
+arrive before a controller has attached its own. They are released in any
+order; a controller that must come after another reads the finalizers still
+on the resource and waits, and the other's release is a change that brings
+its next pass. The App needs no such order for its token: removing it is
+the first action of its own uninstall.
 
 Owned resources are collected through their declared `owner_refs`, never by
 inferring ownership from a name: an uninstalled app's publications go with
@@ -416,5 +480,12 @@ it does no engine work itself. It holds the app's operation claim until that
 condition resolves (`start` only until the container is created and run), and
 a second mutating command on the same app is refused as busy: HTTP 400,
 `Another job is running for job group addon_<slug>`. A `start` that reaches
-120 s with its gates still closed returns success with state `startup`, as
+120 s still short of Ready returns success with state `startup`, as
 upstream does.
+
+The API is not a child of the resource subtree and keeps serving while that
+restarts. For that moment the tables are gone and the store has no process:
+a read raises and a write exits. The command facade catches both and
+answers an explicit "control plane restarting" (HTTP 503), for reads as
+for commands, so a restart of the subtree is an answer and not an API that
+went down.

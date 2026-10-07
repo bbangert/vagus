@@ -33,10 +33,7 @@ defmodule Vagus.Resource.StorePersistenceTest do
     do: File.write!(path, path |> File.read!() |> Jason.decode!() |> fun.() |> Jason.encode!())
 
   defp start!(path, opts \\ []) do
-    instance = TestInstance.start!([path: path] ++ opts)
-    i = [instance: instance]
-    :ok = Store.register_kind(:thing, Owner, [conditions: [:ready]] ++ i)
-    i
+    [instance: TestInstance.start!([path: path, owned: %{thing: [{Owner, [:ready]}]}] ++ opts)]
   end
 
   defp restart!(i, path) do
@@ -561,7 +558,7 @@ defmodule Vagus.Resource.StorePersistenceTest do
 
       TestInstance.restart_store(i[:instance])
       # The new store's answer follows anything it sent while starting.
-      :ok = Store.register_kind(:thing, Owner, [conditions: [:ready]] ++ i)
+      :ok = Store.relay([], nil, i)
 
       refute_received {Watch, _, _}
       assert Store.get(:thing, "t", i) == before

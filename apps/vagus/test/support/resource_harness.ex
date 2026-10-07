@@ -61,8 +61,7 @@ defmodule Vagus.Resource.Harness do
   and `:persist` for the store; `:faults`, see `Vagus.Resource.Harness.Faults`.
 
   Steps that crash are retried after 1 to 8 ms unless `:runtime` sets
-  `:backoff`, and verdicts are checked strictly. The system is settled when
-  this returns.
+  `:backoff`. The system is settled when this returns.
   """
   @spec start_system(keyword()) :: system()
   def start_system(opts \\ []) do
@@ -94,7 +93,6 @@ defmodule Vagus.Resource.Harness do
         gate_poll: 5,
         unavailable_retry: 5,
         backoff: {1, 8},
-        strict_verdicts: true,
         boundary: faults && (&Faults.boundary(faults, &1)),
         context: Map.merge(%{world: world, test: self()}, Keyword.get(opts, :context, %{}))
       ]
@@ -425,8 +423,9 @@ defmodule Vagus.Resource.Harness do
   The contract every controller's `reconcile/2` is held to, over a table of
   `{resource, observation}` rows: it returns a verdict whose condition types
   are exactly the ones the controller declared, in a shape the runtime
-  accepts, and effects the runtime can apply. A row for a pass with nothing
-  to report is `{resource, observation, :no_verdict}`.
+  accepts, and effects the runtime can apply: at most one action, and no
+  op after it. A row for a pass with nothing to report is
+  `{resource, observation, :no_verdict}`.
   """
   @spec assert_verdict_contract(module(), [tuple()]) :: :ok
   def assert_verdict_contract(controller, rows) do
@@ -451,6 +450,15 @@ defmodule Vagus.Resource.Harness do
       end
 
       assert effects |> Enum.reject(&Controller.effect?/1) == [], "#{where} returned a non-effect"
+
+      after_first_action =
+        effects
+        |> Enum.reject(&match?({:requeue_after, _ms}, &1))
+        |> Enum.drop_while(&(not match?({:action, _name, _args}, &1)))
+        |> Enum.drop(1)
+
+      assert after_first_action == [],
+             "#{where} returned more than one action, or an op after its action"
     end
 
     :ok
@@ -462,20 +470,22 @@ defmodule Vagus.Resource.Harness.Faults do
   Kills a runtime at a chosen point of a scenario, to show that the scenario
   ends the same wherever it is interrupted.
 
-  A step has a boundary after each action and after each commit that
-  changed something: the places a crash can fall, since a commit is all or
-  none. A commit that changed nothing, as the store reports it, is not one:
-  the store is as it was before the pass, so a kill there is a kill before
-  the pass, which is the boundary before. Leaving those out is also what makes a scenario cross the
-  same boundaries each time, since how many passes find nothing to write
-  depends on how the notifications happened to fall. A boundary is named by
-  the controller, the resource and which of the two it follows, and by how
-  many of that name came before it. `each_boundary/1` runs the scenario once
-  undisturbed, keeping the boundaries crossed, the final store and the
-  journal. Then, for each of those boundaries, it runs the scenario in a
-  fresh system in which the runtime whose step crosses that boundary is
-  killed there, with the step; its supervisor replaces it, and the run must
-  end with the same store and an equivalent journal.
+  A pass has a boundary after its commit, if that changed something, and
+  one after its action: the places a crash can fall, since a commit is all
+  or none. A pass that deletes what its kind no longer retains has one
+  after each of those deletes as well. A commit that changed nothing, as
+  the store reports it, is not one: the store is as it was before the pass,
+  so a kill there is a kill before the pass, which is the boundary before.
+  Leaving those out is also what makes a scenario cross the same boundaries
+  each time, since how many passes find nothing to write depends on how the
+  notifications happened to fall. A boundary is named by the controller,
+  the resource and which of the two it follows, and by how many of that
+  name came before it. `each_boundary/1` runs the scenario once undisturbed,
+  keeping the boundaries crossed, the final store and the journal. Then, for
+  each of those boundaries, it runs the scenario in a fresh system in which
+  the runtime whose step crosses that boundary is killed there, with the
+  step; its supervisor replaces it, and the run must end with the same
+  store and an equivalent journal.
 
   Every one of those kills must happen. A run that never reaches its
   boundary fails, so a scenario has to cross the same boundaries each time:
@@ -483,24 +493,24 @@ defmodule Vagus.Resource.Harness.Faults do
 
   ## Equivalent journals
 
-  Actions are idempotent against observation, so an interrupted pass may do
-  again what it had already done, and nothing else. Per resource, an
-  interrupted journal is equivalent to the undisturbed one when it is that
-  journal with one replay in it (`replay?/2`): it follows the reference up
-  to some point, goes back to an earlier point, and follows it from there to
-  the end. `a b b c` and `a b a b c` are replays of `a b c`. A missing
-  action, an action the reference does not have, another order, or a repeat
-  that is not a re-run from an earlier point is a difference, as is any
-  repeat in a resource of a controller that was not killed, since its replay
-  is then empty. The reference is taken as it is: what it repeats, the
+  The step killed at a boundary repeats nothing: its action had either not
+  begun or had returned, and the pass that follows observes which. But the
+  kill takes the controller's other steps with it wherever they are, and
+  one cut inside `act/3` may have acted without leaving what the next pass
+  observes. Actions being idempotent against observation, that pass does
+  the one action again and nothing else. So per resource of the killed
+  controller, an interrupted journal is equivalent to the undisturbed one
+  when it is that journal with at most one action done twice in a row
+  (`replay?/2`): `a b b c` for `a b c`. A missing action, an action the
+  reference does not have, another order, or any other repeat is a
+  difference. The reference is taken as it is: what it repeats, the
   interrupted run must repeat.
 
-  A replay is allowed only in the resources of the controller that was
-  killed. Every other controller's actions must be exactly the reference's:
-  its runtime lost nothing, and what it acts on is what it observes, which a
-  replayed action, being idempotent, does not change. If such a controller
+  Every other controller's actions must be exactly the reference's: its
+  runtime lost nothing, and what it acts on is what it observes, which a
+  repeated action, being idempotent, does not change. If such a controller
   repeats or adds an action after another was interrupted, it is acting on
-  something that the interruption made visible for longer or that a replay
+  something that the interruption made visible for longer or that a repeat
   disturbed, and either is a defect in one of the two, not a tolerance to
   grant.
 
@@ -550,7 +560,7 @@ defmodule Vagus.Resource.Harness.Faults do
           nth <- 1..crossed,
           do: {label, nth}
 
-    for {{killed, _name, kind} = label, nth} = target <- Enum.sort(targets) do
+    for {{killed, _name, _kind} = label, nth} = target <- Enum.sort(targets) do
       interrupted = run(system, {:kill_at, target}, scenario, normalize)
       where = "killed after #{inspect(label)} ##{nth}"
 
@@ -576,17 +586,7 @@ defmodule Vagus.Resource.Harness.Faults do
         interrupted: #{inspect(found)}
         """
       end
-
-      kind
     end
-    |> Enum.uniq()
-    |> Enum.sort()
-    |> then(fn killed ->
-      crossed = reference.boundaries |> Enum.map(&elem(&1, 2)) |> Enum.uniq() |> Enum.sort()
-
-      assert killed == crossed,
-             "boundaries of kind #{inspect(crossed -- killed)} were never killed"
-    end)
 
     reference
   end
@@ -602,19 +602,13 @@ defmodule Vagus.Resource.Harness.Faults do
     %{store: store, journal: journal, boundaries: report.crossed, kill: report.kill}
   end
 
-  @doc """
-  Whether `interrupted` is `reference` with one replay: for some `j <= i`,
-  the first `i` of the reference followed by the reference from `j` on.
-  """
+  @doc "Whether `interrupted` is `reference`, or `reference` with one action done twice in a row."
   @spec replay?(list(), list()) :: boolean()
   def replay?(reference, interrupted) do
-    size = length(reference)
-
-    Enum.any?(0..size, fn i ->
-      Enum.any?(0..i, fn j ->
-        interrupted == Enum.take(reference, i) ++ Enum.drop(reference, j)
-      end)
-    end)
+    interrupted == reference or
+      reference
+      |> Enum.with_index()
+      |> Enum.any?(fn {action, at} -> interrupted == List.insert_at(reference, at, action) end)
   end
 
   @spec start_link({atom(), mode()}) :: GenServer.on_start()
