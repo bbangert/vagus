@@ -83,6 +83,7 @@ defmodule Vagus.Resource.Runtime do
           queued: [Resource.name()],
           in_flight: %{optional(Resource.name()) => pid()},
           dirty: [Resource.name()],
+          hinted: [Resource.name()],
           timers: [Resource.name()],
           failures: %{optional(Resource.name()) => pos_integer()},
           references: %{optional(Resource.name()) => [Resource.key()]},
@@ -116,6 +117,12 @@ defmodule Vagus.Resource.Runtime do
   about its container, a pull it waits for that has ended. A name the kind
   does not hold is forgotten at once, and with no runtime nothing is lost:
   its replacement looks at everything.
+
+  One that arrives during the resource's pass gets a pass of its own right
+  after, whatever that pass ends in and whatever timer it arms. A change in
+  the store that arrives then may wait for a back-off, because it may be the
+  pass's own write; this cannot be, and what it announces may be what the
+  failing pass was waiting for.
   """
   @spec enqueue(module(), Resource.name(), keyword()) :: :ok
   def enqueue(controller, name, opts \\ []),
@@ -199,6 +206,9 @@ defmodule Vagus.Resource.Runtime do
       in_flight: %{},
       refs: %{},
       dirty: MapSet.new(),
+      # Names `enqueue/3` asked for while their step was in flight. Kept
+      # apart from `dirty`, which a failing step's timer may hold back.
+      hinted: MapSet.new(),
       # Everything remembered about a resource, by name, each record saying
       # which uid it is about. See `record/3`.
       known: %{},
@@ -242,7 +252,7 @@ defmodule Vagus.Resource.Runtime do
   @impl true
   def handle_cast(:resync, state), do: {:noreply, state |> look_again() |> settle()}
 
-  def handle_cast({:enqueue, name}, state), do: {:noreply, state |> queue(name) |> settle()}
+  def handle_cast({:enqueue, name}, state), do: {:noreply, state |> hint(name) |> settle()}
 
   @impl true
   def handle_info({Watch, _event, _meta}, %{deliver_events: false} = state),
@@ -303,6 +313,7 @@ defmodule Vagus.Resource.Runtime do
       queued: state.queued |> MapSet.to_list() |> Enum.sort(),
       in_flight: Map.new(state.in_flight, fn {name, flight} -> {name, flight.task.pid} end),
       dirty: state.dirty |> MapSet.to_list() |> Enum.sort(),
+      hinted: state.hinted |> MapSet.to_list() |> Enum.sort(),
       timers: Enum.sort(names.(&(&1.timer != nil))),
       failures: for({name, %{failures: n}} <- state.known, n > 0, into: %{}, do: {name, n}),
       references:
@@ -434,6 +445,12 @@ defmodule Vagus.Resource.Runtime do
     end
   end
 
+  defp hint(state, name) do
+    if is_map_key(state.in_flight, name) and not state.double_step,
+      do: %{state | hinted: MapSet.put(state.hinted, name)},
+      else: queue(state, name)
+  end
+
   defp settle(state), do: state |> dispatch() |> answer_probes()
 
   defp dispatch(state) do
@@ -486,7 +503,15 @@ defmodule Vagus.Resource.Runtime do
     {name, refs} = Map.pop!(state.refs, ref)
     {%{uid: uid}, in_flight} = Map.pop!(state.in_flight, name)
     dirty? = MapSet.member?(state.dirty, name)
-    state = %{state | refs: refs, in_flight: in_flight, dirty: MapSet.delete(state.dirty, name)}
+    hinted? = MapSet.member?(state.hinted, name)
+
+    state = %{
+      state
+      | refs: refs,
+        in_flight: in_flight,
+        dirty: MapSet.delete(state.dirty, name),
+        hinted: MapSet.delete(state.hinted, name)
+    }
 
     # The store writes its table before it sends a notice. So a resource
     # missing here is gone, whatever this step or a notice not yet read
@@ -505,7 +530,8 @@ defmodule Vagus.Resource.Runtime do
         state = disarm(state, name, uid)
         {state, new_reference?} = learn(state, name, uid, result)
         {state, carried?} = outcome(state, name, uid, result)
-        again?(state, name, dirty?, new_reference?, carried?)
+        state = again?(state, name, dirty?, new_reference?, carried?)
+        if hinted?, do: queue(state, name), else: state
     end
   end
 

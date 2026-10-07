@@ -1,18 +1,21 @@
 defmodule Vagus.Test.FakeEngine.Model do
   @moduledoc """
-  A container engine that keeps state: containers, images and a ring of
-  events, served over a unix socket in the Engine API's shapes. Started by
+  A container engine that keeps state: containers and images, served over a
+  unix socket in the Engine API's shapes. Started by
   `Vagus.Test.FakeEngine.start_model/1`; every function here takes the
   handle that returns.
 
   What it models, because the code under test depends on it:
 
-    * `GET /containers/json` with `all` and the `label` and `name` filters;
-    * `GET /events` holds the response open. With `since` it first replays
-      the ring from that time on, inclusive, as the real engine does. The
-      ring keeps the last `:ring` events of any container and forgets the
-      rest without a mark;
-    * `POST /containers/{name}/stop` answers only after `:stop_delay` ms;
+    * `GET /containers/json` with `all` and the `label` and `name` filters.
+      A name pattern is matched against the bare name, as moby does, or with
+      `slashed_names: true` against the name as the engine holds it, with
+      its leading slash;
+    * `GET /events` holds the response open and carries what happens from
+      then on. Nothing is replayed;
+    * `POST /containers/{name}/stop` answers only after `:stop_delay` ms,
+      and the container stops, with its `die` and `stop` events, at the end
+      of that time and not before;
     * a pull is a stream written from a script (`script_pull/3`), `200`
       before any line of it;
     * `crash/3` on a container with a restart policy is `die`, then `start`
@@ -21,9 +24,9 @@ defmodule Vagus.Test.FakeEngine.Model do
   Time is a counter, so every event and start has a distinct, increasing
   stamp and a run is the same every time.
 
-  Options: `:ring` (default 256), `:stop_delay` (default 0), `:notify`, a
-  process told `{:fake_engine, :client_closed, path}` when a client closes
-  a stream that had stalled.
+  Options: `:stop_delay` (default 0), `:slashed_names`, `:notify`, a process
+  told `{:fake_engine, :client_closed, path}` when a client closes a stream
+  that had stalled.
   """
 
   use GenServer
@@ -70,8 +73,16 @@ defmodule Vagus.Test.FakeEngine.Model do
   def emit(%{model: model}, action, name, attributes \\ %{}),
     do: GenServer.call(model, {:emit, action, name, attributes})
 
-  @doc "Closes every open event stream, as an engine restart would."
-  def drop_event_streams(%{model: model}), do: GenServer.call(model, :drop_event_streams)
+  @doc """
+  Ends every open event stream, as an engine restart would: `:abort` breaks
+  the connection, `:finish` ends the response properly, and `{:mid_line,
+  action, name}` writes half of an event's line first.
+  """
+  def drop_event_streams(%{model: model}, how \\ :abort),
+    do: GenServer.call(model, {:drop_event_streams, how})
+
+  @doc "How many event streams are open."
+  def event_streams(%{model: model}), do: GenServer.call(model, :event_streams)
 
   def set(%{model: model}, key, value) when key in [:stop_delay],
     do: GenServer.call(model, {:set, key, value})
@@ -99,12 +110,11 @@ defmodule Vagus.Test.FakeEngine.Model do
 
     {:ok,
      %{
-       ring_size: Keyword.get(opts, :ring, 256),
+       slashed_names: Keyword.get(opts, :slashed_names, false),
        stop_delay: Keyword.get(opts, :stop_delay, 0),
        containers: %{},
        images: MapSet.new(),
        pulls: %{},
-       ring: [],
        streams: [],
        tick: 0,
        log: []
@@ -134,33 +144,46 @@ defmodule Vagus.Test.FakeEngine.Model do
       entry = %{method: method, path: path, query: query, body: body}
 
       case GenServer.call(model, {:request, entry}, 10_000) do
-        {:reply, status, body, delay} ->
+        {:reply, status, body} ->
+          FakeEngine.send_response(sock, status, body)
+
+        {:hold, delay, then} ->
           Process.sleep(delay)
+          {status, body} = GenServer.call(model, then, 10_000)
           FakeEngine.send_response(sock, status, body)
 
         {:stream, steps} ->
           FakeEngine.stream(sock, 200, steps, path, notify)
 
-        {:events, replay} ->
-          FakeEngine.stream(
-            sock,
-            200,
-            [{:run, fn -> events(sock, replay) end}, :abort],
-            path,
-            nil
-          )
+        :events ->
+          FakeEngine.stream(sock, 200, [{:run, fn -> events(sock) end}], path, nil)
+          # The response has ended and the connection has not: an engine
+          # keeps it for the next request, and it is the client's to close.
+          _ = :gen_tcp.recv(sock, 0)
       end
     end
 
     :gen_tcp.close(sock)
   end
 
-  defp events(sock, lines) do
-    for line <- lines, do: FakeEngine.chunk(sock, line)
-
+  # Returns to end the response properly; exits to break it instead.
+  defp events(sock) do
     receive do
-      {:event, line} -> events(sock, [line])
-      :drop -> :ok
+      {:event, line} ->
+        FakeEngine.chunk(sock, line)
+        events(sock)
+
+      {:drop, :finish} ->
+        :ok
+
+      {:drop, :abort} ->
+        :gen_tcp.close(sock)
+        exit(:normal)
+
+      {:drop, {:partial, line}} ->
+        FakeEngine.chunk(sock, binary_part(line, 0, div(byte_size(line), 2)))
+        :gen_tcp.close(sock)
+        exit(:normal)
     end
   end
 
@@ -213,12 +236,42 @@ defmodule Vagus.Test.FakeEngine.Model do
   def handle_call({:emit, action, name, attributes}, _from, state) do
     container = %{id: "id-#{name}", name: name, labels: %{}}
     state = event(state, action, container, attributes)
-    {:reply, hd(state.ring)["timeNano"], state}
+    {:reply, @epoch + state.tick * 1_000_000, state}
   end
 
-  def handle_call(:drop_event_streams, _from, state) do
-    for pid <- state.streams, do: send(pid, :drop)
+  def handle_call({:drop_event_streams, how}, _from, state) do
+    how =
+      case how do
+        {:mid_line, action, name} ->
+          container = %{id: "id-#{name}", name: name, labels: %{}}
+          {:partial, line(event_map(state.tick + 1, action, container, %{}))}
+
+        other ->
+          other
+      end
+
+    for pid <- state.streams, do: send(pid, {:drop, how})
     {:reply, :ok, %{state | streams: []}}
+  end
+
+  def handle_call(:event_streams, _from, state), do: {:reply, length(state.streams), state}
+
+  def handle_call({:finish_stop, name}, _from, state) do
+    case Map.fetch(state.containers, name) do
+      {:ok, %{state: "running"} = container} ->
+        container = %{container | state: "exited", exit_code: 143}
+
+        state =
+          state
+          |> put(container)
+          |> event("die", container, %{"exitCode" => "143"})
+          |> event("stop", container)
+
+        {:reply, {204, nil}, state}
+
+      _gone_or_stopped ->
+        {:reply, {304, nil}, state}
+    end
   end
 
   def handle_call({:request, entry}, {pid, _tag}, state) do
@@ -229,7 +282,7 @@ defmodule Vagus.Test.FakeEngine.Model do
 
     reply =
       case reply do
-        {status, body} when is_integer(status) -> {:reply, status, body, 0}
+        {status, body} when is_integer(status) -> {:reply, status, body}
         other -> other
       end
 
@@ -240,17 +293,8 @@ defmodule Vagus.Test.FakeEngine.Model do
 
   defp route(:get, ["_ping"], _entry, _pid, state), do: {{200, "OK"}, state}
 
-  defp route(:get, ["events"], entry, pid, state) do
-    replay =
-      case entry.query["since"] do
-        nil ->
-          []
-
-        since ->
-          for event <- Enum.reverse(state.ring), event["timeNano"] >= nano(since), do: line(event)
-      end
-
-    {{:events, replay}, %{state | streams: [pid | state.streams]}}
+  defp route(:get, ["events"], _entry, pid, state) do
+    {:events, %{state | streams: [pid | state.streams]}}
   end
 
   defp route(:get, ["containers", "json"], entry, _pid, state) do
@@ -260,13 +304,13 @@ defmodule Vagus.Test.FakeEngine.Model do
     listed =
       for {_name, container} <- Enum.sort(state.containers),
           all? or container.state == "running",
-          listed?(container, filters),
+          listed?(container, filters, state.slashed_names),
           do: %{
             "Id" => container.id,
             "Names" => ["/" <> container.name],
             "Image" => container.image,
             "State" => container.state,
-            "Status" => container.state,
+            "Status" => status_text(container),
             "Labels" => container.labels
           }
 
@@ -330,16 +374,8 @@ defmodule Vagus.Test.FakeEngine.Model do
         {no_container(ref), state}
 
       %{state: "running"} = container ->
-        container = %{container | state: "exited", exit_code: 143}
-
-        state =
-          state
-          |> put(container)
-          |> event("kill", container)
-          |> event("die", container, %{"exitCode" => "143"})
-          |> event("stop", container)
-
-        {{:reply, 204, nil, state.stop_delay}, state}
+        {{:hold, state.stop_delay, {:finish_stop, container.name}},
+         event(state, "kill", container)}
 
       _stopped ->
         {{304, nil}, state}
@@ -481,9 +517,15 @@ defmodule Vagus.Test.FakeEngine.Model do
 
   defp event(state, action, container, attributes \\ %{}) do
     tick = state.tick + 1
+    line = line(event_map(tick, action, container, attributes))
+    for pid <- state.streams, do: send(pid, {:event, line})
+    %{state | tick: tick}
+  end
+
+  defp event_map(tick, action, container, attributes) do
     nano = @epoch + tick * 1_000_000
 
-    event = %{
+    %{
       "Type" => "container",
       "Action" => action,
       "Actor" => %{
@@ -494,27 +536,25 @@ defmodule Vagus.Test.FakeEngine.Model do
       "time" => div(nano, 1_000_000_000),
       "timeNano" => nano
     }
-
-    for pid <- state.streams, do: send(pid, {:event, line(event)})
-    %{state | tick: tick, ring: Enum.take([event | state.ring], state.ring_size)}
   end
 
   defp line(event), do: Jason.encode!(event) <> "\n"
 
-  defp nano(since) do
-    case String.split(since, ".") do
-      [seconds] ->
-        String.to_integer(seconds) * 1_000_000_000
+  # As the engine words it: a sentence for people, not a state.
+  defp status_text(%{state: "running"}), do: "Up 3 seconds"
+  defp status_text(%{state: "created"}), do: "Created"
+  defp status_text(%{state: "paused"}), do: "Up 3 seconds (Paused)"
+  defp status_text(%{state: "removing"}), do: "Removal In Progress"
+  defp status_text(%{state: "dead"}), do: "Dead"
 
-      [seconds, fraction] ->
-        String.to_integer(seconds) * 1_000_000_000 +
-          (fraction |> String.pad_trailing(9, "0") |> String.to_integer())
-    end
-  end
+  defp status_text(%{state: "restarting"} = container),
+    do: "Restarting (#{container.exit_code}) 1 second ago"
+
+  defp status_text(container), do: "Exited (#{container.exit_code}) 2 seconds ago"
 
   # Label values are all required; name values are alternatives, each a
   # regular expression matched anywhere in the name.
-  defp listed?(container, filters) do
+  defp listed?(container, filters, slashed?) do
     labels? =
       Enum.all?(filters["label"] || [], fn label ->
         case String.split(label, "=", parts: 2) do
@@ -524,9 +564,8 @@ defmodule Vagus.Test.FakeEngine.Model do
       end)
 
     names = filters["name"] || []
-
-    labels? and
-      (names == [] or Enum.any?(names, &Regex.match?(Regex.compile!(&1), container.name)))
+    name = if slashed?, do: "/" <> container.name, else: container.name
+    labels? and (names == [] or Enum.any?(names, &Regex.match?(Regex.compile!(&1), name)))
   end
 
   # An image reference has slashes of its own.

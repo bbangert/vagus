@@ -7,15 +7,24 @@ defmodule Vagus.App.Backend.Native do
   There is nothing to create and no image. `create/3` and `remove_image/2`
   do nothing, `image_present?/2` is always true, `start/2` starts the
   subtree and `stop/3` and `remove/2` both end it, so an instance is either
-  `:absent` or `:running`. Its `id` names the subtree's process and so
-  differs for every start.
+  `:absent` or `:running`: after `create/3` there is still no instance and
+  no id. Its `id` names the subtree's process and so differs for every
+  start.
 
   The subtree is a `:temporary` child: the broker's own supervisor absorbs
   its children's crashes, and one that gives up stays down and is observed
   as `:absent`. Whether to start it again is the controller's decision.
 
   With the holding supervisor away, `observe/2` is `{:unavailable,
-  :native_supervisor_down}` and the actions exit.
+  :native_supervisor_down}`, `start/2` exits, and `stop/3` and `remove/2`
+  exit when there is a subtree to end.
+
+  The subtree registers the name the backend this one replaces uses for the
+  same app, so the two cannot each run a broker on the port; one started by
+  either is the instance both see. `stop/3` does not tell that backend's
+  sentinel. For a broker the old backend started and still records as
+  started, the sentinel reads this stop as a death and starts it again some
+  seconds later, so only one of the two may be given an app to run.
 
   Options: `:supervisor` (default the application's), `:port` (default
   `config :vagus, :mqtt_broker_port`, else 1883) and `:provider`, the
@@ -42,7 +51,7 @@ defmodule Vagus.App.Backend.Native do
   def image_present?(_image, _opts \\ []), do: {:ok, true}
 
   @impl true
-  def create(slug, _config, _opts \\ []), do: {:ok, slug}
+  def create(_slug, _config, _opts \\ []), do: :ok
 
   @impl true
   def start(slug, opts \\ []) do
@@ -65,7 +74,7 @@ defmodule Vagus.App.Backend.Native do
 
   @impl true
   def stop(slug, _grace, opts \\ []) do
-    case Process.whereis(broker_name(slug)) do
+    case registered(slug) do
       nil ->
         :ok
 
@@ -98,10 +107,18 @@ defmodule Vagus.App.Backend.Native do
   @spec broker_name(String.t()) :: atom()
   def broker_name(slug), do: Module.concat(Broker, "addon_" <> slug)
 
+  # A name nothing was ever started under is not an atom yet, and asking
+  # after it must not make it one: atoms are never collected.
+  defp registered(slug) do
+    Process.whereis(String.to_existing_atom("#{Broker}.addon_#{slug}"))
+  rescue
+    ArgumentError -> nil
+  end
+
   # The registered name gives a pid; whether that pid is the running
   # instance is the supervisor's to say, so it is asked for its children.
   defp child(slug, opts) do
-    pid = Process.whereis(broker_name(slug))
+    pid = registered(slug)
 
     children =
       for {_id, child, _type, _modules} <- DynamicSupervisor.which_children(supervisor(opts)),

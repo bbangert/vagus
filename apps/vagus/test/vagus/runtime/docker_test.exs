@@ -286,9 +286,17 @@ defmodule Vagus.Runtime.DockerTest do
                collect(engine)
     end
 
-    test "silence longer than the idle timeout ends the pull, with what came before it" do
+    test "silence longer than the idle timeout ends the pull" do
+      # Nothing after the headers, so nothing has to arrive inside the 50 ms.
+      engine = scripted([{:stream, 200, [:stall]}])
+
+      assert {:error, {:pull_timeout, :idle}} =
+               collect(engine, idle_timeout: 50, total_timeout: 60_000)
+    end
+
+    test "what came before the silence was handed over" do
       test = self()
-      engine = scripted([{:stream, 200, [{:line, status("first")}, {:wait, 2_000}]}])
+      engine = scripted([{:stream, 200, [{:line, status("first")}, :stall]}])
 
       assert {:error, {:pull_timeout, :idle}} =
                Docker.pull_image_stream(
@@ -296,10 +304,20 @@ defmodule Vagus.Runtime.DockerTest do
                  nil,
                  fn line, nil -> send(test, {:line, line}) && nil end,
                  socket: engine.socket,
-                 idle_timeout: 50
+                 idle_timeout: 1_000
                )
 
       assert_received {:line, %{"status" => "first"}}
+    end
+
+    test "with both timeouts set, a silent stream ends by whichever is shorter" do
+      engine = scripted([{:stream, 200, [:stall]}, {:stream, 200, [:stall]}])
+
+      assert {:error, {:pull_timeout, :idle}} =
+               collect(engine, idle_timeout: 50, total_timeout: 60_000)
+
+      assert {:error, {:pull_timeout, :total}} =
+               collect(engine, idle_timeout: 60_000, total_timeout: 50)
     end
 
     test "a stream that never falls silent still ends at the total timeout" do
@@ -308,6 +326,138 @@ defmodule Vagus.Runtime.DockerTest do
 
       assert {:error, {:pull_timeout, :total}} =
                collect(engine, idle_timeout: 10_000, total_timeout: 100)
+    end
+
+    test "a reader slower than the stream, with lines always waiting, ends at the total too" do
+      # The engine is done in a moment; the function takes 40 ms a line, so
+      # every receive after the first finds data and none of them waits.
+      steps = Enum.flat_map(1..40, &[{:line, status("#{&1}")}, {:wait, 2}])
+      engine = scripted([{:stream, 200, steps}])
+      test = self()
+
+      slow = fn _line, count ->
+        Process.sleep(40)
+        send(test, {:read, count + 1})
+        count + 1
+      end
+
+      assert {:error, {:pull_timeout, :total}} =
+               Docker.pull_image_stream("repo/img:1", 0, slow,
+                 socket: engine.socket,
+                 total_timeout: 200
+               )
+
+      refute_received {:read, 40}
+    end
+
+    test "a last line the stream ends without terminating is still read" do
+      engine = scripted([{:stream, 200, [{:chunk, Jason.encode!(status("last"))}]}])
+      assert {:ok, [%{"status" => "last"}]} = collect(engine)
+    end
+
+    test "an error in a last line the stream ends without terminating fails the pull" do
+      engine =
+        scripted([
+          {:stream, 200, [{:line, status("first")}, {:chunk, ~s({"error":"no space left"})}]}
+        ])
+
+      assert {:error, {:pull_failed, "no space left"}} = collect(engine)
+    end
+
+    test "a stream that breaks off is the transport's failure" do
+      engine = scripted([{:stream, 200, [{:line, status("first")}, :abort]}])
+
+      assert {:error, reason} = collect(engine)
+      assert Docker.failure(reason) == {:transport, :closed}
+    end
+
+    test "an error line that arrives with the break is the pull's failure, not the break" do
+      # One write: a whole chunk holding the error, then bytes that are no
+      # chunk. The reader gets the data and the framing error together.
+      chunk = ~s({"error":"layer verification failed"}\n)
+      raw = Integer.to_string(byte_size(chunk), 16) <> "\r\n" <> chunk <> "\r\n" <> "ZZ\r\n"
+      engine = scripted([{:stream, 200, [{:line, status("first")}, {:wait, 50}, {:raw, raw}]}])
+
+      assert {:error, {:pull_failed, "layer verification failed"}} = collect(engine)
+    end
+
+    test "lines ending in CR LF are lines" do
+      body = Enum.map_join(["a", "b"], &(Jason.encode!(status(&1)) <> "\r\n"))
+      engine = scripted([{:stream, 200, [{:chunk, body}]}])
+
+      assert {:ok, [%{"status" => "b"}, %{"status" => "a"}]} = collect(engine)
+    end
+
+    test "a read may end between CR and LF, in a chunk's size, or inside a character" do
+      a = Jason.encode!(status("a"))
+      accented = Jason.encode!(status("é"))
+      [before, rest] = :binary.split(accented, <<0xA9>>)
+      b = Jason.encode!(status("b")) <> String.duplicate(" ", 300) <> "\n"
+
+      <<size_digit, framed_rest::binary>> =
+        Integer.to_string(byte_size(b), 16) <> "\r\n" <> b <> "\r\n"
+
+      engine =
+        scripted([
+          {:stream, 200,
+           [
+             {:chunk, a <> "\r"},
+             {:wait, 20},
+             {:chunk, "\n" <> before},
+             {:wait, 20},
+             {:chunk, <<0xA9>> <> rest <> "\n"},
+             {:wait, 20},
+             {:raw, <<size_digit>>},
+             {:wait, 20},
+             {:raw, framed_rest}
+           ]}
+        ])
+
+      assert {:ok, seen} = collect(engine)
+      assert Enum.reverse(seen) == [status("a"), status("é"), status("b")]
+    end
+
+    test "a refusal that is not JSON keeps its text" do
+      engine = scripted([{500, "something broke\n"}])
+
+      assert {:error, {:pull_failed, {500, "something broke\n"}} = reason} = collect(engine)
+
+      assert Docker.failure({:pull_failed, {500, "something broke"}}) ==
+               {:status, 500, "something broke"}
+
+      assert {:status, 500, "something broke\n"} = Docker.failure(reason)
+    end
+
+    test "of a refusal's body no more than 64 kB is kept" do
+      engine = scripted([{500, String.duplicate("x", 200_000)}])
+
+      assert {:error, {:pull_failed, {500, kept}}} = collect(engine)
+      assert byte_size(kept) == 65_536
+    end
+
+    for {reference, repo, tag} <- [
+          {"img", "img", "latest"},
+          {"repo/img:1.2", "repo/img", "1.2"},
+          {"host:5000/img", "host:5000/img", "latest"},
+          {"host:5000/org/img:1", "host:5000/org/img", "1"},
+          {"img@sha256:abc", "img", "sha256:abc"},
+          {"repo/img:1@sha256:abc", "repo/img", "sha256:abc"},
+          {"host:5000/img@sha256:abc", "host:5000/img", "sha256:abc"}
+        ] do
+      test "#{reference} is pulled as #{repo} at #{tag}, streamed or buffered" do
+        lines = [{:line, status("one")}, {:line, status("two")}]
+        engine = scripted([{:stream, 200, lines}, {:stream, 200, lines}])
+
+        assert {:ok, [_two, _one]} =
+                 Docker.pull_image_stream(unquote(reference), [], &[&1 | &2],
+                   socket: engine.socket
+                 )
+
+        assert :ok = Docker.pull_image(unquote(reference), socket: engine.socket)
+
+        assert [%{"fromImage" => unquote(repo), "tag" => unquote(tag)} = query, query] =
+                 for(request <- FakeEngine.requests(engine), do: request.query)
+      end
     end
 
     test "killing the caller closes the connection" do
@@ -333,10 +483,25 @@ defmodule Vagus.Runtime.DockerTest do
       stream = {:stream, 200, List.duplicate({:line, line}, 36)}
       engine = scripted([stream, stream])
 
-      count = fn %{"status" => text}, {lines, bytes} -> {lines + 1, bytes + byte_size(text)} end
+      # Binaries this process still holds once it has collected its garbage:
+      # what the reader keeps of the stream, whatever it means to.
+      held = fn ->
+        :erlang.garbage_collect()
+        {:binary, binaries} = Process.info(self(), :binary)
+        binaries |> Enum.map(&elem(&1, 1)) |> Enum.sum()
+      end
 
-      assert {:ok, {36, 18_000_000}} =
-               Docker.pull_image_stream("repo/img:1", {0, 0}, count, socket: engine.socket)
+      base = held.()
+
+      count = fn %{"status" => text}, {lines, bytes, most} ->
+        {lines + 1, bytes + byte_size(text), max(most, held.() - base)}
+      end
+
+      assert {:ok, {36, 18_000_000, most}} =
+               Docker.pull_image_stream("repo/img:1", {0, 0, 0}, count, socket: engine.socket)
+
+      # A few lines' worth at the worst, with 36 gone by.
+      assert most < 4_000_000
 
       # The same stream through the call that buffers it.
       assert {:error, :response_too_large} =
@@ -426,7 +591,7 @@ defmodule Vagus.Runtime.DockerTest do
                  names: ["app_a"],
                  image: "repo/a:1",
                  state: "running",
-                 status: "running",
+                 status: "Up " <> _,
                  labels: %{"supervisor_managed" => ""}
                }
              ] = Enum.map(listed, &Docker.summary/1)
@@ -448,13 +613,12 @@ defmodule Vagus.Runtime.DockerTest do
     end
 
     test "failure/1: no socket is unreachable" do
-      missing = "/tmp/vagus-none-#{System.unique_integer([:positive])}.sock"
-      assert {:error, reason} = Docker.inspect_container("x", socket: missing)
+      assert {:error, reason} = Docker.inspect_container("x", socket: FakeEngine.socket_path())
       assert Docker.failure(reason) == {:unreachable, :enoent}
     end
 
     test "failure/1: a socket nobody listens on is unreachable" do
-      path = "/tmp/vagus-dead-#{System.unique_integer([:positive])}.sock"
+      path = FakeEngine.socket_path()
       {:ok, listen} = :gen_tcp.listen(0, [:binary, {:ifaddr, {:local, path}}])
       :ok = :gen_tcp.close(listen)
       on_exit(fn -> File.rm(path) end)
@@ -515,6 +679,11 @@ defmodule Vagus.Runtime.DockerTest do
       assert Docker.failure({:pull_timeout, :idle}) == {:timeout, :idle}
       assert Docker.failure({:remove_failed, 409, "in progress"}) == {:status, 409, "in progress"}
       assert Docker.failure(%Mint.TransportError{reason: :closed}) == {:transport, :closed}
+
+      assert Docker.failure(%Mint.HTTPError{reason: :invalid_chunk_size}) ==
+               {:transport, :invalid_chunk_size}
+
+      assert Docker.failure({:connect, :enoent}) == {:unreachable, :enoent}
       assert Docker.failure({:invalid_ref, "a/b"}) == {:invalid, {:invalid_ref, "a/b"}}
       assert Docker.failure(:response_too_large) == {:other, :response_too_large}
     end

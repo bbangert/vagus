@@ -4,7 +4,7 @@ defmodule Vagus.Resource.RuntimeEnqueueTest do
   import Vagus.Resource.Harness
 
   alias Vagus.Resource.{Runtime, Store}
-  alias Vagus.Resource.Toys.{Follower, Probe}
+  alias Vagus.Resource.Toys.{Follower, Probe, Stall}
 
   @moduletag :capture_log
 
@@ -51,13 +51,45 @@ defmodule Vagus.Resource.RuntimeEnqueueTest do
     enqueued(sys, "f1")
     assert_receive {:following, "f1", step}, sys.wait
 
-    assert %{dirty: ["f1"], in_flight: %{"f1" => ^step}} = enqueued(sys, "f1")
+    assert %{hinted: ["f1"], dirty: [], in_flight: %{"f1" => ^step}} = enqueued(sys, "f1")
 
     put_fact(sys, {:follow, "f1"}, nil)
     send(step, :go)
     settle(sys)
 
     assert notes(sys) == [{:followed, "f1", 1}, {:followed, "f1", 1}]
+  end
+
+  describe "while the resource's pass is failing" do
+    # A pass that will crash is parked, with a back-off long enough never to
+    # fire: whatever runs after it was not brought by the timer.
+    setup do
+      sys = start_system(controllers: [Stall], runtime: [backoff: {600_000, 600_000}])
+      {:ok, _} = Store.create(:stall, "s", %{}, sys.i)
+      assert_receive {:stalled, "s", step}, sys.wait
+      %{sys: sys, step: step}
+    end
+
+    test "an enqueue gets its pass as soon as that one has failed", %{sys: sys, step: step} do
+      :ok = Runtime.enqueue(Stall, "s", sys.i)
+      assert %{hinted: ["s"]} = Runtime.info(Stall, sys.i)
+
+      send(step, :go)
+
+      assert_receive {:stalled, "s", next}, sys.wait
+      assert next != step
+    end
+
+    test "a change in the store waits for the back-off", %{sys: sys, step: step} do
+      {:ok, _} = Store.update_spec(:stall, "s", %{"n" => 2}, sys.i)
+      assert %{dirty: ["s"], hinted: []} = info(sys, Stall)
+
+      send(step, :go)
+      settle(sys)
+
+      assert %{steps: 1, timers: ["s"], failures: %{"s" => 1}, queued: [], dirty: []} =
+               Runtime.info(Stall, sys.i)
+    end
   end
 
   test "enqueue of a name the kind does not hold starts nothing and is not kept" do

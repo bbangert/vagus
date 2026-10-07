@@ -133,6 +133,82 @@ defmodule Vagus.App.Backend.NativeTest do
     assert Native.observe(slug, opts) == {:unavailable, :native_supervisor_down}
   end
 
+  test "with the supervisor away, start/2 exits", %{slug: slug, opts: opts} do
+    opts = Keyword.put(opts, :supervisor, :"no_supervisor_#{slug}")
+    assert {:noproc, _call} = catch_exit(Native.start(slug, opts))
+  end
+
+  test "with the supervisor away, stop/3 of something registered exits and of nothing is :ok",
+       %{slug: slug, opts: opts} do
+    opts = Keyword.put(opts, :supervisor, :"no_supervisor_#{slug}")
+    assert Native.stop(slug, nil, opts) == :ok
+
+    holder = spawn(fn -> Process.sleep(:infinity) end)
+    Process.register(holder, Native.broker_name(slug))
+    on_exit(fn -> Process.exit(holder, :kill) end)
+
+    assert {:noproc, _call} = catch_exit(Native.stop(slug, nil, opts))
+  end
+
+  test "asking after a name nothing was started under makes no atom of it", %{opts: opts} do
+    slug = "never_#{System.unique_integer([:positive])}"
+
+    assert Native.observe(slug, opts) == {:ok, :absent}
+    assert Native.stop(slug, nil, opts) == :ok
+    assert Native.remove(slug, opts) == :ok
+
+    assert_raise ArgumentError, fn ->
+      String.to_existing_atom("Elixir.Vagus.Mqtt.Broker.addon_" <> slug)
+    end
+  end
+
+  describe "defaults" do
+    setup %{slug: slug, port: port, opts: opts} do
+      root = Path.join(System.tmp_dir!(), "vagus-native-#{System.pid()}-#{slug}")
+
+      previous =
+        for key <- [:mqtt_broker_port, :addon_data_root],
+            do: {key, Application.fetch_env(:vagus, key)}
+
+      Application.put_env(:vagus, :mqtt_broker_port, port)
+      Application.put_env(:vagus, :addon_data_root, root)
+
+      on_exit(fn ->
+        File.rm_rf(root)
+
+        for {key, value} <- previous do
+          case value do
+            {:ok, value} -> Application.put_env(:vagus, key, value)
+            :error -> Application.delete_env(:vagus, key)
+          end
+        end
+      end)
+
+      %{opts: Keyword.take(opts, [:supervisor])}
+    end
+
+    test "the port is the configured broker port", %{slug: slug, port: port, opts: opts} do
+      :ok = Native.start(slug, [provider: nil] ++ opts)
+      assert connects?(port)
+    end
+
+    test "the broker announces its service unless told not to", %{slug: slug, opts: opts} do
+      provider = Module.concat(Native.broker_name(slug), "Provider")
+
+      :ok = Native.start(slug, [provider: nil] ++ opts)
+      assert Process.whereis(provider) == nil
+      :ok = Native.stop(slug, nil, opts)
+
+      :ok = Native.start(slug, opts)
+      assert is_pid(Process.whereis(provider))
+      assert {:ok, %{"addon" => ^slug}} = Vagus.Services.get("mqtt")
+
+      :ok = Native.stop(slug, nil, opts)
+      assert Process.whereis(provider) == nil
+      assert Vagus.Services.get("mqtt") == :error
+    end
+  end
+
   test "a broker that cannot start is an error, and nothing is left behind", %{
     slug: slug,
     opts: opts
@@ -149,7 +225,7 @@ defmodule Vagus.App.Backend.NativeTest do
     slug: slug,
     opts: opts
   } do
-    assert Native.create(slug, %{}, opts) == {:ok, slug}
+    assert Native.create(slug, %{}, opts) == :ok
     assert Native.observe(slug, opts) == {:ok, :absent}
 
     assert Native.image_present?("any:1", opts) == {:ok, true}

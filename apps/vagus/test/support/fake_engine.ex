@@ -44,7 +44,8 @@ defmodule Vagus.Test.FakeEngine do
 
   A response may also be `{:stream, status, steps}`: chunked, written as the
   steps say and then ended. A step is `{:line, map}` (one JSON line),
-  `{:chunk, binary}`, `{:wait, ms}`, `{:run, fun}` (called in the process
+  `{:chunk, binary}`, `{:raw, binary}` (bytes written as they are, outside
+  the chunk framing), `{:wait, ms}`, `{:run, fun}` (called in the process
   that writes the response), `:abort` (close without ending the body) or
   `:stall`: send nothing more and wait for the client to close,
   then tell the `:notify` process given to `start/2`
@@ -108,7 +109,7 @@ defmodule Vagus.Test.FakeEngine do
   @doc "Starts `Vagus.Test.FakeEngine.Model`; the handle works with `requests/1` and `stop/1` too."
   @spec start_model(keyword()) :: map()
   def start_model(opts \\ []) do
-    path = socket_path()
+    path = Keyword.get_lazy(opts, :socket, &socket_path/0)
     _ = File.rm(path)
     {:ok, model} = __MODULE__.Model.start_link(Keyword.put(opts, :socket, path))
     %{socket: path, model: model}
@@ -246,6 +247,7 @@ defmodule Vagus.Test.FakeEngine do
     case step do
       {:line, map} -> chunk(sock, Jason.encode!(map) <> "\n")
       {:chunk, binary} -> chunk(sock, binary)
+      {:raw, binary} -> :gen_tcp.send(sock, binary)
       {:wait, ms} -> Process.sleep(ms)
       {:run, fun} -> fun.()
     end
@@ -388,7 +390,13 @@ defmodule Vagus.Test.FakeEngine do
   defp reason_phrase(500), do: "Internal Server Error"
   defp reason_phrase(_status), do: "Unknown"
 
-  defp socket_path do
-    Path.join(System.tmp_dir!(), "vagus-core-engine-#{System.unique_integer([:positive])}.sock")
+  @doc "A socket path nothing listens at, and that no other test run will pick."
+  @spec socket_path() :: String.t()
+  def socket_path do
+    # The OS pid: two test runs at once, in two checkouts, count from one each.
+    Path.join(
+      System.tmp_dir!(),
+      "vagus-engine-#{System.pid()}-#{System.unique_integer([:positive])}.sock"
+    )
   end
 end

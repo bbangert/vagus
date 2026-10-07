@@ -108,7 +108,7 @@ defmodule Vagus.Resource.Harness do
         runtime: runtime,
         kinds: Keyword.get(opts, :kinds, %{}),
         lanes: Keyword.get(opts, :lanes)
-      ] ++ Keyword.take(opts, [:path, :persist, :pulls])
+      ] ++ Keyword.take(opts, [:path, :persist]) ++ services(instance, opts[:pulls])
 
     start_supervised!(Supervisor.child_spec({Resource.Supervisor, tree}, id: instance))
 
@@ -129,6 +129,12 @@ defmodule Vagus.Resource.Harness do
     settle(sys)
     sys
   end
+
+  # `Vagus.App.Pulls` as the application runs it, for a test that asks for it.
+  defp services(_instance, nil), do: []
+
+  defp services(instance, pulls),
+    do: [services: Vagus.App.Pulls.child_specs([instance: instance] ++ pulls)]
 
   @spec stop_system(system()) :: :ok
   def stop_system(sys) do

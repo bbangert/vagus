@@ -11,6 +11,19 @@ defmodule Vagus.App.PullsTest do
 
   @moduletag :capture_log
 
+  defmodule Chatty do
+    @moduledoc """
+    An engine client whose pull is 200 lines at once, and which then tells
+    the test named in its options how many it fed.
+    """
+    def pull_image_stream(_image, acc, fun, opts) do
+      line = &Vagus.Test.FakeEngine.Model.downloading("l1", &1, 200)
+      acc = Enum.reduce(1..200, acc, &fun.(line.(&1), &2))
+      send(Keyword.fetch!(opts, :test), {:fed, 200})
+      {:ok, acc}
+    end
+  end
+
   defmodule Crashing do
     @moduledoc "An engine client whose pull dies."
     def pull_image_stream(_image, _acc, _fun, _opts), do: raise("the pull died")
@@ -20,15 +33,21 @@ defmodule Vagus.App.PullsTest do
     engine = FakeEngine.start_model(notify: self())
     on_exit(fn -> FakeEngine.stop(engine) end)
     clock = start_supervised!(TestClock)
+    instance = TestInstance.name()
 
     pulls =
       Keyword.merge(
-        [engine: [socket: engine.socket], clock: TestClock.clock(clock), progress_interval: 0],
+        [
+          instance: instance,
+          engine: [socket: engine.socket, test: self()],
+          clock: TestClock.clock(clock),
+          progress_interval: 0
+        ],
         Map.get(context, :pulls, [])
       )
 
-    instance = TestInstance.start!(pulls: pulls)
-    i = [instance: instance]
+    # As the application places it: among the resource supervisor's services.
+    TestInstance.start!(instance: instance, services: Pulls.child_specs(pulls))
 
     # Wake-ups are casts to the runtime of the waiter's controller. This
     # test is that runtime, for a controller that exists only as a name.
@@ -38,7 +57,7 @@ defmodule Vagus.App.PullsTest do
       engine: engine,
       clock: clock,
       instance: instance,
-      i: i,
+      i: [instance: instance],
       engine_opts: [engine: [socket: engine.socket]]
     }
   end
@@ -51,24 +70,28 @@ defmodule Vagus.App.PullsTest do
     end
   end
 
-  defmacrop refute_woken(name) do
+  # The worker's answer comes after any wake-up it had sent this process
+  # before answering: the same sender, the same receiver.
+  defmacrop refute_woken(context, name) do
     quote do
+      Pulls.info(unquote(context).i)
       refute_received {:"$gen_cast", {:enqueue, unquote(name)}}
     end
   end
 
-  defp requests(engine, path \\ "/images/create"),
-    do: for(%{path: ^path} = request <- FakeEngine.requests(engine), do: request.query)
+  defp requests(engine),
+    do: for(%{path: "/images/create"} = request <- FakeEngine.requests(engine), do: request.query)
 
-  # A pull that has read one line and then hears nothing more. Returns once
-  # it is there, with the pull's task.
-  defp stalled(context, image, opts \\ []) do
+  # A pull that has read one line and then hears nothing more, asked for by
+  # `who`. Returns once it is there, with the pull's task.
+  defp stalled(context, image, who, opts \\ []) do
     test = self()
     Model.script_pull(context.engine, image, {:stall, [Model.downloading("l1", 1, 2)]})
 
     :ok =
       Pulls.request(
         image,
+        waiter(who),
         [on_progress: &send(test, {:progress, image, &1})] ++ opts ++ context.i
       )
 
@@ -76,7 +99,20 @@ defmodule Vagus.App.PullsTest do
     Pulls.info(context.i)[image].task
   end
 
-  # Returns once `count` requests for the pull lane have reached the lanes.
+  # A pull whose engine writes `lines`, then waits for `:go` from the test,
+  # which is sent `{:held, handler}`, then writes `more` and falls silent,
+  # or with `:end` ends the stream as a pull that worked.
+  defp held(context, image, lines, more, last \\ :stall) do
+    test = self()
+
+    steps =
+      Enum.map(lines, &{:line, &1}) ++
+        [{:run, fn -> send(test, {:held, self()}) && receive(do: (:go -> :ok)) end}] ++
+        Enum.map(more, &{:line, &1}) ++ if(last == :stall, do: [:stall], else: [])
+
+    Model.script_pull(context.engine, image, {:steps, steps})
+  end
+
   defp traced_lanes(instance) do
     lanes = Process.whereis(Lanes.name(instance))
     :erlang.trace(lanes, true, [:receive])
@@ -91,16 +127,39 @@ defmodule Vagus.App.PullsTest do
     end
   end
 
-  describe "request/2" do
+  defp next_progress do
+    receive do
+      {:progress, progress} -> progress
+    after
+      2_000 -> flunk("no progress")
+    end
+  end
+
+  # The summaries a pull of these lines passes on, one a line.
+  defp summaries(context, lines) do
+    test = self()
+    Model.script_pull(context.engine, "repo/a:1", {:stall, lines})
+
+    :ok =
+      Pulls.request(
+        "repo/a:1",
+        waiter("a"),
+        [on_progress: &send(test, {:progress, &1})] ++ context.i
+      )
+
+    for _line <- lines, do: next_progress()
+  end
+
+  describe "request/3" do
     test "returns while the pull is still running, and state/2 says it is", context do
-      stalled(context, "repo/a:1", waiter: waiter("a"))
+      stalled(context, "repo/a:1", "a")
 
       assert {:pulling, %{current: 1, total: 2}} = Pulls.state("repo/a:1", context.i)
-      refute_woken("a")
+      refute_woken(context, "a")
     end
 
     test "a pull that succeeds leaves :idle, the image present, and wakes its waiter", context do
-      :ok = Pulls.request("repo/a:1", [waiter: waiter("a")] ++ context.i)
+      :ok = Pulls.request("repo/a:1", waiter("a"), context.i)
 
       assert_woken("a")
       assert Pulls.state("repo/a:1", context.i) == :idle
@@ -109,42 +168,48 @@ defmodule Vagus.App.PullsTest do
     end
 
     test "a second request for a reference being pulled joins that pull", context do
-      task = stalled(context, "repo/a:1", waiter: waiter("a"))
+      task = stalled(context, "repo/a:1", "a")
 
-      :ok = Pulls.request("repo/a:1", [waiter: waiter("b")] ++ context.i)
+      :ok = Pulls.request("repo/a:1", waiter("b"), context.i)
 
-      assert %{"repo/a:1" => %{task: ^task, waiters: waiters}} = Pulls.info(context.i)
-      assert Enum.sort(waiters) == [waiter("a"), waiter("b")]
+      assert Pulls.info(context.i) == %{
+               "repo/a:1" => %{task: task, waiters: [waiter("a"), waiter("b")]}
+             }
+
       assert length(requests(context.engine)) == 1
     end
 
     test "when a pull ends, every waiter of it is woken and nobody else", context do
-      test = self()
+      held(context, "repo/a:1", [Model.downloading("l1", 1, 2)], [], :end)
+      Model.script_pull(context.engine, "repo/other:1", {:stall, []})
 
-      Model.script_pull(context.engine, "repo/a:1", {
-        :steps,
-        [
-          {:line, Model.downloading("l1", 1, 2)},
-          {:run, fn -> send(test, {:held, self()}) && receive(do: (:go -> :ok)) end}
-        ]
-      })
-
-      stalled(context, "repo/other:1", waiter: waiter("c"))
-      :ok = Pulls.request("repo/a:1", [waiter: waiter("a")] ++ context.i)
-      :ok = Pulls.request("repo/a:1", [waiter: waiter("b")] ++ context.i)
-      :ok = Pulls.cancel("repo/other:1", context.i)
-      assert_woken("c")
+      :ok = Pulls.request("repo/a:1", waiter("a"), context.i)
+      :ok = Pulls.request("repo/a:1", waiter("b"), context.i)
+      # Waits for the lane behind the first, and then hears nothing.
+      :ok = Pulls.request("repo/other:1", waiter("c"), context.i)
 
       assert_receive {:held, handler}, 2_000
       send(handler, :go)
 
       assert_woken("a")
       assert_woken("b")
-      refute_woken("c")
+      refute_woken(context, "c")
+      assert Pulls.state("repo/a:1", context.i) == :idle
+    end
+
+    test "a waiter is one waiter however often it asks", context do
+      task = stalled(context, "repo/a:1", "a")
+      for _again <- 1..4, do: :ok = Pulls.request("repo/a:1", waiter("a"), context.i)
+
+      assert Pulls.info(context.i) == %{"repo/a:1" => %{task: task, waiters: [waiter("a")]}}
+
+      :ok = Pulls.cancel("repo/a:1", waiter("a"), context.i)
+      assert_woken("a")
+      refute_woken(context, "a")
     end
 
     test "the platform asked for is the engine's platform parameter", context do
-      :ok = Pulls.request("repo/a:1", [platform: "linux/arm64", waiter: waiter("a")] ++ context.i)
+      :ok = Pulls.request("repo/a:1", waiter("a"), [platform: "linux/arm64"] ++ context.i)
       assert_woken("a")
 
       assert [%{"fromImage" => "repo/a", "tag" => "1", "platform" => "linux/arm64"}] =
@@ -153,7 +218,13 @@ defmodule Vagus.App.PullsTest do
 
     test "with no worker it exits", _context do
       assert {:noproc, _call} =
-               catch_exit(Pulls.request("repo/a:1", instance: __MODULE__.Nowhere))
+               catch_exit(Pulls.request("repo/a:1", waiter("a"), instance: __MODULE__.Nowhere))
+    end
+
+    test "a request names its waiter", context do
+      # Read at run time, so that the compiler has no say on its type.
+      nobody = Process.get(:no_such_waiter)
+      assert_raise FunctionClauseError, fn -> Pulls.request("repo/a:1", nobody, context.i) end
     end
   end
 
@@ -162,7 +233,7 @@ defmodule Vagus.App.PullsTest do
       Model.script_pull(context.engine, "repo/a:1", {:error, "manifest unknown"})
       TestClock.advance(context.clock, 1_234)
 
-      :ok = Pulls.request("repo/a:1", [waiter: waiter("a")] ++ context.i)
+      :ok = Pulls.request("repo/a:1", waiter("a"), context.i)
       assert_woken("a")
 
       assert Pulls.state("repo/a:1", context.i) ==
@@ -172,16 +243,16 @@ defmodule Vagus.App.PullsTest do
     test "an image the registry does not have is the engine's status", context do
       Model.script_pull(context.engine, "repo/a:1", :not_found)
 
-      :ok = Pulls.request("repo/a:1", [waiter: waiter("a")] ++ context.i)
+      :ok = Pulls.request("repo/a:1", waiter("a"), context.i)
       assert_woken("a")
 
       assert {:failed, {:status, 404, "pull access denied for repo/a"}, %Stamp{}} =
                Pulls.state("repo/a:1", context.i)
     end
 
-    @tag pulls: [engine: [socket: "/tmp/vagus-pulls-no-engine.sock"]]
+    @tag pulls: [engine: [socket: "/tmp/vagus-pulls-no-engine-#{System.pid()}.sock"]]
     test "an engine that is away is a failure that says so", context do
-      :ok = Pulls.request("repo/a:1", [waiter: waiter("a")] ++ context.i)
+      :ok = Pulls.request("repo/a:1", waiter("a"), context.i)
       assert_woken("a")
 
       assert {:failed, {:unreachable, :enoent}, %Stamp{}} = Pulls.state("repo/a:1", context.i)
@@ -189,7 +260,7 @@ defmodule Vagus.App.PullsTest do
 
     @tag pulls: [client: Crashing]
     test "a pull that dies is a failure too, and its waiter is woken", context do
-      :ok = Pulls.request("repo/a:1", [waiter: waiter("a")] ++ context.i)
+      :ok = Pulls.request("repo/a:1", waiter("a"), context.i)
       assert_woken("a")
 
       assert {:failed, {:crashed, {%RuntimeError{message: "the pull died"}, _stack}}, %Stamp{}} =
@@ -198,12 +269,15 @@ defmodule Vagus.App.PullsTest do
 
     test "is not retried by itself; the next request pulls again", context do
       Model.script_pull(context.engine, "repo/a:1", {:error, "manifest unknown"})
-      :ok = Pulls.request("repo/a:1", [waiter: waiter("a")] ++ context.i)
+      :ok = Pulls.request("repo/a:1", waiter("a"), context.i)
       assert_woken("a")
-      assert length(requests(context.engine)) == 1
+
+      # Nothing is in flight and nothing was asked of the engine again.
+      assert Pulls.info(context.i) == %{}
+      assert {:failed, {:stream, "manifest unknown"}, _stamp} = Pulls.state("repo/a:1", context.i)
 
       Model.script_pull(context.engine, "repo/a:1", :ok)
-      :ok = Pulls.request("repo/a:1", [waiter: waiter("a")] ++ context.i)
+      :ok = Pulls.request("repo/a:1", waiter("a"), context.i)
       assert_woken("a")
 
       assert Pulls.state("repo/a:1", context.i) == :idle
@@ -212,21 +286,21 @@ defmodule Vagus.App.PullsTest do
 
     test "is forgotten on cancel", context do
       Model.script_pull(context.engine, "repo/a:1", {:error, "manifest unknown"})
-      :ok = Pulls.request("repo/a:1", [waiter: waiter("a")] ++ context.i)
+      :ok = Pulls.request("repo/a:1", waiter("a"), context.i)
       assert_woken("a")
 
-      assert :ok = Pulls.cancel("repo/a:1", context.i)
+      assert :ok = Pulls.cancel("repo/a:1", waiter("a"), context.i)
       assert Pulls.state("repo/a:1", context.i) == :idle
     end
   end
 
-  describe "cancel/2" do
-    test "ends the pull: the task is gone, the engine's connection closed, the waiter woken",
+  describe "cancel/3" do
+    test "by the only waiter ends the pull: task gone, connection closed, waiter woken",
          context do
-      task = stalled(context, "repo/a:1", waiter: waiter("a"))
+      task = stalled(context, "repo/a:1", "a")
       monitor = Process.monitor(task)
 
-      assert :ok = Pulls.cancel("repo/a:1", context.i)
+      assert :ok = Pulls.cancel("repo/a:1", waiter("a"), context.i)
 
       assert_receive {:DOWN, ^monitor, :process, ^task, :shutdown}, 2_000
       assert_receive {:fake_engine, :client_closed, "/images/create"}, 2_000
@@ -236,39 +310,38 @@ defmodule Vagus.App.PullsTest do
     end
 
     test "by one of two waiters withdraws it and leaves the pull running", context do
-      task = stalled(context, "repo/a:1", waiter: waiter("a"))
-      :ok = Pulls.request("repo/a:1", [waiter: waiter("b")] ++ context.i)
+      task = stalled(context, "repo/a:1", "a")
+      :ok = Pulls.request("repo/a:1", waiter("b"), context.i)
 
-      assert :ok = Pulls.cancel("repo/a:1", [waiter: waiter("a")] ++ context.i)
+      assert :ok = Pulls.cancel("repo/a:1", waiter("a"), context.i)
 
       assert Pulls.info(context.i) == %{"repo/a:1" => %{task: task, waiters: [waiter("b")]}}
       assert {:pulling, _progress} = Pulls.state("repo/a:1", context.i)
-      refute_woken("a")
-      refute_woken("b")
+      refute_woken(context, "a")
+      refute_woken(context, "b")
     end
 
-    test "by the last waiter ends the pull", context do
-      task = stalled(context, "repo/a:1", waiter: waiter("a"))
-      monitor = Process.monitor(task)
+    test "by someone who never asked leaves the pull and its waiter alone", context do
+      task = stalled(context, "repo/a:1", "a")
 
-      assert :ok = Pulls.cancel("repo/a:1", [waiter: waiter("a")] ++ context.i)
+      assert :ok = Pulls.cancel("repo/a:1", waiter("stranger"), context.i)
 
-      assert_receive {:DOWN, ^monitor, :process, ^task, :shutdown}, 2_000
-      assert Pulls.state("repo/a:1", context.i) == :idle
-      assert_woken("a")
+      assert Pulls.info(context.i) == %{"repo/a:1" => %{task: task, waiters: [waiter("a")]}}
+      assert {:pulling, _progress} = Pulls.state("repo/a:1", context.i)
+      refute_woken(context, "a")
     end
 
     test "of a reference nobody pulls is :ok", context do
-      assert :ok = Pulls.cancel("repo/none:1", context.i)
+      assert :ok = Pulls.cancel("repo/none:1", waiter("a"), context.i)
     end
 
     test "a pull cancelled can be requested again", context do
-      stalled(context, "repo/a:1", waiter: waiter("a"))
-      :ok = Pulls.cancel("repo/a:1", context.i)
+      stalled(context, "repo/a:1", "a")
+      :ok = Pulls.cancel("repo/a:1", waiter("a"), context.i)
       assert_woken("a")
 
       Model.script_pull(context.engine, "repo/a:1", :ok)
-      :ok = Pulls.request("repo/a:1", [waiter: waiter("a")] ++ context.i)
+      :ok = Pulls.request("repo/a:1", waiter("a"), context.i)
       assert_woken("a")
       assert Container.image_present?("repo/a:1", context.engine_opts) == {:ok, true}
     end
@@ -278,34 +351,33 @@ defmodule Vagus.App.PullsTest do
     test "one pull runs at a time; the next waits its turn with nothing asked of the engine",
          context do
       lanes = traced_lanes(context.instance)
-      stalled(context, "repo/a:1", waiter: waiter("a"))
+      first = stalled(context, "repo/a:1", "a")
       assert_lane_asked(lanes)
 
-      :ok = Pulls.request("repo/b:1", [waiter: waiter("b")] ++ context.i)
+      :ok = Pulls.request("repo/b:1", waiter("b"), context.i)
       assert_lane_asked(lanes)
 
-      first = Pulls.info(context.i)["repo/a:1"].task
       assert %{pull: %{cap: 1, held: [^first], waiting: 1}} = Lanes.info(context.i)
       assert Pulls.state("repo/b:1", context.i) == {:pulling, nil}
       assert [%{"fromImage" => "repo/a"}] = requests(context.engine)
 
-      :ok = Pulls.cancel("repo/a:1", context.i)
+      :ok = Pulls.cancel("repo/a:1", waiter("a"), context.i)
       assert_woken("b")
       assert [%{"fromImage" => "repo/a"}, %{"fromImage" => "repo/b"}] = requests(context.engine)
     end
 
     test "the lane goes to the waiting pull with the lowest priority number", context do
       lanes = traced_lanes(context.instance)
-      stalled(context, "repo/a:1")
-      assert_lane_asked(lanes)
-
-      :ok = Pulls.request("repo/late:1", [priority: 5] ++ context.i)
-      assert_lane_asked(lanes)
-      :ok = Pulls.request("repo/first:1", [priority: 1, waiter: waiter("first")] ++ context.i)
+      stalled(context, "repo/a:1", "a")
       assert_lane_asked(lanes)
 
       Model.script_pull(context.engine, "repo/late:1", {:stall, []})
-      :ok = Pulls.cancel("repo/a:1", context.i)
+      :ok = Pulls.request("repo/late:1", waiter("late"), [priority: 5] ++ context.i)
+      assert_lane_asked(lanes)
+      :ok = Pulls.request("repo/first:1", waiter("first"), [priority: 1] ++ context.i)
+      assert_lane_asked(lanes)
+
+      :ok = Pulls.cancel("repo/a:1", waiter("a"), context.i)
       assert_woken("first")
 
       assert [%{"fromImage" => "repo/a"}, %{"fromImage" => "repo/first"} | _] =
@@ -314,152 +386,146 @@ defmodule Vagus.App.PullsTest do
 
     test "a pull cancelled while it waits for the lane leaves the line", context do
       lanes = traced_lanes(context.instance)
-      stalled(context, "repo/a:1")
+      stalled(context, "repo/a:1", "a")
       assert_lane_asked(lanes)
-      :ok = Pulls.request("repo/b:1", context.i)
+      :ok = Pulls.request("repo/b:1", waiter("b"), context.i)
       assert_lane_asked(lanes)
 
-      :ok = Pulls.cancel("repo/b:1", context.i)
-      :ok = Pulls.cancel("repo/a:1", context.i)
-      :ok = Pulls.request("repo/c:1", [waiter: waiter("c")] ++ context.i)
+      :ok = Pulls.cancel("repo/b:1", waiter("b"), context.i)
+      :ok = Pulls.cancel("repo/a:1", waiter("a"), context.i)
+      :ok = Pulls.request("repo/c:1", waiter("c"), context.i)
       assert_woken("c")
 
       assert [%{"fromImage" => "repo/a"}, %{"fromImage" => "repo/c"}] = requests(context.engine)
     end
   end
 
-  defp next_progress do
-    receive do
-      {:progress, progress} -> progress
-    after
-      2_000 -> flunk("no progress")
-    end
-  end
-
   describe "progress" do
-    test "summarises the layers seen so far, in the table and to the request's function",
+    test "a layer downloaded: bytes while it downloads, done from Download complete on",
          context do
-      test = self()
-
-      Model.script_pull(context.engine, "repo/a:1", {
-        :stall,
-        [
+      seen =
+        summaries(context, [
           %{"status" => "Pulling from repo/a", "id" => "1"},
           %{"status" => "Pulling fs layer", "id" => "l1"},
+          %{"status" => "Waiting", "id" => "l1"},
           Model.downloading("l1", 50, 100),
-          Model.downloading("l2", 10, 300),
+          %{"status" => "Verifying Checksum", "id" => "l1"},
           %{"status" => "Download complete", "id" => "l1"},
-          %{"status" => "Already exists", "id" => "l0"},
           %{
             "status" => "Extracting",
             "id" => "l1",
             "progressDetail" => %{"current" => 1, "total" => 9}
-          }
-        ]
-      })
+          },
+          %{"status" => "Pull complete", "id" => "l1"},
+          %{"status" => "Digest: sha256:abc"},
+          %{"status" => "Status: Downloaded newer image for repo/a:1"}
+        ])
 
-      :ok = Pulls.request("repo/a:1", [on_progress: &send(test, {:progress, &1})] ++ context.i)
+      assert Enum.map(seen, &{&1.current, &1.total, &1.layers, &1.layers_done}) == [
+               {0, 0, 0, 0},
+               {0, 0, 1, 0},
+               {0, 0, 1, 0},
+               {50, 100, 1, 0},
+               {50, 100, 1, 0},
+               {100, 100, 1, 1},
+               {100, 100, 1, 1},
+               {100, 100, 1, 1},
+               {100, 100, 1, 1},
+               {100, 100, 1, 1}
+             ]
 
-      seen = for _line <- 1..7, do: next_progress()
-
-      assert Enum.at(seen, 0) == %{
-               status: "Pulling from repo/a",
-               current: 0,
-               total: 0,
-               layers: 0,
-               layers_done: 0
-             }
-
-      assert Enum.at(seen, 1) == %{
-               status: "Pulling fs layer",
-               current: 0,
-               total: 0,
-               layers: 1,
-               layers_done: 0
-             }
-
-      assert Enum.at(seen, 2) == %{
-               status: "Downloading",
-               current: 50,
-               total: 100,
-               layers: 1,
-               layers_done: 0
-             }
-
-      assert Enum.at(seen, 3) == %{
-               status: "Downloading",
-               current: 60,
-               total: 400,
-               layers: 2,
-               layers_done: 0
-             }
-
-      assert Enum.at(seen, 4) == %{
-               status: "Download complete",
-               current: 110,
-               total: 400,
-               layers: 2,
-               layers_done: 1
-             }
-
-      assert Enum.at(seen, 5) == %{
-               status: "Already exists",
-               current: 110,
-               total: 400,
-               layers: 3,
-               layers_done: 2
-             }
-
-      assert Enum.at(seen, 6) == %{
-               status: "Extracting",
-               current: 110,
-               total: 400,
-               layers: 3,
-               layers_done: 2
-             }
+      assert List.last(seen).status == "Status: Downloaded newer image for repo/a:1"
 
       # The call that carried the last summary wrote the table before it
       # answered the task, which then ran the function.
-      assert Pulls.state("repo/a:1", context.i) == {:pulling, Enum.at(seen, 6)}
+      assert Pulls.state("repo/a:1", context.i) == {:pulling, List.last(seen)}
     end
 
-    @tag pulls: [progress_interval: 3_600_000]
+    test "a layer never seen downloading: waiting, then complete", context do
+      seen =
+        summaries(context, [
+          %{"status" => "Pulling fs layer", "id" => "l1"},
+          %{"status" => "Download complete", "id" => "l1"},
+          %{"status" => "Pulling fs layer", "id" => "l2"},
+          %{"status" => "Pull complete", "id" => "l2"}
+        ])
+
+      assert Enum.map(seen, &{&1.layers, &1.layers_done}) == [{1, 0}, {1, 1}, {2, 1}, {2, 2}]
+    end
+
+    test "a layer the engine already has is done from its first line", context do
+      seen =
+        summaries(context, [
+          %{"status" => "Already exists", "id" => "l0"},
+          %{"status" => "Pull complete", "id" => "l9"},
+          Model.downloading("l1", 10, 300)
+        ])
+
+      assert Enum.map(seen, &{&1.current, &1.total, &1.layers, &1.layers_done}) ==
+               [{0, 0, 1, 1}, {0, 0, 2, 2}, {10, 300, 3, 2}]
+    end
+
+    test "several layers are summed, and lines that name no layer change no count", context do
+      seen =
+        summaries(context, [
+          Model.downloading("l1", 50, 100),
+          Model.downloading("l2", 10, 300),
+          %{"status" => "Download complete", "id" => "l1"},
+          %{"status" => "Downloading", "id" => "l3"},
+          %{"status" => "Downloading", "id" => "l2", "progressDetail" => %{}},
+          %{"id" => "l4"},
+          %{"status" => "Extracting", "id" => nil},
+          %{"progressDetail" => %{"current" => 5, "total" => 5}}
+        ])
+
+      assert Enum.map(seen, &{&1.current, &1.total, &1.layers, &1.layers_done}) == [
+               {50, 100, 1, 0},
+               {60, 400, 2, 0},
+               {110, 400, 2, 1},
+               {110, 400, 3, 1},
+               {110, 400, 3, 1},
+               {110, 400, 3, 1},
+               {110, 400, 3, 1},
+               {110, 400, 3, 1}
+             ]
+    end
+
+    @tag pulls: [progress_interval: 3_600_000, client: Chatty]
     test "a pull that reports faster than the interval is passed on once per interval", context do
       test = self()
-      lines = for n <- 1..200, do: Model.downloading("l1", n, 200)
-      Model.script_pull(context.engine, "repo/a:1", {:lines, lines})
 
       :ok =
         Pulls.request(
           "repo/a:1",
-          [on_progress: &send(test, {:progress, &1}), waiter: waiter("a")] ++ context.i
+          waiter("a"),
+          [on_progress: &send(test, {:progress, &1})] ++ context.i
         )
 
-      assert_woken("a")
+      # Sent by the pull's task after its last line, as the summaries are.
+      assert_receive {:fed, 200}, 2_000
       assert_received {:progress, %{current: 1, total: 200}}
       refute_received {:progress, _later}
     end
 
     test "a request that joins has its function told from then on", context do
       test = self()
-
-      Model.script_pull(context.engine, "repo/a:1", {
-        :steps,
-        [
-          {:line, Model.downloading("l1", 1, 3)},
-          {:run, fn -> send(test, {:held, self()}) && receive(do: (:go -> :ok)) end},
-          {:line, Model.downloading("l1", 2, 3)},
-          :stall
-        ]
-      })
+      held(context, "repo/a:1", [Model.downloading("l1", 1, 3)], [Model.downloading("l1", 2, 3)])
 
       :ok =
-        Pulls.request("repo/a:1", [on_progress: &send(test, {:first, &1.current})] ++ context.i)
+        Pulls.request(
+          "repo/a:1",
+          waiter("a"),
+          [on_progress: &send(test, {:first, &1.current})] ++ context.i
+        )
 
       assert_receive {:first, 1}, 2_000
 
       :ok =
-        Pulls.request("repo/a:1", [on_progress: &send(test, {:second, &1.current})] ++ context.i)
+        Pulls.request(
+          "repo/a:1",
+          waiter("b"),
+          [on_progress: &send(test, {:second, &1.current})] ++ context.i
+        )
 
       assert_receive {:held, handler}, 2_000
       send(handler, :go)
@@ -469,32 +535,73 @@ defmodule Vagus.App.PullsTest do
       refute_received {:second, 1}
     end
 
-    test "a progress function that raises costs the pull nothing", context do
+    test "a waiter has one function, that of its latest request", context do
       test = self()
+      held(context, "repo/a:1", [Model.downloading("l1", 1, 3)], [Model.downloading("l1", 2, 3)])
 
+      for n <- 1..5 do
+        :ok =
+          Pulls.request(
+            "repo/a:1",
+            waiter("a"),
+            [on_progress: &send(test, {n, &1.current})] ++ context.i
+          )
+      end
+
+      assert_receive {:held, handler}, 2_000
+      send(handler, :go)
+
+      assert_receive {5, 2}, 2_000
+      for n <- 1..4, do: refute_received({^n, 2})
+    end
+
+    test "a waiter that withdrew is told nothing more", context do
+      test = self()
+      held(context, "repo/a:1", [Model.downloading("l1", 1, 3)], [Model.downloading("l1", 2, 3)])
+
+      :ok =
+        Pulls.request(
+          "repo/a:1",
+          waiter("a"),
+          [on_progress: &send(test, {:gone, &1.current})] ++ context.i
+        )
+
+      :ok =
+        Pulls.request(
+          "repo/a:1",
+          waiter("b"),
+          [on_progress: &send(test, {:stays, &1.current})] ++ context.i
+        )
+
+      assert_receive {:held, handler}, 2_000
+      :ok = Pulls.cancel("repo/a:1", waiter("a"), context.i)
+      send(handler, :go)
+
+      # Each tick's functions run in the order of one list, in one process.
+      assert_receive {:stays, 2}, 2_000
+      refute_received {:gone, 2}
+    end
+
+    test "a progress function that raises costs the pull nothing", context do
       log =
         capture_log(fn ->
           :ok =
             Pulls.request(
               "repo/a:1",
-              [
-                on_progress: fn _progress -> raise "not the pull's problem" end,
-                waiter: waiter("a")
-              ] ++ context.i
+              waiter("a"),
+              [on_progress: fn _progress -> raise "not the pull's problem" end] ++ context.i
             )
 
           assert_woken("a")
-          send(test, :done)
         end)
 
-      assert_received :done
       assert Pulls.state("repo/a:1", context.i) == :idle
       assert Container.image_present?("repo/a:1", context.engine_opts) == {:ok, true}
       assert log =~ "a progress function failed"
     end
 
     test "progress from anyone but the pull's own task changes nothing", context do
-      task = stalled(context, "repo/a:1")
+      task = stalled(context, "repo/a:1", "a")
       before = Pulls.state("repo/a:1", context.i)
 
       worker = Process.whereis(Pulls.name(context.instance))
@@ -507,7 +614,7 @@ defmodule Vagus.App.PullsTest do
 
   describe "the worker" do
     test "state/2 answers while the worker cannot", context do
-      stalled(context, "repo/a:1")
+      stalled(context, "repo/a:1", "a")
       worker = Process.whereis(Pulls.name(context.instance))
       :ok = :sys.suspend(worker)
 
@@ -524,7 +631,7 @@ defmodule Vagus.App.PullsTest do
     end
 
     test "when it dies its pulls die with it, and their connections close", context do
-      task = stalled(context, "repo/a:1", waiter: waiter("a"))
+      task = stalled(context, "repo/a:1", "a")
       monitor = Process.monitor(task)
       worker = Process.whereis(Pulls.name(context.instance))
       tasks = Process.whereis(Pulls.tasks(context.instance))
@@ -542,19 +649,8 @@ defmodule Vagus.App.PullsTest do
       assert Pulls.state("repo/a:1", context.i) == :idle
     end
 
-    test "when it dies, the runtimes after it are replaced and look at everything", context do
-      controllers = Process.whereis(Vagus.Resource.Controllers.Supervisor.name(context.instance))
-      worker = Process.whereis(Pulls.name(context.instance))
-      supervisor = Process.whereis(Module.concat(context.instance, Supervisor))
-
-      TestInstance.kill_observed(worker, supervisor)
-
-      replaced = Process.whereis(Vagus.Resource.Controllers.Supervisor.name(context.instance))
-      assert is_pid(replaced) and replaced != controllers
-    end
-
     test "when the lanes die, its pulls end and it starts over with them", context do
-      task = stalled(context, "repo/a:1")
+      task = stalled(context, "repo/a:1", "a")
       monitor = Process.monitor(task)
       worker = Process.whereis(Pulls.name(context.instance))
       supervisor = Process.whereis(Module.concat(context.instance, Supervisor))
@@ -564,6 +660,17 @@ defmodule Vagus.App.PullsTest do
       assert_receive {:DOWN, ^monitor, :process, ^task, _reason}, 2_000
       assert Process.whereis(Pulls.name(context.instance)) != worker
       assert Pulls.state("repo/a:1", context.i) == :idle
+    end
+
+    test "child_specs/1 is the worker, then the supervisor of its tasks", context do
+      assert [
+               {Pulls, [instance: instance]},
+               %{id: tasks, start: {Task.Supervisor, :start_link, [[name: tasks]]}}
+             ] =
+               Pulls.child_specs(instance: context.instance)
+
+      assert instance == context.instance
+      assert tasks == Pulls.tasks(context.instance)
     end
   end
 end

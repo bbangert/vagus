@@ -5,14 +5,14 @@ defmodule Vagus.App.Pulls do
   A pull takes minutes and says nothing for long stretches, so it cannot be
   an action of a controller's pass: the pass would hold its resource's place
   in the runtime for all of it, and a stop arriving meanwhile would wait.
-  Instead a pass asks for the image (`request/2`, which returns at once),
+  Instead a pass asks for the image (`request/3`, which returns at once),
   reads how the pull is doing (`state/2`), and is looked at again when the
   pull ends. A second request for a reference being pulled joins that pull.
 
   This process owns which pulls are in flight, who waits for each, and the
   table `state/2` reads; the pulls themselves run under the task supervisor
-  started after it, each holding the `:pull` lane of `Vagus.Resource.Lanes`
-  for as long as it runs. It does no engine work and runs nobody's code, so
+  started after it (`child_specs/1` is the pair, in that order), each
+  holding the `:pull` lane of `Vagus.Resource.Lanes` for as long as it runs. It does no engine work and runs nobody's code, so
   it answers at once whatever a pull is doing.
 
   ## State
@@ -24,32 +24,36 @@ defmodule Vagus.App.Pulls do
     * `{:pulling, progress}`: in flight, or waiting for the lane with
       `progress` still `nil`.
     * `{:failed, reason, stamp}`: the last pull failed then. It is not
-      retried here; the next `request/2` starts another. `reason` is a
+      retried here; the next `request/3` starts another. `reason` is a
       `t:Vagus.Runtime.Docker.failure/0`, so an engine that was away
       (`{:unreachable, _}`) reads differently from an image that does not
       exist, or `{:crashed, reason}` for a pull that died.
 
   ## Waiters
 
-  A waiter is `{controller, resource name}`: data, so it means the same
-  after either side restarts. When a pull ends, by success, failure or
-  `cancel/2`, each of its waiters gets `Vagus.Resource.Runtime.enqueue/3`.
+  A pull exists for its waiters and for as long as it has one. A waiter is
+  `{controller, resource name}`: data, so it means the same after either
+  side restarts. Every request names its waiter; when the pull ends, by
+  success, failure or its last waiter's `cancel/3`, each waiter gets
+  `Vagus.Resource.Runtime.enqueue/3`.
 
-  `cancel/2` with a waiter withdraws that waiter and ends the pull only when
-  no other is left; without one it ends the pull. Ending it kills the task,
-  which closes its connection, which is what makes the engine stop.
+  `cancel/3` withdraws one waiter. The pull ends when the waiter withdrawn
+  was the last on its list, and a cancel by anyone not on the list changes
+  nothing about it. Ending a pull kills its task, which closes its
+  connection, which is what makes the engine stop.
 
   ## Progress
 
   A pull reports far more often than anyone can use. Its task summarises the
   lines and passes a summary on at most once per `:progress_interval`: to
-  the table, and to each `:on_progress` function given with a request. Those
-  run in the pull's task, between two reads of the stream, and one that is
-  slow slows the pull.
+  the table, and to the `:on_progress` function of each waiter. A waiter has
+  one such function, that of its latest request, and none once it has
+  withdrawn. They run in the pull's task, between two reads of the stream,
+  and one that is slow slows the pull.
 
   ## When this process is absent
 
-  `state/2` reads `:idle`, and `request/2` and `cancel/2` exit. Its
+  `state/2` reads `:idle`, and `request/3` and `cancel/3` exit. Its
   supervisor restarts everything after it with it: the tasks, so that no
   pull outlives the process that would have reported it, and the runtimes,
   whose resources are the waiters it has forgotten and which look at
@@ -73,7 +77,10 @@ defmodule Vagus.App.Pulls do
 
   @type waiter :: {controller :: module(), Resource.name()}
 
-  @typedoc "`current` and `total` are bytes to download, over the layers announced so far."
+  @typedoc """
+  `current` and `total` are bytes to download, over the layers announced so
+  far; `layers_done` counts those with nothing left to download.
+  """
   @type progress :: %{
           status: String.t() | nil,
           current: non_neg_integer(),
@@ -103,27 +110,47 @@ defmodule Vagus.App.Pulls do
   def table(instance), do: Module.concat(instance, PullStates)
 
   @doc """
-  Has `image` pulled, unless it is being pulled already. Options:
-  `:instance`; `:waiter`; `:platform`; `:priority`, the pull's place among
-  those waiting for the lane; `:on_progress`. Platform and priority are those
-  of the request that started the pull.
+  The worker and the task supervisor its pulls run under, in the order they
+  must start: placed so in a `:rest_for_one` supervisor, the tasks end with
+  the worker. Options are the worker's.
   """
-  @spec request(String.t(), keyword()) :: :ok
-  def request(image, opts \\ []) when is_binary(image) do
+  @spec child_specs(keyword()) :: [Supervisor.child_spec() | {module(), keyword()}]
+  def child_specs(opts \\ []) do
+    [
+      {__MODULE__, opts},
+      # No `:max_children`: one task per image being pulled, and those are
+      # the images of the apps installed.
+      Supervisor.child_spec({Task.Supervisor, name: tasks(instance(opts))},
+        id: tasks(instance(opts))
+      )
+    ]
+  end
+
+  @doc """
+  Has `image` pulled for `waiter`, unless it is being pulled already, in
+  which case `waiter` joins. Options: `:instance`; `:platform`; `:priority`,
+  the pull's place among those waiting for the lane; `:on_progress`, which
+  replaces the function of an earlier request by the same waiter. Platform
+  and priority are those of the request that started the pull.
+  """
+  @spec request(String.t(), waiter(), keyword()) :: :ok
+  def request(image, {controller, _name} = waiter, opts \\ [])
+      when is_binary(image) and is_atom(controller) do
     GenServer.call(
       name(instance(opts)),
-      {:request, image, Keyword.take(opts, [:waiter, :platform, :priority, :on_progress])}
+      {:request, image, waiter, Keyword.take(opts, [:platform, :priority, :on_progress])}
     )
   end
 
   @doc """
-  Withdraws `:waiter` from the pull of `image`, ending the pull if it was the
-  last; with no `:waiter`, ends it. Either way a remembered failure is
-  forgotten. The pull's task is gone when this returns.
+  Withdraws `waiter` from the pull of `image`, ending the pull if it was the
+  last. With no pull in flight, a remembered failure is forgotten. A pull
+  this ends has its task gone when this returns.
   """
-  @spec cancel(String.t(), keyword()) :: :ok
-  def cancel(image, opts \\ []) when is_binary(image),
-    do: GenServer.call(name(instance(opts)), {:cancel, image, opts[:waiter]})
+  @spec cancel(String.t(), waiter(), keyword()) :: :ok
+  def cancel(image, {controller, _name} = waiter, opts \\ [])
+      when is_binary(image) and is_atom(controller),
+      do: GenServer.call(name(instance(opts)), {:cancel, image, waiter})
 
   @spec state(String.t(), keyword()) :: state()
   def state(image, opts \\ []) do
@@ -169,18 +196,14 @@ defmodule Vagus.App.Pulls do
   end
 
   @impl true
-  def handle_call({:request, image, opts}, _from, state) do
+  def handle_call({:request, image, waiter, opts}, _from, state) do
     pull =
       case state.pulls do
         %{^image => pull} -> pull
         _none -> start(state, image, opts)
       end
 
-    pull = %{
-      pull
-      | waiters: Enum.uniq(List.wrap(opts[:waiter]) ++ pull.waiters),
-        callbacks: List.wrap(opts[:on_progress]) ++ pull.callbacks
-    }
+    pull = %{pull | waiters: Map.put(pull.waiters, waiter, opts[:on_progress])}
 
     state = %{
       state
@@ -193,17 +216,16 @@ defmodule Vagus.App.Pulls do
 
   def handle_call({:cancel, image, waiter}, _from, state) do
     case state.pulls do
-      %{^image => pull} ->
-        left = if waiter, do: List.delete(pull.waiters, waiter), else: []
+      %{^image => %{waiters: %{^waiter => _callback} = waiters} = pull}
+      when map_size(waiters) == 1 ->
+        # Synchronous, so the row is not cleared while the pull still runs.
+        _ = Task.Supervisor.terminate_child(state.tasks, pull.task.pid)
+        Process.demonitor(pull.task.ref, [:flush])
+        {:reply, :ok, ended(state, image, pull, :idle)}
 
-        if left != [] do
-          {:reply, :ok, %{state | pulls: Map.put(state.pulls, image, %{pull | waiters: left})}}
-        else
-          # Synchronous, so the row is not cleared while the pull still runs.
-          _ = Task.Supervisor.terminate_child(state.tasks, pull.task.pid)
-          Process.demonitor(pull.task.ref, [:flush])
-          {:reply, :ok, ended(state, image, pull, :idle)}
-        end
+      %{^image => pull} ->
+        pull = %{pull | waiters: Map.delete(pull.waiters, waiter)}
+        {:reply, :ok, %{state | pulls: Map.put(state.pulls, image, pull)}}
 
       _none ->
         :ets.delete(state.table, image)
@@ -215,9 +237,9 @@ defmodule Vagus.App.Pulls do
   # the mailbox still, and the reference may be pulled again since.
   def handle_call({:progress, image, progress}, {pid, _tag}, state) do
     case state.pulls do
-      %{^image => %{task: %Task{pid: ^pid}, callbacks: callbacks}} ->
+      %{^image => %{task: %Task{pid: ^pid}, waiters: waiters}} ->
         :ets.insert(state.table, {image, {:pulling, progress}})
-        {:reply, callbacks, state}
+        {:reply, for({_waiter, callback} <- waiters, callback != nil, do: callback), state}
 
       _another ->
         {:reply, [], state}
@@ -227,7 +249,7 @@ defmodule Vagus.App.Pulls do
   def handle_call(:info, _from, state) do
     info =
       Map.new(state.pulls, fn {image, pull} ->
-        {image, %{task: pull.task.pid, waiters: pull.waiters}}
+        {image, %{task: pull.task.pid, waiters: pull.waiters |> Map.keys() |> Enum.sort()}}
       end)
 
     {:reply, info, state}
@@ -261,7 +283,7 @@ defmodule Vagus.App.Pulls do
 
     :ets.insert(state.table, {image, {:pulling, nil}})
     task = Task.Supervisor.async_nolink(state.tasks, __MODULE__, :pull, [pull])
-    %{task: task, waiters: [], callbacks: []}
+    %{task: task, waiters: %{}}
   end
 
   defp ended(state, ref, outcome) when is_reference(ref) do
@@ -276,7 +298,7 @@ defmodule Vagus.App.Pulls do
       failed -> :ets.insert(state.table, {image, failed})
     end
 
-    for {controller, name} <- pull.waiters,
+    for {{controller, name}, _callback} <- pull.waiters,
         do: Runtime.enqueue(controller, name, instance: state.instance)
 
     %{state | pulls: Map.delete(state.pulls, image), refs: Map.delete(state.refs, pull.task.ref)}
@@ -314,34 +336,40 @@ defmodule Vagus.App.Pulls do
     end
   end
 
-  defp layer(layers, %{"id" => id, "status" => status} = line) do
+  # A layer is `{downloaded, to_download, done?}`. The engine names a layer
+  # in any of these lines first, and skips whichever do not apply: one it
+  # already has is announced as existing and nothing else, a small one may
+  # go from waiting to complete with no `Downloading` between.
+  defp layer(layers, %{"id" => id, "status" => status} = line) when is_binary(id) do
     case {status, line["progressDetail"]} do
-      {"Downloading", %{"current" => current, "total" => total}} ->
-        Map.put(layers, id, {current, total})
-
-      {done, _detail} when done in ["Download complete", "Pull complete", "Already exists"] ->
-        Map.update(layers, id, {0, 0}, fn {_current, total} -> {total, total} end)
-
       # The line that announces the tag carries it as its `id`.
       {"Pulling from " <> _repository, _detail} ->
         layers
 
-      _waiting_or_extracting ->
-        Map.put_new(layers, id, :pending)
+      {"Downloading", %{"current" => current, "total" => total}}
+      when is_integer(current) and is_integer(total) ->
+        Map.put(layers, id, {current, total, false})
+
+      {done, _detail} when done in ["Download complete", "Pull complete", "Already exists"] ->
+        {_current, total, _done?} = Map.get(layers, id, {0, 0, false})
+        Map.put(layers, id, {total, total, true})
+
+      _waiting_verifying_or_extracting ->
+        Map.put_new(layers, id, {0, 0, false})
     end
   end
 
   defp layer(layers, _line), do: layers
 
   defp summary(%{layers: layers, status: status}) do
-    known = for {_id, {current, total}} <- layers, do: {current, total}
+    layers = Map.values(layers)
 
     %{
       status: status,
-      current: known |> Enum.map(&elem(&1, 0)) |> Enum.sum(),
-      total: known |> Enum.map(&elem(&1, 1)) |> Enum.sum(),
-      layers: map_size(layers),
-      layers_done: Enum.count(known, fn {current, total} -> current == total end)
+      current: layers |> Enum.map(&elem(&1, 0)) |> Enum.sum(),
+      total: layers |> Enum.map(&elem(&1, 1)) |> Enum.sum(),
+      layers: length(layers),
+      layers_done: Enum.count(layers, &elem(&1, 2))
     }
   end
 

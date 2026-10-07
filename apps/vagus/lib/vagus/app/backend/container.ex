@@ -43,9 +43,14 @@ defmodule Vagus.App.Backend.Container do
     # The engine ANDs filter keys, and Core's container may carry no label
     # of ours, so only names can be asked for. They are matched again here:
     # an engine that ignores the filter answers with every container.
-    names = ["^app_", "^addon_", "^#{Regex.escape(Vagus.Core.Container.name())}$"]
-
-    case client(opts).list_containers([all: true, filters: %{name: names}] ++ engine(opts)) do
+    #
+    # The engine holds names with a leading slash. moby matches a pattern
+    # against the name without it; the optional slash keeps the anchors true
+    # on an engine that matches against the name as held, where `^app_`
+    # would select nothing and say nothing.
+    case client(opts).list_containers(
+           [all: true, filters: %{name: name_filters()}] ++ engine(opts)
+         ) do
       {:ok, containers} ->
         {:ok,
          for(
@@ -59,10 +64,15 @@ defmodule Vagus.App.Backend.Container do
     end
   end
 
+  @doc false
+  @spec name_filters() :: [String.t()]
+  def name_filters,
+    do: ["^/?app_", "^/?addon_", "^/?#{Regex.escape(Vagus.Core.Container.name())}$"]
+
   @impl true
   def create(name, config, opts \\ []) when is_map(config) do
     case client(opts).create_container(config, [name: name] ++ engine(opts)) do
-      {:ok, id} -> {:ok, id}
+      {:ok, _id} -> :ok
       {:error, {:create_failed, 409, _message}} -> {:error, :already_exists}
       {:error, reason} -> {:error, Docker.failure(reason)}
     end
@@ -105,11 +115,12 @@ defmodule Vagus.App.Backend.Container do
     state = inspect["State"] || %{}
     config = inspect["Config"] || %{}
     health = state["Health"] || %{}
+    state_now = state(state)
 
     %{
       id: id,
-      state: state(state),
-      exit_code: state["ExitCode"],
+      state: state_now,
+      exit_code: exit_code(state_now, state["ExitCode"]),
       started_at: started_at(state["StartedAt"]),
       restart_count: inspect["RestartCount"] || 0,
       health: health(health["Status"]),
@@ -136,6 +147,11 @@ defmodule Vagus.App.Backend.Container do
   defp state(%{"Running" => true}), do: :running
   defp state(%{"Dead" => true}), do: :dead
   defp state(_stopped), do: :exited
+
+  # The engine reports 0 for a container that has not exited: never
+  # started, or started again since.
+  defp exit_code(state, _code) when state in [:created, :running, :paused], do: nil
+  defp exit_code(_state, code), do: code
 
   defp health("starting"), do: :starting
   defp health("healthy"), do: :healthy

@@ -481,6 +481,27 @@ defmodule Vagus.Resource.Toys do
     def act(:try, nil, _context), do: {:error, :never}
   end
 
+  defmodule Stall do
+    @moduledoc """
+    Owns `:stall`. Every pass parks in `observe/2`, having told the test
+    `{:stalled, name, pid}`, and once let go crashes in its action.
+    """
+    @behaviour Vagus.Resource.Controller
+
+    alias Vagus.Resource.Toys
+
+    @impl true
+    def kind, do: :stall
+    @impl true
+    def condition_types, do: [:ready]
+    @impl true
+    def observe(%{name: name}, context), do: Toys.parked(context, {:stalled, name, self()})
+    @impl true
+    def reconcile(_stall, _observed), do: {:no_verdict, [{:action, :fall, nil}]}
+    @impl true
+    def act(:fall, nil, _context), do: raise("as it always does")
+  end
+
   defmodule Wild do
     @moduledoc """
     Owns `:wild`, and misbehaves as its spec says. `"refs"`: `"exit"` exits

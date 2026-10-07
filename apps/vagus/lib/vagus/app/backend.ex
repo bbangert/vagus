@@ -11,6 +11,11 @@ defmodule Vagus.App.Backend do
   exists under the name was not made from its config: `{:error,
   :already_exists}`.
 
+  No action returns an id. What an instance is called by its backend is
+  `observe/2`'s to say, in `id`, and that is the only id a caller may hold
+  or compare: a backend with nothing to make before a start has none until
+  then.
+
   An action does one engine call's worth of work. Pulling an image is not
   one of them: it takes minutes and belongs to `Vagus.App.Pulls`.
 
@@ -41,8 +46,10 @@ defmodule Vagus.App.Backend do
   @typedoc """
   One instance as it is now.
 
-    * `id` changes whenever the instance is made anew.
-    * `exit_code` is the last exit's, and only until the next start.
+    * `id` changes whenever the instance is made anew, and is the same for
+      as long as it is the same instance.
+    * `exit_code` is the last exit's: `nil` before the first start and
+      while the instance runs.
     * `started_at` is the engine's own text, on the engine's clock: compare
       it for equality only. `nil` before the first start.
     * `restart_count` counts restarts by the engine's restart policy alone.
@@ -77,7 +84,7 @@ defmodule Vagus.App.Backend do
 
   @doc "Makes the instance from `config`, the backend's own description of it, without starting it."
   @callback create(name(), config :: map(), keyword()) ::
-              {:ok, id :: String.t()} | {:error, :already_exists} | error()
+              :ok | {:error, :already_exists} | error()
 
   @callback start(name(), keyword()) :: :ok | error()
 

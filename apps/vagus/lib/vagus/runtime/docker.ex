@@ -333,7 +333,8 @@ defmodule Vagus.Runtime.Docker do
   `opts[:filters]` narrows the listing in the engine: `%{label: [...], name:
   [...]}`. Keys are ANDed and the values of one key ORed. A label is `"key"`
   or `"key=value"`. A name is a regular expression matched anywhere in the
-  name, so a prefix is `"^app_"`.
+  name. The engine lists names with a leading `/` and moby matches without
+  it; a pattern that must hold on a fork as well allows for both: `"^/?app_"`.
   """
   @spec list_containers(keyword()) :: {:ok, [map()]} | {:error, term()}
   def list_containers(opts \\ []) do
@@ -369,7 +370,9 @@ defmodule Vagus.Runtime.Docker do
   def failure(%Mint.HTTPError{reason: reason}), do: {:transport, reason}
   def failure({:http, status}) when is_integer(status), do: {:status, status, nil}
   def failure({:http, status, message}), do: {:status, status, message}
-  def failure({:pull_failed, {status, body}}), do: {:status, status, message(body)}
+  def failure({:pull_failed, {status, %{"message" => text}}}), do: {:status, status, text}
+  def failure({:pull_failed, {status, text}}) when is_binary(text), do: {:status, status, text}
+  def failure({:pull_failed, {status, body}}), do: {:status, status, inspect(body)}
   def failure({:pull_failed, message}) when is_binary(message), do: {:stream, message}
   def failure({:invalid_ref, _ref} = reason), do: {:invalid, reason}
 
@@ -702,7 +705,18 @@ defmodule Vagus.Runtime.Docker do
     if left < idle, do: {left, :total}, else: {idle, :idle}
   end
 
+  # Asked before every receive: a stream that always has something buffered
+  # never waits, so a timeout on the receive alone would never end it.
   defp pull_recv(conn, ref, pull) do
+    if expired?(pull.deadline),
+      do: {:error, {:pull_timeout, :total}},
+      else: pull_recv_within(conn, ref, pull)
+  end
+
+  defp expired?(:infinity), do: false
+  defp expired?(deadline), do: System.monotonic_time(:millisecond) >= deadline
+
+  defp pull_recv_within(conn, ref, pull) do
     {wait, which} = pull_wait(pull)
 
     case Mint.HTTP.recv(conn, 0, wait) do
@@ -715,8 +729,13 @@ defmodule Vagus.Runtime.Docker do
       {:error, _conn, %Mint.TransportError{reason: :timeout}, _responses} ->
         {:error, {:pull_timeout, which}}
 
-      {:error, _conn, reason, _responses} ->
-        {:error, reason}
+      # What arrived with the failure is read first: an engine that reports
+      # an error and then drops the connection has said more than "closed".
+      {:error, _conn, reason, responses} ->
+        case pull_responses(responses, ref, pull) do
+          {:halt, result} -> result
+          {:cont, _pull} -> {:error, reason}
+        end
     end
   end
 
@@ -880,12 +899,22 @@ defmodule Vagus.Runtime.Docker do
   # The tag is the part after the last ":" that follows the last "/", so a
   # registry `host:port` before the path isn't mistaken for a tag
   # (e.g. `ghcr.io:443/org/img:1.0` → repo `ghcr.io:443/org/img`, tag `1.0`).
+  #
+  # A digest goes where the tag goes: the engine's `tag` parameter takes
+  # either, and a reference carrying both is pulled by its digest.
   defp split_image(image) do
-    last_segment = image |> String.split("/") |> List.last()
+    case String.split(image, "@", parts: 2) do
+      [name, digest] -> {elem(split_tag(name), 0), digest}
+      [name] -> split_tag(name)
+    end
+  end
+
+  defp split_tag(name) do
+    last_segment = name |> String.split("/") |> List.last()
 
     case String.split(last_segment, ":", parts: 2) do
-      [_name, tag] -> {String.replace_suffix(image, ":" <> tag, ""), tag}
-      [_name] -> {image, "latest"}
+      [_name, tag] -> {String.replace_suffix(name, ":" <> tag, ""), tag}
+      [_name] -> {name, "latest"}
     end
   end
 

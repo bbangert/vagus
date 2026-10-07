@@ -41,7 +41,7 @@ defmodule Vagus.App.Backend.ContainerTest do
         Model.put_container(engine, "app_a",
           image: "repo/a:1",
           labels: %{"supervisor_managed" => "", "io.vagus.spec" => "f00"},
-          env: ["SUPERVISOR_TOKEN=secret", "TZ=UTC", "EMPTY=", "A=b=c"],
+          env: ["SUPERVISOR_TOKEN=secret", "TZ=UTC", "EMPTY=", "A=b=c", "FLAG"],
           ip: "172.30.33.7"
         )
 
@@ -50,7 +50,7 @@ defmodule Vagus.App.Backend.ContainerTest do
       assert instance == %{
                id: id,
                state: :running,
-               exit_code: 0,
+               exit_code: nil,
                started_at: Model.container(engine, "app_a").started_at,
                restart_count: 0,
                health: :none,
@@ -58,7 +58,13 @@ defmodule Vagus.App.Backend.ContainerTest do
                image: "repo/a:1",
                image_id: "sha256:repo/a:1",
                labels: %{"supervisor_managed" => "", "io.vagus.spec" => "f00"},
-               env: %{"SUPERVISOR_TOKEN" => "secret", "TZ" => "UTC", "EMPTY" => "", "A" => "b=c"},
+               env: %{
+                 "SUPERVISOR_TOKEN" => "secret",
+                 "TZ" => "UTC",
+                 "EMPTY" => "",
+                 "A" => "b=c",
+                 "FLAG" => ""
+               },
                address: "172.30.33.7"
              }
     end
@@ -66,7 +72,7 @@ defmodule Vagus.App.Backend.ContainerTest do
     test "a created container has never started and has no address", %{engine: engine, opts: opts} do
       Model.put_container(engine, "app_a", state: "created")
 
-      assert {:ok, %{state: :created, started_at: nil, address: nil}} =
+      assert {:ok, %{state: :created, started_at: nil, address: nil, exit_code: nil}} =
                Container.observe("app_a", opts)
     end
 
@@ -107,6 +113,19 @@ defmodule Vagus.App.Backend.ContainerTest do
       end
     end
 
+    test "the last exit's code is kept while the engine waits to restart it", %{
+      engine: engine,
+      opts: opts
+    } do
+      Model.put_container(engine, "app_a", state: "restarting", exit_code: 3)
+      assert {:ok, %{state: :restarting, exit_code: 3}} = Container.observe("app_a", opts)
+    end
+
+    test "a paused container has not exited", %{engine: engine, opts: opts} do
+      Model.put_container(engine, "app_a", state: "paused", exit_code: 0)
+      assert {:ok, %{state: :paused, exit_code: nil}} = Container.observe("app_a", opts)
+    end
+
     test "a restart by the engine's policy shows as a higher count and a new start time", %{
       engine: engine,
       opts: opts
@@ -121,6 +140,7 @@ defmodule Vagus.App.Backend.ContainerTest do
       assert later.started_at != before.started_at
       assert later.id == before.id
       assert later.state == :running
+      assert later.exit_code == nil
     end
 
     test "a crash with no restart policy leaves it exited, count unchanged", %{
@@ -135,7 +155,7 @@ defmodule Vagus.App.Backend.ContainerTest do
     end
 
     test "no engine at the socket is unavailable, never absent" do
-      missing = "/tmp/vagus-none-#{System.unique_integer([:positive])}.sock"
+      missing = FakeEngine.socket_path()
 
       assert Container.observe("app_a", engine: [socket: missing]) ==
                {:unavailable, :engine_unavailable}
@@ -193,6 +213,18 @@ defmodule Vagus.App.Backend.ContainerTest do
       assert %{address: "10.0.0.2"} = Container.project(inspect)
     end
 
+    test "of two networks that are not the app's, the first by name" do
+      networks = %{
+        "zeta" => %{"IPAddress" => "10.9.0.2"},
+        "alpha" => %{"IPAddress" => "10.1.0.2"}
+      }
+
+      inspect =
+        inspect_map(%{"Status" => "running"}, %{"NetworkSettings" => %{"Networks" => networks}})
+
+      assert %{address: "10.1.0.2"} = Container.project(inspect)
+    end
+
     test "the host network gives no address" do
       networks = %{"host" => %{"IPAddress" => ""}}
 
@@ -229,7 +261,7 @@ defmodule Vagus.App.Backend.ContainerTest do
     end
 
     test "no engine is unavailable, not false" do
-      missing = "/tmp/vagus-none-#{System.unique_integer([:positive])}.sock"
+      missing = FakeEngine.socket_path()
 
       assert Container.image_present?("a:1", engine: [socket: missing]) ==
                {:unavailable, :engine_unavailable}
@@ -252,7 +284,36 @@ defmodule Vagus.App.Backend.ContainerTest do
       assert [%{path: "/containers/json", query: %{"all" => "true", "filters" => filters}}] =
                FakeEngine.requests(engine)
 
-      assert Jason.decode!(filters) == %{"name" => ["^app_", "^addon_", "^homeassistant$"]}
+      assert Jason.decode!(filters) == %{"name" => Container.name_filters()}
+      assert Container.name_filters() == ["^/?app_", "^/?addon_", "^/?homeassistant$"]
+    end
+
+    for {how, slashed?} <- [{"the bare name", false}, {"the name with its slash", true}] do
+      test "the name patterns select ours on an engine that matches #{how}" do
+        engine = FakeEngine.start_model(slashed_names: unquote(slashed?))
+        on_exit(fn -> FakeEngine.stop(engine) end)
+
+        for name <- ~w(app_a addon_b homeassistant my_app_x application homeassistant2 bystander),
+            do: Model.put_container(engine, name)
+
+        # The engine's own answer, before anything is filtered here.
+        {:ok, listed} =
+          Vagus.Runtime.Docker.list_containers(
+            all: true,
+            filters: %{name: Container.name_filters()},
+            socket: engine.socket
+          )
+
+        assert listed |> Enum.flat_map(& &1["Names"]) |> Enum.sort() ==
+                 ["/addon_b", "/app_a", "/homeassistant"]
+      end
+    end
+
+    test "an engine that fails to list is an error, not an empty list" do
+      engine = FakeEngine.start([{500, %{"message" => "boom"}}])
+      on_exit(fn -> FakeEngine.stop(engine) end)
+
+      assert Container.list(engine: [socket: engine.socket]) == {:error, {:status, 500, "boom"}}
     end
 
     test "an engine that ignores the filter is filtered here" do
@@ -270,7 +331,7 @@ defmodule Vagus.App.Backend.ContainerTest do
     end
 
     test "no engine is unavailable, not an empty list" do
-      missing = "/tmp/vagus-none-#{System.unique_integer([:positive])}.sock"
+      missing = FakeEngine.socket_path()
       assert Container.list(engine: [socket: missing]) == {:unavailable, :engine_unavailable}
     end
   end
@@ -292,9 +353,9 @@ defmodule Vagus.App.Backend.ContainerTest do
         "HostConfig" => %{"RestartPolicy" => %{"Name" => "unless-stopped"}}
       }
 
-      assert {:ok, id} = Container.create("app_a", config, opts)
+      assert Container.create("app_a", config, opts) == :ok
 
-      assert {:ok, %{id: ^id, state: :created, env: %{"SUPERVISOR_TOKEN" => "t"}}} =
+      assert {:ok, %{state: :created, env: %{"SUPERVISOR_TOKEN" => "t"}}} =
                Container.observe("app_a", opts)
 
       assert [
@@ -327,7 +388,7 @@ defmodule Vagus.App.Backend.ContainerTest do
     end
 
     test "is one engine call", %{engine: engine, opts: opts} do
-      {:ok, _id} = Container.create("app_a", %{"Image" => "repo/a:1"}, opts)
+      :ok = Container.create("app_a", %{"Image" => "repo/a:1"}, opts)
       assert paths(engine) == [{:post, "/containers/create"}]
     end
   end
@@ -365,7 +426,7 @@ defmodule Vagus.App.Backend.ContainerTest do
     end
 
     test "no engine is an error that says so" do
-      missing = "/tmp/vagus-none-#{System.unique_integer([:positive])}.sock"
+      missing = FakeEngine.socket_path()
 
       assert Container.start("app_a", engine: [socket: missing]) ==
                {:error, {:unreachable, :enoent}}
@@ -446,6 +507,46 @@ defmodule Vagus.App.Backend.ContainerTest do
     end
   end
 
+  describe "an engine that refuses" do
+    defp refusing(status, message) do
+      engine = FakeEngine.start([{status, %{"message" => message}}])
+      on_exit(fn -> FakeEngine.stop(engine) end)
+      [engine: [socket: engine.socket]]
+    end
+
+    for {status, message} <- [{500, "boom"}, {409, "busy with it"}] do
+      @refusal {:error, {:status, status, message}}
+
+      test "create answered #{status} is that status, unless it is the name that is taken" do
+        opts = refusing(unquote(status), unquote(message))
+        expected = if unquote(status) == 409, do: {:error, :already_exists}, else: @refusal
+        assert Container.create("app_a", %{"Image" => "a:1"}, opts) == expected
+      end
+
+      test "start answered #{status} is that status and the engine's message" do
+        assert Container.start("app_a", refusing(unquote(status), unquote(message))) == @refusal
+      end
+
+      test "stop answered #{status} is that status and the engine's message" do
+        assert Container.stop("app_a", 1, refusing(unquote(status), unquote(message))) == @refusal
+      end
+
+      test "remove answered #{status} is that status and the engine's message" do
+        assert Container.remove("app_a", refusing(unquote(status), unquote(message))) == @refusal
+      end
+
+      test "remove_image answered #{status} is that status and the engine's message" do
+        opts = refusing(unquote(status), unquote(message))
+        assert Container.remove_image("a:1", opts) == @refusal
+      end
+
+      test "image_present? answered #{status} is an error, not false" do
+        opts = refusing(unquote(status), unquote(message))
+        assert Container.image_present?("a:1", opts) == @refusal
+      end
+    end
+  end
+
   test "every action runs in the engine lane" do
     for action <- [:create, :start, :stop, :remove, :remove_image],
         do: assert(Container.lane(action) == :engine)
@@ -475,11 +576,17 @@ defmodule Vagus.App.Backend.ContainerSlowStopTest do
     engine = FakeEngine.start_model(stop_delay: 400)
     on_exit(fn -> FakeEngine.stop(engine) end)
     Model.put_container(engine, "homeassistant")
-    %{opts: [engine: [socket: engine.socket]]}
+    %{engine: engine, opts: [engine: [socket: engine.socket]]}
   end
 
-  test "a grace outlasts the client's default receive timeout", %{opts: opts} do
-    assert Container.stop("homeassistant", 240, opts) == :ok
+  # The answer comes 400 ms in, eight times the default wait. A grace of
+  # zero adds nothing, so what outwaits it is the margin alone.
+  test "a stop outwaits its grace by a margin, past the default receive timeout", %{
+    engine: engine,
+    opts: opts
+  } do
+    assert Container.stop("homeassistant", 0, opts) == :ok
+    assert %{state: "exited"} = Model.container(engine, "homeassistant")
   end
 
   test "without a grace the default applies, and the call gives up as a timeout", %{opts: opts} do

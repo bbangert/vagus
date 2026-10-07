@@ -43,18 +43,16 @@ defmodule Vagus.Runtime.Events do
 
   ## What a drop loses
 
-  A reconnect asks for the events `since` the newest one it had seen, and
-  the daemon replays what it still holds. It holds the last 256 events of
-  every type, in memory, and says nothing when the ones asked for are gone,
-  so the replay narrows the gap and cannot close it. Subscribers are
-  therefore sent `{:docker_events, :gap}` each time a stream is established,
-  ahead of anything it carries, and one that subscribes to a stream already
-  established is sent it at once: from then on it sees events, and what
-  happened before it has to be found by looking.
+  Whatever happened while no stream was up is not seen, and nothing says how
+  much that was. Subscribers are therefore sent `{:docker_events, :gap}` each
+  time a stream is established, ahead of anything it carries, and one that
+  subscribes to a stream already established is sent it at once: from then
+  on it sees events, and what happened before has to be found by looking.
 
-  The replay starts at the newest event seen, inclusive, so that event comes
-  again. It is recognised and dropped here: a subscriber that counts events
-  (crashes within a window) must not be handed the same crash twice.
+  The daemon could replay part of what was missed (`since`), and it is not
+  asked to: a subscriber that acts on each event would judge an old one
+  against the state it finds on receipt, a crash long since handled counted
+  as a fresh one.
 
   ## Bounded memory
 
@@ -152,10 +150,6 @@ defmodule Vagus.Runtime.Events do
       stable_after: Keyword.get(opts, :stable_after, @stable_ms),
       # True between a 200 and the drop of that stream.
       streaming?: false,
-      # The newest `timeNano` seen on any stream, and the events seen with
-      # exactly that time: what a replay `since` it will send again.
-      last_nano: nil,
-      seen_at_last: MapSet.new(),
       # The pending :connect retry timer, if any — kept so a second drop can
       # never arm a second retry loop beside it.
       reconnect_timer: nil
@@ -247,7 +241,7 @@ defmodule Vagus.Runtime.Events do
   defp do_connect(state) do
     filters = URI.encode_www_form(Jason.encode!(%{"type" => ["container"]}))
 
-    path = "/events?filters=" <> filters <> since(state.last_nano)
+    path = "/events?filters=" <> filters
 
     case Mint.HTTP.connect(:http, {:local, state.socket}, 0, hostname: "localhost", mode: :active) do
       {:ok, conn} ->
@@ -263,16 +257,6 @@ defmodule Vagus.Runtime.Events do
       {:error, reason} ->
         schedule_reconnect({:connect, reason}, state)
     end
-  end
-
-  # Nothing before the first event: there is nothing to resume from, and
-  # without `since` the daemon replays nothing. Seconds with a nine-digit
-  # fraction is the form the daemon parses to the nanosecond.
-  defp since(nil), do: ""
-
-  defp since(nano) do
-    fraction = nano |> rem(1_000_000_000) |> Integer.to_string() |> String.pad_leading(9, "0")
-    "&since=#{div(nano, 1_000_000_000)}.#{fraction}"
   end
 
   # Logs the drop exactly once (warning) and arms the retry timer; the retry
@@ -318,9 +302,16 @@ defmodule Vagus.Runtime.Events do
     Logger.debug("Vagus.Runtime.Events: connected")
     Process.send_after(self(), {:stable, ref}, state.stable_after)
     # Before any event of this stream: the same sender to the same receiver,
-    # so a subscriber reads the notice first and the replay after it.
+    # so a subscriber reads the notice first.
     for {pid, _monitor} <- state.subscribers, do: send(pid, {:docker_events, :gap})
     %{state | streaming?: true}
+  end
+
+  # A refusal is not a stream. Its body is the daemon's error text, not an
+  # event, so the request is given up here and what follows of it ignored.
+  defp handle_response({:status, ref, status}, %{request_ref: ref} = state) do
+    if state.conn, do: Mint.HTTP.close(state.conn)
+    schedule_reconnect({:status, status}, %{state | conn: nil, request_ref: nil})
   end
 
   defp handle_response({:data, ref, data}, state) do
@@ -381,14 +372,8 @@ defmodule Vagus.Runtime.Events do
   defp handle_line(line, state) do
     case Jason.decode(line) do
       {:ok, %{} = event} ->
-        case fresh(event, state) do
-          {:fresh, state} ->
-            dispatch(event, state)
-            state
-
-          :replayed ->
-            state
-        end
+        dispatch(event, state)
+        state
 
       _not_an_event ->
         Logger.debug("Vagus.Runtime.Events: malformed event line skipped")
@@ -396,30 +381,9 @@ defmodule Vagus.Runtime.Events do
     end
   end
 
-  # Every event moves the resume point, whether or not it is one of ours:
-  # the daemon's replay is by time, not by container.
-  defp fresh(event, %{last_nano: last} = state) do
-    key = {get_in(event, ["Actor", "ID"]), Map.get(event, "Action")}
-
-    case Map.get(event, "timeNano") do
-      nano when is_integer(nano) and (last == nil or nano > last) ->
-        {:fresh, %{state | last_nano: nano, seen_at_last: MapSet.new([key])}}
-
-      ^last when is_integer(last) ->
-        if MapSet.member?(state.seen_at_last, key),
-          do: :replayed,
-          else: {:fresh, %{state | seen_at_last: MapSet.put(state.seen_at_last, key)}}
-
-      # Older than the newest seen (the daemon stamps an event before it
-      # queues it, so two can swap), or carrying no time at all.
-      _older_or_untimed ->
-        {:fresh, state}
-    end
-  end
-
   defp dispatch(event, state) do
-    actor = Map.get(event, "Actor") || %{}
-    attributes = Map.get(actor, "Attributes") || %{}
+    actor = map(Map.get(event, "Actor"))
+    attributes = map(Map.get(actor, "Attributes"))
     name = Map.get(attributes, "name")
 
     # Core-name pass-through: the adopted Core container has no Vagus label
@@ -438,6 +402,9 @@ defmodule Vagus.Runtime.Events do
       Enum.each(state.subscribers, fn {pid, _ref} -> send(pid, {:docker_event, payload}) end)
     end
   end
+
+  defp map(%{} = map), do: map
+  defp map(_absent_or_malformed), do: %{}
 
   defp parse_exit_code(nil), do: nil
   defp parse_exit_code(code) when is_integer(code), do: code
