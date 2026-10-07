@@ -153,22 +153,22 @@ defmodule Vagus.Runtime.EngineLiveTest do
       assert %{state: "created", status: "Created"} = Docker.summary(stopped)
     end
 
-    test "the patterns for our names select an app's container and none that only looks like one" do
+    test "Container.list/1 is ours by name or by label, and none that only looks like ours" do
       app = container(unique("app"), ["sleep", "300"])
+
+      labelled =
+        container(unique("custom"), ["sleep", "300"], %{
+          "Labels" => %{"supervisor_managed" => ""}
+        })
 
       near =
         for prefix <- ["my_app", "application", "homeassistant2", "addons"],
             do: container(unique(prefix), ["sleep", "300"])
 
-      # What the engine itself answers to the patterns, before any check here.
-      {:ok, raw} = Docker.list_containers(all: true, filters: %{name: Container.name_filters()})
-      engine_names = Enum.flat_map(raw, &Docker.summary(&1).names)
-      assert app in engine_names
-      assert near -- engine_names == near
-
       {:ok, listed} = Container.list()
       names = Enum.flat_map(listed, & &1.names)
       assert app in names
+      assert labelled in names
       assert near -- names == near
     end
   end

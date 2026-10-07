@@ -369,6 +369,13 @@ defmodule Vagus.Runtime.Events do
 
   defp handle_line("", state), do: state
 
+  # The cap is for a line, whether or not its end has come: one that ended
+  # inside a single read was never in the buffer to be measured there.
+  defp handle_line(line, state) when byte_size(line) > @max_buffer_bytes do
+    Logger.warning("Vagus.Runtime.Events: event line over #{@max_buffer_bytes} bytes dropped")
+    state
+  end
+
   defp handle_line(line, state) do
     case Jason.decode(line) do
       {:ok, %{} = event} ->

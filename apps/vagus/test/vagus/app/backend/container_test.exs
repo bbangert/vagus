@@ -273,40 +273,37 @@ defmodule Vagus.App.Backend.ContainerTest do
       Model.put_container(engine, "app_a")
       Model.put_container(engine, "addon_b", state: "exited")
       Model.put_container(engine, "homeassistant", state: "exited")
-      Model.put_container(engine, "bystander")
-      Model.put_container(engine, "my_app_x")
 
       assert {:ok, listed} = Container.list(opts)
 
       assert Enum.sort(Enum.flat_map(listed, & &1.names)) == ["addon_b", "app_a", "homeassistant"]
       assert [%{state: "exited"}] = Enum.filter(listed, &(&1.names == ["addon_b"]))
 
-      assert [%{path: "/containers/json", query: %{"all" => "true", "filters" => filters}}] =
+      # One call, for everything: what is ours is not the engine's to say.
+      assert [%{method: :get, path: "/containers/json", query: query}] =
                FakeEngine.requests(engine)
 
-      assert Jason.decode!(filters) == %{"name" => Container.name_filters()}
-      assert Container.name_filters() == ["^/?app_", "^/?addon_", "^/?homeassistant$"]
+      assert query == %{"all" => "true"}
     end
 
-    for {how, slashed?} <- [{"the bare name", false}, {"the name with its slash", true}] do
-      test "the name patterns select ours on an engine that matches #{how}" do
-        engine = FakeEngine.start_model(slashed_names: unquote(slashed?))
-        on_exit(fn -> FakeEngine.stop(engine) end)
+    test "a container that is ours by its label alone is listed", %{engine: engine, opts: opts} do
+      Model.put_container(engine, "custom",
+        labels: %{"supervisor_managed" => ""},
+        state: "exited"
+      )
 
-        for name <- ~w(app_a addon_b homeassistant my_app_x application homeassistant2 bystander),
-            do: Model.put_container(engine, name)
+      assert {:ok, [%{names: ["custom"], labels: %{"supervisor_managed" => ""}}]} =
+               Container.list(opts)
+    end
 
-        # The engine's own answer, before anything is filtered here.
-        {:ok, listed} =
-          Vagus.Runtime.Docker.list_containers(
-            all: true,
-            filters: %{name: Container.name_filters()},
-            socket: engine.socket
-          )
+    test "a container neither named nor labelled as ours is not listed", %{
+      engine: engine,
+      opts: opts
+    } do
+      for name <- ~w(bystander my_app_x application homeassistant2 addons),
+          do: Model.put_container(engine, name, labels: %{"other" => "label"})
 
-        assert listed |> Enum.flat_map(& &1["Names"]) |> Enum.sort() ==
-                 ["/addon_b", "/app_a", "/homeassistant"]
-      end
+      assert Container.list(opts) == {:ok, []}
     end
 
     test "an engine that fails to list is an error, not an empty list" do

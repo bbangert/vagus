@@ -232,9 +232,12 @@ a call can pass its own (`:recv_timeout`). `stop` needs that: the engine
 answers a stop only when the container has exited, so the call waits the
 grace plus 15 s, and a call that gives up does not stop the stop.
 `Docker.failure/1` puts any error of the client into one shape:
-`{:unreachable, reason}` (nothing at the socket), `{:timeout, which}`,
-`{:status, status, message}` with the engine's own text, `{:stream,
-message}` (a pull that answered 200 and then failed), `{:transport, reason}`.
+`{:unreachable, reason}` (nothing at the socket), `{:timeout, :recv | :idle
+| :total}`, `{:status, status, message}` with the engine's own text or
+`nil`, `{:stream, message}` (a pull that answered 200 and then failed),
+`{:transport, reason}` (the connection broke after the request was sent),
+`{:invalid, term}` (refused before any request) and `{:other, term}` for
+anything else, unchanged.
 
 **Events.** `Vagus.Runtime.Events` holds the engine's event stream and passes
 on the events of our containers: those labelled `supervisor_managed`, named

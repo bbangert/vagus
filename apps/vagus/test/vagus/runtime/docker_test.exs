@@ -508,10 +508,47 @@ defmodule Vagus.Runtime.DockerTest do
                Docker.pull_image("repo/img:1", socket: engine.socket)
     end
 
-    test "a line with no end is refused once it passes a megabyte" do
-      engine = scripted([{:stream, 200, [{:chunk, String.duplicate("x", 1_100_000)}]}])
+    # A progress line of exactly `bytes` bytes, its newline not counted.
+    defp line_of(bytes) do
+      empty = byte_size(Jason.encode!(status("")))
+      Jason.encode!(status(String.duplicate("x", bytes - empty)))
+    end
 
-      assert {:error, {:pull_failed, "progress line over" <> _}} = collect(engine)
+    test "a line that ends is refused over a megabyte like one that does not, before it is decoded" do
+      engine =
+        scripted([
+          {:stream, 200, [{:line, status("first")}, {:chunk, line_of(1_048_577) <> "\n"}]}
+        ])
+
+      test = self()
+
+      assert {:error, {:pull_failed, "progress line over 1048576 bytes"}} =
+               Docker.pull_image_stream(
+                 "repo/img:1",
+                 nil,
+                 fn line, nil -> send(test, {:line, line}) && nil end,
+                 socket: engine.socket
+               )
+
+      assert_received {:line, %{"status" => "first"}}
+      refute_received {:line, _the_long_one}
+    end
+
+    test "a line of exactly a megabyte is read, ended or left unended by the stream's end" do
+      line = line_of(1_048_576)
+      engine = scripted([{:stream, 200, [{:chunk, line <> "\n" <> line}]}])
+
+      assert {:ok, [%{"status" => "x" <> _}, %{"status" => "x" <> _}]} = collect(engine)
+    end
+
+    test "a line with no end is refused once it passes a megabyte, while the stream goes on" do
+      # The engine stays silent afterwards: the refusal cannot be waiting
+      # for the stream to end, and a reader that only kept on buffering
+      # would end in the idle timeout instead.
+      engine = scripted([{:stream, 200, [{:chunk, String.duplicate("x", 1_100_000)}, :stall]}])
+
+      assert {:error, {:pull_failed, "progress line over 1048576 bytes"}} =
+               collect(engine, idle_timeout: 1_000)
     end
   end
 

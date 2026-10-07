@@ -7,10 +7,8 @@ defmodule Vagus.Test.FakeEngine.Model do
 
   What it models, because the code under test depends on it:
 
-    * `GET /containers/json` with `all` and the `label` and `name` filters.
-      A name pattern is matched against the bare name, as moby does, or with
-      `slashed_names: true` against the name as the engine holds it, with
-      its leading slash;
+    * `GET /containers/json` with `all` and the `label` and `name` filters,
+      a name pattern matched against the bare name, as moby does;
     * `GET /events` holds the response open and carries what happens from
       then on. Nothing is replayed;
     * `POST /containers/{name}/stop` answers only after `:stop_delay` ms,
@@ -24,7 +22,7 @@ defmodule Vagus.Test.FakeEngine.Model do
   Time is a counter, so every event and start has a distinct, increasing
   stamp and a run is the same every time.
 
-  Options: `:stop_delay` (default 0), `:slashed_names`, `:notify`, a process
+  Options: `:stop_delay` (default 0), `:notify`, a process
   told `{:fake_engine, :client_closed, path}` when a client closes a stream
   that had stalled.
   """
@@ -110,7 +108,6 @@ defmodule Vagus.Test.FakeEngine.Model do
 
     {:ok,
      %{
-       slashed_names: Keyword.get(opts, :slashed_names, false),
        stop_delay: Keyword.get(opts, :stop_delay, 0),
        containers: %{},
        images: MapSet.new(),
@@ -304,7 +301,7 @@ defmodule Vagus.Test.FakeEngine.Model do
     listed =
       for {_name, container} <- Enum.sort(state.containers),
           all? or container.state == "running",
-          listed?(container, filters, state.slashed_names),
+          listed?(container, filters),
           do: %{
             "Id" => container.id,
             "Names" => ["/" <> container.name],
@@ -554,7 +551,7 @@ defmodule Vagus.Test.FakeEngine.Model do
 
   # Label values are all required; name values are alternatives, each a
   # regular expression matched anywhere in the name.
-  defp listed?(container, filters, slashed?) do
+  defp listed?(container, filters) do
     labels? =
       Enum.all?(filters["label"] || [], fn label ->
         case String.split(label, "=", parts: 2) do
@@ -564,7 +561,7 @@ defmodule Vagus.Test.FakeEngine.Model do
       end)
 
     names = filters["name"] || []
-    name = if slashed?, do: "/" <> container.name, else: container.name
+    name = container.name
     labels? and (names == [] or Enum.any?(names, &Regex.match?(Regex.compile!(&1), name)))
   end
 

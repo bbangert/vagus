@@ -26,8 +26,9 @@ defmodule Vagus.Runtime.Docker do
   # and again while it verifies and registers a large layer; how long those
   # silences last on a board is not measured.
   @pull_idle_timeout 300_000
-  # One progress line is a few hundred bytes. This bounds what a stream with
-  # no newline in it can make the reader hold.
+  # One progress line is a few hundred bytes. No longer line is decoded,
+  # ended or not, so what the reader holds of the stream is at most this
+  # much pending text and one receive, which the socket's buffer bounds.
   @max_pull_line 1_048_576
   @max_error_body 65_536
   # Cap a single response body so a hostile/huge daemon stream can't exhaust a
@@ -753,11 +754,11 @@ defmodule Vagus.Runtime.Docker do
   defp pull_response({:data, ref, chunk}, ref, %{status: 200} = pull) do
     {lines, rest} = split_lines(pull.buffer <> chunk)
 
-    with {:cont, pull} <- pull_lines(lines, pull) do
-      if byte_size(rest) > @max_pull_line,
-        do: {:halt, {:error, {:pull_failed, "progress line over #{@max_pull_line} bytes"}}},
-        else: {:cont, %{pull | buffer: rest}}
-    end
+    # The rest goes through the same check as a line that has ended, so
+    # that one with no end is refused as soon as it is too long.
+    with {:cont, pull} <- pull_lines(lines, pull),
+         :ok <- line_fits(rest),
+         do: {:cont, %{pull | buffer: rest}}
   end
 
   # Not a progress stream but the body of a refusal, which is short; what is
@@ -787,6 +788,17 @@ defmodule Vagus.Runtime.Docker do
   defp pull_lines([], pull), do: {:cont, pull}
 
   defp pull_lines([line | rest], pull) do
+    with :ok <- line_fits(line), do: pull_line(line, rest, pull)
+  end
+
+  # Asked of every line before it is decoded: a decoded term is several
+  # times its text, and a line that ends is no smaller for ending.
+  defp line_fits(line) when byte_size(line) > @max_pull_line,
+    do: {:halt, {:error, {:pull_failed, "progress line over #{@max_pull_line} bytes"}}}
+
+  defp line_fits(_line), do: :ok
+
+  defp pull_line(line, rest, pull) do
     case Jason.decode(line) do
       {:ok, %{"error" => message}} when is_binary(message) ->
         {:halt, {:error, {:pull_failed, message}}}

@@ -616,6 +616,31 @@ defmodule Vagus.Runtime.EventsTest do
       assert_receive {:docker_event, %{action: "die", name: "app_c", time_nano: nil}}, 1_000
     end
 
+    # An event line of exactly `bytes` bytes, its newline not counted.
+    defp padded(id, bytes) do
+      event = fn pad ->
+        Jason.encode!(%{
+          "Action" => "die",
+          "Type" => "container",
+          "Actor" => %{"ID" => id, "Attributes" => %{"name" => "app_" <> id, "pad" => pad}}
+        })
+      end
+
+      event.(String.duplicate("x", bytes - byte_size(event.(""))))
+    end
+
+    @tag :capture_log
+    test "a line over a megabyte is dropped though it ends, and one of exactly that is not", %{
+      sock: sock
+    } do
+      send_chunk(sock, padded("big", 1_048_577) <> "\n")
+      send_chunk(sock, padded("fits", 1_048_576) <> "\n")
+
+      # In the order the worker read them: the first was not passed on.
+      assert_receive {:docker_event, %{name: name}}, 2_000
+      assert name == "app_fits"
+    end
+
     test "an event the engine sends twice is delivered twice", %{sock: sock} do
       send_chunk(sock, timed("die", "a", 5) <> timed("die", "a", 5) <> timed("start", "z", 6))
 

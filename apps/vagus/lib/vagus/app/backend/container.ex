@@ -40,17 +40,11 @@ defmodule Vagus.App.Backend.Container do
   @spec list(keyword()) ::
           {:ok, [Docker.summary()]} | Backend.unavailable() | Backend.error()
   def list(opts \\ []) do
-    # The engine ANDs filter keys, and Core's container may carry no label
-    # of ours, so only names can be asked for. They are matched again here:
-    # an engine that ignores the filter answers with every container.
-    #
-    # The engine holds names with a leading slash. moby matches a pattern
-    # against the name without it; the optional slash keeps the anchors true
-    # on an engine that matches against the name as held, where `^app_`
-    # would select nothing and say nothing.
-    case client(opts).list_containers(
-           [all: true, filters: %{name: name_filters()}] ++ engine(opts)
-         ) do
+    # Everything is asked for and what is ours is decided here, by the one
+    # rule there is. The engine cannot be given that rule: it ANDs filter
+    # keys, and ours is a label or a name. A board runs a few dozen
+    # containers at most, and a listing costs the engine no more unfiltered.
+    case client(opts).list_containers([all: true] ++ engine(opts)) do
       {:ok, containers} ->
         {:ok,
          for(
@@ -63,11 +57,6 @@ defmodule Vagus.App.Backend.Container do
         unobserved(reason, nil)
     end
   end
-
-  @doc false
-  @spec name_filters() :: [String.t()]
-  def name_filters,
-    do: ["^/?app_", "^/?addon_", "^/?#{Regex.escape(Vagus.Core.Container.name())}$"]
 
   @impl true
   def create(name, config, opts \\ []) when is_map(config) do
