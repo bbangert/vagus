@@ -99,6 +99,10 @@ config :vagus, :backends, %{
 config :vagus, :addon_state_path, nil
 config :vagus, :addon_boot_start, false
 
+# The application's resource store stays in memory; tests that cover the
+# file start a private instance with their own path.
+config :vagus, :resources_path, nil
+
 # Per-run tmp dir, set here too because under a MIX_TARGET config/target.exs
 # loads first and would point the suite at the real `/run/vagus`.
 config :vagus, :run_state_dir, Path.join(System.tmp_dir!(), "vagus-run-#{System.pid()}")

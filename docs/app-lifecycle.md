@@ -50,13 +50,40 @@ Core is not a separate mechanism. It is a resource of kind App named
 - One file, `/data/vagus/resources.json`, holds the persisted fields. It is
   rewritten only when one of them changed, so status churn costs no flash
   writes: temp file, fsync, rename, directory fsync.
+- Kinds are static and given to the store when it starts
+  (`Vagus.Resource.Kind`): the validators that admit a spec, and the hooks
+  that carry the kind's own shapes through JSON. Admission is only ever
+  these validators; nothing registers one later. The file is loaded before
+  the store's start returns. A missing file is an empty store; one that
+  cannot be read or parsed, has another version, or holds a kind or atom this
+  build does not know fails the start, because loading it as empty would
+  read as "nothing installed". So a file written by a newer build that added
+  a kind, a finalizer or a writer name does not load on an older one.
+- Nothing is written that would not load back the same: the store reads back
+  what it encoded and refuses the commit if it differs, with or without a
+  file.
+- A write goes to flash, then to ETS, then to subscribers. A reader never
+  acts on desired state a reboot would take back. A flash write that fails
+  before its rename rejects the commit. One that fails after it has an
+  unknown outcome: the store stops instead of answering, and its
+  replacement re-reads the file and announces the difference, as it does
+  after dying between flash and ETS.
+- A write is a call with a 30 s timeout. A write whose call exits, by
+  timeout or because the store died, may have been applied; the caller
+  reads to find out.
 - `managed_fields` gives each spec path one owning writer; a write to a path
   someone else owns is a conflict. An Update claims its app's `version` this
   way, so a user's write to it mid-update is refused instead of raced.
 - `Store.commit(ops)` applies writes to several resources all or none,
   persists once and notifies once.
 - The store keeps one in-memory operation claim per app. A command takes it;
-  a second mutating command on that app fails as busy.
+  a second mutating command on that app fails as busy. The claim ends when
+  its holder releases it or dies, and outlives a store restart.
+- A kind has one owner, the only writer of its `progress` and of status
+  outside conditions. Every writer declares the condition types it owns, and
+  a type has one writer. Registrations are lost when the store restarts;
+  until an owner registers again its status and progress writes are refused,
+  while spec writes are admitted by the kind's validators as always.
 - `Vagus.Resource.Watch` is a duplicate-key `Registry`, so subscriptions
   outlast a store restart. They are by object, kind or owner:
   `{:object, kind, name}`, `{:kind, kind}`, `{:owner, kind, name}`. ETS is
