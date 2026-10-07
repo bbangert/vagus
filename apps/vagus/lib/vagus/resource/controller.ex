@@ -384,10 +384,12 @@ defmodule Vagus.Resource.Controller do
   @doc """
   Whether `term` is an effect the runtime can apply: an action, a timed
   re-queue, or a store op of a known shape. A status write is none: status
-  comes from the verdict alone.
+  comes from the verdict alone. An action's name is an atom other than
+  `nil`, `true` and `false`: the runtime remembers the last one by name,
+  with `nil` for none.
   """
   @spec effect?(term()) :: boolean()
-  def effect?({:action, name, _args}), do: is_atom(name)
+  def effect?({:action, name, _args}), do: is_atom(name) and name not in [nil, true, false]
   def effect?({:requeue_after, ms}), do: is_integer(ms) and ms >= 0
 
   def effect?({op, kind, name, arg, opts}) when op in [:create, :put_progress],

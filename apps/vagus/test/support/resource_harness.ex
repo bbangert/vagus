@@ -493,18 +493,23 @@ defmodule Vagus.Resource.Harness.Faults do
 
   ## Equivalent journals
 
-  The step killed at a boundary repeats nothing: its action had either not
-  begun or had returned, and the pass that follows observes which. But the
-  kill takes the controller's other steps with it wherever they are, and
-  one cut inside `act/3` may have acted without leaving what the next pass
-  observes. Actions being idempotent against observation, that pass does
-  the one action again and nothing else. So per resource of the killed
-  controller, an interrupted journal is equivalent to the undisturbed one
-  when it is that journal with at most one action done twice in a row
-  (`replay?/2`): `a b b c` for `a b c`. A missing action, an action the
-  reference does not have, another order, or any other repeat is a
-  difference. The reference is taken as it is: what it repeats, the
-  interrupted run must repeat.
+  What an interrupted run may do differently depends on whose step it was:
+
+    * The resource whose step was killed at the boundary repeats nothing,
+      whichever boundary it was. After its commit the action had not begun,
+      and is done once by the pass that follows. After its action, `act/3`
+      had returned, and the pass that follows must observe what it did. Its
+      journal is the reference's exactly, and a controller whose is not is
+      not idempotent against observation.
+    * The killed controller's other resources had steps in flight wherever
+      they were, and one cut inside `act/3` may have acted without leaving
+      what the next pass observes. That pass does the one action again and
+      nothing else, so such a journal is the reference's with at most one
+      action done twice in a row (`replay?/2`): `a b b c` for `a b c`.
+
+  A missing action, an action the reference does not have, another order,
+  or any other repeat is a difference. The reference is taken as it is:
+  what it repeats, the interrupted run must repeat.
 
   Every other controller's actions must be exactly the reference's: its
   runtime lost nothing, and what it acts on is what it observes, which a
@@ -539,7 +544,7 @@ defmodule Vagus.Resource.Harness.Faults do
   for what it needs; `:system`, `Vagus.Resource.Harness.start_system/1`
   options; `:normalize`, applied to each final store before comparing;
   `:equivalent`, a function of one resource's reference and interrupted
-  actions in place of `replay?/2`, for the killed controller's resources.
+  actions in place of both rules for the killed controller's resources.
 
   Returns the undisturbed run: `store`, `journal` (actions per resource) and
   `boundaries` (labels in the order crossed).
@@ -549,7 +554,7 @@ defmodule Vagus.Resource.Harness.Faults do
     scenario = Keyword.fetch!(opts, :scenario)
     system = Keyword.get(opts, :system, [])
     normalize = Keyword.get(opts, :normalize, & &1)
-    equivalent = Keyword.get(opts, :equivalent, &replay?/2)
+    equivalent = Keyword.get(opts, :equivalent)
     reference = run(system, :count, scenario, normalize)
 
     if reference.boundaries == [],
@@ -560,7 +565,7 @@ defmodule Vagus.Resource.Harness.Faults do
           nth <- 1..crossed,
           do: {label, nth}
 
-    for {{killed, _name, _kind} = label, nth} = target <- Enum.sort(targets) do
+    for {{killed, cut, _kind} = label, nth} = target <- Enum.sort(targets) do
       interrupted = run(system, {:kill_at, target}, scenario, normalize)
       where = "killed after #{inspect(label)} ##{nth}"
 
@@ -576,9 +581,11 @@ defmodule Vagus.Resource.Harness.Faults do
         {expected, found} = {reference.journal[key] || [], interrupted.journal[key] || []}
 
         same? =
-          if match?({^killed, _name}, key),
-            do: equivalent.(expected, found),
-            else: expected == found
+          case key do
+            {^killed, _name} when equivalent != nil -> equivalent.(expected, found)
+            {^killed, name} when name != cut -> replay?(expected, found)
+            _the_step_cut_or_another_controller -> expected == found
+          end
 
         assert same?, """
         #{where}: the actions for #{inspect(key)} differ.

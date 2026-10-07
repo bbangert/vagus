@@ -194,6 +194,9 @@ defmodule Vagus.Resource.ControllerTest do
             {:remove_finalizer, :app, "a", "dns"},
             {:requeue_after, -1},
             {:action, "pull", nil},
+            {:action, nil, %{image: "x"}},
+            {:action, true, nil},
+            {:action, false, nil},
             :delete
           ] do
         refute Controller.effect?(effect), inspect(effect)

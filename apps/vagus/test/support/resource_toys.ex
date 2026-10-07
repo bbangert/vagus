@@ -502,7 +502,7 @@ defmodule Vagus.Resource.Toys do
     itself. `"effect"`: `"refused"` writes to a resource that is not there,
     `"bad_act"` has an action return nonsense, `"non_effect"` returns a
     status write, `"two_actions"` and `"op_after_action"` return what their
-    names say, each with a write to the spec, `"op_after_requeue"` an action,
+    names say, each with a write to the spec, `"nil_action"` an action with no name, `"op_after_requeue"` an action,
     a re-queue and then a write, `"no_pair"` returns no pair at all,
     `"expect_generation"` expects a generation the resource does not have,
     `"requeue_after_action"` returns a `:fine` action, which tells the test
@@ -543,6 +543,7 @@ defmodule Vagus.Resource.Toys do
           "non_effect" -> [written, {:status, %{}}]
           "two_actions" -> [written, nonsense, nonsense]
           "op_after_action" -> [nonsense, written]
+          "nil_action" -> [written, {:action, nil, nil}]
           "op_after_requeue" -> [nonsense, {:requeue_after, 5}, written]
           "expect_generation" -> [{:expect, :wild, name, generation: 99}]
           "requeue_after_action" -> [{:action, :fine, nil}, {:requeue_after, 600_000}]
@@ -962,6 +963,76 @@ defmodule Vagus.Resource.Toys do
     def act(action, nil, %{resource: %{name: name}} = context) do
       Harness.record(context, {__MODULE__, name}, action)
       Harness.put_fact(context, {action, name}, true)
+    end
+  end
+
+  defmodule Forgetful do
+    @moduledoc """
+    Owns `:forgetful`, and is wrong on purpose: what it takes for proof
+    that its action ran is kept under its runtime's pid, so a replacement
+    runtime observes nothing done and does it again.
+    """
+    @behaviour Vagus.Resource.Controller
+
+    alias Vagus.Resource.{Harness, Runtime}
+
+    defp done(name, context),
+      do: {:done, name, Process.whereis(Runtime.name(context.instance, __MODULE__))}
+
+    @impl true
+    def kind, do: :forgetful
+    @impl true
+    def condition_types, do: [:ready]
+    @impl true
+    def observe(%{name: name}, context), do: Harness.fact(context, done(name, context)) == true
+
+    @impl true
+    def reconcile(_forgetful, done?),
+      do: {Verdict.new(ready: {done?, :doing}), if(done?, do: [], else: [{:action, :do, nil}])}
+
+    @impl true
+    def act(:do, nil, %{resource: %{name: name}} = context) do
+      Harness.record(context, {__MODULE__, name}, :do)
+      Harness.put_fact(context, done(name, context), true)
+    end
+  end
+
+  defmodule Gated do
+    @moduledoc """
+    Owns `:gated`. Its action is in two parts, the doing and what makes it
+    observable, and for a resource with a process under the fact
+    `{:gate, name}` it waits between the two until that process is gone,
+    having told the test `{:inside, name}`.
+    """
+    @behaviour Vagus.Resource.Controller
+
+    alias Vagus.Resource.Harness
+
+    @impl true
+    def kind, do: :gated
+    @impl true
+    def condition_types, do: [:ready]
+    @impl true
+    def observe(%{name: name}, context), do: Harness.fact(context, {:done, name}) == true
+
+    @impl true
+    def reconcile(_gated, done?),
+      do: {Verdict.new(ready: {done?, :doing}), if(done?, do: [], else: [{:action, :do, nil}])}
+
+    @impl true
+    def act(:do, nil, %{resource: %{name: name}} = context) do
+      Harness.record(context, {__MODULE__, name}, :do)
+
+      if gate = Harness.fact(context, {:gate, name}) do
+        send(context.test, {:inside, name})
+        monitor = Process.monitor(gate)
+
+        receive do
+          {:DOWN, ^monitor, :process, ^gate, _reason} -> :ok
+        end
+      end
+
+      Harness.put_fact(context, {:done, name}, true)
     end
   end
 

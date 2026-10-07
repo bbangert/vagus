@@ -477,6 +477,7 @@ defmodule Vagus.Resource.RuntimeRulesTest do
 
     for {effect, logged} <- [
           {"non_effect", "not effects: [status: %{}]"},
+          {"nil_action", "not effects: [{:action, nil, nil}]"},
           {"two_actions", "more than one action in a pass, or an op after the action"},
           {"op_after_action", "more than one action in a pass, or an op after the action"},
           {"op_after_requeue", "more than one action in a pass, or an op after the action"},
