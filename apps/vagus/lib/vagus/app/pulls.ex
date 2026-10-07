@@ -51,6 +51,13 @@ defmodule Vagus.App.Pulls do
   withdrawn. They run in the pull's task, between two reads of the stream,
   and one that is slow slows the pull.
 
+  The task is given the functions for a summary when it hands the summary
+  over, and calls them afterwards, outside this process. So a function may
+  be called once more, for a summary already on its way, after the request
+  that replaced it or the cancel that withdrew it has returned. It is never
+  called for a later summary. A function must therefore tolerate one call
+  that arrives after its waiter has moved on.
+
   ## When this process is absent
 
   `state/2` reads `:idle`, and `request/3` and `cancel/3` exit. Its
@@ -130,7 +137,8 @@ defmodule Vagus.App.Pulls do
   Has `image` pulled for `waiter`, unless it is being pulled already, in
   which case `waiter` joins. Options: `:instance`; `:platform`; `:priority`,
   the pull's place among those waiting for the lane; `:on_progress`, which
-  replaces the function of an earlier request by the same waiter. Platform
+  replaces the function of an earlier request by the same waiter for every
+  summary not already on its way (see "Progress"). Platform
   and priority are those of the request that started the pull.
   """
   @spec request(String.t(), waiter(), keyword()) :: :ok
@@ -144,7 +152,8 @@ defmodule Vagus.App.Pulls do
 
   @doc """
   Withdraws `waiter` from the pull of `image`, ending the pull if it was the
-  last. With no pull in flight, a remembered failure is forgotten. A pull
+  last. Its progress function may still be called once, for a summary
+  already on its way. With no pull in flight, a remembered failure is forgotten. A pull
   this ends has its task gone when this returns.
   """
   @spec cancel(String.t(), waiter(), keyword()) :: :ok

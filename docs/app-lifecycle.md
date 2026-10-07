@@ -275,7 +275,9 @@ failure or cancel) is a `Runtime.enqueue` for each waiter. `cancel`
 withdraws one waiter, and when it was the last, kills the task, which closes
 the connection, which stops the engine pulling. Progress is summarised in
 the task and passed on at most twice a second, to the table and to the one
-function each waiter may have given.
+function each waiter may have given. The functions run in the task, so one
+may be called once more, for a summary already on its way, after it was
+replaced or its waiter withdrew, and never for a later one.
 
 ## Verdicts
 

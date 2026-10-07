@@ -641,6 +641,55 @@ defmodule Vagus.Runtime.EventsTest do
       assert name == "app_fits"
     end
 
+    # A line one byte over the cap and still without its end: the worker has
+    # refused it, and holds nothing of it, when the next read comes. Each
+    # part after it is a read of its own (see `send_apart/2`).
+    defp after_refusal(sock, parts) do
+      send_chunk(sock, String.duplicate("x", 1_048_577))
+      Process.sleep(50)
+      send_apart(sock, Enum.map(parts, &framed/1))
+    end
+
+    @tag :capture_log
+    test "nothing of a line that outgrew the cap is read, though its end looks like an event", %{
+      sock: sock
+    } do
+      # The end of that line: text that by itself would be an event of ours.
+      tail = String.trim_trailing(timed("die", "tail", 1), "\n")
+      after_refusal(sock, [tail <> "\n" <> timed("start", "next", 2)])
+
+      assert_receive {:docker_event, %{name: name}}, 2_000
+      assert name == "app_next"
+    end
+
+    @tag :capture_log
+    test "a line that outgrew the cap is skipped to its newline, however many reads away", %{
+      sock: sock
+    } do
+      tail = String.trim_trailing(timed("die", "tail", 1), "\n")
+      after_refusal(sock, ["still the same line", tail <> "\n" <> timed("start", "next", 2)])
+
+      assert_receive {:docker_event, %{name: name}}, 2_000
+      assert name == "app_next"
+    end
+
+    @tag :capture_log
+    test "a new stream starts clean of a line the old one was skipping", %{
+      sock: sock,
+      listen: listen
+    } do
+      after_refusal(sock, [])
+      :gen_tcp.close(sock)
+
+      # The default back-off: a second.
+      {again, _head} = accept_conn(listen, 5_000)
+      send_ok_headers(again)
+      send_chunk(again, timed("start", "next", 2) <> timed("die", "after", 3))
+
+      assert_receive {:docker_event, %{name: name}}, 2_000
+      assert name == "app_next"
+    end
+
     test "an event the engine sends twice is delivered twice", %{sock: sock} do
       send_chunk(sock, timed("die", "a", 5) <> timed("die", "a", 5) <> timed("start", "z", 6))
 

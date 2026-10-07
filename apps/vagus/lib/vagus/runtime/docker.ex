@@ -147,7 +147,9 @@ defmodule Vagus.Runtime.Docker do
     * `:idle_timeout`, the longest silence allowed, milliseconds (default
       five minutes). `{:error, {:pull_timeout, :idle}}`.
     * `:total_timeout`, for the whole call (default `:infinity`).
-      `{:error, {:pull_timeout, :total}}`.
+      `{:error, {:pull_timeout, :total}}`. It is looked at before every
+      receive and before every call of `fun`, so the call outlasts it by at
+      most one call of `fun`.
 
   The connection belongs to the calling process. Killing that process closes
   it, and the engine cancels a pull whose connection closes.
@@ -806,8 +808,12 @@ defmodule Vagus.Runtime.Docker do
       {:ok, %{"errorDetail" => %{"message" => message}}} when is_binary(message) ->
         {:halt, {:error, {:pull_failed, message}}}
 
+      # One receive can hold many lines, and the function may be slow:
+      # the total is asked about before each call of it as well.
       {:ok, %{} = progress} ->
-        pull_lines(rest, %{pull | acc: pull.fun.(progress, pull.acc)})
+        if expired?(pull.deadline),
+          do: {:halt, {:error, {:pull_timeout, :total}}},
+          else: pull_lines(rest, %{pull | acc: pull.fun.(progress, pull.acc)})
 
       _blank_or_not_json ->
         pull_lines(rest, pull)

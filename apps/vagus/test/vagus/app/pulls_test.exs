@@ -582,6 +582,72 @@ defmodule Vagus.App.PullsTest do
       refute_received {:gone, 2}
     end
 
+    # A pull with waiters "a" and "b" whose first summary is on its way:
+    # the task holds both functions, is inside "a"'s, and has yet to call
+    # "b"'s. Returns the task, to be sent `:go`, and the engine's handler,
+    # which then sends two more lines.
+    defp summary_in_flight(context, b_function) do
+      test = self()
+      lines = for n <- 2..3, do: Model.downloading("l1", n, 3)
+      held(context, "repo/a:1", [Model.downloading("l1", 1, 3)], lines)
+
+      a_function = fn progress ->
+        send(test, {:a, progress.current, self()})
+        if progress.current == 1, do: receive(do: (:go -> :ok))
+      end
+
+      # Both join while the pull waits for the lane, so both are waiting
+      # when its first line is read.
+      stalled(context, "repo/other:1", "z")
+      :ok = Pulls.request("repo/a:1", waiter("a"), [on_progress: a_function] ++ context.i)
+      :ok = Pulls.request("repo/a:1", waiter("b"), [on_progress: b_function] ++ context.i)
+      :ok = Pulls.cancel("repo/other:1", waiter("z"), context.i)
+
+      assert_receive {:a, 1, task}, 2_000
+      assert_receive {:held, handler}, 2_000
+      {task, handler}
+    end
+
+    test "a function withdrawn while a summary is on its way gets that one, and none after",
+         context do
+      test = self()
+      {task, handler} = summary_in_flight(context, &send(test, {:b, &1.current}))
+
+      :ok = Pulls.cancel("repo/a:1", waiter("b"), context.i)
+      refute_received {:b, 1}
+      send(task, :go)
+      assert_receive {:b, 1}, 2_000
+
+      send(handler, :go)
+      # The third summary's call comes after every call for the second.
+      assert_receive {:a, 3, _task}, 2_000
+      refute_received {:b, 2}
+      refute_received {:b, 3}
+    end
+
+    test "a function replaced while a summary is on its way gets that one, and its successor the rest",
+         context do
+      test = self()
+      {task, handler} = summary_in_flight(context, &send(test, {:old, &1.current}))
+
+      :ok =
+        Pulls.request(
+          "repo/a:1",
+          waiter("b"),
+          [on_progress: &send(test, {:new, &1.current})] ++ context.i
+        )
+
+      send(task, :go)
+      assert_receive {:old, 1}, 2_000
+
+      send(handler, :go)
+      assert_receive {:a, 3, _task}, 2_000
+      assert_received {:new, 2}
+      refute_received {:new, 1}
+      refute_received {:old, 2}
+      refute_received {:old, 3}
+    end
+
     test "a progress function that raises costs the pull nothing", context do
       log =
         capture_log(fn ->

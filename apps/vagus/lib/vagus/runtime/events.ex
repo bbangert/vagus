@@ -59,8 +59,8 @@ defmodule Vagus.Runtime.Events do
   Docker's line-delimited stream is normally tiny per line, but a corrupt
   or adversarial stream could send an unbounded line with no `\\n` — on a
   1GB device that would balloon the buffer forever. The pending-line buffer
-  is capped at 1MB; a line that grows past the cap without a newline is
-  dropped (logged at `warning`) rather than accumulated further.
+  is capped at 1MB; a line that grows past the cap is dropped whole (logged
+  at `warning`): what has come of it, and what still comes up to its newline.
 
   Gated at the application-supervisor level by `config :vagus, :events_enabled`
   (default `true`, `false` in `config/test.exs`) — mirrors `Vagus.DNS`'s
@@ -150,6 +150,9 @@ defmodule Vagus.Runtime.Events do
       stable_after: Keyword.get(opts, :stable_after, @stable_ms),
       # True between a 200 and the drop of that stream.
       streaming?: false,
+      # True from the refusal of a line that outgrew the cap until that
+      # line's end has gone by: its tail is not the start of another.
+      skipping?: false,
       # The pending :connect retry timer, if any — kept so a second drop can
       # never arm a second retry loop beside it.
       reconnect_timer: nil
@@ -247,7 +250,7 @@ defmodule Vagus.Runtime.Events do
       {:ok, conn} ->
         case Mint.HTTP.request(conn, "GET", path, [], "") do
           {:ok, conn, ref} ->
-            %{state | conn: conn, request_ref: ref, buffer: ""}
+            %{state | conn: conn, request_ref: ref, buffer: "", skipping?: false}
 
           {:error, conn, reason} ->
             Mint.HTTP.close(conn)
@@ -340,10 +343,28 @@ defmodule Vagus.Runtime.Events do
 
   ## Line buffering + decoding
 
+  # Still inside a line that was refused: nothing up to its newline is
+  # looked at, however much like an event the end of it may read.
+  defp process_data(data, %{skipping?: true} = state) do
+    case :binary.split(data, "\n") do
+      [_more_of_it] -> state
+      [_its_end, rest] -> process_data(rest, %{state | skipping?: false})
+    end
+  end
+
   defp process_data(data, state) do
     {lines, remainder} = split_lines(state.buffer <> data)
     state = Enum.reduce(lines, state, &handle_line/2)
-    %{state | buffer: cap_buffer(remainder)}
+
+    if byte_size(remainder) > @max_buffer_bytes do
+      Logger.warning(
+        "Vagus.Runtime.Events: event line over #{@max_buffer_bytes} bytes dropped, with what is still to come of it"
+      )
+
+      %{state | buffer: "", skipping?: true}
+    else
+      %{state | buffer: remainder}
+    end
   end
 
   # Docker emits one JSON object per `\n`-terminated line; the last element
@@ -353,18 +374,6 @@ defmodule Vagus.Runtime.Events do
     parts = String.split(buffer, "\n")
     {complete, [remainder]} = Enum.split(parts, length(parts) - 1)
     {complete, remainder}
-  end
-
-  defp cap_buffer(buffer) do
-    if byte_size(buffer) > @max_buffer_bytes do
-      Logger.warning(
-        "Vagus.Runtime.Events: pending line exceeded #{@max_buffer_bytes} bytes without a newline; dropping buffer"
-      )
-
-      ""
-    else
-      buffer
-    end
   end
 
   defp handle_line("", state), do: state

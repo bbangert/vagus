@@ -350,6 +350,32 @@ defmodule Vagus.Runtime.DockerTest do
       refute_received {:read, 40}
     end
 
+    test "the total is asked about between the lines of one read, not only between reads" do
+      # One write, and so one read or two: forty lines, forty milliseconds
+      # each for the function.
+      body = Enum.map_join(1..40, &(Jason.encode!(status("#{&1}")) <> "\n"))
+      engine = scripted([{:stream, 200, [{:chunk, body}, :stall]}])
+
+      slow = fn _line, count ->
+        Process.sleep(40)
+        count + 1
+      end
+
+      test = self()
+      counted = fn line, count -> slow.(line, count) |> tap(&send(test, {:read, &1})) end
+
+      assert {:error, {:pull_timeout, :total}} =
+               Docker.pull_image_stream("repo/img:1", 0, counted,
+                 socket: engine.socket,
+                 total_timeout: 200
+               )
+
+      # The function ran for the lines before the total, and one at most
+      # that began before it; not for the rest.
+      assert_received {:read, 1}
+      refute_received {:read, 10}
+    end
+
     test "a last line the stream ends without terminating is still read" do
       engine = scripted([{:stream, 200, [{:chunk, Jason.encode!(status("last"))}]}])
       assert {:ok, [%{"status" => "last"}]} = collect(engine)
