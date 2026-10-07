@@ -18,13 +18,10 @@ defmodule Vagus.Resource.Store do
   survive a power cut, it stops rather than answer, and its replacement
   takes whatever the file holds. The caller reads to find out.
 
-  What this process keeps in its own memory, and so loses when it restarts,
-  is who registered for which kind. Everyone who registers is a later child
-  of `Vagus.Resource.Supervisor`, which restarts them with the store. Until
-  an owner has registered again, status and progress writes for its kind are
-  refused, since nobody owns them; spec writes are admitted as always,
-  because the validators are part of the kind the store was started with and
-  not of any registration.
+  This process keeps nothing in its own memory that a restart loses: the
+  rows and the claims are in the tables, and who may write what is in the
+  kinds it is started with (`Vagus.Resource.Kind`). So nothing is replaced
+  with it (`Vagus.Resource.Supervisor`).
 
   All functions take `instance: name` to address a store other than the
   application's.
@@ -140,36 +137,6 @@ defmodule Vagus.Resource.Store do
   end
 
   @doc """
-  Makes `owner` the owner of `kind`: the only writer of its `progress` and of
-  status outside conditions. `:conditions` are the condition types `owner`
-  writes.
-
-  The same owner may register again (its runtime restarted); a different one
-  is refused.
-  """
-  @spec register_kind(Resource.kind(), Resource.writer(), keyword()) ::
-          :ok
-          | {:error, {:unknown_kind, Resource.kind()}}
-          | {:error, {:kind_owned, Resource.writer()}}
-          | {:error, {:condition_owned, atom(), Resource.writer()}}
-          | {:error, {:bad_conditions, term()}}
-          | {:error, {:bad_writer, nil}}
-  def register_kind(kind, owner, opts \\ []) do
-    call(opts, {:register, kind, owner, Keyword.get(opts, :conditions, []), true})
-  end
-
-  @doc "Declares the condition types (`:conditions`) an attached writer owns on `kind`."
-  @spec register_writer(Resource.kind(), Resource.writer(), keyword()) ::
-          :ok
-          | {:error, {:unknown_kind, Resource.kind()}}
-          | {:error, {:condition_owned, atom(), Resource.writer()}}
-          | {:error, {:bad_conditions, term()}}
-          | {:error, {:bad_writer, nil}}
-  def register_writer(kind, writer, opts \\ []) do
-    call(opts, {:register, kind, writer, Keyword.get(opts, :conditions, []), false})
-  end
-
-  @doc """
   Applies `ops` in order, all or none, and returns each op's resource as that
   op left it. One rejected op rejects the commit and nothing changes.
   """
@@ -211,7 +178,7 @@ defmodule Vagus.Resource.Store do
 
   @doc """
   Merges `patch` into status; `:conditions` (a list) merges by type. `:writer`
-  must have registered each condition type it writes, and must be the kind's
+  must be the kind's writer of each condition type it writes, and the kind's
   owner to write anything else.
   """
   @spec patch_status(Resource.kind(), Resource.name(), map(), keyword()) :: result()
@@ -426,15 +393,15 @@ defmodule Vagus.Resource.Store do
       claims: Tables.claims(instance),
       path: Keyword.get(opts, :path),
       persist: Keyword.get(opts, :persist, &Persistence.write/2),
-      kinds: kinds,
-      registrations:
-        Map.new(kinds, fn {kind, _fields} -> {kind, %{owner: nil, conditions: %{}}} end)
+      kinds: kinds
     }
 
     with :ok <- Tables.take(instance),
          {:ok, contents} <- load(state) do
       restore(state, contents)
       remonitor(state.claims)
+      # After the tables are right. At a first start nobody listens yet.
+      Watch.restarted(instance)
       {:ok, state}
     else
       {:error, reason} ->
@@ -467,20 +434,6 @@ defmodule Vagus.Resource.Store do
   def handle_call({:relay, pids, message}, _from, state) do
     for pid <- pids, is_pid(pid), do: send(pid, message)
     {:reply, :ok, state}
-  end
-
-  def handle_call({:register, kind, writer, types, owner?}, _from, state) do
-    with {:ok, registration} <- registration(state, kind),
-         # `nil` is how "no writer" is spelled everywhere else.
-         :ok <- if(writer == nil, do: {:error, {:bad_writer, nil}}, else: :ok),
-         :ok <- free_for(registration, writer, owner?),
-         {:ok, conditions} <- declare(registration.conditions, writer, types) do
-      registration = %{registration | conditions: conditions}
-      registration = if owner?, do: %{registration | owner: writer}, else: registration
-      {:reply, :ok, put_in(state.registrations[kind], registration)}
-    else
-      {:error, _reason} = error -> {:reply, error, state}
-    end
   end
 
   def handle_call({:claim, key}, {pid, _tag}, state) do
@@ -687,7 +640,7 @@ defmodule Vagus.Resource.Store do
     owner_refs = Keyword.get(opts, :owner_refs, [])
     finalizers = Keyword.get(opts, :finalizers, [])
 
-    with {:ok, _registration} <- registration(txn.state, kind),
+    with {:ok, _kind} <- kind(txn.state, kind),
          :ok <- absent(txn, {kind, name}),
          writer = opts[:writer],
          :ok <- creatable(op, finalizers, writer),
@@ -728,9 +681,9 @@ defmodule Vagus.Resource.Store do
     {conditions, rest} = Map.pop(patch, :conditions, [])
 
     with {:ok, resource} <- lookup(txn, {kind, name}),
-         {:ok, registration} <- registration(txn.state, kind),
+         {:ok, kind} <- kind(txn.state, kind),
          :ok <- if(every?(conditions, &condition?/1), do: :ok, else: {:error, {:bad_op, op}}),
-         :ok <- owns_status(registration, conditions, rest, opts[:writer]) do
+         :ok <- owns_status(kind, conditions, rest, opts[:writer]) do
       resource = %{resource | status: Map.merge(resource.status, rest)}
       put(txn, Enum.reduce(conditions, resource, &Resource.put_condition(&2, &1)))
     end
@@ -739,8 +692,8 @@ defmodule Vagus.Resource.Store do
   defp run({:put_progress, kind, name, progress, opts}, txn)
        when is_map(progress) and is_list(opts) do
     with {:ok, resource} <- lookup(txn, {kind, name}),
-         {:ok, registration} <- registration(txn.state, kind),
-         :ok <- owner(registration, :progress, opts[:writer]) do
+         {:ok, kind} <- kind(txn.state, kind),
+         :ok <- owner(kind, :progress, opts[:writer]) do
       put(txn, %{resource | progress: progress})
     end
   end
@@ -863,9 +816,9 @@ defmodule Vagus.Resource.Store do
 
   # A kind the store was not started with could be written but never read
   # back, which would fail the next start.
-  defp registration(state, kind) do
-    case state.registrations do
-      %{^kind => registration} -> {:ok, registration}
+  defp kind(state, kind) do
+    case state.kinds do
+      %{^kind => fields} -> {:ok, fields}
       _unknown -> {:error, {:unknown_kind, kind}}
     end
   end
@@ -907,37 +860,20 @@ defmodule Vagus.Resource.Store do
     )
   end
 
-  defp free_for(%{owner: owner}, writer, true) when owner not in [nil, writer],
-    do: {:error, {:kind_owned, owner}}
-
-  defp free_for(_registration, _writer, _owner?), do: :ok
-
-  defp declare(conditions, writer, types) do
-    others = Map.reject(conditions, fn {_type, owner} -> owner == writer end)
-
-    if every?(types, &is_atom/1) do
-      case Enum.find(types, &is_map_key(others, &1)) do
-        nil -> {:ok, Map.merge(others, Map.new(types, &{&1, writer}))}
-        type -> {:error, {:condition_owned, type, others[type]}}
-      end
-    else
-      {:error, {:bad_conditions, types}}
-    end
-  end
-
-  defp owns_status(registration, conditions, rest, writer) do
-    foreign =
-      Enum.find(conditions, &(writer == nil or registration.conditions[&1.type] != writer))
+  # `nil` is how "no writer" is spelled, so it owns nothing even where a
+  # kind names no writer either.
+  defp owns_status(kind, conditions, rest, writer) do
+    foreign = Enum.find(conditions, &(writer == nil or kind.conditions[&1.type] != writer))
 
     cond do
       foreign -> {:error, {:not_owner, foreign.type, writer}}
       rest == %{} -> :ok
-      true -> owner(registration, rest |> Map.keys() |> hd(), writer)
+      true -> owner(kind, rest |> Map.keys() |> hd(), writer)
     end
   end
 
   defp owner(%{owner: owner}, _field, writer) when writer != nil and writer == owner, do: :ok
-  defp owner(_registration, field, writer), do: {:error, {:not_owner, field, writer}}
+  defp owner(_kind, field, writer), do: {:error, {:not_owner, field, writer}}
 
   defp admit(state, kind, spec) do
     Enum.reduce_while(state.kinds[kind].validators, {:ok, spec}, fn validator, {:ok, spec} ->

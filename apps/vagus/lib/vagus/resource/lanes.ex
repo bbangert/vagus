@@ -5,15 +5,16 @@ defmodule Vagus.Resource.Lanes do
   engine should not be asked for more than a few things at a time.
 
   A slot is held by the process that runs the action, for the time the
-  action runs. The wait is in that process, a step's task, so the runtime
-  never waits here and a resource that is only deciding or waiting holds
-  nothing. A holder that dies gives its slot back, as does a waiter that dies
-  its place in line.
+  action runs. The wait is in that process, a step's task or a pull's, so
+  no runtime waits here. A step that waits holds no slot here, but it does
+  hold one of its runtime's steps in flight. A holder that dies gives its
+  slot back, as does a waiter that dies its place in line.
 
   Fairness: within a class the next slot goes to the lowest `:priority`
   waiting, and among equals to the one that asked first. Nothing ages, so a
-  steady stream of lower priorities would starve a higher one; the waiters
-  are at most one per resource.
+  steady stream of lower priorities would starve a higher one. Pulls ask
+  with a priority; a step's action asks with none, the order of steps being
+  its runtime's queue.
 
   A slot is held for as long as its action takes: one that never returns
   keeps it, so what bounds an action is the timeout of the call it makes.

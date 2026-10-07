@@ -37,6 +37,11 @@ config :vagus, :store_asset_mode, :auto
 # runs, one runtime each. The resource store's kinds follow from this list.
 config :vagus, :controllers, []
 
+# How many steps one controller's runtime has in flight at once. A step
+# starts with an observation, usually an engine call, and a start looks at
+# every resource of the kind.
+config :vagus, :max_in_flight_steps, 4
+
 if Mix.target() == :host do
   import_config "host.exs"
 else

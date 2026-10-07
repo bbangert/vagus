@@ -25,8 +25,6 @@ defmodule Vagus.Resource.RuntimeIsolationTest do
     @impl true
     def finalizer, do: :watched
     @impl true
-    def finalize_after, do: [:nothing]
-    @impl true
     def writer_entries, do: [["holds"]]
     @impl true
     def validate(spec), do: {:ok, spec}
@@ -36,8 +34,6 @@ defmodule Vagus.Resource.RuntimeIsolationTest do
     def decode_spec(spec), do: spec
     @impl true
     def references(_watched), do: []
-    @impl true
-    def priority(_watched), do: 1
     @impl true
     def action_class(:touch), do: :engine
 
@@ -100,13 +96,11 @@ defmodule Vagus.Resource.RuntimeIsolationTest do
           :condition_types,
           :retention,
           :finalizer,
-          :finalize_after,
           :writer_entries,
           :validate,
           :encode_spec,
           :decode_spec,
           :references,
-          :priority,
           :action_class,
           :observe,
           :reconcile,
@@ -121,7 +115,7 @@ defmodule Vagus.Resource.RuntimeIsolationTest do
     # The declarations once, where a failure fails the start; admission and
     # the codec in the store.
     assert Enum.sort(by.(supervisor)) ==
-             [:condition_types, :finalize_after, :finalizer, :kind, :retention, :writer_entries]
+             [:condition_types, :finalizer, :kind, :retention, :writer_entries]
 
     assert Enum.sort(by.(store)) == [:decode_spec, :encode_spec, :validate]
   end

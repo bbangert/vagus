@@ -3,10 +3,11 @@ defmodule Vagus.Resource.Runtime do
   Runs one controller against the resources of its kind.
 
   It owns a queue of resource names with at most one step in flight per
-  name, and what it remembers of each resource: its timer, its failure
-  count, the references it reported. That is kept by uid, so a resource
-  created under a deleted one's name starts with nothing. None of it is durable and none needs
-  to be: a start lists the kind and looks at everything.
+  name and at most `:max_in_flight_steps` in all, and what it remembers of
+  each resource: its timer, its failure count, the references it reported.
+  That is kept by uid, so a resource created under a deleted one's name
+  starts with nothing. None of it is durable and none needs to be: a start
+  lists the kind and looks at everything.
 
   A step (`Vagus.Resource.Runtime.Step`) runs in a task under the
   controller's own `Task.Supervisor`, and every callback of the controller
@@ -15,23 +16,34 @@ defmodule Vagus.Resource.Runtime do
   flight marks the name dirty and it runs once more afterwards, however many
   changes there were: notifications become set members, never queued work.
 
+  The queue is first come, first served: a name already waiting keeps its
+  place whatever else asks for it, and one whose step has ended and is
+  wanted again goes to the back, so none is held back by another that keeps
+  coming round. The bound is on steps, observations included, which the
+  lanes do not count: without it a start would observe every resource of
+  the kind at once. A step holds its place until it ends, a wait for a lane
+  and the action included: a stop holds one for its grace plus a margin, so
+  as many long actions as the bound leave the rest of the kind unobserved
+  meanwhile, and what bounds a step is the timeout of the calls it makes.
+
   A step that crashes frees its name and is retried with back-off. The same
   back-off spaces passes that keep ending in a failed action, and passes
-  that keep performing the same actions: an action that succeeds without
-  changing what is observed would otherwise be repeated without pause.
+  that keep performing the action of the same name, whatever its arguments:
+  an action that succeeds without changing what is observed would otherwise
+  be repeated without pause. A pass that performs none in between ends the
+  run.
 
   What such a timer holds back is only the dirty mark made while the failing
   step was in flight: that mark may be the step's own write, announced like
   any other, and a step that writes and then fails must not bring itself
-  back. A change that arrives after the step has ended starts a pass at
+  back. A change that arrives after the step has ended queues the name at
   once, timer or no timer, since by then it can only be news.
 
   Controllers are level-triggered, so a notification is only a hint to look.
   Whatever one missed is found by a resync, which looks at every resource of
-  the kind: at start, every `:resync` milliseconds, and on `resync/2`, for
-  the engine's event stream after each reconnect because it cannot say
-  what it dropped. `enqueue/3` is the hint for one resource, from a source
-  the store does not announce.
+  the kind: at start, every `:resync` milliseconds, and on `resync/2`.
+  `enqueue/3` is the hint for one resource, from a source the store does not
+  announce.
 
   While the host is shutting down (`:shutdown?`) no step starts and a step
   in flight stops before its next write or action: the containers the
@@ -39,9 +51,8 @@ defmodule Vagus.Resource.Runtime do
 
   **When this process is absent** nothing reconciles the kind for this
   controller. Its supervisor replaces it together with its task supervisor,
-  and the replacement registers with the store again, under the same
-  identity, and starts from a listing. The store forgets registrations when
-  it restarts, and this process is restarted with it.
+  and the replacement starts from a listing. A new store leaves this
+  process as it is, and has it look at everything again.
 
   ## Options
 
@@ -50,13 +61,12 @@ defmodule Vagus.Resource.Runtime do
       supervisor's name)
     * `:context`, a map merged into what `observe/2` and `act/3` are given
     * `:clock`, `:shutdown?` (default `Vagus.Host.Shutdown.in_flight?/0`)
+    * `:max_in_flight_steps` (default `config :vagus, :max_in_flight_steps`,
+      else 4)
     * `:resync`, milliseconds or `:infinity` (default five minutes)
     * `:backoff`, `{base_ms, max_ms}` for crashed steps
     * `:unavailable_retry` and `:gate_poll`, milliseconds
-    * `:strict_verdicts`: raise in the step on a verdict that does not match
-      the controller's declaration, instead of logging and writing nothing
-      (default `config :vagus, :strict_verdicts`)
-    * `:boundary`, called in the step's task after each commit and each
+    * `:boundary`, called in the step's task after its commit and after its
       action, for a harness that interrupts there, with a map whose `:after`
       is `:commit`, `:idle_commit` for one that changed nothing, or `:action`
 
@@ -79,6 +89,7 @@ defmodule Vagus.Resource.Runtime do
   alias Vagus.Resource.{Clock, Store, Watch}
   alias Vagus.Resource.Runtime.Step
 
+  @typedoc "`queued` is in the order the names will be served."
   @type info :: %{
           queued: [Resource.name()],
           in_flight: %{optional(Resource.name()) => pid()},
@@ -115,8 +126,8 @@ defmodule Vagus.Resource.Runtime do
   Looks at one resource again. For whoever knows that something outside the
   store changed for it, which no notification announces: an engine event
   about its container, a pull it waits for that has ended. A name the kind
-  does not hold is forgotten at once, and with no runtime nothing is lost:
-  its replacement looks at everything.
+  does not hold is dropped when its turn comes, and with no runtime nothing
+  is lost: its replacement looks at everything.
 
   One that arrives during the resource's pass gets a pass of its own right
   after, whatever that pass ends in and whatever timer it arms. A change in
@@ -162,13 +173,22 @@ defmodule Vagus.Resource.Runtime do
     clock = Keyword.get(opts, :clock, Clock.System)
     shutdown? = Keyword.get(opts, :shutdown?, &Shutdown.in_flight?/0)
 
+    max_in_flight =
+      Keyword.get_lazy(opts, :max_in_flight_steps, fn ->
+        Application.get_env(:vagus, :max_in_flight_steps, 4)
+      end)
+
+    # Zero would start nothing, ever, and say nothing about it.
+    if not (is_integer(max_in_flight) and max_in_flight > 0),
+      do: raise(ArgumentError, "max_in_flight_steps must be a positive integer")
+
     state = %{
       i: [instance: instance],
       controller: controller,
       kind: kind,
-      owner?: owner?,
       tasks: Keyword.fetch!(opts, :tasks),
       shutdown?: shutdown?,
+      max_in_flight: max_in_flight,
       resync: Keyword.get(opts, :resync, :timer.minutes(5)),
       backoff: Keyword.get(opts, :backoff, {500, 60_000}),
       unavailable_retry: Keyword.get(opts, :unavailable_retry, 5_000),
@@ -190,17 +210,12 @@ defmodule Vagus.Resource.Runtime do
         stamp_current_generation: Keyword.get(opts, :stamp_current_generation, false),
         repeat_action: Keyword.get(opts, :repeat_action, false),
         context: Keyword.get(opts, :context, %{}),
-        strict:
-          Keyword.get_lazy(opts, :strict_verdicts, fn ->
-            Application.get_env(:vagus, :strict_verdicts, false)
-          end),
         boundary: Keyword.get(opts, :boundary),
         types: declaration.conditions,
-        retention: declaration.retention,
-        finalize_after: declaration.finalize_after,
-        priority: 0
+        retention: declaration.retention
       },
-      queued: MapSet.new(),
+      # In the order to be served. A list: a kind has tens of resources.
+      queued: [],
       # `name => %{task, uid}`: the step in flight and the resource it is
       # about.
       in_flight: %{},
@@ -225,25 +240,10 @@ defmodule Vagus.Resource.Runtime do
   # Not in `init/1`: the supervisor's start sequence does not wait for a
   # listing, and nothing later in it depends on this process being ready.
   @impl true
-  def handle_continue(:start, %{controller: controller, kind: kind, i: i} = state) do
-    declared = [conditions: state.step.types] ++ i
-
-    registered =
-      if state.owner?,
-        do: Store.register_kind(kind, controller, declared),
-        else: Store.register_writer(kind, controller, declared)
-
-    case registered do
-      :ok ->
-        :ok = Watch.subscribe({:kind, kind}, i)
-        {:noreply, state |> schedule_resync() |> relist() |> dispatch()}
-
-      # `Vagus.Resource.Controller.kinds/1` refuses every list of controllers
-      # the store would refuse, before anything starts. Reaching this means
-      # the two disagree, and no restart will change that.
-      {:error, reason} ->
-        {:stop, {:registration_refused, controller, reason}, state}
-    end
+  def handle_continue(:start, state) do
+    :ok = Watch.subscribe({:kind, state.kind}, state.i)
+    :ok = Watch.subscribe(:store, state.i)
+    {:noreply, state |> schedule_resync() |> relist() |> dispatch()}
   end
 
   @impl true
@@ -267,6 +267,9 @@ defmodule Vagus.Resource.Runtime do
     |> settle()
     |> noreply()
   end
+
+  def handle_info({Watch, :restarted}, state),
+    do: {:noreply, state |> look_again() |> settle()}
 
   def handle_info(:resync, state),
     do: {:noreply, state |> schedule_resync() |> look_again() |> settle()}
@@ -310,7 +313,7 @@ defmodule Vagus.Resource.Runtime do
     names = fn keep? -> for {name, record} <- state.known, keep?.(record), do: name end
 
     %{
-      queued: state.queued |> MapSet.to_list() |> Enum.sort(),
+      queued: state.queued,
       in_flight: Map.new(state.in_flight, fn {name, flight} -> {name, flight.task.pid} end),
       dirty: state.dirty |> MapSet.to_list() |> Enum.sort(),
       hinted: state.hinted |> MapSet.to_list() |> Enum.sort(),
@@ -323,15 +326,15 @@ defmodule Vagus.Resource.Runtime do
   end
 
   # What is remembered about a resource is about that resource, not about
-  # its name: a failure count, a failed action, the actions of the last
-  # pass, a pending timer and the references it reported. `record/3` is the
+  # its name: a failure count, a failed action, the name of the action the
+  # last pass performed, a pending timer and the references it reported. `record/3` is the
   # only way to read it and `put_record/3` the only way to write it, both by
   # name and uid, so that nothing remembered of a deleted resource is ever
   # read as, or added to, what is known of a later one of the same name.
   defp record(state, name, uid) do
     case state.known do
       %{^name => %{uid: ^uid} = record} -> record
-      _none_or_another -> %{uid: uid, failures: 0, failed: nil, acted: [], timer: nil, refs: []}
+      _none_or_another -> %{uid: uid, failures: 0, failed: nil, acted: nil, timer: nil, refs: []}
     end
   end
 
@@ -434,8 +437,9 @@ defmodule Vagus.Resource.Runtime do
 
   defp queue(state, name) do
     cond do
+      # At the back, and only once: a name that waits keeps its place.
       not is_map_key(state.in_flight, name) or state.double_step ->
-        %{state | queued: MapSet.put(state.queued, name)}
+        if name in state.queued, do: state, else: %{state | queued: state.queued ++ [name]}
 
       state.ignore_dirty ->
         state
@@ -454,8 +458,10 @@ defmodule Vagus.Resource.Runtime do
   defp settle(state), do: state |> dispatch() |> answer_probes()
 
   defp dispatch(state) do
+    free = state.max_in_flight - map_size(state.in_flight)
+
     cond do
-      MapSet.size(state.queued) == 0 ->
+      state.queued == [] or free <= 0 ->
         state
 
       state.shutdown?.() ->
@@ -463,10 +469,10 @@ defmodule Vagus.Resource.Runtime do
         timer = state.gate_timer || Process.send_after(self(), :gate, state.gate_poll)
         %{state | gate_timer: timer}
 
-      # In no order: every step is started at once, and what orders the
-      # work is the lane each action waits in.
+      # Again afterwards: a name whose resource is gone took no place.
       true ->
-        Enum.reduce(state.queued, %{state | queued: MapSet.new()}, &start_step/2)
+        {next, waiting} = Enum.split(state.queued, free)
+        next |> Enum.reduce(%{state | queued: waiting}, &start_step/2) |> dispatch()
     end
   end
 
@@ -557,15 +563,18 @@ defmodule Vagus.Resource.Runtime do
   end
 
   # Each returns whether it armed a timer that is to carry the next pass.
-  defp outcome(state, name, uid, %{outcome: {:ok, next}, actions: actions}) do
+  defp outcome(state, name, uid, %{outcome: {:ok, next}, action: action}) do
     record = %{record(state, name, uid) | failed: nil}
+    # By name: arguments that differ each time, a counter or a stamp, would
+    # make every repeat look new.
+    acted = action && elem(action, 0)
 
-    if actions != [] and record.acted == actions do
-      # The same actions as the pass before, which therefore changed nothing
+    if acted != nil and record.acted == acted do
+      # The same action as the pass before, which therefore changed nothing
       # that this pass could observe.
       {paced(state, name, record), true}
     else
-      record = %{record | failures: 0, acted: actions}
+      record = %{record | failures: 0, acted: acted}
 
       case next do
         :rest -> {put_record(state, name, record), false}
@@ -584,14 +593,14 @@ defmodule Vagus.Resource.Runtime do
         _other -> state.unavailable_retry
       end
 
-    {arm(state, name, record(state, name, uid), ms), true}
+    {arm(state, name, %{record(state, name, uid) | acted: nil}, ms), true}
   end
 
   # The controller counts these and paces its own retries, so the next pass
   # is at once, to let its verdict say what happened. Should that pass end
   # the same way, nothing is pacing them, and the back-off does.
   defp outcome(state, name, uid, %{outcome: {:action_failed, failure}}) do
-    record = %{record(state, name, uid) | failed: failure}
+    record = %{record(state, name, uid) | failed: failure, acted: nil}
 
     if record.failures > 0,
       do: {paced(state, name, record), true},
@@ -635,7 +644,7 @@ defmodule Vagus.Resource.Runtime do
 
   defp answer_probes(state) do
     quiet? =
-      map_size(state.in_flight) == 0 and (MapSet.size(state.queued) == 0 or state.shutdown?.())
+      map_size(state.in_flight) == 0 and (state.queued == [] or state.shutdown?.())
 
     {answered, waiting} =
       Enum.split_with(state.probes, fn {_reply_to, _ref, timers} ->

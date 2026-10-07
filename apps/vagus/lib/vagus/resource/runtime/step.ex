@@ -1,18 +1,26 @@
 defmodule Vagus.Resource.Runtime.Step do
   @moduledoc """
-  One pass over one resource: read, collect, observe, reconcile, apply.
-  Everything here runs in the step's task, never in the runtime, so a
-  callback that raises or an engine call that hangs costs the runtime
-  nothing but that key.
+  One pass over one resource: read, collect, observe, reconcile, commit,
+  act. Everything here runs in the step's task, never in the runtime, so a
+  callback that raises costs the runtime nothing but that pass, and an
+  engine call that hangs costs it that key and one of its steps in flight.
 
-  The task's result says what the resource it was given refers to, which
-  actions the pass performed, and its outcome:
+  A pass makes one commit of its own, the verdict's status with every op
+  `reconcile/2` returned, and then performs at most one action. What it
+  collects is apart from that. A release or a delete owed to a resource
+  that is gone is the whole pass. The finished resources the kind no longer
+  retains are deleted last, after the action, each in a commit of its own
+  since each is another resource with its own uid to expect: that is
+  housekeeping for others, and this resource's action does not wait on it.
+
+  The task's result says what the resource it was given refers to, the
+  action the pass performed, and its outcome:
 
     * `{:ok, next}`, a pass that ran, `next` being `:rest`, `:now` or
       `{:after, ms}`;
     * `{:unavailable, next}`, the same for a pass whose observation could
       not be made;
-    * `{:action_failed, failure}`, an action returned an error;
+    * `{:action_failed, failure}`, the action returned an error;
     * `:gone`, the resource is no longer the one read;
     * `:gated`, the host is shutting down and the pass stopped short.
 
@@ -33,29 +41,29 @@ defmodule Vagus.Resource.Runtime.Step do
           | :gone
           | :gated
 
-  @typedoc "`refs` is what the resource refers to, `actions` what the pass performed."
-  @type result :: %{refs: [Resource.key()], actions: [{atom(), term()}], outcome: outcome()}
+  @typedoc "`refs` is what the resource refers to, `action` what the pass performed."
+  @type result :: %{
+          refs: [Resource.key()],
+          action: {atom(), term()} | nil,
+          outcome: outcome()
+        }
 
   # `step.resource` is the row the runtime read when it started this, which
   # is how the runtime knows whose pass it is even if the pass crashes.
-  #
-  # The controller's own code is called here and not in the runtime: one
-  # callback that raises, exits or never returns costs this key and nothing
-  # else.
   @spec run(map()) :: result()
   def run(%{resource: %Resource{} = resource} = step) do
-    step = %{step | priority: priority(step, resource)}
-    result = %{refs: references(step, resource), actions: [], outcome: nil}
-    pass(step, resource, collectable(step, resource), result)
-  end
+    result = %{refs: references(step, resource), action: nil, outcome: nil}
 
-  defp priority(step, resource) do
-    case Controller.optional(step.controller, :priority, [resource], 0) do
-      priority when is_integer(priority) ->
-        priority
+    case if(collects?(step), do: Collector.ops(resource, step.i), else: []) do
+      [] ->
+        if step.shutdown?.(),
+          do: %{result | outcome: :gated},
+          else: reconcile(step, resource, Clock.now(step.clock), result)
 
-      other ->
-        raise ArgumentError, "#{inspect(step.controller)}.priority/1 returned #{inspect(other)}"
+      # What was collected changed the resource this pass read, so the
+      # decision is left to the next one.
+      ops ->
+        %{result | outcome: with(:ok <- commit(step, resource, ops), do: {:ok, :now})}
     end
   end
 
@@ -79,29 +87,6 @@ defmodule Vagus.Resource.Runtime.Step do
 
   defp collects?(step), do: step.owner? and not step.skip_collector
 
-  defp pass(step, resource, [], result) do
-    cond do
-      step.shutdown?.() -> %{result | outcome: :gated}
-      held_back?(step, resource) -> %{result | outcome: {:ok, :rest}}
-      true -> reconcile(step, resource, Clock.now(step.clock), result)
-    end
-  end
-
-  # What was collected changed the resource this pass read, so the decision
-  # is left to the next one.
-  defp pass(step, resource, ops, result) do
-    outcome = with :ok <- group(step, resource, ops), do: {:ok, :now}
-    %{result | outcome: outcome}
-  end
-
-  defp collectable(step, resource),
-    do: if(collects?(step), do: Collector.ops(resource, step.i), else: [])
-
-  defp held_back?(step, %Resource{deleting?: true, finalizers: finalizers}),
-    do: Enum.any?(step.finalize_after, &(&1 in finalizers))
-
-  defp held_back?(_step, _resource), do: false
-
   defp reconcile(step, resource, now, result) do
     context =
       Map.merge(step.context, %{
@@ -113,20 +98,24 @@ defmodule Vagus.Resource.Runtime.Step do
 
     observation = step.controller.observe(resource, context)
     unavailable? = match?({:unavailable, _reason}, observation)
-    {verdict, effects} = step.controller.reconcile(resource, observation)
-    verdict = admitted(step, resource, verdict)
-    {[first | acts], requeue} = plan(effects)
-    {first, acts} = performable(step, resource, first, acts, unavailable?)
+
+    {verdict, ops, action, requeue} =
+      decided(step, resource, step.controller.reconcile(resource, observation))
+
+    action = performable(step, resource, action, unavailable?)
     requeue = sooner(requeue, expiry(step, resource, verdict, now))
 
     outcome =
-      with :ok <- group(step, resource, status_ops(step, resource, verdict, now) ++ first),
+      with :ok <- commit(step, resource, status_ops(step, resource, verdict, now) ++ ops),
+           acted = act(step, action, Map.put(context, :resource, resource)),
+           # Whatever the action came to: a failing one would otherwise
+           # keep the kind's finished resources for as long as it fails.
            :ok <- retain(step, verdict, now),
-           :ok <- actions(step, resource, acts, Map.put(context, :resource, resource)) do
+           :ok <- acted do
         next =
           cond do
             # An action changed the world and no event is promised for it.
-            acts != [] -> :now
+            action != nil -> :now
             requeue != nil -> {:after, requeue}
             true -> :rest
           end
@@ -134,25 +123,63 @@ defmodule Vagus.Resource.Runtime.Step do
         if unavailable?, do: {:unavailable, next}, else: {:ok, next}
       end
 
-    performed = if match?({:ok, _next}, outcome), do: Enum.map(acts, &elem(&1, 0)), else: []
-    %{result | outcome: outcome, actions: performed}
+    %{result | outcome: outcome, action: if(match?({:ok, _next}, outcome), do: action)}
   end
+
+  # Checked whole, before any of it is applied: a return that is wrong in
+  # one part must not have another part of it written or performed.
+  defp decided(step, resource, {verdict, effects}) when is_list(effects) do
+    {verdict, problems} =
+      if verdict == :no_verdict,
+        do: {nil, []},
+        else: {verdict, Verdict.problems(verdict, step.types, step.owner?)}
+
+    bad = Enum.reject(effects, &Controller.effect?/1)
+    {requeues, rest} = Enum.split_with(effects, &match?({:requeue_after, _ms}, &1))
+    {ops, acts} = Enum.split_while(rest, &(not match?({:action, _name, _args}, &1)))
+
+    refused =
+      cond do
+        problems != [] ->
+          "verdict on #{resource.kind}/#{resource.name} refused: #{inspect(problems)}"
+
+        bad != [] ->
+          "not effects: #{inspect(bad)}"
+
+        match?([_action, _more | _], acts) ->
+          "more than one action in a pass, or an op after the action: #{inspect(acts)}"
+
+        true ->
+          nil
+      end
+
+    if refused, do: raise(ArgumentError, "#{inspect(step.controller)}: #{refused}")
+
+    action =
+      case acts do
+        [{:action, name, args}] -> {name, args}
+        [] -> nil
+      end
+
+    {verdict, ops, action, Enum.min(for({:requeue_after, ms} <- requeues, do: ms), fn -> nil end)}
+  end
+
+  defp decided(step, _resource, other),
+    do: raise(ArgumentError, "#{inspect(step.controller)}.reconcile/2 returned #{inspect(other)}")
 
   # With nothing observed there is nothing an action could rightly be
   # decided from, and one that failed against an absent engine would be
-  # counted against the resource. Only the actions go: the ops around them
-  # are still written, as one group now that nothing separates them.
-  defp performable(_step, _resource, first, acts, false), do: {first, acts}
-  defp performable(_step, _resource, first, [], true), do: {first, []}
-
-  defp performable(step, resource, first, acts, true) do
+  # counted against the resource. The ops and the verdict are still written.
+  defp performable(step, resource, {name, _args}, true) do
     Logger.warning(
       "#{inspect(step.controller)}: #{resource.kind}/#{resource.name} could not be observed; " <>
-        "not performing #{inspect(Enum.map(acts, &elem(&1, 0)))}"
+        "not performing #{inspect(name)}"
     )
 
-    {first ++ Enum.flat_map(acts, &elem(&1, 1)), []}
+    nil
   end
+
+  defp performable(_step, _resource, action, _unavailable?), do: action
 
   defp sooner(nil, ms), do: ms
   defp sooner(ms, nil), do: ms
@@ -167,47 +194,6 @@ defmodule Vagus.Resource.Runtime.Step do
   end
 
   defp expiry(_step, _resource, _verdict, _now), do: nil
-
-  defp admitted(_step, _resource, :no_verdict), do: nil
-
-  defp admitted(step, resource, verdict) do
-    case Verdict.problems(verdict, step.types, step.owner?) do
-      [] ->
-        verdict
-
-      problems ->
-        message =
-          "#{inspect(step.controller)}: verdict on #{resource.kind}/#{resource.name} refused: " <>
-            inspect(problems)
-
-        if step.strict, do: raise(ArgumentError, message)
-        Logger.error(message)
-        nil
-    end
-  end
-
-  # The ops before the first action, then each action with the ops up to the
-  # next one.
-  defp plan(effects) do
-    with [_ | _] = bad <- Enum.reject(effects, &Controller.effect?/1) do
-      raise ArgumentError, "not effects: #{inspect(bad)}"
-    end
-
-    {requeues, effects} = Enum.split_with(effects, &match?({:requeue_after, _ms}, &1))
-    {first, rest} = Enum.split_while(effects, &(not action?(&1)))
-
-    {[first | chunk(rest)],
-     Enum.min(for({:requeue_after, ms} <- requeues, do: ms), fn -> nil end)}
-  end
-
-  defp chunk([]), do: []
-
-  defp chunk([{:action, name, args} | rest]) do
-    {ops, rest} = Enum.split_while(rest, &(not action?(&1)))
-    [{{name, args}, ops} | chunk(rest)]
-  end
-
-  defp action?(effect), do: match?({:action, _name, _args}, effect)
 
   defp status_ops(_step, _resource, nil, _now), do: []
 
@@ -244,9 +230,7 @@ defmodule Vagus.Resource.Runtime.Step do
 
   defp finished(_step, _resource, _now), do: %{}
 
-  defp group(_step, _resource, []), do: :ok
-
-  defp group(step, resource, ops), do: commit(step, resource, ops)
+  defp commit(_step, _target, []), do: :ok
 
   # Every write of a step: not during a shutdown, only to the resource that
   # was read, and failing the step on anything else the store refuses.
@@ -263,7 +247,10 @@ defmodule Vagus.Resource.Runtime.Step do
         {:ok, _resources, changed?} ->
           boundary(step, if(changed?, do: :commit, else: :idle_commit))
 
-        {:error, {:precondition, {^kind, ^name}, _field}} ->
+        # A new resource under the name, or none. Any other expectation
+        # that fails was the controller's own, about a resource that is
+        # still the one read, and is a commit refused like any other.
+        {:error, {:precondition, {^kind, ^name}, field}} when field in [:uid, :not_found] ->
           :gone
 
         {:error, reason} ->
@@ -272,6 +259,8 @@ defmodule Vagus.Resource.Runtime.Step do
     end
   end
 
+  # After the pass's own commit, which is what stamps this resource as
+  # finished and so puts it in the listing, and after its action.
   defp retain(
          %{retention: %{} = retention, skip_collector: false} = step,
          %Verdict{terminal?: true},
@@ -291,23 +280,9 @@ defmodule Vagus.Resource.Runtime.Step do
 
   defp retain(_step, _verdict, _now), do: :ok
 
-  defp actions(_step, _resource, [], _context), do: :ok
+  defp act(_step, nil, _context), do: :ok
 
-  defp actions(step, resource, [{{name, args}, ops} | rest], context) do
-    case act(step, name, args, context) do
-      :ok ->
-        boundary(step, :action)
-        with :ok <- group(step, resource, ops), do: actions(step, resource, rest, context)
-
-      {:error, reason} ->
-        {:action_failed, %{name: name, args: args, reason: reason, at: context.now}}
-
-      :gated ->
-        :gated
-    end
-  end
-
-  defp act(step, name, args, context) do
+  defp act(step, {name, args}, context) do
     # Asked with the lane held: the wait for it may have been long enough
     # for a shutdown to begin.
     run = fn ->
@@ -327,14 +302,21 @@ defmodule Vagus.Resource.Runtime.Step do
     result =
       case Controller.optional(step.controller, :action_class, [name], nil) do
         nil -> run.()
-        class -> Lanes.run(class, [instance: step.instance, priority: step.priority], run)
+        class -> Lanes.run(class, [instance: step.instance], run)
       end
 
     case result do
-      :ok -> :ok
-      :gated -> :gated
-      {:error, _reason} = error -> error
-      other -> raise ArgumentError, "#{inspect(step.controller)}.act/3 returned #{inspect(other)}"
+      :ok ->
+        boundary(step, :action)
+
+      :gated ->
+        :gated
+
+      {:error, reason} ->
+        {:action_failed, %{name: name, args: args, reason: reason, at: context.now}}
+
+      other ->
+        raise ArgumentError, "#{inspect(step.controller)}.act/3 returned #{inspect(other)}"
     end
   end
 

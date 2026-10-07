@@ -33,10 +33,7 @@ defmodule Vagus.Resource.StorePersistenceTest do
     do: File.write!(path, path |> File.read!() |> Jason.decode!() |> fun.() |> Jason.encode!())
 
   defp start!(path, opts \\ []) do
-    instance = TestInstance.start!([path: path] ++ opts)
-    i = [instance: instance]
-    :ok = Store.register_kind(:thing, Owner, [conditions: [:ready]] ++ i)
-    i
+    [instance: TestInstance.start!([path: path, owned: %{thing: [{Owner, [:ready]}]}] ++ opts)]
   end
 
   defp restart!(i, path) do
@@ -333,8 +330,12 @@ defmodule Vagus.Resource.StorePersistenceTest do
     @describetag :capture_log
 
     defp refused(path, opts \\ []) do
-      assert {:error, {{:shutdown, {:failed_to_start_child, Store, reason}}, _spec}} =
+      # Twice: the store's start fails its own supervisor's, which fails the
+      # subtree's.
+      assert {:error, {{:shutdown, {:failed_to_start_child, Store, its_own}}, _spec}} =
                TestInstance.start([path: path] ++ opts)
+
+      assert {:shutdown, {:failed_to_start_child, Store, reason}} = its_own
 
       reason
     end
@@ -561,7 +562,7 @@ defmodule Vagus.Resource.StorePersistenceTest do
 
       TestInstance.restart_store(i[:instance])
       # The new store's answer follows anything it sent while starting.
-      :ok = Store.register_kind(:thing, Owner, [conditions: [:ready]] ++ i)
+      :ok = Store.relay([], nil, i)
 
       refute_received {Watch, _, _}
       assert Store.get(:thing, "t", i) == before

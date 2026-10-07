@@ -10,46 +10,61 @@ defmodule Vagus.Resource.Controller do
 
   ## Effects
 
-  Effects are data, applied in order:
+  `reconcile/2` returns, as data:
 
-    * a store op (`t:Vagus.Resource.Store.op/0`), written with whatever
-      `:writer` the op names;
-    * `{:action, name, args}`, performed by `act/3`;
+    * store ops (`t:Vagus.Resource.Store.op/0`), any number, each written
+      with whatever `:writer` it names;
+    * at most one `{:action, name, args}`, performed by `act/3`, after every
+      op;
     * `{:requeue_after, ms}`, which looks at the resource again after that
       long. The shortest one wins.
 
-  The ops between two actions are one commit, and the verdict is written in
-  the first. A crash therefore falls between a commit and an action, never
-  inside a group, and **an action must be idempotent against observation**:
-  the pass after a crash observes what the action already did and carries on
-  from there, so the action may run twice and must not depend on the commit
-  after it having happened.
+  A pass makes one commit, of the verdict and all the ops, then performs
+  the action, and ends: the resource is observed again before anything else
+  is decided. A second action would rest on facts the first has changed,
+  and each one adds a place a crash can fall. So create and start, stop and
+  remove, and each hook of a sequence are separate passes, each decided
+  from what the pass before left to observe.
+
+  A pass can be cut anywhere: a commit whose call exits may have been
+  applied, and a step that dies with its runtime dies inside `act/3`. So
+  **an action must be idempotent against observation**: the pass after
+  observes whatever the action did and carries on from there. Nothing but
+  `observe/2` tells a pass that an action ran. The commit is made before
+  it, and a pass cut between the two has the one without the other.
 
   There is no status effect. Status is written by the runtime, from the
   `Vagus.Resource.Verdict`, and by nothing else.
 
-  A commit the store refuses crashes the pass, which is retried with
-  back-off; so does anything a callback raises. `act/3` returning
-  `{:error, reason}` ends the pass without the effects after it. The next
-  pass runs at once and finds the failure in `context.failed_action`,
-  because a failed action usually leaves nothing behind for `observe/2` to
-  see; counting it and spacing the retries is the controller's to do, with
-  `{:requeue_after, ms}`. Passes that keep ending in a failed action are
-  spaced like crashed ones, and so are passes that perform the same actions
-  as the pass before: an action must change what `observe/2` sees.
+  What `reconcile/2` returns is checked whole before any of it is applied.
+  A verdict that does not match the declaration, a term that is no effect,
+  a second action or an op after the action fails the pass with nothing
+  written and nothing done.
+
+  A failed pass is retried with back-off: one whose commit the store
+  refuses, and anything a callback raises. `act/3` returning
+  `{:error, reason}` ends the pass. The next pass runs at once and finds
+  the failure in `context.failed_action`, because a failed action usually
+  leaves nothing behind for `observe/2` to see; counting it and spacing the
+  retries is the controller's to do, with `{:requeue_after, ms}`. Passes
+  that keep ending in a failed action are spaced like crashed ones, and so
+  is a pass that performs the action the pass before performed, compared by
+  name: an action must change what `observe/2` sees.
 
   ## Where a controller's code runs
 
   Nowhere in the runtime. The callbacks that take no argument (`kind/0`,
   `condition_types/0`, `owned_conditions/0`, `retention/0`, `finalizer/0`,
-  `finalize_after/0`, `writer_entries/0`) are evaluated once, by
-  `declare/1`, while `Vagus.Resource.Supervisor` starts: one that raises
-  fails that start, with its name. `observe/2`, `reconcile/2`, `act/3`,
-  `references/1`, `priority/1` and `action_class/1` run in the pass's task,
-  where one that raises, exits or never returns costs its resource that pass
-  and nothing beyond it. `validate/1` and the codec hooks run in the store,
-  on each write to the kind: what they raise refuses the write, and they
-  must not block, since every write waits behind them.
+  `writer_entries/0`) are evaluated once, by `declare/1`, while
+  `Vagus.Resource.Supervisor` starts: one that raises fails that start,
+  with its name. `observe/2`, `reconcile/2`, `act/3`, `references/1`,
+  `action_class/1` run in the pass's task, where one that
+  raises or exits costs its resource that pass and nothing beyond it. One
+  that never returns also keeps one of the passes its runtime may have in
+  flight, so every call a callback makes needs a timeout. `validate/1` and
+  the codec hooks run in the store, on each write to the kind: what they
+  raise refuses the write, and they must not block, since every write
+  waits behind them.
 
   ## What `observe/2` cannot reach
 
@@ -57,16 +72,22 @@ defmodule Vagus.Resource.Controller do
   reached, the container engine above all (`{:unavailable,
   :engine_unavailable}`). `reconcile/2` is given that in place of an
   observation and returns the verdict for it: progressing, with that reason.
-  Its store ops are applied; any action it returns is not performed. The
-  runtime counts no failure and looks again shortly, whatever the effects
-  ask for.
+  Its store ops and its verdict are written; an action it returns is not
+  performed. The runtime counts no failure and looks again shortly, whatever
+  the effects ask for.
 
   ## Owning and attaching
 
   One controller owns a kind: it supplies the kind's admission and codec, and
   its verdict covers `condition_types/0`. A controller that exports
   `owned_conditions/0` is attached to a kind another owns: its verdict covers
-  exactly those types and carries no other status.
+  exactly those types and carries no other status. Who owns a kind and who
+  writes which condition type is fixed by the list of controllers, before
+  the store starts (`kinds/1`).
+
+  A controller that must clean up after another reads the resource's
+  `finalizers` and waits while the other's is there: its removal is a
+  change, which brings the next pass.
   """
 
   alias Vagus.Resource
@@ -118,12 +139,6 @@ defmodule Vagus.Resource.Controller do
   @callback references(Resource.t()) :: [Resource.key()]
 
   @doc """
-  The resource's place among the actions waiting for a lane: lower is served
-  first. Default 0. It orders nothing else; steps all start at once.
-  """
-  @callback priority(Resource.t()) :: integer()
-
-  @doc """
   For a kind whose resources finish: how many finished ones to keep, and for
   how long. The count is the bound that always holds; an age is only known
   within one incarnation.
@@ -134,12 +149,6 @@ defmodule Vagus.Resource.Controller do
 
   @doc "Held by every resource of the kind from its creation until this controller removes it."
   @callback finalizer() :: atom()
-
-  @doc """
-  Finalizers that must be gone before this controller is shown a resource
-  that is being deleted.
-  """
-  @callback finalize_after() :: [atom()]
 
   @doc "The lane an action runs in (`Vagus.Resource.Lanes`), or `nil` for none."
   @callback action_class(name :: atom()) :: Lanes.class() | nil
@@ -159,11 +168,9 @@ defmodule Vagus.Resource.Controller do
 
   @optional_callbacks validate: 1,
                       references: 1,
-                      priority: 1,
                       retention: 0,
                       owned_conditions: 0,
                       finalizer: 0,
-                      finalize_after: 0,
                       action_class: 1,
                       writer_entries: 0,
                       encode_spec: 1,
@@ -202,7 +209,6 @@ defmodule Vagus.Resource.Controller do
           conditions: [atom()],
           retention: %{keep: non_neg_integer(), ttl_ms: non_neg_integer() | :infinity} | nil,
           finalizer: atom() | nil,
-          finalize_after: [atom()],
           writer_entries: [Resource.path()]
         }
 
@@ -210,11 +216,11 @@ defmodule Vagus.Resource.Controller do
   Evaluates the controller's declarations. Raises, naming the controller
   and the callback, if one of them raises or returns anything but what it
   is declared to: an atom for `kind/0` and `finalizer/0`, a list of atoms
-  for `condition_types/0`, `owned_conditions/0` and `finalize_after/0`, a
-  list of paths for `writer_entries/0`, and a map of a `keep` count and a
-  `ttl_ms` for `retention/0`. A value of the wrong shape would otherwise
-  surface later and elsewhere, as a store that refuses a registration or a
-  step that fails on every resource.
+  for `condition_types/0` and `owned_conditions/0`, a list of paths for
+  `writer_entries/0`, and a map of a `keep` count and a `ttl_ms` for
+  `retention/0`. A value of the wrong shape would otherwise surface later
+  and elsewhere, as a status write the store refuses or a step that fails
+  on every resource.
   """
   @spec declare(module()) :: declaration()
   def declare(controller) do
@@ -237,7 +243,6 @@ defmodule Vagus.Resource.Controller do
           {"%{keep: count, ttl_ms: ms | :infinity}", &retention?/1}
         ),
       finalizer: declared(controller, :finalizer, nil, name),
-      finalize_after: declared(controller, :finalize_after, [], atoms),
       writer_entries:
         declared(
           controller,
@@ -286,13 +291,12 @@ defmodule Vagus.Resource.Controller do
 
   @doc """
   The kinds the store is started with, one per owning controller, each with
-  the finalizers of every controller on it. Takes controllers or their
-  declarations.
+  its owner, the writer of every condition type and the finalizers of every
+  controller on it. Takes controllers or their declarations.
 
-  Raises on a list the store would later refuse a registration from: two
-  owners of one kind, a controller attached to a kind nobody owns, or one
-  condition type or one finalizer declared by two controllers of a kind. None of these can run, and found here they
-  fail the start with a name instead of a runtime that can never register.
+  Raises, naming the controllers, on a list that cannot run: two owners of
+  one kind, a controller attached to a kind nobody owns, or one condition
+  type or one finalizer declared by two controllers of a kind.
   """
   @spec kinds([module() | declaration()]) :: %{Resource.kind() => Kind.t()}
   def kinds(controllers) do
@@ -318,7 +322,7 @@ defmodule Vagus.Resource.Controller do
 
     Map.new(owned, fn {kind, %{controller: owner} = declaration} ->
       on_kind = [declaration | Enum.filter(attached, &(&1.kind == kind))]
-      distinct_conditions!(kind, on_kind)
+      conditions = distinct_conditions!(kind, on_kind)
       finalizers = distinct_finalizers!(kind, on_kind)
 
       # The validator and the hooks are the controller's code, run by the
@@ -328,7 +332,9 @@ defmodule Vagus.Resource.Controller do
          [
            validators: if(exports?(owner, :validate, 1), do: [&owner.validate/1], else: []),
            finalizers: finalizers,
-           writer_entries: declaration.writer_entries
+           writer_entries: declaration.writer_entries,
+           owner: owner,
+           conditions: conditions
          ] ++
            for(
              hook <- @hooks,
@@ -378,10 +384,12 @@ defmodule Vagus.Resource.Controller do
   @doc """
   Whether `term` is an effect the runtime can apply: an action, a timed
   re-queue, or a store op of a known shape. A status write is none: status
-  comes from the verdict alone.
+  comes from the verdict alone. An action's name is an atom other than
+  `nil`, `true` and `false`: the runtime remembers the last one by name,
+  with `nil` for none.
   """
   @spec effect?(term()) :: boolean()
-  def effect?({:action, name, _args}), do: is_atom(name)
+  def effect?({:action, name, _args}), do: is_atom(name) and name not in [nil, true, false]
   def effect?({:requeue_after, ms}), do: is_integer(ms) and ms >= 0
 
   def effect?({op, kind, name, arg, opts}) when op in [:create, :put_progress],

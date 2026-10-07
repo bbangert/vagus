@@ -3,7 +3,8 @@ defmodule Vagus.Resource.Kind do
   What the store has to know about a kind before any controller exists:
   how to admit a spec, and how to get the kind's own shapes through JSON,
   which has no atoms, tuples or structs. Kinds are static, so the store is
-  given these when it starts and can read its file before anything registers.
+  given these when it starts and can read its file before any controller
+  runs.
 
   The `encode_*` hooks return something `Jason` can encode; the `decode_*`
   hooks get the decoded form back, string keys and all. Both default to
@@ -16,6 +17,11 @@ defmodule Vagus.Resource.Kind do
   `writer_entries` are spec paths under which each entry exists only for the
   writer that put it there, such as a hold. Releasing a writer deletes its
   entries there; anywhere else the value stays and only the ownership goes.
+
+  `owner` is the only writer of the kind's `progress` and of status outside
+  conditions, and `conditions` names the one writer of each condition type.
+  Being start options they hold from the store's first message and through
+  each of its restarts; `nil` and a type left out belong to nobody.
   """
 
   alias Vagus.Resource
@@ -23,6 +29,8 @@ defmodule Vagus.Resource.Kind do
   defstruct validators: [],
             finalizers: [],
             writer_entries: [],
+            owner: nil,
+            conditions: %{},
             encode_spec: &Function.identity/1,
             decode_spec: &Function.identity/1,
             encode_progress: &Function.identity/1,
@@ -35,6 +43,8 @@ defmodule Vagus.Resource.Kind do
           validators: [validator()],
           finalizers: [atom()],
           writer_entries: [Resource.path()],
+          owner: Resource.writer() | nil,
+          conditions: %{optional(atom()) => Resource.writer()},
           encode_spec: (map() -> term()),
           decode_spec: (term() -> map()),
           encode_progress: (map() -> term()),

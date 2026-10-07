@@ -103,11 +103,6 @@ config :vagus, :addon_boot_start, false
 # file start a private instance with their own path.
 config :vagus, :resources_path, nil
 
-# A controller whose verdict leaves out a condition type it declared, or
-# carries one it did not, fails its step here; elsewhere the verdict is
-# logged and not written.
-config :vagus, :strict_verdicts, true
-
 # Per-run tmp dir, set here too because under a MIX_TARGET config/target.exs
 # loads first and would point the suite at the real `/run/vagus`.
 config :vagus, :run_state_dir, Path.join(System.tmp_dir!(), "vagus-run-#{System.pid()}")

@@ -6,13 +6,34 @@ defmodule Vagus.Resource.RuntimeTest do
 
   alias Vagus.Resource
   alias Vagus.Resource.{Lanes, Runtime, Store}
-  alias Vagus.Resource.Toys.{Batch, Kept, Linker, Probe, Scribe, Sloppy, Stubborn, Tagger}
+
+  alias Vagus.Resource.Toys.{
+    Batch,
+    Finisher,
+    Kept,
+    Linker,
+    Probe,
+    Scribe,
+    Sloppy,
+    Stubborn,
+    Tagger
+  }
 
   @moduletag :capture_log
   @moduletag :scenario
 
   defp condition(sys, kind, name, type),
     do: Resource.get_condition(Store.get(kind, name, sys.i), type)
+
+  # Those that changed something, in order, from the mailbox.
+  defp boundaries(seen \\ []) do
+    receive do
+      {:boundary, :idle_commit} -> boundaries(seen)
+      {:boundary, crossed} -> boundaries([crossed | seen])
+    after
+      0 -> Enum.reverse(seen)
+    end
+  end
 
   describe "the queue" do
     test "a change that arrives during a step is not lost: the key runs once more" do
@@ -165,15 +186,39 @@ defmodule Vagus.Resource.RuntimeTest do
       {:ok, %{uid: second}} = Store.create(:scribe, "s", %{}, sys.i)
 
       # The step read the first "s" and decides to write a note for it.
-      send(step, :go)
-      assert_receive {:observing, "s", again}, sys.wait
-      put_fact(sys, :block_scribe, false)
-      send(again, :go)
+      log =
+        capture_log(fn ->
+          send(step, :go)
+          assert_receive {:observing, "s", again}, sys.wait
+          put_fact(sys, :block_scribe, false)
+          send(again, :go)
 
-      await!(sys, :scribe, "s", :ready)
-      settle(sys)
+          await!(sys, :scribe, "s", :ready)
+          settle(sys)
+        end)
+
       assert first != second
       assert for(note <- Store.list(:note, sys.i), do: note.name) == ["by-#{second}"]
+      # It ended, as a pass about a resource that is gone; it did not fail.
+      refute log =~ "started from #{inspect(Runtime.name(sys.instance, Scribe))} terminating"
+    end
+
+    test "a step that outlived its resource, with none in its place, ends without failing" do
+      sys = start_system(controllers: [Scribe], kinds: %{note: []})
+      put_fact(sys, :block_scribe, true)
+
+      {:ok, _} = Store.create(:scribe, "s", %{}, sys.i)
+      assert_receive {:observing, "s", step}, sys.wait
+      {:ok, _} = Store.delete(:scribe, "s", sys.i)
+
+      log =
+        capture_log(fn ->
+          send(step, :go)
+          settle(sys)
+        end)
+
+      assert Store.list(:note, sys.i) == []
+      refute log =~ "started from #{inspect(Runtime.name(sys.instance, Scribe))} terminating"
     end
   end
 
@@ -197,25 +242,111 @@ defmodule Vagus.Resource.RuntimeTest do
       settle(sys)
       assert fact(sys, {:seen, "p"}) == 1
     end
+  end
 
-    test "after a store restart every runtime has registered again and writes status" do
-      sys = start_system(controllers: [Kept, Tagger])
-      given_ready(sys, {:kept, "k", %{}})
+  describe "a store that is replaced" do
+    defp alive(sys) do
+      names = [Runtime.name(sys.instance, Probe), Lanes.name(sys.instance)]
+      pulls = [Vagus.App.Pulls.name(sys.instance), Vagus.App.Pulls.tasks(sys.instance)]
+      for name <- names ++ pulls, do: {name, Process.whereis(name)}
+    end
 
-      before =
-        for controller <- sys.controllers,
-            do: Process.whereis(Runtime.name(sys.instance, controller))
+    defp system_with_pulls,
+      do: start_system(controllers: [Probe], pulls: [engine: [socket: "/nowhere.sock"]])
+
+    test "takes nothing with it: the runtime, its step in flight, the pulls and the lanes stay" do
+      sys = system_with_pulls()
+      put_fact(sys, {:observe, "p"}, :block)
+      {:ok, _} = Store.create(:probe, "p", %{}, sys.i)
+      assert_receive {:observing, "p", step}, sys.wait
+      before = alive(sys)
 
       restart_store(sys)
 
-      for {controller, old} <- Enum.zip(sys.controllers, before) do
-        assert Process.whereis(Runtime.name(sys.instance, controller)) != old
+      assert alive(sys) == before
+      assert Enum.all?(before, fn {_name, pid} -> is_pid(pid) end)
+      assert %{in_flight: %{"p" => ^step}} = Runtime.info(Probe, sys.i)
+
+      # The step goes on, and its commit is the new store's to take.
+      put_fact(sys, {:observe, "p"}, nil)
+      send(step, :go)
+      await!(sys, :probe, "p", :ready)
+
+      # As is a write made since, heard of by the runtime that was there.
+      {:ok, _} = Store.update_spec(:probe, "p", %{"n" => 2}, sys.i)
+      await!(sys, :probe, "p", :ready)
+      settle(sys)
+      assert fact(sys, {:seen, "p"}) == 2
+      assert alive(sys) == before
+    end
+
+    test "fails the step whose commit it was holding, which is retried" do
+      sys = start_system(controllers: [Probe])
+      runtime = Process.whereis(Runtime.name(sys.instance, Probe))
+      store = Process.whereis(Store.name(sys.instance))
+      put_fact(sys, {:observe, "p"}, :block)
+      {:ok, _} = Store.create(:probe, "p", %{}, sys.i)
+      assert_receive {:observing, "p", step}, sys.wait
+
+      # The commit is in the mailbox of a store that will never read it.
+      :ok = :sys.suspend(store)
+      :erlang.trace(store, true, [:receive])
+      put_fact(sys, {:observe, "p"}, nil)
+      send(step, :go)
+      assert_receive {:trace, ^store, :receive, {:"$gen_call", _from, {:commit, _ops}}}, sys.wait
+      :erlang.trace(store, false, [:receive])
+      monitor = Process.monitor(step)
+
+      restart_store(sys)
+
+      assert_receive {:DOWN, ^monitor, :process, ^step, {:killed, _call}}, sys.wait
+      await!(sys, :probe, "p", :ready)
+      settle(sys)
+      assert fact(sys, {:seen, "p"}) == 1
+      assert Process.whereis(Runtime.name(sys.instance, Probe)) == runtime
+    end
+
+    test "has every runtime look again, for what the old store never announced" do
+      sys = start_system(controllers: [Probe], runtime: [deliver_events: false])
+      runtime = Process.whereis(Runtime.name(sys.instance, Probe))
+
+      # In the tables, and unheard of: as if the store had died between the
+      # two.
+      {:ok, created} = Store.create(:probe, "p", %{}, sys.i)
+      settle(sys)
+      assert Store.get(:probe, "p", sys.i) == created
+
+      restart_store(sys)
+
+      await!(sys, :probe, "p", :ready)
+      assert Process.whereis(Runtime.name(sys.instance, Probe)) == runtime
+    end
+
+    test "once too often takes everything after it along" do
+      sys = system_with_pulls()
+      given_ready(sys, {:probe, "p", %{}})
+      before = alive(sys)
+      supervisor = Process.whereis(Module.concat(sys.instance, Supervisor))
+      its_own = Process.whereis(Resource.Supervisor.store_supervisor(sys.instance))
+
+      for _restart <- 1..3, do: restart_store(sys)
+      assert alive(sys) == before
+
+      # The fourth in thirty seconds ends the store's supervisor, which is
+      # the death the subtree's supervisor hears of.
+      :erlang.trace(supervisor, true, [:receive])
+      Process.exit(Process.whereis(Store.name(sys.instance)), :kill)
+      assert_receive {:trace, ^supervisor, :receive, {:EXIT, ^its_own, :shutdown}}, sys.wait
+      :erlang.trace(supervisor, false, [:receive])
+      # Answered once the children after the store are in place again.
+      _children = Supervisor.which_children(supervisor)
+
+      for {{name, old}, {name, new}} <- Enum.zip(before, alive(sys)) do
+        assert is_pid(new) and new != old, "#{inspect(name)} was not replaced"
       end
 
-      # A new generation, so both conditions have to be written again.
-      {:ok, _} = Store.update_spec(:kept, "k", %{"again" => true}, sys.i)
-      await!(sys, :kept, "k", :ready)
-      await!(sys, :kept, "k", :tagged)
+      {:ok, _} = Store.update_spec(:probe, "p", %{"n" => 2}, sys.i)
+      await!(sys, :probe, "p", :ready)
     end
   end
 
@@ -328,23 +459,12 @@ defmodule Vagus.Resource.RuntimeTest do
       assert %{failures: %{"s" => 1}, steps: 1} = Runtime.info(Sloppy, sys.i)
       assert journal(sys) == []
     end
-
-    test "outside strict mode such a verdict is dropped and the effects still happen" do
-      sys = start_system(controllers: [Sloppy], runtime: [strict_verdicts: false])
-
-      {:ok, created} = Store.create(:sloppy, "s", %{}, sys.i)
-      settle(sys)
-
-      assert %{failures: failures} = Runtime.info(Sloppy, sys.i)
-      assert failures == %{}
-      assert Store.get(:sloppy, "s", sys.i) == created
-      assert journal(sys) == [{{Sloppy, "s"}, :poke}]
-    end
   end
 
-  describe "effect groups" do
+  describe "a pass" do
     @tag :tmp_dir
-    test "the effects between two actions are one commit", %{tmp_dir: dir} do
+    test "is one commit of its ops and its verdict, made before its one action",
+         %{tmp_dir: dir} do
       test = self()
 
       persist = fn path, data ->
@@ -356,12 +476,17 @@ defmodule Vagus.Resource.RuntimeTest do
         start_system(
           controllers: [Batch],
           path: Path.join(dir, "resources.json"),
-          persist: persist
+          persist: persist,
+          runtime: [boundary: fn info -> send(test, {:boundary, info.after}) end]
         )
 
       given_ready(sys, {:batch, "b", %{}})
 
-      # The create, then one write per group: `a` with the progress and the
+      # Two passes that write and act, one that writes, and one more for the
+      # generation that one made: a commit each, whatever it holds.
+      assert boundaries() == [:commit, :action, :commit, :action, :commit, :commit]
+
+      # The create, then one write per pass: `a` with the progress and the
       # verdict, `b` with `c`, and `d`. Status alone never reaches the file.
       for _commit <- 1..4, do: assert_received(:persisted)
       refute_received :persisted
@@ -371,9 +496,60 @@ defmodule Vagus.Resource.RuntimeTest do
 
       assert journal(sys) == [{{Batch, "b"}, {:mark, 1}}, {{Batch, "b"}, {:mark, 2}}]
 
-      # The verdict went with the first group: it is there before any action.
+      # The verdict went with the commit: it is there before the action.
       assert [{:status_at_mark, 1, at_first}, {:status_at_mark, 2, _status}] = notes(sys)
       assert %{observed_generation: 1, conditions: %{ready: %{reason: :marking}}} = at_first
+    end
+  end
+
+  describe "what a kind no longer retains" do
+    @tag :tmp_dir
+    test "is deleted after the pass's action, which a delete the store refuses does not hold up",
+         %{tmp_dir: dir} do
+      test = self()
+      failing = :atomics.new(1, [])
+
+      persist = fn path, data ->
+        if :atomics.get(failing, 1) == 1,
+          do: {:error, :enospc},
+          else: Vagus.Resource.Persistence.write(path, data)
+      end
+
+      sys =
+        start_system(
+          controllers: [Finisher],
+          path: Path.join(dir, "resources.json"),
+          persist: persist,
+          runtime: [
+            backoff: {60_000, 60_000},
+            boundary: fn info ->
+              if info.name == "f-2", do: send(test, {:boundary, info.after})
+            end
+          ]
+        )
+
+      given_ready(sys, {:finisher, "f-1", %{}}, condition: :done)
+      given_ready(sys, {:finisher, "f-2", %{}}, condition: :done)
+
+      # The second is the one kept; its pass deleted the first, last of all.
+      assert boundaries() == [:commit, :action, :commit]
+
+      assert for(run <- Store.list(:finisher, sys.i), do: run.name) == ["f-2"]
+
+      shutdown(sys, true)
+      {:ok, _} = Store.create(:finisher, "f-3", %{}, sys.i)
+      :atomics.put(failing, 1, 1)
+
+      log =
+        capture_log(fn ->
+          shutdown(sys, false)
+          settle(sys)
+        end)
+
+      assert {{Finisher, "f-3"}, :sweep} in journal(sys)
+      assert log =~ ":commit_refused, {:finisher, \"f-2\"}, {:persist_failed, :enospc}"
+      assert %{failures: %{"f-3" => 1}} = Runtime.info(Finisher, sys.i)
+      assert for(run <- Store.list(:finisher, sys.i), do: run.name) == ["f-2", "f-3"]
     end
   end
 
@@ -484,7 +660,7 @@ defmodule Vagus.Resource.RuntimeTest do
       await!(sys, :probe, "p", :ready)
     end
 
-    test "has none of the actions decided from it performed, and every write around them made" do
+    test "has the action decided from it withheld, and the ops and the verdict written" do
       sys = start_system(controllers: [Probe], runtime: [unavailable_retry: 600_000])
       put_fact(sys, :engine, :down)
       put_fact(sys, :act_when_down, true)
@@ -496,14 +672,11 @@ defmodule Vagus.Resource.RuntimeTest do
           settle(sys)
         end)
 
-      assert log =~ "probe/p could not be observed; not performing [visit: 0, visit: 0]"
+      assert log =~ "probe/p could not be observed; not performing :visit"
       assert journal(sys) == []
       refute_received {:acting, "p", _n, _step}
 
-      # The writes before, between and after the two actions, with the
-      # verdict, as the one group they are once nothing separates them.
-      assert %{spec: %{"before" => true, "between" => true, "after" => true}, generation: 4} =
-               Store.get(:probe, "p", sys.i)
+      assert %{spec: %{"noted" => true}, generation: 2} = Store.get(:probe, "p", sys.i)
 
       assert %{reason: :engine_unavailable} = condition(sys, :probe, "p", :progressing)
       assert %{timers: ["p"], steps: 1} = Runtime.info(Probe, sys.i)

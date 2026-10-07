@@ -11,9 +11,20 @@ defmodule Vagus.App.Backend.Native do
   no id. Its `id` names the subtree's process and so differs for every
   start.
 
-  The subtree is a `:temporary` child: the broker's own supervisor absorbs
-  its children's crashes, and one that gives up stays down and is observed
-  as `:absent`. Whether to start it again is the controller's decision.
+  The subtree is a `:temporary` child. A crash inside the broker is
+  supervision's to recover from: the broker's own supervisor restarts its
+  children. The subtree itself ending is not: it stays down, is observed as
+  `:absent`, and whether to start it again is the controller's decision,
+  with its back-off. What ends a subtree abnormally is a kill, and a
+  restart by the holding supervisor would then race the killed subtree's
+  own children, which still hold their names and the port for a moment;
+  each failed try counts, and enough of them end the supervisor every
+  native app shares. That the subtree went is to be noticed at once by
+  whoever monitors it and wakes the app, not waited for.
+
+  `stop/3` ends the subtree through the holding supervisor. A `start/2`
+  that follows a kill closely can fail for the reason above; it is an error
+  like any other, and tried again.
 
   `start/2` of a running instance is `:ok`. When the name the subtree
   registers is held by a process the supervisor does not hold, nothing can
@@ -132,6 +143,7 @@ defmodule Vagus.App.Backend.Native do
 
   # The registered name gives a pid; whether that pid is the running
   # instance is the supervisor's to say, so it is asked for its children.
+  # An entry that is `:restarting` is no pid and so nobody's instance.
   defp child(slug, opts) do
     pid = registered(slug)
 
