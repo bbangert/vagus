@@ -365,9 +365,11 @@ decides nothing and keeps nothing a controller reads.
   what a pass decides does so: `create`, `start`, `die`, `stop`, `kill`,
   `oom`, `destroy`, `pause`, `unpause`, `restart`, `rename` and
   `health_status: …`. The rest is dropped, the three `exec_*` events of
-  every healthcheck probe above all. Events are only made members of a
-  set, emptied once per burst, so a thousand events about one container
-  are one wake.
+  every healthcheck probe above all. A `rename` is about two names: the
+  engine emits it under the new one, with the former in `oldName` as a
+  path, the events worker passes it on when either is ours, and the app of
+  each is woken. Events are only made members of a set, emptied once per
+  burst, so a thousand events about one container are one wake.
 - On every gap it makes one container list and wakes every app that has a
   container in that listing or in the one before. Events were lost, and a
   listing cannot stand in for them: a container restarted by the engine's
@@ -379,11 +381,16 @@ decides nothing and keeps nothing a controller reads.
   and health the engine's status text carries, without its durations: `Up
   3 seconds` becoming `Up 4 seconds` is no change. The first listing after
   its start wakes every app that has a container.
+- A listing runs in a process of its own, linked to the observer, one at a
+  time: the observer goes on handling events meanwhile, and a gap or tick
+  that arrives during one is one more listing after it. Nothing paces the
+  events worker, so the observer's mailbox is bounded by this alone, that
+  it never waits: an event costs one insertion into a set. The listing's
+  timeout is how long the engine may stay silent, not a deadline.
 - A listing that fails, the engine being away or anything else, keeps the
   last listing and what the next one owes, and is tried again after 1 s,
   doubling to 60 s, by one timer; each gap or tick meanwhile is a try of
-  its own. The listing's timeout is how long the engine may stay silent,
-  not a deadline.
+  its own.
 - The events worker is outside this subtree and keeps its subscribers in
   its own memory, so it is monitored, and when it is replaced, or was not
   there, subscribing is tried again after 100 ms, doubling to 30 s.
@@ -399,8 +406,8 @@ decides nothing and keeps nothing a controller reads.
 When the observer is replaced nothing is replaced with it. It starts by
 having its runtime look at every app, which finds what happened while it
 was away and, as each pass observes a native instance, tells it again what
-to watch. A backend that raises ends it, which is loud and costs only the
-observer. This is the drift repair of the App kind: neither a gap nor a
+to watch. A backend that raises does so in the lister and ends the
+observer through the link, which is loud and costs only the observer. This is the drift repair of the App kind: neither a gap nor a
 timer has every app observed by every controller.
 
 ## Verdicts

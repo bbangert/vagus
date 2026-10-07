@@ -29,19 +29,29 @@ defmodule Vagus.App.EngineObserver do
 
   Events can arrive faster than they are handled. Each is only made a
   member of the set of apps to wake, which is emptied once per burst: a
-  thousand events about one container are one wake.
+  thousand events about one container are one wake. Nothing paces the
+  events worker, so what bounds the mailbox is that this process never
+  waits for anything: handling an event is one insertion into a set, and
+  the mailbox grows only while the engine emits events faster than that.
 
-  A listing is an engine call made in this process. `:list_timeout` is how
-  long the engine may stay silent during it, not a deadline for the whole
-  of it. While it is out, events wait in the mailbox, at the engine's pace
-  and each a few hundred bytes.
+  A listing is an engine call, which can take as long as the engine stays
+  silent (`:list_timeout` is that silence, not a deadline for the whole
+  call), so it is not made here. It runs in a process of its own, linked
+  to this one and started by it: one at a time, so a notice that arrives
+  meanwhile is remembered and is one more listing after this one, however
+  many such notices there were. The link is its whole supervision. It ends
+  with this process, whatever ends this process; and a backend that raises
+  there ends this process too, with that reason, which costs nothing else.
+  Its answer comes back as a message that names the listing it answers.
 
   A listing that fails, whatever the reason, keeps the last one and what
   is owed, and is tried again after `:relist`, `{first_ms, max_ms}`,
   doubling, by one timer however many notices arrive meanwhile; each
   notice is also a try of its own. A backend whose call exits has failed
-  the same way. One that raises is a defect and ends this process, which
-  costs nothing else.
+  the same way: the client gave up, which another try may not.
+
+  A `rename` names two containers, the one that was and the one that is,
+  and wakes the app of each.
 
   ## The events worker
 
@@ -191,10 +201,14 @@ defmodule Vagus.App.EngineObserver do
       # Whom the next listing that succeeds wakes: `:everything` listed
       # before or after it, or only the `:changed`.
       owed: :everything,
-      # Whether the next drain lists. Apart from `owed`, which outlives a
+      # Whether the next drain starts a listing, or, with one in flight,
+      # whether another follows it. Apart from `owed`, which outlives a
       # failed listing while this does not: an event is no reason to ask an
       # engine again that has just failed to answer.
       due?: true,
+      # `{ref, pid, owed}` of the listing in flight: what names its answer,
+      # the process making it, and whom it wakes if it succeeds.
+      listing: nil,
       # `{token, next_delay}` after a failed listing: the token of the
       # timer that is out, or `nil` once it has fired.
       retry: nil,
@@ -234,10 +248,18 @@ defmodule Vagus.App.EngineObserver do
 
   @impl true
   def handle_info({:docker_event, %{name: name} = event}, state) do
-    if waking?(event[:action]),
-      do: {:noreply, state |> wake(Profile.app_of_container(name)) |> soon()},
-      else: {:noreply, state}
+    if waking?(event[:action]) do
+      state =
+        [name, former_name(event)] |> Enum.reduce(state, &wake(&2, Profile.app_of_container(&1)))
+
+      {:noreply, soon(state)}
+    else
+      {:noreply, state}
+    end
   end
+
+  def handle_info({:listed, ref, result}, %{listing: {ref, _pid, owed}} = state),
+    do: {:noreply, state |> listed(result, owed) |> soon()}
 
   def handle_info({:docker_events, :gap}, state),
     do: {:noreply, soon(%{state | owed: :everything, due?: true})}
@@ -293,43 +315,63 @@ defmodule Vagus.App.EngineObserver do
   end
 
   defp drain(state) do
-    state = if state.due?, do: list(%{state | due?: false}), else: state
+    state = if state.due? and state.listing == nil, do: list(state), else: state
     for app <- Enum.sort(state.wake), do: state.enqueue.(state.controller, app, state.i)
     %{state | wake: MapSet.new(), drain?: false}
   end
 
+  # The engine names a renamed container by its new name, and gives the
+  # former one as a path from its root.
+  defp former_name(%{action: "rename", attributes: %{"oldName" => former}})
+       when is_binary(former),
+       do: String.trim_leading(former, "/")
+
+  defp former_name(_event), do: nil
+
+  # Linked: the lister ends with this process, and what it raises ends this
+  # process. An exit is the client giving up on a call, which is an answer.
   defp list(state) do
-    case listing(state) do
-      {:ok, containers} ->
-        rows =
-          for summary <- containers, name <- summary.names, into: %{}, do: {name, row(summary)}
+    observer = self()
+    ref = make_ref()
+    %{backend: backend, backend_opts: opts} = state
 
-        state.rows
-        |> owed(rows, state.owed)
-        |> Enum.reduce(
-          %{state | rows: rows, owed: nil, retry: nil},
-          &wake(&2, Profile.app_of_container(&1))
-        )
+    {:ok, pid} =
+      Task.start_link(fn ->
+        result =
+          try do
+            backend.list(opts)
+          catch
+            :exit, reason -> {:exit, reason}
+          end
 
-      # Every boot begins so.
-      {:unavailable, _reason} ->
-        again(state)
+        send(observer, {:listed, ref, result})
+      end)
 
-      failed ->
-        Logger.warning(
-          "Vagus.App.EngineObserver: the containers could not be listed: #{inspect(failed)}"
-        )
-
-        again(state)
-    end
+    %{state | listing: {ref, pid, state.owed}, owed: nil, due?: false}
   end
 
-  # An exit is the client giving up on a call, which another try may not.
-  # Anything raised is left to end this process.
-  defp listing(state) do
-    state.backend.list(state.backend_opts)
-  catch
-    :exit, reason -> {:exit, reason}
+  defp listed(state, {:ok, containers}, owed) do
+    rows = for summary <- containers, name <- summary.names, into: %{}, do: {name, row(summary)}
+
+    state.rows
+    |> owed(rows, owed)
+    |> Enum.reduce(
+      %{state | rows: rows, listing: nil, retry: nil},
+      &wake(&2, Profile.app_of_container(&1))
+    )
+  end
+
+  defp listed(state, failed, owed) do
+    # An engine that is away is how every boot begins: no warning.
+    if not match?({:unavailable, _reason}, failed) do
+      Logger.warning(
+        "Vagus.App.EngineObserver: the containers could not be listed: #{inspect(failed)}"
+      )
+    end
+
+    # A notice that came meanwhile may owe more than this listing did.
+    owed = if :everything in [owed, state.owed], do: :everything, else: owed || state.owed
+    again(%{state | listing: nil, owed: owed})
   end
 
   defp owed(nil, rows, _owed), do: Map.keys(rows)

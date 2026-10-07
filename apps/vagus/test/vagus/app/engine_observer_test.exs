@@ -34,6 +34,23 @@ defmodule Vagus.App.EngineObserverTest do
     end
   end
 
+  defmodule Held do
+    @moduledoc """
+    A listing that tells the test `{:listing, lister}` and answers only
+    when told what: `:list` for the real listing, or the answer itself.
+    """
+    def list(opts) do
+      send(opts[:test], {:listing, self()})
+
+      receive do
+        {:answer, :list} -> Backend.Container.list(opts)
+        {:answer, {:raise, message}} -> raise message
+        {:answer, {:exit, reason}} -> exit(reason)
+        {:answer, answer} -> answer
+      end
+    end
+  end
+
   defmodule TwoNames do
     @moduledoc "A listing of one container that has two names."
     def list(_opts) do
@@ -97,8 +114,9 @@ defmodule Vagus.App.EngineObserverTest do
     opts =
       if id == EngineObserver, do: opts, else: Keyword.put(opts, :instance, TestInstance.name())
 
+    {sync?, opts} = Keyword.pop(opts, :sync, true)
     pid = start_supervised!({EngineObserver, opts}, id: id)
-    sync(pid)
+    if sync?, do: sync(pid)
     pid
   end
 
@@ -118,11 +136,45 @@ defmodule Vagus.App.EngineObserverTest do
     {name, pid}
   end
 
-  # A message is handled, and what it asked for done in the drain it queued
-  # behind whatever else was waiting, by the time the second answer comes.
+  # Returns once the observer is at rest: everything sent to it before this
+  # is handled, no drain is queued and no listing is in flight. Each answer
+  # comes from behind what was in its mailbox, a drain it queued for itself
+  # included; a listing in flight is waited for by its answer's arrival.
   defp sync(pid) do
-    :sys.get_state(pid)
-    :sys.get_state(pid)
+    case :sys.get_state(pid) do
+      %{listing: {ref, _lister, _owed}} ->
+        await_listing(pid, ref)
+        sync(pid)
+
+      %{drain?: true} ->
+        sync(pid)
+
+      _at_rest ->
+        :ok
+    end
+  end
+
+  defp await_listing(pid, ref) do
+    {:flags, flags} = :erlang.trace_info(pid, :flags)
+    mine? = :receive not in flags
+    if mine?, do: :erlang.trace(pid, true, [:receive])
+
+    # Read again now that arrivals are traced: it may have come in between.
+    case :sys.get_state(pid) do
+      %{listing: {^ref, _lister, _owed}} ->
+        assert_receive {:trace, ^pid, :receive, {:listed, ^ref, _answer}}, 5_000
+
+      _answered ->
+        :ok
+    end
+
+    if mine? do
+      :erlang.trace(pid, false, [:receive])
+      delivered = :erlang.trace_delivered(pid)
+      assert_receive {:trace_delivered, ^pid, ^delivered}, 2_000
+      traced(pid, :nothing)
+    end
+
     :ok
   end
 
@@ -304,13 +356,16 @@ defmodule Vagus.App.EngineObserverTest do
       :erlang.trace(pid, false, [:receive])
 
       assert listed() == 1
-      assert woken() == ["crash", "gone", "homeassistant", "keep", "new", "other"]
+      # The events' apps first, without waiting for the listing; then the
+      # listing's, which a notice makes everything.
+      assert woken() == ["keep", "other", "crash", "gone", "homeassistant", "keep", "new"]
       assert {:message_queue_len, 0} = Process.info(pid, :message_queue_len)
 
-      # The burst cost the mailbox one message more, not one each.
+      # The burst cost the mailbox one message more, not one each, and the
+      # listing's answer one after it.
       delivered = :erlang.trace_delivered(pid)
       assert_receive {:trace_delivered, ^pid, ^delivered}, 2_000
-      assert traced(pid, :drain) == 1
+      assert traced(pid, :drain) == 2
     end
   end
 
@@ -636,6 +691,310 @@ defmodule Vagus.App.EngineObserverTest do
         )
 
       assert :sys.get_state(bare).backend_opts == [engine: [recv_timeout: 99]]
+    end
+  end
+
+  describe "while a listing is out" do
+    setup context do
+      Model.put_container(context.engine, "app_keep")
+      Model.put_container(context.engine, "app_gone")
+
+      pid =
+        observer(context,
+          sync: false,
+          backend: Held,
+          backend_opts: [test: self(), engine: [socket: context.engine.socket]]
+        )
+
+      assert_receive {:listing, lister}, 2_000
+      %{pid: pid, lister: lister}
+    end
+
+    # Has the lister answer, and returns once the observer has dealt with
+    # the answer and with the drain that follows it: at rest, or with the
+    # next listing started.
+    defp answer(pid, lister, answer \\ :list) do
+      assert %{listing: {ref, ^lister, _owed}} = :sys.get_state(pid)
+      :erlang.trace(pid, true, [:receive])
+      send(lister, {:answer, answer})
+      assert_receive {:trace, ^pid, :receive, {:listed, ^ref, _answer}}, 2_000
+      :erlang.trace(pid, false, [:receive])
+      delivered = :erlang.trace_delivered(pid)
+      assert_receive {:trace_delivered, ^pid, ^delivered}, 2_000
+      traced(pid, :nothing)
+      :sys.get_state(pid)
+      :sys.get_state(pid)
+      :ok
+    end
+
+    # Sent, handled, and the drain it queued done; no waiting for a listing.
+    defp tell(pid, message) do
+      send(pid, message)
+      :sys.get_state(pid)
+      :sys.get_state(pid)
+    end
+
+    test "events are handled and their apps woken before it returns", %{pid: pid, lister: lister} do
+      :sys.suspend(pid)
+
+      for n <- 1..3_000 do
+        send(pid, {:docker_event, %{name: "app_noisy", action: "die", n: n}})
+        send(pid, {:docker_event, %{name: "app_n#{rem(n, 3)}", action: "start"}})
+      end
+
+      assert {:message_queue_len, queued} = Process.info(pid, :message_queue_len)
+      assert queued >= 6_000
+      :sys.resume(pid)
+
+      # Twice: behind the burst, and behind the drain it queued.
+      :sys.get_state(pid)
+      state = :sys.get_state(pid)
+
+      assert {:message_queue_len, 0} = Process.info(pid, :message_queue_len)
+      assert woken() == ["n0", "n1", "n2", "noisy"]
+      assert MapSet.size(state.wake) == 0
+
+      # All of that with the listing still out, and the same one.
+      assert %{listing: {_ref, ^lister, :everything}, rows: nil} = state
+      assert Process.alive?(lister)
+      refute_received {:listing, _another}
+
+      answer(pid, lister)
+      sync(pid)
+      assert woken() == ["gone", "keep"]
+    end
+
+    test "is one at a time: notices meanwhile are one more listing after it", context do
+      %{pid: pid, lister: lister, engine: engine} = context
+
+      for _ <- 1..5, do: tell(pid, {:docker_events, :gap})
+      state = tell(pid, :tick)
+      refute_received {:listing, _second}
+      assert %{listing: {_ref, ^lister, :everything}, due?: true, owed: :everything} = state
+
+      Model.put_container(engine, "app_late")
+      answer(pid, lister, {:ok, []})
+
+      # The first answered with nothing; the one more is the notices'.
+      assert_receive {:listing, second}, 2_000
+      assert second != lister
+      assert woken() == []
+
+      answer(pid, second)
+      sync(pid)
+      assert woken() == ["gone", "keep", "late"]
+      refute_received {:listing, _third}
+      assert %{listing: nil, due?: false, owed: nil} = :sys.get_state(pid)
+    end
+
+    test "a tick meanwhile is one more listing too, and owes only what changed", context do
+      %{pid: pid, lister: lister, engine: engine} = context
+      answer(pid, lister)
+      sync(pid)
+      assert woken() == ["gone", "keep"]
+
+      tell(pid, :tick)
+      assert_receive {:listing, second}, 2_000
+      tell(pid, :tick)
+      refute_received {:listing, _third}
+
+      answer(pid, second)
+      assert_receive {:listing, third}, 2_000
+      assert woken() == []
+
+      Model.put_container(engine, "app_new")
+      answer(pid, third)
+      sync(pid)
+      assert woken() == ["new"]
+    end
+
+    test "an answer that names another listing is ignored, and so is one that comes late", %{
+      pid: pid,
+      lister: lister
+    } do
+      forged =
+        {:ok,
+         [
+           %{
+             id: "x",
+             names: ["app_forged"],
+             image: "i",
+             state: "running",
+             status: "Up",
+             labels: %{}
+           }
+         ]}
+
+      state = tell(pid, {:listed, make_ref(), forged})
+      assert woken() == []
+      assert %{listing: {ref, ^lister, :everything}, rows: nil} = state
+
+      answer(pid, lister)
+      sync(pid)
+      assert woken() == ["gone", "keep"]
+
+      # The same answer again, with nothing out: nothing is waiting for it.
+      before = :sys.get_state(pid)
+      tell(pid, {:listed, ref, forged})
+      assert tell(pid, {:listed, ref, {:error, :late}}) == before
+      assert woken() == []
+      assert timers() == []
+    end
+
+    test "a failure with a notice behind it owes what the notice does, and the notice is a try",
+         context do
+      %{pid: pid, lister: lister} = context
+      answer(pid, lister)
+      sync(pid)
+      woken()
+
+      tell(pid, :tick)
+      assert_receive {:listing, second}, 2_000
+      tell(pid, {:docker_events, :gap})
+      answer(pid, second, {:unavailable, :engine_unavailable})
+
+      # The retry timer is armed, and the notice lists at once besides.
+      assert [{{:relist, _token}, 1_000}] = timers()
+      assert_receive {:listing, third}, 2_000
+      answer(pid, third)
+      sync(pid)
+      # Everything, as a notice owes; a tick alone would wake nobody here.
+      assert woken() == ["gone", "keep"]
+    end
+
+    test "a failure keeps what its own listing owed", %{pid: pid, lister: lister} do
+      # The first listing, which owes everything, fails; a tick is next.
+      answer(pid, lister, {:unavailable, :engine_unavailable})
+      assert [{{:relist, _token}, 1_000}] = timers()
+      assert %{listing: nil, owed: :everything, rows: nil} = :sys.get_state(pid)
+
+      tell(pid, :tick)
+      assert_receive {:listing, second}, 2_000
+      answer(pid, second)
+      sync(pid)
+      assert woken() == ["gone", "keep"]
+    end
+
+    test "the lister ends with the observer, however that ends", %{pid: pid, lister: lister} do
+      assert {:links, links} = Process.info(pid, :links)
+      assert lister in links
+
+      ref = Process.monitor(lister)
+      Process.exit(pid, :kill)
+      assert_receive {:DOWN, ^ref, :process, ^lister, :killed}, 2_000
+    end
+
+    test "a backend that raises in the lister ends the observer with what it raised", context do
+      %{pid: pid, lister: lister} = context
+      ref = Process.monitor(pid)
+
+      send(lister, {:answer, {:raise, "held and broken"}})
+
+      assert_receive {:DOWN, ^ref, :process, ^pid,
+                      {%RuntimeError{message: "held and broken"}, _stack}},
+                     2_000
+    end
+
+    test "a backend whose call exits in the lister is a failed listing, and the observer lives",
+         %{pid: pid, lister: lister} do
+      log = capture_log(fn -> answer(pid, lister, {:exit, :gave_up}) end)
+
+      assert log =~ "could not be listed"
+      assert log =~ ":gave_up"
+      assert [{{:relist, _token}, 1_000}] = timers()
+      assert %{listing: nil, owed: :everything} = :sys.get_state(pid)
+      assert woken() == []
+    end
+  end
+
+  describe "a rename" do
+    setup context do
+      pid = observer(context)
+      woken()
+      %{pid: pid}
+    end
+
+    # As the engine emits one: under the new name, the former one a path.
+    defp renamed(pid, from, to) do
+      fire(
+        pid,
+        {:docker_event,
+         %{name: to, action: "rename", attributes: %{"name" => to, "oldName" => from}}}
+      )
+    end
+
+    test "to a name that is no app's wakes the app it was", %{pid: pid} do
+      renamed(pid, "/app_a", "elsewhere")
+      assert woken() == ["a"]
+    end
+
+    test "from a name that is no app's wakes the app it is now", %{pid: pid} do
+      renamed(pid, "/elsewhere", "app_b")
+      assert woken() == ["b"]
+    end
+
+    test "from one app's name to another's wakes both, and to its own other name once", %{
+      pid: pid
+    } do
+      renamed(pid, "/app_a", "app_b")
+      assert woken() == ["a", "b"]
+
+      renamed(pid, "/addon_c", "app_c")
+      assert woken() == ["c"]
+
+      renamed(pid, "/homeassistant", "homeassistant_old")
+      renamed(pid, "/homeassistant_new", "homeassistant")
+      assert woken() == ["homeassistant", "homeassistant"]
+    end
+
+    test "between names that are no app's wakes nobody", %{pid: pid} do
+      renamed(pid, "/elsewhere", "hassio_dns")
+      assert woken() == []
+    end
+
+    test "with no former name, or none that is a name, wakes by its name as any event", %{
+      pid: pid
+    } do
+      fire(pid, {:docker_event, %{name: "app_a", action: "rename", attributes: %{}}})
+      fire(pid, {:docker_event, %{name: "app_b", action: "rename"}})
+      assert woken() == ["a", "b"]
+
+      for former <- [nil, 7, "", "/", ["app_x"]] do
+        fire(
+          pid,
+          {:docker_event,
+           %{name: "elsewhere", action: "rename", attributes: %{"oldName" => former}}}
+        )
+      end
+
+      assert woken() == []
+
+      # Without the slash, it is the name all the same.
+      renamed(pid, "app_bare", "elsewhere")
+      assert woken() == ["bare"]
+    end
+
+    test "a former name on any other action is nobody's", %{pid: pid} do
+      for action <- ["die", "start", "destroy", "health_status: unhealthy"] do
+        fire(
+          pid,
+          {:docker_event,
+           %{name: "elsewhere", action: action, attributes: %{"oldName" => "/app_a"}}}
+        )
+      end
+
+      assert woken() == []
+    end
+
+    test "through the events worker, away from an app's name, wakes that app", context do
+      {name, _events} = events(context)
+      observer(context, id: :through, events: {Events, name})
+      woken()
+
+      Model.emit(context.engine, "rename", "elsewhere", %{"oldName" => "/app_moved"})
+      Model.emit(context.engine, "rename", "bystander", %{"oldName" => "/elsewhere"})
+      barrier(context.engine)
+      assert woken() == ["moved"]
     end
   end
 

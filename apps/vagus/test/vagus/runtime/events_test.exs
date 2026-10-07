@@ -459,6 +459,68 @@ defmodule Vagus.Runtime.EventsTest do
              ]
     end
 
+    # As the engine emits one: under the new name, the former one a path.
+    defp renamed(engine, from, to, attributes \\ %{}),
+      do: Model.emit(engine, "rename", to, Map.merge(%{"oldName" => "/" <> from}, attributes))
+
+    test "a rename is forwarded when either of its names is ours, and carries both", %{
+      engine: engine
+    } do
+      start_stream(engine)
+
+      renamed(engine, "app_a", "elsewhere")
+      renamed(engine, "elsewhere", "app_b")
+      renamed(engine, "app_c", "addon_c")
+      renamed(engine, "bystander", "elsewhere")
+      renamed(engine, "homeassistant", "homeassistant_old")
+      renamed(engine, "homeassistant_new", "homeassistant")
+      renamed(engine, "homeassistant2", "homeassistant3")
+      renamed(engine, "my_app_x", "application")
+
+      assert events_so_far(engine) == [
+               {"rename", "elsewhere"},
+               {"rename", "app_b"},
+               {"rename", "addon_c"},
+               {"rename", "homeassistant_old"},
+               {"rename", "homeassistant"}
+             ]
+
+      renamed(engine, "app_a", "elsewhere")
+
+      assert_receive {:docker_event,
+                      %{action: "rename", name: "elsewhere", attributes: attributes}},
+                     2_000
+
+      assert attributes["oldName"] == "/app_a"
+    end
+
+    test "a rename with no former name, or one that is no name, is judged by its name alone", %{
+      engine: engine
+    } do
+      start_stream(engine)
+
+      Model.emit(engine, "rename", "elsewhere")
+      Model.emit(engine, "rename", "app_kept")
+      Model.emit(engine, "rename", "elsewhere", %{"oldName" => 7})
+      Model.emit(engine, "rename", "elsewhere", %{"oldName" => nil})
+      Model.emit(engine, "rename", "elsewhere", %{"oldName" => ""})
+      # Without the slash a fork might leave out, it is still the name.
+      Model.emit(engine, "rename", "elsewhere2", %{"oldName" => "addon_bare"})
+
+      assert events_so_far(engine) == [{"rename", "app_kept"}, {"rename", "elsewhere2"}]
+    end
+
+    test "a former name means nothing on any other action", %{engine: engine} do
+      start_stream(engine)
+
+      for action <- ["die", "start", "destroy", "health_status: unhealthy", "renamed", "Rename"] do
+        Model.emit(engine, action, "elsewhere", %{"oldName" => "/app_a"})
+        Model.emit(engine, action, "elsewhere", %{"oldName" => "/homeassistant"})
+      end
+
+      assert events_so_far(engine) == []
+    end
+
     test "managed?/2 is the label, the two prefixes, or Core's name" do
       assert Events.managed?("app_x", %{})
       assert Events.managed?("addon_x", %{})

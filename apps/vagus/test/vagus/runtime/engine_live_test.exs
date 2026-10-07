@@ -248,6 +248,35 @@ defmodule Vagus.Runtime.EngineLiveTest do
 
       assert streak >= 1
     end
+
+    defp rename(from, to) do
+      on_exit(fn -> Docker.remove_container(to, force: true) end)
+
+      assert {:ok, %{status: 204}} =
+               Docker.request(:post, "/containers/#{from}/rename", query: [name: to])
+    end
+
+    test "a rename is emitted under the new name, with the former one as a path" do
+      former = container(unique("app"), ["sleep", "300"])
+      {:ok, %{"Id" => id}} = Docker.inspect_container(former)
+      events()
+
+      # To a name that is none of ours: only the former one says whose it was.
+      away = unique("renamed")
+      rename(former, away)
+
+      assert_receive {:docker_event, %{action: "rename", name: ^away} = event}, 5_000
+      assert event.id == id
+      assert event.attributes["oldName"] == "/" <> former
+      assert event.attributes["name"] == away
+
+      # And back: the new name is ours, the former one is not.
+      back = unique("app")
+      rename(away, back)
+
+      assert_receive {:docker_event, %{action: "rename", name: ^back} = event}, 5_000
+      assert event.attributes["oldName"] == "/" <> away
+    end
   end
 
   describe "stop" do
