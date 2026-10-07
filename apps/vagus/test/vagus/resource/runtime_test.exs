@@ -312,7 +312,7 @@ defmodule Vagus.Resource.RuntimeTest do
       settle(sys)
       kept = Store.get(:kept, "k", sys.i)
       assert kept.status.observed_generation == kept.generation
-      assert Map.keys(kept.status.conditions) == [:ready, :tagged]
+      assert Enum.sort(Map.keys(kept.status.conditions)) == [:ready, :tagged]
       assert Enum.count(journal(sys), &(&1 == {{:kept, "k"}, :make})) == 2
     end
 
