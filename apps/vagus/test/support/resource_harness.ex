@@ -269,6 +269,40 @@ defmodule Vagus.Resource.Harness do
   end
 
   @doc """
+  The timer a runtime has pending for a resource: the runtime, how long the
+  timer still has to run, and the message it will deliver. Raises if there
+  is none.
+  """
+  @spec pending_timer(system(), module(), Resource.name()) ::
+          %{runtime: pid(), remaining: non_neg_integer(), message: term()}
+  def pending_timer(sys, controller, name) do
+    runtime = Process.whereis(Runtime.name(sys.instance, controller))
+    %{^name => %{uid: uid, timer: {timer, token}}} = :sys.get_state(runtime).known
+
+    %{
+      runtime: runtime,
+      remaining: Process.read_timer(timer),
+      message: {:requeue, name, uid, token}
+    }
+  end
+
+  @doc """
+  Delivers a resource's pending timer now instead of waiting for it, and
+  returns how long it still had to run. The runtime has read the message
+  when this returns.
+  """
+  @spec fire_timer(system(), module(), Resource.name()) :: non_neg_integer()
+  def fire_timer(sys, controller, name) do
+    %{runtime: runtime, remaining: remaining, message: message} =
+      pending_timer(sys, controller, name)
+
+    send(runtime, message)
+    # A call from here is behind that message; a settle might not be.
+    _info = Runtime.info(controller, sys.i)
+    remaining
+  end
+
+  @doc """
   Waits for something about one resource, and returns the resource. `what`
   is a condition type, which must be true and about the current generation;
   `{type, status}`; `:gone`; or a function of the resource (or `nil`).

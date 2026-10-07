@@ -169,11 +169,7 @@ defmodule Vagus.Resource.CollectorTest do
       sys
     end
 
-    defp expire(sys, step_of) do
-      runtime = Process.whereis(Runtime.name(sys.instance, OneShot))
-      %{^step_of => {_timer, token}} = :sys.get_state(runtime).timers
-      send(runtime, {:requeue, step_of, token})
-    end
+    defp expire(sys, step_of), do: fire_timer(sys, OneShot, step_of)
 
     test "a resource created under an expired name since the listing is not the one deleted" do
       sys =
@@ -251,12 +247,10 @@ defmodule Vagus.Resource.CollectorTest do
       sys = start_system(controllers: [OneShot])
       given_ready(sys, {:oneshot, "run", %{}}, condition: :done)
 
-      runtime = Process.whereis(Runtime.name(sys.instance, OneShot))
-      assert %{"run" => {timer, token}} = :sys.get_state(runtime).timers
-      assert Process.read_timer(timer) in 90_000..100_001
+      assert pending_timer(sys, OneShot, "run").remaining in 90_000..100_001
 
       TestClock.advance(sys.clock, 100_001)
-      send(runtime, {:requeue, "run", token})
+      fire_timer(sys, OneShot, "run")
       await!(sys, :oneshot, "run", :gone)
     end
 

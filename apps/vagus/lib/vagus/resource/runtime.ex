@@ -3,8 +3,9 @@ defmodule Vagus.Resource.Runtime do
   Runs one controller against the resources of its kind.
 
   It owns a queue of resource names with at most one step in flight per
-  name, the timers and failure counts of those names, and an index of which
-  other resources each one refers to. None of it is durable and none needs
+  name, and what it remembers of each resource: its timer, its failure
+  count, the references it reported. That is kept by uid, so a resource
+  created under a deleted one's name starts with nothing. None of it is durable and none needs
   to be: a start lists the kind and looks at everything.
 
   A step (`Vagus.Resource.Runtime.Step`) runs in a task under the
@@ -181,17 +182,14 @@ defmodule Vagus.Resource.Runtime do
         priority: 0
       },
       queued: MapSet.new(),
+      # `name => %{task, uid}`: the step in flight and the resource it is
+      # about.
       in_flight: %{},
       refs: %{},
       dirty: MapSet.new(),
-      # Names removed while their step was in flight: what that step reports
-      # is about a resource that is gone.
-      stale: MapSet.new(),
-      timers: %{},
-      failures: %{},
-      failed: %{},
-      acted: %{},
-      refs_out: %{},
+      # Everything remembered about a resource, by name, each record saying
+      # which uid it is about. See `record/3`.
+      known: %{},
       refs_in: %{},
       watched: MapSet.new([kind]),
       steps: 0,
@@ -236,8 +234,8 @@ defmodule Vagus.Resource.Runtime do
   def handle_info({Watch, _event, _meta}, %{deliver_events: false} = state),
     do: {:noreply, state}
 
-  def handle_info({Watch, event, %{kind: kind, name: name}}, state) do
-    state = if kind == state.kind, do: own(state, event, name), else: state
+  def handle_info({Watch, event, %{kind: kind, name: name} = meta}, state) do
+    state = if kind == state.kind, do: own(state, event, meta), else: state
 
     state.refs_in
     |> Map.get({kind, name}, [])
@@ -252,10 +250,10 @@ defmodule Vagus.Resource.Runtime do
   # The token: a timer cancelled after it fired has its message in the
   # mailbox already, and for a resource since deleted that message must not
   # queue the name again.
-  def handle_info({:requeue, name, token}, state) do
-    case state.timers do
-      %{^name => {_timer, ^token}} ->
-        {:noreply, %{state | timers: Map.delete(state.timers, name)} |> enqueue(name) |> settle()}
+  def handle_info({:requeue, name, uid, token}, state) do
+    case record(state, name, uid) do
+      %{timer: {_timer, ^token}} = record ->
+        {:noreply, state |> put_record(name, %{record | timer: nil}) |> enqueue(name) |> settle()}
 
       _stale ->
         {:noreply, state}
@@ -285,24 +283,81 @@ defmodule Vagus.Resource.Runtime do
   defp noreply(state), do: {:noreply, state}
 
   defp snapshot(state) do
+    names = fn keep? -> for {name, record} <- state.known, keep?.(record), do: name end
+
     %{
       queued: state.queued |> MapSet.to_list() |> Enum.sort(),
-      in_flight: Map.new(state.in_flight, fn {name, task} -> {name, task.pid} end),
+      in_flight: Map.new(state.in_flight, fn {name, flight} -> {name, flight.task.pid} end),
       dirty: state.dirty |> MapSet.to_list() |> Enum.sort(),
-      timers: state.timers |> Map.keys() |> Enum.sort(),
-      failures: state.failures,
-      references: state.refs_out,
+      timers: Enum.sort(names.(&(&1.timer != nil))),
+      failures: for({name, %{failures: n}} <- state.known, n > 0, into: %{}, do: {name, n}),
+      references:
+        for({name, %{refs: [_ | _] = refs}} <- state.known, into: %{}, do: {name, refs}),
       steps: state.steps
     }
   end
 
-  defp own(state, :changed, name), do: enqueue(state, name)
+  # What is remembered about a resource is about that resource, not about
+  # its name: a failure count, a failed action, the actions of the last
+  # pass, a pending timer and the references it reported. `record/3` is the
+  # only way to read it and `put_record/3` the only way to write it, both by
+  # name and uid, so that nothing remembered of a deleted resource is ever
+  # read as, or added to, what is known of a later one of the same name.
+  defp record(state, name, uid) do
+    case state.known do
+      %{^name => %{uid: ^uid} = record} -> record
+      _none_or_another -> %{uid: uid, failures: 0, failed: nil, acted: [], timer: nil, refs: []}
+    end
+  end
 
-  defp own(state, :removed, name) do
-    stale =
-      if is_map_key(state.in_flight, name), do: MapSet.put(state.stale, name), else: state.stale
+  # Uids only grow. So a record for a higher uid replaces what was known of
+  # the name, after that has been dropped whole, and one for a lower uid is
+  # about a resource already replaced and is not kept.
+  defp put_record(state, name, %{uid: uid} = record) do
+    case state.known do
+      %{^name => %{uid: held}} when held > uid -> state
+      %{^name => %{uid: held}} when held < uid -> put_record(forget(state, name), name, record)
+      _same_or_none -> %{state | known: Map.put(state.known, name, record)}
+    end
+  end
 
-    forget(%{state | stale: stale}, name)
+  # Having seen `uid` under `name`: whatever was known of an earlier resource
+  # of that name is dropped now, before anything is decided from it.
+  defp seen(state, name, uid), do: put_record(state, name, record(state, name, uid))
+
+  defp forget(state, name) do
+    case Map.pop(state.known, name) do
+      {nil, _known} ->
+        state
+
+      {record, known} ->
+        cancel(record.timer)
+        %{state | known: known, refs_in: unrefer(state.refs_in, record.refs, name)}
+    end
+  end
+
+  defp cancel(nil), do: :ok
+  defp cancel({timer, _token}), do: Process.cancel_timer(timer)
+
+  defp unrefer(refs_in, keys, name) do
+    Enum.reduce(keys, refs_in, fn key, refs_in ->
+      case List.delete(Map.fetch!(refs_in, key), name) do
+        [] -> Map.delete(refs_in, key)
+        names -> Map.put(refs_in, key, names)
+      end
+    end)
+  end
+
+  defp own(state, :changed, %{name: name, uid: uid}),
+    do: state |> seen(name, uid) |> enqueue(name)
+
+  # Only what was known of the resource that went: a removal read late must
+  # not cost its successor anything.
+  defp own(state, :removed, %{name: name, uid: uid}) do
+    case state.known do
+      %{^name => %{uid: ^uid}} -> forget(state, name)
+      _none_or_another -> state
+    end
   end
 
   defp schedule_resync(%{resync: :infinity} = state), do: state
@@ -316,52 +371,32 @@ defmodule Vagus.Resource.Runtime do
   defp look_again(state), do: relist(state)
 
   defp relist(state) do
-    names = for resource <- Store.list(state.kind, state.i), do: resource.name
-    state = Enum.reduce(names, state, &enqueue(&2, &1))
+    listed = for resource <- Store.list(state.kind, state.i), do: {resource.name, resource.uid}
+
+    state =
+      Enum.reduce(listed, state, fn {name, uid}, state ->
+        state |> seen(name, uid) |> enqueue(name)
+      end)
 
     # What a missed removal notice left behind.
-    [state.timers, state.failures, state.failed, state.acted, state.refs_out]
-    |> Enum.flat_map(&Map.keys/1)
-    |> Enum.uniq()
-    |> Kernel.--(names)
-    |> Enum.reduce(state, &forget(&2, &1))
-  end
-
-  defp forget(state, name) do
-    state = state |> cancel_timer(name) |> index(name, []) |> elem(0)
-
-    %{
-      state
-      | queued: MapSet.delete(state.queued, name),
-        failures: Map.delete(state.failures, name),
-        failed: Map.delete(state.failed, name),
-        acted: Map.delete(state.acted, name)
-    }
+    Enum.reduce(Map.keys(state.known) -- Enum.map(listed, &elem(&1, 0)), state, &forget(&2, &1))
   end
 
   # Returns whether `keys` holds a reference the index did not have for the
-  # name, having subscribed to its kind if nobody had.
-  defp index(state, name, keys) do
-    old = Map.get(state.refs_out, name, [])
-    added = keys -- old
+  # resource, having subscribed to its kind if nobody had.
+  defp index(state, name, uid, keys) do
+    record = record(state, name, uid)
+    added = keys -- record.refs
 
     refs_in =
-      Enum.reduce(old -- keys, state.refs_in, fn key, refs_in ->
-        case List.delete(Map.fetch!(refs_in, key), name) do
-          [] -> Map.delete(refs_in, key)
-          names -> Map.put(refs_in, key, names)
-        end
-      end)
+      Enum.reduce(
+        added,
+        unrefer(state.refs_in, record.refs -- keys, name),
+        &Map.update(&2, &1, [name], fn names -> [name | names] end)
+      )
 
-    refs_in =
-      Enum.reduce(added, refs_in, &Map.update(&2, &1, [name], fn names -> [name | names] end))
-
-    refs_out =
-      if keys == [],
-        do: Map.delete(state.refs_out, name),
-        else: Map.put(state.refs_out, name, keys)
-
-    {watch(%{state | refs_in: refs_in, refs_out: refs_out}, added), added != []}
+    state = put_record(%{state | refs_in: refs_in}, name, %{record | refs: keys})
+    {watch(state, added), added != []}
   end
 
   defp watch(state, keys) do
@@ -404,34 +439,40 @@ defmodule Vagus.Resource.Runtime do
     end
   end
 
+  # The row is read here, a table read, so that the runtime knows which
+  # resource the step is about before the step says anything: a step that
+  # crashes says nothing.
   defp start_step(name, state) do
-    step = Map.merge(state.step, %{name: name, failed_action: Map.get(state.failed, name)})
-    task = Task.Supervisor.async_nolink(state.tasks, Step, :run, [step])
+    case Store.get(state.kind, name, state.i) do
+      nil ->
+        forget(state, name)
 
-    %{
-      state
-      | in_flight: Map.put(state.in_flight, name, task),
-        refs: Map.put(state.refs, task.ref, name),
-        steps: state.steps + 1
-    }
+      %Resource{uid: uid} = resource ->
+        state = seen(state, name, uid)
+
+        step =
+          Map.merge(state.step, %{
+            name: name,
+            resource: resource,
+            failed_action: record(state, name, uid).failed
+          })
+
+        task = Task.Supervisor.async_nolink(state.tasks, Step, :run, [step])
+
+        %{
+          state
+          | in_flight: Map.put(state.in_flight, name, %{task: task, uid: uid}),
+            refs: Map.put(state.refs, task.ref, name),
+            steps: state.steps + 1
+        }
+    end
   end
 
   defp finish(state, ref, result) do
     {name, refs} = Map.pop!(state.refs, ref)
+    {%{uid: uid}, in_flight} = Map.pop!(state.in_flight, name)
     dirty? = MapSet.member?(state.dirty, name)
-    stale? = MapSet.member?(state.stale, name)
-
-    state =
-      cancel_timer(
-        %{
-          state
-          | refs: refs,
-            in_flight: Map.delete(state.in_flight, name),
-            dirty: MapSet.delete(state.dirty, name),
-            stale: MapSet.delete(state.stale, name)
-        },
-        name
-      )
+    state = %{state | refs: refs, in_flight: in_flight, dirty: MapSet.delete(state.dirty, name)}
 
     # The store writes its table before it sends a notice. So a resource
     # missing here is gone, whatever this step or a notice not yet read
@@ -440,25 +481,22 @@ defmodule Vagus.Resource.Runtime do
       nil ->
         forget(state, name)
 
-      stored ->
-        if stale? or other?(result, stored) do
-          # The step was about an earlier resource of this name. Nothing it
-          # found is true of this one, which has only been announced.
-          state = forget(state, name)
-          if dirty?, do: enqueue(state, name), else: state
-        else
-          {state, new_reference?} = learn(state, name, result)
-          {state, carried?} = outcome(state, name, result)
-          again?(state, name, dirty?, new_reference?, carried?)
-        end
+      # The step was about an earlier resource of this name, whether it
+      # ended or crashed and whether or not the notices have been read.
+      # Nothing it found is true of this one, which is only looked at.
+      %Resource{uid: other} when other != uid ->
+        state |> seen(name, other) |> enqueue(name)
+
+      %Resource{} ->
+        state = disarm(state, name, uid)
+        {state, new_reference?} = learn(state, name, uid, result)
+        {state, carried?} = outcome(state, name, uid, result)
+        again?(state, name, dirty?, new_reference?, carried?)
     end
   end
 
-  defp other?(%{uid: uid}, stored), do: uid != stored.uid
-  defp other?(_gone_or_crashed, _stored), do: false
-
-  defp learn(state, name, %{refs: keys}), do: index(state, name, keys)
-  defp learn(state, _name, _gone_or_crashed), do: {state, false}
+  defp learn(state, name, uid, %{refs: keys}), do: index(state, name, uid, keys)
+  defp learn(state, _name, _uid, _crashed), do: {state, false}
 
   # A reference the index learns only now may have changed after the step
   # observed it and before this: that notice came while nothing pointed from
@@ -477,88 +515,78 @@ defmodule Vagus.Resource.Runtime do
   end
 
   # Each returns whether it armed a timer that is to carry the next pass.
-  defp outcome(state, name, %{outcome: {:ok, next}, actions: actions}) do
-    state = %{state | failed: Map.delete(state.failed, name)}
+  defp outcome(state, name, uid, %{outcome: {:ok, next}, actions: actions}) do
+    record = %{record(state, name, uid) | failed: nil}
 
-    if actions != [] and Map.get(state.acted, name) == actions do
+    if actions != [] and record.acted == actions do
       # The same actions as the pass before, which therefore changed nothing
       # that this pass could observe.
-      {paced(state, name), true}
+      {paced(state, name, record), true}
     else
-      acted =
-        if actions == [],
-          do: Map.delete(state.acted, name),
-          else: Map.put(state.acted, name, actions)
+      record = %{record | failures: 0, acted: actions}
 
-      {next(%{state | failures: Map.delete(state.failures, name), acted: acted}, name, next),
-       false}
+      case next do
+        :rest -> {put_record(state, name, record), false}
+        :now -> {state |> put_record(name, record) |> enqueue(name), false}
+        {:after, ms} -> {arm(state, name, record, ms), false}
+      end
     end
   end
 
   # Not a failure: nothing was tried. The failed action of the pass before
   # is kept for the next pass that can observe.
-  defp outcome(state, name, %{outcome: {:unavailable, next}}) do
+  defp outcome(state, name, uid, %{outcome: {:unavailable, next}}) do
     ms =
       case next do
         {:after, ms} -> min(ms, state.unavailable_retry)
         _other -> state.unavailable_retry
       end
 
-    {arm(state, name, ms), true}
+    {arm(state, name, record(state, name, uid), ms), true}
   end
 
   # The controller counts these and paces its own retries, so the next pass
   # is at once, to let its verdict say what happened. Should that pass end
   # the same way, nothing is pacing them, and the back-off does.
-  defp outcome(state, name, %{outcome: {:action_failed, failure}}) do
-    state = %{state | failed: Map.put(state.failed, name, failure)}
+  defp outcome(state, name, uid, %{outcome: {:action_failed, failure}}) do
+    record = %{record(state, name, uid) | failed: failure}
 
-    if is_map_key(state.failures, name),
-      do: {paced(state, name), true},
-      else: {enqueue(%{state | failures: Map.put(state.failures, name, 1)}, name), false}
+    if record.failures > 0,
+      do: {paced(state, name, record), true},
+      else: {state |> put_record(name, %{record | failures: 1}) |> enqueue(name), false}
   end
 
-  defp outcome(state, name, %{outcome: :gated}), do: {enqueue(state, name), false}
-  defp outcome(state, _name, %{outcome: :gone}), do: {state, false}
-  defp outcome(state, _name, :gone), do: {state, false}
+  defp outcome(state, name, _uid, %{outcome: :gated}), do: {enqueue(state, name), false}
+  defp outcome(state, _name, _uid, %{outcome: :gone}), do: {state, false}
 
-  defp outcome(state, name, crashed) do
-    state = paced(state, name)
+  defp outcome(state, name, uid, crashed) do
+    record = record(state, name, uid)
 
     Logger.warning(
       "#{inspect(state.controller)}: step for #{state.kind}/#{name} failed " <>
-        "(#{state.failures[name]}): #{inspect(crashed)}"
+        "(#{record.failures + 1}): #{inspect(crashed)}"
     )
 
-    {state, true}
+    {paced(state, name, record), true}
   end
 
-  defp paced(%{backoff: {base, max}} = state, name) do
-    count = Map.get(state.failures, name, 0) + 1
+  defp paced(%{backoff: {base, max}} = state, name, record) do
+    count = record.failures + 1
     ms = min(base * Integer.pow(2, min(count - 1, 20)), max)
-    arm(%{state | failures: Map.put(state.failures, name, count)}, name, ms)
+    arm(state, name, %{record | failures: count}, ms)
   end
 
-  defp next(state, _name, :rest), do: state
-  defp next(state, name, :now), do: enqueue(state, name)
-  defp next(state, name, {:after, ms}), do: arm(state, name, ms)
-
-  defp arm(state, name, ms) do
-    state = cancel_timer(state, name)
+  defp arm(state, name, %{uid: uid} = record, ms) do
+    cancel(record.timer)
     token = make_ref()
-    timer = Process.send_after(self(), {:requeue, name, token}, ms)
-    %{state | timers: Map.put(state.timers, name, {timer, token})}
+    timer = Process.send_after(self(), {:requeue, name, uid, token}, ms)
+    put_record(state, name, %{record | timer: {timer, token}})
   end
 
-  defp cancel_timer(state, name) do
-    case Map.pop(state.timers, name) do
-      {nil, _timers} ->
-        state
-
-      {{timer, _token}, timers} ->
-        Process.cancel_timer(timer)
-        %{state | timers: timers}
-    end
+  defp disarm(state, name, uid) do
+    record = record(state, name, uid)
+    cancel(record.timer)
+    put_record(state, name, %{record | timer: nil})
   end
 
   defp answer_probes(%{probes: []} = state), do: state
@@ -569,7 +597,7 @@ defmodule Vagus.Resource.Runtime do
 
     {answered, waiting} =
       Enum.split_with(state.probes, fn {_reply_to, _ref, timers} ->
-        quiet? and (timers == :any or map_size(state.timers) == 0)
+        quiet? and (timers == :any or Enum.all?(state.known, &(elem(&1, 1).timer == nil)))
       end)
 
     for {reply_to, ref, _timers} <- answered, do: send(reply_to, {ref, self(), state.steps})

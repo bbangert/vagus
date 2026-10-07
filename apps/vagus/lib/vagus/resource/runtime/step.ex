@@ -5,9 +5,8 @@ defmodule Vagus.Resource.Runtime.Step do
   callback that raises or an engine call that hangs costs the runtime
   nothing but that key.
 
-  The task's result is `:gone` when there is no such resource, and
-  otherwise says which resource the pass read, what that resource refers
-  to, which actions the pass performed, and its outcome:
+  The task's result says what the resource it was given refers to, which
+  actions the pass performed, and its outcome:
 
     * `{:ok, next}`, a pass that ran, `next` being `:rest`, `:now` or
       `{:after, ms}`;
@@ -34,34 +33,20 @@ defmodule Vagus.Resource.Runtime.Step do
           | :gone
           | :gated
 
-  @typedoc """
-  `uid` is the resource the pass was about: the runtime keys its queue by
-  name, and what this pass found out must not be believed of a later
-  resource of that name. `refs` is what the resource refers to, `actions`
-  what the pass performed.
-  """
-  @type result ::
-          :gone
-          | %{
-              uid: pos_integer(),
-              refs: [Resource.key()],
-              actions: [{atom(), term()}],
-              outcome: outcome()
-            }
+  @typedoc "`refs` is what the resource refers to, `actions` what the pass performed."
+  @type result :: %{refs: [Resource.key()], actions: [{atom(), term()}], outcome: outcome()}
 
+  # `step.resource` is the row the runtime read when it started this, which
+  # is how the runtime knows whose pass it is even if the pass crashes.
+  #
+  # The controller's own code is called here and not in the runtime: one
+  # callback that raises, exits or never returns costs this key and nothing
+  # else.
   @spec run(map()) :: result()
-  def run(%{kind: kind, name: name} = step) do
-    case Store.get(kind, name, step.i) do
-      nil ->
-        :gone
-
-      resource ->
-        # The controller's own code, here and not in the runtime: one that
-        # raises, exits or never returns costs this key and nothing else.
-        step = %{step | priority: priority(step, resource)}
-        result = %{uid: resource.uid, refs: references(step, resource), actions: [], outcome: nil}
-        pass(step, resource, collectable(step, resource), result)
-    end
+  def run(%{resource: %Resource{} = resource} = step) do
+    step = %{step | priority: priority(step, resource)}
+    result = %{refs: references(step, resource), actions: [], outcome: nil}
+    pass(step, resource, collectable(step, resource), result)
   end
 
   defp priority(step, resource) do

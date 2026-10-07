@@ -208,30 +208,63 @@ defmodule Vagus.Resource.Controller do
 
   @doc """
   Evaluates the controller's declarations. Raises, naming the controller
-  and the callback, if one of them does.
+  and the callback, if one of them raises or returns anything but what it
+  is declared to: an atom for `kind/0` and `finalizer/0`, a list of atoms
+  for `condition_types/0`, `owned_conditions/0` and `finalize_after/0`, a
+  list of paths for `writer_entries/0`, and a map of a `keep` count and a
+  `ttl_ms` for `retention/0`. A value of the wrong shape would otherwise
+  surface later and elsewhere, as a store that refuses a registration or a
+  step that fails on every resource.
   """
   @spec declare(module()) :: declaration()
   def declare(controller) do
     Code.ensure_loaded!(controller)
     owner? = owner?(controller)
+    conditions = if owner?, do: :condition_types, else: :owned_conditions
+    atoms = {"a list of atoms", &list_of?(&1, fn atom -> is_atom(atom) end)}
+    name = {"an atom other than nil", &(is_atom(&1) and &1 != nil)}
 
     %{
       controller: controller,
-      kind: declared(controller, :kind, :required),
+      kind: declared(controller, :kind, :required, name),
       owner?: owner?,
-      conditions:
-        declared(controller, if(owner?, do: :condition_types, else: :owned_conditions), :required),
-      retention: declared(controller, :retention, nil),
-      finalizer: declared(controller, :finalizer, nil),
-      finalize_after: declared(controller, :finalize_after, []),
-      writer_entries: declared(controller, :writer_entries, [])
+      conditions: declared(controller, conditions, :required, atoms),
+      retention:
+        declared(
+          controller,
+          :retention,
+          nil,
+          {"%{keep: count, ttl_ms: ms | :infinity}", &retention?/1}
+        ),
+      finalizer: declared(controller, :finalizer, nil, name),
+      finalize_after: declared(controller, :finalize_after, [], atoms),
+      writer_entries:
+        declared(
+          controller,
+          :writer_entries,
+          [],
+          {"a list of spec paths", &list_of?(&1, fn path -> Resource.path?(path) end)}
+        )
     }
   end
 
-  defp declared(controller, callback, default) do
-    if default == :required or exports?(controller, callback, 0),
-      do: apply(controller, callback, []),
-      else: default
+  defp declared(controller, callback, default, {expected, valid?}) do
+    if default == :required or exports?(controller, callback, 0) do
+      value = returned(controller, callback)
+
+      if not valid?.(value) do
+        raise ArgumentError,
+              "#{inspect(controller)}.#{callback}/0 returned #{inspect(value)}, not #{expected}"
+      end
+
+      value
+    else
+      default
+    end
+  end
+
+  defp returned(controller, callback) do
+    apply(controller, callback, [])
   catch
     kind, reason ->
       raise ArgumentError,
@@ -239,15 +272,26 @@ defmodule Vagus.Resource.Controller do
               Exception.format_banner(kind, reason, __STACKTRACE__)
   end
 
+  # Not `Enum`: it raises on what is not a proper list, without a name.
+  defp list_of?([], _valid?), do: true
+  defp list_of?([head | tail], valid?), do: valid?.(head) and list_of?(tail, valid?)
+  defp list_of?(_not_a_list, _valid?), do: false
+
+  defp retention?(%{keep: keep, ttl_ms: ttl} = retention) do
+    map_size(retention) == 2 and is_integer(keep) and keep >= 0 and
+      (ttl == :infinity or (is_integer(ttl) and ttl >= 0))
+  end
+
+  defp retention?(_other), do: false
+
   @doc """
   The kinds the store is started with, one per owning controller, each with
   the finalizers of every controller on it. Takes controllers or their
   declarations.
 
   Raises on a list the store would later refuse a registration from: two
-  owners of one kind, a controller attached to a kind nobody owns, condition
-  types that are not atoms, or one condition type or one finalizer declared
-  by two controllers of a kind. None of these can run, and found here they
+  owners of one kind, a controller attached to a kind nobody owns, or one
+  condition type or one finalizer declared by two controllers of a kind. None of these can run, and found here they
   fail the start with a name instead of a runtime that can never register.
   """
   @spec kinds([module() | declaration()]) :: %{Resource.kind() => Kind.t()}
@@ -321,11 +365,6 @@ defmodule Vagus.Resource.Controller do
 
   defp distinct_conditions!(kind, declarations) do
     Enum.reduce(declarations, %{}, fn %{controller: controller, conditions: types}, declared ->
-      with [_ | _] <- Enum.reject(List.wrap(types), &is_atom/1) do
-        raise ArgumentError,
-              "#{inspect(controller)} declares condition types #{inspect(types)}, not a list of atoms"
-      end
-
       Enum.reduce(types, declared, fn type, declared ->
         Map.update(declared, type, controller, fn rival ->
           raise ArgumentError,

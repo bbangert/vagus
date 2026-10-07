@@ -753,6 +753,80 @@ defmodule Vagus.Resource.Toys do
     def act(_action, _args, _context), do: :ok
   end
 
+  defmodule Sticky do
+    @moduledoc """
+    Owns `:sticky`. Every pass nudges, and refers to the probe named in
+    `spec["target"]`; with `spec["fail"]` the nudge fails. Notes the failed
+    action each pass is told of as `{:told, name, failed_action}`.
+    """
+    @behaviour Vagus.Resource.Controller
+
+    alias Vagus.Resource.Harness
+
+    @impl true
+    def kind, do: :sticky
+    @impl true
+    def condition_types, do: [:ready]
+    @impl true
+    def references(%{spec: %{"target" => target}}), do: [{:probe, target}]
+
+    @impl true
+    def observe(%{name: name}, context),
+      do: Harness.note(context, {:told, name, context.failed_action})
+
+    @impl true
+    def reconcile(%{spec: spec}, _observed),
+      do: {:no_verdict, [{:action, :nudge, spec["fail"] == true}]}
+
+    @impl true
+    def act(:nudge, fail?, _context), do: if(fail?, do: {:error, :stuck}, else: :ok)
+  end
+
+  defmodule Shapeless do
+    @moduledoc """
+    Declares whatever the calling process has put under `{Shapeless,
+    callback}`, and something well-formed otherwise.
+    """
+    @behaviour Vagus.Resource.Controller
+
+    defp said(callback, otherwise), do: Process.get({__MODULE__, callback}, otherwise)
+
+    @impl true
+    def kind, do: said(:kind, :shapeless)
+    @impl true
+    def condition_types, do: said(:condition_types, [:ready])
+    @impl true
+    def retention, do: said(:retention, %{keep: 1, ttl_ms: :infinity})
+    @impl true
+    def finalizer, do: said(:finalizer, :shapeless)
+    @impl true
+    def finalize_after, do: said(:finalize_after, [])
+    @impl true
+    def writer_entries, do: said(:writer_entries, [["holds"]])
+    @impl true
+    def observe(_shapeless, _context), do: %{}
+    @impl true
+    def reconcile(_shapeless, _observed), do: {:no_verdict, []}
+    @impl true
+    def act(_action, _args, _context), do: :ok
+  end
+
+  defmodule Bare do
+    @moduledoc "Owns `:bare`, and declares its condition type as an atom where a list is due."
+    @behaviour Vagus.Resource.Controller
+
+    @impl true
+    def kind, do: :bare
+    @impl true
+    def condition_types, do: :ready
+    @impl true
+    def observe(_bare, _context), do: %{}
+    @impl true
+    def reconcile(_bare, _observed), do: {:no_verdict, []}
+    @impl true
+    def act(_action, _args, _context), do: :ok
+  end
+
   defmodule Twisted do
     @moduledoc """
     Owns `:twisted`, and is wrong on purpose in the way `spec["twist"]`

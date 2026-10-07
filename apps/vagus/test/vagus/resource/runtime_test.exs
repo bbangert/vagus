@@ -14,17 +14,6 @@ defmodule Vagus.Resource.RuntimeTest do
   defp condition(sys, kind, name, type),
     do: Resource.get_condition(Store.get(kind, name, sys.i), type)
 
-  # Delivers the message of the timer pending for `name` now, and returns
-  # how long the timer still had to run.
-  defp fire_timer(sys, controller, name) do
-    runtime = Process.whereis(Runtime.name(sys.instance, controller))
-    %{^name => {timer, token}} = :sys.get_state(runtime).timers
-    send(runtime, {:requeue, name, token})
-    # A call from here is behind that message; a settle might not be.
-    Runtime.info(controller, sys.i)
-    Process.read_timer(timer)
-  end
-
   describe "the queue" do
     test "a change that arrives during a step is not lost: the key runs once more" do
       sys = start_system(controllers: [Probe])
@@ -139,16 +128,25 @@ defmodule Vagus.Resource.RuntimeTest do
       put_fact(sys, {:requeue, "p"}, 600_000)
       given_ready(sys, {:probe, "p", %{}})
 
-      runtime = Process.whereis(Runtime.name(sys.instance, Probe))
       assert %{timers: ["p"]} = Runtime.info(Probe, sys.i)
-      %{"p" => {_timer, token}} = :sys.get_state(runtime).timers
+      %{runtime: runtime, message: superseded} = pending_timer(sys, Probe, "p")
+
+      # A pass arms the timer anew; the message of the one it replaced, had
+      # it fired just before, starts nothing either.
+      resync(sys, Probe)
+      settle(sys)
+      %{steps: before} = Runtime.info(Probe, sys.i)
+      send(runtime, superseded)
+      assert %{steps: ^before, queued: [], in_flight: none} = Runtime.info(Probe, sys.i)
+      assert none == %{}
+      %{message: late} = pending_timer(sys, Probe, "p")
 
       {:ok, _} = Store.delete(:probe, "p", sys.i)
       settle(sys)
       assert %{timers: [], steps: steps} = Runtime.info(Probe, sys.i)
 
       # What a timer that fired just before it was cancelled leaves behind.
-      send(runtime, {:requeue, "p", token})
+      send(runtime, late)
       # A call from here is behind that message; the settle might not be.
       Runtime.info(Probe, sys.i)
       settle(sys)

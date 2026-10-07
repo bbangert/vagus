@@ -8,6 +8,7 @@ defmodule Vagus.Resource.RuntimeRulesTest do
   alias Vagus.Resource.{Controller, Lanes, Runtime, Store, TestInstance}
 
   alias Vagus.Resource.Toys.{
+    Bare,
     Broken,
     Clasher,
     Echo,
@@ -19,7 +20,9 @@ defmodule Vagus.Resource.RuntimeRulesTest do
     Last,
     Mute,
     Probe,
+    Shapeless,
     Solo,
+    Sticky,
     Wild
   }
 
@@ -129,13 +132,84 @@ defmodule Vagus.Resource.RuntimeRulesTest do
       {:ok, _} = Store.create(:probe, "p", %{}, sys.i)
       put_fact(sys, {:act, "p"}, nil)
       send(step, {:fail, :boom})
-      settle(sys)
-      assert %{failures: failures, timers: [], steps: 1} = Runtime.info(Probe, sys.i)
-      assert failures == %{}
 
-      resync(sys, Probe)
+      # The replacement is looked at for having been found, and clean.
       await!(sys, :probe, "p", :ready)
+      settle(sys)
       assert Store.get(:probe, "p", sys.i).status[:last_error] == nil
+      assert %{failures: failures, timers: []} = Runtime.info(Probe, sys.i)
+      assert failures == %{}
+    end
+
+    test "is not charged to a replacement the store already holds when the step crashes" do
+      sys =
+        start_system(
+          controllers: [Probe],
+          runtime: [backoff: {60_000, 60_000}, deliver_events: false]
+        )
+
+      put_fact(sys, {:observe, "p"}, :block)
+      {:ok, _} = Store.create(:probe, "p", %{}, sys.i)
+      resync(sys, Probe)
+      assert_receive {:observing, "p", step}, sys.wait
+
+      # Neither the removal nor the new resource is ever announced: the
+      # crash is all the runtime hears, with the replacement in the store.
+      {:ok, _} = Store.delete(:probe, "p", sys.i)
+      {:ok, %{uid: uid}} = Store.create(:probe, "p", %{}, sys.i)
+      put_fact(sys, {:observe, "p"}, nil)
+      Process.exit(step, :kill)
+
+      assert %{uid: ^uid} = await!(sys, :probe, "p", :ready)
+      settle(sys)
+      assert %{failures: failures, timers: []} = Runtime.info(Probe, sys.i)
+      assert failures == %{}
+    end
+
+    test "nothing remembered of a resource is found by one a resync finds in its place" do
+      sys =
+        start_system(
+          controllers: [Sticky],
+          runtime: [backoff: {60_000, 60_000}, deliver_events: false]
+        )
+
+      known = fn -> :sys.get_state(runtime(sys, Sticky)) |> Map.take([:known, :refs_in]) end
+      {:ok, _} = Store.create(:sticky, "a", %{"target" => "old"}, sys.i)
+      {:ok, _} = Store.create(:sticky, "b", %{"target" => "old", "fail" => true}, sys.i)
+      resync(sys, Sticky)
+      settle(sys)
+
+      # Everything there is to remember: a repeated pass being paced, a
+      # failed action, timers, references.
+      assert %{known: %{"a" => a, "b" => b}, refs_in: %{{:probe, "old"} => [_, _]}} = known.()
+      assert %{failures: 1, acted: [nudge: false], timer: {_, _}, refs: [probe: "old"]} = a
+      assert %{failures: 2, failed: %{reason: :stuck}, timer: {_, _}, refs: [probe: "old"]} = b
+
+      for name <- ["a", "b"] do
+        {:ok, _} = Store.delete(:sticky, name, sys.i)
+        {:ok, _} = Store.create(:sticky, name, %{"target" => "new"}, sys.i)
+      end
+
+      # Found by the listing, and held before any step can add to it.
+      shutdown(sys, true)
+      resync(sys, Sticky)
+      settle(sys)
+      fresh = &%{uid: &1, failures: 0, failed: nil, acted: [], timer: nil, refs: []}
+
+      assert known.() == %{
+               known: Map.new(Store.list(:sticky, sys.i), &{&1.name, fresh.(&1.uid)}),
+               refs_in: %{}
+             }
+
+      notes(sys)
+      shutdown(sys, false)
+      settle(sys, only: [Sticky])
+
+      assert %{known: %{"a" => a, "b" => b}, refs_in: refs_in} = known.()
+      assert %{failures: 1, failed: nil, refs: [probe: "new"]} = a
+      assert %{failures: 1, failed: nil, refs: [probe: "new"]} = b
+      assert Map.keys(refs_in) == [{:probe, "new"}]
+      assert notes(sys) |> Enum.map(&elem(&1, 2)) |> Enum.uniq() == [nil]
     end
 
     test "is not believed of a namesake even when the step crashed" do
@@ -215,6 +289,41 @@ defmodule Vagus.Resource.RuntimeRulesTest do
                Controller.declare(Kept)
     end
 
+    test "a declaration of the wrong shape fails the start, naming the controller and the callback" do
+      assert {:error, reason} = TestInstance.start(controllers: [Bare], kinds: %{})
+
+      assert inspect(reason) =~
+               "Vagus.Resource.Toys.Bare.condition_types/0 returned :ready, not a list of atoms"
+
+      for {callback, malformed, expected} <- [
+            {:kind, "shapeless", "an atom other than nil"},
+            {:kind, nil, "an atom other than nil"},
+            {:condition_types, :ready, "a list of atoms"},
+            {:condition_types, %{ready: true}, "a list of atoms"},
+            {:condition_types, [:ready | :failed], "a list of atoms"},
+            {:condition_types, ["ready"], "a list of atoms"},
+            {:retention, %{keep: 3}, "%{keep: count, ttl_ms: ms | :infinity}"},
+            {:retention, %{keep: -1, ttl_ms: 0}, "%{keep: count, ttl_ms: ms | :infinity}"},
+            {:retention, [keep: 1, ttl_ms: 1], "%{keep: count, ttl_ms: ms | :infinity}"},
+            {:finalizer, "shapeless", "an atom other than nil"},
+            {:finalize_after, :auth, "a list of atoms"},
+            {:writer_entries, ["holds"], "a list of spec paths"},
+            {:writer_entries, %{}, "a list of spec paths"}
+          ] do
+        Process.put({Shapeless, callback}, malformed)
+
+        message =
+          "Vagus.Resource.Toys.Shapeless.#{callback}/0 returned #{inspect(malformed)}, " <>
+            "not #{expected}"
+
+        assert_raise ArgumentError, message, fn -> Controller.declare(Shapeless) end
+        Process.delete({Shapeless, callback})
+      end
+
+      assert %{kind: :shapeless, conditions: [:ready], writer_entries: [["holds"]]} =
+               Controller.declare(Shapeless)
+    end
+
     test "a registration the store refuses stops the runtime with that reason" do
       instance = TestInstance.start!()
       i = [instance: instance]
@@ -273,8 +382,7 @@ defmodule Vagus.Resource.RuntimeRulesTest do
       sys = start_system(controllers: [Wild])
       given_ready(sys, {:wild, "w", %{"effect" => "requeues"}})
 
-      %{"w" => {timer, _token}} = :sys.get_state(runtime(sys, Wild)).timers
-      assert Process.read_timer(timer) in 290_000..300_000
+      assert pending_timer(sys, Wild, "w").remaining in 290_000..300_000
     end
   end
 

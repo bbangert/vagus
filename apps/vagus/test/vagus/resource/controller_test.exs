@@ -71,9 +71,11 @@ defmodule Vagus.Resource.ControllerTest do
                    ~r/Kept and Vagus.Resource.Toys.Clasher both declare condition :ready on kind :kept/,
                    fn -> Controller.kinds([Kept, Clasher]) end
 
-      assert_raise ArgumentError, ~r/Vague declares condition types \["ready"\]/, fn ->
-        Controller.kinds([Vague])
-      end
+      assert_raise ArgumentError,
+                   ~r/Vague.condition_types\/0 returned \["ready"\], not a list of atoms/,
+                   fn ->
+                     Controller.kinds([Vague])
+                   end
     end
 
     test "a controller listed twice counts once" do
