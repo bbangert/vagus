@@ -79,6 +79,14 @@ defmodule Vagus.Resource do
     }
   end
 
+  @doc "Whether `term` is a `t:path/0`: a proper, non-empty list of keys."
+  @spec path?(term()) :: boolean()
+  def path?([key]), do: path_key?(key)
+  def path?([key | rest]), do: path_key?(key) and path?(rest)
+  def path?(_other), do: false
+
+  defp path_key?(key), do: is_atom(key) or is_binary(key) or is_integer(key)
+
   @spec get_condition(t(), atom()) :: condition() | nil
   def get_condition(%__MODULE__{status: status}, type), do: conditions(status)[type]
 

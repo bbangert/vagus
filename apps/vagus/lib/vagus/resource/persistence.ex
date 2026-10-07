@@ -182,10 +182,19 @@ defmodule Vagus.Resource.Persistence do
       end
     end)
     |> case do
-      {:error, _reason} = error -> error
-      resources -> {:ok, Enum.reverse(resources)}
+      {:error, _reason} = error ->
+        error
+
+      resources ->
+        # Two entries for one key, or one uid on two resources, is a file the
+        # store did not write; picking one would be a guess.
+        if unique?(resources, &{&1.kind, &1.name}) and unique?(resources, & &1.uid),
+          do: {:ok, Enum.reverse(resources)},
+          else: {:error, :malformed}
     end
   end
+
+  defp unique?(resources, by), do: resources |> Enum.uniq_by(by) |> length() == length(resources)
 
   defp decode_resource(
          %{
@@ -202,11 +211,18 @@ defmodule Vagus.Resource.Persistence do
          },
          by_name
        )
-       when is_binary(name) and is_integer(uid) and is_integer(generation) and
-              is_boolean(deleting?) and is_list(finalizers) and is_list(owner_refs) and
-              is_list(managed_fields) do
+       when is_binary(name) and is_integer(uid) and uid > 0 and is_integer(generation) and
+              generation > 0 and is_boolean(deleting?) and is_list(finalizers) and
+              is_list(owner_refs) and is_list(managed_fields) do
     with {:ok, {kind, codec}} <- known_kind(by_name, kind),
          {:ok, owner_refs} <- decode_refs(owner_refs, by_name) do
+      finalizers = Enum.map(finalizers, &decode_finalizer/1)
+
+      # Neither is a state the store ever writes, and each would leave a
+      # resource that can never finish deleting, or one already finished.
+      if Enum.uniq(finalizers) != finalizers or (deleting? and finalizers == []),
+        do: throw(:malformed)
+
       {:ok,
        %Resource{
          kind: kind,
@@ -214,24 +230,33 @@ defmodule Vagus.Resource.Persistence do
          uid: uid,
          generation: generation,
          deleting?: deleting?,
-         finalizers: Enum.map(finalizers, &decode_finalizer/1),
+         finalizers: finalizers,
          owner_refs: owner_refs,
-         managed_fields:
-           Map.new(managed_fields, fn
-             %{"path" => path, "writer" => writer} when is_list(path) ->
-               {Enum.map(path, &decode_term/1), decode_term(writer)}
-
-             _other ->
-               throw(:malformed)
-           end),
-         spec: hook(codec, :decode_spec, Stamp.revive(spec), %{kind: kind, name: name}),
+         managed_fields: Map.new(managed_fields, &decode_managed/1),
+         spec: map!(hook(codec, :decode_spec, Stamp.revive(spec), %{kind: kind, name: name})),
          progress:
-           hook(codec, :decode_progress, Stamp.revive(progress), %{kind: kind, name: name})
+           map!(hook(codec, :decode_progress, Stamp.revive(progress), %{kind: kind, name: name}))
        }}
     end
   end
 
   defp decode_resource(_entry, _by_name), do: {:error, :malformed}
+
+  # The store updates both with `Map` functions, so anything else would
+  # crash it on the next write, and its replacement would load the same.
+  defp map!(%{} = map), do: map
+  defp map!(_other), do: throw(:malformed)
+
+  defp decode_managed(%{"path" => path, "writer" => writer}) when is_list(path) do
+    path = Enum.map(path, &decode_term/1)
+    writer = decode_term(writer)
+
+    # A `nil` writer means "no writer" to the store: it would own a path
+    # that nobody could ever take or release.
+    if Resource.path?(path) and writer != nil, do: {path, writer}, else: throw(:malformed)
+  end
+
+  defp decode_managed(_other), do: throw(:malformed)
 
   # Only an atom can be released again, so anything else would hold a
   # deleting resource for ever.
@@ -245,7 +270,7 @@ defmodule Vagus.Resource.Persistence do
   defp decode_refs(refs, by_name) do
     Enum.reduce_while(refs, {:ok, []}, fn
       %{"kind" => kind, "name" => name, "uid" => uid} = ref, {:ok, acc}
-      when map_size(ref) == 3 and is_binary(name) and is_integer(uid) ->
+      when map_size(ref) == 3 and is_binary(name) and is_integer(uid) and uid > 0 ->
         case known_kind(by_name, kind) do
           {:ok, {kind, _codec}} -> {:cont, {:ok, acc ++ [%{kind: kind, name: name, uid: uid}]}}
           {:error, _reason} = error -> {:halt, error}

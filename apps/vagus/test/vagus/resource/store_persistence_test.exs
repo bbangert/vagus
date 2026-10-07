@@ -421,6 +421,67 @@ defmodule Vagus.Resource.StorePersistenceTest do
       assert refused(path) == {:unknown_atom, "zz_not_an_atom_yet"}
     end
 
+    # A store with one of each kind, stopped, and its file changed by `fun`,
+    # which gets the `:thing` entry.
+    defp tampered(path, fun) do
+      i = start!(path)
+
+      {:ok, _} =
+        Store.create(:thing, "t", %{a: 1}, [writer: :ctl, finalizers: [:tidy]] ++ i)
+
+      {:ok, _} = Store.create(:part, "p", %{}, i)
+      :ok = stop_supervised(i[:instance])
+
+      rewrite(path, fn document ->
+        Map.update!(document, "resources", fn resources ->
+          Enum.flat_map(resources, fn
+            %{"kind" => "thing"} = thing -> List.wrap(fun.(thing))
+            other -> [other]
+          end)
+        end)
+      end)
+
+      refused(path)
+    end
+
+    test "a spec that is not an object", %{path: path} do
+      assert tampered(path, &%{&1 | "kind" => "part", "name" => "q", "spec" => nil}) ==
+               :malformed
+    end
+
+    test "progress that is not an object", %{path: path} do
+      assert tampered(path, &%{&1 | "kind" => "part", "name" => "q", "progress" => [1]}) ==
+               :malformed
+    end
+
+    test "a finalizer listed twice", %{path: path} do
+      assert tampered(path, &%{&1 | "finalizers" => [":tidy", ":tidy"]}) == :malformed
+    end
+
+    test "a deleting resource with no finalizer left", %{path: path} do
+      assert tampered(path, &%{&1 | "deleting" => true, "finalizers" => []}) == :malformed
+    end
+
+    test "a uid or a generation that is not positive", %{path: path, tmp_dir: dir} do
+      assert tampered(path, &%{&1 | "uid" => 0}) == :malformed
+      other = Path.join(dir, "other.json")
+      assert tampered(other, &%{&1 | "generation" => 0}) == :malformed
+    end
+
+    test "two resources of one name, or of one uid", %{path: path, tmp_dir: dir} do
+      assert tampered(path, &[&1, %{&1 | "uid" => 9}]) == :malformed
+      other = Path.join(dir, "other.json")
+      assert tampered(other, &[&1, %{&1 | "name" => "twin"}]) == :malformed
+    end
+
+    test "an owned path that is empty, or owned by nobody", %{path: path, tmp_dir: dir} do
+      owned = fn path, writer -> [%{"path" => path, "writer" => writer}] end
+
+      assert tampered(path, &%{&1 | "managed_fields" => owned.([], ":ctl")}) == :malformed
+      other = Path.join(dir, "other.json")
+      assert tampered(other, &%{&1 | "managed_fields" => owned.([":a"], ":nil")}) == :malformed
+    end
+
     test "a finalizer that is not an atom", %{path: path} do
       i = start!(path)
       {:ok, _} = Store.create(:thing, "t", %{}, [finalizers: [:tidy]] ++ i)

@@ -150,6 +150,7 @@ defmodule Vagus.Resource.Store do
           | {:error, {:kind_owned, Resource.writer()}}
           | {:error, {:condition_owned, atom(), Resource.writer()}}
           | {:error, {:bad_conditions, term()}}
+          | {:error, {:bad_writer, nil}}
   def register_kind(kind, owner, opts \\ []) do
     call(opts, {:register, kind, owner, Keyword.get(opts, :conditions, []), true})
   end
@@ -160,6 +161,7 @@ defmodule Vagus.Resource.Store do
           | {:error, {:unknown_kind, Resource.kind()}}
           | {:error, {:condition_owned, atom(), Resource.writer()}}
           | {:error, {:bad_conditions, term()}}
+          | {:error, {:bad_writer, nil}}
   def register_writer(kind, writer, opts \\ []) do
     call(opts, {:register, kind, writer, Keyword.get(opts, :conditions, []), false})
   end
@@ -299,6 +301,8 @@ defmodule Vagus.Resource.Store do
 
   def handle_call({:register, kind, writer, types, owner?}, _from, state) do
     with {:ok, registration} <- registration(state, kind),
+         # `nil` is how "no writer" is spelled everywhere else.
+         :ok <- if(writer == nil, do: {:error, {:bad_writer, nil}}, else: :ok),
          :ok <- free_for(registration, writer, owner?),
          {:ok, conditions} <- declare(registration.conditions, writer, types) do
       registration = %{registration | conditions: conditions}
@@ -406,13 +410,19 @@ defmodule Vagus.Resource.Store do
   defp run_all([], results, txn), do: {:ok, Enum.reverse(results), txn}
 
   defp run_all([op | ops], results, txn) do
-    case run(op, txn) do
+    case if(options?(op), do: run(op, txn), else: {:error, {:bad_op, op}}) do
       {:ok, resource, txn} -> run_all(ops, [resource | results], txn)
       {:error, _reason} = error -> error
     end
   end
 
   defp run_all(not_a_list, _results, _txn), do: {:error, {:bad_op, not_a_list}}
+
+  # Options are read with `Keyword`, which raises on anything but pairs.
+  defp options?({_op, _kind, _name, _arg, opts}),
+    do: every?(opts, &match?({key, _value} when is_atom(key), &1))
+
+  defp options?(_op), do: true
 
   defp changes(table, txn) do
     Enum.flat_map(txn.rows, fn {key, new} ->
@@ -509,17 +519,17 @@ defmodule Vagus.Resource.Store do
 
     with {:ok, _registration} <- registration(txn.state, kind),
          :ok <- absent(txn, {kind, name}),
-         :ok <- if(every?(finalizers, &is_atom/1), do: :ok, else: {:error, {:bad_op, op}}),
+         writer = opts[:writer],
+         :ok <- creatable(op, finalizers, writer),
          :ok <- known_refs(txn.state, owner_refs),
          {:ok, admitted} <- admit(txn.state, kind, spec) do
-      writer = opts[:writer]
-
       resource = %Resource{
         kind: kind,
         name: name,
         uid: txn.next_uid,
         spec: admitted,
-        finalizers: finalizers,
+        # One release per name has to be enough to let the resource go.
+        finalizers: Enum.uniq(finalizers),
         owner_refs: owner_refs,
         managed_fields:
           if(writer != nil, do: Map.new(spec, fn {key, _} -> {[key], writer} end), else: %{})
@@ -600,6 +610,15 @@ defmodule Vagus.Resource.Store do
 
   defp run(op, _txn), do: {:error, {:bad_op, op}}
 
+  # With a writer the given keys become owned paths, which the file has to
+  # be able to hold.
+  defp creatable({:create, _kind, _name, spec, _opts} = op, finalizers, writer) do
+    if every?(finalizers, &is_atom/1) and
+         (writer == nil or Enum.all?(Map.keys(spec), &Resource.path?([&1]))),
+       do: :ok,
+       else: {:error, {:bad_op, op}}
+  end
+
   defp put(txn, %Resource{deleting?: true, finalizers: []} = resource) do
     {:ok, resource,
      %{txn | rows: Map.put(txn.rows, key(resource), nil), removed: [resource | txn.removed]}}
@@ -678,12 +697,6 @@ defmodule Vagus.Resource.Store do
     )
   end
 
-  defp path?([key]), do: path_key?(key)
-  defp path?([key | rest]), do: path_key?(key) and path?(rest)
-  defp path?(_other), do: false
-
-  defp path_key?(key), do: is_atom(key) or is_binary(key) or is_integer(key)
-
   defp free_for(%{owner: owner}, writer, true) when owner not in [nil, writer],
     do: {:error, {:kind_owned, owner}}
 
@@ -718,11 +731,20 @@ defmodule Vagus.Resource.Store do
 
   defp admit(state, kind, spec) do
     Enum.reduce_while(state.kinds[kind].validators, {:ok, spec}, fn validator, {:ok, spec} ->
-      case validator.(spec) do
+      case validate(validator, spec) do
         {:ok, %{} = spec} -> {:cont, {:ok, spec}}
         {:error, reason} -> {:halt, {:error, {:invalid, reason}}}
+        other -> {:halt, {:error, {:bad_validator, other}}}
       end
     end)
+  end
+
+  # A validator is the kind's code run on a caller's spec, inside the one
+  # process every write goes through: what it raises rejects the commit.
+  defp validate(validator, spec) do
+    validator.(spec)
+  rescue
+    exception -> {:raised, Exception.message(exception)}
   end
 
   # Giving up a path must work on a spec that would no longer be admitted.
@@ -730,7 +752,7 @@ defmodule Vagus.Resource.Store do
   defp readmit(state, %Resource{kind: kind}, spec), do: admit(state, kind, spec)
 
   defp spec_ops(%{} = puts),
-    do: {:ok, Enum.map(puts, fn {key, value} -> {:put, [key], value} end)}
+    do: spec_ops(Enum.map(puts, fn {key, value} -> {:put, [key], value} end))
 
   defp spec_ops(ops) do
     case first_bad(ops, &spec_op?/1) do
@@ -739,8 +761,8 @@ defmodule Vagus.Resource.Store do
     end
   end
 
-  defp spec_op?({name, path}) when name in [:inc, :delete, :release], do: path?(path)
-  defp spec_op?({:put, path, _value}), do: path?(path)
+  defp spec_op?({name, path}) when name in [:inc, :delete, :release], do: Resource.path?(path)
+  defp spec_op?({:put, path, _value}), do: Resource.path?(path)
   defp spec_op?(_other), do: false
 
   # Nothing new may be asked of a resource on its way out, but a writer can

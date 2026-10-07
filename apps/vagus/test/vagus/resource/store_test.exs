@@ -374,6 +374,17 @@ defmodule Vagus.Resource.StoreTest do
       refute_received {Watch, :changed, _}
     end
 
+    test "a finalizer named twice at create is owed once", %{i: i} do
+      assert {:ok, %{finalizers: [:tidy, :auth]}} =
+               Store.create(:part, "p", %{}, [finalizers: [:tidy, :auth, :tidy]] ++ i)
+
+      {:ok, _} = Store.delete(:part, "p", i)
+      {:ok, _} = Store.remove_finalizer(:part, "p", :auth, i)
+      {:ok, _} = Store.remove_finalizer(:part, "p", :tidy, i)
+
+      assert Store.get(:part, "p", i) == nil
+    end
+
     test "a finalizer added before deletion holds the resource", %{i: i} do
       {:ok, _} = Store.create(:part, "p", %{}, i)
       assert {:ok, %{finalizers: [:auth]}} = Store.add_finalizer(:part, "p", :auth, i)
@@ -604,6 +615,68 @@ defmodule Vagus.Resource.StoreTest do
       assert {:error, {:bad_conditions, :ready}} =
                Store.register_writer(:thing, Late, [conditions: :ready] ++ i)
 
+      assert same_store?(instance, store)
+    end
+
+    test "a spec or progress that is not a map", %{i: i, instance: instance, store: store} do
+      assert {:error, {:bad_op, {:create, :part, "p", [a: 1], _}}} =
+               Store.create(:part, "p", [a: 1], i)
+
+      assert {:error, {:bad_op, {:put_progress, :thing, "t", nil, _}}} =
+               Store.put_progress(:thing, "t", nil, [writer: Owner] ++ i)
+
+      assert {:error, {:bad_op, {:patch_status, :thing, "t", nil, _}}} =
+               Store.patch_status(:thing, "t", nil, [writer: Owner] ++ i)
+
+      assert same_store?(instance, store)
+    end
+
+    test "options that are not a keyword list", %{i: i, instance: instance, store: store} do
+      for opts <- [[{:writer, :x} | :tail], [:writer], :writer, [{"writer", :x}]] do
+        assert {:error, {:bad_op, {:create, :part, "p", %{}, ^opts}}} =
+                 Store.commit([{:create, :part, "p", %{}, opts}], i)
+
+        assert {:error, {:bad_op, {:update_spec, :thing, "t", %{a: 2}, ^opts}}} =
+                 Store.commit([{:update_spec, :thing, "t", %{a: 2}, opts}], i)
+      end
+
+      assert same_store?(instance, store)
+    end
+
+    test "a spec key that cannot be an owned path", %{i: i, instance: instance, store: store} do
+      assert {:error, {:bad_op, {:create, :part, "p", %{{:a, 1} => 1}, _}}} =
+               Store.create(:part, "p", %{{:a, 1} => 1}, [writer: :ctl] ++ i)
+
+      assert {:error, {:bad_op, {:put, [{:a, 1}], 1}}} =
+               Store.update_spec(:thing, "t", %{{:a, 1} => 1}, i)
+
+      assert same_store?(instance, store)
+    end
+
+    test "a registration in nobody's name", %{i: i, instance: instance, store: store} do
+      assert {:error, {:bad_writer, nil}} = Store.register_kind(:part, nil, i)
+
+      assert {:error, {:bad_writer, nil}} =
+               Store.register_writer(:thing, nil, [conditions: [:late]] ++ i)
+
+      assert same_store?(instance, store)
+    end
+
+    test "a validator that raises, or answers with something else" do
+      kinds = %{
+        part: [validators: [fn %{"ok" => true} = spec -> {:ok, spec} end]],
+        thing: [validators: [fn _spec -> :fine end]]
+      }
+
+      instance = TestInstance.start!(kinds: kinds)
+      i = [instance: instance]
+      store = Process.whereis(Store.name(instance))
+
+      assert {:error, {:bad_validator, {:raised, "no function clause matching" <> _}}} =
+               Store.create(:part, "p", %{"ok" => false}, i)
+
+      assert {:error, {:bad_validator, :fine}} = Store.create(:thing, "t", %{}, i)
+      assert {:ok, _} = Store.create(:part, "p", %{"ok" => true}, i)
       assert same_store?(instance, store)
     end
 
