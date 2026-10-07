@@ -4,8 +4,8 @@ defmodule Vagus.App.AuthIndex do
 
   This process owns the table and is its only writer. `lookup/2` is a table
   read in the caller and never waits for it. A token has one app and an app
-  one token: `put/3` for an app replaces the token it had, so nothing is
-  left of an earlier instance of it.
+  one token: `put/3` for an app replaces the token it had, so a token of
+  another instance of the app is nobody's.
 
   Neither the table nor this process ever holds a token. A row is keyed by
   the token's SHA-256, taken in the caller, so what a crash report, a
@@ -13,8 +13,12 @@ defmodule Vagus.App.AuthIndex do
   a credential, and how long a lookup takes says nothing about how much of
   a guess was right.
 
+  A function here that is given a token takes any term for every argument
+  and hashes before it looks at the others. A clause that did not match
+  would be reported with its arguments, the token among them.
+
   What an app may do with its token is not here: the caller reads that
-  from the App resource, as it is now.
+  from the App resource.
 
   ## When this process is absent
 
@@ -25,6 +29,12 @@ defmodule Vagus.App.AuthIndex do
   table. It stands before the controllers under a `:rest_for_one`
   supervisor, so they are replaced with it, and a runtime that starts looks
   at every app: each pass finds its app's token missing and puts it back.
+
+  That is what a replacement costs: every app's requests are refused until
+  the app's own pass has put its token back. A runtime runs four passes at
+  a time, and a pass that has to observe the engine first puts nothing
+  while the engine is away. So it stands first among the services, where
+  nothing but the store and the lanes can take it along.
   """
 
   use GenServer
@@ -44,44 +54,51 @@ defmodule Vagus.App.AuthIndex do
   @spec table(atom()) :: atom()
   def table(instance), do: Module.concat(instance, AuthTokens)
 
-  @doc "The app `token` belongs to."
+  @doc "The app `token` belongs to. What is no token is nobody's."
   @spec lookup(term(), keyword()) :: {:ok, Resource.name()} | :error
-  def lookup(token, opts \\ [])
-
-  def lookup(token, opts) when is_binary(token) and token != "" do
-    case :ets.lookup(table(instance(opts)), digest(token)) do
-      [{_digest, app}] -> {:ok, app}
-      [] -> :error
+  def lookup(token, opts \\ []) do
+    with {:ok, digest} <- digest(token),
+         [{_digest, app}] <- :ets.lookup(table(instance(opts)), digest) do
+      {:ok, app}
+    else
+      _unknown -> :error
     end
   rescue
     # No table: nobody is known.
     ArgumentError -> :error
   end
 
-  def lookup(_token, _opts), do: :error
-
   @doc """
   Makes `token` the token of `app`, and the only one. Returns once a
-  `lookup/2` finds it. Options: `:instance`, and `:timeout` for the call
-  (5 s).
+  `lookup/2` finds it. `{:error, :invalid}` for an app that is no name or a
+  token that is no non-empty string. Options: `:instance`, and `:timeout`
+  for the call (5 s).
   """
-  @spec put(Resource.name(), String.t(), keyword()) :: :ok | {:error, :unavailable}
-  def put(app, token, opts \\ []) when is_binary(app) and is_binary(token) and token != "",
-    do: call(opts, {:put, app, digest(token)})
+  @spec put(term(), term(), keyword()) :: :ok | {:error, :unavailable | :invalid}
+  def put(app, token, opts \\ []) do
+    case digest(token) do
+      {:ok, digest} when is_binary(app) -> call(opts, {:put, app, digest})
+      _invalid -> {:error, :invalid}
+    end
+  end
 
   @doc "Forgets the token of `app`, if it has one."
   @spec remove(Resource.name(), keyword()) :: :ok | {:error, :unavailable}
   def remove(app, opts \\ []) when is_binary(app), do: call(opts, {:remove, app})
 
-  # Caught, not left to exit: the exit of a call names the request, and a
-  # step that died of it would be logged with it.
+  # An answer and not an exit, so that a step can fail on it by returning
+  # it. The request holds a digest and no token either way.
   defp call(opts, request) do
     GenServer.call(name(instance(opts)), request, Keyword.get(opts, :timeout, 5_000))
   catch
     :exit, _reason -> {:error, :unavailable}
   end
 
-  defp digest(token), do: :crypto.hash(:sha256, token)
+  defp digest(token) when is_binary(token) and token != "",
+    do: {:ok, :crypto.hash(:sha256, token)}
+
+  defp digest(_not_a_token), do: :error
+
   defp instance(opts), do: Keyword.get(opts, :instance, Resource)
 
   # In `init/1`: whoever starts after this reads the table.
@@ -96,7 +113,7 @@ defmodule Vagus.App.AuthIndex do
   @impl true
   def handle_call({:put, app, digest}, _from, state) do
     forget(state, app, digest)
-    # A token another app had put is that app's no longer.
+    # A token has one app: an entry of another app for this one goes.
     digests = Map.reject(state.digests, fn {other, held} -> other != app and held == digest end)
     :ets.insert(state.table, {digest, app})
     {:reply, :ok, %{state | digests: Map.put(digests, app, digest)}}
@@ -107,8 +124,8 @@ defmodule Vagus.App.AuthIndex do
     {:reply, :ok, %{state | digests: Map.delete(state.digests, app)}}
   end
 
-  # Not when it is the one being put: deleted and inserted again, the row
-  # would be missing to a reader in between.
+  # Not the row being put: between a delete and an insert of it a reader
+  # would find the token unknown.
   defp forget(state, app, keep) do
     case state.digests do
       %{^app => held} when held != keep -> :ets.delete(state.table, held)

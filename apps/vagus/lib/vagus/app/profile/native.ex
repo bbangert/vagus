@@ -1,7 +1,12 @@
 defmodule Vagus.App.Profile.Native do
   @moduledoc """
   An app that runs inside the VM: the MQTT broker. There is no container,
-  no image and no token, so every question about one is answered `nil`.
+  no image and no token: the questions about a container (its name, what a
+  stop leaves, reuse, the engine's restart policy) are answered `nil`.
+
+  A native app is a service kept up by its watchdog, not something that
+  runs once and ends: admission refuses a native manifest whose `startup`
+  is `once` (`:native_run_once`).
   """
 
   @behaviour Vagus.App.Profile

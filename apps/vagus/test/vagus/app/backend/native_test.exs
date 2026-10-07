@@ -55,21 +55,17 @@ defmodule Vagus.App.Backend.NativeTest do
     assert connects?(port)
   end
 
-  test "pid/2 is the running instance's process, and nil without one", %{slug: slug, opts: opts} do
-    assert Native.pid(slug, opts) == nil
-
+  test "the instance observed carries its process, from the same reading", %{
+    slug: slug,
+    opts: opts
+  } do
     :ok = Native.start(slug, opts)
-    pid = Native.pid(slug, opts)
 
-    assert [{_id, ^pid, :supervisor, _modules}] =
+    assert [{_id, pid, :supervisor, _modules}] =
              DynamicSupervisor.which_children(opts[:supervisor])
 
-    {:ok, %{id: id}} = Native.observe(slug, opts)
+    assert {:ok, %{process: ^pid, id: id}} = Native.observe(slug, opts)
     assert id =~ List.to_string(:erlang.pid_to_list(pid))
-
-    :ok = Native.stop(slug, nil, opts)
-    assert Native.pid(slug, opts) == nil
-    assert Native.pid(slug, supervisor: :no_such_supervisor) == nil
   end
 
   test "start/2 of a running broker is :ok and leaves the instance as it is", %{

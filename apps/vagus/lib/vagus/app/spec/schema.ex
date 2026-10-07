@@ -25,7 +25,7 @@ defmodule Vagus.App.Spec.Schema do
   leave a stale copy of one behind.
 
   A Core spec has `lifecycle`, `version`, `run`, the counters and `holds`
-  only, until its container config is built from a spec.
+  only.
 
   ## Who writes what
 
@@ -49,10 +49,15 @@ defmodule Vagus.App.Spec.Schema do
   It is given the whole spec and no other resource, so it cannot refuse a
   dynamic ingress port another app holds. See `ingress_port_contested?/2`.
 
-  Every rule holds on every write, availability included: an app whose
-  manifest asks for a newer Core than `facts.core_version` can be deleted
-  but takes no other write, a stop among them. `core_version: nil` leaves
-  that one rule out, and `availability/2` asks it alone.
+  Whether this machine can run the manifest is not among its rules, since
+  every rule holds on every write: an app whose manifest asks for a newer
+  Core than is installed would refuse its own stop. `availability/2` is
+  that question, for whoever installs or updates to ask first.
+
+  A spec is admitted only if it comes back from the resource file as
+  itself, which is checked by doing it. The store checks the same of every
+  commit and refuses one that fails, with a reason that names the resource
+  and not what is wrong with it.
   """
 
   alias Vagus.Addon.{Availability, Config, OptionsSchema}
@@ -72,18 +77,23 @@ defmodule Vagus.App.Spec.Schema do
           | {:setting_not_in_profile, term(), Profile.tag()}
           | {:lifecycle_mismatch, Profile.tag()}
           | {:reserved_slug, String.t()}
+          | {:invalid_slug, term()}
           | :config_not_persistable
+          | :not_persistable
           | :no_image
-          | {:not_supported, :architecture | :machine_type | :home_assistant_version, String.t()}
+          | :native_run_once
           | {:invalid_options, String.t()}
           | :watchdog_run_once
           | :ingress_port_missing
+          | :ingress_port_out_of_range
+          | :ingress_port_reserved
           | :ingress_port_not_assignable
 
   @kind :app
   @max_port 65_535
   # The Docker tag charset: `version` becomes the tag of the image pulled.
-  @version ~r/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/
+  @version ~r/\A[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}\z/
+  @slug ~r/\A[-_.A-Za-z0-9]+\z/
   @ingress_ports 62_000..65_500
 
   @fields %{
@@ -146,9 +156,8 @@ defmodule Vagus.App.Spec.Schema do
     with {:ok, tag, profile} <- profile(spec),
          :ok <- own_fields(spec, tag, profile),
          {:ok, spec} <- with_defaults(spec, profile),
-         :ok <- shapes(spec, profile.fields()),
-         :ok <- manifest(spec, tag, facts) do
-      {:ok, spec}
+         :ok <- shapes(spec, profile.fields()) do
+      manifest(spec, tag, facts)
     end
   end
 
@@ -287,46 +296,77 @@ defmodule Vagus.App.Spec.Schema do
   defp plain?(value) when is_binary(value), do: String.valid?(value)
   defp plain?(value) when is_number(value) or is_boolean(value) or is_nil(value), do: true
   defp plain?([]), do: true
-  defp plain?([head | tail]), do: plain?(head) and plain?(tail)
+  defp plain?([head | tail]) when is_list(tail), do: plain?(head) and plain?(tail)
   defp plain?(%{} = map), do: plain_map?(map)
   defp plain?(_other), do: false
 
   defp plain_string?(key), do: is_binary(key) and String.valid?(key)
 
-  defp manifest(_spec, :core, _facts), do: :ok
+  defp manifest(spec, :core, _facts), do: round_trip(spec)
 
   defp manifest(%{config: config} = spec, tag, facts) do
-    with :ok <- unreserved(config),
+    with :ok <- slug(config),
          :ok <- persistable(config),
          :ok <- lifecycle(config, tag, facts),
-         :ok <- availability(config, facts),
          :ok <- options(config, spec.options),
-         :ok <- watchdog(config, spec.settings) do
-      ingress(config, Map.get(spec, :ingress_port))
+         :ok <- watchdog(config, spec.settings),
+         :ok <- ingress(config, Map.get(spec, :ingress_port), facts) do
+      round_trip(spec)
     end
   end
 
-  # The store reads back what it wrote and refuses a difference, by which
-  # time the reason is no longer known. A struct built by hand, not by
-  # `Config.parse/1`, is what fails here.
+  # Checked here although `Config.parse/1` checks it: a manifest's slug can
+  # be replaced after parsing, the slug becomes a directory and a container
+  # name, and that pattern lets a trailing newline through. Core's name is
+  # refused because `app_<it>` would read back as Core's container.
+  defp slug(%Config{slug: slug}) do
+    cond do
+      not (is_binary(slug) and Regex.match?(@slug, slug)) or slug in [".", ".."] ->
+        {:error, {:invalid_slug, slug}}
+
+      Config.reserved_slug?(slug) or slug == Profile.core_app() ->
+        {:error, {:reserved_slug, slug}}
+
+      true ->
+        :ok
+    end
+  end
+
+  # A manifest built by hand, not by `Config.parse/1`, is what fails here:
+  # a field of the wrong type, or an option or schema key that is no string
+  # and so would be one after the file. Through JSON itself: compared as
+  # terms, such a key reads back equal.
   defp persistable(config) do
-    if Config.parse(Config.to_persistable(config)) == {:ok, config},
-      do: :ok,
-      else: {:error, :config_not_persistable}
+    raw = Config.to_persistable(config)
+
+    with {:ok, json} <- Jason.encode(raw),
+         {:ok, ^config} <- Config.parse(Jason.decode!(json)) do
+      :ok
+    else
+      _differs -> {:error, :config_not_persistable}
+    end
   rescue
     _error -> {:error, :config_not_persistable}
   end
 
-  # `Config.parse/1` refuses such a slug too. Asked first, so that a manifest
-  # given another's slug after parsing is refused by name.
-  defp unreserved(%Config{slug: slug}) do
-    if Config.reserved_slug?(slug), do: {:error, {:reserved_slug, slug}}, else: :ok
+  # Exactly what the store does with a spec on its way to the file and
+  # back, stamps included.
+  defp round_trip(spec) do
+    with {:ok, json} <- spec |> encode_spec() |> Jason.encode(),
+         ^spec <- json |> Jason.decode!() |> Resource.Stamp.revive() |> decode_spec() do
+      {:ok, spec}
+    else
+      _differs -> {:error, :not_persistable}
+    end
+  rescue
+    _error -> {:error, :not_persistable}
   end
 
   defp lifecycle(%Config{} = config, tag, facts) do
     cond do
       lifecycle_for(config, facts) != tag -> {:error, {:lifecycle_mismatch, tag}}
       tag == :container and config.image == nil -> {:error, :no_image}
+      tag == :native and config.startup == "once" -> {:error, :native_run_once}
       true -> :ok
     end
   end
@@ -367,10 +407,13 @@ defmodule Vagus.App.Spec.Schema do
   defp watchdog(%Config{startup: "once"}, %{watchdog: true}), do: {:error, :watchdog_run_once}
   defp watchdog(_config, _settings), do: :ok
 
-  defp ingress(config, port) do
+  defp ingress(config, port, facts) do
     cond do
-      dynamic_ingress?(config) and port == nil -> {:error, :ingress_port_missing}
       not dynamic_ingress?(config) and port != nil -> {:error, :ingress_port_not_assignable}
+      not dynamic_ingress?(config) -> :ok
+      port == nil -> {:error, :ingress_port_missing}
+      port not in @ingress_ports -> {:error, :ingress_port_out_of_range}
+      port in facts.reserved_host_ports -> {:error, :ingress_port_reserved}
       true -> :ok
     end
   end
@@ -390,21 +433,20 @@ defmodule Vagus.App.Spec.Schema do
   @doc """
   The value of `ingress_port` for a new spec of `config`: `nil` unless the
   manifest asks for a dynamic port, and then the lowest port of the range
-  that is in neither `held` (`held_ingress_ports/2`) nor `opts[:in_use]`,
-  ports the caller found something listening on. `opts[:range]` replaces
-  the range.
+  that is in neither `held` (`held_ingress_ports/2`) nor `in_use`, ports
+  the caller found something listening on or that the system keeps.
 
   Two callers that pick at once from the same reading pick the same port,
   and nothing here or in the store prevents it.
   `ingress_port_contested?/2` is how the later of the two finds out.
   """
-  @spec assign_ingress_port(Config.t(), Enumerable.t(), keyword()) ::
+  @spec assign_ingress_port(Config.t(), Enumerable.t(), Enumerable.t()) ::
           {:ok, pos_integer() | nil} | {:error, :no_ingress_port_free}
-  def assign_ingress_port(%Config{} = config, held, opts \\ []) do
+  def assign_ingress_port(%Config{} = config, held, in_use \\ []) do
     if dynamic_ingress?(config) do
-      taken = MapSet.union(MapSet.new(held), MapSet.new(Keyword.get(opts, :in_use, [])))
+      taken = MapSet.union(MapSet.new(held), MapSet.new(in_use))
 
-      case Enum.find(Keyword.get(opts, :range, @ingress_ports), &(&1 not in taken)) do
+      case Enum.find(@ingress_ports, &(&1 not in taken)) do
         nil -> {:error, :no_ingress_port_free}
         port -> {:ok, port}
       end

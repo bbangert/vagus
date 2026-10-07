@@ -6,8 +6,11 @@ defmodule Vagus.App.Container.ConfigFingerprintTest do
   to, read here from the engine config instead of the intermediate struct.
 
   What is compared and what is not, and how the capture is regenerated, is
-  written there. What the capture itself must satisfy (redaction, its
-  version) is tested there alone.
+  written there. Every assertion here has its ground truth in the capture;
+  what the config says that the capture cannot witness (labels, the restart
+  policy, published ports, the network alias) is held to the builder this
+  one replaces, in `Vagus.App.Container.ConfigTest`. That the capture is
+  redacted is tested there alone.
   """
 
   use ExUnit.Case, async: true
@@ -27,6 +30,10 @@ defmodule Vagus.App.Container.ConfigFingerprintTest do
                 ])
   @external_resource @fixture_path
   @fixture @fixture_path |> File.read!() |> Jason.decode!()
+  @supervisor_version @fixture_path
+                      |> Path.basename()
+                      |> String.replace_prefix("haos-", "")
+                      |> String.replace_suffix("-container-fingerprint.json", "")
   @fingerprint @fixture["fingerprint"]
   @identity @fixture["identity"]
 
@@ -39,6 +46,12 @@ defmodule Vagus.App.Container.ConfigFingerprintTest do
   # `Vagus.Addon.ContainerFingerprintTest`.
   @accepted_mounts ["/run/cid"]
   @accepted_dns_options ["ndots:0"]
+  # Mounts the config declares that a real Supervisor's container lacks.
+  @vagus_only_mounts []
+
+  @mount_flags ~w(dirsync lazytime noatime nodev nodiratime noexec nosuid nosymfollow
+                  relatime strictatime sync)
+  @policy_flags ~w(nodev noexec nosuid)
 
   setup_all do
     {:ok, manifest} =
@@ -101,17 +114,13 @@ defmodule Vagus.App.Container.ConfigFingerprintTest do
   end
 
   test "the hostname is the slug with underscores dashed, in the app network's domain", %{
-    config: config,
-    facts: facts
+    config: config
   } do
     expected = String.replace(@identity["slug"], "_", "-")
 
     assert @fingerprint["hostname"] == expected
     assert config["Hostname"] == expected
     assert config["Domainname"] in @fingerprint["resolv_conf"]["search"]
-
-    assert config["NetworkingConfig"] ==
-             %{"EndpointsConfig" => %{facts.network_name => %{"Aliases" => [expected]}}}
   end
 
   test "resolver search domain and options match, ndots aside", %{host: host} do
@@ -120,7 +129,6 @@ defmodule Vagus.App.Container.ConfigFingerprintTest do
     assert host["DnsSearch"] == resolv["search"]
     # The engine's embedded resolver, which forwards to what `Dns` names.
     assert resolv["nameservers"] == ["127.0.0.11"]
-    assert host["Dns"] != []
 
     for option <- host["DnsOptions"] do
       assert option in resolv["options"],
@@ -161,18 +169,61 @@ defmodule Vagus.App.Container.ConfigFingerprintTest do
   test "every mount the config declares is in the container, as writable as there", %{host: host} do
     assert host["Mounts"] != []
 
-    for mount <- host["Mounts"] do
+    for mount <- host["Mounts"], mount["Target"] not in @vagus_only_mounts do
       real = fixture_mounts(mount["Target"])
 
-      assert mount["Type"] == "bind"
       assert real != [], "the config mounts #{mount["Target"]}, absent from the real mount table"
       assert Enum.all?(real, &(&1["ro"] == mount["ReadOnly"])), mount["Target"]
     end
 
-    # `/dev` is what this pins read-only, and as upstream binds it.
-    dev = Enum.find(host["Mounts"], &(&1["Target"] == "/dev"))
-    assert dev["ReadOnly"]
-    assert dev["BindOptions"] == %{"ReadOnlyNonRecursive" => true}
+    # `/dev` is what this pins read-only: the capture's is.
+    assert [%{"ro" => true}] = fixture_mounts("/dev")
+    assert Enum.find(host["Mounts"], &(&1["Target"] == "/dev"))["ReadOnly"]
+  end
+
+  test "each declared divergence is still real: declared by the config, absent upstream", %{
+    host: host
+  } do
+    declared = Enum.map(host["Mounts"], & &1["Target"])
+
+    for target <- @vagus_only_mounts do
+      assert target in declared, "#{target} is ledgered and no longer declared"
+      assert fixture_mounts(target) == [], "#{target} is ledgered and the real app has it too"
+    end
+
+    # With nothing ledgered, everything declared is upstream's as well.
+    assert Enum.all?(declared -- @vagus_only_mounts, &(fixture_mounts(&1) != []))
+  end
+
+  test "the accepted mount gap is still exactly what was accepted" do
+    assert [cid] = fixture_mounts("/run/cid")
+
+    # The source says this is the Supervisor's doing and not the engine's.
+    assert cid["source"] =~ ~r{/supervisor/cid_files/.+\.cid$}
+    assert cid["ro"] == true
+  end
+
+  test "the capture's mount flags are whole, and tied to the options they came from" do
+    mounts = @fingerprint["mounts"]
+
+    for mount <- mounts do
+      assert mount["flags"] |> Map.keys() |> Enum.sort() == @mount_flags, mount["target"]
+    end
+
+    # Each was witnessed somewhere: a capture where one is nowhere true has
+    # lost hardening.
+    for flag <- @policy_flags do
+      assert Enum.any?(mounts, & &1["flags"][flag]), "no mount carries #{flag}"
+    end
+
+    for mount <- mounts, flag <- @mount_flags do
+      assert mount["flags"][flag] == flag in String.split(mount["options"], ","),
+             "#{mount["target"]}: flags.#{flag} disagrees with options #{mount["options"]}"
+    end
+  end
+
+  test "the capture records the Supervisor version its filename claims" do
+    assert @fixture["versions"]["supervisor"] == @supervisor_version
   end
 
   test "every mount the container has is explained", %{host: host} do
@@ -193,26 +244,15 @@ defmodule Vagus.App.Container.ConfigFingerprintTest do
     refute Enum.any?(@accepted_mounts, &(&1 in explained))
   end
 
-  test "OomScoreAdj, seccomp, privilege and pid 1 are what the container shows", %{host: host} do
+  test "OomScoreAdj, seccomp and pid 1 are what the container shows", %{host: host} do
     assert @fingerprint["proc"]["oom_score_adj"] == host["OomScoreAdj"]
 
     # `Seccomp: 0` in /proc/self/status is what `seccomp=unconfined` does.
     assert @fingerprint["status"]["Seccomp"] == "0"
     assert host["SecurityOpt"] == ["seccomp=unconfined"]
-    assert host["Privileged"] == false
 
     # No init shim: the image's own entrypoint is pid 1.
     assert host["Init"] == false
     assert @fingerprint["proc"]["pid1_comm"] == "beam.smp"
-  end
-
-  test "the port the manifest declares is published, and the container is managed", %{
-    config: config,
-    host: host
-  } do
-    assert config["ExposedPorts"] == %{"4000/tcp" => %{}}
-    assert host["PortBindings"] == %{"4000/tcp" => [%{"HostPort" => "4000"}]}
-    assert config["Labels"] == %{"supervisor_managed" => ""}
-    assert host["RestartPolicy"] == %{"Name" => ""}
   end
 end

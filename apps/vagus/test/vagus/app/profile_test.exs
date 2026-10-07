@@ -5,7 +5,7 @@ defmodule Vagus.App.ProfileTest do
   alias Vagus.App.Spec.Schema
   alias Vagus.Test.AppManifests
 
-  @facts Facts.read(arch: "aarch64", machine: "raspberrypi3-64")
+  defp facts, do: Facts.read(arch: "aarch64", machine: "raspberrypi3-64")
 
   defp admitted(slug, fields \\ %{}) do
     config = AppManifests.get(slug)
@@ -15,12 +15,12 @@ defmodule Vagus.App.ProfileTest do
         do: Map.put_new(fields, :ingress_port, 62_000),
         else: fields
 
-    {:ok, spec} = config |> Schema.from_manifest(@facts, fields) |> Schema.validate(@facts)
+    {:ok, spec} = config |> Schema.from_manifest(facts(), fields) |> Schema.validate(facts())
     spec
   end
 
   defp core do
-    {:ok, spec} = Schema.validate(%{lifecycle: :core, version: "2026.10.1"}, @facts)
+    {:ok, spec} = Schema.validate(%{lifecycle: :core, version: "2026.10.1"}, facts())
     spec
   end
 
@@ -154,7 +154,7 @@ defmodule Vagus.App.ProfileTest do
               "startup" => startup
             })
 
-          {:ok, spec} = config |> Schema.from_manifest(@facts) |> Schema.validate(@facts)
+          {:ok, spec} = config |> Schema.from_manifest(facts()) |> Schema.validate(facts())
           {startup, Profile.Container.wave(spec)}
         end
 
@@ -181,6 +181,43 @@ defmodule Vagus.App.ProfileTest do
 
       forced = admitted("local_once", %{settings: %{boot: "auto"}})
       assert Profile.Container.boot(forced) == :manual
+    end
+
+    test "Core's answers are the same whatever its spec says" do
+      {:ok, other} =
+        Schema.validate(
+          %{
+            lifecycle: :core,
+            version: "dev",
+            run: true,
+            restart_counter: 9,
+            holds: %{"u" => true}
+          },
+          facts()
+        )
+
+      assert answers(Profile.Core, "anything", other) ==
+               answers(Profile.Core, "homeassistant", core())
+    end
+
+    test "a native app's wave is its manifest's, and nothing else of its spec changes an answer" do
+      plain = admitted("core_mqtt")
+      later = %{plain | config: %{plain.config | startup: "system"}}
+
+      assert Profile.Native.wave(plain) == 30
+      assert Profile.Native.wave(later) == 20
+
+      differing = %{plain | run: true, options: %{"a" => 1}, restart_counter: 4}
+
+      assert answers(Profile.Native, "core_mqtt", differing) ==
+               answers(Profile.Native, "core_mqtt", plain)
+    end
+
+    test "a startup stage nobody knows is the last wave" do
+      assert Profile.wave_of_startup("application") == 50
+
+      for unknown <- ["later", "", nil, :system, 20],
+          do: assert(Profile.wave_of_startup(unknown) == 50)
     end
 
     test "the backup rule is the manifest's" do

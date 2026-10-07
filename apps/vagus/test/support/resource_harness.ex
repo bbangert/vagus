@@ -60,7 +60,8 @@ defmodule Vagus.Resource.Harness do
   controller owns; `:resync` (default `:infinity`); `:runtime`, further
   `Vagus.Resource.Runtime` options; `:context`; `:lanes`; `:pulls`;
   `:services`, a function of the instance that returns child specs to start
-  after the pull worker and before the controllers; `:path`
+  before the pull worker and the controllers, and `:observers`, one for
+  those to start after the controllers; `:path`
   and `:persist` for the store; `:faults`, see `Vagus.Resource.Harness.Faults`.
 
   Steps that crash are retried after 1 to 8 ms unless `:runtime` sets
@@ -119,7 +120,8 @@ defmodule Vagus.Resource.Harness do
         Keyword.take(opts, [:path, :persist]) ++
         [
           services:
-            pulls(instance, opts[:pulls]) ++ Keyword.get(opts, :services, &none/1).(instance)
+            Keyword.get(opts, :services, &none/1).(instance) ++ pulls(instance, opts[:pulls]),
+          observers: Keyword.get(opts, :observers, &none/1).(instance)
         ]
 
     start_supervised!(Supervisor.child_spec({Resource.Supervisor, tree}, id: instance))

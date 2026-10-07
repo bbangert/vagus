@@ -45,6 +45,51 @@ defmodule Vagus.App.FailureTest do
                %{port: nil}
     end
 
+    test "names it however the engine writes the address" do
+      rows = [
+        {"Bind for 0.0.0.0:8080 failed: port is already allocated", 8080},
+        {"Bind for :::8080 failed: port is already allocated", 8080},
+        {"Bind for [::]:8080 failed: port is already allocated", 8080},
+        {"Bind for [::1]:443 failed: port is already allocated", 443},
+        {"listen tcp :8080: bind: address already in use", 8080},
+        {"listen tcp4 0.0.0.0:53: bind: address already in use", 53},
+        {"listen udp6 [::]:5353: bind: address already in use", 5353},
+        {"failed to bind host port for 0.0.0.0:65535:172.30.33.5:80/tcp: address already in use",
+         65_535},
+        # No port is above this: whatever those digits are, they are not one.
+        {"Bind for 0.0.0.0:65536 failed: port is already allocated", nil},
+        {"Bind for 0.0.0.0:99999 failed: port is already allocated", nil},
+        {"Bind for 0.0.0.0:0 failed: port is already allocated", nil},
+        {"Bind for 0.0.0.0:123456 failed: port is already allocated", nil},
+        {"port is already allocated", nil}
+      ]
+
+      for {message, port} <- rows do
+        assert Failure.classify(:start, {:status, 500, message}) ==
+                 %{class: :permanent, cause: :port_conflict, detail: %{port: port}},
+               message
+      end
+    end
+
+    test "is one in any case of the text, and under any 5xx" do
+      assert row(:start, {:status, 500, "Bind for 0.0.0.0:80 failed: Port Is Already Allocated"}) ==
+               {:permanent, :port_conflict}
+
+      assert row(:start, {:status, 500, "ADDRESS ALREADY IN USE"}) == {:permanent, :port_conflict}
+
+      for status <- [500, 502, 503, 599] do
+        assert row(:start, {:status, status, @allocated}) == {:permanent, :port_conflict}
+        assert row(:pull, {:status, status, @in_use}) == {:permanent, :port_conflict}
+      end
+    end
+
+    test "is not one under a 4xx, whose status says what it is" do
+      assert row(:create, {:status, 400, @allocated}) == {:permanent, :invalid_config}
+      assert row(:start, {:status, 404, @in_use}) == {:transient, :not_found}
+      assert row(:pull, {:status, 404, @in_use}) == {:permanent, :image_not_found}
+      assert row(:start, {:status, 409, @in_use}) == {:transient, :engine_refused}
+    end
+
     test "is what the client's own error becomes" do
       reason = {:http, 500, @allocated}
       assert row(:start, Docker.failure(reason)) == {:permanent, :port_conflict}
@@ -53,11 +98,11 @@ defmodule Vagus.App.FailureTest do
 
   describe "an image that does not exist" do
     test "is permanent for a pull the engine refused with a 404" do
-      # Both recorded: a repository, and a tag, that do not exist.
+      # The first is recorded: a tag that does not exist.
       for message <- [
-            "pull access denied for vagus-does-not-exist, repository does not exist or may " <>
-              "require 'docker login': denied: requested access to the resource is denied",
             "manifest for busybox:vagus-no-such-tag not found: manifest unknown: manifest unknown",
+            "Manifest Unknown",
+            "no such image",
             nil
           ] do
         assert row(:pull, {:status, 404, message}) == {:permanent, :image_not_found}
@@ -68,7 +113,8 @@ defmodule Vagus.App.FailureTest do
       for message <- [
             "manifest unknown",
             "manifest for ghcr.io/a/b:1 not found: manifest unknown: manifest unknown",
-            "pull access denied for a/b, repository does not exist"
+            "MANIFEST UNKNOWN",
+            "ghcr.io/a/b:1: Not Found"
           ] do
         assert row(:pull, {:stream, message}) == {:permanent, :image_not_found}, message
 
@@ -84,6 +130,43 @@ defmodule Vagus.App.FailureTest do
 
       assert row(:start, {:status, 404, "No such container: app_x"}) == {:transient, :not_found}
       assert row(:remove, {:status, 404, nil}) == {:transient, :not_found}
+    end
+  end
+
+  describe "a pull the registry refuses" do
+    # Recorded: a repository that does not exist, which a registry does not
+    # tell from one that is private.
+    @no_repository "pull access denied for vagus-does-not-exist, repository does not exist or " <>
+                     "may require 'docker login': denied: requested access to the resource is denied"
+
+    test "is permanent and its own cause, by each of the texts, in any case" do
+      texts = [
+        @no_repository,
+        "unauthorized: authentication required",
+        "Head \"https://ghcr.io/v2/a/b/manifests/1\": unauthorized",
+        "denied: requested access to the resource is denied",
+        "requested access to the resource is denied",
+        "repository does not exist or may require 'docker login'",
+        "UNAUTHORIZED",
+        "Denied",
+        "Repository Does Not Exist"
+      ]
+
+      for message <- texts do
+        assert row(:pull, {:stream, message}) == {:permanent, :pull_denied}, message
+
+        for status <- [401, 403, 404, 500] do
+          assert row(:pull, {:status, status, message}) == {:permanent, :pull_denied}, message
+        end
+      end
+
+      assert row(:pull, Docker.failure({:pull_failed, {404, %{"message" => @no_repository}}})) ==
+               {:permanent, :pull_denied}
+    end
+
+    test "is that only for a pull" do
+      assert row(:start, {:status, 403, "permission denied"}) == {:transient, :engine_refused}
+      assert row(:create, {:status, 500, "access denied"}) == {:transient, :engine_error}
     end
   end
 
@@ -139,8 +222,18 @@ defmodule Vagus.App.FailureTest do
       assert row(:pull, {:crashed, {%RuntimeError{}, []}}) == {:transient, :pull_crashed}
     end
 
+    test "a status that is no refusal and no failure of the engine's" do
+      for status <- [100, 101, 204, 301, 304, 399, 401, 409, 418, 499] do
+        assert row(:start, {:status, status, "whatever"}) == {:transient, :engine_refused}
+        assert row(:start, {:status, status, nil}) == {:transient, :engine_refused}
+      end
+    end
+
     test "a name in use, by a container or by a process" do
       assert row(:create, :already_exists) == {:transient, :already_exists}
+      # Whatever the action: only a create answers so, and nothing depends on it.
+      assert row(:start, :already_exists) == {:transient, :already_exists}
+      assert row(:pull, :already_exists) == {:transient, :already_exists}
 
       assert row(:start, {:other, {:name_taken, Vagus.Mqtt.Broker.Addon_core_mqtt}}) ==
                {:transient, :name_taken}
@@ -180,6 +273,14 @@ defmodule Vagus.App.FailureTest do
   end
 
   describe "anything else" do
+    test "what only a pull reports is unknown from any other action" do
+      for action <- [:create, :start, :stop, :remove, :remove_image] do
+        assert row(action, {:crashed, :killed}) == {:transient, :unknown}
+        assert row(action, {:stream, "manifest unknown"}) == {:transient, :unknown}
+        assert row(action, {:stream, "unauthorized"}) == {:transient, :unknown}
+      end
+    end
+
     test "is transient and unknown, and keeps what it was" do
       for reason <- [{:other, :weird}, :nope, nil, {:status, "500", "x"}, {:stream, "x"}, %{}] do
         assert Failure.classify(:start, reason) ==

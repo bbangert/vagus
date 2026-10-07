@@ -30,6 +30,12 @@ defmodule Vagus.Resource.Supervisor do
   is replaced with the lanes and the services before it, and the runtimes
   with any of them: a runtime that starts looks at every resource, which is
   how a service that has forgotten its waiters hears from them again.
+
+  `:observers` are children that only tell runtimes where to look and hold
+  nothing a runtime relies on. They stand after the controllers, so one
+  that is replaced takes nothing with it, and it is replaced with the
+  controllers' supervisor when that ends. An observer makes up for what it
+  missed by itself, by having its runtime look at everything.
   """
 
   use Supervisor
@@ -60,6 +66,7 @@ defmodule Vagus.Resource.Supervisor do
     * `:lanes`, `Vagus.Resource.Lanes` caps.
     * `:services`, child specs started after `Vagus.Resource.Lanes` and
       before the controllers.
+    * `:observers`, child specs started after the controllers.
 
   `:path` and `:controllers` default to `config :vagus, :resources_path` and
   `config :vagus, :controllers`, and only for the application's instance.
@@ -83,7 +90,7 @@ defmodule Vagus.Resource.Supervisor do
         opts
       end
 
-    {own, store} = Keyword.split(opts, [:controllers, :runtime, :lanes, :services])
+    {own, store} = Keyword.split(opts, [:controllers, :runtime, :lanes, :services, :observers])
     # Every controller is asked what it declares here, once. A declaration
     # that raises fails this start with its name, and nothing started below
     # has to call a controller to know its kind or its conditions.
@@ -130,7 +137,7 @@ defmodule Vagus.Resource.Supervisor do
            controllers: declarations,
            runtime: Keyword.get(own, :runtime, []),
            options: Map.new(entries)}
-        ]
+        ] ++ Keyword.get(own, :observers, [])
 
     # What fails outside the VM, flash or the engine, reaches a caller as an
     # error, not as a child's exit; the store, which does stop over it, has
@@ -171,7 +178,24 @@ defmodule Vagus.Resource.Supervisor do
       raise ArgumentError, "#{inspect(controller)}: options must be a keyword list"
     end
 
-    case Keyword.keys(options) -- known do
+    keys = Keyword.keys(options)
+
+    # The runtime would read one of the two, and nobody could say which.
+    case keys -- Enum.uniq(keys) do
+      [] ->
+        :ok
+
+      [twice | _] ->
+        raise ArgumentError,
+              "#{inspect(controller)}: runtime option #{inspect(twice)} is given twice"
+    end
+
+    for {key, value} <- options, key in known, not Runtime.controller_option?(key, value) do
+      raise ArgumentError,
+            "#{inspect(controller)}: runtime option #{inspect(key)} cannot be #{inspect(value)}"
+    end
+
+    case keys -- known do
       [] ->
         Enum.sort(options)
 

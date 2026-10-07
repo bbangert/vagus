@@ -114,11 +114,53 @@ defmodule Vagus.App.AuthIndexTest do
         assert AuthIndex.lookup(not_a_token, i) == :error
       end
 
-      for not_a_token <- ["", nil, 7] do
-        assert_raise FunctionClauseError, fn -> AuthIndex.put("a", not_a_token, i) end
+      for not_a_token <- ["", nil, 7, [token(2)], %{}] do
+        assert AuthIndex.put("b", not_a_token, i) == {:error, :invalid}
       end
 
-      assert :ets.info(AuthIndex.table(i[:instance]), :size) == 1
+      for not_a_name <- [nil, :a, 7, ["a"]] do
+        assert AuthIndex.put(not_a_name, token(3), i) == {:error, :invalid}
+      end
+
+      assert AuthIndex.lookup(token(3), i) == :error
+
+      assert :ets.tab2list(AuthIndex.table(i[:instance])) == [
+               {:crypto.hash(:sha256, token(1)), "a"}
+             ]
+    end
+
+    test "a row is the token's SHA-256 and the app, and nothing else", %{i: i} do
+      :ok = AuthIndex.put("a", token(1), i)
+      :ok = AuthIndex.put("b", token(2), i)
+
+      assert Enum.sort(:ets.tab2list(AuthIndex.table(i[:instance]))) ==
+               Enum.sort([
+                 {:crypto.hash(:sha256, token(1)), "a"},
+                 {:crypto.hash(:sha256, token(2)), "b"}
+               ])
+    end
+
+    test "putting an app's own token again deletes nothing, so no reader can miss it", %{
+      i: i,
+      pid: pid
+    } do
+      :ok = AuthIndex.put("a", token(1), i)
+      digest = :crypto.hash(:sha256, token(1))
+
+      :erlang.trace_pattern({:ets, :delete, 2}, true, [])
+      :erlang.trace(pid, true, [:call])
+
+      :ok = AuthIndex.put("a", token(1), i)
+      :ok = AuthIndex.put("a", token(2), i)
+
+      :erlang.trace(pid, false, [:call])
+      :erlang.trace_pattern({:ets, :delete, 2}, false, [])
+      delivered = :erlang.trace_delivered(pid)
+      assert_receive {:trace_delivered, ^pid, ^delivered}, 2_000
+
+      # One delete in all: the old token's, when another replaced it.
+      assert_received {:trace, ^pid, :call, {:ets, :delete, [_table, ^digest]}}
+      refute_received {:trace, ^pid, :call, {:ets, :delete, _args}}
     end
 
     test "many writers at once leave one row an app, each its last", %{i: i} do
@@ -141,6 +183,7 @@ defmodule Vagus.App.AuthIndexTest do
       assert :ets.info(AuthIndex.table(i[:instance]), :size) == 20
     end
 
+    # A stress test: what pins the rule is the test above.
     test "readers never miss a token while others are written, or it is put again", %{i: i} do
       :ok = AuthIndex.put("steady", token(:steady), i)
       test = self()
@@ -231,6 +274,39 @@ defmodule Vagus.App.AuthIndexTest do
       for n <- 1..3, do: refute(held =~ token(n))
     end
 
+    test "not in what a caller that fails logs, whatever it passed", %{i: i} do
+      tasks = start_supervised!(Task.Supervisor)
+      Process.flag(:trap_exit, true)
+
+      log =
+        capture_log(fn ->
+          for {app, secret} <- [{nil, token(:a)}, {:not_a_name, token(:b)}, {"app", token(:c)}] do
+            {:ok, task} =
+              Task.Supervisor.start_child(tasks, fn ->
+                # A match that fails, in a function whose arguments are no token.
+                :done = AuthIndex.put(app, secret, i)
+              end)
+
+            ref = Process.monitor(task)
+            assert_receive {:DOWN, ^ref, :process, ^task, {{:badmatch, _result}, _stack}}, 2_000
+          end
+
+          {:ok, task} =
+            Task.Supervisor.start_child(tasks, fn ->
+              {:ok, :nobody} = AuthIndex.lookup(token(:d), i)
+            end)
+
+          ref = Process.monitor(task)
+          assert_receive {:DOWN, ^ref, :process, ^task, {{:badmatch, :error}, _stack}}, 2_000
+          Logger.flush()
+        end)
+
+      # The crash reports are there, and say what failed.
+      assert log =~ "MatchError"
+      assert log =~ "{:error, :invalid}"
+      for which <- [:a, :b, :c, :d], do: refute(log =~ token(which))
+    end
+
     test "not in what is logged when the process dies of a request", %{i: i, pid: pid} do
       Process.flag(:trap_exit, true)
 
@@ -240,7 +316,7 @@ defmodule Vagus.App.AuthIndexTest do
           :ok = AuthIndex.put("a", token(2), i)
           ref = Process.monitor(pid)
           catch_exit(GenServer.call(pid, :not_a_request))
-          assert_receive {:DOWN, ^ref, :process, ^pid, _reason}
+          assert_receive {:DOWN, ^ref, :process, ^pid, _reason}, 2_000
           Logger.flush()
         end)
 
@@ -252,7 +328,7 @@ defmodule Vagus.App.AuthIndexTest do
   end
 
   describe "the application's own instance" do
-    test "has the table, after the pull worker and before the controllers" do
+    test "has the table, first among the services: after the lanes, before the pull worker" do
       order =
         Vagus.Resource.Supervisor
         |> Supervisor.which_children()
@@ -261,8 +337,14 @@ defmodule Vagus.App.AuthIndexTest do
 
       place = fn id -> Enum.find_index(order, &(&1 == id)) end
 
-      assert place.(Vagus.App.Pulls.tasks(Vagus.Resource)) < place.(AuthIndex)
-      assert place.(AuthIndex) < place.(Vagus.Resource.Controllers.Supervisor)
+      # A pull worker that ends takes everything after it along, and the
+      # table must not be among that.
+      assert place.(AuthIndex) == place.(Vagus.Resource.Lanes) + 1
+      assert place.(AuthIndex) < place.(Vagus.App.Pulls)
+
+      assert place.(Vagus.App.Pulls.tasks(Vagus.Resource)) <
+               place.(Vagus.Resource.Controllers.Supervisor)
+
       assert AuthIndex.lookup(token(:nobody)) == :error
       assert :ets.info(AuthIndex.table(Vagus.Resource), :protection) == :protected
     end
@@ -290,6 +372,31 @@ defmodule Vagus.App.AuthIndexTest do
 
       assert Enum.find_index(children, &(&1 == AuthIndex)) <
                Enum.find_index(children, &(&1 == Vagus.Resource.Lanes))
+    end
+
+    test "a pull worker that ends leaves it, and every token, as it was" do
+      sys =
+        start_system(
+          controllers: [Tokened],
+          services: &[{AuthIndex, instance: &1}],
+          pulls: [engine: [socket: Vagus.Test.FakeEngine.socket_path()]]
+        )
+
+      given_ready(sys, {:tokened, "a", %{"token" => token("kept")}})
+      index = Process.whereis(AuthIndex.name(sys.instance))
+      runtime = Process.whereis(Runtime.name(sys.instance, Tokened))
+      worker = Process.whereis(Vagus.App.Pulls.name(sys.instance))
+      :sys.suspend(index)
+
+      TestInstance.kill_observed(worker, Process.whereis(Module.concat(sys.instance, Supervisor)))
+
+      # Read before any pass could have put it back: the index answers nobody.
+      assert AuthIndex.lookup(token("kept"), sys.i) == {:ok, "a"}
+      assert Process.whereis(AuthIndex.name(sys.instance)) == index
+      assert Process.whereis(Vagus.App.Pulls.name(sys.instance)) != worker
+      assert Process.whereis(Runtime.name(sys.instance, Tokened)) != runtime
+      :sys.resume(index)
+      settle(sys)
     end
 
     test "a pass puts its resource's token, once", %{sys: sys} do
@@ -332,7 +439,7 @@ defmodule Vagus.App.AuthIndexTest do
 
   defp collect_traces(pid) do
     delivered = :erlang.trace_delivered(pid)
-    assert_receive {:trace_delivered, ^pid, ^delivered}
+    assert_receive {:trace_delivered, ^pid, ^delivered}, 2_000
     drain_traces(pid, [])
   end
 

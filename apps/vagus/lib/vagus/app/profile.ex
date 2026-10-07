@@ -125,8 +125,8 @@ defmodule Vagus.App.Profile do
 
   @doc """
   The app a container belongs to, by its name alone, or `nil` for a name
-  that is no app's. `addon_<slug>` is what an app's container was called
-  before `app_<slug>`, and one may still exist.
+  that is no app's. `addon_<slug>` is the same app as `app_<slug>`: the
+  firmware that shares this engine's data names its containers so.
   """
   @spec app_of_container(term()) :: String.t() | nil
   def app_of_container("app_" <> slug) when slug != "", do: slug

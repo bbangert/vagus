@@ -9,12 +9,16 @@ defmodule Vagus.App.EngineObserver do
 
     * the subscription to `Vagus.Runtime.Events`. An event about a
       container wakes the app the container is named for
-      (`Vagus.App.Profile.app_of_container/1`), and no other.
-    * the last listing of our containers. On each notice that events were
-      missed, at its own start and every `:interval` it lists them once and
-      wakes the apps whose container appeared, went or changed (`row/1`).
-      The first listing after its start has nothing to compare with and
-      wakes every app that has a container.
+      (`Vagus.App.Profile.app_of_container/1`), and no other, when its
+      action is one that can change what a pass decides (`waking?/1`).
+    * the last listing of our containers (`row/1`), and what the next one
+      owes. A notice that events were missed wakes every app with a
+      container in the listing before it or after it: a listing does not
+      show a restart by the engine's own policy, which leaves the same
+      container running, and the events that did are the ones lost. The
+      `:interval` loses nothing and wakes only the apps whose row appeared,
+      went or changed. The first listing after a start wakes every app
+      that has a container.
     * a monitor on each native instance it was told of (`watch/3`), whose
       end wakes its app. Nothing restarts such an instance but its app's
       next pass.
@@ -27,12 +31,17 @@ defmodule Vagus.App.EngineObserver do
   member of the set of apps to wake, which is emptied once per burst: a
   thousand events about one container are one wake.
 
-  A listing is an engine call made in this process, bounded by
-  `:list_timeout`. While it is out, events wait in the mailbox, at the
-  engine's pace and each a few hundred bytes. When the engine cannot be
-  listed the last listing is kept and compared with the next that succeeds:
-  the engine's return is announced by the events worker as a gap, and the
-  interval is there for when it is not.
+  A listing is an engine call made in this process. `:list_timeout` is how
+  long the engine may stay silent during it, not a deadline for the whole
+  of it. While it is out, events wait in the mailbox, at the engine's pace
+  and each a few hundred bytes.
+
+  A listing that fails, whatever the reason, keeps the last one and what
+  is owed, and is tried again after `:relist`, `{first_ms, max_ms}`,
+  doubling, by one timer however many notices arrive meanwhile; each
+  notice is also a try of its own. A backend whose call exits has failed
+  the same way. One that raises is a defect and ends this process, which
+  costs nothing else.
 
   ## The events worker
 
@@ -49,23 +58,29 @@ defmodule Vagus.App.EngineObserver do
   ## When this process is absent
 
   Nothing wakes an app for what happens in the engine, and `watch/3` is
-  dropped. Its supervisor replaces the controllers with it, and their
-  runtimes start by looking at every app, native ones included, which is
-  how the replacement is told again what to watch.
+  dropped. It stands after the controllers and nothing is replaced with
+  it. Whatever it missed, and every watch it held, it makes up for when it
+  starts: it has its runtime look at every app
+  (`Vagus.Resource.Runtime.resync/2`), and each pass that observes a native
+  instance watches it again.
 
   ## Options
 
     * `:controller`, the controller whose runtime is woken (required), and
       `:instance`
     * `:enqueue`, `(controller, app, [instance: instance] -> term)`
-      (default `Vagus.Resource.Runtime.enqueue/3`)
+      (default `Vagus.Resource.Runtime.enqueue/3`), and `:resync`,
+      `(controller, [instance: instance] -> term)` (default
+      `Vagus.Resource.Runtime.resync/2`)
     * `:events`, `{module, server}` to subscribe with, or `nil` for none
       (default `{Vagus.Runtime.Events, Vagus.Runtime.Events}`)
     * `:backend`, the module whose `list/1` is the inventory (default
       `Vagus.App.Backend.Container`), and `:backend_opts` for it
     * `:interval`, milliseconds or `:infinity` (default five minutes)
-    * `:list_timeout`, milliseconds (default 15 s), and `:resubscribe`
-      (default `{100, 30_000}`)
+    * `:list_timeout`, milliseconds (default 15 s); `:relist` (default
+      `{1_000, 60_000}`) and `:resubscribe` (default `{100, 30_000}`)
+    * `:timer`, `(message, ms -> reference)`, which has `message` sent to
+      this process after `ms` (default `Process.send_after/3`)
   """
 
   use GenServer
@@ -77,6 +92,17 @@ defmodule Vagus.App.EngineObserver do
   alias Vagus.Resource
   alias Vagus.Resource.Runtime
   alias Vagus.Runtime.{Docker, Events}
+
+  # What can change what a pass decides: the container is made, runs, has
+  # ended or is gone, is held, is called something else, or its health
+  # changed. The rest, `exec_*` above all, which a healthcheck emits three
+  # of at every probe, says nothing a pass would act on.
+  @waking ~w(create start die stop kill oom destroy pause unpause restart rename)
+
+  @doc "Whether an event with this action wakes its app."
+  @spec waking?(term()) :: boolean()
+  def waking?("health_status" <> _which), do: true
+  def waking?(action), do: action in @waking
 
   @typedoc """
   What of a listed container counts as a change. `detail` is the exit code
@@ -142,6 +168,7 @@ defmodule Vagus.App.EngineObserver do
       controller: Keyword.fetch!(opts, :controller),
       i: [instance: instance],
       enqueue: Keyword.get(opts, :enqueue, &Runtime.enqueue/3),
+      resync: Keyword.get(opts, :resync, &Runtime.resync/2),
       events: Keyword.get(opts, :events, {Events, Events}),
       backend: Keyword.get(opts, :backend, Backend.Container),
       backend_opts:
@@ -152,6 +179,8 @@ defmodule Vagus.App.EngineObserver do
         end),
       interval: Keyword.get(opts, :interval, :timer.minutes(5)),
       resubscribe: Keyword.get(opts, :resubscribe, {100, 30_000}),
+      relist: Keyword.get(opts, :relist, {1_000, 60_000}),
+      timer: Keyword.get(opts, :timer, &Process.send_after(self(), &1, &2)),
       # `{:subscribed, monitor}`, or `{:retrying, next_delay}` while a timer
       # is out; `nil` with no worker to subscribe to.
       subscription: nil,
@@ -159,8 +188,17 @@ defmodule Vagus.App.EngineObserver do
       ticker: nil,
       # `nil` until a listing has succeeded.
       rows: nil,
+      # Whom the next listing that succeeds wakes: `:everything` listed
+      # before or after it, or only the `:changed`.
+      owed: :everything,
+      # Whether the next drain lists. Apart from `owed`, which outlives a
+      # failed listing while this does not: an event is no reason to ask an
+      # engine again that has just failed to answer.
+      due?: true,
+      # `{token, next_delay}` after a failed listing: the token of the
+      # timer that is out, or `nil` once it has fired.
+      retry: nil,
       wake: MapSet.new(),
-      list?: true,
       drain?: false,
       # `app => {pid, monitor}` and `monitor => app`.
       natives: %{},
@@ -174,6 +212,9 @@ defmodule Vagus.App.EngineObserver do
   # that starts after this process needs it done.
   @impl true
   def handle_continue(:start, state) do
+    # Whatever the process before this one was about to say is lost, and
+    # so is every watch it held.
+    state.resync.(state.controller, state.i)
     {first, _max} = state.resubscribe
     {:noreply, state |> subscribe(first) |> tick() |> drain()}
   end
@@ -192,13 +233,22 @@ defmodule Vagus.App.EngineObserver do
   end
 
   @impl true
-  def handle_info({:docker_event, %{name: name}}, state),
-    do: {:noreply, state |> wake(Profile.app_of_container(name)) |> soon()}
+  def handle_info({:docker_event, %{name: name} = event}, state) do
+    if waking?(event[:action]),
+      do: {:noreply, state |> wake(Profile.app_of_container(name)) |> soon()},
+      else: {:noreply, state}
+  end
 
-  def handle_info({:docker_events, :gap}, state), do: {:noreply, soon(%{state | list?: true})}
+  def handle_info({:docker_events, :gap}, state),
+    do: {:noreply, soon(%{state | owed: :everything, due?: true})}
 
   def handle_info(:tick, state),
-    do: {:noreply, state |> tick() |> Map.put(:list?, true) |> soon()}
+    do: {:noreply, state |> tick() |> owe() |> soon()}
+
+  # The token: a listing that succeeded since has no timer, and the message
+  # of the one it had may still arrive.
+  def handle_info({:relist, token}, %{retry: {token, delay}} = state),
+    do: {:noreply, %{state | retry: {nil, delay}} |> owe() |> soon()}
 
   def handle_info(:drain, state), do: {:noreply, drain(state)}
 
@@ -232,6 +282,8 @@ defmodule Vagus.App.EngineObserver do
   defp wake(state, nil), do: state
   defp wake(state, app), do: %{state | wake: MapSet.put(state.wake, app)}
 
+  defp owe(state), do: %{state | owed: state.owed || :changed, due?: true}
+
   # After whatever is in the mailbox now, so that a burst is one drain.
   defp soon(%{drain?: true} = state), do: state
 
@@ -241,7 +293,7 @@ defmodule Vagus.App.EngineObserver do
   end
 
   defp drain(state) do
-    state = if state.list?, do: list(%{state | list?: false}), else: state
+    state = if state.due?, do: list(%{state | due?: false}), else: state
     for app <- Enum.sort(state.wake), do: state.enqueue.(state.controller, app, state.i)
     %{state | wake: MapSet.new(), drain?: false}
   end
@@ -252,43 +304,59 @@ defmodule Vagus.App.EngineObserver do
         rows =
           for summary <- containers, name <- summary.names, into: %{}, do: {name, row(summary)}
 
-        changed = changed(state.rows, rows)
-        Enum.reduce(changed, %{state | rows: rows}, &wake(&2, Profile.app_of_container(&1)))
+        state.rows
+        |> owed(rows, state.owed)
+        |> Enum.reduce(
+          %{state | rows: rows, owed: nil, retry: nil},
+          &wake(&2, Profile.app_of_container(&1))
+        )
 
+      # Every boot begins so.
       {:unavailable, _reason} ->
-        state
+        again(state)
 
       failed ->
         Logger.warning(
           "Vagus.App.EngineObserver: the containers could not be listed: #{inspect(failed)}"
         )
 
-        state
+        again(state)
     end
   end
 
-  # The backend is the engine's client, and its failures are values. One
-  # that raised or exited instead is a listing that did not happen, as for
-  # an engine that is away, and must not end the process the runtimes are
-  # replaced with.
+  # An exit is the client giving up on a call, which another try may not.
+  # Anything raised is left to end this process.
   defp listing(state) do
     state.backend.list(state.backend_opts)
   catch
-    kind, reason -> {kind, reason}
+    :exit, reason -> {:exit, reason}
   end
 
-  defp changed(nil, rows), do: Map.keys(rows)
+  defp owed(nil, rows, _owed), do: Map.keys(rows)
+  defp owed(before, rows, :everything), do: Enum.uniq(Map.keys(before) ++ Map.keys(rows))
 
-  defp changed(before, rows) do
-    for name <- Enum.uniq(Map.keys(before) ++ Map.keys(rows)),
-        before[name] != rows[name],
-        do: name
+  defp owed(before, rows, _changed),
+    do: for(name <- owed(before, rows, :everything), before[name] != rows[name], do: name)
+
+  # One timer: a failure while it is out waits for it.
+  defp again(%{retry: {token, _delay}} = state) when token != nil, do: state
+
+  defp again(state) do
+    {first, max} = state.relist
+
+    delay =
+      case state.retry do
+        {nil, delay} -> delay
+        nil -> first
+      end
+
+    token = make_ref()
+    state.timer.({:relist, token}, delay)
+    %{state | retry: {token, min(delay * 2, max)}}
   end
 
   defp tick(%{interval: :infinity} = state), do: state
-
-  defp tick(state),
-    do: %{state | ticker: Process.send_after(self(), :tick, state.interval)}
+  defp tick(state), do: %{state | ticker: state.timer.(:tick, state.interval)}
 
   defp subscribe(%{events: nil} = state, _delay), do: state
 
@@ -312,7 +380,7 @@ defmodule Vagus.App.EngineObserver do
 
   defp retry(state, delay) do
     {_first, max} = state.resubscribe
-    Process.send_after(self(), :subscribe, delay)
+    state.timer.(:subscribe, delay)
     %{state | subscription: {:retrying, min(delay * 2, max)}}
   end
 end

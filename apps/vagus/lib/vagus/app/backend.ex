@@ -60,6 +60,10 @@ defmodule Vagus.App.Backend do
       first, by name, of the networks it has one on, which is then not an
       address on the app network. `nil` when it has none: on the host
       network, while it is not running, and always for a native app.
+    * `process` is the process in this VM that is the instance, for a
+      backend that has one: what to monitor to hear at once that the
+      instance ended, taken in the same reading as the rest. `nil` for a
+      container.
   """
   @type instance :: %{
           id: String.t(),
@@ -73,7 +77,8 @@ defmodule Vagus.App.Backend do
           image_id: String.t() | nil,
           labels: %{optional(String.t()) => String.t()},
           env: %{optional(String.t()) => String.t()},
-          address: String.t() | nil
+          address: String.t() | nil,
+          process: pid() | nil
         }
 
   @type unavailable :: {:unavailable, atom()}

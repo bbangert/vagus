@@ -3,12 +3,15 @@ defmodule Vagus.Test.AppManifests do
   Manifests to run the App spec's functions over, and a generator of
   variations on them.
 
-  The repository keeps no store manifests as files. Three here are ones it
-  does hold: the built-in broker's (`Vagus.Addon.Store.BuiltinFetcher`),
-  the probe app the device-captured container fingerprint was taken from,
-  and the broker manifest the old builder's own tests use. The rest are
-  written after store apps, one for each thing a manifest can ask of a
-  container.
+  The repository keeps no store manifests as files, so none here is a real
+  one read from a store. Three are manifests the repository does hold in
+  code: the built-in broker's (`Vagus.Addon.Store.BuiltinFetcher`), the
+  probe app the device-captured container fingerprint was taken from, and
+  the broker manifest the old builder's own tests use. The rest are written
+  by hand: some after store apps, and one for each thing a manifest can ask
+  of a container alone, so that a flag read for another's key shows.
+  `manifest/0` generates more, over every field the container builders
+  read.
 
   Generated values come from a seeded generator: a run is the same every
   time, and a failure names the case.
@@ -101,7 +104,33 @@ defmodule Vagus.Test.AppManifests do
       "services" => ["mqtt:need"],
       "watchdog" => "http://[HOST]:[PORT:8099]/",
       "timeout" => 30,
-      "homeassistant" => "2024.1.0"
+      "homeassistant" => "2024.1.0",
+      "ingress_entry" => "index.html",
+      "ingress_stream" => true,
+      "panel_title" => "Zigbee\n2 \u{1F41D} MQTT",
+      "panel_icon" => "mdi:zigbee",
+      "panel_admin" => false,
+      "webui" => "http://[HOST]:[PORT:8099]/",
+      "backup_pre" => "sh -c 'sync; echo \"pre\"'",
+      "backup_post" => "true",
+      "backup_exclude" => ["log/*", "**/*.tmp"],
+      "docker_api" => true,
+      "description" => String.duplicate("A bridge between Zigbee and MQTT. ", 40),
+      "options" => %{
+        "data_path" => "/config/zigbee2mqtt",
+        "serial" => %{"port" => "/dev/ttyUSB0", "baudrate" => 115_200},
+        "retries" => [1, 2, 3],
+        "ratio" => 0.25,
+        "mqtt" => %{}
+      },
+      "schema" => %{
+        "data_path" => "str",
+        "serial" => %{"port" => "str", "baudrate" => "int(9600,921600)?"},
+        "retries" => ["int(1,5)"],
+        "ratio" => "float(0,1)",
+        "mqtt" => %{"server" => "str?", "password" => "password?"},
+        "level" => "list(debug|info|warn)?"
+      }
     },
     %{
       "name" => "Glances",
@@ -133,6 +162,84 @@ defmodule Vagus.Test.AppManifests do
       "privileged" => ["SYS_RAWIO"],
       "full_access" => true,
       "ports" => %{"80/tcp" => 80, "8123/tcp" => 8123, "8888/tcp" => 8888, "53/udp" => 53}
+    },
+    %{
+      "name" => "Only the host's pids",
+      "version" => "1",
+      "slug" => "only_host_pid",
+      "image" => "local/{arch}-one",
+      "host_pid" => true,
+      "ports" => %{"7000/tcp" => 7000, "7001/tcp" => nil, "7002/udp" => 0}
+    },
+    %{
+      "name" => "Only the host's name",
+      "version" => "1",
+      "slug" => "only_host_uts",
+      "image" => "local/one",
+      "host_uts" => true
+    },
+    %{
+      "name" => "Only the host's IPC",
+      "version" => "1",
+      "slug" => "only_host_ipc",
+      "image" => "local/one",
+      "host_ipc" => true
+    },
+    %{
+      "name" => "Only the host's bus",
+      "version" => "1",
+      "slug" => "only_host_dbus",
+      "image" => "local/one",
+      "host_dbus" => true
+    },
+    %{
+      "name" => "Only full access",
+      "version" => "1",
+      "slug" => "only_full_access",
+      "image" => "local/one",
+      "full_access" => true
+    },
+    %{
+      "name" => "Only capabilities",
+      "version" => "1",
+      "slug" => "only_privileged",
+      "image" => "local/one",
+      "privileged" => ["NET_ADMIN"]
+    },
+    %{
+      "name" => "Host network, and ports all the same",
+      "version" => "1",
+      "slug" => "host_with_ports",
+      "image" => "local/one",
+      "host_network" => true,
+      "ports" => %{"8080/tcp" => 8080, "53/udp" => nil}
+    },
+    %{
+      "name" => "Full access and devices",
+      "version" => "1",
+      "slug" => "full_and_devices",
+      "image" => "local/one",
+      "full_access" => true,
+      "devices" => ["/dev/null", "/dev/zero", "/dev/absent0"]
+    },
+    %{
+      "name" => "DSP on the host network",
+      "version" => "1",
+      "slug" => "dsp_on_host",
+      "image" => "local/one",
+      "dsp" => true,
+      "host_network" => true
+    },
+    %{
+      "name" => "Two mappings, one target",
+      "version" => "1",
+      "slug" => "two_configs",
+      "image" => "local/one",
+      "map" => [
+        "config:rw",
+        %{"type" => "addon_config", "read_only" => true, "path" => "/custom"},
+        "ssl"
+      ]
     },
     %{
       "name" => "DSP inference",
@@ -226,8 +333,7 @@ defmodule Vagus.Test.AppManifests do
   def plain(depth \\ 2) do
     leaves = [
       fn -> string() end,
-      fn -> :rand.uniform(2_000_000) - 1_000_000 end,
-      fn -> :rand.uniform() * 100 end,
+      fn -> number() end,
       fn -> pick([true, false, nil]) end
     ]
 
@@ -242,8 +348,90 @@ defmodule Vagus.Test.AppManifests do
 
   @spec string() :: String.t()
   def string do
-    pick(["", "a", "é ü", ":atom", "{\"tuple\": [1]}", "$stamp", "true", "0", "x/y.z-1_2"]) <>
-      Integer.to_string(:rand.uniform(99))
+    pick([
+      "",
+      "a",
+      "é ü",
+      ":atom",
+      "{\"tuple\": [1]}",
+      "$stamp",
+      "true",
+      "0",
+      "x/y.z-1_2",
+      "line\nbreak\ttab",
+      <<0, 1, 31, 127>>,
+      "\u{1F600}\u{10FFFF}",
+      "\\\"\\u0000\\n",
+      "</script>"
+    ]) <> pick(["", Integer.to_string(:rand.uniform(99))])
+  end
+
+  @doc "A number JSON carries: among them the largest and smallest of each kind."
+  @spec number() :: number()
+  def number do
+    pick([
+      0,
+      -1,
+      9_007_199_254_740_993,
+      -(2 ** 80),
+      2 ** 200,
+      0.0,
+      -0.5,
+      1.0e-320,
+      5.0e-324,
+      1.0e308,
+      -1.0e300,
+      0.1 + 0.2,
+      :rand.uniform() * 1.0e15,
+      :rand.uniform(2_000_000) - 1_000_000
+    ])
+  end
+
+  # Every field `Vagus.Addon.Manager.build_spec/2` and
+  # `Vagus.App.Container.Config.build/3` read of a manifest, and nothing
+  # else: `slug`, `image`, `version`, `host_network`, `init`, `privileged`,
+  # `host_ipc`, `host_pid`, `host_uts`, `host_dbus`, `full_access`,
+  # `devices`, `dsp`, `map` and `ports`.
+  @doc "A manifest that runs as a container, with every field a container is built from at random."
+  @spec manifest() :: Config.t()
+  def manifest do
+    flag = fn -> pick([true, false, false]) end
+    some = fn list -> Enum.filter(list, fn _ -> :rand.uniform(3) == 1 end) end
+
+    ports =
+      for port <- some.(["80/tcp", "443/tcp", "53/udp", "1883/tcp", "8888/tcp", "9000/tcp"]),
+          into: %{},
+          do: {port, pick([nil, 0, 80, 8_123, 8_888, 1_883, 40_000])}
+
+    map =
+      for type <- some.(~w(ssl share media backup config homeassistant_config
+                           all_addon_configs addons addon_config unknown_type)) do
+        pick([
+          type,
+          type <> ":rw",
+          type <> ":ro",
+          %{"type" => type, "read_only" => flag.(), "path" => pick([nil, "/custom"])}
+        ])
+      end
+
+    parse!(%{
+      "name" => "generated",
+      "version" => pick(["1", "2.0.1", "2026.10.0b1", "latest"]),
+      "slug" => pick(["gen", "gen_under_score", "Gen.Dot-dash", "a0d7b954_gen"]),
+      "image" => pick(["local/gen", "ghcr.io/x/{arch}-gen", "{arch}/gen-{arch}"]),
+      "host_network" => flag.(),
+      "init" => flag.(),
+      "privileged" => some.(["NET_ADMIN", "SYS_ADMIN", "SYS_RAWIO", "SYS_PTRACE"]),
+      "host_ipc" => flag.(),
+      "host_pid" => flag.(),
+      "host_uts" => flag.(),
+      "host_dbus" => flag.(),
+      "full_access" => flag.(),
+      "devices" => some.(["/dev/null", "/dev/zero", "/dev/absent0", "/etc/hostname"]),
+      "dsp" => flag.(),
+      "map" => map,
+      "ports" => ports
+    })
   end
 
   @doc "Any term at all: what a validator must refuse without raising."
@@ -254,7 +442,11 @@ defmodule Vagus.Test.AppManifests do
         pick([nil, true, :lifecycle, :container, :core, :native, :config, "", "x", 0, -1])
       end,
       fn -> pick([1.5, self(), make_ref(), <<255, 254>>, &is_atom/1, 65_536, {}, {:a, 1}]) end,
-      fn -> pick([[1 | 2], [], %{}, ~D[2026-10-07], 1..3, MapSet.new([1]), "9" <> <<0>>]) end
+      fn -> pick([[1 | 2], [], %{}, ~D[2026-10-07], 1..3, MapSet.new([1]), "9" <> <<0>>]) end,
+      fn -> pick([[1], %{"x" => %{}}, %{<<255>> => 1}, %{1 => 1}, ["a" | "b"], 1.0e308]) end,
+      fn ->
+        pick(["1.0\n", "auto", "manual", "once", 62_000, 61_999, 8_888, [%{}], %{"a" => []}])
+      end
     ]
 
     nested = [

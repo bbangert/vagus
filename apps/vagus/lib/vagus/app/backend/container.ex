@@ -118,7 +118,8 @@ defmodule Vagus.App.Backend.Container do
       image_id: inspect["Image"],
       labels: config["Labels"] || %{},
       env: env(config["Env"] || []),
-      address: address(get_in(inspect, ["NetworkSettings", "Networks"]) || %{})
+      address: address(get_in(inspect, ["NetworkSettings", "Networks"]) || %{}),
+      process: nil
     }
   end
 

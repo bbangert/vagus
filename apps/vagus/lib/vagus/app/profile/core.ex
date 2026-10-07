@@ -3,13 +3,13 @@ defmodule Vagus.App.Profile.Core do
   Home Assistant Core: one container, kept across stops and reused while it
   still matches what would be made, restarted by the engine.
 
-  It keeps the name `homeassistant`, whatever the app is called, because
-  the firmware before this one must still find Core after a revert.
+  The container is named `homeassistant` whatever the app is called: the
+  other firmware slot finds Core by that name.
 
-  This says what Core's lifecycle is. What is not here yet: the builder of
-  its container config, with the fingerprint `reuse/0` compares, and the
-  steps `hooks/0` names. Until they exist a Core spec carries no more than
-  `fields/0`.
+  This module says what Core's lifecycle is and nothing of how. Its
+  container config, the fingerprint `reuse/0` compares and the steps
+  `hooks/0` names are none of this module's, and a Core spec carries
+  `fields/0` and nothing else.
   """
 
   @behaviour Vagus.App.Profile

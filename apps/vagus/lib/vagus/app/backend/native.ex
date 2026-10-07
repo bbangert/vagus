@@ -63,18 +63,6 @@ defmodule Vagus.App.Backend.Native do
     end
   end
 
-  @doc """
-  The process of the instance `observe/2` reports, or `nil` when there is
-  none or nobody to ask: what to monitor to hear at once that it ended.
-  """
-  @spec pid(Vagus.App.Backend.name(), keyword()) :: pid() | nil
-  def pid(slug, opts \\ []) do
-    case child(slug, opts) do
-      {:ok, pid} -> pid
-      :down -> nil
-    end
-  end
-
   @impl true
   def image_present?(_image, _opts \\ []), do: {:ok, true}
 
@@ -181,7 +169,8 @@ defmodule Vagus.App.Backend.Native do
       image_id: nil,
       labels: %{},
       env: %{},
-      address: nil
+      address: nil,
+      process: pid
     }
   end
 

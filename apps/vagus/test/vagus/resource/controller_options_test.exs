@@ -76,6 +76,7 @@ defmodule Vagus.Resource.ControllerOptionsTest do
       end
 
       assert_receive {:observing, "a", step}, sys.wait
+      # Asked through the store, so behind every notice of the three creations.
       assert %{queued: ["b", "c"], in_flight: in_flight} = info(sys, Probe)
       assert Map.keys(in_flight) == ["a"]
       refute_received {:observing, _name, _step}
@@ -181,6 +182,38 @@ defmodule Vagus.Resource.ControllerOptionsTest do
                "Vagus.Resource.Toys.Probe is listed twice, with different options"
     end
 
+    test "a module, and a module with no options, are the same entry" do
+      instance = TestInstance.start!(controllers: [Probe, {Probe, []}, {Follower, []}])
+
+      children = Supervisor.which_children(Vagus.Resource.Controllers.Supervisor.name(instance))
+      assert length(children) == 2
+
+      plain = TestInstance.start!(controllers: [Probe, Follower])
+      state = fn instance, controller -> :sys.get_state(Runtime.name(instance, controller)) end
+
+      for controller <- [Probe, Follower],
+          key <- [:resync, :max_in_flight, :backoff, :gate_poll] do
+        assert Map.fetch!(state.(instance, controller), key) ==
+                 Map.fetch!(state.(plain, controller), key)
+      end
+    end
+
+    test "the order options are written in does not make two entries of one" do
+      instance =
+        TestInstance.start!(
+          controllers: [
+            {Probe, resync: 5, gate_poll: 7, backoff: {1, 2}},
+            {Probe, backoff: {1, 2}, resync: 5, gate_poll: 7}
+          ]
+        )
+
+      assert [_one] =
+               Supervisor.which_children(Vagus.Resource.Controllers.Supervisor.name(instance))
+
+      assert %{resync: 5, gate_poll: 7, backoff: {1, 2}} =
+               :sys.get_state(Runtime.name(instance, Probe))
+    end
+
     test "but one listed twice the same way is one controller" do
       instance =
         TestInstance.start!(
@@ -191,12 +224,54 @@ defmodule Vagus.Resource.ControllerOptionsTest do
       assert length(children) == 2
     end
 
-    test "a cap that would start nothing, given to one controller" do
-      Process.flag(:trap_exit, true)
+    test "an option given twice in one entry, of which the runtime would read one" do
+      assert start_error([{Probe, [resync: 5, resync: 900_000]}]) ==
+               "Vagus.Resource.Toys.Probe: runtime option :resync is given twice"
 
-      assert {:error, reason} = TestInstance.start(controllers: [{Probe, max_in_flight_steps: 0}])
-      assert inspect(reason) =~ "max_in_flight_steps must be a positive integer"
-      assert inspect(reason) =~ "failed_to_start_child, Vagus.Resource.Toys.Probe"
+      assert start_error([Follower, {Probe, [context: %{}, gate_poll: 1, context: %{a: 1}]}]) =~
+               "Vagus.Resource.Toys.Probe: runtime option :context is given twice"
+    end
+
+    test "a value its option cannot have, by controller, option and value" do
+      rows = [
+        resync: 0,
+        resync: -5,
+        resync: "5m",
+        resync: nil,
+        max_in_flight_steps: 0,
+        max_in_flight_steps: :all,
+        max_in_flight_steps: 1.5,
+        context: [a: 1],
+        context: nil,
+        backoff: 500,
+        backoff: {0, 10},
+        backoff: {20, 10},
+        backoff: {1, :infinity},
+        unavailable_retry: 0,
+        unavailable_retry: :infinity,
+        gate_poll: -1,
+        gate_poll: "1s"
+      ]
+
+      for {key, value} <- rows do
+        assert start_error([{Probe, [{key, value}]}]) ==
+                 "Vagus.Resource.Toys.Probe: runtime option #{inspect(key)} cannot be " <>
+                   inspect(value)
+      end
+    end
+
+    test "but every value an option can have starts" do
+      for options <- [
+            [resync: :infinity],
+            [resync: 1],
+            [max_in_flight_steps: 1],
+            [context: %{}],
+            [backoff: {5, 5}],
+            [unavailable_retry: 1, gate_poll: 1]
+          ] do
+        instance = TestInstance.start!(controllers: [{Probe, options}])
+        :ok = stop_supervised(instance)
+      end
     end
   end
 end

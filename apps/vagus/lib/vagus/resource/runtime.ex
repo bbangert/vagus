@@ -169,6 +169,22 @@ defmodule Vagus.Resource.Runtime do
   def controller_options,
     do: [:resync, :max_in_flight_steps, :context, :backoff, :unavailable_retry, :gate_poll]
 
+  @doc "Whether `value` is one a runtime can run with as its `key` of `controller_options/0`."
+  @spec controller_option?(atom(), term()) :: boolean()
+  def controller_option?(:resync, value), do: value == :infinity or positive?(value)
+  def controller_option?(:context, value), do: is_map(value) and not is_struct(value)
+
+  def controller_option?(:backoff, {base, max}),
+    do: positive?(base) and positive?(max) and base <= max
+
+  def controller_option?(key, value)
+      when key in [:max_in_flight_steps, :unavailable_retry, :gate_poll],
+      do: positive?(value)
+
+  def controller_option?(_key, _value), do: false
+
+  defp positive?(value), do: is_integer(value) and value > 0
+
   defp instance(opts), do: Keyword.get(opts, :instance, Resource)
 
   @impl true

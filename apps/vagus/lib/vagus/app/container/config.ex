@@ -33,7 +33,9 @@ defmodule Vagus.App.Container.Config do
   """
   @type creation :: %{token: String.t(), device_cgroup_rules: [String.t()]}
 
-  @type refusal :: :no_image | {:not_a_container, Profile.tag()}
+  @typedoc "`:invalid_creation` is a token that is no string or rules that are no list."
+  @type refusal ::
+          :no_image | :no_manifest | :invalid_creation | {:not_a_container, Profile.tag()}
 
   # A manifest's `map:` type: the directory under the data root, where it is
   # mounted, and the bind propagation.
@@ -87,6 +89,10 @@ defmodule Vagus.App.Container.Config do
     end
   end
 
+  def build(%{lifecycle: :container, config: %Config{}}, %Facts{}, _creation),
+    do: {:error, :invalid_creation}
+
+  def build(%{lifecycle: :container}, %Facts{}, _creation), do: {:error, :no_manifest}
   def build(%{lifecycle: tag}, %Facts{}, _creation), do: {:error, {:not_a_container, tag}}
 
   @doc "The image the app runs: the manifest's, for the machine's architecture, at the spec's version."
