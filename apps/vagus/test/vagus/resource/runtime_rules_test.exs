@@ -12,6 +12,7 @@ defmodule Vagus.Resource.RuntimeRulesTest do
     Echo,
     Flaky,
     Follower,
+    Grabber,
     Idle,
     Kept,
     Last,
@@ -186,6 +187,17 @@ defmodule Vagus.Resource.RuntimeRulesTest do
       assert inspect(reason) =~
                "Vagus.Resource.Toys.Kept and Vagus.Resource.Toys.Clasher both declare " <>
                  "condition :ready on kind :kept"
+    end
+
+    test "two controllers declaring one finalizer on a kind fail the start, by name" do
+      assert {:error, reason} = TestInstance.start(controllers: [Kept, Grabber], kinds: %{})
+
+      assert inspect(reason) =~
+               "Vagus.Resource.Toys.Kept and Vagus.Resource.Toys.Grabber both declare " <>
+                 "finalizer :kept on kind :kept"
+
+      # The same controller twice is one controller.
+      assert {:ok, _instance} = TestInstance.start(controllers: [Kept, Kept], kinds: %{})
     end
 
     test "a registration the store refuses stops the runtime with that reason" do

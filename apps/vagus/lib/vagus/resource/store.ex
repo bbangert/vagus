@@ -272,7 +272,9 @@ defmodule Vagus.Resource.Store do
   registry, and the wait must not hang on a notification nobody sent.
 
   The caller must hold no subscription of its own to the same object; the
-  notifications left in its mailbox when this returns are dropped.
+  notifications left in its mailbox when this returns are dropped. To be
+  sure of that it asks the store once before returning, so it returns behind
+  whatever the store is then writing.
   """
   @spec await(Resource.kind(), Resource.name(), await_fun(), keyword()) ::
           {:ok, term()} | {:error, {:timeout, Resource.t() | nil}}
@@ -286,8 +288,26 @@ defmodule Vagus.Resource.Store do
       await_loop({kind, name}, fun, deadline, Keyword.get(opts, :poll, 1_000), opts)
     after
       Watch.unsubscribe(key, watch)
+      behind_dispatch(opts)
       drop_notifications(kind, name)
     end
+  end
+
+  # The store may have read the subscription, for a notification it is about
+  # to send, just before it was withdrawn. It answers this after that send,
+  # so the notification is in the mailbox to be dropped.
+  #
+  # With the store gone or not answering the wait still returns what it
+  # found: its answer came from the tables, not from the store, and a
+  # command that got its condition must not fail on tidying up. A store that
+  # died while asked had sent whatever it was going to before the exit that
+  # says so arrived. One that is merely slow may still send, and that one
+  # notification is left for the caller; it says "look again", which no
+  # caller is harmed by doing.
+  defp behind_dispatch(opts) do
+    relay([], nil, opts)
+  catch
+    :exit, _reason -> :ok
   end
 
   defp await_loop({kind, name} = key, fun, deadline, poll, opts) do

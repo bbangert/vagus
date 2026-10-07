@@ -187,6 +187,49 @@ defmodule Vagus.Resource.StoreAdditionsTest do
       assert Store.await(:part, "ghost", halt, [poll: 1, timeout: 60_000] ++ i) == {:ok, :third}
     end
 
+    # The store reads who is subscribed and then sends. A waiter that
+    # unsubscribes between the two gets the notification after it has
+    # looked. Here the store is held while the waiter finishes, and the test
+    # sends what the store was about to.
+    test "returns behind a notification the store was already sending", %{i: i} do
+      {:ok, _} = Store.create(:part, "p", %{}, i)
+      store = Process.whereis(Store.name(i[:instance]))
+      test = self()
+
+      :erlang.trace(store, true, [:receive])
+      :ok = :sys.suspend(store)
+
+      waiter =
+        Task.async(fn ->
+          result = Store.await(:part, "p", &{:halt, &1.name}, i)
+          send(test, {:returned, result, Process.info(self(), :messages)})
+        end)
+
+      # Its subscription is withdrawn and it is asking the store.
+      assert_receive {:trace, ^store, :receive, {:"$gen_call", {from, _tag}, {:relay, [], nil}}},
+                     1_000
+
+      assert from == waiter.pid
+      :erlang.trace(store, false, [:receive])
+      assert Registry.lookup(Watch.name(i[:instance]), {:object, :part, "p"}) == []
+      refute_received {:returned, _result, _messages}
+
+      send(waiter.pid, {Watch, :changed, %{kind: :part, name: "p"}})
+      :ok = :sys.resume(store)
+
+      assert_receive {:returned, {:ok, "p"}, {:messages, []}}, 1_000
+      Task.await(waiter)
+    end
+
+    test "still answers when there is no store to ask" do
+      instance = TestInstance.name()
+      start_supervised!({Vagus.Resource.Tables, instance})
+      start_supervised!(Watch.child_spec(instance))
+
+      assert Store.await(:part, "p", &{:halt, &1}, instance: instance) == {:ok, nil}
+      assert Registry.keys(Watch.name(instance), self()) == []
+    end
+
     test "gives up at the deadline with what it last saw, and leaves nothing behind", %{i: i} do
       {:ok, created} = Store.create(:part, "p", %{}, i)
 

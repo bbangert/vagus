@@ -187,8 +187,8 @@ defmodule Vagus.Resource.Controller do
 
   Raises on a list the store would later refuse a registration from: two
   owners of one kind, a controller attached to a kind nobody owns, condition
-  types that are not atoms, or one condition type declared by two
-  controllers of a kind. None of these can run, and found here they fail the
+  types that are not atoms, or one condition type or one finalizer declared
+  by two controllers of a kind. None of these can run, and found here they fail the
   start with a name instead of a runtime that can never register.
   """
   @spec kinds([module()]) :: %{Resource.kind() => Kind.t()}
@@ -212,13 +212,13 @@ defmodule Vagus.Resource.Controller do
     Map.new(owned, fn {kind, owner} ->
       on_kind = [owner | Enum.filter(attached, &(&1.kind() == kind))]
       distinct_conditions!(kind, on_kind)
+      finalizers = distinct_finalizers!(kind, on_kind)
 
       {kind,
        Kind.new(
          [
            validators: if(exports?(owner, :validate, 1), do: [&owner.validate/1], else: []),
-           finalizers:
-             Enum.uniq(for(c <- on_kind, exports?(c, :finalizer, 0), do: c.finalizer())),
+           finalizers: finalizers,
            writer_entries: optional(owner, :writer_entries, [], [])
          ] ++
            for(
@@ -228,6 +228,27 @@ defmodule Vagus.Resource.Controller do
            )
        )}
     end)
+  end
+
+  # A resource holds a finalizer once. Shared, the first controller to finish
+  # would release it for both, and the resource could go before the other
+  # had cleaned up.
+  defp distinct_finalizers!(kind, controllers) do
+    held = for c <- controllers, exports?(c, :finalizer, 0), do: {c.finalizer(), c}
+
+    held
+    |> Enum.reduce([], fn {finalizer, controller}, seen ->
+      case List.keyfind(seen, finalizer, 0) do
+        nil ->
+          seen ++ [{finalizer, controller}]
+
+        {^finalizer, rival} ->
+          raise ArgumentError,
+                "#{inspect(rival)} and #{inspect(controller)} both declare finalizer " <>
+                  "#{inspect(finalizer)} on kind #{inspect(kind)}"
+      end
+    end)
+    |> Enum.map(&elem(&1, 0))
   end
 
   defp distinct_conditions!(kind, controllers) do

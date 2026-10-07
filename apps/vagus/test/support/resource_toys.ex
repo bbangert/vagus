@@ -704,6 +704,26 @@ defmodule Vagus.Resource.Toys do
     def act(_action, _args, _context), do: :ok
   end
 
+  defmodule Grabber do
+    @moduledoc "Attached to `:kept`, and declares the finalizer its owner declares."
+    @behaviour Vagus.Resource.Controller
+
+    @impl true
+    def kind, do: :kept
+    @impl true
+    def condition_types, do: [:grabbed]
+    @impl true
+    def owned_conditions, do: [:grabbed]
+    @impl true
+    def finalizer, do: :kept
+    @impl true
+    def observe(_kept, _context), do: %{}
+    @impl true
+    def reconcile(_kept, _observed), do: {:no_verdict, []}
+    @impl true
+    def act(_action, _args, _context), do: :ok
+  end
+
   defmodule Twisted do
     @moduledoc """
     Owns `:twisted`, and is wrong on purpose in the way `spec["twist"]`
