@@ -15,6 +15,11 @@ defmodule Vagus.App.Backend.Native do
   its children's crashes, and one that gives up stays down and is observed
   as `:absent`. Whether to start it again is the controller's decision.
 
+  `start/2` of a running instance is `:ok`. When the name the subtree
+  registers is held by a process the supervisor does not hold, nothing can
+  be started under it and `start/2` is `{:error, {:other, {:name_taken,
+  name}}}`.
+
   With the holding supervisor away, `observe/2` is `{:unavailable,
   :native_supervisor_down}`, `start/2` exits, and `stop/3` and `remove/2`
   exit when there is a subtree to end.
@@ -67,8 +72,18 @@ defmodule Vagus.App.Backend.Native do
 
     case DynamicSupervisor.start_child(supervisor(opts), spec) do
       {:ok, _pid} -> :ok
-      {:error, {:already_started, _pid}} -> :ok
+      {:error, {:already_started, pid}} -> running(slug, pid, opts)
       {:error, reason} -> {:error, {:other, reason}}
+    end
+  end
+
+  # The name being taken says a process has it, not that the instance runs:
+  # only a child of the supervisor is one `observe/2` will report, and a
+  # start answered `:ok` for anything else would be asked for again forever.
+  defp running(slug, pid, opts) do
+    case child(slug, opts) do
+      {:ok, ^pid} -> :ok
+      _held_by_another -> {:error, {:other, {:name_taken, broker_name(slug)}}}
     end
   end
 

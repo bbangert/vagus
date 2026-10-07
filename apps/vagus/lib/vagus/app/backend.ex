@@ -55,8 +55,11 @@ defmodule Vagus.App.Backend do
     * `restart_count` counts restarts by the engine's restart policy alone.
     * `health` is `:none` without a healthcheck.
     * `env` holds the app's token. Do not log an instance.
-    * `address` is the instance's address on the app network, `nil` on the
-      host network and while it is not running.
+    * `address` is where the instance is reached: its address on the app
+      network when it is on that network, otherwise its address on the
+      first, by name, of the networks it has one on, which is then not an
+      address on the app network. `nil` when it has none: on the host
+      network, while it is not running, and always for a native app.
   """
   @type instance :: %{
           id: String.t(),

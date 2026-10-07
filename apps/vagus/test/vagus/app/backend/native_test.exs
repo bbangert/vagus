@@ -128,6 +128,22 @@ defmodule Vagus.App.Backend.NativeTest do
     assert Native.observe(slug, opts) == {:ok, :absent}
   end
 
+  test "start/2 under a name another process holds is an error, and nothing is started", %{
+    slug: slug,
+    opts: opts
+  } do
+    impostor = spawn(fn -> Process.sleep(:infinity) end)
+    Process.register(impostor, Native.broker_name(slug))
+    on_exit(fn -> Process.exit(impostor, :kill) end)
+
+    assert Native.start(slug, opts) ==
+             {:error, {:other, {:name_taken, Native.broker_name(slug)}}}
+
+    assert Native.observe(slug, opts) == {:ok, :absent}
+    assert %{active: 0} = DynamicSupervisor.count_children(opts[:supervisor])
+    assert Process.whereis(Native.broker_name(slug)) == impostor
+  end
+
   test "with the supervisor away, observe/2 is unavailable", %{slug: slug, opts: opts} do
     opts = Keyword.put(opts, :supervisor, :"no_supervisor_#{slug}")
     assert Native.observe(slug, opts) == {:unavailable, :native_supervisor_down}
