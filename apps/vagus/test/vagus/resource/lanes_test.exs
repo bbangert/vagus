@@ -110,6 +110,18 @@ defmodule Vagus.Resource.LanesTest do
     end
   end
 
+  test "a process may hold several slots, and gives them back one at a time", %{i: i} do
+    assert Lanes.acquire(:pair, i) == :ok
+    assert Lanes.acquire(:pair, i) == :ok
+    assert %{pair: %{held: [me, me]}} = Lanes.info(i)
+    assert me == self()
+
+    assert Lanes.release(:pair, i) == :ok
+    assert %{pair: %{held: [^me]}} = Lanes.info(i)
+    assert Lanes.release(:pair, i) == :ok
+    assert Lanes.release(:pair, i) == {:error, :not_held}
+  end
+
   test "a class the lanes were not started with is refused, as is a release of nothing", %{i: i} do
     assert Lanes.acquire(:ghost, i) == {:error, {:unknown_class, :ghost}}
     assert_raise ArgumentError, fn -> Lanes.run(:ghost, i, fn -> :ok end) end

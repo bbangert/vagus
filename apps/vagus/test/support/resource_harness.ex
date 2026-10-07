@@ -20,10 +20,17 @@ defmodule Vagus.Resource.Harness do
   ## Mutations
 
   With `VAGUS_RESOURCE_MUTATION` set, every runtime is started with one of
-  its mechanisms taken away, whatever the test asked for: `deliver_events`,
-  `resync` (which also drops events, so that only a resync could repair
-  them), `ignore_dirty` or `skip_collector`. `mix test.mutations` runs the
-  scenario tests once per value and requires them to fail.
+  its mechanisms taken away or one of its rules broken, whatever the test
+  asked for: `deliver_events`, `resync`, `ignore_dirty`, `skip_collector`,
+  `double_step`, `stamp_current_generation` or `repeat_action` (see
+  `Vagus.Resource.Runtime`). `mix test.mutations` runs the scenario tests
+  once per value and requires them to fail.
+
+  A mutated run should fail on what the runtime did, not on a wait running
+  out, and where the mutation makes the runtime do something wrong it does.
+  Where it makes the runtime not do something (`deliver_events`, `resync`,
+  `ignore_dirty`, `skip_collector`) the failure is a wait that ends, there
+  being nothing else to see; every wait is `wait`, shortened for such a run.
   """
 
   import ExUnit.Assertions
@@ -134,9 +141,12 @@ defmodule Vagus.Resource.Harness do
     case System.get_env(@mutation_env) do
       nil -> []
       "deliver_events" -> [deliver_events: false]
-      "resync" -> [deliver_events: false, resync: :infinity]
+      "resync" -> [skip_resync: true]
       "ignore_dirty" -> [ignore_dirty: true]
       "skip_collector" -> [skip_collector: true]
+      "double_step" -> [double_step: true]
+      "stamp_current_generation" -> [stamp_current_generation: true]
+      "repeat_action" -> [repeat_action: true]
     end
   end
 
@@ -152,41 +162,45 @@ defmodule Vagus.Resource.Harness do
   Each runtime is asked through the store (`Vagus.Resource.Store.relay/3`),
   so its answer comes after it has read every notification the store had
   sent. It answers when quiet, with the number of steps it has ever started.
-  The system is at rest when two rounds in a row get the same numbers: when
-  the second round's question left the store, no step was running anywhere,
-  since each runtime was quiet before and started nothing until after, and
-  every notification sent by then was answered without a step. Nothing is
-  left that could cause one.
+  The system is at rest when two rounds in a row get the same numbers from
+  the same processes: when the second round's question left the store, no
+  step was running anywhere, since each runtime was quiet before and started
+  nothing until after, and every notification sent by then was answered
+  without a step. Nothing is left that could cause one.
 
   Timers are not waited for: a resource that asked to be looked at again
-  later is at rest until then. Neither is anything the test itself started.
-  A runtime may only be killed through this module while a settle runs.
+  later is at rest until then, and may no longer be when the test looks.
+  `timers: :none` waits them out as well, and returns only when no runtime
+  has one pending; a test that goes on to read a runtime's state asks for
+  that, or uses timers too long to fire. Nothing the test itself started is
+  waited for. A runtime may only be killed through this module while a
+  settle runs.
   """
   @spec settle(system(), keyword()) :: :ok
   def settle(sys, opts \\ []) do
     controllers = Keyword.get(opts, :only, sys.controllers)
     deadline = System.monotonic_time(:millisecond) + sys.wait
-    settle(sys, controllers, nil, deadline)
+    settle(sys, {controllers, Keyword.get(opts, :timers, :any)}, nil, deadline)
   end
 
-  defp settle(sys, controllers, previous, deadline) do
-    case round(sys, controllers, deadline) do
+  defp settle(sys, asked, previous, deadline) do
+    case round(sys, asked, deadline) do
       {:ok, ^previous} -> :ok
-      {:ok, steps} -> settle(sys, controllers, steps, deadline)
-      :restarted -> settle(sys, controllers, nil, deadline)
+      {:ok, answers} -> settle(sys, asked, answers, deadline)
+      :restarted -> settle(sys, asked, nil, deadline)
     end
   end
 
-  defp round(sys, controllers, deadline) do
+  defp round(sys, {controllers, timers}, deadline) do
     # A kill by the fault harness is finished, replacement included, before
     # this returns. One that begins right after it shows below as a name
     # with no process or as a process going down, and the round is taken
     # again.
-    if sys.faults, do: Faults.count(sys.faults)
+    if sys.faults, do: Faults.report(sys.faults)
     found = for controller <- controllers, do: {controller, runtime(sys, controller)}
 
     case Enum.find(found, &(elem(&1, 1) == nil)) do
-      nil -> probe(sys, found, deadline)
+      nil -> probe(sys, found, timers, deadline)
       {_controller, nil} when sys.faults != nil -> :restarted
       {controller, nil} -> flunk("no runtime for #{inspect(controller)}")
     end
@@ -194,10 +208,11 @@ defmodule Vagus.Resource.Harness do
 
   defp runtime(sys, controller), do: Process.whereis(Runtime.name(sys.instance, controller))
 
-  defp probe(sys, found, deadline) do
+  defp probe(sys, found, timers, deadline) do
     runtimes = for {controller, pid} <- found, do: {controller, pid, Process.monitor(pid)}
     ref = make_ref()
-    :ok = Store.relay(Enum.map(found, &elem(&1, 1)), Runtime.quiet_probe(self(), ref), sys.i)
+    message = Runtime.quiet_probe(self(), ref, timers: timers)
+    :ok = Store.relay(Enum.map(found, &elem(&1, 1)), message, sys.i)
     answers = Enum.map(runtimes, &answer(sys, &1, ref, deadline))
     for {_controller, _pid, monitor} <- runtimes, do: Process.demonitor(monitor, [:flush])
 
@@ -206,8 +221,10 @@ defmodule Vagus.Resource.Harness do
 
   defp answer(sys, {controller, pid, monitor}, ref, deadline) do
     receive do
+      # With the pid: a replacement that happens to have started as many
+      # steps is not the runtime that answered before.
       {^ref, ^pid, steps} ->
-        steps
+        {pid, steps}
 
       {:DOWN, ^monitor, :process, ^pid, reason} ->
         if sys.faults == nil,
@@ -294,15 +311,17 @@ defmodule Vagus.Resource.Harness do
   @doc """
   Creates a resource, waits for its condition (`:condition`, default
   `:ready`) and for the system to settle, so that what the test does next
-  starts from rest. Other options are `Vagus.Resource.Store.create/4`'s.
+  starts from rest; `settle: false` for a system that cannot come to rest.
+  Other options are `Vagus.Resource.Store.create/4`'s.
   """
   @spec given_ready(system(), {Resource.kind(), Resource.name(), map()}, keyword()) ::
           Resource.t()
   def given_ready(sys, {kind, name, spec}, opts \\ []) do
-    {condition, create} = Keyword.pop(opts, :condition, :ready)
+    {condition, opts} = Keyword.pop(opts, :condition, :ready)
+    {settle?, create} = Keyword.pop(opts, :settle, true)
     {:ok, _resource} = Store.create(kind, name, spec, create ++ sys.i)
     await!(sys, kind, name, condition)
-    settle(sys)
+    if settle?, do: settle(sys)
     Store.get(kind, name, sys.i)
   end
 
@@ -399,28 +418,47 @@ defmodule Vagus.Resource.Harness.Faults do
   Kills a runtime at a chosen point of a scenario, to show that the scenario
   ends the same wherever it is interrupted.
 
-  A step has a boundary after each commit and after each action: the places
-  a crash can fall, since a commit is all or none. `each_boundary/1` runs
-  the scenario once undisturbed, counting the boundaries crossed and keeping
-  the final store and the journal. Then, for each `k`, it runs the scenario
-  in a fresh system in which the runtime whose step crosses the `k`-th
-  boundary is killed there, with the step; its supervisor replaces it, and
-  the run must end with the same store and an equivalent journal.
+  A step has a boundary after each action and after each commit that
+  changed something: the places a crash can fall, since a commit is all or
+  none. A commit that changed nothing is not one: the store is as it was
+  before the pass, so a kill there is a kill before the pass, which is the
+  boundary before. Leaving those out is also what makes a scenario cross the
+  same boundaries each time, since how many passes find nothing to write
+  depends on how the notifications happened to fall. A boundary is named by
+  the controller, the resource and which of the two it follows, and by how
+  many of that name came before it. `each_boundary/1` runs the scenario once
+  undisturbed, keeping the boundaries crossed, the final store and the
+  journal. Then, for each of those boundaries, it runs the scenario in a
+  fresh system in which the runtime whose step crosses that boundary is
+  killed there, with the step; its supervisor replaces it, and the run must
+  end with the same store and an equivalent journal.
+
+  Every one of those kills must happen. A run that never reaches its
+  boundary fails, so a scenario has to cross the same boundaries each time:
+  it settles between the things it does.
 
   ## Equivalent journals
 
-  Actions are idempotent against observation, so an interrupted pass may
-  repeat what it had already done, and nothing else. Two journals are
-  equivalent when, for every resource, they are the same sequence of actions
-  once each immediate repetition of a block is reduced to one occurrence
-  (`collapse/1`: `a b a b c` and `a a b c` are both `a b c`; `a b a` stays).
-  A missing, extra or reordered action is a difference. Only the order
-  within one resource is compared: independent runtimes interleave
-  differently on every run, interrupted or not.
+  Actions are idempotent against observation, so an interrupted pass may do
+  again what it had already done, and nothing else. Per resource, an
+  interrupted journal is equivalent to the undisturbed one when it is that
+  journal with one replay in it (`replay?/2`): it follows the reference up
+  to some point, goes back to an earlier point, and follows it from there to
+  the end. `a b b c` and `a b a b c` are replays of `a b c`. A missing
+  action, an action the reference does not have, another order, or a repeat
+  that is not a re-run from an earlier point is a difference, as is any
+  repeat in a resource of a controller that was not killed, since its replay
+  is then empty. The reference is taken as it is: what it repeats, the
+  interrupted run must repeat.
 
-  This process counts the boundaries and does the killing, so that both
+  Only the order within one resource is compared: independent runtimes
+  interleave differently on every run, interrupted or not. And a boundary is
+  never inside `act/3`: an action that is itself several steps, and breaks
+  when cut between them, is not found here.
+
+  This process records the boundaries and does the killing, so that both
   happen one at a time: a step that reports a boundary waits in the call
-  while it is counted, and is still waiting when it is killed.
+  while it is recorded, and is still waiting when it is killed.
   """
 
   use GenServer
@@ -429,34 +467,68 @@ defmodule Vagus.Resource.Harness.Faults do
 
   alias Vagus.Resource.{Controllers, Harness, TestInstance}
 
-  @type mode :: :count | {:kill_at, pos_integer()}
+  @typedoc "`{controller, resource name, :commit | :action}`"
+  @type label :: {module(), String.t(), :commit | :action}
+  @type mode :: :count | {:kill_at, {label(), pos_integer()}}
 
   @doc """
   Options: `:scenario`, a function of the system that drives it and waits
   for what it needs; `:system`, `Vagus.Resource.Harness.start_system/1`
-  options; `:normalize`, applied to each final store before comparing.
-  Returns the undisturbed run: `store`, `journal` and `boundaries`.
+  options; `:normalize`, applied to each final store before comparing;
+  `:equivalent`, a function of one resource's reference and interrupted
+  actions in place of `replay?/2`.
+
+  Returns the undisturbed run: `store`, `journal` (actions per resource) and
+  `boundaries` (labels in the order crossed).
   """
-  @spec each_boundary(keyword()) :: %{
-          store: term(),
-          journal: map(),
-          boundaries: non_neg_integer()
-        }
+  @spec each_boundary(keyword()) :: %{store: term(), journal: map(), boundaries: [label()]}
   def each_boundary(opts) do
     scenario = Keyword.fetch!(opts, :scenario)
     system = Keyword.get(opts, :system, [])
     normalize = Keyword.get(opts, :normalize, & &1)
+    equivalent = Keyword.get(opts, :equivalent, &replay?/2)
     reference = run(system, :count, scenario, normalize)
 
-    for k <- 1..reference.boundaries//1 do
-      interrupted = run(system, {:kill_at, k}, scenario, normalize)
+    if reference.boundaries == [],
+      do: flunk("the scenario crosses no boundary, so there is nowhere to interrupt it")
 
-      assert interrupted.store == reference.store,
-             "killed after boundary #{k} of #{reference.boundaries}: the store ends differently"
+    targets =
+      for {label, crossed} <- Enum.frequencies(reference.boundaries),
+          nth <- 1..crossed,
+          do: {label, nth}
 
-      assert interrupted.journal == reference.journal,
-             "killed after boundary #{k} of #{reference.boundaries}: the actions differ"
+    for {{_controller, _name, kind} = label, nth} = target <- Enum.sort(targets) do
+      interrupted = run(system, {:kill_at, target}, scenario, normalize)
+      where = "killed after #{inspect(label)} ##{nth}"
+
+      case interrupted.kill do
+        :done -> :ok
+        nil -> flunk("#{where}: the run never crossed that boundary")
+        {:error, reason} -> flunk("#{where}: the kill did not happen: #{reason}")
+      end
+
+      assert interrupted.store == reference.store, "#{where}: the store ends differently"
+
+      for key <- Enum.uniq(Map.keys(reference.journal) ++ Map.keys(interrupted.journal)) do
+        {expected, found} = {reference.journal[key] || [], interrupted.journal[key] || []}
+
+        assert equivalent.(expected, found), """
+        #{where}: the actions for #{inspect(key)} differ.
+        undisturbed: #{inspect(expected)}
+        interrupted: #{inspect(found)}
+        """
+      end
+
+      kind
     end
+    |> Enum.uniq()
+    |> Enum.sort()
+    |> then(fn killed ->
+      crossed = reference.boundaries |> Enum.map(&elem(&1, 2)) |> Enum.uniq() |> Enum.sort()
+
+      assert killed == crossed,
+             "boundaries of kind #{inspect(crossed -- killed)} were never killed"
+    end)
 
     reference
   end
@@ -465,40 +537,26 @@ defmodule Vagus.Resource.Harness.Faults do
     sys = Harness.start_system([faults: mode] ++ system)
     scenario.(sys)
     Harness.settle(sys)
-
-    journal =
-      sys
-      |> Harness.journal()
-      |> Enum.group_by(&elem(&1, 0), &elem(&1, 1))
-      |> Map.new(fn {key, actions} -> {key, collapse(actions)} end)
-
-    result = %{
-      store: normalize.(Harness.snapshot(sys)),
-      journal: journal,
-      boundaries: count(sys.faults)
-    }
-
+    journal = sys |> Harness.journal() |> Enum.group_by(&elem(&1, 0), &elem(&1, 1))
+    report = report(sys.faults)
+    store = normalize.(Harness.snapshot(sys))
     Harness.stop_system(sys)
-    result
+    %{store: store, journal: journal, boundaries: report.crossed, kill: report.kill}
   end
 
-  @doc "Reduces every immediate repetition of a block to one occurrence, shortest and leftmost first."
-  @spec collapse(list()) :: list()
-  def collapse(list) do
-    size = length(list)
+  @doc """
+  Whether `interrupted` is `reference` with one replay: for some `j <= i`,
+  the first `i` of the reference followed by the reference from `j` on.
+  """
+  @spec replay?(list(), list()) :: boolean()
+  def replay?(reference, interrupted) do
+    size = length(reference)
 
-    repeat =
-      Enum.find_value(1..div(size, 2)//1, fn length ->
-        Enum.find_value(0..(size - 2 * length)//1, fn at ->
-          if Enum.slice(list, at, length) == Enum.slice(list, at + length, length),
-            do: {at, length}
-        end)
+    Enum.any?(0..size, fn i ->
+      Enum.any?(0..i, fn j ->
+        interrupted == Enum.take(reference, i) ++ Enum.drop(reference, j)
       end)
-
-    case repeat do
-      nil -> list
-      {at, length} -> collapse(Enum.take(list, at + length) ++ Enum.drop(list, at + 2 * length))
-    end
+    end)
   end
 
   @spec start_link({atom(), mode()}) :: GenServer.on_start()
@@ -508,26 +566,51 @@ defmodule Vagus.Resource.Harness.Faults do
   @spec boundary(pid(), map()) :: :ok
   def boundary(faults, info), do: GenServer.call(faults, {:boundary, info}, :infinity)
 
-  @doc "Boundaries crossed so far. Returns after a kill in progress has been replaced."
-  @spec count(pid()) :: non_neg_integer()
-  def count(faults), do: GenServer.call(faults, :count, 30_000)
+  @doc """
+  The boundaries crossed so far, and what became of the kill: `nil` while it
+  has not been reached, `:done`, or `{:error, reason}`. Returns after a kill
+  in progress has been replaced.
+  """
+  @spec report(pid()) :: %{crossed: [label()], kill: nil | :done | {:error, String.t()}}
+  def report(faults), do: GenServer.call(faults, :report, 30_000)
 
   @impl true
-  def init({instance, mode}), do: {:ok, %{instance: instance, mode: mode, count: 0}}
+  def init({instance, mode}), do: {:ok, %{instance: instance, mode: mode, crossed: [], kill: nil}}
 
   @impl true
+  def handle_call({:boundary, %{after: :idle_commit}}, _from, state), do: {:reply, :ok, state}
+
   def handle_call({:boundary, info}, _from, state) do
-    state = %{state | count: state.count + 1}
+    label = {info.controller, info.name, info.after}
+    state = %{state | crossed: [label | state.crossed]}
 
-    if state.mode == {:kill_at, state.count} do
-      pair = Process.whereis(Controllers.Supervisor.pair(state.instance, info.controller))
-      TestInstance.kill_observed(info.runtime, pair)
-      # No reply: the step that asked died with its runtime.
-      {:noreply, state}
+    if state.mode == {:kill_at, {label, Enum.count(state.crossed, &(&1 == label))}} do
+      case kill(state.instance, info) do
+        # No reply: the step that asked died with its runtime.
+        :done -> {:noreply, %{state | kill: :done}}
+        # The step goes on, and the run is failed by its report.
+        error -> {:reply, :ok, %{state | kill: error}}
+      end
     else
       {:reply, :ok, state}
     end
   end
 
-  def handle_call(:count, _from, state), do: {:reply, state.count, state}
+  def handle_call(:report, _from, state),
+    do: {:reply, %{crossed: Enum.reverse(state.crossed), kill: state.kill}, state}
+
+  # The check only names the commonest way for the kill to fail. One that
+  # fails later, the runtime dying of something else in between, raises in
+  # `kill_observed/2` and is reported the same way.
+  defp kill(instance, %{runtime: runtime, controller: controller}) do
+    if Process.alive?(runtime) do
+      pair = Process.whereis(Controllers.Supervisor.pair(instance, controller))
+      TestInstance.kill_observed(runtime, pair)
+      :done
+    else
+      {:error, "the runtime of #{inspect(controller)} was already dead"}
+    end
+  rescue
+    error -> {:error, Exception.message(error)}
+  end
 end

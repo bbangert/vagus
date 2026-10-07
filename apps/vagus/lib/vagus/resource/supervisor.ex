@@ -47,7 +47,7 @@ defmodule Vagus.Resource.Supervisor do
       end
 
     {own, store} = Keyword.split(opts, [:controllers, :runtime, :lanes])
-    controllers = Keyword.get(own, :controllers, [])
+    controllers = own |> Keyword.get(:controllers, []) |> Enum.uniq()
 
     # Derived here and given to the store as a start option because the
     # store reads its file before any controller exists to register a kind.

@@ -4,7 +4,7 @@ defmodule Vagus.Resource.CollectorTest do
   import Vagus.Resource.Harness
 
   alias Vagus.Resource
-  alias Vagus.Resource.{Store, TestClock}
+  alias Vagus.Resource.{Collector, Runtime, Stamp, Store, TestClock}
   alias Vagus.Resource.Toys.{Kept, OneShot, Probe, Tagger}
 
   @moduletag :capture_log
@@ -57,6 +57,36 @@ defmodule Vagus.Resource.CollectorTest do
     end
   end
 
+  describe "an orphan" do
+    test "is only deleted: a release beside the delete could be refused and keep it" do
+      sys = start_system(controllers: [Probe, Kept])
+      shutdown(sys, true)
+      gone = %{kind: :probe, name: "gone", uid: 99}
+      writer = {:probe, "gone", 99}
+
+      {:ok, _} = Store.create(:kept, "k", %{}, [owner_refs: [gone]] ++ sys.i)
+
+      {:ok, orphan} =
+        Store.update_spec(:kept, "k", [{:put, ["holds", "x"], true}], [writer: writer] ++ sys.i)
+
+      assert Collector.dependencies(orphan) == [probe: "gone"]
+      assert Collector.ops(orphan, sys.i) == [{:delete, :kept, "k"}]
+
+      # Owned, the same dead writer is released.
+      {:ok, _} = Store.create(:kept, "free", %{}, sys.i)
+
+      {:ok, held} =
+        Store.update_spec(
+          :kept,
+          "free",
+          [{:put, ["holds", "x"], true}],
+          [writer: writer] ++ sys.i
+        )
+
+      assert Collector.ops(held, sys.i) == [{:release_writer, :kept, "free", writer}]
+    end
+  end
+
   describe "field writers" do
     test "when a resource that wrote another's fields is removed, its paths are released" do
       sys = start_system(controllers: [Probe, Kept])
@@ -95,6 +125,36 @@ defmodule Vagus.Resource.CollectorTest do
       settle(sys)
 
       assert for(run <- Store.list(:oneshot, sys.i), do: run.name) == ["run-4", "run-5"]
+    end
+
+    test "each expiry names the uid it listed, and with no ttl only the count applies" do
+      sys = start_system(controllers: [OneShot])
+      for n <- 1..2, do: given_ready(sys, {:oneshot, "run-#{n}", %{}}, condition: :done)
+      [first, second] = Store.list(:oneshot, sys.i)
+      %Stamp{} = now = TestClock.now(sys.clock)
+      later = %{now | at: 10_000_000}
+
+      assert Collector.expired(:oneshot, %{keep: 1, ttl_ms: :infinity}, later, sys.i) ==
+               [[{:expect, :oneshot, "run-1", uid: first.uid}, {:delete, :oneshot, "run-1"}]]
+
+      assert [[{:expect, :oneshot, "run-2", uid: uid}, _], [{:expect, :oneshot, "run-1", _}, _]] =
+               Collector.expired(:oneshot, %{keep: 2, ttl_ms: 1_000}, later, sys.i)
+
+      assert uid == second.uid
+      assert Collector.expired(:oneshot, %{keep: 2, ttl_ms: :infinity}, later, sys.i) == []
+    end
+
+    test "a finished resource is looked at again when its ttl is up, without a resync" do
+      sys = start_system(controllers: [OneShot])
+      given_ready(sys, {:oneshot, "run", %{}}, condition: :done)
+
+      runtime = Process.whereis(Runtime.name(sys.instance, OneShot))
+      assert %{"run" => {timer, token}} = :sys.get_state(runtime).timers
+      assert Process.read_timer(timer) in 500..1_001
+
+      TestClock.advance(sys.clock, 1_001)
+      send(runtime, {:requeue, "run", token})
+      await!(sys, :oneshot, "run", :gone)
     end
 
     test "a finished resource older than the ttl goes, however few there are" do
@@ -142,7 +202,7 @@ defmodule Vagus.Resource.CollectorTest do
       put_fact(sys, {:untag, "k"}, :block)
 
       {:ok, _} = Store.delete(:kept, "k", sys.i)
-      assert_receive {:untagging, "k", step}, 5_000
+      assert_receive {:untagging, "k", step}, sys.wait
 
       # The owner has heard of the delete and is at rest, having done nothing.
       settle(sys, only: [Kept])

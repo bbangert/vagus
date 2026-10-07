@@ -3,9 +3,16 @@
 Everything that installs, starts, stops, restarts, updates, watches and
 removes apps and Home Assistant Core goes through one Kubernetes-shaped
 reconciliation model: desired state is stored, observed state is derived, and
-controllers close the gap. This page is the vocabulary for that model. It
-describes the design the `redesign/app-lifecycle` branch is building toward,
-not code that exists yet; each change on the branch keeps it current.
+controllers close the gap. This page is the vocabulary for that model, on
+the `redesign/app-lifecycle` branch; each change there keeps it current.
+
+What exists so far is the generic machinery under `Vagus.Resource`: the
+resource, the store, and everything in "Controllers and runtimes",
+"Verdicts", "Clocks" and the generic half of "Deletion and collection".
+The rest is the design it is built for and has no code yet: the App kind and
+its controllers, Update and Backup, the pull worker and the engine's event
+stream, and the commands. No controller is configured, and apps and Core
+still run on the code this replaces.
 
 The HTTP wire toward Core is unchanged: routes stay `/addons`, keys stay
 `addon`, job names keep their upstream names. Only internal names say "app".
@@ -114,7 +121,8 @@ is in three parts, which keeps the decision a pure function a table can test:
 
 The other callbacks are declarations: `kind/0`, `condition_types/0`, and
 optionally `validate/1` (admission), `references/1` (resources whose changes
-concern this one), `priority/1` (lower first), `retention/0`,
+concern this one), `priority/1` (lower is served first by a lane),
+`retention/0`,
 `owned_conditions/0`, `finalizer/0`, `finalize_after/0`, `action_class/1`
 (the lane an action runs in), `writer_entries/0`, and the codec hooks
 `encode_spec/1`, `decode_spec/1`, `encode_progress/1`, `decode_progress/1`
@@ -125,23 +133,38 @@ a kind and writes its verdict; one that exports `owned_conditions/0` is
 attached to a kind another owns and writes only those conditions. The
 store's kinds are derived from the list: each owner contributes its kind,
 with its admission and codec and the finalizers of every controller on it.
+A list that could not register (two owners of a kind, an attachment to a
+kind nobody owns, one condition type declared twice on a kind) fails the
+start of the subtree with an error that names the controllers.
 
 Each controller has its own `Vagus.Resource.Runtime`, so a wedged controller
 blocks no other and several can work one kind. The runtime keeps a queue
 keyed by resource with at most one step in flight per key; a change arriving
-mid-step marks the key dirty and it runs again. Steps run in tasks. The
+mid-step marks the key dirty and it runs again. Steps run in tasks, and so
+does every callback of the controller: the runtime handles data only, and a
+callback that raises, exits or hangs costs one resource one step. The
 effects between two actions are grouped into one commit, so a crash can fall
 between a commit and an action but never inside a group. Every commit of a
-step expects the uid the step read.
+step expects the uid the step read, and what a step reports is believed
+only of that uid: a resource created under the name meanwhile starts clean.
 
 A step that crashes is retried with back-off. An action that returns an
 error ends its step; the next one runs at once and is told of the failure,
 because a failed pull leaves nothing to observe. Counting failures and
-spacing retries is the controller's decision, kept in status.
+spacing retries is the controller's decision, kept in status. Two things
+the runtime paces by itself, with the same back-off: steps that keep ending
+in a failed action, and steps that perform the same actions as the step
+before, since an action that changes nothing observable would otherwise
+repeat without pause. While such a timer is armed, it alone brings the next
+step: a change arriving during the failed step waits for it, because the
+step's own status write is announced like any other and cannot be told
+apart.
 
 A runtime indexes what each resource refers to: its `references/1`, its
-owners and the resources that wrote fields of its spec. A change to one of
-those runs the resources that refer to it, and no others.
+owners and the resources that wrote fields of its spec, as each step reports
+them. A change to one of those runs the resources that refer to it, and no
+others. A reference first reported by a step gets one more step, for a
+change that came before the index knew of it.
 
 Controllers are level-triggered: they act on what they observe, not on the
 event that woke them, so a missed event is repaired by the next observation.
@@ -153,7 +176,8 @@ looked at again.
 `Vagus.Resource.Lanes` holds a counting semaphore per action class: pulls 1,
 engine calls 4. Only running actions count, and the wait is in the step's
 task, so a waiting app holds nothing and the runtime never waits. The next
-slot goes to the lowest priority waiting, then to whoever asked first. A
+slot goes to the lowest `priority/1` waiting, then to whoever asked first;
+that is all priority orders, since steps themselves all start at once. A
 pull runs in a keyed pull worker whose state `observe` reads; it never
 occupies the app's queue slot, and a stop during a pull cancels it.
 
@@ -161,8 +185,8 @@ While the host is shutting down every runtime rests and writes nothing;
 otherwise the containers the shutdown stops would be read as crashes. While
 the engine is unreachable `observe/2` returns `{:unavailable,
 :engine_unavailable}`, `reconcile/2` is given that and answers Progressing
-with that reason, no failure is counted, and the runtime looks again a few
-seconds later: every boot starts that way.
+with that reason, no action is performed, no failure is counted, and the
+runtime looks again a few seconds later: every boot starts that way.
 
 ```
 Vagus.Resource.Supervisor        :rest_for_one
@@ -279,16 +303,18 @@ inferring ownership from a name: an uninstalled app's publications go with
 it. Ownership is by uid, so a new resource under an old name owns nothing
 its predecessor did, and a resource with several owners goes with the last.
 A field written by a resource (a Backup's hold, an Update's claim on
-`version`) is released when that resource is gone. Both are checked from the
+`version`) is released when that resource is gone; a resource that is
+itself an orphan is only deleted. Both are checked from the
 resource that depends, at the start of each of its steps, by the runtime of
 its kind; a resync finds whatever a missed notice left.
 
 One-shot kinds such as Update and Backup declare `retention/0`, a keep count
 and a TTL. A resource with a terminal verdict gets a finished stamp; the
 newest `keep` by uid remain, and of those any finished longer ago than the
-TTL goes too. The count is the bound that always holds: the stamp is status
-and starts again after a reboot. Collection is an ordinary delete, so
-finalizers run.
+TTL goes too, looked at again when its time is up. The count is the bound
+that always holds: the stamp is status and starts again after a reboot.
+Collection is an ordinary delete of the uid that was listed, so finalizers
+run and a newer resource of the name is left alone.
 
 ## Clocks
 

@@ -5,8 +5,8 @@ defmodule Vagus.Resource.HarnessTest do
 
   alias Vagus.Resource
   alias Vagus.Resource.Harness.Faults
-  alias Vagus.Resource.Store
-  alias Vagus.Resource.Toys.{Fragile, Kept, Linker, Probe, Tagger}
+  alias Vagus.Resource.{Runtime, Store, TestInstance}
+  alias Vagus.Resource.Toys.{Fragile, Kept, Linker, Probe, Tagger, Twisted}
 
   @moduletag :capture_log
   @moduletag :scenario
@@ -34,7 +34,10 @@ defmodule Vagus.Resource.HarnessTest do
           scenario: scenario
         )
 
-      assert reference.boundaries >= 10
+      # Every boundary of the undisturbed run was killed at, and both kinds.
+      assert length(reference.boundaries) >= 20
+      assert {Probe, "p", :action} in reference.boundaries
+      assert {Tagger, "k", :commit} in reference.boundaries
       assert [%Resource{kind: :link, name: "l"}] = reference.store
 
       assert reference.journal == %{
@@ -51,16 +54,114 @@ defmodule Vagus.Resource.HarnessTest do
         Faults.each_boundary(system: [controllers: [Fragile]], scenario: scenario)
       end
     end
+
+    for {twist, interrupted} <- [
+          {"missing", "[:b]"},
+          {"extra", "[:repair, :a, :b]"},
+          {"reorder", "[:b, :a]"}
+        ] do
+      test "fails on the actions when an interrupted run's are #{twist}" do
+        scenario = fn sys -> given_ready(sys, {:twisted, "t", %{"twist" => unquote(twist)}}) end
+
+        error =
+          assert_raise ExUnit.AssertionError, fn ->
+            Faults.each_boundary(system: [controllers: [Twisted]], scenario: scenario)
+          end
+
+        assert error.message =~ ~s(killed after {Vagus.Resource.Toys.Twisted, "t", :commit} #1)
+        assert error.message =~ ~s(the actions for {:twisted, "t"} differ)
+        assert error.message =~ "undisturbed: [:a, :b]"
+        assert error.message =~ "interrupted: #{unquote(interrupted)}"
+      end
+    end
+
+    test "fails when an interrupted run never reaches the boundary it was to be killed at" do
+      runs = :counters.new(1, [])
+
+      # Only the undisturbed run has a second probe.
+      scenario = fn sys ->
+        :counters.add(runs, 1, 1)
+        given_ready(sys, {:probe, "a", %{}})
+        if :counters.get(runs, 1) == 1, do: given_ready(sys, {:probe, "b", %{}})
+      end
+
+      assert_raise ExUnit.AssertionError,
+                   ~r/"b", :action} #1: the run never crossed that boundary/,
+                   fn ->
+                     Faults.each_boundary(
+                       system: [controllers: [Probe]],
+                       scenario: scenario,
+                       normalize: fn _store -> :same end,
+                       equivalent: fn _reference, _interrupted -> true end
+                     )
+                   end
+    end
+
+    test "fails a scenario that crosses no boundary" do
+      assert_raise ExUnit.AssertionError, ~r/crosses no boundary/, fn ->
+        Faults.each_boundary(system: [controllers: [Probe]], scenario: fn _sys -> :ok end)
+      end
+    end
+
+    test "takes a rule of the scenario's own in place of the default" do
+      scenario = fn sys -> given_ready(sys, {:twisted, "t", %{"twist" => "extra"}}) end
+      anything = fn _reference, _interrupted -> true end
+
+      assert %{journal: %{{:twisted, "t"} => [:a, :b]}} =
+               Faults.each_boundary(
+                 system: [controllers: [Twisted]],
+                 scenario: scenario,
+                 equivalent: anything
+               )
+    end
+
+    test "a kill aimed at a runtime that is already dead is reported, not waited for" do
+      instance = TestInstance.name()
+      label = {Probe, "p", :commit}
+      faults = start_supervised!({Faults, {instance, {:kill_at, {label, 1}}}})
+      {dead, monitor} = spawn_monitor(fn -> :ok end)
+      assert_receive {:DOWN, ^monitor, :process, ^dead, :normal}
+
+      boundary = %{runtime: dead, controller: Probe, kind: :probe, name: "p", after: :commit}
+      assert Faults.boundary(faults, boundary) == :ok
+
+      assert %{crossed: [^label], kill: {:error, reason}} = Faults.report(faults)
+      assert reason =~ "the runtime of Vagus.Resource.Toys.Probe was already dead"
+    end
   end
 
   describe "journal equivalence" do
-    test "a repeated block is one occurrence; anything else is a difference" do
-      assert Faults.collapse([]) == []
-      assert Faults.collapse([:a, :a, :b, :c]) == [:a, :b, :c]
-      assert Faults.collapse([:a, :b, :a, :b, :c]) == [:a, :b, :c]
-      assert Faults.collapse([:a, :a, :b, :a, :b, :b]) == [:a, :b]
-      assert Faults.collapse([:a, :b, :a]) == [:a, :b, :a]
-      assert Faults.collapse([:start, :stop, :start]) == [:start, :stop, :start]
+    test "an interrupted journal is the reference with one replay in it" do
+      reference = [:a, :b, :c]
+
+      for replay <- [[:a, :b, :c], [:a, :a, :b, :c], [:a, :b, :b, :c], [:a, :b, :a, :b, :c]] do
+        assert Faults.replay?(reference, replay), inspect(replay)
+      end
+
+      assert Faults.replay?([:a, :b, :c], [:a, :b, :c, :a, :b, :c])
+      assert Faults.replay?([], [])
+    end
+
+    test "nothing may be missing, added or moved, and a repeat must be a re-run" do
+      reference = [:a, :b, :c]
+
+      for other <- [
+            [:a, :b],
+            [:b, :c],
+            [:a, :c],
+            [],
+            [:a, :b, :c, :d],
+            [:a, :x, :b, :c],
+            [:b, :a, :c],
+            [:a, :b, :c, :a],
+            [:a, :a, :b, :b, :c]
+          ] do
+        refute Faults.replay?(reference, other), inspect(other)
+      end
+
+      # The reference is taken as it is, not reduced.
+      refute Faults.replay?([:visit, :visit], [:visit])
+      refute Faults.replay?([:make, :unmake, :make, :unmake], [:make, :unmake])
     end
   end
 
@@ -93,14 +194,42 @@ defmodule Vagus.Resource.HarnessTest do
 
       # The owner is at rest, waiting for the tagger's finalizer. The
       # tagger's write is what sets it to work again.
-      assert_receive {:untagging, "k", tagger}, 5_000
+      assert_receive {:untagging, "k", tagger}, sys.wait
       send(tagger, :go)
-      assert_receive {:unmaking, "k", owner}, 5_000
+      assert_receive {:unmaking, "k", owner}, sys.wait
 
       assert Task.yield(settling, 100) == nil
       send(owner, :go)
       assert Task.await(settling) == :ok
       assert Store.get(:kept, "k", sys.i) == nil
+    end
+  end
+
+  describe "settle with timers" do
+    test "waits out a pending timer when asked to, and otherwise leaves it pending" do
+      sys = start_system(controllers: [Probe], runtime: [unavailable_retry: 50])
+      put_fact(sys, :engine, :down)
+      {:ok, _} = Store.create(:probe, "p", %{}, sys.i)
+      await!(sys, :probe, "p", :progressing)
+      put_fact(sys, :engine, :up)
+
+      settle(sys, timers: :none)
+      assert %{timers: [], in_flight: in_flight} = Runtime.info(Probe, sys.i)
+      assert in_flight == %{}
+      assert %{status: true} = Resource.get_condition(Store.get(:probe, "p", sys.i), :ready)
+    end
+
+    test "raises when a timer is still pending at the deadline" do
+      sys = %{start_system(controllers: [Probe]) | wait: 50}
+      put_fact(sys, {:requeue, "p"}, 600_000)
+      {:ok, _} = Store.create(:probe, "p", %{}, sys.i)
+      await!(%{sys | wait: 5_000}, :probe, "p", :ready)
+
+      assert settle(sys) == :ok
+
+      assert_raise ExUnit.AssertionError, ~r/never came to rest/, fn ->
+        settle(sys, timers: :none)
+      end
     end
   end
 

@@ -5,13 +5,23 @@ defmodule Vagus.Resource.ControllerTest do
 
   alias Vagus.Resource
   alias Vagus.Resource.{Controller, Kind, Stamp, Store, Verdict}
-  alias Vagus.Resource.Toys.{Atomic, Kept, OneShot, Probe, Tagger}
+  alias Vagus.Resource.Toys.{Atomic, Clasher, Kept, OneShot, Probe, Tagger}
 
   defmodule Rival do
     @moduledoc "A second owner of `:kept`."
     @behaviour Vagus.Resource.Controller
     def kind, do: :kept
     def condition_types, do: []
+    def observe(_resource, _context), do: nil
+    def reconcile(_resource, _observed), do: {:no_verdict, []}
+    def act(_action, _args, _context), do: :ok
+  end
+
+  defmodule Vague do
+    @moduledoc "Declares condition types that are not atoms."
+    @behaviour Vagus.Resource.Controller
+    def kind, do: :vague
+    def condition_types, do: ["ready"]
     def observe(_resource, _context), do: nil
     def reconcile(_resource, _observed), do: {:no_verdict, []}
     def act(_action, _args, _context), do: :ok
@@ -54,6 +64,21 @@ defmodule Vagus.Resource.ControllerTest do
       assert_raise ArgumentError, ~r/which no controller owns/, fn ->
         Controller.kinds([Tagger])
       end
+    end
+
+    test "one condition type declared twice on a kind, or types that are not atoms, cannot start" do
+      assert_raise ArgumentError,
+                   ~r/Kept and Vagus.Resource.Toys.Clasher both declare condition :ready on kind :kept/,
+                   fn -> Controller.kinds([Kept, Clasher]) end
+
+      assert_raise ArgumentError, ~r/Vague declares condition types \["ready"\]/, fn ->
+        Controller.kinds([Vague])
+      end
+    end
+
+    test "a controller listed twice counts once" do
+      assert %{kept: %Kind{finalizers: [:kept, :tagged]}} =
+               Controller.kinds([Kept, Tagger, Tagger, Kept])
     end
 
     @tag :tmp_dir
@@ -103,6 +128,13 @@ defmodule Vagus.Resource.ControllerTest do
       assert Verdict.problems(terminal, [:ready], false) == [:terminal_not_owned]
     end
 
+    test "with a terminal? that is not a boolean is refused, not crashed on" do
+      for terminal? <- [nil, :yes, 1] do
+        verdict = %{Verdict.new(ready: {true, :ok}) | terminal?: terminal?}
+        assert Verdict.problems(verdict, [:ready], true) == [:bad_terminal]
+      end
+    end
+
     test "becomes conditions marked with the generation it is about" do
       verdict = Verdict.new(ready: {false, :pulling, "3 of 9"}, failed: {false, :none})
 
@@ -110,6 +142,45 @@ defmodule Vagus.Resource.ControllerTest do
                Resource.condition(:failed, false, :none, 4),
                Resource.condition(:ready, false, :pulling, 4, "3 of 9")
              ]
+    end
+  end
+
+  describe "an effect" do
+    test "is an action, a timed re-queue, or a store op of a known shape" do
+      for effect <- [
+            {:action, :pull, %{image: "x"}},
+            {:requeue_after, 0},
+            {:create, :note, "n", %{}, [owner_refs: []]},
+            {:update_spec, :app, "a", %{"run" => true}, []},
+            {:update_spec, :app, "a", [{:release, ["version"]}], [writer: Probe]},
+            {:put_progress, :update, "u", %{}, [writer: Probe]},
+            {:add_finalizer, :app, "a", :dns},
+            {:remove_finalizer, :app, "a", :dns},
+            {:release_writer, :app, "a", {:update, "u", 3}},
+            {:expect, :app, "a", [generation: 2]},
+            {:delete, :app, "a"}
+          ] do
+        assert Controller.effect?(effect), inspect(effect)
+      end
+    end
+
+    test "is never a status write, nor a tuple that only looks like an op" do
+      for effect <- [
+            {:status, %{}},
+            {:patch_status, :app, "a", %{conditions: []}, [writer: Probe]},
+            {:patch_status, :app, "a", %{observed_generation: 9}, []},
+            {:anything, :app, "a"},
+            {:delete, :app, :a},
+            {:delete, "app", "a"},
+            {:create, :note, "n", [], []},
+            {:update_spec, :app, "a", %{}},
+            {:remove_finalizer, :app, "a", "dns"},
+            {:requeue_after, -1},
+            {:action, "pull", nil},
+            :delete
+          ] do
+        refute Controller.effect?(effect), inspect(effect)
+      end
     end
   end
 

@@ -3,9 +3,16 @@ defmodule Vagus.Resource.Controllers.Supervisor do
   One subtree per controller: its `Vagus.Resource.Runtime` and the
   `Task.Supervisor` its steps run under.
 
-  `:one_for_one` between controllers, so one that keeps failing replaces
-  only itself. There is no process per resource and nothing is started
-  later: the children are the configured controllers.
+  `:one_for_one` between controllers: a runtime that dies is replaced with
+  its task supervisor and no other controller notices. Five such deaths in
+  thirty seconds end that controller's subtree, which this supervisor
+  restarts; five of those in thirty seconds end this supervisor, and every
+  controller with it, and the failure goes to `Vagus.Resource.Supervisor`.
+  A controller's own code cannot bring a runtime down, since all of it runs
+  in step tasks, so each of these is a defect in the runtime itself.
+
+  There is no process per resource and nothing is started later: the
+  children are the configured controllers.
   """
 
   use Supervisor
@@ -56,10 +63,6 @@ defmodule Vagus.Resource.Controllers.Supervisor do
         %{id: controller, type: :supervisor, start: {Supervisor, :start_link, [pair, options]}}
       end
 
-    # A step that fails is retried by its runtime and never reaches a
-    # supervisor. A runtime that dies is a bug: its pair, and then this
-    # supervisor, each allow what the application's other subtrees allow
-    # before passing the failure up.
     Supervisor.init(children, strategy: :one_for_one, max_restarts: 5, max_seconds: 30)
   end
 end

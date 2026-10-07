@@ -8,11 +8,18 @@ defmodule Vagus.Resource.Runtime do
   to be: a start lists the kind and looks at everything.
 
   A step (`Vagus.Resource.Runtime.Step`) runs in a task under the
-  controller's own `Task.Supervisor`. A change that arrives while a name's
-  step is in flight marks the name dirty and it runs once more afterwards,
-  however many changes there were: notifications become set members, never
-  queued work. A step that crashes frees its name and is retried with
-  back-off.
+  controller's own `Task.Supervisor`, and every callback of the controller
+  runs there: this process handles only data, so nothing a controller does
+  can stop or stall it. A change that arrives while a name's step is in
+  flight marks the name dirty and it runs once more afterwards, however many
+  changes there were: notifications become set members, never queued work.
+
+  A step that crashes frees its name and is retried with back-off. The same
+  back-off spaces passes that keep ending in a failed action, and passes
+  that keep performing the same actions: an action that succeeds without
+  changing what is observed would otherwise be repeated without pause. While
+  such a timer is armed it alone brings the next pass: a change that arrives
+  during the failing step waits for it.
 
   Controllers are level-triggered, so a notification is only a hint to look.
   Whatever one missed is found by a resync, which looks at every resource of
@@ -42,12 +49,17 @@ defmodule Vagus.Resource.Runtime do
       the controller's declaration, instead of logging and writing nothing
       (default `config :vagus, :strict_verdicts`)
     * `:boundary`, called in the step's task after each commit and each
-      action, for a harness that interrupts there
+      action, for a harness that interrupts there, with a map whose `:after`
+      is `:commit`, `:idle_commit` for one that changed nothing, or `:action`
 
-  Three options take a mechanism away, to prove that a test suite notices:
-  `deliver_events: false` drops change notifications, `ignore_dirty: true`
-  forgets a change that arrives during a step, and `skip_collector: true`
-  collects nothing.
+  The remaining options each take a mechanism away or break a rule, to
+  prove that a test suite notices: `deliver_events: false` drops change
+  notifications, `skip_resync: true` makes every resync after the start a
+  no-op, `ignore_dirty: true` forgets a change that arrives during a step,
+  `skip_collector: true` collects nothing, `double_step: true` starts a step
+  for a name that has one in flight, `stamp_current_generation: true` marks
+  a verdict with the generation current at its commit, and
+  `repeat_action: true` performs every action twice.
   """
 
   use GenServer
@@ -56,7 +68,7 @@ defmodule Vagus.Resource.Runtime do
 
   alias Vagus.Host.Shutdown
   alias Vagus.Resource
-  alias Vagus.Resource.{Clock, Collector, Controller, Store, Watch}
+  alias Vagus.Resource.{Clock, Controller, Store, Watch}
   alias Vagus.Resource.Runtime.Step
 
   @type info :: %{
@@ -96,14 +108,15 @@ defmodule Vagus.Resource.Runtime do
   @doc """
   A message a runtime answers, once it has nothing queued and nothing in
   flight, with `{ref, runtime_pid, steps_started}` to `reply_to`. A runtime
-  resting for a shutdown counts as having nothing queued.
+  resting for a shutdown counts as having nothing queued. With
+  `timers: :none` it answers only once no timer is pending either.
 
   Sent through `Vagus.Resource.Store.relay/3` it arrives behind every
   notification the store has sent, so the answer covers them.
   """
-  @spec quiet_probe(pid(), reference()) :: term()
-  def quiet_probe(reply_to, ref) when is_pid(reply_to) and is_reference(ref),
-    do: {__MODULE__, :quiet?, reply_to, ref}
+  @spec quiet_probe(pid(), reference(), timers: :any | :none) :: term()
+  def quiet_probe(reply_to, ref, opts \\ []) when is_pid(reply_to) and is_reference(ref),
+    do: {__MODULE__, :quiet?, reply_to, ref, Keyword.get(opts, :timers, :any)}
 
   @doc "As `quiet_probe/2`, answered at once with `{ref, runtime_pid, info}`."
   @spec info_probe(pid(), reference()) :: term()
@@ -121,7 +134,6 @@ defmodule Vagus.Resource.Runtime do
     owner? = Controller.owner?(controller)
     clock = Keyword.get(opts, :clock, Clock.System)
     shutdown? = Keyword.get(opts, :shutdown?, &Shutdown.in_flight?/0)
-    skip_collector = Keyword.get(opts, :skip_collector, false)
 
     state = %{
       i: [instance: instance],
@@ -135,8 +147,9 @@ defmodule Vagus.Resource.Runtime do
       unavailable_retry: Keyword.get(opts, :unavailable_retry, 5_000),
       gate_poll: Keyword.get(opts, :gate_poll, 1_000),
       deliver_events: Keyword.get(opts, :deliver_events, true),
+      skip_resync: Keyword.get(opts, :skip_resync, false),
       ignore_dirty: Keyword.get(opts, :ignore_dirty, false),
-      skip_collector: skip_collector,
+      double_step: Keyword.get(opts, :double_step, false),
       step: %{
         runtime: self(),
         controller: controller,
@@ -146,7 +159,9 @@ defmodule Vagus.Resource.Runtime do
         i: [instance: instance],
         clock: clock,
         shutdown?: shutdown?,
-        skip_collector: skip_collector,
+        skip_collector: Keyword.get(opts, :skip_collector, false),
+        stamp_current_generation: Keyword.get(opts, :stamp_current_generation, false),
+        repeat_action: Keyword.get(opts, :repeat_action, false),
         context: Keyword.get(opts, :context, %{}),
         strict:
           Keyword.get_lazy(opts, :strict_verdicts, fn ->
@@ -155,15 +170,20 @@ defmodule Vagus.Resource.Runtime do
         boundary: Keyword.get(opts, :boundary),
         types: Controller.conditions(controller),
         retention: Controller.optional(controller, :retention, [], nil),
-        finalize_after: Controller.optional(controller, :finalize_after, [], [])
+        finalize_after: Controller.optional(controller, :finalize_after, [], []),
+        priority: 0
       },
-      queued: %{},
+      queued: MapSet.new(),
       in_flight: %{},
       refs: %{},
       dirty: MapSet.new(),
+      # Names removed while their step was in flight: what that step reports
+      # is about a resource that is gone.
+      stale: MapSet.new(),
       timers: %{},
       failures: %{},
       failed: %{},
+      acted: %{},
       refs_out: %{},
       refs_in: %{},
       watched: MapSet.new([kind]),
@@ -181,20 +201,29 @@ defmodule Vagus.Resource.Runtime do
   def handle_continue(:start, %{controller: controller, kind: kind, i: i} = state) do
     declared = [conditions: state.step.types] ++ i
 
-    :ok =
+    registered =
       if state.owner?,
         do: Store.register_kind(kind, controller, declared),
         else: Store.register_writer(kind, controller, declared)
 
-    :ok = Watch.subscribe({:kind, kind}, i)
-    {:noreply, state |> schedule_resync() |> relist() |> dispatch()}
+    case registered do
+      :ok ->
+        :ok = Watch.subscribe({:kind, kind}, i)
+        {:noreply, state |> schedule_resync() |> relist() |> dispatch()}
+
+      # `Vagus.Resource.Controller.kinds/1` refuses every list of controllers
+      # the store would refuse, before anything starts. Reaching this means
+      # the two disagree, and no restart will change that.
+      {:error, reason} ->
+        {:stop, {:registration_refused, controller, reason}, state}
+    end
   end
 
   @impl true
   def handle_call(:info, _from, state), do: {:reply, snapshot(state), state}
 
   @impl true
-  def handle_cast(:resync, state), do: {:noreply, state |> relist() |> settle()}
+  def handle_cast(:resync, state), do: {:noreply, state |> look_again() |> settle()}
 
   @impl true
   def handle_info({Watch, _event, _meta}, %{deliver_events: false} = state),
@@ -211,7 +240,7 @@ defmodule Vagus.Resource.Runtime do
   end
 
   def handle_info(:resync, state),
-    do: {:noreply, state |> schedule_resync() |> relist() |> settle()}
+    do: {:noreply, state |> schedule_resync() |> look_again() |> settle()}
 
   # The token: a timer cancelled after it fired has its message in the
   # mailbox already, and for a resource since deleted that message must not
@@ -228,8 +257,8 @@ defmodule Vagus.Resource.Runtime do
 
   def handle_info(:gate, state), do: {:noreply, settle(%{state | gate_timer: nil})}
 
-  def handle_info({__MODULE__, :quiet?, reply_to, ref}, state),
-    do: {:noreply, answer_probes(%{state | probes: [{reply_to, ref} | state.probes]})}
+  def handle_info({__MODULE__, :quiet?, reply_to, ref, timers}, state),
+    do: {:noreply, answer_probes(%{state | probes: [{reply_to, ref, timers} | state.probes]})}
 
   def handle_info({__MODULE__, :info, reply_to, ref}, state) do
     send(reply_to, {ref, self(), snapshot(state)})
@@ -250,7 +279,7 @@ defmodule Vagus.Resource.Runtime do
 
   defp snapshot(state) do
     %{
-      queued: state.queued |> Map.keys() |> Enum.sort(),
+      queued: state.queued |> MapSet.to_list() |> Enum.sort(),
       in_flight: Map.new(state.in_flight, fn {name, task} -> {name, task.pid} end),
       dirty: state.dirty |> MapSet.to_list() |> Enum.sort(),
       timers: state.timers |> Map.keys() |> Enum.sort(),
@@ -260,8 +289,14 @@ defmodule Vagus.Resource.Runtime do
     }
   end
 
-  defp own(state, :changed, name), do: state |> reindex(name) |> enqueue(name)
-  defp own(state, :removed, name), do: forget(state, name)
+  defp own(state, :changed, name), do: enqueue(state, name)
+
+  defp own(state, :removed, name) do
+    stale =
+      if is_map_key(state.in_flight, name), do: MapSet.put(state.stale, name), else: state.stale
+
+    forget(%{state | stale: stale}, name)
+  end
 
   defp schedule_resync(%{resync: :infinity} = state), do: state
 
@@ -270,12 +305,15 @@ defmodule Vagus.Resource.Runtime do
     state
   end
 
+  defp look_again(%{skip_resync: true} = state), do: state
+  defp look_again(state), do: relist(state)
+
   defp relist(state) do
     names = for resource <- Store.list(state.kind, state.i), do: resource.name
-    state = Enum.reduce(names, state, &(&2 |> reindex(&1) |> enqueue(&1)))
+    state = Enum.reduce(names, state, &enqueue(&2, &1))
 
     # What a missed removal notice left behind.
-    [state.timers, state.failures, state.failed, state.refs_out]
+    [state.timers, state.failures, state.failed, state.acted, state.refs_out]
     |> Enum.flat_map(&Map.keys/1)
     |> Enum.uniq()
     |> Kernel.--(names)
@@ -283,38 +321,22 @@ defmodule Vagus.Resource.Runtime do
   end
 
   defp forget(state, name) do
-    state = state |> cancel_timer(name) |> index(name, [])
+    state = state |> cancel_timer(name) |> index(name, []) |> elem(0)
 
     %{
       state
-      | queued: Map.delete(state.queued, name),
+      | queued: MapSet.delete(state.queued, name),
         failures: Map.delete(state.failures, name),
-        failed: Map.delete(state.failed, name)
+        failed: Map.delete(state.failed, name),
+        acted: Map.delete(state.acted, name)
     }
   end
 
-  defp reindex(state, name) do
-    case Store.get(state.kind, name, state.i) do
-      nil -> index(state, name, [])
-      resource -> index(state, name, references(state, resource))
-    end
-  end
-
-  # An owner or a field's writer is referred to as well: its removal is what
-  # the collector acts on.
-  defp references(state, resource) do
-    declared = declared(state, :references, resource, Map.get(state.refs_out, resource.name, []))
-
-    owed =
-      if state.owner? and not state.skip_collector,
-        do: Collector.dependencies(resource),
-        else: []
-
-    Enum.uniq(declared ++ owed) -- [{state.kind, resource.name}]
-  end
-
+  # Returns whether `keys` holds a reference the index did not have for the
+  # name, having subscribed to its kind if nobody had.
   defp index(state, name, keys) do
     old = Map.get(state.refs_out, name, [])
+    added = keys -- old
 
     refs_in =
       Enum.reduce(old -- keys, state.refs_in, fn key, refs_in ->
@@ -325,18 +347,14 @@ defmodule Vagus.Resource.Runtime do
       end)
 
     refs_in =
-      Enum.reduce(
-        keys -- old,
-        refs_in,
-        &Map.update(&2, &1, [name], fn names -> [name | names] end)
-      )
+      Enum.reduce(added, refs_in, &Map.update(&2, &1, [name], fn names -> [name | names] end))
 
     refs_out =
       if keys == [],
         do: Map.delete(state.refs_out, name),
         else: Map.put(state.refs_out, name, keys)
 
-    watch(%{state | refs_in: refs_in, refs_out: refs_out}, keys)
+    {watch(%{state | refs_in: refs_in, refs_out: refs_out}, added), added != []}
   end
 
   defp watch(state, keys) do
@@ -347,46 +365,10 @@ defmodule Vagus.Resource.Runtime do
     %{state | watched: Enum.into(kinds, state.watched)}
   end
 
-  # `references/1` and `priority/1` are the controller's code run in this
-  # process, on every change notice, where a step cannot do it: the index
-  # has to know a reference before the change it concerns arrives. What they
-  # raise or return wrongly costs the default, not the runtime.
-  defp declared(state, callback, resource, default) do
-    value = Controller.optional(state.controller, callback, [resource], default)
-
-    valid? =
-      case callback do
-        :references ->
-          Enum.all?(value, &match?({kind, name} when is_atom(kind) and is_binary(name), &1))
-
-        :priority ->
-          is_integer(value)
-      end
-
-    if valid?, do: value, else: raise(ArgumentError, "returned #{inspect(value)}")
-  rescue
-    exception ->
-      Logger.error(
-        "#{inspect(state.controller)}.#{callback}/1 on #{state.kind}/#{resource.name}: " <>
-          Exception.message(exception)
-      )
-
-      default
-  end
-
-  defp priority(state, name) do
-    with true <- function_exported?(state.controller, :priority, 1),
-         %Resource{} = resource <- Store.get(state.kind, name, state.i) do
-      declared(state, :priority, resource, 0)
-    else
-      _none -> 0
-    end
-  end
-
   defp enqueue(state, name) do
     cond do
-      not is_map_key(state.in_flight, name) ->
-        %{state | queued: Map.put(state.queued, name, priority(state, name))}
+      not is_map_key(state.in_flight, name) or state.double_step ->
+        %{state | queued: MapSet.put(state.queued, name)}
 
       state.ignore_dirty ->
         state
@@ -398,28 +380,25 @@ defmodule Vagus.Resource.Runtime do
 
   defp settle(state), do: state |> dispatch() |> answer_probes()
 
-  defp dispatch(%{queued: queued} = state) when map_size(queued) == 0, do: state
-
   defp dispatch(state) do
-    if state.shutdown?.() do
-      # Nothing announces the end of a shutdown that did not happen.
-      timer = state.gate_timer || Process.send_after(self(), :gate, state.gate_poll)
-      %{state | gate_timer: timer}
-    else
-      state.queued
-      |> Enum.sort_by(fn {name, priority} -> {priority, name} end)
-      |> Enum.reduce(%{state | queued: %{}}, &start_step/2)
+    cond do
+      MapSet.size(state.queued) == 0 ->
+        state
+
+      state.shutdown?.() ->
+        # Nothing announces the end of a shutdown that did not happen.
+        timer = state.gate_timer || Process.send_after(self(), :gate, state.gate_poll)
+        %{state | gate_timer: timer}
+
+      # In no order: every step is started at once, and what orders the
+      # work is the lane each action waits in.
+      true ->
+        Enum.reduce(state.queued, %{state | queued: MapSet.new()}, &start_step/2)
     end
   end
 
-  defp start_step({name, priority}, state) do
-    step =
-      Map.merge(state.step, %{
-        name: name,
-        priority: priority,
-        failed_action: Map.get(state.failed, name)
-      })
-
+  defp start_step(name, state) do
+    step = Map.merge(state.step, %{name: name, failed_action: Map.get(state.failed, name)})
     task = Task.Supervisor.async_nolink(state.tasks, Step, :run, [step])
 
     %{
@@ -433,6 +412,7 @@ defmodule Vagus.Resource.Runtime do
   defp finish(state, ref, result) do
     {name, refs} = Map.pop!(state.refs, ref)
     dirty? = MapSet.member?(state.dirty, name)
+    stale? = MapSet.member?(state.stale, name)
 
     state =
       cancel_timer(
@@ -440,7 +420,8 @@ defmodule Vagus.Resource.Runtime do
           state
           | refs: refs,
             in_flight: Map.delete(state.in_flight, name),
-            dirty: MapSet.delete(state.dirty, name)
+            dirty: MapSet.delete(state.dirty, name),
+            stale: MapSet.delete(state.stale, name)
         },
         name
       )
@@ -448,70 +429,108 @@ defmodule Vagus.Resource.Runtime do
     # The store writes its table before it sends a notice. So a resource
     # missing here is gone, whatever this step or a notice not yet read
     # says, and one created after this read has its own notice still to come.
-    if Store.get(state.kind, name, state.i) == nil do
-      forget(state, name)
-    else
-      state = outcome(state, name, result)
-      if dirty?, do: enqueue(state, name), else: state
+    case Store.get(state.kind, name, state.i) do
+      nil ->
+        forget(state, name)
+
+      stored ->
+        if stale? or other?(result, stored) do
+          # The step was about an earlier resource of this name. Nothing it
+          # found is true of this one, which has only been announced.
+          state = forget(state, name)
+          if dirty?, do: enqueue(state, name), else: state
+        else
+          {state, new_reference?} = learn(state, name, result)
+          {state, carried?} = outcome(state, name, result)
+          again?(state, name, dirty?, new_reference?, carried?)
+        end
     end
   end
 
-  defp outcome(state, name, {:ok, next}) do
-    next(
-      %{
-        state
-        | failures: Map.delete(state.failures, name),
-          failed: Map.delete(state.failed, name)
-      },
-      name,
-      next
-    )
+  defp other?(%{uid: uid}, stored), do: uid != stored.uid
+  defp other?(_gone_or_crashed, _stored), do: false
+
+  defp learn(state, name, %{refs: keys}), do: index(state, name, keys)
+  defp learn(state, _name, _gone_or_crashed), do: {state, false}
+
+  # A reference the index learns only now may have changed after the step
+  # observed it and before this: that notice came while nothing pointed from
+  # it to this name. One more pass sees what it announced; it reports the
+  # same references, so there is no third.
+  #
+  # While a failure's timer is armed the timer brings the next pass and a
+  # dirty mark does not. The mark may be the step's own doing: its commit
+  # is announced like any other, and a pass that writes status and then
+  # fails would bring itself back at once, each time. Told apart it cannot
+  # be, since a commit's result already holds any write that landed between
+  # the step's read and that commit. The cost is that a real change during
+  # a failing step waits for the back-off, at most its cap.
+  defp again?(state, name, dirty?, new_reference?, carried?) do
+    if new_reference? or (dirty? and not carried?), do: enqueue(state, name), else: state
+  end
+
+  # Each returns whether it armed a timer that is to carry the next pass.
+  defp outcome(state, name, %{outcome: {:ok, next}, actions: actions}) do
+    state = %{state | failed: Map.delete(state.failed, name)}
+
+    if actions != [] and Map.get(state.acted, name) == actions do
+      # The same actions as the pass before, which therefore changed nothing
+      # that this pass could observe.
+      {paced(state, name), true}
+    else
+      acted =
+        if actions == [],
+          do: Map.delete(state.acted, name),
+          else: Map.put(state.acted, name, actions)
+
+      {next(%{state | failures: Map.delete(state.failures, name), acted: acted}, name, next),
+       false}
+    end
   end
 
   # Not a failure: nothing was tried. The failed action of the pass before
   # is kept for the next pass that can observe.
-  defp outcome(state, name, {:unavailable, next}) do
+  defp outcome(state, name, %{outcome: {:unavailable, next}}) do
     ms =
       case next do
         {:after, ms} -> min(ms, state.unavailable_retry)
         _other -> state.unavailable_retry
       end
 
-    arm(state, name, ms)
+    {arm(state, name, ms), true}
   end
 
   # The controller counts these and paces its own retries, so the next pass
   # is at once, to let its verdict say what happened. Should that pass end
   # the same way, nothing is pacing them, and the back-off does.
-  defp outcome(state, name, {:action_failed, failure}) do
-    count = Map.get(state.failures, name, 0) + 1
+  defp outcome(state, name, %{outcome: {:action_failed, failure}}) do
+    state = %{state | failed: Map.put(state.failed, name, failure)}
 
-    state = %{
-      state
-      | failures: Map.put(state.failures, name, count),
-        failed: Map.put(state.failed, name, failure)
-    }
-
-    if count == 1, do: enqueue(state, name), else: arm(state, name, backoff(state, count - 1))
+    if is_map_key(state.failures, name),
+      do: {paced(state, name), true},
+      else: {enqueue(%{state | failures: Map.put(state.failures, name, 1)}, name), false}
   end
 
-  defp outcome(state, name, :gated), do: enqueue(state, name)
-  defp outcome(state, _name, :gone), do: state
+  defp outcome(state, name, %{outcome: :gated}), do: {enqueue(state, name), false}
+  defp outcome(state, _name, %{outcome: :gone}), do: {state, false}
+  defp outcome(state, _name, :gone), do: {state, false}
 
   defp outcome(state, name, crashed) do
-    count = Map.get(state.failures, name, 0) + 1
-    ms = backoff(state, count)
+    state = paced(state, name)
 
     Logger.warning(
-      "#{inspect(state.controller)}: step for #{state.kind}/#{name} failed (#{count}), " <>
-        "again in #{ms} ms: #{inspect(crashed)}"
+      "#{inspect(state.controller)}: step for #{state.kind}/#{name} failed " <>
+        "(#{state.failures[name]}): #{inspect(crashed)}"
     )
 
-    arm(%{state | failures: Map.put(state.failures, name, count)}, name, ms)
+    {state, true}
   end
 
-  defp backoff(%{backoff: {base, max}}, count),
-    do: min(base * Integer.pow(2, min(count - 1, 20)), max)
+  defp paced(%{backoff: {base, max}} = state, name) do
+    count = Map.get(state.failures, name, 0) + 1
+    ms = min(base * Integer.pow(2, min(count - 1, 20)), max)
+    arm(%{state | failures: Map.put(state.failures, name, count)}, name, ms)
+  end
 
   defp next(state, _name, :rest), do: state
   defp next(state, name, :now), do: enqueue(state, name)
@@ -538,11 +557,15 @@ defmodule Vagus.Resource.Runtime do
   defp answer_probes(%{probes: []} = state), do: state
 
   defp answer_probes(state) do
-    if map_size(state.in_flight) == 0 and (map_size(state.queued) == 0 or state.shutdown?.()) do
-      for {reply_to, ref} <- state.probes, do: send(reply_to, {ref, self(), state.steps})
-      %{state | probes: []}
-    else
-      state
-    end
+    quiet? =
+      map_size(state.in_flight) == 0 and (MapSet.size(state.queued) == 0 or state.shutdown?.())
+
+    {answered, waiting} =
+      Enum.split_with(state.probes, fn {_reply_to, _ref, timers} ->
+        quiet? and (timers == :any or map_size(state.timers) == 0)
+      end)
+
+    for {reply_to, ref, _timers} <- answered, do: send(reply_to, {ref, self(), state.steps})
+    %{state | probes: waiting}
   end
 end

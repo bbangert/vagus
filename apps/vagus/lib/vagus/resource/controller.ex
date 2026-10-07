@@ -35,16 +35,22 @@ defmodule Vagus.Resource.Controller do
   because a failed action usually leaves nothing behind for `observe/2` to
   see; counting it and spacing the retries is the controller's to do, with
   `{:requeue_after, ms}`. Passes that keep ending in a failed action are
-  spaced like crashed ones.
+  spaced like crashed ones, and so are passes that perform the same actions
+  as the pass before: an action must change what `observe/2` sees.
+
+  Every callback runs in the pass's task, `references/1` and `priority/1`
+  included. One that raises, exits or never returns costs its resource that
+  pass and nothing beyond it.
 
   ## What `observe/2` cannot reach
 
   `observe/2` returns `{:unavailable, reason}` when what it reads cannot be
   reached, the container engine above all (`{:unavailable,
   :engine_unavailable}`). `reconcile/2` is given that in place of an
-  observation and returns the verdict for it: progressing, with that reason,
-  and no actions. The runtime counts no failure and looks again shortly,
-  whatever the effects ask for.
+  observation and returns the verdict for it: progressing, with that reason.
+  Its store ops are applied; any action it returns is not performed. The
+  runtime counts no failure and looks again shortly, whatever the effects
+  ask for.
 
   ## Owning and attaching
 
@@ -102,7 +108,10 @@ defmodule Vagus.Resource.Controller do
   """
   @callback references(Resource.t()) :: [Resource.key()]
 
-  @doc "Lower runs first, in the queue and when waiting for a lane. Default 0."
+  @doc """
+  The resource's place among the actions waiting for a lane: lower is served
+  first. Default 0. It orders nothing else; steps all start at once.
+  """
   @callback priority(Resource.t()) :: integer()
 
   @doc """
@@ -176,13 +185,15 @@ defmodule Vagus.Resource.Controller do
   The kinds the store is started with, one per owning controller, each with
   the finalizers of every controller on it.
 
-  Raises on two owners of one kind, or a controller attached to a kind
-  nobody owns: neither can run, and a store started without the kind would
-  refuse its resource file.
+  Raises on a list the store would later refuse a registration from: two
+  owners of one kind, a controller attached to a kind nobody owns, condition
+  types that are not atoms, or one condition type declared by two
+  controllers of a kind. None of these can run, and found here they fail the
+  start with a name instead of a runtime that can never register.
   """
   @spec kinds([module()]) :: %{Resource.kind() => Kind.t()}
   def kinds(controllers) do
-    {owners, attached} = Enum.split_with(controllers, &owner?/1)
+    {owners, attached} = controllers |> Enum.uniq() |> Enum.split_with(&owner?/1)
 
     owned =
       Enum.reduce(owners, %{}, fn owner, owned ->
@@ -200,12 +211,14 @@ defmodule Vagus.Resource.Controller do
 
     Map.new(owned, fn {kind, owner} ->
       on_kind = [owner | Enum.filter(attached, &(&1.kind() == kind))]
+      distinct_conditions!(kind, on_kind)
 
       {kind,
        Kind.new(
          [
            validators: if(exports?(owner, :validate, 1), do: [&owner.validate/1], else: []),
-           finalizers: for(c <- on_kind, exports?(c, :finalizer, 0), do: c.finalizer()),
+           finalizers:
+             Enum.uniq(for(c <- on_kind, exports?(c, :finalizer, 0), do: c.finalizer())),
            writer_entries: optional(owner, :writer_entries, [], [])
          ] ++
            for(
@@ -217,12 +230,49 @@ defmodule Vagus.Resource.Controller do
     end)
   end
 
-  @doc "Whether `term` is an effect the runtime can apply; a store op is judged by the store."
+  defp distinct_conditions!(kind, controllers) do
+    Enum.reduce(controllers, %{}, fn controller, declared ->
+      types = conditions(controller)
+
+      with [_ | _] <- Enum.reject(List.wrap(types), &is_atom/1) do
+        raise ArgumentError,
+              "#{inspect(controller)} declares condition types #{inspect(types)}, not a list of atoms"
+      end
+
+      Enum.reduce(types, declared, fn type, declared ->
+        Map.update(declared, type, controller, fn rival ->
+          raise ArgumentError,
+                "#{inspect(rival)} and #{inspect(controller)} both declare condition " <>
+                  "#{inspect(type)} on kind #{inspect(kind)}"
+        end)
+      end)
+    end)
+  end
+
+  @doc """
+  Whether `term` is an effect the runtime can apply: an action, a timed
+  re-queue, or a store op of a known shape. A status write is none: status
+  comes from the verdict alone.
+  """
   @spec effect?(term()) :: boolean()
   def effect?({:action, name, _args}), do: is_atom(name)
   def effect?({:requeue_after, ms}), do: is_integer(ms) and ms >= 0
-  def effect?({:status, _patch}), do: false
-  def effect?(op), do: is_tuple(op) and tuple_size(op) >= 3 and is_atom(elem(op, 0))
+
+  def effect?({op, kind, name, arg, opts}) when op in [:create, :put_progress],
+    do: key?(kind, name) and is_map(arg) and is_list(opts)
+
+  def effect?({:update_spec, kind, name, ops, opts}),
+    do: key?(kind, name) and (is_map(ops) or is_list(ops)) and is_list(opts)
+
+  def effect?({op, kind, name, finalizer}) when op in [:add_finalizer, :remove_finalizer],
+    do: key?(kind, name) and is_atom(finalizer)
+
+  def effect?({:release_writer, kind, name, _writer}), do: key?(kind, name)
+  def effect?({:expect, kind, name, expected}), do: key?(kind, name) and is_list(expected)
+  def effect?({:delete, kind, name}), do: key?(kind, name)
+  def effect?(_other), do: false
+
+  defp key?(kind, name), do: is_atom(kind) and is_binary(name)
 
   defp exports?(controller, callback, arity) do
     Code.ensure_loaded?(controller) and function_exported?(controller, callback, arity)

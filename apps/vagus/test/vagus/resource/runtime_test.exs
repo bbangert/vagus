@@ -1,6 +1,7 @@
 defmodule Vagus.Resource.RuntimeTest do
   use ExUnit.Case, async: true
 
+  import ExUnit.CaptureLog
   import Vagus.Resource.Harness
 
   alias Vagus.Resource
@@ -13,6 +14,17 @@ defmodule Vagus.Resource.RuntimeTest do
   defp condition(sys, kind, name, type),
     do: Resource.get_condition(Store.get(kind, name, sys.i), type)
 
+  # Delivers the message of the timer pending for `name` now, and returns
+  # how long the timer still had to run.
+  defp fire_timer(sys, controller, name) do
+    runtime = Process.whereis(Runtime.name(sys.instance, controller))
+    %{^name => {timer, token}} = :sys.get_state(runtime).timers
+    send(runtime, {:requeue, name, token})
+    # A call from here is behind that message; a settle might not be.
+    Runtime.info(controller, sys.i)
+    Process.read_timer(timer)
+  end
+
   describe "the queue" do
     test "a change that arrives during a step is not lost: the key runs once more" do
       sys = start_system(controllers: [Probe])
@@ -20,7 +32,7 @@ defmodule Vagus.Resource.RuntimeTest do
 
       put_fact(sys, {:observe, "p"}, :block)
       resync(sys, Probe)
-      assert_receive {:observing, "p", step}, 5_000
+      assert_receive {:observing, "p", step}, sys.wait
 
       for n <- 2..4, do: {:ok, _} = Store.update_spec(:probe, "p", %{"n" => n}, sys.i)
 
@@ -66,10 +78,29 @@ defmodule Vagus.Resource.RuntimeTest do
       put_fact(sys, {:act, "p"}, :raise)
 
       {:ok, _} = Store.create(:probe, "p", %{}, sys.i)
-      for _attempt <- 1..4, do: assert_receive({:acting, "p", 1, _step}, 5_000)
+      for _attempt <- 1..4, do: assert_receive({:acting, "p", 1, _step}, sys.wait)
 
       put_fact(sys, {:act, "p"}, nil)
       await!(sys, :probe, "p", :ready)
+    end
+
+    test "each failure in a row doubles the wait, up to the cap" do
+      sys = start_system(controllers: [Probe], runtime: [backoff: {10_000, 35_000}])
+      put_fact(sys, {:observe, "p"}, :raise)
+      {:ok, _} = Store.create(:probe, "p", %{}, sys.i)
+
+      waits =
+        for failures <- 1..4 do
+          settle(sys)
+          assert %{failures: %{"p" => ^failures}} = Runtime.info(Probe, sys.i)
+          fire_timer(sys, Probe, "p")
+        end
+
+      # 10 s, 20 s, then 35 s where 40 s and 80 s would have been; each read
+      # a moment after it was armed.
+      for {wait, armed} <- Enum.zip(waits, [10_000, 20_000, 35_000, 35_000]) do
+        assert wait in (armed - 4_000)..armed
+      end
     end
 
     test "an action that returns an error is told to the next pass and counts no crash" do
@@ -130,14 +161,14 @@ defmodule Vagus.Resource.RuntimeTest do
       put_fact(sys, :block_scribe, true)
 
       {:ok, %{uid: first}} = Store.create(:scribe, "s", %{}, sys.i)
-      assert_receive {:observing, "s", step}, 5_000
+      assert_receive {:observing, "s", step}, sys.wait
 
       {:ok, _} = Store.delete(:scribe, "s", sys.i)
       {:ok, %{uid: second}} = Store.create(:scribe, "s", %{}, sys.i)
 
       # The step read the first "s" and decides to write a note for it.
       send(step, :go)
-      assert_receive {:observing, "s", again}, 5_000
+      assert_receive {:observing, "s", again}, sys.wait
       put_fact(sys, :block_scribe, false)
       send(again, :go)
 
@@ -154,14 +185,14 @@ defmodule Vagus.Resource.RuntimeTest do
       put_fact(sys, {:act, "p"}, :block)
 
       {:ok, _} = Store.create(:probe, "p", %{}, sys.i)
-      assert_receive {:acting, "p", 1, orphan}, 5_000
+      assert_receive {:acting, "p", 1, orphan}, sys.wait
       monitor = Process.monitor(orphan)
 
       kill_runtime(sys, Probe)
-      assert_receive {:DOWN, ^monitor, :process, ^orphan, _reason}, 5_000
+      assert_receive {:DOWN, ^monitor, :process, ^orphan, _reason}, sys.wait
 
       # Its listing at start is all the replacement has to go on.
-      assert_receive {:acting, "p", 1, step}, 5_000
+      assert_receive {:acting, "p", 1, step}, sys.wait
       assert step != orphan
       send(step, :go)
       await!(sys, :probe, "p", :ready)
@@ -212,7 +243,7 @@ defmodule Vagus.Resource.RuntimeTest do
       put_fact(sys, {:observe, "p"}, :block)
 
       {:ok, created} = Store.create(:probe, "p", %{}, sys.i)
-      assert_receive {:observing, "p", step}, 5_000
+      assert_receive {:observing, "p", step}, sys.wait
 
       shutdown(sys, true)
       put_fact(sys, {:observe, "p"}, nil)
@@ -234,13 +265,13 @@ defmodule Vagus.Resource.RuntimeTest do
       put_fact(sys, {:act, "a"}, :block)
 
       {:ok, _} = Store.create(:probe, "a", %{"lane" => true}, sys.i)
-      assert_receive {:acting, "a", 1, holder}, 5_000
+      assert_receive {:acting, "a", 1, holder}, sys.wait
 
       :erlang.trace(lanes, true, [:receive])
       {:ok, _} = Store.create(:probe, "b", %{"lane" => true}, sys.i)
 
       assert_receive {:trace, ^lanes, :receive, {:"$gen_call", _from, {:acquire, :pull, 0}}},
-                     5_000
+                     sys.wait
 
       :erlang.trace(lanes, false, [:receive])
 
@@ -286,14 +317,17 @@ defmodule Vagus.Resource.RuntimeTest do
     end
 
     test "a verdict missing a declared condition type fails the step and writes nothing" do
-      sys = start_system(controllers: [Sloppy])
+      sys = start_system(controllers: [Sloppy], runtime: [backoff: {60_000, 60_000}])
 
-      {:ok, created} = Store.create(:sloppy, "s", %{}, sys.i)
-      settle(sys)
+      log =
+        capture_log(fn ->
+          {:ok, created} = Store.create(:sloppy, "s", %{}, sys.i)
+          settle(sys)
+          assert Store.get(:sloppy, "s", sys.i) == created
+        end)
 
-      assert %{failures: %{"s" => count}} = Runtime.info(Sloppy, sys.i)
-      assert count >= 1
-      assert Store.get(:sloppy, "s", sys.i) == created
+      assert log =~ "verdict on sloppy/s refused: [missing: :progressing]"
+      assert %{failures: %{"s" => 1}, steps: 1} = Runtime.info(Sloppy, sys.i)
       assert journal(sys) == []
     end
 
@@ -338,6 +372,10 @@ defmodule Vagus.Resource.RuntimeTest do
                Store.get(:batch, "b", sys.i)
 
       assert journal(sys) == [{{:batch, "b"}, {:mark, 1}}, {{:batch, "b"}, {:mark, 2}}]
+
+      # The verdict went with the first group: it is there before any action.
+      assert [{:status_at_mark, 1, at_first}, {:status_at_mark, 2, _status}] = notes(sys)
+      assert %{observed_generation: 1, conditions: %{ready: %{reason: :marking}}} = at_first
     end
   end
 
@@ -383,13 +421,17 @@ defmodule Vagus.Resource.RuntimeTest do
 
   describe "resync" do
     @tag scenario: :resync
-    test "the periodic resync finds a resource whose notification was missed" do
+    test "the periodic resync finds what was never announced, tick after tick" do
       sys = start_system(controllers: [Probe], resync: 20, runtime: [deliver_events: false])
 
       {:ok, _} = Store.create(:probe, "p", %{}, sys.i)
       await!(sys, :probe, "p", :ready)
+
+      {:ok, _} = Store.update_spec(:probe, "p", %{"n" => 2}, sys.i)
+      await!(sys, :probe, "p", :ready)
     end
 
+    @tag scenario: :resync
     test "a gap signal has every resource looked at again" do
       sys = start_system(controllers: [Probe], runtime: [deliver_events: false])
 
@@ -400,11 +442,31 @@ defmodule Vagus.Resource.RuntimeTest do
       Runtime.resync(Probe, sys.i)
       await!(sys, :probe, "p", :ready)
     end
+
+    @tag scenario: :resync
+    test "a resync forgets a resource whose removal was never announced" do
+      sys = start_system(controllers: [Probe], runtime: [deliver_events: false])
+      put_fact(sys, {:requeue, "p"}, 600_000)
+
+      {:ok, _} = Store.create(:probe, "p", %{}, sys.i)
+      resync(sys, Probe)
+      await!(sys, :probe, "p", :ready)
+      settle(sys)
+      assert %{timers: ["p"]} = Runtime.info(Probe, sys.i)
+
+      {:ok, _} = Store.delete(:probe, "p", sys.i)
+      settle(sys)
+      assert %{timers: ["p"]} = Runtime.info(Probe, sys.i)
+
+      resync(sys, Probe)
+      settle(sys)
+      assert %{timers: [], queued: []} = Runtime.info(Probe, sys.i)
+    end
   end
 
   describe "an observation that cannot be made" do
     test "is reported as progressing, counts no failure, and is retried" do
-      sys = start_system(controllers: [Probe])
+      sys = start_system(controllers: [Probe], runtime: [unavailable_retry: 600_000])
       put_fact(sys, :engine, :down)
 
       {:ok, _} = Store.create(:probe, "p", %{}, sys.i)
@@ -415,12 +477,31 @@ defmodule Vagus.Resource.RuntimeTest do
                condition(sys, :probe, "p", :progressing)
 
       assert %{status: false, reason: :engine_unavailable} = condition(sys, :probe, "p", :ready)
-      assert %{failures: failures, timers: ["p"]} = Runtime.info(Probe, sys.i)
+      assert %{failures: failures, timers: ["p"], steps: 1} = Runtime.info(Probe, sys.i)
       assert failures == %{}
       assert journal(sys) == []
 
       put_fact(sys, :engine, :up)
+      assert fire_timer(sys, Probe, "p") in 590_000..600_000
       await!(sys, :probe, "p", :ready)
+    end
+
+    test "has none of the actions decided from it performed" do
+      sys = start_system(controllers: [Probe], runtime: [unavailable_retry: 600_000])
+      put_fact(sys, :engine, :down)
+      put_fact(sys, :act_when_down, true)
+
+      log =
+        capture_log(fn ->
+          {:ok, _} = Store.create(:probe, "p", %{}, sys.i)
+          await!(sys, :probe, "p", :progressing)
+          settle(sys)
+        end)
+
+      assert log =~ "probe/p could not be observed; not performing [visit: 0]"
+      assert journal(sys) == []
+      refute_received {:acting, "p", _n, _step}
+      assert %{timers: ["p"], steps: 1} = Runtime.info(Probe, sys.i)
     end
   end
 
@@ -435,21 +516,21 @@ defmodule Vagus.Resource.RuntimeTest do
 
       for _step <- 1..2 do
         assert_receive {:trace, ^lanes, :receive, {:"$gen_call", _from, {:acquire, :pull, 0}}},
-                       5_000
+                       sys.wait
       end
 
       :erlang.trace(lanes, false, [:receive])
 
       # Both have asked; this call is behind them.
       assert %{pull: %{cap: 1, held: [holder], waiting: 1}} = Lanes.info(sys.i)
-      assert_receive {:acting, first, 1, ^holder}, 5_000
+      assert_receive {:acting, first, 1, ^holder}, sys.wait
       refute_received {:acting, _name, 1, _step}
 
       for name <- ["a", "b"], do: put_fact(sys, {:act, name}, nil)
       Process.exit(holder, :kill)
 
       [second] = ["a", "b"] -- [first]
-      assert_receive {:acting, ^second, 1, _step}, 5_000
+      assert_receive {:acting, ^second, 1, _step}, sys.wait
       for name <- ["a", "b"], do: await!(sys, :probe, name, :ready)
       settle(sys)
       assert %{pull: %{held: [], waiting: 0}} = Lanes.info(sys.i)

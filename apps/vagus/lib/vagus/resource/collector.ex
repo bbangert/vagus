@@ -31,23 +31,29 @@ defmodule Vagus.Resource.Collector do
     Enum.uniq(owners ++ for({kind, name, _uid} <- writers(resource), do: {kind, name}))
   end
 
-  @doc "The ops that collect `resource` or release what dead writers held on it."
+  @doc "The op that collects `resource`, or else those that release what dead writers held on it."
   @spec ops(Resource.t(), keyword()) :: [Store.op()]
   def ops(%Resource{kind: kind, name: name} = resource, opts \\ []) do
-    releases =
-      for writer <- writers(resource), gone?(writer, opts) do
-        {:release_writer, kind, name, writer}
-      end
-
     orphan? =
       resource.owner_refs != [] and not resource.deleting? and
         Enum.all?(resource.owner_refs, &gone?({&1.kind, &1.name, &1.uid}, opts))
 
-    if orphan?, do: releases ++ [{:delete, kind, name}], else: releases
+    # Only the delete for an orphan. A release beside it would have to be
+    # admitted for the delete to happen, and a spec that is not valid without
+    # the released entry would keep the orphan for ever.
+    if orphan? do
+      [{:delete, kind, name}]
+    else
+      for writer <- writers(resource), gone?(writer, opts) do
+        {:release_writer, kind, name, writer}
+      end
+    end
   end
 
   @doc """
-  The finished resources of `kind` that `retention` no longer keeps.
+  One commit for each finished resource of `kind` that `retention` no
+  longer keeps. Each expects the uid that was listed: by the time it is
+  deleted, the name may be another resource's.
 
   Newest is highest uid. A finished stamp is status, so after a reboot it is
   taken again and tells nothing of the order things finished in; the uid
@@ -58,7 +64,7 @@ defmodule Vagus.Resource.Collector do
           %{keep: non_neg_integer(), ttl_ms: non_neg_integer() | :infinity},
           Stamp.t(),
           keyword()
-        ) :: [Resource.name()]
+        ) :: [[Store.op()]]
   def expired(kind, %{keep: keep, ttl_ms: ttl}, %Stamp{} = now, opts \\ []) do
     finished =
       for %Resource{deleting?: false, status: %{finished: %Stamp{}}} = resource <-
@@ -67,7 +73,10 @@ defmodule Vagus.Resource.Collector do
 
     {kept, beyond} = finished |> Enum.sort_by(& &1.uid, :desc) |> Enum.split(keep)
     old = Enum.filter(kept, &(ttl != :infinity and Stamp.age(&1.status.finished, now) > ttl))
-    Enum.map(beyond ++ old, & &1.name)
+
+    for %Resource{name: name, uid: uid} <- beyond ++ old do
+      [{:expect, kind, name, uid: uid}, {:delete, kind, name}]
+    end
   end
 
   defp writers(resource) do

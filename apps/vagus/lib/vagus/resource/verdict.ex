@@ -57,8 +57,11 @@ defmodule Vagus.Resource.Verdict do
       for({type, outcome} <- conditions, not outcome?(outcome), do: {:bad_outcome, type}),
       for(key <- @reserved, is_map_key(status, key), do: {:reserved, key}),
       if(owner? or status == %{}, do: [], else: [:status_not_owned]),
-      if(owner? or not verdict.terminal?, do: [], else: [:terminal_not_owned]),
-      if(is_boolean(verdict.terminal?), do: [], else: [:bad_terminal])
+      case verdict.terminal? do
+        false -> []
+        true -> if(owner?, do: [], else: [:terminal_not_owned])
+        _other -> [:bad_terminal]
+      end
     ])
   end
 

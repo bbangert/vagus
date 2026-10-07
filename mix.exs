@@ -16,16 +16,19 @@ defmodule VagusUmbrella.MixProject do
   end
 
   # Proves that the resource runtime's scenario tests can fail. Each run takes
-  # one mechanism away from every runtime the tests start (see
-  # `Vagus.Resource.Harness`) and must end in failed tests; a suite that
-  # stays green without change notifications, say, is passing for some other
-  # reason. `resync` is run against the tests that are about resync alone,
-  # since with notifications gone too every other scenario fails regardless.
+  # one mechanism away from, or breaks one rule in, every runtime the tests
+  # start (see `Vagus.Resource.Harness`) and must end in failed tests; a
+  # suite that stays green without change notifications, say, is passing for
+  # some other reason. `resync` is run against the tests that are about
+  # resync alone: by design no other scenario depends on it.
   @mutations [
     {"deliver_events", "scenario"},
     {"resync", "scenario:resync"},
     {"ignore_dirty", "scenario"},
-    {"skip_collector", "scenario"}
+    {"skip_collector", "scenario"},
+    {"double_step", "scenario"},
+    {"stamp_current_generation", "scenario"},
+    {"repeat_action", "scenario"}
   ]
 
   defp test_mutations(_args) do
@@ -51,8 +54,9 @@ defmodule VagusUmbrella.MixProject do
   defp scenarios(mutation, only) do
     Mix.shell().info("==> scenario tests, mutation: #{mutation || "none"}")
 
-    env =
-      [{"MIX_ENV", "test"}] ++ if(mutation, do: [{"VAGUS_RESOURCE_MUTATION", mutation}], else: [])
+    # `nil` unsets it: the unmutated run must not inherit a mutation from
+    # the shell this was started in.
+    env = [{"MIX_ENV", "test"}, {"VAGUS_RESOURCE_MUTATION", mutation}]
 
     args = ["test", "apps/vagus/test/vagus/resource", "--only", only]
 
