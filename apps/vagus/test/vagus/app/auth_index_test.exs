@@ -390,7 +390,8 @@ defmodule Vagus.App.AuthIndexTest do
 
       TestInstance.kill_observed(worker, Process.whereis(Module.concat(sys.instance, Supervisor)))
 
-      # Read before any pass could have put it back: the index answers nobody.
+      # The suspended index can take no put, so a row found here is the one
+      # that was there before the kill, not one a restarted runtime wrote.
       assert AuthIndex.lookup(token("kept"), sys.i) == {:ok, "a"}
       assert Process.whereis(AuthIndex.name(sys.instance)) == index
       assert Process.whereis(Vagus.App.Pulls.name(sys.instance)) != worker
