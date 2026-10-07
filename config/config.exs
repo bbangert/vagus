@@ -33,6 +33,10 @@ config :nerves, source_date_epoch: "1784525674"
 # a board is ever misjudged. See `Vagus.Addon.Store.AssetMode`.
 config :vagus, :store_asset_mode, :auto
 
+# The `Vagus.Resource.Controller` modules that `Vagus.Resource.Supervisor`
+# runs, one runtime each. The resource store's kinds follow from this list.
+config :vagus, :controllers, []
+
 if Mix.target() == :host do
   import_config "host.exs"
 else

@@ -6,12 +6,64 @@ defmodule VagusUmbrella.MixProject do
       apps_path: "apps",
       version: "0.1.0",
       start_permanent: Mix.env() == :prod,
-      deps: deps()
+      deps: deps(),
+      aliases: [{:"test.mutations", &test_mutations/1}]
     ]
   end
 
   def cli do
     [preferred_targets: [run: :host, test: :host]]
+  end
+
+  # Proves that the resource runtime's scenario tests can fail. Each run takes
+  # one mechanism away from, or breaks one rule in, every runtime the tests
+  # start (see `Vagus.Resource.Harness`) and must end in failed tests; a
+  # suite that stays green without change notifications, say, is passing for
+  # some other reason. `resync` is run against the tests that are about
+  # resync alone: by design no other scenario depends on it.
+  @mutations [
+    {"deliver_events", "scenario"},
+    {"resync", "scenario:resync"},
+    {"ignore_dirty", "scenario"},
+    {"skip_collector", "scenario"},
+    {"double_step", "scenario"},
+    {"stamp_current_generation", "scenario"},
+    {"repeat_action", "scenario"}
+  ]
+
+  defp test_mutations(_args) do
+    # Unmutated first: a suite that fails by itself proves nothing below.
+    if scenarios(nil, "scenario") != 0,
+      do: Mix.raise("the scenario tests fail without a mutation")
+
+    survivors =
+      for {mutation, only} <- @mutations,
+          status = scenarios(mutation, only),
+          # 2 is ExUnit's "tests failed"; anything else did not run them.
+          status != 2,
+          do: "#{mutation} (exit #{status})"
+
+    if survivors != [],
+      do: Mix.raise("no scenario test failed under: #{Enum.join(survivors, ", ")}")
+
+    Mix.shell().info(
+      "every mutation was caught: #{Enum.map_join(@mutations, ", ", &elem(&1, 0))}"
+    )
+  end
+
+  defp scenarios(mutation, only) do
+    Mix.shell().info("==> scenario tests, mutation: #{mutation || "none"}")
+
+    # `nil` unsets it: the unmutated run must not inherit a mutation from
+    # the shell this was started in.
+    env = [{"MIX_ENV", "test"}, {"VAGUS_RESOURCE_MUTATION", mutation}]
+
+    args = ["test", "apps/vagus/test/vagus/resource", "--only", only]
+
+    {_output, status} =
+      System.cmd("mix", args, env: env, into: IO.stream(), stderr_to_stdout: true)
+
+    status
   end
 
   # Dependencies listed here are available only for this project

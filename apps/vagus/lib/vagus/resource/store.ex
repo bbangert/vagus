@@ -57,6 +57,9 @@ defmodule Vagus.Resource.Store do
           | {:add_finalizer, Resource.kind(), Resource.name(), atom()}
           | {:remove_finalizer, Resource.kind(), Resource.name(), atom()}
           | {:delete, Resource.kind(), Resource.name()}
+          | {:release_writer, Resource.kind(), Resource.name(), Resource.writer()}
+          | {:expect, Resource.kind(), Resource.name(),
+             [uid: pos_integer(), generation: pos_integer()]}
 
   @type result :: {:ok, Resource.t()} | {:error, term()}
 
@@ -171,11 +174,23 @@ defmodule Vagus.Resource.Store do
   op left it. One rejected op rejects the commit and nothing changes.
   """
   @spec commit([op()], keyword()) :: {:ok, [Resource.t()]} | {:error, term()}
-  def commit(ops, opts \\ []) when is_list(ops), do: call(opts, {:commit, ops})
+  def commit(ops, opts \\ []) when is_list(ops) do
+    with {:ok, resources, _changed?} <- commit_changed(ops, opts), do: {:ok, resources}
+  end
+
+  @doc """
+  As `commit/2`, and also whether the commit changed anything: a resource,
+  or the uid counter, which a create and delete of one resource moves
+  without leaving a row. A commit that changed nothing wrote nothing and
+  told nobody.
+  """
+  @spec commit_changed([op()], keyword()) ::
+          {:ok, [Resource.t()], changed? :: boolean()} | {:error, term()}
+  def commit_changed(ops, opts \\ []) when is_list(ops), do: call(opts, {:commit, ops})
 
   @doc """
   Options: `:owner_refs`, `:finalizers`, and `:writer` to own the spec keys
-  given here.
+  given here. The kind's own finalizers are added to the ones given.
   """
   @spec create(Resource.kind(), Resource.name(), map(), keyword()) :: result()
   def create(kind, name, spec, opts \\ []), do: one({:create, kind, name, spec, opts}, opts)
@@ -223,6 +238,144 @@ defmodule Vagus.Resource.Store do
   """
   @spec delete(Resource.kind(), Resource.name(), keyword()) :: result()
   def delete(kind, name, opts \\ []), do: one({:delete, kind, name}, opts)
+
+  @doc """
+  Gives up every spec path `writer` owns on the resource. A path under one of
+  the kind's `writer_entries` is deleted with its value; any other keeps its
+  value and becomes unowned. For a writer that no longer exists to release
+  its paths itself.
+  """
+  @spec release_writer(Resource.kind(), Resource.name(), Resource.writer(), keyword()) ::
+          result()
+  def release_writer(kind, name, writer, opts \\ []),
+    do: one({:release_writer, kind, name, writer}, opts)
+
+  @doc """
+  Rejects the commit it is part of unless the resource has this `:uid` and
+  `:generation` (either may be left out), with
+  `{:error, {:precondition, {kind, name}, :uid | :generation | :not_found}}`.
+
+  A writer that decided from a read uses the uid: a resource deleted and
+  created again under the same name is a different one, and what was decided
+  about its predecessor must not land on it.
+  """
+  @spec expect(Resource.kind(), Resource.name(), keyword(), keyword()) :: result()
+  def expect(kind, name, expected, opts \\ []), do: one({:expect, kind, name, expected}, opts)
+
+  @doc """
+  Has the store send `message` to each of `pids`. The store is also the
+  sender of every change notification, so a subscriber receives `message`
+  after the notifications of every commit that returned before this call:
+  what it does on receipt, it does having heard of all of them.
+  """
+  @spec relay([pid()], term(), keyword()) :: :ok
+  def relay(pids, message, opts \\ []) when is_list(pids), do: call(opts, {:relay, pids, message})
+
+  @typedoc "Sees the resource, or `nil` when there is none."
+  @type await_fun :: (Resource.t() | nil -> {:halt, term()} | :cont)
+
+  @doc """
+  Blocks the caller until `fun` halts on the resource, and returns what it
+  halted with; `{:error, {:timeout, last_seen}}` after `:timeout` (5 s).
+
+  The caller subscribes to the object before the first read, so no change
+  falls between the two, and reads again on every notification. It also
+  reads every `:poll` (1 s), for the notification that never comes: one the
+  store did not live to send, or a wait for something that is not a change
+  to the resource at all. A store that restarts during the wait costs
+  nothing else: the subscription is in `Vagus.Resource.Watch`, which
+  outlives it.
+
+  **The wait does not outlive `Watch`.** When the registry goes, with the
+  whole subtree, the caller goes with it as every subscriber does: by its
+  link to the registry, with the registry's reason, or by an exit from here
+  with `{:watch_down, reason}`, whichever comes first. A caller that traps
+  exits gets the second. A wait that went on without a subscription would
+  end as a timeout that says nothing of why.
+
+  The caller must hold no subscription of its own to the same object; the
+  notifications left in its mailbox when this returns are dropped. To be
+  sure of that it asks the store once before returning, so it returns behind
+  whatever the store is then writing.
+  """
+  @spec await(Resource.kind(), Resource.name(), await_fun(), keyword()) ::
+          {:ok, term()} | {:error, {:timeout, Resource.t() | nil}}
+  def await(kind, name, fun, opts \\ []) when is_function(fun, 1) do
+    watch = Keyword.take(opts, [:instance])
+    key = {:object, kind, name}
+    deadline = System.monotonic_time(:millisecond) + Keyword.get(opts, :timeout, 5_000)
+    # For the caller that traps exits, whom the link to the registry only
+    # sends a message.
+    registry = Process.monitor(Watch.name(instance(opts)))
+    :ok = Watch.subscribe(key, watch)
+
+    try do
+      await_loop({kind, name}, fun, {deadline, Keyword.get(opts, :poll, 1_000), registry}, opts)
+    after
+      Process.demonitor(registry, [:flush])
+      withdraw(key, watch)
+      behind_dispatch(opts)
+      drop_notifications(kind, name)
+    end
+  end
+
+  # With the registry gone there is nothing to withdraw, and raising here
+  # would replace the exit that says so.
+  defp withdraw(key, watch) do
+    Watch.unsubscribe(key, watch)
+  rescue
+    ArgumentError -> :ok
+  end
+
+  # The store may have read the subscription, for a notification it is about
+  # to send, just before it was withdrawn. It answers this after that send,
+  # so the notification is in the mailbox to be dropped.
+  #
+  # With the store gone or not answering the wait still returns what it
+  # found: its answer came from the tables, not from the store, and a
+  # command that got its condition must not fail on tidying up. A store that
+  # died while asked had sent whatever it was going to before the exit that
+  # says so arrived. One that is merely slow may still send, and that one
+  # notification is left for the caller; it says "look again", which no
+  # caller is harmed by doing.
+  defp behind_dispatch(opts) do
+    relay([], nil, opts)
+  catch
+    :exit, _reason -> :ok
+  end
+
+  defp await_loop({kind, name} = key, fun, {deadline, poll, registry} = timing, opts) do
+    resource = get(kind, name, opts)
+
+    case fun.(resource) do
+      {:halt, result} ->
+        {:ok, result}
+
+      :cont ->
+        case deadline - System.monotonic_time(:millisecond) do
+          remaining when remaining <= 0 ->
+            {:error, {:timeout, resource}}
+
+          remaining ->
+            receive do
+              {Watch, _event, %{kind: ^kind, name: ^name}} -> :ok
+              {:DOWN, ^registry, :process, _pid, reason} -> exit({:watch_down, reason})
+            after
+              min(remaining, poll) -> :ok
+            end
+
+            await_loop(key, fun, timing, opts)
+        end
+    end
+  end
+
+  defp drop_notifications(kind, name) do
+    receive do
+      {Watch, _event, %{kind: ^kind, name: ^name}} -> drop_notifications(kind, name)
+    after
+      0 -> :ok
+    end
+  end
 
   @doc """
   Takes the operation claim on `{kind, name}` for the calling process, which
@@ -281,13 +434,14 @@ defmodule Vagus.Resource.Store do
 
   @impl true
   def handle_call({:commit, ops}, _from, state) do
-    txn = %{state: state, rows: %{}, removed: [], next_uid: next_uid(state.table)}
+    next_uid = next_uid(state.table)
+    txn = %{state: state, rows: %{}, removed: [], next_uid: next_uid}
 
     with {:ok, results, txn} <- run_all(ops, [], txn),
          changes = changes(state.table, txn),
          :ok <- persist(state, txn, changes) do
       apply_changes(state, txn, changes)
-      {:reply, {:ok, results}, state}
+      {:reply, {:ok, results, changes != [] or txn.next_uid != next_uid}, state}
     else
       {:error, _reason} = error ->
         {:reply, error, state}
@@ -297,6 +451,11 @@ defmodule Vagus.Resource.Store do
       {:unknown, reason} ->
         {:stop, {:persist_outcome_unknown, reason}, state}
     end
+  end
+
+  def handle_call({:relay, pids, message}, _from, state) do
+    for pid <- pids, is_pid(pid), do: send(pid, message)
+    {:reply, :ok, state}
   end
 
   def handle_call({:register, kind, writer, types, owner?}, _from, state) do
@@ -529,7 +688,7 @@ defmodule Vagus.Resource.Store do
         uid: txn.next_uid,
         spec: admitted,
         # One release per name has to be enough to let the resource go.
-        finalizers: Enum.uniq(finalizers),
+        finalizers: Enum.uniq(txn.state.kinds[kind].finalizers ++ finalizers),
         owner_refs: owner_refs,
         managed_fields:
           if(writer != nil, do: Map.new(spec, fn {key, _} -> {[key], writer} end), else: %{})
@@ -608,7 +767,47 @@ defmodule Vagus.Resource.Store do
     end
   end
 
+  # Also for a resource on its way out: letting go is always allowed.
+  defp run({:release_writer, kind, name, writer}, txn) when writer != nil do
+    with {:ok, resource} <- lookup(txn, {kind, name}),
+         owned = for({path, ^writer} <- resource.managed_fields, do: path),
+         entries = txn.state.kinds[kind].writer_entries,
+         spec =
+           owned
+           |> Enum.filter(&entry?(&1, entries))
+           |> Enum.reduce(resource.spec, &delete_path(&2, &1)),
+         {:ok, spec} <- readmit(txn.state, resource, spec) do
+      generation =
+        if spec == resource.spec, do: resource.generation, else: resource.generation + 1
+
+      put(txn, %{
+        resource
+        | spec: spec,
+          managed_fields: Map.drop(resource.managed_fields, owned),
+          generation: generation
+      })
+    end
+  end
+
+  defp run({:expect, kind, name, expected} = op, txn) do
+    known? = &match?({field, value} when field in [:uid, :generation] and is_integer(value), &1)
+
+    with :ok <- if(every?(expected, known?), do: :ok, else: {:error, {:bad_op, op}}),
+         %Resource{} = resource <- current(txn, {kind, name}),
+         nil <- Enum.find(expected, fn {field, value} -> Map.fetch!(resource, field) != value end) do
+      {:ok, resource, txn}
+    else
+      {:error, _reason} = error -> error
+      nil -> {:error, {:precondition, {kind, name}, :not_found}}
+      {field, _value} -> {:error, {:precondition, {kind, name}, field}}
+    end
+  end
+
   defp run(op, _txn), do: {:error, {:bad_op, op}}
+
+  defp entry?(path, entries) do
+    Enum.any?(entries, &(List.starts_with?(path, &1) and length(path) > length(&1)))
+  end
 
   # With a writer the given keys become owned paths, which the file has to
   # be able to hold.

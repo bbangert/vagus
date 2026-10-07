@@ -67,6 +67,10 @@ defmodule Vagus.Resource do
   @spec ref(t()) :: ref()
   def ref(%__MODULE__{kind: kind, name: name, uid: uid}), do: %{kind: kind, name: name, uid: uid}
 
+  @doc "The identity under which a resource writes to another's spec."
+  @spec writer(t()) :: {kind(), name(), pos_integer()}
+  def writer(%__MODULE__{kind: kind, name: name, uid: uid}), do: {kind, name, uid}
+
   @spec condition(atom(), boolean(), atom(), pos_integer(), String.t() | nil) :: condition()
   def condition(type, status, reason, observed_generation, message \\ nil)
       when is_atom(type) and is_boolean(status) and is_atom(reason) do
