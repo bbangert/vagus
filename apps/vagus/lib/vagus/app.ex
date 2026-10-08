@@ -42,8 +42,14 @@ defmodule Vagus.App do
     * `:gates`, the conditions the app waits for before it is Ready. The
       default is none: `:dns_ready` belongs here once a controller writes
       it, and listed before that it would keep every app in `startup`.
-    * `:facts`, overrides for `Vagus.App.Facts.read/1`
-    * `:engine`, options for every engine call (`:socket`)
+    * `:facts`, overrides for `Vagus.App.Facts.read/1`. The facts are the
+      controller's context, which its passes and the kind's admission in
+      the store both read
+    * `:engine`, options for every engine call (`:socket`): the
+      backend's, the pull worker's, the observer's listing, and the app
+      network made before a create. The observer's events are the one
+      thing of the engine they do not reach: those come from the worker
+      its `:events` names, by default the application's
     * `:context`, merged over the controller's context
     * `:boot_marker`, as `Vagus.App.Boot`'s `:marker`
     * `:resync`, and `:observer`, options for `Vagus.App.EngineObserver`

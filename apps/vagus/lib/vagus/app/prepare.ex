@@ -31,7 +31,13 @@ defmodule Vagus.App.Prepare do
   ## Options
 
     * `:network`, `(-> :ok | {:error, term})`, which makes sure the app
-      network exists (default `Vagus.Network.ensure/0` and its anchors)
+      network exists (default `Vagus.Network.ensure/1` on the engine of
+      `:engine`, then `:anchors`)
+    * `:engine`, options for that engine call: a network on any engine
+      but the one the container is made on is no network of the container's
+    * `:anchors`, `(-> :ok)`, which gives the host the Supervisor's
+      addresses on that network (default
+      `Vagus.Network.ensure_supervisor_ip/0`)
     * `:dsp_state`, `(-> :configured | :not_configured | :unsupported)`
       (default `Vagus.DSP.state/0`)
     * `:devices`, options for `Vagus.Addon.Devices`
@@ -53,7 +59,7 @@ defmodule Vagus.App.Prepare do
          :ok <- dsp_store(config, Keyword.get(opts, :dsp_state, &Vagus.DSP.state/0)),
          :ok <- dsp_devices(config, devices),
          :ok <- write_options(spec, facts),
-         :ok <- network(spec, Keyword.get(opts, :network, &ensure_network/0)) do
+         :ok <- network(spec, Keyword.get(opts, :network, fn -> ensure_network(opts) end)) do
       protected? = Map.get(spec.settings, :protected, true)
       {:ok, %{device_cgroup_rules: Devices.cgroup_rules(config, protected?, devices)}}
     end
@@ -161,11 +167,11 @@ defmodule Vagus.App.Prepare do
     with {:error, reason} <- ensure.(), do: {:error, Docker.failure(reason)}
   end
 
-  defp ensure_network do
-    with {:ok, _id} <- Network.ensure() do
+  defp ensure_network(opts) do
+    with {:ok, _id} <- Network.ensure(Keyword.get(opts, :engine, [])) do
       # The Supervisor's address on the bridge, where a bridged app reaches
       # the API, is lost at every reboot.
-      Network.ensure_supervisor_ip()
+      Keyword.get(opts, :anchors, &Network.ensure_supervisor_ip/0).()
       :ok
     end
   end

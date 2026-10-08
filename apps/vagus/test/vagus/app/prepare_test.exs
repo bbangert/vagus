@@ -119,6 +119,57 @@ defmodule Vagus.App.PrepareTest do
   end
 
   describe "run/3" do
+    test "makes the app network on the engine it is given, then the host's addresses on it",
+         ctx do
+      engine = Vagus.Test.FakeEngine.start_model()
+      # A call made without the options is to find no engine, not this host's.
+      configured = Application.fetch_env(:vagus, :docker_socket)
+      Application.put_env(:vagus, :docker_socket, Path.join(ctx.new, "no-engine.sock"))
+
+      on_exit(fn ->
+        case configured do
+          {:ok, socket} -> Application.put_env(:vagus, :docker_socket, socket)
+          :error -> Application.delete_env(:vagus, :docker_socket)
+        end
+
+        Vagus.Test.FakeEngine.stop(engine)
+      end)
+
+      facts = Facts.read(data_root: ctx.new)
+      test = self()
+
+      opts = [
+        engine: [socket: engine.socket],
+        anchors: fn ->
+          send(test, {:anchored, length(Vagus.Test.FakeEngine.requests(engine))})
+          :ok
+        end
+      ]
+
+      bridged = spec(AppManifests.get("only_host_uts"), facts, %{})
+      assert {:ok, _prepared} = Prepare.run(bridged, facts, opts)
+      network = "/networks/" <> Vagus.Network.name()
+
+      assert [%{method: :get, path: ^network}, %{method: :post, path: "/networks/create"}] =
+               Vagus.Test.FakeEngine.requests(engine)
+
+      assert_received {:anchored, 2}
+
+      # There already: asked after, and not made again.
+      assert {:ok, _prepared} = Prepare.run(bridged, facts, opts)
+
+      assert [_get, _post, %{method: :get, path: ^network}] =
+               Vagus.Test.FakeEngine.requests(engine)
+
+      assert_received {:anchored, 3}
+
+      # An app on the host's network needs none.
+      on_host = spec(AppManifests.get("host_with_ports"), facts, %{})
+      assert {:ok, _prepared} = Prepare.run(on_host, facts, opts)
+      assert length(Vagus.Test.FakeEngine.requests(engine)) == 3
+      refute_received {:anchored, _requests}
+    end
+
     test "is the same done twice", ctx do
       config = AppManifests.get("core_samba")
       assert {:ok, first} = prepare(config, ctx.new)

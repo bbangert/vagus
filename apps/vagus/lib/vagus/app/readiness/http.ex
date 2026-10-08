@@ -2,8 +2,8 @@ defmodule Vagus.App.Readiness.Http do
   @moduledoc """
   `Vagus.App.Readiness` asked over the network: a TCP connect for a `tcp`
   target, otherwise one `GET` on a connection of its own, answered by any
-  status below 300. Certificates are not verified: an app's own is usually
-  self-signed, and the question is whether anything answers.
+  final status below 300. Certificates are not verified: an app's own is
+  usually self-signed, and the question is whether anything answers.
 
   `timeout` bounds the whole exchange, connect included.
   """
@@ -65,14 +65,19 @@ defmodule Vagus.App.Readiness.Http do
   defp status(conn, ref, deadline) do
     with {:ok, left} <- left(deadline),
          {:ok, conn, responses} <- Mint.HTTP.recv(conn, 0, left) do
-      case List.keyfind(responses, :status, 0) do
+      case Enum.find(responses, &final?(&1, ref)) do
         {:status, ^ref, status} -> {:ok, status}
-        _not_yet -> status(conn, ref, deadline)
+        nil -> status(conn, ref, deadline)
       end
     else
       _gave_up -> :error
     end
   end
+
+  # A 1xx is an interim response, `100 Continue` or `103 Early Hints`: the
+  # status that says whether the app answers follows it on the same request.
+  defp final?({:status, ref, status}, ref), do: status >= 200
+  defp final?(_response, _ref), do: false
 
   defp left(deadline) do
     case deadline - System.monotonic_time(:millisecond) do

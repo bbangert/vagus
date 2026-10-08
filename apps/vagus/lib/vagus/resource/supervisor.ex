@@ -60,8 +60,10 @@ defmodule Vagus.Resource.Supervisor do
       controller's runtime alone
       (`Vagus.Resource.Runtime.controller_options/0`), which are merged
       over `:runtime`; a `:context` is merged into the shared one key by
-      key. An option not among those, or a controller listed twice with
-      different options, fails this start with the controller's name.
+      key, and is what an owner's `c:Vagus.Resource.Controller.validate/2`
+      is given in the store. An option not among those, or a controller
+      listed twice with different options, fails this start with the
+      controller's name.
     * `:runtime`, options for every `Vagus.Resource.Runtime`.
     * `:lanes`, `Vagus.Resource.Lanes` caps.
     * `:services`, child specs started after `Vagus.Resource.Lanes` and
@@ -102,7 +104,7 @@ defmodule Vagus.Resource.Supervisor do
     # Derived here and given to the store as a start option: the store reads
     # its file, and checks who may write status, before any runtime exists.
     given = Map.new(Keyword.get(store, :kinds, %{}))
-    derived = Controller.kinds(declarations)
+    derived = Controller.kinds(declarations, contexts(entries, Keyword.get(own, :runtime, [])))
 
     # Merged, the controller's kind would silently replace the given one.
     for {kind, %{owner: owner}} <- derived, is_map_key(given, kind) do
@@ -143,6 +145,16 @@ defmodule Vagus.Resource.Supervisor do
     # error, not as a child's exit; the store, which does stop over it, has
     # its own budget. A child that ends here is a defect to escalate.
     Supervisor.init(children, strategy: :rest_for_one, max_restarts: 5, max_seconds: 30)
+  end
+
+  # What each runtime is started with as its `:context`, for a kind whose
+  # admission reads it: the store is given the same one.
+  defp contexts(entries, runtime) do
+    shared = Keyword.get(runtime, :context, %{})
+
+    Map.new(entries, fn {controller, options} ->
+      {controller, Map.merge(shared, Keyword.get(options, :context, %{}))}
+    end)
   end
 
   # Checked here, where a mistake fails the start with a name. Passed on

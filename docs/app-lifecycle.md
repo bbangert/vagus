@@ -128,8 +128,10 @@ is in three parts, which keeps the decision a pure function a table can test:
   is idempotent against observation, so the pass after a crash carries on.
 
 The other callbacks are declarations: `kind/0`, `condition_types/0`, and
-optionally `validate/1` (admission), `references/1` (resources whose changes
-concern this one),
+optionally `validate/1` (admission; `validate/2` is given the context the
+controller's runtime is started with as well, for a kind admitted by what
+its passes also read), `references/1` (resources whose changes concern this
+one),
 `retention/0`, `owned_conditions/0`, `finalizer/0`, `action_class/1` (the
 lane an action runs in), `writer_entries/0`, and the codec hooks
 `encode_spec/1`, `decode_spec/1`, `encode_progress/1`, `decode_progress/1`
@@ -458,7 +460,10 @@ written by commands, which own nothing.
 
 The kind's validator is `Schema.validate/2`: a pure function of the spec
 and of `Vagus.App.Facts`, the machine's architecture, board, Core version
-and so on as data. The store runs it on every write of a spec. It fills in
+and so on as data. The store runs it on every write of a spec, with the
+facts of the controller's context, the ones its passes read
+(`Vagus.App.wiring/1`): a spec made from a manifest for those facts is
+admitted by them, and the two cannot be given different ones. It fills in
 what was left out (a manifest alone is a whole spec) and refuses, each with
 a reason a command turns into its answer:
 
@@ -621,12 +626,20 @@ answer it was reading would otherwise put the environment into a crash
 report. A read that raised is an engine that failed the pass. Core's token is the Supervisor's, read through
 a function the controller is given; a native app has none.
 
+The table has a row for the app that is the instance's token, or none. A
+row for any other token, the one of the container before this one or of a
+container that is gone, is removed by the pass that sees it, before
+anything else is decided for the app: so the token of a removed container
+is nobody's before the next one is created, and an instance that has no
+token to put (`no_token`, or Core while the Supervisor's is not there yet)
+is not left answering to an earlier one. A put fills a row that is missing.
+
 **Before the create.** `Vagus.App.Prepare.run/3` is part of the create
 action (of the start, for a native app), not an action of its own: the
 directories the container binds, the DSP checks of a `dsp: true` manifest,
 `options.json` in the app's data directory (the same bytes and mode the
-start this replaces writes), the app network for a bridged app, and the
-container's device rules. None of that is something a pass could observe
+start this replaces writes), the app network for a bridged app, on the
+engine the container is made on, and the container's device rules. None of that is something a pass could observe
 cheaply, and a mark in status could not stand in for looking, since status
 is committed before the action runs: a pass cut between the two would find
 the mark and no directories. Done again with the create it belongs to, it
@@ -700,9 +713,15 @@ that holds is the pass. In order:
 
 0. An app whose resource name is not its manifest's slug is Failed,
    `name_mismatch`, and nothing is done to it: the container, the data
-   directory and the token row are named for one or the other. Then an
-   app one of whose actions raised is Failed, `crashed`, and nothing more
-   is done to it, with one exception before it: an instance that runs
+   directory and the token row are named for one or the other. Then a
+   row of the token table that is not the token of the instance observed,
+   left by the instance before it or by one that is gone, is removed,
+   whatever else is owed: for as long as it is there, that token is the
+   app's to whoever holds it. The pass that removes it judges nothing, and
+   keeps what status has of an instance that is gone for the pass after.
+   Then an app one of whose actions raised is Failed, `crashed`, and
+   nothing more is done to it, the removal of such a row included if that
+   is what raised, with one exception before it: an instance that runs
    and whose token the table lacks has it put, unless the action that
    raised was that put. An app being deleted is not held up this way.
 1. A container the other firmware slot left under `addon_<slug>` is stopped,
@@ -795,7 +814,8 @@ attempt of its budget.
 `Vagus.App.Readiness`: a container is ready when it runs and, where the
 image has a healthcheck, is healthy; a native app when its process exists;
 an `{:http, path}` app (Core) when a `GET` of the path answered 2xx, asked
-every five seconds until it has. While its deadline has passed without an
+every five seconds until it has. The answer is the final status: a `1xx`
+sent before it, `100 Continue` or `103 Early Hints`, says nothing. While its deadline has passed without an
 answer it is Failed (`readiness_timeout`) and asked every thirty seconds:
 that Failed is not given up, and ends when the app answers. The probe of a `watchdog` URL
 keeps the template grammar and the rule of the probe this replaces: a TCP
@@ -908,8 +928,9 @@ on the resource and waits, and the other's release is a change that brings
 its next pass. The App needs no such order for its token: removing it is
 the first action of its own uninstall.
 
-An App's own cleanup, one action a pass: cancel its pull, remove the token,
-stop the container, remove it (Core's too), remove the image where a stop
+An App's own cleanup, one action a pass: remove a token row an earlier
+instance left, cancel its pull, remove the token of the instance that is
+there, stop the container, remove it (Core's too), remove the image where a stop
 removes the container, remove the app's data directory, and release the
 finalizer. An image another container still uses stays: the engine's
 conflict is the end of that step, and any other failure is tried again. The data directory

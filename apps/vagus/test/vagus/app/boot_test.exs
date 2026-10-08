@@ -20,7 +20,7 @@ defmodule Vagus.App.BootTest do
         kinds: %{
           app: [
             finalizers: [:app],
-            validators: [&Controller.validate/1],
+            validators: [&Controller.validate(&1, %{facts: Facts.read(data_root: "/nowhere")})],
             encode_spec: &Schema.encode_spec/1,
             decode_spec: &Schema.decode_spec/1
           ]

@@ -209,6 +209,17 @@ defmodule Vagus.App.ReadinessTest do
                :error
     end
 
+    test "an interim status is no answer: the final one that follows it is" do
+      continue = "HTTP/1.1 100 Continue\r\n\r\n"
+      hints = "HTTP/1.1 103 Early Hints\r\nlink: </style.css>; rel=preload\r\n\r\n"
+      busy = "HTTP/1.1 503 Busy\r\ncontent-length: 0\r\n\r\n"
+      fine = "HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n"
+
+      assert Http.probe(target(serve(continue <> busy)), 2_000) == :error
+      assert Http.probe(target(serve(hints <> fine)), 2_000) == :ok
+      assert Http.probe(target(serve(continue <> hints <> busy)), 2_000) == :error
+    end
+
     test "silence is none, within the time given" do
       port = serve(nil)
       started = System.monotonic_time(:millisecond)
@@ -255,6 +266,33 @@ defmodule Vagus.App.ReadinessTest do
       refute Task.yield(probing, 100)
       send(server, :write)
       assert Task.await(probing) == :ok
+    end
+
+    for {final, answer} <- [
+          {"HTTP/1.1 503 Busy\r\ncontent-length: 0\r\n\r\n", :error},
+          {"HTTP/1.1 204 No Content\r\n\r\n", :ok}
+        ] do
+      test "an interim status in one read and #{inspect(final)} in the next: #{answer}" do
+        port = serve_in_parts(["HTTP/1.1 100 Continue\r\n\r\n", unquote(final)])
+        probing = Task.async(fn -> Http.probe(target(port), 5_000) end)
+
+        assert_receive {:ready_to_write, server, "HTTP/1.1 100" <> _}, 5_000
+        send(server, :write)
+        # Asked for only once the interim status has been sent: the probe
+        # has read that one and goes on reading.
+        assert_receive {:ready_to_write, ^server, unquote(final)}, 5_000
+        refute Task.yield(probing, 100)
+        send(server, :write)
+        assert Task.await(probing) == unquote(answer)
+      end
+    end
+
+    test "an interim status and then silence is none, within the time given" do
+      port = serve_in_parts(["HTTP/1.1 100 Continue\r\n\r\n", "never written"])
+      probing = Task.async(fn -> Http.probe(target(port), 300) end)
+      assert_receive {:ready_to_write, server, "HTTP/1.1 100" <> _}, 5_000
+      send(server, :write)
+      assert Task.await(probing) == :error
     end
 
     test "an answer that stops in the middle is none, within the time given" do

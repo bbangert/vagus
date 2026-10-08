@@ -18,6 +18,7 @@ defmodule Vagus.Test.FakeEngine.Model do
       of that time and not before;
     * a pull is a stream written from a script (`script_pull/3`), `200`
       before any line of it;
+    * a network is there once it was created, by its name;
     * `crash/3` on a container with a restart policy is `die`, then `start`
       with a higher `RestartCount` and a new `StartedAt`.
 
@@ -148,6 +149,7 @@ defmodule Vagus.Test.FakeEngine.Model do
        stop_delay: Keyword.get(opts, :stop_delay, 0),
        containers: %{},
        images: MapSet.new(),
+       networks: MapSet.new(),
        pulls: %{},
        fail_starts: %{},
        on_request: Keyword.get(opts, :on_request, fn _entry, _containers -> :ok end),
@@ -560,6 +562,15 @@ defmodule Vagus.Test.FakeEngine.Model do
 
     {reply, state}
   end
+
+  defp route(:get, ["networks", name], _entry, _pid, state) do
+    if name in state.networks,
+      do: {{200, %{"Id" => "network-" <> name, "Name" => name}}, state},
+      else: {{404, %{"message" => "network #{name} not found"}}, state}
+  end
+
+  defp route(:post, ["networks", "create"], %{body: %{"Name" => name}}, _pid, state),
+    do: {{201, %{"Id" => "network-" <> name}}, update_in(state.networks, &MapSet.put(&1, name))}
 
   defp route(_method, _path, entry, _pid, state),
     do: {{500, %{"message" => "the model has no #{entry.method} #{entry.path}"}}, state}

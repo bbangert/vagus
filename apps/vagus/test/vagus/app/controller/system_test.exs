@@ -9,7 +9,8 @@ defmodule Vagus.App.Controller.SystemTest do
   import Vagus.Test.AppWorld,
     only: [actions: 2, advance: 3, install: 4, verdict: 1, wake: 2, write: 3]
 
-  alias Vagus.App.{AuthIndex, Backend, Boot, Controller, EngineObserver, Pulls}
+  alias Vagus.App.{AuthIndex, Backend, Boot, Controller, EngineObserver, Facts, Pulls}
+  alias Vagus.App.Spec.Schema
   alias Vagus.Resource.Harness.Faults
   alias Vagus.Resource.{Runtime, Store}
   alias Vagus.Test.{AppManifests, AppWorld, FakeEngine}
@@ -678,6 +679,108 @@ defmodule Vagus.App.Controller.SystemTest do
       Model.crash(engine, "app_" <> @plain, 9)
       app = await!(sys, :app, @plain, :failed)
       assert %{cause: :crashed, detail: %{exit_code: 9}} = app.status.failure
+    end
+  end
+
+  describe "Vagus.App.wiring/1, with facts and an engine of its own" do
+    setup do
+      world = AppWorld.new()
+
+      opts = [
+        engine: [socket: world.socket],
+        boot_marker: Path.join(world.root, "booted"),
+        context: %{api_ready: fn -> true end},
+        observer: [events: nil, interval: :infinity]
+      ]
+
+      %{world: world, opts: opts}
+    end
+
+    # The wiring as a system, and the facts it was given.
+    defp wired(world, opts, facts) do
+      facts = [data_root: world.data] ++ facts
+      wiring = &Vagus.App.wiring([instance: &1, facts: facts] ++ opts)
+
+      sys =
+        start_system(
+          controllers: wiring.(nil)[:controllers],
+          services:
+            &[%{id: :engine, start: {AppWorld, :start_engine, [world]}} | wiring.(&1)[:services]],
+          observers: &wiring.(&1)[:observers]
+        )
+
+      {sys, Facts.read(facts)}
+    end
+
+    test "an app that runs in the VM here and nowhere else is admitted here, and the application's is not",
+         %{world: world, opts: opts} do
+      {sys, facts} = wired(world, opts, native_apps: ["local_broker"])
+
+      own = Schema.from_manifest(%{AppManifests.native() | slug: "local_broker"}, facts)
+      assert own.lifecycle == :native
+      assert {:ok, _app} = Store.create(:app, "local_broker", Map.put(own, :run, false), sys.i)
+
+      elsewhere = Schema.from_manifest(AppManifests.native(), Facts.read())
+      assert elsewhere.lifecycle == :native
+
+      assert Store.create(:app, @native, Map.put(elsewhere, :run, false), sys.i) ==
+               {:error, {:invalid, {:lifecycle_mismatch, :native}}}
+    end
+
+    test "a host port kept here is no ingress port here, and the one assigned around it is",
+         %{world: world, opts: opts} do
+      {sys, facts} = wired(world, opts, reserved_host_ports: [62_000])
+      manifest = AppManifests.get("5c53de3b_esphome")
+      spec = &Schema.from_manifest(manifest, facts, %{run: false, ingress_port: &1})
+
+      assert Store.create(:app, manifest.slug, spec.(62_000), sys.i) ==
+               {:error, {:invalid, :ingress_port_reserved}}
+
+      assert {:ok, 62_001} =
+               Schema.assign_ingress_port(manifest, MapSet.new(), facts.reserved_host_ports)
+
+      assert {:ok, _app} = Store.create(:app, manifest.slug, spec.(62_001), sys.i)
+    end
+
+    test "the app network is made on the engine given, and the application's is asked nothing",
+         %{world: world, opts: opts} do
+      # Where a call without the engine's options would arrive.
+      default = FakeEngine.start_model()
+      configured = Application.fetch_env(:vagus, :docker_socket)
+      Application.put_env(:vagus, :docker_socket, default.socket)
+
+      on_exit(fn ->
+        case configured do
+          {:ok, socket} -> Application.put_env(:vagus, :docker_socket, socket)
+          :error -> Application.delete_env(:vagus, :docker_socket)
+        end
+
+        FakeEngine.stop(default)
+      end)
+
+      # The host's own addresses are no engine's to give.
+      prepare = [anchors: fn -> :ok end, dsp_state: fn -> :unsupported end]
+      opts = Keyword.update!(opts, :context, &Map.put(&1, :prepare, prepare))
+      {sys, _facts} = wired(world, opts, [])
+
+      app = install(world, sys, @plain, %{run: true})
+      assert verdict(app) == @ready
+
+      network = Vagus.Network.name()
+
+      assert [
+               {:get, "/networks/" <> ^network},
+               {:post, "/networks/create"},
+               {:post, "/containers/create"}
+             ] =
+               for(
+                 %{method: method, path: path} <-
+                   FakeEngine.requests(AppWorld.engine(world, sys)),
+                 path =~ "/networks/" or path == "/containers/create",
+                 do: {method, path}
+               )
+
+      assert FakeEngine.requests(default) == []
     end
   end
 

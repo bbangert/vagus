@@ -16,9 +16,10 @@ defmodule Vagus.App.Controller.Reconcile do
   (`readiness_timeout`): the instance runs and is still asked, at a longer
   interval, and is Ready when it answers, with no write to anything.
 
-  The order of the clauses is the order of precedence: what is owed to a
-  container the other firmware slot left, then taking an instance away,
-  then judging one that ended, then the start sequence.
+  The order of the clauses is the order of precedence: a token row that is
+  nobody's, then what is owed to a container the other firmware slot left,
+  then taking an instance away, then judging one that ended, then the start
+  sequence.
   """
 
   alias Vagus.App.Controller.View
@@ -66,7 +67,10 @@ defmodule Vagus.App.Controller.Reconcile do
       v.mismatch? ->
         out(v, :failed, :name_mismatch, :failed)
 
-      v.raised? and v.running? and v.token in [:absent, :other] and not v.put_raised? ->
+      v.token == :other and not v.revoke_raised? ->
+        act(v, :revoking_token, revoking(v), :remove_token, unjudged(v))
+
+      v.raised? and v.running? and v.token_owed? and not v.put_raised? ->
         act(v, :indexing_token, :starting, :put_token)
 
       v.raised? ->
@@ -111,7 +115,7 @@ defmodule Vagus.App.Controller.Reconcile do
       not v.wanted? ->
         out(v, :idle, if(v.held?, do: :held, else: :stopped), :stopped, stopped(v))
 
-      v.running? and v.token in [:absent, :other] ->
+      v.running? and v.token_owed? ->
         act(v, :indexing_token, :starting, :put_token)
 
       v.succeeded? ->
@@ -179,13 +183,13 @@ defmodule Vagus.App.Controller.Reconcile do
       v.absent? ->
         act(v, :creating, :creating, :create, launching(v))
 
-      v.token == :none_to_put and v.token_pending? ->
+      v.no_token? and v.token_pending? ->
         wait(v, :waiting_for_token, :starting, @readiness_poll_ms)
 
-      v.token == :none_to_put ->
+      v.no_token? ->
         out(v, :failed, :no_token, :failed)
 
-      v.token in [:absent, :other] ->
+      v.token_owed? ->
         act(v, :indexing_token, :starting, :put_token)
 
       not v.running? ->
@@ -204,6 +208,16 @@ defmodule Vagus.App.Controller.Reconcile do
         ready(v)
     end
   end
+
+  defp revoking(v), do: if(v.down?, do: :stopping, else: :starting)
+
+  # An instance that is gone is judged by the pass that first finds it so,
+  # from what status has of it, and this pass judges nothing: what it would
+  # forget is kept for the one after.
+  defp unjudged(%{absent?: true} = v),
+    do: [instance: v.known, expected_exit: v.st.expected_exit]
+
+  defp unjudged(_v), do: []
 
   defp stop(v), do: {if(v.native?, do: :stop_process, else: :stop), %{grace: v.grace}}
 

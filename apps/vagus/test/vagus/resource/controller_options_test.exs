@@ -48,6 +48,30 @@ defmodule Vagus.Resource.ControllerOptionsTest do
     def act(_action, _args, _context), do: :ok
   end
 
+  defmodule Bounded do
+    @moduledoc "Owns `:bounded`, and admits a spec by a bound that is in its context."
+    @behaviour Vagus.Resource.Controller
+
+    @impl true
+    def kind, do: :bounded
+    @impl true
+    def condition_types, do: [:ready]
+
+    @impl true
+    def validate(_spec), do: {:error, :no_context}
+
+    @impl true
+    def validate(%{"n" => n} = spec, %{bound: bound, slack: slack}),
+      do: if(n <= bound + slack, do: {:ok, spec}, else: {:error, {:above, bound + slack}})
+
+    @impl true
+    def observe(_bounded, _context), do: :seen
+    @impl true
+    def reconcile(_bounded, _observed), do: {Verdict.new(ready: {true, :seen}), []}
+    @impl true
+    def act(_action, _args, _context), do: :ok
+  end
+
   @moduletag :capture_log
 
   defp runtime_state(sys, controller),
@@ -123,6 +147,23 @@ defmodule Vagus.Resource.ControllerOptionsTest do
                {Reader, "r", %{flavour: :own, shared: 1}},
                {Reader2, "r", %{flavour: :plain, shared: 1}}
              ]
+    end
+
+    test "has its context given to the kind's admission in the store, over the shared one" do
+      sys =
+        start_system(
+          controllers: [{Bounded, context: %{bound: 3}}],
+          context: %{bound: 1, slack: 1}
+        )
+
+      assert {:ok, _bounded} = Store.create(:bounded, "within", %{"n" => 4}, sys.i)
+
+      assert Store.create(:bounded, "above", %{"n" => 5}, sys.i) ==
+               {:error, {:invalid, {:above, 4}}}
+
+      # Asked for by itself, the controller is given no context to admit by.
+      assert [validate] = Controller.kinds([Bounded]).bounded.validators
+      assert_raise FunctionClauseError, fn -> validate.(%{"n" => 1}) end
     end
 
     test "may set the pacing options too, and one without options is as before" do

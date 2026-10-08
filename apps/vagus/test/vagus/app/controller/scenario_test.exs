@@ -149,7 +149,7 @@ defmodule Vagus.App.Controller.ScenarioTest do
 
       app = write(sys, @plain, [{:inc, [:restart_counter]}])
       assert verdict(app) == @ready
-      assert actions(sys, @plain) == @start ++ [:stop, :remove] ++ @start
+      assert actions(sys, @plain) == @start ++ [:stop, :remove, :remove_token] ++ @start
       assert %{id: second} = container(engine, @plain)
       assert second != first
       assert app.status.made_for.restart_counter == 1
@@ -192,16 +192,16 @@ defmodule Vagus.App.Controller.ScenarioTest do
       app = crash(sys, engine, @watched)
       assert verdict(app) == {false, true, false, :backing_off, :restarting}
       assert attempts(app) == 1
-      assert actions(sys, @watched) == @start ++ [:remove]
+      assert actions(sys, @watched) == @start ++ [:remove, :remove_token]
       assert container(engine, @watched) == nil
 
       app = advance(sys, @watched, 9_000)
       assert verdict(app) == {false, true, false, :backing_off, :restarting}
-      assert actions(sys, @watched) == @start ++ [:remove]
+      assert actions(sys, @watched) == @start ++ [:remove, :remove_token]
 
       app = advance(sys, @watched, 1_000)
       assert verdict(app) == @ready
-      assert actions(sys, @watched) == @start ++ [:remove] ++ @start
+      assert actions(sys, @watched) == @start ++ [:remove, :remove_token] ++ @start
       assert %{id: second, state: "running"} = container(engine, @watched)
       assert second != first
       assert attempts(app) == 1
@@ -242,7 +242,7 @@ defmodule Vagus.App.Controller.ScenarioTest do
       app = write(sys, @watched, [{:inc, [:restart_counter]}])
       assert verdict(app) == @ready
       assert attempts(app) == 0
-      assert actions(sys, @watched) == before ++ [:remove] ++ @start
+      assert actions(sys, @watched) == before ++ [:remove, :remove_token] ++ @start
     end)
   end
 
@@ -274,11 +274,11 @@ defmodule Vagus.App.Controller.ScenarioTest do
       app = wake(sys, @watched)
       assert verdict(app) == {false, true, false, :backing_off, :restarting}
       assert attempts(app) == 1
-      assert actions(sys, @watched) == @start ++ [:stop, :remove]
+      assert actions(sys, @watched) == @start ++ [:stop, :remove, :remove_token]
 
       app = advance(sys, @watched, 10_000)
       assert verdict(app) == @ready
-      assert actions(sys, @watched) == @start ++ [:stop, :remove] ++ @start
+      assert actions(sys, @watched) == @start ++ [:stop, :remove, :remove_token] ++ @start
       # The stop that followed was the controller's own: one attempt, not two.
       assert attempts(wake(sys, @watched)) == 1
     end)
@@ -295,7 +295,7 @@ defmodule Vagus.App.Controller.ScenarioTest do
       assert verdict(app) == @ready
       assert %{id: second} = container(engine, @watched)
       assert second != first
-      assert actions(sys, @watched) == @start ++ [:stop, :remove] ++ @start
+      assert actions(sys, @watched) == @start ++ [:stop, :remove, :remove_token] ++ @start
       app = wake(sys, @watched)
       assert attempts(app) == 0
       assert app.status.failure == nil
@@ -327,9 +327,49 @@ defmodule Vagus.App.Controller.ScenarioTest do
       assert app.status.instance.id == second
       assert attempts(app) == 0
       assert app.status.failure == nil
-      assert actions(sys, @watched) == @start ++ [:put_token]
+      assert actions(sys, @watched) == @start ++ [:remove_token, :put_token]
       assert AuthIndex.lookup("a-token-nobody-here-minted", sys.i) == {:ok, @watched}
       assert AuthIndex.lookup(old, sys.i) == :error
+    end)
+  end
+
+  test "a container put there without a token: the one before it has no token left either" do
+    world = AppWorld.new()
+    image = AppWorld.image(world, AppWorld.spec(world, @watched))
+
+    run(world, fn sys, engine ->
+      install(world, sys, @watched, watchdog())
+      old = token(engine, @watched)
+      assert AuthIndex.lookup(old, sys.i) == {:ok, @watched}
+
+      Model.delete_container(engine, "app_" <> @watched)
+      Model.put_container(engine, "app_" <> @watched, image: image, env: ["TZ=UTC"])
+
+      app = wake(sys, @watched)
+      assert verdict(app) == {false, false, true, :no_token, :failed}
+      assert actions(sys, @watched) == @start ++ [:remove_token]
+      assert AuthIndex.lookup(old, sys.i) == :error
+    end)
+  end
+
+  test "a container that is gone has no token left, and is a crash all the same" do
+    world = AppWorld.new()
+
+    run(world, fn sys, engine ->
+      install(world, sys, @watched, watchdog())
+      old = token(engine, @watched)
+
+      Model.delete_container(engine, "app_" <> @watched)
+
+      app = wake(sys, @watched)
+      assert verdict(app) == {false, true, false, :backing_off, :restarting}
+      assert attempts(app) == 1
+      assert app.status.instance == nil
+      assert actions(sys, @watched) == @start ++ [:remove_token]
+      assert AuthIndex.lookup(old, sys.i) == :error
+
+      assert verdict(advance(sys, @watched, 10_000)) == @ready
+      assert actions(sys, @watched) == @start ++ [:remove_token] ++ @start
     end)
   end
 
@@ -379,7 +419,7 @@ defmodule Vagus.App.Controller.ScenarioTest do
 
       app = advance(sys, @watched, 120_000)
       assert verdict(app) == {false, true, false, :backing_off, :restarting}
-      assert actions(sys, @watched) == @start ++ [:stop, :remove]
+      assert actions(sys, @watched) == @start ++ [:stop, :remove, :remove_token]
 
       :atomics.put(world.probe, 1, 0)
       assert verdict(advance(sys, @watched, 10_000)) == @ready
@@ -426,7 +466,7 @@ defmodule Vagus.App.Controller.ScenarioTest do
 
       app = write(sys, @plain, [{:inc, [:start_counter]}])
       assert verdict(app) == @ready
-      assert actions(sys, @plain) == @start ++ [:remove] ++ @start
+      assert actions(sys, @plain) == @start ++ [:remove, :remove_token] ++ @start
     end)
   end
 
@@ -448,7 +488,7 @@ defmodule Vagus.App.Controller.ScenarioTest do
       app = crash(sys, engine, @once, 3)
       assert verdict(app) == {false, false, true, :crashed, :failed}
       assert Controller.wire_state(app) == :error
-      assert actions(sys, @once) == @start ++ [:remove] ++ @start
+      assert actions(sys, @once) == @start ++ [:remove, :remove_token] ++ @start
     end)
   end
 
@@ -578,7 +618,7 @@ defmodule Vagus.App.Controller.ScenarioTest do
       assert verdict(app) == @ready
       assert %{id: started, state: "running"} = container(engine, @plain)
       assert started != refused
-      assert actions(sys, @plain) == @start ++ [:remove] ++ @start
+      assert actions(sys, @plain) == @start ++ [:remove, :remove_token] ++ @start
       assert app.status.failure == nil
     end)
   end
@@ -872,7 +912,7 @@ defmodule Vagus.App.Controller.ScenarioTest do
       assert verdict(app) == @ready
       assert attempts(app) == 0
       assert app.status.failure == nil
-      assert actions(sys, @watched) == @start ++ [:stop, :remove] ++ @start
+      assert actions(sys, @watched) == @start ++ [:stop, :remove, :remove_token] ++ @start
     end
 
     test "does not lose its gate opening meanwhile", %{world: world} do
@@ -1371,7 +1411,7 @@ defmodule Vagus.App.Controller.ScenarioTest do
       app = wake(sys, @watched)
       assert verdict(app) == {false, true, false, :backing_off, :restarting}
       assert attempts(app) == 1
-      assert actions(sys, @watched) == @start ++ [:remove]
+      assert actions(sys, @watched) == @start ++ [:remove, :remove_token]
       assert verdict(advance(sys, @watched, 10_000)) == @ready
     end
   end

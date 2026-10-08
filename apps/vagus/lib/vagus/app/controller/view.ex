@@ -216,9 +216,13 @@ defmodule Vagus.App.Controller.View do
       dispose?: v.deleting? or v.recreate? or (v.removes? and discarded?(v)),
       pull_waiting?: match?({:pulling, true}, o.pull),
       stale_pull: o.stale_pull,
+      # What the table holds for the app, apart from what the instance has
+      # to put there: a row that is another token's is nobody's, whether or
+      # not this instance has one of its own.
+      token: o.token,
       token_held?: o.token in [:current, :other],
-      token:
-        if(inst != nil and not inst.token? and o.token != :none, do: :none_to_put, else: o.token),
+      token_owed?: inst != nil and inst.token? and o.token == :absent,
+      no_token?: inst != nil and not inst.token? and o.token != :none,
       image_owed?: image_owed?(v, o),
       data?: o.data?,
       buildable?: v.native? or o.image != nil
@@ -253,19 +257,23 @@ defmodule Vagus.App.Controller.View do
     {spend, spent?} = spend(v.restarts, v.policy, v.now)
     loop = loop(v.engine, v.policy, v.now)
 
+    # An action that raised, whichever it was: asked for again it raises
+    # again. Not of an app being deleted, which nothing but its removal
+    # can move on, and whose spec no write will change.
+    raised? =
+      not v.deleting? and match?(%{class: :permanent, cause: :crashed}, base.failure) and
+        base.failure.action != :run
+
     %{
       succeeded?: st.succeeded == v.generation,
       failed?: base.failure != nil and base.failure.class == :permanent,
-      # An action that raised, whichever it was: asked for again it raises
-      # again. Not of an app being deleted, which nothing but its removal
-      # can move on, and whose spec no write will change.
-      raised?:
-        not v.deleting? and match?(%{class: :permanent, cause: :crashed}, base.failure) and
-          base.failure.action != :run,
+      raised?: raised?,
       # A running instance has its token in the table whatever became of
       # the app, the action that raised included. Unless that action was
       # the put: asked for again by every pass, it would raise in every one.
       put_raised?: match?(%{action: :put_token}, base.failure),
+      # The same of the removal of a row that is nobody's.
+      revoke_raised?: raised? and match?(%{action: :remove_token}, base.failure),
       retry_in: retry_in(base.failure, v.now),
       crash_loop?: v.running? and loop.looping?,
       loop_spent?: loop.spent? or o.image == nil,

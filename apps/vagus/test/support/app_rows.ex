@@ -654,11 +654,37 @@ defmodule Vagus.Test.AppRows do
        {:progressing, :indexing_token, :starting, :stopped},
        action(:put_token, %{instance: "c1"}),
        %{instance: seen(running?: false, since: nil, started_at: nil)}},
-      {"created, the table holding another instance's token: put this one's",
+      {"created, the table holding another instance's token: that one goes before this one's is put",
        app(@container, %{}, status: %{made_for: :this}),
        obs(instance: inst(:created), token: :other),
-       {:progressing, :indexing_token, :starting, :stopped},
-       action(:put_token, %{instance: "c1"}), %{}},
+       {:progressing, :revoking_token, :starting, :stopped}, action(:remove_token), %{}},
+      {"running with no token to put, the table holding another instance's: that one goes",
+       app(@container, %{}, status: running()),
+       obs(instance: inst(:running, token?: false), token: :other),
+       {:progressing, :revoking_token, :starting, :startup}, action(:remove_token),
+       %{instance: seen()}},
+      {"and with no row left, a running instance without a token is Failed",
+       app(@container, %{}, status: running()), obs(instance: inst(:running, token?: false)),
+       {:failed, :no_token, :failed, :error}, [], %{}},
+      {"Core's token not there, the table holding an earlier one: that goes before the wait",
+       core(%{}, status: running()),
+       obs(instance: inst(:running, token?: false), token: :other, image: nil),
+       {:progressing, :revoking_token, :starting, :startup}, action(:remove_token), %{}},
+      {"Failed for good with no instance, a token of the one before in the table: it goes",
+       app(@container, %{}, status: %{failure: failure(action: :create, cause: :invalid_config)}),
+       obs(token: :other), {:progressing, :revoking_token, :starting, :stopped},
+       action(:remove_token), %{failure: failure(action: :create, cause: :invalid_config)}},
+      {"an instance that is gone, its token in the table: the token goes, the instance is not judged",
+       watched(%{}, status: running()), obs(token: :other),
+       {:progressing, :revoking_token, :starting, :startup}, action(:remove_token),
+       %{instance: seen(), restarts: View.blank().restarts}},
+      {"and is judged by the pass after, from what was kept of it",
+       watched(%{}, status: running()), obs(), {:progressing, :crashed, :restarting, :stopped},
+       later(0), %{restarts: %{attempts: 1, last: now()}, instance: nil}},
+      {"an exit that was asked for stays asked for while the token of the instance that is gone goes",
+       watched(%{}, status: running(expected_exit: "c1")), obs(token: :other),
+       {:progressing, :revoking_token, :starting, :startup}, action(:remove_token),
+       %{instance: seen(), expected_exit: "c1"}},
       {"running, the table without its token: put back, the container untouched",
        app(@container, %{}, status: ready), obs(instance: inst()),
        {:progressing, :indexing_token, :starting, :startup},
@@ -843,6 +869,8 @@ defmodule Vagus.Test.AppRows do
           image_only_of_a_manifest_with_one: container? or o.image == nil,
           image_asked_after_only_when_it_decides: asked? or o.image_present?,
           no_token_only_without_one: profile.token() == :none == (o.token == :none),
+          current_only_of_an_instance_with_a_token:
+            o.token != :current or (there? and o.instance.token?),
           native_instance: not (native? and there?) or native?(o.instance),
           waits_only_before_its_instance: o.waiting_on == [] or not there?,
           answer_only_of_a_running_http_app:
@@ -881,6 +909,7 @@ defmodule Vagus.Test.AppRows do
   @clauses [
     :mismatch_deleted,
     :name_mismatch,
+    :revoke_stale_token,
     :restore_token_raised,
     :raised,
     :stop_leftover,
@@ -991,8 +1020,11 @@ defmodule Vagus.Test.AppRows do
       {:progressing, :cancelling_pull, :stopping, :cancel_pull} ->
         :cancel_pull
 
+      {:progressing, :revoking_token, :starting, :remove_token} ->
+        :revoke_stale_token
+
       {:progressing, :revoking_token, :stopping, :remove_token} ->
-        if(v.deleting?, do: :revoke_token_first, else: :revoke_token)
+        revoking(v)
 
       {:progressing, :stopping, :stopping, stop} when stop in [:stop, :stop_process] ->
         :stop
@@ -1112,6 +1144,8 @@ defmodule Vagus.Test.AppRows do
     launching? = clause in [:start_process, :create, :start]
     counted? = clause in [:remove_crashed, :unhealthy, :gone]
     given_up? = clause in [:crashed, :budget_spent, :crash_loop_spent, :pull_refused]
+    # The one pass that judges nothing of an instance that is gone.
+    kept? = clause == :revoke_stale_token and inst == nil
 
     for {rule, ok?} <- [
           every_key: Enum.sort(Map.keys(st)) == Enum.sort([:state | Map.keys(View.blank())]),
@@ -1124,11 +1158,12 @@ defmodule Vagus.Test.AppRows do
                       [:id, :address, :process, :running?, :since, :ready?] ++
                         [:restart_count, :started_at]
                     ),
-              else: st.instance == nil
+              else: st.instance == if(kept?, do: v.known)
             ),
-          since_only_while_it_runs: st.instance == nil or st.instance.since != nil == up?,
+          since_only_while_it_runs:
+            kept? or st.instance == nil or st.instance.since != nil == up?,
           ready_recorded_only_of_a_running_instance:
-            not match?(%{ready?: true}, st.instance) or up?,
+            kept? or not match?(%{ready?: true}, st.instance) or up?,
           ready_since_only_while_ready: match?(%Stamp{}, st.ready_since) == (clause == :ready),
           ready_instance: clause != :ready or match?(%{ready?: true}, st.instance),
           ready_forgets: clause != :ready or (st.failure == nil and st.pull == nil),
@@ -1138,7 +1173,12 @@ defmodule Vagus.Test.AppRows do
           restart_required_is_drift_under_a_running_instance:
             st.restart_required ==
               (up? and st.made_for != nil and st.made_for.fingerprint != v.target.fingerprint),
-          expected_exit_is_of_this_instance: st.expected_exit in [nil, id],
+          expected_exit_is_of_this_instance:
+            if(kept?,
+              do: st.expected_exit == v.st.expected_exit,
+              else: st.expected_exit in [nil, id]
+            ),
+          stale_row_only: clause != :revoke_stale_token or o.token == :other,
           recreate_is_of_this_instance: st.recreate in [nil, id],
           exit_expected_of_what_is_taken_away:
             not stopping? or (id != nil and st.expected_exit == id),
@@ -1203,6 +1243,10 @@ defmodule Vagus.Test.AppRows do
 
   # Every clause that reports Failed and no time to look again. One that
   # was Failed before the pass comes first among them in the decision.
+  defp revoking(%{token: :other}), do: :revoke_stale_token
+  defp revoking(%{deleting?: true}), do: :revoke_token_first
+  defp revoking(_v), do: :revoke_token
+
   defp restoring(%{raised?: true}), do: :restore_token_raised
   defp restoring(%{running?: true}), do: :restore_token
   defp restoring(_v), do: :put_token
@@ -1222,7 +1266,8 @@ defmodule Vagus.Test.AppRows do
   #
   # The neighbours that have no row here cannot both hold. One fact with one
   # value: a leftover that runs or is stopped; a pull that is in flight,
-  # refused, or paused; a token there is none of to put, or one to put. An
+  # refused, or paused; a token there is none of to put, or one to put; a
+  # row in the table that is another token's, or none. An
   # instance that runs and one that does not: stop and remove; the crash
   # loop and the run that succeeded; the instance gone and the unhealthy
   # one; unhealthy and waiting for the API; a start and a readiness
@@ -1252,16 +1297,18 @@ defmodule Vagus.Test.AppRows do
        obs(image_present?: false, pull: {:pulling, true}, stale_pull: "image:0"),
        {:progressing, :cancelling_pull, :pulling, :stopped},
        action(:cancel_pull, %{image: "image:0"}), %{pull: held.pull}},
-      {"order: deleting, the pull is cancelled before the token goes",
-       app(@container, %{}, deleting?: true),
-       obs(image_present?: false, pull: {:pulling, true}, token: :other),
-       {:progressing, :cancelling_pull, :stopping, :stopped},
+      {"order: deleting, the pull is cancelled before the token of the running instance goes",
+       app(@container, %{}, status: running(), deleting?: true),
+       obs(instance: inst(), token: :current, pull: {:pulling, true}),
+       {:progressing, :cancelling_pull, :stopping, :startup},
        action(:cancel_pull, %{image: "image:1"}), %{pull: nil}},
-      {"order: not to run, the pull is cancelled before a token left behind goes",
+      {"order: a token row that is nobody's goes before a leftover does", app(),
+       obs(leftover: :running, token: :other),
+       {:progressing, :revoking_token, :starting, :stopped}, action(:remove_token), %{}},
+      {"order: and before the pull of an app that is not to run is cancelled, a token left behind",
        app(@container, %{run: false}),
        obs(image_present?: false, pull: {:pulling, true}, token: :other),
-       {:progressing, :cancelling_pull, :stopping, :stopped},
-       action(:cancel_pull, %{image: "image:1"}), %{pull: nil}},
+       {:progressing, :revoking_token, :stopping, :stopped}, action(:remove_token), %{}},
       {"order: deleting, the container goes before the image and the data",
        app(@container, %{}, status: running(expected_exit: "c1"), deleting?: true),
        obs(instance: inst(:exited), data?: true), {:progressing, :removing, :stopping, :stopped},
@@ -1373,6 +1420,16 @@ defmodule Vagus.Test.AppRows do
       {"order: an app named otherwise than its slug has nothing put, raised action or not",
        %{app(@container, %{}, status: running(failure: gave_up.(:stop))) | name: "another"},
        obs(instance: inst()), {:failed, :name_mismatch, :failed, :error}, [], %{}},
+      {"order: nor is a token row that is nobody's taken from it", %{app() | name: "another"},
+       obs(token: :other), {:failed, :name_mismatch, :failed, :error}, [], %{}},
+      {"order: a token row that is nobody's goes before an app whose action raised is left Failed",
+       app(@container, %{}, status: %{made_for: :this, failure: gave_up.(:start)}),
+       obs(instance: inst(:created), token: :other),
+       {:progressing, :revoking_token, :starting, :stopped}, action(:remove_token),
+       %{failure: gave_up.(:start)}},
+      {"the removal of such a row that raised is not asked for again", app(),
+       obs(token: :other, failed_action: failed(:remove_token, crash)),
+       {:failed, :crashed, :failed, :error}, [], %{failure: gave_up.(:remove_token)}},
       {"a gate opened for the spec before a write that kept the instance is closed",
        gated(app(@container, %{}, status: running()), "c1", true, 2),
        obs(instance: inst(), token: :current, gates: [:dns_ready]),

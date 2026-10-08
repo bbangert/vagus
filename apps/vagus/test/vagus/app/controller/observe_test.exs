@@ -102,7 +102,7 @@ defmodule Vagus.App.Controller.ObserveTest do
 
       :ok = AuthIndex.put(@plain, "another", ctx.sys.i)
       assert %{token: :other} = o = observe(ctx, app)
-      assert_decided(app, o, :put_token)
+      assert_decided(app, o, :revoke_stale_token)
 
       :ok = AuthIndex.put(@plain, @token, ctx.sys.i)
       assert %{token: :current} = o = observe(ctx, app)
@@ -114,6 +114,11 @@ defmodule Vagus.App.Controller.ObserveTest do
       Model.put_container(ctx.engine, "app_" <> @plain, state: "created", env: ["TZ=UTC"])
       assert %{instance: %{token?: false}, token: :absent} = o = observe(ctx, app)
       assert_decided(app, o, :no_token)
+
+      # A row of an instance before it is seen as one, with nothing to put.
+      :ok = AuthIndex.put(@plain, @token, ctx.sys.i)
+      assert %{instance: %{token?: false}, token: :other} = o = observe(ctx, app)
+      assert_decided(app, o, :revoke_stale_token)
     end
 
     for {health, clause} <- [
@@ -470,7 +475,14 @@ defmodule Vagus.App.Controller.ObserveTest do
 
       # A container that is not Core's own to authenticate: no Supervisor
       # token to give it yet.
-      assert %{instance: %{token?: false}} =
+      assert %{instance: %{token?: false}, token: :other} =
+               o = observe(ctx, core, %{supervisor_token: fn -> nil end})
+
+      assert_decided(core, o, :revoke_stale_token)
+
+      :ok = AuthIndex.remove(@core, ctx.sys.i)
+
+      assert %{instance: %{token?: false}, token: :absent} =
                o = observe(ctx, core, %{supervisor_token: fn -> nil end})
 
       assert_decided(core, o, :await_token)

@@ -61,10 +61,10 @@ defmodule Vagus.Resource.Controller do
   `action_class/1` run in the pass's task, where one that
   raises or exits costs its resource that pass and nothing beyond it. One
   that never returns also keeps one of the passes its runtime may have in
-  flight, so every call a callback makes needs a timeout. `validate/1` and
-  the codec hooks run in the store, on each write to the kind: what they
-  raise refuses the write, and they must not block, since every write
-  waits behind them.
+  flight, so every call a callback makes needs a timeout. `validate/1` or
+  `validate/2` and the codec hooks run in the store, on each write to the
+  kind: what they raise refuses the write, and they must not block, since
+  every write waits behind them.
 
   ## What `observe/2` cannot reach
 
@@ -133,6 +133,17 @@ defmodule Vagus.Resource.Controller do
   @callback validate(spec :: map()) :: {:ok, map()} | {:error, term()}
 
   @doc """
+  Admission that reads what the controller is wired with. `context` is the
+  `:context` its runtime is started with, the shared one with the
+  controller's own over it and nothing a pass adds. A kind admitted by
+  something its passes read as well, which machine this is, say, reads it
+  from there in both places: given to each separately, the two could be
+  given different answers, and a spec made for the one be refused by the
+  other. Taken in place of `validate/1` by a controller that has both.
+  """
+  @callback validate(spec :: map(), context :: map()) :: {:ok, map()} | {:error, term()}
+
+  @doc """
   Other resources whose changes concern this one. A change to one of them
   runs a pass for this resource, and for no other.
   """
@@ -167,6 +178,7 @@ defmodule Vagus.Resource.Controller do
   @callback decode_progress(term()) :: map()
 
   @optional_callbacks validate: 1,
+                      validate: 2,
                       references: 1,
                       retention: 0,
                       owned_conditions: 0,
@@ -292,14 +304,17 @@ defmodule Vagus.Resource.Controller do
   @doc """
   The kinds the store is started with, one per owning controller, each with
   its owner, the writer of every condition type and the finalizers of every
-  controller on it. Takes controllers or their declarations.
+  controller on it. Takes controllers or their declarations, and
+  `contexts`, the context each controller's runtime is started with, for an
+  owner whose admission is `c:validate/2`.
 
   Raises, naming the controllers, on a list that cannot run: two owners of
   one kind, a controller attached to a kind nobody owns, or one condition
   type or one finalizer declared by two controllers of a kind.
   """
-  @spec kinds([module() | declaration()]) :: %{Resource.kind() => Kind.t()}
-  def kinds(controllers) do
+  @spec kinds([module() | declaration()], %{optional(module()) => map()}) ::
+          %{Resource.kind() => Kind.t()}
+  def kinds(controllers, contexts \\ %{}) do
     {owners, attached} =
       controllers
       |> Enum.uniq()
@@ -330,7 +345,7 @@ defmodule Vagus.Resource.Controller do
       {kind,
        Kind.new(
          [
-           validators: if(exports?(owner, :validate, 1), do: [&owner.validate/1], else: []),
+           validators: validators(owner, Map.get(contexts, owner, %{})),
            finalizers: finalizers,
            writer_entries: declaration.writer_entries,
            owner: owner,
@@ -343,6 +358,14 @@ defmodule Vagus.Resource.Controller do
            )
        )}
     end)
+  end
+
+  defp validators(owner, context) do
+    cond do
+      exports?(owner, :validate, 2) -> [&owner.validate(&1, context)]
+      exports?(owner, :validate, 1) -> [&owner.validate/1]
+      true -> []
+    end
   end
 
   # A resource holds a finalizer once. Shared, the first controller to finish

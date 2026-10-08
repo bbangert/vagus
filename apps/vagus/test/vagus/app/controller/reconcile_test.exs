@@ -635,11 +635,13 @@ defmodule Vagus.App.Controller.ReconcileTest do
                    ]),
                  else: :idle
                ),
+             # The table has the instance's token only of an instance with one.
              token:
-               if(kind == :native,
-                 do: :none,
-                 else: of([{5, :current}, {3, :absent}, {2, :other}])
-               ),
+               cond do
+                 kind == :native -> :none
+                 there? and instance.token? -> of([{5, :current}, {3, :absent}, {2, :other}])
+                 true -> of([{3, :absent}, {2, :other}])
+               end,
              waiting_on: if(there?, do: [], else: of([{5, []}, {1, ["core_mosquitto"]}])),
              gates: of([{5, []}, {1, [:dns_ready]}]),
              ready:
@@ -796,6 +798,12 @@ defmodule Vagus.App.Controller.ReconcileTest do
           end
 
           if failed?(verdict), do: assert(action == nil)
+
+          # A row that is not the instance's token resolves to the app for
+          # whoever holds that token: no pass that sees one leaves it. But
+          # for an app nothing is done to, and a removal that raised.
+          if o.token == :other and not v.mismatch? and not v.revoke_raised?,
+            do: assert(action == :remove_token)
 
           healthy? =
             wanted? and inst != nil and inst.state == :running and

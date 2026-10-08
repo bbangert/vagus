@@ -24,7 +24,8 @@ defmodule Vagus.App.Controller do
 
   What the runtime's `:context` has to carry (`Vagus.App.wiring/1`):
 
-    * `:facts`, a `Vagus.App.Facts`
+    * `:facts`, a `Vagus.App.Facts`, which admission in the store reads
+      as well
     * `:backends`, `%{backend_module => options}`
     * `:gates`, the condition types of other controllers that must be true,
       naming the instance, before the app is Ready (default none)
@@ -38,7 +39,8 @@ defmodule Vagus.App.Controller do
     * `:api_ready`, `(-> boolean)`: whether the API an app calls as it
       starts is accepting. No instance is created or started while it
       is not (default: always)
-    * `:prepare`, options for `Vagus.App.Prepare.run/3`
+    * `:prepare`, options for `Vagus.App.Prepare.run/3`. Its `:engine` is
+      the container backend's unless given
     * `:observe_timeout`, milliseconds
 
   ## Lanes
@@ -59,7 +61,7 @@ defmodule Vagus.App.Controller do
 
   @behaviour Vagus.Resource.Controller
 
-  alias Vagus.App.{AuthIndex, Backend, Container, Facts, Prepare, Profile, Pulls, Token}
+  alias Vagus.App.{AuthIndex, Backend, Container, Prepare, Profile, Pulls, Token}
   alias Vagus.App.Controller.{Observe, Reconcile}
   alias Vagus.App.Spec.Schema
   alias Vagus.Resource
@@ -87,8 +89,10 @@ defmodule Vagus.App.Controller do
   @impl true
   def writer_entries, do: Schema.writer_entries()
 
+  # By the facts the passes read: a spec made for the machine this
+  # controller is wired for is admitted by its store, and no other is.
   @impl true
-  def validate(spec), do: Schema.validate(spec, Facts.read())
+  def validate(spec, context), do: Schema.validate(spec, Map.fetch!(context, :facts))
 
   @impl true
   def encode_spec(spec), do: Schema.encode_spec(spec)
@@ -208,8 +212,17 @@ defmodule Vagus.App.Controller do
     call.(Observe.leftover_name(app), opts)
   end
 
-  defp prepare(spec, context),
-    do: Prepare.run(spec, context.facts, Map.get(context, :prepare, []))
+  # On the engine the container is made on: the backend's options name it.
+  defp prepare(spec, context) do
+    {_backend, opts} = Observe.backend(Profile.of(spec), context)
+    engine = Keyword.get(opts, :engine, [])
+
+    Prepare.run(
+      spec,
+      context.facts,
+      Keyword.put_new(Map.get(context, :prepare, []), :engine, engine)
+    )
+  end
 
   # A config this build cannot make is refused before the engine is asked,
   # and will be refused again.
