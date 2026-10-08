@@ -44,7 +44,6 @@ defmodule Vagus.API.PermissionMatrixTest do
 
   import Vagus.AppFixtures
 
-  alias Vagus.Addon.Config
   alias Vagus.API.Dispatcher
 
   @fixture_path Path.join([
@@ -177,20 +176,6 @@ defmodule Vagus.API.PermissionMatrixTest do
       # never suppressed.
       _error -> 500
     end
-  end
-
-  defp app_config(slug) do
-    {:ok, config} =
-      Config.parse(%{
-        "name" => "Test App",
-        "version" => "1",
-        "slug" => slug,
-        "description" => "d",
-        "arch" => ["amd64"],
-        "image" => "x/y"
-      })
-
-    config
   end
 
   defp split_query(path) do

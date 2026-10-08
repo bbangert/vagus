@@ -204,6 +204,8 @@ defmodule Vagus.API.IngressProxy do
     end
   end
 
+  # The seam answers `{:ok, {ip, port, stream?}}` or `{:error, reason}`:
+  # address and streaming mode in one call, so a request costs one lookup.
   defp resolve_target(slug) do
     fun = Application.get_env(:vagus, :ingress_target_fun, &Vagus.App.ingress_target/1)
     fun.(slug)

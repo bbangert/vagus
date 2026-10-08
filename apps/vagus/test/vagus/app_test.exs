@@ -2,7 +2,9 @@ defmodule Vagus.AppTest do
   # Seeds the global `Vagus.Addon.State` and briefly stops the global Registry.
   use ExUnit.Case, async: false
 
-  alias Vagus.Addon.{Backend, Config, Registry, State}
+  import Vagus.AppFixtures
+
+  alias Vagus.Addon.{Backend, Config, Registry}
   alias Vagus.App
 
   defp config(overrides \\ %{}) do
@@ -24,43 +26,40 @@ defmodule Vagus.AppTest do
     config
   end
 
-  defp track(config) do
-    :ok = State.put(config, :stopped)
-    on_exit(fn -> State.delete(config.slug) end)
-    config.slug
-  end
+  defp track(config, opts \\ []), do: install_app(config, opts).slug
 
   describe "set/2" do
     test "writes options and settings" do
       slug = track(config())
 
       assert :ok = App.set(slug, options: %{"a" => 1}, watchdog: true)
-      assert {:ok, %{user_options: %{"a" => 1}, watchdog: true}} = State.get(slug)
+      assert {:ok, %{user_options: %{"a" => 1}, watchdog: true}} = app_info(slug)
     end
 
     test "an unknown key raises before anything is written" do
       slug = track(config())
 
       assert_raise ArgumentError, fn -> App.set(slug, watchdog: true, bogus: 1) end
-      assert {:ok, %{watchdog: false}} = State.get(slug)
+      assert {:ok, %{watchdog: false}} = app_info(slug)
     end
 
     test "an untracked slug is :error" do
       assert :error = App.set("app_test_untracked", boot: "manual")
     end
+
+    test "an untracked slug is :error even with nothing to write" do
+      assert :error = App.set("app_test_untracked", [])
+    end
   end
 
   describe "identity_for_token/1" do
     setup do
-      token = "app-test-#{System.unique_integer([:positive])}"
-      identity = Registry.identity_from_config(config())
-      :ok = Registry.register(token, identity)
-      on_exit(fn -> Registry.unregister_slug(identity.slug) end)
-      %{token: token, identity: identity}
+      config = config()
+      %{token: register_app_token(config), slug: config.slug}
     end
 
-    test "resolves a registered token", %{token: token, identity: identity} do
-      assert {:ok, ^identity} = App.identity_for_token(token)
+    test "resolves a registered token", %{token: token, slug: slug} do
+      assert {:ok, %{slug: ^slug}} = App.identity_for_token(token)
       assert :error = App.identity_for_token("app-test-unknown")
     end
 
@@ -86,17 +85,17 @@ defmodule Vagus.AppTest do
 
     test "records the app as :stopped" do
       config = config()
-      on_exit(fn -> State.delete(config.slug) end)
+      on_exit(fn -> forget_app(config.slug) end)
 
       assert :ok = App.install(config)
-      assert {:ok, %{state: :stopped}} = State.get(config.slug)
+      assert {:ok, %{state: :stopped}} = app_info(config.slug)
     end
 
     test "a refused install records nothing" do
       config = %{config() | slug: "vagus"}
 
       assert {:error, {:reserved_slug, "vagus"}} = App.install(config)
-      assert :error = State.get("vagus")
+      assert :error = app_info("vagus")
     end
   end
 
@@ -115,8 +114,7 @@ defmodule Vagus.AppTest do
     end
 
     test "the allocated port wins over the 0 sentinel", %{port: port} do
-      slug = track(config(%{"ingress" => true, "ingress_port" => 0}))
-      :ok = State.put_setting(slug, :ingress_port, port)
+      slug = track(config(%{"ingress" => true, "ingress_port" => 0}), ingress_port: port)
 
       assert {:ok, {"127.0.0.1", ^port, false}} = App.ingress_target(slug)
     end

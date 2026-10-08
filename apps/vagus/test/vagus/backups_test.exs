@@ -177,7 +177,7 @@ defmodule Vagus.BackupsTest do
       server: server
     } do
       slug = "core_restore"
-      config = install(slug, dr, :started, %{"greet" => "hi"})
+      install(slug, dr, :started, %{"greet" => "hi"})
       dd = data_dir(dr, slug)
       File.write!(Path.join(dd, "keep.txt"), "original")
 
@@ -191,7 +191,7 @@ defmodule Vagus.BackupsTest do
       # Drift after the backup was taken.
       File.write!(Path.join(dd, "keep.txt"), "mutated")
       File.write!(Path.join(dd, "extra.txt"), "should be gone")
-      install_app(config, state: :started, options: %{"greet" => "bye"})
+      set_app(slug, options: %{"greet" => "bye"})
 
       :ok = @backend.reset_calls()
 
@@ -221,14 +221,14 @@ defmodule Vagus.BackupsTest do
       server: server
     } do
       slug = "core_restore_protected"
-      config = install(slug, dr, :stopped, %{"greet" => "hi"})
+      install(slug, dr, :stopped, %{"greet" => "hi"})
       File.write!(Path.join(data_dir(dr, slug), "f.txt"), "x")
 
       {:ok, backup_slug} = Backups.create_partial(nil, [slug], server: server, data_root: dr)
 
       # Turned off AFTER the backup was taken — the restore must not roll it
       # back to the protected default the tar knows nothing about.
-      install_app(config, protected: false)
+      set_app(slug, protected: false)
 
       assert :ok =
                Backups.restore_partial(backup_slug, [slug],

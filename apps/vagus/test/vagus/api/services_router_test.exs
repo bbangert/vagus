@@ -5,23 +5,7 @@ defmodule Vagus.API.ServicesRouterTest do
 
   import Vagus.AppFixtures
 
-  alias Vagus.Addon.Config
-
   @opts Vagus.API.Router.init([])
-
-  defp app_config(slug) do
-    {:ok, config} =
-      Config.parse(%{
-        "name" => "Test App",
-        "version" => "1",
-        "slug" => slug,
-        "description" => "d",
-        "arch" => ["amd64"],
-        "image" => "x/y"
-      })
-
-    config
-  end
 
   # Register a running add-on with the given grants; return its token.
   defp addon_token(slug, services_role) do

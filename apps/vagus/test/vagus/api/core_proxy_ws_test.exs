@@ -437,7 +437,6 @@ defmodule Vagus.API.CoreProxyWSTest do
 
   import Vagus.AppFixtures
 
-  alias Vagus.Addon.Config
   alias Vagus.API.CoreProxy.WSBridge
   alias Vagus.API.CoreProxyWSTest.{Client, CoreAuthScript, DialCounter, FakeCore}
   alias Vagus.API.{Dispatcher, Token}
@@ -525,20 +524,6 @@ defmodule Vagus.API.CoreProxyWSTest do
   defp listening_port(bandit_pid) do
     {:ok, {_address, port}} = ThousandIsland.listener_info(bandit_pid)
     port
-  end
-
-  defp app_config(slug) do
-    {:ok, config} =
-      Config.parse(%{
-        "name" => "Test App",
-        "version" => "1",
-        "slug" => slug,
-        "description" => "d",
-        "arch" => ["amd64"],
-        "image" => "x/y"
-      })
-
-    config
   end
 
   defp addon_token(slug, grants \\ %{}),

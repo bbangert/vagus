@@ -15,8 +15,6 @@ defmodule Vagus.API.DiscoveryRouterTest do
 
   import Vagus.AppFixtures
 
-  alias Vagus.Addon.Config
-
   @opts Vagus.API.Router.init([])
 
   setup do
@@ -38,20 +36,6 @@ defmodule Vagus.API.DiscoveryRouterTest do
     end)
 
     :ok
-  end
-
-  defp app_config(slug) do
-    {:ok, config} =
-      Config.parse(%{
-        "name" => "Test App",
-        "version" => "1",
-        "slug" => slug,
-        "description" => "d",
-        "arch" => ["amd64"],
-        "image" => "x/y"
-      })
-
-    config
   end
 
   # Register a running add-on that declares `discovery`; return its token.

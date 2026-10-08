@@ -24,19 +24,6 @@ defmodule Vagus.API.AddonInfoRouterTest do
     %{config: c}
   end
 
-  defp app_config(slug) do
-    {:ok, config} =
-      Config.parse(%{
-        "name" => slug,
-        "version" => "1",
-        "slug" => slug,
-        "description" => "d",
-        "arch" => ["aarch64"]
-      })
-
-    config
-  end
-
   defp addon_token(slug, grants \\ %{}),
     do:
       register_app_token(app_config(slug),

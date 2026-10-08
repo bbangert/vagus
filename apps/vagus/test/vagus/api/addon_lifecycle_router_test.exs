@@ -342,8 +342,8 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
       assert info["network"] == %{"22/tcp" => 2222, "80/tcp" => 8080}
     end
 
-    test "network: null resets to the config's declared defaults", %{config: config} do
-      install_app(config, ports: %{"22/tcp" => 2222})
+    test "network: null resets to the config's declared defaults" do
+      set_app("core_netopts", ports: %{"22/tcp" => 2222})
 
       conn = supervisor_call(:post, "/addons/core_netopts/options", %{"network" => nil})
 
@@ -528,8 +528,8 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
       assert {:ok, %{user_options: %{}}} = app_info("core_opts")
     end
 
-    test "options: null resets to no user options", %{config: config} do
-      install_app(config, options: %{"greeting" => "hey"})
+    test "options: null resets to no user options" do
+      set_app("core_opts", options: %{"greeting" => "hey"})
       conn = supervisor_call(:post, "/addons/core_opts/options", %{"options" => nil})
       assert conn.status == 200
       assert {:ok, %{user_options: %{}}} = app_info("core_opts")
@@ -558,10 +558,8 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
       assert info["boot"] == "manual"
     end
 
-    test "boot: auto is persisted and read back, overriding a previously-saved manual", %{
-      config: config
-    } do
-      install_app(config, boot: "manual")
+    test "boot: auto is persisted and read back, overriding a previously-saved manual" do
+      set_app("core_opts", boot: "manual")
 
       conn = supervisor_call(:post, "/addons/core_opts/options", %{"boot" => "auto"})
       assert conn.status == 200
@@ -622,8 +620,8 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
       assert info["auto_update"] == true
     end
 
-    test "auto_update: false is persisted", %{config: config} do
-      install_app(config, auto_update: true)
+    test "auto_update: false is persisted" do
+      set_app("core_opts", auto_update: true)
       conn = supervisor_call(:post, "/addons/core_opts/options", %{"auto_update" => false})
       assert conn.status == 200
       assert {:ok, %{auto_update: false}} = app_info("core_opts")
@@ -672,8 +670,8 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
       assert {:ok, %{watchdog: true}} = app_info("core_opts")
     end
 
-    test "watchdog: false is persisted", %{config: config} do
-      install_app(config, watchdog: true)
+    test "watchdog: false is persisted" do
+      set_app("core_opts", watchdog: true)
       conn = supervisor_call(:post, "/addons/core_opts/options", %{"watchdog" => false})
       assert conn.status == 200
       assert {:ok, %{watchdog: false}} = app_info("core_opts")
@@ -744,8 +742,8 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
       assert {:ok, %{protected: false}} = app_info("core_sec")
     end
 
-    test "protected: true puts it back", %{config: config} do
-      install_app(config, protected: false)
+    test "protected: true puts it back" do
+      set_app("core_sec", protected: false)
 
       assert supervisor_call(:post, "/addons/core_sec/security", %{"protected" => true}).status ==
                200
@@ -761,10 +759,8 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
       assert info["protected"] == false
     end
 
-    test "a body without the key is a 200 no-op (SCHEMA_SECURITY marks it optional)", %{
-      config: config
-    } do
-      install_app(config, protected: false)
+    test "a body without the key is a 200 no-op (SCHEMA_SECURITY marks it optional)" do
+      set_app("core_sec", protected: false)
       conn = supervisor_call(:post, "/addons/core_sec/security", %{"unrelated" => 1})
       assert conn.status == 200
       assert {:ok, %{protected: false}} = app_info("core_sec")
@@ -845,8 +841,8 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
     test "an installed add-on still gets the installed shape, not the store's" do
       config = fixture_config("realinstall")
       seed_store("core_realinstall", config)
-      assert supervisor_call(:post, "/store/addons/core_realinstall/install").status == 200
       on_exit(fn -> forget_app("core_realinstall") end)
+      assert supervisor_call(:post, "/store/addons/core_realinstall/install").status == 200
 
       info = json(supervisor_call(:get, "/addons/core_realinstall/info"))["data"]
       assert info["state"] == "stopped"
@@ -870,8 +866,8 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
       installed = fixture_config("verbump")
       seed_store("core_verbump", installed)
 
-      conn = supervisor_call(:post, "/store/addons/core_verbump/install")
       on_exit(fn -> forget_app("core_verbump") end)
+      conn = supervisor_call(:post, "/store/addons/core_verbump/install")
       assert conn.status == 200
 
       # Installed and store agree: nothing to update.
@@ -907,8 +903,8 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
     test "an add-on detached from the store reports no update, not an error" do
       installed = fixture_config("detached")
       seed_store("core_detached", installed)
-      assert supervisor_call(:post, "/store/addons/core_detached/install").status == 200
       on_exit(fn -> forget_app("core_detached") end)
+      assert supervisor_call(:post, "/store/addons/core_detached/install").status == 200
 
       # First move the store ahead, so the "no update" below can only be
       # caused by detachment — not by the store happening to match.
@@ -938,8 +934,8 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
       # this fails; the hand-driven `State` tests would not notice.
       installed = fixture_config("lifecycleversion")
       seed_store("core_lifecycleversion", installed)
-      assert supervisor_call(:post, "/store/addons/core_lifecycleversion/install").status == 200
       on_exit(fn -> forget_app("core_lifecycleversion") end)
+      assert supervisor_call(:post, "/store/addons/core_lifecycleversion/install").status == 200
 
       seed_store("core_lifecycleversion", %{installed | version: "9.9.9"})
 
@@ -982,8 +978,8 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
     test "updates an installed add-on and reports the new version on the wire" do
       installed = fixture_config("updrt")
       seed_store("core_updrt", installed)
-      assert supervisor_call(:post, "/store/addons/core_updrt/install").status == 200
       on_exit(fn -> forget_app("core_updrt") end)
+      assert supervisor_call(:post, "/store/addons/core_updrt/install").status == 200
 
       seed_store("core_updrt", %{installed | version: "9.9.9"})
 
@@ -1004,8 +1000,8 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
           ] do
         installed = fixture_config(slug)
         seed_store(slug, installed)
-        assert supervisor_call(:post, "/store/addons/#{slug}/install").status == 200
         on_exit(fn -> forget_app(slug) end)
+        assert supervisor_call(:post, "/store/addons/#{slug}/install").status == 200
         seed_store(slug, %{installed | version: "9.9.9"})
 
         # Upstream registers `/update/{version}` and never reads the segment —
@@ -1023,8 +1019,8 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
     test "background: true returns {job_id} and the update completes in a task" do
       installed = fixture_config("updbg")
       seed_store("core_updbg", installed)
-      assert supervisor_call(:post, "/store/addons/core_updbg/install").status == 200
       on_exit(fn -> forget_app("core_updbg") end)
+      assert supervisor_call(:post, "/store/addons/core_updbg/install").status == 200
       seed_store("core_updbg", %{installed | version: "9.9.9"})
 
       conn = supervisor_call(:post, "/store/addons/core_updbg/update", %{"background" => true})
@@ -1052,8 +1048,8 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
     test "background: true at the task-supervisor cap is a 429, job finished with an error" do
       installed = fixture_config("updbgcap")
       seed_store("core_updbgcap", installed)
-      assert supervisor_call(:post, "/store/addons/core_updbgcap/install").status == 200
       on_exit(fn -> forget_app("core_updbgcap") end)
+      assert supervisor_call(:post, "/store/addons/core_updbgcap/install").status == 200
       seed_store("core_updbgcap", %{installed | version: "9.9.9"})
 
       # Saturate Vagus.Jobs.TaskSupervisor (max_children: 8) with parked
@@ -1105,8 +1101,8 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
     test "background: false and an absent body both proceed synchronously" do
       installed = fixture_config("updbgfalse")
       seed_store("core_updbgfalse", installed)
-      assert supervisor_call(:post, "/store/addons/core_updbgfalse/install").status == 200
       on_exit(fn -> forget_app("core_updbgfalse") end)
+      assert supervisor_call(:post, "/store/addons/core_updbgfalse/install").status == 200
       seed_store("core_updbgfalse", %{installed | version: "9.9.9"})
 
       conn =
@@ -1118,8 +1114,8 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
     test "a sync update is wrapped in a job too, done when the response lands" do
       installed = fixture_config("updsyncjob")
       seed_store("core_updsyncjob", installed)
-      assert supervisor_call(:post, "/store/addons/core_updsyncjob/install").status == 200
       on_exit(fn -> forget_app("core_updsyncjob") end)
+      assert supervisor_call(:post, "/store/addons/core_updsyncjob/install").status == 200
       seed_store("core_updsyncjob", %{installed | version: "9.9.9"})
 
       assert supervisor_call(:post, "/store/addons/core_updsyncjob/update", %{}).status == 200
@@ -1140,8 +1136,8 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
 
     test "a failed update finishes its job with an honest error entry" do
       seed_store("core_updjobfail", fixture_config("updjobfail"))
-      assert supervisor_call(:post, "/store/addons/core_updjobfail/install").status == 200
       on_exit(fn -> forget_app("core_updjobfail") end)
+      assert supervisor_call(:post, "/store/addons/core_updjobfail/install").status == 200
       # No store version bump: the update 400s with "No update available".
 
       conn = supervisor_call(:post, "/store/addons/core_updjobfail/update", %{})
@@ -1164,8 +1160,8 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
     test "unknown body keys are ignored (aiohttp tolerance)" do
       installed = fixture_config("updunknown")
       seed_store("core_updunknown", installed)
-      assert supervisor_call(:post, "/store/addons/core_updunknown/install").status == 200
       on_exit(fn -> forget_app("core_updunknown") end)
+      assert supervisor_call(:post, "/store/addons/core_updunknown/install").status == 200
       seed_store("core_updunknown", %{installed | version: "9.9.9"})
 
       conn =
@@ -1177,8 +1173,8 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
     test "an add-on with no update available is a 400, not a silent success" do
       installed = fixture_config("updsame")
       seed_store("core_updsame", installed)
-      assert supervisor_call(:post, "/store/addons/core_updsame/install").status == 200
       on_exit(fn -> forget_app("core_updsame") end)
+      assert supervisor_call(:post, "/store/addons/core_updsame/install").status == 200
 
       conn = supervisor_call(:post, "/store/addons/core_updsame/update", %{})
 
@@ -1198,8 +1194,8 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
     test "a detached add-on is 404, naming the store rather than the install" do
       installed = fixture_config("upddetached")
       seed_store("core_upddetached", installed)
-      assert supervisor_call(:post, "/store/addons/core_upddetached/install").status == 200
       on_exit(fn -> forget_app("core_upddetached") end)
+      assert supervisor_call(:post, "/store/addons/core_upddetached/install").status == 200
       :ok = GenServer.call(Store, {:put_catalog, Map.delete(Store.catalog(), "core_upddetached")})
 
       conn = supervisor_call(:post, "/store/addons/core_upddetached/update", %{})

@@ -548,12 +548,10 @@ defmodule Vagus.API.BackupRouterTest do
     end
 
     test "options that still validate are restored", %{data_root: dr} do
-      config =
-        install_with_schema("core_sch_ok", dr, %{"greeting" => "str"}, %{"greeting" => "hi"})
-
+      install_with_schema("core_sch_ok", dr, %{"greeting" => "str"}, %{"greeting" => "hi"})
       slug = create_backup("core_sch_ok")
 
-      install_app(config, options: %{"greeting" => "changed"})
+      set_app("core_sch_ok", options: %{"greeting" => "changed"})
 
       conn =
         supervisor_call(:post, "/backups/#{slug}/restore/partial", %{"addons" => ["core_sch_ok"]})

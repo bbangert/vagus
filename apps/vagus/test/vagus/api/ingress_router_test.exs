@@ -28,19 +28,6 @@ defmodule Vagus.API.IngressRouterTest do
   # (`hassio_api: false`); pass `%{hassio_api: true, hassio_role: "admin"}` to
   # exercise a caller that clears `Vagus.API.Tiers`' gate and reaches the
   # handler's own guard.
-  defp app_config(slug) do
-    {:ok, config} =
-      Config.parse(%{
-        "name" => slug,
-        "version" => "1",
-        "slug" => slug,
-        "description" => "d",
-        "arch" => ["aarch64"]
-      })
-
-    config
-  end
-
   defp addon_token(slug, grants \\ %{}),
     do: register_app_token(app_config(slug), identity: grants)
 

@@ -63,7 +63,6 @@ defmodule Vagus.API.CoreLifecycleRouterTest do
 
   import Vagus.AppFixtures
 
-  alias Vagus.Addon.Config
   alias Vagus.API.CoreLifecycleRouterTest.{StubConfigCheck, StubLifecycle}
   alias Vagus.API.{Router, Token}
   alias Vagus.Core.{HttpConfig, Versions}
@@ -136,20 +135,6 @@ defmodule Vagus.API.CoreLifecycleRouterTest do
   # token resolves `conn.assigns.caller` to `{:addon, %{slug: ...}}` via the
   # `x-supervisor-token` header, instead of the `Authorization: Bearer`
   # supervisor token `authed/1` uses above.
-  defp app_config(slug) do
-    {:ok, config} =
-      Config.parse(%{
-        "name" => "Test App",
-        "version" => "1",
-        "slug" => slug,
-        "description" => "d",
-        "arch" => ["amd64"],
-        "image" => "x/y"
-      })
-
-    config
-  end
-
   defp addon_call(path) do
     token = register_app_token(app_config("core_forbidden_addon"))
 

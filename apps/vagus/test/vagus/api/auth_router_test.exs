@@ -5,8 +5,6 @@ defmodule Vagus.API.AuthRouterTest do
 
   import Vagus.AppFixtures
 
-  alias Vagus.Addon.Config
-
   @opts Vagus.API.Router.init([])
 
   # A stub Core client: the router's `Vagus.Auth.check_login/3` runs
@@ -28,20 +26,6 @@ defmodule Vagus.API.AuthRouterTest do
     Vagus.Auth.reset_cache()
     on_exit(fn -> Application.delete_env(:vagus, :core_client) end)
     :ok
-  end
-
-  defp app_config(slug) do
-    {:ok, config} =
-      Config.parse(%{
-        "name" => "Test App",
-        "version" => "1",
-        "slug" => slug,
-        "description" => "d",
-        "arch" => ["amd64"],
-        "image" => "x/y"
-      })
-
-    config
   end
 
   defp addon_token(slug, auth_api, grants \\ %{}) do

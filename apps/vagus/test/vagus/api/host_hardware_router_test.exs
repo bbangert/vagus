@@ -13,7 +13,6 @@ defmodule Vagus.API.HostHardwareRouterTest do
 
   import Vagus.AppFixtures
 
-  alias Vagus.Addon.Config
   alias Vagus.API.{Router, Token}
 
   @opts Router.init([])
@@ -22,20 +21,6 @@ defmodule Vagus.API.HostHardwareRouterTest do
     conn(:get, path)
     |> put_req_header("authorization", "Bearer " <> Token.get())
     |> Router.call(@opts)
-  end
-
-  defp app_config(slug) do
-    {:ok, config} =
-      Config.parse(%{
-        "name" => "Test App",
-        "version" => "1",
-        "slug" => slug,
-        "description" => "d",
-        "arch" => ["amd64"],
-        "image" => "x/y"
-      })
-
-    config
   end
 
   defp get_as_addon(path, grants \\ %{hassio_api: true, hassio_role: "default"}) do

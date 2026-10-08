@@ -186,7 +186,6 @@ defmodule Vagus.API.CoreProxyTest do
 
   import Vagus.AppFixtures
 
-  alias Vagus.Addon.Config
   alias Vagus.API.{CoreProxy, Dispatcher, Token}
   alias Vagus.API.CoreProxyTest.{FakeCore, HitCounter, Recorder, Script, SSEGate}
 
@@ -261,20 +260,6 @@ defmodule Vagus.API.CoreProxyTest do
   defp finch_req(method, url, headers \\ [], body \\ nil) do
     Finch.build(method, url, headers, body)
     |> Finch.request(@client_finch, receive_timeout: 5_000)
-  end
-
-  defp app_config(slug) do
-    {:ok, config} =
-      Config.parse(%{
-        "name" => "Test App",
-        "version" => "1",
-        "slug" => slug,
-        "description" => "d",
-        "arch" => ["amd64"],
-        "image" => "x/y"
-      })
-
-    config
   end
 
   defp addon_token(slug, grants \\ %{}),

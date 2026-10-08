@@ -23,8 +23,12 @@ defmodule Vagus.AppCharacterisationTest.GatedBackend do
         Application.put_env(:vagus, @key, rest)
         send(test_pid, {:gate_entered, op, self()})
 
+        # Runs in the parked caller: exiting fails this test loudly instead of
+        # leaving a request wedged for the serial modules after it.
         receive do
           :release -> :ok
+        after
+          10_000 -> exit({:gate_never_released, op})
         end
     end
   end
@@ -190,13 +194,25 @@ defmodule Vagus.AppCharacterisationTest do
     update = Task.async(fn -> supervisor_call(:post, "/store/addons/#{slug}/update", %{}) end)
     assert_receive {:gate_entered, :pull, puller}, 5_000
 
-    conn =
-      supervisor_call(:post, "/addons/#{slug}/options", %{"options" => %{"greeting" => "new"}})
+    options =
+      Task.async(fn ->
+        supervisor_call(:post, "/addons/#{slug}/options", %{"options" => %{"greeting" => "new"}})
+      end)
 
-    assert conn.status == 200
+    # Today the write answers while the pull is held; a fix that queues it behind
+    # the update answers only after the release, so this bound must not fail.
+    answered_while_held = Task.yield(options, 2_000)
 
     send(puller, :release)
     assert Task.await(update).status == 200
+
+    conn =
+      case answered_while_held do
+        {:ok, conn} -> conn
+        nil -> Task.await(options)
+      end
+
+    assert conn.status == 200
 
     assert {:ok, %{config: %{version: "2.0.0"}, user_options: %{"greeting" => "new"}}} =
              app_info(slug)
@@ -225,7 +241,9 @@ defmodule Vagus.AppCharacterisationTest do
     assert Enum.map(backup["addons"], & &1["slug"]) == [slug]
 
     assert {:ok, %{state: :stopped, config: %{version: "2.0.0"}}} = app_info(slug)
-    refute Enum.any?(Fake.calls_for("addon_#{slug}"), &match?({:start, _}, &1))
+    calls = Fake.calls_for("addon_#{slug}")
+    assert {:pull, "addon_#{slug}"} in calls
+    refute Enum.any?(calls, &match?({:start, _}, &1))
   end
 
   # Core keeps a config flow alive until it is told the discovery is gone;
@@ -261,11 +279,17 @@ defmodule Vagus.AppCharacterisationTest do
     # Only bounds the failure: the intended reply never waits on the first start.
     answered_while_held = Task.yield(second, 2_000)
 
+    # Released before any assert so a still-parked second start can finish.
     send(starter, :release)
     assert Task.await(first).status == 200
-    conn = answered_while_held || Task.await(second)
 
-    assert {answered_while_held != nil, conn.status, body(conn)["message"]} ==
+    {held?, conn} =
+      case answered_while_held do
+        {:ok, conn} -> {true, conn}
+        nil -> {false, Task.await(second)}
+      end
+
+    assert {held?, conn.status, body(conn)["message"]} ==
              {true, 400, "Another job is running for job group app_" <> slug}
   end
 end

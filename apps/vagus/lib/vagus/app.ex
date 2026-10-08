@@ -30,9 +30,9 @@ defmodule Vagus.App do
   def slugs, do: Enum.map(State.list(), & &1.config.slug)
 
   @doc """
-  Writes `:options` and the per-install settings in the order given, stopping
-  at the first `:error` (the slug is not installed). Every key is checked
-  before anything is written: an unknown one raises `ArgumentError`.
+  Writes `:options` and the per-install settings in the order given; `:error`
+  when the slug is not installed, even with nothing to write. Every key is
+  checked before anything is written: an unknown one raises `ArgumentError`.
   """
   @spec set(String.t(), keyword()) :: :ok | :error
   def set(slug, changes) when is_list(changes) do
@@ -41,6 +41,12 @@ defmodule Vagus.App do
         do: raise(ArgumentError, "unknown app setting #{inspect(key)}")
     end)
 
+    if installed?(slug), do: write_all(slug, changes), else: :error
+  end
+
+  # A write still answers `:error` if the app is uninstalled between the check
+  # and it, so the first one stops the rest.
+  defp write_all(slug, changes) do
     Enum.reduce_while(changes, :ok, fn change, :ok ->
       case write(slug, change) do
         :ok -> {:cont, :ok}

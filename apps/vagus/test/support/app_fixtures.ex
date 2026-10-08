@@ -13,6 +13,23 @@ defmodule Vagus.AppFixtures do
 
   @settings [:watchdog, :boot, :ingress_panel, :protected, :auto_update, :ports, :ingress_port]
 
+  @spec app_config(String.t(), map()) :: Config.t()
+  def app_config(slug, overrides \\ %{}) do
+    {:ok, config} =
+      %{
+        "name" => "Test App",
+        "version" => "1",
+        "slug" => slug,
+        "description" => "d",
+        "arch" => ["amd64"],
+        "image" => "x/y"
+      }
+      |> Map.merge(overrides)
+      |> Config.parse()
+
+    config
+  end
+
   @doc """
   Installing a slug again keeps its ingress token, user options and settings,
   as a reinstall over a live entry does.
@@ -20,21 +37,33 @@ defmodule Vagus.AppFixtures do
   @spec install_app(Config.t(), keyword()) :: Config.t()
   def install_app(%Config{slug: slug} = config, opts \\ []) do
     {state, changes} = Keyword.pop(opts, :state, :stopped)
-
-    Enum.each(changes, fn {key, _value} ->
-      unless key == :options or key in @settings,
-        do: raise(ArgumentError, "unknown install_app option #{inspect(key)}")
-    end)
+    check_keys!(changes)
 
     :ok = State.put(config, state)
-
-    Enum.each(changes, fn
-      {:options, options} -> :ok = State.put_options(slug, options)
-      {key, value} -> :ok = State.put_setting(slug, key, value)
-    end)
+    :ok = set_app(slug, changes)
 
     on_exit(fn -> forget_app(slug) end)
     config
+  end
+
+  @doc """
+  Changes an installed app's options and settings mid-test, taking the same
+  keys as `install_app/2` bar `:state`. `:ingress_port` is written to the store
+  directly: `Vagus.App` does not expose it.
+  """
+  @spec set_app(String.t(), keyword()) :: :ok
+  def set_app(slug, changes) do
+    check_keys!(changes)
+    {ingress_port, changes} = Keyword.split(changes, [:ingress_port])
+    :ok = Vagus.App.set(slug, changes)
+    Enum.each(ingress_port, fn {key, port} -> :ok = State.put_setting(slug, key, port) end)
+  end
+
+  defp check_keys!(changes) do
+    Enum.each(changes, fn {key, _value} ->
+      unless key == :options or key in @settings,
+        do: raise(ArgumentError, "unknown app fixture option #{inspect(key)}")
+    end)
   end
 
   @spec register_app_token(Config.t(), keyword()) :: String.t()
