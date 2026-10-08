@@ -21,8 +21,9 @@ defmodule Vagus.Resource.Controllers.Supervisor do
 
   @doc """
   Options: `:instance`, `:controllers` (their
-  `t:Vagus.Resource.Controller.declaration/0`s), and `:runtime`, options
-  given to every runtime.
+  `t:Vagus.Resource.Controller.declaration/0`s), `:runtime`, options
+  given to every runtime, and `:options`, `%{controller => options}` for
+  that controller's runtime alone, merged over them.
   """
   @spec start_link(keyword()) :: Supervisor.on_start()
   def start_link(opts) do
@@ -39,11 +40,13 @@ defmodule Vagus.Resource.Controllers.Supervisor do
   @impl true
   def init(opts) do
     instance = Keyword.fetch!(opts, :instance)
-    runtime = Keyword.get(opts, :runtime, [])
+    shared = Keyword.get(opts, :runtime, [])
+    own = Keyword.get(opts, :options, %{})
 
     children =
       for %{controller: controller} = declaration <- Keyword.get(opts, :controllers, []) do
         tasks = Runtime.tasks(instance, controller)
+        runtime = merge(shared, Map.get(own, controller, []))
 
         pair = [
           # No `:max_children`: the runtime bounds the steps it has in
@@ -75,5 +78,14 @@ defmodule Vagus.Resource.Controllers.Supervisor do
       end
 
     Supervisor.init(children, strategy: :one_for_one, max_restarts: 5, max_seconds: 30)
+  end
+
+  # A controller's own context adds to the shared one: what every
+  # controller is given stays given.
+  defp merge(shared, own) do
+    Keyword.merge(shared, own, fn
+      :context, %{} = all, %{} = mine -> Map.merge(all, mine)
+      _key, _all, mine -> mine
+    end)
   end
 end

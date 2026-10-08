@@ -169,7 +169,8 @@ defmodule Vagus.App.Backend.Native do
       image_id: nil,
       labels: %{},
       env: %{},
-      address: nil
+      address: nil,
+      process: pid
     }
   end
 

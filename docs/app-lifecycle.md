@@ -8,12 +8,16 @@ the `redesign/app-lifecycle` branch; each change there keeps it current.
 
 What exists so far is the generic machinery under `Vagus.Resource` (the
 resource, the store, and everything in "Controllers and runtimes",
-"Verdicts", "Clocks" and the generic half of "Deletion and collection") and
-"The engine layer" a controller will act through. The rest is the design
-they are built for and has no code yet: the App kind and its controllers,
-the engine observer, the token table, Update and Backup, and the commands.
-No controller is configured, nothing calls the engine layer's new parts,
-and apps and Core still run on the code this replaces.
+"Verdicts", "Clocks" and the generic half of "Deletion and collection"),
+"The engine layer" a controller will act through, and what the App
+controller will be made of: the lifecycle profiles, the spec with its
+admission and codec, the container config, the failure table, the token
+table and the engine observer. The rest is the design they are built for
+and has no code yet: the App controller and the controllers attached to
+its kind, Core's container config and hooks, Update and Backup, and the
+commands. No controller is configured, only the token table of the new
+parts runs, with nothing in it, and apps and Core still run on the code
+this replaces.
 
 The HTTP wire toward Core is unchanged: routes stay `/addons`, keys stay
 `addon`, job names keep their upstream names. Only internal names say "app".
@@ -132,7 +136,14 @@ lane an action runs in), `writer_entries/0`, and the codec hooks
 `encode_spec/1`, `decode_spec/1`, `encode_progress/1`, `decode_progress/1`
 that a spec with atoms needs to get through JSON.
 
-Controllers are listed in `config :vagus, :controllers`. One controller owns
+Controllers are listed in `config :vagus, :controllers`, each as a module
+or as `{module, options}`. The options are for that controller's runtime
+alone and are merged over the ones every runtime gets: how often it looks
+at everything (`:resync`), how many steps it has in flight
+(`:max_in_flight_steps`), its pacing, and a `:context` added to the shared
+one. An option that is not one of those, one given twice or with a value it
+cannot have, or a controller listed twice with different options, fails the
+start of the subtree with the controller's name. One controller owns
 a kind and writes its verdict; one that exports `owned_conditions/0` is
 attached to a kind another owns and writes only those conditions. The
 store's kinds are derived from the list, before the store starts: each
@@ -207,7 +218,8 @@ the step's own write.
 For the App kind, looking at everything is not how drift in the engine is
 repaired: with several controllers on the kind it would be one engine call
 per app per controller. One engine observer does it instead (see "The
-engine layer"), and wakes only the apps that changed.
+engine layer"), and wakes only the apps that changed; the App runtime is
+given a long `:resync` of its own, or none.
 
 `Vagus.Resource.Lanes` holds a counting semaphore per action class: pulls 1,
 engine calls 4. Only running actions count, and the wait is in the task
@@ -234,14 +246,16 @@ Vagus.Resource.Supervisor        :rest_for_one
 │  └─ Store                      single writer, persistence
 ├─ Lanes                         action semaphores
 ├─ services                      what controllers stand on, in this order:
+│  ├─ App.AuthIndex              the token table API auth reads
 │  ├─ App.Pulls                  which pulls run, who waits, their state
-│  ├─ Task.Supervisor            the pulls themselves
-│  ├─ token table                (planned) what API auth reads
-│  └─ engine observer            (planned) engine events and inventory
-└─ Controllers.Supervisor        :one_for_one
-   └─ one per controller         :one_for_all
-      ├─ Task.Supervisor
-      └─ Runtime
+│  └─ Task.Supervisor            the pulls themselves
+├─ Controllers.Supervisor        :one_for_one
+│  └─ one per controller         :one_for_all
+│     ├─ Task.Supervisor
+│     └─ Runtime
+└─ observers                     what stands on the controllers:
+   └─ App.EngineObserver         engine events and inventory (started
+                                 only with a controller to wake)
 ```
 
 The store stands alone under a supervisor of its own, so its restart is
@@ -266,7 +280,16 @@ supervisor knows nothing of apps: services are child specs it is given and
 places after the lanes and before the controllers. Each stands before the
 runtimes because a new one has forgotten what the resources had told it:
 the pull worker its waiters, the token table its tokens. The runtimes start
-again with it and look at everything, which tells it again.
+again with it and look at everything, which tells it again. The token table
+is first among them: a table that is replaced refuses every app's token
+until that app's next pass puts it back, and the pull worker, which talks
+to the engine, is the likelier to end.
+
+Observers are the other kind of child it is given, placed after the
+controllers. An observer tells runtimes where to look and holds nothing a
+runtime relies on, so its replacement takes nothing with it: no step in
+flight ends, no pull is cancelled, no token is forgotten. It makes up for
+what it missed by having its runtime look at everything when it starts.
 
 ## The engine layer
 
@@ -330,17 +353,62 @@ function each waiter may have given. The functions run in the task, so one
 may be called once more, for a summary already on its way, after it was
 replaced or its waiter withdrew, and never for a later one.
 
-**Engine observer** (planned). One process, placed before the controllers,
-is the only subscriber to `Vagus.Runtime.Events` and the only reader of the
-engine's inventory. It monitors the events worker and subscribes again when
-that is replaced, since the worker keeps its subscribers in its own memory.
-An event about a container becomes a `Runtime.enqueue` for that one app.
-On every gap, at its own start and on a periodic tick it makes one filtered
-container list, compares it with the snapshot it kept of the last, and
-enqueues only the apps whose row changed. It also monitors the native
-broker's subtree and enqueues the app when that exits, which is what makes
-its recovery immediate: nothing else restarts it. This is the drift repair of the App kind:
-neither a gap nor a timer has every app observed by every controller.
+**Engine observer.** `Vagus.App.EngineObserver`, one process placed after
+the controllers, is the only subscriber to `Vagus.Runtime.Events` and the
+only reader of the engine's inventory. Everything it does ends in a
+`Runtime.enqueue` for one app of one controller, the hint to look again; it
+decides nothing and keeps nothing a controller reads.
+
+- An event about a container wakes the app the container is named for:
+  `app_<slug>` and `addon_<slug>`, as the other firmware slot names it, are
+  `<slug>`, and Core's is `homeassistant`. Only an action that can change
+  what a pass decides does so: `create`, `start`, `die`, `stop`, `kill`,
+  `oom`, `destroy`, `pause`, `unpause`, `restart`, `rename` and
+  `health_status: …`. The rest is dropped, the three `exec_*` events of
+  every healthcheck probe above all. A `rename` is about two names: the
+  engine emits it under the new one, with the former in `oldName` as a
+  path, the events worker passes it on when either is ours, and the app of
+  each is woken. Events are only made members of a set, emptied once per
+  burst, so a thousand events about one container are one wake.
+- On every gap it makes one container list and wakes every app that has a
+  container in that listing or in the one before. Events were lost, and a
+  listing cannot stand in for them: a container restarted by the engine's
+  own policy, as Core's is, has the same id and the same state before and
+  after.
+- Every five minutes (configurable, or never) it lists as well, and since
+  no event was lost wakes only the apps whose row appeared, went or
+  changed. A row is the container's id, image, state, and the exit code
+  and health the engine's status text carries, without its durations: `Up
+  3 seconds` becoming `Up 4 seconds` is no change. The first listing after
+  its start wakes every app that has a container.
+- A listing runs in a process of its own, linked to the observer, one at a
+  time: the observer goes on handling events meanwhile, and a gap or tick
+  that arrives during one is one more listing after it. Nothing paces the
+  events worker, so the observer's mailbox is bounded by this alone, that
+  it never waits: an event costs one insertion into a set. The listing's
+  timeout is how long the engine may stay silent, not a deadline.
+- A listing that fails, the engine being away or anything else, keeps the
+  last listing and what the next one owes, and is tried again after 1 s,
+  doubling to 60 s, by one timer; each gap or tick meanwhile is a try of
+  its own.
+- The events worker is outside this subtree and keeps its subscribers in
+  its own memory, so it is monitored, and when it is replaced, or was not
+  there, subscribing is tried again after 100 ms, doubling to 30 s.
+  Nothing announces that a name is registered again; the worker's
+  supervisor has it back at once, and a subscriber that joins a running
+  stream is sent a gap, which is a listing.
+- `watch(app, pid)` has it monitor a native instance and wake the app when
+  that ends, which is what makes the broker's recovery immediate: nothing
+  else restarts it. The pid is the `process` of the instance `observe`
+  returned, read with the rest of it, and whoever observed calls `watch`
+  on every observation; it is idempotent.
+
+When the observer is replaced nothing is replaced with it. It starts by
+having its runtime look at every app, which finds what happened while it
+was away and, as each pass observes a native instance, tells it again what
+to watch. A backend that raises does so in the lister and ends the
+observer through the link, which is loud and costs only the observer. This is the drift repair of the App kind: neither a gap nor a
+timer has every app observed by every controller.
 
 ## Verdicts
 
@@ -367,18 +435,81 @@ and the back-off the pacing. One contract test, over a table of
 
 ## The App kind
 
-An App's spec holds `config` (the parsed manifest), `version`, `options`,
-`settings`, `ingress_port`, `run`, `restart_counter`, `start_counter`,
-`holds` and `lifecycle`. The app should run when `run` is true and `holds` is
-empty.
+An App's spec (`Vagus.App.Spec.Schema`) holds `config` (the app's own copy
+of its manifest), `version`, `options` (the user's, merged over the
+manifest's when written out), `settings` (`ports`, `protected`, `watchdog`,
+`boot`, `ingress_panel`, `auto_update`), `ingress_port`, `run`,
+`restart_counter`, `start_counter`, `holds` and `lifecycle`. The app should
+run when `run` is true and `holds` is empty.
+
+Nothing derived is stored. The wave, the boot mode, the container's name
+and every other answer of the profile is computed from those fields when
+asked for, so a new manifest cannot leave a stale copy behind.
+`ingress_port` is stored only for a manifest that asks for a dynamic port,
+which is an assignment and not a derivation.
+
+Paths have owners: an Update owns `version` while it runs, the resource
+that placed a hold owns `holds.<name>`, and `holds` is the kind's
+`writer_entries`, so a hold disappears with its writer. Everything else is
+written by commands, which own nothing.
+
+### Admission
+
+The kind's validator is `Schema.validate/2`: a pure function of the spec
+and of `Vagus.App.Facts`, the machine's architecture, board, Core version
+and so on as data. The store runs it on every write of a spec. It fills in
+what was left out (a manifest alone is a whole spec) and refuses, each with
+a reason a command turns into its answer:
+
+- a `lifecycle` that is none of the three, a field or a setting the
+  profile does not have, a field of the wrong shape;
+- a profile the manifest's backend is not. A manifest that asks to run
+  inside the VM gets the native profile only if the app is one of ours;
+- a manifest whose slug is reserved (the system's own, and Core's name,
+  since `app_homeassistant` would read back as Core's container) or is no
+  name for a directory, a manifest with no image, a native manifest that
+  runs once;
+- a spec that would not come back from the resource file as itself, found
+  by encoding and decoding it as the store does;
+- options the manifest's schema does not accept;
+- `watchdog` for an app that runs once;
+- a dynamic ingress app without its port, a port outside the range or one
+  the system keeps, and a port for any other app.
+
+Whether this machine can run the manifest is not among them. Every rule
+holds on every write, so an app whose manifest asks for a newer Core than
+is installed would refuse its own stop. `Schema.availability/2` answers
+it, by architecture, machine type and Home Assistant version, with
+upstream's three refusals and messages, for an install or an update to ask
+before it writes.
+
+A validator is given one spec and no other resource, so it cannot refuse a
+dynamic ingress port that another app holds, and nothing serialises one
+caller's read of the ports in use with its create. The pick
+(`assign_ingress_port/3`, the lowest free port) is therefore checked after
+the fact: uids are given in the order the store creates, so of two apps
+that picked the same port exactly the later one finds
+`ingress_port_contested?/2` true, picks again and writes, before it is
+first started.
 
 ### Lifecycle profiles
 
 `lifecycle` names one of three profiles: `:container`, `:core` or
-`:native`. A profile is a pure module that answers the questions in the
-table for one app; admission accepts the three names and nothing else. The
-settings are not fields to combine freely: the controller is tested against
-three profiles, not against every combination of their answers.
+`:native`. A profile is a pure module (`Vagus.App.Profile.Container`,
+`.Core`, `.Native`) that answers the questions in the table for one app,
+one function a question; admission accepts the three names and nothing
+else. The settings are not fields to combine freely: the controller is
+tested against three profiles, not against every combination of their
+answers. A profile also lists the spec fields and settings its apps have:
+a native app has no ingress port and only the `watchdog` setting, and a
+Core spec is its version and what commands write, until Core's container
+is built from a spec.
+
+The watchdog's budget is five attempts, the pause between them starting at
+10 s and doubling, at most ten such runs in thirty minutes, forgotten once
+the app has been ready for ten minutes. A native app's `watchdog` is on
+unless turned off. Core's crash-loop rule is three engine restarts in ten
+minutes, acted on at most ten times in thirty minutes.
 
 | Question | `:container` | `:core` | `:native` |
 |---|---|---|---|
@@ -399,7 +530,42 @@ three profiles, not against every combination of their answers.
 Core keeps the container name `homeassistant` because the previous firmware
 must still find Core after a revert; only apps become `app_<slug>`. A lower
 `wave` starts first: an app waits while an earlier wave is still progressing,
-for at most its own `wave_wait_ms`, then starts anyway.
+for at most its own `wave_wait_ms`, then starts anyway. The wave follows
+the manifest's `startup`: `initialize` 10, `system` 20, `services` 30,
+`application` and `once` 50, with Core at 40 between them.
+
+### The container
+
+`Vagus.App.Container.Config.build/3` is the one description of an app's
+container: a pure function of the spec, the facts, and what only creation
+knows, the token and the device rules (resolving a device path reads the
+node). For the same inputs it gives exactly what the code this replaces
+gives. The container's name is not in it: that is the profile's, `app_<slug>`
+where it was `addon_<slug>`, and nothing in the config is derived from it.
+The image's tag is the spec's `version`, which an update moves ahead of the
+manifest's. Core's container is not described by it.
+
+### Failures
+
+`Vagus.App.Failure.classify/2` says what a failed action or pull means:
+
+| What failed | Class | Cause |
+|---|---|---|
+| a 5xx saying `address already in use` or `port is already allocated`, in any case | permanent | `:port_conflict`, with the port |
+| a pull refused as unauthorized or denied, or whose repository "does not exist" | permanent | `:pull_denied` |
+| a pull's 404, or its stream saying the manifest is unknown or not found | permanent | `:image_not_found` |
+| a 400, or a reference refused before any request | permanent | `:invalid_config` |
+| any other action's 404 | transient | `:not_found` |
+| a stop that timed out | pending | `:still_stopping` |
+| engine away, slow, connection broken | transient | `:engine_unreachable`, `:engine_timeout`, `:engine_transport` |
+| any other 5xx; any other refusal | transient | `:engine_error`; `:engine_refused` |
+| a pull that failed otherwise, or died | transient | `:pull_failed`, `:pull_crashed` |
+| a name in use by a container, or by a process | transient | `:already_exists`, `:name_taken` |
+| anything else | transient | `:unknown` |
+
+Permanent means the same attempt fails the same way until the spec or the
+machine changes. A stop that timed out has not failed: the engine answers
+a stop when the container has exited, and goes on stopping it.
 
 ### Start sequence
 
@@ -422,12 +588,22 @@ after the put has returned. The token is never written to flash; after a
 restart it is re-read from the engine. A Core hook is an action too, and so
 a pass of its own.
 
-Auth is not a controller. A small process owns the token table, which API
-auth reads directly, and offers an idempotent put and remove. It stands
-before the App runtime, so its replacement, which has an empty table,
-restarts that runtime: every app is observed again, found without its
-token, and put back. Uninstall removes the token before it touches the
-container.
+Auth is not a controller. `Vagus.App.AuthIndex` owns the token table, which
+API auth reads directly: one lookup a request, from the token to the app's
+name. What the app may do is read from its resource at each request.
+It offers an idempotent `put` and `remove`, each a call that returns once
+the table shows it, and a `put` replaces the app's earlier token. The
+table is keyed by the token's SHA-256, taken by the caller, so neither it
+nor the process ever holds a token.
+
+With the process gone the table is gone: every lookup answers "unknown",
+and a put or remove answers an error, which fails the step that made it.
+It stands before the App runtime, so its replacement, which has an empty
+table, restarts that runtime: every app is observed again, found without
+its token, and put back, by the listing a runtime makes when it starts.
+Until then the app's requests are refused: four apps are put back at a
+time, and none while the engine is away if the pass must observe it first.
+Uninstall removes the token before it touches the container.
 
 Three controllers attach to the App kind, each with its own runtime:
 

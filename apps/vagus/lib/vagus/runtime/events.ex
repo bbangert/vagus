@@ -28,6 +28,11 @@ defmodule Vagus.Runtime.Events do
   (`managed?/2`). A daemon that ignores the server-side filter entirely still
   can't flood subscribers with unrelated host-container noise.
 
+  A `rename` is the one event about two names: the daemon emits it under
+  the new name, with the former one in `attributes["oldName"]` as a path
+  (`/app_x`). It is passed on when either name is one of ours, since a
+  container renamed away from one of our names is news about ours.
+
   ## Reconnect
 
   A dropped stream (the request's `:done`, a transport error/close, or a
@@ -405,7 +410,8 @@ defmodule Vagus.Runtime.Events do
     # Core-name pass-through: the adopted Core container has no Vagus label
     # (and won't until a rebuild), so its fixed name is its identity here.
     # Container.name/0 is an Application.get_env read — cheap per event.
-    if Map.get(event, "Type") == "container" and managed?(name, attributes) do
+    if Map.get(event, "Type") == "container" and
+         (managed?(name, attributes) or renamed_from_managed?(event, attributes)) do
       payload = %{
         action: Map.get(event, "Action"),
         name: name,
@@ -418,6 +424,15 @@ defmodule Vagus.Runtime.Events do
       Enum.each(state.subscribers, fn {pid, _ref} -> send(pid, {:docker_event, payload}) end)
     end
   end
+
+  # A rename is emitted after it, under the new name, with the former one
+  # as a path from the engine's root. One of ours renamed to anything else
+  # is still an event about one of ours.
+  defp renamed_from_managed?(%{"Action" => "rename"}, %{"oldName" => former})
+       when is_binary(former),
+       do: managed?(String.trim_leading(former, "/"), %{})
+
+  defp renamed_from_managed?(_event, _attributes), do: false
 
   defp map(%{} = map), do: map
   defp map(_absent_or_malformed), do: %{}

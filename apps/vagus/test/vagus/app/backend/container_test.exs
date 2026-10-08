@@ -65,7 +65,8 @@ defmodule Vagus.App.Backend.ContainerTest do
                  "A" => "b=c",
                  "FLAG" => ""
                },
-               address: "172.30.33.7"
+               address: "172.30.33.7",
+               process: nil
              }
     end
 
