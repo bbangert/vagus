@@ -69,6 +69,14 @@ defmodule Vagus.Test.FakeEngine.Model do
   def set_health(%{model: model}, name, status, failing_streak \\ 0),
     do: GenServer.call(model, {:set_health, name, status, failing_streak})
 
+  @doc """
+  Has every start of the container named `name` refused with `message`, as
+  a 500, until it is called again with `nil`. The container need not exist
+  yet.
+  """
+  def fail_start(%{model: model}, name, message),
+    do: GenServer.call(model, {:fail_start, name, message})
+
   @doc "Emits a container event for any name, existing or not. Returns its `timeNano`."
   def emit(%{model: model}, action, name, attributes \\ %{}),
     do: GenServer.call(model, {:emit, action, name, attributes})
@@ -114,6 +122,7 @@ defmodule Vagus.Test.FakeEngine.Model do
        containers: %{},
        images: MapSet.new(),
        pulls: %{},
+       fail_starts: %{},
        streams: [],
        tick: 0,
        listings: 0,
@@ -205,6 +214,9 @@ defmodule Vagus.Test.FakeEngine.Model do
     do: {:reply, :ok, %{state | pulls: Map.put(state.pulls, image, script)}}
 
   def handle_call({:set, key, value}, _from, state), do: {:reply, :ok, Map.put(state, key, value)}
+
+  def handle_call({:fail_start, name, message}, _from, state),
+    do: {:reply, :ok, %{state | fail_starts: Map.put(state.fail_starts, name, message)}}
 
   def handle_call({:crash, name, exit_code}, _from, state) do
     container = Map.fetch!(state.containers, name)
@@ -360,6 +372,9 @@ defmodule Vagus.Test.FakeEngine.Model do
 
       %{fail_start: message} when is_binary(message) ->
         {{500, %{"message" => message}}, state}
+
+      %{name: name} when is_binary(:erlang.map_get(name, state.fail_starts)) ->
+        {{500, %{"message" => state.fail_starts[name]}}, state}
 
       container ->
         {state, at} = started_at(state)

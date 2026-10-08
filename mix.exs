@@ -58,7 +58,13 @@ defmodule VagusUmbrella.MixProject do
     # the shell this was started in.
     env = [{"MIX_ENV", "test"}, {"VAGUS_RESOURCE_MUTATION", mutation}]
 
-    args = ["test", "apps/vagus/test/vagus/resource", "--only", only]
+    args = [
+      "test",
+      "apps/vagus/test/vagus/resource",
+      "apps/vagus/test/vagus/app/controller",
+      "--only",
+      only
+    ]
 
     {_output, status} =
       System.cmd("mix", args, env: env, into: IO.stream(), stderr_to_stdout: true)

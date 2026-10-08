@@ -69,6 +69,21 @@ defmodule Vagus.App.AuthIndex do
   end
 
   @doc """
+  The SHA-256 of the token `app` has here: what to compare with the digest
+  of a token read elsewhere, to learn whether that is the one known. A scan
+  of the table, which holds one row per running app.
+  """
+  @spec digest_of(Resource.name(), keyword()) :: {:ok, binary()} | :error
+  def digest_of(app, opts \\ []) when is_binary(app) do
+    case :ets.match(table(instance(opts)), {:"$1", app}) do
+      [[digest]] -> {:ok, digest}
+      _none -> :error
+    end
+  rescue
+    ArgumentError -> :error
+  end
+
+  @doc """
   Makes `token` the token of `app`, and the only one. Returns once a
   `lookup/2` finds it. `{:error, :invalid}` for an app that is no name or a
   token that is no non-empty string. Options: `:instance`, and `:timeout`

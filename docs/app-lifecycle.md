@@ -9,15 +9,14 @@ the `redesign/app-lifecycle` branch; each change there keeps it current.
 What exists so far is the generic machinery under `Vagus.Resource` (the
 resource, the store, and everything in "Controllers and runtimes",
 "Verdicts", "Clocks" and the generic half of "Deletion and collection"),
-"The engine layer" a controller will act through, and what the App
-controller will be made of: the lifecycle profiles, the spec with its
-admission and codec, the container config, the failure table, the token
-table and the engine observer. The rest is the design they are built for
-and has no code yet: the App controller and the controllers attached to
-its kind, Core's container config and hooks, Update and Backup, and the
-commands. No controller is configured, only the token table of the new
-parts runs, with nothing in it, and apps and Core still run on the code
-this replaces.
+"The engine layer", and the App controller with everything in "The App
+kind" except what is marked as Core's or as another controller's. The rest
+is the design they are built for and has no code yet: the controllers
+attached to the App kind, Core's container config and hooks, Update and
+Backup, and the commands. No controller is configured: `Vagus.App.wiring/1`
+is what the application will start the resource subtree with, and until it
+does only the token table and the pull worker run, with nothing in them,
+and apps and Core still run on the code this replaces.
 
 The HTTP wire toward Core is unchanged: routes stay `/addons`, keys stay
 `addon`, job names keep their upstream names. Only internal names say "app".
@@ -248,7 +247,9 @@ Vagus.Resource.Supervisor        :rest_for_one
 ├─ services                      what controllers stand on, in this order:
 │  ├─ App.AuthIndex              the token table API auth reads
 │  ├─ App.Pulls                  which pulls run, who waits, their state
-│  └─ Task.Supervisor            the pulls themselves
+│  ├─ Task.Supervisor            the pulls themselves
+│  └─ App.Boot                   no process: one commit per boot, made in
+│                                its start (see "Boot")
 ├─ Controllers.Supervisor        :one_for_one
 │  └─ one per controller         :one_for_all
 │     ├─ Task.Supervisor
@@ -572,14 +573,19 @@ a stop when the container has exited, and goes on stopping it.
 One action per pass, each decided from what the pass before left to
 observe:
 
-1. Pull the image, in the pull worker; the app's passes wait for its end.
-2. Create the container, minting the token into its environment.
-3. Put the token in the token table. Status publishes the instance:
+1. Wait for the earlier waves (see "Waves").
+2. Pull the image, in the pull worker; the app's passes wait for its end.
+3. Create the container, minting the token into its environment. The same
+   action first makes what the container needs on the host (see "Before
+   the create").
+4. Put the token in the token table. Status publishes the instance:
    container id, address.
-4. Start the container.
-5. Wait for readiness, as the profile defines it.
-6. Gate `:dns_ready`, a condition the Dns controller sets and that must
-   name this instance id, then Ready.
+5. Start the container.
+6. Wait for readiness, as the profile defines it.
+7. Wait for every gate, then Ready.
+
+A native app has no image, container or token: its sequence is the wave,
+then one start.
 
 The invariant: a container never runs before auth knows its token. It holds
 because both are the App controller's own actions, in that order: start is
@@ -587,6 +593,40 @@ decided only by a pass that observes the token in the table, which is
 after the put has returned. The token is never written to flash; after a
 restart it is re-read from the engine. A Core hook is an action too, and so
 a pass of its own.
+
+**The token.** `Vagus.App.Token.mint/0` makes 256 random bits, URL-safe, in
+the create action, and `Container.Config.build/3` puts it into the
+container's environment; nothing else keeps it. "The token is in the table"
+is a comparison of digests: `observe/2` hashes the `SUPERVISOR_TOKEN` of the
+instance's environment and asks `AuthIndex.digest_of/2` what the table has
+for the app. A table that was replaced has nothing, so the next pass of
+every running app puts its token back, read from the container, and the
+container is not touched. The token itself exists in three places only:
+the create action, the put action, which reads it from the engine again
+instead of taking it as an argument, and the function of `observe/2` that
+takes the instance apart. What leaves that function is a state and an
+instance without its environment; both actions turn whatever they raise
+into the kind of failure and nothing it carried
+(`Vagus.App.Token.guard/1`). Core's token is the Supervisor's, read through
+a function the controller is given; a native app has none.
+
+**Before the create.** `Vagus.App.Prepare.run/3` is part of the create
+action (of the start, for a native app), not an action of its own: the
+directories the container binds, the DSP checks of a `dsp: true` manifest,
+`options.json` in the app's data directory (the same bytes and mode the
+start this replaces writes), the app network for a bridged app, and the
+container's device rules. None of that is something a pass could observe
+cheaply, and a mark in status could not stand in for looking, since status
+is committed before the action runs: a pass cut between the two would find
+the mark and no directories. Done again with the create it belongs to, it
+gives the same result.
+
+**Gates.** The conditions an app waits for after it is ready are data, the
+controller's `:gates`: none unless the wiring lists them, which it does for
+`:dns_ready` once a controller writes it. A gate is open when its condition
+is true and its `message` is the id of the instance that runs now, so one
+left from the instance before opens nothing. An app whose gate stays closed
+is running and not Ready (`startup`), never Failed.
 
 Auth is not a controller. `Vagus.App.AuthIndex` owns the token table, which
 API auth reads directly: one lookup a request, from the token to the app's
@@ -605,7 +645,7 @@ Until then the app's requests are refused: four apps are put back at a
 time, and none while the engine is away if the pass must observe it first.
 Uninstall removes the token before it touches the container.
 
-Three controllers attach to the App kind, each with its own runtime:
+Three controllers are to attach to the App kind, each with its own runtime:
 
 - Dns owns `:dns_ready`, the one gate, and the last step before Ready.
 - Ingress owns `:ingress_ready`, ingress sessions and the panel push to
@@ -614,14 +654,158 @@ Three controllers attach to the App kind, each with its own runtime:
 - Publications turns Services and Discovery entries into resources owned by
   the publishing app.
 
+### The controller
+
+`Vagus.App.Controller` owns the kind. `Vagus.App.Controller.Observe` reads,
+`Vagus.App.Controller.Reconcile` decides, and `act/3` performs.
+
+**Conditions.** `:ready`, `:progressing` and `:failed`, all three in every
+verdict and all with the pass's reason. Ready: the instance runs, is ready
+and every gate is open. Progressing: the controller is on its way, or waits
+for something that comes by itself (a pull, a pause, a wave, the engine).
+Failed: it has given up until the spec changes. None of the three: the app
+is where it should be, which is not running (stopped, held, succeeded).
+
+**Status.** Besides the conditions: `state`, a word for where the app is;
+`instance` (`id`, `address`, `process`, whether it runs, since when,
+whether it was ready, and the engine's restart count and start time);
+`made_for`, the two counters and the fingerprint of the spec the instance
+was made from; `expected_exit`, the id of an instance being taken away;
+`failure` (action, class, cause, detail, when, for which generation, how
+often); `restarts`, the budget's count; `probe`; `pull`; `wave_since` and
+`waiting_on`; `ready_since`; `restart_required`. Never the token and never
+an environment.
+
+**The decision** is one ordered table, `Reconcile.decide/1`; the first row
+that holds is the pass. In order:
+
+1. A container the other firmware slot left under `addon_<slug>` is stopped,
+   then removed, whatever the app is to do: it holds the app's ports. It is
+   looked for while the app's own container does not run.
+2. Taking an instance away, for an app that is not to run (`run` false, a
+   hold, or being deleted), an instance made for an earlier
+   `restart_counter`, and one that is being replaced: cancel the pull the
+   app waits for, remove the token (only when the app is not to run),
+   record `expected_exit` and stop with the profile's grace, then remove
+   the container where the profile's `on_stop` says so. A stop that timed
+   out is still stopping: the pass looks again.
+3. For an app being deleted: the image, the data directory, and last the
+   finalizer (see "Deletion and collection").
+4. An app that is not to run is `stopped`, or `held`.
+5. A failure for good, of this generation, is Failed. One for now holds the
+   start sequence back for a pause that starts at 1 s and doubles to 60 s.
+6. An instance that ended by itself, or is unhealthy, is judged (see "When
+   an instance ends").
+7. The start sequence.
+
+**Failures.** Every error an action returns is classified
+(`Vagus.App.Failure`) by the pass after it. Permanent: Failed, with the
+cause in `status.failure`, and nothing is tried until the generation
+changes, which every write to the spec does. Transient: counted, and tried
+again after its pause. Pending: looked at again. A failed pull is read from
+the pull worker instead, and judged only if it is the pull this generation
+asked for.
+
+**The counters.** `restart_counter` says "replace the instance": one made
+for a lower value is stopped and removed, running or not, and the start
+sequence makes another. That is restart and rebuild both, for an app whose
+container a stop removes; for Core, whose container is kept, it is a stop
+and a start of the same container, and a rebuild waits for Core's container
+config. `start_counter` says "start again": it leaves a running instance
+alone and replaces one that is not running, which is how a start is asked
+for of an app that has failed or has run once. Either forgets the restart
+budget's count.
+
+**A spec that changed under a running instance** restarts nothing, as
+today: the instance records the fingerprint of the manifest, version,
+options, ports and protection it was made from, and `restart_required`
+says they have changed since. A container that was created and never
+started is made anew instead.
+
+### When an instance ends
+
+An exit of the instance status knows, which was not its `expected_exit`,
+is the app ending by itself. A container nothing is recorded of, as after a
+reboot, is removed and made anew without counting anything.
+
+| `restart_policy` | What happens |
+|---|---|
+| `:never` (watchdog off, or runs once) | Failed, `crashed`, with the exit code; the dead container stays, `run` is unchanged. An app that runs once and exits 0 has succeeded: none of the three conditions, wire `stopped`. |
+| `{:restart, budget}` | One more attempt: the dead container is removed and the start sequence waits out the pause, 10 s doubling. The sixth in a row, or the eleventh run in thirty minutes, is Failed (`restart_budget_exhausted`). Ready for ten minutes forgets the attempts. |
+| `{:crash_loop, rule}` (Core) | Nothing: the engine restarts it. Each restart, a higher restart count with a new start time, is noted; three in ten minutes have the container removed and made anew, at most ten times in thirty minutes, then Failed (`crash_loop`). |
+
+The counts are status and every instant in them is a stamp: they start
+again at a reboot.
+
+A container that is running and unhealthy, by the engine's healthcheck or
+by two probes of the manifest's `watchdog` URL unanswered two minutes
+apart, is a failure of the same budget: it is stopped, removed and made
+anew. This is a deliberate change: today's watchdog acts on `unhealthy`
+only for a container that has already stopped. With the watchdog off it is
+left running, not Ready.
+
+A shutdown stops containers while every runtime rests, and the reboot that
+follows leaves no status: the next boot finds containers nothing is
+recorded of, which are no crashes.
+
+### Readiness
+
+`Vagus.App.Readiness`: a container is ready when it runs and, where the
+image has a healthcheck, is healthy; a native app when its process exists;
+an `{:http, path}` app (Core) when a `GET` of the path answered 2xx, asked
+every five seconds until it has, and Failed (`readiness_timeout`) while
+its deadline has passed without an answer. The probe of a `watchdog` URL
+keeps the template grammar and the rule of the probe this replaces: a TCP
+connect, or an HTTP status below 300.
+
+### Waves
+
+An app that has yet to make its instance waits while any app of an earlier
+wave that should run has neither become Ready nor Failed nor succeeded, an
+app nothing was observed of among them, for at most its `wave_wait_ms`
+from when it first waited. The apps it waits for are in its status
+(`waiting_on`) and are its `references/1`, so a change to any of them is
+its next pass: an earlier app becoming Ready starts it at once. It refers
+to them only while it waits, and only to those still starting, so an app
+that has started is woken by no other.
+
+### Boot
+
+After a reboot, and not after a restart of the application, one commit
+sets `run` to false for an app whose `boot` is `manual` and for one that
+runs once, and to true for `always` (`Vagus.App.Boot`). A boot is known by
+a marker file beside the run directory, on a tmpfs. The marker is written
+before the commit with each app's uid and generation, and again after it;
+the commit touches only apps that still have those, so cut anywhere and
+run again it finishes and undoes nothing a user has since chosen. It runs
+in the start of a child placed before the controllers, which answers
+`:ignore`: the App runtime's first pass must come after it, and there is
+nothing to keep running. A store that refuses the commit is logged and the
+start goes on.
+
+### Core, so far
+
+Core's profile is decided for like any other, and the table is tested for
+it. What a running system does with a Core resource today: a container
+named `homeassistant` that exists is taken as it is, its token put in the
+table, asked whether it answers, stopped with the grace its image asks for
+and kept, and started again. What it does not do is make one: with no
+container the verdict is Failed, `no_container_builder`, and a crash loop
+is Failed, `crash_loop`, without removing anything. The container config,
+the fingerprint that decides reuse, the hooks, and where Core is asked
+(today `127.0.0.1:8123` unless the controller is told otherwise) come with
+Core's own change.
+
 ### Wire state
+
+`Vagus.App.Controller.wire_state/1`, from status alone:
 
 | Internal condition | Wire `state` |
 |---|---|
 | Ready | `started` |
 | Container running but not Ready | `startup` |
 | Failed | `error` |
-| No container and not Failed (stopped, held, pulling, creating) | `stopped` |
+| No container running and not Failed (stopped, held, pulling, creating, waiting, succeeded) | `stopped` |
 | Never observed | `unknown` |
 
 ## Deletion and collection
@@ -635,6 +819,13 @@ order; a controller that must come after another reads the finalizers still
 on the resource and waits, and the other's release is a change that brings
 its next pass. The App needs no such order for its token: removing it is
 the first action of its own uninstall.
+
+An App's own cleanup, one action a pass: cancel its pull, remove the token,
+stop the container, remove it (Core's too), remove the image where a stop
+removes the container, remove the app's data directory, and release the
+finalizer. An image another container still uses stays: its removal is
+tried once and its failure is the end of that step. The data directory
+goes as it does today.
 
 Owned resources are collected through their declared `owner_refs`, never by
 inferring ownership from a name: an uninstalled app's publications go with
@@ -669,6 +860,7 @@ reads as age zero, so a restart can lengthen a deadline but never skip one.
 | start | container running (healthy/unhealthy if it has a healthcheck), a permanent create/run failure, or 120 s (success) | no |
 | stop | no container (or stopped, for `on_stop: :keep`) | no |
 | restart, rebuild | as start, for the instance made for the new `restart_counter` | no |
+| start, of an app that failed or ran once | as start, for the new `start_counter` | no |
 | uninstall | resource gone | no |
 | update | Update terminal | yes |
 | Core start/restart/rebuild | Core Ready, or Failed | no |
