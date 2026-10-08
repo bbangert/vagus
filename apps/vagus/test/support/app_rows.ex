@@ -482,6 +482,70 @@ defmodule Vagus.Test.AppRows do
          image: nil
        ), {:progressing, :not_answering, :starting, :startup}, later(5_000),
        %{engine_restarts: %{seen: [now(), ago(1_000)], actions: []}}},
+      {"Core restarted three times between two passes: each is counted, and that is a crash loop",
+       core(%{}, status: running()),
+       obs(
+         instance: inst(:running, restart_count: 3, started_at: "started-2"),
+         token: :current,
+         image: nil
+       ), {:failed, :crash_loop, :failed, :error}, [],
+       %{engine_restarts: %{seen: [now(), now(), now()], actions: []}}},
+      {"restarted twice between two passes: both counted, and below the rule",
+       core(%{}, status: running()),
+       obs(
+         instance: inst(:running, restart_count: 2, started_at: "started-2"),
+         token: :current,
+         image: nil
+       ), {:progressing, :not_answering, :starting, :startup}, later(5_000),
+       %{engine_restarts: %{seen: [now(), now()], actions: []}}},
+      {"restarted once, and twice more by the next pass: a crash loop",
+       core(%{},
+         status:
+           running(
+             instance: seen(restart_count: 1, started_at: "started-2"),
+             engine_restarts: %{seen: [ago(1_000)], actions: []}
+           )
+       ),
+       obs(
+         instance: inst(:running, restart_count: 3, started_at: "started-3"),
+         token: :current,
+         image: nil
+       ), {:failed, :crash_loop, :failed, :error}, [],
+       %{engine_restarts: %{seen: [now(), now(), ago(1_000)], actions: []}}},
+      {"a restart count lower than the one recorded of the same container counts nothing",
+       core(%{}, status: running(instance: seen(restart_count: 3))),
+       obs(
+         instance: inst(:running, restart_count: 1, started_at: "started-2"),
+         token: :current,
+         image: nil
+       ), {:progressing, :not_answering, :starting, :startup}, later(5_000),
+       %{engine_restarts: %{seen: [], actions: []}}},
+      {"however far the count rose, no more restarts are kept than the rule asks for",
+       core(%{}, status: running()),
+       obs(
+         instance: inst(:running, restart_count: 500, started_at: "started-2"),
+         token: :current,
+         image: nil
+       ), {:failed, :crash_loop, :failed, :error}, [],
+       %{engine_restarts: %{seen: [now(), now(), now()], actions: []}}},
+      {"and of those kept, the newest: an earlier one makes room",
+       core(%{},
+         status: running(engine_restarts: %{seen: [ago(1_000), ago(2_000)], actions: []})
+       ),
+       obs(
+         instance: inst(:running, restart_count: 2, started_at: "started-2"),
+         token: :current,
+         image: nil
+       ), {:failed, :crash_loop, :failed, :error}, [],
+       %{engine_restarts: %{seen: [now(), now(), ago(1_000)], actions: []}}},
+      {"restarts seen at once are forgotten at once, the window after they were seen",
+       core(%{},
+         status:
+           Map.merge(ready, %{
+             engine_restarts: %{seen: [ago(600_000), ago(600_000), ago(600_000)], actions: []}
+           })
+       ), obs(instance: inst(), token: :current, image: nil), {:ready, :ready, :ready, :started},
+       [], %{engine_restarts: %{seen: [], actions: []}}},
       {"a restart count that rose with no new start is no restart", core(%{}, status: ready),
        obs(instance: inst(:running, restart_count: 1), token: :current, image: nil),
        {:ready, :ready, :ready, :started}, [], %{engine_restarts: %{seen: [], actions: []}}},

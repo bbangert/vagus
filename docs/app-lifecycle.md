@@ -790,7 +790,7 @@ reboot, is removed and made anew without counting anything.
 |---|---|
 | `:never` (watchdog off, or runs once) | Failed, `crashed`, with the exit code; the dead container stays, `run` is unchanged. An app that runs once and exits 0 has succeeded: none of the three conditions, wire `stopped`. |
 | `{:restart, budget}` | One more attempt: the dead container is removed and the start sequence waits out the pause, 10 s doubling. The sixth in a row is Failed (`restart_budget_exhausted`). Ready for ten minutes forgets the attempts. |
-| `{:crash_loop, rule}` (Core) | Nothing: the engine restarts it. Each restart, a higher restart count with a new start time, is noted; three in ten minutes have the container removed and made anew, at most ten times in thirty minutes, then Failed (`crash_loop`). Making it anew needs Core's container config: until that is here, three in ten minutes are Failed at once (see "Core, so far"). |
+| `{:crash_loop, rule}` (Core) | Nothing: the engine restarts it. Each restart, a higher restart count with a new start time, is noted: the count is the engine's total, so one that rose by several since the last pass is that many restarts, all noted at the time they were seen, and no more are kept than the rule counts. A count that fell, or rose with the start time unchanged, is none. Three in ten minutes have the container removed and made anew, at most ten times in thirty minutes, then Failed (`crash_loop`). Making it anew needs Core's container config: until that is here, three in ten minutes are Failed at once (see "Core, so far"). |
 
 The counts are status and every instant in them is a stamp: they start
 again at a reboot.

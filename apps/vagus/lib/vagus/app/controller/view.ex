@@ -396,19 +396,30 @@ defmodule Vagus.App.Controller.View do
   defp probe(_probe, _none, false, _now), do: @blank.probe
 
   # The engine restarted the instance: the same container, started again.
+  # Its count is of every restart there was, and one pass may follow
+  # several: events for an app are one wake. Each is recorded, at this
+  # pass's stamp, since when each happened is not known. That is no earlier
+  # than they did, so a burst counts as within the window for the window's
+  # length from when it was seen, and is forgotten then like any other.
+  # No more are kept than the rule asks for: the newest decide it.
   defp engine_restarts(%{seen: seen} = engine, {:crash_loop, rule}, inst, known, true, now) do
     seen = Enum.filter(seen, &(Stamp.age(&1, now) < rule.window_ms))
-
-    restarted? =
-      inst.restart_count > known.restart_count and inst.started_at != known.started_at
-
-    %{engine | seen: if(restarted?, do: [now | seen], else: seen)}
+    new = List.duplicate(now, min(risen(inst, known), rule.restarts))
+    %{engine | seen: Enum.take(new ++ seen, rule.restarts)}
   end
 
   defp engine_restarts(engine, {:crash_loop, _rule}, _inst, _known, false, _now),
     do: %{engine | seen: []}
 
   defp engine_restarts(_engine, _policy, _inst, _known, _same?, _now), do: @blank.engine_restarts
+
+  # A count that is lower under the same id, or higher with the start time
+  # it had, is no restart that was seen.
+  defp risen(%{restart_count: to, started_at: at}, %{restart_count: from, started_at: was})
+       when is_integer(from) and to > from and at != was,
+       do: to - from
+
+  defp risen(_inst, _known), do: 0
 
   defp loop(%{seen: seen, actions: actions}, {:crash_loop, rule}, now) do
     actions = Enum.filter(actions, &(Stamp.age(&1, now) < rule.action_window_ms))
