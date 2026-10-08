@@ -29,7 +29,8 @@ defmodule Vagus.Test.AppWorld do
   """
   @spec new(keyword()) :: map()
   def new(opts \\ []) do
-    id = System.unique_integer([:positive])
+    # With the OS process: the counter starts over in every VM.
+    id = "#{System.pid()}-#{System.unique_integer([:positive])}"
     root = Path.join(System.tmp_dir!(), "vagus-app-#{id}")
     File.mkdir_p!(root)
     ExUnit.Callbacks.on_exit(fn -> File.rm_rf!(root) end)
@@ -41,6 +42,8 @@ defmodule Vagus.Test.AppWorld do
       socket: Path.join(root, "engine.sock"),
       # 1 while the app's probe is to go unanswered.
       probe: :atomics.new(1, []),
+      # 1 while the API is not accepting.
+      api: :atomics.new(1, []),
       gates: Keyword.get(opts, :gates, []),
       seed: Keyword.get(opts, :seed, fn _engine -> :ok end),
       before: Keyword.get(opts, :before, fn -> :ok end),
@@ -71,6 +74,7 @@ defmodule Vagus.Test.AppWorld do
   @spec context(map()) :: map()
   def context(world) do
     probe = world.probe
+    api = world.api
 
     %{
       facts: world.facts,
@@ -83,12 +87,22 @@ defmodule Vagus.Test.AppWorld do
           )
       },
       gates: world.gates,
-      prober: fn _target, _timeout -> if :atomics.get(probe, 1) == 1, do: :error, else: :ok end,
+      api_ready: fn -> :atomics.get(api, 1) == 0 end,
+      prober: fn _target, _timeout -> probed(probe) end,
       host_address: fn _port -> "127.0.0.1" end,
       supervisor_token: fn -> "the-supervisor-token" end,
       prepare: [network: fn -> :ok end, dsp_state: fn -> :unsupported end],
       audit: fn key, action, context -> Harness.record(context, key, action) end
     }
+  end
+
+  # 0 answers, 1 does not, and 2 raises once and answers from then on.
+  defp probed(probe) do
+    case :atomics.get(probe, 1) do
+      0 -> :ok
+      1 -> :error
+      2 -> :atomics.put(probe, 1, 0) && raise "the prober fell over"
+    end
   end
 
   # Called by `start_system/1` in the test process, before the subtree

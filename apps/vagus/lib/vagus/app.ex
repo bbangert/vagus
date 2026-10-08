@@ -2,7 +2,24 @@ defmodule Vagus.App do
   @moduledoc """
   The App kind as the application runs it: `wiring/1` is what
   `Vagus.Resource.Supervisor` is started with to have apps reconciled.
+
+  That call is the switch. `config :vagus, :controllers` alone is not: a
+  controller listed there gets no context, and the App controller cannot
+  observe without its facts and backends.
+
+  It must not be switched on beside the lifecycle code it replaces
+  (`Vagus.Addon.Manager`, the watchdogs, the boot starter). This controller
+  stops and removes every `addon_<slug>` container of an app it has a
+  resource for, which that watchdog would start again; and the native
+  broker registers one name whichever of the two started it, so each would
+  take the other's broker for its own.
   """
+
+  # Twice the engine lane's four slots. A pass holds a step through its
+  # action and the wait for a lane, so with as many steps as slots four
+  # slow engine calls would leave every other app unobserved, a native
+  # app's restart and every token put among them.
+  @steps 8
 
   alias Vagus.App.{AuthIndex, Backend, Boot, Controller, EngineObserver, Facts, Pulls}
 
@@ -41,7 +58,8 @@ defmodule Vagus.App do
         %{
           facts: Facts.read(Keyword.get(opts, :facts, [])),
           backends: %{Backend.Container => [engine: engine], Backend.Native => []},
-          gates: Keyword.get(opts, :gates, [])
+          gates: Keyword.get(opts, :gates, []),
+          api_ready: &Vagus.API.Listener.accepting?/0
         },
         Keyword.get(opts, :context, %{})
       )
@@ -52,7 +70,10 @@ defmodule Vagus.App do
 
     [
       controllers: [
-        {Controller, resync: Keyword.get(opts, :resync, :timer.hours(1)), context: context}
+        {Controller,
+         resync: Keyword.get(opts, :resync, :timer.hours(1)),
+         max_in_flight_steps: @steps,
+         context: context}
       ],
       services:
         [{AuthIndex, instance: instance}] ++

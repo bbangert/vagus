@@ -25,15 +25,28 @@ defmodule Vagus.App.Controller.LiveTest do
   defp docker(args), do: System.cmd("docker", args, stderr_to_stdout: true)
 
   setup do
-    n = System.unique_integer([:positive])
+    # With the OS process: the counter starts over in every VM.
+    n = "#{System.pid()}_#{System.unique_integer([:positive])}"
     slug = "live_#{n}"
     repository = "vagus-live-#{n}/sleeper"
     image = "#{repository}:1"
-    root = "/tmp/vagus-live-#{n}"
+    # Every run's directory under one of the tests' own, which is all that
+    # is ever mounted to clean up.
+    root = "/tmp/vagus-live/#{n}"
     pulled? = match?({_out, 1}, docker(["image", "inspect", @base]))
 
+    # Before anything is made, so that what a failing setup left goes too.
+    on_exit(fn ->
+      docker(["rm", "-f", "app_" <> slug, "vagus-live-#{n}-seed"])
+      docker(["rmi", image])
+      docker(["run", "--rm", "-v", "/tmp/vagus-live:/own", @base, "rm", "-rf", "/own/#{n}"])
+      if pulled?, do: docker(["rmi", @base])
+      File.rm_rf!(root)
+    end)
+
     # An image whose own command keeps running: an app's container is made
-    # with no command of its own.
+    # with no command of its own. Its init passes a stop's signal on, so a
+    # stop takes no part of the engine's ten seconds of grace.
     docker!(["create", "--name", "vagus-live-#{n}-seed", @base, "sleep", "86400"])
     docker!(["commit", "--change", ~s(CMD ["sleep", "86400"]), "vagus-live-#{n}-seed", image])
     docker!(["rm", "vagus-live-#{n}-seed"])
@@ -42,25 +55,6 @@ defmodule Vagus.App.Controller.LiveTest do
     # there on its side, and only the engine can make it there.
     data = Path.join([root, "addons", "data", slug])
     docker!(["run", "--rm", "-v", "#{data}:/data", @base, "true"])
-
-    on_exit(fn ->
-      docker(["rm", "-f", "app_" <> slug])
-      docker(["rmi", image])
-
-      docker([
-        "run",
-        "--rm",
-        "-v",
-        "/tmp:/host-tmp",
-        @base,
-        "rm",
-        "-rf",
-        "/host-tmp/vagus-live-#{n}"
-      ])
-
-      if pulled?, do: docker(["rmi", @base])
-      File.rm_rf!(root)
-    end)
 
     config =
       AppManifests.parse!(%{
@@ -77,7 +71,7 @@ defmodule Vagus.App.Controller.LiveTest do
   test "install, start, crash, stop and uninstall on a real engine", ctx do
     %{slug: slug, image: image} = ctx
     name = "app_" <> slug
-    events = Module.concat(__MODULE__, "Events#{ctx.n}")
+    events = Module.concat(__MODULE__, "Events#{System.unique_integer([:positive])}")
     engine = [engine: [socket: @socket]]
 
     wiring =
@@ -86,6 +80,7 @@ defmodule Vagus.App.Controller.LiveTest do
         engine: [socket: @socket],
         facts: [data_root: ctx.root],
         boot_marker: Path.join(ctx.root, "booted"),
+        context: %{api_ready: fn -> true end},
         observer: [events: {Vagus.Runtime.Events, events}, interval: :infinity]
       )
 

@@ -10,8 +10,19 @@ defmodule Vagus.App.Readiness.Http do
 
   @behaviour Vagus.App.Readiness
 
+  # Whatever the target, an answer or none: a host that is no host, a port
+  # no socket takes, or anything else a client raises on is nothing
+  # answering.
   @impl true
-  def probe(%{proto: "tcp", host: host, port: port}, timeout) do
+  def probe(target, timeout) do
+    ask(target, timeout)
+  rescue
+    _error -> :error
+  catch
+    _kind, _reason -> :error
+  end
+
+  defp ask(%{proto: "tcp", host: host, port: port}, timeout) do
     case :gen_tcp.connect(String.to_charlist(host), port, [active: false], timeout) do
       {:ok, socket} ->
         :gen_tcp.close(socket)
@@ -22,23 +33,17 @@ defmodule Vagus.App.Readiness.Http do
     end
   end
 
-  def probe(%{proto: proto, host: host, port: port, path: path}, timeout)
-      when proto in ["http", "https"] do
+  defp ask(%{proto: proto, host: host, port: port, path: path}, timeout)
+       when proto in ["http", "https"] do
     deadline = System.monotonic_time(:millisecond) + timeout
 
     case get(String.to_existing_atom(proto), host, port, path, deadline) do
       {:ok, status} when status < 300 -> :ok
       _other -> :error
     end
-  rescue
-    # A host that is no host, or anything else the client raises on: nothing
-    # answered.
-    _error -> :error
-  catch
-    _kind, _reason -> :error
   end
 
-  def probe(_target, _timeout), do: :error
+  defp ask(_target, _timeout), do: :error
 
   defp get(scheme, host, port, path, deadline) do
     with {:ok, left} <- left(deadline),

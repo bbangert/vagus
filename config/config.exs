@@ -36,6 +36,11 @@ config :vagus, :store_asset_mode, :auto
 # The `Vagus.Resource.Controller` modules that `Vagus.Resource.Supervisor`
 # runs, one runtime each. The resource store's kinds follow from this list.
 # An entry is a module, or `{module, options}` for that runtime alone.
+#
+# This list is not how apps are switched over: the App controller needs the
+# context `Vagus.App.wiring/1` builds, and that function's result is what
+# the resource supervisor is started with. See `Vagus.App` for why it must
+# not run beside `Vagus.Addon.Manager` and the watchdogs.
 config :vagus, :controllers, []
 
 # How many steps one controller's runtime has in flight at once. A step

@@ -17,6 +17,8 @@ defmodule Vagus.App.Controller.SystemTest do
 
   @moduletag :capture_log
   @moduletag :scenario
+  # A scenario runs once more for each boundary it crosses.
+  @moduletag timeout: 180_000
 
   @plain "only_host_uts"
   @watched "45df7312_zigbee2mqtt"
@@ -173,7 +175,6 @@ defmodule Vagus.App.Controller.SystemTest do
   test "no token is in the store's file, in status, in a process's state or in a log" do
     world = AppWorld.new()
     path = Path.join(world.root, "resources.json")
-    raising = fn _target, _timeout -> raise "the prober fell over" end
     seen = :ets.new(:seen, [:public, :bag])
 
     look = fn sys ->
@@ -199,7 +200,7 @@ defmodule Vagus.App.Controller.SystemTest do
 
     log =
       capture_log([level: :debug], fn ->
-        sys = start_system(AppWorld.system(world, path: path, context: %{prober: raising}))
+        sys = start_system(AppWorld.system(world, path: path))
         engine = AppWorld.engine(world, sys)
 
         install(world, sys, @plain, %{run: true})
@@ -217,7 +218,11 @@ defmodule Vagus.App.Controller.SystemTest do
         wake(sys, @watched)
         advance(sys, @watched, 10_000)
         look.(sys)
+        # The probe raises, once, in a pass that has the instance in hand.
+        :atomics.put(world.probe, 1, 2)
         advance(sys, @watched, 120_000)
+        await!(sys, :app, @watched, :ready)
+        settle(sys)
         look.(sys)
         kill_runtime(sys, Controller)
         settle(sys)
@@ -244,7 +249,7 @@ defmodule Vagus.App.Controller.SystemTest do
 
     for token <- tokens, text <- hay do
       refute text =~ token
-      refute text =~ Base.encode16(:crypto.hash(:sha256, token), case: :lower) <> "x"
+      refute text =~ Base.encode16(:crypto.hash(:sha256, token), case: :lower)
     end
 
     refute Enum.any?(hay, &(&1 =~ "SUPERVISOR_TOKEN"))
@@ -259,7 +264,10 @@ defmodule Vagus.App.Controller.SystemTest do
         engine: [socket: world.socket],
         facts: [data_root: world.data],
         boot_marker: Path.join(world.root, "booted"),
-        context: Map.take(AppWorld.context(world), [:prepare, :audit]),
+        context:
+          Map.put(Map.take(AppWorld.context(world), [:prepare, :audit]), :api_ready, fn ->
+            true
+          end),
         observer: [events: {Vagus.Runtime.Events, events}, interval: :infinity]
       ]
 
@@ -328,20 +336,26 @@ defmodule Vagus.App.Controller.SystemTest do
       for module <- @traced, do: :erlang.trace_pattern({module, :_, :_}, true, [:local])
       :erlang.trace(:new_processes, true, [:call])
 
-      sys = start_system(AppWorld.system(world))
-      first = Process.whereis(Runtime.name(sys.instance, Controller))
-      store = Process.whereis(Store.name(sys.instance))
+      {first, second, store} =
+        try do
+          sys = start_system(AppWorld.system(world))
+          first = Process.whereis(Runtime.name(sys.instance, Controller))
+          store = Process.whereis(Store.name(sys.instance))
 
-      install(world, sys, @plain, %{run: true})
-      second = kill_runtime(sys, Controller)
-      settle(sys)
-      write(sys, @plain, [{:inc, [:restart_counter]}])
-      {:ok, _app} = Store.delete(:app, @plain, sys.i)
-      await!(sys, :app, @plain, :gone)
-      settle(sys)
+          install(world, sys, @plain, %{run: true})
+          second = kill_runtime(sys, Controller)
+          settle(sys)
+          write(sys, @plain, [{:inc, [:restart_counter]}])
+          {:ok, _app} = Store.delete(:app, @plain, sys.i)
+          await!(sys, :app, @plain, :gone)
+          settle(sys)
+          {first, second, store}
+        after
+          # Whatever became of the scenario: a tracer left on outlives the test.
+          :erlang.trace(:new_processes, false, [:call])
+          for module <- @traced, do: :erlang.trace_pattern({module, :_, :_}, false, [:local])
+        end
 
-      :erlang.trace(:new_processes, false, [:call])
-      for module <- @traced, do: :erlang.trace_pattern({module, :_, :_}, false, [:local])
       calls = calls()
 
       for function <- [:observe, :reconcile, :act, :references, :action_class] do

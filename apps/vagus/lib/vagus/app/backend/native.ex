@@ -35,7 +35,7 @@ defmodule Vagus.App.Backend.Native do
   :native_supervisor_down}`, `start/2` exits, and `stop/3` and `remove/2`
   exit when there is a subtree to end.
 
-  The subtree registers the name the backend this one replaces uses for the
+  The subtree registers the name `Vagus.Addon.Backend.Native` uses for the
   same app, so the two cannot each run a broker on the port; one started by
   either is the instance both see. `stop/3` does not tell that backend's
   sentinel. For a broker the old backend started and still records as

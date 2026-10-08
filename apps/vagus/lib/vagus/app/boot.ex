@@ -40,8 +40,10 @@ defmodule Vagus.App.Boot do
   work and answers `:ignore`: there is nothing to keep running, and a later
   child, the App runtime, must not make its first pass before the commit,
   which is the one reason to do work in a start. It runs in the supervisor,
-  never in the store. A store that refuses the commit is logged and the
-  start goes on: the alternative is a device on which nothing starts.
+  never in the store. A store that refuses the commit, or whose call exits, is logged
+  and the start goes on: the alternative is a device on which nothing
+  starts. The marker then stays short of done, and the next start of the
+  boot tries again.
   """
 
   require Logger
@@ -110,9 +112,12 @@ defmodule Vagus.App.Boot do
     end
   end
 
+  # Done is written only for a commit that was made, or had nothing to
+  # make. After one the store refused, or whose call exited with its outcome
+  # unknown, the marker stays as it is: the next start of this boot tries
+  # again, and the generations it recorded keep that from undoing anything.
   defp finish(seen, marker, i) do
-    commit(seen, i, @tries)
-    write(marker, %{"state" => "done"})
+    if commit(seen, i, @tries) == :ok, do: write(marker, %{"state" => "done"})
     :done
   end
 
@@ -130,7 +135,7 @@ defmodule Vagus.App.Boot do
           ],
           do: op
 
-    case ops == [] or Store.commit(ops, i) do
+    case ops == [] or committed(ops, i) do
       true ->
         :ok
 
@@ -144,7 +149,16 @@ defmodule Vagus.App.Boot do
 
       {:error, reason} ->
         Logger.error("apps were not set for this boot: #{inspect(reason)}")
+        :error
     end
+  end
+
+  # A store that stops over a write it cannot vouch for, or does not answer
+  # in time, exits the caller. Here that would fail the supervisor's start.
+  defp committed(ops, i) do
+    Store.commit(ops, i)
+  catch
+    :exit, reason -> {:error, {:exit, reason}}
   end
 
   defp read(nil), do: :none

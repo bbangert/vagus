@@ -14,6 +14,8 @@ defmodule Vagus.App.Controller.ScenarioTest do
 
   @moduletag :capture_log
   @moduletag :scenario
+  # A scenario runs once more for each boundary it crosses.
+  @moduletag timeout: 180_000
 
   @plain "only_host_uts"
   @watched "45df7312_zigbee2mqtt"
@@ -109,7 +111,7 @@ defmodule Vagus.App.Controller.ScenarioTest do
 
       app = write(sys, @watched, %{run: false})
       assert verdict(app) == @stopped
-      assert tail(actions(sys, @watched), 3) == [:remove_token, :stop, :remove]
+      assert tail(actions(sys, @watched), 3) == [:stop, :remove, :remove_token]
       assert container(engine, @watched) == nil
       assert AuthIndex.lookup(held, sys.i) == :error
       assert attempts(app) == 0
@@ -295,7 +297,7 @@ defmodule Vagus.App.Controller.ScenarioTest do
       app = write(sys, @watched, %{run: false})
       assert verdict(app) == @stopped
       assert attempts(app) == 0
-      assert actions(sys, @watched) == @start ++ [:remove_token, :remove]
+      assert actions(sys, @watched) == @start ++ [:remove, :remove_token]
 
       app = write(sys, @watched, %{run: true})
       assert verdict(app) == @ready
@@ -512,7 +514,7 @@ defmodule Vagus.App.Controller.ScenarioTest do
 
       app = install(world, sys, @plain, %{run: true})
       assert {_, true, _, :waiting_for_wave, _} = verdict(app)
-      waiting = pending_timer(sys, Controller, @plain)
+      steps = info(sys, Controller).steps
 
       # The earlier app's pull is tried again and succeeds. The clock moves
       # one second of the waiter's two minutes, and its timer is not fired.
@@ -521,8 +523,44 @@ defmodule Vagus.App.Controller.ScenarioTest do
       await!(sys, :app, @early, :ready)
       await!(sys, :app, @plain, :ready)
       settle(sys)
-      assert waiting.remaining > 60_000
+      # Not by its wait running out: one second of its two minutes has
+      # passed on the clock it is measured by, and its own timer, which
+      # nobody fired, is still far out. And not by looking again and again.
+      assert Vagus.Resource.TestClock.now(sys.clock).at == 1_000
+      assert info(sys, Controller).steps - steps < 40
       assert AppWorld.acted?(sys, @plain, @start)
+    end)
+  end
+
+  test "no app is created while the API it calls as it starts is not accepting" do
+    world = AppWorld.new()
+
+    run(world, fn sys, engine ->
+      :atomics.put(world.api, 1, 1)
+      app = install(world, sys, @plain, %{run: true})
+      assert verdict(app) == {false, true, false, :waiting_for_api, :waiting}
+      assert actions(sys, @plain) == []
+      assert container(engine, @plain) == nil
+
+      :atomics.put(world.api, 1, 0)
+      assert verdict(advance(sys, @plain, 0)) == @ready
+      assert actions(sys, @plain) == @start
+    end)
+  end
+
+  test "a start asked for during a back-off starts at once and forgets the count" do
+    world = AppWorld.new()
+
+    run(world, fn sys, engine ->
+      install(world, sys, @watched, watchdog())
+      app = crash(sys, engine, @watched)
+      assert verdict(app) == {false, true, false, :backing_off, :restarting}
+      assert attempts(app) == 1
+
+      # The clock has not moved: it is not the pause that ended.
+      app = write(sys, @watched, [{:inc, [:start_counter]}])
+      assert verdict(app) == @ready
+      assert attempts(app) == 0
     end)
   end
 
@@ -620,7 +658,7 @@ defmodule Vagus.App.Controller.ScenarioTest do
       assert app.spec.holds == %{}
       assert verdict(app) == @ready
       assert attempts(app) == 0
-      assert actions(sys, @watched) == @start ++ [:remove_token, :stop, :remove] ++ @start
+      assert actions(sys, @watched) == @start ++ [:stop, :remove, :remove_token] ++ @start
     end)
   end
 
@@ -635,7 +673,7 @@ defmodule Vagus.App.Controller.ScenarioTest do
       hold(sys, @plain)
       app = get(sys, @plain)
       assert verdict(app) == {false, false, false, :held, :stopped}
-      assert actions(sys, @plain) == @start ++ [:remove_token, :remove]
+      assert actions(sys, @plain) == @start ++ [:remove, :remove_token]
       assert container(engine, @plain) == nil
       assert app.status.failure == nil
 
@@ -819,7 +857,7 @@ defmodule Vagus.App.Controller.ScenarioTest do
       app = write(sys, "homeassistant", %{run: false})
       assert verdict(app) == @stopped
       assert %{state: "exited"} = Model.container(engine, "homeassistant")
-      assert actions(sys, "homeassistant") == [:put_token, :remove_token, :stop]
+      assert actions(sys, "homeassistant") == [:put_token, :stop, :remove_token]
 
       assert %{query: %{"t" => "260"}} =
                Enum.find(Vagus.Test.FakeEngine.requests(engine), &(&1.path =~ "/stop"))

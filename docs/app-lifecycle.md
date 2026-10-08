@@ -507,8 +507,10 @@ Core spec is its version and what commands write, until Core's container
 is built from a spec.
 
 The watchdog's budget is five attempts, the pause between them starting at
-10 s and doubling, at most ten such runs in thirty minutes, forgotten once
-the app has been ready for ten minutes. A native app's `watchdog` is on
+10 s and doubling, forgotten once the app has been ready for ten minutes.
+(The profile's budget also names a number of runs per window. Attempts are
+forgotten only by ten minutes of Ready or by a counter, so ten runs cannot
+begin in thirty minutes and the controller does not read it.) A native app's `watchdog` is on
 unless turned off. Core's crash-loop rule is three engine restarts in ten
 minutes, acted on at most ten times in thirty minutes.
 
@@ -562,6 +564,7 @@ manifest's. Core's container is not described by it.
 | any other 5xx; any other refusal | transient | `:engine_error`; `:engine_refused` |
 | a pull that failed otherwise, or died | transient | `:pull_failed`, `:pull_crashed` |
 | a name in use by a container, or by a process | transient | `:already_exists`, `:name_taken` |
+| an action that raised | permanent | `:crashed` |
 | anything else | transient | `:unknown` |
 
 Permanent means the same attempt fails the same way until the spec or the
@@ -573,7 +576,9 @@ a stop when the container has exited, and goes on stopping it.
 One action per pass, each decided from what the pass before left to
 observe:
 
-1. Wait for the earlier waves (see "Waves").
+1. Wait for the API apps call as they start to be accepting (an app
+   started before it fails its init and stays down), then for the earlier
+   waves (see "Waves").
 2. Pull the image, in the pull worker; the app's passes wait for its end.
 3. Create the container, minting the token into its environment. The same
    action first makes what the container needs on the host (see "Before
@@ -587,10 +592,14 @@ observe:
 A native app has no image, container or token: its sequence is the wave,
 then one start.
 
-The invariant: a container never runs before auth knows its token. It holds
-because both are the App controller's own actions, in that order: start is
-decided only by a pass that observes the token in the table, which is
-after the put has returned. The token is never written to flash; after a
+The invariant: a container this controller starts never runs before auth
+knows its token. It holds because both are the App controller's own
+actions, in that order: start is decided only by a pass that observes the
+token in the table, which is after the put has returned. Outside it are
+the containers it did not start: one found running after the token table
+was replaced, whose token is put back by its next pass, whatever that pass
+would otherwise say of the app; and Core, which the engine's own restart
+policy starts at boot before any pass. The token is never written to flash; after a
 restart it is re-read from the engine. A Core hook is an action too, and so
 a pass of its own.
 
@@ -679,19 +688,26 @@ an environment.
 **The decision** is one ordered table, `Reconcile.decide/1`; the first row
 that holds is the pass. In order:
 
+0. An app whose resource name is not its manifest's slug is Failed,
+   `name_mismatch`, and nothing is done to it: the container, the data
+   directory and the token row are named for one or the other.
 1. A container the other firmware slot left under `addon_<slug>` is stopped,
    then removed, whatever the app is to do: it holds the app's ports. It is
    looked for while the app's own container does not run.
 2. Taking an instance away, for an app that is not to run (`run` false, a
    hold, or being deleted), an instance made for an earlier
    `restart_counter`, and one that is being replaced: cancel the pull the
-   app waits for, remove the token (only when the app is not to run),
-   record `expected_exit` and stop with the profile's grace, then remove
-   the container where the profile's `on_stop` says so. A stop that timed
+   app waits for, record `expected_exit` and stop with the profile's
+   grace, then remove the container where the profile's `on_stop` says so.
+   The token of an app that is not to run goes last, once nothing runs: an
+   app answers its own shutdown with it. Only a delete takes it first.
+   A pull of an image the spec has moved on from is cancelled as well. A stop that timed
    out is still stopping: the pass looks again.
 3. For an app being deleted: the image, the data directory, and last the
    finalizer (see "Deletion and collection").
-4. An app that is not to run is `stopped`, or `held`.
+4. An app that is not to run is `stopped`, or `held`. One that runs and
+   whose token the table lacks has it put, before any verdict that would
+   leave it be.
 5. A failure for good, of this generation, is Failed. One for now holds the
    start sequence back for a pause that starts at 1 s and doubles to 60 s.
 6. An instance that ended by itself, or is unhealthy, is judged (see "When
@@ -702,7 +718,9 @@ that holds is the pass. In order:
 (`Vagus.App.Failure`) by the pass after it. Permanent: Failed, with the
 cause in `status.failure`, and nothing is tried until the generation
 changes, which every write to the spec does. Transient: counted, and tried
-again after its pause. Pending: looked at again. A failed pull is read from
+again after its pause. Pending: looked at again. A failure belongs to the generation whose pass performed the
+action, which the action's arguments carry: one of an earlier generation
+is dropped. A failed pull is read from
 the pull worker instead, and judged only if it is the pull this generation
 asked for.
 
@@ -714,7 +732,8 @@ and a start of the same container, and a rebuild waits for Core's container
 config. `start_counter` says "start again": it leaves a running instance
 alone and replaces one that is not running, which is how a start is asked
 for of an app that has failed or has run once. Either forgets the restart
-budget's count.
+budget's count at once: what the count was made under is kept while there
+is no instance, so a start asked for during a pause does not wait it out.
 
 **A spec that changed under a running instance** restarts nothing, as
 today: the instance records the fingerprint of the manifest, version,
@@ -731,7 +750,7 @@ reboot, is removed and made anew without counting anything.
 | `restart_policy` | What happens |
 |---|---|
 | `:never` (watchdog off, or runs once) | Failed, `crashed`, with the exit code; the dead container stays, `run` is unchanged. An app that runs once and exits 0 has succeeded: none of the three conditions, wire `stopped`. |
-| `{:restart, budget}` | One more attempt: the dead container is removed and the start sequence waits out the pause, 10 s doubling. The sixth in a row, or the eleventh run in thirty minutes, is Failed (`restart_budget_exhausted`). Ready for ten minutes forgets the attempts. |
+| `{:restart, budget}` | One more attempt: the dead container is removed and the start sequence waits out the pause, 10 s doubling. The sixth in a row is Failed (`restart_budget_exhausted`). Ready for ten minutes forgets the attempts. |
 | `{:crash_loop, rule}` (Core) | Nothing: the engine restarts it. Each restart, a higher restart count with a new start time, is noted; three in ten minutes have the container removed and made anew, at most ten times in thirty minutes, then Failed (`crash_loop`). |
 
 The counts are status and every instant in them is a stamp: they start
@@ -796,6 +815,36 @@ the fingerprint that decides reuse, the hooks, and where Core is asked
 (today `127.0.0.1:8123` unless the controller is told otherwise) come with
 Core's own change.
 
+### Against today
+
+What this controller does differently from the code it replaces:
+
+- A running container that is unhealthy is restarted; today's watchdog
+  leaves it. Missed probes spend the same budget as crashes, where today
+  they have no limit.
+- Budgets are per app, not one for all apps.
+- The first restart after a crash waits 10 s; today's is at once.
+- Giving up leaves `run` as it was and the app Failed, where today it is
+  set stopped: the next reboot tries again with a fresh budget.
+- With the watchdog off a crashed app is Failed (`error`); an app that
+  runs once has succeeded or failed.
+- A start that fails is tried again with a pause, and the container that
+  was created is kept; today the start returns the error and removes it.
+- A token is 43 URL-safe characters (256 bits); today's is 112 hex digits.
+- No app is started before the API accepts, as today, but per pass and
+  not once at boot.
+- An uninstall leaves DNS records, Discovery, Services and the panel to
+  the controllers that own them.
+
+Not done by this controller, and in need of an owner before
+`Vagus.Addon.BootStarter` is retired: at every boot, apps or none, that
+process makes sure the `hassio` bridge exists, binds the Supervisor's and
+the DNS server's addresses on it (they are lost at a reboot) and asserts
+the NAT rule that carries `172.30.32.2:80` to the API. Here the bridge and
+the two addresses are made only as part of creating a bridged app's
+container, and the NAT rule not at all. Nor does it register an app's
+identity for API auth beyond the token row, or push the ingress panel.
+
 ### Wire state
 
 `Vagus.App.Controller.wire_state/1`, from status alone:
@@ -823,8 +872,8 @@ the first action of its own uninstall.
 An App's own cleanup, one action a pass: cancel its pull, remove the token,
 stop the container, remove it (Core's too), remove the image where a stop
 removes the container, remove the app's data directory, and release the
-finalizer. An image another container still uses stays: its removal is
-tried once and its failure is the end of that step. The data directory
+finalizer. An image another container still uses stays: the engine's
+conflict is the end of that step, and any other failure is tried again. The data directory
 goes as it does today.
 
 Owned resources are collected through their declared `owner_refs`, never by

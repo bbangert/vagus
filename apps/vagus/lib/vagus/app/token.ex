@@ -16,6 +16,8 @@ defmodule Vagus.App.Token do
   escapes it is the kind of failure and nothing it carried.
   """
 
+  require Logger
+
   alias Vagus.App.AuthIndex
 
   @env "SUPERVISOR_TOKEN"
@@ -60,14 +62,31 @@ defmodule Vagus.App.Token do
   @doc """
   Runs `fun`, which holds a token, and turns anything it raises, throws or
   exits with into `{:error, {:crashed, kind}}`: the exception's module or
-  the kind of exit, never its message, its arguments or a stack.
+  the kind of exit. What is logged is that and where it happened, module,
+  function and line: never a message, an argument or a reason, any of
+  which may carry the token.
   """
   @spec guard((-> result)) :: result | {:error, {:crashed, atom()}} when result: term()
   def guard(fun) when is_function(fun, 0) do
     fun.()
   rescue
-    exception -> {:error, {:crashed, exception.__struct__}}
+    exception -> crashed(exception.__struct__, __STACKTRACE__)
   catch
-    kind, _reason -> {:error, {:crashed, kind}}
+    kind, _reason -> crashed(kind, __STACKTRACE__)
+  end
+
+  defp crashed(kind, stack) do
+    Logger.error("an action holding a token crashed: #{inspect(kind)} at #{where(stack)}")
+    {:error, {:crashed, kind}}
+  end
+
+  # A stack entry's third element is an arity, or the arguments themselves.
+  defp where(stack) do
+    stack
+    |> Enum.take(6)
+    |> Enum.map_join(" < ", fn {module, function, arity, location} ->
+      arity = if is_list(arity), do: length(arity), else: arity
+      "#{inspect(module)}.#{function}/#{arity}:#{location[:line]}"
+    end)
   end
 end

@@ -33,24 +33,39 @@ defmodule VagusUmbrella.MixProject do
 
   defp test_mutations(_args) do
     # Unmutated first: a suite that fails by itself proves nothing below.
-    if scenarios(nil, "scenario") != 0,
-      do: Mix.raise("the scenario tests fail without a mutation")
+    case scenarios(nil, "scenario") do
+      {0, _failed} ->
+        :ok
+
+      {status, failed} ->
+        Mix.raise(
+          "stage: no mutation. The scenario tests fail by themselves (exit #{status}):\n" <>
+            names(failed)
+        )
+    end
 
     survivors =
       for {mutation, only} <- @mutations,
-          status = scenarios(mutation, only),
+          {status, _failed} = scenarios(mutation, only),
           # 2 is ExUnit's "tests failed"; anything else did not run them.
           status != 2,
           do: "#{mutation} (exit #{status})"
 
     if survivors != [],
-      do: Mix.raise("no scenario test failed under: #{Enum.join(survivors, ", ")}")
+      do:
+        Mix.raise(
+          "stage: mutations. No scenario test failed under: #{Enum.join(survivors, ", ")}"
+        )
 
     Mix.shell().info(
       "every mutation was caught: #{Enum.map_join(@mutations, ", ", &elem(&1, 0))}"
     )
   end
 
+  defp names([]), do: "  (no failing test was named in the output)"
+  defp names(failed), do: Enum.map_join(failed, "\n", &("  " <> &1))
+
+  # The exit status, and the tests the run named as failed.
   defp scenarios(mutation, only) do
     Mix.shell().info("==> scenario tests, mutation: #{mutation || "none"}")
 
@@ -66,10 +81,17 @@ defmodule VagusUmbrella.MixProject do
       only
     ]
 
-    {_output, status} =
-      System.cmd("mix", args, env: env, into: IO.stream(), stderr_to_stdout: true)
+    {output, status} = System.cmd("mix", args, env: env, stderr_to_stdout: true)
+    IO.write(output)
 
-    status
+    failed =
+      for [_all, name] <- Regex.scan(~r/^\s+\d+\) (test .+)$/m, output), uniq: true, do: name
+
+    Mix.shell().info(
+      "==> mutation #{mutation || "none"}: exit #{status}, #{length(failed)} failed"
+    )
+
+    {status, failed}
   end
 
   # Dependencies listed here are available only for this project

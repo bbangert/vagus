@@ -275,7 +275,7 @@ defmodule Vagus.App.FailureTest do
   describe "anything else" do
     test "what only a pull reports is unknown from any other action" do
       for action <- [:create, :start, :stop, :remove, :remove_image] do
-        assert row(action, {:crashed, :killed}) == {:transient, :unknown}
+        assert row(action, {:crashed, :killed}) == {:permanent, :crashed}
         assert row(action, {:stream, "manifest unknown"}) == {:transient, :unknown}
         assert row(action, {:stream, "unauthorized"}) == {:transient, :unknown}
       end

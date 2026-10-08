@@ -11,7 +11,7 @@ defmodule Vagus.App.Prepare do
   directories. Run again with the create it belongs to, it costs a few
   system calls and gives the same result.
 
-  In order, as the start this replaces has it:
+  In the order `Vagus.Addon.Manager.start/2` does them:
 
     1. the directories the container binds that are the app's own
        (`Vagus.App.Container.Config.bind_sources/2`);

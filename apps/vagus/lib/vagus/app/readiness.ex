@@ -14,8 +14,9 @@ defmodule Vagus.App.Readiness do
   An app whose manifest has a `watchdog` URL is also asked, every
   `probe_interval_ms/0` once it is ready, whether it still answers there:
   the template and what counts as an answer are
-  `Vagus.Addon.ProbeURL.watchdog_spec/4`'s and the probe's this replaces
-  (a TCP connect, or an HTTP status below 300). Two misses in a row are an
+  `Vagus.Addon.ProbeURL.watchdog_spec/4`'s and
+  `Vagus.Addon.Watchdog.Probe`'s (a TCP connect, or an HTTP status below
+  300). Two misses in a row are an
   unhealthy app. A probe that could not be aimed, the instance having no
   address, is neither a miss nor an answer.
 

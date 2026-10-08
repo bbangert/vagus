@@ -33,7 +33,7 @@ defmodule Vagus.App.Controller.View do
     recreate: nil,
     failure: nil,
     succeeded: nil,
-    restarts: %{attempts: 0, last: nil, sequences: []},
+    restarts: %{attempts: 0, last: nil},
     engine_restarts: %{seen: [], actions: []},
     probe: %{misses: 0, at: nil},
     pull: nil,
@@ -86,9 +86,18 @@ defmodule Vagus.App.Controller.View do
       fingerprint: fingerprint(spec)
     }
 
-    # A running instance nothing is recorded about was made before this
-    # status existed, and is taken as made for what is wanted now.
-    made_for = st.made_for || if(running?, do: target)
+    run_once? = match?(%{config: %Config{startup: "once"}}, spec)
+    wanted? = Schema.wanted?(spec) and not resource.deleting?
+
+    # A run-once app's container that ran and exited with 0 is its success
+    # to see, with or without a record of it.
+    done? = run_once? and done?(inst)
+
+    # An instance nothing is recorded about, running or done, was made
+    # before this status existed, and is taken as made for what is wanted.
+    made_for = st.made_for || if(running? or done?, do: target)
+    counters? = made_for != nil and counters(made_for) == counters(target)
+    expected? = inst != nil and st.expected_exit == inst.id
 
     %{
       resource: resource,
@@ -102,27 +111,50 @@ defmodule Vagus.App.Controller.View do
       known: known,
       same?: same?,
       # The same instance in the same run of it: the engine starts a
-      # container again under its id, and what was learnt of the run before
-      # is void.
+      # container again under its id, and readiness and probes are of one
+      # run.
       same_run?: same? and known.started_at == inst.started_at,
       running?: running?,
       target: target,
       made_for: made_for,
-      counters?: made_for != nil and counters(made_for) == counters(target),
-      expected?: inst != nil and st.expected_exit == inst.id,
-      recreate?: inst != nil and st.recreate == inst.id,
+      counters?: counters?,
+      expected?: expected?,
+      finished?: finished?(wanted?, done?, counters?, expected?),
+      # An app is its manifest's slug: the container, the data directory
+      # and the token row are all named for one or the other.
+      mismatch?: mismatch?(resource),
+      api?: o.api?,
+      token_pending?: profile.token() == :supervisor,
       deleting?: resource.deleting?,
-      wanted?: Schema.wanted?(spec) and not resource.deleting?,
+      wanted?: wanted?,
       held?: Map.get(spec, :holds, %{}) != %{},
       removes?: profile.on_stop() == :remove,
       native?: profile.backend() == Vagus.App.Backend.Native,
-      run_once?: match?(%{config: %Config{startup: "once"}}, spec),
-      id: inst && inst.id,
-      grace: inst && inst[:grace],
-      exit_code: inst && inst.exit_code,
+      run_once?: run_once?,
       image: o.image
     }
+    |> Map.merge(named(inst, st))
   end
+
+  defp named(nil, _st), do: %{id: nil, grace: nil, exit_code: nil, recreate?: false}
+
+  defp named(inst, st) do
+    %{
+      id: inst.id,
+      grace: inst[:grace],
+      exit_code: inst.exit_code,
+      recreate?: st.recreate == inst.id
+    }
+  end
+
+  defp finished?(wanted?, done?, counters?, expected?),
+    do: wanted? and done? and counters? and not expected?
+
+  defp done?(%{state: state, exit_code: 0}) when state in [:exited, :dead], do: true
+  defp done?(_instance), do: false
+
+  defp mismatch?(%Resource{name: name, spec: %{config: %Config{slug: slug}}}), do: slug != name
+  defp mismatch?(_core), do: false
 
   # What status carries from pass to pass, brought up to this one.
   defp carried(%{st: st, inst: inst, known: known, now: now} = v, o) do
@@ -147,14 +179,14 @@ defmodule Vagus.App.Controller.View do
     # An image that could not be removed, another container using it, is
     # left: learnt from the failure, since the image is there either way.
     cleaned =
-      if match?(%{name: :remove_image}, o.failed_action),
+      if match?(%{name: :remove_image, reason: {:status, 409, _message}}, o.failed_action),
         do: Enum.uniq([:image | st.cleaned]),
         else: st.cleaned
 
     base = %{
       st
       | instance: record,
-        made_for: if(inst, do: v.made_for),
+        made_for: v.made_for,
         expected_exit: if(v.expected?, do: st.expected_exit),
         recreate: if(v.recreate?, do: st.recreate),
         failure: failure(st.failure, o.failed_action, v.generation),
@@ -162,7 +194,7 @@ defmodule Vagus.App.Controller.View do
         restarts: restarts,
         engine_restarts: engine,
         probe: probe(st.probe, o.probe, watched?, now),
-        pull: pull.record,
+        pull: if(o.stale_pull, do: st.pull, else: pull.record),
         cleaned: cleaned,
         waiting_on: [],
         restart_required: v.running? and drifted?(v)
@@ -183,6 +215,7 @@ defmodule Vagus.App.Controller.View do
       retire?: not v.wanted? or v.expected? or v.recreate? or stale?(v),
       dispose?: v.deleting? or v.recreate? or (v.removes? and discarded?(v)),
       pull_waiting?: match?({:pulling, true}, o.pull),
+      stale_pull: o.stale_pull,
       token_held?: o.token in [:current, :other],
       token:
         if(inst != nil and not inst.token? and o.token != :none, do: :none_to_put, else: o.token),
@@ -203,7 +236,7 @@ defmodule Vagus.App.Controller.View do
     created? = inst != nil and inst.state == :created
 
     not v.wanted? or v.expected? or not v.counters? or
-      if(created?, do: drifted?(v), else: not v.same?)
+      if(created?, do: drifted?(v), else: not v.same? and not v.finished?)
   end
 
   # Of an app being removed, an image that is still there; of any other,
@@ -224,7 +257,7 @@ defmodule Vagus.App.Controller.View do
       succeeded?: st.succeeded == v.generation,
       failed?: base.failure != nil and base.failure.class == :permanent,
       retry_in: retry_in(base.failure, v.now),
-      crash_loop?: v.wanted? and v.running? and loop.looping?,
+      crash_loop?: v.running? and loop.looping?,
       loop_spent?: loop.spent? or o.image == nil,
       loop_actions: loop.actions,
       exited?: exited?,
@@ -235,11 +268,11 @@ defmodule Vagus.App.Controller.View do
     }
   end
 
-  # Ended by itself: there, having run, with nobody having asked for it.
-  defp exited?(%{inst: inst} = v) do
-    judged?(v) and v.same? and not v.running? and inst.state != :created and v.counters? and
-      not v.expected? and not v.recreate?
-  end
+  # Ended by itself: there, and having run. One whose exit was asked for,
+  # that was made for other counters or that nothing is recorded of has
+  # been removed by a clause before any that reads this.
+  defp exited?(%{inst: inst} = v),
+    do: judged?(v) and inst != nil and not v.running? and inst.state != :created
 
   # Or gone, after it was seen running.
   defp gone?(%{inst: nil, known: %{running?: true, id: id}} = v),
@@ -293,6 +326,16 @@ defmodule Vagus.App.Controller.View do
   # it is about this generation. A stop that is still under way is none.
   defp failure(recorded, nil, generation),
     do: if(recorded != nil and recorded.generation == generation, do: recorded)
+
+  # A failure is of the generation whose pass performed the action, which
+  # the action's arguments say: one of another generation is about a spec
+  # that has been written to since. It is counted once, known by its
+  # stamp: a pass that fails after its commit is handed the same again.
+  defp failure(recorded, %{generation: other}, generation) when other != generation,
+    do: failure(recorded, nil, generation)
+
+  defp failure(%{action: action, at: at} = recorded, %{name: action, at: at}, generation),
+    do: failure(recorded, nil, generation)
 
   defp failure(recorded, %{name: action, reason: reason, at: at}, generation) do
     case Failure.classify(action, reason) do
@@ -359,17 +402,11 @@ defmodule Vagus.App.Controller.View do
 
   defp loop(_engine, _policy, _now), do: %{looping?: false, spent?: false, actions: []}
 
-  # One more attempt, and whether there is none left: the attempts of this
-  # run, or the runs of this window.
-  defp spend(%{attempts: attempts, sequences: sequences} = restarts, {:restart, budget}, now) do
-    recent = Enum.filter(sequences, &(Stamp.age(&1, now) < budget.sequence_window_ms))
-
-    cond do
-      attempts >= budget.attempts -> {restarts, true}
-      attempts == 0 and length(recent) >= budget.max_sequences -> {restarts, true}
-      attempts == 0 -> {%{attempts: 1, last: now, sequences: [now | recent]}, false}
-      true -> {%{attempts: attempts + 1, last: now, sequences: recent}, false}
-    end
+  # One more attempt, and whether there is none left.
+  defp spend(%{attempts: attempts} = restarts, {:restart, budget}, now) do
+    if attempts >= budget.attempts,
+      do: {restarts, true},
+      else: {%{attempts: attempts + 1, last: now}, false}
   end
 
   defp spend(restarts, _policy, _now), do: {restarts, false}

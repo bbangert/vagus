@@ -78,6 +78,8 @@ defmodule Vagus.App.Controller.ReconcileTest.Rows do
         probes?: false,
         probe: :none,
         data?: false,
+        stale_pull: nil,
+        api?: true,
         failed_action: nil
       },
       Map.new(over)
@@ -141,9 +143,7 @@ defmodule Vagus.App.Controller.ReconcileTest.Rows do
     )
   end
 
-  def restarts(attempts, last_ago \\ 1_000, sequences \\ nil) do
-    %{attempts: attempts, last: ago(last_ago), sequences: sequences || [ago(last_ago)]}
-  end
+  def restarts(attempts, last_ago \\ 1_000), do: %{attempts: attempts, last: ago(last_ago)}
 
   def pulled(over \\ %{}) do
     Map.merge(
@@ -154,7 +154,9 @@ defmodule Vagus.App.Controller.ReconcileTest.Rows do
 
   def action(name, args \\ %{}), do: [{:action, name, args}]
   def later(ms), do: [{:requeue_after, ms}]
-  def failed(name, reason), do: %{name: name, reason: reason, at: ago(0)}
+
+  def failed(name, reason, generation \\ 3),
+    do: %{name: name, reason: reason, at: ago(0), generation: generation}
 
   @doc "`{name, resource, observation, {kind, reason, state, wire}, effects, status}`"
   def all do
@@ -186,9 +188,122 @@ defmodule Vagus.App.Controller.ReconcileTest.Rows do
       {"a pull another app waits for is not this one's to cancel", app(@container, %{run: false}),
        obs(image_present?: false, pull: {:pulling, false}), {:idle, :stopped, :stopped, :stopped},
        [], %{}},
-      {"a stop takes the token away before the container",
+      {"a plain stop leaves the token for as long as the container runs",
        app(@container, %{run: false}, status: running()), up,
-       {:progressing, :revoking_token, :stopping, :startup}, action(:remove_token), %{}},
+       {:progressing, :stopping, :stopping, :startup}, action(:stop, %{grace: nil}),
+       %{expected_exit: "c1"}},
+      {"a stopped container goes before its token does",
+       app(@container, %{run: false}, status: running(expected_exit: "c1")),
+       obs(instance: inst(:exited), token: :current),
+       {:progressing, :removing, :stopping, :stopped}, action(:remove), %{}},
+      {"Core stopped and kept: then its token goes",
+       core(%{run: false}, status: running(expected_exit: "c1")),
+       obs(instance: inst(:exited), token: :current, image: nil),
+       {:progressing, :revoking_token, :stopping, :stopped}, action(:remove_token), %{}},
+      {"deleting, nothing left but a token of some instance: it goes before the finalizer",
+       app(@container, %{}, deleting?: true), obs(image_present?: false, token: :other),
+       {:progressing, :revoking_token, :stopping, :stopped}, action(:remove_token), %{}},
+      {"Failed and running, the token table replaced: its token is put back all the same",
+       watched(%{},
+         status: running(failure: failure(action: :run, cause: :restart_budget_exhausted))
+       ), obs(instance: inst(:running, health: :unhealthy)),
+       {:progressing, :indexing_token, :starting, :startup},
+       action(:put_token, %{instance: "c1"}), %{}},
+      {"a start asked for during a back-off starts at once, the count forgotten",
+       watched(%{start_counter: 1},
+         status: %{made_for: %{start_counter: 0}, restarts: restarts(3, 1_000)}
+       ), obs(), {:progressing, :creating, :creating, :stopped}, action(:create),
+       %{restarts: View.blank().restarts}},
+      {"what the count was made under is kept while there is no instance",
+       watched(%{}, status: %{made_for: :this, restarts: restarts(2, 1_000)}), obs(),
+       {:progressing, :backing_off, :restarting, :stopped}, later(19_000),
+       %{made_for: target(watched().spec), restarts: restarts(2, 1_000)}},
+      {"a failure of an action decided for an earlier generation is not this one's", app(),
+       obs(failed_action: failed(:create, {:status, 400, "bad"}, 2)),
+       {:progressing, :creating, :creating, :stopped}, action(:create), %{failure: nil}},
+      {"a failure handed over twice is counted once",
+       app(@container, %{},
+         status: %{
+           made_for: :this,
+           failure: failure(class: :transient, cause: :engine_error, at: ago(0))
+         }
+       ),
+       obs(
+         instance: inst(:created),
+         token: :current,
+         failed_action: failed(:start, {:status, 500, "x"})
+       ), {:progressing, :engine_error, :starting, :stopped}, later(1_000), %{}},
+      {"a run-once container that exited with 0 and nothing is recorded of has succeeded", once(),
+       obs(instance: inst(:exited, exit_code: 0)), {:idle, :succeeded, :succeeded, :stopped}, [],
+       %{succeeded: 3, made_for: target(once().spec)}},
+      {"a start asked for of a run-once app that succeeded runs it again",
+       once(%{start_counter: 1}, status: %{made_for: %{start_counter: 0}}),
+       obs(instance: inst(:exited, exit_code: 0)), {:progressing, :removing, :stopping, :stopped},
+       action(:remove), %{}},
+      {"a plain app that exited with 0 has not succeeded: it crashed",
+       app(@container, %{}, status: running()), obs(instance: inst(:exited, exit_code: 0)),
+       {:failed, :crashed, :failed, :error}, [], %{}},
+      {"a pull of an image that is not wanted any more is cancelled",
+       app(@container, %{}, status: %{pull: pulled(image: "image:0")}),
+       obs(image_present?: false, stale_pull: "image:0"),
+       {:progressing, :cancelling_pull, :pulling, :stopped},
+       action(:cancel_pull, %{image: "image:0"}), %{pull: pulled(image: "image:0")}},
+      {"Core's token not there yet is waited for", core(%{}, status: running()),
+       obs(instance: inst(:running, token?: false), image: nil),
+       {:progressing, :waiting_for_token, :starting, :startup}, later(5_000), %{}},
+      {"deleting: an image whose removal failed otherwise is asked for again",
+       app(@container, %{}, deleting?: true),
+       obs(data?: true, failed_action: failed(:remove_image, {:timeout, :recv})),
+       {:progressing, :removing_image, :deleting, :stopped},
+       action(:remove_image, %{image: "image:1"}), %{cleaned: []}},
+      {"an app named otherwise than its manifest's slug: Failed, and nothing is done",
+       %{app() | name: "another"}, obs(leftover: :running, data?: true),
+       {:failed, :name_mismatch, :failed, :error}, [], %{}},
+      {"such an app being deleted is let go, its data untouched",
+       %{app(@container, %{}, deleting?: true) | name: "another"}, obs(data?: true),
+       {:idle, :deleted, :deleting, :stopped}, [{:remove_finalizer, :app, "another", :app}], %{}},
+      {"the API not accepting: nothing is created", app(), obs(api?: false),
+       {:progressing, :waiting_for_api, :waiting, :stopped}, later(2_000), %{}},
+      {"the API not accepting: a container that was created is not started",
+       app(@container, %{}, status: %{made_for: :this}),
+       obs(instance: inst(:created), token: :current, api?: false),
+       {:progressing, :waiting_for_api, :waiting, :stopped}, later(2_000), %{}},
+      {"the API not accepting is nothing to a running app", app(@container, %{}, status: ready),
+       Map.put(up, :api?, false), {:ready, :ready, :ready, :started}, [], %{}},
+      {"an expected exit of another instance is not this one's: a crash",
+       watched(%{}, status: running(expected_exit: "c0")), obs(instance: inst(:exited)),
+       {:progressing, :crashed, :restarting, :stopped}, action(:remove),
+       %{restarts: %{attempts: 1, last: now()}, expected_exit: "c1"}},
+      {"an instance other than the one recorded, running: taken as it is, nothing counted",
+       watched(%{},
+         status: running(instance: seen(id: "c0", ready?: true), restarts: restarts(1))
+       ), up, {:ready, :ready, :ready, :started}, later(600_000),
+       %{instance: seen(ready?: true, since: now()), restarts: restarts(1)}},
+      {"a gate that is false but names the instance is closed",
+       gated(app(@container, %{}, status: running()), "c1", false),
+       obs(instance: inst(), token: :current, gates: [:dns_ready]),
+       {:progressing, :waiting_for_gate, :starting, :startup}, [], %{ready_since: nil}},
+      {"a transient failure of a stop holds nothing back: asked again",
+       app(@container, %{run: false}, status: running()),
+       obs(instance: inst(), failed_action: failed(:stop, {:status, 500, "x"})),
+       {:progressing, :stopping, :stopping, :startup}, action(:stop, %{grace: nil}),
+       %{
+         failure:
+           failure(
+             action: :stop,
+             class: :transient,
+             cause: :engine_error,
+             detail: {:status, 500, "x"},
+             at: ago(0)
+           )
+       }},
+      {"a paused instance of an app not to run is stopped",
+       app(@container, %{run: false}, status: running()), obs(instance: inst(:paused)),
+       {:progressing, :stopping, :stopping, :startup}, action(:stop, %{grace: nil}), %{}},
+      {"a stamp from another incarnation has no age: the back-off starts over",
+       watched(%{},
+         status: %{made_for: :this, restarts: %{attempts: 1, last: %Stamp{incarnation: 9, at: 5}}}
+       ), obs(), {:progressing, :backing_off, :restarting, :stopped}, later(10_000), %{}},
       {"a token of an instance that is gone is taken away too", app(@container, %{run: false}),
        obs(token: :other), {:progressing, :revoking_token, :stopping, :stopped},
        action(:remove_token), %{}},
@@ -416,45 +531,24 @@ defmodule Vagus.App.Controller.ReconcileTest.Rows do
       {"the attempts of the run are spent: Failed",
        watched(%{}, status: running(restarts: restarts(5))), obs(instance: inst(:exited)),
        {:failed, :restart_budget_exhausted, :failed, :error}, [], %{}},
-      {"the runs of the window are spent: Failed",
-       watched(%{},
-         status:
-           running(
-             restarts: %{attempts: 0, last: nil, sequences: for(n <- 1..10, do: ago(n * 1_000))}
-           )
-       ), obs(instance: inst(:exited)), {:failed, :restart_budget_exhausted, :failed, :error}, [],
-       %{}},
       {"unhealthy with the budget spent: Failed, and left running",
        watched(%{}, status: running(restarts: restarts(5))),
        obs(instance: inst(:running, health: :unhealthy), token: :current),
        {:failed, :restart_budget_exhausted, :failed, :error}, [], %{}},
       {"a crash: counted, and the dead container removed", watched(%{}, status: running()),
        obs(instance: inst(:exited)), {:progressing, :crashed, :restarting, :stopped},
-       action(:remove),
-       %{restarts: %{attempts: 1, last: now(), sequences: [now()]}, expected_exit: "c1"}},
+       action(:remove), %{restarts: %{attempts: 1, last: now()}, expected_exit: "c1"}},
       {"a second crash of the run: counted in the same run",
        watched(%{}, status: running(restarts: restarts(1, 20_000))), obs(instance: inst(:exited)),
        {:progressing, :crashed, :restarting, :stopped}, action(:remove),
-       %{restarts: %{attempts: 2, last: now(), sequences: [ago(20_000)]}}},
-      {"runs older than the window do not count against a new one",
-       watched(%{},
-         status:
-           running(
-             restarts: %{
-               attempts: 0,
-               last: nil,
-               sequences: for(n <- 1..10, do: ago(1_800_000 + n))
-             }
-           )
-       ), obs(instance: inst(:exited)), {:progressing, :crashed, :restarting, :stopped},
-       action(:remove), %{restarts: %{attempts: 1, last: now(), sequences: [now()]}}},
+       %{restarts: %{attempts: 2, last: now()}}},
       {"a native app that ended: counted, nothing to remove", native(%{}, status: running()),
        obs(token: :none, image: nil), {:progressing, :crashed, :restarting, :stopped}, later(0),
-       %{restarts: %{attempts: 1, last: now(), sequences: [now()]}, instance: nil}},
+       %{restarts: %{attempts: 1, last: now()}, instance: nil}},
       {"unhealthy while running: counted and stopped", watched(%{}, status: ready),
        obs(instance: inst(:running, health: :unhealthy), token: :current),
        {:progressing, :unhealthy, :restarting, :startup}, action(:stop, %{grace: nil}),
-       %{restarts: %{attempts: 1, last: now(), sequences: [now()]}, expected_exit: "c1"}},
+       %{restarts: %{attempts: 1, last: now()}, expected_exit: "c1"}},
       {"a second probe unanswered: unhealthy",
        watched(%{}, status: Map.merge(ready, %{probe: %{misses: 1, at: ago(120_000)}})),
        obs(instance: inst(), token: :current, probes?: true, probe: :unhealthy),
@@ -635,8 +729,8 @@ defmodule Vagus.App.Controller.ReconcileTest.Rows do
     ]
   end
 
-  defp gated(app, id) do
-    Resource.put_condition(app, Resource.condition(:dns_ready, true, :registered, 3, id))
+  defp gated(app, id, open? \\ true) do
+    Resource.put_condition(app, Resource.condition(:dns_ready, open?, :registered, 3, id))
   end
 end
 
@@ -651,6 +745,14 @@ defmodule Vagus.App.Controller.ReconcileTest do
   alias Vagus.Test.AppManifests
 
   @moduletag :capture_log
+
+  # Every action says which generation decided it; one row checks that.
+  defp ungenerated(effects) do
+    Enum.map(effects, fn
+      {:action, name, %{generation: 3} = args} -> {:action, name, Map.delete(args, :generation)}
+      effect -> effect
+    end)
+  end
 
   defp conditions(:ready, reason), do: outcome({true, false, false}, reason)
   defp conditions(:progressing, reason), do: outcome({false, true, false}, reason)
@@ -692,7 +794,14 @@ defmodule Vagus.App.Controller.ReconcileTest do
           end
       end
 
-      assert returned == effects
+      assert ungenerated(returned) == effects
+    end
+  end
+
+  test "every action carries the generation that decided it" do
+    for {_name, resource, observation, _expected, _effects, _status} <- Rows.all(),
+        {:action, _name, args} <- elem(Controller.reconcile(resource, observation), 1) do
+      assert args.generation == resource.generation
     end
   end
 
@@ -829,8 +938,7 @@ defmodule Vagus.App.Controller.ReconcileTest do
         succeeded: AppManifests.pick([nil, 2, 3]),
         restarts: %{
           attempts: AppManifests.pick([0, 1, 5, 9]),
-          last: stamp(),
-          sequences: for(_ <- 1..AppManifests.pick([1, 3, 11]), do: stamp())
+          last: stamp()
         },
         engine_restarts: %{
           seen: for(_ <- 1..AppManifests.pick([1, 3]), do: stamp()),
@@ -889,6 +997,8 @@ defmodule Vagus.App.Controller.ReconcileTest do
           probes?: AppManifests.pick([true, false]),
           probe: AppManifests.pick([:none, :healthy, :unhealthy, :skipped]),
           data?: AppManifests.pick([true, false]),
+          stale_pull: AppManifests.pick([nil, nil, "image:0"]),
+          api?: AppManifests.pick([true, true, false]),
           failed_action:
             some(fn ->
               Rows.failed(

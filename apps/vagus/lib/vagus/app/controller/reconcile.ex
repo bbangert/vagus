@@ -24,6 +24,7 @@ defmodule Vagus.App.Controller.Reconcile do
 
   @readiness_poll_ms 5_000
   @removing_poll_ms 1_000
+  @api_poll_ms 2_000
 
   @blank View.blank()
 
@@ -49,6 +50,12 @@ defmodule Vagus.App.Controller.Reconcile do
   # credo:disable-for-next-line Credo.Check.Refactor.CyclomaticComplexity
   defp decide(v) do
     cond do
+      v.mismatch? and v.deleting? ->
+        out(v, :idle, :deleted, :deleting, %{}, [release(v)])
+
+      v.mismatch? ->
+        out(v, :failed, :name_mismatch, :failed)
+
       v.leftover == :running ->
         act(v, :removing_leftover, :stopping, :stop_leftover)
 
@@ -58,10 +65,13 @@ defmodule Vagus.App.Controller.Reconcile do
       v.removing? ->
         wait(v, :removing, :stopping, @removing_poll_ms)
 
+      v.stale_pull != nil ->
+        act(v, :cancelling_pull, :pulling, {:cancel_pull, %{image: v.stale_pull}})
+
       v.down? and v.pull_waiting? ->
         act(v, :cancelling_pull, :stopping, :cancel_pull, pull: nil)
 
-      v.down? and v.token_held? ->
+      v.deleting? and v.token_held? ->
         act(v, :revoking_token, :stopping, :remove_token)
 
       v.running? and v.retire? ->
@@ -69,6 +79,9 @@ defmodule Vagus.App.Controller.Reconcile do
 
       v.present? and v.dispose? ->
         act(v, :removing, :stopping, :remove, expected_exit: v.id)
+
+      v.down? and v.token_held? ->
+        act(v, :revoking_token, :stopping, :remove_token)
 
       v.deleting? and v.image_owed? ->
         act(v, :removing_image, :deleting, :remove_image)
@@ -81,6 +94,9 @@ defmodule Vagus.App.Controller.Reconcile do
 
       not v.wanted? ->
         out(v, :idle, if(v.held?, do: :held, else: :stopped), :stopped, stopped(v))
+
+      v.running? and v.token in [:absent, :other] ->
+        act(v, :indexing_token, :starting, :put_token)
 
       v.succeeded? ->
         out(v, :idle, :succeeded, :succeeded)
@@ -97,7 +113,7 @@ defmodule Vagus.App.Controller.Reconcile do
       v.crash_loop? ->
         act(v, :crash_loop, :stopping, stop(v), recreating(v))
 
-      v.exited? and v.run_once? and v.exit_code == 0 ->
+      v.finished? ->
         out(v, :idle, :succeeded, :succeeded, %{succeeded: v.generation})
 
       v.ended? and v.policy == :never ->
@@ -116,6 +132,9 @@ defmodule Vagus.App.Controller.Reconcile do
 
       v.unhealthy? ->
         act(v, :unhealthy, :restarting, stop(v), restarts: v.spend, expected_exit: v.id)
+
+      not v.running? and not v.api? ->
+        wait(v, :waiting_for_api, :waiting, @api_poll_ms)
 
       v.absent? and v.backoff_in > 0 ->
         wait(v, :backing_off, :restarting, v.backoff_in)
@@ -143,6 +162,9 @@ defmodule Vagus.App.Controller.Reconcile do
 
       v.absent? ->
         act(v, :creating, :creating, :create, launching(v))
+
+      v.token == :none_to_put and v.token_pending? ->
+        wait(v, :waiting_for_token, :starting, @readiness_poll_ms)
 
       v.token == :none_to_put ->
         out(v, :failed, :no_token, :failed)
@@ -233,6 +255,8 @@ defmodule Vagus.App.Controller.Reconcile do
 
   defp act(v, reason, state, action, changes \\ []) do
     {name, args} = if is_tuple(action), do: action, else: {action, args(action, v)}
+    # The generation, for whoever reads of the action's failure later.
+    args = Map.put(args, :generation, v.generation)
     out(v, :progressing, reason, state, Map.new(changes), [{:action, name, args}])
   end
 

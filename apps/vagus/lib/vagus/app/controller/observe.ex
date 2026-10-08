@@ -63,6 +63,8 @@ defmodule Vagus.App.Controller.Observe do
         image: image,
         image_present?: present?,
         pull: pull,
+        stale_pull: stale_pull(status[:pull], image, {controller, app}, i),
+        api?: Map.get(context, :api_ready, fn -> true end).(),
         token: token,
         waiting_on: waiting_on(resource, instance, profile, i),
         gates: Map.get(context, :gates, []),
@@ -177,6 +179,14 @@ defmodule Vagus.App.Controller.Observe do
     end
   end
 
+  # The image this app asked for before the one it wants, if it still waits
+  # for that pull: the lane has one slot, and the image wanted waits behind it.
+  defp stale_pull(%{image: asked}, image, waiter, i) when is_binary(asked) and asked != image do
+    if waiter in (waiters(asked, i) || []), do: asked
+  end
+
+  defp stale_pull(_recorded, _image, _waiter, _i), do: nil
+
   # The worker answers at once whatever a pull is doing. Without it there
   # is no pull to wait for.
   defp waiters(image, i) do
@@ -265,7 +275,9 @@ defmodule Vagus.App.Controller.Observe do
   defp data?(%{config: %Config{slug: slug}}, context), do: Prepare.data?(slug, context.facts)
   defp data?(_spec, _context), do: false
 
-  # Without its arguments: they are the pass's own and say nothing here.
+  # Of its arguments only the generation the action was decided for.
   defp failed(nil), do: nil
-  defp failed(%{name: name, reason: reason, at: at}), do: %{name: name, reason: reason, at: at}
+
+  defp failed(%{name: name, args: args, reason: reason, at: at}),
+    do: %{name: name, reason: reason, at: at, generation: is_map(args) && args[:generation]}
 end

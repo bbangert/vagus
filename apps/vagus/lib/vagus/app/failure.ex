@@ -48,6 +48,7 @@ defmodule Vagus.App.Failure do
           | :engine_refused
           | :pull_failed
           | :pull_crashed
+          | :crashed
           | :unknown
 
   @typedoc "`detail` is `%{port: port | nil}` for a port conflict and otherwise what failed, as given."
@@ -89,6 +90,9 @@ defmodule Vagus.App.Failure do
   end
 
   defp row(:pull, {:crashed, _reason}), do: {:transient, :pull_crashed}
+  # An action that raised: a defect or a config nothing here can use, and
+  # the same again on every attempt.
+  defp row(_action, {:crashed, _kind}), do: {:permanent, :crashed}
   # The engine answers a stop when the container has exited. The call gave
   # up; the stop goes on.
   defp row(:stop, {:timeout, _which}), do: {:pending, :still_stopping}

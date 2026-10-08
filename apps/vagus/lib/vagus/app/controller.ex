@@ -33,6 +33,9 @@ defmodule Vagus.App.Controller do
       is asked at, and `:host_address`, `(port -> host)` for the probe of
       an app on the host network
     * `:supervisor_token`, `(-> token | nil)`
+    * `:api_ready`, `(-> boolean)`: whether the API an app calls as it
+      starts is accepting. No instance is created or started while it
+      is not (default: always)
     * `:prepare`, options for `Vagus.App.Prepare.run/3`
     * `:observe_timeout`, milliseconds
     * `:audit`, `({controller, app}, action, context -> term)`, called
@@ -43,9 +46,15 @@ defmodule Vagus.App.Controller do
   An action that asks the engine for something runs in the `:engine` lane.
   The rest run in none: a pull request and its cancel return at once, the
   token table answers from memory, and a native app's start and stop
-  (`:start_process`, `:stop_process`) are calls within this VM, which must
-  not wait behind four slow engine calls to bring the broker back. Removing
-  an app's data is file work that no lane counts.
+  (`:start_process`, `:stop_process`) are calls within this VM. Removing an
+  app's data is file work that no lane counts.
+
+  A lane bounds actions, not passes. A pass holds one of its runtime's
+  steps from its observation to the end of its action, the wait for a lane
+  included, so a runtime with as many steps as the engine lane has slots
+  would observe nothing while that many slow engine actions run.
+  `Vagus.App.wiring/1` therefore gives the App runtime more steps than the
+  lane has slots.
   """
 
   @behaviour Vagus.Resource.Controller
@@ -110,19 +119,21 @@ defmodule Vagus.App.Controller do
     perform(action, args, context)
   end
 
-  # Made here and nowhere kept: the token goes into the container's
-  # environment and is read back from there.
+  # The token is made here and nowhere kept: it goes into the container's
+  # environment and is read back from there. What comes before the mint
+  # holds no token, and what it raises is reported like any other crash.
   defp perform(:create, _args, %{resource: %{name: app, spec: spec}} = context) do
     profile = Profile.of(spec)
     {backend, opts} = Observe.backend(profile, context)
 
-    Token.guard(fn ->
-      with {:ok, prepared} <- prepare(spec, context),
-           {:ok, config} <-
-             build(spec, context.facts, Map.put(prepared, :token, Token.mint())) do
-        backend.create(profile.container_name(app), config, opts)
-      end
-    end)
+    with {:ok, prepared} <- prepare(spec, context) do
+      Token.guard(fn ->
+        with {:ok, config} <-
+               build(spec, context.facts, Map.put(prepared, :token, Token.mint())) do
+          backend.create(profile.container_name(app), config, opts)
+        end
+      end)
+    end
   end
 
   defp perform(:start, _args, context), do: instance(context, & &1.start(&2, &3))
@@ -167,6 +178,8 @@ defmodule Vagus.App.Controller do
            token when is_binary(token) <- Token.of(source(profile, context), env) do
         AuthIndex.put(app, token, instance: context.instance)
       else
+        {:unavailable, reason} -> {:error, {:unreachable, reason}}
+        {:error, failure} -> {:error, failure}
         _another_instance_or_none -> {:error, {:other, :instance_changed}}
       end
     end)
@@ -183,8 +196,9 @@ defmodule Vagus.App.Controller do
     backend.remove_image(image, opts)
   end
 
-  defp perform(:remove_data, _args, %{resource: %{name: app}} = context),
-    do: Prepare.remove_data(app, context.facts)
+  # By the manifest's slug, as the directory was made and is looked for.
+  defp perform(:remove_data, _args, %{resource: %{spec: %{config: %{slug: slug}}}} = context),
+    do: Prepare.remove_data(slug, context.facts)
 
   defp instance(%{resource: %{name: app, spec: spec}} = context, call) do
     profile = Profile.of(spec)
