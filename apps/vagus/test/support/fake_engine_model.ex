@@ -28,8 +28,9 @@ defmodule Vagus.Test.FakeEngine.Model do
   Options: `:stop_delay` (default 0), `:notify`, a process
   told `{:fake_engine, :client_closed, path}` when a client closes a stream
   that had stalled, and `:on_request`, a function called here with each
-  request as it arrives and the containers as they are then, before the
-  request changes anything: what the engine saw, and in what order.
+  request as it is served and the containers as they are then, before the
+  request changes anything: what the engine saw, and in what order. A
+  request that was held is served when it is let go.
   """
 
   use GenServer
@@ -356,7 +357,6 @@ defmodule Vagus.Test.FakeEngine.Model do
   end
 
   def handle_call({:request, entry}, {pid, _tag} = from, state) do
-    state.on_request.(entry, state.containers)
     state = %{state | log: [entry | state.log]}
 
     case Enum.split_with(state.holds, fn {method, part, _tell} ->
@@ -373,6 +373,8 @@ defmodule Vagus.Test.FakeEngine.Model do
   end
 
   defp served(entry, pid, state) do
+    state.on_request.(entry, state.containers)
+
     failing =
       Enum.find_value(state.fails, fn {{method, part}, answer} ->
         if entry.method == method and entry.path =~ part, do: answer

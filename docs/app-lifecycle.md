@@ -597,6 +597,20 @@ observe:
 A native app has no image, container or token: its sequence is the wave,
 then one start.
 
+A start, a stop and a remove are of the instance the pass observed: the
+action carries its id and asks the engine by that id, never by the
+container's name. A name is whichever container holds it when the request
+arrives, and one put there since the observation was never decided about:
+started, it would run with a token nobody put; stopped or removed, it
+would go as the one whose exit was expected. For an id that is gone the
+engine answers 404, which is the end a stop or a remove asked for and, to
+a start, a failure for now (`not_found`): the next pass decides about what
+is there. The token put pins the id the same way, by reading the instance
+again. A create is by name, there being no instance yet, and is refused if
+the name is taken. A leftover is by name too: whatever holds the other
+slot's name is to go. A native app's instance is the process under its
+name in this VM, which only its own passes start, one at a time.
+
 The invariant: a container this controller starts never runs before auth
 knows its token. It holds because both are the App controller's own
 actions, in that order: start is decided only by a pass that observes the
@@ -789,7 +803,7 @@ reboot, is removed and made anew without counting anything.
 | `restart_policy` | What happens |
 |---|---|
 | `:never` (watchdog off, or runs once) | Failed, `crashed`, with the exit code; the dead container stays, `run` is unchanged. An app that runs once and exits 0 has succeeded: none of the three conditions, wire `stopped`. |
-| `{:restart, budget}` | One more attempt: the dead container is removed and the start sequence waits out the pause, 10 s doubling. The sixth in a row is Failed (`restart_budget_exhausted`). Ready for ten minutes forgets the attempts. |
+| `{:restart, budget}` | One more attempt: the dead container is removed and the start sequence waits out the pause, 10 s doubling. The sixth in a row is Failed (`restart_budget_exhausted`). Ready for ten minutes forgets the attempts: ten minutes of one run of one instance, so a container found in the place of the one recorded, or the same one started again, begins its own. |
 | `{:crash_loop, rule}` (Core) | Nothing: the engine restarts it. Each restart, a higher restart count with a new start time, is noted: the count is the engine's total, so one that rose by several since the last pass is that many restarts, all noted at the time they were seen, and no more are kept than the rule counts. A count that fell, or rose with the start time unchanged, is none. Three in ten minutes have the container removed and made anew, at most ten times in thirty minutes, then Failed (`crash_loop`). Making it anew needs Core's container config: until that is here, three in ten minutes are Failed at once (see "Core, so far"). |
 
 The counts are status and every instant in them is a stamp: they start
@@ -829,7 +843,11 @@ its spec as it is now, an app nothing was observed of among them and one
 whose spec was written to after its last verdict; Failed past a readiness
 deadline counts, so nobody waits on an app that may never answer. It
 waits for at most its `wave_wait_ms`
-from when it first waited. The apps it waits for are in its status
+from when that wait began (`wave_since`). A wait is of one launch: the
+stamp is kept only while there is somebody to wait for, so an app that has
+its instance, is Ready or is not to run has none, and one made anew while
+an earlier wave is on its way again waits its whole time again. The apps it
+waits for are in its status
 (`waiting_on`) and are its `references/1`, so a change to any of them is
 its next pass: an earlier app becoming Ready starts it at once. It refers
 to them only while it waits, and only to those still starting, so an app

@@ -492,8 +492,7 @@ defmodule Vagus.App.Controller.SystemTest do
             Model.hold(engine, :post, "/start")
             {:ok, _app} = Store.update_spec(:app, @plain, [{:inc, [:restart_counter]}], sys.i)
 
-            assert_receive {:fake_engine, :held,
-                            %{path: "/containers/app_" <> @plain <> "/start"}},
+            assert_receive {:fake_engine, :held, %{path: "/containers/" <> _id_and_start}},
                            5_000
 
             held = look(sys, path)

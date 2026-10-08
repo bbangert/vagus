@@ -15,11 +15,13 @@ defmodule Vagus.Test.AppWorld do
   journal is in the order things were done. An action that never reached
   any of them, a create whose preparation failed, is not in it.
 
-  Two entries say more than their action. A start that arrived while the
+  Some entries say more than their action. A start that arrived while the
   token table did not resolve the container's token to the app is
   `{:start, :token_unknown}`, and a create that arrived before the app's
   options were written is `{:create, :unprepared}`: both are looked at
-  where the request lands, at the moment it lands.
+  where the request lands, at the moment it lands. A start, stop or remove
+  of a container that was there and is gone is `{action, :gone}`: asked
+  for by an id the engine has no container for any more.
 
   `new/1` makes a world, a map of what stays the same across the systems
   started in it; `system/2` is the `Vagus.Resource.Harness.start_system/1`
@@ -191,24 +193,35 @@ defmodule Vagus.Test.AppWorld do
 
   # Called in the engine, with a request that has arrived and done nothing yet.
   defp engine(%{method: method, path: path} = entry, containers, instance, journal) do
+    # An id outlives its container here, so that a request for one that is
+    # gone is still somebody's.
+    for {name, %{id: id}} <- containers, do: Harness.put_fact(journal, {:container, id}, name)
+
     case {method, String.split(path, "/", trim: true)} do
       {:post, ["containers", "create"]} ->
         {app, _leftover?} = owner(entry.query["name"])
         prepared? = File.exists?(Prepare.options_path(app, Harness.fact(journal, :facts)))
         did(journal, app, if(prepared?, do: :create, else: {:create, :unprepared}))
 
-      {:post, ["containers", name, "start"]} ->
-        {app, _leftover?} = owner(name)
-        known? = AuthIndex.lookup(token_of(containers[name]), instance: instance) == {:ok, app}
-        did(journal, app, if(known?, do: :start, else: {:start, :token_unknown}))
+      {:post, ["containers", ref, "start"]} ->
+        {app, _leftover?, container} = target(ref, containers, journal)
+        known? = AuthIndex.lookup(token_of(container), instance: instance) == {:ok, app}
 
-      {:post, ["containers", name, "stop"]} ->
-        {app, leftover?} = owner(name)
-        did(journal, app, if(leftover?, do: :stop_leftover, else: :stop))
+        did(
+          journal,
+          app,
+          there(container, if(known?, do: :start, else: {:start, :token_unknown}))
+        )
 
-      {:delete, ["containers", name]} ->
-        {app, leftover?} = owner(name)
-        did(journal, app, if(leftover?, do: :remove_leftover, else: :remove))
+      {:post, ["containers", ref, "stop"]} ->
+        {app, leftover?, container} = target(ref, containers, journal)
+        action = if(leftover?, do: :stop_leftover, else: :stop)
+        did(journal, app, if(leftover?, do: action, else: there(container, action)))
+
+      {:delete, ["containers", ref]} ->
+        {app, leftover?, container} = target(ref, containers, journal)
+        action = if(leftover?, do: :remove_leftover, else: :remove)
+        did(journal, app, if(leftover?, do: action, else: there(container, action)))
 
       {:delete, ["images" | reference]} ->
         did(journal, image_owner(Enum.join(reference, "/"), instance, journal), :remove_image)
@@ -217,6 +230,19 @@ defmodule Vagus.Test.AppWorld do
         :ok
     end
   end
+
+  # Whose container a request names, by name or by id, and the container
+  # if it is there.
+  defp target(ref, containers, journal) do
+    by_id = Enum.find_value(containers, fn {name, %{id: id}} -> if id == ref, do: name end)
+    name = by_id || Harness.fact(journal, {:container, ref}) || ref
+    {app, leftover?} = owner(name)
+    {app, leftover?, if(by_id || is_map_key(containers, ref), do: containers[name])}
+  end
+
+  defp there(nil, {action, _mark}), do: {action, :gone}
+  defp there(nil, action), do: {action, :gone}
+  defp there(_container, action), do: action
 
   defp owner("app_" <> app), do: {app, false}
   defp owner("addon_" <> app), do: {app, true}

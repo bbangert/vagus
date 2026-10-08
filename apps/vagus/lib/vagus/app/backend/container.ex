@@ -1,7 +1,8 @@
 defmodule Vagus.App.Backend.Container do
   @moduledoc """
   `Vagus.App.Backend` for a container on the engine, addressed by container
-  name.
+  name or by id: the engine takes either. A name is whichever container
+  holds it at the time; an id is one container, and gone with it.
 
   Options: `:client` (default `Vagus.Runtime.Docker`) and `:engine`, a
   keyword given to every call of it (`:socket`, `:recv_timeout`).

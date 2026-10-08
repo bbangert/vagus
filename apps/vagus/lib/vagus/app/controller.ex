@@ -139,19 +139,36 @@ defmodule Vagus.App.Controller do
     end
   end
 
-  defp perform(:start, _args, context), do: instance(context, & &1.start(&2, &3))
+  # A container is acted on by the id the pass observed, not by its name.
+  # The name is whatever container holds it when the request arrives: one
+  # put there since the observation was never decided about, and a start
+  # of it would run a container whose token nobody put, a stop or a remove
+  # take away one whose exit is expected of another. The engine takes an
+  # id wherever it takes a name, and answers 404 for one that is gone:
+  # the end a stop or a remove asked for, and to a start a failure for
+  # now, after which the next pass decides about what is there.
+  defp perform(:start, %{instance: id}, context), do: instance(context, id, & &1.start(&2, &3))
 
   # A native app has nothing to create, so what a create prepares is
-  # prepared here.
-  defp perform(:start_process, _args, %{resource: %{spec: spec}} = context) do
+  # prepared here. Its instance is the process under the app's name in
+  # this VM, which nothing but this app's own passes starts, one at a
+  # time: there is no other to take for it.
+  defp perform(:start_process, _args, %{resource: %{name: app, spec: spec}} = context) do
     with {:ok, _prepared} <- prepare(spec, context),
-         do: instance(context, & &1.start(&2, &3))
+         do: instance(context, app, & &1.start(&2, &3))
   end
 
-  defp perform(stop, %{grace: grace}, context) when stop in [:stop, :stop_process],
-    do: instance(context, & &1.stop(&2, grace, &3))
+  defp perform(:stop, %{grace: grace, instance: id}, context),
+    do: instance(context, id, & &1.stop(&2, grace, &3))
 
-  defp perform(:remove, _args, context), do: instance(context, & &1.remove(&2, &3))
+  defp perform(:stop_process, %{grace: grace}, %{resource: %{name: app}} = context),
+    do: instance(context, app, & &1.stop(&2, grace, &3))
+
+  defp perform(:remove, %{instance: id}, context),
+    do: instance(context, id, & &1.remove(&2, &3))
+
+  # A leftover is whatever holds the other slot's name: no container under
+  # it is this controller's, and any that is there is to go.
 
   defp perform(:stop_leftover, _args, context),
     do: leftover(context, &Backend.Container.stop(&1, nil, &2))
@@ -201,10 +218,9 @@ defmodule Vagus.App.Controller do
   defp perform(:remove_data, _args, %{resource: %{spec: %{config: %{slug: slug}}}} = context),
     do: Prepare.remove_data(slug, context.facts)
 
-  defp instance(%{resource: %{name: app, spec: spec}} = context, call) do
-    profile = Profile.of(spec)
-    {backend, opts} = Observe.backend(profile, context)
-    call.(backend, profile.container_name(app) || app, opts)
+  defp instance(%{resource: %{spec: spec}} = context, ref, call) do
+    {backend, opts} = Observe.backend(Profile.of(spec), context)
+    call.(backend, ref, opts)
   end
 
   defp leftover(%{resource: %{name: app}} = context, call) do

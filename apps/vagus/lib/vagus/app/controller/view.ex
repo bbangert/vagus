@@ -161,7 +161,7 @@ defmodule Vagus.App.Controller.View do
     watched? = v.same_run? and v.running?
     restarts = if v.counters? or v.made_for == nil, do: st.restarts, else: @blank.restarts
     engine = engine_restarts(st.engine_restarts, v.policy, inst, known, v.same?, now)
-    pull = pull(o.pull, st.pull, o.image, v.generation, now)
+    pull = pull(o.pull, st.pull, {o.image, o.image_present?}, v.generation, now)
 
     record =
       inst &&
@@ -176,13 +176,6 @@ defmodule Vagus.App.Controller.View do
           started_at: inst.started_at
         }
 
-    # An image that could not be removed, another container using it, is
-    # left: learnt from the failure, since the image is there either way.
-    cleaned =
-      if match?(%{name: :remove_image, reason: {:status, 409, _message}}, o.failed_action),
-        do: Enum.uniq([:image | st.cleaned]),
-        else: st.cleaned
-
     base = %{
       st
       | instance: record,
@@ -195,13 +188,31 @@ defmodule Vagus.App.Controller.View do
         engine_restarts: engine,
         probe: probe(st.probe, o.probe, watched?, now),
         pull: if(o.stale_pull, do: st.pull, else: pull.record),
-        cleaned: cleaned,
+        cleaned: cleaned(st.cleaned, o.failed_action),
+        ready_since: held_since(st.ready_since, record),
+        # A wait is of one launch, and begins when an earlier wave is first
+        # found on its way: kept from an earlier launch, its beginning
+        # would have the next one's wait over before it began.
+        wave_since: if(o.waiting_on != [], do: st.wave_since),
         waiting_on: [],
         restart_required: v.running? and drifted?(v)
     }
 
     Map.merge(v, %{base: base, record: record, restarts: restarts, engine: engine, pulled: pull})
   end
+
+  # An image that could not be removed, another container using it, is
+  # left: learnt from the failure, since the image is there either way.
+  defp cleaned(cleaned, %{name: :remove_image, reason: {:status, 409, _message}}),
+    do: Enum.uniq([:image | cleaned])
+
+  defp cleaned(cleaned, _failed_action), do: cleaned
+
+  # Ready is held by one run of one instance: a container in the place of
+  # the one recorded, or the same one started again, has held it from when
+  # it is first found so.
+  defp held_since(since, %{ready?: true}), do: since
+  defp held_since(_since, _record), do: nil
 
   defp drifted?(v), do: v.made_for != nil and v.made_for.fingerprint != v.target.fingerprint
 
@@ -306,10 +317,10 @@ defmodule Vagus.App.Controller.View do
       (inst.health == :unhealthy or Readiness.unhealthy?(v.base.probe))
   end
 
-  defp starting(%{inst: inst, record: record, st: st, pulled: pull, now: now} = v, o) do
+  defp starting(%{inst: inst, record: record, pulled: pull, now: now} = v, o) do
     spec = v.resource.spec
     readiness = v.profile.readiness(spec)
-    wave_since = st.wave_since || now
+    wave_since = v.base.wave_since || now
 
     %{
       backoff_in: backoff_in(v.restarts, v.policy, now),
@@ -329,7 +340,7 @@ defmodule Vagus.App.Controller.View do
       past_deadline?: record != nil and Readiness.past_deadline?(readiness, record.since, now),
       readiness_poll: if(match?(%{kind: {:http, _}}, readiness), do: @readiness_poll_ms),
       gates_closed: for(gate <- o.gates, not open?(v.resource, gate, v.id), do: gate),
-      reset_in: reset_in(v.restarts, v.policy, st.ready_since || now, now),
+      reset_in: reset_in(v.restarts, v.policy, v.base.ready_since || now, now),
       probe_in: if(o.probes?, do: Readiness.probe_due_in(v.base.probe, now))
     }
   end
@@ -464,8 +475,13 @@ defmodule Vagus.App.Controller.View do
   # anew. `after` is the failure that stood when it asked, which is the one
   # being tried again and not its answer. Failures are counted as they are
   # seen, by their stamp: a pass cut after its commit has asked for nothing.
-  defp pull(state, recorded, image, generation, now) do
-    mine? = recorded != nil and recorded.image == image and recorded.generation == generation
+  # With the image there and no pull under way the pull is over, and what
+  # was counted of it is not the next one's to count on.
+  defp pull(state, recorded, {image, present?}, generation, now) do
+    mine? =
+      recorded != nil and recorded.image == image and recorded.generation == generation and
+        not (present? and state == :idle)
+
     record = if(mine?, do: recorded, else: %{@pull | image: image, generation: generation})
 
     none = %{

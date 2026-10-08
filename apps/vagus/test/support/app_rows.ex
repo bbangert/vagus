@@ -219,12 +219,12 @@ defmodule Vagus.Test.AppRows do
        [], %{}},
       {"a plain stop leaves the token for as long as the container runs",
        app(@container, %{run: false}, status: running()), up,
-       {:progressing, :stopping, :stopping, :startup}, action(:stop, %{grace: nil}),
-       %{expected_exit: "c1"}},
+       {:progressing, :stopping, :stopping, :startup},
+       action(:stop, %{grace: nil, instance: "c1"}), %{expected_exit: "c1"}},
       {"a stopped container goes before its token does",
        app(@container, %{run: false}, status: running(expected_exit: "c1")),
        obs(instance: inst(:exited), token: :current),
-       {:progressing, :removing, :stopping, :stopped}, action(:remove), %{}},
+       {:progressing, :removing, :stopping, :stopped}, action(:remove, %{instance: "c1"}), %{}},
       {"Core stopped and kept: then its token goes",
        core(%{run: false}, status: running(expected_exit: "c1")),
        obs(instance: inst(:exited), token: :current, image: nil),
@@ -268,7 +268,7 @@ defmodule Vagus.Test.AppRows do
       {"a start asked for of a run-once app that succeeded runs it again",
        once(%{start_counter: 1}, status: %{made_for: %{start_counter: 0}}),
        obs(instance: inst(:exited, exit_code: 0)), {:progressing, :removing, :stopping, :stopped},
-       action(:remove), %{}},
+       action(:remove, %{instance: "c1"}), %{}},
       {"a plain app that exited with 0 has not succeeded: it crashed",
        app(@container, %{}, status: running()), obs(instance: inst(:exited, exit_code: 0)),
        {:failed, :crashed, :failed, :error}, [], %{}},
@@ -301,7 +301,7 @@ defmodule Vagus.Test.AppRows do
        Map.put(up, :api?, false), {:ready, :ready, :ready, :started}, [], %{}},
       {"an expected exit of another instance is not this one's: a crash",
        watched(%{}, status: running(expected_exit: "c0")), obs(instance: inst(:exited)),
-       {:progressing, :crashed, :restarting, :stopped}, action(:remove),
+       {:progressing, :crashed, :restarting, :stopped}, action(:remove, %{instance: "c1"}),
        %{restarts: %{attempts: 1, last: now()}, expected_exit: "c1"}},
       {"an instance other than the one recorded, running: taken as it is, nothing counted",
        watched(%{},
@@ -315,7 +315,8 @@ defmodule Vagus.Test.AppRows do
       {"a transient failure of a stop holds nothing back: asked again",
        app(@container, %{run: false}, status: running()),
        obs(instance: inst(), failed_action: failed(:stop, {:status, 500, "x"})),
-       {:progressing, :stopping, :stopping, :startup}, action(:stop, %{grace: nil}),
+       {:progressing, :stopping, :stopping, :startup},
+       action(:stop, %{grace: nil, instance: "c1"}),
        %{
          failure:
            failure(
@@ -328,7 +329,8 @@ defmodule Vagus.Test.AppRows do
        }},
       {"a paused instance of an app not to run is stopped",
        app(@container, %{run: false}, status: running()), obs(instance: inst(:paused)),
-       {:progressing, :stopping, :stopping, :startup}, action(:stop, %{grace: nil}), %{}},
+       {:progressing, :stopping, :stopping, :startup},
+       action(:stop, %{grace: nil, instance: "c1"}), %{}},
       {"a stamp from another incarnation has no age: the back-off starts over",
        watched(%{},
          status: %{made_for: :this, restarts: %{attempts: 1, last: %Stamp{incarnation: 9, at: 5}}}
@@ -338,62 +340,64 @@ defmodule Vagus.Test.AppRows do
        action(:remove_token), %{}},
       {"not wanted and running: the exit is expected, then stop",
        app(@container, %{run: false}, status: running()), obs(instance: inst()),
-       {:progressing, :stopping, :stopping, :startup}, action(:stop, %{grace: nil}),
-       %{expected_exit: "c1"}},
+       {:progressing, :stopping, :stopping, :startup},
+       action(:stop, %{grace: nil, instance: "c1"}), %{expected_exit: "c1"}},
       {"held and running: stopped the same way",
        app(@container, %{holds: %{"backup" => true}}, status: running()), obs(instance: inst()),
-       {:progressing, :stopping, :stopping, :startup}, action(:stop, %{grace: nil}),
-       %{expected_exit: "c1"}},
+       {:progressing, :stopping, :stopping, :startup},
+       action(:stop, %{grace: nil, instance: "c1"}), %{expected_exit: "c1"}},
       {"a restart counter above the instance's: the instance is stopped",
        app(@container, %{restart_counter: 2}, status: running(made_for: %{restart_counter: 1})),
-       up, {:progressing, :stopping, :stopping, :startup}, action(:stop, %{grace: nil}),
-       %{expected_exit: "c1"}},
+       up, {:progressing, :stopping, :stopping, :startup},
+       action(:stop, %{grace: nil, instance: "c1"}), %{expected_exit: "c1"}},
       {"a start counter above a running instance's changes nothing",
        app(@container, %{start_counter: 2},
          status: Map.merge(ready, %{made_for: %{start_counter: 1}})
        ), up, {:ready, :ready, :ready, :started}, [], %{expected_exit: nil}},
       {"an instance whose exit is expected and that still runs is stopped again",
        app(@container, %{}, status: running(expected_exit: "c1")), up,
-       {:progressing, :stopping, :stopping, :startup}, action(:stop, %{grace: nil}), %{}},
+       {:progressing, :stopping, :stopping, :startup},
+       action(:stop, %{grace: nil, instance: "c1"}), %{}},
       {"Core is stopped with the grace its image asks for",
        core(%{run: false}, status: running()),
        obs(instance: inst(:running, grace: 260), token: :absent, image: nil),
-       {:progressing, :stopping, :stopping, :startup}, action(:stop, %{grace: 260}), %{}},
+       {:progressing, :stopping, :stopping, :startup},
+       action(:stop, %{grace: 260, instance: "c1"}), %{}},
       {"a native app is stopped as a process", native(%{run: false}, status: running()),
        obs(instance: process(), token: :none, image: nil),
-       {:progressing, :stopping, :stopping, :startup}, action(:stop_process, %{grace: nil}),
-       %{expected_exit: "c1"}},
+       {:progressing, :stopping, :stopping, :startup},
+       action(:stop_process, %{grace: nil, instance: "c1"}), %{expected_exit: "c1"}},
       {"stopped by request and still there: removed",
        app(@container, %{run: false}, status: running(expected_exit: "c1")),
        obs(instance: inst(:exited)), {:progressing, :removing, :stopping, :stopped},
-       action(:remove), %{expected_exit: "c1"}},
+       action(:remove, %{instance: "c1"}), %{expected_exit: "c1"}},
       {"an exit that was expected of a wanted app: removed, not counted",
        watched(%{}, status: running(expected_exit: "c1")), obs(instance: inst(:exited)),
-       {:progressing, :removing, :stopping, :stopped}, action(:remove),
+       {:progressing, :removing, :stopping, :stopped}, action(:remove, %{instance: "c1"}),
        %{restarts: View.blank().restarts}},
       {"a stopped instance made for an earlier start counter is replaced",
        app(@container, %{start_counter: 2}, status: running(made_for: %{start_counter: 1})),
        obs(instance: inst(:exited)), {:progressing, :removing, :stopping, :stopped},
-       action(:remove), %{}},
+       action(:remove, %{instance: "c1"}), %{}},
       {"created from a spec that has changed since, and never started: made anew",
        app(@container, %{}, status: %{made_for: %{fingerprint: 0}}),
        obs(instance: inst(:created)), {:progressing, :removing, :stopping, :stopped},
-       action(:remove), %{}},
+       action(:remove, %{instance: "c1"}), %{}},
       {"a container that has run and nothing is recorded of: removed, not counted", watched(),
        obs(instance: inst(:exited)), {:progressing, :removing, :stopping, :stopped},
-       action(:remove), %{restarts: View.blank().restarts}},
+       action(:remove, %{instance: "c1"}), %{restarts: View.blank().restarts}},
       {"Core stopped by request stays", core(%{run: false}, status: running(expected_exit: "c1")),
        obs(instance: inst(:exited), image: nil), {:idle, :stopped, :stopped, :stopped}, [], %{}},
       {"Core being deleted is removed", core(%{}, status: running(), deleting?: true),
        obs(instance: inst(:exited), image: nil), {:progressing, :removing, :stopping, :stopped},
-       action(:remove), %{}},
+       action(:remove, %{instance: "c1"}), %{}},
       {"deleting: the token goes first, while the container still runs",
        app(@container, %{}, status: running(), deleting?: true), up,
        {:progressing, :revoking_token, :stopping, :startup}, action(:remove_token), %{}},
       {"deleting: then the container is stopped",
        app(@container, %{}, status: running(), deleting?: true), obs(instance: inst()),
-       {:progressing, :stopping, :stopping, :startup}, action(:stop, %{grace: nil}),
-       %{expected_exit: "c1"}},
+       {:progressing, :stopping, :stopping, :startup},
+       action(:stop, %{grace: nil, instance: "c1"}), %{expected_exit: "c1"}},
       {"deleting: then the image", app(@container, %{}, deleting?: true), obs(),
        {:progressing, :removing_image, :deleting, :stopped},
        action(:remove_image, %{image: "image:1"}), %{cleaned: []}},
@@ -466,12 +470,12 @@ defmodule Vagus.Test.AppRows do
            failure: failure(class: :transient, cause: :engine_error, at: ago(1_000))
          }
        ), obs(instance: inst(:created), token: :current),
-       {:progressing, :starting, :starting, :stopped}, action(:start), %{}},
+       {:progressing, :starting, :starting, :stopped}, action(:start, %{instance: "c1"}), %{}},
       {"a stop that timed out is still stopping: no failure, look again",
        app(@container, %{run: false}, status: running(expected_exit: "c1")),
        obs(instance: inst(), failed_action: failed(:stop, {:timeout, :recv})),
-       {:progressing, :stopping, :stopping, :startup}, action(:stop, %{grace: nil}),
-       %{failure: nil}},
+       {:progressing, :stopping, :stopping, :startup},
+       action(:stop, %{grace: nil, instance: "c1"}), %{failure: nil}},
       {"Core restarted by the engine, below the rule: counted, left alone",
        core(%{},
          status: Map.merge(ready, %{engine_restarts: %{seen: [ago(1_000)], actions: []}})
@@ -604,23 +608,25 @@ defmodule Vagus.Test.AppRows do
        {:failed, :restart_budget_exhausted, :failed, :error}, [], %{}},
       {"a crash: counted, and the dead container removed", watched(%{}, status: running()),
        obs(instance: inst(:exited)), {:progressing, :crashed, :restarting, :stopped},
-       action(:remove), %{restarts: %{attempts: 1, last: now()}, expected_exit: "c1"}},
+       action(:remove, %{instance: "c1"}),
+       %{restarts: %{attempts: 1, last: now()}, expected_exit: "c1"}},
       {"a second crash of the run: counted in the same run",
        watched(%{}, status: running(restarts: restarts(1, 20_000))), obs(instance: inst(:exited)),
-       {:progressing, :crashed, :restarting, :stopped}, action(:remove),
+       {:progressing, :crashed, :restarting, :stopped}, action(:remove, %{instance: "c1"}),
        %{restarts: %{attempts: 2, last: now()}}},
       {"a native app that ended: counted, nothing to remove", native(%{}, status: running()),
        obs(token: :none, image: nil), {:progressing, :crashed, :restarting, :stopped}, later(0),
        %{restarts: %{attempts: 1, last: now()}, instance: nil}},
       {"unhealthy while running: counted and stopped", watched(%{}, status: ready),
        obs(instance: inst(:running, health: :unhealthy), token: :current),
-       {:progressing, :unhealthy, :restarting, :startup}, action(:stop, %{grace: nil}),
+       {:progressing, :unhealthy, :restarting, :startup},
+       action(:stop, %{grace: nil, instance: "c1"}),
        %{restarts: %{attempts: 1, last: now()}, expected_exit: "c1"}},
       {"a second probe unanswered: unhealthy",
        watched(%{}, status: Map.merge(ready, %{probe: %{misses: 1, at: ago(120_000)}})),
        obs(instance: inst(), token: :current, probes?: true, probe: :unhealthy),
-       {:progressing, :unhealthy, :restarting, :startup}, action(:stop, %{grace: nil}),
-       %{probe: %{misses: 2, at: now()}}},
+       {:progressing, :unhealthy, :restarting, :startup},
+       action(:stop, %{grace: nil, instance: "c1"}), %{probe: %{misses: 2, at: now()}}},
       {"one probe unanswered: still Ready, asked again in two minutes",
        watched(%{}, status: Map.merge(ready, %{probe: %{misses: 0, at: ago(120_000)}})),
        obs(instance: inst(), token: :current, probes?: true, probe: :unhealthy),
@@ -654,6 +660,44 @@ defmodule Vagus.Test.AppRows do
        app(@container, %{}, status: %{wave_since: ago(100_000)}),
        obs(waiting_on: ["core_mosquitto"]), {:progressing, :waiting_for_wave, :waiting, :stopped},
        later(20_000), %{wave_since: ago(100_000)}},
+      {"a container in the place of one that was Ready has held Ready from now, not from then",
+       watched(%{},
+         status:
+           running(
+             instance: seen(id: "c0", ready?: true),
+             restarts: restarts(1),
+             ready_since: ago(600_000)
+           )
+       ), up, {:ready, :ready, :ready, :started}, later(600_000),
+       %{ready_since: now(), restarts: restarts(1)}},
+      {"and so has the same container started again since",
+       watched(%{},
+         status: Map.merge(ready, %{restarts: restarts(1), ready_since: ago(600_000)})
+       ), obs(instance: inst(:running, started_at: "started-2"), token: :current),
+       {:ready, :ready, :ready, :started}, later(600_000),
+       %{ready_since: now(), restarts: restarts(1)}},
+      {"the image there and no pull under way: what was counted of the pull is forgotten",
+       app(@container, %{}, status: %{pull: pulled(failures: 2, seen: ago(9_000))}), obs(),
+       {:progressing, :creating, :creating, :stopped}, action(:create), %{pull: nil}},
+      {"Ready: the wave that was waited for, and since when, are forgotten",
+       app(@container, %{},
+         status: Map.merge(ready, %{wave_since: ago(300_000), waiting_on: ["core_mosquitto"]})
+       ), up, {:ready, :ready, :ready, :started}, [], %{wave_since: nil, waiting_on: []}},
+      {"a wait that begins after a restart was asked for is measured from its own beginning",
+       app(@container, %{restart_counter: 1}, status: %{made_for: %{restart_counter: 0}}),
+       obs(waiting_on: ["core_mosquitto"]), {:progressing, :waiting_for_wave, :waiting, :stopped},
+       later(120_000), %{wave_since: now(), waiting_on: ["core_mosquitto"]}},
+      {"and a minute on it has a minute left, from that beginning",
+       app(@container, %{restart_counter: 1},
+         status: %{made_for: %{restart_counter: 0}, wave_since: now()}
+       ), obs(now: t(@now + 60_000), waiting_on: ["core_mosquitto"]),
+       {:progressing, :waiting_for_wave, :waiting, :stopped}, later(60_000),
+       %{wave_since: now(), waiting_on: ["core_mosquitto"]}},
+      {"created, nobody waited for any more: the wait's beginning is forgotten before the start",
+       app(@container, %{}, status: %{made_for: :this, wave_since: ago(120_000)}),
+       obs(instance: inst(:created), token: :current),
+       {:progressing, :starting, :starting, :stopped}, action(:start, %{instance: "c1"}),
+       %{wave_since: nil}},
       {"the wait over: start anyway", app(@container, %{}, status: %{wave_since: ago(120_000)}),
        obs(waiting_on: ["core_mosquitto"]), {:progressing, :creating, :creating, :stopped},
        action(:create), %{waiting_on: []}},
@@ -755,16 +799,16 @@ defmodule Vagus.Test.AppRows do
        action(:put_token, %{instance: "c1"}), %{}},
       {"created and its token known: start", app(@container, %{}, status: %{made_for: :this}),
        obs(instance: inst(:created), token: :current),
-       {:progressing, :starting, :starting, :stopped}, action(:start), %{}},
+       {:progressing, :starting, :starting, :stopped}, action(:start, %{instance: "c1"}), %{}},
       {"Core stopped and wanted: the container is started again, for what is wanted now",
        core(%{restart_counter: 1},
          status: running(expected_exit: "c1", made_for: %{restart_counter: 0})
        ), obs(instance: inst(:exited), token: :current, image: nil),
-       {:progressing, :starting, :starting, :stopped}, action(:start),
+       {:progressing, :starting, :starting, :stopped}, action(:start, %{instance: "c1"}),
        %{expected_exit: nil, made_for: target(core(%{restart_counter: 1}).spec)}},
       {"Core found stopped by something else: started, not counted", core(%{}, status: running()),
        obs(instance: inst(:exited), token: :current, image: nil),
-       {:progressing, :starting, :starting, :stopped}, action(:start), %{}},
+       {:progressing, :starting, :starting, :stopped}, action(:start, %{instance: "c1"}), %{}},
       {"Core not answering yet: asked again shortly", core(%{}, status: running()),
        obs(instance: inst(), token: :current, ready: :not_ready, image: nil),
        {:progressing, :not_answering, :starting, :startup}, later(5_000), %{}},
@@ -823,7 +867,7 @@ defmodule Vagus.Test.AppRows do
        watched(%{restart_counter: 1},
          status: running(made_for: %{restart_counter: 0}, restarts: restarts(5))
        ), obs(instance: inst(:exited)), {:progressing, :removing, :stopping, :stopped},
-       action(:remove), %{restarts: View.blank().restarts}}
+       action(:remove, %{instance: "c1"}), %{restarts: View.blank().restarts}}
     ]
   end
 
@@ -1204,6 +1248,7 @@ defmodule Vagus.Test.AppRows do
     generation = resource.generation
     reason = elem(verdict.conditions.ready, 1)
     args = Enum.find_value(effects, %{}, &(match?({:action, _, _}, &1) && elem(&1, 2)))
+    action = Enum.find_value(effects, &(match?({:action, _, _}, &1) && elem(&1, 1)))
     stopping? = clause in [:stop, :remove, :remove_crashed, :unhealthy, :crash_loop]
     launching? = clause in [:start_process, :create, :start]
     counted? = clause in [:remove_crashed, :unhealthy, :gone]
@@ -1234,6 +1279,7 @@ defmodule Vagus.Test.AppRows do
           waits_on_what_it_observed:
             st.waiting_on == if(clause == :await_wave, do: o.waiting_on, else: []),
           wave_since_when_waiting: clause != :await_wave or match?(%Stamp{}, st.wave_since),
+          wave_since_only_while_waited_on: o.waiting_on != [] or st.wave_since == nil,
           restart_required_is_drift_under_a_running_instance:
             st.restart_required ==
               (up? and st.made_for != nil and st.made_for.fingerprint != v.target.fingerprint),
@@ -1299,6 +1345,9 @@ defmodule Vagus.Test.AppRows do
           token_of_this_instance:
             clause not in [:put_token, :restore_token, :restore_token_raised] or
               args.instance == id,
+          acts_on_the_instance_observed:
+            action not in [:start, :stop, :stop_process, :remove] or
+              (id != nil and args.instance == id),
           decided_for_this_generation: args == %{} or args.generation == generation
         ],
         not ok?,
@@ -1376,7 +1425,7 @@ defmodule Vagus.Test.AppRows do
       {"order: deleting, the container goes before the image and the data",
        app(@container, %{}, status: running(expected_exit: "c1"), deleting?: true),
        obs(instance: inst(:exited), data?: true), {:progressing, :removing, :stopping, :stopped},
-       action(:remove), %{expected_exit: "c1", cleaned: []}},
+       action(:remove, %{instance: "c1"}), %{expected_exit: "c1", cleaned: []}},
       {"order: deleting, the image goes before the data", app(@container, %{}, deleting?: true),
        obs(data?: true), {:progressing, :removing_image, :deleting, :stopped},
        action(:remove_image, %{image: "image:1"}), %{cleaned: []}},
@@ -1501,12 +1550,12 @@ defmodule Vagus.Test.AppRows do
       {"deleting: a remove that raised is asked for again, there being no other way on",
        app(@container, %{}, status: running(expected_exit: "c1"), deleting?: true),
        obs(instance: inst(:exited), failed_action: failed(:remove, crash)),
-       {:progressing, :removing, :stopping, :stopped}, action(:remove), %{}},
+       {:progressing, :removing, :stopping, :stopped}, action(:remove, %{instance: "c1"}), %{}},
       {"an app that crashed and is not restarted is no action that raised: stopped when told to",
        app(@container, %{run: false},
          status: running(failure: failure(action: :run, cause: :crashed, generation: 3))
        ), obs(instance: inst(:exited)), {:progressing, :removing, :stopping, :stopped},
-       action(:remove), %{}},
+       action(:remove, %{instance: "c1"}), %{}},
       {"a token removal whose call exited, the table being replaced: asked for again",
        app(@container, %{run: false}),
        obs(token: :other, failed_action: failed(:remove_token, {:exit, :noproc})),
@@ -1617,14 +1666,15 @@ defmodule Vagus.Test.AppRows do
       {"guard: making anew is of the instance it was decided for, not of another",
        core(%{}, status: running(recreate: "c0")),
        obs(instance: inst(:exited), token: :current, image: nil),
-       {:progressing, :starting, :starting, :stopped}, action(:start), %{recreate: nil}},
+       {:progressing, :starting, :starting, :stopped}, action(:start, %{instance: "c1"}),
+       %{recreate: nil}},
       {"guard: a success recorded for an earlier generation is no success of this one",
        once(%{}, status: %{succeeded: 2}), obs(), {:progressing, :creating, :creating, :stopped},
        action(:create), %{succeeded: nil}},
       {"guard: the misses of an instance that has ended are forgotten",
        watched(%{}, status: running(probe: %{misses: 1, at: ago(5)})),
        obs(instance: inst(:exited)), {:progressing, :crashed, :restarting, :stopped},
-       action(:remove), %{probe: View.blank().probe}}
+       action(:remove, %{instance: "c1"}), %{probe: View.blank().probe}}
     ]
   end
 
@@ -1647,7 +1697,8 @@ defmodule Vagus.Test.AppRows do
              }
            )
        ), obs(instance: inst(:running, grace: 260), token: :current),
-       {:progressing, :crash_loop, :stopping, :startup}, action(:stop, %{grace: 260}),
+       {:progressing, :crash_loop, :stopping, :startup},
+       action(:stop, %{grace: 260, instance: "c1"}),
        %{engine_restarts: %{seen: [], actions: [now()]}}},
       {"deleting: Core's image stays", core(%{}, deleting?: true), obs(image: "image:1"),
        {:idle, :deleted, :deleting, :stopped}, [{:remove_finalizer, :app, "homeassistant", :app}],
@@ -1659,7 +1710,8 @@ defmodule Vagus.Test.AppRows do
        obs(
          instance: inst(:running, restart_count: 1, started_at: "started-2", grace: 260),
          token: :current
-       ), {:progressing, :crash_loop, :stopping, :startup}, action(:stop, %{grace: 260}),
+       ), {:progressing, :crash_loop, :stopping, :startup},
+       action(:stop, %{grace: 260, instance: "c1"}),
        %{expected_exit: "c1", recreate: "c1", engine_restarts: %{seen: [], actions: [now()]}}},
       {"Core in a crash loop too often: Failed",
        core(%{},
@@ -1675,7 +1727,7 @@ defmodule Vagus.Test.AppRows do
       {"Core being made anew: stopped, then removed although it is kept",
        core(%{}, status: running(expected_exit: "c1", recreate: "c1")),
        obs(instance: inst(:exited), token: :current),
-       {:progressing, :removing, :stopping, :stopped}, action(:remove), %{}}
+       {:progressing, :removing, :stopping, :stopped}, action(:remove, %{instance: "c1"}), %{}}
     ]
   end
 

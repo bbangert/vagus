@@ -219,7 +219,8 @@ defmodule Vagus.App.Controller.Reconcile do
 
   defp unjudged(_v), do: []
 
-  defp stop(v), do: {if(v.native?, do: :stop_process, else: :stop), %{grace: v.grace}}
+  defp stop(v),
+    do: {if(v.native?, do: :stop_process, else: :stop), %{grace: v.grace, instance: v.id}}
 
   defp launching(v), do: [made_for: v.target, expected_exit: nil, recreate: nil]
 
@@ -292,7 +293,8 @@ defmodule Vagus.App.Controller.Reconcile do
 
   defp args(:request_pull, v), do: %{image: v.image, priority: v.wave}
   defp args(action, v) when action in [:cancel_pull, :remove_image], do: %{image: v.image}
-  defp args(:put_token, v), do: %{instance: v.id}
+  # The instance the pass observed: the action is of that one and no other.
+  defp args(action, v) when action in [:put_token, :start, :remove], do: %{instance: v.id}
   defp args(_action, _v), do: %{}
 
   defp out(v, kind, reason, state, changes \\ %{}, effects \\ []) do

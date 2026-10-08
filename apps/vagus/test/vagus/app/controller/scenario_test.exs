@@ -101,9 +101,12 @@ defmodule Vagus.App.Controller.ScenarioTest do
       # The put had returned before the start was decided, by a later pass.
       assert actions(sys, @plain) == @start
 
+      # Started by the id it was observed under, not by its name.
+      %{id: id} = container(engine, @plain)
+
       assert AppWorld.writes(engine) == [
                {:post, "/containers/create"},
-               {:post, "/containers/app_#{@plain}/start"}
+               {:post, "/containers/#{id}/start"}
              ]
 
       assert %{state: "running", id: id} = container(engine, @plain)
@@ -651,6 +654,34 @@ defmodule Vagus.App.Controller.ScenarioTest do
     end)
   end
 
+  test "an app that waited once waits its whole wait again when it is made anew" do
+    world = AppWorld.new()
+    early = AppWorld.spec(world, @early, %{run: true})
+    sys = start_system(AppWorld.system(world))
+    engine = AppWorld.engine(world, sys)
+
+    Model.script_pull(engine, AppWorld.image(world, early), {:error, "unexpected EOF"})
+    {:ok, _app} = Store.create(:app, @early, early, sys.i)
+    await!(sys, :app, @early, &match?(%{reason: :pull_failed}, &1.status[:conditions][:ready]))
+    settle(sys)
+
+    app = install(world, sys, @plain, %{run: true})
+    assert {_, true, _, :waiting_for_wave, _} = verdict(app)
+    app = advance(sys, @plain, 120_000)
+    assert verdict(app) == @ready
+
+    # The earlier app is still on its way. The second wait begins when the
+    # app has no instance again, not when the first one did.
+    app = write(sys, @plain, [{:inc, [:restart_counter]}])
+    assert verdict(app) == {false, true, false, :waiting_for_wave, :waiting}
+    assert actions(sys, @plain) == @start ++ [:stop, :remove, :remove_token]
+
+    assert {_, true, _, :waiting_for_wave, _} = verdict(advance(sys, @plain, 119_000))
+    assert actions(sys, @plain) == @start ++ [:stop, :remove, :remove_token]
+    assert verdict(advance(sys, @plain, 1_000)) == @ready
+    assert actions(sys, @plain) == @start ++ [:stop, :remove, :remove_token] ++ @start
+  end
+
   test "an earlier wave becoming Ready wakes the app that waits, with no timer" do
     world = AppWorld.new()
     early = AppWorld.spec(world, @early, %{run: true})
@@ -899,7 +930,9 @@ defmodule Vagus.App.Controller.ScenarioTest do
       Model.hold(engine, :post, "/stop")
       {:ok, _app} = Store.update_spec(:app, @watched, %{run: false}, sys.i)
 
-      assert_receive {:fake_engine, :held, %{path: "/containers/app_" <> @watched <> "/stop"}},
+      stop = "/containers/#{container(engine, @watched).id}/stop"
+
+      assert_receive {:fake_engine, :held, %{path: ^stop}},
                      sys.wait
 
       {:ok, _app} = Store.update_spec(:app, @watched, %{run: true}, sys.i)
@@ -1024,6 +1057,108 @@ defmodule Vagus.App.Controller.ScenarioTest do
       Model.fail(engine, :post, "/containers/create", nil)
       assert verdict(advance(sys, @plain, 1_000)) == @ready
       assert actions(sys, @plain) == [:create] ++ @start
+    end
+
+    # Another container under the app's name, as something else would put
+    # it there between a pass's observation and its action.
+    defp replaced(engine, app, image, attrs \\ []) do
+      %{id: first} = container(engine, app)
+      Model.delete_container(engine, "app_" <> app)
+
+      second =
+        Model.put_container(
+          engine,
+          "app_" <> app,
+          [image: image, env: ["SUPERVISOR_TOKEN=the-token-of-the-second"]] ++ attrs
+        )
+
+      assert second != first
+      second
+    end
+
+    test "a start is of the container the pass saw: one put in its place is not started unknown" do
+      world = AppWorld.new()
+      sys = start_system(AppWorld.system(world))
+      engine = AppWorld.engine(world, sys)
+      image = AppWorld.image(world, AppWorld.spec(world, @plain))
+      install(world, sys, @plain)
+
+      Model.hold(engine, :post, "/start")
+      {:ok, _app} = Store.update_spec(:app, @plain, %{run: true}, sys.i)
+      assert_receive {:fake_engine, :held, %{path: "/containers/" <> _start}}, sys.wait
+      second = replaced(engine, @plain, image, state: "created")
+      Model.release(engine)
+      settle(sys)
+
+      # The start found no container of that id. The one that is there was
+      # not started; the token of the one that is gone is nobody's.
+      assert %{id: ^second, state: "created"} = container(engine, @plain)
+      app = get(sys, @plain)
+      assert %{action: :start, class: :transient, cause: :not_found} = app.status.failure
+      assert actions(sys, @plain) == [:create, :put_token, {:start, :gone}, :remove_token]
+      assert AuthIndex.digest_of(@plain, sys.i) == :error
+
+      # Its pause over, the container that is there is decided about: its
+      # own token, then its start.
+      app = advance(sys, @plain, 1_000)
+      assert verdict(app) == @ready
+      assert app.status.instance.id == second
+
+      assert actions(sys, @plain) ==
+               [:create, :put_token, {:start, :gone}, :remove_token, :put_token, :start]
+
+      assert AuthIndex.lookup("the-token-of-the-second", sys.i) == {:ok, @plain}
+    end
+
+    test "a stop is of the container the pass saw: one put in its place is stopped by a pass that saw it" do
+      world = AppWorld.new()
+      sys = start_system(AppWorld.system(world))
+      engine = AppWorld.engine(world, sys)
+      image = AppWorld.image(world, AppWorld.spec(world, @plain))
+      install(world, sys, @plain, %{run: true})
+
+      Model.hold(engine, :post, "/stop")
+      {:ok, _app} = Store.update_spec(:app, @plain, %{run: false}, sys.i)
+      assert_receive {:fake_engine, :held, %{path: "/containers/" <> _stop}}, sys.wait
+      replaced(engine, @plain, image)
+      Model.release(engine)
+      settle(sys)
+
+      # Gone is what that stop asked for, and no failure. The container in
+      # its place is observed, and then stopped under its own id.
+      app = get(sys, @plain)
+      assert verdict(app) == @stopped
+      assert app.status.failure == nil
+
+      assert actions(sys, @plain) ==
+               @start ++ [{:stop, :gone}, :remove_token, :stop, :remove]
+
+      assert container(engine, @plain) == nil
+    end
+
+    test "a remove is of the container the pass saw: one put in its place is not removed unseen" do
+      world = AppWorld.new()
+      sys = start_system(AppWorld.system(world))
+      engine = AppWorld.engine(world, sys)
+      image = AppWorld.image(world, AppWorld.spec(world, @plain))
+      install(world, sys, @plain, %{run: true})
+
+      Model.hold(engine, :delete, "/containers/")
+      {:ok, _app} = Store.update_spec(:app, @plain, %{run: false}, sys.i)
+      assert_receive {:fake_engine, :held, %{path: "/containers/" <> _id}}, sys.wait
+      replaced(engine, @plain, image)
+      Model.release(engine)
+      settle(sys)
+
+      app = get(sys, @plain)
+      assert verdict(app) == @stopped
+      assert app.status.failure == nil
+
+      # The running container in its place is stopped before it is removed.
+      assert actions(sys, @plain) ==
+               @start ++ [:stop, {:remove, :gone}, :remove_token, :stop, :remove]
+
+      assert container(engine, @plain) == nil
     end
 
     test "a token is not put for an instance that is no longer the one the pass saw" do
