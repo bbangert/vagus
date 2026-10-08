@@ -11,9 +11,9 @@ defmodule Vagus.App.Token do
 
   A token is hashed before it leaves the function that read it:
   `state/4` answers from digests, and `Vagus.App.AuthIndex` takes its own.
-  `guard/1` is for the two actions that do hold one and for the read of an
-  instance with its environment. A function that raised there would be
-  reported with its arguments, the token among them, so what escapes it is
+  `guard/1` is around every action and around the read of an instance with
+  its environment. A function that raised there would be reported with its
+  arguments, the token among them where one is held, so what escapes it is
   the kind of failure and nothing it carried.
   """
 
@@ -61,24 +61,57 @@ defmodule Vagus.App.Token do
   end
 
   @doc """
-  Runs `fun`, which holds a token, and turns anything it raises, throws or
-  exits with into `{:error, {:crashed, kind}}`: the exception's module or
-  the kind of exit. What is logged is that and where it happened, module,
-  function and line: never a message, an argument or a reason, any of
-  which may carry the token.
+  Runs `fun`, which may hold a token, and turns anything it raises, throws
+  or exits with into an error. What is logged is the kind of failure and
+  where it happened, module, function and line: never a message, an
+  argument or a reason, any of which may carry the token.
+
+  A raise, a throw, and an exit for any reason not named below is
+  `{:error, {:crashed, kind}}`, the exception's module or the kind of exit:
+  a defect, and the same again on every attempt.
+
+  An exit that says the process asked was away or slow is
+  `{:error, {:exit, why}}` and worth another attempt: `:timeout`, `:noproc`,
+  `:normal`, `:shutdown` and `:killed`, alone, as `{:shutdown, _}`, or as
+  the reason of a call (`{reason, {module, :call, args}}`). That is a token
+  table, a pull worker or a supervisor being replaced, or not answering in
+  time.
   """
-  @spec guard((-> result)) :: result | {:error, {:crashed, atom()}} when result: term()
+  @spec guard((-> result)) :: result | {:error, {:crashed, atom()} | {:exit, atom()}}
+        when result: term()
   def guard(fun) when is_function(fun, 0) do
     fun.()
   rescue
     exception -> crashed(exception.__struct__, __STACKTRACE__)
   catch
-    kind, _reason -> crashed(kind, __STACKTRACE__)
+    :exit, reason ->
+      case away(reason) do
+        nil -> crashed(:exit, __STACKTRACE__)
+        why -> exited(why, __STACKTRACE__)
+      end
+
+    kind, _reason ->
+      crashed(kind, __STACKTRACE__)
   end
 
+  @away [:timeout, :noproc, :normal, :shutdown, :killed]
+
+  defp away({reason, {module, function, args}})
+       when is_atom(module) and is_atom(function) and is_list(args),
+       do: away(reason)
+
+  defp away({:shutdown, _why}), do: :shutdown
+  defp away(reason) when reason in @away, do: reason
+  defp away(_reason), do: nil
+
   defp crashed(kind, stack) do
-    Logger.error("a step holding a token crashed: #{inspect(kind)} at #{where(stack)}")
+    Logger.error("a step crashed: #{inspect(kind)} at #{where(stack)}")
     {:error, {:crashed, kind}}
+  end
+
+  defp exited(why, stack) do
+    Logger.warning("a step's call exited: #{inspect(why)} at #{where(stack)}")
+    {:error, {:exit, why}}
   end
 
   # A stack entry's third element is an arity, or the arguments themselves.

@@ -256,6 +256,12 @@ defmodule Vagus.App.Controller.View do
     %{
       succeeded?: st.succeeded == v.generation,
       failed?: base.failure != nil and base.failure.class == :permanent,
+      # An action that raised, whichever it was: asked for again it raises
+      # again. Not of an app being deleted, which nothing but its removal
+      # can move on, and whose spec no write will change.
+      raised?:
+        not v.deleting? and match?(%{class: :permanent, cause: :crashed}, base.failure) and
+          base.failure.action != :run,
       retry_in: retry_in(base.failure, v.now),
       crash_loop?: v.running? and loop.looping?,
       loop_spent?: loop.spent? or o.image == nil,

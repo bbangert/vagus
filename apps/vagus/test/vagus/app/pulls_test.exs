@@ -185,10 +185,11 @@ defmodule Vagus.App.PullsTest do
 
       :ok = Pulls.request("repo/a:1", waiter("a"), context.i)
       :ok = Pulls.request("repo/a:1", waiter("b"), context.i)
-      # Waits for the lane behind the first, and then hears nothing.
-      :ok = Pulls.request("repo/other:1", waiter("c"), context.i)
-
       assert_receive {:held, handler}, 2_000
+      # Asked for once the first has the lane: two pulls asked for together
+      # race for it, and this one, had it won, would hold it for good.
+      # It waits behind the first, and then hears nothing.
+      :ok = Pulls.request("repo/other:1", waiter("c"), context.i)
       send(handler, :go)
 
       assert_woken("a")

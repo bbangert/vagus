@@ -1039,6 +1039,158 @@ defmodule Vagus.App.Controller.ScenarioTest do
     end
   end
 
+  defmodule Raising do
+    @moduledoc """
+    The engine client, with a start (switch at 1) or a remove (2) that
+    raises instead of asking the engine.
+    """
+    alias Vagus.Runtime.Docker
+
+    for {function, arity, at} <-
+          [
+            inspect_container: 2,
+            inspect_image: 2,
+            create_container: 2,
+            start_container: 2,
+            stop_container: 2,
+            remove_container: 2,
+            remove_image: 2
+          ]
+          |> Enum.map(fn {function, arity} ->
+            {function, arity, %{start_container: 1, remove_container: 2}[function]}
+          end) do
+      args = Macro.generate_arguments(arity, __MODULE__)
+
+      def unquote(function)(unquote_splicing(args)) do
+        {last, first} = List.pop_at(unquote(args), -1)
+        {switch, opts} = Keyword.pop!(last, :raising)
+
+        if :atomics.get(switch, 1) == unquote(at),
+          do: raise("#{unquote(function)} fell over")
+
+        apply(Docker, unquote(function), first ++ [opts])
+      end
+    end
+  end
+
+  describe "an action that raises, or whose call exits" do
+    setup do
+      world = AppWorld.new()
+      switch = :atomics.new(1, [])
+
+      backends = %{
+        Vagus.App.Backend.Container => [
+          client: Raising,
+          engine: [socket: world.socket, raising: switch]
+        ],
+        Vagus.App.Backend.Native => []
+      }
+
+      sys = start_system(AppWorld.system(world, context: %{backends: backends}))
+      %{world: world, sys: sys, engine: AppWorld.engine(world, sys), switch: switch}
+    end
+
+    test "a start that raises: Failed, with the failure in status, and not asked for again",
+         %{world: world, sys: sys, engine: engine, switch: switch} do
+      :atomics.put(switch, 1, 1)
+      app = install(world, sys, @plain, %{run: true})
+      assert verdict(app) == {false, false, true, :crashed, :failed}
+      assert Controller.wire_state(app) == :error
+
+      assert %{action: :start, class: :permanent, detail: {:crashed, RuntimeError}, count: 1} =
+               app.status.failure
+
+      # An action that failed, not a pass that crashed: nothing is being
+      # tried again behind the verdict.
+      assert info(sys, Controller).failures == %{}
+      assert info(sys, Controller).timers == []
+      assert actions(sys, @plain) == [:create, :put_token]
+      assert wake(sys, @plain) == app
+      assert %{state: "created"} = container(engine, @plain)
+
+      :atomics.put(switch, 1, 0)
+      assert verdict(write(sys, @plain, [{:inc, [:start_counter]}])) == @ready
+    end
+
+    test "a remove that raises: Failed all the same, the container left where it is",
+         %{world: world, sys: sys, engine: engine, switch: switch} do
+      install(world, sys, @plain, %{run: true})
+      :atomics.put(switch, 1, 2)
+
+      app = write(sys, @plain, %{run: false})
+      assert verdict(app) == {false, false, true, :crashed, :failed}
+
+      assert %{action: :remove, class: :permanent, detail: {:crashed, RuntimeError}} =
+               app.status.failure
+
+      assert info(sys, Controller).failures == %{}
+      assert actions(sys, @plain) == @start ++ [:stop]
+      assert wake(sys, @plain) == app
+      assert %{state: "exited"} = container(engine, @plain)
+
+      # A write to the spec is a new generation, and another attempt.
+      :atomics.put(switch, 1, 0)
+      app = write(sys, @plain, [{:inc, [:start_counter]}])
+      assert verdict(app) == @stopped
+      assert container(engine, @plain) == nil
+    end
+
+    test "a pull asked for while the pull worker is being replaced is asked for again",
+         %{world: world, sys: sys} do
+      supervisor = Module.concat(sys.instance, Supervisor)
+      :ok = Supervisor.terminate_child(supervisor, Pulls.name(sys.instance))
+      {:ok, _app} = Store.create(:app, @plain, AppWorld.spec(world, @plain, %{run: true}), sys.i)
+      app = await!(sys, :app, @plain, &(&1.status[:failure] != nil))
+      settle(sys)
+
+      # The call exited, nobody answering to the worker's name: a failure
+      # for now, in status, and no crashed pass.
+      assert %{action: :request_pull, class: :transient, cause: :call_exited} = app.status.failure
+      assert app.status.failure.detail == {:exit, :noproc}
+      assert verdict(get(sys, @plain)) == {false, true, false, :call_exited, :starting}
+      assert info(sys, Controller).failures == %{}
+
+      {:ok, _worker} = Supervisor.restart_child(supervisor, Pulls.name(sys.instance))
+      advance(sys, @plain, 1_000)
+      await!(sys, :app, @plain, :ready)
+      settle(sys)
+      assert actions(sys, @plain) == [:request_pull] ++ @start
+    end
+  end
+
+  describe "an earlier wave written to" do
+    test "is waited for again by an app asked to start meanwhile, until it is Ready as written" do
+      world = AppWorld.new()
+      sys = start_system(AppWorld.system(world))
+      engine = AppWorld.engine(world, sys)
+      install(world, sys, @early, %{run: true})
+      %{id: first} = container(engine, @early)
+
+      # The earlier app's pass for its new spec stands in its first read:
+      # status still says Ready, of the spec before.
+      Model.hold(engine, :get, "/containers/app_#{@early}/json")
+      {:ok, _app} = Store.update_spec(:app, @early, [{:inc, [:restart_counter]}], sys.i)
+      assert_receive {:fake_engine, :held, %{method: :get}}, sys.wait
+      assert %{status: true} = get(sys, @early).status.conditions.ready
+
+      spec = AppWorld.spec(world, @plain, %{run: true})
+      Model.put_image(engine, AppWorld.image(world, spec))
+      {:ok, _app} = Store.create(:app, @plain, spec, sys.i)
+      app = await!(sys, :app, @plain, &is_map_key(&1.status, :state))
+      assert verdict(app) == {false, true, false, :waiting_for_wave, :waiting}
+      assert app.status.waiting_on == [@early]
+      assert actions(sys, @plain) == []
+
+      Model.release(engine)
+      await!(sys, :app, @early, :ready)
+      await!(sys, :app, @plain, :ready)
+      settle(sys)
+      assert %{id: second} = container(engine, @early)
+      assert second != first
+      assert actions(sys, @plain) == @start
+    end
+  end
+
   describe "with nobody to say what happened in the engine" do
     @tag scenario: :resync
     test "a container that ended is found when the runtime looks at everything again" do
@@ -1364,9 +1516,19 @@ defmodule Vagus.App.Controller.ScenarioTest do
       assert actions(sys, "homeassistant") == [:put_token]
       assert AuthIndex.lookup("the-supervisor-token", sys.i) == {:ok, "homeassistant"}
 
+      # Its ten minutes over, it is Failed and still asked, at longer
+      # intervals: a slow Core comes up all the same, with nothing written.
+      app = advance(sys, "homeassistant", 600_000)
+      assert verdict(app) == {false, false, true, :readiness_timeout, :failed}
+      assert Controller.wire_state(app) == :error
+      assert app.status.failure == nil
+      %{generation: generation} = app
+
       :atomics.put(world.probe, 1, 0)
-      app = advance(sys, "homeassistant", 5_000)
+      app = advance(sys, "homeassistant", 30_000)
       assert verdict(app) == @ready
+      assert app.generation == generation
+      assert actions(sys, "homeassistant") == [:put_token]
 
       # A stop keeps the container, with the grace its image asks for.
       app = write(sys, "homeassistant", %{run: false})

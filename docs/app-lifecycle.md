@@ -614,8 +614,8 @@ container is not touched. The token itself exists in three places only:
 the create action, the put action, which reads it from the engine again
 instead of taking it as an argument, and the function of `observe/2` that
 takes the instance apart. What leaves that function is a state and an
-instance without its environment; both actions, and that read of the
-instance, turn whatever they raise into the kind of failure and nothing it
+instance without its environment; every action, and that read of the
+instance, turns whatever it raises into the kind of failure and nothing it
 carried (`Vagus.App.Token.guard/1`): an engine client that raised with the
 answer it was reading would otherwise put the environment into a crash
 report. A read that raised is an engine that failed the pass. Core's token is the Supervisor's, read through
@@ -674,8 +674,13 @@ Three controllers are to attach to the App kind, each with its own runtime:
 verdict and all with the pass's reason. Ready: the instance runs, is ready
 and every gate is open. Progressing: the controller is on its way, or waits
 for something that comes by itself (a pull, a pause, a wave, the engine).
-Failed: it has given up until the spec changes. None of the three: the app
-is where it should be, which is not running (stopped, held, succeeded).
+Failed is of two kinds. Given up until the spec or a counter is written to:
+a failure for good, an action that raised, a budget spent, a crash nothing
+restarts, a crash loop. And not ready within its deadline
+(`readiness_timeout`): the instance runs and is still asked, every thirty
+seconds, and is Ready when it answers, with no write to anything. Both are
+`error` on the wire. None of the three: the app is where it should be,
+which is not running (stopped, held, succeeded).
 
 **Status.** Besides the conditions: `state`, a word for where the app is;
 `instance` (`id`, `address`, `process`, whether it runs, since when,
@@ -717,7 +722,13 @@ that holds is the pass. In order:
 7. The start sequence.
 
 **Failures.** Every error an action returns is classified
-(`Vagus.App.Failure`) by the pass after it. Permanent: Failed, with the
+(`Vagus.App.Failure`) by the pass after it. What an action raises or
+throws is an error it returns, `crashed`, and permanent: whichever action
+it was, the app is Failed and that action is not asked for again, except
+of an app being deleted, which nothing but its removal moves on. An exit
+is the same, unless it says the process asked was away or slow (a call
+that timed out, a process that is not there, was shut down or killed):
+that is `call_exited`, transient, and tried again. Permanent: Failed, with the
 cause in `status.failure`, and nothing is tried until the generation
 changes, which every write to the spec does. Transient: counted, and tried
 again after its pause. Pending: looked at again. A failure belongs to the generation whose pass performed the
@@ -777,16 +788,20 @@ attempt of its budget.
 `Vagus.App.Readiness`: a container is ready when it runs and, where the
 image has a healthcheck, is healthy; a native app when its process exists;
 an `{:http, path}` app (Core) when a `GET` of the path answered 2xx, asked
-every five seconds until it has, and Failed (`readiness_timeout`) while
-its deadline has passed without an answer. The probe of a `watchdog` URL
+every five seconds until it has. While its deadline has passed without an
+answer it is Failed (`readiness_timeout`) and asked every thirty seconds:
+that Failed is not given up, and ends when the app answers. The probe of a `watchdog` URL
 keeps the template grammar and the rule of the probe this replaces: a TCP
 connect, or an HTTP status below 300.
 
 ### Waves
 
 An app that has yet to make its instance waits while any app of an earlier
-wave that should run has neither become Ready nor Failed nor succeeded, an
-app nothing was observed of among them, for at most its `wave_wait_ms`
+wave that should run has neither become Ready nor Failed nor succeeded for
+its spec as it is now, an app nothing was observed of among them and one
+whose spec was written to after its last verdict; Failed past a readiness
+deadline counts, so nobody waits on an app that may never answer. It
+waits for at most its `wave_wait_ms`
 from when it first waited. The apps it waits for are in its status
 (`waiting_on`) and are its `references/1`, so a change to any of them is
 its next pass: an earlier app becoming Ready starts it at once. It refers

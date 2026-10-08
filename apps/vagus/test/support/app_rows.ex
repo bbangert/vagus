@@ -186,7 +186,7 @@ defmodule Vagus.Test.AppRows do
     do: %{name: name, reason: reason, at: ago(0), generation: generation}
 
   @doc "`{name, resource, observation, {kind, reason, state, wire}, effects, status}`"
-  def all, do: decisions() ++ order() ++ guards()
+  def all, do: decisions() ++ order() ++ guards() ++ raised()
 
   defp decisions do
     up = obs(instance: inst(), token: :current)
@@ -681,7 +681,12 @@ defmodule Vagus.Test.AppRows do
       {"Core not answering past its deadline: Failed, and still asked",
        core(%{}, status: running(instance: seen(since: ago(600_000)))),
        obs(instance: inst(), token: :current, ready: :not_ready, image: nil),
-       {:failed, :readiness_timeout, :failed, :error}, later(5_000), %{}},
+       {:failed, :readiness_timeout, :failed, :error}, later(30_000), %{failure: nil}},
+      {"Core answering after its deadline has passed: Ready, with nothing written to its spec",
+       core(%{}, status: running(instance: seen(since: ago(700_000)))),
+       obs(instance: inst(), token: :current, ready: :ready, image: nil),
+       {:ready, :ready, :ready, :started}, [],
+       %{failure: nil, instance: seen(since: ago(700_000), ready?: true)}},
       {"Core answering: Ready, and not asked again", core(%{}, status: running()),
        obs(instance: inst(), token: :current, ready: :ready, image: nil),
        {:ready, :ready, :ready, :started}, [], %{instance: seen(ready?: true)}},
@@ -876,6 +881,7 @@ defmodule Vagus.Test.AppRows do
   @clauses [
     :mismatch_deleted,
     :name_mismatch,
+    :raised,
     :stop_leftover,
     :remove_leftover,
     :await_removal,
@@ -1156,7 +1162,8 @@ defmodule Vagus.Test.AppRows do
                 st.failure
               ),
           failed_with_its_cause:
-            clause != :failed_before or match?(%{class: :permanent, cause: ^reason}, st.failure),
+            clause not in [:failed_before, :raised] or
+              match?(%{class: :permanent, cause: ^reason}, st.failure),
           paused_with_its_cause:
             clause != :retry_pause or match?(%{class: :transient, cause: ^reason}, st.failure),
           attempt_counted:
@@ -1194,6 +1201,7 @@ defmodule Vagus.Test.AppRows do
 
   # Every clause that reports Failed and no time to look again. One that
   # was Failed before the pass comes first among them in the decision.
+  defp failed_clause(_reason, %{raised?: true}), do: :raised
   defp failed_clause(_reason, %{failed?: true}), do: :failed_before
   defp failed_clause(:crash_loop, _v), do: :crash_loop_spent
   defp failed_clause(:crashed, _v), do: :crashed
@@ -1318,6 +1326,65 @@ defmodule Vagus.Test.AppRows do
 
   # One row for each guard of a fact the decision turns on: what the fact
   # is when the guard does not hold.
+  # An action that raised or whose call exited, as the pass after it
+  # is handed it.
+  defp raised do
+    crash = {:crashed, RuntimeError}
+
+    gave_up = fn action ->
+      failure(action: action, cause: :crashed, detail: crash, at: ago(0))
+    end
+
+    [
+      {"a start that raised: Failed, recorded, and not asked for again",
+       app(@container, %{}, status: %{made_for: :this}),
+       obs(instance: inst(:created), token: :current, failed_action: failed(:start, crash)),
+       {:failed, :crashed, :failed, :error}, [], %{failure: gave_up.(:start)}},
+      {"a remove that raised: Failed too, though the container is still to go",
+       app(@container, %{run: false}, status: running(expected_exit: "c1")),
+       obs(instance: inst(:exited), failed_action: failed(:remove, crash)),
+       {:failed, :crashed, :failed, :error}, [], %{failure: gave_up.(:remove)}},
+      {"and it stays Failed in the passes after, with nothing done",
+       app(@container, %{run: false},
+         status: running(expected_exit: "c1", failure: gave_up.(:remove))
+       ), obs(instance: inst(:exited)), {:failed, :crashed, :failed, :error}, [],
+       %{failure: gave_up.(:remove)}},
+      {"a leftover's stop that raised keeps the app from being made beside it", app(),
+       obs(leftover: :running, failed_action: failed(:stop_leftover, crash)),
+       {:failed, :crashed, :failed, :error}, [], %{}},
+      {"deleting: a remove that raised is asked for again, there being no other way on",
+       app(@container, %{}, status: running(expected_exit: "c1"), deleting?: true),
+       obs(instance: inst(:exited), failed_action: failed(:remove, crash)),
+       {:progressing, :removing, :stopping, :stopped}, action(:remove), %{}},
+      {"an app that crashed and is not restarted is no action that raised: stopped when told to",
+       app(@container, %{run: false},
+         status: running(failure: failure(action: :run, cause: :crashed, generation: 3))
+       ), obs(instance: inst(:exited)), {:progressing, :removing, :stopping, :stopped},
+       action(:remove), %{}},
+      {"a token removal whose call exited, the table being replaced: asked for again",
+       app(@container, %{run: false}),
+       obs(token: :other, failed_action: failed(:remove_token, {:exit, :noproc})),
+       {:progressing, :revoking_token, :stopping, :stopped}, action(:remove_token),
+       %{
+         failure:
+           failure(
+             action: :remove_token,
+             class: :transient,
+             cause: :call_exited,
+             detail: {:exit, :noproc},
+             at: ago(0)
+           )
+       }},
+      {"a start whose call timed out is tried again after its pause, like any failure for now",
+       app(@container, %{}, status: %{made_for: :this}),
+       obs(
+         instance: inst(:created),
+         token: :current,
+         failed_action: failed(:start, {:exit, :timeout})
+       ), {:progressing, :call_exited, :starting, :stopped}, later(1_000), %{}}
+    ]
+  end
+
   defp guards do
     ready = running(instance: seen(ready?: true), ready_since: ago(30_000))
     refused = {:failed, {:status, 404, "no such image"}, ago(50)}

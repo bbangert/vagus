@@ -10,6 +10,12 @@ defmodule Vagus.App.Controller.Reconcile do
   and at most one action. A clause's reason is the reason of all three
   conditions.
 
+  Failed is of two kinds. Given up: a failure for good, an action that
+  raised, a budget spent, a crash nothing restarts. Nothing more is done
+  until the spec is written to. And not ready within its deadline
+  (`readiness_timeout`): the instance runs and is still asked, at a longer
+  interval, and is Ready when it answers, with no write to anything.
+
   The order of the clauses is the order of precedence: what is owed to a
   container the other firmware slot left, then taking an instance away,
   then judging one that ended, then the start sequence.
@@ -23,6 +29,10 @@ defmodule Vagus.App.Controller.Reconcile do
   @finalizer :app
 
   @readiness_poll_ms 5_000
+  # Past its deadline an app is still asked, since a slow one must come up
+  # all the same, but seldom: one that is dead is not worth a question
+  # every five seconds for as long as it stays so.
+  @overdue_poll_ms 30_000
   @removing_poll_ms 1_000
   @api_poll_ms 2_000
 
@@ -55,6 +65,9 @@ defmodule Vagus.App.Controller.Reconcile do
 
       v.mismatch? ->
         out(v, :failed, :name_mismatch, :failed)
+
+      v.raised? ->
+        out(v, :failed, :crashed, :failed)
 
       v.leftover == :running ->
         act(v, :removing_leftover, :stopping, :stop_leftover)
@@ -176,7 +189,7 @@ defmodule Vagus.App.Controller.Reconcile do
         act(v, :starting, :starting, :start, launching(v))
 
       v.waiting != nil and v.past_deadline? ->
-        wait(v, :readiness_timeout, :failed, @readiness_poll_ms, %{}, :failed)
+        wait(v, :readiness_timeout, :failed, @overdue_poll_ms, %{}, :failed)
 
       v.waiting != nil ->
         wait(v, v.waiting, :starting, v.readiness_poll)

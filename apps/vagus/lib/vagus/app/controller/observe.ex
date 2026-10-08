@@ -215,7 +215,9 @@ defmodule Vagus.App.Controller.Observe do
   end
 
   # The apps of an earlier wave that should run and have neither become
-  # ready nor given up, an app nothing was observed of among them. Only an
+  # ready nor failed, an app nothing was observed of among them. Failed
+  # past a readiness deadline counts as failed: nobody waits on an app
+  # that may never answer. Only an
   # app that has yet to make its instance waits for anyone.
   defp waiting_on(%Resource{spec: spec, name: name} = resource, :absent, profile, i) do
     if Schema.wanted?(spec) and not resource.deleting? do
@@ -234,9 +236,19 @@ defmodule Vagus.App.Controller.Observe do
 
   defp waiting_on(_resource, _instance, _profile, _i), do: []
 
-  defp settled?(app) do
-    Enum.any?([:ready, :failed], &match?(%{status: true}, Resource.get_condition(app, &1))) or
-      app.status[:state] == :succeeded
+  # For the spec as it is now. A condition or a success of an earlier
+  # generation is about an instance the app is on its way from: its spec
+  # has been written to since, and it has yet to be looked at.
+  defp settled?(%Resource{generation: generation} = app) do
+    said? = fn type ->
+      match?(
+        %{status: true, observed_generation: ^generation},
+        Resource.get_condition(app, type)
+      )
+    end
+
+    said?.(:ready) or said?.(:failed) or
+      (app.status[:state] == :succeeded and app.status[:succeeded] == generation)
   end
 
   # What is recorded of this run of the instance: the engine starts a

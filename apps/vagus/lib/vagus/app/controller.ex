@@ -15,8 +15,10 @@ defmodule Vagus.App.Controller do
   with the same reason. Ready: the instance runs, is ready as its profile
   defines it, and every gate is open. Progressing: the controller is on its
   way to what is wanted, or waits for something that comes by itself.
-  Failed: it has given up until the spec changes. None of the three: the
-  app is where it should be and that is not running.
+  Failed: it has given up until the spec changes; or, as
+  `readiness_timeout`, the instance has not become ready within its
+  deadline, is still asked, and is Ready when it answers. None of the
+  three: the app is where it should be and that is not running.
 
   ## Context
 
@@ -111,45 +113,49 @@ defmodule Vagus.App.Controller do
   @impl true
   defdelegate reconcile(resource, observation), to: Reconcile
 
-  # The token is made here and nowhere kept: it goes into the container's
-  # environment and is read back from there. What comes before the mint
-  # holds no token, and what it raises is reported like any other crash.
+  # Whatever an action raises, throws or exits with is its failure, to be
+  # recorded and judged like one it returned: left to end the step's task,
+  # it would be a crashed step, tried again for ever with nothing in status
+  # to say so. Two of the actions hold a token, and what they raise would
+  # carry it: the guard passes on the kind of failure and where it
+  # happened, nothing else. See `Vagus.App.Token.guard/1` for which
+  # failures are worth trying again.
   @impl true
-  def act(:create, _args, %{resource: %{name: app, spec: spec}} = context) do
+  def act(action, args, context), do: Token.guard(fn -> perform(action, args, context) end)
+
+  # The token is made here and nowhere kept: it goes into the container's
+  # environment and is read back from there.
+  defp perform(:create, _args, %{resource: %{name: app, spec: spec}} = context) do
     profile = Profile.of(spec)
     {backend, opts} = Observe.backend(profile, context)
 
-    with {:ok, prepared} <- prepare(spec, context) do
-      Token.guard(fn ->
-        with {:ok, config} <-
-               build(spec, context.facts, Map.put(prepared, :token, Token.mint())) do
-          backend.create(profile.container_name(app), config, opts)
-        end
-      end)
+    with {:ok, prepared} <- prepare(spec, context),
+         {:ok, config} <- build(spec, context.facts, Map.put(prepared, :token, Token.mint())) do
+      backend.create(profile.container_name(app), config, opts)
     end
   end
 
-  def act(:start, _args, context), do: instance(context, & &1.start(&2, &3))
+  defp perform(:start, _args, context), do: instance(context, & &1.start(&2, &3))
 
   # A native app has nothing to create, so what a create prepares is
   # prepared here.
-  def act(:start_process, _args, %{resource: %{spec: spec}} = context) do
+  defp perform(:start_process, _args, %{resource: %{spec: spec}} = context) do
     with {:ok, _prepared} <- prepare(spec, context),
          do: instance(context, & &1.start(&2, &3))
   end
 
-  def act(stop, %{grace: grace}, context) when stop in [:stop, :stop_process],
+  defp perform(stop, %{grace: grace}, context) when stop in [:stop, :stop_process],
     do: instance(context, & &1.stop(&2, grace, &3))
 
-  def act(:remove, _args, context), do: instance(context, & &1.remove(&2, &3))
+  defp perform(:remove, _args, context), do: instance(context, & &1.remove(&2, &3))
 
-  def act(:stop_leftover, _args, context),
+  defp perform(:stop_leftover, _args, context),
     do: leftover(context, &Backend.Container.stop(&1, nil, &2))
 
-  def act(:remove_leftover, _args, context),
+  defp perform(:remove_leftover, _args, context),
     do: leftover(context, &Backend.Container.remove/2)
 
-  def act(:request_pull, %{image: image, priority: priority}, context) do
+  defp perform(:request_pull, %{image: image, priority: priority}, context) do
     Pulls.request(image, {__MODULE__, context.resource.name},
       instance: context.instance,
       platform: Container.Config.platform(context.facts),
@@ -157,40 +163,38 @@ defmodule Vagus.App.Controller do
     )
   end
 
-  def act(:cancel_pull, %{image: image}, context),
+  defp perform(:cancel_pull, %{image: image}, context),
     do: Pulls.cancel(image, {__MODULE__, context.resource.name}, instance: context.instance)
 
   # The token is read here, from the instance, and not handed in: an
   # action's arguments are kept by the runtime and shown with a failure.
-  def act(:put_token, %{instance: id}, %{resource: %{name: app, spec: spec}} = context) do
+  defp perform(:put_token, %{instance: id}, %{resource: %{name: app, spec: spec}} = context) do
     profile = Profile.of(spec)
     {backend, opts} = Observe.backend(profile, context)
 
-    Token.guard(fn ->
-      with {:ok, %{id: ^id, env: env}} <- backend.observe(profile.container_name(app), opts),
-           token when is_binary(token) <- Token.of(source(profile, context), env) do
-        AuthIndex.put(app, token, instance: context.instance)
-      else
-        {:unavailable, reason} -> {:error, {:unreachable, reason}}
-        {:error, failure} -> {:error, failure}
-        _another_instance_or_none -> {:error, {:other, :instance_changed}}
-      end
-    end)
+    with {:ok, %{id: ^id, env: env}} <- backend.observe(profile.container_name(app), opts),
+         token when is_binary(token) <- Token.of(source(profile, context), env) do
+      AuthIndex.put(app, token, instance: context.instance)
+    else
+      {:unavailable, reason} -> {:error, {:unreachable, reason}}
+      {:error, failure} -> {:error, failure}
+      _another_instance_or_none -> {:error, {:other, :instance_changed}}
+    end
   end
 
-  def act(:remove_token, _args, context),
+  defp perform(:remove_token, _args, context),
     do: AuthIndex.remove(context.resource.name, instance: context.instance)
 
   # An image another container still uses is refused by the engine. The
   # error is what tells the next pass to leave the image: it would be there
   # to see either way.
-  def act(:remove_image, %{image: image}, %{resource: %{spec: spec}} = context) do
+  defp perform(:remove_image, %{image: image}, %{resource: %{spec: spec}} = context) do
     {backend, opts} = Observe.backend(Profile.of(spec), context)
     backend.remove_image(image, opts)
   end
 
   # By the manifest's slug, as the directory was made and is looked for.
-  def act(:remove_data, _args, %{resource: %{spec: %{config: %{slug: slug}}}} = context),
+  defp perform(:remove_data, _args, %{resource: %{spec: %{config: %{slug: slug}}}} = context),
     do: Prepare.remove_data(slug, context.facts)
 
   defp instance(%{resource: %{name: app, spec: spec}} = context, call) do

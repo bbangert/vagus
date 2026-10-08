@@ -249,7 +249,7 @@ defmodule Vagus.App.Controller.SystemTest do
       {:current_stacktrace, stack} = Process.info(self(), :current_stacktrace)
 
       Enum.any?(stack, fn {module, function, _arity, _location} ->
-        module == Controller and Atom.to_string(function) =~ "act"
+        module == Controller and Atom.to_string(function) =~ "perform"
       end)
     end
 
@@ -529,7 +529,7 @@ defmodule Vagus.App.Controller.SystemTest do
       assert Enum.all?(tokens, &(byte_size(&1) == 43))
       # Each of the three faults was reported, and a pass that raised too:
       # crash reports are among what is read.
-      assert log =~ "a step holding a token crashed"
+      assert log =~ "a step crashed"
       assert log =~ "the prober fell over"
 
       calls = traced()

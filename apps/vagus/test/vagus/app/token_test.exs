@@ -83,7 +83,7 @@ defmodule Vagus.App.TokenTest do
             fn -> raise ArgumentError, "bad config #{secret}" end,
             fn -> takes_none.(secret) end,
             fn -> throw({:config, secret}) end,
-            fn -> exit({:shutdown, secret}) end,
+            fn -> exit({:crashed_with, secret}) end,
             fn -> Map.fetch!(%{token: secret}, :missing) end
           ] do
         assert {:error, {:crashed, kind}} = Token.guard(failing)
@@ -93,6 +93,38 @@ defmodule Vagus.App.TokenTest do
 
       assert Token.guard(fn -> raise KeyError, key: secret end) == {:error, {:crashed, KeyError}}
       assert Token.guard(fn -> exit(secret) end) == {:error, {:crashed, :exit}}
+    end
+
+    test "an exit that says the process asked was away or slow is told apart, and is no crash" do
+      secret = "s3cret-token"
+      call = {GenServer, :call, [:somebody, {:put, secret}, 5_000]}
+
+      for {reason, why} <- [
+            {{:timeout, call}, :timeout},
+            {{:noproc, call}, :noproc},
+            {{:normal, call}, :normal},
+            {{:shutdown, call}, :shutdown},
+            {{{:shutdown, secret}, call}, :shutdown},
+            {{:killed, call}, :killed},
+            {:shutdown, :shutdown},
+            {{:shutdown, secret}, :shutdown},
+            {:noproc, :noproc}
+          ] do
+        assert Token.guard(fn -> exit(reason) end) == {:error, {:exit, why}}
+      end
+
+      # As a call to a name nobody has really exits.
+      nobody = Module.concat(__MODULE__, "Nobody#{System.unique_integer([:positive])}")
+
+      assert Token.guard(fn -> GenServer.call(nobody, :anything) end) ==
+               {:error, {:exit, :noproc}}
+
+      # The process asked having crashed over the request is a crash.
+      crashed = {{%RuntimeError{message: secret}, []}, call}
+      assert Token.guard(fn -> exit(crashed) end) == {:error, {:crashed, :exit}}
+
+      assert Token.guard(fn -> exit({:timeout_of_another_kind, secret}) end) ==
+               {:error, {:crashed, :exit}}
     end
   end
 end

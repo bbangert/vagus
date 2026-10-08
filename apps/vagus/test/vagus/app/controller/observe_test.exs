@@ -334,6 +334,44 @@ defmodule Vagus.App.Controller.ObserveTest do
       assert %{waiting_on: []} = observe(ctx, early)
     end
 
+    test "an earlier wave is settled by what was said of its spec as it is, and of no other",
+         ctx do
+      app(ctx, "core_mosquitto")
+      app = app(ctx, @plain)
+      have_image(ctx, app)
+      waits = fn -> observe(ctx, app).waiting_on end
+
+      said = fn type, generation, status ->
+        conditions = [Vagus.Resource.condition(type, true, :a_reason, generation)]
+        patch = Map.put(status, :conditions, conditions)
+        writer = [writer: Controller] ++ ctx.sys.i
+        {:ok, _app} = Store.patch_status(:app, "core_mosquitto", patch, writer)
+      end
+
+      # Ready, or Failed, whatever the reason: a readiness deadline that
+      # passed is nothing a later app waits out.
+      said.(:ready, 1, %{})
+      assert waits.() == []
+
+      {:ok, %{generation: 2}} =
+        Store.update_spec(:app, "core_mosquitto", [{:inc, [:restart_counter]}], ctx.sys.i)
+
+      # Ready still stands in status, said of the spec before the write.
+      assert waits.() == ["core_mosquitto"]
+      said.(:failed, 2, %{})
+      assert waits.() == []
+
+      {:ok, %{generation: 3}} =
+        Store.update_spec(:app, "core_mosquitto", [{:inc, [:start_counter]}], ctx.sys.i)
+
+      assert waits.() == ["core_mosquitto"]
+      # Run once and done: for this generation, and not for the one before.
+      said.(:progressing, 3, %{state: :succeeded, succeeded: 2})
+      assert waits.() == ["core_mosquitto"]
+      said.(:progressing, 3, %{state: :succeeded, succeeded: 3})
+      assert waits.() == []
+    end
+
     test "the API not accepting, and the gates the controller was given", ctx do
       app = app(ctx, @plain)
       have_image(ctx, app)
