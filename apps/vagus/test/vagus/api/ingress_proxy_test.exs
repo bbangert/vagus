@@ -181,7 +181,9 @@ defmodule Vagus.API.IngressProxyTest do
   """
   use ExUnit.Case, async: false
 
-  alias Vagus.Addon.{Config, State}
+  import Vagus.AppFixtures
+
+  alias Vagus.Addon.Config
   alias Vagus.API.IngressProxyTest.{FakeAddon, HitCounter, StubUsers}
   alias Vagus.API.Token
 
@@ -241,8 +243,8 @@ defmodule Vagus.API.IngressProxyTest do
 
     slug = "ingress_test_#{System.unique_integer([:positive])}"
     {:ok, config} = Config.parse(required_config(slug))
-    :ok = State.put(config, :started)
-    {:ok, entry} = State.get(slug)
+    install_app(config, state: :started)
+    {:ok, entry} = app_info(slug)
 
     Application.put_env(:vagus, :ingress_target_fun, fn
       ^slug -> {:ok, {"127.0.0.1", addon_port, false}}
@@ -251,7 +253,6 @@ defmodule Vagus.API.IngressProxyTest do
 
     on_exit(fn ->
       Application.delete_env(:vagus, :ingress_target_fun)
-      State.delete(slug)
     end)
 
     %{
@@ -1110,8 +1111,7 @@ defmodule Vagus.API.IngressProxyTest do
       |> Map.merge(%{"host_network" => true, "ingress_port" => port})
       |> Vagus.Addon.Config.parse()
 
-    :ok = State.put(config, :started)
-    on_exit(fn -> State.delete(slug) end)
+    install_app(config, state: :started)
     slug
   end
 
@@ -1138,8 +1138,7 @@ defmodule Vagus.API.IngressProxyTest do
   test "a bridge-mode add-on never takes the host-address path" do
     slug = "ingress_bridged_#{System.unique_integer([:positive])}"
     {:ok, config} = Vagus.Addon.Config.parse(required_config(slug))
-    :ok = State.put(config, :started)
-    on_exit(fn -> State.delete(slug) end)
+    install_app(config, state: :started)
 
     # There is no `addon_<slug>` container to inspect here, so the lookup
     # fails — which is the assertion: it went looking for a bridge IP at all,

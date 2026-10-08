@@ -5,7 +5,9 @@ defmodule Vagus.Addon.StoreTest do
 
   import ExUnit.CaptureLog
 
-  alias Vagus.Addon.{State, Store, StoreView}
+  import Vagus.AppFixtures
+
+  alias Vagus.Addon.{Store, StoreView}
   alias Vagus.Addon.Store.{Assets, RepositorySpec}
 
   @mosquitto_yaml """
@@ -141,8 +143,7 @@ defmodule Vagus.Addon.StoreTest do
         "image" => "x/y"
       })
 
-    :ok = State.put(config, :started)
-    on_exit(fn -> State.delete(store_slug) end)
+    install_app(config, state: :started)
   end
 
   test "build_catalog parses each config.yaml into a store-slugged entry" do

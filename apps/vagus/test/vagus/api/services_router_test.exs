@@ -3,24 +3,29 @@ defmodule Vagus.API.ServicesRouterTest do
   use ExUnit.Case, async: false
   use Plug.Test
 
-  alias Vagus.Addon.Registry
+  import Vagus.AppFixtures
+
+  alias Vagus.Addon.Config
 
   @opts Vagus.API.Router.init([])
 
-  # Register a running add-on with the given grants; return its token.
-  defp addon_token(slug, services_role) do
-    token = "tok-#{System.unique_integer([:positive])}"
-
-    :ok =
-      Registry.register(token, %{
-        slug: slug,
-        services_role: services_role,
-        auth_api: false,
-        discovery: []
+  defp app_config(slug) do
+    {:ok, config} =
+      Config.parse(%{
+        "name" => "Test App",
+        "version" => "1",
+        "slug" => slug,
+        "description" => "d",
+        "arch" => ["amd64"],
+        "image" => "x/y"
       })
 
-    on_exit(fn -> Registry.unregister_slug(slug) end)
-    token
+    config
+  end
+
+  # Register a running add-on with the given grants; return its token.
+  defp addon_token(slug, services_role) do
+    register_app_token(app_config(slug), identity: %{services_role: services_role})
   end
 
   defp call(method, path, token, body \\ nil) do

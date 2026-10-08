@@ -13,7 +13,9 @@ defmodule Vagus.Ingress.PanelsTest do
   """
   use ExUnit.Case, async: false
 
-  alias Vagus.Addon.{Config, State}
+  import Vagus.AppFixtures
+
+  alias Vagus.Addon.Config
   alias Vagus.API.AdminPanel
   alias Vagus.Core.{Client, TokenStore}
   alias Vagus.Ingress.Panels
@@ -91,11 +93,10 @@ defmodule Vagus.Ingress.PanelsTest do
     client
   end
 
-  # The global `Vagus.Addon.State` is what `Panels` reads, hence `async: false`.
+  # `Panels` reads the global app store, hence `async: false`.
   defp install(config, opts \\ []) do
-    :ok = State.put(config, :started)
-    on_exit(fn -> State.delete(config.slug) end)
-    if Keyword.get(opts, :panel), do: :ok = State.put_setting(config.slug, :ingress_panel, true)
+    panel = if Keyword.get(opts, :panel), do: [ingress_panel: true], else: []
+    install_app(config, [state: :started] ++ panel)
     :ok
   end
 

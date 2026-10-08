@@ -3,20 +3,26 @@ defmodule Vagus.API.LogsRouterTest do
   use ExUnit.Case, async: false
   use Plug.Test
 
-  alias Vagus.Addon.Registry
+  import Vagus.AppFixtures
+
+  alias Vagus.Addon.Config
 
   @opts Vagus.API.Router.init([])
 
   defp sup(conn), do: put_req_header(conn, "authorization", "Bearer #{Vagus.API.Token.get()}")
 
   defp addon_token(slug) do
-    token = "tok-#{System.unique_integer([:positive])}"
+    {:ok, config} =
+      Config.parse(%{
+        "name" => "Test App",
+        "version" => "1",
+        "slug" => slug,
+        "description" => "d",
+        "arch" => ["amd64"],
+        "image" => "x/y"
+      })
 
-    :ok =
-      Registry.register(token, %{slug: slug, services_role: %{}, auth_api: false, discovery: []})
-
-    on_exit(fn -> Registry.unregister_slug(slug) end)
-    token
+    register_app_token(config)
   end
 
   test "host/logs is empty text/plain with the required headers (no journal)" do

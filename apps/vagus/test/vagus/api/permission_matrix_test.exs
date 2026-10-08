@@ -42,7 +42,9 @@ defmodule Vagus.API.PermissionMatrixTest do
 
   import Plug.Test
 
-  alias Vagus.Addon.Registry
+  import Vagus.AppFixtures
+
+  alias Vagus.Addon.Config
   alias Vagus.API.Dispatcher
 
   @fixture_path Path.join([
@@ -146,7 +148,11 @@ defmodule Vagus.API.PermissionMatrixTest do
 
   defp request(key, variant, path) do
     token = "matrix-#{variant["addon"]}-#{System.unique_integer([:positive])}"
-    :ok = Registry.register(token, identity(key, variant))
+
+    register_app_token(app_config(variant["addon"]),
+      token: token,
+      identity: identity(key, variant)
+    )
 
     try do
       {path, query} = split_query(path)
@@ -170,9 +176,21 @@ defmodule Vagus.API.PermissionMatrixTest do
       # fixture that says denied, and land in the `looser` bucket, which is
       # never suppressed.
       _error -> 500
-    after
-      Registry.unregister_slug(variant["addon"])
     end
+  end
+
+  defp app_config(slug) do
+    {:ok, config} =
+      Config.parse(%{
+        "name" => "Test App",
+        "version" => "1",
+        "slug" => slug,
+        "description" => "d",
+        "arch" => ["amd64"],
+        "image" => "x/y"
+      })
+
+    config
   end
 
   defp split_query(path) do

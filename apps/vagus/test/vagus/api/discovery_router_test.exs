@@ -13,7 +13,9 @@ defmodule Vagus.API.DiscoveryRouterTest do
   use ExUnit.Case, async: false
   use Plug.Test
 
-  alias Vagus.Addon.Registry
+  import Vagus.AppFixtures
+
+  alias Vagus.Addon.Config
 
   @opts Vagus.API.Router.init([])
 
@@ -38,24 +40,24 @@ defmodule Vagus.API.DiscoveryRouterTest do
     :ok
   end
 
-  # Register a running add-on that declares `discovery`; return its token.
-  defp addon_token(slug, discovery) do
-    token = "tok-#{System.unique_integer([:positive])}"
-
-    :ok =
-      Registry.register(token, %{
-        slug: slug,
-        services_role: %{},
-        auth_api: false,
-        discovery: discovery
+  defp app_config(slug) do
+    {:ok, config} =
+      Config.parse(%{
+        "name" => "Test App",
+        "version" => "1",
+        "slug" => slug,
+        "description" => "d",
+        "arch" => ["amd64"],
+        "image" => "x/y"
       })
 
-    on_exit(fn ->
-      Registry.unregister_slug(slug)
-      Vagus.Discovery.delete_by_slug(slug)
-    end)
+    config
+  end
 
-    token
+  # Register a running add-on that declares `discovery`; return its token.
+  defp addon_token(slug, discovery) do
+    on_exit(fn -> Vagus.Discovery.delete_by_slug(slug) end)
+    register_app_token(app_config(slug), identity: %{discovery: discovery})
   end
 
   defp call(method, path, token, body \\ nil) do

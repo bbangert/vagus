@@ -32,7 +32,9 @@ defmodule Vagus.API.RouterStoreRepositoriesTest do
   import Plug.Test
   import Plug.Conn
 
-  alias Vagus.Addon.{Config, State, Store}
+  import Vagus.AppFixtures
+
+  alias Vagus.Addon.{Config, Store}
   alias Vagus.Addon.Store.RepositorySpec
   alias Vagus.API.{Router, Token}
 
@@ -371,8 +373,7 @@ defmodule Vagus.API.RouterStoreRepositoriesTest do
       assert :ok = Store.add_repository(@awesome)
       store_slug = "#{@awesome_slug}_esphome"
 
-      :ok = State.put(fixture_config(store_slug), :started)
-      on_exit(fn -> State.delete(store_slug) end)
+      install_app(fixture_config(store_slug), state: :started)
 
       conn = delete_("/store/repositories/#{@awesome_slug}")
       assert conn.status == 400

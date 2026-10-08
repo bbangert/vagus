@@ -9,16 +9,16 @@ defmodule Vagus.API.AuthTierGateTest do
   table nobody consults would reproduce that exactly, so the assertions here
   go through `Router.call/2` rather than calling `Tiers` directly.
 
-  `async: true`: every helper registers a token under a slug unique to this
-  file and unregisters on exit, and nothing here asserts on shared state.
+  `async: false`: `GET /addons` reads the global state other files seed.
   """
 
-  use ExUnit.Case, async: true
+  use ExUnit.Case, async: false
 
   import Plug.Test
   import Plug.Conn
+  import Vagus.AppFixtures
 
-  alias Vagus.Addon.Registry
+  alias Vagus.Addon.Config
   alias Vagus.API.{Router, Token}
 
   @opts Router.init([])
@@ -89,26 +89,21 @@ defmodule Vagus.API.AuthTierGateTest do
     "/supervisor/ping"
   ]
 
-  defp addon_token(slug, grants \\ %{}) do
-    token = "tok-#{System.unique_integer([:positive])}"
+  defp app_config(slug) do
+    {:ok, config} =
+      Config.parse(%{
+        "name" => slug,
+        "version" => "1",
+        "slug" => slug,
+        "description" => "d",
+        "arch" => ["aarch64"]
+      })
 
-    identity =
-      Map.merge(
-        %{
-          slug: slug,
-          services_role: %{},
-          auth_api: false,
-          discovery: [],
-          hassio_api: false,
-          hassio_role: "default"
-        },
-        grants
-      )
-
-    :ok = Registry.register(token, identity)
-    on_exit(fn -> Registry.unregister_slug(slug) end)
-    token
+    config
   end
+
+  defp addon_token(slug, grants \\ %{}),
+    do: register_app_token(app_config(slug), identity: grants)
 
   defp call(method, path, token) do
     conn(method, path)
@@ -226,7 +221,7 @@ defmodule Vagus.API.AuthTierGateTest do
   describe "POST /addons/:slug/security is unreachable from an add-on token" do
     setup do
       {:ok, config} =
-        Vagus.Addon.Config.parse(%{
+        Config.parse(%{
           "name" => "Sec",
           "version" => "1",
           "slug" => "tier_gate_sec_admin",
@@ -235,8 +230,7 @@ defmodule Vagus.API.AuthTierGateTest do
           "image" => "x/y"
         })
 
-      :ok = Vagus.Addon.State.put(config, :stopped)
-      on_exit(fn -> Vagus.Addon.State.delete("tier_gate_sec_admin") end)
+      install_app(config)
       :ok
     end
 
@@ -246,7 +240,7 @@ defmodule Vagus.API.AuthTierGateTest do
 
       assert call(:post, "/addons/self/security", token).status == 403
       assert call(:post, "/addons/tier_gate_sec_admin/security", token).status == 403
-      assert {:ok, %{protected: true}} = Vagus.Addon.State.get("tier_gate_sec_admin")
+      assert {:ok, %{protected: true}} = app_info("tier_gate_sec_admin")
     end
 
     test "a plain add-on is refused too" do
@@ -264,7 +258,7 @@ defmodule Vagus.API.AuthTierGateTest do
   describe "GET /addons carries no secrets (A7)" do
     setup do
       {:ok, config} =
-        Vagus.Addon.Config.parse(%{
+        Config.parse(%{
           "name" => "Secretful",
           "version" => "1",
           "slug" => "core_secretful",
@@ -276,9 +270,7 @@ defmodule Vagus.API.AuthTierGateTest do
           "schema" => %{"api_key" => "str"}
         })
 
-      :ok = Vagus.Addon.State.put(config, :started)
-      :ok = Vagus.Addon.State.put_options("core_secretful", %{"api_key" => "s3cr3t"})
-      on_exit(fn -> Vagus.Addon.State.delete("core_secretful") end)
+      install_app(config, state: :started, options: %{"api_key" => "s3cr3t"})
       :ok
     end
 
@@ -301,7 +293,7 @@ defmodule Vagus.API.AuthTierGateTest do
       # The whole body, not just the one entry — the token must not appear
       # anywhere, and neither must the option value.
       refute conn.resp_body =~ "s3cr3t"
-      {:ok, state} = Vagus.Addon.State.get("core_secretful")
+      {:ok, state} = app_info("core_secretful")
       refute conn.resp_body =~ state.ingress_token
     end
 

@@ -11,7 +11,9 @@ defmodule Vagus.API.HostHardwareRouterTest do
   import Plug.Test
   import Plug.Conn
 
-  alias Vagus.Addon.Registry
+  import Vagus.AppFixtures
+
+  alias Vagus.Addon.Config
   alias Vagus.API.{Router, Token}
 
   @opts Router.init([])
@@ -22,19 +24,22 @@ defmodule Vagus.API.HostHardwareRouterTest do
     |> Router.call(@opts)
   end
 
+  defp app_config(slug) do
+    {:ok, config} =
+      Config.parse(%{
+        "name" => "Test App",
+        "version" => "1",
+        "slug" => slug,
+        "description" => "d",
+        "arch" => ["amd64"],
+        "image" => "x/y"
+      })
+
+    config
+  end
+
   defp get_as_addon(path, grants \\ %{hassio_api: true, hassio_role: "default"}) do
-    token = "tok-#{System.unique_integer([:positive])}"
-    slug = "host_hardware_test_addon"
-
-    identity =
-      Map.merge(
-        %{slug: slug, services_role: %{}, auth_api: false, discovery: []},
-        grants
-      )
-
-    :ok = Registry.register(token, identity)
-
-    on_exit(fn -> Registry.unregister_slug(slug) end)
+    token = register_app_token(app_config("host_hardware_test_addon"), identity: grants)
 
     conn(:get, path)
     |> put_req_header("x-supervisor-token", token)

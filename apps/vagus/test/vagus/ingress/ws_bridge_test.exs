@@ -280,7 +280,9 @@ defmodule Vagus.Ingress.WSBridgeTest do
   # sit above that, not equal to it.
   @moduletag timeout: 120_000
 
-  alias Vagus.Addon.{Config, State}
+  import Vagus.AppFixtures
+
+  alias Vagus.Addon.Config
   alias Vagus.Ingress.WSBridgeTest.{Client, FakeAddon}
 
   setup do
@@ -323,8 +325,8 @@ defmodule Vagus.Ingress.WSBridgeTest do
 
     slug = "ws_bridge_test_#{System.unique_integer([:positive])}"
     {:ok, config} = Config.parse(required_config(slug))
-    :ok = State.put(config, :started)
-    {:ok, entry} = State.get(slug)
+    install_app(config, state: :started)
+    {:ok, entry} = app_info(slug)
 
     Application.put_env(:vagus, :ingress_target_fun, fn
       ^slug -> {:ok, {"127.0.0.1", addon_port, false}}
@@ -334,7 +336,6 @@ defmodule Vagus.Ingress.WSBridgeTest do
     on_exit(fn ->
       Application.delete_env(:vagus, :ingress_target_fun)
       Application.delete_env(:vagus, :ws_bridge_test_pid)
-      State.delete(slug)
     end)
 
     %{

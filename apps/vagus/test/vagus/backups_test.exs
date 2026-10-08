@@ -11,7 +11,9 @@ defmodule Vagus.BackupsTest do
   """
   use ExUnit.Case, async: false
 
-  alias Vagus.Addon.{Backend, Config, State}
+  import Vagus.AppFixtures
+
+  alias Vagus.Addon.{Backend, Config}
   alias Vagus.Backups
 
   @backend Backend.Fake
@@ -40,13 +42,11 @@ defmodule Vagus.BackupsTest do
     config
   end
 
-  # Seeds `Vagus.Addon.State` (the real, globally-supervised singleton) and
-  # creates the add-on's data dir under `data_root`, scheduling both for
-  # cleanup.
+  # Installs into the real, global app store, and creates the app's data dir
+  # under `data_root`.
   defp install(slug, data_root, state \\ :started, user_options \\ %{}, overrides \\ %{}) do
     config = fixture_config(slug, overrides)
-    :ok = State.put(config, state, user_options: user_options)
-    on_exit(fn -> State.delete(slug) end)
+    install_app(config, state: state, options: user_options)
 
     data_dir = Path.join([data_root, "addons", "data", slug])
     File.mkdir_p!(data_dir)
@@ -143,7 +143,7 @@ defmodule Vagus.BackupsTest do
       calls = @backend.calls()
       assert Enum.any?(calls, &match?({:stop, "addon_" <> ^slug}, &1))
       assert Enum.any?(calls, &match?({:start, _}, &1))
-      assert {:ok, %{state: :started}} = State.get(slug)
+      assert {:ok, %{state: :started}} = app_info(slug)
     end
 
     test "a stopped add-on is snapshotted as-is (no stop/start either way)", %{
@@ -177,7 +177,7 @@ defmodule Vagus.BackupsTest do
       server: server
     } do
       slug = "core_restore"
-      install(slug, dr, :started, %{"greet" => "hi"})
+      config = install(slug, dr, :started, %{"greet" => "hi"})
       dd = data_dir(dr, slug)
       File.write!(Path.join(dd, "keep.txt"), "original")
 
@@ -191,7 +191,7 @@ defmodule Vagus.BackupsTest do
       # Drift after the backup was taken.
       File.write!(Path.join(dd, "keep.txt"), "mutated")
       File.write!(Path.join(dd, "extra.txt"), "should be gone")
-      :ok = State.put_options(slug, %{"greet" => "bye"})
+      install_app(config, state: :started, options: %{"greet" => "bye"})
 
       :ok = @backend.reset_calls()
 
@@ -204,7 +204,7 @@ defmodule Vagus.BackupsTest do
 
       assert File.read!(Path.join(dd, "keep.txt")) == "original"
       refute File.exists?(Path.join(dd, "extra.txt"))
-      assert {:ok, %{user_options: %{"greet" => "hi"}}} = State.get(slug)
+      assert {:ok, %{user_options: %{"greet" => "hi"}}} = app_info(slug)
 
       calls = @backend.calls()
       assert Enum.any?(calls, &match?({:stop, "addon_" <> ^slug}, &1))
@@ -221,14 +221,14 @@ defmodule Vagus.BackupsTest do
       server: server
     } do
       slug = "core_restore_protected"
-      install(slug, dr, :stopped, %{"greet" => "hi"})
+      config = install(slug, dr, :stopped, %{"greet" => "hi"})
       File.write!(Path.join(data_dir(dr, slug), "f.txt"), "x")
 
       {:ok, backup_slug} = Backups.create_partial(nil, [slug], server: server, data_root: dr)
 
       # Turned off AFTER the backup was taken — the restore must not roll it
       # back to the protected default the tar knows nothing about.
-      :ok = State.put_setting(slug, :protected, false)
+      install_app(config, protected: false)
 
       assert :ok =
                Backups.restore_partial(backup_slug, [slug],
@@ -237,7 +237,7 @@ defmodule Vagus.BackupsTest do
                  backend: @backend
                )
 
-      assert {:ok, %{protected: false, user_options: %{"greet" => "hi"}}} = State.get(slug)
+      assert {:ok, %{protected: false, user_options: %{"greet" => "hi"}}} = app_info(slug)
     end
 
     test "a stopped-at-backup-time add-on is not restarted on restore", %{
@@ -268,7 +268,7 @@ defmodule Vagus.BackupsTest do
       File.write!(Path.join(data_dir(dr, slug), "f.txt"), "x")
 
       {:ok, backup_slug} = Backups.create_partial(nil, [slug], server: server, data_root: dr)
-      State.delete(slug)
+      forget_app(slug)
 
       assert {:error, message} =
                Backups.restore_partial(backup_slug, [slug], server: server, data_root: dr)

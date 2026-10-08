@@ -184,7 +184,9 @@ defmodule Vagus.API.CoreProxyTest do
   use ExUnit.Case, async: false
   use Plug.Test
 
-  alias Vagus.Addon.Registry
+  import Vagus.AppFixtures
+
+  alias Vagus.Addon.Config
   alias Vagus.API.{CoreProxy, Dispatcher, Token}
   alias Vagus.API.CoreProxyTest.{FakeCore, HitCounter, Recorder, Script, SSEGate}
 
@@ -261,27 +263,26 @@ defmodule Vagus.API.CoreProxyTest do
     |> Finch.request(@client_finch, receive_timeout: 5_000)
   end
 
-  defp addon_token(slug, grants \\ %{}) do
-    token = "core-proxy-tok-#{System.unique_integer([:positive])}"
+  defp app_config(slug) do
+    {:ok, config} =
+      Config.parse(%{
+        "name" => "Test App",
+        "version" => "1",
+        "slug" => slug,
+        "description" => "d",
+        "arch" => ["amd64"],
+        "image" => "x/y"
+      })
 
-    identity =
-      Map.merge(
-        %{
-          slug: slug,
-          services_role: %{},
-          auth_api: false,
-          discovery: [],
-          hassio_api: false,
-          hassio_role: "default",
-          homeassistant_api: false
-        },
-        grants
-      )
-
-    :ok = Registry.register(token, identity)
-    on_exit(fn -> Registry.unregister_slug(slug) end)
-    token
+    config
   end
+
+  defp addon_token(slug, grants \\ %{}),
+    do:
+      register_app_token(app_config(slug),
+        token: "core-proxy-tok-#{System.unique_integer([:positive])}",
+        identity: grants
+      )
 
   defp bearer(token), do: {"authorization", "Bearer #{token}"}
 

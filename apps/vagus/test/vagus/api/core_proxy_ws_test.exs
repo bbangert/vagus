@@ -435,7 +435,9 @@ defmodule Vagus.API.CoreProxyWSTest do
   # sit above that, not equal to it.
   @moduletag timeout: 120_000
 
-  alias Vagus.Addon.Registry
+  import Vagus.AppFixtures
+
+  alias Vagus.Addon.Config
   alias Vagus.API.CoreProxy.WSBridge
   alias Vagus.API.CoreProxyWSTest.{Client, CoreAuthScript, DialCounter, FakeCore}
   alias Vagus.API.{Dispatcher, Token}
@@ -525,27 +527,26 @@ defmodule Vagus.API.CoreProxyWSTest do
     port
   end
 
-  defp addon_token(slug, grants \\ %{}) do
-    token = "core-ws-tok-#{System.unique_integer([:positive])}"
+  defp app_config(slug) do
+    {:ok, config} =
+      Config.parse(%{
+        "name" => "Test App",
+        "version" => "1",
+        "slug" => slug,
+        "description" => "d",
+        "arch" => ["amd64"],
+        "image" => "x/y"
+      })
 
-    identity =
-      Map.merge(
-        %{
-          slug: slug,
-          services_role: %{},
-          auth_api: false,
-          discovery: [],
-          hassio_api: false,
-          hassio_role: "default",
-          homeassistant_api: false
-        },
-        grants
-      )
-
-    :ok = Registry.register(token, identity)
-    on_exit(fn -> Registry.unregister_slug(slug) end)
-    token
+    config
   end
+
+  defp addon_token(slug, grants \\ %{}),
+    do:
+      register_app_token(app_config(slug),
+        token: "core-ws-tok-#{System.unique_integer([:positive])}",
+        identity: grants
+      )
 
   defp decode_text({:text, data}), do: Jason.decode!(data)
 

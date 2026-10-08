@@ -12,11 +12,13 @@ defmodule Vagus.API.AddonOptionsConfigTest do
   use ExUnit.Case, async: false
   use Plug.Test
 
-  alias Vagus.Addon.{Config, Registry, State}
+  import Vagus.AppFixtures
+
+  alias Vagus.Addon.Config
 
   @opts Vagus.API.Router.init([])
 
-  defp install(slug, opts \\ []) do
+  defp config(slug, opts) do
     {:ok, config} =
       Config.parse(%{
         "name" => "Test Addon",
@@ -29,20 +31,16 @@ defmodule Vagus.API.AddonOptionsConfigTest do
         "schema" => Keyword.get(opts, :schema, %{"greeting" => "str", "extra" => "bool"})
       })
 
-    :ok = State.put(config, :started, user_options: Keyword.get(opts, :user_options, %{}))
-    on_exit(fn -> State.delete(slug) end)
     config
   end
 
-  defp addon_token(slug) do
-    token = "tok-#{System.unique_integer([:positive])}"
-
-    :ok =
-      Registry.register(token, %{slug: slug, services_role: %{}, auth_api: false, discovery: []})
-
-    on_exit(fn -> Registry.unregister_slug(slug) end)
-    token
+  defp install(slug, opts \\ []) do
+    slug
+    |> config(opts)
+    |> install_app(state: :started, options: Keyword.get(opts, :user_options, %{}))
   end
+
+  defp addon_token(slug), do: register_app_token(config(slug, []))
 
   defp get(path, token) do
     conn(:get, path)
@@ -77,7 +75,7 @@ defmodule Vagus.API.AddonOptionsConfigTest do
 
     assert data(get("/addons/self/options/config", token))["greeting"] == "hi"
 
-    :ok = State.put_options("core_optcfglive", %{"greeting" => "changed"})
+    :ok = Vagus.App.set("core_optcfglive", options: %{"greeting" => "changed"})
 
     assert data(get("/addons/self/options/config", token))["greeting"] == "changed"
   end
