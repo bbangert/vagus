@@ -24,7 +24,9 @@ defmodule Vagus.API.AdminPanelTest do
   import Plug.Conn
   import Plug.Test
 
-  alias Vagus.Addon.{Config, State}
+  import Vagus.AppFixtures
+
+  alias Vagus.Addon.Config
   alias Vagus.API.{AdminPanel, IngressProxy, Router, Token}
   alias Vagus.DSP
   alias Vagus.Ingress.Panels
@@ -135,25 +137,12 @@ defmodule Vagus.API.AdminPanelTest do
 
   # Registers an add-on token the auth plug will resolve to `{:addon, _}`.
   defp addon_token(slug) do
-    token = "tok-#{System.unique_integer([:positive])}"
-
-    :ok =
-      Vagus.Addon.Registry.register(token, %{
-        slug: slug,
-        services_role: %{},
-        auth_api: true,
-        discovery: [],
-        hassio_api: true,
-        hassio_role: "default"
-      })
-
-    on_exit(fn -> Vagus.Addon.Registry.unregister_slug(slug) end)
-    token
+    register_app_token(ingress_config(slug), identity: %{auth_api: true, hassio_api: true})
   end
 
   defp data(conn), do: Jason.decode!(conn.resp_body)["data"]
 
-  describe "Vagus.Ingress.Panels.list/1" do
+  describe "Vagus.Ingress.Panels.list/0" do
     test "advertises the synthetic panel with the four keys aiohasupervisor requires" do
       entry = Panels.list()["vagus"]
 
@@ -165,11 +154,10 @@ defmodule Vagus.API.AdminPanelTest do
     end
 
     test "still lists real ingress add-ons alongside it" do
-      state = start_state()
       slug = "panel_addon_#{System.unique_integer([:positive])}"
-      :ok = State.put(ingress_config(slug), :started, server: state)
+      install_app(ingress_config(slug), state: :started)
 
-      panels = Panels.list(state)
+      panels = Panels.list()
 
       assert Map.has_key?(panels, slug)
       assert Map.has_key?(panels, "vagus")
@@ -376,10 +364,9 @@ defmodule Vagus.API.AdminPanelTest do
       stub_admin({:ok, false})
 
       slug = "addon_regression_#{System.unique_integer([:positive])}"
-      :ok = State.put(ingress_config(slug), :started)
-      on_exit(fn -> State.delete(slug) end)
+      install_app(ingress_config(slug), state: :started)
 
-      {:ok, %{ingress_token: addon_token}} = State.get(slug)
+      {:ok, %{ingress_token: addon_token}} = app_info(slug)
 
       Application.put_env(:vagus, :ingress_target_fun, fn _slug -> {:error, :no_target} end)
       on_exit(fn -> Application.delete_env(:vagus, :ingress_target_fun) end)
@@ -510,10 +497,9 @@ defmodule Vagus.API.AdminPanelTest do
 
     test "a real add-on's token still resolves to its own slug" do
       slug = "resolve_addon_#{System.unique_integer([:positive])}"
-      :ok = State.put(ingress_config(slug), :started)
-      on_exit(fn -> State.delete(slug) end)
+      install_app(ingress_config(slug), state: :started)
 
-      {:ok, %{ingress_token: addon_token}} = State.get(slug)
+      {:ok, %{ingress_token: addon_token}} = app_info(slug)
 
       assert {:ok, ^slug} = Vagus.Ingress.resolve_token(addon_token)
     end
@@ -923,10 +909,6 @@ defmodule Vagus.API.AdminPanelTest do
   end
 
   ## Fixtures
-
-  defp start_state do
-    start_supervised!({State, name: nil, persist_path: nil}, id: make_ref())
-  end
 
   defp ingress_config(slug) do
     {:ok, config} =

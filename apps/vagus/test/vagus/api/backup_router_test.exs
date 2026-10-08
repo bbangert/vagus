@@ -17,7 +17,9 @@ defmodule Vagus.API.BackupRouterTest do
   use ExUnit.Case, async: false
   use Plug.Test
 
-  alias Vagus.Addon.{Config, Registry, State}
+  import Vagus.AppFixtures
+
+  alias Vagus.Addon.Config
   alias Vagus.Backups
 
   @opts Vagus.API.Router.init([])
@@ -68,8 +70,7 @@ defmodule Vagus.API.BackupRouterTest do
 
   defp install(slug, data_root, state \\ :started) do
     config = fixture_config(slug)
-    :ok = State.put(config, state)
-    on_exit(fn -> State.delete(slug) end)
+    install_app(config, state: state)
 
     data_dir = Path.join([data_root, "addons", "data", slug])
     File.mkdir_p!(data_dir)
@@ -87,23 +88,7 @@ defmodule Vagus.API.BackupRouterTest do
   end
 
   defp addon_call(method, path, slug, grants \\ %{}, body \\ nil) do
-    token = "tok-#{System.unique_integer([:positive])}"
-
-    identity =
-      Map.merge(
-        %{
-          slug: slug,
-          services_role: %{},
-          auth_api: false,
-          discovery: [],
-          hassio_api: false,
-          hassio_role: "default"
-        },
-        grants
-      )
-
-    :ok = Registry.register(token, identity)
-    on_exit(fn -> Registry.unregister_slug(slug) end)
+    token = register_app_token(fixture_config(slug), identity: grants)
 
     conn = conn(method, path, body && Jason.encode!(body))
     conn = if body, do: put_req_header(conn, "content-type", "application/json"), else: conn
@@ -288,17 +273,7 @@ defmodule Vagus.API.BackupRouterTest do
         conn(:post, "/backups/new/partial", Jason.encode!(%{"addons" => ["core_forbidden"]}))
         |> put_req_header("content-type", "application/json")
 
-      token = "tok-#{System.unique_integer([:positive])}"
-
-      :ok =
-        Registry.register(token, %{
-          slug: "core_forbidden",
-          services_role: %{},
-          auth_api: false,
-          discovery: []
-        })
-
-      on_exit(fn -> Registry.unregister_slug("core_forbidden") end)
+      token = register_app_token(fixture_config("core_forbidden"))
 
       conn = conn |> put_req_header("x-supervisor-token", token) |> Vagus.API.Router.call(@opts)
       assert conn.status == 403
@@ -452,12 +427,7 @@ defmodule Vagus.API.BackupRouterTest do
 
     test "an add-on (non-supervisor) caller's multipart POST gets 403 without the body being parsed" do
       slug = "core_upload_forbidden"
-      token = "tok-#{System.unique_integer([:positive])}"
-
-      :ok =
-        Registry.register(token, %{slug: slug, services_role: %{}, auth_api: false, discovery: []})
-
-      on_exit(fn -> Registry.unregister_slug(slug) end)
+      token = register_app_token(fixture_config(slug))
 
       conn =
         multipart_conn("/backups/new/upload", [{:field, "note", "irrelevant"}])
@@ -569,9 +539,7 @@ defmodule Vagus.API.BackupRouterTest do
           "schema" => schema
         })
 
-      :ok = State.put(config, :stopped)
-      :ok = State.put_options(slug, options)
-      on_exit(fn -> State.delete(slug) end)
+      install_app(config, options: options)
 
       data_dir = Path.join([data_root, "addons", "data", slug])
       File.mkdir_p!(data_dir)
@@ -583,13 +551,13 @@ defmodule Vagus.API.BackupRouterTest do
       install_with_schema("core_sch_ok", dr, %{"greeting" => "str"}, %{"greeting" => "hi"})
       slug = create_backup("core_sch_ok")
 
-      :ok = State.put_options("core_sch_ok", %{"greeting" => "changed"})
+      set_app("core_sch_ok", options: %{"greeting" => "changed"})
 
       conn =
         supervisor_call(:post, "/backups/#{slug}/restore/partial", %{"addons" => ["core_sch_ok"]})
 
       assert conn.status == 200
-      assert {:ok, %{user_options: %{"greeting" => "hi"}}} = State.get("core_sch_ok")
+      assert {:ok, %{user_options: %{"greeting" => "hi"}}} = app_info("core_sch_ok")
     end
 
     test "options that no longer validate are dropped, and the file restore still completes",
@@ -610,8 +578,7 @@ defmodule Vagus.API.BackupRouterTest do
           "schema" => %{"greeting" => "int"}
         })
 
-      :ok = State.put(tightened, :stopped)
-      :ok = State.put_options("core_sch_bad", %{"greeting" => 42})
+      install_app(tightened, options: %{"greeting" => 42})
 
       data_dir = Path.join([dr, "addons", "data", "core_sch_bad"])
       File.write!(Path.join(data_dir, "f.txt"), "mutated")
@@ -624,7 +591,7 @@ defmodule Vagus.API.BackupRouterTest do
       # that kept its current options.
       assert conn.status == 200
       assert File.read!(Path.join(data_dir, "f.txt")) == "hello"
-      assert {:ok, %{user_options: %{"greeting" => 42}}} = State.get("core_sch_bad")
+      assert {:ok, %{user_options: %{"greeting" => 42}}} = app_info("core_sch_bad")
     end
   end
 

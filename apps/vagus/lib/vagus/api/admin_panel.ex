@@ -10,7 +10,7 @@ defmodule Vagus.API.AdminPanel do
 
   Three Core-facing surfaces, all pointed here:
 
-    * `GET /ingress/panels` (`Vagus.Ingress.Panels.list/1`) advertises
+    * `GET /ingress/panels` (`Vagus.Ingress.Panels.list/0`) advertises
       `panel_entry/0` under the `vagus` slug. That response is parsed by
       `aiohasupervisor`'s strict `IngressPanel` model, so all four of
       `title`/`icon`/`admin`/`enable` must be present — a missing key breaks

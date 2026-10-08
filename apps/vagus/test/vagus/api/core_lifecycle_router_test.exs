@@ -61,7 +61,8 @@ defmodule Vagus.API.CoreLifecycleRouterTest do
   use ExUnit.Case, async: false
   use Plug.Test
 
-  alias Vagus.Addon.Registry
+  import Vagus.AppFixtures
+
   alias Vagus.API.CoreLifecycleRouterTest.{StubConfigCheck, StubLifecycle}
   alias Vagus.API.{Router, Token}
   alias Vagus.Core.{HttpConfig, Versions}
@@ -135,13 +136,7 @@ defmodule Vagus.API.CoreLifecycleRouterTest do
   # `x-supervisor-token` header, instead of the `Authorization: Bearer`
   # supervisor token `authed/1` uses above.
   defp addon_call(path) do
-    token = "tok-#{System.unique_integer([:positive])}"
-    slug = "core_forbidden_addon"
-
-    :ok =
-      Registry.register(token, %{slug: slug, services_role: %{}, auth_api: false, discovery: []})
-
-    on_exit(fn -> Registry.unregister_slug(slug) end)
+    token = register_app_token(app_config("core_forbidden_addon"))
 
     conn(:post, path)
     |> put_req_header("x-supervisor-token", token)

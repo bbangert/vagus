@@ -8,6 +8,8 @@ defmodule Vagus.API.LogsFollowRouterTest do
   use ExUnit.Case, async: false
   use Plug.Test
 
+  import Vagus.AppFixtures
+
   alias Vagus.Mqtt.Broker
 
   @opts Vagus.API.Router.init([])
@@ -144,17 +146,17 @@ defmodule Vagus.API.LogsFollowRouterTest do
   end
 
   test "an add-on may not follow another add-on's logs" do
-    token = "tok-#{System.unique_integer([:positive])}"
-
-    :ok =
-      Vagus.Addon.Registry.register(token, %{
-        slug: "intruder",
-        services_role: %{},
-        auth_api: false,
-        discovery: []
+    {:ok, config} =
+      Vagus.Addon.Config.parse(%{
+        "name" => "Test App",
+        "version" => "1",
+        "slug" => "intruder",
+        "description" => "d",
+        "arch" => ["amd64"],
+        "image" => "x/y"
       })
 
-    on_exit(fn -> Vagus.Addon.Registry.unregister_slug("intruder") end)
+    token = register_app_token(config)
 
     conn =
       conn(:get, "/addons/core_mosquitto/logs/follow")

@@ -3,7 +3,7 @@ defmodule Vagus.API.AuthRouterTest do
   use ExUnit.Case, async: false
   use Plug.Test
 
-  alias Vagus.Addon.Registry
+  import Vagus.AppFixtures
 
   @opts Vagus.API.Router.init([])
 
@@ -29,25 +29,10 @@ defmodule Vagus.API.AuthRouterTest do
   end
 
   defp addon_token(slug, auth_api, grants \\ %{}) do
-    token = "tok-#{System.unique_integer([:positive])}"
-
-    identity =
-      Map.merge(
-        %{
-          slug: slug,
-          services_role: %{},
-          auth_api: auth_api,
-          discovery: [],
-          hassio_api: false,
-          hassio_role: "default"
-        },
-        grants
-      )
-
-    :ok = Registry.register(token, identity)
-
-    on_exit(fn -> Registry.unregister_slug(slug) end)
-    token
+    register_app_token(app_config(slug),
+      token: "tok-#{System.unique_integer([:positive])}",
+      identity: Map.merge(%{auth_api: auth_api}, grants)
+    )
   end
 
   defp basic(user, pass), do: "Basic " <> Base.encode64("#{user}:#{pass}")

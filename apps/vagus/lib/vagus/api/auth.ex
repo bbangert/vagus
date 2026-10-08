@@ -58,8 +58,8 @@ defmodule Vagus.API.Auth do
 
   require Logger
 
-  alias Vagus.Addon.Registry
   alias Vagus.API.{Envelope, SourceGuard, Tiers, Token}
+  alias Vagus.App
 
   @impl Plug
   def init(opts), do: opts
@@ -223,10 +223,7 @@ defmodule Vagus.API.Auth do
     end
   end
 
-  # Registry may be absent in narrow test setups — treat as "no add-on tokens".
-  defp addon_identity(token) do
-    if Process.whereis(Registry), do: Registry.identity_for_token(token), else: :error
-  end
+  defp addon_identity(token), do: App.identity_for_token(token)
 
   defp unauthorized(conn), do: Envelope.send_error(conn, "unauthorized", 401)
 end

@@ -346,7 +346,7 @@ defmodule Vagus.Host.Shutdown do
   # removing. Also deliberately no `Vagus.Addon.State` writes: entries
   # stay `:started` so boot-time reconciliation restarts them.
   defp stop_addons(opts) do
-    addons_fun = Keyword.get(opts, :addons, &Vagus.Addon.State.list/0)
+    addons_fun = Keyword.get(opts, :addons, &Vagus.App.list/0)
     stop_addon_fun = Keyword.get(opts, :stop_addon, &default_stop_addon/2)
     addon_stop_s = Keyword.get(opts, :addon_stop_s, @addon_stop_s)
 
@@ -391,7 +391,7 @@ defmodule Vagus.Host.Shutdown do
   # spoofed/legacy config would wrongly get skipped here and leave its
   # very real container running unstopped.
   defp native_backend?(%{config: %{backend: :native, slug: slug}}) do
-    Vagus.Addon.Manager.native_allowed?(slug)
+    Vagus.App.native_allowed?(slug)
   end
 
   defp native_backend?(_entry), do: false

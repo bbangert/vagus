@@ -22,7 +22,7 @@ defmodule Vagus.API.IngressProxy do
   1. `ingress_session` cookie → `Vagus.Ingress.validate_session/1`; `:error`
      or missing cookie → 401.
   2. `{token}` (the path segment right after `/ingress/`) →
-     `Vagus.Ingress.resolve_token/1` → add-on slug; unresolvable → 503
+     `Vagus.App.resolve_ingress_token/1` → add-on slug; unresolvable → 503
      (upstream: `HTTPServiceUnavailable`).
   2b. The reserved `vagus` slug is `Vagus.API.AdminPanel`'s synthetic panel,
      which has no container: it is served in-process by `AdminPanel.serve/2`
@@ -30,9 +30,10 @@ defmodule Vagus.API.IngressProxy do
      session cookie gates it exactly like a real add-on — and it then
      imposes an admin-only gate of its own on top (403), which no add-on
      path has.
-  3. slug → `{ip, port}` via `config :vagus, :ingress_target_fun` (default
-     `&default_target/1`, injectable so tests can point at a fake add-on
-     without a real docker daemon/container) → resolution failure → 502.
+  3. slug → `{ip, port, stream?}` via `config :vagus, :ingress_target_fun`
+     (default `&Vagus.App.ingress_target/1`, injectable so tests can point
+     at a fake add-on without a real docker daemon/container) → resolution
+     failure → 502.
   4. A `Connection: upgrade` + `Upgrade: websocket` request upgrades via
      `WebSockAdapter.upgrade/4` to `Vagus.Ingress.WSBridge` — the two-linked-
      process bridge described in the research doc §2 and that module's own
@@ -84,7 +85,6 @@ defmodule Vagus.API.IngressProxy do
 
   import Plug.Conn
 
-  alias Vagus.Addon.State
   alias Vagus.API.AdminPanel
   alias Vagus.Network
 
@@ -165,7 +165,7 @@ defmodule Vagus.API.IngressProxy do
     ["ingress", token | rest] = conn.path_info
 
     with :ok <- check_session(conn),
-         {:ok, slug} <- Vagus.Ingress.resolve_token(token) do
+         {:ok, slug} <- Vagus.App.resolve_ingress_token(token) do
       route(conn, slug, rest)
     else
       :unauthorized -> send_plain(conn, 401, "Unauthorized")
@@ -184,62 +184,8 @@ defmodule Vagus.API.IngressProxy do
 
   defp route(conn, slug, rest) do
     case resolve_target(slug) do
-      {:ok, {ip, port}} -> proxy(conn, slug, ip, port, rest)
+      {:ok, {ip, port, stream?}} -> proxy(conn, stream?, ip, port, rest)
       {:error, _reason} -> send_plain(conn, 502, "Bad Gateway")
-    end
-  end
-
-  @doc """
-  Default `:ingress_target_fun` — resolves `slug` to `{ip, port}` from
-  `Vagus.Addon.State` (the port) and a live docker inspect of
-  `addon_<slug>` (the container's `hassio` bridge IP), mirroring
-  `Vagus.Addon.Manager`'s `register_dns/3` IP-lookup pattern.
-  """
-  @spec default_target(String.t()) :: {:ok, {String.t(), pos_integer()}} | {:error, term()}
-  def default_target(slug) do
-    case State.get(slug) do
-      :error ->
-        {:error, :not_found}
-
-      {:ok, entry} ->
-        with {:ok, port} <- resolve_port(entry),
-             {:ok, ip} <- resolve_ip(slug, entry, port) do
-          {:ok, {ip, port}}
-        end
-    end
-  end
-
-  # The resolved dynamic/settings port (`Vagus.Ingress.dynamic_port/2`'s
-  # persisted result) wins when present; otherwise fall back to the
-  # config-declared static port, when it's a real (non-zero) port rather
-  # than the `ingress_port: 0` "assign one dynamically" sentinel.
-  defp resolve_port(%{ingress_port: port}) when is_integer(port) and port > 0, do: {:ok, port}
-
-  defp resolve_port(%{config: %{ingress_port: port}}) when is_integer(port) and port > 0,
-    do: {:ok, port}
-
-  defp resolve_port(_entry), do: {:error, :no_ingress_port}
-
-  # A `host_network: true` add-on has no `hassio` bridge IP — it binds on the
-  # host itself — but *which* host address it answers on differs per add-on
-  # (ESPHome: loopback only; Music Assistant: gateway only), so the ingress
-  # port decides: `Vagus.Network.host_network_ip/1`. Same rule, same helper,
-  # as `Vagus.Addon.Watchdog.Probe`'s default `:host_ip_fun` (§B7) — a
-  # watchdog that disagreed with this would probe a live add-on dead and
-  # restart-loop it.
-  defp resolve_ip(_slug, %{config: %{host_network: true}}, port),
-    do: {:ok, Network.host_network_ip(port)}
-
-  defp resolve_ip(slug, _entry, _port) do
-    id = "addon_#{slug}"
-
-    with {:ok, %{"NetworkSettings" => %{"Networks" => networks}}} <-
-           Vagus.Runtime.Docker.inspect_container(id),
-         %{"IPAddress" => ip} when is_binary(ip) and ip != "" <-
-           Map.get(networks, Network.name()) do
-      {:ok, ip}
-    else
-      _ -> {:error, :no_container_ip}
     end
   end
 
@@ -258,40 +204,20 @@ defmodule Vagus.API.IngressProxy do
     end
   end
 
+  # The seam answers `{:ok, {ip, port, stream?}}` or `{:error, reason}`:
+  # address and streaming mode in one call, so a request costs one lookup.
   defp resolve_target(slug) do
-    fun = Application.get_env(:vagus, :ingress_target_fun, &default_target/1)
+    fun = Application.get_env(:vagus, :ingress_target_fun, &Vagus.App.ingress_target/1)
     fun.(slug)
-  end
-
-  defp resolve_ingress_stream(slug) do
-    fun = Application.get_env(:vagus, :ingress_stream_fun, &default_ingress_stream/1)
-    fun.(slug)
-  end
-
-  @doc """
-  Default `:ingress_stream_fun` — resolves `slug`'s config-declared
-  `ingress_stream` flag (`Vagus.Addon.Config`) from `Vagus.Addon.State`,
-  mirroring `default_target/1`'s own injectable-seam pattern so tests can
-  flip the flag without a real add-on config. `false` (buffer, don't
-  stream) for any slug this emulator doesn't have tracked — matching
-  upstream's own falsy default rather than guessing streaming is safe for
-  an add-on we know nothing about.
-  """
-  @spec default_ingress_stream(String.t()) :: boolean()
-  def default_ingress_stream(slug) do
-    case State.get(slug) do
-      {:ok, %{config: %{ingress_stream: flag}}} when is_boolean(flag) -> flag
-      _ -> false
-    end
   end
 
   ## WS upgrade seam
 
-  defp proxy(conn, slug, ip, port, rest) do
+  defp proxy(conn, stream?, ip, port, rest) do
     if websocket_upgrade?(conn) do
       upgrade_websocket(conn, ip, port, rest)
     else
-      proxy_http(conn, slug, ip, port, rest)
+      proxy_http(conn, stream?, ip, port, rest)
     end
   end
 
@@ -392,11 +318,11 @@ defmodule Vagus.API.IngressProxy do
 
   ## Plain-HTTP leg
 
-  defp proxy_http(conn, slug, ip, port, rest) do
+  defp proxy_http(conn, stream?, ip, port, rest) do
     url = build_url(ip, port, rest, conn.query_string)
     headers = build_request_headers(conn)
 
-    case build_request_body(conn, slug) do
+    case build_request_body(conn, stream?) do
       {:ok, conn, body, ref} ->
         request = Finch.build(conn.method, url, headers, body)
         acc = %{conn: conn, ref: ref, resolved?: ref == nil, status: nil, mode: nil}
@@ -598,12 +524,12 @@ defmodule Vagus.API.IngressProxy do
   # `read_buffered/4`'s own return, reflecting exactly how much of the body
   # it actually consumed before bailing — propagated rather than discarded
   # so `proxy_http/5` can answer the 413 through it (security-phase7.md W1).
-  defp build_request_body(conn, slug) do
+  defp build_request_body(conn, stream?) do
     cond do
       not has_body?(conn) ->
         {:ok, conn, nil, nil}
 
-      conn.method == "POST" and resolve_ingress_stream(slug) ->
+      conn.method == "POST" and stream? ->
         {stream, ref} = build_stream_body(conn)
         {:ok, conn, stream, ref}
 

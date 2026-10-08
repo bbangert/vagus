@@ -3,7 +3,9 @@ defmodule Vagus.API.AddonInfoRouterTest do
   use ExUnit.Case, async: false
   use Plug.Test
 
-  alias Vagus.Addon.{Config, Registry, State}
+  import Vagus.AppFixtures
+
+  alias Vagus.Addon.Config
 
   @opts Vagus.API.Router.init([])
 
@@ -18,31 +20,15 @@ defmodule Vagus.API.AddonInfoRouterTest do
         "auth_api" => true
       })
 
-    :ok = State.put(c, :started)
-    on_exit(fn -> State.delete("core_mosquitto") end)
+    install_app(c, state: :started)
     %{config: c}
   end
 
-  defp addon_token(slug, grants \\ %{}) do
-    token = "tok-#{System.unique_integer([:positive])}"
-
-    identity =
-      Map.merge(
-        %{
-          slug: slug,
-          services_role: %{},
-          auth_api: true,
-          discovery: [],
-          hassio_api: true,
-          hassio_role: "default"
-        },
-        grants
+  defp addon_token(slug, grants \\ %{}),
+    do:
+      register_app_token(app_config(slug),
+        identity: Map.merge(%{auth_api: true, hassio_api: true}, grants)
       )
-
-    :ok = Registry.register(token, identity)
-    on_exit(fn -> Registry.unregister_slug(slug) end)
-    token
-  end
 
   defp call(path, headers) do
     conn = conn(:get, path)
@@ -114,11 +100,8 @@ defmodule Vagus.API.AddonInfoRouterTest do
           "ingress_port" => 6052
         })
 
-      :ok = State.put(c, :started)
-      :ok = State.put_setting("core_esphome", :ingress_panel, true)
-      :ok = State.put_setting("core_esphome", :watchdog, true)
-      {:ok, entry} = State.get("core_esphome")
-      on_exit(fn -> State.delete("core_esphome") end)
+      install_app(c, state: :started, ingress_panel: true, watchdog: true)
+      {:ok, entry} = app_info("core_esphome")
       %{config: c, entry: entry}
     end
 
@@ -156,8 +139,8 @@ defmodule Vagus.API.AddonInfoRouterTest do
   # empty map rather than dropping the key, because the frontend's config form
   # reads it unconditionally.
   describe "options redaction (A8)" do
-    setup do
-      :ok = State.put_options("core_mosquitto", %{"password" => "hunter2"})
+    setup %{config: config} do
+      install_app(config, state: :started, options: %{"password" => "hunter2"})
       :ok
     end
 

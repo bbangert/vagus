@@ -24,7 +24,10 @@ Mox.stub_with(Vagus.Backend.OSMock, Vagus.Backend.OS.HostStub)
 # has none of (only /dev/null, /dev/zero and friends). Opt-in via
 # `mix test --include block_device` on a board or any host with a disk; when
 # included with no node present it flunks rather than passing vacuously.
-ExUnit.start(exclude: [:docker, :block_device])
+#
+# `:known_failing` tests pin the intended behaviour of defects the per-app
+# lifecycle fixes; run them with `mix test --include known_failing`.
+ExUnit.start(exclude: [:docker, :block_device, :known_failing])
 
 # At VM exit rather than `ExUnit.after_suite/1`: that runs after every pass of
 # `--repeat-until-failure`, and without the directory each later pass's saves

@@ -12,7 +12,9 @@ defmodule Vagus.API.IngressRouterTest do
   use ExUnit.Case, async: false
   use Plug.Test
 
-  alias Vagus.Addon.{Config, Registry, State}
+  import Vagus.AppFixtures
+
+  alias Vagus.Addon.Config
   alias Vagus.API.{Router, Token}
 
   @opts Router.init([])
@@ -26,28 +28,8 @@ defmodule Vagus.API.IngressRouterTest do
   # (`hassio_api: false`); pass `%{hassio_api: true, hassio_role: "admin"}` to
   # exercise a caller that clears `Vagus.API.Tiers`' gate and reaches the
   # handler's own guard.
-  defp addon_token(slug, grants \\ %{}) do
-    token = "tok-#{System.unique_integer([:positive])}"
-
-    identity =
-      Map.merge(
-        %{
-          slug: slug,
-          services_role: %{},
-          auth_api: false,
-          discovery: [],
-          hassio_api: false,
-          hassio_role: "default"
-        },
-        grants
-      )
-
-    :ok = Registry.register(token, identity)
-
-    on_exit(fn -> Registry.unregister_slug(slug) end)
-
-    token
-  end
+  defp addon_token(slug, grants \\ %{}),
+    do: register_app_token(app_config(slug), identity: grants)
 
   defp call(method, path, token, body \\ nil) do
     conn = conn(method, path, body && Jason.encode!(body))
@@ -205,13 +187,10 @@ defmodule Vagus.API.IngressRouterTest do
 
     test "lists every ingress-capable add-on, enable reflecting the ingress_panel toggle" do
       enabled = ingress_config("core_esphome_panels", panel_title: "ESPHome")
-      :ok = State.put(enabled, :started)
-      :ok = State.put_setting("core_esphome_panels", :ingress_panel, true)
-      on_exit(fn -> State.delete("core_esphome_panels") end)
+      install_app(enabled, state: :started, ingress_panel: true)
 
       disabled = ingress_config("core_other_panels", panel_title: nil, panel_icon: "mdi:cog")
-      :ok = State.put(disabled, :started)
-      on_exit(fn -> State.delete("core_other_panels") end)
+      install_app(disabled, state: :started)
 
       conn = call(:get, "/ingress/panels", Token.get())
       assert conn.status == 200
@@ -244,8 +223,7 @@ defmodule Vagus.API.IngressRouterTest do
           "ingress" => false
         })
 
-      :ok = State.put(plain, :started)
-      on_exit(fn -> State.delete("plain_panels") end)
+      install_app(plain, state: :started)
 
       conn = call(:get, "/ingress/panels", Token.get())
       assert conn.status == 200
@@ -285,14 +263,13 @@ defmodule Vagus.API.IngressRouterTest do
           "ingress" => true
         })
 
-      :ok = State.put(config, :stopped)
-      on_exit(fn -> State.delete("core_esphome_push") end)
+      install_app(config)
 
       conn =
         call(:post, "/addons/core_esphome_push/options", Token.get(), %{"ingress_panel" => true})
 
       assert conn.status == 200
-      assert {:ok, %{ingress_panel: true}} = State.get("core_esphome_push")
+      assert {:ok, %{ingress_panel: true}} = app_info("core_esphome_push")
     end
   end
 end

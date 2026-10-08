@@ -18,7 +18,9 @@ defmodule Vagus.API.AddonAssetsRouterTest do
   use ExUnit.Case, async: false
   use Plug.Test
 
-  alias Vagus.Addon.{Config, Registry, State, Store}
+  import Vagus.AppFixtures
+
+  alias Vagus.Addon.{Config, Store}
   alias Vagus.Addon.Store.Assets
   alias Vagus.API.{Router, Token}
 
@@ -73,12 +75,7 @@ defmodule Vagus.API.AddonAssetsRouterTest do
   end
 
   defp addon_call(method, path, slug) do
-    token = "tok-#{System.unique_integer([:positive])}"
-
-    :ok =
-      Registry.register(token, %{slug: slug, services_role: %{}, auth_api: false, discovery: []})
-
-    on_exit(fn -> Registry.unregister_slug(slug) end)
+    token = register_app_token(fixture_config(slug))
 
     conn(method, path) |> put_req_header("x-supervisor-token", token) |> Router.call(@opts)
   end
@@ -169,8 +166,7 @@ defmodule Vagus.API.AddonAssetsRouterTest do
     test "a detached add-on (installed, no longer in the store) reports absent" do
       id = seed_store("core_detachedicon")
       put_asset(id, :icon, @png)
-      :ok = State.put(fixture_config("core_detachedicon"), :stopped)
-      on_exit(fn -> State.delete("core_detachedicon") end)
+      install_app(fixture_config("core_detachedicon"))
 
       # The repository drops it entirely — installed, but no store entry.
       :ok =
@@ -247,8 +243,7 @@ defmodule Vagus.API.AddonAssetsRouterTest do
     test "a detached add-on reports absent, not an error" do
       id = seed_store("core_detachedlog")
       put_asset(id, :changelog, "old news")
-      :ok = State.put(fixture_config("core_detachedlog"), :stopped)
-      on_exit(fn -> State.delete("core_detachedlog") end)
+      install_app(fixture_config("core_detachedlog"))
 
       :ok = GenServer.call(Store, {:put_catalog, Map.delete(Store.catalog(), "core_detachedlog")})
 

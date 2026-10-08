@@ -7,7 +7,7 @@ defmodule Vagus.Backups do
   A `GenServer` only for the directory listing (an in-memory `slug =>
   %{backup, path, size_bytes}` index, built by scanning `*.tar` at `init/1`
   and kept current via `reload/1`/`put_file/2`/`delete/2`); the actual file
-  I/O and `Vagus.Addon.Manager`/`Vagus.Addon.State` orchestration in
+  I/O and `Vagus.App` orchestration in
   `create_partial/3` and `restore_partial/3` runs in the caller's process
   (mirroring `Vagus.Addon.Store.reload/1`'s own rationale — a slow backup
   shouldn't block a concurrent `list/1`/`get/2` read).
@@ -22,8 +22,9 @@ defmodule Vagus.Backups do
 
   require Logger
 
-  alias Vagus.Addon.{Config, Manager, OptionsSchema, State, Store}
+  alias Vagus.Addon.{Config, OptionsSchema, Store}
   alias Vagus.API.StaticData
+  alias Vagus.App
   alias Vagus.Runtime.Docker
 
   @default_data_root "/data"
@@ -114,11 +115,11 @@ defmodule Vagus.Backups do
   Builds + stores a partial backup of `addon_slugs` (already resolved by the
   caller — `"ALL"` is a router-level concern). `name` defaults to `"Partial
   backup <ISO8601 date>"`. Each add-on must already be installed
-  (`Vagus.Addon.State`); the first missing slug aborts with
+  (`Vagus.App`); the first missing slug aborts with
   `{:error, {:not_installed, slug}}` before anything is stopped/snapshotted.
 
   Hot/cold handling (§A4, `AppBackupMode`): a **cold** add-on that's running
-  is `Manager.stop`'d before the snapshot and `Manager.start_slug`'d back
+  is `App.stop_for_backup`'d before the snapshot and `App.start_after_backup`'d back
   after (restart failure is logged + tolerated — the backup itself already
   succeeded by that point); a **hot** add-on with `backup_pre`/`backup_post`
   runs those commands via `Vagus.Runtime.Docker.exec/3` before/after (a
@@ -169,7 +170,7 @@ defmodule Vagus.Backups do
   — restore never accepts `"ALL"`, §A4). Two phases (W2):
 
     1. PRE-FLIGHT (no side effects): every requested slug is validated,
-       confirmed installed (`Vagus.Addon.State`), and confirmed present +
+       confirmed installed (`Vagus.App`), and confirmed present +
        parseable in the backup tar (`Vagus.Backup.extract_addon/2`) — absent
        from the backup → `{:error, "Addon <slug> not in backup"}`; not
        currently installed → `{:error, "Addon <slug> is not installed"}`
@@ -177,14 +178,14 @@ defmodule Vagus.Backups do
        out of M4 scope). A failure here aborts the whole call before ANY
        add-on has been stopped or touched — a multi-slug restore no longer
        stops/wipes slugs 1..N-1 only to discover slug N is missing.
-    2. APPLY, per add-on: `Manager.stop` (tolerates not-running); the
+    2. APPLY, per add-on: `App.stop_for_backup` (tolerates not-running); the
        backup's `data/` files are staged into a temp sibling of the data dir
        first (`stage_files/3`) and only swapped in via `File.rename/2` once
        staging fully succeeds — a mid-write failure (disk full) leaves the
        existing data dir completely untouched instead of half-wiped;
-       `State.put_options/2` the backed-up user options (tolerating a
+       `App.set/2` the backed-up user options (tolerating a
        concurrent uninstall having removed the slug — logged, restart
-       skipped, not a raise); then `Manager.start_slug` iff the backup
+       skipped, not a raise); then `App.start_after_backup` iff the backup
        recorded the add-on as `"started"`.
 
   The first per-addon apply-phase error aborts the whole call (no
@@ -301,7 +302,7 @@ defmodule Vagus.Backups do
   # stopped) so a not-installed slug aborts cleanly with nothing touched yet.
   defp prepare_addons(addon_slugs) do
     Enum.reduce_while(addon_slugs, {:ok, []}, fn slug, {:ok, acc} ->
-      case State.get(slug) do
+      case App.info(slug) do
         {:ok, %{config: config, state: state, user_options: user_options}} ->
           {:cont, {:ok, [{config, state, user_options} | acc]}}
 
@@ -394,7 +395,7 @@ defmodule Vagus.Backups do
   defp begin_backup({config, :started, _user_options}, opts) do
     cond do
       config.backup == "cold" ->
-        case Manager.stop(config.slug, opts) do
+        case App.stop_for_backup(config.slug, opts) do
           :ok -> :ok
           {:error, reason} -> {:error, {:cold_stop_failed, config.slug, reason}}
         end
@@ -425,7 +426,7 @@ defmodule Vagus.Backups do
   defp end_backup({config, :started, _user_options}, opts) do
     cond do
       config.backup == "cold" ->
-        case Manager.start_slug(config.slug, opts) do
+        case App.start_after_backup(config.slug, opts) do
           {:ok, _} ->
             :ok
 
@@ -501,7 +502,7 @@ defmodule Vagus.Backups do
   end
 
   defp state_get(slug) do
-    case State.get(slug) do
+    case App.info(slug) do
       {:ok, entry} -> {:ok, entry}
       :error -> {:error, :not_installed}
     end
@@ -524,7 +525,7 @@ defmodule Vagus.Backups do
     end)
   end
 
-  # `Manager.stop/2`'s result is checked, not discarded: swapping the data
+  # `App.stop_for_backup/2`'s result is checked, not discarded: swapping the data
   # dir out from under a still-running container gives the add-on a
   # half-old/half-new view of its own `/data` and can corrupt what it writes
   # next. `:not_running`/`:not_found` are the expected benign cases (the
@@ -542,7 +543,7 @@ defmodule Vagus.Backups do
   end
 
   defp stop_for_restore(slug, opts) do
-    case Manager.stop(slug, opts) do
+    case App.stop_for_backup(slug, opts) do
       :ok ->
         :ok
 
@@ -596,15 +597,15 @@ defmodule Vagus.Backups do
     end
   end
 
-  # `State.put_options/2` returning `:error` means a concurrent uninstall
-  # removed the slug's `State` entry between pre-flight and here — tolerated
+  # `App.set/2` returning `:error` means a concurrent uninstall
+  # removed the slug's entry between pre-flight and here — tolerated
   # (logged, restart skipped for this slug) rather than the old `:ok = ...`
   # match, which would raise (surfacing as a 500) instead of the honest
   # partial-failure this already is.
   defp finish_restore(slug, addon, opts) do
     case restorable_options(slug, addon) do
       {:ok, options} ->
-        case State.put_options(slug, options) do
+        case App.set(slug, options: options) do
           :ok ->
             maybe_start(slug, addon, opts)
 
@@ -648,8 +649,8 @@ defmodule Vagus.Backups do
   defp restorable_options(slug, addon) do
     options = get_in(addon, ["user", "options"]) || %{}
 
-    case State.get(slug) do
-      # Not tracked in `State`. Pass through — `put_options/2` reports
+    case App.info(slug) do
+      # Not installed. Pass through — `App.set/2` reports
       # `:error` itself and the caller logs the uninstalled-mid-restore case.
       :error ->
         {:ok, options}
@@ -675,7 +676,7 @@ defmodule Vagus.Backups do
 
   defp maybe_start(slug, addon, opts) do
     if addon["state"] == "started" do
-      case Manager.start_slug(slug, opts) do
+      case App.start_after_backup(slug, opts) do
         {:ok, _} -> :ok
         {:error, reason} -> {:error, reason}
       end

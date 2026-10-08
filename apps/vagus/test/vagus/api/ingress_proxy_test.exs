@@ -176,12 +176,14 @@ defmodule Vagus.API.IngressProxyTest do
   real device), and `Vagus.Ingress.Finch` (the proxy's outbound pool).
   `config :vagus, :ingress_target_fun` is pointed at the fake add-on's port
   for the duration of each test, standing in for a real docker
-  inspect/`Vagus.Addon.State` lookup — `default_target/1` itself needs a
-  real docker daemon and is out of scope for a hermetic suite.
+  inspect/`Vagus.Addon.State` lookup — `Vagus.App.ingress_target/1` itself
+  needs a real docker daemon and is out of scope for a hermetic suite.
   """
   use ExUnit.Case, async: false
 
-  alias Vagus.Addon.{Config, State}
+  import Vagus.AppFixtures
+
+  alias Vagus.Addon.Config
   alias Vagus.API.IngressProxyTest.{FakeAddon, HitCounter, StubUsers}
   alias Vagus.API.Token
 
@@ -241,17 +243,16 @@ defmodule Vagus.API.IngressProxyTest do
 
     slug = "ingress_test_#{System.unique_integer([:positive])}"
     {:ok, config} = Config.parse(required_config(slug))
-    :ok = State.put(config, :started)
-    {:ok, entry} = State.get(slug)
+    install_app(config, state: :started)
+    {:ok, entry} = app_info(slug)
 
     Application.put_env(:vagus, :ingress_target_fun, fn
-      ^slug -> {:ok, {"127.0.0.1", addon_port}}
+      ^slug -> {:ok, {"127.0.0.1", addon_port, false}}
       _other -> {:error, :unknown_slug}
     end)
 
     on_exit(fn ->
       Application.delete_env(:vagus, :ingress_target_fun)
-      State.delete(slug)
     end)
 
     %{
@@ -901,16 +902,15 @@ defmodule Vagus.API.IngressProxyTest do
   test "a POST to an add-on with ingress_stream: true is streamed (chunked), not buffered", %{
     proxy_base: base,
     token: token,
-    slug: slug
+    slug: slug,
+    addon_port: addon_port
   } do
     {:ok, session} = Vagus.Ingress.create_session()
 
-    Application.put_env(:vagus, :ingress_stream_fun, fn
-      ^slug -> true
-      _other -> false
+    Application.put_env(:vagus, :ingress_target_fun, fn
+      ^slug -> {:ok, {"127.0.0.1", addon_port, true}}
+      _other -> {:error, :unknown_slug}
     end)
-
-    on_exit(fn -> Application.delete_env(:vagus, :ingress_stream_fun) end)
 
     resp =
       req(:post, "#{base}/ingress/#{token}/echo-headers", [cookie_header(session)], "hello")
@@ -1097,8 +1097,8 @@ defmodule Vagus.API.IngressProxyTest do
     assert session =~ ~r/\A[0-9a-f]{128}\z/
   end
 
-  # `default_target/1`'s bridge branch needs a real docker daemon (out of
-  # scope here), but the `host_network: true` branch short-circuits before
+  # `Vagus.App.ingress_target/1`'s bridge branch needs a real docker daemon
+  # (out of scope here), but the `host_network: true` branch short-circuits before
   # the docker inspect. Both device-found 502s live in these two tests:
   # ESPHome answers only on loopback, Music Assistant binds its ingress port
   # to the bridge gateway alone — so the listening port, not the network mode,
@@ -1111,40 +1111,38 @@ defmodule Vagus.API.IngressProxyTest do
       |> Map.merge(%{"host_network" => true, "ingress_port" => port})
       |> Vagus.Addon.Config.parse()
 
-    :ok = State.put(config, :started)
-    on_exit(fn -> State.delete(slug) end)
+    install_app(config, state: :started)
     slug
   end
 
-  test "default_target resolves a host_network add-on to loopback when it listens there" do
+  test "ingress_target resolves a host_network add-on to loopback when it listens there" do
     {:ok, listen} = :gen_tcp.listen(0, [:binary, ip: {127, 0, 0, 1}, active: false])
     on_exit(fn -> :gen_tcp.close(listen) end)
     {:ok, port} = :inet.port(listen)
 
-    assert {:ok, {"127.0.0.1", ^port}} =
-             Vagus.API.IngressProxy.default_target(seed_host_network_addon(port))
+    assert {:ok, {"127.0.0.1", ^port, false}} =
+             Vagus.App.ingress_target(seed_host_network_addon(port))
   end
 
-  test "default_target falls back to the bridge gateway when loopback refuses" do
+  test "ingress_target falls back to the bridge gateway when loopback refuses" do
     {:ok, listen} = :gen_tcp.listen(0, [:binary, ip: {127, 0, 0, 1}, active: false])
     {:ok, port} = :inet.port(listen)
     :ok = :gen_tcp.close(listen)
 
     gateway = Vagus.Network.gateway()
 
-    assert {:ok, {^gateway, ^port}} =
-             Vagus.API.IngressProxy.default_target(seed_host_network_addon(port))
+    assert {:ok, {^gateway, ^port, false}} =
+             Vagus.App.ingress_target(seed_host_network_addon(port))
   end
 
   test "a bridge-mode add-on never takes the host-address path" do
     slug = "ingress_bridged_#{System.unique_integer([:positive])}"
     {:ok, config} = Vagus.Addon.Config.parse(required_config(slug))
-    :ok = State.put(config, :started)
-    on_exit(fn -> State.delete(slug) end)
+    install_app(config, state: :started)
 
     # There is no `addon_<slug>` container to inspect here, so the lookup
     # fails — which is the assertion: it went looking for a bridge IP at all,
     # rather than short-circuiting to loopback or the gateway.
-    assert {:error, :no_container_ip} = Vagus.API.IngressProxy.default_target(slug)
+    assert {:error, :no_container_ip} = Vagus.App.ingress_target(slug)
   end
 end
