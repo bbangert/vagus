@@ -216,12 +216,92 @@ defmodule Vagus.App.ReadinessTest do
       assert System.monotonic_time(:millisecond) - started < 2_000
     end
 
+    # Writes `parts` one at a time, each when the test says so, and then
+    # holds the connection open.
+    defp serve_in_parts(parts) do
+      {:ok, listen} = :gen_tcp.listen(0, [:binary, active: false, reuseaddr: true])
+      {:ok, port} = :inet.port(listen)
+      test = self()
+
+      pid =
+        spawn_link(fn ->
+          {:ok, socket} = :gen_tcp.accept(listen)
+          {:ok, _request} = :gen_tcp.recv(socket, 0)
+
+          for part <- parts do
+            send(test, {:ready_to_write, self(), part})
+
+            receive do
+              :write -> :gen_tcp.send(socket, part)
+            end
+          end
+
+          Process.sleep(:infinity)
+        end)
+
+      on_exit(fn -> Process.exit(pid, :kill) end)
+      port
+    end
+
+    test "a status line that comes in two reads is still an answer" do
+      port = serve_in_parts(["HTTP/1.1 2", "04 No Content\r\n\r\n"])
+      probing = Task.async(fn -> Http.probe(target(port), 5_000) end)
+
+      # The second part is not written until the first has been sent, so
+      # the probe has read a line that says nothing yet.
+      assert_receive {:ready_to_write, server, "HTTP/1.1 2"}, 5_000
+      send(server, :write)
+      assert_receive {:ready_to_write, ^server, "04 No Content" <> _}, 5_000
+      refute Task.yield(probing, 100)
+      send(server, :write)
+      assert Task.await(probing) == :ok
+    end
+
+    test "an answer that stops in the middle is none, within the time given" do
+      port = serve_in_parts(["HTTP/1.1 2", "never written"])
+      started = System.monotonic_time(:millisecond)
+      probing = Task.async(fn -> Http.probe(target(port), 300) end)
+      assert_receive {:ready_to_write, server, "HTTP/1.1 2"}, 5_000
+      send(server, :write)
+      assert Task.await(probing) == :error
+      assert System.monotonic_time(:millisecond) - started < 2_000
+    end
+
+    test "an app that answers over TLS with a certificate of its own making is answered for" do
+      %{cert: cert, key: key} =
+        :public_key.pkix_test_root_cert(~c"an app's own", key: {:rsa, 2048, 65_537})
+
+      der = {:RSAPrivateKey, :public_key.der_encode(:RSAPrivateKey, key)}
+
+      {:ok, listen} =
+        :ssl.listen(0, cert: cert, key: der, active: false, mode: :binary, reuseaddr: true)
+
+      {:ok, {_address, port}} = :ssl.sockname(listen)
+
+      pid =
+        spawn_link(fn ->
+          {:ok, transport} = :ssl.transport_accept(listen)
+          {:ok, socket} = :ssl.handshake(transport)
+          {:ok, _request} = :ssl.recv(socket, 0)
+          :ssl.send(socket, "HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+          Process.sleep(:infinity)
+        end)
+
+      on_exit(fn -> Process.exit(pid, :kill) end)
+      assert Http.probe(target(port, "https"), 5_000) == :ok
+      # The same port asked in the clear is no answer.
+      assert Http.probe(target(port), 500) == :error
+    end
+
     test "nothing listening is none, and so is a host that is none" do
       port = serve(nil)
       assert Http.probe(target(port + 0, "tcp"), 500) == :ok
-      {:ok, closed} = :gen_tcp.listen(0, [])
-      {:ok, free} = :inet.port(closed)
-      :gen_tcp.close(closed)
+      # A port that is held and not listened on refuses every connection,
+      # and nobody else can take it meanwhile.
+      {:ok, held} = :socket.open(:inet, :stream, :tcp)
+      :ok = :socket.bind(held, %{family: :inet, addr: {127, 0, 0, 1}, port: 0})
+      {:ok, %{port: free}} = :socket.sockname(held)
+      on_exit(fn -> :socket.close(held) end)
       assert Http.probe(target(free), 500) == :error
       assert Http.probe(target(free, "tcp"), 500) == :error
       assert Http.probe(%{target(free) | host: "not a host"}, 500) == :error

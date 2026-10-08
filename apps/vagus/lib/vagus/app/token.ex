@@ -11,9 +11,10 @@ defmodule Vagus.App.Token do
 
   A token is hashed before it leaves the function that read it:
   `state/4` answers from digests, and `Vagus.App.AuthIndex` takes its own.
-  `guard/1` is for the two actions that do hold one. A function that raised
-  there would be reported with its arguments, the token among them, so what
-  escapes it is the kind of failure and nothing it carried.
+  `guard/1` is for the two actions that do hold one and for the read of an
+  instance with its environment. A function that raised there would be
+  reported with its arguments, the token among them, so what escapes it is
+  the kind of failure and nothing it carried.
   """
 
   require Logger
@@ -76,7 +77,7 @@ defmodule Vagus.App.Token do
   end
 
   defp crashed(kind, stack) do
-    Logger.error("an action holding a token crashed: #{inspect(kind)} at #{where(stack)}")
+    Logger.error("a step holding a token crashed: #{inspect(kind)} at #{where(stack)}")
     {:error, {:crashed, kind}}
   end
 

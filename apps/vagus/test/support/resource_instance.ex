@@ -51,16 +51,23 @@ defmodule Vagus.Resource.TestInstance do
   @spec kill_observed(pid(), pid()) :: :ok
   def kill_observed(victim, observer) do
     :erlang.trace(observer, true, [:receive])
-    Process.exit(victim, :kill)
 
-    receive do
-      {:trace, ^observer, :receive, {:DOWN, _ref, :process, ^victim, _reason}} -> :ok
-      {:trace, ^observer, :receive, {:EXIT, ^victim, _reason}} -> :ok
+    try do
+      Process.exit(victim, :kill)
+
+      receive do
+        {:trace, ^observer, :receive, {:DOWN, _ref, :process, ^victim, _reason}} -> :ok
+        {:trace, ^observer, :receive, {:EXIT, ^victim, _reason}} -> :ok
+      after
+        5_000 -> raise "#{inspect(observer)} never heard that #{inspect(victim)} died"
+      end
     after
-      5_000 -> raise "#{inspect(observer)} never heard that #{inspect(victim)} died"
+      # Also when the wait above gave up: a trace left on would fill this
+      # process's mailbox for the rest of the test, and refuse the next
+      # tracer of the observer.
+      if Process.alive?(observer), do: :erlang.trace(observer, false, [:receive])
     end
 
-    :erlang.trace(observer, false, [:receive])
     :sys.get_state(observer)
 
     delivered = :erlang.trace_delivered(observer)

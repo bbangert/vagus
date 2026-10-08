@@ -25,6 +25,7 @@ defmodule Vagus.App.Controller.SystemTest do
   @once "local_once"
   @manual "elixir_probe"
   @native "core_mqtt"
+  @early "core_mosquitto"
 
   @ready {true, false, false, :ready, :ready}
   @stopped {false, false, false, :stopped, :stopped}
@@ -34,6 +35,7 @@ defmodule Vagus.App.Controller.SystemTest do
     Faults.each_boundary(
       system: AppWorld.system(world, extra),
       normalize: &AppWorld.normalize/1,
+      journal: &AppWorld.journal/1,
       scenario: fn sys -> scenario.(sys, AppWorld.engine(world, sys)) end
     )
   end
@@ -68,7 +70,7 @@ defmodule Vagus.App.Controller.SystemTest do
   test "a native app is started, comes back under its budget when it ends, and is stopped" do
     world = AppWorld.new(native: true)
     spec = AppWorld.spec(world, AppManifests.native(), %{run: true})
-    native = [supervisor: world.native.supervisor, port: world.native.port]
+    native = [supervisor: world.native.supervisor]
 
     run(world, [observers: &[AppWorld.observer(world, &1)]], fn sys, _engine ->
       {:ok, _app} = Store.create(:app, @native, spec, sys.i)
@@ -91,18 +93,50 @@ defmodule Vagus.App.Controller.SystemTest do
       assert actions(sys, @native) == [:start_process]
       assert Backend.Native.observe(@native, native) == {:ok, :absent}
 
-      assert {_, true, _, :backing_off, _} = verdict(advance(sys, @native, 9_999))
-      app = advance(sys, @native, 1)
+      assert {_, true, _, :backing_off, _} = verdict(advance(sys, @native, 9_000))
+      app = advance(sys, @native, 1_000)
       assert verdict(app) == @ready
       assert actions(sys, @native) == [:start_process, :start_process]
       assert app.status.instance.process != broker
 
+      # A restart asked for ends the broker and starts another: its going
+      # was asked for, and is no attempt of the budget.
+      was = app.status.instance.process
+      app = write(sys, @native, [{:inc, [:restart_counter]}])
+      assert verdict(app) == @ready
+      assert app.status.instance.process != was
+      started = [:start_process, :start_process, :stop_process, :start_process]
+      assert actions(sys, @native) == started
+      assert wake(sys, @native).status.restarts.attempts == 0
+
       app = write(sys, @native, %{run: false})
       assert verdict(app) == @stopped
-      assert actions(sys, @native) == [:start_process, :start_process, :stop_process]
+      assert actions(sys, @native) == started ++ [:stop_process]
       assert Backend.Native.observe(@native, native) == {:ok, :absent}
       assert app.status.restarts.attempts == 0
     end)
+  end
+
+  test "a native app whose options cannot be written is not started, and is once they can" do
+    world = AppWorld.new(native: true)
+    spec = AppWorld.spec(world, AppManifests.native(), %{run: true})
+    sys = start_system(AppWorld.system(world))
+    File.mkdir_p!(world.data)
+    File.write!(Path.join(world.data, "addons"), "in the way")
+
+    {:ok, _app} = Store.create(:app, @native, spec, sys.i)
+    await!(sys, :app, @native, &(&1.status[:failure] != nil))
+    settle(sys)
+    app = get(sys, @native)
+    assert %{action: :start_process, class: :transient} = app.status.failure
+    # The broker's supervisor was never asked.
+    assert actions(sys, @native) == []
+    assert Backend.Native.observe(@native, supervisor: world.native.supervisor) == {:ok, :absent}
+
+    File.rm!(Path.join(world.data, "addons"))
+    assert verdict(advance(sys, @native, 1_000)) == @ready
+    assert actions(sys, @native) == [:start_process]
+    assert verdict(write(sys, @native, %{run: false})) == @stopped
   end
 
   describe "after a reboot" do
@@ -172,87 +206,366 @@ defmodule Vagus.App.Controller.SystemTest do
     end
   end
 
-  test "no token is in the store's file, in status, in a process's state or in a log" do
-    world = AppWorld.new()
-    path = Path.join(world.root, "resources.json")
-    seen = :ets.new(:seen, [:public, :bag])
+  defmodule Faulty do
+    @moduledoc """
+    The engine client, with the faults a token could leave by: on the
+    switch in its `:faults` option, a call raises with everything it was
+    given or read in the exception's message, the container's environment
+    and so its token among it.
 
-    look = fn sys ->
-      runtime = Process.whereis(Runtime.name(sys.instance, Controller))
-      index = Process.whereis(AuthIndex.name(sys.instance))
+      * 1: the create raises, with the config it was given;
+      * 2: the inspect the token put makes raises, with what it read;
+      * 3: the next inspect an observation makes raises the same way, once;
+      * 4: so does the next inspect of a container the other slot left.
+    """
+    alias Vagus.Runtime.Docker
 
-      for term <- [
-            File.read!(path),
-            snapshot(sys),
-            journal(sys),
-            :sys.get_state(runtime),
-            Runtime.info(Controller, sys.i),
-            :sys.get_state(index),
-            :ets.tab2list(AuthIndex.table(sys.instance)),
-            :sys.get_state(Process.whereis(Pulls.name(sys.instance)))
-          ],
-          do:
-            :ets.insert(
-              seen,
-              {:term, inspect(term, limit: :infinity, printable_limit: :infinity)}
-            )
+    def create_container(config, opts) do
+      {faults, opts} = Keyword.pop!(opts, :faults)
+      if :atomics.get(faults, 1) == 1, do: raise("create fell over with #{inspect(config)}")
+      Docker.create_container(config, opts)
     end
 
-    log =
-      capture_log([level: :debug], fn ->
-        sys = start_system(AppWorld.system(world, path: path))
-        engine = AppWorld.engine(world, sys)
+    def inspect_container(name, opts) do
+      {faults, opts} = Keyword.pop!(opts, :faults)
+      result = Docker.inspect_container(name, opts)
 
-        install(world, sys, @plain, %{run: true})
-        install(world, sys, @watched, %{run: true, settings: %{watchdog: true}})
-        look.(sys)
+      case {:atomics.get(faults, 1), putting?()} do
+        {2, true} -> raise "inspect fell over with #{inspect(result, limit: :infinity)}"
+        {3, false} -> match?({:ok, _}, result) && once(faults, result)
+        {4, false} -> name =~ "addon_" && once(faults, result)
+        _neither -> result
+      end || result
+    end
 
-        # A start that fails, a restart, a crash, a pass that raises with
-        # the instance in hand, a runtime replaced, a token table replaced.
-        Model.fail_start(engine, "app_" <> @plain, "port is already allocated")
-        write(sys, @plain, [{:inc, [:restart_counter]}])
-        look.(sys)
-        Model.fail_start(engine, "app_" <> @plain, nil)
-        write(sys, @plain, [{:inc, [:start_counter]}])
-        Model.crash(engine, "app_" <> @watched)
-        wake(sys, @watched)
-        advance(sys, @watched, 10_000)
-        look.(sys)
-        # The probe raises, once, in a pass that has the instance in hand.
-        :atomics.put(world.probe, 1, 2)
-        advance(sys, @watched, 120_000)
-        await!(sys, :app, @watched, :ready)
-        settle(sys)
-        look.(sys)
-        kill_runtime(sys, Controller)
-        settle(sys)
-        look.(sys)
+    defp once(faults, result) do
+      :atomics.put(faults, 1, 0)
+      raise "inspect fell over with #{inspect(result, limit: :infinity)}"
+    end
 
-        {:ok, _app} = Store.delete(:app, @plain, sys.i)
-        await!(sys, :app, @plain, :gone)
-        look.(sys)
+    # Whether this is the token put's read and not an observation's: the two
+    # make the same call.
+    defp putting? do
+      {:current_stacktrace, stack} = Process.info(self(), :current_stacktrace)
 
-        tokens =
-          for %{path: "/containers/create", body: %{"Env" => env}} <- FakeEngine.requests(engine),
-              "SUPERVISOR_TOKEN=" <> token <- env,
-              do: token
-
-        :ets.insert(seen, {:tokens, tokens})
+      Enum.any?(stack, fn {module, function, _arity, _location} ->
+        module == Controller and Atom.to_string(function) =~ "act"
       end)
-
-    [tokens: tokens] = :ets.lookup(seen, :tokens)
-    assert length(Enum.uniq(tokens)) >= 4
-    assert Enum.all?(tokens, &(byte_size(&1) == 43))
-    # The pass that raised was logged, so a crash report is among what is read.
-    assert log =~ "the prober fell over"
-    hay = [log | for({:term, text} <- :ets.lookup(seen, :term), do: text)]
-
-    for token <- tokens, text <- hay do
-      refute text =~ token
-      refute text =~ Base.encode16(:crypto.hash(:sha256, token), case: :lower)
     end
 
-    refute Enum.any?(hay, &(&1 =~ "SUPERVISOR_TOKEN"))
+    for {function, arity} <- [
+          inspect_image: 2,
+          list_containers: 1,
+          start_container: 2,
+          stop_container: 2,
+          remove_container: 2,
+          remove_image: 2
+        ] do
+      args = Macro.generate_arguments(arity, __MODULE__)
+
+      def unquote(function)(unquote_splicing(args)) do
+        {last, first} = List.pop_at(unquote(args), -1)
+        apply(Docker, unquote(function), first ++ [Keyword.delete(last, :faults)])
+      end
+    end
+  end
+
+  describe "a token" do
+    @core "homeassistant"
+    @supervisor_token "the-supervisor-token"
+    @other_slot_token "the-token-the-other-slot-gave"
+
+    # Every form a token or its digest could be written in.
+    defp forms(token) do
+      digest = :crypto.hash(:sha256, token)
+
+      %{
+        token: [token],
+        digest: [
+          Base.encode16(digest, case: :lower),
+          Base.encode16(digest, case: :upper),
+          Base.encode64(digest),
+          Base.encode64(digest, padding: false),
+          Base.url_encode64(digest),
+          Base.url_encode64(digest, padding: false),
+          # As `inspect/1` shows a binary that is no text.
+          digest |> :binary.bin_to_list() |> Enum.join(", ")
+        ]
+      }
+    end
+
+    defp text(term), do: inspect(term, limit: :infinity, printable_limit: :infinity)
+
+    # A process as a dump of it would show it: its state where it has one
+    # to ask for, and whatever is on its stack, in its dictionary and in
+    # its mailbox.
+    defp process(pid) do
+      {pid, Process.info(pid, [:backtrace, :dictionary, :messages])}
+    end
+
+    defp stateful(name) do
+      pid = Process.whereis(name)
+      {:sys.get_state(pid), process(pid)}
+    end
+
+    # Everything there is to read of a running system. The token table and
+    # its process hold digests, which is what they are for, and so are
+    # kept apart: only a token itself must not be in them.
+    defp look(sys, path) do
+      i = sys.instance
+      tasks = Task.Supervisor.children(Runtime.tasks(i, Controller))
+      pulls = Task.Supervisor.children(Pulls.tasks(i))
+
+      %{
+        anywhere: [
+          file: File.read!(path),
+          store: snapshot(sys),
+          journal: AppWorld.journal(sys),
+          runtime: stateful(Runtime.name(i, Controller)),
+          info: Runtime.info(Controller, sys.i),
+          steps: Enum.map(tasks, &process/1),
+          lanes: stateful(Vagus.Resource.Lanes.name(i)),
+          store_process: stateful(Store.name(i)),
+          pull_worker: stateful(Pulls.name(i)),
+          pull_tasks: Enum.map(pulls, &process/1)
+        ],
+        table: [
+          index: stateful(AuthIndex.name(i)),
+          rows: :ets.tab2list(AuthIndex.table(i))
+        ]
+      }
+    end
+
+    defp traced(seen \\ []) do
+      receive do
+        {:trace, _pid, :call, {Controller, function, args}} ->
+          traced([{function, args} | seen])
+
+        {:trace, _pid, :return_from, {Controller, function, _arity}, value} ->
+          traced([{function, value} | seen])
+      after
+        0 -> seen
+      end
+    end
+
+    defp minted(engine) do
+      for %{path: "/containers/create", body: %{"Env" => env}} <- FakeEngine.requests(engine),
+          "SUPERVISOR_TOKEN=" <> token <- env,
+          uniq: true,
+          do: token
+    end
+
+    test "is in nothing a run leaves or shows: file, status, journal, log, crash report, " <>
+           "process, or what the controller's callbacks are given and return" do
+      world = AppWorld.new()
+      path = Path.join(world.root, "resources.json")
+      faults = :atomics.new(1, [])
+      network = :atomics.new(1, [])
+
+      context = %{
+        backends: %{
+          Backend.Container => [client: Faulty, engine: [socket: world.socket, faults: faults]],
+          Backend.Native => []
+        },
+        prepare: [
+          network: fn -> if(:atomics.get(network, 1) == 1, do: {:error, :enetdown}, else: :ok) end,
+          dsp_state: fn -> :unsupported end
+        ]
+      }
+
+      seen = :ets.new(:seen, [:public, :bag])
+      keep = fn sys -> :ets.insert(seen, {:look, look(sys, path)}) end
+      failed = fn sys, app -> get(sys, app).status.failure end
+      # Looked at after the search: with a guard gone the fault is a crashed
+      # step and no failure, and what the test then says is where the token is.
+      hit = fn action, failure -> :ets.insert(seen, {:hit, action, failure}) end
+
+      # A pattern is set on code that is loaded, and on no other.
+      Code.ensure_loaded!(Controller)
+      :erlang.trace_pattern({Controller, :observe, 2}, [{:_, [], [{:return_trace}]}], [:local])
+      :erlang.trace_pattern({Controller, :reconcile, 2}, true, [:local])
+      :erlang.trace_pattern({Controller, :act, 3}, true, [:local])
+      :erlang.trace(:new_processes, true, [:call])
+
+      log =
+        try do
+          capture_log([level: :debug], fn ->
+            sys = start_system(AppWorld.system(world, path: path, context: context))
+            engine = AppWorld.engine(world, sys)
+
+            # The read of a container the other slot left raises, with its
+            # environment and the token that slot gave it.
+            Model.put_container(engine, "addon_" <> @plain,
+              state: "exited",
+              env: ["SUPERVISOR_TOKEN=" <> @other_slot_token]
+            )
+
+            :atomics.put(faults, 1, 4)
+            install(world, sys, @plain, %{run: true})
+            await!(sys, :app, @plain, :ready)
+            settle(sys)
+            assert :atomics.get(faults, 1) == 0
+            install(world, sys, @watched, %{run: true, settings: %{watchdog: true}})
+            keep.(sys)
+
+            # A create that raises with the token it had just minted in hand.
+            :atomics.put(faults, 1, 1)
+            app = write(sys, @plain, [{:inc, [:restart_counter]}])
+            hit.(:create, app.status.failure)
+            keep.(sys)
+            :atomics.put(faults, 1, 0)
+            assert verdict(write(sys, @plain, [{:inc, [:start_counter]}])) == @ready
+
+            # A token put that raises with the environment it had just read.
+            :atomics.put(faults, 1, 2)
+            app = write(sys, @plain, [{:inc, [:restart_counter]}])
+            hit.(:put_token, app.status.failure)
+            keep.(sys)
+            :atomics.put(faults, 1, 0)
+            assert verdict(write(sys, @plain, [{:inc, [:start_counter]}])) == @ready
+
+            # An observation whose read raises the same way. The pass says
+            # the engine failed it, and the next one sees the app as it is.
+            :atomics.put(faults, 1, 3)
+            wake(sys, @plain)
+            await!(sys, :app, @plain, :ready)
+            settle(sys)
+            assert :atomics.get(faults, 1) == 0
+            keep.(sys)
+
+            # A pass that raises with the instance in hand: the prober
+            # falls over, once.
+            Model.crash(engine, "app_" <> @watched)
+            wake(sys, @watched)
+            advance(sys, @watched, 10_000)
+            :atomics.put(world.probe, 1, 2)
+            advance(sys, @watched, 120_000)
+            await!(sys, :app, @watched, :ready)
+            settle(sys)
+            keep.(sys)
+
+            # A create that fails before anything is minted.
+            :atomics.put(network, 1, 1)
+            Model.put_image(engine, AppWorld.image(world, AppWorld.spec(world, @early)))
+
+            {:ok, _app} =
+              Store.create(:app, @early, AppWorld.spec(world, @early, %{run: true}), sys.i)
+
+            await!(sys, :app, @early, &(&1.status[:failure] != nil))
+            settle(sys)
+            assert %{action: :create} = failed.(sys, @early)
+            keep.(sys)
+            :atomics.put(network, 1, 0)
+            assert verdict(advance(sys, @early, 1_000)) == @ready
+
+            # Core: its token is the Supervisor's own, and the put of it
+            # raises as the others'.
+            Model.put_container(engine, @core,
+              restart_policy: "unless-stopped",
+              env: ["SUPERVISOR_TOKEN=#{@supervisor_token}"]
+            )
+
+            :atomics.put(faults, 1, 2)
+            core = %{lifecycle: :core, version: "2026.8.0", run: true}
+            {:ok, _core} = Store.create(:app, @core, core, sys.i)
+            await!(sys, :app, @core, &is_map_key(&1.status, :state))
+            settle(sys)
+            hit.(:put_token, failed.(sys, @core))
+            keep.(sys)
+            :atomics.put(faults, 1, 0)
+            assert verdict(write(sys, @core, [{:inc, [:start_counter]}])) == @ready
+            assert AuthIndex.lookup(@supervisor_token, sys.i) == {:ok, @core}
+
+            # In flight: a step held inside its start, the token already in
+            # the table, and a pull that stalls.
+            stalled = AppWorld.spec(world, @once, %{run: true})
+
+            Model.script_pull(
+              engine,
+              AppWorld.image(world, stalled),
+              {:stall, [Model.downloading("layer", 1, 100)]}
+            )
+
+            {:ok, _app} = Store.create(:app, @once, stalled, sys.i)
+            await!(sys, :app, @once, &(&1.status[:state] == :pulling))
+            Model.hold(engine, :post, "/start")
+            {:ok, _app} = Store.update_spec(:app, @plain, [{:inc, [:restart_counter]}], sys.i)
+
+            assert_receive {:fake_engine, :held,
+                            %{path: "/containers/app_" <> @plain <> "/start"}},
+                           5_000
+
+            held = look(sys, path)
+            assert [_step] = held.anywhere[:steps]
+            assert [_pull] = held.anywhere[:pull_tasks]
+            assert is_map_key(held.anywhere[:info].in_flight, @plain)
+            :ets.insert(seen, {:look, held})
+            Model.release(engine)
+            await!(sys, :app, @plain, :ready)
+            settle(sys)
+
+            kill_runtime(sys, Controller)
+            settle(sys)
+            keep.(sys)
+
+            {:ok, _app} = Store.delete(:app, @plain, sys.i)
+            await!(sys, :app, @plain, :gone)
+            keep.(sys)
+            :ets.insert(seen, {:tokens, minted(engine)})
+          end)
+        after
+          # Whatever became of the scenario: a tracer left on outlives the test.
+          :erlang.trace(:new_processes, false, [:call])
+
+          for function <- [observe: 2, reconcile: 2, act: 3],
+              do:
+                :erlang.trace_pattern({Controller, elem(function, 0), elem(function, 1)}, false, [
+                  :local
+                ])
+        end
+
+      [tokens: tokens] = :ets.lookup(seen, :tokens)
+      assert length(tokens) >= 5
+      assert Enum.all?(tokens, &(byte_size(&1) == 43))
+      # Each of the three faults was reported, and a pass that raised too:
+      # crash reports are among what is read.
+      assert log =~ "a step holding a token crashed"
+      assert log =~ "the prober fell over"
+
+      calls = traced()
+
+      for function <- [:observe, :reconcile, :act],
+          do: assert(List.keymember?(calls, function, 0))
+
+      looks = for {:look, look} <- :ets.lookup(seen, :look), do: look
+
+      anywhere =
+        [log: log, callbacks: text(calls)] ++
+          for(look <- looks, {where, term} <- look.anywhere, do: {where, text(term)})
+
+      table = for look <- looks, {where, term} <- look.table, do: {where, text(term)}
+
+      for secret <- [@supervisor_token, @other_slot_token | tokens] do
+        %{token: [token], digest: digests} = forms(secret)
+
+        for {where, text} <- anywhere ++ table,
+            do: refute(text =~ token, "a token is in #{where}")
+
+        for {where, text} <- anywhere, form <- digests do
+          refute text =~ form, "a token's digest is in #{where}"
+        end
+      end
+
+      for {where, text} <- anywhere ++ table,
+          do: refute(text =~ "SUPERVISOR_TOKEN", "an environment is in #{where}")
+
+      assert [create: _, put_token: _, put_token: _] =
+               hits =
+               for({:hit, action, failure} <- :ets.lookup(seen, :hit), do: {action, failure})
+
+      for {action, failure} <- hits,
+          do: assert(%{action: ^action, class: :permanent, cause: :crashed} = failure)
+    end
   end
 
   describe "Vagus.App.wiring/1" do
@@ -265,7 +578,7 @@ defmodule Vagus.App.Controller.SystemTest do
         facts: [data_root: world.data],
         boot_marker: Path.join(world.root, "booted"),
         context:
-          Map.put(Map.take(AppWorld.context(world), [:prepare, :audit]), :api_ready, fn ->
+          Map.put(Map.take(AppWorld.context(world), [:prepare]), :api_ready, fn ->
             true
           end),
         observer: [events: {Vagus.Runtime.Events, events}, interval: :infinity]
@@ -275,22 +588,68 @@ defmodule Vagus.App.Controller.SystemTest do
     end
 
     test "is the controller with a long resync of its own, what it stands on, and the observer",
-         %{opts: opts} do
+         %{world: world, opts: opts, events: events} do
+      engine = [socket: world.socket]
       wiring = Vagus.App.wiring([instance: I] ++ opts)
       assert Keyword.keys(wiring) == [:controllers, :services, :observers]
+
       assert [{Controller, runtime}] = wiring[:controllers]
+      assert Keyword.keys(runtime) == [:resync, :max_in_flight_steps, :context]
       assert runtime[:resync] == :timer.hours(1)
-      assert %{facts: %Vagus.App.Facts{}, gates: [], backends: %{}} = runtime[:context]
+      # Twice the engine lane's four slots: see the controller's "Lanes".
+      assert runtime[:max_in_flight_steps] == 8
 
-      assert [{AuthIndex, instance: I}, {Pulls, _}, %{id: _tasks}, %{id: Boot}] =
-               wiring[:services]
+      context = runtime[:context]
+      assert Enum.sort(Map.keys(context)) == [:api_ready, :backends, :facts, :gates, :prepare]
+      assert context.facts == Vagus.App.Facts.read(data_root: world.data)
+      assert context.gates == []
+      # The test's own, over the application's: `&Vagus.API.Listener.accepting?/0`.
+      assert context.api_ready == opts[:context].api_ready
+      assert context.prepare == opts[:context].prepare
 
-      assert [{EngineObserver, observer}] = wiring[:observers]
-      assert observer[:controller] == Controller and observer[:instance] == I
+      assert context.backends == %{
+               Backend.Container => [engine: engine],
+               Backend.Native => []
+             }
 
-      # Only a gate somebody opens is waited for.
-      assert [{Controller, gated}] = Vagus.App.wiring(gates: [:dns_ready])[:controllers]
+      assert wiring[:services] == [
+               {AuthIndex, instance: I},
+               {Pulls, instance: I, engine: engine},
+               Supervisor.child_spec({Task.Supervisor, name: Pulls.tasks(I)}, id: Pulls.tasks(I)),
+               Boot.child_spec(instance: I, marker: opts[:boot_marker])
+             ]
+
+      assert wiring[:observers] == [
+               {EngineObserver,
+                controller: Controller,
+                instance: I,
+                backend_opts: [engine: engine],
+                events: {Vagus.Runtime.Events, events},
+                interval: :infinity}
+             ]
+
+      # With nothing given: the application's own instance, engine and API,
+      # the boot marker beside the run directory, and no gate.
+      assert [{Controller, plain}] = Vagus.App.wiring()[:controllers]
+      assert plain[:context].api_ready == (&Vagus.API.Listener.accepting?/0)
+      assert plain[:context].gates == []
+
+      assert plain[:context].backends == %{
+               Backend.Container => [engine: []],
+               Backend.Native => []
+             }
+
+      assert [{AuthIndex, instance: Vagus.Resource}, _pulls, _tasks, boot] =
+               Vagus.App.wiring()[:services]
+
+      assert boot == Boot.child_spec(instance: Vagus.Resource)
+
+      # Only a gate somebody opens is waited for, and a resync asked for is had.
+      assert [{Controller, gated}] =
+               Vagus.App.wiring(gates: [:dns_ready], resync: 5_000)[:controllers]
+
       assert gated[:context].gates == [:dns_ready]
+      assert gated[:resync] == 5_000
     end
 
     test "run as given: an app is started, and what happens in the engine wakes it",
@@ -307,6 +666,8 @@ defmodule Vagus.App.Controller.SystemTest do
 
       engine = AppWorld.engine(world, sys)
       start_supervised!({Vagus.Runtime.Events, name: events, socket: world.socket})
+      # An engine tells of nothing that happened before it was asked.
+      :ok = Model.await_event_stream(engine)
       assert File.read!(opts[:boot_marker]) =~ "done"
 
       app = install(world, sys, @plain, %{run: true})
@@ -333,6 +694,8 @@ defmodule Vagus.App.Controller.SystemTest do
 
     test "never in its runtime, from that runtime's start to its replacement's work" do
       world = AppWorld.new()
+      # A pattern is set on code that is loaded, and on no other.
+      for module <- @traced, do: Code.ensure_loaded!(module)
       for module <- @traced, do: :erlang.trace_pattern({module, :_, :_}, true, [:local])
       :erlang.trace(:new_processes, true, [:call])
 

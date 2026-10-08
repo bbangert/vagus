@@ -417,6 +417,19 @@ defmodule Vagus.Resource.Harness do
   def record(%{world: world}, key, action),
     do: Agent.update(world, &%{&1 | journal: [{key, action} | &1.journal]})
 
+  @doc """
+  Changes the facts and adds to the journal in one step: `fun` is given the
+  facts and returns them with the entries to add, oldest first. For a
+  journal entry that depends on what the facts say when it is written.
+  """
+  @spec transact(%{world: pid()}, (map() -> {map(), [{term(), term()}]})) :: :ok
+  def transact(%{world: world}, fun) do
+    Agent.update(world, fn state ->
+      {facts, entries} = fun.(state.facts)
+      %{state | facts: facts, journal: Enum.reverse(entries) ++ state.journal}
+    end)
+  end
+
   @doc "The actions, oldest first, as `{key, action}`."
   @spec journal(%{world: pid()}) :: [{term(), term()}]
   def journal(%{world: world}), do: Agent.get(world, &Enum.reverse(&1.journal))
@@ -560,7 +573,9 @@ defmodule Vagus.Resource.Harness.Faults do
   for what it needs; `:system`, `Vagus.Resource.Harness.start_system/1`
   options; `:normalize`, applied to each final store before comparing;
   `:equivalent`, a function of one resource's reference and interrupted
-  actions in place of both rules for the killed controller's resources.
+  actions in place of both rules for the killed controller's resources;
+  `:journal`, a function of the system that reads its journal (default
+  `Vagus.Resource.Harness.journal/1`).
 
   Returns the undisturbed run: `store`, `journal` (actions per resource) and
   `boundaries` (labels in the order crossed).
@@ -571,7 +586,8 @@ defmodule Vagus.Resource.Harness.Faults do
     system = Keyword.get(opts, :system, [])
     normalize = Keyword.get(opts, :normalize, & &1)
     equivalent = Keyword.get(opts, :equivalent)
-    reference = run(system, :count, scenario, normalize)
+    read = {normalize, Keyword.get(opts, :journal, &Harness.journal/1)}
+    reference = run(system, :count, scenario, read)
 
     if reference.boundaries == [],
       do: flunk("the scenario crosses no boundary, so there is nowhere to interrupt it")
@@ -582,7 +598,7 @@ defmodule Vagus.Resource.Harness.Faults do
           do: {label, nth}
 
     for {{killed, cut, _kind} = label, nth} = target <- Enum.sort(targets) do
-      interrupted = run(system, {:kill_at, target}, scenario, normalize)
+      interrupted = run(system, {:kill_at, target}, scenario, read)
       where = "killed after #{inspect(label)} ##{nth}"
 
       case interrupted.kill do
@@ -591,7 +607,12 @@ defmodule Vagus.Resource.Harness.Faults do
         {:error, reason} -> flunk("#{where}: the kill did not happen: #{reason}")
       end
 
-      assert interrupted.store == reference.store, "#{where}: the store ends differently"
+      if interrupted.store != reference.store do
+        flunk("""
+        #{where}: the store ends differently, as {path, undisturbed, interrupted}:
+        #{inspect(differences(reference.store, interrupted.store, []), pretty: true, limit: :infinity)}
+        """)
+      end
 
       for key <- Enum.uniq(Map.keys(reference.journal) ++ Map.keys(interrupted.journal)) do
         {expected, found} = {reference.journal[key] || [], interrupted.journal[key] || []}
@@ -614,11 +635,29 @@ defmodule Vagus.Resource.Harness.Faults do
     reference
   end
 
-  defp run(system, mode, scenario, normalize) do
+  # Where two terms differ, each by the path of keys and positions to it.
+  defp differences(same, same, _path), do: []
+
+  defp differences(%{} = one, %{} = other, path)
+       when not is_struct(one) and not is_struct(other) do
+    for key <- Enum.uniq(Map.keys(one) ++ Map.keys(other)),
+        difference <- differences(one[key], other[key], path ++ [key]),
+        do: difference
+  end
+
+  defp differences(one, other, path) when is_list(one) and length(one) == length(other) do
+    for {{a, b}, at} <- Enum.with_index(Enum.zip(one, other)),
+        difference <- differences(a, b, path ++ [at]),
+        do: difference
+  end
+
+  defp differences(one, other, path), do: [{path, one, other}]
+
+  defp run(system, mode, scenario, {normalize, journal}) do
     sys = Harness.start_system([faults: mode] ++ system)
     scenario.(sys)
     Harness.settle(sys)
-    journal = sys |> Harness.journal() |> Enum.group_by(&elem(&1, 0), &elem(&1, 1))
+    journal = sys |> journal.() |> Enum.group_by(&elem(&1, 0), &elem(&1, 1))
     report = report(sys.faults)
     store = normalize.(Harness.snapshot(sys))
     Harness.stop_system(sys)

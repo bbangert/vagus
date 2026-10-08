@@ -614,9 +614,11 @@ container is not touched. The token itself exists in three places only:
 the create action, the put action, which reads it from the engine again
 instead of taking it as an argument, and the function of `observe/2` that
 takes the instance apart. What leaves that function is a state and an
-instance without its environment; both actions turn whatever they raise
-into the kind of failure and nothing it carried
-(`Vagus.App.Token.guard/1`). Core's token is the Supervisor's, read through
+instance without its environment; both actions, and that read of the
+instance, turn whatever they raise into the kind of failure and nothing it
+carried (`Vagus.App.Token.guard/1`): an engine client that raised with the
+answer it was reading would otherwise put the environment into a crash
+report. A read that raised is an engine that failed the pass. Core's token is the Supervisor's, read through
 a function the controller is given; a native app has none.
 
 **Before the create.** `Vagus.App.Prepare.run/3` is part of the create
@@ -751,7 +753,7 @@ reboot, is removed and made anew without counting anything.
 |---|---|
 | `:never` (watchdog off, or runs once) | Failed, `crashed`, with the exit code; the dead container stays, `run` is unchanged. An app that runs once and exits 0 has succeeded: none of the three conditions, wire `stopped`. |
 | `{:restart, budget}` | One more attempt: the dead container is removed and the start sequence waits out the pause, 10 s doubling. The sixth in a row is Failed (`restart_budget_exhausted`). Ready for ten minutes forgets the attempts. |
-| `{:crash_loop, rule}` (Core) | Nothing: the engine restarts it. Each restart, a higher restart count with a new start time, is noted; three in ten minutes have the container removed and made anew, at most ten times in thirty minutes, then Failed (`crash_loop`). |
+| `{:crash_loop, rule}` (Core) | Nothing: the engine restarts it. Each restart, a higher restart count with a new start time, is noted; three in ten minutes have the container removed and made anew, at most ten times in thirty minutes, then Failed (`crash_loop`). Making it anew needs Core's container config: until that is here, three in ten minutes are Failed at once (see "Core, so far"). |
 
 The counts are status and every instant in them is a stamp: they start
 again at a reboot.
@@ -765,7 +767,10 @@ left running, not Ready.
 
 A shutdown stops containers while every runtime rests, and the reboot that
 follows leaves no status: the next boot finds containers nothing is
-recorded of, which are no crashes.
+recorded of, which are no crashes. A shutdown that is called off is not
+told apart: status still has each instance as running, so a container the
+shutdown stopped is judged as one that ended by itself, and costs an
+attempt of its budget.
 
 ### Readiness
 
@@ -810,7 +815,9 @@ named `homeassistant` that exists is taken as it is, its token put in the
 table, asked whether it answers, stopped with the grace its image asks for
 and kept, and started again. What it does not do is make one: with no
 container the verdict is Failed, `no_container_builder`, and a crash loop
-is Failed, `crash_loop`, without removing anything. The container config,
+is Failed, `crash_loop`, without removing anything: the clauses that stop,
+remove and make Core anew, and the bound on how often, are in the table
+and no observation reaches them, since Core has no image to observe. The container config,
 the fingerprint that decides reuse, the hooks, and where Core is asked
 (today `127.0.0.1:8123` unless the controller is told otherwise) come with
 Core's own change.

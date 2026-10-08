@@ -91,6 +91,11 @@ defmodule Vagus.App.Controller.LiveTest do
         observers: &wiring.(&1)[:observers]
       )
 
+    # A stop is answered when the container has exited, which an engine
+    # allows ten seconds for before it kills it. Every wait here outlasts
+    # that, whether or not this image's init passes the signal on.
+    sys = %{sys | wait: 30_000}
+
     start_supervised!({Vagus.Runtime.Events, name: events, socket: @socket})
     facts = Vagus.App.Facts.read(data_root: ctx.root)
 

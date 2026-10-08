@@ -4,7 +4,16 @@ defmodule Vagus.App.Controller.ScenarioTest do
   import Vagus.Resource.Harness
 
   import Vagus.Test.AppWorld,
-    only: [actions: 2, advance: 3, install: 3, install: 4, verdict: 1, wake: 2, write: 3]
+    only: [
+      actions: 2,
+      advance: 3,
+      advance: 4,
+      install: 3,
+      install: 4,
+      verdict: 1,
+      wake: 2,
+      write: 3
+    ]
 
   alias Vagus.App.{AuthIndex, Controller, Prepare, Pulls}
   alias Vagus.Resource.Harness.Faults
@@ -17,10 +26,14 @@ defmodule Vagus.App.Controller.ScenarioTest do
   # A scenario runs once more for each boundary it crosses.
   @moduletag timeout: 180_000
 
+  # No scenario rests a millisecond short of a pause. The runtime's timers
+  # run on real time: one armed for the millisecond that is left comes round
+  # every millisecond for as long as the clock stands, a pass each time. The
+  # instants themselves are the table's to pin (`Vagus.Test.AppRows`).
+
   @plain "only_host_uts"
   @watched "45df7312_zigbee2mqtt"
   @once "local_once"
-  @manual "elixir_probe"
   @early "core_mosquitto"
 
   @ready {true, false, false, :ready, :ready}
@@ -33,6 +46,7 @@ defmodule Vagus.App.Controller.ScenarioTest do
     Faults.each_boundary(
       system: AppWorld.system(world, extra),
       normalize: &AppWorld.normalize/1,
+      journal: &AppWorld.journal/1,
       scenario: fn sys -> scenario.(sys, AppWorld.engine(world, sys)) end
     )
   end
@@ -181,11 +195,11 @@ defmodule Vagus.App.Controller.ScenarioTest do
       assert actions(sys, @watched) == @start ++ [:remove]
       assert container(engine, @watched) == nil
 
-      app = advance(sys, @watched, 9_999)
+      app = advance(sys, @watched, 9_000)
       assert verdict(app) == {false, true, false, :backing_off, :restarting}
       assert actions(sys, @watched) == @start ++ [:remove]
 
-      app = advance(sys, @watched, 1)
+      app = advance(sys, @watched, 1_000)
       assert verdict(app) == @ready
       assert actions(sys, @watched) == @start ++ [:remove] ++ @start
       assert %{id: second, state: "running"} = container(engine, @watched)
@@ -194,6 +208,11 @@ defmodule Vagus.App.Controller.ScenarioTest do
     end)
   end
 
+  # Six crashes and five restarts: several times the boundaries of any other
+  # scenario, each of them one more run of the whole. On a core it shares
+  # with others every call to the engine waits its turn, and the runs
+  # together take minutes.
+  @tag timeout: 900_000
   test "the budget spent is Failed, and a restart asked for recovers" do
     world = AppWorld.new()
 
@@ -203,10 +222,10 @@ defmodule Vagus.App.Controller.ScenarioTest do
       for attempt <- 1..5 do
         app = crash(sys, engine, @watched)
         assert verdict(app) == {false, true, false, :backing_off, :restarting}
-        # One millisecond short of the pause is still a pause.
+        # A second short of the pause is still a pause.
         pause = 10_000 * Integer.pow(2, attempt - 1)
-        assert {_, true, _, :backing_off, _} = verdict(advance(sys, @watched, pause - 1))
-        app = advance(sys, @watched, 1)
+        assert {_, true, _, :backing_off, _} = verdict(advance(sys, @watched, pause - 1_000))
+        app = advance(sys, @watched, 1_000)
         assert verdict(app) == @ready
         assert attempts(app) == attempt
       end
@@ -237,9 +256,9 @@ defmodule Vagus.App.Controller.ScenarioTest do
       assert verdict(app) == @ready
       assert attempts(app) == 1
 
-      app = advance(sys, @watched, 599_999)
+      app = advance(sys, @watched, 599_000)
       assert attempts(app) == 1
-      app = advance(sys, @watched, 1)
+      app = advance(sys, @watched, 1_000)
       assert verdict(app) == @ready
       assert attempts(app) == 0
     end)
@@ -260,6 +279,86 @@ defmodule Vagus.App.Controller.ScenarioTest do
       app = advance(sys, @watched, 10_000)
       assert verdict(app) == @ready
       assert actions(sys, @watched) == @start ++ [:stop, :remove] ++ @start
+      # The stop that followed was the controller's own: one attempt, not two.
+      assert attempts(wake(sys, @watched)) == 1
+    end)
+  end
+
+  test "a restart asked for of an app that is to run is no crash: nothing is counted" do
+    world = AppWorld.new()
+
+    run(world, fn sys, engine ->
+      install(world, sys, @watched, watchdog())
+      %{id: first} = container(engine, @watched)
+
+      app = write(sys, @watched, [{:inc, [:restart_counter]}])
+      assert verdict(app) == @ready
+      assert %{id: second} = container(engine, @watched)
+      assert second != first
+      assert actions(sys, @watched) == @start ++ [:stop, :remove] ++ @start
+      app = wake(sys, @watched)
+      assert attempts(app) == 0
+      assert app.status.failure == nil
+      assert app.status.expected_exit == nil
+    end)
+  end
+
+  test "a container put in the place of the one recorded is taken as it is, its token put" do
+    world = AppWorld.new()
+    image = AppWorld.image(world, AppWorld.spec(world, @watched))
+
+    run(world, fn sys, engine ->
+      install(world, sys, @watched, watchdog())
+      %{id: first} = container(engine, @watched)
+      old = token(engine, @watched)
+
+      # Behind the controller's back: nothing here stopped the first.
+      Model.delete_container(engine, "app_" <> @watched)
+
+      second =
+        Model.put_container(engine, "app_" <> @watched,
+          image: image,
+          env: ["SUPERVISOR_TOKEN=a-token-nobody-here-minted"]
+        )
+
+      app = wake(sys, @watched)
+      assert verdict(app) == @ready
+      assert second != first
+      assert app.status.instance.id == second
+      assert attempts(app) == 0
+      assert app.status.failure == nil
+      assert actions(sys, @watched) == @start ++ [:put_token]
+      assert AuthIndex.lookup("a-token-nobody-here-minted", sys.i) == {:ok, @watched}
+      assert AuthIndex.lookup(old, sys.i) == :error
+    end)
+  end
+
+  test "a start the engine fails for now is asked for again after its pause, which doubles" do
+    world = AppWorld.new()
+
+    run(world, fn sys, engine ->
+      Model.fail_start(engine, "app_" <> @plain, "no space left on device")
+      app = install(world, sys, @plain, %{run: true})
+      assert verdict(app) == {false, true, false, :engine_error, :starting}
+      assert %{action: :start, class: :transient, count: 1} = app.status.failure
+      assert actions(sys, @plain) == @start
+
+      assert {_, true, _, :engine_error, :starting} = verdict(advance(sys, @plain, 500))
+      assert actions(sys, @plain) == @start
+
+      # The pause over, the same container is started, and refused again.
+      app = advance(sys, @plain, 500)
+      assert %{action: :start, count: 2} = app.status.failure
+      assert actions(sys, @plain) == @start ++ [:start]
+
+      Model.fail_start(engine, "app_" <> @plain, nil)
+      assert {_, true, _, :engine_error, :starting} = verdict(advance(sys, @plain, 1_000))
+      assert actions(sys, @plain) == @start ++ [:start]
+
+      app = advance(sys, @plain, 1_000)
+      assert verdict(app) == @ready
+      assert app.status.failure == nil
+      assert actions(sys, @plain) == @start ++ [:start, :start]
     end)
   end
 
@@ -271,9 +370,9 @@ defmodule Vagus.App.Controller.ScenarioTest do
       install(world, sys, @watched, watchdog())
       :atomics.put(world.probe, 1, 1)
 
-      app = advance(sys, @watched, 119_999)
+      app = advance(sys, @watched, 119_000)
       assert app.status.probe.misses == 0
-      app = advance(sys, @watched, 1)
+      app = advance(sys, @watched, 1_000)
       assert verdict(app) == @ready
       assert app.status.probe.misses == 1
       assert actions(sys, @watched) == @start
@@ -405,11 +504,11 @@ defmodule Vagus.App.Controller.ScenarioTest do
       assert verdict(get(sys, @plain)) == {false, true, false, :pull_failed, :pulling}
       assert actions(sys, @plain) == [:request_pull]
 
-      assert verdict(advance(sys, @plain, 999)) == {false, true, false, :pull_failed, :pulling}
+      assert verdict(advance(sys, @plain, 500)) == {false, true, false, :pull_failed, :pulling}
       assert actions(sys, @plain) == [:request_pull]
 
       Model.script_pull(engine, image, :ok)
-      advance(sys, @plain, 1)
+      advance(sys, @plain, 500)
       await!(sys, :app, @plain, :ready)
       settle(sys)
       assert actions(sys, @plain) == [:request_pull, :request_pull] ++ @start
@@ -471,10 +570,16 @@ defmodule Vagus.App.Controller.ScenarioTest do
       # Asked for once, and not again.
       assert actions(sys, @plain) == @start
 
-      # The next attempt is the user's, and starts the container made before.
+      # The next attempt is the user's, and is a container of its own: the
+      # one whose start failed was made for the start asked for before.
+      %{id: refused} = container(engine, @plain)
       Model.fail_start(engine, "app_" <> @plain, nil)
       app = write(sys, @plain, [{:inc, [:start_counter]}])
       assert verdict(app) == @ready
+      assert %{id: started, state: "running"} = container(engine, @plain)
+      assert started != refused
+      assert actions(sys, @plain) == @start ++ [:remove] ++ @start
+      assert app.status.failure == nil
     end)
   end
 
@@ -494,8 +599,12 @@ defmodule Vagus.App.Controller.ScenarioTest do
       assert Controller.wire_state(app) == :stopped
       assert actions(sys, @plain) == []
 
-      assert {_, true, _, :waiting_for_wave, _} = verdict(advance(sys, @plain, 119_999))
-      app = advance(sys, @plain, 1)
+      assert {_, true, _, :waiting_for_wave, _} = verdict(advance(sys, @plain, 119_000))
+      # Time passed for the earlier app too: its pause is over, it has asked
+      # again, and that pull fails like the first, whenever it gets to.
+      await!(sys, :app, @early, &match?(%{failures: 2}, &1.status.pull))
+      settle(sys)
+      app = advance(sys, @plain, 1_000)
       assert verdict(app) == @ready
       assert app.status.waiting_on == []
       assert {_, true, _, :pull_failed, _} = verdict(get(sys, @early))
@@ -519,7 +628,7 @@ defmodule Vagus.App.Controller.ScenarioTest do
       # The earlier app's pull is tried again and succeeds. The clock moves
       # one second of the waiter's two minutes, and its timer is not fired.
       Model.script_pull(engine, AppWorld.image(world, early), :ok)
-      advance(sys, @early, 1_000)
+      advance(sys, @early, 1_000, timers: [@early])
       await!(sys, :app, @early, :ready)
       await!(sys, :app, @plain, :ready)
       settle(sys)
@@ -684,6 +793,411 @@ defmodule Vagus.App.Controller.ScenarioTest do
     end)
   end
 
+  describe "a pass in flight" do
+    setup do
+      world = AppWorld.new()
+      %{world: world}
+    end
+
+    # The app's next pass waits in its first read of the engine until the
+    # test lets it go on: what the test does meanwhile lands during a pass.
+    defp looking(sys, engine, app) do
+      Model.hold(engine, :get, "/containers/app_#{app}/json")
+      :ok = Vagus.Resource.Runtime.enqueue(Controller, app, sys.i)
+      assert_receive {:fake_engine, :held, %{method: :get}}, sys.wait
+    end
+
+    test "that began before a stop was written does not report Ready for the stop's generation",
+         %{world: world} do
+      sys = start_system(AppWorld.system(world))
+      engine = AppWorld.engine(world, sys)
+      %{generation: seen} = install(world, sys, @plain, %{run: true})
+
+      # The pass the write brings is held too, so that what the pass before
+      # it committed can be read before anything is written over it.
+      looking(sys, engine, @plain)
+      Model.hold(engine, :get, "/containers/app_#{@plain}/json")
+      {:ok, %{generation: written}} = Store.update_spec(:app, @plain, %{run: false}, sys.i)
+      assert written == seen + 1
+      Model.release(engine)
+      assert_receive {:fake_engine, :held, %{method: :get}}, sys.wait
+
+      app = get(sys, @plain)
+      assert app.generation == written
+      # Ready is what the pass saw, and it says of which generation.
+      assert %{status: true, observed_generation: ^seen} = app.status.conditions.ready
+      assert app.status.observed_generation == seen
+
+      Model.release(engine)
+      settle(sys)
+      app = get(sys, @plain)
+      assert verdict(app) == @stopped
+      assert %{status: false, observed_generation: ^written} = app.status.conditions.ready
+    end
+
+    test "does not lose a stop written meanwhile", %{world: world} do
+      sys = start_system(AppWorld.system(world))
+      engine = AppWorld.engine(world, sys)
+      install(world, sys, @plain, %{run: true})
+
+      looking(sys, engine, @plain)
+      {:ok, _app} = Store.update_spec(:app, @plain, %{run: false}, sys.i)
+      Model.release(engine)
+      settle(sys)
+
+      assert verdict(get(sys, @plain)) == @stopped
+      assert container(engine, @plain) == nil
+      assert actions(sys, @plain) == @start ++ [:stop, :remove, :remove_token]
+    end
+
+    test "a start written while the stop is still under way: the exit that follows is no crash",
+         %{world: world} do
+      sys = start_system(AppWorld.system(world))
+      engine = AppWorld.engine(world, sys)
+      install(world, sys, @watched, watchdog())
+
+      Model.hold(engine, :post, "/stop")
+      {:ok, _app} = Store.update_spec(:app, @watched, %{run: false}, sys.i)
+
+      assert_receive {:fake_engine, :held, %{path: "/containers/app_" <> @watched <> "/stop"}},
+                     sys.wait
+
+      {:ok, _app} = Store.update_spec(:app, @watched, %{run: true}, sys.i)
+      Model.release(engine)
+      settle(sys)
+
+      # The pass after the stop finds the app to run again and its container
+      # exited. That exit was asked for: it is removed, and nothing counted.
+      app = get(sys, @watched)
+      assert verdict(app) == @ready
+      assert attempts(app) == 0
+      assert app.status.failure == nil
+      assert actions(sys, @watched) == @start ++ [:stop, :remove] ++ @start
+    end
+
+    test "does not lose its gate opening meanwhile", %{world: world} do
+      world = %{world | gates: [:dns_ready]}
+      system = Keyword.update!(AppWorld.system(world), :controllers, &(&1 ++ [__MODULE__.Gate]))
+      sys = start_system(system)
+      engine = AppWorld.engine(world, sys)
+      app = install(world, sys, @plain, %{run: true})
+      assert verdict(app) == {false, true, false, :waiting_for_gate, :starting}
+      %{id: id} = container(engine, @plain)
+
+      looking(sys, engine, @plain)
+      put_fact(sys, {:registered, @plain}, id)
+      :ok = Vagus.Resource.Runtime.enqueue(__MODULE__.Gate, @plain, sys.i)
+      await!(sys, :app, @plain, &match?(%{status: true}, &1.status.conditions[:dns_ready]))
+      Model.release(engine)
+      settle(sys)
+
+      assert verdict(get(sys, @plain)) == @ready
+    end
+
+    test "a hold placed while the container is being created takes the start back",
+         %{world: world} do
+      sys = start_system(AppWorld.system(world, kinds: %{backup: []}))
+      engine = AppWorld.engine(world, sys)
+      install(world, sys, @plain)
+
+      Model.hold(engine, :post, "/containers/create")
+      {:ok, _app} = Store.update_spec(:app, @plain, %{run: true}, sys.i)
+      assert_receive {:fake_engine, :held, %{path: "/containers/create"}}, sys.wait
+      {:ok, backup} = Store.create(:backup, "nightly", %{}, sys.i)
+      writer = [writer: Vagus.Resource.writer(backup)]
+
+      {:ok, _app} =
+        Store.update_spec(:app, @plain, [{:put, [:holds, "nightly"], true}], writer ++ sys.i)
+
+      Model.release(engine)
+      settle(sys)
+
+      assert verdict(get(sys, @plain)) == {false, false, false, :held, :stopped}
+      # Made, and taken away again: never given its token, never started.
+      assert actions(sys, @plain) == [:create, :remove]
+      assert container(engine, @plain) == nil
+      assert AuthIndex.digest_of(@plain, sys.i) == :error
+    end
+  end
+
+  describe "an action that fails before the engine is asked, or is refused by it" do
+    test "an app that needs a DSP this device has not got is Failed, and made once it has" do
+      world = AppWorld.new()
+      dsp = :atomics.new(1, [])
+
+      prepare = [
+        network: fn -> :ok end,
+        dsp_state: fn -> if(:atomics.get(dsp, 1) == 1, do: :configured, else: :unsupported) end,
+        devices: [required_dsp_nodes: ["/dev/null"]]
+      ]
+
+      sys = start_system(AppWorld.system(world, context: %{prepare: prepare}))
+      engine = AppWorld.engine(world, sys)
+
+      app = install(world, sys, "local_dsp", %{run: true})
+      assert verdict(app) == {false, false, true, :invalid_config, :failed}
+
+      assert %{action: :create, class: :permanent, detail: {:invalid, {:dsp_unsupported, _}}} =
+               app.status.failure
+
+      # Refused before the engine was asked for anything.
+      assert actions(sys, "local_dsp") == []
+      assert AppWorld.writes(engine) == []
+
+      :atomics.put(dsp, 1, 1)
+      app = write(sys, "local_dsp", [{:inc, [:start_counter]}])
+      assert verdict(app) == @ready
+      assert actions(sys, "local_dsp") == @start
+    end
+
+    test "a data directory that cannot be made is tried again after a pause" do
+      world = AppWorld.new()
+      sys = start_system(AppWorld.system(world))
+      File.mkdir_p!(world.data)
+      File.write!(Path.join(world.data, "addons"), "in the way")
+
+      app = install(world, sys, @plain, %{run: true})
+      assert verdict(app) == {false, true, false, :unknown, :starting}
+
+      assert %{action: :create, class: :transient, detail: {:mkdir, _path, _}} =
+               app.status.failure
+
+      assert actions(sys, @plain) == []
+
+      File.rm!(Path.join(world.data, "addons"))
+      assert {_, true, _, :unknown, _} = verdict(advance(sys, @plain, 500))
+      assert verdict(advance(sys, @plain, 500)) == @ready
+      assert actions(sys, @plain) == @start
+    end
+
+    test "a create the engine refuses because the name is taken is tried again after a pause" do
+      world = AppWorld.new()
+      sys = start_system(AppWorld.system(world))
+      engine = AppWorld.engine(world, sys)
+      Model.fail(engine, :post, "/containers/create", {409, "Conflict. The name is in use"})
+
+      app = install(world, sys, @plain, %{run: true})
+      assert verdict(app) == {false, true, false, :already_exists, :starting}
+      assert %{action: :create, class: :transient, count: 1} = app.status.failure
+      assert actions(sys, @plain) == [:create]
+
+      Model.fail(engine, :post, "/containers/create", nil)
+      assert verdict(advance(sys, @plain, 1_000)) == @ready
+      assert actions(sys, @plain) == [:create] ++ @start
+    end
+
+    test "a token is not put for an instance that is no longer the one the pass saw" do
+      world = AppWorld.new()
+      sys = start_system(AppWorld.system(world))
+      engine = AppWorld.engine(world, sys)
+      spec = AppWorld.spec(world, @plain)
+      image = AppWorld.image(world, spec)
+      install(world, sys, @plain)
+      read = "/containers/app_#{@plain}/json"
+
+      # The pass that creates, the pass that decides the put, and then the
+      # put's own read of the container, each let go as it arrives.
+      Model.hold(engine, :get, read)
+      {:ok, _app} = Store.update_spec(:app, @plain, %{run: true}, sys.i)
+
+      for _pass <- 1..2 do
+        assert_receive {:fake_engine, :held, %{path: ^read}}, sys.wait
+        Model.hold(engine, :get, read)
+        Model.release(engine)
+      end
+
+      assert_receive {:fake_engine, :held, %{path: ^read}}, sys.wait
+      %{id: first} = container(engine, @plain)
+      Model.delete_container(engine, "app_" <> @plain)
+
+      second =
+        Model.put_container(engine, "app_" <> @plain,
+          state: "created",
+          image: image,
+          env: ["SUPERVISOR_TOKEN=the-token-of-the-second"]
+        )
+
+      Model.release(engine)
+      settle(sys)
+
+      # Nothing was put: the table does not know a token of either.
+      app = get(sys, @plain)
+      assert second != first
+
+      assert %{action: :put_token, class: :transient, detail: {:other, :instance_changed}} =
+               app.status.failure
+
+      assert actions(sys, @plain) == [:create]
+      assert AuthIndex.digest_of(@plain, sys.i) == :error
+
+      # After the pause the instance that is there has its own token put.
+      app = advance(sys, @plain, 1_000)
+      assert verdict(app) == @ready
+      assert app.status.instance.id == second
+      assert actions(sys, @plain) == @start
+      assert AuthIndex.lookup("the-token-of-the-second", sys.i) == {:ok, @plain}
+    end
+  end
+
+  describe "with nobody to say what happened in the engine" do
+    @tag scenario: :resync
+    test "a container that ended is found when the runtime looks at everything again" do
+      world = AppWorld.new()
+      sys = start_system(AppWorld.system(world))
+      engine = AppWorld.engine(world, sys)
+      install(world, sys, @plain, %{run: true})
+
+      # No observer and no event: nothing brings the app a pass.
+      Model.crash(engine, "app_" <> @plain, 9)
+      settle(sys)
+      assert verdict(get(sys, @plain)) == @ready
+
+      resync(sys, Controller)
+      settle(sys)
+      app = get(sys, @plain)
+      assert verdict(app) == {false, false, true, :crashed, :failed}
+      assert app.status.failure.detail == %{exit_code: 9}
+    end
+  end
+
+  describe "an uninstall" do
+    test "of an app whose owner is gone is the collector's to ask for, and ends like any other" do
+      world = AppWorld.new()
+
+      run(world, [kinds: %{backup: []}], fn sys, engine ->
+        {:ok, owner} = Store.create(:backup, "restored", %{}, sys.i)
+        spec = AppWorld.spec(world, @plain, %{run: true})
+        Model.put_image(engine, AppWorld.image(world, spec))
+        owned = [owner_refs: [Vagus.Resource.ref(owner)]]
+        {:ok, _app} = Store.create(:app, @plain, spec, owned ++ sys.i)
+        await!(sys, :app, @plain, :ready)
+        settle(sys)
+
+        {:ok, _owner} = Store.delete(:backup, "restored", sys.i)
+        await!(sys, :app, @plain, :gone)
+        settle(sys)
+
+        assert actions(sys, @plain) ==
+                 @start ++ [:remove_token, :stop, :remove, :remove_image, :remove_data]
+
+        assert container(engine, @plain) == nil
+        assert snapshot(sys) == []
+      end)
+    end
+
+    test "held by another's finalizer: this controller does its part once and lets go" do
+      world = AppWorld.new()
+
+      run(world, fn sys, engine ->
+        spec = AppWorld.spec(world, @plain, %{run: true})
+        Model.put_image(engine, AppWorld.image(world, spec))
+        {:ok, _app} = Store.create(:app, @plain, spec, [finalizers: [:dns]] ++ sys.i)
+        await!(sys, :app, @plain, :ready)
+        settle(sys)
+        held = token(engine, @plain)
+
+        {:ok, _app} = Store.delete(:app, @plain, sys.i)
+        app = await!(sys, :app, @plain, &(&1.finalizers == [:dns]))
+        settle(sys)
+        assert app.deleting?
+        assert container(engine, @plain) == nil
+        assert AuthIndex.lookup(held, sys.i) == :error
+        refute File.exists?(Prepare.data_dir(@plain, world.facts))
+        done = @start ++ [:remove_token, :stop, :remove, :remove_image, :remove_data]
+        assert actions(sys, @plain) == done
+
+        # Looked at again, it is no longer this controller's: nothing is
+        # done and nothing is said, whatever has appeared in the meantime.
+        before = get(sys, @plain)
+        File.mkdir_p!(Prepare.data_dir(@plain, world.facts))
+        assert wake(sys, @plain) == before
+        assert actions(sys, @plain) == done
+        assert File.dir?(Prepare.data_dir(@plain, world.facts))
+
+        {:ok, _resources} = Store.commit([{:remove_finalizer, :app, @plain, :dns}], sys.i)
+        await!(sys, :app, @plain, :gone)
+        settle(sys)
+        assert snapshot(sys) == []
+      end)
+    end
+
+    test "of an app that has failed takes away the container whose start was refused" do
+      world = AppWorld.new()
+
+      run(world, fn sys, engine ->
+        Model.fail_start(
+          engine,
+          "app_" <> @plain,
+          "Bind for 0.0.0.0:80 failed: port is already allocated"
+        )
+
+        app = install(world, sys, @plain, %{run: true})
+        assert {false, false, true, :port_conflict, :failed} = verdict(app)
+        held = token(engine, @plain)
+
+        {:ok, _app} = Store.delete(:app, @plain, sys.i)
+        await!(sys, :app, @plain, :gone)
+        settle(sys)
+
+        # Nothing runs, so nothing is stopped.
+        assert actions(sys, @plain) ==
+                 @start ++ [:remove_token, :remove, :remove_image, :remove_data]
+
+        assert container(engine, @plain) == nil
+        assert AuthIndex.lookup(held, sys.i) == :error
+        assert snapshot(sys) == []
+      end)
+    end
+
+    test "during a pull cancels the pull and leaves nothing" do
+      world = AppWorld.new()
+      spec = AppWorld.spec(world, @plain, %{run: true})
+      image = AppWorld.image(world, spec)
+
+      run(world, fn sys, engine ->
+        Model.script_pull(engine, image, {:stall, [Model.downloading("layer", 1, 100)]})
+        {:ok, _app} = Store.create(:app, @plain, spec, sys.i)
+        await!(sys, :app, @plain, &(&1.status[:state] == :pulling))
+        settle(sys)
+
+        {:ok, _app} = Store.delete(:app, @plain, sys.i)
+        await!(sys, :app, @plain, :gone)
+        settle(sys)
+
+        assert actions(sys, @plain) == [:request_pull, :cancel_pull]
+        assert Pulls.info(sys.i) == %{}
+        assert Pulls.state(image, sys.i) == :idle
+        assert container(engine, @plain) == nil
+        assert snapshot(sys) == []
+      end)
+    end
+  end
+
+  describe "a shutdown that did not end in a reboot" do
+    test "leaves status as it was; a container it stopped is then taken for one that ended by itself" do
+      world = AppWorld.new()
+      sys = start_system(AppWorld.system(world))
+      engine = AppWorld.engine(world, sys)
+      install(world, sys, @watched, watchdog())
+      before = get(sys, @watched)
+
+      shutdown(sys, true)
+      Model.crash(engine, "app_" <> @watched, 143)
+      assert wake(sys, @watched).status == before.status
+
+      # Not what is wanted. Nothing tells the pass after the shutdown that
+      # the exit was the host's doing, and status still has the instance as
+      # running: one attempt is counted, and the app comes back after its
+      # pause. After a reboot there is no status, and nothing is counted.
+      shutdown(sys, false)
+      app = wake(sys, @watched)
+      assert verdict(app) == {false, true, false, :backing_off, :restarting}
+      assert attempts(app) == 1
+      assert actions(sys, @watched) == @start ++ [:remove]
+      assert verdict(advance(sys, @watched, 10_000)) == @ready
+    end
+  end
+
   defmodule Gate do
     @moduledoc """
     Attached to the App kind as a controller that registers an instance
@@ -720,7 +1234,7 @@ defmodule Vagus.App.Controller.ScenarioTest do
     register = fn sys, id ->
       put_fact(sys, {:registered, @plain}, id)
       :ok = Vagus.Resource.Runtime.enqueue(Gate, @plain, sys.i)
-      _info = Vagus.Resource.Runtime.info(Gate, sys.i)
+      AppWorld.heard(sys, Gate)
       settle(sys)
       get(sys, @plain)
     end
@@ -728,6 +1242,7 @@ defmodule Vagus.App.Controller.ScenarioTest do
     Faults.each_boundary(
       system: system,
       normalize: &AppWorld.normalize/1,
+      journal: &AppWorld.journal/1,
       scenario: fn sys ->
         engine = AppWorld.engine(world, sys)
         app = install(world, sys, @plain, %{run: true})
@@ -877,6 +1392,17 @@ defmodule Vagus.App.Controller.ScenarioTest do
       assert verdict(app) == {false, false, true, :crash_loop, :failed}
       assert %{state: "running", restart_count: 3} = Model.container(engine, "homeassistant")
       assert tail(actions(sys, "homeassistant"), 2) == [:put_token, :start]
+
+      # Failed, and running all the same: a token table that is replaced
+      # gets its token back, and nothing else is done to it.
+      index = Process.whereis(AuthIndex.name(sys.instance))
+      TestInstance.kill_observed(index, Process.whereis(Module.concat(sys.instance, Supervisor)))
+      settle(sys)
+      await!(sys, :app, "homeassistant", :failed)
+      settle(sys)
+      assert AuthIndex.lookup("the-supervisor-token", sys.i) == {:ok, "homeassistant"}
+      assert verdict(get(sys, "homeassistant")) == {false, false, true, :crash_loop, :failed}
+      assert tail(actions(sys, "homeassistant"), 3) == [:put_token, :start, :put_token]
     end)
   end
 end

@@ -364,9 +364,11 @@ defmodule Vagus.App.Controller.View do
 
   defp retry_in(_none, _now), do: 0
 
+  # A count below one is none this controller writes. Status is read as it
+  # is found, and a pass that raised on it would raise again every time.
   defp retry_delay(count) do
     {base, max} = @retry_ms
-    min(base * Integer.pow(2, min(count - 1, 20)), max)
+    min(base * Integer.pow(2, count |> Kernel.-(1) |> max(0) |> min(20)), max)
   end
 
   defp probe(probe, result, _watched?, now) when result in [:healthy, :unhealthy, :skipped],

@@ -5,6 +5,22 @@ defmodule Vagus.Test.AppWorld do
   a data root in a temporary directory, a probe the test answers for, and
   the harness's clock in the pull worker too.
 
+  ## The journal
+
+  What was done for an app is what the things done to say, never the
+  controller: the engine's requests as they arrived there, the calls the
+  token table and the pull worker handled, the children the native
+  supervisor was asked to start and end, and an app's data directory going
+  away. Each tells the harness's world as it happens, in a call, so the
+  journal is in the order things were done. An action that never reached
+  any of them, a create whose preparation failed, is not in it.
+
+  Two entries say more than their action. A start that arrived while the
+  token table did not resolve the container's token to the app is
+  `{:start, :token_unknown}`, and a create that arrived before the app's
+  options were written is `{:create, :unprepared}`: both are looked at
+  where the request lands, at the moment it lands.
+
   `new/1` makes a world, a map of what stays the same across the systems
   started in it; `system/2` is the `Vagus.Resource.Harness.start_system/1`
   options for one. Every system started from them begins with an engine
@@ -15,9 +31,10 @@ defmodule Vagus.Test.AppWorld do
 
   import ExUnit.Assertions
 
-  alias Vagus.App.{AuthIndex, Backend, Controller, EngineObserver, Facts, Pulls}
+  alias Vagus.App.{AuthIndex, Backend, Controller, EngineObserver, Facts, Prepare, Pulls}
+  alias Vagus.App.Container.Config
   alias Vagus.Resource.{Harness, Runtime, Store, TestClock}
-  alias Vagus.Test.{AppManifests, FakeEngine}
+  alias Vagus.Test.{AppManifests, FakeEngine, Recording}
   alias Vagus.Test.FakeEngine.Model
 
   @doc """
@@ -48,16 +65,14 @@ defmodule Vagus.Test.AppWorld do
       seed: Keyword.get(opts, :seed, fn _engine -> :ok end),
       before: Keyword.get(opts, :before, fn -> :ok end),
       boot_marker: Keyword.get(opts, :boot_marker),
-      native: if(Keyword.get(opts, :native, false), do: native(id)),
+      # Port 0: the broker binds whichever port is free at that moment. One
+      # picked here would be anybody's by the time the broker asked for it.
+      native:
+        if(Keyword.get(opts, :native, false),
+          do: %{supervisor: Module.concat(__MODULE__, "Native#{id}"), port: 0}
+        ),
       facts: Facts.read(data_root: Path.join(root, "data"))
     }
-  end
-
-  defp native(id) do
-    {:ok, socket} = :gen_tcp.listen(0, [:binary, active: false])
-    {:ok, port} = :inet.port(socket)
-    :gen_tcp.close(socket)
-    %{supervisor: Module.concat(__MODULE__, "Native#{id}"), port: port}
   end
 
   @doc "`extra` is merged into the options: `:path`, `:observers`, `:resync`, `:context`."
@@ -91,8 +106,7 @@ defmodule Vagus.Test.AppWorld do
       prober: fn _target, _timeout -> probed(probe) end,
       host_address: fn _port -> "127.0.0.1" end,
       supervisor_token: fn -> "the-supervisor-token" end,
-      prepare: [network: fn -> :ok end, dsp_state: fn -> :unsupported end],
-      audit: fn key, action, context -> Harness.record(context, key, action) end
+      prepare: [network: fn -> :ok end, dsp_state: fn -> :unsupported end]
     }
   end
 
@@ -110,32 +124,165 @@ defmodule Vagus.Test.AppWorld do
   defp services(world, instance) do
     File.rm_rf!(world.data)
     world.before.()
-    clock = TestClock.clock(clock(instance))
+    clock = TestClock.clock(sibling(instance, :clock))
+    journal = %{world: sibling(instance, :world)}
+    Harness.put_fact(journal, :data_root, world.data)
+    Harness.put_fact(journal, :facts, world.facts)
+    Harness.put_fact(journal, :socket, world.socket)
 
     native =
-      if world.native,
-        do: [
-          {DynamicSupervisor,
-           name: world.native.supervisor, strategy: :one_for_one, max_restarts: 50, max_seconds: 1}
-        ],
-        else: []
+      if world.native do
+        flags = DynamicSupervisor.init(strategy: :one_for_one, max_restarts: 50, max_seconds: 1)
+        name = world.native.supervisor
+
+        [
+          {Recording,
+           {DynamicSupervisor, {Supervisor.Default, flags, name}, name, &native(journal, &1, &2)}}
+        ]
+      else
+        []
+      end
+
+    [pulls, tasks] =
+      Pulls.child_specs(instance: instance, engine: [socket: world.socket], clock: clock)
 
     [
-      %{id: :engine, start: {__MODULE__, :start_engine, [world]}},
-      {AuthIndex, instance: instance}
+      %{id: :engine, start: {__MODULE__, :start_engine, [world, instance, journal]}},
+      {Recording, {AuthIndex, instance, AuthIndex.name(instance), &token(journal, &1, &2)}}
     ] ++
       native ++
-      Pulls.child_specs(instance: instance, engine: [socket: world.socket], clock: clock) ++
+      [
+        {Recording, {Pulls, elem(pulls, 1), Pulls.name(instance), &pull(journal, &1, &2)}},
+        tasks
+      ] ++
       if(world.boot_marker,
         do: [Vagus.App.Boot.child_spec(instance: instance, marker: world.boot_marker)],
         else: []
       )
   end
 
+  ## What the things done to report
+
+  defp token(journal, {:put, app, _digest}, :ok), do: did(journal, app, :put_token)
+  defp token(journal, {:remove, app}, :ok), do: did(journal, app, :remove_token)
+  defp token(_journal, _request, _reply), do: :ok
+
+  defp pull(journal, {:request, _image, {Controller, app}, _opts}, :ok),
+    do: did(journal, app, :request_pull)
+
+  defp pull(journal, {:cancel, _image, {Controller, app}}, :ok),
+    do: did(journal, app, :cancel_pull)
+
+  defp pull(_journal, _request, _reply), do: :ok
+
+  # The supervisor has no word for whose child it ends, so the pid it gave
+  # each app's start is kept.
+  defp native(journal, {:start_child, {{_module, _start, [opts]}, _, _, _, _}}, reply) do
+    app = opts[:auth][:slug]
+    did(journal, app, :start_process)
+    with {:ok, pid} <- reply, do: Harness.put_fact(journal, {:native, pid}, app)
+  end
+
+  defp native(journal, {:terminate_child, pid}, _reply) do
+    if app = Harness.fact(journal, {:native, pid}), do: did(journal, app, :stop_process)
+  end
+
+  defp native(_journal, _request, _reply), do: :ok
+
+  # Called in the engine, with a request that has arrived and done nothing yet.
+  defp engine(%{method: method, path: path} = entry, containers, instance, journal) do
+    case {method, String.split(path, "/", trim: true)} do
+      {:post, ["containers", "create"]} ->
+        {app, _leftover?} = owner(entry.query["name"])
+        prepared? = File.exists?(Prepare.options_path(app, Harness.fact(journal, :facts)))
+        did(journal, app, if(prepared?, do: :create, else: {:create, :unprepared}))
+
+      {:post, ["containers", name, "start"]} ->
+        {app, _leftover?} = owner(name)
+        known? = AuthIndex.lookup(token_of(containers[name]), instance: instance) == {:ok, app}
+        did(journal, app, if(known?, do: :start, else: {:start, :token_unknown}))
+
+      {:post, ["containers", name, "stop"]} ->
+        {app, leftover?} = owner(name)
+        did(journal, app, if(leftover?, do: :stop_leftover, else: :stop))
+
+      {:delete, ["containers", name]} ->
+        {app, leftover?} = owner(name)
+        did(journal, app, if(leftover?, do: :remove_leftover, else: :remove))
+
+      {:delete, ["images" | reference]} ->
+        did(journal, image_owner(Enum.join(reference, "/"), instance, journal), :remove_image)
+
+      _a_read_or_a_pull ->
+        :ok
+    end
+  end
+
+  defp owner("app_" <> app), do: {app, false}
+  defp owner("addon_" <> app), do: {app, true}
+  defp owner(name), do: {name, false}
+
+  defp token_of(%{env: env}) do
+    Enum.find_value(env, fn
+      "SUPERVISOR_TOKEN=" <> token -> token
+      _other -> nil
+    end)
+  end
+
+  defp token_of(nil), do: nil
+
+  # The request names an image and nobody. The app whose spec asks for that
+  # image is still in the store: its finalizer is what the removal precedes.
+  defp image_owner(image, instance, journal) do
+    facts = Harness.fact(journal, :facts)
+
+    Enum.find_value(Store.list(:app, instance: instance), "?", fn app ->
+      if Config.image(app.spec, facts) == {:ok, image}, do: app.name
+    end)
+  end
+
+  # In one step with the journal's write: a data directory that is gone
+  # since the entry before went before this one was done.
+  defp did(journal, app, action) do
+    Harness.transact(journal, fn facts ->
+      {facts, gone} = swept(facts)
+      {facts, gone ++ [{{Controller, app}, action}]}
+    end)
+  end
+
+  defp swept(%{data_root: root} = facts) do
+    there =
+      case File.ls(Path.join([root, "addons", "data"])) do
+        {:ok, slugs} -> MapSet.new(slugs)
+        {:error, _none} -> MapSet.new()
+      end
+
+    before = Map.get(facts, :data, MapSet.new())
+
+    gone =
+      for slug <- Enum.sort(MapSet.difference(before, there)),
+          do: {{Controller, slug}, :remove_data}
+
+    {Map.put(facts, :data, there), gone}
+  end
+
+  @doc "The journal of a system, oldest first, as `{{controller, app}, action}`."
+  @spec journal(map()) :: [{{module(), String.t()}, term()}]
+  def journal(sys) do
+    Harness.transact(sys, fn facts -> swept(facts) end)
+    Harness.journal(sys)
+  end
+
   @doc "Takes the engine of a running system away, and `engine_up/1` brings one back, seeded."
   @spec engine_down(map()) :: :ok
-  def engine_down(sys),
-    do: Supervisor.terminate_child(Module.concat(sys.instance, Supervisor), :engine)
+  def engine_down(sys) do
+    :ok = Supervisor.terminate_child(Module.concat(sys.instance, Supervisor), :engine)
+    # The engine's socket closes some time after its process has ended, and
+    # a connection made until then is taken and dropped: an engine that
+    # fails, not one that is away. With no file there is nothing to connect to.
+    File.rm(Harness.fact(sys, :socket))
+    :ok
+  end
 
   @spec engine_up(map()) :: :ok
   def engine_up(sys) do
@@ -143,23 +290,28 @@ defmodule Vagus.Test.AppWorld do
     :ok
   end
 
+  @doc "The engine as a child of a system that keeps no journal."
+  def start_engine(world), do: start_engine(world, nil, nil)
+
   @doc false
-  def start_engine(world) do
+  def start_engine(world, instance, journal) do
     # A socket file left by the engine before this one refuses the address.
     File.rm(world.socket)
+    seen = if journal, do: &engine(&1, &2, instance, journal), else: fn _entry, _all -> :ok end
 
-    with {:ok, model} <- Model.start_link(socket: world.socket) do
+    with {:ok, model} <- Model.start_link(socket: world.socket, on_request: seen) do
       world.seed.(%{model: model, socket: world.socket})
       {:ok, model}
     end
   end
 
-  # The harness starts its clock under the test's supervisor, by this id.
-  defp clock(instance) do
+  # The harness starts its clock and its world under the test's supervisor,
+  # by these ids.
+  defp sibling(instance, part) do
     {:ok, supervisor} = ExUnit.fetch_test_supervisor()
 
     Enum.find_value(Supervisor.which_children(supervisor), fn {id, pid, _type, _modules} ->
-      if id == {instance, :clock}, do: pid
+      if id == {instance, part}, do: pid
     end)
   end
 
@@ -229,35 +381,84 @@ defmodule Vagus.Test.AppWorld do
   @spec wake(map(), String.t()) :: Vagus.Resource.t() | nil
   def wake(sys, app) do
     :ok = Runtime.enqueue(Controller, app, sys.i)
-    # A call from here is behind that cast.
-    _info = Runtime.info(Controller, sys.i)
-    Harness.settle(sys)
-    Store.get(:app, app, sys.i)
-  end
-
-  @doc "Moves the clock and delivers the app's pending timer, then waits for rest."
-  @spec advance(map(), String.t(), non_neg_integer()) :: Vagus.Resource.t() | nil
-  def advance(sys, app, ms) do
-    TestClock.advance(sys.clock, ms)
-    Harness.fire_timer(sys, Controller, app)
+    heard(sys, Controller)
     Harness.settle(sys)
     Store.get(:app, app, sys.i)
   end
 
   @doc """
-  Whether the actions performed for an app are `expected`, or `expected`
-  with one of them done twice in a row: what a scenario with several apps
-  may assert of each, since the fault harness may cut one app's action
-  while it interrupts another's pass.
+  Returns once a controller's runtime has read everything this process
+  sent it before: a call from here is behind those messages, and a settle
+  might not be.
+
+  The pass such a message brings may reach the boundary the fault harness
+  kills at before the runtime gets to answer, and the call then exits with
+  the runtime. That is as good an answer: the replacement looks at every
+  resource, which is what the message asked for.
+  """
+  @spec heard(map(), module()) :: :ok
+  def heard(sys, controller) do
+    _info = Runtime.info(controller, sys.i)
+    :ok
+  catch
+    :exit, _killed when sys.faults != nil -> :ok
+  end
+
+  @doc """
+  Moves the clock, delivers the pending timer of every app, and waits for
+  rest. Returns `app`.
+
+  The runtime's timers run on real time and the clock here does not. So a
+  move of the clock is time passing for every app: one whose pause is over
+  by the clock would otherwise go on waiting for as long as the scenario is
+  quicker than its timer, and act only in the run that happened to be slow,
+  or was interrupted and looked at everything again. An app that is not yet
+  due arms its timer anew and writes nothing.
+
+  A timer that fired by itself is no trouble: the runtime takes a timer's
+  message once, whoever sent it. `timers: [app]` delivers only those.
+  """
+  @spec advance(map(), String.t(), non_neg_integer(), keyword()) :: Vagus.Resource.t() | nil
+  def advance(sys, app, ms, opts \\ []) do
+    TestClock.advance(sys.clock, ms)
+    Harness.settle(sys)
+    runtime = Process.whereis(Runtime.name(sys.instance, Controller))
+
+    for {name, %{uid: uid, timer: {_timer, token}}} <- timers(sys, runtime),
+        Keyword.get(opts, :timers, :all) == :all or name in opts[:timers],
+        do: send(runtime, {:requeue, name, uid, token})
+
+    heard(sys, Controller)
+    Harness.settle(sys)
+    Store.get(:app, app, sys.i)
+  end
+
+  # A timer that fired by itself just now may have brought the pass the
+  # fault harness kills at: no timers then, as in `heard/2`.
+  defp timers(sys, runtime) do
+    :sys.get_state(runtime).known
+  catch
+    :exit, _killed when sys.faults != nil -> %{}
+  end
+
+  @doc """
+  Whether the actions performed for an app are `expected`, or, in a run
+  the fault harness has interrupted, `expected` with one of them done twice
+  in a row: what a scenario with several apps may assert of each, since
+  the harness may cut one app's action while it interrupts another's pass.
   """
   @spec acted?(map(), String.t(), [atom()]) :: boolean()
-  def acted?(sys, app, expected),
-    do: Vagus.Resource.Harness.Faults.replay?(expected, actions(sys, app))
+  def acted?(sys, app, expected) do
+    # Only a run that has been interrupted may have done anything twice.
+    cut? = sys.faults != nil and Vagus.Resource.Harness.Faults.report(sys.faults).kill == :done
+    found = actions(sys, app)
+    found == expected or (cut? and Vagus.Resource.Harness.Faults.replay?(expected, found))
+  end
 
-  @doc "The actions asked for on behalf of an app, oldest first, whatever came of them."
-  @spec actions(map(), String.t()) :: [atom()]
+  @doc "What was done for an app, oldest first, whatever came of it. See \"The journal\"."
+  @spec actions(map(), String.t()) :: [term()]
   def actions(sys, app),
-    do: for({{Controller, ^app}, action} <- Harness.journal(sys), do: action)
+    do: for({{Controller, ^app}, action} <- journal(sys), do: action)
 
   @doc "An app's conditions as `{ready, progressing, failed, reason}`, and its state."
   @spec verdict(Vagus.Resource.t()) :: {boolean(), boolean(), boolean(), atom(), atom()}
@@ -270,31 +471,59 @@ defmodule Vagus.Test.AppWorld do
   end
 
   @doc """
-  A final store with everything left out that differs from run to run
-  without meaning anything: instants, and the ids and addresses the engine
-  gives, which count every container it ever made.
+  A final store as two runs of a scenario must leave it: every resource
+  with its spec, its conditions and everything the controller keeps in
+  status. Only what the engine numbers differently from run to run is
+  replaced: it counts every container and event it ever had, so an
+  instance's id is named for where it first appears here, and its address,
+  process and start time are kept as whether there is one. Instants are
+  kept as they are: the clock moves only when the scenario moves it.
   """
   @spec normalize([Vagus.Resource.t()]) :: [map()]
   def normalize(resources) do
+    ids =
+      for %{status: status} <- resources,
+          id <- [get_in(status, [:instance, :id]), status[:expected_exit], status[:recreate]],
+          id != nil,
+          uniq: true,
+          do: id
+
+    names = for {id, n} <- Enum.with_index(ids, 1), into: %{}, do: {id, "instance-#{n}"}
+
     for resource <- resources do
-      status = resource.status
+      {conditions, status} = Map.pop(resource.status, :conditions, %{})
 
       %{
         key: {resource.kind, resource.name},
+        generation: resource.generation,
         spec: resource.spec,
         finalizers: resource.finalizers,
         deleting?: resource.deleting?,
         conditions:
-          for({type, condition} <- Map.get(status, :conditions, %{}), into: %{}) do
-            {type, {condition.status, condition.reason}}
+          for({type, condition} <- conditions, into: %{}) do
+            {type, renamed(Map.delete(condition, :type), names)}
           end,
-        state: status[:state],
-        running?: match?(%{instance: %{running?: true}}, status),
-        attempts: get_in(status, [:restarts, :attempts]),
-        failure: status[:failure] && Map.take(status.failure, [:action, :class, :cause])
+        status: status |> Map.replace_lazy(:instance, &there/1) |> renamed(names)
       }
     end
   end
+
+  defp there(nil), do: nil
+
+  defp there(instance) do
+    Enum.reduce([:address, :process, :started_at], instance, fn key, instance ->
+      Map.replace_lazy(instance, key, &(&1 != nil))
+    end)
+  end
+
+  defp renamed(%_struct{} = term, _names), do: term
+
+  defp renamed(%{} = map, names),
+    do: Map.new(map, fn {key, value} -> {key, renamed(value, names)} end)
+
+  defp renamed(list, names) when is_list(list), do: Enum.map(list, &renamed(&1, names))
+  defp renamed(id, names) when is_map_key(names, id), do: names[id]
+  defp renamed(term, _names), do: term
 
   @doc "A fake engine request log as `{method, path}`, without the reads."
   @spec writes(map()) :: [{atom(), String.t()}]

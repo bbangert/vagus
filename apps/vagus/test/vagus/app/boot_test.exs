@@ -37,7 +37,12 @@ defmodule Vagus.App.BootTest do
 
     {:ok, _core} = Store.create(:app, @core, %{lifecycle: :core, version: "2026.8.0"}, i)
 
-    dir = Path.join(System.tmp_dir!(), "vagus-boot-#{System.unique_integer([:positive])}")
+    dir =
+      Path.join(
+        System.tmp_dir!(),
+        "vagus-boot-#{System.pid()}-#{System.unique_integer([:positive])}"
+      )
+
     on_exit(fn -> File.rm_rf!(dir) end)
 
     %{
@@ -103,6 +108,28 @@ defmodule Vagus.App.BootTest do
 
   test "cut before the commit: the next start makes it", ctx do
     pending(ctx.marker, seen(ctx.i))
+    assert Boot.normalise(ctx.opts) == :done
+    assert runs(ctx.i) == @booted
+    assert Jason.decode!(File.read!(ctx.marker)) == %{"state" => "done"}
+  end
+
+  test "a store that cannot be asked: the start goes on, the marker stays short of done, " <>
+         "and the next start of the boot finishes",
+       ctx do
+    before = runs(ctx.i)
+    name = Store.name(ctx.i[:instance])
+    store = Process.whereis(name)
+
+    # Nobody answers to the store's name: a call to it exits, as one does
+    # whose store stopped over a write or did not answer in time.
+    Process.unregister(name)
+    log = capture_log(fn -> assert Boot.normalise(ctx.opts) == :done end)
+    Process.register(store, name)
+
+    assert log =~ "apps were not set for this boot"
+    assert %{"state" => "pending"} = Jason.decode!(File.read!(ctx.marker))
+    assert runs(ctx.i) == before
+
     assert Boot.normalise(ctx.opts) == :done
     assert runs(ctx.i) == @booted
     assert Jason.decode!(File.read!(ctx.marker)) == %{"state" => "done"}

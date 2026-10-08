@@ -274,6 +274,14 @@ defmodule Vagus.App.AuthIndexTest do
       for n <- 1..3, do: refute(held =~ token(n))
     end
 
+    # A task that fails at once may be gone before it is monitored, and the
+    # monitor then says only that there is no such process.
+    defp watched do
+      receive do
+        :watched -> :ok
+      end
+    end
+
     test "not in what a caller that fails logs, whatever it passed", %{i: i} do
       tasks = start_supervised!(Task.Supervisor)
       Process.flag(:trap_exit, true)
@@ -283,20 +291,24 @@ defmodule Vagus.App.AuthIndexTest do
           for {app, secret} <- [{nil, token(:a)}, {:not_a_name, token(:b)}, {"app", token(:c)}] do
             {:ok, task} =
               Task.Supervisor.start_child(tasks, fn ->
+                watched()
                 # A match that fails, in a function whose arguments are no token.
                 :done = AuthIndex.put(app, secret, i)
               end)
 
             ref = Process.monitor(task)
+            send(task, :watched)
             assert_receive {:DOWN, ^ref, :process, ^task, {{:badmatch, _result}, _stack}}, 2_000
           end
 
           {:ok, task} =
             Task.Supervisor.start_child(tasks, fn ->
+              watched()
               {:ok, :nobody} = AuthIndex.lookup(token(:d), i)
             end)
 
           ref = Process.monitor(task)
+          send(task, :watched)
           assert_receive {:DOWN, ^ref, :process, ^task, {{:badmatch, :error}, _stack}}, 2_000
           Logger.flush()
         end)

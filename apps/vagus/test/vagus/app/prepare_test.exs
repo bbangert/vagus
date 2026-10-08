@@ -18,7 +18,12 @@ defmodule Vagus.App.PrepareTest do
   end
 
   setup do
-    root = Path.join(System.tmp_dir!(), "vagus-prepare-#{System.unique_integer([:positive])}")
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "vagus-prepare-#{System.pid()}-#{System.unique_integer([:positive])}"
+      )
+
     on_exit(fn -> File.rm_rf!(root) end)
     %{old: Path.join(root, "old"), new: Path.join(root, "new")}
   end
@@ -208,6 +213,30 @@ defmodule Vagus.App.PrepareTest do
       assert Prepare.remove_data("only_host_uts", facts) == :ok
       refute Prepare.data?("only_host_uts", facts)
       assert Prepare.remove_data("only_host_uts", facts) == :ok
+    end
+
+    test "data that cannot be removed says what could not be, and is still there", ctx do
+      facts = Facts.read(data_root: ctx.new)
+      dir = Prepare.data_dir("only_host_uts", facts)
+      held = Path.join(dir, "held")
+      File.mkdir_p!(held)
+      File.write!(Path.join(held, "a file"), "x")
+      # Nothing can be taken out of a directory that may not be written to.
+      File.chmod!(held, 0o500)
+      on_exit(fn -> File.chmod(held, 0o700) end)
+
+      if File.rm(Path.join(held, "a file")) == :ok do
+        # Whoever may do anything, root, is refused nothing: there is no
+        # failure to see.
+        :ok
+      else
+        assert {:error, {:remove_data, path, _reason}} =
+                 Prepare.remove_data("only_host_uts", facts)
+
+        assert String.starts_with?(path, dir)
+        assert Prepare.data?("only_host_uts", facts)
+        assert File.exists?(Path.join(held, "a file"))
+      end
     end
 
     test "a slug that names anything but a directory of its own removes nothing", ctx do

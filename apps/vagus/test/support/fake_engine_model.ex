@@ -26,7 +26,9 @@ defmodule Vagus.Test.FakeEngine.Model do
 
   Options: `:stop_delay` (default 0), `:notify`, a process
   told `{:fake_engine, :client_closed, path}` when a client closes a stream
-  that had stalled.
+  that had stalled, and `:on_request`, a function called here with each
+  request as it arrives and the containers as they are then, before the
+  request changes anything: what the engine saw, and in what order.
   """
 
   use GenServer
@@ -48,6 +50,10 @@ defmodule Vagus.Test.FakeEngine.Model do
   """
   def put_container(%{model: model}, name, attrs \\ []),
     do: GenServer.call(model, {:put_container, name, Map.new(attrs)})
+
+  @doc "Takes a container away, with its `destroy` event, as something other than the code under test would."
+  def delete_container(%{model: model}, name),
+    do: GenServer.call(model, {:delete_container, name})
 
   @doc "The model's record of a container, or `nil`."
   def container(%{model: model}, name), do: GenServer.call(model, {:container, name})
@@ -89,11 +95,32 @@ defmodule Vagus.Test.FakeEngine.Model do
   def drop_event_streams(%{model: model}, how \\ :abort),
     do: GenServer.call(model, {:drop_event_streams, how})
 
+  @doc "Returns once an event stream is open: what happens from then on is told to somebody."
+  def await_event_stream(%{model: model}), do: GenServer.call(model, :await_event_stream)
+
   @doc "How many event streams are open."
   def event_streams(%{model: model}), do: GenServer.call(model, :event_streams)
 
   def set(%{model: model}, key, value) when key in [:stop_delay],
     do: GenServer.call(model, {:set, key, value})
+
+  @doc """
+  Has the next request of `method` whose path contains `part` wait, having
+  arrived and changed nothing, until `release/1`. The caller is told
+  `{:fake_engine, :held, entry}` when it has arrived.
+  """
+  def hold(%{model: model}, method, part),
+    do: GenServer.call(model, {:hold, method, part, self()})
+
+  @doc "Lets every held request go on, in the order they arrived."
+  def release(%{model: model}), do: GenServer.call(model, :release)
+
+  @doc """
+  Has every request of `method` whose path contains `part` answered with
+  `status` and `message` instead of being served, until called with `nil`.
+  """
+  def fail(%{model: model}, method, part, answer),
+    do: GenServer.call(model, {:fail, method, part, answer})
 
   ## Server
 
@@ -123,7 +150,12 @@ defmodule Vagus.Test.FakeEngine.Model do
        images: MapSet.new(),
        pulls: %{},
        fail_starts: %{},
+       on_request: Keyword.get(opts, :on_request, fn _entry, _containers -> :ok end),
+       holds: [],
+       held: [],
+       fails: %{},
        streams: [],
+       stream_waiters: [],
        tick: 0,
        listings: 0,
        log: []
@@ -152,7 +184,8 @@ defmodule Vagus.Test.FakeEngine.Model do
     with {:ok, method, path, query, body} <- FakeEngine.read_request(sock) do
       entry = %{method: method, path: path, query: query, body: body}
 
-      case GenServer.call(model, {:request, entry}, 10_000) do
+      # A request the test holds waits here for as long as the test likes.
+      case GenServer.call(model, {:request, entry}, :infinity) do
         {:reply, status, body} ->
           FakeEngine.send_response(sock, status, body)
 
@@ -205,6 +238,11 @@ defmodule Vagus.Test.FakeEngine.Model do
   def handle_call({:put_container, name, attrs}, _from, state) do
     {state, container} = new_container(state, name, attrs)
     {:reply, container.id, put(state, container)}
+  end
+
+  def handle_call({:delete_container, name}, _from, state) do
+    {container, containers} = Map.pop!(state.containers, name)
+    {:reply, :ok, event(%{state | containers: containers}, "destroy", container)}
   end
 
   def handle_call({:container, name}, _from, state),
@@ -268,6 +306,12 @@ defmodule Vagus.Test.FakeEngine.Model do
 
   def handle_call(:event_streams, _from, state), do: {:reply, length(state.streams), state}
 
+  def handle_call(:await_event_stream, from, state) do
+    if state.streams == [],
+      do: {:noreply, %{state | stream_waiters: [from | state.stream_waiters]}},
+      else: {:reply, :ok, state}
+  end
+
   def handle_call({:finish_stop, name}, _from, state) do
     case Map.fetch(state.containers, name) do
       {:ok, %{state: "running"} = container} ->
@@ -286,19 +330,62 @@ defmodule Vagus.Test.FakeEngine.Model do
     end
   end
 
-  def handle_call({:request, entry}, {pid, _tag}, state) do
+  def handle_call({:hold, method, part, tell}, _from, state),
+    do: {:reply, :ok, %{state | holds: state.holds ++ [{method, part, tell}]}}
+
+  def handle_call(:release, _from, state) do
+    state =
+      Enum.reduce(Enum.reverse(state.held), %{state | held: []}, fn {from, entry}, state ->
+        {reply, state} = served(entry, elem(from, 0), state)
+        GenServer.reply(from, reply)
+        state
+      end)
+
+    {:reply, :ok, state}
+  end
+
+  def handle_call({:fail, method, part, answer}, _from, state) do
+    fails =
+      if answer,
+        do: Map.put(state.fails, {method, part}, answer),
+        else: Map.delete(state.fails, {method, part})
+
+    {:reply, :ok, %{state | fails: fails}}
+  end
+
+  def handle_call({:request, entry}, {pid, _tag} = from, state) do
+    state.on_request.(entry, state.containers)
     state = %{state | log: [entry | state.log]}
 
-    {reply, state} =
-      route(entry.method, String.split(entry.path, "/", trim: true), entry, pid, state)
+    case Enum.split_with(state.holds, fn {method, part, _tell} ->
+           entry.method == method and entry.path =~ part
+         end) do
+      {[{_method, _part, tell} | more], others} ->
+        send(tell, {:fake_engine, :held, entry})
+        {:noreply, %{state | holds: more ++ others, held: [{from, entry} | state.held]}}
 
-    reply =
-      case reply do
-        {status, body} when is_integer(status) -> {:reply, status, body}
-        other -> other
+      {[], _holds} ->
+        {reply, state} = served(entry, pid, state)
+        {:reply, reply, state}
+    end
+  end
+
+  defp served(entry, pid, state) do
+    failing =
+      Enum.find_value(state.fails, fn {{method, part}, answer} ->
+        if entry.method == method and entry.path =~ part, do: answer
+      end)
+
+    {reply, state} =
+      case failing do
+        {status, message} -> {{status, %{"message" => message}}, state}
+        nil -> route(entry.method, String.split(entry.path, "/", trim: true), entry, pid, state)
       end
 
-    {:reply, reply, state}
+    case reply do
+      {status, body} when is_integer(status) -> {{:reply, status, body}, state}
+      other -> {other, state}
+    end
   end
 
   ## Routes
@@ -306,7 +393,8 @@ defmodule Vagus.Test.FakeEngine.Model do
   defp route(:get, ["_ping"], _entry, _pid, state), do: {{200, "OK"}, state}
 
   defp route(:get, ["events"], _entry, pid, state) do
-    {:events, %{state | streams: [pid | state.streams]}}
+    for waiter <- state.stream_waiters, do: GenServer.reply(waiter, :ok)
+    {:events, %{state | streams: [pid | state.streams], stream_waiters: []}}
   end
 
   defp route(:get, ["containers", "json"], entry, _pid, state) do

@@ -10,7 +10,10 @@ defmodule Vagus.App.Controller.Observe do
   environment holds the token. It is taken apart in `instance/3`, the first
   thing done with it: the token becomes a state (`Vagus.App.Token.state/4`)
   and the instance that goes on has no environment. Nothing below that
-  function, no observation and no crash report, can carry a token.
+  function, no observation and no crash report, can carry a token. The
+  read and the taking apart run under `Vagus.App.Token.guard/1`: whatever
+  either raises would be reported with the environment it held, so what
+  leaves is that the engine's read failed.
 
   Every read has a bound: the engine's are given `:observe_timeout` as the
   silence they accept, and a probe its own. A read the engine fails or does
@@ -40,8 +43,7 @@ defmodule Vagus.App.Controller.Observe do
     {backend, opts} = profile |> backend(context) |> bounded(context)
     i = [instance: context.instance]
 
-    with {:ok, seen} <- read(backend.observe(profile.container_name(app) || app, opts)),
-         {token, instance} = instance(seen, {profile, spec, app}, context),
+    with {:ok, {token, instance}} <- seen(backend, {profile, spec, app}, opts, context),
          {:ok, leftover} <- leftover(profile, app, instance, context),
          image = image(spec, context),
          # Before the image is asked after: a pull that ends in between has
@@ -88,6 +90,15 @@ defmodule Vagus.App.Controller.Observe do
     timeout = Map.get(context, :observe_timeout, 10_000)
     bound = &Keyword.put_new(&1, :recv_timeout, timeout)
     {module, Keyword.update(opts, :engine, bound.([]), bound)}
+  end
+
+  defp seen(backend, {profile, _spec, app} = whose, opts, context) do
+    read(
+      Token.guard(fn ->
+        with {:ok, seen} <- backend.observe(profile.container_name(app) || app, opts),
+             do: {:ok, instance(seen, whose, context)}
+      end)
+    )
   end
 
   defp read({:ok, seen}), do: {:ok, seen}
@@ -138,14 +149,19 @@ defmodule Vagus.App.Controller.Observe do
     if profile.container_name(app) == "app_" <> app do
       {backend, opts} = profile |> backend(context) |> bounded(context)
 
-      with {:ok, seen} <- read(backend.observe(leftover_name(app), opts)) do
-        {:ok,
-         case seen do
-           :absent -> :absent
-           %{state: state} when state in [:running, :paused, :restarting] -> :running
-           _stopped -> :stopped
-         end}
-      end
+      # Its environment holds the token the other slot gave it.
+      read(
+        Token.guard(fn ->
+          with {:ok, seen} <- backend.observe(leftover_name(app), opts) do
+            {:ok,
+             case seen do
+               :absent -> :absent
+               %{state: state} when state in [:running, :paused, :restarting] -> :running
+               _stopped -> :stopped
+             end}
+          end
+        end)
+      )
     else
       {:ok, :absent}
     end
