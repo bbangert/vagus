@@ -327,7 +327,7 @@ defmodule Vagus.Ingress.WSBridgeTest do
     {:ok, entry} = State.get(slug)
 
     Application.put_env(:vagus, :ingress_target_fun, fn
-      ^slug -> {:ok, {"127.0.0.1", addon_port}}
+      ^slug -> {:ok, {"127.0.0.1", addon_port, false}}
       _other -> {:error, :unknown_slug}
     end)
 

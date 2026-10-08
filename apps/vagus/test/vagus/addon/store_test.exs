@@ -1,6 +1,7 @@
 defmodule Vagus.Addon.StoreTest do
   @moduledoc "P2-T3: the add-on store — catalog building, GenServer, and store views."
-  use ExUnit.Case, async: true
+  # `remove_repository/2`'s in-use guard reads the global `Vagus.Addon.State`.
+  use ExUnit.Case, async: false
 
   import ExUnit.CaptureLog
 
@@ -125,11 +126,11 @@ defmodule Vagus.Addon.StoreTest do
     def fetch(%{url: "https://github.com/example/gone"}), do: {:error, :nxdomain}
   end
 
-  # A `Vagus.Addon.State` entry under `store_slug` — that is the key an
+  # A global `Vagus.Addon.State` entry under `store_slug` — that is the key an
   # installed add-on is really recorded under (`handle_install` rewrites
   # `config.slug` to the store slug), which is what makes the catalog entry's
   # `:repository` field readable as the in-use association.
-  defp install(state_server, store_slug) do
+  defp install(store_slug) do
     {:ok, config} =
       Vagus.Addon.Config.parse(%{
         "name" => "Installed",
@@ -140,7 +141,8 @@ defmodule Vagus.Addon.StoreTest do
         "image" => "x/y"
       })
 
-    :ok = State.put(config, :started, server: state_server)
+    :ok = State.put(config, :started)
+    on_exit(fn -> State.delete(store_slug) end)
   end
 
   test "build_catalog parses each config.yaml into a store-slugged entry" do
@@ -1056,11 +1058,10 @@ defmodule Vagus.Addon.StoreTest do
 
     test "a repository an installed add-on came from is in_use, quoting its source",
          %{path: path} do
-      addon_state = start_supervised!({State, name: nil, persist_path: nil})
-      srv = start_mutable_store(path, addon_state: addon_state)
+      srv = start_mutable_store(path)
 
       assert :ok = Store.add_repository(srv, @awesome)
-      install(addon_state, "#{@awesome_slug}_esphome")
+      install("#{@awesome_slug}_esphome")
 
       assert {:error, {:in_use, @awesome}} = Store.remove_repository(srv, @awesome_slug)
       assert Enum.map(Store.repositories(srv), & &1.slug) == ["core", @awesome_slug]
@@ -1072,11 +1073,10 @@ defmodule Vagus.Addon.StoreTest do
       # The association is the catalog entry's `:repository` field, not the
       # store slug's prefix: `core_mosquitto` is installed from `core` and says
       # nothing about the runtime-added repo.
-      addon_state = start_supervised!({State, name: nil, persist_path: nil})
-      srv = start_mutable_store(path, addon_state: addon_state)
+      srv = start_mutable_store(path)
 
       assert :ok = Store.add_repository(srv, @awesome)
-      install(addon_state, "core_mosquitto")
+      install("core_mosquitto")
 
       assert :ok = Store.remove_repository(srv, @awesome_slug)
     end

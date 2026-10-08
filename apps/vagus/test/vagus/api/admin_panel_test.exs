@@ -153,7 +153,7 @@ defmodule Vagus.API.AdminPanelTest do
 
   defp data(conn), do: Jason.decode!(conn.resp_body)["data"]
 
-  describe "Vagus.Ingress.Panels.list/1" do
+  describe "Vagus.Ingress.Panels.list/0" do
     test "advertises the synthetic panel with the four keys aiohasupervisor requires" do
       entry = Panels.list()["vagus"]
 
@@ -165,11 +165,11 @@ defmodule Vagus.API.AdminPanelTest do
     end
 
     test "still lists real ingress add-ons alongside it" do
-      state = start_state()
       slug = "panel_addon_#{System.unique_integer([:positive])}"
-      :ok = State.put(ingress_config(slug), :started, server: state)
+      :ok = State.put(ingress_config(slug), :started)
+      on_exit(fn -> State.delete(slug) end)
 
-      panels = Panels.list(state)
+      panels = Panels.list()
 
       assert Map.has_key?(panels, slug)
       assert Map.has_key?(panels, "vagus")
@@ -923,10 +923,6 @@ defmodule Vagus.API.AdminPanelTest do
   end
 
   ## Fixtures
-
-  defp start_state do
-    start_supervised!({State, name: nil, persist_path: nil}, id: make_ref())
-  end
 
   defp ingress_config(slug) do
     {:ok, config} =

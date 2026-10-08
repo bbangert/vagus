@@ -30,10 +30,11 @@ defmodule Vagus.API.Router do
 
   require Logger
 
-  alias Vagus.Addon.{Availability, Manager, OptionsSchema, Ports, State, Store, StoreView, Update}
+  alias Vagus.Addon.{Availability, OptionsSchema, Ports, Store, StoreView}
   alias Vagus.Addon.Backend.Native
   alias Vagus.Addon.Store.Assets
   alias Vagus.API.{AdminPanel, Envelope, StaticData, SupervisorOptions, Tiers}
+  alias Vagus.App
   alias Vagus.Backend
   alias Vagus.Backups
   alias Vagus.Core.{ConfigCheck, Lifecycle, TokenStore, Versions}
@@ -580,7 +581,7 @@ defmodule Vagus.API.Router do
 
   # -- Addon coordinator (15 min) -------------------------------------------
 
-  # Backed by `Vagus.Addon.State` (not `StaticData`, unlike most other GETs
+  # Backed by `Vagus.App` (not `StaticData`, unlike most other GETs
   # here) — the installed-addon list a `POST .../install` grows and a
   # `POST .../uninstall` shrinks. Each entry reuses `Vagus.Addon.Info.render/4`
   # (the `GET /addons/{slug}/info` shape, a superset of the wire's
@@ -591,7 +592,7 @@ defmodule Vagus.API.Router do
   # …with three exceptions, stripped in `addon_list_entry/1`: the superset was
   # NOT harmless for `options`, `ingress_entry` and `ingress_url` (audit A7).
   get "/addons" do
-    addons = Enum.map(State.list(), &addon_list_entry/1)
+    addons = Enum.map(App.list(), &addon_list_entry/1)
     Envelope.send_ok(conn, AddonsList.build!(%{addons: addons}))
   end
 
@@ -608,7 +609,7 @@ defmodule Vagus.API.Router do
   # The reserved `vagus` slug is `Vagus.API.AdminPanel`'s synthetic panel,
   # which has no `Vagus.Addon.State` entry to render from. It is matched on
   # the literal URL segment and wins over any add-on that claims the slug —
-  # the same precedence `Vagus.Ingress.Panels.list/1` and
+  # the same precedence `Vagus.Ingress.Panels.list/0` and
   # `Vagus.Ingress.resolve_token/2` apply.
   #
   # The synthetic payload is supervisor-only. Its `ingress_url` embeds the
@@ -638,7 +639,7 @@ defmodule Vagus.API.Router do
 
   defp addon_info(conn, slug, caller) do
     with {:ok, resolved} <- resolve_info_slug(slug, caller),
-         {:ok, %{config: config, state: state} = entry} <- Vagus.Addon.State.get(resolved) do
+         {:ok, %{config: config, state: state} = entry} <- App.info(resolved) do
       # Audit A8 — "User options may contain secrets". The rule lives in
       # `Vagus.API.Tiers` because its false branch is unreachable from here;
       # see that function's doc.
@@ -709,7 +710,7 @@ defmodule Vagus.API.Router do
         # merge, validated — not a file read, so an add-on calling
         # `bashio::config` sees an option saved while it was running rather
         # than the snapshot it booted with.
-        case Vagus.Addon.State.get(caller_slug) do
+        case App.info(caller_slug) do
           {:ok, %{config: config} = entry} ->
             case OptionsSchema.validate(config.schema, live_options(entry)) do
               {:ok, options} ->
@@ -743,9 +744,9 @@ defmodule Vagus.API.Router do
   # Store slug is rewritten onto the parsed config (a store entry's own
   # `config.slug` is the add-on's bare slug, e.g. "mosquitto"; installed
   # add-ons run under the store slug, e.g. "core_mosquitto" — see
-  # `Vagus.Addon.Store`'s moduledoc) before `Manager.install/2` builds the
-  # container spec from it, and before `State.put/3` records it as
-  # installed-but-stopped (a freshly-installed add-on isn't started yet).
+  # `Vagus.Addon.Store`'s moduledoc) before `App.install/1` builds the
+  # container spec from it and records it as installed-but-stopped (a
+  # freshly-installed add-on isn't started yet).
   post "/store/addons/:slug/install" do
     handle_install(conn, slug)
   end
@@ -780,30 +781,30 @@ defmodule Vagus.API.Router do
   end
 
   post "/addons/:slug/start" do
-    lifecycle_action(conn, slug, &Manager.start_slug/1)
+    lifecycle_action(conn, slug, &App.start/1)
   end
 
   post "/addons/:slug/stop" do
-    lifecycle_action(conn, slug, &Manager.stop/1)
+    lifecycle_action(conn, slug, &App.stop/1)
   end
 
   post "/addons/:slug/restart" do
-    lifecycle_action(conn, slug, &Manager.restart/1)
+    lifecycle_action(conn, slug, &App.restart/1)
   end
 
   # `{"remove_config": bool}` is accepted (Core's `AddonsOptions`/uninstall
   # payload) and ignored — this emulator has no separate "keep config"
   # retention to honor; `Manager.uninstall/2` always purges the data dir.
   post "/addons/:slug/uninstall" do
-    lifecycle_action(conn, slug, &Manager.uninstall/1)
+    lifecycle_action(conn, slug, &App.uninstall/1)
   end
 
   # `POST /addons/{slug}/options` (SCHEMA_OPTIONS). Implements three keys:
   # `options` (`null` resets to no user options, a map is validated against
   # the add-on's schema — merged over its config defaults, mirroring what
   # `Manager.start/2` would write — and, only if valid, stored raw via
-  # `State.put_options/2`), `watchdog`, and `ingress_panel` (both booleans,
-  # persisted via `State.put_setting/3` — §B3.1/§B8 of
+  # `App.set/2`), `watchdog`, and `ingress_panel` (both booleans,
+  # persisted via `App.set/2` — §B3.1/§B8 of
   # `docs/contract-2026.7-m4b-ingress-watchdog.md`; the real Supervisor sets
   # both from this same handler, sharing `SCHEMA_OPTIONS`). Other
   # SCHEMA_OPTIONS keys (`boot`, `auto_update`, …) aren't modeled yet;
@@ -991,7 +992,7 @@ defmodule Vagus.API.Router do
   # Polled by hassio's addon_panel setup at every Core boot (observed on
   # device 2026-07-20: 404 here logs "Can't read panel info: not found").
   # Raw-dict path in Core (no aiohasupervisor model) — `data["panels"]` is a
-  # map of addon-slug → panel config. Backed by `Vagus.Ingress.Panels.list/1`
+  # map of addon-slug → panel config. Backed by `Vagus.Ingress.Panels.list/0`
   # (IW-P2-T3; §B4.1) — one entry per installed ingress-capable add-on,
   # `enable` reflecting its `ingress_panel` toggle. §B1.4 explicitly does NOT
   # put this route in the ingress-proxy's no-security-check bypass — that
@@ -1003,7 +1004,7 @@ defmodule Vagus.API.Router do
   # (`security.py` L129-158), so this falls through to `role_access[admin]`.
   # `Vagus.API.Tiers`' catch-all is that fallthrough, which is why there is no
   # entry for the route in its table and no guard here. The body carries no
-  # secrets — `Vagus.Ingress.Panels.list/1` emits title/icon/admin/enable only
+  # secrets — `Vagus.Ingress.Panels.list/0` emits title/icon/admin/enable only
   # — but serving every installed add-on an inventory of the others is still a
   # disclosure upstream does not make.
   get "/ingress/panels" do
@@ -2391,7 +2392,7 @@ defmodule Vagus.API.Router do
   # renders the whole catalog, so asking twice per entry doubles the
   # synchronous GenServer calls on the widest read path in the API.
   defp installed_entry(store_slug) do
-    case State.get(store_slug) do
+    case App.info(store_slug) do
       {:ok, entry} -> entry
       :error -> nil
     end
@@ -2666,9 +2667,8 @@ defmodule Vagus.API.Router do
   end
 
   defp do_install(conn, config) do
-    case Manager.install(config) do
+    case App.install(config) do
       :ok ->
-        :ok = State.put(config, :stopped)
         Envelope.send_ok(conn, %{})
 
       {:error, reason} ->
@@ -2720,12 +2720,12 @@ defmodule Vagus.API.Router do
     if background?(conn) do
       result =
         start_job_task(job, fn ->
-          finish_addon_update_job(job, slug, Update.update(slug, opts))
+          finish_addon_update_job(job, slug, App.update(slug, opts))
         end)
 
       send_job_task_result(conn, job, result)
     else
-      result = run_with_job(job, fn -> Update.update(slug, opts) end)
+      result = run_with_job(job, fn -> App.update(slug, opts) end)
       finish_addon_update_job(job, slug, result)
       send_update_result(conn, slug, result)
     end
@@ -2833,7 +2833,7 @@ defmodule Vagus.API.Router do
   defp handle_addon_options(conn, slug) do
     case resolve_info_slug(slug, conn.assigns.caller) do
       {:ok, resolved} ->
-        case State.get(resolved) do
+        case App.info(resolved) do
           :error ->
             Envelope.send_error(conn, "Addon #{resolved} does not exist", 404)
 
@@ -2850,7 +2850,7 @@ defmodule Vagus.API.Router do
   # of that route, so anything it would reject must be rejected here too.
   defp handle_addon_options_validate(conn, slug) do
     if conn.assigns.caller == :supervisor do
-      case State.get(slug) do
+      case App.info(slug) do
         :error ->
           Envelope.send_error(conn, "Addon #{slug} does not exist", 404)
 
@@ -2881,19 +2881,17 @@ defmodule Vagus.API.Router do
   # until the caller restarts it.
   defp handle_addon_security(conn, slug) do
     supervisor_only(conn, fn ->
-      case State.get(slug) do
-        :error ->
-          Envelope.send_error(conn, "Addon #{slug} does not exist", 404)
+      if App.installed?(slug) do
+        case validate_protected_key(conn.body_params) do
+          {:ok, action} ->
+            apply_protected_action(slug, action)
+            Envelope.send_ok(conn, %{})
 
-        {:ok, _entry} ->
-          case validate_protected_key(conn.body_params) do
-            {:ok, action} ->
-              apply_protected_action(slug, action)
-              Envelope.send_ok(conn, %{})
-
-            {:error, message} ->
-              Envelope.send_error(conn, message, 400)
-          end
+          {:error, message} ->
+            Envelope.send_error(conn, message, 400)
+        end
+      else
+        Envelope.send_error(conn, "Addon #{slug} does not exist", 404)
       end
     end)
   end
@@ -2910,7 +2908,7 @@ defmodule Vagus.API.Router do
   end
 
   defp apply_protected_action(_slug, :none), do: :ok
-  defp apply_protected_action(slug, {:set, value}), do: State.put_setting(slug, :protected, value)
+  defp apply_protected_action(slug, {:set, value}), do: App.set(slug, protected: value)
 
   # Deliberately routed through the very same `OptionsSchema.effective/3` call
   # the save path uses (`validate_options_key/2`), so the dry run and the real
@@ -2981,8 +2979,8 @@ defmodule Vagus.API.Router do
   end
 
   defp apply_options_action(_slug, :none), do: :ok
-  defp apply_options_action(slug, :reset), do: State.put_options(slug, %{})
-  defp apply_options_action(slug, {:set, options}), do: State.put_options(slug, options)
+  defp apply_options_action(slug, :reset), do: App.set(slug, options: %{})
+  defp apply_options_action(slug, {:set, options}), do: App.set(slug, options: options)
 
   # The Network card posts `{"network": {"22/tcp": 2222}}` to this same
   # endpoint. Before this it fell into the accept-and-ignore bucket with the
@@ -3011,8 +3009,8 @@ defmodule Vagus.API.Router do
   end
 
   defp apply_network_action(_slug, :none), do: :ok
-  defp apply_network_action(slug, :reset), do: State.put_setting(slug, :ports, %{})
-  defp apply_network_action(slug, {:set, ports}), do: State.put_setting(slug, :ports, ports)
+  defp apply_network_action(slug, :reset), do: App.set(slug, ports: %{})
+  defp apply_network_action(slug, {:set, ports}), do: App.set(slug, ports: ports)
 
   # `boot` must be `"auto"` or `"manual"` when present (upstream's
   # `SCHEMA_OPTIONS` coerces it to the 2-value `AppBoot` enum — `manual_only`
@@ -3038,7 +3036,7 @@ defmodule Vagus.API.Router do
   end
 
   defp apply_boot_action(_slug, :none), do: :ok
-  defp apply_boot_action(slug, {:set, value}), do: State.put_setting(slug, :boot, value)
+  defp apply_boot_action(slug, {:set, value}), do: App.set(slug, boot: value)
 
   # `auto_update` must be a boolean when present; no key at all is a no-op.
   # Persisted and reported honestly (`Vagus.Addon.Info.render/4`) — Vagus has
@@ -3054,7 +3052,7 @@ defmodule Vagus.API.Router do
   defp apply_auto_update_action(_slug, :none), do: :ok
 
   defp apply_auto_update_action(slug, {:set, value}),
-    do: State.put_setting(slug, :auto_update, value)
+    do: App.set(slug, auto_update: value)
 
   # `watchdog` must be a boolean when present; no key at all is a no-op.
   defp validate_watchdog_key(body) do
@@ -3083,7 +3081,7 @@ defmodule Vagus.API.Router do
   end
 
   defp apply_watchdog_action(slug, _config, {:set, value}) do
-    :ok = State.put_setting(slug, :watchdog, value)
+    :ok = App.set(slug, watchdog: value)
   end
 
   # `ingress_panel` must be a boolean when present; no key at all is a no-op.
@@ -3101,7 +3099,7 @@ defmodule Vagus.API.Router do
   defp apply_ingress_panel_action(_slug, :none), do: :ok
 
   defp apply_ingress_panel_action(slug, {:set, value}) do
-    :ok = State.put_setting(slug, :ingress_panel, value)
+    :ok = App.set(slug, ingress_panel: value)
 
     # §B4.4: real Supervisor `await`s `sys_ingress.update_hass_panel(app)`
     # inside this same request. Ours fire-and-forgets (the default async
@@ -3528,7 +3526,7 @@ defmodule Vagus.API.Router do
   defp resolve_create_addon_slugs(params) do
     case Map.get(params, "addons") do
       "ALL" ->
-        {:ok, Enum.map(State.list(), & &1.config.slug)}
+        {:ok, App.slugs()}
 
       list when is_list(list) ->
         if Enum.all?(list, &is_binary/1),

@@ -147,7 +147,7 @@ defmodule Vagus.API.CoreProxy do
 
   import Plug.Conn
 
-  alias Vagus.Addon.Registry
+  alias Vagus.App
   alias Vagus.Core.{Client, Health, Transport}
 
   @finch Vagus.API.CoreProxy.Finch
@@ -338,17 +338,10 @@ defmodule Vagus.API.CoreProxy do
     end
   end
 
-  # Registry may be absent in narrow test setups — same guard
-  # `Vagus.API.Auth.addon_identity/1` uses: treat as "no add-on tokens", not a
-  # crash.
   defp resolve_addon(token) do
-    if Process.whereis(Registry) do
-      case Registry.identity_for_token(token) do
-        {:ok, identity} -> {:ok, identity}
-        :error -> {:error, :unauthorized}
-      end
-    else
-      {:error, :unauthorized}
+    case App.identity_for_token(token) do
+      {:ok, identity} -> {:ok, identity}
+      :error -> {:error, :unauthorized}
     end
   end
 

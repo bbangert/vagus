@@ -3,18 +3,18 @@ defmodule Vagus.Ingress.Panels do
   Ingress sidebar panel listing + the push-to-Core notification
   (`docs/contract-2026.7-m4b-ingress-watchdog.md` §B4). A plain, process-free
   module — unlike `Vagus.Ingress` (sessions/dynamic ports), there's no state
-  to own here: `list/1` reads straight from `Vagus.Addon.State`, and
+  to own here: `list/0` reads straight from `Vagus.App`, and
   `update_hass_panel/2` is a stateless fire-and-forget side effect.
 
   ## `GET /ingress/panels` (§B4.1)
 
-  `list/1` returns one entry per **installed add-on with `config.ingress ==
+  `list/0` returns one entry per **installed add-on with `config.ingress ==
   true`** — every ingress-capable add-on, not just ones currently toggled on;
   `"enable"` reflects the per-install `ingress_panel` toggle and is present
   (`false`) even for an ingress add-on whose panel isn't enabled.
 
   Plus `Vagus.API.AdminPanel`'s synthetic `vagus` entry, which has no add-on
-  behind it and so is merged in independently of `Vagus.Addon.State`.
+  behind it and so is merged in independently of the installed apps.
 
   All four keys (`title`/`icon`/`admin`/`enable`) must be present on every
   entry: `aiohasupervisor` parses this response with a strict model, and one
@@ -39,15 +39,14 @@ defmodule Vagus.Ingress.Panels do
   a few milliseconds after the response already went out changes nothing
   observable to Core.
 
-  An unknown slug (no `Vagus.Addon.State` entry) resolves to a DELETE push —
+  An unknown slug (not installed) resolves to a DELETE push —
   this is what lets `Vagus.Addon.Manager.uninstall/2` call this *after* the
-  `State` entry has already been purged and still get the right verb,
+  entry has already been purged and still get the right verb,
   mirroring upstream forcing `ingress_panel = false` + pushing on uninstall.
   """
 
   require Logger
 
-  alias Vagus.Addon.State
   alias Vagus.API.AdminPanel
   alias Vagus.Core.Client
 
@@ -59,10 +58,9 @@ defmodule Vagus.Ingress.Panels do
   `Vagus.API.AdminPanel`'s synthetic entry. `panel_title` falls back to the
   add-on's `name` when unset.
   """
-  @spec list(GenServer.server()) :: %{String.t() => map()}
-  def list(state_server \\ State) do
-    state_server
-    |> State.list()
+  @spec list() :: %{String.t() => map()}
+  def list do
+    Vagus.App.list()
     |> Enum.filter(fn %{config: config} -> config.ingress end)
     |> Map.new(fn %{config: config, ingress_panel: ingress_panel} ->
       {config.slug,
@@ -88,8 +86,6 @@ defmodule Vagus.Ingress.Panels do
 
   `opts`:
 
-    * `:state` - the `Vagus.Addon.State` server to read `ingress_panel` from
-      (default `Vagus.Addon.State`).
     * `:client` - forwarded as `Vagus.Core.Client.request/3`'s `:server` opt
       (default `Vagus.Core.Client`). When omitted *and* the default-named
       client isn't running (isolated unit tests, a host devcontainer with no
@@ -109,8 +105,7 @@ defmodule Vagus.Ingress.Panels do
   @spec update_hass_panel(String.t(), keyword()) :: :ok
   def update_hass_panel(slug, opts \\ []) do
     if client_available?(opts) do
-      state_server = Keyword.get(opts, :state, State)
-      method = push_method(slug, state_server)
+      method = push_method(slug)
       push = fn -> do_push(method, slug, opts) end
 
       if Keyword.get(opts, :sync, false), do: push.(), else: Task.start(push)
@@ -126,13 +121,13 @@ defmodule Vagus.Ingress.Panels do
     end
   end
 
-  # Defensive: the synthetic panel has no `Vagus.Addon.State` entry, so the
+  # Defensive: the synthetic panel is not an installed app, so the
   # clause below would resolve it to a DELETE and un-register our own
   # sidebar panel if anything ever pushed for this slug.
-  defp push_method(@admin_slug, _state_server), do: :post
+  defp push_method(@admin_slug), do: :post
 
-  defp push_method(slug, state_server) do
-    case State.get(slug, state_server) do
+  defp push_method(slug) do
+    case Vagus.App.info(slug) do
       {:ok, %{ingress_panel: true}} -> :post
       _not_enabled_or_untracked -> :delete
     end

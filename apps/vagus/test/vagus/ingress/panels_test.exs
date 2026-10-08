@@ -11,7 +11,7 @@ defmodule Vagus.Ingress.PanelsTest do
   in production. All push assertions use `sync: true` so the push happens
   inline before the assertion runs, instead of racing a detached `Task`.
   """
-  use ExUnit.Case, async: true
+  use ExUnit.Case, async: false
 
   alias Vagus.Addon.{Config, State}
   alias Vagus.API.AdminPanel
@@ -91,9 +91,12 @@ defmodule Vagus.Ingress.PanelsTest do
     client
   end
 
-  defp start_state(name) do
-    start_supervised!({State, name: name, persist_path: nil})
-    name
+  # The global `Vagus.Addon.State` is what `Panels` reads, hence `async: false`.
+  defp install(config, opts \\ []) do
+    :ok = State.put(config, :started)
+    on_exit(fn -> State.delete(config.slug) end)
+    if Keyword.get(opts, :panel), do: :ok = State.put_setting(config.slug, :ingress_panel, true)
+    :ok
   end
 
   defp ingress_config(slug, opts \\ []) do
@@ -114,18 +117,15 @@ defmodule Vagus.Ingress.PanelsTest do
     config
   end
 
-  describe "list/1 (§B4.1)" do
+  describe "list/0 (§B4.1)" do
     test "one entry per ingress-capable add-on; non-ingress absent; enable reflects the toggle" do
-      state = start_state(:"state_#{System.unique_integer([:positive])}")
-
       enabled =
         ingress_config("core_esphome", panel_title: "ESPHome Dashboard", panel_icon: "mdi:chip")
 
-      :ok = State.put(enabled, :started, server: state)
-      :ok = State.put_setting("core_esphome", :ingress_panel, true, state)
+      install(enabled, panel: true)
 
       disabled = ingress_config("core_other", panel_title: nil)
-      :ok = State.put(disabled, :started, server: state)
+      install(disabled)
       # ingress_panel defaults to false — left untouched.
 
       {:ok, non_ingress} =
@@ -139,9 +139,9 @@ defmodule Vagus.Ingress.PanelsTest do
           "ingress" => false
         })
 
-      :ok = State.put(non_ingress, :started, server: state)
+      install(non_ingress)
 
-      panels = Panels.list(state)
+      panels = Panels.list()
 
       # `vagus` is `Vagus.API.AdminPanel`'s synthetic entry, merged in
       # independently of `State` — see `Vagus.API.AdminPanelTest` for its
@@ -165,8 +165,7 @@ defmodule Vagus.Ingress.PanelsTest do
     end
 
     test "only the synthetic admin panel when no add-ons are installed" do
-      state = start_state(:"state_#{System.unique_integer([:positive])}")
-      assert Panels.list(state) == %{"vagus" => AdminPanel.panel_entry()}
+      assert Panels.list() == %{"vagus" => AdminPanel.panel_entry()}
     end
   end
 
@@ -174,14 +173,10 @@ defmodule Vagus.Ingress.PanelsTest do
     test "POSTs when ingress_panel is true" do
       base_url = start_fake_core(self())
       client = start_client(base_url)
-      state = start_state(:"state_#{System.unique_integer([:positive])}")
-
-      config = ingress_config("core_esphome")
-      :ok = State.put(config, :started, server: state)
-      :ok = State.put_setting("core_esphome", :ingress_panel, true, state)
+      install(ingress_config("core_esphome"), panel: true)
 
       assert :ok =
-               Panels.update_hass_panel("core_esphome", state: state, client: client, sync: true)
+               Panels.update_hass_panel("core_esphome", client: client, sync: true)
 
       assert_received {:panel_push, "POST", "core_esphome"}
     end
@@ -189,13 +184,10 @@ defmodule Vagus.Ingress.PanelsTest do
     test "DELETEs when ingress_panel is false" do
       base_url = start_fake_core(self())
       client = start_client(base_url)
-      state = start_state(:"state_#{System.unique_integer([:positive])}")
-
-      config = ingress_config("core_esphome")
-      :ok = State.put(config, :started, server: state)
+      install(ingress_config("core_esphome"))
 
       assert :ok =
-               Panels.update_hass_panel("core_esphome", state: state, client: client, sync: true)
+               Panels.update_hass_panel("core_esphome", client: client, sync: true)
 
       assert_received {:panel_push, "DELETE", "core_esphome"}
     end
@@ -203,11 +195,9 @@ defmodule Vagus.Ingress.PanelsTest do
     test "DELETEs for an unknown/untracked slug (uninstall's after-purge call)" do
       base_url = start_fake_core(self())
       client = start_client(base_url)
-      state = start_state(:"state_#{System.unique_integer([:positive])}")
 
       assert :ok =
                Panels.update_hass_panel("never_installed",
-                 state: state,
                  client: client,
                  sync: true
                )
@@ -216,10 +206,7 @@ defmodule Vagus.Ingress.PanelsTest do
     end
 
     test "an unreachable Core logs a warning and never raises" do
-      state = start_state(:"state_#{System.unique_integer([:positive])}")
-      config = ingress_config("core_esphome")
-      :ok = State.put(config, :started, server: state)
-      :ok = State.put_setting("core_esphome", :ingress_panel, true, state)
+      install(ingress_config("core_esphome"), panel: true)
 
       client = :"unreachable_client_#{System.unique_integer([:positive])}"
       token_store = :"unreachable_token_store_#{System.unique_integer([:positive])}"
@@ -248,7 +235,6 @@ defmodule Vagus.Ingress.PanelsTest do
         ExUnit.CaptureLog.capture_log(fn ->
           assert :ok =
                    Panels.update_hass_panel("core_esphome",
-                     state: state,
                      client: client,
                      sync: true
                    )
@@ -268,13 +254,10 @@ defmodule Vagus.Ingress.PanelsTest do
     # it hits the same `{:error, _}` warning path as the unreachable-Core
     # test above, just via `:no_refresh_token` instead of a connection error.
     test "no :client opt given (falls back to the default-named Client): never crashes" do
-      state = start_state(:"state_#{System.unique_integer([:positive])}")
-      config = ingress_config("core_esphome")
-      :ok = State.put(config, :started, server: state)
-      :ok = State.put_setting("core_esphome", :ingress_panel, true, state)
+      install(ingress_config("core_esphome"), panel: true)
 
       assert Process.whereis(Client)
-      assert :ok = Panels.update_hass_panel("core_esphome", state: state, sync: true)
+      assert :ok = Panels.update_hass_panel("core_esphome", sync: true)
     end
   end
 end

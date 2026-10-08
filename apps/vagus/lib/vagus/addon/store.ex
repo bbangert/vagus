@@ -34,8 +34,7 @@ defmodule Vagus.Addon.Store do
   happen cannot be reported as one.
 
   `remove_repository/2`'s in-use guard reads installed add-ons from
-  `Vagus.Addon.State` — `:addon_state`/`init/1` names the server (default
-  `Vagus.Addon.State`), the same injection point `Vagus.Ingress` uses.
+  `Vagus.App`.
 
   ## Store assets
 
@@ -59,7 +58,7 @@ defmodule Vagus.Addon.Store do
 
   require Logger
 
-  alias Vagus.Addon.{Config, State}
+  alias Vagus.Addon.Config
   alias Vagus.Addon.Store.{AssetMode, Assets, RepositorySpec}
 
   @default_fetcher Vagus.Addon.Store.HTTPFetcher
@@ -494,7 +493,7 @@ defmodule Vagus.Addon.Store do
   # currently fails to fetch, or stopped listing it) has no association to read
   # and so holds nothing back. Honest: nothing in the store claims it either.
   defp unused(context, slug) do
-    installed = State.list(context.addon_state)
+    installed = Vagus.App.list()
 
     if Enum.any?(installed, &installed_from?(&1, slug, context.catalog)) do
       {:error, {:in_use, repository_source(context.repositories, slug)}}
@@ -548,8 +547,6 @@ defmodule Vagus.Addon.Store do
       repositories: configured ++ derive_repositories(persisted_sources),
       path: path,
       persisted_sources: persisted_sources,
-      # Read (caller-side) only by `remove_repository/2`'s in-use guard.
-      addon_state: Keyword.get(opts, :addon_state, State),
       catalog: %{},
       repository_meta: %{},
       assets: Assets.init(mode, opts)
@@ -608,9 +605,9 @@ defmodule Vagus.Addon.Store do
   # Everything `remove_repository/2`'s guards decide from, in ONE call: the
   # repositories, which sources were persisted (i.e. which slugs are removable
   # at all), and — for the in-use guard, which runs in the caller — the catalog
-  # plus the `Vagus.Addon.State` server to resolve installed add-ons against.
+  # to resolve installed add-ons against.
   def handle_call(:removal_context, _from, state) do
-    {:reply, Map.take(state, [:repositories, :persisted_sources, :catalog, :addon_state]), state}
+    {:reply, Map.take(state, [:repositories, :persisted_sources, :catalog]), state}
   end
 
   # The whole mutation: appended to the served list and written to disk in one
