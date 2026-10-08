@@ -66,6 +66,9 @@ defmodule Vagus.App.Controller.Reconcile do
       v.mismatch? ->
         out(v, :failed, :name_mismatch, :failed)
 
+      v.raised? and v.running? and v.token in [:absent, :other] and not v.put_raised? ->
+        act(v, :indexing_token, :starting, :put_token)
+
       v.raised? ->
         out(v, :failed, :crashed, :failed)
 

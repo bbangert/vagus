@@ -1041,8 +1041,8 @@ defmodule Vagus.App.Controller.ScenarioTest do
 
   defmodule Raising do
     @moduledoc """
-    The engine client, with a start (switch at 1) or a remove (2) that
-    raises instead of asking the engine.
+    The engine client, with a start (switch at 1), a remove (2) or a stop
+    (3) that raises instead of asking the engine.
     """
     alias Vagus.Runtime.Docker
 
@@ -1057,7 +1057,8 @@ defmodule Vagus.App.Controller.ScenarioTest do
             remove_image: 2
           ]
           |> Enum.map(fn {function, arity} ->
-            {function, arity, %{start_container: 1, remove_container: 2}[function]}
+            {function, arity,
+             %{start_container: 1, remove_container: 2, stop_container: 3}[function]}
           end) do
       args = Macro.generate_arguments(arity, __MODULE__)
 
@@ -1133,6 +1134,31 @@ defmodule Vagus.App.Controller.ScenarioTest do
       app = write(sys, @plain, [{:inc, [:start_counter]}])
       assert verdict(app) == @stopped
       assert container(engine, @plain) == nil
+    end
+
+    test "a stop that raises leaves the app Failed and running, and its token is still kept",
+         %{world: world, sys: sys, engine: engine, switch: switch} do
+      install(world, sys, @plain, %{run: true})
+      held = token(engine, @plain)
+      :atomics.put(switch, 1, 3)
+
+      app = write(sys, @plain, %{run: false})
+      assert verdict(app) == {false, false, true, :crashed, :failed}
+      assert %{action: :stop, class: :permanent} = app.status.failure
+      assert %{state: "running"} = container(engine, @plain)
+      assert actions(sys, @plain) == @start
+
+      # The token table is replaced: the container still runs and still
+      # calls the API, so its token goes back, and nothing else is done.
+      index = Process.whereis(AuthIndex.name(sys.instance))
+      TestInstance.kill_observed(index, Process.whereis(Module.concat(sys.instance, Supervisor)))
+      settle(sys)
+      await!(sys, :app, @plain, :failed)
+      settle(sys)
+      assert AuthIndex.lookup(held, sys.i) == {:ok, @plain}
+      assert verdict(get(sys, @plain)) == {false, false, true, :crashed, :failed}
+      assert actions(sys, @plain) == @start ++ [:put_token]
+      assert %{state: "running"} = container(engine, @plain)
     end
 
     test "a pull asked for while the pull worker is being replaced is asked for again",
@@ -1367,10 +1393,16 @@ defmodule Vagus.App.Controller.ScenarioTest do
     @impl true
     def owned_conditions, do: [:dns_ready]
 
+    # Away while the test says so: it has yet to look, and says nothing.
     @impl true
-    def observe(%{name: name}, context), do: Harness.fact(context, {:registered, name})
+    def observe(%{name: name}, context) do
+      if Harness.fact(context, :gate_away),
+        do: {:unavailable, :away},
+        else: Harness.fact(context, {:registered, name})
+    end
 
     @impl true
+    def reconcile(_app, {:unavailable, :away}), do: {:no_verdict, []}
     def reconcile(_app, nil), do: {Verdict.new(dns_ready: {false, :unregistered}), []}
     def reconcile(_app, id), do: {Verdict.new(dns_ready: {true, :registered, id}), []}
 
@@ -1414,6 +1446,21 @@ defmodule Vagus.App.Controller.ScenarioTest do
         assert Controller.wire_state(app) == :startup
 
         assert verdict(register.(sys, second)) == @ready
+
+        # A write that keeps the instance: the gate's word is of the spec
+        # before it until the gate's owner has looked at the new one.
+        put_fact(sys, :gate_away, true)
+        app = write(sys, @plain, %{settings: %{protected: false}})
+        assert %{id: ^second, state: "running"} = container(engine, @plain)
+        assert %{status: true, message: ^second} = stale = app.status.conditions.dns_ready
+        assert stale.observed_generation < app.generation
+        assert verdict(app) == {false, true, false, :waiting_for_gate, :starting}
+        assert Controller.wire_state(app) == :startup
+
+        put_fact(sys, :gate_away, false)
+        app = register.(sys, second)
+        assert app.status.conditions.dns_ready.observed_generation == app.generation
+        assert verdict(app) == @ready
       end
     )
   end

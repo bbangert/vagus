@@ -881,6 +881,7 @@ defmodule Vagus.Test.AppRows do
   @clauses [
     :mismatch_deleted,
     :name_mismatch,
+    :restore_token_raised,
     :raised,
     :stop_leftover,
     :remove_leftover,
@@ -1009,7 +1010,7 @@ defmodule Vagus.Test.AppRows do
         :not_wanted
 
       {:progressing, :indexing_token, :starting, :put_token} ->
-        if(v.running?, do: :restore_token, else: :put_token)
+        restoring(v)
 
       {:idle, :succeeded, :succeeded, nil} ->
         if(v.succeeded?, do: :succeeded_before, else: :succeeded)
@@ -1192,7 +1193,8 @@ defmodule Vagus.Test.AppRows do
           stop_with_the_grace_observed:
             clause not in [:stop, :unhealthy, :crash_loop] or args.grace == inst.grace,
           token_of_this_instance:
-            clause not in [:put_token, :restore_token] or args.instance == id,
+            clause not in [:put_token, :restore_token, :restore_token_raised] or
+              args.instance == id,
           decided_for_this_generation: args == %{} or args.generation == generation
         ],
         not ok?,
@@ -1201,6 +1203,10 @@ defmodule Vagus.Test.AppRows do
 
   # Every clause that reports Failed and no time to look again. One that
   # was Failed before the pass comes first among them in the decision.
+  defp restoring(%{raised?: true}), do: :restore_token_raised
+  defp restoring(%{running?: true}), do: :restore_token
+  defp restoring(_v), do: :put_token
+
   defp failed_clause(_reason, %{raised?: true}), do: :raised
   defp failed_clause(_reason, %{failed?: true}), do: :failed_before
   defp failed_clause(:crash_loop, _v), do: :crash_loop_spent
@@ -1352,6 +1358,25 @@ defmodule Vagus.Test.AppRows do
       {"a leftover's stop that raised keeps the app from being made beside it", app(),
        obs(leftover: :running, failed_action: failed(:stop_leftover, crash)),
        {:failed, :crashed, :failed, :error}, [], %{}},
+      {"a stop that raised left the instance running: its token is put back all the same",
+       app(@container, %{run: false}, status: running(failure: gave_up.(:stop))),
+       obs(instance: inst()), {:progressing, :indexing_token, :starting, :startup},
+       action(:put_token, %{instance: "c1"}), %{failure: gave_up.(:stop)}},
+      {"and with its token there, it is Failed as the stop left it",
+       app(@container, %{run: false}, status: running(failure: gave_up.(:stop))),
+       obs(instance: inst(), token: :current), {:failed, :crashed, :failed, :error}, [],
+       %{failure: gave_up.(:stop)}},
+      {"a token put that raised is not asked for again, though the instance runs without one",
+       app(@container, %{}, status: running(failure: gave_up.(:put_token))),
+       obs(instance: inst()), {:failed, :crashed, :failed, :error}, [],
+       %{failure: gave_up.(:put_token)}},
+      {"order: an app named otherwise than its slug has nothing put, raised action or not",
+       %{app(@container, %{}, status: running(failure: gave_up.(:stop))) | name: "another"},
+       obs(instance: inst()), {:failed, :name_mismatch, :failed, :error}, [], %{}},
+      {"a gate opened for the spec before a write that kept the instance is closed",
+       gated(app(@container, %{}, status: running()), "c1", true, 2),
+       obs(instance: inst(), token: :current, gates: [:dns_ready]),
+       {:progressing, :waiting_for_gate, :starting, :startup}, [], %{}},
       {"deleting: a remove that raised is asked for again, there being no other way on",
        app(@container, %{}, status: running(expected_exit: "c1"), deleting?: true),
        obs(instance: inst(:exited), failed_action: failed(:remove, crash)),
@@ -1533,7 +1558,10 @@ defmodule Vagus.Test.AppRows do
     ]
   end
 
-  defp gated(app, id, open? \\ true) do
-    Resource.put_condition(app, Resource.condition(:dns_ready, open?, :registered, 3, id))
+  defp gated(app, id, open? \\ true, generation \\ 3) do
+    Resource.put_condition(
+      app,
+      Resource.condition(:dns_ready, open?, :registered, generation, id)
+    )
   end
 end

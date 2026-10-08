@@ -157,11 +157,36 @@ defmodule Vagus.App.Controller.ReconcileTest do
   end
 
   describe "wire_state/1" do
-    defp with_status(status, conditions) do
-      Enum.reduce(conditions, Harness.resource(:app, "a", %{}, status: status), fn
-        {type, value}, app ->
-          Resource.put_condition(app, Resource.condition(type, value, :reason, 1))
+    # The conditions as said of generation 1, of a resource at `generation`.
+    defp with_status(status, conditions, generation \\ 1) do
+      app = Harness.resource(:app, "a", %{}, status: status, generation: generation)
+
+      Enum.reduce(conditions, app, fn {type, value}, app ->
+        Resource.put_condition(app, Resource.condition(type, value, :reason, 1))
       end)
+    end
+
+    # After a write to the spec, until the next pass has committed.
+    for {name, status, conditions, wire} <- [
+          {"Ready, said of the spec before a write: the instance runs, and that is all",
+           %{state: :ready, instance: %{running?: true}},
+           [ready: true, progressing: false, failed: false], :startup},
+          {"Failed, said of the spec before a write, the instance running",
+           %{state: :failed, instance: %{running?: true}},
+           [ready: false, progressing: false, failed: true], :startup},
+          {"Failed, said of the spec before a write, with no instance",
+           %{state: :failed, instance: nil}, [ready: false, progressing: false, failed: true],
+           :stopped},
+          {"Failed, said of the spec before a write, its container created and not started",
+           %{state: :failed, instance: %{running?: false}},
+           [ready: false, progressing: false, failed: true], :stopped},
+          {"stopped before a write is stopped after it", %{state: :stopped, instance: nil},
+           [ready: false, progressing: false, failed: false], :stopped}
+        ] do
+      test name do
+        stale = with_status(unquote(Macro.escape(status)), unquote(conditions), 2)
+        assert Controller.wire_state(stale) == unquote(wire)
+      end
     end
 
     for {name, status, conditions, wire} <- [
@@ -764,7 +789,10 @@ defmodule Vagus.App.Controller.ReconcileTest do
           inst = if o.instance != :absent, do: o.instance
 
           if not wanted? do
-            assert action not in [:create, :start, :start_process, :request_pull, :put_token]
+            assert action not in [:create, :start, :start_process, :request_pull]
+            # A token is put for an app not to run only where the action
+            # that should have stopped it raised and left it running.
+            assert action != :put_token or clause == :restore_token_raised
           end
 
           if failed?(verdict), do: assert(action == nil)

@@ -635,8 +635,11 @@ gives the same result.
 **Gates.** The conditions an app waits for after it is ready are data, the
 controller's `:gates`: none unless the wiring lists them, which it does for
 `:dns_ready` once a controller writes it. A gate is open when its condition
-is true and its `message` is the id of the instance that runs now, so one
-left from the instance before opens nothing. An app whose gate stays closed
+is true, its `message` is the id of the instance that runs now, and it was
+written for the spec as it is, so one left from the instance before, or
+from before a write that kept the instance, opens nothing. A runtime
+stamps every condition with the generation its pass read, whoever the
+controller, so a gate's owner has only to look again. An app whose gate stays closed
 is running and not Ready (`startup`), never Failed.
 
 Auth is not a controller. `Vagus.App.AuthIndex` owns the token table, which
@@ -697,7 +700,11 @@ that holds is the pass. In order:
 
 0. An app whose resource name is not its manifest's slug is Failed,
    `name_mismatch`, and nothing is done to it: the container, the data
-   directory and the token row are named for one or the other.
+   directory and the token row are named for one or the other. Then an
+   app one of whose actions raised is Failed, `crashed`, and nothing more
+   is done to it, with one exception before it: an instance that runs
+   and whose token the table lacks has it put, unless the action that
+   raised was that put. An app being deleted is not held up this way.
 1. A container the other firmware slot left under `addon_<slug>` is stopped,
    then removed, whatever the app is to do: it holds the app's ports. It is
    looked for while the app's own container does not run.
@@ -878,6 +885,16 @@ identity for API auth beyond the token row, or push the ingress panel.
 | Failed | `error` |
 | No container running and not Failed (stopped, held, pulling, creating, waiting, succeeded) | `stopped` |
 | Never observed | `unknown` |
+
+Ready and Failed count only when said of the spec as it is: a condition's
+`observed_generation` is the resource's generation. After a write to the
+spec and until the next pass has committed, they are of the generation
+before and read as not said, so the app is `startup` if an instance is
+recorded as running and `stopped` if not. The recorded instance is what
+the last pass saw and is read as it is. So a write that restarts nothing,
+an options change under a Ready app, reads `startup` for the moment
+between the write and the next pass: whatever comes to push wire-state
+changes to Core must not make an event of that.
 
 ## Deletion and collection
 

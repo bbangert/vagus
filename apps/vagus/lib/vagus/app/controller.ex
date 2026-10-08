@@ -231,10 +231,21 @@ defmodule Vagus.App.Controller do
   @doc """
   An app's state on the wire, from its status alone: `:unknown` until a
   pass has observed it.
+
+  Ready and Failed count only as said of the spec as it is. After a write
+  and until the next pass has committed, they are of the generation before
+  and are taken as not said: the app reads `:startup` if an instance is
+  recorded as running and `:stopped` if not. The recorded instance and
+  `state` are what the last pass saw, not a verdict on any spec, and are
+  read as they are.
   """
   @spec wire_state(Resource.t()) :: wire_state()
-  def wire_state(%Resource{status: status} = app) do
-    true? = &match?(%{status: true}, Resource.get_condition(app, &1))
+  def wire_state(%Resource{status: status, generation: generation} = app) do
+    true? =
+      &match?(
+        %{status: true, observed_generation: ^generation},
+        Resource.get_condition(app, &1)
+      )
 
     cond do
       not is_map_key(status, :state) -> :unknown

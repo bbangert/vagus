@@ -262,6 +262,10 @@ defmodule Vagus.App.Controller.View do
       raised?:
         not v.deleting? and match?(%{class: :permanent, cause: :crashed}, base.failure) and
           base.failure.action != :run,
+      # A running instance has its token in the table whatever became of
+      # the app, the action that raised included. Unless that action was
+      # the put: asked for again by every pass, it would raise in every one.
+      put_raised?: match?(%{action: :put_token}, base.failure),
       retry_in: retry_in(base.failure, v.now),
       crash_loop?: v.running? and loop.looping?,
       loop_spent?: loop.spent? or o.image == nil,
@@ -475,10 +479,15 @@ defmodule Vagus.App.Controller.View do
     end
   end
 
-  # A gate is open when its condition is true and names this instance.
+  # A gate is open when its condition is true, names this instance, and was
+  # written for the spec as it is: one from before a write that kept the
+  # instance is its owner's word on a spec it has yet to look at.
   defp open?(_resource, _gate, nil), do: false
 
-  defp open?(resource, gate, id) do
-    match?(%{status: true, message: ^id}, Resource.get_condition(resource, gate))
+  defp open?(%Resource{generation: generation} = resource, gate, id) do
+    match?(
+      %{status: true, message: ^id, observed_generation: ^generation},
+      Resource.get_condition(resource, gate)
+    )
   end
 end
