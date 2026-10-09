@@ -328,16 +328,35 @@ defmodule Vagus.App do
   def uninstall(slug), do: command(slug, :uninstall, %{})
 
   @doc """
-  Pulls the image and records the app installed but `:stopped`. An installed
-  slug is refused by its process before any pull, as upstream does.
+  Pulls the image and records the app installed, wanted `:stopped` unless
+  `wanted: :started` says boot should start it. An installed slug is refused
+  by its process before any pull, as upstream does.
   """
-  @spec install(Config.t()) :: :ok | {:error, :already_installed | term()}
-  def install(%Config{slug: slug} = config) do
+  @spec install(Config.t(), keyword()) :: :ok | {:error, :already_installed | term()}
+  def install(%Config{slug: slug} = config, opts \\ []) do
+    args = %{config: config, wanted: Keyword.get(opts, :wanted, :stopped)}
+
     case Instances.ensure(slug) do
-      {:ok, pid} -> call_op(pid, {:install, %{config: config}})
+      {:ok, pid} -> call_op(pid, {:install, args})
       _not_started -> {:error, :unavailable}
     end
   end
+
+  @doc """
+  Applies the app's boot rule. One halted by a shutdown that did not take the
+  device down is resumed instead, which applies the same rule.
+  """
+  @spec boot_start(String.t()) :: :ok | {:error, term()}
+  def boot_start(slug) do
+    case command(slug, :boot_start, %{}) do
+      {:error, :shutting_down} -> command(slug, :resume, %{})
+      result -> result
+    end
+  end
+
+  @doc "Stops the app's container for a shutdown, keeping what the app wants for the next boot."
+  @spec halt(String.t()) :: :ok | {:error, term()}
+  def halt(slug), do: command(slug, :halt, %{})
 
   @doc """
   Updates `slug` to the store's current version. The pre-update backup runs

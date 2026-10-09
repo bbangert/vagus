@@ -30,14 +30,9 @@ config :vagus, :core_socket_path, nil
 # inject their own tmp marker/store paths.
 config :vagus, :core_port_migration_marker, nil
 
-# Don't start the container-event watchdog during `mix test` — same
-# rationale as :events_enabled; watchdog unit tests start their own
-# instance with injected fakes.
-config :vagus, :watchdog_enabled, false
-
 # Don't start the ingress session store during `mix test` — ingress
 # unit/router tests `start_supervised` their own instance under the default
-# name, which would clash with an app-started one. Mirrors :watchdog_enabled.
+# name, which would clash with an app-started one. Mirrors :events_enabled.
 config :vagus, :ingress_enabled, false
 
 # Don't start the device SSH access key manager during `mix test` — SSH
@@ -92,18 +87,13 @@ config :vagus, :backends, %{
   os: Vagus.Backend.OSMock
 }
 
-# Add-on state stays in-memory (nil disables `Vagus.Addon.State` file
-# persistence). The Orchestrator's boot is off, so the app's own
-# Orchestrator only brings up app processes: tests that boot start their own
-# with injected units. Set here too because under a MIX_TARGET
-# config/target.exs loads first and turns it on.
-config :vagus, :addon_state_path, nil
+# Per-run app files, and no `addons.json` to import. The Orchestrator's boot
+# is off, so the app's own Orchestrator only brings up app processes: tests
+# that boot start their own with injected units. Set here too because under
+# a MIX_TARGET config/target.exs loads first and turns them on.
+config :vagus, :legacy_addons_json, nil
 config :vagus, :app_files_dir, Path.join(System.tmp_dir!(), "vagus-apps-#{System.pid()}")
 config :vagus, Vagus.App.Orchestrator, boot: false, default_native_app: nil
-
-# Per-run tmp dir, set here too because under a MIX_TARGET config/target.exs
-# loads first and would point the suite at the real `/run/vagus`.
-config :vagus, :run_state_dir, Path.join(System.tmp_dir!(), "vagus-run-#{System.pid()}")
 
 # Store assets stay in memory during `mix test` regardless of how much RAM
 # the CI runner or dev box happens to have — `:auto` would make the store's

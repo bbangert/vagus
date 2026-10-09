@@ -33,7 +33,7 @@ defmodule Vagus.Core.Watchdog do
 
   Watchdog-initiated actions are capped at 10 per 30 minutes (upstream
   `const.py:16-19`), a hand-rolled sliding window of action timestamps in
-  the house style (`Vagus.Addon.Watchdog` precedent) — independent of the
+  the house style — independent of the
   probe half's attempt ladder, like upstream's separate mechanisms. The
   die window is cleared whenever the threshold trips (action dispatched,
   or dropped by the limiter), so each rebuild needs 3 *fresh* crashes.
@@ -41,8 +41,7 @@ defmodule Vagus.Core.Watchdog do
   ## Event source
 
   Subscribes to `Vagus.Runtime.Events` (`:events` opt) in `init/1`,
-  tolerating an absent/disabled server the same way `Vagus.Addon.Watchdog`
-  does — `Events` is gated by `:events_enabled` (not target-only), and the
+  tolerating an absent/disabled server — `Events` is gated by `:events_enabled` (not target-only), and the
   probe half must keep working even when the event stream isn't there.
   Also accepts `{:docker_event, event}` sent directly (tests, alternate
   sources) — the message shape is the only contract.
@@ -314,8 +313,7 @@ defmodule Vagus.Core.Watchdog do
     end
   end
 
-  # Same rule as Vagus.Addon.Watchdog: the app's own events server is
-  # expected whenever `:events_enabled` is on.
+  # The app's own events server is expected whenever `:events_enabled` is on.
   defp events_expected?(events),
     do: events == Vagus.Runtime.Events and Application.get_env(:vagus, :events_enabled, true)
 

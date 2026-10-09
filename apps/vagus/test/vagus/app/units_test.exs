@@ -1,39 +1,28 @@
 defmodule Vagus.App.UnitsTest do
-  # `async: false`: `demote` and `want_started` write the shared State.
+  # `async: false`: installed apps are global.
   use ExUnit.Case, async: false
 
-  import Vagus.AppFixtures, only: [app_config: 2, listening_api_port: 0]
+  import ExUnit.CaptureLog
+  import Vagus.AppFixtures, only: [app_config: 2, install_app: 1, listening_api_port: 0]
 
-  alias Vagus.Addon.Backend.Native
-  alias Vagus.Addon.State
   alias Vagus.App.{Gates, Units}
   alias Vagus.Core.EventPusher
 
   @arities %{
+    import: 0,
+    slugs: 0,
     list: 0,
     ensure: 1,
     in_flight?: 0,
     install_default: 1,
-    want_started: 1,
     native?: 1,
-    running?: 1,
-    start: 1,
-    demote: 1,
-    stop: 1,
+    boot_start: 1,
+    halt: 1,
     core_start: 1,
     core_stop: 1,
     report: 2,
     push_complete: 0
   }
-
-  defp installed(slug, attrs \\ %{}) do
-    config = app_config(slug, attrs)
-    :ok = State.put(config, :started)
-    on_exit(fn -> State.delete(slug) end)
-    %{config: config, state: :started}
-  end
-
-  defp slug, do: "units_#{System.unique_integer([:positive])}"
 
   test "every unit is a function of the arity the orchestrator calls it with" do
     units = Units.all()
@@ -59,21 +48,26 @@ defmodule Vagus.App.UnitsTest do
     assert Gates.api() == {:error, :not_accepting}
   end
 
-  test "demote records the app stopped" do
-    slug = slug()
-    entry = installed(slug)
-    assert Units.demote(entry) == :ok
-    assert {:ok, %{state: :stopped}} = State.get(slug)
+  test "an installed default app is present, and is not installed again" do
+    slug = "units_#{System.unique_integer([:positive])}"
+    install_app(app_config(slug, %{}))
+    assert Units.install_default(slug) == :present
   end
 
-  test "want_started records an installed app started, and an unknown one is an error" do
-    slug = slug()
-    %{config: config} = installed(slug)
-    :ok = State.put(config, :stopped)
+  test "an import that raises is logged, not raised" do
+    prev = Application.fetch_env!(:vagus, :legacy_addons_json)
+    dir = Application.fetch_env!(:vagus, :app_files_dir)
+    blocker = Path.join(System.tmp_dir!(), "units_import_#{System.unique_integer([:positive])}")
+    File.write!(blocker, "")
+    Application.put_env(:vagus, :app_files_dir, Path.join(blocker, "apps"))
 
-    assert Units.want_started(slug) == :ok
-    assert {:ok, %{state: :started}} = State.get(slug)
-    assert Units.want_started(slug()) == :error
+    on_exit(fn ->
+      Application.put_env(:vagus, :app_files_dir, dir)
+      Application.put_env(:vagus, :legacy_addons_json, prev)
+      File.rm(blocker)
+    end)
+
+    assert capture_log(fn -> assert Units.import() == :ok end) =~ "Apps not imported"
   end
 
   test "native? holds only for an allowlisted native app" do
@@ -81,21 +75,6 @@ defmodule Vagus.App.UnitsTest do
     assert Units.native?(native)
     refute Units.native?(%{config: %{app_config("other", %{}) | backend: :native}})
     refute Units.native?(%{config: app_config("core_mqtt", %{})})
-  end
-
-  test "running? asks the native backend for a native app" do
-    entry = %{config: %{app_config("core_mqtt", %{}) | backend: :native}}
-    refute Units.running?(entry)
-
-    Process.register(self(), Native.broker_name("addon_core_mqtt"))
-    assert Units.running?(entry)
-  after
-    if Process.whereis(Native.broker_name("addon_core_mqtt")) == self(),
-      do: Process.unregister(Native.broker_name("addon_core_mqtt"))
-  end
-
-  test "running? is :unknown when the backend cannot be asked" do
-    assert Units.running?(%{config: %{app_config("x", %{}) | slug: "a/b"}}) == :unknown
   end
 
   test "push_complete pushes Core the startup complete event" do

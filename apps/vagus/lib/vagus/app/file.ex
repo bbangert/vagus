@@ -123,7 +123,7 @@ defmodule Vagus.App.File do
   rather than leaving a partial set that would count as done.
   """
   @spec import_once(String.t(), String.t() | nil) :: {:ok, :skipped | non_neg_integer()}
-  def import_once(dir \\ dir(), legacy \\ Application.get_env(:vagus, :addon_state_path)) do
+  def import_once(dir \\ dir(), legacy \\ Application.get_env(:vagus, :legacy_addons_json)) do
     if File.dir?(dir), do: {:ok, :skipped}, else: import_legacy(dir, legacy)
   end
 

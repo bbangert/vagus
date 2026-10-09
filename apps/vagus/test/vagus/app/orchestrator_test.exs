@@ -11,54 +11,24 @@ defmodule Vagus.App.OrchestratorTest do
   @moduletag :capture_log
 
   defp app(slug, startup, attrs \\ []) do
-    {boot, attrs} = Keyword.pop(attrs, :boot, "auto")
-    config = app_config(slug, %{"startup" => startup, "boot" => boot})
-
-    Map.merge(
-      %{state: :started, boot: nil, config: config, running: false, native: false},
-      Map.new(attrs)
-    )
+    config = app_config(slug, %{"startup" => startup})
+    Map.merge(%{state: :stopped, config: config, native: false}, Map.new(attrs))
   end
 
   defp gate(test_pid, name), do: fn -> send(test_pid, {:gate, name}) && :ok end
 
   defp units(test_pid, apps, overrides) do
-    report = fn
-      what, %{config: %{slug: slug}} -> send(test_pid, {what, slug}) && :ok
-      what, slug -> send(test_pid, {what, slug}) && :ok
-    end
+    report = fn what, slug -> send(test_pid, {what, slug}) && :ok end
 
     Map.merge(
       %{
+        import: fn -> :ok end,
+        slugs: fn -> Agent.get(apps, &Enum.map(&1, fn a -> a.config.slug end)) end,
         list: fn -> Agent.get(apps, & &1) end,
         install_default: fn _slug -> :present end,
-        want_started: fn slug ->
-          Agent.update(
-            apps,
-            &Enum.map(&1, fn a ->
-              if a.config.slug == slug, do: %{a | state: :started}, else: a
-            end)
-          )
-        end,
         native?: & &1.native,
-        running?: & &1.running,
-        start: fn slug ->
-          Agent.update(
-            apps,
-            &Enum.map(&1, fn a -> if a.config.slug == slug, do: %{a | running: true}, else: a end)
-          )
-
-          report.(:start, slug)
-        end,
-        demote: &report.(:demote, &1),
-        stop: fn slug ->
-          Agent.update(
-            apps,
-            &Enum.map(&1, fn a -> if a.config.slug == slug, do: %{a | running: false}, else: a end)
-          )
-
-          report.(:stop, slug)
-        end,
+        boot_start: &report.(:boot_start, &1),
+        halt: &report.(:halt, &1),
         ensure: fn _slug -> :ok end,
         in_flight?: fn -> false end,
         core_start: fn _deadline -> send(test_pid, :core_start) && :ok end,
@@ -159,20 +129,21 @@ defmodule Vagus.App.OrchestratorTest do
 
     assert collect_until(:complete) == [
              {:gate, :tree},
-             {:start, "broker"},
+             {:boot_start, "broker"},
              {:report, :native, [{"broker", :ready}]},
              {:gate, :engine},
              {:gate, :network},
              {:gate, :api},
-             {:start, "init"},
+             {:boot_start, "init"},
              {:report, :initialize, [{"init", :ready}]},
-             {:start, "sys"},
+             {:boot_start, "sys"},
              {:report, :system, [{"sys", :ready}]},
-             {:start, "svc"},
+             {:boot_start, "svc"},
+             {:boot_start, "broker"},
              {:report, :services, [{"svc", :ready}, {"broker", :ready}]},
              :core_start,
              {:report, :core, [{"core", :ready}]},
-             {:start, "app"},
+             {:boot_start, "app"},
              {:report, :application, [{"app", :ready}]},
              :complete
            ]
@@ -180,34 +151,10 @@ defmodule Vagus.App.OrchestratorTest do
     assert %{phase: :up, task: nil} = await_boot(name)
   end
 
-  for {label, attrs, unit, outcome} <- [
-        {"started, auto, not running starts", [], {:start, "a"}, :ready},
-        {"started, manual, not running is demoted", [boot: "manual"], {:demote, "a"}, :ready},
-        {"started, manual_only is demoted", [boot: "manual_only"], {:demote, "a"}, :ready},
-        {"started, manual, running is left alone", [boot: "manual", running: true], nil, :ready},
-        {"started, manual, running unknown is left alone", [boot: "manual", running: :unknown],
-         nil, :ready},
-        {"started, auto, running unknown starts", [running: :unknown], {:start, "a"}, :ready},
-        {"started, auto, running is left alone", [running: true], nil, :ready},
-        {"started with a manual override is demoted", [boot: "auto", boot_override: "manual"],
-         {:demote, "a"}, :ready},
-        {"stopped is left alone", [state: :stopped], nil, :ready}
-      ] do
-    test "boot rule: #{label}" do
-      attrs = unquote(attrs)
-      {override, attrs} = Keyword.pop(attrs, :boot_override)
-      entry = app("a", "application", attrs) |> Map.put(:boot, override)
-      start_orchestrator([entry])
-
-      messages = collect_until(:complete)
-      assert {:report, :application, [{"a", unquote(outcome)}]} in messages
-      acted = for {what, "a"} = message <- messages, what in [:start, :demote], do: message
-      assert acted == List.wrap(unquote(Macro.escape(unit)))
-    end
-  end
-
   test "an app whose start fails is reported failed and boot carries on" do
-    start_orchestrator([app("a", "application")], %{start: fn _slug -> {:error, :no_image} end})
+    start_orchestrator([app("a", "application")], %{
+      boot_start: fn _slug -> {:error, :no_image} end
+    })
 
     messages = collect_until(:complete)
     assert {:report, :application, [{"a", :failed}]} in messages
@@ -221,7 +168,7 @@ defmodule Vagus.App.OrchestratorTest do
       "slow" -> blocking(test_pid, :slow_started).()
     end
 
-    start_orchestrator([app("once", "once"), app("slow", "services")], %{start: start},
+    start_orchestrator([app("once", "once"), app("slow", "services")], %{boot_start: start},
       stage_timeout: 50
     )
 
@@ -279,7 +226,7 @@ defmodule Vagus.App.OrchestratorTest do
 
         messages = collect_until(:complete)
         assert Enum.count(messages, &(&1 == {:gate, :api})) == 2
-        assert {:start, "a"} in messages
+        assert {:boot_start, "a"} in messages
       end)
 
     assert log =~ "gate api failing after 2 tries"
@@ -293,16 +240,31 @@ defmodule Vagus.App.OrchestratorTest do
     start_orchestrator([broker], %{install_default: install}, default_native_app: "core_mqtt")
 
     messages = collect_until({:gate, :engine})
-    assert [{:install, "core_mqtt"}, {:gate, :tree}, {:start, "core_mqtt"} | _] = messages
+    assert [{:install, "core_mqtt"}, {:gate, :tree}, {:boot_start, "core_mqtt"} | _] = messages
   end
 
-  test "an installed default app the user stopped stays stopped" do
-    broker = app("core_mqtt", "services", native: true, state: :stopped)
-    start_orchestrator([broker], %{}, default_native_app: "core_mqtt")
+  test "an installed default app is not installed again, and boots by its own rule" do
+    test_pid = self()
+    broker = app("core_mqtt", "services", native: true)
+    install = fn slug -> send(test_pid, {:install, slug}) && :present end
+    start_orchestrator([broker], %{install_default: install}, default_native_app: "core_mqtt")
 
     messages = collect_until(:complete)
+    assert {:install, "core_mqtt"} in messages
     assert {:report, :native, [{"core_mqtt", :ready}]} in messages
-    refute {:start, "core_mqtt"} in messages
+  end
+
+  test "a default app that cannot be installed is logged and boot carries on" do
+    log =
+      capture_log(fn ->
+        start_orchestrator([], %{install_default: fn _slug -> {:error, :no_builtin} end},
+          default_native_app: "core_mqtt"
+        )
+
+        assert :complete in collect_until(:complete)
+      end)
+
+    assert log =~ "default app core_mqtt not installed"
   end
 
   test "an absent Core is ready, with a warning" do
@@ -322,7 +284,7 @@ defmodule Vagus.App.OrchestratorTest do
 
     start = fn
       "svc" -> held(test_pid, :svc).()
-      slug -> send(test_pid, {:start, slug}) && :ok
+      slug -> send(test_pid, {:boot_start, slug}) && :ok
     end
 
     apps = [
@@ -330,10 +292,10 @@ defmodule Vagus.App.OrchestratorTest do
       app("once", "once"),
       app("svc", "services"),
       app("idle", "application", state: :stopped),
-      app("broker", "services", native: true, running: true)
+      app("broker", "services", native: true, state: :started)
     ]
 
-    name = start_orchestrator(apps, %{start: start}, stage_timeout: 60_000)
+    name = start_orchestrator(apps, %{boot_start: start}, stage_timeout: 60_000)
     assert_receive {:svc, unit}
     %{task: %Task{pid: boot}} = :sys.get_state(name)
     boot_ref = Process.monitor(boot)
@@ -342,14 +304,14 @@ defmodule Vagus.App.OrchestratorTest do
     await_phase(name, :cancelling)
     send(unit, :release)
 
-    assert Task.await(shutdown) == {{3, 3}, :ok}
+    assert Task.await(shutdown) == {{4, 4}, :ok}
     assert_receive {:DOWN, ^boot_ref, :process, ^boot, :normal}
     messages = drain()
 
     assert [{:svc, :returned} | after_unit] =
              Enum.drop_while(messages, &(&1 != {:svc, :returned}))
 
-    refute Enum.any?(after_unit, &match?({:start, _}, &1))
+    refute Enum.any?(after_unit, &match?({:boot_start, _}, &1))
     refute :core_start in messages
     refute :complete in messages
 
@@ -358,9 +320,9 @@ defmodule Vagus.App.OrchestratorTest do
              &match?({:report, stage, _} when stage in [:core, :application], &1)
            )
 
-    stops = Enum.filter(after_unit, &(match?({:stop, _}, &1) or &1 == :core_stop))
-    assert [first, second, :core_stop, {:stop, "svc"}] = stops
-    assert Enum.sort([first, second]) == [{:stop, "app"}, {:stop, "once"}]
+    stops = Enum.filter(after_unit, &(match?({:halt, _}, &1) or &1 == :core_stop))
+    assert [first, second, third, :core_stop, {:halt, "svc"}] = stops
+    assert Enum.sort([first, second, third]) == [{:halt, "app"}, {:halt, "idle"}, {:halt, "once"}]
     assert %{phase: :stopping} = :sys.get_state(name)
   end
 
@@ -386,7 +348,7 @@ defmodule Vagus.App.OrchestratorTest do
     assert_receive {:DOWN, ^boot_ref, :process, ^boot, :normal}
 
     messages = drain()
-    assert {:stop, "a"} in messages
+    assert {:halt, "a"} in messages
     refute {:gate, :network} in messages
     refute {:gate, :engine} in messages
   end
@@ -396,8 +358,7 @@ defmodule Vagus.App.OrchestratorTest do
 
     list = fn ->
       :counters.add(counter, 1, 1)
-      # The first call is init's; the second is the boot's.
-      if :counters.get(counter, 1) == 2, do: raise("listing failed")
+      if :counters.get(counter, 1) == 1, do: raise("listing failed")
       [app("a", "application")]
     end
 
@@ -408,7 +369,7 @@ defmodule Vagus.App.OrchestratorTest do
     assert_receive {:DOWN, ^ref, :process, ^pid, {:boot_crashed, {%RuntimeError{}, _stack}}},
                    1_000
 
-    assert {:start, "a"} in collect_until(:complete)
+    assert {:boot_start, "a"} in collect_until(:complete)
     assert %{phase: :up} = await_boot(name)
     assert Process.whereis(name) != pid
   end
@@ -418,14 +379,14 @@ defmodule Vagus.App.OrchestratorTest do
 
     name =
       start_orchestrator([app("a", "application")], %{
-        stop: fn _slug -> held(test_pid, :stop).() end
+        halt: fn _slug -> held(test_pid, :halt).() end
       })
 
     collect_until(:complete)
     await_boot(name)
 
     shutdown = Task.async(fn -> Orchestrator.shutdown(name) end)
-    assert_receive {:stop, unit}
+    assert_receive {:halt, unit}
     Orchestrator.resume(name)
     assert %{resume: true} = :sys.get_state(name)
     send(unit, :release)
@@ -456,18 +417,11 @@ defmodule Vagus.App.OrchestratorTest do
     assert {{2, 2}, {:error, :timeout}} = Task.await(shutdown, 2_000)
     assert_received {:core_deadline, deadline}
     assert deadline in 1..250
-    assert_received {:stop, "init"}
+    assert_received {:halt, "init"}
   end
 
   test "a listing that fails still stops Core" do
-    counter = :counters.new(1, [])
-
-    list = fn ->
-      :counters.add(counter, 1, 1)
-      if :counters.get(counter, 1) > 1, do: exit(:state_down), else: []
-    end
-
-    name = start_orchestrator([], %{list: list}, boot: false)
+    name = start_orchestrator([], %{list: fn -> exit(:no_answer) end}, boot: false)
 
     log = capture_log(fn -> assert Orchestrator.shutdown(name) == {{0, 0}, :ok} end)
     assert_received :core_stop
@@ -480,19 +434,19 @@ defmodule Vagus.App.OrchestratorTest do
     name =
       start_orchestrator(
         [app("a", "application")],
-        %{stop: fn _slug -> held(test_pid, :stop).() end},
+        %{halt: fn _slug -> held(test_pid, :halt).() end},
         boot: false
       )
 
     {:ok, _caller} = Task.start(fn -> Orchestrator.shutdown(name) end)
-    assert_receive {:stop, unit}
+    assert_receive {:halt, unit}
     pid = Process.whereis(name)
     ref = Process.monitor(pid)
     Process.exit(pid, :kill)
     assert_receive {:DOWN, ^ref, :process, ^pid, :killed}
 
     send(unit, :release)
-    assert_receive {:stop, :returned}
+    assert_receive {:halt, :returned}
     assert_receive :core_stop
   end
 
@@ -502,7 +456,7 @@ defmodule Vagus.App.OrchestratorTest do
     refute_received {:gate, :tree}
 
     Orchestrator.resume(name)
-    assert {:start, "a"} in collect_until(:complete)
+    assert {:boot_start, "a"} in collect_until(:complete)
   end
 
   test "the tree gate retries on its own short interval" do
@@ -532,16 +486,18 @@ defmodule Vagus.App.OrchestratorTest do
     assert log =~ "gate tree passed"
   end
 
-  test "app processes are ensured through the units, not started for real" do
+  test "apps are imported, then a process ensured per app, through the units" do
     test_pid = self()
     ensure = fn slug -> send(test_pid, {:ensure, slug}) && :ok end
+    import = fn -> send(test_pid, :imported) end
 
-    start_orchestrator([app("a", "application"), app("b", "services")], %{ensure: ensure},
+    start_orchestrator(
+      [app("a", "application"), app("b", "services")],
+      %{ensure: ensure, import: import},
       boot: false
     )
 
-    assert_received {:ensure, "a"}
-    assert_received {:ensure, "b"}
+    assert drain() == [:imported, {:ensure, "a"}, {:ensure, "b"}]
   end
 
   describe "core stage" do
@@ -557,7 +513,7 @@ defmodule Vagus.App.OrchestratorTest do
 
       messages = collect_until(:complete)
       assert {:report, :core, [{"core", :failed}]} in messages
-      assert {:start, "a"} in messages
+      assert {:boot_start, "a"} in messages
     end
 
     test "a hung Core start is carried past at the budget and left running" do
@@ -569,7 +525,7 @@ defmodule Vagus.App.OrchestratorTest do
       assert_receive {:core_starting, unit}
       messages = collect_until(:complete)
       assert {:report, :core, [{"core", :pending}]} in messages
-      assert {:start, "a"} in messages
+      assert {:boot_start, "a"} in messages
       assert Process.alive?(unit)
     end
   end
@@ -580,14 +536,14 @@ defmodule Vagus.App.OrchestratorTest do
     stop = fn
       "bad" -> {:error, :gone}
       "hung" -> blocking(test_pid, :hung).()
-      slug -> send(test_pid, {:stop, slug}) && :ok
+      slug -> send(test_pid, {:halt, slug}) && :ok
     end
 
     apps = [app("bad", "application"), app("hung", "application"), app("good", "application")]
-    name = start_orchestrator(apps, %{stop: stop}, boot: false, app_stop_timeout: 50)
+    name = start_orchestrator(apps, %{halt: stop}, boot: false, app_stop_timeout: 50)
 
     assert Orchestrator.shutdown(name) == {{1, 3}, :ok}
-    assert_received {:stop, "good"}
+    assert_received {:halt, "good"}
     assert_received :core_stop
   end
 
@@ -599,7 +555,7 @@ defmodule Vagus.App.OrchestratorTest do
     assert {{1, 1}, :ok} = Orchestrator.shutdown(name)
     Orchestrator.resume(name)
 
-    assert {:start, "a"} in collect_until(:complete)
+    assert {:boot_start, "a"} in collect_until(:complete)
     assert %{phase: :up} = await_boot(name)
   end
 
@@ -608,34 +564,29 @@ defmodule Vagus.App.OrchestratorTest do
     gates = Map.new([:engine, :network, :api], &{&1, gate(test_pid, &1)})
     gates = Map.put(gates, :tree, blocking(test_pid, :tree))
 
-    list = fn ->
-      send(test_pid, :listed)
-      [app("late", "application")]
-    end
-
-    name = start_orchestrator([], %{gates: gates, list: list}, gate_timeout: 60_000)
+    name = start_orchestrator([], %{gates: gates}, gate_timeout: 60_000)
     assert_receive {:tree, _pid}
-    flush(:listed)
 
     Orchestrator.up("late", name)
     assert %{phase: :booting} = :sys.get_state(name)
-    refute_received :listed
+    refute_received {:boot_start, "late"}
   end
 
   test "an app reported up once boot is over is given its boot rule" do
-    name = start_orchestrator([app("late", "application")], %{running?: fn _entry -> false end})
-    assert {:start, "late"} in collect_until(:complete)
+    name = start_orchestrator([app("late", "application")])
+    assert {:boot_start, "late"} in collect_until(:complete)
     assert %{phase: :up} = await_boot(name)
 
     Orchestrator.up("late", name)
-    assert_receive {:start, "late"}
+    assert_receive {:boot_start, "late"}
   end
 
-  defp flush(message) do
-    receive do
-      ^message -> flush(message)
-    after
-      0 -> :ok
-    end
+  test "with boot off, an app reported up is given no boot rule" do
+    name = start_orchestrator([], %{}, boot: false)
+    assert %{phase: :up} = :sys.get_state(name)
+
+    Orchestrator.up("late", name)
+    _ = :sys.get_state(name)
+    refute_receive {:boot_start, "late"}, 100
   end
 end

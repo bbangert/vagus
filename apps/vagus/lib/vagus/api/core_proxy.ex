@@ -26,16 +26,15 @@ defmodule Vagus.API.CoreProxy do
   resolves it to `:supervisor` or `{:addon, identity}`, and `Vagus.API.Tiers`
   grades the identity's `hassio_role` against the path. Here there is no
   grading and no role lattice: the token must resolve to an **installed
-  add-on** in `Vagus.Addon.Registry`, and that add-on's identity must carry
-  `homeassistant_api: true` (`config.yaml`'s `homeassistant_api:`, plumbed
-  through `Vagus.Addon.Config` since M4 but only reaching
-  `Vagus.Addon.Registry.identity_from_config/1`'s output as of this feature —
-  see that module's moduledoc). Anything else is refused with 401, including
-  a token that resolves fine but lacks the flag.
+  app** through `Vagus.App.identity_for_token/1` (its hash a directory key
+  held by the app's process), and that app's identity must carry
+  `homeassistant_api: true` (`config.yaml`'s `homeassistant_api:`, in
+  `Vagus.App.Policy.identity/1`). Anything else is refused with 401,
+  including a token that resolves fine but lacks the flag.
 
   **The supervisor token is deliberately NOT accepted here** — it simply
-  doesn't resolve in `Vagus.Addon.Registry` (that registry only ever holds
-  add-on tokens), so it falls through to the same 401 as any other unknown
+  doesn't resolve in the directory (which only ever holds app tokens), so it
+  falls through to the same 401 as any other unknown
   token. There is no special-case rejection to get wrong, which is itself the
   point: the one route family where Core's own token — normally the highest
   tier there is — must be refused, and an add-on's token — normally the

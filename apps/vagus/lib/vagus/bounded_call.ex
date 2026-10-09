@@ -1,8 +1,7 @@
 defmodule Vagus.BoundedCall do
   @moduledoc """
   Runs a function in a task with a deadline — the shared shape behind the
-  watchdogs' per-attempt timeouts (`Vagus.Addon.Watchdog`,
-  `Vagus.Addon.Watchdog.Probe`, `Vagus.Core.Watchdog`,
+  Core watchdogs' per-attempt timeouts (`Vagus.Core.Watchdog`,
   `Vagus.Core.Watchdog.Probe`).
 
   The task is linked (`Task.async/1`) on purpose: callers run inside their

@@ -323,6 +323,9 @@ defmodule Vagus.App.PolicyTest do
       assert Policy.boot(app(%{boot: "manual"}), :unknown) == :none
       assert Policy.boot(app(), true) == :none
       assert Policy.boot(app(%{wanted: :stopped}), false) == :none
+      assert Policy.boot(app(%{boot: "manual"}), :adopted) == :start
+      assert Policy.boot(app(), :adopted) == :start
+      assert Policy.boot(app(%{wanted: :stopped}), :adopted) == :none
     end
   end
 

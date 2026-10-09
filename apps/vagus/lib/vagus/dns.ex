@@ -6,9 +6,9 @@ defmodule Vagus.DNS do
   Serves `A` records for the fixed anchors (supervisor/hassio → `.2`,
   homeassistant/home-assistant → gateway `.1`, dns → `.3`, observer → `.6`,
   localhost → `127.0.0.1`), each also under the `.local.hass.io` search suffix,
-  plus per-add-on records (`<slug-with-dashes>`) registered/removed on
-  start/stop. Names we don't own are forwarded verbatim to the configured
-  upstream resolver (`locals`); with no upstream we answer `NXDOMAIN`.
+  plus one record per running app (`<slug-with-dashes>`). Names we don't own
+  are forwarded verbatim to the configured upstream resolver (`locals`); with
+  no upstream we answer `NXDOMAIN`.
 
   Bridged add-ons already get `Dns=[172.30.32.3]` injected into their
   `/etc/resolv.conf` (the Spec builder, P1-T3), so once this server is up they
@@ -18,14 +18,13 @@ defmodule Vagus.DNS do
   Bind address/port and upstream are configurable (`opts`/`config :vagus, :dns_*`)
   so the server is unit-testable on loopback without `CAP_NET_BIND_SERVICE`.
 
-  The per-add-on records are checkpointed to `Vagus.RunState` (`opts[:path]`)
-  and read back in `init/1`, so running add-ons keep their names across a
-  crash here. The checkpoint lives one application run: the directory is
-  wiped at app start and sits on tmpfs, so neither an app restart nor a
-  reboot can revive the address of a container that is gone.
-
-  Only the default-named instance checkpoints unless `:path` is given, so a
-  privately-named one stays memory-only.
+  An app's record is its process's `{:dns, name}` key in
+  `Vagus.App.Directory`, valued with its IP, read on each query: it goes
+  with the process, and this server holds none of it. A running container
+  app has one; a host-network app has none; a native app's is the
+  supervisor's address. An app record wins over an anchor of the same name.
+  `foo_bar` and `foo-bar` share a name, and the directory's unique keys give
+  it to whichever app started first; the second runs without one.
   """
 
   use GenServer
@@ -34,7 +33,6 @@ defmodule Vagus.DNS do
 
   alias Vagus.DNS.Message
   alias Vagus.Network
-  alias Vagus.RunState
 
   @forward_timeout 2_000
   # Cap concurrent upstream relays so a flood of un-owned queries can't exhaust
@@ -46,20 +44,7 @@ defmodule Vagus.DNS do
     GenServer.start_link(__MODULE__, Keyword.put(opts, :name, name), name: name)
   end
 
-  @doc "Registers/updates `hostname` → `ip` (a `{a,b,c,d}` tuple or dotted string)."
-  @spec register(String.t(), :inet.ip4_address() | String.t(), GenServer.server(), timeout()) ::
-          :ok
-  def register(hostname, ip, server \\ __MODULE__, timeout \\ 5_000) do
-    GenServer.call(server, {:register, String.downcase(hostname), to_ip(ip)}, timeout)
-  end
-
-  @doc "Removes a dynamic record."
-  @spec unregister(String.t(), GenServer.server(), timeout()) :: :ok
-  def unregister(hostname, server \\ __MODULE__, timeout \\ 5_000) do
-    GenServer.call(server, {:unregister, String.downcase(hostname)}, timeout)
-  end
-
-  @doc "Resolves `name` against the static + dynamic zone (no forwarding); for tests/inspection."
+  @doc "Resolves `name` against the apps and the anchors (no forwarding); for tests/inspection."
   @spec resolve(String.t(), GenServer.server()) :: {:ok, :inet.ip4_address()} | :error
   def resolve(name, server \\ __MODULE__) do
     GenServer.call(server, {:resolve, String.downcase(name)})
@@ -71,8 +56,6 @@ defmodule Vagus.DNS do
 
   @impl GenServer
   def init(opts) do
-    path = Keyword.get_lazy(opts, :path, fn -> default_path(opts[:name]) end)
-
     # Bind the DNS socket to the `.3` anchor itself (not `0.0.0.0`): a client's
     # stub resolver drops replies whose source IP isn't the server it queried,
     # and only a socket bound to `.3` sources its replies from `.3`. Because
@@ -84,8 +67,7 @@ defmodule Vagus.DNS do
         to_ip(Keyword.get(opts, :ip, Application.get_env(:vagus, :dns_bind_ip, Network.dns_ip()))),
       port: Keyword.get(opts, :port, Application.get_env(:vagus, :dns_port, 53)),
       static: static_zone(),
-      dynamic: load_dynamic(path),
-      path: path,
+      directory: Keyword.get(opts, :directory, Vagus.App.Directory),
       # Monitor ref -> relay pid for each upstream relay in flight; its size
       # is the in-flight count (see forward/4).
       relays: %{},
@@ -96,34 +78,6 @@ defmodule Vagus.DNS do
     }
 
     {:ok, try_bind(state)}
-  end
-
-  defp default_path(__MODULE__), do: RunState.path(:dns)
-  defp default_path(_name), do: nil
-
-  defp load_dynamic(path) do
-    dynamic = RunState.load(path, %{})
-
-    if is_map(dynamic) and not is_struct(dynamic) and Enum.all?(dynamic, &record?/1) do
-      dynamic
-    else
-      Logger.warning("run state #{path} unusable: :wrong_shape")
-      %{}
-    end
-  end
-
-  # A value that is not an address would crash every query for its name, and
-  # be loaded again after each restart.
-  defp record?({host, {a, b, c, d}})
-       when is_binary(host) and is_integer(a) and is_integer(b) and is_integer(c) and
-              is_integer(d),
-       do: true
-
-  defp record?(_other), do: false
-
-  defp put_dynamic(state, dynamic) do
-    RunState.save(state.path, dynamic)
-    %{state | dynamic: dynamic}
   end
 
   defp try_bind(%{ip: ip, port: port} = state) do
@@ -143,14 +97,6 @@ defmodule Vagus.DNS do
   end
 
   @impl GenServer
-  def handle_call({:register, host, ip}, _from, state) do
-    {:reply, :ok, put_dynamic(state, Map.put(state.dynamic, host, ip))}
-  end
-
-  def handle_call({:unregister, host}, _from, state) do
-    {:reply, :ok, put_dynamic(state, Map.delete(state.dynamic, host))}
-  end
-
   def handle_call({:resolve, name}, _from, state) do
     {:reply, lookup(strip_suffix(name), state), state}
   end
@@ -263,11 +209,25 @@ defmodule Vagus.DNS do
   defp reply(nil, _host, _port, _packet), do: :ok
   defp reply(socket, host, port, packet), do: :gen_udp.send(socket, host, port, packet)
 
-  defp lookup(name, %{static: static, dynamic: dynamic}) do
-    case Map.get(dynamic, name) || Map.get(static, name) do
+  defp lookup(name, %{static: static} = state) do
+    case app_ip(name, state.directory) || Map.get(static, name) do
       nil -> :error
       ip -> {:ok, ip}
     end
+  end
+
+  # A value that is not an address must not crash the query, nor shadow an
+  # anchor.
+  defp app_ip(name, directory) do
+    with [{_pid, ip}] when is_binary(ip) <- Registry.lookup(directory, {:dns, name}),
+         {:ok, {_, _, _, _} = address} <- :inet.parse_ipv4strict_address(String.to_charlist(ip)) do
+      address
+    else
+      _ -> nil
+    end
+  rescue
+    # The directory is restarting.
+    ArgumentError -> nil
   end
 
   # Strip the search suffix so `<name>` and `<name>.local.hass.io` both resolve.

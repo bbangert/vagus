@@ -31,8 +31,7 @@ defmodule Vagus.API.Dispatcher do
   `no_security_check` bypass list — only the per-request proxy path
   `/ingress/{token}/.*` is). There is no real collision risk either way: a
   genuine ingress token is a 43-character URL-safe-base64 string
-  (`Vagus.Addon.State`'s `generate_ingress_token/0`, 32 random bytes with no
-  padding), so it can never literally equal one of these three short
+  (32 random bytes, URL-safe base64 with no padding, minted at install), so it can never literally equal one of these three short
   literals.
 
   `rest` may be empty — `GET /ingress/<token>/` arrives as

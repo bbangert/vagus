@@ -138,7 +138,7 @@ defmodule Vagus.Addon.Devices do
   `cgroup_rules/3` skips what it cannot resolve, which is right for an
   author's `devices:` and wrong for these — see `@required_dsp_nodes`. Rule
   building has no error channel and should not grow one, so the question is
-  answered separately and `Vagus.Addon.Manager` refuses the start, beside the
+  answered separately and `Vagus.App.Steps` refuses the start, beside the
   same fail-closed check it already makes for a missing skel.
 
   `:required_dsp_nodes` is injectable for the same reason `cgroup_rules/3`'s

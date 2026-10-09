@@ -606,7 +606,7 @@ defmodule Vagus.API.Router do
   # `bashio::addon.ingress_port` expects (§B3.2 fact 5) — no separate path
   # needed for the self-read case.
   # The reserved `vagus` slug is `Vagus.API.AdminPanel`'s synthetic panel,
-  # which has no `Vagus.Addon.State` entry to render from. It is matched on
+  # which has no app process to render from. It is matched on
   # the literal URL segment and wins over any add-on that claims the slug —
   # the same precedence `Vagus.Ingress.Panels.list/0` and
   # `Vagus.Ingress.resolve_token/2` apply.
@@ -696,7 +696,7 @@ defmodule Vagus.API.Router do
   # `bashio::config`/`bashio::addon.config` fetch this once and cache it. Only
   # `self` is permitted (the real handler 403s any other slug); `self` resolves
   # to the calling add-on. The effective options are exactly what
-  # `Manager.start` wrote to that add-on's `/data/options.json`.
+  # the app's start wrote to its `/data/options.json`.
   get "/addons/:slug/options/config" do
     cond do
       slug != "self" ->
@@ -732,7 +732,7 @@ defmodule Vagus.API.Router do
   #
   # Install/update are supervisor-only (Core drives them from the frontend's
   # addon dashboard) — a non-supervisor caller gets a 403 from
-  # `Vagus.API.Tiers` before any `Manager`/`Store` call. Upstream would admit
+  # `Vagus.API.Tiers` before any app or `Store` call. Upstream would admit
   # `ROLE_MANAGER`; stricter is fine and these keep the tier they shipped
   # with.
   #
@@ -793,7 +793,7 @@ defmodule Vagus.API.Router do
 
   # `{"remove_config": bool}` is accepted (Core's `AddonsOptions`/uninstall
   # payload) and ignored — this emulator has no separate "keep config"
-  # retention to honor; `Manager.uninstall/2` always purges the data dir.
+  # retention to honor; an uninstall always purges the data dir.
   post "/addons/:slug/uninstall" do
     lifecycle_action(conn, slug, &App.uninstall/1)
   end
@@ -801,7 +801,7 @@ defmodule Vagus.API.Router do
   # `POST /addons/{slug}/options` (SCHEMA_OPTIONS). Implements three keys:
   # `options` (`null` resets to no user options, a map is validated against
   # the add-on's schema — merged over its config defaults, mirroring what
-  # `Manager.start/2` would write — and, only if valid, stored raw via
+  # the app's start would write — and, only if valid, stored raw via
   # `App.set/2`), `watchdog`, and `ingress_panel` (both booleans,
   # persisted via `App.set/2` — §B3.1/§B8 of
   # `docs/contract-2026.7-m4b-ingress-watchdog.md`; the real Supervisor sets
@@ -2409,9 +2409,8 @@ defmodule Vagus.API.Router do
   # The version of the locally installed copy, or nil if it isn't installed.
   #
   # An installed entry's `config` is the one captured at install time —
-  # `Vagus.Addon.State` never refreshes it from the store catalog (every
-  # `State.put/3` call site outside install/update passes a config that came
-  # back out of `State`), so `config.version` is the installed version by
+  # an app's process replaces it only by an install or an update, never from
+  # the store catalog, so `config.version` is the installed version by
   # construction, with no second field to keep in sync.
   defp installed_version(nil), do: nil
   defp installed_version(%{config: %{version: version}}), do: version
@@ -2608,7 +2607,7 @@ defmodule Vagus.API.Router do
   # user's saved options merged over them (`App.options` upstream, same
   # deepmerge).
   #
-  # NOT `/data/options.json`. That file is an *output* — `Manager.start/2`
+  # NOT `/data/options.json`. That file is an *output* — the app's start
   # writes it for the container — so reading it back reports whatever the
   # add-on was last started with: the config defaults for an add-on that has
   # never run, and stale values for one whose options changed since. The
@@ -2970,8 +2969,8 @@ defmodule Vagus.API.Router do
   end
 
   # `options: nil` resets to no user options; a map is validated (merged over
-  # the config defaults, mirroring `Manager.start/2`'s own write path) —
-  # stored raw if valid (not the merged/validated result — `start_slug/2`
+  # the config defaults, mirroring the start's own write path) —
+  # stored raw if valid (not the merged/validated result — each start
   # redoes that merge+validate itself against whatever the config looks like
   # at start time). No `options` key at all is a no-op, not an error.
   defp validate_options_key(body, config) do

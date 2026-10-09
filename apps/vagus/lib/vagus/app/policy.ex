@@ -29,11 +29,15 @@ defmodule Vagus.App.Policy do
   running one is left alone, since starting it again would recreate its
   container; a stopped one starts when its effective boot is `auto`, and is
   otherwise recorded `:stopped` so its state stops claiming it runs. When the
-  engine could not be asked (`:unknown`) nothing is demoted.
+  engine could not be asked (`:unknown`) nothing is demoted. A container
+  running under a token no process holds any more (`:adopted`) is started
+  again whatever its boot mode, so it gets one that authenticates.
   """
-  @spec boot(map(), boolean() | :unknown) :: :start | :demote | :none
+  @spec boot(map(), boolean() | :unknown | :adopted) :: :start | :demote | :none
   def boot(%{wanted: wanted, config: config} = data, running?),
     do: boot(%{state: wanted, config: config, boot: data.boot}, running?)
+
+  def boot(%{state: :started}, :adopted), do: :start
 
   def boot(%{state: :started} = entry, running?) when running? in [false, :unknown] do
     cond do
@@ -417,8 +421,8 @@ defmodule Vagus.App.Policy do
   defp ingress_ip(_data), do: {:error, :no_container_ip}
 
   @doc """
-  The app as `Vagus.Addon.State` held it, so `Addon.Info.render` and the
-  router read it unchanged; `state` is the reported state and `wanted` is new.
+  The app's saved facts plus its reported `state`, the shape
+  `Addon.Info.render` and the router read.
   """
   @spec snapshot(map()) :: map()
   def snapshot(data),
@@ -553,7 +557,14 @@ defmodule Vagus.App.Policy do
 
   defp run_step({:commit, _}, %{run: %{op: :install, args: %{config: config}}} = data, effects) do
     token = data.ingress_token || Base.url_encode64(:crypto.strong_rand_bytes(32), padding: false)
-    data = %{data | config: config, ingress_token: token, wanted: :stopped}
+
+    data = %{
+      data
+      | config: config,
+        ingress_token: token,
+        wanted: data.run.args[:wanted] || :stopped
+    }
+
     token_key = Enum.filter(ingress_keys(data), &match?({:ingress_token, _}, &1))
     keys = if token_key == [], do: [], else: [{:keys, token_key, []}]
     advance(data, effects ++ keys ++ [:persist])

@@ -41,7 +41,7 @@ defmodule Vagus.Addon.Backend do
   @callback state(id()) :: {:ok, state()} | {:error, term()}
 
   @doc """
-  Removes an image by ref, once nothing needs it — `Vagus.Addon.Update` calls
+  Removes an image by ref, once nothing needs it — an app update calls
   this after a successful update so the superseded image doesn't sit on the
   data partition forever.
 

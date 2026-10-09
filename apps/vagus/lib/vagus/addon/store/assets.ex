@@ -15,9 +15,9 @@ defmodule Vagus.Addon.Store.Assets do
 
     * `:memory` — an ETS table owned by the `Vagus.Addon.Store` GenServer.
       Dies with it and is rebuilt by the next reload. The default.
-    * `:disk` — `<dirname of :addon_state_path>/store_assets/<repo_slug>/
-      <addon_slug>/<file>`, written tmp+rename per file, mirroring
-      `Vagus.Addon.State`'s write discipline. For boards under 1 GiB, so a
+    * `:disk` — `<dirname of :app_files_dir>/store_assets/<repo_slug>/
+      <addon_slug>/<file>`, written tmp+rename per file, as each app's own
+      file is. For boards under 1 GiB, so a
       large community repository's assets don't sit resident for the life of
       the node.
     * `:none` — retains nothing. `build_catalog/3`'s default, for callers
@@ -152,8 +152,8 @@ defmodule Vagus.Addon.Store.Assets do
   `Vagus.Addon.Store`'s state. Call from the owning process: in `:memory`
   mode the ETS table is owned by (and dies with) the caller.
 
-  `opts[:root]` overrides the disk root, for tests. `:disk` with no
-  resolvable root — no `:addon_state_path` configured, as on `:host` —
+  `opts[:root]` overrides the disk root, for tests (`nil` for none). `:disk` with no
+  resolvable root — no `:app_files_dir` configured —
   degrades to `:memory` with a warning rather than failing to boot the store.
   """
   @spec init(:memory | :disk | :none, keyword()) :: t()
@@ -166,13 +166,13 @@ defmodule Vagus.Addon.Store.Assets do
   end
 
   def init(:disk, opts) do
-    case Keyword.get(opts, :root) || configured_root() do
+    case Keyword.get_lazy(opts, :root, &configured_root/0) do
       root when is_binary(root) ->
         {:disk, root}
 
       nil ->
         Logger.warning(
-          "Vagus.Addon.Store.Assets: :disk mode but no :addon_state_path to anchor " <>
+          "Vagus.Addon.Store.Assets: :disk mode but no :app_files_dir to anchor " <>
             "#{@dir}/ under; retaining assets in memory instead"
         )
 
@@ -217,7 +217,7 @@ defmodule Vagus.Addon.Store.Assets do
     :ok
   end
 
-  # `root` is the configured asset root (derived from `:addon_state_path`),
+  # `root` is the configured asset root (derived from `:app_files_dir`),
   # never request input — and the two slug segments below it are gated by
   # `valid_slug?/1` in `put/4` and then component-checked by `asset_dir/3`.
   # sobelow_skip ["Traversal.FileModule"]
@@ -425,11 +425,11 @@ defmodule Vagus.Addon.Store.Assets do
     end
   end
 
-  # `:store_assets` sits beside `addons.json` rather than under a config key
-  # of its own: both are store/add-on state and neither should be able to
-  # drift onto a different filesystem from the other.
+  # `:store_assets` sits beside the apps' files rather than under a config key
+  # of its own: both are app state and neither should be able to drift onto a
+  # different filesystem from the other.
   defp configured_root do
-    case Application.get_env(:vagus, :addon_state_path) do
+    case Application.get_env(:vagus, :app_files_dir) do
       path when is_binary(path) -> Path.join(Path.dirname(path), @dir)
       _other -> nil
     end

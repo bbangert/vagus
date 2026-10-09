@@ -6,7 +6,7 @@ defmodule Vagus.Core.Lifecycle do
   (`.claude/plans/vagus-core-lifecycle/plan.md` Phase 1, mirroring upstream
   `homeassistant/core.py`/`docker/manager.py` per
   `.claude/plans/vagus-core-lifecycle/research/supervisor-semantics.md`
-  §1-§2/§4). A plain functions module, `Vagus.Addon.Manager` style — no
+  §1-§2/§4). A plain functions module — no
   process, no state of its own; every op reads/writes through
   `Vagus.Runtime.Docker` (the Engine-API client) and `Vagus.Core.Versions`
   (persisted installed version), both injectable per call.
@@ -221,24 +221,18 @@ defmodule Vagus.Core.Lifecycle do
 
   Every public op wraps its body in
   `:global.trans({{:core_lifecycle, Container.name()}, self()}, fun, [node()], 0)`
-  — the same `:global.trans/3`-based local mutex `Vagus.Addon.Manager` uses
-  for its per-slug locks (see that module's "W6" moduledoc section), but
-  with an explicit `retries: 0` and a **single** key (`Container.name()`,
-  not per-op) rather than `Addon.Manager`'s blocking, per-slug lock.
-
-  Two differences from `Addon.Manager`, both deliberate:
+  — a `:global.trans/3`-based local mutex with an explicit `retries: 0` and
+  a **single** key (`Container.name()`, not per-op). Two choices, both
+  deliberate:
 
     * **One key for all ops, not one per op** — there is exactly one Core
       container, so unlike add-ons (many independent slugs that can run
       concurrently) every Core lifecycle op is mutually exclusive with
       every other one: a `stop` racing an in-flight `update`'s
       create/start would be exactly the kind of container/state
-      inconsistency `Addon.Manager`'s per-slug lock exists to prevent, and
+      inconsistency a lock exists to prevent, and
       Core has only the one container to protect.
-    * **Non-blocking (`retries: 0`), not blocking** — add-on lifecycle
-      calls come from a handful of internal callers (the router, the
-      watchdog) that are fine waiting briefly for another op on the same
-      slug to finish. Core's `update/2` can run for minutes (a multi-GB
+    * **Non-blocking (`retries: 0`), not blocking** — Core's `update/2` can run for minutes (a multi-GB
       image pull + health gate on a slow device, per the plan's "long sync
       update" risk); a caller blocking on `:global.trans` for that whole
       window would tie up a Bandit request worker for no benefit. Returning
@@ -561,9 +555,8 @@ defmodule Vagus.Core.Lifecycle do
   end
 
   # Stage waypoints for the `home_assistant_core_update` job the router
-  # creates (see `Vagus.Addon.Update`'s "Job progress" moduledoc section —
-  # same discipline: coarse transitions, no-op without `opts[:job]`, always
-  # `:ok` so it can sit in a `with` chain).
+  # creates: coarse transitions, no-op without `opts[:job]`, always `:ok` so
+  # it can sit in a `with` chain.
   defp report_stage(opts, stage, progress) do
     Vagus.Jobs.update(
       Keyword.get(opts, :job),

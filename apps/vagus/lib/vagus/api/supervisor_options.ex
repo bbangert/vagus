@@ -125,8 +125,7 @@ defmodule Vagus.API.SupervisorOptions do
     end
   end
 
-  # Mirrors `Vagus.Addon.State`'s decode discipline (`decode_entry`/
-  # `decode_bool_setting` etc., state.ex) — a hand-edited or partially
+  # Mirrors `Vagus.App.File`'s decode discipline — a hand-edited or partially
   # written `supervisor_options.json` is not trusted verbatim. Before this,
   # a wrongly-typed field (e.g. `"diagnostics": "yes"`) reached
   # `handle_call(:get, ...)` unchanged and would raise wherever the caller

@@ -40,8 +40,8 @@ defmodule Vagus.Ingress.Panels do
   observable to Core.
 
   An unknown slug (not installed) resolves to a DELETE push —
-  this is what lets `Vagus.Addon.Manager.uninstall/2` call this *after* the
-  entry has already been purged and still get the right verb,
+  this is what lets an app's uninstall call this *after* the app's
+  process has already let go of it and still get the right verb,
   mirroring upstream forcing `ingress_panel = false` + pushing on uninstall.
   """
 

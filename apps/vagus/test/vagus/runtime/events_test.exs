@@ -290,6 +290,120 @@ defmodule Vagus.Runtime.EventsTest do
     assert Process.alive?(events_pid)
   end
 
+  describe "app processes" do
+    import Vagus.AppFixtures, only: [app_config: 2, app_info: 1, install_app: 1]
+
+    defp app_slug, do: "events_app_#{System.unique_integer([:positive])}"
+
+    defp app_pid(slug) do
+      [{pid, _}] = Registry.lookup(Vagus.App.Directory, {:slug, slug})
+      pid
+    end
+
+    test "an app's container event goes to whichever process holds its slug when sent", %{
+      path: path,
+      listen: listen
+    } do
+      slug = app_slug()
+      start_supervised!({Events, name: unique_name(), socket: path})
+      {sock, _head} = accept_conn(listen)
+      send_ok_headers(sock)
+
+      {:ok, _} = Registry.register(Vagus.App.Directory, {:slug, slug}, nil)
+      send_chunk(sock, event_json("die", "addon_" <> slug, "c1") <> "\n")
+      assert_receive {:docker_event, %{action: "die", id: "c1"}}, 1_000
+
+      # A restarted app process is found by the next event, with no subscribe.
+      :ok = Registry.unregister(Vagus.App.Directory, {:slug, slug})
+      test = self()
+
+      owner =
+        spawn_link(fn ->
+          {:ok, _} = Registry.register(Vagus.App.Directory, {:slug, slug}, nil)
+          send(test, :registered)
+
+          receive do
+            event -> send(test, {:owner_got, event})
+          end
+        end)
+
+      assert_receive :registered
+      send_chunk(sock, event_json("start", "addon_" <> slug, "c2") <> "\n")
+      assert_receive {:owner_got, {:docker_event, %{action: "start", id: "c2"}}}, 1_000
+      refute_received {:docker_event, %{id: "c2"}}
+      assert is_pid(owner)
+    end
+
+    test "each connect lists the app containers and tells each app process its state", %{
+      path: path,
+      listen: listen
+    } do
+      slug = app_slug()
+      install_app(app_config(slug, %{}))
+      pid = app_pid(slug)
+      {:ok, listings} = Agent.start_link(fn -> [] end)
+
+      list = fn _socket ->
+        Agent.get_and_update(listings, fn
+          [] ->
+            {{:ok, [container("/addon_" <> slug, "c1", "running", "Up 2 minutes")]}, [:first]}
+
+          seen ->
+            {{:ok,
+              [
+                container("/addon_" <> slug, "c1", "exited", "Exited (137) 1 second ago"),
+                container("/not_an_app", "x", "running", "Up")
+              ]}, [:again | seen]}
+        end)
+      end
+
+      start_supervised!({Events, name: unique_name(), socket: path, list: list})
+
+      # The first connect: a running container this process did not start is
+      # adopted as its own.
+      {sock1, _head} = accept_conn(listen)
+      send_ok_headers(sock1)
+      assert eventually(fn -> app_info(slug) end, &match?({:ok, %{state: :started}}, &1))
+      assert %{container_id: "c1"} = :sys.get_state(pid) |> elem(1)
+
+      # The container died while the stream was down: the reconnect tells it.
+      :gen_tcp.close(sock1)
+      {sock2, _head} = accept_conn(listen, 5_000)
+      send_ok_headers(sock2)
+      assert eventually(fn -> app_info(slug) end, &match?({:ok, %{state: :error}}, &1))
+      assert %{last_event: {:exited, 137}} = :sys.get_state(pid) |> elem(1)
+      assert Agent.get(listings, & &1) == [:again, :first]
+    end
+
+    test "a listing that fails leaves the stream running", %{path: path, listen: listen} do
+      test = self()
+      list = fn _socket -> send(test, :listed) && {:error, :down} end
+      name = unique_name()
+      start_supervised!({Events, name: name, socket: path, list: list})
+      :ok = Events.subscribe(name)
+
+      {sock, _head} = accept_conn(listen)
+      send_ok_headers(sock)
+      assert_receive :listed, 1_000
+
+      send_chunk(sock, event_json("start", "addon_after", "a1") <> "\n")
+      assert_receive {:docker_event, %{id: "a1"}}, 1_000
+    end
+
+    defp container(name, id, state, status),
+      do: %{"Id" => id, "Names" => [name], "State" => state, "Status" => status}
+
+    defp eventually(fun, done?, tries \\ 100) do
+      value = fun.()
+
+      cond do
+        done?.(value) -> value
+        tries == 0 -> value
+        true -> Process.sleep(10) && eventually(fun, done?, tries - 1)
+      end
+    end
+  end
+
   describe "schedule_reconnect/2" do
     import ExUnit.CaptureLog
 

@@ -29,22 +29,11 @@ defmodule Vagus.Application do
     # value rather than inferring "off" from an absent table.
     Vagus.Dist.create_session_table()
 
-    # The run-state files describe this application run's add-ons and none is
-    # registered yet, so wiping loses nothing valid and guarantees no file is
-    # older than the app instance that reads it.
-    Vagus.RunState.reset_dir()
-
     children =
       [
         # Fire-and-forget and bounded work that must not be a bare spawn
         # (crash visibility): `Vagus.DNS`'s upstream relays.
         {Task.Supervisor, name: Vagus.TaskSupervisor},
-
-        # Add-on identity + service registries (M4). Started before the HTTP
-        # surface so `Vagus.API.Auth` can resolve add-on tokens and the
-        # `/services` endpoints have their store the moment requests arrive.
-        Vagus.Addon.Registry,
-        Vagus.Addon.State,
         Vagus.Addon.Store,
 
         # Fills the store's catalog once after boot. `:ignore` unless its
@@ -103,17 +92,13 @@ defmodule Vagus.Application do
          max_restarts: 5,
          max_seconds: 30},
 
-        # One process per installed app, brought up from `Vagus.Addon.State`
-        # (started above) before anything that reads apps through `Vagus.App`.
-        # Its orchestrator's boot waits for the rest of this tree before it
+        # One process per installed app, each holding every fact about its
+        # app, brought up from the apps' files before anything that reads
+        # apps: DNS, the events stream, ingress and the API all ask it.
+        # After the native supervisor, which a native app starts into. Its
+        # orchestrator's boot waits for the rest of this tree before it
         # starts any app.
         Vagus.App.Supervisor,
-
-        # Keeps `Vagus.Addon.State` honest for native add-ons: demotes a broker
-        # subtree to `:stopped` if OTP supervision exhausts its restart budget
-        # (no Docker `die` event fires for a BEAM crash). Started after the
-        # DynamicSupervisor it watches children of, and after `Vagus.Addon.State`.
-        Vagus.Addon.Backend.Native.Sentinel,
 
         # Boot-time swap (zram or a /data swapfile, per root medium — see
         # `Vagus.Host.Swap`). Unconditional child, `:ignore` unless
@@ -136,7 +121,6 @@ defmodule Vagus.Application do
       ] ++
         dns_children() ++
         events_children() ++
-        watchdog_children() ++
         ingress_children() ++
         ssh_access_children() ++
         [
@@ -205,36 +189,17 @@ defmodule Vagus.Application do
     if Application.get_env(:vagus, :events_enabled, true), do: [Vagus.Runtime.Events], else: []
   end
 
-  # Both halves of the add-on watchdog (§B6 container-event +
-  # M4B-IW-P1-T3's §B7 application probe), gated together by
-  # `:watchdog_enabled` (false in test.exs) — mirrors `:events_enabled`.
-  # §B6.5: the two are independent code paths with independent state, but
-  # they share a single on/off switch since neither is useful without the
-  # other in practice. Isolated under `Vagus.Addon.Watchdog.Supervisor`
-  # (review W2) rather than as bare children here — see that module for the
-  # isolation rationale. Unit tests start their own instances with injected
-  # fakes instead of subscribing to the real `Vagus.Runtime.Events`/engine/
-  # `Vagus.Addon.State`.
-  defp watchdog_children do
-    if Application.get_env(:vagus, :watchdog_enabled, true) do
-      [Vagus.Addon.Watchdog.Supervisor]
-    else
-      []
-    end
-  end
-
-  # Ingress sessions + token resolution + dynamic-port allocator
-  # (M4B-IW-P2-T1, §B1/§B3), gated by `:ingress_enabled` (false in test.exs)
-  # — mirrors `:watchdog_enabled`. Router/unit tests `start_supervised` their
-  # own instance under the default name, which would clash with an
-  # app-started one.
+  # Ingress sessions + token resolution (M4B-IW-P2-T1, §B1), gated by
+  # `:ingress_enabled` (false in test.exs). Router/unit tests
+  # `start_supervised` their own instance under the default name, which would
+  # clash with an app-started one.
   defp ingress_children do
     if Application.get_env(:vagus, :ingress_enabled, true), do: [Vagus.Ingress], else: []
   end
 
   # The device-managed SSH access key (keygen + authorize), gated by
   # :ssh_access_enabled (false in test.exs) — mirrors :ingress_enabled. Runs
-  # on both :host and target (unlike :dns_enabled/:watchdog_enabled, this
+  # on both :host and target (unlike :dns_enabled, this
   # isn't target-only work) since the DETS-backed keypair is useful in dev
   # too. Tests start their own instance with a private name/table/dets_path.
   defp ssh_access_children do

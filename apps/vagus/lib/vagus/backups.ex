@@ -12,7 +12,7 @@ defmodule Vagus.Backups do
   (mirroring `Vagus.Addon.Store.reload/1`'s own rationale — a slow backup
   shouldn't block a concurrent `list/1`/`get/2` read).
 
-  Data root resolves exactly like `Vagus.Addon.Manager`'s: `config :vagus,
+  Data root resolves exactly like `Vagus.App.Steps`': `config :vagus,
   :addon_data_root` (default `/data`), overridable via `opts[:data_root]`
   (host tests point it at a tmp dir); `opts[:dir]` overrides the backup
   directory outright.
@@ -52,7 +52,7 @@ defmodule Vagus.Backups do
   @doc """
   Test/ops seam: repoints the running server at a different backup directory
   and rescans it. `init/1` only resolves the directory once at boot (unlike
-  `Vagus.Addon.Manager`, which re-resolves `data_root` from `opts`/
+  `Vagus.App.Steps`, which re-resolves `data_root` from `opts`/
   `Application.get_env` on every call) — a router-level test that needs the
   supervised singleton `Vagus.Backups` pointed at a tmp dir has to call this,
   the same way `Vagus.Addon.Store`'s tests seed its catalog directly via
@@ -256,7 +256,7 @@ defmodule Vagus.Backups do
   ## Internals — directory scan
 
   # `File.mkdir_p/1` is tolerated (logged, empty index) rather than raised —
-  # unlike `Vagus.Addon.Manager`'s data-dir writes (only reached via an
+  # unlike `Vagus.App.Steps`' data-dir writes (only reached via an
   # explicit `install`/`start` call), this runs unconditionally at
   # `Vagus.Application` boot, and a `/data` that isn't writable yet (or ever,
   # e.g. a sandboxed `mix test` run) must not crash the whole app.

@@ -1,9 +1,11 @@
 defmodule Vagus.Ingress do
   @moduledoc """
-  Ingress session store + per-add-on dynamic port allocator
-  (`docs/contract-2026.7-m4b-ingress-watchdog.md` §B1, §B3.2) — the
+  Ingress session store and ingress-token resolution
+  (`docs/contract-2026.7-m4b-ingress-watchdog.md` §B1, §B2.2) — the
   in-memory counterpart of the real Supervisor's `Ingress` class
-  (`supervisor/ingress.py`).
+  (`supervisor/ingress.py`). An app's dynamic ingress port is its own
+  process's (`Vagus.App.Steps`), held as a directory key so no two apps
+  share one.
 
   ## Sessions (§B1)
 
@@ -23,18 +25,11 @@ defmodule Vagus.Ingress do
   Deliberate deviations from upstream, both intentional for M4b:
 
     * **No disk persistence.** Real Supervisor persists `session`/
-      `session_data`/`ports` to `ingress.json` so sessions and dynamic port
-      assignments survive a Supervisor restart. This module is pure
-      in-memory state — an emulator restart drops every open ingress
-      session (the panel iframe would need reloading) and, more subtly,
-      *would* re-roll dynamic ports too if `Vagus.Addon.State` weren't
-      already the durable side of that: dynamic ports are persisted via
-      `State.put_setting/4` (§B3.2 below), so *those* do survive a restart
-      even though the session store doesn't. Acceptable for M4b; sessions
-      dying on emulator restart is a minor, self-healing UX blip (the
-      frontend just re-requests a session), unlike a port reassignment
-      which would break bashio's cached `ingress_port` inside a running
-      add-on container.
+      `session_data` to `ingress.json` so sessions survive a Supervisor
+      restart. Here an emulator restart drops every open ingress session
+      (the panel iframe would need reloading), a minor, self-healing UX
+      blip: the frontend just re-requests a session. Dynamic ports are
+      saved in each app's own file, so they do survive.
     * **Lazy pruning, no timer.** Upstream purges expired sessions on
       `Ingress.load()`/`reload()`, which runs at Supervisor startup and
       every `RUN_RELOAD_INGRESS` tick (930s). This module instead prunes
@@ -42,22 +37,6 @@ defmodule Vagus.Ingress do
       `validate_session/2` call — equivalent for correctness (an expired
       session is never observably valid either way) and needs no
       background timer process.
-
-  ## Dynamic ports (§B3.2)
-
-  `dynamic_port/2` resolves an add-on's `ingress_port: 0` config to a real
-  port in `62_000..65_500`. Once allocated it is persisted forever (via
-  `Vagus.Addon.State.put_setting/4`) and never re-rolled for that slug,
-  matching upstream's "assign once, keep until uninstall" behavior — this
-  module doesn't handle the uninstall-time `del_dynamic_port` release
-  itself; that's `Vagus.Addon.State`'s entry lifecycle (deleting the slug's
-  entry entirely drops its `ingress_port` along with it).
-
-  A candidate port is rejected if it collides with another add-on's already
-  -assigned port (scanned from `State.list/1`) or if something is actually
-  listening on it at the docker gateway IP (`port_probe`, a real
-  `:gen_tcp.connect/3` probe by default) — mirroring upstream's
-  `check_port(sys_docker.network.gateway, port)` call.
 
   ## Token → slug resolution (§B2.2 step 2)
 
@@ -68,10 +47,10 @@ defmodule Vagus.Ingress do
 
   ## Admin panel token
 
-  `Vagus.API.AdminPanel` is a synthetic ingress panel with no add-on and no
-  app process, so it has no `ingress_token` in the directory. One is minted here at `init/1` instead and matched *first* by
-  `resolve_token/2`, so the reserved `vagus` slug can never be shadowed by
-  an add-on that happens to share it.
+  `Vagus.API.AdminPanel` is a synthetic ingress panel with no app process,
+  so it has no `ingress_token` in the directory. One is minted here at
+  `init/1` instead and matched *first* by `resolve_token/2`, so the reserved
+  `vagus` slug can never be shadowed by an app that happens to share it.
 
   Like sessions, this token is **per-boot and in-memory only**: restarting
   this GenServer mints a new one, which invalidates the previous panel URL.
@@ -81,34 +60,17 @@ defmodule Vagus.Ingress do
 
   ## Injectable opts
 
-  `:state` — the `Vagus.Addon.State` server to resolve slugs/tokens/ports
-  against (default `Vagus.Addon.State`).
-
   `:clock` — zero-arity fn returning "now" in milliseconds (default
   `System.monotonic_time(:millisecond)`), so tests can drive session
   expiry without sleeping.
 
-  `:port_probe` — arity-2 fn `(ip, port) -> :listening | :free` (default: a
-  real TCP connect probe against `ip:port` with a ~500ms timeout; a
-  successful connect means something is already listening there).
-
-  `:gateway_ip` — the docker bridge gateway IP the port probe targets
-  (default `Vagus.Network.anchors().gateway`).
-
-  `:rand` — arity-2 fn `(min, max) -> integer` for candidate port
-  selection (default a uniform `min..max` picker).
   """
 
   use GenServer
 
-  alias Vagus.Addon.State
   alias Vagus.API.AdminPanel
-  alias Vagus.Network
 
   @session_ttl_ms 15 * 60 * 1000
-  @port_min 62_000
-  @port_max 65_500
-  @max_port_tries 100
 
   @type token :: String.t()
 
@@ -182,17 +144,6 @@ defmodule Vagus.Ingress do
   end
 
   @doc """
-  Resolves `slug`'s dynamic ingress port (§B3.2), allocating and persisting
-  one on first call. `{:error, :not_found}` for an untracked slug,
-  `{:error, :no_free_port}` if 100 candidates in a row all collide.
-  """
-  @spec dynamic_port(String.t(), GenServer.server()) ::
-          {:ok, pos_integer()} | {:error, :not_found | :no_free_port}
-  def dynamic_port(slug, server \\ __MODULE__) when is_binary(slug) do
-    GenServer.call(server, {:dynamic_port, slug})
-  end
-
-  @doc """
   The Core user id recorded on `token` at `create_session/2`, or `nil` when
   the session carries none (Core sent no `user_id`, or the session predates
   this being recorded). `:error` for an unknown or expired token.
@@ -221,18 +172,12 @@ defmodule Vagus.Ingress do
   def init(opts) do
     state = %{
       sessions: %{},
-      # Same charset/entropy as an add-on's own `ingress_token` (32 random
+      # Same charset/entropy as an app's own `ingress_token` (32 random
       # bytes, URL-safe base64, no padding), so it satisfies the
       # `/ingress/[-_A-Za-z0-9]+/.*` route shape `Vagus.API.Dispatcher`
-      # relies on. Generated locally rather than borrowed from
-      # `Vagus.Addon.State` (whose generator is private) to keep this
-      # module free of a dependency it needs for nothing else.
+      # relies on.
       admin_token: generate_ingress_token(),
-      state_server: Keyword.get(opts, :state, State),
-      clock: Keyword.get(opts, :clock, fn -> System.monotonic_time(:millisecond) end),
-      port_probe: Keyword.get(opts, :port_probe, &default_port_probe/2),
-      gateway_ip: Keyword.get(opts, :gateway_ip, Network.anchors().gateway),
-      rand: Keyword.get(opts, :rand, &default_rand/2)
+      clock: Keyword.get(opts, :clock, fn -> System.monotonic_time(:millisecond) end)
     }
 
     {:ok, state}
@@ -290,29 +235,7 @@ defmodule Vagus.Ingress do
     if Plug.Crypto.secure_compare(ingress_token, state.admin_token) do
       {:reply, {:ok, AdminPanel.slug()}, state}
     else
-      {:reply, resolve_addon_token(ingress_token), state}
-    end
-  end
-
-  def handle_call({:dynamic_port, slug}, _from, state) do
-    case State.get(slug, state.state_server) do
-      :error ->
-        {:reply, {:error, :not_found}, state}
-
-      {:ok, %{ingress_port: port}} when is_integer(port) ->
-        {:reply, {:ok, port}, state}
-
-      {:ok, _entry} ->
-        other_ports = other_assigned_ports(state.state_server)
-
-        case allocate_port(state, other_ports, @max_port_tries) do
-          {:ok, port} ->
-            :ok = State.put_setting(slug, :ingress_port, port, state.state_server)
-            {:reply, {:ok, port}, state}
-
-          {:error, :no_free_port} = error ->
-            {:reply, error, state}
-        end
+      {:reply, resolve_app_token(ingress_token), state}
     end
   end
 
@@ -325,7 +248,7 @@ defmodule Vagus.Ingress do
   ## Internals
 
   # Only an ingress app registers its token's hash, under its slug.
-  defp resolve_addon_token(ingress_token) do
+  defp resolve_app_token(ingress_token) do
     case Registry.lookup(
            Vagus.App.Directory,
            {:ingress_token, Vagus.App.Policy.hash(ingress_token)}
@@ -349,47 +272,4 @@ defmodule Vagus.Ingress do
   defp generate_ingress_token do
     Base.url_encode64(:crypto.strong_rand_bytes(32), padding: false)
   end
-
-  defp other_assigned_ports(state_server) do
-    state_server
-    |> State.list()
-    |> Enum.flat_map(fn
-      %{ingress_port: port} when is_integer(port) -> [port]
-      _ -> []
-    end)
-    |> MapSet.new()
-  end
-
-  defp allocate_port(_state, _other_ports, 0), do: {:error, :no_free_port}
-
-  defp allocate_port(state, other_ports, tries_left) do
-    candidate = state.rand.(@port_min, @port_max)
-
-    if MapSet.member?(other_ports, candidate) or
-         state.port_probe.(state.gateway_ip, candidate) == :listening do
-      allocate_port(state, other_ports, tries_left - 1)
-    else
-      {:ok, candidate}
-    end
-  end
-
-  # Real Supervisor's `check_port`: attempt a TCP connect, success means
-  # something is already listening there. Short timeout — this runs
-  # synchronously inline in a GenServer call, on the loopback-ish docker
-  # gateway, so a hung/filtered port must not stall port allocation for
-  # long.
-  defp default_port_probe(ip, port) do
-    ip_charlist = ip |> to_string() |> String.to_charlist()
-
-    case :gen_tcp.connect(ip_charlist, port, [:binary, active: false], 500) do
-      {:ok, socket} ->
-        :gen_tcp.close(socket)
-        :listening
-
-      {:error, _reason} ->
-        :free
-    end
-  end
-
-  defp default_rand(min, max), do: min + :rand.uniform(max - min + 1) - 1
 end

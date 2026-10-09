@@ -6,6 +6,7 @@ defmodule Vagus.App.ImportTest do
 
   import ExUnit.CaptureLog
 
+  alias Vagus.Addon.Config
   alias Vagus.API.{Router, Token}
   alias Vagus.App.File, as: AppFile
   alias Vagus.App.Instances
@@ -40,43 +41,57 @@ defmodule Vagus.App.ImportTest do
     Jason.decode!(conn.resp_body)["data"]
   end
 
-  # The old reader is `Vagus.Addon.State` over the same file: whatever the
-  # router renders from its entry, it now renders from the process's answer.
+  # Every field the 0.9.0 reader kept from each entry, checked against what
+  # the process answers and what the router renders from it.
   test "a 0.9.0 addons.json imported to processes answers every field as before", %{
-    legacy: legacy
+    legacy: legacy,
+    legacy_entries: entries
   } do
-    old_state = start_supervised!({Vagus.Addon.State, name: nil, persist_path: legacy})
     capture_log(fn -> assert {:ok, 3} = AppFile.import_once(AppFile.dir(), legacy) end)
     slugs = AppFile.saved()
     assert Enum.sort(slugs) == ["core_mqtt", "core_ssh", "esphome_esphome"]
 
     for slug <- slugs do
-      {:ok, old} = Vagus.Addon.State.get(slug, old_state)
+      raw = Map.fetch!(entries, slug)
+      {:ok, config} = Config.parse(raw["config"])
+      wanted = String.to_existing_atom(raw["state"])
       {:ok, pid} = Instances.ensure(slug)
 
       # A process knows a container runs only once the engine says so.
-      if old.state == :started do
+      if wanted == :started do
         assert {:ok, %{state: :stopped}} = Vagus.App.info(slug)
         send(pid, {:docker_event, %{action: "start", id: "c-" <> slug, name: "addon_" <> slug}})
       end
 
       {:ok, new} = Vagus.App.info(slug)
-      assert Map.delete(new, :wanted) == old, slug
-      assert new.wanted == old.state
+
+      assert new == %{
+               config: config,
+               state: wanted,
+               wanted: wanted,
+               user_options: raw["user_options"],
+               ports: raw["network"],
+               ingress_token: raw["ingress_token"],
+               ingress_port: raw["ingress_port"],
+               ingress_panel: raw["ingress_panel"],
+               watchdog: raw["watchdog"],
+               boot: raw["boot"],
+               auto_update: raw["auto_update"],
+               protected: raw["protected"]
+             },
+             slug
 
       body = info(slug)
-      assert body["state"] == Atom.to_string(old.state)
-      assert body["version"] == old.config.version
-      assert body["network"] |> Map.reject(fn {_k, v} -> is_nil(v) end) == old.ports
-      assert body["ingress_url"] == ingress_url(old)
+      assert body["state"] == raw["state"]
+      assert body["version"] == config.version
+      assert body["network"] |> Map.reject(fn {_k, v} -> is_nil(v) end) == raw["network"]
+      assert body["ingress_url"] == ingress_url(config, raw["ingress_token"])
 
-      for key <- ~w(ingress_panel watchdog protected)a,
-          do: assert(body[Atom.to_string(key)] == Map.fetch!(old, key), "#{slug} #{key}")
+      for key <- ~w(ingress_panel watchdog protected),
+          do: assert(body[key] == raw[key], "#{slug} #{key}")
     end
   end
 
-  defp ingress_url(%{config: %{ingress: true}, ingress_token: token}),
-    do: "/api/hassio_ingress/#{token}/"
-
-  defp ingress_url(_entry), do: nil
+  defp ingress_url(%{ingress: true}, token), do: "/api/hassio_ingress/#{token}/"
+  defp ingress_url(_config, _token), do: nil
 end

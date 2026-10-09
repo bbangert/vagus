@@ -1,5 +1,5 @@
 defmodule Vagus.DNSTest do
-  @moduledoc "DNS server — static anchors, dynamic add-on records, NXDOMAIN, over UDP loopback."
+  @moduledoc "DNS server — static anchors, app records from a directory, NXDOMAIN, over UDP loopback."
   use ExUnit.Case, async: false
 
   alias Vagus.DNS
@@ -7,10 +7,34 @@ defmodule Vagus.DNSTest do
 
   setup do
     port = 15_300 + rem(System.unique_integer([:positive]), 2000)
-    server = start_supervised!({DNS, name: nil, ip: {127, 0, 0, 1}, port: port, upstream: nil})
+    directory = :"dns_test_directory_#{System.unique_integer([:positive])}"
+    start_supervised!({Registry, keys: :unique, name: directory})
+
+    server =
+      start_supervised!(
+        {DNS, name: nil, ip: {127, 0, 0, 1}, port: port, upstream: nil, directory: directory}
+      )
+
     {:ok, sock} = :gen_udp.open(0, [:binary, active: false])
     on_exit(fn -> :gen_udp.close(sock) end)
-    %{server: server, port: port, sock: sock}
+    %{server: server, port: port, sock: sock, directory: directory}
+  end
+
+  # An app process stands behind each name: the key is its, valued with the
+  # IP, and goes when it does.
+  defp app_record(directory, name, ip) do
+    test = self()
+
+    owner =
+      spawn(fn ->
+        {:ok, _} = Registry.register(directory, {:dns, name}, ip)
+        send(test, :registered)
+        Process.sleep(:infinity)
+      end)
+
+    assert_receive :registered
+    on_exit(fn -> Process.exit(owner, :kill) end)
+    owner
   end
 
   defp ask(sock, port, name, qtype \\ 1) do
@@ -58,21 +82,71 @@ defmodule Vagus.DNSTest do
     assert ask(s, p, "homeassistant").addr == [172, 30, 32, 1]
   end
 
-  test "a registered add-on hostname resolves to its bridge IP", %{server: srv, sock: s, port: p} do
-    :ok = DNS.register("core-mosquitto", {172, 30, 33, 0}, srv)
+  test "an app's name resolves to the IP its key holds", %{directory: d, sock: s, port: p} do
+    app_record(d, "core-mosquitto", "172.30.33.0")
     assert ask(s, p, "core-mosquitto").addr == [172, 30, 33, 0]
     assert ask(s, p, "core-mosquitto.local.hass.io").addr == [172, 30, 33, 0]
   end
 
-  test "unregister removes a dynamic record (→ NXDOMAIN, no upstream)", %{
-    server: srv,
+  test "a name goes with its app's process (→ NXDOMAIN, no upstream)", %{
+    directory: d,
     sock: s,
     port: p
   } do
-    :ok = DNS.register("temp-addon", {172, 30, 33, 5}, srv)
-    assert ask(s, p, "temp-addon").ancount == 1
-    :ok = DNS.unregister("temp-addon", srv)
-    assert ask(s, p, "temp-addon").rcode == 3
+    owner = app_record(d, "temp-app", "172.30.33.5")
+    assert ask(s, p, "temp-app").ancount == 1
+
+    ref = Process.monitor(owner)
+    Process.exit(owner, :kill)
+    assert_receive {:DOWN, ^ref, :process, ^owner, :killed}
+    # The partition drops the key on the owner's exit, after its DOWN here.
+    assert wait_for(fn -> Registry.lookup(d, {:dns, "temp-app"}) end, &(&1 == [])) == []
+    assert ask(s, p, "temp-app").rcode == 3
+  end
+
+  test "an app record wins over an anchor of the same name", %{directory: d, sock: s, port: p} do
+    app_record(d, "observer", "172.30.33.6")
+    assert ask(s, p, "observer").addr == [172, 30, 33, 6]
+  end
+
+  test "a value that is not an address answers as if absent, and the server goes on", %{
+    directory: d,
+    sock: s,
+    port: p
+  } do
+    app_record(d, "bad-app", "not-an-ip")
+    app_record(d, "hassio", {172, 30, 33, 7})
+    app_record(d, "v6-app", "::1")
+
+    assert ask(s, p, "bad-app").rcode == 3
+    assert ask(s, p, "v6-app").rcode == 3
+    assert ask(s, p, "hassio").addr == [172, 30, 32, 2]
+    assert ask(s, p, "supervisor").addr == [172, 30, 32, 2]
+  end
+
+  test "an app's name queried as AAAA is NOERROR with no answers", %{
+    directory: d,
+    sock: s,
+    port: p
+  } do
+    app_record(d, "core-ssh", "172.30.33.8")
+    r = ask(s, p, "core-ssh", 28)
+    assert {r.rcode, r.ancount} == {0, 0}
+  end
+
+  test "with no directory to read, the anchors still answer" do
+    port = 17_400 + rem(System.unique_integer([:positive]), 2000)
+
+    start_supervised!(
+      {DNS,
+       name: nil, ip: {127, 0, 0, 1}, port: port, upstream: nil, directory: :no_such_directory},
+      id: :no_directory
+    )
+
+    {:ok, sock} = :gen_udp.open(0, [:binary, active: false])
+    on_exit(fn -> :gen_udp.close(sock) end)
+    assert ask(sock, port, "supervisor").addr == [172, 30, 32, 2]
+    assert ask(sock, port, "core-ssh").rcode == 3
   end
 
   test "an owned name queried as AAAA is NOERROR with no answers (not NXDOMAIN)", %{
@@ -84,7 +158,9 @@ defmodule Vagus.DNSTest do
     assert r.ancount == 0
   end
 
-  test "a relay that cannot start (task supervisor down) drops the query, not the server" do
+  test "a relay that cannot start (task supervisor down) drops the query, not the server", %{
+    directory: d
+  } do
     port = 17_400 + rem(System.unique_integer([:positive]), 2000)
 
     server =
@@ -94,22 +170,22 @@ defmodule Vagus.DNSTest do
          ip: {127, 0, 0, 1},
          port: port,
          upstream: "127.0.0.1",
-         task_supervisor: :vagus_dns_test_no_such_supervisor},
+         task_supervisor: :vagus_dns_test_no_such_supervisor,
+         directory: d},
         id: :no_task_supervisor
       )
 
     {:ok, sock} = :gen_udp.open(0, [:binary, active: false])
     on_exit(fn -> :gen_udp.close(sock) end)
-    :ok = DNS.register("kept-addon", {172, 30, 33, 9}, server)
+    app_record(d, "kept-app", "172.30.33.9")
 
     # A miss with an upstream configured goes to the relay path, which fails.
     query = <<0x3333::16, 0x0100::16, 1::16, 0::16, 0::16, 0::16, 7, "unknown", 0, 1::16, 1::16>>
     :ok = :gen_udp.send(sock, {127, 0, 0, 1}, port, query)
     assert {:error, :timeout} = :gen_udp.recv(sock, 0, 200)
 
-    # Same process, dynamic records intact.
     assert Process.alive?(server)
-    assert ask(sock, port, "kept-addon").addr == [172, 30, 33, 9]
+    assert ask(sock, port, "kept-app").addr == [172, 30, 33, 9]
   end
 
   test "a relay killed from outside is counted out of the in-flight set" do
@@ -168,137 +244,5 @@ defmodule Vagus.DNSTest do
   test "resolve/2 checks the zone without UDP", %{server: srv} do
     assert {:ok, {172, 30, 32, 3}} = DNS.resolve("dns", srv)
     assert :error = DNS.resolve("whatever", srv)
-  end
-
-  describe "checkpoint" do
-    setup do
-      dir = Path.join(System.tmp_dir!(), "vagus-dns-#{System.unique_integer([:positive])}")
-      File.mkdir_p!(dir)
-      on_exit(fn -> File.rm_rf(dir) end)
-
-      path = Path.join(dir, "dns.term")
-      port = free_udp_port()
-      %{path: path, cp_port: port, cp: start_checkpointed(path, port)}
-    end
-
-    defp free_udp_port do
-      {:ok, sock} = :gen_udp.open(0, ip: {127, 0, 0, 1})
-      {:ok, port} = :inet.port(sock)
-      :gen_udp.close(sock)
-      port
-    end
-
-    defp start_checkpointed(path, port) do
-      start_supervised!(
-        {DNS, name: nil, ip: {127, 0, 0, 1}, port: port, upstream: nil, path: path},
-        id: :checkpointed
-      )
-    end
-
-    defp restart_checkpointed(path, port) do
-      :ok = stop_supervised!(:checkpointed)
-      start_checkpointed(path, port)
-    end
-
-    test "a registered name resolves after a restart on the same path", %{
-      cp: cp,
-      path: path,
-      cp_port: port,
-      sock: sock
-    } do
-      :ok = DNS.register("kept-addon", {172, 30, 33, 7}, cp)
-
-      cp = restart_checkpointed(path, port)
-
-      assert {:ok, {172, 30, 33, 7}} = DNS.resolve("kept-addon", cp)
-      assert ask(sock, port, "kept-addon").addr == [172, 30, 33, 7]
-    end
-
-    test "an unregistered name stays gone after a restart", %{
-      cp: cp,
-      path: path,
-      cp_port: port,
-      sock: sock
-    } do
-      :ok = DNS.register("gone-addon", {172, 30, 33, 8}, cp)
-      :ok = DNS.register("other-addon", {172, 30, 33, 9}, cp)
-      :ok = DNS.unregister("gone-addon", cp)
-
-      cp = restart_checkpointed(path, port)
-
-      assert :error = DNS.resolve("gone-addon", cp)
-      assert ask(sock, port, "gone-addon").rcode == 3
-      assert ask(sock, port, "other-addon").addr == [172, 30, 33, 9]
-    end
-
-    test "an unusable file starts the server with no dynamic records, and working", %{
-      path: path,
-      cp_port: port,
-      sock: sock
-    } do
-      for content <- [
-            "not a term",
-            :erlang.term_to_binary(:nope),
-            :erlang.term_to_binary(%{"stale-addon" => "172.30.33.99"}),
-            :erlang.term_to_binary(%{stale: {172, 30, 33, 99}}),
-            :erlang.term_to_binary(%{"stale-addon" => {172, 30, 33}}),
-            :erlang.term_to_binary(%URI{}),
-            :erlang.term_to_binary(MapSet.new())
-          ] do
-        :ok = stop_supervised!(:checkpointed)
-        File.write!(path, content)
-
-        {cp, log} = ExUnit.CaptureLog.with_log(fn -> start_checkpointed(path, port) end)
-
-        assert log =~ "run state #{path} unusable"
-        refute log =~ "stale"
-        assert :error = DNS.resolve("stale-addon", cp)
-        assert :error = DNS.resolve("fresh-addon", cp)
-        assert :ok = DNS.register("fresh-addon", {172, 30, 33, 10}, cp)
-        assert ask(sock, port, "fresh-addon").addr == [172, 30, 33, 10]
-      end
-    end
-
-    # A privately-named instance falling back to the default path would read
-    # and overwrite the application DNS's checkpoint.
-    test "a privately-named instance without a :path keeps nothing across a restart" do
-      name = :"dns_#{System.unique_integer([:positive])}"
-      host = "memory-only-#{System.unique_integer([:positive])}"
-      spec = {DNS, name: name, ip: {127, 0, 0, 1}, port: free_udp_port(), upstream: nil}
-
-      dns = start_supervised!(spec, id: :pathless)
-      :ok = DNS.register(host, {172, 30, 33, 13}, dns)
-      assert {:ok, _ip} = DNS.resolve(host, dns)
-
-      :ok = stop_supervised!(:pathless)
-      dns = start_supervised!(spec, id: :pathless)
-
-      assert :error = DNS.resolve(host, dns)
-    end
-
-    # An older checkpoint surviving a failed save would point a name at a
-    # container that is gone.
-    @tag :capture_log
-    test "a failed save leaves the next start empty, not on the older checkpoint", %{
-      cp: cp,
-      path: path,
-      cp_port: port,
-      sock: sock
-    } do
-      :ok = DNS.register("dropped-addon", {172, 30, 33, 11}, cp)
-      :ok = DNS.register("bystander-addon", {172, 30, 33, 12}, cp)
-
-      # The save writes `path <> ".tmp"` first; a directory there fails it.
-      File.mkdir_p!(path <> ".tmp")
-      assert :ok = DNS.unregister("dropped-addon", cp)
-      assert {:ok, {172, 30, 33, 12}} = DNS.resolve("bystander-addon", cp)
-
-      cp = restart_checkpointed(path, port)
-
-      assert :error = DNS.resolve("dropped-addon", cp)
-      assert :error = DNS.resolve("bystander-addon", cp)
-      assert ask(sock, port, "dropped-addon").rcode == 3
-      assert ask(sock, port, "bystander-addon").rcode == 3
-    end
   end
 end

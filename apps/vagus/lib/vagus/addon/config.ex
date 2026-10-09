@@ -15,11 +15,10 @@ defmodule Vagus.Addon.Config do
 
   `parse/1` also rejects the slugs Vagus reserves for itself
   (`reserved_slug?/1` — currently just `vagus`, the synthetic admin panel).
-  That covers a persisted entry too: `Vagus.Addon.State.decode_entry/2`
-  wraps `parse/1`, so a state file carrying a `vagus` add-on from before the
-  reservation is dropped with a warning and the rest of the file still
-  loads, per that module's "a corrupt state file must never brick the
-  device" invariant.
+  That covers a saved app too: `Vagus.App.File` decodes through `parse/1`,
+  so a file carrying a `vagus` app from before the reservation is skipped
+  with a warning and the other apps still load, since a corrupt file must
+  never brick the device.
 
   `ingress_entry`/`ingress_stream`/`panel_icon`/`panel_title`/`panel_admin`
   (`docs/contract-2026.7-m4b-ingress-watchdog.md` §B3.1) round out the
@@ -44,7 +43,7 @@ defmodule Vagus.Addon.Config do
   (`/usr/lib/dsp`) and the operator-supplied Hexagon skel (`Vagus.DSP`) — and
   grants the fastrpc/DMA-heap device rules both are inert without
   (`Vagus.Addon.Devices`). All three parts are required; see
-  `Vagus.Addon.Manager`'s `dsp_mount/1` for what each supplies.
+  `Vagus.App.Steps`' `dsp_mount/1` for what each supplies.
   `_SCHEMA_APP_CONFIG` has no such key, and
   upstream has **no precedent at all** for host-mounting vendor accelerator
   libraries — this rests on analogy to `kernel_modules`, which exists for the
@@ -60,11 +59,11 @@ defmodule Vagus.Addon.Config do
   @slug_re ~r/^[-_.A-Za-z0-9]+$/
   # Slugs the Supervisor itself owns and no add-on may claim. A literal, not
   # `Vagus.API.AdminPanel.slug()`: referencing that module here would close a
-  # compile-time cycle (Config <- Addon.State <- Ingress <- AdminPanel). The
+  # compile-time cycle (Config <- App.File <- ... <- AdminPanel). The
   # two are pinned together by a test instead.
   @reserved_slugs ["vagus"]
   # Docker tag charset (W1) — `version:` becomes the tag half of the image
-  # ref `Vagus.Addon.Manager.image_ref/2` builds (`"#{image}:#{version}"`)
+  # ref `Vagus.App.Steps` builds (`"#{image}:#{version}"`)
   # and, unlike `slug`, previously had no charset validation at all even
   # though it's just as add-on-supplied/untrusted; an unvalidated value
   # could smuggle extra path/query structure into the Engine-API image
@@ -208,7 +207,7 @@ defmodule Vagus.Addon.Config do
 
   @doc """
   The shared "is this slug safe to interpolate into a filesystem path" check
-  (W3) — used by both `Vagus.Addon.Manager`'s data-dir `rm_rf` guard and
+  (W3) — used by both `Vagus.App.Steps`' data-dir `rm_rf` guard and
   `Vagus.Backups`' restore/create slug validation, replacing their previous
   divergent (and lowercase-only) regexes with the charset `parse/1` itself
   actually enforces (`@slug_re`, which permits uppercase and dots).
@@ -231,12 +230,12 @@ defmodule Vagus.Addon.Config do
   panel, `Vagus.API.AdminPanel`) and so may not name an add-on.
 
   Deliberately separate from `valid_slug?/1`, which is a *filesystem*-safety
-  guard (`Vagus.Addon.Manager.uninstall/2`'s `rm_rf`, `Vagus.Backups`):
+  guard (`Vagus.App.Steps`' uninstall `rm_rf`, `Vagus.Backups`):
   a reserved slug that somehow got installed must still be cleanable, so
   that check must keep accepting it.
 
-  `Vagus.Addon.Manager.install/2` uses this to reject an install whose slug
-  comes from the URL rather than from a parsed config.
+  `Vagus.App.Policy` uses this to reject an install whose slug comes from
+  the URL rather than from a parsed config.
   """
   @spec reserved_slug?(term()) :: boolean()
   def reserved_slug?(slug) when is_binary(slug), do: slug in @reserved_slugs
@@ -246,7 +245,7 @@ defmodule Vagus.Addon.Config do
   The boot mode an add-on actually starts with (phase 6 chunk A, audit E1):
   `config.boot` (`"auto"`/`"manual"`/`"manual_only"`, the config.yaml
   default) overridden by `persisted` — the per-install `POST
-  /addons/{slug}/options` value (`Vagus.Addon.State`'s `:boot` field,
+  /addons/{slug}/options` value (the app's saved `:boot` setting,
   `nil | "auto" | "manual"`) — when the config allows an override at all.
 
   A `"manual_only"` config always wins, regardless of `persisted`: real
@@ -268,8 +267,8 @@ defmodule Vagus.Addon.Config do
 
   @doc """
   The inverse of `parse/1`: renders `config` back to the raw, string-keyed
-  wire shape `parse/1` itself accepts — needed so `Vagus.Addon.State` can
-  persist an installed add-on's config to disk (§ M4-P8-T1, real-Supervisor
+  wire shape `parse/1` itself accepts — needed so `Vagus.App.File` can
+  persist an installed app's config to disk (§ M4-P8-T1, real-Supervisor
   parity for its persisted `sys_apps.data`) and restore it across a device
   reboot without a second, divergent decoder: `parse/1` stays the single
   validator, both on the store's initial `config.yaml`/`config.json` decode

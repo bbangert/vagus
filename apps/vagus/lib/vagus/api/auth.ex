@@ -29,8 +29,8 @@ defmodule Vagus.API.Auth do
     * the token `Vagus.API.Token` resolves (constant-time
       `Plug.Crypto.secure_compare/2`, checked first so Core's polling never
       touches the registry) → `:supervisor`;
-    * a token registered in `Vagus.Addon.Registry` (a running add-on's
-      per-start token) → `{:addon, identity}`;
+    * a running app's per-start token, found by its hash in
+      `Vagus.App.Directory` and answered by its process → `{:addon, identity}`;
     * otherwise a 401 error envelope, halted before dispatch.
 
   ## The role gate

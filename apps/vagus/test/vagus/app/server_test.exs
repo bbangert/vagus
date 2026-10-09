@@ -287,6 +287,18 @@ defmodule Vagus.App.ServerTest do
       assert {:error, :already_installed} = :gen_statem.call(pid, {:install, %{}})
     end
 
+    test "an install asked to be wanted started is saved so, for boot to start it" do
+      slug = slug()
+      on_exit(fn -> forget_app(slug) end)
+      {:ok, pid} = Instances.ensure(slug)
+      t = op(pid, {:install, %{config: app_config(slug), wanted: :started}})
+      answer(:pull, {:ok, "x/y:1"})
+
+      assert :ok = Task.await(t)
+      assert {:ok, %{wanted: :started}} = AppFile.read(slug)
+      assert {:ok, %{state: :stopped}} = App.info(slug)
+    end
+
     test "a failed install leaves no file and no process" do
       slug = slug()
       {:ok, pid} = Instances.ensure(slug)
@@ -416,6 +428,117 @@ defmodule Vagus.App.ServerTest do
 
       assert {:ok, %{to: "2"}} = Task.await(t)
       refute_received {:step, :start, _, _}
+    end
+  end
+
+  describe "boot_start" do
+    # `state: :started` is the engine reporting a running container, which
+    # the process adopts without having started it.
+    test "a wanted auto app running a container it did not start is recreated with a token" do
+      {_slug, pid} = installed(%{}, state: :started)
+      assert %{container_id: "fixture-" <> _, token_hash: nil} = data(pid)
+
+      boot = op(pid, {:boot_start, %{}})
+      assert %{token: token} = answer(:start, {:ok, @started})
+      assert is_binary(token)
+      assert :ok = Task.await(boot)
+      assert %{container_id: "c1"} = data(pid)
+    end
+
+    test "a wanted manual app is recreated if it runs, and demoted if not" do
+      {_slug, pid} = installed(%{"boot" => "manual"}, state: :started)
+      boot = op(pid, {:boot_start, %{}})
+      assert %{token: token} = answer(:start, {:ok, @started})
+      assert is_binary(token)
+      assert :ok = Task.await(boot)
+      assert %{wanted: :started, container_id: "c1"} = data(pid)
+
+      # Wanted started, with no container reported.
+      slug = slug()
+      install_app(app_config(slug, %{"boot" => "manual"}), state: :started, process: false)
+      {:ok, pid} = Instances.ensure(slug)
+      assert :ok = :gen_statem.call(pid, {:boot_start, %{}})
+      assert %{wanted: :stopped} = data(pid)
+      refute_received {:step, :start, _, _}
+    end
+
+    test "an app halted by a shutdown that did not happen is resumed, and booted" do
+      {slug, pid} = installed(%{}, state: :started)
+      halt = op(pid, {:halt, %{}})
+      answer(:halt_stop, {:ok, :stopped})
+      assert :ok = Task.await(halt)
+      assert :shutting_down = state(pid)
+
+      boot = Task.async(fn -> App.boot_start(slug) end)
+      answer(:start, {:ok, @started})
+      assert :ok = Task.await(boot)
+      assert :idle = state(pid)
+    end
+
+    test "an app wanted stopped is left stopped" do
+      {_slug, pid} = installed()
+      assert :ok = :gen_statem.call(pid, {:boot_start, %{}})
+      refute_received {:step, :start, _, _}
+      assert %{wanted: :stopped} = data(pid)
+    end
+  end
+
+  describe "the URL probe" do
+    # Real timers, shortened: the 120 s interval runs in 50 ms.
+    setup do
+      stub_app_probe()
+      app_deadlines(%{probe: 50, probe_deadline: 100})
+    end
+
+    @watched %{"watchdog" => "http://[HOST]:[PORT:8080]/health"}
+
+    defp probed do
+      assert_receive {:probe, template, input, task}, 2_000
+      {template, input, task}
+    end
+
+    test "runs on its interval against the app's address, and a healthy app is left be" do
+      {_slug, pid} = started(@watched, watchdog: true)
+      {template, input, task} = probed()
+      assert template == "http://[HOST]:[PORT:8080]/health"
+      assert input.ip == "172.30.33.9"
+      send(task, {:result, :healthy})
+
+      {_template, _input, task} = probed()
+      send(task, {:result, :healthy})
+      _ = :sys.get_state(pid)
+      refute_received {:step, :start, _, _}
+    end
+
+    test "two misses in a row restart the app with a new token" do
+      {_slug, pid} = started(@watched, watchdog: true)
+      %{token: old} = data(pid)
+      {_template, _input, task} = probed()
+      send(task, {:result, :unhealthy})
+      {_template, _input, task} = probed()
+      send(task, {:result, :unhealthy})
+
+      input = answer(:start, {:ok, @started})
+      assert input.token != old
+      assert %{attempt: 1, strikes: 0} = data(pid)
+    end
+
+    test "a probe past its deadline is a miss" do
+      {_slug, pid} = started(@watched, watchdog: true)
+      {_template, _input, task} = probed()
+      ref = Process.monitor(task)
+      assert_receive {:DOWN, ^ref, :process, ^task, :killed}, 1_000
+      assert %{strikes: 1} = data(pid)
+    end
+
+    test "is off with the watchdog off, and never runs while an operation does" do
+      {_slug, pid} = started(@watched)
+      refute_receive {:probe, _, _, _}, 200
+
+      :ok = :gen_statem.call(pid, {:set, [watchdog: true]})
+      _stop = op(pid, {:stop, %{}})
+      step(:stop)
+      refute_receive {:probe, _, _, _}, 200
     end
   end
 

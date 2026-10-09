@@ -20,7 +20,7 @@ defmodule Vagus.Addon.Backend.Spec do
   # instead of silently binding an empty directory.
   # `:read_only_non_recursive` maps to the Engine API's
   # `BindOptions.ReadOnlyNonRecursive` — read-only applies to the bind itself
-  # but is not forced onto submounts. Only `/dev` needs it (see `Manager`), and
+  # but is not forced onto submounts. Only `/dev` needs it (see `Vagus.App.Steps`), and
   # it exists because upstream's `MOUNT_DEV` sets it.
   @type mount :: %{
           required(:source) => String.t(),
@@ -34,7 +34,7 @@ defmodule Vagus.Addon.Backend.Spec do
   @type t :: %__MODULE__{
           name: String.t(),
           # nil for `backend: :native` add-ons, which run in-VM and have no
-          # image (`Manager.image_ref/2` returns nil for them).
+          # image (`Vagus.App.Steps` builds none for them).
           image: String.t() | nil,
           hostname: String.t() | nil,
           cmd: [String.t()] | nil,

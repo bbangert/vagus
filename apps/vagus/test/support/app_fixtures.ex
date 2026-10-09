@@ -171,12 +171,15 @@ defmodule Vagus.AppFixtures do
   @doc """
   For tests that install through a route, so no fixture call exists to hang
   cleanup on, and for simulating a concurrent uninstall mid-test. The file
-  goes first, so nothing that heals a missing process brings this one back.
+  goes first, so nothing that heals a missing process brings this one back,
+  and again after the stop, since an operation the process was finishing may
+  have written it since.
   """
   @spec forget_app(String.t()) :: :ok
   def forget_app(slug) do
     :ok = AppFile.delete(slug)
     :ok = Instances.stop(slug)
+    :ok = AppFile.delete(slug)
   end
 
   @doc "Hands every app step to the calling test through `Vagus.App.StepsStub`."
@@ -186,7 +189,18 @@ defmodule Vagus.AppFixtures do
     put_env_for_test(:app_steps_test_pid, self())
   end
 
-  @doc "Sets each step's deadline in ms, by step name, for this test."
+  @doc "Hands every URL probe to the calling test through `Vagus.App.ProbeStub`."
+  @spec stub_app_probe() :: :ok
+  def stub_app_probe do
+    put_env_for_test(:app_probe, Vagus.App.ProbeStub)
+    put_env_for_test(:app_steps_test_pid, self())
+  end
+
+  @doc """
+  Sets step deadlines and the process's timers (`:retry`, `:settled`,
+  `:probe`, `:probe_deadline`, `:new`) for this test, by name, in ms or as a
+  function of the default.
+  """
   @spec app_deadlines(map()) :: :ok
   def app_deadlines(deadlines), do: put_env_for_test(:app_deadlines, deadlines)
 

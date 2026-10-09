@@ -6,7 +6,8 @@ defmodule Vagus.App.Steps do
   needs (`Vagus.App.Policy.task_input/2`), so nothing here reads app state.
 
   The container spec (`build_spec/2`, mounts, DSP, ports, image ref,
-  platform) and backend selection are `Vagus.Addon.Manager`'s, carried as is.
+  platform) and backend selection are carried from the module the app
+  process replaced.
   `input[:backend]`, `input[:data_root]` and `input[:socket]` override the
   configured backend, data root and engine socket.
   """
@@ -614,7 +615,7 @@ defmodule Vagus.App.Steps do
   # by uploading a file. This says that instead, and only for `dsp: true`.
   #
   # `DSP.state/0`, not `DSP.status/0`: a start must not pay the whole-file
-  # version rescan, and `Vagus.Addon.Watchdog` can drive starts in a loop.
+  # version rescan, and an app's restart ladder can drive starts in a loop.
   defp ensure_dsp_store(%Config{dsp: true}) do
     case DSP.state() do
       :configured ->

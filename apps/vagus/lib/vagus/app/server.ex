@@ -286,9 +286,7 @@ defmodule Vagus.App.Server do
   defp command(op, args, from, state, data), do: begin_op(op, args, from, state, data)
 
   defp boot(from, data) do
-    running? = Policy.derive(:idle, data) in [:startup, :started]
-
-    case Policy.boot(data, running?) do
+    case Policy.boot(data, running?(data)) do
       :start ->
         begin_op(:start, %{}, from, :idle, data)
 
@@ -301,6 +299,13 @@ defmodule Vagus.App.Server do
         {:next_state, :idle, data, [{:reply, from, :ok}]}
     end
   end
+
+  # A container adopted from an engine report, not started by this process,
+  # holds no token this process issued.
+  defp running?(%{container_id: id, token_hash: nil, broker_pid: nil}) when id != nil,
+    do: :adopted
+
+  defp running?(data), do: Policy.derive(:idle, data) in [:startup, :started]
 
   defp begin_op(op, args, from, state, data, actions \\ []) do
     case Policy.plan(op, args, data) do
@@ -361,7 +366,7 @@ defmodule Vagus.App.Server do
   defp effect({:keys, add, drop}, {st, d, acts}), do: {st, sync_keys(d, add, drop), acts}
 
   defp effect({:timer, name, ms, msg}, {st, d, acts}),
-    do: {st, d, acts ++ [{{:timeout, name}, ms, msg}]}
+    do: {st, d, acts ++ [{{:timeout, name}, deadline(name, ms), msg}]}
 
   defp effect({:cancel, name}, {st, d, acts}), do: {st, d, acts ++ [{{:timeout, name}, :cancel}]}
   defp effect(:monitor_broker, {st, d, acts}), do: {st, monitor_broker(d), acts}
@@ -401,7 +406,7 @@ defmodule Vagus.App.Server do
       spawn_link(fn -> send(parent, {:probe, ref, probe.check(input.config.watchdog, input)}) end)
 
     {:keep_state, %{data | probe: {pid, ref}},
-     [{{:timeout, :probe_deadline}, deadline(:probe), ref}]}
+     [{{:timeout, :probe_deadline}, deadline(:probe_deadline), ref}]}
   end
 
   # An operation never runs beside a probe.
@@ -472,16 +477,20 @@ defmodule Vagus.App.Server do
   defp steps, do: Application.get_env(:vagus, :app_steps, Vagus.App.Steps)
   defp probe, do: Application.get_env(:vagus, :app_probe, Vagus.App.Probe)
 
-  # Tests shorten deadlines here; production never sets it.
-  defp deadline(name) do
+  defp deadline(name), do: deadline(name, default_deadline(name))
+
+  # Tests shorten deadlines and timers here, by name, to a value or by a
+  # function of the default; production never sets it.
+  defp deadline(name, default) do
     case Application.get_env(:vagus, :app_deadlines, %{}) do
+      %{^name => scale} when is_function(scale, 1) -> scale.(default)
       %{^name => ms} -> ms
-      _none -> default_deadline(name)
+      _none -> default
     end
   end
 
   defp default_deadline(:new), do: @new_ttl_ms
-  defp default_deadline(:probe), do: @probe_deadline_ms
+  defp default_deadline(:probe_deadline), do: @probe_deadline_ms
   defp default_deadline(name), do: Policy.deadline(name)
 
   # Tokens, options, service payloads and discovery configs can carry

@@ -24,7 +24,7 @@ defmodule Vagus.Jobs do
   `create/3` → zero or more `update/3` (stage/progress transitions) →
   `finish/3` (`done: true`, and on success `progress: 100`). All three accept
   `nil` for the uuid and no-op on it, so a producer wired for job tracking
-  (`Vagus.Addon.Update`, `Vagus.Core.Lifecycle`, the backup routes) can run
+  (an app update, `Vagus.Core.Lifecycle`, the backup routes) can run
   identically with tracking off — job bookkeeping must never be the reason an
   update fails. An unknown uuid is likewise a logged no-op, not an error:
   the job may have been evicted (below) mid-operation.

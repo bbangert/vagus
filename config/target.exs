@@ -154,26 +154,22 @@ config :vagus, :api_bind_ip, "172.30.32.2"
 config :vagus, :supervisor_nat, true
 config :vagus, :token_path, "/data/vagus/token"
 
-# Add-on state persistence (M4-P8-T1). `/data` is a
-# symlink to `/root` — fine for plain `File.read!/write!/rename` IO like
-# this, same as `:token_path` above; only a runc container *rootfs* path
-# (see `:addon_data_root` below) needs the real, non-symlinked `/root/...`
-# form.
-config :vagus, :addon_state_path, "/data/vagus/addons.json"
-
-# One file per installed app (`Vagus.App.File`), seeded once from
-# `addons.json`, which is never written again.
+# One file per installed app (`Vagus.App.File`). `/data` is a symlink to
+# `/root` — fine for plain `File.read!/write!/rename` IO like this, same as
+# `:token_path` above; only a runc container *rootfs* path (see
+# `:addon_data_root` below) needs the real, non-symlinked `/root/...` form.
 config :vagus, :app_files_dir, "/data/vagus/apps"
+
+# Where releases before the per-app files kept every app. Import only: read
+# once to seed `:app_files_dir` and never written, so a reverted firmware
+# boots from it as it was at the upgrade.
+config :vagus, :legacy_addons_json, "/data/vagus/addons.json"
 
 # Boot starts apps and Core (`Vagus.App.Orchestrator`); off on :host/:test,
 # where there is no engine to wait on and no reboot to come back from. The
 # default native app is installed and started on its first boot, independent
 # of the container engine; afterwards it boots like any other app.
 config :vagus, Vagus.App.Orchestrator, boot: true, default_native_app: "core_mqtt"
-
-# tmpfs checkpoint of add-on registrations so a process restart loses nothing;
-# `Vagus.Application` wipes it at every app start (see `Vagus.RunState`).
-config :vagus, :run_state_dir, "/run/vagus"
 
 # Core watchdog pair (CW-P2-T2): API probe + crash-loop event half
 # (`Vagus.Core.Watchdog.Supervisor` returns :ignore when unset — same

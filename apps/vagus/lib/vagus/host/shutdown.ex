@@ -88,17 +88,17 @@ defmodule Vagus.Host.Shutdown do
 
   ## Watchdog stand-down
 
-  `Vagus.Addon.Watchdog` restarts an app on any `die` event while
-  `Vagus.Addon.State` says `state: :started, watchdog: true`. A user's stop
-  records `:stopped` first, so its `die` is ignored; the shutdown's stops
-  deliberately do not (`Vagus.App.Orchestrator.shutdown/2`), so the next boot
-  starts the same apps, and every `docker stop` would otherwise look like a
-  crash and restart an app that erlinit then SIGKILLs moments later.
+  An app's process restarts its container on a `die` while it is wanted
+  started with its watchdog on. A user's stop records `:stopped` first, so
+  its `die` is ignored; the shutdown's halts deliberately do not
+  (`Vagus.App.Orchestrator.shutdown/2`), so the next boot starts the same
+  apps, and every `docker stop` would otherwise look like a crash and restart
+  an app that erlinit then SIGKILLs moments later.
 
   `in_flight?/0` closes that gap: `do_run/2` sets a `:persistent_term` flag
-  before the stop stages and the watchdog checks it before any restart. A
-  `:persistent_term`, not watchdog state, because it must survive the
-  watchdog restarting mid-shutdown. It stays set once the stages finish: the
+  before the stop stages and an app's process checks it before any restart.
+  A `:persistent_term`, not process state, because it must survive an app
+  process restarting mid-shutdown. It stays set once the stages finish: the
   reboot always follows. The exception is the runtime call itself failing:
   the device is not going down, so the flag is erased, the orchestrator
   boots the apps again, and the failure propagates.

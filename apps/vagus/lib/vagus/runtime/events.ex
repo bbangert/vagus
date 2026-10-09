@@ -10,7 +10,19 @@ defmodule Vagus.Runtime.Events do
   Mint connection in **active** mode inside a `GenServer` (house pattern —
   see `Vagus.DNS`, `Vagus.Core.ApiSocket`), reassembles the line-delimited
   JSON across TCP/chunk boundaries, and fans decoded events out to
-  subscribers as `{:docker_event, map}`.
+  subscribers as `{:docker_event, map}`. An app container's event also goes
+  to that app's process, looked up in `Vagus.App.Directory` as each event is
+  sent, so a restarted app process gets the next one without subscribing.
+
+  ## After a reconnect
+
+  Events missed while the stream was down are never replayed, so each time a
+  connection is answered (the first included) the managed containers are
+  listed and each app process is sent its container's state as the event it
+  missed: a running one as `start`, an exited one as `die` with its exit
+  code. The app process ignores one about a container it does not hold, so a
+  repeat is harmless. The list runs in a task; only the default-named
+  instance lists unless `:list` is given.
 
   ## Filtering — server-side + client-side
 
@@ -102,6 +114,8 @@ defmodule Vagus.Runtime.Events do
 
   @impl GenServer
   def init(opts) do
+    name = Keyword.get(opts, :name, __MODULE__)
+
     state = %{
       socket: Keyword.get(opts, :socket, Docker.socket_path()),
       conn: nil,
@@ -111,7 +125,9 @@ defmodule Vagus.Runtime.Events do
       backoff_ms: @initial_backoff_ms,
       # The pending :connect retry timer, if any — kept so a second drop can
       # never arm a second retry loop beside it.
-      reconnect_timer: nil
+      reconnect_timer: nil,
+      route: Keyword.get(opts, :route, &route/1),
+      list: Keyword.get_lazy(opts, :list, fn -> default_list(name) end)
     }
 
     {:ok, state, {:continue, :connect}}
@@ -252,6 +268,7 @@ defmodule Vagus.Runtime.Events do
   defp handle_response({:status, ref, status}, state) do
     if ref == state.request_ref do
       Logger.debug("Vagus.Runtime.Events: connected, status #{status}")
+      if status == 200, do: resync(state)
       %{state | backoff_ms: @initial_backoff_ms}
     else
       state
@@ -351,8 +368,61 @@ defmodule Vagus.Runtime.Events do
       }
 
       Enum.each(state.subscribers, fn {pid, _ref} -> send(pid, {:docker_event, payload}) end)
+      state.route.(payload)
     end
   end
+
+  defp route(%{name: "addon_" <> slug} = payload) do
+    case Registry.lookup(Vagus.App.Directory, {:slug, slug}) do
+      [{pid, _value}] -> send(pid, {:docker_event, payload})
+      [] -> :ok
+    end
+  rescue
+    # The directory is restarting; its app processes start over without it.
+    ArgumentError -> :ok
+  end
+
+  defp route(_payload), do: :ok
+
+  defp default_list(__MODULE__), do: &list_apps/1
+  defp default_list(_name), do: nil
+
+  defp list_apps(socket), do: Docker.list_containers(all: true, socket: socket)
+
+  defp resync(%{list: nil}), do: :ok
+
+  defp resync(%{list: list, route: route, socket: socket}) do
+    Task.Supervisor.start_child(Vagus.TaskSupervisor, fn ->
+      case list.(socket) do
+        {:ok, containers} -> containers |> Enum.flat_map(&missed/1) |> Enum.each(route)
+        {:error, reason} -> Logger.warning("Vagus.Runtime.Events: no resync: #{inspect(reason)}")
+      end
+    end)
+  catch
+    :exit, _reason -> :ok
+  end
+
+  defp missed(%{"Id" => id, "Names" => names, "State" => state} = container) do
+    with [name] <- for("/addon_" <> _ = n <- List.wrap(names), do: String.trim_leading(n, "/")),
+         {action, code} when action != nil <- missed_action(state, container["Status"]) do
+      [%{action: action, name: name, id: id, exit_code: code, time_nano: nil, attributes: %{}}]
+    else
+      _ -> []
+    end
+  end
+
+  defp missed(_container), do: []
+
+  defp missed_action("running", _status), do: {"start", nil}
+
+  defp missed_action(state, status) when state in ["exited", "dead"] do
+    case Regex.run(~r/^Exited \((-?\d+)\)/, status || "") do
+      [_, code] -> {"die", String.to_integer(code)}
+      nil -> {"die", nil}
+    end
+  end
+
+  defp missed_action(_state, _status), do: {nil, nil}
 
   defp parse_exit_code(nil), do: nil
   defp parse_exit_code(code) when is_integer(code), do: code
