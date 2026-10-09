@@ -796,7 +796,7 @@ defmodule Vagus.App.StepsTest do
     end
 
     # A name too long for the filesystem fails for root too, unlike a mode.
-    test "a data dir it cannot remove is the step's error, naming the path", ctx do
+    test "a data dir it cannot remove is the step's error; the path is only logged", ctx do
       File.mkdir_p!(ctx.data_root)
       root = Path.join(ctx.data_root, String.duplicate("x", 300))
       parent = Path.join([root, "addons", "data"])
@@ -805,7 +805,12 @@ defmodule Vagus.App.StepsTest do
       input =
         input(ctx, %{data_root: root, staging_dir: Path.join(parent, ".restore-test_app-1")})
 
-      assert {:error, {:remove_data_dir, ^data_dir, :enametoolong}} = Steps.run(:swap_data, input)
+      log =
+        capture_log(fn ->
+          assert {:error, {:remove_data_dir, :enametoolong}} = Steps.run(:swap_data, input)
+        end)
+
+      assert log =~ data_dir
     end
   end
 
@@ -906,13 +911,18 @@ defmodule Vagus.App.StepsTest do
     # A name too long for the filesystem fails for root too, unlike a mode.
     # Its parent must exist: lookup stops at a missing one with `:enoent`,
     # which `rm_rf` takes as already removed.
-    test "a data dir it cannot remove is the step's error, naming the path", ctx do
+    test "a data dir it cannot remove is the step's error; the path is only logged", ctx do
       File.mkdir_p!(ctx.data_root)
       root = Path.join(ctx.data_root, String.duplicate("x", 300))
       data_dir = Path.join([root, "addons", "data", "test_app"])
 
-      assert {:error, {:remove_data_dir, ^data_dir, :enametoolong}} =
-               Steps.run(:remove_app, input(ctx, %{data_root: root}))
+      log =
+        capture_log(fn ->
+          assert {:error, {:remove_data_dir, :enametoolong}} =
+                   Steps.run(:remove_app, input(ctx, %{data_root: root}))
+        end)
+
+      assert log =~ data_dir
     end
 
     test "refuses to rm_rf outside the data dir for an unsafe slug", ctx do

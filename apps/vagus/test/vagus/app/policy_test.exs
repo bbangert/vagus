@@ -478,7 +478,7 @@ defmodule Vagus.App.PolicyTest do
           do: assert(%{op: ^op, steps: ^steps} = Policy.plan(op, args, running()))
     end
 
-    test "backups: cold stops; hot runs the hooks on any container it may hold; native only snapshots" do
+    test "backups: cold stops; hot always runs a container app's hooks; native only snapshots" do
       cold = running(%{config: app_config(%{"backup" => "cold"})})
 
       assert Policy.plan(:backup, %{}, cold).steps ==
@@ -494,8 +494,12 @@ defmodule Vagus.App.PolicyTest do
       assert Policy.plan(:backup, %{}, app(%{config: hooks, container_id: nil})).steps ==
                [{:exec_hook, :pre}, {:snapshot, nil}, {:exec_hook, :post}]
 
+      # A stop the engine refused yet tolerated leaves a container these
+      # facts no longer know; the hook step skips one that is not there.
       stopped = app(%{config: hooks, wanted: :stopped, last_event: :stopped})
-      assert Policy.plan(:backup, %{}, stopped).steps == [{:snapshot, nil}]
+
+      assert Policy.plan(:backup, %{}, stopped).steps ==
+               [{:exec_hook, :pre}, {:snapshot, nil}, {:exec_hook, :post}]
 
       native = running(%{config: %{native_config() | backup_pre: "pre"}})
       assert Policy.plan(:backup, %{}, native).steps == [{:snapshot, nil}]
@@ -622,10 +626,11 @@ defmodule Vagus.App.PolicyTest do
       assert List.last(effects) == {:step, {:stop, :strict}}
       assert %{strict: true} = Policy.task_input({:stop, :strict}, data)
       refute Map.has_key?(Policy.task_input({:stop, nil}, data), :strict)
-      assert %{wanted: :stopped, token_hash: nil} = data
+      assert %{wanted: :started, token_hash: nil} = data
 
       {data, effects} = step(data, {:ok, %{was_running: true}})
       assert List.last(effects) == {:step, {:swap_data, nil}}
+      assert data.wanted == :stopped
       assert %{staging_dir: "/s"} = Policy.task_input({:swap_data, nil}, data)
 
       {data, effects} = step(data, {:ok, "/data/addons/data/app_one"})
@@ -694,20 +699,32 @@ defmodule Vagus.App.PolicyTest do
       assert %{user_options: %{"o" => 2}, options_rev: 1} = data
     end
 
-    # A container the engine failed to stop may still be writing the dir.
-    test "restore: a strict stop's engine error ends it before the swap" do
+    # A container the engine failed to stop may still be writing the dir, so
+    # the data stays as it was, and so does the app, as after a backup's.
+    test "restore: a strict stop's engine error ends it before the swap and starts the app again" do
       args = %{staging_dir: "/s", options: %{"o" => 2}, start?: true}
       {data, _} = begin(:restore, args, running(%{user_options: %{"o" => 1}}))
       {data, effects} = step(data, {:error, :econnrefused})
-      assert List.last(effects) == {:step, {:stop, :by_name}}
-
-      {data, effects} = step(data, {:ok, %{was_running: true}})
-
-      assert [:persist, {:reply, {:error, {:stop, :econnrefused}}}, :idle] =
-               Enum.reject(effects, &match?({:emit, _}, &1))
-
+      assert List.last(effects) == {:step, {:start, nil}}
       refute Enum.any?(effects, &match?({:step, {:swap_data, _}}, &1))
-      assert %{user_options: %{"o" => 1}, wanted: :stopped, run: %{steps: []}} = data
+
+      {data, effects} = step(data, {:ok, %{container_id: "c2", ip: @ip}})
+
+      assert Enum.take(effects, -3) ==
+               [:persist, {:reply, {:error, {:stop, :econnrefused}}}, :idle]
+
+      assert %{user_options: %{"o" => 1}, wanted: :started, container_id: "c2"} = data
+    end
+
+    test "restore: a strict stop's engine error leaves a stopped app stopped" do
+      args = %{staging_dir: "/s", options: nil, start?: true}
+      {data, _} = begin(:restore, args, app(%{wanted: :stopped}))
+      {data, effects} = step(data, {:error, :econnrefused})
+
+      assert Enum.reject(effects, &match?({:emit, _}, &1)) ==
+               [:persist, {:reply, {:error, {:stop, :econnrefused}}}, :idle]
+
+      assert data.wanted == :stopped
     end
 
     test "restore: a failed swap ends it before the options are touched" do
@@ -980,6 +997,37 @@ defmodule Vagus.App.PolicyTest do
       assert List.last(effects) == {:step, {:start, nil}}
       {_data, effects} = step(data, {:ok, %{container_id: "c2", ip: @ip}})
       assert Enum.take(effects, -3) == [:persist, {:reply, {:ok, "/s/app_one.tar.gz"}}, :idle]
+    end
+
+    # The snapshot is done before the restart, so it stands however the
+    # restart fails; the app's failure is its own, on the ladder.
+    test "backup cold: a restart that dies keeps the snapshot and joins the ladder" do
+      cold = running(%{config: app_config(%{"backup" => "cold"})})
+      {data, _} = begin(:backup, %{staging_dir: "/s"}, cold)
+      {data, _} = step(data, {:ok, %{was_running: true}})
+      {data, _} = step(data, {:ok, "/s/app_one.tar.gz"})
+
+      for dead <- [:died, :timeout] do
+        {data, effects} = step(data, {:error, dead})
+        assert List.last(effects) == {:step, {:stop, :by_name}}
+        {data, effects} = step(data, {:ok, %{was_running: false}})
+
+        assert [:persist, {:reply, {:ok, "/s/app_one.tar.gz"}}, {:timer, :retry, _, _}, :idle] =
+                 Enum.reject(effects, &match?({:emit, _}, &1))
+
+        assert %{last_event: {:failed, ^dead}, attempt: 1} = data
+      end
+    end
+
+    test "backup cold: a restart that errors keeps the snapshot" do
+      cold = running(%{config: app_config(%{"backup" => "cold"})})
+      {data, _} = begin(:backup, %{staging_dir: "/s"}, cold)
+      {data, _} = step(data, {:ok, %{was_running: true}})
+      {data, _} = step(data, {:ok, "/s/app_one.tar.gz"})
+      {data, effects} = step(data, {:error, :enospc})
+
+      assert Enum.take(effects, -3) == [:persist, {:reply, {:ok, "/s/app_one.tar.gz"}}, :idle]
+      assert data.last_event == {:failed, :enospc}
     end
 
     test "backup cold of a stopped app does not start it" do

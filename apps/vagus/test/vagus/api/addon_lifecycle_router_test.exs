@@ -335,14 +335,14 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
 
     # A name too long for the filesystem fails for root too, unlike a mode;
     # setup restores the data root.
-    test "a data dir that cannot be removed -> 500 naming it; the app is gone" do
+    test "a data dir that cannot be removed -> 500 without its path; the app is gone" do
       root = Path.join(System.tmp_dir!(), String.duplicate("x", 300))
       Application.put_env(:vagus, :addon_data_root, root)
-      data_dir = Path.join([root, "addons", "data", "core_uninstallme"])
 
       conn = supervisor_call(:post, "/addons/core_uninstallme/uninstall")
       assert conn.status == 500
-      assert body(conn)["message"] =~ data_dir
+      assert body(conn)["message"] =~ "its data could not be removed (:enametoolong)"
+      refute body(conn)["message"] =~ root
       assert :error = app_info("core_uninstallme")
     end
 

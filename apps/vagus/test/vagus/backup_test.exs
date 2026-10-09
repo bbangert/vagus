@@ -79,6 +79,48 @@ defmodule Vagus.BackupTest do
     refute inspect(files) =~ "h0st-s3cret"
   end
 
+  # The race itself cannot be won on demand: each case hands the read a
+  # name that now opens something other than what was lstat'd.
+  describe "read_regular/2 after an lstat" do
+    test "a name swapped for a symlink to a host file is skipped", %{data: data} do
+      host = Path.join(Path.dirname(data), "host_secret")
+      File.write!(host, "h0st-s3cret")
+      {:ok, seen} = File.lstat(Path.join(data, "options.json"))
+      link = Path.join(data, "swapped")
+      File.ln_s!(host, link)
+
+      assert Backup.read_regular(link, seen) == :skip
+    end
+
+    test "a file grown since its lstat is read only to the lstat'd size", %{data: data} do
+      path = Path.join(data, "growing")
+      File.write!(path, "12345")
+      {:ok, seen} = File.lstat(path)
+      File.write!(path, "6789", [:append])
+
+      assert Backup.read_regular(path, seen) == {:ok, "12345"}
+    end
+
+    test "the same device and inode is the same file; a different inode is not" do
+      seen = %File.Stat{type: :regular, major_device: 8, minor_device: 1, inode: 42}
+
+      assert Backup.same_file?(seen, seen)
+      refute Backup.same_file?(seen, %{seen | inode: 43})
+      refute Backup.same_file?(seen, %{seen | minor_device: 2})
+      refute Backup.same_file?(seen, %{seen | type: :device})
+    end
+  end
+
+  test "an app's data beyond the byte cap fails the snapshot rather than filling memory", %{
+    data: data
+  } do
+    addon = %{slug: "x", version: "1", data_dir: data}
+    total = byte_size(~s({"require_certificate":false})) + byte_size("nested content")
+
+    assert {:ok, _gz, _size} = Backup.addon_tar(Map.put(addon, :max_bytes, total))
+    assert {:error, :too_large} = Backup.addon_tar(Map.put(addon, :max_bytes, total - 1))
+  end
+
   test "extract_addon on an absent add-on → :not_in_backup", %{data: data} do
     {:ok, tar} = Backup.create(spec(data))
     assert {:error, :not_in_backup} = Backup.extract_addon(tar, "core_ghost")

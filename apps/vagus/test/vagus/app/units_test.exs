@@ -59,6 +59,8 @@ defmodule Vagus.App.UnitsTest do
       base = Path.join(System.tmp_dir!(), "vagus-units-#{System.unique_integer([:positive])}")
       prev = Application.fetch_env(:vagus, :addon_data_root)
       Application.put_env(:vagus, :addon_data_root, Path.join(base, "data"))
+      prev_dir = Vagus.Backups.dir()
+      Vagus.Backups.set_dir(Path.join([base, "data", "backup"]))
 
       on_exit(fn ->
         case prev do
@@ -66,13 +68,14 @@ defmodule Vagus.App.UnitsTest do
           :error -> Application.delete_env(:vagus, :addon_data_root)
         end
 
+        Vagus.Backups.set_dir(prev_dir)
         File.rm_rf(base)
       end)
 
-      %{staging: Path.join(base, "staging")}
+      %{staging: Path.join([base, "data", ".backup-staging"])}
     end
 
-    test "clears the backup staging beside the configured data root", %{staging: staging} do
+    test "clears the backup staging in the running store's data root", %{staging: staging} do
       leftover = Path.join(staging, "backup-deadbeef-1")
       File.mkdir_p!(leftover)
 

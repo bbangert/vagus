@@ -519,17 +519,16 @@ defmodule Vagus.App.Policy do
     [{:pull, nil}, stop] ++ snapshot ++ [{:commit, nil}, {:start?, nil}, {:reclaim_image, nil}]
   end
 
-  # Hooks go to any container that may be running, by name: this process's
-  # last-seen state can lag the engine, and one that is not there skips them.
+  # A hot backup always plans its hooks, by name: this process's facts can
+  # miss a container the engine refused to stop, and a container that is not
+  # there skips them.
   defp steps(:backup, _args, data) do
     cond do
       data.config.backup == "cold" -> [{:stop, :strict}, {:snapshot, nil}, {:start?, nil}]
-      Steps.native?(data.config) or not hooked?(data) -> [{:snapshot, nil}]
+      Steps.native?(data.config) -> [{:snapshot, nil}]
       true -> hook(data, :pre) ++ [{:snapshot, nil}] ++ hook(data, :post)
     end
   end
-
-  defp hooked?(data), do: data.container_id != nil or data.wanted == :started
 
   defp start_steps, do: [{:port?, nil}, {:mint_token, nil}, {:start, nil}]
 
@@ -658,7 +657,7 @@ defmodule Vagus.App.Policy do
 
   defp before_task({name, _}, data) when name in [:stop, :halt_stop] do
     {data, effects} = drop_run_keys(data)
-    data = if data.run.op in [:stop, :restore], do: %{data | wanted: :stopped}, else: data
+    data = if data.run.op == :stop, do: %{data | wanted: :stopped}, else: data
     {data, effects ++ cancel_timers()}
   end
 
@@ -690,8 +689,12 @@ defmodule Vagus.App.Policy do
     do: fail(data, {:unplanned, run.op, run.step, outcome}, [])
 
   # The one recovery after a dead or timed-out step that touched the
-  # container: its state is unknown, so it is removed by name. It always ends
-  # the op as a failure, then the restart rule.
+  # container: its state is unknown, so it is removed by name. It ends the op
+  # as a failure, then the restart rule; a cold backup still replies its
+  # result, settled before the restart, as when the restart errors.
+  defp on_outcome(:backup, :stop, :by_name, _outcome, %{run: %{acc: %{result: result}}} = data),
+    do: close(put_acc(release(data), :cleaned, true), result, [])
+
   defp on_outcome(_op, :stop, :by_name, _outcome, data),
     do: fail(put_acc(release(data), :cleaned, true), data.run.acc.cause, [])
 
@@ -744,24 +747,25 @@ defmodule Vagus.App.Policy do
   end
 
   # A backup's stop cancels the restart a crashed app was waiting for, so one
-  # that should run is started again like one that ran.
+  # that should run is started again like one that ran. A restore gives up
+  # what the app wanted only once its stop held: after a failed one the data
+  # is untouched, and the app comes back.
   defp on_outcome(op, :stop, _strict, {:ok, %{was_running: was_running}}, data) do
     was_running = was_running or (op == :backup and data.wanted == :started)
     data = put_acc(%{release(data) | last_event: :stopped}, :was_running, was_running)
-    advance(data, [])
+    advance(if(op == :restore, do: %{data | wanted: :stopped}, else: data), [])
   end
 
   # Its token is already revoked, so an app that should run is started again
   # in place of a container that may still run, as after a failed snapshot.
-  # Nothing is committed: an update keeps its old version.
+  # Nothing is committed: an update keeps its old version, a restore its data.
   defp on_outcome(op, :stop, :strict, {:error, reason}, data)
-       when op in [:backup, :update] and reason not in [:died, :timeout] do
+       when op in [:backup, :update, :restore] and reason not in [:died, :timeout] do
     was_running = running?(data) or data.wanted == :started
     data = put_acc(release(data), :result, {:error, {:stop, reason}})
     advance(put_steps(put_acc(data, :was_running, was_running), [{:start?, nil}]), [])
   end
 
-  # A strict stop's error lands here too, so a restore ends before its swap.
   defp on_outcome(_op, :stop, _strict, {:error, reason}, data),
     do: cleanup(data, {:stop, reason}, [])
 
@@ -860,12 +864,12 @@ defmodule Vagus.App.Policy do
   defp finish(%{run: run} = data, effects),
     do: {data, effects ++ [:persist, {:reply, result(run, data)}, :idle]}
 
-  defp result(%{op: :update, acc: %{result: result}}, _data), do: result
+  defp result(%{acc: %{result: result}}, _data), do: result
 
   defp result(%{op: :update, acc: acc}, data),
     do: {:ok, %{slug: data.slug, from: acc.old.version, to: data.config.version}}
 
-  defp result(%{op: :backup, acc: acc}, _data), do: Map.get(acc, :result, {:ok, nil})
+  defp result(%{op: :backup}, _data), do: {:ok, nil}
   defp result(_run, _data), do: :ok
 
   # An install that fails leaves no file and no process. Otherwise a retry
@@ -876,11 +880,13 @@ defmodule Vagus.App.Policy do
   defp fail(%{gone: true} = data, reason, effects),
     do: {data, effects ++ [{:reply, {:error, reason}}, :exit]}
 
-  defp fail(%{run: run} = data, reason, effects) do
+  defp fail(data, reason, effects), do: close(data, {:error, reason}, effects)
+
+  defp close(%{run: run} = data, reply, effects) do
     {data, retry} =
       if run.args[:retry] || run.acc[:cleaned], do: retry(data, []), else: {data, []}
 
-    {data, effects ++ [:persist, {:reply, {:error, reason}}] ++ retry ++ [:idle]}
+    {data, effects ++ [:persist, {:reply, reply}] ++ retry ++ [:idle]}
   end
 
   defp put_steps(data, steps), do: put_in(data.run.steps, steps)

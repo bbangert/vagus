@@ -168,14 +168,15 @@ defmodule Vagus.Backups do
   end
 
   @doc """
-  Where backups are staged: beside the data root (`backup_dir` is
-  `<data_root>/backup`), so outside every tree a `map:` key mounts into an
-  app. Vagus writes, reads and removes there as root, and a symlink an app
-  planted would be followed.
+  Where backups are staged: in the data root (`backup_dir` is
+  `<data_root>/backup`), outside every tree a `map:` key mounts into an app.
+  Vagus writes, reads and removes there as root, and a symlink an app
+  planted would be followed. Distinctly named, since the boot sweep removes
+  it whole.
   """
   @spec staging_root(Path.t()) :: Path.t()
   def staging_root(backup_dir),
-    do: backup_dir |> Path.dirname() |> Path.dirname() |> Path.join("staging")
+    do: backup_dir |> Path.dirname() |> Path.join(".backup-staging")
 
   @doc """
   Assembles and indexes the backup from the staged snapshot of every slug in
@@ -246,13 +247,14 @@ defmodule Vagus.Backups do
   Removes the staging a backup or restore left when its caller died before
   finishing it, which nothing else removes. Only safe while no backup or
   restore can be in flight, so `Vagus.App.Units.sweep/0` runs it once per
-  VM, at the first boot before any app is started.
+  VM, at the first boot before any app is started. The staging root is the
+  running store's, as `begin_partial/2` uses.
   """
   @spec sweep_stale(keyword()) :: :ok
   # path is internal/config-derived, not request input
   # sobelow_skip ["Traversal.FileModule"]
   def sweep_stale(opts \\ []) do
-    File.rm_rf(staging_root(backup_dir(opts)))
+    File.rm_rf(staging_root(dir(Keyword.get(opts, :server, __MODULE__))))
     restores = Path.join([data_root(opts), "addons", "data", ".restore-*"])
     for path <- Path.wildcard(restores, match_dot: true), do: File.rm_rf(path)
     :ok

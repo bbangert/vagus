@@ -2851,8 +2851,8 @@ defmodule Vagus.API.Router do
   defp app_failure({:persist, reason}),
     do: {500, "The app's state could not be saved: #{inspect(reason)}"}
 
-  defp app_failure({:remove_data_dir, path, reason}),
-    do: {500, "The app was uninstalled but #{path} could not be removed (#{inspect(reason)})"}
+  defp app_failure({:remove_data_dir, reason}),
+    do: {500, "The app was uninstalled but its data could not be removed (#{inspect(reason)})"}
 
   defp app_failure(reason), do: {400, inspect(reason)}
 
@@ -3403,6 +3403,9 @@ defmodule Vagus.API.Router do
 
   defp restore_error_message({:restore, addon_slug, {:staging, reason}}),
     do: "Restore of addon #{addon_slug} could not stage its data: #{inspect(reason)}"
+
+  defp restore_error_message({:restore, addon_slug, {:remove_data_dir, reason}}),
+    do: "Restore of addon #{addon_slug} could not clear its data: #{inspect(reason)}"
 
   defp restore_error_message({:restore, addon_slug, reason}),
     do: "Restore of addon #{addon_slug} failed: #{inspect(reason)}"

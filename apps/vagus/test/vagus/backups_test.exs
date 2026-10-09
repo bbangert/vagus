@@ -317,7 +317,8 @@ defmodule Vagus.BackupsTest do
 
     test "the boot sweep clears staging a crashed VM left behind", %{
       data_root: dr,
-      backup_dir: backup_dir
+      backup_dir: backup_dir,
+      server: server
     } do
       leftover = Path.join(Backups.staging_root(backup_dir), "backup-deadbeef-1")
       File.mkdir_p!(leftover)
@@ -327,7 +328,7 @@ defmodule Vagus.BackupsTest do
       File.mkdir_p!(Path.join([parent, ".restore-core_a-1", "sub"]))
       File.mkdir_p!(Path.join(parent, "core_a"))
 
-      assert :ok = Backups.sweep_stale(dir: backup_dir, data_root: dr)
+      assert :ok = Backups.sweep_stale(server: server, data_root: dr)
 
       refute File.exists?(Backups.staging_root(backup_dir))
       assert File.ls!(parent) == ["core_a"]
@@ -350,12 +351,12 @@ defmodule Vagus.BackupsTest do
       assert File.dir?(restore)
     end
 
-    test "each backup stages in its own new root-only dir beside the data root", %{
+    test "each backup stages in its own new root-only dir in the data root", %{
       data_root: dr,
       backup_dir: backup_dir,
       server: server
     } do
-      root = Path.join(Path.dirname(dr), "staging")
+      root = Path.join(dr, ".backup-staging")
       assert Backups.staging_root(backup_dir) == root
       opts = [server: server, date: "2026-07-21T00:00:00Z"]
 
@@ -572,7 +573,7 @@ defmodule Vagus.BackupsTest do
     end
 
     # The stop the engine failed may have left the container writing the dir.
-    test "a strict stop's engine error fails the restore before the swap", %{
+    test "a strict stop's engine error fails the restore before the swap; the app runs on", %{
       data_root: dr,
       server: server
     } do
@@ -586,15 +587,14 @@ defmodule Vagus.BackupsTest do
 
       assert_receive {:step, :stop, %{slug: ^slug, strict: true}, task}, 5_000
       send(task, {:outcome, {:error, :econnrefused}})
-      assert_receive {:step, :stop, %{slug: ^slug} = by_name, task}, 5_000
-      refute Map.has_key?(by_name, :strict)
-      send(task, {:outcome, {:ok, %{was_running: false}}})
+      assert_receive {:step, :start, %{slug: ^slug}, task}, 5_000
+      send(task, {:outcome, {:ok, %{container_id: "c2"}}})
 
       assert {:error, {:restore, ^slug, {:stop, :econnrefused}}} = Task.await(restore)
       refute_received {:step, :swap_data, _input, _task}
       assert File.read!(Path.join(data_dir(dr, slug), "f.txt")) == "since"
       assert restore_leftovers(dr) == []
-      assert {:ok, %{user_options: %{"greet" => "since"}}} = app_info(slug)
+      assert {:ok, %{state: :started, user_options: %{"greet" => "since"}}} = app_info(slug)
     end
 
     test "restore onto a not-installed slug errors", %{data_root: dr, server: server} do

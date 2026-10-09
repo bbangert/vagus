@@ -25,6 +25,8 @@ defmodule Vagus.Backup do
   memory) and tests.
   """
 
+  require Logger
+
   @version 2
   # Bomb guards. Binary API: the outer tar is uncompressed so its own size
   # is the bound (@max_outer applies to `read/1`/`extract_addon/2` ONLY —
@@ -282,13 +284,15 @@ defmodule Vagus.Backup do
 
     data_members =
       addon.data_dir
-      |> read_dir()
+      |> read_dir(Map.get(addon, :max_bytes, @max_outer))
       |> Enum.map(fn {rel, content} -> {"./data/#{rel}", content} end)
 
     gz = write_tar([{"./addon.json", addon_json} | data_members], compressed: true)
     {:ok, gz, byte_size(gz)}
   rescue
     e -> {:error, {:addon_tar, addon.slug, Exception.message(e)}}
+  catch
+    :throw, :too_large -> {:error, :too_large}
   end
 
   # Recursively read a directory into [{relative_path, content}]. Absent dir → [].
@@ -296,31 +300,95 @@ defmodule Vagus.Backup do
   # resolves on the host, so one is never followed, only skipped. A running
   # app keeps writing through the walk, so the window between its writes and
   # an entry's lstat and read is upstream's own: its tar never pauses either.
+  # In that window the app can rename a symlink over a name already lstat'd:
+  # a file is read only through a descriptor that is still the lstat'd file,
+  # and a directory swapped that way (the BEAM has no `openat`) is bounded by
+  # `max_bytes` across the walk rather than reading the host into memory.
   # path is internal/config-derived, not request input
   # sobelow_skip ["Traversal.FileModule"]
-  defp read_dir(dir) do
+  defp read_dir(dir, max_bytes) do
     case File.lstat(dir) do
-      {:ok, %File.Stat{type: :directory}} -> read_tree(dir, [])
-      _absent_or_not_a_directory -> []
+      {:ok, %File.Stat{type: :directory}} ->
+        read_tree(dir, [], {[], max_bytes}) |> elem(0) |> Enum.reverse()
+
+      _absent_or_not_a_directory ->
+        []
     end
   end
 
   # sobelow_skip ["Traversal.FileModule"]
-  defp read_tree(root, rel) do
+  defp read_tree(root, rel, acc) do
     [root | rel]
     |> Path.join()
     |> File.ls!()
     |> Enum.sort()
-    |> Enum.flat_map(fn name ->
+    |> Enum.reduce(acc, fn name, {members, left} = acc ->
       member = rel ++ [name]
       path = Path.join([root | member])
 
       case File.lstat(path) do
-        {:ok, %File.Stat{type: :directory}} -> read_tree(root, member)
-        {:ok, %File.Stat{type: :regular}} -> [{Path.join(member), File.read!(path)}]
-        _symlink_or_special -> []
+        {:ok, %File.Stat{type: :directory}} ->
+          read_tree(root, member, acc)
+
+        {:ok, %File.Stat{type: :regular, size: size}} when size > left ->
+          throw(:too_large)
+
+        {:ok, %File.Stat{type: :regular} = seen} ->
+          case read_regular(path, seen) do
+            {:ok, content} -> {[{Path.join(member), content} | members], left - seen.size}
+            :skip -> skipped(member, acc)
+          end
+
+        _symlink_or_special ->
+          acc
       end
     end)
+  end
+
+  defp skipped(member, acc) do
+    Logger.warning("Vagus.Backup: #{Path.join(member)} changed while read; not backed up")
+    acc
+  end
+
+  @doc false
+  # Reads at most the lstat'd size, so a file that grows or a device swapped
+  # in cannot be read without bound.
+  @spec read_regular(Path.t(), File.Stat.t()) :: {:ok, binary()} | :skip
+  def read_regular(path, %File.Stat{size: size} = seen) do
+    case :file.open(path, [:raw, :binary, :read]) do
+      {:ok, fd} ->
+        try do
+          with {:ok, info} <- :file.read_file_info(fd),
+               true <- same_file?(seen, File.Stat.from_record(info)),
+               {:ok, content} <- read_at_most(fd, size) do
+            {:ok, content}
+          else
+            _changed_or_failed -> :skip
+          end
+        after
+          :file.close(fd)
+        end
+
+      {:error, _reason} ->
+        :skip
+    end
+  end
+
+  defp read_at_most(_fd, 0), do: {:ok, ""}
+
+  defp read_at_most(fd, size) do
+    case :file.read(fd, size) do
+      :eof -> {:ok, ""}
+      other -> other
+    end
+  end
+
+  @doc false
+  @spec same_file?(File.Stat.t(), File.Stat.t()) :: boolean()
+  def same_file?(%File.Stat{} = seen, %File.Stat{} = opened) do
+    opened.type == :regular and
+      {seen.major_device, seen.minor_device, seen.inode} ==
+        {opened.major_device, opened.minor_device, opened.inode}
   end
 
   ## tar helpers

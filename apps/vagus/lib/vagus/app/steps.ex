@@ -85,6 +85,10 @@ defmodule Vagus.App.Steps do
          {:ok, id} <- backend(opts).create(spec),
          :ok <- start_or_cleanup(id, opts) do
       {:ok, started(config, id, opts)}
+    else
+      error ->
+        Logger.warning("Vagus.App.Steps: #{config.slug} did not start: #{inspect(error)}")
+        error
     end
   end
 
@@ -116,8 +120,8 @@ defmodule Vagus.App.Steps do
     pick_port(directory, probe, rand, @port_tries)
   end
 
-  # Planned for an app wanted started, whose container may not exist: with
-  # none, nothing is writing, so there is nothing for the hook to quiesce.
+  # Planned for every hot backup, whose container may not exist: with none,
+  # nothing is writing, so there is nothing for the hook to quiesce.
   defp step(:exec_hook, %{config: config, cmd: cmd} = input) do
     docker = input[:docker] || Vagus.Runtime.Docker
     id = container_name(config.slug)
@@ -131,6 +135,7 @@ defmodule Vagus.App.Steps do
         {:ok, :skipped}
 
       {:error, reason} ->
+        Logger.warning("Vagus.App.Steps: backup hook in #{id} failed: #{inspect(reason)}")
         {:error, reason}
     end
   end
@@ -180,7 +185,7 @@ defmodule Vagus.App.Steps do
 
       {:error, reason, path} ->
         File.rm_rf(staging)
-        {:error, {:remove_data_dir, path, reason}}
+        data_dir_failure(config.slug, path, reason)
 
       error ->
         File.rm_rf(staging)
@@ -874,7 +879,7 @@ defmodule Vagus.App.Steps do
     if Config.valid_slug?(slug) do
       case File.rm_rf(Path.join([data_root(opts), "addons", "data", slug])) do
         {:ok, _removed} -> :ok
-        {:error, reason, path} -> {:error, {:remove_data_dir, path, reason}}
+        {:error, reason, path} -> data_dir_failure(slug, path, reason)
       end
     else
       Logger.warning(
@@ -883,6 +888,13 @@ defmodule Vagus.App.Steps do
 
       {:error, {:invalid_slug, slug}}
     end
+  end
+
+  # The path names a file inside the app's data dir, which the reply must not
+  # disclose: a `hassio_role: backup` app can restore onto another app.
+  defp data_dir_failure(slug, path, reason) do
+    Logger.warning("Vagus.App.Steps: #{slug} data dir: #{path} not removed (#{inspect(reason)})")
+    {:error, {:remove_data_dir, reason}}
   end
 
   # Uninstall only, as upstream: Core answers a push for a panel it already

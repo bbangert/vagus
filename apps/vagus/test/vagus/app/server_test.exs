@@ -509,7 +509,7 @@ defmodule Vagus.App.ServerTest do
     test "an uninstall whose data dir cannot be removed replies why; the file stays gone" do
       {slug, pid} = installed()
       ref = Process.monitor(pid)
-      failure = {:remove_data_dir, "/data/addons/data/#{slug}/locked", :eacces}
+      failure = {:remove_data_dir, :eacces}
 
       t = op(pid, {:uninstall, %{}})
       answer(:stop, {:ok, %{was_running: false}})
