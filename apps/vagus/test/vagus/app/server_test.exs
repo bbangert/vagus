@@ -47,10 +47,20 @@ defmodule Vagus.App.ServerTest do
     assert :ignore = Instances.ensure(slug())
   end
 
+  # A private supervisor, so repeated runs cannot spend the restart budget of
+  # the shared `Vagus.App.Instances`; the via-name still registers the process
+  # in the directory.
   test "killed, it comes back under the same key as a new process" do
     slug = slug()
-    install_app(app_config(slug))
-    [{pid, _}] = lookup(slug)
+    :ok = State.put(app_config(slug), :stopped)
+    on_exit(fn -> State.delete(slug) end)
+
+    sup =
+      start_supervised!(
+        {DynamicSupervisor, strategy: :one_for_one, max_restarts: 10, max_seconds: 60}
+      )
+
+    {:ok, pid} = DynamicSupervisor.start_child(sup, {Server, slug})
     ref = Process.monitor(pid)
 
     Process.exit(pid, :kill)
@@ -59,6 +69,15 @@ defmodule Vagus.App.ServerTest do
     assert new_pid = wait_for_new(slug, pid)
     assert new_pid != pid
     assert {:ok, %{config: %{slug: ^slug}}} = :gen_statem.call(new_pid, :info)
+  end
+
+  test "an unknown question is answered, not a crash" do
+    slug = slug()
+    install_app(app_config(slug))
+    [{pid, _}] = lookup(slug)
+
+    assert {:error, :unknown_question} = :gen_statem.call(pid, :no_such_question)
+    assert Process.alive?(pid)
   end
 
   test "format_status/1 redacts secrets when present" do

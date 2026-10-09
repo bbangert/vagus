@@ -27,8 +27,6 @@ defmodule Vagus.App.Server do
 
   @impl :gen_statem
   def init(slug) do
-    Process.flag(:trap_exit, true)
-
     case State.get(slug) do
       {:ok, _entry} -> {:ok, :idle, %{slug: slug}}
       :error -> :ignore
@@ -44,8 +42,11 @@ defmodule Vagus.App.Server do
     reply_and_stop_if_gone(from, read(slug), &match?({:ok, _entry}, &1))
   end
 
-  # The directory's partition link delivers `EXIT` under `trap_exit`; the
-  # parent's is handled by `:gen_statem` itself.
+  # A typo'd question from one caller must not crash-loop every app process.
+  def handle_event({:call, from}, _question, _state, _data),
+    do: {:keep_state_and_data, [{:reply, from, {:error, :unknown_question}}]}
+
+  # Late replies and stray messages carry nothing this process acts on.
   def handle_event(:info, _message, _state, _data), do: :keep_state_and_data
 
   @impl :gen_statem

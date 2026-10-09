@@ -2387,9 +2387,9 @@ defmodule Vagus.API.Router do
   end
 
   # Store slugs and installed slugs share one namespace (`core_mosquitto` is
-  # both). `GET /store/addons` renders the whole catalog; `App.info/1` only
-  # calls an app process on a directory hit, so a catalog slug that is not
-  # installed costs one ETS lookup. Ask once per slug, not once per question.
+  # both). `GET /store/addons` renders the whole catalog, and a slug that is
+  # not installed still costs `App.info/1` a State call, so ask once per slug,
+  # not once per question.
   defp installed_entry(store_slug) do
     case App.info(store_slug) do
       {:ok, entry} -> entry

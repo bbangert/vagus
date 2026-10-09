@@ -15,8 +15,15 @@ defmodule Vagus.App.Instances do
   @spec stop(String.t()) :: :ok
   def stop(slug) do
     case Registry.lookup(Vagus.App.Directory, {:slug, slug}) do
-      [{pid, _value}] -> :gen_statem.stop(pid, :normal, 5_000)
-      [] -> :ok
+      [{pid, _value}] ->
+        case DynamicSupervisor.terminate_child(__MODULE__, pid) do
+          :ok -> :ok
+          # It exited after the lookup; the directory had not yet dropped it.
+          {:error, :not_found} -> :ok
+        end
+
+      [] ->
+        :ok
     end
   rescue
     # The directory is restarting, and every app process with it.

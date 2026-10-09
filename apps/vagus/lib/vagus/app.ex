@@ -8,6 +8,8 @@ defmodule Vagus.App do
   without touching them.
   """
 
+  require Logger
+
   alias Vagus.Addon.{Config, Manager, State, Update}
   alias Vagus.Addon.Registry, as: Tokens
   alias Vagus.App.{Directory, Instances}
@@ -21,39 +23,38 @@ defmodule Vagus.App do
 
   @spec info(String.t()) :: {:ok, State.entry()} | :error
   def info(slug) do
-    case ask(slug, :info) do
+    case ask_healing(slug, :info) do
       {:ok, {:ok, entry}} -> {:ok, entry}
       _other -> :error
     end
   end
 
   @doc """
-  Every app the directory knows. One that does not answer within the gather
-  deadline but still has a State entry is listed with `state: :unknown`, which
-  `GET /addons` renders as upstream's `unknown`.
+  Every app `Vagus.Addon.State` records, each with its process's answer laid
+  over it. One whose process is missing or does not answer by the deadline is
+  listed with `state: :unknown`, never left out: Home Assistant deletes the
+  device of an app missing from `GET /addons`, with its entities and renames.
   """
   @spec list() :: [State.entry() | %{state: :unknown}]
   def list do
-    Enum.flat_map(gather(:info), fn
-      {_slug, {:ok, {:ok, entry}}} -> [entry]
-      {slug, _unanswered} -> unknown(slug)
+    entries = State.list()
+    answers = entries |> Enum.flat_map(&live(&1.config.slug)) |> ask_all(:info, 1_000)
+
+    Enum.flat_map(entries, fn %{config: %{slug: slug}} = entry ->
+      case Map.get(answers, slug) do
+        {:ok, {:ok, answered}} -> [answered]
+        # Uninstalled since `State.list/0`.
+        {:ok, :error} -> []
+        _unanswered -> [%{entry | state: :unknown}]
+      end
     end)
   end
 
-  defp unknown(slug) do
-    case State.get(slug) do
-      {:ok, entry} -> [%{entry | state: :unknown}]
-      :error -> []
-    end
-  catch
-    :exit, _reason -> []
-  end
-
   @spec installed?(String.t()) :: boolean()
-  def installed?(slug), do: ask(slug, :installed?) == {:ok, true}
+  def installed?(slug), do: ask_healing(slug, :installed?) == {:ok, true}
 
   @spec slugs() :: [String.t()]
-  def slugs, do: Enum.map(directory(), &elem(&1, 0))
+  def slugs, do: Enum.map(State.list(), & &1.config.slug)
 
   @doc """
   `:absent` covers no process for the slug, a dead or unanswering one, and a
@@ -69,45 +70,63 @@ defmodule Vagus.App do
     :exit, _reason -> :absent
   end
 
-  # The directory drops a dead process's key only once its partition handles
-  # the exit, so a lookup can briefly return a pid that is already gone.
+  # An entry whose process is missing (its start failed, or it was stopped
+  # out of band) gets one back here, so the fact stays answerable.
+  defp ask_healing(slug, question) do
+    case ask(slug, question) do
+      :absent -> heal(slug, question)
+      answer -> answer
+    end
+  end
+
+  defp heal(slug, question) do
+    with {:ok, _entry} <- State.get(slug),
+         {:ok, _pid} <- Instances.ensure(slug) do
+      ask(slug, question)
+    else
+      _no_entry_or_no_start -> :absent
+    end
+  end
+
+  # A dead pid can still be listed until the directory's partition handles its
+  # exit; asking it exits `noproc`, which callers already read as no answer.
   defp whereis(slug) do
     case Registry.lookup(Directory, {:slug, slug}) do
-      [{pid, _value}] -> if Process.alive?(pid), do: pid
+      [{pid, _value}] -> pid
       [] -> nil
     end
   rescue
-    # The directory is restarting.
     ArgumentError -> nil
   end
 
+  defp live(slug) do
+    case whereis(slug) do
+      nil -> []
+      pid -> [{slug, pid}]
+    end
+  end
+
   @doc """
-  Asks every app at once under one absolute deadline, so a single stuck app
-  costs the caller `deadline_ms`, not `deadline_ms` per app. Requests still
-  outstanding at the deadline are abandoned by `:gen_statem`, so no late reply
-  reaches the caller's mailbox.
+  Asks every installed app at once under one absolute deadline, so a single
+  stuck app costs the caller `deadline_ms`, not `deadline_ms` per app.
   """
   @spec gather(term(), non_neg_integer()) :: [{String.t(), {:ok, term()} | :absent}]
   def gather(question, deadline_ms \\ 1_000) do
-    deadline = {:abs, System.monotonic_time(:millisecond) + deadline_ms}
-    apps = directory()
-
-    answers =
-      apps
-      |> Enum.reduce(:gen_statem.reqids_new(), fn {slug, pid}, reqids ->
-        :gen_statem.send_request(pid, question, slug, reqids)
-      end)
-      |> collect(deadline, %{})
-
-    Enum.map(apps, fn {slug, _pid} -> {slug, Map.get(answers, slug, :absent)} end)
+    slugs = slugs()
+    answers = slugs |> Enum.flat_map(&live/1) |> ask_all(question, deadline_ms)
+    Enum.map(slugs, &{&1, Map.get(answers, &1, :absent)})
   end
 
-  defp directory do
-    Directory
-    |> Registry.select([{{{:slug, :"$1"}, :"$2", :_}, [], [{{:"$1", :"$2"}}]}])
-    |> Enum.filter(fn {_slug, pid} -> Process.alive?(pid) end)
-  rescue
-    ArgumentError -> []
+  # Requests still outstanding at the deadline are abandoned by `:gen_statem`,
+  # so no late reply reaches the caller's mailbox.
+  defp ask_all(apps, question, deadline_ms) do
+    deadline = {:abs, System.monotonic_time(:millisecond) + deadline_ms}
+
+    apps
+    |> Enum.reduce(:gen_statem.reqids_new(), fn {slug, pid}, reqids ->
+      :gen_statem.send_request(pid, question, slug, reqids)
+    end)
+    |> collect(deadline, %{})
   end
 
   defp collect(reqids, deadline, answers) do
@@ -218,7 +237,10 @@ defmodule Vagus.App do
 
   @spec uninstall(String.t()) :: :ok | {:error, term()}
   def uninstall(slug) do
-    with :ok <- Manager.uninstall(slug), do: Instances.stop(slug)
+    result = Manager.uninstall(slug)
+    # `:not_found` too: an entry deleted out of band can leave its process up.
+    if result in [:ok, {:error, :not_found}], do: Instances.stop(slug)
+    result
   end
 
   @doc """
@@ -227,16 +249,25 @@ defmodule Vagus.App do
   """
   @spec install(Config.t()) :: :ok | {:error, :already_installed | term()}
   def install(%Config{slug: slug} = config) do
-    if whereis(slug) do
+    if installed?(slug) do
       {:error, :already_installed}
     else
       with :ok <- Manager.install(config),
            :ok <- State.put(config, :stopped) do
         case Instances.ensure(slug) do
-          {:ok, _pid} -> :ok
+          {:ok, _pid} ->
+            :ok
+
           # The entry went between the put and the start: uninstalled meanwhile.
-          :ignore -> {:error, :not_found}
-          {:error, _reason} = error -> error
+          :ignore ->
+            {:error, :not_found}
+
+          {:error, reason} = error ->
+            Logger.warning(
+              "App #{slug} installed but its process did not start: #{inspect(reason)}"
+            )
+
+            error
         end
       end
     end
