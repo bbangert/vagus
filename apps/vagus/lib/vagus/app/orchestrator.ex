@@ -76,10 +76,7 @@ defmodule Vagus.App.Orchestrator do
   }
 
   @plan [gate: :tree, stage: :native, gate: :engine, gate: :network, gate: :api] ++
-          for(
-            stage <- [:initialize, :system, :services, :core, :application],
-            do: {:stage, stage}
-          )
+          Enum.map([:initialize, :system, :services, :core, :application], &{:stage, &1})
 
   @defaults [
     boot: false,
@@ -115,13 +112,14 @@ defmodule Vagus.App.Orchestrator do
   def resume(server \\ __MODULE__), do: GenServer.cast(server, :resume)
 
   @doc """
-  Applies the boot rule to one app whose process (re)started, once boot is
-  over; one reported mid-boot is given it when boot ends. Its container is
+  Called by an app process as it starts: applies the boot rule to its app,
+  once boot is over. Mid-boot, one of the processes `init/1` started is left
+  to its stage; any other is given the rule when boot ends. Its container is
   inspected first, so a wanted one still running is started again under a
   token the new process holds.
   """
   @spec up(String.t(), GenServer.server()) :: :ok
-  def up(slug, server \\ __MODULE__), do: GenServer.cast(server, {:up, slug})
+  def up(slug, server \\ __MODULE__), do: GenServer.cast(server, {:up, slug, self()})
 
   @impl GenServer
   def init(opts) do
@@ -142,10 +140,11 @@ defmodule Vagus.App.Orchestrator do
     # app process exists.
     Map.get(cfg.units, :import, &Units.import/0).()
     ensure = Map.get(cfg.units, :ensure, &Units.ensure/1)
-    Enum.each(Map.get(cfg.units, :slugs, &Vagus.App.slugs/0).(), ensure)
+    slugs = Map.get(cfg.units, :slugs, &Vagus.App.slugs/0).()
+    inits = for slug <- slugs, {:ok, pid} <- [ensure.(slug)], into: %{}, do: {pid, slug}
 
     state = %{phase: :up, task: nil, waiters: [], resume: false, deadline: :infinity, cfg: cfg}
-    {:ok, Map.put(state, :ups, MapSet.new()), {:continue, :boot}}
+    {:ok, Map.merge(state, %{ups: MapSet.new(), inits: inits}), {:continue, :boot}}
   end
 
   # The rest of the units are resolved here rather than in init/1: they lead
@@ -176,7 +175,7 @@ defmodule Vagus.App.Orchestrator do
   def handle_cast(:resume, %{phase: phase} = state) when phase in [:stopping, :cancelling],
     do: {:noreply, %{state | resume: true}}
 
-  def handle_cast({:up, slug}, %{phase: :up, cfg: %{boot: true, units: units}} = state) do
+  def handle_cast({:up, slug, _pid}, %{phase: :up, cfg: %{boot: true, units: units}} = state) do
     Task.Supervisor.start_child(Vagus.TaskSupervisor, fn ->
       boot_start(slug, units.inspect.(slug), units)
     end)
@@ -184,10 +183,17 @@ defmodule Vagus.App.Orchestrator do
     {:noreply, state}
   end
 
-  # Its stage may already be behind it, and nothing later in the boot revisits
-  # it: without the replay at boot's end it would own neither a token nor its
-  # still-running container until the next boot.
-  def handle_cast({:up, slug}, %{phase: :booting} = state),
+  # Announced by a process init/1 started, so up before the boot began: its
+  # stage gives it its rule. A replay too would find a `once` app that has
+  # already exited stopped and start it a second time.
+  def handle_cast({:up, _slug, pid}, %{phase: :booting, inits: inits} = state)
+      when is_map_key(inits, pid),
+      do: {:noreply, state}
+
+  # A successor: its stage may already be behind it, and nothing later in the
+  # boot revisits it, so without the replay at boot's end it would own
+  # neither a token nor its still-running container until the next boot.
+  def handle_cast({:up, slug, _pid}, %{phase: :booting} = state),
     do: {:noreply, %{state | ups: MapSet.put(state.ups, slug)}}
 
   def handle_cast(_ignored, state), do: {:noreply, state}
@@ -219,8 +225,8 @@ defmodule Vagus.App.Orchestrator do
   # A slug its stage reached after the restart is already started under the
   # successor's token, so its replay is a no-op (`Vagus.App.Policy.boot/2`).
   defp finish(_result, state) do
-    Enum.each(state.ups, &GenServer.cast(self(), {:up, &1}))
-    {:noreply, %{state | phase: :up, ups: MapSet.new()}}
+    Enum.each(state.ups, &GenServer.cast(self(), {:up, &1, nil}))
+    {:noreply, %{state | phase: :up, ups: MapSet.new(), inits: %{}}}
   end
 
   defp preempt(%{phase: :booting} = state) do

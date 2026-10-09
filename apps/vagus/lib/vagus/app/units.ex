@@ -66,11 +66,13 @@ defmodule Vagus.App.Units do
   end
 
   # One app whose process cannot start must not take the others down with it.
-  @spec ensure(String.t()) :: :ok
+  # The pid is how the Orchestrator tells this process's first announcement
+  # from a successor's.
+  @spec ensure(String.t()) :: {:ok, pid()} | :ignore | {:error, term()}
   def ensure(slug) do
-    case Instances.ensure(slug) do
-      {:error, reason} -> Logger.warning("App #{slug} process did not start: #{inspect(reason)}")
-      _started_or_gone -> :ok
+    with {:error, reason} = error <- Instances.ensure(slug) do
+      Logger.warning("App #{slug} process did not start: #{inspect(reason)}")
+      error
     end
   end
 

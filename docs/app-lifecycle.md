@@ -41,12 +41,14 @@ Vagus.Supervisor (one_for_one)
 | `Vagus.App.Orchestrator` | `Vagus.App.Supervisor` | only itself and its boot task |
 
 An app process whose file cannot be read or decoded, or whose rewrite
-failed, returns `:ignore` from `init/1` and is not restarted: a retried start
-would only fail again until the supervisor's intensity took every app down.
-The facade's `ask_healing` tries again on the next request.
+failed, returns `:ignore` from `init/1`, so it is not restarted and cannot
+spend the DynamicSupervisor's restart budget: a retried start would only
+fail again until the supervisor's intensity took every app down. The
+facade's `ask_healing` tries again on the next request.
 
 `Instances` has a wider restart budget than the tree so a few app processes
-crash-looping on one bad file do not take the directory with them.
+in an abnormal crash loop at runtime do not take the directory with them. A
+bad file never reaches that budget.
 
 An app process is started by the Orchestrator's `init/1` (one per saved
 file), by `Vagus.App.install/2` for a new slug, or on demand by the facade
@@ -376,12 +378,16 @@ starts the same apps.
 `boot_start` with `:shutting_down`, and the facade sends it `resume`, which
 applies the same boot rule.
 
-**An app process that restarts** calls `Vagus.App.Orchestrator.up/1`
-from its `init/1`; the Orchestrator inspects that app's container and sends
-`boot_start` with the answer. One reported mid-boot is given the same once
-boot ends: its stage may already have run, and it would otherwise own neither
-its token nor its running container until the next boot. If its stage ran
-after the restart it is already started, so that replay is a no-op.
+**Every app process** calls `Vagus.App.Orchestrator.up/1` from its
+`init/1`. Once boot is over, the Orchestrator inspects that app's container
+and sends `boot_start` with the answer. Mid-boot it tells, by pid, the processes its
+own `init/1` started from any other. The announcement of one it started is
+covered by its stage: replaying it too would find a `once` app that had
+already exited stopped and start it a second time. Any other's, a
+successor's, is replayed when boot ends: its stage may already have run, and
+it would otherwise own neither its token nor its running container until the
+next boot. If its stage ran after the restart it is already started, so that
+replay is a no-op.
 
 **Once-per-VM guards.** Two `:persistent_term` flags survive any restart of
 this tree: the sweep's `{Vagus.App.Units, :swept}`, and
