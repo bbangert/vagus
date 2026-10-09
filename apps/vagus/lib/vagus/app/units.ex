@@ -78,10 +78,16 @@ defmodule Vagus.App.Units do
   def native?(%{config: %{backend: :native, slug: slug}}), do: Manager.native_allowed?(slug)
   def native?(_entry), do: false
 
-  @spec running?(map()) :: boolean()
+  # `:unknown` when the engine cannot be asked: a transient fault must not read
+  # as "stopped", or boot would record a user's running app as stopped.
+  @spec running?(map()) :: boolean() | :unknown
   def running?(%{config: %{slug: slug}} = entry) do
     backend = if native?(entry), do: Native, else: Container
-    match?({:ok, :running}, backend.state("addon_" <> slug))
+
+    case backend.state("addon_" <> slug) do
+      {:ok, state} -> state == :running
+      {:error, _reason} -> :unknown
+    end
   end
 
   @spec start(String.t()) :: :ok | {:error, term()}

@@ -16,11 +16,17 @@ defmodule Vagus.App.Policy do
   What boot does with one app. Only one recorded `:started` is touched: a
   running one is left alone, since starting it again would recreate its
   container; a stopped one starts when its effective boot is `auto`, and is
-  otherwise recorded `:stopped` so its state stops claiming it runs.
+  otherwise recorded `:stopped` so its state stops claiming it runs. When the
+  engine could not be asked (`:unknown`) nothing is demoted.
   """
-  @spec boot(map(), boolean()) :: :start | :demote | :none
-  def boot(%{state: :started} = entry, false = _running?) do
-    if Config.effective_boot(entry.config, entry[:boot]) == "auto", do: :start, else: :demote
+  @spec boot(map(), boolean() | :unknown) :: :start | :demote | :none
+  def boot(%{state: :started} = entry, running?) when running? in [false, :unknown] do
+    cond do
+      Config.effective_boot(entry.config, entry[:boot]) == "auto" -> :start
+      # Auto still starts: that is what `Manager.start_slug` does regardless of container state.
+      running? == :unknown -> :none
+      true -> :demote
+    end
   end
 
   def boot(_entry, _running?), do: :none

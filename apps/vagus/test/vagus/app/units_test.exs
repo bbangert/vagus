@@ -94,6 +94,10 @@ defmodule Vagus.App.UnitsTest do
       do: Process.unregister(Native.broker_name("addon_core_mqtt"))
   end
 
+  test "running? is :unknown when the backend cannot be asked" do
+    assert Units.running?(%{config: %{app_config("x", %{}) | slug: "a/b"}}) == :unknown
+  end
+
   test "push_complete pushes Core the startup complete event" do
     assert Units.push_complete(self()) == :ok
     assert_received {:"$gen_cast", {:push, data}}
