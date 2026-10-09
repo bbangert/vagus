@@ -93,17 +93,43 @@ defmodule Vagus.App.Units do
   @spec running(keyword()) :: {:ok, MapSet.t(String.t())} | {:error, term()}
   def running(opts \\ []) do
     with {:ok, containers} <- Docker.list_containers(opts) do
-      {:ok,
-       MapSet.new(for %{"Names" => names} <- containers, "/addon_" <> slug <- names, do: slug)}
+      slugs =
+        for %{"Names" => names} = container <- containers, "/addon_" <> slug <- names do
+          if container["State"] == "paused", do: thaw(slug, opts)
+          slug
+        end
+
+      {:ok, MapSet.new(slugs)}
     end
   end
 
   @spec running?(String.t(), keyword()) :: boolean() | :unknown
   def running?(slug, opts \\ []) do
     case Docker.inspect_container("addon_" <> slug, opts) do
-      {:ok, %{"State" => %{"Running" => running}}} -> running == true
-      {:error, {:http, 404, _message}} -> false
-      _unknown -> :unknown
+      {:ok, %{"State" => %{"Running" => running} = state}} ->
+        if state["Paused"] == true, do: thaw(slug, opts)
+        running == true
+
+      {:error, {:http, 404, _message}} ->
+        false
+
+      _unknown ->
+        :unknown
+    end
+  end
+
+  # A snapshot whose app process died left it paused: frozen, it hangs its
+  # watchdog probe and the engine refuses to stop it. A paused container
+  # still counts as running.
+  defp thaw(slug, opts) do
+    case Docker.unpause_container("addon_" <> slug, opts) do
+      :ok ->
+        Logger.warning("Boot: #{slug}'s container was left paused; unpaused")
+
+      {:error, reason} ->
+        Logger.error(
+          "Boot: #{slug}'s container is paused and did not unpause: #{inspect(reason)}"
+        )
     end
   end
 

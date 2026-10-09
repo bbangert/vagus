@@ -102,7 +102,7 @@ defmodule Vagus.App.Steps do
     opts = opts(input)
     id = container_name(config.slug)
 
-    case backend(opts).stop(id, Keyword.put(opts, :timeout, @halt_timeout_s)) do
+    case stop_thawed(id, Keyword.put(opts, :timeout, @halt_timeout_s)) do
       :ok -> {:ok, :stopped}
       {:error, reason} -> {:error, reason}
     end
@@ -150,29 +150,33 @@ defmodule Vagus.App.Steps do
   end
 
   defp step(:unpause, %{config: config} = input) do
-    opts = opts(input)
-
-    case backend(opts).unpause(container_name(config.slug), opts) do
-      :ok -> {:ok, :ok}
+    case thaw(container_name(config.slug), opts(input)) do
       {:error, reason} -> {:error, reason}
+      thawed -> {:ok, thawed}
     end
   end
 
   # The old data is set aside, not removed, until the new is in place, so a
   # failed rename leaves the app's data as it was. The staging dir is a
   # sibling of the data dir, so each rename stays on one filesystem. A failed
-  # swap removes the staged data itself, as its caller may be gone.
+  # swap removes the staged data itself, as its caller may be gone; the aside
+  # of one that succeeded is the caller's to remove, outside this deadline.
+  # The staging path comes from the op's args and is renamed and removed as
+  # root, so anything but this app's own restore sibling is refused.
   # path is internal/config-derived, not request input
   # sobelow_skip ["Traversal.FileModule"]
   defp step(:swap_data, %{config: config, staging_dir: staging} = input) do
     data_dir = data_dir(data_root(opts(input)), config.slug)
     aside = staging <> ".old"
 
-    with :ok <- set_aside(data_dir, aside),
+    with :ok <- restore_sibling(staging, data_dir, config.slug),
+         :ok <- set_aside(data_dir, aside),
          :ok <- swap_in(staging, data_dir, aside) do
-      File.rm_rf(aside)
       {:ok, data_dir}
     else
+      {:error, :bad_staging} = error ->
+        error
+
       error ->
         File.rm_rf(staging)
         error
@@ -225,12 +229,43 @@ defmodule Vagus.App.Steps do
         try do
           tar.()
         after
-          with {:error, reason} <- backend(opts).unpause(id, opts),
-               do: Logger.error("Vagus.App.Steps: unpause #{id} failed: #{inspect(reason)}")
+          thaw(id, opts)
         end
+
+      # Not running: the app's last-seen state lagged the engine, and nothing
+      # in a stopped container can move under the tar.
+      {:error, {:http, 409}} ->
+        tar.()
 
       {:error, reason} ->
         {:error, {:pause, reason}}
+    end
+  end
+
+  # A 409 is a container that is not paused, which is what was asked.
+  defp thaw(id, opts) do
+    case backend(opts).unpause(id, opts) do
+      :ok ->
+        :ok
+
+      {:error, {:http, 409}} ->
+        :not_paused
+
+      {:error, reason} = error ->
+        Logger.error("Vagus.App.Steps: unpause #{id} failed: #{inspect(reason)}")
+        error
+    end
+  end
+
+  # The engine refuses to stop a paused container with a 409: a snapshot task
+  # killed by its deadline, a halt or its process dying leaves one paused, so
+  # it is thawed and stopped once more.
+
+  defp stop_thawed(id, opts) do
+    with {:error, {:http, 409}} <- backend(opts).stop(id, opts) do
+      Logger.warning("Vagus.App.Steps: #{id} refused to stop; unpausing it and stopping again")
+      thaw(id, opts)
+      backend(opts).stop(id, opts)
     end
   end
 
@@ -273,11 +308,30 @@ defmodule Vagus.App.Steps do
     end
   end
 
+  defp restore_sibling(staging, data_dir, slug) do
+    sibling? =
+      Path.dirname(staging) == Path.dirname(data_dir) and
+        Regex.match?(~r/\A\.restore-#{Regex.escape(slug)}-\d+\z/, Path.basename(staging))
+
+    if sibling?, do: :ok, else: {:error, :bad_staging}
+  end
+
+  # An `:enoent` rename back is an app that had no data dir to set aside.
   # path is internal/config-derived, not request input
   # sobelow_skip ["Traversal.FileModule"]
   defp swap_in(staging, data_dir, aside) do
     with {:error, _reason} = error <- File.rename(staging, data_dir) do
-      File.rename(aside, data_dir)
+      case File.rename(aside, data_dir) do
+        {:error, reason} when reason != :enoent ->
+          Logger.error(
+            "Vagus.App.Steps: #{data_dir} was not moved back after a failed swap " <>
+              "(#{inspect(reason)}); its data is at #{aside}"
+          )
+
+        _restored ->
+          :ok
+      end
+
       error
     end
   end
@@ -806,7 +860,7 @@ defmodule Vagus.App.Steps do
   # Both calls are tolerated: an absent or stopped container is success at the
   # backend, and a failing daemon must not keep a stop from completing.
   defp stop_and_remove_container(id, opts) do
-    with {:error, reason} <- backend(opts).stop(id, opts),
+    with {:error, reason} <- stop_thawed(id, opts),
          do: Logger.warning("Vagus.App.Steps: stop #{id} failed (tolerated): #{inspect(reason)}")
 
     with {:error, reason} <- backend(opts).remove(id, opts),

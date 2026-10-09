@@ -377,7 +377,8 @@ defmodule Vagus.App.StepsTest do
     :persistent_term.put({FakeBackend, :pid}, self())
 
     on_exit(fn ->
-      for key <- [:state, :pause, :unpause], do: :persistent_term.erase({FakeBackend, key})
+      for key <- [:state, :pause, :unpause, :stop],
+          do: :persistent_term.erase({FakeBackend, key})
     end)
 
     data_root = Path.join(context[:tmp_dir] || System.tmp_dir!(), "data")
@@ -593,6 +594,38 @@ defmodule Vagus.App.StepsTest do
       refute_received {:remove, _}
     end
 
+    # The engine refuses to stop a paused container until it is unpaused.
+    defp paused_engine do
+      Process.put(:paused, true)
+
+      :persistent_term.put({FakeBackend, :stop}, fn ->
+        if Process.get(:paused), do: {:error, {:http, 409}}, else: :ok
+      end)
+
+      :persistent_term.put({FakeBackend, :unpause}, fn -> Process.delete(:paused) && :ok end)
+    end
+
+    test "stop and halt_stop thaw a container left paused and stop it again", ctx do
+      for step <- [:stop, :halt_stop] do
+        paused_engine()
+
+        log = capture_log(fn -> assert {:ok, _fact} = Steps.run(step, input(ctx)) end)
+
+        assert log =~ "refused to stop"
+        assert_received {:stop, "addon_test_app"}
+        assert_received {:unpause, "addon_test_app"}
+        assert_received {:stop, "addon_test_app"}
+        refute Process.get(:paused)
+      end
+    end
+
+    test "a stop that fails for another reason is not retried", ctx do
+      :persistent_term.put({FakeBackend, :stop}, fn -> {:error, :engine_gone} end)
+
+      assert {:error, :engine_gone} = Steps.run(:halt_stop, input(ctx))
+      refute_received {:unpause, _id}
+    end
+
     test "pull pulls the arch-resolved image", ctx do
       assert {:ok, image} = Steps.run(:pull, Map.put(input(ctx), :arch, "amd64"))
       assert image == "homeassistant/amd64-addon-test:3"
@@ -714,13 +747,23 @@ defmodule Vagus.App.StepsTest do
     end
 
     test "a failed pause fails the snapshot and writes nothing", ctx do
-      :persistent_term.put({FakeBackend, :pause}, fn -> {:error, {:http, 409}} end)
+      :persistent_term.put({FakeBackend, :pause}, fn -> {:error, :engine_gone} end)
       staging = Path.join(ctx.tmp_dir, "staging")
 
-      assert {:error, {:pause, {:http, 409}}} =
+      assert {:error, {:pause, :engine_gone}} =
                Steps.run(:snapshot, snapshot_input(ctx, %{pause: true}))
 
       refute File.exists?(Path.join(staging, "test_app.tar.gz"))
+      refute_received {:unpause, _id}
+    end
+
+    test "a pause refused as not running is not paused: the tar runs and nothing is unpaused",
+         ctx do
+      :persistent_term.put({FakeBackend, :pause}, fn -> {:error, {:http, 409}} end)
+
+      assert {:ok, path} = Steps.run(:snapshot, snapshot_input(ctx, %{pause: true}))
+      assert File.regular?(path)
+      assert_received {:pause, "addon_test_app"}
       refute_received {:unpause, _id}
     end
 
@@ -744,12 +787,21 @@ defmodule Vagus.App.StepsTest do
       assert log =~ "unpause addon_test_app failed: :engine_gone"
     end
 
-    test "unpause thaws the app's container", ctx do
+    test "unpause thaws the app's container; one not paused is no failure", ctx do
       assert {:ok, :ok} = Steps.run(:unpause, input(ctx))
       assert_received {:unpause, "addon_test_app"}
 
       :persistent_term.put({FakeBackend, :unpause}, fn -> {:error, {:http, 409}} end)
-      assert {:error, {:http, 409}} = Steps.run(:unpause, input(ctx))
+      assert {:ok, :not_paused} = Steps.run(:unpause, input(ctx))
+    end
+
+    test "a failed unpause is the step's error, and logged", ctx do
+      :persistent_term.put({FakeBackend, :unpause}, fn -> {:error, :engine_gone} end)
+
+      log =
+        capture_log(fn -> assert {:error, :engine_gone} = Steps.run(:unpause, input(ctx)) end)
+
+      assert log =~ "unpause addon_test_app failed: :engine_gone"
     end
 
     test "addon.json's system block carries the restore-required keys", ctx do
@@ -776,13 +828,29 @@ defmodule Vagus.App.StepsTest do
 
     defp siblings(data_dir), do: data_dir |> Path.dirname() |> File.ls!() |> Enum.sort()
 
-    test "the staged data replaces the data dir and nothing is left beside it", ctx do
+    test "the staged data replaces the data dir; the old is set aside for the caller", ctx do
       {data_dir, staging} = swap_dirs(ctx)
 
       assert {:ok, ^data_dir} = Steps.run(:swap_data, input(ctx, %{staging_dir: staging}))
       assert File.ls!(data_dir) == ["db"]
       assert File.read!(Path.join(data_dir, "db")) == "new"
-      assert siblings(data_dir) == ["test_app"]
+      assert siblings(data_dir) == [".restore-test_app-1.old", "test_app"]
+      assert File.read!(Path.join(staging <> ".old", "db")) == "old"
+    end
+
+    test "a staging path that is not this app's restore sibling is refused untouched", ctx do
+      {data_dir, staging} = swap_dirs(ctx)
+      elsewhere = Path.join(ctx.tmp_dir, ".restore-test_app-1")
+      File.mkdir_p!(elsewhere)
+      other_app = Path.join(Path.dirname(data_dir), ".restore-other_app-1")
+      File.mkdir_p!(other_app)
+
+      for bad <- [elsewhere, other_app, staging <> "x", staging <> "/../test_app"] do
+        assert {:error, :bad_staging} = Steps.run(:swap_data, input(ctx, %{staging_dir: bad}))
+      end
+
+      assert File.read!(Path.join(data_dir, "db")) == "old"
+      assert File.dir?(elsewhere) and File.dir?(other_app) and File.dir?(staging)
     end
 
     test "an app with no data dir yet gets the staged one", ctx do
@@ -918,7 +986,7 @@ defmodule Vagus.App.StepsTest do
     def stop(id, opts \\ []) do
       notify({:stop, id})
       notify({:stop, id, opts})
-      :ok
+      :persistent_term.get({__MODULE__, :stop}, fn -> :ok end).()
     end
 
     @impl true

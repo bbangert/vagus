@@ -757,6 +757,7 @@ defmodule Vagus.App.Policy do
   defp on_outcome(:backup, :snapshot, _, {status, _} = result, data) when status in [:ok, :error],
     do: advance(put_acc(data, :result, result), [])
 
+  # Logged where it failed: by the step, or by the process for a dead one.
   defp on_outcome(:backup, :unpause, _, _outcome, data), do: advance(data, [])
 
   defp on_outcome(:backup, :exec_hook, :pre, {:ok, _}, data), do: advance(data, [])
@@ -882,8 +883,13 @@ defmodule Vagus.App.Policy do
   defp input(:start, _arg, data),
     do: Map.take(data, [:token, :user_options, :ports, :protected])
 
+  # A backup of an app that should run records it started, hot or cold, so a
+  # restore starts it whether or not it had crashed.
   defp input(:snapshot, _arg, %{run: run} = data) do
-    state = if run.acc[:was_running] || running?(data), do: "started", else: "stopped"
+    started? =
+      run.acc[:was_running] || running?(data) || (run.op == :backup and data.wanted == :started)
+
+    state = if started?, do: "started", else: "stopped"
 
     %{
       staging_dir: run.args[:staging_dir],
@@ -899,9 +905,11 @@ defmodule Vagus.App.Policy do
   defp input(:swap_data, _arg, data), do: %{staging_dir: data.run.args.staging_dir}
   defp input(_name, _arg, _data), do: %{}
 
-  # A container still running at the snapshot is a hot backup's, paused
-  # around the tar. A cold one was stopped by the step before.
-  defp pause?(data), do: running?(data) and not Steps.native?(data.config)
+  # Any container this process holds is paused around the tar, whatever its
+  # last-seen state, which can lag the engine; one that is not running
+  # refuses the pause, and the tar goes on. A cold one was released by the
+  # stop before.
+  defp pause?(data), do: data.container_id != nil and not Steps.native?(data.config)
 
   # Coarse waypoints for the update job's progress bar.
   defp stage(:update, :pull), do: {"pull_image", 20}

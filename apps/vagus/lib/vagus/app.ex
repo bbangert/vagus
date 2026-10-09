@@ -401,7 +401,12 @@ defmodule Vagus.App do
       {:ok, handle} ->
         args = Map.merge(args, %{backup: true, staging_dir: handle.staging_dir})
         result = command(slug, :update, args)
-        keep_backup(backups, handle, slug, result)
+
+        # A failed snapshot may have staged part of a file.
+        if match?({:error, {:backup_failed, _reason}}, result),
+          do: backups.discard_partial(handle),
+          else: keep_backup(backups, handle, slug)
+
         result
 
       {:error, reason} ->
@@ -409,13 +414,9 @@ defmodule Vagus.App do
     end
   end
 
-  # A failed snapshot may have staged part of a file. An update that failed
-  # before its snapshot staged nothing, which `finish_partial` reports as
-  # `:not_staged`.
-  defp keep_backup(backups, handle, _slug, {:error, {:backup_failed, _reason}}),
-    do: backups.discard_partial(handle)
-
-  defp keep_backup(backups, handle, slug, _result) do
+  # An update that failed before its snapshot staged nothing, which
+  # `finish_partial` reports as `:not_staged`.
+  defp keep_backup(backups, handle, slug) do
     case backups.finish_partial(handle, [slug]) do
       {:ok, _backup_slug} ->
         :ok

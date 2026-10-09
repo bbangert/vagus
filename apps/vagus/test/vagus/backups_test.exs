@@ -30,11 +30,13 @@ defmodule Vagus.BackupsTest do
       end
     end)
 
-    data_root = Path.join(System.tmp_dir!(), "vagus-bk-#{System.unique_integer([:positive])}")
+    # The data root is nested so the staging root beside it is this test's own.
+    base = Path.join(System.tmp_dir!(), "vagus-bk-#{System.unique_integer([:positive])}")
+    data_root = Path.join(base, "data")
     backup_dir = Path.join(data_root, "backup")
     server = :"backups_test_#{System.unique_integer([:positive])}"
-    {:ok, _pid} = Backups.start_link(name: server, dir: backup_dir)
-    on_exit(fn -> File.rm_rf(data_root) end)
+    {:ok, _pid} = Backups.start_link(name: server, dir: backup_dir, data_root: data_root)
+    on_exit(fn -> File.rm_rf(base) end)
     %{data_root: data_root, backup_dir: backup_dir, server: server}
   end
 
@@ -118,7 +120,7 @@ defmodule Vagus.BackupsTest do
       assert b["name"] =~ "Partial backup"
       assert [%{"slug" => ^slug, "name" => "Test Addon", "version" => "1.0"}] = b["addons"]
       assert File.exists?(path)
-      assert File.ls!(Path.join(backup_dir, ".staging")) == []
+      assert File.ls!(Backups.staging_root(backup_dir)) == []
 
       {:ok, tar} = File.read(path)
       {:ok, %{addon: addon, data: files}} = Vagus.Backup.extract_addon(tar, slug)
@@ -235,7 +237,7 @@ defmodule Vagus.BackupsTest do
       assert {:error, {:busy, ^busy}} = Task.await(backup)
       assert {:ok, %{state: :started}} = app_info(cold)
       assert Backups.list(server) == []
-      assert File.ls!(Path.join(backup_dir, ".staging")) == []
+      assert File.ls!(Backups.staging_root(backup_dir)) == []
 
       send(held, {:outcome, {:ok, %{was_running: true}}})
       assert :ok = Task.await(stopping)
@@ -290,16 +292,57 @@ defmodule Vagus.BackupsTest do
     end
 
     test "staging a crashed VM left behind is cleared when the store starts", %{
+      data_root: dr,
       backup_dir: backup_dir
     } do
-      leftover = Path.join([backup_dir, ".staging", "deadbeef"])
+      leftover = Path.join(Backups.staging_root(backup_dir), "backup-deadbeef-1")
       File.mkdir_p!(leftover)
       File.write!(Path.join(leftover, "core_x.tar.gz"), "partial")
 
-      {:ok, _pid} = Backups.start_link(name: :backups_test_restart, dir: backup_dir)
+      # A staged restore, the aside of a swap whose data dir is back, and the
+      # aside of one halted between its renames, which holds the only copy.
+      parent = Path.join([dr, "addons", "data"])
+      File.mkdir_p!(Path.join(parent, ".restore-core_a-1"))
+      File.mkdir_p!(Path.join(parent, "core_b"))
+      File.mkdir_p!(Path.join(parent, ".restore-core_b-2.old"))
+      File.mkdir_p!(Path.join(parent, ".restore-core_c-3.old"))
+      File.write!(Path.join([parent, ".restore-core_c-3.old", "db"]), "kept")
+
+      log =
+        capture_log(fn ->
+          {:ok, _pid} =
+            Backups.start_link(name: :backups_test_restart, dir: backup_dir, data_root: dr)
+        end)
+
       on_exit(fn -> if pid = Process.whereis(:backups_test_restart), do: GenServer.stop(pid) end)
 
-      refute File.exists?(Path.join(backup_dir, ".staging"))
+      refute File.exists?(Backups.staging_root(backup_dir))
+      assert File.ls!(parent) |> Enum.sort() == ["core_b", "core_c"]
+      assert File.read!(Path.join([parent, "core_c", "db"])) == "kept"
+      assert log =~ "core_c's data moved back"
+    end
+
+    test "each backup stages in its own new root-only dir beside the data root", %{
+      data_root: dr,
+      backup_dir: backup_dir,
+      server: server
+    } do
+      root = Path.join(Path.dirname(dr), "staging")
+      assert Backups.staging_root(backup_dir) == root
+      opts = [server: server, date: "2026-07-21T00:00:00Z"]
+
+      assert {:ok, %{staging_dir: a, slug: slug}} = Backups.begin_partial("same", opts)
+      assert {:ok, %{staging_dir: b, slug: ^slug}} = Backups.begin_partial("same", opts)
+      assert a != b
+      assert Path.dirname(a) == root and Path.dirname(b) == root
+      assert File.dir?(a) and File.dir?(b)
+      assert {:ok, %File.Stat{mode: mode}} = File.stat(root)
+      assert Bitwise.band(mode, 0o777) == 0o700
+
+      File.mkdir!(Path.join(root, "backup-#{slug}-7"))
+
+      assert {:error, {:staging, :eexist}} =
+               Backups.begin_partial("same", [unique: 7] ++ opts)
     end
   end
 
@@ -336,6 +379,7 @@ defmodule Vagus.BackupsTest do
 
       assert File.read!(Path.join(dd, "keep.txt")) == "original"
       refute File.exists?(Path.join(dd, "extra.txt"))
+      assert restore_leftovers(dr) == []
       assert {:ok, %{state: :started, user_options: %{"greet" => "hi"}}} = app_info(slug)
 
       calls = @backend.calls()

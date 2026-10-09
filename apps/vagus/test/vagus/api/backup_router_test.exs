@@ -29,8 +29,9 @@ defmodule Vagus.API.BackupRouterTest do
     prev_backend = Application.get_env(:vagus, :addon_backend)
     Application.put_env(:vagus, :addon_backend, Vagus.Addon.Backend.Fake)
 
-    data_root =
-      Path.join(System.tmp_dir!(), "vagus-backup-rt-#{System.unique_integer([:positive])}")
+    # Nested, so the staging root beside the data root is this test's own.
+    base = Path.join(System.tmp_dir!(), "vagus-backup-rt-#{System.unique_integer([:positive])}")
+    data_root = Path.join(base, "data")
 
     prev_root = Application.get_env(:vagus, :addon_data_root)
     Application.put_env(:vagus, :addon_data_root, data_root)
@@ -48,7 +49,7 @@ defmodule Vagus.API.BackupRouterTest do
         else: Application.delete_env(:vagus, :addon_data_root)
 
       Backups.set_dir(prev_dir)
-      File.rm_rf(data_root)
+      File.rm_rf(base)
     end)
 
     %{data_root: data_root}

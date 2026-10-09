@@ -217,13 +217,15 @@ defmodule Vagus.AppTest do
 
   describe "update/2 with a backup" do
     setup do
-      dir = Path.join(System.tmp_dir!(), "vagus-app-bk-#{System.unique_integer([:positive])}")
+      # Nested, so the staging root beside its data root is this test's own.
+      base = Path.join(System.tmp_dir!(), "vagus-app-bk-#{System.unique_integer([:positive])}")
+      dir = Path.join([base, "data", "backup"])
       prev_dir = Vagus.Backups.dir()
       :ok = Vagus.Backups.set_dir(dir)
 
       on_exit(fn ->
         Vagus.Backups.set_dir(prev_dir)
-        File.rm_rf(dir)
+        File.rm_rf(base)
       end)
 
       config = config()
@@ -269,7 +271,7 @@ defmodule Vagus.AppTest do
       assert backup["name"] == "addon_#{ctx.slug}_1.0"
       assert [%{"slug" => slug, "version" => "1.0"}] = backup["addons"]
       assert slug == ctx.slug
-      assert File.ls!(Path.join(ctx.dir, ".staging")) == []
+      assert File.ls!(Vagus.Backups.staging_root(ctx.dir)) == []
     end
 
     test "a failed snapshot fails the update and stores nothing", ctx do
@@ -281,7 +283,7 @@ defmodule Vagus.AppTest do
 
       assert {:error, {:backup_failed, :enospc}} = Task.await(update)
       assert Vagus.Backups.list() == []
-      assert File.ls!(Path.join(ctx.dir, ".staging")) == []
+      assert File.ls!(Vagus.Backups.staging_root(ctx.dir)) == []
     end
 
     test "an update that fails before its snapshot stores nothing", ctx do
@@ -290,7 +292,7 @@ defmodule Vagus.AppTest do
 
       assert {:error, {:pull, :unreachable}} = Task.await(update)
       assert Vagus.Backups.list() == []
-      assert File.ls!(Path.join(ctx.dir, ".staging")) == []
+      assert File.ls!(Vagus.Backups.staging_root(ctx.dir)) == []
     end
   end
 

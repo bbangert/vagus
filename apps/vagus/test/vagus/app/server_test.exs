@@ -738,6 +738,30 @@ defmodule Vagus.App.ServerTest do
       assert {:error, :timeout} = Task.await(t)
     end
 
+    test "a halt while a snapshot holds the container paused thaws it so the stop lands" do
+      {slug, pid} = started()
+      Application.put_env(:vagus, :app_steps, __MODULE__.HaltThroughSteps)
+      :persistent_term.put({__MODULE__.PausedEngine, :test}, self())
+      :persistent_term.put({__MODULE__.PausedEngine, :paused}, true)
+      on_exit(fn -> :persistent_term.erase({__MODULE__.PausedEngine, :paused}) end)
+
+      t = op(pid, {:backup, %{staging_dir: "/s"}})
+      {%{pause: true}, task} = step(:snapshot)
+      ref = Process.monitor(task)
+
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert :ok = :gen_statem.call(pid, {:halt, %{backend: __MODULE__.PausedEngine}})
+      end)
+
+      assert_receive {:DOWN, ^ref, :process, ^task, :killed}
+      assert {:error, :shutting_down} = Task.await(t)
+      id = "addon_" <> slug
+      assert_received {:engine, :stop, ^id}
+      assert_received {:engine, :unpause, ^id}
+      assert_received {:engine, :stop, ^id}
+      refute :persistent_term.get({__MODULE__.PausedEngine, :paused})
+    end
+
     test "a container event during an operation is handled once, after it" do
       {slug, pid} = started(%{}, watchdog: true)
       t = op(pid, {:backup, %{staging_dir: "/nonexistent"}})
@@ -1227,6 +1251,31 @@ defmodule Vagus.App.ServerTest do
         if System.monotonic_time(:millisecond) > deadline,
           do: nil,
           else: wait_for_new(slug, old, deadline)
+    end
+  end
+
+  # The real halt_stop step against an engine that, as Docker does, refuses
+  # to stop a paused container; every other step is the test's.
+  defmodule HaltThroughSteps do
+    @moduledoc false
+    def run(:halt_stop, input), do: Vagus.App.Steps.run(:halt_stop, input)
+    def run(name, input), do: Vagus.App.StepsStub.run(name, input)
+  end
+
+  defmodule PausedEngine do
+    @moduledoc false
+    defp record(call, id),
+      do: send(:persistent_term.get({__MODULE__, :test}), {:engine, call, id})
+
+    def stop(id, _opts) do
+      record(:stop, id)
+      if :persistent_term.get({__MODULE__, :paused}), do: {:error, {:http, 409}}, else: :ok
+    end
+
+    def unpause(id, _opts) do
+      record(:unpause, id)
+      :persistent_term.put({__MODULE__, :paused}, false)
+      :ok
     end
   end
 end

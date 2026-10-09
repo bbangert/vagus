@@ -119,6 +119,27 @@ defmodule Vagus.BackupTest do
     bin
   end
 
+  test "a staged inner tar that does not parse names the slug, never its addon.json", %{
+    data: data
+  } do
+    staged = fn json ->
+      path = Path.join(Path.dirname(data), "x-#{System.unique_integer([:positive])}.tar.gz")
+      File.write!(path, build_tar([{~c"./addon.json", json}], compressed: true))
+      %{slug: "x", inner: path}
+    end
+
+    secret = ~s({"user":{"options":{"password":"hunter2"}}})
+    s = %{slug: "b", name: "n", supervisor_version: "2026.07.3"}
+
+    for json <- [secret, "not json " <> secret] do
+      assert {:error, {:inner_tar, "x", :malformed}} =
+               Backup.create(Map.put(s, :addons, [staged.(json)]))
+    end
+
+    missing = %{slug: "x", inner: Path.join(data, "missing.tar.gz")}
+    assert {:error, {:inner_tar, "x", :enoent}} = Backup.create(Map.put(s, :addons, [missing]))
+  end
+
   test "an add-on with no data dir still backs up (empty data)", %{data: _data} do
     s = %{
       slug: "b",

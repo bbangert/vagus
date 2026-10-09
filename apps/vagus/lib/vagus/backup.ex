@@ -256,7 +256,10 @@ defmodule Vagus.Backup do
          {:ok, %{"version" => version, "system" => %{"name" => name}}} <- Jason.decode(json) do
       {:ok, Map.merge(addon, %{name: name, version: version}), gz, byte_size(gz)}
     else
-      other -> {:error, {:inner_tar, slug, other}}
+      # Anything else can carry the decoded `addon.json`, the app's
+      # passwords among its options, into an API error and the log.
+      {:error, reason} when is_atom(reason) -> {:error, {:inner_tar, slug, reason}}
+      _malformed -> {:error, {:inner_tar, slug, :malformed}}
     end
   end
 

@@ -3328,6 +3328,12 @@ defmodule Vagus.API.Router do
 
   defp backup_new_error_message({:busy, addon_slug}), do: busy_message(addon_slug)
 
+  defp backup_new_error_message({:backup_failed, addon_slug, :shutting_down}),
+    do: "Backup of addon #{addon_slug} was interrupted: the system is shutting down"
+
+  defp backup_new_error_message({:staging, reason}),
+    do: "Backup could not be staged: #{inspect(reason)}"
+
   defp backup_new_error_message({:backup_failed, addon_slug, reason}),
     do: "Backup of addon #{addon_slug} failed: #{inspect(reason)}"
 
@@ -3387,6 +3393,12 @@ defmodule Vagus.API.Router do
 
   defp restore_error_message(message) when is_binary(message), do: message
   defp restore_error_message({:restore, addon_slug, :busy}), do: busy_message(addon_slug)
+
+  defp restore_error_message({:restore, addon_slug, :shutting_down}),
+    do: "Restore of addon #{addon_slug} was interrupted: the system is shutting down"
+
+  defp restore_error_message({:restore, addon_slug, {:staging, reason}}),
+    do: "Restore of addon #{addon_slug} could not stage its data: #{inspect(reason)}"
 
   defp restore_error_message({:restore, addon_slug, reason}),
     do: "Restore of addon #{addon_slug} failed: #{inspect(reason)}"

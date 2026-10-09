@@ -139,9 +139,9 @@ defmodule Vagus.Backups do
   end
 
   @doc """
-  Names a partial backup and creates its staging directory,
-  `<backup dir>/.staging/<backup slug>/`, where each app's snapshot writes
-  `<slug>.tar.gz`. Ended by `finish_partial/2` or `discard_partial/1`.
+  Names a partial backup and creates its staging directory under
+  `staging_root/1`, where each app's snapshot writes `<slug>.tar.gz`. Ended
+  by `finish_partial/2` or `discard_partial/1`.
   """
   @spec begin_partial(String.t() | nil, keyword()) :: {:ok, map()} | {:error, term()}
   # path is internal/config-derived, not request input
@@ -151,18 +151,31 @@ defmodule Vagus.Backups do
     date = Keyword.get(opts, :date) || iso8601_now()
     name = name || "Partial backup #{date}"
     slug = derive_slug(date, name)
-    staging_dir = Path.join([dir(server), ".staging", slug])
-    File.rm_rf(staging_dir)
+    root = staging_root(dir(server))
+    # Unique: two backups of one name in one second share a slug.
+    unique = Keyword.get_lazy(opts, :unique, fn -> System.unique_integer([:positive]) end)
+    staging_dir = Path.join(root, "backup-#{slug}-#{unique}")
 
-    case File.mkdir_p(staging_dir) do
-      :ok ->
-        handle = %{slug: slug, name: name, date: date, extra: Keyword.get(opts, :extra)}
-        {:ok, Map.merge(handle, %{server: server, staging_dir: staging_dir})}
-
-      {:error, reason} ->
-        {:error, {:staging, reason}}
+    # `mkdir`, not `mkdir_p`: a name already there is not this backup's.
+    with :ok <- File.mkdir_p(root),
+         :ok <- File.chmod(root, 0o700),
+         :ok <- File.mkdir(staging_dir) do
+      handle = %{slug: slug, name: name, date: date, extra: Keyword.get(opts, :extra)}
+      {:ok, Map.merge(handle, %{server: server, staging_dir: staging_dir})}
+    else
+      {:error, reason} -> {:error, {:staging, reason}}
     end
   end
+
+  @doc """
+  Where backups are staged: beside the data root (`backup_dir` is
+  `<data_root>/backup`), so outside every tree a `map:` key mounts into an
+  app. Vagus writes, reads and removes there as root, and a symlink an app
+  planted would be followed.
+  """
+  @spec staging_root(Path.t()) :: Path.t()
+  def staging_root(backup_dir),
+    do: backup_dir |> Path.dirname() |> Path.dirname() |> Path.join("staging")
 
   @doc """
   Assembles and indexes the backup from the staged snapshot of every slug in
@@ -232,13 +245,14 @@ defmodule Vagus.Backups do
   ## GenServer
 
   @impl GenServer
-  # A staging dir outlives a backup whose caller died before finishing it;
-  # nothing else removes it.
+  # A staging dir outlives a backup or restore whose caller died before
+  # finishing it; nothing else removes it.
   # path is internal/config-derived, not request input
   # sobelow_skip ["Traversal.FileModule"]
   def init(opts) do
     dir = Keyword.get(opts, :dir) || Path.join(data_root(opts), "backup")
-    File.rm_rf(Path.join(dir, ".staging"))
+    File.rm_rf(staging_root(dir))
+    sweep_restores(Path.join([data_root(opts), "addons", "data"]))
     {:ok, %{dir: dir, index: ensure_and_scan(dir)}}
   end
 
@@ -269,6 +283,23 @@ defmodule Vagus.Backups do
 
       :error ->
         {:reply, :error, state}
+    end
+  end
+
+  # A restore halted between its two renames left the app's data only in the
+  # aside, which goes back while the data dir is still missing.
+  # path is internal/config-derived, not request input
+  # sobelow_skip ["Traversal.FileModule"]
+  defp sweep_restores(parent) do
+    for path <- Path.wildcard(Path.join(parent, ".restore-*"), match_dot: true) do
+      with [_all, slug] <- Regex.run(~r/\A\.restore-(.+)-\d+\.old\z/, Path.basename(path)),
+           data_dir = Path.join(parent, slug),
+           false <- File.exists?(data_dir),
+           :ok <- File.rename(path, data_dir) do
+        Logger.warning("Vagus.Backups: #{slug}'s data moved back from #{path}")
+      else
+        _stale -> File.rm_rf(path)
+      end
     end
   end
 
@@ -409,7 +440,10 @@ defmodule Vagus.Backups do
   end
 
   # An op that never ran (the app busy or gone) leaves the staging dir
-  # behind; one that ran has swapped it in or removed it.
+  # behind; one that ran has swapped it in or removed it. The old data set
+  # aside by a swap goes here, off the swap's deadline, unless the data dir
+  # is missing: then a failed swap could not move it back, and the aside is
+  # the only copy.
   # path is internal/config-derived, not request input
   # sobelow_skip ["Traversal.FileModule"]
   defp restore_app(slug, config, addon, files, data_root, opts) do
@@ -419,26 +453,42 @@ defmodule Vagus.Backups do
       options = restorable_options(slug, config, addon)
       result = App.restore(slug, staging_dir, options, addon["state"] == "started", opts)
       File.rm_rf(staging_dir)
+      if File.dir?(data_dir), do: File.rm_rf(staging_dir <> ".old")
       result
     end
   end
 
   # A sibling of `data_dir`, so the app's swap is a rename on one filesystem
-  # and a write that fails here (disk full) leaves its data untouched.
+  # and a write that fails here (disk full) leaves its data untouched. The
+  # parent is mounted into no app.
   # path is internal/config-derived, not request input
   # sobelow_skip ["Traversal.FileModule"]
   defp stage_files(data_dir, files) do
+    with {:ok, staging_dir} <- restore_dir(data_dir, 3) do
+      case materialize(staging_dir, files) do
+        :ok ->
+          {:ok, staging_dir}
+
+        {:error, reason} ->
+          File.rm_rf(staging_dir)
+          {:error, {:staging, reason}}
+      end
+    end
+  end
+
+  # `mkdir`, not `mkdir_p`: the counter restarts at every boot, and one left
+  # by an earlier boot must not be merged into this restore.
+  # path is internal/config-derived, not request input
+  # sobelow_skip ["Traversal.FileModule"]
+  defp restore_dir(data_dir, tries) do
     parent = Path.dirname(data_dir)
     unique = System.unique_integer([:positive])
     staging_dir = Path.join(parent, ".restore-#{Path.basename(data_dir)}-#{unique}")
 
-    with :ok <- File.mkdir_p(staging_dir),
-         :ok <- materialize(staging_dir, files) do
-      {:ok, staging_dir}
-    else
-      {:error, _reason} = error ->
-        File.rm_rf(staging_dir)
-        error
+    case with(:ok <- File.mkdir_p(parent), do: File.mkdir(staging_dir)) do
+      :ok -> {:ok, staging_dir}
+      {:error, :eexist} when tries > 1 -> restore_dir(data_dir, tries - 1)
+      {:error, reason} -> {:error, {:staging, reason}}
     end
   end
 

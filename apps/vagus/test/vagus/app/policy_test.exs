@@ -1083,10 +1083,22 @@ defmodule Vagus.App.PolicyTest do
       assert List.last(effects) == {:step, {:snapshot, nil}}
       assert %{state: "started", pause: false} = Policy.task_input({:snapshot, nil}, data)
 
-      {data, _} = begin(:backup, %{staging_dir: "/s"}, app())
+      {data, _} = begin(:backup, %{staging_dir: "/s"}, app(%{wanted: :stopped}))
       assert %{state: "stopped", pause: false} = Policy.task_input({:snapshot, nil}, data)
 
       {data, _} = begin(:backup, %{staging_dir: "/s"}, running(%{config: native_config()}))
+      assert %{state: "started", pause: false} = Policy.task_input({:snapshot, nil}, data)
+    end
+
+    test "a container whose last-seen state lags the engine is still paused around the tar" do
+      lagging = app(%{container_id: "c1", last_event: :stopped})
+      {data, [{:step, {:snapshot, nil}}]} = begin(:backup, %{staging_dir: "/s"}, lagging)
+      assert %{pause: true} = Policy.task_input({:snapshot, nil}, data)
+    end
+
+    test "a hot backup of a crashed app that should run records it started, as a cold one does" do
+      crashed = app(%{last_event: {:exited, 1}})
+      {data, [{:step, {:snapshot, nil}}]} = begin(:backup, %{staging_dir: "/s"}, crashed)
       assert %{state: "started", pause: false} = Policy.task_input({:snapshot, nil}, data)
     end
 

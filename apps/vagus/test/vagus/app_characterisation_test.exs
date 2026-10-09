@@ -105,8 +105,9 @@ defmodule Vagus.AppCharacterisationTest do
     prev_backend = Application.get_env(:vagus, :addon_backend)
     Application.put_env(:vagus, :addon_backend, GatedBackend)
 
-    data_root =
-      Path.join(System.tmp_dir!(), "vagus-app-char-#{System.unique_integer([:positive])}")
+    # Nested, so the backup staging root beside the data root is this test's own.
+    base = Path.join(System.tmp_dir!(), "vagus-app-char-#{System.unique_integer([:positive])}")
+    data_root = Path.join(base, "data")
 
     prev_root = Application.get_env(:vagus, :addon_data_root)
     Application.put_env(:vagus, :addon_data_root, data_root)
@@ -115,7 +116,7 @@ defmodule Vagus.AppCharacterisationTest do
       GatedBackend.disarm_all()
       restore.(:addon_backend, prev_backend)
       restore.(:addon_data_root, prev_root)
-      File.rm_rf(data_root)
+      File.rm_rf(base)
     end)
 
     %{data_root: data_root}
