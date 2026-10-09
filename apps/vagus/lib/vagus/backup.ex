@@ -81,7 +81,8 @@ defmodule Vagus.Backup do
     addons = Map.get(spec, :addons, [])
     date = Keyword.get(opts, :date) || iso8601_now()
 
-    with {:ok, addon_members, addon_meta} <- build_addon_members(addons) do
+    with :ok <- guard_staged_size(addons, Keyword.get(opts, :max_bytes, @max_outer)),
+         {:ok, addon_members, addon_meta} <- build_addon_members(addons) do
       backup_json = backup_json(spec, addon_meta, date)
       members = [{"./backup.json", Jason.encode!(backup_json)} | addon_members]
       {:ok, write_tar(members, compressed: false)}
@@ -219,6 +220,31 @@ defmodule Vagus.Backup do
 
   ## Inner add-on tars
 
+  # The outer tar is assembled in memory from every staged inner tar, so their
+  # sizes are summed before any is read rather than after allocation.
+  # path is internal/config-derived, not request input
+  # sobelow_skip ["Traversal.FileModule"]
+  defp guard_staged_size(addons, max_bytes) do
+    addons
+    |> Enum.filter(&Map.has_key?(&1, :inner))
+    |> Enum.reduce_while({:ok, 0}, fn %{inner: path, slug: slug}, {:ok, total} ->
+      case File.stat(path) do
+        {:ok, %File.Stat{size: size}} when total + size > max_bytes ->
+          {:halt, {:error, :too_large}}
+
+        {:ok, %File.Stat{size: size}} ->
+          {:cont, {:ok, total + size}}
+
+        {:error, reason} ->
+          {:halt, {:error, {:inner_tar, slug, reason}}}
+      end
+    end)
+    |> case do
+      {:ok, _total} -> :ok
+      error -> error
+    end
+  end
+
   defp build_addon_members(addons) do
     Enum.reduce_while(addons, {:ok, [], []}, fn addon, {:ok, members, meta} ->
       case inner_tar(addon) do
@@ -293,6 +319,7 @@ defmodule Vagus.Backup do
     e -> {:error, {:addon_tar, addon.slug, Exception.message(e)}}
   catch
     :throw, :too_large -> {:error, :too_large}
+    :throw, {:read, _rel, _reason} = failed -> {:error, failed}
   end
 
   # Recursively read a directory into [{relative_path, content}]. Absent dir → [].
@@ -337,6 +364,7 @@ defmodule Vagus.Backup do
           case read_regular(path, seen) do
             {:ok, content} -> {[{Path.join(member), content} | members], left - seen.size}
             :skip -> skipped(member, acc)
+            {:error, reason} -> throw({:read, Path.join(member), reason})
           end
 
         _symlink_or_special ->
@@ -352,25 +380,30 @@ defmodule Vagus.Backup do
 
   @doc false
   # Reads at most the lstat'd size, so a file that grows or a device swapped
-  # in cannot be read without bound.
-  @spec read_regular(Path.t(), File.Stat.t()) :: {:ok, binary()} | :skip
+  # in cannot be read without bound. Only a name that vanished or now names
+  # another file is skipped; any other I/O error fails the snapshot, so a
+  # backup is never reported complete without a file it could not read.
+  @spec read_regular(Path.t(), File.Stat.t()) :: {:ok, binary()} | :skip | {:error, term()}
   def read_regular(path, %File.Stat{size: size} = seen) do
     case :file.open(path, [:raw, :binary, :read]) do
       {:ok, fd} ->
         try do
           with {:ok, info} <- :file.read_file_info(fd),
-               true <- same_file?(seen, File.Stat.from_record(info)),
-               {:ok, content} <- read_at_most(fd, size) do
-            {:ok, content}
+               true <- same_file?(seen, File.Stat.from_record(info)) do
+            read_at_most(fd, size)
           else
-            _changed_or_failed -> :skip
+            false -> :skip
+            {:error, _reason} = error -> error
           end
         after
           :file.close(fd)
         end
 
-      {:error, _reason} ->
+      {:error, :enoent} ->
         :skip
+
+      {:error, _reason} = error ->
+        error
     end
   end
 

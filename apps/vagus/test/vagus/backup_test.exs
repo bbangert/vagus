@@ -101,6 +101,23 @@ defmodule Vagus.BackupTest do
       assert Backup.read_regular(path, seen) == {:ok, "12345"}
     end
 
+    test "a name that vanished since its lstat is skipped", %{data: data} do
+      path = Path.join(data, "gone")
+      File.write!(path, "x")
+      {:ok, seen} = File.lstat(path)
+      File.rm!(path)
+
+      assert Backup.read_regular(path, seen) == :skip
+    end
+
+    test "an I/O error is returned, not skipped, so the snapshot fails", %{data: data} do
+      {:ok, seen} = File.lstat(Path.join(data, "options.json"))
+      path = Path.join(data, "now_a_dir")
+      File.mkdir_p!(path)
+
+      assert Backup.read_regular(path, seen) == {:error, :eisdir}
+    end
+
     test "the same device and inode is the same file; a different inode is not" do
       seen = %File.Stat{type: :regular, major_device: 8, minor_device: 1, inode: 42}
 
@@ -119,6 +136,21 @@ defmodule Vagus.BackupTest do
 
     assert {:ok, _gz, _size} = Backup.addon_tar(Map.put(addon, :max_bytes, total))
     assert {:error, :too_large} = Backup.addon_tar(Map.put(addon, :max_bytes, total - 1))
+  end
+
+  test "staged inner tars over the outer cap together fail before any is read", %{data: data} do
+    # Not tars at all: reading either fails as a bad inner tar, not too large.
+    staged =
+      for slug <- ["a", "b"] do
+        path = Path.join(Path.dirname(data), "#{slug}.tar.gz")
+        File.write!(path, String.duplicate("x", 10))
+        %{slug: slug, inner: path}
+      end
+
+    s = %{slug: "b", name: "n", supervisor_version: "2026.07.3", addons: staged}
+
+    assert {:error, :too_large} = Backup.create(s, max_bytes: 19)
+    assert {:error, {:inner_tar, "a", _not_a_tar}} = Backup.create(s, max_bytes: 20)
   end
 
   test "extract_addon on an absent add-on → :not_in_backup", %{data: data} do
