@@ -3,9 +3,8 @@ defmodule Vagus.Core.Watchdog.Probe do
   The API-probe half of the Core watchdog — real Supervisor's periodic
   `_watchdog_homeassistant_api()` scheduler task (`misc/tasks.py:164-237`,
   `RUN_WATCHDOG_HOMEASSISTANT_API = 120`). The container-event half is the
-  sibling `Vagus.Core.Watchdog`; like the add-on pair
-  (`Vagus.Addon.Watchdog` / `.Probe`), the two are independent code paths
-  with independent counters — neither ever reads the other's state.
+  sibling `Vagus.Core.Watchdog`; the two are independent code paths with
+  independent counters — neither ever reads the other's state.
 
   This is the primary value of the Core watchdog: a Core that is
   running-but-hung (container alive, API dead) produces no docker event at
@@ -52,15 +51,14 @@ defmodule Vagus.Core.Watchdog.Probe do
   tick. Actions therefore run in a monitored `Task` (one at a time; ticks
   while an action is in flight skip probing entirely), each call bounded by
   `:attempt_timeout_ms` and backstopped by an `:action_deadline_ms`
-  GenServer-side failsafe — the same bounded-call + deadline-failsafe
-  skeleton as `Vagus.Addon.Watchdog`. Ladder counting happens when the
+  GenServer-side failsafe. Ladder counting happens when the
   task's result arrives, not at dispatch, so a `:busy` skip is observable
   as exactly nothing.
 
   ## Toggle revive
 
-  Subscribes to `Vagus.Core.TokenStore` (tolerating an absent server, like
-  `Vagus.Addon.Watchdog`'s events subscription) and resets the whole
+  Subscribes to `Vagus.Core.TokenStore` (tolerating an absent server) and
+  resets the whole
   ladder — misses, reanimations, the given-up latch — on
   `{:token_store, :watchdog_changed}`. Toggling the watchdog off and back
   on via `POST core/options` is the documented way to revive a given-up
@@ -93,8 +91,7 @@ defmodule Vagus.Core.Watchdog.Probe do
       default `900_000` (15 min — above `Lifecycle`'s own internal 10-min
       health gate, so a slow-but-legitimate op finishes inside it).
     * `:action_deadline_ms` — GenServer-side failsafe that force-clears a
-      wedged action task, default `1_800_000` (30 min) — mirrors
-      `Vagus.Addon.Watchdog`'s identical failsafe.
+      wedged action task, default `1_800_000` (30 min).
 
   Gated (with the sibling event half, under
   `Vagus.Core.Watchdog.Supervisor`) by `config :vagus, :core_watchdog`
@@ -166,7 +163,7 @@ defmodule Vagus.Core.Watchdog.Probe do
 
     # First probe only after one full interval — right after Vagus boots,
     # Core is very likely still starting; probing it immediately would
-    # record spurious misses (same convention as Vagus.Addon.Watchdog.Probe).
+    # record spurious misses.
     Process.send_after(self(), :tick, interval)
     {:ok, st}
   end
@@ -224,8 +221,7 @@ defmodule Vagus.Core.Watchdog.Probe do
   end
 
   # Failsafe — force-clears a wedged action task so the probe can never be
-  # stuck skipping ticks forever (mirrors Vagus.Addon.Watchdog's identical
-  # clause). Ignored if that exact ref already finished normally.
+  # stuck skipping ticks forever. Ignored if that exact ref already finished normally.
   def handle_info({:action_deadline, ref}, %{action: action} = st) do
     case action do
       %{task: %Task{ref: ^ref} = task, kind: kind} ->
@@ -383,8 +379,7 @@ defmodule Vagus.Core.Watchdog.Probe do
       {:error, :crashed}
   end
 
-  # Same bounded-call shape as Vagus.Addon.Watchdog.bounded_manager_call/2 —
-  # see that function's doc for why brutal-killing the inner Task cannot
+  # See `Vagus.BoundedCall` for why brutal-killing the inner Task cannot
   # orphan a :global.trans lock it was still waiting on.
   defp bounded_call(timeout_ms, fun), do: BoundedCall.run(fun, timeout_ms)
 

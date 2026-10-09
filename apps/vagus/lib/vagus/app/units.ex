@@ -6,33 +6,43 @@ defmodule Vagus.App.Units do
 
   require Logger
 
-  alias Vagus.Addon.Backend.{Container, Native}
-  alias Vagus.Addon.{Config, Manager, State}
+  alias Vagus.Addon.Config
   alias Vagus.Addon.Store.BuiltinFetcher
-  alias Vagus.App.{CoreUnit, Gates, Instances}
+  alias Vagus.App
+  alias Vagus.App.{CoreUnit, Gates, Instances, Steps}
+  alias Vagus.App.File, as: AppFile
   alias Vagus.Core.{EventPusher, Events}
-
-  @app_stop_s 30
+  alias Vagus.Runtime.Docker
 
   @spec all() :: map()
   def all do
     %{
-      list: &State.list/0,
+      import: &import/0,
+      slugs: &App.slugs/0,
+      list: &App.list/0,
       ensure: &ensure/1,
       in_flight?: &Vagus.Host.Shutdown.in_flight?/0,
       install_default: &install_default/1,
-      want_started: &want_started/1,
       native?: &native?/1,
-      running?: &running?/1,
-      start: &start/1,
-      demote: &demote/1,
-      stop: &stop/1,
+      boot_start: &App.boot_start/2,
+      running: &running/0,
+      inspect: &running?/1,
+      halt: &App.halt/1,
       core_start: &CoreUnit.start(deadline: &1),
       core_stop: &CoreUnit.stop(deadline: &1),
       gates: Gates.all(),
       report: &report/2,
       push_complete: &push_complete/0
     }
+  end
+
+  # A failed import must not keep the apps already imported from booting.
+  @spec import() :: :ok
+  def import do
+    AppFile.import_once()
+    :ok
+  rescue
+    exception -> Logger.error("Apps not imported: #{Exception.message(exception)}")
   end
 
   # One app whose process cannot start must not take the others down with it.
@@ -44,16 +54,22 @@ defmodule Vagus.App.Units do
     end
   end
 
+  @doc "A fresh install is wanted started, so boot starts it; a present one is left as the user set it."
   @spec install_default(String.t()) :: :installed | :present | {:error, term()}
   def install_default(slug) do
-    case State.get(slug) do
-      {:ok, _entry} ->
+    cond do
+      slug in App.slugs() ->
         :present
 
-      :error ->
-        with {:ok, config} <- builtin_config(slug), :ok <- Vagus.App.install(config) do
-          :installed
-        end
+      # Its file would create the apps directory, and a legacy file whose
+      # import failed would count as imported at the next boot.
+      not File.dir?(AppFile.dir()) ->
+        {:error, :not_imported}
+
+      true ->
+        with {:ok, config} <- builtin_config(slug),
+             :ok <- App.install(config, wanted: :started),
+             do: :installed
     end
   end
 
@@ -67,41 +83,29 @@ defmodule Vagus.App.Units do
     end
   end
 
-  @spec want_started(String.t()) :: :ok | :error
-  def want_started(slug) do
-    with {:ok, %{config: config}} <- State.get(slug), do: State.put(config, :started)
-  end
-
   # The allowlist and not the config's `backend` tag alone: a non-allowlisted
-  # `backend: native` config runs in a container, which must still be stopped.
+  # `backend: native` config runs in a container, which must still be halted.
   @spec native?(map()) :: boolean()
-  def native?(%{config: %{backend: :native, slug: slug}}), do: Manager.native_allowed?(slug)
+  def native?(%{config: config}), do: Steps.native?(config)
   def native?(_entry), do: false
 
-  # `:unknown` when the engine cannot be asked: a transient fault must not read
-  # as "stopped", or boot would record a user's running app as stopped.
-  @spec running?(map()) :: boolean() | :unknown
-  def running?(%{config: %{slug: slug}} = entry) do
-    backend = if native?(entry), do: Native, else: Container
-
-    case backend.state("addon_" <> slug) do
-      {:ok, state} -> state == :running
-      {:error, _reason} -> :unknown
+  @doc "The slugs whose container the engine reports running; one listing for the whole boot."
+  @spec running(keyword()) :: {:ok, MapSet.t(String.t())} | {:error, term()}
+  def running(opts \\ []) do
+    with {:ok, containers} <- Docker.list_containers(opts) do
+      {:ok,
+       MapSet.new(for %{"Names" => names} <- containers, "/addon_" <> slug <- names, do: slug)}
     end
   end
 
-  @spec start(String.t()) :: :ok | {:error, term()}
-  def start(slug) do
-    with {:ok, _started} <- Manager.start_slug(slug), do: :ok
+  @spec running?(String.t(), keyword()) :: boolean() | :unknown
+  def running?(slug, opts \\ []) do
+    case Docker.inspect_container("addon_" <> slug, opts) do
+      {:ok, %{"State" => %{"Running" => running}}} -> running == true
+      {:error, {:http, 404, _message}} -> false
+      _unknown -> :unknown
+    end
   end
-
-  @spec demote(map()) :: :ok
-  def demote(%{config: config}), do: State.put(config, :stopped)
-
-  # Not `Manager.stop/2`, which removes the container, and no State write:
-  # a reboot must neither churn containers nor forget which apps ran.
-  @spec stop(String.t()) :: :ok | {:error, term()}
-  def stop(slug), do: Vagus.Runtime.Docker.stop_container("addon_" <> slug, timeout: @app_stop_s)
 
   @spec report(atom(), [{String.t(), :ready | :failed | :pending}]) :: :ok
   def report(step, outcomes) do

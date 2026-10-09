@@ -33,19 +33,18 @@ defmodule Vagus.Addon.Info do
   @doc """
   Builds the info map for `config` in lifecycle `state` (`:started`/`:stopped`,
   or `:unknown` for an app whose process did not answer) with its effective
-  `options`, plus the per-install `settings` carried by a
-  `Vagus.Addon.State` entry (`docs/contract-2026.7-m4b-ingress-watchdog.md`
-  §B3.4, §B8) — everything in that entry except `config`/`state`/
-  `user_options`, i.e. `Map.take(entry, [:ingress_token, :ingress_port,
-  :ingress_panel, :watchdog])`. All keys are optional (default `%{}`, so
-  callers that don't yet have a State entry — e.g. hermetic unit tests — get
-  the honest "not resolved yet" rendering below) with atom keys:
+  `options`, plus the per-install `settings` an app's snapshot carries
+  (`docs/contract-2026.7-m4b-ingress-watchdog.md` §B3.4, §B8), i.e.
+  `Map.take(entry, [:ingress_token, :ingress_port, :ingress_panel,
+  :watchdog])`. All keys are optional (default `%{}`, so callers with no
+  installed app behind them — e.g. hermetic unit tests — get the honest "not
+  resolved yet" rendering below) with atom keys:
 
     * `:ingress_token` — the stable per-install token; without it `ingress_entry`/
       `ingress_url` render `nil` even for an `ingress: true` config, since real
       Supervisor can't build those URLs before the token is assigned either.
-    * `:ingress_port` — the resolved dynamic port (§B3.2), once
-      `Vagus.Ingress.dynamic_port/2` has allocated one.
+    * `:ingress_port` — the resolved dynamic port (§B3.2), once the app's
+      first start has assigned one.
     * `:ingress_panel` — the persisted sidebar-panel toggle (§B4.4).
     * `:watchdog` — the persisted watchdog enable/disable (§B8).
     * `:boot` — the persisted boot override, `nil | "auto" | "manual"`
@@ -78,16 +77,15 @@ defmodule Vagus.Addon.Info do
       cost (upstream's list route omits the field entirely).
 
   `version` always comes from `config`, which for an installed add-on is the
-  config captured at install time — `Vagus.Addon.State` never refreshes a
+  config captured at install time — an app's process never refreshes a
   stored config from the store catalog, so it is the installed version by
   construction. The invariant that keeps it true — no lifecycle path re-reads
   config from the store catalog — is pinned by
   `addon_lifecycle_router_test.exs`'s "a real stop/start never adopts the
-  store's version", which drives the actual routes. (`state_test.exs` covers
-  the same ground at the `State.put/3` level, but only the router test would
-  notice if `Manager` started sourcing config from `Store`.)
+  store's version", which drives the actual routes.
   """
-  @spec render(Config.t(), :started | :stopped | :unknown, map(), map()) :: map()
+  @spec render(Config.t(), :startup | :started | :stopped | :error | :unknown, map(), map()) ::
+          map()
   def render(%Config{} = config, state, options, settings \\ %{})
       when is_map(options) and is_map(settings) do
     latest = Map.get(settings, :version_latest)

@@ -60,8 +60,18 @@ defmodule Vagus.AppCharacterisationTest.GatedBackend do
   @impl true
   def remove_image(image, opts \\ []), do: Fake.remove_image(image, opts)
 
+  # Running only between a start and the next stop or remove, as an engine
+  # reports it: the app process asks before an update whether to start again.
   @impl true
-  def state(id), do: Fake.state(id)
+  def state(id) do
+    last =
+      id
+      |> Fake.calls_for()
+      |> Enum.filter(&(elem(&1, 0) in [:start, :stop, :remove]))
+      |> List.last()
+
+    if match?({:start, _id}, last), do: {:ok, :running}, else: {:ok, :exited}
+  end
 end
 
 defmodule Vagus.AppCharacterisationTest do
@@ -199,9 +209,8 @@ defmodule Vagus.AppCharacterisationTest do
     refute Enum.any?(Fake.calls_for("addon_core_char_reinstall"), &match?({:pull, _}, &1))
   end
 
-  # The options write lands after the update captured the old entry; committing
-  # that capture with the new config silently reverts the user's save.
-  @tag :known_failing
+  # An update that captured the app when it began and committed that capture
+  # with the new config would silently revert a save made while it pulled.
   test "options saved while an update is pulling survive the update" do
     slug = "core_char_updopts"
     installed = install_app(config(slug), options: %{"greeting" => "old"})
@@ -216,8 +225,8 @@ defmodule Vagus.AppCharacterisationTest do
         supervisor_call(:post, "/addons/#{slug}/options", %{"options" => %{"greeting" => "new"}})
       end)
 
-    # Today the write answers while the pull is held; a fix that queues it behind
-    # the update answers only after the release, so this bound must not fail.
+    # The write answers while the pull is held; one queued behind the update
+    # would answer only after the release, so this bound must not fail.
     answered_while_held = Task.yield(options, 2_000)
 
     send(puller, :release)
@@ -318,10 +327,11 @@ defmodule Vagus.AppCharacterisationTest do
     uninstall = Task.async(fn -> Vagus.App.uninstall(slug) end)
     assert_receive {:gate_entered, :remove, remover}, 5_000
 
-    # Core's GET while the container stops already misses.
+    # Core's GET while the container stops already misses, and the stopping
+    # app's token went before its container did.
     assert :error = Vagus.App.discovery(early)
     conn = app_call(:post, "/discovery", token, %{"service" => "other", "config" => %{}})
-    assert conn.status == 503
+    assert conn.status == 401
     send(remover, :release)
     assert :ok = Task.await(uninstall)
 
@@ -332,9 +342,8 @@ defmodule Vagus.AppCharacterisationTest do
     assert :error = Vagus.App.discovery(early)
   end
 
-  # Upstream's per-app job group rejects a second lifecycle job outright;
-  # today it queues behind Manager's lock and then runs a second start.
-  @tag :known_failing
+  # Upstream's per-app job group rejects a second lifecycle job outright,
+  # rather than queueing it to run a second start.
   test "a start issued while a start is running answers 400 without waiting" do
     slug = "core_char_dblstart"
     install_app(config(slug))

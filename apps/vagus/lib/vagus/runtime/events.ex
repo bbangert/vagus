@@ -10,7 +10,24 @@ defmodule Vagus.Runtime.Events do
   Mint connection in **active** mode inside a `GenServer` (house pattern —
   see `Vagus.DNS`, `Vagus.Core.ApiSocket`), reassembles the line-delimited
   JSON across TCP/chunk boundaries, and fans decoded events out to
-  subscribers as `{:docker_event, map}`.
+  subscribers as `{:docker_event, map}`. An app container's event also goes
+  to that app's process, looked up in `Vagus.App.Directory` as each event is
+  sent, so a restarted app process gets the next one without subscribing.
+
+  ## After a reconnect
+
+  Events missed while the stream was down are never replayed, so each time a
+  connection is answered (the first included) the managed containers are
+  listed and each app process is sent its container's state as the event it
+  missed: a running one as `start`, an exited one as `die` with its exit
+  code. The app process ignores one about a container it does not hold, so a
+  repeat is harmless. The list runs in a task; only the default-named
+  instance lists unless `:list` is given.
+
+  A listing is older than any event that arrives while it runs, so the task
+  only returns it, tagged with its connection's generation: app events that
+  arrive meanwhile are held back and sent after the listing's, and a listing
+  from an earlier connection is dropped.
 
   ## Filtering — server-side + client-side
 
@@ -102,6 +119,8 @@ defmodule Vagus.Runtime.Events do
 
   @impl GenServer
   def init(opts) do
+    name = Keyword.get(opts, :name, __MODULE__)
+
     state = %{
       socket: Keyword.get(opts, :socket, Docker.socket_path()),
       conn: nil,
@@ -111,7 +130,12 @@ defmodule Vagus.Runtime.Events do
       backoff_ms: @initial_backoff_ms,
       # The pending :connect retry timer, if any — kept so a second drop can
       # never arm a second retry loop beside it.
-      reconnect_timer: nil
+      reconnect_timer: nil,
+      route: Keyword.get(opts, :route, &route/1),
+      list: Keyword.get_lazy(opts, :list, fn -> default_list(name) end),
+      generation: 0,
+      # While a listing runs: its task's monitor and the app events held back.
+      resync: nil
     }
 
     {:ok, state, {:continue, :connect}}
@@ -149,6 +173,33 @@ defmodule Vagus.Runtime.Events do
   def handle_info(:connect, state) do
     Logger.debug("Vagus.Runtime.Events: attempting to (re)connect to #{state.socket}")
     {:noreply, do_connect(%{state | reconnect_timer: nil})}
+  end
+
+  def handle_info({:resync, gen, result}, %{generation: gen, resync: {ref, held}} = state) do
+    Process.demonitor(ref, [:flush])
+
+    missed =
+      case result do
+        {:ok, containers} ->
+          Enum.flat_map(containers, &missed/1)
+
+        {:error, reason} ->
+          Logger.warning("Vagus.Runtime.Events: no resync: #{inspect(reason)}")
+          []
+      end
+
+    Enum.each(missed ++ Enum.reverse(held), state.route)
+    {:noreply, %{state | resync: nil}}
+  end
+
+  def handle_info({:resync, _gen, _result}, state), do: {:noreply, state}
+
+  # The listing died without an answer: what it held back goes out unordered
+  # against nothing.
+  def handle_info({:DOWN, ref, :process, _pid, reason}, %{resync: {ref, held}} = state) do
+    Logger.warning("Vagus.Runtime.Events: no resync: the listing died (#{inspect(reason)})")
+    Enum.each(Enum.reverse(held), state.route)
+    {:noreply, %{state | resync: nil}}
   end
 
   def handle_info({:DOWN, ref, :process, pid, _reason}, %{subscribers: subs} = state) do
@@ -252,6 +303,7 @@ defmodule Vagus.Runtime.Events do
   defp handle_response({:status, ref, status}, state) do
     if ref == state.request_ref do
       Logger.debug("Vagus.Runtime.Events: connected, status #{status}")
+      state = if status == 200, do: resync(state), else: state
       %{state | backoff_ms: @initial_backoff_ms}
     else
       state
@@ -290,7 +342,7 @@ defmodule Vagus.Runtime.Events do
 
   defp process_data(data, state) do
     {lines, remainder} = split_lines(state.buffer <> data)
-    Enum.each(lines, &handle_line(&1, state))
+    state = Enum.reduce(lines, state, &handle_line/2)
     %{state | buffer: cap_buffer(remainder)}
   end
 
@@ -315,7 +367,7 @@ defmodule Vagus.Runtime.Events do
     end
   end
 
-  defp handle_line("", _state), do: :ok
+  defp handle_line("", state), do: state
 
   defp handle_line(line, state) do
     case Jason.decode(line) do
@@ -324,6 +376,7 @@ defmodule Vagus.Runtime.Events do
 
       {:error, reason} ->
         Logger.debug("Vagus.Runtime.Events: malformed event line skipped (#{inspect(reason)})")
+        state
     end
   end
 
@@ -351,8 +404,84 @@ defmodule Vagus.Runtime.Events do
       }
 
       Enum.each(state.subscribers, fn {pid, _ref} -> send(pid, {:docker_event, payload}) end)
+      route_live(payload, state)
+    else
+      state
     end
   end
+
+  defp route_live(payload, %{resync: {ref, held}} = state),
+    do: %{state | resync: {ref, [payload | held]}}
+
+  defp route_live(payload, state) do
+    state.route.(payload)
+    state
+  end
+
+  defp route(%{name: "addon_" <> slug} = payload) do
+    case Registry.lookup(Vagus.App.Directory, {:slug, slug}) do
+      [{pid, _value}] -> send(pid, {:docker_event, payload})
+      [] -> :ok
+    end
+  rescue
+    # The directory is restarting; its app processes start over without it.
+    ArgumentError -> :ok
+  end
+
+  defp route(_payload), do: :ok
+
+  defp default_list(__MODULE__), do: &list_apps/1
+  defp default_list(_name), do: nil
+
+  defp list_apps(socket), do: Docker.list_containers(all: true, socket: socket)
+
+  defp resync(%{list: nil} = state), do: state
+
+  # What an earlier listing still held back is older than this connection.
+  defp resync(%{list: list, socket: socket} = state) do
+    state = flush_held(state)
+    gen = state.generation + 1
+    parent = self()
+
+    case Task.Supervisor.start_child(Vagus.TaskSupervisor, fn ->
+           send(parent, {:resync, gen, list.(socket)})
+         end) do
+      {:ok, pid} -> %{state | generation: gen, resync: {Process.monitor(pid), []}}
+      {:error, _reason} -> %{state | generation: gen}
+    end
+  catch
+    :exit, _reason -> state
+  end
+
+  defp flush_held(%{resync: {ref, held}} = state) do
+    Process.demonitor(ref, [:flush])
+    Enum.each(Enum.reverse(held), state.route)
+    %{state | resync: nil}
+  end
+
+  defp flush_held(state), do: state
+
+  defp missed(%{"Id" => id, "Names" => names, "State" => state} = container) do
+    with [name] <- for("/addon_" <> _ = n <- List.wrap(names), do: String.trim_leading(n, "/")),
+         {action, code} when action != nil <- missed_action(state, container["Status"]) do
+      [%{action: action, name: name, id: id, exit_code: code, time_nano: nil, attributes: %{}}]
+    else
+      _ -> []
+    end
+  end
+
+  defp missed(_container), do: []
+
+  defp missed_action("running", _status), do: {"start", nil}
+
+  defp missed_action(state, status) when state in ["exited", "dead"] do
+    case Regex.run(~r/^Exited \((-?\d+)\)/, status || "") do
+      [_, code] -> {"die", String.to_integer(code)}
+      nil -> {"die", nil}
+    end
+  end
+
+  defp missed_action(_state, _status), do: {nil, nil}
 
   defp parse_exit_code(nil), do: nil
   defp parse_exit_code(code) when is_integer(code), do: code

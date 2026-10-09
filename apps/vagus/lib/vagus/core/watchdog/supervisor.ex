@@ -2,8 +2,7 @@ defmodule Vagus.Core.Watchdog.Supervisor do
   @moduledoc """
   Isolating supervisor for the Core watchdog pair (`Vagus.Core.Watchdog`
   container-event half + `Vagus.Core.Watchdog.Probe` API-probe half) —
-  the same structure as `Vagus.Addon.Watchdog.Supervisor`, and the same
-  `:one_for_one, max_restarts: 5, max_seconds: 30` budget: both halves do
+  with a `:one_for_one, max_restarts: 5, max_seconds: 30` budget: both halves do
   I/O against the engine/Core and a crash-loop in either must burn its own
   budget here rather than escalate into `Vagus.Supervisor`'s.
 

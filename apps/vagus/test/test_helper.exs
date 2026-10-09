@@ -30,8 +30,7 @@ Mox.stub_with(Vagus.Backend.OSMock, Vagus.Backend.OS.HostStub)
 ExUnit.start(exclude: [:docker, :block_device, :known_failing])
 
 # At VM exit rather than `ExUnit.after_suite/1`: that runs after every pass of
-# `--repeat-until-failure`, and without the directory each later pass's saves
-# fail, so a restarted Registry or DNS comes back empty.
+# `--repeat-until-failure`, and the app processes started at boot read from it.
 System.at_exit(fn _status ->
-  if dir = Application.get_env(:vagus, :run_state_dir), do: File.rm_rf(dir)
+  if dir = Application.get_env(:vagus, :app_files_dir), do: File.rm_rf(dir)
 end)

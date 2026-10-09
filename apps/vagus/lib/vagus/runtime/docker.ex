@@ -91,7 +91,7 @@ defmodule Vagus.Runtime.Docker do
 
   @doc """
   DELETE `/images/{name}` (`name` a `"repo:tag"` or `"repo"` ref, as built by
-  `Vagus.Addon.Manager.build_spec/2`). A missing image (404) is treated as
+  `Vagus.App.Steps.build_spec/2`). A missing image (404) is treated as
   `:ok` (already gone) — mirrors `remove_container/2`/`remove_network/2`.
 
   Unlike a container/network id, an image ref legitimately contains `/`

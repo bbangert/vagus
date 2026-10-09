@@ -53,7 +53,7 @@ defmodule Vagus.Core.PortMigration do
   decoded, the single value replaced, and re-encoded, so `created_at`, the
   SSL settings, trusted proxies, `yaml_migration_done` and the version
   envelope all survive. The write is a sibling tmp file plus `File.rename/2`
-  (the `Vagus.Addon.State` idiom) so a power loss mid-write can never leave
+  (as `Vagus.App.File` writes) so a power loss mid-write can never leave
   Core with a truncated store, and the original file's mode is carried onto
   the replacement — Core writes this store `private=True` (0600), and a
   migration must not widen that. The tmp file is chmod'd 0600 *before* the
@@ -372,7 +372,7 @@ defmodule Vagus.Core.PortMigration do
     {:skipped, {:other_port, port}}
   end
 
-  # tmp-then-rename in the same directory (`Vagus.Addon.State`'s idiom):
+  # tmp-then-rename in the same directory (as `Vagus.App.File` writes):
   # `File.rename/2` within one filesystem is atomic, so Core can only ever
   # observe the old store or the new one. The tmp file is chmod'd 0600 before
   # any content is written to it, not after — Core's config (trusted

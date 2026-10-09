@@ -155,8 +155,7 @@ defmodule Vagus.DSP do
   # can end up empty. Both need validate → write → rename → sweep to be one
   # step, so the whole thing takes a mutex keyed by the store directory.
   #
-  # Same call shape and the same reasoning as `Vagus.Addon.Manager`'s per-slug
-  # lock: `[node()]` scopes it here, and `:global.trans` is used for its
+  # `[node()]` scopes it here, and `:global.trans` is used for its
   # reentrant local mutex behaviour, not for distribution. It blocks rather
   # than erroring, so a second uploader waits instead of needing a "locked"
   # answer rendered to a human.
@@ -228,7 +227,7 @@ defmodule Vagus.DSP do
 
   `status/0` reads the stored file whole to rescan its version, which is fine
   for the panel and wrong for anything on a hot path — a container start asks
-  this per `dsp: true` add-on, and `Vagus.Addon.Watchdog` can drive starts in a
+  this per `dsp: true` app, and an app's restart ladder can drive starts in a
   loop. A directory listing settles the question this asks.
   """
   @spec state() :: :unsupported | :not_configured | :configured
@@ -371,7 +370,7 @@ defmodule Vagus.DSP do
   # safe is the marker's shape. `libQnnHtpV<digits>Skel.so` admits no separator
   # and no `..`, so `Path.join/2` cannot leave the store directory.
   #
-  # `.tmp` sibling then rename, like `Vagus.Addon.State.persist/2`: a power cut
+  # `.tmp` sibling then rename, like `Vagus.App.File.write/2`: a power cut
   # mid-write must not leave a truncated `.so` that still passes a header check
   # and then fails inside the DSP loader, where nothing reports it.
   # sobelow_skip ["Traversal.FileModule"]

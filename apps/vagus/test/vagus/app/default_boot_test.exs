@@ -1,6 +1,6 @@
 defmodule Vagus.App.DefaultBootTest do
-  # The real units on host: no engine, no Core, no apps. `async: false` so
-  # no other test's apps are in State while this boot lists them.
+  # The real units on host: no engine, no Core. `async: false` so no other
+  # test's apps are booted by it.
   use ExUnit.Case, async: false
 
   import ExUnit.CaptureLog
@@ -17,7 +17,6 @@ defmodule Vagus.App.DefaultBootTest do
   }
 
   test "boots through the default units to up, pushing startup complete" do
-    assert Vagus.Addon.State.list() == []
     Vagus.AppFixtures.listening_api_port()
     name = :"orchestrator_#{System.unique_integer([:positive])}"
 

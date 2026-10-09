@@ -32,6 +32,10 @@ config :vagus, :supervisor_options_path, Path.expand("../.dev/supervisor_options
 # file-backed-JSON pattern as :core_token_path above.
 config :vagus, :store_repositories_path, Path.expand("../.dev/store_repositories.json", __DIR__)
 
+# One file per installed app, beside the other .dev/ state; config/target.exs
+# puts it on /data.
+config :vagus, :app_files_dir, Path.expand("../.dev/apps", __DIR__)
+
 # Device-managed SSH access keypair (`Vagus.SSHAccess`). A DETS file rather
 # than JSON, but the same `__DIR__`-anchored .dev/ path idiom as
 # :core_token_path above; config/target.exs puts it on /data.
@@ -102,7 +106,3 @@ config :nerves_runtime,
 # reports that board's machine string. Per-target values live in
 # config/rpi3_64.exs and config/dragon_q6a.exs.
 config :vagus, :machine, "raspberrypi3-64"
-
-# Keyed by OS pid so two concurrent `mix` runs never wipe each other's
-# directory; `Vagus.RunState.reset_dir/0` empties it at every app start.
-config :vagus, :run_state_dir, Path.join(System.tmp_dir!(), "vagus-run-#{System.pid()}")

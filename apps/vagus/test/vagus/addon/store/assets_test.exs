@@ -458,13 +458,9 @@ defmodule Vagus.Addon.Store.AssetsTest do
     end
 
     test "with no root to anchor under, degrades to memory with a warning" do
-      # `:addon_state_path` is nil under config/test.exs, which is exactly the
-      # host/dev situation this guard exists for.
-      assert Application.get_env(:vagus, :addon_state_path) == nil
+      {assets, log} = with_log(fn -> Assets.init(:disk, root: nil) end)
 
-      {assets, log} = with_log(fn -> Assets.init(:disk) end)
-
-      assert log =~ "no :addon_state_path to anchor"
+      assert log =~ "no :app_files_dir to anchor"
       assert :ok = Assets.put(@mosquitto, :icon, @png, assets)
       assert {:ok, @png} = Assets.get(@mosquitto, :icon, assets)
     end

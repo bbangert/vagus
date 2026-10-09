@@ -87,4 +87,13 @@ defmodule Vagus.Core.Events do
 
     %{"event" => "job", "data" => job_map}
   end
+
+  @doc """
+  An app's reported state changed. Upstream sends this under the `app` event
+  name and rewrites it to `addon` unless its v2 WS API feature flag is on;
+  this emulator has no such flag, so it sends the `addon` form.
+  """
+  @spec app_state(String.t(), atom()) :: map()
+  def app_state(slug, state) when is_binary(slug) and is_atom(state),
+    do: %{"event" => "addon", "slug" => slug, "state" => Atom.to_string(state)}
 end

@@ -9,15 +9,14 @@ defmodule Vagus.Addon.Backend.Native do
   the app-level `Vagus.Addon.Backend.Native.Supervisor` (`DynamicSupervisor`)
   under a **deterministic registered name** derived from the add-on id
   (`broker_name/1`), so `state/1`, `stop/2`, and `remove/2` re-derive the handle
-  from the id alone — no pid table to keep. `Vagus.Addon.Backend.Native.Sentinel`
-  watches those subtrees so `Vagus.Addon.State` stays honest if OTP supervision
-  exhausts its restart budget (the crash-restart half of `Vagus.Addon.Watchdog`
-  never fires for a BEAM process — there is no Docker `die` event).
+  from the id alone — no pid table to keep. A BEAM subtree has no Docker
+  `die` event, so the app's process monitors the subtree's root and revives
+  it when OTP supervision gives up.
 
-  The manager builds the same runtime-neutral `Spec` for every backend; a native
-  backend uses only `name` (→ id) and ignores the container-only fields.
-  `create/1` returns `"addon_<slug>"` to match the id the manager independently
-  re-derives at stop/remove (`manager.ex`).
+  `Vagus.App.Steps` builds the same runtime-neutral `Spec` for every backend;
+  a native backend uses only `name` (→ id) and ignores the container-only
+  fields. `create/1` returns `"addon_<slug>"`, the id the steps re-derive at
+  stop and remove.
   """
 
   @behaviour Vagus.Addon.Backend
@@ -37,26 +36,14 @@ defmodule Vagus.Addon.Backend.Native do
     slug = slug_from_id(id)
 
     case DynamicSupervisor.start_child(Native.Supervisor, broker_child_spec(id, slug)) do
-      {:ok, _pid} ->
-        Native.Sentinel.watch(id)
-        :ok
-
-      {:error, {:already_started, _pid}} ->
-        # Re-arm the Sentinel too — a redundant start must not leave a running
-        # broker unwatched (e.g. after a Sentinel restart re-monitored nothing).
-        Native.Sentinel.watch(id)
-        :ok
-
-      {:error, reason} ->
-        {:error, reason}
+      {:ok, _pid} -> :ok
+      {:error, {:already_started, _pid}} -> :ok
+      {:error, reason} -> {:error, reason}
     end
   end
 
   @impl Vagus.Addon.Backend
   def stop(id, _opts \\ []) do
-    # Manual stop — the Sentinel must not then demote State for this id.
-    Native.Sentinel.unwatch(id)
-
     case Process.whereis(broker_name(id)) do
       nil ->
         :ok
@@ -139,8 +126,8 @@ defmodule Vagus.Addon.Backend.Native do
   # (`Vagus.Mqtt.Broker`, 5/30) absorbs transient child crashes, and if IT
   # exhausts its budget and terminates, the shared `Native.Supervisor` neither
   # restarts it nor counts it against its own budget — so one crash-looping
-  # native add-on can't take its siblings down with it. `Native.Sentinel` then
-  # observes the permanent death and demotes `State` to `:stopped`.
+  # native app can't take its siblings down with it. The app's process then
+  # sees the permanent death and revives it.
   defp broker_child_spec(id, slug) do
     Supervisor.child_spec(
       {

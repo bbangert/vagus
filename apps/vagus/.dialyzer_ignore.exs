@@ -51,16 +51,13 @@
   {"lib/vagus/core/events.ex", :call_without_opaque},
 
   # ── Root 3: benign dead defensive checks ────────────────────────────────
-  # Dialyzer proved a nil/default branch unreachable given the inferred types:
-  # `user_options || %{}` in manager.ex (a defaulting `||` on a value already
-  # typed as a map). Correct, defensive, not worth churning. (The analogous
-  # ingress_proxy `query_string` dead-nil check was fixed at the source rather
-  # than ignored — `in [nil, ""]` → `== ""`, since Plug guarantees a binary.)
-  {"lib/vagus/addon/manager.ex", :guard_fail},
-  # Two more of the same kind, formerly listed under the (removed) Mint root
-  # but independent of it: router.ex's `first_upload(_params)` fallback
-  # clause (Plug always hands a map), and host_stub.ex's `{:error, _}` arm on
-  # `:inet.gethostname/0` (typed as only ever returning `{:ok, name}`).
+  # Dialyzer proved a nil/default branch unreachable given the inferred types.
+  # Correct, defensive, not worth churning. (The ingress_proxy `query_string`
+  # dead-nil check was fixed at the source rather than ignored — `in [nil,
+  # ""]` → `== ""`, since Plug guarantees a binary.) router.ex's
+  # `first_upload(_params)` fallback clause (Plug always hands a map), and
+  # host_stub.ex's `{:error, _}` arm on `:inet.gethostname/0` (typed as only
+  # ever returning `{:ok, name}`).
   {"lib/vagus/api/router.ex", :pattern_match_cov},
   {"lib/vagus/backend/host/host_stub.ex", :pattern_match},
 

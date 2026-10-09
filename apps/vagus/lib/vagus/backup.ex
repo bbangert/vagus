@@ -239,6 +239,10 @@ defmodule Vagus.Backup do
     end)
   end
 
+  @doc false
+  @spec addon_tar(map()) :: {:ok, binary(), non_neg_integer()} | {:error, term()}
+  def addon_tar(addon), do: build_addon_tar(addon)
+
   defp build_addon_tar(addon) do
     addon_json =
       Jason.encode!(%{
@@ -260,18 +264,33 @@ defmodule Vagus.Backup do
   end
 
   # Recursively read a directory into [{relative_path, content}]. Absent dir → [].
+  # The app owns this tree and this runs as root: a symlink it planted
+  # resolves on the host, so one is never followed, only skipped.
   # path is internal/config-derived, not request input
   # sobelow_skip ["Traversal.FileModule"]
   defp read_dir(dir) do
-    if File.dir?(dir) do
-      dir
-      |> Path.join("**")
-      |> Path.wildcard(match_dot: true)
-      |> Enum.filter(&File.regular?/1)
-      |> Enum.map(fn path -> {Path.relative_to(path, dir), File.read!(path)} end)
-    else
-      []
+    case File.lstat(dir) do
+      {:ok, %File.Stat{type: :directory}} -> read_tree(dir, [])
+      _absent_or_not_a_directory -> []
     end
+  end
+
+  # sobelow_skip ["Traversal.FileModule"]
+  defp read_tree(root, rel) do
+    [root | rel]
+    |> Path.join()
+    |> File.ls!()
+    |> Enum.sort()
+    |> Enum.flat_map(fn name ->
+      member = rel ++ [name]
+      path = Path.join([root | member])
+
+      case File.lstat(path) do
+        {:ok, %File.Stat{type: :directory}} -> read_tree(root, member)
+        {:ok, %File.Stat{type: :regular}} -> [{Path.join(member), File.read!(path)}]
+        _symlink_or_special -> []
+      end
+    end)
   end
 
   ## tar helpers

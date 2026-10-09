@@ -139,7 +139,7 @@ address. Retrying such a response elsewhere would mask real add-on errors.
 Deliberately uncached: a refused loopback connect costs a syscall with no
 network hop, while a cached answer goes stale the moment an add-on rebinds,
 and a stale answer here is a 502 for the whole panel.
-`Vagus.Addon.Watchdog.Probe` uses the same helper — a watchdog that disagreed
+`Vagus.App.Probe` uses the same helper — a watchdog that disagreed
 with the proxy would probe a live add-on dead and restart-loop it.
 
 ## `dsp:` — a config key, two host mounts, and an operator setup step, none with upstream precedent

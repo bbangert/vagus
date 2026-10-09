@@ -290,6 +290,249 @@ defmodule Vagus.Runtime.EventsTest do
     assert Process.alive?(events_pid)
   end
 
+  describe "app processes" do
+    import Vagus.AppFixtures, only: [app_config: 2, app_info: 1, install_app: 1]
+
+    defp app_slug, do: "events_app_#{System.unique_integer([:positive])}"
+
+    defp app_pid(slug) do
+      [{pid, _}] = Registry.lookup(Vagus.App.Directory, {:slug, slug})
+      pid
+    end
+
+    test "an app's container event goes to whichever process holds its slug when sent", %{
+      path: path,
+      listen: listen
+    } do
+      slug = app_slug()
+      start_supervised!({Events, name: unique_name(), socket: path})
+      {sock, _head} = accept_conn(listen)
+      send_ok_headers(sock)
+
+      {:ok, _} = Registry.register(Vagus.App.Directory, {:slug, slug}, nil)
+      send_chunk(sock, event_json("die", "addon_" <> slug, "c1") <> "\n")
+      assert_receive {:docker_event, %{action: "die", id: "c1"}}, 1_000
+
+      # A restarted app process is found by the next event, with no subscribe.
+      :ok = Registry.unregister(Vagus.App.Directory, {:slug, slug})
+      test = self()
+
+      owner =
+        spawn_link(fn ->
+          {:ok, _} = Registry.register(Vagus.App.Directory, {:slug, slug}, nil)
+          send(test, :registered)
+
+          receive do
+            event -> send(test, {:owner_got, event})
+          end
+        end)
+
+      assert_receive :registered
+      send_chunk(sock, event_json("start", "addon_" <> slug, "c2") <> "\n")
+      assert_receive {:owner_got, {:docker_event, %{action: "start", id: "c2"}}}, 1_000
+      refute_received {:docker_event, %{id: "c2"}}
+      assert is_pid(owner)
+    end
+
+    test "each connect lists the app containers and tells each app process its state", %{
+      path: path,
+      listen: listen
+    } do
+      slug = app_slug()
+      install_app(app_config(slug, %{}))
+      pid = app_pid(slug)
+      {:ok, listings} = Agent.start_link(fn -> [] end)
+
+      list = fn _socket ->
+        Agent.get_and_update(listings, fn
+          [] ->
+            {{:ok, [container("/addon_" <> slug, "c1", "running", "Up 2 minutes")]}, [:first]}
+
+          seen ->
+            {{:ok,
+              [
+                container("/addon_" <> slug, "c1", "exited", "Exited (137) 1 second ago"),
+                container("/not_an_app", "x", "running", "Up")
+              ]}, [:again | seen]}
+        end)
+      end
+
+      # The app process's receipt of each synthesized event is traced, so
+      # whatever the test asks it next is handled after that event.
+      :erlang.trace(pid, true, [:receive])
+      on_exit(fn -> :erlang.trace(pid, false, [:receive]) end)
+      start_supervised!({Events, name: unique_name(), socket: path, list: list})
+
+      # The first connect: a running container this process did not start is
+      # adopted as its own.
+      {sock1, _head} = accept_conn(listen)
+      send_ok_headers(sock1)
+
+      assert_receive {:trace, ^pid, :receive, {:docker_event, %{action: "start", id: "c1"}}},
+                     1_000
+
+      assert {:ok, %{state: :started}} = app_info(slug)
+      assert %{container_id: "c1"} = :sys.get_state(pid) |> elem(1)
+
+      # The container died while the stream was down: the reconnect tells it.
+      :gen_tcp.close(sock1)
+      {sock2, _head} = accept_conn(listen, 5_000)
+      send_ok_headers(sock2)
+
+      assert_receive {:trace, ^pid, :receive,
+                      {:docker_event, %{action: "die", id: "c1", exit_code: 137}}},
+                     5_000
+
+      assert {:ok, %{state: :error}} = app_info(slug)
+      assert %{last_event: {:exited, 137}} = :sys.get_state(pid) |> elem(1)
+      assert Agent.get(listings, & &1) == [:again, :first]
+    end
+
+    test "a listing that fails leaves the stream running", %{path: path, listen: listen} do
+      test = self()
+      list = fn _socket -> send(test, :listed) && {:error, :down} end
+      name = unique_name()
+      start_supervised!({Events, name: name, socket: path, list: list})
+      :ok = Events.subscribe(name)
+
+      {sock, _head} = accept_conn(listen)
+      send_ok_headers(sock)
+      assert_receive :listed, 1_000
+
+      send_chunk(sock, event_json("start", "addon_after", "a1") <> "\n")
+      assert_receive {:docker_event, %{id: "a1"}}, 1_000
+    end
+
+    test "a live event that arrives while the listing runs is sent after the listing's", %{
+      path: path,
+      listen: listen
+    } do
+      slug = app_slug()
+      owner = owner(slug)
+      name = unique_name()
+      start_supervised!({Events, name: name, socket: path, list: held_listing(self())})
+      :ok = Events.subscribe(name)
+
+      {sock, _head} = accept_conn(listen)
+      send_ok_headers(sock)
+      assert_receive {:listing, lister}, 1_000
+
+      send_chunk(sock, event_json("start", "addon_" <> slug, "c1") <> "\n")
+      assert_receive {:docker_event, %{action: "start", id: "c1"}}, 1_000
+
+      send(
+        lister,
+        {:go, [container("/addon_" <> slug, "c1", "exited", "Exited (1) 1 second ago")]}
+      )
+
+      assert_receive {:owner_got, %{action: first, id: "c1"}}, 1_000
+      assert_receive {:owner_got, %{action: last, id: "c1"}}, 1_000
+      assert {first, last} == {"die", "start"}
+      assert ping(owner) == :pong
+      refute_received {:owner_got, _}
+    end
+
+    test "a listing from an earlier connection is dropped", %{path: path, listen: listen} do
+      slug = app_slug()
+      owner = owner(slug)
+
+      events =
+        start_supervised!({Events, name: unique_name(), socket: path, list: held_listing(self())})
+
+      {sock1, _head} = accept_conn(listen)
+      send_ok_headers(sock1)
+      assert_receive {:listing, old}, 1_000
+      :gen_tcp.close(sock1)
+
+      {sock2, _head} = accept_conn(listen, 5_000)
+      send_ok_headers(sock2)
+      assert_receive {:listing, new}, 5_000
+
+      # Answered while the new connection's listing still runs.
+      ref = Process.monitor(old)
+      send(old, {:go, [container("/addon_" <> slug, "c1", "exited", "Exited (1) 1 second ago")]})
+      assert_receive {:DOWN, ^ref, :process, ^old, :normal}, 1_000
+      _ = :sys.get_state(events)
+      assert ping(owner) == :pong
+      refute_received {:owner_got, _}
+
+      send(new, {:go, [container("/addon_" <> slug, "c2", "running", "Up 1 second")]})
+      assert_receive {:owner_got, %{action: "start", id: "c2"}}, 1_000
+      assert ping(owner) == :pong
+      refute_received {:owner_got, _}
+    end
+
+    test "a listing that dies lets go of the live events it held back", %{
+      path: path,
+      listen: listen
+    } do
+      slug = app_slug()
+      owner = owner(slug)
+      name = unique_name()
+      start_supervised!({Events, name: name, socket: path, list: held_listing(self())})
+      :ok = Events.subscribe(name)
+
+      {sock, _head} = accept_conn(listen)
+      send_ok_headers(sock)
+      assert_receive {:listing, lister}, 1_000
+      send_chunk(sock, event_json("start", "addon_" <> slug, "c1") <> "\n")
+      assert_receive {:docker_event, %{action: "start", id: "c1"}}, 1_000
+
+      ExUnit.CaptureLog.capture_log(fn ->
+        ref = Process.monitor(lister)
+        Process.exit(lister, :kill)
+        assert_receive {:DOWN, ^ref, :process, ^lister, :killed}
+        assert_receive {:owner_got, %{action: "start", id: "c1"}}, 1_000
+      end)
+
+      assert ping(owner) == :pong
+    end
+
+    defp held_listing(test) do
+      fn _socket ->
+        send(test, {:listing, self()})
+
+        receive do
+          {:go, containers} -> {:ok, containers}
+        end
+      end
+    end
+
+    # Registered as the app process, it forwards each event it is routed.
+    defp owner(slug) do
+      test = self()
+
+      pid =
+        spawn_link(fn ->
+          {:ok, _} = Registry.register(Vagus.App.Directory, {:slug, slug}, nil)
+          send(test, :registered)
+          forward(test)
+        end)
+
+      assert_receive :registered
+      pid
+    end
+
+    defp forward(test) do
+      receive do
+        {:docker_event, payload} -> send(test, {:owner_got, payload})
+        {:ping, from} -> send(from, :pong)
+      end
+
+      forward(test)
+    end
+
+    # Every routed event the process was sent is forwarded before the reply.
+    defp ping(owner) do
+      send(owner, {:ping, self()})
+      assert_receive :pong, 1_000
+      :pong
+    end
+
+    defp container(name, id, state, status),
+      do: %{"Id" => id, "Names" => [name], "State" => state, "Status" => status}
+  end
+
   describe "schedule_reconnect/2" do
     import ExUnit.CaptureLog
 

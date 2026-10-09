@@ -88,11 +88,12 @@ defmodule Vagus.API.AddonOptionsConfigTest do
     assert Jason.decode!(conn.resp_body)["message"] =~ "Invalid configuration data"
   end
 
-  test "an add-on that isn't installed is a 400" do
-    # Registered token, no State entry — nothing to compute options from.
+  # A token lives in its app's process, so one for an app that is not
+  # installed authenticates nothing.
+  test "a token no installed app holds is a 401" do
     token = register_app_token(config("core_optcfgghost", []), installed: false)
     conn = get("/addons/self/options/config", token)
-    assert conn.status == 400
+    assert conn.status == 401
   end
 
   test "a non-self slug is forbidden (self-only)" do

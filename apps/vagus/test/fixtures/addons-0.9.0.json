@@ -1,0 +1,264 @@
+{
+    "addons": {
+        "core_mqtt": {
+            "auto_update": null,
+            "boot": null,
+            "config": {
+                "arch": [
+                    "aarch64",
+                    "amd64"
+                ],
+                "ingress_entry": null,
+                "ingress_port": 8099,
+                "url": null,
+                "apparmor": true,
+                "timeout": 10,
+                "homeassistant_api": false,
+                "init": true,
+                "schema": {},
+                "backup_pre": null,
+                "auth_api": false,
+                "backend": "native",
+                "slug": "core_mqtt",
+                "host_ipc": false,
+                "backup_exclude": [],
+                "description": "Built-in MQTT broker",
+                "docker_api": false,
+                "image": null,
+                "startup": "services",
+                "panel_title": null,
+                "name": "MQTT broker",
+                "discovery": [
+                    "mqtt"
+                ],
+                "backup_post": null,
+                "watchdog": null,
+                "machine": [],
+                "host_pid": false,
+                "hassio_role": "default",
+                "boot": "auto",
+                "ingress": false,
+                "advanced": false,
+                "backup": "hot",
+                "stage": "stable",
+                "dsp": false,
+                "ports": {},
+                "devices": [],
+                "host_network": false,
+                "map": [],
+                "privileged": [],
+                "host_dbus": false,
+                "options": {},
+                "host_uts": false,
+                "version": "1.0.0",
+                "hassio_api": false,
+                "homeassistant": null,
+                "panel_admin": true,
+                "ingress_stream": false,
+                "full_access": false,
+                "webui": null,
+                "services": [
+                    "mqtt:provide"
+                ],
+                "panel_icon": "mdi:puzzle"
+            },
+            "ingress_panel": false,
+            "ingress_port": null,
+            "ingress_token": "OC-I4pFvNCe-7XPMdYnKtAvnZMDhUjKtdjwIsGw7aG0",
+            "network": {},
+            "protected": true,
+            "state": "started",
+            "user_options": {},
+            "watchdog": false
+        },
+        "core_ssh": {
+            "auto_update": null,
+            "boot": null,
+            "config": {
+                "arch": [
+                    "aarch64",
+                    "amd64"
+                ],
+                "ingress_entry": null,
+                "ingress_port": 8099,
+                "url": null,
+                "apparmor": true,
+                "timeout": 10,
+                "homeassistant_api": true,
+                "init": false,
+                "schema": {
+                    "authorized_keys": [
+                        "str"
+                    ],
+                    "password": "password"
+                },
+                "backup_pre": null,
+                "auth_api": true,
+                "backend": "container",
+                "slug": "core_ssh",
+                "host_ipc": false,
+                "backup_exclude": [],
+                "description": "Allow logging in remotely",
+                "docker_api": false,
+                "image": "homeassistant/{arch}-addon-ssh",
+                "startup": "application",
+                "panel_title": null,
+                "name": "Terminal & SSH",
+                "discovery": [],
+                "backup_post": null,
+                "watchdog": null,
+                "machine": [],
+                "host_pid": false,
+                "hassio_role": "manager",
+                "boot": "auto",
+                "ingress": true,
+                "advanced": false,
+                "backup": "hot",
+                "stage": "stable",
+                "dsp": false,
+                "ports": {
+                    "22/tcp": null
+                },
+                "devices": [],
+                "host_network": false,
+                "map": [
+                    {
+                        "path": null,
+                        "read_only": false,
+                        "type": "config"
+                    },
+                    {
+                        "path": null,
+                        "read_only": true,
+                        "type": "ssl"
+                    },
+                    {
+                        "path": null,
+                        "read_only": true,
+                        "type": "share"
+                    },
+                    {
+                        "path": null,
+                        "read_only": true,
+                        "type": "media"
+                    },
+                    {
+                        "path": null,
+                        "read_only": true,
+                        "type": "backup"
+                    },
+                    {
+                        "path": null,
+                        "read_only": true,
+                        "type": "addons"
+                    }
+                ],
+                "privileged": [],
+                "host_dbus": false,
+                "options": {
+                    "authorized_keys": [],
+                    "password": ""
+                },
+                "host_uts": false,
+                "version": "10.5.0",
+                "hassio_api": true,
+                "homeassistant": null,
+                "panel_admin": true,
+                "ingress_stream": false,
+                "full_access": true,
+                "webui": null,
+                "services": [],
+                "panel_icon": "mdi:puzzle"
+            },
+            "ingress_panel": true,
+            "ingress_port": null,
+            "ingress_token": "PDySopzuto0qk0UH6Px_OPTjc4rqGhbfk-nzXbYIeB8",
+            "network": {
+                "22/tcp": 2222
+            },
+            "protected": false,
+            "state": "started",
+            "user_options": {
+                "authorized_keys": [
+                    "ssh-ed25519 AAAA test"
+                ],
+                "password": ""
+            },
+            "watchdog": false
+        },
+        "esphome_esphome": {
+            "auto_update": true,
+            "boot": "manual",
+            "config": {
+                "arch": [
+                    "aarch64",
+                    "amd64"
+                ],
+                "ingress_entry": null,
+                "ingress_port": 0,
+                "url": null,
+                "apparmor": true,
+                "timeout": 10,
+                "homeassistant_api": false,
+                "init": true,
+                "schema": {
+                    "leave_front_door_open": "bool?"
+                },
+                "backup_pre": null,
+                "auth_api": false,
+                "backend": "container",
+                "slug": "esphome_esphome",
+                "host_ipc": false,
+                "backup_exclude": [],
+                "description": "ESPHome dashboard",
+                "docker_api": false,
+                "image": "ghcr.io/esphome/esphome-hassio",
+                "startup": "application",
+                "panel_title": null,
+                "name": "ESPHome Device Builder",
+                "discovery": [],
+                "backup_post": null,
+                "watchdog": "http://[HOST]:[PORT:6052]/",
+                "machine": [],
+                "host_pid": false,
+                "hassio_role": "default",
+                "boot": "auto",
+                "ingress": true,
+                "advanced": false,
+                "backup": "cold",
+                "stage": "stable",
+                "dsp": false,
+                "ports": {},
+                "devices": [],
+                "host_network": true,
+                "map": [],
+                "privileged": [],
+                "host_dbus": false,
+                "options": {
+                    "leave_front_door_open": false
+                },
+                "host_uts": false,
+                "version": "2026.9.1",
+                "hassio_api": false,
+                "homeassistant": null,
+                "panel_admin": true,
+                "ingress_stream": false,
+                "full_access": false,
+                "webui": null,
+                "services": [],
+                "panel_icon": "mdi:puzzle"
+            },
+            "ingress_panel": true,
+            "ingress_port": 62917,
+            "ingress_token": "qNSNyjCekjCGDgSiUXHJMSD_kEu3UZuc_Vq8O5N6xmI",
+            "network": {},
+            "protected": true,
+            "state": "stopped",
+            "user_options": {
+                "leave_front_door_open": true
+            },
+            "watchdog": true
+        }
+    },
+    "version": 1
+}

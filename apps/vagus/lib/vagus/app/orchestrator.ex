@@ -5,6 +5,9 @@ defmodule Vagus.App.Orchestrator do
   task. Every step is idempotent, so a boot task that crashes stops this
   process, and its supervisor's restart simply boots again.
 
+  Its start imports the apps an older Vagus recorded (`Vagus.App.File`) and
+  ensures a process per saved app, whether or not it then boots.
+
   Boot:
 
     1. the default native app is installed if missing, and on that fresh
@@ -23,8 +26,10 @@ defmodule Vagus.App.Orchestrator do
        | (Home Assistant Core) | `core`        |
        | `application`, `once` | `application` |
 
-       an app's boot rule is `Vagus.App.Policy.boot/2`; `once` apps are not
-       awaited;
+       each app is sent `boot_start` with whether its container runs, from
+       one listing taken after the `engine` gate (`:unknown` if it fails),
+       and applies its own boot rule (`Vagus.App.Policy.boot/2`); `once`
+       apps are not awaited;
     5. `supervisor_update` with `startup: complete`, which Core takes as the
        Supervisor having finished starting.
 
@@ -37,26 +42,28 @@ defmodule Vagus.App.Orchestrator do
   longest a shutdown waits; a unit still running past its stage budget is
   left to finish beside the stop.
 
-  Shutdown stops the `application` stage, then Core, then every earlier
-  stage, each group all at once. Core stops by a deadline that leaves the
-  earlier group its own bound within the caller's budget. Native apps keep
-  running and nothing is written to State, so the next boot starts the same
-  apps. The stop runs outside this process, so a crash here does not cut it
-  short; a restart while `Vagus.Host.Shutdown` is in flight does not boot,
-  and answers `shutdown/2` and `resume/1` as after any stop.
+  Shutdown sends `halt` to the `application` stage, then stops Core, then
+  halts every earlier stage, each group all at once. A halted app stops its
+  container by name and keeps what it wants, so the next boot starts the
+  same apps; it refuses commands until `resume`. Core stops by a deadline
+  that leaves the earlier group its own bound within the caller's budget.
+  Native apps keep running. The stop runs outside this process, so a crash
+  here does not cut it short; a restart while `Vagus.Host.Shutdown` is in
+  flight does not boot, and answers `shutdown/2` and `resume/1` as after any
+  stop. A boot after a stop that did not take the device down resumes each
+  halted app in its stage.
 
   A user's stop of the default broker survives a reboot: it starts only on a
-  fresh install or when State says `:started`. An app whose boot start fails
-  stays `:started`, as one whose start fails its registration already does.
-  `Vagus.Provisioner`'s first-boot Core start stays its own, outside these
-  stages.
+  fresh install or when it is wanted started. With `boot: false` nothing is
+  ever given its boot rule. `Vagus.Provisioner`'s first-boot Core start stays
+  its own, outside these stages.
   """
 
   use GenServer
 
   require Logger
 
-  alias Vagus.App.{Policy, Units}
+  alias Vagus.App.Units
 
   @stage_of %{
     "initialize" => :initialize,
@@ -105,7 +112,11 @@ defmodule Vagus.App.Orchestrator do
   @spec resume(GenServer.server()) :: :ok
   def resume(server \\ __MODULE__), do: GenServer.cast(server, :resume)
 
-  @doc "Applies the boot rule to one app once boot is over; ignored before."
+  @doc """
+  Applies the boot rule to one app whose process (re)started, once boot is
+  over; ignored before. Its container is inspected first, so a wanted one
+  still running is started again under a token the new process holds.
+  """
   @spec up(String.t(), GenServer.server()) :: :ok
   def up(slug, server \\ __MODULE__), do: GenServer.cast(server, {:up, slug})
 
@@ -122,11 +133,10 @@ defmodule Vagus.App.Orchestrator do
 
     cfg = cfg |> Map.new() |> Map.update!(:units, &Map.new/1)
     # Here, not in the task, so this tree is not reported started until every
-    # app process exists. A `State.list/0` exit crashes it: State is a durable
-    # sibling started before this tree, so its absence must be loud.
-    list = Map.get(cfg.units, :list, &Vagus.Addon.State.list/0)
+    # app process exists.
+    Map.get(cfg.units, :import, &Units.import/0).()
     ensure = Map.get(cfg.units, :ensure, &Units.ensure/1)
-    Enum.each(list.(), &ensure.(&1.config.slug))
+    Enum.each(Map.get(cfg.units, :slugs, &Vagus.App.slugs/0).(), ensure)
 
     state = %{phase: :up, task: nil, waiters: [], resume: false, deadline: :infinity, cfg: cfg}
     {:ok, state, {:continue, :boot}}
@@ -168,10 +178,10 @@ defmodule Vagus.App.Orchestrator do
   def handle_cast(:resume, %{phase: phase} = state) when phase in [:stopping, :cancelling],
     do: {:noreply, %{state | resume: true}}
 
-  def handle_cast({:up, slug}, %{phase: :up, cfg: %{units: units}} = state) do
-    with %{} = entry <- Enum.find(units.list.(), &(&1.config.slug == slug)) do
-      Task.Supervisor.start_child(Vagus.TaskSupervisor, fn -> boot_start(entry, units) end)
-    end
+  def handle_cast({:up, slug}, %{phase: :up, cfg: %{boot: true, units: units}} = state) do
+    Task.Supervisor.start_child(Vagus.TaskSupervisor, fn ->
+      boot_start(slug, units.inspect.(slug), units)
+    end)
 
     {:noreply, state}
   end
@@ -225,13 +235,13 @@ defmodule Vagus.App.Orchestrator do
   end
 
   defp run_boot(cfg) do
-    import_once()
     if slug = cfg.default_native_app, do: install_default(slug, cfg.units)
 
-    Enum.each(@plan, fn step ->
-      checkpoint(0)
-      step(step, cfg)
-    end)
+    _running =
+      Enum.reduce(@plan, :unknown, fn step, running ->
+        checkpoint(0)
+        step(step, running, cfg)
+      end)
 
     cfg.units.push_complete.()
   catch
@@ -247,38 +257,52 @@ defmodule Vagus.App.Orchestrator do
     end
   end
 
-  # Where apps recorded by an older Vagus are brought into this one.
-  defp import_once, do: :ok
-
   defp install_default(slug, units) do
     case units.install_default.(slug) do
-      :installed -> units.want_started.(slug)
-      :present -> :ok
+      result when result in [:installed, :present] -> :ok
       error -> Logger.warning("Boot: default app #{slug} not installed: #{inspect(error)}")
     end
   end
 
-  defp step({:gate, name}, cfg), do: gate(name, Map.fetch!(cfg.units.gates, name), cfg, 1)
-
-  defp step({:stage, :core}, cfg) do
-    task = spawn_unit(fn -> ready("Core", cfg.units.core_start.(cfg.stage_timeout)) end)
-    await(:core, [{"core", task}], cfg)
+  # `running` is the engine's one listing of app containers, taken once the
+  # engine gate is behind and carried through the stages.
+  defp step({:gate, name}, running, cfg) do
+    gate(name, Map.fetch!(cfg.units.gates, name), cfg, 1)
+    if name == :engine, do: listing(cfg), else: running
   end
 
-  defp step({:stage, stage}, %{units: units} = cfg) do
+  defp step({:stage, :core}, running, cfg) do
+    task = spawn_unit(fn -> ready("Core", cfg.units.core_start.(cfg.stage_timeout)) end)
+    await(:core, [{"core", task}], cfg)
+    running
+  end
+
+  defp step({:stage, stage}, running, %{units: units} = cfg) do
     {once, awaited} =
       units.list.()
       |> Enum.filter(&in_stage?(&1, stage, units))
       |> Enum.split_with(&(&1.config.startup == "once"))
 
-    Enum.each(once, fn entry -> spawn_unit(fn -> boot_start(entry, units) end) end)
-
-    tasks =
-      for entry <- awaited,
-          do: {entry.config.slug, spawn_unit(fn -> boot_start(entry, units) end)}
-
+    start = fn slug -> spawn_unit(fn -> boot_start(slug, running?(running, slug), units) end) end
+    Enum.each(once, &start.(&1.config.slug))
+    tasks = for %{config: %{slug: slug}} <- awaited, do: {slug, start.(slug)}
     await(stage, tasks, cfg)
+    running
   end
+
+  defp listing(cfg) do
+    case run_bounded(cfg.units.running, cfg.gate_timeout) do
+      {:ok, %MapSet{} = running} ->
+        running
+
+      failure ->
+        Logger.warning("Boot: app containers not listed (#{inspect(failure)}); none demoted")
+        :unknown
+    end
+  end
+
+  defp running?(:unknown, _slug), do: :unknown
+  defp running?(running, slug), do: MapSet.member?(running, slug)
 
   defp in_stage?(entry, :native, units), do: units.native?.(entry)
   defp in_stage?(entry, stage, _units), do: Map.get(@stage_of, entry.config.startup) == stage
@@ -337,13 +361,7 @@ defmodule Vagus.App.Orchestrator do
   defp outcome(nil), do: :pending
   defp outcome(_crashed), do: :failed
 
-  defp boot_start(entry, units) do
-    case Policy.boot(entry, entry.state == :started and units.running?.(entry)) do
-      :start -> ready(entry.config.slug, units.start.(entry.config.slug))
-      :demote -> ready(entry.config.slug, units.demote.(entry))
-      :none -> :ready
-    end
-  end
+  defp boot_start(slug, running?, units), do: ready(slug, units.boot_start.(slug, running?))
 
   defp ready(_name, :ok), do: :ready
 
@@ -366,7 +384,7 @@ defmodule Vagus.App.Orchestrator do
 
   # A listing that fails must still let Core stop.
   defp stoppable(units) do
-    Enum.filter(units.list.(), &(&1.state == :started and not units.native?.(&1)))
+    Enum.reject(units.list.(), units.native?)
   rescue
     exception -> unlisted(exception)
   catch
@@ -407,13 +425,13 @@ defmodule Vagus.App.Orchestrator do
   defp stop_all(entries, cfg) do
     tasks =
       for %{config: %{slug: slug}} <- entries,
-          do: {slug, spawn_unit(fn -> cfg.units.stop.(slug) end)}
+          do: {slug, spawn_unit(fn -> cfg.units.halt.(slug) end)}
 
     opts = [timeout: cfg.app_stop_timeout, on_timeout: :kill_task]
     results = Task.yield_many(Enum.map(tasks, &elem(&1, 1)), opts)
 
     Enum.zip_with(tasks, results, fn {slug, _}, {_, result} ->
-      result == {:ok, :ok} || Logger.warning("Shutdown: #{slug} stop failed: #{inspect(result)}")
+      result == {:ok, :ok} || Logger.warning("Shutdown: #{slug} halt failed: #{inspect(result)}")
     end)
     |> Enum.count(&(&1 == true))
     |> then(&{&1, length(tasks)})

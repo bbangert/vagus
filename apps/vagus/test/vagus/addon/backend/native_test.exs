@@ -1,57 +1,35 @@
 defmodule Vagus.Addon.Backend.NativeTest do
-  # async: false — drives the app-global Native.Supervisor / State and binds a
-  # real TCP port for the broker subtree.
+  # async: false — drives the app-global Native.Supervisor and app processes,
+  # and binds a real TCP port for the broker subtree.
   use ExUnit.Case, async: false
 
+  import Vagus.AppFixtures,
+    only: [app_deadlines: 1, forget_app: 1, install_app: 1, stub_app_steps: 0]
+
   alias Vagus.Addon.Backend.Native
-  alias Vagus.Addon.{Config, Info, Manager, State}
+  alias Vagus.Addon.{Config, Info}
   alias Vagus.Addon.Store.BuiltinFetcher
+  alias Vagus.App
+  alias Vagus.App.Steps
 
   @slug "core_mqtt"
   @id "addon_core_mqtt"
 
   # The store rewrites `config.slug` to the store slug on install (router
-  # handle_install); mirror that so the installed add-on runs under "core_mqtt".
+  # handle_install); mirror that so the installed app runs under "core_mqtt".
   defp mqtt_config do
     {:ok, config} = Config.parse(BuiltinFetcher.config(:mqtt))
     %{config | slug: @slug}
   end
 
-  # A State stub whose `list/0` reports one :started native add-on, to exercise
-  # the sentinel's init-reconcile (watch set rebuilt from State, not from watch/1).
-  # Defined here (before its use) so the module alias is in scope.
-  defmodule ReconcileState do
-    @moduledoc false
-
-    def list do
-      {_pid, slug} = :persistent_term.get(__MODULE__)
-
-      {:ok, config} =
-        Vagus.Addon.Config.parse(%{
-          "name" => "rc",
-          "version" => "1",
-          "slug" => slug,
-          "description" => "rc",
-          "arch" => ["amd64"],
-          "backend" => "native"
-        })
-
-      [%{state: :started, config: config}]
-    end
-
-    def get(_slug) do
-      {_pid, slug} = :persistent_term.get(__MODULE__)
-      {:ok, %{config: {:reconciled, slug}}}
-    end
-
-    def put(config, state) do
-      {pid, _slug} = :persistent_term.get(__MODULE__)
-      send(pid, {:state_put, config, state})
-      :ok
-    end
+  # Installs and starts the real broker through its app process.
+  defp start_broker do
+    assert :ok = App.install(mqtt_config())
+    on_exit(fn -> forget_app(@slug) end)
+    assert {:ok, %{slug: @slug}} = App.start(@slug)
   end
 
-  describe "native add-on lifecycle (real broker subtree, Manager routes to :native)" do
+  describe "native app lifecycle (real broker subtree, the steps route to :native)" do
     setup do
       port = free_port()
       prev_port = Application.get_env(:vagus, :mqtt_broker_port)
@@ -61,61 +39,52 @@ defmodule Vagus.Addon.Backend.NativeTest do
       Application.put_env(:vagus, :addon_data_root, data_root)
 
       on_exit(fn ->
-        Manager.uninstall(@slug, data_root: data_root)
+        Native.stop(@id)
         restore_env(:mqtt_broker_port, prev_port)
         restore_env(:addon_data_root, prev_root)
       end)
 
-      %{config: mqtt_config(), port: port, data_root: data_root}
+      %{config: mqtt_config(), port: port}
     end
 
-    test "install → start → state → stop → uninstall", %{
-      config: config,
-      port: port,
-      data_root: dr
-    } do
-      # install routes to Native.pull (no Docker); the router persists :stopped.
-      assert :ok = Manager.install(config, data_root: dr)
-      :ok = State.put(config, :stopped)
+    test "install → start → state → stop → uninstall", %{config: config, port: port} do
+      # install pulls through Native.pull (no Docker) and records it stopped.
+      assert :ok = App.install(config)
+      on_exit(fn -> forget_app(@slug) end)
+      assert {:ok, %{state: :stopped}} = App.info(@slug)
 
       # start routes to Native → a real supervised broker subtree.
-      assert {:ok, %{id: @id}} = Manager.start(config, data_root: dr)
+      assert {:ok, %{slug: @slug}} = App.start(@slug)
       assert {:ok, :running} = Native.state(@id)
-      assert {:ok, %{state: :started}} = State.get(@slug)
+      assert {:ok, %{state: :started}} = App.info(@slug)
 
       # the listener is actually bound on the configured port.
       assert {:ok, sock} = :gen_tcp.connect(~c"127.0.0.1", port, [active: false], 1_000)
       :gen_tcp.close(sock)
 
-      # Info.render surfaces the add-on from its Config (no backend coupling).
+      # Info.render surfaces the app from its Config (no backend coupling).
       info = Info.render(config, :started, config.options)
       assert info["slug"] == @slug
       assert info["name"] == config.name
 
-      # stop tears the subtree down and records :stopped.
-      assert :ok = Manager.stop(@slug, data_root: dr)
+      # stop tears the subtree down and reports stopped.
+      assert :ok = App.stop(@slug)
       assert {:ok, :stopped} = Native.state(@id)
-      assert {:ok, %{state: :stopped}} = State.get(@slug)
+      assert {:ok, %{state: :stopped}} = App.info(@slug)
       assert {:error, :econnrefused} = :gen_tcp.connect(~c"127.0.0.1", port, [active: false], 500)
 
-      # uninstall purges State.
-      assert :ok = Manager.uninstall(@slug, data_root: dr)
-      assert :error = State.get(@slug)
+      assert :ok = App.uninstall(@slug)
+      assert :error = App.info(@slug)
     end
 
-    test "start is idempotent and stop tolerates an already-stopped add-on", %{
-      config: config,
-      data_root: dr
-    } do
-      assert :ok = Manager.install(config, data_root: dr)
-      Vagus.AppFixtures.install_app(config)
-      assert {:ok, _} = Manager.start(config, data_root: dr)
+    test "start is idempotent and stop tolerates an already-stopped app" do
+      start_broker()
 
       # Native.start on an already-running id is :ok, not a crash.
       assert :ok = Native.start(@id)
       assert {:ok, :running} = Native.state(@id)
 
-      assert :ok = Manager.stop(@slug, data_root: dr)
+      assert :ok = App.stop(@slug)
       # Native.stop/remove on an unstarted id is idempotent.
       assert :ok = Native.stop(@id)
       assert :ok = Native.remove(@id)
@@ -141,28 +110,24 @@ defmodule Vagus.Addon.Backend.NativeTest do
       prev_port = Application.get_env(:vagus, :mqtt_broker_port)
       prev_root = Application.get_env(:vagus, :addon_data_root)
       Application.put_env(:vagus, :mqtt_broker_port, port)
-      # Align the Provider's data dir (config) with the Manager's (opt) so the
-      # persisted broker_state.json rides in the backup tar.
+      # The Provider's data dir is the app's, so the persisted
+      # broker_state.json rides in the backup tar.
       Application.put_env(:vagus, :addon_data_root, dr)
 
       backups = :"backups_#{System.unique_integer([:positive])}"
       start_supervised!({Vagus.Backups, name: backups, dir: Path.join(dr, "backup")})
 
-      config = mqtt_config()
-      assert :ok = Manager.install(config, data_root: dr)
-      Vagus.AppFixtures.install_app(config)
-      assert {:ok, _} = Manager.start(config, data_root: dr)
-
       on_exit(fn ->
-        Manager.uninstall(@slug, data_root: dr)
+        Native.stop(@id)
         restore_env(:mqtt_broker_port, prev_port)
         restore_env(:addon_data_root, prev_root)
       end)
 
+      start_broker()
       %{port: port, dr: dr, backups: backups}
     end
 
-    test "publishes the mqtt service with the add-on slug + addons credentials" do
+    test "publishes the mqtt service with the app slug + addons credentials" do
       assert {:ok, @slug, data} = Vagus.App.service("mqtt")
       assert data["host"] == "127.0.0.1"
       assert data["protocol"] == "3.1.1"
@@ -175,7 +140,7 @@ defmodule Vagus.Addon.Backend.NativeTest do
       assert connected_within?(connect_auth(port, "addons", pass))
     end
 
-    test "adds an mqtt discovery message for the add-on" do
+    test "adds an mqtt discovery message for the app" do
       assert Enum.any?(Vagus.App.discoveries(), &(&1.service == "mqtt" and &1.addon == @slug))
     end
 
@@ -219,7 +184,7 @@ defmodule Vagus.Addon.Backend.NativeTest do
     end
   end
 
-  describe "native runtime surfaces (stats / logs / DNS / watchdog liveness, MQ-P3)" do
+  describe "native runtime surfaces (stats / logs / DNS / liveness, MQ-P3)" do
     setup do
       port = free_port()
       prev_port = Application.get_env(:vagus, :mqtt_broker_port)
@@ -228,80 +193,49 @@ defmodule Vagus.Addon.Backend.NativeTest do
       dr = tmp_dir()
       Application.put_env(:vagus, :addon_data_root, dr)
 
-      # A DNS server under the global name, and `:dns_enabled` on so the
-      # Manager registers with it (the app doesn't start one in :test). The
-      # default-named server checkpoints, so an earlier test's file goes first.
-      prev_dns = Application.get_env(:vagus, :dns_enabled)
-      Application.put_env(:vagus, :dns_enabled, true)
-      File.rm(Vagus.RunState.path(:dns))
-
       start_supervised!(
         {Vagus.DNS, name: Vagus.DNS, ip: {127, 0, 0, 1}, port: free_port(), upstream: nil}
       )
 
-      config = mqtt_config()
-      assert :ok = Manager.install(config, data_root: dr)
-      :ok = State.put(config, :stopped)
-      assert {:ok, %{access_token: token}} = Manager.start(config, data_root: dr)
-
       on_exit(fn ->
-        # First: the supervised DNS is already gone, and with DNS still
-        # enabled the uninstall would wait out its whole retry budget.
-        restore_env(:dns_enabled, prev_dns)
-        File.rm(Vagus.RunState.path(:dns))
-        Manager.uninstall(@slug, data_root: dr)
+        Native.stop(@id)
         restore_env(:mqtt_broker_port, prev_port)
         restore_env(:addon_data_root, prev_root)
       end)
 
-      %{port: port, dr: dr, token: token}
+      start_broker()
+      %{port: port, dr: dr}
     end
 
-    test "stats are process-derived while running and zero when stopped", %{dr: dr} do
+    test "stats are process-derived while running and zero when stopped" do
       stats = Native.stats(@id)
       assert stats.memory_usage > 0
       assert stats.cpu_percent == 0.0
       assert stats.memory_limit == 0
       assert Enum.sort(Map.keys(stats)) == Enum.sort(Map.keys(Vagus.Runtime.Stats.zero()))
 
-      assert :ok = Manager.stop(@slug, data_root: dr)
+      assert :ok = App.stop(@slug)
       assert Native.stats(@id) == Vagus.Runtime.Stats.zero()
     end
 
-    test "watchdog liveness follows the broker subtree", %{dr: dr} do
+    test "liveness follows the broker subtree" do
       assert Native.running?(@id)
-      assert :ok = Manager.stop(@slug, data_root: dr)
+      assert :ok = App.stop(@slug)
       refute Native.running?(@id)
     end
 
-    test "DNS advertises the broker at the supervisor anchor IP" do
+    test "DNS advertises the broker at the supervisor anchor IP, and a stop withdraws it" do
       assert {:ok, {172, 30, 32, 2}} = Vagus.DNS.resolve("core-mqtt", Vagus.DNS)
+      assert :ok = App.stop(@slug)
+      assert :error = Vagus.DNS.resolve("core-mqtt", Vagus.DNS)
     end
 
-    # Both run under their default names here, as in production, so this is
-    # what notices a default-named instance that does not checkpoint.
-    test "a Registry or DNS restart keeps the running add-on's token and name", %{
-      token: token
-    } do
+    # The name is the app process's key, not the DNS server's: a DNS restart
+    # loses nothing.
+    test "a DNS restart keeps the running app's name" do
       {:ok, test_sup} = ExUnit.fetch_test_supervisor()
-
-      # A failure between the terminate and the restart below must not leave
-      # the application without its Registry for every later test.
-      on_exit(fn ->
-        case Supervisor.restart_child(Vagus.Supervisor, Vagus.Addon.Registry) do
-          {:ok, _pid} -> :ok
-          {:error, :running} -> :ok
-        end
-      end)
-
-      # Same `init/1` as after a crash, without spending the supervisor's
-      # restart intensity the way a kill does.
-      for {sup, id} <- [{Vagus.Supervisor, Vagus.Addon.Registry}, {test_sup, Vagus.DNS}] do
-        :ok = Supervisor.terminate_child(sup, id)
-        assert {:ok, _pid} = Supervisor.restart_child(sup, id)
-      end
-
-      assert {:ok, %{slug: @slug}} = Vagus.Addon.Registry.identity_for_token(token)
+      :ok = Supervisor.terminate_child(test_sup, Vagus.DNS)
+      assert {:ok, _pid} = Supervisor.restart_child(test_sup, Vagus.DNS)
       assert {:ok, {172, 30, 32, 2}} = Vagus.DNS.resolve("core-mqtt", Vagus.DNS)
     end
 
@@ -330,8 +264,8 @@ defmodule Vagus.Addon.Backend.NativeTest do
     end
   end
 
-  describe "backend routing (Manager.put_backend, incl. native allowlist)" do
-    # Records which backend module's `pull/1` the Manager actually invoked.
+  describe "backend routing (the steps' backend choice, incl. native allowlist)" do
+    # Records which backend module's `pull/1` the pull step actually invoked.
     defmodule FakeBackend do
       @moduledoc false
       @behaviour Vagus.Addon.Backend
@@ -373,268 +307,101 @@ defmodule Vagus.Addon.Backend.NativeTest do
       %{dr: tmp_dir()}
     end
 
-    test "a container add-on routes to the default backend", %{dr: dr} do
-      assert :ok = Manager.install(container_config("plain_c"), data_root: dr)
+    test "a container app routes to the default backend", %{dr: dr} do
+      assert {:ok, _image} = pull(container_config("plain_c"), dr)
       assert_receive {:fake_pull, "addon_plain_c"}
     end
 
-    test "a non-allowlisted native add-on falls back to the default (container) backend",
+    test "a non-allowlisted native app falls back to the default (container) backend",
          %{dr: dr} do
-      # SECURITY: an untrusted store add-on declaring `backend: native` on a
+      # SECURITY: an untrusted store app declaring `backend: native` on a
       # non-allowlisted slug must NOT reach Backend.Native — it routes to the
       # default, so it can't run un-sandboxed or impersonate the broker.
-      assert :ok = Manager.install(rogue_native_config("rogue_native"), data_root: dr)
+      assert {:ok, _image} = pull(rogue_native_config("rogue_native"), dr)
       assert_receive {:fake_pull, "addon_rogue_native"}
     end
 
-    test "an allowlisted native add-on routes to Backend.Native (not the default)", %{dr: dr} do
-      assert :ok = Manager.install(mqtt_config(), data_root: dr)
+    test "an allowlisted native app routes to Backend.Native (not the default)", %{dr: dr} do
+      assert {:ok, nil} = pull(mqtt_config(), dr)
       refute_receive {:fake_pull, "addon_core_mqtt"}
     end
+
+    # Host-networked so the pull does not stand up the bridge.
+    defp pull(config, dr),
+      do:
+        Steps.run(:pull, %{
+          slug: config.slug,
+          config: %{config | host_network: true},
+          data_root: dr
+        })
   end
 
-  describe "Sentinel (native lifecycle → State sync, MQ-P2-T3)" do
-    defmodule FakeState do
-      @moduledoc false
-      # Empty catalog so init-reconcile is a no-op for these unit tests.
-      def list, do: []
-      def get(_slug), do: {:ok, %{config: :fake_config}}
-
-      def put(config, state) do
-        send(:persistent_term.get(__MODULE__), {:state_put, config, state})
-        :ok
-      end
-    end
-
+  describe "native revive (the app process's rule for a broker that died)" do
+    # The process monitors the broker pid its start reported; the steps are
+    # stubbed, so the "broker" is a process the test owns. Retry timers run at
+    # a hundredth of their real length: 5 s becomes 50 ms, 30 s 300 ms.
     setup do
-      :persistent_term.put(FakeState, self())
-      on_exit(fn -> :persistent_term.erase(FakeState) end)
-      name = :"sentinel_#{System.unique_integer([:positive])}"
-      start_supervised!({Native.Sentinel, name: name, state_mod: FakeState, recheck_ms: 100})
-      %{sentinel: name}
+      stub_app_steps()
+      app_deadlines(%{retry: &div(&1, 100), start: 5_000})
+      Application.put_env(:vagus, :native_addon_slugs, ["core_mqtt"])
+      on_exit(fn -> Application.delete_env(:vagus, :native_addon_slugs) end)
+      :ok
     end
 
-    test "demotes to :stopped when a watched broker does not restart", %{sentinel: sentinel} do
-      id = unique_id()
-      {:ok, dummy} = Agent.start(fn -> :ok end, name: Native.broker_name(id))
-
-      watch_sync(sentinel, id)
-      Agent.stop(dummy)
-
-      # No process re-registers broker_name(id) → permanent death → demote.
-      assert_receive {:state_put, :fake_config, :stopped}, 1_000
+    defp running_broker(attrs \\ %{}) do
+      install_app(Map.merge(mqtt_config(), attrs))
+      [{pid, _}] = Registry.lookup(Vagus.App.Directory, {:slug, @slug})
+      start = Task.async(fn -> App.start(@slug) end)
+      broker = answer_start()
+      assert {:ok, _} = Task.await(start)
+      {pid, broker}
     end
 
-    test "does NOT demote when the broker is restarted before the recheck", %{sentinel: sentinel} do
-      id = unique_id()
-      {:ok, dummy1} = Agent.start(fn -> :ok end, name: Native.broker_name(id))
+    defp answer_start(outcome \\ :ok) do
+      assert_receive {:step, :start, _input, task}, 2_000
 
-      watch_sync(sentinel, id)
-      Agent.stop(dummy1)
-      # Re-register under the same name before the recheck fires — simulates OTP
-      # bringing the broker back; the sentinel must re-monitor, not demote.
-      {:ok, _dummy2} = Agent.start(fn -> :ok end, name: Native.broker_name(id))
+      case outcome do
+        :ok ->
+          broker = spawn(fn -> Process.sleep(:infinity) end)
+          send(task, {:outcome, {:ok, %{container_id: @id, ip: "172.30.32.2", pid: broker}}})
+          broker
 
-      refute_receive {:state_put, _config, :stopped}, 400
-    end
-
-    test "does NOT demote after an intentional unwatch (manual stop)", %{sentinel: sentinel} do
-      id = unique_id()
-      {:ok, dummy} = Agent.start(fn -> :ok end, name: Native.broker_name(id))
-
-      watch_sync(sentinel, id)
-      Native.Sentinel.unwatch(id, sentinel)
-      # A synchronous state read flushes the unwatch cast before we kill the pid.
-      :sys.get_state(sentinel)
-      Agent.stop(dummy)
-
-      refute_receive {:state_put, _config, :stopped}, 400
-    end
-
-    test "reconciles a running native broker from State at init (no watch/1 call)" do
-      slug = "rc_#{System.unique_integer([:positive])}"
-      id = "addon_#{slug}"
-      {:ok, _broker} = Agent.start(fn -> :ok end, name: Native.broker_name(id))
-
-      :persistent_term.put(ReconcileState, {self(), slug})
-      on_exit(fn -> :persistent_term.erase(ReconcileState) end)
-
-      name = :"sentinel_rc_#{System.unique_integer([:positive])}"
-      # Distinct child id — the describe's setup already supervises a Sentinel
-      # under the default (module) id.
-      start_supervised!(
-        Supervisor.child_spec(
-          {Native.Sentinel, name: name, state_mod: ReconcileState, recheck_ms: 100},
-          id: name
-        )
-      )
-
-      # Flush init + the {:continue, :reconcile} that rebuilds the watch set.
-      :sys.get_state(name)
-
-      Agent.stop(Process.whereis(Native.broker_name(id)))
-      assert_receive {:state_put, {:reconciled, ^slug}, :stopped}, 1_000
-    end
-  end
-
-  describe "Sentinel revive (native watchdog for boot:auto add-ons)" do
-    # A stateful fake: demote's put/2 updates the entry the later revive
-    # re-reads, so the skip-if-changed logic is exercised for real.
-    defmodule ReviveState do
-      @moduledoc false
-      def list, do: []
-      def get(_slug), do: :persistent_term.get({__MODULE__, :entry}, {:error, :not_found})
-
-      def put(config, s) do
-        send(:persistent_term.get(__MODULE__), {:state_put, config, s})
-        :persistent_term.put({__MODULE__, :entry}, {:ok, %{state: s, config: config}})
-        :ok
+        error ->
+          send(task, {:outcome, error})
       end
     end
 
-    defp start_revive_sentinel(ctx_name, config, revive_fun) do
-      :persistent_term.put(ReviveState, self())
-      :persistent_term.put({ReviveState, :entry}, {:ok, %{state: :started, config: config}})
+    test "a broker that dies is started again after 5 s, then every 30 s" do
+      {_pid, broker} = running_broker()
+      died = System.monotonic_time(:millisecond)
+      Process.exit(broker, :kill)
 
-      on_exit(fn ->
-        :persistent_term.erase(ReviveState)
-        :persistent_term.erase({ReviveState, :entry})
-      end)
+      assert_receive {:step, :start, _input, task}, 2_000
+      first = System.monotonic_time(:millisecond)
+      assert first - died >= 50
+      send(task, {:outcome, {:error, :eaddrinuse}})
 
-      start_supervised!(
-        Supervisor.child_spec(
-          {Native.Sentinel,
-           name: ctx_name,
-           state_mod: ReviveState,
-           recheck_ms: 50,
-           revive_delay_ms: 50,
-           revive_retry_ms: 50,
-           revive_fun: revive_fun},
-          id: ctx_name
-        )
-      )
-
-      ctx_name
+      answer_start()
+      assert System.monotonic_time(:millisecond) - first >= 300
     end
 
-    defp kill_watched_broker(sentinel, id) do
-      {:ok, dummy} = Agent.start(fn -> :ok end, name: Native.broker_name(id))
-      watch_sync(sentinel, id)
-      Agent.stop(dummy)
+    test "a broker stopped by the user is not revived" do
+      {pid, broker} = running_broker()
+      stop = Task.async(fn -> App.stop(@slug) end)
+      assert_receive {:step, :stop, _input, task}, 2_000
+      Process.exit(broker, :kill)
+      send(task, {:outcome, {:ok, %{was_running: true}}})
+      assert :ok = Task.await(stop)
+
+      _ = :sys.get_state(pid)
+      refute_receive {:step, :start, _input, _task}, 300
     end
 
-    test "revives a boot:auto add-on after demotion (watch re-armed by Manager path)" do
-      test = self()
-      id = unique_id()
-      slug = Native.slug_from_id(id)
-      config = %{boot: "auto", slug: slug}
-
-      sentinel =
-        start_revive_sentinel(:"rv_#{System.unique_integer([:positive])}", config, fn cfg ->
-          send(test, {:revive_called, cfg})
-          {:ok, %{id: id}}
-        end)
-
-      kill_watched_broker(sentinel, id)
-
-      assert_receive {:state_put, ^config, :stopped}, 1_000
-      assert_receive {:revive_called, ^config}, 1_000
-    end
-
-    test "a failed revive retries on the fixed interval" do
-      test = self()
-      id = unique_id()
-      config = %{boot: "auto", slug: Native.slug_from_id(id)}
-
-      sentinel =
-        start_revive_sentinel(:"rv_#{System.unique_integer([:positive])}", config, fn _cfg ->
-          send(test, :revive_attempt)
-          {:error, :port_busy}
-        end)
-
-      kill_watched_broker(sentinel, id)
-
-      assert_receive :revive_attempt, 1_000
-      # No cap, fixed interval: further attempts keep coming.
-      assert_receive :revive_attempt, 1_000
-      assert_receive :revive_attempt, 1_000
-    end
-
-    test "no revive when the add-on was manually started before the delay fired" do
-      test = self()
-      id = unique_id()
-      config = %{boot: "auto", slug: Native.slug_from_id(id)}
-
-      sentinel =
-        start_revive_sentinel(:"rv_#{System.unique_integer([:positive])}", config, fn cfg ->
-          send(test, {:revive_called, cfg})
-          {:ok, %{}}
-        end)
-
-      kill_watched_broker(sentinel, id)
-      assert_receive {:state_put, ^config, :stopped}, 1_000
-
-      # Someone starts it manually before the revive delay elapses.
-      :persistent_term.put({ReviveState, :entry}, {:ok, %{state: :started, config: config}})
-      refute_receive {:revive_called, _}, 400
-    end
-
-    test "no revive when boot flipped to manual after the demotion scheduled it" do
-      test = self()
-      id = unique_id()
-      config = %{boot: "auto", slug: Native.slug_from_id(id)}
-
-      sentinel =
-        start_revive_sentinel(:"rv_#{System.unique_integer([:positive])}", config, fn cfg ->
-          send(test, {:revive_called, cfg})
-          {:ok, %{}}
-        end)
-
-      kill_watched_broker(sentinel, id)
-      assert_receive {:state_put, ^config, :stopped}, 1_000
-
-      # Config edited (e.g. re-install) to boot: manual before the revive
-      # delay elapses — the CURRENT config must win.
-      manual = %{config | boot: "manual"}
-      :persistent_term.put({ReviveState, :entry}, {:ok, %{state: :stopped, config: manual}})
-      refute_receive {:revive_called, _}, 400
-    end
-
-    test "no revive when a manual stop raced the DOWN (State already :stopped at demote)" do
-      test = self()
-      id = unique_id()
-      config = %{boot: "auto", slug: Native.slug_from_id(id)}
-
-      sentinel =
-        start_revive_sentinel(:"rv_#{System.unique_integer([:positive])}", config, fn cfg ->
-          send(test, {:revive_called, cfg})
-          {:ok, %{}}
-        end)
-
-      # Manual-stop shape: Manager.stop recorded :stopped BEFORE the broker
-      # died, and the unwatch cast lost the race with the DOWN.
-      :persistent_term.put({ReviveState, :entry}, {:ok, %{state: :stopped, config: config}})
-      kill_watched_broker(sentinel, id)
-
-      # Demotion may still (redundantly) put :stopped, but no revive fires.
-      refute_receive {:revive_called, _}, 500
-    end
-
-    test "no revive for a non-auto add-on" do
-      test = self()
-      id = unique_id()
-      config = %{boot: "manual", slug: Native.slug_from_id(id)}
-
-      sentinel =
-        start_revive_sentinel(:"rv_#{System.unique_integer([:positive])}", config, fn cfg ->
-          send(test, {:revive_called, cfg})
-          {:ok, %{}}
-        end)
-
-      kill_watched_broker(sentinel, id)
-
-      assert_receive {:state_put, ^config, :stopped}, 1_000
-      refute_receive {:revive_called, _}, 400
+    test "a manual-boot broker is not revived" do
+      {_pid, broker} = running_broker(%{boot: "manual"})
+      Process.exit(broker, :kill)
+      refute_receive {:step, :start, _input, _task}, 300
+      assert {:ok, %{state: :error}} = App.info(@slug)
     end
   end
 
@@ -666,14 +433,6 @@ defmodule Vagus.Addon.Backend.NativeTest do
       })
 
     config
-  end
-
-  # Watch, then flush the cast with a synchronous state read so the monitor is
-  # established before the test kills the process (no Process.sleep race).
-  defp watch_sync(sentinel, id) do
-    Native.Sentinel.watch(id, sentinel)
-    :sys.get_state(sentinel)
-    :ok
   end
 
   defp connect_auth(port, user, pass), do: connect(port, user, pass, [])
@@ -719,8 +478,6 @@ defmodule Vagus.Addon.Backend.NativeTest do
       true -> Process.sleep(20) && eventually(fun, pred, tries - 1)
     end
   end
-
-  defp unique_id, do: "addon_sentinel_#{System.unique_integer([:positive])}"
 
   defp free_port do
     {:ok, socket} = :gen_tcp.listen(0, ip: {127, 0, 0, 1})

@@ -3,7 +3,7 @@ defmodule Vagus.Addon.ContainerFingerprintTest do
   Does an add-on Vagus starts *look from the inside* like one a real Supervisor
   started?
 
-  `Manager.build_spec/2` and `Backend.Container.build_config/1` were written
+  `Vagus.App.Steps.build_spec/2` and `Backend.Container.build_config/1` were written
   against upstream's `docker/addon.py`, and the tests around them assert the
   Docker JSON matches what we believe upstream asks for. Belief is the weak
   part: every one of those assertions restates our own reading of upstream back
@@ -39,7 +39,8 @@ defmodule Vagus.Addon.ContainerFingerprintTest do
   use ExUnit.Case, async: true
 
   alias Vagus.Addon.Backend.Container
-  alias Vagus.Addon.{Config, Manager}
+  alias Vagus.Addon.Config
+  alias Vagus.App.Steps
   alias Vagus.Network
   alias Vagus.ProbeParity.Canon
 
@@ -163,7 +164,7 @@ defmodule Vagus.Addon.ContainerFingerprintTest do
       })
 
     spec =
-      Manager.build_spec(config,
+      Steps.build_spec(config,
         access_token: "fingerprint-token",
         arch: @fixture["versions"]["arch"],
         data_root: "/mnt/data/supervisor",

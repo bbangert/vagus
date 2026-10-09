@@ -18,16 +18,6 @@
     title: "Coupled children under one_for_one",
     at_label: "supervision tree defined here",
     detail:
-      "Vagus.Addon.Watchdog registers with Vagus.Runtime.Events when it starts, and Vagus.Runtime.Events keeps a monitor or link for it. Both are children of the one_for_one supervisor Vagus.Application, which restarts either alone. When Vagus.Runtime.Events restarts, its init/1 starts it afresh without what Vagus.Addon.Watchdog put there, and Vagus.Addon.Watchdog, which is not restarted with it, never registers again. When Vagus.Addon.Watchdog restarts, it registers a second time beside what its old process left.",
-    reason:
-      "Fixed rather than accepted: the subscriber monitors the server it subscribed to and re-subscribes to the restarted, name-registered server (Vagus.Resubscribe, see its tests). argus does not model re-registering from a handler (restart_state.dl: \"a's re-registering on a schedule of its own\" is not asked), so it still reports the init/1 subscribe."
-  },
-  %{
-    analysis: "coupling",
-    file: "lib/vagus/application.ex",
-    title: "Coupled children under one_for_one",
-    at_label: "supervision tree defined here",
-    detail:
       "Vagus.Core.Watchdog registers with Vagus.Runtime.Events when it starts, and Vagus.Runtime.Events keeps a monitor or link for it. Both are children of the one_for_one supervisor Vagus.Application, which restarts either alone. When Vagus.Runtime.Events restarts, its init/1 starts it afresh without what Vagus.Core.Watchdog put there, and Vagus.Core.Watchdog, which is not restarted with it, never registers again. When Vagus.Core.Watchdog restarts, it registers a second time beside what its old process left.",
     reason:
       "Fixed rather than accepted: the subscriber monitors the server it subscribed to and re-subscribes to the restarted, name-registered server (Vagus.Resubscribe, see its tests). argus does not model re-registering from a handler (restart_state.dl: \"a's re-registering on a schedule of its own\" is not asked), so it still reports the init/1 subscribe."
@@ -103,16 +93,6 @@
       "terminate/2 only sends a courtesy WebSocket close frame (Upstream) or closes the Mint connection; the socket is owned by this process, so the VM closes it when the process is killed. Skipping it on a shutdown only drops the close frame — the peer sees the TCP close."
   },
   %{
-    analysis: "startup",
-    file: "lib/vagus/ingress.ex",
-    title: "init/1 connects with no reconnect path",
-    at_label: "connects from here",
-    detail:
-      "Vagus.Ingress's init/1 reaches :gen_tcp.connect/4, and nothing in the module arms a timer or continues after init to try again. When the dependency is not there yet, init fails, the supervisor restarts the child at once, and after max_restarts the tree — usually the application — goes down at boot.",
-    reason:
-      "False positive: Vagus.Ingress.init/1 only captures &default_port_probe/2 as the :port_probe closure; the :gen_tcp.connect runs later, per port allocation, never in init/1."
-  },
-  %{
     analysis: "shutdown",
     file: "lib/vagus/ingress/ws_bridge.ex",
     title: "terminate/2 does work a supervisor shutdown will skip",
@@ -178,58 +158,8 @@
     title: "Coupled children under one_for_one",
     at_label: "supervision tree defined here",
     detail:
-      "Vagus.App.Orchestrator registers with Vagus.Addon.State when it starts, and Vagus.Addon.State keeps it in its state. Both are children of the one_for_one supervisor Vagus.Application, which restarts either alone. When Vagus.Addon.State restarts, its init/1 starts it afresh without what Vagus.App.Orchestrator put there, and Vagus.App.Orchestrator, which is not restarted with it, never registers again. When Vagus.App.Orchestrator restarts, it registers a second time beside what its old process left.",
-    reason:
-      "False positive: Orchestrator.init/1 only reads State.list/0 (a reply of the entries); State's :list clause stores nothing from the caller, so there is nothing to lose on either restart. On a State restart the entries reload from addons.json; on an Orchestrator restart it re-ensures a process per entry, which is idempotent (already_started is folded)."
-  },
-  %{
-    analysis: "startup",
-    file: "lib/vagus/app/orchestrator.ex",
-    title: "handle_continue races a later sibling",
-    at_label: "the racing call originates here",
-    detail:
-      "Vagus.App.Orchestrator sync-calls Vagus.DNS, a later sibling, from handle_continue under Vagus.Application. The continue runs concurrently with the supervisor's start sequence, so whether Vagus.DNS is alive when the call lands is a boot-time race — it works on the fast machine and fails in CI.",
-    reason:
-      "The continue only starts the boot task; the task reaches Vagus.DNS/Vagus.Ingress (through Vagus.Addon.Manager's app starts) only after its first gate, Vagus.App.Gates.tree/0, sees :vagus in Application.started_applications/0, which holds only once every child of Vagus.Application has started."
-  },
-  %{
-    analysis: "startup",
-    file: "lib/vagus/app/orchestrator.ex",
-    title: "handle_continue races a later sibling",
-    at_label: "the racing call originates here",
-    detail:
-      "Vagus.App.Orchestrator sync-calls Vagus.Ingress, a later sibling, from handle_continue under Vagus.Application. The continue runs concurrently with the supervisor's start sequence, so whether Vagus.Ingress is alive when the call lands is a boot-time race — it works on the fast machine and fails in CI.",
-    reason:
-      "The continue only starts the boot task; the task reaches Vagus.DNS/Vagus.Ingress (through Vagus.Addon.Manager's app starts) only after its first gate, Vagus.App.Gates.tree/0, sees :vagus in Application.started_applications/0, which holds only once every child of Vagus.Application has started."
-  },
-  %{
-    analysis: "coupling",
-    file: "lib/vagus/application.ex",
-    title: "Coupled children under one_for_one",
-    at_label: "supervision tree defined here",
-    detail:
-      "Vagus.App.Orchestrator registers with Vagus.Addon.Registry when it starts, and Vagus.Addon.Registry keeps it in its state. Both are children of the one_for_one supervisor Vagus.Application, which restarts either alone. When Vagus.Addon.Registry restarts, its init/1 starts it afresh without what Vagus.App.Orchestrator put there, and Vagus.App.Orchestrator, which is not restarted with it, never registers again. When Vagus.App.Orchestrator restarts, it registers a second time beside what its old process left.",
-    reason:
-      "Misattributed: Vagus.Addon.Manager registers each app's per-start token on every start (boot, the router, the watchdog), not this boot-time caller specifically, and the token is minted per start, so a re-register is only possible by restarting the app. Vagus.Addon.Registry checkpoints every registration to a tmpfs file (Vagus.RunState) and reloads it in init/1, so its restart keeps what callers put there unless a save failed (then it restarts empty, failing closed), which argus does not model."
-  },
-  %{
-    analysis: "coupling",
-    file: "lib/vagus/application.ex",
-    title: "Coupled children under one_for_one",
-    at_label: "supervision tree defined here",
-    detail:
       "Vagus.App.Orchestrator registers with Vagus.Core.EventPusher when it starts, and Vagus.Core.EventPusher keeps it in its state. Both are children of the one_for_one supervisor Vagus.Application, which restarts either alone. When Vagus.Core.EventPusher restarts, its init/1 starts it afresh without what Vagus.App.Orchestrator put there, and Vagus.App.Orchestrator, which is not restarted with it, never registers again. When Vagus.App.Orchestrator restarts, it registers a second time beside what its old process left.",
     reason:
       "A one-shot push, not a registration: boot pushes supervisor_update startup: complete once into Vagus.Core.EventPusher's bounded, drop-oldest queue, which is lossy by design; a restart losing it is a dropped event like any other, and Core's hassio coordinator still refreshes on its own schedule."
-  },
-  %{
-    analysis: "coupling",
-    file: "lib/vagus/application.ex",
-    title: "Coupled children under one_for_one",
-    at_label: "supervision tree defined here",
-    detail:
-      "Vagus.App.Orchestrator registers with Vagus.DNS when it starts, and Vagus.DNS keeps it in its state. Both are children of the one_for_one supervisor Vagus.Application, which restarts either alone. When Vagus.DNS restarts, its init/1 starts it afresh without what Vagus.App.Orchestrator put there, and Vagus.App.Orchestrator, which is not restarted with it, never registers again. When Vagus.App.Orchestrator restarts, it registers a second time beside what its old process left.",
-    reason:
-      "Misattributed: Vagus.Addon.Manager registers each app's DNS name (container bridge IP) on every start, not this boot-time caller specifically. Vagus.DNS checkpoints its dynamic names to a tmpfs file (Vagus.RunState) and reloads them in init/1, so its restart keeps what callers put there unless a save failed (then it restarts empty, failing closed), which argus does not model."
   }
 ]
