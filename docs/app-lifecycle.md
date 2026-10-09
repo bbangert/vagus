@@ -10,8 +10,12 @@ runs every operation on it; everything else asks that process, or reads a
 key it registered.** There is no second holder of app state, no lock, and
 no outside party that stops and starts an app on its behalf.
 
-Everything outside the subsystem goes through `Vagus.App`, which returns
-plain maps and results, never a pid.
+Commands, settings and questions from outside the subsystem go through
+`Vagus.App`, which returns plain maps and results, never a pid. Three hot-path
+readers skip the facade and read `Vagus.App.Directory` directly:
+`Vagus.Runtime.Events` (to route a container event to its app's pid),
+`Vagus.DNS` and `Vagus.Ingress` (to resolve a name or an ingress token without
+a call).
 
 ---
 
@@ -35,6 +39,11 @@ Vagus.Supervisor (one_for_one)
 | `Vagus.App.Instances` | `Vagus.App.Supervisor` | every app process and the Orchestrator |
 | `Vagus.App.Server` | `Vagus.App.Instances.ensure/1` | only itself; `:transient`, so an abnormal exit restarts it |
 | `Vagus.App.Orchestrator` | `Vagus.App.Supervisor` | only itself and its boot task |
+
+An app process whose file cannot be read or decoded, or whose rewrite
+failed, returns `:ignore` from `init/1` and is not restarted: a retried start
+would only fail again until the supervisor's intensity took every app down.
+The facade's `ask_healing` tries again on the next request.
 
 `Instances` has a wider restart budget than the tree so a few app processes
 crash-looping on one bad file do not take the directory with them.
@@ -67,7 +76,7 @@ its container's state as the event it missed (a running container as
 
 | State | Meaning |
 |---|---|
-| `:new` | no file yet; expires after 60 s unless an install arrives |
+| `:new` | no file yet; a 60 s state timeout ends the process unless an install moves it out of `:new` |
 | `:idle` | installed; takes any operation |
 | `{:busy, op}` | an operation is running |
 | `:shutting_down` | halted for a shutdown; refuses operations until `resume` |
@@ -76,19 +85,28 @@ The step an operation is on is deliberately not part of the state. A state
 change replays postponed events and cancels the state timeout; both must
 happen once, when the operation ends, not at every step.
 
-**Admission** (`Vagus.App.Policy.admit/2`): install only in `:new`; anything
-else in `:new` is `:not_installed`. In `{:busy, _}` every operation is
-refused with `{:error, :busy}`, except `halt`. In `:shutting_down`
-everything is refused with `:shutting_down` except `halt` (a no-op) and
-`resume`. A `resume` outside `:shutting_down` is a no-op. A busy app rejects
-rather than queues, as upstream's job groups do.
+**Admission** (`Vagus.App.Policy.admit/2`), in clause order:
 
-**Taken in every state**, an operation in flight included: questions
-(`:info`, `:snapshot`, `:installed?`, `:identity`, `:ingress_target`,
-`:discovery_list`, `{:service, name}`, `{:discovery, uuid}`), settings
-writes (`{:set, changes}`), and the app's own service and discovery posts.
-An unknown question gets an error reply rather than crashing every app
-process that receives it.
+| Command | `:new` | `:idle` | `{:busy, _}` | `:shutting_down` |
+|---|---|---|---|---|
+| `install` | taken | `:already_installed` | `:already_installed` | `:already_installed` |
+| `halt` | `:not_installed` | taken | taken (pre-empts); `:busy` during a halt | no-op |
+| `resume` | `:not_installed` | no-op | no-op | taken |
+| anything else | `:not_installed` | taken | `:busy` | `:shutting_down` |
+
+A busy app rejects rather than queues, as upstream's job groups do.
+
+**Questions are answered in every state**, an operation in flight
+included (in `:new`, as an app that is not installed). An unknown question
+gets an error reply rather than crashing every app process that receives it.
+
+**Settings writes and the app's own service and discovery posts** are taken
+in every state from install on, an operation in flight included, so an app
+mid-update can still post its discovery. Two windows refuse them: `:new`
+(nothing to write before an install commits) and once an uninstall has begun
+(`{:set, _}` is `:not_installed`, posts are `:unavailable`), because a write
+then would bring the file back and a post would land for an app being
+removed.
 
 **Postponed while busy**: container events, the native broker's `DOWN`, and
 the `:retry`, `:settled` and `:probe` timers. They are replayed when the
@@ -96,7 +114,8 @@ operation ends, against the facts the operation left.
 
 ### Operations and their steps
 
-`(T)` is a task step, `(L)` a local step applied inside `Policy.next/3`.
+`(T)` is a task step, `(L)` a local step applied inside `Policy.next/3`,
+`(S)` a step the Server runs inline and feeds back into `Policy.next/3`.
 `port?` expands to `port` only for a dynamic ingress port with none
 assigned; `start?` expands to the start steps only if the stop found the
 container running (or, for a backup, the app wanted started).
@@ -113,7 +132,7 @@ container running (or, for a backup, the app wanted started).
 | backup, hot | `exec_hook(T, pre)`, `snapshot(T)`, `exec_hook(T, post)` | each hook only if the config has one; `post` runs after a failed snapshot too; no container → hook skipped |
 | backup, native | `snapshot(T)` | |
 | restore | `stop(T, strict)`, `swap_data(T)`, `set_options(T)`, start steps if the backup says started | `set_options` skipped when the backup had none |
-| uninstall | `stop(T)`, `delete_file`, `remove_app(T)` | every key but `{:slug, _}` dropped before the stop |
+| uninstall | `stop(T)`, `delete_file(S)`, `remove_app(T)` | every key but `{:slug, _}` dropped before the stop |
 | halt | `halt_stop(T)` | stop by name, no remove; never persists; ends in `:shutting_down` |
 
 Update start failures: after a commit, a failed start runs
@@ -148,11 +167,13 @@ app with effective boot `auto` is always revived, 5 s then every 30 s, with no
 cap and no watchdog flag: it is the MQTT broker every other app leans on, and
 nothing outside the BEAM restarts it.
 
-The ladder resets only after a retried start stays up for 120 s (the
-`:settled` timer), so a container that dies a second after each start runs
-out. A `:retry` timer carries the container id it was armed for; it is
-stale once an operation replaced that container. A clean exit restarts too,
-as upstream, except a `startup: once` app's, which is its completion.
+Any start that is not a ladder retry (a user's start or restart, an
+update, a boot start) zeroes the attempt count. A retry start keeps it until
+the start has stayed up for 120 s (the `:settled` timer), so a container that
+dies a second after each retry runs out. A `:retry` timer carries the
+container id it was armed for; it is stale once an operation replaced that container. A clean exit restarts too,
+as upstream's `watchdog_container` does for a `STOPPED` container it did not
+stop itself, except a `startup: once` app's, which is its completion.
 
 The URL probe (`Vagus.App.Probe`) runs every 120 s in its own task while the
 app is idle, has a container, its watchdog flag is on and its config has a
@@ -190,7 +211,8 @@ nothing the container holds authenticates any more.
 
 The runner lives in `Vagus.App.Policy` as pure functions so every operation
 is a table test. `Policy.plan/3` returns the run or why it cannot begin
-(an update needs a newer version whose schema accepts the saved options).
+(an update needs a version different from the installed one, whose schema
+accepts the saved options).
 `Policy.next(run, outcome, data)` applies one outcome (or `:begin`), runs
 local steps in place, and returns new data plus effects that end in one
 task step or in the operation's end. An outcome no clause plans for fails
@@ -214,30 +236,30 @@ effects. The vocabulary is closed:
 | `:shutting_down` | ends a halt |
 | `:exit` | stops the process normally, sending its replies |
 
-`{:emit, _}` is produced wherever the reported state changes, so Core hears
-every transition exactly once. Container events and probe results go through
+`{:emit, _}` is produced by comparing the reported state before and after
+each `next/3` or event, so Core hears once per change of the reported state;
+a change that leaves it the same (a boot demote of a stopped app) emits
+nothing. Container events and probe results go through
 `Policy.on_event/2` and `Policy.strike/2`, which return effects from the same
 vocabulary.
 
 **Task steps vs local steps.** A task step touches the engine, disk or
 network and runs in `Vagus.App.Steps.run/2`; it gets everything it needs as
 input and reads no app state. Local steps (`mint_token`, `commit`,
-`rollback_config`, `delete_file`) are decisions or one small write; minting
-a token is the one impure act left in `Policy`.
+`rollback_config`) are decisions applied inside `Policy.next/3`; minting a
+token is the one impure act left in `Policy`. `delete_file` is planned like a
+step but `Policy` only emits the `:delete_file` effect: the Server deletes the
+file inline, because the uninstall's commit point must be acknowledged before
+anything else runs.
 
-**Deadlines** (`Policy.deadline/1`), re-armed at every spawn without a state
-change:
-
-| Step | Deadline |
-|---|---|
-| `pull` | 30 min |
-| `snapshot`, `swap_data` | 10 min |
-| `start`, `exec_hook`, `remove_app` | 120 s |
-| `stop`, `reclaim_image` | 60 s |
-| `halt_stop` | 40 s (the engine stop itself gets 30 s) |
-| `port`, `set_options` | 15 s |
-
-The probe has its own 10 s deadline, and a `:new` process 60 s.
+**Deadlines.** Each task step has its own (`Policy.deadline/1`), re-armed
+as a `state_timeout` at every spawn without a state change, so an operation
+has no overall deadline and a facade call into one waits `:infinity`. Two
+values carry a reason: `halt_stop` gets 40 s around an engine stop of 30 s,
+so the engine kills a container that ignores SIGTERM and the step still
+returns inside its own deadline; `swap_data`
+gets as long as a snapshot because it removes the old data dir first, a walk
+of the same size. The probe has its own 10 s deadline.
 
 **`task_input/2` is built from the data current when the task is spawned**,
 not from a copy taken when the operation began. Options saved while an
@@ -368,18 +390,20 @@ booting what is being stopped, starts a restarted app process in
 
 The app process otherwise performs no action itself; these are deliberate.
 
-- **Inline file writes.** Settings writes are validated and written by the
-  process before it replies, and `:persist` and `:delete_file` run inline,
+- **Inline file writes.** Settings writes are written by the process before
+  it replies (the process checks only that each key is a known setting; the
+  router validates the values), and `:persist` and `:delete_file` run inline,
   because the reply must mean "on disk": a reboot right after a 200 keeps the
   change. The file is small, so the write does not hold the process up.
 - **Postponed own-container events.** An event about the app's container
   while an operation runs describes a container the operation is replacing;
   it is handled once, after the operation, against the facts it left.
 - **Each step reads current settings.** See `task_input/2` above.
-- **Saves outside an operation are log-only.** A boot demote's save, and a
-  boot start whose container started but whose save failed
-  (`Vagus.App.boot_start/2` folds `{:persist, _}` to `:ok`), are logged: boot
-  would otherwise report a running app as failed. Inside an operation a
+- **Boot's saves are log-only.** A boot demote's save, and a boot start
+  whose container started but whose save failed (`Vagus.App.boot_start/2`
+  folds `{:persist, _}` to `:ok`), are logged: boot would otherwise report a
+  running app as failed. A failed settings write is not: it replies `:error`
+  and nothing changes in the process. Inside an operation a
   failed save is reported as `{:error, {:persist, reason}}` (the router's
   500), and the operation still completes, because the container already did
   what was asked. An install is the exception: an install that could not
@@ -410,7 +434,8 @@ against upstream where noted.
   for update, the start/stop/restart/uninstall commands, backup and restore
   alike.
 - **No per-app restart window; the ladder is the only bound.** Five attempts
-  with backoff, reset after 120 s up. Upstream also throttles the watchdog
+  with backoff, zeroed by any non-retry start, and kept by a retry until it
+  has stayed up 120 s. Upstream also throttles the watchdog
   to 10 restarts per 30 minutes; Vagus does not (ledgered in
   [`divergences.md`](divergences.md)).
 - **No demote after five failures.** The app stays wanted started and reports
@@ -421,7 +446,8 @@ against upstream where noted.
 - **Unhealthy containers are restarted.** A `health_status: unhealthy`
   event goes on the ladder, as upstream.
 - **DNS name collisions are refused**: the first holder keeps the name.
-  Upstream replaces the entry with the newest.
+  Upstream's `PluginDns.add_host` replaces an existing entry for the name, so
+  the newest wins.
 - **Backups and restores are the app's own operations.** A busy app fails
   the whole backup (`{:busy, slug}`, the busy text); a restore aborts at the
   first app that fails. Restore wipes the data dir then renames the staged
@@ -430,7 +456,8 @@ against upstream where noted.
   backups do not pause the container, as upstream does not. A caller that
   dies mid-backup cannot leave a cold app stopped, since the app's own
   operation starts it again.
-- **Staging** is `<data_root>/.backup-staging` (0700) for backups, outside
+- **Staging** for backups is under `<data_root>/.backup-staging` (the root
+  is 0700), outside
   every tree a `map:` key mounts into an app, because Vagus writes and
   removes there as root and would follow a planted symlink. A restore stages
   in a `.restore-<slug>-<n>` sibling of the app's data dir, so the swap is a
@@ -449,8 +476,9 @@ against upstream where noted.
 ## Persistence
 
 One JSON file per app, `<:app_files_dir>/<slug>.json` (`/data/vagus/apps` on
-target), written only by the app's own process through
-`Vagus.App.File.write/2`: a temporary opened exclusive and set to 0600 before
+target). Only an app's own process writes its live file (the legacy import
+writes the first set into a staging directory before any process exists),
+through `Vagus.App.File.write/2`: a temporary opened exclusive and set to 0600 before
 any content lands, then a rename, so neither a power cut nor another user
 ever sees a partial or readable file. It holds the ingress token.
 
