@@ -32,14 +32,17 @@ defmodule Vagus.AppFixtures do
 
   @doc """
   Installing a slug again keeps its ingress token, user options and settings,
-  as a reinstall over a live entry does.
+  as a reinstall over a live entry does. `process: false` records the app with
+  no process behind it, as after a process start that failed.
   """
   @spec install_app(Config.t(), keyword()) :: Config.t()
   def install_app(%Config{slug: slug} = config, opts \\ []) do
-    {state, changes} = Keyword.pop(opts, :state, :stopped)
+    {state, opts} = Keyword.pop(opts, :state, :stopped)
+    {process?, changes} = Keyword.pop(opts, :process, true)
     check_keys!(changes)
 
     :ok = State.put(config, state)
+    if process?, do: {:ok, _pid} = Vagus.App.Instances.ensure(slug)
     :ok = set_app(slug, changes)
 
     on_exit(fn -> forget_app(slug) end)
@@ -83,11 +86,14 @@ defmodule Vagus.AppFixtures do
 
   @doc """
   For tests that install through a route, so no fixture call exists to hang
-  cleanup on, and for simulating a concurrent uninstall mid-test.
+  cleanup on, and for simulating a concurrent uninstall mid-test. The entry
+  goes first, so a process restarting meanwhile ignores its start instead of
+  coming back with no entry.
   """
   @spec forget_app(String.t()) :: :ok
   def forget_app(slug) do
     :ok = State.delete(slug)
+    :ok = Vagus.App.Instances.stop(slug)
     :ok = Registry.unregister_slug(slug)
   end
 

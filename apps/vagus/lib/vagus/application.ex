@@ -109,6 +109,10 @@ defmodule Vagus.Application do
          max_restarts: 5,
          max_seconds: 30},
 
+        # One process per installed app, brought up from `Vagus.Addon.State`
+        # (started above) before anything that reads apps through `Vagus.App`.
+        Vagus.App.Supervisor,
+
         # Keeps `Vagus.Addon.State` honest for native add-ons: demotes a broker
         # subtree to `:stopped` if OTP supervision exhausts its restart budget
         # (no Docker `die` event fires for a BEAM crash). Started after the

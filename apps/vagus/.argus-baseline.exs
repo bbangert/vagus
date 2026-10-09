@@ -261,5 +261,25 @@
       "Vagus.Core.EventPusher.handle_info/2 sends an exit signal to a process it holds as a value from inside a callback. This is often deliberate — process-manager handoff, registry name-conflict resolution, an ownership watcher killing dependents — but killing a process imperatively bypasses the supervisor that started it, so it is worth confirming the target is meant to be torn down this way rather than stopped through its own protocol.",
     reason:
       "Deliberate: the :ready_timeout handler kills a connection it monitors that connected but never became ready; its :DOWN then runs the ordinary backoff and transport re-pick (see the comment at the call). The connection is not under a restarting supervisor."
+  },
+  %{
+    analysis: "coupling",
+    file: "lib/vagus/application.ex",
+    title: "Coupled children under one_for_one",
+    at_label: "supervision tree defined here",
+    detail:
+      "Vagus.App.Orchestrator registers with Vagus.Addon.State when it starts, and Vagus.Addon.State keeps it in its state. Both are children of the one_for_one supervisor Vagus.Application, which restarts either alone. When Vagus.Addon.State restarts, its init/1 starts it afresh without what Vagus.App.Orchestrator put there, and Vagus.App.Orchestrator, which is not restarted with it, never registers again. When Vagus.App.Orchestrator restarts, it registers a second time beside what its old process left.",
+    reason:
+      "False positive: Orchestrator.init/1 only reads State.list/0 (a reply of the entries); State's :list clause stores nothing from the caller, so there is nothing to lose on either restart. On a State restart the entries reload from addons.json; on an Orchestrator restart it re-ensures a process per entry, which is idempotent (already_started is folded)."
+  },
+  %{
+    analysis: "startup",
+    file: "lib/vagus/app/instances.ex",
+    title: "init/1 makes a synchronous supervisor call",
+    at_label: "this call blocks init until the supervisor answers",
+    detail:
+      "Vagus.App.Orchestrator.init/1 reaches DynamicSupervisor.start_child on Vagus.App.Instances. Every supervisor management call is a GenServer.call into the supervisor; start_child in particular does not return until the new child's init/1 has, so those inits now run inside this one, on the tree's startup path. A child that calls back into Vagus.App.Orchestrator, or into anything not yet started, deadlocks the boot; terminate_child waits for the whole shutdown of the child.",
+    reason:
+      "Deliberate: the ensure loop runs in init/1 so Vagus.App.Supervisor is not reported started until every app process exists; the API supervisor is a later child of Vagus.Application and must wait for this tree. Each started child (Vagus.App.Server.init/1) only reads Vagus.Addon.State, an earlier top-level sibling that is already running, and never calls the Orchestrator, Instances or anything later in the tree, so no deadlock is possible. Instances is a sibling started before the Orchestrator under :rest_for_one."
   }
 ]

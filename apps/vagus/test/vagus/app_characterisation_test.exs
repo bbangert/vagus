@@ -164,22 +164,25 @@ defmodule Vagus.AppCharacterisationTest do
     end)
   end
 
-  # Upstream's install raises "App <slug> is already installed"; today a
-  # reinstall re-pulls and rewrites the entry as a fresh `:stopped` install.
-  @tag :known_failing
+  # Upstream refuses with "App <name> is already installed" before any pull; a
+  # re-pull would rewrite the entry as a fresh `:stopped` install.
   test "installing an app that is already installed answers 400 on both routes" do
     installed = install_app(config("core_char_reinstall"), state: :started)
     seed_store(installed)
+    Fake.reset_calls()
 
     for path <- [
           "/store/addons/core_char_reinstall/install",
           "/addons/core_char_reinstall/install"
         ] do
       conn = supervisor_call(:post, path)
-      assert {path, conn.status, body(conn)["result"]} == {path, 400, "error"}
+
+      assert {path, conn.status, body(conn)["result"], body(conn)["message"]} ==
+               {path, 400, "error", "App Test App is already installed"}
     end
 
     assert {:ok, %{state: :started}} = app_info("core_char_reinstall")
+    refute Enum.any?(Fake.calls_for("addon_core_char_reinstall"), &match?({:pull, _}, &1))
   end
 
   # The options write lands after the update captured the old entry; committing

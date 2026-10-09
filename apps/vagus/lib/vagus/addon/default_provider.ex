@@ -69,9 +69,7 @@ defmodule Vagus.Addon.DefaultProvider do
         :ok
 
       :error ->
-        with :ok <- Manager.install(config) do
-          State.put(config, :stopped)
-        end
+        Vagus.App.install(config)
     end
   end
 

@@ -488,8 +488,8 @@ defmodule Vagus.Addon.Manager do
   # (reentrant per-process, node-local here) rather than a `GenServer`/
   # `Registry`-backed lock.
   @doc false
-  # Unlocked `stop`/`start`, for a caller that ALREADY holds this slug's
-  # lock — today only `Vagus.Addon.Update`.
+  # Unlocked `stop`/`start`/`uninstall`, for a caller that ALREADY holds this
+  # slug's lock — today `Vagus.Addon.Update` and `Vagus.App.uninstall/1`.
   #
   # Nesting `:global.trans/4` on the same resource id does NOT work, even for
   # the same requester: `:global` locks are not counted, so the *inner*
@@ -509,6 +509,10 @@ defmodule Vagus.Addon.Manager do
   @spec start_holding_lock(Config.t(), keyword()) ::
           {:ok, %{id: String.t(), access_token: String.t()}} | {:error, term()}
   def start_holding_lock(%Config{} = config, opts \\ []), do: do_start(config, opts)
+
+  @doc false
+  @spec uninstall_holding_lock(String.t(), keyword()) :: :ok | {:error, term()}
+  def uninstall_holding_lock(slug, opts \\ []), do: do_uninstall(slug, opts)
 
   defp with_slug_lock(slug, fun) do
     :global.trans({{:addon_lifecycle, slug}, self()}, fun, [node()])

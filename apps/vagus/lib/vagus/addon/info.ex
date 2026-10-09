@@ -31,8 +31,9 @@ defmodule Vagus.Addon.Info do
   alias Vagus.Addon.{Availability, Config, OptionsSchema, Rating}
 
   @doc """
-  Builds the info map for `config` in lifecycle `state` (`:started`/`:stopped`)
-  with its effective `options`, plus the per-install `settings` carried by a
+  Builds the info map for `config` in lifecycle `state` (`:started`/`:stopped`,
+  or `:unknown` for an app whose process did not answer) with its effective
+  `options`, plus the per-install `settings` carried by a
   `Vagus.Addon.State` entry (`docs/contract-2026.7-m4b-ingress-watchdog.md`
   §B3.4, §B8) — everything in that entry except `config`/`state`/
   `user_options`, i.e. `Map.take(entry, [:ingress_token, :ingress_port,
@@ -86,7 +87,7 @@ defmodule Vagus.Addon.Info do
   the same ground at the `State.put/3` level, but only the router test would
   notice if `Manager` started sourcing config from `Store`.)
   """
-  @spec render(Config.t(), :started | :stopped, map(), map()) :: map()
+  @spec render(Config.t(), :started | :stopped | :unknown, map(), map()) :: map()
   def render(%Config{} = config, state, options, settings \\ %{})
       when is_map(options) and is_map(settings) do
     latest = Map.get(settings, :version_latest)

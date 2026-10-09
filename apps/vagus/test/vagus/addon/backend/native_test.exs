@@ -108,7 +108,7 @@ defmodule Vagus.Addon.Backend.NativeTest do
       data_root: dr
     } do
       assert :ok = Manager.install(config, data_root: dr)
-      :ok = State.put(config, :stopped)
+      Vagus.AppFixtures.install_app(config)
       assert {:ok, _} = Manager.start(config, data_root: dr)
 
       # Native.start on an already-running id is :ok, not a crash.
@@ -150,7 +150,7 @@ defmodule Vagus.Addon.Backend.NativeTest do
 
       config = mqtt_config()
       assert :ok = Manager.install(config, data_root: dr)
-      :ok = State.put(config, :stopped)
+      Vagus.AppFixtures.install_app(config)
       assert {:ok, _} = Manager.start(config, data_root: dr)
 
       on_exit(fn ->

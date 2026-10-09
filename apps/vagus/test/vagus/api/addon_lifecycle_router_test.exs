@@ -790,6 +790,38 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
       assert Enum.any?(addons, &(&1["slug"] == "core_listed" and &1["state"] == "started"))
     end
 
+    test "apps that do not answer in time are listed unknown" do
+      slugs = for n <- 1..3, do: "core_stuck#{n}"
+
+      for slug <- slugs do
+        install_app(fixture_config(slug) |> Map.put(:slug, slug), state: :started)
+        [{pid, _}] = Registry.lookup(Vagus.App.Directory, {:slug, slug})
+        :ok = :sys.suspend(pid)
+        on_exit(fn -> :sys.resume(pid) end)
+      end
+
+      started = System.monotonic_time(:millisecond)
+      conn = supervisor_call(:get, "/addons")
+      elapsed = System.monotonic_time(:millisecond) - started
+
+      assert conn.status == 200
+      states = Map.new(body(conn)["data"]["addons"], &{&1["slug"], &1["state"]})
+      for slug <- slugs, do: assert(states[slug] == "unknown")
+      # `App.list/0`'s deadline is one second, shared by every app.
+      assert elapsed < 2 * 1_000
+    end
+
+    # Home Assistant deletes the device of an app missing from this list.
+    test "an app with no process behind it is still listed" do
+      config = fixture_config("orphan") |> Map.put(:slug, "core_orphan")
+      install_app(config, state: :started, process: false)
+
+      conn = supervisor_call(:get, "/addons")
+
+      assert conn.status == 200
+      assert Enum.any?(body(conn)["data"]["addons"], &(&1["slug"] == "core_orphan"))
+    end
+
     test "an empty State -> empty list" do
       # `Vagus.Addon.State` is a global singleton other tests seed; this file is
       # async: false, so nothing runs concurrently and we can reset it to a
