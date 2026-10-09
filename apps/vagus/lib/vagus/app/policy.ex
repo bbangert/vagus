@@ -512,18 +512,20 @@ defmodule Vagus.App.Policy do
     [{:stop, :strict}, {:swap_data, nil}, {:set_options, nil}] ++ start ++ [{:drop_aside, nil}]
   end
 
+  # A stop a snapshot follows is strict, as the restore's: the tar is not
+  # paused, so a container still running would write under it.
   defp steps(:update, args, _data) do
-    snapshot = if args[:backup], do: [{:snapshot, nil}], else: []
+    {stop, snapshot} =
+      if args[:backup], do: {{:stop, :strict}, [{:snapshot, nil}]}, else: {{:stop, nil}, []}
 
-    [{:pull, nil}, {:stop, nil}] ++
-      snapshot ++ [{:commit, nil}, {:start?, nil}, {:reclaim_image, nil}]
+    [{:pull, nil}, stop] ++ snapshot ++ [{:commit, nil}, {:start?, nil}, {:reclaim_image, nil}]
   end
 
   # The hooks follow the pause: a container that may be running and writing
   # is quiesced by its own hooks too, not frozen behind their back.
   defp steps(:backup, _args, data) do
     cond do
-      data.config.backup == "cold" -> [{:stop, nil}, {:snapshot, nil}, {:start?, nil}]
+      data.config.backup == "cold" -> [{:stop, :strict}, {:snapshot, nil}, {:start?, nil}]
       held?(data) -> hook(data, :pre) ++ [{:snapshot, nil}] ++ hook(data, :post)
       true -> [{:snapshot, nil}]
     end
@@ -747,6 +749,16 @@ defmodule Vagus.App.Policy do
     was_running = was_running or (op == :backup and data.wanted == :started)
     data = put_acc(%{release(data) | last_event: :stopped}, :was_running, was_running)
     advance(data, [])
+  end
+
+  # Its token is already revoked, so an app that should run is started again
+  # in place of a container that may still run, as after a failed snapshot.
+  # Nothing is committed: an update keeps its old version.
+  defp on_outcome(op, :stop, :strict, {:error, reason}, data)
+       when op in [:backup, :update] and reason not in [:died, :timeout] do
+    was_running = running?(data) or data.wanted == :started
+    data = put_acc(release(data), :result, {:error, {:stop, reason}})
+    advance(put_steps(put_acc(data, :was_running, was_running), [{:start?, nil}]), [])
   end
 
   # A strict stop's error lands here too, so a restore ends before its swap.

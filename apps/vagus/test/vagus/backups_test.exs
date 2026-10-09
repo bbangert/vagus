@@ -183,6 +183,32 @@ defmodule Vagus.BackupsTest do
       assert addon["state"] == "started"
     end
 
+    # The snapshot of a cold app is not paused: a container the engine failed
+    # to stop could write under the tar.
+    test "a cold add-on whose strict stop fails is not snapshotted and is started again", %{
+      data_root: dr,
+      backup_dir: backup_dir,
+      server: server
+    } do
+      slug = "core_cold_stuck"
+      install(slug, dr, :started, %{}, %{"backup" => "cold"})
+      stub_app_steps()
+
+      backup =
+        Task.async(fn -> Backups.create_partial(nil, [slug], server: server, data_root: dr) end)
+
+      assert_receive {:step, :stop, %{slug: ^slug, strict: true}, task}, 5_000
+      send(task, {:outcome, {:error, :econnrefused}})
+      assert_receive {:step, :start, %{slug: ^slug}, task}, 5_000
+      send(task, {:outcome, {:ok, %{container_id: "c2"}}})
+
+      assert {:error, {:backup_failed, ^slug, {:stop, :econnrefused}}} = Task.await(backup)
+      refute_received {:step, :snapshot, _input, _task}
+      assert Backups.list(server) == []
+      assert File.ls!(Backups.staging_root(backup_dir)) == []
+      assert {:ok, %{state: :started}} = app_info(slug)
+    end
+
     test "a stopped cold add-on is snapshotted and left stopped", %{
       data_root: dr,
       server: server

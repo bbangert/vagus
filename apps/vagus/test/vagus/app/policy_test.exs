@@ -468,7 +468,7 @@ defmodule Vagus.App.PolicyTest do
         {:update, %{config: app_config(%{"version" => "2"}), backup: true},
          [
            {:pull, nil},
-           {:stop, nil},
+           {:stop, :strict},
            {:snapshot, nil},
            {:commit, nil},
            {:start?, nil},
@@ -484,7 +484,7 @@ defmodule Vagus.App.PolicyTest do
       cold = running(%{config: app_config(%{"backup" => "cold"})})
 
       assert Policy.plan(:backup, %{}, cold).steps ==
-               [{:stop, nil}, {:snapshot, nil}, {:start?, nil}]
+               [{:stop, :strict}, {:snapshot, nil}, {:start?, nil}]
 
       hooks = app_config(%{"backup_pre" => "pre", "backup_post" => "post"})
 
@@ -748,7 +748,7 @@ defmodule Vagus.App.PolicyTest do
       {data, [{:step, {:pull, nil}}]} = begin(:update, %{config: target, backup: true}, running())
 
       {data, [{:keys, [], [{:dns, "app-one"}]} | _] = effects} = step(data, {:ok, "img:2"})
-      assert List.last(effects) == {:step, {:stop, nil}}
+      assert List.last(effects) == {:step, {:stop, :strict}}
       assert data.wanted == :started
 
       # 5. the stop records was_running and goes on to the snapshot
@@ -788,6 +788,37 @@ defmodule Vagus.App.PolicyTest do
              ]
 
       assert data.container_id == "c3"
+    end
+
+    # The snapshot is not paused, so a container the engine failed to stop
+    # could write under it.
+    test "update with a backup: a strict stop's engine error commits nothing and starts the old version" do
+      old = running().config
+      target = app_config(%{"version" => "2"})
+      {data, _} = begin(:update, %{config: target, backup: true}, running())
+      {data, _} = step(data, {:ok, "img:2"})
+      {data, effects} = step(data, {:error, :econnrefused})
+
+      assert List.last(effects) == {:step, {:start, nil}}
+      refute Enum.any?(effects, &(&1 == :persist))
+      assert data.config == old
+      assert data.run.steps == []
+
+      {data, effects} = step(data, {:ok, %{container_id: "c2", ip: @ip}})
+
+      assert Enum.take(effects, -3) == [
+               :persist,
+               {:reply, {:error, {:stop, :econnrefused}}},
+               :idle
+             ]
+
+      assert %{config: ^old, container_id: "c2"} = data
+    end
+
+    test "update without a backup keeps the tolerant stop" do
+      {data, _} = begin(:update, %{config: app_config(%{"version" => "2"})}, running())
+      {_data, effects} = step(data, {:ok, "img:2"})
+      assert List.last(effects) == {:step, {:stop, nil}}
     end
 
     test "update success reclaims the old image and reports the versions" do
@@ -986,6 +1017,34 @@ defmodule Vagus.App.PolicyTest do
       {data, effects} = step(data, {:ok, %{container_id: "c2", ip: @ip}})
       assert Enum.take(effects, -3) == [:persist, {:reply, {:error, :enospc}}, :idle]
       assert data.wanted == :started
+    end
+
+    test "backup cold: a strict stop's engine error fails before the snapshot and starts the app again" do
+      cold = running(%{config: app_config(%{"backup" => "cold"})})
+      {data, effects} = begin(:backup, %{staging_dir: "/s"}, cold)
+      assert List.last(effects) == {:step, {:stop, :strict}}
+      assert %{strict: true} = Policy.task_input({:stop, :strict}, data)
+
+      {data, effects} = step(data, {:error, :econnrefused})
+      assert List.last(effects) == {:step, {:start, nil}}
+      refute Enum.any?(effects, &match?({:step, {:snapshot, _}}, &1))
+
+      {data, effects} = step(data, {:ok, %{container_id: "c2", ip: @ip}})
+
+      assert Enum.take(effects, -3) == [
+               :persist,
+               {:reply, {:error, {:stop, :econnrefused}}},
+               :idle
+             ]
+
+      assert %{wanted: :started, container_id: "c2"} = data
+    end
+
+    test "backup cold: a strict stop that died is cleaned up by name, as any dead stop" do
+      cold = running(%{config: app_config(%{"backup" => "cold"})})
+      {data, _} = begin(:backup, %{staging_dir: "/s"}, cold)
+      {_data, effects} = step(data, {:error, :died})
+      assert List.last(effects) == {:step, {:stop, :by_name}}
     end
 
     test "backup cold of a crashed app that should run starts it, so its cancelled restart is not lost" do

@@ -25,6 +25,7 @@ defmodule Vagus.Backups do
   alias Vagus.Addon.Config
   alias Vagus.API.StaticData
   alias Vagus.App
+  alias Vagus.App.Steps
 
   @default_data_root "/data"
 
@@ -253,7 +254,7 @@ defmodule Vagus.Backups do
   # sobelow_skip ["Traversal.FileModule"]
   def sweep_stale(opts \\ []) do
     File.rm_rf(staging_root(backup_dir(opts)))
-    sweep_restores(Path.join([data_root(opts), "addons", "data"]))
+    sweep_restores(data_root(opts))
     :ok
   end
 
@@ -295,35 +296,18 @@ defmodule Vagus.Backups do
     end
   end
 
+  # An aside goes to `Vagus.App.Steps.reconcile_asides/2`, which every start
+  # of its app's process also runs; here it covers one whose app never starts
+  # again (its file unreadable).
   # path is internal/config-derived, not request input
   # sobelow_skip ["Traversal.FileModule"]
-  defp sweep_restores(parent) do
+  defp sweep_restores(data_root) do
+    parent = Path.join([data_root, "addons", "data"])
+
     for path <- Path.wildcard(Path.join(parent, ".restore-*"), match_dot: true) do
       case Regex.run(~r/\A\.restore-(.+)-\d+\.old\z/, Path.basename(path)) do
-        [_all, slug] -> sweep_aside(path, Path.join(parent, slug), slug)
+        [_all, slug] -> Steps.reconcile_asides(slug, data_root: data_root)
         nil -> File.rm_rf(path)
-      end
-    end
-  end
-
-  # A restore halted between its two renames left the app's data only in the
-  # aside: it goes only once a data dir is back, and one that cannot move
-  # back waits for the next boot.
-  # path is internal/config-derived, not request input
-  # sobelow_skip ["Traversal.FileModule"]
-  defp sweep_aside(path, data_dir, slug) do
-    if File.dir?(data_dir) do
-      File.rm_rf(path)
-    else
-      case File.rename(path, data_dir) do
-        :ok ->
-          Logger.warning("Vagus.Backups: #{slug}'s data moved back from #{path}")
-
-        {:error, reason} ->
-          Logger.error(
-            "Vagus.Backups: #{slug}'s data could not move back from #{path} " <>
-              "(#{inspect(reason)}); kept there"
-          )
       end
     end
   end

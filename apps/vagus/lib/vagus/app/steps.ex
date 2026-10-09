@@ -197,7 +197,7 @@ defmodule Vagus.App.Steps do
   end
 
   # The op's last step, so the aside is gone before the app is free for an
-  # uninstall: one left behind a removed data dir is what the boot sweep
+  # uninstall: one left behind a removed data dir is what `reconcile_asides/2`
   # moves back. The data is already restored, so this never fails the op.
   # path is internal/config-derived, not request input
   # sobelow_skip ["Traversal.FileModule"]
@@ -211,7 +211,7 @@ defmodule Vagus.App.Steps do
       error ->
         Logger.warning(
           "Vagus.App.Steps: #{config.slug}'s pre-restore data at #{staging}.old was not " <>
-            "removed (#{inspect(error)}); the boot sweep removes it"
+            "removed (#{inspect(error)}); its next start removes it"
         )
 
         {:ok, :kept}
@@ -1001,20 +1001,15 @@ defmodule Vagus.App.Steps do
   end
 
   # A restore's aside goes first: one that outlived the data dir (its drop
-  # failed, or the restore's start did before it) is what the boot sweep
-  # would move back as the app's only copy.
+  # failed, or the restore's start did before it) is what
+  # `reconcile_asides/2` would move back as the app's only copy.
   # path is internal/config-derived, not request input
   # sobelow_skip ["Traversal.FileModule"]
   defp remove_data_dir(slug, opts) do
     if Config.valid_slug?(slug) do
       parent = Path.join([data_root(opts), "addons", "data"])
 
-      asides =
-        for path <- Path.wildcard(Path.join(parent, ".restore-*.old"), match_dot: true),
-            Regex.match?(~r/\A\.restore-#{Regex.escape(slug)}-\d+\.old\z/, Path.basename(path)),
-            do: path
-
-      Enum.reduce_while(asides ++ [Path.join(parent, slug)], :ok, fn path, :ok ->
+      Enum.reduce_while(asides(parent, slug) ++ [Path.join(parent, slug)], :ok, fn path, :ok ->
         case File.rm_rf(path) do
           {:ok, _removed} -> {:cont, :ok}
           {:error, reason, failed} -> {:halt, {:error, {:remove_data_dir, failed, reason}}}
@@ -1027,6 +1022,53 @@ defmodule Vagus.App.Steps do
 
       {:error, {:invalid_slug, slug}}
     end
+  end
+
+  @doc """
+  Settles the asides an interrupted restore of `slug` left beside its data
+  dir. With no data dir, an aside holds the pre-restore data, the only copy,
+  and moves back; beside one, the swap completed and it goes. Its owner runs
+  this before the app can start, so it never boots on an empty data dir.
+  `opts[:data_root]` overrides the configured data root.
+  """
+  @spec reconcile_asides(String.t(), keyword()) :: :ok
+  # path is internal/config-derived, not request input
+  # sobelow_skip ["Traversal.FileModule"]
+  def reconcile_asides(slug, opts \\ []) do
+    parent = Path.join([data_root(opts), "addons", "data"])
+    data_dir = Path.join(parent, slug)
+
+    if Config.valid_slug?(slug) do
+      for aside <- asides(parent, slug), do: reconcile_aside(aside, data_dir, slug)
+    end
+
+    :ok
+  end
+
+  # path is internal/config-derived, not request input
+  # sobelow_skip ["Traversal.FileModule"]
+  defp reconcile_aside(aside, data_dir, slug) do
+    if File.dir?(data_dir) do
+      File.rm_rf(aside)
+      Logger.info("Vagus.App.Steps: #{slug}'s completed restore left #{aside}; removed")
+    else
+      case File.rename(aside, data_dir) do
+        :ok ->
+          Logger.warning("Vagus.App.Steps: #{slug}'s data moved back from #{aside}")
+
+        {:error, reason} ->
+          Logger.error(
+            "Vagus.App.Steps: #{slug}'s data could not move back from #{aside} " <>
+              "(#{inspect(reason)}); kept there"
+          )
+      end
+    end
+  end
+
+  defp asides(parent, slug) do
+    for path <- Path.wildcard(Path.join(parent, ".restore-*.old"), match_dot: true),
+        Regex.match?(~r/\A\.restore-#{Regex.escape(slug)}-\d+\.old\z/, Path.basename(path)),
+        do: path
   end
 
   # Uninstall only, as upstream: Core answers a push for a panel it already

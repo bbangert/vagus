@@ -91,6 +91,60 @@ defmodule Vagus.App.ServerTest do
       assert {:ok, %{config: %{slug: ^slug}}} = :gen_statem.call(new_pid, :info)
     end
 
+    # A restore killed between its two renames leaves the pre-restore data
+    # only in the aside; the boot sweep runs once per VM, so the successor
+    # settles it before the app can start.
+    @tag :tmp_dir
+    test "a successor moves back an aside left with no data dir, and drops one beside it", ctx do
+      prev = Application.fetch_env(:vagus, :addon_data_root)
+      Application.put_env(:vagus, :addon_data_root, ctx.tmp_dir)
+
+      on_exit(fn ->
+        case prev do
+          {:ok, root} -> Application.put_env(:vagus, :addon_data_root, root)
+          :error -> Application.delete_env(:vagus, :addon_data_root)
+        end
+      end)
+
+      parent = Path.join([ctx.tmp_dir, "addons", "data"])
+      [lost, done] = for _ <- 1..2, do: slug()
+
+      sup =
+        start_supervised!(
+          {DynamicSupervisor, strategy: :one_for_one, max_restarts: 10, max_seconds: 60}
+        )
+
+      # Started first, so only a successor's start can find the asides.
+      pids =
+        for slug <- [lost, done] do
+          install_app(app_config(slug), process: false)
+          {:ok, pid} = DynamicSupervisor.start_child(sup, {Server, slug})
+          aside = Path.join(parent, ".restore-#{slug}-1.old")
+          File.mkdir_p!(aside)
+          File.write!(Path.join(aside, "db"), "before")
+          {slug, pid}
+        end
+
+      File.mkdir_p!(Path.join(parent, done))
+      File.write!(Path.join([parent, done, "db"]), "restored")
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          for {slug, pid} <- pids do
+            ref = Process.monitor(pid)
+            Process.exit(pid, :kill)
+            assert_receive {:DOWN, ^ref, :process, ^pid, :killed}
+            # `:sys` waits for its init, which settles the aside.
+            :sys.get_state(wait_for_new(slug, pid))
+          end
+        end)
+
+      assert File.read!(Path.join([parent, lost, "db"])) == "before"
+      assert File.read!(Path.join([parent, done, "db"])) == "restored"
+      assert File.ls!(parent) |> Enum.sort() == Enum.sort([lost, done])
+      assert log =~ "#{lost}'s data moved back"
+    end
+
     test "an EXIT from a linked process that is not its task stops it, to be restarted" do
       {slug, pid} = installed()
       ref = Process.monitor(pid)
