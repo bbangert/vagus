@@ -372,7 +372,9 @@ defmodule Vagus.App do
   @doc """
   Updates `slug` to the store's current version. With `backup: true` the
   update op snapshots the stopped app into a backup staged here, kept even
-  when the update then rolls back: it holds the version the user had.
+  when the update then rolls back: it holds the version the user had. An
+  update done whose backup could not be stored is `{:error,
+  {:backup_not_stored, reason}}`; the update stands.
   """
   @spec update(String.t(), keyword()) :: {:ok, update_result()} | {:error, term()}
   def update(slug, opts) do
@@ -400,23 +402,31 @@ defmodule Vagus.App do
     case backups.begin_partial("addon_#{slug}_#{version}", Keyword.take(opts, [:server])) do
       {:ok, handle} ->
         args = Map.merge(args, %{backup: true, staging_dir: handle.staging_dir})
-        result = command(slug, :update, args)
-
-        # A failed snapshot may have staged part of a file.
-        if match?({:error, {:backup_failed, _reason}}, result),
-          do: backups.discard_partial(handle),
-          else: keep_backup(backups, handle, slug)
-
-        result
+        command(slug, :update, args) |> keep_backup(backups, handle, slug)
 
       {:error, reason} ->
         {:error, {:backup_failed, reason}}
     end
   end
 
-  # An update that failed before its snapshot staged nothing, which
-  # `finish_partial` reports as `:not_staged`.
-  defp keep_backup(backups, handle, slug) do
+  # A failed snapshot may have staged part of a file.
+  defp keep_backup({:error, {:backup_failed, _reason}} = result, backups, handle, _slug) do
+    backups.discard_partial(handle)
+    result
+  end
+
+  # The update stands either way; the caller asked for a backup and must hear
+  # that it has none.
+  defp keep_backup({:ok, _update} = result, backups, handle, slug) do
+    case backups.finish_partial(handle, [slug]) do
+      {:ok, _backup_slug} -> result
+      {:error, reason} -> {:error, {:backup_not_stored, reason}}
+    end
+  end
+
+  # The update's own failure is the answer. One that failed before its
+  # snapshot staged nothing, which `finish_partial` reports as `:not_staged`.
+  defp keep_backup(result, backups, handle, slug) do
     case backups.finish_partial(handle, [slug]) do
       {:ok, _backup_slug} ->
         :ok
@@ -427,6 +437,8 @@ defmodule Vagus.App do
       {:error, reason} ->
         Logger.error("App #{slug}: the pre-update backup was not stored: #{inspect(reason)}")
     end
+
+    result
   end
 
   defp installed(slug) do

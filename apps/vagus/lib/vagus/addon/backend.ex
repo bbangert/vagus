@@ -20,7 +20,7 @@ defmodule Vagus.Addon.Backend do
   @type id :: String.t()
 
   @typedoc "Coarse runtime state, normalized across backends."
-  @type state :: :running | :stopped | :restarting | :unknown
+  @type state :: :running | :paused | :stopped | :restarting | :unknown
 
   @doc "Ensure the add-on's image/artifact is present locally."
   @callback pull(Spec.t()) :: :ok | {:error, term()}

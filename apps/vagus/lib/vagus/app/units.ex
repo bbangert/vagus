@@ -18,6 +18,7 @@ defmodule Vagus.App.Units do
   def all do
     %{
       import: &import/0,
+      sweep: &sweep/0,
       slugs: &App.slugs/0,
       list: &App.list/0,
       ensure: &ensure/1,
@@ -43,6 +44,22 @@ defmodule Vagus.App.Units do
     :ok
   rescue
     exception -> Logger.error("Apps not imported: #{Exception.message(exception)}")
+  end
+
+  # Once per VM: a boot re-run by an orchestrator restart or a resume can
+  # find backups and restores in flight, and wiping their staging loses a
+  # backup or fails a swap, where an orphan costs only disk until reboot.
+  # Boot must go on without it.
+  @spec sweep() :: :ok
+  def sweep do
+    unless :persistent_term.get({__MODULE__, :swept}, false) do
+      Vagus.Backups.sweep_stale()
+      :persistent_term.put({__MODULE__, :swept}, true)
+    end
+
+    :ok
+  rescue
+    exception -> Logger.error("Stale backup staging not swept: #{Exception.message(exception)}")
   end
 
   # One app whose process cannot start must not take the others down with it.

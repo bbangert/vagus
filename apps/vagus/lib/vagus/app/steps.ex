@@ -91,7 +91,7 @@ defmodule Vagus.App.Steps do
   defp step(:stop, %{config: config} = input) do
     opts = opts(input)
     id = container_name(config.slug)
-    was_running = match?({:ok, :running}, backend(opts).state(id))
+    was_running = match?({:ok, state} when state in [:running, :paused], backend(opts).state(id))
     stop_and_remove_container(id, opts)
     {:ok, %{was_running: was_running}}
   end
@@ -142,10 +142,12 @@ defmodule Vagus.App.Steps do
     path = Path.join(dir, "#{config.slug}.tar.gz")
     tar = fn -> Vagus.Backup.addon_tar(addon) end
 
-    with {:ok, gz, _size} <- if(input[:pause], do: frozen(config, opts, tar), else: tar.()),
+    {tarred, thawed} = if input[:pause], do: frozen(config, opts, tar), else: {tar.(), :ok}
+
+    with {:ok, gz, _size} <- tarred,
          :ok <- File.mkdir_p(dir),
          :ok <- File.write(path, gz) do
-      {:ok, path}
+      if match?({:error, _reason}, thawed), do: {:ok, {:still_paused, path}}, else: {:ok, path}
     end
   end
 
@@ -219,27 +221,36 @@ defmodule Vagus.App.Steps do
 
   # The walk lstats each entry and then reads it; frozen, nothing in the
   # container can swap a file for a symlink in between. A failed unpause does
-  # not fail the snapshot: the tar is whole, and failing it would not thaw the
-  # container either.
+  # not fail the snapshot: the tar is whole. It is returned beside the tar's
+  # result, so the operation can thaw the app again before it ends.
   defp frozen(config, opts, tar) do
     id = container_name(config.slug)
 
     case backend(opts).pause(id, opts) do
       :ok ->
-        try do
-          tar.()
-        after
-          thaw(id, opts)
+        tar_thawed(id, opts, tar)
+
+      # The engine's 409 is either "not running" or "already paused": a
+      # paused one is frozen all the same, and must still be thawed.
+      {:error, {:http, 409}} ->
+        case backend(opts).state(id) do
+          {:ok, :paused} -> tar_thawed(id, opts, tar)
+          _not_running -> {tar.(), :ok}
         end
 
-      # Not running: the app's last-seen state lagged the engine, and nothing
-      # in a stopped container can move under the tar.
-      {:error, {:http, 409}} ->
-        tar.()
-
       {:error, reason} ->
-        {:error, {:pause, reason}}
+        {{:error, {:pause, reason}}, :ok}
     end
+  end
+
+  defp tar_thawed(id, opts, tar) do
+    tar.()
+  catch
+    kind, reason ->
+      thaw(id, opts)
+      :erlang.raise(kind, reason, __STACKTRACE__)
+  else
+    tarred -> {tarred, thaw(id, opts)}
   end
 
   # A 409 is a container that is not paused, which is what was asked.

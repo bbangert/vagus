@@ -745,16 +745,23 @@ defmodule Vagus.App.Policy do
     advance(put_steps(data, [{:start?, nil}]), [])
   end
 
-  # A snapshot killed while it held the container paused never ran its own
-  # unpause, so the app is thawed before the op goes on.
-  defp on_outcome(:backup, :snapshot, _, {:error, reason} = result, data)
-       when reason in [:died, :timeout] do
+  # A snapshot that failed may have held the container paused past its own
+  # unpause: killed, it never ran one, and a failed tar's may have failed
+  # too. A container not paused answers the unpause with a harmless 409.
+  defp on_outcome(:backup, :snapshot, _, {:error, _reason} = result, data) do
     data = put_acc(data, :result, result)
     steps = if pause?(data), do: [{:unpause, nil} | data.run.steps], else: data.run.steps
     advance(put_steps(data, steps), [])
   end
 
-  defp on_outcome(:backup, :snapshot, _, {status, _} = result, data) when status in [:ok, :error],
+  # The tar is whole but the snapshot's own unpause failed: thawed again
+  # before the op goes on, as after a killed one.
+  defp on_outcome(:backup, :snapshot, _, {:ok, {:still_paused, path}}, data) do
+    data = put_acc(data, :result, {:ok, path})
+    advance(put_steps(data, [{:unpause, nil} | data.run.steps]), [])
+  end
+
+  defp on_outcome(:backup, :snapshot, _, {:ok, _path} = result, data),
     do: advance(put_acc(data, :result, result), [])
 
   # Logged where it failed: by the step, or by the process for a dead one.

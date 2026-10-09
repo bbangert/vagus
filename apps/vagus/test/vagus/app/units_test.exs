@@ -10,6 +10,7 @@ defmodule Vagus.App.UnitsTest do
 
   @arities %{
     import: 0,
+    sweep: 0,
     slugs: 0,
     list: 0,
     ensure: 1,
@@ -36,6 +37,47 @@ defmodule Vagus.App.UnitsTest do
 
     assert Map.keys(units.gates) |> Enum.sort() == [:api, :engine, :network, :tree]
     assert Enum.all?(Map.values(units.gates), &is_function(&1, 0))
+  end
+
+  describe "sweep/0" do
+    setup do
+      base = Path.join(System.tmp_dir!(), "vagus-units-#{System.unique_integer([:positive])}")
+      prev = Application.fetch_env(:vagus, :addon_data_root)
+      Application.put_env(:vagus, :addon_data_root, Path.join(base, "data"))
+      :persistent_term.erase({Units, :swept})
+
+      on_exit(fn ->
+        :persistent_term.erase({Units, :swept})
+
+        case prev do
+          {:ok, root} -> Application.put_env(:vagus, :addon_data_root, root)
+          :error -> Application.delete_env(:vagus, :addon_data_root)
+        end
+
+        File.rm_rf(base)
+      end)
+
+      %{staging: Path.join(base, "staging")}
+    end
+
+    test "clears the backup staging beside the configured data root", %{staging: staging} do
+      leftover = Path.join(staging, "backup-deadbeef-1")
+      File.mkdir_p!(leftover)
+
+      assert Units.sweep() == :ok
+      refute File.exists?(leftover)
+    end
+
+    test "sweeps only once per VM, so a later boot leaves live staging alone", %{
+      staging: staging
+    } do
+      assert Units.sweep() == :ok
+      live = Path.join(staging, "backup-live-1")
+      File.mkdir_p!(live)
+
+      assert Units.sweep() == :ok
+      assert File.dir?(live)
+    end
   end
 
   test "the tree gate passes once the application is started" do

@@ -2774,6 +2774,10 @@ defmodule Vagus.API.Router do
     do: {404, "Addon #{slug} is no longer available in the store"}
 
   defp update_failure(_slug, {:persist, _reason} = reason), do: app_failure(reason)
+
+  defp update_failure(_slug, {:backup_not_stored, reason}),
+    do: {500, "The update succeeded, but its backup could not be stored: #{inspect(reason)}"}
+
   defp update_failure(_slug, other), do: {400, update_error_message(other)}
 
   defp update_error_message(:no_update_available), do: "No update available for this addon"

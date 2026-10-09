@@ -583,6 +583,9 @@ defmodule Vagus.App.StepsTest do
       assert_received {:stop, "addon_test_app"}
       assert_received {:remove, "addon_test_app"}
 
+      :persistent_term.put({FakeBackend, :state}, {:ok, :paused})
+      assert {:ok, %{was_running: true}} = Steps.run(:stop, input(ctx))
+
       :persistent_term.put({FakeBackend, :state}, {:ok, :stopped})
       assert {:ok, %{was_running: false}} = Steps.run(:stop, input(ctx))
     end
@@ -760,11 +763,22 @@ defmodule Vagus.App.StepsTest do
     test "a pause refused as not running is not paused: the tar runs and nothing is unpaused",
          ctx do
       :persistent_term.put({FakeBackend, :pause}, fn -> {:error, {:http, 409}} end)
+      :persistent_term.put({FakeBackend, :state}, {:ok, :stopped})
 
       assert {:ok, path} = Steps.run(:snapshot, snapshot_input(ctx, %{pause: true}))
       assert File.regular?(path)
       assert_received {:pause, "addon_test_app"}
       refute_received {:unpause, _id}
+    end
+
+    test "a pause refused as already paused still tars frozen and unpauses after", ctx do
+      :persistent_term.put({FakeBackend, :pause}, fn -> {:error, {:http, 409}} end)
+      :persistent_term.put({FakeBackend, :state}, {:ok, :paused})
+
+      assert {:ok, path} = Steps.run(:snapshot, snapshot_input(ctx, %{pause: true}))
+      assert File.regular?(path)
+      assert_received {:pause, "addon_test_app"}
+      assert_received {:unpause, "addon_test_app"}
     end
 
     test "the container is unpaused when the tar fails", ctx do
@@ -775,12 +789,14 @@ defmodule Vagus.App.StepsTest do
       assert_received {:unpause, "addon_test_app"}
     end
 
-    test "a failed unpause is logged and the snapshot still stands", ctx do
+    test "a failed unpause is logged, and the snapshot stands marked still paused", ctx do
       :persistent_term.put({FakeBackend, :unpause}, fn -> {:error, :engine_gone} end)
 
       log =
         capture_log(fn ->
-          assert {:ok, path} = Steps.run(:snapshot, snapshot_input(ctx, %{pause: true}))
+          assert {:ok, {:still_paused, path}} =
+                   Steps.run(:snapshot, snapshot_input(ctx, %{pause: true}))
+
           assert File.regular?(path)
         end)
 

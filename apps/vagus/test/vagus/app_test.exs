@@ -286,6 +286,33 @@ defmodule Vagus.AppTest do
       assert File.ls!(Vagus.Backups.staging_root(ctx.dir)) == []
     end
 
+    # A snapshot that reports a file it never wrote leaves nothing to store.
+    test "an update done whose backup is not stored is the backup's error", ctx do
+      update = Task.async(fn -> App.update(ctx.slug, backup: true) end)
+      answer(:pull, {:ok, "x/y:2"})
+      answer(:stop, {:ok, %{was_running: true}})
+      answer(:snapshot, {:ok, "/nowhere/#{ctx.slug}.tar.gz"})
+      answer(:start, {:ok, %{container_id: "c2"}})
+      answer(:reclaim_image, {:ok, :ok})
+
+      assert {:error, {:backup_not_stored, {:not_staged, slug}}} = Task.await(update)
+      assert slug == ctx.slug
+      assert {:ok, %{config: %{version: "2.0"}}} = app_info(ctx.slug)
+      assert Vagus.Backups.list() == []
+    end
+
+    test "an update that fails is its own error, whatever became of its backup", ctx do
+      update = Task.async(fn -> App.update(ctx.slug, backup: true) end)
+      answer(:pull, {:ok, "x/y:2"})
+      answer(:stop, {:ok, %{was_running: true}})
+      answer(:snapshot, {:ok, "/nowhere/#{ctx.slug}.tar.gz"})
+      answer(:start, {:error, :boom})
+      answer(:start, {:ok, %{container_id: "c2"}})
+
+      assert {:error, {:rolled_back, :boom}} = Task.await(update)
+      assert Vagus.Backups.list() == []
+    end
+
     test "an update that fails before its snapshot stores nothing", ctx do
       update = Task.async(fn -> App.update(ctx.slug, backup: true) end)
       answer(:pull, {:error, :unreachable})

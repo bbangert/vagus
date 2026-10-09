@@ -809,13 +809,16 @@ defmodule Vagus.App.PolicyTest do
                [:persist, {:reply, {:error, {:backup_failed, :enospc}}}, :idle]
     end
 
-    test "9. backup hot: the post hook runs after a failed snapshot, and the error is the result" do
+    # A failed tar's own unpause may have failed too, so a paused one is thawed.
+    test "9. backup hot: a failed snapshot thaws, then runs the post hook, and the error is the result" do
       hooks = app_config(%{"backup_pre" => "pre", "backup_post" => "post"})
       {data, [{:step, {:exec_hook, :pre}}]} = begin(:backup, %{}, running(%{config: hooks}))
       {data, [{:step, {:snapshot, nil}}]} = step(data, {:ok, :ok})
       {data, effects} = step(data, {:error, :enospc})
-      assert effects == [{:step, {:exec_hook, :post}}]
+      assert effects == [{:step, {:unpause, nil}}]
       assert data.run.acc.result == {:error, :enospc}
+      {data, effects} = step(data, {:error, :engine_gone})
+      assert effects == [{:step, {:exec_hook, :post}}]
 
       {_data, effects} = step(data, {:error, {:exec, 1}})
       assert effects == [:persist, {:reply, {:error, :enospc}}, :idle]
@@ -832,6 +835,15 @@ defmodule Vagus.App.PolicyTest do
       {data, _} = begin(:backup, %{}, app(%{config: hooks}))
       {_data, effects} = step(data, {:error, :timeout})
       assert effects == [:persist, {:reply, {:error, :timeout}}, :idle]
+    end
+
+    test "backup hot: a snapshot whose own unpause failed is thawed again, then the post hook" do
+      hooks = app_config(%{"backup_post" => "post"})
+      {data, [{:step, {:snapshot, nil}}]} = begin(:backup, %{}, running(%{config: hooks}))
+      {data, [{:step, {:unpause, nil}}]} = step(data, {:ok, {:still_paused, "/s/a.tar.gz"}})
+      {data, [{:step, {:exec_hook, :post}}]} = step(data, {:error, :engine_gone})
+      {_data, effects} = step(data, {:ok, :ok})
+      assert effects == [:persist, {:reply, {:ok, "/s/a.tar.gz"}}, :idle]
     end
 
     test "backup hot: a failed pre hook ends it before the snapshot" do

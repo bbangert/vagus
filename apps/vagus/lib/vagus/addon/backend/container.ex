@@ -188,6 +188,7 @@ defmodule Vagus.Addon.Backend.Container do
   Public for hermetic testing (the daemon-facing `state/1` wraps it).
   """
   @spec normalize_state(map()) :: Vagus.Addon.Backend.state()
+  def normalize_state(%{"Paused" => true}), do: :paused
   def normalize_state(%{"Running" => true}), do: :running
   def normalize_state(%{"Restarting" => true}), do: :restarting
   def normalize_state(%{"Status" => "restarting"}), do: :restarting

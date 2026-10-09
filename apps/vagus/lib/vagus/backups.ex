@@ -242,17 +242,26 @@ defmodule Vagus.Backups do
     end
   end
 
+  @doc """
+  Removes the staging a backup or restore left when its caller died before
+  finishing it, which nothing else removes. Only safe while no backup or
+  restore can be in flight, so `Vagus.App.Units.sweep/0` runs it once per
+  VM, at the first boot before any app is started.
+  """
+  @spec sweep_stale(keyword()) :: :ok
+  # path is internal/config-derived, not request input
+  # sobelow_skip ["Traversal.FileModule"]
+  def sweep_stale(opts \\ []) do
+    File.rm_rf(staging_root(backup_dir(opts)))
+    sweep_restores(Path.join([data_root(opts), "addons", "data"]))
+    :ok
+  end
+
   ## GenServer
 
   @impl GenServer
-  # A staging dir outlives a backup or restore whose caller died before
-  # finishing it; nothing else removes it.
-  # path is internal/config-derived, not request input
-  # sobelow_skip ["Traversal.FileModule"]
   def init(opts) do
-    dir = Keyword.get(opts, :dir) || Path.join(data_root(opts), "backup")
-    File.rm_rf(staging_root(dir))
-    sweep_restores(Path.join([data_root(opts), "addons", "data"]))
+    dir = backup_dir(opts)
     {:ok, %{dir: dir, index: ensure_and_scan(dir)}}
   end
 
@@ -538,6 +547,8 @@ defmodule Vagus.Backups do
   end
 
   defp iso8601_now, do: DateTime.utc_now() |> DateTime.to_iso8601()
+
+  defp backup_dir(opts), do: Keyword.get(opts, :dir) || Path.join(data_root(opts), "backup")
 
   defp data_root(opts),
     do:

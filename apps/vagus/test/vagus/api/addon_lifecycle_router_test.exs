@@ -1264,6 +1264,35 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
       assert error["message"] =~ "No update available"
     end
 
+    test "an update done whose backup cannot be stored -> 500 saying so, job too" do
+      installed = fixture_config("updnostore")
+      seed_store("core_updnostore", installed)
+      on_exit(fn -> forget_app("core_updnostore") end)
+      assert supervisor_call(:post, "/store/addons/core_updnostore/install").status == 200
+      seed_store("core_updnostore", %{installed | version: "9.9.9"})
+      prev = Application.fetch_env(:vagus, :backups_module)
+      Application.put_env(:vagus, :backups_module, __MODULE__.UnstorableBackups)
+
+      on_exit(fn ->
+        case prev do
+          {:ok, mod} -> Application.put_env(:vagus, :backups_module, mod)
+          :error -> Application.delete_env(:vagus, :backups_module)
+        end
+      end)
+
+      conn = supervisor_call(:post, "/store/addons/core_updnostore/update", %{"backup" => true})
+      message = "The update succeeded, but its backup could not be stored: :enospc"
+      assert conn.status == 500
+      assert body(conn)["message"] == message
+
+      jobs = json(supervisor_call(:get, "/jobs/info"))["data"]["jobs"]
+      assert [job] = Enum.filter(jobs, &(&1["reference"] == "core_updnostore"))
+      assert [%{"message" => ^message}] = job["errors"]
+
+      assert json(supervisor_call(:get, "/addons/core_updnostore/info"))["data"]["version"] ==
+               "9.9.9"
+    end
+
     test "unknown body keys are ignored (aiohttp tolerance)" do
       installed = fixture_config("updunknown")
       seed_store("core_updunknown", installed)
@@ -1320,5 +1349,21 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
 
       assert conn.status == 401
     end
+  end
+
+  defmodule UnstorableBackups do
+    @moduledoc false
+    def begin_partial(name, _opts) do
+      staging_dir = Path.join(System.tmp_dir!(), "vagus-unstorable-#{System.unique_integer()}")
+      File.mkdir_p!(staging_dir)
+      {:ok, %{slug: "unstorable", name: name, staging_dir: staging_dir}}
+    end
+
+    def finish_partial(handle, _slugs) do
+      File.rm_rf(handle.staging_dir)
+      {:error, :enospc}
+    end
+
+    def discard_partial(handle), do: File.rm_rf(handle.staging_dir) && :ok
   end
 end

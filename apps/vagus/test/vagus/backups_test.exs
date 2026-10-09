@@ -291,7 +291,7 @@ defmodule Vagus.BackupsTest do
       assert {:ok, %{state: :started}} = app_info(slug)
     end
 
-    test "staging a crashed VM left behind is cleared when the store starts", %{
+    test "the boot sweep clears staging a crashed VM left behind", %{
       data_root: dr,
       backup_dir: backup_dir
     } do
@@ -309,17 +309,29 @@ defmodule Vagus.BackupsTest do
       File.write!(Path.join([parent, ".restore-core_c-3.old", "db"]), "kept")
 
       log =
-        capture_log(fn ->
-          {:ok, _pid} =
-            Backups.start_link(name: :backups_test_restart, dir: backup_dir, data_root: dr)
-        end)
-
-      on_exit(fn -> if pid = Process.whereis(:backups_test_restart), do: GenServer.stop(pid) end)
+        capture_log(fn -> assert :ok = Backups.sweep_stale(dir: backup_dir, data_root: dr) end)
 
       refute File.exists?(Backups.staging_root(backup_dir))
       assert File.ls!(parent) |> Enum.sort() == ["core_b", "core_c"]
       assert File.read!(Path.join([parent, "core_c", "db"])) == "kept"
       assert log =~ "core_c's data moved back"
+    end
+
+    # Backup callers and app operations outlive a restart of the store.
+    test "a restart of the store leaves live backup and restore staging alone", %{
+      data_root: dr,
+      backup_dir: backup_dir,
+      server: server
+    } do
+      {:ok, %{staging_dir: staging}} = Backups.begin_partial("live", server: server)
+      restore = Path.join([dr, "addons", "data", ".restore-core_a-1"])
+      File.mkdir_p!(restore)
+
+      :ok = GenServer.stop(server)
+      {:ok, _pid} = Backups.start_link(name: server, dir: backup_dir, data_root: dr)
+
+      assert File.dir?(staging)
+      assert File.dir?(restore)
     end
 
     test "each backup stages in its own new root-only dir beside the data root", %{

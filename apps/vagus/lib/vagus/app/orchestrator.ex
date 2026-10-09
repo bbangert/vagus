@@ -10,8 +10,10 @@ defmodule Vagus.App.Orchestrator do
 
   Boot:
 
-    1. the default native app is installed if missing, and on that fresh
-       install recorded as wanted started;
+    1. the staging an interrupted backup or restore left is swept
+       (`Vagus.Backups.sweep_stale/1`), then the default native app is
+       installed if missing, and on that fresh install recorded as wanted
+       started;
     2. the `tree` gate, then native apps get their boot rule: they need no
        engine, so an offline boot still brings the broker up;
     3. the `engine`, `network` and `api` gates (`Vagus.App.Gates`), each
@@ -228,13 +230,15 @@ defmodule Vagus.App.Orchestrator do
     do: %{state | phase: :booting, task: Task.async(fn -> run_boot(state.cfg) end)}
 
   # Runs outside this process, so a crash here does not cut the stop short.
-  defp begin_stop(state) do
-    %{cfg: cfg, deadline: deadline} = state
+  defp begin_stop(%{cfg: cfg, deadline: deadline} = state) do
     task = Task.Supervisor.async_nolink(Vagus.TaskSupervisor, fn -> run_stop(cfg, deadline) end)
     %{state | phase: :stopping, task: task}
   end
 
+  # The sweep runs before this boot starts or installs anything; the unit
+  # itself sweeps only at the first boot in this VM.
   defp run_boot(cfg) do
+    cfg.units.sweep.()
     if slug = cfg.default_native_app, do: install_default(slug, cfg.units)
 
     _running =
