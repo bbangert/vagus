@@ -1004,6 +1004,69 @@ defmodule Vagus.App.ServerTest do
       assert :idle = state(pid)
     end
 
+    # The engine refuses to stop a paused container until it is unpaused.
+    defmodule PausedBackend do
+      @moduledoc false
+      @behaviour Vagus.Addon.Backend
+
+      @impl true
+      def pull(_spec), do: :ok
+      @impl true
+      def create(_spec), do: {:ok, "fake-id"}
+      @impl true
+      def start(_id), do: :ok
+      @impl true
+      def remove(id, _opts \\ []), do: send(self(), {:remove, id}) && :ok
+      @impl true
+      def remove_image(_image, _opts \\ []), do: :ok
+      @impl true
+      def state(_id), do: {:ok, if(Process.get(:paused), do: :paused, else: :running)}
+      @impl true
+      def pause(_id, _opts \\ []), do: :ok
+
+      @impl true
+      def stop(id, _opts \\ []) do
+        send(self(), {:stop, id})
+        if Process.get(:paused), do: {:error, {:http, 409}}, else: :ok
+      end
+
+      @impl true
+      def unpause(id, _opts \\ []) do
+        send(self(), {:unpause, id})
+        Process.delete(:paused) && :ok
+      end
+    end
+
+    # A snapshot whose process died with the VM left the container paused:
+    # the boot listing counts it running, so the app's own start replaces it.
+    @tag :tmp_dir
+    test "a container left paused is thawed and replaced by the app's own start", ctx do
+      slug = slug()
+      install_app(app_config(slug, %{"host_network" => true}), state: :started, process: false)
+      {:ok, pid} = Instances.ensure(slug)
+
+      paused = %{"State" => %{"Running" => true, "Paused" => true}}
+      engine = Vagus.Test.FakeEngine.start([{200, paused}])
+      on_exit(fn -> Vagus.Test.FakeEngine.stop(engine) end)
+      running? = Vagus.App.Units.running?(slug, socket: engine.socket)
+      assert running? == true
+
+      boot = op(pid, {:boot_start, %{running?: running?}})
+      {input, task} = step(:start)
+      Process.put(:paused, true)
+      input = Map.merge(input, %{backend: PausedBackend, data_root: ctx.tmp_dir})
+      outcome = ExUnit.CaptureLog.with_log(fn -> Vagus.App.Steps.run(:start, input) end)
+      send(task, {:outcome, elem(outcome, 0)})
+      assert :ok = Task.await(boot)
+
+      name = "addon_" <> slug
+      assert_received {:stop, ^name}
+      assert_received {:unpause, ^name}
+      assert_received {:remove, ^name}
+      refute Process.get(:paused)
+      assert %{container_id: "fake-id", wanted: :started} = data(pid)
+    end
+
     test "an app wanted stopped is left stopped" do
       {_slug, pid} = installed()
       assert :ok = :gen_statem.call(pid, {:boot_start, %{}})

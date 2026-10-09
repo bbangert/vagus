@@ -45,26 +45,19 @@ defmodule Vagus.App.Units do
     exception -> Logger.error("Apps not imported: #{Exception.message(exception)}")
   end
 
-  # Only the first boot in a VM can find what an earlier VM left: staging no
-  # backup is still writing, and containers no app process will thaw. A later
-  # one is the orchestrator restarted alone, under app processes that still
-  # own both, so it touches neither: wiping live staging loses a backup or
-  # fails a swap, where an orphan costs only disk until reboot.
-  @cold_boot {__MODULE__, :cold_boot}
+  # Only the first boot in a VM can find staging an earlier VM left with no
+  # backup still writing it. A later one is the orchestrator restarted alone,
+  # under app processes that may be mid-backup or mid-restore: wiping their
+  # live staging loses a backup or fails a swap, where an orphan costs only
+  # disk until reboot.
+  @swept {__MODULE__, :swept}
 
   # Boot must go on without the sweep.
   @spec sweep() :: :ok
   def sweep do
-    case :persistent_term.get(@cold_boot, :unset) do
-      :unset ->
-        :persistent_term.put(@cold_boot, true)
-        Vagus.Backups.sweep_stale()
-
-      true ->
-        :persistent_term.put(@cold_boot, false)
-
-      false ->
-        :ok
+    unless :persistent_term.get(@swept, false) do
+      :persistent_term.put(@swept, true)
+      Vagus.Backups.sweep_stale()
     end
 
     :ok
@@ -116,50 +109,25 @@ defmodule Vagus.App.Units do
   def native?(%{config: config}), do: Steps.native?(config)
   def native?(_entry), do: false
 
+  # A paused container counts as running and is never thawed here: a boot
+  # listing can overlap a backup already pausing its container. Boot sends a
+  # paused one's app through its own start, whose replace thaws it, in the
+  # one process that also owns any backup of it.
   @doc "The slugs whose container the engine reports running; one listing for the whole boot."
   @spec running(keyword()) :: {:ok, MapSet.t(String.t())} | {:error, term()}
   def running(opts \\ []) do
     with {:ok, containers} <- Docker.list_containers(opts) do
-      slugs =
-        for %{"Names" => names} = container <- containers, "/addon_" <> slug <- names do
-          if container["State"] == "paused" and cold_boot?(), do: thaw(slug, opts)
-          slug
-        end
-
-      {:ok, MapSet.new(slugs)}
+      {:ok,
+       MapSet.new(for %{"Names" => names} <- containers, "/addon_" <> slug <- names, do: slug)}
     end
   end
 
   @spec running?(String.t(), keyword()) :: boolean() | :unknown
   def running?(slug, opts \\ []) do
     case Docker.inspect_container("addon_" <> slug, opts) do
-      {:ok, %{"State" => %{"Running" => running} = state}} ->
-        if state["Paused"] == true and cold_boot?(), do: thaw(slug, opts)
-        running == true
-
-      {:error, {:http, 404, _message}} ->
-        false
-
-      _unknown ->
-        :unknown
-    end
-  end
-
-  # Before any boot has swept, as for a unit called on its own, it is cold.
-  defp cold_boot?, do: :persistent_term.get(@cold_boot, true)
-
-  # A snapshot whose app process died with the VM left it paused: frozen, it
-  # hangs its watchdog probe and the engine refuses to stop it. A paused
-  # container still counts as running.
-  defp thaw(slug, opts) do
-    case Docker.unpause_container("addon_" <> slug, opts) do
-      :ok ->
-        Logger.warning("Boot: #{slug}'s container was left paused; unpaused")
-
-      {:error, reason} ->
-        Logger.error(
-          "Boot: #{slug}'s container is paused and did not unpause: #{inspect(reason)}"
-        )
+      {:ok, %{"State" => state}} -> state["Running"] == true or state["Paused"] == true
+      {:error, {:http, 404, _message}} -> false
+      _unknown -> :unknown
     end
   end
 

@@ -504,10 +504,12 @@ defmodule Vagus.App.Policy do
   defp steps(:halt, _args, _data), do: [{:halt_stop, nil}]
 
   # The backup decides whether the app ends running, as it decides its data.
-  # The old data goes last, so a large one never holds back the start.
+  # The old data goes last, so a large one never holds back the start. The
+  # stop is strict: a container a failed stop left running would write into
+  # the directory the swap replaces.
   defp steps(:restore, args, _data) do
     start = if args[:start?], do: start_steps(), else: []
-    [{:stop, nil}, {:swap_data, nil}, {:set_options, nil}] ++ start ++ [{:drop_aside, nil}]
+    [{:stop, :strict}, {:swap_data, nil}, {:set_options, nil}] ++ start ++ [{:drop_aside, nil}]
   end
 
   defp steps(:update, args, _data) do
@@ -741,13 +743,15 @@ defmodule Vagus.App.Policy do
 
   # A backup's stop cancels the restart a crashed app was waiting for, so one
   # that should run is started again like one that ran.
-  defp on_outcome(op, :stop, nil, {:ok, %{was_running: was_running}}, data) do
+  defp on_outcome(op, :stop, _strict, {:ok, %{was_running: was_running}}, data) do
     was_running = was_running or (op == :backup and data.wanted == :started)
     data = put_acc(%{release(data) | last_event: :stopped}, :was_running, was_running)
     advance(data, [])
   end
 
-  defp on_outcome(_op, :stop, nil, {:error, reason}, data), do: cleanup(data, {:stop, reason}, [])
+  # A strict stop's error lands here too, so a restore ends before its swap.
+  defp on_outcome(_op, :stop, _strict, {:error, reason}, data),
+    do: cleanup(data, {:stop, reason}, [])
 
   defp on_outcome(:update, :snapshot, _, {:ok, _path}, data), do: advance(data, [])
 
@@ -951,6 +955,7 @@ defmodule Vagus.App.Policy do
     do: %{staging_dir: data.run.args.staging_dir}
 
   defp input(:set_options, _arg, data), do: %{options: data.run.args.options}
+  defp input(:stop, :strict, _data), do: %{strict: true}
   defp input(_name, _arg, _data), do: %{}
 
   # Any container this process holds is paused around the tar, whatever its

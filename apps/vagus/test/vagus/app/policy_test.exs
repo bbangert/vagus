@@ -452,10 +452,10 @@ defmodule Vagus.App.PolicyTest do
         {:uninstall, %{}, [{:stop, nil}, {:delete_file, nil}, {:remove_app, nil}]},
         {:halt, %{}, [{:halt_stop, nil}]},
         {:restore, %{start?: false},
-         [{:stop, nil}, {:swap_data, nil}, {:set_options, nil}, {:drop_aside, nil}]},
+         [{:stop, :strict}, {:swap_data, nil}, {:set_options, nil}, {:drop_aside, nil}]},
         {:restore, %{start?: true},
          [
-           {:stop, nil},
+           {:stop, :strict},
            {:swap_data, nil},
            {:set_options, nil},
            {:port?, nil},
@@ -621,7 +621,9 @@ defmodule Vagus.App.PolicyTest do
       {data, effects} =
         begin(:restore, args, running(%{token_hash: "h", user_options: %{"o" => 1}}))
 
-      assert List.last(effects) == {:step, {:stop, nil}}
+      assert List.last(effects) == {:step, {:stop, :strict}}
+      assert %{strict: true} = Policy.task_input({:stop, :strict}, data)
+      refute Map.has_key?(Policy.task_input({:stop, nil}, data), :strict)
       assert %{wanted: :stopped, token_hash: nil} = data
 
       {data, effects} = step(data, {:ok, %{was_running: true}})
@@ -712,6 +714,22 @@ defmodule Vagus.App.PolicyTest do
 
       assert [:persist, {:step, {:drop_aside, nil}}] = effects
       assert %{user_options: %{"o" => 2}, options_rev: 1} = data
+    end
+
+    # A container the engine failed to stop may still be writing the dir.
+    test "restore: a strict stop's engine error ends it before the swap" do
+      args = %{staging_dir: "/s", options: %{"o" => 2}, start?: true}
+      {data, _} = begin(:restore, args, running(%{user_options: %{"o" => 1}}))
+      {data, effects} = step(data, {:error, :econnrefused})
+      assert List.last(effects) == {:step, {:stop, :by_name}}
+
+      {data, effects} = step(data, {:ok, %{was_running: true}})
+
+      assert [:persist, {:reply, {:error, {:stop, :econnrefused}}}, :idle] =
+               Enum.reject(effects, &match?({:emit, _}, &1))
+
+      refute Enum.any?(effects, &match?({:step, {:swap_data, _}}, &1))
+      assert %{user_options: %{"o" => 1}, wanted: :stopped, run: %{steps: []}} = data
     end
 
     test "restore: a failed swap ends it before the options are touched" do

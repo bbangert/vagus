@@ -581,6 +581,32 @@ defmodule Vagus.BackupsTest do
       assert {:ok, %{user_options: %{"greet" => "since"}}} = app_info(slug)
     end
 
+    # The stop the engine failed may have left the container writing the dir.
+    test "a strict stop's engine error fails the restore before the swap", %{
+      data_root: dr,
+      server: server
+    } do
+      slug = "core_restore_stop"
+      backup_slug = backed_up_app(slug, dr, server)
+
+      restore =
+        Task.async(fn ->
+          Backups.restore_partial(backup_slug, [slug], server: server, data_root: dr)
+        end)
+
+      assert_receive {:step, :stop, %{slug: ^slug, strict: true}, task}, 5_000
+      send(task, {:outcome, {:error, :econnrefused}})
+      assert_receive {:step, :stop, %{slug: ^slug} = by_name, task}, 5_000
+      refute Map.has_key?(by_name, :strict)
+      send(task, {:outcome, {:ok, %{was_running: false}}})
+
+      assert {:error, {:restore, ^slug, {:stop, :econnrefused}}} = Task.await(restore)
+      refute_received {:step, :swap_data, _input, _task}
+      assert File.read!(Path.join(data_dir(dr, slug), "f.txt")) == "since"
+      assert restore_leftovers(dr) == []
+      assert {:ok, %{user_options: %{"greet" => "since"}}} = app_info(slug)
+    end
+
     test "restore onto a not-installed slug errors", %{data_root: dr, server: server} do
       slug = "core_src"
       install(slug, dr)

@@ -40,13 +40,13 @@ defmodule Vagus.App.UnitsTest do
 
   # The VM's own boot already set it; each test starts as if none had.
   defp fresh_vm(context) do
-    prev = :persistent_term.get({Units, :cold_boot}, :unset)
-    :persistent_term.erase({Units, :cold_boot})
+    prev = :persistent_term.get({Units, :swept}, :unset)
+    :persistent_term.erase({Units, :swept})
 
     on_exit(fn ->
       if prev == :unset,
-        do: :persistent_term.erase({Units, :cold_boot}),
-        else: :persistent_term.put({Units, :cold_boot}, prev)
+        do: :persistent_term.erase({Units, :swept}),
+        else: :persistent_term.put({Units, :swept}, prev)
     end)
 
     context
@@ -84,13 +84,11 @@ defmodule Vagus.App.UnitsTest do
       staging: staging
     } do
       assert Units.sweep() == :ok
-      assert :persistent_term.get({Units, :cold_boot})
       live = Path.join(staging, "backup-live-1")
       File.mkdir_p!(live)
 
       assert Units.sweep() == :ok
       assert File.dir?(live)
-      refute :persistent_term.get({Units, :cold_boot})
     end
   end
 
@@ -175,8 +173,6 @@ defmodule Vagus.App.UnitsTest do
   describe "what the engine says runs" do
     alias Vagus.Test.FakeEngine
 
-    setup :fresh_vm
-
     defp engine(responses) do
       engine = FakeEngine.start(responses)
       on_exit(fn -> FakeEngine.stop(engine) end)
@@ -205,50 +201,21 @@ defmodule Vagus.App.UnitsTest do
     defp posts(engine),
       do: for(%{method: :post, path: path} <- FakeEngine.requests(engine), do: path)
 
-    test "a container found paused is unpaused, logged, and still counts as running" do
-      :persistent_term.put({Units, :cold_boot}, true)
-      paused = %{"State" => %{"Running" => true, "Paused" => true}}
-      engine = FakeEngine.start([{200, paused}, {204, nil}])
-      on_exit(fn -> FakeEngine.stop(engine) end)
-
-      log = capture_log(fn -> assert Units.running?("core_ssh", socket: engine.socket) end)
-
-      assert posts(engine) == ["/containers/addon_core_ssh/unpause"]
-      assert log =~ "core_ssh's container was left paused; unpaused"
-    end
-
-    test "the boot listing unpauses a paused container, and a failed unpause is logged" do
-      containers = [
+    # Thawing here could unpause a backup's container mid-tar; the app's own
+    # start replaces a paused one.
+    test "a paused container counts as running, listed or inspected, and is never unpaused" do
+      listing = [
         %{"Names" => ["/addon_core_ssh"], "State" => "paused"},
         %{"Names" => ["/addon_local_x"], "State" => "running"}
       ]
 
-      engine = FakeEngine.start([{200, containers}, {500, %{"message" => "x"}}])
-      on_exit(fn -> FakeEngine.stop(engine) end)
-      :persistent_term.put({Units, :cold_boot}, true)
-
-      log =
-        capture_log(fn ->
-          assert {:ok, running} = Units.running(socket: engine.socket)
-          assert running == MapSet.new(["core_ssh", "local_x"])
-        end)
-
-      assert posts(engine) == ["/containers/addon_core_ssh/unpause"]
-      assert log =~ "core_ssh's container is paused and did not unpause"
-    end
-
-    # An orchestrator restarted alone boots under live app processes: the
-    # paused one is a backup's, mid-tar, and its process thaws it.
-    test "a later boot in the VM leaves a paused container alone, still running" do
-      :persistent_term.put({Units, :cold_boot}, false)
-      listing = [%{"Names" => ["/addon_core_ssh"], "State" => "paused"}]
-      paused = %{"State" => %{"Running" => true, "Paused" => true}}
+      paused = %{"State" => %{"Running" => false, "Paused" => true}}
       engine = FakeEngine.start([{200, listing}, {200, paused}])
       on_exit(fn -> FakeEngine.stop(engine) end)
 
       assert {:ok, running} = Units.running(socket: engine.socket)
-      assert running == MapSet.new(["core_ssh"])
-      assert Units.running?("core_ssh", socket: engine.socket)
+      assert running == MapSet.new(["core_ssh", "local_x"])
+      assert Units.running?("core_ssh", socket: engine.socket) == true
       assert posts(engine) == []
     end
   end

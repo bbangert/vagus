@@ -629,6 +629,51 @@ defmodule Vagus.App.StepsTest do
       refute_received {:unpause, _id}
     end
 
+    # A restore swaps the data dir next: only a container that is gone or
+    # stopped is safe, and a stop the engine failed may have left it writing.
+    test "a strict stop fails on an engine error, and passes an absent or stopped container",
+         ctx do
+      strict = Map.put(input(ctx), :strict, true)
+
+      for ok <- [:ok, {:error, {:http, 404}}] do
+        :persistent_term.put({FakeBackend, :stop}, fn -> ok end)
+        assert {:ok, %{was_running: true}} = Steps.run(:stop, strict)
+        assert_received {:remove, "addon_test_app"}
+      end
+
+      for failure <- [{:http, 500}, :econnrefused] do
+        :persistent_term.put({FakeBackend, :stop}, fn -> {:error, failure} end)
+
+        log = capture_log(fn -> assert {:error, ^failure} = Steps.run(:stop, strict) end)
+        assert log =~ "stop addon_test_app failed"
+        refute_received {:remove, _id}
+
+        capture_log(fn -> assert {:ok, _fact} = Steps.run(:stop, input(ctx)) end)
+        assert_received {:remove, "addon_test_app"}
+      end
+    end
+
+    test "a strict stop still thaws a paused container before stopping it", ctx do
+      paused_engine()
+      strict = Map.put(input(ctx), :strict, true)
+
+      capture_log(fn -> assert {:ok, _fact} = Steps.run(:stop, strict) end)
+      assert_received {:unpause, "addon_test_app"}
+      refute Process.get(:paused)
+    end
+
+    # Boot sends an app whose container a dead snapshot left paused through
+    # its start; the stale container is thawed there, by its own process.
+    test "start thaws a paused stale container before replacing it", ctx do
+      paused_engine()
+
+      capture_log(fn -> assert {:ok, _fact} = Steps.run(:start, input(ctx)) end)
+      assert_received {:unpause, "addon_test_app"}
+      assert_received {:remove, "addon_test_app"}
+      assert_received {:start, "fake-id"}
+      refute Process.get(:paused)
+    end
+
     test "pull pulls the arch-resolved image", ctx do
       assert {:ok, image} = Steps.run(:pull, Map.put(input(ctx), :arch, "amd64"))
       assert image == "homeassistant/amd64-addon-test:3"

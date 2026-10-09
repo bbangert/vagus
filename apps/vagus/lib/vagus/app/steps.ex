@@ -92,8 +92,9 @@ defmodule Vagus.App.Steps do
     opts = opts(input)
     id = container_name(config.slug)
     was_running = match?({:ok, state} when state in [:running, :paused], backend(opts).state(id))
-    stop_and_remove_container(id, opts)
-    {:ok, %{was_running: was_running}}
+
+    with :ok <- stop_and_remove_container(id, opts, input[:strict] == true),
+         do: {:ok, %{was_running: was_running}}
   end
 
   # Shutdown: stop by name and leave the container for the next boot to
@@ -505,8 +506,11 @@ defmodule Vagus.App.Steps do
   # name. The real Supervisor's `DockerInterface.run` stops+removes any
   # existing container before creating (§A1.4 — no restart policy, the manager
   # owns the lifecycle), so do the same, tolerantly (absent/not-running is fine).
+  # Through `stop_thawed/2`: a container a snapshot left paused refuses the
+  # stop, and boot replaces one here, so it gets its graceful stop rather
+  # than only the forced remove's kill.
   defp remove_stale_container(spec, opts) do
-    _ = backend(opts).stop(spec.name, [])
+    _ = stop_thawed(spec.name, Keyword.take(opts, [:backend]))
     _ = backend(opts).remove(spec.name, [])
     :ok
   end
@@ -934,17 +938,34 @@ defmodule Vagus.App.Steps do
 
   defp data_dir(data_root, slug), do: Path.join([data_root, "addons", "data", slug])
 
-  # Both calls are tolerated: an absent or stopped container is success at the
-  # backend, and a failing daemon must not keep a stop from completing.
-  defp stop_and_remove_container(id, opts) do
-    with {:error, reason} <- stop_thawed(id, opts),
-         do: Logger.warning("Vagus.App.Steps: stop #{id} failed (tolerated): #{inspect(reason)}")
+  # An absent or stopped container is success; otherwise a failing daemon must
+  # not keep a stop from completing, unless the stop is strict. A failed
+  # remove leaves the container stopped, so it is tolerated either way.
+  defp stop_and_remove_container(id, opts, strict?) do
+    with :ok <- stop_container(id, opts, strict?) do
+      with {:error, reason} <- backend(opts).remove(id, opts),
+           do:
+             Logger.warning(
+               "Vagus.App.Steps: remove #{id} failed (tolerated): #{inspect(reason)}"
+             )
 
-    with {:error, reason} <- backend(opts).remove(id, opts),
-         do:
-           Logger.warning("Vagus.App.Steps: remove #{id} failed (tolerated): #{inspect(reason)}")
+      :ok
+    end
+  end
 
-    :ok
+  defp stop_container(id, opts, strict?) do
+    case stop_thawed(id, opts) do
+      result when result in [:ok, {:error, {:http, 404}}] ->
+        :ok
+
+      {:error, reason} = error when strict? ->
+        Logger.error("Vagus.App.Steps: stop #{id} failed: #{inspect(reason)}")
+        error
+
+      {:error, reason} ->
+        Logger.warning("Vagus.App.Steps: stop #{id} failed (tolerated): #{inspect(reason)}")
+        :ok
+    end
   end
 
   # Image removal goes straight through `Vagus.Runtime.Docker` (not the
