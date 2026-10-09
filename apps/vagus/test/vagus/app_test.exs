@@ -5,7 +5,7 @@ defmodule Vagus.AppTest do
   import ExUnit.CaptureLog
   import Vagus.AppFixtures
 
-  alias Vagus.Addon.{Backend, Config}
+  alias Vagus.Addon.{Backend, Config, Store}
   alias Vagus.App
   alias Vagus.App.Directory
   alias Vagus.App.File, as: AppFile
@@ -212,6 +212,85 @@ defmodule Vagus.AppTest do
 
       assert {:error, {:reserved_slug, "vagus"}} = App.install(config)
       assert :error = app_info("vagus")
+    end
+  end
+
+  describe "update/2 with a backup" do
+    setup do
+      dir = Path.join(System.tmp_dir!(), "vagus-app-bk-#{System.unique_integer([:positive])}")
+      prev_dir = Vagus.Backups.dir()
+      :ok = Vagus.Backups.set_dir(dir)
+
+      on_exit(fn ->
+        Vagus.Backups.set_dir(prev_dir)
+        File.rm_rf(dir)
+      end)
+
+      config = config()
+      slug = track(config, state: :started)
+      seed_store(%{config | version: "2.0"})
+      stub_app_steps()
+      %{slug: slug, dir: dir}
+    end
+
+    defp seed_store(%Config{slug: slug} = config) do
+      catalog = Map.put(Store.catalog(), slug, %{config: config, repository: "core"})
+      :ok = GenServer.call(Store, {:put_catalog, catalog})
+      on_exit(fn -> GenServer.call(Store, {:put_catalog, Map.delete(Store.catalog(), slug)}) end)
+    end
+
+    defp answer(name, outcome) do
+      assert_receive {:step, ^name, input, task}, 5_000
+      send(task, {:outcome, outcome})
+      input
+    end
+
+    # Stands in for the snapshot step: writes a real inner tar where it would,
+    # whatever outcome it then reports.
+    defp answer_snapshot(slug, outcome \\ :ok) do
+      assert_receive {:step, :snapshot, %{staging_dir: staging}, task}, 5_000
+      addon = %{slug: slug, name: "App Test", version: "1.0", data_dir: "/nonexistent"}
+      {:ok, gz, _size} = Vagus.Backup.addon_tar(Map.put(addon, :system, %{"name" => "App Test"}))
+      path = Path.join(staging, slug <> ".tar.gz")
+      File.write!(path, gz)
+      send(task, {:outcome, if(outcome == :ok, do: {:ok, path}, else: outcome)})
+    end
+
+    test "the snapshot inside the update is kept even when the update rolls back", ctx do
+      update = Task.async(fn -> App.update(ctx.slug, backup: true) end)
+      answer(:pull, {:ok, "x/y:2"})
+      answer(:stop, {:ok, %{was_running: true}})
+      answer_snapshot(ctx.slug)
+      answer(:start, {:error, :boom})
+      answer(:start, {:ok, %{container_id: "c2"}})
+
+      assert {:error, {:rolled_back, :boom}} = Task.await(update)
+      assert [%{backup: backup}] = Vagus.Backups.list()
+      assert backup["name"] == "addon_#{ctx.slug}_1.0"
+      assert [%{"slug" => slug, "version" => "1.0"}] = backup["addons"]
+      assert slug == ctx.slug
+      assert File.ls!(Path.join(ctx.dir, ".staging")) == []
+    end
+
+    test "a failed snapshot fails the update and stores nothing", ctx do
+      update = Task.async(fn -> App.update(ctx.slug, backup: true) end)
+      answer(:pull, {:ok, "x/y:2"})
+      answer(:stop, {:ok, %{was_running: true}})
+      answer_snapshot(ctx.slug, {:error, :enospc})
+      answer(:start, {:ok, %{container_id: "c2"}})
+
+      assert {:error, {:backup_failed, :enospc}} = Task.await(update)
+      assert Vagus.Backups.list() == []
+      assert File.ls!(Path.join(ctx.dir, ".staging")) == []
+    end
+
+    test "an update that fails before its snapshot stores nothing", ctx do
+      update = Task.async(fn -> App.update(ctx.slug, backup: true) end)
+      answer(:pull, {:error, :unreachable})
+
+      assert {:error, {:pull, :unreachable}} = Task.await(update)
+      assert Vagus.Backups.list() == []
+      assert File.ls!(Path.join(ctx.dir, ".staging")) == []
     end
   end
 

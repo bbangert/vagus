@@ -34,6 +34,11 @@ defmodule Vagus.Addon.Backend do
   @doc "Stop a running add-on (`opts[:timeout]` seconds). Idempotent."
   @callback stop(id(), keyword()) :: :ok | {:error, term()}
 
+  @doc "Freezes a running add-on's processes, so its files hold still while they are read."
+  @callback pause(id(), keyword()) :: :ok | {:error, term()}
+
+  @callback unpause(id(), keyword()) :: :ok | {:error, term()}
+
   @doc "Remove an add-on's container/instance. Idempotent (missing is `:ok`)."
   @callback remove(id(), keyword()) :: :ok | {:error, term()}
 

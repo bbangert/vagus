@@ -59,6 +59,13 @@ defmodule Vagus.Addon.Backend.Native do
   @impl Vagus.Addon.Backend
   def remove(id, opts \\ []), do: stop(id, opts)
 
+  # A broker in the BEAM has no container to freeze.
+  @impl Vagus.Addon.Backend
+  def pause(_id, _opts \\ []), do: {:error, :not_supported}
+
+  @impl Vagus.Addon.Backend
+  def unpause(_id, _opts \\ []), do: {:error, :not_supported}
+
   @impl true
   # Native add-ons run in-VM; there is no image to reclaim.
   def remove_image(_image, _opts \\ []), do: :ok

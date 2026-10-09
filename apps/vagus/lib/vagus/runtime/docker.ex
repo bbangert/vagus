@@ -150,6 +150,17 @@ defmodule Vagus.Runtime.Docker do
            post_no_content("/containers/#{id}/stop", [204, 304], Keyword.put(opts, :query, query))
   end
 
+  @doc "POST `/containers/{id}/pause`: freezes every process in the container."
+  @spec pause_container(String.t(), keyword()) :: :ok | {:error, term()}
+  def pause_container(id, opts \\ []) do
+    with :ok <- ensure_ref(id), do: post_no_content("/containers/#{id}/pause", [204], opts)
+  end
+
+  @spec unpause_container(String.t(), keyword()) :: :ok | {:error, term()}
+  def unpause_container(id, opts \\ []) do
+    with :ok <- ensure_ref(id), do: post_no_content("/containers/#{id}/unpause", [204], opts)
+  end
+
   @doc "POST `/containers/{id}/restart` (`opts[:timeout]` seconds)."
   @spec restart_container(String.t(), keyword()) :: :ok | {:error, term()}
   def restart_container(id, opts \\ []) do

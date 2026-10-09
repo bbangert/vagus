@@ -69,8 +69,10 @@ defmodule Vagus.Backup do
 
   @doc """
   Builds an unprotected partial backup tar for `spec`
-  (`%{slug, name, addons: [addon_spec], supervisor_version}`). `opts[:date]`
-  overrides the ISO8601 timestamp (for tests). Returns `{:ok, tar_binary}`.
+  (`%{slug, name, addons: [addon_spec | %{slug, inner: path}], supervisor_version}`):
+  an app given as `inner:` is the `<slug>.tar.gz` its own snapshot already
+  wrote. `opts[:date]` overrides the ISO8601 timestamp (for tests). Returns
+  `{:ok, tar_binary}`.
   """
   @spec create(map(), keyword()) :: {:ok, binary()} | {:error, term()}
   def create(spec, opts \\ []) do
@@ -217,8 +219,8 @@ defmodule Vagus.Backup do
 
   defp build_addon_members(addons) do
     Enum.reduce_while(addons, {:ok, [], []}, fn addon, {:ok, members, meta} ->
-      case build_addon_tar(addon) do
-        {:ok, gz, size} ->
+      case inner_tar(addon) do
+        {:ok, addon, gz, size} ->
           member = {"./#{addon.slug}.tar.gz", gz}
 
           m = %{
@@ -237,6 +239,29 @@ defmodule Vagus.Backup do
           {:halt, {:error, reason}}
       end
     end)
+  end
+
+  # Only `addon.json` is inflated into memory: erl_tar streams a gzip file and
+  # skips the members it is not asked for.
+  # path is internal/config-derived, not request input
+  # sobelow_skip ["Traversal.FileModule"]
+  defp inner_tar(%{inner: path, slug: slug} = addon) do
+    with {:ok, gz} <- File.read(path),
+         {:ok, [{_name, json}]} <-
+           :erl_tar.extract(String.to_charlist(path), [
+             :compressed,
+             :memory,
+             {:files, [~c"./addon.json"]}
+           ]),
+         {:ok, %{"version" => version, "system" => %{"name" => name}}} <- Jason.decode(json) do
+      {:ok, Map.merge(addon, %{name: name, version: version}), gz, byte_size(gz)}
+    else
+      other -> {:error, {:inner_tar, slug, other}}
+    end
+  end
+
+  defp inner_tar(addon) do
+    with {:ok, gz, size} <- build_addon_tar(addon), do: {:ok, addon, gz, size}
   end
 
   @doc false

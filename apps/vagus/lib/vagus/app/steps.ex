@@ -15,7 +15,7 @@ defmodule Vagus.App.Steps do
   require Logger
 
   alias Vagus.Addon.Backend.{Native, Spec}
-  alias Vagus.Addon.{Config, Devices, OptionsSchema, Ports}
+  alias Vagus.Addon.{Config, Devices, OptionsSchema, Ports, Store}
   alias Vagus.DSP
   alias Vagus.Ingress.Panels
   alias Vagus.Network
@@ -127,22 +127,34 @@ defmodule Vagus.App.Steps do
   # path is internal/config-derived, not request input
   # sobelow_skip ["Traversal.FileModule"]
   defp step(:snapshot, %{config: config, staging_dir: dir} = input) do
+    opts = opts(input)
+
     addon = %{
       slug: config.slug,
       name: config.name,
       version: config.version,
-      data_dir: data_dir(data_root(opts(input)), config.slug),
+      data_dir: data_dir(data_root(opts), config.slug),
       user: %{"options" => input[:user_options] || %{}, "version" => config.version},
-      system: input[:system] || %{},
+      system: system_map(config),
       state: input[:state] || "stopped"
     }
 
     path = Path.join(dir, "#{config.slug}.tar.gz")
+    tar = fn -> Vagus.Backup.addon_tar(addon) end
 
-    with {:ok, gz, _size} <- Vagus.Backup.addon_tar(addon),
+    with {:ok, gz, _size} <- if(input[:pause], do: frozen(config, opts, tar), else: tar.()),
          :ok <- File.mkdir_p(dir),
          :ok <- File.write(path, gz) do
       {:ok, path}
+    end
+  end
+
+  defp step(:unpause, %{config: config} = input) do
+    opts = opts(input)
+
+    case backend(opts).unpause(container_name(config.slug), opts) do
+      :ok -> {:ok, :ok}
+      {:error, reason} -> {:error, reason}
     end
   end
 
@@ -177,6 +189,57 @@ defmodule Vagus.App.Steps do
     case remove_data_dir(config.slug, opts) do
       :ok -> {:ok, :ok}
       {:error, reason} -> {:error, reason}
+    end
+  end
+
+  # The walk lstats each entry and then reads it; frozen, nothing in the
+  # container can swap a file for a symlink in between. A failed unpause does
+  # not fail the snapshot: the tar is whole, and failing it would not thaw the
+  # container either.
+  defp frozen(config, opts, tar) do
+    id = container_name(config.slug)
+
+    case backend(opts).pause(id, opts) do
+      :ok ->
+        try do
+          tar.()
+        after
+          with {:error, reason} <- backend(opts).unpause(id, opts),
+               do: Logger.error("Vagus.App.Steps: unpause #{id} failed: #{inspect(reason)}")
+        end
+
+      {:error, reason} ->
+        {:error, {:pause, reason}}
+    end
+  end
+
+  # `addon.json`'s `system` block. A restoring HAOS validates it against
+  # `SCHEMA_APP_SYSTEM` (the app config schema plus a required `repository`)
+  # and uses it to find the image of an app the target lacks. Only keys whose
+  # parsed shape is the wire shape are emitted: upstream defaults an absent
+  # optional key, where a wrong shape fails the schema.
+  defp system_map(config) do
+    system = %{
+      "name" => config.name,
+      "version" => config.version,
+      "slug" => config.slug,
+      "description" => config.description,
+      "arch" => config.arch,
+      "startup" => config.startup,
+      "boot" => config.boot,
+      "init" => config.init,
+      "repository" => repository_of(config.slug)
+    }
+
+    if config.image, do: Map.put(system, "image", config.image), else: system
+  end
+
+  # An app no longer in any repository falls back to `"core"`, which the info
+  # payload already claims for every installed app.
+  defp repository_of(slug) do
+    case Store.get(slug) do
+      {:ok, %{repository: repository}} when is_binary(repository) -> repository
+      _absent_or_unshaped -> "core"
     end
   end
 

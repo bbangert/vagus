@@ -19,6 +19,16 @@ defmodule Vagus.BackupsTest do
   @backend Backend.Fake
 
   setup do
+    prev_backend = Application.fetch_env(:vagus, :addon_backend)
+    Application.put_env(:vagus, :addon_backend, @backend)
+
+    on_exit(fn ->
+      case prev_backend do
+        {:ok, backend} -> Application.put_env(:vagus, :addon_backend, backend)
+        :error -> Application.delete_env(:vagus, :addon_backend)
+      end
+    end)
+
     data_root = Path.join(System.tmp_dir!(), "vagus-bk-#{System.unique_integer([:positive])}")
     backup_dir = Path.join(data_root, "backup")
     server = :"backups_test_#{System.unique_integer([:positive])}"
@@ -89,6 +99,7 @@ defmodule Vagus.BackupsTest do
   describe "create_partial/3" do
     test "an installed hot add-on: tar written + indexed, content lists the add-on", %{
       data_root: dr,
+      backup_dir: backup_dir,
       server: server
     } do
       slug = "core_hot"
@@ -104,8 +115,9 @@ defmodule Vagus.BackupsTest do
 
       assert {:ok, %{backup: b, path: path}} = Backups.get(backup_slug, server)
       assert b["name"] =~ "Partial backup"
-      assert Enum.any?(b["addons"], &(&1["slug"] == slug))
+      assert [%{"slug" => ^slug, "name" => "Test Addon", "version" => "1.0"}] = b["addons"]
       assert File.exists?(path)
+      assert File.ls!(Path.join(backup_dir, ".staging")) == []
 
       {:ok, tar} = File.read(path)
       {:ok, %{addon: addon, data: files}} = Vagus.Backup.extract_addon(tar, slug)
@@ -123,7 +135,28 @@ defmodule Vagus.BackupsTest do
       assert Backups.list(server) == []
     end
 
-    test "a cold-mode add-on is stopped before the snapshot and restarted after", %{
+    test "a hot add-on runs its hooks outside a pause that spans the tar", %{
+      data_root: dr,
+      server: server
+    } do
+      slug = "core_hot_hooks"
+      install(slug, dr, :started, %{}, %{"backup_pre" => "dump", "backup_post" => "undump"})
+      :ok = @backend.reset_calls()
+
+      assert {:ok, _backup_slug} =
+               Backups.create_partial(nil, [slug],
+                 server: server,
+                 data_root: dr,
+                 docker: @backend
+               )
+
+      id = "addon_" <> slug
+
+      assert @backend.calls_for(id) ==
+               [{:exec, id, "dump"}, {:pause, id}, {:unpause, id}, {:exec, id, "undump"}]
+    end
+
+    test "a cold add-on is stopped and started again by its own backup", %{
       data_root: dr,
       server: server
     } do
@@ -133,20 +166,21 @@ defmodule Vagus.BackupsTest do
 
       :ok = @backend.reset_calls()
 
-      assert {:ok, _backup_slug} =
-               Backups.create_partial(nil, [slug],
-                 server: server,
-                 data_root: dr,
-                 backend: @backend
-               )
+      assert {:ok, backup_slug} =
+               Backups.create_partial(nil, [slug], server: server, data_root: dr)
 
-      calls = @backend.calls()
-      assert Enum.any?(calls, &match?({:stop, "addon_" <> ^slug}, &1))
-      assert Enum.any?(calls, &match?({:start, _}, &1))
+      ops = Enum.map(@backend.calls_for("addon_" <> slug), &elem(&1, 0))
+      assert [:stop, :remove | started] = ops
+      assert :start in started
+      refute :pause in ops
       assert {:ok, %{state: :started}} = app_info(slug)
+
+      {:ok, %{path: path}} = Backups.get(backup_slug, server)
+      {:ok, %{addon: addon}} = Vagus.Backup.extract_addon_file(path, slug)
+      assert addon["state"] == "started"
     end
 
-    test "a stopped add-on is snapshotted as-is (no stop/start either way)", %{
+    test "a stopped cold add-on is snapshotted and left stopped", %{
       data_root: dr,
       server: server
     } do
@@ -160,14 +194,111 @@ defmodule Vagus.BackupsTest do
                Backups.create_partial(nil, [slug],
                  server: server,
                  data_root: dr,
-                 backend: @backend
+                 backend: __MODULE__.ExitedBackend
                )
 
-      assert @backend.calls() == []
+      refute Enum.any?(@backend.calls(), &match?({op, _} when op in [:create, :start], &1))
+      assert {:ok, %{state: :stopped}} = app_info(slug)
       {:ok, %{path: path}} = Backups.get(backup_slug, server)
       {:ok, tar} = File.read(path)
       {:ok, %{addon: addon}} = Vagus.Backup.extract_addon(tar, slug)
       assert addon["state"] == "stopped"
+    end
+
+    test "a busy app fails the whole backup by name; the app before it is running again", %{
+      data_root: dr,
+      backup_dir: backup_dir,
+      server: server
+    } do
+      cold = "core_busy_cold"
+      busy = "core_busy_busy"
+      install(cold, dr, :started, %{}, %{"backup" => "cold"})
+      install(busy, dr, :started)
+      stub_app_steps()
+
+      stopping = Task.async(fn -> Vagus.App.stop(busy) end)
+      assert_receive {:step, :stop, %{slug: ^busy}, held}, 5_000
+
+      backup =
+        Task.async(fn ->
+          Backups.create_partial(nil, [cold, busy], server: server, data_root: dr)
+        end)
+
+      assert_receive {:step, :stop, %{slug: ^cold}, task}, 5_000
+      send(task, {:outcome, {:ok, %{was_running: true}}})
+      assert_receive {:step, :snapshot, %{slug: ^cold, staging_dir: staging}, task}, 5_000
+      send(task, {:outcome, {:ok, Path.join(staging, cold <> ".tar.gz")}})
+      assert_receive {:step, :start, %{slug: ^cold}, task}, 5_000
+      send(task, {:outcome, {:ok, %{container_id: "c2"}}})
+
+      assert {:error, {:busy, ^busy}} = Task.await(backup)
+      assert {:ok, %{state: :started}} = app_info(cold)
+      assert Backups.list(server) == []
+      assert File.ls!(Path.join(backup_dir, ".staging")) == []
+
+      send(held, {:outcome, {:ok, %{was_running: true}}})
+      assert :ok = Task.await(stopping)
+    end
+
+    # The op's reply to a dead caller is its last act, so it is the one
+    # barrier the test can wait on from the app process itself.
+    defp notify_reply_to(slug, caller) do
+      [{app, _value}] = Registry.lookup(Vagus.App.Directory, {:slug, slug})
+      test = self()
+
+      :sys.install(
+        app,
+        {fn
+           :watching, {:out, reply, {^caller, _tag}}, _name ->
+             send(test, {:replied, reply})
+             :done
+
+           :watching, _event, _name ->
+             :watching
+         end, :watching}
+      )
+    end
+
+    test "a backup caller killed mid-tar leaves the cold app started by its own op", %{
+      data_root: dr,
+      server: server
+    } do
+      slug = "core_orphaned"
+      install(slug, dr, :started, %{}, %{"backup" => "cold"})
+      stub_app_steps()
+
+      {caller, ref} =
+        spawn_monitor(fn ->
+          Backups.create_partial(nil, [slug], server: server, data_root: dr)
+        end)
+
+      assert_receive {:step, :stop, %{slug: ^slug}, task}, 5_000
+      send(task, {:outcome, {:ok, %{was_running: true}}})
+      assert_receive {:step, :snapshot, %{slug: ^slug}, task}, 5_000
+      notify_reply_to(slug, caller)
+
+      Process.exit(caller, :kill)
+      assert_receive {:DOWN, ^ref, :process, ^caller, :killed}
+
+      send(task, {:outcome, {:ok, "/gone/#{slug}.tar.gz"}})
+      assert_receive {:step, :start, %{slug: ^slug}, task}, 5_000
+      send(task, {:outcome, {:ok, %{container_id: "c2"}}})
+
+      assert_receive {:replied, {:ok, "/gone/core_orphaned.tar.gz"}}, 5_000
+      assert {:ok, %{state: :started}} = app_info(slug)
+    end
+
+    test "staging a crashed VM left behind is cleared when the store starts", %{
+      backup_dir: backup_dir
+    } do
+      leftover = Path.join([backup_dir, ".staging", "deadbeef"])
+      File.mkdir_p!(leftover)
+      File.write!(Path.join(leftover, "core_x.tar.gz"), "partial")
+
+      {:ok, _pid} = Backups.start_link(name: :backups_test_restart, dir: backup_dir)
+      on_exit(fn -> if pid = Process.whereis(:backups_test_restart), do: GenServer.stop(pid) end)
+
+      refute File.exists?(Path.join(backup_dir, ".staging"))
     end
   end
 
@@ -431,5 +562,18 @@ defmodule Vagus.BackupsTest do
       assert :error = Backups.get(backup_slug, server)
       assert :error = Backups.delete(backup_slug, server)
     end
+  end
+
+  defmodule ExitedBackend do
+    @moduledoc false
+    # The fake backend, with no container running, as an engine reports a stopped app.
+    alias Vagus.Addon.Backend.Fake
+
+    defdelegate pull(spec), to: Fake
+    defdelegate create(spec), to: Fake
+    defdelegate start(id), to: Fake
+    defdelegate stop(id, opts), to: Fake
+    defdelegate remove(id, opts), to: Fake
+    def state(_id), do: {:ok, :stopped}
   end
 end

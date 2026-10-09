@@ -3326,6 +3326,11 @@ defmodule Vagus.API.Router do
   defp backup_new_error_message({:not_installed, addon_slug}),
     do: "Addon #{addon_slug} is not installed"
 
+  defp backup_new_error_message({:busy, addon_slug}), do: busy_message(addon_slug)
+
+  defp backup_new_error_message({:backup_failed, addon_slug, reason}),
+    do: "Backup of addon #{addon_slug} failed: #{inspect(reason)}"
+
   defp backup_new_error_message(reason), do: inspect(reason)
 
   defp handle_backup_restore(conn, slug, params) do

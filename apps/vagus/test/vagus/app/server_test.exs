@@ -726,6 +726,18 @@ defmodule Vagus.App.ServerTest do
       assert [{^pa, ^a}] = lookup({:ingress_port, 62_011})
     end
 
+    test "a hot snapshot killed at its deadline is followed by an unpause of the container" do
+      app_deadlines(%{snapshot: 100})
+      {slug, pid} = started()
+      t = op(pid, {:backup, %{staging_dir: "/nonexistent"}})
+      {_input, task} = step(:snapshot)
+      ref = Process.monitor(task)
+
+      assert_receive {:DOWN, ^ref, :process, ^task, :killed}, 1_000
+      assert %{config: %{slug: ^slug}} = answer(:unpause, {:ok, :ok})
+      assert {:error, :timeout} = Task.await(t)
+    end
+
     test "a container event during an operation is handled once, after it" do
       {slug, pid} = started(%{}, watchdog: true)
       t = op(pid, {:backup, %{staging_dir: "/nonexistent"}})
@@ -780,6 +792,20 @@ defmodule Vagus.App.ServerTest do
 
       assert {:ok, %{config: %{version: "2"}, user_options: %{"greeting" => "new"}}} =
                App.info(slug)
+    end
+
+    test "a backup is snapshotted into the caller's staging dir between the stop and the start" do
+      {slug, pid} = started(@v1)
+      t = op(pid, {:update, %{config: target(slug), backup: true, staging_dir: "/s"}})
+      answer(:pull, {:ok, "x/y:2"})
+      answer(:stop, {:ok, %{was_running: true}})
+
+      assert %{staging_dir: "/s", state: "started", pause: false, config: %{version: "1"}} =
+               answer(:snapshot, {:ok, "/s/#{slug}.tar.gz"})
+
+      answer(:start, {:ok, @started})
+      answer(:reclaim_image, {:ok, :ok})
+      assert {:ok, %{from: "1", to: "2"}} = Task.await(t)
     end
 
     test "a start that fails on the new version rolls back to the old one" do

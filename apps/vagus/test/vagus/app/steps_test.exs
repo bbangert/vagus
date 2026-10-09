@@ -375,7 +375,11 @@ defmodule Vagus.App.StepsTest do
 
   setup context do
     :persistent_term.put({FakeBackend, :pid}, self())
-    on_exit(fn -> :persistent_term.erase({FakeBackend, :state}) end)
+
+    on_exit(fn ->
+      for key <- [:state, :pause, :unpause], do: :persistent_term.erase({FakeBackend, key})
+    end)
+
     data_root = Path.join(context[:tmp_dir] || System.tmp_dir!(), "data")
     %{data_root: data_root}
   end
@@ -678,6 +682,83 @@ defmodule Vagus.App.StepsTest do
       assert %{"state" => "started", "user" => %{"options" => %{"greeting" => "yo"}}} =
                Jason.decode!(entries["./addon.json"])
     end
+
+    defp members(path) do
+      {:ok, entries} = :erl_tar.extract(String.to_charlist(path), [:memory, :compressed])
+      Map.new(entries, fn {name, bin} -> {to_string(name), bin} end)
+    end
+
+    defp snapshot_input(ctx, extra) do
+      input(ctx, Map.merge(%{staging_dir: Path.join(ctx.tmp_dir, "staging")}, extra))
+    end
+
+    # What the container writes is seen by the tar only as it stood at the pause.
+    test "a running container is paused for the tar and unpaused after it", ctx do
+      data_dir = Path.join([ctx.data_root, "addons", "data", "test_app"])
+      File.mkdir_p!(data_dir)
+      marker = Path.join(data_dir, "marker")
+      :persistent_term.put({FakeBackend, :pause}, fn -> File.write(marker, "frozen") end)
+      :persistent_term.put({FakeBackend, :unpause}, fn -> File.write(marker, "thawed") end)
+
+      assert {:ok, path} = Steps.run(:snapshot, snapshot_input(ctx, %{pause: true}))
+
+      assert members(path)["./data/marker"] == "frozen"
+      assert File.read!(marker) == "thawed"
+      assert_received {:pause, "addon_test_app"}
+      assert_received {:unpause, "addon_test_app"}
+    end
+
+    test "a stopped or native app is not paused", ctx do
+      assert {:ok, _path} = Steps.run(:snapshot, snapshot_input(ctx, %{pause: false}))
+      refute_received {:pause, _id}
+    end
+
+    test "a failed pause fails the snapshot and writes nothing", ctx do
+      :persistent_term.put({FakeBackend, :pause}, fn -> {:error, {:http, 409}} end)
+      staging = Path.join(ctx.tmp_dir, "staging")
+
+      assert {:error, {:pause, {:http, 409}}} =
+               Steps.run(:snapshot, snapshot_input(ctx, %{pause: true}))
+
+      refute File.exists?(Path.join(staging, "test_app.tar.gz"))
+      refute_received {:unpause, _id}
+    end
+
+    test "the container is unpaused when the tar fails", ctx do
+      # Options that cannot be encoded make `addon.json`, and so the tar, fail.
+      input = snapshot_input(ctx, %{pause: true, user_options: %{"bad" => {:not, :json}}})
+
+      assert {:error, {:addon_tar, "test_app", _message}} = Steps.run(:snapshot, input)
+      assert_received {:unpause, "addon_test_app"}
+    end
+
+    test "a failed unpause is logged and the snapshot still stands", ctx do
+      :persistent_term.put({FakeBackend, :unpause}, fn -> {:error, :engine_gone} end)
+
+      log =
+        capture_log(fn ->
+          assert {:ok, path} = Steps.run(:snapshot, snapshot_input(ctx, %{pause: true}))
+          assert File.regular?(path)
+        end)
+
+      assert log =~ "unpause addon_test_app failed: :engine_gone"
+    end
+
+    test "unpause thaws the app's container", ctx do
+      assert {:ok, :ok} = Steps.run(:unpause, input(ctx))
+      assert_received {:unpause, "addon_test_app"}
+
+      :persistent_term.put({FakeBackend, :unpause}, fn -> {:error, {:http, 409}} end)
+      assert {:error, {:http, 409}} = Steps.run(:unpause, input(ctx))
+    end
+
+    test "addon.json's system block carries the restore-required keys", ctx do
+      assert {:ok, path} = Steps.run(:snapshot, snapshot_input(ctx, %{}))
+      system = Jason.decode!(members(path)["./addon.json"])["system"]
+
+      assert %{"slug" => "test_app", "repository" => "core", "arch" => [_ | _]} = system
+      assert Map.has_key?(system, "name") and Map.has_key?(system, "version")
+    end
   end
 
   describe "reclaim_image" do
@@ -797,6 +878,20 @@ defmodule Vagus.App.StepsTest do
 
     @impl true
     def state(_id), do: :persistent_term.get({__MODULE__, :state}, {:ok, :running})
+
+    # A test sets `{FakeBackend, :pause}` to a function run at the call,
+    # whose result is the call's.
+    @impl true
+    def pause(id, _opts \\ []) do
+      notify({:pause, id})
+      :persistent_term.get({__MODULE__, :pause}, fn -> :ok end).()
+    end
+
+    @impl true
+    def unpause(id, _opts \\ []) do
+      notify({:unpause, id})
+      :persistent_term.get({__MODULE__, :unpause}, fn -> :ok end).()
+    end
   end
 
   defmodule RefusingBackend do

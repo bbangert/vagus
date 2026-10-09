@@ -46,6 +46,12 @@ defmodule Vagus.Addon.Backend.Container do
   def remove(id, opts \\ []), do: Docker.remove_container(id, opts)
 
   @impl true
+  def pause(id, opts \\ []), do: Docker.pause_container(id, opts)
+
+  @impl true
+  def unpause(id, opts \\ []), do: Docker.unpause_container(id, opts)
+
+  @impl true
   def remove_image(image, opts \\ []), do: Docker.remove_image(image, opts)
 
   @impl true

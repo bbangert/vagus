@@ -19,6 +19,7 @@ defmodule Vagus.API.BackupRouterTest do
 
   import Vagus.AppFixtures
 
+  alias Vagus.Addon.Backend.Fake
   alias Vagus.Addon.Config
   alias Vagus.Backups
 
@@ -53,9 +54,9 @@ defmodule Vagus.API.BackupRouterTest do
     %{data_root: data_root}
   end
 
-  defp fixture_config(slug) do
+  defp fixture_config(slug, overrides \\ %{}) do
     {:ok, config} =
-      Config.parse(%{
+      %{
         "name" => "Test Addon",
         "version" => "1.0",
         "slug" => slug,
@@ -63,13 +64,15 @@ defmodule Vagus.API.BackupRouterTest do
         "arch" => ["amd64"],
         "image" => "homeassistant/{arch}-addon-test",
         "host_network" => true
-      })
+      }
+      |> Map.merge(overrides)
+      |> Config.parse()
 
     config
   end
 
-  defp install(slug, data_root, state \\ :started) do
-    config = fixture_config(slug)
+  defp install(slug, data_root, state \\ :started, overrides \\ %{}) do
+    config = fixture_config(slug, overrides)
     install_app(config, state: state)
 
     data_dir = Path.join([data_root, "addons", "data", slug])
@@ -250,6 +253,44 @@ defmodule Vagus.API.BackupRouterTest do
       assert conn.status == 400
       assert body(conn)["message"] =~ "ghost"
       assert Backups.list() == []
+    end
+
+    test "a cold app is stopped and started again by its own op; a hot one is paused", %{
+      data_root: dr
+    } do
+      install("core_rt_cold", dr, :started, %{"backup" => "cold"})
+      install("core_rt_hot", dr)
+      Fake.reset_calls()
+
+      conn =
+        supervisor_call(:post, "/backups/new/partial", %{
+          "addons" => ["core_rt_cold", "core_rt_hot"]
+        })
+
+      assert conn.status == 200, conn.resp_body
+      cold = Enum.map(Fake.calls_for("addon_core_rt_cold"), &elem(&1, 0))
+      assert [:stop, :remove | started] = cold
+      assert :start in started
+      assert {:ok, %{state: :started}} = app_info("core_rt_cold")
+
+      assert Fake.calls_for("addon_core_rt_hot") ==
+               [{:pause, "addon_core_rt_hot"}, {:unpause, "addon_core_rt_hot"}]
+    end
+
+    test "a busy app fails the backup with upstream's busy text naming it", %{data_root: dr} do
+      install("core_rt_busy", dr)
+      stub_app_steps()
+      stopping = Task.async(fn -> Vagus.App.stop("core_rt_busy") end)
+      assert_receive {:step, :stop, _input, held}, 5_000
+
+      conn = supervisor_call(:post, "/backups/new/partial", %{"addons" => ["core_rt_busy"]})
+
+      assert conn.status == 400
+      assert body(conn)["message"] == "Another job is running for job group app_core_rt_busy"
+      assert Backups.list() == []
+
+      send(held, {:outcome, {:ok, %{was_running: true}}})
+      assert :ok = Task.await(stopping)
     end
 
     test "addons: \"ALL\" resolves to every installed slug", %{data_root: dr} do

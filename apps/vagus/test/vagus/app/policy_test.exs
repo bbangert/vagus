@@ -769,6 +769,19 @@ defmodule Vagus.App.PolicyTest do
       assert effects == [:persist, {:reply, {:error, :enospc}}, :idle]
     end
 
+    test "backup hot: a snapshot killed at its deadline thaws the container, then runs the post hook" do
+      hooks = app_config(%{"backup_post" => "post"})
+      {data, [{:step, {:snapshot, nil}}]} = begin(:backup, %{}, running(%{config: hooks}))
+      {data, [{:step, {:unpause, nil}}]} = step(data, {:error, :timeout})
+      {data, [{:step, {:exec_hook, :post}}]} = step(data, {:error, {:http, 409}})
+      {_data, effects} = step(data, {:ok, :ok})
+      assert effects == [:persist, {:reply, {:error, :timeout}}, :idle]
+
+      {data, _} = begin(:backup, %{}, app(%{config: hooks}))
+      {_data, effects} = step(data, {:error, :timeout})
+      assert effects == [:persist, {:reply, {:error, :timeout}}, :idle]
+    end
+
     test "backup hot: a failed pre hook ends it before the snapshot" do
       hooks = app_config(%{"backup_pre" => "pre", "backup_post" => "post"})
       {data, _} = begin(:backup, %{}, running(%{config: hooks}))
@@ -786,6 +799,19 @@ defmodule Vagus.App.PolicyTest do
       {data, effects} = step(data, {:ok, %{container_id: "c2", ip: @ip}})
       assert Enum.take(effects, -3) == [:persist, {:reply, {:error, :enospc}}, :idle]
       assert data.wanted == :started
+    end
+
+    test "backup cold of a crashed app that should run starts it, so its cancelled restart is not lost" do
+      cold = app(%{config: app_config(%{"backup" => "cold"}), last_event: {:exited, 1}})
+      {data, effects} = begin(:backup, %{staging_dir: "/s"}, cold)
+      assert {:cancel, :retry} in effects
+      {data, _} = step(data, {:ok, %{was_running: false}})
+      assert Policy.task_input({:snapshot, nil}, data).state == "started"
+
+      {data, effects} = step(data, {:ok, "/s/app_one.tar.gz"})
+      assert List.last(effects) == {:step, {:start, nil}}
+      {_data, effects} = step(data, {:ok, %{container_id: "c2", ip: @ip}})
+      assert Enum.take(effects, -3) == [:persist, {:reply, {:ok, "/s/app_one.tar.gz"}}, :idle]
     end
 
     test "backup cold of a stopped app does not start it" do
@@ -991,6 +1017,38 @@ defmodule Vagus.App.PolicyTest do
       assert Policy.task_input({:pull, nil}, data).config.version == "2"
     end
 
+    test "a hot snapshot of a running container pauses it; cold, stopped and native do not" do
+      opts = %{"o" => 1}
+      hot = running(%{user_options: opts})
+      {data, [{:step, {:snapshot, nil}}]} = begin(:backup, %{staging_dir: "/s"}, hot)
+
+      assert %{staging_dir: "/s", user_options: ^opts, state: "started", pause: true} =
+               Policy.task_input({:snapshot, nil}, data)
+
+      cold = running(%{config: app_config(%{"backup" => "cold"})})
+      {data, _} = begin(:backup, %{staging_dir: "/s"}, cold)
+      {data, effects} = step(data, {:ok, %{was_running: true}})
+      assert List.last(effects) == {:step, {:snapshot, nil}}
+      assert %{state: "started", pause: false} = Policy.task_input({:snapshot, nil}, data)
+
+      {data, _} = begin(:backup, %{staging_dir: "/s"}, app())
+      assert %{state: "stopped", pause: false} = Policy.task_input({:snapshot, nil}, data)
+
+      {data, _} = begin(:backup, %{staging_dir: "/s"}, running(%{config: native_config()}))
+      assert %{state: "started", pause: false} = Policy.task_input({:snapshot, nil}, data)
+    end
+
+    test "an update's snapshot takes the staging dir and the state before the stop" do
+      args = %{config: app_config(%{"version" => "2"}), backup: true, staging_dir: "/s"}
+      {data, _} = begin(:update, args, running())
+      {data, _} = step(data, {:ok, "img"})
+      {data, effects} = step(data, {:ok, %{was_running: true}})
+      assert List.last(effects) == {:step, {:snapshot, nil}}
+
+      assert %{staging_dir: "/s", state: "started", pause: false} =
+               Policy.task_input({:snapshot, nil}, data)
+    end
+
     test "every task step has a deadline" do
       for name <- [
             :pull,
@@ -1000,6 +1058,7 @@ defmodule Vagus.App.PolicyTest do
             :halt_stop,
             :snapshot,
             :exec_hook,
+            :unpause,
             :remove_app,
             :reclaim_image
           ],

@@ -123,13 +123,14 @@ defmodule Vagus.App.Policy do
     halt_stop: 40_000,
     snapshot: 600_000,
     exec_hook: 120_000,
+    unpause: 30_000,
     remove_app: 120_000,
     reclaim_image: 60_000
   }
 
-  # A caller's backend, data root, engine socket and jobs server reach every
-  # task step.
-  @engine_overrides [:backend, :data_root, :socket, :jobs_server]
+  # A caller's backend, engine client, data root, engine socket and jobs
+  # server reach every task step.
+  @engine_overrides [:backend, :docker, :data_root, :socket, :jobs_server]
 
   @persisted ~w(config wanted user_options ingress_token ingress_port ingress_panel watchdog ports
                  boot auto_update protected)a
@@ -714,7 +715,10 @@ defmodule Vagus.App.Policy do
     end
   end
 
-  defp on_outcome(_op, :stop, nil, {:ok, %{was_running: was_running}}, data) do
+  # A backup's stop cancels the restart a crashed app was waiting for, so one
+  # that should run is started again like one that ran.
+  defp on_outcome(op, :stop, nil, {:ok, %{was_running: was_running}}, data) do
+    was_running = was_running or (op == :backup and data.wanted == :started)
     data = put_acc(%{release(data) | last_event: :stopped}, :was_running, was_running)
     advance(data, [])
   end
@@ -728,8 +732,19 @@ defmodule Vagus.App.Policy do
     advance(put_steps(data, [{:start?, nil}]), [])
   end
 
+  # A snapshot killed while it held the container paused never ran its own
+  # unpause, so the app is thawed before the op goes on.
+  defp on_outcome(:backup, :snapshot, _, {:error, reason} = result, data)
+       when reason in [:died, :timeout] do
+    data = put_acc(data, :result, result)
+    steps = if pause?(data), do: [{:unpause, nil} | data.run.steps], else: data.run.steps
+    advance(put_steps(data, steps), [])
+  end
+
   defp on_outcome(:backup, :snapshot, _, {status, _} = result, data) when status in [:ok, :error],
     do: advance(put_acc(data, :result, result), [])
+
+  defp on_outcome(:backup, :unpause, _, _outcome, data), do: advance(data, [])
 
   defp on_outcome(:backup, :exec_hook, :pre, {:ok, _}, data), do: advance(data, [])
 
@@ -857,9 +872,9 @@ defmodule Vagus.App.Policy do
 
     %{
       staging_dir: run.args[:staging_dir],
-      system: run.args[:system] || %{},
       user_options: data.user_options,
-      state: state
+      state: state,
+      pause: pause?(data)
     }
   end
 
@@ -867,6 +882,10 @@ defmodule Vagus.App.Policy do
   defp input(:exec_hook, :post, data), do: %{cmd: data.config.backup_post}
   defp input(:reclaim_image, _arg, data), do: %{old: data.run.acc.old}
   defp input(_name, _arg, _data), do: %{}
+
+  # A container still running at the snapshot is a hot backup's, paused
+  # around the tar. A cold one was stopped by the step before.
+  defp pause?(data), do: running?(data) and not Steps.native?(data.config)
 
   # Coarse waypoints for the update job's progress bar.
   defp stage(:update, :pull), do: {"pull_image", 20}

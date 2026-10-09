@@ -20,7 +20,7 @@ defmodule Vagus.App do
 
   # The only options that mean anything to an operation from a backup; the
   # rest of `Vagus.Backups`' opts (`:server`, `:date`, `:extra`) are its own.
-  @backup_opts [:backend, :data_root, :socket]
+  @backup_opts [:backend, :docker, :data_root, :socket]
 
   @type entry :: map()
   @type update_result :: %{slug: String.t(), from: String.t(), to: String.t()}
@@ -370,21 +370,61 @@ defmodule Vagus.App do
   def halt(slug), do: command(slug, :halt, %{})
 
   @doc """
-  Updates `slug` to the store's current version. The pre-update backup runs
-  first, while the app is idle, since stopping and starting it for a cold
-  backup are operations of its own.
+  Updates `slug` to the store's current version. With `backup: true` the
+  update op snapshots the stopped app into a backup staged here, kept even
+  when the update then rolls back: it holds the version the user had.
   """
   @spec update(String.t(), keyword()) :: {:ok, update_result()} | {:error, term()}
   def update(slug, opts) do
     with {:ok, installed} <- installed(slug),
          {:ok, target} <- store_target(slug),
          # Only the precheck matters here: whether the target can be applied.
-         %{} <- Policy.plan(:update, %{config: target}, installed),
-         :ok <- maybe_backup(slug, installed, opts) do
-      args =
-        opts |> Keyword.take([:job, :jobs_server, :backend, :data_root, :socket]) |> Map.new()
+         %{} <- Policy.plan(:update, %{config: target}, installed) do
+      report_stage(opts, "validate_options", 5)
 
-      command(slug, :update, Map.put(args, :config, target))
+      args =
+        opts
+        |> Keyword.take([:job, :jobs_server, :backend, :data_root, :socket])
+        |> Map.new()
+        |> Map.put(:config, target)
+
+      if Keyword.get(opts, :backup, false),
+        do: update_with_backup(slug, installed.config.version, args, opts),
+        else: command(slug, :update, args)
+    end
+  end
+
+  defp update_with_backup(slug, version, args, opts) do
+    backups = Application.get_env(:vagus, :backups_module, Vagus.Backups)
+
+    case backups.begin_partial("addon_#{slug}_#{version}", Keyword.take(opts, [:server])) do
+      {:ok, handle} ->
+        args = Map.merge(args, %{backup: true, staging_dir: handle.staging_dir})
+        result = command(slug, :update, args)
+        keep_backup(backups, handle, slug, result)
+        result
+
+      {:error, reason} ->
+        {:error, {:backup_failed, reason}}
+    end
+  end
+
+  # A failed snapshot may have staged part of a file. An update that failed
+  # before its snapshot staged nothing, which `finish_partial` reports as
+  # `:not_staged`.
+  defp keep_backup(backups, handle, _slug, {:error, {:backup_failed, _reason}}),
+    do: backups.discard_partial(handle)
+
+  defp keep_backup(backups, handle, slug, _result) do
+    case backups.finish_partial(handle, [slug]) do
+      {:ok, _backup_slug} ->
+        :ok
+
+      {:error, {:not_staged, ^slug}} ->
+        :ok
+
+      {:error, reason} ->
+        Logger.error("App #{slug}: the pre-update backup was not stored: #{inspect(reason)}")
     end
   end
 
@@ -404,29 +444,23 @@ defmodule Vagus.App do
     end
   end
 
-  defp maybe_backup(slug, installed, opts) do
-    report_stage(opts, "validate_options", 5)
-
-    if Keyword.get(opts, :backup, false) do
-      report_stage(opts, "backup", 10)
-      name = "addon_#{slug}_#{installed.config.version}"
-      backups = Application.get_env(:vagus, :backups_module, Vagus.Backups)
-
-      case backups.create_partial(name, [slug], Keyword.take(opts, [:server, :data_root])) do
-        {:ok, _backup_slug} -> :ok
-        {:error, reason} -> {:error, {:backup_failed, reason}}
-      end
-    else
-      :ok
-    end
-  end
-
   defp report_stage(opts, stage, progress) do
     Vagus.Jobs.update(
       Keyword.get(opts, :job),
       [stage: stage, progress: progress],
       Keyword.get(opts, :jobs_server, Vagus.Jobs)
     )
+  end
+
+  @doc """
+  Snapshots the app into `<staging_dir>/<slug>.tar.gz` by its own `backup`
+  operation, which stops and starts a cold app itself: a caller that dies
+  mid-backup cannot leave it stopped.
+  """
+  @spec backup(String.t(), Path.t(), keyword()) :: {:ok, Path.t()} | {:error, term()}
+  def backup(slug, staging_dir, opts \\ []) do
+    args = opts |> Keyword.take(@backup_opts) |> Map.new() |> Map.put(:staging_dir, staging_dir)
+    command(slug, :backup, args)
   end
 
   @spec stop_for_backup(String.t(), keyword()) :: :ok | {:error, term()}
@@ -441,10 +475,10 @@ defmodule Vagus.App do
     |> started(slug)
   end
 
-  # The container was stopped or started as asked. A backup ends what it
-  # began, and failing on the unsaved state would strand a cold backup's app
-  # stopped; boot would report a running app as failed. The process has
-  # logged the save.
+  # The container was stopped or started as asked. A restore ends what it
+  # began, and failing on the unsaved state would strand its app stopped;
+  # boot would report a running app as failed. The process has logged the
+  # save.
   defp unsaved_ok({:error, {:persist, _reason}}), do: :ok
   defp unsaved_ok(result), do: result
 
