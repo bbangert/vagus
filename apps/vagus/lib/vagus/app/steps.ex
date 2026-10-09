@@ -162,7 +162,7 @@ defmodule Vagus.App.Steps do
   # failed rename leaves the app's data as it was. The staging dir is a
   # sibling of the data dir, so each rename stays on one filesystem. A failed
   # swap removes the staged data itself, as its caller may be gone; the aside
-  # of one that succeeded is the caller's to remove, outside this deadline.
+  # of one that succeeded goes in `drop_aside`, outside this deadline.
   # The staging path comes from the op's args and is renamed and removed as
   # root, so anything but this app's own restore sibling is refused.
   # path is internal/config-derived, not request input
@@ -182,6 +182,28 @@ defmodule Vagus.App.Steps do
       error ->
         File.rm_rf(staging)
         error
+    end
+  end
+
+  # The op's last step, so the aside is gone before the app is free for an
+  # uninstall: one left behind a removed data dir is what the boot sweep
+  # moves back. The data is already restored, so this never fails the op.
+  # path is internal/config-derived, not request input
+  # sobelow_skip ["Traversal.FileModule"]
+  defp step(:drop_aside, %{config: config, staging_dir: staging} = input) do
+    data_dir = data_dir(data_root(opts(input)), config.slug)
+
+    with :ok <- restore_sibling(staging, data_dir, config.slug),
+         {:ok, _removed} <- File.rm_rf(staging <> ".old") do
+      {:ok, :ok}
+    else
+      error ->
+        Logger.warning(
+          "Vagus.App.Steps: #{config.slug}'s pre-restore data at #{staging}.old was not " <>
+            "removed (#{inspect(error)}); the boot sweep removes it"
+        )
+
+        {:ok, :kept}
     end
   end
 
@@ -255,12 +277,20 @@ defmodule Vagus.App.Steps do
       :ok ->
         tar_thawed(id, opts, tar)
 
+      # An app wanted started but not yet adopted may have no container.
+      {:error, {:http, 404}} ->
+        {tar.(), :ok}
+
       # The engine's 409 is either "not running" or "already paused": a
-      # paused one is frozen all the same, and must still be thawed.
+      # paused one is frozen all the same, and must still be thawed. Only a
+      # state that rules out a pause tars unthawed; anything else fails the
+      # snapshot, so the operation thaws whatever may be paused.
       {:error, {:http, 409}} ->
         case backend(opts).state(id) do
           {:ok, :paused} -> tar_thawed(id, opts, tar)
-          _not_running -> {tar.(), :ok}
+          {:ok, state} when state in [:stopped, :unknown] -> {tar.(), :ok}
+          {:ok, state} -> {{:error, {:pause, {:conflict, state}}}, :ok}
+          {:error, reason} -> {{:error, {:pause, reason}}, :ok}
         end
 
       {:error, reason} ->
@@ -278,13 +308,14 @@ defmodule Vagus.App.Steps do
     tarred -> {tarred, thaw(id, opts)}
   end
 
-  # A 409 is a container that is not paused, which is what was asked.
+  # A 409 is a container that is not paused, and a 404 one that is gone:
+  # either way nothing is frozen, which is what was asked.
   defp thaw(id, opts) do
     case backend(opts).unpause(id, opts) do
       :ok ->
         :ok
 
-      {:error, {:http, 409}} ->
+      {:error, {:http, status}} when status in [404, 409] ->
         :not_paused
 
       {:error, reason} = error ->
@@ -938,14 +969,26 @@ defmodule Vagus.App.Steps do
     ArgumentError -> :error
   end
 
+  # A restore's aside goes first: one that outlived the data dir (its drop
+  # failed, or the restore's start did before it) is what the boot sweep
+  # would move back as the app's only copy.
   # path is internal/config-derived, not request input
   # sobelow_skip ["Traversal.FileModule"]
   defp remove_data_dir(slug, opts) do
     if Config.valid_slug?(slug) do
-      case File.rm_rf(Path.join([data_root(opts), "addons", "data", slug])) do
-        {:ok, _removed} -> :ok
-        {:error, reason, path} -> {:error, {:remove_data_dir, path, reason}}
-      end
+      parent = Path.join([data_root(opts), "addons", "data"])
+
+      asides =
+        for path <- Path.wildcard(Path.join(parent, ".restore-*.old"), match_dot: true),
+            Regex.match?(~r/\A\.restore-#{Regex.escape(slug)}-\d+\.old\z/, Path.basename(path)),
+            do: path
+
+      Enum.reduce_while(asides ++ [Path.join(parent, slug)], :ok, fn path, :ok ->
+        case File.rm_rf(path) do
+          {:ok, _removed} -> {:cont, :ok}
+          {:error, reason, failed} -> {:halt, {:error, {:remove_data_dir, failed, reason}}}
+        end
+      end)
     else
       Logger.warning(
         "Vagus.App.Steps: refusing to rm_rf the data dir for unsafe slug #{inspect(slug)}"

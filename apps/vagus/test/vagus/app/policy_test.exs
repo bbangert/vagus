@@ -451,7 +451,8 @@ defmodule Vagus.App.PolicyTest do
         {:restart, %{}, [{:stop, nil}, {:port?, nil}, {:mint_token, nil}, {:start, nil}]},
         {:uninstall, %{}, [{:stop, nil}, {:delete_file, nil}, {:remove_app, nil}]},
         {:halt, %{}, [{:halt_stop, nil}]},
-        {:restore, %{start?: false}, [{:stop, nil}, {:swap_data, nil}, {:set_options, nil}]},
+        {:restore, %{start?: false},
+         [{:stop, nil}, {:swap_data, nil}, {:set_options, nil}, {:drop_aside, nil}]},
         {:restore, %{start?: true},
          [
            {:stop, nil},
@@ -459,7 +460,8 @@ defmodule Vagus.App.PolicyTest do
            {:set_options, nil},
            {:port?, nil},
            {:mint_token, nil},
-           {:start, nil}
+           {:start, nil},
+           {:drop_aside, nil}
          ]},
         {:update, %{config: app_config(%{"version" => "2"})},
          [{:pull, nil}, {:stop, nil}, {:commit, nil}, {:start?, nil}, {:reclaim_image, nil}]},
@@ -631,8 +633,25 @@ defmodule Vagus.App.PolicyTest do
       assert %{user_options: %{"o" => 2}} = Policy.task_input({:start, nil}, data)
 
       {data, effects} = step(data, {:ok, %{container_id: "c2", ip: @ip}})
-      assert Enum.take(effects, -3) == [:persist, {:reply, :ok}, :idle]
+      assert List.last(effects) == {:step, {:drop_aside, nil}}
+      assert %{staging_dir: "/s"} = Policy.task_input({:drop_aside, nil}, data)
       assert data.wanted == :started
+
+      {data, effects} = step(data, {:ok, :ok})
+      assert effects == [:persist, {:reply, :ok}, :idle]
+      assert data.wanted == :started
+    end
+
+    # The data is restored by then; the aside is only disk.
+    test "restore: an old data dir that is not dropped does not fail the op" do
+      for outcome <- [{:ok, :kept}, {:error, :died}, {:error, :timeout}] do
+        args = %{staging_dir: "/s", options: nil, start?: false}
+        {data, _} = begin(:restore, args, running())
+        {data, _} = step(data, {:ok, %{was_running: true}})
+        {data, [{:step, {:drop_aside, nil}}]} = step(data, {:ok, "/data/addons/data/app_one"})
+        {_data, effects} = step(data, outcome)
+        assert effects == [:persist, {:reply, :ok}, :idle], inspect(outcome)
+      end
     end
 
     test "restore without options or a start keeps the options and leaves the app stopped" do
@@ -640,6 +659,8 @@ defmodule Vagus.App.PolicyTest do
       {data, _} = begin(:restore, args, running(%{user_options: %{"o" => 1}}))
       {data, _} = step(data, {:ok, %{was_running: true}})
       {data, effects} = step(data, {:ok, "/data/addons/data/app_one"})
+      assert effects == [{:step, {:drop_aside, nil}}]
+      {data, effects} = step(data, {:ok, :ok})
 
       assert effects == [:persist, {:reply, :ok}, :idle]
       assert %{wanted: :stopped, user_options: %{"o" => 1}} = data
@@ -650,7 +671,8 @@ defmodule Vagus.App.PolicyTest do
       {data, _} = begin(:restore, args, running(%{user_options: %{"o" => 1}}))
       {data, _} = step(data, {:ok, %{was_running: true}})
       {data, [{:step, {:set_options, nil}}]} = step(data, {:ok, "/data/addons/data/app_one"})
-      {data, effects} = step(data, {:ok, nil})
+      {data, [{:step, {:drop_aside, nil}}]} = step(data, {:ok, nil})
+      {data, effects} = step(data, {:ok, :ok})
 
       assert effects == [:persist, {:reply, :ok}, :idle]
       assert data.user_options == %{"o" => 1}
@@ -849,7 +871,7 @@ defmodule Vagus.App.PolicyTest do
       {_data, effects} = step(data, {:ok, :ok})
       assert effects == [:persist, {:reply, {:error, :timeout}}, :idle]
 
-      {data, _} = begin(:backup, %{}, app(%{config: hooks}))
+      {data, _} = begin(:backup, %{}, app(%{config: hooks, wanted: :stopped}))
       {_data, effects} = step(data, {:error, :timeout})
       assert effects == [:persist, {:reply, {:error, :timeout}}, :idle]
     end
@@ -1158,7 +1180,20 @@ defmodule Vagus.App.PolicyTest do
     test "a hot backup of a crashed app that should run records it started, as a cold one does" do
       crashed = app(%{last_event: {:exited, 1}})
       {data, [{:step, {:snapshot, nil}}]} = begin(:backup, %{staging_dir: "/s"}, crashed)
-      assert %{state: "started", pause: false} = Policy.task_input({:snapshot, nil}, data)
+      assert %{state: "started", pause: true} = Policy.task_input({:snapshot, nil}, data)
+    end
+
+    # A restarted process holds no container id until its adoption inspect
+    # answers, while the old container may still be running and writing.
+    test "an app wanted started but not yet adopted is paused by name, and thawed after a failure" do
+      unadopted = app(%{container_id: nil, wanted: :started, last_event: nil})
+      {data, [{:step, {:snapshot, nil}}]} = begin(:backup, %{staging_dir: "/s"}, unadopted)
+      assert %{pause: true} = Policy.task_input({:snapshot, nil}, data)
+
+      {data, effects} = step(data, {:error, {:pause, :engine_gone}})
+      assert effects == [{:step, {:unpause, nil}}]
+      {_data, effects} = step(data, {:ok, :not_paused})
+      assert effects == [:persist, {:reply, {:error, {:pause, :engine_gone}}}, :idle]
     end
 
     test "an update's snapshot takes the staging dir and the state before the stop" do
@@ -1183,10 +1218,18 @@ defmodule Vagus.App.PolicyTest do
             :exec_hook,
             :unpause,
             :swap_data,
+            :set_options,
+            :drop_aside,
             :remove_app,
             :reclaim_image
           ],
           do: assert(Policy.deadline(name) > 0)
+    end
+
+    # Removing a large old data dir is a walk as long as a snapshot's.
+    test "dropping the aside has a snapshot's deadline, not the swap's" do
+      assert Policy.deadline(:drop_aside) == Policy.deadline(:snapshot)
+      assert Policy.deadline(:drop_aside) > Policy.deadline(:swap_data)
     end
   end
 end

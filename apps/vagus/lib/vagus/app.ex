@@ -479,10 +479,10 @@ defmodule Vagus.App do
   @doc """
   Replaces the app's data with `staging_dir`, a sibling of its data dir, and
   its options with the backed-up `options`, by its own `restore` operation:
-  stop, swap, set, and a start when `start?`. The options are validated
-  against the config current in the op; `nil`, or options it rejects, keep
-  the current ones. The app is busy
-  throughout, so nothing else, an uninstall included, acts on it mid-restore.
+  stop, swap, set, a start when `start?`, then removal of the old data. The
+  options are validated against the config current in the op; `nil`, or
+  options it rejects, keep the current ones. The app is busy throughout, so
+  nothing else, an uninstall included, acts on it mid-restore.
   """
   @spec restore(String.t(), Path.t(), map() | nil, boolean(), keyword()) ::
           :ok | {:error, term()}

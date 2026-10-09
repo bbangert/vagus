@@ -38,16 +38,29 @@ defmodule Vagus.App.UnitsTest do
     assert Enum.all?(Map.values(units.gates), &is_function(&1, 0))
   end
 
+  # The VM's own boot already set it; each test starts as if none had.
+  defp fresh_vm(context) do
+    prev = :persistent_term.get({Units, :cold_boot}, :unset)
+    :persistent_term.erase({Units, :cold_boot})
+
+    on_exit(fn ->
+      if prev == :unset,
+        do: :persistent_term.erase({Units, :cold_boot}),
+        else: :persistent_term.put({Units, :cold_boot}, prev)
+    end)
+
+    context
+  end
+
   describe "sweep/0" do
+    setup :fresh_vm
+
     setup do
       base = Path.join(System.tmp_dir!(), "vagus-units-#{System.unique_integer([:positive])}")
       prev = Application.fetch_env(:vagus, :addon_data_root)
       Application.put_env(:vagus, :addon_data_root, Path.join(base, "data"))
-      :persistent_term.erase({Units, :swept})
 
       on_exit(fn ->
-        :persistent_term.erase({Units, :swept})
-
         case prev do
           {:ok, root} -> Application.put_env(:vagus, :addon_data_root, root)
           :error -> Application.delete_env(:vagus, :addon_data_root)
@@ -67,15 +80,17 @@ defmodule Vagus.App.UnitsTest do
       refute File.exists?(leftover)
     end
 
-    test "sweeps only once per VM, so a later boot leaves live staging alone", %{
+    test "sweeps only on the VM's first boot, so a later boot leaves live staging alone", %{
       staging: staging
     } do
       assert Units.sweep() == :ok
+      assert :persistent_term.get({Units, :cold_boot})
       live = Path.join(staging, "backup-live-1")
       File.mkdir_p!(live)
 
       assert Units.sweep() == :ok
       assert File.dir?(live)
+      refute :persistent_term.get({Units, :cold_boot})
     end
   end
 
@@ -160,6 +175,8 @@ defmodule Vagus.App.UnitsTest do
   describe "what the engine says runs" do
     alias Vagus.Test.FakeEngine
 
+    setup :fresh_vm
+
     defp engine(responses) do
       engine = FakeEngine.start(responses)
       on_exit(fn -> FakeEngine.stop(engine) end)
@@ -189,6 +206,7 @@ defmodule Vagus.App.UnitsTest do
       do: for(%{method: :post, path: path} <- FakeEngine.requests(engine), do: path)
 
     test "a container found paused is unpaused, logged, and still counts as running" do
+      :persistent_term.put({Units, :cold_boot}, true)
       paused = %{"State" => %{"Running" => true, "Paused" => true}}
       engine = FakeEngine.start([{200, paused}, {204, nil}])
       on_exit(fn -> FakeEngine.stop(engine) end)
@@ -207,6 +225,7 @@ defmodule Vagus.App.UnitsTest do
 
       engine = FakeEngine.start([{200, containers}, {500, %{"message" => "x"}}])
       on_exit(fn -> FakeEngine.stop(engine) end)
+      :persistent_term.put({Units, :cold_boot}, true)
 
       log =
         capture_log(fn ->
@@ -216,6 +235,21 @@ defmodule Vagus.App.UnitsTest do
 
       assert posts(engine) == ["/containers/addon_core_ssh/unpause"]
       assert log =~ "core_ssh's container is paused and did not unpause"
+    end
+
+    # An orchestrator restarted alone boots under live app processes: the
+    # paused one is a backup's, mid-tar, and its process thaws it.
+    test "a later boot in the VM leaves a paused container alone, still running" do
+      :persistent_term.put({Units, :cold_boot}, false)
+      listing = [%{"Names" => ["/addon_core_ssh"], "State" => "paused"}]
+      paused = %{"State" => %{"Running" => true, "Paused" => true}}
+      engine = FakeEngine.start([{200, listing}, {200, paused}])
+      on_exit(fn -> FakeEngine.stop(engine) end)
+
+      assert {:ok, running} = Units.running(socket: engine.socket)
+      assert running == MapSet.new(["core_ssh"])
+      assert Units.running?("core_ssh", socket: engine.socket)
+      assert posts(engine) == []
     end
   end
 end

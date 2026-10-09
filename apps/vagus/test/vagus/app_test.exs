@@ -337,6 +337,7 @@ defmodule Vagus.AppTest do
       assert %{staging_dir: "/staging"} = answer(:swap_data, {:ok, "/data"})
       assert %{options: %{"a" => 2}} = answer(:set_options, {:ok, %{"a" => 2}})
       assert %{user_options: %{"a" => 2}} = answer(:start, {:ok, %{container_id: "c2"}})
+      assert %{staging_dir: "/staging"} = answer(:drop_aside, {:ok, :ok})
 
       assert :ok = Task.await(restore)
 
@@ -352,6 +353,7 @@ defmodule Vagus.AppTest do
 
       answer(:stop, {:ok, %{was_running: true}})
       answer(:swap_data, {:ok, "/data"})
+      answer(:drop_aside, {:ok, :ok})
 
       assert :ok = Task.await(restore)
       refute_received {:step, :start, _input, _task}
@@ -372,6 +374,8 @@ defmodule Vagus.AppTest do
       assert {:ok, %{user_options: %{"a" => 1}}} = app_info(slug)
     end
 
+    # Up to dropping the old data: an uninstall after it would leave the
+    # aside for the boot sweep to move back.
     test "a busy app refuses it, and an uninstall is refused mid-restore" do
       slug = track(config(), state: :started)
       restore = Task.async(fn -> App.restore(slug, "/staging", nil, false) end)
@@ -382,6 +386,9 @@ defmodule Vagus.AppTest do
 
       send(stopping, {:outcome, {:ok, %{was_running: true}}})
       answer(:swap_data, {:ok, "/data"})
+      assert_receive {:step, :drop_aside, _input, dropping}, 5_000
+      assert {:error, :busy} = App.uninstall(slug)
+      send(dropping, {:outcome, {:ok, :ok}})
       assert :ok = Task.await(restore)
       assert App.installed?(slug)
     end

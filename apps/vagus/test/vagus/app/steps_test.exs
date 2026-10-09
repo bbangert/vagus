@@ -771,6 +771,35 @@ defmodule Vagus.App.StepsTest do
       refute_received {:unpause, _id}
     end
 
+    test "a container that is not there is not paused: the tar runs and nothing is unpaused",
+         ctx do
+      :persistent_term.put({FakeBackend, :pause}, fn -> {:error, {:http, 404}} end)
+
+      assert {:ok, path} = Steps.run(:snapshot, snapshot_input(ctx, %{pause: true}))
+      assert File.regular?(path)
+      assert_received {:pause, "addon_test_app"}
+      refute_received {:unpause, _id}
+    end
+
+    # The 409 may be "already paused": without a state that rules it out, the
+    # op must thaw, which it does after a failed snapshot.
+    test "a refused pause whose state cannot be read, or may be paused, fails the snapshot",
+         ctx do
+      :persistent_term.put({FakeBackend, :pause}, fn -> {:error, {:http, 409}} end)
+
+      for {state, reason} <- [
+            {{:error, :engine_gone}, :engine_gone},
+            {{:ok, :restarting}, {:conflict, :restarting}}
+          ] do
+        :persistent_term.put({FakeBackend, :state}, state)
+
+        assert {:error, {:pause, ^reason}} =
+                 Steps.run(:snapshot, snapshot_input(ctx, %{pause: true}))
+      end
+
+      refute File.exists?(Path.join([ctx.tmp_dir, "staging", "test_app.tar.gz"]))
+    end
+
     test "a pause refused as already paused still tars frozen and unpauses after", ctx do
       :persistent_term.put({FakeBackend, :pause}, fn -> {:error, {:http, 409}} end)
       :persistent_term.put({FakeBackend, :state}, {:ok, :paused})
@@ -807,8 +836,10 @@ defmodule Vagus.App.StepsTest do
       assert {:ok, :ok} = Steps.run(:unpause, input(ctx))
       assert_received {:unpause, "addon_test_app"}
 
-      :persistent_term.put({FakeBackend, :unpause}, fn -> {:error, {:http, 409}} end)
-      assert {:ok, :not_paused} = Steps.run(:unpause, input(ctx))
+      for status <- [409, 404] do
+        :persistent_term.put({FakeBackend, :unpause}, fn -> {:error, {:http, status}} end)
+        assert {:ok, :not_paused} = Steps.run(:unpause, input(ctx))
+      end
     end
 
     test "a failed unpause is the step's error, and logged", ctx do
@@ -893,6 +924,48 @@ defmodule Vagus.App.StepsTest do
       assert {:error, :enoent} = Steps.run(:swap_data, input(ctx, %{staging_dir: staging}))
       assert File.read!(Path.join(data_dir, "db")) == "old"
       assert siblings(data_dir) == ["test_app"]
+    end
+  end
+
+  describe "drop_aside" do
+    @describetag :tmp_dir
+
+    test "removes the data a swap set aside, and only this app's restore sibling's", ctx do
+      parent = Path.join([ctx.data_root, "addons", "data"])
+      staging = Path.join(parent, ".restore-test_app-1")
+      File.mkdir_p!(Path.join(staging <> ".old", "sub"))
+      File.mkdir_p!(Path.join(parent, "test_app"))
+      other = Path.join(parent, ".restore-other_app-1")
+      File.mkdir_p!(other <> ".old")
+
+      assert {:ok, :ok} = Steps.run(:drop_aside, input(ctx, %{staging_dir: staging}))
+      refute File.exists?(staging <> ".old")
+      assert File.dir?(Path.join(parent, "test_app"))
+
+      log =
+        capture_log(fn ->
+          assert {:ok, :kept} = Steps.run(:drop_aside, input(ctx, %{staging_dir: other}))
+        end)
+
+      assert File.dir?(other <> ".old")
+      assert log =~ "was not removed"
+    end
+
+    # A name too long for the filesystem fails for root too, unlike a mode;
+    # its parent must exist, or lookup stops at `:enoent`, which `rm_rf`
+    # takes as already removed.
+    test "an aside it cannot remove is logged, and the step still succeeds", ctx do
+      File.mkdir_p!(ctx.data_root)
+      root = Path.join(ctx.data_root, String.duplicate("x", 300))
+      staging = Path.join([root, "addons", "data", ".restore-test_app-1"])
+
+      log =
+        capture_log(fn ->
+          assert {:ok, :kept} =
+                   Steps.run(:drop_aside, input(ctx, %{data_root: root, staging_dir: staging}))
+        end)
+
+      assert log =~ "test_app's pre-restore data"
     end
   end
 
@@ -982,6 +1055,17 @@ defmodule Vagus.App.StepsTest do
       assert {:ok, :ok} = Steps.run(:remove_app, input(ctx, %{config: ingress, panels: PanelSpy}))
       refute File.exists?(data_dir)
       assert_received {:panel_push, "test_app", [method: :delete]}
+    end
+
+    # One left behind would be moved back by the boot sweep as the only copy.
+    test "removes a restore's aside of this app with the data dir, and no other app's", ctx do
+      parent = Path.join([ctx.data_root, "addons", "data"])
+      File.mkdir_p!(Path.join(parent, "test_app"))
+      File.mkdir_p!(Path.join(parent, ".restore-test_app-7.old"))
+      File.mkdir_p!(Path.join(parent, ".restore-test_app_two-7.old"))
+
+      assert {:ok, :ok} = Steps.run(:remove_app, input(ctx, %{panels: PanelSpy}))
+      assert File.ls!(parent) == [".restore-test_app_two-7.old"]
     end
 
     test "a non-ingress app pushes no panel", ctx do

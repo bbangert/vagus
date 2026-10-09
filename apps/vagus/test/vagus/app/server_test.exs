@@ -806,6 +806,7 @@ defmodule Vagus.App.ServerTest do
       assert {:ok, %{user_options: %{"greeting" => "restored"}}} = AppFile.read(slug)
       assert [{^pid, ^slug}] = lookup({:token, Policy.hash(input.token)})
       send(task, {:outcome, {:ok, @started}})
+      assert %{staging_dir: "/s"} = answer(:drop_aside, {:ok, :ok})
 
       assert :ok = Task.await(t)
       assert {:ok, %{state: :started, user_options: %{"greeting" => "restored"}}} = App.info(slug)
@@ -832,6 +833,11 @@ defmodule Vagus.App.ServerTest do
       assert :timeout = :gen_statem.wait_response(req, 0)
 
       send(starting, {:outcome, {:ok, @started}})
+      {_input, dropping} = step(:drop_aside)
+      :sys.get_state(pid)
+      assert :timeout = :gen_statem.wait_response(req, 0)
+
+      send(dropping, {:outcome, {:ok, :ok}})
       assert :ok = Task.await(t)
       assert {:reply, :ok} = :gen_statem.receive_response(req, 2_000)
       assert {:ok, %{state: :started, user_options: %{"greeting" => "mine"}}} = App.info(slug)

@@ -45,14 +45,26 @@ defmodule Vagus.App.Units do
     exception -> Logger.error("Apps not imported: #{Exception.message(exception)}")
   end
 
-  # Once per VM: an orchestrator restart can find backups and restores in
-  # flight, and wiping their staging loses a backup or fails a swap, where an
-  # orphan costs only disk until reboot. Boot must go on without it.
+  # Only the first boot in a VM can find what an earlier VM left: staging no
+  # backup is still writing, and containers no app process will thaw. A later
+  # one is the orchestrator restarted alone, under app processes that still
+  # own both, so it touches neither: wiping live staging loses a backup or
+  # fails a swap, where an orphan costs only disk until reboot.
+  @cold_boot {__MODULE__, :cold_boot}
+
+  # Boot must go on without the sweep.
   @spec sweep() :: :ok
   def sweep do
-    unless :persistent_term.get({__MODULE__, :swept}, false) do
-      Vagus.Backups.sweep_stale()
-      :persistent_term.put({__MODULE__, :swept}, true)
+    case :persistent_term.get(@cold_boot, :unset) do
+      :unset ->
+        :persistent_term.put(@cold_boot, true)
+        Vagus.Backups.sweep_stale()
+
+      true ->
+        :persistent_term.put(@cold_boot, false)
+
+      false ->
+        :ok
     end
 
     :ok
@@ -110,7 +122,7 @@ defmodule Vagus.App.Units do
     with {:ok, containers} <- Docker.list_containers(opts) do
       slugs =
         for %{"Names" => names} = container <- containers, "/addon_" <> slug <- names do
-          if container["State"] == "paused", do: thaw(slug, opts)
+          if container["State"] == "paused" and cold_boot?(), do: thaw(slug, opts)
           slug
         end
 
@@ -122,7 +134,7 @@ defmodule Vagus.App.Units do
   def running?(slug, opts \\ []) do
     case Docker.inspect_container("addon_" <> slug, opts) do
       {:ok, %{"State" => %{"Running" => running} = state}} ->
-        if state["Paused"] == true, do: thaw(slug, opts)
+        if state["Paused"] == true and cold_boot?(), do: thaw(slug, opts)
         running == true
 
       {:error, {:http, 404, _message}} ->
@@ -133,9 +145,12 @@ defmodule Vagus.App.Units do
     end
   end
 
-  # A snapshot whose app process died left it paused: frozen, it hangs its
-  # watchdog probe and the engine refuses to stop it. A paused container
-  # still counts as running.
+  # Before any boot has swept, as for a unit called on its own, it is cold.
+  defp cold_boot?, do: :persistent_term.get(@cold_boot, true)
+
+  # A snapshot whose app process died with the VM left it paused: frozen, it
+  # hangs its watchdog probe and the engine refuses to stop it. A paused
+  # container still counts as running.
   defp thaw(slug, opts) do
     case Docker.unpause_container("addon_" <> slug, opts) do
       :ok ->

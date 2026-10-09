@@ -526,8 +526,15 @@ defmodule Vagus.BackupsTest do
       assert_receive {:step, :start, %{user_options: %{"greet" => "hi"}}, task}, 5_000
       send(task, {:outcome, {:ok, %{container_id: "c2"}}})
 
+      # The op drops the aside, last; once it replies, an uninstall may run,
+      # so nothing after it may touch the data dir's siblings.
+      aside = staging <> ".old"
+      File.mkdir_p!(aside)
+      assert_receive {:step, :drop_aside, %{staging_dir: ^staging}, task}, 5_000
+      send(task, {:outcome, {:ok, :kept}})
+
       assert :ok = Task.await(restore)
-      assert restore_leftovers(dr) == []
+      assert restore_leftovers(dr) == [Path.basename(aside)]
       assert {:ok, %{state: :started, user_options: %{"greet" => "hi"}}} = app_info(slug)
     end
 

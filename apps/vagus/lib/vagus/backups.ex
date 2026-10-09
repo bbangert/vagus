@@ -462,10 +462,9 @@ defmodule Vagus.Backups do
   end
 
   # An op that never ran (the app busy or gone) leaves the staging dir
-  # behind; one that ran has swapped it in or removed it. The old data set
-  # aside by a swap goes here, off the swap's deadline, unless the data dir
-  # is missing: then a failed swap could not move it back, and the aside is
-  # the only copy.
+  # behind; one that ran has swapped it in or removed it. The old data a swap
+  # set aside is the op's own to remove: once it replies, the app is free for
+  # an uninstall this could race.
   # path is internal/config-derived, not request input
   # sobelow_skip ["Traversal.FileModule"]
   defp restore_app(slug, addon, files, data_root, opts) do
@@ -475,7 +474,6 @@ defmodule Vagus.Backups do
       options = get_in(addon, ["user", "options"]) || %{}
       result = App.restore(slug, staging_dir, options, addon["state"] == "started", opts)
       File.rm_rf(staging_dir)
-      if File.dir?(data_dir), do: File.rm_rf(staging_dir <> ".old")
       result
     end
   end
