@@ -71,8 +71,12 @@ defmodule Vagus.Mqtt.Broker.Provider do
       withdraw_timeout: Keyword.get(opts, :withdraw_timeout, @withdraw_timeout)
     }
 
-    {:ok, publish(state)}
+    # A continue: the publish talks to another tree and must not hold up the broker's start.
+    {:ok, state, {:continue, :publish}}
   end
+
+  @impl GenServer
+  def handle_continue(:publish, state), do: {:noreply, publish(state)}
 
   @impl GenServer
   def handle_info({:DOWN, ref, :process, _pid, _reason}, %{ref: ref} = state) do
