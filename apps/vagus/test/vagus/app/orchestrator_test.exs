@@ -650,17 +650,21 @@ defmodule Vagus.App.OrchestratorTest do
     assert %{phase: :up} = await_boot(name)
   end
 
-  test "an app reported up is ignored while booting" do
-    test_pid = self()
-    gates = Map.new([:engine, :network, :api], &{&1, gate(test_pid, &1)})
-    gates = Map.put(gates, :tree, blocking(test_pid, :tree))
+  test "an app reported up after its stage ran is given its boot rule once, when boot ends" do
+    hold = held(self(), :core)
+    name = start_orchestrator([app("early", "initialize")], %{core_start: fn _ -> hold.() end})
+    assert_receive {:boot_start, "early"}
+    assert_receive {:core, core}
 
-    name = start_orchestrator([], %{gates: gates}, gate_timeout: 60_000)
-    assert_receive {:tree, _pid}
-
-    Orchestrator.up("late", name)
+    Orchestrator.up("early", name)
     assert %{phase: :booting} = :sys.get_state(name)
-    refute_received {:boot_start, "late"}
+    refute_received {:boot_start, "early"}
+
+    send(core, :release)
+    assert :complete in collect_until(:complete)
+    assert %{phase: :up} = await_boot(name)
+    assert_receive {:boot_start, "early"}
+    refute_receive {:boot_start, "early"}, 100
   end
 
   test "an app reported up once boot is over is given its boot rule" do

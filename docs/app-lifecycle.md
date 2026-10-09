@@ -376,9 +376,12 @@ starts the same apps.
 `boot_start` with `:shutting_down`, and the facade sends it `resume`, which
 applies the same boot rule.
 
-**An app process restarted after boot** calls `Vagus.App.Orchestrator.up/1`
+**An app process that restarts** calls `Vagus.App.Orchestrator.up/1`
 from its `init/1`; the Orchestrator inspects that app's container and sends
-`boot_start` with the answer. Before boot is over the stage covers it.
+`boot_start` with the answer. One reported mid-boot is given the same once
+boot ends: its stage may already have run, and it would otherwise own neither
+its token nor its running container until the next boot. If its stage ran
+after the restart it is already started, so that replay is a no-op.
 
 **Once-per-VM guards.** Two `:persistent_term` flags survive any restart of
 this tree: the sweep's `{Vagus.App.Units, :swept}`, and

@@ -116,8 +116,9 @@ defmodule Vagus.App.Orchestrator do
 
   @doc """
   Applies the boot rule to one app whose process (re)started, once boot is
-  over; ignored before. Its container is inspected first, so a wanted one
-  still running is started again under a token the new process holds.
+  over; one reported mid-boot is given it when boot ends. Its container is
+  inspected first, so a wanted one still running is started again under a
+  token the new process holds.
   """
   @spec up(String.t(), GenServer.server()) :: :ok
   def up(slug, server \\ __MODULE__), do: GenServer.cast(server, {:up, slug})
@@ -144,7 +145,7 @@ defmodule Vagus.App.Orchestrator do
     Enum.each(Map.get(cfg.units, :slugs, &Vagus.App.slugs/0).(), ensure)
 
     state = %{phase: :up, task: nil, waiters: [], resume: false, deadline: :infinity, cfg: cfg}
-    {:ok, state, {:continue, :boot}}
+    {:ok, Map.put(state, :ups, MapSet.new()), {:continue, :boot}}
   end
 
   # The rest of the units are resolved here rather than in init/1: they lead
@@ -166,16 +167,8 @@ defmodule Vagus.App.Orchestrator do
       when phase in [:stopping, :cancelling],
       do: {:noreply, %{state | waiters: [from | state.waiters]}}
 
-  def handle_call({:shutdown, budget}, from, state) do
-    state = %{state | waiters: [from], deadline: deadline(budget)}
-
-    if state.phase == :booting do
-      send(state.task.pid, :cancel)
-      {:noreply, %{state | phase: :cancelling}}
-    else
-      {:noreply, begin_stop(state)}
-    end
-  end
+  def handle_call({:shutdown, budget}, from, state),
+    do: {:noreply, preempt(%{state | waiters: [from], deadline: deadline(budget)})}
 
   @impl GenServer
   def handle_cast(:resume, %{phase: :stopping, task: nil} = state), do: {:noreply, boot(state)}
@@ -191,6 +184,12 @@ defmodule Vagus.App.Orchestrator do
     {:noreply, state}
   end
 
+  # Its stage may already be behind it, and nothing later in the boot revisits
+  # it: without the replay at boot's end it would own neither a token nor its
+  # still-running container until the next boot.
+  def handle_cast({:up, slug}, %{phase: :booting} = state),
+    do: {:noreply, %{state | ups: MapSet.put(state.ups, slug)}}
+
   def handle_cast(_ignored, state), do: {:noreply, state}
 
   @impl GenServer
@@ -199,17 +198,12 @@ defmodule Vagus.App.Orchestrator do
     finish(result, %{state | task: nil})
   end
 
-  def handle_info({:DOWN, ref, :process, _pid, reason}, %{task: %Task{ref: ref}} = state) do
-    state = %{state | task: nil}
+  def handle_info({:DOWN, ref, _, _, reason}, %{phase: :booting, task: %Task{ref: ref}} = state),
+    do: {:stop, {:boot_crashed, reason}, state}
 
-    case state.phase do
-      :booting ->
-        {:stop, {:boot_crashed, reason}, state}
-
-      phase ->
-        Logger.error("App #{phase} sequence crashed: #{inspect(reason)}")
-        finish(@degraded, state)
-    end
+  def handle_info({:DOWN, ref, _, _, reason}, %{task: %Task{ref: ref}} = state) do
+    Logger.error("App #{state.phase} sequence crashed: #{inspect(reason)}")
+    finish(@degraded, %{state | task: nil})
   end
 
   def handle_info(_exit_or_late_reply, state), do: {:noreply, state}
@@ -222,7 +216,19 @@ defmodule Vagus.App.Orchestrator do
     if state.resume, do: {:noreply, boot(%{state | resume: false})}, else: {:noreply, state}
   end
 
-  defp finish(_result, state), do: {:noreply, %{state | phase: :up}}
+  # A slug its stage reached after the restart is already started under the
+  # successor's token, so its replay is a no-op (`Vagus.App.Policy.boot/2`).
+  defp finish(_result, state) do
+    Enum.each(state.ups, &GenServer.cast(self(), {:up, &1}))
+    {:noreply, %{state | phase: :up, ups: MapSet.new()}}
+  end
+
+  defp preempt(%{phase: :booting} = state) do
+    send(state.task.pid, :cancel)
+    %{state | phase: :cancelling}
+  end
+
+  defp preempt(state), do: begin_stop(state)
 
   defp deadline(:infinity), do: :infinity
   defp deadline(budget_ms), do: System.monotonic_time(:millisecond) + budget_ms
@@ -233,9 +239,10 @@ defmodule Vagus.App.Orchestrator do
     do: %{state | phase: :booting, task: Task.async(fn -> run_boot(state.cfg) end)}
 
   # Runs outside this process, so a crash here does not cut the stop short.
+  # A stop halts every app and a resume boots them all, so no replay is owed.
   defp begin_stop(%{cfg: cfg, deadline: deadline} = state) do
     task = Task.Supervisor.async_nolink(Vagus.TaskSupervisor, fn -> run_stop(cfg, deadline) end)
-    %{state | phase: :stopping, task: task}
+    %{state | phase: :stopping, task: task, ups: MapSet.new()}
   end
 
   defp run_boot(cfg) do
