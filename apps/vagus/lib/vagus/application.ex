@@ -84,8 +84,6 @@ defmodule Vagus.Application do
         Vagus.Jobs,
         {Task.Supervisor, name: Vagus.Jobs.TaskSupervisor, max_children: 8},
         Vagus.Backups,
-        Vagus.Services,
-        Vagus.Discovery,
         Vagus.Auth,
 
         # Persisted POST /supervisor/options fields (timezone/country/
@@ -195,9 +193,9 @@ defmodule Vagus.Application do
 
           # Auto-installs + boots the default native provider (the mqttx broker,
           # M5-P5). `:ignore` unless `config :vagus, :default_native_addon` is set
-          # (only target.exs sets it). Placed last so `Native.Supervisor`,
-          # `Services`, `Discovery`, and `Vagus.DNS` are all up before it installs
-          # + starts the broker (which needs none of the container engine).
+          # (only target.exs sets it). Placed last so `Native.Supervisor`, the
+          # app tree and `Vagus.DNS` are all up before it installs + starts the
+          # broker (which needs none of the container engine).
           Vagus.Addon.DefaultProvider
         ] ++ target_children()
 

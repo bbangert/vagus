@@ -30,19 +30,17 @@ defmodule Vagus.Mqtt.Broker.AuthTest do
 
   setup do
     cache = start_supervised!({Vagus.Auth, name: nil})
-
-    services =
-      start_supervised!({Vagus.Services, name: :"svc_#{System.unique_integer([:positive])}"})
+    service_login = %{username: "svcuser", password: "svcpass"}
 
     config =
       Auth.config(
         slug: "core_mqtt",
-        services: services,
+        service_login: service_login,
         auth_opts: [server: cache, core_client: StubCore],
         logins: [%{username: "optuser", password: "optpass"}]
       )
 
-    %{cache: cache, services: services, config: config}
+    %{cache: cache, service_login: service_login, config: config}
   end
 
   describe "authenticate/3" do
@@ -54,51 +52,14 @@ defmodule Vagus.Mqtt.Broker.AuthTest do
       assert :error = Auth.authenticate("alice", "wrong", config)
     end
 
-    test "accepts registered mqtt service credentials", %{services: services, config: config} do
-      :ok =
-        Vagus.Services.set(
-          "mqtt",
-          %{"host" => "h", "port" => 1883, "username" => "svcuser", "password" => "svcpass"},
-          "core_mqtt",
-          services
-        )
-
+    test "accepts the service login it was started with", %{config: config} do
       assert :ok = Auth.authenticate("svcuser", "svcpass", config)
       # A service user with the wrong password still falls through to rejection.
       assert :error = Auth.authenticate("svcuser", "nope", config)
     end
 
-    # The application's own Services, as its child spec starts it: the one a
-    # real broker authenticates against.
-    test "service credentials still authenticate after Vagus.Services restarts", %{cache: cache} do
-      config = Auth.config(slug: "core_mqtt", auth_opts: [server: cache, core_client: StubCore])
-      slug = "auth_restart_#{System.unique_integer([:positive])}"
-      held = Vagus.Services.get("mqtt")
-
-      on_exit(fn ->
-        Vagus.Services.delete_by_slug(slug)
-
-        with {:ok, %{"addon" => holder} = data} <- held do
-          Vagus.Services.set("mqtt", Map.delete(data, "addon"), holder)
-        end
-      end)
-
-      # Registered after the cleanup above, so it runs first.
-      on_exit(fn ->
-        case Supervisor.restart_child(Vagus.Supervisor, Vagus.Services) do
-          {:ok, _pid} -> :ok
-          {:error, :running} -> :ok
-        end
-      end)
-
-      with {:ok, %{"addon" => holder}} <- held, do: Vagus.Services.delete_by_slug(holder)
-      :ok = Vagus.Services.set("mqtt", %{"username" => "svcuser", "password" => "svcpass"}, slug)
-      assert :ok = Auth.authenticate("svcuser", "svcpass", config)
-
-      :ok = Supervisor.terminate_child(Vagus.Supervisor, Vagus.Services)
-      {:ok, _pid} = Supervisor.restart_child(Vagus.Supervisor, Vagus.Services)
-
-      assert :ok = Auth.authenticate("svcuser", "svcpass", config)
+    test "has no service login unless it was started with one", %{config: config} do
+      assert :error = Auth.authenticate("svcuser", "svcpass", %{config | service_login: nil})
     end
 
     test "accepts a static broker options login", %{config: config} do
@@ -123,7 +84,7 @@ defmodule Vagus.Mqtt.Broker.AuthTest do
     end
 
     test "negative cache collapses repeated identical failures to one Core hit",
-         %{cache: cache, services: services} do
+         %{cache: cache} do
       table = :"nc_#{System.unique_integer([:positive])}"
       start_supervised!({AuthCache, name: table})
       Process.put(:core_hits, 0)
@@ -131,7 +92,6 @@ defmodule Vagus.Mqtt.Broker.AuthTest do
       config =
         Auth.config(
           slug: "core_mqtt",
-          services: services,
           auth_opts: [server: cache, core_client: CountingCore],
           neg_cache: table
         )
@@ -159,7 +119,7 @@ defmodule Vagus.Mqtt.Broker.AuthTest do
          ip: {127, 0, 0, 1},
          auth: [
            slug: config.slug,
-           services: config.services,
+           service_login: config.service_login,
            auth_opts: config.auth_opts,
            logins: config.logins
          ]}
@@ -172,15 +132,7 @@ defmodule Vagus.Mqtt.Broker.AuthTest do
       assert connected_within?(client(port, "alice", "s3cret"))
     end
 
-    test "an accepted service user connects", %{port: port, services: services} do
-      :ok =
-        Vagus.Services.set(
-          "mqtt",
-          %{"host" => "h", "port" => 1883, "username" => "svcuser", "password" => "svcpass"},
-          "core_mqtt",
-          services
-        )
-
+    test "an accepted service user connects", %{port: port} do
       assert connected_within?(client(port, "svcuser", "svcpass"))
     end
 

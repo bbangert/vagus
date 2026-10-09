@@ -3,7 +3,7 @@ defmodule Vagus.API.DiscoveryRouterTest do
   P4-T2: /discovery endpoints through Auth's caller resolution.
 
   The dedup tests (audit B3) intercept the Core push via `:discovery_push`
-  (`Vagus.API.Router.push_discovery/2`'s seam) instead of standing up a real
+  (`Vagus.Discovery.Push.notify/2`'s seam) instead of standing up a real
   `Vagus.Core.Client`/Core: the router's push is fire-and-forget
   (`Vagus.Discovery.Push.push/2` always returns `:ok` and does its real work
   in a detached `Task`), so intercepting at that boundary is the only way to
@@ -40,7 +40,6 @@ defmodule Vagus.API.DiscoveryRouterTest do
 
   # Register a running add-on that declares `discovery`; return its token.
   defp addon_token(slug, discovery) do
-    on_exit(fn -> Vagus.Discovery.delete_by_slug(slug) end)
     register_app_token(app_config(slug), identity: %{discovery: discovery})
   end
 

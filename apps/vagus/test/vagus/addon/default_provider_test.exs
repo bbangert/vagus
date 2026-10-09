@@ -25,8 +25,6 @@ defmodule Vagus.Addon.DefaultProviderTest do
       # The provider installs through `Vagus.App`, whose process for the slug
       # would otherwise refuse the next test's install as already installed.
       Vagus.AppFixtures.forget_app(@slug)
-      Vagus.Services.delete_by_slug(@slug)
-      Vagus.Discovery.delete_by_slug(@slug)
       restore_env(:mqtt_broker_port, prev.port)
       restore_env(:addon_data_root, prev.root)
       restore_env(:default_native_addon, prev.default)

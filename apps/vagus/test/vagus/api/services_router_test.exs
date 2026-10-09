@@ -27,8 +27,6 @@ defmodule Vagus.API.ServicesRouterTest do
     token = addon_token("core_mosquitto", %{"mqtt" => "provide"})
     payload = %{"host" => "core-mosquitto", "port" => 1883}
 
-    on_exit(fn -> Vagus.Services.delete("mqtt", "core_mosquitto") end)
-
     conn = call(:post, "/services/mqtt", token, payload)
     assert conn.status == 200
     assert body(conn)["result"] == "ok"
@@ -66,7 +64,7 @@ defmodule Vagus.API.ServicesRouterTest do
     conn = call(:post, "/services/mqtt", token, %{"port" => 1883})
     assert conn.status == 400
     assert body(conn)["message"] =~ "host"
-    assert :error = Vagus.Services.get("mqtt")
+    assert :error = Vagus.App.service("mqtt")
   end
 
   test "bad port → 400" do

@@ -69,8 +69,17 @@ defmodule Vagus.AppFixtures do
     end)
   end
 
+  @doc """
+  A token is only ever issued to an installed app, and what the app posts with
+  it lands in the app's process, so an app not yet installed is installed
+  here and forgotten again at exit. `installed: false` leaves it uninstalled,
+  as for a token outliving its app.
+  """
   @spec register_app_token(Config.t(), keyword()) :: String.t()
   def register_app_token(%Config{slug: slug} = config, opts \\ []) do
+    if Keyword.get(opts, :installed, true) and not match?({:ok, _entry}, State.get(slug)),
+      do: install_app(config)
+
     token = Keyword.get_lazy(opts, :token, fn -> random_token() end)
     identity = Map.merge(Registry.identity_from_config(config), Keyword.get(opts, :identity, %{}))
     :ok = Registry.register(token, identity)

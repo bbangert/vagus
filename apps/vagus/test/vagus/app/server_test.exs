@@ -89,6 +89,150 @@ defmodule Vagus.App.ServerTest do
     assert %{data: %{slug: "s"}} = Server.format_status(%{state: :idle, data: %{slug: "s"}})
   end
 
+  test "format_status/1 redacts the payload of an event being handled" do
+    from = {self(), make_ref()}
+
+    queue = [
+      {{:call, from}, {:provide_service, "mqtt", %{"password" => "p"}}},
+      {{:call, from}, {:add_discovery, "mqtt", %{"password" => "p"}}},
+      {{:call, from}, :info}
+    ]
+
+    assert %{queue: redacted, postponed: [_]} =
+             Server.format_status(%{data: %{}, queue: queue, postponed: [hd(queue)]})
+
+    assert redacted == [
+             {{:call, from}, {:provide_service, "mqtt", :redacted}},
+             {{:call, from}, {:add_discovery, "mqtt", :redacted}},
+             {{:call, from}, :info}
+           ]
+
+    refute inspect(Server.format_status(%{data: %{}, queue: queue, postponed: queue})) =~ ~s("p")
+  end
+
+  # Process-level: the state of a live process, as `:sys.get_status/1` and a
+  # crash report show it.
+  test "a live process's status shows no service payload" do
+    slug = slug()
+    install_app(app_config(slug))
+    [{pid, _}] = lookup(slug)
+    :ok = :gen_statem.call(pid, {:provide_service, "svc_#{slug}", %{"password" => "s3cret"}})
+
+    refute inspect(:sys.get_status(pid)) =~ "s3cret"
+  end
+
+  describe "services" do
+    setup do
+      slug = slug()
+      install_app(app_config(slug))
+      [{pid, _}] = lookup(slug)
+      %{slug: slug, pid: pid, name: "svc_#{slug}"}
+    end
+
+    test "a provided service is held and keyed in the directory under its provider",
+         %{slug: slug, pid: pid, name: name} do
+      assert :ok = :gen_statem.call(pid, {:provide_service, name, %{"host" => "h"}})
+
+      assert {:ok, %{"host" => "h"}} = :gen_statem.call(pid, {:service, name})
+      assert [{^pid, ^slug}] = Registry.lookup(Vagus.App.Directory, {:service, name})
+    end
+
+    test "a second provider is refused, and so is the provider's own re-post",
+         %{pid: pid, name: name} do
+      other = slug()
+      install_app(app_config(other))
+      [{other_pid, _}] = lookup(other)
+      :ok = :gen_statem.call(pid, {:provide_service, name, %{"host" => "a"}})
+
+      assert {:error, :already_provided} =
+               :gen_statem.call(other_pid, {:provide_service, name, %{"host" => "b"}})
+
+      assert {:error, :already_provided} =
+               :gen_statem.call(pid, {:provide_service, name, %{"host" => "c"}})
+
+      assert :error = :gen_statem.call(other_pid, {:service, name})
+      assert {:ok, %{"host" => "a"}} = :gen_statem.call(pid, {:service, name})
+    end
+
+    test "a withdrawn service leaves the directory and can be provided again",
+         %{pid: pid, name: name} do
+      :ok = :gen_statem.call(pid, {:provide_service, name, %{}})
+
+      assert :ok = :gen_statem.call(pid, {:withdraw_service, name})
+      assert {:error, :not_found} = :gen_statem.call(pid, {:withdraw_service, name})
+      assert :error = :gen_statem.call(pid, {:service, name})
+      assert [] = Registry.lookup(Vagus.App.Directory, {:service, name})
+      assert :ok = :gen_statem.call(pid, {:provide_service, name, %{}})
+    end
+
+    test "every key goes with the process", %{slug: slug, pid: pid, name: name} do
+      :ok = :gen_statem.call(pid, {:provide_service, name, %{}})
+      {:ok, %{uuid: uuid}, :new} = :gen_statem.call(pid, {:add_discovery, "mqtt", %{}})
+      ref = Process.monitor(pid)
+
+      :ok = Instances.stop(slug)
+      assert_receive {:DOWN, ^ref, :process, ^pid, _reason}
+
+      # The directory drops a dead process's keys when its partition handles
+      # the exit, asynchronously to the DOWN the test sees.
+      assert gone?({:service, name})
+      assert gone?({:discovery, uuid})
+    end
+  end
+
+  describe "discovery" do
+    setup do
+      slug = slug()
+      install_app(app_config(slug))
+      [{pid, _}] = lookup(slug)
+      %{slug: slug, pid: pid}
+    end
+
+    test "a new message gets a uuid and a directory key, a repeat keeps both",
+         %{slug: slug, pid: pid} do
+      assert {:ok, %{uuid: uuid, addon: ^slug, service: "mqtt", config: %{"a" => 1}} = message,
+              :new} = :gen_statem.call(pid, {:add_discovery, "mqtt", %{"a" => 1}})
+
+      assert uuid =~ ~r/\A[0-9a-f]{32}\z/
+      assert [{^pid, ^slug}] = Registry.lookup(Vagus.App.Directory, {:discovery, uuid})
+
+      assert {:ok, ^message, :existing} =
+               :gen_statem.call(pid, {:add_discovery, "mqtt", %{"a" => 1}})
+
+      assert {:ok, %{uuid: ^uuid, config: %{"a" => 2}}, :updated} =
+               :gen_statem.call(pid, {:add_discovery, "mqtt", %{"a" => 2}})
+
+      assert {:ok, %{config: %{"a" => 2}}} = :gen_statem.call(pid, {:discovery, uuid})
+      assert [%{uuid: ^uuid}] = :gen_statem.call(pid, :discovery_list)
+    end
+
+    test "another service is another message", %{pid: pid} do
+      {:ok, %{uuid: a}, :new} = :gen_statem.call(pid, {:add_discovery, "mqtt", %{}})
+      {:ok, %{uuid: b}, :new} = :gen_statem.call(pid, {:add_discovery, "other", %{}})
+
+      refute a == b
+      assert length(:gen_statem.call(pid, :discovery_list)) == 2
+    end
+
+    test "a deleted message leaves the directory", %{pid: pid} do
+      {:ok, %{uuid: uuid} = message, :new} = :gen_statem.call(pid, {:add_discovery, "mqtt", %{}})
+
+      assert {:ok, ^message} = :gen_statem.call(pid, {:delete_discovery, uuid})
+      assert {:error, :not_found} = :gen_statem.call(pid, {:delete_discovery, uuid})
+      assert :error = :gen_statem.call(pid, {:discovery, uuid})
+      assert [] = :gen_statem.call(pid, :discovery_list)
+      assert [] = Registry.lookup(Vagus.App.Directory, {:discovery, uuid})
+    end
+  end
+
+  defp gone?(key, deadline \\ System.monotonic_time(:millisecond) + 1_000) do
+    cond do
+      Registry.lookup(Vagus.App.Directory, key) == [] -> true
+      System.monotonic_time(:millisecond) > deadline -> false
+      true -> gone?(key, deadline)
+    end
+  end
+
   # The restart is the DynamicSupervisor's, asynchronous to the DOWN the test
   # sees; poll the directory against a deadline rather than sleeping.
   defp wait_for_new(slug, old, deadline \\ System.monotonic_time(:millisecond) + 1_000) do

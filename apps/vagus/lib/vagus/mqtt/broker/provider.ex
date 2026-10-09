@@ -1,198 +1,163 @@
 defmodule Vagus.Mqtt.Broker.Provider do
   @moduledoc """
-  Publishes the native broker as the `mqtt` service + discovery (M5, MQ-P4-T1),
-  the in-process equivalent of what Mosquitto's s6 scripts do on start.
+  Publishes the native broker as the `mqtt` service and discovery of its own
+  app process, the in-process equivalent of what Mosquitto's s6 scripts post
+  on start. Started only when the broker runs as the real native app
+  (`Vagus.Addon.Backend.Native` passes `:provider`); bare broker instances
+  never publish.
 
-  Started as a child of the `Vagus.Mqtt.Broker` subtree **only when the broker is
-  run as the real native add-on** (`Vagus.Addon.Backend.Native` passes a
-  `:provider` config); bare broker instances (the routing/auth unit tests) omit
-  it and never touch the global service/discovery registries. On `init` it:
+  The `addons` password lives in `<data_dir>/broker_state.json`, so a hot
+  backup carries it and a restore brings the same credentials back without a
+  `backup_pre` script. `Vagus.Mqtt.Broker` reads it through `service_login/1`
+  before its listener starts and hands it to both this and the broker's auth.
 
-    1. loads (or generates + persists) the `addons` service password in
-       `<data_dir>/broker_state.json` — the broker's snapshot-able state. Because
-       that file lives in the add-on's data dir it is included in a hot backup
-       automatically and staged back on restore, so the same credentials survive
-       backup → uninstall → reinstall → restore (MQ-P4-T2) with no `backup_pre`
-       script to run;
-    2. registers the `mqtt` service (`Vagus.Services`) — `host` = the advertised
-       broker IP, `port`, `protocol: "3.1.1"`, `username: "addons"`, `password`.
-       `Vagus.Mqtt.Broker.Auth`'s service-credentials path reads the same entry,
-       so an add-on connecting as `addons`/`<password>` authenticates;
-    3. adds the `mqtt` discovery message (`Vagus.Discovery`) — pushing it to
-       Core via `Vagus.Discovery.Push` only when `Discovery.add/4` says the
-       registry actually changed — exactly as a container add-on's
-       `POST /discovery` does, so Core live-configures the MQTT integration
-       instead of only noticing on its next boot-time `GET /discovery` pull. If
-       Core isn't up yet (the broker boots ahead of it) the push is a no-op and
-       Core's boot pull covers it.
-
-  Idempotency across a broker **crash** (where `terminate` never ran and a
-  previous uuid was left in `Vagus.Discovery`) no longer needs a manual
-  clear-then-add here: `Discovery.add/4` dedups on `(slug, service)` itself
-  (audit B3), so a fresh `init` for the same slug either finds the leftover
-  entry's config unchanged (`:existing` — nothing to push, nothing
-  duplicated) or changed (`:updated` — the *same* uuid is kept, `config` is
-  replaced in place, and exactly one push goes out). Either way there is
-  never more than one `mqtt` discovery for this slug, without this module
-  having to delete anything first.
-
-  On `terminate` it deregisters the service and discovery (pushing the discovery
-  delete to Core), so both follow broker liveness.
-
-  Every registry call waits out a registry that is briefly absent
-  (`Vagus.AbsentRetry`). A publish skipped while one restarts would leave the
-  broker running with no `mqtt` service, so its service credentials are
-  refused; both registries reload their checkpoint on restart, so a delete
-  skipped then would leave the entry published for a broker that is gone. A
-  registry that stays absent is logged as an error and never fails the
-  broker: `init` still starts it and `terminate` still completes.
-  `opts[:registry_retry]` (`{attempts, delay_ms}`) overrides the budget, and
-  `opts[:deregister_call_timeout]` (ms) the `terminate` call timeout.
+  The app process keeps neither entry across its own restart while the broker
+  keeps running, so this monitors it and publishes again into the next one,
+  retrying on `opts[:publish_retry]` (`{attempts, delay_ms}`) while it is not
+  back. On `terminate/2` an app process that is down has nothing to withdraw:
+  the next one starts empty. `opts[:withdraw_timeout]` (ms) bounds each of the
+  two withdraw calls inside the child's shutdown timeout.
   """
 
   use GenServer
 
   require Logger
 
-  alias Vagus.AbsentRetry
+  alias Vagus.App
 
-  # `{attempts, delay_ms}` for a registry call that finds its server absent.
-  #
-  # `terminate/2` has the child's 5 s shutdown timeout for two deletes, each
-  # one call plus this budget's sleeps (200 ms). A registry that holds the
-  # first call for a default 5 s would get the provider killed before the
-  # Discovery delete and its Core push.
-  @registry_retry {5, 50}
-  @deregister_call_timeout 1_000
+  @publish_retry {10, 100}
+  @withdraw_timeout 1_000
 
   @service "mqtt"
   @user "addons"
   @state_file "broker_state.json"
 
-  @doc "Starts the provider. Required opts: `:slug`, `:host`, `:port`. See moduledoc."
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts) do
     GenServer.start_link(__MODULE__, opts, name: Keyword.get(opts, :name, __MODULE__))
   end
 
-  @impl GenServer
-  def init(opts) do
-    # Trap exits so `terminate/2` runs when the broker subtree is shut down
-    # (e.g. the add-on is stopped/uninstalled) — without it a plain GenServer is
-    # killed on the supervisor's shutdown signal and the service/discovery
-    # deregister below never fires, leaving a stale `mqtt` service + a stale
-    # discovery in Core.
-    Process.flag(:trap_exit, true)
-
-    slug = Keyword.fetch!(opts, :slug)
-    host = Keyword.fetch!(opts, :host)
-    port = Keyword.fetch!(opts, :port)
-    services = Keyword.get(opts, :services, Vagus.Services)
-    discovery = Keyword.get(opts, :discovery, Vagus.Discovery)
-    push = Keyword.get(opts, :push, &Vagus.Discovery.Push.push/2)
-    data_dir = Keyword.get(opts, :data_dir, data_dir(slug))
-
-    password = load_or_generate_password(data_dir)
-    payload = service_payload(host, port, password)
-
-    retry = Keyword.get(opts, :registry_retry, @registry_retry)
-
-    publish_service(services, slug, payload, retry)
-    uuid = publish_discovery(discovery, slug, payload, push, retry)
-
-    {:ok,
-     %{
-       slug: slug,
-       services: services,
-       discovery: discovery,
-       push: push,
-       uuid: uuid,
-       retry: retry,
-       call_timeout: Keyword.get(opts, :deregister_call_timeout, @deregister_call_timeout)
-     }}
+  @doc "The login this publishes, from the provider opts the broker is given."
+  @spec service_login(keyword()) :: %{username: String.t(), password: String.t()}
+  def service_login(opts) do
+    %{username: @user, password: Keyword.get_lazy(opts, :password, fn -> password(opts) end)}
   end
 
   @impl GenServer
-  def terminate(_reason, %{slug: slug, retry: retry, call_timeout: timeout} = state) do
-    services = fn -> Vagus.Services.delete(@service, slug, state.services, timeout) end
+  def init(opts) do
+    # Without it the supervisor's shutdown kills this outright and the
+    # withdraw in `terminate/2` never runs, leaving Core a stale discovery.
+    Process.flag(:trap_exit, true)
 
-    case AbsentRetry.call(services, retry) do
-      {:ok, _reply} -> :ok
-      {:error, tag} -> log_left(slug, "Services", tag)
-    end
+    slug = Keyword.fetch!(opts, :slug)
+    login = service_login(opts)
+    retry = Keyword.get(opts, :publish_retry, @publish_retry)
 
-    if state.uuid do
-      discovery = fn -> Vagus.Discovery.delete(state.uuid, slug, state.discovery, timeout) end
+    state = %{
+      slug: slug,
+      payload: payload(Keyword.fetch!(opts, :host), Keyword.fetch!(opts, :port), login),
+      push: Keyword.get(opts, :push, &Vagus.Discovery.Push.push/2),
+      retry: retry,
+      attempts: elem(retry, 0),
+      ref: nil,
+      uuid: nil,
+      withdraw_timeout: Keyword.get(opts, :withdraw_timeout, @withdraw_timeout)
+    }
 
-      case AbsentRetry.call(discovery, retry) do
-        {:ok, {:ok, message}} -> state.push.(:delete, message)
-        {:ok, _not_deleted} -> :ok
-        {:error, tag} -> log_left(slug, "Discovery", tag)
-      end
+    {:ok, publish(state)}
+  end
+
+  @impl GenServer
+  def handle_info({:DOWN, ref, :process, _pid, _reason}, %{ref: ref} = state) do
+    {:noreply, publish(%{state | ref: nil, attempts: elem(state.retry, 0)})}
+  end
+
+  def handle_info(:publish, %{ref: nil} = state), do: {:noreply, publish(state)}
+  def handle_info(_message, state), do: {:noreply, state}
+
+  @impl GenServer
+  def terminate(_reason, %{slug: slug, withdraw_timeout: timeout} = state) do
+    _ = App.withdraw_service(slug, @service, timeout)
+
+    case state.uuid && App.delete_discovery(slug, state.uuid, timeout) do
+      {:ok, message} -> state.push.(:delete, message)
+      _gone -> :ok
     end
 
     :ok
   end
 
-  defp log_left(slug, registry, tag) do
-    Logger.error(
-      "Vagus.Mqtt.Broker.Provider: #{registry} delete for #{slug} failed (#{tag}); " <>
-        "its entry may stay until a reboot"
-    )
+  # The process found here may die at any step; its DOWN, or the retry when
+  # it was never found, publishes everything again.
+  defp publish(%{slug: slug, payload: payload} = state) do
+    with {:ok, ref} <- App.monitor(slug),
+         :ok <- provide(slug, payload),
+         {:ok, message, outcome} <- App.add_discovery(slug, @service, payload) do
+      announce(state, message, outcome)
+      %{state | ref: ref, uuid: message.uuid}
+    else
+      failed -> retry(state, failed)
+    end
   end
 
-  # The tag only: the exit reason holds the payload, password included.
-  defp log_unpublished(slug, registry, tag) do
-    Logger.error(
-      "Vagus.Mqtt.Broker.Provider: #{registry} publish for #{slug} failed (#{tag}); " <>
-        "the broker runs without it"
-    )
+  # Another app providing `mqtt` too is upstream's refusal, not a reason to
+  # stop the broker.
+  defp provide(slug, payload) do
+    case App.provide_service(slug, @service, payload) do
+      {:error, :already_provided} -> :ok
+      other -> other
+    end
   end
 
-  ## Internals
+  # Push only on `:new`/`:updated`: `:existing` is a record Core already has,
+  # and pushing it again is the duplicate config flow the dedup prevents. A
+  # new uuid after the app process restarted leaves the old one in Core
+  # unless it is deleted there.
+  defp announce(state, message, outcome) do
+    if outcome != :existing, do: state.push.(:post, message)
 
-  defp service_payload(host, port, password) do
+    if state.uuid not in [nil, message.uuid],
+      do: state.push.(:delete, %{message | uuid: state.uuid})
+  end
+
+  defp retry(%{attempts: attempts} = state, failed) when attempts > 1 do
+    forget(failed)
+    Process.send_after(self(), :publish, elem(state.retry, 1))
+    %{state | attempts: attempts - 1}
+  end
+
+  defp retry(state, failed) do
+    forget(failed)
+
+    Logger.error(
+      "Vagus.Mqtt.Broker.Provider: mqtt publish for #{state.slug} failed; " <>
+        "the broker runs without its service and discovery"
+    )
+
+    state
+  end
+
+  # A monitor taken before a later step failed would deliver a second DOWN
+  # for a process this is no longer publishing into.
+  defp forget({:ok, ref}) when is_reference(ref), do: Process.demonitor(ref, [:flush])
+  defp forget(_failed), do: :ok
+
+  defp payload(host, port, login) do
     %{
       "host" => host,
       "port" => port,
       "ssl" => false,
       "protocol" => "3.1.1",
-      "username" => @user,
-      "password" => password
+      "username" => login.username,
+      "password" => login.password
     }
   end
 
-  defp publish_service(services, slug, payload, retry) do
-    case AbsentRetry.call(fn -> Vagus.Services.set(@service, payload, slug, services) end, retry) do
-      {:ok, _set_or_already_provided} -> :ok
-      {:error, tag} -> log_unpublished(slug, "Services", tag)
-    end
+  defp password(opts) do
+    data_dir = Keyword.get_lazy(opts, :data_dir, fn -> data_dir(Keyword.fetch!(opts, :slug)) end)
+    load_or_generate_password(data_dir)
   end
 
-  # Push only on `:new`/`:updated` — `:existing` means this exact (slug,
-  # service, config) triple is already in Core, so pushing again would
-  # recreate the duplicate the dedup exists to prevent (mirrors the router's
-  # `POST /discovery`, audit B3).
-  defp publish_discovery(discovery, slug, payload, push, retry) do
-    case AbsentRetry.call(
-           fn -> Vagus.Discovery.add(slug, @service, payload, discovery) end,
-           retry
-         ) do
-      {:ok, {:ok, %{uuid: uuid} = message, outcome}} when outcome in [:new, :updated] ->
-        push.(:post, message)
-        uuid
-
-      {:ok, {:ok, %{uuid: uuid}, :existing}} ->
-        uuid
-
-      {:error, tag} ->
-        log_unpublished(slug, "Discovery", tag)
-        nil
-    end
-  end
-
-  # Persist the addons password so it's stable across broker restarts AND
-  # survives a backup/restore round-trip (the file rides along in the data dir).
   # path is internal/config-derived (`:addon_data_root` + a constant filename),
   # not request input
   # sobelow_skip ["Traversal.FileModule"]

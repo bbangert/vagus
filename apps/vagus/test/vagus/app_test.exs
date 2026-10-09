@@ -336,6 +336,76 @@ defmodule Vagus.AppTest do
     end
   end
 
+  describe "services and discovery" do
+    test "a provided service is found by name, with its provider" do
+      slug = track(config())
+      name = "svc_#{slug}"
+
+      assert :ok = App.provide_service(slug, name, %{"host" => "h"})
+      assert {:ok, ^slug, %{"host" => "h"}} = App.service(name)
+      assert {name, slug} in App.services()
+      assert :error = App.service("none_#{slug}")
+    end
+
+    test "a provide from an app whose process is missing starts it and lands" do
+      slug = track(config(), process: false)
+      name = "svc_#{slug}"
+
+      assert :ok = App.provide_service(slug, name, %{})
+      assert {:ok, ^slug, %{}} = App.service(name)
+    end
+
+    test "a provide or a discovery from an app that is not installed is unavailable" do
+      slug = "core_app_ghost_#{System.unique_integer([:positive])}"
+
+      assert {:error, :unavailable} = App.provide_service(slug, "svc_#{slug}", %{})
+      assert {:error, :unavailable} = App.add_discovery(slug, "mqtt", %{})
+      assert [] = Elixir.Registry.lookup(Directory, {:slug, slug})
+    end
+
+    test "only the provider withdraws its service" do
+      owner = track(config())
+      other = track(config())
+      name = "svc_#{owner}"
+      :ok = App.provide_service(owner, name, %{})
+
+      assert {:error, :not_found} = App.withdraw_service(other, name)
+      assert {:ok, ^owner, _payload} = App.service(name)
+      assert :ok = App.withdraw_service(owner, name)
+      assert :error = App.service(name)
+    end
+
+    test "only the owner deletes its discovery message" do
+      owner = track(config())
+      other = track(config())
+      {:ok, %{uuid: uuid} = message, :new} = App.add_discovery(owner, "mqtt", %{})
+
+      assert {:ok, ^message} = App.discovery(uuid)
+      assert {:error, :not_owner} = App.delete_discovery(other, uuid)
+      assert {:ok, ^message} = App.delete_discovery(owner, uuid)
+      assert {:error, :not_found} = App.delete_discovery(owner, uuid)
+      assert :error = App.discovery(uuid)
+    end
+
+    test "discoveries/0 gathers every app's messages and leaves out one that does not answer" do
+      a = track(config())
+      b = track(config())
+      stuck = track(config())
+      {:ok, %{uuid: ua}, :new} = App.add_discovery(a, "mqtt", %{})
+      {:ok, %{uuid: ub}, :new} = App.add_discovery(b, "mqtt", %{})
+      {:ok, %{uuid: us}, :new} = App.add_discovery(stuck, "mqtt", %{})
+      suspend(stuck)
+
+      started = System.monotonic_time(:millisecond)
+      uuids = Enum.map(App.discoveries(), & &1.uuid)
+      elapsed = System.monotonic_time(:millisecond) - started
+
+      assert ua in uuids and ub in uuids
+      refute us in uuids
+      assert elapsed < 2 * 1_000
+    end
+  end
+
   # A child stopped through `terminate_child/2` stays down until restarted;
   # every app process goes with it.
   defp stop_instances do

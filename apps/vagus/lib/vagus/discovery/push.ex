@@ -5,8 +5,8 @@ defmodule Vagus.Discovery.Push do
   config flow immediately, instead of only picking the change up on its next
   boot-time `GET /discovery` pull (§A3.2).
 
-  Shared by both discovery publishers: `Vagus.API.Router` (a container add-on
-  POSTing `/discovery`) and `Vagus.Mqtt.Broker.Provider` (the native broker,
+  Shared by `Vagus.API.Router` (a container app POSTing `/discovery`),
+  `Vagus.App.uninstall/1` and `Vagus.Mqtt.Broker.Provider` (the native broker,
   which registers `mqtt` in-process rather than over HTTP).
 
   Best-effort and decoupled via `Task.start/1` — the caller never blocks on a
@@ -39,6 +39,15 @@ defmodule Vagus.Discovery.Push do
     request_fun = Keyword.get(opts, :request_fun, &Vagus.Core.Client.request/3)
     Task.start(fn -> deliver(method, message, request_fun) end)
     :ok
+  end
+
+  @doc """
+  `push/3` unless `:discovery_push` names another function, the seam tests use
+  to see a push that `push/3` would detach.
+  """
+  @spec notify(:post | :delete, message()) :: :ok
+  def notify(method, message) do
+    Application.get_env(:vagus, :discovery_push, &push/2).(method, message)
   end
 
   @doc """

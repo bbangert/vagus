@@ -169,8 +169,7 @@ defmodule Vagus.Addon.Manager do
 
   `opts[:register_retry]`/`opts[:deregister_retry]` (`{attempts, delay_ms}`)
   and `opts[:registration_call_timeout]` (ms) override the Registry/DNS call
-  budgets, here and in `stop/2`/`uninstall/2`; `uninstall/2` spends the
-  deregister budget on Discovery and Services too.
+  budgets, here and in `stop/2`/`uninstall/2`.
   """
   @spec start(Config.t(), keyword()) ::
           {:ok, %{id: String.t(), access_token: String.t()}} | {:error, term()}
@@ -324,10 +323,10 @@ defmodule Vagus.Addon.Manager do
   @doc """
   Uninstalls `slug`: stop+remove the container and remove the image (both
   best-effort — a daemon that's already gone-ahead-and-forgotten either one
-  isn't a failure here), purge its discovery messages
-  (`Vagus.Discovery.delete_by_slug/1`) and service registrations
-  (`Vagus.Services.delete_by_slug/1`), drop its `Registry`/`DNS`/`State`
-  entries, then `File.rm_rf` its data dir (`<data_root>/addons/data/<slug>`).
+  isn't a failure here), drop its `Registry`/`DNS`/`State` entries, then
+  `File.rm_rf` its data dir (`<data_root>/addons/data/<slug>`). Its services
+  and discovery messages go with its app process, which `Vagus.App.uninstall/1`
+  stops.
 
   The data-dir removal is gated on `Vagus.Addon.Config.valid_slug?/1` (W3) —
   `slug` is interpolated straight into that rm_rf path, so a slug that fails
@@ -1024,41 +1023,11 @@ defmodule Vagus.Addon.Manager do
     ArgumentError -> :error
   end
 
-  # Purge every other subsystem's record of `slug` on uninstall. Discovery
-  # and Services get the deregister budget: both reload their checkpoint on
-  # restart, so a delete skipped while one is absent would come back with it.
-  #
-  # The token and DNS record go first: revoking a credential must not wait on
-  # side-state cleanup.
+  # Purge every other subsystem's record of `slug` on uninstall.
   defp purge_side_state(slug, opts) do
-    retry = Keyword.get(opts, :deregister_retry, @deregister_retry)
-    timeout = call_timeout(opts)
-
     deregister_slug(slug, opts)
-
-    purge(slug, "Discovery", retry, fn ->
-      Vagus.Discovery.delete_by_slug(slug, Vagus.Discovery, timeout)
-    end)
-
-    purge(slug, "Services", retry, fn ->
-      Vagus.Services.delete_by_slug(slug, Vagus.Services, timeout)
-    end)
-
     if Process.whereis(Vagus.Addon.State), do: Vagus.Addon.State.delete(slug)
     :ok
-  end
-
-  defp purge(slug, server, retry, fun) do
-    case AbsentRetry.call(fun, retry) do
-      {:ok, _reply} ->
-        :ok
-
-      {:error, tag} ->
-        Logger.error(
-          "Vagus.Addon.Manager: #{server} purge for #{slug} failed (#{tag}); " <>
-            "its entries may stay until a reboot"
-        )
-    end
   end
 
   # path is internal/config-derived, not request input

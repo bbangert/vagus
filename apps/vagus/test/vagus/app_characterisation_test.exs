@@ -251,7 +251,6 @@ defmodule Vagus.AppCharacterisationTest do
 
   # Core keeps a config flow alive until it is told the discovery is gone;
   # dropping the entry locally only reaches Core at its next boot-time pull.
-  @tag :known_failing
   test "uninstall pushes a discovery DELETE to Core for each message the app posted" do
     capture_discovery_pushes()
     slug = "core_char_disc"

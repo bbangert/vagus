@@ -7,10 +7,10 @@ defmodule Vagus.Mqtt.Broker.Auth do
   the add-on subsystem's existing machinery verbatim rather than inventing a new
   auth path. A CONNECT is accepted if any of these match, in order:
 
-    1. **mqtt service credentials** — the `username`/`password` in the provider
-       payload registered via `POST /services/mqtt` (`Vagus.Services.get/2`).
-       This is how add-ons authenticate against the broker (Mosquitto's
-       `addons` service user); a local, no-round-trip check.
+    1. **mqtt service credentials** — the `addons` login the broker publishes
+       as its `mqtt` service, handed in at start (`:service_login`), so a
+       CONNECT never waits on the publisher. This is how add-ons authenticate
+       against the broker (Mosquitto's `addons` service user).
     2. **Home Assistant users** — `Vagus.Auth.check_login/4`, the same cache →
        Core `api/hassio_auth` path `POST /auth` already uses (`auth.ex`). REUSED,
        not reimplemented.
@@ -28,12 +28,11 @@ defmodule Vagus.Mqtt.Broker.Auth do
   """
 
   alias Vagus.Mqtt.Broker.AuthCache
-  alias Vagus.Services
 
   @type login :: %{username: String.t(), password: String.t()}
   @type config :: %{
           slug: String.t(),
-          services: GenServer.server(),
+          service_login: login() | nil,
           auth_opts: keyword(),
           logins: [login()],
           allow_anonymous: boolean(),
@@ -44,7 +43,8 @@ defmodule Vagus.Mqtt.Broker.Auth do
   Builds an auth `config` from broker options.
 
     * `:slug` — add-on slug passed to `check_login/4` (default `"core_mqtt"`)
-    * `:services` — `Vagus.Services` server (default `Vagus.Services`)
+    * `:service_login` — the `%{username, password}` the broker publishes as
+      its `mqtt` service (default `nil`: none)
     * `:auth_opts` — opts threaded into `Vagus.Auth.check_login/4` (`:server`,
       `:core_client`; mainly for tests)
     * `:logins` — static `%{username, password}` option logins (default `[]`)
@@ -56,7 +56,7 @@ defmodule Vagus.Mqtt.Broker.Auth do
   def config(opts \\ []) do
     %{
       slug: Keyword.get(opts, :slug, "core_mqtt"),
-      services: Keyword.get(opts, :services, Services),
+      service_login: Keyword.get(opts, :service_login),
       auth_opts: Keyword.get(opts, :auth_opts, []),
       logins: Keyword.get(opts, :logins, []),
       allow_anonymous: Keyword.get(opts, :allow_anonymous, false),
@@ -85,7 +85,7 @@ defmodule Vagus.Mqtt.Broker.Auth do
       neg_blocked?(config, key) ->
         :error
 
-      service_credentials?(username, password, config.services) or
+      service_login?(username, password, config.service_login) or
         Vagus.Auth.check_login(username, password, config.slug, config.auth_opts) or
           options_login?(username, password, config.logins) ->
         :ok
@@ -109,15 +109,11 @@ defmodule Vagus.Mqtt.Broker.Auth do
   defp neg_record(%{neg_cache: nil}, _key), do: :ok
   defp neg_record(%{neg_cache: table}, key), do: AuthCache.record_failure(table, key)
 
-  defp service_credentials?(username, password, services) do
-    case Services.get("mqtt", services) do
-      {:ok, %{"username" => u, "password" => p}} when is_binary(u) and is_binary(p) and p != "" ->
-        secure_equal?(u, username) and secure_equal?(p, password)
+  defp service_login?(username, password, %{username: u, password: p})
+       when is_binary(u) and is_binary(p) and p != "",
+       do: secure_equal?(u, username) and secure_equal?(p, password)
 
-      _ ->
-        false
-    end
-  end
+  defp service_login?(_username, _password, _none), do: false
 
   defp options_login?(username, password, logins) do
     Enum.any?(logins, fn %{username: u, password: p} ->
