@@ -430,15 +430,35 @@ defmodule Vagus.Backups do
   defp preflight_addon(path, slug) do
     with :ok <- validate_slug(slug),
          :ok <- installed(slug),
-         {:ok, %{addon: addon, data: files}} <- Vagus.Backup.extract_addon_file(path, slug) do
-      {:ok, {slug, addon, files}}
+         {:ok, %{addon: addon, data: files}} <- Vagus.Backup.extract_addon_file(path, slug),
+         {:ok, options, start?} <- addon_fields(addon) do
+      {:ok, {slug, options, start?, files}}
     else
       {:error, {:invalid_slug, _}} -> {:error, "Addon #{slug} not in backup"}
       {:error, :not_installed} -> {:error, "Addon #{slug} is not installed"}
       {:error, :not_in_backup} -> {:error, "Addon #{slug} not in backup"}
       {:error, :too_large} -> {:error, "Addon #{slug}'s backup data exceeds the restore size cap"}
+      {:error, :malformed} -> {:error, "Addon #{slug}'s backup is malformed"}
+      {:error, %Jason.DecodeError{}} -> {:error, "Addon #{slug}'s backup is malformed"}
     end
   end
+
+  # An uploaded backup's `addon.json` is any JSON the uploader wrote; read
+  # here, before anything is staged, a wrong shape fails the whole restore.
+  defp addon_fields(%{} = addon) do
+    with {:ok, user} <- optional(addon["user"], &is_map/1),
+         {:ok, options} <- optional(user && user["options"], &is_map/1),
+         {:ok, state} <- optional(addon["state"], &is_binary/1) do
+      {:ok, options || %{}, state == "started"}
+    end
+  end
+
+  defp addon_fields(_addon), do: {:error, :malformed}
+
+  defp optional(nil, _valid?), do: {:ok, nil}
+
+  defp optional(value, valid?),
+    do: if(valid?.(value), do: {:ok, value}, else: {:error, :malformed})
 
   defp installed(slug) do
     if App.installed?(slug), do: :ok, else: {:error, :not_installed}
@@ -453,45 +473,36 @@ defmodule Vagus.Backups do
   ## Internals — restore_partial: apply
 
   defp restore_apps(prepared, data_root, opts) do
-    Enum.reduce_while(prepared, :ok, fn {slug, addon, files}, :ok ->
-      case restore_app(slug, addon, files, data_root, opts) do
+    Enum.reduce_while(prepared, :ok, fn {slug, options, start?, files}, :ok ->
+      case restore_app(slug, {options, start?}, files, data_root, opts) do
         :ok -> {:cont, :ok}
         {:error, reason} -> {:halt, {:error, {:restore, slug, reason}}}
       end
     end)
   end
 
-  # An op that never ran (the app busy or gone) leaves the staging dir
-  # behind; one that ran has swapped it in or removed it. The old data a swap
-  # set aside is the op's own to remove: once it replies, the app is free for
-  # an uninstall this could race.
+  # The staging dir is a sibling of the data dir, so the app's swap is a
+  # rename on one filesystem and a write that fails here (disk full) leaves
+  # its data untouched; the parent is mounted into no app. It is removed here
+  # on every exit, a raise included, since an op that never ran (the app busy
+  # or gone) leaves it and otherwise only the boot sweep would. The old data a
+  # swap set aside is the op's own to remove: once it replies, the app is free
+  # for an uninstall this could race. `opts[:app]` stands in for `Vagus.App`
+  # in tests.
   # path is internal/config-derived, not request input
   # sobelow_skip ["Traversal.FileModule"]
-  defp restore_app(slug, addon, files, data_root, opts) do
+  defp restore_app(slug, {options, start?}, files, data_root, opts) do
     data_dir = Path.join([data_root, "addons", "data", slug])
+    app = Keyword.get(opts, :app, App)
 
-    with {:ok, staging_dir} <- stage_files(data_dir, files) do
-      options = get_in(addon, ["user", "options"]) || %{}
-      result = App.restore(slug, staging_dir, options, addon["state"] == "started", opts)
-      File.rm_rf(staging_dir)
-      result
-    end
-  end
-
-  # A sibling of `data_dir`, so the app's swap is a rename on one filesystem
-  # and a write that fails here (disk full) leaves its data untouched. The
-  # parent is mounted into no app.
-  # path is internal/config-derived, not request input
-  # sobelow_skip ["Traversal.FileModule"]
-  defp stage_files(data_dir, files) do
     with {:ok, staging_dir} <- restore_dir(data_dir, 3) do
-      case materialize(staging_dir, files) do
-        :ok ->
-          {:ok, staging_dir}
-
-        {:error, reason} ->
-          File.rm_rf(staging_dir)
-          {:error, {:staging, reason}}
+      try do
+        case materialize(staging_dir, files) do
+          :ok -> app.restore(slug, staging_dir, options, start?, opts)
+          {:error, reason} -> {:error, {:staging, reason}}
+        end
+      after
+        File.rm_rf(staging_dir)
       end
     end
   end

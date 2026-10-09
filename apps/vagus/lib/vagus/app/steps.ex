@@ -115,12 +115,22 @@ defmodule Vagus.App.Steps do
     pick_port(directory, probe, rand, @port_tries)
   end
 
+  # Planned for an app wanted started, whose container may not exist: with
+  # none, nothing is writing, so there is nothing for the hook to quiesce.
   defp step(:exec_hook, %{config: config, cmd: cmd} = input) do
     docker = input[:docker] || Vagus.Runtime.Docker
+    id = container_name(config.slug)
 
-    case docker.exec(container_name(config.slug), cmd, Keyword.take(opts(input), [:socket])) do
-      :ok -> {:ok, :ok}
-      {:error, reason} -> {:error, reason}
+    case docker.exec(id, cmd, Keyword.take(opts(input), [:socket])) do
+      :ok ->
+        {:ok, :ok}
+
+      {:error, {:exec_create_failed, 404, _message}} ->
+        Logger.info("Vagus.App.Steps: no container #{id}; backup hook skipped")
+        {:ok, :skipped}
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 

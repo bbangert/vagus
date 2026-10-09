@@ -645,6 +645,108 @@ defmodule Vagus.BackupsTest do
     end
   end
 
+  # As an uploaded backup may carry it: `addon_json` verbatim beside staged data.
+  defp backup_with_addon_json(slug, addon_json, server) do
+    inner = Path.join(System.tmp_dir!(), "vagus-inner-#{System.unique_integer([:positive])}")
+
+    :ok =
+      :erl_tar.create(
+        String.to_charlist(inner),
+        [{~c"./addon.json", addon_json}, {~c"./data/f.txt", "from the backup"}],
+        [:compressed]
+      )
+
+    backup_slug = "m#{System.unique_integer([:positive])}" |> String.slice(0, 8)
+    backup_json = Jason.encode!(%{"slug" => backup_slug, "name" => "upload", "type" => "partial"})
+    outer = Path.join(System.tmp_dir!(), "vagus-outer-#{System.unique_integer([:positive])}")
+
+    :ok =
+      :erl_tar.create(String.to_charlist(outer), [
+        {~c"./backup.json", backup_json},
+        {String.to_charlist("./#{slug}.tar.gz"), File.read!(inner)}
+      ])
+
+    {:ok, ^backup_slug} = Backups.put_file(File.read!(outer), server)
+    File.rm!(inner)
+    File.rm!(outer)
+    backup_slug
+  end
+
+  describe "restore_partial/3 of a malformed backup" do
+    for {label, addon_json} <- [
+          {"not an object", "1"},
+          {"not JSON", "{"},
+          {"a non-object user", ~s({"user":"bad"})},
+          {"non-object options", ~s({"user":{"options":[1]}})},
+          {"a non-string state", ~s({"state":1})}
+        ] do
+      test "#{label} fails in pre-flight, nothing staged or touched", %{
+        data_root: dr,
+        server: server
+      } do
+        slug = "core_malformed"
+        install(slug, dr)
+        File.write!(Path.join(data_dir(dr, slug), "f.txt"), "since")
+        backup_slug = backup_with_addon_json(slug, unquote(addon_json), server)
+        :ok = @backend.reset_calls()
+
+        assert {:error, "Addon core_malformed's backup is malformed"} =
+                 Backups.restore_partial(backup_slug, [slug],
+                   server: server,
+                   data_root: dr,
+                   backend: @backend
+                 )
+
+        assert @backend.calls() == []
+        assert File.read!(Path.join(data_dir(dr, slug), "f.txt")) == "since"
+        assert restore_leftovers(dr) == []
+      end
+    end
+
+    test "absent user, options and state are accepted", %{
+      data_root: dr,
+      server: server
+    } do
+      slug = "core_bare"
+      install(slug, dr, :stopped, %{"greet" => "kept"})
+      backup_slug = backup_with_addon_json(slug, "{}", server)
+
+      assert :ok = Backups.restore_partial(backup_slug, [slug], server: server, data_root: dr)
+      assert File.read!(Path.join(data_dir(dr, slug), "f.txt")) == "from the backup"
+      assert restore_leftovers(dr) == []
+    end
+  end
+
+  describe "restore_partial/3 when the restore raises" do
+    defmodule RaisingApp do
+      @moduledoc false
+      def restore(_slug, staging_dir, _options, _start?, _opts) do
+        true = File.regular?(Path.join(staging_dir, "f.txt"))
+        raise "restore crashed"
+      end
+    end
+
+    test "the staged data is removed and the raise reaches the caller", %{
+      data_root: dr,
+      server: server
+    } do
+      slug = "core_raising"
+      install(slug, dr, :stopped)
+      File.write!(Path.join(data_dir(dr, slug), "f.txt"), "x")
+      {:ok, backup_slug} = Backups.create_partial(nil, [slug], server: server, data_root: dr)
+
+      assert_raise RuntimeError, "restore crashed", fn ->
+        Backups.restore_partial(backup_slug, [slug],
+          server: server,
+          data_root: dr,
+          app: RaisingApp
+        )
+      end
+
+      assert restore_leftovers(dr) == []
+    end
+  end
+
   # The upstream restore contract, asserted on the tar directly — the schema
   # IS the contract (plan P4-T7). A restoring HAOS coerces
   # `supervisor_version` through AwesomeVersion and compares it

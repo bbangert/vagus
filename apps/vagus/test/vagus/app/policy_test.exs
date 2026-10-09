@@ -480,7 +480,7 @@ defmodule Vagus.App.PolicyTest do
           do: assert(%{op: ^op, steps: ^steps} = Policy.plan(op, args, running()))
     end
 
-    test "backups: cold stops; hot runs the hooks only while running; native only snapshots" do
+    test "backups: cold stops; hot runs the hooks whenever it pauses; native only snapshots" do
       cold = running(%{config: app_config(%{"backup" => "cold"})})
 
       assert Policy.plan(:backup, %{}, cold).steps ==
@@ -491,7 +491,13 @@ defmodule Vagus.App.PolicyTest do
       assert Policy.plan(:backup, %{}, running(%{config: hooks})).steps ==
                [{:exec_hook, :pre}, {:snapshot, nil}, {:exec_hook, :post}]
 
-      assert Policy.plan(:backup, %{}, app(%{config: hooks})).steps == [{:snapshot, nil}]
+      # A restarted process holds no container id until its adoption, while
+      # the old container may still be running: paused, so hooked too.
+      assert Policy.plan(:backup, %{}, app(%{config: hooks, container_id: nil})).steps ==
+               [{:exec_hook, :pre}, {:snapshot, nil}, {:exec_hook, :post}]
+
+      stopped = app(%{config: hooks, wanted: :stopped, last_event: :stopped})
+      assert Policy.plan(:backup, %{}, stopped).steps == [{:snapshot, nil}]
 
       native = running(%{config: %{native_config() | backup_pre: "pre"}})
       assert Policy.plan(:backup, %{}, native).steps == [{:snapshot, nil}]

@@ -126,7 +126,7 @@ defmodule Vagus.Backup do
   the add-on's inner tar is absent.
   """
   @spec extract_addon(binary(), String.t()) ::
-          {:ok, %{addon: map(), data: [{String.t(), binary()}]}} | {:error, term()}
+          {:ok, %{addon: term(), data: [{String.t(), binary()}]}} | {:error, term()}
   def extract_addon(tar, slug) when is_binary(tar) do
     with :ok <- guard_outer_size(tar),
          {:ok, entries} <- untar_plain(tar),
@@ -145,7 +145,7 @@ defmodule Vagus.Backup do
   never the whole outer tar.
   """
   @spec extract_addon_file(Path.t(), String.t()) ::
-          {:ok, %{addon: map(), data: [{String.t(), binary()}]}} | {:error, term()}
+          {:ok, %{addon: term(), data: [{String.t(), binary()}]}} | {:error, term()}
   def extract_addon_file(path, slug) do
     with {:ok, entries} <- table(path),
          {:ok, {name, size}} <- find_table_entry(entries, "#{slug}.tar.gz"),

@@ -478,6 +478,7 @@ defmodule Vagus.App.Policy do
   # Every update branch that rolls back, a failed snapshot's included, needs
   # the version it started from.
   defp acc(:update, data), do: %{old: data.config}
+  defp acc(:restore, data), do: %{options_at: data.user_options}
   defp acc(_op, _data), do: %{}
 
   # `:port?` and `:start?` are resolved against the data current when they
@@ -506,11 +507,13 @@ defmodule Vagus.App.Policy do
       snapshot ++ [{:commit, nil}, {:start?, nil}, {:reclaim_image, nil}]
   end
 
+  # The hooks follow the pause: a container that may be running and writing
+  # is quiesced by its own hooks too, not frozen behind their back.
   defp steps(:backup, _args, data) do
     cond do
       data.config.backup == "cold" -> [{:stop, nil}, {:snapshot, nil}, {:start?, nil}]
-      Steps.native?(data.config) or not running?(data) -> [{:snapshot, nil}]
-      true -> hook(data, :pre) ++ [{:snapshot, nil}] ++ hook(data, :post)
+      held?(data) -> hook(data, :pre) ++ [{:snapshot, nil}] ++ hook(data, :post)
+      true -> [{:snapshot, nil}]
     end
   end
 
@@ -787,8 +790,14 @@ defmodule Vagus.App.Policy do
   defp on_outcome(:restore, :swap_data, _, {:ok, _dir}, data), do: advance(data, [])
   defp on_outcome(:restore, :swap_data, _, {:error, reason}, data), do: fail(data, reason, [])
 
-  defp on_outcome(:restore, :set_options, _, {:ok, options}, data) when is_map(options),
-    do: advance(%{data | user_options: options}, [:persist])
+  # A set is applied the moment it is asked, mid-restore included, and its
+  # caller was told so: a write since the op began is newer than the backup
+  # and stands.
+  defp on_outcome(:restore, :set_options, _, {:ok, options}, data) when is_map(options) do
+    if data.user_options == data.run.acc.options_at,
+      do: advance(%{data | user_options: options}, [:persist]),
+      else: advance(data, [])
+  end
 
   defp on_outcome(:restore, :set_options, _, {:ok, nil}, data), do: advance(data, [])
   defp on_outcome(:restore, :set_options, _, {:error, reason}, data), do: fail(data, reason, [])
@@ -939,10 +948,10 @@ defmodule Vagus.App.Policy do
   # this process has not adopted yet, by its name. One that is not running or
   # not there refuses the pause, and the tar goes on. A stop earlier in the
   # op (cold, update) released it.
-  defp pause?(%{run: run} = data) do
-    held? = data.container_id != nil or data.wanted == :started
-    held? and not Map.has_key?(run.acc, :was_running) and not Steps.native?(data.config)
-  end
+  defp pause?(%{run: run} = data), do: held?(data) and not Map.has_key?(run.acc, :was_running)
+
+  defp held?(data),
+    do: (data.container_id != nil or data.wanted == :started) and not Steps.native?(data.config)
 
   # Coarse waypoints for the update job's progress bar.
   defp stage(:update, :pull), do: {"pull_image", 20}

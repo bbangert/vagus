@@ -560,6 +560,39 @@ defmodule Vagus.API.BackupRouterTest do
       assert body(conn)["message"] =~ "not in backup"
     end
 
+    test "a malformed addon.json -> 400 naming the app, its data untouched", %{data_root: dr} do
+      install("core_restore_malformed", dr)
+      inner = Path.join(System.tmp_dir!(), "vagus-inner-#{System.unique_integer([:positive])}")
+
+      :ok =
+        :erl_tar.create(
+          String.to_charlist(inner),
+          [{~c"./addon.json", ~s({"user":"bad"})}, {~c"./data/f.txt", "from the backup"}],
+          [:compressed]
+        )
+
+      File.write!(
+        Path.join(Backups.dir(), "malform1.tar"),
+        raw_tar([
+          {"./backup.json", Jason.encode!(%{"slug" => "malform1", "name" => "upload"})},
+          {"./core_restore_malformed.tar.gz", File.read!(inner)}
+        ])
+      )
+
+      File.rm!(inner)
+      :ok = Backups.reload()
+
+      conn =
+        supervisor_call(:post, "/backups/malform1/restore/partial", %{
+          "addons" => ["core_restore_malformed"]
+        })
+
+      assert conn.status == 400
+      assert body(conn)["message"] == "Addon core_restore_malformed's backup is malformed"
+      data_dir = Path.join([dr, "addons", "data", "core_restore_malformed"])
+      assert File.read!(Path.join(data_dir, "f.txt")) == "hello"
+    end
+
     test "a busy app fails the restore with upstream's busy text naming it", %{data_root: dr} do
       install("core_restore_busy", dr)
       slug = create_backup("core_restore_busy")

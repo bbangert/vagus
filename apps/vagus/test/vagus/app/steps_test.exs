@@ -687,6 +687,19 @@ defmodule Vagus.App.StepsTest do
 
       assert {:error, {:exec, 3}} =
                Steps.run(:exec_hook, input(ctx, %{cmd: "fail 3", docker: DockerSpy}))
+
+      assert {:error, {:exec_create_failed, 409, _}} =
+               Steps.run(:exec_hook, input(ctx, %{cmd: "status 409", docker: DockerSpy}))
+    end
+
+    test "exec_hook with no container skips the hook", ctx do
+      log =
+        capture_log(fn ->
+          assert {:ok, :skipped} =
+                   Steps.run(:exec_hook, input(ctx, %{cmd: "status 404", docker: DockerSpy}))
+        end)
+
+      assert log =~ "no container addon_test_app; backup hook skipped"
     end
 
     test "snapshot writes <slug>.tar.gz of the data dir into the staging dir", ctx do
@@ -1177,6 +1190,10 @@ defmodule Vagus.App.StepsTest do
   defmodule DockerSpy do
     @moduledoc false
     def exec(_id, "fail " <> code, _opts), do: {:error, {:exec, String.to_integer(code)}}
+
+    def exec(_id, "status " <> status, _opts),
+      do: {:error, {:exec_create_failed, String.to_integer(status), "refused"}}
+
     def exec(id, cmd, _opts), do: send(self(), {:exec, id, cmd}) && :ok
   end
 
