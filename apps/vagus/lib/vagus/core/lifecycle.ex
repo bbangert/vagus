@@ -121,7 +121,7 @@ defmodule Vagus.Core.Lifecycle do
   listens on, ssl, server_host) are re-pulled at every point this module
   establishes that Core is up: after a passing health gate, and on the
   already-running no-op `start/1`. That no-op branch is not redundant —
-  `Vagus.Core.Boot` calls `start/1` unconditionally on every boot, so it is
+  boot (`Vagus.App.CoreUnit.start/1`) calls `start/1` unconditionally, so it is
   the only hook that fires when Vagus restarts (an OTA, say) under a Core
   that kept running, where no health gate ever runs.
 

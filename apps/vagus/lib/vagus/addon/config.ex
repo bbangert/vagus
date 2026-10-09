@@ -258,7 +258,7 @@ defmodule Vagus.Addon.Config do
 
   Used both to render the wire `boot` field (`Vagus.Addon.Info.render/4`)
   and to decide which persisted-`:started` add-ons actually restart at boot
-  (`Vagus.Addon.BootStarter`) — one function so the two can't drift apart on
+  (`Vagus.App.Policy.boot/2`) — one function so the two can't drift apart on
   what "boot: auto" means for a given add-on.
   """
   @spec effective_boot(t(), String.t() | nil) :: String.t()

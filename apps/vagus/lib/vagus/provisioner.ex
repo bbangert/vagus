@@ -42,8 +42,7 @@ defmodule Vagus.Provisioner do
   ## StartupGuard safety
 
   `init/1` returns immediately with `{:continue, :run}` — no blocking work
-  runs before the process is alive and supervised, mirroring
-  `Vagus.Core.Boot`. All provisioning happens post-init, message-driven.
+  runs before the process is alive and supervised. All provisioning happens post-init, message-driven.
   Post-v0.3.1 flashes boot with `nerves_fw_validated=1` already set (the
   StartupGuard fix), so the guard passes in seconds and the `:expand_data`
   reboot can never race it into a reboot-cycle.
@@ -51,7 +50,7 @@ defmodule Vagus.Provisioner do
   ## Gate + lifecycle
 
   Gated by `config :vagus, :first_boot_provision`, read at `start_link/1`
-  time (not compile time) — same convention as `Vagus.Core.Boot`. `:host`
+  time (not compile time). `:host`
   and `mix test` never enable it; `start_link/1` returns `:ignore` rather
   than starting a GenServer with nothing to do.
 

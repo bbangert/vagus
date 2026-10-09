@@ -6,14 +6,14 @@ defmodule Vagus.Host.Shutdown do
 
   ## The corruption problem
 
-  HA Core and every add-on container keep their state in `.storage/*` JSON
+  HA Core and every app container keep their state in `.storage/*` JSON
   files that get written with a temp-file-then-rename dance, but that
   dance only protects against a crash *between* writes — it does nothing
   if the process is SIGKILLed mid-write. `erlinit`'s shutdown path sends
   every still-running container a hard kill (it doesn't know how to ask
   balena-engine to gracefully `docker stop` its containers, and doesn't
   wait around for it if it did) once the BEAM has exited, so a reboot or
-  poweroff that races Core or an add-on mid-write to `.storage` truncates
+  poweroff that races Core or an app mid-write to `.storage` truncates
   the file to zero bytes or leaves a lost rename — the exact bug this
   module exists to close. The fix is to stop every container (real
   `docker stop`, SIGTERM-then-grace-then-SIGKILL, *before* anything is
@@ -88,79 +88,45 @@ defmodule Vagus.Host.Shutdown do
 
   ## Watchdog stand-down
 
-  `Vagus.Addon.Watchdog` restarts an add-on on ANY `die` event (exit code
-  irrelevant — see that module's moduledoc "Triggering events") whenever
-  `Vagus.Addon.State` still says `state: :started, watchdog: true`. Its
-  only existing suppression is the W6 pattern: `Vagus.Addon.Manager.stop/2`
-  records `:stopped` **before** touching the container, so a manual stop's
-  `die` event finds `:stopped` and is ignored. This module's add-on stop
-  stage deliberately does **not** record `:stopped` (see `stop_addons/1` —
-  entries must stay `:started` so `Vagus.Addon.BootStarter`'s reconciliation
-  restarts them on the next boot), which means the W6 mechanism cannot
-  cover it: every `docker stop` this module issues would otherwise look to
-  the watchdog exactly like an unexpected crash, triggering a restart
-  sequence *during* the shutdown window — the restarted container then
-  gets SIGKILLed by erlinit moments later, recreating exactly the
-  `.storage` corruption this whole module exists to prevent.
+  `Vagus.Addon.Watchdog` restarts an app on any `die` event while
+  `Vagus.Addon.State` says `state: :started, watchdog: true`. A user's stop
+  records `:stopped` first, so its `die` is ignored; the shutdown's stops
+  deliberately do not (`Vagus.App.Orchestrator.shutdown/2`), so the next boot
+  starts the same apps, and every `docker stop` would otherwise look like a
+  crash and restart an app that erlinit then SIGKILLs moments later.
 
-  `in_flight?/0` closes that gap: `do_run/2` marks a shutdown in flight via
-  `:persistent_term` **before** the stop stages begin, and
-  `Vagus.Addon.Watchdog` checks it (its own `:shutdown_check` opt) ahead of
-  starting any restart sequence. `:persistent_term` — not GenServer state on
-  the watchdog, and not a suspend/pause call made against it — is used
-  specifically because it survives a watchdog process restart under its
-  `one_for_one` supervisor mid-shutdown-window: a crash-and-restart of the
-  watchdog process during the stop stages must still see the flag, and a
-  value living in the watchdog's own (about-to-be-replaced) process state
-  couldn't guarantee that. The flag stays set once the stop stages finish —
-  the reboot/poweroff this module was called to perform always follows
-  them (see "Availability over cleanliness"), so there is no "shutdown
-  aborted, resume normal watchdog behavior" state to return to in that
-  case. The one exception is `call_runtime/2` itself failing: if the
-  runtime delegate raises/exits/throws, the device is *not* going down, so
-  `do_run/2` erases the flag and re-raises — the watchdogs must resume on
-  a box that is still running.
+  `in_flight?/0` closes that gap: `do_run/2` sets a `:persistent_term` flag
+  before the stop stages and the watchdog checks it before any restart. A
+  `:persistent_term`, not watchdog state, because it must survive the
+  watchdog restarting mid-shutdown. It stays set once the stages finish: the
+  reboot always follows. The exception is the runtime call itself failing:
+  the device is not going down, so the flag is erased, the orchestrator
+  boots the apps again, and the failure propagates.
 
-  The Core lifecycle watchdog (paired event+probe checks on the HA Core
-  container, not add-ons) needs no equivalent: its event half only counts
-  **nonzero**-exit `die`s (an intentional `docker stop`, this module's
-  own `stop_core/1` included, exits 0 and is never mistaken for a crash),
-  and both its event and probe halves skip a container that isn't running
-  in the first place — a stopped Core is simply outside what that watchdog
-  reacts to. Only the add-on watchdog's any-exit-code `die` handling
-  creates the race this section closes.
+  The Core watchdog needs no flag: it counts only nonzero-exit `die`s, and a
+  `docker stop` exits 0.
 
   ## Budgets
 
-    * `30` s per add-on container `docker stop` timeout — generous enough
-      for a well-behaved add-on's own graceful shutdown hook, small enough
-      that four of them stopping serially still fits comfortably inside
-      the total budget.
-    * Core's stop retries on `{:error, :busy}` (its own non-blocking
-      `:global.trans` lock, held by an in-flight `update`/`rebuild`) for
-      up to `60_000` ms, backing off from `1_000` ms and doubling each
-      attempt, capped at `8_000` ms — long enough to ride out a typical
-      in-flight lifecycle op without indefinitely delaying the reboot the
-      caller actually asked for.
-    * `300_000` ms hard overall deadline wrapping the add-on and Core stop
-      stages together — sized against `Vagus.Core.Lifecycle` stop's own
-      worst-case fallback timeout (260 s, `@fallback_stop_timeout_s`
-      there) plus margin for the add-on stage ahead of it, while staying
-      safely under `nerves_runtime`'s own ~10-minute post-`:init.stop`
-      halt backstop — this facade's stages must finish well before that
-      outer backstop would fire.
+  `300_000` ms bounds the whole stop sequence, well under `nerves_runtime`'s
+  own ~10-minute halt backstop after `:init.stop/0`. It is split three
+  ways: the `application` apps stopped ahead of Core (35 s per app, all at
+  once), then Core until a deadline that keeps the same 35 s plus a 5 s
+  margin back for the `initialize`, `system` and `services` apps stopped
+  after it. Those run Core's dependencies, MQTT among them, so they must
+  always get their stop. Core's worst-case stop (260 s,
+  `@fallback_stop_timeout_s` in `Vagus.Core.Lifecycle`) is cut short by
+  however long the apps ahead of it took; past its deadline Core is left
+  stopping. The per-app and Core busy budgets are the orchestrator's
+  and `Vagus.App.CoreUnit`'s.
   """
 
   require Logger
 
-  @addon_stop_s 30
-  @busy_retry_budget_ms 60_000
-  @busy_backoff_ms 1_000
-  @busy_backoff_cap_ms 8_000
   @total_budget_ms 300_000
 
   @doc """
-  Stops every started add-on container and HA Core (best-effort, bounded),
+  Stops every started app container and HA Core (best-effort, bounded),
   then calls `Nerves.Runtime.reboot/0`. Always returns `:ok` — see the
   moduledoc's "Availability over cleanliness" section. A shutdown already
   in flight makes this call a no-op (see "Reentrancy").
@@ -221,12 +187,12 @@ defmodule Vagus.Host.Shutdown do
     # call_runtime/2 itself fails below, in which case the device is not
     # going down and the flag must come back off.
     :persistent_term.put({__MODULE__, :in_flight}, true)
-    {addon_result, core_result} = bounded_stop_stages(kind, opts)
-    {ok_count, total} = addon_result
+    {app_result, core_result} = bounded_stop_stages(kind, opts)
+    {ok_count, total} = app_result
     elapsed = System.monotonic_time(:millisecond) - started_at
 
     Logger.warning(
-      "Vagus.Host.Shutdown: #{kind} — add-ons stopped #{ok_count}/#{total}, " <>
+      "Vagus.Host.Shutdown: #{kind} — apps stopped #{ok_count}/#{total}, " <>
         "core #{inspect(core_result)}, elapsed #{elapsed}ms"
     )
 
@@ -236,23 +202,28 @@ defmodule Vagus.Host.Shutdown do
       exception ->
         Logger.error(
           "Vagus.Host.Shutdown: runtime #{kind} call raised, device is NOT going down — " <>
-            "clearing in-flight flag (#{Exception.format(:error, exception, __STACKTRACE__)})"
+            "clearing in-flight flag and booting the apps again (#{Exception.format(:error, exception, __STACKTRACE__)})"
         )
 
-        :persistent_term.erase({__MODULE__, :in_flight})
+        resume(opts)
         reraise exception, __STACKTRACE__
     catch
       kind_caught, reason ->
         Logger.error(
           "Vagus.Host.Shutdown: runtime #{kind} call failed (caught #{kind_caught}: " <>
-            "#{inspect(reason)}), device is NOT going down — clearing in-flight flag"
+            "#{inspect(reason)}), device is NOT going down — clearing in-flight flag and booting the apps again"
         )
 
-        :persistent_term.erase({__MODULE__, :in_flight})
+        resume(opts)
         :erlang.raise(kind_caught, reason, __STACKTRACE__)
     end
 
     :ok
+  end
+
+  defp resume(opts) do
+    :persistent_term.erase({__MODULE__, :in_flight})
+    Keyword.get(opts, :resume, &Vagus.App.Orchestrator.resume/0).()
   end
 
   defp call_runtime(:reboot, opts) do
@@ -265,24 +236,20 @@ defmodule Vagus.Host.Shutdown do
 
   ## Bounded stop stages — see moduledoc "Availability over cleanliness".
 
-  # Guards against a wedged engine call hanging the reboot indefinitely
-  # (an unbounded task is a wedge — see
-  # .claude/solutions/otp-issues/task-dedup-map-wedge). Wrapped in
-  # try/rescue/catch too: `Vagus.Jobs.TaskSupervisor` not being available
-  # (or any other setup failure before the task even starts) must still
-  # fall through to the runtime call, never crash the caller out of the
-  # reboot it asked for. `stop_addons/1` is called through `safe_stop_addons/1`
-  # (mirroring `stop_core/1`'s own rescue/catch) so a crash in the add-on
-  # stage degrades only that stage's result instead of killing the whole
-  # task and skipping `stop_core/1` — the most corruption-sensitive stage —
-  # entirely.
+  # An unbounded call is a wedge, and a failure to even start the task must
+  # still fall through to the runtime call.
   defp bounded_stop_stages(kind, opts) do
     total_budget_ms = Keyword.get(opts, :total_budget_ms, @total_budget_ms)
 
+    stop =
+      Keyword.get(
+        opts,
+        :orchestrator,
+        &Vagus.App.Orchestrator.shutdown(Vagus.App.Orchestrator, &1)
+      )
+
     task =
-      Task.Supervisor.async_nolink(Vagus.Jobs.TaskSupervisor, fn ->
-        {safe_stop_addons(opts), stop_core(opts)}
-      end)
+      Task.Supervisor.async_nolink(Vagus.Jobs.TaskSupervisor, fn -> stop.(total_budget_ms) end)
 
     case Task.yield(task, total_budget_ms) || Task.shutdown(task, :brutal_kill) do
       {:ok, result} ->
@@ -314,165 +281,4 @@ defmodule Vagus.Host.Shutdown do
   end
 
   defp degraded_result, do: {{0, 0}, {:error, :not_run}}
-
-  ## stop_addons/1
-
-  # Rescue/catch wrapper around `stop_addons/1` — see `bounded_stop_stages/2`
-  # for why: a crash there must degrade only the add-on result, not take
-  # `stop_core/1` down with it inside the shared task.
-  defp safe_stop_addons(opts) do
-    stop_addons(opts)
-  rescue
-    exception ->
-      Logger.warning(
-        "Vagus.Host.Shutdown: add-on stop stage raised, proceeding: " <>
-          "#{Exception.format(:error, exception, __STACKTRACE__)}"
-      )
-
-      {0, 0}
-  catch
-    kind_caught, reason ->
-      Logger.warning(
-        "Vagus.Host.Shutdown: add-on stop stage failed (caught #{kind_caught}: " <>
-          "#{inspect(reason)}), proceeding"
-      )
-
-      {0, 0}
-  end
-
-  # Deliberately NOT `Vagus.Addon.Manager.stop/2` — that REMOVES the
-  # container (upstream parity for user-initiated stops); a reboot must
-  # not churn add-on containers. `Docker.stop_container/2` stops without
-  # removing. Also deliberately no `Vagus.Addon.State` writes: entries
-  # stay `:started` so boot-time reconciliation restarts them.
-  defp stop_addons(opts) do
-    addons_fun = Keyword.get(opts, :addons, &Vagus.App.list/0)
-    stop_addon_fun = Keyword.get(opts, :stop_addon, &default_stop_addon/2)
-    addon_stop_s = Keyword.get(opts, :addon_stop_s, @addon_stop_s)
-
-    entries =
-      addons_fun.()
-      |> Enum.filter(&(&1.state == :started))
-      |> Enum.reject(&native_backend?/1)
-
-    total = length(entries)
-    addon_task_timeout_ms = Keyword.get(opts, :addon_task_timeout_ms, addon_stop_s * 1000 + 5_000)
-
-    results =
-      Task.Supervisor.async_stream_nolink(
-        Vagus.Jobs.TaskSupervisor,
-        entries,
-        fn entry ->
-          {entry.config.slug, stop_addon_fun.("addon_" <> entry.config.slug, addon_stop_s)}
-        end,
-        timeout: addon_task_timeout_ms,
-        on_timeout: :kill_task,
-        zip_input_on_exit: true,
-        max_concurrency: 4,
-        ordered: false
-      )
-      |> Enum.to_list()
-
-    ok_count = Enum.count(results, &addon_stop_ok?/1)
-    Enum.each(results, &log_addon_result/1)
-
-    {ok_count, total}
-  end
-
-  defp default_stop_addon(name, timeout_s) do
-    Vagus.Runtime.Docker.stop_container(name, timeout: timeout_s)
-  end
-
-  # Native-backend add-ons (the in-BEAM mqttx broker, `core_mqtt`) have no
-  # container to stop — mirrors `Vagus.Addon.Manager.put_backend/2`'s
-  # allowlist check exactly: a non-allowlisted `backend: :native` config
-  # silently runs in a container (see that module), so the allowlist check
-  # must be part of this filter, not just the raw `backend` tag, or a
-  # spoofed/legacy config would wrongly get skipped here and leave its
-  # very real container running unstopped.
-  defp native_backend?(%{config: %{backend: :native, slug: slug}}) do
-    Vagus.App.native_allowed?(slug)
-  end
-
-  defp native_backend?(_entry), do: false
-
-  defp addon_stop_ok?({:ok, {_slug, :ok}}), do: true
-  defp addon_stop_ok?(_other), do: false
-
-  defp log_addon_result({:ok, {_slug, :ok}}), do: :ok
-
-  defp log_addon_result({:ok, {slug, {:error, reason}}}) do
-    Logger.warning(
-      "Vagus.Host.Shutdown: add-on #{slug} stop failed, proceeding: #{inspect(reason)}"
-    )
-  end
-
-  defp log_addon_result({:exit, {entry, reason}}) do
-    Logger.warning(
-      "Vagus.Host.Shutdown: add-on #{entry.config.slug} stop timed out/crashed, proceeding: " <>
-        "#{inspect(reason)}"
-    )
-  end
-
-  ## stop_core/1
-
-  defp stop_core(opts) do
-    stop_core_fun = Keyword.get(opts, :stop_core, &Vagus.Core.Lifecycle.stop/0)
-    busy_retry_budget_ms = Keyword.get(opts, :busy_retry_budget_ms, @busy_retry_budget_ms)
-    busy_backoff_ms = Keyword.get(opts, :busy_backoff_ms, @busy_backoff_ms)
-    stage_started_at = System.monotonic_time(:millisecond)
-
-    stop_core_with_retry(
-      stop_core_fun,
-      stage_started_at,
-      busy_retry_budget_ms,
-      busy_backoff_ms
-    )
-  rescue
-    exception ->
-      Logger.warning(
-        "Vagus.Host.Shutdown: core stop raised (#{Exception.format(:error, exception, __STACKTRACE__)})"
-      )
-
-      {:error, {:raised, exception}}
-  catch
-    kind_caught, reason ->
-      Logger.warning(
-        "Vagus.Host.Shutdown: core stop failed (caught #{kind_caught}: #{inspect(reason)})"
-      )
-
-      {:error, {kind_caught, reason}}
-  end
-
-  defp stop_core_with_retry(stop_core_fun, stage_started_at, budget_ms, backoff_ms) do
-    case stop_core_fun.() do
-      :ok ->
-        :ok
-
-      {:error, :busy} ->
-        elapsed = System.monotonic_time(:millisecond) - stage_started_at
-
-        if elapsed < budget_ms do
-          Process.sleep(backoff_ms)
-
-          stop_core_with_retry(
-            stop_core_fun,
-            stage_started_at,
-            budget_ms,
-            min(backoff_ms * 2, @busy_backoff_cap_ms)
-          )
-        else
-          Logger.warning(
-            "Vagus.Host.Shutdown: core stop stayed busy for #{elapsed}ms, giving up — " <>
-              "proceeding with shutdown anyway"
-          )
-
-          :busy_gave_up
-        end
-
-      {:error, reason} ->
-        Logger.warning("Vagus.Host.Shutdown: core stop failed, proceeding: #{inspect(reason)}")
-        {:error, reason}
-    end
-  end
 end

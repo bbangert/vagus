@@ -194,4 +194,22 @@ defmodule Vagus.AppFixtures do
   end
 
   defp random_token, do: Base.url_encode64(:crypto.strong_rand_bytes(24), padding: false)
+
+  @doc "Points `:api_port` at a socket of ours: the test env runs no API listener."
+  @spec listening_api_port() :: :gen_tcp.socket()
+  def listening_api_port do
+    previous = Application.fetch_env(:vagus, :api_port)
+    {:ok, socket} = :gen_tcp.listen(0, active: false)
+    {:ok, port} = :inet.port(socket)
+    Application.put_env(:vagus, :api_port, port)
+
+    ExUnit.Callbacks.on_exit(fn ->
+      case previous do
+        {:ok, value} -> Application.put_env(:vagus, :api_port, value)
+        :error -> Application.delete_env(:vagus, :api_port)
+      end
+    end)
+
+    socket
+  end
 end

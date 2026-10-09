@@ -45,18 +45,10 @@ defmodule Vagus.Application do
         # `/services` endpoints have their store the moment requests arrive.
         Vagus.Addon.Registry,
         Vagus.Addon.State,
-
-        # Boot-time reconciliation (M4-P8-T1): restarts `boot: auto` add-ons
-        # left `:started` in the persisted state file. Sits unconditionally
-        # here on both :host and target — `start_link/1` returns `:ignore`
-        # unless `config :vagus, :addon_boot_start` is set (only target.exs
-        # sets it; :host/:test stay ephemeral). Started right after
-        # `Vagus.Addon.State` so it never races the store it reads from.
-        Vagus.Addon.BootStarter,
         Vagus.Addon.Store,
 
-        # Fills the store's catalog once after boot. Same config-gated
-        # `:ignore` convention as `BootStarter` above; without it the catalog
+        # Fills the store's catalog once after boot. `:ignore` unless its
+        # config key is set; without it the catalog
         # stays empty until someone calls `POST /store/reload`, which means a
         # blank add-on store (and no icons, since asset lookup goes through
         # the catalog) after every reboot. After `Store`, whose GenServer it
@@ -113,6 +105,8 @@ defmodule Vagus.Application do
 
         # One process per installed app, brought up from `Vagus.Addon.State`
         # (started above) before anything that reads apps through `Vagus.App`.
+        # Its orchestrator's boot waits for the rest of this tree before it
+        # starts any app.
         Vagus.App.Supervisor,
 
         # Keeps `Vagus.Addon.State` honest for native add-ons: demotes a broker
@@ -158,21 +152,11 @@ defmodule Vagus.Application do
           # isolation rationale.
           {Vagus.Core.Supervisor, []},
 
-          # Boot-time Core adoption (CL-P1-T2): polls the engine, then adopts
-          # (never creates) the HA Core container, same unconditional-child/
-          # config-gated-:ignore convention as `Vagus.Addon.BootStarter`
-          # above — see `Vagus.Core.Boot` for the poll/adopt rationale.
-          # Started after `Vagus.Core.Supervisor` so `Vagus.Core.Versions` (the
-          # seed target) is already up.
-          Vagus.Core.Boot,
-
           # Core watchdog pair (CW-P2-T2): API probe + crash-loop event half,
-          # isolated under their own supervisor. Unconditional child, gated by
-          # `config :vagus, :core_watchdog` via the same `:ignore` convention
-          # as `Vagus.Core.Boot` above (only target.exs sets it — no real Core
-          # container exists on :host/test). Placed after `Vagus.Core.Supervisor`
-          # (TokenStore subscription) and `Vagus.Core.Boot` (adoption seeds
-          # Versions before the first 120s probe tick could ever act).
+          # isolated under their own supervisor. Unconditional child, `:ignore`
+          # unless `config :vagus, :core_watchdog` is set (only target.exs sets
+          # it — no real Core container exists on :host/test). Placed after
+          # `Vagus.Core.Supervisor` for its TokenStore subscription.
           Vagus.Core.Watchdog.Supervisor,
 
           # First-boot provisioning (issue #40): auto-expand /data + auto-
@@ -180,9 +164,7 @@ defmodule Vagus.Application do
           # onboarding wizard needs zero console commands. Unconditional
           # child, `:ignore` unless `config :vagus, :first_boot_provision` is
           # set (only target.exs sets it — no real disk/Core to provision on
-          # :host/test). Placed after `Vagus.Core.Boot` so boot-time adoption
-          # seeds `Vagus.Core.Versions` first, keeping the already-installed
-          # path a cheap no-op.
+          # :host/test).
           Vagus.Provisioner,
 
           # Real /os/update (build-order #4): the GitHub-releases OTA
@@ -193,14 +175,7 @@ defmodule Vagus.Application do
           # `Vagus.Core.EventPusher` registered (a cast to an unregistered
           # name would be silently dropped — harmless, but the first check
           # is minutes after boot anyway).
-          Vagus.OS.Updater,
-
-          # Auto-installs + boots the default native provider (the mqttx broker,
-          # M5-P5). `:ignore` unless `config :vagus, :default_native_addon` is set
-          # (only target.exs sets it). Placed last so `Native.Supervisor`, the
-          # app tree and `Vagus.DNS` are all up before it installs + starts the
-          # broker (which needs none of the container engine).
-          Vagus.Addon.DefaultProvider
+          Vagus.OS.Updater
         ] ++ target_children()
 
     # Explicit restart budget (was the OTP default 3/5s): the top level now

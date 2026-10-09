@@ -49,7 +49,7 @@ defmodule Vagus.Network.Nat do
   re-inserted, since a jump sitting behind balena's is a jump that does
   nothing. That matters because the failure mode this guards against — a
   balena-engine restart re-writing the `nat` table — is not observable from
-  here, so the callers (`Vagus.Addon.BootStarter` at boot,
+  here, so the callers (`Vagus.App.Gates.network/0` at boot,
   `Vagus.Engine.Manager` after a daemon start) simply call it again and let
   the probes decide.
 

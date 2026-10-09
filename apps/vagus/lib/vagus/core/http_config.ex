@@ -57,8 +57,8 @@ defmodule Vagus.Core.HttpConfig do
   `Vagus.Core.Lifecycle` calls `refresh/1` at every point it establishes
   that Core is up: after a passing health gate (start / restart / rebuild /
   update) and on the already-running no-op `start/1` — the latter is the
-  Vagus-restarted-while-Core-kept-running case (`Vagus.Core.Boot` calls
-  `start/1` unconditionally), which has no health gate to hang off. Core's
+  Vagus-restarted-while-Core-kept-running case (boot's
+  `Vagus.App.CoreUnit.start/1` calls `start/1` unconditionally), which has no health gate to hang off. Core's
   port can change across its own restarts, so this is a re-pull on every
   such transition, never a pull-once.
 
@@ -87,7 +87,7 @@ defmodule Vagus.Core.HttpConfig do
   ## Why a process, and why the pull does not run inside it
 
   The cache is written by whoever drives Core's lifecycle (a router request
-  worker, `Vagus.Core.Boot`, the watchdog's action task) and read by
+  worker, boot's `Vagus.App.CoreUnit`, the watchdog's action task) and read by
   whichever Bandit worker is serving `core/info` — different processes,
   mutable state, so it needs an owner. No existing process fits:
   `Vagus.Core.Versions` owns the persisted *version* file (with its own

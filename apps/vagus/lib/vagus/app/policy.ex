@@ -1,14 +1,35 @@
 defmodule Vagus.App.Policy do
   @moduledoc """
-  Upstream Supervisor's service and discovery rules, as pure functions: the
-  app process and the router apply the results.
+  Upstream Supervisor's boot, service and discovery rules, as pure functions:
+  the orchestrator, the app process and the router apply the results.
   """
+
+  alias Vagus.Addon.Config
 
   @type message :: %{uuid: String.t(), addon: String.t(), service: String.t(), config: map()}
   @type caller :: :supervisor | {:addon, map()} | term()
 
   # `GET /services` lists these whether or not anything provides them.
   @known_services ~w(mqtt)
+
+  @doc """
+  What boot does with one app. Only one recorded `:started` is touched: a
+  running one is left alone, since starting it again would recreate its
+  container; a stopped one starts when its effective boot is `auto`, and is
+  otherwise recorded `:stopped` so its state stops claiming it runs. When the
+  engine could not be asked (`:unknown`) nothing is demoted.
+  """
+  @spec boot(map(), boolean() | :unknown) :: :start | :demote | :none
+  def boot(%{state: :started} = entry, running?) when running? in [false, :unknown] do
+    cond do
+      Config.effective_boot(entry.config, entry[:boot]) == "auto" -> :start
+      # Auto still starts: that is what `Manager.start_slug` does regardless of container state.
+      running? == :unknown -> :none
+      true -> :demote
+    end
+  end
+
+  def boot(_entry, _running?), do: :none
 
   @doc """
   Upstream compares discovery messages by `(app, service)` only, so a repeat

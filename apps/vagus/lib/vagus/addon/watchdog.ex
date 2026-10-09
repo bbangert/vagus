@@ -39,19 +39,18 @@ defmodule Vagus.Addon.Watchdog do
   a `die`/`unhealthy` event caused by a manual stop/restart/uninstall
   always finds `state: :stopped` here and is ignored, exactly like real
   Supervisor's `_manual_stop` flag would suppress it. Host-reboot
-  suppression falls out the same way, for free: `Vagus.Addon.BootStarter`
-  demotes any `:started` entry that isn't a `boot: auto` add-on (and any
-  `boot: auto` entry that fails to actually restart) to `:stopped` at boot,
-  so a stale `:started` record left over from before a reboot is corrected
-  before this watchdog ever sees a live event for it.
+  suppression falls out the same way, for free: boot
+  (`Vagus.App.Policy.boot/2`) demotes any `:started` entry whose effective
+  boot is not `auto` and whose container is not running to `:stopped`, so
+  such a stale record from before a reboot is corrected before this
+  watchdog ever sees a live event for it.
 
   A third suppression covers the window the other two can't: a host
   shutdown *actually in progress* (`Vagus.Host.Shutdown`, issue #39's
   graceful-shutdown facade). That module's own add-on stop stage runs
   ordinary `docker stop` calls against every started add-on, but
   deliberately does **not** record `:stopped` in `State` — its whole point
-  is that `Vagus.Addon.BootStarter` sees `:started` and restarts these
-  add-ons on the next boot, so the W6 mechanism above cannot apply here
+  is that the next boot sees `:started` and restarts these add-ons, so the W6 mechanism above cannot apply here
   (there is no `:stopped` for `eligible?/2` to find). Left unhandled, every
   one of those stops would look to this watchdog exactly like an
   unexpected crash and trigger a restart sequence *during* the shutdown
@@ -86,8 +85,7 @@ defmodule Vagus.Addon.Watchdog do
   above) — either one failing ends the sequence quietly, no further log.
   Five failed attempts give up: logged, and the entry is demoted to
   `:stopped` (`Vagus.Addon.State.put/3`) — an honest record for an add-on
-  the watchdog could not bring back up, mirroring `BootStarter`'s same
-  demote-on-failure move.
+  the watchdog could not bring back up.
 
   A task that raises/exits is caught inside the task itself (never
   propagated through the `Task.async/1` link back to this GenServer — a
