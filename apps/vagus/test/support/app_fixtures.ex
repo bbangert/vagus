@@ -43,8 +43,7 @@ defmodule Vagus.AppFixtures do
 
     :ok = State.put(config, state)
     if process?, do: {:ok, _pid} = Vagus.App.Instances.ensure(slug)
-    # `Vagus.App.set/2` asks the app, which would bring a missing process back.
-    if changes != [], do: :ok = set_app(slug, changes)
+    :ok = set_app(slug, changes)
 
     on_exit(fn -> forget_app(slug) end)
     config

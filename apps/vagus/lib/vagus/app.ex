@@ -21,11 +21,25 @@ defmodule Vagus.App do
   # `Vagus.Backups`' opts (`:server`, `:date`, `:extra`) are its own.
   @backup_opts [:backend, :data_root, :socket]
 
+  @doc """
+  The process's answer when it gives one, else the `Vagus.Addon.State` entry,
+  so a missing or stuck process never hides an installed app.
+  """
   @spec info(String.t()) :: {:ok, State.entry()} | :error
   def info(slug) do
-    case ask_healing(slug, :info) do
+    case ask(slug, :info) do
       {:ok, {:ok, entry}} -> {:ok, entry}
-      _other -> :error
+      {:ok, :error} -> :error
+      :absent -> from_state(slug)
+    end
+  end
+
+  # An entry whose process is missing (its start failed, or it was stopped out
+  # of band) gets one back here; a live but stuck one is left to its own fate.
+  defp from_state(slug) do
+    with {:ok, _entry} = found <- State.get(slug) do
+      if whereis(slug) == nil, do: Instances.ensure(slug)
+      found
     end
   end
 
@@ -51,7 +65,7 @@ defmodule Vagus.App do
   end
 
   @spec installed?(String.t()) :: boolean()
-  def installed?(slug), do: ask_healing(slug, :installed?) == {:ok, true}
+  def installed?(slug), do: match?({:ok, _entry}, State.get(slug))
 
   @spec slugs() :: [String.t()]
   def slugs, do: Enum.map(State.list(), & &1.config.slug)
@@ -68,24 +82,6 @@ defmodule Vagus.App do
     end
   catch
     :exit, _reason -> :absent
-  end
-
-  # An entry whose process is missing (its start failed, or it was stopped
-  # out of band) gets one back here, so the fact stays answerable.
-  defp ask_healing(slug, question) do
-    case ask(slug, question) do
-      :absent -> heal(slug, question)
-      answer -> answer
-    end
-  end
-
-  defp heal(slug, question) do
-    with {:ok, _entry} <- State.get(slug),
-         {:ok, _pid} <- Instances.ensure(slug) do
-      ask(slug, question)
-    else
-      _no_entry_or_no_start -> :absent
-    end
   end
 
   # A dead pid can still be listed until the directory's partition handles its
@@ -249,27 +245,37 @@ defmodule Vagus.App do
   """
   @spec install(Config.t()) :: :ok | {:error, :already_installed | term()}
   def install(%Config{slug: slug} = config) do
+    # Under the lifecycle lock so two installs of one slug cannot both pass the
+    # check, both pull and both write the entry. `Manager.install/2` does not
+    # take this lock itself; nesting it would drop it at the inner release.
+    :global.trans({{:addon_lifecycle, slug}, self()}, fn -> do_install(config) end, [node()])
+  end
+
+  defp do_install(%Config{slug: slug} = config) do
     if installed?(slug) do
       {:error, :already_installed}
     else
       with :ok <- Manager.install(config),
            :ok <- State.put(config, :stopped) do
-        case Instances.ensure(slug) do
-          {:ok, _pid} ->
-            :ok
-
-          # The entry went between the put and the start: uninstalled meanwhile.
-          :ignore ->
-            {:error, :not_found}
-
-          {:error, reason} = error ->
-            Logger.warning(
-              "App #{slug} installed but its process did not start: #{inspect(reason)}"
-            )
-
-            error
-        end
+        ensure_after_install(slug)
       end
+    end
+  end
+
+  # The install is durable once the entry is written; a process that does not
+  # start now comes back on the Orchestrator's next start or through `info/1`.
+  defp ensure_after_install(slug) do
+    case Instances.ensure(slug) do
+      {:ok, _pid} ->
+        :ok
+
+      # The entry went between the put and the start: uninstalled meanwhile.
+      :ignore ->
+        {:error, :not_found}
+
+      {:error, reason} ->
+        Logger.warning("App #{slug} installed but its process did not start: #{inspect(reason)}")
+        :ok
     end
   end
 

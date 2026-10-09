@@ -134,6 +134,32 @@ defmodule Vagus.AppTest do
       assert {:ok, %{state: :stopped}} = app_info(config.slug)
     end
 
+    test "an install whose process does not start is still installed" do
+      stop_instances()
+      config = config()
+      on_exit(fn -> forget_app(config.slug) end)
+
+      assert :ok = App.install(config)
+      assert App.installed?(config.slug)
+    end
+
+    test "concurrent installs of one slug pull once" do
+      config = config()
+      on_exit(fn -> forget_app(config.slug) end)
+      Backend.Fake.reset_calls()
+
+      results =
+        1..4
+        |> Enum.map(fn _ -> Task.async(fn -> App.install(config) end) end)
+        |> Task.await_many()
+
+      assert Enum.sort(results) ==
+               Enum.sort([:ok | List.duplicate({:error, :already_installed}, 3)])
+
+      pulls = Enum.filter(Backend.Fake.calls_for("addon_#{config.slug}"), &match?({:pull, _}, &1))
+      assert length(pulls) == 1
+    end
+
     test "a refused install records nothing" do
       config = %{config() | slug: "vagus"}
 
@@ -202,6 +228,33 @@ defmodule Vagus.AppTest do
     end
   end
 
+  describe "installed?/1" do
+    test "answers from the entry while the process is stuck" do
+      slug = track(config())
+      suspend(slug)
+
+      assert App.installed?(slug)
+    end
+
+    test "an entry with no process is installed without starting one" do
+      slug = track(config(), process: false)
+
+      assert App.installed?(slug)
+      assert [] = Elixir.Registry.lookup(Directory, {:slug, slug})
+    end
+  end
+
+  describe "Instances.ensure/1" do
+    test "is {:error, :unavailable} while the app supervisor is down" do
+      stop_instances()
+      config = config()
+      on_exit(fn -> forget_app(config.slug) end)
+      :ok = Vagus.Addon.State.put(config, :stopped)
+
+      assert {:error, :unavailable} = Vagus.App.Instances.ensure(config.slug)
+    end
+  end
+
   describe "list/0" do
     test "apps that do not answer share one deadline and are listed :unknown" do
       answering = track(config(), state: :started)
@@ -218,7 +271,9 @@ defmodule Vagus.AppTest do
     end
 
     test "an entry with no process is listed :unknown and info/1 brings it back" do
-      slug = track(config(), state: :started, process: false)
+      slug =
+        track(config(), state: :started, process: false, options: %{"a" => 1}, watchdog: true)
+
       assert [] = Elixir.Registry.lookup(Directory, {:slug, slug})
 
       assert [%{state: :unknown}] = Enum.filter(App.list(), &(&1.config.slug == slug))
@@ -248,6 +303,16 @@ defmodule Vagus.AppTest do
       for pid <- pids, do: _ = :sys.get_state(pid)
       refute_received _late_reply
     end
+  end
+
+  # A child stopped through `terminate_child/2` stays down until restarted;
+  # every app process goes with it.
+  defp stop_instances do
+    :ok = Supervisor.terminate_child(Vagus.App.Supervisor, Vagus.App.Instances)
+
+    on_exit(fn ->
+      {:ok, _pid} = Supervisor.restart_child(Vagus.App.Supervisor, Vagus.App.Instances)
+    end)
   end
 
   defp suspend(slug) do
