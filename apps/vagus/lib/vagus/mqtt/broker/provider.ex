@@ -15,7 +15,8 @@ defmodule Vagus.Mqtt.Broker.Provider do
   The app process keeps neither entry across its own restart while the broker
   keeps running, so this monitors it and publishes again into the next one,
   retrying on `opts[:publish_retry]` (`{attempts, delay_ms}`) while it is not
-  back. On `terminate/2` an app process that is down has nothing to withdraw:
+  back, then every `opts[:publish_backoff_ms]` for as long as it takes: a
+  native app always gets its service back. On `terminate/2` an app process that is down has nothing to withdraw:
   the next one starts empty. `opts[:withdraw_timeout]` (ms) bounds each of the
   two withdraw calls inside the child's shutdown timeout.
   """
@@ -27,6 +28,7 @@ defmodule Vagus.Mqtt.Broker.Provider do
   alias Vagus.App
 
   @publish_retry {10, 100}
+  @publish_backoff_ms 30_000
   @withdraw_timeout 1_000
 
   @service "mqtt"
@@ -66,6 +68,7 @@ defmodule Vagus.Mqtt.Broker.Provider do
       push: Keyword.get(opts, :push, &Vagus.Discovery.Push.notify/2),
       retry: retry,
       attempts: elem(retry, 0),
+      backoff_ms: Keyword.get(opts, :publish_backoff_ms, @publish_backoff_ms),
       ref: nil,
       uuid: nil,
       withdraw_timeout: Keyword.get(opts, :withdraw_timeout, @withdraw_timeout)
@@ -114,7 +117,11 @@ defmodule Vagus.Mqtt.Broker.Provider do
         case publish_into(state) do
           {:ok, message, outcome} ->
             announce(state, message, outcome)
-            %{state | ref: ref, uuid: message.uuid}
+
+            if state.attempts == 0,
+              do: Logger.info("Vagus.Mqtt.Broker.Provider: mqtt service published again")
+
+            %{state | ref: ref, uuid: message.uuid, attempts: elem(state.retry, 0)}
 
           _failed ->
             # Else every retry would leave one more monitor, each a later DOWN.
@@ -127,24 +134,26 @@ defmodule Vagus.Mqtt.Broker.Provider do
     end
   end
 
-  defp publish_into(%{slug: slug, payload: payload}) do
-    with :ok <- provide(slug, payload),
+  defp publish_into(%{slug: slug, payload: payload} = state) do
+    with :ok <- provide(state),
          do: App.add_discovery(slug, @service, payload)
   end
 
   # The key already held by this app is its own earlier post; held by another
   # app, the broker runs without the service until that app lets it go.
-  defp provide(slug, payload) do
+  defp provide(%{slug: slug, payload: payload} = state) do
     with {:error, :already_provided} <- App.provide_service(slug, @service, payload) do
       case List.keyfind(App.services(), @service, 0) do
         {@service, ^slug} ->
           :ok
 
         {@service, owner} ->
-          Logger.error(
-            "Vagus.Mqtt.Broker.Provider: the mqtt service is provided by app #{owner}, " <>
-              "not by #{slug}"
-          )
+          if state.attempts > 0 do
+            Logger.error(
+              "Vagus.Mqtt.Broker.Provider: the mqtt service is provided by app #{owner}, " <>
+                "not by #{slug}"
+            )
+          end
 
           {:error, {:provided_by, owner}}
 
@@ -171,13 +180,17 @@ defmodule Vagus.Mqtt.Broker.Provider do
     %{state | attempts: attempts - 1}
   end
 
+  # `attempts: 0` marks the slow cadence, so the error is logged once per outage.
   defp retry(state) do
-    Logger.error(
-      "Vagus.Mqtt.Broker.Provider: mqtt publish for #{state.slug} failed; " <>
-        "the broker runs without its service and discovery"
-    )
+    if state.attempts == 1 do
+      Logger.error(
+        "Vagus.Mqtt.Broker.Provider: mqtt publish for #{state.slug} failed; " <>
+          "the broker runs without its service and discovery until it succeeds"
+      )
+    end
 
-    state
+    Process.send_after(self(), :publish, state.backoff_ms)
+    %{state | attempts: 0}
   end
 
   defp payload(host, port, login) do

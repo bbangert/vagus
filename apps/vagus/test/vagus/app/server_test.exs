@@ -72,17 +72,38 @@ defmodule Vagus.App.ServerTest do
     assert_receive {:DOWN, ^ref, :process, ^pid, :normal}
   end
 
-  test "the discovery list of a gone app is still answered, then it stops :normal" do
+  test "a gone app lists no discovery and stops :normal" do
     slug = slug()
     install_app(app_config(slug))
     [{pid, _}] = lookup(slug)
-    {:ok, %{uuid: uuid}, :new} = :gen_statem.call(pid, {:add_discovery, "mqtt", %{}})
+    {:ok, _message, :new} = :gen_statem.call(pid, {:add_discovery, "mqtt", %{}})
     ref = Process.monitor(pid)
 
     :ok = State.delete(slug)
 
-    assert [%{uuid: ^uuid}] = :gen_statem.call(pid, :discovery_list)
+    assert [] = :gen_statem.call(pid, :discovery_list)
     assert_receive {:DOWN, ^ref, :process, ^pid, :normal}
+  end
+
+  test ":retire drops every key, returns the messages and refuses later writes" do
+    slug = slug()
+    install_app(app_config(slug))
+    [{pid, _}] = lookup(slug)
+    name = "svc_#{slug}"
+    :ok = :gen_statem.call(pid, {:provide_service, name, %{}})
+    {:ok, %{uuid: uuid} = message, :new} = :gen_statem.call(pid, {:add_discovery, "mqtt", %{}})
+
+    assert {:ok, [^message]} = :gen_statem.call(pid, :retire)
+
+    assert [] = Registry.lookup(Vagus.App.Directory, {:service, name})
+    assert [] = Registry.lookup(Vagus.App.Directory, {:discovery, uuid})
+    assert [{^pid, _}] = lookup(slug)
+    assert :error = :gen_statem.call(pid, {:service, name})
+    assert :error = :gen_statem.call(pid, {:discovery, uuid})
+    assert {:error, :unavailable} = :gen_statem.call(pid, {:provide_service, "other", %{}})
+    assert {:error, :unavailable} = :gen_statem.call(pid, {:add_discovery, "other", %{}})
+    assert [] = Registry.lookup(Vagus.App.Directory, {:service, "other"})
+    assert {:ok, []} = :gen_statem.call(pid, :retire)
   end
 
   test "format_status/1 redacts the log" do

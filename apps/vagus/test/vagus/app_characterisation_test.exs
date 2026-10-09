@@ -269,10 +269,13 @@ defmodule Vagus.AppCharacterisationTest do
     assert_receive {:discovery_push, :delete, %{uuid: ^uuid}}, 1_000
   end
 
-  test "uninstall also pushes the DELETE for a message posted while the container is removed" do
+  # Every message the app posted before the uninstall is deleted in Core; one
+  # the stopping container posts is refused, so nothing outlives the app.
+  test "a discovery posted while the container is removed is refused and never pushed" do
     capture_discovery_pushes()
     slug = "core_char_disc_late"
-    install_app(config(slug), state: :started)
+    installed = install_app(config(slug, %{"discovery" => ["mqtt", "other"]}), state: :started)
+    token = register_app_token(installed)
     name = "svc_#{slug}"
     :ok = Vagus.App.provide_service(slug, name, %{"password" => "p"})
     {:ok, %{uuid: early}, :new} = Vagus.App.add_discovery(slug, "mqtt", %{})
@@ -281,15 +284,17 @@ defmodule Vagus.AppCharacterisationTest do
     uninstall = Task.async(fn -> Vagus.App.uninstall(slug) end)
     assert_receive {:gate_entered, :remove, remover}, 5_000
 
-    {:ok, %{uuid: late}, :new} = Vagus.App.add_discovery(slug, "other", %{})
+    # Core's GET while the container stops already misses.
+    assert :error = Vagus.App.discovery(early)
+    conn = app_call(:post, "/discovery", token, %{"service" => "other", "config" => %{}})
+    assert conn.status == 503
     send(remover, :release)
     assert :ok = Task.await(uninstall)
 
     assert_receive {:discovery_push, :delete, %{uuid: ^early}}, 1_000
-    assert_receive {:discovery_push, :delete, %{uuid: ^late}}, 1_000
+    refute_received {:discovery_push, _method, _message}
     assert :error = Vagus.App.service(name)
     assert :error = Vagus.App.discovery(early)
-    assert :error = Vagus.App.discovery(late)
   end
 
   # Upstream's per-app job group rejects a second lifecycle job outright;

@@ -279,16 +279,24 @@ defmodule Vagus.AppTest do
     test "an app reads as not installed, not as a crash" do
       config = config()
       slug = track(config, process: false)
-      :ok = Supervisor.terminate_child(Vagus.Supervisor, Vagus.Addon.State)
-
-      on_exit(fn ->
-        {:ok, _pid} = Supervisor.restart_child(Vagus.Supervisor, Vagus.Addon.State)
-      end)
+      stop_state()
 
       refute App.installed?(slug)
       assert :absent = App.monitor(slug)
       assert {:error, :unavailable} = App.provide_service(slug, "svc_#{slug}", %{})
       assert {:error, :unavailable} = App.install(config)
+    end
+
+    test "an app with a live process gains no service and no discovery" do
+      slug = track(config())
+      [{pid, _}] = Elixir.Registry.lookup(Directory, {:slug, slug})
+      stop_state()
+
+      assert {:error, :unavailable} = App.provide_service(slug, "svc_#{slug}", %{})
+      assert {:error, :unavailable} = App.add_discovery(slug, "mqtt", %{})
+      assert Process.alive?(pid)
+      assert [] = Elixir.Registry.lookup(Directory, {:service, "svc_#{slug}"})
+      assert {:ok, []} = App.ask(slug, :discovery_list)
     end
   end
 
@@ -459,6 +467,14 @@ defmodule Vagus.AppTest do
 
     on_exit(fn ->
       {:ok, _pid} = Supervisor.restart_child(Vagus.App.Supervisor, Vagus.App.Instances)
+    end)
+  end
+
+  defp stop_state do
+    :ok = Supervisor.terminate_child(Vagus.Supervisor, Vagus.Addon.State)
+
+    on_exit(fn ->
+      {:ok, _pid} = Supervisor.restart_child(Vagus.Supervisor, Vagus.Addon.State)
     end)
   end
 

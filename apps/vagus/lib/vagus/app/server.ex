@@ -38,7 +38,7 @@ defmodule Vagus.App.Server do
   @impl :gen_statem
   def init(slug) do
     case State.get(slug) do
-      {:ok, _entry} -> {:ok, :idle, %{slug: slug, services: %{}, discovery: %{}}}
+      {:ok, _entry} -> {:ok, :idle, %{slug: slug, services: %{}, discovery: %{}, retired: false}}
       :error -> :ignore
     end
   end
@@ -51,6 +51,20 @@ defmodule Vagus.App.Server do
   def handle_event({:call, from}, :installed?, :idle, %{slug: slug}) do
     reply_and_stop_if_gone(from, read(slug), &match?({:ok, _entry}, &1))
   end
+
+  # Uninstall's snapshot: every key goes now, so Core's GET of a message misses
+  # while the container stops, and what the stopping app posts lands nowhere.
+  def handle_event({:call, from}, :retire, _state, data) do
+    keys = Enum.map(Map.keys(data.services), &{:service, &1})
+    keys = keys ++ Enum.map(Map.keys(data.discovery), &{:discovery, &1})
+    Enum.each(keys, &Registry.unregister(Directory, &1))
+    retired = %{data | services: %{}, discovery: %{}, retired: true}
+    {:keep_state, retired, [{:reply, from, {:ok, Map.values(data.discovery)}}]}
+  end
+
+  def handle_event({:call, from}, {write, _name, _payload}, _state, %{retired: true})
+      when write in [:provide_service, :add_discovery],
+      do: {:keep_state_and_data, [{:reply, from, {:error, :unavailable}}]}
 
   # The app's own re-post is refused too, as upstream refuses any second
   # provider: the key is already held.
@@ -114,10 +128,11 @@ defmodule Vagus.App.Server do
     end)
   end
 
-  # Still the list once the entry is gone: `Vagus.App.uninstall/1` reads it
-  # after the delete to tell Core about every message.
   def handle_event({:call, from}, :discovery_list, _state, data) do
-    reply_and_stop_if_gone(from, read(data.slug), fn _entry -> Map.values(data.discovery) end)
+    reply_and_stop_if_gone(from, read(data.slug), fn
+      :error -> []
+      _entry -> Map.values(data.discovery)
+    end)
   end
 
   # A typo'd question from one caller must not crash-loop every app process.

@@ -97,18 +97,20 @@ defmodule Vagus.App do
 
   # For writes an app makes about itself: its process may be missing while
   # it runs (a failed start, a stop out of band), and the write must land.
+  # State is asked even when a process is up: an app nobody can confirm is
+  # installed must not gain a service or a discovery.
   defp ask_healing(slug, question) do
-    case whereis(slug) do
-      nil -> call(heal(slug), question, 5_000)
-      pid -> call(pid, question, 5_000)
+    case state_get(slug) do
+      {:ok, _entry} -> call(whereis(slug) || ensure(slug), question, 5_000)
+      _unconfirmed -> :absent
     end
   end
 
-  defp heal(slug) do
-    with true <- installed?(slug),
-         {:ok, pid} <- Instances.ensure(slug) do
-      pid
-    else
+  defp heal(slug), do: if(installed?(slug), do: ensure(slug))
+
+  defp ensure(slug) do
+    case Instances.ensure(slug) do
+      {:ok, pid} -> pid
       _not_started -> nil
     end
   end
@@ -375,30 +377,27 @@ defmodule Vagus.App do
     # One critical section: a reinstall landing between the uninstall and the
     # stop would have its new process killed.
     with_slug_lock(slug, fn ->
-      # Read before too: the process stops itself once the entry is gone, so a
-      # question from anyone during the uninstall would take the list with it.
-      before = discovery_list(slug)
+      # Before the container stops: Core GETs a message before acting on its
+      # DELETE and ignores the DELETE while that still answers, and a message
+      # the stopping app posts now is refused instead of outliving it.
+      discovery = retire(slug)
       result = Manager.uninstall_holding_lock(slug)
-      # A message posted while the container was stopping is only in the
-      # process; this read finds the entry gone and stops it.
-      discovery = Enum.uniq_by(before ++ discovery_list(slug), & &1.uuid)
+      # Also when the app stays installed: its retired process refuses every
+      # write, so it goes and the next ask starts a fresh one.
+      Instances.stop(slug)
 
       # `:not_found` too: an entry deleted out of band can leave its process up.
-      if result in [:ok, {:error, :not_found}] do
-        # Stop first: Core GETs the message before acting on a DELETE and
-        # ignores the DELETE while that still answers.
-        Instances.stop(slug)
-        # Core keeps a config flow until told; its next boot pull is too late.
-        Enum.each(discovery, &Push.notify(:delete, &1))
-      end
+      # Core keeps a config flow until told; its next boot pull is too late.
+      if result in [:ok, {:error, :not_found}],
+        do: Enum.each(discovery, &Push.notify(:delete, &1))
 
       result
     end)
   end
 
-  defp discovery_list(slug) do
-    case ask(slug, :discovery_list) do
-      {:ok, messages} when is_list(messages) -> messages
+  defp retire(slug) do
+    case ask(slug, :retire) do
+      {:ok, {:ok, messages}} -> messages
       _absent -> []
     end
   end

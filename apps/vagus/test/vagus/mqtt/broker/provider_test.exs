@@ -72,13 +72,14 @@ defmodule Vagus.Mqtt.Broker.ProviderTest do
   test "publishes the mqtt service and discovery into its app's process", %{slug: slug} = ctx do
     install_app(app_config(slug))
     start_provider(ctx)
+    # The publish runs in a continue; its push is the last step.
+    assert_receive {:push, :post, %{service: "mqtt", addon: ^slug, uuid: uuid}}
 
     assert {:ok, ^slug, %{"username" => "addons", "host" => @host} = payload} =
              App.service("mqtt")
 
     assert payload["password"] != ""
-    assert {:ok, [%{service: "mqtt", uuid: uuid}]} = App.ask(slug, :discovery_list)
-    assert_receive {:push, :post, %{service: "mqtt", addon: ^slug, uuid: ^uuid}}
+    assert {:ok, [%{service: "mqtt", uuid: ^uuid}]} = App.ask(slug, :discovery_list)
   end
 
   test "the service login is the persisted password", ctx do
@@ -150,6 +151,31 @@ defmodule Vagus.Mqtt.Broker.ProviderTest do
 
     assert_receive {:push, :post, %{addon: ^slug}}, 5_000
     assert {:ok, ^slug, _payload} = App.service("mqtt")
+  end
+
+  test "after the fast retries it keeps publishing on the slow cadence", %{slug: slug} = ctx do
+    install_app(app_config(slug))
+    :ok = Supervisor.terminate_child(Vagus.App.Supervisor, Vagus.App.Instances)
+    on_exit(fn -> Supervisor.restart_child(Vagus.App.Supervisor, Vagus.App.Instances) end)
+
+    log =
+      ExUnit.CaptureLog.capture_log([level: :info], fn ->
+        provider = start_provider(ctx, publish_retry: {3, 0}, publish_backoff_ms: 50)
+        pid = Process.whereis(provider)
+        :erlang.trace(pid, true, [:receive])
+        # Three fast `:publish`es, then slow ones that must log nothing more.
+        for _ <- 1..5, do: assert_receive({:trace, ^pid, :receive, :publish}, 1_000)
+        assert :sys.get_state(provider).attempts == 0
+        refute_received {:push, _method, _message}
+
+        {:ok, _pid} = Supervisor.restart_child(Vagus.App.Supervisor, Vagus.App.Instances)
+        assert_receive {:push, :post, %{addon: ^slug, service: "mqtt"}}, 1_000
+        :erlang.trace(pid, false, [:receive])
+      end)
+
+    assert {:ok, ^slug, _payload} = App.service("mqtt")
+    assert length(String.split(log, "mqtt publish for #{slug} failed")) == 2
+    assert log =~ "mqtt service published again"
   end
 
   test "its app's own earlier provide is no refusal", %{slug: slug} = ctx do
