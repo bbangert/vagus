@@ -599,7 +599,7 @@ defmodule Vagus.App.Server do
     end
   end
 
-  defp put_setting({:options, options}, data), do: %{data | user_options: options}
+  defp put_setting({:options, options}, data), do: Policy.put_options(data, options)
   defp put_setting({key, value}, data), do: Map.put(data, key, value)
 
   defp watchdog_flip(%{watchdog: same}, %{watchdog: same}), do: []

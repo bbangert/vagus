@@ -684,6 +684,36 @@ defmodule Vagus.App.PolicyTest do
       assert data.user_options == %{"o" => 1}
     end
 
+    test "restore: options written since it began, even the same ones, are kept" do
+      data = running(%{user_options: %{"o" => 1}})
+      assert data.options_rev == 0
+      assert %{options_rev: 1, user_options: %{"o" => 1}} = Policy.put_options(data, %{"o" => 1})
+
+      args = %{staging_dir: "/s", options: %{"o" => 2}, start?: false}
+      {data, _} = begin(:restore, args, data)
+      assert data.run.acc.options_rev == 0
+      {data, _} = step(data, {:ok, %{was_running: true}})
+      {data, [{:step, {:set_options, nil}}]} = step(data, {:ok, "/data/addons/data/app_one"})
+
+      data = Policy.put_options(data, %{"o" => 1})
+      assert data.options_rev == 1
+      {data, effects} = step(data, {:ok, %{"o" => 2}})
+
+      assert effects == [{:step, {:drop_aside, nil}}]
+      assert %{user_options: %{"o" => 1}, options_rev: 1} = data
+    end
+
+    test "restore: its own commit bumps the revision" do
+      args = %{staging_dir: "/s", options: %{"o" => 2}, start?: false}
+      {data, _} = begin(:restore, args, running(%{user_options: %{"o" => 1}}))
+      {data, _} = step(data, {:ok, %{was_running: true}})
+      {data, _} = step(data, {:ok, "/data/addons/data/app_one"})
+      {data, effects} = step(data, {:ok, %{"o" => 2}})
+
+      assert [:persist, {:step, {:drop_aside, nil}}] = effects
+      assert %{user_options: %{"o" => 2}, options_rev: 1} = data
+    end
+
     test "restore: a failed swap ends it before the options are touched" do
       args = %{staging_dir: "/s", options: %{"o" => 2}, start?: true}
       {data, _} = begin(:restore, args, running(%{user_options: %{"o" => 1}}))

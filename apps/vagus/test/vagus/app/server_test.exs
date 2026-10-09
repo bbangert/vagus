@@ -832,6 +832,30 @@ defmodule Vagus.App.ServerTest do
       assert {:ok, %{state: :started, user_options: %{"greeting" => "mine"}}} = App.info(slug)
       assert {:ok, %{user_options: %{"greeting" => "mine"}}} = AppFile.read(slug)
     end
+
+    test "a mid-restore write of the options it began with still wins" do
+      {slug, pid} =
+        started(%{"options" => %{"greeting" => "hi"}, "schema" => %{"greeting" => "str"}})
+
+      assert :ok = App.set(slug, options: %{"greeting" => "before"})
+      before = data(pid)
+      args = %{staging_dir: "/s", options: %{"greeting" => "restored"}, start?: true}
+      t = op(pid, {:restore, args})
+      {_input, stopping} = step(:stop)
+
+      assert :ok = App.set(slug, options: before.user_options)
+
+      send(stopping, {:outcome, {:ok, %{was_running: true}}})
+      answer(:swap_data, {:ok, "/data"})
+      answer(:set_options, {:ok, args.options})
+      assert %{user_options: %{"greeting" => "before"}} = answer(:start, {:ok, @started})
+      answer(:drop_aside, {:ok, :ok})
+
+      assert :ok = Task.await(t)
+      assert data(pid).options_rev == before.options_rev + 1
+      assert {:ok, %{user_options: %{"greeting" => "before"}}} = App.info(slug)
+      assert {:ok, %{user_options: %{"greeting" => "before"}}} = AppFile.read(slug)
+    end
   end
 
   describe "update" do

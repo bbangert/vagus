@@ -438,8 +438,8 @@ defmodule Vagus.Backups do
       {:error, :not_installed} -> {:error, "Addon #{slug} is not installed"}
       {:error, :not_in_backup} -> {:error, "Addon #{slug} not in backup"}
       {:error, :too_large} -> {:error, "Addon #{slug}'s backup data exceeds the restore size cap"}
-      {:error, :malformed} -> {:error, "Addon #{slug}'s backup is malformed"}
-      {:error, %Jason.DecodeError{}} -> {:error, "Addon #{slug}'s backup is malformed"}
+      # Anything else the extraction refuses is a crafted or broken tar.
+      {:error, _reason} -> {:error, "Addon #{slug}'s backup is malformed"}
     end
   end
 

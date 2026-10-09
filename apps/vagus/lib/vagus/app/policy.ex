@@ -146,6 +146,7 @@ defmodule Vagus.App.Policy do
       config: nil,
       wanted: :stopped,
       user_options: %{},
+      options_rev: 0,
       ingress_token: nil,
       ingress_port: nil,
       ingress_panel: false,
@@ -171,6 +172,15 @@ defmodule Vagus.App.Policy do
     }
     |> Map.merge(Map.take(saved || %{}, @persisted))
   end
+
+  @doc """
+  Sets the options and bumps their revision. A restore compares revisions,
+  not values: a write of the very options it started from is still newer
+  than the backup.
+  """
+  @spec put_options(map(), map()) :: map()
+  def put_options(data, options),
+    do: %{data | user_options: options, options_rev: data.options_rev + 1}
 
   @doc "Readers hash a presented token the same way to find its key."
   @spec hash(String.t()) :: binary()
@@ -478,7 +488,7 @@ defmodule Vagus.App.Policy do
   # Every update branch that rolls back, a failed snapshot's included, needs
   # the version it started from.
   defp acc(:update, data), do: %{old: data.config}
-  defp acc(:restore, data), do: %{options_at: data.user_options}
+  defp acc(:restore, data), do: %{options_rev: data.options_rev}
   defp acc(_op, _data), do: %{}
 
   # `:port?` and `:start?` are resolved against the data current when they
@@ -794,8 +804,8 @@ defmodule Vagus.App.Policy do
   # caller was told so: a write since the op began is newer than the backup
   # and stands.
   defp on_outcome(:restore, :set_options, _, {:ok, options}, data) when is_map(options) do
-    if data.user_options == data.run.acc.options_at,
-      do: advance(%{data | user_options: options}, [:persist]),
+    if data.options_rev == data.run.acc.options_rev,
+      do: advance(put_options(data, options), [:persist]),
       else: advance(data, [])
   end
 

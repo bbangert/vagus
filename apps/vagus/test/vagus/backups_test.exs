@@ -646,15 +646,17 @@ defmodule Vagus.BackupsTest do
   end
 
   # As an uploaded backup may carry it: `addon_json` verbatim beside staged data.
-  defp backup_with_addon_json(slug, addon_json, server) do
-    inner = Path.join(System.tmp_dir!(), "vagus-inner-#{System.unique_integer([:positive])}")
-
-    :ok =
-      :erl_tar.create(
-        String.to_charlist(inner),
+  defp backup_with_addon_json(slug, addon_json, server),
+    do:
+      backup_with_inner(
+        slug,
         [{~c"./addon.json", addon_json}, {~c"./data/f.txt", "from the backup"}],
-        [:compressed]
+        server
       )
+
+  defp backup_with_inner(slug, members, server) do
+    inner = Path.join(System.tmp_dir!(), "vagus-inner-#{System.unique_integer([:positive])}")
+    :ok = :erl_tar.create(String.to_charlist(inner), members, [:compressed])
 
     backup_slug = "m#{System.unique_integer([:positive])}" |> String.slice(0, 8)
     backup_json = Jason.encode!(%{"slug" => backup_slug, "name" => "upload", "type" => "partial"})
@@ -688,6 +690,34 @@ defmodule Vagus.BackupsTest do
         install(slug, dr)
         File.write!(Path.join(data_dir(dr, slug), "f.txt"), "since")
         backup_slug = backup_with_addon_json(slug, unquote(addon_json), server)
+        :ok = @backend.reset_calls()
+
+        assert {:error, "Addon core_malformed's backup is malformed"} =
+                 Backups.restore_partial(backup_slug, [slug],
+                   server: server,
+                   data_root: dr,
+                   backend: @backend
+                 )
+
+        assert @backend.calls() == []
+        assert File.read!(Path.join(data_dir(dr, slug), "f.txt")) == "since"
+        assert restore_leftovers(dr) == []
+      end
+    end
+
+    for {label, members} <- [
+          {"an inner tar without addon.json", [{~c"./data/f.txt", "from the backup"}]},
+          {"a data member escaping the app dir",
+           [{~c"./addon.json", "{}"}, {~c"./data/../../escape.txt", "out"}]}
+        ] do
+      test "#{label} fails in pre-flight, nothing staged or touched", %{
+        data_root: dr,
+        server: server
+      } do
+        slug = "core_malformed"
+        install(slug, dr)
+        File.write!(Path.join(data_dir(dr, slug), "f.txt"), "since")
+        backup_slug = backup_with_inner(slug, unquote(Macro.escape(members)), server)
         :ok = @backend.reset_calls()
 
         assert {:error, "Addon core_malformed's backup is malformed"} =
