@@ -86,7 +86,7 @@ defmodule Vagus.Addon.Info do
   the same ground at the `State.put/3` level, but only the router test would
   notice if `Manager` started sourcing config from `Store`.)
   """
-  @spec render(Config.t(), :started | :stopped, map(), map()) :: map()
+  @spec render(Config.t(), :started | :stopped | :unknown, map(), map()) :: map()
   def render(%Config{} = config, state, options, settings \\ %{})
       when is_map(options) and is_map(settings) do
     latest = Map.get(settings, :version_latest)

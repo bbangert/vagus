@@ -40,6 +40,7 @@ defmodule Vagus.AppFixtures do
     check_keys!(changes)
 
     :ok = State.put(config, state)
+    {:ok, _pid} = Vagus.App.Instances.ensure(slug)
     :ok = set_app(slug, changes)
 
     on_exit(fn -> forget_app(slug) end)
@@ -87,6 +88,7 @@ defmodule Vagus.AppFixtures do
   """
   @spec forget_app(String.t()) :: :ok
   def forget_app(slug) do
+    :ok = Vagus.App.Instances.stop(slug)
     :ok = State.delete(slug)
     :ok = Registry.unregister_slug(slug)
   end

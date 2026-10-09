@@ -91,6 +91,28 @@ defmodule Vagus.AppTest do
       assert {:ok, %{state: :stopped}} = app_info(config.slug)
     end
 
+    test "an installed slug is refused before the pull" do
+      config = config()
+      on_exit(fn -> forget_app(config.slug) end)
+      assert :ok = App.install(config)
+      Backend.Fake.reset_calls()
+
+      assert {:error, :already_installed} = App.install(config)
+      refute Enum.any?(Backend.Fake.calls_for("addon_#{config.slug}"), &match?({:pull, _}, &1))
+    end
+
+    test "uninstall stops the app's process" do
+      config = config()
+      on_exit(fn -> forget_app(config.slug) end)
+      :ok = App.install(config)
+      [{pid, _}] = Elixir.Registry.lookup(Vagus.App.Directory, {:slug, config.slug})
+      ref = Process.monitor(pid)
+
+      assert :ok = App.uninstall(config.slug)
+      assert_receive {:DOWN, ^ref, :process, ^pid, :normal}
+      refute App.installed?(config.slug)
+    end
+
     test "a refused install records nothing" do
       config = %{config() | slug: "vagus"}
 
@@ -133,6 +155,69 @@ defmodule Vagus.AppTest do
 
     test "an untracked slug is not found" do
       assert {:error, :not_found} = App.ingress_target("app_test_untracked")
+    end
+  end
+
+  describe "ask/3" do
+    test "no process for the slug is :absent" do
+      assert :absent = App.ask("app_test_nobody", :info)
+    end
+
+    test "a process that stopped is :absent" do
+      slug = track(config())
+      [{pid, _}] = Elixir.Registry.lookup(Vagus.App.Directory, {:slug, slug})
+      :ok = :gen_statem.stop(pid)
+
+      assert :absent = App.ask(slug, :info)
+    end
+
+    test "a process that does not answer in time is :absent" do
+      slug = track(config())
+      [{pid, _}] = Elixir.Registry.lookup(Vagus.App.Directory, {:slug, slug})
+      :ok = :sys.suspend(pid)
+      on_exit(fn -> :sys.resume(pid) end)
+
+      assert :absent = App.ask(slug, :info, 50)
+    end
+  end
+
+  describe "list/0" do
+    test "an app that does not answer by the deadline is listed :unknown" do
+      answering = track(config(), state: :started)
+      stuck = track(config(), state: :started)
+      [{pid, _}] = Elixir.Registry.lookup(Vagus.App.Directory, {:slug, stuck})
+      :ok = :sys.suspend(pid)
+      on_exit(fn -> :sys.resume(pid) end)
+
+      started = System.monotonic_time(:millisecond)
+      listed = Map.new(App.list(), &{&1.config.slug, &1.state})
+      elapsed = System.monotonic_time(:millisecond) - started
+
+      assert %{^answering => :started, ^stuck => :unknown} = listed
+      assert elapsed < 1_000 + 500
+    end
+
+    test "gather/2 answers every app under one deadline" do
+      slugs = for _ <- 1..3, do: track(config())
+      stuck = Enum.at(slugs, 0)
+      [{pid, _}] = Elixir.Registry.lookup(Vagus.App.Directory, {:slug, stuck})
+      :ok = :sys.suspend(pid)
+      on_exit(fn -> :sys.resume(pid) end)
+
+      started = System.monotonic_time(:millisecond)
+      answers = Map.new(App.gather(:installed?, 200))
+      elapsed = System.monotonic_time(:millisecond) - started
+
+      assert answers[stuck] == :absent
+      for slug <- tl(slugs), do: assert(answers[slug] == {:ok, true})
+      assert elapsed < 200 + 300
+
+      # The stuck app answers once resumed; the abandoned request's reply must
+      # not land in the caller's mailbox. `get_state` returns only after the
+      # queued call has been handled.
+      :ok = :sys.resume(pid)
+      _ = :sys.get_state(pid)
+      refute_received _late_reply
     end
   end
 end

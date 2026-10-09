@@ -8,7 +8,9 @@ defmodule Vagus.App do
   without touching them.
   """
 
-  alias Vagus.Addon.{Config, Manager, Registry, State, Update}
+  alias Vagus.Addon.{Config, Manager, State, Update}
+  alias Vagus.Addon.Registry, as: Tokens
+  alias Vagus.App.{Directory, Instances}
   alias Vagus.Network
 
   @settings [:ingress_panel, :watchdog, :ports, :boot, :auto_update, :protected]
@@ -18,16 +20,108 @@ defmodule Vagus.App do
   @backup_opts [:backend, :data_root, :socket]
 
   @spec info(String.t()) :: {:ok, State.entry()} | :error
-  def info(slug), do: State.get(slug)
+  def info(slug) do
+    case ask(slug, :info) do
+      {:ok, {:ok, entry}} -> {:ok, entry}
+      _other -> :error
+    end
+  end
 
-  @spec list() :: [State.entry()]
-  def list, do: State.list()
+  @doc """
+  Every app the directory knows. One that does not answer within the gather
+  deadline but still has a State entry is listed with `state: :unknown`, which
+  `GET /addons` renders as upstream's `unknown`.
+  """
+  @spec list() :: [State.entry() | %{state: :unknown}]
+  def list do
+    Enum.flat_map(gather(:info), fn
+      {_slug, {:ok, {:ok, entry}}} -> [entry]
+      {slug, _unanswered} -> unknown(slug)
+    end)
+  end
+
+  defp unknown(slug) do
+    case State.get(slug) do
+      {:ok, entry} -> [%{entry | state: :unknown}]
+      :error -> []
+    end
+  catch
+    :exit, _reason -> []
+  end
 
   @spec installed?(String.t()) :: boolean()
-  def installed?(slug), do: match?({:ok, _entry}, State.get(slug))
+  def installed?(slug), do: ask(slug, :installed?) == {:ok, true}
 
   @spec slugs() :: [String.t()]
-  def slugs, do: Enum.map(State.list(), & &1.config.slug)
+  def slugs, do: Enum.map(directory(), &elem(&1, 0))
+
+  @doc """
+  `:absent` covers no process for the slug, a dead or unanswering one, and a
+  directory that is restarting: to a caller they all mean "no answer".
+  """
+  @spec ask(String.t(), term(), timeout()) :: {:ok, term()} | :absent
+  def ask(slug, question, timeout \\ 5_000) do
+    case whereis(slug) do
+      nil -> :absent
+      pid -> {:ok, :gen_statem.call(pid, question, timeout)}
+    end
+  catch
+    :exit, _reason -> :absent
+  end
+
+  # The directory drops a dead process's key only once its partition handles
+  # the exit, so a lookup can briefly return a pid that is already gone.
+  defp whereis(slug) do
+    case Registry.lookup(Directory, {:slug, slug}) do
+      [{pid, _value}] -> if Process.alive?(pid), do: pid
+      [] -> nil
+    end
+  rescue
+    # The directory is restarting.
+    ArgumentError -> nil
+  end
+
+  @doc """
+  Asks every app at once under one absolute deadline, so a single stuck app
+  costs the caller `deadline_ms`, not `deadline_ms` per app. Requests still
+  outstanding at the deadline are abandoned by `:gen_statem`, so no late reply
+  reaches the caller's mailbox.
+  """
+  @spec gather(term(), non_neg_integer()) :: [{String.t(), {:ok, term()} | :absent}]
+  def gather(question, deadline_ms \\ 1_000) do
+    deadline = {:abs, System.monotonic_time(:millisecond) + deadline_ms}
+    apps = directory()
+
+    answers =
+      apps
+      |> Enum.reduce(:gen_statem.reqids_new(), fn {slug, pid}, reqids ->
+        :gen_statem.send_request(pid, question, slug, reqids)
+      end)
+      |> collect(deadline, %{})
+
+    Enum.map(apps, fn {slug, _pid} -> {slug, Map.get(answers, slug, :absent)} end)
+  end
+
+  defp directory do
+    Directory
+    |> Registry.select([{{{:slug, :"$1"}, :"$2", :_}, [], [{{:"$1", :"$2"}}]}])
+    |> Enum.filter(fn {_slug, pid} -> Process.alive?(pid) end)
+  rescue
+    ArgumentError -> []
+  end
+
+  defp collect(reqids, deadline, answers) do
+    case :gen_statem.receive_response(reqids, deadline, true) do
+      {{:reply, reply}, slug, rest} ->
+        collect(rest, deadline, Map.put(answers, slug, {:ok, reply}))
+
+      {{:error, _reason}, _slug, rest} ->
+        collect(rest, deadline, answers)
+
+      _timeout_or_no_request ->
+        answers
+    end
+  end
 
   @doc """
   Writes `:options` and the per-install settings in the order given; `:error`
@@ -58,10 +152,10 @@ defmodule Vagus.App do
   defp write(slug, {:options, options}), do: State.put_options(slug, options)
   defp write(slug, {key, value}), do: State.put_setting(slug, key, value)
 
-  @doc "`:error` also when the Registry is not running, as in narrow test setups."
-  @spec identity_for_token(String.t()) :: {:ok, Registry.identity()} | :error
+  @doc "`:error` also when the token registry is not running, as in narrow test setups."
+  @spec identity_for_token(String.t()) :: {:ok, Tokens.identity()} | :error
   def identity_for_token(token) do
-    if Process.whereis(Registry), do: Registry.identity_for_token(token), else: :error
+    if Process.whereis(Tokens), do: Tokens.identity_for_token(token), else: :error
   end
 
   @spec resolve_ingress_token(String.t()) :: {:ok, String.t()} | :error
@@ -123,13 +217,28 @@ defmodule Vagus.App do
   def restart(slug), do: Manager.restart(slug)
 
   @spec uninstall(String.t()) :: :ok | {:error, term()}
-  def uninstall(slug), do: Manager.uninstall(slug)
+  def uninstall(slug) do
+    with :ok <- Manager.uninstall(slug), do: Instances.stop(slug)
+  end
 
-  @doc "Pulls the image and records the app installed but `:stopped`."
-  @spec install(Config.t()) :: :ok | {:error, term()}
-  def install(%Config{} = config) do
-    with :ok <- Manager.install(config) do
-      State.put(config, :stopped)
+  @doc """
+  Pulls the image and records the app installed but `:stopped`. An installed
+  slug is refused before the pull, as upstream does.
+  """
+  @spec install(Config.t()) :: :ok | {:error, :already_installed | term()}
+  def install(%Config{slug: slug} = config) do
+    if whereis(slug) do
+      {:error, :already_installed}
+    else
+      with :ok <- Manager.install(config),
+           :ok <- State.put(config, :stopped) do
+        case Instances.ensure(slug) do
+          {:ok, _pid} -> :ok
+          # The entry went between the put and the start: uninstalled meanwhile.
+          :ignore -> {:error, :not_found}
+          {:error, _reason} = error -> error
+        end
+      end
     end
   end
 

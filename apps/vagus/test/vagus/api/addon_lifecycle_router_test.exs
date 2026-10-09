@@ -790,6 +790,25 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
       assert Enum.any?(addons, &(&1["slug"] == "core_listed" and &1["state"] == "started"))
     end
 
+    test "an app that does not answer in time is listed unknown" do
+      config = fixture_config("stuck") |> Map.put(:slug, "core_stuck")
+      install_app(config, state: :started)
+      [{pid, _}] = Registry.lookup(Vagus.App.Directory, {:slug, "core_stuck"})
+      :ok = :sys.suspend(pid)
+      on_exit(fn -> :sys.resume(pid) end)
+
+      started = System.monotonic_time(:millisecond)
+      conn = supervisor_call(:get, "/addons")
+      elapsed = System.monotonic_time(:millisecond) - started
+
+      assert conn.status == 200
+
+      assert [%{"state" => "unknown"}] =
+               Enum.filter(body(conn)["data"]["addons"], &(&1["slug"] == "core_stuck"))
+
+      assert elapsed < 1_000 + 500
+    end
+
     test "an empty State -> empty list" do
       # `Vagus.Addon.State` is a global singleton other tests seed; this file is
       # async: false, so nothing runs concurrently and we can reset it to a

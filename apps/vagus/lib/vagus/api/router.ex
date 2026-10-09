@@ -2386,11 +2386,10 @@ defmodule Vagus.API.Router do
     end)
   end
 
-  # Store slugs and installed-state slugs share the same namespace
-  # (`core_mosquitto` both in the catalog and in `Vagus.Addon.State`).
-  # One `State` lookup per slug, not one per question. `GET /store/addons`
-  # renders the whole catalog, so asking twice per entry doubles the
-  # synchronous GenServer calls on the widest read path in the API.
+  # Store slugs and installed slugs share one namespace (`core_mosquitto` is
+  # both). `GET /store/addons` renders the whole catalog; `App.info/1` only
+  # calls an app process on a directory hit, so a catalog slug that is not
+  # installed costs one ETS lookup. Ask once per slug, not once per question.
   defp installed_entry(store_slug) do
     case App.info(store_slug) do
       {:ok, entry} -> entry
@@ -2670,6 +2669,10 @@ defmodule Vagus.API.Router do
     case App.install(config) do
       :ok ->
         Envelope.send_ok(conn, %{})
+
+      # Upstream's `AppAlreadyInstalledError` wording, which names the app.
+      {:error, :already_installed} ->
+        Envelope.send_error(conn, "App #{config.name} is already installed", 400)
 
       {:error, reason} ->
         Envelope.send_error(conn, inspect(reason), 400)
