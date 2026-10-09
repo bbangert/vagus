@@ -85,12 +85,7 @@ defmodule Vagus.App.Server do
         Logger.error("App #{slug}: its file cannot be read (#{inspect(reason)}); not started")
         :ignore
 
-      # Before any key or boot can reach the app, so a restore this process's
-      # predecessor died in never leaves it starting on an empty data dir.
-      # One that died after its swap restored the data but not the options;
-      # its caller got no reply, so the restore failed and a retry redoes it.
       {:ok, saved} ->
-        Steps.reconcile_asides(slug)
         {data, rewrite?} = claim_port(fresh(slug, saved), saved[:rewrite] == true)
         if rewrite?, do: rewritten(data), else: up(data)
     end

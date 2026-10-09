@@ -288,10 +288,6 @@ defmodule Vagus.Addon.Backend.NativeTest do
       def remove(_id, _opts \\ []), do: :ok
       @impl true
       def state(_id), do: {:ok, :stopped}
-      @impl true
-      def pause(_id, _opts \\ []), do: :ok
-      @impl true
-      def unpause(_id, _opts \\ []), do: :ok
     end
 
     setup do

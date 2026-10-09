@@ -91,7 +91,7 @@ defmodule Vagus.App.Steps do
   defp step(:stop, %{config: config} = input) do
     opts = opts(input)
     id = container_name(config.slug)
-    was_running = match?({:ok, state} when state in [:running, :paused], backend(opts).state(id))
+    was_running = match?({:ok, :running}, backend(opts).state(id))
 
     with :ok <- stop_and_remove_container(id, opts, input[:strict] == true),
          do: {:ok, %{was_running: was_running}}
@@ -103,7 +103,7 @@ defmodule Vagus.App.Steps do
     opts = opts(input)
     id = container_name(config.slug)
 
-    case stop_thawed(id, Keyword.put(opts, :timeout, @halt_timeout_s)) do
+    case backend(opts).stop(id, Keyword.put(opts, :timeout, @halt_timeout_s)) do
       :ok -> {:ok, :stopped}
       {:error, reason} -> {:error, reason}
     end
@@ -151,70 +151,40 @@ defmodule Vagus.App.Steps do
     }
 
     path = Path.join(dir, "#{config.slug}.tar.gz")
-    tar = fn -> Vagus.Backup.addon_tar(addon) end
 
-    {tarred, thawed} = if input[:pause], do: frozen(config, opts, tar), else: {tar.(), :ok}
-
-    with {:ok, gz, _size} <- tarred,
+    with {:ok, gz, _size} <- Vagus.Backup.addon_tar(addon),
          :ok <- File.mkdir_p(dir),
          :ok <- File.write(path, gz) do
-      if match?({:error, _reason}, thawed), do: {:ok, {:still_paused, path}}, else: {:ok, path}
+      {:ok, path}
     end
   end
 
-  defp step(:unpause, %{config: config} = input) do
-    case thaw(container_name(config.slug), opts(input)) do
-      {:error, reason} -> {:error, reason}
-      thawed -> {:ok, thawed}
-    end
-  end
-
-  # The old data is set aside, not removed, until the new is in place, so a
-  # failed rename leaves the app's data as it was. The staging dir is a
-  # sibling of the data dir, so each rename stays on one filesystem. A failed
-  # swap removes the staged data itself, as its caller may be gone; the aside
-  # of one that succeeded goes in `drop_aside`, outside this deadline.
-  # The staging path comes from the op's args and is renamed and removed as
-  # root, so anything but this app's own restore sibling is refused.
+  # As upstream's wipe-then-extract, there is no rollback: a crash or failure
+  # between the two leaves the app on an empty data dir, and the caller, who
+  # got no reply or the error, retries. The staging dir is a sibling of the
+  # data dir, so the rename stays on one filesystem. The staging path comes
+  # from the op's args and is renamed and removed as root, so anything but
+  # this app's own restore sibling is refused.
   # path is internal/config-derived, not request input
   # sobelow_skip ["Traversal.FileModule"]
   defp step(:swap_data, %{config: config, staging_dir: staging} = input) do
     data_dir = data_dir(data_root(opts(input)), config.slug)
-    aside = staging <> ".old"
 
     with :ok <- restore_sibling(staging, data_dir, config.slug),
-         :ok <- set_aside(data_dir, aside),
-         :ok <- swap_in(staging, data_dir, aside) do
+         {:ok, _removed} <- File.rm_rf(data_dir),
+         :ok <- File.rename(staging, data_dir) do
       {:ok, data_dir}
     else
       {:error, :bad_staging} = error ->
         error
 
+      {:error, reason, path} ->
+        File.rm_rf(staging)
+        {:error, {:remove_data_dir, path, reason}}
+
       error ->
         File.rm_rf(staging)
         error
-    end
-  end
-
-  # The op's last step, so the aside is gone before the app is free for an
-  # uninstall: one left behind a removed data dir is what `reconcile_asides/2`
-  # moves back. The data is already restored, so this never fails the op.
-  # path is internal/config-derived, not request input
-  # sobelow_skip ["Traversal.FileModule"]
-  defp step(:drop_aside, %{config: config, staging_dir: staging} = input) do
-    data_dir = data_dir(data_root(opts(input)), config.slug)
-
-    with :ok <- restore_sibling(staging, data_dir, config.slug),
-         {:ok, _removed} <- File.rm_rf(staging <> ".old") do
-      {:ok, :ok}
-    else
-      error ->
-        Logger.warning(
-          "Vagus.App.Steps: #{config.slug}'s pre-restore data at #{staging}.old was not " <>
-            "removed (#{inspect(error)}); its next start removes it"
-        )
-
-        {:ok, :kept}
     end
   end
 
@@ -277,76 +247,6 @@ defmodule Vagus.App.Steps do
     end
   end
 
-  # The walk lstats each entry and then reads it; frozen, nothing in the
-  # container can swap a file for a symlink in between. A failed unpause does
-  # not fail the snapshot: the tar is whole. It is returned beside the tar's
-  # result, so the operation can thaw the app again before it ends.
-  defp frozen(config, opts, tar) do
-    id = container_name(config.slug)
-
-    case backend(opts).pause(id, opts) do
-      :ok ->
-        tar_thawed(id, opts, tar)
-
-      # An app wanted started but not yet adopted may have no container.
-      {:error, {:http, 404}} ->
-        {tar.(), :ok}
-
-      # The engine's 409 is either "not running" or "already paused": a
-      # paused one is frozen all the same, and must still be thawed. Only a
-      # state that rules out a pause tars unthawed; anything else fails the
-      # snapshot, so the operation thaws whatever may be paused.
-      {:error, {:http, 409}} ->
-        case backend(opts).state(id) do
-          {:ok, :paused} -> tar_thawed(id, opts, tar)
-          {:ok, state} when state in [:stopped, :unknown] -> {tar.(), :ok}
-          {:ok, state} -> {{:error, {:pause, {:conflict, state}}}, :ok}
-          {:error, reason} -> {{:error, {:pause, reason}}, :ok}
-        end
-
-      {:error, reason} ->
-        {{:error, {:pause, reason}}, :ok}
-    end
-  end
-
-  defp tar_thawed(id, opts, tar) do
-    tar.()
-  catch
-    kind, reason ->
-      thaw(id, opts)
-      :erlang.raise(kind, reason, __STACKTRACE__)
-  else
-    tarred -> {tarred, thaw(id, opts)}
-  end
-
-  # A 409 is a container that is not paused, and a 404 one that is gone:
-  # either way nothing is frozen, which is what was asked.
-  defp thaw(id, opts) do
-    case backend(opts).unpause(id, opts) do
-      :ok ->
-        :ok
-
-      {:error, {:http, status}} when status in [404, 409] ->
-        :not_paused
-
-      {:error, reason} = error ->
-        Logger.error("Vagus.App.Steps: unpause #{id} failed: #{inspect(reason)}")
-        error
-    end
-  end
-
-  # The engine refuses to stop a paused container with a 409: a snapshot task
-  # killed by its deadline, a halt or its process dying leaves one paused, so
-  # it is thawed and stopped once more.
-
-  defp stop_thawed(id, opts) do
-    with {:error, {:http, 409}} <- backend(opts).stop(id, opts) do
-      Logger.warning("Vagus.App.Steps: #{id} refused to stop; unpausing it and stopping again")
-      thaw(id, opts)
-      backend(opts).stop(id, opts)
-    end
-  end
-
   # `addon.json`'s `system` block. A restoring HAOS validates it against
   # `SCHEMA_APP_SYSTEM` (the app config schema plus a required `repository`)
   # and uses it to find the image of an app the target lacks. Only keys whose
@@ -377,41 +277,12 @@ defmodule Vagus.App.Steps do
     end
   end
 
-  # path is internal/config-derived, not request input
-  # sobelow_skip ["Traversal.FileModule"]
-  defp set_aside(data_dir, aside) do
-    case File.rename(data_dir, aside) do
-      {:error, :enoent} -> :ok
-      result -> result
-    end
-  end
-
   defp restore_sibling(staging, data_dir, slug) do
     sibling? =
       Path.dirname(staging) == Path.dirname(data_dir) and
         Regex.match?(~r/\A\.restore-#{Regex.escape(slug)}-\d+\z/, Path.basename(staging))
 
     if sibling?, do: :ok, else: {:error, :bad_staging}
-  end
-
-  # An `:enoent` rename back is an app that had no data dir to set aside.
-  # path is internal/config-derived, not request input
-  # sobelow_skip ["Traversal.FileModule"]
-  defp swap_in(staging, data_dir, aside) do
-    with {:error, _reason} = error <- File.rename(staging, data_dir) do
-      case File.rename(aside, data_dir) do
-        {:error, reason} when reason != :enoent ->
-          Logger.error(
-            "Vagus.App.Steps: #{data_dir} was not moved back after a failed swap " <>
-              "(#{inspect(reason)}); its data is at #{aside}"
-          )
-
-        _restored ->
-          :ok
-      end
-
-      error
-    end
   end
 
   defp opts(input),
@@ -506,11 +377,8 @@ defmodule Vagus.App.Steps do
   # name. The real Supervisor's `DockerInterface.run` stops+removes any
   # existing container before creating (§A1.4 — no restart policy, the manager
   # owns the lifecycle), so do the same, tolerantly (absent/not-running is fine).
-  # Through `stop_thawed/2`: a container a snapshot left paused refuses the
-  # stop, and boot replaces one here, so it gets its graceful stop rather
-  # than only the forced remove's kill.
   defp remove_stale_container(spec, opts) do
-    _ = stop_thawed(spec.name, Keyword.take(opts, [:backend]))
+    _ = backend(opts).stop(spec.name, [])
     _ = backend(opts).remove(spec.name, [])
     :ok
   end
@@ -954,7 +822,7 @@ defmodule Vagus.App.Steps do
   end
 
   defp stop_container(id, opts, strict?) do
-    case stop_thawed(id, opts) do
+    case backend(opts).stop(id, opts) do
       result when result in [:ok, {:error, {:http, 404}}] ->
         :ok
 
@@ -1000,21 +868,14 @@ defmodule Vagus.App.Steps do
     ArgumentError -> :error
   end
 
-  # A restore's aside goes first: one that outlived the data dir (its drop
-  # failed, or the restore's start did before it) is what
-  # `reconcile_asides/2` would move back as the app's only copy.
   # path is internal/config-derived, not request input
   # sobelow_skip ["Traversal.FileModule"]
   defp remove_data_dir(slug, opts) do
     if Config.valid_slug?(slug) do
-      parent = Path.join([data_root(opts), "addons", "data"])
-
-      Enum.reduce_while(asides(parent, slug) ++ [Path.join(parent, slug)], :ok, fn path, :ok ->
-        case File.rm_rf(path) do
-          {:ok, _removed} -> {:cont, :ok}
-          {:error, reason, failed} -> {:halt, {:error, {:remove_data_dir, failed, reason}}}
-        end
-      end)
+      case File.rm_rf(Path.join([data_root(opts), "addons", "data", slug])) do
+        {:ok, _removed} -> :ok
+        {:error, reason, path} -> {:error, {:remove_data_dir, path, reason}}
+      end
     else
       Logger.warning(
         "Vagus.App.Steps: refusing to rm_rf the data dir for unsafe slug #{inspect(slug)}"
@@ -1022,53 +883,6 @@ defmodule Vagus.App.Steps do
 
       {:error, {:invalid_slug, slug}}
     end
-  end
-
-  @doc """
-  Settles the asides an interrupted restore of `slug` left beside its data
-  dir. With no data dir, an aside holds the pre-restore data, the only copy,
-  and moves back; beside one, the swap completed and it goes. Its owner runs
-  this before the app can start, so it never boots on an empty data dir.
-  `opts[:data_root]` overrides the configured data root.
-  """
-  @spec reconcile_asides(String.t(), keyword()) :: :ok
-  # path is internal/config-derived, not request input
-  # sobelow_skip ["Traversal.FileModule"]
-  def reconcile_asides(slug, opts \\ []) do
-    parent = Path.join([data_root(opts), "addons", "data"])
-    data_dir = Path.join(parent, slug)
-
-    if Config.valid_slug?(slug) do
-      for aside <- asides(parent, slug), do: reconcile_aside(aside, data_dir, slug)
-    end
-
-    :ok
-  end
-
-  # path is internal/config-derived, not request input
-  # sobelow_skip ["Traversal.FileModule"]
-  defp reconcile_aside(aside, data_dir, slug) do
-    if File.dir?(data_dir) do
-      File.rm_rf(aside)
-      Logger.info("Vagus.App.Steps: #{slug}'s completed restore left #{aside}; removed")
-    else
-      case File.rename(aside, data_dir) do
-        :ok ->
-          Logger.warning("Vagus.App.Steps: #{slug}'s data moved back from #{aside}")
-
-        {:error, reason} ->
-          Logger.error(
-            "Vagus.App.Steps: #{slug}'s data could not move back from #{aside} " <>
-              "(#{inspect(reason)}); kept there"
-          )
-      end
-    end
-  end
-
-  defp asides(parent, slug) do
-    for path <- Path.wildcard(Path.join(parent, ".restore-*.old"), match_dot: true),
-        Regex.match?(~r/\A\.restore-#{Regex.escape(slug)}-\d+\.old\z/, Path.basename(path)),
-        do: path
   end
 
   # Uninstall only, as upstream: Core answers a push for a panel it already

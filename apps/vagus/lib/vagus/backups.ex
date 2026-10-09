@@ -25,7 +25,6 @@ defmodule Vagus.Backups do
   alias Vagus.Addon.Config
   alias Vagus.API.StaticData
   alias Vagus.App
-  alias Vagus.App.Steps
 
   @default_data_root "/data"
 
@@ -254,7 +253,8 @@ defmodule Vagus.Backups do
   # sobelow_skip ["Traversal.FileModule"]
   def sweep_stale(opts \\ []) do
     File.rm_rf(staging_root(backup_dir(opts)))
-    sweep_restores(data_root(opts))
+    restores = Path.join([data_root(opts), "addons", "data", ".restore-*"])
+    for path <- Path.wildcard(restores, match_dot: true), do: File.rm_rf(path)
     :ok
   end
 
@@ -293,22 +293,6 @@ defmodule Vagus.Backups do
 
       :error ->
         {:reply, :error, state}
-    end
-  end
-
-  # An aside goes to `Vagus.App.Steps.reconcile_asides/2`, which every start
-  # of its app's process also runs; here it covers one whose app never starts
-  # again (its file unreadable).
-  # path is internal/config-derived, not request input
-  # sobelow_skip ["Traversal.FileModule"]
-  defp sweep_restores(data_root) do
-    parent = Path.join([data_root, "addons", "data"])
-
-    for path <- Path.wildcard(Path.join(parent, ".restore-*"), match_dot: true) do
-      case Regex.run(~r/\A\.restore-(.+)-\d+\.old\z/, Path.basename(path)) do
-        [_all, slug] -> Steps.reconcile_asides(slug, data_root: data_root)
-        nil -> File.rm_rf(path)
-      end
     end
   end
 
@@ -469,10 +453,8 @@ defmodule Vagus.Backups do
   # rename on one filesystem and a write that fails here (disk full) leaves
   # its data untouched; the parent is mounted into no app. It is removed here
   # on every exit, a raise included, since an op that never ran (the app busy
-  # or gone) leaves it and otherwise only the boot sweep would. The old data a
-  # swap set aside is the op's own to remove: once it replies, the app is free
-  # for an uninstall this could race. `opts[:app]` stands in for `Vagus.App`
-  # in tests.
+  # or gone) leaves it and otherwise only the boot sweep would. `opts[:app]`
+  # stands in for `Vagus.App` in tests.
   # path is internal/config-derived, not request input
   # sobelow_skip ["Traversal.FileModule"]
   defp restore_app(slug, {options, start?}, files, data_root, opts) do

@@ -20,7 +20,7 @@ defmodule Vagus.Addon.Backend do
   @type id :: String.t()
 
   @typedoc "Coarse runtime state, normalized across backends."
-  @type state :: :running | :paused | :stopped | :restarting | :unknown
+  @type state :: :running | :stopped | :restarting | :unknown
 
   @doc "Ensure the add-on's image/artifact is present locally."
   @callback pull(Spec.t()) :: :ok | {:error, term()}
@@ -33,11 +33,6 @@ defmodule Vagus.Addon.Backend do
 
   @doc "Stop a running add-on (`opts[:timeout]` seconds). Idempotent."
   @callback stop(id(), keyword()) :: :ok | {:error, term()}
-
-  @doc "Freezes a running add-on's processes, so its files hold still while they are read."
-  @callback pause(id(), keyword()) :: :ok | {:error, term()}
-
-  @callback unpause(id(), keyword()) :: :ok | {:error, term()}
 
   @doc "Remove an add-on's container/instance. Idempotent (missing is `:ok`)."
   @callback remove(id(), keyword()) :: :ok | {:error, term()}

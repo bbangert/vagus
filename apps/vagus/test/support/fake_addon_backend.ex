@@ -104,18 +104,6 @@ defmodule Vagus.Addon.Backend.Fake do
     :ok
   end
 
-  @impl true
-  def pause(id, _opts \\ []) do
-    record({:pause, id})
-    :ok
-  end
-
-  @impl true
-  def unpause(id, _opts \\ []) do
-    record({:unpause, id})
-    :ok
-  end
-
   @doc "`Vagus.Runtime.Docker.exec/3`'s shape, passed as `docker:` so a hook lands in the same record."
   @spec exec(String.t(), String.t(), keyword()) :: :ok
   def exec(id, cmd, _opts \\ []) do

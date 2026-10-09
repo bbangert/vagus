@@ -256,7 +256,7 @@ defmodule Vagus.API.BackupRouterTest do
       assert Backups.list() == []
     end
 
-    test "a cold app is stopped and started again by its own op; a hot one is paused", %{
+    test "a cold app is stopped and started again by its own op; a hot one is left running", %{
       data_root: dr
     } do
       install("core_rt_cold", dr, :started, %{"backup" => "cold"})
@@ -274,8 +274,7 @@ defmodule Vagus.API.BackupRouterTest do
       assert :start in started
       assert {:ok, %{state: :started}} = app_info("core_rt_cold")
 
-      assert Fake.calls_for("addon_core_rt_hot") ==
-               [{:pause, "addon_core_rt_hot"}, {:unpause, "addon_core_rt_hot"}]
+      assert Fake.calls_for("addon_core_rt_hot") == []
     end
 
     test "a busy app fails the backup with upstream's busy text naming it", %{data_root: dr} do

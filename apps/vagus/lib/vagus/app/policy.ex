@@ -123,9 +123,8 @@ defmodule Vagus.App.Policy do
     halt_stop: 40_000,
     snapshot: 600_000,
     exec_hook: 120_000,
-    unpause: 30_000,
-    swap_data: 60_000,
-    drop_aside: 600_000,
+    # Removes the old data dir first: a walk as long as a snapshot's.
+    swap_data: 600_000,
     set_options: 15_000,
     remove_app: 120_000,
     reclaim_image: 60_000
@@ -504,16 +503,15 @@ defmodule Vagus.App.Policy do
   defp steps(:halt, _args, _data), do: [{:halt_stop, nil}]
 
   # The backup decides whether the app ends running, as it decides its data.
-  # The old data goes last, so a large one never holds back the start. The
-  # stop is strict: a container a failed stop left running would write into
-  # the directory the swap replaces.
+  # The stop is strict: a container a failed stop left running would write
+  # into the directory the swap replaces.
   defp steps(:restore, args, _data) do
     start = if args[:start?], do: start_steps(), else: []
-    [{:stop, :strict}, {:swap_data, nil}, {:set_options, nil}] ++ start ++ [{:drop_aside, nil}]
+    [{:stop, :strict}, {:swap_data, nil}, {:set_options, nil}] ++ start
   end
 
-  # A stop a snapshot follows is strict, as the restore's: the tar is not
-  # paused, so a container still running would write under it.
+  # A stop a snapshot follows is strict, as the restore's: a container still
+  # running would write under the tar.
   defp steps(:update, args, _data) do
     {stop, snapshot} =
       if args[:backup], do: {{:stop, :strict}, [{:snapshot, nil}]}, else: {{:stop, nil}, []}
@@ -521,15 +519,17 @@ defmodule Vagus.App.Policy do
     [{:pull, nil}, stop] ++ snapshot ++ [{:commit, nil}, {:start?, nil}, {:reclaim_image, nil}]
   end
 
-  # The hooks follow the pause: a container that may be running and writing
-  # is quiesced by its own hooks too, not frozen behind their back.
+  # Hooks go to any container that may be running, by name: this process's
+  # last-seen state can lag the engine, and one that is not there skips them.
   defp steps(:backup, _args, data) do
     cond do
       data.config.backup == "cold" -> [{:stop, :strict}, {:snapshot, nil}, {:start?, nil}]
-      held?(data) -> hook(data, :pre) ++ [{:snapshot, nil}] ++ hook(data, :post)
-      true -> [{:snapshot, nil}]
+      Steps.native?(data.config) or not hooked?(data) -> [{:snapshot, nil}]
+      true -> hook(data, :pre) ++ [{:snapshot, nil}] ++ hook(data, :post)
     end
   end
+
+  defp hooked?(data), do: data.container_id != nil or data.wanted == :started
 
   defp start_steps, do: [{:port?, nil}, {:mint_token, nil}, {:start, nil}]
 
@@ -772,40 +772,8 @@ defmodule Vagus.App.Policy do
     advance(put_steps(data, [{:start?, nil}]), [])
   end
 
-  # A snapshot that failed may have held the container paused past its own
-  # unpause: killed, it never ran one, and a failed tar's may have failed
-  # too. A container not paused answers the unpause with a harmless 409.
-  defp on_outcome(:backup, :snapshot, _, {:error, _reason} = result, data) do
-    data = put_acc(data, :result, result)
-    steps = if pause?(data), do: [{:unpause, nil} | data.run.steps], else: data.run.steps
-    advance(put_steps(data, steps), [])
-  end
-
-  # The tar is whole but the snapshot's own unpause failed: thawed again
-  # before the op goes on, as after a killed one.
-  defp on_outcome(:backup, :snapshot, _, {:ok, {:still_paused, path}}, data) do
-    data = put_acc(data, :result, {:ok, path})
-    advance(put_steps(data, [{:unpause, nil} | data.run.steps]), [])
-  end
-
-  defp on_outcome(:backup, :snapshot, _, {:ok, _path} = result, data),
+  defp on_outcome(:backup, :snapshot, _, result, data),
     do: advance(put_acc(data, :result, result), [])
-
-  defp on_outcome(:backup, :unpause, _, {:ok, _thawed}, data), do: advance(data, [])
-
-  # Still frozen, so not healthy, and a post hook would hang on it: the stop
-  # by name thaws and removes it, then the restart rule. An earlier snapshot
-  # error stays the reply. Logged where it failed: by the step, or by the
-  # process for a dead one.
-  defp on_outcome(:backup, :unpause, _, {:error, reason}, data) do
-    cause =
-      case data.run.acc[:result] do
-        {:error, earlier} -> earlier
-        _tar_whole -> {:unpause, reason}
-      end
-
-    cleanup(%{data | last_event: {:failed, {:unpause, reason}}}, cause, [])
-  end
 
   defp on_outcome(:backup, :exec_hook, :pre, {:ok, _}, data), do: advance(data, [])
 
@@ -827,7 +795,6 @@ defmodule Vagus.App.Policy do
 
   defp on_outcome(:restore, :set_options, _, {:ok, nil}, data), do: advance(data, [])
   defp on_outcome(:restore, :set_options, _, {:error, reason}, data), do: fail(data, reason, [])
-  defp on_outcome(:restore, :drop_aside, _, _outcome, data), do: advance(data, [])
   defp on_outcome(:update, :reclaim_image, _, _outcome, data), do: advance(data, [])
   # The commit point of an uninstall: from here nothing writes the file
   # again, so nothing that follows can bring the app back.
@@ -954,8 +921,7 @@ defmodule Vagus.App.Policy do
     %{
       staging_dir: run.args[:staging_dir],
       user_options: data.user_options,
-      state: state,
-      pause: pause?(data)
+      state: state
     }
   end
 
@@ -963,22 +929,11 @@ defmodule Vagus.App.Policy do
   defp input(:exec_hook, :post, data), do: %{cmd: data.config.backup_post}
   defp input(:reclaim_image, _arg, data), do: %{old: data.run.acc.old}
 
-  defp input(name, _arg, data) when name in [:swap_data, :drop_aside],
-    do: %{staging_dir: data.run.args.staging_dir}
+  defp input(:swap_data, _arg, data), do: %{staging_dir: data.run.args.staging_dir}
 
   defp input(:set_options, _arg, data), do: %{options: data.run.args.options}
   defp input(:stop, :strict, _data), do: %{strict: true}
   defp input(_name, _arg, _data), do: %{}
-
-  # Any container this process holds is paused around the tar, whatever its
-  # last-seen state, which can lag the engine; so is one wanted started that
-  # this process has not adopted yet, by its name. One that is not running or
-  # not there refuses the pause, and the tar goes on. A stop earlier in the
-  # op (cold, update) released it.
-  defp pause?(%{run: run} = data), do: held?(data) and not Map.has_key?(run.acc, :was_running)
-
-  defp held?(data),
-    do: (data.container_id != nil or data.wanted == :started) and not Steps.native?(data.config)
 
   # Coarse waypoints for the update job's progress bar.
   defp stage(:update, :pull), do: {"pull_image", 20}

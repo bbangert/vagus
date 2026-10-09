@@ -34,8 +34,6 @@ defmodule Vagus.Runtime.DockerTest do
         assert {:error, {:invalid_ref, ^ref}} = Docker.start_container(ref)
         assert {:error, {:invalid_ref, ^ref}} = Docker.stop_container(ref)
         assert {:error, {:invalid_ref, ^ref}} = Docker.restart_container(ref)
-        assert {:error, {:invalid_ref, ^ref}} = Docker.pause_container(ref)
-        assert {:error, {:invalid_ref, ^ref}} = Docker.unpause_container(ref)
         assert {:error, {:invalid_ref, ^ref}} = Docker.remove_container(ref)
         assert {:error, {:invalid_ref, ^ref}} = Docker.inspect_container(ref)
       end
@@ -89,23 +87,6 @@ defmodule Vagus.Runtime.DockerTest do
                    socket: "/tmp/nope-#{System.unique_integer([:positive])}.sock"
                  )
       end
-    end
-  end
-
-  describe "pause_container/2 and unpause_container/2 (hermetic — FakeEngine)" do
-    test "post to the container's pause and unpause; any status but 204 is an error" do
-      engine = FakeEngine.start([{204, nil}, {204, nil}, {409, %{"message" => "not running"}}])
-      on_exit(fn -> FakeEngine.stop(engine) end)
-
-      assert :ok = Docker.pause_container("addon_x", socket: engine.socket)
-      assert :ok = Docker.unpause_container("addon_x", socket: engine.socket)
-      assert {:error, {:http, 409}} = Docker.pause_container("addon_x", socket: engine.socket)
-
-      assert Enum.map(FakeEngine.requests(engine), &{&1.method, &1.path}) == [
-               {:post, "/containers/addon_x/pause"},
-               {:post, "/containers/addon_x/unpause"},
-               {:post, "/containers/addon_x/pause"}
-             ]
     end
   end
 

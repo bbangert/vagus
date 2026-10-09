@@ -197,26 +197,5 @@ defmodule Vagus.App.UnitsTest do
       refute Units.running?("core_ssh", engine([{404, %{"message" => "no such container"}}]))
       assert :unknown == Units.running?("core_ssh", engine([{500, %{"message" => "x"}}]))
     end
-
-    defp posts(engine),
-      do: for(%{method: :post, path: path} <- FakeEngine.requests(engine), do: path)
-
-    # Thawing here could unpause a backup's container mid-tar; the app's own
-    # start replaces a paused one.
-    test "a paused container counts as running, listed or inspected, and is never unpaused" do
-      listing = [
-        %{"Names" => ["/addon_core_ssh"], "State" => "paused"},
-        %{"Names" => ["/addon_local_x"], "State" => "running"}
-      ]
-
-      paused = %{"State" => %{"Running" => false, "Paused" => true}}
-      engine = FakeEngine.start([{200, listing}, {200, paused}])
-      on_exit(fn -> FakeEngine.stop(engine) end)
-
-      assert {:ok, running} = Units.running(socket: engine.socket)
-      assert running == MapSet.new(["core_ssh", "local_x"])
-      assert Units.running?("core_ssh", socket: engine.socket) == true
-      assert posts(engine) == []
-    end
   end
 end

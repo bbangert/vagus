@@ -109,10 +109,6 @@ defmodule Vagus.App.Units do
   def native?(%{config: config}), do: Steps.native?(config)
   def native?(_entry), do: false
 
-  # A paused container counts as running and is never thawed here: a boot
-  # listing can overlap a backup already pausing its container. Boot sends a
-  # paused one's app through its own start, whose replace thaws it, in the
-  # one process that also owns any backup of it.
   @doc "The slugs whose container the engine reports running; one listing for the whole boot."
   @spec running(keyword()) :: {:ok, MapSet.t(String.t())} | {:error, term()}
   def running(opts \\ []) do
@@ -125,7 +121,7 @@ defmodule Vagus.App.Units do
   @spec running?(String.t(), keyword()) :: boolean() | :unknown
   def running?(slug, opts \\ []) do
     case Docker.inspect_container("addon_" <> slug, opts) do
-      {:ok, %{"State" => state}} -> state["Running"] == true or state["Paused"] == true
+      {:ok, %{"State" => %{"Running" => running}}} -> running == true
       {:error, {:http, 404, _message}} -> false
       _unknown -> :unknown
     end

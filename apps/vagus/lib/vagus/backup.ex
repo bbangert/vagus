@@ -293,7 +293,9 @@ defmodule Vagus.Backup do
 
   # Recursively read a directory into [{relative_path, content}]. Absent dir → [].
   # The app owns this tree and this runs as root: a symlink it planted
-  # resolves on the host, so one is never followed, only skipped.
+  # resolves on the host, so one is never followed, only skipped. A running
+  # app keeps writing through the walk, so the window between its writes and
+  # an entry's lstat and read is upstream's own: its tar never pauses either.
   # path is internal/config-derived, not request input
   # sobelow_skip ["Traversal.FileModule"]
   defp read_dir(dir) do

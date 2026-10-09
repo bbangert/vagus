@@ -23,9 +23,5 @@ defmodule Vagus.Addon.Backend.Microvm do
   @impl true
   def state(_id), do: raise(@not_impl)
   @impl true
-  def pause(_id, _opts \\ []), do: raise(@not_impl)
-  @impl true
-  def unpause(_id, _opts \\ []), do: raise(@not_impl)
-  @impl true
   def remove_image(_image, _opts \\ []), do: raise(@not_impl)
 end

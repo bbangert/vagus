@@ -60,12 +60,6 @@ defmodule Vagus.AppCharacterisationTest.GatedBackend do
   @impl true
   def remove_image(image, opts \\ []), do: Fake.remove_image(image, opts)
 
-  @impl true
-  def pause(id, opts \\ []), do: Fake.pause(id, opts)
-
-  @impl true
-  def unpause(id, opts \\ []), do: Fake.unpause(id, opts)
-
   # Running only between a start and the next stop or remove, as an engine
   # reports it: the app process asks before an update whether to start again.
   @impl true

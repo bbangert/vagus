@@ -377,7 +377,7 @@ defmodule Vagus.App.StepsTest do
     :persistent_term.put({FakeBackend, :pid}, self())
 
     on_exit(fn ->
-      for key <- [:state, :pause, :unpause, :stop],
+      for key <- [:state, :stop],
           do: :persistent_term.erase({FakeBackend, key})
     end)
 
@@ -583,9 +583,6 @@ defmodule Vagus.App.StepsTest do
       assert_received {:stop, "addon_test_app"}
       assert_received {:remove, "addon_test_app"}
 
-      :persistent_term.put({FakeBackend, :state}, {:ok, :paused})
-      assert {:ok, %{was_running: true}} = Steps.run(:stop, input(ctx))
-
       :persistent_term.put({FakeBackend, :state}, {:ok, :stopped})
       assert {:ok, %{was_running: false}} = Steps.run(:stop, input(ctx))
     end
@@ -595,38 +592,6 @@ defmodule Vagus.App.StepsTest do
       assert_received {:stop, "addon_test_app", opts}
       assert opts[:timeout] == 30
       refute_received {:remove, _}
-    end
-
-    # The engine refuses to stop a paused container until it is unpaused.
-    defp paused_engine do
-      Process.put(:paused, true)
-
-      :persistent_term.put({FakeBackend, :stop}, fn ->
-        if Process.get(:paused), do: {:error, {:http, 409}}, else: :ok
-      end)
-
-      :persistent_term.put({FakeBackend, :unpause}, fn -> Process.delete(:paused) && :ok end)
-    end
-
-    test "stop and halt_stop thaw a container left paused and stop it again", ctx do
-      for step <- [:stop, :halt_stop] do
-        paused_engine()
-
-        log = capture_log(fn -> assert {:ok, _fact} = Steps.run(step, input(ctx)) end)
-
-        assert log =~ "refused to stop"
-        assert_received {:stop, "addon_test_app"}
-        assert_received {:unpause, "addon_test_app"}
-        assert_received {:stop, "addon_test_app"}
-        refute Process.get(:paused)
-      end
-    end
-
-    test "a stop that fails for another reason is not retried", ctx do
-      :persistent_term.put({FakeBackend, :stop}, fn -> {:error, :engine_gone} end)
-
-      assert {:error, :engine_gone} = Steps.run(:halt_stop, input(ctx))
-      refute_received {:unpause, _id}
     end
 
     # A restore swaps the data dir next: only a container that is gone or
@@ -651,27 +616,6 @@ defmodule Vagus.App.StepsTest do
         capture_log(fn -> assert {:ok, _fact} = Steps.run(:stop, input(ctx)) end)
         assert_received {:remove, "addon_test_app"}
       end
-    end
-
-    test "a strict stop still thaws a paused container before stopping it", ctx do
-      paused_engine()
-      strict = Map.put(input(ctx), :strict, true)
-
-      capture_log(fn -> assert {:ok, _fact} = Steps.run(:stop, strict) end)
-      assert_received {:unpause, "addon_test_app"}
-      refute Process.get(:paused)
-    end
-
-    # Boot sends an app whose container a dead snapshot left paused through
-    # its start; the stale container is thawed there, by its own process.
-    test "start thaws a paused stale container before replacing it", ctx do
-      paused_engine()
-
-      capture_log(fn -> assert {:ok, _fact} = Steps.run(:start, input(ctx)) end)
-      assert_received {:unpause, "addon_test_app"}
-      assert_received {:remove, "addon_test_app"}
-      assert_received {:start, "fake-id"}
-      refute Process.get(:paused)
     end
 
     test "pull pulls the arch-resolved image", ctx do
@@ -786,129 +730,6 @@ defmodule Vagus.App.StepsTest do
       input(ctx, Map.merge(%{staging_dir: Path.join(ctx.tmp_dir, "staging")}, extra))
     end
 
-    # What the container writes is seen by the tar only as it stood at the pause.
-    test "a running container is paused for the tar and unpaused after it", ctx do
-      data_dir = Path.join([ctx.data_root, "addons", "data", "test_app"])
-      File.mkdir_p!(data_dir)
-      marker = Path.join(data_dir, "marker")
-      :persistent_term.put({FakeBackend, :pause}, fn -> File.write(marker, "frozen") end)
-      :persistent_term.put({FakeBackend, :unpause}, fn -> File.write(marker, "thawed") end)
-
-      assert {:ok, path} = Steps.run(:snapshot, snapshot_input(ctx, %{pause: true}))
-
-      assert members(path)["./data/marker"] == "frozen"
-      assert File.read!(marker) == "thawed"
-      assert_received {:pause, "addon_test_app"}
-      assert_received {:unpause, "addon_test_app"}
-    end
-
-    test "a stopped or native app is not paused", ctx do
-      assert {:ok, _path} = Steps.run(:snapshot, snapshot_input(ctx, %{pause: false}))
-      refute_received {:pause, _id}
-    end
-
-    test "a failed pause fails the snapshot and writes nothing", ctx do
-      :persistent_term.put({FakeBackend, :pause}, fn -> {:error, :engine_gone} end)
-      staging = Path.join(ctx.tmp_dir, "staging")
-
-      assert {:error, {:pause, :engine_gone}} =
-               Steps.run(:snapshot, snapshot_input(ctx, %{pause: true}))
-
-      refute File.exists?(Path.join(staging, "test_app.tar.gz"))
-      refute_received {:unpause, _id}
-    end
-
-    test "a pause refused as not running is not paused: the tar runs and nothing is unpaused",
-         ctx do
-      :persistent_term.put({FakeBackend, :pause}, fn -> {:error, {:http, 409}} end)
-      :persistent_term.put({FakeBackend, :state}, {:ok, :stopped})
-
-      assert {:ok, path} = Steps.run(:snapshot, snapshot_input(ctx, %{pause: true}))
-      assert File.regular?(path)
-      assert_received {:pause, "addon_test_app"}
-      refute_received {:unpause, _id}
-    end
-
-    test "a container that is not there is not paused: the tar runs and nothing is unpaused",
-         ctx do
-      :persistent_term.put({FakeBackend, :pause}, fn -> {:error, {:http, 404}} end)
-
-      assert {:ok, path} = Steps.run(:snapshot, snapshot_input(ctx, %{pause: true}))
-      assert File.regular?(path)
-      assert_received {:pause, "addon_test_app"}
-      refute_received {:unpause, _id}
-    end
-
-    # The 409 may be "already paused": without a state that rules it out, the
-    # op must thaw, which it does after a failed snapshot.
-    test "a refused pause whose state cannot be read, or may be paused, fails the snapshot",
-         ctx do
-      :persistent_term.put({FakeBackend, :pause}, fn -> {:error, {:http, 409}} end)
-
-      for {state, reason} <- [
-            {{:error, :engine_gone}, :engine_gone},
-            {{:ok, :restarting}, {:conflict, :restarting}}
-          ] do
-        :persistent_term.put({FakeBackend, :state}, state)
-
-        assert {:error, {:pause, ^reason}} =
-                 Steps.run(:snapshot, snapshot_input(ctx, %{pause: true}))
-      end
-
-      refute File.exists?(Path.join([ctx.tmp_dir, "staging", "test_app.tar.gz"]))
-    end
-
-    test "a pause refused as already paused still tars frozen and unpauses after", ctx do
-      :persistent_term.put({FakeBackend, :pause}, fn -> {:error, {:http, 409}} end)
-      :persistent_term.put({FakeBackend, :state}, {:ok, :paused})
-
-      assert {:ok, path} = Steps.run(:snapshot, snapshot_input(ctx, %{pause: true}))
-      assert File.regular?(path)
-      assert_received {:pause, "addon_test_app"}
-      assert_received {:unpause, "addon_test_app"}
-    end
-
-    test "the container is unpaused when the tar fails", ctx do
-      # Options that cannot be encoded make `addon.json`, and so the tar, fail.
-      input = snapshot_input(ctx, %{pause: true, user_options: %{"bad" => {:not, :json}}})
-
-      assert {:error, {:addon_tar, "test_app", _message}} = Steps.run(:snapshot, input)
-      assert_received {:unpause, "addon_test_app"}
-    end
-
-    test "a failed unpause is logged, and the snapshot stands marked still paused", ctx do
-      :persistent_term.put({FakeBackend, :unpause}, fn -> {:error, :engine_gone} end)
-
-      log =
-        capture_log(fn ->
-          assert {:ok, {:still_paused, path}} =
-                   Steps.run(:snapshot, snapshot_input(ctx, %{pause: true}))
-
-          assert File.regular?(path)
-        end)
-
-      assert log =~ "unpause addon_test_app failed: :engine_gone"
-    end
-
-    test "unpause thaws the app's container; one not paused is no failure", ctx do
-      assert {:ok, :ok} = Steps.run(:unpause, input(ctx))
-      assert_received {:unpause, "addon_test_app"}
-
-      for status <- [409, 404] do
-        :persistent_term.put({FakeBackend, :unpause}, fn -> {:error, {:http, status}} end)
-        assert {:ok, :not_paused} = Steps.run(:unpause, input(ctx))
-      end
-    end
-
-    test "a failed unpause is the step's error, and logged", ctx do
-      :persistent_term.put({FakeBackend, :unpause}, fn -> {:error, :engine_gone} end)
-
-      log =
-        capture_log(fn -> assert {:error, :engine_gone} = Steps.run(:unpause, input(ctx)) end)
-
-      assert log =~ "unpause addon_test_app failed: :engine_gone"
-    end
-
     test "addon.json's system block carries the restore-required keys", ctx do
       assert {:ok, path} = Steps.run(:snapshot, snapshot_input(ctx, %{}))
       system = Jason.decode!(members(path)["./addon.json"])["system"]
@@ -933,14 +754,13 @@ defmodule Vagus.App.StepsTest do
 
     defp siblings(data_dir), do: data_dir |> Path.dirname() |> File.ls!() |> Enum.sort()
 
-    test "the staged data replaces the data dir; the old is set aside for the caller", ctx do
+    test "the staged data replaces the data dir", ctx do
       {data_dir, staging} = swap_dirs(ctx)
 
       assert {:ok, ^data_dir} = Steps.run(:swap_data, input(ctx, %{staging_dir: staging}))
       assert File.ls!(data_dir) == ["db"]
       assert File.read!(Path.join(data_dir, "db")) == "new"
-      assert siblings(data_dir) == [".restore-test_app-1.old", "test_app"]
-      assert File.read!(Path.join(staging <> ".old", "db")) == "old"
+      assert siblings(data_dir) == ["test_app"]
     end
 
     test "a staging path that is not this app's restore sibling is refused untouched", ctx do
@@ -966,64 +786,26 @@ defmodule Vagus.App.StepsTest do
       assert File.read!(Path.join(data_dir, "db")) == "new"
     end
 
-    test "a failed swap removes the staged data and leaves the data dir as it was", ctx do
-      {data_dir, staging} = swap_dirs(ctx)
-      File.mkdir_p!(Path.join(staging <> ".old", "taken"))
-
-      assert {:error, _reason} = Steps.run(:swap_data, input(ctx, %{staging_dir: staging}))
-      assert File.read!(Path.join(data_dir, "db")) == "old"
-      refute File.exists?(staging)
-    end
-
-    test "a rename that fails leaves the data dir as it was", ctx do
+    # Upstream's wipe-then-extract has no rollback either; the caller retries.
+    test "a rename that fails is the step's error, with the data dir already gone", ctx do
       {data_dir, staging} = swap_dirs(ctx)
       File.rm_rf!(staging)
 
       assert {:error, :enoent} = Steps.run(:swap_data, input(ctx, %{staging_dir: staging}))
-      assert File.read!(Path.join(data_dir, "db")) == "old"
-      assert siblings(data_dir) == ["test_app"]
-    end
-  end
-
-  describe "drop_aside" do
-    @describetag :tmp_dir
-
-    test "removes the data a swap set aside, and only this app's restore sibling's", ctx do
-      parent = Path.join([ctx.data_root, "addons", "data"])
-      staging = Path.join(parent, ".restore-test_app-1")
-      File.mkdir_p!(Path.join(staging <> ".old", "sub"))
-      File.mkdir_p!(Path.join(parent, "test_app"))
-      other = Path.join(parent, ".restore-other_app-1")
-      File.mkdir_p!(other <> ".old")
-
-      assert {:ok, :ok} = Steps.run(:drop_aside, input(ctx, %{staging_dir: staging}))
-      refute File.exists?(staging <> ".old")
-      assert File.dir?(Path.join(parent, "test_app"))
-
-      log =
-        capture_log(fn ->
-          assert {:ok, :kept} = Steps.run(:drop_aside, input(ctx, %{staging_dir: other}))
-        end)
-
-      assert File.dir?(other <> ".old")
-      assert log =~ "was not removed"
+      assert siblings(data_dir) == []
     end
 
-    # A name too long for the filesystem fails for root too, unlike a mode;
-    # its parent must exist, or lookup stops at `:enoent`, which `rm_rf`
-    # takes as already removed.
-    test "an aside it cannot remove is logged, and the step still succeeds", ctx do
+    # A name too long for the filesystem fails for root too, unlike a mode.
+    test "a data dir it cannot remove is the step's error, naming the path", ctx do
       File.mkdir_p!(ctx.data_root)
       root = Path.join(ctx.data_root, String.duplicate("x", 300))
-      staging = Path.join([root, "addons", "data", ".restore-test_app-1"])
+      parent = Path.join([root, "addons", "data"])
+      data_dir = Path.join(parent, "test_app")
 
-      log =
-        capture_log(fn ->
-          assert {:ok, :kept} =
-                   Steps.run(:drop_aside, input(ctx, %{data_root: root, staging_dir: staging}))
-        end)
+      input =
+        input(ctx, %{data_root: root, staging_dir: Path.join(parent, ".restore-test_app-1")})
 
-      assert log =~ "test_app's pre-restore data"
+      assert {:error, {:remove_data_dir, ^data_dir, :enametoolong}} = Steps.run(:swap_data, input)
     end
   end
 
@@ -1115,17 +897,6 @@ defmodule Vagus.App.StepsTest do
       assert_received {:panel_push, "test_app", [method: :delete]}
     end
 
-    # One left behind would be moved back by the boot sweep as the only copy.
-    test "removes a restore's aside of this app with the data dir, and no other app's", ctx do
-      parent = Path.join([ctx.data_root, "addons", "data"])
-      File.mkdir_p!(Path.join(parent, "test_app"))
-      File.mkdir_p!(Path.join(parent, ".restore-test_app-7.old"))
-      File.mkdir_p!(Path.join(parent, ".restore-test_app_two-7.old"))
-
-      assert {:ok, :ok} = Steps.run(:remove_app, input(ctx, %{panels: PanelSpy}))
-      assert File.ls!(parent) == [".restore-test_app_two-7.old"]
-    end
-
     test "a non-ingress app pushes no panel", ctx do
       :persistent_term.put({PanelSpy, :pid}, self())
       assert {:ok, :ok} = Steps.run(:remove_app, input(ctx, %{panels: PanelSpy}))
@@ -1206,20 +977,6 @@ defmodule Vagus.App.StepsTest do
 
     @impl true
     def state(_id), do: :persistent_term.get({__MODULE__, :state}, {:ok, :running})
-
-    # A test sets `{FakeBackend, :pause}` to a function run at the call,
-    # whose result is the call's.
-    @impl true
-    def pause(id, _opts \\ []) do
-      notify({:pause, id})
-      :persistent_term.get({__MODULE__, :pause}, fn -> :ok end).()
-    end
-
-    @impl true
-    def unpause(id, _opts \\ []) do
-      notify({:unpause, id})
-      :persistent_term.get({__MODULE__, :unpause}, fn -> :ok end).()
-    end
   end
 
   defmodule RefusingBackend do

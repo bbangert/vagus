@@ -479,8 +479,7 @@ defmodule Vagus.App do
   @doc """
   Replaces the app's data with `staging_dir`, a sibling of its data dir, and
   its options with the backed-up `options`, by its own `restore` operation:
-  stop, swap, set, a start when `start?`, then removal of the old data. The
-  options are validated against the config current in the op; `nil`, options
+  stop, swap, set, and a start when `start?`. The options are validated against the config current in the op; `nil`, options
   it rejects, or an options write since the op began keep the current ones.
   The app is busy throughout, so no other operation, an uninstall included,
   runs on it mid-restore.

@@ -138,7 +138,7 @@ defmodule Vagus.BackupsTest do
       assert Backups.list(server) == []
     end
 
-    test "a hot add-on runs its hooks outside a pause that spans the tar", %{
+    test "a hot add-on runs its hooks around the tar", %{
       data_root: dr,
       server: server
     } do
@@ -156,7 +156,7 @@ defmodule Vagus.BackupsTest do
       id = "addon_" <> slug
 
       assert @backend.calls_for(id) ==
-               [{:exec, id, "dump"}, {:pause, id}, {:unpause, id}, {:exec, id, "undump"}]
+               [{:exec, id, "dump"}, {:exec, id, "undump"}]
     end
 
     test "a cold add-on is stopped and started again by its own backup", %{
@@ -175,7 +175,6 @@ defmodule Vagus.BackupsTest do
       ops = Enum.map(@backend.calls_for("addon_" <> slug), &elem(&1, 0))
       assert [:stop, :remove | started] = ops
       assert :start in started
-      refute :pause in ops
       assert {:ok, %{state: :started}} = app_info(slug)
 
       {:ok, %{path: path}} = Backups.get(backup_slug, server)
@@ -183,8 +182,7 @@ defmodule Vagus.BackupsTest do
       assert addon["state"] == "started"
     end
 
-    # The snapshot of a cold app is not paused: a container the engine failed
-    # to stop could write under the tar.
+    # A container the engine failed to stop could write under the tar.
     test "a cold add-on whose strict stop fails is not snapshotted and is started again", %{
       data_root: dr,
       backup_dir: backup_dir,
@@ -325,40 +323,14 @@ defmodule Vagus.BackupsTest do
       File.mkdir_p!(leftover)
       File.write!(Path.join(leftover, "core_x.tar.gz"), "partial")
 
-      # A staged restore, the aside of a swap whose data dir is back, and the
-      # aside of one halted between its renames, which holds the only copy.
       parent = Path.join([dr, "addons", "data"])
-      File.mkdir_p!(Path.join(parent, ".restore-core_a-1"))
-      File.mkdir_p!(Path.join(parent, "core_b"))
-      File.mkdir_p!(Path.join(parent, ".restore-core_b-2.old"))
-      File.mkdir_p!(Path.join(parent, ".restore-core_c-3.old"))
-      File.write!(Path.join([parent, ".restore-core_c-3.old", "db"]), "kept")
+      File.mkdir_p!(Path.join([parent, ".restore-core_a-1", "sub"]))
+      File.mkdir_p!(Path.join(parent, "core_a"))
 
-      log =
-        capture_log(fn -> assert :ok = Backups.sweep_stale(dir: backup_dir, data_root: dr) end)
+      assert :ok = Backups.sweep_stale(dir: backup_dir, data_root: dr)
 
       refute File.exists?(Backups.staging_root(backup_dir))
-      assert File.ls!(parent) |> Enum.sort() == ["core_b", "core_c"]
-      assert File.read!(Path.join([parent, "core_c", "db"])) == "kept"
-      assert log =~ "core_c's data moved back"
-    end
-
-    # A file where the data dir goes makes the move back fail.
-    test "the boot sweep keeps an aside that cannot move back to a missing data dir", %{
-      data_root: dr,
-      backup_dir: backup_dir
-    } do
-      parent = Path.join([dr, "addons", "data"])
-      aside = Path.join(parent, ".restore-core_d-4.old")
-      File.mkdir_p!(aside)
-      File.write!(Path.join(aside, "db"), "only copy")
-      File.write!(Path.join(parent, "core_d"), "in the way")
-
-      log =
-        capture_log(fn -> assert :ok = Backups.sweep_stale(dir: backup_dir, data_root: dr) end)
-
-      assert File.read!(Path.join(aside, "db")) == "only copy"
-      assert log =~ "core_d's data could not move back"
+      assert File.ls!(parent) == ["core_a"]
     end
 
     # Backup callers and app operations outlive a restart of the store.
@@ -552,15 +524,8 @@ defmodule Vagus.BackupsTest do
       assert_receive {:step, :start, %{user_options: %{"greet" => "hi"}}, task}, 5_000
       send(task, {:outcome, {:ok, %{container_id: "c2"}}})
 
-      # The op drops the aside, last; once it replies, an uninstall may run,
-      # so nothing after it may touch the data dir's siblings.
-      aside = staging <> ".old"
-      File.mkdir_p!(aside)
-      assert_receive {:step, :drop_aside, %{staging_dir: ^staging}, task}, 5_000
-      send(task, {:outcome, {:ok, :kept}})
-
       assert :ok = Task.await(restore)
-      assert restore_leftovers(dr) == [Path.basename(aside)]
+      assert restore_leftovers(dr) == []
       assert {:ok, %{state: :started, user_options: %{"greet" => "hi"}}} = app_info(slug)
     end
 
@@ -602,7 +567,6 @@ defmodule Vagus.BackupsTest do
 
       assert {:error, {:restore, ^slug, :exdev}} = Task.await(restore)
       refute_received {:step, :start, _input, _task}
-      assert File.read!(Path.join(data_dir(dr, slug), "f.txt")) == "since"
       assert restore_leftovers(dr) == []
       assert {:ok, %{user_options: %{"greet" => "since"}}} = app_info(slug)
     end

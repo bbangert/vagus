@@ -169,7 +169,6 @@ defmodule Vagus.Addon.Backend.ContainerTest do
   describe "normalize_state/1 (hermetic)" do
     test "maps Docker inspect State to coarse atoms" do
       assert Container.normalize_state(%{"Running" => true}) == :running
-      assert Container.normalize_state(%{"Running" => true, "Paused" => true}) == :paused
       assert Container.normalize_state(%{"Running" => false, "Restarting" => true}) == :restarting
       assert Container.normalize_state(%{"Status" => "restarting"}) == :restarting
       assert Container.normalize_state(%{"Running" => false, "Status" => "exited"}) == :stopped

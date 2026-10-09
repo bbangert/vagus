@@ -91,60 +91,6 @@ defmodule Vagus.App.ServerTest do
       assert {:ok, %{config: %{slug: ^slug}}} = :gen_statem.call(new_pid, :info)
     end
 
-    # A restore killed between its two renames leaves the pre-restore data
-    # only in the aside; the boot sweep runs once per VM, so the successor
-    # settles it before the app can start.
-    @tag :tmp_dir
-    test "a successor moves back an aside left with no data dir, and drops one beside it", ctx do
-      prev = Application.fetch_env(:vagus, :addon_data_root)
-      Application.put_env(:vagus, :addon_data_root, ctx.tmp_dir)
-
-      on_exit(fn ->
-        case prev do
-          {:ok, root} -> Application.put_env(:vagus, :addon_data_root, root)
-          :error -> Application.delete_env(:vagus, :addon_data_root)
-        end
-      end)
-
-      parent = Path.join([ctx.tmp_dir, "addons", "data"])
-      [lost, done] = for _ <- 1..2, do: slug()
-
-      sup =
-        start_supervised!(
-          {DynamicSupervisor, strategy: :one_for_one, max_restarts: 10, max_seconds: 60}
-        )
-
-      # Started first, so only a successor's start can find the asides.
-      pids =
-        for slug <- [lost, done] do
-          install_app(app_config(slug), process: false)
-          {:ok, pid} = DynamicSupervisor.start_child(sup, {Server, slug})
-          aside = Path.join(parent, ".restore-#{slug}-1.old")
-          File.mkdir_p!(aside)
-          File.write!(Path.join(aside, "db"), "before")
-          {slug, pid}
-        end
-
-      File.mkdir_p!(Path.join(parent, done))
-      File.write!(Path.join([parent, done, "db"]), "restored")
-
-      log =
-        ExUnit.CaptureLog.capture_log(fn ->
-          for {slug, pid} <- pids do
-            ref = Process.monitor(pid)
-            Process.exit(pid, :kill)
-            assert_receive {:DOWN, ^ref, :process, ^pid, :killed}
-            # `:sys` waits for its init, which settles the aside.
-            :sys.get_state(wait_for_new(slug, pid))
-          end
-        end)
-
-      assert File.read!(Path.join([parent, lost, "db"])) == "before"
-      assert File.read!(Path.join([parent, done, "db"])) == "restored"
-      assert File.ls!(parent) |> Enum.sort() == Enum.sort([lost, done])
-      assert log =~ "#{lost}'s data moved back"
-    end
-
     test "an EXIT from a linked process that is not its task stops it, to be restarted" do
       {slug, pid} = installed()
       ref = Process.monitor(pid)
@@ -780,40 +726,15 @@ defmodule Vagus.App.ServerTest do
       assert [{^pa, ^a}] = lookup({:ingress_port, 62_011})
     end
 
-    test "a hot snapshot killed at its deadline is followed by an unpause of the container" do
+    test "a hot snapshot killed at its deadline fails the backup" do
       app_deadlines(%{snapshot: 100})
-      {slug, pid} = started()
+      {_slug, pid} = started()
       t = op(pid, {:backup, %{staging_dir: "/nonexistent"}})
       {_input, task} = step(:snapshot)
       ref = Process.monitor(task)
 
       assert_receive {:DOWN, ^ref, :process, ^task, :killed}, 1_000
-      assert %{config: %{slug: ^slug}} = answer(:unpause, {:ok, :ok})
       assert {:error, :timeout} = Task.await(t)
-    end
-
-    test "a halt while a snapshot holds the container paused thaws it so the stop lands" do
-      {slug, pid} = started()
-      Application.put_env(:vagus, :app_steps, __MODULE__.HaltThroughSteps)
-      :persistent_term.put({__MODULE__.PausedEngine, :test}, self())
-      :persistent_term.put({__MODULE__.PausedEngine, :paused}, true)
-      on_exit(fn -> :persistent_term.erase({__MODULE__.PausedEngine, :paused}) end)
-
-      t = op(pid, {:backup, %{staging_dir: "/s"}})
-      {%{pause: true}, task} = step(:snapshot)
-      ref = Process.monitor(task)
-
-      ExUnit.CaptureLog.capture_log(fn ->
-        assert :ok = :gen_statem.call(pid, {:halt, %{backend: __MODULE__.PausedEngine}})
-      end)
-
-      assert_receive {:DOWN, ^ref, :process, ^task, :killed}
-      assert {:error, :shutting_down} = Task.await(t)
-      id = "addon_" <> slug
-      assert_received {:engine, :stop, ^id}
-      assert_received {:engine, :unpause, ^id}
-      assert_received {:engine, :stop, ^id}
-      refute :persistent_term.get({__MODULE__.PausedEngine, :paused})
     end
 
     test "a container event during an operation is handled once, after it" do
@@ -860,7 +781,6 @@ defmodule Vagus.App.ServerTest do
       assert {:ok, %{user_options: %{"greeting" => "restored"}}} = AppFile.read(slug)
       assert [{^pid, ^slug}] = lookup({:token, Policy.hash(input.token)})
       send(task, {:outcome, {:ok, @started}})
-      assert %{staging_dir: "/s"} = answer(:drop_aside, {:ok, :ok})
 
       assert :ok = Task.await(t)
       assert {:ok, %{state: :started, user_options: %{"greeting" => "restored"}}} = App.info(slug)
@@ -880,7 +800,6 @@ defmodule Vagus.App.ServerTest do
       answer(:swap_data, {:ok, "/data"})
       answer(:set_options, {:ok, args.options})
       assert %{user_options: %{"greeting" => "mine"}} = answer(:start, {:ok, @started})
-      answer(:drop_aside, {:ok, :ok})
 
       assert :ok = Task.await(t)
       assert {:ok, %{state: :started, user_options: %{"greeting" => "mine"}}} = App.info(slug)
@@ -903,7 +822,6 @@ defmodule Vagus.App.ServerTest do
       answer(:swap_data, {:ok, "/data"})
       answer(:set_options, {:ok, args.options})
       assert %{user_options: %{"greeting" => "before"}} = answer(:start, {:ok, @started})
-      answer(:drop_aside, {:ok, :ok})
 
       assert :ok = Task.await(t)
       assert data(pid).options_rev == before.options_rev + 1
@@ -947,7 +865,7 @@ defmodule Vagus.App.ServerTest do
       answer(:pull, {:ok, "x/y:2"})
       answer(:stop, {:ok, %{was_running: true}})
 
-      assert %{staging_dir: "/s", state: "started", pause: false, config: %{version: "1"}} =
+      assert %{staging_dir: "/s", state: "started", config: %{version: "1"}} =
                answer(:snapshot, {:ok, "/s/#{slug}.tar.gz"})
 
       answer(:start, {:ok, @started})
@@ -1056,69 +974,6 @@ defmodule Vagus.App.ServerTest do
       answer(:start, {:ok, @started})
       assert :ok = Task.await(boot)
       assert :idle = state(pid)
-    end
-
-    # The engine refuses to stop a paused container until it is unpaused.
-    defmodule PausedBackend do
-      @moduledoc false
-      @behaviour Vagus.Addon.Backend
-
-      @impl true
-      def pull(_spec), do: :ok
-      @impl true
-      def create(_spec), do: {:ok, "fake-id"}
-      @impl true
-      def start(_id), do: :ok
-      @impl true
-      def remove(id, _opts \\ []), do: send(self(), {:remove, id}) && :ok
-      @impl true
-      def remove_image(_image, _opts \\ []), do: :ok
-      @impl true
-      def state(_id), do: {:ok, if(Process.get(:paused), do: :paused, else: :running)}
-      @impl true
-      def pause(_id, _opts \\ []), do: :ok
-
-      @impl true
-      def stop(id, _opts \\ []) do
-        send(self(), {:stop, id})
-        if Process.get(:paused), do: {:error, {:http, 409}}, else: :ok
-      end
-
-      @impl true
-      def unpause(id, _opts \\ []) do
-        send(self(), {:unpause, id})
-        Process.delete(:paused) && :ok
-      end
-    end
-
-    # A snapshot whose process died with the VM left the container paused:
-    # the boot listing counts it running, so the app's own start replaces it.
-    @tag :tmp_dir
-    test "a container left paused is thawed and replaced by the app's own start", ctx do
-      slug = slug()
-      install_app(app_config(slug, %{"host_network" => true}), state: :started, process: false)
-      {:ok, pid} = Instances.ensure(slug)
-
-      paused = %{"State" => %{"Running" => true, "Paused" => true}}
-      engine = Vagus.Test.FakeEngine.start([{200, paused}])
-      on_exit(fn -> Vagus.Test.FakeEngine.stop(engine) end)
-      running? = Vagus.App.Units.running?(slug, socket: engine.socket)
-      assert running? == true
-
-      boot = op(pid, {:boot_start, %{running?: running?}})
-      {input, task} = step(:start)
-      Process.put(:paused, true)
-      input = Map.merge(input, %{backend: PausedBackend, data_root: ctx.tmp_dir})
-      outcome = ExUnit.CaptureLog.with_log(fn -> Vagus.App.Steps.run(:start, input) end)
-      send(task, {:outcome, elem(outcome, 0)})
-      assert :ok = Task.await(boot)
-
-      name = "addon_" <> slug
-      assert_received {:stop, ^name}
-      assert_received {:unpause, ^name}
-      assert_received {:remove, ^name}
-      refute Process.get(:paused)
-      assert %{container_id: "fake-id", wanted: :started} = data(pid)
     end
 
     test "an app wanted stopped is left stopped" do
@@ -1415,31 +1270,6 @@ defmodule Vagus.App.ServerTest do
         if System.monotonic_time(:millisecond) > deadline,
           do: nil,
           else: wait_for_new(slug, old, deadline)
-    end
-  end
-
-  # The real halt_stop step against an engine that, as Docker does, refuses
-  # to stop a paused container; every other step is the test's.
-  defmodule HaltThroughSteps do
-    @moduledoc false
-    def run(:halt_stop, input), do: Vagus.App.Steps.run(:halt_stop, input)
-    def run(name, input), do: Vagus.App.StepsStub.run(name, input)
-  end
-
-  defmodule PausedEngine do
-    @moduledoc false
-    defp record(call, id),
-      do: send(:persistent_term.get({__MODULE__, :test}), {:engine, call, id})
-
-    def stop(id, _opts) do
-      record(:stop, id)
-      if :persistent_term.get({__MODULE__, :paused}), do: {:error, {:http, 409}}, else: :ok
-    end
-
-    def unpause(id, _opts) do
-      record(:unpause, id)
-      :persistent_term.put({__MODULE__, :paused}, false)
-      :ok
     end
   end
 end
