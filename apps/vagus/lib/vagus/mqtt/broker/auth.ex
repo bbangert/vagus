@@ -8,9 +8,10 @@ defmodule Vagus.Mqtt.Broker.Auth do
   auth path. A CONNECT is accepted if any of these match, in order:
 
     1. **mqtt service credentials** — the `addons` login the broker publishes
-       as its `mqtt` service, handed in at start (`:service_login`), so a
-       CONNECT never waits on the publisher. This is how add-ons authenticate
-       against the broker (Mosquitto's `addons` service user).
+       as its `mqtt` service, handed in at start (`:service_login`) as a
+       closure so the password never sits in a child spec or crash report,
+       and a CONNECT never waits on the publisher. This is how apps
+       authenticate against the broker (Mosquitto's `addons` service user).
     2. **Home Assistant users** — `Vagus.Auth.check_login/4`, the same cache →
        Core `api/hassio_auth` path `POST /auth` already uses (`auth.ex`). REUSED,
        not reimplemented.
@@ -32,7 +33,7 @@ defmodule Vagus.Mqtt.Broker.Auth do
   @type login :: %{username: String.t(), password: String.t()}
   @type config :: %{
           slug: String.t(),
-          service_login: login() | nil,
+          service_login: (-> login()) | nil,
           auth_opts: keyword(),
           logins: [login()],
           allow_anonymous: boolean(),
@@ -43,8 +44,9 @@ defmodule Vagus.Mqtt.Broker.Auth do
   Builds an auth `config` from broker options.
 
     * `:slug` — add-on slug passed to `check_login/4` (default `"core_mqtt"`)
-    * `:service_login` — the `%{username, password}` the broker publishes as
-      its `mqtt` service (default `nil`: none)
+    * `:service_login` — a zero-arity function returning the
+      `%{username, password}` the broker publishes as its `mqtt` service
+      (default `nil`: none)
     * `:auth_opts` — opts threaded into `Vagus.Auth.check_login/4` (`:server`,
       `:core_client`; mainly for tests)
     * `:logins` — static `%{username, password}` option logins (default `[]`)
@@ -109,11 +111,17 @@ defmodule Vagus.Mqtt.Broker.Auth do
   defp neg_record(%{neg_cache: nil}, _key), do: :ok
   defp neg_record(%{neg_cache: table}, key), do: AuthCache.record_failure(table, key)
 
-  defp service_login?(username, password, %{username: u, password: p})
-       when is_binary(u) and is_binary(p) and p != "",
-       do: secure_equal?(u, username) and secure_equal?(p, password)
+  defp service_login?(username, password, login) when is_function(login, 0) do
+    case login.() do
+      %{username: u, password: p} when is_binary(u) and is_binary(p) and p != "" ->
+        secure_equal?(u, username) and secure_equal?(p, password)
 
-  defp service_login?(_username, _password, _none), do: false
+      _none ->
+        false
+    end
+  end
+
+  defp service_login?(_username, _password, nil), do: false
 
   defp options_login?(username, password, logins) do
     Enum.any?(logins, fn %{username: u, password: p} ->

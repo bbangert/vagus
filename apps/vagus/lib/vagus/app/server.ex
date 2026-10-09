@@ -10,7 +10,9 @@ defmodule Vagus.App.Server do
   as the value, so a unique key is the one-provider-per-service rule and its
   exit drops them all. They are not checkpointed: a restarted process starts
   empty, and until a restart also recreates the container, a container app's
-  entries stay gone until it posts them again.
+  entries stay gone until it posts them again. A container app that does
+  re-post gets a new uuid, so Core may show a second discovered card until
+  Core restarts.
   """
 
   @behaviour :gen_statem
@@ -18,7 +20,7 @@ defmodule Vagus.App.Server do
   alias Vagus.Addon.State
   alias Vagus.App.{Directory, Policy}
 
-  @redacted [:token_hash, :services, :discovery]
+  @redacted [:token_hash, :services, :discovery, :log]
 
   @spec child_spec(String.t()) :: Supervisor.child_spec()
   def child_spec(slug) do
@@ -74,8 +76,12 @@ defmodule Vagus.App.Server do
     end
   end
 
+  # A process outliving its app must never serve what the app posted.
   def handle_event({:call, from}, {:service, name}, _state, data) do
-    {:keep_state_and_data, [{:reply, from, Map.fetch(data.services, name)}]}
+    reply_and_stop_if_gone(from, read(data.slug), fn
+      :error -> :error
+      _entry -> Map.fetch(data.services, name)
+    end)
   end
 
   def handle_event({:call, from}, {:add_discovery, service, config}, _state, data) do
@@ -102,11 +108,16 @@ defmodule Vagus.App.Server do
   end
 
   def handle_event({:call, from}, {:discovery, uuid}, _state, data) do
-    {:keep_state_and_data, [{:reply, from, Map.fetch(data.discovery, uuid)}]}
+    reply_and_stop_if_gone(from, read(data.slug), fn
+      :error -> :error
+      _entry -> Map.fetch(data.discovery, uuid)
+    end)
   end
 
+  # Still the list once the entry is gone: `Vagus.App.uninstall/1` reads it
+  # after the delete to tell Core about every message.
   def handle_event({:call, from}, :discovery_list, _state, data) do
-    {:keep_state_and_data, [{:reply, from, Map.values(data.discovery)}]}
+    reply_and_stop_if_gone(from, read(data.slug), fn _entry -> Map.values(data.discovery) end)
   end
 
   # A typo'd question from one caller must not crash-loop every app process.

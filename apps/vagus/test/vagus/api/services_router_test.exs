@@ -73,6 +73,36 @@ defmodule Vagus.API.ServicesRouterTest do
     assert conn.status == 400
   end
 
+  test "a publish while the app's process cannot be started answers 503" do
+    token = addon_token("core_mosquitto", %{"mqtt" => "provide"})
+    :ok = Supervisor.terminate_child(Vagus.App.Supervisor, Vagus.App.Instances)
+
+    on_exit(fn ->
+      {:ok, _pid} = Supervisor.restart_child(Vagus.App.Supervisor, Vagus.App.Instances)
+    end)
+
+    conn = call(:post, "/services/mqtt", token, %{"host" => "h", "port" => 1})
+    assert conn.status == 503
+    assert :error = Vagus.App.service("mqtt")
+  end
+
+  test "a second provider is refused with 400" do
+    first = addon_token("core_mosquitto", %{"mqtt" => "provide"})
+    second = addon_token("other_broker", %{"mqtt" => "provide"})
+    assert call(:post, "/services/mqtt", first, %{"host" => "a", "port" => 1}).status == 200
+
+    conn = call(:post, "/services/mqtt", second, %{"host" => "b", "port" => 1})
+    assert {conn.status, body(conn)["message"]} == {400, "Service already provided"}
+    assert {:ok, "core_mosquitto", %{"host" => "a"}} = Vagus.App.service("mqtt")
+  end
+
+  test "withdrawing a service that is not provided answers 200" do
+    token = addon_token("core_mosquitto", %{"mqtt" => "provide"})
+
+    conn = call(:delete, "/services/mqtt", token, nil)
+    assert {conn.status, body(conn)["result"]} == {200, "ok"}
+  end
+
   test "GET /services lists mqtt availability" do
     token = addon_token("reader", %{"mqtt" => "want"})
     conn = call(:get, "/services", token, nil)

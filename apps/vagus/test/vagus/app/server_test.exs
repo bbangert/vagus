@@ -43,6 +43,53 @@ defmodule Vagus.App.ServerTest do
     assert :absent = Vagus.App.ask(slug, :info)
   end
 
+  test "once its entry is gone it serves nothing it holds and stops :normal" do
+    slug = slug()
+    install_app(app_config(slug))
+    [{pid, _}] = lookup(slug)
+    :ok = :gen_statem.call(pid, {:provide_service, "svc_#{slug}", %{"password" => "p"}})
+    {:ok, %{uuid: uuid}, :new} = :gen_statem.call(pid, {:add_discovery, "mqtt", %{}})
+    ref = Process.monitor(pid)
+
+    :ok = State.delete(slug)
+
+    assert :error = :gen_statem.call(pid, {:service, "svc_#{slug}"})
+    assert_receive {:DOWN, ^ref, :process, ^pid, :normal}
+    assert :error = Vagus.App.service("svc_#{slug}")
+    assert :error = Vagus.App.discovery(uuid)
+  end
+
+  test "a discovery read of a gone app answers :error and stops :normal" do
+    slug = slug()
+    install_app(app_config(slug))
+    [{pid, _}] = lookup(slug)
+    {:ok, %{uuid: uuid}, :new} = :gen_statem.call(pid, {:add_discovery, "mqtt", %{}})
+    ref = Process.monitor(pid)
+
+    :ok = State.delete(slug)
+
+    assert :error = :gen_statem.call(pid, {:discovery, uuid})
+    assert_receive {:DOWN, ^ref, :process, ^pid, :normal}
+  end
+
+  test "the discovery list of a gone app is still answered, then it stops :normal" do
+    slug = slug()
+    install_app(app_config(slug))
+    [{pid, _}] = lookup(slug)
+    {:ok, %{uuid: uuid}, :new} = :gen_statem.call(pid, {:add_discovery, "mqtt", %{}})
+    ref = Process.monitor(pid)
+
+    :ok = State.delete(slug)
+
+    assert [%{uuid: ^uuid}] = :gen_statem.call(pid, :discovery_list)
+    assert_receive {:DOWN, ^ref, :process, ^pid, :normal}
+  end
+
+  test "format_status/1 redacts the log" do
+    assert %{data: %{log: :redacted}} =
+             Server.format_status(%{state: :idle, data: %{slug: "s", log: ["secret line"]}})
+  end
+
   test "with no State entry it does not start" do
     assert :ignore = Instances.ensure(slug())
   end

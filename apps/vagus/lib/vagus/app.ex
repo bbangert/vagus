@@ -65,8 +65,17 @@ defmodule Vagus.App do
     end)
   end
 
+  @doc "`false` while `Vagus.Addon.State` is restarting."
   @spec installed?(String.t()) :: boolean()
-  def installed?(slug), do: match?({:ok, _entry}, State.get(slug))
+  def installed?(slug), do: match?({:ok, _entry}, state_get(slug))
+
+  # The broker's Provider and `monitor/1` callers reach State through here; a
+  # State restart must read as "no answer", not crash them.
+  defp state_get(slug) do
+    State.get(slug)
+  catch
+    :exit, _reason -> :unavailable
+  end
 
   @spec slugs() :: [String.t()]
   def slugs, do: Enum.map(State.list(), & &1.config.slug)
@@ -247,7 +256,17 @@ defmodule Vagus.App do
   @doc "An app that does not answer by the deadline is left out."
   @spec discoveries() :: [Policy.message()]
   def discoveries do
-    for {_slug, {:ok, messages}} when is_list(messages) <- gather(:discovery_list),
+    answers = gather(:discovery_list)
+
+    case for {slug, :absent} <- answers, do: slug do
+      [] ->
+        :ok
+
+      missing ->
+        Logger.warning("Discovery list omits apps that did not answer: #{inspect(missing)}")
+    end
+
+    for {_slug, {:ok, messages}} when is_list(messages) <- answers,
         message <- messages,
         do: message
   end
@@ -356,16 +375,21 @@ defmodule Vagus.App do
     # One critical section: a reinstall landing between the uninstall and the
     # stop would have its new process killed.
     with_slug_lock(slug, fn ->
-      # Read first: the process stops itself once the entry is gone, so a
+      # Read before too: the process stops itself once the entry is gone, so a
       # question from anyone during the uninstall would take the list with it.
-      discovery = discovery_list(slug)
+      before = discovery_list(slug)
       result = Manager.uninstall_holding_lock(slug)
+      # A message posted while the container was stopping is only in the
+      # process; this read finds the entry gone and stops it.
+      discovery = Enum.uniq_by(before ++ discovery_list(slug), & &1.uuid)
 
       # `:not_found` too: an entry deleted out of band can leave its process up.
       if result in [:ok, {:error, :not_found}] do
+        # Stop first: Core GETs the message before acting on a DELETE and
+        # ignores the DELETE while that still answers.
+        Instances.stop(slug)
         # Core keeps a config flow until told; its next boot pull is too late.
         Enum.each(discovery, &Push.notify(:delete, &1))
-        Instances.stop(slug)
       end
 
       result
@@ -392,13 +416,19 @@ defmodule Vagus.App do
   end
 
   defp do_install(%Config{slug: slug} = config) do
-    if installed?(slug) do
-      {:error, :already_installed}
-    else
-      with :ok <- Manager.install(config),
-           :ok <- State.put(config, :stopped) do
-        ensure_after_install(slug)
-      end
+    case state_get(slug) do
+      {:ok, _entry} ->
+        {:error, :already_installed}
+
+      # Not known to be absent, so no pull.
+      :unavailable ->
+        {:error, :unavailable}
+
+      :error ->
+        with :ok <- Manager.install(config),
+             :ok <- State.put(config, :stopped) do
+          ensure_after_install(slug)
+        end
     end
   end
 

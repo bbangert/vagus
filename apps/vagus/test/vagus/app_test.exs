@@ -110,7 +110,8 @@ defmodule Vagus.AppTest do
       ref = Process.monitor(pid)
 
       assert :ok = App.uninstall(config.slug)
-      assert_receive {:DOWN, ^ref, :process, ^pid, :shutdown}
+      # `:normal` when its own read after the delete found the entry gone.
+      assert_receive {:DOWN, ^ref, :process, ^pid, reason} when reason in [:normal, :shutdown]
       refute App.installed?(config.slug)
     end
 
@@ -150,22 +151,21 @@ defmodule Vagus.AppTest do
       :ok = App.install(config)
       [{old, _}] = Elixir.Registry.lookup(Directory, {:slug, slug})
 
-      # A suspended app supervisor parks the uninstall in its process stop,
-      # after the entry is gone: the window a reinstall must not get into.
-      sup = Process.whereis(Vagus.App.Instances)
-      :erlang.trace(sup, true, [:receive])
-      :ok = :sys.suspend(sup)
-      on_exit(fn -> :sys.resume(sup) end)
+      {:ok, _message, :new} = App.add_discovery(slug, "mqtt", %{})
+      old_ref = Process.monitor(old)
 
+      # The discovery DELETE push parks the uninstall after the entry is gone
+      # and the process stopped: the window a reinstall must not get into.
+      park_discovery_push()
       uninstall = Task.async(fn -> App.uninstall(slug) end)
-      assert_receive {:trace, ^sup, :receive, {:"$gen_call", _, {:terminate_child, ^old}}}, 5_000
+      assert_receive {:push_parked, :delete, pusher}, 5_000
+      assert_receive {:DOWN, ^old_ref, :process, ^old, _reason}
 
       install = Task.async(fn -> App.install(config) end)
       assert Task.yield(install, 200) == nil
       refute App.installed?(slug)
 
-      :erlang.trace(sup, false, [:receive])
-      :ok = :sys.resume(sup)
+      send(pusher, :release)
       assert :ok = Task.await(uninstall)
       assert :ok = Task.await(install)
 
@@ -272,6 +272,23 @@ defmodule Vagus.AppTest do
 
       assert App.installed?(slug)
       assert [] = Elixir.Registry.lookup(Directory, {:slug, slug})
+    end
+  end
+
+  describe "while Vagus.Addon.State is down" do
+    test "an app reads as not installed, not as a crash" do
+      config = config()
+      slug = track(config, process: false)
+      :ok = Supervisor.terminate_child(Vagus.Supervisor, Vagus.Addon.State)
+
+      on_exit(fn ->
+        {:ok, _pid} = Supervisor.restart_child(Vagus.Supervisor, Vagus.Addon.State)
+      end)
+
+      refute App.installed?(slug)
+      assert :absent = App.monitor(slug)
+      assert {:error, :unavailable} = App.provide_service(slug, "svc_#{slug}", %{})
+      assert {:error, :unavailable} = App.install(config)
     end
   end
 
@@ -387,23 +404,52 @@ defmodule Vagus.AppTest do
       assert :error = App.discovery(uuid)
     end
 
-    test "discoveries/0 gathers every app's messages and leaves out one that does not answer" do
+    test "discoveries/0 gathers every app's messages and leaves out, and logs, those that do not answer" do
       a = track(config())
       b = track(config())
-      stuck = track(config())
+      stuck = for _ <- 1..2, do: track(config())
       {:ok, %{uuid: ua}, :new} = App.add_discovery(a, "mqtt", %{})
       {:ok, %{uuid: ub}, :new} = App.add_discovery(b, "mqtt", %{})
-      {:ok, %{uuid: us}, :new} = App.add_discovery(stuck, "mqtt", %{})
-      suspend(stuck)
+      stuck_uuids = for slug <- stuck, do: elem(App.add_discovery(slug, "mqtt", %{}), 1).uuid
+      pids = Enum.map(stuck, &suspend/1)
 
-      started = System.monotonic_time(:millisecond)
-      uuids = Enum.map(App.discoveries(), & &1.uuid)
-      elapsed = System.monotonic_time(:millisecond) - started
+      {{uuids, elapsed}, log} =
+        ExUnit.CaptureLog.with_log(fn ->
+          started = System.monotonic_time(:millisecond)
+          uuids = Enum.map(App.discoveries(), & &1.uuid)
+          {uuids, System.monotonic_time(:millisecond) - started}
+        end)
 
       assert ua in uuids and ub in uuids
-      refute us in uuids
+      for uuid <- stuck_uuids, do: refute(uuid in uuids)
       assert elapsed < 2 * 1_000
+      for slug <- stuck, do: assert(log =~ slug)
+
+      for pid <- pids, do: :ok = :sys.resume(pid)
+      for pid <- pids, do: _ = :sys.get_state(pid)
+      refute_received _late_reply
     end
+  end
+
+  defp park_discovery_push do
+    test_pid = self()
+    prev = Application.get_env(:vagus, :discovery_push)
+
+    Application.put_env(:vagus, :discovery_push, fn method, _message ->
+      send(test_pid, {:push_parked, method, self()})
+
+      receive do
+        :release -> :ok
+      after
+        10_000 -> exit(:push_never_released)
+      end
+    end)
+
+    on_exit(fn ->
+      if prev,
+        do: Application.put_env(:vagus, :discovery_push, prev),
+        else: Application.delete_env(:vagus, :discovery_push)
+    end)
   end
 
   # A child stopped through `terminate_child/2` stays down until restarted;

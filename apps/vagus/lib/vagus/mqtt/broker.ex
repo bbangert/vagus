@@ -138,18 +138,20 @@ defmodule Vagus.Mqtt.Broker do
 
   # The password is read here, before the listener starts, so the first
   # CONNECT already knows the login the Provider publishes; a start after a
-  # restore reads the restored one.
+  # restore reads the restored one. A closure, so it is in no child spec and
+  # no supervisor report.
   defp provider_opts(nil), do: nil
 
   defp provider_opts(opts) do
-    opts = Keyword.take(opts, [:slug, :data_dir, :push])
-    Keyword.put(opts, :password, Provider.service_login(opts).password)
+    opts = Keyword.take(opts, [:slug, :data_dir, :push, :publish_retry, :withdraw_timeout])
+    login = Provider.service_login(opts)
+    Keyword.put(opts, :service_login, fn -> login end)
   end
 
   defp put_service_login(auth, nil), do: auth
 
   defp put_service_login(auth, provider),
-    do: Keyword.put(auth, :service_login, Provider.service_login(provider))
+    do: Keyword.put(auth, :service_login, Keyword.fetch!(provider, :service_login))
 
   # The `mqtt` service/discovery provider (MQ-P4-T1) — added only when the broker
   # is the real native app (`Backend.Native` passes `:provider`); bare

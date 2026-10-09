@@ -52,7 +52,10 @@ defmodule Vagus.AppCharacterisationTest.GatedBackend do
   def stop(id, opts \\ []), do: Fake.stop(id, opts)
 
   @impl true
-  def remove(id, opts \\ []), do: Fake.remove(id, opts)
+  def remove(id, opts \\ []) do
+    gate(:remove)
+    Fake.remove(id, opts)
+  end
 
   @impl true
   def remove_image(image, opts \\ []), do: Fake.remove_image(image, opts)
@@ -264,6 +267,29 @@ defmodule Vagus.AppCharacterisationTest do
 
     assert supervisor_call(:post, "/addons/#{slug}/uninstall").status == 200
     assert_receive {:discovery_push, :delete, %{uuid: ^uuid}}, 1_000
+  end
+
+  test "uninstall also pushes the DELETE for a message posted while the container is removed" do
+    capture_discovery_pushes()
+    slug = "core_char_disc_late"
+    install_app(config(slug), state: :started)
+    name = "svc_#{slug}"
+    :ok = Vagus.App.provide_service(slug, name, %{"password" => "p"})
+    {:ok, %{uuid: early}, :new} = Vagus.App.add_discovery(slug, "mqtt", %{})
+
+    GatedBackend.arm(:remove)
+    uninstall = Task.async(fn -> Vagus.App.uninstall(slug) end)
+    assert_receive {:gate_entered, :remove, remover}, 5_000
+
+    {:ok, %{uuid: late}, :new} = Vagus.App.add_discovery(slug, "other", %{})
+    send(remover, :release)
+    assert :ok = Task.await(uninstall)
+
+    assert_receive {:discovery_push, :delete, %{uuid: ^early}}, 1_000
+    assert_receive {:discovery_push, :delete, %{uuid: ^late}}, 1_000
+    assert :error = Vagus.App.service(name)
+    assert :error = Vagus.App.discovery(early)
+    assert :error = Vagus.App.discovery(late)
   end
 
   # Upstream's per-app job group rejects a second lifecycle job outright;

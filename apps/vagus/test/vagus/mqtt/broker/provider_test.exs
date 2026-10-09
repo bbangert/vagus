@@ -137,7 +137,7 @@ defmodule Vagus.Mqtt.Broker.ProviderTest do
     assert_receive {:push, :post, %{uuid: new}}, 5_000
     refute new == old
     # Core's flow for the old uuid would otherwise stay beside the new one.
-    assert_receive {:push, :delete, %{uuid: ^old}}
+    assert_receive {:push, :delete, %{uuid: ^old}}, 5_000
     assert {:ok, ^slug, _payload} = App.service("mqtt")
     refute app_pid(slug) == old_pid
   end
@@ -150,6 +150,50 @@ defmodule Vagus.Mqtt.Broker.ProviderTest do
 
     assert_receive {:push, :post, %{addon: ^slug}}, 5_000
     assert {:ok, ^slug, _payload} = App.service("mqtt")
+  end
+
+  test "its app's own earlier provide is no refusal", %{slug: slug} = ctx do
+    install_app(app_config(slug))
+    :ok = App.provide_service(slug, "mqtt", %{"stale" => true})
+
+    start_provider(ctx, publish_retry: {1, 0})
+
+    assert_receive {:push, :post, %{addon: ^slug, service: "mqtt"}}
+    assert {:ok, ^slug, _payload} = App.service("mqtt")
+  end
+
+  test "another app holding mqtt is logged and retried until it lets go", %{slug: slug} = ctx do
+    install_app(app_config(slug))
+    other = "prov_other_#{System.unique_integer([:positive])}"
+    install_app(app_config(other))
+    :ok = App.provide_service(other, "mqtt", %{"host" => "elsewhere"})
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        provider = start_provider(ctx, publish_retry: {500, 10})
+        assert :sys.get_state(provider).uuid == nil
+        refute_received {:push, _method, _message}
+        # A failed attempt keeps no monitor on the app process. Suspended, so
+        # no attempt is mid-flight while it is looked at.
+        pid = Process.whereis(provider)
+        :ok = :sys.suspend(pid)
+        assert {:monitors, []} = Process.info(pid, :monitors)
+        :ok = :sys.resume(pid)
+
+        :ok = App.withdraw_service(other, "mqtt")
+        assert_receive {:push, :post, %{addon: ^slug}}, 5_000
+      end)
+
+    assert log =~ "provided by app #{other}"
+    assert {:ok, ^slug, _payload} = App.service("mqtt")
+  end
+
+  test "its status shows no password", %{slug: slug} = ctx do
+    install_app(app_config(slug))
+    pin_password(ctx, "pinned-secret")
+    provider = start_provider(ctx)
+
+    refute inspect(:sys.get_status(provider)) =~ "pinned-secret"
   end
 
   test "terminate with its app process gone drops the withdraw", %{slug: slug} = ctx do

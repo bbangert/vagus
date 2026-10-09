@@ -35,7 +35,7 @@ defmodule Vagus.Mqtt.Broker.AuthTest do
     config =
       Auth.config(
         slug: "core_mqtt",
-        service_login: service_login,
+        service_login: fn -> service_login end,
         auth_opts: [server: cache, core_client: StubCore],
         logins: [%{username: "optuser", password: "optpass"}]
       )
