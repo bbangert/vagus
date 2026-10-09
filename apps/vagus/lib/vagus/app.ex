@@ -13,7 +13,6 @@ defmodule Vagus.App do
   alias Vagus.Addon.{Config, Manager, State, Update}
   alias Vagus.Addon.Registry, as: Tokens
   alias Vagus.App.{Directory, Instances, Policy}
-  alias Vagus.Discovery.Push
   alias Vagus.Network
 
   @settings [:ingress_panel, :watchdog, :ports, :boot, :auto_update, :protected]
@@ -380,26 +379,13 @@ defmodule Vagus.App do
       # Before the container stops: Core GETs a message before acting on its
       # DELETE and ignores the DELETE while that still answers, and a message
       # the stopping app posts now is refused instead of outliving it.
-      discovery = retire(slug)
+      _ = ask(slug, :retire)
       result = Manager.uninstall_holding_lock(slug)
       # Also when the app stays installed: its retired process refuses every
       # write, so it goes and the next ask starts a fresh one.
       Instances.stop(slug)
-
-      # `:not_found` too: an entry deleted out of band can leave its process up.
-      # Core keeps a config flow until told; its next boot pull is too late.
-      if result in [:ok, {:error, :not_found}],
-        do: Enum.each(discovery, &Push.notify(:delete, &1))
-
       result
     end)
-  end
-
-  defp retire(slug) do
-    case ask(slug, :retire) do
-      {:ok, {:ok, messages}} -> messages
-      _absent -> []
-    end
   end
 
   @doc """

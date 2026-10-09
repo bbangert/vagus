@@ -39,7 +39,6 @@ defmodule Vagus.API.Router do
   alias Vagus.Backend
   alias Vagus.Backups
   alias Vagus.Core.{ConfigCheck, Lifecycle, TokenStore, Versions}
-  alias Vagus.Discovery.Push
   alias Vagus.Jobs
   alias Vagus.Mqtt.Broker
   alias Vagus.Runtime.{Docker, Logs, Stats}
@@ -1104,12 +1103,7 @@ defmodule Vagus.API.Router do
          {:ok, service, config} <- validate_discovery(conn.body_params),
          true <- service in declared do
       case App.add_discovery(slug, service, config) do
-        # `:existing` means Core already has this exact (addon, service,
-        # config) record — pushing again would be the duplicate this dedup
-        # exists to prevent (audit B3). `:new`/`:updated` both need Core told,
-        # same as upstream telling it on every non-identical `send`.
-        {:ok, message, outcome} ->
-          if outcome != :existing, do: Push.notify(:post, message)
+        {:ok, message, _outcome} ->
           Envelope.send_ok(conn, %{uuid: message.uuid})
 
         {:error, :unavailable} ->
@@ -1126,8 +1120,7 @@ defmodule Vagus.API.Router do
     case conn.assigns.caller do
       {:addon, %{slug: slug}} ->
         case App.delete_discovery(slug, uuid) do
-          {:ok, message} ->
-            Push.notify(:delete, message)
+          {:ok, _message} ->
             Envelope.send_ok(conn, %{})
 
           {:error, :not_found} ->

@@ -1,21 +1,24 @@
 defmodule Vagus.Discovery.Push do
   @moduledoc """
-  Fire-and-forget push of a discovery add/remove to Core
+  Pushes a discovery add/remove to Core
   (`POST|DELETE api/hassio_push/discovery/{uuid}`) so Core live-reconfigures a
   config flow immediately, instead of only picking the change up on its next
   boot-time `GET /discovery` pull (§A3.2).
 
-  Shared by `Vagus.API.Router` (a container app POSTing `/discovery`),
-  `Vagus.App.uninstall/1` and `Vagus.Mqtt.Broker.Provider` (the native broker,
-  which registers `mqtt` in-process rather than over HTTP).
+  Core acts on pushes in arrival order, so every push is one entry in this
+  process's FIFO and they are delivered one at a time: a DELETE queued after a
+  POST for the same uuid never overtakes it. `Vagus.App.Server` queues before
+  it replies, so whatever its caller does next queues behind. Delivery runs in
+  a task, so a slow Core holds up the queue but never `notify/2`.
 
-  Best-effort and decoupled via `Task.start/1` — the caller never blocks on a
-  Core round-trip. Until the Core handshake has happened,
-  `Vagus.Core.Client.request/3` returns `{:error, :no_refresh_token}`; that is
-  the expected case when a publisher registers before Core is up (the native
-  broker boots ahead of Core), and Core's boot-time pull then covers it, so it
-  is logged only at debug. Other errors are logged as warnings.
+  Until the Core handshake has happened, `Vagus.Core.Client.request/3` returns
+  `{:error, :no_refresh_token}`; that is the expected case when a publisher
+  registers before Core is up (the native broker boots ahead of Core), and
+  Core's boot-time pull then covers it, so it is logged only at debug. Other
+  errors are logged as warnings.
   """
+
+  use GenServer
 
   require Logger
 
@@ -26,41 +29,66 @@ defmodule Vagus.Discovery.Push do
           optional(any()) => any()
         }
 
-  @doc """
-  Pushes `message` (add via `:post`, remove via `:delete`) to Core. Always
-  returns `:ok` — the actual request runs in a detached task (`deliver/3`).
-
-  `opts[:request_fun]` overrides the Core request function (arity 3, matching
-  `Vagus.Core.Client.request/3`); used by tests to drive `deliver/3`'s branches
-  synchronously without a live Core.
-  """
-  @spec push(:post | :delete, message(), keyword()) :: :ok
-  def push(method, message, opts \\ []) do
-    request_fun = Keyword.get(opts, :request_fun, &Vagus.Core.Client.request/3)
-    Task.start(fn -> deliver(method, message, request_fun) end)
-    :ok
-  end
+  @spec start_link(keyword()) :: GenServer.on_start()
+  def start_link(_opts), do: GenServer.start_link(__MODULE__, :ok, name: __MODULE__)
 
   @doc """
-  `push/3` unless `:discovery_push` names another function, the seam tests use
-  to see a push that `push/3` would detach.
+  Queues the push. `:discovery_push` names a function the queue calls instead
+  of Core, the seam tests use to see each push in order.
   """
   @spec notify(:post | :delete, message()) :: :ok
-  def notify(method, message) do
-    Application.get_env(:vagus, :discovery_push, &push/2).(method, message)
+  def notify(method, %{uuid: _, addon: _, service: _} = message) do
+    # The config can hold a password and Core is never sent it.
+    GenServer.cast(__MODULE__, {:push, method, Map.take(message, [:uuid, :addon, :service])})
+  end
+
+  @impl GenServer
+  def init(:ok), do: {:ok, %{queue: :queue.new(), in_flight: nil}}
+
+  @impl GenServer
+  def handle_cast({:push, method, message}, state) do
+    {:noreply, next(%{state | queue: :queue.in({method, message}, state.queue)})}
+  end
+
+  @impl GenServer
+  def handle_info({ref, _result}, %{in_flight: ref} = state) do
+    Process.demonitor(ref, [:flush])
+    {:noreply, next(%{state | in_flight: nil})}
+  end
+
+  # A crashed push is lost like a failed one; the rest still go.
+  def handle_info({:DOWN, ref, :process, _pid, _reason}, %{in_flight: ref} = state),
+    do: {:noreply, next(%{state | in_flight: nil})}
+
+  def handle_info(_message, state), do: {:noreply, state}
+
+  defp next(%{in_flight: nil} = state) do
+    case :queue.out(state.queue) do
+      {{:value, {method, message}}, queue} ->
+        task = Task.Supervisor.async_nolink(Vagus.TaskSupervisor, fn -> run(method, message) end)
+        %{state | queue: queue, in_flight: task.ref}
+
+      {:empty, _queue} ->
+        state
+    end
+  end
+
+  defp next(state), do: state
+
+  defp run(method, message) do
+    case Application.get_env(:vagus, :discovery_push) do
+      nil -> deliver(method, message, &Vagus.Core.Client.request/3)
+      seam -> seam.(method, message)
+    end
   end
 
   @doc """
-  The synchronous body of one push — issues the Core request via `request_fun`
-  and logs per outcome. Exposed (not private) only so tests can exercise every
-  branch deterministically; production always reaches it through `push/3`'s
-  detached task.
+  One push, logged per outcome. Public only so tests can drive every branch
+  with their own `request_fun`.
 
-  `request_fun` is expected to return a tagged tuple, but a misbehaving call must
-  not kill the detached task with only a default crash report: an exception is
-  `rescue`d and an exit (e.g. a `GenServer.call` to an unstarted
-  `Vagus.Core.Client`, which exits `:noproc`) is `catch`ed — both logged and
-  swallowed like any other push failure.
+  An exception or an exit (a `GenServer.call` to an unstarted
+  `Vagus.Core.Client` exits `:noproc`) is logged like any other failure
+  instead of leaving only a task crash report.
   """
   @spec deliver(:post | :delete, message(), (atom(), String.t(), keyword() -> term())) :: :ok
   def deliver(method, %{uuid: uuid, addon: addon, service: service}, request_fun) do

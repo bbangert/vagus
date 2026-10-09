@@ -19,6 +19,7 @@ defmodule Vagus.App.Server do
 
   alias Vagus.Addon.State
   alias Vagus.App.{Directory, Policy}
+  alias Vagus.Discovery.Push
 
   @redacted [:token_hash, :services, :discovery, :log]
 
@@ -54,10 +55,12 @@ defmodule Vagus.App.Server do
 
   # Uninstall's snapshot: every key goes now, so Core's GET of a message misses
   # while the container stops, and what the stopping app posts lands nowhere.
+  # Core keeps a config flow until told, and its next boot pull is too late.
   def handle_event({:call, from}, :retire, _state, data) do
     keys = Enum.map(Map.keys(data.services), &{:service, &1})
     keys = keys ++ Enum.map(Map.keys(data.discovery), &{:discovery, &1})
     Enum.each(keys, &Registry.unregister(Directory, &1))
+    Enum.each(Map.values(data.discovery), &Push.notify(:delete, &1))
     retired = %{data | services: %{}, discovery: %{}, retired: true}
     {:keep_state, retired, [{:reply, from, {:ok, Map.values(data.discovery)}}]}
   end
@@ -106,6 +109,11 @@ defmodule Vagus.App.Server do
     if outcome == :new,
       do: {:ok, _owner} = Registry.register(Directory, {:discovery, message.uuid}, data.slug)
 
+    # Queued before the reply so it is ahead of anything the caller does next.
+    # `:existing` is a record Core already has; pushing it again is the
+    # duplicate config flow the dedup prevents.
+    if outcome != :existing, do: Push.notify(:post, message)
+
     data = put_in(data.discovery[message.uuid], message)
     {:keep_state, data, [{:reply, from, {:ok, message, outcome}}]}
   end
@@ -117,6 +125,7 @@ defmodule Vagus.App.Server do
 
       {message, discovery} ->
         :ok = Registry.unregister(Directory, {:discovery, uuid})
+        Push.notify(:delete, message)
         {:keep_state, %{data | discovery: discovery}, [{:reply, from, {:ok, message}}]}
     end
   end

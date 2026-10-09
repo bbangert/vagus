@@ -151,22 +151,29 @@ defmodule Vagus.AppTest do
       :ok = App.install(config)
       [{old, _}] = Elixir.Registry.lookup(Directory, {:slug, slug})
 
-      {:ok, _message, :new} = App.add_discovery(slug, "mqtt", %{})
       old_ref = Process.monitor(old)
 
-      # The discovery DELETE push parks the uninstall after the entry is gone
-      # and the process stopped: the window a reinstall must not get into.
-      park_discovery_push()
+      # Suspended, the app supervisor parks the uninstall at its stop, after
+      # the entry is gone: the window a reinstall must not get into.
+      instances = Process.whereis(Vagus.App.Instances)
+      :erlang.trace(instances, true, [:receive])
+      :ok = :sys.suspend(instances)
+      on_exit(fn -> :sys.resume(instances) end)
       uninstall = Task.async(fn -> App.uninstall(slug) end)
-      assert_receive {:push_parked, :delete, pusher}, 5_000
-      assert_receive {:DOWN, ^old_ref, :process, ^old, _reason}
+
+      assert_receive {:trace, ^instances, :receive,
+                      {:"$gen_call", _from, {:terminate_child, ^old}}},
+                     5_000
+
+      :erlang.trace(instances, false, [:receive])
+      refute App.installed?(slug)
 
       install = Task.async(fn -> App.install(config) end)
       assert Task.yield(install, 200) == nil
-      refute App.installed?(slug)
 
-      send(pusher, :release)
+      :ok = :sys.resume(instances)
       assert :ok = Task.await(uninstall)
+      assert_receive {:DOWN, ^old_ref, :process, ^old, _reason}
       assert :ok = Task.await(install)
 
       assert [{pid, _}] = Elixir.Registry.lookup(Directory, {:slug, slug})
@@ -437,27 +444,6 @@ defmodule Vagus.AppTest do
       for pid <- pids, do: _ = :sys.get_state(pid)
       refute_received _late_reply
     end
-  end
-
-  defp park_discovery_push do
-    test_pid = self()
-    prev = Application.get_env(:vagus, :discovery_push)
-
-    Application.put_env(:vagus, :discovery_push, fn method, _message ->
-      send(test_pid, {:push_parked, method, self()})
-
-      receive do
-        :release -> :ok
-      after
-        10_000 -> exit(:push_never_released)
-      end
-    end)
-
-    on_exit(fn ->
-      if prev,
-        do: Application.put_env(:vagus, :discovery_push, prev),
-        else: Application.delete_env(:vagus, :discovery_push)
-    end)
   end
 
   # A child stopped through `terminate_child/2` stays down until restarted;

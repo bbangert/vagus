@@ -26,6 +26,7 @@ defmodule Vagus.Mqtt.Broker.Provider do
   require Logger
 
   alias Vagus.App
+  alias Vagus.Discovery.Push
 
   @publish_retry {10, 100}
   @publish_backoff_ms 30_000
@@ -65,7 +66,6 @@ defmodule Vagus.Mqtt.Broker.Provider do
     state = %{
       slug: slug,
       payload: payload(Keyword.fetch!(opts, :host), Keyword.fetch!(opts, :port), login),
-      push: Keyword.get(opts, :push, &Vagus.Discovery.Push.notify/2),
       retry: retry,
       attempts: elem(retry, 0),
       backoff_ms: Keyword.get(opts, :publish_backoff_ms, @publish_backoff_ms),
@@ -101,11 +101,7 @@ defmodule Vagus.Mqtt.Broker.Provider do
   def terminate(_reason, %{slug: slug, withdraw_timeout: timeout} = state) do
     _ = App.withdraw_service(slug, @service, timeout)
 
-    case state.uuid && App.delete_discovery(slug, state.uuid, timeout) do
-      {:ok, message} -> state.push.(:delete, message)
-      _gone -> :ok
-    end
-
+    if state.uuid, do: App.delete_discovery(slug, state.uuid, timeout)
     :ok
   end
 
@@ -115,8 +111,8 @@ defmodule Vagus.Mqtt.Broker.Provider do
     case App.monitor(slug) do
       {:ok, ref} ->
         case publish_into(state) do
-          {:ok, message, outcome} ->
-            announce(state, message, outcome)
+          {:ok, message, _outcome} ->
+            retire_old_uuid(state, message)
 
             if state.attempts == 0,
               do: Logger.info("Vagus.Mqtt.Broker.Provider: mqtt service published again")
@@ -164,15 +160,12 @@ defmodule Vagus.Mqtt.Broker.Provider do
     end
   end
 
-  # Push only on `:new`/`:updated`: `:existing` is a record Core already has,
-  # and pushing it again is the duplicate config flow the dedup prevents. A
-  # new uuid after the app process restarted leaves the old one in Core
-  # unless it is deleted there.
-  defp announce(state, message, outcome) do
-    if outcome != :existing, do: state.push.(:post, message)
-
+  # The app process pushed the new uuid's POST before replying, so this DELETE
+  # queues behind it. The old uuid's process is gone and cannot push it, and
+  # Core would keep its flow beside the new one.
+  defp retire_old_uuid(state, message) do
     if state.uuid not in [nil, message.uuid],
-      do: state.push.(:delete, %{message | uuid: state.uuid})
+      do: Push.notify(:delete, %{message | uuid: state.uuid})
   end
 
   defp retry(%{attempts: attempts} = state) when attempts > 1 do

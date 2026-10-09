@@ -94,6 +94,10 @@ defmodule Vagus.Application do
         # posted before a restart.
         Vagus.API.SupervisorOptions,
 
+        # Before the app processes and the native broker, which queue pushes
+        # here; stopped after them, so an uninstall's DELETEs still queue.
+        Vagus.Discovery.Push,
+
         # Holds the native "virtual add-on" BEAM subtrees (M5, the mqttx
         # broker) once `Vagus.Addon.Backend.Native.start/1` starts them —
         # mirrors `Vagus.Engine.DaemonSupervisor`. Started unconditionally on

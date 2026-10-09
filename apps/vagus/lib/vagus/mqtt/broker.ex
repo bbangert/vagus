@@ -143,7 +143,15 @@ defmodule Vagus.Mqtt.Broker do
   defp provider_opts(nil), do: nil
 
   defp provider_opts(opts) do
-    opts = Keyword.take(opts, [:slug, :data_dir, :push, :publish_retry, :withdraw_timeout])
+    opts =
+      Keyword.take(opts, [
+        :slug,
+        :data_dir,
+        :publish_retry,
+        :publish_backoff_ms,
+        :withdraw_timeout
+      ])
+
     login = Provider.service_login(opts)
     Keyword.put(opts, :service_login, fn -> login end)
   end

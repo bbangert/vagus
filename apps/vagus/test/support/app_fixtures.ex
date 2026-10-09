@@ -7,6 +7,7 @@ defmodule Vagus.AppFixtures do
   `Vagus.App` changes, only this file changes with it.
   """
 
+  import ExUnit.Assertions, only: [assert_receive: 2]
   import ExUnit.Callbacks, only: [on_exit: 1]
 
   alias Vagus.Addon.{Config, Registry, State}
@@ -104,6 +105,36 @@ defmodule Vagus.AppFixtures do
     :ok = State.delete(slug)
     :ok = Vagus.App.Instances.stop(slug)
     :ok = Registry.unregister_slug(slug)
+  end
+
+  @doc "Sends `{tag, method, message}` to the test for each discovery push, in delivery order."
+  @spec capture_discovery_pushes(atom()) :: :ok
+  def capture_discovery_pushes(tag \\ :discovery_push) do
+    test_pid = self()
+    prev = Application.get_env(:vagus, :discovery_push)
+
+    Application.put_env(:vagus, :discovery_push, fn method, message ->
+      send(test_pid, {tag, method, message})
+      :ok
+    end)
+
+    on_exit(fn ->
+      if is_nil(prev),
+        do: Application.delete_env(:vagus, :discovery_push),
+        else: Application.put_env(:vagus, :discovery_push, prev)
+    end)
+  end
+
+  @doc """
+  Returns once every push queued before it is delivered, so a `refute_received`
+  after it is not racing the queue.
+  """
+  @spec drain_discovery_pushes(atom()) :: :ok
+  def drain_discovery_pushes(tag \\ :discovery_push) do
+    uuid = "drain-#{System.unique_integer([:positive])}"
+    Vagus.Discovery.Push.notify(:delete, %{uuid: uuid, addon: "", service: ""})
+    assert_receive {^tag, :delete, %{uuid: ^uuid}}, 5_000
+    :ok
   end
 
   defp random_token, do: Base.url_encode64(:crypto.strong_rand_bytes(24), padding: false)

@@ -16,14 +16,8 @@ defmodule Vagus.Mqtt.Broker.ProviderTest do
     data_dir = Path.join(System.tmp_dir!(), "vagus-provider-#{uniq}")
     on_exit(fn -> File.rm_rf(data_dir) end)
 
-    parent = self()
-
-    push = fn method, message ->
-      send(parent, {:push, method, message})
-      :ok
-    end
-
-    %{slug: "prov_#{uniq}", data_dir: data_dir, push: push}
+    capture_discovery_pushes(:push)
+    %{slug: "prov_#{uniq}", data_dir: data_dir}
   end
 
   defp start_provider(ctx, overrides \\ []) do
@@ -33,7 +27,6 @@ defmodule Vagus.Mqtt.Broker.ProviderTest do
           slug: ctx.slug,
           host: @host,
           port: @port,
-          push: ctx.push,
           data_dir: ctx.data_dir,
           name: :"provider_#{System.unique_integer([:positive])}"
         ],
@@ -95,21 +88,24 @@ defmodule Vagus.Mqtt.Broker.ProviderTest do
     install_app(app_config(slug))
     pin_password(ctx, "already-current")
     {:ok, %{uuid: uuid}, :new} = App.add_discovery(slug, "mqtt", payload("already-current"))
+    assert_receive {:push, :post, %{uuid: ^uuid}}
 
     provider = start_provider(ctx)
 
     assert :sys.get_state(provider).uuid == uuid
+    drain_discovery_pushes(:push)
     refute_received {:push, _method, _message}
   end
 
   test "a changed record keeps its uuid and is pushed", %{slug: slug} = ctx do
     install_app(app_config(slug))
     {:ok, %{uuid: uuid}, :new} = App.add_discovery(slug, "mqtt", %{"stale" => true})
+    assert_receive {:push, :post, %{uuid: ^uuid}}
 
     start_provider(ctx)
 
-    assert_receive {:push, :post, %{uuid: ^uuid, config: %{"host" => @host}}}
-    assert {:ok, [%{uuid: ^uuid}]} = App.ask(slug, :discovery_list)
+    assert_receive {:push, :post, %{uuid: ^uuid}}
+    assert {:ok, [%{uuid: ^uuid, config: %{"host" => @host}}]} = App.ask(slug, :discovery_list)
   end
 
   test "terminate withdraws the service and pushes the discovery delete", %{slug: slug} = ctx do
@@ -145,6 +141,7 @@ defmodule Vagus.Mqtt.Broker.ProviderTest do
 
   test "keeps trying to publish until its app process exists", %{slug: slug} = ctx do
     start_provider(ctx, publish_retry: {500, 10})
+    drain_discovery_pushes(:push)
     refute_received {:push, _method, _message}
 
     install_app(app_config(slug))
@@ -166,6 +163,7 @@ defmodule Vagus.Mqtt.Broker.ProviderTest do
         # Three fast `:publish`es, then slow ones that must log nothing more.
         for _ <- 1..5, do: assert_receive({:trace, ^pid, :receive, :publish}, 1_000)
         assert :sys.get_state(provider).attempts == 0
+        drain_discovery_pushes(:push)
         refute_received {:push, _method, _message}
 
         {:ok, _pid} = Supervisor.restart_child(Vagus.App.Supervisor, Vagus.App.Instances)
@@ -176,6 +174,34 @@ defmodule Vagus.Mqtt.Broker.ProviderTest do
     assert {:ok, ^slug, _payload} = App.service("mqtt")
     assert length(String.split(log, "mqtt publish for #{slug} failed")) == 2
     assert log =~ "mqtt service published again"
+  end
+
+  test "the broker hands the provider its slow cadence", %{slug: slug} = ctx do
+    install_app(app_config(slug))
+    :ok = Supervisor.terminate_child(Vagus.App.Supervisor, Vagus.App.Instances)
+    on_exit(fn -> Supervisor.restart_child(Vagus.App.Supervisor, Vagus.App.Instances) end)
+    broker = :"broker_#{System.unique_integer([:positive])}"
+
+    ExUnit.CaptureLog.capture_log(fn ->
+      start_supervised!(
+        {Vagus.Mqtt.Broker,
+         name: broker,
+         port: free_port(),
+         ip: {127, 0, 0, 1},
+         provider: [
+           slug: slug,
+           data_dir: ctx.data_dir,
+           publish_retry: {3, 0},
+           publish_backoff_ms: 50
+         ]}
+      )
+
+      pid = Process.whereis(Module.concat(broker, "Provider"))
+      :erlang.trace(pid, true, [:receive])
+      # Two past the fast retries: the default 30 s cadence would not get there.
+      for _ <- 1..5, do: assert_receive({:trace, ^pid, :receive, :publish}, 1_000)
+      :erlang.trace(pid, false, [:receive])
+    end)
   end
 
   test "its app's own earlier provide is no refusal", %{slug: slug} = ctx do
@@ -198,6 +224,7 @@ defmodule Vagus.Mqtt.Broker.ProviderTest do
       ExUnit.CaptureLog.capture_log(fn ->
         provider = start_provider(ctx, publish_retry: {500, 10})
         assert :sys.get_state(provider).uuid == nil
+        drain_discovery_pushes(:push)
         refute_received {:push, _method, _message}
         # A failed attempt keeps no monitor on the app process. Suspended, so
         # no attempt is mid-flight while it is looked at.
@@ -237,6 +264,14 @@ defmodule Vagus.Mqtt.Broker.ProviderTest do
       end)
 
     :ok = stop_supervised!(provider)
+    drain_discovery_pushes(:push)
     refute_received {:push, :delete, _message}
+  end
+
+  defp free_port do
+    {:ok, socket} = :gen_tcp.listen(0, [])
+    {:ok, port} = :inet.port(socket)
+    :ok = :gen_tcp.close(socket)
+    port
   end
 end
