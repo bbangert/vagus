@@ -2,8 +2,8 @@ defmodule Vagus.App.Orchestrator do
   @moduledoc """
   Brings the apps and Core up at boot and down at shutdown, in upstream's
   stage order. It holds only the sequence in flight; the sequence runs in a
-  task, so a shutdown can pre-empt a boot at any step. Every step is
-  idempotent, so a restart of this process simply boots again.
+  task. Every step is idempotent, so a boot task that crashes stops this
+  process, and its supervisor's restart simply boots again.
 
   Boot:
 
@@ -28,15 +28,28 @@ defmodule Vagus.App.Orchestrator do
     5. `supervisor_update` with `startup: complete`, which Core takes as the
        Supervisor having finished starting.
 
-  Shutdown stops the `application` stage, then Core, then every earlier
-  stage, each group all at once. Native apps keep running and nothing is
-  written to State, so the next boot starts the same apps.
+  A shutdown pre-empts a boot only at a step boundary: before a gate or a
+  stage, or while a gate waits out its interval. A unit in flight is never
+  killed: Core's start may be midway through stop, remove, create and start,
+  and a killed one leaves Core absent, which the next boot cannot repair
+  since boot never creates Core. Units are bounded on their own (a gate
+  check by `gate_timeout`, a stage by `stage_timeout`), so that is the
+  longest a shutdown waits; a unit still running past its stage budget is
+  left to finish beside the stop.
 
-  Unlike the boot it replaces, a user's stop of the default broker survives
-  a reboot: it starts only on a fresh install or when State says `:started`.
-  An app whose boot start fails stays `:started`, as one whose start fails
-  its registration already does. `Vagus.Provisioner`'s first-boot Core start
-  stays its own, outside these stages.
+  Shutdown stops the `application` stage, then Core, then every earlier
+  stage, each group all at once. Core stops by a deadline that leaves the
+  earlier group its own bound within the caller's budget. Native apps keep
+  running and nothing is written to State, so the next boot starts the same
+  apps. The stop runs outside this process, so a crash here does not cut it
+  short; a restart while `Vagus.Host.Shutdown` is in flight does not boot,
+  and answers `shutdown/2` and `resume/1` as after any stop.
+
+  A user's stop of the default broker survives a reboot: it starts only on a
+  fresh install or when State says `:started`. An app whose boot start fails
+  stays `:started`, as one whose start fails its registration already does.
+  `Vagus.Provisioner`'s first-boot Core start stays its own, outside these
+  stages.
   """
 
   use GenServer
@@ -64,9 +77,11 @@ defmodule Vagus.App.Orchestrator do
     default_native_app: nil,
     gate_tries: 60,
     gate_interval: 5_000,
+    tree_interval: 250,
     gate_timeout: 10_000,
     stage_timeout: 120_000,
     app_stop_timeout: 35_000,
+    stop_margin: 5_000,
     units: %{}
   ]
 
@@ -76,9 +91,15 @@ defmodule Vagus.App.Orchestrator do
   def start_link(opts \\ []),
     do: GenServer.start_link(__MODULE__, opts, name: Keyword.get(opts, :name, __MODULE__))
 
-  @doc "Pre-empts a boot in flight. `{{apps_stopped, apps_running}, core_result}`."
-  @spec shutdown(GenServer.server()) :: {{non_neg_integer(), non_neg_integer()}, term()}
-  def shutdown(server \\ __MODULE__), do: GenServer.call(server, :shutdown, 300_000)
+  @doc """
+  Pre-empts a boot in flight, then stops within `budget_ms`.
+  `{{apps_stopped, apps_running}, core_result}`. No call timeout: the
+  caller's budget is the deadline.
+  """
+  @spec shutdown(GenServer.server(), timeout()) ::
+          {{non_neg_integer(), non_neg_integer()}, term()}
+  def shutdown(server \\ __MODULE__, budget_ms \\ :infinity),
+    do: GenServer.call(server, {:shutdown, budget_ms}, :infinity)
 
   @doc "Boots again after a shutdown that did not take the device down."
   @spec resume(GenServer.server()) :: :ok
@@ -90,8 +111,8 @@ defmodule Vagus.App.Orchestrator do
 
   @impl GenServer
   def init(opts) do
-    # The sequence task is linked so it dies with this process, and a crash
-    # of it must not take this process down.
+    # A crash of the linked boot task arrives as a message, so it can stop
+    # this process with a reason of its own.
     Process.flag(:trap_exit, true)
 
     cfg =
@@ -104,34 +125,48 @@ defmodule Vagus.App.Orchestrator do
     # app process exists. A `State.list/0` exit crashes it: State is a durable
     # sibling started before this tree, so its absence must be loud.
     list = Map.get(cfg.units, :list, &Vagus.Addon.State.list/0)
-    Enum.each(list.(), &Units.ensure(&1.config.slug))
-    {:ok, %{phase: :up, task: nil, waiters: [], cfg: cfg}, {:continue, :boot}}
+    ensure = Map.get(cfg.units, :ensure, &Units.ensure/1)
+    Enum.each(list.(), &ensure.(&1.config.slug))
+
+    state = %{phase: :up, task: nil, waiters: [], resume: false, deadline: :infinity, cfg: cfg}
+    {:ok, state, {:continue, :boot}}
   end
 
   # The rest of the units are resolved here rather than in init/1: they lead
   # into later siblings (DNS, Ingress, the event pusher), and argus counts a
   # function captured in init/1 as one init/1 calls.
   @impl GenServer
-  def handle_continue(:boot, state) do
-    state = update_in(state.cfg.units, &Map.merge(Units.all(), &1))
+  def handle_continue(:boot, %{cfg: %{units: overrides}} = state) do
+    units = Units.all()
+    gates = Map.merge(units.gates, Map.get(overrides, :gates, %{}))
+    state = put_in(state.cfg.units, %{Map.merge(units, overrides) | gates: gates})
     # Restarted mid-shutdown: booting now would restart what is being stopped.
-    if Vagus.Host.Shutdown.in_flight?(),
+    if state.cfg.units.in_flight?.(),
       do: {:noreply, %{state | phase: :stopping}},
       else: {:noreply, boot(state)}
   end
 
   @impl GenServer
-  def handle_call(:shutdown, from, %{phase: :stopping, task: %Task{}} = state),
-    do: {:noreply, %{state | waiters: [from | state.waiters]}}
+  def handle_call({:shutdown, _budget}, from, %{phase: phase, task: %Task{}} = state)
+      when phase in [:stopping, :cancelling],
+      do: {:noreply, %{state | waiters: [from | state.waiters]}}
 
-  def handle_call(:shutdown, from, state) do
-    if state.task, do: Task.shutdown(state.task, :brutal_kill)
-    task = Task.async(fn -> run_stop(state.cfg) end)
-    {:noreply, %{state | phase: :stopping, task: task, waiters: [from]}}
+  def handle_call({:shutdown, budget}, from, state) do
+    state = %{state | waiters: [from], deadline: deadline(budget)}
+
+    if state.phase == :booting do
+      send(state.task.pid, :cancel)
+      {:noreply, %{state | phase: :cancelling}}
+    else
+      {:noreply, begin_stop(state)}
+    end
   end
 
   @impl GenServer
   def handle_cast(:resume, %{phase: :stopping, task: nil} = state), do: {:noreply, boot(state)}
+
+  def handle_cast(:resume, %{phase: phase} = state) when phase in [:stopping, :cancelling],
+    do: {:noreply, %{state | resume: true}}
 
   def handle_cast({:up, slug}, %{phase: :up, cfg: %{units: units}} = state) do
     with %{} = entry <- Enum.find(units.list.(), &(&1.config.slug == slug)) do
@@ -150,29 +185,66 @@ defmodule Vagus.App.Orchestrator do
   end
 
   def handle_info({:DOWN, ref, :process, _pid, reason}, %{task: %Task{ref: ref}} = state) do
-    Logger.error("App #{state.phase} sequence crashed: #{inspect(reason)}")
-    finish(@degraded, %{state | task: nil})
+    state = %{state | task: nil}
+
+    case state.phase do
+      :booting ->
+        {:stop, {:boot_crashed, reason}, state}
+
+      phase ->
+        Logger.error("App #{phase} sequence crashed: #{inspect(reason)}")
+        finish(@degraded, state)
+    end
   end
 
   def handle_info(_exit_or_late_reply, state), do: {:noreply, state}
 
+  defp finish(_result, %{phase: :cancelling} = state), do: {:noreply, begin_stop(state)}
+
   defp finish(result, %{phase: :stopping} = state) do
     Enum.each(state.waiters, &GenServer.reply(&1, result))
-    {:noreply, %{state | waiters: []}}
+    state = %{state | waiters: []}
+    if state.resume, do: {:noreply, boot(%{state | resume: false})}, else: {:noreply, state}
   end
 
   defp finish(_result, state), do: {:noreply, %{state | phase: :up}}
+
+  defp deadline(:infinity), do: :infinity
+  defp deadline(budget_ms), do: System.monotonic_time(:millisecond) + budget_ms
 
   defp boot(%{cfg: %{boot: false}} = state), do: %{state | phase: :up}
 
   defp boot(state),
     do: %{state | phase: :booting, task: Task.async(fn -> run_boot(state.cfg) end)}
 
+  # Runs outside this process, so a crash here does not cut the stop short.
+  defp begin_stop(state) do
+    %{cfg: cfg, deadline: deadline} = state
+    task = Task.Supervisor.async_nolink(Vagus.TaskSupervisor, fn -> run_stop(cfg, deadline) end)
+    %{state | phase: :stopping, task: task}
+  end
+
   defp run_boot(cfg) do
     import_once()
     if slug = cfg.default_native_app, do: install_default(slug, cfg.units)
-    Enum.each(@plan, &step(&1, cfg))
+
+    Enum.each(@plan, fn step ->
+      checkpoint(0)
+      step(step, cfg)
+    end)
+
     cfg.units.push_complete.()
+  catch
+    :cancelled -> :cancelled
+  end
+
+  # A step boundary: where a shutdown's `:cancel` ends the boot.
+  defp checkpoint(wait_ms) do
+    receive do
+      :cancel -> throw(:cancelled)
+    after
+      wait_ms -> :ok
+    end
   end
 
   # Where apps recorded by an older Vagus are brought into this one.
@@ -223,11 +295,12 @@ defmodule Vagus.App.Orchestrator do
 
       failure ->
         if tries == 1, do: Logger.info("Boot: waiting on gate #{name} (#{inspect(failure)})")
-        Process.sleep(cfg.gate_interval)
+        checkpoint(if name == :tree, do: cfg.tree_interval, else: cfg.gate_interval)
         gate(name, check, cfg, tries + 1)
     end
   end
 
+  # A gate check only reads, so one past its timeout is killed.
   defp run_bounded(fun, timeout) do
     task = spawn_unit(fun)
 
@@ -237,10 +310,10 @@ defmodule Vagus.App.Orchestrator do
     end
   end
 
-  # Linked to the sequence task, so killing it stops these too. A raise is
-  # this unit's result, not a crash of the sequence.
+  # Unlinked, so nothing that ends the sequence kills a unit midway. A raise
+  # is this unit's result, not a crash of the sequence.
   defp spawn_unit(fun) do
-    Task.async(fn ->
+    Task.Supervisor.async_nolink(Vagus.TaskSupervisor, fn ->
       try do
         fun.()
       rescue
@@ -251,8 +324,6 @@ defmodule Vagus.App.Orchestrator do
     end)
   end
 
-  # A straggler is left to finish: killing a start midway leaves a container
-  # half made.
   defp await(stage, tasks, cfg) do
     results = Task.yield_many(Enum.map(tasks, &elem(&1, 1)), cfg.stage_timeout)
 
@@ -281,16 +352,56 @@ defmodule Vagus.App.Orchestrator do
     :failed
   end
 
-  defp run_stop(%{units: units} = cfg) do
+  defp run_stop(%{units: units} = cfg, deadline) do
     {apps, earlier} =
-      units.list.()
-      |> Enum.filter(&(&1.state == :started and not units.native?.(&1)))
+      units
+      |> stoppable()
       |> Enum.split_with(&(Map.get(@stage_of, &1.config.startup) == :application))
 
     {apps_ok, apps_total} = stop_all(apps, cfg)
-    core = units.core_stop.()
+    core = stop_core(units, core_budget(deadline, cfg))
     {earlier_ok, earlier_total} = stop_all(earlier, cfg)
     {{apps_ok + earlier_ok, apps_total + earlier_total}, core}
+  end
+
+  # A listing that fails must still let Core stop.
+  defp stoppable(units) do
+    Enum.filter(units.list.(), &(&1.state == :started and not units.native?.(&1)))
+  rescue
+    exception -> unlisted(exception)
+  catch
+    kind, reason -> unlisted({kind, reason})
+  end
+
+  defp unlisted(reason) do
+    Logger.warning("Shutdown: could not list apps, stopping Core only: #{inspect(reason)}")
+    []
+  end
+
+  # What is left of the budget once the earlier group's bound is set aside.
+  defp core_budget(:infinity, _cfg), do: :infinity
+
+  defp core_budget(deadline, cfg) do
+    left = deadline - System.monotonic_time(:millisecond)
+    max(left - cfg.app_stop_timeout - cfg.stop_margin, 0)
+  end
+
+  # Past its deadline Core is left stopping: the earlier group must still
+  # get its stop before the caller's budget runs out.
+  defp stop_core(units, budget_ms) do
+    task = spawn_unit(fn -> units.core_stop.(budget_ms) end)
+
+    case Task.yield(task, budget_ms) do
+      {:ok, result} ->
+        result
+
+      {:exit, reason} ->
+        {:error, {:exit, reason}}
+
+      nil ->
+        Logger.warning("Shutdown: Core still stopping at its deadline; stopping the earlier apps")
+        {:error, :timeout}
+    end
   end
 
   defp stop_all(entries, cfg) do

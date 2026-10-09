@@ -91,7 +91,7 @@ defmodule Vagus.Host.Shutdown do
   `Vagus.Addon.Watchdog` restarts an app on any `die` event while
   `Vagus.Addon.State` says `state: :started, watchdog: true`. A user's stop
   records `:stopped` first, so its `die` is ignored; the shutdown's stops
-  deliberately do not (`Vagus.App.Orchestrator.shutdown/0`), so the next boot
+  deliberately do not (`Vagus.App.Orchestrator.shutdown/2`), so the next boot
   starts the same apps, and every `docker stop` would otherwise look like a
   crash and restart an app that erlinit then SIGKILLs moments later.
 
@@ -108,11 +108,17 @@ defmodule Vagus.Host.Shutdown do
 
   ## Budgets
 
-  `300_000` ms bounds the whole stop sequence: Core's worst-case stop
-  (260 s, `@fallback_stop_timeout_s` in `Vagus.Core.Lifecycle`) plus margin
-  for the apps stopped ahead of it, and well under `nerves_runtime`'s own
-  ~10-minute halt backstop after `:init.stop/0`. The per-app and Core busy
-  budgets are the orchestrator's and `Vagus.App.CoreUnit`'s.
+  `300_000` ms bounds the whole stop sequence, well under `nerves_runtime`'s
+  own ~10-minute halt backstop after `:init.stop/0`. It is split three
+  ways: the `application` apps stopped ahead of Core (35 s per app, all at
+  once), then Core until a deadline that keeps the same 35 s plus a 5 s
+  margin back for the `initialize`, `system` and `services` apps stopped
+  after it. Those run Core's dependencies, MQTT among them, so they must
+  always get their stop. Core's worst-case stop (260 s,
+  `@fallback_stop_timeout_s` in `Vagus.Core.Lifecycle`) is cut short by
+  however long the apps ahead of it took; past its deadline Core is left
+  stopping. The per-app and Core busy budgets are the orchestrator's
+  and `Vagus.App.CoreUnit`'s.
   """
 
   require Logger
@@ -234,8 +240,16 @@ defmodule Vagus.Host.Shutdown do
   # still fall through to the runtime call.
   defp bounded_stop_stages(kind, opts) do
     total_budget_ms = Keyword.get(opts, :total_budget_ms, @total_budget_ms)
-    stop = Keyword.get(opts, :orchestrator, &Vagus.App.Orchestrator.shutdown/0)
-    task = Task.Supervisor.async_nolink(Vagus.Jobs.TaskSupervisor, stop)
+
+    stop =
+      Keyword.get(
+        opts,
+        :orchestrator,
+        &Vagus.App.Orchestrator.shutdown(Vagus.App.Orchestrator, &1)
+      )
+
+    task =
+      Task.Supervisor.async_nolink(Vagus.Jobs.TaskSupervisor, fn -> stop.(total_budget_ms) end)
 
     case Task.yield(task, total_budget_ms) || Task.shutdown(task, :brutal_kill) do
       {:ok, result} ->

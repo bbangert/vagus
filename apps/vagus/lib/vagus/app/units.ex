@@ -18,6 +18,8 @@ defmodule Vagus.App.Units do
   def all do
     %{
       list: &State.list/0,
+      ensure: &ensure/1,
+      in_flight?: &Vagus.Host.Shutdown.in_flight?/0,
       install_default: &install_default/1,
       want_started: &want_started/1,
       native?: &native?/1,
@@ -26,7 +28,7 @@ defmodule Vagus.App.Units do
       demote: &demote/1,
       stop: &stop/1,
       core_start: &CoreUnit.start(deadline: &1),
-      core_stop: &CoreUnit.stop/0,
+      core_stop: &CoreUnit.stop(deadline: &1),
       gates: Gates.all(),
       report: &report/2,
       push_complete: &push_complete/0
@@ -103,8 +105,10 @@ defmodule Vagus.App.Units do
     end
   end
 
-  @spec push_complete() :: :ok
-  def push_complete do
-    "supervisor" |> Events.supervisor_update(%{"startup" => "complete"}) |> EventPusher.push()
+  @spec push_complete(GenServer.server()) :: :ok
+  def push_complete(pusher \\ EventPusher) do
+    "supervisor"
+    |> Events.supervisor_update(%{"startup" => "complete"})
+    |> EventPusher.push(pusher)
   end
 end

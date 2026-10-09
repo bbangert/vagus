@@ -1,8 +1,8 @@
 defmodule Vagus.Host.ShutdownTest do
   @moduledoc """
-  Every test injects the orchestrator's stop sequence and the runtime call,
-  so nothing here stops a container or calls `Nerves.Runtime`. The injected
-  orchestrator runs in a `Vagus.Jobs.TaskSupervisor` task, not the test
+  Every test injects the runtime call and either the orchestrator's stop
+  sequence or a real orchestrator's units, so nothing here stops a container
+  or calls `Nerves.Runtime`. The stop sequence runs in a `Vagus.Jobs.TaskSupervisor` task, not the test
   process, so it reports back by message.
 
   `async: false` because the in-flight flag is one `:persistent_term` key
@@ -11,8 +11,11 @@ defmodule Vagus.Host.ShutdownTest do
 
   use ExUnit.Case, async: false
 
+  import ExUnit.CaptureLog
+
   @moduletag :capture_log
 
+  alias Vagus.App.Orchestrator
   alias Vagus.Host.Shutdown
 
   @stopped {{2, 2}, :ok}
@@ -25,7 +28,7 @@ defmodule Vagus.Host.ShutdownTest do
   end
 
   defp reporting(test_pid, result \\ @stopped) do
-    fn ->
+    fn _budget_ms ->
       send(test_pid, {:stopping, Shutdown.in_flight?()})
       result
     end
@@ -48,7 +51,7 @@ defmodule Vagus.Host.ShutdownTest do
 
   test "a wedged stop sequence is bounded by total_budget_ms", ctx do
     opts = [
-      orchestrator: fn ->
+      orchestrator: fn _budget_ms ->
         send(ctx.test_pid, :stopping)
 
         receive do
@@ -66,7 +69,7 @@ defmodule Vagus.Host.ShutdownTest do
 
   test "a stop sequence that raises still lets the runtime call happen", ctx do
     opts = [
-      orchestrator: fn -> raise "boom" end,
+      orchestrator: fn _budget_ms -> raise "boom" end,
       runtime_reboot: fn -> send(ctx.test_pid, :runtime_called) end,
       resume: ctx.resume
     ]
@@ -77,7 +80,7 @@ defmodule Vagus.Host.ShutdownTest do
 
   test "a second caller while a shutdown is in flight is a no-op", ctx do
     first_opts = [
-      orchestrator: fn ->
+      orchestrator: fn _budget_ms ->
         send(ctx.test_pid, {:first_blocked, self()})
 
         receive do
@@ -143,5 +146,41 @@ defmodule Vagus.Host.ShutdownTest do
     assert catch_throw(Shutdown.poweroff(opts)) == :boom
     assert_received :resumed
     refute Shutdown.in_flight?()
+  end
+
+  test "the stop sequence gets the 300 s budget by default", ctx do
+    opts = [
+      orchestrator: fn budget_ms -> send(ctx.test_pid, {:budget, budget_ms}) && @stopped end,
+      runtime_reboot: fn -> :ok end,
+      resume: ctx.resume
+    ]
+
+    assert Shutdown.reboot(opts) == :ok
+    assert_received {:budget, 300_000}
+  end
+
+  test "the real orchestrator stops Core through the facade", ctx do
+    name = :"orchestrator_#{System.unique_integer([:positive])}"
+
+    units = %{
+      list: fn -> [] end,
+      ensure: fn _slug -> :ok end,
+      in_flight?: fn -> false end,
+      core_stop: fn budget_ms -> send(ctx.test_pid, {:core_stop, budget_ms}) && :ok end
+    }
+
+    start_supervised!({Orchestrator, name: name, boot: false, units: units})
+
+    opts = [
+      orchestrator: &Orchestrator.shutdown(name, &1),
+      runtime_reboot: fn -> send(ctx.test_pid, :runtime_called) end,
+      resume: ctx.resume
+    ]
+
+    log = capture_log(fn -> assert Shutdown.reboot(opts) == :ok end)
+    assert_received {:core_stop, budget_ms}
+    assert budget_ms in 1..(300_000 - 35_000 - 5_000)
+    assert_received :runtime_called
+    assert log =~ "apps stopped 0/0, core :ok"
   end
 end

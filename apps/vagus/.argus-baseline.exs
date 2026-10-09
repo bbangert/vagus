@@ -184,16 +184,6 @@
   },
   %{
     analysis: "startup",
-    file: "lib/vagus/app/instances.ex",
-    title: "init/1 makes a synchronous supervisor call",
-    at_label: "this call blocks init until the supervisor answers",
-    detail:
-      "Vagus.App.Orchestrator.init/1 reaches DynamicSupervisor.start_child on Vagus.App.Instances. Every supervisor management call is a GenServer.call into the supervisor; start_child in particular does not return until the new child's init/1 has, so those inits now run inside this one, on the tree's startup path. A child that calls back into Vagus.App.Orchestrator, or into anything not yet started, deadlocks the boot; terminate_child waits for the whole shutdown of the child.",
-    reason:
-      "Deliberate: the ensure loop runs in init/1 so Vagus.App.Supervisor is not reported started until every app process exists; the API supervisor is a later child of Vagus.Application and must wait for this tree. Each started child (Vagus.App.Server.init/1) only reads Vagus.Addon.State, an earlier top-level sibling that is already running, and never calls the Orchestrator, Instances or anything later in the tree, so no deadlock is possible. Instances is a sibling started before the Orchestrator under :rest_for_one."
-  },
-  %{
-    analysis: "startup",
     file: "lib/vagus/app/orchestrator.ex",
     title: "handle_continue races a later sibling",
     at_label: "the racing call originates here",

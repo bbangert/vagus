@@ -10,8 +10,8 @@ defmodule Vagus.App.Gates do
   alias Vagus.Network
   alias Vagus.Network.Nat
 
-  @spec all() :: [{atom(), (-> :ok | {:error, term()})}]
-  def all, do: [tree: &tree/0, engine: &engine/0, network: &network/0, api: &api/0]
+  @spec all() :: %{atom() => (-> :ok | {:error, term()})}
+  def all, do: %{tree: &tree/0, engine: &engine/0, network: &network/0, api: &api/0}
 
   @doc """
   The rest of the application tree is up. The app tree starts before DNS,

@@ -59,8 +59,10 @@ defmodule Vagus.App.OrchestratorTest do
 
           report.(:stop, slug)
         end,
+        ensure: fn _slug -> :ok end,
+        in_flight?: fn -> false end,
         core_start: fn _deadline -> send(test_pid, :core_start) && :ok end,
-        core_stop: fn -> send(test_pid, :core_stop) && :ok end,
+        core_stop: fn _deadline -> send(test_pid, :core_stop) && :ok end,
         gates: Map.new([:tree, :engine, :network, :api], &{&1, gate(test_pid, &1)}),
         report: fn stage, outcomes -> send(test_pid, {:report, stage, outcomes}) end,
         push_complete: fn -> send(test_pid, :complete) end
@@ -106,13 +108,42 @@ defmodule Vagus.App.OrchestratorTest do
     :sys.get_state(name)
   end
 
+  # Units run unlinked, so a blocked one is released when the test ends.
   defp blocking(test_pid, tag) do
+    fn ->
+      send(test_pid, {tag, self()})
+      ref = Process.monitor(test_pid)
+
+      receive do
+        {:DOWN, ^ref, :process, _pid, _reason} -> :ok
+      end
+    end
+  end
+
+  # Blocks until the test sends `:release`, then answers `result`.
+  defp held(test_pid, tag, result \\ :ok) do
     fn ->
       send(test_pid, {tag, self()})
 
       receive do
+        :release -> send(test_pid, {tag, :returned}) && result
       end
     end
+  end
+
+  defp await_phase(name, phase, tries \\ 1_000) do
+    case :sys.get_state(name) do
+      %{phase: ^phase} = state -> state
+      _other when tries > 0 -> await_phase(name, phase, tries - 1)
+      other -> flunk("never reached #{phase}: #{inspect(other)}")
+    end
+  end
+
+  # Everything the test process received up to now, in order.
+  defp drain do
+    marker = make_ref()
+    send(self(), marker)
+    collect_until(marker) |> List.delete_at(-1)
   end
 
   test "boot runs gates and stages in order, natives before the engine, the push last" do
@@ -283,37 +314,259 @@ defmodule Vagus.App.OrchestratorTest do
     assert log =~ "no Core container"
   end
 
-  test "shutdown pre-empts a boot in flight, then stops apps, Core and earlier stages in order" do
+  test "shutdown waits out a stage unit in flight, then stops apps, Core and earlier stages" do
     test_pid = self()
 
-    gates =
-      Map.new([:tree, :engine, :network], &{&1, gate(test_pid, &1)})
-      |> Map.put(:api, blocking(test_pid, :api))
+    start = fn
+      "svc" -> held(test_pid, :svc).()
+      slug -> send(test_pid, {:start, slug}) && :ok
+    end
 
     apps = [
       app("app", "application"),
       app("once", "once"),
       app("svc", "services"),
       app("idle", "application", state: :stopped),
-      app("broker", "services", native: true)
+      app("broker", "services", native: true, running: true)
     ]
 
-    name = start_orchestrator(apps, %{gates: gates}, gate_timeout: 60_000)
-    assert_receive {:api, gate_pid}
-    gate_ref = Process.monitor(gate_pid)
+    name = start_orchestrator(apps, %{start: start}, stage_timeout: 60_000)
+    assert_receive {:svc, unit}
+    %{task: %Task{pid: boot}} = :sys.get_state(name)
+    boot_ref = Process.monitor(boot)
 
-    assert Orchestrator.shutdown(name) == {{3, 3}, :ok}
-    assert_received {:DOWN, ^gate_ref, :process, ^gate_pid, _reason}
+    shutdown = Task.async(fn -> Orchestrator.shutdown(name) end)
+    await_phase(name, :cancelling)
+    send(unit, :release)
 
-    messages = collect_until(:core_stop) ++ collect_until({:stop, "svc"})
-    assert for({:start, slug} <- messages, do: slug) == ["broker"]
-    stops = Enum.filter(messages, &(match?({:stop, _}, &1) or &1 == :core_stop))
+    assert Task.await(shutdown) == {{3, 3}, :ok}
+    assert_receive {:DOWN, ^boot_ref, :process, ^boot, :normal}
+    messages = drain()
+
+    assert [{:svc, :returned} | after_unit] =
+             Enum.drop_while(messages, &(&1 != {:svc, :returned}))
+
+    refute Enum.any?(after_unit, &match?({:start, _}, &1))
+    refute :core_start in messages
+    refute :complete in messages
+
+    refute Enum.any?(
+             messages,
+             &match?({:report, stage, _} when stage in [:core, :application], &1)
+           )
+
+    stops = Enum.filter(after_unit, &(match?({:stop, _}, &1) or &1 == :core_stop))
     assert [first, second, :core_stop, {:stop, "svc"}] = stops
     assert Enum.sort([first, second]) == [{:stop, "app"}, {:stop, "once"}]
-    refute_received {:stop, "broker"}
-    refute_received {:stop, "idle"}
-    refute_received :complete
     assert %{phase: :stopping} = :sys.get_state(name)
+  end
+
+  test "shutdown ends a boot waiting out a gate interval at once" do
+    test_pid = self()
+    engine = fn -> send(test_pid, {:gate, :engine}) && {:error, :down} end
+
+    gates =
+      Map.new([:tree, :network, :api], &{&1, gate(test_pid, &1)}) |> Map.put(:engine, engine)
+
+    name =
+      start_orchestrator([app("a", "application")], %{gates: gates},
+        gate_interval: 60_000,
+        gate_tries: 2
+      )
+
+    assert_receive {:gate, :engine}
+    %{task: %Task{pid: boot}} = :sys.get_state(name)
+    boot_ref = Process.monitor(boot)
+
+    shutdown = Task.async(fn -> Orchestrator.shutdown(name) end)
+    assert Task.await(shutdown, 5_000) == {{1, 1}, :ok}
+    assert_receive {:DOWN, ^boot_ref, :process, ^boot, :normal}
+
+    messages = drain()
+    assert {:stop, "a"} in messages
+    refute {:gate, :network} in messages
+    refute {:gate, :engine} in messages
+  end
+
+  test "a boot task crash stops the orchestrator, and its restart boots again" do
+    counter = :counters.new(1, [])
+
+    list = fn ->
+      :counters.add(counter, 1, 1)
+      # The first call is init's; the second is the boot's.
+      if :counters.get(counter, 1) == 2, do: raise("listing failed")
+      [app("a", "application")]
+    end
+
+    name = start_orchestrator([], %{list: list})
+    pid = Process.whereis(name)
+    ref = Process.monitor(pid)
+
+    assert_receive {:DOWN, ^ref, :process, ^pid, {:boot_crashed, {%RuntimeError{}, _stack}}}
+    assert {:start, "a"} in collect_until(:complete)
+    assert %{phase: :up} = await_boot(name)
+    assert Process.whereis(name) != pid
+  end
+
+  test "resume during a stop is remembered, and boots once the stop ends" do
+    test_pid = self()
+
+    name =
+      start_orchestrator([app("a", "application")], %{
+        stop: fn _slug -> held(test_pid, :stop).() end
+      })
+
+    collect_until(:complete)
+    await_boot(name)
+
+    shutdown = Task.async(fn -> Orchestrator.shutdown(name) end)
+    assert_receive {:stop, unit}
+    Orchestrator.resume(name)
+    assert %{resume: true} = :sys.get_state(name)
+    send(unit, :release)
+
+    assert {{1, 1}, :ok} = Task.await(shutdown)
+    assert {:gate, :tree} in collect_until(:complete)
+    assert %{phase: :up} = await_boot(name)
+  end
+
+  test "Core stops by a deadline that leaves the earlier group its bound" do
+    test_pid = self()
+
+    core_stop = fn deadline ->
+      send(test_pid, {:core_deadline, deadline})
+      blocking(test_pid, :core_stopping).()
+    end
+
+    apps = [app("app", "application"), app("init", "initialize")]
+
+    name =
+      start_orchestrator(apps, %{core_stop: core_stop},
+        boot: false,
+        app_stop_timeout: 50,
+        stop_margin: 0
+      )
+
+    shutdown = Task.async(fn -> Orchestrator.shutdown(name, 300) end)
+    assert {{2, 2}, {:error, :timeout}} = Task.await(shutdown, 2_000)
+    assert_received {:core_deadline, deadline}
+    assert deadline in 1..250
+    assert_received {:stop, "init"}
+  end
+
+  test "a listing that fails still stops Core" do
+    counter = :counters.new(1, [])
+
+    list = fn ->
+      :counters.add(counter, 1, 1)
+      if :counters.get(counter, 1) > 1, do: exit(:state_down), else: []
+    end
+
+    name = start_orchestrator([], %{list: list}, boot: false)
+
+    log = capture_log(fn -> assert Orchestrator.shutdown(name) == {{0, 0}, :ok} end)
+    assert_received :core_stop
+    assert log =~ "could not list apps"
+  end
+
+  test "the stop outlives a crash of the orchestrator" do
+    test_pid = self()
+
+    name =
+      start_orchestrator(
+        [app("a", "application")],
+        %{stop: fn _slug -> held(test_pid, :stop).() end},
+        boot: false
+      )
+
+    {:ok, _caller} = Task.start(fn -> Orchestrator.shutdown(name) end)
+    assert_receive {:stop, unit}
+    pid = Process.whereis(name)
+    ref = Process.monitor(pid)
+    Process.exit(pid, :kill)
+    assert_receive {:DOWN, ^ref, :process, ^pid, :killed}
+
+    send(unit, :release)
+    assert_receive {:stop, :returned}
+    assert_receive :core_stop
+  end
+
+  test "an orchestrator started mid-shutdown does not boot, and a resume boots it" do
+    name = start_orchestrator([app("a", "application")], %{in_flight?: fn -> true end})
+    assert %{phase: :stopping, task: nil} = :sys.get_state(name)
+    refute_received {:gate, :tree}
+
+    Orchestrator.resume(name)
+    assert {:start, "a"} in collect_until(:complete)
+  end
+
+  test "the tree gate retries on its own short interval" do
+    test_pid = self()
+    counter = :counters.new(1, [])
+
+    tree = fn ->
+      :counters.add(counter, 1, 1)
+      if :counters.get(counter, 1) == 1, do: {:error, :starting}, else: :ok
+    end
+
+    gates = Map.new([:engine, :network, :api], &{&1, gate(test_pid, &1)}) |> Map.put(:tree, tree)
+    start_orchestrator([], %{gates: gates}, gate_interval: 60_000)
+    assert_receive {:gate, :engine}, 5_000
+  end
+
+  test "a partial gates override keeps the default gates it leaves out" do
+    test_pid = self()
+    gates = Map.new([:engine, :network, :api], &{&1, gate(test_pid, &1)})
+
+    log =
+      capture_log(fn ->
+        start_orchestrator([], %{gates: gates})
+        assert {:gate, :engine} in collect_until(:complete)
+      end)
+
+    assert log =~ "gate tree passed"
+  end
+
+  test "app processes are ensured through the units, not started for real" do
+    test_pid = self()
+    ensure = fn slug -> send(test_pid, {:ensure, slug}) && :ok end
+
+    start_orchestrator([app("a", "application"), app("b", "services")], %{ensure: ensure},
+      boot: false
+    )
+
+    assert_received {:ensure, "a"}
+    assert_received {:ensure, "b"}
+  end
+
+  describe "core stage" do
+    test "Core start gets the stage budget as its deadline" do
+      test_pid = self()
+      core_start = fn deadline -> send(test_pid, {:core_deadline, deadline}) && :ok end
+      start_orchestrator([], %{core_start: core_start}, stage_timeout: 4_321)
+      assert {:core_deadline, 4_321} in collect_until(:complete)
+    end
+
+    test "a failed Core start is reported failed and boot carries on" do
+      start_orchestrator([app("a", "application")], %{core_start: fn _ -> {:error, :no_image} end})
+
+      messages = collect_until(:complete)
+      assert {:report, :core, [{"core", :failed}]} in messages
+      assert {:start, "a"} in messages
+    end
+
+    test "a hung Core start is carried past at the budget and left running" do
+      test_pid = self()
+      core_start = fn _deadline -> blocking(test_pid, :core_starting).() end
+
+      start_orchestrator([app("a", "application")], %{core_start: core_start}, stage_timeout: 50)
+
+      assert_receive {:core_starting, unit}
+      messages = collect_until(:complete)
+      assert {:report, :core, [{"core", :pending}]} in messages
+      assert {:start, "a"} in messages
+      assert Process.alive?(unit)
+    end
   end
 
   test "a failed or hung app stop is counted, and does not hold the rest back" do

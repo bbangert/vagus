@@ -34,6 +34,15 @@ defmodule Vagus.App.CoreUnitTest do
       assert log =~ "stayed busy"
     end
 
+    test "a deadline sooner than the retry budget ends the retries" do
+      stop =
+        Task.async(fn ->
+          CoreUnit.stop(stop: fn -> {:error, :busy} end, busy_backoff_ms: 1, deadline: 20)
+        end)
+
+      assert Task.await(stop, 1_000) == {:error, :busy}
+    end
+
     test "any other failure is returned without a retry" do
       stop = sequence([{:error, :engine_down}, :ok])
       assert CoreUnit.stop(stop: stop, busy_backoff_ms: 0) == {:error, :engine_down}

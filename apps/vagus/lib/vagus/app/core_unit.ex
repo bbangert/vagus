@@ -53,13 +53,20 @@ defmodule Vagus.App.CoreUnit do
 
   @doc """
   Retries while an update or rebuild holds Core's lifecycle lock, backing
-  off from 1 s and doubling to 8 s, for up to 60 s: long enough to ride out
-  one, short enough not to hold back the reboot the caller asked for.
+  off from 1 s and doubling to 8 s, for up to 60 s or `opts[:deadline]` ms,
+  whichever is sooner: long enough to ride out one, short enough not to hold
+  back the reboot the caller asked for.
   """
   @spec stop(keyword()) :: :ok | {:error, term()}
   def stop(opts \\ []) do
     stop = Keyword.get(opts, :stop, &Lifecycle.stop/0)
-    budget_ms = Keyword.get(opts, :busy_retry_budget_ms, @busy_retry_budget_ms)
+
+    budget_ms =
+      min(
+        Keyword.get(opts, :busy_retry_budget_ms, @busy_retry_budget_ms),
+        Keyword.get(opts, :deadline, :infinity)
+      )
+
     deadline = System.monotonic_time(:millisecond) + budget_ms
     stop_with_retry(stop, deadline, Keyword.get(opts, :busy_backoff_ms, @busy_backoff_ms))
   end
