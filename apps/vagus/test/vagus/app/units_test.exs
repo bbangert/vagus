@@ -56,6 +56,16 @@ defmodule Vagus.App.UnitsTest do
     assert Units.install_default(slug) == :present
   end
 
+  test "no default app is installed while a failed import left no apps directory" do
+    dir = Application.fetch_env!(:vagus, :app_files_dir)
+    absent = Path.join(System.tmp_dir!(), "units_apps_#{System.unique_integer([:positive])}")
+    Application.put_env(:vagus, :app_files_dir, absent)
+    on_exit(fn -> Application.put_env(:vagus, :app_files_dir, dir) end)
+
+    assert Units.install_default("units_default") == {:error, :not_imported}
+    refute File.exists?(absent)
+  end
+
   test "an import that raises is logged, not raised" do
     prev = Application.fetch_env!(:vagus, :legacy_addons_json)
     dir = Application.fetch_env!(:vagus, :app_files_dir)

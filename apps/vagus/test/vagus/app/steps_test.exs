@@ -557,6 +557,17 @@ defmodule Vagus.App.StepsTest do
       dir = Path.dirname(options_path(ctx.data_root))
       assert File.ls!(dir) == ["options.json"]
     end
+
+    test "a data dir it cannot write fails the start with the reason, leaving nothing", ctx do
+      dir = Path.dirname(options_path(ctx.data_root))
+      File.mkdir_p!(dir)
+      File.chmod!(dir, 0o555)
+      on_exit(fn -> File.chmod!(dir, 0o755) end)
+
+      assert {:error, {:write_options, :eacces}} = Steps.run(:start, input(ctx))
+      refute_received {:create, _}
+      assert File.ls!(dir) == []
+    end
   end
 
   describe "stop, halt_stop, pull" do

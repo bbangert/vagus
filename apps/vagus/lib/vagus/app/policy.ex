@@ -595,10 +595,10 @@ defmodule Vagus.App.Policy do
   defp run_step({:rollback_config, _}, data, effects),
     do: advance(%{data | config: data.run.acc.old}, effects ++ [:persist])
 
-  # The commit point of an uninstall: from here nothing writes the file
-  # again, so nothing that follows can bring the app back.
-  defp run_step({:delete_file, _}, data, effects),
-    do: advance(%{data | gone: true}, effects ++ [:delete_file])
+  # Run by the process itself, which feeds its result back as this step's
+  # outcome.
+  defp run_step({:delete_file, _} = step, data, effects),
+    do: {put_in(data.run.step, step), effects ++ [:delete_file]}
 
   defp run_step(step, data, effects) do
     {data, before} = before_task(step, data)
@@ -725,6 +725,15 @@ defmodule Vagus.App.Policy do
 
   defp on_outcome(:backup, :exec_hook, :post, _outcome, data), do: advance(data, [])
   defp on_outcome(:update, :reclaim_image, _, _outcome, data), do: advance(data, [])
+  # The commit point of an uninstall: from here nothing writes the file
+  # again, so nothing that follows can bring the app back.
+  defp on_outcome(:uninstall, :delete_file, _, {:ok, _}, data),
+    do: advance(%{data | gone: true}, [])
+
+  # Still installed, so its ingress URL answers again.
+  defp on_outcome(:uninstall, :delete_file, _, {:error, reason}, data),
+    do: fail(data, reason, [{:keys, ingress_keys(data), []}])
+
   defp on_outcome(:uninstall, :remove_app, _, {:ok, _}, data), do: advance(data, [])
 
   defp on_outcome(:uninstall, :remove_app, _, {:error, reason}, data),

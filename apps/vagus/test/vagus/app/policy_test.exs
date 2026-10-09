@@ -769,16 +769,32 @@ defmodule Vagus.App.PolicyTest do
       assert List.last(effects) == {:step, {:stop, nil}}
       assert data.discovery == %{}
 
-      {data, [{:emit, :stopped}, :delete_file, {:step, {:remove_app, nil}}]} =
-        step(data, {:ok, %{was_running: true}})
+      {data, [{:emit, :stopped}, :delete_file]} = step(data, {:ok, %{was_running: true}})
+      refute data.gone
+      {data, [{:step, {:remove_app, nil}}]} = step(data, {:ok, nil})
+      assert data.gone
 
       {_data, effects} = step(data, {:ok, :ok})
       assert effects == [{:reply, :ok}, :exit]
     end
 
+    test "uninstall: a file that cannot be deleted fails it before the removal, still installed" do
+      data = running(%{config: app_config(%{"ingress" => true}), ingress_token: "it"})
+      {data, _} = begin(:uninstall, %{}, data)
+      {data, _} = step(data, {:ok, %{was_running: true}})
+      {data, effects} = step(data, {:error, {:delete_file, :eacces}})
+
+      refute data.gone
+      assert {:keys, [{:ingress_token, Policy.hash("it")}], []} in effects
+      assert {:reply, {:error, {:delete_file, :eacces}}} in effects
+      assert List.last(effects) == :idle
+      refute Enum.any?(effects, &match?({:step, _}, &1))
+    end
+
     test "uninstall: a refused removal after the file is gone ends the process, unsaved" do
       {data, _} = begin(:uninstall, %{}, running())
       {data, _} = step(data, {:ok, %{was_running: true}})
+      {data, _} = step(data, {:ok, nil})
       {_data, effects} = step(data, {:error, {:invalid_slug, "x"}})
       assert effects == [{:reply, {:error, {:invalid_slug, "x"}}}, :exit]
     end
@@ -786,6 +802,7 @@ defmodule Vagus.App.PolicyTest do
     test "uninstall: a halt once the file is gone ends the process rather than waiting to resume" do
       {data, _} = begin(:uninstall, %{}, running())
       {data, _} = step(data, {:ok, %{was_running: true}})
+      {data, _} = step(data, {:ok, nil})
       {data, effects} = begin(:halt, %{}, data)
       assert List.last(effects) == {:step, {:halt_stop, nil}}
       {_data, effects} = step(data, {:ok, :stopped})

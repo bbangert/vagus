@@ -14,6 +14,12 @@ defmodule Vagus.App.File do
   `protected`, which falls back to `true` because it gates `full_access`,
   `host_pid` and `docker_api`.
 
+  A decoded file whose ingress token had to be minted carries `rewrite:
+  true`: its owner saves it once, or each read would mint another and the
+  ingress URL would change at every restart.
+
+  The file holds the ingress token, so it is readable by its owner only.
+
   `import_once/2` seeds the directory from the single `addons.json` earlier
   releases kept. That file is only ever read, so a reverted firmware boots
   from it exactly as it was at the upgrade.
@@ -84,13 +90,37 @@ defmodule Vagus.App.File do
     result
   end
 
+  # The mode is set before any content lands, so the token is never readable
+  # by others, even in a temporary a power cut leaves behind.
   # path is internal/config-derived, not request input
   # sobelow_skip ["Traversal.FileModule"]
   defp replace(path, content) do
     tmp = path <> ".tmp"
 
-    with :ok <- File.write(tmp, content) do
+    with :ok <- remove_stale(tmp),
+         {:ok, fd} <- :file.open(tmp, [:write, :binary, :exclusive, :raw]),
+         :ok <- write_private(fd, tmp, content) do
       File.rename(tmp, path)
+    end
+  end
+
+  # sobelow_skip ["Traversal.FileModule"]
+  defp remove_stale(tmp) do
+    case File.rm(tmp) do
+      {:error, :enoent} -> :ok
+      other -> other
+    end
+  end
+
+  # sobelow_skip ["Traversal.FileModule"]
+  defp write_private(fd, tmp, content) do
+    result =
+      with :ok <- File.chmod(tmp, 0o600),
+           do: :file.write(fd, content)
+
+    case {result, :file.close(fd)} do
+      {:ok, close} -> close
+      {error, _close} -> error
     end
   end
 
@@ -125,18 +155,32 @@ defmodule Vagus.App.File do
   of `legacy` (`addons.json`). The files are built in a sibling directory and
   renamed into place, so an import cut short is redone on the next boot
   rather than leaving a partial set that would count as done.
+
+  An `addons.json` that exists but cannot be read or is not the shape it
+  should be is an error, and no directory is created: an empty one would
+  count as a finished import, and every app it held would be lost for good.
   """
-  @spec import_once(String.t(), String.t() | nil) :: {:ok, :skipped | non_neg_integer()}
+  @spec import_once(String.t(), String.t() | nil) ::
+          {:ok, :skipped | non_neg_integer()} | {:error, term()}
   def import_once(dir \\ dir(), legacy \\ Application.get_env(:vagus, :legacy_addons_json)) do
-    if File.dir?(dir), do: {:ok, :skipped}, else: import_legacy(dir, legacy)
+    with false <- File.dir?(dir),
+         {:ok, entries} <- legacy_entries(legacy) do
+      import_legacy(dir, legacy, entries)
+    else
+      true ->
+        {:ok, :skipped}
+
+      {:error, reason} ->
+        Logger.error("Vagus.App.File: #{legacy} not imported: #{inspect(reason)}")
+        {:error, reason}
+    end
   end
 
   # path is internal/config-derived, not request input
   # sobelow_skip ["Traversal.FileModule"]
-  defp import_legacy(dir, legacy) do
+  defp import_legacy(dir, legacy, entries) do
     staging = dir <> ".import"
     File.rm_rf!(staging)
-    entries = legacy_entries(legacy)
 
     for {slug, raw} <- entries,
         {:ok, data} <- [decode(slug, Map.put(raw, "wanted", raw["state"]))],
@@ -150,16 +194,19 @@ defmodule Vagus.App.File do
     {:ok, count}
   end
 
-  defp legacy_entries(nil), do: %{}
+  defp legacy_entries(nil), do: {:ok, %{}}
 
   # path is internal/config-derived, not request input
   # sobelow_skip ["Traversal.FileModule"]
   defp legacy_entries(path) do
     with {:ok, content} <- read_file(path),
          {:ok, %{"addons" => addons}} when is_map(addons) <- Jason.decode(content) do
-      Map.filter(addons, fn {_slug, raw} -> is_map(raw) end)
+      {:ok, Map.filter(addons, fn {_slug, raw} -> is_map(raw) end)}
     else
-      _ -> %{}
+      :error -> {:ok, %{}}
+      {:error, %Jason.DecodeError{}} -> {:error, :not_json}
+      {:error, reason} -> {:error, reason}
+      {:ok, _other} -> {:error, :invalid}
     end
   end
 
@@ -170,12 +217,15 @@ defmodule Vagus.App.File do
          {:ok, config} <- Config.parse(config_raw),
          true <- config.slug == slug,
          {:ok, wanted} <- decode_wanted(wanted_raw) do
+      token = decode_ingress_token(raw)
+
       {:ok,
        %{
          config: config,
+         rewrite: token != Map.get(raw, "ingress_token"),
          wanted: wanted,
          user_options: decode_options(raw),
-         ingress_token: decode_ingress_token(raw),
+         ingress_token: token,
          ingress_port: decode_ingress_port(raw),
          ingress_panel: decode_bool(raw, "ingress_panel"),
          watchdog: decode_bool(raw, "watchdog"),

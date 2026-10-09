@@ -118,6 +118,45 @@ defmodule Vagus.App.ServerTest do
       assert [{^pid, ^slug}] = lookup({:ingress_token, Policy.hash(token)})
       assert [{^pid, ^slug}] = lookup({:ingress_port, 62_123})
     end
+
+    test "an ingress token its file lacked is saved before it is registered, so it holds" do
+      {slug, pid} = installed(%{"ingress" => true})
+      :ok = Instances.stop(slug)
+      path = Path.join(AppFile.dir(), slug <> ".json")
+
+      File.write!(
+        path,
+        path |> File.read!() |> Jason.decode!() |> Map.delete("ingress_token") |> Jason.encode!()
+      )
+
+      refute Process.alive?(pid)
+
+      {:ok, pid} = Instances.ensure(slug)
+      token = data(pid).ingress_token
+      assert [{^pid, ^slug}] = lookup({:ingress_token, Policy.hash(token)})
+      assert %{"ingress_token" => ^token} = path |> File.read!() |> Jason.decode!()
+
+      :ok = Instances.stop(slug)
+      {:ok, pid} = Instances.ensure(slug)
+      assert %{ingress_token: ^token} = data(pid)
+    end
+
+    test "a saved dynamic port another app holds is dropped and saved so; the holder keeps it" do
+      ingress = %{"ingress" => true, "ingress_port" => 0}
+      {a, pa} = installed(ingress, ingress_port: 62_124)
+      b = slug()
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          install_app(app_config(b, ingress), ingress_port: 62_124)
+        end)
+
+      assert log =~ "held by another app"
+      assert [{^pa, ^a}] = lookup({:ingress_port, 62_124})
+      assert %{ingress_port: nil} = data(pid_of(b))
+      assert {:ok, %{ingress_port: nil, rewrite: false}} = AppFile.read(b)
+      assert {:ok, %{ingress_port: 62_124}} = AppFile.read(a)
+    end
   end
 
   describe "settings" do
@@ -421,6 +460,26 @@ defmodule Vagus.App.ServerTest do
       assert :error = AppFile.read(slug)
     end
 
+    test "an uninstall whose file cannot be deleted fails before the removal; the app stays" do
+      {slug, pid} = installed(%{"ingress" => true})
+      token_key = {:ingress_token, Policy.hash(data(pid).ingress_token)}
+      File.chmod!(AppFile.dir(), 0o555)
+      on_exit(fn -> File.chmod!(AppFile.dir(), 0o755) end)
+
+      ExUnit.CaptureLog.capture_log(fn ->
+        t = op(pid, {:uninstall, %{}})
+        answer(:stop, {:ok, %{was_running: false}})
+        assert {:error, {:delete_file, :eacces}} = Task.await(t)
+      end)
+
+      refute_received {:step, :remove_app, _input, _task}
+      assert :idle = state(pid)
+      assert %{gone: false, retired: false} = data(pid)
+      assert {:ok, _saved} = AppFile.read(slug)
+      assert [{^pid, ^slug}] = lookup(token_key)
+      assert :gen_statem.call(pid, :installed?) == true
+    end
+
     test "a halt once the file is gone ends the process; the slug comes back new" do
       {slug, pid} = started()
       ref = Process.monitor(pid)
@@ -495,7 +554,7 @@ defmodule Vagus.App.ServerTest do
       t = op(pid, {:install, %{config: app_config(slug)}})
       answer(:pull, {:ok, "x/y:1"})
 
-      assert {:error, {:persist, :eisdir}} = Task.await(t)
+      assert {:error, {:persist, :eperm}} = Task.await(t)
       assert_receive {:DOWN, ^ref, :process, ^pid, :normal}
       assert :error = AppFile.read(slug)
     end

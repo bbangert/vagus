@@ -1,6 +1,7 @@
 defmodule Vagus.App.FileTest do
   use ExUnit.Case, async: true
 
+  import Bitwise
   import ExUnit.CaptureLog
 
   alias Vagus.Addon.Config
@@ -56,7 +57,8 @@ defmodule Vagus.App.FileTest do
   test "write then read round-trips every persisted field", %{config: c, dir: dir} do
     saved = data(c)
     assert :ok = AppFile.write(Map.merge(saved, %{token: "secret", container_id: "c1"}), dir)
-    assert {:ok, ^saved} = AppFile.read("core_mosquitto", dir)
+    assert {:ok, read} = AppFile.read("core_mosquitto", dir)
+    assert read == Map.put(saved, :rewrite, false)
 
     on_disk = Jason.decode!(File.read!(Path.join(dir, "core_mosquitto.json")))
     refute Map.has_key?(on_disk, "token")
@@ -81,6 +83,22 @@ defmodule Vagus.App.FileTest do
     assert :error = AppFile.read("core_mosquitto", dir)
     assert :ok = AppFile.delete("core_mosquitto", dir)
   end
+
+  test "the file holds the ingress token, so only its owner can read it", %{config: c, dir: dir} do
+    :ok = AppFile.write(data(c), dir)
+    assert mode(Path.join(dir, "core_mosquitto.json")) == 0o600
+
+    # A temporary a power cut left behind is replaced, not written through.
+    tmp = Path.join(dir, "core_mosquitto.json.tmp")
+    File.write!(tmp, "stale")
+    File.chmod!(tmp, 0o644)
+    :ok = AppFile.write(data(c, %{wanted: :stopped}), dir)
+    assert mode(Path.join(dir, "core_mosquitto.json")) == 0o600
+    assert {:ok, %{wanted: :stopped}} = AppFile.read("core_mosquitto", dir)
+    refute File.exists?(tmp)
+  end
+
+  defp mode(path), do: File.stat!(path).mode &&& 0o777
 
   test "an unsafe slug is never read", %{dir: dir} do
     assert :error = AppFile.read("../addons", dir)
@@ -110,6 +128,18 @@ defmodule Vagus.App.FileTest do
       assert token =~ ~r/^[-_A-Za-z0-9]{43}$/
       {:ok, entry} = AppFile.read("core_mosquitto", dir)
       assert {entry.user_options, entry.ports} == {%{}, %{}}
+    end
+
+    test "a minted ingress token asks for a rewrite; a saved one does not", %{
+      config: c,
+      dir: dir
+    } do
+      put_raw(dir, "core_mosquitto", file_body(c, %{"ingress_token" => 7}))
+      assert {:ok, %{rewrite: true, ingress_token: minted}} = AppFile.read("core_mosquitto", dir)
+      assert is_binary(minted)
+
+      put_raw(dir, "core_mosquitto", file_body(c, %{"ingress_token" => "itok"}))
+      assert {:ok, %{rewrite: false, ingress_token: "itok"}} = AppFile.read("core_mosquitto", dir)
     end
 
     test "garbage settings fall back; protected falls back to true", %{config: c, dir: dir} do
@@ -207,6 +237,7 @@ defmodule Vagus.App.FileTest do
       capture_log(fn -> assert {:ok, 3} = AppFile.import_once(dir, legacy) end)
 
       assert Enum.sort(AppFile.saved(dir)) == ["core_mqtt", "core_ssh", "esphome_esphome"]
+      for slug <- AppFile.saved(dir), do: assert(mode(Path.join(dir, slug <> ".json")) == 0o600)
       assert File.read!(legacy) == before
       assert File.stat!(legacy).mtime == mtime
 
@@ -299,6 +330,35 @@ defmodule Vagus.App.FileTest do
 
       assert File.dir?(dir)
       assert {:ok, :skipped} = AppFile.import_once(dir, @fixture)
+    end
+
+    # An empty directory would count as imported, and the apps would be lost.
+    test "an addons.json that cannot be read or is not its shape is an error, and no directory",
+         %{dir: dir, legacy: legacy} do
+      for {body, reason} <- [
+            {"{{{", :not_json},
+            {~s({"version": 1}), :invalid},
+            {~s({"addons": []}), :invalid},
+            {~s([1]), :invalid}
+          ] do
+        File.write!(legacy, body)
+
+        assert capture_log(fn ->
+                 assert {:error, ^reason} = AppFile.import_once(dir, legacy)
+               end) =~ "not imported"
+
+        refute File.exists?(dir), body
+      end
+
+      File.rm!(legacy)
+      File.mkdir_p!(legacy)
+
+      capture_log(fn -> assert {:error, :eisdir} = AppFile.import_once(dir, legacy) end)
+      refute File.exists?(dir)
+
+      File.rm_rf!(legacy)
+      File.cp!(@fixture, legacy)
+      capture_log(fn -> assert {:ok, 3} = AppFile.import_once(dir, legacy) end)
     end
   end
 

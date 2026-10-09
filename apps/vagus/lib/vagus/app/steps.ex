@@ -688,13 +688,13 @@ defmodule Vagus.App.Steps do
     end
   end
 
+  # Raw, so a full disk is an `{:error, reason}` here rather than a raise.
   # sobelow_skip ["Traversal.FileModule"]
   defp write_new(path, content) do
-    with {:ok, file} <- File.open(path, [:write, :binary, :exclusive]) do
-      try do
-        IO.binwrite(file, content)
-      after
-        File.close(file)
+    with {:ok, fd} <- :file.open(path, [:write, :binary, :exclusive, :raw]) do
+      case {:file.write(fd, content), :file.close(fd)} do
+        {:ok, close} -> close
+        {error, _close} -> error
       end
     end
   end

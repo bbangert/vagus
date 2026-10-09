@@ -57,12 +57,19 @@ defmodule Vagus.App.Units do
   @doc "A fresh install is wanted started, so boot starts it; a present one is left as the user set it."
   @spec install_default(String.t()) :: :installed | :present | {:error, term()}
   def install_default(slug) do
-    if slug in App.slugs() do
-      :present
-    else
-      with {:ok, config} <- builtin_config(slug), :ok <- App.install(config, wanted: :started) do
-        :installed
-      end
+    cond do
+      slug in App.slugs() ->
+        :present
+
+      # Its file would create the apps directory, and a legacy file whose
+      # import failed would count as imported at the next boot.
+      not File.dir?(AppFile.dir()) ->
+        {:error, :not_imported}
+
+      true ->
+        with {:ok, config} <- builtin_config(slug),
+             :ok <- App.install(config, wanted: :started),
+             do: :installed
     end
   end
 

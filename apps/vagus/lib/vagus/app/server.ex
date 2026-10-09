@@ -85,12 +85,33 @@ defmodule Vagus.App.Server do
         :ignore
 
       {:ok, saved} ->
-        data = fresh(slug, saved)
+        {data, rewrite?} = claim_port(fresh(slug, saved), saved[:rewrite] == true)
+        if rewrite?, do: persist(data)
         data = sync_keys(data, tl(Policy.keys(data)), [])
         Orchestrator.up(slug)
         {:ok, if(data.shutting_down, do: :shutting_down, else: :idle), data}
     end
   end
+
+  # A saved dynamic port another app already holds is not this app's: it is
+  # dropped, and the next start's `port?` step picks one.
+  defp claim_port(%{ingress_port: port} = data, rewrite?) when is_integer(port) do
+    me = self()
+
+    case Registry.register(Directory, {:ingress_port, port}, data.slug) do
+      {:error, {:already_registered, other}} when other != me ->
+        Logger.warning(
+          "App #{data.slug}: its ingress port #{port} is held by another app; dropped"
+        )
+
+        {%{data | ingress_port: nil}, true}
+
+      _registered ->
+        {data, rewrite?}
+    end
+  end
+
+  defp claim_port(data, rewrite?), do: {data, rewrite?}
 
   defp fresh(slug, saved) do
     slug
@@ -420,6 +441,23 @@ defmodule Vagus.App.Server do
     end
   end
 
+  # Acknowledged: an uninstall whose file is still there has removed nothing,
+  # so a failed delete fails the op before the removal and keeps the app.
+  defp effect(:delete_file, {st, d, acts}) do
+    outcome =
+      case AppFile.delete(d.slug) do
+        :ok -> {:ok, nil}
+        {:error, reason} -> {:error, {:delete_file, reason}}
+      end
+
+    {d, effects} = Policy.next(d.run, outcome, d)
+
+    case Enum.reduce_while(effects, {st, d, acts}, &effect/2) do
+      {:exit, _d, _acts} = exit -> {:halt, exit}
+      acc -> {:cont, acc}
+    end
+  end
+
   defp effect(effect, acc), do: {:cont, apply_effect(effect, acc)}
 
   defp persist(data) do
@@ -450,11 +488,6 @@ defmodule Vagus.App.Server do
     do: {:shutting_down, %{d | run: nil, retired: false}, acts}
 
   defp apply_effect(:exit, {_st, d, acts}), do: {:exit, d, acts}
-
-  defp apply_effect(:delete_file, {_st, d, _acts} = acc) do
-    AppFile.delete(d.slug)
-    acc
-  end
 
   defp apply_effect({:emit, state}, {_st, d, _acts} = acc) do
     d.slug |> Events.app_state(state) |> EventPusher.push()
