@@ -896,6 +896,57 @@ defmodule Vagus.App.StepsTest do
     end
   end
 
+  describe "set_options" do
+    defp schema_config(schema) do
+      {:ok, config} =
+        Config.parse(%{
+          "name" => "Test",
+          "version" => "1",
+          "slug" => "test_app",
+          "description" => "d",
+          "arch" => ["amd64"],
+          "options" => %{"greet" => "hi"},
+          "schema" => schema
+        })
+
+      config
+    end
+
+    test "options the config in hand accepts are returned raw" do
+      config = schema_config(%{"greet" => "str"})
+      raw = %{"greet" => "hello", "extra" => 1}
+
+      assert {:ok, ^raw} =
+               Steps.run(:set_options, %{config: config, options: raw, job: nil, stage: nil})
+    end
+
+    test "options the config in hand rejects keep the current ones, with a warning" do
+      config = schema_config(%{"greet" => "int"})
+
+      log =
+        capture_log(fn ->
+          assert {:ok, nil} =
+                   Steps.run(:set_options, %{
+                     config: config,
+                     options: %{"greet" => "hello"},
+                     job: nil,
+                     stage: nil
+                   })
+        end)
+
+      assert log =~ "test_app's backed-up options do not validate"
+      assert log =~ "keeping the current options"
+    end
+
+    # An app without a schema accepts any map, but a tar's options are its own.
+    test "options that are not a map keep the current ones, schema or not" do
+      for schema <- [%{"greet" => "str"}, false] do
+        input = %{config: schema_config(schema), options: ["x"], job: nil, stage: nil}
+        capture_log(fn -> assert {:ok, nil} = Steps.run(:set_options, input) end)
+      end
+    end
+  end
+
   describe "reclaim_image" do
     test "removes the superseded image only when the ref changed" do
       old = test_config()

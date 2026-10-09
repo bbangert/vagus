@@ -800,6 +800,7 @@ defmodule Vagus.App.ServerTest do
       assert lookup({:token, old}) == []
       send(task, {:outcome, {:ok, %{was_running: true}}})
       assert %{staging_dir: "/s"} = answer(:swap_data, {:ok, "/data"})
+      assert %{options: %{"greeting" => "restored"}} = answer(:set_options, {:ok, args.options})
 
       {input, task} = step(:start)
       assert {:ok, %{user_options: %{"greeting" => "restored"}}} = AppFile.read(slug)
@@ -808,6 +809,33 @@ defmodule Vagus.App.ServerTest do
 
       assert :ok = Task.await(t)
       assert {:ok, %{state: :started, user_options: %{"greeting" => "restored"}}} = App.info(slug)
+    end
+
+    # Sent from this process, so `:sys.get_state/1` after it means it was
+    # handled; `wait_response/2`, unlike `receive_response/2`, keeps the request
+    # on a timeout.
+    test "an options write during a restore is applied after it, so the newer value wins" do
+      {slug, pid} = started()
+      args = %{staging_dir: "/s", options: %{"greeting" => "restored"}, start?: true}
+      t = op(pid, {:restore, args})
+      {_input, stopping} = step(:stop)
+
+      req = :gen_statem.send_request(pid, {:set, [options: %{"greeting" => "mine"}]})
+      :sys.get_state(pid)
+      assert :timeout = :gen_statem.wait_response(req, 0)
+
+      send(stopping, {:outcome, {:ok, %{was_running: true}}})
+      answer(:swap_data, {:ok, "/data"})
+      answer(:set_options, {:ok, args.options})
+      {_input, starting} = step(:start)
+      :sys.get_state(pid)
+      assert :timeout = :gen_statem.wait_response(req, 0)
+
+      send(starting, {:outcome, {:ok, @started}})
+      assert :ok = Task.await(t)
+      assert {:reply, :ok} = :gen_statem.receive_response(req, 2_000)
+      assert {:ok, %{state: :started, user_options: %{"greeting" => "mine"}}} = App.info(slug)
+      assert {:ok, %{user_options: %{"greeting" => "mine"}}} = AppFile.read(slug)
     end
   end
 

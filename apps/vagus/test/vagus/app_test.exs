@@ -335,6 +335,7 @@ defmodule Vagus.AppTest do
 
       answer(:stop, {:ok, %{was_running: true}})
       assert %{staging_dir: "/staging"} = answer(:swap_data, {:ok, "/data"})
+      assert %{options: %{"a" => 2}} = answer(:set_options, {:ok, %{"a" => 2}})
       assert %{user_options: %{"a" => 2}} = answer(:start, {:ok, %{container_id: "c2"}})
 
       assert :ok = Task.await(restore)

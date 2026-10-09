@@ -22,7 +22,7 @@ defmodule Vagus.Backups do
 
   require Logger
 
-  alias Vagus.Addon.{Config, OptionsSchema}
+  alias Vagus.Addon.Config
   alias Vagus.API.StaticData
   alias Vagus.App
 
@@ -295,19 +295,35 @@ defmodule Vagus.Backups do
     end
   end
 
-  # A restore halted between its two renames left the app's data only in the
-  # aside, which goes back while the data dir is still missing.
   # path is internal/config-derived, not request input
   # sobelow_skip ["Traversal.FileModule"]
   defp sweep_restores(parent) do
     for path <- Path.wildcard(Path.join(parent, ".restore-*"), match_dot: true) do
-      with [_all, slug] <- Regex.run(~r/\A\.restore-(.+)-\d+\.old\z/, Path.basename(path)),
-           data_dir = Path.join(parent, slug),
-           false <- File.exists?(data_dir),
-           :ok <- File.rename(path, data_dir) do
-        Logger.warning("Vagus.Backups: #{slug}'s data moved back from #{path}")
-      else
-        _stale -> File.rm_rf(path)
+      case Regex.run(~r/\A\.restore-(.+)-\d+\.old\z/, Path.basename(path)) do
+        [_all, slug] -> sweep_aside(path, Path.join(parent, slug), slug)
+        nil -> File.rm_rf(path)
+      end
+    end
+  end
+
+  # A restore halted between its two renames left the app's data only in the
+  # aside: it goes only once a data dir is back, and one that cannot move
+  # back waits for the next boot.
+  # path is internal/config-derived, not request input
+  # sobelow_skip ["Traversal.FileModule"]
+  defp sweep_aside(path, data_dir, slug) do
+    if File.dir?(data_dir) do
+      File.rm_rf(path)
+    else
+      case File.rename(path, data_dir) do
+        :ok ->
+          Logger.warning("Vagus.Backups: #{slug}'s data moved back from #{path}")
+
+        {:error, reason} ->
+          Logger.error(
+            "Vagus.Backups: #{slug}'s data could not move back from #{path} " <>
+              "(#{inspect(reason)}); kept there"
+          )
       end
     end
   end
@@ -413,9 +429,9 @@ defmodule Vagus.Backups do
 
   defp preflight_addon(path, slug) do
     with :ok <- validate_slug(slug),
-         {:ok, %{config: config}} <- state_get(slug),
+         :ok <- installed(slug),
          {:ok, %{addon: addon, data: files}} <- Vagus.Backup.extract_addon_file(path, slug) do
-      {:ok, {slug, config, addon, files}}
+      {:ok, {slug, addon, files}}
     else
       {:error, {:invalid_slug, _}} -> {:error, "Addon #{slug} not in backup"}
       {:error, :not_installed} -> {:error, "Addon #{slug} is not installed"}
@@ -424,11 +440,8 @@ defmodule Vagus.Backups do
     end
   end
 
-  defp state_get(slug) do
-    case App.info(slug) do
-      {:ok, entry} -> {:ok, entry}
-      :error -> {:error, :not_installed}
-    end
+  defp installed(slug) do
+    if App.installed?(slug), do: :ok, else: {:error, :not_installed}
   end
 
   defp validate_slug(slug) do
@@ -440,8 +453,8 @@ defmodule Vagus.Backups do
   ## Internals — restore_partial: apply
 
   defp restore_apps(prepared, data_root, opts) do
-    Enum.reduce_while(prepared, :ok, fn {slug, config, addon, files}, :ok ->
-      case restore_app(slug, config, addon, files, data_root, opts) do
+    Enum.reduce_while(prepared, :ok, fn {slug, addon, files}, :ok ->
+      case restore_app(slug, addon, files, data_root, opts) do
         :ok -> {:cont, :ok}
         {:error, reason} -> {:halt, {:error, {:restore, slug, reason}}}
       end
@@ -455,11 +468,11 @@ defmodule Vagus.Backups do
   # the only copy.
   # path is internal/config-derived, not request input
   # sobelow_skip ["Traversal.FileModule"]
-  defp restore_app(slug, config, addon, files, data_root, opts) do
+  defp restore_app(slug, addon, files, data_root, opts) do
     data_dir = Path.join([data_root, "addons", "data", slug])
 
     with {:ok, staging_dir} <- stage_files(data_dir, files) do
-      options = restorable_options(slug, config, addon)
+      options = get_in(addon, ["user", "options"]) || %{}
       result = App.restore(slug, staging_dir, options, addon["state"] == "started", opts)
       File.rm_rf(staging_dir)
       if File.dir?(data_dir), do: File.rm_rf(staging_dir <> ".old")
@@ -498,33 +511,6 @@ defmodule Vagus.Backups do
       :ok -> {:ok, staging_dir}
       {:error, :eexist} when tries > 1 -> restore_dir(data_dir, tries - 1)
       {:error, reason} -> {:error, {:staging, reason}}
-    end
-  end
-
-  # The tar's `user.options` validated against the installed schema, as a
-  # save to `POST /addons/{slug}/options` is: a `hassio_role: backup` app can
-  # upload a tar and restore it onto another app, so the tar is the less
-  # trusted input. This bounds the options only, and only as far as the
-  # schema is narrow: an app without one accepts anything, as upstream's
-  # does, and the tar's data is swapped in as it is. Options that do not
-  # validate are dropped and the current ones kept, rather than failing the
-  # restore: a schema that tightened since the backup (back up at v1, update
-  # to v2, restore) must not cost the user the data they restored. The raw
-  # map is kept, as a save keeps it.
-  defp restorable_options(slug, config, addon) do
-    options = get_in(addon, ["user", "options"]) || %{}
-
-    case OptionsSchema.effective(config.schema, config.options, options) do
-      {:ok, _validated} ->
-        options
-
-      {:error, reason} ->
-        Logger.warning(
-          "Vagus.Backups: #{slug}'s backed-up options do not validate against its " <>
-            "installed schema (#{reason}) — keeping the current options, restore continuing"
-        )
-
-        nil
     end
   end
 

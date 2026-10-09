@@ -614,19 +614,28 @@ defmodule Vagus.App.OrchestratorTest do
   end
 
   # The unit, not the orchestrator, keeps it to the first boot in the VM.
-  test "stale backup staging is swept before anything is installed or started" do
+  test "stale backup staging is swept before any app process starts or anything boots" do
     test_pid = self()
     sweep = fn -> send(test_pid, :sweep) && :ok end
+    ensure = fn slug -> send(test_pid, {:ensure, slug}) && :ok end
     install = fn slug -> send(test_pid, {:install, slug}) && :present end
     broker = app("core_mqtt", "services", native: true)
-    overrides = %{sweep: sweep, install_default: install}
+    overrides = %{sweep: sweep, ensure: ensure, install_default: install}
 
     start_orchestrator([broker, app("a", "initialize")], overrides,
       default_native_app: "core_mqtt"
     )
 
-    assert [:sweep, {:install, "core_mqtt"}, {:gate, :tree} | rest] = collect_until(:complete)
+    assert [:sweep, {:ensure, "core_mqtt"}, {:ensure, "a"}, {:install, "core_mqtt"} | rest] =
+             collect_until(:complete)
+
     refute :sweep in rest
+  end
+
+  test "with boot off nothing is swept" do
+    test_pid = self()
+    start_orchestrator([], %{sweep: fn -> send(test_pid, :sweep) && :ok end}, boot: false)
+    refute_received :sweep
   end
 
   test "resume boots again after a shutdown" do

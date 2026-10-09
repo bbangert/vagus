@@ -24,7 +24,8 @@ defmodule Vagus.App.Server do
 
   Questions, settings writes and the app's own service and discovery posts
   are taken in every state, an operation in flight included. Container
-  events and the native broker's `DOWN` wait until the operation ends.
+  events, the native broker's `DOWN` and an options write during a restore
+  wait until the operation ends.
 
   Registering a directory key links this process to a registry partition,
   and exits are trapped, so a partition's death arrives as an `EXIT`: it
@@ -169,16 +170,26 @@ defmodule Vagus.App.Server do
 
   # Validated and on disk before the reply, so a reboot right after it keeps
   # the change; an operation in flight reads the new values at its next step.
+  # A restore sets the backed-up options at its own step, which would
+  # overwrite an options write acknowledged before it, so that write waits
+  # for the restore to end. A caller whose call timeout is shorter than the
+  # restore gets no reply (`App.set/2` says `:error`), and the write lands all
+  # the same.
   defp event({:call, from}, {:set, changes}, state, data) do
-    if Enum.all?(changes, fn {key, _value} -> key == :options or key in @settings end) do
-      updated = Enum.reduce(changes, data, &put_setting/2)
+    cond do
+      not Enum.all?(changes, fn {key, _value} -> key == :options or key in @settings end) ->
+        {:keep_state_and_data, [{:reply, from, :error}]}
 
-      case AppFile.write(updated) do
-        :ok -> run_effects(watchdog_flip(data, updated), state, updated, [{:reply, from, :ok}])
-        {:error, _reason} -> {:keep_state_and_data, [{:reply, from, :error}]}
-      end
-    else
-      {:keep_state_and_data, [{:reply, from, :error}]}
+      state == {:busy, :restore} and Keyword.has_key?(changes, :options) ->
+        {:keep_state_and_data, [:postpone]}
+
+      true ->
+        updated = Enum.reduce(changes, data, &put_setting/2)
+
+        case AppFile.write(updated) do
+          :ok -> run_effects(watchdog_flip(data, updated), state, updated, [{:reply, from, :ok}])
+          {:error, _reason} -> {:keep_state_and_data, [{:reply, from, :error}]}
+        end
     end
   end
 

@@ -621,6 +621,12 @@ defmodule Vagus.App.PolicyTest do
       assert %{staging_dir: "/s"} = Policy.task_input({:swap_data, nil}, data)
 
       {data, effects} = step(data, {:ok, "/data/addons/data/app_one"})
+      assert effects == [{:step, {:set_options, nil}}]
+
+      assert %{options: %{"o" => 2}, config: %{slug: "app_one"}} =
+               Policy.task_input({:set_options, nil}, data)
+
+      {data, effects} = step(data, {:ok, %{"o" => 2}})
       assert [:persist, {:keys, [{:token, _hash}], []}, {:step, {:start, nil}}] = effects
       assert %{user_options: %{"o" => 2}} = Policy.task_input({:start, nil}, data)
 
@@ -637,6 +643,17 @@ defmodule Vagus.App.PolicyTest do
 
       assert effects == [:persist, {:reply, :ok}, :idle]
       assert %{wanted: :stopped, user_options: %{"o" => 1}} = data
+    end
+
+    test "restore: options the step rejects keep the current ones" do
+      args = %{staging_dir: "/s", options: %{"o" => "bad"}, start?: false}
+      {data, _} = begin(:restore, args, running(%{user_options: %{"o" => 1}}))
+      {data, _} = step(data, {:ok, %{was_running: true}})
+      {data, [{:step, {:set_options, nil}}]} = step(data, {:ok, "/data/addons/data/app_one"})
+      {data, effects} = step(data, {:ok, nil})
+
+      assert effects == [:persist, {:reply, :ok}, :idle]
+      assert data.user_options == %{"o" => 1}
     end
 
     test "restore: a failed swap ends it before the options are touched" do
@@ -817,7 +834,7 @@ defmodule Vagus.App.PolicyTest do
       {data, effects} = step(data, {:error, :enospc})
       assert effects == [{:step, {:unpause, nil}}]
       assert data.run.acc.result == {:error, :enospc}
-      {data, effects} = step(data, {:error, :engine_gone})
+      {data, effects} = step(data, {:ok, :ok})
       assert effects == [{:step, {:exec_hook, :post}}]
 
       {_data, effects} = step(data, {:error, {:exec, 1}})
@@ -828,7 +845,7 @@ defmodule Vagus.App.PolicyTest do
       hooks = app_config(%{"backup_post" => "post"})
       {data, [{:step, {:snapshot, nil}}]} = begin(:backup, %{}, running(%{config: hooks}))
       {data, [{:step, {:unpause, nil}}]} = step(data, {:error, :timeout})
-      {data, [{:step, {:exec_hook, :post}}]} = step(data, {:error, {:http, 409}})
+      {data, [{:step, {:exec_hook, :post}}]} = step(data, {:ok, :not_paused})
       {_data, effects} = step(data, {:ok, :ok})
       assert effects == [:persist, {:reply, {:error, :timeout}}, :idle]
 
@@ -841,9 +858,39 @@ defmodule Vagus.App.PolicyTest do
       hooks = app_config(%{"backup_post" => "post"})
       {data, [{:step, {:snapshot, nil}}]} = begin(:backup, %{}, running(%{config: hooks}))
       {data, [{:step, {:unpause, nil}}]} = step(data, {:ok, {:still_paused, "/s/a.tar.gz"}})
-      {data, [{:step, {:exec_hook, :post}}]} = step(data, {:error, :engine_gone})
+      {data, [{:step, {:exec_hook, :post}}]} = step(data, {:ok, :ok})
       {_data, effects} = step(data, {:ok, :ok})
       assert effects == [:persist, {:reply, {:ok, "/s/a.tar.gz"}}, :idle]
+    end
+
+    # Frozen, the app is neither healthy nor able to answer its post hook.
+    test "backup hot: a recovery unpause that fails is cleaned up by name and restarted, no post hook" do
+      hooks = app_config(%{"backup_post" => "post"})
+
+      for {snapshot, reply} <- [
+            {{:ok, {:still_paused, "/s/a.tar.gz"}}, {:error, {:unpause, :engine_gone}}},
+            {{:error, :enospc}, {:error, :enospc}}
+          ] do
+        {data, _} = begin(:backup, %{}, running(%{config: hooks, token_hash: "h"}))
+        {data, [{:step, {:unpause, nil}}]} = step(data, snapshot)
+        {data, effects} = step(data, {:error, :engine_gone})
+
+        assert List.last(effects) == {:step, {:stop, :by_name}}
+        assert {:keys, [], [{:token, "h"}, {:dns, "app-one"}]} in effects
+        refute {:step, {:exec_hook, :post}} in effects
+        assert data.last_event == {:failed, {:unpause, :engine_gone}}
+
+        {data, effects} = step(data, {:ok, %{was_running: true}})
+
+        assert effects == [
+                 :persist,
+                 {:reply, reply},
+                 {:timer, :retry, 0, {:retry, nil}},
+                 :idle
+               ]
+
+        assert %{container_id: nil, wanted: :started} = data
+      end
     end
 
     test "backup hot: a failed pre hook ends it before the snapshot" do

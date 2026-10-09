@@ -185,6 +185,31 @@ defmodule Vagus.App.Steps do
     end
   end
 
+  # The backup's options are validated against the config current in this
+  # op, as a save to `POST /addons/{slug}/options` is: a `hassio_role:
+  # backup` app can upload a tar and restore it onto another app, so the tar
+  # is the less trusted input. This bounds the options only, and only as far
+  # as the schema is narrow: an app without one accepts anything, as
+  # upstream's does, and the tar's data is swapped in as it is. Options that
+  # do not validate are dropped and the current ones kept, rather than
+  # failing the restore: a schema that tightened since the backup must not
+  # cost the user the data they restored. The raw map is kept, as a save
+  # keeps it.
+  defp step(:set_options, %{config: config, options: options}) do
+    with true <- is_map(options) || {:error, "not a map"},
+         {:ok, _validated} <- OptionsSchema.effective(config.schema, config.options, options) do
+      {:ok, options}
+    else
+      {:error, reason} ->
+        Logger.warning(
+          "Vagus.App.Steps: #{config.slug}'s backed-up options do not validate against its " <>
+            "installed schema (#{reason}) — keeping the current options, restore continuing"
+        )
+
+        {:ok, nil}
+    end
+  end
+
   # Never fails the op: the update has already succeeded, and the likely
   # failure is the engine refusing an image another container still uses.
   defp step(:reclaim_image, %{old: old, config: new} = input) do

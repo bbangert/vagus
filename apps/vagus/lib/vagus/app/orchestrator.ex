@@ -5,15 +5,15 @@ defmodule Vagus.App.Orchestrator do
   task. Every step is idempotent, so a boot task that crashes stops this
   process, and its supervisor's restart simply boots again.
 
-  Its start imports the apps an older Vagus recorded (`Vagus.App.File`) and
-  ensures a process per saved app, whether or not it then boots.
+  Its start sweeps the staging an interrupted backup or restore left
+  (`Vagus.App.Units.sweep/0`, once per VM and only when it boots), imports
+  the apps an older Vagus recorded (`Vagus.App.File`) and ensures a process
+  per saved app, whether or not it then boots.
 
   Boot:
 
-    1. the staging an interrupted backup or restore left is swept
-       (`Vagus.Backups.sweep_stale/1`), then the default native app is
-       installed if missing, and on that fresh install recorded as wanted
-       started;
+    1. the default native app is installed if missing, and on that fresh
+       install recorded as wanted started;
     2. the `tree` gate, then native apps get their boot rule: they need no
        engine, so an offline boot still brings the broker up;
     3. the `engine`, `network` and `api` gates (`Vagus.App.Gates`), each
@@ -134,6 +134,9 @@ defmodule Vagus.App.Orchestrator do
       |> Keyword.merge(opts)
 
     cfg = cfg |> Map.new() |> Map.update!(:units, &Map.new/1)
+    # Before any app process exists and before the API tree (a later sibling
+    # of this one) can admit a backup or restore whose staging it would wipe.
+    if cfg.boot, do: Map.get(cfg.units, :sweep, &Units.sweep/0).()
     # Here, not in the task, so this tree is not reported started until every
     # app process exists.
     Map.get(cfg.units, :import, &Units.import/0).()
@@ -235,10 +238,7 @@ defmodule Vagus.App.Orchestrator do
     %{state | phase: :stopping, task: task}
   end
 
-  # The sweep runs before this boot starts or installs anything; the unit
-  # itself sweeps only at the first boot in this VM.
   defp run_boot(cfg) do
-    cfg.units.sweep.()
     if slug = cfg.default_native_app, do: install_default(slug, cfg.units)
 
     _running =

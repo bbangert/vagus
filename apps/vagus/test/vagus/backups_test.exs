@@ -317,6 +317,24 @@ defmodule Vagus.BackupsTest do
       assert log =~ "core_c's data moved back"
     end
 
+    # A file where the data dir goes makes the move back fail.
+    test "the boot sweep keeps an aside that cannot move back to a missing data dir", %{
+      data_root: dr,
+      backup_dir: backup_dir
+    } do
+      parent = Path.join([dr, "addons", "data"])
+      aside = Path.join(parent, ".restore-core_d-4.old")
+      File.mkdir_p!(aside)
+      File.write!(Path.join(aside, "db"), "only copy")
+      File.write!(Path.join(parent, "core_d"), "in the way")
+
+      log =
+        capture_log(fn -> assert :ok = Backups.sweep_stale(dir: backup_dir, data_root: dr) end)
+
+      assert File.read!(Path.join(aside, "db")) == "only copy"
+      assert log =~ "core_d's data could not move back"
+    end
+
     # Backup callers and app operations outlive a restart of the store.
     test "a restart of the store leaves live backup and restore staging alone", %{
       data_root: dr,
@@ -503,6 +521,8 @@ defmodule Vagus.BackupsTest do
       assert Path.dirname(staging) == Path.dirname(data_dir(dr, slug))
       assert File.read!(Path.join(staging, "f.txt")) == "backed up"
       send(task, {:outcome, {:ok, data_dir(dr, slug)}})
+      assert_receive {:step, :set_options, %{options: %{"greet" => "hi"} = raw}, task}, 5_000
+      send(task, {:outcome, {:ok, raw}})
       assert_receive {:step, :start, %{user_options: %{"greet" => "hi"}}, task}, 5_000
       send(task, {:outcome, {:ok, %{container_id: "c2"}}})
 

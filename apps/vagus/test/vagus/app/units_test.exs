@@ -10,7 +10,6 @@ defmodule Vagus.App.UnitsTest do
 
   @arities %{
     import: 0,
-    sweep: 0,
     slugs: 0,
     list: 0,
     ensure: 1,

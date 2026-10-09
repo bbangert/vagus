@@ -125,6 +125,7 @@ defmodule Vagus.App.Policy do
     exec_hook: 120_000,
     unpause: 30_000,
     swap_data: 60_000,
+    set_options: 15_000,
     remove_app: 120_000,
     reclaim_image: 60_000
   }
@@ -573,6 +574,7 @@ defmodule Vagus.App.Policy do
   defp expand({:mint_token, _} = step, data),
     do: if(Steps.native?(data.config), do: [], else: [step])
 
+  defp expand({:set_options, _}, %{run: %{args: %{options: nil}}}), do: []
   defp expand(step, _data), do: [step]
 
   defp run_step({:mint_token, _}, data, effects) do
@@ -602,12 +604,6 @@ defmodule Vagus.App.Policy do
 
   defp run_step({:rollback_config, _}, data, effects),
     do: reconfigure(data, data.run.acc.old, data.ingress_port, effects)
-
-  defp run_step({:set_options, _}, %{run: %{args: %{options: options}}} = data, effects)
-       when is_map(options),
-       do: advance(%{data | user_options: options}, effects ++ [:persist])
-
-  defp run_step({:set_options, _}, data, effects), do: advance(data, effects)
 
   # Run by the process itself, which feeds its result back as this step's
   # outcome.
@@ -764,8 +760,21 @@ defmodule Vagus.App.Policy do
   defp on_outcome(:backup, :snapshot, _, {:ok, _path} = result, data),
     do: advance(put_acc(data, :result, result), [])
 
-  # Logged where it failed: by the step, or by the process for a dead one.
-  defp on_outcome(:backup, :unpause, _, _outcome, data), do: advance(data, [])
+  defp on_outcome(:backup, :unpause, _, {:ok, _thawed}, data), do: advance(data, [])
+
+  # Still frozen, so not healthy, and a post hook would hang on it: the stop
+  # by name thaws and removes it, then the restart rule. An earlier snapshot
+  # error stays the reply. Logged where it failed: by the step, or by the
+  # process for a dead one.
+  defp on_outcome(:backup, :unpause, _, {:error, reason}, data) do
+    cause =
+      case data.run.acc[:result] do
+        {:error, earlier} -> earlier
+        _tar_whole -> {:unpause, reason}
+      end
+
+    cleanup(%{data | last_event: {:failed, {:unpause, reason}}}, cause, [])
+  end
 
   defp on_outcome(:backup, :exec_hook, :pre, {:ok, _}, data), do: advance(data, [])
 
@@ -775,6 +784,12 @@ defmodule Vagus.App.Policy do
   defp on_outcome(:backup, :exec_hook, :post, _outcome, data), do: advance(data, [])
   defp on_outcome(:restore, :swap_data, _, {:ok, _dir}, data), do: advance(data, [])
   defp on_outcome(:restore, :swap_data, _, {:error, reason}, data), do: fail(data, reason, [])
+
+  defp on_outcome(:restore, :set_options, _, {:ok, options}, data) when is_map(options),
+    do: advance(%{data | user_options: options}, [:persist])
+
+  defp on_outcome(:restore, :set_options, _, {:ok, nil}, data), do: advance(data, [])
+  defp on_outcome(:restore, :set_options, _, {:error, reason}, data), do: fail(data, reason, [])
   defp on_outcome(:update, :reclaim_image, _, _outcome, data), do: advance(data, [])
   # The commit point of an uninstall: from here nothing writes the file
   # again, so nothing that follows can bring the app back.
@@ -910,6 +925,7 @@ defmodule Vagus.App.Policy do
   defp input(:exec_hook, :post, data), do: %{cmd: data.config.backup_post}
   defp input(:reclaim_image, _arg, data), do: %{old: data.run.acc.old}
   defp input(:swap_data, _arg, data), do: %{staging_dir: data.run.args.staging_dir}
+  defp input(:set_options, _arg, data), do: %{options: data.run.args.options}
   defp input(_name, _arg, _data), do: %{}
 
   # Any container this process holds is paused around the tar, whatever its
