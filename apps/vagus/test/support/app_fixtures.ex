@@ -50,7 +50,7 @@ defmodule Vagus.AppFixtures do
     saved =
       case AppFile.read(slug) do
         {:ok, saved} -> saved
-        :error -> nil
+        _absent_or_unreadable -> nil
       end
 
     data = Policy.init_data(slug, saved)

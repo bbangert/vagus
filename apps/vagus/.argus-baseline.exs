@@ -161,15 +161,5 @@
       "Vagus.App.Orchestrator registers with Vagus.Core.EventPusher when it starts, and Vagus.Core.EventPusher keeps it in its state. Both are children of the one_for_one supervisor Vagus.Application, which restarts either alone. When Vagus.Core.EventPusher restarts, its init/1 starts it afresh without what Vagus.App.Orchestrator put there, and Vagus.App.Orchestrator, which is not restarted with it, never registers again. When Vagus.App.Orchestrator restarts, it registers a second time beside what its old process left.",
     reason:
       "A one-shot push, not a registration: boot pushes supervisor_update startup: complete once into Vagus.Core.EventPusher's bounded, drop-oldest queue, which is lossy by design; a restart losing it is a dropped event like any other, and Core's hassio coordinator still refreshes on its own schedule."
-  },
-  %{
-    analysis: "failure",
-    file: "lib/vagus/app/server.ex",
-    title: "Call made bare where other call sites catch its error",
-    at_label: "called outside any try",
-    detail:
-      "Vagus.App.Server.port_free/2 calls Registry.lookup/2 with no try around it, in its own body or on some way into it; 4 of the 5 call sites in this program catch its error. No rule says the callee's failure must be taken; the program's own sites say so, and this one disagrees — the shape of a site written without the convention in mind, or one the convention grew around.",
-    reason:
-      "Deliberate: the other sites (Vagus.App, Vagus.DNS, Vagus.Ingress, Vagus.Runtime.Events) are outside the app tree and must outlive a restarting directory. An app process is under the directory's :rest_for_one supervisor and linked to its partition, so a lookup that raises there means the directory is gone and this process is about to be restarted with it; crashing is the intended outcome, and catching would only start a step against a directory that no longer exists."
   }
 ]

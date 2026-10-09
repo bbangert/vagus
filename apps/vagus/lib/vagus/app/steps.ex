@@ -761,34 +761,11 @@ defmodule Vagus.App.Steps do
     end
   end
 
-  # Core sidebar-panel push, on uninstall only — §B4.4's set, not a superset
-  # of it.
-  #
-  # This used to fire on start/stop as well, on the theory that "an extra push
-  # is harmless, since Core re-fetches the full list rather than trusting the
-  # push body". The P2-A phase 5 device gate disproved the premise: Core
-  # answers `POST api/hassio_push/panel/{slug}` with **500** whenever the panel
-  # is already registered, and logs `ValueError: Overwriting panel {slug}` with
-  # a full traceback at ERROR. That is structural upstream, not a transient —
-  # HA's `components/hassio/addon_panel.py::_register_panel` calls
-  # `frontend.async_register_built_in_panel` without `update=True`, and
-  # `components/frontend/__init__.py` raises on overwrite. So every start of an
-  # ingress add-on wrote a traceback into the user's Core log.
-  #
-  # Upstream pushes from exactly three places, none of them a lifecycle
-  # transition: the options handler when `ingress_panel` is toggled
-  # (`supervisor/api/apps.py`), uninstall after forcing `ingress_panel = false`
-  # (`supervisor/apps/app.py`), and restore when the flag actually changed
-  # (`supervisor/apps/manager.py`). Vagus matches that: the options-change push
-  # lives in the router, this one covers uninstall, and restore never moves
-  # `ingress_panel` so it needs none. A start doesn't need one either — the
-  # flag defaults to false and only the options endpoint flips it, and Core
-  # registers every enabled panel itself at its own startup.
-  #
-  # `Panels.update_hass_panel/2` still guards for an unreachable/absent Core
-  # client, so a bare call is fine here.
-  # Always a DELETE: the app's own process still answers `info` while this
-  # runs, so letting `Panels` choose would read the panel as still enabled.
+  # Uninstall only, as upstream: Core answers a push for a panel it already
+  # holds with a 500 and a traceback in its log, and registers every enabled
+  # panel itself at startup. Always a DELETE: the app's own process still
+  # answers `info` while this runs, so letting `Panels` choose would read the
+  # panel as still enabled.
   defp maybe_push_panel(%Config{ingress: true, slug: slug}, opts) do
     panels(opts).update_hass_panel(slug, method: :delete)
     :ok

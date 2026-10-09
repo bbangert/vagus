@@ -12,6 +12,7 @@ defmodule Vagus.App.Units do
   alias Vagus.App.{CoreUnit, Gates, Instances, Steps}
   alias Vagus.App.File, as: AppFile
   alias Vagus.Core.{EventPusher, Events}
+  alias Vagus.Runtime.Docker
 
   @spec all() :: map()
   def all do
@@ -23,7 +24,9 @@ defmodule Vagus.App.Units do
       in_flight?: &Vagus.Host.Shutdown.in_flight?/0,
       install_default: &install_default/1,
       native?: &native?/1,
-      boot_start: &App.boot_start/1,
+      boot_start: &App.boot_start/2,
+      running: &running/0,
+      inspect: &running?/1,
       halt: &App.halt/1,
       core_start: &CoreUnit.start(deadline: &1),
       core_stop: &CoreUnit.stop(deadline: &1),
@@ -78,6 +81,24 @@ defmodule Vagus.App.Units do
   @spec native?(map()) :: boolean()
   def native?(%{config: config}), do: Steps.native?(config)
   def native?(_entry), do: false
+
+  @doc "The slugs whose container the engine reports running; one listing for the whole boot."
+  @spec running(keyword()) :: {:ok, MapSet.t(String.t())} | {:error, term()}
+  def running(opts \\ []) do
+    with {:ok, containers} <- Docker.list_containers(opts) do
+      {:ok,
+       MapSet.new(for %{"Names" => names} <- containers, "/addon_" <> slug <- names, do: slug)}
+    end
+  end
+
+  @spec running?(String.t(), keyword()) :: boolean() | :unknown
+  def running?(slug, opts \\ []) do
+    case Docker.inspect_container("addon_" <> slug, opts) do
+      {:ok, %{"State" => %{"Running" => running}}} -> running == true
+      {:error, {:http, 404, _message}} -> false
+      _unknown -> :unknown
+    end
+  end
 
   @spec report(atom(), [{String.t(), :ready | :failed | :pending}]) :: :ok
   def report(step, outcomes) do

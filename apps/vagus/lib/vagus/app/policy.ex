@@ -25,24 +25,24 @@ defmodule Vagus.App.Policy do
   @known_services ~w(mqtt)
 
   @doc """
-  What boot does with one app. Only one recorded `:started` is touched: a
-  running one is left alone, since starting it again would recreate its
-  container; a stopped one starts when its effective boot is `auto`, and is
-  otherwise recorded `:stopped` so its state stops claiming it runs. When the
-  engine could not be asked (`:unknown`) nothing is demoted. A container
-  running under a token no process holds any more (`:adopted`) is started
-  again whatever its boot mode, so it gets one that authenticates.
+  What boot does with one app, by whether its container runs: `:managed` is
+  one this process started and still holds; `true`, `false` and `:unknown`
+  are the engine's answer for one it did not start. Only an app recorded
+  `:started` is touched. A container running without this process's token
+  is started again whatever the boot mode, since nothing it holds
+  authenticates any more; a stopped one starts when its effective boot is
+  `auto`, and is otherwise recorded `:stopped` so its state stops claiming it
+  runs. With no answer from the engine nothing is demoted.
   """
-  @spec boot(map(), boolean() | :unknown | :adopted) :: :start | :demote | :none
+  @spec boot(map(), :managed | boolean() | :unknown) :: :start | :demote | :none
   def boot(%{wanted: wanted, config: config} = data, running?),
     do: boot(%{state: wanted, config: config, boot: data.boot}, running?)
 
-  def boot(%{state: :started}, :adopted), do: :start
+  def boot(%{state: :started}, true), do: :start
 
   def boot(%{state: :started} = entry, running?) when running? in [false, :unknown] do
     cond do
       Config.effective_boot(entry.config, entry[:boot]) == "auto" -> :start
-      # Auto still starts: that is what `Manager.start_slug` does regardless of container state.
       running? == :unknown -> :none
       true -> :demote
     end
@@ -111,8 +111,8 @@ defmodule Vagus.App.Policy do
   @max_attempts 5
   @strikes_to_restart 2
   @probe_interval_ms 120_000
-  # Decision 28: the ladder resets once a restart stays up, not when it merely
-  # starts, or a container that dies a second after each start never runs out.
+  # The ladder resets once a restart stays up, not when it merely starts, or a
+  # container that dies a second after each start never runs out.
   @settled_ms 120_000
 
   @deadlines %{
@@ -160,6 +160,8 @@ defmodule Vagus.App.Policy do
       strikes: 0,
       services: %{},
       discovery: %{},
+      released: [],
+      gone: false,
       run: nil,
       shutting_down: false
     }
@@ -194,27 +196,17 @@ defmodule Vagus.App.Policy do
 
   @doc """
   A container event or the native broker's `DOWN` (`{:broker_down, reason}`),
-  or `:settled`. An event for a container other than the current one is stale
-  and ignored, which also covers the exit a stop causes (the stop clears the
-  id). A start seen while no container is known is the app's container
-  running without this process having started it (the process restarted, or
-  the engine reports it after a reconnect): it is adopted. Upstream restarts on any exit, a clean one included; a `once` app's
-  clean exit is its completion instead (C4).
+  or `:settled`. An event for a container this process stopped or cleaned up
+  is late and ignored, as is one for a container other than the current one.
+  A start seen while no container is known is the app's container running
+  without this process having started it (the process restarted, or the
+  engine reports it after a reconnect): it is adopted. Upstream restarts on
+  any exit, a clean one included; a `once` app's clean exit is its
+  completion instead.
   """
   @spec on_event(term(), map()) :: {map(), [effect()]}
-  def on_event(%{action: "start", id: id}, %{container_id: nil} = data) when is_binary(id),
-    do: observe(%{data | container_id: id}, {:running, false}, [])
-
-  def on_event(%{id: id}, %{container_id: current} = data) when id != current, do: {data, []}
-
-  def on_event(%{action: "die"} = event, data),
-    do: died(data, {:exited, Map.get(event, :exit_code)})
-
-  def on_event(%{action: "health_status: healthy"}, data), do: observe(data, :healthy, [])
-
-  def on_event(%{action: "health_status: unhealthy"}, data) do
-    {data, effects} = observe(data, :unhealthy, [])
-    retry(data, effects)
+  def on_event(%{id: id} = event, data) do
+    if id in data.released, do: {data, []}, else: container_event(event, data)
   end
 
   def on_event({:broker_down, _reason}, %{container_id: id} = data) when id != nil,
@@ -222,6 +214,26 @@ defmodule Vagus.App.Policy do
 
   def on_event(:settled, data), do: {%{data | attempt: 0}, []}
   def on_event(_event, data), do: {data, []}
+
+  defp container_event(%{action: "start", id: id}, %{container_id: nil} = data)
+       when is_binary(id),
+       do: observe(%{data | container_id: id}, {:running, false}, [])
+
+  defp container_event(%{id: id}, %{container_id: current} = data) when id != current,
+    do: {data, []}
+
+  defp container_event(%{action: "die"} = event, data),
+    do: died(data, {:exited, Map.get(event, :exit_code)})
+
+  defp container_event(%{action: "health_status: healthy"}, data),
+    do: observe(data, :healthy, [])
+
+  defp container_event(%{action: "health_status: unhealthy"}, data) do
+    {data, effects} = observe(data, :unhealthy, [])
+    retry(data, effects)
+  end
+
+  defp container_event(_event, data), do: {data, []}
 
   defp died(data, event) do
     {data, effects} = drop_run_keys(data)
@@ -235,9 +247,10 @@ defmodule Vagus.App.Policy do
 
   @doc """
   Whether an app that went down comes back. A native app with boot `auto` is
-  always revived, with no cap and no watchdog flag (decision 18); a container
-  app needs its watchdog flag and an attempt left. No time window: the ladder
-  is the only bound (A7).
+  always revived, with no cap and no watchdog flag: it is the MQTT broker
+  every other app leans on, and nothing outside the BEAM restarts it. A
+  container app needs its watchdog flag and an attempt left. No time window:
+  the ladder is the only bound.
   """
   @spec restart?(map(), boolean()) :: boolean()
   def restart?(_data, true = _shutting_down), do: false
@@ -265,7 +278,8 @@ defmodule Vagus.App.Policy do
 
   defp retry(data, effects) do
     if restart?(data, data.shutting_down) do
-      {%{data | attempt: data.attempt + 1}, effects ++ [{:timer, :retry, backoff(data), :retry}]}
+      timer = {:timer, :retry, backoff(data), {:retry, data.container_id}}
+      {%{data | attempt: data.attempt + 1}, effects ++ [timer]}
     else
       {data, effects}
     end
@@ -273,8 +287,8 @@ defmodule Vagus.App.Policy do
 
   @doc """
   One URL-probe result (`:healthy`, `:unhealthy`, or `:skip` when the probe
-  could not be run). Two misses in a row are one restart on the crash ladder
-  (decision 28); once that is spent the app reports `error` and the probe
+  could not be run). Two misses in a row are one restart on the crash ladder,
+  so one slow answer is not a restart; once that is spent the app reports `error` and the probe
   stops.
   """
   @spec strike(:healthy | :unhealthy | :skip, map()) :: {map(), [effect()]}
@@ -298,7 +312,7 @@ defmodule Vagus.App.Policy do
 
   @doc """
   Whether a command is taken in this state. Only `halt` pre-empts an
-  operation (C6); `resume` is what leaves `:shutting_down`. `:noop` asks for
+  operation, since a shutdown cannot wait out an image pull; `resume` is what leaves `:shutting_down`. `:noop` asks for
   an `:ok` reply and nothing else.
   """
   @spec admit(atom() | tuple(), term()) :: :ok | :noop | {:error, term()}
@@ -436,7 +450,7 @@ defmodule Vagus.App.Policy do
   @spec plan(atom(), map(), map()) :: map() | {:error, term()}
   def plan(op, args, data) do
     with :ok <- precheck(op, args, data) do
-      %{op: op, args: args, steps: steps(op, args, data), step: nil, acc: %{}}
+      %{op: op, args: args, steps: steps(op, args, data), step: nil, acc: acc(op, data)}
       |> Map.merge(%{task: nil, ref: nil, from: nil})
     end
   end
@@ -457,6 +471,11 @@ defmodule Vagus.App.Policy do
 
   defp precheck(_op, _args, _data), do: :ok
 
+  # Every update branch that rolls back, a failed snapshot's included, needs
+  # the version it started from.
+  defp acc(:update, data), do: %{old: data.config}
+  defp acc(_op, _data), do: %{}
+
   # `:port?` and `:start?` are resolved against the data current when they
   # are reached, so an update's start sees the committed config.
   defp steps(:install, _args, _data), do: [{:pull, nil}, {:port?, nil}, {:commit, nil}]
@@ -465,7 +484,7 @@ defmodule Vagus.App.Policy do
   defp steps(:restart, _args, _data), do: [{:stop, nil} | start_steps()]
 
   defp steps(:uninstall, _args, _data),
-    do: [{:stop, nil}, {:remove_app, nil}, {:delete_file, nil}]
+    do: [{:stop, nil}, {:delete_file, nil}, {:remove_app, nil}]
 
   defp steps(:halt, _args, _data), do: [{:halt_stop, nil}]
 
@@ -542,7 +561,7 @@ defmodule Vagus.App.Policy do
   defp expand({:start?, _}, data),
     do: if(data.run.acc[:was_running], do: start_steps(), else: [])
 
-  # Native apps mint no token (C5): nothing authenticates as one.
+  # Native apps mint no token: they run in the BEAM and never call the API.
   defp expand({:mint_token, _} = step, data),
     do: if(Steps.native?(data.config), do: [], else: [step])
 
@@ -570,15 +589,16 @@ defmodule Vagus.App.Policy do
     advance(data, effects ++ keys ++ [:persist])
   end
 
-  defp run_step({:commit, _}, %{run: %{args: %{config: config}}} = data, effects) do
-    data = put_acc(%{data | config: config}, :old, data.config)
-    advance(data, effects ++ [:persist])
-  end
+  defp run_step({:commit, _}, %{run: %{args: %{config: config}}} = data, effects),
+    do: advance(%{data | config: config}, effects ++ [:persist])
 
   defp run_step({:rollback_config, _}, data, effects),
     do: advance(%{data | config: data.run.acc.old}, effects ++ [:persist])
 
-  defp run_step({:delete_file, _}, data, effects), do: advance(data, effects ++ [:delete_file])
+  # The commit point of an uninstall: from here nothing writes the file
+  # again, so nothing that follows can bring the app back.
+  defp run_step({:delete_file, _}, data, effects),
+    do: advance(%{data | gone: true}, effects ++ [:delete_file])
 
   defp run_step(step, data, effects) do
     {data, before} = before_task(step, data)
@@ -609,6 +629,13 @@ defmodule Vagus.App.Policy do
     {%{data | token: nil, token_hash: nil, ip: nil}, effects}
   end
 
+  # Only the last few: a late event trails its container by moments, not by
+  # many containers.
+  defp release(%{container_id: nil} = data), do: data
+
+  defp release(data),
+    do: %{data | container_id: nil, released: Enum.take([data.container_id | data.released], 4)}
+
   defp key({{_kind, _name} = key, _value}), do: key
   defp key(key), do: key
 
@@ -620,10 +647,11 @@ defmodule Vagus.App.Policy do
   defp settle(outcome, %{run: run} = data),
     do: fail(data, {:unplanned, run.op, run.step, outcome}, [])
 
-  # A1: the one recovery after a dead or timed-out step that touched the
-  # container. It always ends the op as a failure, then the restart rule.
+  # The one recovery after a dead or timed-out step that touched the
+  # container: its state is unknown, so it is removed by name. It always ends
+  # the op as a failure, then the restart rule.
   defp on_outcome(_op, :stop, :by_name, _outcome, data),
-    do: fail(put_acc(%{data | container_id: nil}, :cleaned, true), data.run.acc.cause, [])
+    do: fail(put_acc(release(data), :cleaned, true), data.run.acc.cause, [])
 
   defp on_outcome(_op, :pull, _, {:ok, _ref}, data), do: advance(data, [])
   defp on_outcome(:install, :pull, _, {:error, reason}, data), do: fail(data, reason, [])
@@ -654,7 +682,10 @@ defmodule Vagus.App.Policy do
     fail(%{data | last_event: {:failed, reason}}, {:rollback_failed, reason}, effects)
   end
 
-  defp on_outcome(:update, :start, _, {:error, reason}, data) do
+  # Only a committed target is rolled back; a start of the old version that
+  # fails, after a failed snapshot, fails like any start.
+  defp on_outcome(:update, :start, _, {:error, reason}, %{config: config} = data)
+       when config != data.run.acc.old do
     steps = [{:rollback_config, nil} | start_steps()]
     advance(data |> put_acc(:cause, reason) |> put_steps(steps), [])
   end
@@ -671,7 +702,7 @@ defmodule Vagus.App.Policy do
   end
 
   defp on_outcome(_op, :stop, nil, {:ok, %{was_running: was_running}}, data) do
-    data = put_acc(%{data | container_id: nil, last_event: :stopped}, :was_running, was_running)
+    data = put_acc(%{release(data) | last_event: :stopped}, :was_running, was_running)
     advance(data, [])
   end
 
@@ -699,9 +730,12 @@ defmodule Vagus.App.Policy do
   defp on_outcome(:uninstall, :remove_app, _, {:error, reason}, data),
     do: fail(data, reason, [])
 
-  defp on_outcome(:halt, :halt_stop, _, _outcome, data) do
-    data = %{data | container_id: nil, last_event: :stopped}
-    {data, [{:reply, :ok}, :shutting_down]}
+  # Halt never persists: it keeps what the app wants for the next boot. An
+  # app whose file is already gone was being uninstalled, and ends here.
+  defp on_outcome(:halt, :halt_stop, _, outcome, data) do
+    data = %{release(data) | last_event: :stopped}
+    reply = if match?({:ok, _}, outcome), do: :ok, else: outcome
+    {data, [{:reply, reply}, if(data.gone, do: :exit, else: :shutting_down)]}
   end
 
   defp on_outcome(op, name, arg, outcome, data),
@@ -757,6 +791,9 @@ defmodule Vagus.App.Policy do
   # An install that fails leaves no file and no process. Otherwise a retry
   # that failed, or a cleanup after a dead step, goes back to the ladder.
   defp fail(%{run: %{op: :install}} = data, reason, effects),
+    do: {data, effects ++ [{:reply, {:error, reason}}, :exit]}
+
+  defp fail(%{gone: true} = data, reason, effects),
     do: {data, effects ++ [{:reply, {:error, reason}}, :exit]}
 
   defp fail(%{run: run} = data, reason, effects) do

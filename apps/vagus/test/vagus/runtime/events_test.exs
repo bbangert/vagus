@@ -357,20 +357,33 @@ defmodule Vagus.Runtime.EventsTest do
         end)
       end
 
+      # The app process's receipt of each synthesized event is traced, so
+      # whatever the test asks it next is handled after that event.
+      :erlang.trace(pid, true, [:receive])
+      on_exit(fn -> :erlang.trace(pid, false, [:receive]) end)
       start_supervised!({Events, name: unique_name(), socket: path, list: list})
 
       # The first connect: a running container this process did not start is
       # adopted as its own.
       {sock1, _head} = accept_conn(listen)
       send_ok_headers(sock1)
-      assert eventually(fn -> app_info(slug) end, &match?({:ok, %{state: :started}}, &1))
+
+      assert_receive {:trace, ^pid, :receive, {:docker_event, %{action: "start", id: "c1"}}},
+                     1_000
+
+      assert {:ok, %{state: :started}} = app_info(slug)
       assert %{container_id: "c1"} = :sys.get_state(pid) |> elem(1)
 
       # The container died while the stream was down: the reconnect tells it.
       :gen_tcp.close(sock1)
       {sock2, _head} = accept_conn(listen, 5_000)
       send_ok_headers(sock2)
-      assert eventually(fn -> app_info(slug) end, &match?({:ok, %{state: :error}}, &1))
+
+      assert_receive {:trace, ^pid, :receive,
+                      {:docker_event, %{action: "die", id: "c1", exit_code: 137}}},
+                     5_000
+
+      assert {:ok, %{state: :error}} = app_info(slug)
       assert %{last_event: {:exited, 137}} = :sys.get_state(pid) |> elem(1)
       assert Agent.get(listings, & &1) == [:again, :first]
     end
@@ -392,16 +405,6 @@ defmodule Vagus.Runtime.EventsTest do
 
     defp container(name, id, state, status),
       do: %{"Id" => id, "Names" => [name], "State" => state, "Status" => status}
-
-    defp eventually(fun, done?, tries \\ 100) do
-      value = fun.()
-
-      cond do
-        done?.(value) -> value
-        tries == 0 -> value
-        true -> Process.sleep(10) && eventually(fun, done?, tries - 1)
-      end
-    end
   end
 
   describe "schedule_reconnect/2" do

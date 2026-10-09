@@ -56,13 +56,18 @@ defmodule Vagus.App do
 
   defp unanswered(slug) do
     case AppFile.read(slug) do
-      {:ok, saved} ->
-        [slug |> Policy.init_data(saved) |> Policy.snapshot() |> Map.put(:state, :unknown)]
-
-      :error ->
-        []
+      {:ok, saved} -> [unknown(slug, saved)]
+      # A file that does not decode still names an installed app.
+      {:error, _reason} -> [unknown(slug, %{config: placeholder(slug)})]
+      :error -> []
     end
   end
+
+  defp unknown(slug, saved),
+    do: slug |> Policy.init_data(saved) |> Policy.snapshot() |> Map.put(:state, :unknown)
+
+  defp placeholder(slug),
+    do: %Config{slug: slug, name: slug, version: "unknown", description: "", arch: []}
 
   @spec installed?(String.t()) :: boolean()
   def installed?(slug), do: match?({:ok, true}, ask_healing(slug, :installed?))
@@ -338,18 +343,24 @@ defmodule Vagus.App do
 
     case Instances.ensure(slug) do
       {:ok, pid} -> call_op(pid, {:install, args})
+      # Its file is there but unreadable: installing would overwrite it.
+      :ignore -> {:error, :corrupt_file}
       _not_started -> {:error, :unavailable}
     end
   end
 
   @doc """
-  Applies the app's boot rule. One halted by a shutdown that did not take the
-  device down is resumed instead, which applies the same rule.
+  Applies the app's boot rule, given whether the engine has its container
+  running (`:unknown` when it could not be asked). One halted by a shutdown
+  that did not take the device down is resumed instead, which applies the
+  same rule.
   """
-  @spec boot_start(String.t()) :: :ok | {:error, term()}
-  def boot_start(slug) do
-    case command(slug, :boot_start, %{}) do
-      {:error, :shutting_down} -> command(slug, :resume, %{})
+  @spec boot_start(String.t(), boolean() | :unknown) :: :ok | {:error, term()}
+  def boot_start(slug, running? \\ :unknown) do
+    args = %{running?: running?}
+
+    case command(slug, :boot_start, args) do
+      {:error, :shutting_down} -> command(slug, :resume, args)
       result -> result
     end
   end

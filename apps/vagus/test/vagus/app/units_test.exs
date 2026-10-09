@@ -16,7 +16,9 @@ defmodule Vagus.App.UnitsTest do
     in_flight?: 0,
     install_default: 1,
     native?: 1,
-    boot_start: 1,
+    boot_start: 2,
+    running: 0,
+    inspect: 1,
     halt: 1,
     core_start: 1,
     core_stop: 1,
@@ -102,5 +104,34 @@ defmodule Vagus.App.UnitsTest do
              "type" => "supervisor/event",
              "data" => data
            }
+  end
+
+  describe "what the engine says runs" do
+    alias Vagus.Test.FakeEngine
+
+    defp engine(responses) do
+      engine = FakeEngine.start(responses)
+      on_exit(fn -> FakeEngine.stop(engine) end)
+      [socket: engine.socket]
+    end
+
+    test "one listing names the apps whose container runs" do
+      containers = [
+        %{"Names" => ["/addon_core_ssh"]},
+        %{"Names" => ["/hassio_dns"]},
+        %{"Names" => ["/addon_local_x", "/alias"]}
+      ]
+
+      assert {:ok, running} = Units.running(engine([{200, containers}]))
+      assert running == MapSet.new(["core_ssh", "local_x"])
+      assert {:error, {:http, 500, _}} = Units.running(engine([{500, %{"message" => "x"}}]))
+    end
+
+    test "one app's container: running, absent, or no answer" do
+      assert Units.running?("core_ssh", engine([{200, %{"State" => %{"Running" => true}}}]))
+      refute Units.running?("core_ssh", engine([{200, %{"State" => %{"Running" => false}}}]))
+      refute Units.running?("core_ssh", engine([{404, %{"message" => "no such container"}}]))
+      assert :unknown == Units.running?("core_ssh", engine([{500, %{"message" => "x"}}]))
+    end
   end
 end

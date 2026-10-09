@@ -15,7 +15,8 @@ defmodule Vagus.App.Probe do
   alias Vagus.Addon.ProbeURL
   alias Vagus.Network
 
-  @tcp_connect_timeout_ms 10_000
+  # One bound for the whole probe, connect included; `:timeout_ms` in the
+  # input overrides it.
   @probe_timeout_ms 10_000
 
   @spec check(String.t() | nil, map()) :: :healthy | :unhealthy | :skip
@@ -24,7 +25,7 @@ defmodule Vagus.App.Probe do
     with {:ok, %{port: port}} <- ProbeURL.watchdog_spec(template, config, options, ""),
          {:ok, ip} <- address(config, data, port),
          {:ok, spec} <- ProbeURL.watchdog_spec(template, config, options, ip) do
-      probe(spec)
+      probe(spec, Map.get(data, :timeout_ms, @probe_timeout_ms))
     else
       _no_spec_or_address -> :skip
     end
@@ -38,8 +39,8 @@ defmodule Vagus.App.Probe do
   defp address(_config, %{ip: ip}, _port) when is_binary(ip), do: {:ok, ip}
   defp address(_config, _data, _port), do: :error
 
-  defp probe(%{proto: "tcp", host: host, port: port}) do
-    case :gen_tcp.connect(String.to_charlist(host), port, [], @tcp_connect_timeout_ms) do
+  defp probe(%{proto: "tcp", host: host, port: port}, timeout) do
+    case :gen_tcp.connect(String.to_charlist(host), port, [], timeout) do
       {:ok, socket} ->
         :gen_tcp.close(socket)
         :healthy
@@ -49,11 +50,11 @@ defmodule Vagus.App.Probe do
     end
   end
 
-  defp probe(%{proto: proto, host: host, port: port, suffix: suffix})
+  defp probe(%{proto: proto, host: host, port: port, suffix: suffix}, timeout)
        when proto in ["http", "https"] do
     path = if suffix == "", do: "/", else: suffix
 
-    case one_shot_get(scheme(proto), host, port, path) do
+    case one_shot_get(scheme(proto), host, port, path, timeout) do
       {:ok, status} when is_integer(status) and status < 300 -> :healthy
       _ -> :unhealthy
     end
@@ -70,8 +71,8 @@ defmodule Vagus.App.Probe do
   defp scheme("http"), do: :http
   defp scheme("https"), do: :https
 
-  defp one_shot_get(scheme, host, port, path) do
-    deadline = System.monotonic_time(:millisecond) + @probe_timeout_ms
+  defp one_shot_get(scheme, host, port, path, timeout) do
+    deadline = System.monotonic_time(:millisecond) + timeout
 
     with {:ok, connect_timeout} <- remaining(deadline),
          {:ok, conn} <-

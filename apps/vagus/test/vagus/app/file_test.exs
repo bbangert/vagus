@@ -163,18 +163,29 @@ defmodule Vagus.App.FileTest do
       log =
         capture_log(fn ->
           for slug <- ["bad", "other", "vagus", "core_mosquitto"],
-              do: assert(:error = AppFile.read(slug, dir))
+              do: assert({:error, :invalid} = AppFile.read(slug, dir))
         end)
 
       assert log =~ "skipping invalid or mismatched app \"vagus\""
     end
 
-    test "a file that is not JSON is skipped, not raised", %{dir: dir} do
+    test "a file that is not JSON is an error, not raised and not taken for no file", %{
+      dir: dir
+    } do
       File.mkdir_p!(dir)
       File.write!(Path.join(dir, "core_mosquitto.json"), "{{{ not json")
 
-      assert capture_log(fn -> assert :error = AppFile.read("core_mosquitto", dir) end) =~
-               "not valid JSON"
+      assert capture_log(fn ->
+               assert {:error, :not_json} = AppFile.read("core_mosquitto", dir)
+             end) =~ "not valid JSON"
+    end
+
+    test "a file that cannot be read is an error with its reason", %{dir: dir} do
+      File.mkdir_p!(Path.join(dir, "core_mosquitto.json"))
+
+      assert capture_log(fn ->
+               assert {:error, :eisdir} = AppFile.read("core_mosquitto", dir)
+             end) =~ "could not read"
     end
   end
 

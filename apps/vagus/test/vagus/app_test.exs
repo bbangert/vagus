@@ -7,6 +7,7 @@ defmodule Vagus.AppTest do
   alias Vagus.Addon.{Backend, Config}
   alias Vagus.App
   alias Vagus.App.Directory
+  alias Vagus.App.File, as: AppFile
 
   defp config(overrides \\ %{}) do
     slug = "app_test_#{System.unique_integer([:positive])}"
@@ -28,6 +29,15 @@ defmodule Vagus.AppTest do
   end
 
   defp track(config, opts \\ []), do: install_app(config, opts).slug
+
+  defp corrupt_file do
+    slug = "app_test_#{System.unique_integer([:positive])}"
+    path = Path.join(AppFile.dir(), slug <> ".json")
+    File.mkdir_p!(AppFile.dir())
+    File.write!(path, "{{{")
+    on_exit(fn -> File.rm(path) end)
+    slug
+  end
 
   describe "set/2" do
     test "writes options and settings" do
@@ -89,6 +99,15 @@ defmodule Vagus.AppTest do
 
       assert :ok = App.install(config)
       assert {:ok, %{state: :stopped}} = app_info(config.slug)
+    end
+
+    test "a slug whose file does not decode is refused, not installed over" do
+      slug = corrupt_file()
+      Backend.Fake.reset_calls()
+
+      assert {:error, :corrupt_file} = App.install(config(%{"slug" => slug}))
+      assert Backend.Fake.calls() == []
+      assert File.read!(Path.join(AppFile.dir(), slug <> ".json")) == "{{{"
     end
 
     test "an installed slug is refused before the pull" do
@@ -320,6 +339,13 @@ defmodule Vagus.AppTest do
       assert {:ok, %{wanted: :started, config: %{slug: ^slug}}} = App.info(slug)
       assert [{pid, _}] = Elixir.Registry.lookup(Directory, {:slug, slug})
       assert Process.alive?(pid)
+    end
+
+    test "an app whose file does not decode is still listed, :unknown" do
+      slug = corrupt_file()
+
+      assert [%{state: :unknown, config: %{slug: ^slug}}] =
+               Enum.filter(App.list(), &(&1.config.slug == slug))
     end
 
     test "gather/2 answers every app under one deadline" do

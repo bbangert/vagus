@@ -144,6 +144,17 @@ defmodule Vagus.App.PolicyTest do
       assert Policy.on_event(%{action: "die", id: "old", exit_code: 1}, data) == {data, []}
     end
 
+    test "a late start and exit of a container this process stopped change nothing" do
+      {data, _} = begin(:stop, %{}, running(%{token_hash: "h"}))
+      {stopped, _} = step(data, {:ok, %{was_running: true}})
+      assert stopped.released == ["c1"]
+
+      for event <- [%{action: "start", id: "c1"}, %{action: "die", id: "c1", exit_code: 1}],
+          do: assert(Policy.on_event(event, stopped) == {stopped, []})
+
+      assert {%{container_id: "c9"}, _} = Policy.on_event(%{action: "start", id: "c9"}, stopped)
+    end
+
     test "an exit after a stop (no current container) is ignored" do
       data = app(%{wanted: :stopped})
       assert Policy.on_event(%{action: "die", id: "c1", exit_code: 0}, data) == {data, []}
@@ -160,7 +171,7 @@ defmodule Vagus.App.PolicyTest do
                {:keys, [], [{:token, "h"}, {:dns, "app-one"}]},
                {:cancel, :probe},
                {:cancel, :settled},
-               {:timer, :retry, 0, :retry}
+               {:timer, :retry, 0, {:retry, "c1"}}
              ]
 
       assert %{attempt: 1, ip: nil, token_hash: nil, container_id: "c1"} = after_crash
@@ -168,7 +179,7 @@ defmodule Vagus.App.PolicyTest do
 
     test "a clean exit of a long-running app is restarted too, as upstream does" do
       {_data, effects} = Policy.on_event(%{action: "die", id: "c1", exit_code: 0}, running())
-      assert {:timer, :retry, 0, :retry} in effects
+      assert {:timer, :retry, 0, {:retry, "c1"}} in effects
       assert {:emit, :stopped} in effects
     end
 
@@ -205,14 +216,14 @@ defmodule Vagus.App.PolicyTest do
       {data, effects} =
         Policy.on_event(%{action: "health_status: unhealthy", id: "c1"}, running())
 
-      assert effects == [{:timer, :retry, 0, :retry}]
+      assert effects == [{:timer, :retry, 0, {:retry, "c1"}}]
       assert data.last_event == :unhealthy
     end
 
     test "the native broker going down is revived after 5 s, watchdog flag or not" do
       data = running(%{config: native_config(), slug: "core_mqtt", watchdog: false})
       {data, effects} = Policy.on_event({:broker_down, :killed}, data)
-      assert {:timer, :retry, 5_000, :retry} in effects
+      assert {:timer, :retry, 5_000, {:retry, "c1"}} in effects
       assert {:emit, :error} in effects
       assert data.attempt == 1
     end
@@ -280,7 +291,7 @@ defmodule Vagus.App.PolicyTest do
 
     test "the second miss is a restart on the crash ladder" do
       {data, effects} = Policy.strike(:unhealthy, running(%{strikes: 1, attempt: 2}))
-      assert effects == [{:timer, :retry, 20_000, :retry}]
+      assert effects == [{:timer, :retry, 20_000, {:retry, "c1"}}]
       assert %{strikes: 0, attempt: 3} = data
     end
 
@@ -317,15 +328,16 @@ defmodule Vagus.App.PolicyTest do
   end
 
   describe "boot/2 with app data" do
-    test "a stopped wanted app starts on auto; manual demotes; running is left alone" do
+    test "a stopped wanted app starts on auto; manual demotes; a container it did not start is started again" do
       assert Policy.boot(app(), false) == :start
       assert Policy.boot(app(%{boot: "manual"}), false) == :demote
+      assert Policy.boot(app(), :unknown) == :start
       assert Policy.boot(app(%{boot: "manual"}), :unknown) == :none
-      assert Policy.boot(app(), true) == :none
+      assert Policy.boot(app(), true) == :start
+      assert Policy.boot(app(%{boot: "manual"}), true) == :start
+      assert Policy.boot(app(), :managed) == :none
+      assert Policy.boot(app(%{wanted: :stopped}), true) == :none
       assert Policy.boot(app(%{wanted: :stopped}), false) == :none
-      assert Policy.boot(app(%{boot: "manual"}), :adopted) == :start
-      assert Policy.boot(app(), :adopted) == :start
-      assert Policy.boot(app(%{wanted: :stopped}), :adopted) == :none
     end
   end
 
@@ -437,7 +449,7 @@ defmodule Vagus.App.PolicyTest do
         {:start, %{}, [{:port?, nil}, {:mint_token, nil}, {:start, nil}]},
         {:stop, %{}, [{:stop, nil}]},
         {:restart, %{}, [{:stop, nil}, {:port?, nil}, {:mint_token, nil}, {:start, nil}]},
-        {:uninstall, %{}, [{:stop, nil}, {:remove_app, nil}, {:delete_file, nil}]},
+        {:uninstall, %{}, [{:stop, nil}, {:delete_file, nil}, {:remove_app, nil}]},
         {:halt, %{}, [{:halt_stop, nil}]},
         {:update, %{config: app_config(%{"version" => "2"})},
          [{:pull, nil}, {:stop, nil}, {:commit, nil}, {:start?, nil}, {:reclaim_image, nil}]},
@@ -560,7 +572,7 @@ defmodule Vagus.App.PolicyTest do
       assert effects == [
                :persist,
                {:reply, {:error, :timeout}},
-               {:timer, :retry, 10_000, :retry},
+               {:timer, :retry, 10_000, {:retry, nil}},
                :idle
              ]
 
@@ -730,7 +742,7 @@ defmodule Vagus.App.PolicyTest do
       assert effects == [:persist, {:reply, {:ok, "/s/app_one.tar.gz"}}, :idle]
     end
 
-    test "10. uninstall: every key dropped first, file deleted last, reply then exit" do
+    test "10. uninstall: every key dropped first, the file deleted before the removal, reply then exit" do
       ingress = app_config(%{"ingress" => true, "ingress_port" => 0})
 
       data =
@@ -757,19 +769,40 @@ defmodule Vagus.App.PolicyTest do
       assert List.last(effects) == {:step, {:stop, nil}}
       assert data.discovery == %{}
 
-      {data, [{:emit, :stopped}, {:step, {:remove_app, nil}}]} =
+      {data, [{:emit, :stopped}, :delete_file, {:step, {:remove_app, nil}}]} =
         step(data, {:ok, %{was_running: true}})
 
       {_data, effects} = step(data, {:ok, :ok})
-      assert effects == [:delete_file, {:reply, :ok}, :exit]
+      assert effects == [{:reply, :ok}, :exit]
     end
 
-    test "uninstall: a refused removal keeps the file and the process" do
+    test "uninstall: a refused removal after the file is gone ends the process, unsaved" do
       {data, _} = begin(:uninstall, %{}, running())
       {data, _} = step(data, {:ok, %{was_running: true}})
       {_data, effects} = step(data, {:error, {:invalid_slug, "x"}})
-      refute :delete_file in effects
-      assert List.last(effects) == :idle
+      assert effects == [{:reply, {:error, {:invalid_slug, "x"}}}, :exit]
+    end
+
+    test "uninstall: a halt once the file is gone ends the process rather than waiting to resume" do
+      {data, _} = begin(:uninstall, %{}, running())
+      {data, _} = step(data, {:ok, %{was_running: true}})
+      {data, effects} = begin(:halt, %{}, data)
+      assert List.last(effects) == {:step, {:halt_stop, nil}}
+      {_data, effects} = step(data, {:ok, :stopped})
+      assert effects == [{:reply, :ok}, :exit]
+    end
+
+    test "update: a failed snapshot whose restart of the old version fails, fails without a rollback" do
+      {data, _} =
+        begin(:update, %{config: app_config(%{"version" => "2"}), backup: true}, running())
+
+      {data, _} = step(data, {:ok, "img"})
+      {data, _} = step(data, {:ok, %{was_running: true}})
+      {data, _} = step(data, {:error, :enospc})
+      {data, effects} = step(data, {:error, :old_broken})
+
+      assert Enum.take(effects, -3) == [:persist, {:reply, {:error, :old_broken}}, :idle]
+      assert data.config.version == "1.0.0"
     end
 
     test "install: pull, port, commit; nothing persisted until the commit" do
@@ -847,12 +880,15 @@ defmodule Vagus.App.PolicyTest do
       assert effects == [:persist, {:reply, {:error, {:stop, :died}}}, :idle]
     end
 
-    test "halt: stop by name, reply, shutting down, nothing persisted" do
+    test "halt: stop by name, reply its result, shutting down, nothing persisted" do
       {data, effects} = begin(:halt, %{}, running(%{token_hash: "h"}))
       assert List.last(effects) == {:step, {:halt_stop, nil}}
-      {data, effects} = step(data, {:error, :timeout})
+      {after_ok, effects} = step(data, {:ok, :stopped})
       assert effects == [{:emit, :stopped}, {:reply, :ok}, :shutting_down]
-      assert data.wanted == :started
+      assert after_ok.wanted == :started
+
+      {_data, effects} = step(data, {:error, :timeout})
+      assert effects == [{:emit, :stopped}, {:reply, {:error, :timeout}}, :shutting_down]
     end
 
     test "an outcome no clause plans for fails the op instead of raising" do

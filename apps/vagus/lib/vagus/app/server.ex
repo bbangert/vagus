@@ -2,8 +2,12 @@ defmodule Vagus.App.Server do
   @moduledoc """
   One process per app: it holds every fact about the app and runs every
   operation on it. Its own file (`Vagus.App.File`) is the durable half; the
-  per-start token, container id and IP live only here, so a restarted
-  process recreates the container rather than trusting one it did not start.
+  per-start token, container id and IP live only here. A restarted process
+  never asks the engine itself: its `Vagus.App.Orchestrator.up/1` makes the
+  orchestrator inspect its container and send `boot_start` with the answer,
+  and a wanted app whose container still runs is started again, which
+  replaces the container under a fresh token (the old token died with the
+  old process).
 
   States: `:new` (no file yet; it expires unless an install arrives),
   `:idle`, `{:busy, op}` and `:shutting_down`. The step an operation is on is
@@ -31,7 +35,7 @@ defmodule Vagus.App.Server do
 
   require Logger
 
-  alias Vagus.App.{Directory, Orchestrator, Policy}
+  alias Vagus.App.{Directory, Orchestrator, Policy, Steps}
   alias Vagus.App.File, as: AppFile
   alias Vagus.Core.{EventPusher, Events}
   alias Vagus.Discovery.Push
@@ -75,6 +79,11 @@ defmodule Vagus.App.Server do
       :error ->
         {:ok, :new, fresh(slug, nil), [{:state_timeout, deadline(:new), :expire}]}
 
+      # Not a fresh slug: an install over it would replace what the user had.
+      {:error, reason} ->
+        Logger.error("App #{slug}: its file cannot be read (#{inspect(reason)}); not started")
+        :ignore
+
       {:ok, saved} ->
         data = fresh(slug, saved)
         data = sync_keys(data, tl(Policy.keys(data)), [])
@@ -86,7 +95,13 @@ defmodule Vagus.App.Server do
   defp fresh(slug, saved) do
     slug
     |> Policy.init_data(saved)
-    |> Map.merge(%{probe: nil, broker_ref: nil, retired: false, shutting_down: shutdown?()})
+    |> Map.merge(%{
+      probe: nil,
+      broker_ref: nil,
+      retired: false,
+      killed: [],
+      shutting_down: shutdown?()
+    })
   end
 
   @impl :gen_statem
@@ -103,11 +118,14 @@ defmodule Vagus.App.Server do
     end
   end
 
-  defp event({:call, from}, {:set, _changes}, :new, _data),
-    do: {:keep_state_and_data, [{:reply, from, :error}]}
+  # Nothing to write before an install commits, nor once an uninstall began:
+  # a write then would bring its file back.
+  defp event({:call, from}, {:set, _changes}, _state, data)
+       when data.config == nil or data.retired,
+       do: {:keep_state_and_data, [{:reply, from, {:error, :not_installed}}]}
 
-  # Validated and on disk before the reply (C1); an operation in flight reads
-  # the new values at its next step.
+  # Validated and on disk before the reply, so a reboot right after it keeps
+  # the change; an operation in flight reads the new values at its next step.
   defp event({:call, from}, {:set, changes}, state, data) do
     if Enum.all?(changes, fn {key, _value} -> key == :options or key in @settings end) do
       updated = Enum.reduce(changes, data, &put_setting/2)
@@ -203,13 +221,13 @@ defmodule Vagus.App.Server do
 
   defp event(:state_timeout, {:step, ref}, state, %{run: %{ref: ref, task: pid}} = data) do
     Logger.warning("App #{data.slug}: #{inspect(data.run.step)} overran its deadline")
-    kill(pid)
-    settle({:error, :timeout}, state, data)
+    settle({:error, :timeout}, state, kill(pid, data))
   end
 
+  # Only the reason's shape: a start task's arguments carry the app's token.
   defp event(:info, {:EXIT, pid, reason}, state, %{run: %{task: pid}} = data)
        when reason != :normal do
-    Logger.warning("App #{data.slug}: #{inspect(data.run.step)} died: #{inspect(reason)}")
+    Logger.warning("App #{data.slug}: #{inspect(data.run.step)} died: #{inspect(shape(reason))}")
     settle({:error, :died}, state, data)
   end
 
@@ -223,10 +241,8 @@ defmodule Vagus.App.Server do
        when reason != :normal,
        do: strike(:skip, state, data)
 
-  defp event({:timeout, :probe_deadline}, ref, state, %{probe: {pid, ref}} = data) do
-    kill(pid)
-    strike(:unhealthy, state, data)
-  end
+  defp event({:timeout, :probe_deadline}, ref, state, %{probe: {pid, ref}} = data),
+    do: strike(:unhealthy, state, kill(pid, data))
 
   defp event(:info, {:docker_event, _payload}, {:busy, _op}, _data),
     do: {:keep_state_and_data, [:postpone]}
@@ -244,9 +260,14 @@ defmodule Vagus.App.Server do
   defp event(:info, {:DOWN, ref, :process, _pid, reason}, state, %{broker_ref: ref} = data),
     do: on_event({:broker_down, reason}, state, %{data | broker_ref: nil})
 
-  # The user may have stopped the app since this was armed.
-  defp event({:timeout, :retry}, :retry, :idle, %{wanted: :started} = data),
-    do: begin_op(:start, %{retry: true}, nil, :idle, data)
+  # For the container it was armed against: once an operation replaced that
+  # one, or the user stopped the app, the restart is stale. Still current, it
+  # may be running yet unhealthy, which is a restart too.
+  defp event({:timeout, :retry}, {:retry, id}, :idle, %{wanted: :started} = data) do
+    if data.shutting_down or id != data.container_id,
+      do: :keep_state_and_data,
+      else: begin_op(:start, %{retry: true}, nil, :idle, data)
+  end
 
   defp event({:timeout, :settled}, :settled, state, data) when state != :new,
     do: on_event(:settled, state, data)
@@ -259,22 +280,35 @@ defmodule Vagus.App.Server do
 
   defp event({:timeout, _name}, _message, _state, _data), do: :keep_state_and_data
 
-  # Every task is unlinked before its result is used or it is killed, so a
-  # normal exit is the only one a finished task can still deliver.
-  defp event(:info, {:EXIT, _pid, :normal}, _state, _data), do: :keep_state_and_data
-  defp event(:info, {:EXIT, _pid, reason}, _state, _data), do: {:stop, reason}
+  # Unlinking does not take back an EXIT already queued by a task that died
+  # as it was killed. Every other task is unlinked before its result is used,
+  # so a normal exit is the only one a finished task can still deliver;
+  # anything else is the directory's partition going.
+  defp event(:info, {:EXIT, pid, reason}, _state, data) do
+    cond do
+      pid in data.killed -> {:keep_state, %{data | killed: List.delete(data.killed, pid)}}
+      reason == :normal -> :keep_state_and_data
+      true -> {:stop, reason}
+    end
+  end
 
   # Stale step results, stale deadlines, late replies and stray messages.
   defp event(_type, _content, _state, _data), do: :keep_state_and_data
 
+  # Nothing to stop yet, and no file: the process just ends.
+  defp command(:halt, _args, from, {:busy, :install}, data) do
+    kill(data.run.task, data)
+    {:stop_and_reply, :normal, reply(data.run, {:error, :shutting_down}) ++ [{:reply, from, :ok}]}
+  end
+
   defp command(:halt, args, from, {:busy, _op}, data) do
-    kill(data.run.task)
     parked = reply(data.run, {:error, :shutting_down})
+    data = kill(data.run.task, data)
     begin_op(:halt, args, from, {:busy, :halt}, %{data | run: nil}, parked)
   end
 
-  defp command(op, _args, from, _state, data) when op in [:resume, :boot_start],
-    do: boot(from, data)
+  defp command(op, args, from, _state, data) when op in [:resume, :boot_start],
+    do: boot(from, Map.get(args, :running?, :unknown), data)
 
   # Core GETs a message before acting on its DELETE, so the DELETEs are queued
   # now, ahead of the stop, and whatever the stopping app posts is refused.
@@ -285,27 +319,34 @@ defmodule Vagus.App.Server do
 
   defp command(op, args, from, state, data), do: begin_op(op, args, from, state, data)
 
-  defp boot(from, data) do
-    case Policy.boot(data, running?(data)) do
+  defp boot(from, reported, data) do
+    case Policy.boot(data, running?(data, reported)) do
       :start ->
         begin_op(:start, %{}, from, :idle, data)
 
       :demote ->
         data = %{data | wanted: :stopped}
-        AppFile.write(data)
-        {:next_state, :idle, data, [{:reply, from, :ok}]}
+        persist(data)
+        {:next_state, :idle, data, [{:reply, from, :ok}, {{:timeout, :retry}, :cancel}]}
 
       :none ->
         {:next_state, :idle, data, [{:reply, from, :ok}]}
     end
   end
 
-  # A container adopted from an engine report, not started by this process,
-  # holds no token this process issued.
-  defp running?(%{container_id: id, token_hash: nil, broker_pid: nil}) when id != nil,
-    do: :adopted
+  # What this process started and still holds is current. A container it only
+  # heard of holds no token it issued; the engine knows nothing of a native
+  # app, which runs in the BEAM.
+  defp running?(data, reported) do
+    up? = Policy.derive(:idle, data) in [:startup, :started]
 
-  defp running?(data), do: Policy.derive(:idle, data) in [:startup, :started]
+    cond do
+      up? and (data.token_hash != nil or data.broker_pid != nil) -> :managed
+      up? -> true
+      Steps.native?(data.config) -> false
+      true -> reported
+    end
+  end
 
   defp begin_op(op, args, from, state, data, actions \\ []) do
     case Policy.plan(op, args, data) do
@@ -317,24 +358,31 @@ defmodule Vagus.App.Server do
 
       run ->
         {data, effects} = Policy.next(%{run | from: from}, :begin, stop_probe(data))
-        run_effects(effects, {:busy, op}, data, actions)
+        run_effects(effects, {:busy, op}, data, actions ++ cancel_retry(op))
     end
   end
+
+  # A pending restart is stale once anything else starts or stops the app.
+  defp cancel_retry(op) when op in [:start, :restart, :stop, :uninstall, :halt],
+    do: [{{:timeout, :retry}, :cancel}]
+
+  defp cancel_retry(_op), do: []
 
   defp settle(outcome, state, data) do
     {data, effects} = Policy.next(data.run, port_free(outcome, data), data)
     run_effects(effects, state, data)
   end
 
-  # The directory is the arbiter of a dynamic port: one another app took
-  # between the task's pick and now fails this start (decision 1).
-  defp port_free({:ok, port}, %{run: %{step: {:port, _arg}}}) do
+  # The directory is the arbiter of a dynamic port, so the claim is the
+  # registration itself: two apps that picked one port cannot both pass.
+  defp port_free({:ok, port}, %{run: %{step: {:port, _arg}}} = data) do
     key = {:ingress_port, port}
     me = self()
 
-    case Registry.lookup(Directory, key) do
-      [{pid, _value}] when pid != me -> {:error, {:port_taken, key}}
-      _free_or_mine -> {:ok, port}
+    case Registry.register(Directory, key, data.slug) do
+      {:ok, _owner} -> {:ok, port}
+      {:error, {:already_registered, ^me}} -> {:ok, port}
+      {:error, {:already_registered, _other}} -> {:error, {:port_taken, key}}
     end
   end
 
@@ -351,40 +399,64 @@ defmodule Vagus.App.Server do
   end
 
   defp run_effects(effects, state, data, actions \\ []) do
-    case Enum.reduce(effects, {state, data, actions}, &effect/2) do
+    case Enum.reduce_while(effects, {state, data, actions}, &effect/2) do
       {:exit, data, actions} -> {:stop_and_reply, :normal, replies(actions), data}
       {state, data, actions} -> {:next_state, state, data, actions}
     end
   end
 
-  defp effect({:step, step}, {st, d, acts}) do
+  # An install that could not save its file has installed nothing: no reboot
+  # would find it. Anywhere else the app is already on disk, so the op goes on.
+  defp effect(:persist, {_st, d, acts} = acc) do
+    case persist(d) do
+      :ok ->
+        {:cont, acc}
+
+      {:error, reason} when d.run.op == :install ->
+        {:halt, {:exit, d, acts ++ reply(d.run, {:error, {:persist, reason}})}}
+
+      {:error, _reason} ->
+        {:cont, acc}
+    end
+  end
+
+  defp effect(effect, acc), do: {:cont, apply_effect(effect, acc)}
+
+  defp persist(data) do
+    with {:error, reason} <- AppFile.write(data) do
+      Logger.warning("App #{data.slug}: not saved (#{inspect(reason)})")
+      {:error, reason}
+    end
+  end
+
+  defp apply_effect({:step, step}, {st, d, acts}) do
     {d, step_actions} = spawn_step(d, step)
     {st, d, acts ++ step_actions}
   end
 
-  defp effect({:reply, term}, {st, d, acts}), do: {st, d, acts ++ reply(d.run, term)}
-  defp effect({:keys, add, drop}, {st, d, acts}), do: {st, sync_keys(d, add, drop), acts}
+  defp apply_effect({:reply, term}, {st, d, acts}), do: {st, d, acts ++ reply(d.run, term)}
+  defp apply_effect({:keys, add, drop}, {st, d, acts}), do: {st, sync_keys(d, add, drop), acts}
 
-  defp effect({:timer, name, ms, msg}, {st, d, acts}),
+  defp apply_effect({:timer, name, ms, msg}, {st, d, acts}),
     do: {st, d, acts ++ [{{:timeout, name}, deadline(name, ms), msg}]}
 
-  defp effect({:cancel, name}, {st, d, acts}), do: {st, d, acts ++ [{{:timeout, name}, :cancel}]}
-  defp effect(:monitor_broker, {st, d, acts}), do: {st, monitor_broker(d), acts}
-  defp effect(:idle, {_st, d, acts}), do: {:idle, %{d | run: nil, retired: false}, acts}
-  defp effect(:shutting_down, {_st, d, acts}), do: {:shutting_down, %{d | run: nil}, acts}
-  defp effect(:exit, {_st, d, acts}), do: {:exit, d, acts}
+  defp apply_effect({:cancel, name}, {st, d, acts}),
+    do: {st, d, acts ++ [{{:timeout, name}, :cancel}]}
 
-  defp effect(:persist, {_st, d, _acts} = acc) do
-    AppFile.write(d)
-    acc
-  end
+  defp apply_effect(:monitor_broker, {st, d, acts}), do: {st, monitor_broker(d), acts}
+  defp apply_effect(:idle, {_st, d, acts}), do: {:idle, %{d | run: nil, retired: false}, acts}
 
-  defp effect(:delete_file, {_st, d, _acts} = acc) do
+  defp apply_effect(:shutting_down, {_st, d, acts}),
+    do: {:shutting_down, %{d | run: nil, retired: false}, acts}
+
+  defp apply_effect(:exit, {_st, d, acts}), do: {:exit, d, acts}
+
+  defp apply_effect(:delete_file, {_st, d, _acts} = acc) do
     AppFile.delete(d.slug)
     acc
   end
 
-  defp effect({:emit, state}, {_st, d, _acts} = acc) do
+  defp apply_effect({:emit, state}, {_st, d, _acts} = acc) do
     d.slug |> Events.app_state(state) |> EventPusher.push()
     acc
   end
@@ -410,16 +482,14 @@ defmodule Vagus.App.Server do
   end
 
   # An operation never runs beside a probe.
-  defp stop_probe(%{probe: {pid, _ref}} = data) do
-    kill(pid)
-    %{data | probe: nil}
-  end
-
+  defp stop_probe(%{probe: {pid, _ref}} = data), do: %{kill(pid, data) | probe: nil}
   defp stop_probe(data), do: data
 
-  defp kill(pid) do
+  # A handful is enough: a queued EXIT is handled before anything sent later.
+  defp kill(pid, data) do
     Process.unlink(pid)
     Process.exit(pid, :kill)
+    %{data | killed: Enum.take([pid | data.killed], 8)}
   end
 
   defp reply(%{from: from}, term) when from != nil, do: [{:reply, from, term}]
@@ -504,7 +574,28 @@ defmodule Vagus.App.Server do
     end)
     |> Map.replace_lazy(:queue, fn queue -> Enum.map(queue, &redact_event/1) end)
     |> Map.replace_lazy(:postponed, fn queue -> Enum.map(queue, &redact_event/1) end)
+    |> Map.replace_lazy(:reason, &shape/1)
+    |> Map.replace(:log, [])
   end
+
+  # A crash's reason holds the arguments of the frame that raised, this data
+  # among them; its shape and where it happened are enough to read.
+  defp shape({cause, [{_m, _f, _a, _loc} | _] = stack}),
+    do: {shape(cause), Enum.map(stack, &frame/1)}
+
+  defp shape(%{__exception__: true} = exception), do: exception.__struct__
+  defp shape(reason) when is_atom(reason), do: reason
+
+  defp shape(reason)
+       when is_tuple(reason) and tuple_size(reason) > 0 and is_atom(elem(reason, 0)),
+       do: elem(reason, 0)
+
+  defp shape(_reason), do: :redacted
+
+  defp frame({module, fun, args, location}) when is_list(args),
+    do: {module, fun, length(args), location}
+
+  defp frame(frame), do: frame
 
   defp redact({key, _value}) when key in @redacted, do: {key, :redacted}
   defp redact({:run, %{op: op, step: step}}), do: {:run, %{op: op, step: step}}

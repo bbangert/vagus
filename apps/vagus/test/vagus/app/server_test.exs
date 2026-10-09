@@ -129,7 +129,31 @@ defmodule Vagus.App.ServerTest do
       assert :error = :gen_statem.call(pid, {:set, [nope: 1]})
 
       {:ok, new} = Instances.ensure(slug())
-      assert :error = :gen_statem.call(new, {:set, [watchdog: true]})
+      assert {:error, :not_installed} = :gen_statem.call(new, {:set, [watchdog: true]})
+    end
+
+    test "a write while the install pulls is refused, not a crash" do
+      slug = slug()
+      on_exit(fn -> forget_app(slug) end)
+      {:ok, pid} = Instances.ensure(slug)
+      t = op(pid, {:install, %{config: app_config(slug)}})
+      {_input, task} = step(:pull)
+
+      assert {:error, :not_installed} = :gen_statem.call(pid, {:set, [watchdog: true]})
+      send(task, {:outcome, {:ok, "x/y:1"}})
+      assert :ok = Task.await(t)
+    end
+
+    test "a write once an uninstall began is refused, so the file stays gone" do
+      {slug, pid} = started()
+      t = op(pid, {:uninstall, %{}})
+      answer(:stop, {:ok, %{was_running: true}})
+      {_input, task} = step(:remove_app)
+
+      assert {:error, :not_installed} = :gen_statem.call(pid, {:set, [watchdog: true]})
+      assert :error = AppFile.read(slug)
+      send(task, {:outcome, {:ok, :ok}})
+      assert :ok = Task.await(t)
     end
   end
 
@@ -219,17 +243,32 @@ defmodule Vagus.App.ServerTest do
     end
 
     test "the deadline is per step: two steps may together outlast one" do
-      app_deadlines(%{stop: 300, start: 300})
+      app_deadlines(%{stop: 1_000, start: 1_000})
       {_slug, pid} = started()
       t = op(pid, {:restart, %{}})
 
       for {name, outcome} <- [stop: {:ok, %{was_running: true}}, start: {:ok, @started}] do
         {_input, task} = step(name)
-        Process.sleep(200)
+        Process.send_after(self(), {:waited, name}, 600)
+        assert_receive {:waited, ^name}, 1_000
         send(task, {:outcome, outcome})
       end
 
       assert :ok = Task.await(t)
+    end
+
+    test "an EXIT a killed task queued before its unlink is dropped, not taken for the directory" do
+      app_deadlines(%{start: 100})
+      {_slug, pid} = installed()
+      t = op(pid, {:start, %{}})
+      {_input, task} = step(:start)
+      ref = Process.monitor(task)
+      assert_receive {:DOWN, ^ref, :process, ^task, :killed}, 1_000
+
+      send(pid, {:EXIT, task, :killed})
+      answer(:stop, {:ok, %{was_running: false}})
+      assert {:error, :timeout} = Task.await(t)
+      assert %{killed: []} = data(pid)
     end
 
     test "a step past its deadline is killed and cleaned up by name" do
@@ -254,6 +293,42 @@ defmodule Vagus.App.ServerTest do
       answer(:stop, {:ok, %{was_running: false}})
       assert {:error, :died} = Task.await(t)
       assert :idle = state(pid)
+    end
+
+    test "halt answers with its stop's result" do
+      {_slug, pid} = installed(%{}, state: :started)
+      halt = op(pid, {:halt, %{}})
+      answer(:halt_stop, {:error, :engine_gone})
+
+      assert {:error, :engine_gone} = Task.await(halt)
+      assert :shutting_down = state(pid)
+    end
+
+    test "halt during an install ends the process and answers both callers" do
+      slug = slug()
+      on_exit(fn -> forget_app(slug) end)
+      {:ok, pid} = Instances.ensure(slug)
+      ref = Process.monitor(pid)
+      install = op(pid, {:install, %{config: app_config(slug)}})
+      step(:pull)
+
+      assert :ok = :gen_statem.call(pid, {:halt, %{}})
+      assert {:error, :shutting_down} = Task.await(install)
+      assert_receive {:DOWN, ^ref, :process, ^pid, :normal}
+      assert :error = AppFile.read(slug)
+    end
+
+    test "a halt during an uninstall's stop leaves an app that takes its own posts after resume" do
+      {slug, pid} = started()
+      uninstall = op(pid, {:uninstall, %{}})
+      step(:stop)
+      halt = op(pid, {:halt, %{}})
+      assert {:error, :shutting_down} = Task.await(uninstall)
+      answer(:halt_stop, {:ok, :stopped})
+      assert :ok = Task.await(halt)
+
+      assert :ok = :gen_statem.call(pid, {:resume, %{}})
+      assert :ok = :gen_statem.call(pid, {:provide_service, "svc_#{slug}", %{}})
     end
 
     test "halt kills the step in flight, answers its caller, and stops by name" do
@@ -311,9 +386,11 @@ defmodule Vagus.App.ServerTest do
       assert :error = AppFile.read(slug)
     end
 
-    test "uninstall drops every key before its task and deletes the file last" do
+    test "uninstall drops every key before its task and deletes the file before the removal" do
       capture_discovery_pushes()
       {slug, pid} = started()
+      token_key = {:token, data(pid).token_hash}
+      assert [{^pid, ^slug}] = lookup(token_key)
       :ok = :gen_statem.call(pid, {:provide_service, "svc_#{slug}", %{}})
       {:ok, %{uuid: uuid}, :new} = :gen_statem.call(pid, {:add_discovery, "mqtt", %{}})
       drain_discovery_pushes()
@@ -323,19 +400,153 @@ defmodule Vagus.App.ServerTest do
       {_input, task} = step(:stop)
       assert_receive {:discovery_push, :delete, %{uuid: ^uuid}}
 
-      for key <- [{:service, "svc_#{slug}"}, {:discovery, uuid}, {:dns, Policy.dns_name(slug)}],
-          do: assert([] = lookup(key))
+      keys = [
+        token_key,
+        {:service, "svc_#{slug}"},
+        {:discovery, uuid},
+        {:dns, Policy.dns_name(slug)}
+      ]
+
+      for key <- keys, do: assert([] = lookup(key))
 
       assert {:error, :unavailable} = :gen_statem.call(pid, {:add_discovery, "x", %{}})
       assert {:ok, _} = AppFile.read(slug)
       send(task, {:outcome, {:ok, %{was_running: true}}})
       {_input, task} = step(:remove_app)
-      assert {:ok, _} = AppFile.read(slug)
+      assert :error = AppFile.read(slug)
       send(task, {:outcome, {:ok, :ok}})
 
       assert :ok = Task.await(t)
       assert_receive {:DOWN, ^ref, :process, ^pid, :normal}
       assert :error = AppFile.read(slug)
+    end
+
+    test "a halt once the file is gone ends the process; the slug comes back new" do
+      {slug, pid} = started()
+      ref = Process.monitor(pid)
+      uninstall = op(pid, {:uninstall, %{}})
+      answer(:stop, {:ok, %{was_running: true}})
+      step(:remove_app)
+
+      halt = op(pid, {:halt, %{}})
+      assert {:error, :shutting_down} = Task.await(uninstall)
+      answer(:halt_stop, {:ok, :stopped})
+      assert :ok = Task.await(halt)
+      assert_receive {:DOWN, ^ref, :process, ^pid, :normal}
+
+      assert :error = AppFile.read(slug)
+      assert {:ok, new} = Instances.ensure(slug)
+      assert :new = state(new)
+    end
+
+    test "late events of a container it stopped are ignored and cost no attempt" do
+      {slug, pid} = started(%{}, watchdog: true)
+      t = op(pid, {:stop, %{}})
+      {_input, task} = step(:stop)
+
+      send(pid, {:docker_event, %{id: "c1", action: "start"}})
+      send(pid, {:docker_event, %{id: "c1", action: "die", exit_code: 137}})
+      send(task, {:outcome, {:ok, %{was_running: true}}})
+      assert :ok = Task.await(t)
+
+      assert %{container_id: nil, attempt: 0, last_event: :stopped} = data(pid)
+      assert {:ok, %{state: :stopped}} = App.info(slug)
+    end
+
+    test "a restart pending when a user start fails is not run" do
+      app_deadlines(%{retry: 150})
+      {_slug, pid} = started(%{}, watchdog: true)
+      send(pid, {:docker_event, %{id: "c1", action: "die", exit_code: 1}})
+      assert %{attempt: 1} = data(pid)
+
+      t = op(pid, {:start, %{}})
+      answer(:start, {:error, :boom})
+      assert {:error, :boom} = Task.await(t)
+      refute_receive {:step, :start, _, _}, 400
+    end
+
+    test "a restart that came due during an operation which started the app again is dropped" do
+      app_deadlines(%{retry: 100})
+      {slug, pid} = started(%{"version" => "1"}, watchdog: true)
+      send(pid, {:docker_event, %{id: "c1", action: "die", exit_code: 1}})
+      t = op(pid, {:update, %{config: app_config(slug, %{"version" => "2"})}})
+      {_input, task} = step(:pull)
+      Process.send_after(self(), :due, 300)
+      assert_receive :due, 1_000
+
+      send(task, {:outcome, {:ok, "x/y:2"}})
+      answer(:stop, {:ok, %{was_running: true}})
+      answer(:start, {:ok, %{@started | container_id: "c2"}})
+      answer(:reclaim_image, {:ok, :ok})
+      assert {:ok, %{to: "2"}} = Task.await(t)
+
+      refute_receive {:step, :start, _, _}, 300
+      assert %{container_id: "c2"} = data(pid)
+    end
+
+    test "an install whose file cannot be written fails and leaves no process" do
+      slug = slug()
+      blocker = Path.join(AppFile.dir(), slug <> ".json.tmp")
+      File.mkdir_p!(blocker)
+      on_exit(fn -> File.rm_rf!(blocker) end)
+      {:ok, pid} = Instances.ensure(slug)
+      ref = Process.monitor(pid)
+
+      t = op(pid, {:install, %{config: app_config(slug)}})
+      answer(:pull, {:ok, "x/y:1"})
+
+      assert {:error, {:persist, :eisdir}} = Task.await(t)
+      assert_receive {:DOWN, ^ref, :process, ^pid, :normal}
+      assert :error = AppFile.read(slug)
+    end
+
+    test "an op on an installed app whose file cannot be written goes on, with a warning" do
+      {slug, pid} = started()
+      blocker = Path.join(AppFile.dir(), slug <> ".json.tmp")
+      File.mkdir_p!(blocker)
+      on_exit(fn -> File.rm_rf!(blocker) end)
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          t = op(pid, {:stop, %{}})
+          answer(:stop, {:ok, %{was_running: true}})
+          assert :ok = Task.await(t)
+        end)
+
+      assert log =~ "not saved"
+      assert %{wanted: :stopped} = data(pid)
+    end
+
+    test "a file that does not decode starts no process, and is logged" do
+      slug = slug()
+      path = Path.join(AppFile.dir(), slug <> ".json")
+      File.mkdir_p!(AppFile.dir())
+      File.write!(path, "{{{")
+      on_exit(fn -> File.rm(path) end)
+
+      assert ExUnit.CaptureLog.capture_log(fn -> assert :ignore = Instances.ensure(slug) end) =~
+               "cannot be read"
+    end
+
+    test "two apps that picked one dynamic port: the second to claim it fails its start" do
+      ingress = %{"ingress" => true, "ingress_port" => 0}
+      {a, pa} = installed(ingress)
+      {b, pb} = installed(ingress)
+      ta = op(pa, {:start, %{}})
+      assert_receive {:step, :port, %{slug: ^a}, port_a}, 2_000
+      tb = op(pb, {:start, %{}})
+      assert_receive {:step, :port, %{slug: ^b}, port_b}, 2_000
+
+      send(port_a, {:outcome, {:ok, 62_011}})
+      assert_receive {:step, :start, %{slug: ^a}, start_a}, 2_000
+      send(port_b, {:outcome, {:ok, 62_011}})
+
+      assert {:error, {:ingress_port, {:port_taken, {:ingress_port, 62_011}}}} =
+               Task.await(tb, 2_000)
+
+      send(start_a, {:outcome, {:ok, @started}})
+      assert :ok = Task.await(ta)
+      assert [{^pa, ^a}] = lookup({:ingress_port, 62_011})
     end
 
     test "a container event during an operation is handled once, after it" do
@@ -453,12 +664,34 @@ defmodule Vagus.App.ServerTest do
       assert :ok = Task.await(boot)
       assert %{wanted: :started, container_id: "c1"} = data(pid)
 
-      # Wanted started, with no container reported.
+      # Wanted started, and the engine lists no container.
       slug = slug()
       install_app(app_config(slug, %{"boot" => "manual"}), state: :started, process: false)
       {:ok, pid} = Instances.ensure(slug)
-      assert :ok = :gen_statem.call(pid, {:boot_start, %{}})
+      assert :ok = :gen_statem.call(pid, {:boot_start, %{running?: false}})
       assert %{wanted: :stopped} = data(pid)
+      refute_received {:step, :start, _, _}
+    end
+
+    test "a restarted process whose container the engine reports running starts it again" do
+      slug = slug()
+      install_app(app_config(slug, %{"boot" => "manual"}), state: :started, process: false)
+      {:ok, pid} = Instances.ensure(slug)
+      assert %{container_id: nil, token_hash: nil} = data(pid)
+
+      boot = op(pid, {:boot_start, %{running?: true}})
+      assert %{token: token} = answer(:start, {:ok, @started})
+      assert is_binary(token)
+      assert :ok = Task.await(boot)
+    end
+
+    test "a manual app the engine could not be asked about is left as it is" do
+      slug = slug()
+      install_app(app_config(slug, %{"boot" => "manual"}), state: :started, process: false)
+      {:ok, pid} = Instances.ensure(slug)
+
+      assert :ok = :gen_statem.call(pid, {:boot_start, %{running?: :unknown}})
+      assert %{wanted: :started} = data(pid)
       refute_received {:step, :start, _, _}
     end
 
@@ -523,6 +756,19 @@ defmodule Vagus.App.ServerTest do
       assert %{attempt: 1, strikes: 0} = data(pid)
     end
 
+    test "a probe in flight when an operation begins is killed, and its result dropped" do
+      {_slug, pid} = started(@watched, watchdog: true)
+      {_template, _input, task} = probed()
+      %{probe: {^task, ref}} = data(pid)
+      monitor = Process.monitor(task)
+
+      _stop = op(pid, {:stop, %{}})
+      step(:stop)
+      assert_receive {:DOWN, ^monitor, :process, ^task, :killed}
+      send(pid, {:probe, ref, :unhealthy})
+      assert %{probe: nil, strikes: 0} = data(pid)
+    end
+
     test "a probe past its deadline is a miss" do
       {_slug, pid} = started(@watched, watchdog: true)
       {_template, _input, task} = probed()
@@ -572,6 +818,41 @@ defmodule Vagus.App.ServerTest do
       status = Server.format_status(%{data: %{}, queue: queue, postponed: queue})
       refute inspect(status) =~ ~s("p")
       assert {{:call, ^from}, :info} = List.last(status.queue)
+    end
+
+    test "a crash reason keeps its shape and frames, not the arguments; the debug log is dropped" do
+      stack = [{Vagus.App.Policy, :advance, [%{token: "t0k"}, []], [line: 1]}]
+
+      reason =
+        {%FunctionClauseError{
+           module: Vagus.App.Policy,
+           function: :advance,
+           arity: 2,
+           args: ["t0k"]
+         }, stack}
+
+      status =
+        Server.format_status(%{data: %{}, reason: reason, log: [{:in, {:set, [options: "t0k"]}}]})
+
+      refute inspect(status) =~ "t0k"
+      assert {FunctionClauseError, [{Vagus.App.Policy, :advance, 2, [line: 1]}]} = status.reason
+      assert status.log == []
+    end
+
+    test "a step that dies is logged by the shape of its reason, never its terms" do
+      {_slug, pid} = installed()
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          t = op(pid, {:start, %{}})
+          {_input, task} = step(:start)
+          Process.exit(task, {:badarg, "t0k-s3cret"})
+          answer(:stop, {:ok, %{was_running: false}})
+          assert {:error, :died} = Task.await(t)
+        end)
+
+      assert log =~ "died: :badarg"
+      refute log =~ "t0k-s3cret"
     end
 
     test "a live process's status shows no token, option or service payload" do

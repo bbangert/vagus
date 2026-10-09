@@ -27,7 +27,9 @@ defmodule Vagus.App.OrchestratorTest do
         list: fn -> Agent.get(apps, & &1) end,
         install_default: fn _slug -> :present end,
         native?: & &1.native,
-        boot_start: &report.(:boot_start, &1),
+        boot_start: fn slug, _running? -> report.(:boot_start, slug) end,
+        running: fn -> {:ok, MapSet.new()} end,
+        inspect: fn _slug -> false end,
         halt: &report.(:halt, &1),
         ensure: fn _slug -> :ok end,
         in_flight?: fn -> false end,
@@ -153,7 +155,7 @@ defmodule Vagus.App.OrchestratorTest do
 
   test "an app whose start fails is reported failed and boot carries on" do
     start_orchestrator([app("a", "application")], %{
-      boot_start: fn _slug -> {:error, :no_image} end
+      boot_start: fn _slug, _running? -> {:error, :no_image} end
     })
 
     messages = collect_until(:complete)
@@ -164,8 +166,8 @@ defmodule Vagus.App.OrchestratorTest do
     test_pid = self()
 
     start = fn
-      "once" -> blocking(test_pid, :once_started).()
-      "slow" -> blocking(test_pid, :slow_started).()
+      "once", _running? -> blocking(test_pid, :once_started).()
+      "slow", _running? -> blocking(test_pid, :slow_started).()
     end
 
     start_orchestrator([app("once", "once"), app("slow", "services")], %{boot_start: start},
@@ -175,7 +177,70 @@ defmodule Vagus.App.OrchestratorTest do
     messages = collect_until(:complete)
     assert {:report, :services, [{"slow", :pending}]} in messages
     assert {:report, :application, []} in messages
-    assert_receive {:once_started, _pid}
+
+    # The unwaited start may land on either side of the push.
+    unless Enum.any?(messages, &match?({:once_started, _pid}, &1)),
+      do: assert_receive({:once_started, _pid})
+  end
+
+  describe "whether a container runs" do
+    defp report_running(test_pid),
+      do: fn slug, running? -> send(test_pid, {:boot_start, slug, running?}) && :ok end
+
+    test "is listed once after the engine gate, and each stage's apps are told theirs" do
+      test_pid = self()
+
+      running = fn ->
+        send(test_pid, :listed)
+        {:ok, MapSet.new(["app"])}
+      end
+
+      apps = [
+        app("app", "application"),
+        app("svc", "services"),
+        app("broker", "services", native: true)
+      ]
+
+      start_orchestrator(apps, %{boot_start: report_running(test_pid), running: running})
+      messages = collect_until(:complete)
+
+      assert [:listed] == Enum.filter(messages, &(&1 == :listed))
+
+      assert Enum.find_index(messages, &(&1 == :listed)) >
+               Enum.find_index(messages, &(&1 == {:gate, :engine}))
+
+      assert {:boot_start, "broker", :unknown} in messages
+      assert {:boot_start, "app", true} in messages
+      assert {:boot_start, "svc", false} in messages
+    end
+
+    test "a listing that fails tells every app :unknown" do
+      running = fn -> {:error, :engine_down} end
+
+      start_orchestrator([app("app", "application")], %{
+        boot_start: report_running(self()),
+        running: running
+      })
+
+      assert {:boot_start, "app", :unknown} in collect_until(:complete)
+    end
+
+    test "a process that restarted has its own container inspected before its boot rule" do
+      test_pid = self()
+
+      inspect = fn slug ->
+        send(test_pid, {:inspected, slug})
+        true
+      end
+
+      name =
+        start_orchestrator([], %{boot_start: report_running(test_pid), inspect: inspect})
+
+      assert %{phase: :up} = await_boot(name)
+      Orchestrator.up("late", name)
+      assert_receive {:inspected, "late"}
+      assert_receive {:boot_start, "late", true}
+    end
   end
 
   test "a gate that fails is retried until it passes" do
@@ -283,8 +348,8 @@ defmodule Vagus.App.OrchestratorTest do
     test_pid = self()
 
     start = fn
-      "svc" -> held(test_pid, :svc).()
-      slug -> send(test_pid, {:boot_start, slug}) && :ok
+      "svc", _running? -> held(test_pid, :svc).()
+      slug, _running? -> send(test_pid, {:boot_start, slug}) && :ok
     end
 
     apps = [

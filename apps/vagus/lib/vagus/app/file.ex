@@ -4,13 +4,15 @@ defmodule Vagus.App.File do
   by the app's own process: its config, whether it should run (`wanted`), the
   user's options and the seven per-install settings, the ingress token and
   the dynamic ingress port. The per-start token, container id and IP are
-  never written: an app process that restarts recreates its container.
+  never written: a restarted app process hears from the orchestrator whether
+  its container still runs, and starts a wanted one again under a fresh token.
 
   Loading never bricks a boot. `Config.parse/1` re-validates the config, so a
-  file it rejects, or one that is not JSON, is logged and skipped; every
-  other field decodes tolerantly to its default, except `protected`, which
-  falls back to `true` because it gates `full_access`, `host_pid` and
-  `docker_api`.
+  file it rejects, or one that is not JSON, is logged and its app is not
+  started; it is never taken for a slug with no file, which an install would
+  overwrite. Every other field decodes tolerantly to its default, except
+  `protected`, which falls back to `true` because it gates `full_access`,
+  `host_pid` and `docker_api`.
 
   `import_once/2` seeds the directory from the single `addons.json` earlier
   releases kept. That file is only ever read, so a reverted firmware boots
@@ -26,15 +28,15 @@ defmodule Vagus.App.File do
   @spec dir() :: String.t()
   def dir, do: Application.fetch_env!(:vagus, :app_files_dir)
 
-  @doc "`:error` when there is no file, or none that decodes."
-  @spec read(String.t(), String.t()) :: {:ok, map()} | :error
+  @doc "`:error` when there is no file; `{:error, reason}` for one that cannot be read or decoded."
+  @spec read(String.t(), String.t()) :: {:ok, map()} | :error | {:error, term()}
   def read(slug, dir \\ dir()) do
-    with true <- Config.valid_slug?(slug) || :error,
-         {:ok, content} <- read_file(path(dir, slug)),
-         {:ok, raw} <- decode_json(slug, content) do
-      decode(slug, raw)
+    if Config.valid_slug?(slug) do
+      with {:ok, content} <- read_file(path(dir, slug)),
+           {:ok, raw} <- decode_json(slug, content),
+           do: decode(slug, raw)
     else
-      _ -> :error
+      :error
     end
   end
 
@@ -50,7 +52,7 @@ defmodule Vagus.App.File do
 
       {:error, reason} ->
         Logger.warning("Vagus.App.File: could not read #{path}: #{inspect(reason)}")
-        :error
+        {:error, reason}
     end
   end
 
@@ -61,11 +63,13 @@ defmodule Vagus.App.File do
 
       {:error, reason} ->
         Logger.warning("Vagus.App.File: #{slug}'s file is not valid JSON (#{inspect(reason)})")
-        :error
+        {:error, :not_json}
     end
   end
 
   @doc "Writes atomically against a power cut: a tmp file, then a rename."
+  # The path is the configured directory plus a slug `Config.parse/1` accepted.
+  # sobelow_skip ["Traversal.FileModule"]
   @spec write(map(), String.t()) :: :ok | {:error, term()}
   def write(%{config: %Config{slug: slug}} = data, dir \\ dir()) do
     result =
@@ -189,7 +193,7 @@ defmodule Vagus.App.File do
 
   defp skip(slug) do
     Logger.warning("Vagus.App.File: skipping invalid or mismatched app #{inspect(slug)}")
-    :error
+    {:error, :invalid}
   end
 
   defp decode_wanted("started"), do: {:ok, :started}

@@ -10,7 +10,7 @@ defmodule Vagus.Test.FakeEngine do
   `start/1` takes an ordered list of canned responses — `{status, body}` (or
   `{status, body, delay: ms}` to hold the connection open before replying,
   for lock-contention tests that need an op to stay "in flight"), `body` a
-  map (JSON-encoded), a binary (sent raw — used for `/images/create`'s
+  map or list (JSON-encoded), a binary (sent raw — used for `/images/create`'s
   non-JSON streamed status lines), or `nil` (empty body) — consumed strictly
   in request-arrival order. Since every `Vagus.Core.Lifecycle` op issues a
   deterministic sequence of Engine-API calls (there's no unscripted
@@ -58,8 +58,8 @@ defmodule Vagus.Test.FakeEngine do
 
   @doc "Starts the fake daemon; returns a handle for `requests/1`/`stop/1`."
   @spec start([
-          {pos_integer(), map() | binary() | nil}
-          | {pos_integer(), map() | binary() | nil, keyword()}
+          {pos_integer(), map() | list() | binary() | nil}
+          | {pos_integer(), map() | list() | binary() | nil, keyword()}
         ]) ::
           map()
   def start(responses) when is_list(responses) do
@@ -270,7 +270,7 @@ defmodule Vagus.Test.FakeEngine do
   defp send_response(sock, status, body) when is_binary(body),
     do: send_raw(sock, status, "text/plain", body)
 
-  defp send_response(sock, status, body) when is_map(body),
+  defp send_response(sock, status, body) when is_map(body) or is_list(body),
     do: send_raw(sock, status, "application/json", Jason.encode!(body))
 
   defp send_raw(sock, status, content_type, body) do

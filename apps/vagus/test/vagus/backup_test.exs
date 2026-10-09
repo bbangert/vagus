@@ -62,6 +62,23 @@ defmodule Vagus.BackupTest do
     assert map["sub/nested.txt"] == "nested content"
   end
 
+  test "symlinks the app planted are skipped, never followed to host files", %{data: data} do
+    host = Path.join(Path.dirname(data), "host")
+    File.mkdir_p!(host)
+    File.write!(Path.join(host, "core_token.json"), "h0st-s3cret")
+    File.ln_s!(Path.join(host, "core_token.json"), Path.join(data, "token"))
+    File.ln_s!(host, Path.join(data, "sub/hostdir"))
+    File.write!(Path.join(data, ".hidden"), "dot")
+
+    {:ok, tar} = Backup.create(spec(data))
+    {:ok, %{data: files}} = Backup.extract_addon(tar, "core_mosquitto")
+
+    assert files |> Map.new() |> Map.keys() |> Enum.sort() ==
+             [".hidden", "options.json", "sub/nested.txt"]
+
+    refute inspect(files) =~ "h0st-s3cret"
+  end
+
   test "extract_addon on an absent add-on → :not_in_backup", %{data: data} do
     {:ok, tar} = Backup.create(spec(data))
     assert {:error, :not_in_backup} = Backup.extract_addon(tar, "core_ghost")
