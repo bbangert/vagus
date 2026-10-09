@@ -47,8 +47,7 @@ defmodule Vagus.Addon.Store.Refresher do
   grace.
 
   Gated by `config :vagus, :store_boot_refresh`, so `:host` and `:test` never
-  reach out to github and `start_link/1` returns `:ignore` — the same
-  convention `Vagus.Addon.BootStarter` uses.
+  reach out to github and `start_link/1` returns `:ignore`.
   """
 
   use GenServer

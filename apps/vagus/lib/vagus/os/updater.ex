@@ -7,7 +7,7 @@ defmodule Vagus.OS.Updater do
   event push, a free-space precheck, and the fresh-check-then-install
   discipline the router relies on.
 
-  Gated exactly like `Vagus.Core.Boot`: an unconditional child of
+  Gated: an unconditional child of
   `Vagus.Application` whose `start_link/1` returns `:ignore` unless
   `config :vagus, :os_updater` is set (only `config/target.exs` sets it —
   there is no firmware to update on `:host`/test). The public reads below

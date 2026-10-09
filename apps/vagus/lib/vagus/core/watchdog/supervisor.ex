@@ -10,8 +10,7 @@ defmodule Vagus.Core.Watchdog.Supervisor do
   The two halves are independent (separate counters, separate rate
   limits — see each module), so `:one_for_one`, not `:rest_for_one`.
 
-  Sits unconditionally in `Vagus.Application`'s children and follows the
-  `Vagus.Core.Boot`/`Vagus.Addon.BootStarter` convention: `init/1` returns
+  Sits unconditionally in `Vagus.Application`'s children: `init/1` returns
   `:ignore` unless `config :vagus, :core_watchdog` is set (only
   `config/target.exs` sets it — there is no real Core container to watch
   on `:host`/test). The runtime on/off switch is separate: the persisted

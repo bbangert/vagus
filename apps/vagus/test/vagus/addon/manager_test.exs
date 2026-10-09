@@ -464,7 +464,7 @@ defmodule Vagus.Addon.ManagerTest do
       assert unprotected_spec.pid_mode == "host"
     end
 
-    # `Update`/`DefaultProvider`/the install path all reach `do_start/2` with a
+    # `Update` and the install path both reach `do_start/2` with a
     # bare `Config` and no `:protected` opt — an explicit one must still win,
     # or the resolution would have to move a level up and those callers would
     # silently run protected.

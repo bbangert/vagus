@@ -14,8 +14,8 @@ defmodule Vagus.API.Listener do
   That address does not exist at boot. It is added with `ip addr add` onto
   the `hassio` bridge interface (`Vagus.Network.ensure_supervisor_ip/0`),
   which cannot happen before balena-engine is up and has created the
-  network — `Vagus.Addon.BootStarter` does it after its engine poll
-  succeeds, tens of seconds into a boot, long after `Vagus.Application`
+  network — boot's `network` gate (`Vagus.App.Gates.network/0`) does it
+  after the engine answers, tens of seconds into a boot, long after `Vagus.Application`
   starts this subtree. Binding a not-yet-configured address fails
   `:eaddrnotavail`, and a `Bandit` child that fails at `init` would take
   `Vagus.API.Supervisor` — and then, once its restart budget is spent, the
@@ -149,7 +149,7 @@ defmodule Vagus.API.Listener do
   next `:retry_ms` tick.
 
   Purely an optimisation, and deliberately one-directional:
-  `Vagus.Addon.BootStarter` knows the instant the anchor this listener binds
+  `Vagus.App.Gates.network/0` knows the instant the anchor this listener binds
   appears, and without a nudge up to `:retry_ms` of every boot is spent
   waiting for an attempt that would now succeed. A dropped, raced or ignored
   signal costs nothing — the retry timer still guarantees the bind and
@@ -174,7 +174,7 @@ defmodule Vagus.API.Listener do
 
   Proves it by connecting: a live `Vagus.API.Listener` process, or even a
   registered Bandit, only answers "something exists" — the question callers
-  actually have (`Vagus.Addon.BootStarter`) is whether an add-on's bashio
+  actually have (`Vagus.App.Gates.api/0`) is whether an add-on's bashio
   can reach `/addons/self/info` *now*. The bind comes from
   `bandit_options/1` so the probe cannot drift from what is bound.
 

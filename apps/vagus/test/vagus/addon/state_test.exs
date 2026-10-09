@@ -506,7 +506,7 @@ defmodule Vagus.Addon.StateTest do
     #
     # They are NOT the guard against the invariant breaking. They drive
     # `State.put/3` by hand, so they would pass unchanged if `Manager`,
-    # `BootStarter` or `Watchdog` started sourcing config from `Store`
+    # boot or `Watchdog` started sourcing config from `Store`
     # instead of `State` — verified by sabotaging `do_start_slug/2`, which
     # these three did not notice. The real guard is
     # `addon_lifecycle_router_test.exs`'s "a real stop/start never adopts the
@@ -517,7 +517,7 @@ defmodule Vagus.Addon.StateTest do
       assert {:ok, %{config: %{version: "7.1.0"}}} = State.get(c.slug, s)
 
       # The shape of a stop: read the persisted config back, write it with a
-      # new lifecycle state. Exactly what Manager/BootStarter/Watchdog do.
+      # new lifecycle state. Exactly what Manager, boot and Watchdog do.
       {:ok, %{config: persisted}} = State.get(c.slug, s)
       :ok = State.put(persisted, :stopped, server: s)
       assert {:ok, %{config: %{version: "7.1.0"}, state: :stopped}} = State.get(c.slug, s)

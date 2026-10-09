@@ -13,7 +13,7 @@ defmodule Vagus.Addon.WatchdogTest do
   whichever pid `config :vagus, :watchdog_test_pid` names (set in
   `setup/1`) and returns whatever `config :vagus, :watchdog_test_result_fun`
   says, the same "app-env as a cross-process test knob" trick
-  `Vagus.Addon.Backend.Fake`/`BootStarterTest` already use for swapping in
+  `Vagus.Addon.Backend.Fake` already uses for swapping in
   fakes app-wide.
   """
 

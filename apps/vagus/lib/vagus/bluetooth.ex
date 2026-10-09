@@ -18,8 +18,7 @@ defmodule Vagus.Bluetooth do
   Started from `target_children/0` only. `start_link/1` returns `:ignore`
   when either daemon binary is absent (e.g. a system built without
   `BR2_PACKAGE_BLUEZ5_UTILS`) so a misbuilt firmware degrades to "no
-  Bluetooth" instead of an app-toppling supervision crash loop — same
-  pattern as `Vagus.Addon.BootStarter`.
+  Bluetooth" instead of an app-toppling supervision crash loop.
 
   Phase 2 (vagus-improv): the tree's tail carries the Improv-over-BLE
   Wi-Fi provisioning group + its reaper (see `Vagus.Improv` /

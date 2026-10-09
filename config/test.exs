@@ -93,11 +93,12 @@ config :vagus, :backends, %{
 }
 
 # Add-on state stays in-memory (nil disables `Vagus.Addon.State` file
-# persistence) and boot reconciliation stays off (`Vagus.Addon.BootStarter`
-# `:ignore`s) — `mix test` has no real engine socket to poll and no
-# device-reboot scenario to reconcile (M4-P8-T1).
+# persistence). The Orchestrator's boot is off, so the app's own
+# Orchestrator only brings up app processes: tests that boot start their own
+# with injected units. Set here too because under a MIX_TARGET
+# config/target.exs loads first and turns it on.
 config :vagus, :addon_state_path, nil
-config :vagus, :addon_boot_start, false
+config :vagus, Vagus.App.Orchestrator, boot: false, default_native_app: nil
 
 # Per-run tmp dir, set here too because under a MIX_TARGET config/target.exs
 # loads first and would point the suite at the real `/run/vagus`.

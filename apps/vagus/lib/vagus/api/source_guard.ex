@@ -89,8 +89,7 @@ defmodule Vagus.API.SourceGuard do
 
   Gated by `config :vagus, :api_source_guard`, so `:host` and `:test` (which
   answer from `127.0.0.1` regardless) are unaffected and `start_link/1`
-  returns `:ignore` rather than running a timer nothing consults — the same
-  convention `Vagus.Addon.BootStarter` uses.
+  returns `:ignore` rather than running a timer nothing consults.
   """
 
   use GenServer

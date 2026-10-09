@@ -154,33 +154,33 @@ config :vagus, :api_bind_ip, "172.30.32.2"
 config :vagus, :supervisor_nat, true
 config :vagus, :token_path, "/data/vagus/token"
 
-# Add-on state persistence + boot reconciliation (M4-P8-T1). `/data` is a
+# Add-on state persistence (M4-P8-T1). `/data` is a
 # symlink to `/root` — fine for plain `File.read!/write!/rename` IO like
 # this, same as `:token_path` above; only a runc container *rootfs* path
 # (see `:addon_data_root` below) needs the real, non-symlinked `/root/...`
 # form.
 config :vagus, :addon_state_path, "/data/vagus/addons.json"
-config :vagus, :addon_boot_start, true
+
+# Boot starts apps and Core (`Vagus.App.Orchestrator`); off on :host/:test,
+# where there is no engine to wait on and no reboot to come back from. The
+# default native app is installed and started on its first boot, independent
+# of the container engine; afterwards it boots like any other app.
+config :vagus, Vagus.App.Orchestrator, boot: true, default_native_app: "core_mqtt"
 
 # tmpfs checkpoint of add-on registrations so a process restart loses nothing;
 # `Vagus.Application` wipes it at every app start (see `Vagus.RunState`).
 config :vagus, :run_state_dir, "/run/vagus"
 
-# Boot-time Core adoption (CL-P1-T2) — see config/host.exs's :core_versions_path
-# comment for why these config-gated boot-reconciliation modules stay off on
-# :host/:test; only target enables the poll-then-adopt GenServer.
-config :vagus, :core_boot, true
-
 # Core watchdog pair (CW-P2-T2): API probe + crash-loop event half
 # (`Vagus.Core.Watchdog.Supervisor` returns :ignore when unset — same
-# target-only convention as :core_boot above; there is no real Core
+# target-only convention as the Orchestrator's boot above; there is no real Core
 # container to watch on :host/:test). Runtime on/off lives separately in
 # the persisted TokenStore `watchdog` option (POST /core/options).
 config :vagus, :core_watchdog, true
 
 # First-boot provisioning (issue #40): auto-expand /data + auto-install/
 # start HA Core — see `Vagus.Provisioner` for the 4Kn/ordering rationale.
-# Same target-only `:ignore` convention as :core_boot/:core_watchdog above.
+# Same target-only `:ignore` convention as :core_watchdog above.
 config :vagus, :first_boot_provision, true
 
 # Boot-time swap (`Vagus.Host.Swap` — :ignore when unset, same target-only
@@ -206,7 +206,7 @@ config :vagus, :memory_monitor, true
 
 # Real /os/update (build-order #4): GitHub-releases OTA firmware updates
 # (`Vagus.OS.Updater` — :ignore when unset, same target-only convention
-# as :core_boot/:core_watchdog/:first_boot_provision above; there is no
+# as :core_watchdog/:first_boot_provision above; there is no
 # firmware to update on :host/:test).
 config :vagus, :os_updater, true
 
@@ -308,8 +308,8 @@ config :vagus, :dns_upstream, "1.1.1.1"
 # selects `BuiltinFetcher`, which serves builtin repos from an embedded config
 # and delegates the git-backed ones to the HTTP fetcher. The containerized
 # Mosquitto (`core_mosquitto`, from the official repo) stays in the catalog as a
-# reference but is never auto-installed (only `core_mqtt` is — see
-# `:default_native_addon`); both can't own `:1883`/the mqtt service at once.
+# reference but is never auto-installed (only `core_mqtt` is — see the
+# Orchestrator's `:default_native_app`); both can't own `:1883`/the mqtt service at once.
 config :vagus, :store_fetcher, Vagus.Addon.Store.BuiltinFetcher
 
 # The default set mirrors upstream's `BuiltinRepository`
@@ -331,11 +331,6 @@ config :vagus, :store_repositories, [
     ref: "main"
   }
 ]
-
-# Make the native mqttx broker the default MQTT provider (M5-P5):
-# `Vagus.Addon.DefaultProvider` auto-installs + boots this store slug on startup,
-# independent of the container engine.
-config :vagus, :default_native_addon, "core_mqtt"
 
 # NOTE: the Supervisor↔Core unix socket needs no config here. Its path is
 # `Vagus.Core.Container.socket_path/0` (`/run/supervisor/core.sock`, the

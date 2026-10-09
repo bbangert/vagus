@@ -129,8 +129,8 @@ defmodule Vagus.Addon.Manager do
   `{:error, {:reserved_slug, slug}}`. The check belongs here rather than only
   in `Config.parse/1` because `Vagus.API.Router`'s install handler overwrites
   the parsed config's slug with the one from the URL — this is the single
-  choke point every install path (`Vagus.Addon.Update`,
-  `Vagus.Addon.DefaultProvider`) goes through.
+  choke point every install path (`Vagus.Addon.Update`, `Vagus.App.install/1`)
+  goes through.
   """
   @spec install(Config.t(), keyword()) :: :ok | {:error, term()}
   def install(%Config{} = config, opts \\ []) do
@@ -164,8 +164,8 @@ defmodule Vagus.Addon.Manager do
   `{:error, {:registration_failed, :registry | :dns}}` returned.
 
   That failure leaves `Vagus.Addon.State` as the start found it, so an add-on
-  that was `:started` is still one `Vagus.Addon.Watchdog` and
-  `Vagus.Addon.BootStarter` will start.
+  that was `:started` is still one `Vagus.Addon.Watchdog` and the next boot
+  (`Vagus.App.Orchestrator`) will start.
 
   `opts[:register_retry]`/`opts[:deregister_retry]` (`{attempts, delay_ms}`)
   and `opts[:registration_call_timeout]` (ms) override the Registry/DNS call
@@ -181,8 +181,8 @@ defmodule Vagus.Addon.Manager do
     token = generate_token()
 
     # `protected` is resolved here rather than in `do_start_slug/2` because
-    # `Vagus.Addon.Update`, `Vagus.Addon.DefaultProvider` and the router's
-    # install path all reach `do_start/2` with a bare `Config` — resolving it
+    # `Vagus.Addon.Update` and the router's install path both reach
+    # `do_start/2` with a bare `Config` — resolving it
     # a level up would silently run those starts protected regardless of what
     # `POST /addons/{slug}/security` stored.
     opts =
@@ -225,7 +225,7 @@ defmodule Vagus.Addon.Manager do
 
   # A failed registration says nothing about whether the add-on should run,
   # and a `:stopped` left behind would end the Watchdog's remaining attempts
-  # and keep `BootStarter` from starting it at the next boot. `:stopped` still
+  # and keep the next boot from starting it. `:stopped` still
   # covers the removal, so the `die` it causes is not taken for a crash.
   defp undo_start(config, prior, opts) do
     retry = Keyword.get(opts, :register_retry, @register_retry)
