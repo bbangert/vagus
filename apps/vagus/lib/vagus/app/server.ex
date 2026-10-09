@@ -49,6 +49,7 @@ defmodule Vagus.App.Server do
     :restart,
     :update,
     :backup,
+    :restore,
     :uninstall,
     :halt,
     :resume,
@@ -675,6 +676,9 @@ defmodule Vagus.App.Server do
 
   defp redact_event({type, {:set, changes}}) when is_list(changes),
     do: {type, {:set, Enum.map(changes, fn {key, _value} -> {key, :redacted} end)}}
+
+  defp redact_event({type, {:restore, %{options: options} = args}}) when options != nil,
+    do: {type, {:restore, %{args | options: :redacted}}}
 
   defp redact_event({type, {:test_token, _token}}), do: {type, {:test_token, :redacted}}
   defp redact_event(event), do: event

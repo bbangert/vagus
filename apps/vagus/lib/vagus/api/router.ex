@@ -3386,6 +3386,11 @@ defmodule Vagus.API.Router do
   end
 
   defp restore_error_message(message) when is_binary(message), do: message
+  defp restore_error_message({:restore, addon_slug, :busy}), do: busy_message(addon_slug)
+
+  defp restore_error_message({:restore, addon_slug, reason}),
+    do: "Restore of addon #{addon_slug} failed: #{inspect(reason)}"
+
   defp restore_error_message(reason), do: inspect(reason)
 
   # path is internal/config-derived, not request input

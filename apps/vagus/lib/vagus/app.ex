@@ -463,22 +463,26 @@ defmodule Vagus.App do
     command(slug, :backup, args)
   end
 
-  @spec stop_for_backup(String.t(), keyword()) :: :ok | {:error, term()}
-  def stop_for_backup(slug, opts \\ []),
-    do: slug |> command(:stop, Map.new(Keyword.take(opts, @backup_opts))) |> unsaved_ok()
+  @doc """
+  Replaces the app's data with `staging_dir`, a sibling of its data dir, and
+  its options with `options` (`nil` keeps them), by its own `restore`
+  operation: stop, swap, set, and a start when `start?`. The app is busy
+  throughout, so nothing else, an uninstall included, acts on it mid-restore.
+  """
+  @spec restore(String.t(), Path.t(), map() | nil, boolean(), keyword()) ::
+          :ok | {:error, term()}
+  def restore(slug, staging_dir, options, start?, opts \\ []) do
+    args =
+      opts
+      |> Keyword.take(@backup_opts)
+      |> Map.new()
+      |> Map.merge(%{staging_dir: staging_dir, options: options, start?: start?})
 
-  @spec start_after_backup(String.t(), keyword()) :: {:ok, map()} | {:error, term()}
-  def start_after_backup(slug, opts \\ []) do
-    slug
-    |> command(:start, Map.new(Keyword.take(opts, @backup_opts)))
-    |> unsaved_ok()
-    |> started(slug)
+    command(slug, :restore, args)
   end
 
-  # The container was stopped or started as asked. A restore ends what it
-  # began, and failing on the unsaved state would strand its app stopped;
-  # boot would report a running app as failed. The process has logged the
-  # save.
+  # The container was started as asked, and boot would report a running app
+  # as failed. The process has logged the save.
   defp unsaved_ok({:error, {:persist, _reason}}), do: :ok
   defp unsaved_ok(result), do: result
 

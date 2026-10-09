@@ -158,6 +158,27 @@ defmodule Vagus.App.Steps do
     end
   end
 
+  # The old data is set aside, not removed, until the new is in place, so a
+  # failed rename leaves the app's data as it was. The staging dir is a
+  # sibling of the data dir, so each rename stays on one filesystem. A failed
+  # swap removes the staged data itself, as its caller may be gone.
+  # path is internal/config-derived, not request input
+  # sobelow_skip ["Traversal.FileModule"]
+  defp step(:swap_data, %{config: config, staging_dir: staging} = input) do
+    data_dir = data_dir(data_root(opts(input)), config.slug)
+    aside = staging <> ".old"
+
+    with :ok <- set_aside(data_dir, aside),
+         :ok <- swap_in(staging, data_dir, aside) do
+      File.rm_rf(aside)
+      {:ok, data_dir}
+    else
+      error ->
+        File.rm_rf(staging)
+        error
+    end
+  end
+
   # Never fails the op: the update has already succeeded, and the likely
   # failure is the engine refusing an image another container still uses.
   defp step(:reclaim_image, %{old: old, config: new} = input) do
@@ -240,6 +261,24 @@ defmodule Vagus.App.Steps do
     case Store.get(slug) do
       {:ok, %{repository: repository}} when is_binary(repository) -> repository
       _absent_or_unshaped -> "core"
+    end
+  end
+
+  # path is internal/config-derived, not request input
+  # sobelow_skip ["Traversal.FileModule"]
+  defp set_aside(data_dir, aside) do
+    case File.rename(data_dir, aside) do
+      {:error, :enoent} -> :ok
+      result -> result
+    end
+  end
+
+  # path is internal/config-derived, not request input
+  # sobelow_skip ["Traversal.FileModule"]
+  defp swap_in(staging, data_dir, aside) do
+    with {:error, _reason} = error <- File.rename(staging, data_dir) do
+      File.rename(aside, data_dir)
+      error
     end
   end
 

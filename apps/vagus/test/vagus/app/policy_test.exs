@@ -451,6 +451,16 @@ defmodule Vagus.App.PolicyTest do
         {:restart, %{}, [{:stop, nil}, {:port?, nil}, {:mint_token, nil}, {:start, nil}]},
         {:uninstall, %{}, [{:stop, nil}, {:delete_file, nil}, {:remove_app, nil}]},
         {:halt, %{}, [{:halt_stop, nil}]},
+        {:restore, %{start?: false}, [{:stop, nil}, {:swap_data, nil}, {:set_options, nil}]},
+        {:restore, %{start?: true},
+         [
+           {:stop, nil},
+           {:swap_data, nil},
+           {:set_options, nil},
+           {:port?, nil},
+           {:mint_token, nil},
+           {:start, nil}
+         ]},
         {:update, %{config: app_config(%{"version" => "2"})},
          [{:pull, nil}, {:stop, nil}, {:commit, nil}, {:start?, nil}, {:reclaim_image, nil}]},
         {:update, %{config: app_config(%{"version" => "2"}), backup: true},
@@ -595,6 +605,48 @@ defmodule Vagus.App.PolicyTest do
       {data, effects} = step(data, {:ok, %{was_running: true}})
       assert effects == [{:emit, :stopped}, :persist, {:reply, :ok}, :idle]
       assert data.container_id == nil
+    end
+
+    test "restore: stop, swap the staged data in, save the options, then start with them" do
+      args = %{staging_dir: "/s", options: %{"o" => 2}, start?: true}
+
+      {data, effects} =
+        begin(:restore, args, running(%{token_hash: "h", user_options: %{"o" => 1}}))
+
+      assert List.last(effects) == {:step, {:stop, nil}}
+      assert %{wanted: :stopped, token_hash: nil} = data
+
+      {data, effects} = step(data, {:ok, %{was_running: true}})
+      assert List.last(effects) == {:step, {:swap_data, nil}}
+      assert %{staging_dir: "/s"} = Policy.task_input({:swap_data, nil}, data)
+
+      {data, effects} = step(data, {:ok, "/data/addons/data/app_one"})
+      assert [:persist, {:keys, [{:token, _hash}], []}, {:step, {:start, nil}}] = effects
+      assert %{user_options: %{"o" => 2}} = Policy.task_input({:start, nil}, data)
+
+      {data, effects} = step(data, {:ok, %{container_id: "c2", ip: @ip}})
+      assert Enum.take(effects, -3) == [:persist, {:reply, :ok}, :idle]
+      assert data.wanted == :started
+    end
+
+    test "restore without options or a start keeps the options and leaves the app stopped" do
+      args = %{staging_dir: "/s", options: nil, start?: false}
+      {data, _} = begin(:restore, args, running(%{user_options: %{"o" => 1}}))
+      {data, _} = step(data, {:ok, %{was_running: true}})
+      {data, effects} = step(data, {:ok, "/data/addons/data/app_one"})
+
+      assert effects == [:persist, {:reply, :ok}, :idle]
+      assert %{wanted: :stopped, user_options: %{"o" => 1}} = data
+    end
+
+    test "restore: a failed swap ends it before the options are touched" do
+      args = %{staging_dir: "/s", options: %{"o" => 2}, start?: true}
+      {data, _} = begin(:restore, args, running(%{user_options: %{"o" => 1}}))
+      {data, _} = step(data, {:ok, %{was_running: true}})
+      {data, effects} = step(data, {:error, :exdev})
+
+      assert effects == [:persist, {:reply, {:error, :exdev}}, :idle]
+      assert %{user_options: %{"o" => 1}, wanted: :stopped} = data
     end
 
     test "5-8. update with a backup: pull, stop, snapshot, commit, start fails, rollback" do
@@ -1059,6 +1111,7 @@ defmodule Vagus.App.PolicyTest do
             :snapshot,
             :exec_hook,
             :unpause,
+            :swap_data,
             :remove_app,
             :reclaim_image
           ],

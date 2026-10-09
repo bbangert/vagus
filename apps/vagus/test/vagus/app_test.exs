@@ -294,26 +294,66 @@ defmodule Vagus.AppTest do
     end
   end
 
-  describe "stop_for_backup/2 and start_after_backup/2" do
-    # A cold backup that failed on the save would leave the app stopped.
-    test "a state that cannot be saved does not fail them" do
-      slug = track(config())
-      blocker = Path.join(AppFile.dir(), slug <> ".json.tmp")
-      File.mkdir_p!(blocker)
-      on_exit(fn -> File.rm_rf!(blocker) end)
+  describe "restore/5" do
+    setup do
       stub_app_steps()
+      :ok
+    end
 
-      capture_log(fn ->
-        stop = Task.async(fn -> App.stop_for_backup(slug) end)
-        assert_receive {:step, :stop, _input, stopping}, 5_000
-        send(stopping, {:outcome, {:ok, %{was_running: true}}})
-        assert :ok = Task.await(stop)
+    test "stops, swaps the data in and starts with the restored options" do
+      slug = track(config(), state: :started, options: %{"a" => 1})
+      restore = Task.async(fn -> App.restore(slug, "/staging", %{"a" => 2}, true) end)
 
-        start = Task.async(fn -> App.start_after_backup(slug) end)
-        assert_receive {:step, :start, _input, starting}, 5_000
-        send(starting, {:outcome, {:ok, %{container_id: "c1"}}})
-        assert {:ok, %{slug: ^slug}} = Task.await(start)
-      end)
+      answer(:stop, {:ok, %{was_running: true}})
+      assert %{staging_dir: "/staging"} = answer(:swap_data, {:ok, "/data"})
+      assert %{user_options: %{"a" => 2}} = answer(:start, {:ok, %{container_id: "c2"}})
+
+      assert :ok = Task.await(restore)
+
+      assert {:ok, %{state: :started, wanted: :started, user_options: %{"a" => 2}}} =
+               app_info(slug)
+
+      assert {:ok, %{user_options: %{"a" => 2}}} = AppFile.read(slug)
+    end
+
+    test "a backup of a stopped app leaves it stopped, and nil options keep the current ones" do
+      slug = track(config(), state: :started, options: %{"a" => 1})
+      restore = Task.async(fn -> App.restore(slug, "/staging", nil, false) end)
+
+      answer(:stop, {:ok, %{was_running: true}})
+      answer(:swap_data, {:ok, "/data"})
+
+      assert :ok = Task.await(restore)
+      refute_received {:step, :start, _input, _task}
+
+      assert {:ok, %{state: :stopped, wanted: :stopped, user_options: %{"a" => 1}}} =
+               app_info(slug)
+    end
+
+    test "a failed swap fails the restore before the options or a start" do
+      slug = track(config(), state: :started, options: %{"a" => 1})
+      restore = Task.async(fn -> App.restore(slug, "/staging", %{"a" => 2}, true) end)
+
+      answer(:stop, {:ok, %{was_running: true}})
+      answer(:swap_data, {:error, :exdev})
+
+      assert {:error, :exdev} = Task.await(restore)
+      refute_received {:step, :start, _input, _task}
+      assert {:ok, %{user_options: %{"a" => 1}}} = app_info(slug)
+    end
+
+    test "a busy app refuses it, and an uninstall is refused mid-restore" do
+      slug = track(config(), state: :started)
+      restore = Task.async(fn -> App.restore(slug, "/staging", nil, false) end)
+      assert_receive {:step, :stop, _input, stopping}, 5_000
+
+      assert {:error, :busy} = App.restore(slug, "/other", nil, false)
+      assert {:error, :busy} = App.uninstall(slug)
+
+      send(stopping, {:outcome, {:ok, %{was_running: true}}})
+      answer(:swap_data, {:ok, "/data"})
+      assert :ok = Task.await(restore)
+      assert App.installed?(slug)
     end
   end
 

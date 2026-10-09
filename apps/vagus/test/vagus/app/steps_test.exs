@@ -761,6 +761,57 @@ defmodule Vagus.App.StepsTest do
     end
   end
 
+  describe "swap_data" do
+    @describetag :tmp_dir
+
+    defp swap_dirs(ctx) do
+      data_dir = Path.join([ctx.data_root, "addons", "data", "test_app"])
+      staging = Path.join([ctx.data_root, "addons", "data", ".restore-test_app-1"])
+      File.mkdir_p!(data_dir)
+      File.write!(Path.join(data_dir, "db"), "old")
+      File.mkdir_p!(staging)
+      File.write!(Path.join(staging, "db"), "new")
+      {data_dir, staging}
+    end
+
+    defp siblings(data_dir), do: data_dir |> Path.dirname() |> File.ls!() |> Enum.sort()
+
+    test "the staged data replaces the data dir and nothing is left beside it", ctx do
+      {data_dir, staging} = swap_dirs(ctx)
+
+      assert {:ok, ^data_dir} = Steps.run(:swap_data, input(ctx, %{staging_dir: staging}))
+      assert File.ls!(data_dir) == ["db"]
+      assert File.read!(Path.join(data_dir, "db")) == "new"
+      assert siblings(data_dir) == ["test_app"]
+    end
+
+    test "an app with no data dir yet gets the staged one", ctx do
+      {data_dir, staging} = swap_dirs(ctx)
+      File.rm_rf!(data_dir)
+
+      assert {:ok, ^data_dir} = Steps.run(:swap_data, input(ctx, %{staging_dir: staging}))
+      assert File.read!(Path.join(data_dir, "db")) == "new"
+    end
+
+    test "a failed swap removes the staged data and leaves the data dir as it was", ctx do
+      {data_dir, staging} = swap_dirs(ctx)
+      File.mkdir_p!(Path.join(staging <> ".old", "taken"))
+
+      assert {:error, _reason} = Steps.run(:swap_data, input(ctx, %{staging_dir: staging}))
+      assert File.read!(Path.join(data_dir, "db")) == "old"
+      refute File.exists?(staging)
+    end
+
+    test "a rename that fails leaves the data dir as it was", ctx do
+      {data_dir, staging} = swap_dirs(ctx)
+      File.rm_rf!(staging)
+
+      assert {:error, :enoent} = Steps.run(:swap_data, input(ctx, %{staging_dir: staging}))
+      assert File.read!(Path.join(data_dir, "db")) == "old"
+      assert siblings(data_dir) == ["test_app"]
+    end
+  end
+
   describe "reclaim_image" do
     test "removes the superseded image only when the ref changed" do
       old = test_config()

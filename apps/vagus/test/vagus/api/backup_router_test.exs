@@ -558,6 +558,49 @@ defmodule Vagus.API.BackupRouterTest do
       assert conn.status == 400
       assert body(conn)["message"] =~ "not in backup"
     end
+
+    test "a busy app fails the restore with upstream's busy text naming it", %{data_root: dr} do
+      install("core_restore_busy", dr)
+      slug = create_backup("core_restore_busy")
+      stub_app_steps()
+      stopping = Task.async(fn -> Vagus.App.stop("core_restore_busy") end)
+      assert_receive {:step, :stop, _input, held}, 5_000
+
+      conn =
+        supervisor_call(:post, "/backups/#{slug}/restore/partial", %{
+          "addons" => ["core_restore_busy"]
+        })
+
+      assert conn.status == 400
+
+      assert body(conn)["message"] ==
+               "Another job is running for job group app_core_restore_busy"
+
+      send(held, {:outcome, {:ok, %{was_running: true}}})
+      assert :ok = Task.await(stopping)
+    end
+
+    test "a failed restore names the app and the cause", %{data_root: dr} do
+      install("core_restore_fail", dr)
+      slug = create_backup("core_restore_fail")
+      stub_app_steps()
+
+      restore =
+        Task.async(fn ->
+          supervisor_call(:post, "/backups/#{slug}/restore/partial", %{
+            "addons" => ["core_restore_fail"]
+          })
+        end)
+
+      assert_receive {:step, :stop, _input, task}, 5_000
+      send(task, {:outcome, {:ok, %{was_running: true}}})
+      assert_receive {:step, :swap_data, _input, task}, 5_000
+      send(task, {:outcome, {:error, :exdev}})
+
+      conn = Task.await(restore)
+      assert conn.status == 400
+      assert body(conn)["message"] == "Restore of addon core_restore_fail failed: :exdev"
+    end
   end
 
   # The save path validates posted options against the add-on's schema; until
@@ -627,9 +670,8 @@ defmodule Vagus.API.BackupRouterTest do
       conn =
         supervisor_call(:post, "/backups/#{slug}/restore/partial", %{"addons" => ["core_sch_bad"]})
 
-      # The restore is NOT failed — the data dir is already swapped by the
-      # time options are written, and a half-restored add-on is worse than one
-      # that kept its current options.
+      # The restore is not failed: a schema that tightened since the backup
+      # must not cost the user the data they restored.
       assert conn.status == 200
       assert File.read!(Path.join(data_dir, "f.txt")) == "hello"
       assert {:ok, %{user_options: %{"greeting" => 42}}} = app_info("core_sch_bad")

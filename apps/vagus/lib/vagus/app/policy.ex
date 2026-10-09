@@ -124,6 +124,7 @@ defmodule Vagus.App.Policy do
     snapshot: 600_000,
     exec_hook: 120_000,
     unpause: 30_000,
+    swap_data: 60_000,
     remove_app: 120_000,
     reclaim_image: 60_000
   }
@@ -489,6 +490,12 @@ defmodule Vagus.App.Policy do
 
   defp steps(:halt, _args, _data), do: [{:halt_stop, nil}]
 
+  # The backup decides whether the app ends running, as it decides its data.
+  defp steps(:restore, args, _data) do
+    start = if args[:start?], do: start_steps(), else: []
+    [{:stop, nil}, {:swap_data, nil}, {:set_options, nil}] ++ start
+  end
+
   defp steps(:update, args, _data) do
     snapshot = if args[:backup], do: [{:snapshot, nil}], else: []
 
@@ -596,6 +603,12 @@ defmodule Vagus.App.Policy do
   defp run_step({:rollback_config, _}, data, effects),
     do: reconfigure(data, data.run.acc.old, data.ingress_port, effects)
 
+  defp run_step({:set_options, _}, %{run: %{args: %{options: options}}} = data, effects)
+       when is_map(options),
+       do: advance(%{data | user_options: options}, effects ++ [:persist])
+
+  defp run_step({:set_options, _}, data, effects), do: advance(data, effects)
+
   # Run by the process itself, which feeds its result back as this step's
   # outcome.
   defp run_step({:delete_file, _} = step, data, effects),
@@ -630,7 +643,7 @@ defmodule Vagus.App.Policy do
 
   defp before_task({name, _}, data) when name in [:stop, :halt_stop] do
     {data, effects} = drop_run_keys(data)
-    data = if data.run.op == :stop, do: %{data | wanted: :stopped}, else: data
+    data = if data.run.op in [:stop, :restore], do: %{data | wanted: :stopped}, else: data
     {data, effects ++ cancel_timers()}
   end
 
@@ -752,6 +765,8 @@ defmodule Vagus.App.Policy do
     do: fail(data, {:backup_pre_failed, reason}, [])
 
   defp on_outcome(:backup, :exec_hook, :post, _outcome, data), do: advance(data, [])
+  defp on_outcome(:restore, :swap_data, _, {:ok, _dir}, data), do: advance(data, [])
+  defp on_outcome(:restore, :swap_data, _, {:error, reason}, data), do: fail(data, reason, [])
   defp on_outcome(:update, :reclaim_image, _, _outcome, data), do: advance(data, [])
   # The commit point of an uninstall: from here nothing writes the file
   # again, so nothing that follows can bring the app back.
@@ -780,7 +795,7 @@ defmodule Vagus.App.Policy do
 
   defp started(data, fact) do
     run = data.run
-    wanted = if run.op == :start, do: :started, else: data.wanted
+    wanted = if run.op in [:start, :restore], do: :started, else: data.wanted
     attempt = if run.args[:retry], do: data.attempt, else: 0
 
     data = %{
@@ -881,6 +896,7 @@ defmodule Vagus.App.Policy do
   defp input(:exec_hook, :pre, data), do: %{cmd: data.config.backup_pre}
   defp input(:exec_hook, :post, data), do: %{cmd: data.config.backup_post}
   defp input(:reclaim_image, _arg, data), do: %{old: data.run.acc.old}
+  defp input(:swap_data, _arg, data), do: %{staging_dir: data.run.args.staging_dir}
   defp input(_name, _arg, _data), do: %{}
 
   # A container still running at the snapshot is a hot backup's, paused

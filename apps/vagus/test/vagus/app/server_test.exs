@@ -765,6 +765,28 @@ defmodule Vagus.App.ServerTest do
     end
   end
 
+  describe "restore" do
+    test "revokes the old token before the stop and saves the options before the start" do
+      {slug, pid} = started()
+      old = data(pid).token_hash
+      args = %{staging_dir: "/s", options: %{"greeting" => "restored"}, start?: true}
+      t = op(pid, {:restore, args})
+
+      {_input, task} = step(:stop)
+      assert lookup({:token, old}) == []
+      send(task, {:outcome, {:ok, %{was_running: true}}})
+      assert %{staging_dir: "/s"} = answer(:swap_data, {:ok, "/data"})
+
+      {input, task} = step(:start)
+      assert {:ok, %{user_options: %{"greeting" => "restored"}}} = AppFile.read(slug)
+      assert [{^pid, ^slug}] = lookup({:token, Policy.hash(input.token)})
+      send(task, {:outcome, {:ok, @started}})
+
+      assert :ok = Task.await(t)
+      assert {:ok, %{state: :started, user_options: %{"greeting" => "restored"}}} = App.info(slug)
+    end
+  end
+
   describe "update" do
     @v1 %{
       "version" => "1",
@@ -1015,6 +1037,7 @@ defmodule Vagus.App.ServerTest do
         {{:call, from}, {:provide_service, "mqtt", %{"password" => "p"}}},
         {{:call, from}, {:add_discovery, "mqtt", %{"password" => "p"}}},
         {{:call, from}, {:set, [options: %{"password" => "p"}]}},
+        {{:call, from}, {:restore, %{staging_dir: "/s", options: %{"password" => "p"}}}},
         {{:call, from}, :info}
       ]
 

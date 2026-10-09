@@ -11,6 +11,7 @@ defmodule Vagus.BackupsTest do
   """
   use ExUnit.Case, async: false
 
+  import ExUnit.CaptureLog
   import Vagus.AppFixtures
 
   alias Vagus.Addon.{Backend, Config}
@@ -335,7 +336,7 @@ defmodule Vagus.BackupsTest do
 
       assert File.read!(Path.join(dd, "keep.txt")) == "original"
       refute File.exists?(Path.join(dd, "extra.txt"))
-      assert {:ok, %{user_options: %{"greet" => "hi"}}} = app_info(slug)
+      assert {:ok, %{state: :started, user_options: %{"greet" => "hi"}}} = app_info(slug)
 
       calls = @backend.calls()
       assert Enum.any?(calls, &match?({:stop, "addon_" <> ^slug}, &1))
@@ -345,8 +346,7 @@ defmodule Vagus.BackupsTest do
     # Intended, not incidental: `protected` is a per-install security setting,
     # not add-on data, so a restore of the add-on's `/data` must not silently
     # re-grant (or revoke) device access the user set independently. Only
-    # `POST /addons/{slug}/security` moves it — `finish_restore/3` reaches
-    # `State.put_options/2` alone.
+    # `POST /addons/{slug}/security` moves it; a restore sets the options alone.
     test "a restore leaves the add-on's protection mode untouched", %{
       data_root: dr,
       server: server
@@ -391,6 +391,111 @@ defmodule Vagus.BackupsTest do
                )
 
       refute Enum.any?(@backend.calls(), &match?({:start, _}, &1))
+      assert {:ok, %{state: :stopped}} = app_info(slug)
+    end
+
+    test "backed-up options the installed schema rejects are dropped; the data still restores",
+         %{data_root: dr, server: server} do
+      slug = "core_restore_schema"
+      install(slug, dr, :stopped, %{"greet" => "hi"}, %{"schema" => %{"greet" => "str"}})
+      File.write!(Path.join(data_dir(dr, slug), "f.txt"), "backed up")
+      {:ok, backup_slug} = Backups.create_partial(nil, [slug], server: server, data_root: dr)
+
+      install(slug, dr, :stopped, %{"greet" => 42}, %{"schema" => %{"greet" => "int"}})
+      File.write!(Path.join(data_dir(dr, slug), "f.txt"), "since")
+
+      log =
+        capture_log(fn ->
+          assert :ok = Backups.restore_partial(backup_slug, [slug], server: server, data_root: dr)
+        end)
+
+      assert log =~ "keeping the current options"
+      assert File.read!(Path.join(data_dir(dr, slug), "f.txt")) == "backed up"
+      assert {:ok, %{user_options: %{"greet" => 42}}} = app_info(slug)
+    end
+
+    # Backed up while running, so the restore starts it again.
+    defp backed_up_app(slug, dr, server) do
+      install(slug, dr, :started, %{"greet" => "hi"})
+      File.write!(Path.join(data_dir(dr, slug), "f.txt"), "backed up")
+      {:ok, backup_slug} = Backups.create_partial(nil, [slug], server: server, data_root: dr)
+      File.write!(Path.join(data_dir(dr, slug), "f.txt"), "since")
+      set_app(slug, options: %{"greet" => "since"})
+      stub_app_steps()
+      backup_slug
+    end
+
+    defp restore_leftovers(dr),
+      do:
+        dr |> Path.join("addons/data") |> File.ls!() |> Enum.filter(&String.starts_with?(&1, "."))
+
+    test "a running app is stopped, swapped and started by its own op, in that order", %{
+      data_root: dr,
+      server: server
+    } do
+      slug = "core_restore_running"
+      backup_slug = backed_up_app(slug, dr, server)
+
+      restore =
+        Task.async(fn ->
+          Backups.restore_partial(backup_slug, [slug], server: server, data_root: dr)
+        end)
+
+      assert_receive {:step, :stop, %{slug: ^slug}, task}, 5_000
+      send(task, {:outcome, {:ok, %{was_running: true}}})
+      assert_receive {:step, :swap_data, %{staging_dir: staging}, task}, 5_000
+      assert Path.dirname(staging) == Path.dirname(data_dir(dr, slug))
+      assert File.read!(Path.join(staging, "f.txt")) == "backed up"
+      send(task, {:outcome, {:ok, data_dir(dr, slug)}})
+      assert_receive {:step, :start, %{user_options: %{"greet" => "hi"}}, task}, 5_000
+      send(task, {:outcome, {:ok, %{container_id: "c2"}}})
+
+      assert :ok = Task.await(restore)
+      assert restore_leftovers(dr) == []
+      assert {:ok, %{state: :started, user_options: %{"greet" => "hi"}}} = app_info(slug)
+    end
+
+    test "a busy app aborts the restore by name, its data untouched", %{
+      data_root: dr,
+      server: server
+    } do
+      slug = "core_restore_busy"
+      backup_slug = backed_up_app(slug, dr, server)
+      stopping = Task.async(fn -> Vagus.App.stop(slug) end)
+      assert_receive {:step, :stop, %{slug: ^slug}, held}, 5_000
+
+      assert {:error, {:restore, ^slug, :busy}} =
+               Backups.restore_partial(backup_slug, [slug], server: server, data_root: dr)
+
+      assert File.read!(Path.join(data_dir(dr, slug), "f.txt")) == "since"
+      assert restore_leftovers(dr) == []
+
+      send(held, {:outcome, {:ok, %{was_running: true}}})
+      assert :ok = Task.await(stopping)
+    end
+
+    test "a failed swap fails the restore before the options or a start", %{
+      data_root: dr,
+      server: server
+    } do
+      slug = "core_restore_swap"
+      backup_slug = backed_up_app(slug, dr, server)
+
+      restore =
+        Task.async(fn ->
+          Backups.restore_partial(backup_slug, [slug], server: server, data_root: dr)
+        end)
+
+      assert_receive {:step, :stop, %{slug: ^slug}, task}, 5_000
+      send(task, {:outcome, {:ok, %{was_running: true}}})
+      assert_receive {:step, :swap_data, _input, task}, 5_000
+      send(task, {:outcome, {:error, :exdev}})
+
+      assert {:error, {:restore, ^slug, :exdev}} = Task.await(restore)
+      refute_received {:step, :start, _input, _task}
+      assert File.read!(Path.join(data_dir(dr, slug), "f.txt")) == "since"
+      assert restore_leftovers(dr) == []
+      assert {:ok, %{user_options: %{"greet" => "since"}}} = app_info(slug)
     end
 
     test "restore onto a not-installed slug errors", %{data_root: dr, server: server} do
