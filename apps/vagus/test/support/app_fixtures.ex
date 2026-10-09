@@ -178,8 +178,27 @@ defmodule Vagus.AppFixtures do
   @spec forget_app(String.t()) :: :ok
   def forget_app(slug) do
     :ok = AppFile.delete(slug)
+    pids = for {pid, _value} <- Registry.lookup(Vagus.App.Directory, {:slug, slug}), do: pid
     :ok = Instances.stop(slug)
     :ok = AppFile.delete(slug)
+    Enum.each(pids, &await_directory_forgets(&1, slug))
+  end
+
+  # The Registry drops a dead process's keys when it handles the DOWN message,
+  # after the synchronous stop returns, and a unique-key lookup does not
+  # filter dead pids in the meantime.
+  defp await_directory_forgets(pid, slug, waited \\ 0) do
+    cond do
+      Registry.keys(Vagus.App.Directory, pid) == [] ->
+        :ok
+
+      waited >= 1_000 ->
+        raise "directory still holds keys of stopped app #{slug} after #{waited} ms"
+
+      true ->
+        Process.sleep(5)
+        await_directory_forgets(pid, slug, waited + 5)
+    end
   end
 
   @doc "Hands every app step to the calling test through `Vagus.App.StepsStub`."
