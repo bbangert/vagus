@@ -104,6 +104,13 @@ defmodule Vagus.Addon.Backend.Fake do
     :ok
   end
 
+  @doc "`Vagus.Runtime.Docker.exec/3`'s shape, passed as `docker:` so a hook lands in the same record."
+  @spec exec(String.t(), String.t(), keyword()) :: :ok
+  def exec(id, cmd, _opts \\ []) do
+    record({:exec, id, cmd})
+    :ok
+  end
+
   @impl true
   def remove_image(image, _opts \\ []) do
     record({:remove_image, image})

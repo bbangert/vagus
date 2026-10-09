@@ -375,7 +375,12 @@ defmodule Vagus.App.StepsTest do
 
   setup context do
     :persistent_term.put({FakeBackend, :pid}, self())
-    on_exit(fn -> :persistent_term.erase({FakeBackend, :state}) end)
+
+    on_exit(fn ->
+      for key <- [:state, :stop],
+          do: :persistent_term.erase({FakeBackend, key})
+    end)
+
     data_root = Path.join(context[:tmp_dir] || System.tmp_dir!(), "data")
     %{data_root: data_root}
   end
@@ -589,6 +594,30 @@ defmodule Vagus.App.StepsTest do
       refute_received {:remove, _}
     end
 
+    # A restore swaps the data dir next: only a container that is gone or
+    # stopped is safe, and a stop the engine failed may have left it writing.
+    test "a strict stop fails on an engine error, and passes an absent or stopped container",
+         ctx do
+      strict = Map.put(input(ctx), :strict, true)
+
+      for ok <- [:ok, {:error, {:http, 404}}] do
+        :persistent_term.put({FakeBackend, :stop}, fn -> ok end)
+        assert {:ok, %{was_running: true}} = Steps.run(:stop, strict)
+        assert_received {:remove, "addon_test_app"}
+      end
+
+      for failure <- [{:http, 500}, :econnrefused] do
+        :persistent_term.put({FakeBackend, :stop}, fn -> {:error, failure} end)
+
+        log = capture_log(fn -> assert {:error, ^failure} = Steps.run(:stop, strict) end)
+        assert log =~ "stop addon_test_app failed"
+        refute_received {:remove, _id}
+
+        capture_log(fn -> assert {:ok, _fact} = Steps.run(:stop, input(ctx)) end)
+        assert_received {:remove, "addon_test_app"}
+      end
+    end
+
     test "pull pulls the arch-resolved image", ctx do
       assert {:ok, image} = Steps.run(:pull, Map.put(input(ctx), :arch, "amd64"))
       assert image == "homeassistant/amd64-addon-test:3"
@@ -647,6 +676,19 @@ defmodule Vagus.App.StepsTest do
 
       assert {:error, {:exec, 3}} =
                Steps.run(:exec_hook, input(ctx, %{cmd: "fail 3", docker: DockerSpy}))
+
+      assert {:error, {:exec_create_failed, 409, _}} =
+               Steps.run(:exec_hook, input(ctx, %{cmd: "status 409", docker: DockerSpy}))
+    end
+
+    test "exec_hook with no container skips the hook", ctx do
+      log =
+        capture_log(fn ->
+          assert {:ok, :skipped} =
+                   Steps.run(:exec_hook, input(ctx, %{cmd: "status 404", docker: DockerSpy}))
+        end)
+
+      assert log =~ "no container addon_test_app; backup hook skipped"
     end
 
     test "snapshot writes <slug>.tar.gz of the data dir into the staging dir", ctx do
@@ -677,6 +719,149 @@ defmodule Vagus.App.StepsTest do
 
       assert %{"state" => "started", "user" => %{"options" => %{"greeting" => "yo"}}} =
                Jason.decode!(entries["./addon.json"])
+    end
+
+    defp members(path) do
+      {:ok, entries} = :erl_tar.extract(String.to_charlist(path), [:memory, :compressed])
+      Map.new(entries, fn {name, bin} -> {to_string(name), bin} end)
+    end
+
+    defp snapshot_input(ctx, extra) do
+      input(ctx, Map.merge(%{staging_dir: Path.join(ctx.tmp_dir, "staging")}, extra))
+    end
+
+    test "addon.json's system block carries the restore-required keys", ctx do
+      assert {:ok, path} = Steps.run(:snapshot, snapshot_input(ctx, %{}))
+      system = Jason.decode!(members(path)["./addon.json"])["system"]
+
+      assert %{"slug" => "test_app", "repository" => "core", "arch" => [_ | _]} = system
+      assert Map.has_key?(system, "name") and Map.has_key?(system, "version")
+    end
+  end
+
+  describe "swap_data" do
+    @describetag :tmp_dir
+
+    defp swap_dirs(ctx) do
+      data_dir = Path.join([ctx.data_root, "addons", "data", "test_app"])
+      staging = Path.join([ctx.data_root, "addons", "data", ".restore-test_app-1"])
+      File.mkdir_p!(data_dir)
+      File.write!(Path.join(data_dir, "db"), "old")
+      File.mkdir_p!(staging)
+      File.write!(Path.join(staging, "db"), "new")
+      {data_dir, staging}
+    end
+
+    defp siblings(data_dir), do: data_dir |> Path.dirname() |> File.ls!() |> Enum.sort()
+
+    test "the staged data replaces the data dir", ctx do
+      {data_dir, staging} = swap_dirs(ctx)
+
+      assert {:ok, ^data_dir} = Steps.run(:swap_data, input(ctx, %{staging_dir: staging}))
+      assert File.ls!(data_dir) == ["db"]
+      assert File.read!(Path.join(data_dir, "db")) == "new"
+      assert siblings(data_dir) == ["test_app"]
+    end
+
+    test "a staging path that is not this app's restore sibling is refused untouched", ctx do
+      {data_dir, staging} = swap_dirs(ctx)
+      elsewhere = Path.join(ctx.tmp_dir, ".restore-test_app-1")
+      File.mkdir_p!(elsewhere)
+      other_app = Path.join(Path.dirname(data_dir), ".restore-other_app-1")
+      File.mkdir_p!(other_app)
+
+      for bad <- [elsewhere, other_app, staging <> "x", staging <> "/../test_app"] do
+        assert {:error, :bad_staging} = Steps.run(:swap_data, input(ctx, %{staging_dir: bad}))
+      end
+
+      assert File.read!(Path.join(data_dir, "db")) == "old"
+      assert File.dir?(elsewhere) and File.dir?(other_app) and File.dir?(staging)
+    end
+
+    test "an app with no data dir yet gets the staged one", ctx do
+      {data_dir, staging} = swap_dirs(ctx)
+      File.rm_rf!(data_dir)
+
+      assert {:ok, ^data_dir} = Steps.run(:swap_data, input(ctx, %{staging_dir: staging}))
+      assert File.read!(Path.join(data_dir, "db")) == "new"
+    end
+
+    # Upstream's wipe-then-extract has no rollback either; the caller retries.
+    test "a rename that fails is the step's error, with the data dir already gone", ctx do
+      {data_dir, staging} = swap_dirs(ctx)
+      File.rm_rf!(staging)
+
+      assert {:error, :enoent} = Steps.run(:swap_data, input(ctx, %{staging_dir: staging}))
+      assert siblings(data_dir) == []
+    end
+
+    # A name too long for the filesystem fails for root too, unlike a mode.
+    test "a data dir it cannot remove is the step's error; the path is only logged", ctx do
+      File.mkdir_p!(ctx.data_root)
+      root = Path.join(ctx.data_root, String.duplicate("x", 300))
+      parent = Path.join([root, "addons", "data"])
+      data_dir = Path.join(parent, "test_app")
+
+      input =
+        input(ctx, %{data_root: root, staging_dir: Path.join(parent, ".restore-test_app-1")})
+
+      log =
+        capture_log(fn ->
+          assert {:error, {:remove_data_dir, :enametoolong}} = Steps.run(:swap_data, input)
+        end)
+
+      assert log =~ data_dir
+    end
+  end
+
+  describe "set_options" do
+    defp schema_config(schema) do
+      {:ok, config} =
+        Config.parse(%{
+          "name" => "Test",
+          "version" => "1",
+          "slug" => "test_app",
+          "description" => "d",
+          "arch" => ["amd64"],
+          "options" => %{"greet" => "hi"},
+          "schema" => schema
+        })
+
+      config
+    end
+
+    test "options the config in hand accepts are returned raw" do
+      config = schema_config(%{"greet" => "str"})
+      raw = %{"greet" => "hello", "extra" => 1}
+
+      assert {:ok, ^raw} =
+               Steps.run(:set_options, %{config: config, options: raw, job: nil, stage: nil})
+    end
+
+    test "options the config in hand rejects keep the current ones, with a warning" do
+      config = schema_config(%{"greet" => "int"})
+
+      log =
+        capture_log(fn ->
+          assert {:ok, nil} =
+                   Steps.run(:set_options, %{
+                     config: config,
+                     options: %{"greet" => "hello"},
+                     job: nil,
+                     stage: nil
+                   })
+        end)
+
+      assert log =~ "test_app's backed-up options do not validate"
+      assert log =~ "keeping the current options"
+    end
+
+    # An app without a schema accepts any map, but a tar's options are its own.
+    test "options that are not a map keep the current ones, schema or not" do
+      for schema <- [%{"greet" => "str"}, false] do
+        input = %{config: schema_config(schema), options: ["x"], job: nil, stage: nil}
+        capture_log(fn -> assert {:ok, nil} = Steps.run(:set_options, input) end)
+      end
     end
   end
 
@@ -726,13 +911,18 @@ defmodule Vagus.App.StepsTest do
     # A name too long for the filesystem fails for root too, unlike a mode.
     # Its parent must exist: lookup stops at a missing one with `:enoent`,
     # which `rm_rf` takes as already removed.
-    test "a data dir it cannot remove is the step's error, naming the path", ctx do
+    test "a data dir it cannot remove is the step's error; the path is only logged", ctx do
       File.mkdir_p!(ctx.data_root)
       root = Path.join(ctx.data_root, String.duplicate("x", 300))
       data_dir = Path.join([root, "addons", "data", "test_app"])
 
-      assert {:error, {:remove_data_dir, ^data_dir, :enametoolong}} =
-               Steps.run(:remove_app, input(ctx, %{data_root: root}))
+      log =
+        capture_log(fn ->
+          assert {:error, {:remove_data_dir, :enametoolong}} =
+                   Steps.run(:remove_app, input(ctx, %{data_root: root}))
+        end)
+
+      assert log =~ data_dir
     end
 
     test "refuses to rm_rf outside the data dir for an unsafe slug", ctx do
@@ -786,7 +976,7 @@ defmodule Vagus.App.StepsTest do
     def stop(id, opts \\ []) do
       notify({:stop, id})
       notify({:stop, id, opts})
-      :ok
+      :persistent_term.get({__MODULE__, :stop}, fn -> :ok end).()
     end
 
     @impl true
@@ -812,6 +1002,10 @@ defmodule Vagus.App.StepsTest do
   defmodule DockerSpy do
     @moduledoc false
     def exec(_id, "fail " <> code, _opts), do: {:error, {:exec, String.to_integer(code)}}
+
+    def exec(_id, "status " <> status, _opts),
+      do: {:error, {:exec_create_failed, String.to_integer(status), "refused"}}
+
     def exec(id, cmd, _opts), do: send(self(), {:exec, id, cmd}) && :ok
   end
 

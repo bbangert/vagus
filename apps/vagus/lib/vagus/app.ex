@@ -20,7 +20,7 @@ defmodule Vagus.App do
 
   # The only options that mean anything to an operation from a backup; the
   # rest of `Vagus.Backups`' opts (`:server`, `:date`, `:extra`) are its own.
-  @backup_opts [:backend, :data_root, :socket]
+  @backup_opts [:backend, :docker, :data_root, :socket]
 
   @type entry :: map()
   @type update_result :: %{slug: String.t(), from: String.t(), to: String.t()}
@@ -370,22 +370,75 @@ defmodule Vagus.App do
   def halt(slug), do: command(slug, :halt, %{})
 
   @doc """
-  Updates `slug` to the store's current version. The pre-update backup runs
-  first, while the app is idle, since stopping and starting it for a cold
-  backup are operations of its own.
+  Updates `slug` to the store's current version. With `backup: true` the
+  update op snapshots the stopped app into a backup staged here, kept even
+  when the update then rolls back: it holds the version the user had. An
+  update done whose backup could not be stored is `{:error,
+  {:backup_not_stored, reason}}`; the update stands.
   """
   @spec update(String.t(), keyword()) :: {:ok, update_result()} | {:error, term()}
   def update(slug, opts) do
     with {:ok, installed} <- installed(slug),
          {:ok, target} <- store_target(slug),
          # Only the precheck matters here: whether the target can be applied.
-         %{} <- Policy.plan(:update, %{config: target}, installed),
-         :ok <- maybe_backup(slug, installed, opts) do
-      args =
-        opts |> Keyword.take([:job, :jobs_server, :backend, :data_root, :socket]) |> Map.new()
+         %{} <- Policy.plan(:update, %{config: target}, installed) do
+      report_stage(opts, "validate_options", 5)
 
-      command(slug, :update, Map.put(args, :config, target))
+      args =
+        opts
+        |> Keyword.take([:job, :jobs_server, :backend, :data_root, :socket])
+        |> Map.new()
+        |> Map.put(:config, target)
+
+      if Keyword.get(opts, :backup, false),
+        do: update_with_backup(slug, installed.config.version, args, opts),
+        else: command(slug, :update, args)
     end
+  end
+
+  defp update_with_backup(slug, version, args, opts) do
+    backups = Application.get_env(:vagus, :backups_module, Vagus.Backups)
+
+    case backups.begin_partial("addon_#{slug}_#{version}", Keyword.take(opts, [:server])) do
+      {:ok, handle} ->
+        args = Map.merge(args, %{backup: true, staging_dir: handle.staging_dir})
+        command(slug, :update, args) |> keep_backup(backups, handle, slug)
+
+      {:error, reason} ->
+        {:error, {:backup_failed, reason}}
+    end
+  end
+
+  # A failed snapshot may have staged part of a file.
+  defp keep_backup({:error, {:backup_failed, _reason}} = result, backups, handle, _slug) do
+    backups.discard_partial(handle)
+    result
+  end
+
+  # The update stands either way; the caller asked for a backup and must hear
+  # that it has none.
+  defp keep_backup({:ok, _update} = result, backups, handle, slug) do
+    case backups.finish_partial(handle, [slug]) do
+      {:ok, _backup_slug} -> result
+      {:error, reason} -> {:error, {:backup_not_stored, reason}}
+    end
+  end
+
+  # The update's own failure is the answer. One that failed before its
+  # snapshot staged nothing, which `finish_partial` reports as `:not_staged`.
+  defp keep_backup(result, backups, handle, slug) do
+    case backups.finish_partial(handle, [slug]) do
+      {:ok, _backup_slug} ->
+        :ok
+
+      {:error, {:not_staged, ^slug}} ->
+        :ok
+
+      {:error, reason} ->
+        Logger.error("App #{slug}: the pre-update backup was not stored: #{inspect(reason)}")
+    end
+
+    result
   end
 
   defp installed(slug) do
@@ -404,23 +457,6 @@ defmodule Vagus.App do
     end
   end
 
-  defp maybe_backup(slug, installed, opts) do
-    report_stage(opts, "validate_options", 5)
-
-    if Keyword.get(opts, :backup, false) do
-      report_stage(opts, "backup", 10)
-      name = "addon_#{slug}_#{installed.config.version}"
-      backups = Application.get_env(:vagus, :backups_module, Vagus.Backups)
-
-      case backups.create_partial(name, [slug], Keyword.take(opts, [:server, :data_root])) do
-        {:ok, _backup_slug} -> :ok
-        {:error, reason} -> {:error, {:backup_failed, reason}}
-      end
-    else
-      :ok
-    end
-  end
-
   defp report_stage(opts, stage, progress) do
     Vagus.Jobs.update(
       Keyword.get(opts, :job),
@@ -429,22 +465,39 @@ defmodule Vagus.App do
     )
   end
 
-  @spec stop_for_backup(String.t(), keyword()) :: :ok | {:error, term()}
-  def stop_for_backup(slug, opts \\ []),
-    do: slug |> command(:stop, Map.new(Keyword.take(opts, @backup_opts))) |> unsaved_ok()
-
-  @spec start_after_backup(String.t(), keyword()) :: {:ok, map()} | {:error, term()}
-  def start_after_backup(slug, opts \\ []) do
-    slug
-    |> command(:start, Map.new(Keyword.take(opts, @backup_opts)))
-    |> unsaved_ok()
-    |> started(slug)
+  @doc """
+  Snapshots the app into `<staging_dir>/<slug>.tar.gz` by its own `backup`
+  operation, which stops and starts a cold app itself: a caller that dies
+  mid-backup cannot leave it stopped.
+  """
+  @spec backup(String.t(), Path.t(), keyword()) :: {:ok, Path.t()} | {:error, term()}
+  def backup(slug, staging_dir, opts \\ []) do
+    args = opts |> Keyword.take(@backup_opts) |> Map.new() |> Map.put(:staging_dir, staging_dir)
+    command(slug, :backup, args)
   end
 
-  # The container was stopped or started as asked. A backup ends what it
-  # began, and failing on the unsaved state would strand a cold backup's app
-  # stopped; boot would report a running app as failed. The process has
-  # logged the save.
+  @doc """
+  Replaces the app's data with `staging_dir`, a sibling of its data dir, and
+  its options with the backed-up `options`, by its own `restore` operation:
+  stop, swap, set, and a start when `start?`. The options are validated against the config current in the op; `nil`, options
+  it rejects, or an options write since the op began keep the current ones.
+  The app is busy throughout, so no other operation, an uninstall included,
+  runs on it mid-restore.
+  """
+  @spec restore(String.t(), Path.t(), map() | nil, boolean(), keyword()) ::
+          :ok | {:error, term()}
+  def restore(slug, staging_dir, options, start?, opts \\ []) do
+    args =
+      opts
+      |> Keyword.take(@backup_opts)
+      |> Map.new()
+      |> Map.merge(%{staging_dir: staging_dir, options: options, start?: start?})
+
+    command(slug, :restore, args)
+  end
+
+  # The container was started as asked, and boot would report a running app
+  # as failed. The process has logged the save.
   defp unsaved_ok({:error, {:persist, _reason}}), do: :ok
   defp unsaved_ok(result), do: result
 

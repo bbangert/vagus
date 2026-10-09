@@ -2774,6 +2774,10 @@ defmodule Vagus.API.Router do
     do: {404, "Addon #{slug} is no longer available in the store"}
 
   defp update_failure(_slug, {:persist, _reason} = reason), do: app_failure(reason)
+
+  defp update_failure(_slug, {:backup_not_stored, reason}),
+    do: {500, "The update succeeded, but its backup could not be stored: #{inspect(reason)}"}
+
   defp update_failure(_slug, other), do: {400, update_error_message(other)}
 
   defp update_error_message(:no_update_available), do: "No update available for this addon"
@@ -2847,8 +2851,8 @@ defmodule Vagus.API.Router do
   defp app_failure({:persist, reason}),
     do: {500, "The app's state could not be saved: #{inspect(reason)}"}
 
-  defp app_failure({:remove_data_dir, path, reason}),
-    do: {500, "The app was uninstalled but #{path} could not be removed (#{inspect(reason)})"}
+  defp app_failure({:remove_data_dir, reason}),
+    do: {500, "The app was uninstalled but its data could not be removed (#{inspect(reason)})"}
 
   defp app_failure(reason), do: {400, inspect(reason)}
 
@@ -3326,6 +3330,17 @@ defmodule Vagus.API.Router do
   defp backup_new_error_message({:not_installed, addon_slug}),
     do: "Addon #{addon_slug} is not installed"
 
+  defp backup_new_error_message({:busy, addon_slug}), do: busy_message(addon_slug)
+
+  defp backup_new_error_message({:backup_failed, addon_slug, :shutting_down}),
+    do: "Backup of addon #{addon_slug} was interrupted: the system is shutting down"
+
+  defp backup_new_error_message({:staging, reason}),
+    do: "Backup could not be staged: #{inspect(reason)}"
+
+  defp backup_new_error_message({:backup_failed, addon_slug, reason}),
+    do: "Backup of addon #{addon_slug} failed: #{inspect(reason)}"
+
   defp backup_new_error_message(reason), do: inspect(reason)
 
   defp handle_backup_restore(conn, slug, params) do
@@ -3381,6 +3396,20 @@ defmodule Vagus.API.Router do
   end
 
   defp restore_error_message(message) when is_binary(message), do: message
+  defp restore_error_message({:restore, addon_slug, :busy}), do: busy_message(addon_slug)
+
+  defp restore_error_message({:restore, addon_slug, :shutting_down}),
+    do: "Restore of addon #{addon_slug} was interrupted: the system is shutting down"
+
+  defp restore_error_message({:restore, addon_slug, {:staging, reason}}),
+    do: "Restore of addon #{addon_slug} could not stage its data: #{inspect(reason)}"
+
+  defp restore_error_message({:restore, addon_slug, {:remove_data_dir, reason}}),
+    do: "Restore of addon #{addon_slug} could not clear its data: #{inspect(reason)}"
+
+  defp restore_error_message({:restore, addon_slug, reason}),
+    do: "Restore of addon #{addon_slug} failed: #{inspect(reason)}"
+
   defp restore_error_message(reason), do: inspect(reason)
 
   # path is internal/config-derived, not request input

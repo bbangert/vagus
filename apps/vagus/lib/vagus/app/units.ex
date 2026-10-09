@@ -45,6 +45,26 @@ defmodule Vagus.App.Units do
     exception -> Logger.error("Apps not imported: #{Exception.message(exception)}")
   end
 
+  # Only the first boot in a VM can find staging an earlier VM left with no
+  # backup still writing it. A later one is the orchestrator restarted alone,
+  # under app processes that may be mid-backup or mid-restore: wiping their
+  # live staging loses a backup or fails a swap, where an orphan costs only
+  # disk until reboot.
+  @swept {__MODULE__, :swept}
+
+  # Boot must go on without the sweep.
+  @spec sweep() :: :ok
+  def sweep do
+    unless :persistent_term.get(@swept, false) do
+      :persistent_term.put(@swept, true)
+      Vagus.Backups.sweep_stale()
+    end
+
+    :ok
+  rescue
+    exception -> Logger.error("Stale backup staging not swept: #{Exception.message(exception)}")
+  end
+
   # One app whose process cannot start must not take the others down with it.
   @spec ensure(String.t()) :: :ok
   def ensure(slug) do

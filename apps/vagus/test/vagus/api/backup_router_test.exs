@@ -19,6 +19,7 @@ defmodule Vagus.API.BackupRouterTest do
 
   import Vagus.AppFixtures
 
+  alias Vagus.Addon.Backend.Fake
   alias Vagus.Addon.Config
   alias Vagus.Backups
 
@@ -28,8 +29,9 @@ defmodule Vagus.API.BackupRouterTest do
     prev_backend = Application.get_env(:vagus, :addon_backend)
     Application.put_env(:vagus, :addon_backend, Vagus.Addon.Backend.Fake)
 
-    data_root =
-      Path.join(System.tmp_dir!(), "vagus-backup-rt-#{System.unique_integer([:positive])}")
+    # Nested, so the staging root beside the data root is this test's own.
+    base = Path.join(System.tmp_dir!(), "vagus-backup-rt-#{System.unique_integer([:positive])}")
+    data_root = Path.join(base, "data")
 
     prev_root = Application.get_env(:vagus, :addon_data_root)
     Application.put_env(:vagus, :addon_data_root, data_root)
@@ -47,15 +49,15 @@ defmodule Vagus.API.BackupRouterTest do
         else: Application.delete_env(:vagus, :addon_data_root)
 
       Backups.set_dir(prev_dir)
-      File.rm_rf(data_root)
+      File.rm_rf(base)
     end)
 
     %{data_root: data_root}
   end
 
-  defp fixture_config(slug) do
+  defp fixture_config(slug, overrides \\ %{}) do
     {:ok, config} =
-      Config.parse(%{
+      %{
         "name" => "Test Addon",
         "version" => "1.0",
         "slug" => slug,
@@ -63,13 +65,15 @@ defmodule Vagus.API.BackupRouterTest do
         "arch" => ["amd64"],
         "image" => "homeassistant/{arch}-addon-test",
         "host_network" => true
-      })
+      }
+      |> Map.merge(overrides)
+      |> Config.parse()
 
     config
   end
 
-  defp install(slug, data_root, state \\ :started) do
-    config = fixture_config(slug)
+  defp install(slug, data_root, state \\ :started, overrides \\ %{}) do
+    config = fixture_config(slug, overrides)
     install_app(config, state: state)
 
     data_dir = Path.join([data_root, "addons", "data", slug])
@@ -250,6 +254,43 @@ defmodule Vagus.API.BackupRouterTest do
       assert conn.status == 400
       assert body(conn)["message"] =~ "ghost"
       assert Backups.list() == []
+    end
+
+    test "a cold app is stopped and started again by its own op; a hot one is left running", %{
+      data_root: dr
+    } do
+      install("core_rt_cold", dr, :started, %{"backup" => "cold"})
+      install("core_rt_hot", dr)
+      Fake.reset_calls()
+
+      conn =
+        supervisor_call(:post, "/backups/new/partial", %{
+          "addons" => ["core_rt_cold", "core_rt_hot"]
+        })
+
+      assert conn.status == 200, conn.resp_body
+      cold = Enum.map(Fake.calls_for("addon_core_rt_cold"), &elem(&1, 0))
+      assert [:stop, :remove | started] = cold
+      assert :start in started
+      assert {:ok, %{state: :started}} = app_info("core_rt_cold")
+
+      assert Fake.calls_for("addon_core_rt_hot") == []
+    end
+
+    test "a busy app fails the backup with upstream's busy text naming it", %{data_root: dr} do
+      install("core_rt_busy", dr)
+      stub_app_steps()
+      stopping = Task.async(fn -> Vagus.App.stop("core_rt_busy") end)
+      assert_receive {:step, :stop, _input, held}, 5_000
+
+      conn = supervisor_call(:post, "/backups/new/partial", %{"addons" => ["core_rt_busy"]})
+
+      assert conn.status == 400
+      assert body(conn)["message"] == "Another job is running for job group app_core_rt_busy"
+      assert Backups.list() == []
+
+      send(held, {:outcome, {:ok, %{was_running: true}}})
+      assert :ok = Task.await(stopping)
     end
 
     test "addons: \"ALL\" resolves to every installed slug", %{data_root: dr} do
@@ -517,6 +558,87 @@ defmodule Vagus.API.BackupRouterTest do
       assert conn.status == 400
       assert body(conn)["message"] =~ "not in backup"
     end
+
+    for {label, members} <- [
+          {"a malformed addon.json",
+           [{~c"./addon.json", ~s({"user":"bad"})}, {~c"./data/f.txt", "from the backup"}]},
+          {"an inner tar without addon.json", [{~c"./data/f.txt", "from the backup"}]},
+          {"an unsafe data member", [{~c"./addon.json", "{}"}, {~c"./data/../../x", "out"}]}
+        ] do
+      test "#{label} -> 400 naming the app, its data untouched", %{data_root: dr} do
+        install("core_restore_malformed", dr)
+        inner = Path.join(System.tmp_dir!(), "vagus-inner-#{System.unique_integer([:positive])}")
+
+        :ok =
+          :erl_tar.create(String.to_charlist(inner), unquote(Macro.escape(members)), [
+            :compressed
+          ])
+
+        File.write!(
+          Path.join(Backups.dir(), "malform1.tar"),
+          raw_tar([
+            {"./backup.json", Jason.encode!(%{"slug" => "malform1", "name" => "upload"})},
+            {"./core_restore_malformed.tar.gz", File.read!(inner)}
+          ])
+        )
+
+        File.rm!(inner)
+        :ok = Backups.reload()
+
+        conn =
+          supervisor_call(:post, "/backups/malform1/restore/partial", %{
+            "addons" => ["core_restore_malformed"]
+          })
+
+        assert conn.status == 400
+        assert body(conn)["message"] == "Addon core_restore_malformed's backup is malformed"
+        data_dir = Path.join([dr, "addons", "data", "core_restore_malformed"])
+        assert File.read!(Path.join(data_dir, "f.txt")) == "hello"
+      end
+    end
+
+    test "a busy app fails the restore with upstream's busy text naming it", %{data_root: dr} do
+      install("core_restore_busy", dr)
+      slug = create_backup("core_restore_busy")
+      stub_app_steps()
+      stopping = Task.async(fn -> Vagus.App.stop("core_restore_busy") end)
+      assert_receive {:step, :stop, _input, held}, 5_000
+
+      conn =
+        supervisor_call(:post, "/backups/#{slug}/restore/partial", %{
+          "addons" => ["core_restore_busy"]
+        })
+
+      assert conn.status == 400
+
+      assert body(conn)["message"] ==
+               "Another job is running for job group app_core_restore_busy"
+
+      send(held, {:outcome, {:ok, %{was_running: true}}})
+      assert :ok = Task.await(stopping)
+    end
+
+    test "a failed restore names the app and the cause", %{data_root: dr} do
+      install("core_restore_fail", dr)
+      slug = create_backup("core_restore_fail")
+      stub_app_steps()
+
+      restore =
+        Task.async(fn ->
+          supervisor_call(:post, "/backups/#{slug}/restore/partial", %{
+            "addons" => ["core_restore_fail"]
+          })
+        end)
+
+      assert_receive {:step, :stop, _input, task}, 5_000
+      send(task, {:outcome, {:ok, %{was_running: true}}})
+      assert_receive {:step, :swap_data, _input, task}, 5_000
+      send(task, {:outcome, {:error, :exdev}})
+
+      conn = Task.await(restore)
+      assert conn.status == 400
+      assert body(conn)["message"] == "Restore of addon core_restore_fail failed: :exdev"
+    end
   end
 
   # The save path validates posted options against the add-on's schema; until
@@ -586,9 +708,8 @@ defmodule Vagus.API.BackupRouterTest do
       conn =
         supervisor_call(:post, "/backups/#{slug}/restore/partial", %{"addons" => ["core_sch_bad"]})
 
-      # The restore is NOT failed — the data dir is already swapped by the
-      # time options are written, and a half-restored add-on is worse than one
-      # that kept its current options.
+      # The restore is not failed: a schema that tightened since the backup
+      # must not cost the user the data they restored.
       assert conn.status == 200
       assert File.read!(Path.join(data_dir, "f.txt")) == "hello"
       assert {:ok, %{user_options: %{"greeting" => 42}}} = app_info("core_sch_bad")

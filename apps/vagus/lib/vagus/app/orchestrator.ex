@@ -5,8 +5,10 @@ defmodule Vagus.App.Orchestrator do
   task. Every step is idempotent, so a boot task that crashes stops this
   process, and its supervisor's restart simply boots again.
 
-  Its start imports the apps an older Vagus recorded (`Vagus.App.File`) and
-  ensures a process per saved app, whether or not it then boots.
+  Its start sweeps the staging an interrupted backup or restore left
+  (`Vagus.App.Units.sweep/0`, once per VM and only when it boots), imports
+  the apps an older Vagus recorded (`Vagus.App.File`) and ensures a process
+  per saved app, whether or not it then boots.
 
   Boot:
 
@@ -132,6 +134,9 @@ defmodule Vagus.App.Orchestrator do
       |> Keyword.merge(opts)
 
     cfg = cfg |> Map.new() |> Map.update!(:units, &Map.new/1)
+    # Before any app process exists and before the API tree (a later sibling
+    # of this one) can admit a backup or restore whose staging it would wipe.
+    if cfg.boot, do: Map.get(cfg.units, :sweep, &Units.sweep/0).()
     # Here, not in the task, so this tree is not reported started until every
     # app process exists.
     Map.get(cfg.units, :import, &Units.import/0).()
@@ -228,8 +233,7 @@ defmodule Vagus.App.Orchestrator do
     do: %{state | phase: :booting, task: Task.async(fn -> run_boot(state.cfg) end)}
 
   # Runs outside this process, so a crash here does not cut the stop short.
-  defp begin_stop(state) do
-    %{cfg: cfg, deadline: deadline} = state
+  defp begin_stop(%{cfg: cfg, deadline: deadline} = state) do
     task = Task.Supervisor.async_nolink(Vagus.TaskSupervisor, fn -> run_stop(cfg, deadline) end)
     %{state | phase: :stopping, task: task}
   end

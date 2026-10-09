@@ -123,13 +123,16 @@ defmodule Vagus.App.Policy do
     halt_stop: 40_000,
     snapshot: 600_000,
     exec_hook: 120_000,
+    # Removes the old data dir first: a walk as long as a snapshot's.
+    swap_data: 600_000,
+    set_options: 15_000,
     remove_app: 120_000,
     reclaim_image: 60_000
   }
 
-  # A caller's backend, data root, engine socket and jobs server reach every
-  # task step.
-  @engine_overrides [:backend, :data_root, :socket, :jobs_server]
+  # A caller's backend, engine client, data root, engine socket and jobs
+  # server reach every task step.
+  @engine_overrides [:backend, :docker, :data_root, :socket, :jobs_server]
 
   @persisted ~w(config wanted user_options ingress_token ingress_port ingress_panel watchdog ports
                  boot auto_update protected)a
@@ -142,6 +145,7 @@ defmodule Vagus.App.Policy do
       config: nil,
       wanted: :stopped,
       user_options: %{},
+      options_rev: 0,
       ingress_token: nil,
       ingress_port: nil,
       ingress_panel: false,
@@ -167,6 +171,15 @@ defmodule Vagus.App.Policy do
     }
     |> Map.merge(Map.take(saved || %{}, @persisted))
   end
+
+  @doc """
+  Sets the options and bumps their revision. A restore compares revisions,
+  not values: a write of the very options it started from is still newer
+  than the backup.
+  """
+  @spec put_options(map(), map()) :: map()
+  def put_options(data, options),
+    do: %{data | user_options: options, options_rev: data.options_rev + 1}
 
   @doc "Readers hash a presented token the same way to find its key."
   @spec hash(String.t()) :: binary()
@@ -474,6 +487,7 @@ defmodule Vagus.App.Policy do
   # Every update branch that rolls back, a failed snapshot's included, needs
   # the version it started from.
   defp acc(:update, data), do: %{old: data.config}
+  defp acc(:restore, data), do: %{options_rev: data.options_rev}
   defp acc(_op, _data), do: %{}
 
   # `:port?` and `:start?` are resolved against the data current when they
@@ -488,17 +502,30 @@ defmodule Vagus.App.Policy do
 
   defp steps(:halt, _args, _data), do: [{:halt_stop, nil}]
 
-  defp steps(:update, args, _data) do
-    snapshot = if args[:backup], do: [{:snapshot, nil}], else: []
-
-    [{:pull, nil}, {:stop, nil}] ++
-      snapshot ++ [{:commit, nil}, {:start?, nil}, {:reclaim_image, nil}]
+  # The backup decides whether the app ends running, as it decides its data.
+  # The stop is strict: a container a failed stop left running would write
+  # into the directory the swap replaces.
+  defp steps(:restore, args, _data) do
+    start = if args[:start?], do: start_steps(), else: []
+    [{:stop, :strict}, {:swap_data, nil}, {:set_options, nil}] ++ start
   end
 
+  # A stop a snapshot follows is strict, as the restore's: a container still
+  # running would write under the tar.
+  defp steps(:update, args, _data) do
+    {stop, snapshot} =
+      if args[:backup], do: {{:stop, :strict}, [{:snapshot, nil}]}, else: {{:stop, nil}, []}
+
+    [{:pull, nil}, stop] ++ snapshot ++ [{:commit, nil}, {:start?, nil}, {:reclaim_image, nil}]
+  end
+
+  # A hot backup always plans its hooks, by name: this process's facts can
+  # miss a container the engine refused to stop, and a container that is not
+  # there skips them.
   defp steps(:backup, _args, data) do
     cond do
-      data.config.backup == "cold" -> [{:stop, nil}, {:snapshot, nil}, {:start?, nil}]
-      Steps.native?(data.config) or not running?(data) -> [{:snapshot, nil}]
+      data.config.backup == "cold" -> [{:stop, :strict}, {:snapshot, nil}, {:start?, nil}]
+      Steps.native?(data.config) -> [{:snapshot, nil}]
       true -> hook(data, :pre) ++ [{:snapshot, nil}] ++ hook(data, :post)
     end
   end
@@ -565,6 +592,7 @@ defmodule Vagus.App.Policy do
   defp expand({:mint_token, _} = step, data),
     do: if(Steps.native?(data.config), do: [], else: [step])
 
+  defp expand({:set_options, _}, %{run: %{args: %{options: nil}}}), do: []
   defp expand(step, _data), do: [step]
 
   defp run_step({:mint_token, _}, data, effects) do
@@ -661,8 +689,12 @@ defmodule Vagus.App.Policy do
     do: fail(data, {:unplanned, run.op, run.step, outcome}, [])
 
   # The one recovery after a dead or timed-out step that touched the
-  # container: its state is unknown, so it is removed by name. It always ends
-  # the op as a failure, then the restart rule.
+  # container: its state is unknown, so it is removed by name. It ends the op
+  # as a failure, then the restart rule; a cold backup still replies its
+  # result, settled before the restart, as when the restart errors.
+  defp on_outcome(:backup, :stop, :by_name, _outcome, %{run: %{acc: %{result: result}}} = data),
+    do: close(put_acc(release(data), :cleaned, true), result, [])
+
   defp on_outcome(_op, :stop, :by_name, _outcome, data),
     do: fail(put_acc(release(data), :cleaned, true), data.run.acc.cause, [])
 
@@ -714,12 +746,28 @@ defmodule Vagus.App.Policy do
     end
   end
 
-  defp on_outcome(_op, :stop, nil, {:ok, %{was_running: was_running}}, data) do
+  # A backup's stop cancels the restart a crashed app was waiting for, so one
+  # that should run is started again like one that ran. A restore gives up
+  # what the app wanted only once its stop held: after a failed one the data
+  # is untouched, and the app comes back.
+  defp on_outcome(op, :stop, _strict, {:ok, %{was_running: was_running}}, data) do
+    was_running = was_running or (op == :backup and data.wanted == :started)
     data = put_acc(%{release(data) | last_event: :stopped}, :was_running, was_running)
-    advance(data, [])
+    advance(if(op == :restore, do: %{data | wanted: :stopped}, else: data), [])
   end
 
-  defp on_outcome(_op, :stop, nil, {:error, reason}, data), do: cleanup(data, {:stop, reason}, [])
+  # Its token is already revoked, so an app that should run is started again
+  # in place of a container that may still run, as after a failed snapshot.
+  # Nothing is committed: an update keeps its old version, a restore its data.
+  defp on_outcome(op, :stop, :strict, {:error, reason}, data)
+       when op in [:backup, :update, :restore] and reason not in [:died, :timeout] do
+    was_running = running?(data) or data.wanted == :started
+    data = put_acc(release(data), :result, {:error, {:stop, reason}})
+    advance(put_steps(put_acc(data, :was_running, was_running), [{:start?, nil}]), [])
+  end
+
+  defp on_outcome(_op, :stop, _strict, {:error, reason}, data),
+    do: cleanup(data, {:stop, reason}, [])
 
   defp on_outcome(:update, :snapshot, _, {:ok, _path}, data), do: advance(data, [])
 
@@ -728,7 +776,7 @@ defmodule Vagus.App.Policy do
     advance(put_steps(data, [{:start?, nil}]), [])
   end
 
-  defp on_outcome(:backup, :snapshot, _, {status, _} = result, data) when status in [:ok, :error],
+  defp on_outcome(:backup, :snapshot, _, result, data),
     do: advance(put_acc(data, :result, result), [])
 
   defp on_outcome(:backup, :exec_hook, :pre, {:ok, _}, data), do: advance(data, [])
@@ -737,6 +785,20 @@ defmodule Vagus.App.Policy do
     do: fail(data, {:backup_pre_failed, reason}, [])
 
   defp on_outcome(:backup, :exec_hook, :post, _outcome, data), do: advance(data, [])
+  defp on_outcome(:restore, :swap_data, _, {:ok, _dir}, data), do: advance(data, [])
+  defp on_outcome(:restore, :swap_data, _, {:error, reason}, data), do: fail(data, reason, [])
+
+  # A set is applied the moment it is asked, mid-restore included, and its
+  # caller was told so: a write since the op began is newer than the backup
+  # and stands.
+  defp on_outcome(:restore, :set_options, _, {:ok, options}, data) when is_map(options) do
+    if data.options_rev == data.run.acc.options_rev,
+      do: advance(put_options(data, options), [:persist]),
+      else: advance(data, [])
+  end
+
+  defp on_outcome(:restore, :set_options, _, {:ok, nil}, data), do: advance(data, [])
+  defp on_outcome(:restore, :set_options, _, {:error, reason}, data), do: fail(data, reason, [])
   defp on_outcome(:update, :reclaim_image, _, _outcome, data), do: advance(data, [])
   # The commit point of an uninstall: from here nothing writes the file
   # again, so nothing that follows can bring the app back.
@@ -765,7 +827,7 @@ defmodule Vagus.App.Policy do
 
   defp started(data, fact) do
     run = data.run
-    wanted = if run.op == :start, do: :started, else: data.wanted
+    wanted = if run.op in [:start, :restore], do: :started, else: data.wanted
     attempt = if run.args[:retry], do: data.attempt, else: 0
 
     data = %{
@@ -802,12 +864,12 @@ defmodule Vagus.App.Policy do
   defp finish(%{run: run} = data, effects),
     do: {data, effects ++ [:persist, {:reply, result(run, data)}, :idle]}
 
-  defp result(%{op: :update, acc: %{result: result}}, _data), do: result
+  defp result(%{acc: %{result: result}}, _data), do: result
 
   defp result(%{op: :update, acc: acc}, data),
     do: {:ok, %{slug: data.slug, from: acc.old.version, to: data.config.version}}
 
-  defp result(%{op: :backup, acc: acc}, _data), do: Map.get(acc, :result, {:ok, nil})
+  defp result(%{op: :backup}, _data), do: {:ok, nil}
   defp result(_run, _data), do: :ok
 
   # An install that fails leaves no file and no process. Otherwise a retry
@@ -818,11 +880,13 @@ defmodule Vagus.App.Policy do
   defp fail(%{gone: true} = data, reason, effects),
     do: {data, effects ++ [{:reply, {:error, reason}}, :exit]}
 
-  defp fail(%{run: run} = data, reason, effects) do
+  defp fail(data, reason, effects), do: close(data, {:error, reason}, effects)
+
+  defp close(%{run: run} = data, reply, effects) do
     {data, retry} =
       if run.args[:retry] || run.acc[:cleaned], do: retry(data, []), else: {data, []}
 
-    {data, effects ++ [:persist, {:reply, {:error, reason}}] ++ retry ++ [:idle]}
+    {data, effects ++ [:persist, {:reply, reply}] ++ retry ++ [:idle]}
   end
 
   defp put_steps(data, steps), do: put_in(data.run.steps, steps)
@@ -852,12 +916,16 @@ defmodule Vagus.App.Policy do
   defp input(:start, _arg, data),
     do: Map.take(data, [:token, :user_options, :ports, :protected])
 
+  # A backup of an app that should run records it started, hot or cold, so a
+  # restore starts it whether or not it had crashed.
   defp input(:snapshot, _arg, %{run: run} = data) do
-    state = if run.acc[:was_running] || running?(data), do: "started", else: "stopped"
+    started? =
+      run.acc[:was_running] || running?(data) || (run.op == :backup and data.wanted == :started)
+
+    state = if started?, do: "started", else: "stopped"
 
     %{
       staging_dir: run.args[:staging_dir],
-      system: run.args[:system] || %{},
       user_options: data.user_options,
       state: state
     }
@@ -866,6 +934,11 @@ defmodule Vagus.App.Policy do
   defp input(:exec_hook, :pre, data), do: %{cmd: data.config.backup_pre}
   defp input(:exec_hook, :post, data), do: %{cmd: data.config.backup_post}
   defp input(:reclaim_image, _arg, data), do: %{old: data.run.acc.old}
+
+  defp input(:swap_data, _arg, data), do: %{staging_dir: data.run.args.staging_dir}
+
+  defp input(:set_options, _arg, data), do: %{options: data.run.args.options}
+  defp input(:stop, :strict, _data), do: %{strict: true}
   defp input(_name, _arg, _data), do: %{}
 
   # Coarse waypoints for the update job's progress bar.

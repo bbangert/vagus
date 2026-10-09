@@ -106,7 +106,8 @@ defmodule Vagus.Addon.Backend.NativeTest do
   describe "services / discovery / backup (MQ-P4)" do
     setup do
       port = free_port()
-      dr = tmp_dir()
+      # Nested, so the backup staging root beside it is inside this test's tmp dir.
+      dr = Path.join(tmp_dir(), "data")
       prev_port = Application.get_env(:vagus, :mqtt_broker_port)
       prev_root = Application.get_env(:vagus, :addon_data_root)
       Application.put_env(:vagus, :mqtt_broker_port, port)

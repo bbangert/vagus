@@ -5,7 +5,7 @@ defmodule Vagus.AppTest do
   import ExUnit.CaptureLog
   import Vagus.AppFixtures
 
-  alias Vagus.Addon.{Backend, Config}
+  alias Vagus.Addon.{Backend, Config, Store}
   alias Vagus.App
   alias Vagus.App.Directory
   alias Vagus.App.File, as: AppFile
@@ -215,26 +215,177 @@ defmodule Vagus.AppTest do
     end
   end
 
-  describe "stop_for_backup/2 and start_after_backup/2" do
-    # A cold backup that failed on the save would leave the app stopped.
-    test "a state that cannot be saved does not fail them" do
-      slug = track(config())
-      blocker = Path.join(AppFile.dir(), slug <> ".json.tmp")
-      File.mkdir_p!(blocker)
-      on_exit(fn -> File.rm_rf!(blocker) end)
-      stub_app_steps()
+  describe "update/2 with a backup" do
+    setup do
+      # Nested, so the staging root beside its data root is this test's own.
+      base = Path.join(System.tmp_dir!(), "vagus-app-bk-#{System.unique_integer([:positive])}")
+      dir = Path.join([base, "data", "backup"])
+      prev_dir = Vagus.Backups.dir()
+      :ok = Vagus.Backups.set_dir(dir)
 
-      capture_log(fn ->
-        stop = Task.async(fn -> App.stop_for_backup(slug) end)
-        assert_receive {:step, :stop, _input, stopping}, 5_000
-        send(stopping, {:outcome, {:ok, %{was_running: true}}})
-        assert :ok = Task.await(stop)
-
-        start = Task.async(fn -> App.start_after_backup(slug) end)
-        assert_receive {:step, :start, _input, starting}, 5_000
-        send(starting, {:outcome, {:ok, %{container_id: "c1"}}})
-        assert {:ok, %{slug: ^slug}} = Task.await(start)
+      on_exit(fn ->
+        Vagus.Backups.set_dir(prev_dir)
+        File.rm_rf(base)
       end)
+
+      config = config()
+      slug = track(config, state: :started)
+      seed_store(%{config | version: "2.0"})
+      stub_app_steps()
+      %{slug: slug, dir: dir}
+    end
+
+    defp seed_store(%Config{slug: slug} = config) do
+      catalog = Map.put(Store.catalog(), slug, %{config: config, repository: "core"})
+      :ok = GenServer.call(Store, {:put_catalog, catalog})
+      on_exit(fn -> GenServer.call(Store, {:put_catalog, Map.delete(Store.catalog(), slug)}) end)
+    end
+
+    defp answer(name, outcome) do
+      assert_receive {:step, ^name, input, task}, 5_000
+      send(task, {:outcome, outcome})
+      input
+    end
+
+    # Stands in for the snapshot step: writes a real inner tar where it would,
+    # whatever outcome it then reports.
+    defp answer_snapshot(slug, outcome \\ :ok) do
+      assert_receive {:step, :snapshot, %{staging_dir: staging}, task}, 5_000
+      addon = %{slug: slug, name: "App Test", version: "1.0", data_dir: "/nonexistent"}
+      {:ok, gz, _size} = Vagus.Backup.addon_tar(Map.put(addon, :system, %{"name" => "App Test"}))
+      path = Path.join(staging, slug <> ".tar.gz")
+      File.write!(path, gz)
+      send(task, {:outcome, if(outcome == :ok, do: {:ok, path}, else: outcome)})
+    end
+
+    test "the snapshot inside the update is kept even when the update rolls back", ctx do
+      update = Task.async(fn -> App.update(ctx.slug, backup: true) end)
+      answer(:pull, {:ok, "x/y:2"})
+      answer(:stop, {:ok, %{was_running: true}})
+      answer_snapshot(ctx.slug)
+      answer(:start, {:error, :boom})
+      answer(:start, {:ok, %{container_id: "c2"}})
+
+      assert {:error, {:rolled_back, :boom}} = Task.await(update)
+      assert [%{backup: backup}] = Vagus.Backups.list()
+      assert backup["name"] == "addon_#{ctx.slug}_1.0"
+      assert [%{"slug" => slug, "version" => "1.0"}] = backup["addons"]
+      assert slug == ctx.slug
+      assert File.ls!(Vagus.Backups.staging_root(ctx.dir)) == []
+    end
+
+    test "a failed snapshot fails the update and stores nothing", ctx do
+      update = Task.async(fn -> App.update(ctx.slug, backup: true) end)
+      answer(:pull, {:ok, "x/y:2"})
+      answer(:stop, {:ok, %{was_running: true}})
+      answer_snapshot(ctx.slug, {:error, :enospc})
+      answer(:start, {:ok, %{container_id: "c2"}})
+
+      assert {:error, {:backup_failed, :enospc}} = Task.await(update)
+      assert Vagus.Backups.list() == []
+      assert File.ls!(Vagus.Backups.staging_root(ctx.dir)) == []
+    end
+
+    # A snapshot that reports a file it never wrote leaves nothing to store.
+    test "an update done whose backup is not stored is the backup's error", ctx do
+      update = Task.async(fn -> App.update(ctx.slug, backup: true) end)
+      answer(:pull, {:ok, "x/y:2"})
+      answer(:stop, {:ok, %{was_running: true}})
+      answer(:snapshot, {:ok, "/nowhere/#{ctx.slug}.tar.gz"})
+      answer(:start, {:ok, %{container_id: "c2"}})
+      answer(:reclaim_image, {:ok, :ok})
+
+      assert {:error, {:backup_not_stored, {:not_staged, slug}}} = Task.await(update)
+      assert slug == ctx.slug
+      assert {:ok, %{config: %{version: "2.0"}}} = app_info(ctx.slug)
+      assert Vagus.Backups.list() == []
+    end
+
+    test "an update that fails is its own error, whatever became of its backup", ctx do
+      update = Task.async(fn -> App.update(ctx.slug, backup: true) end)
+      answer(:pull, {:ok, "x/y:2"})
+      answer(:stop, {:ok, %{was_running: true}})
+      answer(:snapshot, {:ok, "/nowhere/#{ctx.slug}.tar.gz"})
+      answer(:start, {:error, :boom})
+      answer(:start, {:ok, %{container_id: "c2"}})
+
+      assert {:error, {:rolled_back, :boom}} = Task.await(update)
+      assert Vagus.Backups.list() == []
+    end
+
+    test "an update that fails before its snapshot stores nothing", ctx do
+      update = Task.async(fn -> App.update(ctx.slug, backup: true) end)
+      answer(:pull, {:error, :unreachable})
+
+      assert {:error, {:pull, :unreachable}} = Task.await(update)
+      assert Vagus.Backups.list() == []
+      assert File.ls!(Vagus.Backups.staging_root(ctx.dir)) == []
+    end
+  end
+
+  describe "restore/5" do
+    setup do
+      stub_app_steps()
+      :ok
+    end
+
+    test "stops, swaps the data in and starts with the restored options" do
+      slug = track(config(), state: :started, options: %{"a" => 1})
+      restore = Task.async(fn -> App.restore(slug, "/staging", %{"a" => 2}, true) end)
+
+      answer(:stop, {:ok, %{was_running: true}})
+      assert %{staging_dir: "/staging"} = answer(:swap_data, {:ok, "/data"})
+      assert %{options: %{"a" => 2}} = answer(:set_options, {:ok, %{"a" => 2}})
+      assert %{user_options: %{"a" => 2}} = answer(:start, {:ok, %{container_id: "c2"}})
+
+      assert :ok = Task.await(restore)
+
+      assert {:ok, %{state: :started, wanted: :started, user_options: %{"a" => 2}}} =
+               app_info(slug)
+
+      assert {:ok, %{user_options: %{"a" => 2}}} = AppFile.read(slug)
+    end
+
+    test "a backup of a stopped app leaves it stopped, and nil options keep the current ones" do
+      slug = track(config(), state: :started, options: %{"a" => 1})
+      restore = Task.async(fn -> App.restore(slug, "/staging", nil, false) end)
+
+      answer(:stop, {:ok, %{was_running: true}})
+      answer(:swap_data, {:ok, "/data"})
+
+      assert :ok = Task.await(restore)
+      refute_received {:step, :start, _input, _task}
+
+      assert {:ok, %{state: :stopped, wanted: :stopped, user_options: %{"a" => 1}}} =
+               app_info(slug)
+    end
+
+    test "a failed swap fails the restore before the options or a start" do
+      slug = track(config(), state: :started, options: %{"a" => 1})
+      restore = Task.async(fn -> App.restore(slug, "/staging", %{"a" => 2}, true) end)
+
+      answer(:stop, {:ok, %{was_running: true}})
+      answer(:swap_data, {:error, :exdev})
+
+      assert {:error, :exdev} = Task.await(restore)
+      refute_received {:step, :start, _input, _task}
+      assert {:ok, %{user_options: %{"a" => 1}}} = app_info(slug)
+    end
+
+    test "a busy app refuses it, and an uninstall is refused mid-restore" do
+      slug = track(config(), state: :started)
+      restore = Task.async(fn -> App.restore(slug, "/staging", nil, false) end)
+      assert_receive {:step, :stop, _input, stopping}, 5_000
+
+      assert {:error, :busy} = App.restore(slug, "/other", nil, false)
+      assert {:error, :busy} = App.uninstall(slug)
+
+      send(stopping, {:outcome, {:ok, %{was_running: true}}})
+      assert_receive {:step, :swap_data, _input, swapping}, 5_000
+      assert {:error, :busy} = App.uninstall(slug)
+      send(swapping, {:outcome, {:ok, "/data"}})
+      assert :ok = Task.await(restore)
+      assert App.installed?(slug)
     end
   end
 

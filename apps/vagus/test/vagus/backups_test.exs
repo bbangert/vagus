@@ -11,6 +11,7 @@ defmodule Vagus.BackupsTest do
   """
   use ExUnit.Case, async: false
 
+  import ExUnit.CaptureLog
   import Vagus.AppFixtures
 
   alias Vagus.Addon.{Backend, Config}
@@ -19,11 +20,23 @@ defmodule Vagus.BackupsTest do
   @backend Backend.Fake
 
   setup do
-    data_root = Path.join(System.tmp_dir!(), "vagus-bk-#{System.unique_integer([:positive])}")
+    prev_backend = Application.fetch_env(:vagus, :addon_backend)
+    Application.put_env(:vagus, :addon_backend, @backend)
+
+    on_exit(fn ->
+      case prev_backend do
+        {:ok, backend} -> Application.put_env(:vagus, :addon_backend, backend)
+        :error -> Application.delete_env(:vagus, :addon_backend)
+      end
+    end)
+
+    # The data root is nested so the staging root beside it is this test's own.
+    base = Path.join(System.tmp_dir!(), "vagus-bk-#{System.unique_integer([:positive])}")
+    data_root = Path.join(base, "data")
     backup_dir = Path.join(data_root, "backup")
     server = :"backups_test_#{System.unique_integer([:positive])}"
-    {:ok, _pid} = Backups.start_link(name: server, dir: backup_dir)
-    on_exit(fn -> File.rm_rf(data_root) end)
+    {:ok, _pid} = Backups.start_link(name: server, dir: backup_dir, data_root: data_root)
+    on_exit(fn -> File.rm_rf(base) end)
     %{data_root: data_root, backup_dir: backup_dir, server: server}
   end
 
@@ -89,6 +102,7 @@ defmodule Vagus.BackupsTest do
   describe "create_partial/3" do
     test "an installed hot add-on: tar written + indexed, content lists the add-on", %{
       data_root: dr,
+      backup_dir: backup_dir,
       server: server
     } do
       slug = "core_hot"
@@ -104,8 +118,9 @@ defmodule Vagus.BackupsTest do
 
       assert {:ok, %{backup: b, path: path}} = Backups.get(backup_slug, server)
       assert b["name"] =~ "Partial backup"
-      assert Enum.any?(b["addons"], &(&1["slug"] == slug))
+      assert [%{"slug" => ^slug, "name" => "Test Addon", "version" => "1.0"}] = b["addons"]
       assert File.exists?(path)
+      assert File.ls!(Backups.staging_root(backup_dir)) == []
 
       {:ok, tar} = File.read(path)
       {:ok, %{addon: addon, data: files}} = Vagus.Backup.extract_addon(tar, slug)
@@ -123,7 +138,28 @@ defmodule Vagus.BackupsTest do
       assert Backups.list(server) == []
     end
 
-    test "a cold-mode add-on is stopped before the snapshot and restarted after", %{
+    test "a hot add-on runs its hooks around the tar", %{
+      data_root: dr,
+      server: server
+    } do
+      slug = "core_hot_hooks"
+      install(slug, dr, :started, %{}, %{"backup_pre" => "dump", "backup_post" => "undump"})
+      :ok = @backend.reset_calls()
+
+      assert {:ok, _backup_slug} =
+               Backups.create_partial(nil, [slug],
+                 server: server,
+                 data_root: dr,
+                 docker: @backend
+               )
+
+      id = "addon_" <> slug
+
+      assert @backend.calls_for(id) ==
+               [{:exec, id, "dump"}, {:exec, id, "undump"}]
+    end
+
+    test "a cold add-on is stopped and started again by its own backup", %{
       data_root: dr,
       server: server
     } do
@@ -133,20 +169,45 @@ defmodule Vagus.BackupsTest do
 
       :ok = @backend.reset_calls()
 
-      assert {:ok, _backup_slug} =
-               Backups.create_partial(nil, [slug],
-                 server: server,
-                 data_root: dr,
-                 backend: @backend
-               )
+      assert {:ok, backup_slug} =
+               Backups.create_partial(nil, [slug], server: server, data_root: dr)
 
-      calls = @backend.calls()
-      assert Enum.any?(calls, &match?({:stop, "addon_" <> ^slug}, &1))
-      assert Enum.any?(calls, &match?({:start, _}, &1))
+      ops = Enum.map(@backend.calls_for("addon_" <> slug), &elem(&1, 0))
+      assert [:stop, :remove | started] = ops
+      assert :start in started
+      assert {:ok, %{state: :started}} = app_info(slug)
+
+      {:ok, %{path: path}} = Backups.get(backup_slug, server)
+      {:ok, %{addon: addon}} = Vagus.Backup.extract_addon_file(path, slug)
+      assert addon["state"] == "started"
+    end
+
+    # A container the engine failed to stop could write under the tar.
+    test "a cold add-on whose strict stop fails is not snapshotted and is started again", %{
+      data_root: dr,
+      backup_dir: backup_dir,
+      server: server
+    } do
+      slug = "core_cold_stuck"
+      install(slug, dr, :started, %{}, %{"backup" => "cold"})
+      stub_app_steps()
+
+      backup =
+        Task.async(fn -> Backups.create_partial(nil, [slug], server: server, data_root: dr) end)
+
+      assert_receive {:step, :stop, %{slug: ^slug, strict: true}, task}, 5_000
+      send(task, {:outcome, {:error, :econnrefused}})
+      assert_receive {:step, :start, %{slug: ^slug}, task}, 5_000
+      send(task, {:outcome, {:ok, %{container_id: "c2"}}})
+
+      assert {:error, {:backup_failed, ^slug, {:stop, :econnrefused}}} = Task.await(backup)
+      refute_received {:step, :snapshot, _input, _task}
+      assert Backups.list(server) == []
+      assert File.ls!(Backups.staging_root(backup_dir)) == []
       assert {:ok, %{state: :started}} = app_info(slug)
     end
 
-    test "a stopped add-on is snapshotted as-is (no stop/start either way)", %{
+    test "a stopped cold add-on is snapshotted and left stopped", %{
       data_root: dr,
       server: server
     } do
@@ -160,14 +221,157 @@ defmodule Vagus.BackupsTest do
                Backups.create_partial(nil, [slug],
                  server: server,
                  data_root: dr,
-                 backend: @backend
+                 backend: __MODULE__.ExitedBackend
                )
 
-      assert @backend.calls() == []
+      refute Enum.any?(@backend.calls(), &match?({op, _} when op in [:create, :start], &1))
+      assert {:ok, %{state: :stopped}} = app_info(slug)
       {:ok, %{path: path}} = Backups.get(backup_slug, server)
       {:ok, tar} = File.read(path)
       {:ok, %{addon: addon}} = Vagus.Backup.extract_addon(tar, slug)
       assert addon["state"] == "stopped"
+    end
+
+    test "a busy app fails the whole backup by name; the app before it is running again", %{
+      data_root: dr,
+      backup_dir: backup_dir,
+      server: server
+    } do
+      cold = "core_busy_cold"
+      busy = "core_busy_busy"
+      install(cold, dr, :started, %{}, %{"backup" => "cold"})
+      install(busy, dr, :started)
+      stub_app_steps()
+
+      stopping = Task.async(fn -> Vagus.App.stop(busy) end)
+      assert_receive {:step, :stop, %{slug: ^busy}, held}, 5_000
+
+      backup =
+        Task.async(fn ->
+          Backups.create_partial(nil, [cold, busy], server: server, data_root: dr)
+        end)
+
+      assert_receive {:step, :stop, %{slug: ^cold}, task}, 5_000
+      send(task, {:outcome, {:ok, %{was_running: true}}})
+      assert_receive {:step, :snapshot, %{slug: ^cold, staging_dir: staging}, task}, 5_000
+      send(task, {:outcome, {:ok, Path.join(staging, cold <> ".tar.gz")}})
+      assert_receive {:step, :start, %{slug: ^cold}, task}, 5_000
+      send(task, {:outcome, {:ok, %{container_id: "c2"}}})
+
+      assert {:error, {:busy, ^busy}} = Task.await(backup)
+      assert {:ok, %{state: :started}} = app_info(cold)
+      assert Backups.list(server) == []
+      assert File.ls!(Backups.staging_root(backup_dir)) == []
+
+      send(held, {:outcome, {:ok, %{was_running: true}}})
+      assert :ok = Task.await(stopping)
+    end
+
+    # The op's reply to a dead caller is its last act, so it is the one
+    # barrier the test can wait on from the app process itself.
+    defp notify_reply_to(slug, caller) do
+      [{app, _value}] = Registry.lookup(Vagus.App.Directory, {:slug, slug})
+      test = self()
+
+      :sys.install(
+        app,
+        {fn
+           :watching, {:out, reply, {^caller, _tag}}, _name ->
+             send(test, {:replied, reply})
+             :done
+
+           :watching, _event, _name ->
+             :watching
+         end, :watching}
+      )
+    end
+
+    test "a backup caller killed mid-tar leaves the cold app started by its own op", %{
+      data_root: dr,
+      server: server
+    } do
+      slug = "core_orphaned"
+      install(slug, dr, :started, %{}, %{"backup" => "cold"})
+      stub_app_steps()
+
+      {caller, ref} =
+        spawn_monitor(fn ->
+          Backups.create_partial(nil, [slug], server: server, data_root: dr)
+        end)
+
+      assert_receive {:step, :stop, %{slug: ^slug}, task}, 5_000
+      send(task, {:outcome, {:ok, %{was_running: true}}})
+      assert_receive {:step, :snapshot, %{slug: ^slug}, task}, 5_000
+      notify_reply_to(slug, caller)
+
+      Process.exit(caller, :kill)
+      assert_receive {:DOWN, ^ref, :process, ^caller, :killed}
+
+      send(task, {:outcome, {:ok, "/gone/#{slug}.tar.gz"}})
+      assert_receive {:step, :start, %{slug: ^slug}, task}, 5_000
+      send(task, {:outcome, {:ok, %{container_id: "c2"}}})
+
+      assert_receive {:replied, {:ok, "/gone/core_orphaned.tar.gz"}}, 5_000
+      assert {:ok, %{state: :started}} = app_info(slug)
+    end
+
+    test "the boot sweep clears staging a crashed VM left behind", %{
+      data_root: dr,
+      backup_dir: backup_dir,
+      server: server
+    } do
+      leftover = Path.join(Backups.staging_root(backup_dir), "backup-deadbeef-1")
+      File.mkdir_p!(leftover)
+      File.write!(Path.join(leftover, "core_x.tar.gz"), "partial")
+
+      parent = Path.join([dr, "addons", "data"])
+      File.mkdir_p!(Path.join([parent, ".restore-core_a-1", "sub"]))
+      File.mkdir_p!(Path.join(parent, "core_a"))
+
+      assert :ok = Backups.sweep_stale(server: server, data_root: dr)
+
+      refute File.exists?(Backups.staging_root(backup_dir))
+      assert File.ls!(parent) == ["core_a"]
+    end
+
+    # Backup callers and app operations outlive a restart of the store.
+    test "a restart of the store leaves live backup and restore staging alone", %{
+      data_root: dr,
+      backup_dir: backup_dir,
+      server: server
+    } do
+      {:ok, %{staging_dir: staging}} = Backups.begin_partial("live", server: server)
+      restore = Path.join([dr, "addons", "data", ".restore-core_a-1"])
+      File.mkdir_p!(restore)
+
+      :ok = GenServer.stop(server)
+      {:ok, _pid} = Backups.start_link(name: server, dir: backup_dir, data_root: dr)
+
+      assert File.dir?(staging)
+      assert File.dir?(restore)
+    end
+
+    test "each backup stages in its own new root-only dir in the data root", %{
+      data_root: dr,
+      backup_dir: backup_dir,
+      server: server
+    } do
+      root = Path.join(dr, ".backup-staging")
+      assert Backups.staging_root(backup_dir) == root
+      opts = [server: server, date: "2026-07-21T00:00:00Z"]
+
+      assert {:ok, %{staging_dir: a, slug: slug}} = Backups.begin_partial("same", opts)
+      assert {:ok, %{staging_dir: b, slug: ^slug}} = Backups.begin_partial("same", opts)
+      assert a != b
+      assert Path.dirname(a) == root and Path.dirname(b) == root
+      assert File.dir?(a) and File.dir?(b)
+      assert {:ok, %File.Stat{mode: mode}} = File.stat(root)
+      assert Bitwise.band(mode, 0o777) == 0o700
+
+      File.mkdir!(Path.join(root, "backup-#{slug}-7"))
+
+      assert {:error, {:staging, :eexist}} =
+               Backups.begin_partial("same", [unique: 7] ++ opts)
     end
   end
 
@@ -204,7 +408,8 @@ defmodule Vagus.BackupsTest do
 
       assert File.read!(Path.join(dd, "keep.txt")) == "original"
       refute File.exists?(Path.join(dd, "extra.txt"))
-      assert {:ok, %{user_options: %{"greet" => "hi"}}} = app_info(slug)
+      assert restore_leftovers(dr) == []
+      assert {:ok, %{state: :started, user_options: %{"greet" => "hi"}}} = app_info(slug)
 
       calls = @backend.calls()
       assert Enum.any?(calls, &match?({:stop, "addon_" <> ^slug}, &1))
@@ -214,8 +419,7 @@ defmodule Vagus.BackupsTest do
     # Intended, not incidental: `protected` is a per-install security setting,
     # not add-on data, so a restore of the add-on's `/data` must not silently
     # re-grant (or revoke) device access the user set independently. Only
-    # `POST /addons/{slug}/security` moves it — `finish_restore/3` reaches
-    # `State.put_options/2` alone.
+    # `POST /addons/{slug}/security` moves it; a restore sets the options alone.
     test "a restore leaves the add-on's protection mode untouched", %{
       data_root: dr,
       server: server
@@ -260,6 +464,137 @@ defmodule Vagus.BackupsTest do
                )
 
       refute Enum.any?(@backend.calls(), &match?({:start, _}, &1))
+      assert {:ok, %{state: :stopped}} = app_info(slug)
+    end
+
+    test "backed-up options the installed schema rejects are dropped; the data still restores",
+         %{data_root: dr, server: server} do
+      slug = "core_restore_schema"
+      install(slug, dr, :stopped, %{"greet" => "hi"}, %{"schema" => %{"greet" => "str"}})
+      File.write!(Path.join(data_dir(dr, slug), "f.txt"), "backed up")
+      {:ok, backup_slug} = Backups.create_partial(nil, [slug], server: server, data_root: dr)
+
+      install(slug, dr, :stopped, %{"greet" => 42}, %{"schema" => %{"greet" => "int"}})
+      File.write!(Path.join(data_dir(dr, slug), "f.txt"), "since")
+
+      log =
+        capture_log(fn ->
+          assert :ok = Backups.restore_partial(backup_slug, [slug], server: server, data_root: dr)
+        end)
+
+      assert log =~ "keeping the current options"
+      assert File.read!(Path.join(data_dir(dr, slug), "f.txt")) == "backed up"
+      assert {:ok, %{user_options: %{"greet" => 42}}} = app_info(slug)
+    end
+
+    # Backed up while running, so the restore starts it again.
+    defp backed_up_app(slug, dr, server) do
+      install(slug, dr, :started, %{"greet" => "hi"})
+      File.write!(Path.join(data_dir(dr, slug), "f.txt"), "backed up")
+      {:ok, backup_slug} = Backups.create_partial(nil, [slug], server: server, data_root: dr)
+      File.write!(Path.join(data_dir(dr, slug), "f.txt"), "since")
+      set_app(slug, options: %{"greet" => "since"})
+      stub_app_steps()
+      backup_slug
+    end
+
+    defp restore_leftovers(dr),
+      do:
+        dr |> Path.join("addons/data") |> File.ls!() |> Enum.filter(&String.starts_with?(&1, "."))
+
+    test "a running app is stopped, swapped and started by its own op, in that order", %{
+      data_root: dr,
+      server: server
+    } do
+      slug = "core_restore_running"
+      backup_slug = backed_up_app(slug, dr, server)
+
+      restore =
+        Task.async(fn ->
+          Backups.restore_partial(backup_slug, [slug], server: server, data_root: dr)
+        end)
+
+      assert_receive {:step, :stop, %{slug: ^slug}, task}, 5_000
+      send(task, {:outcome, {:ok, %{was_running: true}}})
+      assert_receive {:step, :swap_data, %{staging_dir: staging}, task}, 5_000
+      assert Path.dirname(staging) == Path.dirname(data_dir(dr, slug))
+      assert File.read!(Path.join(staging, "f.txt")) == "backed up"
+      send(task, {:outcome, {:ok, data_dir(dr, slug)}})
+      assert_receive {:step, :set_options, %{options: %{"greet" => "hi"} = raw}, task}, 5_000
+      send(task, {:outcome, {:ok, raw}})
+      assert_receive {:step, :start, %{user_options: %{"greet" => "hi"}}, task}, 5_000
+      send(task, {:outcome, {:ok, %{container_id: "c2"}}})
+
+      assert :ok = Task.await(restore)
+      assert restore_leftovers(dr) == []
+      assert {:ok, %{state: :started, user_options: %{"greet" => "hi"}}} = app_info(slug)
+    end
+
+    test "a busy app aborts the restore by name, its data untouched", %{
+      data_root: dr,
+      server: server
+    } do
+      slug = "core_restore_busy"
+      backup_slug = backed_up_app(slug, dr, server)
+      stopping = Task.async(fn -> Vagus.App.stop(slug) end)
+      assert_receive {:step, :stop, %{slug: ^slug}, held}, 5_000
+
+      assert {:error, {:restore, ^slug, :busy}} =
+               Backups.restore_partial(backup_slug, [slug], server: server, data_root: dr)
+
+      assert File.read!(Path.join(data_dir(dr, slug), "f.txt")) == "since"
+      assert restore_leftovers(dr) == []
+
+      send(held, {:outcome, {:ok, %{was_running: true}}})
+      assert :ok = Task.await(stopping)
+    end
+
+    test "a failed swap fails the restore before the options or a start", %{
+      data_root: dr,
+      server: server
+    } do
+      slug = "core_restore_swap"
+      backup_slug = backed_up_app(slug, dr, server)
+
+      restore =
+        Task.async(fn ->
+          Backups.restore_partial(backup_slug, [slug], server: server, data_root: dr)
+        end)
+
+      assert_receive {:step, :stop, %{slug: ^slug}, task}, 5_000
+      send(task, {:outcome, {:ok, %{was_running: true}}})
+      assert_receive {:step, :swap_data, _input, task}, 5_000
+      send(task, {:outcome, {:error, :exdev}})
+
+      assert {:error, {:restore, ^slug, :exdev}} = Task.await(restore)
+      refute_received {:step, :start, _input, _task}
+      assert restore_leftovers(dr) == []
+      assert {:ok, %{user_options: %{"greet" => "since"}}} = app_info(slug)
+    end
+
+    # The stop the engine failed may have left the container writing the dir.
+    test "a strict stop's engine error fails the restore before the swap; the app runs on", %{
+      data_root: dr,
+      server: server
+    } do
+      slug = "core_restore_stop"
+      backup_slug = backed_up_app(slug, dr, server)
+
+      restore =
+        Task.async(fn ->
+          Backups.restore_partial(backup_slug, [slug], server: server, data_root: dr)
+        end)
+
+      assert_receive {:step, :stop, %{slug: ^slug, strict: true}, task}, 5_000
+      send(task, {:outcome, {:error, :econnrefused}})
+      assert_receive {:step, :start, %{slug: ^slug}, task}, 5_000
+      send(task, {:outcome, {:ok, %{container_id: "c2"}}})
+
+      assert {:error, {:restore, ^slug, {:stop, :econnrefused}}} = Task.await(restore)
+      refute_received {:step, :swap_data, _input, _task}
+      assert File.read!(Path.join(data_dir(dr, slug), "f.txt")) == "since"
+      assert restore_leftovers(dr) == []
+      assert {:ok, %{state: :started, user_options: %{"greet" => "since"}}} = app_info(slug)
     end
 
     test "restore onto a not-installed slug errors", %{data_root: dr, server: server} do
@@ -323,6 +658,138 @@ defmodule Vagus.BackupsTest do
       # stopped/wiped just because `ghost` (checked second) fails pre-flight.
       assert @backend.calls() == []
       assert File.read!(Path.join(data_dir(dr, slug), "keep.txt")) == "original"
+    end
+  end
+
+  # As an uploaded backup may carry it: `addon_json` verbatim beside staged data.
+  defp backup_with_addon_json(slug, addon_json, server),
+    do:
+      backup_with_inner(
+        slug,
+        [{~c"./addon.json", addon_json}, {~c"./data/f.txt", "from the backup"}],
+        server
+      )
+
+  defp backup_with_inner(slug, members, server) do
+    inner = Path.join(System.tmp_dir!(), "vagus-inner-#{System.unique_integer([:positive])}")
+    :ok = :erl_tar.create(String.to_charlist(inner), members, [:compressed])
+
+    backup_slug = "m#{System.unique_integer([:positive])}" |> String.slice(0, 8)
+    backup_json = Jason.encode!(%{"slug" => backup_slug, "name" => "upload", "type" => "partial"})
+    outer = Path.join(System.tmp_dir!(), "vagus-outer-#{System.unique_integer([:positive])}")
+
+    :ok =
+      :erl_tar.create(String.to_charlist(outer), [
+        {~c"./backup.json", backup_json},
+        {String.to_charlist("./#{slug}.tar.gz"), File.read!(inner)}
+      ])
+
+    {:ok, ^backup_slug} = Backups.put_file(File.read!(outer), server)
+    File.rm!(inner)
+    File.rm!(outer)
+    backup_slug
+  end
+
+  describe "restore_partial/3 of a malformed backup" do
+    for {label, addon_json} <- [
+          {"not an object", "1"},
+          {"not JSON", "{"},
+          {"a non-object user", ~s({"user":"bad"})},
+          {"non-object options", ~s({"user":{"options":[1]}})},
+          {"a non-string state", ~s({"state":1})}
+        ] do
+      test "#{label} fails in pre-flight, nothing staged or touched", %{
+        data_root: dr,
+        server: server
+      } do
+        slug = "core_malformed"
+        install(slug, dr)
+        File.write!(Path.join(data_dir(dr, slug), "f.txt"), "since")
+        backup_slug = backup_with_addon_json(slug, unquote(addon_json), server)
+        :ok = @backend.reset_calls()
+
+        assert {:error, "Addon core_malformed's backup is malformed"} =
+                 Backups.restore_partial(backup_slug, [slug],
+                   server: server,
+                   data_root: dr,
+                   backend: @backend
+                 )
+
+        assert @backend.calls() == []
+        assert File.read!(Path.join(data_dir(dr, slug), "f.txt")) == "since"
+        assert restore_leftovers(dr) == []
+      end
+    end
+
+    for {label, members} <- [
+          {"an inner tar without addon.json", [{~c"./data/f.txt", "from the backup"}]},
+          {"a data member escaping the app dir",
+           [{~c"./addon.json", "{}"}, {~c"./data/../../escape.txt", "out"}]}
+        ] do
+      test "#{label} fails in pre-flight, nothing staged or touched", %{
+        data_root: dr,
+        server: server
+      } do
+        slug = "core_malformed"
+        install(slug, dr)
+        File.write!(Path.join(data_dir(dr, slug), "f.txt"), "since")
+        backup_slug = backup_with_inner(slug, unquote(Macro.escape(members)), server)
+        :ok = @backend.reset_calls()
+
+        assert {:error, "Addon core_malformed's backup is malformed"} =
+                 Backups.restore_partial(backup_slug, [slug],
+                   server: server,
+                   data_root: dr,
+                   backend: @backend
+                 )
+
+        assert @backend.calls() == []
+        assert File.read!(Path.join(data_dir(dr, slug), "f.txt")) == "since"
+        assert restore_leftovers(dr) == []
+      end
+    end
+
+    test "absent user, options and state are accepted", %{
+      data_root: dr,
+      server: server
+    } do
+      slug = "core_bare"
+      install(slug, dr, :stopped, %{"greet" => "kept"})
+      backup_slug = backup_with_addon_json(slug, "{}", server)
+
+      assert :ok = Backups.restore_partial(backup_slug, [slug], server: server, data_root: dr)
+      assert File.read!(Path.join(data_dir(dr, slug), "f.txt")) == "from the backup"
+      assert restore_leftovers(dr) == []
+    end
+  end
+
+  describe "restore_partial/3 when the restore raises" do
+    defmodule RaisingApp do
+      @moduledoc false
+      def restore(_slug, staging_dir, _options, _start?, _opts) do
+        true = File.regular?(Path.join(staging_dir, "f.txt"))
+        raise "restore crashed"
+      end
+    end
+
+    test "the staged data is removed and the raise reaches the caller", %{
+      data_root: dr,
+      server: server
+    } do
+      slug = "core_raising"
+      install(slug, dr, :stopped)
+      File.write!(Path.join(data_dir(dr, slug), "f.txt"), "x")
+      {:ok, backup_slug} = Backups.create_partial(nil, [slug], server: server, data_root: dr)
+
+      assert_raise RuntimeError, "restore crashed", fn ->
+        Backups.restore_partial(backup_slug, [slug],
+          server: server,
+          data_root: dr,
+          app: RaisingApp
+        )
+      end
+
+      assert restore_leftovers(dr) == []
     end
   end
 
@@ -431,5 +898,18 @@ defmodule Vagus.BackupsTest do
       assert :error = Backups.get(backup_slug, server)
       assert :error = Backups.delete(backup_slug, server)
     end
+  end
+
+  defmodule ExitedBackend do
+    @moduledoc false
+    # The fake backend, with no container running, as an engine reports a stopped app.
+    alias Vagus.Addon.Backend.Fake
+
+    defdelegate pull(spec), to: Fake
+    defdelegate create(spec), to: Fake
+    defdelegate start(id), to: Fake
+    defdelegate stop(id, opts), to: Fake
+    defdelegate remove(id, opts), to: Fake
+    def state(_id), do: {:ok, :stopped}
   end
 end

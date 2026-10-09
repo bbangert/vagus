@@ -23,6 +23,7 @@ defmodule Vagus.App.OrchestratorTest do
     Map.merge(
       %{
         import: fn -> :ok end,
+        sweep: fn -> :ok end,
         slugs: fn -> Agent.get(apps, &Enum.map(&1, fn a -> a.config.slug end)) end,
         list: fn -> Agent.get(apps, & &1) end,
         install_default: fn _slug -> :present end,
@@ -610,6 +611,31 @@ defmodule Vagus.App.OrchestratorTest do
     assert Orchestrator.shutdown(name) == {{1, 3}, :ok}
     assert_received {:halt, "good"}
     assert_received :core_stop
+  end
+
+  # The unit, not the orchestrator, keeps it to the first boot in the VM.
+  test "stale backup staging is swept before any app process starts or anything boots" do
+    test_pid = self()
+    sweep = fn -> send(test_pid, :sweep) && :ok end
+    ensure = fn slug -> send(test_pid, {:ensure, slug}) && :ok end
+    install = fn slug -> send(test_pid, {:install, slug}) && :present end
+    broker = app("core_mqtt", "services", native: true)
+    overrides = %{sweep: sweep, ensure: ensure, install_default: install}
+
+    start_orchestrator([broker, app("a", "initialize")], overrides,
+      default_native_app: "core_mqtt"
+    )
+
+    assert [:sweep, {:ensure, "core_mqtt"}, {:ensure, "a"}, {:install, "core_mqtt"} | rest] =
+             collect_until(:complete)
+
+    refute :sweep in rest
+  end
+
+  test "with boot off nothing is swept" do
+    test_pid = self()
+    start_orchestrator([], %{sweep: fn -> send(test_pid, :sweep) && :ok end}, boot: false)
+    refute_received :sweep
   end
 
   test "resume boots again after a shutdown" do

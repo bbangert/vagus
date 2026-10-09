@@ -15,7 +15,7 @@ defmodule Vagus.App.Steps do
   require Logger
 
   alias Vagus.Addon.Backend.{Native, Spec}
-  alias Vagus.Addon.{Config, Devices, OptionsSchema, Ports}
+  alias Vagus.Addon.{Config, Devices, OptionsSchema, Ports, Store}
   alias Vagus.DSP
   alias Vagus.Ingress.Panels
   alias Vagus.Network
@@ -85,6 +85,10 @@ defmodule Vagus.App.Steps do
          {:ok, id} <- backend(opts).create(spec),
          :ok <- start_or_cleanup(id, opts) do
       {:ok, started(config, id, opts)}
+    else
+      error ->
+        Logger.warning("Vagus.App.Steps: #{config.slug} did not start: #{inspect(error)}")
+        error
     end
   end
 
@@ -92,8 +96,9 @@ defmodule Vagus.App.Steps do
     opts = opts(input)
     id = container_name(config.slug)
     was_running = match?({:ok, :running}, backend(opts).state(id))
-    stop_and_remove_container(id, opts)
-    {:ok, %{was_running: was_running}}
+
+    with :ok <- stop_and_remove_container(id, opts, input[:strict] == true),
+         do: {:ok, %{was_running: was_running}}
   end
 
   # Shutdown: stop by name and leave the container for the next boot to
@@ -115,25 +120,38 @@ defmodule Vagus.App.Steps do
     pick_port(directory, probe, rand, @port_tries)
   end
 
+  # Planned for every hot backup, whose container may not exist: with none,
+  # nothing is writing, so there is nothing for the hook to quiesce.
   defp step(:exec_hook, %{config: config, cmd: cmd} = input) do
     docker = input[:docker] || Vagus.Runtime.Docker
+    id = container_name(config.slug)
 
-    case docker.exec(container_name(config.slug), cmd, Keyword.take(opts(input), [:socket])) do
-      :ok -> {:ok, :ok}
-      {:error, reason} -> {:error, reason}
+    case docker.exec(id, cmd, Keyword.take(opts(input), [:socket])) do
+      :ok ->
+        {:ok, :ok}
+
+      {:error, {:exec_create_failed, 404, _message}} ->
+        Logger.info("Vagus.App.Steps: no container #{id}; backup hook skipped")
+        {:ok, :skipped}
+
+      {:error, reason} ->
+        Logger.warning("Vagus.App.Steps: backup hook in #{id} failed: #{inspect(reason)}")
+        {:error, reason}
     end
   end
 
   # path is internal/config-derived, not request input
   # sobelow_skip ["Traversal.FileModule"]
   defp step(:snapshot, %{config: config, staging_dir: dir} = input) do
+    opts = opts(input)
+
     addon = %{
       slug: config.slug,
       name: config.name,
       version: config.version,
-      data_dir: data_dir(data_root(opts(input)), config.slug),
+      data_dir: data_dir(data_root(opts), config.slug),
       user: %{"options" => input[:user_options] || %{}, "version" => config.version},
-      system: input[:system] || %{},
+      system: system_map(config),
       state: input[:state] || "stopped"
     }
 
@@ -143,6 +161,60 @@ defmodule Vagus.App.Steps do
          :ok <- File.mkdir_p(dir),
          :ok <- File.write(path, gz) do
       {:ok, path}
+    end
+  end
+
+  # As upstream's wipe-then-extract, there is no rollback: a crash or failure
+  # between the two leaves the app on an empty data dir, and the caller, who
+  # got no reply or the error, retries. The staging dir is a sibling of the
+  # data dir, so the rename stays on one filesystem. The staging path comes
+  # from the op's args and is renamed and removed as root, so anything but
+  # this app's own restore sibling is refused.
+  # path is internal/config-derived, not request input
+  # sobelow_skip ["Traversal.FileModule"]
+  defp step(:swap_data, %{config: config, staging_dir: staging} = input) do
+    data_dir = data_dir(data_root(opts(input)), config.slug)
+
+    with :ok <- restore_sibling(staging, data_dir, config.slug),
+         {:ok, _removed} <- File.rm_rf(data_dir),
+         :ok <- File.rename(staging, data_dir) do
+      {:ok, data_dir}
+    else
+      {:error, :bad_staging} = error ->
+        error
+
+      {:error, reason, path} ->
+        File.rm_rf(staging)
+        data_dir_failure(config.slug, path, reason)
+
+      error ->
+        File.rm_rf(staging)
+        error
+    end
+  end
+
+  # The backup's options are validated against the config current in this
+  # op, as a save to `POST /addons/{slug}/options` is: a `hassio_role:
+  # backup` app can upload a tar and restore it onto another app, so the tar
+  # is the less trusted input. This bounds the options only, and only as far
+  # as the schema is narrow: an app without one accepts anything, as
+  # upstream's does, and the tar's data is swapped in as it is. Options that
+  # do not validate are dropped and the current ones kept, rather than
+  # failing the restore: a schema that tightened since the backup must not
+  # cost the user the data they restored. The raw map is kept, as a save
+  # keeps it.
+  defp step(:set_options, %{config: config, options: options}) do
+    with true <- is_map(options) || {:error, "not a map"},
+         {:ok, _validated} <- OptionsSchema.effective(config.schema, config.options, options) do
+      {:ok, options}
+    else
+      {:error, reason} ->
+        Logger.warning(
+          "Vagus.App.Steps: #{config.slug}'s backed-up options do not validate against its " <>
+            "installed schema (#{reason}) — keeping the current options, restore continuing"
+        )
+
+        {:ok, nil}
     end
   end
 
@@ -178,6 +250,44 @@ defmodule Vagus.App.Steps do
       :ok -> {:ok, :ok}
       {:error, reason} -> {:error, reason}
     end
+  end
+
+  # `addon.json`'s `system` block. A restoring HAOS validates it against
+  # `SCHEMA_APP_SYSTEM` (the app config schema plus a required `repository`)
+  # and uses it to find the image of an app the target lacks. Only keys whose
+  # parsed shape is the wire shape are emitted: upstream defaults an absent
+  # optional key, where a wrong shape fails the schema.
+  defp system_map(config) do
+    system = %{
+      "name" => config.name,
+      "version" => config.version,
+      "slug" => config.slug,
+      "description" => config.description,
+      "arch" => config.arch,
+      "startup" => config.startup,
+      "boot" => config.boot,
+      "init" => config.init,
+      "repository" => repository_of(config.slug)
+    }
+
+    if config.image, do: Map.put(system, "image", config.image), else: system
+  end
+
+  # An app no longer in any repository falls back to `"core"`, which the info
+  # payload already claims for every installed app.
+  defp repository_of(slug) do
+    case Store.get(slug) do
+      {:ok, %{repository: repository}} when is_binary(repository) -> repository
+      _absent_or_unshaped -> "core"
+    end
+  end
+
+  defp restore_sibling(staging, data_dir, slug) do
+    sibling? =
+      Path.dirname(staging) == Path.dirname(data_dir) and
+        Regex.match?(~r/\A\.restore-#{Regex.escape(slug)}-\d+\z/, Path.basename(staging))
+
+    if sibling?, do: :ok, else: {:error, :bad_staging}
   end
 
   defp opts(input),
@@ -701,17 +811,34 @@ defmodule Vagus.App.Steps do
 
   defp data_dir(data_root, slug), do: Path.join([data_root, "addons", "data", slug])
 
-  # Both calls are tolerated: an absent or stopped container is success at the
-  # backend, and a failing daemon must not keep a stop from completing.
-  defp stop_and_remove_container(id, opts) do
-    with {:error, reason} <- backend(opts).stop(id, opts),
-         do: Logger.warning("Vagus.App.Steps: stop #{id} failed (tolerated): #{inspect(reason)}")
+  # An absent or stopped container is success; otherwise a failing daemon must
+  # not keep a stop from completing, unless the stop is strict. A failed
+  # remove leaves the container stopped, so it is tolerated either way.
+  defp stop_and_remove_container(id, opts, strict?) do
+    with :ok <- stop_container(id, opts, strict?) do
+      with {:error, reason} <- backend(opts).remove(id, opts),
+           do:
+             Logger.warning(
+               "Vagus.App.Steps: remove #{id} failed (tolerated): #{inspect(reason)}"
+             )
 
-    with {:error, reason} <- backend(opts).remove(id, opts),
-         do:
-           Logger.warning("Vagus.App.Steps: remove #{id} failed (tolerated): #{inspect(reason)}")
+      :ok
+    end
+  end
 
-    :ok
+  defp stop_container(id, opts, strict?) do
+    case backend(opts).stop(id, opts) do
+      result when result in [:ok, {:error, {:http, 404}}] ->
+        :ok
+
+      {:error, reason} = error when strict? ->
+        Logger.error("Vagus.App.Steps: stop #{id} failed: #{inspect(reason)}")
+        error
+
+      {:error, reason} ->
+        Logger.warning("Vagus.App.Steps: stop #{id} failed (tolerated): #{inspect(reason)}")
+        :ok
+    end
   end
 
   # Image removal goes straight through `Vagus.Runtime.Docker` (not the
@@ -752,7 +879,7 @@ defmodule Vagus.App.Steps do
     if Config.valid_slug?(slug) do
       case File.rm_rf(Path.join([data_root(opts), "addons", "data", slug])) do
         {:ok, _removed} -> :ok
-        {:error, reason, path} -> {:error, {:remove_data_dir, path, reason}}
+        {:error, reason, path} -> data_dir_failure(slug, path, reason)
       end
     else
       Logger.warning(
@@ -761,6 +888,13 @@ defmodule Vagus.App.Steps do
 
       {:error, {:invalid_slug, slug}}
     end
+  end
+
+  # The path names a file inside the app's data dir, which the reply must not
+  # disclose: a `hassio_role: backup` app can restore onto another app.
+  defp data_dir_failure(slug, path, reason) do
+    Logger.warning("Vagus.App.Steps: #{slug} data dir: #{path} not removed (#{inspect(reason)})")
+    {:error, {:remove_data_dir, reason}}
   end
 
   # Uninstall only, as upstream: Core answers a push for a panel it already

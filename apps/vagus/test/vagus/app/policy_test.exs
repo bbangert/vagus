@@ -451,12 +451,22 @@ defmodule Vagus.App.PolicyTest do
         {:restart, %{}, [{:stop, nil}, {:port?, nil}, {:mint_token, nil}, {:start, nil}]},
         {:uninstall, %{}, [{:stop, nil}, {:delete_file, nil}, {:remove_app, nil}]},
         {:halt, %{}, [{:halt_stop, nil}]},
+        {:restore, %{start?: false}, [{:stop, :strict}, {:swap_data, nil}, {:set_options, nil}]},
+        {:restore, %{start?: true},
+         [
+           {:stop, :strict},
+           {:swap_data, nil},
+           {:set_options, nil},
+           {:port?, nil},
+           {:mint_token, nil},
+           {:start, nil}
+         ]},
         {:update, %{config: app_config(%{"version" => "2"})},
          [{:pull, nil}, {:stop, nil}, {:commit, nil}, {:start?, nil}, {:reclaim_image, nil}]},
         {:update, %{config: app_config(%{"version" => "2"}), backup: true},
          [
            {:pull, nil},
-           {:stop, nil},
+           {:stop, :strict},
            {:snapshot, nil},
            {:commit, nil},
            {:start?, nil},
@@ -468,18 +478,28 @@ defmodule Vagus.App.PolicyTest do
           do: assert(%{op: ^op, steps: ^steps} = Policy.plan(op, args, running()))
     end
 
-    test "backups: cold stops; hot runs the hooks only while running; native only snapshots" do
+    test "backups: cold stops; hot always runs a container app's hooks; native only snapshots" do
       cold = running(%{config: app_config(%{"backup" => "cold"})})
 
       assert Policy.plan(:backup, %{}, cold).steps ==
-               [{:stop, nil}, {:snapshot, nil}, {:start?, nil}]
+               [{:stop, :strict}, {:snapshot, nil}, {:start?, nil}]
 
       hooks = app_config(%{"backup_pre" => "pre", "backup_post" => "post"})
 
       assert Policy.plan(:backup, %{}, running(%{config: hooks})).steps ==
                [{:exec_hook, :pre}, {:snapshot, nil}, {:exec_hook, :post}]
 
-      assert Policy.plan(:backup, %{}, app(%{config: hooks})).steps == [{:snapshot, nil}]
+      # A restarted process holds no container id until its adoption, while
+      # the old container may still be running and writing, so hooked too.
+      assert Policy.plan(:backup, %{}, app(%{config: hooks, container_id: nil})).steps ==
+               [{:exec_hook, :pre}, {:snapshot, nil}, {:exec_hook, :post}]
+
+      # A stop the engine refused yet tolerated leaves a container these
+      # facts no longer know; the hook step skips one that is not there.
+      stopped = app(%{config: hooks, wanted: :stopped, last_event: :stopped})
+
+      assert Policy.plan(:backup, %{}, stopped).steps ==
+               [{:exec_hook, :pre}, {:snapshot, nil}, {:exec_hook, :post}]
 
       native = running(%{config: %{native_config() | backup_pre: "pre"}})
       assert Policy.plan(:backup, %{}, native).steps == [{:snapshot, nil}]
@@ -597,13 +617,133 @@ defmodule Vagus.App.PolicyTest do
       assert data.container_id == nil
     end
 
+    test "restore: stop, swap the staged data in, save the options, then start with them" do
+      args = %{staging_dir: "/s", options: %{"o" => 2}, start?: true}
+
+      {data, effects} =
+        begin(:restore, args, running(%{token_hash: "h", user_options: %{"o" => 1}}))
+
+      assert List.last(effects) == {:step, {:stop, :strict}}
+      assert %{strict: true} = Policy.task_input({:stop, :strict}, data)
+      refute Map.has_key?(Policy.task_input({:stop, nil}, data), :strict)
+      assert %{wanted: :started, token_hash: nil} = data
+
+      {data, effects} = step(data, {:ok, %{was_running: true}})
+      assert List.last(effects) == {:step, {:swap_data, nil}}
+      assert data.wanted == :stopped
+      assert %{staging_dir: "/s"} = Policy.task_input({:swap_data, nil}, data)
+
+      {data, effects} = step(data, {:ok, "/data/addons/data/app_one"})
+      assert effects == [{:step, {:set_options, nil}}]
+
+      assert %{options: %{"o" => 2}, config: %{slug: "app_one"}} =
+               Policy.task_input({:set_options, nil}, data)
+
+      {data, effects} = step(data, {:ok, %{"o" => 2}})
+      assert [:persist, {:keys, [{:token, _hash}], []}, {:step, {:start, nil}}] = effects
+      assert %{user_options: %{"o" => 2}} = Policy.task_input({:start, nil}, data)
+
+      {data, effects} = step(data, {:ok, %{container_id: "c2", ip: @ip}})
+      assert Enum.take(effects, -3) == [:persist, {:reply, :ok}, :idle]
+      assert data.wanted == :started
+    end
+
+    test "restore without options or a start keeps the options and leaves the app stopped" do
+      args = %{staging_dir: "/s", options: nil, start?: false}
+      {data, _} = begin(:restore, args, running(%{user_options: %{"o" => 1}}))
+      {data, _} = step(data, {:ok, %{was_running: true}})
+      {data, effects} = step(data, {:ok, "/data/addons/data/app_one"})
+
+      assert effects == [:persist, {:reply, :ok}, :idle]
+      assert %{wanted: :stopped, user_options: %{"o" => 1}} = data
+    end
+
+    test "restore: options the step rejects keep the current ones" do
+      args = %{staging_dir: "/s", options: %{"o" => "bad"}, start?: false}
+      {data, _} = begin(:restore, args, running(%{user_options: %{"o" => 1}}))
+      {data, _} = step(data, {:ok, %{was_running: true}})
+      {data, [{:step, {:set_options, nil}}]} = step(data, {:ok, "/data/addons/data/app_one"})
+      {data, effects} = step(data, {:ok, nil})
+
+      assert effects == [:persist, {:reply, :ok}, :idle]
+      assert data.user_options == %{"o" => 1}
+    end
+
+    test "restore: options written since it began, even the same ones, are kept" do
+      data = running(%{user_options: %{"o" => 1}})
+      assert data.options_rev == 0
+      assert %{options_rev: 1, user_options: %{"o" => 1}} = Policy.put_options(data, %{"o" => 1})
+
+      args = %{staging_dir: "/s", options: %{"o" => 2}, start?: false}
+      {data, _} = begin(:restore, args, data)
+      assert data.run.acc.options_rev == 0
+      {data, _} = step(data, {:ok, %{was_running: true}})
+      {data, [{:step, {:set_options, nil}}]} = step(data, {:ok, "/data/addons/data/app_one"})
+
+      data = Policy.put_options(data, %{"o" => 1})
+      assert data.options_rev == 1
+      {data, effects} = step(data, {:ok, %{"o" => 2}})
+
+      assert effects == [:persist, {:reply, :ok}, :idle]
+      assert %{user_options: %{"o" => 1}, options_rev: 1} = data
+    end
+
+    test "restore: its own commit bumps the revision" do
+      args = %{staging_dir: "/s", options: %{"o" => 2}, start?: false}
+      {data, _} = begin(:restore, args, running(%{user_options: %{"o" => 1}}))
+      {data, _} = step(data, {:ok, %{was_running: true}})
+      {data, _} = step(data, {:ok, "/data/addons/data/app_one"})
+      {data, effects} = step(data, {:ok, %{"o" => 2}})
+
+      assert [:persist, :persist, {:reply, :ok}, :idle] = effects
+      assert %{user_options: %{"o" => 2}, options_rev: 1} = data
+    end
+
+    # A container the engine failed to stop may still be writing the dir, so
+    # the data stays as it was, and so does the app, as after a backup's.
+    test "restore: a strict stop's engine error ends it before the swap and starts the app again" do
+      args = %{staging_dir: "/s", options: %{"o" => 2}, start?: true}
+      {data, _} = begin(:restore, args, running(%{user_options: %{"o" => 1}}))
+      {data, effects} = step(data, {:error, :econnrefused})
+      assert List.last(effects) == {:step, {:start, nil}}
+      refute Enum.any?(effects, &match?({:step, {:swap_data, _}}, &1))
+
+      {data, effects} = step(data, {:ok, %{container_id: "c2", ip: @ip}})
+
+      assert Enum.take(effects, -3) ==
+               [:persist, {:reply, {:error, {:stop, :econnrefused}}}, :idle]
+
+      assert %{user_options: %{"o" => 1}, wanted: :started, container_id: "c2"} = data
+    end
+
+    test "restore: a strict stop's engine error leaves a stopped app stopped" do
+      args = %{staging_dir: "/s", options: nil, start?: true}
+      {data, _} = begin(:restore, args, app(%{wanted: :stopped}))
+      {data, effects} = step(data, {:error, :econnrefused})
+
+      assert Enum.reject(effects, &match?({:emit, _}, &1)) ==
+               [:persist, {:reply, {:error, {:stop, :econnrefused}}}, :idle]
+
+      assert data.wanted == :stopped
+    end
+
+    test "restore: a failed swap ends it before the options are touched" do
+      args = %{staging_dir: "/s", options: %{"o" => 2}, start?: true}
+      {data, _} = begin(:restore, args, running(%{user_options: %{"o" => 1}}))
+      {data, _} = step(data, {:ok, %{was_running: true}})
+      {data, effects} = step(data, {:error, :exdev})
+
+      assert effects == [:persist, {:reply, {:error, :exdev}}, :idle]
+      assert %{user_options: %{"o" => 1}, wanted: :stopped} = data
+    end
+
     test "5-8. update with a backup: pull, stop, snapshot, commit, start fails, rollback" do
       old = running().config
       target = app_config(%{"version" => "2"})
       {data, [{:step, {:pull, nil}}]} = begin(:update, %{config: target, backup: true}, running())
 
       {data, [{:keys, [], [{:dns, "app-one"}]} | _] = effects} = step(data, {:ok, "img:2"})
-      assert List.last(effects) == {:step, {:stop, nil}}
+      assert List.last(effects) == {:step, {:stop, :strict}}
       assert data.wanted == :started
 
       # 5. the stop records was_running and goes on to the snapshot
@@ -643,6 +783,36 @@ defmodule Vagus.App.PolicyTest do
              ]
 
       assert data.container_id == "c3"
+    end
+
+    # A container the engine failed to stop could write under the snapshot.
+    test "update with a backup: a strict stop's engine error commits nothing and starts the old version" do
+      old = running().config
+      target = app_config(%{"version" => "2"})
+      {data, _} = begin(:update, %{config: target, backup: true}, running())
+      {data, _} = step(data, {:ok, "img:2"})
+      {data, effects} = step(data, {:error, :econnrefused})
+
+      assert List.last(effects) == {:step, {:start, nil}}
+      refute Enum.any?(effects, &(&1 == :persist))
+      assert data.config == old
+      assert data.run.steps == []
+
+      {data, effects} = step(data, {:ok, %{container_id: "c2", ip: @ip}})
+
+      assert Enum.take(effects, -3) == [
+               :persist,
+               {:reply, {:error, {:stop, :econnrefused}}},
+               :idle
+             ]
+
+      assert %{config: ^old, container_id: "c2"} = data
+    end
+
+    test "update without a backup keeps the tolerant stop" do
+      {data, _} = begin(:update, %{config: app_config(%{"version" => "2"})}, running())
+      {_data, effects} = step(data, {:ok, "img:2"})
+      assert List.last(effects) == {:step, {:stop, nil}}
     end
 
     test "update success reclaims the old image and reports the versions" do
@@ -786,6 +956,78 @@ defmodule Vagus.App.PolicyTest do
       {data, effects} = step(data, {:ok, %{container_id: "c2", ip: @ip}})
       assert Enum.take(effects, -3) == [:persist, {:reply, {:error, :enospc}}, :idle]
       assert data.wanted == :started
+    end
+
+    test "backup cold: a strict stop's engine error fails before the snapshot and starts the app again" do
+      cold = running(%{config: app_config(%{"backup" => "cold"})})
+      {data, effects} = begin(:backup, %{staging_dir: "/s"}, cold)
+      assert List.last(effects) == {:step, {:stop, :strict}}
+      assert %{strict: true} = Policy.task_input({:stop, :strict}, data)
+
+      {data, effects} = step(data, {:error, :econnrefused})
+      assert List.last(effects) == {:step, {:start, nil}}
+      refute Enum.any?(effects, &match?({:step, {:snapshot, _}}, &1))
+
+      {data, effects} = step(data, {:ok, %{container_id: "c2", ip: @ip}})
+
+      assert Enum.take(effects, -3) == [
+               :persist,
+               {:reply, {:error, {:stop, :econnrefused}}},
+               :idle
+             ]
+
+      assert %{wanted: :started, container_id: "c2"} = data
+    end
+
+    test "backup cold: a strict stop that died is cleaned up by name, as any dead stop" do
+      cold = running(%{config: app_config(%{"backup" => "cold"})})
+      {data, _} = begin(:backup, %{staging_dir: "/s"}, cold)
+      {_data, effects} = step(data, {:error, :died})
+      assert List.last(effects) == {:step, {:stop, :by_name}}
+    end
+
+    test "backup cold of a crashed app that should run starts it, so its cancelled restart is not lost" do
+      cold = app(%{config: app_config(%{"backup" => "cold"}), last_event: {:exited, 1}})
+      {data, effects} = begin(:backup, %{staging_dir: "/s"}, cold)
+      assert {:cancel, :retry} in effects
+      {data, _} = step(data, {:ok, %{was_running: false}})
+      assert Policy.task_input({:snapshot, nil}, data).state == "started"
+
+      {data, effects} = step(data, {:ok, "/s/app_one.tar.gz"})
+      assert List.last(effects) == {:step, {:start, nil}}
+      {_data, effects} = step(data, {:ok, %{container_id: "c2", ip: @ip}})
+      assert Enum.take(effects, -3) == [:persist, {:reply, {:ok, "/s/app_one.tar.gz"}}, :idle]
+    end
+
+    # The snapshot is done before the restart, so it stands however the
+    # restart fails; the app's failure is its own, on the ladder.
+    test "backup cold: a restart that dies keeps the snapshot and joins the ladder" do
+      cold = running(%{config: app_config(%{"backup" => "cold"})})
+      {data, _} = begin(:backup, %{staging_dir: "/s"}, cold)
+      {data, _} = step(data, {:ok, %{was_running: true}})
+      {data, _} = step(data, {:ok, "/s/app_one.tar.gz"})
+
+      for dead <- [:died, :timeout] do
+        {data, effects} = step(data, {:error, dead})
+        assert List.last(effects) == {:step, {:stop, :by_name}}
+        {data, effects} = step(data, {:ok, %{was_running: false}})
+
+        assert [:persist, {:reply, {:ok, "/s/app_one.tar.gz"}}, {:timer, :retry, _, _}, :idle] =
+                 Enum.reject(effects, &match?({:emit, _}, &1))
+
+        assert %{last_event: {:failed, ^dead}, attempt: 1} = data
+      end
+    end
+
+    test "backup cold: a restart that errors keeps the snapshot" do
+      cold = running(%{config: app_config(%{"backup" => "cold"})})
+      {data, _} = begin(:backup, %{staging_dir: "/s"}, cold)
+      {data, _} = step(data, {:ok, %{was_running: true}})
+      {data, _} = step(data, {:ok, "/s/app_one.tar.gz"})
+      {data, effects} = step(data, {:error, :enospc})
+
+      assert Enum.take(effects, -3) == [:persist, {:reply, {:ok, "/s/app_one.tar.gz"}}, :idle]
+      assert data.last_event == {:failed, :enospc}
     end
 
     test "backup cold of a stopped app does not start it" do
@@ -991,6 +1233,40 @@ defmodule Vagus.App.PolicyTest do
       assert Policy.task_input({:pull, nil}, data).config.version == "2"
     end
 
+    test "a snapshot takes the staging dir, the options and the state it records" do
+      opts = %{"o" => 1}
+      hot = running(%{user_options: opts})
+      {data, [{:step, {:snapshot, nil}}]} = begin(:backup, %{staging_dir: "/s"}, hot)
+
+      assert %{staging_dir: "/s", user_options: ^opts, state: "started"} =
+               Policy.task_input({:snapshot, nil}, data)
+
+      cold = running(%{config: app_config(%{"backup" => "cold"})})
+      {data, _} = begin(:backup, %{staging_dir: "/s"}, cold)
+      {data, effects} = step(data, {:ok, %{was_running: true}})
+      assert List.last(effects) == {:step, {:snapshot, nil}}
+      assert %{state: "started"} = Policy.task_input({:snapshot, nil}, data)
+
+      {data, _} = begin(:backup, %{staging_dir: "/s"}, app(%{wanted: :stopped}))
+      assert %{state: "stopped"} = Policy.task_input({:snapshot, nil}, data)
+    end
+
+    test "a hot backup of a crashed app that should run records it started, as a cold one does" do
+      crashed = app(%{last_event: {:exited, 1}})
+      {data, [{:step, {:snapshot, nil}}]} = begin(:backup, %{staging_dir: "/s"}, crashed)
+      assert %{state: "started"} = Policy.task_input({:snapshot, nil}, data)
+    end
+
+    test "an update's snapshot takes the staging dir and the state before the stop" do
+      args = %{config: app_config(%{"version" => "2"}), backup: true, staging_dir: "/s"}
+      {data, _} = begin(:update, args, running())
+      {data, _} = step(data, {:ok, "img"})
+      {data, effects} = step(data, {:ok, %{was_running: true}})
+      assert List.last(effects) == {:step, {:snapshot, nil}}
+
+      assert %{staging_dir: "/s", state: "started"} = Policy.task_input({:snapshot, nil}, data)
+    end
+
     test "every task step has a deadline" do
       for name <- [
             :pull,
@@ -1000,10 +1276,16 @@ defmodule Vagus.App.PolicyTest do
             :halt_stop,
             :snapshot,
             :exec_hook,
+            :swap_data,
+            :set_options,
             :remove_app,
             :reclaim_image
           ],
           do: assert(Policy.deadline(name) > 0)
+    end
+
+    test "the swap, which removes the old data dir, has a snapshot's deadline" do
+      assert Policy.deadline(:swap_data) == Policy.deadline(:snapshot)
     end
   end
 end

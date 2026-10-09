@@ -509,7 +509,7 @@ defmodule Vagus.App.ServerTest do
     test "an uninstall whose data dir cannot be removed replies why; the file stays gone" do
       {slug, pid} = installed()
       ref = Process.monitor(pid)
-      failure = {:remove_data_dir, "/data/addons/data/#{slug}/locked", :eacces}
+      failure = {:remove_data_dir, :eacces}
 
       t = op(pid, {:uninstall, %{}})
       answer(:stop, {:ok, %{was_running: false}})
@@ -726,6 +726,17 @@ defmodule Vagus.App.ServerTest do
       assert [{^pa, ^a}] = lookup({:ingress_port, 62_011})
     end
 
+    test "a hot snapshot killed at its deadline fails the backup" do
+      app_deadlines(%{snapshot: 100})
+      {_slug, pid} = started()
+      t = op(pid, {:backup, %{staging_dir: "/nonexistent"}})
+      {_input, task} = step(:snapshot)
+      ref = Process.monitor(task)
+
+      assert_receive {:DOWN, ^ref, :process, ^task, :killed}, 1_000
+      assert {:error, :timeout} = Task.await(t)
+    end
+
     test "a container event during an operation is handled once, after it" do
       {slug, pid} = started(%{}, watchdog: true)
       t = op(pid, {:backup, %{staging_dir: "/nonexistent"}})
@@ -750,6 +761,72 @@ defmodule Vagus.App.ServerTest do
       assert {:error, {:ingress_port, {:port_taken, {:ingress_port, 62_001}}}} = Task.await(t)
       assert [{^holder, _}] = lookup({:ingress_port, 62_001})
       assert {:ok, %{ingress_port: nil}} = App.info(slug)
+    end
+  end
+
+  describe "restore" do
+    test "revokes the old token before the stop and saves the options before the start" do
+      {slug, pid} = started()
+      old = data(pid).token_hash
+      args = %{staging_dir: "/s", options: %{"greeting" => "restored"}, start?: true}
+      t = op(pid, {:restore, args})
+
+      {_input, task} = step(:stop)
+      assert lookup({:token, old}) == []
+      send(task, {:outcome, {:ok, %{was_running: true}}})
+      assert %{staging_dir: "/s"} = answer(:swap_data, {:ok, "/data"})
+      assert %{options: %{"greeting" => "restored"}} = answer(:set_options, {:ok, args.options})
+
+      {input, task} = step(:start)
+      assert {:ok, %{user_options: %{"greeting" => "restored"}}} = AppFile.read(slug)
+      assert [{^pid, ^slug}] = lookup({:token, Policy.hash(input.token)})
+      send(task, {:outcome, {:ok, @started}})
+
+      assert :ok = Task.await(t)
+      assert {:ok, %{state: :started, user_options: %{"greeting" => "restored"}}} = App.info(slug)
+    end
+
+    test "an options write during a restore is applied at once and survives it" do
+      {slug, pid} = started()
+      args = %{staging_dir: "/s", options: %{"greeting" => "restored"}, start?: true}
+      t = op(pid, {:restore, args})
+      {_input, stopping} = step(:stop)
+
+      # Answered while the stop is still held, not after the restore.
+      assert :ok = App.set(slug, options: %{"greeting" => "mine"})
+      assert {:ok, %{user_options: %{"greeting" => "mine"}}} = AppFile.read(slug)
+
+      send(stopping, {:outcome, {:ok, %{was_running: true}}})
+      answer(:swap_data, {:ok, "/data"})
+      answer(:set_options, {:ok, args.options})
+      assert %{user_options: %{"greeting" => "mine"}} = answer(:start, {:ok, @started})
+
+      assert :ok = Task.await(t)
+      assert {:ok, %{state: :started, user_options: %{"greeting" => "mine"}}} = App.info(slug)
+      assert {:ok, %{user_options: %{"greeting" => "mine"}}} = AppFile.read(slug)
+    end
+
+    test "a mid-restore write of the options it began with still wins" do
+      {slug, pid} =
+        started(%{"options" => %{"greeting" => "hi"}, "schema" => %{"greeting" => "str"}})
+
+      assert :ok = App.set(slug, options: %{"greeting" => "before"})
+      before = data(pid)
+      args = %{staging_dir: "/s", options: %{"greeting" => "restored"}, start?: true}
+      t = op(pid, {:restore, args})
+      {_input, stopping} = step(:stop)
+
+      assert :ok = App.set(slug, options: before.user_options)
+
+      send(stopping, {:outcome, {:ok, %{was_running: true}}})
+      answer(:swap_data, {:ok, "/data"})
+      answer(:set_options, {:ok, args.options})
+      assert %{user_options: %{"greeting" => "before"}} = answer(:start, {:ok, @started})
+
+      assert :ok = Task.await(t)
+      assert data(pid).options_rev == before.options_rev + 1
+      assert {:ok, %{user_options: %{"greeting" => "before"}}} = App.info(slug)
+      assert {:ok, %{user_options: %{"greeting" => "before"}}} = AppFile.read(slug)
     end
   end
 
@@ -780,6 +857,20 @@ defmodule Vagus.App.ServerTest do
 
       assert {:ok, %{config: %{version: "2"}, user_options: %{"greeting" => "new"}}} =
                App.info(slug)
+    end
+
+    test "a backup is snapshotted into the caller's staging dir between the stop and the start" do
+      {slug, pid} = started(@v1)
+      t = op(pid, {:update, %{config: target(slug), backup: true, staging_dir: "/s"}})
+      answer(:pull, {:ok, "x/y:2"})
+      answer(:stop, {:ok, %{was_running: true}})
+
+      assert %{staging_dir: "/s", state: "started", config: %{version: "1"}} =
+               answer(:snapshot, {:ok, "/s/#{slug}.tar.gz"})
+
+      answer(:start, {:ok, @started})
+      answer(:reclaim_image, {:ok, :ok})
+      assert {:ok, %{from: "1", to: "2"}} = Task.await(t)
     end
 
     test "a start that fails on the new version rolls back to the old one" do
@@ -989,6 +1080,7 @@ defmodule Vagus.App.ServerTest do
         {{:call, from}, {:provide_service, "mqtt", %{"password" => "p"}}},
         {{:call, from}, {:add_discovery, "mqtt", %{"password" => "p"}}},
         {{:call, from}, {:set, [options: %{"password" => "p"}]}},
+        {{:call, from}, {:restore, %{staging_dir: "/s", options: %{"password" => "p"}}}},
         {{:call, from}, :info}
       ]
 
