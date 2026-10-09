@@ -125,4 +125,48 @@ defmodule Vagus.Discovery.PushQueueTest do
     assert_receive {:pushed, :post, pushed}, 1_000
     assert pushed == %{uuid: "queue-5", addon: "a", service: "s"}
   end
+
+  test "identical POSTs queued behind a push in flight reach Core once" do
+    pusher = hold_discovery_queue(:pushed)
+    for _ <- 1..100, do: :ok = Push.notify(:post, message(6))
+
+    assert release_discovery_queue(pusher, :pushed) == [{:post, "queue-6"}]
+  end
+
+  test "coalescing keeps a uuid's POST, DELETE and re-POST in order" do
+    pusher = hold_discovery_queue(:pushed)
+
+    for method <- [:post, :delete, :post], _ <- 1..3, do: :ok = Push.notify(method, message(7))
+
+    assert release_discovery_queue(pusher, :pushed) ==
+             [{:post, "queue-7"}, {:delete, "queue-7"}, {:post, "queue-7"}]
+  end
+
+  test "a full queue sheds its oldest POSTs, with one warning, and never a DELETE" do
+    pusher = hold_discovery_queue(:pushed)
+    max = :sys.get_state(Push).max_pending
+    :sys.replace_state(Push, &%{&1 | max_pending: 3})
+    on_exit(fn -> :sys.replace_state(Push, &%{&1 | max_pending: max}) end)
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        :ok = Push.notify(:delete, message(8))
+        for n <- 9..12, do: :ok = Push.notify(:post, message(n))
+        for n <- 13..14, do: :ok = Push.notify(:delete, message(n))
+        # Nothing left to shed: the POST is dropped, the DELETE goes over the cap.
+        :ok = Push.notify(:post, message(15))
+        :ok = Push.notify(:delete, message(16))
+        # Else the release's own drain marker would shed too.
+        :sys.replace_state(Push, &%{&1 | max_pending: max})
+
+        assert release_discovery_queue(pusher, :pushed) == [
+                 {:delete, "queue-8"},
+                 {:delete, "queue-13"},
+                 {:delete, "queue-14"},
+                 {:delete, "queue-16"}
+               ]
+      end)
+
+    assert length(String.split(log, "shedding the oldest POSTs")) == 2
+  end
 end

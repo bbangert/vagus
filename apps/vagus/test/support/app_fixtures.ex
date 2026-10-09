@@ -137,5 +137,61 @@ defmodule Vagus.AppFixtures do
     :ok
   end
 
+  @doc """
+  Stalls the push queue behind one held push and returns its pusher; send it
+  `:release` to let the queue go. Every other push is sent to the test as
+  `{tag, method, message}`.
+  """
+  @spec hold_discovery_queue(atom()) :: pid()
+  def hold_discovery_queue(tag) do
+    test_pid = self()
+    hold = "hold-#{System.unique_integer([:positive])}"
+    prev = Application.get_env(:vagus, :discovery_push)
+
+    Application.put_env(:vagus, :discovery_push, fn
+      _method, %{uuid: ^hold} ->
+        send(test_pid, {:discovery_queue_held, self()})
+
+        receive do
+          :release -> :ok
+        after
+          5_000 -> exit(:queue_never_released)
+        end
+
+      method, message ->
+        send(test_pid, {tag, method, message})
+        :ok
+    end)
+
+    on_exit(fn ->
+      if is_nil(prev),
+        do: Application.delete_env(:vagus, :discovery_push),
+        else: Application.put_env(:vagus, :discovery_push, prev)
+    end)
+
+    :ok = Vagus.Discovery.Push.notify(:delete, %{uuid: hold, addon: "", service: ""})
+    assert_receive {:discovery_queue_held, pusher}, 5_000
+    pusher
+  end
+
+  @doc "Releases a `hold_discovery_queue/1` and returns every push after it as `{method, uuid}`, in delivery order."
+  @spec release_discovery_queue(pid(), atom()) :: [{:post | :delete, String.t()}]
+  def release_discovery_queue(pusher, tag) do
+    send(pusher, :release)
+    drain = "drain-#{System.unique_integer([:positive])}"
+    :ok = Vagus.Discovery.Push.notify(:delete, %{uuid: drain, addon: "", service: ""})
+    collect_pushes(tag, drain, [])
+  end
+
+  defp collect_pushes(tag, drain, acc) do
+    receive do
+      {^tag, :delete, %{uuid: ^drain}} -> Enum.reverse(acc)
+      {^tag, method, %{uuid: uuid}} -> collect_pushes(tag, drain, [{method, uuid} | acc])
+    after
+      5_000 ->
+        raise "discovery queue never drained; delivered so far: #{inspect(Enum.reverse(acc))}"
+    end
+  end
+
   defp random_token, do: Base.url_encode64(:crypto.strong_rand_bytes(24), padding: false)
 end

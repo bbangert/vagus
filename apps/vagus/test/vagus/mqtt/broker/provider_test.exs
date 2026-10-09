@@ -139,6 +139,31 @@ defmodule Vagus.Mqtt.Broker.ProviderTest do
     refute app_pid(slug) == old_pid
   end
 
+  # The new process queues its POST, the provider (another sender) the DELETE:
+  # Core told the old uuid is gone first would briefly have no mqtt flow.
+  test "the re-post's POST reaches Core before the old uuid's DELETE", %{slug: slug} = ctx do
+    install_app(app_config(slug))
+    start_provider(ctx)
+    assert_receive {:push, :post, %{uuid: old}}
+
+    pusher = hold_discovery_queue(:push)
+    push = Process.whereis(Vagus.Discovery.Push)
+    :erlang.trace(push, true, [:receive])
+    old_pid = app_pid(slug)
+    ref = Process.monitor(old_pid)
+    Process.exit(old_pid, :kill)
+    assert_receive {:DOWN, ^ref, :process, ^old_pid, :killed}
+
+    assert_receive {:trace, ^push, :receive,
+                    {:"$gen_call", _from, {:push, :delete, %{uuid: ^old}}}},
+                   5_000
+
+    :erlang.trace(push, false, [:receive])
+
+    assert [{:post, new}, {:delete, ^old}] = release_discovery_queue(pusher, :push)
+    refute new == old
+  end
+
   test "keeps trying to publish until its app process exists", %{slug: slug} = ctx do
     start_provider(ctx, publish_retry: {500, 10})
     drain_discovery_pushes(:push)

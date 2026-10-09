@@ -160,7 +160,7 @@ defmodule Vagus.Mqtt.Broker.Provider do
     end
   end
 
-  # The app process pushed the new uuid's POST before replying, so this DELETE
+  # The app process queued the new uuid's POST before replying, so this DELETE
   # queues behind it. The old uuid's process is gone and cannot push it, and
   # Core would keep its flow beside the new one.
   defp retire_old_uuid(state, message) do
