@@ -141,6 +141,32 @@ defmodule Vagus.App.ServerTest do
       assert %{ingress_token: ^token} = data(pid)
     end
 
+    test "a file that needs a rewrite it cannot get starts nothing and registers nothing" do
+      {slug, pid} = installed(%{"ingress" => true})
+      :ok = Instances.stop(slug)
+      refute Process.alive?(pid)
+      path = Path.join(AppFile.dir(), slug <> ".json")
+
+      File.write!(
+        path,
+        path |> File.read!() |> Jason.decode!() |> Map.delete("ingress_token") |> Jason.encode!()
+      )
+
+      blocker = path <> ".tmp"
+      File.mkdir_p!(blocker)
+      on_exit(fn -> File.rm_rf!(blocker) end)
+
+      log = ExUnit.CaptureLog.capture_log(fn -> assert :ignore = Instances.ensure(slug) end)
+
+      assert log =~ "could not be rewritten"
+      assert [] = lookup({:slug, slug})
+
+      assert [] =
+               Registry.select(Vagus.App.Directory, [
+                 {{{:ingress_token, :_}, :_, :"$1"}, [{:==, :"$1", slug}], [true]}
+               ])
+    end
+
     test "a saved dynamic port another app holds is dropped and saved so; the holder keeps it" do
       ingress = %{"ingress" => true, "ingress_port" => 0}
       {a, pa} = installed(ingress, ingress_port: 62_124)
@@ -541,6 +567,24 @@ defmodule Vagus.App.ServerTest do
 
       refute_receive {:step, :start, _, _}, 300
       assert %{container_id: "c2"} = data(pid)
+    end
+
+    test "an update's commit moves the ingress keys: ingress off, dynamic port to fixed" do
+      dynamic = %{"version" => "1", "ingress" => true, "ingress_port" => 0}
+      {slug, pid} = installed(dynamic, ingress_port: 62_125)
+      hashed = {:ingress_token, Policy.hash(data(pid).ingress_token)}
+      assert [{^pid, ^slug}] = lookup(hashed)
+
+      target = %{"version" => "2", "ingress" => false, "ingress_port" => 8123}
+      t = op(pid, {:update, %{config: app_config(slug, target)}})
+      answer(:pull, {:ok, "x/y:2"})
+      answer(:stop, {:ok, %{was_running: false}})
+      answer(:reclaim_image, {:ok, :ok})
+      assert {:ok, %{to: "2"}} = Task.await(t)
+
+      assert [] = lookup(hashed)
+      assert [] = lookup({:ingress_port, 62_125})
+      assert {:ok, %{ingress_port: nil}} = AppFile.read(slug)
     end
 
     test "an install whose file cannot be written fails and leaves no process" do

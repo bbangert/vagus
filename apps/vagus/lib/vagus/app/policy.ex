@@ -590,10 +590,10 @@ defmodule Vagus.App.Policy do
   end
 
   defp run_step({:commit, _}, %{run: %{args: %{config: config}}} = data, effects),
-    do: advance(%{data | config: config}, effects ++ [:persist])
+    do: reconfigure(data, config, data.ingress_port, effects)
 
   defp run_step({:rollback_config, _}, data, effects),
-    do: advance(%{data | config: data.run.acc.old}, effects ++ [:persist])
+    do: reconfigure(data, data.run.acc.old, data.ingress_port, effects)
 
   # Run by the process itself, which feeds its result back as this step's
   # outcome.
@@ -603,6 +603,19 @@ defmodule Vagus.App.Policy do
   defp run_step(step, data, effects) do
     {data, before} = before_task(step, data)
     {put_in(data.run.step, step), effects ++ before ++ [{:step, step}]}
+  end
+
+  # The ingress keys follow the config in both directions, and a dynamic port
+  # outlives only a config that still asks for one: `ingress_target/1`
+  # prefers it over the config's own port. A rollback never takes back a port
+  # the commit dropped, since another app may hold it by then; the start that
+  # follows picks a fresh one.
+  defp reconfigure(data, config, port, effects) do
+    before = ingress_keys(data)
+    data = %{data | config: config, ingress_port: if(config.ingress_port == 0, do: port)}
+    now = ingress_keys(data)
+    keys = if before == now, do: [], else: [{:keys, now -- before, before -- now}]
+    advance(data, effects ++ keys ++ [:persist])
   end
 
   # The credential goes before the container: a stopped app's token must not

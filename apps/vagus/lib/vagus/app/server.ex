@@ -86,11 +86,32 @@ defmodule Vagus.App.Server do
 
       {:ok, saved} ->
         {data, rewrite?} = claim_port(fresh(slug, saved), saved[:rewrite] == true)
-        if rewrite?, do: persist(data)
-        data = sync_keys(data, tl(Policy.keys(data)), [])
-        Orchestrator.up(slug)
-        {:ok, if(data.shutting_down, do: :shutting_down, else: :idle), data}
+        if rewrite?, do: rewritten(data), else: up(data)
     end
+  end
+
+  # A token minted for this file but not saved would be minted again at every
+  # start, moving the app's ingress URL each time, so the start fails closed.
+  # `:ignore` rather than a stop: a `:transient` restart that errors is
+  # retried by the supervisor until its intensity takes every app down.
+  defp rewritten(data) do
+    case persist(data) do
+      :ok ->
+        up(data)
+
+      {:error, reason} ->
+        Logger.error(
+          "App #{data.slug}: its file could not be rewritten (#{inspect(reason)}); not started"
+        )
+
+        :ignore
+    end
+  end
+
+  defp up(data) do
+    data = sync_keys(data, tl(Policy.keys(data)), [])
+    Orchestrator.up(data.slug)
+    {:ok, if(data.shutting_down, do: :shutting_down, else: :idle), data}
   end
 
   # A saved dynamic port another app already holds is not this app's: it is

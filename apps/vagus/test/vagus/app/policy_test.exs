@@ -669,6 +669,60 @@ defmodule Vagus.App.PolicyTest do
       assert data.config == target
     end
 
+    test "an update's commit moves the ingress keys with the config" do
+      dynamic = %{"ingress" => true, "ingress_port" => 0}
+      itok = {:ingress_token, Policy.hash("itok")}
+
+      commit = fn from, to ->
+        data =
+          app(%{
+            config: app_config(from),
+            wanted: :stopped,
+            ingress_token: "itok",
+            ingress_port: 62_000
+          })
+
+        {data, _} = begin(:update, %{config: app_config(Map.put(to, "version", "2"))}, data)
+        {data, _} = step(data, {:ok, "img"})
+        step(data, {:ok, %{was_running: false}})
+      end
+
+      {data, effects} = commit.(dynamic, %{"ingress" => false, "ingress_port" => 0})
+      assert [{:keys, [], [^itok]}, :persist | _] = effects
+      assert data.ingress_port == 62_000
+
+      {_data, effects} = commit.(%{"ingress" => false, "ingress_port" => 0}, dynamic)
+      assert [{:keys, [^itok], []}, :persist | _] = effects
+
+      {data, effects} = commit.(dynamic, %{"ingress" => true, "ingress_port" => 8123})
+      assert [{:keys, [], [{:ingress_port, 62_000}]}, :persist | _] = effects
+      assert data.ingress_port == nil
+      assert {:ok, {_ip, 8123, false}} = Policy.answer(:ingress_target, %{data | ip: @ip})
+    end
+
+    test "a rollback restores the ingress token key; a dropped dynamic port is picked afresh" do
+      data =
+        running(%{
+          config: app_config(%{"ingress" => true, "ingress_port" => 0}),
+          ingress_token: "itok",
+          ingress_port: 62_000
+        })
+
+      target = app_config(%{"version" => "2", "ingress" => false, "ingress_port" => 8123})
+      dropped = [{:ingress_token, Policy.hash("itok")}, {:ingress_port, 62_000}]
+      {data, _} = begin(:update, %{config: target}, data)
+      {data, _} = step(data, {:ok, "img"})
+      {data, effects} = step(data, {:ok, %{was_running: true}})
+      assert {:keys, [], ^dropped} = Enum.find(effects, &match?({:keys, [], [_ | _]}, &1))
+      assert data.ingress_port == nil
+
+      {data, effects} = step(data, {:error, :crashloop})
+      itok = hd(dropped)
+      assert {:keys, [^itok], []} = Enum.find(effects, &match?({:keys, [_ | _], []}, &1))
+      assert data.ingress_port == nil
+      assert List.last(effects) == {:step, {:port, nil}}
+    end
+
     test "update: a failed pull changes nothing" do
       data = running()
       {data, _} = begin(:update, %{config: app_config(%{"version" => "2"})}, data)
