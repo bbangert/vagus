@@ -1,7 +1,7 @@
 defmodule Vagus.Discovery.PushTest do
   @moduledoc """
   `Vagus.Discovery.Push` — the shared fire-and-forget Core discovery push (M5).
-  `deliver/3` (the synchronous body `push/3`'s task calls) is driven directly
+  `deliver/3` (the body of one queued push) is driven directly
   with an injected `request_fun` so every outcome branch — success, the expected
   `:no_refresh_token` no-op, a plain error, an exception, and an exit — is
   covered without a live `Vagus.Core.Client`.
@@ -83,14 +83,90 @@ defmodule Vagus.Discovery.PushTest do
       assert log =~ "noproc"
     end
   end
+end
 
-  describe "push/3" do
-    test "returns :ok immediately and delivers via the detached task", %{msg: msg} do
-      parent = self()
-      req = fn _m, _p, _o -> send(parent, :delivered) && {:ok, %{}} end
+defmodule Vagus.Discovery.PushQueueTest do
+  # async: false — the queue is the application's and the seam is global.
+  use ExUnit.Case, async: false
 
-      assert :ok = Push.push(:post, msg, request_fun: req)
-      assert_receive :delivered, 500
-    end
+  import Vagus.AppFixtures
+
+  alias Vagus.Discovery.Push
+
+  defp message(n), do: %{uuid: "queue-#{n}", addon: "a", service: "s", config: %{"pw" => "x"}}
+
+  test "a crashing push neither blocks the next nor reorders the rest" do
+    test_pid = self()
+    prev = Application.get_env(:vagus, :discovery_push)
+
+    Application.put_env(:vagus, :discovery_push, fn
+      _method, %{uuid: "queue-2"} -> raise "boom"
+      method, message -> send(test_pid, {:pushed, method, message})
+    end)
+
+    on_exit(fn ->
+      if is_nil(prev),
+        do: Application.delete_env(:vagus, :discovery_push),
+        else: Application.put_env(:vagus, :discovery_push, prev)
+    end)
+
+    ExUnit.CaptureLog.capture_log(fn ->
+      for n <- 1..4, do: Push.notify(:post, message(n))
+      assert_receive {:pushed, :post, %{uuid: "queue-1"}}, 1_000
+      assert_receive {:pushed, :post, %{uuid: "queue-3"}}, 1_000
+      assert_receive {:pushed, :post, %{uuid: "queue-4"}}, 1_000
+    end)
+  end
+
+  test "the config, which can hold a password, is never queued" do
+    capture_discovery_pushes(:pushed)
+    Push.notify(:post, message(5))
+
+    assert_receive {:pushed, :post, pushed}, 1_000
+    assert pushed == %{uuid: "queue-5", addon: "a", service: "s"}
+  end
+
+  test "identical POSTs queued behind a push in flight reach Core once" do
+    pusher = hold_discovery_queue(:pushed)
+    for _ <- 1..100, do: :ok = Push.notify(:post, message(6))
+
+    assert release_discovery_queue(pusher, :pushed) == [{:post, "queue-6"}]
+  end
+
+  test "coalescing keeps a uuid's POST, DELETE and re-POST in order" do
+    pusher = hold_discovery_queue(:pushed)
+
+    for method <- [:post, :delete, :post], _ <- 1..3, do: :ok = Push.notify(method, message(7))
+
+    assert release_discovery_queue(pusher, :pushed) ==
+             [{:post, "queue-7"}, {:delete, "queue-7"}, {:post, "queue-7"}]
+  end
+
+  test "a full queue sheds its oldest POSTs, with one warning, and never a DELETE" do
+    pusher = hold_discovery_queue(:pushed)
+    max = :sys.get_state(Push).max_pending
+    :sys.replace_state(Push, &%{&1 | max_pending: 3})
+    on_exit(fn -> :sys.replace_state(Push, &%{&1 | max_pending: max}) end)
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        :ok = Push.notify(:delete, message(8))
+        for n <- 9..12, do: :ok = Push.notify(:post, message(n))
+        for n <- 13..14, do: :ok = Push.notify(:delete, message(n))
+        # Nothing left to shed: the POST is dropped, the DELETE goes over the cap.
+        :ok = Push.notify(:post, message(15))
+        :ok = Push.notify(:delete, message(16))
+        # Else the release's own drain marker would shed too.
+        :sys.replace_state(Push, &%{&1 | max_pending: max})
+
+        assert release_discovery_queue(pusher, :pushed) == [
+                 {:delete, "queue-8"},
+                 {:delete, "queue-13"},
+                 {:delete, "queue-14"},
+                 {:delete, "queue-16"}
+               ]
+      end)
+
+    assert length(String.split(log, "shedding the oldest POSTs")) == 2
   end
 end

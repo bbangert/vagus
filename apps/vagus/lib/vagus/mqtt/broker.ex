@@ -59,8 +59,8 @@ defmodule Vagus.Mqtt.Broker do
     * `:ip` — bind address tuple (default: loopback on host/test, supervisor
       bridge IP on target)
     * `:auth` — keyword opts for `Vagus.Mqtt.Broker.Auth.config/1` (slug,
-      services server, `check_login` opts, option logins, allow_anonymous). The
-      negative-cache table is injected automatically.
+      `check_login` opts, option logins, allow_anonymous). The negative-cache
+      table, and with `:provider` the published service login, are injected.
     * `:max_connections` — new connections/second before excess CONNECTs are
       rate-limited (default `#{@default_max_connections}`)
   """
@@ -82,9 +82,15 @@ defmodule Vagus.Mqtt.Broker do
     ip = Keyword.get(opts, :ip, default_ip())
     max_connections = Keyword.get(opts, :max_connections, @default_max_connections)
 
+    provider = provider_opts(Keyword.get(opts, :provider))
+
     # Inject the negative-cache table into the handler's auth config so the
     # broker's reconnect-storm mitigation is wired without the caller knowing.
-    auth = Keyword.put(Keyword.get(opts, :auth, []), :neg_cache, authcache_name)
+    auth =
+      opts
+      |> Keyword.get(:auth, [])
+      |> Keyword.put(:neg_cache, authcache_name)
+      |> put_service_login(provider)
 
     children =
       [
@@ -125,23 +131,47 @@ defmodule Vagus.Mqtt.Broker do
         # Last: the telemetry-fed log buffer (MQ-P3-T2). After the listener so a
         # buffer crash restarts only itself, never drops connections.
         {Logs, name: logs_name}
-      ] ++ provider_child(name, port, Keyword.get(opts, :provider))
+      ] ++ provider_child(name, port, provider)
 
     Supervisor.init(children, strategy: :rest_for_one, max_restarts: 5, max_seconds: 30)
   end
 
+  # The password is read here, before the listener starts, so the first
+  # CONNECT already knows the login the Provider publishes; a start after a
+  # restore reads the restored one. A closure, so it is in no child spec and
+  # no supervisor report.
+  defp provider_opts(nil), do: nil
+
+  defp provider_opts(opts) do
+    opts =
+      Keyword.take(opts, [
+        :slug,
+        :data_dir,
+        :publish_retry,
+        :publish_backoff_ms,
+        :withdraw_timeout
+      ])
+
+    login = Provider.service_login(opts)
+    Keyword.put(opts, :service_login, fn -> login end)
+  end
+
+  defp put_service_login(auth, nil), do: auth
+
+  defp put_service_login(auth, provider),
+    do: Keyword.put(auth, :service_login, Keyword.fetch!(provider, :service_login))
+
   # The `mqtt` service/discovery provider (MQ-P4-T1) — added only when the broker
-  # is the real native add-on (`Backend.Native` passes `:provider`); bare
-  # instances (routing/auth unit tests) omit it and never touch the global
-  # service/discovery registries. Last child so it publishes with the listener up.
+  # is the real native app (`Backend.Native` passes `:provider`); bare
+  # instances (routing/auth unit tests) omit it and never publish. Last child
+  # so it publishes with the listener up.
   defp provider_child(_name, _port, nil), do: []
 
-  defp provider_child(name, port, provider_opts) do
-    opts =
-      [name: Module.concat(name, "Provider"), host: advertised_host(), port: port] ++
-        Keyword.take(provider_opts, [:slug, :services, :discovery, :data_dir])
-
-    [{Provider, opts}]
+  defp provider_child(name, port, provider) do
+    [
+      {Provider,
+       [name: Module.concat(name, "Provider"), host: advertised_host(), port: port] ++ provider}
+    ]
   end
 
   if Mix.target() == :host do

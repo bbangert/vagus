@@ -1,115 +1,53 @@
 defmodule Vagus.Mqtt.Broker.ProviderTest do
-  @moduledoc """
-  M5 (MQ-P4-T1) — the native broker's service/discovery publisher. Runs against
-  isolated `Vagus.Services`/`Vagus.Discovery` instances and a recording `push`
-  fn (in place of `Vagus.Discovery.Push`, which would fire a real Core request),
-  so the service registration, the Core discovery push, the crash-orphan
-  idempotency (now `Vagus.Discovery.add/4`'s own `(slug, service)` dedup —
-  audit B3, see `Vagus.Mqtt.Broker.Provider`'s moduledoc), and the terminate
-  cleanup are all assertable without a broker or Core.
-  """
-  use ExUnit.Case, async: true
+  # async: false — publishes into the application's app directory, where
+  # `mqtt` is one key for every app.
+  use ExUnit.Case, async: false
 
-  alias Vagus.Discovery
-  alias Vagus.Mqtt.Broker.Auth
+  import Vagus.AppFixtures
+
+  alias Vagus.App
   alias Vagus.Mqtt.Broker.Provider
-  alias Vagus.Services
 
-  @slug "core_mqtt"
   @host "172.30.32.2"
   @port 1883
 
   setup do
     uniq = System.unique_integer([:positive])
-    services = start_supervised!({Services, name: :"services_#{uniq}"})
-    discovery = start_supervised!({Discovery, name: :"discovery_#{uniq}"})
     data_dir = Path.join(System.tmp_dir!(), "vagus-provider-#{uniq}")
     on_exit(fn -> File.rm_rf(data_dir) end)
 
-    parent = self()
-
-    push = fn method, message ->
-      send(parent, {:push, method, message})
-      :ok
-    end
-
-    %{services: services, discovery: discovery, data_dir: data_dir, push: push}
-  end
-
-  defp provider_opts(ctx, overrides) do
-    Keyword.merge(
-      [
-        slug: @slug,
-        host: @host,
-        port: @port,
-        services: ctx.services,
-        discovery: ctx.discovery,
-        push: ctx.push,
-        data_dir: ctx.data_dir,
-        name: :"provider_#{System.unique_integer([:positive])}"
-      ],
-      overrides
-    )
+    capture_discovery_pushes(:push)
+    %{slug: "prov_#{uniq}", data_dir: data_dir}
   end
 
   defp start_provider(ctx, overrides \\ []) do
-    opts = provider_opts(ctx, overrides)
-    name = opts[:name]
+    opts =
+      Keyword.merge(
+        [
+          slug: ctx.slug,
+          host: @host,
+          port: @port,
+          data_dir: ctx.data_dir,
+          name: :"provider_#{System.unique_integer([:positive])}"
+        ],
+        overrides
+      )
 
-    start_supervised!(
-      {Provider, opts},
-      id: name,
-      # The absent-registry tests stop it themselves; a restart would
-      # publish again.
-      restart: :temporary
-    )
-
-    name
+    start_supervised!({Provider, opts}, id: opts[:name], restart: :temporary)
+    opts[:name]
   end
 
-  test "registers the mqtt service and pushes the discovery to Core", ctx do
-    start_provider(ctx)
-
-    assert {:ok, %{"username" => "addons", "host" => @host, "port" => @port} = payload} =
-             Services.get("mqtt", ctx.services)
-
-    assert is_binary(payload["password"]) and payload["password"] != ""
-
-    assert [%{service: "mqtt", addon: @slug, uuid: uuid}] = Discovery.list(ctx.discovery)
-    assert_receive {:push, :post, %{service: "mqtt", addon: @slug, uuid: ^uuid}}
-  end
-
-  test "reuses a slug's leftover discovery (crash leftover) instead of duplicating it", ctx do
-    # Simulate a previous broker instance that crashed without terminating:
-    # its discovery lingers in the registry (and in Core) under the same
-    # (slug, service) pair, with a stale config.
-    {:ok, %{uuid: stale}, :new} = Discovery.add(@slug, "mqtt", %{"stale" => true}, ctx.discovery)
-
-    start_provider(ctx)
-
-    # `Discovery.add/4`'s own dedup (audit B3) keeps the leftover's uuid and
-    # updates `config` in place — never a delete, never a second entry.
-    assert [%{uuid: ^stale, config: config}] = Discovery.list(ctx.discovery)
-    assert config["host"] == @host
-    assert_receive {:push, :post, %{uuid: ^stale}}
-    refute_received {:push, :delete, _message}
-  end
-
-  test "publishing an already-current record pushes nothing", ctx do
-    # Pin the password `load_or_generate_password/1` will read back, so the
-    # payload the provider computes on `init` is fully deterministic —
-    # standing in for "this exact record is already in the registry (and in
-    # Core)", e.g. the discovery survived a supervisor restart that only
-    # killed the provider process.
-    password = "already-current-password"
+  defp pin_password(ctx, password) do
     File.mkdir_p!(ctx.data_dir)
 
     File.write!(
       Path.join(ctx.data_dir, "broker_state.json"),
-      Jason.encode!(%{"addons_password" => password})
+      ~s({"addons_password":"#{password}"})
     )
+  end
 
-    payload = %{
+  defp payload(password) do
+    %{
       "host" => @host,
       "port" => @port,
       "ssl" => false,
@@ -117,328 +55,248 @@ defmodule Vagus.Mqtt.Broker.ProviderTest do
       "username" => "addons",
       "password" => password
     }
+  end
 
-    {:ok, _message, :new} = Discovery.add(@slug, "mqtt", payload, ctx.discovery)
+  defp app_pid(slug) do
+    [{pid, _value}] = Registry.lookup(Vagus.App.Directory, {:slug, slug})
+    pid
+  end
+
+  test "publishes the mqtt service and discovery into its app's process", %{slug: slug} = ctx do
+    install_app(app_config(slug))
+    start_provider(ctx)
+    # The publish runs in a continue; its push is the last step.
+    assert_receive {:push, :post, %{service: "mqtt", addon: ^slug, uuid: uuid}}
+
+    assert {:ok, ^slug, %{"username" => "addons", "host" => @host} = payload} =
+             App.service("mqtt")
+
+    assert payload["password"] != ""
+    assert {:ok, [%{service: "mqtt", uuid: ^uuid}]} = App.ask(slug, :discovery_list)
+  end
+
+  test "the service login is the persisted password", ctx do
+    pin_password(ctx, "pinned")
+
+    assert Provider.service_login(data_dir: ctx.data_dir) == %{
+             username: "addons",
+             password: "pinned"
+           }
+  end
+
+  test "a record its app process already holds is not pushed again", %{slug: slug} = ctx do
+    install_app(app_config(slug))
+    pin_password(ctx, "already-current")
+    {:ok, %{uuid: uuid}, :new} = App.add_discovery(slug, "mqtt", payload("already-current"))
+    assert_receive {:push, :post, %{uuid: ^uuid}}
+
+    provider = start_provider(ctx)
+
+    assert :sys.get_state(provider).uuid == uuid
+    drain_discovery_pushes(:push)
+    refute_received {:push, _method, _message}
+  end
+
+  test "a changed record keeps its uuid and is pushed", %{slug: slug} = ctx do
+    install_app(app_config(slug))
+    {:ok, %{uuid: uuid}, :new} = App.add_discovery(slug, "mqtt", %{"stale" => true})
+    assert_receive {:push, :post, %{uuid: ^uuid}}
 
     start_provider(ctx)
 
-    # `Discovery.add/4` reported `:existing` — same record, nothing changed —
-    # so the provider must not re-push it (audit B3: an unchanged restart is
-    # not a new discovery event for Core).
-    assert [%{config: ^payload}] = Discovery.list(ctx.discovery)
-    refute_received {:push, :post, _message}
+    assert_receive {:push, :post, %{uuid: ^uuid}}
+    assert {:ok, [%{uuid: ^uuid, config: %{"host" => @host}}]} = App.ask(slug, :discovery_list)
+  end
+
+  test "terminate withdraws the service and pushes the discovery delete", %{slug: slug} = ctx do
+    install_app(app_config(slug))
+    provider = start_provider(ctx)
+    assert_receive {:push, :post, %{uuid: uuid}}
+
+    :ok = stop_supervised!(provider)
+
+    assert_receive {:push, :delete, %{uuid: ^uuid}}
+    assert :error = App.service("mqtt")
+    assert {:ok, []} = App.ask(slug, :discovery_list)
+  end
+
+  test "publishes again into the next app process after its own is killed",
+       %{slug: slug} = ctx do
+    install_app(app_config(slug))
+    start_provider(ctx)
+    assert_receive {:push, :post, %{uuid: old}}
+
+    old_pid = app_pid(slug)
+    ref = Process.monitor(old_pid)
+    Process.exit(old_pid, :kill)
+    assert_receive {:DOWN, ^ref, :process, ^old_pid, :killed}
+
+    assert_receive {:push, :post, %{uuid: new}}, 5_000
+    refute new == old
+    # Core's flow for the old uuid would otherwise stay beside the new one.
+    assert_receive {:push, :delete, %{uuid: ^old}}, 5_000
+    assert {:ok, ^slug, _payload} = App.service("mqtt")
+    refute app_pid(slug) == old_pid
+  end
+
+  # The new process queues its POST, the provider (another sender) the DELETE:
+  # Core told the old uuid is gone first would briefly have no mqtt flow.
+  test "the re-post's POST reaches Core before the old uuid's DELETE", %{slug: slug} = ctx do
+    install_app(app_config(slug))
+    start_provider(ctx)
+    assert_receive {:push, :post, %{uuid: old}}
+
+    pusher = hold_discovery_queue(:push)
+    push = Process.whereis(Vagus.Discovery.Push)
+    :erlang.trace(push, true, [:receive])
+    old_pid = app_pid(slug)
+    ref = Process.monitor(old_pid)
+    Process.exit(old_pid, :kill)
+    assert_receive {:DOWN, ^ref, :process, ^old_pid, :killed}
+
+    assert_receive {:trace, ^push, :receive,
+                    {:"$gen_call", _from, {:push, :delete, %{uuid: ^old}}}},
+                   5_000
+
+    :erlang.trace(push, false, [:receive])
+
+    assert [{:post, new}, {:delete, ^old}] = release_discovery_queue(pusher, :push)
+    refute new == old
+  end
+
+  test "keeps trying to publish until its app process exists", %{slug: slug} = ctx do
+    start_provider(ctx, publish_retry: {500, 10})
+    drain_discovery_pushes(:push)
+    refute_received {:push, _method, _message}
+
+    install_app(app_config(slug))
+
+    assert_receive {:push, :post, %{addon: ^slug}}, 5_000
+    assert {:ok, ^slug, _payload} = App.service("mqtt")
+  end
+
+  test "after the fast retries it keeps publishing on the slow cadence", %{slug: slug} = ctx do
+    install_app(app_config(slug))
+    :ok = Supervisor.terminate_child(Vagus.App.Supervisor, Vagus.App.Instances)
+    on_exit(fn -> Supervisor.restart_child(Vagus.App.Supervisor, Vagus.App.Instances) end)
+
+    log =
+      ExUnit.CaptureLog.capture_log([level: :info], fn ->
+        provider = start_provider(ctx, publish_retry: {3, 0}, publish_backoff_ms: 50)
+        pid = Process.whereis(provider)
+        :erlang.trace(pid, true, [:receive])
+        # Three fast `:publish`es, then slow ones that must log nothing more.
+        for _ <- 1..5, do: assert_receive({:trace, ^pid, :receive, :publish}, 1_000)
+        assert :sys.get_state(provider).attempts == 0
+        drain_discovery_pushes(:push)
+        refute_received {:push, _method, _message}
+
+        {:ok, _pid} = Supervisor.restart_child(Vagus.App.Supervisor, Vagus.App.Instances)
+        assert_receive {:push, :post, %{addon: ^slug, service: "mqtt"}}, 1_000
+        :erlang.trace(pid, false, [:receive])
+      end)
+
+    assert {:ok, ^slug, _payload} = App.service("mqtt")
+    assert length(String.split(log, "mqtt publish for #{slug} failed")) == 2
+    assert log =~ "mqtt service published again"
+  end
+
+  test "the broker hands the provider its slow cadence", %{slug: slug} = ctx do
+    install_app(app_config(slug))
+    :ok = Supervisor.terminate_child(Vagus.App.Supervisor, Vagus.App.Instances)
+    on_exit(fn -> Supervisor.restart_child(Vagus.App.Supervisor, Vagus.App.Instances) end)
+    broker = :"broker_#{System.unique_integer([:positive])}"
+
+    ExUnit.CaptureLog.capture_log(fn ->
+      start_supervised!(
+        {Vagus.Mqtt.Broker,
+         name: broker,
+         port: free_port(),
+         ip: {127, 0, 0, 1},
+         provider: [
+           slug: slug,
+           data_dir: ctx.data_dir,
+           publish_retry: {3, 0},
+           publish_backoff_ms: 50
+         ]}
+      )
+
+      pid = Process.whereis(Module.concat(broker, "Provider"))
+      :erlang.trace(pid, true, [:receive])
+      # Two past the fast retries: the default 30 s cadence would not get there.
+      for _ <- 1..5, do: assert_receive({:trace, ^pid, :receive, :publish}, 1_000)
+      :erlang.trace(pid, false, [:receive])
+    end)
+  end
+
+  test "its app's own earlier provide is no refusal", %{slug: slug} = ctx do
+    install_app(app_config(slug))
+    :ok = App.provide_service(slug, "mqtt", %{"stale" => true})
+
+    start_provider(ctx, publish_retry: {1, 0})
+
+    assert_receive {:push, :post, %{addon: ^slug, service: "mqtt"}}
+    assert {:ok, ^slug, _payload} = App.service("mqtt")
+  end
+
+  test "another app holding mqtt is logged and retried until it lets go", %{slug: slug} = ctx do
+    install_app(app_config(slug))
+    other = "prov_other_#{System.unique_integer([:positive])}"
+    install_app(app_config(other))
+    :ok = App.provide_service(other, "mqtt", %{"host" => "elsewhere"})
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        provider = start_provider(ctx, publish_retry: {500, 10})
+        assert :sys.get_state(provider).uuid == nil
+        drain_discovery_pushes(:push)
+        refute_received {:push, _method, _message}
+        # A failed attempt keeps no monitor on the app process. Suspended, so
+        # no attempt is mid-flight while it is looked at.
+        pid = Process.whereis(provider)
+        :ok = :sys.suspend(pid)
+        assert {:monitors, []} = Process.info(pid, :monitors)
+        :ok = :sys.resume(pid)
+
+        :ok = App.withdraw_service(other, "mqtt")
+        assert_receive {:push, :post, %{addon: ^slug}}, 5_000
+      end)
+
+    assert log =~ "provided by app #{other}"
+    assert {:ok, ^slug, _payload} = App.service("mqtt")
+  end
+
+  test "its status shows no password", %{slug: slug} = ctx do
+    install_app(app_config(slug))
+    pin_password(ctx, "pinned-secret")
+    provider = start_provider(ctx)
+
+    refute inspect(:sys.get_status(provider)) =~ "pinned-secret"
+  end
+
+  test "terminate with its app process gone drops the withdraw", %{slug: slug} = ctx do
+    install_app(app_config(slug))
+
+    {provider, _log} =
+      ExUnit.CaptureLog.with_log(fn ->
+        provider = start_provider(ctx, publish_retry: {1, 0})
+        assert_receive {:push, :post, _message}
+
+        # Gone for good: without its entry nothing brings the process back.
+        :ok = forget_app(slug)
+        :sys.get_state(provider)
+        provider
+      end)
+
+    :ok = stop_supervised!(provider)
+    drain_discovery_pushes(:push)
     refute_received {:push, :delete, _message}
   end
 
-  test "terminate deregisters the service and pushes a discovery delete", ctx do
-    name = start_provider(ctx)
-    assert [%{uuid: uuid}] = Discovery.list(ctx.discovery)
-    assert {:ok, _} = Services.get("mqtt", ctx.services)
-
-    :ok = stop_supervised!(name)
-
-    assert_receive {:push, :delete, %{uuid: ^uuid}}
-    assert Discovery.list(ctx.discovery) == []
-    assert Services.get("mqtt", ctx.services) == :error
-  end
-
-  describe "a registry that is absent" do
-    # Wide enough that bringing the registry back always lands inside it.
-    @slack_retry {2_000, 5}
-    @tiny_retry {2, 1}
-
-    # Named and checkpointed, so a restart under the same name reloads what
-    # the provider published, as the application's registries do.
-    setup ctx do
-      uniq = System.unique_integer([:positive])
-      File.mkdir_p!(ctx.data_dir)
-
-      registries = %{
-        services: {Services, :"services_named_#{uniq}", Path.join(ctx.data_dir, "services.term")},
-        discovery:
-          {Discovery, :"discovery_named_#{uniq}", Path.join(ctx.data_dir, "discovery.term")}
-      }
-
-      Enum.each(registries, fn {id, _spec} -> start_registry(registries, id) end)
-
-      %{
-        registries: registries,
-        # Apart from the test supervisor, which a provider waiting in `init/1`
-        # would block from starting the registry it waits for.
-        providers: start_supervised!({DynamicSupervisor, []}, id: :providers),
-        slug: "absent_#{uniq}",
-        services: elem(registries.services, 1),
-        discovery: elem(registries.discovery, 1)
-      }
-    end
-
-    defp start_provider_async(ctx, overrides) do
-      spec = Supervisor.child_spec({Provider, provider_opts(ctx, overrides)}, restart: :temporary)
-      Task.async(fn -> DynamicSupervisor.start_child(ctx.providers, spec) end)
-    end
-
-    defp start_registry(registries, id) do
-      {module, name, path} = Map.fetch!(registries, id)
-      start_supervised!({module, name: name, path: path}, id: id)
-    end
-
-    # Holds `name` like a registry that goes down on the first call it gets.
-    defp dying_stub(name) do
-      test = self()
-
-      pid =
-        spawn(fn ->
-          receive do
-            {:"$gen_call", _from, request} ->
-              send(test, {:stub_call, name, request})
-              exit(:shutdown)
-          end
-        end)
-
-      Process.register(pid, name)
-      on_exit(fn -> Process.exit(pid, :kill) end)
-      pid
-    end
-
-    # Holds `name` like a registry that is alive and never answers.
-    defp holding_stub(name) do
-      test = self()
-
-      pid =
-        spawn(fn ->
-          receive do
-            {:"$gen_call", _from, request} -> send(test, {:held, request})
-          end
-
-          Process.sleep(:infinity)
-        end)
-
-      Process.register(pid, name)
-      on_exit(fn -> Process.exit(pid, :kill) end)
-    end
-
-    # A dead process has released its name by the time its monitor fires.
-    defp await_down(pid) do
-      ref = Process.monitor(pid)
-
-      receive do
-        {:DOWN, ^ref, :process, ^pid, _reason} -> :ok
-      end
-    end
-
-    test "waits out a Services that is briefly absent, and the service stays deregistered",
-         %{slug: slug} = ctx do
-      provider = start_provider(ctx, slug: slug, registry_retry: @slack_retry)
-      assert {:ok, %{"addon" => ^slug}} = Services.get("mqtt", ctx.services)
-
-      :ok = stop_supervised!(:services)
-      stub = dying_stub(ctx.services)
-      stop = Task.async(fn -> GenServer.stop(provider, :shutdown) end)
-
-      assert_receive {:stub_call, _name, {:delete, "mqtt", ^slug}}, 5_000
-      await_down(stub)
-      # Comes back holding the entry: its checkpoint predates the delete.
-      start_registry(ctx.registries, :services)
-
-      assert :ok = Task.await(stop, 60_000)
-      assert :error = Services.get("mqtt", ctx.services)
-    end
-
-    test "waits out a Discovery that is briefly absent, and the delete still reaches Core",
-         %{slug: slug} = ctx do
-      provider = start_provider(ctx, slug: slug, registry_retry: @slack_retry)
-      assert [%{uuid: uuid}] = Discovery.list(ctx.discovery)
-
-      :ok = stop_supervised!(:discovery)
-      stub = dying_stub(ctx.discovery)
-      stop = Task.async(fn -> GenServer.stop(provider, :shutdown) end)
-
-      assert_receive {:stub_call, _name, {:delete, ^uuid, ^slug}}, 5_000
-      await_down(stub)
-      # Comes back holding the message: its checkpoint predates the delete.
-      start_registry(ctx.registries, :discovery)
-
-      assert :ok = Task.await(stop, 60_000)
-      assert [] = Discovery.list(ctx.discovery)
-      assert_receive {:push, :delete, %{uuid: ^uuid}}
-    end
-
-    # A publish skipped here would leave the broker running with no service
-    # entry, so its service credentials are refused for as long as it runs.
-    test "init waits out a Services that is briefly absent, and the credentials authenticate",
-         %{slug: slug} = ctx do
-      :ok = stop_supervised!(:services)
-      stub = dying_stub(ctx.services)
-      start = start_provider_async(ctx, slug: slug, registry_retry: @slack_retry)
-
-      assert_receive {:stub_call, _name, {:set, "mqtt", %{"password" => password}, ^slug}}, 5_000
-      await_down(stub)
-      start_registry(ctx.registries, :services)
-
-      assert {:ok, _provider} = Task.await(start, 60_000)
-      assert {:ok, %{"addon" => ^slug}} = Services.get("mqtt", ctx.services)
-      assert :ok = Auth.authenticate("addons", password, Auth.config(services: ctx.services))
-
-      :ok = stop_supervised!(:providers)
-    end
-
-    test "init waits out a Discovery that is briefly absent, and pushes the message once",
-         %{slug: slug} = ctx do
-      :ok = stop_supervised!(:discovery)
-      stub = dying_stub(ctx.discovery)
-      start = start_provider_async(ctx, slug: slug, registry_retry: @slack_retry)
-
-      assert_receive {:stub_call, _name, {:add, ^slug, "mqtt", _config}}, 5_000
-      await_down(stub)
-      start_registry(ctx.registries, :discovery)
-
-      assert {:ok, provider} = Task.await(start, 60_000)
-      assert [%{uuid: uuid, addon: ^slug}] = Discovery.list(ctx.discovery)
-      assert :sys.get_state(provider).uuid == uuid
-      assert_receive {:push, :post, %{uuid: ^uuid}}
-      refute_received {:push, :post, _message}
-
-      :ok = stop_supervised!(:providers)
-    end
-
-    test "init still starts the provider when both stay absent, and logs it without the password",
-         %{slug: slug} = ctx do
-      password = "pw-#{System.unique_integer([:positive])}-must-not-print"
-
-      File.write!(
-        Path.join(ctx.data_dir, "broker_state.json"),
-        Jason.encode!(%{"addons_password" => password})
-      )
-
-      :ok = stop_supervised!(:services)
-      :ok = stop_supervised!(:discovery)
-
-      {provider, log} =
-        ExUnit.CaptureLog.with_log(fn ->
-          start_provider(ctx, slug: slug, registry_retry: @tiny_retry)
-        end)
-
-      assert :sys.get_state(provider).uuid == nil
-
-      assert log =~
-               "[error] Vagus.Mqtt.Broker.Provider: Services publish for #{slug} failed (noproc)"
-
-      assert log =~
-               "[error] Vagus.Mqtt.Broker.Provider: Discovery publish for #{slug} failed (noproc)"
-
-      refute log =~ password
-
-      # Stopped here so its Services delete, absent too, logs inside a capture.
-      ExUnit.CaptureLog.capture_log(fn -> :ok = stop_supervised!(provider) end)
-    end
-
-    # The held call sets these tests' duration; the other registry has the
-    # same timeout to answer in, checkpoint save included.
-    @hold_timeout 400
-
-    test "a Services that holds the call costs one call timeout, and Discovery is still deleted",
-         %{slug: slug} = ctx do
-      provider = start_provider(ctx, slug: slug, deregister_call_timeout: @hold_timeout)
-      assert [%{uuid: uuid}] = Discovery.list(ctx.discovery)
-
-      :ok = stop_supervised!(:services)
-      holding_stub(ctx.services)
-
-      stop =
-        Task.async(fn ->
-          ExUnit.CaptureLog.with_log(fn -> GenServer.stop(provider, :shutdown) end)
-        end)
-
-      # Half a default call timeout: the injected one reached the call.
-      assert {:ok, {:ok, log}} = Task.yield(stop, 2_500) || Task.shutdown(stop, :brutal_kill)
-      assert_receive {:held, {:delete, "mqtt", ^slug}}
-      assert log =~ "Services delete for #{slug} failed (timeout)"
-      assert [] = Discovery.list(ctx.discovery)
-      assert_receive {:push, :delete, %{uuid: ^uuid}}
-    end
-
-    test "a Discovery that holds the call costs one call timeout", %{slug: slug} = ctx do
-      provider = start_provider(ctx, slug: slug, deregister_call_timeout: @hold_timeout)
-      assert [%{uuid: uuid}] = Discovery.list(ctx.discovery)
-
-      :ok = stop_supervised!(:discovery)
-      holding_stub(ctx.discovery)
-
-      stop =
-        Task.async(fn ->
-          ExUnit.CaptureLog.with_log(fn -> GenServer.stop(provider, :shutdown) end)
-        end)
-
-      assert {:ok, {:ok, log}} = Task.yield(stop, 2_500) || Task.shutdown(stop, :brutal_kill)
-      assert_receive {:held, {:delete, ^uuid, ^slug}}
-      assert log =~ "Discovery delete for #{slug} failed (timeout)"
-      assert :error = Services.get("mqtt", ctx.services)
-    end
-
-    # The module's own budget and call timeout, under the shutdown its child
-    # spec gets in the broker: a provider still on its Services delete when
-    # that runs out is killed before it deletes the discovery.
-    defp start_as_in_production(ctx) do
-      opts = provider_opts(ctx, slug: ctx.slug)
-
-      start_supervised!(%{
-        id: :production_spec,
-        type: :supervisor,
-        start: {Supervisor, :start_link, [[{Provider, opts}], [strategy: :one_for_one]]}
-      })
-    end
-
-    test "the default call timeout leaves a held Services call time for the Discovery delete",
-         %{slug: slug} = ctx do
-      sup = start_as_in_production(ctx)
-      assert [%{uuid: uuid}] = Discovery.list(ctx.discovery)
-
-      :ok = stop_supervised!(:services)
-      holding_stub(ctx.services)
-
-      {result, log} =
-        ExUnit.CaptureLog.with_log(fn -> Supervisor.terminate_child(sup, Provider) end)
-
-      assert result == :ok
-      assert log =~ "Services delete for #{slug} failed (timeout)"
-      assert [] = Discovery.list(ctx.discovery)
-      assert_receive {:push, :delete, %{uuid: ^uuid}}
-    end
-
-    test "the default budget leaves an absent Services time for the Discovery delete",
-         %{slug: slug} = ctx do
-      sup = start_as_in_production(ctx)
-      assert [%{uuid: uuid}] = Discovery.list(ctx.discovery)
-
-      :ok = stop_supervised!(:services)
-
-      {result, log} =
-        ExUnit.CaptureLog.with_log(fn -> Supervisor.terminate_child(sup, Provider) end)
-
-      assert result == :ok
-      assert log =~ "Services delete for #{slug} failed (noproc)"
-      assert [] = Discovery.list(ctx.discovery)
-      assert_receive {:push, :delete, %{uuid: ^uuid}}
-    end
-
-    test "terminate still completes when both stay absent, and logs what it left",
-         %{slug: slug} = ctx do
-      provider = start_provider(ctx, slug: slug, registry_retry: @tiny_retry)
-
-      :ok = stop_supervised!(:services)
-      :ok = stop_supervised!(:discovery)
-
-      {result, log} = ExUnit.CaptureLog.with_log(fn -> GenServer.stop(provider, :shutdown) end)
-
-      assert result == :ok
-
-      assert log =~
-               "[error] Vagus.Mqtt.Broker.Provider: Services delete for #{slug} failed (noproc)"
-
-      assert log =~
-               "[error] Vagus.Mqtt.Broker.Provider: Discovery delete for #{slug} failed (noproc)"
-
-      refute_received {:push, :delete, _message}
-    end
+  defp free_port do
+    {:ok, socket} = :gen_tcp.listen(0, [])
+    {:ok, port} = :inet.port(socket)
+    :ok = :gen_tcp.close(socket)
+    port
   end
 end

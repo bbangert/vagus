@@ -155,8 +155,6 @@ defmodule Vagus.Addon.Backend.NativeTest do
 
       on_exit(fn ->
         Manager.uninstall(@slug, data_root: dr)
-        Vagus.Services.delete_by_slug(@slug)
-        Vagus.Discovery.delete_by_slug(@slug)
         restore_env(:mqtt_broker_port, prev_port)
         restore_env(:addon_data_root, prev_root)
       end)
@@ -165,8 +163,7 @@ defmodule Vagus.Addon.Backend.NativeTest do
     end
 
     test "publishes the mqtt service with the add-on slug + addons credentials" do
-      assert {:ok, data} = Vagus.Services.get("mqtt")
-      assert data["addon"] == @slug
+      assert {:ok, @slug, data} = Vagus.App.service("mqtt")
       assert data["host"] == "127.0.0.1"
       assert data["protocol"] == "3.1.1"
       assert data["username"] == "addons"
@@ -174,16 +171,16 @@ defmodule Vagus.Addon.Backend.NativeTest do
     end
 
     test "the published addons credentials authenticate a client", %{port: port} do
-      {:ok, %{"password" => pass}} = Vagus.Services.get("mqtt")
+      {:ok, @slug, %{"password" => pass}} = Vagus.App.service("mqtt")
       assert connected_within?(connect_auth(port, "addons", pass))
     end
 
     test "adds an mqtt discovery message for the add-on" do
-      assert Enum.any?(Vagus.Discovery.list(), &(&1.service == "mqtt" and &1.addon == @slug))
+      assert Enum.any?(Vagus.App.discoveries(), &(&1.service == "mqtt" and &1.addon == @slug))
     end
 
     test "retained message + QoS1 round-trip through the broker", %{port: port} do
-      {:ok, %{"password" => pass}} = Vagus.Services.get("mqtt")
+      {:ok, @slug, %{"password" => pass}} = Vagus.App.service("mqtt")
       pub = connect_auth(port, "addons", pass)
       assert connected_within?(pub)
       :ok = MqttX.Client.publish(pub, "sensor/room", "21.5", qos: 1, retain: true)
@@ -197,7 +194,7 @@ defmodule Vagus.Addon.Backend.NativeTest do
 
     test "hot backup then restore preserves the addons password + re-publishes",
          %{dr: dr, backups: backups} do
-      {:ok, %{"password" => pass0}} = Vagus.Services.get("mqtt")
+      {:ok, @slug, %{"password" => pass0}} = Vagus.App.service("mqtt")
 
       assert {:ok, backup_slug} =
                Vagus.Backups.create_partial(nil, [@slug], server: backups, data_root: dr)
@@ -214,11 +211,11 @@ defmodule Vagus.Addon.Backend.NativeTest do
       # The restarted broker re-published the service with the RESTORED password.
       creds =
         eventually(
-          fn -> Vagus.Services.get("mqtt") end,
-          &match?({:ok, %{"password" => ^pass0}}, &1)
+          fn -> Vagus.App.service("mqtt") end,
+          &match?({:ok, @slug, %{"password" => ^pass0}}, &1)
         )
 
-      assert {:ok, %{"password" => ^pass0}} = creds
+      assert {:ok, @slug, %{"password" => ^pass0}} = creds
     end
   end
 
@@ -253,8 +250,6 @@ defmodule Vagus.Addon.Backend.NativeTest do
         restore_env(:dns_enabled, prev_dns)
         File.rm(Vagus.RunState.path(:dns))
         Manager.uninstall(@slug, data_root: dr)
-        Vagus.Services.delete_by_slug(@slug)
-        Vagus.Discovery.delete_by_slug(@slug)
         restore_env(:mqtt_broker_port, prev_port)
         restore_env(:addon_data_root, prev_root)
       end)

@@ -2,13 +2,8 @@ defmodule Vagus.API.DiscoveryRouterTest do
   @moduledoc """
   P4-T2: /discovery endpoints through Auth's caller resolution.
 
-  The dedup tests (audit B3) intercept the Core push via `:discovery_push`
-  (`Vagus.API.Router.push_discovery/2`'s seam) instead of standing up a real
-  `Vagus.Core.Client`/Core: the router's push is fire-and-forget
-  (`Vagus.Discovery.Push.push/2` always returns `:ok` and does its real work
-  in a detached `Task`), so intercepting at that boundary is the only way to
-  assert "a push was attempted" without also asserting anything about
-  network delivery, which isn't this module's concern.
+  The dedup tests (audit B3) see each Core push through the `:discovery_push`
+  seam, which the push queue calls instead of Core.
   """
   use ExUnit.Case, async: false
   use Plug.Test
@@ -18,29 +13,11 @@ defmodule Vagus.API.DiscoveryRouterTest do
   @opts Vagus.API.Router.init([])
 
   setup do
-    prev = Application.get_env(:vagus, :discovery_push)
-    test_pid = self()
-
-    Application.put_env(:vagus, :discovery_push, fn method, message ->
-      send(test_pid, {:discovery_push, method, message})
-      :ok
-    end)
-
-    on_exit(fn ->
-      # `is_nil/1`, not a truthiness check: an explicitly-configured `nil`
-      # (there isn't one today, but nothing rules it out later) is still a
-      # real value to restore rather than delete.
-      if is_nil(prev),
-        do: Application.delete_env(:vagus, :discovery_push),
-        else: Application.put_env(:vagus, :discovery_push, prev)
-    end)
-
-    :ok
+    capture_discovery_pushes()
   end
 
   # Register a running add-on that declares `discovery`; return its token.
   defp addon_token(slug, discovery) do
-    on_exit(fn -> Vagus.Discovery.delete_by_slug(slug) end)
     register_app_token(app_config(slug), identity: %{discovery: discovery})
   end
 
@@ -100,6 +77,7 @@ defmodule Vagus.API.DiscoveryRouterTest do
     conn2 = call(:post, "/discovery", token, body_params)
     assert conn2.status == 200
     assert body(conn2)["data"]["uuid"] == uuid
+    drain_discovery_pushes()
     refute_received {:discovery_push, _method, _message}
 
     sup = Vagus.API.Token.get()

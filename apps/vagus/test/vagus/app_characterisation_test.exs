@@ -52,7 +52,10 @@ defmodule Vagus.AppCharacterisationTest.GatedBackend do
   def stop(id, opts \\ []), do: Fake.stop(id, opts)
 
   @impl true
-  def remove(id, opts \\ []), do: Fake.remove(id, opts)
+  def remove(id, opts \\ []) do
+    gate(:remove)
+    Fake.remove(id, opts)
+  end
 
   @impl true
   def remove_image(image, opts \\ []), do: Fake.remove_image(image, opts)
@@ -148,11 +151,22 @@ defmodule Vagus.AppCharacterisationTest do
 
   defp body(conn), do: Jason.decode!(conn.resp_body)
 
-  defp capture_discovery_pushes do
-    prev = Application.get_env(:vagus, :discovery_push)
+  # Holds each POST push until the test releases it; a DELETE goes straight through.
+  defp hold_post_pushes do
     test_pid = self()
+    prev = Application.get_env(:vagus, :discovery_push)
 
     Application.put_env(:vagus, :discovery_push, fn method, message ->
+      if method == :post do
+        send(test_pid, {:post_held, self()})
+
+        receive do
+          :release -> :ok
+        after
+          5_000 -> exit(:post_never_released)
+        end
+      end
+
       send(test_pid, {:discovery_push, method, message})
       :ok
     end)
@@ -251,7 +265,6 @@ defmodule Vagus.AppCharacterisationTest do
 
   # Core keeps a config flow alive until it is told the discovery is gone;
   # dropping the entry locally only reaches Core at its next boot-time pull.
-  @tag :known_failing
   test "uninstall pushes a discovery DELETE to Core for each message the app posted" do
     capture_discovery_pushes()
     slug = "core_char_disc"
@@ -265,6 +278,58 @@ defmodule Vagus.AppCharacterisationTest do
 
     assert supervisor_call(:post, "/addons/#{slug}/uninstall").status == 200
     assert_receive {:discovery_push, :delete, %{uuid: ^uuid}}, 1_000
+  end
+
+  # Core acts on pushes in arrival order: a DELETE overtaking its uuid's POST
+  # would leave Core a config flow for an app that is gone.
+  test "an accepted discovery's POST reaches Core before the uninstall's DELETE" do
+    hold_post_pushes()
+    slug = "core_char_disc_order"
+    installed = install_app(config(slug, %{"discovery" => ["mqtt"]}), state: :started)
+    token = register_app_token(installed)
+
+    conn = app_call(:post, "/discovery", token, %{"service" => "mqtt", "config" => %{}})
+    assert conn.status == 200
+    uuid = body(conn)["data"]["uuid"]
+    assert_receive {:post_held, pusher}, 1_000
+
+    assert supervisor_call(:post, "/addons/#{slug}/uninstall").status == 200
+    refute_receive {:discovery_push, :delete, _message}, 100
+    send(pusher, :release)
+
+    assert_receive {:discovery_push, first, %{uuid: ^uuid}}, 1_000
+    assert_receive {:discovery_push, second, %{uuid: ^uuid}}, 1_000
+    assert [first, second] == [:post, :delete]
+  end
+
+  # Every message the app posted before the uninstall is deleted in Core; one
+  # the stopping container posts is refused, so nothing outlives the app.
+  test "a discovery posted while the container is removed is refused and never pushed" do
+    capture_discovery_pushes()
+    slug = "core_char_disc_late"
+    installed = install_app(config(slug, %{"discovery" => ["mqtt", "other"]}), state: :started)
+    token = register_app_token(installed)
+    name = "svc_#{slug}"
+    :ok = Vagus.App.provide_service(slug, name, %{"password" => "p"})
+    {:ok, %{uuid: early}, :new} = Vagus.App.add_discovery(slug, "mqtt", %{})
+    assert_receive {:discovery_push, :post, %{uuid: ^early}}
+
+    GatedBackend.arm(:remove)
+    uninstall = Task.async(fn -> Vagus.App.uninstall(slug) end)
+    assert_receive {:gate_entered, :remove, remover}, 5_000
+
+    # Core's GET while the container stops already misses.
+    assert :error = Vagus.App.discovery(early)
+    conn = app_call(:post, "/discovery", token, %{"service" => "other", "config" => %{}})
+    assert conn.status == 503
+    send(remover, :release)
+    assert :ok = Task.await(uninstall)
+
+    assert_receive {:discovery_push, :delete, %{uuid: ^early}}, 1_000
+    drain_discovery_pushes()
+    refute_received {:discovery_push, _method, _message}
+    assert :error = Vagus.App.service(name)
+    assert :error = Vagus.App.discovery(early)
   end
 
   # Upstream's per-app job group rejects a second lifecycle job outright;

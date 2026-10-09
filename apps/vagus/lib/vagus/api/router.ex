@@ -35,14 +35,13 @@ defmodule Vagus.API.Router do
   alias Vagus.Addon.Store.Assets
   alias Vagus.API.{AdminPanel, Envelope, StaticData, SupervisorOptions, Tiers}
   alias Vagus.App
+  alias Vagus.App.Policy
   alias Vagus.Backend
   alias Vagus.Backups
   alias Vagus.Core.{ConfigCheck, Lifecycle, TokenStore, Versions}
-  alias Vagus.Discovery
   alias Vagus.Jobs
   alias Vagus.Mqtt.Broker
   alias Vagus.Runtime.{Docker, Logs, Stats}
-  alias Vagus.Services
 
   alias Vagus.API.Models.{
     AccessPoint,
@@ -1072,7 +1071,7 @@ defmodule Vagus.API.Router do
 
   get "/discovery" do
     if home_assistant?(conn.assigns.caller) do
-      messages = Discovery.list()
+      messages = App.discoveries()
 
       services =
         messages
@@ -1090,7 +1089,7 @@ defmodule Vagus.API.Router do
 
   get "/discovery/:uuid" do
     if home_assistant?(conn.assigns.caller) do
-      case Discovery.get(uuid) do
+      case App.discovery(uuid) do
         {:ok, message} -> Envelope.send_ok(conn, discovery_view(message))
         :error -> Envelope.send_error(conn, "Discovery message not found", 404)
       end
@@ -1103,13 +1102,13 @@ defmodule Vagus.API.Router do
     with {:addon, %{slug: slug, discovery: declared}} <- conn.assigns.caller,
          {:ok, service, config} <- validate_discovery(conn.body_params),
          true <- service in declared do
-      {:ok, message, outcome} = Discovery.add(slug, service, config)
-      # `:existing` means Core already has this exact (addon, service,
-      # config) record — pushing again would be the duplicate this dedup
-      # exists to prevent (audit B3). `:new`/`:updated` both need Core told,
-      # same as upstream telling it on every non-identical `send`.
-      if outcome != :existing, do: push_discovery(:post, message)
-      Envelope.send_ok(conn, %{uuid: message.uuid})
+      case App.add_discovery(slug, service, config) do
+        {:ok, message, _outcome} ->
+          Envelope.send_ok(conn, %{uuid: message.uuid})
+
+        {:error, :unavailable} ->
+          Envelope.send_error(conn, "App #{slug} is not available", 503)
+      end
     else
       {:error, message} -> Envelope.send_error(conn, message, 400)
       # A non-add-on caller, or an add-on that didn't declare the service.
@@ -1120,9 +1119,8 @@ defmodule Vagus.API.Router do
   delete "/discovery/:uuid" do
     case conn.assigns.caller do
       {:addon, %{slug: slug}} ->
-        case Discovery.delete(uuid, slug) do
-          {:ok, message} ->
-            push_discovery(:delete, message)
+        case App.delete_discovery(slug, uuid) do
+          {:ok, _message} ->
             Envelope.send_ok(conn, %{})
 
           {:error, :not_found} ->
@@ -1204,19 +1202,24 @@ defmodule Vagus.API.Router do
   # `services_role` grant (from its config.yaml `services:`).
 
   get "/services" do
-    Envelope.send_ok(conn, %{services: Services.list()})
+    Envelope.send_ok(conn, %{services: Policy.services_view(App.services())})
   end
 
   post "/services/:service" do
-    if provider?(conn.assigns.caller, service) do
+    if Policy.may_provide?(conn.assigns.caller, service) do
       case validate_service(service, conn.body_params) do
         {:ok, data} ->
-          case Services.set(service, data, addon_slug(conn.assigns.caller)) do
+          slug = addon_slug(conn.assigns.caller)
+
+          case App.provide_service(slug, service, data) do
             :ok ->
               Envelope.send_ok(conn, %{})
 
             {:error, :already_provided} ->
               Envelope.send_error(conn, "Service already provided", 400)
+
+            {:error, :unavailable} ->
+              Envelope.send_error(conn, "App #{slug} is not available", 503)
           end
 
         {:error, message} ->
@@ -1228,9 +1231,11 @@ defmodule Vagus.API.Router do
   end
 
   get "/services/:service" do
-    if service_reader?(conn.assigns.caller, service) do
-      case Services.get(service) do
-        {:ok, data} -> Envelope.send_ok(conn, data)
+    if Policy.may_read_service?(conn.assigns.caller, service) do
+      case App.service(service) do
+        # The provider under the legacy `addon` key, the shape Core's
+        # `aiohasupervisor` reads.
+        {:ok, slug, data} -> Envelope.send_ok(conn, Map.put(data, "addon", slug))
         :error -> Envelope.send_error(conn, "Service not enabled", 400)
       end
     else
@@ -1239,8 +1244,9 @@ defmodule Vagus.API.Router do
   end
 
   delete "/services/:service" do
-    if provider?(conn.assigns.caller, service) do
-      Services.delete(service, addon_slug(conn.assigns.caller))
+    # Not provided, or provided by another app: upstream answers ok either way.
+    if Policy.may_provide?(conn.assigns.caller, service) do
+      _ = App.withdraw_service(addon_slug(conn.assigns.caller), service)
       Envelope.send_ok(conn, %{})
     else
       Envelope.send_error(conn, "Caller may not delete '#{service}'", 403)
@@ -3652,21 +3658,6 @@ defmodule Vagus.API.Router do
 
   defp validate_discovery(_params), do: {:error, "invalid discovery body"}
 
-  # Fire-and-forget push to Core `POST|DELETE api/hassio_push/discovery/{uuid}`
-  # with the message minus `config` (`app`→`addon`). Shared with the native
-  # broker's provider via `Vagus.Discovery.Push` — see that module for the
-  # `no_refresh_token`/best-effort semantics.
-  #
-  # Resolved through `:discovery_push` (default `&Vagus.Discovery.Push.push/2`)
-  # rather than called directly, same seam shape as `core_lifecycle/0` etc.
-  # above — the router has no other way to observe whether a given
-  # `POST /discovery` actually reached Core, since `Push.push/2` always
-  # answers `:ok` immediately and does the real work in a detached `Task`.
-  defp push_discovery(method, message) do
-    push = Application.get_env(:vagus, :discovery_push, &Vagus.Discovery.Push.push/2)
-    push.(method, message)
-  end
-
   # Resolve the slug an info request may read: the supervisor (Core) may read
   # any slug; an add-on may read `self` or its own slug, nothing else. The
   # supervisor slug comes from the URL, so validate it before it's interpolated
@@ -3752,21 +3743,6 @@ defmodule Vagus.API.Router do
   # the supervisor token, resolved to `:supervisor` by `Vagus.API.Auth`.
   defp home_assistant?(:supervisor), do: true
   defp home_assistant?(_caller), do: false
-
-  # May the caller provide/delete this service? (its role must be "provide").
-  defp provider?({:addon, %{services_role: roles}}, service),
-    do: Map.get(roles, service) == "provide"
-
-  defp provider?(_caller, _service), do: false
-
-  # May the caller read the service? Supervisor/Core always; an add-on iff it
-  # declares any role for the service (provide/want/need).
-  defp service_reader?(:supervisor, _service), do: true
-
-  defp service_reader?({:addon, %{services_role: roles}}, service),
-    do: Map.has_key?(roles, service)
-
-  defp service_reader?(_caller, _service), do: false
 
   # Validate a service publish body. Only `mqtt` is known (§A3.1
   # SCHEMA_SERVICE_MQTT).

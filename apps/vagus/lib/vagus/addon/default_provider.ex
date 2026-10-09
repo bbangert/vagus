@@ -9,8 +9,8 @@ defmodule Vagus.Addon.DefaultProvider do
   add-ons and waits for the balena-engine to come up), a native add-on needs no
   container/engine, so this one-shot process installs + starts it directly,
   independent of Docker — the broker is available even on a boot where the
-  engine never appears. It's placed after `Native.Supervisor`/`Services`/
-  `Discovery`/`DNS` in the tree so all of its dependencies are up when it runs.
+  engine never appears. It's placed after `Native.Supervisor`, the app tree
+  and `DNS` so all of its dependencies are up when it runs.
 
   Gated by `config :vagus, :default_native_addon` (the store slug to ensure,
   e.g. `"core_mqtt"`); `start_link/1` returns `:ignore` when unset, so it sits

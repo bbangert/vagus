@@ -88,8 +88,8 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
     |> Router.call(@opts)
   end
 
-  defp addon_call(method, path, slug, body \\ nil) do
-    token = register_app_token(fixture_config(slug))
+  defp addon_call(method, path, slug, body \\ nil, token_opts \\ []) do
+    token = register_app_token(fixture_config(slug), token_opts)
 
     conn = conn(method, path, body && Jason.encode!(body))
     conn = if body, do: put_req_header(conn, "content-type", "application/json"), else: conn
@@ -252,7 +252,7 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
       # A different add-on saying `self` acts on itself — which is not
       # installed — so it gets a 404 about its own slug and core_lifecycle is
       # untouched.
-      conn = addon_call(:post, "/addons/self/start", "core_intruder")
+      conn = addon_call(:post, "/addons/self/start", "core_intruder", nil, installed: false)
       assert conn.status == 404
       assert body(conn)["message"] =~ "core_intruder"
       assert {:ok, %{state: :stopped}} = app_info("core_lifecycle")

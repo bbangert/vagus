@@ -12,7 +12,7 @@ defmodule Vagus.App do
 
   alias Vagus.Addon.{Config, Manager, State, Update}
   alias Vagus.Addon.Registry, as: Tokens
-  alias Vagus.App.{Directory, Instances}
+  alias Vagus.App.{Directory, Instances, Policy}
   alias Vagus.Network
 
   @settings [:ingress_panel, :watchdog, :ports, :boot, :auto_update, :protected]
@@ -64,8 +64,17 @@ defmodule Vagus.App do
     end)
   end
 
+  @doc "`false` while `Vagus.Addon.State` is restarting."
   @spec installed?(String.t()) :: boolean()
-  def installed?(slug), do: match?({:ok, _entry}, State.get(slug))
+  def installed?(slug), do: match?({:ok, _entry}, state_get(slug))
+
+  # The broker's Provider and `monitor/1` callers reach State through here; a
+  # State restart must read as "no answer", not crash them.
+  defp state_get(slug) do
+    State.get(slug)
+  catch
+    :exit, _reason -> :unavailable
+  end
 
   @spec slugs() :: [String.t()]
   def slugs, do: Enum.map(State.list(), & &1.config.slug)
@@ -75,13 +84,34 @@ defmodule Vagus.App do
   directory that is restarting: to a caller they all mean "no answer".
   """
   @spec ask(String.t(), term(), timeout()) :: {:ok, term()} | :absent
-  def ask(slug, question, timeout \\ 5_000) do
-    case whereis(slug) do
-      nil -> :absent
-      pid -> {:ok, :gen_statem.call(pid, question, timeout)}
-    end
+  def ask(slug, question, timeout \\ 5_000), do: call(whereis(slug), question, timeout)
+
+  defp call(nil, _question, _timeout), do: :absent
+
+  defp call(pid, question, timeout) do
+    {:ok, :gen_statem.call(pid, question, timeout)}
   catch
     :exit, _reason -> :absent
+  end
+
+  # For writes an app makes about itself: its process may be missing while
+  # it runs (a failed start, a stop out of band), and the write must land.
+  # State is asked even when a process is up: an app nobody can confirm is
+  # installed must not gain a service or a discovery.
+  defp ask_healing(slug, question) do
+    case state_get(slug) do
+      {:ok, _entry} -> call(whereis(slug) || ensure(slug), question, 5_000)
+      _unconfirmed -> :absent
+    end
+  end
+
+  defp heal(slug), do: if(installed?(slug), do: ensure(slug))
+
+  defp ensure(slug) do
+    case Instances.ensure(slug) do
+      {:ok, pid} -> pid
+      _not_started -> nil
+    end
   end
 
   # A dead pid can still be listed until the directory's partition handles its
@@ -136,6 +166,116 @@ defmodule Vagus.App do
       _timeout_or_no_request ->
         answers
     end
+  end
+
+  @doc """
+  Monitors the app's process, starting it first if the app is installed but
+  has none, for a caller that must publish again into the next one.
+  """
+  @spec monitor(String.t()) :: {:ok, reference()} | :absent
+  def monitor(slug) do
+    case whereis(slug) || heal(slug) do
+      nil -> :absent
+      pid -> {:ok, Process.monitor(pid)}
+    end
+  end
+
+  @spec provide_service(String.t(), String.t(), map()) ::
+          :ok | {:error, :already_provided | :unavailable}
+  def provide_service(slug, name, payload) do
+    case ask_healing(slug, {:provide_service, name, payload}) do
+      {:ok, reply} -> reply
+      :absent -> {:error, :unavailable}
+    end
+  end
+
+  @doc "Only the providing app's own process holds the service, so another app's withdraw finds nothing."
+  @spec withdraw_service(String.t(), String.t(), timeout()) ::
+          :ok | {:error, :not_found | :unavailable}
+  def withdraw_service(slug, name, timeout \\ 5_000) do
+    case ask(slug, {:withdraw_service, name}, timeout) do
+      {:ok, reply} -> reply
+      :absent -> {:error, :unavailable}
+    end
+  end
+
+  @spec service(String.t()) :: {:ok, String.t(), map()} | :error
+  def service(name) do
+    with [{pid, slug}] <- lookup({:service, name}),
+         {:ok, {:ok, payload}} <- call(pid, {:service, name}, 5_000) do
+      {:ok, slug, payload}
+    else
+      _ -> :error
+    end
+  end
+
+  @doc "Every provided service as `{name, provider_slug}`, read from the directory alone."
+  @spec services() :: [{String.t(), String.t()}]
+  def services do
+    Registry.select(Directory, [{{{:service, :"$1"}, :_, :"$2"}, [], [{{:"$1", :"$2"}}]}])
+  rescue
+    ArgumentError -> []
+  end
+
+  @spec add_discovery(String.t(), String.t(), map()) ::
+          {:ok, Policy.message(), :new | :existing | :updated} | {:error, :unavailable}
+  def add_discovery(slug, service, config) do
+    case ask_healing(slug, {:add_discovery, service, config}) do
+      {:ok, reply} -> reply
+      :absent -> {:error, :unavailable}
+    end
+  end
+
+  @spec delete_discovery(String.t(), String.t(), timeout()) ::
+          {:ok, Policy.message()} | {:error, :not_found | :not_owner}
+  def delete_discovery(slug, uuid, timeout \\ 5_000) do
+    case lookup({:discovery, uuid}) do
+      [{pid, ^slug}] ->
+        case call(pid, {:delete_discovery, uuid}, timeout) do
+          {:ok, reply} -> reply
+          :absent -> {:error, :not_found}
+        end
+
+      [{_pid, _owner}] ->
+        {:error, :not_owner}
+
+      [] ->
+        {:error, :not_found}
+    end
+  end
+
+  @spec discovery(String.t()) :: {:ok, Policy.message()} | :error
+  def discovery(uuid) do
+    with [{pid, _slug}] <- lookup({:discovery, uuid}),
+         {:ok, {:ok, message}} <- call(pid, {:discovery, uuid}, 5_000) do
+      {:ok, message}
+    else
+      _ -> :error
+    end
+  end
+
+  @doc "An app that does not answer by the deadline is left out."
+  @spec discoveries() :: [Policy.message()]
+  def discoveries do
+    answers = gather(:discovery_list)
+
+    case for {slug, :absent} <- answers, do: slug do
+      [] ->
+        :ok
+
+      missing ->
+        Logger.warning("Discovery list omits apps that did not answer: #{inspect(missing)}")
+    end
+
+    for {_slug, {:ok, messages}} when is_list(messages) <- answers,
+        message <- messages,
+        do: message
+  end
+
+  defp lookup(key) do
+    Registry.lookup(Directory, key)
+  rescue
+    ArgumentError -> []
   end
 
   @doc """
@@ -236,9 +376,14 @@ defmodule Vagus.App do
     # One critical section: a reinstall landing between the uninstall and the
     # stop would have its new process killed.
     with_slug_lock(slug, fn ->
+      # Before the container stops: Core GETs a message before acting on its
+      # DELETE and ignores the DELETE while that still answers, and a message
+      # the stopping app posts now is refused instead of outliving it.
+      _ = ask(slug, :retire)
       result = Manager.uninstall_holding_lock(slug)
-      # `:not_found` too: an entry deleted out of band can leave its process up.
-      if result in [:ok, {:error, :not_found}], do: Instances.stop(slug)
+      # Also when the app stays installed: its retired process refuses every
+      # write, so it goes and the next ask starts a fresh one.
+      Instances.stop(slug)
       result
     end)
   end
@@ -256,13 +401,19 @@ defmodule Vagus.App do
   end
 
   defp do_install(%Config{slug: slug} = config) do
-    if installed?(slug) do
-      {:error, :already_installed}
-    else
-      with :ok <- Manager.install(config),
-           :ok <- State.put(config, :stopped) do
-        ensure_after_install(slug)
-      end
+    case state_get(slug) do
+      {:ok, _entry} ->
+        {:error, :already_installed}
+
+      # Not known to be absent, so no pull.
+      :unavailable ->
+        {:error, :unavailable}
+
+      :error ->
+        with :ok <- Manager.install(config),
+             :ok <- State.put(config, :stopped) do
+          ensure_after_install(slug)
+        end
     end
   end
 

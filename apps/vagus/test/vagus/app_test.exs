@@ -110,7 +110,8 @@ defmodule Vagus.AppTest do
       ref = Process.monitor(pid)
 
       assert :ok = App.uninstall(config.slug)
-      assert_receive {:DOWN, ^ref, :process, ^pid, :shutdown}
+      # `:normal` when its own read after the delete found the entry gone.
+      assert_receive {:DOWN, ^ref, :process, ^pid, reason} when reason in [:normal, :shutdown]
       refute App.installed?(config.slug)
     end
 
@@ -150,23 +151,29 @@ defmodule Vagus.AppTest do
       :ok = App.install(config)
       [{old, _}] = Elixir.Registry.lookup(Directory, {:slug, slug})
 
-      # A suspended app supervisor parks the uninstall in its process stop,
-      # after the entry is gone: the window a reinstall must not get into.
-      sup = Process.whereis(Vagus.App.Instances)
-      :erlang.trace(sup, true, [:receive])
-      :ok = :sys.suspend(sup)
-      on_exit(fn -> :sys.resume(sup) end)
+      old_ref = Process.monitor(old)
 
+      # Suspended, the app supervisor parks the uninstall at its stop, after
+      # the entry is gone: the window a reinstall must not get into.
+      instances = Process.whereis(Vagus.App.Instances)
+      :erlang.trace(instances, true, [:receive])
+      :ok = :sys.suspend(instances)
+      on_exit(fn -> :sys.resume(instances) end)
       uninstall = Task.async(fn -> App.uninstall(slug) end)
-      assert_receive {:trace, ^sup, :receive, {:"$gen_call", _, {:terminate_child, ^old}}}, 5_000
+
+      assert_receive {:trace, ^instances, :receive,
+                      {:"$gen_call", _from, {:terminate_child, ^old}}},
+                     5_000
+
+      :erlang.trace(instances, false, [:receive])
+      refute App.installed?(slug)
 
       install = Task.async(fn -> App.install(config) end)
       assert Task.yield(install, 200) == nil
-      refute App.installed?(slug)
 
-      :erlang.trace(sup, false, [:receive])
-      :ok = :sys.resume(sup)
+      :ok = :sys.resume(instances)
       assert :ok = Task.await(uninstall)
+      assert_receive {:DOWN, ^old_ref, :process, ^old, _reason}
       assert :ok = Task.await(install)
 
       assert [{pid, _}] = Elixir.Registry.lookup(Directory, {:slug, slug})
@@ -275,6 +282,31 @@ defmodule Vagus.AppTest do
     end
   end
 
+  describe "while Vagus.Addon.State is down" do
+    test "an app reads as not installed, not as a crash" do
+      config = config()
+      slug = track(config, process: false)
+      stop_state()
+
+      refute App.installed?(slug)
+      assert :absent = App.monitor(slug)
+      assert {:error, :unavailable} = App.provide_service(slug, "svc_#{slug}", %{})
+      assert {:error, :unavailable} = App.install(config)
+    end
+
+    test "an app with a live process gains no service and no discovery" do
+      slug = track(config())
+      [{pid, _}] = Elixir.Registry.lookup(Directory, {:slug, slug})
+      stop_state()
+
+      assert {:error, :unavailable} = App.provide_service(slug, "svc_#{slug}", %{})
+      assert {:error, :unavailable} = App.add_discovery(slug, "mqtt", %{})
+      assert Process.alive?(pid)
+      assert [] = Elixir.Registry.lookup(Directory, {:service, "svc_#{slug}"})
+      assert {:ok, []} = App.ask(slug, :discovery_list)
+    end
+  end
+
   describe "Instances.ensure/1" do
     test "is {:error, :unavailable} while the app supervisor is down" do
       stop_instances()
@@ -336,6 +368,84 @@ defmodule Vagus.AppTest do
     end
   end
 
+  describe "services and discovery" do
+    test "a provided service is found by name, with its provider" do
+      slug = track(config())
+      name = "svc_#{slug}"
+
+      assert :ok = App.provide_service(slug, name, %{"host" => "h"})
+      assert {:ok, ^slug, %{"host" => "h"}} = App.service(name)
+      assert {name, slug} in App.services()
+      assert :error = App.service("none_#{slug}")
+    end
+
+    test "a provide from an app whose process is missing starts it and lands" do
+      slug = track(config(), process: false)
+      name = "svc_#{slug}"
+
+      assert :ok = App.provide_service(slug, name, %{})
+      assert {:ok, ^slug, %{}} = App.service(name)
+    end
+
+    test "a provide or a discovery from an app that is not installed is unavailable" do
+      slug = "core_app_ghost_#{System.unique_integer([:positive])}"
+
+      assert {:error, :unavailable} = App.provide_service(slug, "svc_#{slug}", %{})
+      assert {:error, :unavailable} = App.add_discovery(slug, "mqtt", %{})
+      assert [] = Elixir.Registry.lookup(Directory, {:slug, slug})
+    end
+
+    test "only the provider withdraws its service" do
+      owner = track(config())
+      other = track(config())
+      name = "svc_#{owner}"
+      :ok = App.provide_service(owner, name, %{})
+
+      assert {:error, :not_found} = App.withdraw_service(other, name)
+      assert {:ok, ^owner, _payload} = App.service(name)
+      assert :ok = App.withdraw_service(owner, name)
+      assert :error = App.service(name)
+    end
+
+    test "only the owner deletes its discovery message" do
+      owner = track(config())
+      other = track(config())
+      {:ok, %{uuid: uuid} = message, :new} = App.add_discovery(owner, "mqtt", %{})
+
+      assert {:ok, ^message} = App.discovery(uuid)
+      assert {:error, :not_owner} = App.delete_discovery(other, uuid)
+      assert {:ok, ^message} = App.delete_discovery(owner, uuid)
+      assert {:error, :not_found} = App.delete_discovery(owner, uuid)
+      assert :error = App.discovery(uuid)
+    end
+
+    test "discoveries/0 gathers every app's messages and leaves out, and logs, those that do not answer" do
+      a = track(config())
+      b = track(config())
+      stuck = for _ <- 1..2, do: track(config())
+      {:ok, %{uuid: ua}, :new} = App.add_discovery(a, "mqtt", %{})
+      {:ok, %{uuid: ub}, :new} = App.add_discovery(b, "mqtt", %{})
+      stuck_uuids = for slug <- stuck, do: elem(App.add_discovery(slug, "mqtt", %{}), 1).uuid
+      pids = Enum.map(stuck, &suspend/1)
+
+      {{uuids, elapsed}, log} =
+        ExUnit.CaptureLog.with_log(fn ->
+          started = System.monotonic_time(:millisecond)
+          uuids = Enum.map(App.discoveries(), & &1.uuid)
+          {uuids, System.monotonic_time(:millisecond) - started}
+        end)
+
+      assert ua in uuids and ub in uuids
+      for uuid <- stuck_uuids, do: refute(uuid in uuids)
+      assert elapsed < 2 * 1_000
+      for slug <- stuck, do: assert(log =~ slug)
+
+      for pid <- pids, do: :ok = :sys.resume(pid)
+      for pid <- pids, do: _ = :sys.get_state(pid)
+      refute_received _late_reply
+    end
+  end
+
   # A child stopped through `terminate_child/2` stays down until restarted;
   # every app process goes with it.
   defp stop_instances do
@@ -343,6 +453,14 @@ defmodule Vagus.AppTest do
 
     on_exit(fn ->
       {:ok, _pid} = Supervisor.restart_child(Vagus.App.Supervisor, Vagus.App.Instances)
+    end)
+  end
+
+  defp stop_state do
+    :ok = Supervisor.terminate_child(Vagus.Supervisor, Vagus.Addon.State)
+
+    on_exit(fn ->
+      {:ok, _pid} = Supervisor.restart_child(Vagus.Supervisor, Vagus.Addon.State)
     end)
   end
 

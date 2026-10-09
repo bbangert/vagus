@@ -90,7 +90,8 @@ defmodule Vagus.API.AddonOptionsConfigTest do
 
   test "an add-on that isn't installed is a 400" do
     # Registered token, no State entry — nothing to compute options from.
-    conn = get("/addons/self/options/config", addon_token("core_optcfgghost"))
+    token = register_app_token(config("core_optcfgghost", []), installed: false)
+    conn = get("/addons/self/options/config", token)
     assert conn.status == 400
   end
 
