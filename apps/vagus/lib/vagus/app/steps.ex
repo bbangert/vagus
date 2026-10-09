@@ -750,8 +750,10 @@ defmodule Vagus.App.Steps do
   # sobelow_skip ["Traversal.FileModule"]
   defp remove_data_dir(slug, opts) do
     if Config.valid_slug?(slug) do
-      File.rm_rf(Path.join([data_root(opts), "addons", "data", slug]))
-      :ok
+      case File.rm_rf(Path.join([data_root(opts), "addons", "data", slug])) do
+        {:ok, _removed} -> :ok
+        {:error, reason, path} -> {:error, {:remove_data_dir, path, reason}}
+      end
     else
       Logger.warning(
         "Vagus.App.Steps: refusing to rm_rf the data dir for unsafe slug #{inspect(slug)}"

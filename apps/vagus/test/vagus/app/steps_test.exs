@@ -723,6 +723,18 @@ defmodule Vagus.App.StepsTest do
       refute_received {:panel_push, _, _}
     end
 
+    # A name too long for the filesystem fails for root too, unlike a mode.
+    # Its parent must exist: lookup stops at a missing one with `:enoent`,
+    # which `rm_rf` takes as already removed.
+    test "a data dir it cannot remove is the step's error, naming the path", ctx do
+      File.mkdir_p!(ctx.data_root)
+      root = Path.join(ctx.data_root, String.duplicate("x", 300))
+      data_dir = Path.join([root, "addons", "data", "test_app"])
+
+      assert {:error, {:remove_data_dir, ^data_dir, :enametoolong}} =
+               Steps.run(:remove_app, input(ctx, %{data_root: root}))
+    end
+
     test "refuses to rm_rf outside the data dir for an unsafe slug", ctx do
       for slug <- ["../evil", ".."] do
         hostile = %{test_config() | slug: slug}

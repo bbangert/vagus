@@ -2680,7 +2680,8 @@ defmodule Vagus.API.Router do
         Envelope.send_error(conn, "App #{config.name} is already installed", 400)
 
       {:error, reason} ->
-        Envelope.send_error(conn, inspect(reason), 400)
+        {status, message} = app_failure(reason)
+        Envelope.send_error(conn, message, status)
     end
   end
 
@@ -2772,6 +2773,7 @@ defmodule Vagus.API.Router do
   defp update_failure(slug, :not_in_store),
     do: {404, "Addon #{slug} is no longer available in the store"}
 
+  defp update_failure(_slug, {:persist, _reason} = reason), do: app_failure(reason)
   defp update_failure(_slug, other), do: {400, update_error_message(other)}
 
   defp update_error_message(:no_update_available), do: "No update available for this addon"
@@ -2828,7 +2830,8 @@ defmodule Vagus.API.Router do
             Envelope.send_error(conn, busy_message(resolved), 400)
 
           {:error, reason} ->
-            Envelope.send_error(conn, inspect(reason), 400)
+            {status, message} = app_failure(reason)
+            Envelope.send_error(conn, message, status)
         end
 
       {:error, :forbidden} ->
@@ -2838,6 +2841,16 @@ defmodule Vagus.API.Router do
 
   # Upstream's per-app job group refuses a second job outright.
   defp busy_message(slug), do: "Another job is running for job group app_#{slug}"
+
+  # The container did what was asked; the host failed to record it or to
+  # clean up after it, which is no fault of the request.
+  defp app_failure({:persist, reason}),
+    do: {500, "The app's state could not be saved: #{inspect(reason)}"}
+
+  defp app_failure({:remove_data_dir, path, reason}),
+    do: {500, "The app was uninstalled but #{path} could not be removed (#{inspect(reason)})"}
+
+  defp app_failure(reason), do: {400, inspect(reason)}
 
   # Same `self`-resolution as `lifecycle_action/3` — `/addons/self/options` is
   # one segment, so upstream bypasses it. Note the deliberate asymmetry with

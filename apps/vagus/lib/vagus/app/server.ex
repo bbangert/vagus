@@ -448,17 +448,19 @@ defmodule Vagus.App.Server do
   end
 
   # An install that could not save its file has installed nothing: no reboot
-  # would find it. Anywhere else the app is already on disk, so the op goes on.
-  defp effect(:persist, {_st, d, acts} = acc) do
+  # would find it. Anywhere else the container already did what was asked,
+  # so the op goes on and its reply carries the failure. Every save writes the
+  # whole record, so a later one that succeeds clears it.
+  defp effect(:persist, {st, %{run: run} = d, acts}) do
     case persist(d) do
       :ok ->
-        {:cont, acc}
+        {:cont, {st, %{d | run: %{run | unsaved: nil}}, acts}}
 
-      {:error, reason} when d.run.op == :install ->
-        {:halt, {:exit, d, acts ++ reply(d.run, {:error, {:persist, reason}})}}
+      {:error, reason} when run.op == :install ->
+        {:halt, {:exit, d, acts ++ reply(run, {:error, {:persist, reason}})}}
 
-      {:error, _reason} ->
-        {:cont, acc}
+      {:error, reason} ->
+        {:cont, {st, %{d | run: %{run | unsaved: reason}}, acts}}
     end
   end
 
@@ -493,7 +495,9 @@ defmodule Vagus.App.Server do
     {st, d, acts ++ step_actions}
   end
 
-  defp apply_effect({:reply, term}, {st, d, acts}), do: {st, d, acts ++ reply(d.run, term)}
+  defp apply_effect({:reply, term}, {st, d, acts}),
+    do: {st, d, acts ++ reply(d.run, unsaved(term, d.run))}
+
   defp apply_effect({:keys, add, drop}, {st, d, acts}), do: {st, sync_keys(d, add, drop), acts}
 
   defp apply_effect({:timer, name, ms, msg}, {st, d, acts}),
@@ -548,6 +552,14 @@ defmodule Vagus.App.Server do
 
   defp reply(%{from: from}, term) when from != nil, do: [{:reply, from, term}]
   defp reply(_run, _term), do: []
+
+  # A success whose record is not on disk would be undone by the next boot.
+  defp unsaved(:ok, %{unsaved: reason}) when reason != nil, do: {:error, {:persist, reason}}
+
+  defp unsaved({:ok, _}, %{op: :update, unsaved: reason}) when reason != nil,
+    do: {:error, {:persist, reason}}
+
+  defp unsaved(term, _run), do: term
 
   defp replies(actions), do: Enum.filter(actions, &match?({:reply, _from, _term}, &1))
 

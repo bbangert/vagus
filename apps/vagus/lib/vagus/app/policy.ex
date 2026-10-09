@@ -451,7 +451,7 @@ defmodule Vagus.App.Policy do
   def plan(op, args, data) do
     with :ok <- precheck(op, args, data) do
       %{op: op, args: args, steps: steps(op, args, data), step: nil, acc: acc(op, data)}
-      |> Map.merge(%{task: nil, ref: nil, from: nil})
+      |> Map.merge(%{task: nil, ref: nil, from: nil, unsaved: nil})
     end
   end
 

@@ -16,6 +16,7 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
 
   alias Vagus.Addon.{Config, Store}
   alias Vagus.API.{Router, Token}
+  alias Vagus.App.File, as: AppFile
 
   @opts Router.init([])
 
@@ -115,6 +116,13 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
     end)
   end
 
+  # The app file's temp path made a directory: every save of `slug` fails.
+  defp block_saves(slug) do
+    blocker = Path.join(AppFile.dir(), slug <> ".json.tmp")
+    File.mkdir_p!(blocker)
+    on_exit(fn -> File.rm_rf!(blocker) end)
+  end
+
   describe "POST /store/addons/:slug/install (+ legacy /addons/:slug/install alias)" do
     test "installs a store entry: config slug rewritten to the store slug, State records :stopped" do
       seed_store("core_testaddon", fixture_config("testaddon"))
@@ -126,6 +134,20 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
 
       assert {:ok, %{config: installed, state: :stopped}} = app_info("core_testaddon")
       assert installed.slug == "core_testaddon"
+    end
+
+    test "an install whose file cannot be saved -> 500 naming the failure, nothing installed" do
+      seed_store("core_testaddon3", fixture_config("testaddon3"))
+      on_exit(fn -> forget_app("core_testaddon3") end)
+      block_saves("core_testaddon3")
+
+      ExUnit.CaptureLog.capture_log(fn ->
+        conn = supervisor_call(:post, "/store/addons/core_testaddon3/install")
+        assert conn.status == 500
+        assert body(conn)["message"] =~ "could not be saved"
+      end)
+
+      assert :error = app_info("core_testaddon3")
     end
 
     test "the legacy /addons/:slug/install alias installs the same way" do
@@ -197,6 +219,20 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
       install_app(config, state: :started)
       conn = supervisor_call(:post, "/addons/core_lifecycle/stop")
       assert conn.status == 200
+      assert {:ok, %{state: :stopped}} = app_info("core_lifecycle")
+    end
+
+    test "a stop whose state cannot be saved -> 500, the app stopped all the same",
+         %{config: config} do
+      install_app(config, state: :started)
+      block_saves("core_lifecycle")
+
+      ExUnit.CaptureLog.capture_log(fn ->
+        conn = supervisor_call(:post, "/addons/core_lifecycle/stop")
+        assert conn.status == 500
+        assert body(conn)["message"] =~ "could not be saved"
+      end)
+
       assert {:ok, %{state: :stopped}} = app_info("core_lifecycle")
     end
 
@@ -294,6 +330,19 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
         supervisor_call(:post, "/addons/core_uninstallme/uninstall", %{"remove_config" => true})
 
       assert conn.status == 200
+      assert :error = app_info("core_uninstallme")
+    end
+
+    # A name too long for the filesystem fails for root too, unlike a mode;
+    # setup restores the data root.
+    test "a data dir that cannot be removed -> 500 naming it; the app is gone" do
+      root = Path.join(System.tmp_dir!(), String.duplicate("x", 300))
+      Application.put_env(:vagus, :addon_data_root, root)
+      data_dir = Path.join([root, "addons", "data", "core_uninstallme"])
+
+      conn = supervisor_call(:post, "/addons/core_uninstallme/uninstall")
+      assert conn.status == 500
+      assert body(conn)["message"] =~ data_dir
       assert :error = app_info("core_uninstallme")
     end
 
@@ -1017,6 +1066,22 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
   defp json(conn), do: Jason.decode!(conn.resp_body)
 
   describe "POST .../update (P2-A P3)" do
+    test "an update whose new version cannot be saved -> 500 naming the failure" do
+      installed = fixture_config("updsave")
+      seed_store("core_updsave", installed)
+      on_exit(fn -> forget_app("core_updsave") end)
+      assert supervisor_call(:post, "/store/addons/core_updsave/install").status == 200
+
+      seed_store("core_updsave", %{installed | version: "9.9.9"})
+      block_saves("core_updsave")
+
+      ExUnit.CaptureLog.capture_log(fn ->
+        conn = supervisor_call(:post, "/store/addons/core_updsave/update", %{})
+        assert conn.status == 500
+        assert body(conn)["message"] =~ "could not be saved"
+      end)
+    end
+
     test "updates an installed add-on and reports the new version on the wire" do
       installed = fixture_config("updrt")
       seed_store("core_updrt", installed)

@@ -360,8 +360,8 @@ defmodule Vagus.App do
     args = %{running?: running?}
 
     case command(slug, :boot_start, args) do
-      {:error, :shutting_down} -> command(slug, :resume, args)
-      result -> result
+      {:error, :shutting_down} -> slug |> command(:resume, args) |> unsaved_ok()
+      result -> unsaved_ok(result)
     end
   end
 
@@ -431,11 +431,22 @@ defmodule Vagus.App do
 
   @spec stop_for_backup(String.t(), keyword()) :: :ok | {:error, term()}
   def stop_for_backup(slug, opts \\ []),
-    do: command(slug, :stop, Map.new(Keyword.take(opts, @backup_opts)))
+    do: slug |> command(:stop, Map.new(Keyword.take(opts, @backup_opts))) |> unsaved_ok()
 
   @spec start_after_backup(String.t(), keyword()) :: {:ok, map()} | {:error, term()}
-  def start_after_backup(slug, opts \\ []),
-    do: slug |> command(:start, Map.new(Keyword.take(opts, @backup_opts))) |> started(slug)
+  def start_after_backup(slug, opts \\ []) do
+    slug
+    |> command(:start, Map.new(Keyword.take(opts, @backup_opts)))
+    |> unsaved_ok()
+    |> started(slug)
+  end
+
+  # The container was stopped or started as asked. A backup ends what it
+  # began, and failing on the unsaved state would strand a cold backup's app
+  # stopped; boot would report a running app as failed. The process has
+  # logged the save.
+  defp unsaved_ok({:error, {:persist, _reason}}), do: :ok
+  defp unsaved_ok(result), do: result
 
   @doc "Whether `slug` may run in-BEAM, with no container behind it."
   @spec native_allowed?(String.t()) :: boolean()
