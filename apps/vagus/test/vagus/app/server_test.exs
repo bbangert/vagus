@@ -506,6 +506,20 @@ defmodule Vagus.App.ServerTest do
       assert :gen_statem.call(pid, :installed?) == true
     end
 
+    test "an uninstall whose data dir cannot be removed replies why; the file stays gone" do
+      {slug, pid} = installed()
+      ref = Process.monitor(pid)
+      failure = {:remove_data_dir, "/data/addons/data/#{slug}/locked", :eacces}
+
+      t = op(pid, {:uninstall, %{}})
+      answer(:stop, {:ok, %{was_running: false}})
+      answer(:remove_app, {:error, failure})
+
+      assert {:error, ^failure} = Task.await(t)
+      assert_receive {:DOWN, ^ref, :process, ^pid, :normal}
+      assert :error = AppFile.read(slug)
+    end
+
     test "a halt once the file is gone ends the process; the slug comes back new" do
       {slug, pid} = started()
       ref = Process.monitor(pid)
@@ -603,7 +617,7 @@ defmodule Vagus.App.ServerTest do
       assert :error = AppFile.read(slug)
     end
 
-    test "an op on an installed app whose file cannot be written goes on, with a warning" do
+    test "a stop whose file cannot be written still stops the container and replies the failure" do
       {slug, pid} = started()
       blocker = Path.join(AppFile.dir(), slug <> ".json.tmp")
       File.mkdir_p!(blocker)
@@ -613,11 +627,71 @@ defmodule Vagus.App.ServerTest do
         ExUnit.CaptureLog.capture_log(fn ->
           t = op(pid, {:stop, %{}})
           answer(:stop, {:ok, %{was_running: true}})
-          assert :ok = Task.await(t)
+          assert {:error, {:persist, :eperm}} = Task.await(t)
         end)
 
       assert log =~ "not saved"
-      assert %{wanted: :stopped} = data(pid)
+      assert :idle = state(pid)
+      assert %{wanted: :stopped, container_id: nil} = data(pid)
+      assert {:ok, %{wanted: :started}} = AppFile.read(slug)
+    end
+
+    test "an update whose commit cannot be saved keeps the new container, no rollback" do
+      {slug, pid} = started(%{"version" => "1"})
+      blocker = Path.join(AppFile.dir(), slug <> ".json.tmp")
+      File.mkdir_p!(blocker)
+      on_exit(fn -> File.rm_rf!(blocker) end)
+
+      ExUnit.CaptureLog.capture_log(fn ->
+        t = op(pid, {:update, %{config: app_config(slug, %{"version" => "2"})}})
+        answer(:pull, {:ok, "x/y:2"})
+        answer(:stop, {:ok, %{was_running: true}})
+
+        assert %{config: %{version: "2"}} =
+                 answer(:start, {:ok, %{@started | container_id: "c2"}})
+
+        answer(:reclaim_image, {:ok, :ok})
+        assert {:error, {:persist, :eperm}} = Task.await(t)
+      end)
+
+      refute_received {:step, :start, _input, _task}
+      assert %{container_id: "c2", config: %{version: "2"}} = data(pid)
+      assert {:ok, %{config: %{version: "1"}}} = AppFile.read(slug)
+    end
+
+    test "an error reply is not masked by a save that failed during the op" do
+      {slug, pid} = started(%{"version" => "1"})
+      blocker = Path.join(AppFile.dir(), slug <> ".json.tmp")
+      File.mkdir_p!(blocker)
+      on_exit(fn -> File.rm_rf!(blocker) end)
+
+      ExUnit.CaptureLog.capture_log(fn ->
+        t = op(pid, {:update, %{config: app_config(slug, %{"version" => "2"})}})
+        answer(:pull, {:ok, "x/y:2"})
+        answer(:stop, {:ok, %{was_running: true}})
+        answer(:start, {:error, :boom})
+        answer(:start, {:ok, %{@started | container_id: "c2"}})
+        assert {:error, {:rolled_back, :boom}} = Task.await(t)
+      end)
+    end
+
+    test "a save that fails mid-op and succeeds at its end replies success" do
+      {slug, pid} = started(%{"version" => "1"})
+      blocker = Path.join(AppFile.dir(), slug <> ".json.tmp")
+      File.mkdir_p!(blocker)
+      on_exit(fn -> File.rm_rf!(blocker) end)
+
+      ExUnit.CaptureLog.capture_log(fn ->
+        t = op(pid, {:update, %{config: app_config(slug, %{"version" => "2"})}})
+        answer(:pull, {:ok, "x/y:2"})
+        answer(:stop, {:ok, %{was_running: false}})
+        {_input, task} = step(:reclaim_image)
+        File.rm_rf!(blocker)
+        send(task, {:outcome, {:ok, :ok}})
+        assert {:ok, %{to: "2"}} = Task.await(t)
+      end)
+
+      assert {:ok, %{config: %{version: "2"}}} = AppFile.read(slug)
     end
 
     test "a file that does not decode starts no process, and is logged" do

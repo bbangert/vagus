@@ -2,6 +2,7 @@ defmodule Vagus.AppTest do
   # Installs apps under the global `Vagus.App.Instances`, and briefly stops it.
   use ExUnit.Case, async: false
 
+  import ExUnit.CaptureLog
   import Vagus.AppFixtures
 
   alias Vagus.Addon.{Backend, Config}
@@ -211,6 +212,61 @@ defmodule Vagus.AppTest do
 
       assert {:error, {:reserved_slug, "vagus"}} = App.install(config)
       assert :error = app_info("vagus")
+    end
+  end
+
+  describe "stop_for_backup/2 and start_after_backup/2" do
+    # A cold backup that failed on the save would leave the app stopped.
+    test "a state that cannot be saved does not fail them" do
+      slug = track(config())
+      blocker = Path.join(AppFile.dir(), slug <> ".json.tmp")
+      File.mkdir_p!(blocker)
+      on_exit(fn -> File.rm_rf!(blocker) end)
+      stub_app_steps()
+
+      capture_log(fn ->
+        stop = Task.async(fn -> App.stop_for_backup(slug) end)
+        assert_receive {:step, :stop, _input, stopping}, 5_000
+        send(stopping, {:outcome, {:ok, %{was_running: true}}})
+        assert :ok = Task.await(stop)
+
+        start = Task.async(fn -> App.start_after_backup(slug) end)
+        assert_receive {:step, :start, _input, starting}, 5_000
+        send(starting, {:outcome, {:ok, %{container_id: "c1"}}})
+        assert {:ok, %{slug: ^slug}} = Task.await(start)
+      end)
+    end
+  end
+
+  describe "boot_start/2" do
+    defp boot_unsaved(slug) do
+      blocker = Path.join(AppFile.dir(), slug <> ".json.tmp")
+      File.mkdir_p!(blocker)
+      on_exit(fn -> File.rm_rf!(blocker) end)
+
+      capture_log(fn ->
+        boot = Task.async(fn -> App.boot_start(slug, false) end)
+        assert_receive {:step, :start, _input, starting}, 5_000
+        send(starting, {:outcome, {:ok, %{container_id: "c1"}}})
+        assert :ok = Task.await(boot)
+      end)
+    end
+
+    # The orchestrator's boot report would show a running app as failed.
+    test "a start whose state cannot be saved still boots" do
+      slug = track(config(), state: :started)
+      stub_app_steps()
+      boot_unsaved(slug)
+    end
+
+    test "a resume whose state cannot be saved still boots" do
+      slug = track(config(), state: :started)
+      stub_app_steps()
+      halt = Task.async(fn -> App.halt(slug) end)
+      assert_receive {:step, :halt_stop, _input, halting}, 5_000
+      send(halting, {:outcome, {:ok, :stopped}})
+      assert :ok = Task.await(halt)
+      boot_unsaved(slug)
     end
   end
 
