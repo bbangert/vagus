@@ -276,8 +276,8 @@ defmodule Vagus.Addon.ConfigTest do
     end
 
     # `Vagus.Addon.Config` can't reference `Vagus.API.AdminPanel` (that would
-    # close a compile-time cycle Config <- Addon.State <- Ingress <-
-    # AdminPanel), so its reserved list is a literal. This is what keeps the
+    # close a compile-time cycle through `Vagus.Ingress`), so its reserved
+    # list is a literal. This is what keeps the
     # two from drifting apart.
     test "the reserved list covers Vagus.API.AdminPanel.slug/0" do
       panel_slug = AdminPanel.slug()
@@ -296,7 +296,7 @@ defmodule Vagus.Addon.ConfigTest do
     end
 
     # Deliberately NOT extended to `valid_slug?/1`: that guard gates
-    # `Manager.uninstall/2`'s `rm_rf`, so a pre-existing `vagus` add-on's
+    # the uninstall's `rm_rf` (`Vagus.App.Steps`), so a pre-existing `vagus` add-on's
     # data dir must stay cleanable.
     test "valid_slug?/1 still accepts a reserved slug" do
       assert Config.valid_slug?("vagus")

@@ -22,7 +22,7 @@ defmodule Vagus.API.IngressProxy do
   1. `ingress_session` cookie → `Vagus.Ingress.validate_session/1`; `:error`
      or missing cookie → 401.
   2. `{token}` (the path segment right after `/ingress/`) →
-     `Vagus.App.resolve_ingress_token/1` → add-on slug; unresolvable → 503
+     `Vagus.Ingress.resolve_token/2` → add-on slug; unresolvable → 503
      (upstream: `HTTPServiceUnavailable`).
   2b. The reserved `vagus` slug is `Vagus.API.AdminPanel`'s synthetic panel,
      which has no container: it is served in-process by `AdminPanel.serve/2`
@@ -165,7 +165,7 @@ defmodule Vagus.API.IngressProxy do
     ["ingress", token | rest] = conn.path_info
 
     with :ok <- check_session(conn),
-         {:ok, slug} <- Vagus.App.resolve_ingress_token(token) do
+         {:ok, slug} <- Vagus.Ingress.resolve_token(token) do
       route(conn, slug, rest)
     else
       :unauthorized -> send_plain(conn, 401, "Unauthorized")

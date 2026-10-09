@@ -1,13 +1,12 @@
 defmodule Vagus.API.AddonLifecycleRouterTest do
   @moduledoc """
-  M4-P3-T1: the add-on lifecycle routes (`POST .../install|start|stop|restart|
-  uninstall|options`, and `GET /addons` reading from `Vagus.Addon.State`
-  instead of `StaticData`).
+  The app lifecycle routes (`POST .../install|start|stop|restart|
+  uninstall|options`) and `GET /addons`.
 
   `Vagus.Addon.Backend.Fake` (`test/support/fake_addon_backend.ex`) is wired
   in via `config :vagus, :addon_backend` for the whole test — the router
-  calls `Vagus.Addon.Manager` with no `:backend` opt, so this is the only way
-  to keep these routes hermetic (no real Docker daemon).
+  passes no `:backend` opt, so this is the only way to keep these routes
+  hermetic (no real Docker daemon).
   """
   use ExUnit.Case, async: false
   use Plug.Test
@@ -173,7 +172,7 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
     end
 
     # G1 (audit B2): before the availability gate, this 200'd and then
-    # failed LATE inside `Manager.install/2`'s image pull — a slower,
+    # failed LATE inside the install's image pull — a slower,
     # more confusing way to say the exact same "wrong arch" thing.
     test "an arch-mismatched store add-on is refused with the reason in the message, no install attempted" do
       {:ok, config} =
@@ -881,12 +880,11 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
       assert Enum.any?(body(conn)["data"]["addons"], &(&1["slug"] == "core_orphan"))
     end
 
-    test "an empty State -> empty list" do
-      # `Vagus.Addon.State` is a global singleton other tests seed; this file is
-      # async: false, so nothing runs concurrently and we can reset it to a
-      # genuinely empty state here rather than assuming a stale entry from an
-      # earlier test isn't lingering (the source of a rare CI flake). `delete/1`
-      # is pure state removal — no backend call.
+    test "no installed apps -> empty list" do
+      # The installed apps are global and other tests seed them; this file is
+      # async: false, so nothing runs concurrently and we can forget every one
+      # here rather than assuming a stale entry from an earlier test isn't
+      # lingering (the source of a rare CI flake).
       for %{config: %{slug: slug}} <- app_list(), do: forget_app(slug)
 
       conn = supervisor_call(:get, "/addons")
@@ -1018,11 +1016,10 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
       #
       # Deriving the installed version from `entry.config.version` is only
       # safe while no lifecycle path re-reads config from the store catalog.
-      # Asserting that by calling `State.put/3` by hand proves nothing about
-      # `Manager` — so this drives the REAL routes, with the store parked on
-      # a different version than the install, and checks what got persisted.
-      # Rewire `Manager.do_start_slug/2` to source config from `Store` and
-      # this fails; the hand-driven `State` tests would not notice.
+      # Writing an app's file by hand proves nothing about the start path —
+      # so this drives the REAL routes, with the store parked on a different
+      # version than the install, and checks what got persisted. Make the
+      # start step source config from `Store` and this fails.
       installed = fixture_config("lifecycleversion")
       seed_store("core_lifecycleversion", installed)
       on_exit(fn -> forget_app("core_lifecycleversion") end)

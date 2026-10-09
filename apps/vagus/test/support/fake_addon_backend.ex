@@ -3,14 +3,14 @@ defmodule Vagus.Addon.Backend.Fake do
   A no-daemon `Vagus.Addon.Backend` for router-level lifecycle tests
   (`test/vagus/api/addon_lifecycle_router_test.exs`) — install/start/stop/
   restart/uninstall all need a backend that succeeds without a real Docker
-  daemon. Injected via `config :vagus, :addon_backend` (see
-  `Vagus.Addon.Manager`'s moduledoc) rather than an explicit `:backend` opt,
-  since the router calls `Manager` with no opts at all.
+  daemon. Injected via `config :vagus, :addon_backend` (read by
+  `Vagus.App.Steps`) rather than an explicit `:backend` opt, since the
+  router passes no opts at all.
 
-  M4-P6-T2 adds an opt-in call recorder (`reset_calls/0` + `calls/0`) so
+  An opt-in call recorder (`reset_calls/0` + `calls/0`) lets
   backup-lifecycle tests (e.g. a cold-mode add-on's `stop`/`start` around a
-  snapshot) can observe *which* backend calls happened, not just the
-  resulting `Vagus.Addon.State`. Backed by a bare ETS table (no process to
+  snapshot) observe *which* backend calls happened, not just the resulting
+  app state. Backed by a bare ETS table (no process to
   supervise — it's owned by whichever test process last called
   `reset_calls/0`, and is torn down for free when that test process exits),
   not a GenServer/Agent; only created on the first `reset_calls/0`, so

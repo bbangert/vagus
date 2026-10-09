@@ -1,6 +1,6 @@
 defmodule Vagus.Addon.StoreTest do
   @moduledoc "P2-T3: the add-on store — catalog building, GenServer, and store views."
-  # `remove_repository/2`'s in-use guard reads the global `Vagus.Addon.State`.
+  # `remove_repository/2`'s in-use guard reads the globally installed apps.
   use ExUnit.Case, async: false
 
   import ExUnit.CaptureLog
@@ -128,7 +128,7 @@ defmodule Vagus.Addon.StoreTest do
     def fetch(%{url: "https://github.com/example/gone"}), do: {:error, :nxdomain}
   end
 
-  # A global `Vagus.Addon.State` entry under `store_slug` — that is the key an
+  # An installed app under `store_slug` — that is the key an
   # installed add-on is really recorded under (`handle_install` rewrites
   # `config.slug` to the store slug), which is what makes the catalog entry's
   # `:repository` field readable as the in-use association.

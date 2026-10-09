@@ -131,7 +131,7 @@ defmodule Vagus.API.CoreLifecycleRouterTest do
   end
 
   # Same add-on-caller registration mechanism as
-  # `Vagus.API.BackupRouterTest`'s `addon_call/3`: a `Vagus.Addon.Registry`
+  # `Vagus.API.BackupRouterTest`'s `addon_call/3`: an installed app's
   # token resolves `conn.assigns.caller` to `{:addon, %{slug: ...}}` via the
   # `x-supervisor-token` header, instead of the `Authorization: Bearer`
   # supervisor token `authed/1` uses above.

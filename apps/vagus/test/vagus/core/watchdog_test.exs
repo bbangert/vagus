@@ -1,8 +1,8 @@
 defmodule Vagus.Core.WatchdogTest do
   @moduledoc """
   Hermetic tests for the Core crash-loop watchdog — events driven by
-  sending `{:docker_event, ...}` directly (the `Vagus.Addon.Watchdog` test
-  pattern; no real `Vagus.Runtime.Events` instance), time driven by an
+  sending `{:docker_event, ...}` directly (no real `Vagus.Runtime.Events`
+  instance), time driven by an
   injected clock, rebuild results scripted.
   """
 

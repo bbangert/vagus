@@ -283,8 +283,8 @@ end
 # The same value as vagus itself serves it. Informational, NOT a check: the
 # cache behind `/core/info` is `Vagus.Core.HttpConfig`, refreshed from
 # `Vagus.Core.Lifecycle`'s health gate and its already-running branch — both
-# driven by `Vagus.Core.Boot`/the container engine, which the host dev loop
-# does not have (`:core_boot` is target-only). On host it therefore reports
+# driven by the Orchestrator's Core stage (`Vagus.App.CoreUnit`), which the
+# host dev loop does not run (its boot is target-only). On host it therefore reports
 # `HttpConfig.defaults/0` (8123) until something triggers a refresh; on a
 # device it is the real assertion and must match the socket value above.
 if supervisor_token do

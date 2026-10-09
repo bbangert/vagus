@@ -6,7 +6,7 @@ defmodule Vagus.API.AddonOptionsConfigTest do
   Upstream answers `app.schema.validate(app.options)`: the config's defaults
   deep-merged with the user's saved options, validated, computed live. It is
   deliberately **not** a read of the `/data/options.json` file
-  `Vagus.Addon.Manager` writes — that file is an output, so reading it back
+  `Vagus.App.Steps` writes — that file is an output, so reading it back
   reports whatever the add-on was last started with.
   """
   use ExUnit.Case, async: false
