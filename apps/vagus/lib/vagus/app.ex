@@ -233,10 +233,14 @@ defmodule Vagus.App do
 
   @spec uninstall(String.t()) :: :ok | {:error, term()}
   def uninstall(slug) do
-    result = Manager.uninstall(slug)
-    # `:not_found` too: an entry deleted out of band can leave its process up.
-    if result in [:ok, {:error, :not_found}], do: Instances.stop(slug)
-    result
+    # One critical section: a reinstall landing between the uninstall and the
+    # stop would have its new process killed.
+    with_slug_lock(slug, fn ->
+      result = Manager.uninstall_holding_lock(slug)
+      # `:not_found` too: an entry deleted out of band can leave its process up.
+      if result in [:ok, {:error, :not_found}], do: Instances.stop(slug)
+      result
+    end)
   end
 
   @doc """
@@ -248,7 +252,7 @@ defmodule Vagus.App do
     # Under the lifecycle lock so two installs of one slug cannot both pass the
     # check, both pull and both write the entry. `Manager.install/2` does not
     # take this lock itself; nesting it would drop it at the inner release.
-    :global.trans({{:addon_lifecycle, slug}, self()}, fn -> do_install(config) end, [node()])
+    with_slug_lock(slug, fn -> do_install(config) end)
   end
 
   defp do_install(%Config{slug: slug} = config) do
@@ -278,6 +282,10 @@ defmodule Vagus.App do
         :ok
     end
   end
+
+  # `Manager`'s lifecycle lock, so app-level steps serialise with its own.
+  defp with_slug_lock(slug, fun),
+    do: :global.trans({{:addon_lifecycle, slug}, self()}, fun, [node()])
 
   @spec update(String.t(), keyword()) :: {:ok, Update.result()} | {:error, term()}
   def update(slug, opts), do: Update.update(slug, opts)

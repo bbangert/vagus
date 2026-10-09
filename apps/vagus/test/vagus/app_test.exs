@@ -143,6 +143,37 @@ defmodule Vagus.AppTest do
       assert App.installed?(config.slug)
     end
 
+    test "an install issued during an uninstall waits and keeps its process" do
+      config = config()
+      slug = config.slug
+      on_exit(fn -> forget_app(slug) end)
+      :ok = App.install(config)
+      [{old, _}] = Elixir.Registry.lookup(Directory, {:slug, slug})
+
+      # A suspended app supervisor parks the uninstall in its process stop,
+      # after the entry is gone: the window a reinstall must not get into.
+      sup = Process.whereis(Vagus.App.Instances)
+      :erlang.trace(sup, true, [:receive])
+      :ok = :sys.suspend(sup)
+      on_exit(fn -> :sys.resume(sup) end)
+
+      uninstall = Task.async(fn -> App.uninstall(slug) end)
+      assert_receive {:trace, ^sup, :receive, {:"$gen_call", _, {:terminate_child, ^old}}}, 5_000
+
+      install = Task.async(fn -> App.install(config) end)
+      assert Task.yield(install, 200) == nil
+      refute App.installed?(slug)
+
+      :erlang.trace(sup, false, [:receive])
+      :ok = :sys.resume(sup)
+      assert :ok = Task.await(uninstall)
+      assert :ok = Task.await(install)
+
+      assert [{pid, _}] = Elixir.Registry.lookup(Directory, {:slug, slug})
+      assert Process.alive?(pid)
+      assert {:ok, %{state: :stopped, config: %{slug: ^slug}}} = App.info(slug)
+    end
+
     test "concurrent installs of one slug pull once" do
       config = config()
       on_exit(fn -> forget_app(config.slug) end)
