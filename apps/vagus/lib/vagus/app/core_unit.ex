@@ -67,24 +67,43 @@ defmodule Vagus.App.CoreUnit do
         Keyword.get(opts, :deadline, :infinity)
       )
 
-    deadline = System.monotonic_time(:millisecond) + budget_ms
-    stop_with_retry(stop, deadline, Keyword.get(opts, :busy_backoff_ms, @busy_backoff_ms))
+    clock = %{
+      now: Keyword.get(opts, :now, fn -> System.monotonic_time(:millisecond) end),
+      sleep: Keyword.get(opts, :sleep, &Process.sleep/1)
+    }
+
+    deadline = clock.now.() + budget_ms
+    backoff_ms = Keyword.get(opts, :busy_backoff_ms, @busy_backoff_ms)
+    stop_with_retry(stop, deadline, backoff_ms, clock)
   end
 
-  defp stop_with_retry(stop, deadline, backoff_ms) do
+  # The sleep is capped to the time left and the deadline re-checked after it,
+  # so no attempt starts past the deadline the caller was promised.
+  defp stop_with_retry(stop, deadline, backoff_ms, clock) do
     case safe(stop) do
       {:error, :busy} = busy ->
-        if System.monotonic_time(:millisecond) < deadline do
-          Process.sleep(backoff_ms)
-          stop_with_retry(stop, deadline, min(backoff_ms * 2, @busy_backoff_cap_ms))
+        remaining = deadline - clock.now.()
+
+        if remaining > 0 do
+          clock.sleep.(min(backoff_ms, remaining))
+
+          if clock.now.() < deadline do
+            stop_with_retry(stop, deadline, min(backoff_ms * 2, @busy_backoff_cap_ms), clock)
+          else
+            give_up(busy)
+          end
         else
-          Logger.warning("Shutdown: Core stayed busy past the retry budget; proceeding")
-          busy
+          give_up(busy)
         end
 
       result ->
         result
     end
+  end
+
+  defp give_up(busy) do
+    Logger.warning("Shutdown: Core stayed busy past the retry budget; proceeding")
+    busy
   end
 
   # A Core stop that raises must not keep the stages after it from running.

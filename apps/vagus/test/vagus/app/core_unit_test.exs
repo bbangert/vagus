@@ -43,6 +43,35 @@ defmodule Vagus.App.CoreUnitTest do
       assert Task.await(stop, 1_000) == {:error, :busy}
     end
 
+    test "the backoff sleep is capped to the time left and no attempt starts past the deadline" do
+      clock = :atomics.new(1, [])
+      calls = :counters.new(1, [])
+      sleeps = :ets.new(:sleeps, [:public, :bag])
+
+      stop = fn ->
+        :counters.add(calls, 1, 1)
+        {:error, :busy}
+      end
+
+      sleep = fn ms ->
+        :ets.insert(sleeps, {ms})
+        :atomics.add(clock, 1, ms)
+      end
+
+      capture_log(fn ->
+        assert CoreUnit.stop(
+                 stop: stop,
+                 sleep: sleep,
+                 now: fn -> :atomics.get(clock, 1) end,
+                 busy_retry_budget_ms: 20,
+                 busy_backoff_ms: 1_000
+               ) == {:error, :busy}
+      end)
+
+      assert :ets.tab2list(sleeps) == [{20}]
+      assert :counters.get(calls, 1) == 1
+    end
+
     test "any other failure is returned without a retry" do
       stop = sequence([{:error, :engine_down}, :ok])
       assert CoreUnit.stop(stop: stop, busy_backoff_ms: 0) == {:error, :engine_down}
