@@ -239,6 +239,10 @@ defmodule Vagus.Backup do
     end)
   end
 
+  @doc false
+  @spec addon_tar(map()) :: {:ok, binary(), non_neg_integer()} | {:error, term()}
+  def addon_tar(addon), do: build_addon_tar(addon)
+
   defp build_addon_tar(addon) do
     addon_json =
       Jason.encode!(%{

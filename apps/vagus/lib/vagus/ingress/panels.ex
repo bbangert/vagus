@@ -95,6 +95,8 @@ defmodule Vagus.Ingress.Panels do
       use. Passing `:client` explicitly (as tests do, pointing at a fixture)
       always attempts the push, regardless of whether the default-named
       client happens to be running.
+    * `:method` - `:post` or `:delete`, for a caller that knows the answer
+      better than the app's current `info` does (an uninstall in progress).
     * `:sync` - `true` runs the push inline instead of in a detached `Task`
       (default `false`). Production callers keep the default; tests that
       need to observe the push's outcome deterministically pass `true`.
@@ -105,7 +107,7 @@ defmodule Vagus.Ingress.Panels do
   @spec update_hass_panel(String.t(), keyword()) :: :ok
   def update_hass_panel(slug, opts \\ []) do
     if client_available?(opts) do
-      method = push_method(slug)
+      method = Keyword.get_lazy(opts, :method, fn -> push_method(slug) end)
       push = fn -> do_push(method, slug, opts) end
 
       if Keyword.get(opts, :sync, false), do: push.(), else: Task.start(push)

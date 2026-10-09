@@ -98,6 +98,7 @@ config :vagus, :backends, %{
 # with injected units. Set here too because under a MIX_TARGET
 # config/target.exs loads first and turns it on.
 config :vagus, :addon_state_path, nil
+config :vagus, :app_files_dir, Path.join(System.tmp_dir!(), "vagus-apps-#{System.pid()}")
 config :vagus, Vagus.App.Orchestrator, boot: false, default_native_app: nil
 
 # Per-run tmp dir, set here too because under a MIX_TARGET config/target.exs

@@ -161,6 +161,10 @@ config :vagus, :token_path, "/data/vagus/token"
 # form.
 config :vagus, :addon_state_path, "/data/vagus/addons.json"
 
+# One file per installed app (`Vagus.App.File`), seeded once from
+# `addons.json`, which is never written again.
+config :vagus, :app_files_dir, "/data/vagus/apps"
+
 # Boot starts apps and Core (`Vagus.App.Orchestrator`); off on :host/:test,
 # where there is no engine to wait on and no reboot to come back from. The
 # default native app is installed and started on its first boot, independent
