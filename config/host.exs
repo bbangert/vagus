@@ -32,6 +32,10 @@ config :vagus, :supervisor_options_path, Path.expand("../.dev/supervisor_options
 # file-backed-JSON pattern as :core_token_path above.
 config :vagus, :store_repositories_path, Path.expand("../.dev/store_repositories.json", __DIR__)
 
+# One file per installed app, beside the other .dev/ state; config/target.exs
+# puts it on /data.
+config :vagus, :app_files_dir, Path.expand("../.dev/apps", __DIR__)
+
 # Device-managed SSH access keypair (`Vagus.SSHAccess`). A DETS file rather
 # than JSON, but the same `__DIR__`-anchored .dev/ path idiom as
 # :core_token_path above; config/target.exs puts it on /data.

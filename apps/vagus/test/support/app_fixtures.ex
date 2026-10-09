@@ -10,7 +10,9 @@ defmodule Vagus.AppFixtures do
   import ExUnit.Assertions, only: [assert_receive: 2]
   import ExUnit.Callbacks, only: [on_exit: 1]
 
-  alias Vagus.Addon.{Config, Registry, State}
+  alias Vagus.Addon.Config
+  alias Vagus.App.File, as: AppFile
+  alias Vagus.App.{Instances, Policy}
 
   @settings [:watchdog, :boot, :ingress_panel, :protected, :auto_update, :ports, :ingress_port]
 
@@ -32,9 +34,12 @@ defmodule Vagus.AppFixtures do
   end
 
   @doc """
+  Writes the app's file and (re)starts its process, which reads it.
   Installing a slug again keeps its ingress token, user options and settings,
-  as a reinstall over a live entry does. `process: false` records the app with
-  no process behind it, as after a process start that failed.
+  as a reinstall over a live app does. `state: :started` is the engine
+  reporting the app's container started, as the process would hear it;
+  `process: false` leaves the app with no process behind it, as after a
+  process start that failed.
   """
   @spec install_app(Config.t(), keyword()) :: Config.t()
   def install_app(%Config{slug: slug} = config, opts \\ []) do
@@ -42,25 +47,66 @@ defmodule Vagus.AppFixtures do
     {process?, changes} = Keyword.pop(opts, :process, true)
     check_keys!(changes)
 
-    :ok = State.put(config, state)
-    if process?, do: {:ok, _pid} = Vagus.App.Instances.ensure(slug)
-    :ok = set_app(slug, changes)
+    saved =
+      case AppFile.read(slug) do
+        {:ok, saved} -> saved
+        :error -> nil
+      end
+
+    data = Policy.init_data(slug, saved)
+    token = data.ingress_token || Base.url_encode64(:crypto.strong_rand_bytes(32), padding: false)
+
+    data =
+      Enum.reduce(changes, %{data | config: config, wanted: state, ingress_token: token}, &put/2)
+
+    :ok = Instances.stop(slug)
+    :ok = AppFile.write(data)
+    if process?, do: start_process(slug, state)
 
     on_exit(fn -> forget_app(slug) end)
     config
   end
 
+  defp put({:options, options}, data), do: %{data | user_options: options}
+  defp put({key, value}, data), do: Map.put(data, key, value)
+
+  defp start_process(slug, state) do
+    {:ok, pid} = Instances.ensure(slug)
+
+    if state == :started do
+      send(
+        pid,
+        {:docker_event, %{action: "start", id: "fixture-" <> slug, name: "addon_" <> slug}}
+      )
+
+      _ = :sys.get_state(pid)
+    end
+
+    pid
+  end
+
   @doc """
   Changes an installed app's options and settings mid-test, taking the same
-  keys as `install_app/2` bar `:state`. `:ingress_port` is written to the store
-  directly: `Vagus.App` does not expose it.
+  keys as `install_app/2` bar `:state`. `:ingress_port` is not a setting
+  `Vagus.App` exposes, so it is written to the app's file and the process
+  restarted to read it.
   """
   @spec set_app(String.t(), keyword()) :: :ok
   def set_app(slug, changes) do
     check_keys!(changes)
     {ingress_port, changes} = Keyword.split(changes, [:ingress_port])
-    :ok = Vagus.App.set(slug, changes)
-    Enum.each(ingress_port, fn {key, port} -> :ok = State.put_setting(slug, key, port) end)
+    if changes != [], do: :ok = Vagus.App.set(slug, changes)
+
+    if ingress_port != [] do
+      {:ok, saved} = AppFile.read(slug)
+      {:ok, %{state: state}} = Vagus.App.info(slug)
+      data = Enum.reduce(ingress_port, Policy.init_data(slug, saved), &put/2)
+      :ok = Instances.stop(slug)
+      :ok = AppFile.write(data)
+      start_process(slug, if(state in [:startup, :started], do: :started, else: :stopped))
+    end
+
+    :ok
   end
 
   defp check_keys!(changes) do
@@ -71,40 +117,89 @@ defmodule Vagus.AppFixtures do
   end
 
   @doc """
-  A token is only ever issued to an installed app, and what the app posts with
-  it lands in the app's process, so an app not yet installed is installed
-  here and forgotten again at exit. `installed: false` leaves it uninstalled,
-  as for a token outliving its app.
+  A token is only ever issued to an installed app, and is held by its
+  process, so an app not yet installed is installed here and forgotten again
+  at exit. What a token grants comes from the app's config, so `identity:`
+  grants are written into the config. `installed: false` returns a token no
+  app holds, as for one that outlived its app.
   """
   @spec register_app_token(Config.t(), keyword()) :: String.t()
   def register_app_token(%Config{slug: slug} = config, opts \\ []) do
-    if Keyword.get(opts, :installed, true) and not match?({:ok, _entry}, State.get(slug)),
-      do: install_app(config)
-
     token = Keyword.get_lazy(opts, :token, fn -> random_token() end)
-    identity = Map.merge(Registry.identity_from_config(config), Keyword.get(opts, :identity, %{}))
-    :ok = Registry.register(token, identity)
-    on_exit(fn -> Registry.unregister_slug(slug) end)
+
+    if Keyword.get(opts, :installed, true) do
+      grants = Keyword.get(opts, :identity, %{})
+
+      case Vagus.App.info(slug) do
+        {:ok, entry} when grants != %{} ->
+          state = if entry.state in [:startup, :started], do: :started, else: :stopped
+          install_app(grant(entry.config, grants), state: state)
+
+        {:ok, _entry} ->
+          :ok
+
+        :error ->
+          install_app(grant(config, grants))
+      end
+
+      [{pid, _slug}] = Registry.lookup(Vagus.App.Directory, {:slug, slug})
+      :ok = :gen_statem.call(pid, {:test_token, token})
+    end
+
     token
   end
 
-  @spec app_info(String.t()) :: {:ok, State.entry()} | :error
+  defp grant(config, grants) do
+    Enum.reduce(grants, config, fn
+      {:slug, _slug}, config ->
+        config
+
+      {:services_role, roles}, config ->
+        %{config | services: for({service, role} <- roles, do: "#{service}:#{role}")}
+
+      {key, value}, config ->
+        Map.replace!(config, key, value)
+    end)
+  end
+
+  @spec app_info(String.t()) :: {:ok, map()} | :error
   def app_info(slug), do: Vagus.App.info(slug)
 
-  @spec app_list() :: [State.entry()]
+  @spec app_list() :: [map()]
   def app_list, do: Vagus.App.list()
 
   @doc """
   For tests that install through a route, so no fixture call exists to hang
-  cleanup on, and for simulating a concurrent uninstall mid-test. The entry
-  goes first, so a process restarting meanwhile ignores its start instead of
-  coming back with no entry.
+  cleanup on, and for simulating a concurrent uninstall mid-test. The file
+  goes first, so nothing that heals a missing process brings this one back.
   """
   @spec forget_app(String.t()) :: :ok
   def forget_app(slug) do
-    :ok = State.delete(slug)
-    :ok = Vagus.App.Instances.stop(slug)
-    :ok = Registry.unregister_slug(slug)
+    :ok = AppFile.delete(slug)
+    :ok = Instances.stop(slug)
+  end
+
+  @doc "Hands every app step to the calling test through `Vagus.App.StepsStub`."
+  @spec stub_app_steps() :: :ok
+  def stub_app_steps do
+    put_env_for_test(:app_steps, Vagus.App.StepsStub)
+    put_env_for_test(:app_steps_test_pid, self())
+  end
+
+  @doc "Sets each step's deadline in ms, by step name, for this test."
+  @spec app_deadlines(map()) :: :ok
+  def app_deadlines(deadlines), do: put_env_for_test(:app_deadlines, deadlines)
+
+  defp put_env_for_test(key, value) do
+    prev = Application.fetch_env(:vagus, key)
+    Application.put_env(:vagus, key, value)
+
+    on_exit(fn ->
+      case prev do
+        {:ok, value} -> Application.put_env(:vagus, key, value)
+        :error -> Application.delete_env(:vagus, key)
+      end
+    end)
   end
 
   @doc "Sends `{tag, method, message}` to the test for each discovery push, in delivery order."

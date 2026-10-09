@@ -249,13 +249,16 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
     test "`self` resolves to the CALLER's slug, never the target's", %{config: config} do
       install_app(config)
 
-      # A different add-on saying `self` acts on itself — which is not
-      # installed — so it gets a 404 about its own slug and core_lifecycle is
-      # untouched.
-      conn = addon_call(:post, "/addons/self/start", "core_intruder", nil, installed: false)
-      assert conn.status == 404
-      assert body(conn)["message"] =~ "core_intruder"
+      # A different add-on saying `self` acts on itself, and only itself.
+      conn = addon_call(:post, "/addons/self/stop", "core_intruder")
+      assert conn.status == 200
+      assert {:ok, %{state: :stopped, wanted: :stopped}} = app_info("core_intruder")
       assert {:ok, %{state: :stopped}} = app_info("core_lifecycle")
+
+      # A token for an app that is not installed is held by no process, so
+      # it authenticates nothing.
+      conn = addon_call(:post, "/addons/self/start", "core_ghost", nil, installed: false)
+      assert conn.status == 401
     end
 
     # `(?!security|update)` — the two segments upstream carves out of the

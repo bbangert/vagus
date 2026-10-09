@@ -44,8 +44,13 @@ defmodule Vagus.App.Steps do
     step(name, input)
   end
 
-  defp report_stage(%{job: job, stage: {stage, progress}}) when job != nil,
-    do: Vagus.Jobs.update(job, stage: stage, progress: progress)
+  defp report_stage(%{job: job, stage: {stage, progress}} = input) when job != nil,
+    do:
+      Vagus.Jobs.update(
+        job,
+        [stage: stage, progress: progress],
+        input[:jobs_server] || Vagus.Jobs
+      )
 
   defp report_stage(_input), do: :ok
 
@@ -160,13 +165,13 @@ defmodule Vagus.App.Steps do
       {:ok, :ok}
   end
 
-  # The container is already stopped (the step before). The pushes are
+  # The container is already stopped (the step before). The panel push is
   # detached: Core may be slow or down, and the uninstall does not wait on it.
+  # Discovery DELETEs are the app process's, queued before the stop.
   defp step(:remove_app, %{config: config} = input) do
     opts = opts(input)
     remove_image_best_effort(config, opts)
     maybe_push_panel(config, opts)
-    Enum.each(input[:discovery] || [], &Vagus.Discovery.Push.notify(:delete, &1))
 
     case remove_data_dir(config.slug, opts) do
       :ok -> {:ok, :ok}

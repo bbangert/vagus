@@ -1,10 +1,10 @@
 defmodule Vagus.AppTest do
-  # Seeds the global `Vagus.Addon.State` and briefly stops the global Registry.
+  # Installs apps under the global `Vagus.App.Instances`, and briefly stops it.
   use ExUnit.Case, async: false
 
   import Vagus.AppFixtures
 
-  alias Vagus.Addon.{Backend, Config, Registry}
+  alias Vagus.Addon.{Backend, Config}
   alias Vagus.App
   alias Vagus.App.Directory
 
@@ -64,9 +64,8 @@ defmodule Vagus.AppTest do
       assert :error = App.identity_for_token("app-test-unknown")
     end
 
-    test "is :error while the Registry is not running", %{token: token} do
-      :ok = Supervisor.terminate_child(Vagus.Supervisor, Registry)
-      on_exit(fn -> {:ok, _pid} = Supervisor.restart_child(Vagus.Supervisor, Registry) end)
+    test "is :error once the app's process is gone", %{token: token, slug: slug} do
+      :ok = Vagus.App.Instances.stop(slug)
 
       assert :error = App.identity_for_token(token)
     end
@@ -125,59 +124,49 @@ defmodule Vagus.AppTest do
       assert {:ok, %{state: :stopped}} = app_info(config.slug)
     end
 
-    test "a process outliving its entry does not block a reinstall" do
+    test "a process waiting in :new takes the install" do
       config = config()
       on_exit(fn -> forget_app(config.slug) end)
-      :ok = App.install(config)
-      :ok = Vagus.Addon.State.delete(config.slug)
+      {:ok, pid} = Vagus.App.Instances.ensure(config.slug)
 
       assert :ok = App.install(config)
+      assert [{^pid, _}] = Elixir.Registry.lookup(Directory, {:slug, config.slug})
       assert {:ok, %{state: :stopped}} = app_info(config.slug)
     end
 
-    test "an install whose process does not start is still installed" do
+    test "with no process to run it, an install pulls nothing and records nothing" do
       stop_instances()
       config = config()
-      on_exit(fn -> forget_app(config.slug) end)
+      Backend.Fake.reset_calls()
 
-      assert :ok = App.install(config)
-      assert App.installed?(config.slug)
+      assert {:error, :unavailable} = App.install(config)
+      assert [] = Backend.Fake.calls_for("addon_#{config.slug}")
+      refute config.slug in App.slugs()
     end
 
-    test "an install issued during an uninstall waits and keeps its process" do
+    test "an install issued during an uninstall is refused; once it ends the slug installs" do
       config = config()
       slug = config.slug
       on_exit(fn -> forget_app(slug) end)
       :ok = App.install(config)
       [{old, _}] = Elixir.Registry.lookup(Directory, {:slug, slug})
-
       old_ref = Process.monitor(old)
 
-      # Suspended, the app supervisor parks the uninstall at its stop, after
-      # the entry is gone: the window a reinstall must not get into.
-      instances = Process.whereis(Vagus.App.Instances)
-      :erlang.trace(instances, true, [:receive])
-      :ok = :sys.suspend(instances)
-      on_exit(fn -> :sys.resume(instances) end)
+      stub_app_steps()
       uninstall = Task.async(fn -> App.uninstall(slug) end)
+      assert_receive {:step, :stop, _input, stopping}, 5_000
 
-      assert_receive {:trace, ^instances, :receive,
-                      {:"$gen_call", _from, {:terminate_child, ^old}}},
-                     5_000
-
-      :erlang.trace(instances, false, [:receive])
-      refute App.installed?(slug)
+      assert {:error, :already_installed} = App.install(config)
+      send(stopping, {:outcome, {:ok, %{was_running: false}}})
+      assert_receive {:step, :remove_app, _input, removing}, 5_000
+      send(removing, {:outcome, {:ok, :ok}})
+      assert :ok = Task.await(uninstall)
+      assert_receive {:DOWN, ^old_ref, :process, ^old, :normal}
 
       install = Task.async(fn -> App.install(config) end)
-      assert Task.yield(install, 200) == nil
-
-      :ok = :sys.resume(instances)
-      assert :ok = Task.await(uninstall)
-      assert_receive {:DOWN, ^old_ref, :process, ^old, _reason}
+      assert_receive {:step, :pull, _input, pulling}, 5_000
+      send(pulling, {:outcome, {:ok, "x/y:1.0"}})
       assert :ok = Task.await(install)
-
-      assert [{pid, _}] = Elixir.Registry.lookup(Directory, {:slug, slug})
-      assert Process.alive?(pid)
       assert {:ok, %{state: :stopped, config: %{slug: ^slug}}} = App.info(slug)
     end
 
@@ -267,43 +256,28 @@ defmodule Vagus.AppTest do
   end
 
   describe "installed?/1" do
-    test "answers from the entry while the process is stuck" do
-      slug = track(config())
-      suspend(slug)
+    test "a process in :new is not an installed app" do
+      slug = config().slug
+      {:ok, _pid} = Vagus.App.Instances.ensure(slug)
+      on_exit(fn -> forget_app(slug) end)
 
-      assert App.installed?(slug)
+      refute App.installed?(slug)
     end
 
-    test "an entry with no process is installed without starting one" do
+    test "a command to a process with no app installed is not found" do
+      slug = config().slug
+      {:ok, _pid} = Vagus.App.Instances.ensure(slug)
+      on_exit(fn -> forget_app(slug) end)
+
+      assert {:error, :not_found} = App.start(slug)
+      assert {:error, :not_found} = App.uninstall(slug)
+    end
+
+    test "a saved app with no process is installed, and gets its process back" do
       slug = track(config(), process: false)
 
       assert App.installed?(slug)
-      assert [] = Elixir.Registry.lookup(Directory, {:slug, slug})
-    end
-  end
-
-  describe "while Vagus.Addon.State is down" do
-    test "an app reads as not installed, not as a crash" do
-      config = config()
-      slug = track(config, process: false)
-      stop_state()
-
-      refute App.installed?(slug)
-      assert :absent = App.monitor(slug)
-      assert {:error, :unavailable} = App.provide_service(slug, "svc_#{slug}", %{})
-      assert {:error, :unavailable} = App.install(config)
-    end
-
-    test "an app with a live process gains no service and no discovery" do
-      slug = track(config())
-      [{pid, _}] = Elixir.Registry.lookup(Directory, {:slug, slug})
-      stop_state()
-
-      assert {:error, :unavailable} = App.provide_service(slug, "svc_#{slug}", %{})
-      assert {:error, :unavailable} = App.add_discovery(slug, "mqtt", %{})
-      assert Process.alive?(pid)
-      assert [] = Elixir.Registry.lookup(Directory, {:service, "svc_#{slug}"})
-      assert {:ok, []} = App.ask(slug, :discovery_list)
+      assert [{_pid, _}] = Elixir.Registry.lookup(Directory, {:slug, slug})
     end
   end
 
@@ -312,7 +286,7 @@ defmodule Vagus.AppTest do
       stop_instances()
       config = config()
       on_exit(fn -> forget_app(config.slug) end)
-      :ok = Vagus.Addon.State.put(config, :stopped)
+      install_app(config, process: false)
 
       assert {:error, :unavailable} = Vagus.App.Instances.ensure(config.slug)
     end
@@ -341,7 +315,9 @@ defmodule Vagus.AppTest do
 
       assert [%{state: :unknown}] = Enum.filter(App.list(), &(&1.config.slug == slug))
 
-      assert {:ok, %{state: :started, config: %{slug: ^slug}}} = App.info(slug)
+      # Until the engine reports the container, a restarted process knows only
+      # what its file says the app should be.
+      assert {:ok, %{wanted: :started, config: %{slug: ^slug}}} = App.info(slug)
       assert [{pid, _}] = Elixir.Registry.lookup(Directory, {:slug, slug})
       assert Process.alive?(pid)
     end
@@ -453,14 +429,6 @@ defmodule Vagus.AppTest do
 
     on_exit(fn ->
       {:ok, _pid} = Supervisor.restart_child(Vagus.App.Supervisor, Vagus.App.Instances)
-    end)
-  end
-
-  defp stop_state do
-    :ok = Supervisor.terminate_child(Vagus.Supervisor, Vagus.Addon.State)
-
-    on_exit(fn ->
-      {:ok, _pid} = Supervisor.restart_child(Vagus.Supervisor, Vagus.Addon.State)
     end)
   end
 

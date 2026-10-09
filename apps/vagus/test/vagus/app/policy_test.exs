@@ -125,6 +125,20 @@ defmodule Vagus.App.PolicyTest do
   end
 
   describe "on_event/2" do
+    test "a start of the app's container while none is known adopts it" do
+      data = app(%{wanted: :stopped})
+      {adopted, effects} = Policy.on_event(%{action: "start", id: "c9"}, data)
+
+      assert %{container_id: "c9", last_event: {:running, false}} = adopted
+      assert effects == [{:emit, :started}]
+    end
+
+    test "a start event for a known container changes nothing" do
+      data = running(%{last_event: {:running, true}})
+      assert Policy.on_event(%{action: "start", id: "c1"}, data) == {data, []}
+      assert Policy.on_event(%{action: "start", id: "c2"}, data) == {data, []}
+    end
+
     test "an exit of a container other than the current one is ignored" do
       data = running()
       assert Policy.on_event(%{action: "die", id: "old", exit_code: 1}, data) == {data, []}
@@ -380,10 +394,27 @@ defmodule Vagus.App.PolicyTest do
       host = %{data | config: %{config | host_network: true}}
       assert Policy.answer(:ingress_target, host) == {:ok, {:host_network, 62_001, true}}
 
-      assert Policy.answer(:ingress_target, %{data | ip: nil}) == {:error, :not_running}
+      assert Policy.answer(:ingress_target, %{data | ip: nil}) == {:error, :no_container_ip}
 
       assert Policy.answer(:ingress_target, %{data | ingress_port: nil}) ==
                {:error, :no_ingress_port}
+    end
+
+    test "a process with no file yet answers as an app that is not installed" do
+      data = Policy.init_data("app_one", nil)
+
+      for {question, answer} <- [
+            info: :error,
+            snapshot: :error,
+            identity: :error,
+            installed?: false,
+            discovery_list: [],
+            ingress_target: {:error, :not_found},
+            service: :error
+          ] do
+        question = if question == :service, do: {:service, "mqtt"}, else: question
+        assert Policy.answer(question, data) == answer, inspect(question)
+      end
     end
 
     test "services, discovery, and an unknown question" do
@@ -474,6 +505,17 @@ defmodule Vagus.App.PolicyTest do
       assert data.ingress_port == 62_123
       assert Policy.hash(data.token) == hash
       assert byte_size(data.token) == 112
+    end
+
+    test "1b. start/port refused by the directory: the start fails, nothing kept" do
+      config = app_config(%{"ingress" => true, "ingress_port" => 0})
+      {data, [{:step, {:port, nil}}]} = begin(:start, %{}, app(%{config: config}))
+      taken = {:port_taken, {:ingress_port, 62_123}}
+
+      {data, effects} = step(data, {:error, taken})
+
+      assert effects == [:persist, {:reply, {:error, {:ingress_port, taken}}}, :idle]
+      assert %{ingress_port: nil, token_hash: nil} = data
     end
 
     test "2. start/start ok: container, IP, DNS key, wanted started, persisted before the reply" do
@@ -710,7 +752,7 @@ defmodule Vagus.App.PolicyTest do
              ]
 
       assert List.last(effects) == {:step, {:stop, nil}}
-      assert Policy.task_input({:remove_app, nil}, data).discovery == [%{uuid: "u1"}]
+      assert data.discovery == %{}
 
       {data, [{:emit, :stopped}, {:step, {:remove_app, nil}}]} =
         step(data, {:ok, %{was_running: true}})

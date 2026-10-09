@@ -73,7 +73,9 @@ defmodule Vagus.API.ServicesRouterTest do
     assert conn.status == 400
   end
 
-  test "a publish while the app's process cannot be started answers 503" do
+  # The token is held by the app's process, so with no process the publish
+  # is not authenticated at all.
+  test "a publish while the app's process cannot be started answers 401" do
     token = addon_token("core_mosquitto", %{"mqtt" => "provide"})
     :ok = Supervisor.terminate_child(Vagus.App.Supervisor, Vagus.App.Instances)
 
@@ -82,7 +84,7 @@ defmodule Vagus.API.ServicesRouterTest do
     end)
 
     conn = call(:post, "/services/mqtt", token, %{"host" => "h", "port" => 1})
-    assert conn.status == 503
+    assert conn.status == 401
     assert :error = Vagus.App.service("mqtt")
   end
 

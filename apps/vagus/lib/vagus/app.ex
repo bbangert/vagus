@@ -3,81 +3,72 @@ defmodule Vagus.App do
   The one entry point to installed apps for everything outside the app
   subsystem: their facts, their settings and their lifecycle.
 
-  Callers get the `Vagus.Addon.State` entry map and plain results, never a
-  pid or a server name, so what sits behind these functions can change
-  without touching them.
+  Callers get plain maps and results, never a pid or a server name, so what
+  sits behind these functions can change without touching them. Behind them
+  is one `Vagus.App.Server` per app; its answer is the truth, and its saved
+  file stands in only for an app that does not answer a listing in time.
   """
 
   require Logger
 
-  alias Vagus.Addon.{Config, Manager, State, Update}
-  alias Vagus.Addon.Registry, as: Tokens
-  alias Vagus.App.{Directory, Instances, Policy}
+  alias Vagus.Addon.{Config, Store}
+  alias Vagus.App.{Directory, Instances, Policy, Steps}
+  alias Vagus.App.File, as: AppFile
   alias Vagus.Network
 
   @settings [:ingress_panel, :watchdog, :ports, :boot, :auto_update, :protected]
 
-  # The only options that mean anything to `Manager` from a backup; the rest of
-  # `Vagus.Backups`' opts (`:server`, `:date`, `:extra`) are its own.
+  # The only options that mean anything to an operation from a backup; the
+  # rest of `Vagus.Backups`' opts (`:server`, `:date`, `:extra`) are its own.
   @backup_opts [:backend, :data_root, :socket]
 
-  @doc """
-  The process's answer when it gives one, else the `Vagus.Addon.State` entry,
-  so a missing or stuck process never hides an installed app.
-  """
-  @spec info(String.t()) :: {:ok, State.entry()} | :error
+  @type entry :: map()
+  @type update_result :: %{slug: String.t(), from: String.t(), to: String.t()}
+
+  @spec info(String.t()) :: {:ok, entry()} | :error
   def info(slug) do
-    case ask(slug, :info) do
+    case ask_healing(slug, :info) do
       {:ok, {:ok, entry}} -> {:ok, entry}
-      {:ok, :error} -> :error
-      :absent -> from_state(slug)
-    end
-  end
-
-  # An entry whose process is missing (its start failed, or it was stopped out
-  # of band) gets one back here; a live but stuck one is left to its own fate.
-  defp from_state(slug) do
-    with {:ok, _entry} = found <- State.get(slug) do
-      if whereis(slug) == nil, do: Instances.ensure(slug)
-      found
+      _absent_or_not_installed -> :error
     end
   end
 
   @doc """
-  Every app `Vagus.Addon.State` records, each with its process's answer laid
-  over it. One whose process is missing or does not answer by the deadline is
-  listed with `state: :unknown`, never left out: Home Assistant deletes the
-  device of an app missing from `GET /addons`, with its entities and renames.
+  Every app with a saved file. One whose process does not answer by the
+  deadline is listed from its file with `state: :unknown`, never left out:
+  Home Assistant deletes the device of an app missing from `GET /addons`,
+  with its entities and renames.
   """
-  @spec list() :: [State.entry() | %{state: :unknown}]
+  @spec list() :: [entry()]
   def list do
-    entries = State.list()
-    answers = entries |> Enum.flat_map(&live(&1.config.slug)) |> ask_all(:info, 1_000)
+    slugs = slugs()
+    answers = slugs |> Enum.flat_map(&live/1) |> ask_all(:snapshot, 1_000)
 
-    Enum.flat_map(entries, fn %{config: %{slug: slug}} = entry ->
+    Enum.flat_map(slugs, fn slug ->
       case Map.get(answers, slug) do
-        {:ok, {:ok, answered}} -> [answered]
-        # Uninstalled since `State.list/0`.
+        # Uninstalled since the directory was listed.
         {:ok, :error} -> []
-        _unanswered -> [%{entry | state: :unknown}]
+        {:ok, entry} -> [entry]
+        nil -> unanswered(slug)
       end
     end)
   end
 
-  @doc "`false` while `Vagus.Addon.State` is restarting."
-  @spec installed?(String.t()) :: boolean()
-  def installed?(slug), do: match?({:ok, _entry}, state_get(slug))
+  defp unanswered(slug) do
+    case AppFile.read(slug) do
+      {:ok, saved} ->
+        [slug |> Policy.init_data(saved) |> Policy.snapshot() |> Map.put(:state, :unknown)]
 
-  # The broker's Provider and `monitor/1` callers reach State through here; a
-  # State restart must read as "no answer", not crash them.
-  defp state_get(slug) do
-    State.get(slug)
-  catch
-    :exit, _reason -> :unavailable
+      :error ->
+        []
+    end
   end
 
+  @spec installed?(String.t()) :: boolean()
+  def installed?(slug), do: match?({:ok, true}, ask_healing(slug, :installed?))
+
   @spec slugs() :: [String.t()]
-  def slugs, do: Enum.map(State.list(), & &1.config.slug)
+  def slugs, do: Enum.sort(AppFile.saved())
 
   @doc """
   `:absent` covers no process for the slug, a dead or unanswering one, and a
@@ -94,35 +85,28 @@ defmodule Vagus.App do
     :exit, _reason -> :absent
   end
 
-  # For writes an app makes about itself: its process may be missing while
-  # it runs (a failed start, a stop out of band), and the write must land.
-  # State is asked even when a process is up: an app nobody can confirm is
-  # installed must not gain a service or a discovery.
-  defp ask_healing(slug, question) do
-    case state_get(slug) do
-      {:ok, _entry} -> call(whereis(slug) || ensure(slug), question, 5_000)
-      _unconfirmed -> :absent
-    end
-  end
+  # An app with a saved file but no process (its start failed, or it was
+  # stopped out of band) gets one back here, so a missing process never hides
+  # an installed app nor drops a write the app makes about itself.
+  defp ask_healing(slug, question, timeout \\ 5_000),
+    do: call(whereis(slug) || heal(slug), question, timeout)
 
-  defp heal(slug), do: if(installed?(slug), do: ensure(slug))
-
-  defp ensure(slug) do
-    case Instances.ensure(slug) do
-      {:ok, pid} -> pid
-      _not_started -> nil
+  defp heal(slug) do
+    with true <- slug in AppFile.saved(),
+         {:ok, pid} <- Instances.ensure(slug) do
+      pid
+    else
+      _ -> nil
     end
   end
 
   # A dead pid can still be listed until the directory's partition handles its
   # exit; asking it exits `noproc`, which callers already read as no answer.
   defp whereis(slug) do
-    case Registry.lookup(Directory, {:slug, slug}) do
+    case lookup({:slug, slug}) do
       [{pid, _value}] -> pid
       [] -> nil
     end
-  rescue
-    ArgumentError -> nil
   end
 
   defp live(slug) do
@@ -279,9 +263,9 @@ defmodule Vagus.App do
   end
 
   @doc """
-  Writes `:options` and the per-install settings in the order given; `:error`
-  when the slug is not installed, even with nothing to write. Every key is
-  checked before anything is written: an unknown one raises `ArgumentError`.
+  Writes `:options` and the per-install settings together, on disk before
+  it returns; `:error` when the slug is not installed, even with nothing to
+  write. Every key is checked first: an unknown one raises `ArgumentError`.
   """
   @spec set(String.t(), keyword()) :: :ok | :error
   def set(slug, changes) when is_list(changes) do
@@ -290,27 +274,21 @@ defmodule Vagus.App do
         do: raise(ArgumentError, "unknown app setting #{inspect(key)}")
     end)
 
-    if installed?(slug), do: write_all(slug, changes), else: :error
+    case ask_healing(slug, {:set, changes}) do
+      {:ok, :ok} -> :ok
+      _not_written -> :error
+    end
   end
 
-  # A write still answers `:error` if the app is uninstalled between the check
-  # and it, so the first one stops the rest.
-  defp write_all(slug, changes) do
-    Enum.reduce_while(changes, :ok, fn change, :ok ->
-      case write(slug, change) do
-        :ok -> {:cont, :ok}
-        :error -> {:halt, :error}
-      end
-    end)
-  end
-
-  defp write(slug, {:options, options}), do: State.put_options(slug, options)
-  defp write(slug, {key, value}), do: State.put_setting(slug, key, value)
-
-  @doc "`:error` also when the token registry is not running, as in narrow test setups."
-  @spec identity_for_token(String.t()) :: {:ok, Tokens.identity()} | :error
+  @doc "A token is found by its hash, so the directory never holds one in the clear."
+  @spec identity_for_token(String.t()) :: {:ok, map()} | :error
   def identity_for_token(token) do
-    if Process.whereis(Tokens), do: Tokens.identity_for_token(token), else: :error
+    with [{pid, _slug}] <- lookup({:token, Policy.hash(token)}),
+         {:ok, {:ok, identity}} <- call(pid, :identity, 5_000) do
+      {:ok, identity}
+    else
+      _ -> :error
+    end
   end
 
   @spec resolve_ingress_token(String.t()) :: {:ok, String.t()} | :error
@@ -318,137 +296,139 @@ defmodule Vagus.App do
 
   @doc """
   Where ingress traffic for `slug` goes: `{ip, port, stream?}`, `stream?`
-  being the config's `ingress_stream`. The IP of a bridged app is read from a
-  live docker inspect on every call.
+  being the config's `ingress_stream`. A host-network app answers on
+  loopback or on the gateway depending on the app, so a connect to its port
+  decides here, outside its process.
   """
   @spec ingress_target(String.t()) ::
           {:ok, {String.t(), pos_integer(), boolean()}} | {:error, term()}
   def ingress_target(slug) do
-    case State.get(slug) do
-      :error ->
+    case ask(slug, :ingress_target) do
+      {:ok, {:ok, {:host_network, port, stream}}} ->
+        {:ok, {Network.host_network_ip(port), port, stream}}
+
+      {:ok, answer} ->
+        answer
+
+      :absent ->
         {:error, :not_found}
-
-      {:ok, entry} ->
-        with {:ok, port} <- ingress_port(entry),
-             {:ok, ip} <- ingress_ip(slug, entry, port) do
-          {:ok, {ip, port, entry.config.ingress_stream == true}}
-        end
-    end
-  end
-
-  # The allocated dynamic port wins; otherwise the config's static port, unless
-  # it is the `0` "assign one dynamically" sentinel.
-  defp ingress_port(%{ingress_port: port}) when is_integer(port) and port > 0, do: {:ok, port}
-
-  defp ingress_port(%{config: %{ingress_port: port}}) when is_integer(port) and port > 0,
-    do: {:ok, port}
-
-  defp ingress_port(_entry), do: {:error, :no_ingress_port}
-
-  # A host-network app answers on loopback or on the gateway depending on the
-  # app, so the port decides; `Vagus.Addon.Watchdog.Probe` must use the same
-  # rule or it probes a live app dead.
-  defp ingress_ip(_slug, %{config: %{host_network: true}}, port),
-    do: {:ok, Network.host_network_ip(port)}
-
-  defp ingress_ip(slug, _entry, _port) do
-    with {:ok, %{"NetworkSettings" => %{"Networks" => networks}}} <-
-           Vagus.Runtime.Docker.inspect_container("addon_#{slug}"),
-         %{"IPAddress" => ip} when is_binary(ip) and ip != "" <-
-           Map.get(networks, Network.name()) do
-      {:ok, ip}
-    else
-      _ -> {:error, :no_container_ip}
     end
   end
 
   @spec start(String.t()) :: {:ok, map()} | {:error, term()}
-  def start(slug), do: Manager.start_slug(slug)
+  def start(slug), do: slug |> command(:start, %{}) |> started(slug)
 
-  @spec stop(String.t()) :: :ok | {:error, :not_found}
-  def stop(slug), do: Manager.stop(slug)
+  @spec stop(String.t()) :: :ok | {:error, term()}
+  def stop(slug), do: command(slug, :stop, %{})
 
   @spec restart(String.t()) :: {:ok, map()} | {:error, term()}
-  def restart(slug), do: Manager.restart(slug)
+  def restart(slug), do: slug |> command(:restart, %{}) |> started(slug)
 
   @spec uninstall(String.t()) :: :ok | {:error, term()}
-  def uninstall(slug) do
-    # One critical section: a reinstall landing between the uninstall and the
-    # stop would have its new process killed.
-    with_slug_lock(slug, fn ->
-      # Before the container stops: Core GETs a message before acting on its
-      # DELETE and ignores the DELETE while that still answers, and a message
-      # the stopping app posts now is refused instead of outliving it.
-      _ = ask(slug, :retire)
-      result = Manager.uninstall_holding_lock(slug)
-      # Also when the app stays installed: its retired process refuses every
-      # write, so it goes and the next ask starts a fresh one.
-      Instances.stop(slug)
-      result
-    end)
-  end
+  def uninstall(slug), do: command(slug, :uninstall, %{})
 
   @doc """
   Pulls the image and records the app installed but `:stopped`. An installed
-  slug is refused before the pull, as upstream does.
+  slug is refused by its process before any pull, as upstream does.
   """
   @spec install(Config.t()) :: :ok | {:error, :already_installed | term()}
   def install(%Config{slug: slug} = config) do
-    # Under the lifecycle lock so two installs of one slug cannot both pass the
-    # check, both pull and both write the entry. `Manager.install/2` does not
-    # take this lock itself; nesting it would drop it at the inner release.
-    with_slug_lock(slug, fn -> do_install(config) end)
-  end
-
-  defp do_install(%Config{slug: slug} = config) do
-    case state_get(slug) do
-      {:ok, _entry} ->
-        {:error, :already_installed}
-
-      # Not known to be absent, so no pull.
-      :unavailable ->
-        {:error, :unavailable}
-
-      :error ->
-        with :ok <- Manager.install(config),
-             :ok <- State.put(config, :stopped) do
-          ensure_after_install(slug)
-        end
-    end
-  end
-
-  # The install is durable once the entry is written; a process that does not
-  # start now comes back on the Orchestrator's next start or through `info/1`.
-  defp ensure_after_install(slug) do
     case Instances.ensure(slug) do
-      {:ok, _pid} ->
-        :ok
-
-      # The entry went between the put and the start: uninstalled meanwhile.
-      :ignore ->
-        {:error, :not_found}
-
-      {:error, reason} ->
-        Logger.warning("App #{slug} installed but its process did not start: #{inspect(reason)}")
-        :ok
+      {:ok, pid} -> call_op(pid, {:install, %{config: config}})
+      _not_started -> {:error, :unavailable}
     end
   end
 
-  # `Manager`'s lifecycle lock, so app-level steps serialise with its own.
-  defp with_slug_lock(slug, fun),
-    do: :global.trans({{:addon_lifecycle, slug}, self()}, fun, [node()])
+  @doc """
+  Updates `slug` to the store's current version. The pre-update backup runs
+  first, while the app is idle, since stopping and starting it for a cold
+  backup are operations of its own.
+  """
+  @spec update(String.t(), keyword()) :: {:ok, update_result()} | {:error, term()}
+  def update(slug, opts) do
+    with {:ok, installed} <- installed(slug),
+         {:ok, target} <- store_target(slug),
+         # Only the precheck matters here: whether the target can be applied.
+         %{} <- Policy.plan(:update, %{config: target}, installed),
+         :ok <- maybe_backup(slug, installed, opts) do
+      args =
+        opts |> Keyword.take([:job, :jobs_server, :backend, :data_root, :socket]) |> Map.new()
 
-  @spec update(String.t(), keyword()) :: {:ok, Update.result()} | {:error, term()}
-  def update(slug, opts), do: Update.update(slug, opts)
+      command(slug, :update, Map.put(args, :config, target))
+    end
+  end
+
+  defp installed(slug) do
+    case info(slug) do
+      {:ok, entry} -> {:ok, entry}
+      :error -> {:error, :not_installed}
+    end
+  end
+
+  # The store entry's own `config.slug` is the bare app slug; installed apps
+  # run under the store slug, as `handle_install` renames it.
+  defp store_target(slug) do
+    case Store.get(slug) do
+      {:ok, %{config: config}} -> {:ok, %{config | slug: slug}}
+      :error -> {:error, :not_in_store}
+    end
+  end
+
+  defp maybe_backup(slug, installed, opts) do
+    report_stage(opts, "validate_options", 5)
+
+    if Keyword.get(opts, :backup, false) do
+      report_stage(opts, "backup", 10)
+      name = "addon_#{slug}_#{installed.config.version}"
+      backups = Application.get_env(:vagus, :backups_module, Vagus.Backups)
+
+      case backups.create_partial(name, [slug], Keyword.take(opts, [:server, :data_root])) do
+        {:ok, _backup_slug} -> :ok
+        {:error, reason} -> {:error, {:backup_failed, reason}}
+      end
+    else
+      :ok
+    end
+  end
+
+  defp report_stage(opts, stage, progress) do
+    Vagus.Jobs.update(
+      Keyword.get(opts, :job),
+      [stage: stage, progress: progress],
+      Keyword.get(opts, :jobs_server, Vagus.Jobs)
+    )
+  end
 
   @spec stop_for_backup(String.t(), keyword()) :: :ok | {:error, term()}
-  def stop_for_backup(slug, opts \\ []), do: Manager.stop(slug, Keyword.take(opts, @backup_opts))
+  def stop_for_backup(slug, opts \\ []),
+    do: command(slug, :stop, Map.new(Keyword.take(opts, @backup_opts)))
 
   @spec start_after_backup(String.t(), keyword()) :: {:ok, map()} | {:error, term()}
   def start_after_backup(slug, opts \\ []),
-    do: Manager.start_slug(slug, Keyword.take(opts, @backup_opts))
+    do: slug |> command(:start, Map.new(Keyword.take(opts, @backup_opts))) |> started(slug)
 
   @doc "Whether `slug` may run in-BEAM, with no container behind it."
   @spec native_allowed?(String.t()) :: boolean()
-  def native_allowed?(slug), do: Manager.native_allowed?(slug)
+  def native_allowed?(slug), do: Steps.native_allowed?(slug)
+
+  # An operation can take as long as an image pull, so there is no call
+  # deadline; each step inside it has its own.
+  defp command(slug, op, args) do
+    case whereis(slug) || heal(slug) do
+      nil -> {:error, :not_found}
+      pid -> call_op(pid, {op, args})
+    end
+  end
+
+  defp call_op(pid, command) do
+    case :gen_statem.call(pid, command, :infinity) do
+      {:error, :not_installed} -> {:error, :not_found}
+      result -> result
+    end
+  catch
+    :exit, _reason -> {:error, :unavailable}
+  end
+
+  defp started(:ok, slug), do: {:ok, %{slug: slug}}
+  defp started(error, _slug), do: error
 end

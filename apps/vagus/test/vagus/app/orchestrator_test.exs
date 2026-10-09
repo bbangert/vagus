@@ -405,7 +405,9 @@ defmodule Vagus.App.OrchestratorTest do
     pid = Process.whereis(name)
     ref = Process.monitor(pid)
 
-    assert_receive {:DOWN, ^ref, :process, ^pid, {:boot_crashed, {%RuntimeError{}, _stack}}}
+    assert_receive {:DOWN, ^ref, :process, ^pid, {:boot_crashed, {%RuntimeError{}, _stack}}},
+                   1_000
+
     assert {:start, "a"} in collect_until(:complete)
     assert %{phase: :up} = await_boot(name)
     assert Process.whereis(name) != pid

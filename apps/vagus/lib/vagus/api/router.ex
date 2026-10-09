@@ -2761,14 +2761,14 @@ defmodule Vagus.API.Router do
     Envelope.send_error(conn, message, status)
   end
 
-  # Mirrors `send_core_lifecycle_error/2`'s shape: `:busy` is the only 409,
-  # "it isn't there" is 404, everything else is a 400 with an honest message.
-  # Shared between the HTTP response and the job's error entry so the two
-  # never tell different stories about the same failure.
-  defp update_failure(slug, :busy),
-    do: {409, "an operation is already in progress for #{slug}"}
+  # "It isn't there" is 404, everything else, `:busy` included as upstream
+  # has it, is a 400 with an honest message. Shared between the HTTP response
+  # and the job's error entry so the two never tell different stories about
+  # the same failure.
+  defp update_failure(slug, :busy), do: {400, busy_message(slug)}
 
-  defp update_failure(slug, :not_installed), do: {404, "Addon #{slug} is not installed"}
+  defp update_failure(slug, reason) when reason in [:not_installed, :not_found],
+    do: {404, "Addon #{slug} is not installed"}
 
   defp update_failure(slug, :not_in_store),
     do: {404, "Addon #{slug} is no longer available in the store"}
@@ -2825,6 +2825,9 @@ defmodule Vagus.API.Router do
           {:error, :not_found} ->
             Envelope.send_error(conn, "Addon #{resolved} does not exist", 404)
 
+          {:error, :busy} ->
+            Envelope.send_error(conn, busy_message(resolved), 400)
+
           {:error, reason} ->
             Envelope.send_error(conn, inspect(reason), 400)
         end
@@ -2833,6 +2836,9 @@ defmodule Vagus.API.Router do
         Envelope.send_error(conn, "unauthorized", 403)
     end
   end
+
+  # Upstream's per-app job group refuses a second job outright.
+  defp busy_message(slug), do: "Another job is running for job group app_#{slug}"
 
   # Same `self`-resolution as `lifecycle_action/3` — `/addons/self/options` is
   # one segment, so upstream bypasses it. Note the deliberate asymmetry with

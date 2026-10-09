@@ -183,30 +183,28 @@ defmodule Vagus.IngressTest do
     end
   end
 
+  # Installs under the global app tree, with slugs no other test uses.
   describe "resolve_token/2" do
     test "resolves an ingress-capable add-on's token to its slug" do
-      state = start_state()
-      config = fixture_config("core_esphome", true)
-      :ok = State.put(config, :started, server: state)
-      {:ok, %{ingress_token: token}} = State.get("core_esphome", state)
+      slug = "core_ingress_test_#{System.unique_integer([:positive])}"
+      Vagus.AppFixtures.install_app(fixture_config(slug, true))
+      {:ok, %{ingress_token: token}} = Vagus.AppFixtures.app_info(slug)
 
-      ingress = start_ingress(state: state)
-      assert {:ok, "core_esphome"} = Ingress.resolve_token(token, ingress)
+      ingress = start_ingress()
+      assert {:ok, ^slug} = Ingress.resolve_token(token, ingress)
     end
 
     test "a non-ingress add-on's token does not resolve" do
-      state = start_state()
-      config = fixture_config("core_mosquitto", false)
-      :ok = State.put(config, :started, server: state)
-      {:ok, %{ingress_token: token}} = State.get("core_mosquitto", state)
+      slug = "core_ingress_test_#{System.unique_integer([:positive])}"
+      Vagus.AppFixtures.install_app(fixture_config(slug, false))
+      {:ok, %{ingress_token: token}} = Vagus.AppFixtures.app_info(slug)
 
-      ingress = start_ingress(state: state)
+      ingress = start_ingress()
       assert :error = Ingress.resolve_token(token, ingress)
     end
 
     test "an unknown token is :error" do
-      state = start_state()
-      ingress = start_ingress(state: state)
+      ingress = start_ingress()
       assert :error = Ingress.resolve_token("not-a-real-token", ingress)
     end
   end

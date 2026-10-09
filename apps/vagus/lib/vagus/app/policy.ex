@@ -123,6 +123,10 @@ defmodule Vagus.App.Policy do
     reclaim_image: 60_000
   }
 
+  # A caller's backend, data root, engine socket and jobs server reach every
+  # task step.
+  @engine_overrides [:backend, :data_root, :socket, :jobs_server]
+
   @persisted ~w(config wanted user_options ingress_token ingress_port ingress_panel watchdog ports
                  boot auto_update protected)a
 
@@ -188,10 +192,15 @@ defmodule Vagus.App.Policy do
   A container event or the native broker's `DOWN` (`{:broker_down, reason}`),
   or `:settled`. An event for a container other than the current one is stale
   and ignored, which also covers the exit a stop causes (the stop clears the
-  id). Upstream restarts on any exit, a clean one included; a `once` app's
+  id). A start seen while no container is known is the app's container
+  running without this process having started it (the process restarted, or
+  the engine reports it after a reconnect): it is adopted. Upstream restarts on any exit, a clean one included; a `once` app's
   clean exit is its completion instead (C4).
   """
   @spec on_event(term(), map()) :: {map(), [effect()]}
+  def on_event(%{action: "start", id: id}, %{container_id: nil} = data) when is_binary(id),
+    do: observe(%{data | container_id: id}, {:running, false}, [])
+
   def on_event(%{id: id}, %{container_id: current} = data) when id != current, do: {data, []}
 
   def on_event(%{action: "die"} = event, data),
@@ -279,7 +288,9 @@ defmodule Vagus.App.Policy do
       else: observe(data, {:failed, :unhealthy}, [])
   end
 
-  defp probe_timer, do: {:timer, :probe, @probe_interval_ms, :probe}
+  @doc "The next URL-probe tick."
+  @spec probe_timer() :: effect()
+  def probe_timer, do: {:timer, :probe, @probe_interval_ms, :probe}
 
   @doc """
   Whether a command is taken in this state. Only `halt` pre-empts an
@@ -371,6 +382,7 @@ defmodule Vagus.App.Policy do
   connect, and the app process never blocks.
   """
   @spec answer(term(), map()) :: term()
+  def answer(question, %{config: nil}), do: uninstalled(question)
   def answer(:info, data), do: {:ok, snapshot(data)}
   def answer(:snapshot, data), do: snapshot(data)
   def answer(:installed?, _data), do: true
@@ -380,6 +392,11 @@ defmodule Vagus.App.Policy do
   def answer({:discovery, uuid}, data), do: Map.fetch(data.discovery, uuid)
   def answer(:discovery_list, data), do: Map.values(data.discovery)
   def answer(_question, _data), do: {:error, :unknown_question}
+
+  defp uninstalled(:installed?), do: false
+  defp uninstalled(:discovery_list), do: []
+  defp uninstalled(:ingress_target), do: {:error, :not_found}
+  defp uninstalled(_question), do: :error
 
   defp ingress_target(data) do
     with {:ok, port} <- ingress_port(data),
@@ -397,7 +414,7 @@ defmodule Vagus.App.Policy do
 
   defp ingress_ip(%{config: %{host_network: true}}), do: {:ok, :host_network}
   defp ingress_ip(%{ip: ip}) when is_binary(ip), do: {:ok, ip}
-  defp ingress_ip(_data), do: {:error, :not_running}
+  defp ingress_ip(_data), do: {:error, :no_container_ip}
 
   @doc """
   The app as `Vagus.Addon.State` held it, so `Addon.Info.render` and the
@@ -560,10 +577,9 @@ defmodule Vagus.App.Policy do
   # The credential goes before the container: a stopped app's token must not
   # outlive it, and nothing it posts while stopping should land.
   defp before_task({:stop, nil}, %{run: %{op: :uninstall}} = data) do
-    acc = Map.put(data.run.acc, :discovery, Map.values(data.discovery))
     drop = Enum.map(tl(keys(data)), &key/1)
     data = %{data | token: nil, token_hash: nil, ip: nil, wanted: :stopped}
-    data = %{data | services: %{}, discovery: %{}, run: %{data.run | acc: acc}}
+    data = %{data | services: %{}, discovery: %{}}
     {data, [{:keys, [], drop} | cancel_timers()]}
   end
 
@@ -752,7 +768,14 @@ defmodule Vagus.App.Policy do
     config =
       if name == :pull, do: run.args[:config] || data.config, else: data.config || run.args.config
 
-    %{slug: data.slug, config: config, job: run.args[:job], stage: stage(run.op, name)}
+    run.args
+    |> Map.take(@engine_overrides)
+    |> Map.merge(%{
+      slug: data.slug,
+      config: config,
+      job: run.args[:job],
+      stage: stage(run.op, name)
+    })
     |> Map.merge(input(name, arg, data))
   end
 
@@ -772,7 +795,6 @@ defmodule Vagus.App.Policy do
 
   defp input(:exec_hook, :pre, data), do: %{cmd: data.config.backup_pre}
   defp input(:exec_hook, :post, data), do: %{cmd: data.config.backup_post}
-  defp input(:remove_app, _arg, data), do: %{discovery: data.run.acc[:discovery] || []}
   defp input(:reclaim_image, _arg, data), do: %{old: data.run.acc.old}
   defp input(_name, _arg, _data), do: %{}
 

@@ -298,13 +298,15 @@ defmodule Vagus.Backups do
 
   ## Internals — create_partial
 
-  # Resolves every slug's installed State entry up front (before anything is
+  # Resolves every slug's installed app up front (before anything is
   # stopped) so a not-installed slug aborts cleanly with nothing touched yet.
   defp prepare_addons(addon_slugs) do
     Enum.reduce_while(addon_slugs, {:ok, []}, fn slug, {:ok, acc} ->
+      # Whether it should run, not what it reports: a crashed app that is
+      # waiting on a restart is still one to stop and start around the tar.
       case App.info(slug) do
-        {:ok, %{config: config, state: state, user_options: user_options}} ->
-          {:cont, {:ok, [{config, state, user_options} | acc]}}
+        {:ok, %{config: config, wanted: wanted, user_options: user_options}} ->
+          {:cont, {:ok, [{config, wanted, user_options} | acc]}}
 
         :error ->
           {:halt, {:error, {:not_installed, slug}}}

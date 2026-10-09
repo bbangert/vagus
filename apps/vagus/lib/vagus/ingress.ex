@@ -62,20 +62,14 @@ defmodule Vagus.Ingress do
   ## Token → slug resolution (§B2.2 step 2)
 
   `resolve_token/2` first compares against the synthetic admin panel's token
-  (see "Admin panel token" below), then scans `State.list/1` for the add-on
-  whose `ingress_token` matches, on every call — **deliberately not cached**.
-  Upstream rebuilds a `dict[ingress_token → slug]` once per
-  `Ingress.load()`/`reload()` tick; this emulator's `State.list/1` is small
-  (a handful of installed add-ons at most) and a scan is cheap enough that
-  keeping a second, cacheable copy in sync across install/uninstall would
-  be pure risk (a stale entry pointing at an uninstalled slug) for no
-  measurable benefit.
+  (see "Admin panel token" below), then looks up the token's hash in
+  `Vagus.App.Directory`, where each ingress app's process registers it with
+  its slug. The key goes with the process, so no entry can outlive its app.
 
   ## Admin panel token
 
   `Vagus.API.AdminPanel` is a synthetic ingress panel with no add-on and no
-  `Vagus.Addon.State` entry, so it has no `ingress_token` to be found by the
-  scan above. One is minted here at `init/1` instead and matched *first* by
+  app process, so it has no `ingress_token` in the directory. One is minted here at `init/1` instead and matched *first* by
   `resolve_token/2`, so the reserved `vagus` slug can never be shadowed by
   an add-on that happens to share it.
 
@@ -296,7 +290,7 @@ defmodule Vagus.Ingress do
     if Plug.Crypto.secure_compare(ingress_token, state.admin_token) do
       {:reply, {:ok, AdminPanel.slug()}, state}
     else
-      {:reply, resolve_addon_token(ingress_token, state), state}
+      {:reply, resolve_addon_token(ingress_token), state}
     end
   end
 
@@ -330,16 +324,18 @@ defmodule Vagus.Ingress do
 
   ## Internals
 
-  defp resolve_addon_token(ingress_token, state) do
-    state.state_server
-    |> State.list()
-    |> Enum.find(fn entry ->
-      entry.config.ingress and entry.ingress_token == ingress_token
-    end)
-    |> case do
-      %{config: %{slug: slug}} -> {:ok, slug}
-      nil -> :error
+  # Only an ingress app registers its token's hash, under its slug.
+  defp resolve_addon_token(ingress_token) do
+    case Registry.lookup(
+           Vagus.App.Directory,
+           {:ingress_token, Vagus.App.Policy.hash(ingress_token)}
+         ) do
+      [{_pid, slug}] -> {:ok, slug}
+      [] -> :error
     end
+  rescue
+    # The directory is restarting.
+    ArgumentError -> :error
   end
 
   defp prune_expired(sessions, now) do
