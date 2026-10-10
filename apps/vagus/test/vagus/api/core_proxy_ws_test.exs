@@ -25,17 +25,18 @@ defmodule Vagus.API.CoreProxyWSTest.CoreHandshakeHandler do
   from init's own return), expects `{"type":"auth","access_token":T}`,
   replies `auth_ok` (or, per `CoreAuthScript`, `auth_invalid` regardless of
   whether `T` is actually correct — the Core-side-failure test's knob) then
-  echoes further frames — except the literal text `"hello"`, which gets
+  echoes further frames — except the magic words below, which travel as a
+  command's `"type"` because the bridge relays nothing else. `hello` gets
   `"world"` back (rather than an echo) so a passing round-trip proves the
   frame really crossed into this fake Core and back, not just an
-  accidental local loop. `"close:<code>:<reason>"` closes with that exact
+  accidental local loop. `close:<code>:<reason>` closes with that exact
   code (`Vagus.Ingress.WSBridgeTest.EchoHandler`'s own convention).
-  `"stall"`, post-auth, parks the process in a `receive`-forever — the
+  `stall`, post-auth, parks the process in a `receive`-forever — the
   steady-state-backpressure tests' way of making Core's own TCP socket
   buffer fill up (Bandit stops reading once this handler stops returning
   from `handle_in/2`), distinct from `CoreAuthScript`'s `:stall` (which
   withholds `auth_ok` itself, the pre-`ha_ready?` pending-cap window). Reports
-  init/terminate to the test process.
+  init/terminate, and every frame it echoes, to the test process.
   """
   @behaviour WebSock
 
@@ -68,28 +69,27 @@ defmodule Vagus.API.CoreProxyWSTest.CoreHandshakeHandler do
     end
   end
 
-  def handle_in({"close:" <> rest, opcode: :text}, %{authed?: true} = state) do
-    case String.split(rest, ":", parts: 2) do
+  def handle_in({~s({"type":"close:) <> rest = data, opcode: :text}, %{authed?: true} = state) do
+    case rest |> String.trim_trailing(~s("})) |> String.split(":", parts: 2) do
       [code_str, reason] -> {:stop, :normal, {String.to_integer(code_str), reason}, state}
-      _other -> {:push, {:text, "close:" <> rest}, state}
+      _other -> {:push, {:text, data}, state}
     end
   end
 
-  def handle_in({"stall", opcode: :text}, %{authed?: true} = state) do
+  def handle_in({~s({"type":"stall"}), opcode: :text}, %{authed?: true} = state) do
     receive do
       :never_sent -> {:ok, state}
     end
   end
 
-  def handle_in({"hello", opcode: :text}, %{authed?: true} = state) do
+  def handle_in({~s({"type":"hello"}), opcode: :text}, %{authed?: true} = state) do
     {:push, {:text, "world"}, state}
   end
 
-  def handle_in({data, opcode: :text}, %{authed?: true} = state),
-    do: {:push, {:text, data}, state}
-
-  def handle_in({data, opcode: :binary}, %{authed?: true} = state),
-    do: {:push, {:binary, data}, state}
+  def handle_in({data, opcode: opcode}, %{authed?: true} = state) do
+    send(state.test_pid, {:core_frame, opcode, data})
+    {:push, {opcode, data}, state}
+  end
 
   defp handle_core_auth(token, state) do
     case CoreAuthScript.get() do
@@ -137,11 +137,11 @@ defmodule Vagus.API.CoreProxyWSTest.CoreSocketHandler do
   Core's `/api/websocket` as it behaves on the Supervisor unix socket (A3):
   the peer is already the Supervisor user, so nothing is pushed on connect
   and no `auth` message is expected — anything auth-shaped that arrives is
-  reported to the test process. `"hello"` answers `"world"` (same
-  crossed-the-bridge proof as `CoreHandshakeHandler`);
-  `"auth-then-hello"` pushes an `auth_ok` frame BEFORE `"world"`, so a test
-  can prove the bridge swallows a handshake frame instead of relaying a
-  second one to a caller that already had its own.
+  reported to the test process. `hello` answers `"world"` (same
+  crossed-the-bridge proof as `CoreHandshakeHandler`, same magic-word
+  convention); `auth-then-hello` pushes an `auth_ok` frame BEFORE
+  `"world"`, so a test can prove the bridge swallows a handshake frame
+  instead of relaying a second one to a caller that already had its own.
   """
   @behaviour WebSock
 
@@ -152,9 +152,10 @@ defmodule Vagus.API.CoreProxyWSTest.CoreSocketHandler do
   end
 
   @impl WebSock
-  def handle_in({"hello", opcode: :text}, state), do: {:push, {:text, "world"}, state}
+  def handle_in({~s({"type":"hello"}), opcode: :text}, state),
+    do: {:push, {:text, "world"}, state}
 
-  def handle_in({"auth-then-hello", opcode: :text}, state) do
+  def handle_in({~s({"type":"auth-then-hello"}), opcode: :text}, state) do
     auth_ok = Jason.encode!(%{"type" => "auth_ok", "ha_version" => "2026.8.0"})
     {:push, [{:text, auth_ok}, {:text, "world"}], state}
   end
@@ -535,6 +536,10 @@ defmodule Vagus.API.CoreProxyWSTest do
 
   defp decode_text({:text, data}), do: Jason.decode!(data)
 
+  # The fake Cores' magic words, as the only shape the bridge relays: a
+  # well-formed command.
+  defp word(type), do: ~s({"type":"#{type}"})
+
   # A caller that has completed both handshakes and is in `:relaying` — the
   # inline version of section 1's first half, for tests whose subject is what
   # happens to frames afterwards.
@@ -579,7 +584,7 @@ defmodule Vagus.API.CoreProxyWSTest do
     assert_receive {:core_init, _core_pid}, @recv_timeout
     assert DialCounter.count() == 1
 
-    client = Client.send_frame(client, {:text, "hello"})
+    client = Client.send_frame(client, {:text, word("hello")})
     {frame, client} = Client.next_frame(client, @recv_timeout)
     assert frame == {:text, "world"}
 
@@ -630,7 +635,7 @@ defmodule Vagus.API.CoreProxyWSTest do
     # Had the frame been relayed, the fake Core's echo of it would be sitting
     # in the queue ahead of this round trip — so `"world"` arriving proves
     # the frame died here rather than merely being answered here.
-    client = Client.send_frame(client, {:text, "hello"})
+    client = Client.send_frame(client, {:text, word("hello")})
     {frame, _client} = Client.next_frame(client, @recv_timeout)
     assert frame == {:text, "world"}
   end
@@ -651,7 +656,7 @@ defmodule Vagus.API.CoreProxyWSTest do
     assert %{"success" => false, "error" => %{"code" => "unauthorized"}} = Jason.decode!(raw)
   end
 
-  # The reason `reserved_command/1` always decodes instead of pre-filtering
+  # The reason `screen/1` always decodes instead of pre-filtering
   # on a raw "hassio" substring: these bytes contain no such substring, and
   # Core's own JSON decoder resolves them straight back to `hassio/api`.
   test "a JSON-escaped command type is refused — matched after decoding, like Core matches it", %{
@@ -674,11 +679,264 @@ defmodule Vagus.API.CoreProxyWSTest do
   } do
     client = relaying_client(host, port, "cp_ws_reserved_control")
 
-    command = Jason.encode!(%{"id" => 3, "type" => "get_states"})
-    client = Client.send_frame(client, {:text, command})
+    assert_relayed(client, Jason.encode!(%{"id" => 3, "type" => "get_states"}))
+  end
+
+  ## 1c. Batches and malformed frames. Core dispatches each element of a JSON
+  ## array as its own command, so a reserved one is as live inside a batch
+  ## as alone; anything that cannot be read as a command is refused too.
+
+  @ordinary ~s({"id":99,"type":"get_states"})
+
+  # The fake Core reports every frame it receives, in order — so `@ordinary`,
+  # sent second, being the FIRST one reported proves `frame` never arrived,
+  # where a bare `refute_receive` would only prove it hadn't arrived yet.
+  defp send_refused(client, frame) do
+    client = Client.send_frame(client, {:text, frame})
+    client = Client.send_frame(client, {:text, @ordinary})
+
+    assert_receive {:core_frame, :text, first}, @recv_timeout
+    assert first == @ordinary, "a frame the bridge must refuse reached Core"
+
+    {{:text, raw}, client} = Client.next_frame(client, @recv_timeout)
+    {Jason.decode!(raw), client}
+  end
+
+  defp assert_unauthorized(reply, id) do
+    assert %{
+             "id" => ^id,
+             "type" => "result",
+             "success" => false,
+             "error" => %{"code" => "unauthorized"}
+           } = reply
+  end
+
+  defp assert_relayed(client, frame) do
+    client = Client.send_frame(client, {:text, frame})
+
+    assert_receive {:core_frame, :text, received}, @recv_timeout
+    assert received == frame
+
+    {echoed, client} = Client.next_frame(client, @recv_timeout)
+    assert echoed == {:text, frame}
+    client
+  end
+
+  test "a reserved command inside an array frame is refused and never reaches Core", %{
+    proxy_host: host,
+    proxy_port: port
+  } do
+    client = relaying_client(host, port, "cp_ws_batch_reserved")
+
+    {reply, client} =
+      send_refused(
+        client,
+        ~s([{"id":1,"type":"supervisor/api","endpoint":"/supervisor/info","method":"get"}])
+      )
+
+    assert_unauthorized(reply, nil)
 
     {frame, _client} = Client.next_frame(client, @recv_timeout)
-    assert frame == {:text, command}
+    assert frame == {:text, @ordinary}
+  end
+
+  test "one reserved element refuses the whole batch, with a single result", %{
+    proxy_host: host,
+    proxy_port: port
+  } do
+    client = relaying_client(host, port, "cp_ws_batch_mixed")
+
+    batch =
+      Jason.encode!([
+        %{"id" => 1, "type" => "call_service", "domain" => "light", "service" => "turn_on"},
+        %{"id" => 2, "type" => "hassio/update/core"}
+      ])
+
+    {reply, client} = send_refused(client, batch)
+    assert_unauthorized(reply, nil)
+
+    # A second result would sit here, ahead of the echo.
+    {frame, _client} = Client.next_frame(client, @recv_timeout)
+    assert frame == {:text, @ordinary}
+  end
+
+  test "an object whose type is not a string is refused under its own id", %{
+    proxy_host: host,
+    proxy_port: port
+  } do
+    client = relaying_client(host, port, "cp_ws_type_not_string")
+
+    {reply, _client} = send_refused(client, ~s({"id":7,"type":5}))
+    assert_unauthorized(reply, 7)
+  end
+
+  test "a batch with a non-object element is refused", %{proxy_host: host, proxy_port: port} do
+    client = relaying_client(host, port, "cp_ws_batch_non_object")
+
+    {reply, _client} = send_refused(client, ~s([{"id":1,"type":"get_states"}, 5]))
+    assert_unauthorized(reply, nil)
+  end
+
+  test "a JSON scalar is refused as one malformed command", %{
+    proxy_host: host,
+    proxy_port: port
+  } do
+    client = relaying_client(host, port, "cp_ws_scalar")
+
+    client =
+      Enum.reduce(["5", ~s("supervisor/api"), "null"], client, fn scalar, client ->
+        client = Client.send_frame(client, {:text, scalar})
+        {{:text, raw}, client} = Client.next_frame(client, @recv_timeout)
+        assert_unauthorized(Jason.decode!(raw), nil)
+        client
+      end)
+
+    # First frame Core reports, so none of the scalars got there.
+    assert_relayed(client, @ordinary)
+  end
+
+  test "invalid JSON closes both legs without reaching Core", %{
+    proxy_host: host,
+    proxy_port: port
+  } do
+    client = relaying_client(host, port, "cp_ws_invalid_json")
+
+    client = Client.send_frame(client, {:text, ~s({"id":1,"type":)})
+    {frame, _client} = Client.next_frame(client, @recv_timeout)
+    assert {:close, 1000, _reason} = frame
+
+    # The fake Core's own `terminate/2` — everything it ever received was
+    # reported before this.
+    assert_receive {:core_terminate, _reason}, @recv_timeout
+    refute_received {:core_frame, _opcode, _data}
+  end
+
+  test "a binary frame is relayed unscreened, even one that is not JSON", %{
+    proxy_host: host,
+    proxy_port: port
+  } do
+    client = relaying_client(host, port, "cp_ws_binary_unscreened")
+
+    payload = <<0, 255>> <> ~s({"id":1,"type":)
+    client = Client.send_frame(client, {:binary, payload})
+
+    assert_receive {:core_frame, :binary, ^payload}, @recv_timeout
+    {frame, _client} = Client.next_frame(client, @recv_timeout)
+    assert frame == {:binary, payload}
+  end
+
+  # Core's decoder keeps the LAST of two duplicate keys, so that is the
+  # command it would dispatch; Jason keeps the first.
+  test "a duplicated type key whose LAST value is reserved is refused", %{
+    proxy_host: host,
+    proxy_port: port
+  } do
+    client = relaying_client(host, port, "cp_ws_dup_type_last")
+
+    {reply, _client} =
+      send_refused(client, ~s({"id":3,"type":"get_states","type":"supervisor/api"}))
+
+    assert_unauthorized(reply, 3)
+  end
+
+  test "a duplicated type key whose FIRST value is reserved is refused", %{
+    proxy_host: host,
+    proxy_port: port
+  } do
+    client = relaying_client(host, port, "cp_ws_dup_type_first")
+
+    {reply, _client} =
+      send_refused(client, ~s({"id":3,"type":"supervisor/api","type":"get_states"}))
+
+    assert_unauthorized(reply, 3)
+  end
+
+  test "a repeated type key is refused even when both values are ordinary", %{
+    proxy_host: host,
+    proxy_port: port
+  } do
+    client = relaying_client(host, port, "cp_ws_dup_type_ordinary")
+
+    {reply, _client} =
+      send_refused(client, ~s({"id":3,"type":"get_states","type":"get_states"}))
+
+    assert_unauthorized(reply, 3)
+  end
+
+  test "a repeated type key inside a batch element refuses the batch", %{
+    proxy_host: host,
+    proxy_port: port
+  } do
+    client = relaying_client(host, port, "cp_ws_dup_type_batch")
+
+    {reply, _client} =
+      send_refused(client, ~s([{"id":3,"type":"get_states","type":"supervisor/api"}]))
+
+    assert_unauthorized(reply, nil)
+  end
+
+  test "a repeated type key is caught when one spelling is JSON-escaped", %{
+    proxy_host: host,
+    proxy_port: port
+  } do
+    client = relaying_client(host, port, "cp_ws_dup_type_escaped")
+
+    frames = [
+      ~s({"id":3,"type":"get_states","\\u0074ype":"supervisor/api"}),
+      ~s({"id":3,"\\u0074ype":"get_states","type":"supervisor/api"})
+    ]
+
+    Enum.reduce(frames, client, fn frame, client ->
+      assert String.contains?(frame, "\\u0074ype")
+
+      {reply, client} = send_refused(client, frame)
+      assert_unauthorized(reply, 3)
+
+      {echo, client} = Client.next_frame(client, @recv_timeout)
+      assert echo == {:text, @ordinary}
+      client
+    end)
+  end
+
+  test "the refusal answers under the last of a repeated id", %{
+    proxy_host: host,
+    proxy_port: port
+  } do
+    client = relaying_client(host, port, "cp_ws_dup_id")
+
+    {reply, _client} = send_refused(client, ~s({"id":1,"type":"supervisor/api","id":2}))
+    assert_unauthorized(reply, 2)
+  end
+
+  # Only a command's own `"type"` is dispatched on. The frame goes out as the
+  # bytes that came in, never re-encoded, so Core still sees the repeat.
+  test "a repeated type key in a nested object relays byte-for-byte", %{
+    proxy_host: host,
+    proxy_port: port
+  } do
+    client = relaying_client(host, port, "cp_ws_dup_type_nested")
+
+    assert_relayed(
+      client,
+      ~s({"id":4, "type":"call_service","domain":"light","service":"turn_on",) <>
+        ~s("service_data":{"type":"a","type":"supervisor/api","rgb":[1,2,{"type":"x"}]}})
+    )
+  end
+
+  test "a batch of ordinary commands, and an empty one, still relay untouched", %{
+    proxy_host: host,
+    proxy_port: port
+  } do
+    client = relaying_client(host, port, "cp_ws_batch_ordinary")
+
+    batch =
+      Jason.encode!([
+        %{"id" => 1, "type" => "get_states"},
+        %{"id" => 2, "type" => "call_service", "domain" => "light", "service" => "turn_on"}
+      ])
+
+    client = assert_relayed(client, batch)
+    assert_relayed(client, "[]")
   end
 
   ## 2. Rejections at the caller handshake — fake Core never dialed
@@ -791,7 +1049,7 @@ defmodule Vagus.API.CoreProxyWSTest do
     client = Client.send_frame(client, {:text, Jason.encode!(%{"access_token" => token})})
     {{:text, _auth_ok}, client} = Client.next_frame(client, @recv_timeout)
 
-    client = Client.send_frame(client, {:text, "close:4002:bye"})
+    client = Client.send_frame(client, {:text, word("close:4002:bye")})
     {frame, _client} = Client.next_frame(client, @recv_timeout)
 
     assert {:close, 4002, "bye"} = frame
@@ -911,7 +1169,7 @@ defmodule Vagus.API.CoreProxyWSTest do
     # server is already tearing down.
     client =
       Enum.reduce(1..4, client, fn i, c ->
-        Client.send_frame(c, {:text, "flood-#{i}"})
+        Client.send_frame(c, {:text, word("flood-#{i}")})
       end)
 
     {frame, _client} = Client.next_frame(client, @recv_timeout)
@@ -941,7 +1199,7 @@ defmodule Vagus.API.CoreProxyWSTest do
     {{:text, raw}, client} = Client.next_frame(client, @recv_timeout)
     assert Jason.decode!(raw)["type"] == "auth_ok"
 
-    client = Client.send_frame(client, {:text, "stall"})
+    client = Client.send_frame(client, {:text, word("stall")})
 
     payload = :crypto.strong_rand_bytes(256 * 1024)
     _client = flood_ignoring_send_errors(client, payload, 20)
@@ -964,7 +1222,7 @@ defmodule Vagus.API.CoreProxyWSTest do
     {{:text, raw}, client} = Client.next_frame(client, @recv_timeout)
     assert Jason.decode!(raw)["type"] == "auth_ok"
 
-    client = Client.send_frame(client, {:text, "stall"})
+    client = Client.send_frame(client, {:text, word("stall")})
 
     payload = :crypto.strong_rand_bytes(256 * 1024)
     _client = flood_ignoring_send_errors(client, payload, 20)
@@ -1086,7 +1344,7 @@ defmodule Vagus.API.CoreProxyWSTest do
 
     assert_receive {:core_socket_init, _core_pid}, @recv_timeout
 
-    client = Client.send_frame(client, {:text, "hello"})
+    client = Client.send_frame(client, {:text, word("hello")})
     {frame, client} = Client.next_frame(client, @recv_timeout)
     assert frame == {:text, "world"}
 
@@ -1108,7 +1366,7 @@ defmodule Vagus.API.CoreProxyWSTest do
 
     assert_receive {:core_socket_init, _core_pid}, @recv_timeout
 
-    client = Client.send_frame(client, {:text, "auth-then-hello"})
+    client = Client.send_frame(client, {:text, word("auth-then-hello")})
 
     # The caller already had its own `auth_ok` from this proxy — the one
     # Core just emitted must never reach it.
@@ -1127,14 +1385,14 @@ defmodule Vagus.API.CoreProxyWSTest do
     # `auth_ok` is pushed to the caller before `Upstream` has upgraded, so
     # these land in `pending` and are flushed on `{:done, ref}` — the socket
     # path's flush point.
-    client = Client.send_frame(client, {:text, "one"})
-    client = Client.send_frame(client, {:text, "two"})
+    client = Client.send_frame(client, {:text, word("one")})
+    client = Client.send_frame(client, {:text, word("two")})
 
     {frame1, client} = Client.next_frame(client, @recv_timeout)
     {frame2, _client} = Client.next_frame(client, @recv_timeout)
 
-    assert frame1 == {:text, "one"}
-    assert frame2 == {:text, "two"}
+    assert frame1 == {:text, word("one")}
+    assert frame2 == {:text, word("two")}
   end
 
   ## 9. `auth_required` is pushed a message after `init/1` (see `WSBridge`'s
@@ -1160,7 +1418,7 @@ defmodule Vagus.API.CoreProxyWSTest do
 
     # A late prompt would be ordered ahead of this round trip on the same
     # socket, so `"world"` arriving next is proof there wasn't one.
-    client = Client.send_frame(client, {:text, "hello"})
+    client = Client.send_frame(client, {:text, word("hello")})
     {frame, _client} = Client.next_frame(client, @recv_timeout)
     assert frame == {:text, "world"}
   end

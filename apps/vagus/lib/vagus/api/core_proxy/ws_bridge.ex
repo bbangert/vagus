@@ -102,7 +102,18 @@ defmodule Vagus.API.CoreProxy.WSBridge do
   API with Core's token and would hand the caller the `:supervisor` tier —
   would otherwise pass Core's own "is this the Supervisor" gates truthfully.
   See `Vagus.Core.Reserved` for the reservation this is one half of, and
-  `reserved_command/1` below for the mechanics.
+  `screen/1` below for the mechanics.
+
+  Core dispatches each element of a JSON array frame as its own command, so
+  a batch is refused whole if any element is reserved. An element — or a
+  lone frame — that is not an object with exactly one `"type"`, a string,
+  is refused as well: what cannot be read as a command cannot be shown to
+  be allowed. A
+  batch has no one `id` to answer under and gets a single result with a
+  null one. Text that is not JSON at all closes both legs, as Core itself
+  would on receiving it. Parity with upstream `supervisor/api/proxy.py`
+  (`_denied_command_types`), bar the repeated-`"type"` refusal, which
+  upstream does not need: it parses with the same decoder Core does.
 
   ## Once past `:awaiting_auth`, relaying is a bounded synchronous handoff
 
@@ -203,8 +214,8 @@ defmodule Vagus.API.CoreProxy.WSBridge do
   via a bounded `GenServer.call/3` (see moduledoc's "bounded synchronous
   handoff" section for why a call and not a cast); a timeout closes with
   1011 directly, any other exit is a no-op since the faithful close is
-  already on its way through `handle_info/2`. The one exception is a
-  `hassio*` command, refused here — see `reserved_command/1`.
+  already on its way through `handle_info/2`. The exceptions are text
+  frames `screen/1` refuses or cannot parse.
   """
   def handle_in({data, opcode: :text}, %{phase: :awaiting_auth} = state) do
     case decode_caller_token(data) do
@@ -218,9 +229,17 @@ defmodule Vagus.API.CoreProxy.WSBridge do
   end
 
   def handle_in({data, opcode: :text} = frame, %{phase: :relaying} = state) do
-    case reserved_command(data) do
-      {:reserved, id} -> {:push, {:text, unauthorized_result(id)}, state}
-      :allowed -> relay(frame, state)
+    case screen(data) do
+      :relay ->
+        relay(frame, state)
+
+      {:refuse, id} ->
+        {:push, {:text, unauthorized_result(id)}, state}
+
+      # 1000 because Core closes on invalid JSON with it too, as does
+      # upstream's plain `close()`. `terminate/2` stops `Upstream`.
+      :invalid_json ->
+        {:stop, :normal, {1000, ""}, %{state | closing?: true}}
     end
   end
 
@@ -352,15 +371,56 @@ defmodule Vagus.API.CoreProxy.WSBridge do
   # REST side, one encoding down: `{"type":"hassio/api"}` contains no
   # literal `hassio` and would sail past, only for Core's own JSON decoder
   # to resolve it back to the reserved command.
-  defp reserved_command(data) do
-    case Jason.decode(data) do
-      {:ok, %{"type" => type} = msg} when is_binary(type) ->
-        if Reserved.command?(type), do: {:reserved, Map.get(msg, "id")}, else: :allowed
+  #
+  # Public only so `Vagus.Core.ReservedContractTest` can pin the batch path
+  # to the commands Core really registers.
+  @doc false
+  @spec screen(binary()) :: :relay | {:refuse, term()} | :invalid_json
+  def screen(data) do
+    # Ordered, so a repeated key stays visible — see `command_type/1`.
+    case Jason.decode(data, objects: :ordered_objects) do
+      {:ok, parsed} ->
+        case denied_command_types(parsed) do
+          [] -> :relay
+          _denied -> {:refuse, response_id(parsed)}
+        end
 
-      _not_a_command ->
-        :allowed
+      {:error, _reason} ->
+        :invalid_json
     end
   end
+
+  # Upstream `proxy.py`'s `_denied_command_types`: `nil` stands for an
+  # element that is not a command at all.
+  defp denied_command_types(parsed) do
+    # Core dispatches each element of a JSON array as a separate command.
+    commands = if is_list(parsed), do: parsed, else: [parsed]
+
+    commands
+    |> Enum.map(&command_type/1)
+    |> Enum.filter(&(is_nil(&1) or Reserved.command?(&1)))
+  end
+
+  # Jason keeps the first of a repeated key, Core's orjson the last, so a
+  # repeated `"type"` is a different command on each side: malformed.
+  defp command_type(%Jason.OrderedObject{values: values}) do
+    case for({"type", type} <- values, do: type) do
+      [type] when is_binary(type) -> type
+      _absent_repeated_or_not_a_string -> nil
+    end
+  end
+
+  defp command_type(_malformed), do: nil
+
+  # The last `"id"`, which is the one Core would have answered under.
+  defp response_id(%Jason.OrderedObject{values: values}) do
+    case values |> Enum.reverse() |> List.keyfind("id", 0) do
+      {"id", id} -> id
+      nil -> nil
+    end
+  end
+
+  defp response_id(_batch_or_scalar), do: nil
 
   defp unauthorized_result(id) do
     encode(%{

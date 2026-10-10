@@ -45,6 +45,7 @@ defmodule Vagus.Core.ReservedContractTest do
 
   use ExUnit.Case, async: true
 
+  alias Vagus.API.CoreProxy.WSBridge
   alias Vagus.API.Tiers
   alias Vagus.Core.{Reserved, Transport}
 
@@ -135,6 +136,17 @@ defmodule Vagus.Core.ReservedContractTest do
     test "is reserved" do
       for command <- @ws_commands do
         assert Reserved.command?(command), "#{command} would be relayed to Core as the Supervisor"
+      end
+    end
+
+    # Core dispatches each element of an array frame as its own command, so
+    # the reservation has to hold inside a batch too.
+    test "is refused by the proxy when wrapped in a batch frame" do
+      for command <- @ws_commands do
+        frame = Jason.encode!([%{"id" => 1, "type" => command}])
+
+        assert WSBridge.screen(frame) == {:refuse, nil},
+               "[#{command}] would be relayed to Core as the Supervisor"
       end
     end
 

@@ -131,7 +131,7 @@ defmodule Vagus.Core.Reserved do
   strings are what dispatch actually matches.
 
   Matched on the DECODED command string, never on the raw frame — see
-  `Vagus.API.CoreProxy.WSBridge`'s `reserved_command/1` for why a substring
+  `Vagus.API.CoreProxy.WSBridge`'s `screen/1` for why a substring
   pre-filter over the raw bytes would be a hole rather than an optimisation.
   """
   @spec command?(String.t()) :: boolean()
