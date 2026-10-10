@@ -488,8 +488,11 @@ One JSON file per app, `<:app_files_dir>/<slug>.json` (`/data/vagus/apps` on
 target). Only an app's own process writes its live file (the legacy import
 writes the first set into a staging directory before any process exists),
 through `Vagus.App.File.write/2`: a temporary opened exclusive and set to 0600 before
-any content lands, then a rename, so neither a power cut nor another user
-ever sees a partial or readable file. It holds the ingress token.
+any content lands, then a rename, so no reader ever sees a partial or
+world-readable file while the system runs. Nothing is synced to disk, so a
+power cut right after the rename can still lose that write; the next boot
+then sees the previous file, which is why every write carries the whole
+record. It holds the ingress token.
 
 | Persisted | Not persisted |
 |---|---|
