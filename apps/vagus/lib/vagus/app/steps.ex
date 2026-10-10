@@ -35,8 +35,18 @@ defmodule Vagus.App.Steps do
     "backup" => {"backup", "/backup", nil},
     "config" => {"homeassistant", "/config", nil},
     "homeassistant_config" => {"homeassistant", "/homeassistant", nil},
+    "all_app_configs" => {"addon_configs", "/app_configs", nil},
     "all_addon_configs" => {"addon_configs", "/addon_configs", nil},
+    "local_apps" => {"addons/local", "/local_apps", nil},
     "addons" => {"addons/local", "/addons", nil}
+  }
+
+  # Upstream renamed the add-on map keys to app ones in 2026.07. The legacy
+  # keys still mount, but an app declaring both forms gets only the new one.
+  @legacy_map_types %{
+    "addon_config" => "app_config",
+    "all_addon_configs" => "all_app_configs",
+    "addons" => "local_apps"
   }
 
   @spec run(atom(), map()) :: {:ok, term()} | {:error, term()}
@@ -541,7 +551,10 @@ defmodule Vagus.App.Steps do
     }
 
     mapped =
-      config.map |> Enum.map(&map_mount(&1, data_root, config.slug)) |> Enum.reject(&is_nil/1)
+      config.map
+      |> drop_superseded_maps()
+      |> Enum.map(&map_mount(&1, data_root, config.slug))
+      |> Enum.reject(&is_nil/1)
 
     [data_mount | mapped] ++ host_dbus_mount(config) ++ dsp_mount(config) ++ [dev_mount()]
   end
@@ -681,7 +694,13 @@ defmodule Vagus.App.Steps do
 
   defp host_dbus_mount(_config), do: []
 
-  defp map_mount(%{type: "addon_config", read_only: ro}, data_root, slug) do
+  defp drop_superseded_maps(maps) do
+    declared = MapSet.new(maps, & &1.type)
+    Enum.reject(maps, &MapSet.member?(declared, Map.get(@legacy_map_types, &1.type)))
+  end
+
+  defp map_mount(%{type: type, read_only: ro}, data_root, slug)
+       when type in ["app_config", "addon_config"] do
     %{
       source: Path.join([data_root, "addon_configs", slug]),
       target: "/config",
