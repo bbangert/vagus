@@ -5,9 +5,8 @@ defmodule Vagus.API.TiersTest do
   Routes are pinned by `test/fixtures/vagus-authz-table.json`: one row per
   route `Vagus.API.Router` registers, with the tier the table demands, the
   tier upstream's `security.py` demands, and how the two compare. The route
-  list is read from the router's source (`Vagus.RouterRoutes`), because a
-  hand-kept list went stale without anything failing: two routes were pinned
-  by no entry. A route nobody graded now fails here instead of shipping.
+  list is read from the router's source (`Vagus.RouterRoutes`) so that a
+  route nobody graded fails here: a hand-kept list has nothing to fail it.
 
   The fixture is a second transcription of the same contract, reviewed
   against upstream by hand; two transcriptions catch drift, one does not.
@@ -118,6 +117,46 @@ defmodule Vagus.API.TiersTest do
 
       for row <- anonymous do
         assert row["method"] == "GET", "#{row["method"]} #{row["path"]} is served with no token"
+      end
+    end
+  end
+
+  # The fixture is only as complete as the route list it is checked against.
+  describe "the route list" do
+    defp router(body) do
+      """
+      defmodule Synthetic.Router do
+        use Plug.Router
+        get "/plain" do
+          send_resp(conn, 200, "")
+        end
+        #{body}
+        match _ do
+          send_resp(conn, 404, "")
+        end
+      end
+      """
+    end
+
+    test "reads top-level literal routes and skips the catch-all" do
+      assert RouterRoutes.parse(router(~s|post("/other", do: conn)|)) ==
+               [{"GET", "/plain"}, {"POST", "/other"}]
+    end
+
+    test "raises on a route it cannot read, wherever it is" do
+      for body <- [
+            ~s|for kind <- ~w(a b) do\n get "/x/\#{kind}" do conn end\n end|,
+            ~s|for kind <- ~w(a b) do\n get "/literal" do conn end\n end|,
+            ~s|if Mix.env() == :dev do\n post "/debug" do conn end\n end|,
+            ~s|get "/x/\#{@name}" do conn end|,
+            ~s|get path do conn end|,
+            ~s|match "/any" do conn end|,
+            ~s|forward "/sub", to: Other|,
+            ~s|def helper(conn), do: delete("/inner", do: conn)|
+          ] do
+        assert_raise RuntimeError, ~r/is a route this module cannot read/, fn ->
+          RouterRoutes.parse(router(body))
+        end
       end
     end
   end

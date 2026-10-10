@@ -263,7 +263,7 @@ defmodule Vagus.API.SourceGuardTest do
       log =
         capture_log(fn ->
           for _ <- 1..4, do: SourceGuard.record_filtered(:authz, "authz/manager")
-          SourceGuard.record_filtered(:blacklist, "authz/manager")
+          SourceGuard.record_filtered(:blacklist, "api/hassio proxy path")
           send(SourceGuard, :refresh)
           _ = :sys.get_state(SourceGuard)
         end)

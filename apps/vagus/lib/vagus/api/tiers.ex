@@ -16,8 +16,10 @@ defmodule Vagus.API.Tiers do
 
   `caller_tier/1` turns the caller `Vagus.API.Auth` resolved into a tier.
   `required/1` turns a request path into the tier that path demands.
-  `allows?/2` compares the two. `Vagus.API.Authz` is the evaluator that puts
-  them together, and the only module that decides with them.
+  `allows?/2` compares the two. `Vagus.API.Authz` puts them together for the
+  Supervisor-API leg. The Core proxy does not go through it yet:
+  `Vagus.API.Dispatcher` calls `blacklisted?/1` directly and
+  `Vagus.API.CoreProxy` grades its callers with a check of its own.
 
   ## Tiers
 
@@ -73,7 +75,8 @@ defmodule Vagus.API.Tiers do
 
     * a binary — that literal segment
     * `:_` — exactly one segment, any value
-    * `:slug` — exactly one segment that is a valid slug (upstream's `RE_SLUG`)
+    * `:slug` — exactly one segment that is a valid slug: upstream's
+      `RE_SLUG`, minus `.` and `..`
     * `:+` — one or more segments
     * `:*` — zero or more segments
 

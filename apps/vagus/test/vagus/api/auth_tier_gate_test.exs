@@ -155,7 +155,7 @@ defmodule Vagus.API.AuthTierGateTest do
       refute log =~ @marker
     end
 
-    test "on device, it lands in the guard's authz bucket and logs nothing per request" do
+    test "on device, it is cast to the guard's authz bucket and logs nothing per request" do
       prev = Application.get_env(:vagus, :api_source_guard)
       Application.put_env(:vagus, :api_source_guard, true)
 
@@ -165,19 +165,23 @@ defmodule Vagus.API.AuthTierGateTest do
           else: Application.put_env(:vagus, :api_source_guard, prev)
       end)
 
-      start_supervised!({Vagus.API.SourceGuard, name: Vagus.API.SourceGuard})
+      # The test stands in for the guard: the real one reports and resets on
+      # a timer, so its state is not something to assert on.
+      Process.register(self(), Vagus.API.SourceGuard)
       token = addon_token("tier_gate_count_device")
 
       log =
         capture_log(fn ->
           for _ <- 1..3, do: assert(call(:get, "/store/#{@marker}", token).status == 403)
-          _ = :sys.get_state(Vagus.API.SourceGuard)
         end)
 
       refute log =~ "authz/"
 
-      assert %{filtered: 3, filtered_by: %{authz: 3}, filtered_sample: "authz/manager"} =
-               :sys.get_state(Vagus.API.SourceGuard)
+      for _ <- 1..3 do
+        assert_received {:"$gen_cast", {:filtered, :authz, "authz/manager"}}
+      end
+
+      refute_received {:"$gen_cast", _other}
     end
 
     test "a permitted request counts nothing" do
@@ -186,7 +190,128 @@ defmodule Vagus.API.AuthTierGateTest do
     end
   end
 
+  # `Plug.Router` matches percent-decoded segments. Graded on the raw path
+  # alone, `/core/%72estart` is the `/core/.+` family and only the handler's
+  # own guard stands between a homeassistant-role app and a Core restart.
+  describe "an encoded spelling of a route" do
+    import ExUnit.CaptureLog
+
+    @principals ~w(none default homeassistant backup manager admin)
+
+    defp refused_at_the_gate(method, path, token) do
+      {conn, log} = with_log(fn -> call(method, path, token) end)
+
+      assert conn.status == 403, "#{path} answered #{conn.status}"
+      assert log =~ "authz/", "#{path} was refused by its handler, not the gate"
+      refute Map.has_key?(conn.private, :plug_route), "#{path} reached :match"
+      log
+    end
+
+    test "is refused by the gate, before the router matches it" do
+      ha = addon_token("enc_gate_ha", %{hassio_api: true, hassio_role: "homeassistant"})
+      manager = addon_token("enc_gate_manager", %{hassio_api: true, hassio_role: "manager"})
+      admin = addon_token("enc_gate_admin", %{hassio_api: true, hassio_role: "admin"})
+
+      assert refused_at_the_gate(:post, "/core/%72estart", ha) =~ "authz/supervisor"
+      assert refused_at_the_gate(:post, "/c%6Fre/restart", admin) =~ "authz/supervisor"
+      assert refused_at_the_gate(:post, "/addons/core_mqtt/%73ecurity", manager) =~ "authz/admin"
+      assert refused_at_the_gate(:post, "/addons/core_mqtt/s%74art", admin) =~ "authz/supervisor"
+      assert refused_at_the_gate(:get, "/os/datadisk/%6Cist", manager) =~ "authz/supervisor"
+    end
+
+    test "still reaches its handler for a caller the plain spelling admits" do
+      assert call_as_core(:get, "/supervisor/%69nfo").status == 200
+    end
+
+    test "of a blacklisted path is refused as blacklisted, token or not" do
+      for path <- ["/core/api/%68assio/x", "/homeassistant/%61pi/hassio_auth"] do
+        log =
+          capture_log(fn ->
+            assert call_as_core(:get, path).status == 403
+            assert (conn(:get, path) |> Router.call(@opts)).status == 403
+          end)
+
+        assert log =~ "refused a blacklisted"
+      end
+    end
+
+    test "of a token-free path is not token-free" do
+      for path <- ["/supervisor/%70ing", "/addons/core_mqtt/%69con", "/%73upervisor/ping"] do
+        assert (conn(:get, path) |> Router.call(@opts)).status == 401, path
+      end
+    end
+
+    defp spellings(route, path) do
+      patterns = String.split(route, "/", trim: true)
+      segments = String.split(path, "/", trim: true)
+
+      for {{pattern, segment}, index} <- Enum.with_index(Enum.zip(patterns, segments)),
+          # A parameter has no spelling the table knows; its first byte will do.
+          last = if(String.starts_with?(pattern, ":"), do: 0, else: byte_size(segment) - 1),
+          at <- 0..last do
+        <<head::binary-size(at), byte, tail::binary>> = segment
+        encoded = head <> "%" <> Base.encode16(<<byte>>) <> tail
+        "/" <> Enum.join(List.replace_at(segments, index, encoded), "/")
+      end
+    end
+
+    defp gate(method, path, token) do
+      conn = conn(method, path)
+      conn = if token, do: put_req_header(conn, "x-supervisor-token", token), else: conn
+      Vagus.API.Auth.call(conn, []).halted
+    end
+
+    # Every route, every byte of every literal segment, every principal.
+    test "is never graded more leniently than the plain spelling" do
+      tokens =
+        [nil, Token.get(), addon_token("enc_prop_none", %{hassio_role: "admin"})] ++
+          for role <- tl(@principals) do
+            addon_token("enc_prop_#{role}", %{hassio_api: true, hassio_role: role})
+          end
+
+      cases =
+        for {method, route, path} <- Vagus.RouterRoutes.instances(),
+            encoded <- spellings(route, path),
+            do: {method |> String.downcase() |> String.to_existing_atom(), path, encoded}
+
+      assert length(cases) > 2000
+
+      lenient =
+        for {method, path, encoded} <- cases,
+            token <- tokens,
+            gate(method, path, token) and not gate(method, encoded, token),
+            do: {method, encoded}
+
+      assert Enum.uniq(lenient) == []
+    end
+  end
+
   describe "Core keeps everything" do
+    @fixture Path.expand("../../fixtures/vagus-authz-table.json", __DIR__)
+             |> File.read!()
+             |> Jason.decode!()
+             |> Map.fetch!("routes")
+
+    # `Router.match/2` records the route it chose without running it, so
+    # this tells a real route from the catch-all without a handler's own 404
+    # getting in the way, and without restarting Core or the host.
+    test "every fixture row passes the gate and matches the route it names" do
+      for row <- @fixture do
+        conn =
+          row["method"]
+          |> String.downcase()
+          |> String.to_existing_atom()
+          |> conn(row["path"])
+          |> put_req_header("authorization", "Bearer " <> Token.get())
+          |> Vagus.API.Auth.call([])
+
+        refute conn.halted, "Core was refused #{row["method"]} #{row["path"]}"
+
+        assert {route, _handler} = Router.match(conn, []).private.plug_route
+        assert route == row["route"], "#{row["method"]} #{row["path"]} matched #{route}"
+      end
+    end
+
     test "every read the hassio coordinator polls is still reachable" do
       for path <- @core_reads do
         conn = call_as_core(:get, path)

@@ -1,10 +1,11 @@
 defmodule Vagus.API.Authz do
   @moduledoc """
-  The one place a principal and an action become a decision.
+  The evaluator for the Supervisor-API leg: a principal and an action in, a
+  decision out.
 
-  `Vagus.API.Tiers` holds the table and the lattice; this module is the only
-  code that applies them. Every app-reachable leg asks here, so there is one
-  evaluation order to get right instead of one per leg.
+  `Vagus.API.Tiers` holds the table and the lattice; `Vagus.API.Auth` asks
+  here instead of applying them itself. The Core proxy does not ask yet:
+  `Vagus.API.Dispatcher` and `Vagus.API.CoreProxy` still check on their own.
 
   ## Nothing is looked up
 
@@ -15,13 +16,25 @@ defmodule Vagus.API.Authz do
 
   ## Legs
 
-  An action names its leg. Only `{:rest, :supervisor_api, method, segments}`
-  is implemented. The other legs have no clause and raise, deliberately: a
-  catch-all would have to answer something, and both answers are wrong. `:ok`
-  opens a leg nobody graded; a refusal reads as a decision the table never
-  made, and would stay green in a caller wired up before its rows existed.
+  An action names its leg, and the ctx must name the same one. Only
+  `{:rest, :supervisor_api, method, segments}` is implemented. The other
+  legs have no clause and raise, deliberately: a catch-all would have to
+  answer something, and both answers are wrong. `:ok` opens a leg nobody
+  graded; a refusal reads as a decision the table never made, and would stay
+  green in a caller wired up before its rows existed.
 
-  ## Order, for the Supervisor API
+  ## Both spellings of the path
+
+  `Plug.Router` matches percent-decoded segments while `conn.path_info` is
+  raw, so `/core/%72estart` is one path to the table and another to the
+  router. Graded raw alone it is the `/core/.+` family and then routes to the
+  supervisor-only `/core/restart`. The caller therefore passes the segments
+  as the router will see them in `ctx.decoded_segments`, and a path is
+  graded under both: blacklisted if either spelling is, allowed only if the
+  principal satisfies both requirements. Keeping the raw spelling in the
+  decision means encoding a path can only ever cost a caller access.
+
+  ## Order
 
   The blacklist is checked before the principal is looked at, so no tier
   satisfies it, the supervisor's included (see
@@ -43,30 +56,56 @@ defmodule Vagus.API.Authz do
 
   @type ctx :: %{leg: atom(), decoded_segments: [String.t()] | nil}
 
+  # For naming a refusal only; `backup` and `homeassistant` are siblings in the
+  # lattice and their order here decides nothing.
+  @by_strictness ~w(anonymous bypass default backup homeassistant manager admin supervisor)a
+
   @type result ::
           :ok
           | {:error, :forbidden | :unauthenticated | :blacklisted}
           | {:intercept, :supervisor_api}
 
   @spec authorize(principal(), action(), ctx()) :: result()
-  def authorize(principal, {:rest, :supervisor_api, method, segments}, %{leg: _leg})
-      when is_binary(method) and is_list(segments) do
-    if Tiers.blacklisted?(segments) do
+  def authorize(
+        principal,
+        {:rest, :supervisor_api, method, segments},
+        %{leg: :supervisor_api, decoded_segments: decoded}
+      )
+      when is_binary(method) and is_list(segments) and is_list(decoded) do
+    spellings = spellings(segments, decoded)
+
+    if Enum.any?(spellings, &Tiers.blacklisted?/1) do
       {:error, :blacklisted}
     else
-      grade(principal, Tiers.required(segments))
+      spellings
+      |> Enum.map(&grade(principal, Tiers.required(&1)))
+      |> Enum.find(:ok, &(&1 != :ok))
     end
   end
 
   @doc """
   What to count a refusal of `action` under.
 
-  Built from the requirement the table holds, never from the path, so it is
-  safe to log as it stands.
+  Built from the stricter of the requirements the table holds for the two
+  spellings, never from the path, so it is safe to log as it stands.
   """
-  @spec refusal_label(action()) :: String.t()
-  def refusal_label({:rest, :supervisor_api, _method, segments}) when is_list(segments),
-    do: "authz/" <> Atom.to_string(Tiers.required(segments))
+  @spec refusal_label(action(), ctx()) :: String.t()
+  def refusal_label({:rest, :supervisor_api, _method, segments}, %{
+        leg: :supervisor_api,
+        decoded_segments: decoded
+      })
+      when is_list(segments) and is_list(decoded) do
+    requirement =
+      segments
+      |> spellings(decoded)
+      |> Enum.map(&Tiers.required/1)
+      |> Enum.max_by(&Enum.find_index(@by_strictness, fn known -> known == &1 end))
+
+    "authz/" <> Atom.to_string(requirement)
+  end
+
+  defp spellings(same, same), do: [same]
+  defp spellings(segments, decoded), do: [decoded, segments]
 
   defp grade(:anonymous, :anonymous), do: :ok
   defp grade(:anonymous, _requirement), do: {:error, :unauthenticated}
