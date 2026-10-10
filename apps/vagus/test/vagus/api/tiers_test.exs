@@ -3,8 +3,9 @@ defmodule Vagus.API.TiersTest do
   The tier table, pinned.
 
   Routes are pinned by `test/fixtures/vagus-authz-table.json`: one row per
-  route `Vagus.API.Router` registers, with the tier the table demands, the
-  tier upstream's `security.py` demands, and how the two compare. The route
+  route `Vagus.API.Router` registers, with the tier and the predicates the
+  table demands, the tier upstream's `security.py` demands, and how the two
+  compare. The route
   list is read from the router's source (`Vagus.RouterRoutes`) so that a
   route nobody graded fails here: a hand-kept list has nothing to fail it.
 
@@ -57,6 +58,15 @@ defmodule Vagus.API.TiersTest do
 
   defp segments(path), do: path |> String.split("/", trim: true)
 
+  # A row's columns as the fixture's JSON spells them.
+  defp pinned(columns),
+    do: Map.new(columns, fn {name, value} -> {"#{name}", pinned_value(value)} end)
+
+  defp pinned_value(value) when is_tuple(value),
+    do: value |> Tuple.to_list() |> Enum.map(&pinned_value/1)
+
+  defp pinned_value(value), do: "#{value}"
+
   defp admitted(name), do: MapSet.new(Map.fetch!(@admits, Map.get(@upstream_names, name, name)))
 
   defp compare(vagus, upstream) do
@@ -84,21 +94,76 @@ defmodule Vagus.API.TiersTest do
 
         assert actual == row["requirement"],
                "#{row["method"]} #{row["path"]} requires #{actual}, pinned as #{row["requirement"]}"
-
-        assert row["predicates"] == %{}
       end
     end
 
-    test "no route is looser than upstream, and every row says how it compares" do
+    test "every route carries the predicates and the handler note its row pins" do
       for row <- @fixture do
-        computed = compare(admitted(row["requirement"]), admitted(row["upstream_tier"]))
+        {requirement, columns} = row["path"] |> segments() |> Tiers.required_with_predicates()
         label = "#{row["method"]} #{row["path"]}"
 
-        refute computed == "looser",
+        assert Atom.to_string(requirement) == row["requirement"], label
+        assert columns |> Tiers.predicates() |> pinned() == row["predicates"], label
+
+        assert columns |> Keyword.take([:handler]) |> pinned() |> Map.get("handler") ==
+                 row["handler"],
+               label
+      end
+
+      shapes = @fixture |> Enum.map(& &1["predicates"]) |> MapSet.new()
+
+      assert shapes ==
+               MapSet.new([
+                 %{},
+                 %{"caller" => "supervisor"},
+                 %{"requires" => "auth_api"},
+                 %{"requires" => ["services_role", "any"]},
+                 %{"subject" => "self"}
+               ])
+    end
+
+    # The comparison is of tiers alone, and neither a predicate nor a handler
+    # note enters it: a row cannot buy a looser tier with either.
+    test "no route is looser than upstream, and every row says how it compares" do
+      for row <- @fixture do
+        by_tier = compare(admitted(row["requirement"]), admitted(row["upstream_tier"]))
+        label = "#{row["method"]} #{row["path"]}"
+
+        refute by_tier == "looser",
                "#{label}: #{row["requirement"]} admits a caller upstream's " <>
                  "#{row["upstream_tier"]} refuses"
 
-        assert row["classification"] == computed, "#{label} is #{computed}"
+        # A predicate only narrows whom the tier admits. That is parity where
+        # upstream's own handler narrows the same way, and stricter otherwise.
+        narrows? = row["predicates"] != %{} and not Map.has_key?(row, "upstream_handler")
+        expected = if narrows?, do: "stricter", else: by_tier
+
+        assert row["classification"] == expected, "#{label} is #{expected}"
+      end
+    end
+
+    # Leaving a grant to the handler is allowed only where upstream's
+    # middleware leaves it to its handler too, and the row has to say where.
+    test "a row left to its handler enforces nothing and names upstream's check" do
+      left = for %{"handler" => _reason} = row <- @fixture, do: row
+
+      assert Enum.map(left, &{&1["method"], &1["route"]}) == [
+               {"GET", "/discovery"},
+               {"GET", "/discovery/:uuid"},
+               {"POST", "/discovery"},
+               {"DELETE", "/discovery/:uuid"}
+             ]
+
+      for row <- left do
+        assert row["predicates"] == %{}
+        assert is_binary(row["handler"]) and row["handler"] != ""
+      end
+
+      for %{"upstream_handler" => cited} = row <- @fixture do
+        assert is_binary(cited) and cited != ""
+
+        assert row["predicates"] != %{} or Map.has_key?(row, "handler"),
+               "#{row["method"]} #{row["path"]} cites a handler check for nothing"
       end
     end
 

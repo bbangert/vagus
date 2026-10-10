@@ -631,6 +631,7 @@ defmodule Vagus.API.Router do
 
   # Non-supervisor callers get the byte-identical 403 a foreign slug produces,
   # so the reserved slug is indistinguishable from any other unauthorized one.
+  # `Vagus.API.Tiers`' `["addons", "vagus", "info"]` row answers it first.
   defp synthetic_info(conn, :supervisor), do: Envelope.send_ok(conn, AdminPanel.info())
 
   defp synthetic_info(conn, _caller),
@@ -697,6 +698,9 @@ defmodule Vagus.API.Router do
   # `self` is permitted (the real handler 403s any other slug); `self` resolves
   # to the calling add-on. The effective options are exactly what
   # the app's start wrote to its `/data/options.json`.
+  #
+  # `Vagus.API.Tiers`' `subject: :self` row refuses another app's slug first.
+  # An app's own slug written out passes that row and is refused here.
   get "/addons/:slug/options/config" do
     cond do
       slug != "self" ->
@@ -1018,7 +1022,8 @@ defmodule Vagus.API.Router do
   # 403-for-wrong-caller pattern (e.g. `supervisor_only/2`'s backup routes) —
   # upstream's `@require_home_assistant` wrapper raises `HTTPUnauthorized`
   # specifically, and the contract calls this out as the one place a
-  # wrong-caller rejection isn't a 403.
+  # wrong-caller rejection isn't a 403. `Vagus.API.Tiers`' two
+  # `["ingress", …]` rows (`caller: :supervisor`) give that 401 first.
   post "/ingress/session" do
     if conn.assigns.caller == :supervisor do
       # Core sends the requesting user's id under the wire key `user_id`
@@ -1068,6 +1073,10 @@ defmodule Vagus.API.Router do
   # because they were written before the ingress-session precedent existed.
   # `POST /discovery` and `DELETE /discovery/:uuid` are a different upstream
   # decorator (`APIForbidden`, genuinely 403) and must NOT be changed to match.
+  #
+  # These guards are the only ones: `Vagus.API.Tiers` marks both discovery
+  # rows `handler:`, since a read and a write share each path and the write's
+  # grant is in the body or the stored message.
 
   get "/discovery" do
     if home_assistant?(conn.assigns.caller) do
@@ -1200,6 +1209,10 @@ defmodule Vagus.API.Router do
   # An add-on that provides a service (e.g. Mosquitto → mqtt) publishes its
   # connection config; Core/other add-ons read it. Access is by the caller's
   # `services_role` grant (from its config.yaml `services:`).
+  #
+  # `Vagus.API.Tiers`' `["services", :_]` row refuses an app with no role for
+  # the service first. Provide against read, and Core's read-only access, are
+  # decided only here.
 
   get "/services" do
     Envelope.send_ok(conn, %{services: Policy.services_view(App.services())})
@@ -1259,6 +1272,7 @@ defmodule Vagus.API.Router do
   # header, JSON, or form body (in that order); the add-on itself authenticates
   # via `X-Supervisor-Token` (so the `Authorization` header is free for Basic).
   # Success → 200; failure → 401 + `WWW-Authenticate`.
+  # `Vagus.API.Tiers`' `["auth"]` row (`requires: :auth_api`) refuses first.
 
   get "/auth" do
     handle_auth(conn)
@@ -2904,7 +2918,9 @@ defmodule Vagus.API.Router do
   # `full_access`, `host_pid` and `docker_api`. `Vagus.API.Tiers` already
   # refuses the `/addons/self/security` spelling for every add-on token
   # (`tiers.ex`'s first `api_bypass` override); resolving by slug here would
-  # have made that guard trivially bypassable.
+  # have made that guard trivially bypassable. Its
+  # `["addons", :_, "security"]` row (`caller: :supervisor`) refuses the
+  # by-slug spelling ahead of this guard as well.
   #
   # The stored value takes effect on the **next container create**, not
   # immediately — same as upstream, which re-reads `App.protected` when it
@@ -3710,6 +3726,9 @@ defmodule Vagus.API.Router do
   # supervisor slug comes from the URL, so validate it before it's interpolated
   # into a container ref (`addon_<slug>`) or the `options.json` path — a `/` or
   # `..` must never shape a Docker ref or traverse the data root.
+  #
+  # The app half is `Vagus.API.Tiers`' `subject: :self` on the info, stats
+  # and logs rows, which refuses first. The slug check is only here.
   defp resolve_info_slug(slug, :supervisor) do
     if valid_slug?(slug), do: {:ok, slug}, else: {:error, :forbidden}
   end

@@ -55,9 +55,12 @@ defmodule Vagus.API.Auth do
   `supervisor_only/2` was applied by hand and 26 routes never got it. The
   *table* is separate and diffable (`Vagus.API.Tiers`); applying it is not.
 
-  `conn.assigns.caller` is unchanged. Every existing handler guard still runs
-  — the gate is a coarse pre-filter, and the per-caller grants
-  (`services_role`, `discovery`, `resolve_info_slug/2`) remain the finer rule.
+  `conn.assigns.caller` is unchanged. Every handler guard is still there, now
+  behind the gate: the per-caller grants a handler used to decide alone
+  (`auth_api`, `services_role`, an app's own slug) are predicates on the
+  table's rows, refused here first with the handler's own status and
+  message. What a predicate cannot read (a discovery message's owner, the
+  service a body names, provide against read) remains the handler's alone.
   """
 
   @behaviour Plug
@@ -242,16 +245,18 @@ defmodule Vagus.API.Auth do
       _refused ->
         count_refusal(Authz.refusal_label(action, ctx))
 
-        # 403, matching upstream's `HTTPForbidden` for a token that resolves
-        # but has no role for the path (`security.py`'s final `raise`), and
-        # matching the router's own wrong-caller shape (`supervisor_only/2`).
-        Envelope.send_error(conn, "unauthorized", 403)
+        # A tier refusal is 403, matching upstream's `HTTPForbidden` for a
+        # token that resolves but has no role for the path (`security.py`'s
+        # final `raise`), and the router's own wrong-caller shape
+        # (`supervisor_only/2`). A predicate's is whatever its row says.
+        {status, message} = Authz.answer(caller, action, ctx)
+        Envelope.send_error(conn, message, status)
     end
   end
 
   # Counted like a blacklist refusal, for the same reason: an installed app
-  # can repeat a refused request at will. `label` names the tier the path
-  # demands and carries none of the request.
+  # can repeat a refused request at will. `label` names what the path demands
+  # and carries none of the request.
   defp count_refusal(label) do
     if SourceGuard.enabled?() do
       SourceGuard.record_filtered(:authz, label)
