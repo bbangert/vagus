@@ -976,6 +976,31 @@ defmodule Vagus.App.ServerTest do
       assert :idle = state(pid)
     end
 
+    test "a second boot_start to the same process applies no rule, even after a failed start" do
+      {_slug, pid} = installed(%{}, state: :started)
+      boot = op(pid, {:boot_start, %{running?: false}})
+      answer(:start, {:error, :boom})
+      assert {:error, _} = Task.await(boot)
+
+      assert :ok = :gen_statem.call(pid, {:boot_start, %{running?: false}})
+      refute_receive {:step, :start, _, _}, 100
+    end
+
+    test "a halt lets the resume after it apply the boot rule again" do
+      {slug, pid} = installed(%{}, state: :started)
+      boot = op(pid, {:boot_start, %{}})
+      answer(:start, {:ok, @started})
+      assert :ok = Task.await(boot)
+
+      halt = op(pid, {:halt, %{}})
+      answer(:halt_stop, {:ok, :stopped})
+      assert :ok = Task.await(halt)
+
+      boot = Task.async(fn -> App.boot_start(slug) end)
+      answer(:start, {:ok, @started})
+      assert :ok = Task.await(boot)
+    end
+
     test "an app wanted stopped is left stopped" do
       {_slug, pid} = installed()
       assert :ok = :gen_statem.call(pid, {:boot_start, %{}})

@@ -3,7 +3,7 @@ defmodule Vagus.App.DefaultBootTest do
   # test's apps are booted by it.
   use ExUnit.Case, async: false
 
-  import ExUnit.CaptureLog
+  import ExUnit.CaptureLog, only: [with_log: 1]
 
   alias Vagus.App.Orchestrator
   alias Vagus.Core.EventPusher
@@ -20,26 +20,30 @@ defmodule Vagus.App.DefaultBootTest do
     Vagus.AppFixtures.listening_api_port()
     name = :"orchestrator_#{System.unique_integer([:positive])}"
 
-    pid =
-      start_supervised!(
-        {Orchestrator,
-         name: name,
-         boot: true,
-         gate_tries: 1,
-         gate_interval: 0,
-         tree_interval: 0,
-         gate_timeout: 2_000,
-         stage_timeout: 2_000}
-      )
+    # The boot task logs from init/handle_continue onward, so capture must
+    # start before the Orchestrator does or early lines escape it.
+    {{pid, ref}, log} =
+      with_log(fn ->
+        pid =
+          start_supervised!(
+            {Orchestrator,
+             name: name,
+             boot: true,
+             gate_tries: 1,
+             gate_interval: 0,
+             tree_interval: 0,
+             gate_timeout: 2_000,
+             stage_timeout: 2_000}
+          )
 
-    ref = Process.monitor(pid)
+        ref = Process.monitor(pid)
 
-    log =
-      capture_log(fn ->
         with %{task: %Task{pid: task_pid}} <- :sys.get_state(name) do
           task_ref = Process.monitor(task_pid)
           assert_receive {:DOWN, ^task_ref, :process, ^task_pid, _reason}, 10_000
         end
+
+        {pid, ref}
       end)
 
     refute_received {:DOWN, ^ref, :process, ^pid, _reason}

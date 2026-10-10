@@ -1,11 +1,11 @@
 defmodule Vagus.App.OrchestratorTest do
   # Every unit is injected and reports to the test process, so nothing here
-  # touches the engine or reaches Core. Only the real app processes' tests
-  # start apps, and those processes are never sent an operation.
+  # touches the engine or reaches Core. Real app processes announcing
+  # themselves are `Vagus.App.OrchestratorAnnouncementsTest`'s.
   use ExUnit.Case, async: true
 
   import ExUnit.CaptureLog
-  import Vagus.AppFixtures, only: [app_config: 2, install_app: 2]
+  import Vagus.AppFixtures, only: [app_config: 2]
 
   alias Vagus.App.{CoreUnit, Orchestrator}
 
@@ -684,91 +684,5 @@ defmodule Vagus.App.OrchestratorTest do
     Orchestrator.up("late", name)
     _ = :sys.get_state(name)
     refute_receive {:boot_start, "late"}, 100
-  end
-
-  describe "announcements from real app processes" do
-    # They cast to the registered name, so the test's Orchestrator takes it
-    # from the app tree's, which is restarted afterwards.
-    setup do
-      :ok = Supervisor.terminate_child(Vagus.App.Supervisor, Orchestrator)
-      on_exit(fn -> Supervisor.restart_child(Vagus.App.Supervisor, Orchestrator) end)
-    end
-
-    defp slug, do: "orchestrated_#{System.unique_integer([:positive])}"
-
-    # The Orchestrator's own start starts their processes, as on a device.
-    defp start_with_processes(apps, overrides \\ %{}) do
-      Enum.each(apps, &install_app(&1.config, process: false))
-      overrides = Map.put(overrides, :ensure, &Vagus.App.Units.ensure/1)
-      start_orchestrator(apps, overrides, name: Orchestrator)
-    end
-
-    test "each started at boot is given its boot rule once, by its stage" do
-      [early, once] = [slug(), slug()]
-      start_with_processes([app(early, "initialize"), app(once, "once")])
-
-      messages = collect_until(:complete)
-      assert %{phase: :up} = await_boot(Orchestrator)
-
-      # A `once` app is not awaited, so its `boot_start` may trail `:complete`;
-      # `collect_until` already consumed whichever arrived before it.
-      for slug <- [early, once] do
-        assert [_pid] = Registry.lookup(Vagus.App.Directory, {:slug, slug})
-        seen = Enum.count(messages, &(&1 == {:boot_start, slug}))
-        assert seen <= 1
-        if seen == 0, do: assert_receive({:boot_start, ^slug})
-      end
-
-      refute_receive {:boot_start, _}, 100
-    end
-
-    test "a successor started before its stage ran, whose start then fails, is not given it again" do
-      slug = slug()
-      test_pid = self()
-      gates = Map.new([:tree, :engine, :network], &{&1, gate(test_pid, &1)})
-      gates = Map.put(gates, :api, held(test_pid, :api))
-
-      boot_start = fn slug, _running? ->
-        send(test_pid, {:boot_start, slug}) && {:error, :boom}
-      end
-
-      start_with_processes([app(slug, "initialize")], %{gates: gates, boot_start: boot_start})
-      assert_receive {:api, api}
-
-      [{pid, _}] = Registry.lookup(Vagus.App.Directory, {:slug, slug})
-      :ok = Vagus.App.Instances.stop(slug)
-      assert {:ok, successor} = Vagus.App.Instances.ensure(slug)
-      assert successor != pid
-      assert %{phase: :booting} = :sys.get_state(Orchestrator)
-
-      send(api, :release)
-      messages = collect_until(:complete)
-      assert {:report, :initialize, [{slug, :failed}]} in messages
-      assert Enum.count(messages, &(&1 == {:boot_start, slug})) == 1
-      assert %{phase: :up} = await_boot(Orchestrator)
-      refute_receive {:boot_start, ^slug}, 100
-    end
-
-    test "a successor started after its stage ran is given its boot rule again once boot ends" do
-      slug = slug()
-      hold = held(self(), :core)
-      start_with_processes([app(slug, "initialize")], %{core_start: fn _ -> hold.() end})
-      assert_receive {:boot_start, ^slug}
-      assert_receive {:core, core}
-
-      # Not a kill: the supervisor's restart budget is shared with the suite.
-      [{pid, _}] = Registry.lookup(Vagus.App.Directory, {:slug, slug})
-      :ok = Vagus.App.Instances.stop(slug)
-      assert {:ok, successor} = Vagus.App.Instances.ensure(slug)
-      assert successor != pid
-      assert %{phase: :booting} = :sys.get_state(Orchestrator)
-      refute_received {:boot_start, ^slug}
-
-      send(core, :release)
-      assert :complete in collect_until(:complete)
-      assert %{phase: :up} = await_boot(Orchestrator)
-      assert_receive {:boot_start, ^slug}
-      refute_receive {:boot_start, ^slug}, 100
-    end
   end
 end

@@ -378,19 +378,23 @@ starts the same apps.
 `boot_start` with `:shutting_down`, and the facade sends it `resume`, which
 applies the same boot rule.
 
-**An app process that loaded a saved file** calls
+**An app process that loaded a saved file** announces itself by calling
 `Vagus.App.Orchestrator.up/1` from its `init/1`; one created by an install
-enters `:new` without announcing, as nothing has been installed to boot. Once boot is over, the Orchestrator inspects that app's container
-and sends `boot_start` with the answer. Mid-boot it remembers each
-announcement, stamped when the process made it, and the boot task returns
-when each app's stage began. When boot ends, only a successor that announced
-after its stage began, or whose app no stage reached, is replayed: its stage
-may have reached the process it replaced, and it would otherwise own neither
-its token nor its running container until the next boot. One that announced
-before its stage began, including every process the Orchestrator's own
-`init/1` started, got that stage's `boot_start`: a replay would start a
-`once` app that had already exited a second time, or retry a failed start
-outside its restart ladder.
+enters `:new` without announcing, as nothing has been installed to boot.
+Once boot is over, the Orchestrator inspects that app's container and sends
+`boot_start` with the answer. While booting it remembers every announcement
+and replays them all when boot ends, since a successor whose stage reached
+the process it replaced would otherwise own neither its token nor its
+running container until the next boot.
+
+An app process accepts one boot rule per lifetime, counted again from each
+completed halt (a halt stops the app, so the `resume` after it applies the
+rule afresh). A replay to a process its stage already reached therefore does
+nothing, and one its stage missed gets exactly one: a second would start a
+`once` app that had already exited, or retry a failed start outside its
+restart ladder. The rule is the process's to keep, not the Orchestrator's,
+because the Orchestrator cannot tell which process a stage's `boot_start`
+reached without racing that process's restart.
 
 **Once-per-VM guards.** Two `:persistent_term` flags survive any restart of
 this tree: the sweep's `{Vagus.App.Units, :swept}`, and
