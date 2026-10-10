@@ -471,6 +471,10 @@ against upstream where noted.
   removes there as root and would follow a planted symlink. A restore stages
   in a `.restore-<slug>-<n>` sibling of the app's data dir, so the swap is a
   rename on one filesystem. Both are swept only at the first boot of a VM.
+  A snapshot is streamed into its staging file one data file at a time, each
+  read through a descriptor checked to be the file its lstat saw; a
+  directory swapped for a symlink between its check and its listing is a
+  residual upstream's tar shares.
 - **`backup_not_stored`.** An update with a backup that succeeded but whose
   backup could not be stored is `{:error, {:backup_not_stored, reason}}`
   (500): the update stands, and the caller who asked for a backup hears it

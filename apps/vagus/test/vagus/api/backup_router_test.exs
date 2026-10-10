@@ -419,7 +419,10 @@ defmodule Vagus.API.BackupRouterTest do
   describe "POST /backups/new/upload (real multipart, W4/B1)" do
     test "a real multipart upload with a valid tar -> {slug}" do
       spec = %{slug: "up1", name: "Uploaded", addons: [], supervisor_version: "2026.07.3"}
-      {:ok, tar} = Vagus.Backup.create(spec, date: "2026-07-21T00:00:00Z")
+      to = Path.join(System.tmp_dir!(), "vagus-up1-#{System.unique_integer([:positive])}.tar")
+      {:ok, ^to} = Vagus.Backup.create(spec, date: "2026-07-21T00:00:00Z", to: to)
+      tar = File.read!(to)
+      File.rm!(to)
 
       conn =
         multipart_conn("/backups/new/upload", [

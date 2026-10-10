@@ -79,8 +79,8 @@ defmodule Vagus.BackupsTest do
         supervisor_version: "2026.07.3"
       }
 
-      {:ok, tar} = Vagus.Backup.create(spec, date: "2026-01-01T00:00:00Z")
-      File.write!(Path.join(dir, "abc12345.tar"), tar)
+      to = Path.join(dir, "abc12345.tar")
+      {:ok, ^to} = Vagus.Backup.create(spec, date: "2026-01-01T00:00:00Z", to: to)
 
       :ok = Backups.reload(server)
 
@@ -90,11 +90,6 @@ defmodule Vagus.BackupsTest do
 
     test "get/2 on an unknown slug is :error", %{server: server} do
       assert :error = Backups.get("nope", server)
-    end
-
-    test "put_file/2 rejects a non-tar payload", %{server: server} do
-      assert {:error, _reason} = Backups.put_file("not a tar", server)
-      assert Backups.list(server) == []
     end
   end
 
@@ -371,6 +366,44 @@ defmodule Vagus.BackupsTest do
 
       assert {:error, {:staging, :eexist}} =
                Backups.begin_partial("same", [unique: 7] ++ opts)
+    end
+  end
+
+  describe "finish_partial/2" do
+    test "lands the outer tar on disk in the backup dir and removes the staging", %{
+      backup_dir: backup_dir,
+      server: server
+    } do
+      opts = [server: server, date: "2026-07-21T00:00:00Z"]
+      {:ok, %{staging_dir: staging} = handle} = Backups.begin_partial("disk", opts)
+      inner = Path.join(staging, "core_disk.tar.gz")
+      addon = %{slug: "core_disk", version: "1", data_dir: "/nonexistent"}
+      :ok = Vagus.Backup.write_addon_tar(Map.put(addon, :system, %{"name" => "Disk"}), inner)
+      inner_bytes = File.read!(inner)
+
+      assert {:ok, slug} = Backups.finish_partial(handle, ["core_disk"])
+
+      path = Path.join(backup_dir, "#{slug}.tar")
+      assert {:ok, %{path: ^path, size_bytes: size}} = Backups.get(slug, server)
+      assert File.stat!(path).size == size
+      {:ok, members} = :erl_tar.extract(String.to_charlist(path), [:memory])
+      assert [{~c"./backup.json", _json}, {~c"./core_disk.tar.gz", ^inner_bytes}] = members
+      assert File.ls!(backup_dir) == ["#{slug}.tar"]
+      refute File.exists?(staging)
+    end
+
+    test "an outer tar that fails to build leaves nothing staged or stored", %{
+      backup_dir: backup_dir,
+      server: server
+    } do
+      {:ok, %{staging_dir: staging} = handle} = Backups.begin_partial("bad", server: server)
+      File.write!(Path.join(staging, "core_bad.tar.gz"), "not a tar")
+
+      assert {:error, {:inner_tar, "core_bad", _reason}} =
+               Backups.finish_partial(handle, ["core_bad"])
+
+      refute File.exists?(staging)
+      assert File.ls!(backup_dir) == []
     end
   end
 
@@ -683,7 +716,7 @@ defmodule Vagus.BackupsTest do
         {String.to_charlist("./#{slug}.tar.gz"), File.read!(inner)}
       ])
 
-    {:ok, ^backup_slug} = Backups.put_file(File.read!(outer), server)
+    {:ok, ^backup_slug} = Backups.put_path(outer, server)
     File.rm!(inner)
     File.rm!(outer)
     backup_slug
@@ -872,8 +905,8 @@ defmodule Vagus.BackupsTest do
       # Written by a pre-phase-4 Vagus — tolerated on read; it simply stays
       # HAOS-unrestorable (scratchpad decision, 2026-07-30).
       spec = %{slug: "0ldvagus", name: "Old tar", addons: [], supervisor_version: "vagus"}
-      {:ok, tar} = Vagus.Backup.create(spec, date: "2026-01-01T00:00:00Z")
-      File.write!(Path.join(dir, "0ldvagus.tar"), tar)
+      to = Path.join(dir, "0ldvagus.tar")
+      {:ok, ^to} = Vagus.Backup.create(spec, date: "2026-01-01T00:00:00Z", to: to)
 
       :ok = Backups.reload(server)
 
