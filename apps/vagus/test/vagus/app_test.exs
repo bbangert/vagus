@@ -252,9 +252,8 @@ defmodule Vagus.AppTest do
     defp answer_snapshot(slug, outcome \\ :ok) do
       assert_receive {:step, :snapshot, %{staging_dir: staging}, task}, 5_000
       addon = %{slug: slug, name: "App Test", version: "1.0", data_dir: "/nonexistent"}
-      {:ok, gz, _size} = Vagus.Backup.addon_tar(Map.put(addon, :system, %{"name" => "App Test"}))
       path = Path.join(staging, slug <> ".tar.gz")
-      File.write!(path, gz)
+      :ok = Vagus.Backup.write_addon_tar(Map.put(addon, :system, %{"name" => "App Test"}), path)
       send(task, {:outcome, if(outcome == :ok, do: {:ok, path}, else: outcome)})
     end
 

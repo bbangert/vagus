@@ -11,8 +11,10 @@ defmodule Vagus.Backup do
   (`{user, system, version, state}`) and `data/` (the add-on's `/data`).
 
   `backup.json` carries the §A4 `SCHEMA_BACKUP` fields (key is `addons`,
-  `version: 2`, `protected: false`). Tar bytes are produced via a short-lived
-  temp file (erl_tar's write sink).
+  `version: 2`, `protected: false`). Both tars are written straight to their
+  destination file, so creating a backup holds at most one data file in
+  memory: the inner tar takes each file as the walk reaches it, and the outer
+  tar takes each staged inner tar by path.
 
   Two read surfaces (audit C6): the original binary API (`read/1`,
   `extract_addon/2`) loads the whole outer tar and is bounded by
@@ -21,8 +23,7 @@ defmodule Vagus.Backup do
   size-checks the one member it needs, and extracts only that member to
   memory. A real HAOS backup runs to gigabytes, so anything touching an
   on-disk tar (upload, boot rescan, restore) must use the file API; the
-  binary API remains for the create path (whose tar was just built in
-  memory) and tests.
+  binary API remains for tests only.
   """
 
   require Logger
@@ -62,31 +63,37 @@ defmodule Vagus.Backup do
   # unreadable.
   @tar_read_timeout_ms 120_000
 
-  @type addon_spec :: %{
-          slug: String.t(),
-          name: String.t(),
-          version: String.t(),
-          data_dir: String.t()
-        }
-
   @doc """
-  Builds an unprotected partial backup tar for `spec`
-  (`%{slug, name, addons: [addon_spec | %{slug, inner: path}], supervisor_version}`):
-  an app given as `inner:` is the `<slug>.tar.gz` its own snapshot already
-  wrote. `opts[:date]` overrides the ISO8601 timestamp (for tests). Returns
-  `{:ok, tar_binary}`.
+  Writes an unprotected partial backup tar for `spec`
+  (`%{slug, name, addons: [%{slug, inner: path}], supervisor_version}`) to
+  `opts[:to]`, where each `inner:` is the `<slug>.tar.gz` that app's own
+  snapshot wrote (`write_addon_tar/2`). `opts[:date]` overrides the ISO8601
+  timestamp (for tests). On an error nothing is left at `opts[:to]`.
   """
-  @spec create(map(), keyword()) :: {:ok, binary()} | {:error, term()}
-  def create(spec, opts \\ []) do
+  @spec create(map(), keyword()) :: {:ok, Path.t()} | {:error, term()}
+  def create(spec, opts) do
+    to = Keyword.fetch!(opts, :to)
     addons = Map.get(spec, :addons, [])
     date = Keyword.get(opts, :date) || iso8601_now()
 
     with :ok <- guard_staged_size(addons, Keyword.get(opts, :max_bytes, @max_outer)),
-         {:ok, addon_members, addon_meta} <- build_addon_members(addons) do
-      backup_json = backup_json(spec, addon_meta, date)
-      members = [{"./backup.json", Jason.encode!(backup_json)} | addon_members]
-      {:ok, write_tar(members, compressed: false)}
+         {:ok, addon_meta} <- addon_meta(addons),
+         :ok <- write_outer(to, spec, addons, addon_meta, date) do
+      {:ok, to}
+    else
+      {:error, {:raised, msg}} -> {:error, {:backup_tar, msg}}
+      other -> other
     end
+  end
+
+  defp write_outer(to, spec, addons, addon_meta, date) do
+    write_tar(to, [], fn tar ->
+      json = Jason.encode!(backup_json(spec, addon_meta, date))
+      add!(tar, json, ~c"./backup.json")
+
+      for %{slug: slug, inner: path} <- addons,
+          do: add!(tar, String.to_charlist(path), String.to_charlist("./#{slug}.tar.gz"))
+    end)
   end
 
   @doc """
@@ -220,8 +227,8 @@ defmodule Vagus.Backup do
 
   ## Inner add-on tars
 
-  # The outer tar is assembled in memory from every staged inner tar, so their
-  # sizes are summed before any is read rather than after allocation.
+  # Inner tars are copied into the outer tar by path, so their summed sizes
+  # are its size but for backup.json and tar headers, which are small.
   # path is internal/config-derived, not request input
   # sobelow_skip ["Traversal.FileModule"]
   defp guard_staged_size(addons, max_bytes) do
@@ -245,36 +252,26 @@ defmodule Vagus.Backup do
     end
   end
 
-  defp build_addon_members(addons) do
-    Enum.reduce_while(addons, {:ok, [], []}, fn addon, {:ok, members, meta} ->
-      case inner_tar(addon) do
-        {:ok, addon, gz, size} ->
-          member = {"./#{addon.slug}.tar.gz", gz}
-
-          m = %{
-            "slug" => addon.slug,
-            "name" => addon.name,
-            "version" => addon.version,
-            # An MB float, not bytes — upstream's `Backup.size` unit
-            # (audit C5; the old bytes value was off by 1048576×). Raw
-            # division, no rounding: upstream's is `st_size / 1024 / 1024`.
-            "size" => size / 1_048_576
-          }
-
-          {:cont, {:ok, [member | members], [m | meta]}}
-
-        {:error, reason} ->
-          {:halt, {:error, reason}}
+  defp addon_meta(addons) do
+    addons
+    |> Enum.reduce_while({:ok, []}, fn addon, {:ok, meta} ->
+      case inner_meta(addon) do
+        {:ok, m} -> {:cont, {:ok, [m | meta]}}
+        {:error, _reason} = error -> {:halt, error}
       end
     end)
+    |> case do
+      {:ok, meta} -> {:ok, Enum.reverse(meta)}
+      error -> error
+    end
   end
 
   # Only `addon.json` is inflated into memory: erl_tar streams a gzip file and
   # skips the members it is not asked for.
   # path is internal/config-derived, not request input
   # sobelow_skip ["Traversal.FileModule"]
-  defp inner_tar(%{inner: path, slug: slug} = addon) do
-    with {:ok, gz} <- File.read(path),
+  defp inner_meta(%{inner: path, slug: slug}) do
+    with {:ok, %File.Stat{size: size}} <- File.stat(path),
          {:ok, [{_name, json}]} <-
            :erl_tar.extract(String.to_charlist(path), [
              :compressed,
@@ -282,7 +279,9 @@ defmodule Vagus.Backup do
              {:files, [~c"./addon.json"]}
            ]),
          {:ok, %{"version" => version, "system" => %{"name" => name}}} <- Jason.decode(json) do
-      {:ok, Map.merge(addon, %{name: name, version: version}), gz, byte_size(gz)}
+      # An MB float, not bytes — upstream's `Backup.size` unit (audit C5).
+      # Raw division, no rounding: upstream's is `st_size / 1024 / 1024`.
+      {:ok, %{"slug" => slug, "name" => name, "version" => version, "size" => size / 1_048_576}}
     else
       # Anything else can carry the decoded `addon.json`, the app's
       # passwords among its options, into an API error and the log.
@@ -291,38 +290,33 @@ defmodule Vagus.Backup do
     end
   end
 
-  defp inner_tar(addon) do
-    with {:ok, gz, size} <- build_addon_tar(addon), do: {:ok, addon, gz, size}
+  defp inner_meta(%{slug: slug}), do: {:error, {:no_inner, slug}}
+
+  @doc """
+  Writes `addon`'s inner tar (`addon.json`, then its data dir as `data/`) to
+  `path`. On an error nothing is left at `path`.
+  """
+  @spec write_addon_tar(map(), Path.t()) :: :ok | {:error, term()}
+  def write_addon_tar(addon, path) do
+    write_tar(path, [:compressed], fn tar ->
+      addon_json =
+        Jason.encode!(%{
+          "user" => Map.get(addon, :user, %{}),
+          "system" => Map.get(addon, :system, %{}),
+          "version" => addon.version,
+          "state" => Map.get(addon, :state, "started")
+        })
+
+      add!(tar, addon_json, ~c"./addon.json")
+      add_dir(tar, addon.data_dir, Map.get(addon, :max_bytes, @max_outer))
+    end)
+    |> case do
+      {:error, {:raised, msg}} -> {:error, {:addon_tar, addon.slug, msg}}
+      other -> other
+    end
   end
 
-  @doc false
-  @spec addon_tar(map()) :: {:ok, binary(), non_neg_integer()} | {:error, term()}
-  def addon_tar(addon), do: build_addon_tar(addon)
-
-  defp build_addon_tar(addon) do
-    addon_json =
-      Jason.encode!(%{
-        "user" => Map.get(addon, :user, %{}),
-        "system" => Map.get(addon, :system, %{}),
-        "version" => addon.version,
-        "state" => Map.get(addon, :state, "started")
-      })
-
-    data_members =
-      addon.data_dir
-      |> read_dir(Map.get(addon, :max_bytes, @max_outer))
-      |> Enum.map(fn {rel, content} -> {"./data/#{rel}", content} end)
-
-    gz = write_tar([{"./addon.json", addon_json} | data_members], compressed: true)
-    {:ok, gz, byte_size(gz)}
-  rescue
-    e -> {:error, {:addon_tar, addon.slug, Exception.message(e)}}
-  catch
-    :throw, :too_large -> {:error, :too_large}
-    :throw, {:read, _rel, _reason} = failed -> {:error, failed}
-  end
-
-  # Recursively read a directory into [{relative_path, content}]. Absent dir → [].
+  # One file is in memory at a time.
   # The app owns this tree and this runs as root: a symlink it planted
   # resolves on the host, so one is never followed, only skipped. A running
   # app keeps writing through the walk, so the window between its writes and
@@ -330,52 +324,64 @@ defmodule Vagus.Backup do
   # In that window the app can rename a symlink over a name already lstat'd:
   # a file is read only through a descriptor that is still the lstat'd file,
   # and a directory swapped that way (the BEAM has no `openat`) is bounded by
-  # `max_bytes` across the walk rather than reading the host into memory.
+  # `max_bytes` across the walk rather than copying the host into the backup.
   # path is internal/config-derived, not request input
   # sobelow_skip ["Traversal.FileModule"]
-  defp read_dir(dir, max_bytes) do
+  defp add_dir(tar, dir, max_bytes) do
     case File.lstat(dir) do
-      {:ok, %File.Stat{type: :directory}} ->
-        read_tree(dir, [], {[], max_bytes}) |> elem(0) |> Enum.reverse()
-
-      _absent_or_not_a_directory ->
-        []
+      {:ok, %File.Stat{type: :directory}} -> add_tree(tar, dir, [], max_bytes)
+      {:ok, %File.Stat{}} -> :ok
+      {:error, :enoent} -> :ok
+      {:error, reason} -> throw({:read, ".", reason})
     end
   end
 
   # sobelow_skip ["Traversal.FileModule"]
-  defp read_tree(root, rel, acc) do
+  defp add_tree(tar, root, rel, left) do
     [root | rel]
     |> Path.join()
     |> File.ls!()
     |> Enum.sort()
-    |> Enum.reduce(acc, fn name, {members, left} = acc ->
+    |> Enum.reduce(left, fn name, left ->
       member = rel ++ [name]
       path = Path.join([root | member])
 
       case File.lstat(path) do
         {:ok, %File.Stat{type: :directory}} ->
-          read_tree(root, member, acc)
+          add_tree(tar, root, member, left)
 
         {:ok, %File.Stat{type: :regular, size: size}} when size > left ->
           throw(:too_large)
 
         {:ok, %File.Stat{type: :regular} = seen} ->
           case read_regular(path, seen) do
-            {:ok, content} -> {[{Path.join(member), content} | members], left - seen.size}
-            :skip -> skipped(member, acc)
-            {:error, reason} -> throw({:read, Path.join(member), reason})
+            {:ok, content} ->
+              add!(tar, content, String.to_charlist("./data/" <> Path.join(member)))
+              left - seen.size
+
+            :skip ->
+              skipped(member, left)
+
+            {:error, reason} ->
+              throw({:read, Path.join(member), reason})
           end
 
-        _symlink_or_special ->
-          acc
+        {:ok, %File.Stat{}} ->
+          left
+
+        # Removed by the app since the listing.
+        {:error, :enoent} ->
+          left
+
+        {:error, reason} ->
+          throw({:read, Path.join(member), reason})
       end
     end)
   end
 
-  defp skipped(member, acc) do
+  defp skipped(member, left) do
     Logger.warning("Vagus.Backup: #{Path.join(member)} changed while read; not backed up")
-    acc
+    left
   end
 
   @doc false
@@ -426,26 +432,66 @@ defmodule Vagus.Backup do
 
   ## tar helpers
 
+  # `fun` fails by throwing its error or raising. The close can fail even
+  # after every add succeeded: it writes the closing blocks, so a full disk
+  # may surface only there, and erl_tar then raises without closing its
+  # descriptor. So on any failure `path` is removed before a close is
+  # attempted, and ends up holding a whole tar or nothing.
   # path is internal/config-derived, not request input
   # sobelow_skip ["Traversal.FileModule"]
-  defp write_tar(members, compressed: compressed?) do
-    path =
-      Path.join(System.tmp_dir!(), "vagus-backup-#{System.unique_integer([:positive])}.tar")
-
-    open_opts = if compressed?, do: [:write, :compressed], else: [:write]
-    {:ok, tar} = :erl_tar.open(String.to_charlist(path), open_opts)
-
-    try do
-      Enum.each(members, fn {name, bin} ->
-        :ok = :erl_tar.add(tar, bin, String.to_charlist(name), [])
-      end)
-
-      :ok = :erl_tar.close(tar)
-      File.read!(path)
-    after
-      File.rm(path)
+  defp write_tar(path, opts, fun) do
+    with {:ok, tar} <- :erl_tar.open(String.to_charlist(path), [:write | opts]) do
+      try do
+        fun.(tar)
+      catch
+        kind, reason ->
+          File.rm(path)
+          close_quietly(tar)
+          failed(kind, reason, __STACKTRACE__)
+      else
+        _ -> close(tar, path)
+      end
     end
   end
+
+  # sobelow_skip ["Traversal.FileModule"]
+  defp close(tar, path) do
+    case :erl_tar.close(tar) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        File.rm(path)
+        {:error, {:tar, reason}}
+    end
+  catch
+    kind, reason ->
+      File.rm(path)
+      failed(kind, reason, __STACKTRACE__)
+  end
+
+  # erl_tar's close asserts each write with a match.
+  defp close_quietly(tar) do
+    :erl_tar.close(tar)
+  catch
+    :error, {:badmatch, {:error, _reason}} -> :ok
+  end
+
+  defp add!(tar, source, name) do
+    case :erl_tar.add(tar, source, name, []) do
+      :ok -> :ok
+      {:error, reason} -> throw({:tar, reason})
+    end
+  end
+
+  # erl_tar throws `{:error, reason}` from inside `add/4` as well as returning it.
+  defp failed(:throw, {:error, reason}, _stacktrace), do: {:error, reason}
+  defp failed(:throw, reason, _stacktrace), do: {:error, reason}
+
+  defp failed(:error, reason, stacktrace),
+    do: {:error, {:raised, Exception.message(Exception.normalize(:error, reason, stacktrace))}}
+
+  defp failed(kind, reason, stacktrace), do: :erlang.raise(kind, reason, stacktrace)
 
   # Reject an oversized outer tar before extraction (it's uncompressed, so its
   # byte size is its real size — no gunzip amplification here).

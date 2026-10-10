@@ -3449,8 +3449,8 @@ defmodule Vagus.API.Router do
                            pass: []
                          )
 
-  # The uploaded tar's bytes are validated by `Backups.put_file/1` itself
-  # (`Vagus.Backup.read/1`) — any field name is accepted (the first
+  # The uploaded tar is validated by `Backups.put_path/1` itself
+  # (`Vagus.Backup.read_file/1`) — any field name is accepted (the first
   # `%Plug.Upload{}` found in the parsed multipart params is used), matching
   # the real Supervisor's tolerance of arbitrary multipart field naming.
   #
@@ -3484,7 +3484,7 @@ defmodule Vagus.API.Router do
       {:ok, conn} ->
         case first_upload(conn.body_params) do
           {:ok, %Plug.Upload{path: path}} ->
-            # `put_path/1`, never `File.read` + `put_file` (audit C6): the
+            # `put_path/1`, never `File.read` into memory (audit C6): the
             # multipart part is already spooled to disk by `Plug.Upload`, so
             # only `backup.json` is parsed and the tar is `cp`'d — a real
             # HAOS-sized backup no longer costs 2-3× its size in RAM.

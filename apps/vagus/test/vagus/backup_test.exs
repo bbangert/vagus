@@ -20,13 +20,33 @@ defmodule Vagus.BackupTest do
       name: "Test backup",
       supervisor_version: "vagus",
       addons: [
-        %{slug: "core_mosquitto", name: "Mosquitto broker", version: "7.1.0", data_dir: data}
+        stage(Path.dirname(data), %{
+          slug: "core_mosquitto",
+          name: "Mosquitto broker",
+          version: "7.1.0",
+          data_dir: data
+        })
       ]
     }
   end
 
+  # As an app's snapshot step would: its inner tar written into staging.
+  defp stage(dir, addon) do
+    path = Path.join(dir, "#{addon.slug}.tar.gz")
+    :ok = Backup.write_addon_tar(Map.put(addon, :system, %{"name" => addon.name}), path)
+    %{slug: addon.slug, inner: path}
+  end
+
+  defp create!(spec, opts \\ []) do
+    to = Path.join(System.tmp_dir!(), "vagus-outer-#{System.unique_integer([:positive])}.tar")
+    {:ok, ^to} = Backup.create(spec, Keyword.put(opts, :to, to))
+    tar = File.read!(to)
+    File.rm!(to)
+    tar
+  end
+
   test "create produces a readable backup.json with the §A4 shape", %{data: data} do
-    {:ok, tar} = Backup.create(spec(data), date: "2026-07-21T00:00:00Z")
+    tar = create!(spec(data), date: "2026-07-21T00:00:00Z")
     {:ok, %{backup: b, members: members}} = Backup.read(tar)
 
     assert b["slug"] == "backup_abc"
@@ -51,7 +71,7 @@ defmodule Vagus.BackupTest do
   end
 
   test "extract_addon round-trips addon.json + the /data tree", %{data: data} do
-    {:ok, tar} = Backup.create(spec(data))
+    tar = create!(spec(data))
     {:ok, %{addon: addon, data: files}} = Backup.extract_addon(tar, "core_mosquitto")
 
     assert addon["version"] == "7.1.0"
@@ -70,7 +90,7 @@ defmodule Vagus.BackupTest do
     File.ln_s!(host, Path.join(data, "sub/hostdir"))
     File.write!(Path.join(data, ".hidden"), "dot")
 
-    {:ok, tar} = Backup.create(spec(data))
+    tar = create!(spec(data))
     {:ok, %{data: files}} = Backup.extract_addon(tar, "core_mosquitto")
 
     assert files |> Map.new() |> Map.keys() |> Enum.sort() ==
@@ -133,9 +153,107 @@ defmodule Vagus.BackupTest do
   } do
     addon = %{slug: "x", version: "1", data_dir: data}
     total = byte_size(~s({"require_certificate":false})) + byte_size("nested content")
+    path = Path.join(Path.dirname(data), "x.tar.gz")
 
-    assert {:ok, _gz, _size} = Backup.addon_tar(Map.put(addon, :max_bytes, total))
-    assert {:error, :too_large} = Backup.addon_tar(Map.put(addon, :max_bytes, total - 1))
+    assert :ok = Backup.write_addon_tar(Map.put(addon, :max_bytes, total), path)
+
+    assert {:error, :too_large} =
+             Backup.write_addon_tar(Map.put(addon, :max_bytes, total - 1), path)
+
+    refute File.exists?(path)
+  end
+
+  test "the inner tar on disk holds addon.json first, then each data file", %{data: data} do
+    File.ln_s!(Path.join(data, "options.json"), Path.join(data, "link"))
+    path = Path.join(Path.dirname(data), "x.tar.gz")
+    addon = %{slug: "x", version: "1", data_dir: data, system: %{"name" => "X"}}
+
+    assert :ok = Backup.write_addon_tar(addon, path)
+    {:ok, members} = :erl_tar.extract(String.to_charlist(path), [:compressed, :memory])
+
+    assert [
+             {~c"./addon.json", json},
+             {~c"./data/options.json", opts},
+             {~c"./data/sub/nested.txt", nested}
+           ] =
+             members
+
+    assert %{"version" => "1", "system" => %{"name" => "X"}} = Jason.decode!(json)
+    assert opts == ~s({"require_certificate":false})
+    assert nested == "nested content"
+  end
+
+  @tag skip: elem(System.cmd("id", ["-u"]), 0) == "0\n" && "root reads a 0o000 file"
+  test "a read error mid-walk fails the snapshot and leaves no staging file", %{data: data} do
+    locked = Path.join(data, "sub/locked")
+    File.write!(locked, "unreadable")
+    File.chmod!(locked, 0o000)
+    on_exit(fn -> File.chmod(locked, 0o600) end)
+    path = Path.join(Path.dirname(data), "x.tar.gz")
+
+    assert {:error, {:read, "sub/locked", :eacces}} =
+             Backup.write_addon_tar(%{slug: "x", version: "1", data_dir: data}, path)
+
+    refute File.exists?(path)
+  end
+
+  @tag skip: elem(System.cmd("id", ["-u"]), 0) == "0\n" && "root searches a 0o000 directory"
+  test "a data root that cannot be lstat'd fails the snapshot rather than being empty", %{
+    data: data
+  } do
+    locked = Path.join(Path.dirname(data), "locked")
+    root = Path.join(locked, "data")
+    File.mkdir_p!(root)
+    File.chmod!(locked, 0o000)
+    on_exit(fn -> File.chmod(locked, 0o700) end)
+    path = Path.join(Path.dirname(data), "x.tar.gz")
+
+    assert {:error, {:read, ".", :eacces}} =
+             Backup.write_addon_tar(%{slug: "x", version: "1", data_dir: root}, path)
+
+    refute File.exists?(path)
+  end
+
+  test "an entry the walk cannot lstat fails the snapshot rather than being dropped", %{
+    data: data
+  } do
+    # Past PATH_MAX by nesting relative to each parent, which no absolute
+    # path call can create; GNU rm walks it by descriptor.
+    deep = Path.join(data, "deep")
+    seg = String.duplicate("d", 250)
+
+    nest = ~S'mkdir "$1"; cd -P "$1"; for i in $(seq 17); do mkdir "$2"; cd -P "$2"; done'
+    on_exit(fn -> System.cmd("rm", ["-rf", deep]) end)
+    {_, 0} = System.cmd("bash", ["-e", "-c", nest, "bash", deep, seg])
+    path = Path.join(Path.dirname(data), "x.tar.gz")
+
+    assert {:error, {:read, member, :enametoolong}} =
+             Backup.write_addon_tar(%{slug: "x", version: "1", data_dir: data}, path)
+
+    assert String.starts_with?(member, "deep/" <> seg)
+    refute File.exists?(path)
+  end
+
+  test "a failure partway through the outer tar is an error and leaves no file", %{data: data} do
+    root = Path.dirname(data)
+    a = stage(root, %{slug: "app_a", name: "A", version: "1", data_dir: data})
+    b = stage(root, %{slug: "app_b", name: "B", version: "2", data_dir: data})
+    # Past what a ustar mtime field holds, so erl_tar fails adding it by
+    # path, after backup.json and app_a are already written.
+    File.touch!(b.inner, 9_000_000_000)
+    s = %{slug: "outer1", name: "n", supervisor_version: "2026.07.3", addons: [a, b]}
+    to = Path.join(root, "outer.tar")
+
+    assert {:error, {:write_failed, :numeric_field_too_long}} = Backup.create(s, to: to)
+    refute File.exists?(to)
+  end
+
+  test "an app in the spec without a staged inner tar is an error naming it", %{data: data} do
+    s = %{slug: "b", name: "n", supervisor_version: "2026.07.3", addons: [%{slug: "x"}]}
+    to = Path.join(Path.dirname(data), "outer.tar")
+
+    assert {:error, {:no_inner, "x"}} = Backup.create(s, to: to)
+    refute File.exists?(to)
   end
 
   test "staged inner tars over the outer cap together fail before any is read", %{data: data} do
@@ -149,12 +267,34 @@ defmodule Vagus.BackupTest do
 
     s = %{slug: "b", name: "n", supervisor_version: "2026.07.3", addons: staged}
 
-    assert {:error, :too_large} = Backup.create(s, max_bytes: 19)
-    assert {:error, {:inner_tar, "a", _not_a_tar}} = Backup.create(s, max_bytes: 20)
+    to = Path.join(Path.dirname(data), "outer.tar")
+    assert {:error, :too_large} = Backup.create(s, max_bytes: 19, to: to)
+    assert {:error, {:inner_tar, "a", _not_a_tar}} = Backup.create(s, max_bytes: 20, to: to)
+    refute File.exists?(to)
+  end
+
+  test "the outer tar on disk is backup.json then each staged inner tar, byte for byte", %{
+    data: data
+  } do
+    root = Path.dirname(data)
+    a = stage(root, %{slug: "app_a", name: "A", version: "1", data_dir: data})
+    b = stage(root, %{slug: "app_b", name: "B", version: "2", data_dir: "/nonexistent"})
+    s = %{slug: "outer1", name: "n", supervisor_version: "2026.07.3", addons: [a, b]}
+    to = Path.join(root, "outer.tar")
+
+    assert {:ok, ^to} = Backup.create(s, to: to)
+    {:ok, members} = :erl_tar.extract(String.to_charlist(to), [:memory])
+
+    assert [{~c"./backup.json", json}, {~c"./app_a.tar.gz", gz_a}, {~c"./app_b.tar.gz", gz_b}] =
+             members
+
+    assert gz_a == File.read!(a.inner)
+    assert gz_b == File.read!(b.inner)
+    assert %{"addons" => [%{"slug" => "app_a"}, %{"slug" => "app_b"}]} = Jason.decode!(json)
   end
 
   test "extract_addon on an absent add-on → :not_in_backup", %{data: data} do
-    {:ok, tar} = Backup.create(spec(data))
+    tar = create!(spec(data))
     assert {:error, :not_in_backup} = Backup.extract_addon(tar, "core_ghost")
   end
 
@@ -205,24 +345,35 @@ defmodule Vagus.BackupTest do
     secret = ~s({"user":{"options":{"password":"hunter2"}}})
     s = %{slug: "b", name: "n", supervisor_version: "2026.07.3"}
 
+    to = Path.join(Path.dirname(data), "outer.tar")
+
     for json <- [secret, "not json " <> secret] do
       assert {:error, {:inner_tar, "x", :malformed}} =
-               Backup.create(Map.put(s, :addons, [staged.(json)]))
+               Backup.create(Map.put(s, :addons, [staged.(json)]), to: to)
     end
 
     missing = %{slug: "x", inner: Path.join(data, "missing.tar.gz")}
-    assert {:error, {:inner_tar, "x", :enoent}} = Backup.create(Map.put(s, :addons, [missing]))
+
+    assert {:error, {:inner_tar, "x", :enoent}} =
+             Backup.create(Map.put(s, :addons, [missing]), to: to)
   end
 
-  test "an add-on with no data dir still backs up (empty data)", %{data: _data} do
+  test "an add-on with no data dir still backs up (empty data)", %{data: data} do
     s = %{
       slug: "b",
       name: "n",
       supervisor_version: "2026.07.3",
-      addons: [%{slug: "x", name: "X", version: "1.0", data_dir: "/nonexistent"}]
+      addons: [
+        stage(Path.dirname(data), %{
+          slug: "x",
+          name: "X",
+          version: "1.0",
+          data_dir: "/nonexistent"
+        })
+      ]
     }
 
-    {:ok, tar} = Backup.create(s)
+    tar = create!(s)
     {:ok, %{data: files}} = Backup.extract_addon(tar, "x")
     assert files == []
   end
@@ -235,7 +386,7 @@ defmodule Vagus.BackupTest do
       path =
         Path.join(System.tmp_dir!(), "vagus-fileapi-#{System.unique_integer([:positive])}.tar")
 
-      {:ok, tar} = Backup.create(spec(data), date: "2026-07-30T00:00:00Z")
+      tar = create!(spec(data), date: "2026-07-30T00:00:00Z")
       File.write!(path, tar)
       on_exit(fn -> File.rm(path) end)
       %{path: path}

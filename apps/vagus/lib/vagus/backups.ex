@@ -6,7 +6,7 @@ defmodule Vagus.Backups do
 
   A `GenServer` only for the directory listing (an in-memory `slug =>
   %{backup, path, size_bytes}` index, built by scanning `*.tar` at `init/1`
-  and kept current via `reload/1`/`put_file/2`/`delete/2`); the actual file
+  and kept current via `reload/1`/`put_path/2`/`delete/2`); the actual file
   I/O and `Vagus.App` orchestration in
   `create_partial/3` and `restore_partial/3` runs in the caller's process
   (mirroring `Vagus.Addon.Store.reload/1`'s own rationale — a slow backup
@@ -66,29 +66,9 @@ defmodule Vagus.Backups do
   def delete(slug, server \\ __MODULE__), do: GenServer.call(server, {:delete, slug})
 
   @doc """
-  Validates `tar` (`Vagus.Backup.read/1`), writes it as `<slug>.tar` (the
-  slug is read from the tar's own `backup.json`, not caller-supplied — this
-  is what both `finish_partial/2` and the `POST /backups/new/upload` handler
-  call), and indexes it. Returns `{:ok, slug}`.
-  """
-  @spec put_file(binary(), GenServer.server()) :: {:ok, String.t()} | {:error, term()}
-  # path is internal/config-derived, not request input
-  # sobelow_skip ["Traversal.FileModule"]
-  def put_file(tar, server \\ __MODULE__) when is_binary(tar) do
-    with {:ok, %{backup: backup}} <- Vagus.Backup.read(tar),
-         slug <- backup["slug"],
-         :ok <- validate_slug(slug),
-         path <- Path.join(dir(server), "#{slug}.tar"),
-         :ok <- File.write(path, tar) do
-      entry = %{backup: backup, path: path, size_bytes: byte_size(tar)}
-      :ok = GenServer.call(server, {:put_index, slug, entry})
-      {:ok, slug}
-    end
-  end
-
-  @doc """
-  `put_file/2` for a tar already on disk (the upload route's
-  `Plug.Upload` spool file — audit C6): validated via
+  Stores a backup tar already on disk (the upload route's `Plug.Upload`
+  spool file — audit C6) as `<slug>.tar`, the slug read from its own
+  `backup.json`, and indexes it. Returns `{:ok, slug}`. Validated via
   `Vagus.Backup.read_file/1` (only `backup.json` is loaded, never the
   multi-GB tar) and `File.cp/2`'d into the backup dir rather than read
   into a BEAM binary and rewritten. The source file is the caller's to
@@ -97,12 +77,16 @@ defmodule Vagus.Backups do
   @spec put_path(Path.t(), GenServer.server()) :: {:ok, String.t()} | {:error, term()}
   # path is internal/config-derived, not request input
   # sobelow_skip ["Traversal.FileModule"]
-  def put_path(src, server \\ __MODULE__) do
+  def put_path(src, server \\ __MODULE__), do: store_path(src, server, &File.cp/2)
+
+  # path is internal/config-derived, not request input
+  # sobelow_skip ["Traversal.FileModule"]
+  defp store_path(src, server, transfer) do
     with {:ok, %{backup: backup}} <- Vagus.Backup.read_file(src),
          slug <- backup["slug"],
          :ok <- validate_slug(slug),
          path <- Path.join(dir(server), "#{slug}.tar"),
-         :ok <- File.cp(src, path),
+         :ok <- transfer.(src, path),
          {:ok, %File.Stat{size: size}} <- File.stat(path) do
       entry = %{backup: backup, path: path, size_bytes: size}
       :ok = GenServer.call(server, {:put_index, slug, entry})
@@ -199,8 +183,12 @@ defmodule Vagus.Backups do
         extra: handle.extra
       }
 
-      with {:ok, tar} <- Vagus.Backup.create(spec, date: handle.date),
-           do: put_file(tar, handle.server)
+      # Only a rename: a copy interrupted partway would leave a truncated
+      # `<slug>.tar` visible over a valid older backup.
+      outer = Path.join(handle.staging_dir, ".outer.tar")
+
+      with {:ok, ^outer} <- Vagus.Backup.create(spec, date: handle.date, to: outer),
+           do: store_path(outer, handle.server, &File.rename/2)
     end
   after
     discard_partial(handle)
@@ -366,7 +354,8 @@ defmodule Vagus.Backups do
   defp staged(staging_dir, addon_slugs) do
     inner = Enum.map(addon_slugs, &%{slug: &1, inner: Path.join(staging_dir, "#{&1}.tar.gz")})
 
-    case Enum.find(inner, &(not File.regular?(&1.inner))) do
+    # lstat: a symlink staged in place of a tar is not one.
+    case Enum.find(inner, &(not match?({:ok, %File.Stat{type: :regular}}, File.lstat(&1.inner)))) do
       nil -> {:ok, inner}
       %{slug: slug} -> {:error, {:not_staged, slug}}
     end

@@ -167,9 +167,8 @@ defmodule Vagus.App.Steps do
 
     path = Path.join(dir, "#{config.slug}.tar.gz")
 
-    with {:ok, gz, _size} <- Vagus.Backup.addon_tar(addon),
-         :ok <- File.mkdir_p(dir),
-         :ok <- File.write(path, gz) do
+    with :ok <- File.mkdir_p(dir),
+         :ok <- Vagus.Backup.write_addon_tar(addon, path) do
       {:ok, path}
     end
   end
