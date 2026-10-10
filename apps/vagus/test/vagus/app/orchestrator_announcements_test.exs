@@ -1,7 +1,9 @@
 defmodule Vagus.App.OrchestratorAnnouncementsTest do
-  # Real app processes announce themselves to the registered Orchestrator, so
-  # the test's takes that name from the app tree's, and the steps stub is
-  # global: neither may be shared with an async test's app processes.
+  # Real app processes announce themselves to whichever process holds the
+  # registered `Orchestrator` name, so each test stops the application tree's
+  # Orchestrator, starts its own under that name, and restarts the tree's on
+  # exit. The name and the global steps stub would otherwise reach an async
+  # test's app processes, so this module is not async.
   use ExUnit.Case, async: false
 
   import Vagus.AppFixtures

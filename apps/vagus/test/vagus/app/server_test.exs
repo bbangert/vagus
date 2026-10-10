@@ -986,6 +986,26 @@ defmodule Vagus.App.ServerTest do
       refute_receive {:step, :start, _, _}, 100
     end
 
+    # A native app gets no halt, so a shutdown that never happened leaves
+    # nothing else to revive one whose restart it suppressed.
+    test "an app whose restart a shutdown suppressed is started by the boot after it" do
+      {_slug, pid} = installed(%{}, state: :started)
+      boot = op(pid, {:boot_start, %{}})
+      answer(:start, {:ok, @started})
+      assert :ok = Task.await(boot)
+
+      :persistent_term.put({Vagus.Host.Shutdown, :in_flight}, true)
+      on_exit(fn -> :persistent_term.erase({Vagus.Host.Shutdown, :in_flight}) end)
+      send(pid, {:docker_event, %{id: "c1", action: "die", exit_code: 1}})
+      assert %{last_event: {:exited, 1}} = data(pid)
+      :persistent_term.erase({Vagus.Host.Shutdown, :in_flight})
+
+      boot = op(pid, {:boot_start, %{running?: false}})
+      answer(:start, {:ok, @started})
+      assert :ok = Task.await(boot)
+      refute_receive {:step, :start, _, _}, 100
+    end
+
     test "a halt lets the resume after it apply the boot rule again" do
       {slug, pid} = installed(%{}, state: :started)
       boot = op(pid, {:boot_start, %{}})

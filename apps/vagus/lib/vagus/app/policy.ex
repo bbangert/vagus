@@ -294,9 +294,15 @@ defmodule Vagus.App.Policy do
       timer = {:timer, :retry, backoff(data), {:retry, data.container_id}}
       {%{data | attempt: data.attempt + 1}, effects ++ [timer]}
     else
-      {data, effects}
+      {rebootable(data), effects}
     end
   end
+
+  # A restart a shutdown suppressed is owed by the boot that follows if the
+  # shutdown never happens, and a native app gets no halt to re-arm it. The
+  # Server initialises `booted`; clearing it is policy, so it lives here.
+  defp rebootable(%{shutting_down: true} = data), do: Map.put(data, :booted, false)
+  defp rebootable(data), do: data
 
   @doc """
   One URL-probe result (`:healthy`, `:unhealthy`, or `:skip` when the probe
@@ -316,7 +322,7 @@ defmodule Vagus.App.Policy do
 
     if restart?(data, data.shutting_down),
       do: retry(data, []),
-      else: observe(data, {:failed, :unhealthy}, [])
+      else: observe(rebootable(data), {:failed, :unhealthy}, [])
   end
 
   @doc "The next URL-probe tick."

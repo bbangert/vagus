@@ -154,11 +154,12 @@ defmodule Vagus.App.Server do
 
   defp event(:state_timeout, :expire, :new, _data), do: {:stop, :normal}
 
-  # At most one boot rule since this process started or last halted. The
-  # Orchestrator replays every announcement made mid-boot because it cannot
-  # tell, without a race, which processes a stage already reached; this is
-  # what keeps a replay from starting a `once` app that already exited, or
-  # retrying a failed start outside the restart ladder.
+  # At most one boot rule since this process started, last halted, or had a
+  # restart suppressed by a shutdown (`Policy`). The Orchestrator replays
+  # every announcement made mid-boot because it cannot tell, without a race,
+  # which processes a stage already reached; this is what keeps a replay from
+  # starting a `once` app that already exited, or retrying a failed start
+  # outside the restart ladder.
   defp event({:call, from}, {op, _args}, _state, %{booted: true})
        when op in [:boot_start, :resume],
        do: {:keep_state_and_data, [{:reply, from, :ok}]}
