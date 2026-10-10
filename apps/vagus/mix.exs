@@ -13,6 +13,9 @@ defmodule Vagus.MixProject do
       lockfile: "../../mix.lock",
       elixir: "~> 1.20",
       start_permanent: Mix.env() == :prod,
+      compilers: [:elixir_make | Mix.compilers()],
+      make_targets: ["all"],
+      make_clean: ["mix_clean"],
       elixirc_paths: elixirc_paths(Mix.env()),
       deps: deps(),
       # NOTE on PLT staleness: dialyxir NEVER checks/updates the PLT from an
@@ -137,6 +140,10 @@ defmodule Vagus.MixProject do
       # Supervises the balena-engine daemon as an OS process (engine
       # supervision, see Vagus.Engine.Manager).
       {:muontrap, "~> 1.8"},
+
+      # Builds c_src/vagus_walk (Vagus.Backup.Walk's port) with the target
+      # toolchain's $CC under Nerves and the host compiler otherwise.
+      {:elixir_make, "~> 0.10", runtime: false},
 
       # BlueZ stack bring-up (dbus-daemon + bluetoothd under MuonTrap).
       # Vagus starts only the daemon slice of its tree — HA Core is the BLE
