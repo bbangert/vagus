@@ -6,7 +6,7 @@ defmodule Vagus.Host.ShutdownTest do
   process, so it reports back by message.
 
   `async: false` because the in-flight flag is one `:persistent_term` key
-  that `Vagus.Addon.Watchdog` reads too; `setup` erases it around each test.
+  that every app process reads too; `setup` erases it around each test.
   """
 
   use ExUnit.Case, async: false

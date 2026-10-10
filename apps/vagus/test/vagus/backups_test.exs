@@ -4,9 +4,8 @@ defmodule Vagus.BackupsTest do
   the `create_partial`/`restore_partial` orchestration on top of it (§A4).
 
   Each test starts its own named `Vagus.Backups` instance pointed at a tmp
-  dir (never touches the app's supervised singleton) but does read/write the
-  real (globally-supervised) `Vagus.Addon.State` — same pattern
-  `test/vagus/addon/manager_test.exs` uses. `async: false` because
+  dir (never touches the app's supervised singleton) but installs real apps
+  through `Vagus.AppFixtures`. `async: false` because
   `Vagus.Addon.Backend.Fake`'s call recorder is a single global table.
   """
   use ExUnit.Case, async: false

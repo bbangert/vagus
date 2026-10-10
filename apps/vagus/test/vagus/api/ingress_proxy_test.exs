@@ -175,9 +175,8 @@ defmodule Vagus.API.IngressProxyTest do
   `Vagus.API.Dispatcher`, exactly as `Vagus.API.Supervisor` wires it on a
   real device), and `Vagus.Ingress.Finch` (the proxy's outbound pool).
   `config :vagus, :ingress_target_fun` is pointed at the fake add-on's port
-  for the duration of each test, standing in for a real docker
-  inspect/`Vagus.Addon.State` lookup — `Vagus.App.ingress_target/1` itself
-  needs a real docker daemon and is out of scope for a hermetic suite.
+  for the duration of each test, standing in for
+  `Vagus.App.ingress_target/1`, which needs a running app process.
   """
   use ExUnit.Case, async: false
 

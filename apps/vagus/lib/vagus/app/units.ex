@@ -65,7 +65,8 @@ defmodule Vagus.App.Units do
     exception -> Logger.error("Stale backup staging not swept: #{Exception.message(exception)}")
   end
 
-  # One app whose process cannot start must not take the others down with it.
+  # Always `:ok`: one app whose process cannot start is logged, and must not
+  # take the others down with it.
   @spec ensure(String.t()) :: :ok
   def ensure(slug) do
     case Instances.ensure(slug) do

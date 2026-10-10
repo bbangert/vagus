@@ -119,12 +119,7 @@ jobs:
       - name: Fetch deps
         run: mix deps.get
 
-      # Full suite — no exclusions. The former `@tag :flaky` quarantine
-      # (BootStarterTest's global-Fake assertions, WatchdogTest's wall-clock
-      # backoff-ratio test) was resolved by hardening: BootStarter now scopes
-      # to `Fake.calls_for/1` (per-add-on, immune to a foreign writer) and the
-      # watchdog backoff asserts the computed schedule via an injected `:sleep`
-      # instead of measured time.
+      # Full suite — no exclusions.
       - name: Tests
         run: mix test
 

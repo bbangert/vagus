@@ -182,7 +182,7 @@ defmodule Vagus.API.RouterTest do
     # instead of `[]` — which crashed Core's hassio coordinator once already
     # (`/store`'s missing `installed`, session 6). `is_list/1` pins exactly
     # that, and unlike `== []` it is race-free: every path below except
-    # `/mounts` projects SHARED singleton state (`Vagus.Addon.State`, the
+    # `/mounts` projects SHARED singleton state (the installed apps, the
     # jobs registry) that concurrent async test files legitimately write to.
     #
     # This file's async-required header used to claim that race "does not
@@ -224,7 +224,7 @@ defmodule Vagus.API.RouterTest do
 
   describe "GET /ingress/panels" do
     # Global emptiness cannot be asserted here: this file is async and the
-    # panels map projects the SHARED `Vagus.Addon.State`, which concurrent
+    # panels map projects every installed app, which concurrent
     # test files legitimately install add-ons into (seed-6 interleaving
     # with auth_tier_gate_test's `core_secretful`, 2026-07-30). Content
     # mapping is pinned with controlled slugs in ingress_router_test.exs

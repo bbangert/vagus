@@ -14,9 +14,9 @@ defmodule Vagus.App.Supervisor do
   def init(_opts) do
     children = [
       {Registry, keys: :unique, name: Vagus.App.Directory},
-      # Wider than this tree's own budget so a few app processes crash-looping
-      # on a bad State entry do not take the directory down with them; each
-      # child's `:transient` restart is the first line.
+      # Wider than this tree's own budget so a few app processes in an
+      # abnormal runtime crash loop do not take the directory down with them.
+      # A bad file never spends it: that process returns `:ignore` from init.
       {DynamicSupervisor,
        name: Vagus.App.Instances, strategy: :one_for_one, max_restarts: 10, max_seconds: 60},
       Vagus.App.Orchestrator

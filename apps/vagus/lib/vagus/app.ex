@@ -12,7 +12,7 @@ defmodule Vagus.App do
   require Logger
 
   alias Vagus.Addon.{Config, Store}
-  alias Vagus.App.{Directory, Instances, Policy, Steps}
+  alias Vagus.App.{Directory, Instances, Policy}
   alias Vagus.App.File, as: AppFile
   alias Vagus.Network
 
@@ -296,9 +296,6 @@ defmodule Vagus.App do
     end
   end
 
-  @spec resolve_ingress_token(String.t()) :: {:ok, String.t()} | :error
-  def resolve_ingress_token(token), do: Vagus.Ingress.resolve_token(token)
-
   @doc """
   Where ingress traffic for `slug` goes: `{ip, port, stream?}`, `stream?`
   being the config's `ingress_stream`. A host-network app answers on
@@ -500,10 +497,6 @@ defmodule Vagus.App do
   # as failed. The process has logged the save.
   defp unsaved_ok({:error, {:persist, _reason}}), do: :ok
   defp unsaved_ok(result), do: result
-
-  @doc "Whether `slug` may run in-BEAM, with no container behind it."
-  @spec native_allowed?(String.t()) :: boolean()
-  def native_allowed?(slug), do: Steps.native_allowed?(slug)
 
   # An operation can take as long as an image pull, so there is no call
   # deadline; each step inside it has its own.

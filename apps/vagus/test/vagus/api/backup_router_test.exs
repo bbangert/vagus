@@ -1,8 +1,7 @@
 defmodule Vagus.API.BackupRouterTest do
   @moduledoc """
   M4-P6-T2: the `/backups...` HTTP surface (§A4) — list/info/create/restore/
-  download/upload/delete/reload, wired to `Vagus.Backups` + `Vagus.Addon.
-  Manager`.
+  download/upload/delete/reload, wired to `Vagus.Backups` + `Vagus.App`.
 
   Unlike most router tests, `Vagus.Backups` is a real supervised singleton
   whose backup directory is resolved once at `Vagus.Application` boot — so

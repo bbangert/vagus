@@ -215,3 +215,53 @@ from the store path, and the no-skel control failing outright.
 Supervisor add-on, which has no `dsp:` — so these two mounts never appear in
 that spec and cannot be registered there without failing its "each declared
 divergence is still real" assertion. They are ledgered here instead.
+
+---
+
+## App lifecycle: where Vagus's apps behave differently
+
+The lifecycle itself is described in [`app-lifecycle.md`](app-lifecycle.md).
+These are the points where it knowingly differs from upstream's `apps/app.py`
+and `backups/backup.py`.
+
+**No watchdog throttle window.** Upstream's `_restart_after_problem`
+(`supervisor/apps/app.py`) is a job with `JobThrottle.GROUP_RATE_LIMIT`, at
+most 10 calls per 30 minutes (`WATCHDOG_THROTTLE_MAX_CALLS`,
+`WATCHDOG_THROTTLE_PERIOD`), on top of `WATCHDOG_MAX_ATTEMPTS = 5` with a
+delay of `WATCHDOG_RETRY_SECONDS * (1 << max(attempts - 1, 0))`. Vagus keeps
+the attempts and the doubling (first try at once, then 10 s doubling) and
+drops the window. Any start that is not a ladder retry zeroes the count; a
+retry start keeps it until it has stayed up 120 s, so a container that dies a
+second after each retry runs out of attempts without a window, and a window
+would be a second counter with its own state to explain.
+
+**The native broker is revived without a cap or a watchdog flag.** Upstream
+has no in-process app. The broker is what every other app's MQTT leans on,
+and nothing outside the BEAM restarts it, so an `auto` native app is retried
+5 s after a crash, then every 30 s, indefinitely.
+
+**The app's API token is never persisted, so a restarted app process
+replaces its running container.** Upstream keeps `access_token` in the app's
+persisted data (`self.persist[ATTR_ACCESS_TOKEN]` in `supervisor/apps/app.py`)
+and attaches to a running container on load (`self.instance.attach`). Vagus mints the token per start and holds it only in the app's
+process: a token on flash outlives the container it was minted for. The
+cost is that an app process that restarts (or a Vagus restart without a
+reboot) recreates a wanted app's container under a fresh token, whatever its
+boot mode, since the old container's token no longer authenticates.
+
+**A busy or failing app fails the whole backup; a restore stops at the first
+failing app.** Upstream's `Backup.store_apps` (`supervisor/backups/backup.py`)
+catches each app's `BackupError` with `capture_error` and carries on with the
+rest, and `Backup.restore_apps` logs each failure, marks the result
+unsuccessful and continues. Vagus snapshots and restores each app through that app's own
+operation and returns the first failure (`{:busy, slug}` with upstream's
+"Another job is running for job group app_<slug>" text): a backup that
+silently lacks an app the caller named is not one they asked for.
+
+**A DNS name two apps share goes to the first.** `foo_bar` and `foo-bar` map
+to the same name. Upstream's `PluginDns.add_host` (`supervisor/plugins/dns.py`)
+finds an existing entry holding any of the names and replaces it, so the app
+written last wins. Vagus gives the name to whichever
+app's process registered it first and logs the second, which runs without a
+record: a second app cannot take over a name a running app already answers
+to, and the directory's unique keys make the refusal free.
