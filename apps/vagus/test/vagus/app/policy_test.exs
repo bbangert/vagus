@@ -228,15 +228,6 @@ defmodule Vagus.App.PolicyTest do
       assert data.attempt == 1
     end
 
-    test "a broker DOWN while the host shuts down is not revived, and owes the next boot" do
-      data =
-        running(%{config: native_config(), slug: "core_mqtt", shutting_down: true, booted: true})
-
-      {data, effects} = Policy.on_event({:broker_down, :killed}, data)
-      refute Enum.any?(effects, &match?({:timer, :retry, _, _}, &1))
-      assert data.booted == false
-    end
-
     test "a broker DOWN for an app that is not running is ignored" do
       data = app(%{config: native_config()})
       assert Policy.on_event({:broker_down, :normal}, data) == {data, []}

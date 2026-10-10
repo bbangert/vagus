@@ -143,7 +143,6 @@ defmodule Vagus.App.Server do
       broker_ref: nil,
       retired: false,
       killed: [],
-      booted: false,
       shutting_down: shutdown?()
     })
   end
@@ -153,16 +152,6 @@ defmodule Vagus.App.Server do
     do: event(type, content, state, %{data | shutting_down: shutdown?()})
 
   defp event(:state_timeout, :expire, :new, _data), do: {:stop, :normal}
-
-  # At most one boot rule since this process started, last halted, or had a
-  # restart suppressed by a shutdown (`Policy`). The Orchestrator replays
-  # every announcement made mid-boot because it cannot tell, without a race,
-  # which processes a stage already reached; this is what keeps a replay from
-  # starting a `once` app that already exited, or retrying a failed start
-  # outside the restart ladder.
-  defp event({:call, from}, {op, _args}, _state, %{booted: true})
-       when op in [:boot_start, :resume],
-       do: {:keep_state_and_data, [{:reply, from, :ok}]}
 
   defp event({:call, from}, {op, args} = command, state, data) when op in @ops do
     case Policy.admit(command, state) do
@@ -374,8 +363,6 @@ defmodule Vagus.App.Server do
   defp command(op, args, from, state, data), do: begin_op(op, args, from, state, data)
 
   defp boot(from, reported, data) do
-    data = %{data | booted: true}
-
     case Policy.boot(data, running?(data, reported)) do
       :start ->
         begin_op(:start, %{}, from, :idle, data)
@@ -523,9 +510,8 @@ defmodule Vagus.App.Server do
   defp apply_effect(:monitor_broker, {st, d, acts}), do: {st, monitor_broker(d), acts}
   defp apply_effect(:idle, {_st, d, acts}), do: {:idle, %{d | run: nil, retired: false}, acts}
 
-  # A halt stops the app, so the resume after it owes the boot rule again.
   defp apply_effect(:shutting_down, {_st, d, acts}),
-    do: {:shutting_down, %{d | run: nil, retired: false, booted: false}, acts}
+    do: {:shutting_down, %{d | run: nil, retired: false}, acts}
 
   defp apply_effect(:exit, {_st, d, acts}), do: {:exit, d, acts}
 

@@ -378,23 +378,16 @@ starts the same apps.
 `boot_start` with `:shutting_down`, and the facade sends it `resume`, which
 applies the same boot rule.
 
-**An app process that loaded a saved file** announces itself by calling
-`Vagus.App.Orchestrator.up/1` from its `init/1`; one created by an install
-enters `:new` without announcing, as nothing has been installed to boot.
-Once boot is over, the Orchestrator inspects that app's container and sends
-`boot_start` with the answer. While booting it remembers every announcement
-and replays them all when boot ends, since a successor whose stage reached
-the process it replaced would otherwise own neither its token nor its
-running container until the next boot.
-
-An app process accepts one boot rule per lifetime, counted again from each
-completed halt (a halt stops the app, so the `resume` after it applies the
-rule afresh). A replay to a process its stage already reached therefore does
-nothing, and one its stage missed gets exactly one: a second would start a
-`once` app that had already exited, or retry a failed start outside its
-restart ladder. The rule is the process's to keep, not the Orchestrator's,
-because the Orchestrator cannot tell which process a stage's `boot_start`
-reached without racing that process's restart.
+**An app process that restarts** calls `Vagus.App.Orchestrator.up/1` from
+its `init/1`; one created by an install enters `:new` without announcing, as
+nothing has been installed to boot. After the Orchestrator has reached `:up`,
+it inspects that app's container at once and sends `boot_start` with the
+answer. While boot is still running the announcement is ignored: the process
+is covered by its stage if that stage has not run yet, and otherwise stays
+idle until the next boot or a user start (a running container keeps running,
+unowned, until then). A correct replay would need the Orchestrator to know
+which process a stage reached, and every attempt to infer it raced, so this
+narrow window, a process crash inside the boot minute, is accepted instead.
 
 **Once-per-VM guards.** Two `:persistent_term` flags survive any restart of
 this tree: the sweep's `{Vagus.App.Units, :swept}`, and

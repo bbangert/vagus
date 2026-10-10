@@ -1,7 +1,6 @@
 defmodule Vagus.App.OrchestratorTest do
   # Every unit is injected and reports to the test process, so nothing here
-  # touches the engine or reaches Core. Real app processes announcing
-  # themselves are `Vagus.App.OrchestratorAnnouncementsTest`'s.
+  # starts an app, touches the engine or reaches Core.
   use ExUnit.Case, async: true
 
   import ExUnit.CaptureLog
@@ -651,21 +650,17 @@ defmodule Vagus.App.OrchestratorTest do
     assert %{phase: :up} = await_boot(name)
   end
 
-  test "an app reported up after its stage ran is given its boot rule once, when boot ends" do
-    hold = held(self(), :core)
-    name = start_orchestrator([app("early", "initialize")], %{core_start: fn _ -> hold.() end})
-    assert_receive {:boot_start, "early"}
-    assert_receive {:core, core}
+  test "an app reported up is ignored while booting" do
+    test_pid = self()
+    gates = Map.new([:engine, :network, :api], &{&1, gate(test_pid, &1)})
+    gates = Map.put(gates, :tree, blocking(test_pid, :tree))
 
-    Orchestrator.up("early", name)
+    name = start_orchestrator([], %{gates: gates}, gate_timeout: 60_000)
+    assert_receive {:tree, _pid}
+
+    Orchestrator.up("late", name)
     assert %{phase: :booting} = :sys.get_state(name)
-    refute_received {:boot_start, "early"}
-
-    send(core, :release)
-    assert :complete in collect_until(:complete)
-    assert %{phase: :up} = await_boot(name)
-    assert_receive {:boot_start, "early"}
-    refute_receive {:boot_start, "early"}, 100
+    refute_received {:boot_start, "late"}
   end
 
   test "an app reported up once boot is over is given its boot rule" do
