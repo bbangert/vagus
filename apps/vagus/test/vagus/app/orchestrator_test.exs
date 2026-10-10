@@ -709,14 +709,17 @@ defmodule Vagus.App.OrchestratorTest do
 
       messages = collect_until(:complete)
       assert %{phase: :up} = await_boot(Orchestrator)
-      # A `once` app is not awaited, so its `boot_start` may trail `:complete`.
-      Process.sleep(100)
-      messages = messages ++ drain()
 
+      # A `once` app is not awaited, so its `boot_start` may trail `:complete`;
+      # `collect_until` already consumed whichever arrived before it.
       for slug <- [early, once] do
         assert [_pid] = Registry.lookup(Vagus.App.Directory, {:slug, slug})
-        assert Enum.count(messages, &(&1 == {:boot_start, slug})) == 1
+        seen = Enum.count(messages, &(&1 == {:boot_start, slug}))
+        assert seen <= 1
+        if seen == 0, do: assert_receive({:boot_start, ^slug})
       end
+
+      refute_receive {:boot_start, _}, 100
     end
 
     test "a successor started after its stage ran is given its boot rule again once boot ends" do

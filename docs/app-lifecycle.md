@@ -378,8 +378,9 @@ starts the same apps.
 `boot_start` with `:shutting_down`, and the facade sends it `resume`, which
 applies the same boot rule.
 
-**Every app process** calls `Vagus.App.Orchestrator.up/1` from its
-`init/1`. Once boot is over, the Orchestrator inspects that app's container
+**An app process that loaded a saved file** calls
+`Vagus.App.Orchestrator.up/1` from its `init/1`; one created by an install
+enters `:new` without announcing, as nothing has been installed to boot. Once boot is over, the Orchestrator inspects that app's container
 and sends `boot_start` with the answer. Mid-boot it tells, by pid, the processes its
 own `init/1` started from any other. The announcement of one it started is
 covered by its stage: replaying it too would find a `once` app that had
