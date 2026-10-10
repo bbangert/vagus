@@ -475,29 +475,77 @@ defmodule Vagus.API.AuthTierGateTest do
       refute log =~ "authz/"
     end
 
-    # Which service a body names and who owns a message are not in the path.
+    # Neither the service a body names nor a message's owner is in the path.
     test "the discovery rows are left to the handler" do
+      owner =
+        addon_token("pred_gate_disc_owner", %{
+          hassio_api: true,
+          hassio_role: "default",
+          discovery: ["mqtt"]
+        })
+
       admin = addon_token("pred_gate_admin", %{hassio_api: true, hassio_role: "admin"})
-      undeclared = Jason.encode!(%{service: "mqtt", config: %{}})
+      message = Jason.encode!(%{service: "mqtt", config: %{}})
 
-      for {method, path, body, status} <- [
-            {:get, "/discovery", nil, 401},
-            {:get, "/discovery/8ced93a7", nil, 401},
-            {:post, "/discovery", undeclared, 403},
-            {:delete, "/discovery/8ced93a7", nil, 404}
+      discovery = fn method, path, body, token ->
+        with_log(fn ->
+          conn(method, path, body)
+          |> put_req_header("content-type", "application/json")
+          |> put_req_header("x-supervisor-token", token)
+          |> Router.call(@opts)
+        end)
+      end
+
+      {created, _log} = discovery.(:post, "/discovery", message, owner)
+      assert %{"data" => %{"uuid" => uuid}} = Jason.decode!(created.resp_body)
+
+      for {method, path, body, status, said} <- [
+            {:get, "/discovery", nil, 401, "unauthorized"},
+            {:get, "/discovery/#{uuid}", nil, 401, "unauthorized"},
+            {:post, "/discovery", message, 403, "Caller may not provide this discovery"},
+            {:delete, "/discovery/#{uuid}", nil, 403, "Caller does not own this discovery"}
           ] do
-        {conn, log} =
-          with_log(fn ->
-            conn(method, path, body)
-            |> put_req_header("content-type", "application/json")
-            |> put_req_header("x-supervisor-token", admin)
-            |> Router.call(@opts)
-          end)
+        {conn, log} = discovery.(method, path, body, admin)
 
-        assert conn.status == status, "#{method} #{path} answered #{conn.status}"
+        assert {conn.status, Jason.decode!(conn.resp_body)} == {status, refused(said)},
+               "#{method} #{path}"
+
         assert {_route, _handler} = conn.private.plug_route
         refute log =~ "authz/", path
       end
+
+      {deleted, _log} = discovery.(:delete, "/discovery/#{uuid}", nil, owner)
+      assert deleted.status == 200
+    end
+
+    # The message would otherwise carry bytes JSON cannot hold, and the
+    # envelope raised: a 500 from the gate and from the handler alike.
+    test "a service name that is not UTF-8 is refused, by the gate and by the handler" do
+      manager = addon_token("pred_gate_manager", %{hassio_api: true, hassio_role: "manager"})
+
+      for {method, message} <- [
+            get: "Caller not authorized for this service",
+            post: "Caller may not provide this service",
+            delete: "Caller may not delete this service"
+          ] do
+        assert gate_refusal(method, "/services/zz%FFmarker", manager) ==
+                 {403, refused(message), "authz/bypass+requires"}
+      end
+
+      # Core may read any service, so only the handler refuses it a write.
+      for {method, message} <- [
+            post: "Caller may not provide this service",
+            delete: "Caller may not delete this service"
+          ] do
+        {conn, log} = with_log(fn -> call_as_core(method, "/services/zz%FFmarker") end)
+
+        assert {conn.status, Jason.decode!(conn.resp_body)} == {403, refused(message)}
+        assert {"/services/:service", _handler} = conn.private.plug_route
+        refute log =~ "marker"
+      end
+
+      {_conn, log} = with_log(fn -> call(:get, "/services/zz%FFmarker", manager) end)
+      refute log =~ "marker"
     end
   end
 

@@ -62,13 +62,14 @@ defmodule Vagus.API.Tiers do
       core lifecycle, changelog/documentation). The audit's standing rule is
       that stricter is fine; those stay as they were.
 
-  ## Method is deliberately not consulted
+  ## Authorisation ignores the method
 
   Upstream's regexes are matched against `request.path` alone —
   `token_validation` never looks at `request.method`. Adding a method
-  dimension here would be a divergence that reads like a hardening, so the
-  table is path-only and the handlers keep whatever method-specific rules they
-  already had.
+  dimension here would be a divergence that reads like a hardening, so no
+  row's tier or predicate reads it and the handlers keep whatever
+  method-specific rules they already had. Only a refusal's wording is
+  per-method (`answer:`, below).
 
   ## Pattern language
 
@@ -89,42 +90,32 @@ defmodule Vagus.API.Tiers do
 
   ## Columns
 
-  A row may carry a third element, a keyword of columns. Three are
-  predicates: grants a tier cannot express, which `Vagus.API.Authz` evaluates
-  from the principal and the action after the lattice. A caller has to
-  satisfy the tier and every predicate.
+  A row's third element holds grants a tier cannot express. `Vagus.API.Authz`
+  requires the tier and every predicate:
 
-    * `subject: :self` — an app only where the path's second segment is
-      `self` or its own slug. Core passes: whether a slug is safe to resolve
-      is its handler's check, not a grant.
-    * `caller: :supervisor` — Core only, whatever the tier. The row keeps
-      upstream's tier so the diff still reads one-to-one.
-    * `requires: :auth_api` — an app whose config sets `auth_api`. Core is
-      not an app and does not pass.
-    * `requires: {:services_role, :any}` — an app declaring any role for the
-      service in the path's second segment, or Core. Reading needs any role
-      and providing needs `provide`; rows carry no method, so the row holds
-      what both share and the handler keeps the rest.
+    * `subject: :self` — an app, only for `self` or its own slug in the second
+      segment. Core passes: whether a slug is safe to resolve is path safety,
+      which stays with the handler.
+    * `caller: :supervisor` — Core only. The row keeps upstream's tier so the
+      diff still reads one-to-one.
+    * `requires: :auth_api` — an app's grant, so Core does not pass.
+    * `requires: {:services_role, :any}` — any role for the service in the
+      second segment, or Core. Provide against read is method-specific and
+      stays with the handler.
 
-  The other two are not predicates:
+  `answer: %{method => kind}` words a predicate's refusal as the route's own
+  handler does (`Vagus.API.Refusal`), so a caller cannot tell which of the two
+  refused. A method without one is not routed there and gets the router's 404.
 
-    * `answer: %{method => {status, message}}` — what a caller failing the
-      row's predicates is told: what the route's own handler says, per method
-      it serves. The handlers keep their guards, and a caller must not be
-      able to tell which of the two refused. A method with no answer is one
-      the router does not serve on that path, and gets the router's 404. This
-      words a refusal and decides nothing: the predicate refuses every
-      method alike.
-    * `handler: reason` — the grant depends on something that is neither the
-      principal nor the action (who owns a stored message, what a body
-      names), so the handler is the policy and the row only records that.
-      Nothing is enforced from it.
+  `handler: reason` marks a grant that depends on neither the principal nor
+  the action (a stored message's owner, a body's contents). Nothing is
+  enforced from it.
 
-  A row whose only literal difference from a broader one is `self` in the
-  second segment carries no `subject:`: it would hold for every app.
+  A literal-`self` row carries no `subject:`; it would hold for every app.
   """
 
   alias Vagus.Addon.Config
+  alias Vagus.API.Tiers.Row
   alias Vagus.Core.Reserved
 
   @type tier ::
@@ -146,14 +137,12 @@ defmodule Vagus.API.Tiers do
           subject: :self,
           caller: :supervisor,
           requires: :auth_api | {:services_role, :any},
-          answer: %{optional(String.t()) => {401 | 403, String.t() | :service}},
+          answer: %{optional(String.t()) => Vagus.API.Refusal.kind()},
           handler: atom()
         ]
 
-  @not_core %{"POST" => {401, "unauthorized"}}
-  @not_this_app %{"GET" => {403, "Not authorized for this add-on"}}
-  @no_auth_api {403, "Caller is not allowed to access the auth API"}
-  @service_answers Map.new(~w(GET POST DELETE), &{&1, {403, :service}})
+  @not_this_app %{"GET" => :not_this_app}
+  @not_core %{"POST" => :not_core}
 
   # fmt: mirrors `security.py`'s own `# fmt: off` block. Read this beside it.
   @table [
@@ -201,7 +190,9 @@ defmodule Vagus.API.Tiers do
     {["addons", "self", "restart"], :bypass},
     {["addons", "self", "uninstall"], :bypass},
     {["info"], :bypass},
-    {["services", :_], :bypass, requires: {:services_role, :any}, answer: @service_answers},
+    {["services", :_], :bypass,
+     requires: {:services_role, :any},
+     answer: %{"GET" => :service, "POST" => :service, "DELETE" => :service}},
     {["services", :*], :bypass},
     # Core reads these and apps write them, on the same two paths, and a row
     # cannot tell a GET from a POST. What an app may write depends on the
@@ -210,7 +201,7 @@ defmodule Vagus.API.Tiers do
     {["discovery", :_], :bypass, handler: :ownership},
     {["discovery", :*], :bypass},
     {["auth"], :bypass,
-     requires: :auth_api, answer: %{"GET" => @no_auth_api, "POST" => @no_auth_api}},
+     requires: :auth_api, answer: %{"GET" => :no_auth_api, "POST" => :no_auth_api}},
 
     # -- no_security_check ----------------------------------------------------
     # `/supervisor/ping`, and `/(store/)?addons/<RE_SLUG>/(logo|icon)` from
@@ -290,6 +281,9 @@ defmodule Vagus.API.Tiers do
     # panel's ingress token (see `Vagus.API.AdminPanel`).
     {["addons", "vagus", "info"], :default, caller: :supervisor, answer: @not_this_app},
     {["addons", :_, "info"], :default, subject: :self, answer: @not_this_app},
+    # A boot id of `info` is `/.+/info` too, and would otherwise leave the
+    # boots row below without its predicate.
+    {["addons", :_, "logs", "boots", "info"], :default, subject: :self, answer: @not_this_app},
     {[:+, "info"], :default},
 
     # -- role_access[homeassistant] (security.py L116-122) --------------------
@@ -315,17 +309,15 @@ defmodule Vagus.API.Tiers do
     # lands on the right tier by default.
     {["addons"], :manager},
     {["addons", "reload"], :manager},
-    # `/addons/{slug}/(?!security).+` — the negative lookahead is the
-    # `["addons", :_, "security"]` entry at the top of the table.
-    # Admin upstream. An admin-role app naming its own slug would otherwise
-    # clear its own protection.
-    {["addons", :_, "security"], :admin,
-     caller: :supervisor, answer: %{"POST" => {403, "unauthorized"}}},
+    # `/addons/{slug}/(?!security).+` — the negative lookahead is the two
+    # `security` rows here, admin as upstream. An admin-role app naming its
+    # own slug would otherwise clear its own protection.
+    {["addons", :_, "security"], :admin, caller: :supervisor, answer: %{"POST" => :forbidden}},
     {["addons", :_, "security", :*], :admin},
     # Upstream role-gates these, so a manager app reads any app's. Here it
     # reads its own.
     {["addons", :_, "options", "config"], :manager,
-     subject: :self, answer: %{"GET" => {403, "This can be only read by the app itself!"}}},
+     subject: :self, answer: %{"GET" => :self_only}},
     {["addons", :_, "stats"], :manager, subject: :self, answer: @not_this_app},
     {["addons", :_, "logs"], :manager, subject: :self, answer: @not_this_app},
     {["addons", :_, "logs", "latest"], :manager, subject: :self, answer: @not_this_app},
@@ -369,41 +361,7 @@ defmodule Vagus.API.Tiers do
     {["ingress", "validate_session"], :admin, caller: :supervisor, answer: @not_core}
   ]
 
-  @predicates [:subject, :caller, :requires]
-  @columns [:answer, :handler | @predicates]
-
-  # Checked here because `Vagus.API.Authz` reads the subject from the second
-  # segment of the decoded path, and because a misspelt column would
-  # otherwise be a predicate nobody evaluates.
-  @rows (for row <- @table do
-           {pattern, requirement, columns} =
-             case row do
-               {pattern, requirement} -> {pattern, requirement, []}
-               {pattern, requirement, columns} -> {pattern, requirement, columns}
-             end
-
-           unknown = Keyword.keys(columns) -- @columns
-
-           reads_subject? =
-             columns[:subject] != nil or match?({:services_role, _}, columns[:requires])
-
-           cond do
-             unknown != [] ->
-               raise "#{inspect(pattern)}: unknown columns #{inspect(unknown)}"
-
-             reads_subject? and Enum.at(pattern, 1) != :_ ->
-               raise "#{inspect(pattern)}: the subject must be the second segment"
-
-             columns[:handler] != nil and Keyword.take(columns, @predicates) != [] ->
-               raise "#{inspect(pattern)}: a handler-decided row enforces nothing"
-
-             is_map(columns[:answer]) != (Keyword.take(columns, @predicates) != []) ->
-               raise "#{inspect(pattern)}: a row has answers exactly when it has predicates"
-
-             true ->
-               {pattern, requirement, columns}
-           end
-         end)
+  @rows Enum.map(@table, &Row.validate!/1)
 
   # `security.py`'s `BLACKLIST`, checked before EVERYTHING else — before
   # `no_security_check`, before `token_validation`'s Core-token branch, before
@@ -482,9 +440,12 @@ defmodule Vagus.API.Tiers do
     end)
   end
 
-  @doc "The columns of `columns` that are predicates."
   @spec predicates(columns()) :: keyword()
-  def predicates(columns), do: Keyword.take(columns, @predicates)
+  defdelegate predicates(columns), to: Row
+
+  @doc false
+  @spec rows() :: [Row.t()]
+  def rows, do: @rows
 
   @doc """
   The tier a resolved caller holds.

@@ -226,6 +226,124 @@ defmodule Vagus.API.TiersTest do
     end
   end
 
+  # First match wins, so a value in a parameter position can hand a path to
+  # an earlier row: a boot id of `info` is `/.+/info`. A predicate row's paths
+  # have to keep the predicate whatever the parameters are.
+  describe "shadowing" do
+    @literals Tiers.rows()
+              |> Enum.flat_map(&elem(&1, 0))
+              |> Enum.filter(&is_binary/1)
+              |> Enum.uniq()
+
+    defp fill(pattern, at, value) do
+      pattern
+      |> Enum.with_index()
+      |> Enum.map(fn
+        {:_, ^at} -> value
+        {:_, _other} -> "zz"
+        {literal, _index} when is_binary(literal) -> literal
+      end)
+    end
+
+    # The same predicates, or a row no app passes at all. The tier may
+    # differ: that is upstream's to say, and the fixture pins it.
+    defp keeps?(columns, {chosen_requirement, chosen}) do
+      chosen_requirement == :supervisor or chosen[:caller] == :supervisor or
+        Tiers.predicates(chosen) == Tiers.predicates(columns)
+    end
+
+    test "no parameter value moves a predicate row's path to a row without the predicate" do
+      rows =
+        for {_pattern, _requirement, columns} = row <- Tiers.rows(),
+            Tiers.predicates(columns) != [],
+            do: row
+
+      assert length(rows) >= 14
+      assert "info" in @literals and "self" in @literals
+
+      for {pattern, _requirement, columns} <- rows,
+          {:_, at} <- Enum.with_index(pattern),
+          value <- ["zz" | @literals],
+          # `self` is what `subject: :self` asks for, so the literal-`self`
+          # rows need no predicate to say it.
+          not (value == "self" and at == 1 and columns[:subject] == :self) do
+        path = fill(pattern, at, value)
+
+        assert keeps?(columns, Tiers.required_with_predicates(path)),
+               "/#{Enum.join(path, "/")} is not held to #{inspect(Tiers.predicates(columns))}"
+      end
+    end
+
+    test "a boot id of `info` keeps upstream's tier and the app's own-slug rule" do
+      assert {:default, columns} =
+               Tiers.required_with_predicates(~w(addons core_ssh logs boots info))
+
+      assert Tiers.predicates(columns) == [subject: :self]
+
+      assert {:manager, _columns} =
+               Tiers.required_with_predicates(~w(addons core_ssh logs boots 0))
+    end
+  end
+
+  describe "a row is checked when the table is compiled" do
+    alias Vagus.API.Tiers.Row
+
+    @good {["addons", :_, "stats"], :manager, subject: :self, answer: %{"GET" => :not_this_app}}
+
+    test "a well-formed row passes, and a bare one gains empty columns" do
+      assert Row.validate!(@good) == @good
+      assert Row.validate!({["info"], :bypass}) == {["info"], :bypass, []}
+    end
+
+    test "each malformed row raises" do
+      answer = %{"GET" => :forbidden}
+
+      for {columns, fault} <- [
+            {[caller: :core, answer: answer], "unknown predicate"},
+            {[subject: :own, answer: answer], "unknown predicate"},
+            {[requires: {:services_role, :provide}, answer: answer], "unknown predicate"},
+            {[subjcet: :self, answer: answer], "unknown columns"},
+            {[subject: :self, subject: :self, answer: answer], "given twice"},
+            {[subject: :self], "answers exactly when"},
+            {[answer: answer], "answers exactly when"},
+            {[subject: :self, answer: %{"get" => :forbidden}], "answer: maps"},
+            {[subject: :self, answer: %{get: :forbidden}], "answer: maps"},
+            {[subject: :self, answer: %{"GET" => {403, "no"}}], "answer: maps"},
+            {[subject: :self, answer: %{"GET" => :nonsense}], "answer: maps"},
+            {[subject: :self, answer: %{}], "answer: maps"},
+            {[subject: :self, handler: :ownership, answer: answer], "enforces nothing"},
+            {[handler: "ownership"], "takes an atom"}
+          ] do
+        assert_raise ArgumentError, ~r/#{fault}/, fn ->
+          Row.validate!({["addons", :_, "stats"], :manager, columns})
+        end
+      end
+
+      for pattern <- [["addons", "self", "stats"], ["addons", "x", :_], ["addons", :_, :+]] do
+        assert_raise ArgumentError, fn ->
+          Row.validate!({pattern, :manager, subject: :self, answer: answer})
+        end
+      end
+    end
+
+    # As `Vagus.API.Tiers` uses it: in a module body, so the build stops.
+    test "a malformed row stops its module compiling" do
+      for columns <- ["caller: :core", "subject: :self, subject: :self"] do
+        assert_raise ArgumentError, fn ->
+          Code.compile_string("""
+          defmodule Vagus.API.TiersTest.BadTable do
+            @rows Enum.map(
+                    [{["addons", :_, "x"], :admin, #{columns}, answer: %{"GET" => :forbidden}}],
+                    &Vagus.API.Tiers.Row.validate!/1
+                  )
+            def rows, do: @rows
+          end
+          """)
+        end
+      end
+    end
+  end
+
   describe "required/1" do
     test "paths the router does not serve are graded too" do
       for {path, expected} <- @unserved do

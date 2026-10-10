@@ -78,10 +78,19 @@ defmodule Vagus.App.Policy do
   @spec may_read_service?(caller(), String.t()) :: boolean()
   def may_read_service?(:supervisor, _service), do: true
 
-  def may_read_service?({:addon, %{services_role: roles}}, service),
+  def may_read_service?({:addon, %{services_role: roles}}, service) when is_map(roles),
     do: Map.has_key?(roles, service)
 
   def may_read_service?(_caller, _service), do: false
+
+  @doc "An app names itself by `self` or by its own slug."
+  @spec own_slug?(caller(), String.t()) :: boolean()
+  def own_slug?({:addon, %{slug: own}}, slug) when is_binary(own), do: slug in ["self", own]
+  def own_slug?(_caller, _slug), do: false
+
+  @doc "The auth API is an app's grant: Core does not hold it."
+  @spec may_authenticate?(caller()) :: boolean()
+  def may_authenticate?(caller), do: match?({:addon, %{auth_api: true}}, caller)
 
   @doc "The `GET /services` list, from the `{service, provider_slug}` pairs provided now."
   @spec services_view([{String.t(), String.t()}]) :: [map()]

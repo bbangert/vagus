@@ -518,6 +518,32 @@ defmodule Vagus.API.AuthzTest do
     defp answer(principal, path, method \\ "GET"),
       do: Authz.answer(principal, {:rest, :supervisor_api, method, segments(path)}, ctx(path))
 
+    test "raises for a caller who was not refused as forbidden" do
+      for {who, path} <- [
+            {principal(:admin), "/store"},
+            {:supervisor, "/core/restart"},
+            {:anonymous, "/store"},
+            {:supervisor, "/core/api/hassio/x"}
+          ] do
+        assert_raise ArgumentError, ~r/is for a :forbidden refusal/, fn -> answer(who, path) end
+      end
+    end
+
+    # The envelope is JSON, which such a name cannot be written into.
+    test "a service name that is not UTF-8 is refused without being echoed" do
+      mine = app("mine")
+
+      for {method, message} <- [
+            {"GET", "Caller not authorized for this service"},
+            {"POST", "Caller may not provide this service"},
+            {"DELETE", "Caller may not delete this service"}
+          ] do
+        assert decide(mine, "/services/%FF", method) == {:error, :forbidden}
+        assert answer(mine, "/services/%FF", method) == {403, message}
+        assert answer(mine, "/services/mq%C3%28tt", method) == {403, message}
+      end
+    end
+
     test "a lattice refusal is the plain 403" do
       assert answer(principal(:default), "/store") == {403, "unauthorized"}
       assert answer(principal(:none), "/addons/probe/stats") == {403, "unauthorized"}

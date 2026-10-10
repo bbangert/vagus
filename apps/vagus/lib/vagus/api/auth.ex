@@ -58,9 +58,10 @@ defmodule Vagus.API.Auth do
   `conn.assigns.caller` is unchanged. Every handler guard is still there, now
   behind the gate: the per-caller grants a handler used to decide alone
   (`auth_api`, `services_role`, an app's own slug) are predicates on the
-  table's rows, refused here first with the handler's own status and
-  message. What a predicate cannot read (a discovery message's owner, the
-  service a body names, provide against read) remains the handler's alone.
+  table's rows, refused here first and worded by `Vagus.API.Refusal` as the
+  handler words it. What a predicate cannot read (a discovery message's
+  owner, the service a body names, provide against read) remains the
+  handler's alone.
   """
 
   @behaviour Plug
@@ -69,7 +70,7 @@ defmodule Vagus.API.Auth do
 
   require Logger
 
-  alias Vagus.API.{Authz, Envelope, SourceGuard, Tiers, Token}
+  alias Vagus.API.{Authz, Envelope, Refusal, SourceGuard, Tiers, Token}
   alias Vagus.App
 
   @impl Plug
@@ -240,16 +241,20 @@ defmodule Vagus.API.Auth do
       :ok ->
         conn
 
-      # Anything but `:ok` refuses, so a result this plug has no branch for
+      # A tier refusal is 403, matching upstream's `HTTPForbidden` for a
+      # token that resolves but has no role for the path (`security.py`'s
+      # final `raise`), and the router's own wrong-caller shape
+      # (`supervisor_only/2`). A predicate's is whatever its row says.
+      {:error, :forbidden} ->
+        count_refusal(Authz.refusal_label(action, ctx))
+        {status, message} = Authz.answer(caller, action, ctx)
+        Envelope.send_error(conn, message, status)
+
+      # Anything else still refuses, so a result this plug has no branch for
       # can never fall through to the handler.
       _refused ->
         count_refusal(Authz.refusal_label(action, ctx))
-
-        # A tier refusal is 403, matching upstream's `HTTPForbidden` for a
-        # token that resolves but has no role for the path (`security.py`'s
-        # final `raise`), and the router's own wrong-caller shape
-        # (`supervisor_only/2`). A predicate's is whatever its row says.
-        {status, message} = Authz.answer(caller, action, ctx)
+        {status, message} = Refusal.answer(:forbidden, conn.method, nil)
         Envelope.send_error(conn, message, status)
     end
   end
