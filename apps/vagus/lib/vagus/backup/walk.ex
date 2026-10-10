@@ -65,37 +65,43 @@ defmodule Vagus.Backup.Walk do
   @spec each_entry(Path.t(), acc, (entry(), acc -> step(acc)), keyword()) ::
           {:ok, acc} | {:error, error()}
         when acc: term()
-  # The spool path is under the caller's own staging directory, not input.
-  # sobelow_skip ["Traversal.FileModule"]
   def each_entry(root, acc, fun, opts) do
-    spool =
-      Path.join(Keyword.fetch!(opts, :spool_dir), ".walk-#{System.unique_integer([:positive])}")
-
     exe = Keyword.get_lazy(opts, :executable, &walker_path/0)
-
-    if File.regular?(exe) do
-      port =
-        Port.open({:spawn_executable, exe}, [:binary, {:packet, 4}, :exit_status, args: [root]])
-
-      {:os_pid, pid} = Port.info(port, :os_pid) || {:os_pid, nil}
-      budget = Keyword.get(opts, :max_bytes, @max_bytes)
-      state = %{port: port, pid: pid, fun: fun, spool: spool, budget: budget, file: nil}
-
-      try do
-        loop(state, acc)
-      after
-        close(port)
-        File.rm(spool)
-      end
-    else
-      {:error, :no_walker}
-    end
+    if File.regular?(exe), do: walk(exe, root, acc, fun, opts), else: {:error, :no_walker}
   end
 
   @spec walker_path() :: Path.t()
   def walker_path, do: Application.app_dir(:vagus, "priv/vagus_walk")
 
-  defp loop(%{port: port} = state, acc) do
+  # The spool path is under the caller's own staging directory, not input.
+  # sobelow_skip ["Traversal.FileModule"]
+  defp walk(exe, root, acc, fun, opts) do
+    spool =
+      Path.join(Keyword.fetch!(opts, :spool_dir), ".walk-#{System.unique_integer([:positive])}")
+
+    port =
+      Port.open({:spawn_executable, exe}, [:binary, {:packet, 4}, :exit_status, args: [root]])
+
+    # Unlinked so the port's :epipe exit (an ack the walker never read)
+    # cannot kill the caller; the monitor reports it instead. Guarded first,
+    # so the port is never left without a way to die with the caller.
+    caller = self()
+    spawn_link(fn -> guard(port, caller) end)
+    Process.unlink(port)
+    ref = Port.monitor(port)
+    {:os_pid, pid} = Port.info(port, :os_pid) || {:os_pid, nil}
+    budget = Keyword.get(opts, :max_bytes, @max_bytes)
+    state = %{port: port, ref: ref, pid: pid, fun: fun, spool: spool, budget: budget, file: nil}
+
+    try do
+      loop(state, acc)
+    after
+      close(port, ref)
+      File.rm(spool)
+    end
+  end
+
+  defp loop(%{port: port, ref: ref} = state, acc) do
     receive do
       {^port, {:data, frame}} ->
         case frame(frame, state) do
@@ -108,7 +114,7 @@ defmodule Vagus.Backup.Walk do
       {^port, {:exit_status, status}} ->
         stop(state, {:error, {:walker, status}})
 
-      {:EXIT, ^port, reason} ->
+      {:DOWN, ^ref, :port, ^port, reason} ->
         stop(state, {:error, {:walker, reason}})
     after
       @idle_timeout -> state |> kill() |> stop({:error, :timeout})
@@ -125,39 +131,30 @@ defmodule Vagus.Backup.Walk do
   end
 
   # A send, not Port.command, which raises once the walker's exit has closed
-  # the port. A walker that died before reading its ack makes the write fail
-  # with EPIPE and the port exit :epipe, which kills a caller not trapping exits.
-  defp next(state, acc) do
-    send(state.port, {self(), {:command, ""}})
-    loop(state, acc)
-  end
+  # the port. A walker gone before reading its ack makes the write fail with
+  # EPIPE, and the port's :epipe exit arrives as the monitor's DOWN.
+  defp next(state, acc), do: loop(tap(state, &send(&1.port, {self(), {:command, ""}})), acc)
 
   # Closing the port only closes the walker's pipes, which a walker blocked
   # in a read never notices. Killed before the close, while the pid is
   # certainly still the walker's.
-  defp kill(%{pid: nil} = state), do: state
-  # pid is the integer Port.info returned, not input. :os.cmd over
+  # pid is nil or the integer Port.info returned, not input. :os.cmd over
   # System.cmd because a best-effort kill must never raise.
   # sobelow_skip ["CI.OS"]
   # credo:disable-for-next-line Credo.Check.Warning.UnsafeExec
-  defp kill(%{pid: pid} = state), do: tap(state, fn _ -> :os.cmd(~c"kill -9 #{pid}") end)
+  defp kill(%{pid: pid} = state), do: tap(state, fn _ -> pid && :os.cmd(~c"kill -9 #{pid}") end)
 
   defp stop(%{file: {_, _, io, _}}, result), do: tap(result, fn _ -> File.close(io) end)
   defp stop(_state, result), do: result
 
   defp frame("C" <> bytes, %{file: {rel, meta, io, got}} = state) do
     got = got + byte_size(bytes)
-    budget = state.budget - byte_size(bytes)
+    state = %{state | file: {rel, meta, io, got}, budget: state.budget - byte_size(bytes)}
 
     cond do
-      got > meta.size ->
-        {:error, :malformed}
-
-      budget < 0 ->
-        {:error, :too_large}
-
-      true ->
-        spooled(:file.write(io, bytes), %{state | file: {rel, meta, io, got}, budget: budget})
+      got > meta.size -> {:error, :malformed}
+      state.budget < 0 -> {:error, :too_large}
+      true -> spooled(:file.write(io, bytes), state)
     end
   end
 
@@ -174,9 +171,8 @@ defmodule Vagus.Backup.Walk do
 
   defp frame(_frame, %{file: {_, _, _, _}}), do: {:error, :malformed}
 
-  defp frame("D" <> rel, state) do
-    if valid_rel?(rel), do: {:emit, {:dir, rel}, state}, else: {:error, :malformed}
-  end
+  defp frame("D" <> rel, state),
+    do: if(valid_rel?(rel), do: {:emit, {:dir, rel}, state}, else: {:error, :malformed})
 
   # sobelow_skip ["Traversal.FileModule"]
   defp frame("F" <> fields, state) do
@@ -215,20 +211,30 @@ defmodule Vagus.Backup.Walk do
 
   # The tar writer joins `rel` under `data/`, so the walker's output is
   # checked rather than trusted to be a plain relative path.
-  defp valid_rel?(rel) do
-    rel != "" and not String.contains?(rel, <<0>>) and
-      Enum.all?(String.split(rel, "/"), &(&1 not in ["", ".", ".."]))
+  defp valid_rel?(rel), do: Enum.all?(String.split(rel, "/"), &valid_name?/1)
+  defp valid_name?(name), do: name not in ["", ".", ".."] and not String.contains?(name, <<0>>)
+
+  # The port dies with its owner only through their link. Once unlinked, this
+  # closes it if the caller dies, and the walker exits on its stdin's EOF. It
+  # unlinks the caller before ending, so a trapping caller gets no EXIT.
+  defp guard(port, caller) do
+    Process.flag(:trap_exit, true)
+    Process.link(port)
+
+    receive do
+      {:EXIT, ^caller, _} -> exit(:shutdown)
+      {:EXIT, ^port, _} -> Process.unlink(caller)
+    end
   end
 
-  # Once unlinked no EXIT from the port can still arrive (Port.close sends
-  # one asynchronously to a caller that traps exits), so the flush is final.
-  # Closing a port that already exited raises.
-  defp close(port) do
+  # Closing a port that already exited raises. An EXIT reaches a trapping
+  # caller only if the port closed before the unlink.
+  defp close(port, ref) do
     Port.close(port)
   rescue
     ArgumentError -> :ok
   after
-    Process.unlink(port)
+    Process.demonitor(ref, [:flush])
     flush(port)
   end
 

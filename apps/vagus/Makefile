@@ -13,13 +13,15 @@ CFLAGS += -std=c11
 
 all: install
 
-install: $(BUILD) $(PREFIX) $(PREFIX)/vagus_walk
+install: $(PREFIX)/vagus_walk
 
-$(BUILD)/%.o: c_src/%.c
+# Order-only, so the directory exists before the recipe even under -j, while
+# its mtime (bumped by every file written into it) never forces a rebuild.
+$(BUILD)/%.o: c_src/%.c | $(BUILD)
 	@echo " CC $(notdir $@)"
 	$(CC) -c $(CFLAGS) -o $@ $<
 
-$(PREFIX)/vagus_walk: $(BUILD)/vagus_walk.o
+$(PREFIX)/vagus_walk: $(BUILD)/vagus_walk.o | $(PREFIX)
 	@echo " LD $(notdir $@)"
 	$(CC) $^ $(LDFLAGS) -o $@
 

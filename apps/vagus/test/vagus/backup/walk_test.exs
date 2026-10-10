@@ -209,6 +209,27 @@ defmodule Vagus.Backup.WalkTest do
     assert length(entries) == 66
   end
 
+  test "a path longer than PATH_MAX within the depth cap is walked", %{tmp_dir: tmp} do
+    root = Path.join(tmp, "data")
+    name = String.duplicate("n", 200)
+    # No syscall takes a path longer than PATH_MAX, so the tree is built as
+    # two shorter halves and one moved under the other.
+    upper = Path.join([root | List.duplicate(name, 12)])
+    lower = Path.join([tmp, "lower" | List.duplicate(name, 12)])
+    File.mkdir_p!(upper)
+    File.mkdir_p!(lower)
+    File.write!(Path.join(lower, "f"), "deep")
+    File.rename!(Path.join(tmp, "lower"), Path.join(upper, name))
+    # File.rm_rf takes whole paths too; rm(1) removes by descriptor.
+    on_exit(fn -> System.cmd("rm", ["-rf", root]) end)
+
+    assert {:ok, entries} = collect(tmp, root)
+    assert length(entries) == 26
+    deep_file = Enum.join(List.duplicate(name, 25) ++ ["f"], "/")
+    assert byte_size(deep_file) > 4096
+    assert Enum.any?(entries, &match?({:file, ^deep_file, %{size: 4}, "deep"}, &1))
+  end
+
   test "a fifo is skipped without blocking the walk", %{tmp_dir: tmp} do
     root = Path.join(tmp, "data")
     File.mkdir_p!(root)
@@ -321,6 +342,46 @@ defmodule Vagus.Backup.WalkTest do
     proc = "/proc/" <> String.trim(File.read!(Path.join(tmp, "walker.pid")))
     # Reaped by erl_child_setup shortly after the kill.
     assert Enum.any?(1..100, fn _ -> not File.exists?(proc) or (Process.sleep(20) && false) end)
+  end
+
+  test "a walker gone before its ack fails the walk, not the caller", %{tmp_dir: tmp} do
+    closed = Path.join(tmp, "closed")
+    tail = ~s|exec 0<&-; touch "$dir/closed"; exec sleep 2|
+    walker = fake_walker(tmp, [{:raw, <<0, 0, 0, 2, "Da">>}], 0, tail)
+
+    # Returns only once the walker has closed stdin, so the ack write fails.
+    wait = fn _, acc ->
+      Enum.find(1..250, fn _ -> File.exists?(closed) or (Process.sleep(20) && false) end)
+      {:cont, acc}
+    end
+
+    assert {:trap_exit, false} = Process.info(self(), :trap_exit)
+    assert {:error, {:walker, :epipe}} = walk(tmp, tmp, nil, wait, executable: walker)
+    assert own_ports() == []
+    assert {:messages, []} = Process.info(self(), :messages)
+  end
+
+  test "a caller killed mid-walk takes the walker with it", %{tmp_dir: tmp} do
+    root = Path.join(tmp, "data")
+    for i <- 1..5, do: File.mkdir_p!(Path.join(root, "d#{i}"))
+    me = self()
+
+    # Parked in the callback, so the walker is blocked reading its ack.
+    owner =
+      spawn(fn ->
+        walk(tmp, root, nil, fn _, _ -> send(me, :parked) && Process.sleep(:infinity) end)
+      end)
+
+    assert_receive :parked, 5_000
+    [port] = Enum.filter(Port.list(), &(Port.info(&1, :connected) == {:connected, owner}))
+    {:os_pid, os_pid} = Port.info(port, :os_pid)
+    Process.exit(owner, :kill)
+
+    alive? = fn ->
+      match?({_, 0}, System.cmd("kill", ["-0", "#{os_pid}"], stderr_to_stdout: true))
+    end
+
+    assert Enum.any?(1..100, fn _ -> not alive?.() or (Process.sleep(20) && false) end)
   end
 
   test "a caller that traps exits is left with an empty mailbox", %{tmp_dir: tmp} do

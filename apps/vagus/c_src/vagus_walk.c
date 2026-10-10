@@ -9,11 +9,10 @@
  * descriptor, but that rename crosses mounts, which only host root can do.
  *
  * Symlinks are skipped, as upstream backups do; a real read error stops the
- * walk, since an incomplete backup must never look complete.
- *
- * Each entry is typed by fstat on an O_PATH descriptor, and only a regular
- * file or directory is reopened, through that descriptor, never the name: a
- * fifo renamed in between would block the open, a device node's open can act.
+ * walk, since an incomplete backup must never look complete. Each entry is
+ * typed by fstat on an O_PATH descriptor, and only a regular file or
+ * directory is reopened, through that descriptor, never the name: a fifo
+ * renamed in between would block the open, a device node's open can act.
  *
  * Every frame but X and Z waits for an ack on stdin: a port has no
  * inbound flow control, so otherwise the walker outruns the owner's mailbox.
@@ -22,6 +21,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -38,7 +38,6 @@ enum { VW_NO_XDEV = 0x01, VW_NO_SYMLINKS = 0x04, VW_BENEATH = 0x08 };
 struct vw_open_how { uint64_t flags, mode, resolve; };
 
 #define CHUNK 65536
-#define REL_MAX 4096
 #define DEPTH_MAX 64 /* bounds the fds and stack a hostile tree makes us hold */
 
 /* NO_XDEV: only an already-privileged party can mount inside a data dir, and
@@ -46,6 +45,8 @@ struct vw_open_how { uint64_t flags, mode, resolve; };
 #define RESOLVE_ENTRY (VW_BENEATH | VW_NO_SYMLINKS | VW_NO_XDEV)
 
 static unsigned char frame[5 + CHUNK];
+/* Entries reach DEPTH_MAX + 1 names; each name is ended by '/' or NUL. */
+static char rel_path[(DEPTH_MAX + 1) * (NAME_MAX + 1)];
 
 static int open2(int dirfd, const char *path, uint64_t flags, uint64_t resolve)
 {
@@ -158,7 +159,7 @@ static void send_file(int fd, const char *rel, const struct stat *st)
     emit('E', NULL, NULL, NULL, NULL);
 }
 
-static void walk(int fd, const char *prefix, int depth);
+static void walk(int fd, size_t len, int depth);
 
 static void visit(int parent, const char *name, const char *rel, int depth)
 {
@@ -200,37 +201,36 @@ static void visit(int parent, const char *name, const char *rel, int depth)
 
     if (is_dir) {
         emit('D', rel, NULL, NULL, NULL);
-        walk(fd, rel, depth);
+        walk(fd, strlen(rel), depth);
     } else {
         send_file(fd, rel, &st);
         close(fd);
     }
 }
 
-/* Takes ownership of fd: closedir closes it. */
-static void walk(int fd, const char *prefix, int depth)
+/* Takes ownership of fd (closedir closes it), whose rel is rel_path[0..len). */
+static void walk(int fd, size_t len, int depth)
 {
     DIR *dir = fdopendir(fd);
     if (!dir)
-        fail(prefix, errno);
+        fail(rel_path, errno);
 
     for (;;) {
         errno = 0;
         struct dirent *de = readdir(dir);
         if (!de) {
             if (errno)
-                fail(prefix, errno);
+                fail(rel_path, errno);
             break;
         }
         if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
             continue;
 
-        char rel[REL_MAX];
-        int n = *prefix ? snprintf(rel, sizeof rel, "%s/%s", prefix, de->d_name)
-                        : snprintf(rel, sizeof rel, "%s", de->d_name);
-        if (n < 0 || (size_t) n >= sizeof rel)
-            fail(prefix, ENAMETOOLONG);
-        visit(dirfd(dir), de->d_name, rel, depth + 1);
+        if (strlen(de->d_name) > NAME_MAX)
+            fail(rel_path, ENAMETOOLONG);
+        snprintf(rel_path + len, sizeof rel_path - len, len ? "/%s" : "%s", de->d_name);
+        visit(dirfd(dir), de->d_name, rel_path, depth + 1);
+        rel_path[len] = 0;
     }
     closedir(dir);
 }
@@ -244,7 +244,7 @@ int main(int argc, char **argv)
     if (rfd < 0)
         fail("", errno);
 
-    walk(rfd, "", 0);
+    walk(rfd, 0, 0);
     emit('Z', NULL, NULL, NULL, NULL);
     return 0;
 }
