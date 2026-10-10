@@ -17,6 +17,13 @@ defmodule Vagus.API.Auth do
   at the auth boundary meant a future plug could disable authentication for
   any route by accident. There is now no flag to set.
 
+  The table is asked as well: a token-free request is served only if
+  `Vagus.API.Authz` also admits the `:anonymous` principal to its path. That
+  is a second lock on the same door, not a second door. `unauthenticated?/1`
+  alone would leave the table silent about the three most exposed paths in
+  the API; the table alone would serve them for every method, since its rows
+  carry none. Requiring both means neither can open a path by itself.
+
   Before any of that, `call/2` checks upstream's `BLACKLIST` — every caller,
   Core included, refused with 403 on `/core/api/hassio/…` and
   `/homeassistant/api/hassio/…` regardless of token or role. See
@@ -35,10 +42,12 @@ defmodule Vagus.API.Auth do
 
   ## The role gate
 
-  An authenticated caller is then graded against `Vagus.API.Tiers`: its tier
-  is assigned on `conn.assigns.tier`, and a path demanding more than the
-  caller holds is refused with 403 (upstream raises `HTTPForbidden`) before
-  `:match` ever runs.
+  An authenticated caller is then graded by `Vagus.API.Authz` against
+  `Vagus.API.Tiers`: its tier is assigned on `conn.assigns.tier`, and a path
+  demanding more than the caller holds is refused with 403 (upstream raises
+  `HTTPForbidden`) before `:match` ever runs. This module never compares a
+  tier with a requirement itself; every leg that grades a caller asks the
+  same evaluator.
 
   That check lives here rather than in a second router plug for the same
   reason the icon/logo carve-out does. This module is the authorisation
@@ -58,7 +67,7 @@ defmodule Vagus.API.Auth do
 
   require Logger
 
-  alias Vagus.API.{Envelope, SourceGuard, Tiers, Token}
+  alias Vagus.API.{Authz, Envelope, SourceGuard, Tiers, Token}
   alias Vagus.App
 
   @impl Plug
@@ -67,16 +76,22 @@ defmodule Vagus.API.Auth do
   # Kinds served without a token. See `unauthenticated?/1`.
   @unauthenticated_asset_kinds ~w(icon logo)
 
+  @ctx %{leg: :supervisor_api, decoded_segments: nil}
+
   @impl Plug
   def call(conn, opts)
 
-  def call(%Plug.Conn{path_info: path_info} = conn, _opts) do
+  def call(%Plug.Conn{} = conn, _opts) do
+    anonymous = Authz.authorize(:anonymous, action(conn), @ctx)
+
     cond do
-      Tiers.blacklisted?(path_info) -> refuse_blacklisted(conn)
-      unauthenticated?(conn) -> conn
+      anonymous == {:error, :blacklisted} -> refuse_blacklisted(conn)
+      anonymous == :ok and unauthenticated?(conn) -> conn
       true -> authenticate(conn)
     end
   end
+
+  defp action(conn), do: {:rest, :supervisor_api, conn.method, conn.path_info}
 
   @doc """
   Whether `conn` is one of the two GETs that must be served with no token at
@@ -213,13 +228,32 @@ defmodule Vagus.API.Auth do
       |> assign(:caller, caller)
       |> assign(:tier, tier)
 
-    if Tiers.allows?(tier, Tiers.required(conn.path_info)) do
-      conn
+    action = action(conn)
+
+    case Authz.authorize(caller, action, @ctx) do
+      :ok ->
+        conn
+
+      # Anything but `:ok` refuses, so a result this plug has no branch for
+      # can never fall through to the handler.
+      _refused ->
+        count_refusal(Authz.refusal_label(action))
+
+        # 403, matching upstream's `HTTPForbidden` for a token that resolves
+        # but has no role for the path (`security.py`'s final `raise`), and
+        # matching the router's own wrong-caller shape (`supervisor_only/2`).
+        Envelope.send_error(conn, "unauthorized", 403)
+    end
+  end
+
+  # Counted like a blacklist refusal, for the same reason: an installed app
+  # can repeat a refused request at will. `label` names the tier the path
+  # demands and carries none of the request.
+  defp count_refusal(label) do
+    if SourceGuard.enabled?() do
+      SourceGuard.record_filtered(:authz, label)
     else
-      # 403, matching upstream's `HTTPForbidden` for a token that resolves but
-      # has no role for the path (`security.py`'s final `raise`), and matching
-      # the router's own wrong-caller shape (`supervisor_only/2`).
-      Envelope.send_error(conn, "unauthorized", 403)
+      Logger.warning("Vagus.API.Auth: refused a request (#{label})")
     end
   end
 

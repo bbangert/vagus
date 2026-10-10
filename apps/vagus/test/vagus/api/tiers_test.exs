@@ -2,253 +2,155 @@ defmodule Vagus.API.TiersTest do
   @moduledoc """
   The tier table, pinned.
 
-  `@routes` below is transcribed **independently** of `Vagus.API.Tiers`'
-  `@table` — from upstream `supervisor/api/middleware/security.py`'s regex
-  alternatives plus the deliberate supervisor-only overrides recorded in the
-  2026-07-29 audit — exactly the way `Vagus.API.RouterTest` pins field lists
-  from the contract rather than from the model modules. Two transcriptions of
-  the same contract catch drift; one does not.
+  Routes are pinned by `test/fixtures/vagus-authz-table.json`: one row per
+  route `Vagus.API.Router` registers, with the tier the table demands, the
+  tier upstream's `security.py` demands, and how the two compare. The route
+  list is read from the router's source (`Vagus.RouterRoutes`), because a
+  hand-kept list went stale without anything failing: two routes were pinned
+  by no entry. A route nobody graded now fails here instead of shipping.
 
-  This is the file that would have caught A2 (26 routes admin-tier to any
-  installed add-on): every route the router registers appears here with the
-  tier it demands, so a route that quietly loses its guard fails a test
-  instead of shipping.
+  The fixture is a second transcription of the same contract, reviewed
+  against upstream by hand; two transcriptions catch drift, one does not.
+  `upstream_tier` is the first of upstream's checks the path matches, in
+  `token_validation`'s order: `no_security_check`, `core_only`, `bypass`,
+  then the lowest `role_access` role that admits it.
   """
 
   use ExUnit.Case, async: true
 
   alias Vagus.API.Tiers
+  alias Vagus.RouterRoutes
 
-  # {path, required tier}. Every route `Vagus.API.Router` registers, in router
-  # order, plus the `self`/negative-lookahead variants the router serves
-  # through a `:slug` segment and the two upstream paths Vagus does not serve
-  # (`sys_options`, `datadisk/wipe`) whose entries keep the catch-all honest.
-  @routes [
-    # -- Main coordinator + one-time setup GETs -------------------------------
-    {"/info", :bypass},
-    {"/supervisor/info", :default},
-    {"/core/info", :default},
-    {"/os/info", :default},
-    {"/os/datadisk/list", :supervisor},
-    {"/host/info", :default},
-    {"/host/disks/default/usage", :supervisor},
-    {"/hardware/info", :default},
-    {"/network/info", :default},
-    {"/network/interface/eth0/info", :default},
-    {"/network/interface/eth0/accesspoints", :manager},
-    {"/network/interface/eth0/update", :manager},
-    {"/host/reboot", :manager},
-    {"/host/shutdown", :manager},
+  @fixture_path Path.expand("../../fixtures/vagus-authz-table.json", __DIR__)
+  @external_resource @fixture_path
+  @fixture @fixture_path |> File.read!() |> Jason.decode!() |> Map.fetch!("routes")
 
-    # -- Store ----------------------------------------------------------------
-    {"/store", :manager},
-    {"/store/addons", :manager},
-    {"/store/addons/core_mqtt", :manager},
-    # The icon/logo GETs never consult the table — `Vagus.API.Auth` serves
-    # them with no token at all — but a non-GET on the same path does, and
-    # manager is where upstream's `role_access` puts it.
-    {"/store/addons/core_mqtt/icon", :manager},
-    {"/store/addons/core_mqtt/logo", :manager},
-    {"/addons/core_mqtt/icon", :manager},
-    {"/addons/core_mqtt/logo", :manager},
-    {"/store/addons/core_mqtt/changelog", :supervisor},
-    {"/store/addons/core_mqtt/documentation", :supervisor},
-    {"/addons/core_mqtt/changelog", :supervisor},
-    {"/addons/core_mqtt/documentation", :supervisor},
-    # Issue #5 — no table entry of their own, method is not consulted (see
-    # this module's moduledoc), so GET/POST share one row per path and
-    # DELETE/POST-repair fall under the same `{["store", :*], :manager}`
-    # catch-all as every other `/store/...` path above.
-    {"/store/repositories", :manager},
-    {"/store/repositories/a474bbd1", :manager},
-    {"/store/repositories/a474bbd1/repair", :manager},
-    {"/mounts", :manager},
-    {"/resolution/info", :default},
-    {"/jobs/info", :default},
-    # `/jobs/{uuid}` + the options/reset POSTs — `/jobs/.+` is plain
-    # `role_access` manager territory upstream; only the `/info` suffix above
-    # lands lower, via `/.+/info`.
-    {"/jobs/00112233445566778899aabbccddeeff", :manager},
-    {"/jobs/options", :manager},
-    {"/jobs/reset", :manager},
+  # Who each requirement admits, written out rather than asked of
+  # `Tiers.allows?/2`, so the comparison with upstream does not lean on the
+  # lattice it is checking. `anonymous` is a caller with no token.
+  @admits %{
+    "anonymous" => ~w(anonymous none default backup homeassistant manager admin supervisor),
+    "bypass" => ~w(none default backup homeassistant manager admin supervisor),
+    "default" => ~w(default backup homeassistant manager admin supervisor),
+    "backup" => ~w(backup manager admin supervisor),
+    "homeassistant" => ~w(homeassistant manager admin supervisor),
+    "manager" => ~w(manager admin supervisor),
+    "admin" => ~w(admin supervisor),
+    "supervisor" => ~w(supervisor)
+  }
 
-    # -- Add-ons --------------------------------------------------------------
-    {"/addons", :manager},
-    {"/addons/core_mqtt/info", :default},
-    {"/addons/self/info", :bypass},
-    {"/addons/core_mqtt/options/config", :manager},
-    {"/addons/self/options/config", :bypass},
-    {"/store/addons/core_mqtt/install", :supervisor},
-    {"/addons/core_mqtt/install", :supervisor},
-    {"/store/addons/core_mqtt/update", :supervisor},
-    {"/store/addons/core_mqtt/update/1.2.3", :supervisor},
-    {"/addons/core_mqtt/update", :supervisor},
-    # `(?!security|update)` — the two segments upstream carves OUT of the
-    # `self` bypass. Vagus keeps both supervisor-only.
-    {"/addons/self/update", :supervisor},
-    {"/addons/self/security", :supervisor},
-    # …and the segments Vagus holds at `:supervisor` for ANY slug must keep
-    # that tier when the slug is the literal `self` too. An earlier revision
-    # wildcarded the third segment and silently graded all four `:bypass`.
-    {"/addons/self/install", :supervisor},
-    {"/addons/self/changelog", :supervisor},
-    {"/addons/self/documentation", :supervisor},
-    {"/addons/self/sys_options", :supervisor},
-    {"/addons/core_mqtt/security", :admin},
-    {"/addons/core_mqtt/start", :supervisor},
-    {"/addons/core_mqtt/stop", :supervisor},
-    {"/addons/core_mqtt/restart", :supervisor},
-    {"/addons/core_mqtt/uninstall", :supervisor},
-    {"/addons/core_mqtt/options", :supervisor},
-    # `/addons/self/(?!security|update)[^/]+` — an add-on manages itself.
-    {"/addons/self/start", :bypass},
-    {"/addons/self/stop", :bypass},
-    {"/addons/self/restart", :bypass},
-    {"/addons/self/uninstall", :bypass},
-    {"/addons/self/options", :bypass},
-    # …but `[^/]+` is ONE segment, so the two-segment forms are not bypassed.
-    {"/addons/core_mqtt/options/validate", :supervisor},
-    {"/addons/self/options/validate", :supervisor},
-    # `core_only` — Vagus serves no such route; the entry stops the catch-all
-    # from handing it to an admin-role add-on if one is ever added.
-    {"/addons/core_mqtt/sys_options", :supervisor},
+  @upstream_names %{"no_security_check" => "anonymous", "core_only" => "supervisor"}
 
-    # -- Stats ----------------------------------------------------------------
-    {"/core/stats", :homeassistant},
-    {"/supervisor/stats", :manager},
-    {"/addons/core_mqtt/stats", :manager},
-    {"/addons/self/stats", :bypass},
-
-    # -- Logs -----------------------------------------------------------------
-    {"/addons/core_mqtt/logs", :manager},
-    {"/addons/self/logs", :bypass},
-    # Audit F8: two segments, so outside `[^/]+` — manager, not bypass.
-    {"/addons/self/logs/latest", :manager},
-    {"/addons/self/logs/follow", :manager},
-    {"/addons/self/logs/boots/3", :manager},
-    {"/addons/core_mqtt/logs/latest", :manager},
-    {"/core/logs", :homeassistant},
-    {"/core/logs/latest", :homeassistant},
-    {"/core/logs/follow", :homeassistant},
-    {"/core/logs/boots/3", :homeassistant},
-    {"/core/logs/boots/3/follow", :homeassistant},
-    {"/supervisor/logs", :manager},
-    {"/supervisor/logs/latest", :manager},
-    {"/supervisor/logs/follow", :manager},
-    {"/supervisor/logs/boots/3", :manager},
-    {"/supervisor/logs/boots/3/follow", :manager},
-    {"/host/logs", :manager},
-    {"/host/logs/latest", :manager},
-    {"/host/logs/follow", :manager},
-    {"/host/logs/boots", :manager},
-    {"/host/logs/boots/3", :manager},
-    {"/host/logs/boots/3/follow", :manager},
-    {"/host/logs/identifiers", :manager},
-    {"/homeassistant/logs", :homeassistant},
-    {"/homeassistant/logs/latest", :homeassistant},
-    {"/homeassistant/logs/follow", :homeassistant},
-    {"/homeassistant/logs/boots/3", :homeassistant},
-    {"/homeassistant/logs/boots/3/follow", :homeassistant},
-    {"/audio/logs", :manager},
-    {"/audio/logs/latest", :manager},
-    {"/audio/logs/follow", :manager},
-    {"/audio/logs/boots/3", :manager},
-    {"/audio/logs/boots/3/follow", :manager},
-    {"/dns/logs", :manager},
-    {"/dns/logs/latest", :manager},
-    {"/dns/logs/follow", :manager},
-    {"/dns/logs/boots/3", :manager},
-    {"/dns/logs/boots/3/follow", :manager},
-    {"/multicast/logs", :manager},
-    {"/multicast/logs/latest", :manager},
-    {"/multicast/logs/follow", :manager},
-    {"/multicast/logs/boots/3", :manager},
-    {"/multicast/logs/boots/3/follow", :manager},
-    {"/available_updates", :manager},
-
-    # -- Ingress --------------------------------------------------------------
-    # No role below `role_access[admin]` lists an `/ingress/…` alternative
-    # (audit A5). The per-request proxy path `/ingress/{token}/…` never
-    # reaches this table — `Vagus.API.Dispatcher` routes it to the proxy.
-    {"/ingress/panels", :admin},
-    {"/ingress/session", :admin},
-    {"/ingress/validate_session", :admin},
-
-    # -- Discovery ------------------------------------------------------------
-    {"/discovery", :bypass},
-    {"/discovery/8ced93a7", :bypass},
-
-    # -- Backups (audit A4: ROLE_BACKUP, not supervisor-only) -----------------
-    {"/backups", :backup},
-    # `/.+/info` is checked before `/backups.*`, upstream and here.
-    {"/backups/info", :default},
-    {"/backups/abc123/info", :default},
-    {"/backups/new/partial", :backup},
-    {"/backups/new/upload", :backup},
-    {"/backups/abc123/restore/partial", :backup},
-    {"/backups/abc123/download", :backup},
-    {"/backups/abc123", :backup},
-    {"/backups/reload", :backup},
-
-    # -- Services / auth ------------------------------------------------------
-    {"/services", :bypass},
-    {"/services/mqtt", :bypass},
-    {"/auth", :bypass},
-    # NOT part of the `/auth` bypass — the alternative is anchored (audit A6).
-    {"/auth/cache", :manager},
-
-    # -- Entry setup / Core lifecycle -----------------------------------------
-    # Phase 8 (audit B1): `GET /supervisor/ping` is now served with no token
-    # at all — `Vagus.API.Auth.unauthenticated?/1` short-circuits it before
-    # this table is ever consulted, same as the icon/logo GETs above, so the
-    # table's old `:bypass` row for it was deleted (see `@table`'s comment).
-    # What's pinned here is what a non-GET on the same path would demand: it
-    # falls through to the plain `/supervisor/.+` manager-family row below,
-    # not any special case — `/supervisor/ping` earns no table entry of its
-    # own precisely because it's never reached through the table.
-    {"/supervisor/ping", :manager},
-    {"/core/options", :homeassistant},
-    {"/homeassistant/options", :homeassistant},
-    {"/core/start", :supervisor},
-    {"/core/stop", :supervisor},
-    {"/core/restart", :supervisor},
-    {"/core/rebuild", :supervisor},
-    {"/core/check", :supervisor},
-    {"/core/update", :supervisor},
-    {"/homeassistant/start", :supervisor},
-    {"/homeassistant/stop", :supervisor},
-    {"/homeassistant/restart", :supervisor},
-    {"/homeassistant/rebuild", :supervisor},
-    {"/homeassistant/check", :supervisor},
-    {"/homeassistant/update", :supervisor},
-
-    # -- Supervisor self ------------------------------------------------------
-    {"/supervisor/options", :manager},
-    {"/supervisor/reload", :manager},
-    {"/refresh_updates", :manager},
-    # V1's manager list has `/refresh_updates` but NOT `/reload_updates`
-    # (only the V2 list does), so this one is admin.
-    {"/reload_updates", :admin},
-    {"/store/reload", :manager},
-    {"/supervisor/restart", :manager},
-    {"/supervisor/update", :manager},
-
-    # -- Not served -----------------------------------------------------------
-    {"/os/datadisk/wipe", :admin},
+  # Paths the router does not serve, whose tier still has to be right the day
+  # a route for them lands.
+  @unserved [
+    # Upstream's empty alternative matches `""`, never `/`.
+    {"/", :admin},
     {"/nonexistent", :admin},
-    {"/", :default}
+    {"/os/datadisk/wipe", :admin},
+    {"/addons/core_mqtt/sys_options", :supervisor},
+    {"/addons/self/sys_options", :supervisor},
+    {"/os/ssh/authorized_keys", :supervisor},
+    {"/os/ssh/authorized_keys/extra", :manager},
+    {"/os/ssh", :manager},
+    {"/addons/reload", :manager}
   ]
 
   defp segments(path), do: path |> String.split("/", trim: true)
 
+  defp admitted(name), do: MapSet.new(Map.fetch!(@admits, Map.get(@upstream_names, name, name)))
+
+  defp compare(vagus, upstream) do
+    cond do
+      MapSet.equal?(vagus, upstream) -> "parity"
+      MapSet.subset?(vagus, upstream) -> "stricter"
+      true -> "looser"
+    end
+  end
+
+  describe "the table against the router and upstream" do
+    test "every route the router registers has a row, and no row is stale" do
+      routed = RouterRoutes.instances()
+      pinned = for row <- @fixture, do: {row["method"], row["route"], row["path"]}
+
+      assert routed != []
+      assert routed -- pinned == [], "routes with no fixture row"
+      assert pinned -- routed == [], "fixture rows the router no longer registers"
+      assert pinned == Enum.uniq(pinned)
+    end
+
+    test "every route demands the tier its row pins" do
+      for row <- @fixture do
+        actual = row["path"] |> segments() |> Tiers.required() |> Atom.to_string()
+
+        assert actual == row["requirement"],
+               "#{row["method"]} #{row["path"]} requires #{actual}, pinned as #{row["requirement"]}"
+
+        assert row["predicates"] == %{}
+      end
+    end
+
+    test "no route is looser than upstream, and every row says how it compares" do
+      for row <- @fixture do
+        computed = compare(admitted(row["requirement"]), admitted(row["upstream_tier"]))
+        label = "#{row["method"]} #{row["path"]}"
+
+        refute computed == "looser",
+               "#{label}: #{row["requirement"]} admits a caller upstream's " <>
+                 "#{row["upstream_tier"]} refuses"
+
+        assert row["classification"] == computed, "#{label} is #{computed}"
+      end
+    end
+
+    test "a stricter row says why" do
+      for %{"classification" => "stricter"} = row <- @fixture do
+        assert is_binary(row["reason"]) and row["reason"] != "",
+               "#{row["method"]} #{row["path"]} is stricter than upstream with no reason"
+      end
+    end
+
+    # No row constrains the method, so an anonymous row admits every method
+    # on its path. That is only safe while nothing but a GET is routed there.
+    test "only GET routes sit on an anonymous row" do
+      anonymous = for %{"requirement" => "anonymous"} = row <- @fixture, do: row
+      assert anonymous != []
+
+      for row <- anonymous do
+        assert row["method"] == "GET", "#{row["method"]} #{row["path"]} is served with no token"
+      end
+    end
+  end
+
   describe "required/1" do
-    test "every registered route demands its pinned tier" do
-      for {path, expected} <- @routes do
+    test "paths the router does not serve are graded too" do
+      for {path, expected} <- @unserved do
         actual = Tiers.required(segments(path))
 
         assert actual == expected,
                "#{path} requires #{inspect(actual)}, pinned as #{inspect(expected)}"
       end
+    end
+
+    test "the token-free paths are anonymous rows, for a real slug and nothing longer" do
+      assert Tiers.required(["supervisor", "ping"]) == :anonymous
+
+      for prefix <- [["addons"], ["store", "addons"]],
+          slug <- ~w(core_mqtt self),
+          kind <- ~w(icon logo) do
+        assert Tiers.required(prefix ++ [slug, kind]) == :anonymous
+      end
+
+      # A segment that is not a slug must not ride the row: it falls through
+      # to the family tier it had before the row existed.
+      for slug <- ["bad!slug", "..", "."] do
+        assert Tiers.required(["addons", slug, "icon"]) == :manager
+        assert Tiers.required(["store", "addons", slug, "logo"]) == :manager
+      end
+
+      assert Tiers.required(["supervisor", "ping", "extra"]) == :manager
+      assert Tiers.required(["addons", "core_mqtt", "icon", "extra"]) == :manager
+      assert Tiers.required(["addons", "core_mqtt", "changelog"]) == :supervisor
     end
 
     test "an unlisted path is admin, so a route added tomorrow is closed" do
@@ -445,16 +347,16 @@ defmodule Vagus.API.TiersTest do
     # The full matrix, written out rather than computed, so a change to the
     # ordering has to be made here too.
     @matrix %{
-      supervisor: ~w(bypass default homeassistant backup manager admin supervisor)a,
-      admin: ~w(bypass default homeassistant backup manager admin)a,
-      manager: ~w(bypass default homeassistant backup manager)a,
-      backup: ~w(bypass default backup)a,
-      homeassistant: ~w(bypass default homeassistant)a,
-      default: ~w(bypass default)a,
-      none: ~w(bypass)a
+      supervisor: ~w(anonymous bypass default homeassistant backup manager admin supervisor)a,
+      admin: ~w(anonymous bypass default homeassistant backup manager admin)a,
+      manager: ~w(anonymous bypass default homeassistant backup manager)a,
+      backup: ~w(anonymous bypass default backup)a,
+      homeassistant: ~w(anonymous bypass default homeassistant)a,
+      default: ~w(anonymous bypass default)a,
+      none: ~w(anonymous bypass)a
     }
 
-    @all_requirements ~w(bypass default homeassistant backup manager admin supervisor)a
+    @all_requirements ~w(anonymous bypass default homeassistant backup manager admin supervisor)a
 
     test "each tier reaches exactly the requirements it should" do
       for {tier, allowed} <- @matrix, requirement <- @all_requirements do

@@ -136,6 +136,56 @@ defmodule Vagus.API.AuthTierGateTest do
     end
   end
 
+  describe "a tier refusal is counted, never logged with the caller's bytes" do
+    import ExUnit.CaptureLog
+
+    @marker "zz-authz-marker"
+
+    test "off device, one line naming the tier the path demands and not the path" do
+      token = addon_token("tier_gate_count_host")
+
+      log = capture_log(fn -> assert call(:get, "/store/#{@marker}", token).status == 403 end)
+
+      assert log =~ "authz/manager"
+      refute log =~ @marker
+
+      log = capture_log(fn -> assert call(:post, "/#{@marker}/x", token).status == 403 end)
+
+      assert log =~ "authz/admin"
+      refute log =~ @marker
+    end
+
+    test "on device, it lands in the guard's authz bucket and logs nothing per request" do
+      prev = Application.get_env(:vagus, :api_source_guard)
+      Application.put_env(:vagus, :api_source_guard, true)
+
+      on_exit(fn ->
+        if is_nil(prev),
+          do: Application.delete_env(:vagus, :api_source_guard),
+          else: Application.put_env(:vagus, :api_source_guard, prev)
+      end)
+
+      start_supervised!({Vagus.API.SourceGuard, name: Vagus.API.SourceGuard})
+      token = addon_token("tier_gate_count_device")
+
+      log =
+        capture_log(fn ->
+          for _ <- 1..3, do: assert(call(:get, "/store/#{@marker}", token).status == 403)
+          _ = :sys.get_state(Vagus.API.SourceGuard)
+        end)
+
+      refute log =~ "authz/"
+
+      assert %{filtered: 3, filtered_by: %{authz: 3}, filtered_sample: "authz/manager"} =
+               :sys.get_state(Vagus.API.SourceGuard)
+    end
+
+    test "a permitted request counts nothing" do
+      log = capture_log(fn -> assert call_as_core(:get, "/info").status == 200 end)
+      refute log =~ "authz/"
+    end
+  end
+
   describe "Core keeps everything" do
     test "every read the hassio coordinator polls is still reachable" do
       for path <- @core_reads do
@@ -345,6 +395,23 @@ defmodule Vagus.API.AuthTierGateTest do
       assert call(:get, "/supervisor/ping", Token.get()).status == 200
       assert call(:get, "/supervisor/ping", "not-a-real-token").status == 200
       assert call_as_core(:get, "/supervisor/ping").status == 200
+    end
+
+    # The table's anonymous rows carry no method, so a token of any tier
+    # clears the gate on these paths. Nothing but the GET is routed there.
+    test "a token-bearing non-GET on a token-free path finds no handler" do
+      token = addon_token("tier_gate_anon_row")
+
+      for method <- [:post, :delete], path <- ["/supervisor/ping", "/addons/core_mqtt/icon"] do
+        assert call(method, path, token).status == 404
+      end
+    end
+
+    test "the root path is admin, like any path with no row" do
+      manager = addon_token("tier_gate_root", %{hassio_api: true, hassio_role: "manager"})
+
+      assert call(:get, "/", manager).status == 403
+      assert call_as_core(:get, "/").status == 404
     end
 
     test "a non-GET on the same path is NOT carved out" do
