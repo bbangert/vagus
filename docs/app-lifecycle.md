@@ -381,14 +381,16 @@ applies the same boot rule.
 **An app process that loaded a saved file** calls
 `Vagus.App.Orchestrator.up/1` from its `init/1`; one created by an install
 enters `:new` without announcing, as nothing has been installed to boot. Once boot is over, the Orchestrator inspects that app's container
-and sends `boot_start` with the answer. Mid-boot it tells, by pid, the processes its
-own `init/1` started from any other. The announcement of one it started is
-covered by its stage: replaying it too would find a `once` app that had
-already exited stopped and start it a second time. Any other's, a
-successor's, is replayed when boot ends: its stage may already have run, and
-it would otherwise own neither its token nor its running container until the
-next boot. If its stage ran after the restart it is already started, so that
-replay is a no-op.
+and sends `boot_start` with the answer. Mid-boot it remembers each
+announcement, stamped when the process made it, and the boot task returns
+when each app's stage began. When boot ends, only a successor that announced
+after its stage began, or whose app no stage reached, is replayed: its stage
+may have reached the process it replaced, and it would otherwise own neither
+its token nor its running container until the next boot. One that announced
+before its stage began, including every process the Orchestrator's own
+`init/1` started, got that stage's `boot_start`: a replay would start a
+`once` app that had already exited a second time, or retry a failed start
+outside its restart ladder.
 
 **Once-per-VM guards.** Two `:persistent_term` flags survive any restart of
 this tree: the sweep's `{Vagus.App.Units, :swept}`, and

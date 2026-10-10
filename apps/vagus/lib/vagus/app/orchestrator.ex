@@ -113,13 +113,14 @@ defmodule Vagus.App.Orchestrator do
 
   @doc """
   Called by an app process as it starts: applies the boot rule to its app,
-  once boot is over. Mid-boot, one of the processes `init/1` started is left
-  to its stage; any other is given the rule when boot ends. Its container is
-  inspected first, so a wanted one still running is started again under a
-  token the new process holds.
+  once boot is over. Mid-boot, one that announced before its stage began is
+  left to that stage, and any other is given the rule when boot ends. Its
+  container is inspected first, so a wanted one still running is started
+  again under a token the new process holds.
   """
   @spec up(String.t(), GenServer.server()) :: :ok
-  def up(slug, server \\ __MODULE__), do: GenServer.cast(server, {:up, slug, self()})
+  def up(slug, server \\ __MODULE__),
+    do: GenServer.cast(server, {:up, slug, System.unique_integer([:monotonic])})
 
   @impl GenServer
   def init(opts) do
@@ -140,11 +141,10 @@ defmodule Vagus.App.Orchestrator do
     # app process exists.
     Map.get(cfg.units, :import, &Units.import/0).()
     ensure = Map.get(cfg.units, :ensure, &Units.ensure/1)
-    slugs = Map.get(cfg.units, :slugs, &Vagus.App.slugs/0).()
-    inits = for slug <- slugs, {:ok, pid} <- [ensure.(slug)], into: %{}, do: {pid, slug}
+    Enum.each(Map.get(cfg.units, :slugs, &Vagus.App.slugs/0).(), ensure)
 
     state = %{phase: :up, task: nil, waiters: [], resume: false, deadline: :infinity, cfg: cfg}
-    {:ok, Map.merge(state, %{ups: MapSet.new(), inits: inits}), {:continue, :boot}}
+    {:ok, Map.put(state, :ups, %{}), {:continue, :boot}}
   end
 
   # The rest of the units are resolved here rather than in init/1: they lead
@@ -175,7 +175,7 @@ defmodule Vagus.App.Orchestrator do
   def handle_cast(:resume, %{phase: phase} = state) when phase in [:stopping, :cancelling],
     do: {:noreply, %{state | resume: true}}
 
-  def handle_cast({:up, slug, _pid}, %{phase: :up, cfg: %{boot: true, units: units}} = state) do
+  def handle_cast({:up, slug, _at}, %{phase: :up, cfg: %{boot: true, units: units}} = state) do
     Task.Supervisor.start_child(Vagus.TaskSupervisor, fn ->
       boot_start(slug, units.inspect.(slug), units)
     end)
@@ -183,18 +183,10 @@ defmodule Vagus.App.Orchestrator do
     {:noreply, state}
   end
 
-  # Announced by a process init/1 started, so up before the boot began: its
-  # stage gives it its rule. A replay too would find a `once` app that has
-  # already exited stopped and start it a second time.
-  def handle_cast({:up, _slug, pid}, %{phase: :booting, inits: inits} = state)
-      when is_map_key(inits, pid),
-      do: {:noreply, state}
-
-  # A successor: its stage may already be behind it, and nothing later in the
-  # boot revisits it, so without the replay at boot's end it would own
-  # neither a token nor its still-running container until the next boot.
-  def handle_cast({:up, slug, _pid}, %{phase: :booting} = state),
-    do: {:noreply, %{state | ups: MapSet.put(state.ups, slug)}}
+  # Its stage may already be behind it, and nothing later in the boot revisits
+  # it, so it is remembered for a replay at boot's end (`finish/2`).
+  def handle_cast({:up, slug, at}, %{phase: :booting} = state),
+    do: {:noreply, %{state | ups: Map.update(state.ups, slug, at, &max(&1, at))}}
 
   def handle_cast(_ignored, state), do: {:noreply, state}
 
@@ -222,11 +214,15 @@ defmodule Vagus.App.Orchestrator do
     if state.resume, do: {:noreply, boot(%{state | resume: false})}, else: {:noreply, state}
   end
 
-  # A slug its stage reached after the restart is already started under the
-  # successor's token, so its replay is a no-op (`Vagus.App.Policy.boot/2`).
-  defp finish(_result, state) do
-    Enum.each(state.ups, &GenServer.cast(self(), {:up, &1, nil}))
-    {:noreply, %{state | phase: :up, ups: MapSet.new(), inits: %{}}}
+  # Replayed only when made after its app's stage began, or when no stage
+  # reached that app. One made earlier, including every process init/1
+  # started, got that stage's `boot_start`: a replay would start a `once` app
+  # that already exited a second time, or retry a failed start outside its
+  # restart ladder.
+  defp finish(staged, state) do
+    for {slug, at} <- state.ups, at > Map.get(staged, slug, at - 1), do: up(slug, self())
+
+    {:noreply, %{state | phase: :up, ups: %{}}}
   end
 
   defp preempt(%{phase: :booting} = state) do
@@ -248,19 +244,20 @@ defmodule Vagus.App.Orchestrator do
   # A stop halts every app and a resume boots them all, so no replay is owed.
   defp begin_stop(%{cfg: cfg, deadline: deadline} = state) do
     task = Task.Supervisor.async_nolink(Vagus.TaskSupervisor, fn -> run_stop(cfg, deadline) end)
-    %{state | phase: :stopping, task: task, ups: MapSet.new()}
+    %{state | phase: :stopping, task: task, ups: %{}}
   end
 
   defp run_boot(cfg) do
     if slug = cfg.default_native_app, do: install_default(slug, cfg.units)
 
-    _running =
-      Enum.reduce(@plan, :unknown, fn step, running ->
+    {_running, staged} =
+      Enum.reduce(@plan, {:unknown, %{}}, fn step, acc ->
         checkpoint(0)
-        step(step, running, cfg)
+        step(step, acc, cfg)
       end)
 
     cfg.units.push_complete.()
+    staged
   catch
     :cancelled -> :cancelled
   end
@@ -282,29 +279,31 @@ defmodule Vagus.App.Orchestrator do
   end
 
   # `running` is the engine's one listing of app containers, taken once the
-  # engine gate is behind and carried through the stages.
-  defp step({:gate, name}, running, cfg) do
+  # engine gate is behind and carried through the stages. `staged` maps each
+  # app a stage gave `boot_start` to when that stage began.
+  defp step({:gate, name}, {running, staged}, cfg) do
     gate(name, Map.fetch!(cfg.units.gates, name), cfg, 1)
-    if name == :engine, do: listing(cfg), else: running
+    {if(name == :engine, do: listing(cfg), else: running), staged}
   end
 
-  defp step({:stage, :core}, running, cfg) do
+  defp step({:stage, :core}, acc, cfg) do
     task = spawn_unit(fn -> ready("Core", cfg.units.core_start.(cfg.stage_timeout)) end)
     await(:core, [{"core", task}], cfg)
-    running
+    acc
   end
 
-  defp step({:stage, stage}, running, %{units: units} = cfg) do
+  defp step({:stage, stage}, {running, staged}, %{units: units} = cfg) do
     {once, awaited} =
       units.list.()
       |> Enum.filter(&in_stage?(&1, stage, units))
       |> Enum.split_with(&(&1.config.startup == "once"))
 
+    at = System.unique_integer([:monotonic])
     start = fn slug -> spawn_unit(fn -> boot_start(slug, running?(running, slug), units) end) end
     Enum.each(once, &start.(&1.config.slug))
     tasks = for %{config: %{slug: slug}} <- awaited, do: {slug, start.(slug)}
     await(stage, tasks, cfg)
-    running
+    {running, Enum.reduce(once ++ awaited, staged, &Map.put(&2, &1.config.slug, at))}
   end
 
   defp listing(cfg) do

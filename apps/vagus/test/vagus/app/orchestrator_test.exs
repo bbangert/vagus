@@ -722,6 +722,33 @@ defmodule Vagus.App.OrchestratorTest do
       refute_receive {:boot_start, _}, 100
     end
 
+    test "a successor started before its stage ran, whose start then fails, is not given it again" do
+      slug = slug()
+      test_pid = self()
+      gates = Map.new([:tree, :engine, :network], &{&1, gate(test_pid, &1)})
+      gates = Map.put(gates, :api, held(test_pid, :api))
+
+      boot_start = fn slug, _running? ->
+        send(test_pid, {:boot_start, slug}) && {:error, :boom}
+      end
+
+      start_with_processes([app(slug, "initialize")], %{gates: gates, boot_start: boot_start})
+      assert_receive {:api, api}
+
+      [{pid, _}] = Registry.lookup(Vagus.App.Directory, {:slug, slug})
+      :ok = Vagus.App.Instances.stop(slug)
+      assert {:ok, successor} = Vagus.App.Instances.ensure(slug)
+      assert successor != pid
+      assert %{phase: :booting} = :sys.get_state(Orchestrator)
+
+      send(api, :release)
+      messages = collect_until(:complete)
+      assert {:report, :initialize, [{slug, :failed}]} in messages
+      assert Enum.count(messages, &(&1 == {:boot_start, slug})) == 1
+      assert %{phase: :up} = await_boot(Orchestrator)
+      refute_receive {:boot_start, ^slug}, 100
+    end
+
     test "a successor started after its stage ran is given its boot rule again once boot ends" do
       slug = slug()
       hold = held(self(), :core)
