@@ -2,20 +2,21 @@
  * vagus_walk <root>: stream every entry under <root> to the BEAM as
  * {packet, 4} frames (the protocol is documented in Vagus.Backup.Walk).
  *
- * The kernel enforces the boundary, not path checks: every open is
- * openat2(parent_fd, name, RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS), so an app
- * that swaps a directory for a symlink between our listing and our open gets
- * ELOOP instead of a walk into host files as root. A path-based
- * lstat-then-open cannot close that window; a descriptor-relative open can.
+ * The kernel enforces the boundary: every open is relative to the parent's
+ * descriptor with RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS, so a directory
+ * swapped for a symlink mid-walk is refused (ELOOP), not followed as root. A
+ * directory moved out of the root mid-walk stays walkable through its
+ * descriptor, but that rename crosses mounts, which only host root can do.
  *
- * A symlink is reported as skipped, not as an error: apps legitimately keep
- * symlinks in their data and upstream backups never follow them either, so an
- * error would make such an app unbackupable, while dropping it silently would
- * hide the skip. A real read error stops the walk: never an incomplete backup.
+ * Symlinks are skipped, as upstream backups do; a real read error stops the
+ * walk, since an incomplete backup must never look complete.
  *
- * Each entry is first opened O_PATH and typed by fstat; only a regular file
- * or directory is reopened for reading, and must be the same inode. A fifo
- * opened O_RDONLY blocks and a device open can have side effects.
+ * Each entry is typed by fstat on an O_PATH descriptor, and only a regular
+ * file or directory is reopened, through that descriptor, never the name: a
+ * fifo renamed in between would block the open, a device node's open can act.
+ *
+ * Every frame but X and Z waits for an ack on stdin: a port has no
+ * inbound flow control, so otherwise the walker outruns the owner's mailbox.
  */
 #define _GNU_SOURCE
 #include <dirent.h>
@@ -32,18 +33,17 @@
 #ifndef SYS_openat2
 #define SYS_openat2 437
 #endif
-#ifndef RESOLVE_NO_SYMLINKS
-#define RESOLVE_NO_SYMLINKS 0x04
-#endif
-#ifndef RESOLVE_BENEATH
-#define RESOLVE_BENEATH 0x08
-#endif
-
-/* Local definition: libc headers that ship one vary, and some ship none. */
+/* Local copies of the kernel ABI: not every libc ships linux/openat2.h. */
+enum { VW_NO_XDEV = 0x01, VW_NO_SYMLINKS = 0x04, VW_BENEATH = 0x08 };
 struct vw_open_how { uint64_t flags, mode, resolve; };
 
 #define CHUNK 65536
 #define REL_MAX 4096
+#define DEPTH_MAX 64 /* bounds the fds and stack a hostile tree makes us hold */
+
+/* NO_XDEV: only an already-privileged party can mount inside a data dir, and
+ * a stalled network mount would hang the walker. Like tar --one-file-system. */
+#define RESOLVE_ENTRY (VW_BENEATH | VW_NO_SYMLINKS | VW_NO_XDEV)
 
 static unsigned char frame[5 + CHUNK];
 
@@ -66,10 +66,18 @@ static void write_all(const unsigned char *p, size_t n)
     }
 }
 
-static void put_len(size_t len)
+/* The ack is an empty frame: one 4-byte pipe write, so it is read whole. */
+static void put_frame(size_t len, int ack)
 {
+    unsigned char b[4];
+    ssize_t n = 4;
     for (int i = 0; i < 4; i++)
         frame[i] = (unsigned char) (len >> (24 - 8 * i));
+    write_all(frame, 4 + len);
+    while (ack && (n = read(STDIN_FILENO, b, sizeof b)) < 0 && errno == EINTR)
+        ;
+    if (n != 4)
+        exit(2);
 }
 
 /* A frame is the tag byte, then the non-NULL fields joined by NUL. */
@@ -87,8 +95,7 @@ static void emit(char tag, const char *a, const char *b, const char *c, const ch
         memcpy(frame + 4 + len, fields[i], n);
         len += n;
     }
-    put_len(len);
-    write_all(frame, 4 + len);
+    put_frame(len, tag != 'X' && tag != 'Z');
 }
 
 static const char *errname(int e)
@@ -97,6 +104,7 @@ static const char *errname(int e)
         {EIO, "eio"}, {EACCES, "eacces"}, {EPERM, "eperm"}, {ENOMEM, "enomem"},
         {EMFILE, "emfile"}, {ENFILE, "enfile"}, {ENAMETOOLONG, "enametoolong"},
         {ENOTDIR, "enotdir"}, {ENOSYS, "enosys"}, {EINVAL, "einval"}, {ESTALE, "estale"},
+        {ENOENT, "enoent"}, {ELOOP, "eloop"}, {EXDEV, "exdev"},
     };
     for (size_t i = 0; i < sizeof names / sizeof names[0]; i++)
         if (names[i].e == e)
@@ -116,13 +124,11 @@ static const char *skip_reason(mode_t m)
          : (S_ISCHR(m) || S_ISBLK(m)) ? "device" : "other";
 }
 
-/* Returns 1 when the open hit a resolve-flag refusal or a vanished name. */
-static int skippable_open_error(const char *rel, int e)
+static void skip(const char *rel, const char *why, int fd)
 {
-    const char *why = e == ELOOP ? "eloop" : e == EXDEV ? "exdev" : e == ENOENT ? "enoent" : NULL;
-    if (why)
-        emit('S', rel, why, NULL, NULL);
-    return why != NULL;
+    emit('S', rel, why, NULL, NULL);
+    if (fd >= 0)
+        close(fd);
 }
 
 static void send_file(int fd, const char *rel, const struct stat *st)
@@ -145,67 +151,66 @@ static void send_file(int fd, const char *rel, const struct stat *st)
             fail(rel, errno);
         if (n == 0)
             break;
-        put_len((size_t) n + 1);
         frame[4] = 'C';
-        write_all(frame, 5 + (size_t) n);
+        put_frame((size_t) n + 1, 1);
         left -= n;
     }
     emit('E', NULL, NULL, NULL, NULL);
 }
 
-/* -1 means the entry was reported as skipped. */
-static int open_entry(int parent, const char *name, const char *rel, uint64_t flags)
-{
-    int fd = open2(parent, name, flags, RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS);
-    if (fd < 0 && !skippable_open_error(rel, errno))
-        fail(rel, errno);
-    return fd;
-}
+static void walk(int fd, const char *prefix, int depth);
 
-static void walk(int dirfd, const char *prefix);
-
-static void visit(int parent, const char *name, const char *rel)
+static void visit(int parent, const char *name, const char *rel, int depth)
 {
     struct stat probe, st;
-    int pfd = open_entry(parent, name, rel, O_PATH | O_NOFOLLOW | O_CLOEXEC);
-    if (pfd < 0)
+    int pfd = open2(parent, name, O_PATH | O_NOFOLLOW | O_CLOEXEC, RESOLVE_ENTRY);
+    if (pfd < 0) {
+        /* A resolve-flag refusal or a name that vanished since readdir. */
+        if (errno != ELOOP && errno != EXDEV && errno != ENOENT)
+            fail(rel, errno);
+        skip(rel, errname(errno), -1);
         return;
+    }
     if (fstat(pfd, &probe) < 0)
         fail(rel, errno);
-    close(pfd);
 
     int is_dir = S_ISDIR(probe.st_mode);
-    if (!is_dir && !S_ISREG(probe.st_mode)) {
-        emit('S', rel, skip_reason(probe.st_mode), NULL, NULL);
+    const char *why = !is_dir && !S_ISREG(probe.st_mode) ? skip_reason(probe.st_mode)
+                    : is_dir && depth > DEPTH_MAX ? "depth" : NULL;
+    if (why) {
+        skip(rel, why, pfd);
         return;
     }
 
-    uint64_t flags = O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NOCTTY | (is_dir ? O_DIRECTORY : 0);
-    int fd = open_entry(parent, name, rel, flags);
+    /* Through /proc there is no second name lookup to race. Without /proc
+     * this fails and the walk stops with an X error; it never falls back to
+     * the name. O_NONBLOCK never affects regular-file or directory reads. */
+    char self[32];
+    snprintf(self, sizeof self, "/proc/self/fd/%d", pfd);
+    int fd = open(self, O_RDONLY | O_CLOEXEC | O_NOCTTY | O_NONBLOCK | (is_dir ? O_DIRECTORY : 0));
     if (fd < 0)
-        return;
+        fail(rel, errno);
+    close(pfd);
     if (fstat(fd, &st) < 0)
         fail(rel, errno);
-    /* The name may have been swapped between the two opens. */
     if (st.st_dev != probe.st_dev || st.st_ino != probe.st_ino) {
-        emit('S', rel, "changed", NULL, NULL);
-        close(fd);
+        skip(rel, "changed", fd);
         return;
     }
 
     if (is_dir) {
         emit('D', rel, NULL, NULL, NULL);
-        walk(fd, rel);
+        walk(fd, rel, depth);
     } else {
         send_file(fd, rel, &st);
+        close(fd);
     }
-    close(fd);
 }
 
-static void walk(int dirfd, const char *prefix)
+/* Takes ownership of fd: closedir closes it. */
+static void walk(int fd, const char *prefix, int depth)
 {
-    int lfd = dup(dirfd);
-    DIR *dir = lfd < 0 ? NULL : fdopendir(lfd);
+    DIR *dir = fdopendir(fd);
     if (!dir)
         fail(prefix, errno);
 
@@ -225,7 +230,7 @@ static void walk(int dirfd, const char *prefix)
                         : snprintf(rel, sizeof rel, "%s", de->d_name);
         if (n < 0 || (size_t) n >= sizeof rel)
             fail(prefix, ENAMETOOLONG);
-        visit(dirfd, de->d_name, rel);
+        visit(dirfd(dir), de->d_name, rel, depth + 1);
     }
     closedir(dir);
 }
@@ -234,17 +239,12 @@ int main(int argc, char **argv)
 {
     if (argc != 2)
         return 64;
-    int root = open2(AT_FDCWD, argv[1], O_PATH | O_DIRECTORY | O_CLOEXEC, RESOLVE_NO_SYMLINKS);
-    if (root < 0)
-        fail("", errno);
-    int rfd = open2(root, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC,
-                    RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS);
+    /* No NO_XDEV here: the data dir may itself be a mount. */
+    int rfd = open2(AT_FDCWD, argv[1], O_RDONLY | O_DIRECTORY | O_CLOEXEC, VW_NO_SYMLINKS);
     if (rfd < 0)
         fail("", errno);
-    close(root);
 
-    walk(rfd, "");
-    close(rfd);
+    walk(rfd, "", 0);
     emit('Z', NULL, NULL, NULL, NULL);
     return 0;
 }
