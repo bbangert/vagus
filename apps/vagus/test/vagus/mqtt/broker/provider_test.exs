@@ -123,8 +123,11 @@ defmodule Vagus.Mqtt.Broker.ProviderTest do
   test "publishes again into the next app process after its own is killed",
        %{slug: slug} = ctx do
     install_app(app_config(slug))
-    start_provider(ctx)
+    provider = start_provider(ctx)
     assert_receive {:push, :post, %{uuid: old}}
+    # The POST is delivered before the app process replies; killed in between,
+    # the provider never learns `old` and has no uuid to retire.
+    assert :sys.get_state(provider).uuid == old
 
     old_pid = app_pid(slug)
     ref = Process.monitor(old_pid)
@@ -143,8 +146,9 @@ defmodule Vagus.Mqtt.Broker.ProviderTest do
   # Core told the old uuid is gone first would briefly have no mqtt flow.
   test "the re-post's POST reaches Core before the old uuid's DELETE", %{slug: slug} = ctx do
     install_app(app_config(slug))
-    start_provider(ctx)
+    provider = start_provider(ctx)
     assert_receive {:push, :post, %{uuid: old}}
+    assert :sys.get_state(provider).uuid == old
 
     pusher = hold_discovery_queue(:push)
     push = Process.whereis(Vagus.Discovery.Push)
@@ -193,6 +197,8 @@ defmodule Vagus.Mqtt.Broker.ProviderTest do
 
         {:ok, _pid} = Supervisor.restart_child(Vagus.App.Supervisor, Vagus.App.Instances)
         assert_receive {:push, :post, %{addon: ^slug, service: "mqtt"}}, 1_000
+        # The POST is delivered before the provider logs its success.
+        _state = :sys.get_state(provider)
         :erlang.trace(pid, false, [:receive])
       end)
 
