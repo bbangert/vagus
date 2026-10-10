@@ -20,24 +20,36 @@ defmodule Vagus.App.StepsTest do
   @host_dsp_nodes ["/dev/null", "/dev/zero"]
 
   defp mosquitto_config do
-    {:ok, c} =
-      Config.parse(%{
-        "name" => "Mosquitto broker",
-        "version" => "7.1.0",
-        "slug" => "core_mosquitto",
-        "description" => "MQTT broker",
-        "arch" => ["aarch64", "amd64"],
-        "image" => "homeassistant/{arch}-addon-mosquitto",
-        "init" => false,
-        "startup" => "system",
-        "auth_api" => true,
-        "services" => ["mqtt:provide"],
-        "discovery" => ["mqtt"],
-        "ports" => %{"1883/tcp" => 1883, "8883/tcp" => 8883},
-        "map" => ["ssl", "share"]
-      })
-
+    {:ok, c} = Config.parse(mosquitto_raw())
     c
+  end
+
+  defp mosquitto_raw do
+    %{
+      "name" => "Mosquitto broker",
+      "version" => "7.1.0",
+      "slug" => "core_mosquitto",
+      "description" => "MQTT broker",
+      "arch" => ["aarch64", "amd64"],
+      "image" => "homeassistant/{arch}-addon-mosquitto",
+      "init" => false,
+      "startup" => "system",
+      "auth_api" => true,
+      "services" => ["mqtt:provide"],
+      "discovery" => ["mqtt"],
+      "ports" => %{"1883/tcp" => 1883, "8883/tcp" => 8883},
+      "map" => ["ssl", "share"]
+    }
+  end
+
+  # Only the `map:`-derived binds; /data and /dev are always there.
+  defp map_mounts(map) do
+    {:ok, config} = Config.parse(%{mosquitto_raw() | "map" => map})
+    spec = Steps.build_spec(config, access_token: "t", arch: "amd64", data_root: "/data")
+
+    spec.mounts
+    |> Enum.reject(&(&1.target in ["/data", "/dev"]))
+    |> Enum.map(&Map.take(&1, [:source, :target, :read_only, :propagation]))
   end
 
   describe "build_spec/2 (hermetic)" do
@@ -96,6 +108,61 @@ defmodule Vagus.App.StepsTest do
       share = Enum.find(s.mounts, &(&1.target == "/share"))
       assert share.source == "/data/share"
       assert share.propagation == "rslave"
+    end
+
+    test "mounts: app_config is the renamed addon_config — same /config bind" do
+      expected = %{
+        source: "/data/addon_configs/core_mosquitto",
+        target: "/config",
+        read_only: false,
+        propagation: nil
+      }
+
+      assert map_mounts(["app_config:rw"]) == [expected]
+      assert map_mounts(["addon_config:rw"]) == [expected]
+    end
+
+    # Upstream mounts the renamed keys at renamed targets (`docker/const.py`
+    # PATH_ALL_APP_CONFIGS / PATH_LOCAL_APPS); the legacy keys keep theirs.
+    test "mounts: all_app_configs and local_apps bind the legacy sources at the new targets" do
+      assert map_mounts(["all_app_configs"]) == [
+               %{
+                 source: "/data/addon_configs",
+                 target: "/app_configs",
+                 read_only: true,
+                 propagation: nil
+               }
+             ]
+
+      assert map_mounts(["all_addon_configs"]) == [
+               %{
+                 source: "/data/addon_configs",
+                 target: "/addon_configs",
+                 read_only: true,
+                 propagation: nil
+               }
+             ]
+
+      assert map_mounts(["local_apps:rw"]) == [
+               %{
+                 source: "/data/addons/local",
+                 target: "/local_apps",
+                 read_only: false,
+                 propagation: nil
+               }
+             ]
+    end
+
+    test "mounts: a legacy key is ignored when its app counterpart is also declared" do
+      assert [%{target: "/config", read_only: false}] =
+               map_mounts(["addon_config", "app_config:rw"])
+
+      assert [%{target: "/app_configs"}] = map_mounts(["all_addon_configs", "all_app_configs"])
+    end
+
+    test "mounts: an unknown map type still warns and is skipped" do
+      log = capture_log([level: :warning], fn -> assert map_mounts(["bogus_config"]) == [] end)
+      assert log =~ "unknown map type 'bogus_config'"
     end
 
     test "mounts: every add-on gets the host /dev read-only (MOUNT_DEV parity)", %{spec: s} do
