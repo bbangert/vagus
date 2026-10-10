@@ -252,7 +252,7 @@ defmodule Vagus.Core.Transport do
   Supervisor user", which a proxied frame truthfully IS, so the credential
   swap satisfies the check rather than failing it. The reservation is
   enforced one layer up instead, per relayed frame, by
-  `Vagus.API.CoreProxy.WSBridge`'s `reserved_command/1`.
+  `Vagus.API.CoreProxy.WSBridge`'s `screen/1`.
   """
   @spec connect_args(t()) :: {Mint.Types.scheme(), Mint.Types.address(), :inet.port_number()}
   def connect_args({:socket, socket}), do: {:http, {:local, socket}, 0}

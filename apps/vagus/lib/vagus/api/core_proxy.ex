@@ -260,7 +260,11 @@ defmodule Vagus.API.CoreProxy do
           Vagus.API.CoreProxy.WSBridge,
           %{},
           timeout: 900_000,
-          max_frame_size: 4_194_304
+          max_frame_size: 4_194_304,
+          # Bandit caps a fragmented message separately, at 8 MB by default.
+          # Core takes nothing over 4 MiB, so a larger one could only be
+          # decoded here and then refused there.
+          max_fragmented_message_size: 4_194_304
         )
     end
   end
