@@ -197,6 +197,23 @@ defmodule Vagus.BackupTest do
     refute File.exists?(path)
   end
 
+  @tag skip: elem(System.cmd("id", ["-u"]), 0) == "0\n" && "root searches a 0o000 directory"
+  test "a data root that cannot be lstat'd fails the snapshot rather than being empty", %{
+    data: data
+  } do
+    locked = Path.join(Path.dirname(data), "locked")
+    root = Path.join(locked, "data")
+    File.mkdir_p!(root)
+    File.chmod!(locked, 0o000)
+    on_exit(fn -> File.chmod(locked, 0o700) end)
+    path = Path.join(Path.dirname(data), "x.tar.gz")
+
+    assert {:error, {:read, ".", :eacces}} =
+             Backup.write_addon_tar(%{slug: "x", version: "1", data_dir: root}, path)
+
+    refute File.exists?(path)
+  end
+
   test "an entry the walk cannot lstat fails the snapshot rather than being dropped", %{
     data: data
   } do

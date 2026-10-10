@@ -168,8 +168,6 @@ defmodule Vagus.Backups do
   is stored. The staging directory is removed either way.
   """
   @spec finish_partial(map(), [String.t()]) :: {:ok, String.t()} | {:error, term()}
-  # path is internal/config-derived, not request input
-  # sobelow_skip ["Traversal.FileModule"]
   def finish_partial(handle, addon_slugs) do
     with {:ok, inner} <- staged(handle.staging_dir, addon_slugs) do
       # `supervisor_version` is the emulated version the whole wire claims
@@ -185,17 +183,12 @@ defmodule Vagus.Backups do
         extra: handle.extra
       }
 
-      # Renamed where it can be: the staging root is the default backup
-      # dir's sibling, but `opts[:dir]`/`set_dir/2` can put the backup dir
-      # on another filesystem. The staged copy goes with the staging dir.
+      # Only a rename: a copy interrupted partway would leave a truncated
+      # `<slug>.tar` visible over a valid older backup.
       outer = Path.join(handle.staging_dir, ".outer.tar")
 
-      move = fn src, dst ->
-        with {:error, :exdev} <- File.rename(src, dst), do: File.cp(src, dst)
-      end
-
       with {:ok, ^outer} <- Vagus.Backup.create(spec, date: handle.date, to: outer),
-           do: store_path(outer, handle.server, move)
+           do: store_path(outer, handle.server, &File.rename/2)
     end
   after
     discard_partial(handle)

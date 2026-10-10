@@ -328,8 +328,12 @@ defmodule Vagus.Backup do
   # path is internal/config-derived, not request input
   # sobelow_skip ["Traversal.FileModule"]
   defp add_dir(tar, dir, max_bytes) do
-    with {:ok, %File.Stat{type: :directory}} <- File.lstat(dir),
-         do: add_tree(tar, dir, [], max_bytes)
+    case File.lstat(dir) do
+      {:ok, %File.Stat{type: :directory}} -> add_tree(tar, dir, [], max_bytes)
+      {:ok, %File.Stat{}} -> :ok
+      {:error, :enoent} -> :ok
+      {:error, reason} -> throw({:read, ".", reason})
+    end
   end
 
   # sobelow_skip ["Traversal.FileModule"]
