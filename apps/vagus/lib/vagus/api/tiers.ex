@@ -16,7 +16,10 @@ defmodule Vagus.API.Tiers do
 
   `caller_tier/1` turns the caller `Vagus.API.Auth` resolved into a tier.
   `required/1` turns a request path into the tier that path demands.
-  `allows?/2` decides. `Vagus.API.Auth` is the only caller of all three.
+  `allows?/2` compares the two. `Vagus.API.Authz` puts them together for the
+  Supervisor-API leg. The Core proxy does not go through it yet:
+  `Vagus.API.Dispatcher` calls `blacklisted?/1` directly and
+  `Vagus.API.CoreProxy` grades its callers with a check of its own.
 
   ## Tiers
 
@@ -42,8 +45,13 @@ defmodule Vagus.API.Tiers do
 
   ## Requirements
 
-  Same vocabulary, plus `:bypass` at the bottom and `:supervisor` at the top:
+  Same vocabulary, plus `:anonymous` and `:bypass` at the bottom and
+  `:supervisor` at the top:
 
+    * `:anonymous` — upstream's `no_security_check`: answered before a token
+      is read, so every caller satisfies it, including one with no token.
+      Whether a request is actually served token-free is still
+      `Vagus.API.Auth`'s decision; the row is what lets the table show it.
     * `:bypass` — upstream's `api_bypass`: **any** installed add-on's token,
       even one with `hassio_api: false`. The handler does its own finer check
       (`/services`, `/discovery`, `/auth` all grant per-caller).
@@ -67,23 +75,33 @@ defmodule Vagus.API.Tiers do
 
     * a binary — that literal segment
     * `:_` — exactly one segment, any value
+    * `:slug` — exactly one segment that is a valid slug: upstream's
+      `RE_SLUG`, minus `.` and `..`
     * `:+` — one or more segments
     * `:*` — zero or more segments
 
   `:+`/`:*` backtrack, so `[:+, "info"]` is upstream's `/.+/info`.
 
   First match wins, so ordering is meaningful and the table is grouped
-  accordingly: bypass, then Vagus's stricter-than-upstream overrides, then
-  `/.+/info`, then the role families.
+  accordingly: bypass, the token-free paths, then Vagus's
+  stricter-than-upstream overrides, then `/.+/info`, then the role families.
   """
 
+  alias Vagus.Addon.Config
   alias Vagus.Core.Reserved
 
   @type tier ::
           :supervisor | :admin | :manager | :backup | :homeassistant | :default | :none
 
   @type requirement ::
-          :bypass | :default | :homeassistant | :backup | :manager | :admin | :supervisor
+          :anonymous
+          | :bypass
+          | :default
+          | :homeassistant
+          | :backup
+          | :manager
+          | :admin
+          | :supervisor
 
   @type caller :: :supervisor | {:addon, map()}
 
@@ -138,16 +156,20 @@ defmodule Vagus.API.Tiers do
     {["auth"], :bypass},
 
     # -- no_security_check ----------------------------------------------------
-    # `/supervisor/ping` WAS here as `:bypass` (audit B1's interim state: still
-    # token-gated, but not role-graded on top). Phase 8 made it genuinely
-    # token-free — `Vagus.API.Auth.unauthenticated?/1` now short-circuits it
-    # before this table is ever consulted, same as the icon/logo GETs, the
-    # other `no_security_check` member Vagus serves — so the row is DELETED
-    # rather than left behind: a route answered pre-table has no tier to pin,
-    # and a leftover `:bypass` entry reads as "still needs a token, just no
-    # role", which is no longer true. If you are diffing this file against
-    # `security.py` and expected to find `/supervisor/ping` here, it is not
-    # missing — see `Vagus.API.Auth`'s moduledoc instead.
+    # `/supervisor/ping`, and `/(store/)?addons/<RE_SLUG>/(logo|icon)` from
+    # `_V1_FRONTEND_PATHS`. Upstream answers these before
+    # `token_validation` reads a token, so they are the only rows a caller
+    # with no token satisfies. `:slug`, not `:_`: a segment outside `RE_SLUG`
+    # is not in upstream's pattern either and must keep the family tier below.
+    #
+    # Rows carry no method, so these admit every method on the path. Only the
+    # GET is served token-free (`Vagus.API.Auth.unauthenticated?/1`) and only
+    # the GET is routed; `Vagus.API.TiersTest` fails if that stops being true.
+    {["supervisor", "ping"], :anonymous},
+    {["addons", :slug, "icon"], :anonymous},
+    {["addons", :slug, "logo"], :anonymous},
+    {["store", "addons", :slug, "icon"], :anonymous},
+    {["store", "addons", :slug, "logo"], :anonymous},
 
     # -- Vagus stricter than upstream: supervisor-only (deliberate) -----------
     # Every entry here is a route the router already gated with
@@ -193,12 +215,18 @@ defmodule Vagus.API.Tiers do
     # `/addons/{slug}/sys_options`. Vagus does not serve it; the entry keeps
     # the catch-all from ever handing it to an admin-role add-on if it lands.
     {["addons", :_, "sys_options"], :supervisor},
+    # Not in 2026.07.5, where `/os/.+` leaves it at manager: upstream added it
+    # to `core_only` later. Unserved here; the row keeps a future route for
+    # writing the host's SSH keys from landing on the manager family.
+    {["os", "ssh", "authorized_keys"], :supervisor},
 
     # -- role_access[default] (security.py L111-115) --------------------------
     # `^(?:|/.+/info)$` — note `.+` spans `/`, so `/network/interface/eth0/info`
     # matches. Placed after the overrides above so a supervisor-only route
     # ending in `info` could never be widened by it.
-    {[], :default},
+    #
+    # The empty alternative has no row: it matches `""`, and a request path is
+    # never shorter than `/`, which upstream therefore grades admin.
     {[:+, "info"], :default},
 
     # -- role_access[homeassistant] (security.py L116-122) --------------------
@@ -355,6 +383,8 @@ defmodule Vagus.API.Tiers do
   # Core's own token is never role-checked (security.py L338-341 sets
   # `request_from` and every later branch is an `elif`).
   def allows?(:supervisor, _requirement), do: true
+  # Answered upstream before a token is read, so no tier can fail it.
+  def allows?(_tier, :anonymous), do: true
   # api_bypass runs before `access_hassio_api`, so even `:none` passes.
   def allows?(_tier, :bypass), do: true
   # Nothing below `:supervisor` reaches a supervisor-only route.
@@ -408,6 +438,11 @@ defmodule Vagus.API.Tiers do
   defp match_path?([:+ | _pattern], []), do: false
   defp match_path?([:_ | pattern], [_segment | rest]), do: match_path?(pattern, rest)
   defp match_path?([:_ | _pattern], []), do: false
+
+  defp match_path?([:slug | pattern], [segment | rest]),
+    do: Config.valid_slug?(segment) and match_path?(pattern, rest)
+
+  defp match_path?([:slug | _pattern], []), do: false
 
   defp match_path?([literal | pattern], [literal | rest]) when is_binary(literal),
     do: match_path?(pattern, rest)

@@ -253,6 +253,32 @@ defmodule Vagus.API.SourceGuardTest do
       assert length(String.split(log, "filtered ")) == 2
     end
 
+    # An authenticated app can repeat a refused request at will, so tier
+    # refusals are the same ring-eviction primitive as the pre-auth ones.
+    test "tier refusals share the counter and the single summary line" do
+      import ExUnit.CaptureLog
+
+      start_supervised!({SourceGuard, name: SourceGuard})
+
+      log =
+        capture_log(fn ->
+          for _ <- 1..4, do: SourceGuard.record_filtered(:authz, "authz/manager")
+          SourceGuard.record_filtered(:blacklist, "api/hassio proxy path")
+          send(SourceGuard, :refresh)
+          _ = :sys.get_state(SourceGuard)
+        end)
+
+      assert log =~ "filtered 5 request(s)"
+      assert log =~ "authz: 4"
+      assert log =~ "blacklist: 1"
+      assert length(String.split(log, "filtered ")) == 2
+
+      # The reset after a report must keep the bucket, or the next refusal
+      # crashes the guard.
+      SourceGuard.record_filtered(:authz, "authz/manager")
+      assert %{filtered_by: %{authz: 1}} = :sys.get_state(SourceGuard)
+    end
+
     test "record_filtered/2 is a no-op when the guard isn't running" do
       # No `start_supervised!` here — mirrors the existing "safe when
       # disabled" property `record_refusal/1` already has: casting to an
