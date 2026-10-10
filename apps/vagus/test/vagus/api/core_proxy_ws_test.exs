@@ -760,21 +760,36 @@ defmodule Vagus.API.CoreProxyWSTest do
     assert frame == {:text, @ordinary}
   end
 
-  test "an object whose type is not a string is refused under its own id", %{
+  defp assert_each_refused(client, cases) do
+    Enum.reduce(cases, client, fn {frame, id}, client ->
+      {reply, client} = send_refused(client, frame)
+      assert_unauthorized(reply, id)
+
+      {echo, client} = Client.next_frame(client, @recv_timeout)
+      assert echo == {:text, @ordinary}
+      client
+    end)
+  end
+
+  test "an object without a string type is refused under its own id", %{
     proxy_host: host,
     proxy_port: port
   } do
     client = relaying_client(host, port, "cp_ws_type_not_string")
 
-    {reply, _client} = send_refused(client, ~s({"id":7,"type":5}))
-    assert_unauthorized(reply, 7)
+    assert_each_refused(client, [{~s({"id":7,"type":5}), 7}, {~s({"id":1}), 1}])
   end
 
-  test "a batch with a non-object element is refused", %{proxy_host: host, proxy_port: port} do
+  test "a batch with an element that is not an object is refused", %{
+    proxy_host: host,
+    proxy_port: port
+  } do
     client = relaying_client(host, port, "cp_ws_batch_non_object")
 
-    {reply, _client} = send_refused(client, ~s([{"id":1,"type":"get_states"}, 5]))
-    assert_unauthorized(reply, nil)
+    assert_each_refused(client, [
+      {~s([{"id":1,"type":"get_states"}, 5]), nil},
+      {~s([[{"id":1,"type":"supervisor/api"}]]), nil}
+    ])
   end
 
   test "a JSON scalar is refused as one malformed command", %{
@@ -921,6 +936,34 @@ defmodule Vagus.API.CoreProxyWSTest do
       ~s({"id":4, "type":"call_service","domain":"light","service":"turn_on",) <>
         ~s("service_data":{"type":"a","type":"supervisor/api","rgb":[1,2,{"type":"x"}]}})
     )
+  end
+
+  # Masked with an all-zero key, so the payload goes out as written.
+  defp send_fragmented(%Client{conn: conn} = client, first, rest) do
+    frame = fn byte, data -> <<byte, 1::1, 127::7, byte_size(data)::64, 0::32, data::binary>> end
+    socket = Mint.HTTP.get_socket(conn)
+    :ok = :gen_tcp.send(socket, [frame.(0x01, first), frame.(0x80, rest)])
+    client
+  end
+
+  # Each fragment is under the per-frame cap; only their sum is over it.
+  test "a fragmented message is capped at Core's own message size", %{
+    proxy_host: host,
+    proxy_port: port
+  } do
+    client = relaying_client(host, port, "cp_ws_fragmented")
+
+    client = send_fragmented(client, ~s({"id":99,), ~s("type":"get_states"}))
+    assert_receive {:core_frame, :text, @ordinary}, @recv_timeout
+    {echo, client} = Client.next_frame(client, @recv_timeout)
+    assert echo == {:text, @ordinary}
+
+    half = String.duplicate("a", 2_500_000)
+    client = send_fragmented(client, ~s({"type":"get_states","pad":") <> half, half <> ~s("}))
+
+    {frame, _client} = Client.next_frame(client, @recv_timeout)
+    assert {:close, 1009, _reason} = frame
+    refute_received {:core_frame, _opcode, _data}
   end
 
   test "a batch of ordinary commands, and an empty one, still relay untouched", %{

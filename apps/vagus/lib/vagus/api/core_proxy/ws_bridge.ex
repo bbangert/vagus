@@ -105,15 +105,11 @@ defmodule Vagus.API.CoreProxy.WSBridge do
   `screen/1` below for the mechanics.
 
   Core dispatches each element of a JSON array frame as its own command, so
-  a batch is refused whole if any element is reserved. An element — or a
-  lone frame — that is not an object with exactly one `"type"`, a string,
-  is refused as well: what cannot be read as a command cannot be shown to
-  be allowed. A
-  batch has no one `id` to answer under and gets a single result with a
-  null one. Text that is not JSON at all closes both legs, as Core itself
-  would on receiving it. Parity with upstream `supervisor/api/proxy.py`
-  (`_denied_command_types`), bar the repeated-`"type"` refusal, which
-  upstream does not need: it parses with the same decoder Core does.
+  a batch is refused whole if any element is reserved, or cannot be read as
+  a command at all — as is a lone frame that cannot. A batch has no one
+  `id` to answer under, so its single result carries a null one. Text that
+  is not JSON closes both legs, as Core itself would on receiving it. This
+  is upstream `supervisor/api/proxy.py`'s `_denied_command_types`.
 
   ## Once past `:awaiting_auth`, relaying is a bounded synchronous handoff
 
@@ -243,6 +239,9 @@ defmodule Vagus.API.CoreProxy.WSBridge do
     end
   end
 
+  # Unscreened: Core reads a binary frame as a handler index plus payload,
+  # for a handler only an already-screened text command can register — never
+  # as a command.
   def handle_in(frame, %{phase: :relaying} = state), do: relay(frame, state)
 
   @impl WebSock
