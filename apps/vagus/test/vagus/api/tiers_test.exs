@@ -135,7 +135,16 @@ defmodule Vagus.API.TiersTest do
 
         # A predicate only narrows whom the tier admits. That is parity where
         # upstream's own handler narrows the same way, and stricter otherwise.
-        narrows? = row["predicates"] != %{} and not Map.has_key?(row, "upstream_handler")
+        # `subject: :self` narrows nothing on a path that says `self`: every
+        # app is its own subject there.
+        names_self? =
+          row["predicates"] == %{"subject" => "self"} and
+            Enum.at(segments(row["path"]), 1) == "self"
+
+        narrows? =
+          row["predicates"] != %{} and not Map.has_key?(row, "upstream_handler") and
+            not names_self?
+
         expected = if narrows?, do: "stricter", else: by_tier
 
         assert row["classification"] == expected, "#{label} is #{expected}"
