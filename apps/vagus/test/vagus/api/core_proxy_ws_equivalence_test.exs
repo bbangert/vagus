@@ -244,10 +244,13 @@ defmodule Vagus.API.CoreProxyWSEquivalenceTest do
 
   defp rows(ctx, name, grants) do
     install_app(app_config("eq_target"))
-    test_pid = self()
+    # Counted before the request is run, and so before its task can answer:
+    # the count read after an answer includes that answer's dispatch.
+    dispatches = :counters.new(1, [])
+    Process.put(:dispatches, dispatches)
 
     Stack.put_env(:ws_dispatch_fun, fn slug, credential, request ->
-      send(test_pid, :dispatched)
+      :counters.add(dispatches, 1, 1)
       plug = plug(request.method, request.path, request.body)
       WSDispatch.run(slug, credential, request, &plug.call(&1, plug.init([])))
     end)
@@ -375,17 +378,15 @@ defmodule Vagus.API.CoreProxyWSEquivalenceTest do
     # what the bridge decided and not this test's idea of it.
     expected = WSBridge.screen(frame, {:addon, %{slug: "x", homeassistant_api: true}})
 
+    dispatches = Process.get(:dispatches)
+    before = :counters.get(dispatches, 1)
+
     client = Client.send_frame(client, {:text, frame})
     {{:text, raw}, client} = Client.next_frame(client, @recv_timeout)
     reply = Jason.decode!(raw)
     assert reply["id"] == id
 
-    dispatched? =
-      receive do
-        :dispatched -> true
-      after
-        0 -> false
-      end
+    dispatched? = :counters.get(dispatches, 1) == before + 1
 
     assert dispatched? == match?({:call, _id, _request}, expected)
     {reply, dispatched?, client}

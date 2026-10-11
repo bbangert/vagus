@@ -1,5 +1,9 @@
 defmodule Vagus.API.CoreProxyWSDispatchTest.SpyRouter do
-  @moduledoc "`Vagus.API.Router`, reporting each request that reaches it to the test."
+  @moduledoc """
+  `Vagus.API.Router`, reporting each request that reaches it to the test.
+  The message is for asserting that a request arrived. That none did is read
+  from a counter instead.
+  """
 
   @spec call(Plug.Conn.t()) :: Plug.Conn.t()
   def call(conn) do
@@ -138,15 +142,34 @@ defmodule Vagus.API.CoreProxyWSDispatchTest do
     client
   end
 
-  defp spy,
-    do:
-      Stack.put_env(:ws_dispatch_fun, &WSDispatch.run(&1, &2, &3, fn c -> SpyRouter.call(c) end))
+  # A request reaching the router is counted before the router runs, and so
+  # before its task can answer. Reading the count after the answer is then
+  # sound, where looking in the mailbox for the spy's message is not: that
+  # message and the answer come from different processes, in no set order.
+  defp spy do
+    routed = :counters.new(1, [])
+    Process.put(:routed, routed)
 
-  # Every dispatch reports itself and then waits to be told its outcome.
+    Stack.put_env(
+      :ws_dispatch_fun,
+      &WSDispatch.run(&1, &2, &3, fn conn ->
+        :counters.add(routed, 1, 1)
+        SpyRouter.call(conn)
+      end)
+    )
+  end
+
+  defp routed, do: :counters.get(Process.get(:routed), 1)
+
+  # Every dispatch is counted, reports itself, and then waits to be told its
+  # outcome. The count is for the same reason as the spy's.
   defp hold_dispatches do
     test_pid = self()
+    dispatched = :counters.new(1, [])
+    Process.put(:dispatched, dispatched)
 
     Stack.put_env(:ws_dispatch_fun, fn slug, _credential, request ->
+      :counters.add(dispatched, 1, 1)
       send(test_pid, {:dispatching, self(), hd(Process.get(:"$callers")), slug, request})
 
       receive do
@@ -154,6 +177,8 @@ defmodule Vagus.API.CoreProxyWSDispatchTest do
       end
     end)
   end
+
+  defp dispatched, do: :counters.get(Process.get(:dispatched), 1)
 
   defp ok_outcome(data),
     do: {:response, 200, Jason.encode!(%{"result" => "ok", "data" => data})}
@@ -370,7 +395,7 @@ defmodule Vagus.API.CoreProxyWSDispatchTest do
     {reply, client} = call(client, 950, "get", "/supervisor/info")
     assert reply["success"]
     assert_receive {:routed, "GET", "/supervisor/info", _bridge}, @recv_timeout
-    refute_received {:routed, _method, _path, _bridge}
+    assert routed() == 1
 
     assert_none_relayed(client)
   end
@@ -444,7 +469,7 @@ defmodule Vagus.API.CoreProxyWSDispatchTest do
         client
       end)
 
-    refute_received {:routed, _method, _path, _bridge}
+    assert routed() == 0
     assert_none_relayed(client)
   end
 
@@ -461,7 +486,7 @@ defmodule Vagus.API.CoreProxyWSDispatchTest do
         client
       end)
 
-    refute_received {:routed, _method, _path, _bridge}
+    assert routed() == 0
     assert_none_relayed(client)
   end
 
@@ -492,7 +517,7 @@ defmodule Vagus.API.CoreProxyWSDispatchTest do
         client
       end)
 
-    refute_received {:routed, _method, _path, _bridge}
+    assert routed() == 3
     assert_none_relayed(client)
   end
 
@@ -532,7 +557,7 @@ defmodule Vagus.API.CoreProxyWSDispatchTest do
       end)
 
     # Refused in the bridge: no task, no slot, nothing routed.
-    refute_received {:routed, _method, _path, _bridge}
+    assert routed() == 1
     assert websock_state(bridge).dispatches == %{}
     assert tasks() == []
     assert_none_relayed(client)
@@ -629,7 +654,7 @@ defmodule Vagus.API.CoreProxyWSDispatchTest do
 
     {reply, client} = call(client, 2, "get", "/supervisor/info")
     assert_error(reply, 2, "unauthorized")
-    refute_received {:routed, _method, _path, _bridge}
+    assert routed() == 1
 
     assert_none_relayed(client)
   end
@@ -659,7 +684,7 @@ defmodule Vagus.API.CoreProxyWSDispatchTest do
     {reply, client} = call(client, 4, "get", "/supervisor/info")
     assert_error(reply, 4, "unauthorized")
 
-    refute_received {:routed, _method, _path, _bridge}
+    assert routed() == 1
     client = assert_none_relayed(client)
 
     # The token the app holds now opens a socket of its own.
@@ -687,7 +712,7 @@ defmodule Vagus.API.CoreProxyWSDispatchTest do
     {reply, client} = call(client, 2, "get", "/addons")
     assert_error(reply, 2, "unauthorized")
     assert reply["error"]["message"] == @not_admitted
-    refute_received {:routed, _method, _path, _bridge}
+    assert routed() == 1
 
     assert_none_relayed(client)
   end
@@ -725,7 +750,7 @@ defmodule Vagus.API.CoreProxyWSDispatchTest do
     {reply, client} = call(client, 4, "get", "/supervisor/info")
     assert_error(reply, 4, "unauthorized")
     assert reply["error"]["message"] == @not_admitted
-    refute_received {:routed, _method, _path, _bridge}
+    assert routed() == 3
 
     assert_none_relayed(client)
   end
@@ -764,6 +789,9 @@ defmodule Vagus.API.CoreProxyWSDispatchTest do
     refute bridge_state(bridge) =~ token
     :erlang.trace(bridge, false, [:receive])
 
+    # Every trace message for the bridge is in the mailbox once this arrives.
+    delivered = :erlang.trace_delivered(bridge)
+    assert_receive {:trace_delivered, ^bridge, ^delivered}, @recv_timeout
     received = collect_trace(bridge, [])
     assert Enum.any?(received, &match?({:supervisor_api, _ref, _result}, &1))
     refute inspect(received, limit: :infinity, printable_limit: :infinity) =~ token
@@ -1048,7 +1076,7 @@ defmodule Vagus.API.CoreProxyWSDispatchTest do
     {reply, client} = call(client, 9, "get", "/supervisor/info")
     assert_error(reply, 9, "unknown_error")
     assert reply["error"]["message"] == "Too many requests in flight"
-    refute_received {:dispatching, _task, _bridge, _slug, _request}
+    assert dispatched() == 8
     assert length(tasks()) == 8
 
     # The slot is free once the bridge has seen the task end.
@@ -1127,7 +1155,7 @@ defmodule Vagus.API.CoreProxyWSDispatchTest do
     assert sockets |> Enum.map(&busy/1) |> Enum.sum() == 8
 
     tasks = 32 |> dispatching() |> Enum.map(&elem(&1, 0))
-    refute_received {:dispatching, _task, _bridge, _slug, _request}
+    assert dispatched() == 32
     assert Enum.sort(tasks()) == Enum.sort(tasks)
 
     Enum.each(tasks, &release(&1, :no_response))
@@ -1160,7 +1188,7 @@ defmodule Vagus.API.CoreProxyWSDispatchTest do
     # A socket that has started nothing is told the bridge is busy.
     late = socket(ctx, token, [1])
     assert busy(late) == 1
-    refute_received {:dispatching, _task, _bridge, _slug, _request}
+    assert dispatched() == 32
 
     # Until a task ends.
     release(hd(tasks), :no_response)

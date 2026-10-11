@@ -549,6 +549,10 @@ defmodule Vagus.API.CoreProxyWSTest do
 
     {frame, _client} = Client.next_frame(client, @recv_timeout)
     assert {:close, 1009, _reason} = frame
+
+    # The fake Core's own `terminate/2`, from the process that reports its
+    # frames: everything it ever received was reported before this.
+    assert_receive {:core_terminate, _reason}, @recv_timeout
     refute_received {:core_frame, _opcode, _data}
   end
 
@@ -1184,9 +1188,13 @@ defmodule Vagus.API.CoreProxyWSTest do
 
     payload = :crypto.strong_rand_bytes(4_096)
     client = Client.send_frame(client, {:binary, payload})
-    {frame, _client} = Client.next_frame(client, @recv_timeout)
+    {frame, client} = Client.next_frame(client, @recv_timeout)
     assert frame == {:binary, payload}
 
+    # The fake Core's own `terminate/2`, from the process that would have
+    # reported an auth frame: whatever it reported came before this.
+    Client.send_frame(client, {:close, 1000, ""})
+    assert_receive {:core_socket_terminate, _reason}, @recv_timeout
     refute_received {:core_socket_unexpected_auth, _data}
   end
 

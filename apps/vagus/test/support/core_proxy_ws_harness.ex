@@ -177,8 +177,12 @@ defmodule Vagus.API.CoreProxyWSTest.CoreSocketHandler do
   @impl WebSock
   def handle_info(_msg, state), do: {:ok, state}
 
+  # A barrier for the test: this process reports nothing after it.
   @impl WebSock
-  def terminate(_reason, _state), do: :ok
+  def terminate(reason, %{test_pid: test_pid}) do
+    send(test_pid, {:core_socket_terminate, reason})
+    :ok
+  end
 end
 
 defmodule Vagus.API.CoreProxyWSTest.FakeCoreSocket do
