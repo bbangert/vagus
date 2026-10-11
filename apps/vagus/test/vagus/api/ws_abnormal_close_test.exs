@@ -1,4 +1,4 @@
-defmodule Vagus.API.WSViolationTest.Raw do
+defmodule Vagus.API.WSAbnormalCloseTest.Raw do
   @moduledoc """
   A WebSocket client over a bare socket: `Mint.WebSocket` will not send an
   unmasked frame, a reserved opcode, or a length it has no payload for.
@@ -98,7 +98,7 @@ defmodule Vagus.API.WSViolationTest.Raw do
   defp parse(_incomplete), do: :more
 end
 
-defmodule Vagus.API.WSViolationTest.Echo do
+defmodule Vagus.API.WSAbnormalCloseTest.Echo do
   @moduledoc false
   @behaviour WebSock
 
@@ -112,7 +112,7 @@ defmodule Vagus.API.WSViolationTest.Echo do
   def handle_info(_message, state), do: {:ok, state}
 end
 
-defmodule Vagus.API.WSViolationTest.EchoApp do
+defmodule Vagus.API.WSAbnormalCloseTest.EchoApp do
   @moduledoc "An app's own WebSocket endpoint, behind the ingress proxy."
   @behaviour Plug
 
@@ -121,12 +121,12 @@ defmodule Vagus.API.WSViolationTest.EchoApp do
 
   @impl Plug
   def call(conn, _opts) do
-    send(Application.fetch_env!(:vagus, :ws_violation_test_pid), :app_upgraded)
-    WebSockAdapter.upgrade(conn, Vagus.API.WSViolationTest.Echo, %{}, timeout: 900_000)
+    send(Application.fetch_env!(:vagus, :ws_abnormal_close_test_pid), :app_upgraded)
+    WebSockAdapter.upgrade(conn, Vagus.API.WSAbnormalCloseTest.Echo, %{}, timeout: 900_000)
   end
 end
 
-defmodule Vagus.API.WSViolationTest.Buggy do
+defmodule Vagus.API.WSAbnormalCloseTest.Buggy do
   @moduledoc false
   @behaviour WebSock
 
@@ -140,7 +140,7 @@ defmodule Vagus.API.WSViolationTest.Buggy do
   def handle_info(_message, state), do: {:ok, state}
 end
 
-defmodule Vagus.API.WSViolationTest.BuggyEndpoint do
+defmodule Vagus.API.WSAbnormalCloseTest.BuggyEndpoint do
   @moduledoc "Upgrades to a handler that raises on any frame."
   @behaviour Plug
 
@@ -149,13 +149,14 @@ defmodule Vagus.API.WSViolationTest.BuggyEndpoint do
 
   @impl Plug
   def call(conn, _opts),
-    do: WebSockAdapter.upgrade(conn, Vagus.API.WSViolationTest.Buggy, %{}, timeout: 900_000)
+    do: WebSockAdapter.upgrade(conn, Vagus.API.WSAbnormalCloseTest.Buggy, %{}, timeout: 900_000)
 end
 
-defmodule Vagus.API.WSViolationTest do
+defmodule Vagus.API.WSAbnormalCloseTest do
   @moduledoc """
-  What reaches the log when Bandit refuses a frame on the listener
-  `Vagus.API.Listener` configures, for both WebSocket bridges.
+  What reaches the log when a WebSocket on the listener `Vagus.API.Listener`
+  configures ends abnormally: a frame Bandit refuses, or a bridge losing its
+  upstream leg.
   """
   use ExUnit.Case, async: false
 
@@ -167,7 +168,8 @@ defmodule Vagus.API.WSViolationTest do
   alias Vagus.Addon.Config
   alias Vagus.API.CoreProxyWSTest.Stack
   alias Vagus.API.{Dispatcher, Listener, SourceGuard}
-  alias Vagus.API.WSViolationTest.{BuggyEndpoint, EchoApp, Raw}
+  alias Vagus.API.WSAbnormalCloseTest.{BuggyEndpoint, EchoApp, Raw}
+  alias Vagus.ConnectionLog
 
   @recv_timeout 30_000
 
@@ -197,13 +199,18 @@ defmodule Vagus.API.WSViolationTest do
     fragmented_ping: {1002, "ws/protocol"}
   ]
 
+  @bridges [:core, :ingress]
+  @upstream_losses [:unreachable, :killed, :wedged]
+
   setup do
     Stack.start()
     start_supervised!({Vagus.Ingress, []})
 
-    Stack.put_env(:ws_violation_test_pid, self())
+    Stack.put_env(:ws_abnormal_close_test_pid, self())
     app = start_supervised!({Bandit, plug: EchoApp, port: 0}, id: :echo_app)
     Stack.put_env(:ingress_target_fun, fn _slug -> {:ok, {"127.0.0.1", port(app), false}} end)
+
+    ConnectionLog.attach()
 
     %{proxy: listener(Dispatcher)}
   end
@@ -211,80 +218,166 @@ defmodule Vagus.API.WSViolationTest do
   for surface <- @surfaces, {violation, {code, label}} <- @violations do
     test "#{surface}: #{violation} closes with #{code} and logs only a static label",
          %{proxy: proxy} do
-      {code, log} = violate(proxy, unquote(surface), unquote(violation))
+      {code, log, own} = violate(proxy, unquote(surface), unquote(violation))
 
       assert code == unquote(code)
-      refute_report(log)
-      # Logged by the connection process, so the capture does see that process.
-      assert count(log, "refused a frame (#{unquote(label)})") == 1
+      refute_leak(log)
+      assert_label_only(own, unquote(label))
     end
   end
 
   # As on a device, where `Vagus.API.SourceGuard` runs and the ring is small.
   for surface <- @surfaces, violation <- [:oversize_frame, :oversize_message, :invalid_utf8] do
     test "#{surface}: on device, #{violation} is counted and logs nothing", %{proxy: proxy} do
-      Stack.put_env(:api_source_guard, true)
-      Process.register(self(), SourceGuard)
+      on_device()
       {_code, label} = Keyword.fetch!(@violations, unquote(violation))
 
-      {_code, log} = violate(proxy, unquote(surface), unquote(violation))
+      {_code, log, own} = violate(proxy, unquote(surface), unquote(violation))
 
-      refute_report(log)
-      refute log =~ "refused a frame"
-      assert_received {:"$gen_cast", {:filtered, :ws, ^label}}
+      refute_leak(log)
+      assert_counted_only(own, label, "#{unquote(surface)}: #{unquote(violation)}")
+    end
+  end
+
+  for bridge <- @bridges, loss <- @upstream_losses do
+    test "#{bridge}: an upstream leg #{loss} closes with 1011 and logs only a static label",
+         %{proxy: proxy} do
+      {code, log, own} = lose_upstream(proxy, unquote(bridge), unquote(loss))
+
+      assert code == 1011
+      refute_leak(log)
+      assert_label_only(own, "ws/upstream")
+    end
+
+    test "#{bridge}: on device, an upstream leg #{loss} is counted and logs nothing",
+         %{proxy: proxy} do
+      on_device()
+
+      {code, log, own} = lose_upstream(proxy, unquote(bridge), unquote(loss))
+
+      assert code == 1011
+      refute_leak(log)
+      assert_counted_only(own, "ws/upstream", "#{unquote(bridge)}: upstream #{unquote(loss)}")
     end
   end
 
   test "a handler that raises is still reported" do
     buggy = listener(BuggyEndpoint)
 
-    {code, log} =
-      exchange(buggy, &upgraded(&1, "/"), fn socket ->
+    {code, _log, own} =
+      exchange(buggy, &upgraded(&1, "/"), fn socket, _connection ->
         :gen_tcp.send(socket, Raw.frame(1, 1, "anything"))
       end)
 
     assert code == 1011
-    assert log =~ "terminating"
-    assert log =~ "handler bug"
+    assert [report] = own
+    assert report =~ "terminating"
+    assert report =~ "handler bug"
   end
 
-  defp refute_report(log) do
+  defp on_device do
+    Stack.put_env(:api_source_guard, true)
+    Process.register(self(), SourceGuard)
+  end
+
+  # Whoever logged it.
+  defp refute_leak(log) do
     refute log =~ "zz-marker"
     refute log =~ @marker_bytes
-    refute log =~ "terminating"
     refute log =~ "Last message"
     refute log =~ "websock_state"
-    refute log =~ "deserializing"
-    # One crash report alone was over 2 KB; what is left is the label and
-    # whatever unrelated processes logged meanwhile.
-    assert byte_size(log) < 2_000
+    refute log =~ "credential"
   end
 
-  defp count(log, text), do: length(String.split(log, text)) - 1
+  # The one line is also the proof that the capture sees this process.
+  defp assert_label_only(own, label) do
+    assert [line] = own
+    assert line =~ "closed a connection (#{label})"
+    assert byte_size(line) < 200
+  end
+
+  defp assert_counted_only(own, label, name) do
+    assert own == [], "#{name}: the connection process logged #{inspect(own)}"
+
+    assert_received {:"$gen_cast", {:filtered, :ws, ^label}},
+                    "#{name}: nothing was counted under #{label}"
+  end
 
   defp violate(proxy, surface, violation) do
-    exchange(proxy, connector(surface), fn socket ->
+    exchange(proxy, connector(surface), fn socket, _connection ->
       :ok = :gen_tcp.send(socket, frames(violation, surface))
     end)
   end
 
-  # Returns once the connection process is gone, so everything it logged is
-  # in the capture.
-  defp exchange(server, connect, send_frames) do
-    {socket, buffer} = connect.(port(server))
-    {:ok, [connection]} = ThousandIsland.connection_pids(server)
-    monitor = Process.monitor(connection)
+  defp lose_upstream(proxy, :ingress, :unreachable) do
+    Stack.put_env(:ingress_target_fun, fn _slug -> {:ok, {"127.0.0.1", unused_port(), false}} end)
+    exchange(proxy, ingress_upgrade(), fn _socket, _connection -> :ok end)
+  end
 
-    {code, log} =
-      with_log(fn ->
-        send_frames.(socket)
-        code = Raw.close_code(socket, buffer)
-        assert_receive {:DOWN, ^monitor, :process, ^connection, _reason}, @recv_timeout
-        code
+  defp lose_upstream(proxy, :core, :unreachable) do
+    Stack.put_env(:core_base_url, "http://127.0.0.1:#{unused_port()}")
+    token = core_token()
+
+    exchange(proxy, connector(:core_before_auth), fn socket, _connection ->
+      :ok = :gen_tcp.send(socket, auth_frame(token))
+    end)
+  end
+
+  defp lose_upstream(proxy, bridge, :killed) do
+    exchange(proxy, relaying(bridge), fn _socket, connection ->
+      Process.exit(upstream(connection), :kill)
+    end)
+  end
+
+  # A suspended upstream never answers the handoff, so the timeout is certain.
+  defp lose_upstream(proxy, bridge, :wedged) do
+    Stack.put_env(:core_ws_handoff_timeout, 50)
+    Stack.put_env(:ingress_ws_handoff_timeout, 50)
+
+    exchange(proxy, relaying(bridge), fn socket, connection ->
+      :ok = :sys.suspend(upstream(connection))
+      :ok = :gen_tcp.send(socket, Raw.frame(1, 1, ~s({"id":1,"type":"get_states"})))
+    end)
+  end
+
+  defp relaying(:core), do: connector(:core_after_auth)
+  defp relaying(:ingress), do: connector(:ingress)
+
+  defp upstream(connection) do
+    {_socket, %{connection: %{websock_state: %{upstream: upstream}}}} = :sys.get_state(connection)
+    upstream
+  end
+
+  defp unused_port do
+    {:ok, listening} = :gen_tcp.listen(0, [])
+    {:ok, port} = :inet.port(listening)
+    :ok = :gen_tcp.close(listening)
+    port
+  end
+
+  # Returns the close code, everything logged meanwhile, and what the
+  # connection process itself logged. That process is gone by then, so both
+  # are complete.
+  defp exchange(server, connect, act) do
+    {{code, connection}, log} =
+      with_log([metadata: [:pid]], fn ->
+        {socket, buffer} = connect.(port(server))
+
+        try do
+          connection = ConnectionLog.pid(socket)
+          monitor = Process.monitor(connection)
+          act.(socket, connection)
+          code = Raw.close_code(socket, buffer)
+          # A normal stop waits for the client's side of the close.
+          :gen_tcp.close(socket)
+          assert_receive {:DOWN, ^monitor, :process, ^connection, _reason}, @recv_timeout
+          {code, connection}
+        after
+          :gen_tcp.close(socket)
+        end
       end)
 
-    :gen_tcp.close(socket)
-    {code, log}
+    {code, log, ConnectionLog.entries(log, connection)}
   end
 
   defp connector(:core_before_auth) do
@@ -297,14 +390,12 @@ defmodule Vagus.API.WSViolationTest do
   end
 
   defp connector(:core_after_auth) do
-    token =
-      register_app_token(app_config("ws_violation_core"), identity: %{homeassistant_api: true})
-
+    token = core_token()
     before_auth = connector(:core_before_auth)
 
     fn port ->
       {socket, buffer} = before_auth.(port)
-      :ok = :gen_tcp.send(socket, Raw.frame(1, 1, Jason.encode!(%{"access_token" => token})))
+      :ok = :gen_tcp.send(socket, auth_frame(token))
       {{1, auth_ok}, buffer} = Raw.next_frame(socket, buffer)
       assert Jason.decode!(auth_ok)["type"] == "auth_ok"
       assert_receive {:core_init, _core}, @recv_timeout
@@ -313,11 +404,21 @@ defmodule Vagus.API.WSViolationTest do
   end
 
   defp connector(:ingress) do
-    slug = "ws_violation_#{System.unique_integer([:positive])}"
+    upgrade = ingress_upgrade()
+
+    fn port ->
+      upgraded = upgrade.(port)
+      assert_receive :app_upgraded, @recv_timeout
+      upgraded
+    end
+  end
+
+  defp ingress_upgrade do
+    slug = "ws_abnormal_close_#{System.unique_integer([:positive])}"
 
     {:ok, config} =
       Config.parse(%{
-        "name" => "WS violation test app",
+        "name" => "WS abnormal close test app",
         "version" => "1.0.0",
         "slug" => slug,
         "description" => "an ingress app",
@@ -330,16 +431,14 @@ defmodule Vagus.API.WSViolationTest do
     {:ok, entry} = app_info(slug)
     {:ok, session} = Vagus.Ingress.create_session()
 
-    fn port ->
-      upgrade =
-        upgraded(port, "/ingress/#{entry.ingress_token}/ws", [
-          {"cookie", "ingress_session=#{session}"}
-        ])
-
-      assert_receive :app_upgraded, @recv_timeout
-      upgrade
-    end
+    &upgraded(&1, "/ingress/#{entry.ingress_token}/ws", [{"cookie", "ingress_session=#{session}"}])
   end
+
+  defp core_token do
+    register_app_token(app_config("ws_abnormal_close_core"), identity: %{homeassistant_api: true})
+  end
+
+  defp auth_frame(token), do: Raw.frame(1, 1, Jason.encode!(%{"access_token" => token}))
 
   defp upgraded(port, path, headers \\ []) do
     {socket, status, buffer} = Raw.connect(port, path, headers)
@@ -382,7 +481,7 @@ defmodule Vagus.API.WSViolationTest do
   defp message_limit(_core), do: @core_limit
 
   defp listener(plug) do
-    name = :"ws_violation_listener_#{System.unique_integer([:positive])}"
+    name = :"ws_abnormal_close_listener_#{System.unique_integer([:positive])}"
     start_supervised!({Bandit, Listener.bandit_options(plug: plug, port: 0, listener_name: name)})
   end
 

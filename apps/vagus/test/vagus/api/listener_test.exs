@@ -73,7 +73,8 @@ defmodule Vagus.API.ListenerTest do
     test "keeps the compression and Thousand Island settings the surface depends on" do
       options = Listener.bandit_options()
 
-      assert options[:http_options] == [compress: false]
+      assert options[:http_options] == [compress: false, log_protocol_errors: false]
+      assert options[:http_2_options] == [enabled: false]
 
       assert options[:thousand_island_options] == [
                num_acceptors: 2,

@@ -167,8 +167,8 @@ defmodule Vagus.API.SourceGuard do
   request bytes. `:authz` is a refusal by `Vagus.API.Authz`'s table. Its
   caller holds a token, but an installed app can repeat a refused request as
   freely as an anonymous one, so it is counted here too, and its sample is a
-  static label as well. `:ws` is a WebSocket frame Bandit refused
-  (`Vagus.API.WSViolation`), under a static label too. This module only
+  static label as well. `:ws` is a WebSocket that ended abnormally
+  (`Vagus.API.WSAbnormalClose`), under a static label too. This module only
   stores/logs whatever it's given, so an unsanitized caller would defeat the
   entire point of routing this through a counter instead of
   `Logger.warning/1` directly.

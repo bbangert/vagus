@@ -123,9 +123,16 @@ defmodule Vagus.API.Listener do
       # complete fix for the vary half of audit finding D8 (F5).
       plug: Keyword.get(opts, :plug, Dispatcher),
       port: Keyword.get_lazy(opts, :port, &configured_port/0),
-      http_options: [compress: false],
+      # `log_protocol_errors`: Bandit logs a line for each request it cannot
+      # parse, some quoting the request, before any plug runs. The caller
+      # still gets the status. A plug that raises is still logged.
+      http_options: [compress: false, log_protocol_errors: false],
+      # Nothing that calls this API speaks cleartext HTTP/2, and Bandit logs
+      # each frame of a type it does not know, payload included, whatever
+      # the options.
+      http_2_options: [enabled: false],
       # Bandit's line for a malformed or oversize frame is one per attempt.
-      # The bridges count those instead (`Vagus.API.WSViolation`).
+      # The bridges count those instead (`Vagus.API.WSAbnormalClose`).
       websocket_options: [log_protocol_errors: false],
       # RAM discipline: no per-request processes or Registry/ETS are needed
       # for this surface. The 15-minute `read_timeout` (Thousand Island's
@@ -136,10 +143,11 @@ defmodule Vagus.API.Listener do
       # before the session itself would time the client out.
       #
       # `silent_terminate_on_error`: Bandit ends a WebSocket by returning an
-      # error on an oversize fragmented message, on invalid UTF-8 and on a
-      # handler's own abnormal stop. Unsilenced, each is a crash report
-      # carrying the caller's last bytes and the handler's state. A handler
-      # that raises is still reported.
+      # error on, for instance, an oversize fragmented message or invalid
+      # UTF-8, and when a handler's `init` or `handle_in` stops abnormally.
+      # Unsilenced, each is a crash report carrying the caller's last bytes
+      # and the handler's state. It does not reach an abnormal stop from
+      # `handle_info`, or a handler that raises: both are still reported.
       thousand_island_options: [
         num_acceptors: 2,
         read_timeout: 900_000,
