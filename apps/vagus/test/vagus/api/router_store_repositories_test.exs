@@ -414,4 +414,46 @@ defmodule Vagus.API.RouterStoreRepositoriesTest do
       assert json_body(conn)["message"] == "Repository broken could not be fetched: :nxdomain"
     end
   end
+
+  describe "a reload past its budget" do
+    # Would never return: the calls below are answered only if no fetch
+    # is started.
+    defmodule HungFetcher do
+      def fetch(_repo), do: Process.sleep(:infinity)
+    end
+
+    setup do
+      isolate_store()
+
+      :sys.replace_state(Store, fn state ->
+        %{
+          state
+          | fetcher: HungFetcher,
+            repositories: [%{slug: "stuck", url: "https://github.com/example/stuck"}],
+            reload_budget_ms: 0
+        }
+      end)
+
+      :ok
+    end
+
+    test "POST /store/reload answers ok with the repository reported as not updated" do
+      conn = post_("/store/reload")
+      assert conn.status == 200
+      assert json_body(conn) == %{"result" => "ok", "data" => %{}}
+    end
+
+    test "repair -> 400 naming the deadline" do
+      conn = post_("/store/repositories/stuck/repair")
+      assert conn.status == 400
+
+      assert json_body(conn)["message"] ==
+               "Repository stuck could not be fetched: :reload_deadline"
+    end
+
+    test "the reload lock is released: the next call is not refused as busy" do
+      assert post_("/store/reload").status == 200
+      assert post_("/store/repositories/stuck/repair").status == 400
+    end
+  end
 end

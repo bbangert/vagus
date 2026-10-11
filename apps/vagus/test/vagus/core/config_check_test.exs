@@ -47,6 +47,21 @@ defmodule Vagus.Core.ConfigCheckTest do
   end
 
   describe "Core running — check_config exec" do
+    test "a check that outlasts its deadline is {:error, :deadline}, with nothing polled after" do
+      Application.put_env(:vagus, :core_check_deadline_ms, 50)
+      on_exit(fn -> Application.delete_env(:vagus, :core_check_deadline_ms) end)
+
+      engine =
+        start_engine([
+          {200, inspect_body(true)},
+          {201, %{"Id" => "exec-1"}},
+          {200, framed("Testing configuration at /config\n"), delay: 2_000}
+        ])
+
+      assert ConfigCheck.check(docker: [socket: engine.socket]) == {:error, :deadline}
+      assert length(FakeEngine.requests(engine)) == 3
+    end
+
     test "exit 0, clean log -> :valid" do
       output = framed("Testing configuration at /config\nSuccess!\n")
 

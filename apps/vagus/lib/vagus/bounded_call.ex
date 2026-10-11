@@ -2,10 +2,13 @@ defmodule Vagus.BoundedCall do
   @moduledoc """
   Runs a function in a task with a deadline — the shared shape behind the
   Core watchdogs' per-attempt timeouts (`Vagus.Core.Watchdog`,
-  `Vagus.Core.Watchdog.Probe`).
+  `Vagus.Core.Watchdog.Probe`) and the reads that have no timeout of their
+  own (`Vagus.Backend.Host.DiskUsage`, `Vagus.API.Router`'s usage walk). The
+  task is killed at the deadline, so it fits only work that is safe to
+  abandon part way.
 
-  The task is linked (`Task.async/1`) on purpose: callers run inside their
-  own watchdog sequence task, and the watchdog's deadline failsafe
+  The task is linked (`Task.async/1`) on purpose: a watchdog caller runs
+  inside its own sequence task, and the watchdog's deadline failsafe
   brutal-kills that task — the link takes this inner call down with it
   rather than leaving it running orphaned. Killing it cannot orphan a
   `:global.trans/3` lock it was still *waiting* on: `:global` only grants

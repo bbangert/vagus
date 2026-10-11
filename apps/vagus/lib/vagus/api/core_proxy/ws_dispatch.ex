@@ -42,7 +42,8 @@ defmodule Vagus.API.CoreProxy.WSDispatch do
   @default_timeout_ms 10_000
 
   # Core's `null` means no limit. The bridge keeps an entry per call, so
-  # there is one: Bandit's read timeout, the longest an HTTP caller waits.
+  # there is one, at the figure of Bandit's read timeout. That timeout bounds
+  # reads from the client, not how long an HTTP caller waits for a handler.
   @max_timeout_ms 900_000
 
   @authz_ctx %{leg: :core_api, decoded_segments: nil}

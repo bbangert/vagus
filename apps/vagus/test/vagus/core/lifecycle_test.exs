@@ -894,6 +894,23 @@ defmodule Vagus.Core.LifecycleTest do
       assert [%{method: :post, path: "/images/create"}] = FakeEngine.requests(engine)
     end
 
+    test "a pull that outlasts its deadline fails the update and leaves the old Core untouched" do
+      Application.put_env(:vagus, :core_pull_deadline_ms, 50)
+      on_exit(fn -> Application.delete_env(:vagus, :core_pull_deadline_ms) end)
+
+      engine = start_engine([{200, "{\"status\":\"Pull complete\"}\n", delay: 2_000}])
+      versions = start_versions("2026.7.0")
+
+      assert Lifecycle.update("2026.8.0", docker: [socket: engine.socket], versions: versions) ==
+               {:error, {:pull, :deadline}}
+
+      assert Versions.installed(versions) == "2026.7.0"
+      assert [%{method: :post, path: "/images/create"}] = FakeEngine.requests(engine)
+
+      # The lock went with the failed op: the next one is not `:busy`.
+      assert Lifecycle.stop(docker: [socket: engine.socket]) != {:error, :busy}
+    end
+
     test "health-gate timeout rolls back to the previous version" do
       engine =
         start_engine([

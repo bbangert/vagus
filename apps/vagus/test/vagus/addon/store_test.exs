@@ -587,6 +587,54 @@ defmodule Vagus.Addon.StoreTest do
       assert log =~ "pruned assets for 1 add-on(s)"
     end
 
+    test "a reload starts no fetch once its budget is spent" do
+      # Outlasts the budget, then answers: only the budget can keep the
+      # second repository from being fetched.
+      defmodule SlowFirstFetcher do
+        def fetch(%{slug: "core", test_pid: pid, budget_ms: budget_ms} = repo) do
+          send(pid, :core_fetched)
+
+          receive do
+          after
+            budget_ms + 30 -> Vagus.Addon.StoreTest.FixtureFetcher.fetch(Map.take(repo, [:slug]))
+          end
+        end
+
+        def fetch(%{slug: "community", test_pid: pid}) do
+          send(pid, :community_fetched)
+          {:ok, [{"esphome/config.yaml", Vagus.Addon.StoreTest.esphome_yaml()}]}
+        end
+      end
+
+      budget_ms = 20
+
+      repos = [
+        %{
+          slug: "core",
+          url: "https://github.com/home-assistant/addons",
+          test_pid: self(),
+          budget_ms: budget_ms
+        },
+        %{slug: "community", url: "https://github.com/hassio-addons/repository", test_pid: self()}
+      ]
+
+      srv =
+        start_supervised!(
+          {Store,
+           name: nil, fetcher: SlowFirstFetcher, repositories: repos, reload_budget_ms: budget_ms}
+        )
+
+      log =
+        capture_log(fn ->
+          assert {:ok, 2, %{"community" => :reload_deadline}} = Store.reload(srv)
+        end)
+
+      assert_received :core_fetched
+      refute_received :community_fetched
+      assert log =~ ~s(fetch "community" failed: :reload_deadline)
+      assert Map.keys(Store.catalog(srv)) == ["core_esphome", "core_mosquitto"]
+    end
+
     test "a repository that failed to fetch keeps its entries, assets and metadata" do
       # Only a repository that came down may have its state replaced. A
       # transient failure used to take the failed repo's catalog entries with

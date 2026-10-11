@@ -160,6 +160,44 @@ defmodule Vagus.Runtime.DockerTest do
     end
   end
 
+  describe "opts[:deadline] (hermetic — FakeEngine)" do
+    defp in_ms(ms), do: System.monotonic_time(:millisecond) + ms
+
+    # The daemon answers after the deadline and well inside the receive
+    # timeout, so only a total deadline can end the request first.
+    test "a pull whose stream outlasts the deadline is {:error, :deadline}" do
+      engine = FakeEngine.start([{200, "{\"status\":\"Pull complete\"}\n", delay: 2_000}])
+      on_exit(fn -> FakeEngine.stop(engine) end)
+
+      assert Docker.pull_image("alpine:3", socket: engine.socket, deadline: in_ms(50)) ==
+               {:error, :deadline}
+    end
+
+    test "one deadline bounds every request of an exec, and the polling after it" do
+      engine =
+        FakeEngine.start([
+          {201, %{"Id" => "exec-1"}},
+          {200, "", delay: 2_000}
+        ])
+
+      on_exit(fn -> FakeEngine.stop(engine) end)
+
+      assert Docker.exec_capture("homeassistant", "sleep 9",
+               socket: engine.socket,
+               deadline: in_ms(50)
+             ) == {:error, :deadline}
+
+      assert length(FakeEngine.requests(engine)) == 2
+    end
+
+    test "a response inside the deadline is unchanged" do
+      engine = FakeEngine.start([{200, "{\"status\":\"Pull complete\"}\n"}])
+      on_exit(fn -> FakeEngine.stop(engine) end)
+
+      assert Docker.pull_image("alpine:3", socket: engine.socket, deadline: in_ms(5_000)) == :ok
+    end
+  end
+
   describe "against a live daemon" do
     @describetag :docker
 

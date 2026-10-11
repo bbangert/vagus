@@ -40,6 +40,39 @@ defmodule Vagus.Backend.Host.DiskUsageTest do
     end
   end
 
+  describe "a df that never returns" do
+    import ExUnit.CaptureLog
+
+    defp hung_df do
+      test = self()
+
+      fn _path ->
+        send(test, {:df, self()})
+        Process.sleep(:infinity)
+      end
+    end
+
+    test "usage_gb/2 answers the failure value at the deadline, and the run is killed" do
+      log =
+        capture_log(fn ->
+          assert DiskUsage.usage_gb("/data", df: hung_df(), timeout_ms: 50) == {0.0, 0.0, 0.0}
+        end)
+
+      assert log =~ "df /data did not return"
+      assert_received {:df, runner}
+      refute Process.alive?(runner)
+    end
+
+    test "usage_bytes/2 does the same" do
+      capture_log(fn ->
+        assert DiskUsage.usage_bytes("/data", df: hung_df(), timeout_ms: 50) == {0, 0}
+      end)
+
+      assert_received {:df, runner}
+      refute Process.alive?(runner)
+    end
+  end
+
   describe "parse_bytes/1" do
     test "parses the two-line df -k form into {total_bytes, free_bytes}" do
       output = """

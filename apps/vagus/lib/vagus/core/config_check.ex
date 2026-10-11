@@ -47,10 +47,13 @@ defmodule Vagus.Core.ConfigCheck do
       the same — the log IS the error detail).
     * `{:not_running, message}` — Core's container is absent or stopped
       (the documented deviation above).
-    * `{:error, reason}` — a genuine Engine-API failure running the check.
+    * `{:error, reason}` — a genuine Engine-API failure running the check,
+      or `:deadline` when the whole check outlasted its deadline.
   """
   @spec check(keyword()) :: result()
   def check(opts \\ []) do
+    opts = Keyword.put(opts, :docker, with_deadline(docker_opts(opts)))
+
     case Docker.inspect_container(Container.name(), docker_opts(opts)) do
       {:ok, info} -> check_running(info, opts)
       {:error, {:http, 404, _message}} -> not_running()
@@ -79,4 +82,14 @@ defmodule Vagus.Core.ConfigCheck do
   defp running?(_info), do: false
 
   defp docker_opts(opts), do: Keyword.get(opts, :docker, [])
+
+  # The check's output is a stream whose pace Core's container sets, so the
+  # client's receive timeout does not bound it. Past the deadline the
+  # connection is closed; the command is left to exit in the container.
+  defp with_deadline(docker) do
+    Keyword.put_new(docker, :deadline, System.monotonic_time(:millisecond) + deadline_ms())
+  end
+
+  # Tests shorten it.
+  defp deadline_ms, do: Application.get_env(:vagus, :core_check_deadline_ms, 300_000)
 end

@@ -346,9 +346,15 @@ defmodule Vagus.Runtime.Docker do
   Issues a single Engine-API request over the Unix socket.
 
   `opts`: `:socket`, `:query` (keyword/map → query string), `:body`
-  (a map → JSON, or a raw string/`nil`), `:headers`. Returns `{:ok, response}`
-  where `response.body` is JSON-decoded when the daemon says so, else the raw
-  string.
+  (a map → JSON, or a raw string/`nil`), `:headers`, `:deadline`. Returns
+  `{:ok, response}` where `response.body` is JSON-decoded when the daemon says
+  so, else the raw string.
+
+  The receive timeout restarts at every chunk, so it does not bound a
+  streamed response (a pull's progress, an attached exec). `:deadline` does:
+  it is a `System.monotonic_time(:millisecond)` instant past which the
+  connection is closed and the result is `{:error, :deadline}`. Being an
+  instant, one value bounds every request of a call that makes several.
   """
   @spec request(atom(), String.t(), keyword()) :: {:ok, response()} | {:error, term()}
   def request(method, path, opts \\ []) do
@@ -363,7 +369,7 @@ defmodule Vagus.Runtime.Docker do
         # (not just an error tuple) escapes the request/recv path.
         try do
           with {:ok, conn, ref} <- Mint.HTTP.request(conn, method, full_path, headers, body),
-               {:ok, _conn, responses} <- recv_all(conn, ref) do
+               {:ok, _conn, responses} <- recv_all(conn, ref, Keyword.get(opts, :deadline)) do
             {:ok, assemble(responses, ref)}
           else
             {:error, _conn, reason} -> {:error, reason}
@@ -503,8 +509,13 @@ defmodule Vagus.Runtime.Docker do
   # Accumulate response batches newest-first (O(1) prepend, not O(n²) `++`),
   # enforcing a hard body ceiling so an unbounded daemon stream can't exhaust
   # memory. Flattened back into arrival order on `:done`.
-  defp recv_all(conn, ref, acc \\ [], size \\ 0) do
-    case Mint.HTTP.recv(conn, 0, @recv_timeout) do
+  defp recv_all(conn, ref, deadline, acc \\ [], size \\ 0) do
+    left = left_ms(deadline)
+
+    case left > 0 and Mint.HTTP.recv(conn, 0, min(left, @recv_timeout)) do
+      false ->
+        {:error, conn, :deadline}
+
       {:ok, conn, responses} ->
         size = size + data_size(responses)
         acc = [responses | acc]
@@ -517,13 +528,23 @@ defmodule Vagus.Runtime.Docker do
             {:ok, conn, acc |> Enum.reverse() |> List.flatten()}
 
           true ->
-            recv_all(conn, ref, acc, size)
+            recv_all(conn, ref, deadline, acc, size)
         end
+
+      # The wait was cut to what the deadline had left, so this is the
+      # deadline and not a quiet daemon.
+      {:error, conn, %Mint.TransportError{reason: :timeout}, _responses}
+      when left < @recv_timeout ->
+        {:error, conn, :deadline}
 
       {:error, conn, reason, _responses} ->
         {:error, conn, reason}
     end
   end
+
+  # No deadline reads as the receive timeout itself, which changes nothing.
+  defp left_ms(nil), do: @recv_timeout
+  defp left_ms(deadline), do: deadline - System.monotonic_time(:millisecond)
 
   defp data_size(responses) do
     Enum.reduce(responses, 0, fn

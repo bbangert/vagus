@@ -274,6 +274,63 @@ defmodule Vagus.API.RouterBackendTest do
     end
   end
 
+  describe "a backend that never answers" do
+    defmodule HungDiskBreakdown do
+      def usage(_opts) do
+        send(Application.fetch_env!(:vagus, :hung_disk_breakdown_test), {:reading, self()})
+        Process.sleep(:infinity)
+      end
+    end
+
+    defp shorten(deadlines) do
+      Application.put_env(:vagus, :handler_deadlines, deadlines)
+      on_exit(fn -> Application.delete_env(:vagus, :handler_deadlines) end)
+    end
+
+    test "GET /host/disks/default/usage -> 400, and the walk is killed" do
+      shorten(%{disk_usage: 50})
+      Application.put_env(:vagus, :hung_disk_breakdown_test, self())
+      Application.put_env(:vagus, :host_disk_breakdown, HungDiskBreakdown)
+
+      on_exit(fn ->
+        Application.delete_env(:vagus, :hung_disk_breakdown_test)
+        Application.delete_env(:vagus, :host_disk_breakdown)
+      end)
+
+      conn = conn(:get, "/host/disks/default/usage") |> authed() |> call()
+
+      assert conn.status == 400
+
+      assert json_body(conn) == %{
+               "result" => "error",
+               "message" => "Disk usage was not read in time"
+             }
+
+      assert_received {:reading, reader}
+      refute Process.alive?(reader)
+    end
+  end
+
+  describe "a backend that raises behind a bound" do
+    defmodule RaisingDiskBreakdown do
+      def usage(_opts), do: raise(ArgumentError, "walk failed")
+    end
+
+    test "GET /host/disks/default/usage fails as the walk did, with a 500" do
+      Application.put_env(:vagus, :host_disk_breakdown, RaisingDiskBreakdown)
+      on_exit(fn -> Application.delete_env(:vagus, :host_disk_breakdown) end)
+
+      error =
+        assert_raise Plug.Conn.WrapperError, fn ->
+          conn(:get, "/host/disks/default/usage") |> authed() |> call()
+        end
+
+      assert {error.kind, error.reason} == {:error, %ArgumentError{message: "walk failed"}}
+      assert {500, _headers, body} = sent_resp(error.conn)
+      assert Jason.decode!(body)["message"] == "internal server error"
+    end
+  end
+
   describe "POST /host/reboot" do
     test "response is fully sent while the backend's reboot/0 is still running" do
       test_pid = self()

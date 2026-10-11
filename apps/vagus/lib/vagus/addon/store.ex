@@ -65,11 +65,16 @@ defmodule Vagus.Addon.Store do
 
   # Cap on RUNTIME-ADDED (persisted) repositories. Config/built-in repos don't
   # count. Every mutation ends in a full reload that fetches all N sources
-  # sequentially (≤33 MB + ≤60 s each) under the global reload mutex, so an
+  # sequentially (≤33 MB each) under the global reload mutex, so an
   # unbounded persisted set is a self-inflicted reload-cost DoS. 50 is far above
   # any real home deployment (upstream users run a handful) while bounding the
   # worst-case reload.
   @max_repositories 50
+
+  # What one reload may spend before it stops starting fetches. A fetch
+  # already running is not cut short, so a reload ends within this plus one
+  # fetch's own limit (`Vagus.Addon.Store.HTTPFetcher`).
+  @reload_budget_ms 900_000
 
   # A repository's own display metadata, at the archive root. Upstream accepts
   # the same three names (`FILE_SUFFIX_CONFIGURATION` against `repository`) and
@@ -135,7 +140,7 @@ defmodule Vagus.Addon.Store do
   already a task in progress"), and `StoreManager.reload` reads that `False`
   as "this repository wasn't updated", not as an error, so the HTTP caller
   still gets a success. Blocking instead would pin a Bandit worker for the
-  length of a network-bound reload (up to `receive_timeout` per repository),
+  length of a network-bound reload (its budget, and the fetch then running),
   the same worker-exhaustion exposure `Vagus.Core.Lifecycle` designed around
   with its `retries: 0` → `{:error, :busy}` → 409.
   """
@@ -189,9 +194,10 @@ defmodule Vagus.Addon.Store do
   # partial reload from a complete one by the count alone.
   defp do_reload(server) do
     snapshot = GenServer.call(server, :snapshot)
+    deadline = System.monotonic_time(:millisecond) + snapshot.reload_budget_ms
 
     {fetched, fetched_meta, errors} =
-      build_with_errors(snapshot.repositories, snapshot.fetcher, snapshot.assets)
+      build_with_errors(snapshot.repositories, snapshot.fetcher, snapshot.assets, deadline)
 
     # A repository that didn't fetch keeps what its last successful fetch left
     # behind — its entries here, its metadata below, and its assets by way of
@@ -549,7 +555,8 @@ defmodule Vagus.Addon.Store do
       persisted_sources: persisted_sources,
       catalog: %{},
       repository_meta: %{},
-      assets: Assets.init(mode, opts)
+      assets: Assets.init(mode, opts),
+      reload_budget_ms: Keyword.get(opts, :reload_budget_ms, @reload_budget_ms)
     }
 
     {:ok, state}
@@ -562,7 +569,16 @@ defmodule Vagus.Addon.Store do
   # every writer of either.
   @impl GenServer
   def handle_call(:snapshot, _from, state) do
-    reply = Map.take(state, [:repositories, :fetcher, :assets, :catalog, :repository_meta])
+    reply =
+      Map.take(state, [
+        :repositories,
+        :fetcher,
+        :assets,
+        :catalog,
+        :repository_meta,
+        :reload_budget_ms
+      ])
+
     {:reply, reply, state}
   end
 
@@ -676,7 +692,7 @@ defmodule Vagus.Addon.Store do
   @spec build([map()], module(), Assets.t()) ::
           {%{optional(String.t()) => map()}, %{optional(String.t()) => map()}}
   def build(repositories, fetcher, assets \\ Assets.none()) do
-    {catalog, meta, _errors} = build_with_errors(repositories, fetcher, assets)
+    {catalog, meta, _errors} = build_with_errors(repositories, fetcher, assets, :infinity)
     {catalog, meta}
   end
 
@@ -691,9 +707,12 @@ defmodule Vagus.Addon.Store do
   # first-file-wins rule: several sources can share one slug (the built-in mqtt
   # repo rides `core`), and a slug any of whose sources failed did not fully
   # refresh.
-  defp build_with_errors(repositories, fetcher, assets) do
+  #
+  # A repository reached after `deadline` is not fetched. It is reported as
+  # one that did not come down, so a reload keeps what it had for it.
+  defp build_with_errors(repositories, fetcher, assets, deadline) do
     Enum.reduce(repositories, {%{}, %{}, %{}}, fn repo, {catalog, meta, errors} ->
-      case fetcher.fetch(repo) do
+      case fetch_before(deadline, fetcher, repo) do
         {:ok, files} ->
           {Map.merge(catalog, entries_from_files(files, repo, assets)),
            put_repository_meta(meta, repo, files), errors}
@@ -706,6 +725,12 @@ defmodule Vagus.Addon.Store do
           {catalog, meta, Map.put_new(errors, repo.slug, reason)}
       end
     end)
+  end
+
+  defp fetch_before(deadline, fetcher, repo) do
+    if deadline == :infinity or System.monotonic_time(:millisecond) < deadline,
+      do: fetcher.fetch(repo),
+      else: {:error, :reload_deadline}
   end
 
   # First parsed `repository.*` for a slug wins. Two configured repositories

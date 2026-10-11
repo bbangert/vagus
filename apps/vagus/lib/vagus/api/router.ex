@@ -270,12 +270,55 @@ defmodule Vagus.API.Router do
       end
 
     supervisor_only(conn, fn ->
-      Envelope.send_ok(
-        conn,
-        HostDisksUsage.build!(Backend.Host.DiskBreakdown.usage(max_depth: max_depth))
-      )
+      read = fn -> host_disk_breakdown().usage(max_depth: max_depth) end
+      respond = &Envelope.send_ok(conn, HostDisksUsage.build!(&1))
+      bounded_read(conn, :disk_usage, "Disk usage was not read in time", read, respond)
     end)
   end
+
+  # Only for a read: the task doing it is killed at the deadline, which is
+  # safe because a read leaves nothing half done. The usage walk has no bound
+  # of its own: it is as long as the tree is large.
+  #
+  # 400 with a sentence, as the router's other timeouts answer
+  # (`:health_timeout`, `:install_timeout`).
+  defp bounded_read(conn, name, timeout_message, read, respond) do
+    case Vagus.BoundedCall.run(fn -> {:read, read.()} end, handler_deadline(name)) do
+      {:read, value} ->
+        respond.(value)
+
+      {:error, :attempt_timeout} ->
+        Envelope.send_error(conn, timeout_message, 400)
+
+      {:error, {:exit, reason}} ->
+        fail_as_task_did(reason)
+    end
+  end
+
+  # A task's raise, throw or exit, raised again here as the same kind, so the
+  # caller's answer and the crash log are what they were without the task.
+  defp fail_as_task_did({%{__exception__: true} = exception, stacktrace})
+       when is_list(stacktrace),
+       do: reraise(exception, stacktrace)
+
+  defp fail_as_task_did({{:nocatch, value}, stacktrace}) when is_list(stacktrace),
+    do: :erlang.raise(:throw, value, stacktrace)
+
+  defp fail_as_task_did(reason), do: exit(reason)
+
+  # The frontend allows the usage walk an hour; 15 min is the longest the Core
+  # WebSocket proxy lets a caller wait for anything.
+  @handler_deadlines %{disk_usage: 900_000}
+
+  # Tests shorten these by name; production never sets the key.
+  defp handler_deadline(name) do
+    :vagus
+    |> Application.get_env(:handler_deadlines, %{})
+    |> Map.get(name, Map.fetch!(@handler_deadlines, name))
+  end
+
+  defp host_disk_breakdown,
+    do: Application.get_env(:vagus, :host_disk_breakdown, Backend.Host.DiskBreakdown)
 
   # Settings → Hardware → "All hardware" dialog (CW survey P1). Plain
   # token auth, NO supervisor gate: upstream's default-role pattern
@@ -310,6 +353,12 @@ defmodule Vagus.API.Router do
     end
   end
 
+  # No timeout here, and none in `VintageNet.configure/2`, which ends in a
+  # `:gen_statem.call/2`. As read in vintage_net 0.13.13, the interface
+  # answers that call before it reconfigures, and the reconfigure runs on its
+  # own timers. The exception read there is the `:reconfiguring` state, which
+  # has no clause for the call: the interface process would crash and this
+  # handler exit with it.
   post "/network/interface/:ifname/update" do
     case Backend.network().configure(ifname, conn.body_params) do
       :ok -> Envelope.send_ok(conn, %{})
@@ -769,9 +818,11 @@ defmodule Vagus.API.Router do
   # `POST .../update` can run for minutes — pulling an add-on image on a slow
   # device, then stopping/recreating the container. Wrapped in an
   # `addon_manager_update` job either way (see `run_addon_update/2`):
-  # `background: true` returns `{job_id}` immediately, and the sync path is
-  # bounded by Bandit's configured 900s `read_timeout`
-  # (`Vagus.API.Supervisor`) — nothing in this router does.
+  # `background: true` returns `{job_id}` immediately. The sync path holds the
+  # request until `App.update/2` returns: that call has no timeout, and each
+  # step the app's process runs for it has a deadline (`Vagus.App.Policy`).
+  # Bandit's `read_timeout` is not a bound: it times reads from the client,
+  # not a handler.
   post "/store/addons/:slug/update" do
     handle_update(conn, slug)
   end
@@ -1358,9 +1409,12 @@ defmodule Vagus.API.Router do
   # `POST /core/update` can run for minutes — pulling a multi-GB Core image
   # on a slow device, then the health gate. Wrapped in a
   # `home_assistant_core_update` job (see `run_core_update/2`):
-  # `background: true` returns `{job_id}` immediately, and the sync path is
-  # bounded by Bandit's configured 900s `read_timeout`
-  # (`Vagus.API.Supervisor`), not anything in this router. `backup: true` is
+  # `background: true` returns `{job_id}` immediately. The sync path holds the
+  # request until `Lifecycle.update/2` returns. Bandit's `read_timeout` does
+  # not end that: it times reads from the client, not a handler. What does is
+  # in `Lifecycle`: the pull has a deadline, the health gate has
+  # `Vagus.Core.Health`'s, and any other Engine-API call fails once the engine
+  # is silent for `Vagus.Runtime.Docker`'s receive timeout. `backup: true` is
   # refused (audit E4) rather than silently ignored — see
   # `validate_core_update_backup/1`.
 
