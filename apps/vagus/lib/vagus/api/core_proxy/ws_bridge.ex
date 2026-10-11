@@ -666,7 +666,8 @@ defmodule Vagus.API.CoreProxy.WSBridge do
   # The principal is set here and nowhere else, with the hash of the token
   # that proved it: a `supervisor/api` call is answered only while the app
   # still holds that token. The hash, as the app directory keys it; the
-  # token itself is not kept, because a crash report prints this state.
+  # token arrived in the caller's frame and is not put in the state,
+  # because a crash report prints the state.
   defp authenticate(token, state) do
     case CoreProxy.check_access(token) do
       {:ok, principal} ->

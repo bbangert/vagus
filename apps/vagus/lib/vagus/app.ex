@@ -299,7 +299,11 @@ defmodule Vagus.App do
   @doc """
   The token the app's running container holds, for a caller inside this VM
   that must act as the app. `:error` for an app that is stopped, native or
-  gone. A secret: it belongs in no state, message or log.
+  gone.
+
+  A secret. It lives in the app's own process, which redacts it from its
+  status, and it reaches the caller in that process's reply. The caller
+  uses it where it asked and does not keep, forward or log it.
   """
   @spec token(String.t()) :: {:ok, String.t()} | :error
   def token(slug) do

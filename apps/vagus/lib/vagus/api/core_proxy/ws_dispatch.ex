@@ -287,8 +287,9 @@ defmodule Vagus.API.CoreProxy.WSDispatch do
   """
   @spec run(String.t(), credential(), request(), (Plug.Conn.t() -> term())) :: outcome()
   def run(slug, credential, request, router \\ &router/1) do
-    # The token exists only inside this `try`. A raise with it in scope is
-    # caught here and never becomes a crash report, which prints arguments.
+    # This process binds the token only inside this `try`, having received
+    # it in the app process's reply. A raise with it in scope is caught here
+    # and never becomes a crash report, which prints arguments.
     attempt =
       try do
         with {:ok, token} <- App.token(slug),
