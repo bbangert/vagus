@@ -414,4 +414,52 @@ defmodule Vagus.API.RouterStoreRepositoriesTest do
       assert json_body(conn)["message"] == "Repository broken could not be fetched: :nxdomain"
     end
   end
+
+  describe "a reload past its budget" do
+    # The router runs a reload in the calling process, so a fetch that is
+    # started reports itself to the test.
+    defmodule RecordingFetcher do
+      def fetch(%{slug: slug}) do
+        send(self(), {:fetched, slug})
+        {:ok, []}
+      end
+    end
+
+    setup do
+      isolate_store()
+
+      :sys.replace_state(Store, fn state ->
+        %{
+          state
+          | fetcher: RecordingFetcher,
+            repositories: [%{slug: "stuck", url: "https://github.com/example/stuck"}],
+            reload_budget_ms: 0
+        }
+      end)
+
+      :ok
+    end
+
+    test "POST /store/reload answers ok with the repository reported as not updated" do
+      conn = post_("/store/reload")
+      assert conn.status == 200
+      assert json_body(conn) == %{"result" => "ok", "data" => %{}}
+      refute_received {:fetched, _slug}
+    end
+
+    test "repair -> 400 naming the deadline" do
+      conn = post_("/store/repositories/stuck/repair")
+      assert conn.status == 400
+
+      assert json_body(conn)["message"] ==
+               "Repository stuck could not be fetched: :reload_deadline"
+
+      refute_received {:fetched, _slug}
+    end
+
+    test "the reload lock is released: the next call is not refused as busy" do
+      assert post_("/store/reload").status == 200
+      assert post_("/store/repositories/stuck/repair").status == 400
+    end
+  end
 end

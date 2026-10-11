@@ -255,6 +255,8 @@ defmodule Vagus.Core.Lifecycle do
   alias Vagus.Runtime.Docker
 
   @fallback_stop_timeout_s 260
+  # Twice an app's pull deadline (`Vagus.App.Policy`).
+  @pull_deadline_ms 3_600_000
   @gracetime_env_prefix "S6_SERVICES_GRACETIME="
   @safe_mode_marker "safe-mode"
 
@@ -577,12 +579,22 @@ defmodule Vagus.Core.Lifecycle do
   defp check_not_installed(target, target), do: {:error, :version_installed}
   defp check_not_installed(_target, _installed), do: :ok
 
+  # The pull is the one Engine-API call here whose response is a stream, so
+  # the client's receive timeout does not bound it. Past the deadline the
+  # connection is closed and the update fails before anything is replaced.
   defp pull_target(target, opts) do
-    case Docker.pull_image(Container.image(target), docker_opts(opts)) do
+    deadline = System.monotonic_time(:millisecond) + pull_deadline_ms()
+    docker = Keyword.put_new(docker_opts(opts), :deadline, deadline)
+
+    case Docker.pull_image(Container.image(target), docker) do
       :ok -> :ok
       {:error, reason} -> {:error, {:pull, reason}}
     end
   end
+
+  # Tests shorten it.
+  defp pull_deadline_ms,
+    do: Application.get_env(:vagus, :core_pull_deadline_ms, @pull_deadline_ms)
 
   defp update_existing(info, target, rollback_version, opts) do
     was_running = running?(info)

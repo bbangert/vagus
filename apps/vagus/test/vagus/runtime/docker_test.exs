@@ -160,6 +160,82 @@ defmodule Vagus.Runtime.DockerTest do
     end
   end
 
+  describe "opts[:deadline] (hermetic — FakeEngine)" do
+    defp in_ms(ms), do: System.monotonic_time(:millisecond) + ms
+
+    # The daemon answers after the deadline and well inside the receive
+    # timeout, so only a total deadline can end the request first. The
+    # deadline is long enough for the request to have been sent, and the
+    # engine having it is what shows the wait for the response was cut.
+    test "a pull whose stream outlasts the deadline is {:error, :deadline}" do
+      engine = FakeEngine.start([{200, "{\"status\":\"Pull complete\"}\n", delay: 2_000}])
+      on_exit(fn -> FakeEngine.stop(engine) end)
+
+      assert Docker.pull_image("alpine:3", socket: engine.socket, deadline: in_ms(500)) ==
+               {:error, :deadline}
+
+      assert [%{method: :post, path: "/images/create"}] = FakeEngine.requests(engine)
+    end
+
+    test "a request whose deadline has passed sends nothing" do
+      engine = FakeEngine.start([{200, %{"ApiVersion" => "1.41"}}])
+      on_exit(fn -> FakeEngine.stop(engine) end)
+
+      assert Docker.request(:get, "/version", socket: engine.socket, deadline: in_ms(-1)) ==
+               {:error, :deadline}
+
+      assert FakeEngine.requests(engine) == []
+    end
+
+    # The deadline is meant to fall in the 200 ms pause after the first poll,
+    # which a slow runner can miss, so this only refuses a second poll. "a
+    # request whose deadline has passed sends nothing" pins the branch.
+    test "an exec whose deadline passes between polls is not polled again" do
+      engine =
+        FakeEngine.start([
+          {201, %{"Id" => "exec-1"}},
+          {200, ""},
+          {200, %{"Running" => true}},
+          {200, %{"Running" => false, "ExitCode" => 0}}
+        ])
+
+      on_exit(fn -> FakeEngine.stop(engine) end)
+
+      assert Docker.exec_capture("homeassistant", "sleep 9",
+               socket: engine.socket,
+               deadline: in_ms(100)
+             ) == {:error, :deadline}
+
+      polls = Enum.filter(FakeEngine.requests(engine), &(&1.path == "/exec/exec-1/json"))
+      assert length(polls) <= 1
+    end
+
+    test "an exec whose output outlasts the deadline is {:error, :deadline}, unpolled" do
+      engine =
+        FakeEngine.start([
+          {201, %{"Id" => "exec-1"}},
+          {200, "", delay: 2_000}
+        ])
+
+      on_exit(fn -> FakeEngine.stop(engine) end)
+
+      assert Docker.exec_capture("homeassistant", "sleep 9",
+               socket: engine.socket,
+               deadline: in_ms(500)
+             ) == {:error, :deadline}
+
+      assert [%{path: "/containers/homeassistant/exec"}, %{path: "/exec/exec-1/start"}] =
+               FakeEngine.requests(engine)
+    end
+
+    test "a response inside the deadline is unchanged" do
+      engine = FakeEngine.start([{200, "{\"status\":\"Pull complete\"}\n"}])
+      on_exit(fn -> FakeEngine.stop(engine) end)
+
+      assert Docker.pull_image("alpine:3", socket: engine.socket, deadline: in_ms(5_000)) == :ok
+    end
+  end
+
   describe "against a live daemon" do
     @describetag :docker
 

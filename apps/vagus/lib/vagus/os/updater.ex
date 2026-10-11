@@ -197,7 +197,8 @@ defmodule Vagus.OS.Updater do
   reason}` (the fresh check errored — never falls back to a stale cache),
   `:no_release_cached` (feed has no release), `:no_asset_for_target`
   (release lacks `vagus_<target>.fw`), `{:version_mismatch, latest}`,
-  `{:insufficient_space, needed, free}`.
+  `{:insufficient_space, needed, free}`, `:free_space_unknown` (the free
+  space could not be read in time).
   """
   @spec install(String.t() | nil, keyword()) :: :ok | {:error, term()}
   def install(requested_version \\ nil, opts \\ []) do
@@ -263,12 +264,11 @@ defmodule Vagus.OS.Updater do
   # /root would starve Core/add-on .storage writes on the same filesystem.
   defp check_free_space(asset, opts) do
     needed = Map.get(asset, :size, 0) + @headroom_bytes
-    free = free_bytes(opts)
 
-    if free >= needed do
-      :ok
-    else
-      {:error, {:insufficient_space, needed, free}}
+    case free_bytes(opts) do
+      :unknown -> {:error, :free_space_unknown}
+      free when free >= needed -> :ok
+      free -> {:error, {:insufficient_space, needed, free}}
     end
   end
 
@@ -284,8 +284,12 @@ defmodule Vagus.OS.Updater do
         # blocking updates as :insufficient_space), so don't lean on that
         # ordering invariant from another module (Copilot, PR #4).
         _ = File.mkdir_p(@download_dir)
-        {_total, free} = DiskUsage.usage_bytes(@download_dir)
-        free
+        # A `df` that did not return is not a full disk: refusing with a
+        # byte count of 0 would say it was.
+        case DiskUsage.read_bytes(@download_dir) do
+          {:ok, {_total, free}} -> free
+          {:error, :timeout} -> :unknown
+        end
     end
   end
 

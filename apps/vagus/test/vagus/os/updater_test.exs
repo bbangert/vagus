@@ -253,6 +253,19 @@ defmodule Vagus.OS.UpdaterTest do
       refute :install_latest in Process.get(:stub_calls)
     end
 
+    test "refuses, without calling it a full disk, when the free space could not be read" do
+      Process.put(:stub_calls, [])
+      Process.put(:stub_state, %{phase: :idle, last_error: nil, last_release: release(1024)})
+
+      assert Updater.install(nil,
+               updater: StubUpdater,
+               poll_ms: 1,
+               free_bytes_fn: fn -> :unknown end
+             ) == {:error, :free_space_unknown}
+
+      refute :install_latest in Process.get(:stub_calls)
+    end
+
     test "proceeds when free_bytes_fn reports exactly enough headroom" do
       Process.put(:stub_calls, [])
       asset_size = 1024
