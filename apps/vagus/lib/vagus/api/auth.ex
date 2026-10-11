@@ -120,7 +120,7 @@ defmodule Vagus.API.Auth do
 
   `/supervisor/ping` is exempted for the same upstream reason, via a
   different member of the same set: it is listed literally in
-  `no_security_check` (`security.py` L166,
+  `no_security_check` (`security.py` L172,
   `_V1_PATTERNS.no_security_check`'s alternation), so upstream answers it
   before `token_validation` runs at all and leaves `request[REQUEST_FROM]`
   as `None`. Audit B1: Vagus previously routed this through the normal

@@ -1,5 +1,5 @@
 {
-  "_upstream": "supervisor 2026.07.5, supervisor/api/middleware/security.py, _V1_PATTERNS",
+  "_upstream": "supervisor 2026.10.1, supervisor/api/middleware/security.py, _V1_PATTERNS",
   "routes": [
     {"method": "GET", "route": "/info", "path": "/info", "requirement": "bypass", "predicates": {}, "upstream_tier": "bypass", "classification": "parity"},
     {"method": "GET", "route": "/supervisor/info", "path": "/supervisor/info", "requirement": "default", "predicates": {}, "upstream_tier": "default", "classification": "parity"},

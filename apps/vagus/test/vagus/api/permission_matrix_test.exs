@@ -11,6 +11,11 @@ defmodule Vagus.API.PermissionMatrixTest do
   Home Assistant Green by installing one add-on per permission set and asking
   each what it could reach.
 
+  The capture is of Supervisor 2026.07.5, older than the tag the table
+  mirrors (`Vagus.API.Tiers`' moduledoc), and cannot be retaken without a
+  device on the newer one. Where upstream has tightened a path since, Vagus
+  refusing it would show here as stricter than this capture.
+
   ## The comparison axis is deliberately binary
 
   Only `denied` (401/403) versus `permitted` (anything else) is asserted, and

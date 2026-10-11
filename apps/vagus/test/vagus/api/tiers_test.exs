@@ -51,12 +51,46 @@ defmodule Vagus.API.TiersTest do
     {"/addons/core_mqtt/sys_options", :supervisor},
     {"/addons/self/sys_options", :supervisor},
     {"/os/ssh/authorized_keys", :supervisor},
-    {"/os/ssh/authorized_keys/extra", :manager},
     {"/os/ssh", :manager},
-    {"/addons/reload", :manager}
+    {"/os/ssh/x", :manager},
+    {"/os/datadisk/x", :manager},
+    {"/addons/reload", :manager},
+    {"/addons/core_mqtt/rebuild", :manager},
+    {"/addons/self/updatefoo", :manager},
+    # Upstream's `(?!...)` is a lookahead, so it excludes whatever starts so.
+    {"/os/ssh/authorized_keys/extra", :admin},
+    {"/os/ssh/authorized_keysfoo", :admin},
+    {"/os/datadisk/wipe/extra", :admin},
+    {"/os/datadisk/wipefoo", :admin},
+    {"/os/datadisk/wipefoo/extra", :admin},
+    {"/addons/core_mqtt/securityfoo", :admin},
+    {"/addons/core_mqtt/securityfoo/extra", :admin},
+    {"/addons/core_mqtt/security/extra", :admin},
+    {"/addons/self/securityfoo", :admin},
+    # `/.+/info` comes first upstream too.
+    {"/os/datadisk/wipefoo/info", :default},
+    {"/addons/core_mqtt/securityfoo/info", :default},
+    # Upstream's manager alternative is `/addons/<RE_SLUG>/...`.
+    {"/addons/bad!slug/rebuild", :admin},
+    {"/addons/bad!slug/x/y", :admin},
+    {"/addons/%63ore_mqtt/rebuild", :admin},
+    # Upstream gives a manager `/time/.+`. Nothing is served there.
+    {"/time/options", :admin},
+    {"/time/info", :default}
   ]
 
   defp segments(path), do: path |> String.split("/", trim: true)
+
+  @upstream_tag "2026.10.1"
+
+  test "the fixture and the table say they mirror the same upstream tag" do
+    {:docs_v1, _anno, _lang, _format, %{"en" => moduledoc}, _meta, _docs} = Code.fetch_docs(Tiers)
+
+    assert @fixture_path |> File.read!() |> Jason.decode!() |> Map.fetch!("_upstream") =~
+             "supervisor #{@upstream_tag},"
+
+    assert moduledoc =~ "upstream `#{@upstream_tag}`"
+  end
 
   # A row's columns as the fixture's JSON spells them.
   defp pinned(columns),
@@ -372,10 +406,11 @@ defmodule Vagus.API.TiersTest do
         assert Tiers.required(prefix ++ [slug, kind]) == :anonymous
       end
 
-      # A segment that is not a slug must not ride the row: it falls through
-      # to the family tier it had before the row existed.
+      # A segment that is not a slug must not ride the row. Under `/addons`
+      # it is no slug to the manager family either, as upstream's
+      # `/addons/<RE_SLUG>/...` has it; `/store.*` takes anything.
       for slug <- ["bad!slug", "..", "."] do
-        assert Tiers.required(["addons", slug, "icon"]) == :manager
+        assert Tiers.required(["addons", slug, "icon"]) == :admin
         assert Tiers.required(["store", "addons", slug, "logo"]) == :manager
       end
 

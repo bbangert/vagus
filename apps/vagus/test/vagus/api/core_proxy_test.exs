@@ -189,8 +189,13 @@ defmodule Vagus.API.CoreProxyTest do
 
   alias Vagus.API.{CoreProxy, Dispatcher, SourceGuard, Token}
   alias Vagus.API.CoreProxyTest.{FakeCore, HitCounter, Recorder, Script, SSEGate}
+  alias Vagus.ReservedSpellings
 
   @opts Dispatcher.init([])
+
+  @reserved_views Path.expand("../../fixtures/core-2026.8.1-hassio-views.json", __DIR__)
+  @external_resource @reserved_views
+  @reserved_urls @reserved_views |> File.read!() |> Jason.decode!() |> Map.fetch!("urls")
   @client_finch Vagus.API.CoreProxyTest.ClientFinch
 
   setup do
@@ -271,6 +276,19 @@ defmodule Vagus.API.CoreProxyTest do
       )
 
   defp bearer(token), do: {"authorization", "Bearer #{token}"}
+
+  # A Core url's segments after `api`, with a literal for each placeholder.
+  defp view_segments(url) do
+    ["api" | segments] =
+      url
+      |> String.split("/", trim: true)
+      |> Enum.map(fn
+        "{" <> _placeholder -> "x"
+        literal -> literal
+      end)
+
+    segments
+  end
 
   # The test stands in for the guard, as on a device: the real one reports
   # and resets on a timer, so its state is not something to assert on.
@@ -615,6 +633,80 @@ defmodule Vagus.API.CoreProxyTest do
         |> Plug.Conn.put_req_header("authorization", "Bearer #{token}")
 
       assert_raise Vagus.Core.Reserved.Error, fn -> CoreProxy.call(conn, CoreProxy.init([])) end
+      assert HitCounter.count() == 0
+    end
+
+    # Core decodes a forwarded path once, so none of these is the view there.
+    # Upstream refuses them on the fully decoded path all the same.
+    test "a reserved view encoded more than once -> the blacklist's 403 for everyone, fake Core never hit" do
+      granted = addon_token("cp_blacklist_layers", %{homeassistant_api: true})
+
+      both =
+        addon_token("cp_blacklist_layers_admin", %{
+          homeassistant_api: true,
+          hassio_api: true,
+          hassio_role: "admin"
+        })
+
+      plain = call(:post, "/core/api/hassio_auth/password_reset", [bearer(granted)])
+      assert plain.status == 403
+
+      principals = [
+        [],
+        [bearer(granted)],
+        [{"x-ha-access", granted}],
+        [bearer(both)],
+        [bearer(Token.get())],
+        [bearer("not-a-real-token")]
+      ]
+
+      for url <- @reserved_urls,
+          {label, tail} <- ReservedSpellings.multiply_encoded(view_segments(url)),
+          family <- ["core", "homeassistant"],
+          headers <- principals,
+          method <- [:get, :post] do
+        path = "/#{family}/api/#{tail}"
+        conn = call(method, path, headers)
+
+        assert {conn.status, conn.resp_body} == {plain.status, plain.resp_body},
+               "#{method} #{path} (#{label}) for #{inspect(headers)}"
+      end
+
+      assert HitCounter.count() == 0
+    end
+
+    test "a path encoded more than once that is not reserved is forwarded as written" do
+      token = addon_token("cp_layers_forwarded", %{homeassistant_api: true})
+
+      for path <- [
+            "/st%2561tes",
+            "/states/sensor.a%252541",
+            "/config%252Fx",
+            "/%2568istory/period",
+            "/states/100%2525",
+            "/states/%2568assio_auth",
+            "/states/%252e/x",
+            "/states/a" <> ReservedSpellings.layered("A", 8)
+          ] do
+        conn = call(:get, "/core/api" <> path, [bearer(token)])
+
+        assert conn.status == 200, path
+        assert Recorder.last().path == "/api" <> path
+      end
+    end
+
+    # One layer past what `Vagus.API.ExploitFilter` unquotes, so the filter
+    # answers and the proxy is never asked.
+    test "a path encoded deeper than the exploit filter reads is a 400, reserved or not" do
+      token = addon_token("cp_layers_capped", %{homeassistant_api: true})
+
+      for tail <- [
+            "#{ReservedSpellings.layered("h", 9)}assio_auth",
+            "states/a#{ReservedSpellings.layered("A", 9)}"
+          ] do
+        assert call(:get, "/core/api/" <> tail, [bearer(token)]).status == 400
+      end
+
       assert HitCounter.count() == 0
     end
 

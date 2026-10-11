@@ -47,9 +47,10 @@ defmodule Vagus.Core.ReservedContractTest do
 
   use ExUnit.Case, async: true
 
-  alias Vagus.API.{Authz, Dispatcher, Tiers}
+  alias Vagus.API.{Authz, Dispatcher, ExploitFilter, Tiers}
   alias Vagus.API.CoreProxy.WSBridge
   alias Vagus.Core.{Reserved, Transport}
+  alias Vagus.ReservedSpellings
 
   @fixture_path Path.join([
                   __DIR__,
@@ -128,10 +129,11 @@ defmodule Vagus.Core.ReservedContractTest do
         assert authorize_view(principal, spelled, plain) == {:error, :blacklisted},
                "#{Enum.join(spelled, "/")} (Core #{url}) is reachable through the proxy"
 
-        # The other way round, so the raw spelling is shown to be checked too:
-        # `%68assio` as a decoded segment is a literal, and not reserved.
+        # The other way round, so the raw spelling is shown to be checked too.
         assert authorize_view(principal, plain, spelled) == {:error, :blacklisted}
-        assert authorize_view(@app, spelled, spelled) == :ok
+
+        # `%68assio` as the decoded spelling is what `%2568assio` was sent as.
+        assert authorize_view(principal, spelled, spelled) == {:error, :blacklisted}
       end
     end
 
@@ -163,6 +165,64 @@ defmodule Vagus.Core.ReservedContractTest do
             )
           end
         end
+      end
+    end
+
+    test "is denied when it takes more than one decode to read, by all three" do
+      for url <- @urls,
+          {label, tail} <- url |> concrete() |> tl() |> ReservedSpellings.multiply_encoded(),
+          family <- ["core", "homeassistant"] do
+        path = "/#{family}/api/#{tail}"
+        raw = String.split(path, "/", trim: true)
+        decoded = path |> URI.decode() |> String.split("/", trim: true)
+
+        for principal <- [@app, :supervisor, :anonymous] do
+          assert authorize_view(principal, raw, decoded) == {:error, :blacklisted},
+                 "#{path} (Core #{url}, #{label}) is reachable through the proxy"
+        end
+
+        conn = Dispatcher.call(Plug.Test.conn(:post, path), Dispatcher.init([]))
+        assert conn.status == 403, "#{path} (Core #{url}, #{label}) got past the dispatcher"
+
+        assert_raise Reserved.Error, fn ->
+          Transport.build({:socket, "/run/os/core.sock"}, :proxied, :post, "/api/" <> tail)
+        end
+      end
+    end
+
+    # A path the dispatcher passes and the proxy then refuses is a 500. With
+    # no token the proxy's own answer is a 401, so a 403 is the dispatcher's.
+    test "is judged alike by the dispatcher, the evaluator and the transport, at every depth" do
+      tails =
+        for url <- @urls,
+            [view | more] = url |> concrete() |> tl(),
+            subject <- [view, "states", "x" <> view],
+            layers <- 1..8,
+            at <- [0, byte_size(subject) - 1],
+            wrap <- ["", "./", "%2e/", "%252e%252F", "states/"] do
+          <<before::binary-size(^at), char::binary-size(1), rest::binary>> = subject
+          spelled = before <> ReservedSpellings.layered(char, layers) <> rest
+          wrap <> Enum.join([spelled | more], "/")
+        end
+
+      for tail <- Enum.uniq(tails), family <- ["core", "homeassistant"] do
+        path = "/#{family}/api/#{tail}"
+        raw = String.split(path, "/", trim: true)
+        decoded = path |> URI.decode() |> String.split("/", trim: true)
+
+        evaluator = authorize_view(@app, raw, decoded) == {:error, :blacklisted}
+        dispatcher = Dispatcher.call(Plug.Test.conn(:post, path), Dispatcher.init([])).status
+
+        transport =
+          try do
+            Transport.build({:socket, "/run/os/core.sock"}, :proxied, :post, "/api/" <> tail)
+            false
+          rescue
+            Reserved.Error -> true
+          end
+
+        assert dispatcher == if(evaluator, do: 403, else: 401), path
+        assert transport == evaluator, path
       end
     end
 
@@ -212,6 +272,58 @@ defmodule Vagus.Core.ReservedContractTest do
       assert Reserved.view?(path)
       assert Tiers.blacklisted?(["core" | path])
       assert Tiers.blacklisted?(["homeassistant" | path])
+    end
+  end
+
+  describe "decoding is bounded" do
+    # `Vagus.API.ExploitFilter` reads the same eight layers and answers 400
+    # past them, so the dispatcher never brings a deeper path here.
+    test "eight layers are read: a reserved view is found, anything else is not reserved" do
+      assert Reserved.view?(["api", ReservedSpellings.layered("h", 8) <> "assio_auth"])
+      refute Reserved.view?(["api", "states", "a" <> ReservedSpellings.layered("A", 8)])
+      refute Reserved.path?("/api/states/a" <> ReservedSpellings.layered("A", 8))
+
+      for tail <- [
+            "#{ReservedSpellings.layered("h", 8)}assio_auth",
+            "states/a#{ReservedSpellings.layered("A", 8)}"
+          ] do
+        refute ExploitFilter.harmful_path?("/core/api/" <> tail)
+      end
+    end
+
+    test "a path still encoded after eight is refused, whatever it would have read as" do
+      for layers <- [9, 10, 40], subject <- ["hassio_auth", "states"] do
+        <<first::binary-size(1), rest::binary>> = subject
+        segment = ReservedSpellings.layered(first, layers) <> rest
+
+        assert Reserved.view?(["api", segment])
+        assert Reserved.view?(["api", "states", segment])
+        assert Reserved.path?("/api/states/" <> segment)
+        assert Tiers.blacklisted?(["core", "api", "states", segment])
+
+        assert authorize_view(@app, ["core", "api", segment], ["core", "api", segment]) ==
+                 {:error, :blacklisted}
+
+        assert ExploitFilter.harmful_path?("/core/api/" <> segment)
+      end
+    end
+
+    # Each layer costs two bytes, so a request line can carry thousands.
+    test "a path of nothing but layers is refused without being read to the end" do
+      segment = "%" <> String.duplicate("25", 4_900) <> "41"
+
+      {micros, reserved?} = :timer.tc(fn -> Reserved.view?(["api", "states", segment]) end)
+
+      assert reserved?
+      assert micros < 250_000
+    end
+
+    test "a path with no escape in it is judged as written" do
+      assert Reserved.view?(["api", "hassio_auth"])
+      refute Reserved.view?(["api", "states", "hassio_auth"])
+      refute Reserved.view?(["api"])
+      refute Reserved.view?([])
+      refute Reserved.view?(["states", "hassio_auth"])
     end
   end
 

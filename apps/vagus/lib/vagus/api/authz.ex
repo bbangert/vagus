@@ -25,7 +25,13 @@ defmodule Vagus.API.Authz do
   and the caller is held to both, so encoding a path can only cost access.
 
   The Core proxy forwards the path as written and Core decodes it, so there
-  the two spellings are what was sent and what Core will read.
+  the two spellings are what was sent and what Core will read. A reserved
+  view is refused under further layers of encoding too:
+  `Vagus.Core.Reserved.view?/1` reads through them from either spelling.
+
+  The Supervisor API's tiers are graded on these two spellings and no
+  deeper, as upstream grades `request.path`: the router decodes once, and
+  that spelling is the one a handler is given.
 
   ## Order on the Supervisor API
 

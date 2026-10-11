@@ -3,7 +3,7 @@ defmodule Vagus.API.Tiers do
   The authorisation ladder: which caller may reach which path.
 
   This is the emulator's mirror of `supervisor/api/middleware/security.py`
-  (upstream `2026.07.5`, V1 pattern set — Vagus serves the V1 surface). It
+  (upstream `2026.10.1`, V1 pattern set — Vagus serves the V1 surface). It
   exists as a **table** rather than as a guard inside each handler for one
   reason: the 2026-07-29 audit found 26 routes that were admin-tier to any
   installed add-on purely because `Vagus.API.Router`'s `supervisor_only/2` is
@@ -36,7 +36,7 @@ defmodule Vagus.API.Tiers do
       :none                  an add-on with `hassio_api: false`
 
   `:none` has no upstream name. Upstream keeps `access_hassio_api` and
-  `hassio_role` as separate checks (`security.py` L360: `elif app and
+  `hassio_role` as separate checks (`security.py` L375: `elif app and
   app.access_hassio_api`), but the only paths reachable *without*
   `access_hassio_api` are the `api_bypass` ones, and those are tier-independent
   — so an add-on that never asked for API access is exactly "satisfies
@@ -80,6 +80,8 @@ defmodule Vagus.API.Tiers do
     * `:_` — exactly one segment, any value
     * `:slug` — exactly one segment that is a valid slug: upstream's
       `RE_SLUG`, minus `.` and `..`
+    * `{:prefix, text}` — exactly one segment that starts with `text`, for
+      upstream's `(?!text)`: a lookahead excludes whatever starts so
     * `:+` — one or more segments
     * `:*` — zero or more segments
 
@@ -147,7 +149,7 @@ defmodule Vagus.API.Tiers do
 
   # fmt: mirrors `security.py`'s own `# fmt: off` block. Read this beside it.
   @table [
-    # -- api_bypass (security.py L95-104) -------------------------------------
+    # -- api_bypass (security.py L99-108) -------------------------------------
     # `^(?:|/addons/self/(?!security|update)[^/]+|/addons/self/options/config
     #    |/info|/services.*|/discovery.*|/auth)$`
     #
@@ -178,7 +180,7 @@ defmodule Vagus.API.Tiers do
     # on 26 routes was this whole plan's root cause.
     #
     # Enumerated, an `/addons/self/X` nobody thought about falls through to
-    # `["addons", :_, :+]` ⇒ `:manager` — closed, the same invariant every
+    # `["addons", :slug, :+]` ⇒ `:manager` — closed, the same invariant every
     # other row keeps. Upstream serves more of these than Vagus does
     # (`rebuild`, `stdin`, …); when a route for one lands, add it here
     # deliberately rather than discovering it was already open.
@@ -260,16 +262,14 @@ defmodule Vagus.API.Tiers do
     {["homeassistant", "check"], :supervisor},
     {["homeassistant", "update"], :supervisor},
 
-    # -- core_only (security.py L106-110) -------------------------------------
-    # `/addons/{slug}/sys_options`. Vagus does not serve it; the entry keeps
-    # the catch-all from ever handing it to an admin-role add-on if it lands.
+    # -- core_only (security.py L109-114) -------------------------------------
+    # `/addons/{slug}/sys_options` and `/os/ssh/authorized_keys`. Vagus serves
+    # neither; the rows keep a route that lands later from being handed to an
+    # admin-role app by the catch-all, or to a manager by `/os/.+`.
     {["addons", :_, "sys_options"], :supervisor},
-    # Not in 2026.07.5, where `/os/.+` leaves it at manager: upstream added it
-    # to `core_only` later. Unserved here; the row keeps a future route for
-    # writing the host's SSH keys from landing on the manager family.
     {["os", "ssh", "authorized_keys"], :supervisor},
 
-    # -- role_access[default] (security.py L111-115) --------------------------
+    # -- role_access[default] (security.py L116-120) --------------------------
     # `^(?:|/.+/info)$` — note `.+` spans `/`, so `/network/interface/eth0/info`
     # matches. Placed after the overrides above so a supervisor-only route
     # ending in `info` could never be widened by it.
@@ -287,7 +287,7 @@ defmodule Vagus.API.Tiers do
     {["addons", :_, "logs", "boots", "info"], :default, subject: :self, answer: @not_this_app},
     {[:+, "info"], :default},
 
-    # -- role_access[homeassistant] (security.py L116-122) --------------------
+    # -- role_access[homeassistant] (security.py L121-127) --------------------
     # `/core/.+` and `/homeassistant/.+`. Everything in these two families that
     # Vagus does not hold at `:supervisor` above — `/core/options`,
     # `/core/logs*`, `/core/stats`, `/homeassistant/options`,
@@ -296,25 +296,26 @@ defmodule Vagus.API.Tiers do
     {["core", :+], :homeassistant},
     {["homeassistant", :+], :homeassistant},
 
-    # -- role_access[backup] (security.py L123-128) ---------------------------
+    # -- role_access[backup] (security.py L128-133) ---------------------------
     # `/backups.*` — note `.*`, so bare `/backups` matches too. `ROLE_MANAGER`
     # matches the same alternative. `/backups/info` and
     # `/backups/{slug}/info` already matched `/.+/info` above, exactly as they
     # do upstream.
     {["backups", :*], :backup},
 
-    # -- role_access[manager] (security.py L129-157) --------------------------
+    # -- role_access[manager] (security.py L134-163) --------------------------
     # One entry per upstream alternative, in upstream's order. Families Vagus
     # does not serve (`/cli`, `/docker`, `/observer`, `/security`,
     # `/snapshots`) are kept so the diff stays one-to-one and a future route
-    # lands on the right tier by default.
+    # lands on the right tier by default. `/time/.+` is the exception: it has
+    # no row, so what upstream gives a manager there is admin here.
     {["addons"], :manager},
     {["addons", "reload"], :manager},
     # `/addons/{slug}/(?!security).+` — the negative lookahead is the two
     # `security` rows here, admin as upstream. An admin-role app naming its
     # own slug would otherwise clear its own protection.
     {["addons", :_, "security"], :admin, caller: :supervisor, answer: %{"POST" => :forbidden}},
-    {["addons", :_, "security", :*], :admin},
+    {["addons", :_, {:prefix, "security"}, :*], :admin},
     # Upstream role-gates these, so a manager app reads any app's. Here it
     # reads its own.
     {["addons", :_, "options", "config"], :manager,
@@ -326,7 +327,9 @@ defmodule Vagus.API.Tiers do
     {["addons", :_, "logs", "boots", :_], :manager, subject: :self, answer: @not_this_app},
     {["addons", :_, "logs", "boots", :_, "follow"], :manager,
      subject: :self, answer: @not_this_app},
-    {["addons", :_, :+], :manager},
+    # `:slug`, as upstream's alternative is `RE_SLUG`: any other segment
+    # leaves the path to the admin fallback.
+    {["addons", :slug, :+], :manager},
     {["audio", :+], :manager},
     {["auth", "cache"], :manager},
     {["available_updates"], :manager},
@@ -340,8 +343,10 @@ defmodule Vagus.API.Tiers do
     {["multicast", :+], :manager},
     {["network", :+], :manager},
     {["observer", :+], :manager},
-    # `/os/(?!datadisk/wipe).+`
-    {["os", "datadisk", "wipe"], :admin},
+    # `/os/(?!datadisk/wipe|ssh/authorized_keys).+`. `core_only` has the
+    # keys' own path, above.
+    {["os", "datadisk", {:prefix, "wipe"}, :*], :admin},
+    {["os", "ssh", {:prefix, "authorized_keys"}, :*], :admin},
     {["os", :+], :manager},
     {["refresh_updates"], :manager},
     {["resolution", :+], :manager},
@@ -375,9 +380,13 @@ defmodule Vagus.API.Tiers do
   #         r")$"
   #     )
   #     ...
-  #     if BLACKLIST.match(request.path):
+  #     if BLACKLIST.match(recursive_unquote(request.path)):
   #         _LOGGER.error("%s is blacklisted!", request.path)
   #         raise HTTPForbidden
+  #
+  # `recursive_unquote` decodes until nothing changes, so a view is refused
+  # however many times it is encoded. `Vagus.Core.Reserved.view?/1` reads
+  # through the layers too, and refuses a path it has not finished reading.
   #
   # Both families are Supervisor's proxy *into* Core's REST API, and Core's
   # `/api/hassio…` views are the private Supervisor↔Core RPC surface on the
@@ -426,6 +435,8 @@ defmodule Vagus.API.Tiers do
   upstream `api/proxy.py`:
 
       CORE_API_DENY: Final = re.compile(r"^hassio(?:/|_)")
+      ...
+      if CORE_API_DENY.match(recursive_unquote(path)):
 
   An `:allow` is for the callers `Vagus.API.Authz` admits to this leg, not for
   everyone. These are functions rather than `@table` rows because a row is
@@ -509,7 +520,7 @@ defmodule Vagus.API.Tiers do
   is above `:default` and below `:manager`, and neither implies the other.
   """
   @spec allows?(tier(), requirement()) :: boolean()
-  # Core's own token is never role-checked (security.py L338-341 sets
+  # Core's own token is never role-checked (security.py L343-345 sets
   # `request_from` and every later branch is an `elif`).
   def allows?(:supervisor, _requirement), do: true
   # Answered upstream before a token is read, so no tier can fail it.
@@ -572,6 +583,11 @@ defmodule Vagus.API.Tiers do
     do: Config.valid_slug?(segment) and match_path?(pattern, rest)
 
   defp match_path?([:slug | _pattern], []), do: false
+
+  defp match_path?([{:prefix, prefix} | pattern], [segment | rest]),
+    do: String.starts_with?(segment, prefix) and match_path?(pattern, rest)
+
+  defp match_path?([{:prefix, _prefix} | _pattern], []), do: false
 
   defp match_path?([literal | pattern], [literal | rest]) when is_binary(literal),
     do: match_path?(pattern, rest)

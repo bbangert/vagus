@@ -394,11 +394,22 @@ defmodule Vagus.API.AuthzTest do
       end
     end
 
-    test "decodes once: a doubly encoded spelling is not the reserved view" do
+    test "a reserved view is blacklisted however many times it is encoded" do
       allowed = core_app(%{homeassistant_api: true})
 
-      assert core(allowed, "/core/api/%2568assio_auth") == :ok
+      for principal <- [allowed, :supervisor, :anonymous],
+          path <- [
+            "/core/api/%2568assio_auth",
+            "/core/api/%252568assio_auth/password_reset",
+            "/core/api/hassio%252Fapp",
+            "/homeassistant/api/%252e/%2568assio_auth"
+          ] do
+        assert core(principal, path) == {:error, :blacklisted}
+      end
+
       assert core(allowed, "/core/api/states/hassio") == :ok
+      assert core(allowed, "/core/api/states/%2568assio") == :ok
+      assert core(allowed, "/core/api/st%2561tes") == :ok
     end
 
     test "a ctx for another leg, or with no decoded segments, has no clause" do
