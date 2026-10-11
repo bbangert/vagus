@@ -45,8 +45,8 @@ defmodule Vagus.Core.ReservedContractTest do
 
   use ExUnit.Case, async: true
 
+  alias Vagus.API.{Authz, Tiers}
   alias Vagus.API.CoreProxy.WSBridge
-  alias Vagus.API.Tiers
   alias Vagus.Core.{Reserved, Transport}
 
   @fixture_path Path.join([
@@ -90,7 +90,52 @@ defmodule Vagus.Core.ReservedContractTest do
     end)
   end
 
+  # The one caller the proxy admits, so a refusal below is the reservation's
+  # and not the caller's.
+  @app {:addon, %{slug: "contract", homeassistant_api: true}}
+
+  defp authorize_view(principal, segments, decoded),
+    do:
+      Authz.authorize(principal, {:rest, :core_api, "POST", segments}, %{
+        leg: :core_api,
+        decoded_segments: decoded
+      })
+
+  defp authorize_command(principal, command),
+    do:
+      Authz.authorize(principal, {:ws, :core_api, command, %{"type" => command}}, %{
+        leg: :core_api,
+        decoded_segments: nil
+      })
+
+  # `%68` for a leading `h`: reserved to Core, which decodes it, and not to a
+  # literal match.
+  defp encoded(["api", "h" <> rest | tail]), do: ["api", "%68" <> rest | tail]
+
   describe "every Core hassio view" do
+    test "is blacklisted by the evaluator, for every principal and in either spelling" do
+      for url <- @urls,
+          family <- ["core", "homeassistant"],
+          principal <- [@app, :supervisor, :anonymous] do
+        plain = [family | concrete(url)]
+        spelled = [family | url |> concrete() |> encoded()]
+
+        assert authorize_view(principal, plain, plain) == {:error, :blacklisted},
+               "#{Enum.join(plain, "/")} (Core #{url}) is reachable through the proxy"
+
+        assert authorize_view(principal, spelled, plain) == {:error, :blacklisted},
+               "#{Enum.join(spelled, "/")} (Core #{url}) is reachable through the proxy"
+      end
+    end
+
+    test "leaves its neighbours to the caller's grant" do
+      for family <- ["core", "homeassistant"],
+          rest <- [["states"], ["states", "sensor.hassio_cpu"], ["services", "hassio", "x"]] do
+        segments = [family, "api" | rest]
+        assert authorize_view(@app, segments, segments) == :ok
+      end
+    end
+
     test "is refused on the Supervisor-side path, under both proxy families" do
       for url <- @urls, family <- ["core", "homeassistant"] do
         segments = concrete(url)
@@ -145,8 +190,37 @@ defmodule Vagus.Core.ReservedContractTest do
       for command <- @ws_commands do
         frame = Jason.encode!([%{"id" => 1, "type" => command}])
 
-        assert WSBridge.screen(frame) == {:refuse, nil},
+        assert WSBridge.screen(frame, @app) == {:refuse, nil},
                "[#{command}] would be relayed to Core as the Supervisor"
+      end
+    end
+
+    test "is refused by the proxy alone, under its own id" do
+      for command <- @ws_commands do
+        frame = Jason.encode!(%{"id" => 9, "type" => command})
+
+        assert WSBridge.screen(frame, @app) == {:refuse, 9},
+               "#{command} would be relayed to Core as the Supervisor"
+      end
+    end
+
+    # `supervisor/api` is the one the evaluator sets aside to be answered
+    # here; it is no more relayed than the rest.
+    test "is never allowed by the evaluator, to the one caller the proxy admits" do
+      for command <- @ws_commands do
+        expected =
+          if command == "supervisor/api",
+            do: {:intercept, :supervisor_api},
+            else: {:error, :blacklisted}
+
+        assert authorize_command(@app, command) == expected,
+               "#{command} would be relayed to Core as the Supervisor"
+      end
+    end
+
+    test "is refused by the evaluator to every other principal" do
+      for command <- @ws_commands, principal <- [:supervisor, :anonymous] do
+        assert {:error, _refusal} = authorize_command(principal, command)
       end
     end
 
@@ -164,6 +238,8 @@ defmodule Vagus.Core.ReservedContractTest do
     test "ordinary Core commands are untouched" do
       for command <- ["get_states", "call_service", "config/auth/list", "subscribe_events"] do
         refute Reserved.command?(command)
+        assert authorize_command(@app, command) == :ok
+        assert WSBridge.screen(Jason.encode!(%{"id" => 1, "type" => command}), @app) == :relay
       end
     end
   end

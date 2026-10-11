@@ -46,8 +46,8 @@ defmodule Vagus.Core.Reserved do
 
   A path-shaped rule cannot reach this: a WS caller addresses Core by typed
   command, and the frames all arrive on one already-authorized socket. So
-  `Vagus.API.CoreProxy.WSBridge` applies `command?/1` per relayed frame
-  instead.
+  `Vagus.API.CoreProxy.WSBridge` puts every command of every frame to
+  `Vagus.API.Authz`, whose WebSocket rule is `command?/1`.
 
   ## Why a namespace, not a list of endpoints
 
@@ -67,16 +67,17 @@ defmodule Vagus.Core.Reserved do
   being untouchable, which is why `Vagus.Core.Transport.build/6` demands an
   origin tag rather than refusing the path outright.
 
-  ## Two applications of one rule
+  ## One rule, applied where each caller arrives
 
   `Vagus.API.Tiers.blacklisted?/1` applies it to the Supervisor-side request
   path (`/core/api/hassio_auth` → segments after the family), refusing with
   the 403 envelope before `Vagus.API.CoreProxy` is ever constructed.
+  `Vagus.API.Authz` decides both proxy legs from `Vagus.API.Tiers.core_api/1`
+  and `core_ws/1`, which ask this module and hold no list of their own.
   `Vagus.Core.Transport.build/6` applies it again to the Core-side path at
   the point Vagus's credential is attached, so a future route that reaches
   Core without passing `Vagus.API.Dispatcher` cannot quietly reintroduce the
-  hole. `Vagus.API.CoreProxy.WSBridge` applies `command?/1` to every relayed
-  frame. `test/vagus/core/reserved_contract_test.exs` pins all three against
+  hole. `test/vagus/core/reserved_contract_test.exs` pins each of them against
   the views and commands Core actually registers.
   """
 
@@ -131,7 +132,7 @@ defmodule Vagus.Core.Reserved do
   strings are what dispatch actually matches.
 
   Matched on the DECODED command string, never on the raw frame — see
-  `Vagus.API.CoreProxy.WSBridge`'s `screen/1` for why a substring
+  `Vagus.API.CoreProxy.WSBridge`'s `screen/2` for why a substring
   pre-filter over the raw bytes would be a hole rather than an optimisation.
   """
   @spec command?(String.t()) :: boolean()

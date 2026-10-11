@@ -17,8 +17,9 @@ defmodule Vagus.API.CoreProxy do
   `/homeassistant/websocket`, `/core/api/.*`, `/core/websocket` — so
   `token_validation` never runs for them and `request[REQUEST_FROM]` is left
   `None`. **The proxy authenticates itself**, via `_check_access`, not via the
-  caller model every other route family uses. `Vagus.API.Auth`/`Vagus.API.Tiers`
-  never run on this leg either; `check_access/1` below is the whole gate.
+  caller model every other route family uses. `Vagus.API.Auth` never runs on
+  this leg either: this module resolves the token to a principal and
+  `Vagus.API.Authz` decides, on rules of this leg's own.
 
   ## The auth model is INVERTED from every other add-on-facing route (fact 2)
 
@@ -32,16 +33,18 @@ defmodule Vagus.API.CoreProxy do
   `Vagus.App.Policy.identity/1`). Anything else is refused with 401,
   including a token that resolves fine but lacks the flag.
 
-  **The supervisor token is deliberately NOT accepted here** — it simply
-  doesn't resolve in the directory (which only ever holds app tokens), so it
-  falls through to the same 401 as any other unknown
-  token. There is no special-case rejection to get wrong, which is itself the
-  point: the one route family where Core's own token — normally the highest
-  tier there is — must be refused, and an add-on's token — normally the
-  lowest — must be treated as admin-on-Core, is exactly the shape of mistake
-  that is easiest to get backwards. Getting the predicate wrong either breaks
-  every add-on that legitimately calls the HA API or hands Core's admin rights
-  to an add-on that never declared `homeassistant_api`.
+  **The supervisor token is deliberately NOT accepted here.** It is
+  recognised, so that the refusal is `Vagus.API.Authz`'s explicit one for the
+  supervisor and not an accident of where tokens are looked up. This is the
+  one route family where Core's own token, normally the highest tier there
+  is, must be refused, and an app's token, normally the lowest, must be
+  treated as admin-on-Core. Getting it backwards either breaks every app that
+  legitimately calls the HA API or hands Core's admin rights to an app that
+  never declared `homeassistant_api`.
+
+  Every refusal is the same 401, as upstream's `_check_access` answers: a
+  caller is not told whether its token was unknown, Core's, or an app's
+  without the grant.
 
   ## Why the proxy calls Core as the Supervisor user (fact 3)
 
@@ -61,16 +64,17 @@ defmodule Vagus.API.CoreProxy do
   Core's whole `/api/hassio…` namespace (PR #34, landed before this feature so
   the deny could not be forgotten; widened from the two literal `hassio/`
   paths to the namespace after the upstream `hassio_auth/password_reset`
-  account-takeover — see `Vagus.Core.Reserved`). This module still has no idea
-  a path is blacklisted: that check runs entirely in `Vagus.API.Dispatcher`
-  (`dispatch_core_proxy/2`), BEFORE this module is ever reached, using the same
-  `Vagus.API.Auth`-shaped 403 every other blacklisted request gets, and it
-  stays there — a second policy check *here* would be the same rule
-  reimplemented in a second place, free to drift.
+  account-takeover — see `Vagus.Core.Reserved`). That check answers in
+  `Vagus.API.Dispatcher` (`dispatch_core_proxy/2`), BEFORE this module is ever
+  reached, with the same `Vagus.API.Auth`-shaped 403 every other blacklisted
+  request gets. `Vagus.API.Authz` holds the same rule for this leg, so a
+  reserved path that arrives here anyway did not come through the
+  dispatcher, and raises `Vagus.Core.Reserved.Error` rather than being
+  answered as policy.
 
-  What DOES back it up is one layer further in, at
-  `Vagus.Core.Transport.build/6`: this module builds its request with
-  `origin: :proxied`, and a reserved path built under that tag raises rather
+  One layer further in, at `Vagus.Core.Transport.build/6`, it is asserted
+  again: this module builds its request with `origin: :proxied`, and a
+  reserved path built under that tag raises rather
   than reaching Core. That is not a policy decision duplicated — it is the
   same rule asserted where Vagus's credential is actually conferred, so a
   routing regression, or some future leg that reaches Core without passing
@@ -123,9 +127,9 @@ defmodule Vagus.API.CoreProxy do
   aiohttp `WebSocketResponse.prepare` on a non-upgrade request raises
   `HTTPBadRequest`, mirrored here rather than 404ing it), then hands off to
   `WebSockAdapter.upgrade/4` with `Vagus.API.CoreProxy.WSBridge`. This is the
-  one branch where `check_access/1` deliberately does **not** run before the
-  upgrade: fact 8's handshake — `WSBridge`'s own `:awaiting_auth` →
-  `:relaying` state machine — **is** the auth here, run against the caller
+  one branch where no access check runs before the upgrade: fact 8's
+  handshake — `WSBridge`'s own `:awaiting_auth` → `:relaying` state
+  machine — **is** the auth here, run against the caller
   over the WebSocket itself instead of a header, exactly like the rest of
   this module's inverted model (fact 1). See `Vagus.API.CoreProxy.WSBridge`'s
   moduledoc for the full handshake and relay design.
@@ -139,15 +143,18 @@ defmodule Vagus.API.CoreProxy do
   (non-slash-terminated) `/core/api`/`/homeassistant/api` literal, and any
   non-GET on `rest == ["stream"]` (fact 7's dedicated resource, registered
   ahead of the generic route — see above) are all answered before
-  `check_access/1` runs.
+  the caller is identified.
   """
 
   @behaviour Plug
 
   import Plug.Conn
 
+  require Logger
+
+  alias Vagus.API.{Authz, SourceGuard, Token}
   alias Vagus.App
-  alias Vagus.Core.{Client, Health, Transport}
+  alias Vagus.Core.{Client, Health, Reserved, Transport}
 
   @finch Vagus.API.CoreProxy.Finch
 
@@ -212,9 +219,7 @@ defmodule Vagus.API.CoreProxy do
     transport = Transport.current()
 
     with :ok <- check_route(conn, family, rest),
-         {:ok, token} <- extract_token(conn),
-         {:ok, identity} <- resolve_addon(token),
-         :ok <- check_homeassistant_api(identity),
+         {:ok, _principal} <- authorize(extract_token(conn), action(conn), ctx(conn)),
          :ok <- check_core_health(),
          {:ok, credential} <- core_credential(transport) do
       proxy_request(conn, rest, credential, transport)
@@ -244,7 +249,7 @@ defmodule Vagus.API.CoreProxy do
         send_plain(conn, 400, "Bad Request")
 
       true ->
-        # No `check_access/1` here — deliberately. `WSBridge`'s own
+        # No access check here — deliberately. `WSBridge`'s own
         # `:awaiting_auth` → `:relaying` handshake against the caller *is*
         # the auth for this leg (fact 1/8); running the REST leg's header
         # check here would be answering a question this route was never
@@ -327,61 +332,107 @@ defmodule Vagus.API.CoreProxy do
   # `bearer.split(' ')[-1]`, not a strict `"Bearer " <> token` match — a
   # malformed or extra-token header still yields *a* candidate string, which
   # then simply fails to resolve below) — or, absent that header, the legacy
-  # `X-Ha-Access` value verbatim. Neither present is a 401.
+  # `X-Ha-Access` value verbatim. Neither present is no token at all.
   defp extract_token(conn) do
     case get_req_header(conn, "authorization") do
       [value | _] ->
-        {:ok, value |> String.split(" ") |> List.last()}
+        value |> String.split(" ") |> List.last()
 
       [] ->
         case get_req_header(conn, "x-ha-access") do
-          [value | _] -> {:ok, value}
-          [] -> {:error, :unauthorized}
+          [value | _] -> value
+          [] -> nil
         end
     end
   end
 
-  defp resolve_addon(token) do
-    case App.identity_for_token(token) do
-      {:ok, identity} -> {:ok, identity}
-      :error -> {:error, :unauthorized}
+  defp action(conn), do: {:rest, :core_api, conn.method, conn.path_info}
+
+  # Decoded whole and split again, as `Vagus.API.Dispatcher` does and for its
+  # reason: Core decodes the path it is forwarded, so `hassio%2fapp` is two
+  # segments there.
+  defp ctx(conn) do
+    decoded = conn.request_path |> URI.decode() |> String.split("/", trim: true)
+    %{leg: :core_api, decoded_segments: decoded}
+  end
+
+  # The supervisor's token is compared first, as `Vagus.API.Auth` does. A
+  # token nobody holds is no identity, which is what `:anonymous` means.
+  defp principal(nil), do: :anonymous
+
+  defp principal(token) do
+    if Plug.Crypto.secure_compare(token, Token.get()) do
+      :supervisor
+    else
+      case App.identity_for_token(token) do
+        {:ok, identity} -> {:addon, identity}
+        :error -> :anonymous
+      end
     end
   end
 
-  # Default `false` — the most restrictive reading, same convention
-  # `Vagus.API.Tiers.caller_tier/1` uses for `hassio_api` — so an identity
-  # built before this field existed (or a narrow test's hand-built map) is
-  # closed, never accidentally admin-on-Core.
-  defp check_homeassistant_api(identity) do
-    if Map.get(identity, :homeassistant_api, false), do: :ok, else: {:error, :unauthorized}
+  defp authorize(token, action, ctx) do
+    principal = principal(token)
+
+    case Authz.authorize(principal, action, ctx) do
+      :ok ->
+        {:ok, principal}
+
+      # `Vagus.API.Dispatcher` answers a reserved path before this module is
+      # reached, so one here means a route around it: loud, like
+      # `Vagus.Core.Transport.build/6`'s own refusal.
+      {:error, :blacklisted} ->
+        {:rest, :core_api, _method, [_family | core_path]} = action
+        raise Reserved.Error, path: "/" <> Enum.join(core_path, "/")
+
+      {:error, :forbidden} ->
+        count_refusal()
+        {:error, :unauthorized}
+
+      # Anything else still refuses, so a result this module has no branch
+      # for can never reach Core.
+      _refused ->
+        {:error, :unauthorized}
+    end
   end
+
+  # The upgrade request every one of the WS leg's paths stands for. None of
+  # them can spell a reserved view, so which one the caller used decides
+  # nothing.
+  @ws_action {:rest, :core_api, "GET", ["core", "websocket"]}
+  @ws_ctx %{leg: :core_api, decoded_segments: ["core", "websocket"]}
 
   @doc """
-  The `_check_access` predicate (fact 2), extracted for reuse by
-  `Vagus.API.CoreProxy.WSBridge` — fact 8's handshake needs the exact same
-  resolve-then-flag-check, just fed a token pulled from the caller's WS auth
-  message instead of a header. `resolve_addon/1` and `check_homeassistant_api/1`
-  already return the same `:ok | {:error, :unauthorized}` shape this needs, so
-  this is a thin `with` over the two rather than a second implementation that
-  could drift from the REST leg's.
+  The WS leg's handshake check, on the token the caller's auth message
+  carried: the REST leg's decision, for the upgrade request the socket
+  arrived on. The principal comes back so the bridge can put each later
+  command to `Vagus.API.Authz` as the same caller.
   """
-  @spec check_access(String.t()) :: :ok | {:error, :unauthorized}
-  def check_access(token) do
-    with {:ok, identity} <- resolve_addon(token) do
-      check_homeassistant_api(identity)
+  @spec check_access(String.t()) :: {:ok, Authz.principal()} | {:error, :unauthorized}
+  def check_access(token) when is_binary(token), do: authorize(token, @ws_action, @ws_ctx)
+
+  @refusal_label "authz/core_api"
+
+  # Only a caller that is somebody: an app without the grant, or Core. The
+  # label is constant and carries none of the request. Counted on device and
+  # logged where there is no counter and no ring to protect, as
+  # `Vagus.API.Auth` does.
+  defp count_refusal do
+    if SourceGuard.enabled?() do
+      SourceGuard.record_filtered(:authz, @refusal_label)
+    else
+      Logger.warning("Vagus.API.CoreProxy: refused a request (#{@refusal_label})")
     end
   end
 
-  # No logging on any branch above, deliberately. This whole path runs
-  # pre-auth from the caller's point of view — same primitive
+  # No per-attempt logging on device for any branch above, deliberately. This
+  # whole path runs pre-auth from the caller's point of view — same primitive
   # `Vagus.API.Dispatcher`'s `report_filtered/2` and `Vagus.API.Auth`'s
   # `refuse_blacklisted/1` both already decline to log per-request for: an
   # unauthenticated or wrongly-scoped caller can repeat this at will, and a
   # `Logger.warning` per attempt would let it push real evidence out of
   # `RingLogger`'s fixed-size ring, the only forensic record on a Nerves
-  # device. Nothing here is attacker-controlled bytes the way a filtered path
-  # is, but the volume argument alone is enough — see PR #34's history for why
-  # this project already learned that lesson once.
+  # device. A caller nobody knows is not even counted.
 
   ## Core health gate (fact 5)
 

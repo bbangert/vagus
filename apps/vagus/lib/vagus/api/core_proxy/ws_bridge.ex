@@ -36,10 +36,11 @@ defmodule Vagus.API.CoreProxy.WSBridge do
      so this deliberately does not require `"type":"auth"` the way the
      moduledoc example message happens to have one.
   3. The token is checked exactly like the REST leg's `_check_access`
-     (`Vagus.API.CoreProxy.check_access/1` — same resolve-in-`Registry`-and-
-     require-`homeassistant_api` predicate, reused rather than
-     reimplemented so the two legs can't drift on what "authorized" means).
-     Success → `auth_ok` is pushed immediately and `Upstream` is started
+     (`Vagus.API.CoreProxy.check_access/1` — the same resolution and the same
+     `Vagus.API.Authz` decision, reused rather than reimplemented so the two
+     legs can't drift on what "authorized" means). Success → the principal
+     is kept (see "The principal" below), `auth_ok` is pushed immediately
+     and `Upstream` is started
      **only now** — an unauthenticated or wrongly-scoped caller never causes
      a dial to Core at all. Failure (bad token, no token field, non-JSON,
      a binary frame, or the deadline firing first) → `auth_invalid` then a
@@ -92,21 +93,34 @@ defmodule Vagus.API.CoreProxy.WSBridge do
   questions, and upstream conflates them in exactly this order, not the
   other way round.
 
+  ## The principal
+
+  The handshake's caller is kept in the state as a `Vagus.API.Authz`
+  principal, and every command of every later text frame is put to
+  `Vagus.API.Authz` as that caller. It is set once and no frame can change
+  it: a second auth message is one more command to relay.
+
+  It is what the app was granted when the socket opened. Nothing here closes
+  an open socket when its app is stopped, uninstalled, or reinstalled without
+  `homeassistant_api`, and asking the app's process per frame would put a
+  call in the relay path.
+
   ## `supervisor/*` and `hassio/*` commands are refused, not relayed
 
   Everything below assumes frames pass through untouched. One class does
-  not: a caller frame naming a command in Core's reserved domains is
+  not: a caller frame naming a command `Vagus.API.Authz` does not allow is
   answered here with Core's own `unauthorized` result envelope and never
   reaches `Upstream`. `Upstream` authenticates to Core as the Supervisor, so
-  those commands — `supervisor/api` above all, which calls the SUPERVISOR
-  API with Core's token and would hand the caller the `:supervisor` tier —
-  would otherwise pass Core's own "is this the Supervisor" gates truthfully.
+  the commands in Core's reserved domains — `supervisor/api` above all,
+  which calls the SUPERVISOR API with Core's token and would hand the caller
+  the `:supervisor` tier — would otherwise pass Core's own "is this the
+  Supervisor" gates truthfully.
   See `Vagus.Core.Reserved` for the reservation this is one half of, and
-  `screen/1` below for the mechanics.
+  `screen/2` below for the mechanics.
 
   Core dispatches each element of a JSON array frame as its own command, so
-  a batch is refused whole if any element is reserved, or cannot be read as
-  a command at all — as is a lone frame that cannot. A batch has no one
+  a batch is refused whole if any element is not allowed, or cannot be read
+  as a command at all — as is a lone frame that cannot. A batch has no one
   `id` to answer under, so its single result carries a null one. Text that
   is not JSON closes both legs, as Core itself would on receiving it. This
   is upstream `supervisor/api/proxy.py`'s `_denied_command_types`.
@@ -162,16 +176,24 @@ defmodule Vagus.API.CoreProxy.WSBridge do
 
   @behaviour WebSock
 
-  alias Vagus.API.CoreProxy
+  require Logger
+
+  alias Vagus.API.{Authz, CoreProxy, SourceGuard}
   alias Vagus.API.CoreProxy.WSBridge.Upstream
-  alias Vagus.Core.{Reserved, Versions}
+  alias Vagus.Core.Versions
 
   @heartbeat_interval_ms 30_000
+
+  # Built once: `screen/2` runs for every text frame.
+  @authz_ctx %{leg: :core_api, decoded_segments: nil}
+
+  @refusal_label "authz/core_ws"
 
   @typedoc "State carried across every `WebSock` callback for the caller leg."
   @type state :: %{
           phase: :awaiting_auth | :relaying,
           upstream: pid() | nil,
+          principal: Authz.principal() | nil,
           ha_version: String.t() | nil,
           closing?: boolean()
         }
@@ -197,7 +219,14 @@ defmodule Vagus.API.CoreProxy.WSBridge do
     Process.send_after(self(), :auth_deadline, CoreProxy.ws_auth_timeout_ms())
     Process.send_after(self(), :heartbeat, @heartbeat_interval_ms)
 
-    {:ok, %{phase: :awaiting_auth, upstream: nil, ha_version: ha_version, closing?: false}}
+    {:ok,
+     %{
+       phase: :awaiting_auth,
+       upstream: nil,
+       principal: nil,
+       ha_version: ha_version,
+       closing?: false
+     }}
   end
 
   @impl WebSock
@@ -211,7 +240,7 @@ defmodule Vagus.API.CoreProxy.WSBridge do
   handoff" section for why a call and not a cast); a timeout closes with
   1011 directly, any other exit is a no-op since the faithful close is
   already on its way through `handle_info/2`. The exceptions are text
-  frames `screen/1` refuses or cannot parse.
+  frames `screen/2` refuses or cannot parse.
   """
   def handle_in({data, opcode: :text}, %{phase: :awaiting_auth} = state) do
     case decode_caller_token(data) do
@@ -225,11 +254,12 @@ defmodule Vagus.API.CoreProxy.WSBridge do
   end
 
   def handle_in({data, opcode: :text} = frame, %{phase: :relaying} = state) do
-    case screen(data) do
+    case screen(data, state.principal) do
       :relay ->
         relay(frame, state)
 
       {:refuse, id} ->
+        count_refusal()
         {:push, {:text, unauthorized_result(id)}, state}
 
       # 1000 because Core closes on invalid JSON with it too, as does
@@ -374,30 +404,34 @@ defmodule Vagus.API.CoreProxy.WSBridge do
   # Public only so `Vagus.Core.ReservedContractTest` can pin the batch path
   # to the commands Core really registers.
   @doc false
-  @spec screen(binary()) :: :relay | {:refuse, term()} | :invalid_json
-  def screen(data) do
+  @spec screen(binary(), Authz.principal()) :: :relay | {:refuse, term()} | :invalid_json
+  def screen(data, principal) do
     # Ordered, so a repeated key stays visible — see `command_type/1`.
     case Jason.decode(data, objects: :ordered_objects) do
       {:ok, parsed} ->
-        case denied_command_types(parsed) do
-          [] -> :relay
-          _denied -> {:refuse, response_id(parsed)}
-        end
+        if allowed?(parsed, principal), do: :relay, else: {:refuse, response_id(parsed)}
 
       {:error, _reason} ->
         :invalid_json
     end
   end
 
-  # Upstream `proxy.py`'s `_denied_command_types`: `nil` stands for an
-  # element that is not a command at all.
-  defp denied_command_types(parsed) do
-    # Core dispatches each element of a JSON array as a separate command.
-    commands = if is_list(parsed), do: parsed, else: [parsed]
+  # Upstream `proxy.py`'s `_denied_command_types`. Core dispatches each
+  # element of a JSON array as a separate command.
+  defp allowed?([command | rest], principal),
+    do: command_allowed?(command, principal) and allowed?(rest, principal)
 
-    commands
-    |> Enum.map(&command_type/1)
-    |> Enum.filter(&(is_nil(&1) or Reserved.command?(&1)))
+  defp allowed?([], _principal), do: true
+  defp allowed?(command, principal), do: command_allowed?(command, principal)
+
+  # Only `:ok` relays. `{:intercept, :supervisor_api}` is the evaluator
+  # setting `supervisor/api` aside to be answered here as the app; until
+  # something here answers it, it is refused like any other result.
+  defp command_allowed?(command, principal) do
+    case command_type(command) do
+      nil -> false
+      type -> Authz.authorize(principal, {:ws, :core_api, type, command}, @authz_ctx) == :ok
+    end
   end
 
   # Jason keeps the first of a repeated key, Core's orjson the last, so a
@@ -449,10 +483,21 @@ defmodule Vagus.API.CoreProxy.WSBridge do
     end
   end
 
+  # The only place the principal is set.
   defp authenticate(token, state) do
     case CoreProxy.check_access(token) do
-      :ok -> start_relaying(state)
+      {:ok, principal} -> start_relaying(%{state | principal: principal})
       {:error, :unauthorized} -> auth_invalid_and_close(state)
+    end
+  end
+
+  # An app that passed the handshake can repeat a refused frame at will, so
+  # it is counted like `Vagus.API.Auth`'s refusals, under a constant label.
+  defp count_refusal do
+    if SourceGuard.enabled?() do
+      SourceGuard.record_filtered(:authz, @refusal_label)
+    else
+      Logger.warning("Vagus.API.CoreProxy.WSBridge: refused a frame (#{@refusal_label})")
     end
   end
 

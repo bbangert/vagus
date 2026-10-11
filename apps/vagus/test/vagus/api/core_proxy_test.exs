@@ -184,6 +184,7 @@ defmodule Vagus.API.CoreProxyTest do
   use ExUnit.Case, async: false
   use Plug.Test
 
+  import ExUnit.CaptureLog
   import Vagus.AppFixtures
 
   alias Vagus.API.{CoreProxy, Dispatcher, Token}
@@ -282,11 +283,97 @@ defmodule Vagus.API.CoreProxyTest do
       assert HitCounter.count() == 0
     end
 
-    test "the supervisor token -> 401 (not special-cased — it simply doesn't resolve in the registry)" do
+    test "the supervisor token -> 401" do
       conn = call(:get, "/core/api/states", [bearer(Token.get())])
 
       assert conn.status == 401
+      assert conn.resp_body == "Unauthorized"
       assert HitCounter.count() == 0
+    end
+
+    test "the supervisor token is refused under every header that carries a token here" do
+      for header <- [bearer(Token.get()), {"x-ha-access", Token.get()}],
+          {method, path} <- [
+            {:get, "/core/api/states"},
+            {:post, "/core/api/services/light/turn_on"},
+            {:delete, "/core/api/states/x"},
+            {:get, "/homeassistant/api/states"},
+            {:get, "/core/api/"},
+            {:get, "/core/api/stream"}
+          ] do
+        conn = call(method, path, [header])
+
+        assert conn.status == 401
+        assert conn.resp_body == "Unauthorized"
+      end
+
+      assert HitCounter.count() == 0
+    end
+
+    # The inversion: on every other leg this app reaches nothing.
+    test "hassio_api: false with homeassistant_api: true -> 200, fake Core hit" do
+      token =
+        addon_token("cp_auth_inverted", %{
+          homeassistant_api: true,
+          hassio_api: false,
+          hassio_role: "default"
+        })
+
+      conn = call(:get, "/core/api/states", [bearer(token)])
+
+      assert conn.status == 200
+      assert HitCounter.count() == 1
+    end
+
+    test "an admin role with hassio_api, without homeassistant_api -> 401" do
+      token =
+        addon_token("cp_auth_admin_no_flag", %{
+          homeassistant_api: false,
+          hassio_api: true,
+          hassio_role: "admin"
+        })
+
+      conn = call(:get, "/core/api/states", [bearer(token)])
+
+      assert conn.status == 401
+      assert conn.resp_body == "Unauthorized"
+      assert HitCounter.count() == 0
+    end
+
+    # The 401 alone does not say who refused. The count does: only
+    # `Vagus.API.Authz` knows the supervisor from a stranger on this leg.
+    test "a known principal's refusal is the evaluator's, counted under a static label" do
+      no_flag = addon_token("cp_auth_counted", %{hassio_api: true, hassio_role: "admin"})
+
+      for token <- [Token.get(), no_flag] do
+        log = capture_log(fn -> call(:get, "/core/api/zz-marker", [bearer(token)]) end)
+
+        assert log =~ "refused a request (authz/core_api)"
+        refute log =~ "zz-marker"
+        refute log =~ token
+      end
+    end
+
+    test "a caller nobody knows is refused uncounted" do
+      log =
+        capture_log(fn ->
+          assert call(:get, "/core/api/states").status == 401
+          assert call(:get, "/core/api/states", [bearer("not-a-real-token")]).status == 401
+        end)
+
+      refute log =~ "authz"
+    end
+
+    test "check_access/1 answers with the principal it admitted" do
+      token = addon_token("cp_auth_principal", %{homeassistant_api: true})
+      no_flag = addon_token("cp_auth_principal_no_flag")
+
+      assert {:ok, {:addon, %{slug: "cp_auth_principal", homeassistant_api: true}}} =
+               CoreProxy.check_access(token)
+
+      for refused <- [no_flag, Token.get(), "not-a-real-token", ""] do
+        assert CoreProxy.check_access(refused) == {:error, :unauthorized}
+      end
     end
 
     test "a registered add-on token with homeassistant_api: false -> 401" do

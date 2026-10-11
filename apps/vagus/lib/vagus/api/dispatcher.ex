@@ -52,6 +52,10 @@ defmodule Vagus.API.Dispatcher do
   #34 shipped and the device already proved). Duplicating that refusal here
   would fork the same logic into two places that could drift.
 
+  `Vagus.API.Authz` denies the same paths on the proxy leg; the check stays
+  here as well because it runs before any token is read and does not depend
+  on the proxy asking.
+
   `["core", "websocket"]` and `["homeassistant", "websocket"]` — the bare,
   EXACT two-segment paths only, matching upstream's own route table (fact 9);
   `/core/websocket/anything` is not a route upstream registers, so it falls

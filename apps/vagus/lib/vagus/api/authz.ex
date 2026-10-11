@@ -1,8 +1,7 @@
 defmodule Vagus.API.Authz do
   @moduledoc """
-  The evaluator for the Supervisor-API leg: a principal and an action in, a
-  decision out. `Vagus.API.Tiers` holds the table and the lattice. The Core
-  proxy does not ask here yet.
+  The evaluator for every app-facing leg: a principal and an action in, a
+  decision out. `Vagus.API.Tiers` holds the rules.
 
   Nothing is looked up: no registry, no process call, no I/O. A decision that
   depended on runtime state could not be read off the table, and the table
@@ -10,9 +9,11 @@ defmodule Vagus.API.Authz do
 
   ## Legs
 
-  Only `{:rest, :supervisor_api, method, segments}` is implemented. The other
-  legs have no clause and raise, deliberately: `:ok` would open a leg nobody
-  graded, and a refusal would read as a decision the table never made.
+  `{:rest, :supervisor_api, method, segments}` is the Supervisor API,
+  `{:rest, :core_api, method, segments}` the proxy into Core's own REST API,
+  and `{:ws, :core_api, type, msg}` one command on that proxy's WebSocket.
+  Anything else has no clause and raises, deliberately: `:ok` would open a
+  leg nobody graded, and a refusal would read as a decision no rule made.
 
   ## Both spellings of the path
 
@@ -21,7 +22,10 @@ defmodule Vagus.API.Authz do
   supervisor-only `/core/restart` to the router. Each spelling chooses a row
   and the caller is held to both, so encoding a path can only cost access.
 
-  ## Order
+  The Core proxy forwards the path as written and Core decodes it, so there
+  the two spellings are what was sent and what Core will read.
+
+  ## Order on the Supervisor API
 
   The blacklist first, before the principal is looked at, so no tier
   satisfies it. Then the lattice, for every spelling, so a caller a tier
@@ -35,6 +39,19 @@ defmodule Vagus.API.Authz do
 
   Authorisation ignores the method, as upstream's patterns do. Only a
   refusal's wording is per-method.
+
+  ## The Core proxy is inverted
+
+  The proxy speaks to Core as the Supervisor on the caller's behalf, so its
+  one question is whether the caller is an app that was granted that:
+  `homeassistant_api`. `hassio_api` and the role say nothing about it, and
+  the supervisor, which satisfies every tier, is refused: Core does not call
+  its own proxy.
+
+  What `Vagus.Core.Reserved` reserves is refused first, to every principal.
+  A WebSocket command is otherwise relayed: a denylist, as upstream's is.
+  `supervisor/api` is neither relayed nor allowed. It comes back as
+  `{:intercept, :supervisor_api}` for the bridge to answer itself.
   """
 
   alias Vagus.API.{Refusal, Tiers}
@@ -69,6 +86,34 @@ defmodule Vagus.API.Authz do
       {error, _why} -> {:error, error}
     end
   end
+
+  def authorize(
+        principal,
+        {:rest, :core_api, method, segments},
+        %{leg: :core_api, decoded_segments: decoded}
+      )
+      when is_binary(method) and is_list(segments) and is_list(decoded) do
+    if segments |> spellings(decoded) |> Enum.any?(&(Tiers.core_api(&1) == :deny)),
+      do: {:error, :blacklisted},
+      else: core_caller(principal)
+  end
+
+  def authorize(principal, {:ws, :core_api, type, _msg}, %{leg: :core_api})
+      when is_binary(type) do
+    case Tiers.core_ws(type) do
+      :deny -> {:error, :blacklisted}
+      :allow -> core_caller(principal)
+      {:intercept, _target} = intercept -> with :ok <- core_caller(principal), do: intercept
+    end
+  end
+
+  # A clause of its own for the supervisor, so that nothing here can come to
+  # read "the top tier passes".
+  defp core_caller(:supervisor), do: {:error, :forbidden}
+  defp core_caller(:anonymous), do: {:error, :unauthenticated}
+
+  defp core_caller({:addon, identity} = app) when is_map(identity),
+    do: if(Policy.may_call_core?(app), do: :ok, else: {:error, :forbidden})
 
   @doc """
   What a caller `authorize/3` refused as `:forbidden` is told.

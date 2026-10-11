@@ -92,6 +92,13 @@ defmodule Vagus.App.Policy do
   @spec may_authenticate?(caller()) :: boolean()
   def may_authenticate?(caller), do: match?({:addon, %{auth_api: true}}, caller)
 
+  @doc """
+  Whether the caller may use the proxy into Core's own API. An app's grant:
+  Core holds no proxy to itself, and `hassio_api` and the role do not count.
+  """
+  @spec may_call_core?(caller()) :: boolean()
+  def may_call_core?(caller), do: match?({:addon, %{homeassistant_api: true}}, caller)
+
   @doc "The `GET /services` list, from the `{service, provider_slug}` pairs provided now."
   @spec services_view([{String.t(), String.t()}]) :: [map()]
   def services_view(provided) do

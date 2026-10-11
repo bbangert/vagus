@@ -17,9 +17,10 @@ defmodule Vagus.API.Tiers do
   `caller_tier/1` turns the caller `Vagus.API.Auth` resolved into a tier.
   `required/1` turns a request path into the tier that path demands.
   `allows?/2` compares the two. `Vagus.API.Authz` puts them together for the
-  Supervisor-API leg. The Core proxy does not go through it yet:
-  `Vagus.API.Dispatcher` calls `blacklisted?/1` directly and
-  `Vagus.API.CoreProxy` grades its callers with a check of its own.
+  Supervisor-API leg.
+
+  The Core proxy's two legs use none of that. Their rules are `core_api/1`
+  and `core_ws/1`: no tier, no lattice, one grant.
 
   ## Tiers
 
@@ -417,6 +418,40 @@ defmodule Vagus.API.Tiers do
   end
 
   def blacklisted?(path_info) when is_list(path_info), do: false
+
+  @type core_disposition :: :deny | :allow | {:intercept, :supervisor_api}
+
+  @doc """
+  What the Core proxy's REST leg does with a Supervisor-side path. Read beside
+  upstream `api/proxy.py`:
+
+      CORE_API_DENY: Final = re.compile(r"^hassio(?:/|_)")
+
+  An `:allow` is for the callers `Vagus.API.Authz` admits to this leg, not for
+  everyone. These are functions rather than `@table` rows because a row is
+  graded on the tier lattice, which Core's own token tops and this leg
+  refuses, and because what is reserved is `Vagus.Core.Reserved`'s to say:
+  a pattern here would be a second copy of it.
+  """
+  @spec core_api([String.t()]) :: core_disposition()
+  def core_api(path_info) when is_list(path_info),
+    do: if(blacklisted?(path_info), do: :deny, else: :allow)
+
+  @doc """
+  What the Core proxy's WebSocket leg does with a command type. First match
+  wins. Read beside upstream `api/proxy.py`:
+
+      DENIED_WS_TYPE_PREFIXES = ("supervisor/", "hassio/")
+
+  A denylist, as upstream's is: Core has no list of the commands an app may
+  send. `supervisor/api` is reserved like its neighbours and is told apart
+  only so that it can be answered here, as the app, instead of refused.
+  """
+  @spec core_ws(String.t()) :: core_disposition()
+  def core_ws("supervisor/api"), do: {:intercept, :supervisor_api}
+
+  def core_ws(type) when is_binary(type),
+    do: if(Reserved.command?(type), do: :deny, else: :allow)
 
   @doc """
   The tier a request path demands.
