@@ -224,7 +224,7 @@ defmodule Vagus.Core.Transport do
   def build(transport, origin, method, path, headers \\ [], body \\ nil)
 
   def build(transport, :proxied, method, path, headers, body) do
-    if Reserved.path?(path), do: raise(Reserved.Error, path: path)
+    if Reserved.path?(path), do: raise(Reserved.Error)
 
     build(transport, :internal, method, path, headers, body)
   end

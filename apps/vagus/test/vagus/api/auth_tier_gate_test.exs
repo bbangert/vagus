@@ -19,7 +19,7 @@ defmodule Vagus.API.AuthTierGateTest do
   import Vagus.AppFixtures
 
   alias Vagus.Addon.Config
-  alias Vagus.API.{Router, Token}
+  alias Vagus.API.{Auth, Router, Token}
 
   @opts Router.init([])
 
@@ -689,6 +689,46 @@ defmodule Vagus.API.AuthTierGateTest do
   # add-on, but a `hassio_role: manager` one legitimately reaches it — so the
   # payload itself must not carry secrets. `_list_apps_data/0` upstream emits
   # none of these three to any caller.
+  # Both the Supervisor API and the Core proxy name their caller with this.
+  describe "principal/1" do
+    test "the supervisor's token, an app's token, and nothing else" do
+      app = addon_token("tier_gate_principal", %{hassio_role: "manager"})
+      supervisor = Token.get()
+
+      assert Auth.principal(supervisor) == :supervisor
+
+      assert {:addon, %{slug: "tier_gate_principal", hassio_role: "manager"}} =
+               Auth.principal(app)
+
+      strangers =
+        [nil, "", "garbage", "Bearer " <> supervisor, "Bearer " <> app] ++
+          for token <- [supervisor, app],
+              stranger <- [
+                binary_part(token, 0, byte_size(token) - 1),
+                binary_part(token, 1, byte_size(token) - 1),
+                token <> "x",
+                token <> " ",
+                String.upcase(token) <> String.downcase(token)
+              ],
+              do: stranger
+
+      for stranger <- strangers do
+        assert Auth.principal(stranger) == :anonymous
+      end
+    end
+
+    test "the router answers each of them as before" do
+      app = addon_token("tier_gate_principal_route", %{hassio_api: true, hassio_role: "manager"})
+
+      assert call(:get, "/store", Token.get()).status == 200
+      assert call(:get, "/store", app).status == 200
+      assert call(:get, "/store", "").status == 401
+      assert call(:get, "/store", app <> "x").status == 401
+      assert call(:get, "/store", binary_part(app, 0, byte_size(app) - 1)).status == 401
+      assert conn(:get, "/store") |> Router.call(@opts) |> Map.fetch!(:status) == 401
+    end
+  end
+
   describe "GET /addons carries no secrets (A7)" do
     setup do
       {:ok, config} =

@@ -436,11 +436,12 @@ defmodule Vagus.API.CoreProxyWSTest do
   # sit above that, not equal to it.
   @moduletag timeout: 120_000
 
+  import ExUnit.CaptureLog
   import Vagus.AppFixtures
 
   alias Vagus.API.CoreProxy.WSBridge
   alias Vagus.API.CoreProxyWSTest.{Client, CoreAuthScript, DialCounter, FakeCore}
-  alias Vagus.API.{Dispatcher, Token}
+  alias Vagus.API.{Dispatcher, SourceGuard, Token}
 
   @opts Dispatcher.init([])
   @expected_core_token "core-access-token"
@@ -982,6 +983,209 @@ defmodule Vagus.API.CoreProxyWSTest do
     assert_relayed(client, "[]")
   end
 
+  ## 1d. The principal is set once, at the handshake, and every command is
+  ## put to `Vagus.API.Authz` as that principal. Driven through the callbacks
+  ## where the state itself is the subject.
+
+  test "the handshake keeps the caller's principal, and no later frame replaces it" do
+    token = addon_token("cp_ws_principal", %{homeassistant_api: true})
+    other = addon_token("cp_ws_principal_other", %{homeassistant_api: true})
+
+    assert {:ok, state} = WSBridge.init([])
+    assert state.principal == nil
+
+    assert {:push, {:text, _auth_ok}, state} =
+             WSBridge.handle_in(
+               {Jason.encode!(%{"access_token" => token}), [opcode: :text]},
+               state
+             )
+
+    assert {:addon, %{slug: "cp_ws_principal", homeassistant_api: true}} = state.principal
+    assert_receive {:core_init, _core_pid}, @recv_timeout
+
+    # A second auth message is one more command to relay.
+    for credential <- [other, Token.get()] do
+      frame = Jason.encode!(%{"id" => 1, "type" => "auth", "access_token" => credential})
+      assert WSBridge.handle_in({frame, [opcode: :text]}, state) == {:ok, state}
+      assert_receive {:core_frame, :text, ^frame}, @recv_timeout
+    end
+
+    WSBridge.terminate(:normal, state)
+  end
+
+  test "a refused handshake leaves no principal behind" do
+    token = addon_token("cp_ws_principal_refused")
+    assert {:ok, state} = WSBridge.init([])
+
+    for refused <- [token, Token.get(), "not-a-real-token"] do
+      frame = {Jason.encode!(%{"access_token" => refused}), [opcode: :text]}
+
+      assert {:stop, :normal, {1000, ""}, [_auth_invalid], after_refusal} =
+               WSBridge.handle_in(frame, state)
+
+      assert after_refusal.principal == nil
+      assert after_refusal.phase == :awaiting_auth
+    end
+  end
+
+  # The one test here that tells this bridge from one that screens frames
+  # without asking `Vagus.API.Authz`: an ordinary command, refused because of
+  # who the state says is asking. No `Upstream` behind these states, so a
+  # frame the bridge tried to relay would not come back as a result.
+  test "every command is put to the evaluator as the principal in state" do
+    frame = {~s({"id":4,"type":"get_states"}), [opcode: :text]}
+
+    for principal <- [
+          :supervisor,
+          :anonymous,
+          {:addon, %{slug: "cp_ws_no_flag", hassio_api: true, hassio_role: "admin"}}
+        ] do
+      state = %{
+        phase: :relaying,
+        upstream: nil,
+        principal: principal,
+        ha_version: nil,
+        closing?: false
+      }
+
+      capture_log(fn ->
+        assert {:push, {:text, raw}, ^state} = WSBridge.handle_in(frame, state)
+        assert %{"id" => 4, "error" => %{"code" => "unauthorized"}} = Jason.decode!(raw)
+      end)
+    end
+  end
+
+  test "a command the evaluator intercepts is refused, alone and in a batch" do
+    app = {:addon, %{slug: "cp_ws_intercept", homeassistant_api: true}}
+
+    assert Vagus.API.Authz.authorize(app, {:ws, :core_api, "supervisor/api", %{}}, %{
+             leg: :core_api,
+             decoded_segments: nil
+           }) == {:intercept, :supervisor_api}
+
+    assert WSBridge.screen(~s({"id":7,"type":"supervisor/api"}), app) == {:refuse, 7}
+
+    assert WSBridge.screen(
+             ~s([{"id":1,"type":"get_states"},{"id":7,"type":"supervisor/api"}]),
+             app
+           ) ==
+             {:refuse, nil}
+
+    assert WSBridge.screen(~s([{"id":1,"type":"get_states"}]), app) == :relay
+  end
+
+  test "a frame is never relayed for a principal that is not one" do
+    for principal <- [nil, {:addon, nil}, :core] do
+      for frame <- [~s({"id":1,"type":"get_states"}), ~s([{"id":1,"type":"get_states"}])] do
+        relayed? =
+          try do
+            WSBridge.screen(frame, principal) == :relay
+          rescue
+            FunctionClauseError -> false
+          end
+
+        refute relayed?
+      end
+    end
+  end
+
+  test "on device, a refused frame is cast to the guard and logs nothing" do
+    prev = Application.get_env(:vagus, :api_source_guard)
+    Application.put_env(:vagus, :api_source_guard, true)
+
+    on_exit(fn ->
+      if is_nil(prev),
+        do: Application.delete_env(:vagus, :api_source_guard),
+        else: Application.put_env(:vagus, :api_source_guard, prev)
+    end)
+
+    # The test stands in for the guard: the real one reports and resets on a
+    # timer.
+    Process.register(self(), SourceGuard)
+
+    state = %{
+      phase: :relaying,
+      upstream: nil,
+      principal: {:addon, %{slug: "cp_ws_counted_device", homeassistant_api: true}},
+      ha_version: nil,
+      closing?: false
+    }
+
+    log =
+      capture_log(fn ->
+        for frame <- [~s({"id":7,"type":"supervisor/api","endpoint":"/zz-marker"}), ~s([5])] do
+          assert {:push, {:text, _unauthorized}, ^state} =
+                   WSBridge.handle_in({frame, [opcode: :text]}, state)
+        end
+      end)
+
+    refute log =~ "authz"
+
+    for _frame <- 1..2 do
+      assert_received {:"$gen_cast", {:filtered, :authz, "authz/core_ws"}}
+    end
+
+    refute_received {:"$gen_cast", _other}
+  end
+
+  # Off device there is no counter, and a refusal is a log line instead.
+  test "off device, a refused frame is logged under a static label, and none of it", %{
+    proxy_host: host,
+    proxy_port: port
+  } do
+    refute SourceGuard.enabled?()
+    client = relaying_client(host, port, "cp_ws_counted")
+
+    log =
+      capture_log(fn ->
+        assert_each_refused(client, [
+          {~s({"id":7,"type":"supervisor/api","endpoint":"/zz-marker"}), 7},
+          {~s([{"id":1,"type":"zz-marker"},{"id":2,"type":"hassio/update/core"}]), nil},
+          {~s({"id":3,"zz-marker":true}), 3}
+        ])
+      end)
+
+    assert log =~ "authz/core_ws"
+    refute log =~ "zz-marker"
+  end
+
+  test "a relayed frame is not counted", %{proxy_host: host, proxy_port: port} do
+    refute SourceGuard.enabled?()
+    client = relaying_client(host, port, "cp_ws_uncounted")
+    log = capture_log(fn -> assert_relayed(client, @ordinary) end)
+
+    refute log =~ "authz"
+  end
+
+  test "a handshake refused to a known principal is counted; a stranger's is not", %{
+    proxy_host: host,
+    proxy_port: port
+  } do
+    refute SourceGuard.enabled?()
+    no_flag = addon_token("cp_ws_handshake_counted", %{hassio_api: true, hassio_role: "admin"})
+
+    refused = fn token ->
+      capture_log(fn ->
+        {:ok, client, _headers} = Client.connect(host, port, "/core/websocket")
+        {{:text, _auth_required}, client} = Client.next_frame(client, @recv_timeout)
+        client = Client.send_frame(client, {:text, Jason.encode!(%{"access_token" => token})})
+        {{:text, raw}, client} = Client.next_frame(client, @recv_timeout)
+        assert Jason.decode!(raw)["type"] == "auth_invalid"
+        {frame, _client} = Client.next_frame(client, @recv_timeout)
+        assert match?({:close, 1000, _}, frame)
+      end)
+    end
+
+    for token <- [no_flag, Token.get()] do
+      log = refused.(token)
+      assert log =~ "authz/core_api"
+      refute log =~ token
+    end
+
+    refute refused.("not-a-real-token") =~ "authz"
+    assert DialCounter.count() == 0
+  end
+
   ## 2. Rejections at the caller handshake — fake Core never dialed
 
   test "an unknown token -> auth_invalid then close, fake Core never dialed", %{
@@ -1018,7 +1222,7 @@ defmodule Vagus.API.CoreProxyWSTest do
     assert DialCounter.count() == 0
   end
 
-  test "the supervisor token -> auth_invalid then close (not special-cased — it simply doesn't resolve)",
+  test "the supervisor token -> auth_invalid then close, fake Core never dialed",
        %{proxy_host: host, proxy_port: port} do
     {:ok, client, _headers} = Client.connect(host, port, "/core/websocket")
     {{:text, _auth_required}, client} = Client.next_frame(client, @recv_timeout)

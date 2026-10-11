@@ -52,6 +52,10 @@ defmodule Vagus.API.Dispatcher do
   #34 shipped and the device already proved). Duplicating that refusal here
   would fork the same logic into two places that could drift.
 
+  `Vagus.API.Authz` denies the same paths on the proxy leg; the check stays
+  here as well because it runs before any token is read and does not depend
+  on the proxy asking.
+
   `["core", "websocket"]` and `["homeassistant", "websocket"]` — the bare,
   EXACT two-segment paths only, matching upstream's own route table (fact 9);
   `/core/websocket/anything` is not a route upstream registers, so it falls
@@ -60,11 +64,12 @@ defmodule Vagus.API.Dispatcher do
   is a no-op for these paths (`Vagus.API.Tiers.blacklisted?/1` only matches
   Core's `/api/hassio…` namespace, and a WS caller addresses Core by typed
   command rather than by path at all — that leg's half of the same
-  reservation lives in `Vagus.API.CoreProxy.WSBridge`), but routing every
+  reservation is `Vagus.API.Authz`'s WebSocket rule, which
+  `Vagus.API.CoreProxy.WSBridge` asks per command), but routing every
   `core`/`homeassistant` path through the
   one `dispatch_core_proxy/2` entry point — rather than adding a second,
-  blacklist-free path just for WS — is the point: one place decides
-  "blacklisted or not" for this whole route family, so a future addition
+  blacklist-free path just for WS — is the point: nothing in this route
+  family reaches the proxy without passing this check, so a future addition
   here can't accidentally skip it. `CoreProxy.call/2` itself decides GET-only
   and does the actual WS upgrade (`.../api/websocket` under
   `["core"/"homeassistant", "api" | rest]` already reaches `CoreProxy`

@@ -190,9 +190,30 @@ defmodule Vagus.API.Auth do
   end
 
   defp authenticate(conn) do
-    case token(conn) do
-      nil -> unauthorized(conn)
-      token -> resolve(conn, token)
+    case conn |> token() |> principal() do
+      :anonymous -> unauthorized(conn)
+      caller -> authorize(conn, caller)
+    end
+  end
+
+  @doc """
+  Who a token belongs to. `nil` is no token, and a token nobody holds is
+  nobody's: both are `:anonymous`.
+
+  The Core proxy names its caller with this too, so the two legs cannot come
+  to disagree about whose token is whose.
+  """
+  @spec principal(String.t() | nil) :: Authz.principal()
+  def principal(nil), do: :anonymous
+
+  def principal(token) when is_binary(token) do
+    if Plug.Crypto.secure_compare(token, Token.get()) do
+      :supervisor
+    else
+      case App.identity_for_token(token) do
+        {:ok, identity} -> {:addon, identity}
+        :error -> :anonymous
+      end
     end
   end
 
@@ -206,20 +227,6 @@ defmodule Vagus.API.Auth do
           [token | _] -> token
           [] -> nil
         end
-    end
-  end
-
-  defp resolve(conn, token) do
-    cond do
-      Plug.Crypto.secure_compare(token, Token.get()) ->
-        authorize(conn, :supervisor)
-
-      match?({:ok, _}, addon_identity(token)) ->
-        {:ok, identity} = addon_identity(token)
-        authorize(conn, {:addon, identity})
-
-      true ->
-        unauthorized(conn)
     end
   end
 
@@ -269,8 +276,6 @@ defmodule Vagus.API.Auth do
       Logger.warning("Vagus.API.Auth: refused a request (#{label})")
     end
   end
-
-  defp addon_identity(token), do: App.identity_for_token(token)
 
   defp unauthorized(conn), do: Envelope.send_error(conn, "unauthorized", 401)
 end

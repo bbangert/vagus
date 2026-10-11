@@ -249,13 +249,39 @@ defmodule Vagus.Core.TransportTest do
   # `Vagus.Core.Reserved`. The raise is the backstop, not the policy.
   describe "build/6 refuses Core's reserved namespace to a proxied caller" do
     test "the account-takeover path raises" do
-      assert_raise Vagus.Core.Reserved.Error, ~r{/api/hassio_auth/password_reset}, fn ->
+      assert_raise Vagus.Core.Reserved.Error, fn ->
         Transport.build(
           {:socket, "/run/x.sock"},
           :proxied,
           :post,
           "/api/hassio_auth/password_reset"
         )
+      end
+    end
+
+    # The path is the caller's, and a crash report is an error-level log line.
+    test "the raise says nothing the caller wrote" do
+      path = "/api/hassio_auth/\e[31mzz-marker?zz-query=1"
+
+      error =
+        assert_raise Vagus.Core.Reserved.Error, fn ->
+          Transport.build({:socket, "/run/x.sock"}, :proxied, :post, path)
+        end
+
+      refute Exception.message(error) =~ "zz-"
+      refute Exception.message(error) =~ "\e"
+      refute inspect(error) =~ "zz-"
+    end
+
+    test "a `.` segment ahead of the reserved view raises too, and only there" do
+      for path <- ["/api/./hassio_auth", "/api/%2e/%2E/hassio/app", "/api/./%68assio_auth"] do
+        assert_raise Vagus.Core.Reserved.Error, fn ->
+          Transport.build({:socket, "/run/x.sock"}, :proxied, :get, path)
+        end
+      end
+
+      for path <- ["/api/./config", "/api/states/./hassio", "/api/.hassio"] do
+        assert Transport.build({:socket, "/run/x.sock"}, :proxied, :get, path).path == path
       end
     end
 

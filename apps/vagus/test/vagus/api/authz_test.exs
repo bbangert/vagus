@@ -154,6 +154,22 @@ defmodule Vagus.API.AuthzTest do
       end
     end
 
+    # The dispatcher sends the proxy family's reserved paths here to be
+    # refused, so this leg has to know them in every spelling it does.
+    test "holds behind `.` segments, as it does on the proxy" do
+      for who <- [:supervisor, :anonymous, :admin],
+          path <- [
+            "/core/api/./hassio_auth",
+            "/core/api/%2e/hassio/app",
+            "/%63ore/api/./hassio_auth",
+            "/homeassistant/%61pi/%2E/./hassio/app"
+          ] do
+        assert authorize(who, path) == {:error, :blacklisted}
+      end
+
+      assert authorize(:supervisor, "/core/./api/hassio_auth") == :ok
+    end
+
     test "a near miss is graded normally" do
       assert authorize(:supervisor, "/core/api/other") == :ok
       assert authorize(:homeassistant, "/core/api/other") == :ok
@@ -218,14 +234,13 @@ defmodule Vagus.API.AuthzTest do
   describe "legs with no rows yet" do
     test "raise rather than answer" do
       for principal <- [:supervisor, :anonymous, principal(:admin)],
-          action <- [
-            {:rest, :core_api, "GET", ["states"]},
-            {:ws, :core_api, "call_service", %{}},
-            {:rest, :ingress, "GET", ["x"]}
+          {action, ctx} <- [
+            {{:rest, :ingress, "GET", ["x"]}, %{leg: :ingress, decoded_segments: ["x"]}},
+            {{:ws, :ingress, "call_service", %{}}, %{leg: :ingress, decoded_segments: nil}},
+            {{:ws, :supervisor_api, "call_service", %{}},
+             %{leg: :supervisor_api, decoded_segments: nil}}
           ] do
-        assert_raise FunctionClauseError, fn ->
-          Authz.authorize(principal, action, %{leg: :core_api, decoded_segments: nil})
-        end
+        assert_raise FunctionClauseError, fn -> Authz.authorize(principal, action, ctx) end
       end
     end
 
@@ -249,6 +264,214 @@ defmodule Vagus.API.AuthzTest do
             %{decoded_segments: ["info"]}
           ] do
         assert_raise FunctionClauseError, fn -> Authz.authorize(:supervisor, action, ctx) end
+      end
+    end
+  end
+
+  # The proxy into Core's own API. Nothing here is graded on the lattice: the
+  # one grant is `homeassistant_api`, and Core's own token is refused.
+  describe "the Core proxy's REST leg" do
+    @core_paths ["/core/api/states", "/homeassistant/api/states", "/core/api/", "/core/websocket"]
+
+    defp core_app(grants), do: {:addon, Map.merge(%{slug: "probe"}, grants)}
+
+    defp core_ctx(path),
+      do: %{leg: :core_api, decoded_segments: path |> URI.decode() |> segments()}
+
+    defp core(principal, path, method \\ "GET"),
+      do: Authz.authorize(principal, {:rest, :core_api, method, segments(path)}, core_ctx(path))
+
+    test "an app holding homeassistant_api is admitted, whatever else it holds" do
+      for path <- @core_paths,
+          hassio_api <- [true, false],
+          role <- ~w(default homeassistant backup manager admin) do
+        app = core_app(%{homeassistant_api: true, hassio_api: hassio_api, hassio_role: role})
+        assert core(app, path) == :ok
+      end
+    end
+
+    # The inversion, pinned: on every other leg this app reaches nothing and
+    # this token reaches everything.
+    test "hassio_api: false with homeassistant_api: true is admitted" do
+      app = core_app(%{homeassistant_api: true, hassio_api: false, hassio_role: "default"})
+
+      assert core(app, "/core/api/states") == :ok
+
+      assert Authz.authorize(app, {:rest, :supervisor_api, "GET", ["store"]}, ctx("/store")) ==
+               {:error, :forbidden}
+    end
+
+    test "the supervisor is refused, though it satisfies every tier" do
+      for path <- @core_paths, method <- ~w(GET POST DELETE) do
+        assert core(:supervisor, path, method) == {:error, :forbidden}
+      end
+
+      assert authorize(:supervisor, "/store") == :ok
+    end
+
+    test "no role or hassio_api stands in for homeassistant_api" do
+      for hassio_api <- [true, false],
+          role <- ~w(default homeassistant backup manager admin),
+          flag <- [%{homeassistant_api: false}, %{}, %{homeassistant_api: nil}] do
+        app = core_app(Map.merge(%{hassio_api: hassio_api, hassio_role: role}, flag))
+        assert core(app, "/core/api/states") == {:error, :forbidden}
+      end
+    end
+
+    test "the anonymous principal is unauthenticated" do
+      for path <- @core_paths do
+        assert core(:anonymous, path) == {:error, :unauthenticated}
+      end
+    end
+
+    test "a reserved view is blacklisted before the principal is looked at" do
+      allowed = core_app(%{homeassistant_api: true})
+
+      for principal <- [allowed, :supervisor, :anonymous, core_app(%{})],
+          path <- [
+            "/core/api/hassio/app",
+            "/core/api/hassio_auth",
+            "/homeassistant/api/hassio_auth/password_reset",
+            "/core/api/hassiofoo"
+          ] do
+        assert core(principal, path) == {:error, :blacklisted}
+      end
+    end
+
+    test "a reserved view is blacklisted in either spelling" do
+      allowed = core_app(%{homeassistant_api: true})
+
+      for path <- [
+            "/core/api/%68assio_auth",
+            "/core/api/hassio%2fapp",
+            "/core/api/%68%61%73%73%69%6f/app",
+            "/homeassistant/api/hassi%6F_auth/password_reset"
+          ] do
+        assert core(allowed, path) == {:error, :blacklisted}
+      end
+
+      # Reserved as written, whatever the decoded spelling says.
+      assert Authz.authorize(
+               allowed,
+               {:rest, :core_api, "GET", ["core", "api", "hassio_auth"]},
+               %{leg: :core_api, decoded_segments: ["core", "api", "states"]}
+             ) == {:error, :blacklisted}
+    end
+
+    test "a reserved view behind `.` segments is still the reserved view" do
+      allowed = core_app(%{homeassistant_api: true})
+
+      for principal <- [allowed, :supervisor, :anonymous],
+          path <- [
+            "/core/api/./hassio_auth/password_reset",
+            "/core/api/././hassio/app",
+            "/core/api/%2e/hassio_auth",
+            "/core/api/%2E/%2e/hassio/app",
+            "/homeassistant/api/./%68assio_auth",
+            "/core/api/.%2fhassio/app"
+          ] do
+        assert core(principal, path) == {:error, :blacklisted}
+      end
+    end
+
+    test "a `.` segment reserves nothing by itself" do
+      allowed = core_app(%{homeassistant_api: true})
+
+      for path <- [
+            "/core/api/./config",
+            "/core/api/states/./hassio",
+            "/core/api/.hassio/app",
+            "/core/api/../hassio/app",
+            "/core/api/."
+          ] do
+        assert core(allowed, path) == :ok
+      end
+    end
+
+    test "a principal that is none of the three raises" do
+      for principal <- [nil, :core, {:addon, nil}, "supervisor"] do
+        assert_raise FunctionClauseError, fn -> core(principal, "/core/api/states") end
+      end
+    end
+
+    test "decodes once: a doubly encoded spelling is not the reserved view" do
+      allowed = core_app(%{homeassistant_api: true})
+
+      assert core(allowed, "/core/api/%2568assio_auth") == :ok
+      assert core(allowed, "/core/api/states/hassio") == :ok
+    end
+
+    test "a ctx for another leg, or with no decoded segments, has no clause" do
+      action = {:rest, :core_api, "GET", ["core", "api", "states"]}
+
+      for ctx <- [
+            %{leg: :supervisor_api, decoded_segments: ["core", "api", "states"]},
+            %{leg: :core_api, decoded_segments: nil},
+            %{leg: :core_api}
+          ] do
+        assert_raise FunctionClauseError, fn ->
+          Authz.authorize(core_app(%{homeassistant_api: true}), action, ctx)
+        end
+      end
+    end
+  end
+
+  describe "the Core proxy's WebSocket leg" do
+    @ws_ctx %{leg: :core_api, decoded_segments: nil}
+
+    defp ws(principal, type), do: Authz.authorize(principal, {:ws, :core_api, type, %{}}, @ws_ctx)
+
+    test "an ordinary command is allowed to an app holding homeassistant_api" do
+      allowed = core_app(%{homeassistant_api: true, hassio_api: false})
+
+      for type <- ["get_states", "call_service", "config/auth/list", "auth", ""] do
+        assert ws(allowed, type) == :ok
+      end
+    end
+
+    test "a reserved command is blacklisted for every principal" do
+      for principal <- [core_app(%{homeassistant_api: true}), :supervisor, :anonymous],
+          type <- ["supervisor/event", "supervisor/subscribe", "hassio/update/core", "hassio"] do
+        assert ws(principal, type) == {:error, :blacklisted}
+      end
+    end
+
+    test "supervisor/api is intercepted, never allowed" do
+      assert ws(core_app(%{homeassistant_api: true}), "supervisor/api") ==
+               {:intercept, :supervisor_api}
+    end
+
+    test "nothing is intercepted for a principal the leg refuses" do
+      assert ws(:supervisor, "supervisor/api") == {:error, :forbidden}
+      assert ws(:anonymous, "supervisor/api") == {:error, :unauthenticated}
+      assert ws(core_app(%{hassio_role: "admin"}), "supervisor/api") == {:error, :forbidden}
+    end
+
+    test "a principal the REST leg refuses is refused every command" do
+      assert ws(:supervisor, "get_states") == {:error, :forbidden}
+      assert ws(:anonymous, "get_states") == {:error, :unauthenticated}
+
+      assert ws(core_app(%{hassio_api: true, hassio_role: "admin"}), "get_states") ==
+               {:error, :forbidden}
+    end
+
+    test "a principal that is none of the three raises for a command it would allow" do
+      for principal <- [nil, :core, {:addon, nil}, "supervisor"],
+          type <- ["get_states", "supervisor/api"] do
+        assert_raise FunctionClauseError, fn -> ws(principal, type) end
+      end
+    end
+
+    test "a type that is not a string, or a ctx for another leg, has no clause" do
+      allowed = core_app(%{homeassistant_api: true})
+
+      assert_raise FunctionClauseError, fn -> ws(allowed, nil) end
+
+      assert_raise FunctionClauseError, fn ->
+        Authz.authorize(allowed, {:ws, :core_api, "get_states", %{}}, %{
+          leg: :supervisor_api,
+          decoded_segments: nil
+        })
       end
     end
   end
