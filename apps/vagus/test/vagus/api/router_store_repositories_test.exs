@@ -416,10 +416,13 @@ defmodule Vagus.API.RouterStoreRepositoriesTest do
   end
 
   describe "a reload past its budget" do
-    # Would never return: the calls below are answered only if no fetch
-    # is started.
-    defmodule HungFetcher do
-      def fetch(_repo), do: Process.sleep(:infinity)
+    # The router runs a reload in the calling process, so a fetch that is
+    # started reports itself to the test.
+    defmodule RecordingFetcher do
+      def fetch(%{slug: slug}) do
+        send(self(), {:fetched, slug})
+        {:ok, []}
+      end
     end
 
     setup do
@@ -428,7 +431,7 @@ defmodule Vagus.API.RouterStoreRepositoriesTest do
       :sys.replace_state(Store, fn state ->
         %{
           state
-          | fetcher: HungFetcher,
+          | fetcher: RecordingFetcher,
             repositories: [%{slug: "stuck", url: "https://github.com/example/stuck"}],
             reload_budget_ms: 0
         }
@@ -441,6 +444,7 @@ defmodule Vagus.API.RouterStoreRepositoriesTest do
       conn = post_("/store/reload")
       assert conn.status == 200
       assert json_body(conn) == %{"result" => "ok", "data" => %{}}
+      refute_received {:fetched, _slug}
     end
 
     test "repair -> 400 naming the deadline" do
@@ -449,6 +453,8 @@ defmodule Vagus.API.RouterStoreRepositoriesTest do
 
       assert json_body(conn)["message"] ==
                "Repository stuck could not be fetched: :reload_deadline"
+
+      refute_received {:fetched, _slug}
     end
 
     test "the reload lock is released: the next call is not refused as busy" do

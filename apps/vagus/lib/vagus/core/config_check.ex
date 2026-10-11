@@ -29,6 +29,7 @@ defmodule Vagus.Core.ConfigCheck do
 
   @check_cmd "python3 -m homeassistant -c /config --script check_config"
   @invalid_marker ~r/homeassistant\.util\.yaml/
+  @deadline_ms 300_000
 
   @type result ::
           :valid
@@ -91,5 +92,5 @@ defmodule Vagus.Core.ConfigCheck do
   end
 
   # Tests shorten it.
-  defp deadline_ms, do: Application.get_env(:vagus, :core_check_deadline_ms, 300_000)
+  defp deadline_ms, do: Application.get_env(:vagus, :core_check_deadline_ms, @deadline_ms)
 end

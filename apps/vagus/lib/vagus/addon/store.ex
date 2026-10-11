@@ -71,9 +71,8 @@ defmodule Vagus.Addon.Store do
   # worst-case reload.
   @max_repositories 50
 
-  # What one reload may spend before it stops starting fetches. A fetch
-  # already running is not cut short, so a reload ends within this plus one
-  # fetch's own limit (`Vagus.Addon.Store.HTTPFetcher`).
+  # No fetch is started once a reload has spent this. It does not end a fetch
+  # already running, nor bound what the reload does after its fetches.
   @reload_budget_ms 900_000
 
   # A repository's own display metadata, at the archive root. Upstream accepts

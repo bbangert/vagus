@@ -352,12 +352,23 @@ defmodule Vagus.Runtime.Docker do
 
   The receive timeout restarts at every chunk, so it does not bound a
   streamed response (a pull's progress, an attached exec). `:deadline` does:
-  it is a `System.monotonic_time(:millisecond)` instant past which the
-  connection is closed and the result is `{:error, :deadline}`. Being an
-  instant, one value bounds every request of a call that makes several.
+  it is a `System.monotonic_time(:millisecond)` instant past which nothing
+  is sent, an open connection is closed, and the result is
+  `{:error, :deadline}`. Being an instant, one value bounds every request of
+  a call that makes several.
   """
   @spec request(atom(), String.t(), keyword()) :: {:ok, response()} | {:error, term()}
   def request(method, path, opts \\ []) do
+    # Checked before connecting: a request sent past the deadline would start
+    # work in the engine that nothing then waits for.
+    if left_ms(Keyword.get(opts, :deadline)) > 0 do
+      send_request(method, path, opts)
+    else
+      {:error, :deadline}
+    end
+  end
+
+  defp send_request(method, path, opts) do
     socket = Keyword.get(opts, :socket, socket_path())
     full_path = path <> encode_query(Keyword.get(opts, :query, []))
     {headers, body} = prepare_body(Keyword.get(opts, :body), Keyword.get(opts, :headers, []))
@@ -512,10 +523,15 @@ defmodule Vagus.Runtime.Docker do
   defp recv_all(conn, ref, deadline, acc \\ [], size \\ 0) do
     left = left_ms(deadline)
 
-    case left > 0 and Mint.HTTP.recv(conn, 0, min(left, @recv_timeout)) do
-      false ->
-        {:error, conn, :deadline}
+    if left > 0 do
+      recv_within(conn, ref, deadline, left, acc, size)
+    else
+      {:error, conn, :deadline}
+    end
+  end
 
+  defp recv_within(conn, ref, deadline, left, acc, size) do
+    case Mint.HTTP.recv(conn, 0, min(left, @recv_timeout)) do
       {:ok, conn, responses} ->
         size = size + data_size(responses)
         acc = [responses | acc]

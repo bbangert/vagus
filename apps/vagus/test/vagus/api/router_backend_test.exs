@@ -287,8 +287,12 @@ defmodule Vagus.API.RouterBackendTest do
       on_exit(fn -> Application.delete_env(:vagus, :handler_deadlines) end)
     end
 
+    # The caller being released is the point, so the fake never returns and a
+    # missing bound shows as this timeout. The deadline is long enough for
+    # the fake to have started before it fires.
+    @tag timeout: 10_000
     test "GET /host/disks/default/usage -> 400, and the walk is killed" do
-      shorten(%{disk_usage: 50})
+      shorten(%{disk_usage: 500})
       Application.put_env(:vagus, :hung_disk_breakdown_test, self())
       Application.put_env(:vagus, :host_disk_breakdown, HungDiskBreakdown)
 
@@ -311,14 +315,85 @@ defmodule Vagus.API.RouterBackendTest do
     end
   end
 
-  describe "a backend that raises behind a bound" do
-    defmodule RaisingDiskBreakdown do
-      def usage(_opts), do: raise(ArgumentError, "walk failed")
+  describe "GET /host/disks/default/usage under its bound" do
+    defmodule FixedDiskBreakdown do
+      def usage(opts) do
+        %{
+          id: "root",
+          label: "Root",
+          total_bytes: 1000,
+          used_bytes: 400,
+          children: [
+            %{id: "system", label: "System", used_bytes: Keyword.fetch!(opts, :max_depth)}
+          ]
+        }
+      end
+    end
+
+    defmodule FailingDiskBreakdown do
+      def usage(_opts), do: fail(Application.fetch_env!(:vagus, :failing_disk_breakdown))
+
+      defp fail(:raise), do: raise(ArgumentError, "walk failed")
+      defp fail(:throw), do: throw(:walk_thrown)
+      defp fail(:exit), do: exit(:walk_exited)
+    end
+
+    defp breakdown(module) do
+      Application.put_env(:vagus, :host_disk_breakdown, module)
+      on_exit(fn -> Application.delete_env(:vagus, :host_disk_breakdown) end)
+    end
+
+    defp fail_with(kind) do
+      breakdown(FailingDiskBreakdown)
+      Application.put_env(:vagus, :failing_disk_breakdown, kind)
+      on_exit(fn -> Application.delete_env(:vagus, :failing_disk_breakdown) end)
+    end
+
+    defp assert_answered_500 do
+      assert_received {:plug_conn, :sent}
+      assert_received {_ref, {500, _headers, body}}
+      assert Jason.decode!(body)["message"] == "internal server error"
+    end
+
+    test "a read that returns is answered with exactly what it read" do
+      breakdown(FixedDiskBreakdown)
+
+      conn = conn(:get, "/host/disks/default/usage?max_depth=3") |> authed() |> call()
+
+      assert conn.status == 200
+
+      assert json_body(conn) == %{
+               "result" => "ok",
+               "data" => %{
+                 "id" => "root",
+                 "label" => "Root",
+                 "total_bytes" => 1000,
+                 "used_bytes" => 400,
+                 "children" => [%{"id" => "system", "label" => "System", "used_bytes" => 3}]
+               }
+             }
+    end
+
+    test "a throw in the walk is thrown from the handler, with a 500" do
+      fail_with(:throw)
+
+      assert catch_throw(conn(:get, "/host/disks/default/usage") |> authed() |> call()) ==
+               :walk_thrown
+
+      assert_answered_500()
+    end
+
+    test "an exit in the walk exits the handler, with a 500" do
+      fail_with(:exit)
+
+      assert catch_exit(conn(:get, "/host/disks/default/usage") |> authed() |> call()) ==
+               :walk_exited
+
+      assert_answered_500()
     end
 
     test "GET /host/disks/default/usage fails as the walk did, with a 500" do
-      Application.put_env(:vagus, :host_disk_breakdown, RaisingDiskBreakdown)
-      on_exit(fn -> Application.delete_env(:vagus, :host_disk_breakdown) end)
+      fail_with(:raise)
 
       error =
         assert_raise Plug.Conn.WrapperError, fn ->

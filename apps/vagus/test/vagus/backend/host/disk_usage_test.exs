@@ -52,11 +52,16 @@ defmodule Vagus.Backend.Host.DiskUsageTest do
       end
     end
 
+    # The point is that the caller is released, so the fake never returns and
+    # a missing bound shows as this timeout. The deadline is long enough for
+    # the fake to have started before it fires.
+    @describetag timeout: 10_000
+    @deadline_ms 500
+
     test "usage_gb/2 answers the failure value at the deadline, and the run is killed" do
-      log =
-        capture_log(fn ->
-          assert DiskUsage.usage_gb("/data", df: hung_df(), timeout_ms: 50) == {0.0, 0.0, 0.0}
-        end)
+      opts = [df: hung_df(), timeout_ms: @deadline_ms]
+
+      log = capture_log(fn -> assert DiskUsage.usage_gb("/data", opts) == {0.0, 0.0, 0.0} end)
 
       assert log =~ "df /data did not return"
       assert_received {:df, runner}
@@ -64,12 +69,32 @@ defmodule Vagus.Backend.Host.DiskUsageTest do
     end
 
     test "usage_bytes/2 does the same" do
-      capture_log(fn ->
-        assert DiskUsage.usage_bytes("/data", df: hung_df(), timeout_ms: 50) == {0, 0}
-      end)
+      opts = [df: hung_df(), timeout_ms: @deadline_ms]
+
+      capture_log(fn -> assert DiskUsage.usage_bytes("/data", opts) == {0, 0} end)
 
       assert_received {:df, runner}
       refute Process.alive?(runner)
+    end
+
+    test "read_bytes/2 says the read timed out, where usage_bytes/2 says nothing is free" do
+      opts = [df: hung_df(), timeout_ms: @deadline_ms]
+
+      capture_log(fn -> assert DiskUsage.read_bytes("/data", opts) == {:error, :timeout} end)
+    end
+  end
+
+  describe "read_bytes/2" do
+    test "a df that failed is still a reading of nothing, as in usage_bytes/2" do
+      assert DiskUsage.read_bytes("/data", df: fn _path -> {"df: no such file", 1} end) ==
+               {:ok, {0, 0}}
+    end
+
+    test "a df that answered is its parsed reading" do
+      output = "Filesystem 1K-blocks Used Available Use% Mounted on\n/dev/x 1000 400 600 40% /\n"
+
+      assert DiskUsage.read_bytes("/data", df: fn _path -> {output, 0} end) ==
+               {:ok, {1_024_000, 614_400}}
     end
   end
 

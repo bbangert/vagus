@@ -898,7 +898,13 @@ defmodule Vagus.Core.LifecycleTest do
       Application.put_env(:vagus, :core_pull_deadline_ms, 50)
       on_exit(fn -> Application.delete_env(:vagus, :core_pull_deadline_ms) end)
 
-      engine = start_engine([{200, "{\"status\":\"Pull complete\"}\n", delay: 2_000}])
+      engine =
+        start_engine([
+          {200, "{\"status\":\"Pull complete\"}\n", delay: 2_000},
+          {200, inspect_body(Container.image("2026.7.0"), true)},
+          {204, nil}
+        ])
+
       versions = start_versions("2026.7.0")
 
       assert Lifecycle.update("2026.8.0", docker: [socket: engine.socket], versions: versions) ==
@@ -907,8 +913,8 @@ defmodule Vagus.Core.LifecycleTest do
       assert Versions.installed(versions) == "2026.7.0"
       assert [%{method: :post, path: "/images/create"}] = FakeEngine.requests(engine)
 
-      # The lock went with the failed op: the next one is not `:busy`.
-      assert Lifecycle.stop(docker: [socket: engine.socket]) != {:error, :busy}
+      # The lock went with the failed op: the next one runs.
+      assert Lifecycle.stop(docker: [socket: engine.socket]) == :ok
     end
 
     test "health-gate timeout rolls back to the previous version" do

@@ -173,7 +173,38 @@ defmodule Vagus.Runtime.DockerTest do
                {:error, :deadline}
     end
 
-    test "one deadline bounds every request of an exec, and the polling after it" do
+    test "a request whose deadline has passed sends nothing" do
+      engine = FakeEngine.start([{200, %{"ApiVersion" => "1.41"}}])
+      on_exit(fn -> FakeEngine.stop(engine) end)
+
+      assert Docker.request(:get, "/version", socket: engine.socket, deadline: in_ms(-1)) ==
+               {:error, :deadline}
+
+      assert FakeEngine.requests(engine) == []
+    end
+
+    # The deadline falls in the 200 ms pause after the first poll. A runner
+    # slow enough to spend 100 ms on the three requests before it sends fewer.
+    test "an exec whose deadline passes between polls is not polled again" do
+      engine =
+        FakeEngine.start([
+          {201, %{"Id" => "exec-1"}},
+          {200, ""},
+          {200, %{"Running" => true}},
+          {200, %{"Running" => false, "ExitCode" => 0}}
+        ])
+
+      on_exit(fn -> FakeEngine.stop(engine) end)
+
+      assert Docker.exec_capture("homeassistant", "sleep 9",
+               socket: engine.socket,
+               deadline: in_ms(100)
+             ) == {:error, :deadline}
+
+      assert length(FakeEngine.requests(engine)) <= 3
+    end
+
+    test "an exec whose output outlasts the deadline is {:error, :deadline}, unpolled" do
       engine =
         FakeEngine.start([
           {201, %{"Id" => "exec-1"}},

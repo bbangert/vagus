@@ -306,8 +306,8 @@ defmodule Vagus.API.Router do
 
   defp fail_as_task_did(reason), do: exit(reason)
 
-  # The frontend allows the usage walk an hour; 15 min is the longest the Core
-  # WebSocket proxy lets a caller wait for anything.
+  # 900 s is the largest timeout one call over the Core WebSocket proxy may
+  # declare (`Vagus.API.CoreProxy.WSDispatch`).
   @handler_deadlines %{disk_usage: 900_000}
 
   # Tests shorten these by name; production never sets the key.
@@ -2074,6 +2074,9 @@ defmodule Vagus.API.Router do
 
   defp os_update_error_message({:insufficient_space, needed, free}),
     do: "not enough free disk space for the download (need #{needed} bytes, have #{free})"
+
+  defp os_update_error_message(:free_space_unknown),
+    do: "free disk space for the download could not be read in time; see the log"
 
   defp os_update_error_message(:not_supported),
     do: "os/update is not supported on this backend"

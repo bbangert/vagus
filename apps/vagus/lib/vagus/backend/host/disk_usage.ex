@@ -19,8 +19,7 @@ defmodule Vagus.Backend.Host.DiskUsage do
 
   @kb_per_gb 1_048_576
 
-  # `df` answers from the mounted filesystem in milliseconds, or not at all
-  # while its storage is stalled.
+  # Assumed generous: a `df` of a local mount is expected to return at once.
   @df_timeout_ms 10_000
 
   @doc """
@@ -48,15 +47,29 @@ defmodule Vagus.Backend.Host.DiskUsage do
   """
   @spec usage_bytes(String.t(), keyword()) :: {non_neg_integer(), non_neg_integer()}
   def usage_bytes(path, opts \\ []) do
+    case read_bytes(path, opts) do
+      {:ok, usage} -> usage
+      {:error, :timeout} -> {0, 0}
+    end
+  end
+
+  @doc """
+  `usage_bytes/2` for a caller that decides on the answer: a `df` that did
+  not return is `{:error, :timeout}`, not a disk with nothing free.
+  """
+  @spec read_bytes(String.t(), keyword()) ::
+          {:ok, {non_neg_integer(), non_neg_integer()}} | {:error, :timeout}
+  def read_bytes(path, opts \\ []) do
     case df(path, opts) do
-      {output, 0} -> parse_bytes(output)
-      _error -> {0, 0}
+      :timeout -> {:error, :timeout}
+      {output, 0} -> {:ok, parse_bytes(output)}
+      _error -> {:ok, {0, 0}}
     end
   end
 
   # `System.cmd/3` has no timeout, so the deadline is a task's. Killing it
-  # closes the port; a `df` the kernel still holds exits when it is let go.
-  # A missing binary raises there, and comes back as an error like the rest.
+  # closes the port; the `df` process itself is not signalled. A missing
+  # binary raises there, and comes back as an error like the rest.
   defp df(path, opts) do
     run = Keyword.get(opts, :df, &run_df/1)
 

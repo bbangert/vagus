@@ -227,6 +227,7 @@ defmodule Vagus.API.OSUpdateRouterTest do
       {:no_release_cached, 409, "check for updates first"},
       {{:version_mismatch, "0.4.0"}, 400, "only the latest version (0.4.0)"},
       {{:insufficient_space, 200_000_000, 1_000_000}, 400, "not enough free disk space"},
+      {:free_space_unknown, 400, "could not be read in time"},
       {:not_supported, 400, "not supported on this backend"}
     ]
 
