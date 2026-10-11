@@ -13,5 +13,6 @@ set -euo pipefail
 ip=${1:?board ip}; port=${2:?probe port}; : "${PROBE_TOKEN:?PROBE_TOKEN}"
 here=$(cd "$(dirname "$0")" && pwd)
 echo "== $(date -u +%FT%TZ) board=$ip probe-port=$port"
+# jq must fail the pipeline when the eval is refused, or `set -e` never sees it.
 curl -sS -m 300 -H "x-probe-token: $PROBE_TOKEN" --data-binary @"$here/ws-proxy-gate.exs" "http://$ip:$port/eval" |
-  jq -r 'if .ok then .result else "EVAL ERROR: " + (.error // "") + (.printed // "") end'
+  jq -r 'if .ok == true then .result else error("EVAL ERROR: " + (.error // "") + (.printed // "") + (if has("ok") then "" else " " + tostring end)) end'

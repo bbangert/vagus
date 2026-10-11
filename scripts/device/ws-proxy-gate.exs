@@ -114,7 +114,7 @@ cases = [
   {"q_api_core_proxy_family", api.(25, "/core/api/config", "get")},
   {"r_api_logs_follow", api.(26, "/addons/self/logs/follow", "get")},
   {"s_api_encoded_endpoint", api.(27, "/addons/%73elf/info", "get")},
-  {"t_api_post_core_restart", api.(28, "/core/restart", "post")},
+  {"t_api_post_core_check", api.(28, "/core/check", "post")},
   {"u_api_unknown_path", api.(29, "/nope", "get")}
 ]
 results =
@@ -139,6 +139,6 @@ equal =
   rescue e -> %{"exception" => Exception.message(e) |> String.slice(0, 200)}
   end
 rest_checks =
-  for {m, p} <- [{"GET", "/supervisor/info"}, {"GET", "/addons/core_mqtt/info"}, {"POST", "/core/restart"}],
+  for {m, p} <- [{"GET", "/supervisor/info"}, {"GET", "/addons/core_mqtt/info"}, {"POST", "/core/check"}],
       do: {m, p, rest.(m, p) |> then(fn {s, b} -> {s, is_map(b) && b["message"]} end)}
 %{utc: DateTime.utc_now() |> DateTime.to_iso8601(), slug: System.get_env("HOSTNAME"), cases: results, self_info_ws_vs_rest: equal, rest_same_token: rest_checks}
