@@ -58,7 +58,7 @@ defmodule Vagus.Ingress.WSBridge do
      not relayed as-is), so it flows through the identical path-1 code in
      `handle_info/2`. If `B` dies without ever sending anything (e.g. an
      unhandled raise), `A`'s trapped `{:EXIT, pid, reason}` catches it and
-     returns `{:stop, {:error, :upstream_down}, {1011, ""}, state}` directly.
+     returns `{:stop, {:shutdown, :upstream_down}, {1011, ""}, state}` directly.
   3. **Browser closes**: Bandit's own `Connection.handle_frame/3` intercepts
      the browser's close frame *before* it ever reaches `handle_in/2` or
      `handle_control/2` — it calls `terminate(:remote, state)` directly.
@@ -129,6 +129,7 @@ defmodule Vagus.Ingress.WSBridge do
 
   @behaviour WebSock
 
+  alias Vagus.API.WSAbnormalClose
   alias Vagus.Ingress.WSBridge.Upstream
 
   @typedoc "State carried across every `WebSock` callback for the browser leg."
@@ -175,7 +176,7 @@ defmodule Vagus.Ingress.WSBridge do
         {:ok, %{upstream: pid, closing?: false}}
 
       {:error, _reason} ->
-        {:stop, {:error, :upstream_connect_failed}, {1011, "upstream connection failed"},
+        {:stop, {:shutdown, :upstream_connect_failed}, {1011, "upstream connection failed"},
          %{upstream: nil, closing?: true}}
     end
   end
@@ -197,6 +198,7 @@ defmodule Vagus.Ingress.WSBridge do
     {:ok, state}
   catch
     :exit, {:timeout, _} ->
+      WSAbnormalClose.count_upstream()
       {:stop, :normal, {1011, ""}, %{state | closing?: true}}
 
     :exit, _upstream_died_mid_call ->
@@ -237,6 +239,10 @@ defmodule Vagus.Ingress.WSBridge do
   an `{:upstream_close, ...}` (i.e. `B` died without a chance to notify us —
   an unhandled crash, not a graceful stop) is upstream-crash path 2: close
   the browser with 1011.
+
+  That stop, like `init/1`'s, is a `:shutdown`: any reason but that and
+  `:normal` ends this process with a crash report, and a stop returned from
+  here does so whatever the listener is told.
   """
   def handle_info({:relay, op, data}, state) do
     {:push, {op, data}, state}
@@ -251,7 +257,7 @@ defmodule Vagus.Ingress.WSBridge do
   end
 
   def handle_info({:EXIT, pid, _reason}, %{upstream: pid, closing?: false} = state) do
-    {:stop, {:error, :upstream_down}, {1011, ""}, %{state | closing?: true}}
+    {:stop, {:shutdown, :upstream_down}, {1011, ""}, %{state | closing?: true}}
   end
 
   def handle_info({:EXIT, _pid, _reason}, state), do: {:ok, state}
@@ -277,8 +283,16 @@ defmodule Vagus.Ingress.WSBridge do
   `{:upstream_close, ...}` for path 1/2) — `GenServer.stop/3` against an
   already-dead pid exits `:noproc`, which would otherwise crash this
   `terminate/2` itself.
+
+  A frame Bandit refused is counted first, since no callback here saw it,
+  and so is a lost upstream.
   """
-  def terminate(_reason, %{upstream: pid}) when is_pid(pid) do
+  def terminate(reason, state) do
+    WSAbnormalClose.count(reason)
+    stop_upstream(state)
+  end
+
+  defp stop_upstream(%{upstream: pid}) when is_pid(pid) do
     try do
       if Process.alive?(pid), do: GenServer.stop(pid, :normal, 5_000)
     catch
@@ -288,7 +302,7 @@ defmodule Vagus.Ingress.WSBridge do
     :ok
   end
 
-  def terminate(_reason, _state), do: :ok
+  defp stop_upstream(_state), do: :ok
 
   # issue #37: bound on the `GenServer.call/3` `handle_in/2` makes to `B` for
   # every relayed frame — see moduledoc's "Steady-state backpressure". No

@@ -212,7 +212,7 @@ defmodule Vagus.API.CoreProxy.WSBridge do
 
   require Logger
 
-  alias Vagus.API.{Authz, CoreProxy, SourceGuard}
+  alias Vagus.API.{Authz, CoreProxy, SourceGuard, WSAbnormalClose}
   alias Vagus.API.CoreProxy.WSBridge.Upstream
   alias Vagus.API.CoreProxy.WSDispatch
   alias Vagus.App.Policy
@@ -393,7 +393,10 @@ defmodule Vagus.API.CoreProxy.WSBridge do
   end
 
   def handle_info({:EXIT, pid, _reason}, %{upstream: pid, closing?: false} = state) do
-    {:stop, {:error, :upstream_down}, {1011, ""}, %{state | closing?: true}}
+    # A `:shutdown` reason: any but that and `:normal` ends this process with
+    # a crash report, which prints the state, and a stop returned from here
+    # does so whatever the listener is told.
+    {:stop, {:shutdown, :upstream_down}, {1011, ""}, %{state | closing?: true}}
   end
 
   def handle_info({:EXIT, _pid, _reason}, state), do: {:ok, state}
@@ -425,9 +428,15 @@ defmodule Vagus.API.CoreProxy.WSBridge do
   so `Upstream.terminate/2`'s own best-effort close-frame-to-Core actually
   runs; the `try/catch` guards the TOCTOU race against `Upstream` having
   already exited on its own (e.g. after already sending
-  `{:upstream_close, ...}`).
+  `{:upstream_close, ...}`). A frame Bandit refused is counted first, since
+  no callback here saw it, and so is a lost upstream.
   """
-  def terminate(_reason, %{upstream: pid}) when is_pid(pid) do
+  def terminate(reason, state) do
+    WSAbnormalClose.count(reason)
+    stop_upstream(state)
+  end
+
+  defp stop_upstream(%{upstream: pid}) when is_pid(pid) do
     try do
       if Process.alive?(pid), do: GenServer.stop(pid, :normal, 5_000)
     catch
@@ -437,7 +446,7 @@ defmodule Vagus.API.CoreProxy.WSBridge do
     :ok
   end
 
-  def terminate(_reason, _state), do: :ok
+  defp stop_upstream(_state), do: :ok
 
   ## Internals
 
@@ -448,6 +457,7 @@ defmodule Vagus.API.CoreProxy.WSBridge do
     :exit, {:timeout, _} ->
       # Upstream wedged longer than the handoff timeout — same
       # abnormal-loss close as every other stuck-relay path.
+      WSAbnormalClose.count_upstream()
       {:stop, :normal, {1011, ""}, %{state | closing?: true}}
 
     :exit, _upstream_died_mid_call ->
@@ -705,7 +715,7 @@ defmodule Vagus.API.CoreProxy.WSBridge do
         {:push, auth_ok, %{state | phase: :relaying, upstream: pid}}
 
       {:error, _reason} ->
-        {:stop, {:error, :upstream_connect_failed}, {1011, ""}, [auth_ok],
+        {:stop, {:shutdown, :upstream_connect_failed}, {1011, ""}, [auth_ok],
          %{state | phase: :relaying, closing?: true}}
     end
   end

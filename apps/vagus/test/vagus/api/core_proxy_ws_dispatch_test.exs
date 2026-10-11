@@ -1247,8 +1247,8 @@ defmodule Vagus.API.CoreProxyWSDispatchTest do
     assert_receive {:dispatching, task, bridge, _slug, _request}, @recv_timeout
     bridge_ref = Process.monitor(bridge)
 
-    # The web server's report of this stop prints the bridge's state: the
-    # credential's hash is in it, and the token is not.
+    # The stop is a shutdown, so no report prints the bridge's state, where
+    # the credential's hash is. The label shows the capture saw the bridge.
     log =
       capture_log(fn ->
         Process.exit(websock_state(bridge).upstream, :kill)
@@ -1257,7 +1257,8 @@ defmodule Vagus.API.CoreProxyWSDispatchTest do
         assert_receive {:DOWN, ^bridge_ref, :process, ^bridge, _reason}, @recv_timeout
       end)
 
-    assert log =~ "credential: <<"
+    assert log =~ "closed a connection (ws/upstream)"
+    refute log =~ "credential"
     refute log =~ token
 
     assert Process.alive?(task)
