@@ -48,7 +48,8 @@ defmodule Vagus.Core.ConfigCheckTest do
 
   describe "Core running — check_config exec" do
     test "a check that outlasts its deadline is {:error, :deadline}, with nothing polled after" do
-      Application.put_env(:vagus, :core_check_deadline_ms, 50)
+      # Long enough for the three requests to have been sent.
+      Application.put_env(:vagus, :core_check_deadline_ms, 500)
       on_exit(fn -> Application.delete_env(:vagus, :core_check_deadline_ms) end)
 
       engine =

@@ -606,7 +606,8 @@ defmodule Vagus.Addon.StoreTest do
         end
       end
 
-      budget_ms = 20
+      # Long enough that the first fetch has started before it is spent.
+      budget_ms = 300
 
       repos = [
         %{
@@ -632,7 +633,7 @@ defmodule Vagus.Addon.StoreTest do
       assert_received :core_fetched
       refute_received :community_fetched
       assert log =~ ~s(fetch "community" failed: :reload_deadline)
-      assert Map.keys(Store.catalog(srv)) == ["core_esphome", "core_mosquitto"]
+      assert Enum.sort(Map.keys(Store.catalog(srv))) == ["core_esphome", "core_mosquitto"]
     end
 
     test "a repository that failed to fetch keeps its entries, assets and metadata" do

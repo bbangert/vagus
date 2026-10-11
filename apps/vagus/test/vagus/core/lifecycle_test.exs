@@ -895,7 +895,8 @@ defmodule Vagus.Core.LifecycleTest do
     end
 
     test "a pull that outlasts its deadline fails the update and leaves the old Core untouched" do
-      Application.put_env(:vagus, :core_pull_deadline_ms, 50)
+      # Long enough for the pull to have been sent.
+      Application.put_env(:vagus, :core_pull_deadline_ms, 500)
       on_exit(fn -> Application.delete_env(:vagus, :core_pull_deadline_ms) end)
 
       engine =
