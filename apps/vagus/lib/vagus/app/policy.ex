@@ -434,6 +434,8 @@ defmodule Vagus.App.Policy do
   def answer(:snapshot, data), do: snapshot(data)
   def answer(:installed?, _data), do: true
   def answer(:identity, data), do: {:ok, identity(data.config)}
+  def answer(:token, %{token: token}) when is_binary(token), do: {:ok, token}
+  def answer(:token, _data), do: :error
   def answer(:ingress_target, data), do: ingress_target(data)
   def answer({:service, name}, data), do: Map.fetch(data.services, name)
   def answer({:discovery, uuid}, data), do: Map.fetch(data.discovery, uuid)

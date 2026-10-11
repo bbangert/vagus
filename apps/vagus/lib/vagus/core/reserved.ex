@@ -49,6 +49,13 @@ defmodule Vagus.Core.Reserved do
   `Vagus.API.CoreProxy.WSBridge` puts every command of every text frame to
   `Vagus.API.Authz`, whose WebSocket rule is `command?/1`.
 
+  No reserved command is relayed, `supervisor/api` included. That one the
+  bridge answers itself when it is alone in its frame: the request it names
+  runs inside Vagus with the calling app's own token
+  (`Vagus.API.CoreProxy.WSDispatch`), so it reaches the Supervisor API as
+  the app and never reaches Core as the Supervisor. Through it an app cannot
+  name a reserved view either: that module refuses the Core proxy's paths.
+
   ## Why a namespace, not a list of endpoints
 
   Upstream's original deny listed `/…/hassio/.*` — the loopback view — and

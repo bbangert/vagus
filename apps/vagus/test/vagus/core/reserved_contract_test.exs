@@ -242,6 +242,25 @@ defmodule Vagus.Core.ReservedContractTest do
       end
     end
 
+    # A frame Core's own schema would accept for `supervisor/api`: the one
+    # shape the proxy does not refuse, and it still does not relay it.
+    test "is never relayed, however well formed" do
+      for command <- @ws_commands do
+        frame =
+          Jason.encode!(%{
+            "id" => 9,
+            "type" => command,
+            "endpoint" => "/supervisor/info",
+            "method" => "get"
+          })
+
+        case WSBridge.screen(frame, @app) do
+          {:call, 9, _request} -> assert command == "supervisor/api"
+          {:refuse, 9} -> assert command != "supervisor/api"
+        end
+      end
+    end
+
     # `supervisor/api` is the one the evaluator sets aside to be answered
     # here; it is no more relayed than the rest.
     test "is never allowed by the evaluator, to the one caller the proxy admits" do

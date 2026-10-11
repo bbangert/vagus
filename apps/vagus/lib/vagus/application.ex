@@ -124,6 +124,19 @@ defmodule Vagus.Application do
         ingress_children() ++
         ssh_access_children() ++
         [
+          # The `supervisor/api` calls `Vagus.API.CoreProxy.WSBridge` answers
+          # in-process, one task each. Immediately before the listener, so
+          # it is ordered against the rest of the tree exactly as the
+          # listener's own request processes are: the sockets that start
+          # these tasks stop first, and what an HTTP handler can rely on at
+          # shutdown a task can too.
+          # `max_children` is the bound across all sockets, the only one that
+          # outlasts a socket, since a task is left running when its caller
+          # times out or goes. A task does not trap exits, so stopping the
+          # application ends one mid-handler, as it ends an HTTP request once
+          # Bandit's drain runs out.
+          {Task.Supervisor, name: Vagus.API.CoreProxy.TaskSupervisor, max_children: 32},
+
           # Supervisor-API emulator's HTTP surface (Bandit + Plug.Router),
           # isolated with its own restart budget so a crash there can't take
           # down the rest of the app. Started on both :host and real targets

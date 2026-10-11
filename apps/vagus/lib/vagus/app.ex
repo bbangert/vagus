@@ -297,6 +297,19 @@ defmodule Vagus.App do
   end
 
   @doc """
+  The token the app's running container holds, for a caller inside this VM
+  that must act as the app. `:error` for an app that is stopped, native or
+  gone. A secret: it belongs in no state, message or log.
+  """
+  @spec token(String.t()) :: {:ok, String.t()} | :error
+  def token(slug) do
+    case ask(slug, :token) do
+      {:ok, {:ok, token}} -> {:ok, token}
+      _absent_or_none -> :error
+    end
+  end
+
+  @doc """
   Where ingress traffic for `slug` goes: `{ip, port, stream?}`, `stream?`
   being the config's `ingress_stream`. A host-network app answers on
   loopback or on the gateway depending on the app, so a connect to its port
