@@ -67,6 +67,17 @@ defmodule Vagus.API.AuthzTest do
   defp refusal(:anonymous), do: {:error, :unauthenticated}
   defp refusal(_who), do: {:error, :forbidden}
 
+  # What a fixture row's predicates admit among these principals, written out
+  # rather than asked of `Authz`. Every app here is `probe` and holds no grant.
+  defp held?(predicates, who, path) do
+    Enum.all?(predicates, fn
+      {"subject", "self"} -> who == :supervisor or Enum.at(segments(path), 1) in ~w(self probe)
+      {"caller", "supervisor"} -> who == :supervisor
+      {"requires", "auth_api"} -> false
+      {"requires", ["services_role", "any"]} -> who == :supervisor
+    end)
+  end
+
   describe "the lattice" do
     test "each principal reaches exactly the requirements it should" do
       for {who, reaches} <- @reaches, {requirement, path} <- @paths do
@@ -77,21 +88,30 @@ defmodule Vagus.API.AuthzTest do
       end
     end
 
-    test "every route decides as its pinned requirement says, for every principal" do
+    test "every route decides as its pinned row says, for every principal" do
       for row <- @fixture, {who, reaches} <- @reaches do
         requirement = String.to_existing_atom(row["requirement"])
-        expected = if requirement in reaches, do: :ok, else: refusal(who)
+
+        expected =
+          if requirement in reaches and held?(row["predicates"], who, row["path"]),
+            do: :ok,
+            else: refusal(who)
 
         assert authorize(who, row["path"], row["method"]) == expected,
                "#{who} on #{row["method"]} #{row["path"]}: expected #{inspect(expected)}"
       end
     end
 
-    test "the supervisor satisfies every row, and the fallback" do
-      for {method, _route, path} <- RouterRoutes.instances() do
-        assert authorize(:supervisor, path, method) == :ok
-      end
+    # `auth_api` is a grant only an app holds, so its row is the one Core
+    # does not pass.
+    test "the supervisor satisfies every row but the auth API's, and the fallback" do
+      refused =
+        for {method, _route, path} <- RouterRoutes.instances(),
+            authorize(:supervisor, path, method) != :ok,
+            do: {method, path}
 
+      assert refused == [{"GET", "/auth"}, {"POST", "/auth"}]
+      assert authorize(:supervisor, "/auth") == {:error, :forbidden}
       assert authorize(:supervisor, "/no/such/route") == :ok
     end
 
@@ -160,10 +180,17 @@ defmodule Vagus.API.AuthzTest do
     end
 
     test "is not admitted by the bypass rows any app token satisfies" do
-      for path <- ~w(/info /services /discovery /auth /addons/self/info) do
+      for path <- ~w(/info /services /discovery /addons/self/info) do
         assert authorize(:none, path) == :ok
         assert authorize(:anonymous, path) == {:error, :unauthenticated}
       end
+
+      # `/auth` is a bypass row too, with a grant on top.
+      action = {:rest, :supervisor_api, "GET", ["auth"]}
+      holder = {:addon, Map.put(identity(false, "default"), :auth_api, true)}
+
+      assert Authz.authorize(holder, action, ctx("/auth")) == :ok
+      assert authorize(:anonymous, "/auth") == {:error, :unauthenticated}
     end
 
     test "is refused a segment that is not a slug" do
@@ -272,6 +299,329 @@ defmodule Vagus.API.AuthzTest do
     end
   end
 
+  # Grants the lattice cannot express. Each is read off the principal and the
+  # action, after the lattice, and a caller has to hold both.
+  describe "predicates" do
+    defp app(slug, grants \\ %{}) do
+      {:addon, Map.merge(%{slug: slug, hassio_api: true, hassio_role: "admin"}, grants)}
+    end
+
+    defp decide(principal, path, method \\ "GET"),
+      do: Authz.authorize(principal, {:rest, :supervisor_api, method, segments(path)}, ctx(path))
+
+    @subject_rows ~w(info stats logs logs/latest logs/follow logs/boots/0 logs/boots/0/follow
+                     options/config)
+
+    test "subject: an app reaches its own slug and `self`, never another app's" do
+      for tail <- @subject_rows do
+        assert decide(app("mine"), "/addons/mine/#{tail}") == :ok, tail
+        assert decide(app("mine"), "/addons/self/#{tail}") == :ok, tail
+        assert decide(app("mine"), "/addons/theirs/#{tail}") == {:error, :forbidden}, tail
+        # A prefix or a near miss is another app.
+        assert decide(app("mine"), "/addons/mine2/#{tail}") == {:error, :forbidden}, tail
+        assert decide(app("mine"), "/addons/min/#{tail}") == {:error, :forbidden}, tail
+        assert decide(app("mine"), "/addons/SELF/#{tail}") == {:error, :forbidden}, tail
+        assert decide(:supervisor, "/addons/theirs/#{tail}") == :ok, tail
+      end
+    end
+
+    test "subject: an identity with no slug is nobody's own" do
+      bare = {:addon, %{hassio_api: true, hassio_role: "admin"}}
+
+      assert decide(bare, "/addons/theirs/info") == {:error, :forbidden}
+      assert decide(bare, "/addons/nil/stats") == {:error, :forbidden}
+      assert decide(app(nil), "/addons/nil/stats") == {:error, :forbidden}
+      assert decide(app(nil), "/addons/self/logs/latest") == {:error, :forbidden}
+    end
+
+    test "subject: the lattice still has to be satisfied first" do
+      # Its own stats, but the row wants manager.
+      assert decide(app("mine", %{hassio_role: "default"}), "/addons/mine/stats") ==
+               {:error, :forbidden}
+
+      assert decide(app("mine", %{hassio_api: false}), "/addons/mine/info") ==
+               {:error, :forbidden}
+
+      assert decide(app("mine", %{hassio_role: "default"}), "/addons/mine/info") == :ok
+    end
+
+    test "the reserved panel slug's info is Core's alone, even for an app so named" do
+      assert Vagus.API.AdminPanel.slug() == "vagus"
+      assert decide(:supervisor, "/addons/vagus/info") == :ok
+      assert decide(app("mine"), "/addons/vagus/info") == {:error, :forbidden}
+      assert decide(app("vagus"), "/addons/vagus/info") == {:error, :forbidden}
+      # Reserved on info only: the other rows resolve it like any slug.
+      assert decide(app("vagus"), "/addons/vagus/stats") == :ok
+      assert decide(app("vagus"), "/addons/self/info") == :ok
+    end
+
+    test "caller: only Core sets an app's protection or opens an ingress session" do
+      for path <- ~w(/addons/mine/security /addons/theirs/security /ingress/session
+                     /ingress/validate_session) do
+        assert decide(:supervisor, path, "POST") == :ok, path
+        assert decide(app("mine"), path, "POST") == {:error, :forbidden}, path
+      end
+
+      # The lattice refuses a manager before the predicate is reached.
+      assert decide(app("mine", %{hassio_role: "manager"}), "/ingress/session", "POST") ==
+               {:error, :forbidden}
+    end
+
+    test "requires auth_api: the flag, on an app, whatever its role" do
+      assert decide(app("mine", %{auth_api: true}), "/auth", "POST") == :ok
+
+      assert decide(app("mine", %{auth_api: true, hassio_api: false}), "/auth") == :ok
+
+      for grants <- [%{}, %{auth_api: false}, %{auth_api: nil}, %{auth_api: "true"}] do
+        assert decide(app("mine", grants), "/auth") == {:error, :forbidden}, inspect(grants)
+      end
+
+      # Core is not an app and holds no such grant.
+      assert decide(:supervisor, "/auth") == {:error, :forbidden}
+      # A different row, with no predicate.
+      assert decide(app("mine"), "/auth/cache", "DELETE") == :ok
+    end
+
+    test "requires a services_role: any role for that service, and Core" do
+      for role <- ~w(provide want need) do
+        holder = app("mine", %{hassio_role: "default", services_role: %{"mqtt" => role}})
+        assert decide(holder, "/services/mqtt") == :ok, role
+        assert decide(holder, "/services/mysql") == {:error, :forbidden}, role
+      end
+
+      no_api = app("mine", %{hassio_api: false, services_role: %{"mqtt" => "want"}})
+      assert decide(no_api, "/services/mqtt") == :ok
+
+      for grants <- [%{}, %{services_role: %{}}, %{services_role: nil}] do
+        manager = app("mine", Map.put(grants, :hassio_role, "manager"))
+        assert decide(manager, "/services/mqtt") == {:error, :forbidden}, inspect(grants)
+      end
+
+      assert decide(:supervisor, "/services/mqtt") == :ok
+      # The list, and anything deeper, has no service to hold a role for.
+      assert decide(app("mine"), "/services") == :ok
+      assert decide(app("mine"), "/services/mqtt/extra") == :ok
+    end
+
+    # Ownership of a message and the service in a body are not in the
+    # principal or the action, so these rows stay the handler's.
+    test "the discovery rows decide nothing the lattice does not" do
+      for principal <- [:supervisor, app("mine"), app("mine", %{hassio_api: false})],
+          {method, path} <- [
+            {"GET", "/discovery"},
+            {"POST", "/discovery"},
+            {"GET", "/discovery/8ced93a7"},
+            {"DELETE", "/discovery/8ced93a7"}
+          ] do
+        assert decide(principal, path, method) == :ok, "#{method} #{path}"
+      end
+    end
+
+    test "the method changes no predicate's decision" do
+      principals = [
+        :supervisor,
+        app("mine"),
+        app("mine", %{auth_api: true, services_role: %{"mqtt" => "want"}})
+      ]
+
+      paths = ~w(/addons/mine/info /addons/theirs/stats /addons/vagus/info /addons/mine/security
+                 /ingress/session /auth /services/mqtt /services/mysql /discovery)
+
+      for principal <- principals, path <- paths do
+        decisions =
+          for method <- ~w(GET POST DELETE PUT BREW), do: decide(principal, path, method)
+
+        assert decisions |> Enum.uniq() |> length() == 1, "#{inspect(principal)} on #{path}"
+      end
+    end
+
+    # The rows are chosen under both spellings; the subject is the decoded
+    # segment, which is the one the handler is given.
+    test "an encoded spelling is judged on the subject the router will read" do
+      mine = app("mine", %{auth_api: true, services_role: %{"mqtt" => "want"}})
+
+      assert decide(mine, "/addons/%6Dine/info") == :ok
+      assert decide(mine, "/addons/%73elf/info") == :ok
+      assert decide(mine, "/addons/%6Dine/stats") == :ok
+      assert decide(mine, "/addons/mine/%69nfo") == :ok
+      assert decide(mine, "/services/%6Dqtt") == :ok
+      assert decide(mine, "/%61uth") == :ok
+      assert decide(:supervisor, "/addons/%74heirs/%69nfo") == :ok
+      assert decide(:supervisor, "/addons/%76agus/info") == :ok
+
+      # Raw, each of these matches a row with no predicate, or a looser one.
+      assert decide(mine, "/addons/%74heirs/info") == {:error, :forbidden}
+      assert decide(mine, "/addons/theirs/%69nfo") == {:error, :forbidden}
+      assert decide(mine, "/addons/theirs/%73tats") == {:error, :forbidden}
+      assert decide(mine, "/addons/theirs/logs/%6Catest") == {:error, :forbidden}
+      assert decide(mine, "/addons/mine/%73ecurity", "POST") == {:error, :forbidden}
+      assert decide(mine, "/addons/%76agus/info") == {:error, :forbidden}
+      assert decide(mine, "/addons/vagus/%69nfo") == {:error, :forbidden}
+      assert decide(mine, "/ingress/%73ession", "POST") == {:error, :forbidden}
+      assert decide(mine, "/services/%6Dysql") == {:error, :forbidden}
+      assert decide(app("mine"), "/%61uth") == {:error, :forbidden}
+      assert decide(app("mine"), "/services/mq%74t") == {:error, :forbidden}
+      # Decoding happens once: this names nobody.
+      assert decide(mine, "/addons/%2573elf/stats") == {:error, :forbidden}
+    end
+
+    test "a tier's refusal is answered as one, whichever spelling the tier refused" do
+      default = app("mine", %{hassio_role: "default"})
+
+      # Raw, no row: admin. Decoded, the auth row and its predicate.
+      for method <- ~w(GET POST DELETE) do
+        assert decide(default, "/%61uth", method) == {:error, :forbidden}
+        assert answer(default, "/%61uth", method) == {403, "unauthorized"}
+      end
+
+      assert answer(app("mine"), "/%61uth") ==
+               {403, "Caller is not allowed to access the auth API"}
+    end
+
+    test "no single-byte encoding of a predicate row is graded more leniently" do
+      principals = [
+        :supervisor,
+        app("core_ssh"),
+        app("other"),
+        app("other", %{auth_api: true, services_role: %{"mqtt" => "provide"}}),
+        app("core_ssh", %{hassio_role: "default"}),
+        app("other", %{hassio_api: false})
+      ]
+
+      rows = for row <- @fixture, row["predicates"] != %{} or row["path"] =~ "vagus", do: row
+      assert length(rows) >= 20
+
+      for row <- rows,
+          path <- [row["path"], String.replace(row["path"], "core_ssh", "vagus")],
+          segs = segments(path),
+          index <- 0..(length(segs) - 1),
+          at <- 0..(byte_size(Enum.at(segs, index)) - 1),
+          principal <- principals do
+        <<head::binary-size(^at), byte, tail::binary>> = Enum.at(segs, index)
+
+        encoded =
+          "/" <>
+            Enum.join(
+              List.replace_at(segs, index, head <> "%" <> Base.encode16(<<byte>>) <> tail),
+              "/"
+            )
+
+        if decide(principal, encoded, row["method"]) == :ok do
+          assert decide(principal, path, row["method"]) == :ok,
+                 "#{encoded} admits #{inspect(principal)}; #{path} does not"
+        end
+      end
+    end
+  end
+
+  describe "answer/3" do
+    defp answer(principal, path, method \\ "GET"),
+      do: Authz.answer(principal, {:rest, :supervisor_api, method, segments(path)}, ctx(path))
+
+    test "raises for a caller who was not refused as forbidden" do
+      for {who, path} <- [
+            {principal(:admin), "/store"},
+            {:supervisor, "/core/restart"},
+            {:anonymous, "/store"},
+            {:supervisor, "/core/api/hassio/x"}
+          ] do
+        assert_raise ArgumentError, ~r/is for a :forbidden refusal/, fn -> answer(who, path) end
+      end
+    end
+
+    # The envelope is JSON, which such a name cannot be written into.
+    test "a service name that is not UTF-8 is refused without being echoed" do
+      mine = app("mine")
+
+      for {method, message} <- [
+            {"GET", "Caller not authorized for this service"},
+            {"POST", "Caller may not provide this service"},
+            {"DELETE", "Caller may not delete this service"}
+          ] do
+        assert decide(mine, "/services/%FF", method) == {:error, :forbidden}
+        assert answer(mine, "/services/%FF", method) == {403, message}
+        assert answer(mine, "/services/mq%C3%28tt", method) == {403, message}
+      end
+    end
+
+    test "a lattice refusal is the plain 403" do
+      assert answer(principal(:default), "/store") == {403, "unauthorized"}
+      assert answer(principal(:none), "/addons/probe/stats") == {403, "unauthorized"}
+      assert answer(principal(:manager), "/ingress/session", "POST") == {403, "unauthorized"}
+    end
+
+    # A predicate refuses every method. Where the router serves none, the
+    # caller is told what the router would have said.
+    test "a predicate refusal on a method the route does not serve is the router's 404" do
+      mine = app("mine")
+
+      for {path, method} <- [
+            {"/addons/theirs/info", "POST"},
+            {"/addons/theirs/stats", "DELETE"},
+            {"/addons/mine/security", "GET"},
+            {"/ingress/session", "GET"},
+            {"/auth", "DELETE"},
+            {"/services/mqtt", "PUT"},
+            {"/services/mqtt", "get"}
+          ] do
+        assert decide(mine, path, method) == {:error, :forbidden}
+        assert answer(mine, path, method) == {404, "not found"}, "#{method} #{path}"
+      end
+
+      # A tier refusal is 403 whatever the method.
+      assert answer(principal(:default), "/addons/probe/stats", "POST") == {403, "unauthorized"}
+    end
+
+    # Every method the router serves on a predicate row's path has an answer,
+    # and no other does: a route added there has to be given one.
+    test "a row answers exactly the methods the router serves on its path" do
+      routed = Enum.group_by(@fixture, & &1["path"], & &1["method"])
+      rows = for row <- @fixture, row["predicates"] != %{}, do: row
+      assert rows != []
+
+      for row <- rows do
+        {_requirement, columns} =
+          row["path"] |> segments() |> Vagus.API.Tiers.required_with_predicates()
+
+        assert columns[:answer] |> Map.keys() |> Enum.sort() == Enum.sort(routed[row["path"]]),
+               row["path"]
+      end
+    end
+
+    test "a predicate refusal is what the row's handler says" do
+      mine = app("mine")
+      not_yours = {403, "Not authorized for this add-on"}
+
+      for tail <- ~w(info stats logs logs/latest logs/follow logs/boots/0 logs/boots/0/follow) do
+        assert answer(mine, "/addons/theirs/#{tail}") == not_yours, tail
+      end
+
+      assert answer(mine, "/addons/vagus/info") == not_yours
+
+      assert answer(mine, "/addons/theirs/options/config") ==
+               {403, "This can be only read by the app itself!"}
+
+      assert answer(mine, "/addons/mine/security", "POST") == {403, "unauthorized"}
+      assert answer(mine, "/ingress/session", "POST") == {401, "unauthorized"}
+      assert answer(mine, "/ingress/validate_session", "POST") == {401, "unauthorized"}
+
+      auth = {403, "Caller is not allowed to access the auth API"}
+      assert answer(mine, "/auth") == auth
+      assert answer(:supervisor, "/auth", "POST") == auth
+    end
+
+    test "a refused service is named as its handler names it, by method" do
+      mine = app("mine")
+
+      assert answer(mine, "/services/mqtt", "GET") == {403, "Caller not authorized for 'mqtt'"}
+      assert answer(mine, "/services/mqtt", "POST") == {403, "Caller may not provide 'mqtt'"}
+      assert answer(mine, "/services/mqtt", "DELETE") == {403, "Caller may not delete 'mqtt'"}
+      # The decoded segment, as the handler would have read it.
+      assert answer(mine, "/services/my%20sql", "GET") ==
+               {403, "Caller not authorized for 'my sql'"}
+    end
+  end
+
   describe "refusal_label/1" do
     test "names the requirement, never the path" do
       label = fn path ->
@@ -292,6 +642,24 @@ defmodule Vagus.API.AuthzTest do
       assert label.("/core/%72estart") == "authz/supervisor"
       # raw admin, decoded bypass
       assert label.("/%69nfo") == "authz/admin"
+    end
+
+    test "names the predicates a row carries, and still never the path" do
+      label = fn path ->
+        Authz.refusal_label({:rest, :supervisor_api, "GET", segments(path)}, ctx(path))
+      end
+
+      assert label.("/addons/zz-marker\e[31m/info") == "authz/default+subject"
+      assert label.("/addons/zz-marker/stats") == "authz/manager+subject"
+      assert label.("/addons/zz-marker/security") == "authz/admin+caller"
+      assert label.("/ingress/session") == "authz/admin+caller"
+      assert label.("/auth") == "authz/bypass+requires"
+      assert label.("/services/zz-marker") == "authz/bypass+requires"
+      # A handler-decided row has nothing the table enforces to name.
+      assert label.("/discovery") == "authz/bypass"
+      # The stricter requirement, and the predicates of either spelling.
+      assert label.("/%61uth") == "authz/admin+requires"
+      assert label.("/addons/%73elf/info") == "authz/default+subject"
     end
   end
 end

@@ -33,7 +33,7 @@ defmodule Vagus.API.Router do
   alias Vagus.Addon.{Availability, OptionsSchema, Ports, Store, StoreView}
   alias Vagus.Addon.Backend.Native
   alias Vagus.Addon.Store.Assets
-  alias Vagus.API.{AdminPanel, Envelope, StaticData, SupervisorOptions, Tiers}
+  alias Vagus.API.{AdminPanel, Envelope, Refusal, StaticData, SupervisorOptions, Tiers}
   alias Vagus.App
   alias Vagus.App.Policy
   alias Vagus.Backend
@@ -631,10 +631,11 @@ defmodule Vagus.API.Router do
 
   # Non-supervisor callers get the byte-identical 403 a foreign slug produces,
   # so the reserved slug is indistinguishable from any other unauthorized one.
+  # `Vagus.API.Tiers`' `["addons", "vagus", "info"]` row answers it first.
   defp synthetic_info(conn, :supervisor), do: Envelope.send_ok(conn, AdminPanel.info())
 
   defp synthetic_info(conn, _caller),
-    do: Envelope.send_error(conn, "Not authorized for this add-on", 403)
+    do: refuse(conn, :not_this_app)
 
   defp addon_info(conn, slug, caller) do
     with {:ok, resolved} <- resolve_info_slug(slug, caller),
@@ -654,7 +655,7 @@ defmodule Vagus.API.Router do
 
       Envelope.send_ok(conn, Vagus.Addon.Info.render(config, state, options, settings))
     else
-      {:error, :forbidden} -> Envelope.send_error(conn, "Not authorized for this add-on", 403)
+      {:error, :forbidden} -> refuse(conn, :not_this_app)
       _ -> uninstalled_addon_info(conn, slug)
     end
   end
@@ -697,10 +698,13 @@ defmodule Vagus.API.Router do
   # `self` is permitted (the real handler 403s any other slug); `self` resolves
   # to the calling add-on. The effective options are exactly what
   # the app's start wrote to its `/data/options.json`.
+  #
+  # `Vagus.API.Tiers`' `subject: :self` row refuses another app's slug first.
+  # An app's own slug written out passes that row and is refused here.
   get "/addons/:slug/options/config" do
     cond do
       slug != "self" ->
-        Envelope.send_error(conn, "This can be only read by the app itself!", 403)
+        refuse(conn, :self_only)
 
       match?({:addon, _}, conn.assigns.caller) ->
         {:addon, %{slug: caller_slug}} = conn.assigns.caller
@@ -856,7 +860,7 @@ defmodule Vagus.API.Router do
         Envelope.send_ok(conn, CoreStats.build!(container_stats("addon_#{resolved}")))
 
       {:error, :forbidden} ->
-        Envelope.send_error(conn, "Not authorized for this add-on", 403)
+        refuse(conn, :not_this_app)
     end
   end
 
@@ -868,14 +872,14 @@ defmodule Vagus.API.Router do
   get "/addons/:slug/logs" do
     case resolve_info_slug(slug, conn.assigns.caller) do
       {:ok, resolved} -> send_logs(conn, "addon_#{resolved}")
-      {:error, :forbidden} -> Envelope.send_error(conn, "Not authorized for this add-on", 403)
+      {:error, :forbidden} -> refuse(conn, :not_this_app)
     end
   end
 
   get "/addons/:slug/logs/latest" do
     case resolve_info_slug(slug, conn.assigns.caller) do
       {:ok, resolved} -> send_logs(conn, "addon_#{resolved}", no_colors: true)
-      {:error, :forbidden} -> Envelope.send_error(conn, "Not authorized for this add-on", 403)
+      {:error, :forbidden} -> refuse(conn, :not_this_app)
     end
   end
 
@@ -896,7 +900,7 @@ defmodule Vagus.API.Router do
   get "/addons/:slug/logs/follow" do
     case resolve_info_slug(slug, conn.assigns.caller) do
       {:ok, resolved} -> follow_logs(conn, "addon_#{resolved}")
-      {:error, :forbidden} -> Envelope.send_error(conn, "Not authorized for this add-on", 403)
+      {:error, :forbidden} -> refuse(conn, :not_this_app)
     end
   end
 
@@ -953,14 +957,14 @@ defmodule Vagus.API.Router do
   get "/addons/:slug/logs/boots/:bootid" do
     case resolve_info_slug(slug, conn.assigns.caller) do
       {:ok, resolved} -> send_logs(conn, boot_ref(bootid, "addon_#{resolved}"))
-      {:error, :forbidden} -> Envelope.send_error(conn, "Not authorized for this add-on", 403)
+      {:error, :forbidden} -> refuse(conn, :not_this_app)
     end
   end
 
   get "/addons/:slug/logs/boots/:bootid/follow" do
     case resolve_info_slug(slug, conn.assigns.caller) do
       {:ok, resolved} -> follow_logs(conn, boot_ref(bootid, "addon_#{resolved}"))
-      {:error, :forbidden} -> Envelope.send_error(conn, "Not authorized for this add-on", 403)
+      {:error, :forbidden} -> refuse(conn, :not_this_app)
     end
   end
 
@@ -1018,7 +1022,8 @@ defmodule Vagus.API.Router do
   # 403-for-wrong-caller pattern (e.g. `supervisor_only/2`'s backup routes) —
   # upstream's `@require_home_assistant` wrapper raises `HTTPUnauthorized`
   # specifically, and the contract calls this out as the one place a
-  # wrong-caller rejection isn't a 403.
+  # wrong-caller rejection isn't a 403. `Vagus.API.Tiers`' two
+  # `["ingress", …]` rows (`caller: :supervisor`) give that 401 first.
   post "/ingress/session" do
     if conn.assigns.caller == :supervisor do
       # Core sends the requesting user's id under the wire key `user_id`
@@ -1032,7 +1037,7 @@ defmodule Vagus.API.Router do
       {:ok, token} = Vagus.Ingress.create_session(Vagus.Ingress, user_id: user_id)
       Envelope.send_ok(conn, %{session: token})
     else
-      Envelope.send_error(conn, "unauthorized", 401)
+      refuse(conn, :not_core)
     end
   end
 
@@ -1049,7 +1054,7 @@ defmodule Vagus.API.Router do
           Envelope.send_error(conn, "session is required", 400)
       end
     else
-      Envelope.send_error(conn, "unauthorized", 401)
+      refuse(conn, :not_core)
     end
   end
 
@@ -1068,6 +1073,11 @@ defmodule Vagus.API.Router do
   # because they were written before the ingress-session precedent existed.
   # `POST /discovery` and `DELETE /discovery/:uuid` are a different upstream
   # decorator (`APIForbidden`, genuinely 403) and must NOT be changed to match.
+  #
+  # `Vagus.API.Tiers` enforces only the bypass tier here and marks both rows
+  # `handler:`: a read and a write share each path, and the write's grant is
+  # in the body or the stored message. Who may read, provide or delete is
+  # decided by these four guards alone.
 
   get "/discovery" do
     if home_assistant?(conn.assigns.caller) do
@@ -1200,6 +1210,10 @@ defmodule Vagus.API.Router do
   # An add-on that provides a service (e.g. Mosquitto → mqtt) publishes its
   # connection config; Core/other add-ons read it. Access is by the caller's
   # `services_role` grant (from its config.yaml `services:`).
+  #
+  # `Vagus.API.Tiers`' `["services", :_]` row refuses an app with no role for
+  # the service first. Provide against read, and Core's read-only access, are
+  # decided only here.
 
   get "/services" do
     Envelope.send_ok(conn, %{services: Policy.services_view(App.services())})
@@ -1226,7 +1240,7 @@ defmodule Vagus.API.Router do
           Envelope.send_error(conn, message, 400)
       end
     else
-      Envelope.send_error(conn, "Caller may not provide '#{service}'", 403)
+      refuse(conn, :service, service)
     end
   end
 
@@ -1239,7 +1253,7 @@ defmodule Vagus.API.Router do
         :error -> Envelope.send_error(conn, "Service not enabled", 400)
       end
     else
-      Envelope.send_error(conn, "Caller not authorized for '#{service}'", 403)
+      refuse(conn, :service, service)
     end
   end
 
@@ -1249,7 +1263,7 @@ defmodule Vagus.API.Router do
       _ = App.withdraw_service(addon_slug(conn.assigns.caller), service)
       Envelope.send_ok(conn, %{})
     else
-      Envelope.send_error(conn, "Caller may not delete '#{service}'", 403)
+      refuse(conn, :service, service)
     end
   end
 
@@ -1259,6 +1273,7 @@ defmodule Vagus.API.Router do
   # header, JSON, or form body (in that order); the add-on itself authenticates
   # via `X-Supervisor-Token` (so the `Authorization` header is free for Basic).
   # Success → 200; failure → 401 + `WWW-Authenticate`.
+  # `Vagus.API.Tiers`' `["auth"]` row (`requires: :auth_api`) refuses first.
 
   get "/auth" do
     handle_auth(conn)
@@ -1464,7 +1479,7 @@ defmodule Vagus.API.Router do
   end
 
   match _ do
-    Envelope.send_error(conn, "not found", 404)
+    refuse(conn, :not_found)
   end
 
   defp handle_core_options(conn) do
@@ -2904,7 +2919,9 @@ defmodule Vagus.API.Router do
   # `full_access`, `host_pid` and `docker_api`. `Vagus.API.Tiers` already
   # refuses the `/addons/self/security` spelling for every add-on token
   # (`tiers.ex`'s first `api_bypass` override); resolving by slug here would
-  # have made that guard trivially bypassable.
+  # have made that guard trivially bypassable. Its
+  # `["addons", :_, "security"]` row (`caller: :supervisor`) refuses the
+  # by-slug spelling ahead of this guard as well.
   #
   # The stored value takes effect on the **next container create**, not
   # immediately — same as upstream, which re-reads `App.protected` when it
@@ -3156,7 +3173,14 @@ defmodule Vagus.API.Router do
   defp supervisor_only(conn, fun) do
     if conn.assigns.caller == :supervisor,
       do: fun.(),
-      else: Envelope.send_error(conn, "unauthorized", 403)
+      else: refuse(conn, :forbidden)
+  end
+
+  # `Vagus.API.Authz` refuses the same callers first and words it from the
+  # same place, so which of the two refused does not show.
+  defp refuse(conn, kind, subject \\ nil) do
+    {status, message} = Refusal.answer(kind, conn.method, subject)
+    Envelope.send_error(conn, message, status)
   end
 
   defp mb(bytes), do: Float.round(bytes / 1_048_576, 2)
@@ -3710,13 +3734,17 @@ defmodule Vagus.API.Router do
   # supervisor slug comes from the URL, so validate it before it's interpolated
   # into a container ref (`addon_<slug>`) or the `options.json` path — a `/` or
   # `..` must never shape a Docker ref or traverse the data root.
+  #
+  # The app half is `Vagus.API.Tiers`' `subject: :self` on the info, stats
+  # and logs rows, which refuses first. The slug check is only here.
   defp resolve_info_slug(slug, :supervisor) do
     if valid_slug?(slug), do: {:ok, slug}, else: {:error, :forbidden}
   end
 
-  defp resolve_info_slug("self", {:addon, %{slug: own}}), do: {:ok, own}
-  defp resolve_info_slug(own, {:addon, %{slug: own}}), do: {:ok, own}
-  defp resolve_info_slug(_slug, {:addon, _}), do: {:error, :forbidden}
+  defp resolve_info_slug(slug, {:addon, %{slug: own}} = caller) do
+    if Policy.own_slug?(caller, slug), do: {:ok, own}, else: {:error, :forbidden}
+  end
+
   defp resolve_info_slug(_slug, _caller), do: {:error, :forbidden}
 
   # Add-on slugs are `RE_SLUG` (`[A-Za-z0-9._-]`); additionally forbid `..` so
@@ -3728,22 +3756,23 @@ defmodule Vagus.API.Router do
   # -- auth helpers ----------------------------------------------------------
 
   defp handle_auth(conn) do
-    case conn.assigns.caller do
-      {:addon, %{auth_api: true, slug: slug}} ->
-        case extract_credentials(conn) do
-          {:ok, username, password} ->
-            if Vagus.Auth.check_login(username, password, slug) do
-              Envelope.send_ok(conn, %{})
-            else
-              unauthorized_basic(conn)
-            end
+    caller = conn.assigns.caller
 
-          :error ->
+    with true <- Policy.may_authenticate?(caller),
+         {:addon, %{slug: slug}} <- caller do
+      case extract_credentials(conn) do
+        {:ok, username, password} ->
+          if Vagus.Auth.check_login(username, password, slug) do
+            Envelope.send_ok(conn, %{})
+          else
             unauthorized_basic(conn)
-        end
+          end
 
-      _ ->
-        Envelope.send_error(conn, "Caller is not allowed to access the auth API", 403)
+        :error ->
+          unauthorized_basic(conn)
+      end
+    else
+      _ -> refuse(conn, :no_auth_api)
     end
   end
 

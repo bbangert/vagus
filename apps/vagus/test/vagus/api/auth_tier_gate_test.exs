@@ -286,6 +286,269 @@ defmodule Vagus.API.AuthTierGateTest do
     end
   end
 
+  # The grants a handler used to decide alone. The handler's guard is still
+  # there; what is pinned here is that the table refuses first, with the
+  # status and message the handler gives.
+  describe "a predicate refuses at the gate, before the handler" do
+    import ExUnit.CaptureLog
+
+    defp gate_refusal(method, path, token) do
+      {conn, log} = with_log(fn -> call(method, path, token) end)
+
+      refute Map.has_key?(conn.private, :plug_route), "#{path} reached :match"
+      [_line, label] = Regex.run(~r/refused a request \(([^)]*)\)/, log)
+      {conn.status, Jason.decode!(conn.resp_body), label}
+    end
+
+    defp refused(message), do: %{"result" => "error", "message" => message}
+
+    setup do
+      install_app(app_config("pred_gate_theirs"))
+      :ok
+    end
+
+    test "another app's info, stats and logs" do
+      default = addon_token("pred_gate_default", %{hassio_api: true, hassio_role: "default"})
+      manager = addon_token("pred_gate_manager", %{hassio_api: true, hassio_role: "manager"})
+      not_yours = refused("Not authorized for this add-on")
+
+      assert gate_refusal(:get, "/addons/pred_gate_theirs/info", default) ==
+               {403, not_yours, "authz/default+subject"}
+
+      for tail <- ~w(stats logs logs/latest logs/follow logs/boots/0 logs/boots/0/follow) do
+        assert gate_refusal(:get, "/addons/pred_gate_theirs/#{tail}", manager) ==
+                 {403, not_yours, "authz/manager+subject"},
+               tail
+      end
+    end
+
+    test "the reserved panel slug's info" do
+      admin = addon_token("pred_gate_admin", %{hassio_api: true, hassio_role: "admin"})
+
+      assert gate_refusal(:get, "/addons/vagus/info", admin) ==
+               {403, refused("Not authorized for this add-on"), "authz/default+caller"}
+    end
+
+    test "another app's effective options" do
+      manager = addon_token("pred_gate_manager", %{hassio_api: true, hassio_role: "manager"})
+
+      assert gate_refusal(:get, "/addons/pred_gate_theirs/options/config", manager) ==
+               {403, refused("This can be only read by the app itself!"), "authz/manager+subject"}
+    end
+
+    test "an admin app setting protection, its own included" do
+      admin = addon_token("pred_gate_admin", %{hassio_api: true, hassio_role: "admin"})
+
+      for slug <- ~w(pred_gate_admin pred_gate_theirs) do
+        assert gate_refusal(:post, "/addons/#{slug}/security", admin) ==
+                 {403, refused("unauthorized"), "authz/admin+caller"}
+      end
+
+      assert {:ok, %{protected: true}} = app_info("pred_gate_admin")
+    end
+
+    # 401, as upstream's `require_home_assistant` answers.
+    test "an admin app opening or validating an ingress session" do
+      admin = addon_token("pred_gate_admin", %{hassio_api: true, hassio_role: "admin"})
+
+      for path <- ~w(/ingress/session /ingress/validate_session) do
+        assert gate_refusal(:post, path, admin) ==
+                 {401, refused("unauthorized"), "authz/admin+caller"}
+      end
+    end
+
+    test "the auth API without auth_api, Core included" do
+      admin = addon_token("pred_gate_admin", %{hassio_api: true, hassio_role: "admin"})
+
+      answer =
+        {403, refused("Caller is not allowed to access the auth API"), "authz/bypass+requires"}
+
+      for method <- [:get, :post], token <- [admin, Token.get()] do
+        assert gate_refusal(method, "/auth", token) == answer
+      end
+    end
+
+    test "a service the app declares no role for" do
+      manager = addon_token("pred_gate_manager", %{hassio_api: true, hassio_role: "manager"})
+
+      for {method, message} <- [
+            get: "Caller not authorized for 'mqtt'",
+            post: "Caller may not provide 'mqtt'",
+            delete: "Caller may not delete 'mqtt'"
+          ] do
+        assert gate_refusal(method, "/services/mqtt", manager) ==
+                 {403, refused(message), "authz/bypass+requires"}
+      end
+    end
+
+    # The predicate refuses whatever the method; the answer is the router's.
+    test "a method the route does not serve is still a 404" do
+      manager = addon_token("pred_gate_manager", %{hassio_api: true, hassio_role: "manager"})
+
+      for {method, path, label} <- [
+            {:post, "/addons/pred_gate_theirs/info", "authz/default+subject"},
+            {:get, "/addons/pred_gate_theirs/security", "authz/admin+caller"},
+            {:put, "/services/mqtt", "authz/bypass+requires"}
+          ] do
+        token =
+          if path =~ "security",
+            do: addon_token("pred_gate_admin", %{hassio_api: true, hassio_role: "admin"}),
+            else: manager
+
+        assert gate_refusal(method, path, token) == {404, refused("not found"), label}
+      end
+    end
+
+    test "an encoded spelling of another app's slug, or of the route" do
+      default = addon_token("pred_gate_default", %{hassio_api: true, hassio_role: "default"})
+      manager = addon_token("pred_gate_manager", %{hassio_api: true, hassio_role: "manager"})
+      not_yours = refused("Not authorized for this add-on")
+
+      assert gate_refusal(:get, "/addons/%70red_gate_theirs/info", default) ==
+               {403, not_yours, "authz/default+subject"}
+
+      # Raw, this is the manager family, which a default app does not reach.
+      assert gate_refusal(:get, "/addons/pred_gate_theirs/%69nfo", default) ==
+               {403, refused("unauthorized"), "authz/manager+subject"}
+
+      assert gate_refusal(:get, "/addons/pred_gate_theirs/%69nfo", manager) ==
+               {403, not_yours, "authz/manager+subject"}
+    end
+
+    test "an encoded spelling of the caller's own slug still reaches its handler" do
+      default = addon_token("pred_gate_default", %{hassio_api: true, hassio_role: "default"})
+
+      for path <- ["/addons/%70red_gate_default/info", "/addons/%73elf/info"] do
+        conn = call(:get, path, default)
+
+        assert conn.status == 200, path
+        assert {"/addons/:slug/info", _handler} = conn.private.plug_route
+      end
+    end
+
+    test "on device, the refusal is cast to the guard's authz bucket" do
+      prev = Application.get_env(:vagus, :api_source_guard)
+      Application.put_env(:vagus, :api_source_guard, true)
+
+      on_exit(fn ->
+        if is_nil(prev),
+          do: Application.delete_env(:vagus, :api_source_guard),
+          else: Application.put_env(:vagus, :api_source_guard, prev)
+      end)
+
+      Process.register(self(), Vagus.API.SourceGuard)
+      manager = addon_token("pred_gate_device", %{hassio_api: true, hassio_role: "manager"})
+
+      log =
+        capture_log(fn ->
+          assert call(:get, "/addons/pred_gate_theirs/stats", manager).status == 403
+        end)
+
+      refute log =~ "authz/"
+      assert_received {:"$gen_cast", {:filtered, :authz, "authz/manager+subject"}}
+      refute_received {:"$gen_cast", _other}
+    end
+
+    test "a caller holding the grant reaches the handler, and nothing is counted" do
+      default =
+        addon_token("pred_gate_holder", %{
+          hassio_api: true,
+          hassio_role: "default",
+          auth_api: true,
+          services_role: %{"mqtt" => "want"}
+        })
+
+      for {method, path} <- [
+            get: "/addons/pred_gate_holder/info",
+            get: "/addons/self/info",
+            get: "/auth",
+            get: "/services/mqtt"
+          ] do
+        {conn, log} = with_log(fn -> call(method, path, default) end)
+
+        assert {_route, _handler} = conn.private.plug_route
+        refute log =~ "authz/", path
+      end
+
+      {conn, log} = with_log(fn -> call_as_core(:get, "/addons/pred_gate_theirs/info") end)
+      assert conn.status == 200
+      refute log =~ "authz/"
+    end
+
+    # Neither the service a body names nor a message's owner is in the path.
+    test "the discovery rows are left to the handler" do
+      owner =
+        addon_token("pred_gate_disc_owner", %{
+          hassio_api: true,
+          hassio_role: "default",
+          discovery: ["mqtt"]
+        })
+
+      admin = addon_token("pred_gate_admin", %{hassio_api: true, hassio_role: "admin"})
+      message = Jason.encode!(%{service: "mqtt", config: %{}})
+
+      discovery = fn method, path, body, token ->
+        with_log(fn ->
+          conn(method, path, body)
+          |> put_req_header("content-type", "application/json")
+          |> put_req_header("x-supervisor-token", token)
+          |> Router.call(@opts)
+        end)
+      end
+
+      {created, _log} = discovery.(:post, "/discovery", message, owner)
+      assert %{"data" => %{"uuid" => uuid}} = Jason.decode!(created.resp_body)
+
+      for {method, path, body, status, said} <- [
+            {:get, "/discovery", nil, 401, "unauthorized"},
+            {:get, "/discovery/#{uuid}", nil, 401, "unauthorized"},
+            {:post, "/discovery", message, 403, "Caller may not provide this discovery"},
+            {:delete, "/discovery/#{uuid}", nil, 403, "Caller does not own this discovery"}
+          ] do
+        {conn, log} = discovery.(method, path, body, admin)
+
+        assert {conn.status, Jason.decode!(conn.resp_body)} == {status, refused(said)},
+               "#{method} #{path}"
+
+        assert {_route, _handler} = conn.private.plug_route
+        refute log =~ "authz/", path
+      end
+
+      {deleted, _log} = discovery.(:delete, "/discovery/#{uuid}", nil, owner)
+      assert deleted.status == 200
+    end
+
+    # The message would otherwise carry bytes JSON cannot hold, and the
+    # envelope raised: a 500 from the gate and from the handler alike.
+    test "a service name that is not UTF-8 is refused, by the gate and by the handler" do
+      manager = addon_token("pred_gate_manager", %{hassio_api: true, hassio_role: "manager"})
+
+      for {method, message} <- [
+            get: "Caller not authorized for this service",
+            post: "Caller may not provide this service",
+            delete: "Caller may not delete this service"
+          ] do
+        assert gate_refusal(method, "/services/zz%FFmarker", manager) ==
+                 {403, refused(message), "authz/bypass+requires"}
+      end
+
+      # Core may read any service, so only the handler refuses it a write.
+      for {method, message} <- [
+            post: "Caller may not provide this service",
+            delete: "Caller may not delete this service"
+          ] do
+        {conn, log} = with_log(fn -> call_as_core(method, "/services/zz%FFmarker") end)
+
+        assert {conn.status, Jason.decode!(conn.resp_body)} == {403, refused(message)}
+        assert {"/services/:service", _handler} = conn.private.plug_route
+        refute log =~ "marker"
+      end
+
+      {_conn, log} = with_log(fn -> call(:get, "/services/zz%FFmarker", manager) end)
+      refute log =~ "marker"
+    end
+  end
+
   describe "Core keeps everything" do
     @fixture Path.expand("../../fixtures/vagus-authz-table.json", __DIR__)
              |> File.read!()
@@ -295,6 +558,9 @@ defmodule Vagus.API.AuthTierGateTest do
     # `Router.match/2` records the route it chose without running it, so
     # this tells a real route from the catch-all without a handler's own 404
     # getting in the way, and without restarting Core or the host.
+    #
+    # The auth API's two routes are the exception: `auth_api` is an app's
+    # grant, and their handler refused Core before the table did.
     test "every fixture row passes the gate and matches the route it names" do
       for row <- @fixture do
         conn =
@@ -303,9 +569,15 @@ defmodule Vagus.API.AuthTierGateTest do
           |> String.to_existing_atom()
           |> conn(row["path"])
           |> put_req_header("authorization", "Bearer " <> Token.get())
-          |> Vagus.API.Auth.call([])
 
-        refute conn.halted, "Core was refused #{row["method"]} #{row["path"]}"
+        gated = Vagus.API.Auth.call(conn, [])
+
+        if row["predicates"] == %{"requires" => "auth_api"} do
+          assert row["path"] == "/auth"
+          assert gated.status == 403
+        else
+          refute gated.halted, "Core was refused #{row["method"]} #{row["path"]}"
+        end
 
         assert {route, _handler} = Router.match(conn, []).private.plug_route
         assert route == row["route"], "#{row["method"]} #{row["path"]} matched #{route}"

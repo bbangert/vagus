@@ -3,8 +3,9 @@ defmodule Vagus.API.TiersTest do
   The tier table, pinned.
 
   Routes are pinned by `test/fixtures/vagus-authz-table.json`: one row per
-  route `Vagus.API.Router` registers, with the tier the table demands, the
-  tier upstream's `security.py` demands, and how the two compare. The route
+  route `Vagus.API.Router` registers, with the tier and the predicates the
+  table demands, the tier upstream's `security.py` demands, and how the two
+  compare. The route
   list is read from the router's source (`Vagus.RouterRoutes`) so that a
   route nobody graded fails here: a hand-kept list has nothing to fail it.
 
@@ -57,6 +58,15 @@ defmodule Vagus.API.TiersTest do
 
   defp segments(path), do: path |> String.split("/", trim: true)
 
+  # A row's columns as the fixture's JSON spells them.
+  defp pinned(columns),
+    do: Map.new(columns, fn {name, value} -> {"#{name}", pinned_value(value)} end)
+
+  defp pinned_value(value) when is_tuple(value),
+    do: value |> Tuple.to_list() |> Enum.map(&pinned_value/1)
+
+  defp pinned_value(value), do: "#{value}"
+
   defp admitted(name), do: MapSet.new(Map.fetch!(@admits, Map.get(@upstream_names, name, name)))
 
   defp compare(vagus, upstream) do
@@ -84,21 +94,85 @@ defmodule Vagus.API.TiersTest do
 
         assert actual == row["requirement"],
                "#{row["method"]} #{row["path"]} requires #{actual}, pinned as #{row["requirement"]}"
-
-        assert row["predicates"] == %{}
       end
     end
 
-    test "no route is looser than upstream, and every row says how it compares" do
+    test "every route carries the predicates and the handler note its row pins" do
       for row <- @fixture do
-        computed = compare(admitted(row["requirement"]), admitted(row["upstream_tier"]))
+        {requirement, columns} = row["path"] |> segments() |> Tiers.required_with_predicates()
         label = "#{row["method"]} #{row["path"]}"
 
-        refute computed == "looser",
+        assert Atom.to_string(requirement) == row["requirement"], label
+        assert columns |> Tiers.predicates() |> pinned() == row["predicates"], label
+
+        assert columns |> Keyword.take([:handler]) |> pinned() |> Map.get("handler") ==
+                 row["handler"],
+               label
+      end
+
+      shapes = @fixture |> Enum.map(& &1["predicates"]) |> MapSet.new()
+
+      assert shapes ==
+               MapSet.new([
+                 %{},
+                 %{"caller" => "supervisor"},
+                 %{"requires" => "auth_api"},
+                 %{"requires" => ["services_role", "any"]},
+                 %{"subject" => "self"}
+               ])
+    end
+
+    # The comparison is of tiers alone, and neither a predicate nor a handler
+    # note enters it: a row cannot buy a looser tier with either.
+    test "no route is looser than upstream, and every row says how it compares" do
+      for row <- @fixture do
+        by_tier = compare(admitted(row["requirement"]), admitted(row["upstream_tier"]))
+        label = "#{row["method"]} #{row["path"]}"
+
+        refute by_tier == "looser",
                "#{label}: #{row["requirement"]} admits a caller upstream's " <>
                  "#{row["upstream_tier"]} refuses"
 
-        assert row["classification"] == computed, "#{label} is #{computed}"
+        # A predicate only narrows whom the tier admits. That is parity where
+        # upstream's own handler narrows the same way, and stricter otherwise.
+        # `subject: :self` narrows nothing on a path that says `self`: every
+        # app is its own subject there.
+        names_self? =
+          row["predicates"] == %{"subject" => "self"} and
+            Enum.at(segments(row["path"]), 1) == "self"
+
+        narrows? =
+          row["predicates"] != %{} and not Map.has_key?(row, "upstream_handler") and
+            not names_self?
+
+        expected = if narrows?, do: "stricter", else: by_tier
+
+        assert row["classification"] == expected, "#{label} is #{expected}"
+      end
+    end
+
+    # Leaving a grant to the handler is allowed only where upstream's
+    # middleware leaves it to its handler too, and the row has to say where.
+    test "a row left to its handler enforces nothing and names upstream's check" do
+      left = for %{"handler" => _reason} = row <- @fixture, do: row
+
+      assert Enum.map(left, &{&1["method"], &1["route"]}) == [
+               {"GET", "/discovery"},
+               {"GET", "/discovery/:uuid"},
+               {"POST", "/discovery"},
+               {"DELETE", "/discovery/:uuid"}
+             ]
+
+      for row <- left do
+        assert row["predicates"] == %{}
+        assert is_binary(row["handler"]) and row["handler"] != ""
+      end
+
+      for %{"upstream_handler" => cited} = row <- @fixture do
+        assert is_binary(cited) and cited != ""
+
+        assert row["predicates"] != %{} or Map.has_key?(row, "handler"),
+               "#{row["method"]} #{row["path"]} cites a handler check for nothing"
       end
     end
 
@@ -156,6 +230,124 @@ defmodule Vagus.API.TiersTest do
           ] do
         assert_raise RuntimeError, ~r/is a route this module cannot read/, fn ->
           RouterRoutes.parse(router(body))
+        end
+      end
+    end
+  end
+
+  # First match wins, so a value in a parameter position can hand a path to
+  # an earlier row: a boot id of `info` is `/.+/info`. A predicate row's paths
+  # have to keep the predicate whatever the parameters are.
+  describe "shadowing" do
+    @literals Tiers.rows()
+              |> Enum.flat_map(&elem(&1, 0))
+              |> Enum.filter(&is_binary/1)
+              |> Enum.uniq()
+
+    defp fill(pattern, at, value) do
+      pattern
+      |> Enum.with_index()
+      |> Enum.map(fn
+        {:_, ^at} -> value
+        {:_, _other} -> "zz"
+        {literal, _index} when is_binary(literal) -> literal
+      end)
+    end
+
+    # The same predicates, or a row no app passes at all. The tier may
+    # differ: that is upstream's to say, and the fixture pins it.
+    defp keeps?(columns, {chosen_requirement, chosen}) do
+      chosen_requirement == :supervisor or chosen[:caller] == :supervisor or
+        Tiers.predicates(chosen) == Tiers.predicates(columns)
+    end
+
+    test "no parameter value moves a predicate row's path to a row without the predicate" do
+      rows =
+        for {_pattern, _requirement, columns} = row <- Tiers.rows(),
+            Tiers.predicates(columns) != [],
+            do: row
+
+      assert length(rows) >= 14
+      assert "info" in @literals and "self" in @literals
+
+      for {pattern, _requirement, columns} <- rows,
+          {:_, at} <- Enum.with_index(pattern),
+          value <- ["zz" | @literals],
+          # `self` is what `subject: :self` asks for, so the literal-`self`
+          # rows need no predicate to say it.
+          not (value == "self" and at == 1 and columns[:subject] == :self) do
+        path = fill(pattern, at, value)
+
+        assert keeps?(columns, Tiers.required_with_predicates(path)),
+               "/#{Enum.join(path, "/")} is not held to #{inspect(Tiers.predicates(columns))}"
+      end
+    end
+
+    test "a boot id of `info` keeps upstream's tier and the app's own-slug rule" do
+      assert {:default, columns} =
+               Tiers.required_with_predicates(~w(addons core_ssh logs boots info))
+
+      assert Tiers.predicates(columns) == [subject: :self]
+
+      assert {:manager, _columns} =
+               Tiers.required_with_predicates(~w(addons core_ssh logs boots 0))
+    end
+  end
+
+  describe "a row is checked when the table is compiled" do
+    alias Vagus.API.Tiers.Row
+
+    @good {["addons", :_, "stats"], :manager, subject: :self, answer: %{"GET" => :not_this_app}}
+
+    test "a well-formed row passes, and a bare one gains empty columns" do
+      assert Row.validate!(@good) == @good
+      assert Row.validate!({["info"], :bypass}) == {["info"], :bypass, []}
+    end
+
+    test "each malformed row raises" do
+      answer = %{"GET" => :forbidden}
+
+      for {columns, fault} <- [
+            {[caller: :core, answer: answer], "unknown predicate"},
+            {[subject: :own, answer: answer], "unknown predicate"},
+            {[requires: {:services_role, :provide}, answer: answer], "unknown predicate"},
+            {[subjcet: :self, answer: answer], "unknown columns"},
+            {[subject: :self, subject: :self, answer: answer], "given twice"},
+            {[subject: :self], "answers exactly when"},
+            {[answer: answer], "answers exactly when"},
+            {[subject: :self, answer: %{"get" => :forbidden}], "answer: maps"},
+            {[subject: :self, answer: %{get: :forbidden}], "answer: maps"},
+            {[subject: :self, answer: %{"GET" => {403, "no"}}], "answer: maps"},
+            {[subject: :self, answer: %{"GET" => :nonsense}], "answer: maps"},
+            {[subject: :self, answer: %{}], "answer: maps"},
+            {[subject: :self, handler: :ownership, answer: answer], "enforces nothing"},
+            {[handler: "ownership"], "takes an atom"}
+          ] do
+        assert_raise ArgumentError, ~r/#{fault}/, fn ->
+          Row.validate!({["addons", :_, "stats"], :manager, columns})
+        end
+      end
+
+      for pattern <- [["addons", "self", "stats"], ["addons", "x", :_], ["addons", :_, :+]] do
+        assert_raise ArgumentError, fn ->
+          Row.validate!({pattern, :manager, subject: :self, answer: answer})
+        end
+      end
+    end
+
+    # As `Vagus.API.Tiers` uses it: in a module body, so the build stops.
+    test "a malformed row stops its module compiling" do
+      for columns <- ["caller: :core", "subject: :self, subject: :self"] do
+        assert_raise ArgumentError, fn ->
+          Code.compile_string("""
+          defmodule Vagus.API.TiersTest.BadTable do
+            @rows Enum.map(
+                    [{["addons", :_, "x"], :admin, #{columns}, answer: %{"GET" => :forbidden}}],
+                    &Vagus.API.Tiers.Row.validate!/1
+                  )
+            def rows, do: @rows
+          end
+          """)
         end
       end
     end
