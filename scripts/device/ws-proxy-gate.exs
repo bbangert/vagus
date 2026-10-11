@@ -4,6 +4,10 @@
 # because the proxy authenticates the app's own SUPERVISOR_TOKEN and the
 # source guard admits only the hassio bridge.
 #
+# `observe?` is prepended by the launcher. Each case carries the outcome the
+# fixed build produces; any mismatch raises so the eval endpoint reports
+# ok:false (unless observing an unfixed build).
+#
 # Raw frames on purpose: a client library would refuse to send a duplicated
 # key or invalid JSON, and those are the cases under test.
 recv = fn recv, st, deadline ->
@@ -96,29 +100,29 @@ end
 sup = ~s("type":"supervisor/api","endpoint":"/supervisor/info","method":"get")
 api = fn id, endpoint, method -> ~s({"id":#{id},"type":"supervisor/api","endpoint":"#{endpoint}","method":"#{method}"}) end
 cases = [
-  {"a_batch_reserved", ~s([{"id":1,#{sup}}])},
-  {"b_batch_mixed", ~s([{"id":1,#{sup}},{"id":2,"type":"ping"}])},
-  {"d_dup_type_reserved_last", ~s({"id":6,"type":"ping","endpoint":"/supervisor/info","method":"get","type":"supervisor/api"})},
-  {"e_nonstring_type", ~s({"id":7,"type":5})},
-  {"f_batch_nonobject", ~s([{"id":1,"type":"ping"},5])},
-  {"g_invalid_json", "{not json"},
-  {"h_ordinary_single", ~s({"id":9,"type":"get_config"})},
-  {"i_ordinary_batch", ~s([{"id":10,"type":"ping"}])},
-  {"j_call_service", ~s({"id":11,"type":"call_service","domain":"persistent_notification","service":"dismiss","service_data":{"notification_id":"vagus-gate-nonexistent"}})},
-  {"k_supervisor_event", ~s({"id":12,"type":"supervisor/event","data":{"event":"x"}})},
-  {"l_api_ping", api.(20, "/supervisor/ping", "get")},
-  {"m_api_self_info", api.(21, "/addons/self/info", "get")},
-  {"n_api_supervisor_info_no_role", api.(22, "/supervisor/info", "get")},
-  {"o_api_foreign_app_info", api.(23, "/addons/core_mqtt/info", "get")},
-  {"p_api_reserved_core_view", api.(24, "/core/api/hassio/app/entrypoint.js", "get")},
-  {"q_api_core_proxy_family", api.(25, "/core/api/config", "get")},
-  {"r_api_logs_follow", api.(26, "/addons/self/logs/follow", "get")},
-  {"s_api_encoded_endpoint", api.(27, "/addons/%73elf/info", "get")},
-  {"t_api_post_core_check", api.(28, "/core/check", "post")},
-  {"u_api_unknown_path", api.(29, "/nope", "get")}
+  {"a_batch_reserved", ~s([{"id":1,#{sup}}]), %{"error" => "unauthorized", "success" => false, "id" => nil}},
+  {"b_batch_mixed", ~s([{"id":1,#{sup}},{"id":2,"type":"ping"}]), %{"error" => "unauthorized", "success" => false, "id" => nil}},
+  {"d_dup_type_reserved_last", ~s({"id":6,"type":"ping","endpoint":"/supervisor/info","method":"get","type":"supervisor/api"}), %{"error" => "unauthorized", "success" => false, "id" => 6}},
+  {"e_nonstring_type", ~s({"id":7,"type":5}), %{"error" => "unauthorized", "success" => false, "id" => 7}},
+  {"f_batch_nonobject", ~s([{"id":1,"type":"ping"},5]), %{"error" => "unauthorized", "success" => false, "id" => nil}},
+  {"g_invalid_json", "{not json", %{"close" => 1000}},
+  {"h_ordinary_single", ~s({"id":9,"type":"get_config"}), %{"success" => true, "id" => 9}},
+  {"i_ordinary_batch", ~s([{"id":10,"type":"ping"}]), %{"type" => "pong", "id" => 10}},
+  {"j_call_service", ~s({"id":11,"type":"call_service","domain":"persistent_notification","service":"dismiss","service_data":{"notification_id":"vagus-gate-nonexistent"}}), %{"success" => true, "id" => 11}},
+  {"k_supervisor_event", ~s({"id":12,"type":"supervisor/event","data":{"event":"x"}}), %{"error" => "unauthorized", "success" => false, "id" => 12}},
+  {"l_api_ping", api.(20, "/supervisor/ping", "get"), %{"success" => true, "id" => 20}},
+  {"m_api_self_info", api.(21, "/addons/self/info", "get"), %{"success" => true, "id" => 21}},
+  {"n_api_supervisor_info_no_role", api.(22, "/supervisor/info", "get"), %{"error" => "unauthorized", "success" => false, "id" => 22}},
+  {"o_api_foreign_app_info", api.(23, "/addons/core_mqtt/info", "get"), %{"error" => "unauthorized", "success" => false, "id" => 23}},
+  {"p_api_reserved_core_view", api.(24, "/core/api/hassio/app/entrypoint.js", "get"), %{"error" => "unauthorized", "success" => false, "id" => 24}},
+  {"q_api_core_proxy_family", api.(25, "/core/api/config", "get"), %{"error" => "unknown_error", "success" => false, "id" => 25}},
+  {"r_api_logs_follow", api.(26, "/addons/self/logs/follow", "get"), %{"error" => "unknown_error", "success" => false, "id" => 26}},
+  {"s_api_encoded_endpoint", api.(27, "/addons/%73elf/info", "get"), %{"error" => "unknown_error", "success" => false, "id" => 27}},
+  {"t_api_post_core_check", api.(28, "/core/check", "post"), %{"error" => "unauthorized", "success" => false, "id" => 28}},
+  {"u_api_unknown_path", api.(29, "/nope", "get"), %{"error" => "unauthorized", "success" => false, "id" => 29}}
 ]
 results =
-  for {name, frame} <- cases do
+  for {name, frame, _} <- cases do
     out =
       try do
         {auth, f, ms} = one.(frame)
@@ -141,4 +145,16 @@ equal =
 rest_checks =
   for {m, p} <- [{"GET", "/supervisor/info"}, {"GET", "/addons/core_mqtt/info"}, {"POST", "/core/check"}],
       do: {m, p, rest.(m, p) |> then(fn {s, b} -> {s, is_map(b) && b["message"]} end)}
-%{utc: DateTime.utc_now() |> DateTime.to_iso8601(), slug: System.get_env("HOSTNAME"), cases: results, self_info_ws_vs_rest: equal, rest_same_token: rest_checks}
+mismatches =
+  (for {{name, out}, {name, _, exp}} <- Enum.zip(results, cases),
+       want = Map.put(exp, "auth", "auth_ok"),
+       got = Map.take(out, Map.keys(want) ++ ["exception", "caught"]),
+       got != want,
+       do: {name, want, got}) ++
+    (case Map.take(equal, ["ws_success", "rest_status", "data_equal"]) do
+       %{"ws_success" => true, "rest_status" => "200", "data_equal" => true} -> []
+       got -> [{"self_info_ws_vs_rest", %{"ws_success" => true, "rest_status" => "200", "data_equal" => true}, equal |> Map.take(["exception"]) |> Map.merge(got)}]
+     end) ++
+    (for {m, p, {s, _}} <- rest_checks, s != "403", do: {"rest_same_token " <> m <> " " <> p, "403", s})
+report = %{utc: DateTime.utc_now() |> DateTime.to_iso8601(), slug: System.get_env("HOSTNAME"), cases: results, self_info_ws_vs_rest: equal, rest_same_token: rest_checks, mismatches: mismatches}
+if mismatches != [] and not observe?, do: raise("GATE FAILED: " <> inspect(mismatches, limit: :infinity, printable_limit: :infinity)), else: report
