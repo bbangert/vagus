@@ -2,66 +2,35 @@ defmodule Vagus.API.CoreProxy.WSDispatch do
   @moduledoc """
   Core's `supervisor/api` WebSocket command, answered here as the calling app.
 
-  On Home Assistant OS the frontend sends this command to Core, and Core
-  calls the Supervisor API with its own token. Relayed from an app it would
-  hand that app Core's privilege (`Vagus.Core.Reserved`), so the frame never
-  leaves Vagus: `read/1` turns it into a request, `run/3` puts that request
-  to `Vagus.API.Router` carrying the app's own token, and `result/2` words
-  the answer as Core words its own (`hassio/websocket_api.py`,
-  `websocket_supervisor_api`, Core 2026.10.1). The app gets what the same
-  request over HTTP would have got it, or less.
+  Core answers this command by calling the Supervisor API with its own
+  token, so relayed from an app it would hand that app Core's privilege
+  (`Vagus.Core.Reserved`). It is never relayed. The request it names is put
+  to `Vagus.API.Router` carrying the app's own token instead, so what grants
+  it is the gate that grants the same request over HTTP. This module can
+  refuse a request and grants none: `CoreProxyWSEquivalenceTest` sends the
+  fixture's routes both ways and finds no call answered that HTTP refused.
+  A handler that only acts was not run there, only graded.
 
-  ## The caller is looked up again for every call
+  The token is asked for again at every call, because a socket outlives
+  what its app was granted at the handshake. It must be the token the socket
+  was opened with, by hash: a restart or a reinstall mints a new one, and a
+  socket opened with the old one is refused, as that token is over HTTP.
 
-  A socket outlives what its app was granted at the handshake. `run/3` takes
-  only the slug, asks the app's process for the token its container holds
-  now, and has `Vagus.API.Auth` resolve that token like any other. An app
-  that is stopped or gone has no token, and one reinstalled without
-  `homeassistant_api` is refused the command itself.
+  This is a second way into the router, past `Vagus.API.Dispatcher`, so
+  `read/1` refuses what the dispatcher would have filtered or sent
+  elsewhere, and what cannot be answered with one result.
 
-  This module puts the token in the request and nowhere else. `run/3` runs
-  in a task, so the bridge never holds it, and whatever the router raises is
-  caught here and logged without its message or arguments: both can carry
-  the request.
-
-  ## What `Vagus.API.Dispatcher` would have done
-
-  This is a second way into the router, past the dispatcher, so `read/1`
-  refuses what the dispatcher would not have routed there:
-
-    * an endpoint that is not plain path segments. No percent-escape, query,
-      fragment, dot segment or empty segment is accepted, so an endpoint has
-      one spelling and it is the one every later check reads. Core refuses
-      what its URL library would rewrite (`HassIO.send_command`,
-      `raw_path != command`); this is stricter;
-    * an endpoint and query longer than a request line may be;
-    * what `Vagus.API.ExploitFilter` blocks, in the endpoint or the query;
-    * the Core proxy's and the ingress proxy's paths, by
-      `Vagus.API.Dispatcher.family/1`;
-    * the routes that stream, take an upload or answer with a file: none
-      has a result to return, and a stream would hold the task open.
-
-  The source address is not checked again: it is the socket's peer, which
-  the dispatcher admitted at the upgrade and which cannot change. The body
-  limit is the router's own, because the request carries a real JSON body
-  for `Plug.Parsers` to read.
-
-  ## Differences from Core
-
-  Core answers every Supervisor refusal as `unknown_error`. A 401 or 403
-  from the router is `unauthorized` here, the code this proxy already gives
-  a refused command. A frame that does not fit the command's schema is
-  refused like any other reserved command rather than as `invalid_format`,
-  and the schema here is narrower: no number where Core's coerces one to a
-  string, and no boolean as a timeout.
-  Core passes any method string to its HTTP client; only the three the
-  router serves are dispatched.
+  Against Core (`hassio/websocket_api.py`, 2026.10.1): a 401 or 403 is
+  `unauthorized` here, not `unknown_error`; a frame outside the schema is
+  refused as a reserved command, not as `invalid_format`; and the methods
+  are the three the router serves, not any string.
   """
 
   require Logger
 
   alias Vagus.API.{Auth, Authz, Dispatcher, ExploitFilter, Router, SourceGuard, Tiers}
   alias Vagus.App
+  alias Vagus.App.Policy
 
   @keys ~w(id type endpoint method data params timeout)
   @methods ~w(GET POST DELETE)
@@ -78,15 +47,20 @@ defmodule Vagus.API.CoreProxy.WSDispatch do
 
   @authz_ctx %{leg: :core_api, decoded_segments: nil}
 
-  @typedoc "`data` is still as decoded, key order and repeats included."
+  @router_opts Router.init([])
+
+  @typedoc "`body` is `data` encoded again, key order and repeats included."
   @type request :: %{
           method: String.t(),
           path: String.t(),
           segments: [String.t()],
           query: String.t(),
-          data: Jason.OrderedObject.t() | nil,
+          body: binary(),
           timeout_ms: non_neg_integer()
         }
+
+  @typedoc "What a socket was opened with: `Vagus.App.Policy.hash/1` of its token."
+  @type credential :: binary()
 
   @type outcome ::
           {:response, status :: pos_integer(), body :: binary()}
@@ -98,12 +72,17 @@ defmodule Vagus.API.CoreProxy.WSDispatch do
 
   `:malformed` is a frame Core's schema would not accept, a repeated key
   among them: Core reads the last of a repeated key and `Jason` the first.
-  `:reserved` names one of Core's reserved views. `:unsupported` is
-  everything else this module does not dispatch.
+  `:reserved` names one of Core's reserved views, and `:too_large` carries
+  more `data` than the router reads. `:unsupported` is everything else this
+  module does not dispatch.
+
+  Runs in the bridge, so the sizes are bounded before anything is encoded:
+  a frame may be megabytes. The source address is not among the checks: it
+  is the socket's peer, which the dispatcher admitted at the upgrade.
   """
   @spec read(Jason.OrderedObject.t()) ::
           {:ok, pos_integer(), request()}
-          | {:error, pos_integer(), :reserved | :unsupported}
+          | {:error, pos_integer(), :reserved | :unsupported | :too_large}
           | :malformed
   def read(%Jason.OrderedObject{values: values}) do
     with {:ok, frame} <- fields(values),
@@ -116,25 +95,66 @@ defmodule Vagus.API.CoreProxy.WSDispatch do
          {:ok, timeout_ms} <- timeout_ms(frame) do
       method = String.upcase(method, :ascii)
 
-      case target(method, endpoint, query) do
-        {:ok, segments} ->
-          {:ok, id,
-           %{
-             method: method,
-             path: endpoint,
-             segments: segments,
-             query: query,
-             data: data,
-             timeout_ms: timeout_ms
-           }}
-
-        {:error, why} ->
-          {:error, id, why}
+      with {:ok, segments} <- target(method, endpoint, query),
+           {:ok, body} <- body(data) do
+        {:ok, id,
+         %{
+           method: method,
+           path: endpoint,
+           segments: segments,
+           query: query,
+           body: body,
+           timeout_ms: timeout_ms
+         }}
+      else
+        {:error, why} -> {:error, id, why}
       end
     else
       :error -> :malformed
     end
   end
+
+  defp body(nil), do: {:ok, ""}
+
+  # Past the first check the encoding is a few hundred kilobytes at the very
+  # most: six bytes out for one in at worst.
+  defp body(data) do
+    limit = Router.body_limit()
+
+    with true <- at_least(data, 0, limit) <= limit,
+         body = Jason.encode!(data),
+         true <- byte_size(body) <= limit do
+      {:ok, body}
+    else
+      false -> {:error, :too_large}
+    end
+  end
+
+  # No more than the encoded size of `term`, and never less than one per
+  # element, so it stops within `limit` elements of starting.
+  defp at_least(_term, sum, limit) when sum > limit, do: sum
+
+  defp at_least(%Jason.OrderedObject{values: values}, sum, limit),
+    do: at_least_all(values, sum + 2, limit)
+
+  defp at_least(list, sum, limit) when is_list(list), do: at_least_all(list, sum + 2, limit)
+  defp at_least({key, value}, sum, limit), do: at_least(value, sum + byte_size(key) + 3, limit)
+  defp at_least(string, sum, _limit) when is_binary(string), do: sum + byte_size(string) + 2
+
+  # Two decimal digits to the byte is under what any integer takes, and
+  # asking its size does not write it out.
+  defp at_least(integer, sum, _limit) when is_integer(integer),
+    do: sum + max(1, 2 * (:erlang.external_size(integer) - 7))
+
+  # `1.0` is the shortest a float is written.
+  defp at_least(float, sum, _limit) when is_float(float), do: sum + 3
+  defp at_least(_scalar, sum, _limit), do: sum + 1
+
+  defp at_least_all(_elements, sum, limit) when sum > limit, do: sum
+  defp at_least_all([], sum, _limit), do: sum
+
+  defp at_least_all([element | rest], sum, limit),
+    do: at_least_all(rest, at_least(element, sum, limit), limit)
 
   defp fields(values) do
     keys = Enum.map(values, &elem(&1, 0))
@@ -165,10 +185,26 @@ defmodule Vagus.API.CoreProxy.WSDispatch do
 
   defp query(nil), do: {:ok, ""}
 
+  # Encoding never shortens, so a query too long as written is not encoded.
   defp query(%Jason.OrderedObject{values: values}) do
-    if Enum.all?(values, fn {_key, value} -> is_binary(value) or is_number(value) end),
-      do: {:ok, URI.encode_query(values)},
-      else: :error
+    cond do
+      not Enum.all?(values, fn {_key, value} -> is_binary(value) or is_number(value) end) ->
+        :error
+
+      written(values, 0) > @max_target_bytes ->
+        {:ok, :too_long}
+
+      true ->
+        {:ok, URI.encode_query(values)}
+    end
+  end
+
+  defp written(_pairs, sum) when sum > @max_target_bytes, do: sum
+  defp written([], sum), do: sum
+
+  defp written([{key, value} | rest], sum) do
+    value = if is_binary(value), do: byte_size(value), else: 1
+    written(rest, sum + byte_size(key) + value)
   end
 
   defp timeout_ms(frame) do
@@ -183,6 +219,8 @@ defmodule Vagus.API.CoreProxy.WSDispatch do
   defp clamp(seconds) when seconds <= 0, do: 0
   defp clamp(seconds) when seconds >= div(@max_timeout_ms, 1000), do: @max_timeout_ms
   defp clamp(seconds), do: round(seconds * 1000)
+
+  defp target(_method, _endpoint, :too_long), do: {:error, :unsupported}
 
   defp target(method, endpoint, query) do
     with true <- method in @methods,
@@ -240,23 +278,54 @@ defmodule Vagus.API.CoreProxy.WSDispatch do
   defp file?(_segments), do: false
 
   @doc """
-  Runs `request` as the app `slug` is now. Call it from a task: it blocks
-  for as long as the route's handler does, and the response is sent to the
-  calling process.
+  Runs `request` as the app `slug`, if the app still holds the token whose
+  hash is `credential`. Call it from a task: it blocks for as long as the
+  route's handler does, and the response is sent to the calling process.
 
-  `plug` is `Vagus.API.Router` everywhere but in a test that must not run a
-  handler.
+  `router` is `Vagus.API.Router` everywhere but in a test that must not run
+  a handler.
   """
-  @spec run(String.t(), request(), module()) :: outcome()
-  def run(slug, request, plug \\ Router) when is_binary(slug) do
-    with {:ok, token} <- App.token(slug),
-         {:addon, %{slug: ^slug}} = app <- Auth.principal(token),
-         {:intercept, :supervisor_api} <- still_admitted(app) do
-      call(plug, conn(request, token))
-    else
-      _gone_or_no_longer_granted ->
-        count_refusal()
-        :unauthorized
+  @spec run(String.t(), credential(), request(), (Plug.Conn.t() -> term())) :: outcome()
+  def run(slug, credential, request, router \\ &router/1) do
+    # The token exists only inside this `try`. A raise with it in scope is
+    # caught here and never becomes a crash report, which prints arguments.
+    attempt =
+      try do
+        with {:ok, token} <- App.token(slug),
+             true <- Plug.Crypto.secure_compare(Policy.hash(token), credential),
+             {:addon, %{slug: ^slug}} = app <- Auth.principal(token),
+             {:intercept, :supervisor_api} <- still_admitted(app) do
+          router.(conn(request, token))
+          :called
+        else
+          _gone_rotated_or_no_longer_granted -> :refused
+        end
+      catch
+        kind, reason -> {:crashed, crash(kind, reason, __STACKTRACE__)}
+      end
+
+    outcome(attempt)
+  end
+
+  defp router(conn), do: Router.call(conn, @router_opts)
+
+  defp outcome(:refused) do
+    count_refusal()
+    :unauthorized
+  end
+
+  # `Plug.ErrorHandler` sends the error envelope and then raises again, so a
+  # handler that raised has still answered. What it raised is logged only
+  # when that answer is a server error: the router raises to refuse, too.
+  defp outcome(attempt) do
+    receive do
+      {__MODULE__.Adapter, status, body} ->
+        with {:crashed, crash} when status >= 500 <- attempt, do: log_crash(crash)
+        {:response, status, body}
+    after
+      0 ->
+        with {:crashed, crash} <- attempt, do: log_crash(crash)
+        :no_response
     end
   end
 
@@ -280,10 +349,8 @@ defmodule Vagus.API.CoreProxy.WSDispatch do
   @doc false
   @spec conn(request(), String.t()) :: Plug.Conn.t()
   def conn(request, token) do
-    body = if request.data, do: Jason.encode!(request.data), else: ""
-
     %Plug.Conn{
-      adapter: {__MODULE__.Adapter, %{owner: self(), body: body}},
+      adapter: {__MODULE__.Adapter, %{owner: self(), body: request.body}},
       host: "supervisor",
       method: request.method,
       owner: self(),
@@ -297,29 +364,6 @@ defmodule Vagus.API.CoreProxy.WSDispatch do
       request_path: request.path,
       scheme: :http
     }
-  end
-
-  # `Plug.ErrorHandler` sends the error envelope and then raises again, so a
-  # handler that raised has still answered. What it raised is logged only
-  # when that answer is a server error: an oversized body raises too.
-  defp call(plug, conn) do
-    crash =
-      try do
-        plug.call(conn, plug.init([]))
-        nil
-      catch
-        kind, reason -> crash(kind, reason, __STACKTRACE__)
-      end
-
-    receive do
-      {__MODULE__.Adapter, status, body} ->
-        if crash && status >= 500, do: log_crash(crash)
-        {:response, status, body}
-    after
-      0 ->
-        if crash, do: log_crash(crash)
-        :no_response
-    end
   end
 
   # The router wraps what a handler raised, together with the conn.
@@ -358,7 +402,8 @@ defmodule Vagus.API.CoreProxy.WSDispatch do
   Core's result message for `outcome`, encoded. Only a 200 carrying an `ok`
   envelope is a success, as in `HassIO.send_command`.
   """
-  @spec result(term(), outcome() | :reserved | :unsupported | :busy | :timeout) :: binary()
+  @spec result(term(), outcome() | :reserved | :unsupported | :too_large | :busy | :timeout) ::
+          binary()
   def result(id, {:response, 200, body}) do
     case Jason.decode(body) do
       {:ok, %{"result" => "ok"} = envelope} -> success(id, Map.get(envelope, "data", %{}))
@@ -380,6 +425,9 @@ defmodule Vagus.API.CoreProxy.WSDispatch do
     do: error(id, "unauthorized", @unauthorized)
 
   def result(id, :busy), do: error(id, "unknown_error", "Too many requests in flight")
+
+  # The router's own answer to a body over its limit.
+  def result(id, :too_large), do: error(id, "unknown_error", "request body too large")
 
   # Core's own failures to reach the Supervisor carry no message.
   def result(id, failed) when failed in [:no_response, :unsupported, :timeout],

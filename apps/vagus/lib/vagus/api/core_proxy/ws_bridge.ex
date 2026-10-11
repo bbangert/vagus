@@ -107,7 +107,9 @@ defmodule Vagus.API.CoreProxy.WSBridge do
   `homeassistant_api`, and asking the app's process per frame would put a
   call in the relay path. So a relayed command is graded as the app the
   handshake saw. A `supervisor/api` call is not: its task asks who the app
-  is now (`Vagus.API.CoreProxy.WSDispatch`).
+  is now, and answers only while the app still holds the token this socket
+  was opened with (`Vagus.API.CoreProxy.WSDispatch`). For that the state
+  keeps that token's hash, never the token.
 
   ## `supervisor/*` and `hassio/*` commands are never relayed
 
@@ -213,6 +215,7 @@ defmodule Vagus.API.CoreProxy.WSBridge do
   alias Vagus.API.{Authz, CoreProxy, SourceGuard}
   alias Vagus.API.CoreProxy.WSBridge.Upstream
   alias Vagus.API.CoreProxy.WSDispatch
+  alias Vagus.App.Policy
   alias Vagus.Core.Versions
 
   @heartbeat_interval_ms 30_000
@@ -222,6 +225,7 @@ defmodule Vagus.API.CoreProxy.WSBridge do
 
   @refusal_label "authz/core_ws"
   @unsupported_label "authz/core_ws+endpoint"
+  @too_large_label "authz/core_ws+body"
   @busy_label "authz/core_ws+busy"
 
   @task_supervisor Vagus.API.CoreProxy.TaskSupervisor
@@ -234,6 +238,7 @@ defmodule Vagus.API.CoreProxy.WSBridge do
           phase: :awaiting_auth | :relaying,
           upstream: pid() | nil,
           principal: Authz.principal() | nil,
+          credential: WSDispatch.credential() | nil,
           ha_version: String.t() | nil,
           closing?: boolean(),
           dispatches: %{reference() => dispatch()}
@@ -268,6 +273,7 @@ defmodule Vagus.API.CoreProxy.WSBridge do
        phase: :awaiting_auth,
        upstream: nil,
        principal: nil,
+       credential: nil,
        ha_version: ha_version,
        closing?: false,
        dispatches: %{}
@@ -312,6 +318,10 @@ defmodule Vagus.API.CoreProxy.WSBridge do
       {:unsupported, id} ->
         count_refusal(@unsupported_label)
         {:push, {:text, WSDispatch.result(id, :unsupported)}, state}
+
+      {:too_large, id} ->
+        count_refusal(@too_large_label)
+        {:push, {:text, WSDispatch.result(id, :too_large)}, state}
 
       {:call, id, request} ->
         dispatch(id, request, state)
@@ -453,13 +463,16 @@ defmodule Vagus.API.CoreProxy.WSBridge do
        when map_size(dispatches) >= @max_dispatches,
        do: busy(id, state)
 
+  # `Vagus.API.Authz` intercepts for an app and for nobody else, so the
+  # principal here is one.
   defp dispatch(id, request, %{principal: {:addon, %{slug: slug}}} = state) do
     ref = make_ref()
     bridge = self()
-    run = Application.get_env(:vagus, :ws_dispatch_fun, &WSDispatch.run/2)
+    credential = state.credential
 
     task = fn ->
-      send(bridge, {:supervisor_api, ref, WSDispatch.result(id, run.(slug, request))})
+      result = WSDispatch.result(id, run(slug, credential, request))
+      send(bridge, {:supervisor_api, ref, result})
     end
 
     case start_task(task) do
@@ -475,6 +488,18 @@ defmodule Vagus.API.CoreProxy.WSBridge do
       :busy ->
         busy(id, state)
     end
+  end
+
+  # A seam that replaces the whole of `WSDispatch.run/3`, the caller's
+  # re-check included, so it is compiled into the test build and no other:
+  # elsewhere there is no key to set.
+  if Mix.env() == :test do
+    defp run(slug, credential, request) do
+      run = Application.get_env(:vagus, :ws_dispatch_fun, &WSDispatch.run/3)
+      run.(slug, credential, request)
+    end
+  else
+    defp run(slug, credential, request), do: WSDispatch.run(slug, credential, request)
   end
 
   # Not linked, and `:temporary`: the task's end is this process's `DOWN`
@@ -549,6 +574,7 @@ defmodule Vagus.API.CoreProxy.WSBridge do
           :relay
           | {:refuse, term()}
           | {:unsupported, pos_integer()}
+          | {:too_large, pos_integer()}
           | {:call, pos_integer(), WSDispatch.request()}
           | :invalid_json
   def screen(data, principal) do
@@ -576,6 +602,7 @@ defmodule Vagus.API.CoreProxy.WSBridge do
       {:ok, id, request} -> {:call, id, request}
       {:error, id, :reserved} -> {:refuse, id}
       {:error, id, :unsupported} -> {:unsupported, id}
+      {:error, id, :too_large} -> {:too_large, id}
       :malformed -> {:refuse, response_id(command)}
     end
   end
@@ -636,11 +663,17 @@ defmodule Vagus.API.CoreProxy.WSBridge do
     end
   end
 
-  # The principal is set here and nowhere else.
+  # The principal is set here and nowhere else, with the hash of the token
+  # that proved it: a `supervisor/api` call is answered only while the app
+  # still holds that token. The hash, as the app directory keys it; the
+  # token itself is not kept, because a crash report prints this state.
   defp authenticate(token, state) do
     case CoreProxy.check_access(token) do
-      {:ok, principal} -> start_relaying(%{state | principal: principal})
-      {:error, :unauthorized} -> auth_invalid_and_close(state)
+      {:ok, principal} ->
+        start_relaying(%{state | principal: principal, credential: Policy.hash(token)})
+
+      {:error, :unauthorized} ->
+        auth_invalid_and_close(state)
     end
   end
 

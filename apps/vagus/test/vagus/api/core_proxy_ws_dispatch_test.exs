@@ -1,15 +1,11 @@
 defmodule Vagus.API.CoreProxyWSDispatchTest.SpyRouter do
   @moduledoc "`Vagus.API.Router`, reporting each request that reaches it to the test."
-  @behaviour Plug
 
-  @impl Plug
-  def init(opts), do: opts
-
-  @impl Plug
-  def call(conn, opts) do
+  @spec call(Plug.Conn.t()) :: Plug.Conn.t()
+  def call(conn) do
     test_pid = Application.fetch_env!(:vagus, :core_ws_test_pid)
     send(test_pid, {:routed, conn.method, conn.request_path, hd(Process.get(:"$callers"))})
-    Vagus.API.Router.call(conn, Vagus.API.Router.init(opts))
+    Vagus.API.Router.call(conn, Vagus.API.Router.init([]))
   end
 end
 
@@ -19,8 +15,9 @@ defmodule Vagus.API.CoreProxyWSDispatchTest do
   bridge: a fake Core that reports every frame it is sent, the real proxy
   stack, and a hand-rolled WebSocket client.
 
-  Nothing here sleeps. A dispatch is held and released by message, through
-  the `:ws_dispatch_fun` seam.
+  Nothing here sleeps to let something happen. A dispatch is held and
+  released by message, through the `:ws_dispatch_fun` seam, and what another
+  process does afterwards is waited for by asking that process.
   """
   use ExUnit.Case, async: false
 
@@ -36,6 +33,7 @@ defmodule Vagus.API.CoreProxyWSDispatchTest do
   alias Vagus.API.CoreProxyWSDispatchTest.SpyRouter
   alias Vagus.API.CoreProxyWSTest.{Client, Stack}
   alias Vagus.API.{Dispatcher, SourceGuard}
+  alias Vagus.App.Policy
   alias Vagus.Backend.HostMock
 
   @recv_timeout 30_000
@@ -46,6 +44,7 @@ defmodule Vagus.API.CoreProxyWSDispatchTest do
   # process last claimed Mox's global mode, so they are claimed and set
   # again here: the handlers run in a task, not in this process.
   setup :set_mox_global
+  setup :verify_on_exit!
 
   setup do
     stub_with(Vagus.Backend.NetworkMock, Vagus.Backend.Network.HostStub)
@@ -71,6 +70,29 @@ defmodule Vagus.API.CoreProxyWSDispatchTest do
   ## Helpers
 
   defp tasks, do: Task.Supervisor.children(@task_supervisor)
+
+  # What another process has yet to do is asked of that process until it
+  # has, or the deadline passes.
+  defp eventually(check, deadline \\ System.monotonic_time(:millisecond) + @recv_timeout) do
+    cond do
+      check.() ->
+        :ok
+
+      System.monotonic_time(:millisecond) > deadline ->
+        flunk("never became true")
+
+      true ->
+        receive do
+        after
+          5 -> eventually(check, deadline)
+        end
+    end
+  end
+
+  defp await_no_tasks, do: eventually(fn -> tasks() == [] end)
+
+  defp await_dispatches(bridge, count),
+    do: eventually(fn -> map_size(websock_state(bridge).dispatches) == count end)
 
   defp token(slug, grants \\ %{}) do
     register_app_token(app_config(slug),
@@ -116,13 +138,15 @@ defmodule Vagus.API.CoreProxyWSDispatchTest do
     client
   end
 
-  defp spy, do: Stack.put_env(:ws_dispatch_fun, &WSDispatch.run(&1, &2, SpyRouter))
+  defp spy,
+    do:
+      Stack.put_env(:ws_dispatch_fun, &WSDispatch.run(&1, &2, &3, fn c -> SpyRouter.call(c) end))
 
   # Every dispatch reports itself and then waits to be told its outcome.
   defp hold_dispatches do
     test_pid = self()
 
-    Stack.put_env(:ws_dispatch_fun, fn slug, request ->
+    Stack.put_env(:ws_dispatch_fun, fn slug, _credential, request ->
       send(test_pid, {:dispatching, self(), hd(Process.get(:"$callers")), slug, request})
 
       receive do
@@ -138,6 +162,13 @@ defmodule Vagus.API.CoreProxyWSDispatchTest do
     ref = Process.monitor(task)
     send(task, {:release, outcome})
     assert_receive {:DOWN, ^ref, :process, ^task, _reason}, @recv_timeout
+  end
+
+  defp dispatching(count) do
+    for _ <- 1..count//1 do
+      assert_receive {:dispatching, task, bridge, _slug, _request}, @recv_timeout
+      {task, bridge}
+    end
   end
 
   defp rest(method, path, token, body \\ nil) do
@@ -158,42 +189,54 @@ defmodule Vagus.API.CoreProxyWSDispatchTest do
     end
   end
 
-  defp bridge_state(bridge), do: :sys.get_state(bridge) |> inspect(limit: :infinity)
+  # Bandit keeps the WebSock state inside its handler's own.
+  defp websock_state(bridge) do
+    {_socket, %{connection: %{websock_state: state}}} = :sys.get_state(bridge)
+    state
+  end
+
+  defp bridge_state(bridge), do: bridge |> :sys.get_state() |> inspect(limit: :infinity)
 
   defp assert_error(reply, id, code) do
     assert %{"id" => ^id, "type" => "result", "success" => false, "error" => %{"code" => ^code}} =
              reply
   end
 
-  ## Answered as the app
-
-  test "a call is answered with what the same request over HTTP returns", ctx do
-    {client, token} = client(ctx, "wsd_info")
-
-    {reply, client} = call(client, 1, "get", "/supervisor/info")
-
-    {200, body} = rest(:get, "/supervisor/info", token)
-    assert reply == %{"id" => 1, "type" => "result", "success" => true, "result" => data(body)}
-    assert is_map(reply["result"]) and reply["result"] != %{}
-
-    assert_none_relayed(client)
-  end
+  # The answer to a caller the dispatch no longer admits. The gate's own
+  # refusals are not worded this way.
+  @not_admitted "Supervisor-only commands are not available through this proxy"
 
   defp data(body), do: Jason.decode!(body)["data"]
 
-  test "the app's own info is its own; another app's is refused as over HTTP", ctx do
+  ## Answered as the app
+
+  # An app's own info has no clock or meter in it, so the two reads are equal.
+  test "a call is answered with what the same request over HTTP returns", ctx do
     install_app(app_config("wsd_other"))
     {client, token} = client(ctx, "wsd_self")
 
     {own, client} = call(client, 1, "get", "/addons/self/info")
-    assert own["success"]
-    assert own["result"] == data(elem(rest(:get, "/addons/self/info", token), 1))
+    {200, body} = rest(:get, "/addons/self/info", token)
+    assert own == %{"id" => 1, "type" => "result", "success" => true, "result" => data(body)}
     assert own["result"]["slug"] == "wsd_self"
 
     {foreign, client} = call(client, 2, "get", "/addons/wsd_other/info")
     assert {403, body} = rest(:get, "/addons/wsd_other/info", token)
     assert_error(foreign, 2, "unauthorized")
     assert foreign["error"]["message"] == Jason.decode!(body)["message"]
+
+    assert_none_relayed(client)
+  end
+
+  test "a read with a clock in it has the same fields as over HTTP", ctx do
+    {client, token} = client(ctx, "wsd_info")
+
+    {reply, client} = call(client, 1, "get", "/supervisor/info")
+    {200, body} = rest(:get, "/supervisor/info", token)
+
+    assert reply["success"]
+    assert reply["result"] != %{}
+    assert Enum.sort(Map.keys(reply["result"])) == Enum.sort(Map.keys(data(body)))
 
     assert_none_relayed(client)
   end
@@ -332,16 +375,24 @@ defmodule Vagus.API.CoreProxyWSDispatchTest do
     assert_none_relayed(client)
   end
 
-  test "a query goes through params, and reaches the handler as over HTTP", ctx do
-    spy()
-    {client, token} = client(ctx, "wsd_params", %{hassio_role: "admin"})
+  test "a query goes through params, and reaches the router encoded", ctx do
+    test_pid = self()
+
+    Stack.put_env(
+      :ws_dispatch_fun,
+      &WSDispatch.run(&1, &2, &3, fn conn ->
+        send(test_pid, {:query, conn.query_string})
+        SpyRouter.call(conn)
+      end)
+    )
+
+    {client, _token} = client(ctx, "wsd_params", %{hassio_role: "admin"})
 
     {reply, _client} =
       call(client, 1, "get", "/supervisor/info", %{"params" => %{"a" => "b c", "n" => 2}})
 
     assert reply["success"]
-    assert reply["result"] == data(elem(rest(:get, "/supervisor/info?a=b+c&n=2", token), 1))
-    assert_receive {:routed, "GET", "/supervisor/info", _bridge}, @recv_timeout
+    assert_receive {:query, "a=b+c&n=2"}, @recv_timeout
   end
 
   ## The frame
@@ -421,7 +472,6 @@ defmodule Vagus.API.CoreProxyWSDispatchTest do
     {upper, client} = call(client, 1, "GET", "/supervisor/info")
     {mixed, client} = call(client, 2, "Get", "/supervisor/info")
     assert upper["success"] and mixed["success"]
-    assert upper["result"] == mixed["result"]
     assert_receive {:routed, "GET", "/supervisor/info", _bridge}, @recv_timeout
     assert_receive {:routed, "GET", "/supervisor/info", _bridge}, @recv_timeout
 
@@ -446,18 +496,19 @@ defmodule Vagus.API.CoreProxyWSDispatchTest do
     assert_none_relayed(client)
   end
 
-  ## The body limit
+  ## The size limits
 
-  test "the router's body limit applies to data, to the byte", ctx do
+  defp options_of(bytes) do
+    empty = byte_size(Jason.encode!(%{"options" => %{"k" => ""}}))
+    %{"options" => %{"k" => String.duplicate("a", bytes - empty)}}
+  end
+
+  test "the router's body limit applies to data, to the byte, before anything is started",
+       ctx do
+    spy()
     {client, token} = client(ctx, "wsd_body")
 
-    body = fn bytes ->
-      empty = byte_size(Jason.encode!(%{"options" => %{"k" => ""}}))
-      %{"options" => %{"k" => String.duplicate("a", bytes - empty)}}
-    end
-
-    at_limit = body.(65_536)
-    over = body.(65_537)
+    at_limit = options_of(65_536)
     assert byte_size(Jason.encode!(at_limit)) == 65_536
 
     {reply, client} = call(client, 1, "post", "/addons/self/options", %{"data" => at_limit})
@@ -465,27 +516,98 @@ defmodule Vagus.API.CoreProxyWSDispatchTest do
     assert status != 413
     assert reply["success"] == (status == 200)
     refute reply["error"]["message"] == "request body too large"
+    assert_receive {:routed, "POST", "/addons/self/options", bridge}, @recv_timeout
+    await_dispatches(bridge, 0)
 
-    for {id, data} <- [{2, over}, {3, body.(200_000)}] do
-      {reply, _client} = call(client, id, "post", "/addons/self/options", %{"data" => data})
-      assert {413, _body} = rest(:post, "/addons/self/options", token, Jason.encode!(data))
-      assert_error(reply, id, "unknown_error")
-      assert reply["error"]["message"] == "request body too large"
-    end
+    client =
+      Enum.reduce([{2, options_of(65_537)}, {3, options_of(200_000)}], client, fn {id, data},
+                                                                                  client ->
+        {reply, client} = call(client, id, "post", "/addons/self/options", %{"data" => data})
+
+        # The answer is the one HTTP gives the same body.
+        assert {413, body} = rest(:post, "/addons/self/options", token, Jason.encode!(data))
+        assert_error(reply, id, "unknown_error")
+        assert reply["error"]["message"] == Jason.decode!(body)["message"]
+        client
+      end)
+
+    # Refused in the bridge: no task, no slot, nothing routed.
+    refute_received {:routed, _method, _path, _bridge}
+    assert websock_state(bridge).dispatches == %{}
+    assert tasks() == []
+    assert_none_relayed(client)
   end
 
-  test "a request always carries the JSON content type, with or without data" do
-    for data <- [nil, %Jason.OrderedObject{values: [{"a", 1}]}] do
+  defp read(frame) do
+    %Jason.OrderedObject{} = object = Jason.decode!(frame, objects: :ordered_objects)
+    WSDispatch.read(object)
+  end
+
+  test "the size checks never refuse what the router would read" do
+    call = ~s("id":1,"type":"supervisor/api","endpoint":"/x","method":"post")
+
+    # Megabytes of frame around a small body.
+    padded = "{" <> call <> String.duplicate(" ", 2_000_000) <> ~s(,"data":{"a":1}})
+    assert {:ok, 1, %{body: ~s({"a":1})}} = read(padded)
+
+    # Written long, encoded short: escapes and whitespace.
+    escaped = String.duplicate("\\u0041", 60_000)
+    assert {:ok, 1, %{body: body}} = read(~s({#{call},"data":{"a":"#{escaped}"}}))
+    assert byte_size(body) == 60_008
+
+    spaced = "[" <> String.duplicate("1 , ", 30_000) <> "1]"
+    assert {:ok, 1, %{body: body}} = read(~s({#{call},"data":{"a":#{spaced}}}))
+    assert byte_size(body) < 65_536
+
+    # Sixty integers of a thousand digits, the most the decoder takes in one.
+    digits = "[" <> String.duplicate(String.duplicate("9", 1_000) <> ",", 59) <> "9]"
+    assert {:ok, 1, %{body: body}} = read(~s({#{call},"data":{"a":#{digits}}}))
+    assert byte_size(body) == 59_068
+  end
+
+  test "data over the limit is refused, however it was written" do
+    call = ~s("id":1,"type":"supervisor/api","endpoint":"/x","method":"post")
+
+    # Written short, encoded long: the exact size decides, not the estimate.
+    floats = "[" <> String.duplicate("1e5,", 15_000) <> "1e5]"
+    assert byte_size(floats) < 65_536
+    assert {:error, 1, :too_large} = read(~s({#{call},"data":{"a":#{floats}}}))
+
+    # Long integers: just over, and megabytes over.
+    integers = fn count ->
+      "[" <> String.duplicate(String.duplicate("9", 1_000) <> ",", count) <> "9]"
+    end
+
+    assert {:error, 1, :too_large} = read(~s({#{call},"data":{"a":#{integers.(66)}}}))
+    assert {:error, 1, :too_large} = read(~s({#{call},"data":{"a":#{integers.(3_000)}}}))
+
+    # Many small elements, each of them counted.
+    assert {:error, 1, :too_large} =
+             read(~s({#{call},"data":{"a":[#{String.duplicate("[],", 40_000)}[]]}}))
+
+    assert {:error, 1, :too_large} =
+             read(~s({#{call},"data":{"a":"#{String.duplicate("a", 3_000_000)}"}}))
+  end
+
+  test "a query is bounded as written, at the request line's limit" do
+    call = ~s("id":1,"type":"supervisor/api","endpoint":"/x","method":"get")
+    query = fn bytes -> ~s({#{call},"params":{"q":"#{String.duplicate("a", bytes)}"}}) end
+
+    # `/x` and `q=` are four bytes of the 8,000.
+    assert {:ok, 1, %{query: "q=" <> _}} = read(query.(7_996))
+    assert {:error, 1, :unsupported} = read(query.(7_997))
+    assert {:error, 1, :unsupported} = read(query.(3_000_000))
+
+    # Short as written, long once encoded.
+    assert {:error, 1, :unsupported} =
+             read(~s({#{call},"params":{"q":"#{String.duplicate(" /", 2_000)}"}}))
+  end
+
+  test "a request always carries the JSON content type, with or without a body" do
+    for body <- ["", ~s({"a":1})] do
       conn =
         WSDispatch.conn(
-          %{
-            method: "POST",
-            path: "/x",
-            segments: ["x"],
-            query: "",
-            data: data,
-            timeout_ms: 1
-          },
+          %{method: "POST", path: "/x", segments: ["x"], query: "", body: body, timeout_ms: 1},
           "t"
         )
 
@@ -493,7 +615,7 @@ defmodule Vagus.API.CoreProxyWSDispatchTest do
     end
   end
 
-  ## The caller is looked up again
+  ## The caller is the one the socket was opened as
 
   test "an app uninstalled with its socket open is refused, and nothing is dispatched", ctx do
     spy()
@@ -512,40 +634,100 @@ defmodule Vagus.API.CoreProxyWSDispatchTest do
     assert_none_relayed(client)
   end
 
-  test "an app that lost homeassistant_api, or its token, is refused", ctx do
+  test "a socket does not outlive the token it was opened with", ctx do
     spy()
-    {client, _token} = client(ctx, "wsd_dropped")
+    {client, _token} = client(ctx, "wsd_rotated")
 
-    # Reinstalled without the grant, and holding a new token.
-    token("wsd_dropped", %{homeassistant_api: false})
     {reply, client} = call(client, 1, "get", "/supervisor/info")
-    assert_error(reply, 1, "unauthorized")
+    assert reply["success"]
+    assert_receive {:routed, "GET", "/supervisor/info", _bridge}, @recv_timeout
 
-    # Granted again, but its process restarted: no container, so no token.
-    install_app(app_config("wsd_dropped", %{"homeassistant_api" => true, "hassio_api" => true}))
-
+    # Its process restarted: no container, so no token at all.
+    install_app(app_config("wsd_rotated", %{"homeassistant_api" => true, "hassio_api" => true}))
     {reply, client} = call(client, 2, "get", "/supervisor/info")
     assert_error(reply, 2, "unauthorized")
-    refute_received {:routed, _method, _path, _bridge}
 
-    token("wsd_dropped")
-    {reply, _client} = call(client, 3, "get", "/supervisor/info")
+    # Started again with the same grants: a new token, which this socket
+    # never presented.
+    token("wsd_rotated")
+    {reply, client} = call(client, 3, "get", "/supervisor/info")
+    assert_error(reply, 3, "unauthorized")
+    assert reply["error"]["message"] == @not_admitted
+
+    # Reinstalled without the grant.
+    token("wsd_rotated", %{homeassistant_api: false})
+    {reply, client} = call(client, 4, "get", "/supervisor/info")
+    assert_error(reply, 4, "unauthorized")
+
+    refute_received {:routed, _method, _path, _bridge}
+    client = assert_none_relayed(client)
+
+    # The token the app holds now opens a socket of its own.
+    Client.send_frame(client, {:close, 1000, ""})
+    assert_receive {:core_terminate, _reason}, @recv_timeout
+
+    fresh = token("wsd_rotated", %{homeassistant_api: true})
+    again = Stack.relaying_client(ctx.proxy_host, ctx.proxy_port, fresh)
+    {reply, _client} = call(again, 1, "get", "/supervisor/info")
     assert reply["success"]
   end
 
-  test "an app whose role changed is graded by the role it has now", ctx do
-    {client, _token} = client(ctx, "wsd_role", %{hassio_role: "manager"})
+  test "an app reinstalled with a higher role is refused, not graded as the new one", ctx do
+    spy()
+    {client, _token} = client(ctx, "wsd_raised", %{hassio_role: "default"})
 
+    # `/addons` asks for manager: the gate refuses, in its own words.
     {reply, client} = call(client, 1, "get", "/addons")
-    assert reply["success"]
+    assert_error(reply, 1, "unauthorized")
+    assert reply["error"]["message"] == "unauthorized"
+    assert_receive {:routed, "GET", "/addons", _bridge}, @recv_timeout
 
-    token("wsd_role", %{hassio_role: "default"})
+    token("wsd_raised", %{hassio_role: "manager"})
+
     {reply, client} = call(client, 2, "get", "/addons")
     assert_error(reply, 2, "unauthorized")
+    assert reply["error"]["message"] == @not_admitted
+    refute_received {:routed, _method, _path, _bridge}
 
-    token("wsd_role", %{hassio_role: "manager"})
-    {reply, _client} = call(client, 3, "get", "/addons")
+    assert_none_relayed(client)
+  end
+
+  # An update commits the new config before its start step mints a new
+  # token, so for that long the old token names an app with new grants.
+  test "grants changed under the same token are the ones that count", ctx do
+    spy()
+    {client, _token} = client(ctx, "wsd_inplace", %{hassio_role: "default"})
+    [{app, _slug}] = Registry.lookup(Vagus.App.Directory, {:slug, "wsd_inplace"})
+
+    set = fn key, value ->
+      :sys.replace_state(app, fn {state, data} ->
+        {state, %{data | config: Map.replace!(data.config, key, value)}}
+      end)
+    end
+
+    {reply, client} = call(client, 1, "get", "/addons")
+    assert_error(reply, 1, "unauthorized")
+
+    set.(:hassio_role, "manager")
+    {reply, client} = call(client, 2, "get", "/addons")
     assert reply["success"]
+
+    set.(:hassio_role, "default")
+    {reply, client} = call(client, 3, "get", "/addons")
+    assert_error(reply, 3, "unauthorized")
+    assert reply["error"]["message"] == "unauthorized"
+
+    for _call <- 1..3, do: assert_receive({:routed, "GET", "/addons", _bridge}, @recv_timeout)
+
+    # Without the grant the socket itself needs, the command is refused and
+    # the request never put to the router.
+    set.(:homeassistant_api, false)
+    {reply, client} = call(client, 4, "get", "/supervisor/info")
+    assert_error(reply, 4, "unauthorized")
+    assert reply["error"]["message"] == @not_admitted
+    refute_received {:routed, _method, _path, _bridge}
+
+    assert_none_relayed(client)
   end
 
   ## No secret outside the request
@@ -577,6 +759,8 @@ defmodule Vagus.API.CoreProxyWSDispatchTest do
     {reply, client} = call(client, 5, "get", "/supervisor/info")
     assert reply["success"]
 
+    # What the state does hold of the credential is its hash.
+    assert websock_state(bridge).credential == Policy.hash(token)
     refute bridge_state(bridge) =~ token
     :erlang.trace(bridge, false, [:receive])
 
@@ -602,11 +786,42 @@ defmodule Vagus.API.CoreProxyWSDispatchTest do
     end
   end
 
+  @request %{method: "GET", path: "/x", segments: ["x"], query: "", body: "", timeout_ms: 1}
+
+  # `run/4` is called here directly, so a raise it let through would fail
+  # the test, and one it turned into a crash report would be in the log.
+  test "a raise anywhere the token is in scope is caught, and logged without it" do
+    token = token("wsd_guard")
+    credential = Policy.hash(token)
+
+    log =
+      capture_log(fn ->
+        # Comparing the hashes.
+        assert WSDispatch.run("wsd_guard", :not_a_hash, @request) == :no_response
+        # Building the request.
+        assert WSDispatch.run("wsd_guard", credential, %{}) == :no_response
+        # The router.
+        assert WSDispatch.run("wsd_guard", credential, @request, fn conn ->
+                 raise "boom " <> hd(get_req_header(conn, "x-supervisor-token"))
+               end) == :no_response
+      end)
+
+    assert log =~
+             "a supervisor/api call raised FunctionClauseError in Plug.Crypto.secure_compare/2"
+
+    assert log =~ "a supervisor/api call raised KeyError in "
+    assert log =~ "a supervisor/api call raised RuntimeError in "
+    refute log =~ token
+    refute log =~ "boom"
+
+    if path = System.get_env("WS_GUARD_LOG"), do: File.write!(path, log)
+  end
+
   test "a dispatch task that itself dies answers the call and logs nothing of the request",
        ctx do
     {client, token} = client(ctx, "wsd_task_crash")
 
-    Stack.put_env(:ws_dispatch_fun, fn _slug, _request -> raise "task died" end)
+    Stack.put_env(:ws_dispatch_fun, fn _slug, _credential, _request -> raise "task died" end)
 
     {client, log} =
       with_log(fn ->
@@ -616,24 +831,66 @@ defmodule Vagus.API.CoreProxyWSDispatchTest do
         client
       end)
 
+    # The crash report is there, so what is refuted below is refuted of it.
+    assert log =~ "terminating"
+    assert log =~ "(RuntimeError) task died"
     refute log =~ token
     refute log =~ "zz"
     if path = System.get_env("WS_TASK_CRASH_LOG"), do: File.write!(path, log)
 
-    Stack.put_env(:ws_dispatch_fun, &WSDispatch.run/2)
+    Stack.put_env(:ws_dispatch_fun, &WSDispatch.run/3)
     {reply, _client} = call(client, 2, "get", "/supervisor/info")
     assert reply["success"]
   end
 
-  test "nothing but the dispatch reads an app's token" do
+  # From the compiled modules' import tables, so an aliased or imported call
+  # counts and a mention in a comment does not.
+  test "the dispatch is the one caller of App.token/1" do
+    {:ok, modules} = :application.get_key(:vagus, :modules)
+
+    callers =
+      for module <- modules,
+          {:ok, {^module, [imports: imports]}} <- [
+            :beam_lib.chunks(:code.which(module), [:imports])
+          ],
+          {Vagus.App, :token, 1} in imports,
+          do: module
+
+    assert callers == [WSDispatch]
+  end
+
+  # The seam swaps out the whole dispatch, the caller's re-check included.
+  test "the dispatch seam is compiled into the test build only" do
     lib = Path.expand("../../../lib", __DIR__)
 
-    readers =
+    mentions =
       for file <- Path.wildcard(Path.join(lib, "**/*.ex")),
-          File.read!(file) =~ ~r/App\.token\(|ask\([^)]*:token/,
+          File.read!(file) =~ "ws_dispatch_fun",
           do: Path.relative_to(file, lib)
 
-    assert readers == ["vagus/api/core_proxy/ws_dispatch.ex", "vagus/app.ex"]
+    assert mentions == ["vagus/api/core_proxy/ws_bridge.ex"]
+
+    # With every `if Mix.env() == :test` body removed, nothing names it.
+    {outside, guarded} =
+      lib
+      |> Path.join("vagus/api/core_proxy/ws_bridge.ex")
+      |> File.read!()
+      |> Code.string_to_quoted!()
+      |> Macro.prewalk(0, fn
+        {:if, _meta,
+         [
+           {:==, _eq, [{{:., _dot, [{:__aliases__, _alias, [:Mix]}, :env]}, _call, []}, :test]},
+           branches
+         ]},
+        guarded ->
+          {{:if, [], [true, Keyword.delete(branches, :do)]}, guarded + 1}
+
+        node, guarded ->
+          {node, guarded}
+      end)
+
+    assert guarded == 1
+    refute Macro.to_string(outside) =~ "ws_dispatch_fun"
   end
 
   ## Refusals are counted under static labels
@@ -659,19 +916,21 @@ defmodule Vagus.API.CoreProxyWSDispatchTest do
         for {text, state} <- [
               {~s({"id":1,"type":"supervisor/api","endpoint":"/zz-marker"}), state},
               {frame(2, "get", "/core/api/zz-marker"), state},
-              {frame(3, "get", "/zz-marker"), full}
+              {frame(3, "post", "/zz-marker", %{"data" => options_of(70_000)}), state},
+              {frame(4, "get", "/zz-marker"), full}
             ] do
           assert {:push, {:text, _result}, ^state} =
                    WSBridge.handle_in({text, [opcode: :text]}, state)
         end
 
-        assert WSDispatch.run("wsd_no_such_app", %{}) == :unauthorized
+        assert WSDispatch.run("wsd_no_such_app", <<0::256>>, @request) == :unauthorized
       end)
 
     refute log =~ "authz"
     refute log =~ "zz-marker"
 
-    for label <- ~w(authz/core_ws authz/core_ws+endpoint authz/core_ws+busy authz/core_ws+caller) do
+    for label <-
+          ~w(authz/core_ws authz/core_ws+endpoint authz/core_ws+body authz/core_ws+busy authz/core_ws+caller) do
       assert_received {:"$gen_cast", {:filtered, :authz, ^label}}
     end
 
@@ -682,12 +941,6 @@ defmodule Vagus.API.CoreProxyWSDispatchTest do
     {_reply, _client} = reply(client)
   end
 
-  # Bandit keeps the WebSock state inside its handler's own.
-  defp websock_state(bridge) do
-    {_socket, %{connection: %{websock_state: state}}} = :sys.get_state(bridge)
-    state
-  end
-
   ## Liveness and bounds
 
   test "pending calls never hold the relay, and each is answered under its own id", ctx do
@@ -696,12 +949,16 @@ defmodule Vagus.API.CoreProxyWSDispatchTest do
 
     client =
       Enum.reduce(1..8, client, fn id, client ->
-        send_text(client, frame(id, "get", "/supervisor/info"))
+        send_text(client, frame(id, "get", "/supervisor/info", %{"params" => %{"n" => id}}))
       end)
 
+    # Each task is told apart by what its own request carries: the order
+    # eight processes report in is not the order they were started in.
     tasks =
       for id <- 1..8 do
-        assert_receive {:dispatching, task, _bridge, "wsd_pending", %{path: "/supervisor/info"}},
+        query = "n=#{id}"
+
+        assert_receive {:dispatching, task, _bridge, "wsd_pending", %{query: ^query}},
                        @recv_timeout
 
         {id, task}
@@ -718,17 +975,13 @@ defmodule Vagus.API.CoreProxyWSDispatchTest do
         client
       end)
 
-    # Tasks start in frame order; answered here in reverse.
+    # Answered in the reverse of the order they were asked in.
     Enum.reduce(Enum.reverse(tasks), client, fn {id, task}, client ->
       send(task, {:release, ok_outcome(%{"n" => id})})
       {reply, client} = reply(client)
 
-      assert reply == %{
-               "id" => id,
-               "type" => "result",
-               "success" => true,
-               "result" => %{"n" => id}
-             }
+      assert reply ==
+               %{"id" => id, "type" => "result", "success" => true, "result" => %{"n" => id}}
 
       client
     end)
@@ -752,15 +1005,13 @@ defmodule Vagus.API.CoreProxyWSDispatchTest do
     assert map_size(websock_state(bridge).dispatches) == 1
 
     release(task, ok_outcome(%{"late" => true}))
+    await_dispatches(bridge, 0)
+    await_no_tasks()
 
-    # The bridge has handled everything the task sent once it answers a
-    # later frame; the late result was not that answer.
+    # Whatever the task sent has been handled, and none of it was an answer:
+    # the next frame out is the next call's.
     {reply, _client} = call_released(client, 2)
     assert reply == %{"id" => 2, "type" => "result", "success" => true, "result" => %{"n" => 2}}
-
-    assert websock_state(bridge).dispatches == %{}
-    assert {:message_queue_len, 0} = Process.info(bridge, :message_queue_len)
-    assert tasks() == []
   end
 
   defp call_released(client, id) do
@@ -780,11 +1031,9 @@ defmodule Vagus.API.CoreProxyWSDispatchTest do
         send_text(client, frame(id, "get", "/supervisor/info", %{"timeout" => 0}))
       end)
 
-    tasks =
-      for _ <- 1..8 do
-        assert_receive {:dispatching, task, _bridge, _slug, _request}, @recv_timeout
-        task
-      end
+    started = dispatching(8)
+    [{_task, bridge} | _rest] = started
+    tasks = Enum.map(started, &elem(&1, 0))
 
     client =
       Enum.reduce(1..8, client, fn _n, client ->
@@ -802,61 +1051,41 @@ defmodule Vagus.API.CoreProxyWSDispatchTest do
     refute_received {:dispatching, _task, _bridge, _slug, _request}
     assert length(tasks()) == 8
 
+    # The slot is free once the bridge has seen the task end.
     release(hd(tasks), :no_response)
+    await_dispatches(bridge, 7)
     {reply, _client} = call_released(client, 10)
     assert reply["success"]
 
     Enum.each(tl(tasks), &release(&1, :no_response))
-    assert tasks() == []
+    await_no_tasks()
   end
 
-  test "all sockets together are bounded by the task supervisor", ctx do
-    hold_dispatches()
-    token = token("wsd_global")
+  # A socket's frames arrive as messages to the process that opened it, so
+  # each socket here has a process of its own. It sends `calls`, reports how
+  # many were answered busy, and closes the socket when told to.
+  defp socket(ctx, token, calls) do
     test_pid = self()
 
-    # A socket's frames arrive as messages to the process that opened it, so
-    # each of the five has its own.
-    sockets =
-      for _socket <- 1..5 do
-        spawn_link(fn ->
-          client = handshake(ctx, token)
+    spawn_link(fn ->
+      client = handshake(ctx, token)
 
-          client =
-            Enum.reduce(1..8, client, fn id, client ->
-              send_text(client, frame(id, "get", "/supervisor/info"))
-            end)
-
-          send(test_pid, {:busy, busy_replies(client)})
-
-          receive do
-            :done -> :ok
-          end
+      client =
+        Enum.reduce(calls, client, fn id, client ->
+          send_text(client, frame(id, "get", "/supervisor/info"))
         end)
+
+      send(test_pid, {:busy, self(), busy_replies(client)})
+
+      receive do
+        :close -> Client.send_frame(client, {:close, 1000, ""})
       end
+    end)
+  end
 
-    # Forty calls, thirty-two tasks: the rest are answered at once.
-    busy =
-      for _socket <- sockets, reduce: 0 do
-        busy ->
-          assert_receive {:busy, count}, @recv_timeout
-          busy + count
-      end
-
-    assert busy == 8
-
-    tasks =
-      for _ <- 1..32 do
-        assert_receive {:dispatching, task, _bridge, _slug, _request}, @recv_timeout
-        task
-      end
-
-    refute_received {:dispatching, _task, _bridge, _slug, _request}
-    assert Enum.sort(tasks()) == Enum.sort(tasks)
-
-    Enum.each(tasks, &release(&1, :no_response))
-    assert tasks() == []
-    Enum.each(sockets, &send(&1, :done))
+  defp busy(socket) do
+    assert_receive {:busy, ^socket, count}, @recv_timeout
+    count
   end
 
   # `Stack.relaying_client/3` without the wait for the fake Core's report,
@@ -888,6 +1117,63 @@ defmodule Vagus.API.CoreProxyWSDispatchTest do
     end
   end
 
+  test "all sockets together are bounded by the task supervisor", ctx do
+    hold_dispatches()
+    token = token("wsd_global")
+
+    sockets = for _socket <- 1..5, do: socket(ctx, token, 1..8)
+
+    # Forty calls, thirty-two tasks: the rest are answered at once.
+    assert sockets |> Enum.map(&busy/1) |> Enum.sum() == 8
+
+    tasks = 32 |> dispatching() |> Enum.map(&elem(&1, 0))
+    refute_received {:dispatching, _task, _bridge, _slug, _request}
+    assert Enum.sort(tasks()) == Enum.sort(tasks)
+
+    Enum.each(tasks, &release(&1, :no_response))
+    await_no_tasks()
+    Enum.each(sockets, &send(&1, :close))
+  end
+
+  test "the bound on all sockets holds after the sockets that filled it have gone", ctx do
+    hold_dispatches()
+    token = token("wsd_orphans")
+
+    sockets = for _socket <- 1..4, do: socket(ctx, token, 1..8)
+    assert sockets |> Enum.map(&busy/1) |> Enum.sum() == 0
+
+    started = dispatching(32)
+    tasks = Enum.map(started, &elem(&1, 0))
+    bridges = started |> Enum.map(&elem(&1, 1)) |> Enum.uniq()
+    assert length(bridges) == 4
+
+    # Every bridge goes, and every task is still there.
+    monitors = Enum.map(bridges, &{&1, Process.monitor(&1)})
+    Enum.each(sockets, &send(&1, :close))
+
+    for {bridge, ref} <- monitors do
+      assert_receive {:DOWN, ^ref, :process, ^bridge, _reason}, @recv_timeout
+    end
+
+    assert Enum.sort(tasks()) == Enum.sort(tasks)
+
+    # A socket that has started nothing is told the bridge is busy.
+    late = socket(ctx, token, [1])
+    assert busy(late) == 1
+    refute_received {:dispatching, _task, _bridge, _slug, _request}
+
+    # Until a task ends.
+    release(hd(tasks), :no_response)
+    eventually(fn -> length(tasks()) == 31 end)
+    next = socket(ctx, token, [1])
+    assert busy(next) == 0
+    [{task, _bridge}] = dispatching(1)
+
+    Enum.each([task | tl(tasks)], &release(&1, :no_response))
+    await_no_tasks()
+    Enum.each([late, next], &send(&1, :close))
+  end
+
   test "a socket closed with calls pending leaves their tasks to finish, and nothing behind",
        ctx do
     hold_dispatches()
@@ -898,14 +1184,9 @@ defmodule Vagus.API.CoreProxyWSDispatchTest do
         send_text(client, frame(id, "post", "/backups/new/full"))
       end)
 
-    dispatching =
-      for _ <- 1..3 do
-        assert_receive {:dispatching, task, bridge, _slug, _request}, @recv_timeout
-        {task, bridge}
-      end
-
-    [{_task, bridge} | _rest] = dispatching
-    tasks = Enum.map(dispatching, &elem(&1, 0))
+    started = dispatching(3)
+    [{_task, bridge} | _rest] = started
+    tasks = Enum.map(started, &elem(&1, 0))
     bridge_ref = Process.monitor(bridge)
 
     log =
@@ -918,9 +1199,9 @@ defmodule Vagus.API.CoreProxyWSDispatchTest do
         assert Enum.sort(tasks()) == Enum.sort(tasks)
 
         Enum.each(tasks, &release(&1, ok_outcome(%{})))
+        await_no_tasks()
       end)
 
-    assert tasks() == []
     refute log =~ "[error]"
   end
 
@@ -933,7 +1214,8 @@ defmodule Vagus.API.CoreProxyWSDispatchTest do
     assert_receive {:dispatching, task, bridge, _slug, _request}, @recv_timeout
     bridge_ref = Process.monitor(bridge)
 
-    # The web server's report of this stop prints the bridge's state.
+    # The web server's report of this stop prints the bridge's state: the
+    # credential's hash is in it, and the token is not.
     log =
       capture_log(fn ->
         Process.exit(websock_state(bridge).upstream, :kill)
@@ -942,11 +1224,12 @@ defmodule Vagus.API.CoreProxyWSDispatchTest do
         assert_receive {:DOWN, ^bridge_ref, :process, ^bridge, _reason}, @recv_timeout
       end)
 
+    assert log =~ "credential: <<"
     refute log =~ token
 
     assert Process.alive?(task)
     release(task, ok_outcome(%{}))
-    assert tasks() == []
+    await_no_tasks()
   end
 
   test "a result for a call this socket never made is dropped", ctx do

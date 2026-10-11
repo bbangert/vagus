@@ -94,11 +94,17 @@ defmodule Vagus.API.Router do
   # non-supervisor caller hitting this same route — passes through here
   # completely unread (`pass: ["*/*"]` below), so it's never spooled to disk
   # pre-auth.
+  @body_limit 65_536
+
+  @doc "The largest request body this router reads, in bytes."
+  @spec body_limit() :: pos_integer()
+  def body_limit, do: @body_limit
+
   plug(Plug.Parsers,
     parsers: [:json, :urlencoded],
     pass: ["*/*"],
     json_decoder: Jason,
-    length: 65_536
+    length: @body_limit
   )
 
   # `Vagus.API.Auth` authenticates every request, with exactly one exemption

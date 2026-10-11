@@ -31,13 +31,17 @@ defmodule Vagus.API.CoreProxyWSEquivalenceTest do
   A `supervisor/api` call must get an app no more than the same request over
   HTTP with its own token gets it.
 
-  Every route in the authorisation fixture, under every method, as every
-  kind of app, plus the paths that are not routes at all, is sent both ways:
-  through `Vagus.API.Dispatcher` and through the bridge on a real socket.
-  A GET runs its handler on both sides; anything else stops at the gate and
-  the matched route, on both sides, since its handler would act.
+  Every route in the authorisation fixture, under every method, plus the
+  paths that are not routes at all, is sent both ways: through
+  `Vagus.API.Dispatcher` and through the bridge on a real socket. One test
+  per kind of app.
 
-  Set `WS_EQUIV_OUT` to a path to keep every row.
+  A GET runs its handler on both sides, and so do the POSTs in `@bodies`.
+  Anything else stops at the gate and the matched route, on both sides,
+  since its handler would act: those rows compare the decision, and their
+  data is equal by construction.
+
+  Set `WS_EQUIV_OUT` to a path to keep every row, one file per app.
   """
   use ExUnit.Case, async: false
 
@@ -61,20 +65,22 @@ defmodule Vagus.API.CoreProxyWSEquivalenceTest do
 
   @methods ~w(GET POST DELETE)
 
-  # Every principal holds `homeassistant_api`: the socket requires it.
+  # Every principal holds `homeassistant_api`: the socket requires it. The
+  # number is how many rows must have run a real handler on both sides and
+  # agreed, so the comparison cannot pass on stubbed rows alone.
   @principals [
-    {"none", %{hassio_api: false, hassio_role: "admin"}},
-    {"default", %{hassio_role: "default"}},
-    {"homeassistant", %{hassio_role: "homeassistant"}},
-    {"backup", %{hassio_role: "backup"}},
-    {"manager", %{hassio_role: "manager"}},
-    {"admin", %{hassio_role: "admin"}},
-    {"none_auth", %{hassio_api: false, hassio_role: "default", auth_api: true}},
-    {"admin_auth", %{hassio_role: "admin", auth_api: true}},
-    {"default_want", %{hassio_role: "default", services_role: %{"mqtt" => "want"}}},
-    {"manager_need", %{hassio_role: "manager", services_role: %{"mqtt" => "need"}}},
-    {"admin_provide", %{hassio_role: "admin", services_role: %{"mqtt" => "provide"}}},
-    {"default_disc", %{hassio_role: "default", discovery: ["mqtt"]}}
+    {"none", %{hassio_api: false, hassio_role: "admin"}, 5},
+    {"default", %{hassio_role: "default"}, 14},
+    {"homeassistant", %{hassio_role: "homeassistant"}, 15},
+    {"backup", %{hassio_role: "backup"}, 15},
+    {"manager", %{hassio_role: "manager"}, 25},
+    {"admin", %{hassio_role: "admin"}, 26},
+    {"none_auth", %{hassio_api: false, hassio_role: "default", auth_api: true}, 5},
+    {"admin_auth", %{hassio_role: "admin", auth_api: true}, 26},
+    {"default_want", %{hassio_role: "default", services_role: %{"mqtt" => "want"}}, 15},
+    {"manager_need", %{hassio_role: "manager", services_role: %{"mqtt" => "need"}}, 25},
+    {"admin_provide", %{hassio_role: "admin", services_role: %{"mqtt" => "provide"}}, 27},
+    {"default_disc", %{hassio_role: "default", discovery: ["mqtt"]}, 15}
   ]
 
   # The routes whose handler, not the table, decides from the body. Their
@@ -90,6 +96,11 @@ defmodule Vagus.API.CoreProxyWSEquivalenceTest do
     {"/addons/eq_target/security", %{"protected" => false}},
     {"/addons/{OWN}/security", %{"protected" => false}}
   ]
+
+  # Fields that differ between two reads of the same route over HTTP alone:
+  # the host stub reads the real disk, which the suite is writing to. Only
+  # these are left out of a comparison, and only on these routes.
+  @volatile %{"/host/info" => ~w(disk_free disk_used)}
 
   # `{OWN}` is the calling app's slug.
   @slugs ["core_ssh", "self", "{OWN}", "eq_target", "vagus", "bad!slug"]
@@ -194,67 +205,84 @@ defmodule Vagus.API.CoreProxyWSEquivalenceTest do
     Stack.start()
   end
 
-  test "a supervisor/api call never gets an app more than the same HTTP request", ctx do
+  for {name, grants, handled_floor} <- @principals do
+    test "a supervisor/api call gets the #{name} app no more than the same HTTP request", ctx do
+      rows = rows(ctx, unquote(name), unquote(Macro.escape(grants)))
+      by_verdict = Enum.frequencies_by(rows, &elem(&1, 0))
+
+      if out = System.get_env("WS_EQUIV_OUT") do
+        File.write!("#{out}.#{unquote(name)}", Enum.map_join(rows, "\n", &line/1) <> "\n")
+
+        File.write!(
+          "#{out}.#{unquote(name)}.summary",
+          inspect(by_verdict, pretty: true, limit: :infinity) <> "\n"
+        )
+      end
+
+      assert for({:permissive, _, _, _, _} = row <- rows, do: line(row)) == []
+      assert for({{:unexplained, _why}, _, _, _, _} = row <- rows, do: line(row)) == []
+
+      # Where HTTP succeeds and the call is refused unsent, it is for one of
+      # the reasons `WSDispatch.read/1` names, and no other.
+      unsent = for {{:http_ok_refused_unsent, class}, _, _, _, _} <- rows, do: class
+      assert Enum.frequencies(unsent)[:unnamed] == nil, inspect(Enum.frequencies(unsent))
+
+      # Rows where a real handler ran on both sides and the data agreed.
+      assert Map.get(by_verdict, {:both_ok, :handler}, 0) >= unquote(handled_floor)
+
+      # Every route of the fixture was sent, under its own method.
+      sent =
+        MapSet.new(rows, fn {_verdict, method, template, _rest, _ws} -> {method, template} end)
+
+      for %{"method" => method, "path" => path} <- @routes do
+        assert {method, path} in sent
+      end
+
+      assert length(rows) > 1_100
+    end
+  end
+
+  defp rows(ctx, name, grants) do
     install_app(app_config("eq_target"))
     test_pid = self()
 
-    Stack.put_env(:ws_dispatch_fun, fn slug, request ->
+    Stack.put_env(:ws_dispatch_fun, fn slug, credential, request ->
       send(test_pid, :dispatched)
-      WSDispatch.run(slug, request, plug(request.method, request.path, request.data))
+      plug = plug(request.method, request.path, request.body)
+      WSDispatch.run(slug, credential, request, &plug.call(&1, plug.init([])))
     end)
 
-    callers =
-      for {name, grants} <- @principals do
-        slug = "eq_" <> name
+    slug = "eq_" <> name
 
-        token =
-          register_app_token(app_config(slug),
-            token: "eq-tok-#{name}-#{System.unique_integer([:positive])}",
-            identity: Map.merge(%{homeassistant_api: true, hassio_api: true}, grants)
-          )
+    token =
+      register_app_token(app_config(slug),
+        token: "eq-tok-#{name}-#{System.unique_integer([:positive])}",
+        identity: Map.merge(%{homeassistant_api: true, hassio_api: true}, grants)
+      )
 
-        {name, slug, token}
-      end
-
-    # One socket open at a time: a socket's frames are messages to this
-    # process, and one read while another socket is being read is lost,
-    # which leaves that socket deaf.
     {rows, _log} =
       with_log(fn ->
-        Enum.flat_map(callers, fn {name, slug, token} ->
-          client = Stack.relaying_client(ctx.proxy_host, ctx.proxy_port, token)
+        client = Stack.relaying_client(ctx.proxy_host, ctx.proxy_port, token)
 
-          {rows, {client, _id}} =
-            Enum.map_reduce(cases(), {client, 1}, fn {method, template, body}, state ->
-              path = String.replace(template, "{OWN}", slug)
-              {verdict, rest, ws, state} = compare({method, path, body}, {slug, token}, state, 3)
-              {{verdict, name, method, template, rest, ws}, state}
-            end)
+        {rows, _client} =
+          cases()
+          |> Enum.with_index(1)
+          |> Enum.map_reduce(client, fn {{method, template, body}, id}, client ->
+            path = String.replace(template, "{OWN}", slug)
+            rest = rest(method, path, token, body)
+            # Providing a service twice is an error, so each side starts without it.
+            Vagus.App.withdraw_service(slug, "mqtt")
+            {ws, dispatched?, client} = ws(client, id, method, path, body)
+            Vagus.App.withdraw_service(slug, "mqtt")
 
-          Client.send_frame(client, {:close, 1000, ""})
-          assert_receive {:core_terminate, _reason}, @recv_timeout
-          rows
-        end)
+            verdict = verdict({method, template, path, body}, rest, ws, dispatched?)
+            {{verdict, method, template, rest, ws}, client}
+          end)
+
+        rows
       end)
 
-    by_verdict = Enum.frequencies_by(rows, &elem(&1, 0))
-
-    if out = System.get_env("WS_EQUIV_OUT") do
-      File.write!(out, Enum.map_join(rows, "\n", &line/1) <> "\n")
-      File.write!(out <> ".summary", inspect(by_verdict, pretty: true, limit: :infinity) <> "\n")
-    end
-
-    permissive = for {:permissive, _, _, _, _, _} = row <- rows, do: line(row)
-    unexplained = for {{:unexplained, _why}, _, _, _, _, _} = row <- rows, do: line(row)
-
-    assert permissive == []
-    assert unexplained == []
-
-    # The comparison is of something: every kind of row occurs.
-    assert by_verdict[:both_ok] > 500
-    assert by_verdict[:both_refused] > 1_000
-    assert by_verdict[:refused_before_dispatch] > 500
-    assert length(rows) == length(@principals) * length(cases())
+    rows
   end
 
   ## The cases
@@ -284,7 +312,7 @@ defmodule Vagus.API.CoreProxyWSEquivalenceTest do
 
   # A handler runs only for a GET, and only where it does not stream.
   defp plug("GET", path, _body), do: if(streams?(path), do: GateOnly, else: Router)
-  defp plug(_method, _path, nil), do: GateOnly
+  defp plug(_method, _path, body) when body in [nil, ""], do: GateOnly
   defp plug(_method, _path, _body), do: Router
 
   defp streams?(path),
@@ -365,38 +393,23 @@ defmodule Vagus.API.CoreProxyWSEquivalenceTest do
 
   ## The rule
 
-  # A clock or a free-space reading can move between the two requests, so a
-  # difference in data must show three times running to count.
-  defp compare({method, path, body} = request, {slug, token} = caller, {client, id}, tries) do
-    rest = rest(method, path, token, body)
-    # Providing a service twice is an error, so each side starts without it.
-    Vagus.App.withdraw_service(slug, "mqtt")
-    {ws, dispatched?, client} = ws(client, id, method, path, body)
-    Vagus.App.withdraw_service(slug, "mqtt")
-
-    case verdict(rest, ws, dispatched?) do
-      {:unexplained, :data_differs} when tries > 1 ->
-        compare(request, caller, {client, id + 1}, tries - 1)
-
-      verdict ->
-        {verdict, rest, ws, {client, id + 1}}
-    end
-  end
-
-  defp verdict({status, body}, ws, dispatched?) do
-    rest = envelope(status, body)
+  defp verdict({method, template, path, body}, {status, rest_body}, ws, dispatched?) do
+    rest = envelope(status, rest_body)
+    ran = if plug(method, path, body) == Router, do: :handler, else: :gate
 
     case {rest, ws, dispatched?} do
-      {{:ok, data}, %{"success" => true, "result" => data}, true} ->
-        :both_ok
-
-      {{:ok, _data}, %{"success" => true}, true} ->
-        {:unexplained, :data_differs}
+      {{:ok, data}, %{"success" => true, "result" => result}, true} ->
+        if steady(template, data) == steady(template, result),
+          do: {:both_ok, ran},
+          else: {:unexplained, :data_differs}
 
       {_refused, %{"success" => true}, _dispatched?} ->
         :permissive
 
-      {_any, %{"success" => false}, false} ->
+      {{:ok, _data}, %{"success" => false}, false} ->
+        {:http_ok_refused_unsent, unsent_class(path)}
+
+      {_refused, %{"success" => false}, false} ->
         :refused_before_dispatch
 
       {{:ok, _data}, %{"success" => false}, true} ->
@@ -406,6 +419,37 @@ defmodule Vagus.API.CoreProxyWSEquivalenceTest do
         if error == expected_error(status, message),
           do: :both_refused,
           else: {:unexplained, :error_mapping}
+    end
+  end
+
+  defp steady(template, data) when is_map(data),
+    do: Map.drop(data, Map.get(@volatile, template, []))
+
+  defp steady(_template, data), do: data
+
+  # Named here independently of `WSDispatch`: what this test expects the
+  # refusal to be for.
+  defp unsent_class(path) do
+    segments = String.split(path, "/", trim: true)
+
+    cond do
+      not String.starts_with?(path, "/") or String.starts_with?(path, "//") ->
+        :non_canonical
+
+      path =~ ~r{[%?#]|//|/\.\.?(/|$)|/$} ->
+        :non_canonical
+
+      Dispatcher.family(segments) != :router ->
+        :proxy_family
+
+      path =~ ~r{/follow$|^/backups/[^/]+/download$|^/backups/new/upload$} ->
+        :stream_or_file
+
+      path =~ ~r{^/(store/)?addons/[^/]+/(icon|logo|changelog|documentation)$} ->
+        :stream_or_file
+
+      true ->
+        :unnamed
     end
   end
 
@@ -431,11 +475,10 @@ defmodule Vagus.API.CoreProxyWSEquivalenceTest do
 
   defp expected_error(_status, message), do: %{"code" => "unknown_error", "message" => message}
 
-  defp line({verdict, name, method, template, {status, body}, ws}) do
+  defp line({verdict, method, template, {status, body}, ws}) do
     Enum.join(
       [
         inspect(verdict),
-        name,
         method,
         template,
         status,

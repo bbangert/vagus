@@ -126,15 +126,18 @@ defmodule Vagus.Application do
         [
           # The `supervisor/api` calls `Vagus.API.CoreProxy.WSBridge` answers
           # in-process, one task each. Immediately before the listener, so
-          # it is ordered against the rest of the tree exactly as the
-          # listener's own request processes are: the sockets that start
-          # these tasks stop first, and what an HTTP handler can rely on at
-          # shutdown a task can too.
-          # `max_children` is the bound across all sockets, the only one that
-          # outlasts a socket, since a task is left running when its caller
-          # times out or goes. A task does not trap exits, so stopping the
-          # application ends one mid-handler, as it ends an HTTP request once
-          # Bandit's drain runs out.
+          # the sockets that start these tasks stop first.
+          #
+          # `max_children` is the bound across all sockets, and the one that
+          # outlasts a socket: a task is left running when its caller times
+          # out or goes. The 32 slots are shared by every app, so one app
+          # with several sockets can fill them and the others are then told
+          # the bridge is busy. Accepted: the same requests over HTTP have no
+          # cap at all, and a handful of parallel reads is the expected use.
+          #
+          # A task does not trap exits, so stopping the application ends it
+          # mid-handler at once, without the drain Bandit gives an HTTP
+          # request.
           {Task.Supervisor, name: Vagus.API.CoreProxy.TaskSupervisor, max_children: 32},
 
           # Supervisor-API emulator's HTTP surface (Bandit + Plug.Router),
