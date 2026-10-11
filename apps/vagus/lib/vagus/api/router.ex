@@ -306,9 +306,10 @@ defmodule Vagus.API.Router do
 
   defp fail_as_task_did(reason), do: exit(reason)
 
-  # 900 s is the largest timeout one call over the Core WebSocket proxy may
-  # declare (`Vagus.API.CoreProxy.WSDispatch`).
-  @handler_deadlines %{disk_usage: 900_000}
+  # A minute under the largest timeout a call over the Core WebSocket proxy
+  # may declare (900 s, `Vagus.API.CoreProxy.WSDispatch`): a caller that waits
+  # that long gets this answer, and its slot is free before its own timer fires.
+  @handler_deadlines %{disk_usage: 840_000}
 
   # Tests shorten these by name; production never sets the key.
   defp handler_deadline(name) do
