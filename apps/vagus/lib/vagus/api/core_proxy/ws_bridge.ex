@@ -212,7 +212,7 @@ defmodule Vagus.API.CoreProxy.WSBridge do
 
   require Logger
 
-  alias Vagus.API.{Authz, CoreProxy, SourceGuard}
+  alias Vagus.API.{Authz, CoreProxy, SourceGuard, WSViolation}
   alias Vagus.API.CoreProxy.WSBridge.Upstream
   alias Vagus.API.CoreProxy.WSDispatch
   alias Vagus.App.Policy
@@ -425,9 +425,15 @@ defmodule Vagus.API.CoreProxy.WSBridge do
   so `Upstream.terminate/2`'s own best-effort close-frame-to-Core actually
   runs; the `try/catch` guards the TOCTOU race against `Upstream` having
   already exited on its own (e.g. after already sending
-  `{:upstream_close, ...}`).
+  `{:upstream_close, ...}`). A frame Bandit refused is counted first: no
+  callback here saw it.
   """
-  def terminate(_reason, %{upstream: pid}) when is_pid(pid) do
+  def terminate(reason, state) do
+    WSViolation.count(reason)
+    stop_upstream(state)
+  end
+
+  defp stop_upstream(%{upstream: pid}) when is_pid(pid) do
     try do
       if Process.alive?(pid), do: GenServer.stop(pid, :normal, 5_000)
     catch
@@ -437,7 +443,7 @@ defmodule Vagus.API.CoreProxy.WSBridge do
     :ok
   end
 
-  def terminate(_reason, _state), do: :ok
+  defp stop_upstream(_state), do: :ok
 
   ## Internals
 

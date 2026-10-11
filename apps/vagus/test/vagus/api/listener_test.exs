@@ -78,8 +78,11 @@ defmodule Vagus.API.ListenerTest do
       assert options[:thousand_island_options] == [
                num_acceptors: 2,
                read_timeout: 900_000,
+               silent_terminate_on_error: true,
                supervisor_options: [name: Vagus.API.Listener.Bandit]
              ]
+
+      assert options[:websocket_options] == [log_protocol_errors: false]
     end
 
     test "the child registers a name, so a restarted manager can find it" do

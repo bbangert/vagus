@@ -279,6 +279,28 @@ defmodule Vagus.API.SourceGuardTest do
       assert %{filtered_by: %{authz: 1}} = :sys.get_state(SourceGuard)
     end
 
+    test "refused WebSocket frames share the counter and the single summary line" do
+      import ExUnit.CaptureLog
+
+      start_supervised!({SourceGuard, name: SourceGuard})
+
+      log =
+        capture_log(fn ->
+          for _ <- 1..3, do: SourceGuard.record_filtered(:ws, "ws/oversize")
+          SourceGuard.record_filtered(:authz, "authz/manager")
+          send(SourceGuard, :refresh)
+          _ = :sys.get_state(SourceGuard)
+        end)
+
+      assert log =~ "filtered 4 request(s)"
+      assert log =~ "ws: 3"
+      assert log =~ "authz: 1"
+      assert length(String.split(log, "filtered ")) == 2
+
+      SourceGuard.record_filtered(:ws, "ws/protocol")
+      assert %{filtered_by: %{ws: 1}} = :sys.get_state(SourceGuard)
+    end
+
     test "record_filtered/2 is a no-op when the guard isn't running" do
       # No `start_supervised!` here — mirrors the existing "safe when
       # disabled" property `record_refusal/1` already has: casting to an

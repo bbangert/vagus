@@ -129,6 +129,7 @@ defmodule Vagus.Ingress.WSBridge do
 
   @behaviour WebSock
 
+  alias Vagus.API.WSViolation
   alias Vagus.Ingress.WSBridge.Upstream
 
   @typedoc "State carried across every `WebSock` callback for the browser leg."
@@ -277,8 +278,15 @@ defmodule Vagus.Ingress.WSBridge do
   `{:upstream_close, ...}` for path 1/2) — `GenServer.stop/3` against an
   already-dead pid exits `:noproc`, which would otherwise crash this
   `terminate/2` itself.
+
+  A frame Bandit refused is counted first: no callback here saw it.
   """
-  def terminate(_reason, %{upstream: pid}) when is_pid(pid) do
+  def terminate(reason, state) do
+    WSViolation.count(reason)
+    stop_upstream(state)
+  end
+
+  defp stop_upstream(%{upstream: pid}) when is_pid(pid) do
     try do
       if Process.alive?(pid), do: GenServer.stop(pid, :normal, 5_000)
     catch
@@ -288,7 +296,7 @@ defmodule Vagus.Ingress.WSBridge do
     :ok
   end
 
-  def terminate(_reason, _state), do: :ok
+  defp stop_upstream(_state), do: :ok
 
   # issue #37: bound on the `GenServer.call/3` `handle_in/2` makes to `B` for
   # every relayed frame — see moduledoc's "Steady-state backpressure". No

@@ -167,15 +167,17 @@ defmodule Vagus.API.SourceGuard do
   request bytes. `:authz` is a refusal by `Vagus.API.Authz`'s table. Its
   caller holds a token, but an installed app can repeat a refused request as
   freely as an anonymous one, so it is counted here too, and its sample is a
-  static label as well. This module only stores/logs whatever it's given, so an
-  unsanitized caller would defeat the entire point of routing this through a
-  counter instead of `Logger.warning/1` directly.
+  static label as well. `:ws` is a WebSocket frame Bandit refused
+  (`Vagus.API.WSViolation`), under a static label too. This module only
+  stores/logs whatever it's given, so an unsanitized caller would defeat the
+  entire point of routing this through a counter instead of
+  `Logger.warning/1` directly.
 
   Safe to call when the guard is disabled, same as `record_refusal/1`.
   """
-  @spec record_filtered(:path | :query | :blacklist | :authz, String.t()) :: :ok
+  @spec record_filtered(:path | :query | :blacklist | :authz | :ws, String.t()) :: :ok
   def record_filtered(kind, sample)
-      when kind in [:path, :query, :blacklist, :authz] and is_binary(sample) do
+      when kind in [:path, :query, :blacklist, :authz, :ws] and is_binary(sample) do
     GenServer.cast(__MODULE__, {:filtered, kind, sample})
   end
 
@@ -223,7 +225,7 @@ defmodule Vagus.API.SourceGuard do
 
   ## GenServer
 
-  @no_filtered %{path: 0, query: 0, blacklist: 0, authz: 0}
+  @no_filtered %{path: 0, query: 0, blacklist: 0, authz: 0, ws: 0}
 
   @impl GenServer
   def init(_opts) do
@@ -311,7 +313,8 @@ defmodule Vagus.API.SourceGuard do
     Logger.warning(
       "Vagus.API.SourceGuard: filtered #{state.filtered} request(s) " <>
         "(path: #{state.filtered_by.path}, query: #{state.filtered_by.query}, " <>
-        "blacklist: #{state.filtered_by.blacklist}, authz: #{state.filtered_by.authz}), " <>
+        "blacklist: #{state.filtered_by.blacklist}, authz: #{state.filtered_by.authz}, " <>
+        "ws: #{state.filtered_by.ws}), " <>
         "e.g. #{state.filtered_sample}"
     )
 

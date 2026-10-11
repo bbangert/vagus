@@ -124,6 +124,9 @@ defmodule Vagus.API.Listener do
       plug: Keyword.get(opts, :plug, Dispatcher),
       port: Keyword.get_lazy(opts, :port, &configured_port/0),
       http_options: [compress: false],
+      # Bandit's line for a malformed or oversize frame is one per attempt.
+      # The bridges count those instead (`Vagus.API.WSViolation`).
+      websocket_options: [log_protocol_errors: false],
       # RAM discipline: no per-request processes or Registry/ETS are needed
       # for this surface. The 15-minute `read_timeout` (Thousand Island's
       # default is 60s) is deliberate: it mirrors the ingress session's own
@@ -131,9 +134,16 @@ defmodule Vagus.API.Listener do
       # legitimately idle-but-open ingress connection (a long-polling panel
       # asset, a slow log tail) is never killed by the transport layer
       # before the session itself would time the client out.
+      #
+      # `silent_terminate_on_error`: Bandit ends a WebSocket by returning an
+      # error on an oversize fragmented message, on invalid UTF-8 and on a
+      # handler's own abnormal stop. Unsilenced, each is a crash report
+      # carrying the caller's last bytes and the handler's state. A handler
+      # that raises is still reported.
       thousand_island_options: [
         num_acceptors: 2,
         read_timeout: 900_000,
+        silent_terminate_on_error: true,
         supervisor_options: [name: listener_name(opts)]
       ]
     ]
