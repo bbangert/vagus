@@ -22,6 +22,8 @@ defmodule Vagus.Runtime.Docker do
 
   @default_socket "/var/run/docker.sock"
   @recv_timeout 60_000
+  # Mint's own default, stated here so a deadline can shorten it.
+  @connect_timeout 30_000
   # Cap a single response body so a hostile/huge daemon stream can't exhaust a
   # 1GB device (mirrors the router's Plug.Parsers `length:` discipline).
   @max_body 16_777_216
@@ -359,28 +361,38 @@ defmodule Vagus.Runtime.Docker do
   """
   @spec request(atom(), String.t(), keyword()) :: {:ok, response()} | {:error, term()}
   def request(method, path, opts \\ []) do
-    # Checked before connecting: a request sent past the deadline would start
-    # work in the engine that nothing then waits for.
-    if left_ms(Keyword.get(opts, :deadline)) > 0 do
-      send_request(method, path, opts)
+    deadline = Keyword.get(opts, :deadline)
+    left = left_ms(deadline)
+
+    # Checked before connecting, and again before sending: a request sent past
+    # the deadline would start work in the engine that nothing then waits for.
+    if left > 0 do
+      send_request(method, path, opts, deadline, min(left, @connect_timeout))
     else
       {:error, :deadline}
     end
   end
 
-  defp send_request(method, path, opts) do
+  defp send_request(method, path, opts, deadline, connect_timeout) do
     socket = Keyword.get(opts, :socket, socket_path())
     full_path = path <> encode_query(Keyword.get(opts, :query, []))
     {headers, body} = prepare_body(Keyword.get(opts, :body), Keyword.get(opts, :headers, []))
     method = method |> to_string() |> String.upcase()
 
-    case Mint.HTTP.connect(:http, {:local, socket}, 0, mode: :passive, hostname: "localhost") do
+    connect_opts = [
+      mode: :passive,
+      hostname: "localhost",
+      transport_opts: [timeout: connect_timeout]
+    ]
+
+    case Mint.HTTP.connect(:http, {:local, socket}, 0, connect_opts) do
       {:ok, conn} ->
         # try/after so the socket is always closed — including when a *raise*
         # (not just an error tuple) escapes the request/recv path.
         try do
-          with {:ok, conn, ref} <- Mint.HTTP.request(conn, method, full_path, headers, body),
-               {:ok, _conn, responses} <- recv_all(conn, ref, Keyword.get(opts, :deadline)) do
+          with :ok <- in_time(conn, deadline),
+               {:ok, conn, ref} <- Mint.HTTP.request(conn, method, full_path, headers, body),
+               {:ok, _conn, responses} <- recv_all(conn, ref, deadline) do
             {:ok, assemble(responses, ref)}
           else
             {:error, _conn, reason} -> {:error, reason}
@@ -389,9 +401,17 @@ defmodule Vagus.Runtime.Docker do
           Mint.HTTP.close(conn)
         end
 
+      # The wait was cut to what the deadline had left.
+      {:error, %Mint.TransportError{reason: :timeout}} when connect_timeout < @connect_timeout ->
+        {:error, :deadline}
+
       {:error, reason} ->
         {:error, {:connect, reason}}
     end
+  end
+
+  defp in_time(conn, deadline) do
+    if left_ms(deadline) > 0, do: :ok, else: {:error, conn, :deadline}
   end
 
   @doc "The resolved daemon socket path."

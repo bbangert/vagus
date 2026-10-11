@@ -11,14 +11,17 @@ defmodule Vagus.Addon.Store.HTTPFetcher do
   A repo map is `%{slug, url, ref}` (`ref` defaults to `"master"`). Never
   raises; any failure is an `{:error, reason}`.
 
-  One fetch is bounded: Finch's pool and connect timeouts, then
-  `@request_timeout` for the whole response. Finch checks that limit as each
-  chunk arrives, so the response can overrun it by one `@receive_timeout`.
+  A fetch has a budget, not a hard limit. `@request_timeout` covers the
+  response only: Finch's pool checkout and connect come before it, under
+  their own timeouts. Finch takes it down as each receive returns, and a
+  receive may wait a full `@receive_timeout`, so the response can overrun it
+  by up to that.
   """
 
   @finch Vagus.Core.Finch
   @receive_timeout 60_000
-  # The largest archive accepted, at about 1 Mbit/s.
+  # A budget for the response, overrun by up to one receive (see the
+  # moduledoc). Sized for the largest archive accepted at about 1 Mbit/s.
   @request_timeout 300_000
   @codeload "https://codeload.github.com"
   @max_archive 33_554_432
@@ -29,7 +32,7 @@ defmodule Vagus.Addon.Store.HTTPFetcher do
   Fetches + extracts `repository`'s archive. See the moduledoc.
 
   `opts` is for tests: `:base` replaces the codeload origin and
-  `:request_timeout` the limit on the whole response.
+  `:request_timeout` the response's budget.
   """
   @spec fetch(map(), keyword()) :: {:ok, [{String.t(), binary()}]} | {:error, term()}
   def fetch(repo, opts \\ [])

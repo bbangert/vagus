@@ -68,8 +68,10 @@ defmodule Vagus.Backend.Host.DiskUsage do
   end
 
   # `System.cmd/3` has no timeout, so the deadline is a task's. Killing it
-  # closes the port; the `df` process itself is not signalled. A missing
-  # binary raises there, and comes back as an error like the rest.
+  # closes the port; the `df` process itself is not signalled. That is
+  # accepted: a `df` stuck in uninterruptible I/O would not die to a signal
+  # either, and before this bound the same stall held the request as well.
+  # A missing binary raises there, and comes back as an error like the rest.
   defp df(path, opts) do
     run = Keyword.get(opts, :df, &run_df/1)
 
