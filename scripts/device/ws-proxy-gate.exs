@@ -48,7 +48,11 @@ connect = fn ->
   status = Enum.find_value(resps, fn {:status, _, s} -> s; _ -> nil end)
   headers = Enum.find_value(resps, fn {:headers, _, h} -> h; _ -> nil end)
   {:ok, conn, ws} = Mint.WebSocket.new(conn, ref, status, headers)
-  left = for {:data, _, d} <- resps, into: "", do: d
+  # Mint.HTTP1 keeps bytes that trail the 101 in its own buffer, which
+  # Mint.WebSocket.stream/2 never revisits; an auth_required sent in the same
+  # TCP read as the 101 would otherwise be lost.
+  buffered = case conn do %{buffer: b} when is_binary(b) -> b; _ -> "" end
+  left = (for {:data, _, d} <- resps, into: "", do: d) <> buffered
   {:ok, ws, frames} = Mint.WebSocket.decode(ws, left)
   st = %{conn: conn, ref: ref, ws: ws, frames: frames}
   {{:text, a}, st} = recv.(recv, st, 15_000)
@@ -71,9 +75,9 @@ summ = fn
   {:close, code, _} -> %{"close" => code}
   other -> %{"other" => inspect(other) |> String.slice(0, 120)}
 end
-rest = fn path ->
+rest = fn method, path ->
   {:ok, s} = :gen_tcp.connect(~c"supervisor", 80, [:binary, active: false], 10_000)
-  :ok = :gen_tcp.send(s, "GET #{path} HTTP/1.1\r\nHost: supervisor\r\nAuthorization: Bearer #{System.get_env("SUPERVISOR_TOKEN")}\r\nConnection: close\r\n\r\n")
+  :ok = :gen_tcp.send(s, "#{method} #{path} HTTP/1.1\r\nHost: supervisor\r\nContent-Length: 0\r\nAuthorization: Bearer #{System.get_env("SUPERVISOR_TOKEN")}\r\nConnection: close\r\n\r\n")
   rd = fn rd, acc -> case :gen_tcp.recv(s, 0, 15_000) do {:ok, d} -> rd.(rd, acc <> d); _ -> acc end end
   resp = rd.(rd, "")
   :gen_tcp.close(s)
@@ -128,11 +132,13 @@ equal =
   try do
     {_a, {:text, t}, _ms} = one.(api.(40, "/addons/self/info", "get"))
     ws = Jason.decode!(t)
-    {status, body} = rest.("/addons/self/info")
+    {status, body} = rest.("GET", "/addons/self/info")
     vol = ~w(cpu_percent memory_usage memory_percent network_rx network_tx blk_read blk_write)
     w = Map.drop(ws["result"] || %{}, vol); r = Map.drop((is_map(body) && body["data"]) || %{}, vol)
     %{"ws_success" => ws["success"], "rest_status" => status, "keys" => map_size(w), "data_equal" => w == r, "differing_keys" => (for k <- Map.keys(w) ++ Map.keys(r), w[k] != r[k], uniq: true, do: k)}
   rescue e -> %{"exception" => Exception.message(e) |> String.slice(0, 200)}
   end
-rest_checks = for p <- ["/supervisor/info", "/addons/core_mqtt/info", "/core/restart"], do: {p, rest.(p) |> then(fn {s, b} -> {s, is_map(b) && b["message"]} end)}
+rest_checks =
+  for {m, p} <- [{"GET", "/supervisor/info"}, {"GET", "/addons/core_mqtt/info"}, {"POST", "/core/restart"}],
+      do: {m, p, rest.(m, p) |> then(fn {s, b} -> {s, is_map(b) && b["message"]} end)}
 %{utc: DateTime.utc_now() |> DateTime.to_iso8601(), slug: System.get_env("HOSTNAME"), cases: results, self_info_ws_vs_rest: equal, rest_same_token: rest_checks}
