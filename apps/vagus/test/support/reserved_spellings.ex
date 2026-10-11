@@ -1,11 +1,11 @@
 defmodule Vagus.ReservedSpellings do
   @moduledoc """
   Spellings of a Core view that read as it only after more than one
-  percent-decode. Core decodes a forwarded path once, so none of these is the
+  percent-decode: none is the view as written or decoded once. Core decodes a forwarded path once, so none of these is the
   view to Core; upstream refuses them all the same, on the fully decoded path.
   """
 
-  @doc "`char` under `layers` rounds of percent-encoding: `layered(\"h\", 2)` is `%2568`."
+  @doc "One byte under `layers` rounds of percent-encoding: `layered(\"h\", 2)` is `%2568`."
   @spec layered(String.t(), pos_integer()) :: String.t()
   def layered(<<byte>>, layers) when layers >= 1 do
     Enum.reduce(2..layers//1, "%" <> Base.encode16(<<byte>>), fn _layer, escape ->
@@ -18,7 +18,7 @@ defmodule Vagus.ReservedSpellings do
   follows `api`). A tail is appended to `/core/api/` or `/api/` as it stands.
   """
   @spec multiply_encoded([String.t()]) :: [{String.t(), String.t()}]
-  def multiply_encoded([view | more] = segments) do
+  def multiply_encoded([view | more]) do
     <<first::binary-size(1), rest::binary>> = view
     tail = fn spelled -> Enum.join([spelled | more], "/") end
     twice = layered(first, 2) <> rest
@@ -39,9 +39,10 @@ defmodule Vagus.ReservedSpellings do
          end)
        )},
       {"an escape whose own characters are escaped", tail.("%25%36%38" <> rest)},
-      {"%252F for every slash", Enum.join(segments, "%252F") <> "%252Fz"},
-      {"%25252f for every slash", Enum.join(segments, "%25252f") <> "%25252fz"},
-      {"twice, with %252F", Enum.join([twice | more], "%252F") <> "%252Fz"},
+      {"first character twice, %252F for every slash",
+       Enum.join([twice | more], "%252F") <> "%252Fz"},
+      {"first character three times, %25252f for every slash",
+       Enum.join([layered(first, 3) <> rest | more], "%25252f") <> "%25252fz"},
       {"a leading %252F", "%252F" <> tail.(view)},
       {"behind %252e", "%252e/" <> tail.(view)},
       {"behind %252E, twice", "%252E/" <> tail.(twice)},

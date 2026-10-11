@@ -70,10 +70,15 @@ defmodule Vagus.API.TiersTest do
     # `/.+/info` comes first upstream too.
     {"/os/datadisk/wipefoo/info", :default},
     {"/addons/core_mqtt/securityfoo/info", :default},
-    # Upstream's manager alternative is `/addons/<RE_SLUG>/...`.
-    {"/addons/bad!slug/rebuild", :admin},
-    {"/addons/bad!slug/x/y", :admin},
-    {"/addons/%63ore_mqtt/rebuild", :admin},
+    # A prefix is of one segment, and anything shorter is not it.
+    {"/os/datadisk/wip", :manager},
+    {"/os/datadisk", :manager},
+    {"/os/ssh/authorized_key", :manager},
+    {"/os/ssh/x/authorized_keys", :manager},
+    {"/addons/core_mqtt/securit", :manager},
+    {"/addons/core_mqtt/x/security", :manager},
+    # The raw spelling of a slug a manager app percent-encodes.
+    {"/addons/%63ore_mqtt/rebuild", :manager},
     # Upstream gives a manager `/time/.+`. Nothing is served there.
     {"/time/options", :admin},
     {"/time/info", :default}
@@ -81,15 +86,14 @@ defmodule Vagus.API.TiersTest do
 
   defp segments(path), do: path |> String.split("/", trim: true)
 
-  @upstream_tag "2026.10.1"
-
-  test "the fixture and the table say they mirror the same upstream tag" do
+  # Neither is checked against upstream here: this only keeps the two places
+  # that name the mirrored tag from drifting apart.
+  test "the fixture's header and the table's moduledoc name one upstream tag" do
     {:docs_v1, _anno, _lang, _format, %{"en" => moduledoc}, _meta, _docs} = Code.fetch_docs(Tiers)
+    header = @fixture_path |> File.read!() |> Jason.decode!() |> Map.fetch!("_upstream")
 
-    assert @fixture_path |> File.read!() |> Jason.decode!() |> Map.fetch!("_upstream") =~
-             "supervisor #{@upstream_tag},"
-
-    assert moduledoc =~ "upstream `#{@upstream_tag}`"
+    assert [_whole, tag] = Regex.run(~r/^supervisor (\d{4}\.\d{2}\.\d+),/, header)
+    assert Regex.scan(~r/\d{4}\.\d{2}\.\d+/, moduledoc) |> List.flatten() |> Enum.uniq() == [tag]
   end
 
   # A row's columns as the fixture's JSON spells them.
@@ -367,6 +371,38 @@ defmodule Vagus.API.TiersTest do
           Row.validate!({pattern, :manager, subject: :self, answer: answer})
         end
       end
+
+      for element <- [:any, nil, 7, {:prefix, ""}, {:prefix, :wipe}, {:suffix, "x"}] do
+        assert_raise ArgumentError, ~r/unknown pattern elements/, fn ->
+          Row.validate!({["os", element], :admin})
+        end
+
+        assert_raise ArgumentError, ~r/unknown pattern elements/, fn ->
+          Row.validate!({["addons", :_, element], :manager, subject: :self, answer: answer})
+        end
+      end
+    end
+
+    # A prefix is one segment, so the subject stays the second. In its place
+    # the prefix would be the subject, and with a tail the row has no fixed
+    # length.
+    test "a prefix row carries a predicate only where the subject still has its place" do
+      answer = %{"GET" => :forbidden}
+      row = {["addons", :_, {:prefix, "logs"}], :manager, subject: :self, answer: answer}
+
+      assert Row.validate!(row) == row
+
+      assert Row.validate!({["os", {:prefix, "x"}, :*], :admin}) ==
+               {["os", {:prefix, "x"}, :*], :admin, []}
+
+      for pattern <- [
+            ["addons", {:prefix, "core"}, "stats"],
+            ["addons", :_, {:prefix, "logs"}, :*]
+          ] do
+        assert_raise ArgumentError, fn ->
+          Row.validate!({pattern, :manager, subject: :self, answer: answer})
+        end
+      end
     end
 
     # As `Vagus.API.Tiers` uses it: in a module body, so the build stops.
@@ -406,11 +442,10 @@ defmodule Vagus.API.TiersTest do
         assert Tiers.required(prefix ++ [slug, kind]) == :anonymous
       end
 
-      # A segment that is not a slug must not ride the row. Under `/addons`
-      # it is no slug to the manager family either, as upstream's
-      # `/addons/<RE_SLUG>/...` has it; `/store.*` takes anything.
+      # A segment that is not a slug must not ride the row: it falls through
+      # to the family tier it had before the row existed.
       for slug <- ["bad!slug", "..", "."] do
-        assert Tiers.required(["addons", slug, "icon"]) == :admin
+        assert Tiers.required(["addons", slug, "icon"]) == :manager
         assert Tiers.required(["store", "addons", slug, "logo"]) == :manager
       end
 

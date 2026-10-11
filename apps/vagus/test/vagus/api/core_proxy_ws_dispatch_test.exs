@@ -336,6 +336,11 @@ defmodule Vagus.API.CoreProxyWSDispatchTest do
       "/store/addons/core_ssh/documentation",
       # Not one spelling of one path.
       "/core/api/%68assio/info",
+      # A reserved view under more than one layer of encoding.
+      "/core/api/%2568assio_auth",
+      "/core/api/%252568assio/info",
+      "/homeassistant/api/%252e/%2568assio_auth",
+      "/core/api/%252Fhassio_auth/password_reset",
       "/core/api/./hassio_auth",
       "/core/api/../api/hassio_auth",
       "/supervisor/%69nfo",

@@ -143,7 +143,7 @@ defmodule Vagus.Core.Reserved do
       ^path ->
         false
 
-      _still_encoded when decodes_left == 0 ->
+      _decoded when decodes_left == 0 ->
         true
 
       decoded ->

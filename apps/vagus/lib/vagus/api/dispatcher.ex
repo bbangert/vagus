@@ -264,7 +264,8 @@ defmodule Vagus.API.Dispatcher do
   # `URI.decode/1` leaves an invalid `%zz` as written and never raises.
   #
   # `Vagus.API.CoreProxy` puts these same two spellings to `Vagus.API.Authz`.
-  # A path this passed and that refused would be a 500, not a 403.
+  # Were a path to pass here and be refused there, the caller would get a 500
+  # where a 403 is due.
   defp core_proxy_blacklisted?(conn) do
     Tiers.blacklisted?(conn.path_info) or Tiers.blacklisted?(decoded_path_segments(conn))
   end

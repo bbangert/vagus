@@ -180,7 +180,7 @@ defmodule Vagus.API.Tiers do
     # on 26 routes was this whole plan's root cause.
     #
     # Enumerated, an `/addons/self/X` nobody thought about falls through to
-    # `["addons", :slug, :+]` ⇒ `:manager` — closed, the same invariant every
+    # `["addons", :_, :+]` ⇒ `:manager` — closed, the same invariant every
     # other row keeps. Upstream serves more of these than Vagus does
     # (`rebuild`, `stdin`, …); when a route for one lands, add it here
     # deliberately rather than discovering it was already open.
@@ -304,11 +304,11 @@ defmodule Vagus.API.Tiers do
     {["backups", :*], :backup},
 
     # -- role_access[manager] (security.py L134-163) --------------------------
-    # One entry per upstream alternative, in upstream's order. Families Vagus
-    # does not serve (`/cli`, `/docker`, `/observer`, `/security`,
-    # `/snapshots`) are kept so the diff stays one-to-one and a future route
-    # lands on the right tier by default. `/time/.+` is the exception: it has
-    # no row, so what upstream gives a manager there is admin here.
+    # Upstream's alternatives in upstream's order, a lookahead taking a row
+    # per thing it excludes. Families Vagus does not serve (`/cli`, `/docker`,
+    # `/observer`, `/security`, `/snapshots`) are kept so a future route lands
+    # on the right tier by default. `/time/.+` has no row: what upstream gives
+    # a manager there is admin here.
     {["addons"], :manager},
     {["addons", "reload"], :manager},
     # `/addons/{slug}/(?!security).+` — the negative lookahead is the two
@@ -327,9 +327,7 @@ defmodule Vagus.API.Tiers do
     {["addons", :_, "logs", "boots", :_], :manager, subject: :self, answer: @not_this_app},
     {["addons", :_, "logs", "boots", :_, "follow"], :manager,
      subject: :self, answer: @not_this_app},
-    # `:slug`, as upstream's alternative is `RE_SLUG`: any other segment
-    # leaves the path to the admin fallback.
-    {["addons", :slug, :+], :manager},
+    {["addons", :_, :+], :manager},
     {["audio", :+], :manager},
     {["auth", "cache"], :manager},
     {["available_updates"], :manager},
