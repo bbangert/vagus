@@ -444,8 +444,9 @@ defmodule Vagus.API.Tiers do
       DENIED_WS_TYPE_PREFIXES = ("supervisor/", "hassio/")
 
   A denylist, as upstream's is: Core has no list of the commands an app may
-  send. `supervisor/api` is reserved like its neighbours and is told apart
-  only so that it can be answered here, as the app, instead of refused.
+  send. `supervisor/api` is reserved like its neighbours and no more relayed
+  than they are. It is told apart because `Vagus.API.CoreProxy.WSBridge`
+  answers it as the app, where upstream refuses it.
   """
   @spec core_ws(String.t()) :: core_disposition()
   def core_ws("supervisor/api"), do: {:intercept, :supervisor_api}

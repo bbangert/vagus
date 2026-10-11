@@ -161,5 +161,35 @@
       "Vagus.App.Orchestrator registers with Vagus.Core.EventPusher when it starts, and Vagus.Core.EventPusher keeps it in its state. Both are children of the one_for_one supervisor Vagus.Application, which restarts either alone. When Vagus.Core.EventPusher restarts, its init/1 starts it afresh without what Vagus.App.Orchestrator put there, and Vagus.App.Orchestrator, which is not restarted with it, never registers again. When Vagus.App.Orchestrator restarts, it registers a second time beside what its old process left.",
     reason:
       "A one-shot push, not a registration: boot pushes supervisor_update startup: complete once into Vagus.Core.EventPusher's bounded, drop-oldest queue, which is lossy by design; a restart losing it is a dropped event like any other, and Core's hassio coordinator still refreshes on its own schedule."
+  },
+  %{
+    analysis: "shutdown",
+    file: "lib/vagus/api/core_proxy/ws_bridge.ex",
+    title: "Children started under another tree outlive their owner",
+    at_label: "start_child onto a supervisor in another tree",
+    detail:
+      "Vagus.API.CoreProxy.WSBridge.start_task/1 starts children under Vagus.API.CoreProxy.TaskSupervisor, a DynamicSupervisor Vagus.API.CoreProxy.WSBridge does not sit under. Their lifetime follows Vagus.API.CoreProxy.TaskSupervisor's tree, not Vagus.API.CoreProxy.WSBridge's: when Vagus.API.CoreProxy.WSBridge's tree shuts down they keep running — reconnecting, logging, calling into applications that have already stopped — and Vagus.API.CoreProxy.WSBridge's terminate/2 does not stop them.",
+    reason:
+      "Deliberate: a supervisor/api call's task must outlive its socket, because its handler may be mid-backup when the caller times out or goes (WSBridge moduledoc; test \"a socket closed with calls pending leaves their tasks to finish\"). It does not outlive the application: Vagus.API.CoreProxy.TaskSupervisor is the child of Vagus.Supervisor started immediately before Vagus.API.Supervisor (Supervisor.which_children/1 on a host build: 15th and 16th), so at stop it is terminated right after the listener and before everything started ahead of it (the app tree, Jobs, Backups, the store). The tasks are :temporary and do not trap exits, so they die at that :shutdown. What stops before them is Vagus.Core.Supervisor and the children after it, exactly as for the listener's own HTTP handler processes; a call into one of those then exits and is caught in WSDispatch.run/4. max_children bounds how many can be left running."
+  },
+  %{
+    analysis: "shutdown",
+    file: "lib/vagus/api/router.ex",
+    title: "Children started under another tree outlive their owner",
+    at_label: "start_child onto a supervisor in another tree",
+    detail:
+      "Vagus.API.Router.start_job_task/2 starts children under Vagus.Jobs.TaskSupervisor, a DynamicSupervisor Vagus.API.CoreProxy.WSBridge does not sit under. Their lifetime follows Vagus.Jobs.TaskSupervisor's tree, not Vagus.API.CoreProxy.WSBridge's: when Vagus.API.CoreProxy.WSBridge's tree shuts down they keep running — reconnecting, logging, calling into applications that have already stopped — and Vagus.API.CoreProxy.WSBridge's terminate/2 does not stop them.",
+    reason:
+      "Deliberate and unchanged: a `background: true` job has always been started under Vagus.Jobs.TaskSupervisor so that it outlives the request that asked for it, which has already been answered with the job id (comment above start_job_task/2). argus attributes it to WSBridge only because a supervisor/api call now reaches the router from the bridge's task; an HTTP request reaches the same line from a Bandit connection process, which argus does not model as an owner. The job's lifetime is the same either way: it ends when its work does, or when Vagus.Jobs.TaskSupervisor stops, which is after the listener and after the bridge's own task supervisor (it is started 6th, they 16th and 15th). max_children: 8 bounds it."
+  },
+  %{
+    analysis: "shutdown",
+    file: "lib/vagus/api/core_proxy/ws_bridge.ex",
+    title: "Server terminates a process it still monitors",
+    at_label: "the monitored process is terminated here",
+    detail:
+      "Vagus.API.CoreProxy.WSBridge monitors processes from its callbacks and also terminates them on purpose, without demonitoring first. The {:DOWN, ...} for a death this server caused is delivered like any other — into the clause written for crashes, which may restart, reconnect or log what was a deliberate stop.",
+    reason:
+      "False positive: the two are different processes. The only Process.monitor/1 in the bridge is on a dispatch task (dispatch/3), and the bridge never stops, exits or kills a task. The only process it terminates is Upstream (GenServer.stop/3 in terminate/2), which it links and does not monitor, and after terminate/2 no message is handled. The {:DOWN, ...} clause looks the monitor reference up among its dispatches, so any other DOWN falls through to {:ok, state} (test \"a result for a call this socket never made is dropped\")."
   }
 ]

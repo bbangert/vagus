@@ -54,8 +54,14 @@ defmodule Vagus.API.Authz do
   WebSocket command is otherwise allowed to a caller this leg admits: a
   denylist, as upstream's is. `supervisor/api` is the exception among the
   reserved commands. For a caller this leg admits it comes back as
-  `{:intercept, :supervisor_api}`, which is not `:ok`, for the bridge to
-  answer itself; anyone else is refused as for any other command.
+  `{:intercept, :supervisor_api}`, which is not `:ok`: the bridge does not
+  relay it, and answers it by running the request it names as the app
+  (`Vagus.API.CoreProxy.WSDispatch`). Anyone else is refused as for any
+  other command.
+
+  That request is then graded on the Supervisor-API leg like any other, for
+  the app as it is at that moment. The intercept decides only that the
+  command may be answered at all.
   """
 
   alias Vagus.API.{Refusal, Tiers}

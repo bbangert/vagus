@@ -209,25 +209,29 @@ defmodule Vagus.API.Dispatcher do
     |> then(&Regex.replace(@control_byte_re, &1, ""))
   end
 
-  defp dispatch(%Plug.Conn{path_info: ["ingress", token | _rest]} = conn, _opts)
-       when token not in ["panels", "session", "validate_session"] do
-    IngressProxy.call(conn, @proxy_opts)
-  end
+  @doc """
+  Which of the three pipelines a request path belongs to.
 
-  defp dispatch(%Plug.Conn{path_info: ["core", "api" | _]} = conn, opts),
-    do: dispatch_core_proxy(conn, opts)
+  Public because `Vagus.API.CoreProxy.WSDispatch` enters `Vagus.API.Router`
+  without passing here, and must refuse what this would have sent elsewhere.
+  """
+  @spec family([String.t()]) :: :ingress_proxy | :core_proxy | :router
+  def family(["ingress", token | _rest])
+      when token not in ["panels", "session", "validate_session"],
+      do: :ingress_proxy
 
-  defp dispatch(%Plug.Conn{path_info: ["homeassistant", "api" | _]} = conn, opts),
-    do: dispatch_core_proxy(conn, opts)
+  def family(["core", "api" | _rest]), do: :core_proxy
+  def family(["homeassistant", "api" | _rest]), do: :core_proxy
+  def family(["core", "websocket"]), do: :core_proxy
+  def family(["homeassistant", "websocket"]), do: :core_proxy
+  def family(path_info) when is_list(path_info), do: :router
 
-  defp dispatch(%Plug.Conn{path_info: ["core", "websocket"]} = conn, opts),
-    do: dispatch_core_proxy(conn, opts)
-
-  defp dispatch(%Plug.Conn{path_info: ["homeassistant", "websocket"]} = conn, opts),
-    do: dispatch_core_proxy(conn, opts)
-
-  defp dispatch(conn, _opts) do
-    Router.call(conn, @router_opts)
+  defp dispatch(conn, opts) do
+    case family(conn.path_info) do
+      :ingress_proxy -> IngressProxy.call(conn, @proxy_opts)
+      :core_proxy -> dispatch_core_proxy(conn, opts)
+      :router -> Router.call(conn, @router_opts)
+    end
   end
 
   # The blacklist decision must precede `CoreProxy` — a blacklisted path must

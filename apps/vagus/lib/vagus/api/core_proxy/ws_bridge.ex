@@ -105,20 +105,26 @@ defmodule Vagus.API.CoreProxy.WSBridge do
   It is what the app was granted when the socket opened. Nothing here closes
   an open socket when its app is stopped, uninstalled, or reinstalled without
   `homeassistant_api`, and asking the app's process per frame would put a
-  call in the relay path.
+  call in the relay path. So a relayed command is graded as the app the
+  handshake saw. A `supervisor/api` call is not: its task asks who the app
+  is now, and answers only while the app still holds the token this socket
+  was opened with (`Vagus.API.CoreProxy.WSDispatch`). For that the state
+  keeps that token's hash, never the token.
 
-  ## `supervisor/*` and `hassio/*` commands are refused, not relayed
+  ## `supervisor/*` and `hassio/*` commands are never relayed
 
   Everything below assumes frames pass through untouched. One class does
-  not: a caller frame naming a command `Vagus.API.Authz` does not allow is
-  answered here with Core's own `unauthorized` result envelope and never
-  reaches `Upstream`. `Upstream` authenticates to Core as the Supervisor, so
-  the commands in Core's reserved domains — `supervisor/api` above all,
-  which calls the SUPERVISOR API with Core's token and would hand the caller
-  the `:supervisor` tier — would otherwise pass Core's own "is this the
-  Supervisor" gates truthfully.
+  not: a caller frame naming a command `Vagus.API.Authz` does not allow
+  never reaches `Upstream`. `Upstream` authenticates to Core as the
+  Supervisor, so the commands in Core's reserved domains — `supervisor/api`
+  above all, which calls the SUPERVISOR API with Core's token and would hand
+  the caller the `:supervisor` tier — would otherwise pass Core's own "is
+  this the Supervisor" gates truthfully.
   See `Vagus.Core.Reserved` for the reservation this is one half of, and
   `screen/2` below for the mechanics.
+
+  They are answered with Core's own `unauthorized` result envelope, except
+  a well-formed `supervisor/api` alone in its frame: see the next section.
 
   Core dispatches each element of a JSON array frame as its own command, so
   a batch is refused whole if any element is not allowed, or cannot be read
@@ -126,6 +132,32 @@ defmodule Vagus.API.CoreProxy.WSBridge do
   `id` to answer under, so its single result carries a null one. Text that
   is not JSON closes both legs, as Core itself would on receiving it. This
   is upstream `supervisor/api/proxy.py`'s `_denied_command_types`.
+
+  ## `supervisor/api` is answered here, as the app
+
+  A frame that is one `supervisor/api` command is turned into a
+  Supervisor-API request and run through `Vagus.API.Router` with the app's
+  own token (`Vagus.API.CoreProxy.WSDispatch`); the result goes back under
+  the frame's `id`. A batch containing one is still refused whole: answering
+  some elements and relaying the rest would need per-element state for no
+  caller that exists.
+
+  The request runs in a task under `Vagus.API.CoreProxy.TaskSupervisor`, so
+  a slow handler does not hold `handle_in/2` and the relay goes on around
+  it. The task is not linked and is never killed from here: a call that
+  outlives its timeout, or its socket, is left to finish, because the
+  handler may be half way through a backup. Its answer is then dropped.
+
+  That makes a call a way to leave work running, so calls are bounded
+  twice, and a call over either bound is answered with an error instead of
+  queued. One socket may have eight unfinished at once, counting those
+  already answered by timeout. All sockets together are bounded by the task
+  supervisor's `max_children`, which holds after a socket has gone.
+
+  What arrives for a call is `{:supervisor_api, ref, result}` or
+  `{:supervisor_api_timeout, ref}`, under a reference made here, and the
+  task's `DOWN`. `Upstream` sends none of those shapes, and a reference this
+  process does not hold is dropped.
 
   ## Once past `:awaiting_auth`, relaying is a bounded synchronous handoff
 
@@ -182,6 +214,8 @@ defmodule Vagus.API.CoreProxy.WSBridge do
 
   alias Vagus.API.{Authz, CoreProxy, SourceGuard}
   alias Vagus.API.CoreProxy.WSBridge.Upstream
+  alias Vagus.API.CoreProxy.WSDispatch
+  alias Vagus.App.Policy
   alias Vagus.Core.Versions
 
   @heartbeat_interval_ms 30_000
@@ -190,15 +224,28 @@ defmodule Vagus.API.CoreProxy.WSBridge do
   @authz_ctx %{leg: :core_api, decoded_segments: nil}
 
   @refusal_label "authz/core_ws"
+  @unsupported_label "authz/core_ws+endpoint"
+  @too_large_label "authz/core_ws+body"
+  @busy_label "authz/core_ws+busy"
+
+  @task_supervisor Vagus.API.CoreProxy.TaskSupervisor
+
+  # A handful of parallel reads is what a page of the frontend sends Core.
+  @max_dispatches 8
 
   @typedoc "State carried across every `WebSock` callback for the caller leg."
   @type state :: %{
           phase: :awaiting_auth | :relaying,
           upstream: pid() | nil,
           principal: Authz.principal() | nil,
+          credential: WSDispatch.credential() | nil,
           ha_version: String.t() | nil,
-          closing?: boolean()
+          closing?: boolean(),
+          dispatches: %{reference() => dispatch()}
         }
+
+  @typedoc "A `supervisor/api` call whose task has not ended. `timer` is `nil` once it is answered."
+  @type dispatch :: %{id: pos_integer(), monitor: reference(), timer: reference() | nil}
 
   @impl WebSock
   @doc """
@@ -226,8 +273,10 @@ defmodule Vagus.API.CoreProxy.WSBridge do
        phase: :awaiting_auth,
        upstream: nil,
        principal: nil,
+       credential: nil,
        ha_version: ha_version,
-       closing?: false
+       closing?: false,
+       dispatches: %{}
      }}
   end
 
@@ -242,7 +291,7 @@ defmodule Vagus.API.CoreProxy.WSBridge do
   handoff" section for why a call and not a cast); a timeout closes with
   1011 directly, any other exit is a no-op since the faithful close is
   already on its way through `handle_info/2`. The exceptions are text
-  frames `screen/2` refuses or cannot parse.
+  frames `screen/2` refuses, answers or cannot parse.
   """
   def handle_in({data, opcode: :text}, %{phase: :awaiting_auth} = state) do
     case decode_caller_token(data) do
@@ -264,7 +313,18 @@ defmodule Vagus.API.CoreProxy.WSBridge do
 
       {:refuse, id} ->
         count_refusal()
-        {:push, {:text, unauthorized_result(id)}, state}
+        {:push, {:text, WSDispatch.result(id, :unauthorized)}, state}
+
+      {:unsupported, id} ->
+        count_refusal(@unsupported_label)
+        {:push, {:text, WSDispatch.result(id, :unsupported)}, state}
+
+      {:too_large, id} ->
+        count_refusal(@too_large_label)
+        {:push, {:text, WSDispatch.result(id, :too_large)}, state}
+
+      {:call, id, request} ->
+        dispatch(id, request, state)
 
       # 1000 because Core closes on invalid JSON with it too, as does
       # upstream's plain `close()`. `terminate/2` stops `Upstream`.
@@ -338,6 +398,24 @@ defmodule Vagus.API.CoreProxy.WSBridge do
 
   def handle_info({:EXIT, _pid, _reason}, state), do: {:ok, state}
 
+  def handle_info({:supervisor_api, ref, result}, state) when is_reference(ref),
+    do: answer(ref, state, fn _id -> result end)
+
+  def handle_info({:supervisor_api_timeout, ref}, state) when is_reference(ref),
+    do: answer(ref, state, &WSDispatch.result(&1, :timeout))
+
+  # A task sends its result before it exits, so a `DOWN` that finds the call
+  # unanswered is a task that died without one. Either way its slot is free.
+  def handle_info({:DOWN, monitor, :process, _pid, _reason}, state) do
+    case Enum.find(state.dispatches, fn {_ref, dispatch} -> dispatch.monitor == monitor end) do
+      {ref, _dispatch} ->
+        ref |> answer(state, &WSDispatch.result(&1, :no_response)) |> forget(ref)
+
+      nil ->
+        {:ok, state}
+    end
+  end
+
   def handle_info(_other, state), do: {:ok, state}
 
   @impl WebSock
@@ -381,6 +459,86 @@ defmodule Vagus.API.CoreProxy.WSBridge do
       {:ok, state}
   end
 
+  defp dispatch(id, _request, %{dispatches: dispatches} = state)
+       when map_size(dispatches) >= @max_dispatches,
+       do: busy(id, state)
+
+  # `Vagus.API.Authz` intercepts for an app and for nobody else, so the
+  # principal here is one.
+  defp dispatch(id, request, %{principal: {:addon, %{slug: slug}}} = state) do
+    ref = make_ref()
+    bridge = self()
+    credential = state.credential
+
+    task = fn ->
+      result = WSDispatch.result(id, run(slug, credential, request))
+      send(bridge, {:supervisor_api, ref, result})
+    end
+
+    case start_task(task) do
+      {:ok, pid} ->
+        dispatch = %{
+          id: id,
+          monitor: Process.monitor(pid),
+          timer: Process.send_after(self(), {:supervisor_api_timeout, ref}, request.timeout_ms)
+        }
+
+        {:ok, put_in(state.dispatches[ref], dispatch)}
+
+      :busy ->
+        busy(id, state)
+    end
+  end
+
+  # A seam that replaces the whole of `WSDispatch.run/3`, the caller's
+  # re-check included, so it is compiled into the test build and no other:
+  # elsewhere there is no key to set.
+  if Mix.env() == :test do
+    defp run(slug, credential, request) do
+      run = Application.get_env(:vagus, :ws_dispatch_fun, &WSDispatch.run/3)
+      run.(slug, credential, request)
+    end
+  else
+    defp run(slug, credential, request), do: WSDispatch.run(slug, credential, request)
+  end
+
+  # Not linked, and `:temporary`: the task's end is this process's `DOWN`
+  # and nobody's restart.
+  defp start_task(task) do
+    case Task.Supervisor.start_child(@task_supervisor, task) do
+      {:ok, pid} -> {:ok, pid}
+      {:error, _max_children} -> :busy
+    end
+  catch
+    # The supervisor is restarting. The caller can ask again.
+    :exit, _reason -> :busy
+  end
+
+  defp busy(id, state) do
+    count_refusal(@busy_label)
+    {:push, {:text, WSDispatch.result(id, :busy)}, state}
+  end
+
+  # The first answer for a call is the only one: a result after the timeout,
+  # or a timeout already in the mailbox when the result came, finds `timer`
+  # cleared. The entry stays until the task ends, holding its slot.
+  defp answer(ref, state, result) do
+    case state.dispatches do
+      %{^ref => %{id: id, timer: timer} = dispatch} when timer != nil ->
+        Process.cancel_timer(timer)
+        state = put_in(state.dispatches[ref], %{dispatch | timer: nil})
+        if state.closing?, do: {:ok, state}, else: {:push, {:text, result.(id)}, state}
+
+      _answered_or_not_ours ->
+        {:ok, state}
+    end
+  end
+
+  defp forget({:push, frame, state}, ref), do: {:push, frame, forget_dispatch(state, ref)}
+  defp forget({:ok, state}, ref), do: {:ok, forget_dispatch(state, ref)}
+
+  defp forget_dispatch(state, ref), do: %{state | dispatches: Map.delete(state.dispatches, ref)}
+
   # `Vagus.Core.Reserved`, applied to the WS leg. `Upstream` authenticates to
   # Core with VAGUS's credential (fact 8 / A3), so every frame relayed from
   # here arrives at Core as the Supervisor user — which is exactly what
@@ -398,6 +556,10 @@ defmodule Vagus.API.CoreProxy.WSBridge do
   # with, so a caller sees the shape it would have seen anyway, and one
   # rejected frame doesn't tear down a working tunnel.
   #
+  # `{:call, id, request}` is a lone `supervisor/api` command to answer
+  # here, and `{:unsupported, id}` one that names nothing this proxy
+  # dispatches. Neither is relayed.
+  #
   # ALWAYS decodes. The tempting fast path — skip the JSON parse when the
   # raw frame has no "hassio" substring — is exactly the encoded-segment
   # hole `Vagus.API.Dispatcher.core_proxy_blacklisted?/1` documents on the
@@ -408,15 +570,40 @@ defmodule Vagus.API.CoreProxy.WSBridge do
   # Public only so `Vagus.Core.ReservedContractTest` can pin the batch path
   # to the commands Core really registers.
   @doc false
-  @spec screen(binary(), Authz.principal()) :: :relay | {:refuse, term()} | :invalid_json
+  @spec screen(binary(), Authz.principal()) ::
+          :relay
+          | {:refuse, term()}
+          | {:unsupported, pos_integer()}
+          | {:too_large, pos_integer()}
+          | {:call, pos_integer(), WSDispatch.request()}
+          | :invalid_json
   def screen(data, principal) do
     # Ordered, so a repeated key stays visible — see `command_type/1`.
     case Jason.decode(data, objects: :ordered_objects) do
-      {:ok, parsed} ->
-        if allowed?(parsed, principal), do: :relay, else: {:refuse, response_id(parsed)}
+      {:ok, parsed} -> decide(parsed, principal)
+      {:error, _reason} -> :invalid_json
+    end
+  end
 
-      {:error, _reason} ->
-        :invalid_json
+  # Only a frame that is one object can be answered here.
+  defp decide(%Jason.OrderedObject{} = command, principal) do
+    case disposition(command, principal) do
+      :ok -> :relay
+      {:intercept, :supervisor_api} -> call(command)
+      _refused -> {:refuse, response_id(command)}
+    end
+  end
+
+  defp decide(parsed, principal),
+    do: if(allowed?(parsed, principal), do: :relay, else: {:refuse, response_id(parsed)})
+
+  defp call(command) do
+    case WSDispatch.read(command) do
+      {:ok, id, request} -> {:call, id, request}
+      {:error, id, :reserved} -> {:refuse, id}
+      {:error, id, :unsupported} -> {:unsupported, id}
+      {:error, id, :too_large} -> {:too_large, id}
+      :malformed -> {:refuse, response_id(command)}
     end
   end
 
@@ -428,13 +615,14 @@ defmodule Vagus.API.CoreProxy.WSBridge do
   defp allowed?([], _principal), do: true
   defp allowed?(command, principal), do: command_allowed?(command, principal)
 
-  # Only `:ok` relays. `{:intercept, :supervisor_api}` is the evaluator
-  # setting `supervisor/api` aside to be answered here as the app; until
-  # something here answers it, it is refused like any other result.
-  defp command_allowed?(command, principal) do
+  # Only `:ok` relays. Inside a batch `{:intercept, :supervisor_api}` is a
+  # refusal like any other.
+  defp command_allowed?(command, principal), do: disposition(command, principal) == :ok
+
+  defp disposition(command, principal) do
     case command_type(command) do
-      nil -> false
-      type -> Authz.authorize(principal, {:ws, :core_api, type, command}, @authz_ctx) == :ok
+      nil -> :malformed
+      type -> Authz.authorize(principal, {:ws, :core_api, type, command}, @authz_ctx)
     end
   end
 
@@ -459,18 +647,6 @@ defmodule Vagus.API.CoreProxy.WSBridge do
 
   defp response_id(_batch_or_scalar), do: nil
 
-  defp unauthorized_result(id) do
-    encode(%{
-      "id" => id,
-      "type" => "result",
-      "success" => false,
-      "error" => %{
-        "code" => "unauthorized",
-        "message" => "Supervisor-only commands are not available through this proxy"
-      }
-    })
-  end
-
   # Fact 8: `msg.get("access_token") or msg.get("api_password")` — no
   # `"type"` field is ever checked. `{:ok, %{} = msg}` requires the decoded
   # JSON to be an object (a JSON array/string/number has no field to read at
@@ -487,22 +663,29 @@ defmodule Vagus.API.CoreProxy.WSBridge do
     end
   end
 
-  # The principal is set here and nowhere else.
+  # The principal is set here and nowhere else, with the hash of the token
+  # that proved it: a `supervisor/api` call is answered only while the app
+  # still holds that token. The hash, as the app directory keys it; the
+  # token arrived in the caller's frame and is not put in the state,
+  # because a crash report prints the state.
   defp authenticate(token, state) do
     case CoreProxy.check_access(token) do
-      {:ok, principal} -> start_relaying(%{state | principal: principal})
-      {:error, :unauthorized} -> auth_invalid_and_close(state)
+      {:ok, principal} ->
+        start_relaying(%{state | principal: principal, credential: Policy.hash(token)})
+
+      {:error, :unauthorized} ->
+        auth_invalid_and_close(state)
     end
   end
 
   # An app that passed the handshake can repeat a refused frame at will, so
   # it is counted like `Vagus.API.Auth`'s refusals, under a constant label.
   # Off device there is no counter and it is a warning instead.
-  defp count_refusal do
+  defp count_refusal(label \\ @refusal_label) do
     if SourceGuard.enabled?() do
-      SourceGuard.record_filtered(:authz, @refusal_label)
+      SourceGuard.record_filtered(:authz, label)
     else
-      Logger.warning("Vagus.API.CoreProxy.WSBridge: refused a frame (#{@refusal_label})")
+      Logger.warning("Vagus.API.CoreProxy.WSBridge: refused a frame (#{label})")
     end
   end
 
