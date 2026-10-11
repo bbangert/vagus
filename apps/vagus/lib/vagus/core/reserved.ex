@@ -91,6 +91,12 @@ defmodule Vagus.Core.Reserved do
   @prefix "hassio"
   @command_domains ["hassio", "supervisor"]
 
+  # `Vagus.API.ExploitFilter` unquotes this many layers and answers 400 past
+  # them, so `Vagus.API.Dispatcher` brings nothing deeper here. The bound is
+  # for a caller that is not behind the filter: a layer costs two bytes, so
+  # one request line can carry thousands of them.
+  @max_decodes 8
+
   @doc """
   Whether Core-side path `segments` address a reserved view.
 
@@ -100,37 +106,62 @@ defmodule Vagus.Core.Reserved do
 
   `.` segments ahead of the view are skipped. Core's router does not collapse
   them today, and `/api/./hassio_auth` is a 404 there, but the reservation
-  would otherwise hold only for as long as that stays true. The dispatcher,
-  the evaluator and `Vagus.Core.Transport` all reach this function, so given
-  the same segments they cannot disagree about it.
+  would otherwise hold only for as long as that stays true.
+
+  Judged as written, then again after each percent-decode of the whole path
+  until one changes nothing, as upstream's `recursive_unquote` reads it. Core
+  decodes a forwarded path once, so `%2568assio_auth` is not a view of its
+  own today; like the `.` segments, the reservation does not rest on that.
+  The path is decoded whole and split again because `%2f` is a separator
+  only once decoded.
+
+  A path still changing after #{@max_decodes} decodes is answered as
+  reserved, since what it would finally read as is unknown.
+
+  The dispatcher, the evaluator and `Vagus.Core.Transport` all reach this
+  function, so given the same segments they cannot disagree about it.
   """
   @spec view?([String.t()]) :: boolean()
-  def view?(["api" | rest]) do
+  def view?(segments) when is_list(segments) do
+    literal_view?(segments) or
+      (Enum.any?(segments, &String.contains?(&1, "%")) and
+         decoded_view?(Enum.join(segments, "/"), @max_decodes))
+  end
+
+  defp literal_view?(["api" | rest]) do
     case Enum.drop_while(rest, &(&1 == ".")) do
       [view | _rest] -> String.starts_with?(view, @prefix)
       [] -> false
     end
   end
 
-  def view?(_segments), do: false
+  defp literal_view?(_segments), do: false
+
+  # `URI.decode/1` leaves an invalid escape as written and never raises.
+  defp decoded_view?(path, decodes_left) do
+    case URI.decode(path) do
+      ^path ->
+        false
+
+      _decoded when decodes_left == 0 ->
+        true
+
+      decoded ->
+        literal_view?(String.split(decoded, "/", trim: true)) or
+          decoded_view?(decoded, decodes_left - 1)
+    end
+  end
 
   @doc """
   Whether a Core-side request path — as sent on the wire, query string and
-  percent-escapes included — addresses a reserved view.
-
-  Decoded exactly ONCE before matching, for the reason
-  `Vagus.API.Dispatcher.core_proxy_blacklisted?/1` documents at length: the
-  path reaches Core verbatim and aiohttp decodes it there, so
-  `/api/%68assio_auth` and `/api/hassio%2fapp` are reserved paths spelled to
-  evade a literal match, while `%2568` must stay `%68` on both sides.
-  `URI.decode/1` is lenient (an invalid `%zz` is left alone, never raises).
+  percent-escapes included — addresses a reserved view. `view?/1` does the
+  decoding; the query string is no part of the path and is dropped first.
   """
   @spec path?(String.t()) :: boolean()
   def path?(path) when is_binary(path) do
     path
     |> String.split("?", parts: 2)
     |> hd()
-    |> URI.decode()
     |> String.split("/", trim: true)
     |> view?()
   end

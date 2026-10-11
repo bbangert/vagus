@@ -51,12 +51,50 @@ defmodule Vagus.API.TiersTest do
     {"/addons/core_mqtt/sys_options", :supervisor},
     {"/addons/self/sys_options", :supervisor},
     {"/os/ssh/authorized_keys", :supervisor},
-    {"/os/ssh/authorized_keys/extra", :manager},
     {"/os/ssh", :manager},
-    {"/addons/reload", :manager}
+    {"/os/ssh/x", :manager},
+    {"/os/datadisk/x", :manager},
+    {"/addons/reload", :manager},
+    {"/addons/core_mqtt/rebuild", :manager},
+    {"/addons/self/updatefoo", :manager},
+    # Upstream's `(?!...)` is a lookahead, so it excludes whatever starts so.
+    {"/os/ssh/authorized_keys/extra", :admin},
+    {"/os/ssh/authorized_keysfoo", :admin},
+    {"/os/datadisk/wipe/extra", :admin},
+    {"/os/datadisk/wipefoo", :admin},
+    {"/os/datadisk/wipefoo/extra", :admin},
+    {"/addons/core_mqtt/securityfoo", :admin},
+    {"/addons/core_mqtt/securityfoo/extra", :admin},
+    {"/addons/core_mqtt/security/extra", :admin},
+    {"/addons/self/securityfoo", :admin},
+    # `/.+/info` comes first upstream too.
+    {"/os/datadisk/wipefoo/info", :default},
+    {"/addons/core_mqtt/securityfoo/info", :default},
+    # A prefix is of one segment, and anything shorter is not it.
+    {"/os/datadisk/wip", :manager},
+    {"/os/datadisk", :manager},
+    {"/os/ssh/authorized_key", :manager},
+    {"/os/ssh/x/authorized_keys", :manager},
+    {"/addons/core_mqtt/securit", :manager},
+    {"/addons/core_mqtt/x/security", :manager},
+    # The raw spelling of a slug a manager app percent-encodes.
+    {"/addons/%63ore_mqtt/rebuild", :manager},
+    # Upstream gives a manager `/time/.+`. Nothing is served there.
+    {"/time/options", :admin},
+    {"/time/info", :default}
   ]
 
   defp segments(path), do: path |> String.split("/", trim: true)
+
+  # Neither is checked against upstream here: this only keeps the two places
+  # that name the mirrored tag from drifting apart.
+  test "the fixture's header and the table's moduledoc name one upstream tag" do
+    {:docs_v1, _anno, _lang, _format, %{"en" => moduledoc}, _meta, _docs} = Code.fetch_docs(Tiers)
+    header = @fixture_path |> File.read!() |> Jason.decode!() |> Map.fetch!("_upstream")
+
+    assert [_whole, tag] = Regex.run(~r/^supervisor (\d{4}\.\d{2}\.\d+),/, header)
+    assert Regex.scan(~r/\d{4}\.\d{2}\.\d+/, moduledoc) |> List.flatten() |> Enum.uniq() == [tag]
+  end
 
   # A row's columns as the fixture's JSON spells them.
   defp pinned(columns),
@@ -329,6 +367,38 @@ defmodule Vagus.API.TiersTest do
       end
 
       for pattern <- [["addons", "self", "stats"], ["addons", "x", :_], ["addons", :_, :+]] do
+        assert_raise ArgumentError, fn ->
+          Row.validate!({pattern, :manager, subject: :self, answer: answer})
+        end
+      end
+
+      for element <- [:any, nil, 7, {:prefix, ""}, {:prefix, :wipe}, {:suffix, "x"}] do
+        assert_raise ArgumentError, ~r/unknown pattern elements/, fn ->
+          Row.validate!({["os", element], :admin})
+        end
+
+        assert_raise ArgumentError, ~r/unknown pattern elements/, fn ->
+          Row.validate!({["addons", :_, element], :manager, subject: :self, answer: answer})
+        end
+      end
+    end
+
+    # A prefix is one segment, so the subject stays the second. In its place
+    # the prefix would be the subject, and with a tail the row has no fixed
+    # length.
+    test "a prefix row carries a predicate only where the subject still has its place" do
+      answer = %{"GET" => :forbidden}
+      row = {["addons", :_, {:prefix, "logs"}], :manager, subject: :self, answer: answer}
+
+      assert Row.validate!(row) == row
+
+      assert Row.validate!({["os", {:prefix, "x"}, :*], :admin}) ==
+               {["os", {:prefix, "x"}, :*], :admin, []}
+
+      for pattern <- [
+            ["addons", {:prefix, "core"}, "stats"],
+            ["addons", :_, {:prefix, "logs"}, :*]
+          ] do
         assert_raise ArgumentError, fn ->
           Row.validate!({pattern, :manager, subject: :self, answer: answer})
         end

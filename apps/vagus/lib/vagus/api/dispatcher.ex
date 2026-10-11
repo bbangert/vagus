@@ -251,33 +251,21 @@ defmodule Vagus.API.Dispatcher do
     end
   end
 
-  # Upstream's `BLACKLIST` (`security.py`) matches the percent-DECODED
-  # `request.path` (yarl's `URL.path`), but `conn.path_info` is never
-  # decoded — Plug only splits on literal "/" bytes, same property
-  # `Vagus.API.IngressProxy.build_url/4`'s own `[DEVIATION ...]` note
-  # documents (no `URI.decode` anywhere in this stack) — and
-  # `CoreProxy.build_url/2` forwards the path to Core VERBATIM. Left as a
-  # literal-segment match alone, a caller could smuggle an encoded `hassio`
-  # segment straight past the deny — `GET /core/api/%68assio/config` or
-  # `GET /core/api/hassio%2fconfig` — only to have Core's own aiohttp
-  # percent-decode it back to `/api/hassio/...` and reach Core's private
-  # Supervisor RPC surface wearing OUR identity, exactly what the blacklist
-  # exists to stop (security review Blocker).
+  # `conn.path_info` is never decoded (Plug only splits on literal "/"), and
+  # `CoreProxy` forwards the path to Core verbatim, where aiohttp decodes it.
+  # A literal match alone would pass `GET /core/api/%68assio/config` to Core
+  # as `/api/hassio/config`, wearing our identity.
   #
-  # Checked against BOTH the raw and the decoded-then-resplit form. Raw
-  # catches the plain, unencoded `hassio` segment (what the existing tests
-  # already cover). Decoded catches every encoded spelling of it, INCLUDING
-  # an encoded slash (`%2f`), which decoding segment-by-segment would miss:
-  # a single decoded segment `"hassio/config"` is not the `hassio` segment
-  # `Vagus.Core.Reserved.view?/1` looks for, but decoding the WHOLE path and
-  # re-splitting on "/" yields `["core","api","hassio","config"]`, which
-  # is — that is the entire reason this decodes the joined path rather
-  # than mapping `URI.decode/1` over `path_info` directly. Decoded exactly
-  # ONCE: `URI.decode/1` is lenient (an invalid `%zz` escape is left
-  # as-is, never raises) and, being a single pass, agrees with aiohttp/
-  # yarl's own single decode of the request line — `%2568` becomes `%68`
-  # on both sides, never `h` — so a caller cannot double-encode around this
-  # check any more than they can around upstream's.
+  # So the path is asked about as written and as decoded whole and split
+  # again: `hassio%2fconfig` is one segment until it is decoded, and decoding
+  # segment by segment would leave it one. `Vagus.Core.Reserved.view?/1`
+  # reads through any further layers of encoding from either spelling, as
+  # upstream matches `BLACKLIST` on `recursive_unquote(request.path)`.
+  # `URI.decode/1` leaves an invalid `%zz` as written and never raises.
+  #
+  # `Vagus.API.CoreProxy` puts these same two spellings to `Vagus.API.Authz`.
+  # Were a path to pass here and be refused there, the caller would get a 500
+  # where a 403 is due.
   defp core_proxy_blacklisted?(conn) do
     Tiers.blacklisted?(conn.path_info) or Tiers.blacklisted?(decoded_path_segments(conn))
   end

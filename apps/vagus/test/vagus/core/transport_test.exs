@@ -293,10 +293,28 @@ defmodule Vagus.Core.TransportTest do
       end
     end
 
-    test "double-encoding does not sneak past — `%2568` stays `%68` on both sides" do
-      request = Transport.build({:socket, "/run/x.sock"}, :proxied, :get, "/api/%2568assio_auth")
+    # Core reads `%2568assio_auth` as `%68assio_auth`, which is no view of
+    # its own. It is refused all the same, as upstream refuses it.
+    test "a spelling that takes more than one decode raises too" do
+      for path <- [
+            "/api/%2568assio_auth",
+            "/api/%252568assio_auth/password_reset",
+            "/api/hassio%252Fapp",
+            "/api/%252e/hassio_auth",
+            "/api/%2568assio_auth?x=1"
+          ] do
+        assert_raise Vagus.Core.Reserved.Error, fn ->
+          Transport.build({:socket, "/run/x.sock"}, :proxied, :get, path)
+        end
+      end
+    end
 
-      assert request.path == "/api/%2568assio_auth"
+    test "a path encoded more than once that is not reserved is built as written" do
+      for path <- ["/api/st%2561tes", "/api/states/%2568assio_auth", "/api/states?x=%2568assio"] do
+        request = Transport.build({:socket, "/run/x.sock"}, :proxied, :get, path)
+
+        assert request.path <> if(request.query, do: "?" <> request.query, else: "") == path
+      end
     end
 
     test "the same paths are still ours to call internally" do

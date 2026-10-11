@@ -22,14 +22,29 @@ defmodule Vagus.API.Tiers.Row do
   def predicates(columns), do: Keyword.take(columns, @predicates)
 
   @spec validate!({list(), atom()} | t()) :: t()
-  def validate!({pattern, requirement}), do: {pattern, requirement, []}
+  def validate!({pattern, requirement}), do: validate!({pattern, requirement, []})
 
   def validate!({pattern, requirement, columns}) do
-    case column_fault(columns) || pattern_fault(pattern, predicates(columns)) do
+    case element_fault(pattern) || column_fault(columns) ||
+           pattern_fault(pattern, predicates(columns)) do
       nil -> {pattern, requirement, columns}
       fault -> raise ArgumentError, "#{inspect(pattern)}: #{fault}"
     end
   end
+
+  # The matcher has no clause for anything else, so such a row would match
+  # nothing and its path would fall to the rows below it.
+  defp element_fault(pattern) do
+    case Enum.reject(pattern, &element?/1) do
+      [] -> nil
+      unknown -> "unknown pattern elements #{inspect(unknown)}"
+    end
+  end
+
+  defp element?(element) when is_binary(element), do: true
+  defp element?(element) when element in [:_, :slug, :+, :*], do: true
+  defp element?({:prefix, text}), do: is_binary(text) and text != ""
+  defp element?(_other), do: false
 
   defp column_fault(columns) do
     keys = Keyword.keys(columns)
