@@ -1,7 +1,9 @@
 defmodule Vagus.API.Authz do
   @moduledoc """
-  The evaluator for every app-facing leg: a principal and an action in, a
-  decision out. `Vagus.API.Tiers` holds the rules.
+  The evaluator for the Supervisor API and for the Core proxy's REST and
+  WebSocket legs: a principal and an action in, a decision out.
+  `Vagus.API.Tiers` holds the rules. The ingress proxy and its WebSocket do
+  not ask here.
 
   Nothing is looked up: no registry, no process call, no I/O. A decision that
   depended on runtime state could not be read off the table, and the table
@@ -48,10 +50,12 @@ defmodule Vagus.API.Authz do
   the supervisor, which satisfies every tier, is refused: Core does not call
   its own proxy.
 
-  What `Vagus.Core.Reserved` reserves is refused first, to every principal.
-  A WebSocket command is otherwise relayed: a denylist, as upstream's is.
-  `supervisor/api` is neither relayed nor allowed. It comes back as
-  `{:intercept, :supervisor_api}` for the bridge to answer itself.
+  What `Vagus.Core.Reserved` reserves is refused first, whoever asks. A
+  WebSocket command is otherwise allowed to a caller this leg admits: a
+  denylist, as upstream's is. `supervisor/api` is the exception among the
+  reserved commands. For a caller this leg admits it comes back as
+  `{:intercept, :supervisor_api}`, which is not `:ok`, for the bridge to
+  answer itself; anyone else is refused as for any other command.
   """
 
   alias Vagus.API.{Refusal, Tiers}

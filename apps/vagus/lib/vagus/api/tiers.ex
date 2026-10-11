@@ -433,7 +433,7 @@ defmodule Vagus.API.Tiers do
   refuses, and because what is reserved is `Vagus.Core.Reserved`'s to say:
   a pattern here would be a second copy of it.
   """
-  @spec core_api([String.t()]) :: core_disposition()
+  @spec core_api([String.t()]) :: :deny | :allow
   def core_api(path_info) when is_list(path_info),
     do: if(blacklisted?(path_info), do: :deny, else: :allow)
 

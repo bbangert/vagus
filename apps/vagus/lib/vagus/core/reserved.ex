@@ -46,7 +46,7 @@ defmodule Vagus.Core.Reserved do
 
   A path-shaped rule cannot reach this: a WS caller addresses Core by typed
   command, and the frames all arrive on one already-authorized socket. So
-  `Vagus.API.CoreProxy.WSBridge` puts every command of every frame to
+  `Vagus.API.CoreProxy.WSBridge` puts every command of every text frame to
   `Vagus.API.Authz`, whose WebSocket rule is `command?/1`.
 
   ## Why a namespace, not a list of endpoints
@@ -73,7 +73,7 @@ defmodule Vagus.Core.Reserved do
   path (`/core/api/hassio_auth` → segments after the family), refusing with
   the 403 envelope before `Vagus.API.CoreProxy` is ever constructed.
   `Vagus.API.Authz` decides both proxy legs from `Vagus.API.Tiers.core_api/1`
-  and `core_ws/1`, which ask this module and hold no list of their own.
+  and `core_ws/1`, which ask this module what is reserved.
   `Vagus.Core.Transport.build/6` applies it again to the Core-side path at
   the point Vagus's credential is attached, so a future route that reaches
   Core without passing `Vagus.API.Dispatcher` cannot quietly reintroduce the
@@ -90,9 +90,21 @@ defmodule Vagus.Core.Reserved do
   Segments are Core's own, `api` included (`["api", "hassio_auth",
   "password_reset"]`) — i.e. what a Supervisor-side `/core/api/...` or
   `/homeassistant/api/...` path becomes with its family segment dropped.
+
+  `.` segments ahead of the view are skipped. Core's router does not collapse
+  them today, and `/api/./hassio_auth` is a 404 there, but the reservation
+  would otherwise hold only for as long as that stays true. The dispatcher,
+  the evaluator and `Vagus.Core.Transport` all reach this function, so given
+  the same segments they cannot disagree about it.
   """
   @spec view?([String.t()]) :: boolean()
-  def view?(["api", view | _rest]), do: String.starts_with?(view, @prefix)
+  def view?(["api" | rest]) do
+    case Enum.drop_while(rest, &(&1 == ".")) do
+      [view | _rest] -> String.starts_with?(view, @prefix)
+      [] -> false
+    end
+  end
+
   def view?(_segments), do: false
 
   @doc """
@@ -153,12 +165,11 @@ defmodule Vagus.Core.Reserved.Error do
   point — this is the backstop for a routing regression, and a 500 with a
   stack trace in RingLogger is a louder, more diagnosable signal than a 403
   that reads like ordinary policy.
+
+  It carries nothing of the request. The path is the caller's own bytes, and
+  a crash report is an error-level line in that same ring.
   """
 
-  defexception [:path]
-
-  @impl Exception
-  def message(%__MODULE__{path: path}) do
-    "refused to build a proxied Core request for the reserved /api/hassio* namespace: #{path}"
-  end
+  defexception message:
+                 "refused to build a proxied Core request for the reserved /api/hassio* namespace"
 end

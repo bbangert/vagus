@@ -44,9 +44,11 @@ defmodule Vagus.API.CoreProxy.WSBridge do
      **only now** — an unauthenticated or wrongly-scoped caller never causes
      a dial to Core at all. Failure (bad token, no token field, non-JSON,
      a binary frame, or the deadline firing first) → `auth_invalid` then a
-     normal close, no per-attempt logging (same RingLogger-ring discipline
-     `Vagus.API.CoreProxy`'s own moduledoc documents for the REST leg — an
-     unauthenticated caller can repeat this at will).
+     normal close, no per-attempt logging on device (same RingLogger-ring
+     discipline `Vagus.API.CoreProxy`'s own moduledoc documents for the REST
+     leg — an unauthenticated caller can repeat this at will). A known
+     caller's refusal is counted there; off device, where there is no ring
+     to protect, it is a warning.
 
   ## Why the prompt is one message late
 
@@ -253,6 +255,8 @@ defmodule Vagus.API.CoreProxy.WSBridge do
     auth_invalid_and_close(state)
   end
 
+  # `authenticate/2` sets the principal on the way into `:relaying`, so it
+  # is never `nil` here.
   def handle_in({data, opcode: :text} = frame, %{phase: :relaying} = state) do
     case screen(data, state.principal) do
       :relay ->
@@ -483,7 +487,7 @@ defmodule Vagus.API.CoreProxy.WSBridge do
     end
   end
 
-  # The only place the principal is set.
+  # The principal is set here and nowhere else.
   defp authenticate(token, state) do
     case CoreProxy.check_access(token) do
       {:ok, principal} -> start_relaying(%{state | principal: principal})
@@ -493,6 +497,7 @@ defmodule Vagus.API.CoreProxy.WSBridge do
 
   # An app that passed the handshake can repeat a refused frame at will, so
   # it is counted like `Vagus.API.Auth`'s refusals, under a constant label.
+  # Off device there is no counter and it is a warning instead.
   defp count_refusal do
     if SourceGuard.enabled?() do
       SourceGuard.record_filtered(:authz, @refusal_label)
@@ -523,10 +528,11 @@ defmodule Vagus.API.CoreProxy.WSBridge do
   end
 
   # Fact 8: on any auth failure, `{"type":"auth_invalid","message":"Invalid
-  # access"}` then a close — no per-attempt logging (same RingLogger
+  # access"}` then a close — nothing here logs (same RingLogger
   # discipline `Vagus.API.CoreProxy`'s own moduledoc documents: an
-  # unauthenticated caller can repeat this at will, so nothing here logs per
-  # attempt). 1000 (normal closure): an auth rejection is this proxy
+  # unauthenticated caller can repeat this at will; what
+  # `CoreProxy.check_access/1` counts, or off device logs, is its own to
+  # say). 1000 (normal closure): an auth rejection is this proxy
   # behaving exactly as designed, not an error condition to flag with a
   # non-1000 code.
   defp auth_invalid_and_close(state) do

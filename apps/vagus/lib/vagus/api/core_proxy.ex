@@ -17,8 +17,9 @@ defmodule Vagus.API.CoreProxy do
   `/homeassistant/websocket`, `/core/api/.*`, `/core/websocket` — so
   `token_validation` never runs for them and `request[REQUEST_FROM]` is left
   `None`. **The proxy authenticates itself**, via `_check_access`, not via the
-  caller model every other route family uses. `Vagus.API.Auth` never runs on
-  this leg either: this module resolves the token to a principal and
+  caller model every other route family uses. `Vagus.API.Auth`'s plug does
+  not run on this leg: this module reads the token from this leg's own
+  headers, `Vagus.API.Auth.principal/1` names whose it is, and
   `Vagus.API.Authz` decides, on rules of this leg's own.
 
   ## The auth model is INVERTED from every other add-on-facing route (fact 2)
@@ -42,9 +43,10 @@ defmodule Vagus.API.CoreProxy do
   legitimately calls the HA API or hands Core's admin rights to an app that
   never declared `homeassistant_api`.
 
-  Every refusal is the same 401, as upstream's `_check_access` answers: a
-  caller is not told whether its token was unknown, Core's, or an app's
-  without the grant.
+  Every refusal of a caller is the same 401, as upstream's `_check_access`
+  answers: a caller is not told whether its token was unknown, Core's, or an
+  app's without the grant. A reserved path that arrives here is not refused
+  but raised (below).
 
   ## Why the proxy calls Core as the Supervisor user (fact 3)
 
@@ -152,8 +154,7 @@ defmodule Vagus.API.CoreProxy do
 
   require Logger
 
-  alias Vagus.API.{Authz, SourceGuard, Token}
-  alias Vagus.App
+  alias Vagus.API.{Auth, Authz, SourceGuard}
   alias Vagus.Core.{Client, Health, Reserved, Transport}
 
   @finch Vagus.API.CoreProxy.Finch
@@ -356,23 +357,8 @@ defmodule Vagus.API.CoreProxy do
     %{leg: :core_api, decoded_segments: decoded}
   end
 
-  # The supervisor's token is compared first, as `Vagus.API.Auth` does. A
-  # token nobody holds is no identity, which is what `:anonymous` means.
-  defp principal(nil), do: :anonymous
-
-  defp principal(token) do
-    if Plug.Crypto.secure_compare(token, Token.get()) do
-      :supervisor
-    else
-      case App.identity_for_token(token) do
-        {:ok, identity} -> {:addon, identity}
-        :error -> :anonymous
-      end
-    end
-  end
-
   defp authorize(token, action, ctx) do
-    principal = principal(token)
+    principal = Auth.principal(token)
 
     case Authz.authorize(principal, action, ctx) do
       :ok ->
@@ -382,8 +368,7 @@ defmodule Vagus.API.CoreProxy do
       # reached, so one here means a route around it: loud, like
       # `Vagus.Core.Transport.build/6`'s own refusal.
       {:error, :blacklisted} ->
-        {:rest, :core_api, _method, [_family | core_path]} = action
-        raise Reserved.Error, path: "/" <> Enum.join(core_path, "/")
+        raise Reserved.Error
 
       {:error, :forbidden} ->
         count_refusal()
@@ -425,7 +410,8 @@ defmodule Vagus.API.CoreProxy do
     end
   end
 
-  # No per-attempt logging on device for any branch above, deliberately. This
+  # No per-attempt logging on device for any branch above, deliberately (off
+  # device, where there is no ring, `count_refusal/0` logs a warning). This
   # whole path runs pre-auth from the caller's point of view — same primitive
   # `Vagus.API.Dispatcher`'s `report_filtered/2` and `Vagus.API.Auth`'s
   # `refuse_blacklisted/1` both already decline to log per-request for: an

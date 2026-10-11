@@ -1,9 +1,11 @@
 defmodule Vagus.Core.ReservedContractTest do
   @moduledoc """
   Contract test for `Vagus.Core.Reserved`: every view Core actually registers
-  under `/api/hassio*` must be refused to a proxied caller, on both the
-  Supervisor-side path (`Vagus.API.Tiers.blacklisted?/1`) and the Core-side
-  one (`Vagus.Core.Transport.build/6`).
+  under `/api/hassio*`, and every command it registers in its reserved
+  domains, must be refused to a proxied caller: by `Vagus.API.Authz`, which
+  decides both proxy legs, by `Vagus.API.Dispatcher` and
+  `Vagus.API.Tiers.blacklisted?/1` on the Supervisor-side path, and by
+  `Vagus.Core.Transport.build/6` on the Core-side one.
 
   This exists because the bug it guards against was never a coding error —
   it was a list going stale. Upstream's deny named `hassio/` when that was
@@ -45,7 +47,7 @@ defmodule Vagus.Core.ReservedContractTest do
 
   use ExUnit.Case, async: true
 
-  alias Vagus.API.{Authz, Tiers}
+  alias Vagus.API.{Authz, Dispatcher, Tiers}
   alias Vagus.API.CoreProxy.WSBridge
   alias Vagus.Core.{Reserved, Transport}
 
@@ -125,6 +127,42 @@ defmodule Vagus.Core.ReservedContractTest do
 
         assert authorize_view(principal, spelled, plain) == {:error, :blacklisted},
                "#{Enum.join(spelled, "/")} (Core #{url}) is reachable through the proxy"
+
+        # The other way round, so the raw spelling is shown to be checked too:
+        # `%68assio` as a decoded segment is a literal, and not reserved.
+        assert authorize_view(principal, plain, spelled) == {:error, :blacklisted}
+        assert authorize_view(@app, spelled, spelled) == :ok
+      end
+    end
+
+    # Core's router does not collapse `.` segments, but nothing here may rest
+    # on that. Before `api` a dot makes a path that is not the proxy's at all.
+    test "is denied with a `.` segment at each position, by the evaluator and the dispatcher" do
+      for url <- @urls, family <- ["core", "homeassistant"] do
+        ["api" | rest] = concrete(url)
+
+        for at <- 0..length(rest), dot <- [".", "%2e", "%2E"] do
+          raw = [family, "api" | List.insert_at(rest, at, dot)]
+          decoded = Enum.map(raw, &URI.decode/1)
+          path = "/" <> Enum.join(raw, "/")
+
+          for principal <- [@app, :supervisor, :anonymous] do
+            assert authorize_view(principal, raw, decoded) == {:error, :blacklisted},
+                   "#{path} (Core #{url}) is reachable through the proxy"
+          end
+
+          conn = Dispatcher.call(Plug.Test.conn(:post, path), Dispatcher.init([]))
+          assert conn.status == 403, "#{path} (Core #{url}) got past the dispatcher"
+
+          assert_raise Reserved.Error, fn ->
+            Transport.build(
+              {:socket, "/run/os/core.sock"},
+              :proxied,
+              :post,
+              "/api/" <> Enum.join(tl(tl(raw)), "/")
+            )
+          end
+        end
       end
     end
 

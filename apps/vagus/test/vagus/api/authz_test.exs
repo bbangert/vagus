@@ -154,6 +154,22 @@ defmodule Vagus.API.AuthzTest do
       end
     end
 
+    # The dispatcher sends the proxy family's reserved paths here to be
+    # refused, so this leg has to know them in every spelling it does.
+    test "holds behind `.` segments, as it does on the proxy" do
+      for who <- [:supervisor, :anonymous, :admin],
+          path <- [
+            "/core/api/./hassio_auth",
+            "/core/api/%2e/hassio/app",
+            "/%63ore/api/./hassio_auth",
+            "/homeassistant/%61pi/%2E/./hassio/app"
+          ] do
+        assert authorize(who, path) == {:error, :blacklisted}
+      end
+
+      assert authorize(:supervisor, "/core/./api/hassio_auth") == :ok
+    end
+
     test "a near miss is graded normally" do
       assert authorize(:supervisor, "/core/api/other") == :ok
       assert authorize(:homeassistant, "/core/api/other") == :ok
@@ -342,6 +358,42 @@ defmodule Vagus.API.AuthzTest do
              ) == {:error, :blacklisted}
     end
 
+    test "a reserved view behind `.` segments is still the reserved view" do
+      allowed = core_app(%{homeassistant_api: true})
+
+      for principal <- [allowed, :supervisor, :anonymous],
+          path <- [
+            "/core/api/./hassio_auth/password_reset",
+            "/core/api/././hassio/app",
+            "/core/api/%2e/hassio_auth",
+            "/core/api/%2E/%2e/hassio/app",
+            "/homeassistant/api/./%68assio_auth",
+            "/core/api/.%2fhassio/app"
+          ] do
+        assert core(principal, path) == {:error, :blacklisted}
+      end
+    end
+
+    test "a `.` segment reserves nothing by itself" do
+      allowed = core_app(%{homeassistant_api: true})
+
+      for path <- [
+            "/core/api/./config",
+            "/core/api/states/./hassio",
+            "/core/api/.hassio/app",
+            "/core/api/../hassio/app",
+            "/core/api/."
+          ] do
+        assert core(allowed, path) == :ok
+      end
+    end
+
+    test "a principal that is none of the three raises" do
+      for principal <- [nil, :core, {:addon, nil}, "supervisor"] do
+        assert_raise FunctionClauseError, fn -> core(principal, "/core/api/states") end
+      end
+    end
+
     test "decodes once: a doubly encoded spelling is not the reserved view" do
       allowed = core_app(%{homeassistant_api: true})
 
@@ -401,6 +453,13 @@ defmodule Vagus.API.AuthzTest do
 
       assert ws(core_app(%{hassio_api: true, hassio_role: "admin"}), "get_states") ==
                {:error, :forbidden}
+    end
+
+    test "a principal that is none of the three raises for a command it would allow" do
+      for principal <- [nil, :core, {:addon, nil}, "supervisor"],
+          type <- ["get_states", "supervisor/api"] do
+        assert_raise FunctionClauseError, fn -> ws(principal, type) end
+      end
     end
 
     test "a type that is not a string, or a ctx for another leg, has no clause" do

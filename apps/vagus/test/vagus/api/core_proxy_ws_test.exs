@@ -441,7 +441,7 @@ defmodule Vagus.API.CoreProxyWSTest do
 
   alias Vagus.API.CoreProxy.WSBridge
   alias Vagus.API.CoreProxyWSTest.{Client, CoreAuthScript, DialCounter, FakeCore}
-  alias Vagus.API.{Dispatcher, Token}
+  alias Vagus.API.{Dispatcher, SourceGuard, Token}
 
   @opts Dispatcher.init([])
   @expected_core_token "core-access-token"
@@ -1028,8 +1028,10 @@ defmodule Vagus.API.CoreProxyWSTest do
     end
   end
 
-  # No `Upstream` behind these states: a frame the bridge tried to relay
-  # would not come back as a result.
+  # The one test here that tells this bridge from one that screens frames
+  # without asking `Vagus.API.Authz`: an ordinary command, refused because of
+  # who the state says is asking. No `Upstream` behind these states, so a
+  # frame the bridge tried to relay would not come back as a result.
   test "every command is put to the evaluator as the principal in state" do
     frame = {~s({"id":4,"type":"get_states"}), [opcode: :text]}
 
@@ -1053,7 +1055,7 @@ defmodule Vagus.API.CoreProxyWSTest do
     end
   end
 
-  test "supervisor/api is refused by the bridge whatever the evaluator would do with it next" do
+  test "a command the evaluator intercepts is refused, alone and in a batch" do
     app = {:addon, %{slug: "cp_ws_intercept", homeassistant_api: true}}
 
     assert Vagus.API.Authz.authorize(app, {:ws, :core_api, "supervisor/api", %{}}, %{
@@ -1072,10 +1074,66 @@ defmodule Vagus.API.CoreProxyWSTest do
     assert WSBridge.screen(~s([{"id":1,"type":"get_states"}]), app) == :relay
   end
 
-  test "a refused frame is counted under a static label, and none of it is logged", %{
+  test "a frame is never relayed for a principal that is not one" do
+    for principal <- [nil, {:addon, nil}, :core] do
+      for frame <- [~s({"id":1,"type":"get_states"}), ~s([{"id":1,"type":"get_states"}])] do
+        relayed? =
+          try do
+            WSBridge.screen(frame, principal) == :relay
+          rescue
+            FunctionClauseError -> false
+          end
+
+        refute relayed?
+      end
+    end
+  end
+
+  test "on device, a refused frame is cast to the guard and logs nothing" do
+    prev = Application.get_env(:vagus, :api_source_guard)
+    Application.put_env(:vagus, :api_source_guard, true)
+
+    on_exit(fn ->
+      if is_nil(prev),
+        do: Application.delete_env(:vagus, :api_source_guard),
+        else: Application.put_env(:vagus, :api_source_guard, prev)
+    end)
+
+    # The test stands in for the guard: the real one reports and resets on a
+    # timer.
+    Process.register(self(), SourceGuard)
+
+    state = %{
+      phase: :relaying,
+      upstream: nil,
+      principal: {:addon, %{slug: "cp_ws_counted_device", homeassistant_api: true}},
+      ha_version: nil,
+      closing?: false
+    }
+
+    log =
+      capture_log(fn ->
+        for frame <- [~s({"id":7,"type":"supervisor/api","endpoint":"/zz-marker"}), ~s([5])] do
+          assert {:push, {:text, _unauthorized}, ^state} =
+                   WSBridge.handle_in({frame, [opcode: :text]}, state)
+        end
+      end)
+
+    refute log =~ "authz"
+
+    for _frame <- 1..2 do
+      assert_received {:"$gen_cast", {:filtered, :authz, "authz/core_ws"}}
+    end
+
+    refute_received {:"$gen_cast", _other}
+  end
+
+  # Off device there is no counter, and a refusal is a log line instead.
+  test "off device, a refused frame is logged under a static label, and none of it", %{
     proxy_host: host,
     proxy_port: port
   } do
+    refute SourceGuard.enabled?()
     client = relaying_client(host, port, "cp_ws_counted")
 
     log =
@@ -1087,11 +1145,12 @@ defmodule Vagus.API.CoreProxyWSTest do
         ])
       end)
 
-    assert length(String.split(log, "refused a frame (authz/core_ws)")) == 4
+    assert log =~ "authz/core_ws"
     refute log =~ "zz-marker"
   end
 
   test "a relayed frame is not counted", %{proxy_host: host, proxy_port: port} do
+    refute SourceGuard.enabled?()
     client = relaying_client(host, port, "cp_ws_uncounted")
     log = capture_log(fn -> assert_relayed(client, @ordinary) end)
 
@@ -1102,6 +1161,7 @@ defmodule Vagus.API.CoreProxyWSTest do
     proxy_host: host,
     proxy_port: port
   } do
+    refute SourceGuard.enabled?()
     no_flag = addon_token("cp_ws_handshake_counted", %{hassio_api: true, hassio_role: "admin"})
 
     refused = fn token ->
@@ -1118,7 +1178,7 @@ defmodule Vagus.API.CoreProxyWSTest do
 
     for token <- [no_flag, Token.get()] do
       log = refused.(token)
-      assert log =~ "refused a request (authz/core_api)"
+      assert log =~ "authz/core_api"
       refute log =~ token
     end
 

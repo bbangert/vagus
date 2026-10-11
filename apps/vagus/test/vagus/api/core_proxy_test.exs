@@ -187,7 +187,7 @@ defmodule Vagus.API.CoreProxyTest do
   import ExUnit.CaptureLog
   import Vagus.AppFixtures
 
-  alias Vagus.API.{CoreProxy, Dispatcher, Token}
+  alias Vagus.API.{CoreProxy, Dispatcher, SourceGuard, Token}
   alias Vagus.API.CoreProxyTest.{FakeCore, HitCounter, Recorder, Script, SSEGate}
 
   @opts Dispatcher.init([])
@@ -272,6 +272,21 @@ defmodule Vagus.API.CoreProxyTest do
 
   defp bearer(token), do: {"authorization", "Bearer #{token}"}
 
+  # The test stands in for the guard, as on a device: the real one reports
+  # and resets on a timer, so its state is not something to assert on.
+  defp as_the_guard do
+    prev = Application.get_env(:vagus, :api_source_guard)
+    Application.put_env(:vagus, :api_source_guard, true)
+
+    on_exit(fn ->
+      if is_nil(prev),
+        do: Application.delete_env(:vagus, :api_source_guard),
+        else: Application.put_env(:vagus, :api_source_guard, prev)
+    end)
+
+    Process.register(self(), SourceGuard)
+  end
+
   ## 1. Auth (fact 2 — the inverted model)
 
   describe "auth" do
@@ -340,21 +355,23 @@ defmodule Vagus.API.CoreProxyTest do
       assert HitCounter.count() == 0
     end
 
-    # The 401 alone does not say who refused. The count does: only
-    # `Vagus.API.Authz` knows the supervisor from a stranger on this leg.
-    test "a known principal's refusal is the evaluator's, counted under a static label" do
+    # Off device there is no counter, and a refusal is a log line instead.
+    test "off device, a known principal's refusal is logged under a static label" do
+      refute SourceGuard.enabled?()
       no_flag = addon_token("cp_auth_counted", %{hassio_api: true, hassio_role: "admin"})
 
       for token <- [Token.get(), no_flag] do
         log = capture_log(fn -> call(:get, "/core/api/zz-marker", [bearer(token)]) end)
 
-        assert log =~ "refused a request (authz/core_api)"
+        assert log =~ "authz/core_api"
         refute log =~ "zz-marker"
         refute log =~ token
       end
     end
 
     test "a caller nobody knows is refused uncounted" do
+      refute SourceGuard.enabled?()
+
       log =
         capture_log(fn ->
           assert call(:get, "/core/api/states").status == 401
@@ -362,6 +379,26 @@ defmodule Vagus.API.CoreProxyTest do
         end)
 
       refute log =~ "authz"
+    end
+
+    test "on device, a known principal's refusal is cast to the guard and logs nothing" do
+      as_the_guard()
+      no_flag = addon_token("cp_auth_counted_device", %{hassio_api: true, hassio_role: "admin"})
+
+      log =
+        capture_log(fn ->
+          for token <- [Token.get(), no_flag, "not-a-real-token"] do
+            assert call(:get, "/core/api/zz-marker", [bearer(token)]).status == 401
+          end
+        end)
+
+      refute log =~ "authz"
+
+      for _known <- [:supervisor, :no_flag] do
+        assert_received {:"$gen_cast", {:filtered, :authz, "authz/core_api"}}
+      end
+
+      refute_received {:"$gen_cast", _other}
     end
 
     test "check_access/1 answers with the principal it admitted" do
@@ -480,6 +517,84 @@ defmodule Vagus.API.CoreProxyTest do
 
       assert conn.status == 403
       assert HitCounter.count() == 0
+    end
+
+    # A crash report is an error-level log line, and this branch is reached
+    # before anyone is authenticated.
+    test "the backstop raise says nothing the caller wrote, to a caller nobody knows" do
+      conn = %{
+        Plug.Test.conn(:post, "/")
+        | path_info: ["core", "api", "hassio_auth", "\e[31mzz-marker"],
+          request_path: "/core/api/hassio_auth/\e[31mzz-marker",
+          query_string: "zz-query=1"
+      }
+
+      {error, log} =
+        with_log(fn ->
+          assert_raise Vagus.Core.Reserved.Error, fn ->
+            CoreProxy.call(conn, CoreProxy.init([]))
+          end
+        end)
+
+      for text <- [Exception.message(error), inspect(error), log] do
+        refute text =~ "zz-"
+        refute text =~ "\e"
+      end
+
+      assert HitCounter.count() == 0
+    end
+
+    # Core's router does not collapse a `.` segment today. The refusal must
+    # not rest on that.
+    test "a reserved view behind `.` segments -> the blacklist's 403 for everyone, fake Core never hit" do
+      granted = addon_token("cp_blacklist_dots", %{homeassistant_api: true})
+      plain = call(:post, "/core/api/hassio_auth/password_reset", [bearer(granted)])
+      assert plain.status == 403
+
+      for path <- [
+            "/core/api/./hassio_auth/password_reset",
+            "/core/api/././hassio/app",
+            "/core/api/%2e/hassio_auth",
+            "/core/api/%2E/hassio_auth/password_reset",
+            "/core/api/./%2e/%2E/hassio/app",
+            "/core/api/./%68assio_auth",
+            "/core/api/%2e/hassi%6F_auth/password_reset",
+            "/core/api/./hassio%2fapp",
+            "/homeassistant/api/./hassio_ingress/token/x",
+            "/homeassistant/api/%2e/hassio_push/discovery/uuid"
+          ],
+          headers <- [[], [bearer(granted)], [bearer(Token.get())], [bearer("not-a-real-token")]],
+          method <- [:get, :post] do
+        conn = call(method, path, headers)
+
+        assert {conn.status, conn.resp_body} == {plain.status, plain.resp_body}, path
+      end
+
+      assert HitCounter.count() == 0
+    end
+
+    # `.%2f` is a dot segment only once decoded, which the router's own
+    # gate does not do to a slash. The dispatcher still keeps it from this leg.
+    test "a `.` segment joined to the reserved view by an encoded slash never reaches Core" do
+      granted = addon_token("cp_blacklist_dot_slash", %{homeassistant_api: true})
+
+      for path <- ["/core/api/.%2fhassio/app", "/core/api/.%2Fhassio_auth"],
+          headers <- [[], [bearer(granted)], [bearer(Token.get())]] do
+        assert call(:get, path, headers).status in [401, 403, 404]
+      end
+
+      assert HitCounter.count() == 0
+    end
+
+    test "a `.` segment in a path that is not reserved is forwarded as written" do
+      token = addon_token("cp_dots_forwarded", %{homeassistant_api: true})
+
+      for path <- ["/./config", "/%2e/config", "/states/./hassio", "/.hassio/app", "/states/."] do
+        conn = call(:get, "/core/api" <> path, [bearer(token)])
+
+        assert conn.status == 200
+        assert Recorder.last().path == "/api" <> path
+      end
     end
 
     # The backstop, exercised the only way it can be: by SKIPPING the
