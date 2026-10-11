@@ -5,6 +5,10 @@
 #
 # Exits nonzero on any mismatch; `--observe` reports mismatches without failing (baseline of an unfixed build).
 #
+# Bench tool: the probe's eval endpoint is plain HTTP and its token lets the holder
+# run code in that app's container. Use it only on a lab network you trust, and
+# set a fresh `auth_token` on the probe afterwards if in doubt.
+#
 # The probe apps come from github.com/bbangert/ha-bench-addons. Use one that
 # declares homeassistant_api (elixir_probe on 4000, probe_core_api on 4002).
 # Expected on a fixed build: reserved, batched and malformed commands answer
