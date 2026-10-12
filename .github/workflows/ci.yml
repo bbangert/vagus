@@ -341,7 +341,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: bbangert/nerves_system_vagus
-          ref: v0.3.4
+          ref: v0.4.0
           path: nerves_system_vagus
 
       - name: Check for unused locked deps
