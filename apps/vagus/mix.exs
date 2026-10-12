@@ -187,8 +187,9 @@ defmodule Vagus.MixProject do
       {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false, targets: :host},
       {:sobelow, "~> 0.13", only: [:dev, :test], runtime: false, targets: :host},
       # Whole-program OTP/supervision analysis over the compiled beams
-      # (`mix argus`). Needs Souffle on PATH; run as its own CI job rather
-      # than a compiler so a missing Souffle never breaks `mix compile`.
+      # (`mix argus`). Fetches its prebuilt FlowLog engines on first run; run
+      # as its own CI job rather than a compiler so an unavailable engine
+      # never breaks `mix compile`.
       {:argus_beam, "~> 0.20", only: [:dev, :test], runtime: false, targets: :host}
     ]
   end
