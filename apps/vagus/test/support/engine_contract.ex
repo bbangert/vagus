@@ -282,8 +282,12 @@ defmodule Vagus.Test.EngineContract do
           assert {:ok, %Container{state: :running}} = Engine.inspect("addon_local_x", opts)
         end
 
-        test "start of a running container is :ok", ctx do
-          assert Engine.start("addon_local_x", arrange(:start_running, ctx)) == :ok
+        test "start of a running container is :ok and leaves it as it was", ctx do
+          opts = arrange(:start_running, ctx)
+          {:ok, before} = Engine.inspect("addon_local_x", opts)
+          assert Engine.start("addon_local_x", opts) == :ok
+          {:ok, now} = Engine.inspect("addon_local_x", opts)
+          assert {now.started_at, now.health} == {before.started_at, before.health}
         end
 
         test "start of an absent container is :not_found", ctx do
@@ -301,6 +305,11 @@ defmodule Vagus.Test.EngineContract do
         test "inspect past timeout_ms is :timeout", ctx do
           opts = [timeout_ms: 200] ++ arrange(:inspect_slow, ctx)
           assert Engine.inspect("addon_local_x", opts) == {:error, :timeout}
+        end
+
+        test "a stop's grace outlasts a smaller timeout_ms", ctx do
+          opts = [timeout_ms: 100, timeout_s: 0] ++ arrange(:stop_within_grace, ctx)
+          assert Engine.stop("addon_local_x", opts) == :ok
         end
 
         test "stop past timeout_ms is :timeout", ctx do
@@ -337,6 +346,15 @@ defmodule Vagus.Test.EngineContract do
 
         test "remove of an absent container is :ok", ctx do
           assert Engine.remove("ghost", arrange(:absent, ctx)) == :ok
+        end
+
+        # 2 x 5.1 s outlasts one 10 s grace but not the two the call owes.
+        @tag timeout: 30_000
+        test "stop_all's budget covers every container's grace in turn", ctx do
+          opts = [timeout_ms: 100] ++ arrange(:stop_all_slow, ctx)
+
+          assert Engine.stop_all(["addon_local_x", "addon_local_d"], 0, opts) ==
+                   {:ok, ["addon_local_x", "addon_local_d"], []}
         end
 
         test "stop_all: stopped and absent count as stopped, a failure is reported", ctx do

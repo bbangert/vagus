@@ -163,7 +163,9 @@ defmodule Vagus.Runtime.Engine.DockerContractTest.Leg do
     do: [{200, [x_summary(), core_summary()]}, {200, [x_summary(), y_summary(), core_summary()]}]
 
   defp script(:start_created), do: [{204, nil}, {200, running_json()}]
-  defp script(:start_running), do: [{304, nil}]
+  defp script(:start_running), do: [{200, running_json()}, {304, nil}, {200, running_json()}]
+  defp script(:stop_within_grace), do: [{204, nil, delay: 500}]
+  defp script(:stop_all_slow), do: [{204, nil, delay: 5_100}, {204, nil, delay: 5_100}]
   defp script(:stop_running), do: [{204, nil}, {200, exited_json(0)}]
   defp script(:stop_stopped), do: [{304, nil}]
   defp script(:restart), do: [{204, nil}]
@@ -392,9 +394,12 @@ defmodule Vagus.Runtime.Engine.DockerContractTest do
              ]
     end
 
-    test "timeout_ms never cuts a stop's own grace short" do
-      {_engine, opts} = engine([{204, nil, delay: 500}])
-      assert Engine.stop("addon_local_x", [timeout_ms: 100, timeout_s: 0] ++ opts) == :ok
+    test "a stop's receive budget covers its grace" do
+      {_engine, opts} = engine([{204, nil, delay: 500}, {204, nil, delay: 500}])
+      opts = [recv_timeout: 200] ++ opts
+
+      assert Engine.stop("addon_local_x", opts) == {:error, :timeout}
+      assert Engine.stop("addon_local_x", [timeout_s: 0] ++ opts) == :ok
     end
 
     test "create sends the name and the rendered spec" do

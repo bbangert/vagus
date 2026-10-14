@@ -90,6 +90,19 @@ defmodule Vagus.Runtime.DockerTest do
     end
   end
 
+  describe ":recv_timeout (hermetic — FakeEngine)" do
+    test "bounds the daemon's silence per request" do
+      engine = FakeEngine.start([{200, %{}, delay: 500}, {200, %{}, delay: 500}])
+      on_exit(fn -> FakeEngine.stop(engine) end)
+
+      assert {:error, %Mint.TransportError{reason: :timeout}} =
+               Docker.request(:get, "/version", socket: engine.socket, recv_timeout: 200)
+
+      assert {:ok, %{status: 200}} =
+               Docker.request(:get, "/version", socket: engine.socket, recv_timeout: 1_000)
+    end
+  end
+
   describe "inspect_image/2 (hermetic — FakeEngine)" do
     test "a present image is its inspect map; an absent one is a 404" do
       engine =

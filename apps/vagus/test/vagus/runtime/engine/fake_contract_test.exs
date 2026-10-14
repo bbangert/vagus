@@ -25,6 +25,19 @@ defmodule Vagus.Runtime.Engine.FakeContractTest.Leg do
 
   defp setup(:start_created, fake), do: put(fake, %{C.running() | state: :created})
   defp setup(:start_running, fake), do: put(fake, C.running())
+
+  defp setup(:stop_within_grace, fake) do
+    put(fake, C.running())
+    Fake.delay_next(fake, :stop, 500)
+  end
+
+  defp setup(:stop_all_slow, fake) do
+    put(fake, C.running())
+    put(fake, %{C.running() | name: "addon_local_d"})
+    Fake.delay_next(fake, :stop, 5_100)
+    Fake.delay_next(fake, :stop, 5_100)
+  end
+
   defp setup(:stop_running, fake), do: put(fake, C.running())
   defp setup(:stop_stopped, fake), do: put(fake, C.exited())
   defp setup(:restart, fake), do: put(fake, C.running())

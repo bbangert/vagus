@@ -109,7 +109,11 @@ defmodule Vagus.Runtime.Engine.Docker do
 
   @impl true
   def stop_all(names, timeout_s, opts) do
-    opts = opts |> Keyword.put(:timeout_s, timeout_s) |> deadline(grace_ms(timeout_s))
+    # Stops run one after another, so the floor is every container's grace.
+    opts =
+      opts
+      |> Keyword.put(:timeout_s, timeout_s)
+      |> deadline(length(names) * grace_ms(timeout_s))
 
     {stopped, failed} =
       Enum.reduce(names, {[], []}, fn name, {stopped, failed} ->
@@ -465,11 +469,20 @@ defmodule Vagus.Runtime.Engine.Docker do
     end
   end
 
-  # A deadline shorter than the grace would abandon the engine mid-kill.
+  # A deadline or receive budget shorter than the grace would abandon the
+  # engine mid-kill: the daemon stays silent until the container is gone.
   defp grace(opts) do
     case Keyword.pop(opts, :timeout_s) do
-      {nil, opts} -> deadline(opts)
-      {seconds, opts} -> opts |> Keyword.put(:timeout, seconds) |> deadline(grace_ms(seconds))
+      {nil, opts} ->
+        deadline(opts)
+
+      {seconds, opts} ->
+        grace = grace_ms(seconds)
+
+        opts
+        |> Keyword.put(:timeout, seconds)
+        |> Keyword.update(:recv_timeout, grace, &max(&1, grace))
+        |> deadline(grace)
     end
   end
 

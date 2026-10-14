@@ -355,7 +355,9 @@ defmodule Vagus.Runtime.Docker do
   Issues a single Engine-API request over the Unix socket.
 
   `opts`: `:socket`, `:query` (keyword/map → query string), `:body`
-  (a map → JSON, or a raw string/`nil`), `:headers`, `:deadline`. Returns
+  (a map → JSON, or a raw string/`nil`), `:headers`, `:deadline`,
+  `:recv_timeout` (ms of daemon silence tolerated, default
+  #{@recv_timeout}; a stop's grace can outlast the default). Returns
   `{:ok, response}` where `response.body` is JSON-decoded when the daemon says
   so, else the raw string.
 
@@ -399,7 +401,8 @@ defmodule Vagus.Runtime.Docker do
         try do
           with :ok <- in_time(conn, deadline),
                {:ok, conn, ref} <- Mint.HTTP.request(conn, method, full_path, headers, body),
-               {:ok, _conn, responses} <- recv_all(conn, ref, deadline) do
+               {:ok, _conn, responses} <-
+                 recv_all(conn, ref, deadline, Keyword.get(opts, :recv_timeout, @recv_timeout)) do
             {:ok, assemble(responses, ref)}
           else
             {:error, _conn, reason} -> {:error, reason}
@@ -550,18 +553,18 @@ defmodule Vagus.Runtime.Docker do
   # Accumulate response batches newest-first (O(1) prepend, not O(n²) `++`),
   # enforcing a hard body ceiling so an unbounded daemon stream can't exhaust
   # memory. Flattened back into arrival order on `:done`.
-  defp recv_all(conn, ref, deadline, acc \\ [], size \\ 0) do
+  defp recv_all(conn, ref, deadline, recv, acc \\ [], size \\ 0) do
     left = left_ms(deadline)
 
     if left > 0 do
-      recv_within(conn, ref, deadline, left, acc, size)
+      recv_within(conn, ref, deadline, recv, left, acc, size)
     else
       {:error, conn, :deadline}
     end
   end
 
-  defp recv_within(conn, ref, deadline, left, acc, size) do
-    case Mint.HTTP.recv(conn, 0, min(left, @recv_timeout)) do
+  defp recv_within(conn, ref, deadline, recv, left, acc, size) do
+    case Mint.HTTP.recv(conn, 0, min(left, recv)) do
       {:ok, conn, responses} ->
         size = size + data_size(responses)
         acc = [responses | acc]
@@ -574,13 +577,13 @@ defmodule Vagus.Runtime.Docker do
             {:ok, conn, acc |> Enum.reverse() |> List.flatten()}
 
           true ->
-            recv_all(conn, ref, deadline, acc, size)
+            recv_all(conn, ref, deadline, recv, acc, size)
         end
 
       # The wait was cut to what the deadline had left, so this is the
       # deadline and not a quiet daemon.
       {:error, conn, %Mint.TransportError{reason: :timeout}, _responses}
-      when left < @recv_timeout ->
+      when left < recv ->
         {:error, conn, :deadline}
 
       {:error, conn, reason, _responses} ->
@@ -588,8 +591,9 @@ defmodule Vagus.Runtime.Docker do
     end
   end
 
-  # No deadline reads as the receive timeout itself, which changes nothing.
-  defp left_ms(nil), do: @recv_timeout
+  # No deadline never runs out; term order puts the atom above any number,
+  # so `min/2` and `left > 0` need no special case.
+  defp left_ms(nil), do: :infinity
   defp left_ms(deadline), do: deadline - System.monotonic_time(:millisecond)
 
   defp data_size(responses) do

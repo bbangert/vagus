@@ -125,8 +125,17 @@ defmodule Vagus.Runtime.Engine.Fake do
   end
 
   @impl true
-  def start(name, opts),
-    do: call(opts, :start, [name], &update_container(&1, name, fn c -> run(c) end))
+  def start(name, opts) do
+    call(
+      opts,
+      :start,
+      [name],
+      &update_container(&1, name, fn
+        %Container{state: :running} = c -> c
+        c -> run(c)
+      end)
+    )
+  end
 
   @impl true
   def stop(name, opts), do: call(opts, :stop, [name], &do_stop(&1, name))
@@ -138,14 +147,19 @@ defmodule Vagus.Runtime.Engine.Fake do
 
   @impl true
   def stop_all(names, timeout_s, opts) do
+    # Delays add up, as sequential stops share one budget of every grace.
+    floor = length(names) * grace_ms(timeout_s)
+
     call(opts, :stop_all, [names, timeout_s], fn s ->
-      {s, stopped, failed} =
-        Enum.reduce(names, {s, [], []}, fn name, {s, stopped, failed} ->
-          case pop_failure(s, :stop) do
-            {nil, s} -> stop_one(s, name, stopped, failed)
-            {{:delay, ms}, s} -> stop_delayed(s, name, stopped, failed, timed_out?(opts, ms))
-            {error, s} -> {s, stopped, [{name, error} | failed]}
-          end
+      {s, stopped, failed, _elapsed} =
+        Enum.reduce(names, {s, [], [], 0}, fn name, {s, stopped, failed, elapsed} ->
+          {failure, s} = pop_failure(s, :stop)
+          elapsed = elapsed + delay_ms(failure)
+
+          {s, stopped, failed} =
+            stop_step(s, name, stopped, failed, failure, timed_out?(opts, elapsed, floor))
+
+          {s, stopped, failed, elapsed}
         end)
 
       {{:ok, Enum.reverse(stopped), Enum.reverse(failed)}, s}
@@ -250,14 +264,34 @@ defmodule Vagus.Runtime.Engine.Fake do
 
     Agent.get_and_update(fake, fn s ->
       case pop_failure(%{s | calls: [{verb, args} | s.calls]}, verb) do
-        {nil, s} -> fun.(s)
-        {{:delay, ms}, s} -> if timed_out?(opts, ms), do: {{:error, :timeout}, s}, else: fun.(s)
-        {error, s} -> {{:error, error}, s}
+        {nil, s} ->
+          fun.(s)
+
+        {{:delay, ms}, s} ->
+          if timed_out?(opts, ms, grace_floor(verb, opts)),
+            do: {{:error, :timeout}, s},
+            else: fun.(s)
+
+        {error, s} ->
+          {{:error, error}, s}
       end
     end)
   end
 
-  defp timed_out?(opts, ms), do: is_integer(opts[:timeout_ms]) and ms > opts[:timeout_ms]
+  defp timed_out?(opts, ms, floor),
+    do: is_integer(opts[:timeout_ms]) and ms > max(opts[:timeout_ms], floor)
+
+  # The same floor Engine.Docker gives a stop: timeout_ms never cuts a grace short.
+  defp grace_floor(verb, opts) when verb in [:stop, :restart] do
+    if seconds = opts[:timeout_s], do: grace_ms(seconds), else: 0
+  end
+
+  defp grace_floor(_verb, _opts), do: 0
+
+  defp grace_ms(seconds), do: seconds * 1000 + 10_000
+
+  defp delay_ms({:delay, ms}), do: ms
+  defp delay_ms(_failure), do: 0
 
   defp pop_failure(s, verb) do
     case s.fail do
@@ -282,8 +316,16 @@ defmodule Vagus.Runtime.Engine.Fake do
 
   defp do_stop(s, name), do: update_container(s, name, &halt/1)
 
-  defp stop_delayed(s, name, stopped, failed, true), do: {s, stopped, [{name, :timeout} | failed]}
-  defp stop_delayed(s, name, stopped, failed, false), do: stop_one(s, name, stopped, failed)
+  defp stop_step(s, name, stopped, failed, _failure, true = _timed_out),
+    do: {s, stopped, [{name, :timeout} | failed]}
+
+  defp stop_step(s, name, stopped, failed, nil, false), do: stop_one(s, name, stopped, failed)
+
+  defp stop_step(s, name, stopped, failed, {:delay, _ms}, false),
+    do: stop_one(s, name, stopped, failed)
+
+  defp stop_step(s, name, stopped, failed, error, false),
+    do: {s, stopped, [{name, error} | failed]}
 
   defp stop_one(s, name, stopped, failed) do
     case do_stop(s, name) do
