@@ -6,8 +6,20 @@ defmodule Vagus.Runtime.Engine do
   `{:failed, verb, detail}`.
 
   Every call takes `opts`; `opts[:engine]` overrides the configured
-  `:engine` per call, which is how async tests inject `Engine.Fake`. The rest
-  of `opts` reaches the adapter untouched.
+  `:engine` per call, which is how async tests inject `Engine.Fake`. Every
+  adapter must honour:
+
+    * `:timeout_ms` (every callback): bounds the whole call; past it the
+      call returns `{:error, :timeout}`.
+    * `:timeout_s` (`stop`, `restart`, `stop_all`): the grace before kill;
+      `:timeout_ms` never cuts it short.
+    * `:force` (`remove`, default true): removes a running container.
+    * `:all` (default false), `:name_prefix` (`list`).
+    * `:tail` (default 100), `:timestamps` (`logs`, `follow_logs`).
+    * `:capture` (`exec`, default true).
+    * `:platform` (`pull`).
+
+  Any other key is adapter-specific (e.g. `socket:` for `Engine.Docker`).
   """
 
   import Kernel, except: [inspect: 2]
@@ -18,6 +30,7 @@ defmodule Vagus.Runtime.Engine do
           :not_found
           | :conflict
           | :in_use
+          # Another operation holds the container (lock/permit); retryable.
           | :busy
           | :timeout
           | :unavailable
@@ -46,7 +59,10 @@ defmodule Vagus.Runtime.Engine do
   @callback start(name(), keyword()) :: :ok | {:error, error()}
   @doc "An already-stopped container is `:ok`."
   @callback stop(name(), keyword()) :: :ok | {:error, error()}
-  @doc "Stops each in turn; an absent container counts as stopped."
+  @doc """
+  `timeout_s` is each container's grace. An absent container counts as
+  stopped. Order is not guaranteed and an adapter may stop concurrently.
+  """
   @callback stop_all([name()], timeout_s :: non_neg_integer(), keyword()) ::
               {:ok, stopped :: [name()], failed :: [{name(), error()}]}
   @callback restart(name(), keyword()) :: :ok | {:error, error()}
@@ -61,11 +77,16 @@ defmodule Vagus.Runtime.Engine do
   next chunk only after `owner` sends `:log_ack` (`Vagus.Runtime.Logs.Follow.ack/1`).
   The streamer is linked to the caller.
   """
-  @callback follow_logs(name(), owner :: pid(), keyword()) :: {:ok, pid()}
+  @callback follow_logs(name(), owner :: pid(), keyword()) :: {:ok, pid()} | {:error, error()}
   @callback stats(name(), keyword()) :: {:ok, stats()} | {:error, error()}
   @doc "Any exit code is `{:ok, _}`; `output` is plain text, `\"\"` when `capture: false`."
   @callback exec(name(), argv :: [String.t()], keyword()) ::
               {:ok, %{exit_code: integer(), output: binary()}} | {:error, error()}
+  @doc """
+  Runs one check now and returns its verdict; may block up to the check's
+  own timeout. An engine that schedules checks itself may return its latest
+  verdict instead.
+  """
   @callback healthcheck(name(), keyword()) ::
               {:ok, Container.health()} | {:error, :no_healthcheck | error()}
   @doc "Creates the network unless it exists; losing a create race is `:ok`."

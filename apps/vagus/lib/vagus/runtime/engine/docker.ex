@@ -3,8 +3,9 @@ defmodule Vagus.Runtime.Engine.Docker do
   `Vagus.Runtime.Engine` over the Docker Engine API (`Vagus.Runtime.Docker`),
   which balena-engine speaks too.
 
-  `opts` reach the client untouched, so `socket:` aims a call at another
-  daemon. `:timeout_ms` becomes the client's `:deadline` instant.
+  `:timeout_ms` becomes the client's `:deadline` instant, so one value
+  bounds every request a callback makes; the remaining opts pass through,
+  which is how `socket:` aims a call at another daemon.
   """
 
   @behaviour Vagus.Runtime.Engine
@@ -31,6 +32,8 @@ defmodule Vagus.Runtime.Engine.Docker do
 
   @impl true
   def ready(opts) do
+    opts = deadline(opts)
+
     case Client.ping(opts) do
       :ok -> :ok
       {:error, {:unexpected_status, status}} -> {:error, {:failed, :ready, status_detail(status)}}
@@ -50,6 +53,8 @@ defmodule Vagus.Runtime.Engine.Docker do
 
   @impl true
   def image_present?(image, opts) do
+    opts = deadline(opts)
+
     case Client.inspect_image(image, opts) do
       {:ok, _image} -> true
       {:error, {:http, 404, _}} -> false
@@ -59,6 +64,8 @@ defmodule Vagus.Runtime.Engine.Docker do
 
   @impl true
   def remove_image(image, opts) do
+    opts = deadline(opts)
+
     case Client.remove_image(image, opts) do
       :ok -> :ok
       {:error, {:remove_image_failed, 409, _}} -> {:error, :in_use}
@@ -68,7 +75,9 @@ defmodule Vagus.Runtime.Engine.Docker do
 
   @impl true
   def create(%ContainerSpec{} = spec, opts) do
-    case Client.create_container(render_container(spec), Keyword.put(opts, :name, spec.name)) do
+    opts = opts |> deadline() |> Keyword.put(:name, spec.name)
+
+    case Client.create_container(render_container(spec), opts) do
       {:ok, id} ->
         {:ok, id}
 
@@ -79,23 +88,28 @@ defmodule Vagus.Runtime.Engine.Docker do
       {:error, {:create_failed, 404, "No such image" <> _}} ->
         {:error, {:failed, :create, :image_not_found}}
 
+      {:error, {:create_failed, 404, "network " <> rest} = reason} ->
+        if String.ends_with?(rest, " not found"),
+          do: {:error, {:failed, :create, :network_not_found}},
+          else: {:error, error(:create, reason)}
+
       {:error, reason} ->
         {:error, error(:create, reason)}
     end
   end
 
   @impl true
-  def start(name, opts), do: unit(:start, Client.start_container(name, opts))
+  def start(name, opts), do: unit(:start, Client.start_container(name, deadline(opts)))
 
   @impl true
-  def stop(name, opts), do: unit(:stop, Client.stop_container(name, timeout_s(opts)))
+  def stop(name, opts), do: unit(:stop, Client.stop_container(name, grace(opts)))
 
   @impl true
-  def restart(name, opts), do: unit(:restart, Client.restart_container(name, timeout_s(opts)))
+  def restart(name, opts), do: unit(:restart, Client.restart_container(name, grace(opts)))
 
   @impl true
   def stop_all(names, timeout_s, opts) do
-    opts = Keyword.put(opts, :timeout_s, timeout_s)
+    opts = opts |> Keyword.put(:timeout_s, timeout_s) |> deadline(grace_ms(timeout_s))
 
     {stopped, failed} =
       Enum.reduce(names, {[], []}, fn name, {stopped, failed} ->
@@ -110,6 +124,8 @@ defmodule Vagus.Runtime.Engine.Docker do
 
   @impl true
   def remove(name, opts) do
+    opts = deadline(opts)
+
     case Client.remove_container(name, opts) do
       :ok -> :ok
       {:error, reason} -> {:error, error(:remove, reason)}
@@ -118,6 +134,8 @@ defmodule Vagus.Runtime.Engine.Docker do
 
   @impl true
   def inspect(name, opts) do
+    opts = deadline(opts)
+
     case Client.inspect_container(name, opts) do
       {:ok, raw} -> {:ok, parse_inspect(raw)}
       {:error, reason} -> {:error, error(:inspect, reason)}
@@ -126,6 +144,8 @@ defmodule Vagus.Runtime.Engine.Docker do
 
   @impl true
   def list(opts) do
+    opts = deadline(opts)
+
     case Client.list_containers(opts) do
       {:ok, raw} -> {:ok, raw |> Enum.map(&parse_summary/1) |> by_prefix(opts[:name_prefix])}
       {:error, reason} -> {:error, error(:list, reason)}
@@ -134,6 +154,8 @@ defmodule Vagus.Runtime.Engine.Docker do
 
   @impl true
   def logs(name, opts) do
+    opts = deadline(opts)
+
     case Client.container_logs(name, opts) do
       {:ok, raw} -> {:ok, Logs.demux(raw)}
       {:error, reason} -> {:error, error(:logs, reason)}
@@ -150,6 +172,8 @@ defmodule Vagus.Runtime.Engine.Docker do
 
   @impl true
   def stats(name, opts) do
+    opts = deadline(opts)
+
     case Client.stats(name, opts) do
       {:ok, raw} -> {:ok, Stats.compute(raw)}
       {:error, reason} -> {:error, error(:stats, reason)}
@@ -177,7 +201,7 @@ defmodule Vagus.Runtime.Engine.Docker do
     end
   end
 
-  # The daemon runs checks itself; this only reports its latest verdict.
+  # The daemon schedules checks itself, so this returns its latest verdict.
   @impl true
   def healthcheck(name, opts) do
     case inspect(name, opts) do
@@ -191,6 +215,8 @@ defmodule Vagus.Runtime.Engine.Docker do
 
   @impl true
   def ensure_network(%NetworkSpec{name: name} = spec, opts) do
+    opts = deadline(opts)
+
     case Client.inspect_network(name, opts) do
       {:ok, _network} -> :ok
       {:error, {:http, 404, _}} -> create_network(spec, opts)
@@ -414,6 +440,9 @@ defmodule Vagus.Runtime.Engine.Docker do
 
   defp error(_verb, :deadline), do: :timeout
   defp error(_verb, :exec_timeout), do: :timeout
+  defp error(_verb, %Mint.TransportError{reason: :timeout}), do: :timeout
+  # The daemon went away mid-request (closed, reset, refused on reconnect).
+  defp error(_verb, %Mint.TransportError{}), do: :unavailable
   defp error(_verb, {:connect, _reason}), do: :unavailable
   defp error(_verb, {:http, 404, _message}), do: :not_found
   defp error(_verb, {:http, 404}), do: :not_found
@@ -428,19 +457,25 @@ defmodule Vagus.Runtime.Engine.Docker do
   defp message(body) when is_binary(body), do: body
   defp message(body), do: Kernel.inspect(body)
 
-  defp deadline(opts) do
+  # An already-set `:deadline` (stop_all's shared instant) wins.
+  defp deadline(opts, floor_ms \\ 0) do
     case Keyword.pop(opts, :timeout_ms) do
       {nil, opts} -> opts
-      {ms, opts} -> Keyword.put(opts, :deadline, System.monotonic_time(:millisecond) + ms)
+      {ms, opts} -> Keyword.put_new(opts, :deadline, now_ms() + max(ms, floor_ms))
     end
   end
 
-  defp timeout_s(opts) do
+  # A deadline shorter than the grace would abandon the engine mid-kill.
+  defp grace(opts) do
     case Keyword.pop(opts, :timeout_s) do
-      {nil, opts} -> opts
-      {seconds, opts} -> Keyword.put(opts, :timeout, seconds)
+      {nil, opts} -> deadline(opts)
+      {seconds, opts} -> opts |> Keyword.put(:timeout, seconds) |> deadline(grace_ms(seconds))
     end
   end
+
+  defp grace_ms(seconds), do: seconds * 1000 + 10_000
+
+  defp now_ms, do: System.monotonic_time(:millisecond)
 
   defp put(map, _key, nil), do: map
   defp put(map, key, value), do: Map.put(map, key, value)

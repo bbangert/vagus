@@ -10,6 +10,8 @@ defmodule Vagus.Test.EngineContract do
 
   use ExUnit.CaseTemplate
 
+  import ExUnit.Assertions, only: [flunk: 1]
+
   alias Vagus.Runtime.Engine
   alias Vagus.Runtime.Engine.{Container, ContainerSpec, NetworkSpec}
   alias Vagus.Test.EngineContract, as: C
@@ -139,18 +141,27 @@ defmodule Vagus.Test.EngineContract do
     ]
   end
 
-  @doc "True when an engine wire shape (HTTP tuple, Mint struct) is anywhere in `term`."
-  def leaks_wire?({:http, _status}), do: true
-  def leaks_wire?({:http, _status, _msg}), do: true
+  @closed [:not_found, :conflict, :in_use, :busy, :timeout, :unavailable]
 
-  def leaks_wire?(%{__struct__: struct}) when struct in [Mint.TransportError, Mint.HTTPError],
-    do: true
+  def closed_error?(error) when error in @closed, do: true
+  def closed_error?({:pull_failed, _detail}), do: true
+  def closed_error?({:failed, verb, _detail}) when is_atom(verb), do: true
+  def closed_error?(_other), do: false
 
-  def leaks_wire?(%Container{}), do: false
-  def leaks_wire?(t) when is_tuple(t), do: t |> Tuple.to_list() |> Enum.any?(&leaks_wire?/1)
-  def leaks_wire?(l) when is_list(l), do: Enum.any?(l, &leaks_wire?/1)
-  def leaks_wire?(m) when is_map(m), do: m |> Map.to_list() |> leaks_wire?()
-  def leaks_wire?(_other), do: false
+  @doc "Flunks unless every error in `result` of `verb` is in the closed set."
+  def check!(verb, {:error, error} = result) do
+    unless closed_error?(error) or {verb, error} == {:healthcheck, :no_healthcheck},
+      do: flunk("#{verb} returned #{inspect(error)}, outside the closed error set")
+
+    result
+  end
+
+  def check!(:stop_all, {:ok, _stopped, failed} = result) do
+    for {_name, error} <- failed, do: check!(:stop, {:error, error})
+    result
+  end
+
+  def check!(_verb, result), do: result
 
   using opts do
     leg = Keyword.fetch!(opts, :leg)
@@ -175,13 +186,38 @@ defmodule Vagus.Test.EngineContract do
 
       @leg unquote(leg)
 
-      defp arrange(scenario, ctx), do: @leg.arrange(scenario, ctx)
+      # Every call goes through Checked, so every result is held to the
+      # closed error set.
+      defp arrange(scenario, ctx) do
+        {engine, opts} = Keyword.pop!(@leg.arrange(scenario, ctx), :engine)
+        [engine: C.Checked, checked_engine: engine] ++ opts
+      end
 
       defp sorted({:ok, containers}), do: Enum.sort_by(containers, & &1.name)
 
       defp follow(name, opts) do
         {:ok, pid} = Engine.follow_logs(name, self(), opts)
         collect(pid, [])
+      end
+
+      defp follow_chunks(name, opts) do
+        {:ok, pid} = Engine.follow_logs(name, self(), opts)
+        chunks_until_eof(pid, [])
+      end
+
+      # The second chunk must wait for the ack of the first.
+      defp chunks_until_eof(pid, acc) do
+        receive do
+          {:log_chunk, chunk} ->
+            refute_receive {:log_chunk, _}, 300
+            Vagus.Runtime.Logs.Follow.ack(pid)
+            chunks_until_eof(pid, [chunk | acc])
+
+          :log_eof ->
+            Enum.reverse(acc)
+        after
+          2_000 -> flunk("no :log_eof")
+        end
       end
 
       defp collect(pid, acc) do
@@ -262,6 +298,21 @@ defmodule Vagus.Test.EngineContract do
                    Engine.inspect("addon_local_x", opts)
         end
 
+        test "inspect past timeout_ms is :timeout", ctx do
+          opts = [timeout_ms: 200] ++ arrange(:inspect_slow, ctx)
+          assert Engine.inspect("addon_local_x", opts) == {:error, :timeout}
+        end
+
+        test "stop past timeout_ms is :timeout", ctx do
+          opts = [timeout_ms: 200] ++ arrange(:stop_slow, ctx)
+          assert Engine.stop("addon_local_x", opts) == {:error, :timeout}
+        end
+
+        test "an engine that hangs up mid-call is :unavailable", ctx do
+          assert Engine.inspect("addon_local_x", arrange(:hang_up, ctx)) ==
+                   {:error, :unavailable}
+        end
+
         test "stop of a stopped container is :ok", ctx do
           assert Engine.stop("addon_local_y", arrange(:stop_stopped, ctx)) == :ok
         end
@@ -310,6 +361,11 @@ defmodule Vagus.Test.EngineContract do
         test "an absent image is {:failed, :create, :image_not_found}", ctx do
           assert Engine.create(C.spec(), arrange(:create_no_image, ctx)) ==
                    {:error, {:failed, :create, :image_not_found}}
+        end
+
+        test "an absent network is {:failed, :create, :network_not_found}", ctx do
+          assert Engine.create(C.spec(), arrange(:create_no_network, ctx)) ==
+                   {:error, {:failed, :create, :network_not_found}}
         end
       end
     end
@@ -364,8 +420,9 @@ defmodule Vagus.Test.EngineContract do
           assert Engine.logs("ghost", arrange(:absent, ctx)) == {:error, :not_found}
         end
 
-        test "follow delivers the text acked chunk by chunk, then :log_eof", ctx do
-          assert follow("addon_local_x", arrange(:follow, ctx)) == C.logs()
+        test "follow delivers one chunk per ack, then :log_eof", ctx do
+          assert follow_chunks("addon_local_x", arrange(:follow, ctx)) ==
+                   ["line one\n", "line two\n"]
         end
 
         test "follow of an absent container is just :log_eof", ctx do
@@ -427,6 +484,11 @@ defmodule Vagus.Test.EngineContract do
           end
         end
 
+        test "one configured but never run is :no_healthcheck", ctx do
+          assert Engine.healthcheck("addon_local_x", arrange(:health_never_ran, ctx)) ==
+                   {:error, :no_healthcheck}
+        end
+
         test "a container without one is :no_healthcheck", ctx do
           assert Engine.healthcheck("addon_local_y", arrange(:inspect_exited, ctx)) ==
                    {:error, :no_healthcheck}
@@ -452,7 +514,7 @@ defmodule Vagus.Test.EngineContract do
   def __failure_tests__ do
     quote do
       describe "an engine failing every call" do
-        test "answers {:failed, verb, _} and never a wire shape", ctx do
+        test "answers {:failed, verb, _} for every verb", ctx do
           opts = arrange(:engine_error, ctx)
 
           results = [
@@ -484,9 +546,40 @@ defmodule Vagus.Test.EngineContract do
 
           assert {:error, {:pull_failed, _}} = pull
           assert {:ok, [], [{"addon_local_x", {:failed, :stop, _}}]} = stop_all
-          refute C.leaks_wire?([pull, stop_all | results])
+
+          case Engine.follow_logs("addon_local_x", self(), opts) do
+            {:error, error} ->
+              assert {:failed, :follow_logs, _} = error
+
+            {:ok, _pid} ->
+              assert_receive :log_eof, 2_000
+              refute_received {:log_chunk, _}
+          end
         end
       end
+    end
+  end
+end
+
+defmodule Vagus.Test.EngineContract.Checked do
+  @moduledoc false
+
+  @behaviour Vagus.Runtime.Engine
+
+  import Kernel, except: [inspect: 2]
+
+  # Delegates to `opts[:checked_engine]` and checks the result.
+  for {fun, arity} <- Vagus.Runtime.Engine.behaviour_info(:callbacks) do
+    args = Macro.generate_arguments(arity, __MODULE__)
+
+    @impl true
+    def unquote(fun)(unquote_splicing(args)) do
+      engine = Keyword.fetch!(List.last([unquote_splicing(args)]), :checked_engine)
+
+      Vagus.Test.EngineContract.check!(
+        unquote(fun),
+        apply(engine, unquote(fun), [unquote_splicing(args)])
+      )
     end
   end
 end

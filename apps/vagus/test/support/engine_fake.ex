@@ -3,10 +3,14 @@ defmodule Vagus.Runtime.Engine.Fake do
   In-memory `Vagus.Runtime.Engine`, one instance per test: pass
   `engine: Vagus.Runtime.Engine.Fake, fake: pid` in a call's opts.
 
-  Creating from an image the fake does not hold is
-  `{:failed, :create, :image_not_found}`, as `Engine.Docker` reports it.
+  Creating from an image the fake does not hold, or onto a bridge never
+  `ensure_network`ed, is `{:failed, :create, :image_not_found |
+  :network_not_found}`, as `Engine.Docker` reports them.
   `calls/1` logs each callback as `{verb, args}` without its opts.
   `fail_next(fake, :stop, e)` also fails the next stop inside `stop_all/3`.
+  `delay_next(fake, verb, ms)` makes the next call of `verb` take `ms`: one
+  given a smaller `timeout_ms` is `:timeout` and changes nothing; no call
+  actually sleeps.
 
   `put_container/3` makes a running container from any `Container` field
   (`state:` overrides) plus `:logs` (text),
@@ -54,9 +58,14 @@ defmodule Vagus.Runtime.Engine.Fake do
     Agent.update(fake, &put_in(&1, [:containers, name, :container, Access.key!(:state)], state))
   end
 
+  # stop_all has no error return; fail its inner stops with `:stop`.
+  def fail_next(_fake, :stop_all, _error), do: raise(ArgumentError, "fail_next(:stop) instead")
+
   def fail_next(fake, verb, error) do
     Agent.update(fake, fn s -> update_in(s, [:fail, Access.key(verb, [])], &(&1 ++ [error])) end)
   end
+
+  def delay_next(fake, verb, ms), do: fail_next(fake, verb, {:delay, ms})
 
   def calls(fake), do: Agent.get(fake, &Enum.reverse(&1.calls))
 
@@ -94,6 +103,10 @@ defmodule Vagus.Runtime.Engine.Fake do
         not MapSet.member?(s.images, image) ->
           {{:error, {:failed, :create, :image_not_found}}, s}
 
+        match?({:bridge, _}, spec.network) and
+            not MapSet.member?(s.networks, elem(spec.network, 1)) ->
+          {{:error, {:failed, :create, :network_not_found}}, s}
+
         true ->
           container = %Container{
             id: new_id(),
@@ -130,6 +143,7 @@ defmodule Vagus.Runtime.Engine.Fake do
         Enum.reduce(names, {s, [], []}, fn name, {s, stopped, failed} ->
           case pop_failure(s, :stop) do
             {nil, s} -> stop_one(s, name, stopped, failed)
+            {{:delay, ms}, s} -> stop_delayed(s, name, stopped, failed, timed_out?(opts, ms))
             {error, s} -> {s, stopped, [{name, error} | failed]}
           end
         end)
@@ -192,12 +206,15 @@ defmodule Vagus.Runtime.Engine.Fake do
   def follow_logs(name, owner, opts) do
     tail = Keyword.get(opts, :tail, 100)
 
-    chunks =
-      call(opts, :follow_logs, [name, owner], fn s ->
-        {(s.containers[name] && lines(s.containers[name].logs, tail)) || [], s}
-      end)
-
-    {:ok, spawn_link(fn -> stream(owner, Process.monitor(owner), chunks) end)}
+    case call(
+           opts,
+           :follow_logs,
+           [name, owner],
+           &{(&1.containers[name] && lines(&1.containers[name].logs, tail)) || [], &1}
+         ) do
+      {:error, error} -> {:error, error}
+      chunks -> {:ok, spawn_link(fn -> stream(owner, Process.monitor(owner), chunks) end)}
+    end
   end
 
   @impl true
@@ -234,10 +251,13 @@ defmodule Vagus.Runtime.Engine.Fake do
     Agent.get_and_update(fake, fn s ->
       case pop_failure(%{s | calls: [{verb, args} | s.calls]}, verb) do
         {nil, s} -> fun.(s)
+        {{:delay, ms}, s} -> if timed_out?(opts, ms), do: {{:error, :timeout}, s}, else: fun.(s)
         {error, s} -> {{:error, error}, s}
       end
     end)
   end
+
+  defp timed_out?(opts, ms), do: is_integer(opts[:timeout_ms]) and ms > opts[:timeout_ms]
 
   defp pop_failure(s, verb) do
     case s.fail do
@@ -261,6 +281,9 @@ defmodule Vagus.Runtime.Engine.Fake do
   end
 
   defp do_stop(s, name), do: update_container(s, name, &halt/1)
+
+  defp stop_delayed(s, name, stopped, failed, true), do: {s, stopped, [{name, :timeout} | failed]}
+  defp stop_delayed(s, name, stopped, failed, false), do: stop_one(s, name, stopped, failed)
 
   defp stop_one(s, name, stopped, failed) do
     case do_stop(s, name) do

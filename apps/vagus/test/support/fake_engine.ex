@@ -11,7 +11,9 @@ defmodule Vagus.Test.FakeEngine do
   `{status, body, delay: ms}` to hold the connection open before replying,
   for lock-contention tests that need an op to stay "in flight"), `body` a
   map or list (JSON-encoded), a binary (sent raw — used for `/images/create`'s
-  non-JSON streamed status lines), or `nil` (empty body) — consumed strictly
+  non-JSON streamed status lines), `{:parts, [binary]}` (one body written in
+  pieces 100ms apart, for stream consumers), or `nil` (empty body); or the
+  bare atom `:close`, which hangs up without answering — consumed strictly
   in request-arrival order. Since every `Vagus.Core.Lifecycle` op issues a
   deterministic sequence of Engine-API calls (there's no unscripted
   branching the fake daemon needs to react to — each op's *own* logic
@@ -56,10 +58,11 @@ defmodule Vagus.Test.FakeEngine do
       FakeEngine.stop(engine)
   """
 
+  @type body :: map() | list() | binary() | {:parts, [binary()]} | nil
+
   @doc "Starts the fake daemon; returns a handle for `requests/1`/`stop/1`."
   @spec start([
-          {pos_integer(), map() | list() | binary() | nil}
-          | {pos_integer(), map() | list() | binary() | nil, keyword()}
+          {pos_integer(), body()} | {pos_integer(), body(), keyword()} | :close
         ]) ::
           map()
   def start(responses) when is_list(responses) do
@@ -155,6 +158,7 @@ defmodule Vagus.Test.FakeEngine do
   defp pop_response([]),
     do: {{500, %{"message" => "Vagus.Test.FakeEngine: response script exhausted"}}, []}
 
+  defp send_scripted(_sock, :close), do: :ok
   defp send_scripted(sock, {status, body}), do: send_response(sock, status, body)
 
   defp send_scripted(sock, {status, body, opts}) do
@@ -267,17 +271,26 @@ defmodule Vagus.Test.FakeEngine do
 
   defp send_response(sock, status, nil), do: send_raw(sock, status, "text/plain", "")
 
+  defp send_response(sock, status, {:parts, [first | rest] = parts}) do
+    send_raw(sock, status, "text/plain", first, byte_size(IO.iodata_to_binary(parts)))
+
+    for part <- rest do
+      Process.sleep(100)
+      :gen_tcp.send(sock, part)
+    end
+  end
+
   defp send_response(sock, status, body) when is_binary(body),
     do: send_raw(sock, status, "text/plain", body)
 
   defp send_response(sock, status, body) when is_map(body) or is_list(body),
     do: send_raw(sock, status, "application/json", Jason.encode!(body))
 
-  defp send_raw(sock, status, content_type, body) do
+  defp send_raw(sock, status, content_type, body, length \\ nil) do
     head =
       "HTTP/1.1 #{status} #{reason_phrase(status)}\r\n" <>
         "Content-Type: #{content_type}\r\n" <>
-        "Content-Length: #{byte_size(body)}\r\n" <>
+        "Content-Length: #{length || byte_size(body)}\r\n" <>
         "Connection: close\r\n\r\n"
 
     :gen_tcp.send(sock, head <> body)

@@ -242,7 +242,21 @@ defmodule Vagus.Runtime.Engine.DockerContractTest.Leg do
   end
 
   defp script(:logs), do: [{200, framed("line one\n") <> framed("line two\n", 2)}]
-  defp script(:follow), do: script(:logs)
+  defp script(:follow), do: [{200, {:parts, [framed("line one\n"), framed("line two\n", 2)]}}]
+  defp script(:inspect_slow), do: [{200, running_json(), delay: 1_500}]
+  defp script(:stop_slow), do: [{204, nil, delay: 1_500}]
+  defp script(:hang_up), do: [:close]
+  defp script(:create_no_network), do: [{404, %{"message" => "network hassio not found"}}]
+
+  defp script(:health_never_ran) do
+    raw =
+      running_json()
+      |> update_in(["State"], &Map.delete(&1, "Health"))
+      |> put_in(["State", "Status"], "created")
+
+    [{200, raw}]
+  end
+
   defp script(:stats), do: [{200, raw_stats()}]
 
   defp script({:exec, code, output}) do
@@ -254,7 +268,12 @@ defmodule Vagus.Runtime.Engine.DockerContractTest.Leg do
   end
 
   defp script(:exec_no_capture) do
-    [{201, %{"Id" => "exec-1"}}, {200, nil}, {200, %{"Running" => false, "ExitCode" => 3}}]
+    # A body here would surface if the adapter captured anyway.
+    [
+      {201, %{"Id" => "exec-1"}},
+      {200, framed("ignored\n")},
+      {200, %{"Running" => false, "ExitCode" => 3}}
+    ]
   end
 
   defp script(:exec_timeout) do
@@ -322,6 +341,62 @@ defmodule Vagus.Runtime.Engine.DockerContractTest do
   end
 
   describe "what reaches the daemon" do
+    test "list asks the daemon for all=false by default and all=true when asked" do
+      {engine, opts} = engine([{200, []}, {200, []}])
+      {:ok, []} = Engine.list(opts)
+      {:ok, []} = Engine.list([all: true] ++ opts)
+
+      assert [%{query: %{"all" => "false"}}, %{query: %{"all" => "true"}}] =
+               FakeEngine.requests(engine)
+    end
+
+    test "each verb hits its Engine-API method and path" do
+      {engine, opts} =
+        engine([
+          {204, nil},
+          {204, nil},
+          {204, nil},
+          {204, nil},
+          {200, Leg.running_json()},
+          {201, %{"Id" => "c0ffee"}},
+          {200, "{\"status\":\"done\"}\n"},
+          {200, []},
+          {201, %{"Id" => "e1"}},
+          {200, nil},
+          {200, %{"Running" => false, "ExitCode" => 0}}
+        ])
+
+      x = "addon_local_x"
+      :ok = Engine.start(x, opts)
+      :ok = Engine.stop(x, opts)
+      :ok = Engine.restart(x, opts)
+      :ok = Engine.remove(x, opts)
+      {:ok, _} = Engine.inspect(x, opts)
+      {:ok, _} = Engine.create(C.spec(), opts)
+      :ok = Engine.pull("ghcr.io/vagus/x:1", opts)
+      :ok = Engine.remove_image("ghcr.io/vagus/x:1", opts)
+      {:ok, _} = Engine.exec(x, ["true"], opts)
+
+      assert Enum.map(FakeEngine.requests(engine), &{&1.method, &1.path}) == [
+               {:post, "/containers/#{x}/start"},
+               {:post, "/containers/#{x}/stop"},
+               {:post, "/containers/#{x}/restart"},
+               {:delete, "/containers/#{x}"},
+               {:get, "/containers/#{x}/json"},
+               {:post, "/containers/create"},
+               {:post, "/images/create"},
+               {:delete, "/images/ghcr.io/vagus/x:1"},
+               {:post, "/containers/#{x}/exec"},
+               {:post, "/exec/e1/start"},
+               {:get, "/exec/e1/json"}
+             ]
+    end
+
+    test "timeout_ms never cuts a stop's own grace short" do
+      {_engine, opts} = engine([{204, nil, delay: 500}])
+      assert Engine.stop("addon_local_x", [timeout_ms: 100, timeout_s: 0] ++ opts) == :ok
+    end
+
     test "create sends the name and the rendered spec" do
       {engine, opts} = engine([{201, %{"Id" => "c0ffee"}}])
       assert {:ok, "c0ffee"} = Engine.create(C.spec(), opts)
