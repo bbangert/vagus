@@ -33,6 +33,9 @@ config :nerves, source_date_epoch: "1784525674"
 # a board is ever misjudged. See `Vagus.Addon.Store.AssetMode`.
 config :vagus, :store_asset_mode, :auto
 
+# The `Vagus.Runtime.Engine` adapter; a call's `engine:` option overrides it.
+config :vagus, :engine, Vagus.Runtime.Engine.Docker
+
 if Mix.target() == :host do
   import_config "host.exs"
 else

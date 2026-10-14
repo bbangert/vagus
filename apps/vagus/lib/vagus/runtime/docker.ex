@@ -118,6 +118,12 @@ defmodule Vagus.Runtime.Docker do
     end
   end
 
+  @doc "GET `/images/{name}/json` — the image's inspect map; a missing image is `{:http, 404, _}`."
+  @spec inspect_image(String.t(), keyword()) :: {:ok, map()} | {:error, term()}
+  def inspect_image(name, opts \\ []) do
+    with :ok <- ensure_image_ref(name), do: get_json("/images/#{name}/json", opts)
+  end
+
   ## Containers
 
   @doc """
@@ -229,8 +235,9 @@ defmodule Vagus.Runtime.Docker do
   end
 
   @doc """
-  Runs `cmd` (via `/bin/sh -c`) inside container `id` and waits for it to
-  exit — the §A4 `backup_pre`/`backup_post` hook for a **hot** add-on.
+  Runs `cmd` (a string via `/bin/sh -c`, or an argv list as-is) inside
+  container `id` and waits for it to exit — the §A4
+  `backup_pre`/`backup_post` hook for a **hot** add-on.
   `:ok` on exit code 0, `{:error, {:exec, code}}` on nonzero.
 
   **Deviation from the originally-specified approach**: the ticket describes
@@ -252,7 +259,7 @@ defmodule Vagus.Runtime.Docker do
   future add-on that needs the command's stdout/stderr will need a real
   streaming client.
   """
-  @spec exec(String.t(), String.t(), keyword()) :: :ok | {:error, term()}
+  @spec exec(String.t(), String.t() | [String.t()], keyword()) :: :ok | {:error, term()}
   def exec(id, cmd, opts \\ []) do
     with :ok <- ensure_ref(id),
          {:ok, exec_id} <- create_exec(id, cmd, opts),
@@ -288,7 +295,7 @@ defmodule Vagus.Runtime.Docker do
   report, not a client error; only a genuine Engine-API failure (create/
   start/inspect never completing) returns `{:error, reason}`.
   """
-  @spec exec_capture(String.t(), String.t(), keyword()) ::
+  @spec exec_capture(String.t(), String.t() | [String.t()], keyword()) ::
           {:ok, %{exit_code: integer(), output: binary()}} | {:error, term()}
   def exec_capture(id, cmd, opts \\ []) do
     with :ok <- ensure_ref(id),
@@ -430,7 +437,7 @@ defmodule Vagus.Runtime.Docker do
   ## `exec/3` internals — see the deviation note on `exec/3` itself.
 
   defp create_exec(id, cmd, opts) do
-    body = %{"Cmd" => ["/bin/sh", "-c", cmd], "AttachStdout" => true, "AttachStderr" => true}
+    body = %{"Cmd" => exec_cmd(cmd), "AttachStdout" => true, "AttachStderr" => true}
 
     case request(:post, "/containers/#{id}/exec", Keyword.merge(opts, body: body)) do
       {:ok, %{status: 201, body: %{"Id" => exec_id}}} ->
@@ -443,6 +450,9 @@ defmodule Vagus.Runtime.Docker do
         {:error, reason}
     end
   end
+
+  defp exec_cmd(cmd) when is_binary(cmd), do: ["/bin/sh", "-c", cmd]
+  defp exec_cmd(argv) when is_list(argv), do: argv
 
   defp start_exec_detached(exec_id, opts) do
     body = %{"Detach" => true}

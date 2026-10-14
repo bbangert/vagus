@@ -1,0 +1,492 @@
+defmodule Vagus.Test.EngineContract do
+  @moduledoc """
+  The behaviour every `Vagus.Runtime.Engine` adapter must share, run through
+  `Engine` dispatch: `use Vagus.Test.EngineContract, leg: Leg, async: true`.
+
+  `Leg.arrange(scenario, ctx)` makes the scenario true for its engine and
+  returns the opts aiming calls at it. A scripted leg must answer the
+  scenario's calls in the order the test makes them.
+  """
+
+  use ExUnit.CaseTemplate
+
+  alias Vagus.Runtime.Engine
+  alias Vagus.Runtime.Engine.{Container, ContainerSpec, NetworkSpec}
+  alias Vagus.Test.EngineContract, as: C
+
+  @callback arrange(scenario :: atom() | tuple(), ctx :: map()) :: keyword()
+
+  @running_id "4f1c2b3a4f1c2b3a4f1c2b3a4f1c2b3a4f1c2b3a4f1c2b3a4f1c2b3a4f1c2b3a"
+  @exited_id "9d2e7f6a9d2e7f6a9d2e7f6a9d2e7f6a9d2e7f6a9d2e7f6a9d2e7f6a9d2e7f6a"
+  @core_id "77aa88bb77aa88bb77aa88bb77aa88bb77aa88bb77aa88bb77aa88bb77aa88bb"
+
+  def running do
+    %Container{
+      id: @running_id,
+      name: "addon_local_x",
+      image: "ghcr.io/vagus/aarch64-addon-x:1.2.0",
+      state: :running,
+      exit_code: nil,
+      health: :healthy,
+      labels: %{"supervisor_managed" => "", "io.hass.version" => "1.2.0"},
+      env: %{"TZ" => "UTC", "SUPERVISOR_TOKEN" => "tok", "OPTS" => "a=b"},
+      ips: %{"hassio" => "172.30.33.4"},
+      healthcheck: %{
+        test: ["CMD-SHELL", "curl -f http://localhost/ || exit 1"],
+        interval_ms: 30_000,
+        timeout_ms: 5_000,
+        start_period_ms: nil,
+        retries: 3
+      },
+      started_at: ~U[2026-10-14 10:00:00.123456Z],
+      finished_at: nil
+    }
+  end
+
+  def exited do
+    %Container{
+      id: @exited_id,
+      name: "addon_local_y",
+      image: "ghcr.io/vagus/aarch64-addon-y:2.0.0",
+      state: :exited,
+      exit_code: 137,
+      health: nil,
+      labels: %{"supervisor_managed" => ""},
+      env: %{"TZ" => "UTC"},
+      ips: %{},
+      healthcheck: nil,
+      started_at: ~U[2026-10-14 09:00:00Z],
+      finished_at: ~U[2026-10-14 09:30:00Z]
+    }
+  end
+
+  def core do
+    %Container{
+      id: @core_id,
+      name: "homeassistant",
+      image: "ghcr.io/home-assistant/home-assistant:2026.7.0",
+      state: :running,
+      labels: %{"io.vagus.spec-fingerprint" => "0123456789abcdef0123456789abcdef"},
+      env: %{},
+      ips: %{}
+    }
+  end
+
+  def summary(%Container{} = c) do
+    %Container{
+      id: c.id,
+      name: c.name,
+      image: c.image,
+      state: c.state,
+      labels: c.labels,
+      exit_code: c.exit_code
+    }
+  end
+
+  def spec do
+    %ContainerSpec{
+      name: "addon_local_x",
+      image: "ghcr.io/vagus/aarch64-addon-x:1.2.0",
+      network: {:bridge, "hassio"},
+      env: [{"TZ", "UTC"}],
+      labels: %{"supervisor_managed" => ""}
+    }
+  end
+
+  def hassio do
+    %NetworkSpec{
+      name: "hassio",
+      subnet: "172.30.32.0/23",
+      gateway: "172.30.32.1",
+      ip_range: "172.30.33.0/24",
+      interface_name: "hassio"
+    }
+  end
+
+  def logs, do: "line one\nline two\n"
+
+  def stats do
+    %{
+      cpu_percent: 25.0,
+      memory_usage: 50_000_000,
+      memory_limit: 1_000_000_000,
+      memory_percent: 5.0,
+      network_rx: 1024,
+      network_tx: 2048,
+      blk_read: 4096,
+      blk_write: 8192
+    }
+  end
+
+  # What the failing-engine test calls, so the Fake leg can fail each one.
+  def failing_verbs do
+    [
+      :ready,
+      :image_present?,
+      :remove_image,
+      :create,
+      :start,
+      :stop,
+      :restart,
+      :remove,
+      :inspect,
+      :list,
+      :logs,
+      :stats,
+      :exec,
+      :healthcheck,
+      :ensure_network
+    ]
+  end
+
+  @doc "True when an engine wire shape (HTTP tuple, Mint struct) is anywhere in `term`."
+  def leaks_wire?({:http, _status}), do: true
+  def leaks_wire?({:http, _status, _msg}), do: true
+
+  def leaks_wire?(%{__struct__: struct}) when struct in [Mint.TransportError, Mint.HTTPError],
+    do: true
+
+  def leaks_wire?(%Container{}), do: false
+  def leaks_wire?(t) when is_tuple(t), do: t |> Tuple.to_list() |> Enum.any?(&leaks_wire?/1)
+  def leaks_wire?(l) when is_list(l), do: Enum.any?(l, &leaks_wire?/1)
+  def leaks_wire?(m) when is_map(m), do: m |> Map.to_list() |> leaks_wire?()
+  def leaks_wire?(_other), do: false
+
+  using opts do
+    leg = Keyword.fetch!(opts, :leg)
+
+    # Split only to keep each quote readable; they land in one module.
+    {:__block__, [],
+     [
+       __helpers__(leg),
+       __container_tests__(),
+       __io_tests__(),
+       __exec_tests__(),
+       __failure_tests__()
+     ]}
+  end
+
+  @doc false
+  def __helpers__(leg) do
+    quote do
+      alias Vagus.Runtime.Engine
+      alias Vagus.Runtime.Engine.Container
+      alias Vagus.Test.EngineContract, as: C
+
+      @leg unquote(leg)
+
+      defp arrange(scenario, ctx), do: @leg.arrange(scenario, ctx)
+
+      defp sorted({:ok, containers}), do: Enum.sort_by(containers, & &1.name)
+
+      defp follow(name, opts) do
+        {:ok, pid} = Engine.follow_logs(name, self(), opts)
+        collect(pid, [])
+      end
+
+      defp collect(pid, acc) do
+        receive do
+          {:log_chunk, chunk} ->
+            Vagus.Runtime.Logs.Follow.ack(pid)
+            collect(pid, [chunk | acc])
+
+          :log_eof ->
+            acc |> Enum.reverse() |> IO.iodata_to_binary()
+        after
+          2_000 -> flunk("no :log_eof")
+        end
+      end
+    end
+  end
+
+  @doc false
+  def __container_tests__ do
+    quote do
+      describe "readiness" do
+        test "a live engine is ready", ctx do
+          assert Engine.ready(arrange(:ready, ctx)) == :ok
+        end
+
+        test "an engine nobody answers for is :unavailable", ctx do
+          assert Engine.ready(arrange(:unavailable, ctx)) == {:error, :unavailable}
+        end
+      end
+
+      describe "inspect" do
+        test "a running container: name without /, env, ips, healthcheck, health", ctx do
+          assert Engine.inspect("addon_local_x", arrange(:inspect_running, ctx)) ==
+                   {:ok, C.running()}
+        end
+
+        test "an exited container: exit code, no healthcheck, empty ips skipped", ctx do
+          assert Engine.inspect("addon_local_y", arrange(:inspect_exited, ctx)) ==
+                   {:ok, C.exited()}
+        end
+
+        test "an absent container is :not_found", ctx do
+          assert Engine.inspect("ghost", arrange(:absent, ctx)) == {:error, :not_found}
+        end
+      end
+
+      describe "list" do
+        test "running only by default; all + name_prefix includes exited", ctx do
+          opts = arrange(:list, ctx)
+
+          assert sorted(Engine.list(opts)) == Enum.map([C.running(), C.core()], &C.summary/1)
+
+          assert sorted(Engine.list([all: true, name_prefix: "addon_"] ++ opts)) ==
+                   Enum.map([C.running(), C.exited()], &C.summary/1)
+        end
+      end
+
+      describe "lifecycle" do
+        test "start of a created container runs it", ctx do
+          opts = arrange(:start_created, ctx)
+          assert Engine.start("addon_local_x", opts) == :ok
+          assert {:ok, %Container{state: :running}} = Engine.inspect("addon_local_x", opts)
+        end
+
+        test "start of a running container is :ok", ctx do
+          assert Engine.start("addon_local_x", arrange(:start_running, ctx)) == :ok
+        end
+
+        test "start of an absent container is :not_found", ctx do
+          assert Engine.start("ghost", arrange(:absent, ctx)) == {:error, :not_found}
+        end
+
+        test "stop of a running container exits it", ctx do
+          opts = arrange(:stop_running, ctx)
+          assert Engine.stop("addon_local_x", [timeout_s: 5] ++ opts) == :ok
+
+          assert {:ok, %Container{state: :exited, exit_code: 0}} =
+                   Engine.inspect("addon_local_x", opts)
+        end
+
+        test "stop of a stopped container is :ok", ctx do
+          assert Engine.stop("addon_local_y", arrange(:stop_stopped, ctx)) == :ok
+        end
+
+        test "stop of an absent container is :not_found", ctx do
+          assert Engine.stop("ghost", arrange(:absent, ctx)) == {:error, :not_found}
+        end
+
+        test "restart of a running container is :ok", ctx do
+          assert Engine.restart("addon_local_x", arrange(:restart, ctx)) == :ok
+        end
+
+        test "restart of an absent container is :not_found", ctx do
+          assert Engine.restart("ghost", arrange(:absent, ctx)) == {:error, :not_found}
+        end
+
+        test "remove deletes the container", ctx do
+          opts = arrange(:remove, ctx)
+          assert Engine.remove("addon_local_y", opts) == :ok
+          assert Engine.inspect("addon_local_y", opts) == {:error, :not_found}
+        end
+
+        test "remove of an absent container is :ok", ctx do
+          assert Engine.remove("ghost", arrange(:absent, ctx)) == :ok
+        end
+
+        test "stop_all: stopped and absent count as stopped, a failure is reported", ctx do
+          opts = arrange(:stop_all, ctx)
+          names = ["addon_local_d", "addon_local_x", "addon_local_y", "ghost"]
+
+          assert {:ok, ["addon_local_x", "addon_local_y", "ghost"],
+                  [{"addon_local_d", {:failed, :stop, _}}]} = Engine.stop_all(names, 5, opts)
+        end
+      end
+
+      describe "create" do
+        test "creates from a present image", ctx do
+          assert {:ok, id} = Engine.create(C.spec(), arrange(:create, ctx))
+          assert is_binary(id) and id != ""
+        end
+
+        test "an existing name is :conflict", ctx do
+          assert Engine.create(C.spec(), arrange(:create_conflict, ctx)) == {:error, :conflict}
+        end
+
+        test "an absent image is {:failed, :create, :image_not_found}", ctx do
+          assert Engine.create(C.spec(), arrange(:create_no_image, ctx)) ==
+                   {:error, {:failed, :create, :image_not_found}}
+        end
+      end
+    end
+  end
+
+  @doc false
+  def __io_tests__ do
+    quote do
+      describe "images" do
+        test "pull makes the image present", ctx do
+          opts = arrange(:pull, ctx)
+          assert Engine.pull("ghcr.io/vagus/aarch64-addon-x:1.2.0", opts) == :ok
+          assert Engine.image_present?("ghcr.io/vagus/aarch64-addon-x:1.2.0", opts) == true
+        end
+
+        test "a failed pull carries the registry's message", ctx do
+          assert Engine.pull("ghcr.io/vagus/missing:1.0", arrange(:pull_failed, ctx)) ==
+                   {:error, {:pull_failed, "manifest unknown"}}
+        end
+
+        test "image_present? of an absent image is false", ctx do
+          assert Engine.image_present?("ghcr.io/vagus/missing:1.0", arrange(:image_absent, ctx)) ==
+                   false
+        end
+
+        test "remove_image of an unused image removes it", ctx do
+          opts = arrange(:remove_image, ctx)
+          assert Engine.remove_image("ghcr.io/vagus/aarch64-addon-x:1.2.0", opts) == :ok
+          assert Engine.image_present?("ghcr.io/vagus/aarch64-addon-x:1.2.0", opts) == false
+        end
+
+        test "remove_image of an absent image is :ok", ctx do
+          assert Engine.remove_image("ghcr.io/vagus/missing:1.0", arrange(:image_absent, ctx)) ==
+                   :ok
+        end
+
+        test "remove_image of an image a container uses is :in_use", ctx do
+          assert Engine.remove_image(
+                   "ghcr.io/vagus/aarch64-addon-x:1.2.0",
+                   arrange(:image_in_use, ctx)
+                 ) ==
+                   {:error, :in_use}
+        end
+      end
+
+      describe "logs" do
+        test "are plain text", ctx do
+          assert Engine.logs("addon_local_x", arrange(:logs, ctx)) == {:ok, C.logs()}
+        end
+
+        test "of an absent container are :not_found", ctx do
+          assert Engine.logs("ghost", arrange(:absent, ctx)) == {:error, :not_found}
+        end
+
+        test "follow delivers the text acked chunk by chunk, then :log_eof", ctx do
+          assert follow("addon_local_x", arrange(:follow, ctx)) == C.logs()
+        end
+
+        test "follow of an absent container is just :log_eof", ctx do
+          assert follow("ghost", arrange(:absent, ctx)) == ""
+        end
+      end
+
+      describe "stats" do
+        test "are the computed eight-key map", ctx do
+          assert Engine.stats("addon_local_x", arrange(:stats, ctx)) == {:ok, C.stats()}
+        end
+
+        test "of an absent container are :not_found", ctx do
+          assert Engine.stats("ghost", arrange(:absent, ctx)) == {:error, :not_found}
+        end
+      end
+    end
+  end
+
+  @doc false
+  def __exec_tests__ do
+    quote do
+      describe "exec" do
+        test "exit 0 with its output", ctx do
+          assert Engine.exec("addon_local_x", ["ha", "check"], arrange({:exec, 0, "ok\n"}, ctx)) ==
+                   {:ok, %{exit_code: 0, output: "ok\n"}}
+        end
+
+        test "a non-zero exit is still {:ok, _} with its output", ctx do
+          opts = arrange({:exec, 3, "bad config\n"}, ctx)
+
+          assert Engine.exec("addon_local_x", ["ha", "check"], opts) ==
+                   {:ok, %{exit_code: 3, output: "bad config\n"}}
+        end
+
+        test "capture: false reports the exit code with empty output", ctx do
+          opts = [capture: false] ++ arrange(:exec_no_capture, ctx)
+
+          assert Engine.exec("addon_local_x", ["ha", "check"], opts) ==
+                   {:ok, %{exit_code: 3, output: ""}}
+        end
+
+        test "in an absent container is :not_found", ctx do
+          assert Engine.exec("ghost", ["true"], arrange(:absent, ctx)) == {:error, :not_found}
+        end
+
+        test "past timeout_ms is :timeout", ctx do
+          opts = [timeout_ms: 200] ++ arrange(:exec_timeout, ctx)
+          assert Engine.exec("addon_local_x", ["sleep", "9"], opts) == {:error, :timeout}
+        end
+      end
+
+      describe "healthcheck" do
+        for health <- [:healthy, :unhealthy, :starting] do
+          @tag health: health
+          test "reports #{health}", ctx do
+            opts = arrange({:health, ctx.health}, ctx)
+            assert Engine.healthcheck("addon_local_x", opts) == {:ok, ctx.health}
+          end
+        end
+
+        test "a container without one is :no_healthcheck", ctx do
+          assert Engine.healthcheck("addon_local_y", arrange(:inspect_exited, ctx)) ==
+                   {:error, :no_healthcheck}
+        end
+
+        test "an absent container is :not_found", ctx do
+          assert Engine.healthcheck("ghost", arrange(:absent, ctx)) == {:error, :not_found}
+        end
+      end
+
+      describe "ensure_network" do
+        for scenario <- [:network_exists, :network_created, :network_race] do
+          @tag scenario: scenario
+          test "is :ok when #{scenario}", ctx do
+            assert Engine.ensure_network(C.hassio(), arrange(ctx.scenario, ctx)) == :ok
+          end
+        end
+      end
+    end
+  end
+
+  @doc false
+  def __failure_tests__ do
+    quote do
+      describe "an engine failing every call" do
+        test "answers {:failed, verb, _} and never a wire shape", ctx do
+          opts = arrange(:engine_error, ctx)
+
+          results = [
+            ready: Engine.ready(opts),
+            image_present?: Engine.image_present?("ghcr.io/vagus/x:1", opts),
+            remove_image: Engine.remove_image("ghcr.io/vagus/x:1", opts),
+            create: Engine.create(C.spec(), opts),
+            start: Engine.start("addon_local_x", opts),
+            stop: Engine.stop("addon_local_x", opts),
+            restart: Engine.restart("addon_local_x", opts),
+            remove: Engine.remove("addon_local_x", opts),
+            inspect: Engine.inspect("addon_local_x", opts),
+            list: Engine.list(opts),
+            logs: Engine.logs("addon_local_x", opts),
+            stats: Engine.stats("addon_local_x", opts),
+            exec: Engine.exec("addon_local_x", ["true"], opts),
+            healthcheck: Engine.healthcheck("addon_local_x", opts),
+            ensure_network: Engine.ensure_network(C.hassio(), opts)
+          ]
+
+          assert Keyword.keys(results) == C.failing_verbs()
+
+          for {verb, result} <- results do
+            assert {:error, {:failed, ^verb, _detail}} = result
+          end
+
+          pull = Engine.pull("ghcr.io/vagus/x:1", opts)
+          stop_all = Engine.stop_all(["addon_local_x"], 1, opts)
+
+          assert {:error, {:pull_failed, _}} = pull
+          assert {:ok, [], [{"addon_local_x", {:failed, :stop, _}}]} = stop_all
+          refute C.leaks_wire?([pull, stop_all | results])
+        end
+      end
+    end
+  end
+end

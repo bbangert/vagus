@@ -1,0 +1,130 @@
+defmodule Vagus.Runtime.Engine.FakeContractTest.Leg do
+  @behaviour Vagus.Test.EngineContract
+
+  alias Vagus.Runtime.Engine.Fake
+  alias Vagus.Test.EngineContract, as: C
+
+  @image "ghcr.io/vagus/aarch64-addon-x:1.2.0"
+
+  @impl true
+  def arrange(scenario, _ctx) do
+    fake = Fake.start()
+    setup(scenario, fake)
+    [engine: Fake, fake: fake]
+  end
+
+  defp setup(:ready, _fake), do: :ok
+  defp setup(:unavailable, fake), do: Fake.fail_next(fake, :ready, :unavailable)
+  defp setup(:absent, _fake), do: :ok
+  defp setup(:inspect_running, fake), do: put(fake, C.running())
+  defp setup(:inspect_exited, fake), do: put(fake, C.exited())
+
+  defp setup(:list, fake) do
+    Enum.each([C.running(), C.exited(), C.core()], &put(fake, &1))
+  end
+
+  defp setup(:start_created, fake), do: put(fake, %{C.running() | state: :created})
+  defp setup(:start_running, fake), do: put(fake, C.running())
+  defp setup(:stop_running, fake), do: put(fake, C.running())
+  defp setup(:stop_stopped, fake), do: put(fake, C.exited())
+  defp setup(:restart, fake), do: put(fake, C.running())
+  defp setup(:remove, fake), do: put(fake, C.exited())
+
+  defp setup(:stop_all, fake) do
+    put(fake, %{C.running() | name: "addon_local_d"})
+    put(fake, C.running())
+    put(fake, C.exited())
+    # stop_all stops in list order, so this lands on addon_local_d.
+    Fake.fail_next(fake, :stop, {:failed, :stop, "boom"})
+  end
+
+  defp setup(:create, fake), do: Fake.put_image(fake, @image)
+
+  defp setup(:create_conflict, fake) do
+    Fake.put_image(fake, @image)
+    put(fake, C.running())
+  end
+
+  defp setup(:create_no_image, _fake), do: :ok
+  defp setup(:pull, _fake), do: :ok
+
+  defp setup(:pull_failed, fake),
+    do: Fake.fail_next(fake, :pull, {:pull_failed, "manifest unknown"})
+
+  defp setup(:image_absent, _fake), do: :ok
+  defp setup(:remove_image, fake), do: Fake.put_image(fake, @image)
+
+  defp setup(:image_in_use, fake) do
+    Fake.put_image(fake, @image)
+    put(fake, C.running())
+  end
+
+  defp setup(:logs, fake), do: put(fake, C.running(), logs: C.logs())
+  defp setup(:follow, fake), do: put(fake, C.running(), logs: C.logs())
+  defp setup(:stats, fake), do: put(fake, C.running(), stats: C.stats())
+  defp setup({:exec, code, output}, fake), do: put(fake, C.running(), exec: {code, output})
+  defp setup(:exec_no_capture, fake), do: put(fake, C.running(), exec: {3, "ignored\n"})
+
+  defp setup(:exec_timeout, fake) do
+    put(fake, C.running())
+    Fake.fail_next(fake, :exec, :timeout)
+  end
+
+  defp setup({:health, health}, fake), do: put(fake, %{C.running() | health: health})
+
+  defp setup(:network_exists, fake),
+    do: Vagus.Runtime.Engine.ensure_network(C.hassio(), engine: Fake, fake: fake)
+
+  defp setup(:network_created, _fake), do: :ok
+  defp setup(:network_race, _fake), do: :ok
+
+  defp setup(:engine_error, fake) do
+    for verb <- [:stop | C.failing_verbs()],
+        do: Fake.fail_next(fake, verb, {:failed, verb, "boom"})
+
+    Fake.fail_next(fake, :pull, {:pull_failed, "boom"})
+  end
+
+  defp put(fake, container, extras \\ []) do
+    Fake.put_container(
+      fake,
+      container.name,
+      Map.merge(Map.from_struct(container), Map.new(extras))
+    )
+  end
+end
+
+defmodule Vagus.Runtime.Engine.FakeContractTest do
+  use Vagus.Test.EngineContract, leg: Vagus.Runtime.Engine.FakeContractTest.Leg, async: true
+
+  alias Vagus.Runtime.Engine.Fake
+
+  describe "fake-only helpers" do
+    test "calls/1 logs verbs in order and spec/2 keeps the create spec" do
+      fake = Fake.start()
+      opts = [engine: Fake, fake: fake]
+      spec = Vagus.Test.EngineContract.spec()
+
+      :ok = Engine.pull(spec.image, opts)
+      {:ok, _id} = Engine.create(spec, opts)
+      :ok = Engine.start(spec.name, opts)
+
+      assert Fake.calls(fake) == [{:pull, [spec.image]}, {:create, [spec]}, {:start, [spec.name]}]
+      assert Fake.spec(fake, spec.name) == spec
+    end
+
+    test "list summaries and tail-limited logs" do
+      fake = Fake.start()
+      opts = [engine: Fake, fake: fake]
+      Fake.put_container(fake, "addon_a", logs: "1\n2\n3\n")
+      Fake.set_state(fake, "addon_a", :exited)
+
+      assert Engine.list(opts) == {:ok, []}
+
+      assert {:ok, [%Container{name: "addon_a", env: nil, ips: nil}]} =
+               Engine.list([all: true] ++ opts)
+
+      assert Engine.logs("addon_a", [tail: 2] ++ opts) == {:ok, "2\n3\n"}
+    end
+  end
+end
