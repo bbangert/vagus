@@ -17,8 +17,11 @@ defmodule Vagus.Runtime.Engine.DockerContractTest.Leg do
   def arrange(scenario, _ctx) do
     engine = FakeEngine.start(script(scenario))
     ExUnit.Callbacks.on_exit(fn -> FakeEngine.stop(engine) end)
-    [engine: Engine.Docker, socket: engine.socket]
+    [engine: Engine.Docker, socket: engine.socket, fake_engine: engine]
   end
+
+  @impl true
+  def release(opts), do: FakeEngine.release(Keyword.fetch!(opts, :fake_engine))
 
   def framed(payload, stream \\ 1), do: <<stream, 0, 0, 0, byte_size(payload)::32>> <> payload
 
@@ -244,7 +247,20 @@ defmodule Vagus.Runtime.Engine.DockerContractTest.Leg do
   end
 
   defp script(:logs), do: [{200, framed("line one\n") <> framed("line two\n", 2)}]
-  defp script(:follow), do: [{200, {:parts, [framed("line one\n"), framed("line two\n", 2)]}}]
+
+  defp script(:follow),
+    do: [{200, {:parts, [framed("line one\n"), :await, framed("line two\n", 2)]}}]
+
+  # The daemon stamps lines itself; Vagus only asks for it.
+  defp script({:stamped, true}) do
+    [
+      {200,
+       framed("2026-10-14T21:00:00.000000001Z line one\n") <>
+         framed("2026-10-14T21:00:00.000000002Z line two\n", 2)}
+    ]
+  end
+
+  defp script({:stamped, false}), do: script(:logs)
   defp script(:inspect_slow), do: [{200, running_json(), delay: 1_500}]
   defp script(:stop_slow), do: [{204, nil, delay: 1_500}]
   defp script(:hang_up), do: [:close]
@@ -343,6 +359,23 @@ defmodule Vagus.Runtime.Engine.DockerContractTest do
   end
 
   describe "what reaches the daemon" do
+    test "logs and follow_logs ask the daemon for timestamps exactly as given" do
+      for timestamps <- [true, false] do
+        {engine, opts} = engine([{200, ""}, {200, ""}])
+        {:ok, ""} = Engine.logs("addon_local_x", [timestamps: timestamps] ++ opts)
+
+        {:ok, _pid} =
+          Engine.follow_logs("addon_local_x", self(), [timestamps: timestamps] ++ opts)
+
+        assert_receive :log_eof, 2_000
+
+        assert [%{query: %{"timestamps" => q}}, %{query: %{"timestamps" => q}}] =
+                 FakeEngine.requests(engine)
+
+        assert q == to_string(timestamps)
+      end
+    end
+
     test "list asks the daemon for all=false by default and all=true when asked" do
       {engine, opts} = engine([{200, []}, {200, []}])
       {:ok, []} = Engine.list(opts)

@@ -17,6 +17,8 @@ defmodule Vagus.Test.EngineContract do
   alias Vagus.Test.EngineContract, as: C
 
   @callback arrange(scenario :: atom() | tuple(), ctx :: map()) :: keyword()
+  @doc "Lets a scripted follow stream send its next piece; a no-op for a leg that needs none."
+  @callback release(opts :: keyword()) :: :ok
 
   @running_id "4f1c2b3a4f1c2b3a4f1c2b3a4f1c2b3a4f1c2b3a4f1c2b3a4f1c2b3a4f1c2b3a"
   @exited_id "9d2e7f6a9d2e7f6a9d2e7f6a9d2e7f6a9d2e7f6a9d2e7f6a9d2e7f6a9d2e7f6a"
@@ -202,22 +204,34 @@ defmodule Vagus.Test.EngineContract do
 
       defp follow_chunks(name, opts) do
         {:ok, pid} = Engine.follow_logs(name, self(), opts)
-        chunks_until_eof(pid, [])
+        chunks_until_eof(pid, opts, [])
       end
 
-      # The second chunk must wait for the ack of the first.
-      defp chunks_until_eof(pid, acc) do
+      # The next piece is released while the chunk is un-acked: it must not
+      # arrive until the ack.
+      defp chunks_until_eof(pid, opts, acc) do
         receive do
           {:log_chunk, chunk} ->
+            @leg.release(opts)
             refute_receive {:log_chunk, _}, 300
             Vagus.Runtime.Logs.Follow.ack(pid)
-            chunks_until_eof(pid, [chunk | acc])
+            chunks_until_eof(pid, opts, [chunk | acc])
 
           :log_eof ->
             Enum.reverse(acc)
         after
           2_000 -> flunk("no :log_eof")
         end
+      end
+
+      defp assert_stamps(text, false), do: assert(text == C.logs())
+
+      defp assert_stamps(text, true) do
+        lines = String.split(text, "\n", trim: true)
+        assert Enum.all?(lines, &(&1 =~ ~r/^\d{4}-\d\d-\d\dT\S+Z /))
+
+        assert Enum.map(lines, &(&1 |> String.split(" ", parts: 2) |> List.last())) ==
+                 ["line one", "line two"]
       end
 
       defp collect(pid, acc) do
@@ -441,6 +455,18 @@ defmodule Vagus.Test.EngineContract do
         test "follow delivers one chunk per ack, then :log_eof", ctx do
           assert follow_chunks("addon_local_x", arrange(:follow, ctx)) ==
                    ["line one\n", "line two\n"]
+        end
+
+        for timestamps <- [true, false] do
+          @tag timestamps: timestamps
+          test "timestamps: #{timestamps} on logs and follow_logs", ctx do
+            opts = [timestamps: ctx.timestamps] ++ arrange({:stamped, ctx.timestamps}, ctx)
+            {:ok, text} = Engine.logs("addon_local_x", opts)
+            assert_stamps(text, ctx.timestamps)
+
+            opts = [timestamps: ctx.timestamps] ++ arrange({:stamped, ctx.timestamps}, ctx)
+            assert_stamps(follow("addon_local_x", opts), ctx.timestamps)
+          end
         end
 
         test "follow of an absent container is just :log_eof", ctx do

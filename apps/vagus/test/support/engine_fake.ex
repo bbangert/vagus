@@ -206,25 +206,21 @@ defmodule Vagus.Runtime.Engine.Fake do
 
   @impl true
   def logs(name, opts) do
-    tail = Keyword.get(opts, :tail, 100)
-
     call(
       opts,
       :logs,
       [name],
-      &read(&1, name, fn e -> {:ok, e.logs |> lines(tail) |> Enum.join()} end)
+      &read(&1, name, fn e -> {:ok, e.logs |> lines(opts) |> Enum.join()} end)
     )
   end
 
   @impl true
   def follow_logs(name, owner, opts) do
-    tail = Keyword.get(opts, :tail, 100)
-
     case call(
            opts,
            :follow_logs,
            [name, owner],
-           &{(&1.containers[name] && lines(&1.containers[name].logs, tail)) || [], &1}
+           &{(&1.containers[name] && lines(&1.containers[name].logs, opts)) || [], &1}
          ) do
       {:error, error} -> {:error, error}
       chunks -> {:ok, spawn_link(fn -> stream(owner, Process.monitor(owner), chunks) end)}
@@ -369,10 +365,24 @@ defmodule Vagus.Runtime.Engine.Fake do
     {:ok, %{exit_code: code, output: if(capture, do: output, else: "")}}
   end
 
-  defp lines(text, tail) do
-    lines = String.split(text, ~r/(?<=\n)/, trim: true)
+  # Line N is stamped N ns past a fixed instant, in Docker's RFC3339Nano form,
+  # so a stamp is deterministic and survives `:tail`.
+  defp lines(text, opts) do
+    tail = Keyword.get(opts, :tail, 100)
+
+    lines =
+      text
+      |> String.split(~r/(?<=\n)/, trim: true)
+      |> Enum.with_index(1)
+      |> Enum.map(fn {line, n} -> stamp(line, n, Keyword.get(opts, :timestamps, false)) end)
+
     if is_integer(tail), do: Enum.take(lines, -tail), else: lines
   end
+
+  defp stamp(line, _n, false), do: line
+
+  defp stamp(line, n, true),
+    do: "2026-10-14T21:00:00.#{String.pad_leading(Integer.to_string(n), 9, "0")}Z " <> line
 
   defp stream(owner, ref, []) do
     send(owner, :log_eof)

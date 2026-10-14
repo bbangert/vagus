@@ -7,6 +7,9 @@ defmodule Vagus.Runtime.Engine.FakeContractTest.Leg do
   @image "ghcr.io/vagus/aarch64-addon-x:1.2.0"
 
   @impl true
+  def release(_opts), do: :ok
+
+  @impl true
   def arrange(scenario, _ctx) do
     fake = Fake.start()
     setup(scenario, fake)
@@ -94,6 +97,7 @@ defmodule Vagus.Runtime.Engine.FakeContractTest.Leg do
 
   defp setup(:logs, fake), do: put(fake, C.running(), logs: C.logs())
   defp setup(:follow, fake), do: put(fake, C.running(), logs: C.logs())
+  defp setup({:stamped, _timestamps}, fake), do: put(fake, C.running(), logs: C.logs())
   defp setup(:stats, fake), do: put(fake, C.running(), stats: C.stats())
   defp setup({:exec, code, output}, fake), do: put(fake, C.running(), exec: {code, output})
   defp setup(:exec_no_capture, fake), do: put(fake, C.running(), exec: {3, "ignored\n"})

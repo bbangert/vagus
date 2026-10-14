@@ -11,8 +11,10 @@ defmodule Vagus.Test.FakeEngine do
   `{status, body, delay: ms}` to hold the connection open before replying,
   for lock-contention tests that need an op to stay "in flight"), `body` a
   map or list (JSON-encoded), a binary (sent raw — used for `/images/create`'s
-  non-JSON streamed status lines), `{:parts, [binary]}` (one body written in
-  pieces 100ms apart, for stream consumers), or `nil` (empty body); or the
+  non-JSON streamed status lines), `{:parts, [binary | :await]}` (one body
+  written piece by piece, each `:await` holding the rest until `release/1`,
+  so a stream consumer sees a deterministic boundary), or `nil` (empty
+  body); or the
   bare atom `:close`, which hangs up without answering — consumed strictly
   in request-arrival order. Since every `Vagus.Core.Lifecycle` op issues a
   deterministic sequence of Engine-API calls (there's no unscripted
@@ -58,7 +60,7 @@ defmodule Vagus.Test.FakeEngine do
       FakeEngine.stop(engine)
   """
 
-  @type body :: map() | list() | binary() | {:parts, [binary()]} | nil
+  @type body :: map() | list() | binary() | {:parts, [binary() | :await]} | nil
 
   @doc "Starts the fake daemon; returns a handle for `requests/1`/`stop/1`."
   @spec start([
@@ -80,7 +82,10 @@ defmodule Vagus.Test.FakeEngine do
         backlog: 128
       ])
 
-    pid = spawn_link(fn -> loop(listen, %{responses: responses, log: []}) end)
+    pid =
+      spawn_link(fn ->
+        loop(listen, %{responses: responses, log: [], parked: [], releases: 0})
+      end)
 
     %{socket: path, listen: listen, pid: pid}
   end
@@ -95,6 +100,13 @@ defmodule Vagus.Test.FakeEngine do
     after
       2_000 -> raise "Vagus.Test.FakeEngine: requests/1 timed out waiting for the daemon process"
     end
+  end
+
+  @doc "Lets the next (or the next to arrive) `:await` in a `{:parts, _}` body continue."
+  @spec release(map()) :: :ok
+  def release(%{pid: pid}) do
+    send(pid, :release)
+    :ok
   end
 
   @doc "Stops the fake daemon and removes its socket file."
@@ -116,10 +128,24 @@ defmodule Vagus.Test.FakeEngine do
       {:get_requests, from} ->
         send(from, {:requests, Enum.reverse(state.log)})
         loop(listen, state)
+
+      {:parked, writer} ->
+        loop(listen, unpark(%{state | parked: state.parked ++ [writer]}))
+
+      :release ->
+        loop(listen, unpark(%{state | releases: state.releases + 1}))
     after
       0 -> accept_once(listen, state)
     end
   end
+
+  # A release may arrive before or after the writer parks.
+  defp unpark(%{parked: [writer | parked], releases: n} = state) when n > 0 do
+    send(writer, :release)
+    %{state | parked: parked, releases: n - 1}
+  end
+
+  defp unpark(state), do: state
 
   defp accept_once(listen, state) do
     case :gen_tcp.accept(listen, 100) do
@@ -140,8 +166,10 @@ defmodule Vagus.Test.FakeEngine do
         # response can't also stall the request being recorded (`requests/1`
         # reflects it immediately) or the loop's ability to keep polling its
         # mailbox/accepting while that response is held open.
+        loop = self()
+
         spawn(fn ->
-          send_scripted(sock, resp)
+          send_scripted(sock, resp, loop)
           :gen_tcp.close(sock)
         end)
 
@@ -158,10 +186,20 @@ defmodule Vagus.Test.FakeEngine do
   defp pop_response([]),
     do: {{500, %{"message" => "Vagus.Test.FakeEngine: response script exhausted"}}, []}
 
-  defp send_scripted(_sock, :close), do: :ok
-  defp send_scripted(sock, {status, body}), do: send_response(sock, status, body)
+  defp send_scripted(_sock, :close, _loop), do: :ok
 
-  defp send_scripted(sock, {status, body, opts}) do
+  defp send_scripted(sock, {status, {:parts, [first | rest] = parts}}, loop) do
+    length = parts |> Enum.filter(&is_binary/1) |> IO.iodata_to_binary() |> byte_size()
+    send_raw(sock, status, "text/plain", first, length)
+
+    for part <- rest do
+      if part == :await, do: await_release(loop), else: :gen_tcp.send(sock, part)
+    end
+  end
+
+  defp send_scripted(sock, {status, body}, _loop), do: send_response(sock, status, body)
+
+  defp send_scripted(sock, {status, body, opts}, _loop) do
     case Keyword.get(opts, :delay) do
       nil -> :ok
       ms -> Process.sleep(ms)
@@ -271,20 +309,22 @@ defmodule Vagus.Test.FakeEngine do
 
   defp send_response(sock, status, nil), do: send_raw(sock, status, "text/plain", "")
 
-  defp send_response(sock, status, {:parts, [first | rest] = parts}) do
-    send_raw(sock, status, "text/plain", first, byte_size(IO.iodata_to_binary(parts)))
-
-    for part <- rest do
-      Process.sleep(100)
-      :gen_tcp.send(sock, part)
-    end
-  end
-
   defp send_response(sock, status, body) when is_binary(body),
     do: send_raw(sock, status, "text/plain", body)
 
   defp send_response(sock, status, body) when is_map(body) or is_list(body),
     do: send_raw(sock, status, "application/json", Jason.encode!(body))
+
+  defp await_release(loop) do
+    send(loop, {:parked, self()})
+
+    # Bounded so a test that never releases can't leave this writer behind.
+    receive do
+      :release -> :ok
+    after
+      5_000 -> :ok
+    end
+  end
 
   defp send_raw(sock, status, content_type, body, length \\ nil) do
     head =
