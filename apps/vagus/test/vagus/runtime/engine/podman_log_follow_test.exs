@@ -82,7 +82,7 @@ defmodule Vagus.Runtime.Engine.Podman.LogFollowTest do
 
     File.write!(log, records(["2026-10-15T18:14:22.0+00:00 stdout P tw"]), [:append])
     # A tick while the chunk is un-acked reads nothing.
-    send(pid, :tick)
+    send(pid, {:tick, :sys.get_state(pid).tick})
     _ = :sys.get_state(pid)
     refute_received {:log_chunk, _}
     Follow.ack(pid)

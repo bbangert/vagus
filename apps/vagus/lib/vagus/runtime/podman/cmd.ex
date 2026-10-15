@@ -72,22 +72,23 @@ defmodule Vagus.Runtime.Podman.Cmd do
     # never reaches a caller that traps exits.
     Process.unlink(port)
 
-    deadline = make_ref()
-    timer = Process.send_after(self(), {__MODULE__, deadline}, Keyword.fetch!(opts, :timeout_ms))
+    # A deadline instant rather than a timer: no message of its own can be
+    # left behind in the caller's mailbox.
+    deadline = now_ms() + Keyword.fetch!(opts, :timeout_ms)
 
     try do
       collect(port, deadline, %{cap: cap, truncate?: truncate?, size: 0, acc: []})
     after
-      Process.cancel_timer(timer)
-      flush(port, deadline)
+      flush(port)
     end
   end
 
-  defp flush(port, deadline) do
+  defp now_ms, do: System.monotonic_time(:millisecond)
+
+  defp flush(port) do
     receive do
-      {__MODULE__, ^deadline} -> flush(port, deadline)
-      {^port, _} -> flush(port, deadline)
-      {:EXIT, ^port, _} -> flush(port, deadline)
+      {^port, _} -> flush(port)
+      {:EXIT, ^port, _} -> flush(port)
     after
       0 -> :ok
     end
@@ -106,9 +107,8 @@ defmodule Vagus.Runtime.Podman.Cmd do
 
       {^port, {:exit_status, status}} ->
         {:exit, status, output(out)}
-
-      {__MODULE__, ^deadline} ->
-        close(port, {:error, :timeout})
+    after
+      max(deadline - now_ms(), 0) -> close(port, {:error, :timeout})
     end
   end
 

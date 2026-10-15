@@ -43,6 +43,7 @@ defmodule Vagus.Runtime.Engine.Podman.LogFollow do
       offset: 0,
       conmon: nil,
       timer: nil,
+      tick: nil,
       # A record not yet ended by its newline, and whether the text sent so
       # far ends mid-line (after a `P` fragment).
       pending: "",
@@ -72,11 +73,13 @@ defmodule Vagus.Runtime.Engine.Podman.LogFollow do
 
   def handle_info(:log_ack, state), do: {:noreply, schedule(%{state | awaiting_ack?: false}, 0)}
 
-  def handle_info(:tick, %{awaiting_ack?: true} = state), do: {:noreply, %{state | timer: nil}}
+  # A tick from a timer since cancelled carries an older ref.
+  def handle_info({:tick, ref}, %{tick: ref, awaiting_ack?: true} = state),
+    do: {:noreply, %{state | timer: nil}}
 
   # Liveness is checked before the read, so the read after conmon's exit
   # still drains what it wrote last.
-  def handle_info(:tick, state) do
+  def handle_info({:tick, ref}, %{tick: ref} = state) do
     gone? = not alive?(state.conmon)
     state = %{state | timer: nil}
 
@@ -211,7 +214,8 @@ defmodule Vagus.Runtime.Engine.Podman.LogFollow do
 
   defp schedule(state, ms) do
     if state.timer, do: Process.cancel_timer(state.timer)
-    %{state | timer: Process.send_after(self(), :tick, ms)}
+    tick = make_ref()
+    %{state | tick: tick, timer: Process.send_after(self(), {:tick, tick}, ms)}
   end
 
   defp eof(state) do
