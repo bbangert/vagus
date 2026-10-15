@@ -199,13 +199,13 @@ defmodule Vagus.Test.FakeEngine do
 
   defp send_scripted(sock, {status, body}, _loop), do: send_response(sock, status, body)
 
-  defp send_scripted(sock, {status, body, opts}, _loop) do
+  defp send_scripted(sock, {status, body, opts}, loop) do
     case Keyword.get(opts, :delay) do
       nil -> :ok
       ms -> Process.sleep(ms)
     end
 
-    send_response(sock, status, body)
+    send_scripted(sock, {status, body}, loop)
   end
 
   ## Request parsing

@@ -403,6 +403,18 @@ defmodule Vagus.Runtime.Engine.DockerContractTest do
   end
 
   describe "what reaches the daemon" do
+    test "a delayed parts body still streams in full" do
+      parts = [Leg.framed("line one\n"), :await, Leg.framed("line two\n", 2)]
+      {engine, opts} = engine([{200, {:parts, parts}, delay: 100}])
+      {:ok, pid} = Engine.follow_logs("addon_local_x", self(), opts)
+
+      assert_receive {:log_chunk, "line one\n"}, 2_000
+      FakeEngine.release(engine)
+      Vagus.Runtime.Logs.Follow.ack(pid)
+      assert_receive {:log_chunk, "line two\n"}, 2_000
+      assert_receive :log_eof, 2_000
+    end
+
     test "logs and follow_logs ask the daemon for timestamps exactly as given" do
       for timestamps <- [true, false] do
         {engine, opts} = engine([{200, ""}, {200, ""}])
