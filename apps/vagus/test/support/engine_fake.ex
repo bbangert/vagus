@@ -280,7 +280,7 @@ defmodule Vagus.Runtime.Engine.Fake do
   end
 
   defp call(opts, verb, args, fun) do
-    fake = opts[:fake] || Application.fetch_env!(:vagus, :engine_fake)
+    fake = instance(opts)
 
     Agent.get_and_update(fake, fn s ->
       case pop_failure(%{s | calls: [{verb, args} | s.calls]}, verb) do
@@ -296,6 +296,20 @@ defmodule Vagus.Runtime.Engine.Fake do
           {{:error, error}, s}
       end
     end)
+  end
+
+  defp instance(opts) do
+    case {opts[:fake], Application.fetch_env(:vagus, :engine_fake)} do
+      {nil, {:ok, fake}} ->
+        fake
+
+      {nil, :error} ->
+        raise ArgumentError,
+              "no Engine.Fake instance: pass fake: pid, or call start_global/0 in an async: false test"
+
+      {fake, _global} ->
+        fake
+    end
   end
 
   defp timed_out?(opts, ms, floor),

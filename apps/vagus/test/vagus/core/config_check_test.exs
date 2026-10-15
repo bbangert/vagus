@@ -6,6 +6,18 @@ defmodule Vagus.Core.ConfigCheckTest do
 
   @argv ~w(python3 -m homeassistant -c /config --script check_config)
 
+  # Answers each call with the next reading, holding the last.
+  defp clock(readings) do
+    {:ok, agent} = Agent.start_link(fn -> readings end)
+
+    fn ->
+      Agent.get_and_update(agent, fn
+        [last] -> {last, [last]}
+        [reading | rest] -> {reading, rest}
+      end)
+    end
+  end
+
   defp engine(state, exec \\ nil) do
     fake = Fake.start()
     if state, do: Fake.put_container(fake, Container.name(), state: state, exec: exec)
@@ -80,6 +92,42 @@ defmodule Vagus.Core.ConfigCheckTest do
 
       assert {:invalid, log} = ConfigCheck.check(engine_opts: opts)
       assert log =~ "homeassistant.util.yaml"
+    end
+
+    test "one deadline covers the inspect and the exec together" do
+      # The inspect "takes" 900 of the 1_000 ms: the exec's 500 would fit a
+      # fresh budget but not the 100 left.
+      {fake, opts} = engine(:running, {0, "Success!\n"})
+      Fake.delay_next(fake, :exec, 500)
+      clock = clock([0, 900])
+
+      assert ConfigCheck.check(engine_opts: [timeout_ms: 1_000] ++ opts, now: clock) ==
+               {:error, :timeout}
+    end
+
+    test "with nothing left after the inspect, the exec is not attempted" do
+      {fake, opts} = engine(:running, {0, "Success!\n"})
+      clock = clock([0, 1_000])
+
+      assert ConfigCheck.check(engine_opts: [timeout_ms: 1_000] ++ opts, now: clock) ==
+               {:error, :timeout}
+
+      assert [{:inspect, _}] = Fake.calls(fake)
+    end
+
+    test "the default deadline is 300 s" do
+      {fake, opts} = engine(:running, {0, "Success!\n"})
+      Fake.delay_next(fake, :exec, 300_001)
+      assert ConfigCheck.check(engine_opts: opts) == {:error, :timeout}
+
+      Fake.delay_next(fake, :exec, 299_000)
+      assert ConfigCheck.check(engine_opts: opts) == :valid
+    end
+
+    test "a Core gone between the inspect and the exec is not running" do
+      {fake, opts} = engine(:running, {0, "Success!\n"})
+      Fake.fail_next(fake, :exec, :not_found)
+      assert {:not_running, _message} = ConfigCheck.check(engine_opts: opts)
     end
 
     test "an exec failure surfaces as {:error, reason}" do

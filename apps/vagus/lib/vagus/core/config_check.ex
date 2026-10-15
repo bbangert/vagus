@@ -27,8 +27,7 @@ defmodule Vagus.Core.ConfigCheck do
   alias Vagus.Core.Container
   alias Vagus.Runtime.{Engine, Logs}
 
-  # Exec'd directly: the command has no shell syntax, and the engine
-  # resolves `python3` on the container's PATH as the shell did.
+  # Exec'd directly: the command has no shell syntax.
   @check_argv ~w(python3 -m homeassistant -c /config --script check_config)
   @invalid_marker ~r/homeassistant\.util\.yaml/
   @deadline_ms 300_000
@@ -42,7 +41,8 @@ defmodule Vagus.Core.ConfigCheck do
   @doc """
   Runs the check. `opts[:engine_opts]` threads into every
   `Vagus.Runtime.Engine` call; its `:timeout_ms` overrides the check's
-  deadline.
+  deadline, which bounds the inspect and the exec together. `opts[:now]`
+  (a monotonic-ms clock) is for tests.
 
     * `:valid` — exit code 0, no yaml-error marker in the log.
     * `{:invalid, log}` — nonzero exit code or the marker matched; `log`
@@ -56,15 +56,18 @@ defmodule Vagus.Core.ConfigCheck do
   """
   @spec check(keyword()) :: result()
   def check(opts \\ []) do
-    # The check's output is a stream whose pace Core's container sets, so
-    # only a deadline bounds it; past it the command is left to exit in the
-    # container.
+    now = Keyword.get(opts, :now, fn -> System.monotonic_time(:millisecond) end)
+
     engine_opts =
       opts |> Keyword.get(:engine_opts, []) |> Keyword.put_new(:timeout_ms, @deadline_ms)
 
+    deadline = now.() + engine_opts[:timeout_ms]
+
     case Engine.inspect(Container.name(), engine_opts) do
       {:ok, container} ->
-        if Engine.Container.alive?(container), do: run_check(engine_opts), else: not_running()
+        if Engine.Container.alive?(container),
+          do: run_check(engine_opts, max(deadline - now.(), 0)),
+          else: not_running()
 
       {:error, :not_found} ->
         not_running()
@@ -76,11 +79,23 @@ defmodule Vagus.Core.ConfigCheck do
 
   defp not_running, do: {:not_running, "cannot run config check while Core is not running"}
 
-  defp run_check(engine_opts) do
-    case Engine.exec(Container.name(), @check_argv, engine_opts) do
+  defp run_check(_engine_opts, 0), do: {:error, :timeout}
+
+  # Only the deadline bounds the whole stream (the Docker client's 60 s cap
+  # is per receive); past it the command is left to exit in the container.
+  defp run_check(engine_opts, left_ms) do
+    case Engine.exec(
+           Container.name(),
+           @check_argv,
+           Keyword.put(engine_opts, :timeout_ms, left_ms)
+         ) do
       {:ok, %{exit_code: code, output: output}} ->
         log = Logs.strip_ansi(output)
         if code == 0 and not Regex.match?(@invalid_marker, log), do: :valid, else: {:invalid, log}
+
+      # Core went away between the inspect and the exec.
+      {:error, :not_found} ->
+        not_running()
 
       {:error, reason} ->
         {:error, reason}

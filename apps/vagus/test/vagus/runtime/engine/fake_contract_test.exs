@@ -142,6 +142,12 @@ defmodule Vagus.Runtime.Engine.FakeContractTest do
   alias Vagus.Runtime.Engine.Fake
 
   describe "fake-only helpers" do
+    test "a call that names no instance, with no global one, says how to give it" do
+      assert_raise ArgumentError, ~r/pass fake: pid, or call start_global/, fn ->
+        Engine.ready(engine: Fake)
+      end
+    end
+
     test "fail_next refuses stop_all, whose result cannot carry an error" do
       assert_raise ArgumentError, fn -> Fake.fail_next(Fake.start(), :stop_all, :busy) end
     end

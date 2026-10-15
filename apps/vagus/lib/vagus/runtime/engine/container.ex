@@ -36,8 +36,7 @@ defmodule Vagus.Runtime.Engine.Container do
           finished_at: DateTime.t() | nil
         }
 
-  # Docker's State.Running, which callers relied on: moby keeps it true
-  # while a container is paused or restarting.
+  # Docker's State.Running: moby keeps it true while paused or restarting.
   @spec alive?(t()) :: boolean()
   def alive?(%__MODULE__{state: state}), do: state in [:running, :paused, :restarting]
 
