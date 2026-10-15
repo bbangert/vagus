@@ -1,7 +1,7 @@
 defmodule Vagus.Core.WatchdogTest do
   @moduledoc """
   Hermetic tests for the Core crash-loop watchdog — events driven by
-  sending `{:docker_event, ...}` directly (no real `Vagus.Runtime.Events`
+  sending `{:engine_event, ...}` directly (no real `Vagus.Runtime.Events`
   instance), time driven by an
   injected clock, rebuild results scripted.
   """
@@ -49,18 +49,17 @@ defmodule Vagus.Core.WatchdogTest do
   end
 
   defp die_event(name, exit_code) do
-    %{
-      action: "die",
+    %Vagus.Runtime.Engine.Event{
+      action: :die,
       name: name,
       id: "core-test-id",
       exit_code: exit_code,
-      time_nano: 1_700_000_000_000_000_000,
-      attributes: %{}
+      time_ns: 1_700_000_000_000_000_000
     }
   end
 
   defp crash_die(pid, exit_code \\ 1) do
-    send(pid, {:docker_event, die_event(Container.name(), exit_code)})
+    send(pid, {:engine_event, die_event(Container.name(), exit_code)})
     :sys.get_state(pid)
   end
 
@@ -138,7 +137,7 @@ defmodule Vagus.Core.WatchdogTest do
       pid = start_watchdog(ctx)
 
       for _ <- 1..3 do
-        send(pid, {:docker_event, die_event(Container.name(), nil)})
+        send(pid, {:engine_event, die_event(Container.name(), nil)})
         :sys.get_state(pid)
       end
 
@@ -150,7 +149,7 @@ defmodule Vagus.Core.WatchdogTest do
       pid = start_watchdog(ctx)
 
       for _ <- 1..3 do
-        send(pid, {:docker_event, die_event("addon_foo", 137)})
+        send(pid, {:engine_event, die_event("addon_foo", 137)})
         :sys.get_state(pid)
       end
 
@@ -161,8 +160,8 @@ defmodule Vagus.Core.WatchdogTest do
     test "non-die actions are ignored", ctx do
       pid = start_watchdog(ctx)
 
-      for action <- ["start", "stop", "create"] do
-        send(pid, {:docker_event, %{die_event(Container.name(), 1) | action: action}})
+      for action <- [:start, :other, :create] do
+        send(pid, {:engine_event, %{die_event(Container.name(), 1) | action: action}})
         :sys.get_state(pid)
       end
 

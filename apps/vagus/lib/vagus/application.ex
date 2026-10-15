@@ -197,10 +197,10 @@ defmodule Vagus.Application do
     if Application.get_env(:vagus, :dns_enabled, true), do: [Vagus.DNS], else: []
   end
 
-  # The docker-events stream (M4B-IW-P1-T1), gated by `:events_enabled` (false
+  # The engine's container-event stream (M4B-IW-P1-T1), gated by `:events_enabled` (false
   # in test.exs) — mirrors `:dns_enabled`. `mix test` has no real engine
-  # socket to stream from; unit tests start their own instance against a fake
-  # unix-socket server instead.
+  # socket to stream from; unit tests start their own instance on a test
+  # source instead.
   defp events_children do
     if Application.get_env(:vagus, :events_enabled, true), do: [Vagus.Runtime.Events], else: []
   end

@@ -2,6 +2,7 @@ defmodule Vagus.App.PolicyTest do
   use ExUnit.Case, async: true
 
   alias Vagus.App.Policy
+  alias Vagus.Runtime.Engine.Event
 
   @mqtt %{uuid: "u1", addon: "mosq", service: "mqtt", config: %{"host" => "a"}}
 
@@ -127,7 +128,7 @@ defmodule Vagus.App.PolicyTest do
   describe "on_event/2" do
     test "a start of the app's container while none is known adopts it" do
       data = app(%{wanted: :stopped})
-      {adopted, effects} = Policy.on_event(%{action: "start", id: "c9"}, data)
+      {adopted, effects} = Policy.on_event(%Event{action: :start, id: "c9"}, data)
 
       assert %{container_id: "c9", last_event: {:running, false}} = adopted
       assert effects == [{:emit, :started}]
@@ -135,13 +136,13 @@ defmodule Vagus.App.PolicyTest do
 
     test "a start event for a known container changes nothing" do
       data = running(%{last_event: {:running, true}})
-      assert Policy.on_event(%{action: "start", id: "c1"}, data) == {data, []}
-      assert Policy.on_event(%{action: "start", id: "c2"}, data) == {data, []}
+      assert Policy.on_event(%Event{action: :start, id: "c1"}, data) == {data, []}
+      assert Policy.on_event(%Event{action: :start, id: "c2"}, data) == {data, []}
     end
 
     test "an exit of a container other than the current one is ignored" do
       data = running()
-      assert Policy.on_event(%{action: "die", id: "old", exit_code: 1}, data) == {data, []}
+      assert Policy.on_event(%Event{action: :die, id: "old", exit_code: 1}, data) == {data, []}
     end
 
     test "a late start and exit of a container this process stopped change nothing" do
@@ -149,22 +150,26 @@ defmodule Vagus.App.PolicyTest do
       {stopped, _} = step(data, {:ok, %{was_running: true}})
       assert stopped.released == ["c1"]
 
-      for event <- [%{action: "start", id: "c1"}, %{action: "die", id: "c1", exit_code: 1}],
+      for event <- [
+            %Event{action: :start, id: "c1"},
+            %Event{action: :die, id: "c1", exit_code: 1}
+          ],
           do: assert(Policy.on_event(event, stopped) == {stopped, []})
 
-      assert {%{container_id: "c9"}, _} = Policy.on_event(%{action: "start", id: "c9"}, stopped)
+      assert {%{container_id: "c9"}, _} =
+               Policy.on_event(%Event{action: :start, id: "c9"}, stopped)
     end
 
     test "an exit after a stop (no current container) is ignored" do
       data = app(%{wanted: :stopped})
-      assert Policy.on_event(%{action: "die", id: "c1", exit_code: 0}, data) == {data, []}
+      assert Policy.on_event(%Event{action: :die, id: "c1", exit_code: 0}, data) == {data, []}
     end
 
     test "a crash with the watchdog on drops the run keys and restarts at once" do
       data = running(%{token_hash: "h"})
 
       assert {after_crash, effects} =
-               Policy.on_event(%{action: "die", id: "c1", exit_code: 1}, data)
+               Policy.on_event(%Event{action: :die, id: "c1", exit_code: 1}, data)
 
       assert effects == [
                {:emit, :error},
@@ -178,14 +183,14 @@ defmodule Vagus.App.PolicyTest do
     end
 
     test "a clean exit of a long-running app is restarted too, as upstream does" do
-      {_data, effects} = Policy.on_event(%{action: "die", id: "c1", exit_code: 0}, running())
+      {_data, effects} = Policy.on_event(%Event{action: :die, id: "c1", exit_code: 0}, running())
       assert {:timer, :retry, 0, {:retry, "c1"}} in effects
       assert {:emit, :stopped} in effects
     end
 
     test "a once app's clean exit completes it: no restart, wanted kept" do
       data = running(%{config: app_config(%{"startup" => "once"})})
-      {after_exit, effects} = Policy.on_event(%{action: "die", id: "c1", exit_code: 0}, data)
+      {after_exit, effects} = Policy.on_event(%Event{action: :die, id: "c1", exit_code: 0}, data)
       refute Enum.any?(effects, &match?({:timer, :retry, _, _}, &1))
       assert after_exit.wanted == :started
       assert after_exit.attempt == 0
@@ -193,7 +198,7 @@ defmodule Vagus.App.PolicyTest do
 
     test "a crash with the watchdog off reports error and does nothing more" do
       data = running(%{watchdog: false})
-      {after_crash, effects} = Policy.on_event(%{action: "die", id: "c1", exit_code: 2}, data)
+      {after_crash, effects} = Policy.on_event(%Event{action: :die, id: "c1", exit_code: 2}, data)
       assert {:emit, :error} in effects
       refute Enum.any?(effects, &match?({:timer, :retry, _, _}, &1))
       assert after_crash.attempt == 0
@@ -201,7 +206,7 @@ defmodule Vagus.App.PolicyTest do
 
     test "nothing is restarted while the host shuts down" do
       data = running(%{shutting_down: true})
-      {_data, effects} = Policy.on_event(%{action: "die", id: "c1", exit_code: 2}, data)
+      {_data, effects} = Policy.on_event(%Event{action: :die, id: "c1", exit_code: 2}, data)
       refute Enum.any?(effects, &match?({:timer, :retry, _, _}, &1))
     end
 
@@ -209,12 +214,12 @@ defmodule Vagus.App.PolicyTest do
       data = running(%{last_event: {:running, true}})
 
       assert {%{last_event: :healthy}, [{:emit, :started}]} =
-               Policy.on_event(%{action: "health_status: healthy", id: "c1"}, data)
+               Policy.on_event(%Event{action: :health, health: :healthy, id: "c1"}, data)
     end
 
     test "unhealthy keeps started and restarts on the ladder" do
       {data, effects} =
-        Policy.on_event(%{action: "health_status: unhealthy", id: "c1"}, running())
+        Policy.on_event(%Event{action: :health, health: :unhealthy, id: "c1"}, running())
 
       assert effects == [{:timer, :retry, 0, {:retry, "c1"}}]
       assert data.last_event == :unhealthy
@@ -239,7 +244,7 @@ defmodule Vagus.App.PolicyTest do
 
     test "unknown events change nothing" do
       data = running()
-      assert Policy.on_event(%{action: "exec_start", id: "c1"}, data) == {data, []}
+      assert Policy.on_event(%Event{action: :other, id: "c1"}, data) == {data, []}
     end
   end
 

@@ -949,9 +949,9 @@ defmodule Vagus.API.Router do
   get("/host/logs/latest", do: send_logs(conn, nil, no_colors: true))
 
   # -- Logs: live `/follow` streaming (§A5) — chunked text/plain, connection
-  # held open. Container families ride a per-connection Runtime.Logs.Follow
-  # (docker --follow; its tail=N carries the backfill on the SAME stream, so
-  # no separate backfill write — no gap, no duplication). The native broker
+  # held open. Container families ride a per-connection engine follow
+  # (`Vagus.Runtime.Engine.follow_logs/3`; its tail=N carries the backfill on
+  # the SAME stream, so no separate backfill write — no gap, no duplication). The native broker
   # subscribes to its Broker.Logs buffer. Sourceless families stream an
   # honest empty body and close. ---------------------------------------------
 
@@ -1414,8 +1414,8 @@ defmodule Vagus.API.Router do
   # request until `Lifecycle.update/2` returns. Bandit's `read_timeout` does
   # not end that: it times reads from the client, not a handler. What does is
   # in `Lifecycle`: the pull has a deadline, the health gate has
-  # `Vagus.Core.Health`'s, and any other Engine-API call fails once the engine
-  # is silent for `Vagus.Runtime.Docker`'s receive timeout. `backup: true` is
+  # `Vagus.Core.Health`'s, and any other engine call fails once the engine
+  # is silent for the adapter's receive timeout. `backup: true` is
   # refused (audit E4) rather than silently ignored — see
   # `validate_core_update_backup/1`.
 
@@ -2287,7 +2287,7 @@ defmodule Vagus.API.Router do
             halt(conn)
         end
 
-      {:docker, _follow_pid} = source ->
+      {:engine, _follow_pid} = source ->
         stream_loop(conn, source, fmt)
     end
   end
@@ -2312,13 +2312,13 @@ defmodule Vagus.API.Router do
       end
     else
       # Linked on purpose: if this request process dies abnormally, the link
-      # (plus the owner monitor inside Follow) guarantees the held docker
-      # connection dies with it. Backfill rides the docker stream (tail=N);
-      # verbose rides docker's per-line stamps (timestamps=true).
-      {:ok, pid} =
-        Logs.Follow.start_link(owner: self(), ref: ref, tail: lines, timestamps: verbose)
-
-      {:docker, pid}
+      # (plus the streamer's own owner monitor) guarantees the held engine
+      # connection dies with it. Backfill rides the stream (tail=N); verbose
+      # rides the engine's per-line stamps (timestamps=true).
+      case Engine.follow_logs(ref, self(), tail: lines, timestamps: verbose) do
+        {:ok, pid} -> {:engine, pid}
+        {:error, _reason} -> :none
+      end
     end
   end
 
@@ -2361,7 +2361,7 @@ defmodule Vagus.API.Router do
 
       {:error, _reason} ->
         # The client hung up mid-stream — tear the source down so the held
-        # docker connection / broker subscription doesn't leak (risk #2).
+        # engine connection / broker subscription doesn't leak (risk #2).
         teardown(source)
         halt(conn)
     end
@@ -2379,13 +2379,15 @@ defmodule Vagus.API.Router do
 
   defp source_pid({_kind, pid}), do: pid
 
-  defp teardown({:docker, pid}) do
-    GenServer.stop(pid, :normal, 1_000)
-  catch
-    :exit, _ -> :ok
+  # Unlinked first: the streamer is linked to this request process, which
+  # must outlive it.
+  defp teardown({:engine, pid}) do
+    Process.unlink(pid)
+    Process.exit(pid, :shutdown)
+    :ok
   end
 
-  # Best-effort like the docker branch: the broker (and its Logs process)
+  # Best-effort like the engine branch: the broker (and its Logs process)
   # can restart/stop while a follow is open — unsubscribing a dead server
   # exits :noproc, and the subscription died with the server anyway.
   defp teardown({:native, logs_pid}) do

@@ -43,7 +43,7 @@ defmodule Vagus.Core.Watchdog do
   Subscribes to `Vagus.Runtime.Events` (`:events` opt) in `init/1`,
   tolerating an absent/disabled server — `Events` is gated by `:events_enabled` (not target-only), and the
   probe half must keep working even when the event stream isn't there.
-  Also accepts `{:docker_event, event}` sent directly (tests, alternate
+  Also accepts `{:engine_event, event}` sent directly (tests, alternate
   sources) — the message shape is the only contract.
 
   ## Options (all injectable — tests never touch a real engine/store)
@@ -118,7 +118,7 @@ defmodule Vagus.Core.Watchdog do
   end
 
   @impl GenServer
-  def handle_info({:docker_event, %{action: "die", name: name} = event}, st) do
+  def handle_info({:engine_event, %{action: :die, name: name} = event}, st) do
     if name == Container.name() do
       {:noreply, handle_die(event, st)}
     else
@@ -126,7 +126,7 @@ defmodule Vagus.Core.Watchdog do
     end
   end
 
-  def handle_info({:docker_event, _event}, st), do: {:noreply, st}
+  def handle_info({:engine_event, _event}, st), do: {:noreply, st}
 
   # The events server restarted with an empty subscriber set: subscribe to
   # its replacement once it is back (`Vagus.Resubscribe`).

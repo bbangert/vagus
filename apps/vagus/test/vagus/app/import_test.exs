@@ -60,7 +60,12 @@ defmodule Vagus.App.ImportTest do
       # A process knows a container runs only once the engine says so.
       if wanted == :started do
         assert {:ok, %{state: :stopped}} = Vagus.App.info(slug)
-        send(pid, {:docker_event, %{action: "start", id: "c-" <> slug, name: "addon_" <> slug}})
+
+        send(
+          pid,
+          {:engine_event,
+           %Vagus.Runtime.Engine.Event{action: :start, id: "c-" <> slug, name: "addon_" <> slug}}
+        )
       end
 
       {:ok, new} = Vagus.App.info(slug)
