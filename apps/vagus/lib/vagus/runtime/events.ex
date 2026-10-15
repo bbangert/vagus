@@ -82,8 +82,8 @@ defmodule Vagus.Runtime.Events do
 
   ## GenServer
 
-  # `:engine_opts` reach the default source's choice and the resync listing;
-  # the rest of `opts` reach the source's `init/1`.
+  # `:engine_opts` reach the source (its choice and `init/1`) and the resync
+  # listing alike.
   @impl GenServer
   def init(opts) do
     name = Keyword.get(opts, :name, __MODULE__)
@@ -92,7 +92,7 @@ defmodule Vagus.Runtime.Events do
 
     state = %{
       source: source,
-      src: source.init(opts),
+      src: source.init(engine_opts),
       connected: false,
       subscribers: %{},
       backoff_ms: @initial_backoff_ms,
@@ -136,14 +136,20 @@ defmodule Vagus.Runtime.Events do
   end
 
   @impl GenServer
+  # Every message Events owns is tagged with this module or is a `:DOWN` for a
+  # ref it holds; everything else belongs to the source.
+  #
   # The retry timer: the debug-level counterpart to the warning logged once
   # when the drop that scheduled it happened (see schedule_reconnect/2).
-  def handle_info(:connect, state) do
+  def handle_info({__MODULE__, :connect}, state) do
     Logger.debug("Vagus.Runtime.Events: attempting to (re)connect")
     {:noreply, do_connect(%{state | reconnect_timer: nil})}
   end
 
-  def handle_info({:resync, gen, result}, %{generation: gen, resync: {ref, held}} = state) do
+  def handle_info(
+        {__MODULE__, :resync, gen, result},
+        %{generation: gen, resync: {ref, held}} = state
+      ) do
     Process.demonitor(ref, [:flush])
 
     missed =
@@ -160,7 +166,7 @@ defmodule Vagus.Runtime.Events do
     {:noreply, %{state | resync: nil}}
   end
 
-  def handle_info({:resync, _gen, _result}, state), do: {:noreply, state}
+  def handle_info({__MODULE__, :resync, _gen, _result}, state), do: {:noreply, state}
 
   # The listing died without an answer: what it held back goes out unordered
   # against nothing.
@@ -170,14 +176,17 @@ defmodule Vagus.Runtime.Events do
     {:noreply, %{state | resync: nil}}
   end
 
-  def handle_info({:DOWN, ref, :process, pid, _reason}, %{subscribers: subs} = state) do
+  def handle_info({:DOWN, ref, :process, pid, _reason} = msg, %{subscribers: subs} = state) do
     case Map.fetch(subs, pid) do
       {:ok, ^ref} -> {:noreply, %{state | subscribers: Map.delete(subs, pid)}}
-      _ -> {:noreply, state}
+      _ -> to_source(msg, state)
     end
   end
 
-  def handle_info(msg, %{connected: true} = state) do
+  def handle_info(msg, state), do: to_source(msg, state)
+
+  # Only a connected source is asked: after `close/1` it has nothing to own.
+  defp to_source(msg, %{connected: true} = state) do
     case state.source.handle_info(msg, state.src) do
       {:ok, notices, src} ->
         {:noreply, Enum.reduce(notices, %{state | src: src}, &notice/2)}
@@ -192,11 +201,11 @@ defmodule Vagus.Runtime.Events do
     end
   end
 
-  def handle_info(_other, state), do: {:noreply, state}
+  defp to_source(_msg, state), do: {:noreply, state}
 
   defp do_connect(state) do
     case state.source.connect(state.src) do
-      {:ok, src} -> %{state | src: src, connected: true}
+      {:ok, notices, src} -> Enum.reduce(notices, %{state | src: src, connected: true}, &notice/2)
       {:error, reason} -> schedule_reconnect(reason, state)
     end
   end
@@ -204,7 +213,7 @@ defmodule Vagus.Runtime.Events do
   defp close(state), do: %{state | src: state.source.close(state.src), connected: false}
 
   # Logs the drop exactly once (warning) and arms the retry timer; the retry
-  # tick itself (handle_info(:connect, ...)) logs at debug. Backoff for the
+  # tick itself (handle_info({__MODULE__, :connect}, ...)) logs at debug. Backoff for the
   # *next* drop is doubled (capped) here; an engine that answered resets it
   # to the floor first (see notice/2).
   #
@@ -224,7 +233,7 @@ defmodule Vagus.Runtime.Events do
 
     %{
       state
-      | reconnect_timer: Process.send_after(self(), :connect, delay),
+      | reconnect_timer: Process.send_after(self(), {__MODULE__, :connect}, delay),
         backoff_ms: min(delay * 2, @max_backoff_ms)
     }
   end
@@ -282,19 +291,32 @@ defmodule Vagus.Runtime.Events do
   defp resync(%{list: nil} = state), do: state
 
   # What an earlier listing still held back is older than this connection.
+  # A listing that cannot start is a listing that failed: nothing is held.
   defp resync(%{list: list} = state) do
     state = flush_held(state)
     gen = state.generation + 1
+    %{state | generation: gen, resync: start_listing(list, gen)}
+  end
+
+  defp start_listing(list, gen) do
     parent = self()
 
     case Task.Supervisor.start_child(Vagus.TaskSupervisor, fn ->
-           send(parent, {:resync, gen, list.()})
+           send(parent, {__MODULE__, :resync, gen, list.()})
          end) do
-      {:ok, pid} -> %{state | generation: gen, resync: {Process.monitor(pid), []}}
-      {:error, _reason} -> %{state | generation: gen}
+      {:ok, pid} -> {Process.monitor(pid), []}
+      {:error, reason} -> no_listing(reason)
     end
   catch
-    :exit, _reason -> state
+    :exit, reason -> no_listing(reason)
+  end
+
+  defp no_listing(reason) do
+    Logger.warning(
+      "Vagus.Runtime.Events: no resync: the listing did not start (#{inspect(reason)})"
+    )
+
+    nil
   end
 
   defp flush_held(%{resync: {ref, held}} = state) do
@@ -305,7 +327,7 @@ defmodule Vagus.Runtime.Events do
 
   defp flush_held(state), do: state
 
-  # Running and exited only: what an app process acts on, as before.
+  # Running and exited only: what an app process acts on.
   defp missed(%Container{name: "addon_" <> _ = name, state: :running} = c),
     do: [%Event{action: :start, name: name, id: c.id}]
 

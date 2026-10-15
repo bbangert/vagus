@@ -314,6 +314,9 @@ defmodule Vagus.Runtime.Engine.Fake do
   end
 
   @impl true
+  def event_source, do: __MODULE__.EventSource
+
+  @impl true
   def ensure_network(%NetworkSpec{name: net} = spec, opts) do
     call(opts, :ensure_network, [spec], &{:ok, %{&1 | networks: MapSet.put(&1.networks, net)}})
   end
@@ -473,8 +476,6 @@ defmodule Vagus.Runtime.Engine.Fake do
     {:ok, %{exit_code: code, output: if(capture, do: output, else: "")}}
   end
 
-  # Line N is stamped N ns past a fixed instant, in Docker's RFC3339Nano form,
-  # so a stamp is deterministic and survives `:tail`.
   defp follow_plan(nil, _opts), do: {[], false}
 
   defp follow_plan(entry, opts),
@@ -482,6 +483,8 @@ defmodule Vagus.Runtime.Engine.Fake do
 
   defp lines(chunks, _opts) when is_list(chunks), do: chunks
 
+  # Line N is stamped N ns past a fixed instant, in Docker's RFC3339Nano form,
+  # so a stamp is deterministic and survives `:tail`.
   defp lines(text, opts) do
     tail = Keyword.get(opts, :tail, 100)
 

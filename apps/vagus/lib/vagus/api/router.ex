@@ -2361,7 +2361,7 @@ defmodule Vagus.API.Router do
 
       {:error, _reason} ->
         # The client hung up mid-stream — tear the source down so the held
-        # docker connection / broker subscription doesn't leak (risk #2).
+        # engine connection / broker subscription doesn't leak (risk #2).
         teardown(source)
         halt(conn)
     end

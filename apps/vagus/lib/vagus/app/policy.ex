@@ -252,7 +252,7 @@ defmodule Vagus.App.Policy do
     do: {data, []}
 
   defp container_event(%{action: :die} = event, data),
-    do: died(data, {:exited, Map.get(event, :exit_code)})
+    do: died(data, {:exited, event.exit_code})
 
   defp container_event(%{action: :health, health: :healthy}, data),
     do: observe(data, :healthy, [])

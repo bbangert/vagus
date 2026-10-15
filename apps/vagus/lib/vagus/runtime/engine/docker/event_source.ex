@@ -43,7 +43,7 @@ defmodule Vagus.Runtime.Engine.Docker.EventSource do
       {:ok, conn} ->
         case Mint.HTTP.request(conn, "GET", "/events?filters=" <> filters, [], "") do
           {:ok, conn, ref} ->
-            {:ok, %{src | conn: conn, request_ref: ref, buffer: ""}}
+            {:ok, [], %{src | conn: conn, request_ref: ref, buffer: ""}}
 
           {:error, conn, reason} ->
             Mint.HTTP.close(conn)

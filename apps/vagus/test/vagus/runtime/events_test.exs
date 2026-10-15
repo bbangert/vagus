@@ -10,7 +10,7 @@ defmodule Vagus.Runtime.EventsTest.Source do
   @impl true
   def connect(src) do
     send(src.test, {:source_connected, self()})
-    {:ok, src}
+    {:ok, [], src}
   end
 
   @impl true
@@ -35,7 +35,9 @@ defmodule Vagus.Runtime.EventsTest do
   # Starts an instance on the stub source; returns its pid once connected.
   defp start_events(opts \\ []) do
     name = unique_name()
-    start_supervised!({Events, [name: name, source: Source, test: self()] ++ opts})
+    {engine_opts, opts} = Keyword.pop(opts, :engine_opts, [])
+    opts = [name: name, source: Source, engine_opts: [test: self()] ++ engine_opts] ++ opts
+    start_supervised!({Events, opts})
     assert_receive {:source_connected, events}, 1_000
     {name, events}
   end
@@ -125,6 +127,16 @@ defmodule Vagus.Runtime.EventsTest do
       _ = :sys.get_state(events)
       assert Process.alive?(events)
     end
+  end
+
+  test "with no :source, the engine names its own" do
+    name = unique_name()
+
+    events =
+      start_supervised!({Events, name: name, engine_opts: [engine: Fake, fake: Fake.start()]})
+
+    assert %{source: Vagus.Runtime.Engine.Fake.EventSource, connected: true} =
+             :sys.get_state(events)
   end
 
   describe "schedule_reconnect/2" do

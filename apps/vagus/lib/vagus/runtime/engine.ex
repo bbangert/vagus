@@ -9,8 +9,9 @@ defmodule Vagus.Runtime.Engine do
   `:engine` per call, which is how async tests inject `Engine.Fake`. Every
   adapter must honour:
 
-    * `:timeout_ms` (every callback): bounds the whole call; past it the
-      call returns `{:error, :timeout}`.
+    * `:timeout_ms` (every callback but `follow_logs`, whose stream lives as
+      long as its owner wants): bounds the whole call; past it the call
+      returns `{:error, :timeout}`.
     * `:timeout_s` (`stop`, `restart`, `stop_all`): the grace before kill;
       `:timeout_ms` never cuts it short.
     * `:force` (`remove`, default true): removes a running container.
@@ -75,7 +76,9 @@ defmodule Vagus.Runtime.Engine do
   @doc """
   Streams to `owner` as `{:log_chunk, binary}` then `:log_eof`, sending the
   next chunk only after `owner` sends `:log_ack` (`Vagus.Runtime.Logs.Follow.ack/1`).
-  The streamer is linked to the caller.
+  The streamer is linked to the caller, which stops it by unlinking and
+  exiting it with `:shutdown`; a streamer holding an external handle (e.g. a
+  Port's OS process) must trap exits and close it in `terminate/2`.
   """
   @callback follow_logs(name(), owner :: pid(), keyword()) :: {:ok, pid()} | {:error, error()}
   @callback stats(name(), keyword()) :: {:ok, stats()} | {:error, error()}
@@ -89,6 +92,8 @@ defmodule Vagus.Runtime.Engine do
   """
   @callback healthcheck(name(), keyword()) ::
               {:ok, Container.health()} | {:error, :no_healthcheck | error()}
+  @callback event_source() :: module()
+
   @doc "Creates the network unless it exists; losing a create race is `:ok`."
   @callback ensure_network(NetworkSpec.t(), keyword()) :: :ok | {:error, error()}
 
@@ -113,7 +118,6 @@ defmodule Vagus.Runtime.Engine do
   def ensure_network(%NetworkSpec{} = spec, opts \\ []),
     do: impl(opts).ensure_network(spec, opts)
 
-  @doc "The `Vagus.Runtime.Events.Source` module for the engine `opts` select."
   @spec event_source(keyword()) :: module()
   def event_source(opts \\ []), do: impl(opts).event_source()
 

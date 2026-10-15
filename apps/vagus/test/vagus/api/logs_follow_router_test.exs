@@ -198,6 +198,31 @@ defmodule Vagus.API.LogsFollowRouterTest do
     assert_receive {:DOWN, ^ref, :process, _streamer, _reason}, 1_000
   end
 
+  # The request process outlives its stream (it answers, then waits): the
+  # teardown must stop the streamer and leave the request process alone.
+  test "the idle teardown stops the streamer without taking the request process with it" do
+    with_core(logs: "only-line\n", follow_open: true)
+    test = self()
+
+    request =
+      spawn(fn ->
+        conn = conn(:get, "/core/logs/follow") |> sup() |> Vagus.API.Router.call(@opts)
+        send(test, {:conn, conn})
+
+        receive do
+          :done -> :ok
+        end
+      end)
+
+    request_ref = Process.monitor(request)
+    streamer_ref = request |> streamer_of() |> Process.monitor()
+
+    assert_receive {:conn, %{resp_body: "only-line\n"}}, 5_000
+    assert_receive {:DOWN, ^streamer_ref, :process, _streamer, _reason}, 1_000
+    refute_receive {:DOWN, ^request_ref, :process, _request, _reason}, 300
+    send(request, :done)
+  end
+
   test "verbose reassembles a line split across two engine chunks" do
     # One log line, split mid-word across two {:log_chunk, _} messages; the
     # router's line buffer must reassemble before applying the verbose prefix.

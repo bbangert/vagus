@@ -7,7 +7,7 @@ defmodule Vagus.Runtime.Engine.Docker.EventSourceTest do
   alias Vagus.Runtime.Engine.Event
   alias Vagus.Runtime.Events
 
-  setup do
+  setup ctx do
     path = "/tmp/vagus-ev-#{System.unique_integer([:positive])}.sock"
     _ = File.rm(path)
 
@@ -23,10 +23,13 @@ defmodule Vagus.Runtime.Engine.Docker.EventSourceTest do
     on_exit(fn -> :gen_tcp.close(listen) end)
     on_exit(fn -> File.rm(path) end)
 
-    name = :"events_#{System.unique_integer([:positive])}"
-    start_supervised!({Events, name: name, source: EventSource, socket: path})
-    :ok = Events.subscribe(name)
-    %{listen: listen}
+    unless ctx[:own_events] do
+      name = :"events_#{System.unique_integer([:positive])}"
+      start_supervised!({Events, name: name, source: EventSource, engine_opts: [socket: path]})
+      :ok = Events.subscribe(name)
+    end
+
+    %{listen: listen, path: path}
   end
 
   defp accept_conn(listen, timeout \\ 3_000) do
@@ -134,6 +137,37 @@ defmodule Vagus.Runtime.Engine.Docker.EventSourceTest do
       end)
 
     assert log =~ "pending line exceeded"
+  end
+
+  @tag :own_events
+  test "a 200 makes the stream ready, which resyncs; a 500 does not", %{
+    listen: listen,
+    path: path
+  } do
+    test = self()
+    list = fn -> send(test, :listed) && {:ok, []} end
+
+    start_supervised!(
+      {Events,
+       name: :"events_#{System.unique_integer([:positive])}",
+       source: EventSource,
+       engine_opts: [socket: path],
+       list: list}
+    )
+
+    {sock, _head} = accept_conn(listen)
+    assert_receive :listed, 1_000
+
+    ExUnit.CaptureLog.capture_log(fn ->
+      :gen_tcp.close(sock)
+      {:ok, sock2} = :gen_tcp.accept(listen, 5_000)
+      _head = read_request_head(sock2, "")
+
+      :ok =
+        :gen_tcp.send(sock2, "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n")
+
+      refute_receive :listed, 500
+    end)
   end
 
   test "a server close reconnects", %{listen: listen} do
