@@ -90,35 +90,37 @@ defmodule Vagus.Application do
          name: Vagus.Addon.Backend.Native.Supervisor,
          strategy: :one_for_one,
          max_restarts: 5,
-         max_seconds: 30},
-
-        # One process per installed app, each holding every fact about its
-        # app, brought up from the apps' files before anything that reads
-        # apps: DNS, the events stream, ingress and the API all ask it.
-        # After the native supervisor, which a native app starts into. Its
-        # orchestrator's boot waits for the rest of this tree before it
-        # starts any app.
-        Vagus.App.Supervisor,
-
-        # Boot-time swap (zram or a /data swapfile, per root medium — see
-        # `Vagus.Host.Swap`). Unconditional child, `:ignore` unless
-        # `config :vagus, :host_swap` is set (only target.exs sets it; there
-        # is no board medium to classify on :host/:test). `init/1` only
-        # returns `{:continue, :run}`, so it never blocks the supervisor start
-        # (same StartupGuard safety as `Vagus.Provisioner`) — which also means
-        # it runs concurrently with the Provisioner rather than after it, and
-        # can measure a `/data` that `resize2fs` has not finished growing; it
-        # retries itself once for exactly that case. On a first boot the
-        # swapfile `dd` may still be running when the engine starts, which is
-        # fine — the Core image pull takes minutes anyway.
-        Vagus.Host.Swap,
-
-        # Logs a memory sample (PSI, swap, MemAvailable) every five minutes
-        # — the soak data the swap tuning above was never measured against.
-        # Same `:ignore` gate convention (`config :vagus, :memory_monitor`,
-        # target only) and the same never-crash discipline.
-        Vagus.Host.MemoryMonitor
+         max_seconds: 30}
       ] ++
+        runtime_host_children() ++
+        [
+          # One process per installed app, each holding every fact about its
+          # app, brought up from the apps' files before anything that reads
+          # apps: DNS, the events stream, ingress and the API all ask it.
+          # After the native supervisor, which a native app starts into. Its
+          # orchestrator's boot waits for the rest of this tree before it
+          # starts any app.
+          Vagus.App.Supervisor,
+
+          # Boot-time swap (zram or a /data swapfile, per root medium — see
+          # `Vagus.Host.Swap`). Unconditional child, `:ignore` unless
+          # `config :vagus, :host_swap` is set (only target.exs sets it; there
+          # is no board medium to classify on :host/:test). `init/1` only
+          # returns `{:continue, :run}`, so it never blocks the supervisor start
+          # (same StartupGuard safety as `Vagus.Provisioner`) — which also means
+          # it runs concurrently with the Provisioner rather than after it, and
+          # can measure a `/data` that `resize2fs` has not finished growing; it
+          # retries itself once for exactly that case. On a first boot the
+          # swapfile `dd` may still be running when the engine starts, which is
+          # fine — the Core image pull takes minutes anyway.
+          Vagus.Host.Swap,
+
+          # Logs a memory sample (PSI, swap, MemAvailable) every five minutes
+          # — the soak data the swap tuning above was never measured against.
+          # Same `:ignore` gate convention (`config :vagus, :memory_monitor`,
+          # target only) and the same never-crash discipline.
+          Vagus.Host.MemoryMonitor
+        ] ++
         dns_children() ++
         events_children() ++
         ingress_children() ++
@@ -187,6 +189,15 @@ defmodule Vagus.Application do
     # 5/30 mirrors the budget those isolation supervisors use themselves.
     opts = [strategy: :one_for_one, name: Vagus.Supervisor, max_restarts: 5, max_seconds: 30]
     Supervisor.start_link(children, opts)
+  end
+
+  # Only under the podman engine: it prepares the board for podman and holds
+  # the permits every podman call takes. Before the app processes, whose
+  # calls need it, and stopped after them.
+  defp runtime_host_children do
+    if Application.get_env(:vagus, :engine) == Vagus.Runtime.Engine.Podman,
+      do: [Vagus.Runtime.Host],
+      else: []
   end
 
   # The `hassio` DNS server (M4-P1-T2), gated by `:dns_enabled` (false in

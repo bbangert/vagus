@@ -1,0 +1,55 @@
+[
+     {
+          "name": "hassio",
+          "id": "933eedab22a5d3d9fefbeefbe734b5ac42887d13a9d9bf812d7f87a782153ab0",
+          "driver": "bridge",
+          "network_interface": "hassio",
+          "created": "2026-10-15T17:41:58.778497939Z",
+          "subnets": [
+               {
+                    "subnet": "172.30.32.0/23",
+                    "gateway": "172.30.32.1",
+                    "lease_range": {
+                         "start_ip": "172.30.33.0",
+                         "end_ip": "172.30.33.255"
+                    }
+               }
+          ],
+          "ipv6_enabled": false,
+          "internal": false,
+          "dns_enabled": false,
+          "ipam_options": {
+               "driver": "host-local"
+          },
+          "containers": {
+               "0592abe301c4b28c3f12696daf119c49fc87d7e39d5046fb217350aca63baf0a": {
+                    "name": "fx_running",
+                    "interfaces": {
+                         "eth0": {
+                              "subnets": [
+                                   {
+                                        "ipnet": "172.30.33.2/23",
+                                        "gateway": "172.30.32.1"
+                                   }
+                              ],
+                              "mac_address": "86:b5:74:a9:41:48"
+                         }
+                    }
+               },
+               "8ce29623f08e2b79721798c28e4df35b90ebdefd674bbe61cde00d43c4d013b0": {
+                    "name": "fx_health",
+                    "interfaces": {
+                         "eth0": {
+                              "subnets": [
+                                   {
+                                        "ipnet": "172.30.33.5/23",
+                                        "gateway": "172.30.32.1"
+                                   }
+                              ],
+                              "mac_address": "b2:ce:ee:26:bb:bb"
+                         }
+                    }
+               }
+          }
+     }
+]

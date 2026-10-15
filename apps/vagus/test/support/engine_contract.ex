@@ -172,13 +172,16 @@ defmodule Vagus.Test.EngineContract do
 
   def check!(_verb, result), do: result
 
+  # `skip_follow: reason` skips the log-follow tests for an adapter that
+  # does not follow yet.
   using opts do
     leg = Keyword.fetch!(opts, :leg)
+    skip_follow = Keyword.get(opts, :skip_follow)
 
     # Split only to keep each quote readable; they land in one module.
     {:__block__, [],
      [
-       __helpers__(leg),
+       __helpers__(leg, skip_follow),
        __container_tests__(),
        __live_tests__(),
        __create_tests__(),
@@ -189,8 +192,10 @@ defmodule Vagus.Test.EngineContract do
   end
 
   @doc false
-  def __helpers__(leg) do
+  def __helpers__(leg, skip_follow \\ nil) do
     quote do
+      @skip_follow unquote(skip_follow)
+
       alias Vagus.Runtime.Engine
       alias Vagus.Runtime.Engine.Container
       alias Vagus.Test.EngineContract, as: C
@@ -507,6 +512,7 @@ defmodule Vagus.Test.EngineContract do
           assert Engine.logs("ghost", arrange(:absent, ctx)) == {:error, :not_found}
         end
 
+        @tag skip: @skip_follow
         test "follow delivers one chunk per ack, then :log_eof", ctx do
           assert follow_chunks("addon_local_x", arrange(:follow, ctx)) ==
                    ["line one\n", "line two\n"]
@@ -514,6 +520,7 @@ defmodule Vagus.Test.EngineContract do
 
         for timestamps <- [true, false] do
           @tag timestamps: timestamps
+          @tag skip: @skip_follow
           test "timestamps: #{timestamps} on logs and follow_logs", ctx do
             opts = [timestamps: ctx.timestamps] ++ arrange({:stamped, ctx.timestamps}, ctx)
             {:ok, text} = Engine.logs("addon_local_x", opts)
@@ -524,6 +531,7 @@ defmodule Vagus.Test.EngineContract do
           end
         end
 
+        @tag skip: @skip_follow
         test "follow of an absent container is just :log_eof", ctx do
           assert follow("ghost", arrange(:absent, ctx)) == ""
         end
