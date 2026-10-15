@@ -165,7 +165,8 @@ defmodule Vagus.Runtime.Engine.Podman.LogFollow do
   end
 
   # A record cut off by the switch ends there, never glued to the next
-  # file's first record.
+  # file's first record. A whole `P` record is not cut off: conmon goes on
+  # with its line in the next file, so `mid_line?` carries over.
   defp end_record(%{pending: "", continuing: nil} = state), do: state
 
   defp end_record(%{pending: ""} = state),

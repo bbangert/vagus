@@ -263,6 +263,8 @@ defmodule Vagus.Runtime.Engine.Podman do
         do: ["rm", "--force", "--ignore", "--time", "0", "--", name],
         else: ["rm", "--ignore", "--", name]
 
+    opts = with_deadline(opts, @lifecycle_ms)
+
     with :ok <- valid_name(:remove, name) do
       # The log is named for the container; a caller holding only its id
       # (Steps, after a failed start) needs the name looked up first.

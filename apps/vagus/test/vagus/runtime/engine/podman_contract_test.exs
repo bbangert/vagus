@@ -754,6 +754,18 @@ defmodule Vagus.Runtime.Engine.PodmanContractTest do
       assert File.ls!(Path.join(root, "logs")) == []
     end
 
+    test "remove by id spends one timeout_ms across the lookup and the rm" do
+      fake =
+        FakePodman.start([
+          {"container inspect *", [{0, Leg.inspect_out(Leg.running_json()), delay_ms: 140}]},
+          {"rm *", [{0, "", delay_ms: 140}]}
+        ])
+
+      host = FakePodman.start_host(fake.bin)
+      opts = [engine: Engine.Podman, host: host, podman_bin: fake.bin, timeout_ms: 200]
+      assert Engine.remove(Leg.running_json()["Id"], opts) == {:error, :timeout}
+    end
+
     test "a failed remove keeps the log" do
       root = Path.join(System.tmp_dir!(), "podman-logs-#{System.unique_integer([:positive])}")
       fake = FakePodman.start([{"rm *", [{125, "Error: boom\n"}]}])
