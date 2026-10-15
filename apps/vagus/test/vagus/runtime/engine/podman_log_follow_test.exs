@@ -110,6 +110,41 @@ defmodule Vagus.Runtime.Engine.Podman.LogFollowTest do
     assert List.last(lines) == "3000 " <> filler
   end
 
+  describe "an unfinished last line counts toward tail" do
+    test "one P fragment", %{log: log} do
+      File.write!(
+        log,
+        records([
+          "2026-10-15T18:14:21.0+00:00 stdout F one",
+          "2026-10-15T18:14:21.0+00:00 stdout F two",
+          "2026-10-15T18:14:21.0+00:00 stdout P three"
+        ])
+      )
+
+      {:ok, pid} = Engine.follow_logs("x", self(), [tail: 2] ++ engine(log, nil))
+      assert collect(pid, []) == "two\nthree"
+    end
+
+    test "several P fragments of one line", %{log: log} do
+      File.write!(
+        log,
+        records([
+          "2026-10-15T18:14:21.0+00:00 stdout F one",
+          "2026-10-15T18:14:21.0+00:00 stdout F two",
+          "2026-10-15T18:14:21.0+00:00 stdout P thr",
+          "2026-10-15T18:14:21.0+00:00 stdout P e",
+          "2026-10-15T18:14:21.0+00:00 stdout P e"
+        ])
+      )
+
+      {:ok, pid} = Engine.follow_logs("x", self(), [tail: 1] ++ engine(log, nil))
+      assert collect(pid, []) == "three"
+
+      {:ok, pid} = Engine.follow_logs("x", self(), [tail: 2] ++ engine(log, nil))
+      assert collect(pid, []) == "two\nthree"
+    end
+  end
+
   test "a tail past 10,000 lines is honoured", %{log: log} do
     File.write!(
       log,

@@ -125,57 +125,73 @@ defmodule Vagus.Runtime.Engine.Podman.LogFollow do
   defp alive?(_none), do: false
 
   # Just after the (tail + 1)th line end back from the end, counting only
-  # `F` records: a `P` record does not end a line. The scan holds one block
-  # and a header at a time, never a record's body, however long it is.
+  # `F` records: a `P` record does not end a line. Whatever follows the last
+  # `F` record (`P` fragments, or a record still being written) is a line
+  # not yet finished, and counts as one. The scan holds one block and a
+  # header at a time, never a record's body, however long it is.
   defp tail_start(_fd, size, 0), do: size
 
-  defp tail_start(fd, size, tail), do: scan_back(fd, size, nil, tail + 1)
+  defp tail_start(fd, size, tail), do: scan_back(fd, size, nil, {tail + 1, :none}, size)
 
   # `next_end` is the newline ending the record that starts after the next
-  # newline found: nil until the last newline, after which is only a record
-  # still being written.
-  defp scan_back(fd, 0, next_end, left), do: first_record(fd, next_end, left)
+  # newline found: nil until the last newline. `count` is the lines still
+  # to pass and whether an unfinished one waits to be counted
+  # (`:unfinished`), was (`:closed`), or none has been seen yet (`:none`).
+  defp scan_back(fd, 0, next_end, count, _size), do: first_record(fd, next_end, count)
 
-  defp scan_back(fd, pos, next_end, left) do
+  defp scan_back(fd, pos, next_end, count, size) do
     from = max(pos - @block_bytes, 0)
     {:ok, block} = :file.pread(fd, from, pos - from)
 
     newlines =
       block |> :binary.matches("\n") |> Enum.map(fn {at, 1} -> from + at end) |> Enum.reverse()
 
-    case count_back(fd, newlines, next_end, left) do
+    case count_back(fd, newlines, next_end, count, size) do
       {:found, start} -> start
-      {next_end, left} -> scan_back(fd, from, next_end, left)
+      {next_end, count} -> scan_back(fd, from, next_end, count, size)
     end
   end
 
-  defp count_back(_fd, [], next_end, left), do: {next_end, left}
+  defp count_back(_fd, [], next_end, count, _size), do: {next_end, count}
 
-  defp count_back(fd, [newline | rest], nil, left), do: count_back(fd, rest, newline, left)
+  # The last newline: bytes after it are a record still being written.
+  defp count_back(fd, [newline | rest], nil, {left, :none}, size) do
+    trailing = if newline < size - 1, do: :unfinished, else: :none
+    count_back(fd, rest, newline, {left, trailing}, size)
+  end
 
-  defp count_back(fd, [newline | rest], next_end, left) do
-    case counted(fd, newline + 1, next_end, left) do
+  defp count_back(fd, [newline | rest], next_end, count, size) do
+    case counted(fd, newline + 1, next_end, count) do
       {:found, _} = found -> found
-      left -> count_back(fd, rest, newline, left)
+      count -> count_back(fd, rest, newline, count, size)
     end
   end
 
-  defp first_record(_fd, nil, _left), do: 0
+  defp first_record(_fd, nil, _count), do: 0
 
-  defp first_record(fd, next_end, left) do
-    case counted(fd, 0, next_end, left) do
+  defp first_record(fd, next_end, count) do
+    case counted(fd, 0, next_end, count) do
       {:found, start} -> start
-      _left -> 0
+      _count -> 0
     end
   end
 
-  defp counted(fd, start, line_end, left) do
+  defp counted(fd, start, line_end, {left, trailing}) do
     cond do
-      not line_end?(fd, start) -> left
-      left == 1 -> {:found, line_end + 1}
-      true -> left - 1
+      not line_end?(fd, start) ->
+        {left, if(trailing == :closed, do: :closed, else: :unfinished)}
+
+      # The unfinished line after this one is counted first.
+      trailing == :unfinished ->
+        counted_line(left - 1, line_end)
+
+      true ->
+        counted_line(left, line_end)
     end
   end
+
+  defp counted_line(1, line_end), do: {:found, line_end + 1}
+  defp counted_line(left, _line_end), do: {left - 1, :closed}
 
   @header_bytes 128
 
