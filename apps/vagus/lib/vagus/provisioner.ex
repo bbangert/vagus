@@ -563,7 +563,7 @@ defmodule Vagus.Provisioner do
   @spec default_cmd(String.t(), [String.t()]) :: {String.t(), non_neg_integer()}
   def default_cmd(bin, args), do: Vagus.Host.Cmd.run(bin, args)
 
-  defp default_ping, do: Vagus.Runtime.Docker.ping()
+  defp default_ping, do: Vagus.Runtime.Engine.ready()
 
   defp default_installed, do: Vagus.Core.Versions.installed()
 

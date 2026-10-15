@@ -1,7 +1,10 @@
 defmodule Vagus.Runtime.Engine.Fake do
   @moduledoc """
   In-memory `Vagus.Runtime.Engine`, one instance per test: pass
-  `engine: Vagus.Runtime.Engine.Fake, fake: pid` in a call's opts.
+  `engine: Vagus.Runtime.Engine.Fake, fake: pid` in a call's opts. Code that
+  takes no per-call opts (the router) reaches it through
+  `config :vagus, engine: Fake, engine_fake: pid` instead, which is global:
+  only `async: false` tests may use it.
 
   Creating from an image the fake does not hold, or onto a bridge never
   `ensure_network`ed, is `{:failed, :create, :image_not_found |
@@ -36,6 +39,26 @@ defmodule Vagus.Runtime.Engine.Fake do
     Agent.start_link(fn ->
       %{images: MapSet.new(), containers: %{}, networks: MapSet.new(), fail: %{}, calls: []}
     end)
+  end
+
+  @doc "A fake that callers without per-call opts reach through app env; restored on exit."
+  def start_global do
+    fake = start()
+    keys = [:engine, :engine_fake]
+    previous = for key <- keys, do: {key, Application.fetch_env(:vagus, key)}
+    Application.put_env(:vagus, :engine, __MODULE__)
+    Application.put_env(:vagus, :engine_fake, fake)
+
+    ExUnit.Callbacks.on_exit(fn ->
+      for {key, value} <- previous do
+        case value do
+          {:ok, value} -> Application.put_env(:vagus, key, value)
+          :error -> Application.delete_env(:vagus, key)
+        end
+      end
+    end)
+
+    fake
   end
 
   def put_image(fake, ref), do: Agent.update(fake, &%{&1 | images: MapSet.put(&1.images, ref)})
@@ -257,7 +280,7 @@ defmodule Vagus.Runtime.Engine.Fake do
   end
 
   defp call(opts, verb, args, fun) do
-    fake = Keyword.fetch!(opts, :fake)
+    fake = opts[:fake] || Application.fetch_env!(:vagus, :engine_fake)
 
     Agent.get_and_update(fake, fn s ->
       case pop_failure(%{s | calls: [{verb, args} | s.calls]}, verb) do

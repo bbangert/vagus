@@ -1,135 +1,93 @@
 defmodule Vagus.Core.ConfigCheckTest do
-  @moduledoc """
-  Hermetic, FakeEngine-driven tests for `POST /core/check`'s real
-  implementation (audit G3) — same fake-unix-socket-daemon pattern
-  `Vagus.Core.LifecycleTest` uses, since `ConfigCheck.check/1` drives the
-  same `Vagus.Runtime.Docker` client.
-  """
-  use ExUnit.Case, async: false
+  use ExUnit.Case, async: true
 
   alias Vagus.Core.{ConfigCheck, Container}
-  alias Vagus.Test.FakeEngine
+  alias Vagus.Runtime.Engine.Fake
 
-  defp framed(payload, stream \\ 1), do: <<stream, 0, 0, 0, byte_size(payload)::32>> <> payload
+  @argv ~w(python3 -m homeassistant -c /config --script check_config)
 
-  defp inspect_body(running), do: %{"State" => %{"Running" => running}}
-
-  defp start_engine(responses) do
-    engine = FakeEngine.start(responses)
-    on_exit(fn -> FakeEngine.stop(engine) end)
-    engine
+  defp engine(state, exec \\ nil) do
+    fake = Fake.start()
+    if state, do: Fake.put_container(fake, Container.name(), state: state, exec: exec)
+    {fake, [engine: Fake, fake: fake]}
   end
 
   describe "Core not running" do
-    test "no container at all (404 inspect) -> {:not_running, message}" do
-      engine = start_engine([{404, %{"message" => "No such container: homeassistant"}}])
+    test "no container at all -> {:not_running, message}" do
+      {fake, opts} = engine(nil)
 
-      assert {:not_running, message} = ConfigCheck.check(docker: [socket: engine.socket])
+      assert {:not_running, message} = ConfigCheck.check(engine_opts: opts)
       assert message =~ "not running"
-
-      assert [%{method: :get, path: "/containers/homeassistant/json"}] =
-               FakeEngine.requests(engine)
+      assert [{:inspect, [_]}] = Fake.calls(fake)
     end
 
     test "container exists but stopped -> {:not_running, message}, no exec attempted" do
-      engine = start_engine([{200, inspect_body(false)}])
+      for state <- [:created, :exited] do
+        {fake, opts} = engine(state)
 
-      assert {:not_running, message} = ConfigCheck.check(docker: [socket: engine.socket])
-      assert message =~ "not running"
-      assert [%{method: :get}] = FakeEngine.requests(engine)
+        assert {:not_running, _message} = ConfigCheck.check(engine_opts: opts)
+        assert [{:inspect, [_]}] = Fake.calls(fake)
+      end
     end
 
     test "a genuine inspect failure surfaces as {:error, reason}" do
-      engine = start_engine([{500, %{"message" => "daemon exploded"}}])
+      {fake, opts} = engine(:running)
+      Fake.fail_next(fake, :inspect, {:failed, :inspect, "daemon exploded"})
 
-      assert {:error, {:http, 500, _message}} = ConfigCheck.check(docker: [socket: engine.socket])
+      assert ConfigCheck.check(engine_opts: opts) ==
+               {:error, {:failed, :inspect, "daemon exploded"}}
     end
   end
 
-  describe "Core running — check_config exec" do
-    test "a check that outlasts its deadline is {:error, :deadline}, with nothing polled after" do
-      # Long enough for the three requests to have been sent.
-      Application.put_env(:vagus, :core_check_deadline_ms, 500)
-      on_exit(fn -> Application.delete_env(:vagus, :core_check_deadline_ms) end)
-
-      engine =
-        start_engine([
-          {200, inspect_body(true)},
-          {201, %{"Id" => "exec-1"}},
-          {200, framed("Testing configuration at /config\n"), delay: 2_000}
-        ])
-
-      assert ConfigCheck.check(docker: [socket: engine.socket]) == {:error, :deadline}
-      assert length(FakeEngine.requests(engine)) == 3
+  describe "Core live — check_config exec" do
+    # Live, so not `:not_running`; the engine then refuses the exec itself.
+    test "paused or restarting is live: the exec is attempted and its refusal surfaces" do
+      for state <- [:paused, :restarting] do
+        {fake, opts} = engine(state, {0, "Success!\n"})
+        assert {:error, {:failed, :exec, _}} = ConfigCheck.check(engine_opts: opts)
+        assert {:exec, [_, @argv]} = List.last(Fake.calls(fake))
+      end
     end
 
-    test "exit 0, clean log -> :valid" do
-      output = framed("Testing configuration at /config\nSuccess!\n")
+    test "a check that outlasts its deadline is {:error, :timeout}" do
+      {fake, opts} = engine(:running, {0, "Success!\n"})
+      Fake.delay_next(fake, :exec, 1_000)
 
-      engine =
-        start_engine([
-          {200, inspect_body(true)},
-          {201, %{"Id" => "exec-1"}},
-          {200, output},
-          {200, %{"Running" => false, "ExitCode" => 0}}
-        ])
-
-      assert :valid = ConfigCheck.check(docker: [socket: engine.socket])
-
-      requests = FakeEngine.requests(engine)
-      assert Enum.map(requests, & &1.method) == [:get, :post, :post, :get]
-      assert Enum.at(requests, 1).path == "/containers/#{Container.name()}/exec"
-
-      assert Enum.at(requests, 1).body["Cmd"] == [
-               "/bin/sh",
-               "-c",
-               "python3 -m homeassistant -c /config --script check_config"
-             ]
+      assert ConfigCheck.check(engine_opts: [timeout_ms: 500] ++ opts) == {:error, :timeout}
     end
 
-    test "nonzero exit -> {:invalid, log}, log is the demuxed+ANSI-stripped output" do
+    test "exit 0, clean log -> :valid, check_config exec'd as a direct argv" do
+      {fake, opts} = engine(:running, {0, "Testing configuration at /config\nSuccess!\n"})
+
+      assert :valid = ConfigCheck.check(engine_opts: opts)
+      assert [{:inspect, [name]}, {:exec, [name, @argv]}] = Fake.calls(fake)
+      assert name == Container.name()
+    end
+
+    test "nonzero exit -> {:invalid, log}, log is the ANSI-stripped output" do
       colored = "\e[31mFailed config\e[0m\nsome.yaml: invalid key 'foo'\n"
-      output = framed(colored, 2)
+      {_fake, opts} = engine(:running, {1, colored})
 
-      engine =
-        start_engine([
-          {200, inspect_body(true)},
-          {201, %{"Id" => "exec-2"}},
-          {200, output},
-          {200, %{"Running" => false, "ExitCode" => 1}}
-        ])
-
-      assert {:invalid, log} = ConfigCheck.check(docker: [socket: engine.socket])
-      assert log == "Failed config\nsome.yaml: invalid key 'foo'\n"
-      refute log =~ "\e["
+      assert ConfigCheck.check(engine_opts: opts) ==
+               {:invalid, "Failed config\nsome.yaml: invalid key 'foo'\n"}
     end
 
     test "exit 0 but the log carries the yaml-error marker -> {:invalid, log} (two-way fix)" do
-      output = framed("homeassistant.util.yaml.loader: while parsing a block mapping\n")
+      # Upstream's own check occasionally exits 0 even when the parser
+      # logged a yaml error — the log match is what actually decides.
+      output = "homeassistant.util.yaml.loader: while parsing a block mapping\n"
+      {_fake, opts} = engine(:running, {0, output})
 
-      engine =
-        start_engine([
-          {200, inspect_body(true)},
-          {201, %{"Id" => "exec-3"}},
-          {200, output},
-          # Upstream's own check occasionally exits 0 even when the parser
-          # logged a yaml error — the log match is what actually decides.
-          {200, %{"Running" => false, "ExitCode" => 0}}
-        ])
-
-      assert {:invalid, log} = ConfigCheck.check(docker: [socket: engine.socket])
+      assert {:invalid, log} = ConfigCheck.check(engine_opts: opts)
       assert log =~ "homeassistant.util.yaml"
     end
 
-    test "an exec failure (e.g. create_exec 500) surfaces as {:error, reason}" do
-      engine =
-        start_engine([
-          {200, inspect_body(true)},
-          {500, %{"message" => "no such container"}}
-        ])
+    test "an exec failure surfaces as {:error, reason}" do
+      {fake, opts} = engine(:running)
+      Fake.fail_next(fake, :exec, {:failed, :exec, "no such container"})
 
-      assert {:error, {:exec_create_failed, 500, _message}} =
-               ConfigCheck.check(docker: [socket: engine.socket])
+      assert ConfigCheck.check(engine_opts: opts) ==
+               {:error, {:failed, :exec, "no such container"}}
     end
   end
 end

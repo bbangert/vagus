@@ -189,6 +189,17 @@ defmodule Vagus.Runtime.Engine.DockerContractTest.Leg do
     [{200, live ++ [core_summary()]}, {200, live ++ [y_summary(), core_summary()]}]
   end
 
+  # moby keeps State.Running true while paused or restarting.
+  defp script({:live, state}) do
+    raw =
+      running_json()
+      |> put_in(["State", "Status"], to_string(state))
+      |> put_in(["State", "Paused"], state == :paused)
+      |> put_in(["State", "Restarting"], state == :restarting)
+
+    [{200, raw}]
+  end
+
   defp script({:remove_live, state}) do
     message =
       if state == :running,

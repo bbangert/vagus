@@ -82,11 +82,10 @@ defmodule Vagus.Core.Watchdog.Probe do
       `fn -> Vagus.Core.Lifecycle.restart() end`.
     * `:rebuild` — zero-arity `-> :ok | {:error, term()}`, default
       `fn -> Vagus.Core.Lifecycle.rebuild() end`.
-    * `:running_check` — zero-arity `-> boolean`, default inspects
-      `Vagus.Core.Container.name/0` via
-      `Vagus.Runtime.Docker.inspect_container/1` (a paused container still
-      reports `Running: true` — exactly the hung-Core case this probe
-      exists for); any error counts as not running.
+    * `:running_check` — zero-arity `-> boolean`, default `core_alive?/1`:
+      Core's container is alive (`Vagus.Runtime.Engine.Container.alive?/1` —
+      a paused container counts, which is exactly the hung-Core case this
+      probe exists for); any error counts as not running.
     * `:attempt_timeout_ms` — bounds a single restart/rebuild call,
       default `900_000` (15 min — above `Lifecycle`'s own internal 10-min
       health gate, so a slow-but-legitimate op finishes inside it).
@@ -104,7 +103,7 @@ defmodule Vagus.Core.Watchdog.Probe do
 
   alias Vagus.{BoundedCall, Resubscribe}
   alias Vagus.Core.{Container, Health, Lifecycle, TokenStore}
-  alias Vagus.Runtime.Docker
+  alias Vagus.Runtime.Engine
 
   @default_interval 120_000
   # HASS_WATCHDOG_MAX_API_ATTEMPTS: tolerate 1 miss, act on the 2nd.
@@ -149,7 +148,7 @@ defmodule Vagus.Core.Watchdog.Probe do
       check: Keyword.get(opts, :check, fn -> Health.check() end),
       restart: Keyword.get(opts, :restart, fn -> Lifecycle.restart() end),
       rebuild: Keyword.get(opts, :rebuild, fn -> Lifecycle.rebuild() end),
-      running_check: Keyword.get(opts, :running_check, &default_running_check/0),
+      running_check: Keyword.get(opts, :running_check, &core_alive?/0),
       attempt_timeout_ms: Keyword.get(opts, :attempt_timeout_ms, @default_attempt_timeout_ms),
       action_deadline_ms: Keyword.get(opts, :action_deadline_ms, @default_action_deadline_ms),
       misses: 0,
@@ -394,9 +393,11 @@ defmodule Vagus.Core.Watchdog.Probe do
     :exit, _reason -> true
   end
 
-  defp default_running_check do
-    case Docker.inspect_container(Container.name()) do
-      {:ok, %{"State" => %{"Running" => true}}} -> true
+  @doc false
+  @spec core_alive?(keyword()) :: boolean()
+  def core_alive?(engine_opts \\ []) do
+    case Engine.inspect(Container.name(), engine_opts) do
+      {:ok, container} -> Engine.Container.alive?(container)
       _other -> false
     end
   end

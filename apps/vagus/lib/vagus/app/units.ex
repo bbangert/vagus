@@ -12,7 +12,8 @@ defmodule Vagus.App.Units do
   alias Vagus.App.{CoreUnit, Gates, Instances, Steps}
   alias Vagus.App.File, as: AppFile
   alias Vagus.Core.{EventPusher, Events}
-  alias Vagus.Runtime.Docker
+  alias Vagus.Runtime.Engine
+  alias Vagus.Runtime.Engine.Container
 
   @spec all() :: map()
   def all do
@@ -113,17 +114,16 @@ defmodule Vagus.App.Units do
   @doc "The slugs whose container the engine reports running; one listing for the whole boot."
   @spec running(keyword()) :: {:ok, MapSet.t(String.t())} | {:error, term()}
   def running(opts \\ []) do
-    with {:ok, containers} <- Docker.list_containers(opts) do
-      {:ok,
-       MapSet.new(for %{"Names" => names} <- containers, "/addon_" <> slug <- names, do: slug)}
+    with {:ok, containers} <- Engine.list([name_prefix: "addon_"] ++ opts) do
+      {:ok, MapSet.new(for %{name: "addon_" <> slug} <- containers, do: slug)}
     end
   end
 
   @spec running?(String.t(), keyword()) :: boolean() | :unknown
   def running?(slug, opts \\ []) do
-    case Docker.inspect_container("addon_" <> slug, opts) do
-      {:ok, %{"State" => %{"Running" => running}}} -> running == true
-      {:error, {:http, 404, _message}} -> false
+    case Engine.inspect("addon_" <> slug, opts) do
+      {:ok, container} -> Container.alive?(container)
+      {:error, :not_found} -> false
       _unknown -> :unknown
     end
   end

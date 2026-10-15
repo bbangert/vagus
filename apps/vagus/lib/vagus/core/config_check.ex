@@ -19,15 +19,17 @@ defmodule Vagus.Core.ConfigCheck do
   moduledoc, "Deliberate v1 omissions" — the same gap that keeps
   `Vagus.Core.Lifecycle.start/1` from pulling a missing image) to spin one
   up for a single command, so this execs into the RUNNING Core container
-  instead (`Vagus.Runtime.Docker.exec_capture/3`). A stopped Core degrades
+  instead (`Vagus.Runtime.Engine.exec/3`). A stopped Core degrades
   honestly to `{:not_running, message}` rather than either of the old
   bug's two wrong answers.
   """
 
   alias Vagus.Core.Container
-  alias Vagus.Runtime.{Docker, Logs}
+  alias Vagus.Runtime.{Engine, Logs}
 
-  @check_cmd "python3 -m homeassistant -c /config --script check_config"
+  # Exec'd directly: the command has no shell syntax, and the engine
+  # resolves `python3` on the container's PATH as the shell did.
+  @check_argv ~w(python3 -m homeassistant -c /config --script check_config)
   @invalid_marker ~r/homeassistant\.util\.yaml/
   @deadline_ms 300_000
 
@@ -38,8 +40,9 @@ defmodule Vagus.Core.ConfigCheck do
           | {:error, term()}
 
   @doc """
-  Runs the check. `opts[:docker]` threads into every `Vagus.Runtime.Docker`
-  call, same as `Vagus.Core.Lifecycle`.
+  Runs the check. `opts[:engine_opts]` threads into every
+  `Vagus.Runtime.Engine` call; its `:timeout_ms` overrides the check's
+  deadline.
 
     * `:valid` — exit code 0, no yaml-error marker in the log.
     * `{:invalid, log}` — nonzero exit code or the marker matched; `log`
@@ -48,49 +51,39 @@ defmodule Vagus.Core.ConfigCheck do
       the same — the log IS the error detail).
     * `{:not_running, message}` — Core's container is absent or stopped
       (the documented deviation above).
-    * `{:error, reason}` — a genuine Engine-API failure running the check,
-      or `:deadline` when the whole check outlasted its deadline.
+    * `{:error, reason}` — a `Vagus.Runtime.Engine.error()` running the
+      check, `:timeout` when the whole check outlasted its deadline.
   """
   @spec check(keyword()) :: result()
   def check(opts \\ []) do
-    opts = Keyword.put(opts, :docker, with_deadline(docker_opts(opts)))
+    # The check's output is a stream whose pace Core's container sets, so
+    # only a deadline bounds it; past it the command is left to exit in the
+    # container.
+    engine_opts =
+      opts |> Keyword.get(:engine_opts, []) |> Keyword.put_new(:timeout_ms, @deadline_ms)
 
-    case Docker.inspect_container(Container.name(), docker_opts(opts)) do
-      {:ok, info} -> check_running(info, opts)
-      {:error, {:http, 404, _message}} -> not_running()
-      {:error, reason} -> {:error, reason}
-    end
-  end
+    case Engine.inspect(Container.name(), engine_opts) do
+      {:ok, container} ->
+        if Engine.Container.alive?(container), do: run_check(engine_opts), else: not_running()
 
-  defp check_running(info, opts) do
-    if running?(info), do: run_check(opts), else: not_running()
-  end
-
-  defp not_running, do: {:not_running, "cannot run config check while Core is not running"}
-
-  defp run_check(opts) do
-    case Docker.exec_capture(Container.name(), @check_cmd, docker_opts(opts)) do
-      {:ok, %{exit_code: code, output: raw}} ->
-        log = raw |> Logs.demux() |> Logs.strip_ansi()
-        if code == 0 and not Regex.match?(@invalid_marker, log), do: :valid, else: {:invalid, log}
+      {:error, :not_found} ->
+        not_running()
 
       {:error, reason} ->
         {:error, reason}
     end
   end
 
-  defp running?(%{"State" => %{"Running" => running}}), do: running == true
-  defp running?(_info), do: false
+  defp not_running, do: {:not_running, "cannot run config check while Core is not running"}
 
-  defp docker_opts(opts), do: Keyword.get(opts, :docker, [])
+  defp run_check(engine_opts) do
+    case Engine.exec(Container.name(), @check_argv, engine_opts) do
+      {:ok, %{exit_code: code, output: output}} ->
+        log = Logs.strip_ansi(output)
+        if code == 0 and not Regex.match?(@invalid_marker, log), do: :valid, else: {:invalid, log}
 
-  # The check's output is a stream whose pace Core's container sets, so the
-  # client's receive timeout does not bound it. Past the deadline the
-  # connection is closed; the command is left to exit in the container.
-  defp with_deadline(docker) do
-    Keyword.put_new(docker, :deadline, System.monotonic_time(:millisecond) + deadline_ms())
+      {:error, reason} ->
+        {:error, reason}
+    end
   end
-
-  # Tests shorten it.
-  defp deadline_ms, do: Application.get_env(:vagus, :core_check_deadline_ms, @deadline_ms)
 end

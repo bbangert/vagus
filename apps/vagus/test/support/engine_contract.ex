@@ -180,6 +180,7 @@ defmodule Vagus.Test.EngineContract do
      [
        __helpers__(leg),
        __container_tests__(),
+       __live_tests__(),
        __create_tests__(),
        __io_tests__(),
        __exec_tests__(),
@@ -362,28 +363,6 @@ defmodule Vagus.Test.EngineContract do
           assert Engine.restart("ghost", arrange(:absent, ctx)) == {:error, :not_found}
         end
 
-        for state <- [:running, :paused, :restarting] do
-          @tag state: state
-          test "remove with force: false refuses a #{state} container and keeps it", ctx do
-            opts = arrange({:remove_live, ctx.state}, ctx)
-
-            assert {:error, {:failed, :remove, _}} =
-                     Engine.remove("addon_local_x", [force: false] ++ opts)
-
-            assert {:ok, %Container{state: state}} = Engine.inspect("addon_local_x", opts)
-            assert state == ctx.state
-          end
-        end
-
-        for state <- [:paused, :restarting] do
-          @tag state: state
-          test "stop of a #{state} container exits it", ctx do
-            opts = arrange({:stop_live, ctx.state}, ctx)
-            assert Engine.stop("addon_local_x", opts) == :ok
-            assert {:ok, %Container{state: :exited}} = Engine.inspect("addon_local_x", opts)
-          end
-        end
-
         test "remove deletes the container", ctx do
           opts = arrange(:remove, ctx)
           assert Engine.remove("addon_local_y", opts) == :ok
@@ -409,6 +388,45 @@ defmodule Vagus.Test.EngineContract do
 
           assert {:ok, ["addon_local_x", "addon_local_y", "ghost"],
                   [{"addon_local_d", {:failed, :stop, _}}]} = Engine.stop_all(names, 5, opts)
+        end
+      end
+    end
+  end
+
+  @doc false
+  def __live_tests__ do
+    quote do
+      describe "live states (paused, restarting)" do
+        for state <- [:running, :paused, :restarting] do
+          @tag state: state
+          test "remove with force: false refuses a #{state} container and keeps it", ctx do
+            opts = arrange({:remove_live, ctx.state}, ctx)
+
+            assert {:error, {:failed, :remove, _}} =
+                     Engine.remove("addon_local_x", [force: false] ++ opts)
+
+            assert {:ok, %Container{state: state}} = Engine.inspect("addon_local_x", opts)
+            assert state == ctx.state
+          end
+        end
+
+        for state <- [:paused, :restarting] do
+          @tag state: state
+          test "a #{state} container is alive?", ctx do
+            opts = arrange({:live, ctx.state}, ctx)
+            assert {:ok, container} = Engine.inspect("addon_local_x", opts)
+            assert container.state == ctx.state
+            assert Container.alive?(container)
+          end
+        end
+
+        for state <- [:paused, :restarting] do
+          @tag state: state
+          test "stop of a #{state} container exits it", ctx do
+            opts = arrange({:stop_live, ctx.state}, ctx)
+            assert Engine.stop("addon_local_x", opts) == :ok
+            assert {:ok, %Container{state: :exited}} = Engine.inspect("addon_local_x", opts)
+          end
         end
       end
     end
