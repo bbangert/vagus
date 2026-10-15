@@ -110,11 +110,57 @@ defmodule Vagus.Runtime.Engine.Podman.LogFollowTest do
     assert List.last(lines) == "3000 " <> filler
   end
 
-  test "a record longer than one read block is not mistaken for the end", %{log: log} do
+  test "a long record goes out in chunks of at most 64 KiB, each only after an ack",
+       %{log: log} do
     long = String.duplicate("y", 100_000)
     File.write!(log, records(["2026-10-15T18:14:21.0+00:00 stdout F " <> long]))
     {:ok, pid} = Engine.follow_logs("x", self(), engine(log, nil))
-    assert collect(pid, []) == long <> "\n"
+
+    chunks = gated_chunks(pid, [])
+    assert Enum.all?(chunks, &(byte_size(&1) <= 65_536))
+    assert length(chunks) == 2
+    assert IO.iodata_to_binary(chunks) == long <> "\n"
+  end
+
+  test "an unfinished record past 1 MiB goes out as it comes", %{log: log} do
+    conmon = conmon()
+    head = "2026-10-15T18:14:21.0+00:00 stdout F "
+    body = String.duplicate("z", 1_200_000)
+    File.write!(log, "")
+    {:ok, pid} = Engine.follow_logs("x", self(), engine(log, conmon))
+
+    File.write!(log, head <> body, [:append])
+    assert receive_bytes(pid, byte_size(body), []) == body
+
+    File.write!(log, "\n", [:append])
+    assert next_chunk(pid) == "\n"
+    assert :sys.get_state(pid).pending == ""
+  end
+
+  # Each chunk: while it is un-acked, a tick sends nothing more.
+  defp gated_chunks(pid, acc) do
+    receive do
+      {:log_chunk, chunk} ->
+        send(pid, {:tick, :sys.get_state(pid).tick})
+        _ = :sys.get_state(pid)
+        refute_received {:log_chunk, _}
+        Follow.ack(pid)
+        gated_chunks(pid, [chunk | acc])
+
+      :log_eof ->
+        Enum.reverse(acc)
+    after
+      10_000 -> flunk("no :log_eof")
+    end
+  end
+
+  defp receive_bytes(_pid, 0, acc), do: acc |> Enum.reverse() |> IO.iodata_to_binary()
+
+  defp receive_bytes(pid, left, acc) do
+    assert_receive {:log_chunk, chunk}, 10_000
+    assert byte_size(chunk) <= 65_536
+    Follow.ack(pid)
+    receive_bytes(pid, left - byte_size(chunk), [chunk | acc])
   end
 
   defp collect(pid, acc) do

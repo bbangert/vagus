@@ -692,20 +692,27 @@ defmodule Vagus.Runtime.Engine.PodmanContractTest do
       opts = [engine: Engine.Podman, host: host, podman_bin: fake.bin]
       spool = Path.join(root, "storage/tmp")
 
+      # What an interrupted pull left an hour ago, and what a live one is
+      # writing now: only the first may go.
       leak = fn ->
-        File.mkdir_p!(Path.join(spool, "layer-#{System.unique_integer([:positive])}"))
+        dir = Path.join(spool, "layer-#{System.unique_integer([:positive])}")
+        File.mkdir_p!(dir)
+        File.touch!(dir, System.os_time(:second) - 3_600)
       end
+
+      live = Path.join(spool, "live")
+      File.mkdir_p!(live)
 
       leak.()
       :ok = Engine.pull("ghcr.io/vagus/good:1", opts)
-      assert [_] = File.ls!(spool)
+      assert length(File.ls!(spool)) == 2
 
       {:error, {:pull_failed, _}} = Engine.pull("ghcr.io/vagus/bad:1", opts)
-      assert File.ls!(spool) == []
+      assert File.ls!(spool) == ["live"]
 
       leak.()
       assert Engine.pull("ghcr.io/vagus/slow:1", [timeout_ms: 200] ++ opts) == {:error, :timeout}
-      assert File.ls!(spool) == []
+      assert File.ls!(spool) == ["live"]
     end
 
     test "a pull refused at shutdown is :busy" do

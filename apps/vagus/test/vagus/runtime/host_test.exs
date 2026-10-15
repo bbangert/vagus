@@ -254,6 +254,74 @@ defmodule Vagus.Runtime.HostTest do
     end
   end
 
+  describe "clear_spool/1 after a failed pull" do
+    setup ctx do
+      start_host(ctx, spool_quiet_ms: 60_000)
+      %{spool: Path.join(ctx.root, "storage/tmp")}
+    end
+
+    # Every path under `path`, itself included, an hour old.
+    defp age(path) do
+      {_, 0} =
+        System.cmd("find", [
+          path,
+          "-exec",
+          "touch",
+          "-h",
+          "-d",
+          "@#{System.os_time(:second) - 3_600}",
+          "{}",
+          "+"
+        ])
+
+      :ok
+    end
+
+    defp tree(spool, entry, files) do
+      for file <- files do
+        path = Path.join([spool, entry, file])
+        File.mkdir_p!(Path.dirname(path))
+        File.write!(path, "x")
+      end
+
+      Path.join(spool, entry)
+    end
+
+    test "keeps an entry just written", %{spool: spool} = ctx do
+      tree(spool, "live", ["layer"])
+      Host.clear_spool(ctx.name)
+      assert File.ls!(spool) == ["live"]
+    end
+
+    test "removes an entry with nothing written inside for the quiet period",
+         %{spool: spool} = ctx do
+      spool |> tree("leaked", ["a/b/layer", "c"]) |> age()
+      Host.clear_spool(ctx.name)
+      assert File.ls!(spool) == []
+    end
+
+    test "keeps an entry with one recent file deep inside", %{spool: spool} = ctx do
+      entry = tree(spool, "pulling", ["a/b/old", "c"])
+      age(entry)
+      File.write!(Path.join(entry, "a/b/new"), "x")
+      Host.clear_spool(ctx.name)
+      assert File.ls!(spool) == ["pulling"]
+    end
+
+    test "does not follow a symlink, for its age or its removal", %{spool: spool} = ctx do
+      outside = Path.join(ctx.root, "outside")
+      File.mkdir_p!(outside)
+      File.write!(Path.join(outside, "recent"), "x")
+      entry = tree(spool, "linky", ["old"])
+      File.ln_s!(outside, Path.join(entry, "link"))
+      age(entry)
+
+      Host.clear_spool(ctx.name)
+      assert File.ls!(spool) == []
+      assert File.read!(Path.join(outside, "recent")) == "x"
+    end
+  end
+
   # Takes every free permit of `class` with try-style zero waits.
   defp permits(host, class) do
     Stream.repeatedly(fn -> Host.checkout(host, class, 0) end)
@@ -355,6 +423,24 @@ defmodule Vagus.Runtime.HostTest do
       Host.checkin(held)
       _ = :sys.get_state(ctx.name)
       refute_received {Host, _, _}
+    end
+
+    test "a waiter whose Host dies is :unavailable at once, not at its deadline", ctx do
+      start_host(ctx, permits: %{pull: 1, ops: 1, shutdown: 1})
+      {:ok, _held} = Host.checkout(ctx.name, :ops, 0)
+      waiter = Task.async(fn -> Host.checkout(ctx.name, :ops, 60_000) end)
+      await_waiters(ctx.name, :ops, 1)
+
+      old = Process.whereis(ctx.name)
+      Process.exit(old, :kill)
+      assert Task.await(waiter, 5_000) == {:error, :unavailable}
+
+      # The test supervisor restarts it; the new Host serves new requests.
+      assert Enum.find(1..1_000, fn _ ->
+               (Process.whereis(ctx.name) || old) != old or (Process.sleep(5) && false)
+             end)
+
+      assert {:ok, _} = Host.checkout(ctx.name, :ops, 5_000)
     end
 
     test "an unknown class is :badarg and the Host lives on", ctx do

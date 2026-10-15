@@ -90,16 +90,60 @@ defmodule Vagus.Runtime.Host do
   def profile(host \\ nil), do: shared(host)[:profile]
 
   @doc """
-  Empties the pull spools. Only for a holder of the pull permit, and only
-  while a single one exists, so no pull can be using them.
+  Removes the pull spools' stale entries: those with nothing written
+  anywhere inside for `:spool_quiet_ms` (default 2 min). Permits alone
+  cannot prove no pull is writing: a restarted Host forgets its holders,
+  and a holder's podman can outlive the holder by its SIGKILL delay. A
+  live pull writes continuously, so its entry is never stale; one an
+  interrupted pull leaked is. Only while a single pull permit exists.
   """
   @spec clear_spool(atom() | nil) :: :ok
   def clear_spool(host) do
-    with %{spools: spools, pull_permits: 1} <- shared(host) do
-      Enum.each(spools, &empty_dir/1)
+    with %{spools: spools, pull_permits: 1, spool_quiet_ms: quiet_ms} <- shared(host) do
+      cutoff = System.os_time(:second) - div(quiet_ms, 1000)
+      Enum.each(spools, &remove_stale(&1, cutoff))
     end
 
     :ok
+  end
+
+  # sobelow_skip ["Traversal.FileModule"]
+  defp remove_stale(dir, cutoff) do
+    case File.ls(dir) do
+      {:ok, entries} ->
+        for entry <- entries,
+            path = Path.join(dir, entry),
+            newest_mtime(path) < cutoff,
+            do: File.rm_rf(path)
+
+      {:error, _} ->
+        :ok
+    end
+  end
+
+  # lstat, so a symlink counts by its own time and is never followed.
+  # sobelow_skip ["Traversal.FileModule"]
+  defp newest_mtime(path) do
+    case File.lstat(path, time: :posix) do
+      {:ok, %File.Stat{type: :directory, mtime: mtime}} ->
+        case File.ls(path) do
+          {:ok, entries} ->
+            entries
+            |> Enum.map(&newest_mtime(Path.join(path, &1)))
+            |> Enum.max(fn -> mtime end)
+            |> max(mtime)
+
+          {:error, _} ->
+            mtime
+        end
+
+      {:ok, %File.Stat{mtime: mtime}} ->
+        mtime
+
+      # Gone already, or unreadable: never stale enough to remove.
+      {:error, _} ->
+        :infinity
+    end
   end
 
   # sobelow_skip ["Traversal.FileModule"]
@@ -147,29 +191,41 @@ defmodule Vagus.Runtime.Host do
   @spec checkout(atom() | nil, class(), non_neg_integer()) ::
           {:ok, permit()} | {:error, :busy | :shutting_down | :unavailable | :badarg}
   def checkout(host, class, wait_ms) do
-    host = host || __MODULE__
+    case GenServer.whereis(host || __MODULE__) do
+      nil -> {:error, :unavailable}
+      pid -> checkout_from(pid, class, wait_ms)
+    end
+  end
+
+  # Everything goes to this one Host: a restarted Host knows nothing of a
+  # request made to the one before, so its death ends the wait.
+  defp checkout_from(pid, class, wait_ms) do
     ref = make_ref()
+    mon = Process.monitor(pid)
     deadline = System.monotonic_time(:millisecond) + wait_ms
 
     try do
-      GenServer.call(host, {:acquire, class, ref}, max(wait_ms, 1))
+      GenServer.call(pid, {:acquire, class, ref}, max(wait_ms, 1))
     catch
-      :exit, {:timeout, _} -> abandon(host, ref)
+      :exit, {:timeout, _} -> abandon(pid, ref)
       :exit, _ -> {:error, :unavailable}
     else
       :granted ->
-        {:ok, {host, ref}}
+        {:ok, {pid, ref}}
 
       :queued ->
         receive do
-          {__MODULE__, :granted, ^ref} -> {:ok, {host, ref}}
+          {__MODULE__, :granted, ^ref} -> {:ok, {pid, ref}}
           {__MODULE__, :refused, ^ref, reason} -> {:error, reason}
+          {:DOWN, ^mon, :process, _, _} -> {:error, :unavailable}
         after
-          max(deadline - System.monotonic_time(:millisecond), 0) -> abandon(host, ref)
+          max(deadline - System.monotonic_time(:millisecond), 0) -> abandon(pid, ref)
         end
 
       {:error, reason} ->
         {:error, reason}
+    after
+      Process.demonitor(mon, [:flush])
     end
   end
 
@@ -357,7 +413,8 @@ defmodule Vagus.Runtime.Host do
       stats: state.stats,
       profile: state.profile,
       spools: [spool_dir(state.opts), Path.join(run_dir(state.opts), "spool")],
-      pull_permits: state.permits[:pull]
+      pull_permits: state.permits[:pull],
+      spool_quiet_ms: Keyword.get(state.opts, :spool_quiet_ms, 120_000)
     }
 
     if shared != state.published, do: :persistent_term.put({__MODULE__, state.name}, shared)

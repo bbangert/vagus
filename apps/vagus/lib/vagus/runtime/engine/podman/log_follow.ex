@@ -5,8 +5,10 @@ defmodule Vagus.Runtime.Engine.Podman.LogFollow do
 
   The backfill starts `tail` lines before the end, found by scanning back
   from the end a block at a time, so a log of any size costs one block of
-  memory. From there the file streams in blocks of at most 64 KiB, one in
-  flight at a time: nothing more is read until the owner acks. Each
+  memory. From there the file streams in chunks of at most 64 KiB, one in
+  flight at a time: nothing more is read or sent until the owner acks. An
+  unfinished record is held up to 1 MiB; past that its text goes out as it
+  comes, so a runaway line cannot grow the buffer. Each
   k8s-file record (`<RFC3339> <stream> <F|P> <msg>`) becomes plain text; a
   `P` record is a fragment the next record continues. With `timestamps`,
   each line starts `<RFC3339 UTC> `, the form Docker's follow produced.
@@ -24,6 +26,7 @@ defmodule Vagus.Runtime.Engine.Podman.LogFollow do
   @poll_ms 250
   @block_bytes 65_536
   @max_tail 10_000
+  @max_pending 1_048_576
 
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts)
 
@@ -44,10 +47,14 @@ defmodule Vagus.Runtime.Engine.Podman.LogFollow do
       conmon: nil,
       timer: nil,
       tick: nil,
-      # A record not yet ended by its newline, and whether the text sent so
-      # far ends mid-line (after a `P` fragment).
+      # A record not yet ended by its newline; or, once it outgrew
+      # @max_pending, the tag of the record whose text is still arriving.
       pending: "",
+      continuing: nil,
+      # Whether the text so far ends mid-line (after a `P` fragment).
       mid_line?: false,
+      # Rendered text not yet sent.
+      out: "",
       awaiting_ack?: false
     }
 
@@ -77,6 +84,9 @@ defmodule Vagus.Runtime.Engine.Podman.LogFollow do
   def handle_info({:tick, ref}, %{tick: ref, awaiting_ack?: true} = state),
     do: {:noreply, %{state | timer: nil}}
 
+  def handle_info({:tick, ref}, %{tick: ref, out: out} = state) when out != "",
+    do: {:noreply, deliver(%{state | timer: nil})}
+
   # Liveness is checked before the read, so the read after conmon's exit
   # still drains what it wrote last.
   def handle_info({:tick, ref}, %{tick: ref} = state) do
@@ -84,11 +94,12 @@ defmodule Vagus.Runtime.Engine.Podman.LogFollow do
     state = %{state | timer: nil}
 
     case read(state) do
-      {:eof, state} when gone? -> eof(state)
+      {:eof, %{pending: ""} = state} when gone? -> eof(state)
+      {:eof, state} when gone? -> {:noreply, deliver(cut_pending(state))}
       {:eof, state} -> {:noreply, schedule(state, state.poll_ms)}
       # Bytes were read but no line finished: read on.
-      {"", state} -> {:noreply, schedule(state, 0)}
-      {text, state} -> {:noreply, deliver(text, state)}
+      {:data, %{out: ""} = state} -> {:noreply, schedule(state, 0)}
+      {:data, state} -> {:noreply, deliver(state)}
     end
   end
 
@@ -159,15 +170,48 @@ defmodule Vagus.Runtime.Engine.Podman.LogFollow do
   defp read(state) do
     case :file.pread(state.fd, state.offset, @block_bytes) do
       {:ok, data} ->
-        {records, pending} = split(state.pending <> data)
-        {text, mid_line?} = render(records, state.timestamps, state.mid_line?)
-        offset = state.offset + byte_size(data)
-        {text, %{state | offset: offset, pending: pending, mid_line?: mid_line?}}
+        state = consume(data, %{state | offset: state.offset + byte_size(data)})
+        {:data, state}
 
       _eof ->
         {:eof, state}
     end
   end
+
+  # The rest of an oversized record: its text up to the newline.
+  defp consume(data, %{continuing: tag} = state) when tag != nil do
+    case :binary.split(data, "\n") do
+      [text] ->
+        emit(state, text)
+
+      [text, rest] ->
+        state = emit(state, [text, if(tag == "F", do: "\n", else: "")])
+        consume(rest, %{state | continuing: nil, mid_line?: tag == "P"})
+    end
+  end
+
+  defp consume(data, state) do
+    {records, pending} = split(state.pending <> data)
+    {text, mid_line?} = render(records, state.timestamps, state.mid_line?)
+    state = emit(%{state | pending: pending, mid_line?: mid_line?}, text)
+
+    if byte_size(pending) > @max_pending, do: cut_pending(state), else: state
+  end
+
+  # Sends the start of an unfinished record now and reads the rest of it
+  # as plain text.
+  defp cut_pending(%{pending: pending} = state) do
+    case String.split(pending, " ", parts: 4) do
+      [ts, _stream, tag, msg] when tag in ["F", "P"] ->
+        stamp = if state.timestamps and not state.mid_line?, do: [utc(ts), " "], else: []
+        emit(%{state | pending: "", continuing: tag, mid_line?: true}, [stamp, msg])
+
+      _no_header ->
+        emit(%{state | pending: "", continuing: "F", mid_line?: true}, pending)
+    end
+  end
+
+  defp emit(state, text), do: %{state | out: IO.iodata_to_binary([state.out, text])}
 
   defp split(buffer) do
     parts = String.split(buffer, "\n")
@@ -207,9 +251,11 @@ defmodule Vagus.Runtime.Engine.Podman.LogFollow do
     end
   end
 
-  defp deliver(text, state) do
-    send(state.owner, {:log_chunk, text})
-    %{state | awaiting_ack?: true}
+  defp deliver(%{out: out} = state) do
+    size = min(byte_size(out), @block_bytes)
+    <<chunk::binary-size(^size), rest::binary>> = out
+    send(state.owner, {:log_chunk, chunk})
+    %{state | out: rest, awaiting_ack?: true}
   end
 
   defp schedule(state, ms) do
