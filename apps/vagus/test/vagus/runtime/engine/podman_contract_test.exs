@@ -737,6 +737,23 @@ defmodule Vagus.Runtime.Engine.PodmanContractTest do
       assert File.read!(outside) == "keep"
     end
 
+    test "remove by container id deletes the log named for the container" do
+      root = Path.join(System.tmp_dir!(), "podman-logs-#{System.unique_integer([:positive])}")
+
+      fake =
+        FakePodman.start([
+          {"container inspect *", [{0, Leg.inspect_out(Leg.running_json())}]},
+          {"rm *", [{0, ""}]}
+        ])
+
+      host = FakePodman.start_host(fake.bin, root: root)
+      opts = [engine: Engine.Podman, host: host, podman_bin: fake.bin]
+      File.write!(Path.join(root, "logs/addon_local_x.log"), "old lines")
+
+      :ok = Engine.remove(Leg.running_json()["Id"], opts)
+      assert File.ls!(Path.join(root, "logs")) == []
+    end
+
     test "a failed remove keeps the log" do
       root = Path.join(System.tmp_dir!(), "podman-logs-#{System.unique_integer([:positive])}")
       fake = FakePodman.start([{"rm *", [{125, "Error: boom\n"}]}])

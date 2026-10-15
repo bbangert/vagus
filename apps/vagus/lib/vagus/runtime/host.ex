@@ -42,9 +42,13 @@ defmodule Vagus.Runtime.Host do
   @permits %{frugal: %{pull: 1, ops: 2, shutdown: 1}, fast: %{pull: 1, ops: 4, shutdown: 1}}
   # Per container; conmon starts the file over once it would pass this.
   @log_max_bytes %{frugal: 2 * 1_048_576, fast: 8 * 1_048_576}
+  # Container logs live on tmpfs, so they never write the SD card, and lose
+  # nothing by it: the transient store forgets every container at reboot,
+  # so each, Core included, is recreated with the current options and its
+  # previous boot's log is gone either way. Their own tmpfs, so they can
+  # never fill /run, where podman keeps its runroot: a 1 GB board's /run is
+  # only 5% of RAM.
   @log_dir "/run/vagus/logs"
-  # The logs' own tmpfs, so they can never fill /run, where podman keeps its
-  # runroot: a 1 GB board's /run is only 5% of RAM.
   @log_tmpfs_bytes %{frugal: 16 * 1_048_576, fast: 64 * 1_048_576}
   # podman reads a bare number of bytes; it rotates the file past this.
   @events_max_bytes 4 * 1_048_576
@@ -491,45 +495,63 @@ defmodule Vagus.Runtime.Host do
   end
 
   # A Vagus restart within one boot finds the tmpfs already there. A board
-  # that cannot mount it keeps the logs in the plain directory on /run.
+  # that cannot mount it, or whose directory already holds something,
+  # keeps the logs in the plain directory on /run: mounting over files
+  # would hide logs conmon is still writing.
   defp mount_log_tmpfs(opts, profile) do
     dir = log_dir(opts)
 
-    if mounted?(dir, Keyword.get(opts, :mountinfo, "/proc/self/mountinfo")) do
-      :ok
-    else
-      run = Keyword.get(opts, :run, &Vagus.Host.Cmd.run/2)
-      options = "size=#{@log_tmpfs_bytes[profile]},mode=0700,nosuid,nodev,noexec"
-
-      case run.("mount", ["-t", "tmpfs", "-o", options, "tmpfs", dir]) do
-        {_out, 0} ->
-          :ok
-
-        {out, status} ->
-          Logger.warning(
-            "Vagus.Runtime.Host: no tmpfs for #{dir} (#{status}): #{out}; logs stay on /run"
-          )
-      end
+    case mount_at(dir, Keyword.get(opts, :mountinfo, "/proc/self/mountinfo")) do
+      {:ok, "tmpfs"} -> :ok
+      {:ok, fstype} -> keep_plain(dir, "#{fstype} is mounted there")
+      {:error, reason} -> keep_plain(dir, "mountinfo unreadable (#{inspect(reason)})")
+      :none -> mount_if_empty(dir, profile, opts)
     end
   end
 
-  # mountinfo's fifth field is the mount point, with spaces and the like
-  # written as octal escapes.
   # sobelow_skip ["Traversal.FileModule"]
-  defp mounted?(dir, mountinfo) do
-    case File.read(mountinfo) do
-      {:ok, text} ->
-        text
-        |> String.split("\n", trim: true)
-        |> Enum.any?(fn line ->
-          case String.split(line, " ") do
-            [_id, _parent, _dev, _root, point | _] -> unescape(point) == dir
-            _ -> false
-          end
-        end)
+  defp mount_if_empty(dir, profile, opts) do
+    case File.ls(dir) do
+      {:ok, []} ->
+        run = Keyword.get(opts, :run, &Vagus.Host.Cmd.run/2)
+        options = "size=#{@log_tmpfs_bytes[profile]},mode=0700,nosuid,nodev,noexec"
 
-      {:error, _} ->
-        false
+        case run.("mount", ["-t", "tmpfs", "-o", options, "tmpfs", dir]) do
+          {_out, 0} -> :ok
+          {out, status} -> keep_plain(dir, "mount failed (#{status}): #{String.trim(out)}")
+        end
+
+      {:ok, _entries} ->
+        keep_plain(dir, "it already holds logs")
+
+      {:error, reason} ->
+        keep_plain(dir, inspect(reason))
+    end
+  end
+
+  defp keep_plain(dir, why),
+    do: Logger.warning("Vagus.Runtime.Host: no tmpfs for #{dir}: #{why}; logs stay on /run")
+
+  # The fstype of the last mount at `dir`, the one in view. mountinfo's
+  # fifth field is the mount point, with spaces and the like written as
+  # octal escapes; the fstype follows the ` - ` separator.
+  # sobelow_skip ["Traversal.FileModule"]
+  defp mount_at(dir, mountinfo) do
+    with {:ok, text} <- File.read(mountinfo) do
+      text
+      |> String.split("\n", trim: true)
+      |> Enum.flat_map(fn line ->
+        with [fields, after_sep] <- String.split(line, " - ", parts: 2),
+             [_id, _parent, _dev, _root, point | _] <- String.split(fields, " "),
+             true <- unescape(point) == dir,
+             [fstype | _] <- String.split(after_sep, " ") do
+          [fstype]
+        else
+          _ -> []
+        end
+      end)
+      |> List.last()
+      |> then(fn fstype -> if fstype, do: {:ok, fstype}, else: :none end)
     end
   end
 
@@ -665,8 +687,6 @@ defmodule Vagus.Runtime.Host do
 
   defp run_dir(opts), do: Keyword.get(opts, :run_dir, "/run/vagus/podman")
 
-  # On tmpfs: container logs never touch the SD card, and they lose nothing
-  # there, since every container is recreated at each boot anyway.
   defp log_dir(opts), do: Keyword.get(opts, :log_dir, @log_dir)
 
   defp shutting_down?(opts),

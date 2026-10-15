@@ -148,7 +148,8 @@ defmodule Vagus.Runtime.Engine.PodmanLiveTest do
       )
 
     # podman prints the byte cap in decimal units: 2 MiB is 2.097MB.
-    assert String.trim(size) in ["2.097MB", "8.389MB"]
+    cap = Vagus.Runtime.Host.log_config(opts[:host]).max_bytes
+    assert String.trim(size) == %{2_097_152 => "2.097MB", 8_388_608 => "8.389MB"}[cap]
 
     :ok = Engine.start(@x, opts)
     assert wait_for_logs(opts) =~ "line one"

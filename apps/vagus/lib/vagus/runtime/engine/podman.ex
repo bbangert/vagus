@@ -27,6 +27,8 @@ defmodule Vagus.Runtime.Engine.Podman do
 
   import Kernel, except: [inspect: 2]
 
+  require Logger
+
   alias Vagus.Runtime.Engine.{Container, ContainerSpec, NetworkSpec}
   alias Vagus.Runtime.Host
   alias Vagus.Runtime.Podman.{Cmd, Error}
@@ -262,10 +264,14 @@ defmodule Vagus.Runtime.Engine.Podman do
         else: ["rm", "--ignore", "--", name]
 
     with :ok <- valid_name(:remove, name) do
+      # The log is named for the container; a caller holding only its id
+      # (Steps, after a failed start) needs the name looked up first.
+      log_name = if id?(name), do: name_of(name, opts), else: name
+
       case unit(:remove, run(:remove, args, opts, @lifecycle_ms)) do
         result when result in [:ok, {:error, :not_found}] ->
           Host.forget_sample(opts[:host], name)
-          remove_log(Host.log_config(opts[:host]).dir, name)
+          if log_name, do: remove_log(Host.log_config(opts[:host]).dir, log_name)
           :ok
 
         other ->
@@ -282,12 +288,21 @@ defmodule Vagus.Runtime.Engine.Podman do
   defp remove_log(dir, name) do
     path = log_path(dir, name)
 
-    case File.lstat(path) do
-      {:ok, %File.Stat{type: type}} when type in [:regular, :symlink] -> File.rm(path)
-      _ -> :ok
+    with {:ok, %File.Stat{type: type}} when type in [:regular, :symlink] <- File.lstat(path),
+         {:error, reason} <- File.rm(path) do
+      Logger.debug("Vagus.Runtime.Engine.Podman: #{path} not removed (#{Kernel.inspect(reason)})")
     end
 
     :ok
+  end
+
+  defp id?(ref), do: Regex.match?(~r/\A[0-9a-f]{64}\z/, ref)
+
+  defp name_of(id, opts) do
+    case inspect_raw(id, opts) do
+      {:ok, raw} -> trim_name(raw["Name"])
+      {:error, _} -> nil
+    end
   end
 
   defp log_path(dir, name), do: Path.join(dir, name <> ".log")
@@ -341,8 +356,7 @@ defmodule Vagus.Runtime.Engine.Podman do
     end
   end
 
-  # The log is the capped file on tmpfs `render_create/2` points conmon at:
-  # what survives is the newest stretch up to the cap, as since boot.
+  # After a rotation at the cap the file holds only what was written since.
   @impl true
   def logs(name, opts) do
     stamps = if opts[:timestamps], do: ["--timestamps"], else: []
@@ -505,9 +519,8 @@ defmodule Vagus.Runtime.Engine.Podman do
   set, unlimited pids, a private IPC namespace, no injected
   `container=podman` or proxy env, no pull on create, Docker's tmpfs
   options, and on a bridge an `/etc/hosts` built from nothing but the
-  spec's entries. The log goes to `log.dir` (tmpfs: no SD writes, and
-  nothing lost, as every container is recreated each boot), capped at
-  `log.max_bytes`, which podman reads as a number of bytes.
+  spec's entries. The log goes to `log.dir`, capped at `log.max_bytes`,
+  which podman reads as a number of bytes.
 
   A `secret_env` entry renders as a bare `--env NAME`, which podman fills
   from its own environment, so the value stays off the argv. The spec must
@@ -519,35 +532,36 @@ defmodule Vagus.Runtime.Engine.Podman do
     bridge = bridge_name(spec.network)
     pid_host? = spec.pid_mode == "host"
 
-    # podman refuses a hostname inside the host's UTS namespace.
-    # podman refuses an init binary outside a private PID namespace.
-    # On tmpfs and capped; conmon starts the file over past the cap.
-    ["create", "--name", spec.name] ++
-      ~w(--pull=never --pids-limit=-1 --ipc=private --unsetenv=container --http-proxy=false) ++
-      ["--log-driver", "k8s-file", "--log-opt", "path=" <> log_path(log.dir, spec.name)] ++
-      ["--log-opt", "max-size=#{log.max_bytes}"] ++
-      flag("--hostname", if(spec.uts_mode != "host", do: spec.hostname)) ++
-      bool("--interactive", spec.open_stdin) ++
-      env(spec.env, spec.secret_env) ++
-      Enum.flat_map(Enum.sort(spec.labels || %{}), fn {k, v} -> ["--label", "#{k}=#{v}"] end) ++
-      network(bridge, spec.network_aliases) ++
-      dns(bridge, spec) ++
-      hosts(bridge, spec.extra_hosts) ++
-      Enum.flat_map(spec.mounts || [], &["--mount", mount(&1)]) ++
+    Enum.concat([
+      ["create", "--name", spec.name],
+      ~w(--pull=never --pids-limit=-1 --ipc=private --unsetenv=container --http-proxy=false),
+      ["--log-driver", "k8s-file", "--log-opt", "path=" <> log_path(log.dir, spec.name)],
+      ["--log-opt", "max-size=#{log.max_bytes}"],
+      # podman refuses a hostname inside the host's UTS namespace.
+      flag("--hostname", if(spec.uts_mode != "host", do: spec.hostname)),
+      bool("--interactive", spec.open_stdin),
+      env(spec.env, spec.secret_env),
+      Enum.flat_map(Enum.sort(spec.labels || %{}), fn {k, v} -> ["--label", "#{k}=#{v}"] end),
+      network(bridge, spec.network_aliases),
+      dns(bridge, spec),
+      hosts(bridge, spec.extra_hosts),
+      Enum.flat_map(spec.mounts || [], &["--mount", mount(&1)]),
       Enum.flat_map(Enum.sort(spec.tmpfs || %{}), fn {dst, o} ->
         ["--tmpfs", "#{dst}:#{tmpfs(o)}"]
-      end) ++
-      many("--device-cgroup-rule", spec.device_cgroup_rules) ++
-      many("--cap-add", caps(spec)) ++
-      bool("--privileged", spec.privileged) ++
-      bool("--init", spec.init == true and not pid_host?) ++
-      flag("--oom-score-adj", spec.oom_score_adj && to_string(spec.oom_score_adj)) ++
-      many("--security-opt", spec.security_opt) ++
-      flag("--restart", restart(spec.restart)) ++
-      if(bridge, do: publish(spec.ports), else: []) ++
-      flag("--pid", spec.pid_mode) ++
-      flag("--uts", spec.uts_mode) ++
+      end),
+      many("--device-cgroup-rule", spec.device_cgroup_rules),
+      many("--cap-add", caps(spec)),
+      bool("--privileged", spec.privileged),
+      # podman refuses an init binary outside a private PID namespace.
+      bool("--init", spec.init == true and not pid_host?),
+      flag("--oom-score-adj", spec.oom_score_adj && to_string(spec.oom_score_adj)),
+      many("--security-opt", spec.security_opt),
+      flag("--restart", restart(spec.restart)),
+      if(bridge, do: publish(spec.ports), else: []),
+      flag("--pid", spec.pid_mode),
+      flag("--uts", spec.uts_mode),
       ["--", spec.image | spec.cmd || []]
+    ])
   end
 
   defp env(nil, _secret), do: []

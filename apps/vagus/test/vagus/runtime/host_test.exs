@@ -14,6 +14,12 @@ defmodule Vagus.Runtime.HostTest do
     %{root: root, name: :"host_#{System.unique_integer([:positive])}"}
   end
 
+  defp mountinfo(root, lines) do
+    path = Path.join(root, "mountinfo-#{System.unique_integer([:positive])}")
+    File.write!(path, lines)
+    path
+  end
+
   defp meminfo(root, kb) do
     path = Path.join(root, "meminfo-#{kb}")
     File.write!(path, "MemTotal:       #{kb} kB\nMemFree:        1000 kB\n")
@@ -33,7 +39,7 @@ defmodule Vagus.Runtime.HostTest do
       socket_dir: Path.join(ctx.root, "run/supervisor"),
       resolv_conf: Path.join(ctx.root, "resolv.conf"),
       log_dir: Path.join(ctx.root, "run/vagus/logs"),
-      mountinfo: Path.join(ctx.root, "no-mountinfo"),
+      mountinfo: mountinfo(ctx.root, ""),
       name_servers: fn -> [{192, 168, 2, 1}] end,
       run: fn bin, args ->
         send(test, {:step, {bin, args}})
@@ -161,6 +167,7 @@ defmodule Vagus.Runtime.HostTest do
       dir = Path.join(ctx.root, "run/vagus/logs")
       args = ["-t", "tmpfs", "-o", "size=16777216," <> @opts, "tmpfs", dir]
       assert_receive {:step, {"mount", ^args}}, 5_000
+      refute_received {:step, {"mount", ["-t" | _]}}
     end
 
     test "is 64 MiB on fast", ctx do
@@ -174,16 +181,53 @@ defmodule Vagus.Runtime.HostTest do
     # (a space in the path is written there as \040).
     test "is not mounted again over itself", ctx do
       dir = Path.join(ctx.root, "run/vagus/log s")
-      mountinfo = Path.join(ctx.root, "mountinfo")
 
-      File.write!(mountinfo, """
-      22 1 0:21 / /run rw,nosuid,nodev,noexec - tmpfs tmpfs rw,size=48000k,mode=755
-      95 22 0:52 / #{String.replace(dir, " ", "\\040")} rw,nosuid,nodev,noexec - tmpfs tmpfs rw,size=16384k,mode=700
-      """)
+      mountinfo =
+        mountinfo(ctx.root, """
+        22 1 0:21 / /run rw,nosuid,nodev,noexec - tmpfs tmpfs rw,size=48000k,mode=755
+        95 22 0:52 / #{String.replace(dir, " ", "\\040")} rw,nosuid,nodev,noexec - tmpfs tmpfs rw,size=16384k,mode=700
+        """)
 
       start_host(ctx, log_dir: dir, mountinfo: mountinfo)
       assert_receive {:step, {"mount", ["--make-rshared", "/"]}}, 5_000
       refute_received {:step, {"mount", ["-t", "tmpfs" | _]}}
+    end
+
+    # Each of these keeps the plain directory and says why.
+    defp refuses_to_mount(ctx, extra) do
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert start_host(ctx, extra) == :ok
+          assert_receive {:step, {"mount", ["--make-rshared", "/"]}}, 5_000
+          refute_received {:step, {"mount", ["-t" | _]}}
+        end)
+
+      assert log =~ "logs stay on /run"
+      log
+    end
+
+    test "not when mountinfo cannot be read", ctx do
+      log = refuses_to_mount(ctx, mountinfo: Path.join(ctx.root, "no-mountinfo"))
+      assert log =~ "mountinfo unreadable"
+    end
+
+    test "not over another filesystem mounted there", ctx do
+      dir = Path.join(ctx.root, "run/vagus/logs")
+
+      info =
+        mountinfo(ctx.root, """
+        95 22 0:52 / #{dir} rw,relatime - ext4 /dev/mmcblk0p7 rw
+        """)
+
+      assert refuses_to_mount(ctx, mountinfo: info) =~ "ext4 is mounted there"
+    end
+
+    test "not over a directory that already holds logs", ctx do
+      dir = Path.join(ctx.root, "run/vagus/logs")
+      File.mkdir_p!(dir)
+      File.write!(Path.join(dir, "addon_local_x.log"), "live lines")
+      assert refuses_to_mount(ctx, []) =~ "already holds logs"
+      assert File.read!(Path.join(dir, "addon_local_x.log")) == "live lines"
     end
 
     test "a failed mount leaves the plain directory and a ready Host", ctx do
