@@ -6,8 +6,9 @@ defmodule Vagus.App.StepsTest do
   alias Vagus.Addon.Config
   alias Vagus.App.Steps
 
+  alias Vagus.Runtime.Engine.Fake
+
   alias Vagus.App.StepsTest.{
-    DockerSpy,
     FakeBackend,
     PanelSpy,
     RaisingBackend,
@@ -424,6 +425,12 @@ defmodule Vagus.App.StepsTest do
     config
   end
 
+  defp engine(containers) do
+    fake = Fake.start()
+    for {name, attrs} <- containers, do: Fake.put_container(fake, name, attrs)
+    {fake, [engine: Fake, fake: fake]}
+  end
+
   defp input(context, extra \\ %{}) do
     Map.merge(
       %{
@@ -516,6 +523,26 @@ defmodule Vagus.App.StepsTest do
       assert_received {:create, spec}
       assert spec.ports == %{"80/tcp" => 9090}
       assert spec.platform == "linux/amd64" or is_binary(spec.platform)
+    end
+
+    test "a bridged app's address and healthcheck come from the engine's inspect", ctx do
+      bridged = test_config(%{"host_network" => false})
+
+      {_fake, engine_opts} =
+        engine(%{
+          "fake-id" => [
+            ips: %{"hassio" => "172.30.33.9", "bridge" => "172.17.0.2"},
+            healthcheck: %{test: ["CMD", "true"]}
+          ]
+        })
+
+      assert {:ok, %{ip: "172.30.33.9", healthcheck: true}} =
+               Steps.run(:start, input(ctx, %{config: bridged, engine_opts: engine_opts}))
+
+      {_fake, engine_opts} = engine(%{"fake-id" => [ips: %{"hassio" => "172.30.33.9"}]})
+
+      assert {:ok, %{ip: nil, healthcheck: false}} =
+               Steps.run(:start, input(ctx, %{engine_opts: engine_opts}))
     end
 
     test "a native app answers on the supervisor anchor", ctx do
@@ -667,13 +694,13 @@ defmodule Vagus.App.StepsTest do
          ctx do
       strict = Map.put(input(ctx), :strict, true)
 
-      for ok <- [:ok, {:error, {:http, 404}}] do
+      for ok <- [:ok, {:error, :not_found}] do
         :persistent_term.put({FakeBackend, :stop}, fn -> ok end)
         assert {:ok, %{was_running: true}} = Steps.run(:stop, strict)
         assert_received {:remove, "addon_test_app"}
       end
 
-      for failure <- [{:http, 500}, :econnrefused] do
+      for failure <- [{:failed, :stop, "boom"}, :unavailable] do
         :persistent_term.put({FakeBackend, :stop}, fn -> {:error, failure} end)
 
         log = capture_log(fn -> assert {:error, ^failure} = Steps.run(:stop, strict) end)
@@ -735,24 +762,30 @@ defmodule Vagus.App.StepsTest do
   describe "exec_hook and snapshot" do
     @describetag :tmp_dir
 
-    test "exec_hook runs the command in the app's container", ctx do
-      assert {:ok, :ok} =
-               Steps.run(:exec_hook, input(ctx, %{cmd: "dump-db", docker: DockerSpy}))
+    test "exec_hook runs the command through a shell in the app's container", ctx do
+      {fake, engine_opts} = engine(%{"addon_test_app" => [exec: {0, ""}]})
+      hook = input(ctx, %{cmd: "dump-db", engine_opts: engine_opts})
 
-      assert_received {:exec, "addon_test_app", "dump-db"}
+      assert {:ok, :ok} = Steps.run(:exec_hook, hook)
+      assert {:exec, ["addon_test_app", ["/bin/sh", "-c", "dump-db"]]} in Fake.calls(fake)
+      # Detached: a hook's output is never read, only its exit code.
+      assert {:exec, opts} = List.keyfind(Fake.call_opts(fake), :exec, 0)
+      assert opts[:capture] == false
 
-      assert {:error, {:exec, 3}} =
-               Steps.run(:exec_hook, input(ctx, %{cmd: "fail 3", docker: DockerSpy}))
+      Fake.put_container(fake, "addon_test_app", exec: {3, "ignored"})
+      assert {:error, {:exec, 3}} = Steps.run(:exec_hook, hook)
 
-      assert {:error, {:exec_create_failed, 409, _}} =
-               Steps.run(:exec_hook, input(ctx, %{cmd: "status 409", docker: DockerSpy}))
+      Fake.fail_next(fake, :exec, {:failed, :exec, "refused"})
+      assert {:error, {:failed, :exec, "refused"}} = Steps.run(:exec_hook, hook)
     end
 
     test "exec_hook with no container skips the hook", ctx do
+      {_fake, engine_opts} = engine(%{})
+
       log =
         capture_log(fn ->
           assert {:ok, :skipped} =
-                   Steps.run(:exec_hook, input(ctx, %{cmd: "status 404", docker: DockerSpy}))
+                   Steps.run(:exec_hook, input(ctx, %{cmd: "dump-db", engine_opts: engine_opts}))
         end)
 
       assert log =~ "no container addon_test_app; backup hook skipped"
@@ -958,6 +991,21 @@ defmodule Vagus.App.StepsTest do
   describe "remove_app" do
     @describetag :tmp_dir
 
+    test "removes the app's image through the backend, tolerating a refusal", ctx do
+      image = "homeassistant/amd64-addon-test:3"
+
+      assert {:ok, :ok} = Steps.run(:remove_app, input(ctx, %{arch: "amd64"}))
+      assert_received {:remove_image, ^image}
+
+      log =
+        capture_log(fn ->
+          assert {:ok, :ok} =
+                   Steps.run(:remove_app, input(ctx, %{arch: "amd64", backend: RefusingBackend}))
+        end)
+
+      assert log =~ "remove image #{image} failed (tolerated): :in_use"
+    end
+
     test "removes the data dir and pushes the panel DELETE for an ingress app", ctx do
       :persistent_term.put({PanelSpy, :pid}, self())
       data_dir = Path.join([ctx.data_root, "addons", "data", "test_app"])
@@ -1064,16 +1112,6 @@ defmodule Vagus.App.StepsTest do
   defmodule RaisingBackend do
     @moduledoc false
     def remove_image(_image, _opts), do: raise("no images here")
-  end
-
-  defmodule DockerSpy do
-    @moduledoc false
-    def exec(_id, "fail " <> code, _opts), do: {:error, {:exec, String.to_integer(code)}}
-
-    def exec(_id, "status " <> status, _opts),
-      do: {:error, {:exec_create_failed, String.to_integer(status), "refused"}}
-
-    def exec(id, cmd, _opts), do: send(self(), {:exec, id, cmd}) && :ok
   end
 
   defmodule PanelSpy do

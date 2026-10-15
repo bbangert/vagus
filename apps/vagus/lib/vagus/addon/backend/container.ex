@@ -1,11 +1,11 @@
 defmodule Vagus.Addon.Backend.Container do
   @moduledoc """
-  The Docker/balena-engine `Vagus.Addon.Backend` — translates a runtime-neutral
-  `Vagus.Addon.Backend.Spec` into an Engine-API container config and drives the
-  lifecycle via `Vagus.Runtime.Docker`.
+  The container `Vagus.Addon.Backend`: translates a runtime-neutral
+  `Vagus.Addon.Backend.Spec` into a `Vagus.Runtime.Engine.ContainerSpec` and
+  drives the lifecycle through `Vagus.Runtime.Engine`.
 
-  `build_config/1` is the pure Spec→Docker-JSON translation, and is where the
-  §A1.4 cross-cutting invariants are stamped regardless of the spec:
+  `to_container_spec/1` is that pure translation, and is where the §A1.4
+  cross-cutting invariants are stamped regardless of the spec:
 
     * `Privileged: false` (add-on `privileged:` maps to `CapAdd`, never Docker
       privileged),
@@ -13,46 +13,58 @@ defmodule Vagus.Addon.Backend.Container do
       the spec names a profile),
     * `Labels` always includes `supervisor_managed: ""`,
     * `OomScoreAdj: 200`,
-    * no `RestartPolicy` (the manager owns start/stop),
+    * `RestartPolicy: {Name: ""}`, i.e. never restarted by the engine (the
+      manager owns start/stop),
     * `Domainname: local.hass.io` when a hostname + DNS are set.
   """
 
   @behaviour Vagus.Addon.Backend
 
   alias Vagus.Addon.Backend.Spec
-  alias Vagus.Runtime.Docker
+  alias Vagus.Runtime.Engine
+  alias Vagus.Runtime.Engine.{Container, ContainerSpec}
 
   @oom_score_adj 200
   @managed_label "supervisor_managed"
   @dns_suffix "local.hass.io"
+  @secret_env ["SUPERVISOR_TOKEN", "HASSIO_TOKEN"]
+
+  # Every callback's `opts` reach `Vagus.Runtime.Engine`, with a nested
+  # `:engine_opts` flattened in. Steps passes its own opts to `stop`,
+  # `remove` and `remove_image`; it calls `pull`, `create`, `start` and
+  # `state` with none, so tests give those the engine directly.
 
   @impl true
-  def pull(%Spec{image: image, platform: platform}) do
-    Docker.pull_image(image, platform: platform)
+  def pull(%Spec{image: image, platform: platform}, opts \\ []) do
+    Engine.pull(image, [platform: platform] ++ engine(opts))
   end
 
   @impl true
-  def create(%Spec{} = spec) do
-    Docker.create_container(build_config(spec), name: spec.name)
+  def create(%Spec{} = spec, opts \\ []),
+    do: Engine.create(to_container_spec(spec), engine(opts))
+
+  @impl true
+  def start(id, opts \\ []), do: Engine.start(id, engine(opts))
+
+  @impl true
+  def stop(id, opts \\ []) do
+    case Keyword.pop(engine(opts), :timeout) do
+      {nil, opts} -> Engine.stop(id, opts)
+      {seconds, opts} -> Engine.stop(id, [timeout_s: seconds] ++ opts)
+    end
   end
 
   @impl true
-  def start(id), do: Docker.start_container(id)
+  def remove(id, opts \\ []), do: Engine.remove(id, engine(opts))
 
   @impl true
-  def stop(id, opts \\ []), do: Docker.stop_container(id, opts)
+  def remove_image(image, opts \\ []), do: Engine.remove_image(image, engine(opts))
 
   @impl true
-  def remove(id, opts \\ []), do: Docker.remove_container(id, opts)
-
-  @impl true
-  def remove_image(image, opts \\ []), do: Docker.remove_image(image, opts)
-
-  @impl true
-  def state(id) do
-    case Docker.inspect_container(id) do
-      {:ok, %{"State" => state}} -> {:ok, normalize_state(state)}
-      {:error, {:http, 404, _}} -> {:ok, :unknown}
+  def state(id, opts \\ []) do
+    case Engine.inspect(id, engine(opts)) do
+      {:ok, container} -> {:ok, if(Container.alive?(container), do: :running, else: :stopped)}
+      {:error, :not_found} -> {:ok, :unknown}
       {:error, reason} -> {:error, reason}
     end
   end
@@ -62,48 +74,51 @@ defmodule Vagus.Addon.Backend.Container do
   testing the pinned run-param fidelity without a daemon.
   """
   @spec build_config(Spec.t()) :: map()
-  def build_config(%Spec{} = spec) do
-    host? = spec.network == :host
+  def build_config(%Spec{} = spec),
+    do: spec |> to_container_spec() |> Engine.Docker.render_container()
 
-    %{
-      "Image" => spec.image,
-      "Env" => normalize_env(spec.env),
-      "OpenStdin" => spec.open_stdin,
-      "Labels" => Map.put(spec.labels, @managed_label, ""),
-      "HostConfig" => host_config(spec, host?)
-    }
-    |> maybe_put("Hostname", spec.hostname)
-    |> maybe_put("Domainname", domainname(spec))
-    |> maybe_put("Cmd", spec.cmd)
-    |> maybe_put("ExposedPorts", exposed_ports(spec, host?))
-    |> maybe_put("NetworkingConfig", networking_config(spec, host?))
-  end
+  @spec to_container_spec(Spec.t()) :: ContainerSpec.t()
+  def to_container_spec(%Spec{} = spec) do
+    bridge? = spec.network != :host
+    env = env_pairs(spec.env)
 
-  ## Config builders
-
-  defp host_config(spec, host?) do
-    %{
-      "NetworkMode" => if(host?, do: "host", else: spec.network_name),
-      "Privileged" => false,
-      "Init" => spec.init,
-      "OomScoreAdj" => @oom_score_adj,
-      "SecurityOpt" => security_opt(spec),
-      "RestartPolicy" => %{"Name" => ""},
-      "ExtraHosts" => extra_hosts(spec),
-      "CapAdd" => spec.cap_add,
-      "Dns" => spec.dns,
-      "DnsSearch" => spec.dns_search,
-      "DnsOptions" => spec.dns_options,
-      "Mounts" => Enum.map(spec.mounts, &mount/1),
-      "Tmpfs" => spec.tmpfs,
+    %ContainerSpec{
+      name: spec.name,
+      image: spec.image,
+      cmd: spec.cmd,
+      env: env,
+      secret_env: for({name, _value} <- env, name in @secret_env, do: name),
+      hostname: spec.hostname,
+      domainname: domainname(spec),
+      open_stdin: spec.open_stdin,
+      labels: Map.put(spec.labels, @managed_label, ""),
+      network: if(bridge?, do: {:bridge, spec.network_name}, else: :host),
+      network_aliases: if(bridge? and is_binary(spec.hostname), do: [spec.hostname]),
+      dns: spec.dns,
+      dns_search: spec.dns_search,
+      dns_options: spec.dns_options,
+      extra_hosts: Enum.sort_by(spec.extra_hosts, fn {name, ip} -> "#{name}:#{ip}" end),
+      mounts: Enum.map(spec.mounts, &mount/1),
+      tmpfs: spec.tmpfs,
       # Additive only: these ALLOW nodes the engine's default device policy
       # denies. They cannot revoke anything, which is why an add-on granting
       # nothing still emits the key rather than omitting it.
-      "DeviceCgroupRules" => spec.device_cgroup_rules
+      device_cgroup_rules: spec.device_cgroup_rules,
+      cap_add: spec.cap_add,
+      privileged: false,
+      init: spec.init,
+      oom_score_adj: @oom_score_adj,
+      security_opt: security_opt(spec),
+      restart: :no,
+      ports: spec.ports,
+      pid_mode: spec.pid_mode,
+      uts_mode: spec.uts_mode
     }
-    |> maybe_put("PortBindings", port_bindings(spec, host?))
-    |> maybe_put("PidMode", spec.pid_mode)
-    |> maybe_put("UTSMode", spec.uts_mode)
+  end
+
+  defp engine(opts) do
+    {nested, opts} = Keyword.pop(opts, :engine_opts, [])
+    opts ++ nested
   end
 
   defp security_opt(spec) do
@@ -111,82 +126,23 @@ defmodule Vagus.Addon.Backend.Container do
     Enum.uniq(["seccomp=unconfined" | apparmor])
   end
 
-  defp extra_hosts(spec) do
-    Enum.map(spec.extra_hosts, fn {name, ip} -> "#{name}:#{ip}" end) |> Enum.sort()
-  end
-
   defp domainname(%Spec{hostname: h, dns: dns}) when is_binary(h) and dns != [], do: @dns_suffix
   defp domainname(_), do: nil
 
-  # host-network containers can't publish ports
-  defp exposed_ports(_spec, true), do: nil
-
-  defp exposed_ports(%Spec{ports: ports}, false) when map_size(ports) > 0 do
-    Map.new(ports, fn {port, _host} -> {port, %{}} end)
-  end
-
-  defp exposed_ports(_spec, _), do: nil
-
-  defp port_bindings(_spec, true), do: nil
-
-  defp port_bindings(%Spec{ports: ports}, false) when map_size(ports) > 0 do
-    Map.new(ports, fn {port, host} -> {port, [%{"HostPort" => to_string(host)}]} end)
-  end
-
-  defp port_bindings(_spec, _), do: nil
-
-  defp networking_config(_spec, true), do: nil
-
-  defp networking_config(%Spec{hostname: h, network_name: net}, false) when is_binary(h) do
-    %{"EndpointsConfig" => %{net => %{"Aliases" => [h]}}}
-  end
-
-  defp networking_config(_spec, _), do: nil
-
+  # A mount asking for neither option must carry no `BindOptions`, so
+  # `false` stays unset rather than sent.
   defp mount(m) do
     %{
-      "Type" => "bind",
-      "Source" => m.source,
-      "Target" => m.target,
-      "ReadOnly" => Map.get(m, :read_only, false)
+      type: :bind,
+      source: m.source,
+      target: m.target,
+      read_only: Map.get(m, :read_only, false),
+      propagation: Map.get(m, :propagation),
+      read_only_non_recursive: if(Map.get(m, :read_only_non_recursive), do: true)
     }
-    |> maybe_put("BindOptions", bind_options(m))
   end
 
-  # Omitted entirely when empty: an add-on mount that asks for neither
-  # propagation nor the recursive-ro opt-out must serialize exactly as before,
-  # or every existing mount's JSON changes shape.
-  defp bind_options(m) do
-    %{}
-    |> maybe_put("Propagation", Map.get(m, :propagation))
-    |> maybe_put("ReadOnlyNonRecursive", nilify(Map.get(m, :read_only_non_recursive)))
-    |> case do
-      empty when map_size(empty) == 0 -> nil
-      opts -> opts
-    end
-  end
-
-  # `false` is not worth sending — the engine's default — and `maybe_put` only
-  # drops `nil`.
-  defp nilify(true), do: true
-  defp nilify(_other), do: nil
-
-  defp normalize_env(env) when is_list(env), do: Enum.sort(env)
-
-  defp normalize_env(env) when is_map(env) do
-    env |> Enum.map(fn {k, v} -> "#{k}=#{v}" end) |> Enum.sort()
-  end
-
-  @doc """
-  Normalizes a Docker inspect `"State"` map to a coarse `Backend.state()`.
-  Public for hermetic testing (the daemon-facing `state/1` wraps it).
-  """
-  @spec normalize_state(map()) :: Vagus.Addon.Backend.state()
-  def normalize_state(%{"Running" => true}), do: :running
-  def normalize_state(%{"Restarting" => true}), do: :restarting
-  def normalize_state(%{"Status" => "restarting"}), do: :restarting
-  def normalize_state(_), do: :stopped
-
-  defp maybe_put(map, _key, nil), do: map
-  defp maybe_put(map, key, value), do: Map.put(map, key, value)
+  # `Env` is a sorted list of `K=V` strings, so sort as those (`VAR1=` comes
+  # before `VAR=`, unlike the bare keys).
+  defp env_pairs(env), do: Enum.sort_by(env, fn {k, v} -> "#{k}=#{v}" end)
 end

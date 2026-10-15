@@ -148,7 +148,7 @@ defmodule Vagus.App.Policy do
 
   # A caller's backend, engine client, data root, engine socket and jobs
   # server reach every task step.
-  @engine_overrides [:backend, :docker, :data_root, :socket, :jobs_server]
+  @engine_overrides [:backend, :engine_opts, :data_root, :socket, :jobs_server]
 
   @persisted ~w(config wanted user_options ingress_token ingress_port ingress_panel watchdog ports
                  boot auto_update protected)a

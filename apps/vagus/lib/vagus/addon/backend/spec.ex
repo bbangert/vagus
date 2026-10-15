@@ -38,7 +38,7 @@ defmodule Vagus.Addon.Backend.Spec do
           image: String.t() | nil,
           hostname: String.t() | nil,
           cmd: [String.t()] | nil,
-          env: %{optional(String.t()) => String.t()} | [String.t()],
+          env: %{optional(String.t()) => String.t()},
           network: network(),
           network_name: String.t(),
           extra_hosts: %{optional(String.t()) => String.t()},

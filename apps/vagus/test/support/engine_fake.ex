@@ -9,7 +9,8 @@ defmodule Vagus.Runtime.Engine.Fake do
   Creating from an image the fake does not hold, or onto a bridge never
   `ensure_network`ed, is `{:failed, :create, :image_not_found |
   :network_not_found}`, as `Engine.Docker` reports them.
-  `calls/1` logs each callback as `{verb, args}` without its opts.
+  `calls/1` logs each callback as `{verb, args}`; `call_opts/1` logs the same
+  calls as `{verb, opts}`, without the dispatch keys.
   `fail_next(fake, :stop, e)` also fails the next stop inside `stop_all/3`.
   `delay_next(fake, verb, ms)` makes the next call of `verb` take `ms`: one
   given a smaller `timeout_ms` is `:timeout` and changes nothing; no call
@@ -90,7 +91,19 @@ defmodule Vagus.Runtime.Engine.Fake do
 
   def delay_next(fake, verb, ms), do: fail_next(fake, verb, {:delay, ms})
 
-  def calls(fake), do: Agent.get(fake, &Enum.reverse(&1.calls))
+  def calls(fake),
+    do:
+      Agent.get(
+        fake,
+        &(&1.calls |> Enum.reverse() |> Enum.map(fn {verb, args, _opts} -> {verb, args} end))
+      )
+
+  def call_opts(fake),
+    do:
+      Agent.get(
+        fake,
+        &(&1.calls |> Enum.reverse() |> Enum.map(fn {verb, _args, opts} -> {verb, opts} end))
+      )
 
   def spec(fake, name), do: Agent.get(fake, &get_in(&1, [:containers, name, :spec]))
 
@@ -283,7 +296,9 @@ defmodule Vagus.Runtime.Engine.Fake do
     fake = instance(opts)
 
     Agent.get_and_update(fake, fn s ->
-      case pop_failure(%{s | calls: [{verb, args} | s.calls]}, verb) do
+      entry = {verb, args, Keyword.drop(opts, [:engine, :fake])}
+
+      case pop_failure(%{s | calls: [entry | s.calls]}, verb) do
         {nil, s} ->
           fun.(s)
 

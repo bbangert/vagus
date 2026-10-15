@@ -424,6 +424,10 @@ defmodule Vagus.Runtime.Docker do
     if left_ms(deadline) > 0, do: :ok, else: {:error, conn, :deadline}
   end
 
+  @doc "The receive timeout a request gets when it names none."
+  @spec default_recv_timeout() :: pos_integer()
+  def default_recv_timeout, do: @recv_timeout
+
   @doc "The resolved daemon socket path."
   @spec socket_path() :: String.t()
   def socket_path, do: Application.get_env(:vagus, :docker_socket, @default_socket)

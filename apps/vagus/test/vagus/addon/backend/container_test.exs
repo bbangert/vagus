@@ -41,7 +41,9 @@ defmodule Vagus.Addon.Backend.ContainerTest do
 
     test("OomScoreAdj is 200", %{host: host}, do: assert(host["OomScoreAdj"] == 200))
 
-    test("no restart policy", %{host: host}, do: assert(host["RestartPolicy"] == %{"Name" => ""}))
+    test("RestartPolicy names none, so the engine never restarts it", %{host: host},
+      do: assert(host["RestartPolicy"] == %{"Name" => ""})
+    )
 
     test "supervisor_managed label always present", %{cfg: cfg} do
       assert cfg["Labels"]["supervisor_managed"] == ""
@@ -166,13 +168,95 @@ defmodule Vagus.Addon.Backend.ContainerTest do
     end
   end
 
-  describe "normalize_state/1 (hermetic)" do
-    test "maps Docker inspect State to coarse atoms" do
-      assert Container.normalize_state(%{"Running" => true}) == :running
-      assert Container.normalize_state(%{"Running" => false, "Restarting" => true}) == :restarting
-      assert Container.normalize_state(%{"Status" => "restarting"}) == :restarting
-      assert Container.normalize_state(%{"Running" => false, "Status" => "exited"}) == :stopped
-      assert Container.normalize_state(%{}) == :stopped
+  describe "to_container_spec/1" do
+    # `Env`/`ExtraHosts` are sorted rendered strings, which is not the
+    # bare-key order once a key ends in a character below `=`/`:`.
+    test "env and extra_hosts sort as their rendered strings" do
+      cfg =
+        Container.build_config(
+          mosquitto_spec(
+            env: %{"VAR" => "b", "VAR1" => "a"},
+            extra_hosts: %{"h" => "2.2.2.2", "h-1" => "1.1.1.1"}
+          )
+        )
+
+      assert cfg["Env"] == ["VAR1=a", "VAR=b"]
+      assert cfg["HostConfig"]["ExtraHosts"] == ["h-1:1.1.1.1", "h:2.2.2.2"]
+    end
+
+    test "the tokens are marked secret" do
+      assert Container.to_container_spec(mosquitto_spec()).secret_env ==
+               ["HASSIO_TOKEN", "SUPERVISOR_TOKEN"]
+    end
+  end
+
+  describe "lifecycle on Engine.Fake" do
+    alias Vagus.Runtime.Engine
+    alias Vagus.Runtime.Engine.Fake
+
+    setup do
+      fake = Fake.start()
+      %{fake: fake, opts: [engine: Fake, fake: fake]}
+    end
+
+    test "pull then create renders the container from to_container_spec/1", %{
+      fake: fake,
+      opts: opts
+    } do
+      spec = mosquitto_spec()
+      Engine.ensure_network(%Engine.NetworkSpec{name: "hassio"}, opts)
+
+      assert :ok = Container.pull(spec, opts)
+      assert {:ok, _id} = Container.create(spec, opts)
+      assert Fake.spec(fake, spec.name) == Container.to_container_spec(spec)
+      assert {:pull, ["homeassistant/amd64-addon-mosquitto:7.1.0"]} in Fake.calls(fake)
+    end
+
+    test "state: live is :running, otherwise :stopped, absent is :unknown", %{
+      fake: fake,
+      opts: opts
+    } do
+      for {state, expected} <- [
+            running: :running,
+            paused: :running,
+            restarting: :running,
+            created: :stopped,
+            exited: :stopped
+          ] do
+        Fake.put_container(fake, "addon_x", state: state)
+        assert Container.state("addon_x", opts) == {:ok, expected}, "#{state}"
+      end
+
+      assert Container.state("addon_ghost", opts) == {:ok, :unknown}
+
+      Fake.fail_next(fake, :inspect, :unavailable)
+      assert Container.state("addon_x", opts) == {:error, :unavailable}
+    end
+
+    test "stop maps the backend's :timeout to the engine's grace", %{fake: fake, opts: opts} do
+      Fake.put_container(fake, "addon_x")
+      Fake.delay_next(fake, :stop, 5_000)
+
+      # A 1 s timeout_ms alone would cut the stop; a 3 s grace never is.
+      assert Container.stop("addon_x", [timeout: 3, timeout_ms: 1_000] ++ opts) == :ok
+      assert Container.state("addon_x", opts) == {:ok, :stopped}
+    end
+
+    # Steps passes its own opts, with the engine nested under `:engine_opts`.
+    test "a nested :engine_opts reaches the engine", %{fake: fake, opts: opts} do
+      Fake.put_container(fake, "addon_x")
+      steps_opts = [backend: Container, data_root: "/data", timeout: 1, engine_opts: opts]
+
+      assert Container.stop("addon_x", steps_opts) == :ok
+      assert Container.remove("addon_x", steps_opts) == :ok
+      assert Container.state("addon_x", opts) == {:ok, :unknown}
+    end
+
+    test "stop of an absent container is :not_found; remove and remove_image of absent are :ok",
+         %{opts: opts} do
+      assert Container.stop("addon_ghost", opts) == {:error, :not_found}
+      assert Container.remove("addon_ghost", opts) == :ok
+      assert Container.remove_image("ghcr.io/x/absent:1", opts) == :ok
     end
   end
 
