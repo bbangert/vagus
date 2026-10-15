@@ -52,7 +52,7 @@ defmodule Vagus.Test.FakeEngine do
           {204, nil}
         ])
 
-      Lifecycle.start(docker: [socket: engine.socket])
+      Lifecycle.start(engine_opts: [socket: engine.socket])
 
       assert [%{method: :get, path: "/containers/homeassistant/json"}, %{method: :post}] =
                FakeEngine.requests(engine)

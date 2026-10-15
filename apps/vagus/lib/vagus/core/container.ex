@@ -61,6 +61,8 @@ defmodule Vagus.Core.Container do
 
   alias Vagus.API.Token
   alias Vagus.Network
+  alias Vagus.Runtime.Engine
+  alias Vagus.Runtime.Engine.ContainerSpec
 
   @image_repo "ghcr.io/home-assistant/home-assistant"
   @default_name "homeassistant"
@@ -137,19 +139,37 @@ defmodule Vagus.Core.Container do
     * `:tz` - the `TZ` env value. Defaults to `"UTC"`.
   """
   @spec create_config(String.t(), keyword()) :: map()
-  def create_config(version, opts \\ []) when is_binary(version) do
+  def create_config(version, opts \\ []) when is_binary(version),
+    do: version |> to_container_spec(opts) |> Engine.Docker.render_container()
+
+  @doc """
+  The engine-neutral spec behind `create_config/2`. The fingerprint label is
+  computed over the Docker render without it, so it matches every Core
+  container already stamped.
+  """
+  @spec to_container_spec(String.t(), keyword()) :: ContainerSpec.t()
+  def to_container_spec(version, opts \\ []) when is_binary(version) do
     ip = Network.supervisor_ip()
     token = Keyword.get_lazy(opts, :token, &Token.get/0)
     tz = Keyword.get(opts, :tz, @default_tz)
 
-    spec = %{
-      "Image" => image(version),
-      "Hostname" => @default_name,
-      "Env" => env(ip, token, tz),
-      "HostConfig" => host_config(ip)
+    spec = %ContainerSpec{
+      name: name(),
+      image: image(version),
+      hostname: @default_name,
+      env: env(ip, token, tz),
+      secret_env: ["SUPERVISOR_TOKEN", "HASSIO_TOKEN"],
+      network: :host,
+      privileged: true,
+      oom_score_adj: -300,
+      restart: :unless_stopped,
+      extra_hosts: [{"supervisor", ip}],
+      tmpfs: %{"/tmp" => ""},
+      mounts: mounts()
     }
 
-    Map.put(spec, "Labels", %{@spec_fingerprint_label => spec_fingerprint(spec)})
+    fingerprint = spec |> Engine.Docker.render_container() |> spec_fingerprint()
+    %{spec | labels: %{@spec_fingerprint_label => fingerprint}}
   end
 
   @doc """
@@ -192,25 +212,13 @@ defmodule Vagus.Core.Container do
 
   defp env(ip, token, tz) do
     [
-      "SUPERVISOR=#{ip}",
-      "HASSIO=#{ip}",
-      "SUPERVISOR_TOKEN=#{token}",
-      "HASSIO_TOKEN=#{token}",
-      "SUPERVISOR_CORE_API_SOCKET=#{@socket_path}",
-      "TZ=#{tz}"
+      {"SUPERVISOR", ip},
+      {"HASSIO", ip},
+      {"SUPERVISOR_TOKEN", token},
+      {"HASSIO_TOKEN", token},
+      {"SUPERVISOR_CORE_API_SOCKET", @socket_path},
+      {"TZ", tz}
     ]
-  end
-
-  defp host_config(ip) do
-    %{
-      "NetworkMode" => "host",
-      "Privileged" => true,
-      "OomScoreAdj" => -300,
-      "RestartPolicy" => %{"Name" => "unless-stopped"},
-      "ExtraHosts" => ["supervisor:#{ip}"],
-      "Tmpfs" => %{"/tmp" => ""},
-      "Mounts" => mounts()
-    }
   end
 
   defp mounts do
@@ -219,23 +227,18 @@ defmodule Vagus.Core.Container do
       # anything bind-mounted *under* /dev (e.g. bluetooth device nodes
       # attached after container start) — load-bearing for bluetooth.
       %{
-        "Type" => "bind",
-        "Source" => "/dev",
-        "Target" => "/dev",
-        "ReadOnly" => true,
-        "BindOptions" => %{"ReadOnlyNonRecursive" => true}
+        type: :bind,
+        source: "/dev",
+        target: "/dev",
+        read_only: true,
+        read_only_non_recursive: true
       },
-      %{"Type" => "bind", "Source" => "/run/dbus", "Target" => "/run/dbus", "ReadOnly" => true},
-      %{"Type" => "bind", "Source" => "/run/udev", "Target" => "/run/udev", "ReadOnly" => true},
+      %{type: :bind, source: "/run/dbus", target: "/run/dbus", read_only: true},
+      %{type: :bind, source: "/run/udev", target: "/run/udev", read_only: true},
       # Writable: Core creates its Supervisor socket inside this directory
       # (see the moduledoc's "The Supervisor socket" section).
-      %{
-        "Type" => "bind",
-        "Source" => @socket_dir,
-        "Target" => @socket_dir,
-        "ReadOnly" => false
-      },
-      %{"Type" => "volume", "Source" => "vagus-core-config", "Target" => "/config"}
+      %{type: :bind, source: @socket_dir, target: @socket_dir, read_only: false},
+      %{type: :volume, source: config_volume(), target: "/config"}
     ]
   end
 end

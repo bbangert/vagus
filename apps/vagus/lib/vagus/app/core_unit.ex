@@ -115,6 +115,6 @@ defmodule Vagus.App.CoreUnit do
     kind, reason -> {:error, {kind, reason}}
   end
 
-  defp short_id(%{"Id" => id}) when is_binary(id), do: String.slice(id, 0, 12)
+  defp short_id(%{id: id}) when is_binary(id), do: String.slice(id, 0, 12)
   defp short_id(_info), do: "unknown"
 end

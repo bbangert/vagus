@@ -97,7 +97,7 @@ defmodule Vagus.App.CoreUnitTest do
       test_pid = self()
 
       opts = [
-        adopt: fn -> {:adopted, %{"Id" => "0123456789abcdef"}} end,
+        adopt: fn -> {:adopted, %Vagus.Runtime.Engine.Container{id: "0123456789abcdef"}} end,
         start: fn -> send(test_pid, :started) && :ok end,
         health: fn opts -> send(test_pid, {:health, opts}) && :healthy end,
         deadline: 42
