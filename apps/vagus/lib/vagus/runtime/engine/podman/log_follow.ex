@@ -13,6 +13,18 @@ defmodule Vagus.Runtime.Engine.Podman.LogFollow do
   `P` record is a fragment the next record continues. With `timestamps`,
   each line starts `<RFC3339 UTC> `, the form Docker's follow produced.
 
+  At its cap conmon writes the full file out, then renames a fresh empty
+  file over it (conmon 2.2.1, `reopen_k8s_file`). Every tick stats the
+  path, even while a chunk waits for its ack, and opens each new file at
+  once, so an unlinked one stays readable; up to four wait their turn, the
+  oldest dropped past that. A file is read to its end, by a read made
+  after the replacement was seen, before the next is followed from its
+  start. No line is read twice. Lines are lost only to conmon itself, to a
+  queue overflow, or to a rotation in the last poll interval before conmon
+  exits: once it has, no new file is followed, since only a recreated
+  container could write one. An unfinished record at the end of a replaced
+  file goes out as text, ended with a newline.
+
   The follow ends, after one last read, when conmon has exited: it holds
   the log open for exactly the container's life and has no other observable
   end that costs nothing to check. A container that is absent or not
@@ -21,11 +33,14 @@ defmodule Vagus.Runtime.Engine.Podman.LogFollow do
 
   use GenServer, restart: :temporary
 
+  require Logger
+
   alias Vagus.Runtime.Engine.Podman
 
   @poll_ms 250
   @block_bytes 65_536
   @max_pending 1_048_576
+  @max_queued 4
 
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts)
 
@@ -42,6 +57,10 @@ defmodule Vagus.Runtime.Engine.Podman.LogFollow do
       timestamps: Keyword.get(opts, :timestamps, false),
       poll_ms: Keyword.get(opts, :poll_ms, @poll_ms),
       fd: nil,
+      path: nil,
+      inode: nil,
+      # Replacements opened as they appeared, oldest first, as {fd, inode}.
+      queued: [],
       offset: 0,
       conmon: nil,
       timer: nil,
@@ -64,9 +83,9 @@ defmodule Vagus.Runtime.Engine.Podman.LogFollow do
   def handle_continue(:open, state) do
     with {:ok, %{path: path, conmon_pid: conmon}} <-
            Podman.log_target(state.name, state.engine_opts),
-         {:ok, fd} <- open(path),
-         {:ok, size} <- :file.position(fd, :eof) do
-      state = %{state | fd: fd, conmon: conmon, offset: tail_start(fd, size, state.tail)}
+         {:ok, fd, %File.Stat{inode: inode, size: size}} <- open(path),
+         {:ok, offset} <- tail_start(fd, size, state.tail) do
+      state = %{state | fd: fd, path: path, inode: inode, conmon: conmon, offset: offset}
       {:noreply, schedule(state, 0)}
     else
       _absent -> eof(state)
@@ -79,42 +98,109 @@ defmodule Vagus.Runtime.Engine.Podman.LogFollow do
 
   def handle_info(:log_ack, state), do: {:noreply, schedule(%{state | awaiting_ack?: false}, 0)}
 
-  # A tick from a timer since cancelled carries an older ref.
-  def handle_info({:tick, ref}, %{tick: ref, awaiting_ack?: true} = state),
-    do: {:noreply, %{state | timer: nil}}
-
-  def handle_info({:tick, ref}, %{tick: ref, out: out} = state) when out != "",
-    do: {:noreply, deliver(%{state | timer: nil})}
-
-  # Liveness is checked before the read, so the read after conmon's exit
-  # still drains what it wrote last.
+  # Liveness is checked before the stat and the read, so the read after
+  # conmon's exit still drains what it wrote last. A tick a timer since
+  # cancelled sent carries an older ref and falls through.
   def handle_info({:tick, ref}, %{tick: ref} = state) do
     gone? = not alive?(state.conmon)
     state = %{state | timer: nil}
+    state = if gone?, do: state, else: watch(state)
 
-    case read(state) do
-      {:eof, %{pending: ""} = state} when gone? -> eof(state)
-      {:eof, state} when gone? -> {:noreply, deliver(cut_pending(state))}
-      {:eof, state} -> {:noreply, schedule(state, state.poll_ms)}
-      # Bytes were read but no line finished: read on.
-      {:data, %{out: ""} = state} -> {:noreply, schedule(state, 0)}
-      {:data, state} -> {:noreply, deliver(state)}
+    cond do
+      state.awaiting_ack? -> {:noreply, schedule(state, state.poll_ms)}
+      state.out != "" -> {:noreply, state |> deliver() |> schedule(state.poll_ms)}
+      true -> after_read(read(state), gone?)
     end
   end
 
   def handle_info(_other, state), do: {:noreply, state}
 
+  defp after_read({:data, %{out: ""} = state}, _gone?), do: {:noreply, schedule(state, 0)}
+
+  defp after_read({:data, state}, _gone?),
+    do: {:noreply, state |> deliver() |> schedule(state.poll_ms)}
+
+  # This end-of-file was read after the stat that queued any replacement,
+  # so the old file is whole by now: conmon finishes it before the rename.
+  defp after_read({:eof, %{queued: [{fd, inode} | rest]} = state}, _gone?) do
+    File.close(state.fd)
+    state = state |> end_record() |> Map.merge(%{fd: fd, inode: inode, offset: 0, queued: rest})
+    {:noreply, schedule(state, 0)}
+  end
+
+  defp after_read({:eof, %{pending: ""} = state}, true), do: eof(state)
+  defp after_read({:eof, state}, true), do: {:noreply, deliver(cut_pending(state))}
+  defp after_read({:eof, state}, false), do: {:noreply, schedule(state, state.poll_ms)}
+
+  # A new file at the path is opened at once: conmon may replace it again
+  # before this reader gets to it, and an open file outlives its unlink.
+  defp watch(state) do
+    newest =
+      state.queued |> List.last() |> then(fn q -> if q, do: elem(q, 1), else: state.inode end)
+
+    with {:ok, %File.Stat{inode: inode}} when inode != newest <- File.stat(state.path),
+         {:ok, fd, %File.Stat{inode: opened}} when opened != newest <- open(state.path) do
+      enqueue(state, {fd, opened})
+    else
+      {:ok, fd, _same} ->
+        File.close(fd)
+        state
+
+      _ ->
+        state
+    end
+  end
+
+  defp enqueue(state, entry) do
+    case state.queued ++ [entry] do
+      queued when length(queued) > @max_queued ->
+        [{fd, _} | rest] = queued
+        File.close(fd)
+        Logger.debug("Vagus LogFollow #{state.name}: a rotated log was dropped unread")
+        %{state | queued: rest}
+
+      queued ->
+        %{state | queued: queued}
+    end
+  end
+
+  # A record cut off by the switch ends there, never glued to the next
+  # file's first record. A whole `P` record is not cut off: conmon goes on
+  # with its line in the next file, so `mid_line?` carries over.
+  defp end_record(%{pending: "", continuing: nil} = state), do: state
+
+  defp end_record(%{pending: ""} = state),
+    do: emit(%{state | continuing: nil, mid_line?: false}, "\n")
+
+  defp end_record(state) do
+    state = cut_pending(state)
+    emit(%{state | continuing: nil, mid_line?: false}, "\n")
+  end
+
   # The path comes from podman's inspect of a Vagus container.
   # sobelow_skip ["Traversal.FileModule"]
-  defp open(path) when is_binary(path) and path != "", do: File.open(path, [:read, :binary, :raw])
+  defp open(path) when is_binary(path) and path != "" do
+    with {:ok, fd} <- File.open(path, [:read, :binary, :raw]) do
+      case :file.read_file_info(fd, time: :posix) do
+        {:ok, info} ->
+          {:ok, fd, File.Stat.from_record(info)}
+
+        {:error, _} = error ->
+          File.close(fd)
+          error
+      end
+    end
+  end
+
   defp open(_no_path), do: {:error, :no_log}
 
   # A zombie has exited too. `pid` is an integer from podman's inspect.
   # sobelow_skip ["Traversal.FileModule"]
   defp alive?(pid) when is_integer(pid) and pid > 0 do
     case File.read("/proc/#{pid}/stat") do
+      # The command name may itself hold ") ": the state follows the last.
       {:ok, stat} ->
-        state = stat |> String.split(") ", parts: 2) |> List.last()
+        state = stat |> String.split(") ") |> List.last()
         not String.starts_with?(state, "Z")
 
       {:error, _} ->
@@ -129,9 +215,13 @@ defmodule Vagus.Runtime.Engine.Podman.LogFollow do
   # `F` record (`P` fragments, or a record still being written) is a line
   # not yet finished, and counts as one. The scan holds one block and a
   # header at a time, never a record's body, however long it is.
-  defp tail_start(_fd, size, 0), do: size
+  defp tail_start(_fd, size, 0), do: {:ok, size}
 
-  defp tail_start(fd, size, tail), do: scan_back(fd, size, nil, {tail + 1, :none}, size)
+  defp tail_start(fd, size, tail) do
+    {:ok, scan_back(fd, size, nil, {tail + 1, :none}, size)}
+  catch
+    {:read_failed, reason} -> {:error, reason}
+  end
 
   # `next_end` is the newline ending the record that starts after the next
   # newline found: nil until the last newline. `count` is the lines still
@@ -141,7 +231,14 @@ defmodule Vagus.Runtime.Engine.Podman.LogFollow do
 
   defp scan_back(fd, pos, next_end, count, size) do
     from = max(pos - @block_bytes, 0)
-    {:ok, block} = :file.pread(fd, from, pos - from)
+
+    # A file that shrank under the scan has nothing before here.
+    block =
+      case :file.pread(fd, from, pos - from) do
+        {:ok, block} -> block
+        :eof -> ""
+        {:error, reason} -> throw({:read_failed, reason})
+      end
 
     newlines =
       block |> :binary.matches("\n") |> Enum.map(fn {at, 1} -> from + at end) |> Enum.reverse()

@@ -223,6 +223,128 @@ defmodule Vagus.Runtime.Engine.Podman.LogFollowTest do
     end
   end
 
+  # As conmon rotates: an empty `.tmp` renamed over the log, then records.
+  defp rotate(log, lines) do
+    tmp = log <> ".tmp"
+    File.write!(tmp, "")
+    File.rename!(tmp, log)
+    File.write!(log, records(lines), [:append])
+  end
+
+  defp await_queued(pid, n) do
+    Enum.find(1..1_000, fn _ ->
+      length(:sys.get_state(pid).queued) == n or (Process.sleep(5) && false)
+    end) || flunk("#{n} rotated file(s) never queued")
+  end
+
+  defp stamp(line), do: "2026-10-15T18:14:21.0+00:00 stdout F " <> line
+
+  describe "rotations" do
+    test "two while a chunk waits for its ack: every generation is read", %{log: log} do
+      File.write!(log, records([stamp("one")]))
+      conmon = conmon()
+      {:ok, pid} = Engine.follow_logs("x", self(), engine(log, conmon))
+      assert_receive {:log_chunk, "one\n"}, 10_000
+
+      # B is unlinked by C's rename before the reader could reach it.
+      File.write!(log, records([stamp("two")]), [:append])
+      rotate(log, [stamp("three")])
+      await_queued(pid, 1)
+      rotate(log, [stamp("four")])
+      await_queued(pid, 2)
+
+      Follow.ack(pid)
+      assert next_chunk(pid) == "two\n"
+      assert next_chunk(pid) == "three\n"
+      assert next_chunk(pid) == "four\n"
+    end
+
+    # The append and the rename both land between two ticks: the old file's
+    # tail is read before the switch.
+    test "a rotation right after the old file grew keeps its tail", %{log: log} do
+      File.write!(log, records([stamp("one")]))
+      conmon = conmon()
+      {:ok, pid} = Engine.follow_logs("x", self(), engine(log, conmon))
+      assert next_chunk(pid) == "one\n"
+      _ = :sys.get_state(pid)
+
+      :sys.suspend(pid)
+      File.write!(log, records([stamp("tail")]), [:append])
+      rotate(log, [stamp("next")])
+      :sys.resume(pid)
+
+      assert next_chunk(pid) == "tail\n"
+      assert next_chunk(pid) == "next\n"
+    end
+
+    test "an unfinished record in a replaced file ends there, not glued on", %{log: log} do
+      File.write!(log, records([stamp("one")]) <> stamp("partial"))
+      conmon = conmon()
+      {:ok, pid} = Engine.follow_logs("x", self(), engine(log, conmon))
+      assert next_chunk(pid) == "one\n"
+
+      rotate(log, [stamp("next")])
+      assert receive_text(pid, "partial\nnext\n") == "partial\nnext\n"
+    end
+
+    # A recreated container writes a new file at the same path; this follow
+    # belonged to the one before.
+    test "once conmon has exited, a new file at the path is not followed", %{log: log} do
+      File.write!(log, records([stamp("old")]))
+      conmon = conmon()
+      {:ok, pid} = Engine.follow_logs("x", self(), engine(log, conmon))
+      assert next_chunk(pid) == "old\n"
+      _ = :sys.get_state(pid)
+
+      :sys.suspend(pid)
+      kill(conmon)
+
+      Enum.find(1..1_000, fn _ ->
+        not File.exists?("/proc/#{conmon}") or (Process.sleep(5) && false)
+      end)
+
+      rotate(log, [stamp("someone else's")])
+      :sys.resume(pid)
+
+      assert_receive :log_eof, 10_000
+      refute_received {:log_chunk, _}
+    end
+  end
+
+  # Text across however many chunks it takes to make `expected`'s length.
+  defp receive_text(pid, expected, acc \\ "") do
+    if byte_size(acc) >= byte_size(expected) do
+      acc
+    else
+      receive_text(pid, expected, acc <> next_chunk(pid))
+    end
+  end
+
+  # conmon 2.2.1 at max-size, as recorded on podman 6.1.4: it flushes the
+  # full file, creates `<path>.tmp` empty, renames it over the log (a new
+  # inode, no `.1` kept) and writes on there.
+  test "follows conmon's cap rotation: the old file to its end, then the new one",
+       %{log: log} do
+    File.write!(log, records(["2026-10-15T18:14:21.0+00:00 stdout F one"]))
+    conmon = conmon()
+    {:ok, pid} = Engine.follow_logs("x", self(), engine(log, conmon))
+    assert next_chunk(pid) == "one\n"
+
+    File.write!(log, records(["2026-10-15T18:14:22.0+00:00 stdout F two"]), [:append])
+    tmp = log <> ".tmp"
+    File.write!(tmp, "")
+    File.rename!(tmp, log)
+    File.write!(log, records(["2026-10-15T18:14:23.0+00:00 stdout F three"]), [:append])
+
+    assert next_chunk(pid) == "two\n"
+    assert next_chunk(pid) == "three\n"
+
+    File.write!(log, records(["2026-10-15T18:14:24.0+00:00 stdout F four"]), [:append])
+    kill(conmon)
+    assert next_chunk(pid) == "four\n"
+    assert_receive :log_eof, 10_000
+  end
+
   test "an owner that goes away stops the follow", %{log: log} do
     File.write!(log, "")
     opts = engine(log, conmon())

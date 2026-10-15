@@ -126,6 +126,8 @@ defmodule Vagus.Test.FakePodman do
           profile_override: Path.join(root, "no-override"),
           socket_dir: Path.join(root, "supervisor"),
           resolv_conf: Path.join(root, "resolv.conf"),
+          log_dir: Path.join(root, "logs"),
+          mountinfo: empty_mountinfo(root),
           name_servers: fn -> [] end,
           run: fn _bin, _args -> {"", 0} end,
           shutting_down?: fn -> false end,
@@ -137,6 +139,13 @@ defmodule Vagus.Test.FakePodman do
     ExUnit.Callbacks.start_supervised!({Vagus.Runtime.Host, host_opts})
     if await?, do: await_answer(name)
     name
+  end
+
+  defp empty_mountinfo(root) do
+    File.mkdir_p!(root)
+    path = Path.join(root, "mountinfo")
+    File.write!(path, "")
+    path
   end
 
   # The probe has answered, either way; a failing one is some tests' point.

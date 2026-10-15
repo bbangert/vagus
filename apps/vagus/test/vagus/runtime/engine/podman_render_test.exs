@@ -10,14 +10,23 @@ defmodule Vagus.Runtime.Engine.PodmanRenderTest do
 
   @ip "172.30.32.2"
   @fixed ~w(--pull=never --pids-limit=-1 --ipc=private --unsetenv=container --http-proxy=false)
+  @log %{dir: "/run/vagus/logs", max_bytes: 2_097_152}
+
+  # On tmpfs, capped at the frugal profile's 2 MiB, in the byte count podman
+  # reads.
+  defp log_opts(name) do
+    ["--log-driver", "k8s-file", "--log-opt", "path=/run/vagus/logs/#{name}.log"] ++
+      ["--log-opt", "max-size=2097152"]
+  end
 
   test "Core" do
     spec = CoreContainer.to_container_spec("2026.7.0", token: "t", tz: "UTC")
     fingerprint = spec.labels[CoreContainer.spec_fingerprint_label()]
 
-    assert Podman.render_create(spec) ==
+    assert Podman.render_create(spec, @log) ==
              ["create", "--name", "homeassistant"] ++
                @fixed ++
+               log_opts("homeassistant") ++
                [
                  "--hostname",
                  "homeassistant",
@@ -96,9 +105,10 @@ defmodule Vagus.Runtime.Engine.PodmanRenderTest do
         labels: %{"io.hass.version" => "1.2.0"}
       )
 
-    assert Podman.render_create(AppContainer.to_container_spec(spec)) ==
+    assert Podman.render_create(AppContainer.to_container_spec(spec), @log) ==
              ["create", "--name", "addon_local_x"] ++
                @fixed ++
+               log_opts("addon_local_x") ++
                [
                  "--hostname",
                  "local-x",
@@ -182,9 +192,10 @@ defmodule Vagus.Runtime.Engine.PodmanRenderTest do
         cmd: ["/run.sh", "--flag"]
       )
 
-    assert Podman.render_create(AppContainer.to_container_spec(spec)) ==
+    assert Podman.render_create(AppContainer.to_container_spec(spec), @log) ==
              ["create", "--name", "addon_local_y"] ++
                @fixed ++
+               log_opts("addon_local_y") ++
                [
                  "--env",
                  "HASSIO_TOKEN",
@@ -227,7 +238,10 @@ defmodule Vagus.Runtime.Engine.PodmanRenderTest do
 
   describe "single fields" do
     defp render(fields) do
-      Podman.render_create(struct!(%ContainerSpec{name: "n", image: "i", network: :host}, fields))
+      Podman.render_create(
+        struct!(%ContainerSpec{name: "n", image: "i", network: :host}, fields),
+        @log
+      )
     end
 
     test "a secret's value never reaches the argv" do
@@ -285,6 +299,16 @@ defmodule Vagus.Runtime.Engine.PodmanRenderTest do
       refute "--publish" in render(ports: %{"80/tcp" => 80})
       assert "--publish" in render(network: {:bridge, "hassio"}, ports: %{"80/tcp" => 80})
     end
+  end
+
+  test "the log path and cap come from the Host's log config" do
+    argv =
+      Podman.render_create(%ContainerSpec{name: "n", image: "i", network: :host}, %{
+        dir: "/x",
+        max_bytes: 8_388_608
+      })
+
+    assert ["--log-opt", "path=/x/n.log", "--log-opt", "max-size=8388608"] -- argv == []
   end
 
   test "the hassio network" do

@@ -27,6 +27,8 @@ defmodule Vagus.Runtime.Engine.Podman do
 
   import Kernel, except: [inspect: 2]
 
+  require Logger
+
   alias Vagus.Runtime.Engine.{Container, ContainerSpec, NetworkSpec}
   alias Vagus.Runtime.Host
   alias Vagus.Runtime.Podman.{Cmd, Error}
@@ -150,7 +152,15 @@ defmodule Vagus.Runtime.Engine.Podman do
 
     with :ok <- validate(spec),
          {:ok, out} <-
-           ok(:create, run(:create, render_create(spec), [env: secrets] ++ opts, @lifecycle_ms)) do
+           ok(
+             :create,
+             run(
+               :create,
+               render_create(spec, Host.log_config(opts[:host])),
+               [env: secrets] ++ opts,
+               @lifecycle_ms
+             )
+           ) do
       {:ok, out |> String.trim() |> String.split("\n") |> List.last()}
     end
   end
@@ -253,10 +263,17 @@ defmodule Vagus.Runtime.Engine.Podman do
         do: ["rm", "--force", "--ignore", "--time", "0", "--", name],
         else: ["rm", "--ignore", "--", name]
 
+    opts = with_deadline(opts, @lifecycle_ms)
+
     with :ok <- valid_name(:remove, name) do
+      # The log is named for the container; a caller holding only its id
+      # (Steps, after a failed start) needs the name looked up first.
+      log_name = if id?(name), do: name_of(name, opts), else: name
+
       case unit(:remove, run(:remove, args, opts, @lifecycle_ms)) do
         result when result in [:ok, {:error, :not_found}] ->
           Host.forget_sample(opts[:host], name)
+          if log_name, do: remove_log(Host.log_config(opts[:host]).dir, log_name)
           :ok
 
         other ->
@@ -264,6 +281,33 @@ defmodule Vagus.Runtime.Engine.Podman do
       end
     end
   end
+
+  # conmon appends to a log file it finds, so a container recreated under
+  # the same name would inherit the old one's lines; Docker's go with the
+  # container. The name was checked, so the path stays inside `dir`; a
+  # symlink there is removed, never followed.
+  # sobelow_skip ["Traversal.FileModule"]
+  defp remove_log(dir, name) do
+    path = log_path(dir, name)
+
+    with {:ok, %File.Stat{type: type}} when type in [:regular, :symlink] <- File.lstat(path),
+         {:error, reason} <- File.rm(path) do
+      Logger.debug("Vagus.Runtime.Engine.Podman: #{path} not removed (#{Kernel.inspect(reason)})")
+    end
+
+    :ok
+  end
+
+  defp id?(ref), do: Regex.match?(~r/\A[0-9a-f]{64}\z/, ref)
+
+  defp name_of(id, opts) do
+    case inspect_raw(id, opts) do
+      {:ok, raw} -> trim_name(raw["Name"])
+      {:error, _} -> nil
+    end
+  end
+
+  defp log_path(dir, name), do: Path.join(dir, name <> ".log")
 
   @impl true
   def inspect(name, opts) do
@@ -314,6 +358,7 @@ defmodule Vagus.Runtime.Engine.Podman do
     end
   end
 
+  # After a rotation at the cap the file holds only what was written since.
   @impl true
   def logs(name, opts) do
     stamps = if opts[:timestamps], do: ["--timestamps"], else: []
@@ -476,43 +521,49 @@ defmodule Vagus.Runtime.Engine.Podman do
   set, unlimited pids, a private IPC namespace, no injected
   `container=podman` or proxy env, no pull on create, Docker's tmpfs
   options, and on a bridge an `/etc/hosts` built from nothing but the
-  spec's entries.
+  spec's entries. The log goes to `log.dir`, capped at `log.max_bytes`,
+  which podman reads as a number of bytes.
 
   A `secret_env` entry renders as a bare `--env NAME`, which podman fills
   from its own environment, so the value stays off the argv. The spec must
   have passed `validate/1`.
   """
-  @spec render_create(ContainerSpec.t()) :: [String.t()]
-  def render_create(%ContainerSpec{} = spec) do
+  @spec render_create(ContainerSpec.t(), %{dir: String.t(), max_bytes: pos_integer()}) ::
+          [String.t()]
+  def render_create(%ContainerSpec{} = spec, log \\ Host.log_config(nil)) do
     bridge = bridge_name(spec.network)
     pid_host? = spec.pid_mode == "host"
 
-    # podman refuses a hostname inside the host's UTS namespace.
-    # podman refuses an init binary outside a private PID namespace.
-    ["create", "--name", spec.name] ++
-      ~w(--pull=never --pids-limit=-1 --ipc=private --unsetenv=container --http-proxy=false) ++
-      flag("--hostname", if(spec.uts_mode != "host", do: spec.hostname)) ++
-      bool("--interactive", spec.open_stdin) ++
-      env(spec.env, spec.secret_env) ++
-      Enum.flat_map(Enum.sort(spec.labels || %{}), fn {k, v} -> ["--label", "#{k}=#{v}"] end) ++
-      network(bridge, spec.network_aliases) ++
-      dns(bridge, spec) ++
-      hosts(bridge, spec.extra_hosts) ++
-      Enum.flat_map(spec.mounts || [], &["--mount", mount(&1)]) ++
+    Enum.concat([
+      ["create", "--name", spec.name],
+      ~w(--pull=never --pids-limit=-1 --ipc=private --unsetenv=container --http-proxy=false),
+      ["--log-driver", "k8s-file", "--log-opt", "path=" <> log_path(log.dir, spec.name)],
+      ["--log-opt", "max-size=#{log.max_bytes}"],
+      # podman refuses a hostname inside the host's UTS namespace.
+      flag("--hostname", if(spec.uts_mode != "host", do: spec.hostname)),
+      bool("--interactive", spec.open_stdin),
+      env(spec.env, spec.secret_env),
+      Enum.flat_map(Enum.sort(spec.labels || %{}), fn {k, v} -> ["--label", "#{k}=#{v}"] end),
+      network(bridge, spec.network_aliases),
+      dns(bridge, spec),
+      hosts(bridge, spec.extra_hosts),
+      Enum.flat_map(spec.mounts || [], &["--mount", mount(&1)]),
       Enum.flat_map(Enum.sort(spec.tmpfs || %{}), fn {dst, o} ->
         ["--tmpfs", "#{dst}:#{tmpfs(o)}"]
-      end) ++
-      many("--device-cgroup-rule", spec.device_cgroup_rules) ++
-      many("--cap-add", caps(spec)) ++
-      bool("--privileged", spec.privileged) ++
-      bool("--init", spec.init == true and not pid_host?) ++
-      flag("--oom-score-adj", spec.oom_score_adj && to_string(spec.oom_score_adj)) ++
-      many("--security-opt", spec.security_opt) ++
-      flag("--restart", restart(spec.restart)) ++
-      if(bridge, do: publish(spec.ports), else: []) ++
-      flag("--pid", spec.pid_mode) ++
-      flag("--uts", spec.uts_mode) ++
+      end),
+      many("--device-cgroup-rule", spec.device_cgroup_rules),
+      many("--cap-add", caps(spec)),
+      bool("--privileged", spec.privileged),
+      # podman refuses an init binary outside a private PID namespace.
+      bool("--init", spec.init == true and not pid_host?),
+      flag("--oom-score-adj", spec.oom_score_adj && to_string(spec.oom_score_adj)),
+      many("--security-opt", spec.security_opt),
+      flag("--restart", restart(spec.restart)),
+      if(bridge, do: publish(spec.ports), else: []),
+      flag("--pid", spec.pid_mode),
+      flag("--uts", spec.uts_mode),
       ["--", spec.image | spec.cmd || []]
+    ])
   end
 
   defp env(nil, _secret), do: []
