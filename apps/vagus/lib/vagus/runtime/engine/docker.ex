@@ -481,7 +481,11 @@ defmodule Vagus.Runtime.Engine.Docker do
 
         opts
         |> Keyword.put(:timeout, seconds)
-        |> Keyword.update(:recv_timeout, grace, &max(&1, grace))
+        |> Keyword.update(
+          :recv_timeout,
+          max(grace, Client.default_recv_timeout()),
+          &max(&1, grace)
+        )
         |> deadline(grace)
     end
   end

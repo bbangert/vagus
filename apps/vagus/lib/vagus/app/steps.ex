@@ -9,7 +9,8 @@ defmodule Vagus.App.Steps do
   platform) and backend selection are carried from the module the app
   process replaced.
   `input[:backend]`, `input[:data_root]` and `input[:socket]` override the
-  configured backend, data root and engine socket.
+  configured backend, data root and engine socket; `input[:engine_opts]`
+  reaches every direct `Vagus.Runtime.Engine` call.
   """
 
   require Logger
@@ -19,6 +20,7 @@ defmodule Vagus.App.Steps do
   alias Vagus.DSP
   alias Vagus.Ingress.Panels
   alias Vagus.Network
+  alias Vagus.Runtime.Engine
 
   @default_backend Vagus.Addon.Backend.Container
   @default_data_root "/data"
@@ -133,14 +135,14 @@ defmodule Vagus.App.Steps do
   # Planned for every hot backup, whose container may not exist: with none,
   # nothing is writing, so there is nothing for the hook to quiesce.
   defp step(:exec_hook, %{config: config, cmd: cmd} = input) do
-    docker = input[:docker] || Vagus.Runtime.Docker
     id = container_name(config.slug)
+    argv = ["/bin/sh", "-c", cmd]
 
-    case docker.exec(id, cmd, Keyword.take(opts(input), [:socket])) do
+    case hook_result(Engine.exec(id, argv, [capture: false] ++ engine_opts(opts(input)))) do
       :ok ->
         {:ok, :ok}
 
-      {:error, {:exec_create_failed, 404, _message}} ->
+      {:error, :not_found} ->
         Logger.info("Vagus.App.Steps: no container #{id}; backup hook skipped")
         {:ok, :skipped}
 
@@ -302,7 +304,15 @@ defmodule Vagus.App.Steps do
   defp opts(input),
     do:
       input
-      |> Map.take([:backend, :data_root, :socket, :panels, :required_dsp_nodes, :arch])
+      |> Map.take([
+        :backend,
+        :data_root,
+        :socket,
+        :engine_opts,
+        :panels,
+        :required_dsp_nodes,
+        :arch
+      ])
       |> Keyword.new()
       |> put_backend(input.config)
 
@@ -322,9 +332,15 @@ defmodule Vagus.App.Steps do
   end
 
   defp inspect_started(config, id, opts) do
-    case Vagus.Runtime.Docker.inspect_container(id, network_opts(opts)) do
-      {:ok, info} ->
-        %{container_id: id, ip: bridge_ip(config, info), healthcheck: healthcheck?(info)}
+    case Engine.inspect(id, engine_opts(opts)) do
+      {:ok, container} ->
+        %{
+          container_id: id,
+          ip: bridge_ip(config, container),
+          # Upstream reports `startup` until the first healthy event only for
+          # an image that declares a healthcheck.
+          healthcheck: container.healthcheck != nil
+        }
 
       {:error, _reason} ->
         %{container_id: id, ip: nil, healthcheck: false}
@@ -335,23 +351,14 @@ defmodule Vagus.App.Steps do
       %{container_id: id, ip: nil, healthcheck: false}
   end
 
-  defp bridge_ip(%Config{host_network: true}, _info), do: nil
+  # A nonzero exit fails as `{:exec, code}`, the reason a failed hook has
+  # always carried.
+  defp hook_result({:ok, %{exit_code: 0}}), do: :ok
+  defp hook_result({:ok, %{exit_code: code}}), do: {:error, {:exec, code}}
+  defp hook_result({:error, _reason} = error), do: error
 
-  defp bridge_ip(_config, %{"NetworkSettings" => %{"Networks" => networks}}) do
-    case Map.get(networks, Network.name()) do
-      %{"IPAddress" => ip} when is_binary(ip) and ip != "" -> ip
-      _ -> nil
-    end
-  end
-
-  defp bridge_ip(_config, _info), do: nil
-
-  # Upstream reports `startup` until the first healthy event only for an
-  # image that declares a healthcheck.
-  defp healthcheck?(%{"Config" => %{"Healthcheck" => %{"Test" => [first | _]}}}),
-    do: first != "NONE"
-
-  defp healthcheck?(_info), do: false
+  defp bridge_ip(%Config{host_network: true}, _container), do: nil
+  defp bridge_ip(_config, container), do: (container.ips || %{})[Network.name()]
 
   defp pick_port(_directory, _probe, _rand, 0), do: {:error, :no_free_port}
 
@@ -508,6 +515,8 @@ defmodule Vagus.App.Steps do
 
   # Only pass through opts the Docker client understands (e.g. :socket).
   defp network_opts(opts), do: Keyword.take(opts, [:socket])
+
+  defp engine_opts(opts), do: Keyword.take(opts, [:socket]) ++ Keyword.get(opts, :engine_opts, [])
 
   defp hostname(slug), do: String.replace(slug, "_", "-")
 
@@ -846,7 +855,7 @@ defmodule Vagus.App.Steps do
 
   defp stop_container(id, opts, strict?) do
     case backend(opts).stop(id, opts) do
-      result when result in [:ok, {:error, {:http, 404}}] ->
+      result when result in [:ok, {:error, :not_found}] ->
         :ok
 
       {:error, reason} = error when strict? ->
@@ -859,9 +868,8 @@ defmodule Vagus.App.Steps do
     end
   end
 
-  # Image removal goes straight through `Vagus.Runtime.Docker` (not the
-  # injectable `:backend` — the `Backend` behaviour is container-lifecycle
-  # only, and image removal isn't part of it) and is best-effort: a config
+  # Image removal goes straight to `Vagus.Runtime.Engine`, not through the
+  # injectable `:backend`, since a native app has no image; best-effort: a config
   # with no `image:` (raises building the spec) or a daemon that's already
   # forgotten the image both just log and move on.
   # Native add-ons have no image to remove (and `image_ref/2` is nil for them).
@@ -870,7 +878,7 @@ defmodule Vagus.App.Steps do
   defp remove_image_best_effort(config, opts) do
     case safe_image_ref(config, opts) do
       {:ok, image} ->
-        case Vagus.Runtime.Docker.remove_image(image, network_opts(opts)) do
+        case Engine.remove_image(image, engine_opts(opts)) do
           :ok ->
             :ok
 

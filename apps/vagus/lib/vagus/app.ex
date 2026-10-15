@@ -20,7 +20,7 @@ defmodule Vagus.App do
 
   # The only options that mean anything to an operation from a backup; the
   # rest of `Vagus.Backups`' opts (`:server`, `:date`, `:extra`) are its own.
-  @backup_opts [:backend, :docker, :data_root, :socket]
+  @backup_opts [:backend, :engine_opts, :data_root, :socket]
 
   @type entry :: map()
   @type update_result :: %{slug: String.t(), from: String.t(), to: String.t()}

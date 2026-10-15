@@ -138,19 +138,19 @@ defmodule Vagus.BackupsTest do
     } do
       slug = "core_hot_hooks"
       install(slug, dr, :started, %{}, %{"backup_pre" => "dump", "backup_post" => "undump"})
-      :ok = @backend.reset_calls()
+      id = "addon_" <> slug
+      engine = Vagus.Runtime.Engine.Fake.start()
+      Vagus.Runtime.Engine.Fake.put_container(engine, id)
 
       assert {:ok, _backup_slug} =
                Backups.create_partial(nil, [slug],
                  server: server,
                  data_root: dr,
-                 docker: @backend
+                 engine_opts: [engine: Vagus.Runtime.Engine.Fake, fake: engine]
                )
 
-      id = "addon_" <> slug
-
-      assert @backend.calls_for(id) ==
-               [{:exec, id, "dump"}, {:exec, id, "undump"}]
+      assert for({:exec, [^id, argv]} <- Vagus.Runtime.Engine.Fake.calls(engine), do: argv) ==
+               [["/bin/sh", "-c", "dump"], ["/bin/sh", "-c", "undump"]]
     end
 
     test "a cold add-on is stopped and started again by its own backup", %{
