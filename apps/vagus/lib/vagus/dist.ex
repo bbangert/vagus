@@ -224,7 +224,9 @@ defmodule Vagus.Dist do
   # job, since the listener binds the wildcard.
   defp address(system) do
     system.ifaddrs_fun.()
-    |> Enum.reject(fn {ifname, opts} -> container_bridge?(ifname) or down?(opts) end)
+    |> Enum.reject(fn {ifname, opts} ->
+      Vagus.Network.container_interface?(ifname) or down?(opts)
+    end)
     |> Enum.find_value(fn {_ifname, opts} ->
       Enum.find(Keyword.get_values(opts, :addr), &reachable?/1)
     end)
@@ -232,18 +234,6 @@ defmodule Vagus.Dist do
       nil -> {:error, :no_address}
       address -> {:ok, address}
     end
-  end
-
-  # By NAME, not by address range: `172.16/12` is RFC1918 in its entirety, so
-  # excluding it would strand a board on an ordinary `172.20.x.x` LAN.
-  #
-  # OBSERVED on a dragon_q6a: `hassio` (the one network Vagus creates) and
-  # `balena0` (balenaEngine's default bridge). `br-` covers any further bridge
-  # the engine names for itself; there is no `docker0` because this product does
-  # not run plain Docker.
-  defp container_bridge?(ifname) do
-    name = to_string(ifname)
-    name in ["hassio", "balena0"] or String.starts_with?(name, "br-")
   end
 
   # A configured address on a DOWN interface is still an address, and choosing

@@ -3,7 +3,7 @@ defmodule Vagus.Network do
   The `hassio` container bridge — the Elixir counterpart of the Supervisor's
   `docker/network.py` (`docs/contract-2026.7-m4-addendum.md` §A6). Owns the
   fixed IP plan add-ons and the plugins share, and creates/adopts the bridge
-  via the Engine API (`Vagus.Runtime.Docker`).
+  through `Vagus.Runtime.Engine`.
 
   IPv4-only for now (sufficient for Gate 1 and all add-on traffic); the real
   Supervisor also runs dual-stack ULA IPv6 (`fd0c:ac1e:2100::/48`) — deferred.
@@ -16,7 +16,8 @@ defmodule Vagus.Network do
 
   require Logger
 
-  alias Vagus.Runtime.Docker
+  alias Vagus.Runtime.Engine
+  alias Vagus.Runtime.Engine.NetworkSpec
 
   @name "hassio"
   @subnet "172.30.32.0/23"
@@ -226,37 +227,49 @@ defmodule Vagus.Network do
     []
   end
 
+  @doc "The `hassio` bridge as the engine creates it."
+  @spec spec() :: NetworkSpec.t()
+  def spec do
+    %NetworkSpec{
+      name: @name,
+      driver: :bridge,
+      subnet: @subnet,
+      gateway: @anchors.gateway,
+      ip_range: @ip_range,
+      # Name the host-side bridge interface `hassio` (matches the Supervisor).
+      interface_name: @name
+    }
+  end
+
   @doc """
   The Engine-API `/networks/create` payload for the `hassio` bridge. Exposed so
   the IP plan can be asserted without a daemon.
   """
   @spec config() :: map()
-  def config do
-    %{
-      "Name" => @name,
-      "Driver" => "bridge",
-      "IPAM" => %{
-        "Driver" => "default",
-        "Config" => [
-          %{"Subnet" => @subnet, "Gateway" => @anchors.gateway, "IPRange" => @ip_range}
-        ]
-      },
-      # Name the host-side bridge interface `hassio` (matches the Supervisor).
-      "Options" => %{"com.docker.network.bridge.name" => @name}
-    }
-  end
+  def config, do: Engine.Docker.render_network(spec())
+
+  @doc "Ensures the `hassio` bridge exists (idempotent). `opts` reach the engine."
+  @spec ensure(keyword()) :: :ok | {:error, Engine.error()}
+  def ensure(opts \\ []), do: Engine.ensure_network(spec(), opts)
 
   @doc """
-  Ensures the `hassio` bridge exists (idempotent): returns the existing
-  network id if present, else creates it. Returns `{:ok, id}` / `{:error, _}`.
+  Whether `ifname` is a container bridge the engine owns rather than a host
+  interface. By NAME, not by address range: `172.16/12` is RFC1918 in its
+  entirety, so excluding it would strand a board on an ordinary
+  `172.20.x.x` LAN.
+
+  OBSERVED on a dragon_q6a: `hassio` (the one network Vagus creates) and
+  `balena0` (balenaEngine's default bridge); `br-` covers any further bridge
+  balena names for itself. podman's netavark names its bridges `podman0`,
+  `podman1`, …; its host-side veth peers carry no IPv4. There is no
+  `docker0` because this product does not run plain Docker.
   """
-  @spec ensure(keyword()) :: {:ok, String.t()} | {:error, term()}
-  def ensure(opts \\ []) do
-    case Docker.inspect_network(@name, opts) do
-      {:ok, %{"Id" => id}} -> {:ok, id}
-      {:error, {:http, 404, _}} -> Docker.create_network(config(), opts)
-      {:error, reason} -> {:error, reason}
-    end
+  @spec container_interface?(String.t() | charlist()) :: boolean()
+  def container_interface?(ifname) do
+    name = to_string(ifname)
+
+    name in ["hassio", "balena0"] or String.starts_with?(name, "br-") or
+      Regex.match?(~r/^podman\d+$/, name)
   end
 
   @doc """

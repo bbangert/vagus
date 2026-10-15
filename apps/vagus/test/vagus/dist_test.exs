@@ -171,6 +171,26 @@ defmodule Vagus.DistTest do
                Enum.find(steps(vm), &match?({:net_kernel_start, _, _}, &1))
     end
 
+    test "skips every container bridge, whichever engine named it", %{vm: vm} do
+      up = [:up, :running]
+
+      bridges =
+        for {name, last} <- [
+              {"hassio", 1},
+              {"balena0", 2},
+              {"br-3f2a", 3},
+              {"podman0", 4},
+              {"podman12", 5}
+            ],
+            do: {String.to_charlist(name), [flags: up, addr: {172, 30, 32, last}]}
+
+      ifaddrs = bridges ++ [{~c"eth0", [flags: up, addr: {192, 168, 2, 58}]}]
+      {:ok, _} = Dist.enable(system(vm, ifaddrs_fun: fn -> ifaddrs end))
+
+      assert {:net_kernel_start, :"vagus@192.168.2.58", _} =
+               Enum.find(steps(vm), &match?({:net_kernel_start, _, _}, &1))
+    end
+
     test "passes no ERL_EPMD_ADDRESS, so epmd agrees with the wildcard listener", %{vm: vm} do
       overrides = [
         epmd_fun: fn args, env ->

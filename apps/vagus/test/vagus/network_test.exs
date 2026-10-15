@@ -223,6 +223,42 @@ defmodule Vagus.NetworkTest do
     end
   end
 
+  describe "container_interface?/1" do
+    test "names the engines' bridges, and only those" do
+      for name <- ["hassio", "balena0", "br-3f2a", "podman0", "podman12", ~c"podman1"] do
+        assert Network.container_interface?(name), inspect(name)
+      end
+
+      for name <- ["eth0", "wlan0", "podmanx", "podman", "podman0x", "end0"] do
+        refute Network.container_interface?(name), name
+      end
+    end
+  end
+
+  describe "ensure/1 on Engine.Fake" do
+    alias Vagus.Runtime.Engine.Fake
+
+    setup do
+      fake = Fake.start()
+      %{fake: fake, opts: [engine: Fake, fake: fake]}
+    end
+
+    test "creates the hassio bridge from spec/0, and is :ok once it exists", %{
+      fake: fake,
+      opts: opts
+    } do
+      assert Network.ensure(opts) == :ok
+      assert Network.ensure(opts) == :ok
+      assert [{:ensure_network, [spec]}, {:ensure_network, [spec]}] = Fake.calls(fake)
+      assert spec == Network.spec()
+    end
+
+    test "surfaces an engine error", %{fake: fake, opts: opts} do
+      Fake.fail_next(fake, :ensure_network, :unavailable)
+      assert Network.ensure(opts) == {:error, :unavailable}
+    end
+  end
+
   describe "against a live daemon" do
     @describetag :docker
 
@@ -255,12 +291,14 @@ defmodule Vagus.NetworkTest do
     test "Network.ensure/1 creates the hassio bridge and is idempotent" do
       on_exit(fn -> Docker.remove_network(Network.name()) end)
 
-      assert {:ok, id} = Network.ensure()
-      assert is_binary(id)
+      assert :ok = Network.ensure()
+      assert {:ok, %{"Id" => id}} = Docker.inspect_network(Network.name())
       # second call adopts the existing network (same id), does not recreate
-      assert {:ok, ^id} = Network.ensure()
+      assert :ok = Network.ensure()
 
-      assert {:ok, %{"IPAM" => %{"Config" => [ipam]}}} = Docker.inspect_network(Network.name())
+      assert {:ok, %{"Id" => ^id, "IPAM" => %{"Config" => [ipam]}}} =
+               Docker.inspect_network(Network.name())
+
       assert ipam["Subnet"] == "172.30.32.0/23"
       assert ipam["Gateway"] == "172.30.32.1"
     end
