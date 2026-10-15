@@ -94,21 +94,26 @@ defmodule Vagus.Runtime.Podman.CmdTest do
 
   # A caller that resumes after its deadline, with podman's output and exit
   # status already queued, is still past its deadline.
+  # The script prints only once released, after the caller is suspended.
+  @tag timeout: 60_000
   test "output queued past the deadline does not outrun it" do
     {bin, dir} =
       script("""
       d="$(dirname "$0")"
       : > "$d/started"
-      sleep 0.3
+      while [ ! -e "$d/release" ]; do sleep 0.05; done
       printf done
       : > "$d/printed"
       """)
 
-    caller = spawn_run(bin, timeout_ms: 500)
+    caller = spawn_run(bin, timeout_ms: 5_000)
     await_file_exists(Path.join(dir, "started"))
+    # The port opened, and its deadline was set, before `started` was written.
+    expired = System.monotonic_time(:millisecond) + 5_500
     :erlang.suspend_process(caller)
+    File.write!(Path.join(dir, "release"), "")
     await_file_exists(Path.join(dir, "printed"))
-    Process.sleep(700)
+    Process.sleep(max(expired - System.monotonic_time(:millisecond), 0))
     :erlang.resume_process(caller)
 
     assert_receive {:result, {:error, :timeout}}, 10_000
@@ -132,6 +137,7 @@ defmodule Vagus.Runtime.Podman.CmdTest do
       script("""
       d="$(dirname "$0")"
       : > "$d/started"
+      while [ ! -e "$d/release" ]; do sleep 0.05; done
       head -c 50000000 /dev/zero
       echo err >&2
       : > "$d/written"
@@ -143,6 +149,7 @@ defmodule Vagus.Runtime.Podman.CmdTest do
 
     await_file_exists(Path.join(dir, "started"))
     :erlang.suspend_process(caller)
+    File.write!(Path.join(dir, "release"), "")
     await_file_exists(Path.join(dir, "written"))
     # Time for any output still in flight to land in the mailbox.
     Process.sleep(200)
