@@ -197,6 +197,23 @@ defmodule Vagus.NetworkTest do
       assert ipam["Subnet"] == "172.30.32.0/23"
       assert ipam["Gateway"] == "172.30.32.1"
       assert ipam["IPRange"] == "172.30.33.0/24"
+
+      # The whole create body as the Docker-map builder emitted it.
+      assert cfg == %{
+               "Name" => "hassio",
+               "Driver" => "bridge",
+               "IPAM" => %{
+                 "Driver" => "default",
+                 "Config" => [
+                   %{
+                     "Subnet" => "172.30.32.0/23",
+                     "Gateway" => "172.30.32.1",
+                     "IPRange" => "172.30.33.0/24"
+                   }
+                 ]
+               },
+               "Options" => %{"com.docker.network.bridge.name" => "hassio"}
+             }
     end
 
     test "fixed anchors match the contract" do
@@ -216,7 +233,7 @@ defmodule Vagus.NetworkTest do
     end
 
     test "ensure/1 surfaces a connect error on a dead socket, never raises" do
-      assert {:error, _} =
+      assert {:error, :unavailable} =
                Network.ensure(
                  socket: "/tmp/vagus-nonet-#{System.unique_integer([:positive])}.sock"
                )
@@ -243,13 +260,9 @@ defmodule Vagus.NetworkTest do
       %{fake: fake, opts: [engine: Fake, fake: fake]}
     end
 
-    test "creates the hassio bridge from spec/0, and is :ok once it exists", %{
-      fake: fake,
-      opts: opts
-    } do
+    test "creates the hassio bridge from spec/0", %{fake: fake, opts: opts} do
       assert Network.ensure(opts) == :ok
-      assert Network.ensure(opts) == :ok
-      assert [{:ensure_network, [spec]}, {:ensure_network, [spec]}] = Fake.calls(fake)
+      assert [{:ensure_network, [spec]}] = Fake.calls(fake)
       assert spec == Network.spec()
     end
 

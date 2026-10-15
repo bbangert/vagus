@@ -269,7 +269,7 @@ defmodule Vagus.Network do
     name = to_string(ifname)
 
     name in ["hassio", "balena0"] or String.starts_with?(name, "br-") or
-      Regex.match?(~r/^podman\d+$/, name)
+      Regex.match?(~r/\Apodman\d+\z/, name)
   end
 
   @doc """
