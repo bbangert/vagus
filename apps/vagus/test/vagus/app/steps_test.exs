@@ -519,7 +519,14 @@ defmodule Vagus.App.StepsTest do
       bridged = test_config(%{"host_network" => false, "ports" => %{"80/tcp" => 8080}})
       ports = %{"80/tcp" => 9090}
 
-      assert {:ok, %{ip: nil}} = Steps.run(:start, input(ctx, %{config: bridged, ports: ports}))
+      {_fake, engine_opts} = engine(%{})
+
+      assert {:ok, %{ip: nil}} =
+               Steps.run(
+                 :start,
+                 input(ctx, %{config: bridged, ports: ports, engine_opts: engine_opts})
+               )
+
       assert_received {:create, spec}
       assert spec.ports == %{"80/tcp" => 9090}
       assert spec.platform == "linux/amd64" or is_binary(spec.platform)

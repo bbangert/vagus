@@ -39,7 +39,7 @@ defmodule Vagus.App.Gates do
   @spec network() :: :ok
   def network do
     case Network.ensure() do
-      {:ok, _id} ->
+      :ok ->
         Network.ensure_supervisor_ip()
         warn_unless_ok(Nat.ensure(), "supervisor DNAT; apps may not reach http://supervisor/")
 

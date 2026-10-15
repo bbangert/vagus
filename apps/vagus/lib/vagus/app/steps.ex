@@ -501,8 +501,8 @@ defmodule Vagus.App.Steps do
   defp maybe_ensure_network(%Config{backend: :native}, _opts), do: :ok
 
   defp maybe_ensure_network(_config, opts) do
-    case Network.ensure(network_opts(opts)) do
-      {:ok, _id} ->
+    case Network.ensure(engine_opts(opts)) do
+      :ok ->
         # Bind the supervisor anchor (.2) to the freshly-ensured bridge so the
         # host-networked emulator answers where the add-on reaches it (§A6).
         Network.ensure_supervisor_ip()
@@ -512,9 +512,6 @@ defmodule Vagus.App.Steps do
         {:error, {:network, reason}}
     end
   end
-
-  # Only pass through opts the Docker client understands (e.g. :socket).
-  defp network_opts(opts), do: Keyword.take(opts, [:socket])
 
   defp engine_opts(opts), do: Keyword.take(opts, [:socket]) ++ Keyword.get(opts, :engine_opts, [])
 
