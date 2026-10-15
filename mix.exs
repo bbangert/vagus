@@ -6,7 +6,11 @@ defmodule VagusUmbrella.MixProject do
       apps_path: "apps",
       version: "0.1.0",
       start_permanent: Mix.env() == :prod,
-      deps: deps()
+      deps: deps(),
+      # GHSA-69m6-wcv4-rwcf is an HTTP/2 flow-control DoS; Vagus's only
+      # Bandit listener runs with HTTP/2 disabled (Vagus.API.Listener,
+      # asserted in listener_test). Drop this once bandit ships the fix.
+      hex: [ignore_advisories: ["EEF-CVE-2026-105659"]]
     ]
   end
 
