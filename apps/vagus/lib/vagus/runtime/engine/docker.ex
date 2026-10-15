@@ -237,6 +237,9 @@ defmodule Vagus.Runtime.Engine.Docker do
     end
   end
 
+  @doc false
+  def event_source, do: __MODULE__.EventSource
+
   @doc "The Engine-API `POST /containers/create` body for `spec` (the name travels separately)."
   @spec render_container(ContainerSpec.t()) :: map()
   def render_container(%ContainerSpec{} = spec) do

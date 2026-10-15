@@ -113,6 +113,10 @@ defmodule Vagus.Runtime.Engine do
   def ensure_network(%NetworkSpec{} = spec, opts \\ []),
     do: impl(opts).ensure_network(spec, opts)
 
+  @doc "The `Vagus.Runtime.Events.Source` module for the engine `opts` select."
+  @spec event_source(keyword()) :: module()
+  def event_source(opts \\ []), do: impl(opts).event_source()
+
   defp impl(opts),
     do: opts[:engine] || Application.get_env(:vagus, :engine, Vagus.Runtime.Engine.Docker)
 end

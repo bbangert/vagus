@@ -76,7 +76,12 @@ defmodule Vagus.AppFixtures do
     if state == :started do
       send(
         pid,
-        {:docker_event, %{action: "start", id: "fixture-" <> slug, name: "addon_" <> slug}}
+        {:engine_event,
+         %Vagus.Runtime.Engine.Event{
+           action: :start,
+           id: "fixture-" <> slug,
+           name: "addon_" <> slug
+         }}
       )
 
       _ = :sys.get_state(pid)

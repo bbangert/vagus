@@ -17,9 +17,11 @@ defmodule Vagus.Runtime.Engine.Fake do
   actually sleeps.
 
   `put_container/3` makes a running container from any `Container` field
-  (`state:` overrides) plus `:logs` (text),
-  `:stats` (the computed map) and `:exec` (`{code, output}` or a function of
-  the argv returning one).
+  (`state:` overrides) plus `:logs` (text, or a list of chunks a follow
+  delivers verbatim, as an engine that already stamped and split them),
+  `:follow_open` (a follow stays open after the last chunk, until its owner
+  exits), `:stats` (the computed map) and `:exec` (`{code, output}` or a
+  function of the argv returning one).
   """
 
   @behaviour Vagus.Runtime.Engine
@@ -73,7 +75,7 @@ defmodule Vagus.Runtime.Engine.Fake do
 
   def put_container(fake, name, attrs \\ []) do
     attrs = Map.new(attrs)
-    {extras, fields} = Map.split(attrs, [:logs, :stats, :exec])
+    {extras, fields} = Map.split(attrs, [:logs, :stats, :exec, :follow_open])
 
     container =
       struct!(
@@ -278,11 +280,13 @@ defmodule Vagus.Runtime.Engine.Fake do
            opts,
            :follow_logs,
            [name, owner],
-           &{(&1.containers[key(&1, name)] && lines(&1.containers[key(&1, name)].logs, opts)) ||
-              [], &1}
+           &{follow_plan(&1.containers[key(&1, name)], opts), &1}
          ) do
-      {:error, error} -> {:error, error}
-      chunks -> {:ok, spawn_link(fn -> stream(owner, Process.monitor(owner), chunks) end)}
+      {:error, error} ->
+        {:error, error}
+
+      {chunks, open?} ->
+        {:ok, spawn_link(fn -> stream(owner, Process.monitor(owner), chunks, open?) end)}
     end
   end
 
@@ -471,6 +475,13 @@ defmodule Vagus.Runtime.Engine.Fake do
 
   # Line N is stamped N ns past a fixed instant, in Docker's RFC3339Nano form,
   # so a stamp is deterministic and survives `:tail`.
+  defp follow_plan(nil, _opts), do: {[], false}
+
+  defp follow_plan(entry, opts),
+    do: {lines(entry.logs, opts), Map.get(entry, :follow_open, false)}
+
+  defp lines(chunks, _opts) when is_list(chunks), do: chunks
+
   defp lines(text, opts) do
     tail = Keyword.get(opts, :tail, 100)
 
@@ -488,16 +499,22 @@ defmodule Vagus.Runtime.Engine.Fake do
   defp stamp(line, n, true),
     do: "2026-10-14T21:00:00.#{String.pad_leading(Integer.to_string(n), 9, "0")}Z " <> line
 
-  defp stream(owner, ref, []) do
+  defp stream(_owner, ref, [], true) do
+    receive do
+      {:DOWN, ^ref, :process, _pid, _reason} -> :ok
+    end
+  end
+
+  defp stream(owner, ref, [], false) do
     send(owner, :log_eof)
     Process.demonitor(ref, [:flush])
   end
 
-  defp stream(owner, ref, [chunk | rest]) do
+  defp stream(owner, ref, [chunk | rest], open?) do
     send(owner, {:log_chunk, chunk})
 
     receive do
-      :log_ack -> stream(owner, ref, rest)
+      :log_ack -> stream(owner, ref, rest, open?)
       {:DOWN, ^ref, :process, _pid, _reason} -> :ok
     end
   end

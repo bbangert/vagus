@@ -1,9 +1,10 @@
 defmodule Vagus.API.LogsFollowRouterTest do
   @moduledoc """
-  `/logs/follow` routes — chunked headers, docker-backed streaming against a
-  fake engine socket, client-death teardown, and the native-broker branch.
-  async: false — mutates :vagus app env (docker_socket, follow_idle_ms,
-  core_container) and registers the native broker's global process names.
+  `/logs/follow` routes — chunked headers, engine-backed streaming against
+  `Engine.Fake`, client-death teardown, and the native-broker branch.
+  async: false — mutates :vagus app env (the global Fake engine,
+  follow_idle_ms, core_container) and registers the native broker's global
+  process names.
   """
   use ExUnit.Case, async: false
   use Plug.Test
@@ -11,6 +12,7 @@ defmodule Vagus.API.LogsFollowRouterTest do
   import Vagus.AppFixtures
 
   alias Vagus.Mqtt.Broker
+  alias Vagus.Runtime.Engine.Fake
 
   @opts Vagus.API.Router.init([])
 
@@ -27,89 +29,42 @@ defmodule Vagus.API.LogsFollowRouterTest do
     :ok
   end
 
-  # -- fake engine socket (events_test/follow_test pattern) -----------------
-
-  defp socket_path, do: "/tmp/vagus-lfr-#{System.unique_integer([:positive])}.sock"
-
-  defp start_fake_server(path) do
-    # rm first: a leftover socket file from a previous run collides
-    # (:eaddrinuse) — see follow_test.exs for the full story.
-    _ = File.rm(path)
-
-    {:ok, listen} =
-      :gen_tcp.listen(0, [
-        :binary,
-        {:ifaddr, {:local, path}},
-        active: false,
-        packet: :raw,
-        backlog: 1
-      ])
-
-    on_exit(fn -> :gen_tcp.close(listen) end)
-    listen
-  end
-
-  defp accept_and_greet(listen) do
-    {:ok, sock} = :gen_tcp.accept(listen, 3_000)
-    head = read_head(sock, "")
-
-    :ok =
-      :gen_tcp.send(
-        sock,
-        "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nTransfer-Encoding: chunked\r\n\r\n"
-      )
-
-    {sock, head}
-  end
-
-  defp read_head(sock, acc) do
-    if String.contains?(acc, "\r\n\r\n") do
-      acc
-    else
-      {:ok, data} = :gen_tcp.recv(sock, 0, 5_000)
-      read_head(sock, acc <> data)
-    end
-  end
-
-  defp send_frame(sock, payload) do
-    framed = <<1, 0, 0, 0, byte_size(payload)::32, payload::binary>>
-    size_hex = framed |> byte_size() |> Integer.to_string(16)
-    :ok = :gen_tcp.send(sock, size_hex <> "\r\n" <> framed <> "\r\n")
-  end
-
-  defp with_docker_env(path) do
-    old_socket = Application.get_env(:vagus, :docker_socket)
+  # Core's container on a global Fake engine: the router takes no per-call
+  # engine opts.
+  defp with_core(attrs) do
+    fake = Fake.start_global()
     old_core = Application.get_env(:vagus, :core_container)
-    Application.put_env(:vagus, :docker_socket, path)
     Application.put_env(:vagus, :core_container, "homeassistant")
 
     on_exit(fn ->
-      restore_env(:docker_socket, old_socket)
-      restore_env(:core_container, old_core)
+      if old_core,
+        do: Application.put_env(:vagus, :core_container, old_core),
+        else: Application.delete_env(:vagus, :core_container)
     end)
+
+    Fake.put_container(fake, "homeassistant", attrs)
+    fake
   end
 
-  defp restore_env(key, nil), do: Application.delete_env(:vagus, key)
-  defp restore_env(key, value), do: Application.put_env(:vagus, key, value)
+  # The engine's streamer is linked to the request process that started it.
+  defp streamer_of(request) do
+    wait_until(fn -> linked(request) != nil end)
+    linked(request)
+  end
 
-  # -- docker-backed follow ---------------------------------------------------
+  defp linked(pid) do
+    case Process.info(pid, :links) do
+      {:links, links} -> Enum.find(links, &(is_pid(&1) and &1 != self()))
+      nil -> nil
+    end
+  end
 
-  test "core follow: chunked 200 + headers + streamed lines until server close" do
-    path = socket_path()
-    listen = start_fake_server(path)
-    with_docker_env(path)
+  # -- engine-backed follow ---------------------------------------------------
 
-    task =
-      Task.async(fn ->
-        conn(:get, "/core/logs/follow?lines=7") |> sup() |> Vagus.API.Router.call(@opts)
-      end)
+  test "core follow: chunked 200 + headers + streamed lines until the engine ends it" do
+    with_core(logs: "one\ntwo\n")
 
-    {sock, _head} = accept_and_greet(listen)
-    send_frame(sock, "one\n")
-    send_frame(sock, "two\n")
-    :gen_tcp.close(sock)
-
-    conn = Task.await(task, 5_000)
+    conn = conn(:get, "/core/logs/follow?lines=7") |> sup() |> Vagus.API.Router.call(@opts)
     assert conn.status == 200
     assert get_resp_header(conn, "x-first-cursor") == ["0"]
     assert get_resp_header(conn, "x-accel-buffering") == ["no"]
@@ -124,25 +79,17 @@ defmodule Vagus.API.LogsFollowRouterTest do
     assert conn.resp_body == ""
   end
 
-  test "client death mid-stream tears down the held docker connection" do
-    path = socket_path()
-    listen = start_fake_server(path)
-    with_docker_env(path)
-    test_pid = self()
+  test "client death mid-stream tears down the engine's streamer" do
+    with_core(logs: "before-death\n", follow_open: true)
 
-    {:ok, task_pid} =
+    {:ok, request} =
       Task.start(fn ->
         conn(:get, "/core/logs/follow") |> sup() |> Vagus.API.Router.call(@opts)
       end)
 
-    {sock, _head} = accept_and_greet(listen)
-    send_frame(sock, "before-death\n")
-
-    # Kill the request process mid-stream: the Follow process (owner-monitor
-    # + link) must die with it and the engine side must see the close.
-    Process.exit(task_pid, :kill)
-    spawn(fn -> send(test_pid, {:recv, :gen_tcp.recv(sock, 0, 3_000)}) end)
-    assert_receive {:recv, {:error, :closed}}, 4_000
+    ref = request |> streamer_of() |> Process.monitor()
+    Process.exit(request, :kill)
+    assert_receive {:DOWN, ^ref, :process, _streamer, _reason}, 3_000
   end
 
   test "an add-on may not follow another add-on's logs" do
@@ -207,98 +154,57 @@ defmodule Vagus.API.LogsFollowRouterTest do
     assert conn.status == 400
   end
 
-  test "lines floor + verbose: docker sees tail=100&timestamps=true; lines get the §A5 prefix" do
-    path = socket_path()
-    listen = start_fake_server(path)
-    with_docker_env(path)
+  test "lines floor + verbose: the engine gets tail 100 + timestamps; lines get the §A5 prefix" do
+    fake = with_core(logs: "started\n")
 
-    task =
-      Task.async(fn ->
-        conn(:get, "/core/logs/follow?lines=1&verbose")
-        |> sup()
-        |> Vagus.API.Router.call(@opts)
-      end)
+    conn =
+      conn(:get, "/core/logs/follow?lines=1&verbose") |> sup() |> Vagus.API.Router.call(@opts)
 
-    {sock, head} = accept_and_greet(listen)
-    assert head =~ "tail=100"
-    assert head =~ "timestamps=true"
+    assert {:follow_logs, opts} = List.keyfind(Fake.call_opts(fake), :follow_logs, 0)
+    assert opts[:tail] == 100
+    assert opts[:timestamps] == true
 
-    send_frame(sock, "2026-07-23T01:02:03Z started\n")
-    :gen_tcp.close(sock)
-
-    conn = Task.await(task, 5_000)
     {:ok, host} = :inet.gethostname()
-    assert conn.resp_body == "2026-07-23 01:02:03.000 #{host} homeassistant: started\n"
+    assert conn.resp_body == "2026-10-14 21:00:00.000 #{host} homeassistant: started\n"
   end
 
   test "boots/0/follow streams the current source; other offsets stream empty" do
-    path = socket_path()
-    listen = start_fake_server(path)
-    with_docker_env(path)
+    fake = with_core(logs: "current-boot\n")
 
-    # Non-zero offset: no journal history — empty stream, no engine dial.
+    # Non-zero offset: no journal history — empty stream, no engine call.
     conn = conn(:get, "/core/logs/boots/-1/follow") |> sup() |> Vagus.API.Router.call(@opts)
     assert conn.status == 200
     assert conn.resp_body == ""
+    assert Fake.calls(fake) == []
 
     # Offset 0 = current boot = the live source.
-    task =
-      Task.async(fn ->
-        conn(:get, "/core/logs/boots/0/follow") |> sup() |> Vagus.API.Router.call(@opts)
-      end)
-
-    {sock, _head} = accept_and_greet(listen)
-    send_frame(sock, "current-boot\n")
-    :gen_tcp.close(sock)
-
-    conn = Task.await(task, 5_000)
+    conn = conn(:get, "/core/logs/boots/0/follow") |> sup() |> Vagus.API.Router.call(@opts)
     assert conn.resp_body == "current-boot\n"
   end
 
-  test "docker idle timeout tears down the Follow process and its engine conn" do
-    path = socket_path()
-    listen = start_fake_server(path)
-    with_docker_env(path)
-    test_pid = self()
+  test "the idle timeout tears down the engine's streamer" do
+    with_core(logs: "only-line\n", follow_open: true)
 
     task =
       Task.async(fn ->
         conn(:get, "/core/logs/follow") |> sup() |> Vagus.API.Router.call(@opts)
       end)
 
-    {sock, _head} = accept_and_greet(listen)
-    send_frame(sock, "only-line\n")
-    # Then silence: the 600ms idle window must fire, stop the Follow, and
-    # the engine side must observe the connection close.
+    # Then silence: the 600ms idle window must fire and stop the streamer.
+    ref = task.pid |> streamer_of() |> Process.monitor()
     conn = Task.await(task, 5_000)
     assert conn.status == 200
     assert conn.resp_body == "only-line\n"
-
-    spawn(fn -> send(test_pid, {:recv, :gen_tcp.recv(sock, 0, 2_000)}) end)
-    assert_receive {:recv, {:error, :closed}}, 3_000
+    assert_receive {:DOWN, ^ref, :process, _streamer, _reason}, 1_000
   end
 
-  test "verbose reassembles a line split across two docker chunks" do
-    path = socket_path()
-    listen = start_fake_server(path)
-    with_docker_env(path)
+  test "verbose reassembles a line split across two engine chunks" do
+    # One log line, split mid-word across two {:log_chunk, _} messages; the
+    # router's line buffer must reassemble before applying the verbose prefix.
+    with_core(logs: ["2026-07-23T01:02:03Z hel", "lo\n"])
 
-    task =
-      Task.async(fn ->
-        conn(:get, "/core/logs/follow?verbose") |> sup() |> Vagus.API.Router.call(@opts)
-      end)
+    conn = conn(:get, "/core/logs/follow?verbose") |> sup() |> Vagus.API.Router.call(@opts)
 
-    {sock, _head} = accept_and_greet(listen)
-    # One log line, split mid-word across two chunked-transfer chunks —
-    # delivered as separate {:log_chunk, _} messages (the sleep defeats
-    # kernel coalescing); the router's line buffer must reassemble before
-    # applying the verbose prefix.
-    send_frame(sock, "2026-07-23T01:02:03Z hel")
-    Process.sleep(100)
-    send_frame(sock, "lo\n")
-    :gen_tcp.close(sock)
-
-    conn = Task.await(task, 5_000)
     {:ok, host} = :inet.gethostname()
     assert conn.resp_body == "2026-07-23 01:02:03.000 #{host} homeassistant: hello\n"
   end

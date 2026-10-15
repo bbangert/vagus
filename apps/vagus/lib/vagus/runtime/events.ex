@@ -1,69 +1,46 @@
 defmodule Vagus.Runtime.Events do
   @moduledoc """
-  Streaming docker-events client — GET `/events?filters=...` over the
-  daemon's Unix socket, the container-event half of the watchdog
-  (`docs/contract-2026.7-m4b-ingress-watchdog.md` §B6.1, real Supervisor's
-  `DockerMonitor._run()`). Unlike `Vagus.Runtime.Docker`'s one-shot
-  request/response calls, this endpoint's HTTP response never ends: the
-  daemon keeps the connection open and writes one newline-delimited JSON
-  event object per line, forever. This module holds a single long-lived
-  Mint connection in **active** mode inside a `GenServer` (house pattern —
-  see `Vagus.DNS`, `Vagus.Core.ApiSocket`), reassembles the line-delimited
-  JSON across TCP/chunk boundaries, and fans decoded events out to
-  subscribers as `{:docker_event, map}`. An app container's event also goes
-  to that app's process, looked up in `Vagus.App.Directory` as each event is
-  sent, so a restarted app process gets the next one without subscribing.
+  The engine's container-event stream, the container-event half of the
+  watchdog (`docs/contract-2026.7-m4b-ingress-watchdog.md` §B6.1, real
+  Supervisor's `DockerMonitor._run()`). The transport is a
+  `Vagus.Runtime.Events.Source` (`:source`, default the engine's own); this
+  process fans its events out to subscribers as
+  `{:engine_event, %Vagus.Runtime.Engine.Event{}}`. An app container's event
+  also goes to that app's process, looked up in `Vagus.App.Directory` as each
+  event is sent, so a restarted app process gets the next one without
+  subscribing.
 
   ## After a reconnect
 
-  Events missed while the stream was down are never replayed, so each time a
-  connection is answered (the first included) the managed containers are
-  listed and each app process is sent its container's state as the event it
-  missed: a running one as `start`, an exited one as `die` with its exit
-  code. The app process ignores one about a container it does not hold, so a
-  repeat is harmless. The list runs in a task; only the default-named
-  instance lists unless `:list` is given.
+  Events missed while the stream was down are never replayed, so each time
+  the source reports the stream ready (the first time included) the app
+  containers are listed and each app process is sent its container's state
+  as the event it missed: a running one as `:start`, an exited one as `:die`
+  with its exit code. The app process ignores one about a container it does
+  not hold, so a repeat is harmless. The list runs in a task; only the
+  default-named instance lists unless `:resync` or `:list` is given.
 
   A listing is older than any event that arrives while it runs, so the task
   only returns it, tagged with its connection's generation: app events that
   arrive meanwhile are held back and sent after the listing's, and a listing
   from an earlier connection is dropped.
 
-  ## Filtering — server-side + client-side
+  ## The managed gate
 
-  The request asks the daemon to filter to `{"type":["container"]}` only —
-  it can't be narrower, because docker ANDs filter keys (a
-  `label=supervisor_managed` filter would also exclude the label-less
-  adopted Core container, whose events the Core watchdog needs). The
-  authoritative gate is client-side (the plan's self-check #1 — some older
-  Engine-API versions silently ignore filters anyway): only
-  `Type == "container"` events whose Actor attributes carry the
-  `supervisor_managed` label key, whose container name starts with
-  `addon_`, or whose name equals `Vagus.Core.Container.name()` (the
-  adopted Core container carries no Vagus label until its first rebuild —
-  name is its only stable identity) are ever sent to a subscriber. A
-  daemon that ignores the server-side filter entirely still can't flood
-  subscribers with unrelated host-container noise.
+  Only events for a container the engine reports as `managed` (the
+  `supervisor_managed` label), whose name starts with `addon_`, or whose name
+  equals `Vagus.Core.Container.name()` (the adopted Core container carries
+  no Vagus label until its first rebuild — name is its only stable identity)
+  are ever sent to a subscriber, so unrelated host containers cannot flood
+  them.
 
   ## Reconnect
 
-  A dropped stream (the request's `:done`, a transport error/close, or a
-  failed connect) is followed by a reconnect with exponential backoff — 1s,
-  2s, 4s, ... capped at 30s — so a daemon restart or a momentary socket
-  hiccup doesn't spin. The backoff resets to 1s as soon as a connection
-  makes it far enough to receive an HTTP status/headers (i.e. the daemon
-  really was there and responding); a connection that never gets that far
-  keeps escalating. Each drop is logged once at `warning`; the retry ticks
-  themselves log at `debug` so a prolonged outage doesn't spam the log at
-  warning level once per attempt.
-
-  ## Bounded memory
-
-  Docker's line-delimited stream is normally tiny per line, but a corrupt
-  or adversarial stream could send an unbounded line with no `\\n` — on a
-  1GB device that would balloon the buffer forever. The pending-line buffer
-  is capped at 1MB; a line that grows past the cap without a newline is
-  dropped (logged at `warning`) rather than accumulated further.
+  A closed stream or a failed connect is followed by a reconnect with
+  exponential backoff — 1s, 2s, 4s, ... capped at 30s — so an engine restart
+  doesn't spin. The backoff resets as soon as the engine answers; a
+  connection that never gets that far keeps escalating. Each drop is logged
+  once at `warning`; the retry ticks themselves log at `debug`.
 
   Gated at the application-supervisor level by `config :vagus, :events_enabled`
   (default `true`, `false` in `config/test.exs`) — mirrors `Vagus.DNS`'s
@@ -75,23 +52,11 @@ defmodule Vagus.Runtime.Events do
 
   require Logger
 
-  alias Vagus.Runtime.Docker
+  alias Vagus.Runtime.Engine
+  alias Vagus.Runtime.Engine.{Container, Event}
 
   @initial_backoff_ms 1_000
   @max_backoff_ms 30_000
-  # Caps the pending (no-newline-yet) line buffer so a corrupt/adversarial
-  # stream can't exhaust memory on a 1GB device.
-  @max_buffer_bytes 1_048_576
-
-  @typedoc "A decoded, client-filtered docker container event."
-  @type event :: %{
-          action: String.t() | nil,
-          name: String.t() | nil,
-          id: String.t() | nil,
-          exit_code: integer() | nil,
-          time_nano: integer() | nil,
-          attributes: map()
-        }
 
   ## Public API
 
@@ -100,7 +65,7 @@ defmodule Vagus.Runtime.Events do
   end
 
   @doc """
-  Subscribes the calling process to `{:docker_event, event}` messages. The
+  Subscribes the calling process to `{:engine_event, event}` messages. The
   server monitors the caller and drops it from the subscriber list on
   `:DOWN` — a crashed/dead subscriber is pruned automatically, never leaked.
   """
@@ -117,22 +82,25 @@ defmodule Vagus.Runtime.Events do
 
   ## GenServer
 
+  # `:engine_opts` reach the default source's choice and the resync listing;
+  # the rest of `opts` reach the source's `init/1`.
   @impl GenServer
   def init(opts) do
     name = Keyword.get(opts, :name, __MODULE__)
+    engine_opts = Keyword.get(opts, :engine_opts, [])
+    source = Keyword.get_lazy(opts, :source, fn -> Engine.event_source(engine_opts) end)
 
     state = %{
-      socket: Keyword.get(opts, :socket, Docker.socket_path()),
-      conn: nil,
-      request_ref: nil,
-      buffer: "",
+      source: source,
+      src: source.init(opts),
+      connected: false,
       subscribers: %{},
       backoff_ms: @initial_backoff_ms,
       # The pending :connect retry timer, if any — kept so a second drop can
       # never arm a second retry loop beside it.
       reconnect_timer: nil,
       route: Keyword.get(opts, :route, &route/1),
-      list: Keyword.get_lazy(opts, :list, fn -> default_list(name) end),
+      list: list(opts, name, engine_opts),
       generation: 0,
       # While a listing runs: its task's monitor and the app events held back.
       resync: nil
@@ -171,7 +139,7 @@ defmodule Vagus.Runtime.Events do
   # The retry timer: the debug-level counterpart to the warning logged once
   # when the drop that scheduled it happened (see schedule_reconnect/2).
   def handle_info(:connect, state) do
-    Logger.debug("Vagus.Runtime.Events: attempting to (re)connect to #{state.socket}")
+    Logger.debug("Vagus.Runtime.Events: attempting to (re)connect")
     {:noreply, do_connect(%{state | reconnect_timer: nil})}
   end
 
@@ -209,22 +177,15 @@ defmodule Vagus.Runtime.Events do
     end
   end
 
-  # Mint active-mode messages (raw socket messages tagged for the transport)
-  # are routed through Mint.HTTP.stream/2, which either recognizes them as
-  # belonging to `state.conn` or returns `:unknown` for anything else
-  # (another process's messages, stray timer sends, etc).
-  def handle_info(msg, %{conn: conn} = state) when not is_nil(conn) do
-    case Mint.HTTP.stream(conn, msg) do
-      {:ok, conn, responses} ->
-        {:noreply, handle_responses(responses, %{state | conn: conn})}
+  def handle_info(msg, %{connected: true} = state) do
+    case state.source.handle_info(msg, state.src) do
+      {:ok, notices, src} ->
+        {:noreply, Enum.reduce(notices, %{state | src: src}, &notice/2)}
 
-      {:error, conn, reason, responses} ->
-        # Process whatever data arrived before the stream errored, then treat
-        # the error itself as a drop — one reconnect scheduled, not two, even
-        # though `responses` might itself contain no :done/:error entry.
-        state = handle_responses(responses, %{state | conn: conn})
-        Mint.HTTP.close(conn)
-        {:noreply, schedule_reconnect(reason, %{state | conn: nil, request_ref: nil})}
+      # Whatever arrived before the close still counts.
+      {:closed, reason, notices, src} ->
+        state = Enum.reduce(notices, %{state | src: src}, &notice/2)
+        {:noreply, schedule_reconnect(reason, close(state))}
 
       :unknown ->
         {:noreply, state}
@@ -233,178 +194,56 @@ defmodule Vagus.Runtime.Events do
 
   def handle_info(_other, state), do: {:noreply, state}
 
-  ## Connect
-
-  # Type-only server filter: docker ANDs filter keys, so a label filter here
-  # would drop the (label-less) adopted Core container's events entirely —
-  # see moduledoc "Filtering". The client-side check in dispatch/2 is the
-  # authoritative gate.
   defp do_connect(state) do
-    filters = URI.encode_www_form(Jason.encode!(%{"type" => ["container"]}))
-
-    path = "/events?filters=" <> filters
-
-    case Mint.HTTP.connect(:http, {:local, state.socket}, 0, hostname: "localhost", mode: :active) do
-      {:ok, conn} ->
-        case Mint.HTTP.request(conn, "GET", path, [], "") do
-          {:ok, conn, ref} ->
-            %{state | conn: conn, request_ref: ref, buffer: ""}
-
-          {:error, conn, reason} ->
-            Mint.HTTP.close(conn)
-            schedule_reconnect({:request, reason}, %{state | conn: nil, request_ref: nil})
-        end
-
-      {:error, reason} ->
-        schedule_reconnect({:connect, reason}, state)
+    case state.source.connect(state.src) do
+      {:ok, src} -> %{state | src: src, connected: true}
+      {:error, reason} -> schedule_reconnect(reason, state)
     end
   end
 
+  defp close(state), do: %{state | src: state.source.close(state.src), connected: false}
+
   # Logs the drop exactly once (warning) and arms the retry timer; the retry
   # tick itself (handle_info(:connect, ...)) logs at debug. Backoff for the
-  # *next* schedule_reconnect/2 call is always doubled (capped) here — but a
-  # connection that got at least a status/headers response resets
-  # `backoff_ms` back to the floor first (see handle_response/2), so a stream
-  # that dies after actually talking to the daemon starts its next retry at
-  # 1s rather than continuing to escalate.
+  # *next* drop is doubled (capped) here; an engine that answered resets it
+  # to the floor first (see notice/2).
   #
-  # One drop is scheduled once: when a retry is already pending (e.g.
-  # handle_responses/2 saw `:done`/`:error` and the stream error that carried
-  # it lands here too), only the connection fields are cleared — no second
-  # warning, no second timer, no extra backoff doubling. Public (`@doc false`)
-  # for its unit test.
+  # One drop is scheduled once: when a retry is already pending, nothing
+  # more happens — no second warning, no second timer, no extra doubling.
+  # Public (`@doc false`) for its unit test.
   @doc false
   @spec schedule_reconnect(term(), map()) :: map()
-  def schedule_reconnect(_reason, %{reconnect_timer: timer} = state) when timer != nil do
-    %{state | conn: nil, request_ref: nil, buffer: ""}
-  end
+  def schedule_reconnect(_reason, %{reconnect_timer: timer} = state) when timer != nil, do: state
 
   def schedule_reconnect(reason, state) do
     delay = state.backoff_ms
 
     Logger.warning(
-      "Vagus.Runtime.Events: docker-events stream dropped (#{inspect(reason)}); reconnecting in #{delay}ms"
+      "Vagus.Runtime.Events: event stream dropped (#{inspect(reason)}); reconnecting in #{delay}ms"
     )
 
     %{
       state
       | reconnect_timer: Process.send_after(self(), :connect, delay),
-        conn: nil,
-        request_ref: nil,
-        buffer: "",
         backoff_ms: min(delay * 2, @max_backoff_ms)
     }
   end
 
-  ## Response handling
+  defp notice(:answered, state), do: %{state | backoff_ms: @initial_backoff_ms}
+  defp notice(:ready, state), do: resync(%{state | backoff_ms: @initial_backoff_ms})
+  defp notice(%Event{} = event, state), do: dispatch(event, state)
 
-  defp handle_responses(responses, state), do: Enum.reduce(responses, state, &handle_response/2)
-
-  defp handle_response({:status, ref, status}, state) do
-    if ref == state.request_ref do
-      Logger.debug("Vagus.Runtime.Events: connected, status #{status}")
-      state = if status == 200, do: resync(state), else: state
-      %{state | backoff_ms: @initial_backoff_ms}
-    else
-      state
-    end
-  end
-
-  defp handle_response({:headers, ref, _headers}, state) do
-    if ref == state.request_ref, do: %{state | backoff_ms: @initial_backoff_ms}, else: state
-  end
-
-  defp handle_response({:data, ref, data}, state) do
-    if ref == state.request_ref, do: process_data(data, state), else: state
-  end
-
-  defp handle_response({:done, ref}, state) do
-    if ref == state.request_ref do
-      if state.conn, do: Mint.HTTP.close(state.conn)
-      schedule_reconnect(:stream_ended, %{state | conn: nil, request_ref: nil})
-    else
-      state
-    end
-  end
-
-  defp handle_response({:error, ref, reason}, state) do
-    if ref == state.request_ref do
-      if state.conn, do: Mint.HTTP.close(state.conn)
-      schedule_reconnect(reason, %{state | conn: nil, request_ref: nil})
-    else
-      state
-    end
-  end
-
-  defp handle_response(_other, state), do: state
-
-  ## Line buffering + decoding
-
-  defp process_data(data, state) do
-    {lines, remainder} = split_lines(state.buffer <> data)
-    state = Enum.reduce(lines, state, &handle_line/2)
-    %{state | buffer: cap_buffer(remainder)}
-  end
-
-  # Docker emits one JSON object per `\n`-terminated line; the last element
-  # of the split is always the (possibly empty, possibly partial) remainder
-  # — kept in the buffer until a future chunk completes it.
-  defp split_lines(buffer) do
-    parts = String.split(buffer, "\n")
-    {complete, [remainder]} = Enum.split(parts, length(parts) - 1)
-    {complete, remainder}
-  end
-
-  defp cap_buffer(buffer) do
-    if byte_size(buffer) > @max_buffer_bytes do
-      Logger.warning(
-        "Vagus.Runtime.Events: pending line exceeded #{@max_buffer_bytes} bytes without a newline; dropping buffer"
-      )
-
-      ""
-    else
-      buffer
-    end
-  end
-
-  defp handle_line("", state), do: state
-
-  defp handle_line(line, state) do
-    case Jason.decode(line) do
-      {:ok, event} ->
-        dispatch(event, state)
-
-      {:error, reason} ->
-        Logger.debug("Vagus.Runtime.Events: malformed event line skipped (#{inspect(reason)})")
-        state
-    end
-  end
-
-  defp dispatch(event, state) do
-    actor = Map.get(event, "Actor") || %{}
-    attributes = Map.get(actor, "Attributes") || %{}
-    name = Map.get(attributes, "name")
-
-    # Core-name pass-through: the adopted Core container has no Vagus label
-    # (and won't until a rebuild), so its fixed name is its identity here.
-    # Container.name/0 is an Application.get_env read — cheap per event.
+  # Core-name pass-through: the adopted Core container has no Vagus label
+  # (and won't until a rebuild), so its fixed name is its identity here.
+  defp dispatch(%Event{name: name} = event, state) do
     managed? =
-      Map.has_key?(attributes, "supervisor_managed") or
+      event.managed or
         (is_binary(name) and
            (String.starts_with?(name, "addon_") or name == Vagus.Core.Container.name()))
 
-    if Map.get(event, "Type") == "container" and managed? do
-      payload = %{
-        action: Map.get(event, "Action"),
-        name: name,
-        id: Map.get(actor, "ID"),
-        exit_code: parse_exit_code(Map.get(attributes, "exitCode")),
-        time_nano: Map.get(event, "timeNano"),
-        attributes: attributes
-      }
-
-      Enum.each(state.subscribers, fn {pid, _ref} -> send(pid, {:docker_event, payload}) end)
-      route_live(payload, state)
+    if managed? do
+      Enum.each(state.subscribers, fn {pid, _ref} -> send(pid, {:engine_event, event}) end)
+      route_live(event, state)
     else
       state
     end
@@ -420,7 +259,7 @@ defmodule Vagus.Runtime.Events do
 
   defp route(%{name: "addon_" <> slug} = payload) do
     case Registry.lookup(Vagus.App.Directory, {:slug, slug}) do
-      [{pid, _value}] -> send(pid, {:docker_event, payload})
+      [{pid, _value}] -> send(pid, {:engine_event, payload})
       [] -> :ok
     end
   rescue
@@ -430,21 +269,26 @@ defmodule Vagus.Runtime.Events do
 
   defp route(_payload), do: :ok
 
-  defp default_list(__MODULE__), do: &list_apps/1
-  defp default_list(_name), do: nil
+  defp list(opts, name, engine_opts) do
+    cond do
+      list = opts[:list] -> list
+      Keyword.get(opts, :resync, name == __MODULE__) -> fn -> list_apps(engine_opts) end
+      true -> nil
+    end
+  end
 
-  defp list_apps(socket), do: Docker.list_containers(all: true, socket: socket)
+  defp list_apps(engine_opts), do: Engine.list([all: true, name_prefix: "addon_"] ++ engine_opts)
 
   defp resync(%{list: nil} = state), do: state
 
   # What an earlier listing still held back is older than this connection.
-  defp resync(%{list: list, socket: socket} = state) do
+  defp resync(%{list: list} = state) do
     state = flush_held(state)
     gen = state.generation + 1
     parent = self()
 
     case Task.Supervisor.start_child(Vagus.TaskSupervisor, fn ->
-           send(parent, {:resync, gen, list.(socket)})
+           send(parent, {:resync, gen, list.()})
          end) do
       {:ok, pid} -> %{state | generation: gen, resync: {Process.monitor(pid), []}}
       {:error, _reason} -> %{state | generation: gen}
@@ -461,37 +305,12 @@ defmodule Vagus.Runtime.Events do
 
   defp flush_held(state), do: state
 
-  defp missed(%{"Id" => id, "Names" => names, "State" => state} = container) do
-    with [name] <- for("/addon_" <> _ = n <- List.wrap(names), do: String.trim_leading(n, "/")),
-         {action, code} when action != nil <- missed_action(state, container["Status"]) do
-      [%{action: action, name: name, id: id, exit_code: code, time_nano: nil, attributes: %{}}]
-    else
-      _ -> []
-    end
-  end
+  # Running and exited only: what an app process acts on, as before.
+  defp missed(%Container{name: "addon_" <> _ = name, state: :running} = c),
+    do: [%Event{action: :start, name: name, id: c.id}]
+
+  defp missed(%Container{name: "addon_" <> _ = name, state: :exited} = c),
+    do: [%Event{action: :die, name: name, id: c.id, exit_code: c.exit_code}]
 
   defp missed(_container), do: []
-
-  defp missed_action("running", _status), do: {"start", nil}
-
-  defp missed_action(state, status) when state in ["exited", "dead"] do
-    case Regex.run(~r/^Exited \((-?\d+)\)/, status || "") do
-      [_, code] -> {"die", String.to_integer(code)}
-      nil -> {"die", nil}
-    end
-  end
-
-  defp missed_action(_state, _status), do: {nil, nil}
-
-  defp parse_exit_code(nil), do: nil
-  defp parse_exit_code(code) when is_integer(code), do: code
-
-  defp parse_exit_code(code) when is_binary(code) do
-    case Integer.parse(code) do
-      {n, _rest} -> n
-      :error -> nil
-    end
-  end
-
-  defp parse_exit_code(_other), do: nil
 end

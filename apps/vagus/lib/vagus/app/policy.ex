@@ -244,20 +244,20 @@ defmodule Vagus.App.Policy do
   def on_event(:settled, data), do: {%{data | attempt: 0}, []}
   def on_event(_event, data), do: {data, []}
 
-  defp container_event(%{action: "start", id: id}, %{container_id: nil} = data)
+  defp container_event(%{action: :start, id: id}, %{container_id: nil} = data)
        when is_binary(id),
        do: observe(%{data | container_id: id}, {:running, false}, [])
 
   defp container_event(%{id: id}, %{container_id: current} = data) when id != current,
     do: {data, []}
 
-  defp container_event(%{action: "die"} = event, data),
+  defp container_event(%{action: :die} = event, data),
     do: died(data, {:exited, Map.get(event, :exit_code)})
 
-  defp container_event(%{action: "health_status: healthy"}, data),
+  defp container_event(%{action: :health, health: :healthy}, data),
     do: observe(data, :healthy, [])
 
-  defp container_event(%{action: "health_status: unhealthy"}, data) do
+  defp container_event(%{action: :health, health: :unhealthy}, data) do
     {data, effects} = observe(data, :unhealthy, [])
     retry(data, effects)
   end

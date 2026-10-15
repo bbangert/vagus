@@ -287,7 +287,7 @@ defmodule Vagus.App.Server do
   defp event({:timeout, :probe_deadline}, ref, state, %{probe: {pid, ref}} = data),
     do: strike(:unhealthy, state, kill(pid, data))
 
-  defp event(:info, {:docker_event, _payload}, {:busy, _op}, _data),
+  defp event(:info, {:engine_event, _event}, {:busy, _op}, _data),
     do: {:keep_state_and_data, [:postpone]}
 
   defp event(:info, {:DOWN, ref, :process, _pid, _reason}, {:busy, _op}, %{broker_ref: ref}),
@@ -297,8 +297,8 @@ defmodule Vagus.App.Server do
        when name in [:retry, :settled, :probe],
        do: {:keep_state_and_data, [:postpone]}
 
-  defp event(:info, {:docker_event, payload}, state, data) when state != :new,
-    do: on_event(payload, state, data)
+  defp event(:info, {:engine_event, event}, state, data) when state != :new,
+    do: on_event(event, state, data)
 
   defp event(:info, {:DOWN, ref, :process, _pid, reason}, state, %{broker_ref: ref} = data),
     do: on_event({:broker_down, reason}, state, %{data | broker_ref: nil})

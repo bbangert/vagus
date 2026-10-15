@@ -8,6 +8,7 @@ defmodule Vagus.App.ServerTest do
   alias Vagus.App
   alias Vagus.App.File, as: AppFile
   alias Vagus.App.{Instances, Policy, Server}
+  alias Vagus.Runtime.Engine.Event
 
   @started %{container_id: "c1", ip: "172.30.33.9"}
 
@@ -543,8 +544,8 @@ defmodule Vagus.App.ServerTest do
       t = op(pid, {:stop, %{}})
       {_input, task} = step(:stop)
 
-      send(pid, {:docker_event, %{id: "c1", action: "start"}})
-      send(pid, {:docker_event, %{id: "c1", action: "die", exit_code: 137}})
+      send(pid, {:engine_event, %Event{id: "c1", action: :start}})
+      send(pid, {:engine_event, %Event{id: "c1", action: :die, exit_code: 137}})
       send(task, {:outcome, {:ok, %{was_running: true}}})
       assert :ok = Task.await(t)
 
@@ -555,7 +556,7 @@ defmodule Vagus.App.ServerTest do
     test "a restart pending when a user start fails is not run" do
       app_deadlines(%{retry: 150})
       {_slug, pid} = started(%{}, watchdog: true)
-      send(pid, {:docker_event, %{id: "c1", action: "die", exit_code: 1}})
+      send(pid, {:engine_event, %Event{id: "c1", action: :die, exit_code: 1}})
       assert %{attempt: 1} = data(pid)
 
       t = op(pid, {:start, %{}})
@@ -567,7 +568,7 @@ defmodule Vagus.App.ServerTest do
     test "a restart that came due during an operation which started the app again is dropped" do
       app_deadlines(%{retry: 100})
       {slug, pid} = started(%{"version" => "1"}, watchdog: true)
-      send(pid, {:docker_event, %{id: "c1", action: "die", exit_code: 1}})
+      send(pid, {:engine_event, %Event{id: "c1", action: :die, exit_code: 1}})
       t = op(pid, {:update, %{config: app_config(slug, %{"version" => "2"})}})
       {_input, task} = step(:pull)
       Process.send_after(self(), :due, 300)
@@ -742,7 +743,7 @@ defmodule Vagus.App.ServerTest do
       t = op(pid, {:backup, %{staging_dir: "/nonexistent"}})
       {_input, task} = step(:snapshot)
 
-      send(pid, {:docker_event, %{id: "c1", action: "die", exit_code: 1}})
+      send(pid, {:engine_event, %Event{id: "c1", action: :die, exit_code: 1}})
       assert {:ok, %{state: :started}} = App.info(slug)
       send(task, {:outcome, {:ok, "/nonexistent/a.tar.gz"}})
       assert {:ok, "/nonexistent/a.tar.gz"} = Task.await(t)
