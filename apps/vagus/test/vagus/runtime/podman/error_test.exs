@@ -1,6 +1,7 @@
 defmodule Vagus.Runtime.Podman.ErrorTest do
-  # Classifies what a real podman 6.1.4 printed, not texts written for the
-  # test: each case names a recorded command in cli_results.txt.
+  # Classifies what a real podman 6.1.4 printed: each case names a recorded
+  # command in cli_results.txt. The lock, signal and detail cases are
+  # synthetic; podman never printed them for us.
   use ExUnit.Case, async: true
 
   alias Vagus.Runtime.Podman.Error
@@ -85,14 +86,26 @@ defmodule Vagus.Runtime.Podman.ErrorTest do
     assert detail =~ "has no defined healthcheck"
   end
 
-  test "lock texts are :busy" do
-    for text <- [
-          "Error: database is locked",
-          "Error: timed out waiting for lock",
-          "Error: acquiring lock 3: timeout"
-        ] do
-      assert Error.classify(:inspect, 125, text) == {:error, :busy}
+  test "SQLite's lock text is :busy; a mere mention of a lock is not" do
+    assert Error.classify(:inspect, 125, "Error: database is locked") == {:error, :busy}
+
+    for text <- ["Error: clock skew: timeout", "Error: block device lock timeout"] do
+      assert {:error, {:failed, :inspect, _}} = Error.classify(:inspect, 125, text)
     end
+  end
+
+  test "a name in use is :conflict only for create" do
+    text = "Error: that name is already in use"
+    assert Error.classify(:create, 125, text) == {:error, :conflict}
+    assert {:error, {:failed, :start, _}} = Error.classify(:start, 125, text)
+  end
+
+  test "the detail is cut at a codepoint boundary" do
+    # 601 bytes of 3-byte codepoints: the last 512 start mid-codepoint.
+    output = "a" <> String.duplicate("€", 200)
+    assert {:error, {:failed, :start, detail}} = Error.classify(:start, 125, output)
+    assert String.valid?(detail)
+    assert byte_size(detail) <= 512 and byte_size(detail) >= 510
   end
 
   test "podman killed by a signal is :unavailable, but an exec's status is the command's" do

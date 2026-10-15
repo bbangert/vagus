@@ -5,32 +5,21 @@ defmodule Vagus.Runtime.Host do
 
   ## Preparation
 
-  Runs in `handle_continue/2`, so permit requests queue behind it and none is
-  granted before it ends. In order, each step idempotent:
+  Runs in `handle_continue/2`, so no permit is granted before the board is
+  set up. Every step is idempotent, and only the readiness probe
+  (`podman info`, run in a task and retried every `:prep_retry_ms`) can
+  fail preparation: a board missing an earlier step still runs most
+  containers, so those log and go on.
 
-    1. `mount --make-rshared /`: `rslave` app binds need a shared root.
-    2. The Core socket dir, mode 0700, which must exist before Core's create
-       binds it.
-    3. `/run/resolv.conf`, the host resolver host-network containers and
-       pulls read.
-    4. The profile (`frugal` below 2 GiB of RAM, else `fast`; the override
-       file wins), its `containers.conf` drop-in, and the env every podman
-       spawn carries.
-    5. `<graphroot>/tmp`, which a pull needs to exist, emptied once per VM
-       boot: a marker in `/run` keeps a Vagus restart from deleting the
-       spool of a pull still running.
-    6. `podman info`, the readiness probe. On failure the probe is retried
-       every `:prep_retry_ms`.
-
-  Only the probe can fail preparation; the earlier steps log and go on,
-  because a board without them still runs most containers.
+  The pull spool is emptied once per VM boot: a marker in `/run` keeps a
+  Vagus restart from deleting the spool of a pull still running.
 
   ## Permits
 
   `:pull` (1), `:ops` (2 frugal, 4 fast) and one reserved `:shutdown` permit
   for `stop_all`. Holders and waiters are monitored, so a crashed holder
   frees its permit. Once `Vagus.Host.Shutdown.in_flight?/0` is true, new
-  `:pull` permits are refused.
+  and queued `:pull` requests are refused.
 
   ## Shared state
 
@@ -97,9 +86,6 @@ defmodule Vagus.Runtime.Host do
     end
   end
 
-  @spec ready?(atom() | nil) :: boolean()
-  def ready?(host \\ nil), do: ready(host) == :ok
-
   @spec profile(atom() | nil) :: profile() | nil
   def profile(host \\ nil), do: shared(host)[:profile]
 
@@ -124,7 +110,6 @@ defmodule Vagus.Runtime.Host do
     end
   end
 
-  @doc "The previous stats sample for `name`, or nil."
   @spec last_sample(atom() | nil, String.t()) :: term()
   def last_sample(host, name) do
     with tid when tid != nil <- shared(host)[:stats],
@@ -146,13 +131,21 @@ defmodule Vagus.Runtime.Host do
     ArgumentError -> :ok
   end
 
+  @spec forget_sample(atom() | nil, String.t()) :: :ok
+  def forget_sample(host, name) do
+    if tid = shared(host)[:stats], do: :ets.delete(tid, name)
+    :ok
+  rescue
+    ArgumentError -> :ok
+  end
+
   @doc """
   Takes a permit of `class`, waiting up to `wait_ms` behind other holders.
   `{:error, :busy}` when the wait runs out, `:shutting_down` for a `:pull`
   during shutdown, `:unavailable` when no Host runs.
   """
   @spec checkout(atom() | nil, class(), non_neg_integer()) ::
-          {:ok, permit()} | {:error, :busy | :shutting_down | :unavailable}
+          {:ok, permit()} | {:error, :busy | :shutting_down | :unavailable | :badarg}
   def checkout(host, class, wait_ms) do
     host = host || __MODULE__
     ref = make_ref()
@@ -170,6 +163,7 @@ defmodule Vagus.Runtime.Host do
       :queued ->
         receive do
           {__MODULE__, :granted, ^ref} -> {:ok, {host, ref}}
+          {__MODULE__, :refused, ^ref, reason} -> {:error, reason}
         after
           max(deadline - System.monotonic_time(:millisecond), 0) -> abandon(host, ref)
         end
@@ -182,7 +176,6 @@ defmodule Vagus.Runtime.Host do
   @spec checkin(permit()) :: :ok
   def checkin({host, ref}), do: GenServer.cast(host, {:release, ref})
 
-  @doc "Runs `fun` under a permit; the permit's error when none is had."
   @spec with_permit(atom() | nil, class(), non_neg_integer(), (-> result)) ::
           result | {:error, :busy | :shutting_down | :unavailable}
         when result: term()
@@ -200,13 +193,18 @@ defmodule Vagus.Runtime.Host do
     end
   end
 
-  # The request may still be queued or even granted by now; the cancel
-  # follows it in this caller's order, so the Host drops either.
+  # The request may still be queued or even granted by now. Once the Host
+  # has answered the cancel, any grant or refusal it sent is already here.
   defp abandon(host, ref) do
-    GenServer.cast(host, {:release, ref})
+    try do
+      GenServer.call(host, {:cancel, ref})
+    catch
+      :exit, _ -> :ok
+    end
 
     receive do
       {__MODULE__, :granted, ^ref} -> :ok
+      {__MODULE__, :refused, ^ref, _reason} -> :ok
     after
       0 -> :ok
     end
@@ -220,7 +218,7 @@ defmodule Vagus.Runtime.Host do
   @impl true
   def init(opts) do
     name = Keyword.fetch!(opts, :name)
-    stats = :ets.new(__MODULE__.Stats, [:public, read_concurrency: true, write_concurrency: true])
+    stats = :ets.new(__MODULE__.Stats, [:public])
 
     state = %{
       name: name,
@@ -228,6 +226,8 @@ defmodule Vagus.Runtime.Host do
       stats: stats,
       profile: nil,
       env: [],
+      published: nil,
+      probe: nil,
       permits: Keyword.get(opts, :permits, @permits.frugal),
       free: %{},
       holders: %{},
@@ -245,10 +245,14 @@ defmodule Vagus.Runtime.Host do
     write_resolv_conf(state.opts)
     state = state |> apply_profile() |> publish(:preparing)
     clear_spool_once(state.opts)
-    {:noreply, probe(state)}
+    {:noreply, start_probe(state)}
   end
 
   @impl true
+  def handle_call({:acquire, class, _ref}, _from, state)
+      when not is_map_key(state.free, class),
+      do: {:reply, {:error, :badarg}, state}
+
   def handle_call({:acquire, class, ref}, {pid, _tag}, state) do
     cond do
       class == :pull and shutting_down?(state.opts) ->
@@ -264,10 +268,20 @@ defmodule Vagus.Runtime.Host do
     end
   end
 
+  def handle_call({:cancel, ref}, _from, state), do: {:reply, :ok, release(state, ref)}
+
   @impl true
   def handle_cast({:release, ref}, state), do: {:noreply, release(state, ref)}
 
   @impl true
+  def handle_info({ref, result}, %{probe: ref} = state) do
+    Process.demonitor(ref, [:flush])
+    {:noreply, probed(%{state | probe: nil}, result)}
+  end
+
+  def handle_info({:DOWN, ref, :process, _pid, reason}, %{probe: ref} = state),
+    do: {:noreply, probed(%{state | probe: nil}, {:error, {:probe_crashed, reason}})}
+
   def handle_info({:DOWN, mon, :process, _pid, _reason}, state) do
     held = for {ref, {_class, _pid, ^mon}} <- state.holders, do: ref
     state = Enum.reduce(held, state, &release(&2, &1))
@@ -278,7 +292,12 @@ defmodule Vagus.Runtime.Host do
     {:noreply, %{state | waiting: waiting}}
   end
 
-  def handle_info(:probe, state), do: {:noreply, probe(state)}
+  def handle_info(:probe, state), do: {:noreply, start_probe(state)}
+
+  def handle_info(msg, state) do
+    Logger.debug("Vagus.Runtime.Host: ignored #{inspect(msg)}")
+    {:noreply, state}
+  end
 
   defp grant(state, class, ref, pid) do
     holders = Map.put(state.holders, ref, {class, pid, Process.monitor(pid)})
@@ -304,8 +323,15 @@ defmodule Vagus.Runtime.Host do
     case :queue.out(state.waiting[class]) do
       {{:value, {ref, pid, mon}}, rest} ->
         Process.demonitor(mon, [:flush])
-        send(pid, {__MODULE__, :granted, ref})
-        grant(%{state | waiting: Map.put(state.waiting, class, rest)}, class, ref, pid)
+        state = %{state | waiting: Map.put(state.waiting, class, rest)}
+
+        if class == :pull and shutting_down?(state.opts) do
+          send(pid, {__MODULE__, :refused, ref, :shutting_down})
+          hand_over(state, class)
+        else
+          send(pid, {__MODULE__, :granted, ref})
+          grant(state, class, ref, pid)
+        end
 
       {:empty, _} ->
         state
@@ -323,34 +349,36 @@ defmodule Vagus.Runtime.Host do
     %{state | waiting: waiting}
   end
 
+  # Each put of a changed term costs a global GC pass, so only changes go out.
   defp publish(state, status) do
-    :persistent_term.put(
-      {__MODULE__, state.name},
-      %{
-        status: status,
-        env: state.env,
-        stats: state.stats,
-        profile: state.profile,
-        spools: [spool_dir(state.opts), Path.join(run_dir(state.opts), "spool")],
-        pull_permits: state.permits[:pull]
-      }
-    )
+    shared = %{
+      status: status,
+      env: state.env,
+      stats: state.stats,
+      profile: state.profile,
+      spools: [spool_dir(state.opts), Path.join(run_dir(state.opts), "spool")],
+      pull_permits: state.permits[:pull]
+    }
 
-    state
+    if shared != state.published, do: :persistent_term.put({__MODULE__, state.name}, shared)
+    %{state | published: shared}
   end
 
-  defp probe(state) do
+  # Off the Host's own process, so permits keep flowing while podman info
+  # takes its time.
+  defp start_probe(state) do
     probe = Keyword.get(state.opts, :probe, &default_probe/1)
+    opts = Keyword.put(state.opts, :host, state.name)
+    supervisor = Keyword.get(state.opts, :task_supervisor, Vagus.TaskSupervisor)
+    %{state | probe: Task.Supervisor.async_nolink(supervisor, fn -> probe.(opts) end).ref}
+  end
 
-    case probe.(Keyword.put(state.opts, :host, state.name)) do
-      :ok ->
-        publish(state, :ready)
+  defp probed(state, :ok), do: publish(state, :ready)
 
-      {:error, reason} ->
-        Logger.error("Vagus.Runtime.Host: podman probe failed: #{inspect(reason)}")
-        Process.send_after(self(), :probe, Keyword.get(state.opts, :prep_retry_ms, 5_000))
-        publish(state, {:prep_failed, reason})
-    end
+  defp probed(state, {:error, reason}) do
+    Logger.error("Vagus.Runtime.Host: podman probe failed: #{inspect(reason)}")
+    Process.send_after(self(), :probe, Keyword.get(state.opts, :prep_retry_ms, 5_000))
+    publish(state, {:prep_failed, reason})
   end
 
   defp default_probe(opts) do
@@ -431,9 +459,9 @@ defmodule Vagus.Runtime.Host do
   end
 
   @doc """
-  `:frugal` below 2 GiB of `MemTotal`, else `:fast`; a readable override
-  file holding `frugal` or `fast` wins. An unreadable meminfo is frugal,
-  the profile that cannot OOM a small board.
+  The override file wins, else 2 GiB of `MemTotal` divides `:frugal` from
+  `:fast`. An unreadable meminfo is frugal, the profile that cannot OOM a
+  small board.
   """
   @spec pick_profile(keyword()) :: profile()
   def pick_profile(opts) do
@@ -453,7 +481,6 @@ defmodule Vagus.Runtime.Host do
     end
   end
 
-  @doc "The `containers.conf` drop-in for `profile`."
   @spec containers_conf(profile(), keyword()) :: String.t()
   def containers_conf(:frugal, opts) do
     """

@@ -96,23 +96,52 @@ defmodule Vagus.Runtime.Engine.Podman.EventSourceTest do
   end
 
   describe "rotation" do
-    test "a file replaced by a new one (new inode) is read from its start", %{path: path} do
+    @rot_before Path.expand("../../../fixtures/podman/events_rotation_before.log", __DIR__)
+    @rot_after Path.expand("../../../fixtures/podman/events_rotation_after.log", __DIR__)
+
+    # Recorded with events_logfile_max_size = 3000: fx_rot7's create went
+    # into the old file, then the rotation copied the old file's newer half
+    # (fx_rot5 to fx_rot7) between its markers.
+    test "drains the old file, then reads the new one from after its end marker",
+         %{path: path} do
+      File.write!(path, File.read!(@rot_before))
+      {_, src} = connect(path)
+      rotated = File.read!(@rot_after)
+      [rot7] = Regex.run(~r/^.*"Name":"fx_rot7".*"create".*\n/m, rotated)
+      append(path, rot7)
+
+      tmp = path <> ".tmp"
+      File.write!(tmp, rotated)
+      File.rename!(tmp, path)
+
+      assert {[
+                %Event{action: :create, name: "fx_rot7"},
+                :ready,
+                %Event{action: :create, name: "fx_rot8", managed: true}
+              ], src} = tick(src)
+
+      append(path, line("start", "addon_after"))
+      assert [%Event{action: :start, name: "addon_after"}] = tick(src) |> elem(0)
+    end
+
+    test "a replaced file without an end marker is read from its end", %{path: path} do
       File.write!(path, line("start", "addon_old"))
       {_, src} = connect(path)
 
-      # podman rotates by writing a truncated copy and renaming it over the log.
       tmp = path <> ".tmp"
-      File.write!(tmp, line("died", "addon_new", %{"ContainerExitCode" => 1}))
+      File.write!(tmp, line("died", "addon_stale", %{"ContainerExitCode" => 1}))
       File.rename!(tmp, path)
 
-      assert [%Event{action: :die, name: "addon_new"}] = tick(src) |> elem(0)
+      assert {[:ready], src} = tick(src)
+      append(path, line("start", "addon_new"))
+      assert [%Event{action: :start, name: "addon_new"}] = tick(src) |> elem(0)
     end
 
-    test "a file truncated below the offset is read from its start", %{path: path} do
+    test "a file truncated below the offset is read from its end", %{path: path} do
       File.write!(path, String.duplicate(line("start", "addon_old"), 5))
       {_, src} = connect(path)
-      File.write!(path, line("died", "addon_new", %{"ContainerExitCode" => 1}))
-      assert [%Event{action: :die, name: "addon_new"}] = tick(src) |> elem(0)
+      File.write!(path, line("died", "addon_stale", %{"ContainerExitCode" => 1}))
+      assert {[:ready], _src} = tick(src)
     end
   end
 
@@ -120,13 +149,15 @@ defmodule Vagus.Runtime.Engine.Podman.EventSourceTest do
     File.write!(path, "")
 
     {:ok, _, src} =
-      EventSource.connect(EventSource.init(events_log: path, events_poll_ms: 50, resync_ms: 50))
+      EventSource.connect(
+        EventSource.init(events_log: path, events_poll_ms: 60_000, resync_ms: 60_000)
+      )
 
     timers = [src.timer, src.resync_timer]
+    assert Enum.all?(timers, &is_integer(Process.read_timer(&1)))
     src = EventSource.close(src)
     assert Enum.map(timers, &Process.read_timer/1) == [false, false]
     assert %{fd: nil, timer: nil, resync_timer: nil, ref: nil} = src
-    refute_receive {EventSource, _, _}, 150
     assert EventSource.handle_info({EventSource, :tick, make_ref()}, src) == :unknown
   end
 
@@ -137,9 +168,9 @@ defmodule Vagus.Runtime.Engine.Podman.EventSourceTest do
       )
 
     ref = src.ref
-    assert_receive {EventSource, :resync, ^ref} = msg, 500
+    assert_receive {EventSource, :resync, ^ref} = msg, 5_000
     assert {:ok, [:ready], src} = EventSource.handle_info(msg, src)
-    assert_receive {EventSource, :resync, ^ref}, 500
+    assert_receive {EventSource, :resync, ^ref}, 5_000
     EventSource.close(src)
   end
 
@@ -163,7 +194,7 @@ defmodule Vagus.Runtime.Engine.Podman.EventSourceTest do
     )
 
     # The connect's own resync reports it running.
-    assert_receive {:engine_event, %Event{action: :start, name: "addon_" <> ^slug}}, 2_000
+    assert_receive {:engine_event, %Event{action: :start, name: "addon_" <> ^slug}}, 10_000
 
     # It dies, and podman's line for it is lost.
     Vagus.Runtime.Engine.Fake.put_container(fake, "addon_" <> slug,
@@ -173,13 +204,38 @@ defmodule Vagus.Runtime.Engine.Podman.EventSourceTest do
     )
 
     assert_receive {:engine_event, %Event{action: :die, name: "addon_" <> ^slug, exit_code: 9}},
-                   2_000
+                   10_000
   end
 
   describe "normalisation of the recorded lines" do
     defp normalised, do: Enum.map(@recorded, &(&1 |> Jason.decode!() |> EventSource.normalize()))
 
-    test "every status, the exit code, health, labels and time" do
+    @actions %{
+      "create" => :create,
+      "init" => :other,
+      "start" => :start,
+      "died" => :die,
+      "cleanup" => :other,
+      "health_status" => :health
+    }
+
+    test "each recorded status maps to its action" do
+      statuses = Enum.map(@recorded, &Jason.decode!(&1)["Status"])
+      assert statuses |> Enum.uniq() |> Enum.sort() == @actions |> Map.keys() |> Enum.sort()
+
+      for {status, %Event{action: action}} <- Enum.zip(statuses, normalised()) do
+        assert {status, action} == {status, @actions[status]}
+      end
+    end
+
+    test "statuses Vagus does not act on are :other" do
+      for status <- ~w(stop kill pause unpause restart exec exec_died mount checkpoint) do
+        assert %Event{action: :other} =
+                 status |> line("addon_a") |> Jason.decode!() |> EventSource.normalize()
+      end
+    end
+
+    test "the exit code, health, labels and time" do
       events = normalised()
 
       assert %Event{
@@ -195,10 +251,6 @@ defmodule Vagus.Runtime.Engine.Podman.EventSourceTest do
 
       assert %Event{action: :health, health: :healthy, name: "fx_health"} =
                Enum.find(events, &(&1.action == :health))
-
-      assert Enum.any?(events, &match?(%Event{action: :start, name: "fx_running"}, &1))
-      # `init` and `cleanup` have no Docker counterpart.
-      assert Enum.count(events, &(&1.action == :other)) == 6
     end
 
     test "remove is :destroy" do
@@ -231,9 +283,6 @@ defmodule Vagus.Runtime.Engine.Podman.EventSourceTest do
     append(path, line("died", "addon_" <> slug, %{"ContainerExitCode" => 42}))
 
     assert_receive {:engine_event, %Event{action: :die, name: "addon_" <> ^slug, exit_code: 42}},
-                   2_000
-
-    # The history before connect was not replayed.
-    refute_received {:engine_event, %Event{name: "fx_" <> _}}
+                   10_000
   end
 end

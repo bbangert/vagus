@@ -3,11 +3,21 @@ defmodule Vagus.Runtime.Engine.Podman do
   `Vagus.Runtime.Engine` over the `podman` CLI, one process per call
   (`Vagus.Runtime.Podman.Cmd`), each under a `Vagus.Runtime.Host` permit.
 
-  `:timeout_ms` bounds the permit wait and the command together; without
-  it each verb class has its own deadline (queries 15 s, lifecycle 60 s,
-  exec 60 s, pull 1 h). A stop's deadline is never shorter than its grace
-  plus 15 s, because podman only SIGKILLs the container once the grace is
-  spent. Adapter-specific opts: `host:` (the Host's name), `podman_bin:`.
+  `:timeout_ms` bounds the permit wait and the command together, across
+  every podman call a callback makes; without it each verb class has its
+  own deadline (queries 15 s, lifecycle 60 s, exec 60 s, pull 1 h). Once a
+  stop has its permit, the command still gets its grace plus 15 s, because
+  podman only SIGKILLs the container once the grace is spent; without
+  `timeout_s` that grace is podman's default 10 s. Adapter-specific opts:
+  `host:` (the Host's name), `podman_bin:`, and for tests of the stop
+  floor `default_stop_grace_s:` (podman's default, 10) and
+  `stop_margin_ms:` (15 000).
+
+  Names and image refs are checked before podman sees them. An image ref
+  must be a registry reference: podman would also take `oci-archive:`,
+  `dir:` and other transports, reading a host path an app's config named,
+  and `create` imports such an archive even with `--pull=never`. Pulls go
+  through `docker://` so only a registry is ever contacted.
 
   Idempotence comes from flags (`--ignore`, `rm -f -t 0`) rather than
   from parsing, except where podman has none.
@@ -30,7 +40,7 @@ defmodule Vagus.Runtime.Engine.Podman do
   @stop_margin_ms 15_000
   # podman stop's own default grace when no `-t` is given.
   @default_grace_s 10
-  @logs_cap 4 * 1_048_576
+  @logs_cap 16 * 1_048_576
   @discard_cap 65_536
   # A first sample older than this is no base for a CPU delta.
   @stale_sample_ms 600_000
@@ -50,6 +60,23 @@ defmodule Vagus.Runtime.Engine.Podman do
   }
 
   @zero_time "0001-01-01T00:00:00Z"
+
+  @name_re ~r/\A[a-zA-Z0-9][a-zA-Z0-9_.-]*\z/
+  # distribution/reference's grammar: optional registry host[:port], path
+  # components, then a tag and/or digest.
+  @image_re ~r"""
+  \A
+  (?:(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?)(?:\.(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?))*(?::\d+)?/)?
+  [a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*
+  (?:/[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*)*
+  (?::[\w][\w.-]{0,127})?
+  (?:@[A-Za-z][A-Za-z0-9]*(?:[-_+.][A-Za-z][A-Za-z0-9]*)*:[0-9a-fA-F]{32,})?
+  \z
+  """x
+  # A name and tag can spell one of these too (`oci:latest`); podman reads
+  # them as transports.
+  @transports ~w(containers-storage docker docker-archive docker-daemon dir oci oci-archive sif tarball)
+  @port_key_re ~r/\A\d{1,5}(\/(tcp|udp|sctp))?\z/
 
   # `stopped` is podman's exited-but-not-cleaned-up state. 6.1.4 never
   # reports `restarting` (its field is a TODO); mapped for parity only.
@@ -81,30 +108,39 @@ defmodule Vagus.Runtime.Engine.Podman do
   @impl true
   def pull(image, opts) do
     platform = if p = opts[:platform], do: ["--platform", p], else: []
+    args = ["pull", "--quiet" | platform] ++ ["--", "docker://" <> image]
 
-    args = ["pull", "--quiet" | platform] ++ ["--", image]
+    case valid_image(:pull, image) do
+      :ok ->
+        case run(:pull, args, opts, @pull_ms, &clear_spool_on_failure(&1, opts[:host])) do
+          {:ok, _id} -> :ok
+          {:exit, 125, out} -> {:error, {:pull_failed, registry_message(out)}}
+          other -> unit(:pull, other)
+        end
 
-    case run(:pull, args, opts, @pull_ms, &clear_spool_on_failure(&1, opts[:host])) do
-      {:ok, _id} -> :ok
-      {:exit, 125, out} -> {:error, {:pull_failed, registry_message(out)}}
-      other -> unit(:pull, other)
+      {:error, {:failed, :pull, reason}} ->
+        {:error, {:pull_failed, reason}}
     end
   end
 
   @impl true
   def image_present?(image, opts) do
-    case run(:image_present?, ["image", "exists", "--", image], opts, @query_ms) do
-      {:ok, _} -> true
-      {:exit, 1, _} -> false
-      other -> unit(:image_present?, other)
+    with :ok <- valid_image(:image_present?, image) do
+      case run(:image_present?, ["image", "exists", "--", image], opts, @query_ms) do
+        {:ok, _} -> true
+        {:exit, 1, _} -> false
+        other -> unit(:image_present?, other)
+      end
     end
   end
 
   @impl true
   def remove_image(image, opts) do
-    case run(:remove_image, ["rmi", "--ignore", "--", image], opts, @lifecycle_ms) do
-      {:exit, 1, _} -> :ok
-      other -> unit(:remove_image, other)
+    with :ok <- valid_image(:remove_image, image) do
+      case run(:remove_image, ["rmi", "--ignore", "--", image], opts, @lifecycle_ms) do
+        {:exit, 1, _} -> :ok
+        other -> unit(:remove_image, other)
+      end
     end
   end
 
@@ -112,45 +148,56 @@ defmodule Vagus.Runtime.Engine.Podman do
   def create(%ContainerSpec{} = spec, opts) do
     secrets = for {k, v} <- spec.env || [], k in spec.secret_env, do: {k, v}
 
-    case run(:create, render_create(spec), [env: secrets] ++ opts, @lifecycle_ms) do
-      {:ok, out} -> {:ok, out |> String.trim() |> String.split("\n") |> List.last()}
-      other -> unit(:create, other)
+    with :ok <- validate(spec),
+         {:ok, out} <-
+           ok(:create, run(:create, render_create(spec), [env: secrets] ++ opts, @lifecycle_ms)) do
+      {:ok, out |> String.trim() |> String.split("\n") |> List.last()}
     end
-  rescue
-    e in ArgumentError -> {:error, {:failed, :create, Exception.message(e)}}
   end
 
   @impl true
-  def start(name, opts), do: unit(:start, run(:start, ["start", "--", name], opts, @lifecycle_ms))
+  def start(name, opts) do
+    with :ok <- valid_name(:start, name),
+         do: unit(:start, run(:start, ["start", "--", name], opts, @lifecycle_ms))
+  end
 
   @impl true
   def stop(name, opts) do
-    {t, ms} = grace(opts)
+    {t, floor} = grace(opts)
+    opts = [floor_ms: floor] ++ with_deadline(opts, floor)
 
-    case run(:stop, ["stop" | t] ++ ["--", name], opts, ms) do
-      {:exit, _, out} = failed ->
-        if paused_refusal?(out),
-          do: unpause_then_stop(name, t, opts, ms),
-          else: unit(:stop, failed)
+    with :ok <- valid_name(:stop, name) do
+      case run(:stop, ["stop" | t] ++ ["--", name], opts, floor) do
+        {:exit, _, out} = failed ->
+          if paused_refusal?(out),
+            do: unpause_then_stop(name, t, opts),
+            else: unit(:stop, failed)
 
-      other ->
-        unit(:stop, other)
+        other ->
+          unit(:stop, other)
+      end
     end
   end
 
   # podman refuses to stop a paused container; Docker unpauses it first.
   defp paused_refusal?(out), do: out =~ "paused" and out =~ "container state improper"
 
-  defp unpause_then_stop(name, t, opts, ms) do
-    with :ok <- unit(:stop, run(:stop, ["unpause", "--", name], opts, @lifecycle_ms)) do
-      unit(:stop, run(:stop, ["stop" | t] ++ ["--", name], opts, ms))
+  defp unpause_then_stop(name, t, opts) do
+    unpause_opts = Keyword.delete(opts, :floor_ms)
+
+    with :ok <- unit(:stop, run(:stop, ["unpause", "--", name], unpause_opts, @lifecycle_ms)) do
+      unit(:stop, run(:stop, ["stop" | t] ++ ["--", name], opts, @lifecycle_ms))
     end
   end
 
   @impl true
   def restart(name, opts) do
-    {t, ms} = grace(opts)
-    unit(:restart, run(:restart, ["restart" | t] ++ ["--", name], opts, ms + @lifecycle_ms))
+    {t, floor} = grace(opts)
+    floor = floor + @lifecycle_ms
+    opts = [floor_ms: floor] ++ with_deadline(opts, floor)
+
+    with :ok <- valid_name(:restart, name),
+         do: unit(:restart, run(:restart, ["restart" | t] ++ ["--", name], opts, floor))
   end
 
   @doc """
@@ -161,23 +208,26 @@ defmodule Vagus.Runtime.Engine.Podman do
   def stop_all([], _timeout_s, _opts), do: {:ok, [], []}
 
   def stop_all(names, timeout_s, opts) do
-    opts = Keyword.put(opts, :timeout_s, timeout_s)
-    {t, ms} = grace(opts)
+    {t, floor} = grace(Keyword.put(opts, :timeout_s, timeout_s))
+    opts = [floor_ms: floor, class: :shutdown] ++ with_deadline(opts, floor)
+    {valid, invalid} = Enum.split_with(names, &(valid_name(:stop, &1) == :ok))
+    bad = for name <- invalid, do: {name, {:failed, :stop, {:invalid_name, name}}}
 
-    case run(:stop_all, ["stop", "--ignore" | t] ++ ["--" | names], opts, ms) do
-      {:ok, _} -> {:ok, names, []}
-      {:exit, _status, out} -> split_stopped(names, out, opts)
-      {:error, _} = error -> {:ok, [], Enum.map(names, &{&1, stop_error(error)})}
+    case valid != [] && run(:stop_all, ["stop", "--ignore" | t] ++ ["--" | valid], opts, floor) do
+      false -> {:ok, [], bad}
+      {:ok, _} -> {:ok, valid, bad}
+      {:exit, _status, out} -> split_stopped(valid, out, Keyword.delete(opts, :floor_ms), bad)
+      {:error, _} = error -> {:ok, [], Enum.map(valid, &{&1, stop_error(error)}) ++ bad}
     end
   end
 
   # podman prints each stopped name and skips (`--ignore`) an absent one, so
   # an unprinted name is either absent or failed; `exists` tells which.
-  defp split_stopped(names, out, opts) do
+  defp split_stopped(names, out, opts, bad) do
     printed = out |> String.split("\n", trim: true) |> MapSet.new()
     detail = Error.detail(out)
 
-    Enum.reduce(Enum.reverse(names), {:ok, [], []}, fn name, {:ok, stopped, failed} ->
+    Enum.reduce(Enum.reverse(names), {:ok, [], bad}, fn name, {:ok, stopped, failed} ->
       cond do
         name in printed -> {:ok, [name | stopped], failed}
         exists(name, opts) == {:error, :not_found} -> {:ok, [name | stopped], failed}
@@ -203,9 +253,15 @@ defmodule Vagus.Runtime.Engine.Podman do
         do: ["rm", "--force", "--ignore", "--time", "0", "--", name],
         else: ["rm", "--ignore", "--", name]
 
-    case unit(:remove, run(:remove, args, opts, @lifecycle_ms)) do
-      {:error, :not_found} -> :ok
-      other -> other
+    with :ok <- valid_name(:remove, name) do
+      case unit(:remove, run(:remove, args, opts, @lifecycle_ms)) do
+        result when result in [:ok, {:error, :not_found}] ->
+          Host.forget_sample(opts[:host], name)
+          :ok
+
+        other ->
+          other
+      end
     end
   end
 
@@ -215,7 +271,8 @@ defmodule Vagus.Runtime.Engine.Podman do
   end
 
   defp inspect_raw(name, opts) do
-    with {:ok, out} <-
+    with :ok <- valid_name(:inspect, name),
+         {:ok, out} <-
            ok(:inspect, run(:inspect, ["container", "inspect", "--", name], opts, @query_ms)),
          {:ok, [raw | _]} <- decode(:inspect, out) do
       {:ok, raw}
@@ -261,7 +318,9 @@ defmodule Vagus.Runtime.Engine.Podman do
   def logs(name, opts) do
     stamps = if opts[:timestamps], do: ["--timestamps"], else: []
     args = ["logs", "--tail", to_string(Keyword.get(opts, :tail, 100))] ++ stamps ++ ["--", name]
-    ok(:logs, run(:logs, args, [cap: @logs_cap] ++ opts, @query_ms))
+
+    with :ok <- valid_name(:logs, name),
+         do: ok(:logs, run(:logs, args, [cap: @logs_cap] ++ opts, @query_ms))
   end
 
   @impl true
@@ -285,7 +344,8 @@ defmodule Vagus.Runtime.Engine.Podman do
       name
     ]
 
-    with {:ok, out} <- ok(:stats, run(:stats, args, opts, @query_ms)),
+    with :ok <- valid_name(:stats, name),
+         {:ok, out} <- ok(:stats, run(:stats, args, opts, @query_ms)),
          {:ok, raw} when is_map(raw) <- decode(:stats, out) do
       {:ok, compute_stats(raw, opts[:host])}
     else
@@ -299,18 +359,22 @@ defmodule Vagus.Runtime.Engine.Podman do
     capture? = Keyword.get(opts, :capture, true)
     cap = if capture?, do: [], else: [cap: @discard_cap, truncate: true]
 
-    case run(:exec, ["exec", "--", name | argv], cap ++ opts, @exec_ms) do
-      {:ok, out} -> {:ok, %{exit_code: 0, output: if(capture?, do: out, else: "")}}
-      {:exit, status, out} -> exec_exit(status, out, capture?)
-      other -> unit(:exec, other)
+    with :ok <- valid_name(:exec, name) do
+      case run(:exec, ["exec", "--", name | argv], cap ++ opts, @exec_ms) do
+        {:ok, out} -> {:ok, %{exit_code: 0, output: if(capture?, do: out, else: "")}}
+        {:exit, status, out} -> exec_exit(status, out, capture?)
+        other -> unit(:exec, other)
+      end
     end
   end
 
-  # Exit codes 125-127 are podman's own as well as a command's; only an
-  # `Error:` line tells podman's failures apart (255 is how 6.1.4 reports
-  # a container that is not running).
+  # Exit codes 125 and 255 are podman's own as well as a command's; only
+  # podman's own texts tell them apart (255 is how 6.1.4 reports a
+  # container that is not running).
+  @exec_failures ~r/^Error: .*(no such container|container state improper)/m
+
   defp exec_exit(status, out, capture?) when status in [125, 255] do
-    if out =~ ~r/^Error: /m,
+    if out =~ @exec_failures,
       do: Error.classify(:exec, status, out),
       else: {:ok, %{exit_code: status, output: if(capture?, do: out, else: "")}}
   end
@@ -325,6 +389,14 @@ defmodule Vagus.Runtime.Engine.Podman do
   """
   @impl true
   def healthcheck(name, opts) do
+    opts = with_deadline(opts, @healthcheck_ms)
+
+    with :ok <- valid_name(:healthcheck, name) do
+      healthcheck_run(name, opts)
+    end
+  end
+
+  defp healthcheck_run(name, opts) do
     case run(:healthcheck, ["healthcheck", "run", "--", name], opts, @healthcheck_ms) do
       {:ok, _} ->
         {:ok, :healthy}
@@ -350,6 +422,8 @@ defmodule Vagus.Runtime.Engine.Podman do
 
   @impl true
   def ensure_network(%NetworkSpec{name: name} = spec, opts) do
+    opts = with_deadline(opts, @lifecycle_ms)
+
     case run(:ensure_network, ["network", "exists", "--", name], opts, @query_ms) do
       {:ok, _} ->
         :ok
@@ -365,7 +439,6 @@ defmodule Vagus.Runtime.Engine.Podman do
   @impl true
   def event_source, do: __MODULE__.EventSource
 
-  @doc "The `podman network create` argv for `spec`."
   @spec render_network(NetworkSpec.t()) :: [String.t()]
   def render_network(%NetworkSpec{driver: :bridge} = spec) do
     # No aardvark-dns on the board: a DNS-enabled network is broken without
@@ -392,18 +465,22 @@ defmodule Vagus.Runtime.Engine.Podman do
     end
   end
 
-  defp ipv4(n), do: n |> then(&<<&1::32>>) |> :binary.bin_to_list() |> Enum.join(".")
+  defp ipv4(n) do
+    <<a, b, c, d>> = <<n::32>>
+    {a, b, c, d} |> :inet.ntoa() |> to_string()
+  end
 
   @doc """
-  The `podman create` argv for `spec`, each value its own element and the
-  image after `--`. Beyond the spec it pins what differs from Docker's
-  defaults: Docker's capability set, unlimited pids, a private IPC
-  namespace, no injected `container=podman` or proxy env, no pull on
-  create, Docker's tmpfs options, and on a bridge an `/etc/hosts` built
-  from nothing but the spec's entries.
+  Each value is its own element and the image follows `--`. Beyond the
+  spec it pins what differs from Docker's defaults: Docker's capability
+  set, unlimited pids, a private IPC namespace, no injected
+  `container=podman` or proxy env, no pull on create, Docker's tmpfs
+  options, and on a bridge an `/etc/hosts` built from nothing but the
+  spec's entries.
 
   A `secret_env` entry renders as a bare `--env NAME`, which podman fills
-  from its own environment, so the value stays off the argv.
+  from its own environment, so the value stays off the argv. The spec must
+  have passed `validate/1`.
   """
   @spec render_create(ContainerSpec.t()) :: [String.t()]
   def render_create(%ContainerSpec{} = spec) do
@@ -469,14 +546,11 @@ defmodule Vagus.Runtime.Engine.Podman do
   defp caps(%ContainerSpec{privileged: true} = spec), do: spec.cap_add
   defp caps(spec), do: Enum.uniq((spec.cap_add || []) ++ @docker_caps)
 
-  # podman has no recursive read-only, so `ro` is the top mount only:
-  # exactly what `read_only_non_recursive` asks for. `bind-nonrecursive`
+  # podman 6.1.4 has no recursive read-only bind (`rro` is refused), so
+  # `ro` is the top mount only: what `read_only_non_recursive` asks for,
+  # and less than Docker 25's recursive `ReadOnly`. `bind-nonrecursive`
   # would also stop submounts being bound at all.
   defp mount(%{type: type} = m) do
-    for v <- [m.source, m.target],
-        String.contains?(v, ","),
-        do: raise(ArgumentError, "mount path #{Kernel.inspect(v)} contains a comma")
-
     ro? = Map.get(m, :read_only) || Map.get(m, :read_only_non_recursive)
     propagation = if type == :bind, do: Map.get(m, :propagation)
 
@@ -677,16 +751,16 @@ defmodule Vagus.Runtime.Engine.Podman do
     end
   end
 
-  # podman's own default grace applies when no timeout_s is given; the CLI
-  # deadline covers the grace whatever timeout_ms says.
-  defp grace(opts) do
-    case opts[:timeout_s] do
-      nil ->
-        {[], opts[:timeout_ms] || @default_grace_s * 1000 + @stop_margin_ms}
+  @doc false
+  # The `--time` args and the command's floor once permitted: without
+  # `timeout_s` podman applies its own default grace.
+  @spec grace(keyword()) :: {[String.t()], pos_integer()}
+  def grace(opts) do
+    margin = Keyword.get(opts, :stop_margin_ms, @stop_margin_ms)
 
-      s ->
-        floor = s * 1000 + @stop_margin_ms
-        {["--time", to_string(s)], max(opts[:timeout_ms] || 0, floor)}
+    case opts[:timeout_s] do
+      nil -> {[], Keyword.get(opts, :default_stop_grace_s, @default_grace_s) * 1000 + margin}
+      s -> {["--time", to_string(s)], s * 1000 + margin}
     end
   end
 
@@ -694,8 +768,16 @@ defmodule Vagus.Runtime.Engine.Podman do
   defp class(:stop_all), do: :shutdown
   defp class(_verb), do: :ops
 
-  # `default_ms` applies only without `timeout_ms`; a grace-carrying verb
-  # passes its already-floored budget and so ignores `timeout_ms` here.
+  # One instant bounds every call a callback makes: the first sets it from
+  # `timeout_ms`, else the verb's default.
+  defp with_deadline(opts, default_ms) do
+    Keyword.put_new_lazy(opts, :deadline, fn ->
+      now_ms() + max(opts[:timeout_ms] || default_ms, opts[:floor_ms] || 0)
+    end)
+  end
+
+  defp now_ms, do: System.monotonic_time(:millisecond)
+
   # A failed or killed pull leaves its layers in the spool. It runs under
   # the only pull permit, so no other pull's spool can be there.
   defp clear_spool_on_failure({:ok, _} = result, _host), do: result
@@ -705,26 +787,79 @@ defmodule Vagus.Runtime.Engine.Podman do
     result
   end
 
+  # The permit wait counts against the deadline; the command then gets
+  # what is left, but never less than `floor_ms` (a stop's grace).
   # `after_run` runs on the result while the permit is still held.
   defp run(verb, args, opts, default_ms, after_run \\ & &1) do
-    budget =
-      if verb in [:stop, :restart, :stop_all],
-        do: default_ms,
-        else: opts[:timeout_ms] || default_ms
-
-    deadline = System.monotonic_time(:millisecond) + budget
+    deadline = with_deadline(opts, default_ms)[:deadline]
     host = opts[:host]
+    floor = opts[:floor_ms] || 1
 
     cmd_opts =
       opts
       |> Keyword.take([:env, :cap, :truncate, :podman_bin])
       |> Keyword.put(:host, host)
 
-    Host.with_permit(host, class(verb), budget, fn ->
-      left = max(deadline - System.monotonic_time(:millisecond), 1)
+    Host.with_permit(host, opts[:class] || class(verb), max(deadline - now_ms(), 0), fn ->
+      left = max(deadline - now_ms(), floor)
       args |> Cmd.run(Keyword.put(cmd_opts, :timeout_ms, left)) |> after_run.()
     end)
   end
+
+  @doc false
+  # Every create input podman would read differently from Docker, rejected
+  # here so `render_create/1` only ever sees a spec podman takes as meant.
+  @spec validate(ContainerSpec.t()) :: :ok | {:error, {:failed, :create, term()}}
+  def validate(%ContainerSpec{} = spec) do
+    with :ok <- valid_name(:create, spec.name),
+         :ok <- valid_image(:create, spec.image),
+         :ok <- check(:invalid_restart, spec.restart, &(&1 in [nil, :no, :unless_stopped])),
+         :ok <- each(:invalid_mount, spec.mounts, &valid_mount?/1) do
+      each(:invalid_port, Map.keys(spec.ports || %{}), &Regex.match?(@port_key_re, &1))
+    end
+  end
+
+  # A comma would end the `--mount` field; podman reads `--publish`'s key
+  # as `[ip:][host:]port`, so a key could bind a host port of its own.
+  defp valid_mount?(%{type: type, source: src, target: dst})
+       when type in [:bind, :volume] and is_binary(src) and is_binary(dst),
+       do: not String.contains?(src <> dst, ",")
+
+  defp valid_mount?(_mount), do: false
+
+  defp each(_tag, nil, _ok?), do: :ok
+
+  defp each(tag, values, ok?) do
+    case Enum.find(values, &(not ok?.(&1))) do
+      nil -> :ok
+      bad -> {:error, {:failed, :create, {tag, bad}}}
+    end
+  end
+
+  defp check(tag, value, ok?),
+    do: if(ok?.(value), do: :ok, else: {:error, {:failed, :create, {tag, value}}})
+
+  defp valid_name(verb, name) when is_binary(name) do
+    if Regex.match?(@name_re, name),
+      do: :ok,
+      else: {:error, {:failed, verb, {:invalid_name, name}}}
+  end
+
+  defp valid_name(verb, name), do: {:error, {:failed, verb, {:invalid_name, name}}}
+
+  defp valid_image(verb, image) when is_binary(image) do
+    transport? =
+      case String.split(image, ":", parts: 2) do
+        [prefix, _] -> prefix in @transports
+        _ -> false
+      end
+
+    if Regex.match?(@image_re, image) and not transport?,
+      do: :ok,
+      else: {:error, {:failed, verb, {:invalid_image, image}}}
+  end
+
+  defp valid_image(verb, image), do: {:error, {:failed, verb, {:invalid_image, image}}}
 
   defp ok(_verb, {:ok, out}), do: {:ok, out}
   defp ok(verb, other), do: unit(verb, other)

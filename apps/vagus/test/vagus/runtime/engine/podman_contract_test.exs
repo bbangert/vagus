@@ -41,6 +41,11 @@ defmodule Vagus.Runtime.Engine.PodmanContractTest.Leg do
     start(ctx, rules, [])
   end
 
+  # A stop's floor is podman's 10 s grace plus 15 s by default; shrunk here
+  # so `timeout_ms` can be seen to bound the call.
+  def arrange(:stop_slow, ctx),
+    do: start(ctx, script(:stop_slow), []) ++ [default_stop_grace_s: 0, stop_margin_ms: 100]
+
   def arrange(scenario, ctx), do: start(ctx, script(scenario), [])
 
   @impl true
@@ -414,7 +419,17 @@ defmodule Vagus.Runtime.Engine.PodmanContractTest.Leg do
     ]
   end
 
-  defp script(:engine_error), do: [{"info*", [{125, "Error: cannot open the store\n"}]}]
+  # An exec's 125 is the command's own unless podman's text says otherwise.
+  defp script(:engine_error) do
+    [
+      {"info*", [{125, "Error: cannot open the store\n"}]},
+      {"exec *",
+       [
+         {255,
+          "Error: can only create exec sessions on running containers: container state improper\n"}
+       ]}
+    ]
+  end
 end
 
 defmodule Vagus.Runtime.Engine.PodmanContractTest do
@@ -543,6 +558,14 @@ defmodule Vagus.Runtime.Engine.PodmanContractTest do
       assert {:ok, %{cpu_percent: 25.0}} = Engine.stats("addon_local_x", opts)
     end
 
+    test "removing a container forgets its sample", ctx do
+      {_fake, opts} = engine(ctx, [{"stats *", [{0, Leg.stats_line()}]}, {"rm *", [{0, ""}]}])
+      {:ok, _} = Engine.stats("addon_local_x", opts)
+      assert Vagus.Runtime.Host.last_sample(opts[:host], "addon_local_x") != nil
+      :ok = Engine.remove("addon_local_x", opts)
+      assert Vagus.Runtime.Host.last_sample(opts[:host], "addon_local_x") == nil
+    end
+
     test "a stopped container is all zeros", ctx do
       stopped = File.read!(Path.expand("../../../fixtures/podman/stats_stopped.json", __DIR__))
       {_fake, opts} = engine(ctx, [{"stats *", [{0, stopped}]}])
@@ -603,7 +626,14 @@ defmodule Vagus.Runtime.Engine.PodmanContractTest do
                ],
                ["exec", "--", x, "ha", "core", "check"],
                ["healthcheck", "run", "--", x],
-               ["pull", "--quiet", "--platform", "linux/arm64", "--", "ghcr.io/vagus/x:1"],
+               [
+                 "pull",
+                 "--quiet",
+                 "--platform",
+                 "linux/arm64",
+                 "--",
+                 "docker://ghcr.io/vagus/x:1"
+               ],
                ["image", "exists", "--", "ghcr.io/vagus/x:1"],
                ["rmi", "--ignore", "--", "ghcr.io/vagus/x:1"],
                ["network", "exists", "--", "hassio"],
@@ -653,8 +683,8 @@ defmodule Vagus.Runtime.Engine.PodmanContractTest do
 
       fake =
         FakePodman.start([
-          {"pull * ghcr.io/vagus/good:1", [{0, "5b0e\n"}]},
-          {"pull * ghcr.io/vagus/slow:1", [{0, "", delay_ms: 2_000}]},
+          {"pull * docker://ghcr.io/vagus/good:1", [{0, "5b0e\n"}]},
+          {"pull * docker://ghcr.io/vagus/slow:1", [{0, "", delay_ms: 2_000}]},
           {"pull *", [{125, "Error: initializing source docker://x: manifest unknown\n"}]}
         ])
 
@@ -680,29 +710,87 @@ defmodule Vagus.Runtime.Engine.PodmanContractTest do
 
     test "a pull refused at shutdown is :busy" do
       fake = FakePodman.start([])
-      root = Path.join(System.tmp_dir!(), "podman-shutdown-#{System.unique_integer([:positive])}")
-      on_exit(fn -> File.rm_rf(root) end)
-      name = :"podman_host_#{System.unique_integer([:positive])}"
-
-      start_supervised!(
-        {Vagus.Runtime.Host,
-         name: name,
-         podman_bin: fake.bin,
-         graphroot: root,
-         run_dir: root,
-         socket_dir: Path.join(root, "s"),
-         resolv_conf: Path.join(root, "r"),
-         run: fn _, _ -> {"", 0} end,
-         shutting_down?: fn -> true end}
-      )
-
-      assert Engine.pull("ghcr.io/vagus/x:1",
-               engine: Engine.Podman,
-               host: name,
-               podman_bin: fake.bin
-             ) ==
-               {:error, :busy}
+      host = FakePodman.start_host(fake.bin, shutting_down?: fn -> true end)
+      opts = [engine: Engine.Podman, host: host, podman_bin: fake.bin]
+      assert Engine.pull("ghcr.io/vagus/x:1", opts) == {:error, :busy}
     end
+
+    # The stop must outlast the 300 ms its permit wait may use.
+    test "a stop waiting for its permit still gets its grace once granted" do
+      fake = FakePodman.start([{"stop *", [{0, "addon_local_x\n", delay_ms: 1_000}]}])
+      host = FakePodman.start_host(fake.bin, permits: %{pull: 1, ops: 1, shutdown: 1})
+      opts = [engine: Engine.Podman, host: host, podman_bin: fake.bin]
+      test = self()
+
+      holder =
+        spawn_link(fn ->
+          {:ok, permit} = Vagus.Runtime.Host.checkout(host, :ops, 0)
+          send(test, :held)
+          receive do: (:release -> Vagus.Runtime.Host.checkin(permit))
+        end)
+
+      assert_receive :held, 5_000
+
+      stop =
+        Task.async(fn ->
+          Engine.stop("addon_local_x", [timeout_ms: 300, timeout_s: 0] ++ opts)
+        end)
+
+      await_waiter(host)
+      send(holder, :release)
+      assert Task.await(stop, 30_000) == :ok
+    end
+
+    test "create refuses a port key that could name a host port, without podman" do
+      {fake, opts} = engine(%{}, [{"create *", [{0, "c0ffee\n"}]}])
+
+      for key <- ["8123:8123/tcp", "0.0.0.0:80:80/tcp", "1-1024", "80/xyz"] do
+        spec = %{C.spec() | ports: %{key => nil}}
+        assert Engine.create(spec, opts) == {:error, {:failed, :create, {:invalid_port, key}}}
+      end
+
+      refute Enum.any?(FakePodman.verbs(fake), &match?(["create" | _], &1))
+
+      spec = %{C.spec() | ports: %{"8080/tcp" => 8080, "53/udp" => nil, "9000" => 9000}}
+      assert {:ok, "c0ffee"} = Engine.create(spec, opts)
+    end
+
+    test "an image ref naming a transport or a bad name never reaches podman" do
+      {fake, opts} = engine(%{}, [])
+
+      for image <- [
+            "oci-archive:/root/vagus/x.tar",
+            "dir:/tmp/x",
+            "docker-archive:/tmp/x.tar",
+            "containers-storage:alpine",
+            "docker://alpine:3.20",
+            "oci:latest",
+            "Ghcr.io/Vagus/x:1"
+          ] do
+        assert Engine.pull(image, opts) == {:error, {:pull_failed, {:invalid_image, image}}}
+
+        assert Engine.image_present?(image, opts) ==
+                 {:error, {:failed, :image_present?, {:invalid_image, image}}}
+
+        assert Engine.remove_image(image, opts) ==
+                 {:error, {:failed, :remove_image, {:invalid_image, image}}}
+
+        assert Engine.create(%{C.spec() | image: image}, opts) ==
+                 {:error, {:failed, :create, {:invalid_image, image}}}
+      end
+
+      for name <- ["-x", "a/b", "a b", ""] do
+        assert Engine.start(name, opts) == {:error, {:failed, :start, {:invalid_name, name}}}
+      end
+
+      assert FakePodman.verbs(fake) == [["info", "--format", "{{.Version.Version}}"]]
+    end
+  end
+
+  defp await_waiter(host) do
+    Enum.find(1..1_000, fn _ ->
+      :queue.len(:sys.get_state(host).waiting.ops) == 1 or (Process.sleep(5) && false)
+    end) || flunk("the stop never queued for its permit")
   end
 
   describe "exec exit codes" do
@@ -730,22 +818,22 @@ defmodule Vagus.Runtime.Engine.PodmanContractTest do
   end
 
   test "the readiness of a Host still preparing is :unavailable" do
-    fake = FakePodman.start([{"info*", [{0, "6.1.4\n", delay_ms: 1_000}]}])
-    root = Path.join(System.tmp_dir!(), "podman-prep-#{System.unique_integer([:positive])}")
-    on_exit(fn -> File.rm_rf(root) end)
-    name = :"podman_host_#{System.unique_integer([:positive])}"
+    fake = FakePodman.start([])
 
-    start_supervised!(
-      {Vagus.Runtime.Host,
-       name: name,
-       podman_bin: fake.bin,
-       graphroot: root,
-       run_dir: root,
-       socket_dir: Path.join(root, "s"),
-       resolv_conf: Path.join(root, "r"),
-       run: fn _, _ -> {"", 0} end}
-    )
+    host =
+      FakePodman.start_host(fake.bin, await: false, probe: fn _ -> Process.sleep(:infinity) end)
 
-    assert Engine.ready(engine: Engine.Podman, host: name) == {:error, :unavailable}
+    assert Engine.ready(engine: Engine.Podman, host: host) == {:error, :unavailable}
+  end
+
+  test "a stop's floor: podman's default 10 s grace or timeout_s, plus 15 s" do
+    assert Engine.Podman.grace([]) == {[], 25_000}
+    assert Engine.Podman.grace(timeout_ms: 100) == {[], 25_000}
+    assert Engine.Podman.grace(timeout_s: 5) == {["--time", "5"], 20_000}
+    assert Engine.Podman.grace(timeout_s: 0, timeout_ms: 100) == {["--time", "0"], 15_000}
+  end
+
+  test "its event source is the events-file tail" do
+    assert Engine.Podman.event_source() == Engine.Podman.EventSource
   end
 end

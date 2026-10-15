@@ -266,8 +266,10 @@ defmodule Vagus.Runtime.Engine.PodmanRenderTest do
       refute "--hostname" in argv
     end
 
-    test "a privileged container gets no capability flags of its own" do
-      refute "--cap-add" in render(privileged: true)
+    test "a privileged container gets the spec's capabilities but not Docker's three" do
+      argv = render(privileged: true, cap_add: ["NET_ADMIN"])
+      assert ["--cap-add", "NET_ADMIN"] -- argv == []
+      refute Enum.any?(["AUDIT_WRITE", "MKNOD", "NET_RAW"], &(&1 in argv))
     end
 
     test "DNS settings render on a bridge only: the host network keeps the host's resolv.conf" do

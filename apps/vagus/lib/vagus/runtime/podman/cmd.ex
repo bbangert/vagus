@@ -68,6 +68,10 @@ defmodule Vagus.Runtime.Podman.Cmd do
         env: Enum.map(env, fn {k, v} -> {String.to_charlist(k), String.to_charlist(v)} end)
       ])
 
+    # The port still closes when its owner dies; unlinked, its own exit
+    # never reaches a caller that traps exits.
+    Process.unlink(port)
+
     deadline = make_ref()
     timer = Process.send_after(self(), {__MODULE__, deadline}, Keyword.fetch!(opts, :timeout_ms))
 
@@ -75,12 +79,17 @@ defmodule Vagus.Runtime.Podman.Cmd do
       collect(port, deadline, %{cap: cap, truncate?: truncate?, size: 0, acc: []})
     after
       Process.cancel_timer(timer)
+      flush(port, deadline)
+    end
+  end
 
-      receive do
-        {__MODULE__, ^deadline} -> :ok
-      after
-        0 -> :ok
-      end
+  defp flush(port, deadline) do
+    receive do
+      {__MODULE__, ^deadline} -> flush(port, deadline)
+      {^port, _} -> flush(port, deadline)
+      {:EXIT, ^port, _} -> flush(port, deadline)
+    after
+      0 -> :ok
     end
   end
 
@@ -114,16 +123,28 @@ defmodule Vagus.Runtime.Podman.Cmd do
 
   defp output(%{acc: acc}), do: acc |> Enum.reverse() |> IO.iodata_to_binary()
 
-  # Closing muontrap's stdin is what makes it kill podman.
+  # Closing muontrap's stdin is what makes it kill podman. muontrap exits
+  # only once podman has, so waiting for it means the caller's permit never
+  # outlives a podman, and a pull's spool is no longer being written.
   defp close(port, result) do
+    muontrap = Port.info(port, :os_pid)
     Port.close(port)
+    with {:os_pid, pid} <- muontrap, do: await_exit(pid, @sigkill_delay_ms + 2_000)
     result
   rescue
     ArgumentError -> result
   end
 
-  @spec bin(keyword()) :: String.t()
-  def bin(opts), do: opts[:podman_bin] || Application.get_env(:vagus, :podman_bin, "podman")
+  defp await_exit(_pid, left) when left <= 0, do: :ok
+
+  defp await_exit(pid, left) do
+    if File.exists?("/proc/#{pid}") do
+      Process.sleep(10)
+      await_exit(pid, left - 10)
+    end
+  end
+
+  defp bin(opts), do: opts[:podman_bin] || Application.get_env(:vagus, :podman_bin, "podman")
 
   @doc """
   Decodes `output` as JSON. A stray line before the document (a warning

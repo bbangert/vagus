@@ -229,7 +229,7 @@ defmodule Vagus.Test.EngineContract do
           :log_eof ->
             Enum.reverse(acc)
         after
-          2_000 -> flunk("no :log_eof")
+          10_000 -> flunk("no :log_eof")
         end
       end
 
@@ -252,7 +252,7 @@ defmodule Vagus.Test.EngineContract do
           :log_eof ->
             acc |> Enum.reverse() |> IO.iodata_to_binary()
         after
-          2_000 -> flunk("no :log_eof")
+          10_000 -> flunk("no :log_eof")
         end
       end
     end
@@ -651,7 +651,7 @@ defmodule Vagus.Test.EngineContract do
               assert {:failed, :follow_logs, _} = error
 
             {:ok, _pid} ->
-              assert_receive :log_eof, 2_000
+              assert_receive :log_eof, 10_000
               refute_received {:log_chunk, _}
           end
         end

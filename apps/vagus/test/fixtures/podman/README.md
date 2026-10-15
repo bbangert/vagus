@@ -37,6 +37,7 @@ Setup, inside the container:
 | `stats_format_json.json` | `podman stats --no-stream --format json fx_running`: the human-string form the adapter does not use |
 | `events.log` | the `fx_*` lines of `/run/libpod/events/events.log` |
 | `cli_results.txt` | each command, its exit status and its merged stdout+stderr |
+| `events_rotation_before.log`, `events_rotation_after.log` | an events file just before and just after a rotation, with `events_logfile_path` in a temp dir and `events_logfile_max_size = 3000`, written by `podman create --name fx_rotN --label supervisor_managed docker.io/library/alpine:3.20 true` for N = 1..8 |
 
 In `cli_results.txt`, `fx_unhealthy` ran `--health-cmd false --health-retries 2`,
 `fx_startp` ran `--health-cmd false --health-start-period 300s`,

@@ -1,0 +1,11 @@
+{"Name":"/tmp/rot/events.log","Status":"log-rotation","Time":"2026-10-15T18:40:34.717839054Z","Type":"system","Attributes":{"io.podman.event.rotate":"begin"}}
+{"ID":"bf8527eb54c3680e728d5b4b383a8ba730d72dae7236fbc8dff97ed6b224a731","Name":"docker.io/library/alpine:3.20","Status":"pull","Time":"2026-10-15T18:40:29.844486186Z","Type":"image","Attributes":null}
+{"ID":"f31a666d949c9b2cabd91fba4b04c484aaa08db3de03a7e65991c490f0d27265","Image":"docker.io/library/alpine:3.20","Name":"fx_rot5","Status":"create","Time":"2026-10-15T18:40:29.958358925Z","Type":"container","Attributes":{"supervisor_managed":""}}
+{"ID":"bf8527eb54c3680e728d5b4b383a8ba730d72dae7236fbc8dff97ed6b224a731","Name":"docker.io/library/alpine:3.20","Status":"pull","Time":"2026-10-15T18:40:29.939760941Z","Type":"image","Attributes":null}
+{"ID":"1e930d41d04195a070ad204e5002ee70c58e7bac375805a2c70ab432617439a1","Image":"docker.io/library/alpine:3.20","Name":"fx_rot6","Status":"create","Time":"2026-10-15T18:40:30.057431018Z","Type":"container","Attributes":{"supervisor_managed":""}}
+{"ID":"bf8527eb54c3680e728d5b4b383a8ba730d72dae7236fbc8dff97ed6b224a731","Name":"docker.io/library/alpine:3.20","Status":"pull","Time":"2026-10-15T18:40:30.039705153Z","Type":"image","Attributes":null}
+{"ID":"f95d2e1d0e0478dbbd76f236f5ff945980c1e7cb725908ec1cc7d16b218f11ae","Image":"docker.io/library/alpine:3.20","Name":"fx_rot7","Status":"create","Time":"2026-10-15T18:40:34.717646089Z","Type":"container","Attributes":{"supervisor_managed":""}}
+{"Name":"/tmp/rot/events.log","Status":"log-rotation","Time":"2026-10-15T18:40:34.717911681Z","Type":"system","Attributes":{"io.podman.event.rotate":"end"}}
+{"ID":"bf8527eb54c3680e728d5b4b383a8ba730d72dae7236fbc8dff97ed6b224a731","Name":"docker.io/library/alpine:3.20","Status":"pull","Time":"2026-10-15T18:40:34.699860471Z","Type":"image","Attributes":null}
+{"ID":"3c38b76fe5f93eb373740c16dde6a6611d8eb1f7919c99c9bdd5b93a3c17352d","Image":"docker.io/library/alpine:3.20","Name":"fx_rot8","Status":"create","Time":"2026-10-15T18:40:34.812608635Z","Type":"container","Attributes":{"supervisor_managed":""}}
+{"ID":"bf8527eb54c3680e728d5b4b383a8ba730d72dae7236fbc8dff97ed6b224a731","Name":"docker.io/library/alpine:3.20","Status":"pull","Time":"2026-10-15T18:40:34.794679606Z","Type":"image","Attributes":null}

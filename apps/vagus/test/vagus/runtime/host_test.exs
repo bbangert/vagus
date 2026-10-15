@@ -51,20 +51,27 @@ defmodule Vagus.Runtime.HostTest do
     await_ready(ctx.name)
   end
 
-  defp await_ready(name) do
-    Enum.find_value(1..200, fn _ ->
+  # The first answer other than :preparing, or :ok when `until_ok`.
+  defp await_ready(name, until_ok \\ false) do
+    Enum.find_value(1..1_000, fn _ ->
       case Host.ready(name) do
-        {:error, :preparing} -> Process.sleep(5) && nil
+        {:error, :preparing} -> Process.sleep(10) && nil
+        :ok -> :ok
+        _other when until_ok -> Process.sleep(10) && nil
         other -> other
       end
-    end)
+    end) || flunk("Host #{name} never answered")
   end
+
+  # Neither the machine's meminfo nor its override file.
+  defp profile_opts(root, extra),
+    do: [profile_override: Path.join(root, "no-override")] ++ extra
 
   describe "preparation" do
     test "runs its steps in order, then is ready", ctx do
       assert start_host(ctx) == :ok
-      assert_received {:step, {"mount", ["--make-rshared", "/"]}}
-      assert_received {:step, :probe}
+      assert_receive {:step, {"mount", ["--make-rshared", "/"]}}, 5_000
+      assert_receive {:step, :probe}, 5_000
 
       assert File.stat!(Path.join(ctx.root, "run/supervisor")).mode |> Bitwise.band(0o777) ==
                0o700
@@ -89,21 +96,23 @@ defmodule Vagus.Runtime.HostTest do
       end
 
       start_host(ctx, probe: probe)
-      assert_received {:at_probe, true, true, true}
+      assert_receive {:at_probe, true, true, true}, 5_000
     end
 
     test "is :preparing until the probe answers", ctx do
       test = self()
 
       probe = fn _opts ->
-        send(test, :probing)
+        send(test, {:probing, self()})
         receive do: (:go -> :ok)
       end
 
-      pid = start_supervised!({Host, host_opts(ctx, probe: probe)})
-      assert_receive :probing
+      start_supervised!({Host, host_opts(ctx, probe: probe)})
+      assert_receive {:probing, prober}, 5_000
       assert Host.ready(ctx.name) == {:error, :preparing}
-      send(pid, :go)
+      # The probe runs off the Host, which keeps granting permits meanwhile.
+      assert {:ok, _} = Host.checkout(ctx.name, :ops, 5_000)
+      send(prober, :go)
       assert await_ready(ctx.name) == :ok
     end
 
@@ -117,9 +126,9 @@ defmodule Vagus.Runtime.HostTest do
       end
 
       start_supervised!({Host, host_opts(ctx, probe: probe, prep_retry_ms: 50)})
-      assert_receive :probed
-      assert_receive :probed, 1_000
-      assert Enum.any?(1..100, fn _ -> Host.ready?(ctx.name) or (Process.sleep(10) && false) end)
+      assert_receive :probed, 5_000
+      assert_receive :probed, 5_000
+      assert await_ready(ctx.name, true) == :ok
     end
 
     test "the default probe is podman info through the runner", ctx do
@@ -143,8 +152,13 @@ defmodule Vagus.Runtime.HostTest do
 
   describe "the profile" do
     test "below 2 GiB is frugal, from 2 GiB fast", ctx do
-      assert Host.pick_profile(meminfo: meminfo(ctx.root, 2 * @gib_kb - 1)) == :frugal
-      assert Host.pick_profile(meminfo: meminfo(ctx.root, 2 * @gib_kb)) == :fast
+      assert Host.pick_profile(
+               profile_opts(ctx.root, meminfo: meminfo(ctx.root, 2 * @gib_kb - 1))
+             ) ==
+               :frugal
+
+      assert Host.pick_profile(profile_opts(ctx.root, meminfo: meminfo(ctx.root, 2 * @gib_kb))) ==
+               :fast
     end
 
     test "the override file wins either way", ctx do
@@ -173,7 +187,8 @@ defmodule Vagus.Runtime.HostTest do
     end
 
     test "an unreadable meminfo is frugal", ctx do
-      assert Host.pick_profile(meminfo: Path.join(ctx.root, "nope")) == :frugal
+      assert Host.pick_profile(profile_opts(ctx.root, meminfo: Path.join(ctx.root, "nope"))) ==
+               :frugal
     end
 
     test "frugal: drop-in, Go limits and permits", ctx do
@@ -246,6 +261,12 @@ defmodule Vagus.Runtime.HostTest do
     |> length()
   end
 
+  defp await_waiters(host, class, n) do
+    Enum.find(1..1_000, fn _ ->
+      :queue.len(:sys.get_state(host).waiting[class]) == n or (Process.sleep(5) && false)
+    end) || flunk("no #{n} #{class} waiter(s) queued")
+  end
+
   describe "permits" do
     test "a full class makes the next caller wait, and :busy when its wait runs out", ctx do
       start_host(ctx)
@@ -257,10 +278,10 @@ defmodule Vagus.Runtime.HostTest do
       start_host(ctx)
       {:ok, p1} = Host.checkout(ctx.name, :ops, 0)
       {:ok, _p2} = Host.checkout(ctx.name, :ops, 0)
-      waiter = Task.async(fn -> Host.checkout(ctx.name, :ops, 2_000) end)
-      Process.sleep(50)
+      waiter = Task.async(fn -> Host.checkout(ctx.name, :ops, 10_000) end)
+      await_waiters(ctx.name, :ops, 1)
       Host.checkin(p1)
-      assert {:ok, _} = Task.await(waiter)
+      assert {:ok, _} = Task.await(waiter, 10_000)
     end
 
     test "classes are separate: a held pull does not hold up ops or shutdown", ctx do
@@ -282,7 +303,7 @@ defmodule Vagus.Runtime.HostTest do
           Process.sleep(:infinity)
         end)
 
-      assert_receive {:ok, _}
+      assert_receive {:ok, _}, 5_000
       assert Host.checkout(ctx.name, :ops, 0) == {:error, :busy}
       Process.exit(holder, :kill)
       assert {:ok, _} = Host.checkout(ctx.name, :ops, 1_000)
@@ -314,6 +335,35 @@ defmodule Vagus.Runtime.HostTest do
       assert Host.checkout(ctx.name, :pull, 0) == {:error, :shutting_down}
       assert {:ok, _} = Host.checkout(ctx.name, :ops, 0)
       assert {:ok, _} = Host.checkout(ctx.name, :shutdown, 0)
+    end
+
+    test "a queued pull is refused once a shutdown has begun", ctx do
+      flag = :atomics.new(1, [])
+      start_host(ctx, shutting_down?: fn -> :atomics.get(flag, 1) == 1 end)
+      {:ok, held} = Host.checkout(ctx.name, :pull, 0)
+      waiter = Task.async(fn -> Host.checkout(ctx.name, :pull, 10_000) end)
+      await_waiters(ctx.name, :pull, 1)
+      :atomics.put(flag, 1, 1)
+      Host.checkin(held)
+      assert Task.await(waiter, 10_000) == {:error, :shutting_down}
+    end
+
+    test "a late grant never lingers in the mailbox of a caller that gave up", ctx do
+      start_host(ctx, permits: %{pull: 1, ops: 1, shutdown: 1})
+      {:ok, held} = Host.checkout(ctx.name, :ops, 0)
+      assert Host.checkout(ctx.name, :ops, 20) == {:error, :busy}
+      Host.checkin(held)
+      _ = :sys.get_state(ctx.name)
+      refute_received {Host, _, _}
+    end
+
+    test "an unknown class is :badarg and the Host lives on", ctx do
+      start_host(ctx)
+      pid = Process.whereis(ctx.name)
+      assert Host.checkout(ctx.name, :bogus, 0) == {:error, :badarg}
+      send(pid, :stray)
+      assert {:ok, _} = Host.checkout(ctx.name, :ops, 0)
+      assert Process.whereis(ctx.name) == pid
     end
 
     test "no Host is :unavailable" do

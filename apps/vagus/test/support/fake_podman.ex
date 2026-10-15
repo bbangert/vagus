@@ -100,39 +100,52 @@ defmodule Vagus.Test.FakePodman do
 
   @doc """
   A `Vagus.Runtime.Host` under the test's supervisor, preparing in a temp
-  dir with `bin` as podman; returns its name once its probe has answered.
-  `root:` names the temp dir (its `storage/tmp` is the spool).
+  dir with `bin` as podman; returns its name once its probe has answered,
+  and flunks if it never does. `root:` names the temp dir (its
+  `storage/tmp` is the spool), `await: false` skips the wait, and any other
+  option goes to the Host.
   """
   def start_host(bin, opts \\ []) do
-    root =
-      Keyword.get_lazy(opts, :root, fn ->
+    {root, opts} =
+      Keyword.pop_lazy(opts, :root, fn ->
         Path.join(System.tmp_dir!(), "podman-host-#{System.unique_integer([:positive])}")
       end)
 
+    {await?, opts} = Keyword.pop(opts, :await, true)
     ExUnit.Callbacks.on_exit(fn -> File.rm_rf(root) end)
     name = :"podman_host_#{System.unique_integer([:positive])}"
 
-    ExUnit.Callbacks.start_supervised!(
-      {Vagus.Runtime.Host,
-       name: name,
-       podman_bin: bin,
-       graphroot: Path.join(root, "storage"),
-       run_dir: Path.join(root, "run"),
-       meminfo: Path.join(root, "no-meminfo"),
-       profile_override: Path.join(root, "no-override"),
-       socket_dir: Path.join(root, "supervisor"),
-       resolv_conf: Path.join(root, "resolv.conf"),
-       name_servers: fn -> [] end,
-       run: fn _bin, _args -> {"", 0} end,
-       shutting_down?: fn -> false end,
-       prep_retry_ms: 60_000}
-    )
+    host_opts =
+      Keyword.merge(
+        [
+          name: name,
+          podman_bin: bin,
+          graphroot: Path.join(root, "storage"),
+          run_dir: Path.join(root, "run"),
+          meminfo: Path.join(root, "no-meminfo"),
+          profile_override: Path.join(root, "no-override"),
+          socket_dir: Path.join(root, "supervisor"),
+          resolv_conf: Path.join(root, "resolv.conf"),
+          name_servers: fn -> [] end,
+          run: fn _bin, _args -> {"", 0} end,
+          shutting_down?: fn -> false end,
+          prep_retry_ms: 60_000
+        ],
+        opts
+      )
 
-    _ =
-      Enum.find(1..400, fn _ ->
-        Vagus.Runtime.Host.ready(name) != {:error, :preparing} or (Process.sleep(5) && false)
-      end)
-
+    ExUnit.Callbacks.start_supervised!({Vagus.Runtime.Host, host_opts})
+    if await?, do: await_answer(name)
     name
+  end
+
+  # The probe has answered, either way; a failing one is some tests' point.
+  defp await_answer(name) do
+    Enum.find_value(1..1_000, fn _ ->
+      case Vagus.Runtime.Host.ready(name) do
+        {:error, :preparing} -> Process.sleep(10) && nil
+        answered -> answered
+      end
+    end) || ExUnit.Assertions.flunk("Host #{name} still preparing after 10 s")
   end
 end

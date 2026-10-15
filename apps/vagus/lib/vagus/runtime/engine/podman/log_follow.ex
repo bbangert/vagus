@@ -3,7 +3,9 @@ defmodule Vagus.Runtime.Engine.Podman.LogFollow do
   One live log follow under podman: a poll of the container's k8s-file log,
   with no `podman logs -f` process to linger after its reader.
 
-  The last `tail` lines go first, then whatever is appended, one chunk in
+  The backfill starts `tail` lines before the end, found by scanning back
+  from the end a block at a time, so a log of any size costs one block of
+  memory. From there the file streams in blocks of at most 64 KiB, one in
   flight at a time: nothing more is read until the owner acks. Each
   k8s-file record (`<RFC3339> <stream> <F|P> <msg>`) becomes plain text; a
   `P` record is a fragment the next record continues. With `timestamps`,
@@ -20,7 +22,8 @@ defmodule Vagus.Runtime.Engine.Podman.LogFollow do
   alias Vagus.Runtime.Engine.Podman
 
   @poll_ms 250
-  @read_bytes 65_536
+  @block_bytes 65_536
+  @max_tail 10_000
 
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts)
 
@@ -33,12 +36,13 @@ defmodule Vagus.Runtime.Engine.Podman.LogFollow do
       owner_ref: Process.monitor(owner),
       name: Keyword.fetch!(opts, :name),
       engine_opts: Keyword.get(opts, :engine_opts, []),
-      tail: Keyword.get(opts, :tail, 100),
+      tail: opts |> Keyword.get(:tail, 100) |> min(@max_tail) |> max(0),
       timestamps: Keyword.get(opts, :timestamps, false),
       poll_ms: Keyword.get(opts, :poll_ms, @poll_ms),
       fd: nil,
       offset: 0,
       conmon: nil,
+      timer: nil,
       # A record not yet ended by its newline, and whether the text sent so
       # far ends mid-line (after a `P` fragment).
       pending: "",
@@ -53,15 +57,10 @@ defmodule Vagus.Runtime.Engine.Podman.LogFollow do
   def handle_continue(:open, state) do
     with {:ok, %{path: path, conmon_pid: conmon}} <-
            Podman.log_target(state.name, state.engine_opts),
-         {:ok, fd} <- open(path) do
-      state = %{state | fd: fd, conmon: conmon}
-      {text, state} = read_all(state, [])
-      state = schedule(state)
-
-      case last_lines(text, state.tail) do
-        "" -> {:noreply, state}
-        backfill -> {:noreply, deliver(backfill, state)}
-      end
+         {:ok, fd} <- open(path),
+         {:ok, size} <- :file.position(fd, :eof) do
+      state = %{state | fd: fd, conmon: conmon, offset: tail_start(fd, size, state.tail)}
+      {:noreply, schedule(state, 0)}
     else
       _absent -> eof(state)
     end
@@ -71,19 +70,22 @@ defmodule Vagus.Runtime.Engine.Podman.LogFollow do
   def handle_info({:DOWN, ref, :process, _pid, _reason}, %{owner_ref: ref} = state),
     do: {:stop, :normal, state}
 
-  def handle_info(:log_ack, state), do: {:noreply, %{state | awaiting_ack?: false}}
+  def handle_info(:log_ack, state), do: {:noreply, schedule(%{state | awaiting_ack?: false}, 0)}
 
-  def handle_info(:tick, %{awaiting_ack?: true} = state), do: {:noreply, schedule(state)}
+  def handle_info(:tick, %{awaiting_ack?: true} = state), do: {:noreply, %{state | timer: nil}}
 
   # Liveness is checked before the read, so the read after conmon's exit
   # still drains what it wrote last.
   def handle_info(:tick, state) do
     gone? = not alive?(state.conmon)
+    state = %{state | timer: nil}
 
     case read(state) do
-      {"", state} when gone? -> eof(state)
-      {"", state} -> {:noreply, schedule(state)}
-      {text, state} -> {:noreply, text |> deliver(state) |> schedule()}
+      {:eof, state} when gone? -> eof(state)
+      {:eof, state} -> {:noreply, schedule(state, state.poll_ms)}
+      # Bytes were read but no line finished: read on.
+      {"", state} -> {:noreply, schedule(state, 0)}
+      {text, state} -> {:noreply, deliver(text, state)}
     end
   end
 
@@ -94,27 +96,73 @@ defmodule Vagus.Runtime.Engine.Podman.LogFollow do
   defp open(path) when is_binary(path) and path != "", do: File.open(path, [:read, :binary, :raw])
   defp open(_no_path), do: {:error, :no_log}
 
-  defp alive?(pid) when is_integer(pid) and pid > 0, do: File.exists?("/proc/#{pid}")
-  defp alive?(_none), do: false
+  # A zombie has exited too. `pid` is an integer from podman's inspect.
+  # sobelow_skip ["Traversal.FileModule"]
+  defp alive?(pid) when is_integer(pid) and pid > 0 do
+    case File.read("/proc/#{pid}/stat") do
+      {:ok, stat} ->
+        state = stat |> String.split(") ", parts: 2) |> List.last()
+        not String.starts_with?(state, "Z")
 
-  defp read_all(state, acc) do
-    case read(state) do
-      {"", state} -> {IO.iodata_to_binary(Enum.reverse(acc)), state}
-      {text, state} -> read_all(state, [text | acc])
+      {:error, _} ->
+        false
     end
   end
 
+  defp alive?(_none), do: false
+
+  # Just after the (tail + 1)th line end back from the end, counting only
+  # `F` records: a `P` record does not end a line.
+  defp tail_start(_fd, size, 0), do: size
+  defp tail_start(fd, size, tail), do: scan_back(fd, size, "", tail + 1)
+
+  defp scan_back(_fd, 0, _carry, _left), do: 0
+
+  defp scan_back(fd, pos, carry, left) do
+    from = max(pos - @block_bytes, 0)
+    {:ok, block} = :file.pread(fd, from, pos - from)
+    [first | rest] = String.split(block <> carry, "\n")
+
+    # Each element of `rest` starts just after a newline; its last is what
+    # follows the final newline, which ends no line.
+    {lines, _} =
+      Enum.map_reduce(rest, from + byte_size(first) + 1, fn line, at ->
+        {{at, line}, at + byte_size(line) + 1}
+      end)
+
+    found =
+      lines
+      |> Enum.drop(-1)
+      |> Enum.reverse()
+      |> Enum.reduce_while(left, fn {at, line}, left ->
+        cond do
+          not line_end?(line) -> {:cont, left}
+          left == 1 -> {:halt, {:found, at + byte_size(line) + 1}}
+          true -> {:cont, left - 1}
+        end
+      end)
+
+    case found do
+      {:found, start} -> start
+      # `first` is the file's first line here, whole.
+      1 when from == 0 -> if line_end?(first), do: byte_size(first) + 1, else: 0
+      _left when from == 0 -> 0
+      left -> scan_back(fd, from, first <> "\n", left)
+    end
+  end
+
+  defp line_end?(record), do: match?([_ts, _stream, "F" | _], String.split(record, " ", parts: 4))
+
   defp read(state) do
-    case :file.pread(state.fd, state.offset, @read_bytes) do
+    case :file.pread(state.fd, state.offset, @block_bytes) do
       {:ok, data} ->
         {records, pending} = split(state.pending <> data)
         {text, mid_line?} = render(records, state.timestamps, state.mid_line?)
-
-        {text,
-         %{state | offset: state.offset + byte_size(data), pending: pending, mid_line?: mid_line?}}
+        offset = state.offset + byte_size(data)
+        {text, %{state | offset: offset, pending: pending, mid_line?: mid_line?}}
 
       _eof ->
-        {"", state}
+        {:eof, state}
     end
   end
 
@@ -147,35 +195,23 @@ defmodule Vagus.Runtime.Engine.Podman.LogFollow do
 
   # conmon writes its local offset; the router's verbose path reads UTC.
   defp utc(ts) do
-    cond do
-      String.ends_with?(ts, "+00:00") ->
-        String.replace_suffix(ts, "+00:00", "Z")
-
-      match?({:ok, _, _}, DateTime.from_iso8601(ts)) ->
-        {:ok, dt, _} = DateTime.from_iso8601(ts)
-        DateTime.to_iso8601(dt)
-
-      true ->
-        ts
+    with false <- String.ends_with?(ts, "+00:00"),
+         {:ok, dt, _offset} <- DateTime.from_iso8601(ts) do
+      DateTime.to_iso8601(dt)
+    else
+      true -> String.replace_suffix(ts, "+00:00", "Z")
+      {:error, _} -> ts
     end
   end
-
-  defp last_lines(_text, tail) when is_integer(tail) and tail <= 0, do: ""
-
-  defp last_lines(text, tail) when is_integer(tail) do
-    text |> String.split(~r/(?<=\n)/, trim: true) |> Enum.take(-tail) |> Enum.join()
-  end
-
-  defp last_lines(text, _all), do: text
 
   defp deliver(text, state) do
     send(state.owner, {:log_chunk, text})
     %{state | awaiting_ack?: true}
   end
 
-  defp schedule(state) do
-    Process.send_after(self(), :tick, state.poll_ms)
-    state
+  defp schedule(state, ms) do
+    if state.timer, do: Process.cancel_timer(state.timer)
+    %{state | timer: Process.send_after(self(), :tick, ms)}
   end
 
   defp eof(state) do

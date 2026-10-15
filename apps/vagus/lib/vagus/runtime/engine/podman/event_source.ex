@@ -6,8 +6,15 @@ defmodule Vagus.Runtime.Engine.Podman.EventSource do
 
   `connect/1` starts at the file's end, so history is never replayed; the
   `:ready` it reports makes Events resync instead. Each tick reads from the
-  saved offset. A changed inode (podman's rotation renames a truncated copy
-  over the file) or a size below the offset starts over from byte 0.
+  saved offset.
+
+  podman rotates by renaming a new file over the log: a `log-rotation`
+  begin marker, the newer half of the old file, an end marker, then new
+  events. The half was already read from the old file, and replaying it
+  would restart running apps on stale `died` lines, so the old file is
+  drained first and the new one is read from after its end marker. A
+  replaced file without one is read from its end. Either way `:ready`
+  follows, since a second rotation between two ticks can hide lines.
 
   A line is kept whole up to 1 MiB, the size at which podman rotates the
   whole file; a pending line past that is dropped.
@@ -75,7 +82,7 @@ defmodule Vagus.Runtime.Engine.Podman.EventSource do
 
   @impl true
   def handle_info({__MODULE__, :tick, ref}, %{ref: ref} = src) do
-    {notices, src} = src |> follow_file() |> read()
+    {notices, src} = advance(src)
     {:ok, notices, arm(src)}
   end
 
@@ -121,27 +128,68 @@ defmodule Vagus.Runtime.Engine.Podman.EventSource do
     end
   end
 
-  defp follow_file(src) do
+  defp advance(src) do
     case File.stat(src.path) do
       {:ok, %File.Stat{inode: inode, size: size}}
       when inode == src.inode and size >= src.offset ->
-        src
+        read(src)
+
+      # The file appeared after connect: all of it is new.
+      {:ok, _stat} when src.inode == nil ->
+        case open(src.path) do
+          {:ok, fd, %File.Stat{inode: inode}} -> read(%{src | fd: fd, inode: inode, offset: 0})
+          :absent -> {[], src}
+        end
 
       {:ok, _replaced_or_truncated} ->
-        reopen(src)
+        rotated(src)
 
       {:error, _gone} ->
-        src
+        {[], src}
     end
   end
 
-  defp reopen(src) do
+  defp rotated(src) do
+    {drained, src} = read(src)
     if src.fd, do: File.close(src.fd)
+    src = %{src | fd: nil, inode: nil, offset: 0, buffer: ""}
 
     case open(src.path) do
-      {:ok, fd, %File.Stat{inode: inode}} -> %{src | fd: fd, inode: inode, offset: 0, buffer: ""}
-      :absent -> %{src | fd: nil, inode: nil, offset: 0, buffer: ""}
+      {:ok, fd, %File.Stat{inode: inode, size: size}} ->
+        src = %{src | fd: fd, inode: inode, offset: after_rotation(fd, size)}
+        {more, src} = read(src)
+        {drained ++ [:ready | more], src}
+
+      :absent ->
+        {drained ++ [:ready], src}
     end
+  end
+
+  # The byte after the first rotation end marker, or the end of the file.
+  defp after_rotation(fd, size) do
+    with {:ok, data} <- :file.pread(fd, 0, size),
+         {:ok, offset} <- end_marker(String.split(data, "\n"), 0) do
+      offset
+    else
+      _ -> size
+    end
+  end
+
+  defp end_marker([], _offset), do: :none
+  defp end_marker([_partial], _offset), do: :none
+
+  defp end_marker([line | rest], offset) do
+    next = offset + byte_size(line) + 1
+
+    if rotation_end?(line), do: {:ok, next}, else: end_marker(rest, next)
+  end
+
+  defp rotation_end?(line) do
+    String.contains?(line, "log-rotation") and
+      match?(
+        {:ok, %{"Type" => "system", "Attributes" => %{"io.podman.event.rotate" => "end"}}},
+        Jason.decode(line)
+      )
   end
 
   defp read(%{fd: nil} = src), do: {[], src}
@@ -178,7 +226,12 @@ defmodule Vagus.Runtime.Engine.Podman.EventSource do
 
   defp decode(""), do: nil
 
+  # Image, network and volume lines are most of a pull's; skip their decode.
   defp decode(line) do
+    if String.contains?(line, ~s("Type":"container")), do: decode_container(line)
+  end
+
+  defp decode_container(line) do
     case Jason.decode(line) do
       {:ok, %{"Type" => "container"} = event} ->
         normalize(event)

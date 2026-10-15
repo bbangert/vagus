@@ -32,7 +32,13 @@ fi
 id="vw.$$.$(date +%s%N)"
 # shellcheck disable=SC2086
 docker exec $envs "$c" sh -c "podman \"\$@\" > /tmp/$id.out 2>&1; echo \$? > /tmp/$id.rc" sh "$@" >/dev/null 2>&1
-until docker exec "$c" test -f "/tmp/$id.rc"; do sleep 0.2; done
+tries=0
+until docker exec "$c" test -f "/tmp/$id.rc"; do
+  tries=$((tries + 1))
+  # 10 minutes, past any pull the suite makes.
+  if [ "$tries" -gt 3000 ]; then echo "Error: wrapper: pull never finished" >&2; exit 125; fi
+  sleep 0.2
+done
 docker exec "$c" cat "/tmp/$id.out"
 rc=$(docker exec "$c" cat "/tmp/$id.rc")
 docker exec "$c" rm -f "/tmp/$id.out" "/tmp/$id.rc"

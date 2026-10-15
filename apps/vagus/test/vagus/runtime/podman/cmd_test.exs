@@ -14,21 +14,32 @@ defmodule Vagus.Runtime.Podman.CmdTest do
     {bin, dir}
   end
 
-  defp alive?(pid), do: File.exists?("/proc/#{pid}")
-
-  defp await_pid(dir) do
-    path = Path.join(dir, "pid")
-
-    Enum.find_value(1..100, fn _ ->
-      case File.read(path) do
-        {:ok, pid} when pid != "" -> String.trim(pid)
-        _ -> Process.sleep(20) && nil
-      end
-    end)
+  # A zombie has exited: only reaping removes it from /proc.
+  defp alive?(pid) do
+    case File.read("/proc/#{pid}/stat") do
+      {:ok, stat} -> not (stat |> String.split(") ", parts: 2) |> List.last() =~ ~r/^Z/)
+      {:error, _} -> false
+    end
   end
 
-  defp await_dead(pid, ms) do
-    Enum.any?(1..div(ms, 50), fn _ -> not alive?(pid) or (Process.sleep(50) && false) end)
+  # The script's own marker that its TERM handling is set up.
+  defp await_file(path) do
+    Enum.find_value(1..1_000, fn _ ->
+      case File.read(path) do
+        {:ok, content} when content != "" -> String.trim(content)
+        _ -> Process.sleep(10) && nil
+      end
+    end) || flunk("#{path} never appeared")
+  end
+
+  # Writes its pid once its TERM trap is in place, then loops until killed.
+  defp trapping_script(trap) do
+    script("""
+    d="$(dirname "$0")"
+    trap '#{trap}' TERM
+    echo $$ > "$d/pid.tmp" && mv "$d/pid.tmp" "$d/pid"
+    while :; do sleep 0.1; done
+    """)
   end
 
   test "global flags come first, then the args as given" do
@@ -54,24 +65,30 @@ defmodule Vagus.Runtime.Podman.CmdTest do
              {:error, :invalid_argument}
   end
 
+  # The deadline must outlast the script's start on a starved runner; the
+  # marker proves it did. `run` returns only once muontrap, and so podman,
+  # has exited.
   describe "the deadline" do
-    test "SIGTERMs a podman that is still running" do
-      {bin, dir} = script("echo $$ > \"$(dirname $0)/pid\"\nexec sleep 30\n")
-      assert Cmd.run([], timeout_ms: 300, podman_bin: bin) == {:error, :timeout}
-      pid = await_pid(dir)
-      assert await_dead(pid, 1_500), "podman #{pid} survived the deadline"
+    @tag timeout: 60_000
+    test "SIGTERMs a podman that is still running, and returns once it is dead" do
+      {bin, dir} = trapping_script(~s(echo term > "$d/term"; exit 0))
+      task = Task.async(fn -> Cmd.run([], timeout_ms: 5_000, podman_bin: bin) end)
+      pid = await_file(Path.join(dir, "pid"))
+
+      assert Task.await(task, 30_000) == {:error, :timeout}
+      assert File.read!(Path.join(dir, "term")) == "term\n"
+      refute alive?(pid), "podman #{pid} outlived run/2"
     end
 
-    @tag timeout: 20_000
-    test "SIGKILLs one that ignores SIGTERM, 3 s later" do
-      {bin, dir} =
-        script("trap '' TERM\necho $$ > \"$(dirname $0)/pid\"\nwhile :; do sleep 0.1; done\n")
+    @tag timeout: 60_000
+    test "SIGKILLs one that survives SIGTERM, and returns once it is dead" do
+      {bin, dir} = trapping_script(~s(echo term >> "$d/term"))
+      task = Task.async(fn -> Cmd.run([], timeout_ms: 5_000, podman_bin: bin) end)
+      pid = await_file(Path.join(dir, "pid"))
 
-      assert Cmd.run([], timeout_ms: 300, podman_bin: bin) == {:error, :timeout}
-      pid = await_pid(dir)
-      Process.sleep(1_500)
-      assert alive?(pid), "the TERM-trapping podman died before its SIGKILL was due"
-      assert await_dead(pid, 4_000), "podman #{pid} survived SIGKILL"
+      assert Task.await(task, 30_000) == {:error, :timeout}
+      assert File.read!(Path.join(dir, "term")) =~ "term"
+      refute alive?(pid), "podman #{pid} outlived run/2"
     end
   end
 

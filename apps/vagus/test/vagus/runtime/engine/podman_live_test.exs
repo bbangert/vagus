@@ -155,6 +155,18 @@ defmodule Vagus.Runtime.Engine.PodmanLiveTest do
              {:error, {:failed, :create, :network_not_found}}
   end
 
+  test "a pull goes through docker:// and lands under the plain ref", %{opts: opts} do
+    assert Engine.pull(@image, opts) == :ok
+    assert Engine.image_present?(@image, opts) == true
+    assert {:ok, %Container{image: @image}} = create_x(opts)
+    assert :ok = Engine.remove(@x, opts)
+  end
+
+  defp create_x(opts) do
+    {:ok, _} = Engine.create(spec(), opts)
+    Engine.inspect(@x, opts)
+  end
+
   test "images", %{opts: opts} do
     assert Engine.image_present?(@image, opts) == true
     assert Engine.image_present?("docker.io/library/nope:1", opts) == false

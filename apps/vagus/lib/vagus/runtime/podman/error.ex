@@ -21,8 +21,11 @@ defmodule Vagus.Runtime.Podman.Error do
     {"image not known", :any, {:error, :not_found}},
     {"no such image", :any, {:error, :not_found}},
     {"network already exists", :ensure_network, :ok},
-    {"already in use", :any, {:error, :conflict}},
-    {"image is in use", :any, {:error, :in_use}}
+    {"already in use", :create, {:error, :conflict}},
+    {"image is in use", :any, {:error, :in_use}},
+    # SQLite's busy wait gave up; the only lock in podman with a timeout.
+    # Not yet seen on a device.
+    {"database is locked", :any, {:error, :busy}}
   ]
 
   @spec classify(atom(), pos_integer(), binary()) :: :ok | {:error, Engine.error()}
@@ -43,24 +46,20 @@ defmodule Vagus.Runtime.Podman.Error do
   defp by_text(verb, text) do
     Enum.find_value(@texts, fn {needle, for_verb, result} ->
       if for_verb in [:any, verb] and String.contains?(text, needle), do: result
-    end) || if(lock?(text), do: {:error, :busy})
+    end)
   end
 
-  # podman's locks have no timeout of their own except SQLite's busy wait;
-  # these are the texts it reports when one gives up.
-  defp lock?(text) do
-    text =~ "database is locked" or text =~ "timed out waiting for lock" or
-      (text =~ "lock" and text =~ "timeout")
-  end
-
-  @doc "The last #{@detail_bytes} bytes of `output`, trimmed."
+  # Cut at a codepoint boundary: the detail may be logged or JSON-encoded.
   @spec detail(binary()) :: binary()
   def detail(output) do
     output = String.trim(output)
     size = byte_size(output)
 
     if size > @detail_bytes,
-      do: binary_part(output, size - @detail_bytes, @detail_bytes),
+      do: output |> binary_part(size - @detail_bytes, @detail_bytes) |> drop_continuation(),
       else: output
   end
+
+  defp drop_continuation(<<0b10::2, _::6, rest::binary>>), do: drop_continuation(rest)
+  defp drop_continuation(bin), do: bin
 end
