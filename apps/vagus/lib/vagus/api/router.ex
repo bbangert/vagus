@@ -41,7 +41,7 @@ defmodule Vagus.API.Router do
   alias Vagus.Core.{ConfigCheck, Lifecycle, TokenStore, Versions}
   alias Vagus.Jobs
   alias Vagus.Mqtt.Broker
-  alias Vagus.Runtime.{Docker, Logs, Stats}
+  alias Vagus.Runtime.{Engine, Logs, Stats}
 
   alias Vagus.API.Models.{
     AccessPoint,
@@ -1782,8 +1782,8 @@ defmodule Vagus.API.Router do
     end)
   end
 
-  # `check_config`'s log is bounded only by `Docker.exec_capture/3`'s
-  # generic 16MB Engine-API response ceiling (security-phase6.md W3) —
+  # `check_config`'s log is bounded only by the engine adapter's
+  # generic 16MB response ceiling (security-phase6.md W3) —
   # without this, a chatty custom-integration traceback becomes a 16MB
   # JSON error body, with several unserialised copies (raw + demuxed +
   # stripped + encoded) alive at once on a 1GB device. `String.byte_slice/3`,
@@ -2196,8 +2196,8 @@ defmodule Vagus.API.Router do
       end
     else
       # verbose rides docker's own per-line RFC3339 stamps (timestamps=true).
-      case Docker.container_logs(ref, tail: lines, timestamps: verbose) do
-        {:ok, raw} -> raw |> Logs.format(no_colors: no_colors) |> maybe_verbose_body(ref, verbose)
+      case Engine.logs(ref, tail: lines, timestamps: verbose) do
+        {:ok, text} -> text |> maybe_strip(no_colors) |> maybe_verbose_body(ref, verbose)
         {:error, _reason} -> ""
       end
     end
@@ -2442,13 +2442,13 @@ defmodule Vagus.API.Router do
   defp container_stats(nil), do: Stats.zero()
 
   # Native add-ons have no container to poll — derive stats from the broker
-  # subtree's processes (same shape) instead of `Docker.stats`.
+  # subtree's processes (same shape) instead of `Engine.stats`.
   defp container_stats(ref) do
     if Native.running?(ref) do
       Native.stats(ref)
     else
-      case Docker.stats(ref) do
-        {:ok, raw} -> Stats.compute(raw)
+      case Engine.stats(ref) do
+        {:ok, stats} -> stats
         {:error, _reason} -> Stats.zero()
       end
     end

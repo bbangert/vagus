@@ -87,6 +87,47 @@ defmodule Vagus.API.AddonInfoRouterTest do
     assert Map.has_key?(data, "memory_percent")
   end
 
+  describe "/core/stats through the engine" do
+    alias Vagus.Runtime.Engine.Fake
+
+    setup do
+      fake = Fake.start_global()
+      previous = Application.get_env(:vagus, :core_container)
+      Application.put_env(:vagus, :core_container, "homeassistant")
+
+      on_exit(fn ->
+        if previous,
+          do: Application.put_env(:vagus, :core_container, previous),
+          else: Application.delete_env(:vagus, :core_container)
+      end)
+
+      %{fake: fake}
+    end
+
+    defp core_stats do
+      conn = call("/core/stats", [{"authorization", "Bearer #{Vagus.API.Token.get()}"}])
+      assert conn.status == 200
+      Jason.decode!(conn.resp_body)["data"]
+    end
+
+    test "serves the engine's stats", %{fake: fake} do
+      stats = %{Vagus.Runtime.Stats.zero() | cpu_percent: 12.5, memory_usage: 4096}
+      Fake.put_container(fake, "homeassistant", stats: stats)
+
+      assert %{"cpu_percent" => 12.5, "memory_usage" => 4096} = core_stats()
+    end
+
+    test "an engine error serves zeros", %{fake: fake} do
+      Fake.put_container(fake, "homeassistant",
+        stats: %{Vagus.Runtime.Stats.zero() | cpu_percent: 12.5}
+      )
+
+      Fake.fail_next(fake, :stats, :unavailable)
+
+      assert %{"cpu_percent" => 0.0, "memory_usage" => 0} = core_stats()
+    end
+  end
+
   describe "ingress fields + watchdog (§B3.4, §B8)" do
     setup do
       {:ok, c} =

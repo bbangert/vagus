@@ -174,31 +174,44 @@ defmodule Vagus.App.UnitsTest do
   end
 
   describe "what the engine says runs" do
-    alias Vagus.Test.FakeEngine
+    alias Vagus.Runtime.Engine.Fake
 
-    defp engine(responses) do
-      engine = FakeEngine.start(responses)
-      on_exit(fn -> FakeEngine.stop(engine) end)
-      [socket: engine.socket]
+    defp engine(containers) do
+      fake = Fake.start()
+      for {name, state} <- containers, do: Fake.put_container(fake, name, state: state)
+      [engine: Fake, fake: fake]
     end
 
-    test "one listing names the apps whose container runs" do
-      containers = [
-        %{"Names" => ["/addon_core_ssh"]},
-        %{"Names" => ["/hassio_dns"]},
-        %{"Names" => ["/addon_local_x", "/alias"]}
-      ]
+    test "one listing names the apps whose container is live" do
+      opts =
+        engine([
+          {"addon_core_ssh", :running},
+          {"addon_local_p", :paused},
+          {"addon_local_r", :restarting},
+          {"addon_local_x", :exited},
+          {"hassio_dns", :running}
+        ])
 
-      assert {:ok, running} = Units.running(engine([{200, containers}]))
-      assert running == MapSet.new(["core_ssh", "local_x"])
-      assert {:error, {:http, 500, _}} = Units.running(engine([{500, %{"message" => "x"}}]))
+      assert Units.running(opts) == {:ok, MapSet.new(["core_ssh", "local_p", "local_r"])}
+
+      Fake.fail_next(opts[:fake], :list, {:failed, :list, "x"})
+      assert {:error, {:failed, :list, "x"}} = Units.running(opts)
     end
 
-    test "one app's container: running, absent, or no answer" do
-      assert Units.running?("core_ssh", engine([{200, %{"State" => %{"Running" => true}}}]))
-      refute Units.running?("core_ssh", engine([{200, %{"State" => %{"Running" => false}}}]))
-      refute Units.running?("core_ssh", engine([{404, %{"message" => "no such container"}}]))
-      assert :unknown == Units.running?("core_ssh", engine([{500, %{"message" => "x"}}]))
+    test "one app's container: live (running, paused, restarting), stopped, absent, or no answer" do
+      for state <- [:running, :paused, :restarting] do
+        assert Units.running?("core_ssh", engine([{"addon_core_ssh", state}]))
+      end
+
+      for state <- [:created, :exited] do
+        refute Units.running?("core_ssh", engine([{"addon_core_ssh", state}]))
+      end
+
+      refute Units.running?("core_ssh", engine([]))
+
+      opts = engine([{"addon_core_ssh", :running}])
+      Fake.fail_next(opts[:fake], :inspect, {:failed, :inspect, "x"})
+      assert :unknown == Units.running?("core_ssh", opts)
     end
   end
 end

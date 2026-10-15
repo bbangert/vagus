@@ -27,7 +27,7 @@ defmodule Vagus.App.Gates do
 
   @doc "The engine starts only once the network reaches the internet."
   @spec engine() :: :ok | {:error, term()}
-  def engine, do: Vagus.Runtime.Docker.ping()
+  def engine, do: Vagus.Runtime.Engine.ready()
 
   @doc """
   Stands up the `hassio` bridge, binds the `.2`/`.3` anchors and asserts the

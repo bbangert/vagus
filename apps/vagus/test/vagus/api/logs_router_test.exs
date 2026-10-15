@@ -126,4 +126,47 @@ defmodule Vagus.API.LogsRouterTest do
       assert conn.status == 403
     end
   end
+
+  describe "container logs through the engine" do
+    alias Vagus.Runtime.Engine.Fake
+
+    setup do
+      fake = Fake.start_global()
+      previous = Application.get_env(:vagus, :core_container)
+      Application.put_env(:vagus, :core_container, "homeassistant")
+
+      on_exit(fn ->
+        if previous,
+          do: Application.put_env(:vagus, :core_container, previous),
+          else: Application.delete_env(:vagus, :core_container)
+      end)
+
+      Fake.put_container(fake, "homeassistant", logs: "\e[31mred\e[0m\nplain\n")
+      %{fake: fake}
+    end
+
+    defp core_logs(query),
+      do: conn(:get, "/core/logs" <> query) |> sup() |> Vagus.API.Router.call(@opts)
+
+    test "the engine's text is served as-is, and no_colors strips ANSI" do
+      assert core_logs("").resp_body == "\e[31mred\e[0m\nplain\n"
+      assert core_logs("?no_colors").resp_body == "red\nplain\n"
+    end
+
+    test "verbose asks for the engine's stamps and renders them in the §A5 shape", %{fake: fake} do
+      lines = String.split(core_logs("?verbose&no_colors").resp_body, "\n", trim: true)
+
+      assert [red, plain] = lines
+      assert red =~ ~r/^2026-10-14 21:00:00\.000 \S+ homeassistant: red$/
+      assert plain =~ ~r/^2026-10-14 21:00:00\.000 \S+ homeassistant: plain$/
+      assert {:logs, ["homeassistant"]} in Fake.calls(fake)
+    end
+
+    test "an engine error serves an empty body", %{fake: fake} do
+      Fake.fail_next(fake, :logs, :unavailable)
+      conn = core_logs("")
+      assert conn.status == 200
+      assert conn.resp_body == ""
+    end
+  end
 end

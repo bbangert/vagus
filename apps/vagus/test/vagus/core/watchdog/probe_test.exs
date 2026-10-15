@@ -351,4 +351,30 @@ defmodule Vagus.Core.Watchdog.ProbeTest do
       assert Process.alive?(pid)
     end
   end
+
+  describe "core_alive?/1 (the default running check)" do
+    alias Vagus.Runtime.Engine.Fake
+
+    defp core_in(state) do
+      fake = Fake.start()
+      if state, do: Fake.put_container(fake, Vagus.Core.Container.name(), state: state)
+      [engine: Fake, fake: fake]
+    end
+
+    # A paused Core is the hung-Core case the probe exists for.
+    test "a running, paused or restarting Core is alive" do
+      for state <- [:running, :paused, :restarting] do
+        assert Watchdog.Probe.core_alive?(core_in(state)), "#{state}"
+      end
+    end
+
+    test "a stopped, absent or unanswering Core is not" do
+      refute Watchdog.Probe.core_alive?(core_in(:exited))
+      refute Watchdog.Probe.core_alive?(core_in(nil))
+
+      opts = core_in(:running)
+      Fake.fail_next(opts[:fake], :inspect, :unavailable)
+      refute Watchdog.Probe.core_alive?(opts)
+    end
+  end
 end
