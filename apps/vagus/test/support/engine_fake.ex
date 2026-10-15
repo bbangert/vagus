@@ -333,6 +333,9 @@ defmodule Vagus.Runtime.Engine.Fake do
 
         receive do
           :fake_release -> :ok
+        after
+          10_000 ->
+            raise "Engine.Fake: #{verb} blocked by block_next/2 was never released (call release/1)"
         end
     end
 

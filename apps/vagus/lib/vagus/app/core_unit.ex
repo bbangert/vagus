@@ -5,7 +5,8 @@ defmodule Vagus.App.CoreUnit do
   Boot never creates Core: an absent container is left to an explicit
   `POST /core/start` or `/core/update`, or to `Vagus.Provisioner` on a first
   boot. An adopted one is started whether or not it already runs: a running
-  container whose spec fingerprint matches costs one inspect, and one that
+  container whose spec fingerprint matches costs only the adopt's and the
+  start's inspects, and one that
   the engine revived from an older spec is how a spec change reaches a
   device at all. A stopped one is the normal case after a graceful reboot,
   which leaves it manually stopped, so `unless-stopped` never revives it.

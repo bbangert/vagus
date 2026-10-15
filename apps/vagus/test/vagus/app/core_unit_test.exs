@@ -103,7 +103,8 @@ defmodule Vagus.App.CoreUnitTest do
         deadline: 42
       ]
 
-      assert CoreUnit.start(opts) == :ok
+      log = capture_log(fn -> assert CoreUnit.start(opts) == :ok end)
+      assert log =~ "Core container 0123456789ab against the current spec"
       assert_received :started
       assert_received {:health, [deadline: 42]}
     end

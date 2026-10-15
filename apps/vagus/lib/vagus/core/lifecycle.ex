@@ -13,8 +13,10 @@ defmodule Vagus.Core.Lifecycle do
 
   ## Options (every public op takes `opts \\\\ []`)
 
-    * `:engine_opts` - keyword list threaded into every `Vagus.Runtime.Engine`
-      call (e.g. `[engine: Engine.Fake, fake: pid]`). Defaults to `[]`.
+    * `:engine_opts` - keyword list that reaches every `Vagus.Runtime.Engine`
+      call this module makes (e.g. `[engine: Engine.Fake, fake: pid]`).
+      Defaults to `[]`. An engine `:busy` comes back as `{:engine, :busy}`,
+      never as the lock's bare `:busy`.
     * `:versions` - the `Vagus.Core.Versions` server ref. Defaults to
       `Vagus.Core.Versions`.
     * `:health` - zero-arity fn `-> :healthy | :timeout`, the health gate.
@@ -81,7 +83,7 @@ defmodule Vagus.Core.Lifecycle do
 
   ## The reuse-vs-recreate rule
 
-  A container is only ever **reused** (plain `docker start`/`restart`, no
+  A container is only ever **reused** (a plain engine start/restart, no
   create) when it already exists under the fixed name AND its
   image equals `Vagus.Core.Container.image(desired_version)` AND
   its `Vagus.Core.Container.spec_fingerprint_label/0` label equals the
@@ -142,7 +144,7 @@ defmodule Vagus.Core.Lifecycle do
 
   It hangs off the two places this module hands Core's process a fresh
   start — `start_container/2` (every create+start, plain start and rollback
-  recreate) and `restart/1`'s in-place `docker restart` — because Core reads
+  recreate) and `restart/1`'s in-place restart — because Core reads
   that file once, at process start, and rewrites it from its in-memory
   config whenever it persists. Writing while Core is live is therefore both
   useless (it will not re-read) and lossy (its next persist wins, and the
@@ -152,7 +154,7 @@ defmodule Vagus.Core.Lifecycle do
   the only moment the rewrite could take effect anyway.
 
   `restart/1` is the one write issued against a container that is still up.
-  It is safe for the same reason it is necessary: `docker restart` stops
+  It is safe for the same reason it is necessary: an engine restart stops
   Core before starting it, so the rewrite is what that boot reads.
 
   A migration that fails, for any reason, is logged and ignored — it can
@@ -278,7 +280,7 @@ defmodule Vagus.Core.Lifecycle do
   Starts the Core container at the desired version (`opts[:version]`,
   default `Vagus.Core.Versions.installed/1`).
 
-  Reuses the existing container (plain `docker start`) when its image tag
+  Reuses the existing container (a plain engine start) when its image tag
   already matches the desired version; recreates it (stop+remove+create+
   start) on a tag mismatch; creates+starts fresh if absent. Already-running
   is a no-op (`:ok`, no health gate). No image pull — a missing image
@@ -302,7 +304,7 @@ defmodule Vagus.Core.Lifecycle do
   end
 
   @doc """
-  Restarts the Core container in place (`docker restart`, no recreate),
+  Restarts the Core container in place (an engine restart, no recreate),
   then runs the health gate.
 
   `opts[:safe_mode]` (default `false`) touches Core's `safe-mode` marker
@@ -466,7 +468,7 @@ defmodule Vagus.Core.Lifecycle do
         {:error, _reason} -> @fallback_stop_timeout_s
       end
 
-    case Engine.stop(Container.name(), [timeout_s: timeout] ++ engine_opts(opts)) do
+    case engine(:stop, Container.name(), [timeout_s: timeout] ++ engine_opts(opts)) do
       :ok -> unlink_core_socket()
       {:error, reason} -> {:error, reason}
     end
@@ -477,7 +479,7 @@ defmodule Vagus.Core.Lifecycle do
   defp do_restart(opts) do
     with :ok <- maybe_write_safe_mode_marker(opts),
          :ok <- migrate_stored_port(opts),
-         :ok <- Engine.restart(Container.name(), engine_opts(opts)) do
+         :ok <- engine(:restart, Container.name(), engine_opts(opts)) do
       health_gate(opts)
     end
   end
@@ -581,7 +583,7 @@ defmodule Vagus.Core.Lifecycle do
   defp pull_target(target, opts) do
     engine_opts = Keyword.put_new(engine_opts(opts), :timeout_ms, pull_deadline_ms())
 
-    case Engine.pull(Container.image(target), engine_opts) do
+    case engine(:pull, Container.image(target), engine_opts) do
       :ok -> :ok
       {:error, reason} -> {:error, {:pull, reason}}
     end
@@ -592,7 +594,7 @@ defmodule Vagus.Core.Lifecycle do
     do: Application.get_env(:vagus, :core_pull_deadline_ms, @pull_deadline_ms)
 
   defp update_existing(info, target, rollback_version, opts) do
-    was_running = Engine.Container.alive?(info)
+    was_running = running?(info)
     :ok = report_stage(opts, "stop", 60)
 
     with :ok <- stop_existing(info, opts),
@@ -647,7 +649,7 @@ defmodule Vagus.Core.Lifecycle do
   end
 
   defp rollback(rollback_version, opts) do
-    with :ok <- Engine.stop(Container.name(), engine_opts(opts)),
+    with :ok <- engine(:stop, Container.name(), engine_opts(opts)),
          :ok <- remove_container(opts),
          :ok <- recreate_previous(rollback_version, opts) do
       {:error, {:health_timeout, :rolled_back}}
@@ -684,13 +686,13 @@ defmodule Vagus.Core.Lifecycle do
 
   ## Shared internals
 
-  defp inspect_container(opts), do: Engine.inspect(Container.name(), engine_opts(opts))
+  defp inspect_container(opts), do: engine(:inspect, Container.name(), engine_opts(opts))
 
   # Every remove goes through here so the socket the removed container
   # created can't outlive it — see the moduledoc's "The socket file outlives
   # Core" section.
   defp remove_container(opts) do
-    case Engine.remove(Container.name(), engine_opts(opts)) do
+    case engine(:remove, Container.name(), engine_opts(opts)) do
       :ok -> unlink_core_socket()
       {:error, reason} -> {:error, reason}
     end
@@ -725,14 +727,15 @@ defmodule Vagus.Core.Lifecycle do
     )
   end
 
-  defp do_create(version, opts), do: Engine.create(desired_spec(version, opts), engine_opts(opts))
+  defp do_create(version, opts),
+    do: engine(:create, desired_spec(version, opts), engine_opts(opts))
 
   # Every container start in this module goes through here, so the stored-port
   # migration lands in the one window where it can take: the container is
   # freshly created or stopped, never live. See "Core's stored port".
   defp start_container(id, opts) do
     :ok = migrate_stored_port(opts)
-    Engine.start(id, engine_opts(opts))
+    engine(:start, id, engine_opts(opts))
   end
 
   # Always `:ok` — a migration cannot fail the op it runs from.
@@ -756,7 +759,7 @@ defmodule Vagus.Core.Lifecycle do
 
   defp stop_existing(info, opts) do
     timeout = stop_timeout_s(info)
-    Engine.stop(Container.name(), [timeout_s: timeout] ++ engine_opts(opts))
+    engine(:stop, Container.name(), [timeout_s: timeout] ++ engine_opts(opts))
   end
 
   defp stop_timeout_s(info) do
@@ -811,6 +814,16 @@ defmodule Vagus.Core.Lifecycle do
   end
 
   defp engine_opts(opts), do: Keyword.get(opts, :engine_opts, [])
+
+  # A bare `{:error, :busy}` from this module means its lock is held, and
+  # callers act on that (the watchdog skips escalation, CoreUnit retries, the
+  # API answers 409); an engine refusing for its own lock must not read so.
+  defp engine(verb, target, engine_opts) do
+    case apply(Engine, verb, [target, engine_opts]) do
+      {:error, :busy} -> {:error, {:engine, :busy}}
+      result -> result
+    end
+  end
 
   defp versions_server(opts), do: Keyword.get(opts, :versions, Versions)
 

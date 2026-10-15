@@ -91,8 +91,6 @@ defmodule Vagus.Core.LifecycleTest do
     end
   end
 
-  ## Engine.Fake fixtures
-
   defp fingerprint_label, do: Container.spec_fingerprint_label()
 
   defp fingerprint(version),
@@ -366,6 +364,15 @@ defmodule Vagus.Core.LifecycleTest do
       assert stop_timeouts(fake) == [260]
     end
 
+    # The stop still goes out (the fallback timeout), and its not-found is
+    # the op's answer, as the engine's 404 was before.
+    test "an absent container fails the stop with :not_found" do
+      {fake, opts} = engine()
+
+      assert {:error, :not_found} = Lifecycle.stop(opts)
+      assert stop_timeouts(fake) == [260]
+    end
+
     test "an already-stopped container is :ok" do
       {_fake, opts} = engine(core("2026.7.0", :exited))
       assert :ok = Lifecycle.stop(opts)
@@ -470,7 +477,7 @@ defmodule Vagus.Core.LifecycleTest do
       assert spec.oom_score_adj == -300
     end
 
-    test "absent container -> still create+start (an explicit op)" do
+    test "absent container -> still create+start (an explicit op), the remove of nothing is :ok" do
       {fake, opts} = engine(nil, ["2026.7.0"])
 
       assert :ok =
@@ -772,6 +779,15 @@ defmodule Vagus.Core.LifecycleTest do
   ## Serialization
 
   describe "the single non-blocking lock" do
+    # Callers read a bare `:busy` as this lock being held (409, retry, no
+    # escalation); the engine's own `:busy` must not look like it.
+    test "an engine :busy is not the lock's :busy" do
+      {fake, opts} = engine(core("2026.7.0", :running))
+      Fake.fail_next(fake, :restart, :busy)
+
+      assert Lifecycle.restart(opts ++ [health: health_fun()]) == {:error, {:engine, :busy}}
+    end
+
     test "a second op returns {:error, :busy} while another op holds the lock" do
       {fake, opts} = engine(core("2026.7.0", :running))
       # Holds adopt's inspect, and so the lock adopt runs under, until released.
