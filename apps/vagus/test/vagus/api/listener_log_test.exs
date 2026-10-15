@@ -111,9 +111,9 @@ defmodule Vagus.API.ListenerLogTest do
         try do
           connection = ConnectionLog.pid(socket)
           monitor = Process.monitor(connection)
-          :ok = :gen_tcp.send(socket, request)
+          send_all(socket, List.wrap(request))
           # An HTTP/2 connection would otherwise stay open.
-          :ok = :gen_tcp.shutdown(socket, :write)
+          _ = :gen_tcp.shutdown(socket, :write)
           response = read_to_close(socket, "")
           assert_receive {:DOWN, ^monitor, :process, ^connection, _reason}, @recv_timeout
           {response, connection}
@@ -123,6 +123,19 @@ defmodule Vagus.API.ListenerLogTest do
       end)
 
     {response, log, ConnectionLog.entries(log, connection)}
+  end
+
+  # The first packet must go out; the server may close the connection as
+  # soon as it has judged it, so the rest may meet a closed socket.
+  defp send_all(socket, [first | rest]) do
+    :ok = :gen_tcp.send(socket, first)
+
+    Enum.reduce_while(rest, :ok, fn packet, :ok ->
+      case :gen_tcp.send(socket, packet) do
+        :ok -> {:cont, :ok}
+        {:error, reason} when reason in [:enotconn, :closed, :epipe, :econnreset] -> {:halt, :ok}
+      end
+    end)
   end
 
   defp read_to_close(socket, acc) do
