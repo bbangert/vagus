@@ -90,6 +90,85 @@ defmodule Vagus.Runtime.DockerTest do
     end
   end
 
+  describe "pull_image/2 (hermetic — FakeEngine)" do
+    # FakeEngine sends a map as application/json, so the client gets it decoded.
+    test "a 200 whose body is one JSON error object is a pull failure, not a crash" do
+      engine =
+        FakeEngine.start([
+          {200,
+           %{"errorDetail" => %{"message" => "manifest unknown"}, "error" => "manifest unknown"}},
+          {200, %{"status" => "Status: Image is up to date for ghcr.io/vagus/x:1"}}
+        ])
+
+      on_exit(fn -> FakeEngine.stop(engine) end)
+
+      assert Docker.pull_image("ghcr.io/vagus/x:1", socket: engine.socket) ==
+               {:error, {:pull_failed, "manifest unknown"}}
+
+      assert Docker.pull_image("ghcr.io/vagus/x:1", socket: engine.socket) == :ok
+    end
+  end
+
+  describe ":recv_timeout (hermetic — FakeEngine)" do
+    test "bounds the daemon's silence per request" do
+      engine = FakeEngine.start([{200, %{}, delay: 500}, {200, %{}, delay: 500}])
+      on_exit(fn -> FakeEngine.stop(engine) end)
+
+      assert {:error, %Mint.TransportError{reason: :timeout}} =
+               Docker.request(:get, "/version", socket: engine.socket, recv_timeout: 200)
+
+      assert {:ok, %{status: 200}} =
+               Docker.request(:get, "/version", socket: engine.socket, recv_timeout: 1_000)
+    end
+  end
+
+  describe "inspect_image/2 (hermetic — FakeEngine)" do
+    test "a present image is its inspect map; an absent one is a 404" do
+      engine =
+        FakeEngine.start([
+          {200, %{"Id" => "sha256:5b0e"}},
+          {404, %{"message" => "No such image: x"}}
+        ])
+
+      on_exit(fn -> FakeEngine.stop(engine) end)
+
+      assert {:ok, %{"Id" => "sha256:5b0e"}} =
+               Docker.inspect_image("ghcr.io/vagus/x:1.0", socket: engine.socket)
+
+      assert {:error, {:http, 404, "No such image: x"}} =
+               Docker.inspect_image("ghcr.io/vagus/y:1.0", socket: engine.socket)
+
+      assert [%{method: :get, path: "/images/ghcr.io/vagus/x:1.0/json"}, _] =
+               FakeEngine.requests(engine)
+    end
+
+    test "a traversing ref is rejected before any request" do
+      engine = FakeEngine.start([])
+      on_exit(fn -> FakeEngine.stop(engine) end)
+
+      assert {:error, {:invalid_ref, _}} =
+               Docker.inspect_image("ghcr.io/../containers/x", socket: engine.socket)
+
+      assert FakeEngine.requests(engine) == []
+    end
+  end
+
+  describe "exec/3 with an argv list (hermetic — FakeEngine)" do
+    test "sends the argv as Cmd, not through a shell" do
+      engine =
+        FakeEngine.start([
+          {201, %{"Id" => "exec-1"}},
+          {200, nil},
+          {200, %{"Running" => false, "ExitCode" => 0}}
+        ])
+
+      on_exit(fn -> FakeEngine.stop(engine) end)
+
+      assert :ok = Docker.exec("homeassistant", ["ha", "core", "check"], socket: engine.socket)
+      assert [%{body: %{"Cmd" => ["ha", "core", "check"]}} | _] = FakeEngine.requests(engine)
+    end
+  end
+
   describe "exec_capture/3 (hermetic — FakeEngine, audit G3)" do
     test "captures the still-framed output alongside a zero exit code" do
       output = framed("config valid\n")

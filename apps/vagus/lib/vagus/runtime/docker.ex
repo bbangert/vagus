@@ -118,6 +118,12 @@ defmodule Vagus.Runtime.Docker do
     end
   end
 
+  @doc "GET `/images/{name}/json` — the image's inspect map; a missing image is `{:http, 404, _}`."
+  @spec inspect_image(String.t(), keyword()) :: {:ok, map()} | {:error, term()}
+  def inspect_image(name, opts \\ []) do
+    with :ok <- ensure_image_ref(name), do: get_json("/images/#{name}/json", opts)
+  end
+
   ## Containers
 
   @doc """
@@ -229,8 +235,9 @@ defmodule Vagus.Runtime.Docker do
   end
 
   @doc """
-  Runs `cmd` (via `/bin/sh -c`) inside container `id` and waits for it to
-  exit — the §A4 `backup_pre`/`backup_post` hook for a **hot** add-on.
+  Runs `cmd` (a string via `/bin/sh -c`, or an argv list as-is) inside
+  container `id` and waits for it to exit — the §A4
+  `backup_pre`/`backup_post` hook for a **hot** add-on.
   `:ok` on exit code 0, `{:error, {:exec, code}}` on nonzero.
 
   **Deviation from the originally-specified approach**: the ticket describes
@@ -252,7 +259,7 @@ defmodule Vagus.Runtime.Docker do
   future add-on that needs the command's stdout/stderr will need a real
   streaming client.
   """
-  @spec exec(String.t(), String.t(), keyword()) :: :ok | {:error, term()}
+  @spec exec(String.t(), String.t() | [String.t()], keyword()) :: :ok | {:error, term()}
   def exec(id, cmd, opts \\ []) do
     with :ok <- ensure_ref(id),
          {:ok, exec_id} <- create_exec(id, cmd, opts),
@@ -288,7 +295,7 @@ defmodule Vagus.Runtime.Docker do
   report, not a client error; only a genuine Engine-API failure (create/
   start/inspect never completing) returns `{:error, reason}`.
   """
-  @spec exec_capture(String.t(), String.t(), keyword()) ::
+  @spec exec_capture(String.t(), String.t() | [String.t()], keyword()) ::
           {:ok, %{exit_code: integer(), output: binary()}} | {:error, term()}
   def exec_capture(id, cmd, opts \\ []) do
     with :ok <- ensure_ref(id),
@@ -348,7 +355,9 @@ defmodule Vagus.Runtime.Docker do
   Issues a single Engine-API request over the Unix socket.
 
   `opts`: `:socket`, `:query` (keyword/map → query string), `:body`
-  (a map → JSON, or a raw string/`nil`), `:headers`, `:deadline`. Returns
+  (a map → JSON, or a raw string/`nil`), `:headers`, `:deadline`,
+  `:recv_timeout` (ms of daemon silence tolerated, default
+  #{@recv_timeout}; a stop's grace can outlast the default). Returns
   `{:ok, response}` where `response.body` is JSON-decoded when the daemon says
   so, else the raw string.
 
@@ -392,7 +401,8 @@ defmodule Vagus.Runtime.Docker do
         try do
           with :ok <- in_time(conn, deadline),
                {:ok, conn, ref} <- Mint.HTTP.request(conn, method, full_path, headers, body),
-               {:ok, _conn, responses} <- recv_all(conn, ref, deadline) do
+               {:ok, _conn, responses} <-
+                 recv_all(conn, ref, deadline, Keyword.get(opts, :recv_timeout, @recv_timeout)) do
             {:ok, assemble(responses, ref)}
           else
             {:error, _conn, reason} -> {:error, reason}
@@ -430,7 +440,7 @@ defmodule Vagus.Runtime.Docker do
   ## `exec/3` internals — see the deviation note on `exec/3` itself.
 
   defp create_exec(id, cmd, opts) do
-    body = %{"Cmd" => ["/bin/sh", "-c", cmd], "AttachStdout" => true, "AttachStderr" => true}
+    body = %{"Cmd" => exec_cmd(cmd), "AttachStdout" => true, "AttachStderr" => true}
 
     case request(:post, "/containers/#{id}/exec", Keyword.merge(opts, body: body)) do
       {:ok, %{status: 201, body: %{"Id" => exec_id}}} ->
@@ -443,6 +453,9 @@ defmodule Vagus.Runtime.Docker do
         {:error, reason}
     end
   end
+
+  defp exec_cmd(cmd) when is_binary(cmd), do: ["/bin/sh", "-c", cmd]
+  defp exec_cmd(argv) when is_list(argv), do: argv
 
   defp start_exec_detached(exec_id, opts) do
     body = %{"Detach" => true}
@@ -540,18 +553,18 @@ defmodule Vagus.Runtime.Docker do
   # Accumulate response batches newest-first (O(1) prepend, not O(n²) `++`),
   # enforcing a hard body ceiling so an unbounded daemon stream can't exhaust
   # memory. Flattened back into arrival order on `:done`.
-  defp recv_all(conn, ref, deadline, acc \\ [], size \\ 0) do
+  defp recv_all(conn, ref, deadline, recv, acc \\ [], size \\ 0) do
     left = left_ms(deadline)
 
     if left > 0 do
-      recv_within(conn, ref, deadline, left, acc, size)
+      recv_within(conn, ref, deadline, recv, left, acc, size)
     else
       {:error, conn, :deadline}
     end
   end
 
-  defp recv_within(conn, ref, deadline, left, acc, size) do
-    case Mint.HTTP.recv(conn, 0, min(left, @recv_timeout)) do
+  defp recv_within(conn, ref, deadline, recv, left, acc, size) do
+    case Mint.HTTP.recv(conn, 0, min(left, recv)) do
       {:ok, conn, responses} ->
         size = size + data_size(responses)
         acc = [responses | acc]
@@ -564,13 +577,13 @@ defmodule Vagus.Runtime.Docker do
             {:ok, conn, acc |> Enum.reverse() |> List.flatten()}
 
           true ->
-            recv_all(conn, ref, deadline, acc, size)
+            recv_all(conn, ref, deadline, recv, acc, size)
         end
 
       # The wait was cut to what the deadline had left, so this is the
       # deadline and not a quiet daemon.
       {:error, conn, %Mint.TransportError{reason: :timeout}, _responses}
-      when left < @recv_timeout ->
+      when left < recv ->
         {:error, conn, :deadline}
 
       {:error, conn, reason, _responses} ->
@@ -578,8 +591,9 @@ defmodule Vagus.Runtime.Docker do
     end
   end
 
-  # No deadline reads as the receive timeout itself, which changes nothing.
-  defp left_ms(nil), do: @recv_timeout
+  # No deadline never runs out; term order puts the atom above any number,
+  # so `min/2` and `left > 0` need no special case.
+  defp left_ms(nil), do: :infinity
   defp left_ms(deadline), do: deadline - System.monotonic_time(:millisecond)
 
   defp data_size(responses) do
@@ -659,6 +673,14 @@ defmodule Vagus.Runtime.Docker do
   end
 
   defp platform_query(opts), do: if(p = opts[:platform], do: [platform: p], else: [])
+
+  # A one-object stream arrives decoded (the daemon says application/json).
+  defp check_pull_stream(body) when is_map(body) or is_list(body) do
+    case Enum.find(List.wrap(body), &(is_map(&1) and (&1["error"] || &1["errorDetail"]))) do
+      nil -> :ok
+      failure -> {:error, {:pull_failed, failure["error"] || failure["errorDetail"]["message"]}}
+    end
+  end
 
   defp check_pull_stream(body) do
     # /images/create streams newline-delimited JSON status objects; an
