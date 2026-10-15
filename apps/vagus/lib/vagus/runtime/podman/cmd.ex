@@ -94,7 +94,16 @@ defmodule Vagus.Runtime.Podman.Cmd do
     end
   end
 
+  # The deadline is checked before every receive: `after` only fires on an
+  # empty mailbox, so queued output would otherwise outrun it.
   defp collect(port, deadline, out) do
+    case deadline - now_ms() do
+      left when left <= 0 -> close(port, {:error, :timeout})
+      left -> await(port, deadline, out, left)
+    end
+  end
+
+  defp await(port, deadline, out, left) do
     receive do
       {^port, {:data, data}} ->
         case keep(out, data) do
@@ -108,7 +117,7 @@ defmodule Vagus.Runtime.Podman.Cmd do
       {^port, {:exit_status, status}} ->
         {:exit, status, output(out)}
     after
-      max(deadline - now_ms(), 0) -> close(port, {:error, :timeout})
+      left -> close(port, {:error, :timeout})
     end
   end
 

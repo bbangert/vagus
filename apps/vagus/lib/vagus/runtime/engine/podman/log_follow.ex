@@ -126,42 +126,64 @@ defmodule Vagus.Runtime.Engine.Podman.LogFollow do
   defp alive?(_none), do: false
 
   # Just after the (tail + 1)th line end back from the end, counting only
-  # `F` records: a `P` record does not end a line.
+  # `F` records: a `P` record does not end a line. The scan holds one block
+  # and a header at a time, never a record's body, however long it is.
   defp tail_start(_fd, size, 0), do: size
-  defp tail_start(fd, size, tail), do: scan_back(fd, size, "", tail + 1)
 
-  defp scan_back(_fd, 0, _carry, _left), do: 0
+  defp tail_start(fd, size, tail), do: scan_back(fd, size, nil, tail + 1)
 
-  defp scan_back(fd, pos, carry, left) do
+  # `next_end` is the newline ending the record that starts after the next
+  # newline found: nil until the last newline, after which is only a record
+  # still being written.
+  defp scan_back(fd, 0, next_end, left), do: first_record(fd, next_end, left)
+
+  defp scan_back(fd, pos, next_end, left) do
     from = max(pos - @block_bytes, 0)
     {:ok, block} = :file.pread(fd, from, pos - from)
-    [first | rest] = String.split(block <> carry, "\n")
 
-    # Each element of `rest` starts just after a newline; its last is what
-    # follows the final newline, which ends no line.
-    {lines, _} =
-      Enum.map_reduce(rest, from + byte_size(first) + 1, fn line, at ->
-        {{at, line}, at + byte_size(line) + 1}
-      end)
+    newlines =
+      block |> :binary.matches("\n") |> Enum.map(fn {at, 1} -> from + at end) |> Enum.reverse()
 
-    found =
-      lines
-      |> Enum.drop(-1)
-      |> Enum.reverse()
-      |> Enum.reduce_while(left, fn {at, line}, left ->
-        cond do
-          not line_end?(line) -> {:cont, left}
-          left == 1 -> {:halt, {:found, at + byte_size(line) + 1}}
-          true -> {:cont, left - 1}
-        end
-      end)
-
-    case found do
+    case count_back(fd, newlines, next_end, left) do
       {:found, start} -> start
-      # `first` is the file's first line here, whole.
-      1 when from == 0 -> if line_end?(first), do: byte_size(first) + 1, else: 0
-      _left when from == 0 -> 0
-      left -> scan_back(fd, from, first <> "\n", left)
+      {next_end, left} -> scan_back(fd, from, next_end, left)
+    end
+  end
+
+  defp count_back(_fd, [], next_end, left), do: {next_end, left}
+
+  defp count_back(fd, [newline | rest], nil, left), do: count_back(fd, rest, newline, left)
+
+  defp count_back(fd, [newline | rest], next_end, left) do
+    case counted(fd, newline + 1, next_end, left) do
+      {:found, _} = found -> found
+      left -> count_back(fd, rest, newline, left)
+    end
+  end
+
+  defp first_record(_fd, nil, _left), do: 0
+
+  defp first_record(fd, next_end, left) do
+    case counted(fd, 0, next_end, left) do
+      {:found, start} -> start
+      _left -> 0
+    end
+  end
+
+  defp counted(fd, start, line_end, left) do
+    cond do
+      not line_end?(fd, start) -> left
+      left == 1 -> {:found, line_end + 1}
+      true -> left - 1
+    end
+  end
+
+  @header_bytes 128
+
+  defp line_end?(fd, start) do
+    case :file.pread(fd, start, @header_bytes) do
+      {:ok, head} -> head |> :binary.split("\n") |> hd() |> line_end?()
+      _ -> false
     end
   end
 

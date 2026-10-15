@@ -53,6 +53,8 @@ defmodule Vagus.Runtime.Engine.Podman.EventSource do
       poll_ms: Keyword.get(opts, :events_poll_ms, @poll_ms),
       resync_ms: Keyword.get(opts, :resync_ms, @resync_ms),
       resync_timer: nil,
+      # Test-only: runs between the open and the descriptor's stat.
+      open_hook: opts[:open_hook],
       fd: nil,
       inode: nil,
       offset: 0,
@@ -69,7 +71,7 @@ defmodule Vagus.Runtime.Engine.Podman.EventSource do
     src = close(src)
 
     src =
-      case open(src.path) do
+      case open(src) do
         {:ok, fd, %File.Stat{inode: inode, size: size}} ->
           %{src | fd: fd, inode: inode, offset: size}
 
@@ -119,12 +121,27 @@ defmodule Vagus.Runtime.Engine.Podman.EventSource do
 
   # The path is config or a test's temp file, never request input.
   # sobelow_skip ["Traversal.FileModule"]
-  defp open(path) do
-    with {:ok, stat} <- File.stat(path),
-         {:ok, fd} <- File.open(path, [:read, :binary, :raw]) do
-      {:ok, fd, stat}
-    else
-      {:error, _} -> :absent
+  # The inode and size come from the opened descriptor: a stat of the path
+  # before the open could describe a file a rotation has since replaced.
+  defp open(src) do
+    case File.open(src.path, [:read, :binary, :raw]) do
+      {:ok, fd} ->
+        if src.open_hook, do: src.open_hook.()
+        fstat(fd)
+
+      {:error, _} ->
+        :absent
+    end
+  end
+
+  defp fstat(fd) do
+    case :file.read_file_info(fd, time: :posix) do
+      {:ok, info} ->
+        {:ok, fd, File.Stat.from_record(info)}
+
+      {:error, _} ->
+        File.close(fd)
+        :absent
     end
   end
 
@@ -136,7 +153,7 @@ defmodule Vagus.Runtime.Engine.Podman.EventSource do
 
       # The file appeared after connect: all of it is new.
       {:ok, _stat} when src.inode == nil ->
-        case open(src.path) do
+        case open(src) do
           {:ok, fd, %File.Stat{inode: inode}} -> read(%{src | fd: fd, inode: inode, offset: 0})
           :absent -> {[], src}
         end
@@ -154,7 +171,7 @@ defmodule Vagus.Runtime.Engine.Podman.EventSource do
     if src.fd, do: File.close(src.fd)
     src = %{src | fd: nil, inode: nil, offset: 0, buffer: ""}
 
-    case open(src.path) do
+    case open(src) do
       {:ok, fd, %File.Stat{inode: inode, size: size}} ->
         src = %{src | fd: fd, inode: inode, offset: after_rotation(fd, size)}
         {more, src} = read(src)

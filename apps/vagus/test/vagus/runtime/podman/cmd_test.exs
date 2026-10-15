@@ -92,6 +92,38 @@ defmodule Vagus.Runtime.Podman.CmdTest do
     end
   end
 
+  # A caller that resumes after its deadline, with podman's output and exit
+  # status already queued, is still past its deadline.
+  test "output queued past the deadline does not outrun it" do
+    {bin, dir} =
+      script("""
+      d="$(dirname "$0")"
+      : > "$d/started"
+      sleep 0.3
+      printf done
+      : > "$d/printed"
+      """)
+
+    caller = spawn_run(bin, timeout_ms: 500)
+    await_file_exists(Path.join(dir, "started"))
+    :erlang.suspend_process(caller)
+    await_file_exists(Path.join(dir, "printed"))
+    Process.sleep(700)
+    :erlang.resume_process(caller)
+
+    assert_receive {:result, {:error, :timeout}}, 10_000
+  end
+
+  defp spawn_run(bin, opts) do
+    test = self()
+    spawn(fn -> send(test, {:result, Cmd.run([], [podman_bin: bin] ++ opts)}) end)
+  end
+
+  defp await_file_exists(path) do
+    Enum.find(1..1_000, fn _ -> File.exists?(path) or (Process.sleep(10) && false) end) ||
+      flunk("#{path} never appeared")
+  end
+
   describe "the output cap" do
     setup do
       {bin, _dir} = script("printf '%5000s' '' | tr ' ' x\n")

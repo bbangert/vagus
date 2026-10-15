@@ -145,6 +145,31 @@ defmodule Vagus.Runtime.Engine.Podman.EventSourceTest do
     end
   end
 
+  test "a file replaced between the open and its stat is described as opened", %{path: path} do
+    File.write!(path, line("start", "addon_old"))
+    tmp = path <> ".tmp"
+
+    # Longer than the old file, so a size taken from the old file would
+    # point into the new one's history.
+    File.write!(
+      tmp,
+      String.duplicate(line("start", "addon_new"), 5) <>
+        line("died", "addon_new", %{"ContainerExitCode" => 1})
+    )
+
+    # podman's rotation lands just after the open.
+    hook = fn -> if File.exists?(tmp), do: File.rename!(tmp, path) end
+
+    {:ok, _, src} =
+      EventSource.connect(
+        EventSource.init(events_log: path, events_poll_ms: 60_000, open_hook: hook)
+      )
+
+    # The opened file was the old one: its rotation is seen, not its tail
+    # read as the new file's.
+    assert {[:ready], _src} = tick(src)
+  end
+
   test "close cancels both timers and drops the file", %{path: path} do
     File.write!(path, "")
 
