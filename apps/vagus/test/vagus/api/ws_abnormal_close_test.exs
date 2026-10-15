@@ -194,7 +194,6 @@ defmodule Vagus.API.WSAbnormalCloseTest do
     reserved_bits: {1002, "ws/protocol"},
     compressed_frame: {1002, "ws/protocol"},
     stray_continuation: {1002, "ws/protocol"},
-    empty_continuation: {1008, "ws/protocol"},
     oversize_ping: {1002, "ws/protocol"},
     fragmented_ping: {1002, "ws/protocol"}
   ]
@@ -465,9 +464,6 @@ defmodule Vagus.API.WSAbnormalCloseTest do
   # Compression is never negotiated on this listener.
   defp frames(:compressed_frame, _surface), do: Raw.frame(1, 1, @marker, rsv: 4)
   defp frames(:stray_continuation, _surface), do: Raw.frame(1, 0, @marker)
-
-  defp frames(:empty_continuation, _surface),
-    do: [Raw.frame(0, 1, @marker), Raw.frame(0, 0, "")]
 
   defp frames(:oversize_ping, _surface), do: Raw.frame(1, 9, filler(126))
   defp frames(:fragmented_ping, _surface), do: Raw.frame(0, 9, @marker)

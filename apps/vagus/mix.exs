@@ -69,7 +69,7 @@ defmodule Vagus.MixProject do
       # Web/API surface (P2+ — supervisor API endpoints and outbound
       # WebSocket client to Core).
       {:plug, "~> 1.20"},
-      {:bandit, "~> 1.12"},
+      {:bandit, "~> 1.13"},
       {:finch, "~> 0.24.0"},
       # Ingress reverse proxy (M4b): websock_adapter provides the
       # Plug-side WebSocket upgrade (`WebSockAdapter.upgrade/4`) for the

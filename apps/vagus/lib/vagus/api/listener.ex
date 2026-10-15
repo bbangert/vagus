@@ -129,8 +129,7 @@ defmodule Vagus.API.Listener do
       http_options: [compress: false, log_protocol_errors: false],
       # Nothing that calls this API speaks cleartext HTTP/2, and Bandit logs
       # each frame of a type it does not know, payload included, whatever
-      # the options. Keep it off: the root mix.exs ignores a bandit HTTP/2
-      # advisory because of it.
+      # the options.
       http_2_options: [enabled: false],
       # Bandit's line for a malformed or oversize frame is one per attempt.
       # The bridges count those instead (`Vagus.API.WSAbnormalClose`).
