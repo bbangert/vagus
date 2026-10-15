@@ -2,7 +2,6 @@ defmodule Vagus.Runtime.Engine.PodmanContractTest.Leg do
   @behaviour Vagus.Test.EngineContract
 
   alias Vagus.Runtime.Engine
-  alias Vagus.Runtime.Host
   alias Vagus.Test.FakePodman
 
   @fixtures Path.expand("../../../fixtures/podman", __DIR__)
@@ -15,10 +14,60 @@ defmodule Vagus.Runtime.Engine.PodmanContractTest.Leg do
 
   @impl true
   def arrange(:unavailable, ctx), do: start(ctx, [], podman_bin: "/nonexistent/podman")
+
+  # A running container whose conmon is a real process: `release/1` writes
+  # the second record and ends it, as conmon does when the container exits.
+  def arrange(:follow, ctx) do
+    log = log_file(["2026-10-14T21:00:00.000000001+00:00 stdout F line one"])
+    conmon = Port.open({:spawn_executable, System.find_executable("sleep")}, args: ["600"])
+    {:os_pid, pid} = Port.info(conmon, :os_pid)
+
+    ExUnit.Callbacks.on_exit(fn ->
+      System.cmd("kill", ["-9", "#{pid}"], stderr_to_stdout: true)
+    end)
+
+    start(ctx, [{"container inspect *", [{0, inspect_out(log_json(log, pid))}]}], []) ++
+      [log_file: log, conmon_pid: pid]
+  end
+
+  def arrange({:stamped, _} = scenario, ctx) do
+    log =
+      log_file([
+        "2026-10-14T21:00:00.000000001+00:00 stdout F line one",
+        "2026-10-14T21:00:00.000000002+00:00 stderr F line two"
+      ])
+
+    rules = script(scenario) ++ [{"container inspect *", [{0, inspect_out(log_json(log, nil))}]}]
+    start(ctx, rules, [])
+  end
+
   def arrange(scenario, ctx), do: start(ctx, script(scenario), [])
 
   @impl true
-  def release(_opts), do: :ok
+  def release(opts) do
+    with log when is_binary(log) <- opts[:log_file],
+         false <- File.read!(log) =~ "line two" do
+      File.write!(log, "2026-10-14T21:00:00.000000002+00:00 stderr F line two\n", [:append])
+      System.cmd("kill", ["-9", "#{opts[:conmon_pid]}"])
+    end
+
+    :ok
+  end
+
+  def log_file(records) do
+    path = Path.join(System.tmp_dir!(), "podman-ctr-#{System.unique_integer([:positive])}.log")
+    File.write!(path, Enum.map_join(records, &(&1 <> "\n")))
+    ExUnit.Callbacks.on_exit(fn -> File.rm(path) end)
+    path
+  end
+
+  # A stopped container has no conmon.
+  def log_json(log, conmon_pid) do
+    running_json()
+    |> put_in(["HostConfig", "LogConfig", "Path"], log)
+    |> put_in(["State", "Running"], conmon_pid != nil)
+    |> put_in(["State", "ConmonPid"], conmon_pid || 0)
+  end
 
   def start(ctx, rules, opts) do
     fake = FakePodman.start(rules)
@@ -27,34 +76,7 @@ defmodule Vagus.Runtime.Engine.PodmanContractTest.Leg do
     [engine: Engine.Podman, host: host, podman_bin: bin, fake_podman: fake]
   end
 
-  def start_host(_ctx, bin) do
-    root = Path.join(System.tmp_dir!(), "podman-leg-#{System.unique_integer([:positive])}")
-    ExUnit.Callbacks.on_exit(fn -> File.rm_rf(root) end)
-    name = :"podman_host_#{System.unique_integer([:positive])}"
-
-    ExUnit.Callbacks.start_supervised!(
-      {Host,
-       name: name,
-       podman_bin: bin,
-       graphroot: Path.join(root, "storage"),
-       run_dir: Path.join(root, "run"),
-       meminfo: Path.join(root, "no-meminfo"),
-       profile_override: Path.join(root, "no-override"),
-       socket_dir: Path.join(root, "supervisor"),
-       resolv_conf: Path.join(root, "resolv.conf"),
-       name_servers: fn -> [] end,
-       run: fn _bin, _args -> {"", 0} end,
-       shutting_down?: fn -> false end,
-       prep_retry_ms: 60_000}
-    )
-
-    _ =
-      Enum.find(1..400, fn _ ->
-        Host.ready(name) != {:error, :preparing} or (Process.sleep(5) && false)
-      end)
-
-    name
-  end
+  def start_host(_ctx, bin), do: FakePodman.start_host(bin)
 
   def running_json(health \\ "healthy") do
     [base] = fixture("inspect_running.json")
@@ -398,7 +420,6 @@ end
 defmodule Vagus.Runtime.Engine.PodmanContractTest do
   use Vagus.Test.EngineContract,
     leg: Vagus.Runtime.Engine.PodmanContractTest.Leg,
-    skip_follow: "podman log follow arrives in the adapter's second part",
     async: true
 
   alias Vagus.Runtime.Engine.PodmanContractTest.Leg
@@ -625,6 +646,36 @@ defmodule Vagus.Runtime.Engine.PodmanContractTest do
       spec = %{C.spec() | mounts: [%{type: :bind, source: "/a,b", target: "/data"}]}
       assert {:error, {:failed, :create, _}} = Engine.create(spec, opts)
       assert FakePodman.verbs(fake) == [["info", "--format", "{{.Version.Version}}"]]
+    end
+
+    test "a failed or killed pull empties the spool; a good one leaves it" do
+      root = Path.join(System.tmp_dir!(), "podman-spool-#{System.unique_integer([:positive])}")
+
+      fake =
+        FakePodman.start([
+          {"pull * ghcr.io/vagus/good:1", [{0, "5b0e\n"}]},
+          {"pull * ghcr.io/vagus/slow:1", [{0, "", delay_ms: 2_000}]},
+          {"pull *", [{125, "Error: initializing source docker://x: manifest unknown\n"}]}
+        ])
+
+      host = FakePodman.start_host(fake.bin, root: root)
+      opts = [engine: Engine.Podman, host: host, podman_bin: fake.bin]
+      spool = Path.join(root, "storage/tmp")
+
+      leak = fn ->
+        File.mkdir_p!(Path.join(spool, "layer-#{System.unique_integer([:positive])}"))
+      end
+
+      leak.()
+      :ok = Engine.pull("ghcr.io/vagus/good:1", opts)
+      assert [_] = File.ls!(spool)
+
+      {:error, {:pull_failed, _}} = Engine.pull("ghcr.io/vagus/bad:1", opts)
+      assert File.ls!(spool) == []
+
+      leak.()
+      assert Engine.pull("ghcr.io/vagus/slow:1", [timeout_ms: 200] ++ opts) == {:error, :timeout}
+      assert File.ls!(spool) == []
     end
 
     test "a pull refused at shutdown is :busy" do

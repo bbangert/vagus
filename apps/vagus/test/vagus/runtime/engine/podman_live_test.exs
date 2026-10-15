@@ -5,7 +5,9 @@ defmodule Vagus.Runtime.Engine.PodmanLiveTest do
   # present and a `hassio` network. The shared contract suite cannot run
   # here: it pins ids, timestamps and failures no real engine reproduces, so
   # this suite checks the same behaviours on real containers. It creates and
-  # removes only `vagus_live_*` containers.
+  # removes only `vagus_live_*` containers. Log follow and the events source
+  # read files podman writes, which through the wrapper live in another
+  # container, so they are covered on recorded output only.
   use ExUnit.Case, async: false
 
   @moduletag :podman

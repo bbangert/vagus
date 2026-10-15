@@ -196,12 +196,6 @@ defmodule Vagus.Runtime.Engine.PodmanRenderTest do
                  "supervisor_managed=",
                  "--network",
                  "host",
-                 "--dns",
-                 "172.30.32.3",
-                 "--dns-search",
-                 "local.hass.io",
-                 "--dns-option",
-                 "timeout:10",
                  "--add-host",
                  "hassio:#{@ip}",
                  "--add-host",
@@ -274,6 +268,15 @@ defmodule Vagus.Runtime.Engine.PodmanRenderTest do
 
     test "a privileged container gets no capability flags of its own" do
       refute "--cap-add" in render(privileged: true)
+    end
+
+    test "DNS settings render on a bridge only: the host network keeps the host's resolv.conf" do
+      dns = [dns: ["172.30.32.3"], dns_search: ["local.hass.io"], dns_options: ["timeout:10"]]
+
+      for flag <- ~w(--dns --dns-search --dns-option) do
+        refute flag in render(dns)
+        assert flag in render([network: {:bridge, "hassio"}] ++ dns)
+      end
     end
 
     test "ports publish only from a bridge" do

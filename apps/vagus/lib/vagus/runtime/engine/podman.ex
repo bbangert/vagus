@@ -82,7 +82,9 @@ defmodule Vagus.Runtime.Engine.Podman do
   def pull(image, opts) do
     platform = if p = opts[:platform], do: ["--platform", p], else: []
 
-    case run(:pull, ["pull", "--quiet" | platform] ++ ["--", image], opts, @pull_ms) do
+    args = ["pull", "--quiet" | platform] ++ ["--", image]
+
+    case run(:pull, args, opts, @pull_ms, &clear_spool_on_failure(&1, opts[:host])) do
       {:ok, _id} -> :ok
       {:exit, 125, out} -> {:error, {:pull_failed, registry_message(out)}}
       other -> unit(:pull, other)
@@ -209,14 +211,35 @@ defmodule Vagus.Runtime.Engine.Podman do
 
   @impl true
   def inspect(name, opts) do
+    with {:ok, raw} <- inspect_raw(name, opts), do: {:ok, parse_inspect(raw)}
+  end
+
+  defp inspect_raw(name, opts) do
     with {:ok, out} <-
            ok(:inspect, run(:inspect, ["container", "inspect", "--", name], opts, @query_ms)),
          {:ok, [raw | _]} <- decode(:inspect, out) do
-      {:ok, parse_inspect(raw)}
+      {:ok, raw}
     else
       {:ok, []} -> {:error, :not_found}
       {:ok, _other} -> {:error, {:failed, :inspect, :bad_json}}
       {:error, _} = error -> error
+    end
+  end
+
+  @doc false
+  # What `LogFollow` tails, and the conmon whose exit ends the follow
+  # (`ConmonPid` is absent once the container stops).
+  @spec log_target(String.t(), keyword()) ::
+          {:ok, %{path: String.t() | nil, conmon_pid: integer() | nil}} | {:error, term()}
+  def log_target(name, opts) do
+    with {:ok, raw} <- inspect_raw(name, opts) do
+      running? = get_in(raw, ["State", "Running"]) == true
+
+      {:ok,
+       %{
+         path: get_in(raw, ["HostConfig", "LogConfig", "Path"]),
+         conmon_pid: if(running?, do: get_in(raw, ["State", "ConmonPid"]))
+       }}
     end
   end
 
@@ -241,9 +264,14 @@ defmodule Vagus.Runtime.Engine.Podman do
     ok(:logs, run(:logs, args, [cap: @logs_cap] ++ opts, @query_ms))
   end
 
-  # Part 2 of this adapter tails the container's k8s-file log here.
   @impl true
-  def follow_logs(_name, _owner, _opts), do: {:error, {:failed, :follow_logs, :not_implemented}}
+  def follow_logs(name, owner, opts) do
+    {follow, engine_opts} = Keyword.split(opts, [:tail, :timestamps, :poll_ms])
+
+    __MODULE__.LogFollow.start_link(
+      [name: name, owner: owner, engine_opts: engine_opts] ++ follow
+    )
+  end
 
   @impl true
   def stats(name, opts) do
@@ -391,9 +419,7 @@ defmodule Vagus.Runtime.Engine.Podman do
       env(spec.env, spec.secret_env) ++
       Enum.flat_map(Enum.sort(spec.labels || %{}), fn {k, v} -> ["--label", "#{k}=#{v}"] end) ++
       network(bridge, spec.network_aliases) ++
-      many("--dns", spec.dns) ++
-      many("--dns-search", spec.dns_search) ++
-      many("--dns-option", spec.dns_options) ++
+      dns(bridge, spec) ++
       hosts(bridge, spec.extra_hosts) ++
       Enum.flat_map(spec.mounts || [], &["--mount", mount(&1)]) ++
       Enum.flat_map(Enum.sort(spec.tmpfs || %{}), fn {dst, o} ->
@@ -418,6 +444,15 @@ defmodule Vagus.Runtime.Engine.Podman do
     Enum.flat_map(env, fn {k, v} ->
       if k in secret, do: ["--env", k], else: ["--env", "#{k}=#{v}"]
     end)
+  end
+
+  # Docker ignores these on the host network, where the container reads the
+  # host's resolv.conf; podman would write them over it.
+  defp dns(nil, _spec), do: []
+
+  defp dns(_bridge, spec) do
+    many("--dns", spec.dns) ++
+      many("--dns-search", spec.dns_search) ++ many("--dns-option", spec.dns_options)
   end
 
   defp network(nil, _aliases), do: ["--network", "host"]
@@ -661,7 +696,17 @@ defmodule Vagus.Runtime.Engine.Podman do
 
   # `default_ms` applies only without `timeout_ms`; a grace-carrying verb
   # passes its already-floored budget and so ignores `timeout_ms` here.
-  defp run(verb, args, opts, default_ms) do
+  # A failed or killed pull leaves its layers in the spool. It runs under
+  # the only pull permit, so no other pull's spool can be there.
+  defp clear_spool_on_failure({:ok, _} = result, _host), do: result
+
+  defp clear_spool_on_failure(result, host) do
+    Host.clear_spool(host)
+    result
+  end
+
+  # `after_run` runs on the result while the permit is still held.
+  defp run(verb, args, opts, default_ms, after_run \\ & &1) do
     budget =
       if verb in [:stop, :restart, :stop_all],
         do: default_ms,
@@ -677,7 +722,7 @@ defmodule Vagus.Runtime.Engine.Podman do
 
     Host.with_permit(host, class(verb), budget, fn ->
       left = max(deadline - System.monotonic_time(:millisecond), 1)
-      Cmd.run(args, Keyword.put(cmd_opts, :timeout_ms, left))
+      args |> Cmd.run(Keyword.put(cmd_opts, :timeout_ms, left)) |> after_run.()
     end)
   end
 

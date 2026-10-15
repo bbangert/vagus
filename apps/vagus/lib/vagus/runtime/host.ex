@@ -103,6 +103,27 @@ defmodule Vagus.Runtime.Host do
   @spec profile(atom() | nil) :: profile() | nil
   def profile(host \\ nil), do: shared(host)[:profile]
 
+  @doc """
+  Empties the pull spools. Only for a holder of the pull permit, and only
+  while a single one exists, so no pull can be using them.
+  """
+  @spec clear_spool(atom() | nil) :: :ok
+  def clear_spool(host) do
+    with %{spools: spools, pull_permits: 1} <- shared(host) do
+      Enum.each(spools, &empty_dir/1)
+    end
+
+    :ok
+  end
+
+  # sobelow_skip ["Traversal.FileModule"]
+  defp empty_dir(dir) do
+    case File.ls(dir) do
+      {:ok, entries} -> Enum.each(entries, &File.rm_rf(Path.join(dir, &1)))
+      {:error, _} -> :ok
+    end
+  end
+
   @doc "The previous stats sample for `name`, or nil."
   @spec last_sample(atom() | nil, String.t()) :: term()
   def last_sample(host, name) do
@@ -223,7 +244,7 @@ defmodule Vagus.Runtime.Host do
     ensure_socket_dir(state.opts)
     write_resolv_conf(state.opts)
     state = state |> apply_profile() |> publish(:preparing)
-    clear_spool(state.opts)
+    clear_spool_once(state.opts)
     {:noreply, probe(state)}
   end
 
@@ -305,7 +326,14 @@ defmodule Vagus.Runtime.Host do
   defp publish(state, status) do
     :persistent_term.put(
       {__MODULE__, state.name},
-      %{status: status, env: state.env, stats: state.stats, profile: state.profile}
+      %{
+        status: status,
+        env: state.env,
+        stats: state.stats,
+        profile: state.profile,
+        spools: [spool_dir(state.opts), Path.join(run_dir(state.opts), "spool")],
+        pull_permits: state.permits[:pull]
+      }
     )
 
     state
@@ -452,15 +480,14 @@ defmodule Vagus.Runtime.Host do
   # Both spools are made: the fast one may hold a pull's layers, and
   # podman stats `<graphroot>/tmp` even when it spools elsewhere.
   # sobelow_skip ["Traversal.FileModule"]
-  defp clear_spool(opts) do
+  defp clear_spool_once(opts) do
     spool = spool_dir(opts)
     marker = Path.join(run_dir(opts), "spool-cleared")
     _ = File.mkdir_p(Path.join(run_dir(opts), "spool"))
 
     with :ok <- File.mkdir_p(spool),
-         false <- File.exists?(marker),
-         {:ok, entries} <- File.ls(spool) do
-      Enum.each(entries, &File.rm_rf(Path.join(spool, &1)))
+         false <- File.exists?(marker) do
+      empty_dir(spool)
       File.write(marker, "")
     else
       true -> :ok

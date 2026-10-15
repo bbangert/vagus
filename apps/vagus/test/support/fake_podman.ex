@@ -97,4 +97,42 @@ defmodule Vagus.Test.FakePodman do
 
   @doc "The calls without podman's global flags."
   def verbs(fake), do: Enum.map(calls(fake), &Enum.drop(&1, 2))
+
+  @doc """
+  A `Vagus.Runtime.Host` under the test's supervisor, preparing in a temp
+  dir with `bin` as podman; returns its name once its probe has answered.
+  `root:` names the temp dir (its `storage/tmp` is the spool).
+  """
+  def start_host(bin, opts \\ []) do
+    root =
+      Keyword.get_lazy(opts, :root, fn ->
+        Path.join(System.tmp_dir!(), "podman-host-#{System.unique_integer([:positive])}")
+      end)
+
+    ExUnit.Callbacks.on_exit(fn -> File.rm_rf(root) end)
+    name = :"podman_host_#{System.unique_integer([:positive])}"
+
+    ExUnit.Callbacks.start_supervised!(
+      {Vagus.Runtime.Host,
+       name: name,
+       podman_bin: bin,
+       graphroot: Path.join(root, "storage"),
+       run_dir: Path.join(root, "run"),
+       meminfo: Path.join(root, "no-meminfo"),
+       profile_override: Path.join(root, "no-override"),
+       socket_dir: Path.join(root, "supervisor"),
+       resolv_conf: Path.join(root, "resolv.conf"),
+       name_servers: fn -> [] end,
+       run: fn _bin, _args -> {"", 0} end,
+       shutting_down?: fn -> false end,
+       prep_retry_ms: 60_000}
+    )
+
+    _ =
+      Enum.find(1..400, fn _ ->
+        Vagus.Runtime.Host.ready(name) != {:error, :preparing} or (Process.sleep(5) && false)
+      end)
+
+    name
+  end
 end
