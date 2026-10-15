@@ -124,6 +124,22 @@ defmodule Vagus.Runtime.Engine.Podman.EventSourceTest do
       assert [%Event{action: :start, name: "addon_after"}] = tick(src) |> elem(0)
     end
 
+    @rot2_before Path.expand("../../../fixtures/podman/events_rotation2_before.log", __DIR__)
+    @rot2_after Path.expand("../../../fixtures/podman/events_rotation2_after.log", __DIR__)
+
+    # Recorded across two rotations: the second's copied half still holds
+    # the first's end marker, ahead of fx_r2_30 and fx_r2_31, read before.
+    test "skips to the last end marker when the copy holds an earlier one", %{path: path} do
+      File.write!(path, File.read!(@rot2_before))
+      {_, src} = connect(path)
+
+      tmp = path <> ".tmp"
+      File.write!(tmp, File.read!(@rot2_after))
+      File.rename!(tmp, path)
+
+      assert {[:ready, %Event{action: :create, name: "fx_r2_32"}], _src} = tick(src)
+    end
+
     test "a replaced file without an end marker is read from its end", %{path: path} do
       File.write!(path, line("start", "addon_old"))
       {_, src} = connect(path)

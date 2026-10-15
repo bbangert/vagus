@@ -182,23 +182,25 @@ defmodule Vagus.Runtime.Engine.Podman.EventSource do
     end
   end
 
-  # The byte after the first rotation end marker, or the end of the file.
+  # The byte after the last rotation end marker, or the end of the file.
+  # The copied half can hold an earlier rotation's markers; only the last
+  # end closes this one. A rotation after it, before this tick, would have
+  # replaced the file again, and the `:ready` that follows covers that.
   defp after_rotation(fd, size) do
     with {:ok, data} <- :file.pread(fd, 0, size),
-         {:ok, offset} <- end_marker(String.split(data, "\n"), 0) do
+         {:ok, offset} <- last_end_marker(String.split(data, "\n"), 0, :none) do
       offset
     else
       _ -> size
     end
   end
 
-  defp end_marker([], _offset), do: :none
-  defp end_marker([_partial], _offset), do: :none
+  # The last element is what follows the final newline: no whole line.
+  defp last_end_marker([_partial], _offset, found), do: found
 
-  defp end_marker([line | rest], offset) do
+  defp last_end_marker([line | rest], offset, found) do
     next = offset + byte_size(line) + 1
-
-    if rotation_end?(line), do: {:ok, next}, else: end_marker(rest, next)
+    last_end_marker(rest, next, if(rotation_end?(line), do: {:ok, next}, else: found))
   end
 
   defp rotation_end?(line) do

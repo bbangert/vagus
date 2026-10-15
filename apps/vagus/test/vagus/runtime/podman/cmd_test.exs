@@ -124,6 +124,39 @@ defmodule Vagus.Runtime.Podman.CmdTest do
       flunk("#{path} never appeared")
   end
 
+  # Discarded stdout must not even reach the caller's mailbox: a suspended
+  # caller would otherwise hold all 50 MB of it.
+  @tag timeout: 60_000
+  test "discarded stdout never reaches the caller; stderr and the exit code do" do
+    {bin, dir} =
+      script("""
+      d="$(dirname "$0")"
+      : > "$d/started"
+      head -c 50000000 /dev/zero
+      echo err >&2
+      : > "$d/written"
+      exit 3
+      """)
+
+    caller =
+      spawn_run(bin, timeout_ms: 30_000, cap: 65_536, truncate: true, discard_stdout: true)
+
+    await_file_exists(Path.join(dir, "started"))
+    :erlang.suspend_process(caller)
+    await_file_exists(Path.join(dir, "written"))
+    # Time for any output still in flight to land in the mailbox.
+    Process.sleep(200)
+
+    [message_queue_len: queued, memory: memory] =
+      Process.info(caller, [:message_queue_len, :memory])
+
+    :erlang.resume_process(caller)
+
+    assert queued < 10
+    assert memory < 1_048_576
+    assert_receive {:result, {:exit, 3, "err\n"}}, 10_000
+  end
+
   describe "the output cap" do
     setup do
       {bin, _dir} = script("printf '%5000s' '' | tr ' ' x\n")

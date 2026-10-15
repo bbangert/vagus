@@ -1,0 +1,10 @@
+{"Name":"/tmp/rot2/events.log","Status":"log-rotation","Time":"2026-10-15T19:53:55.909743833Z","Type":"system","Attributes":{"io.podman.event.rotate":"begin"}}
+{"Name":"/tmp/rot2/events.log","Status":"log-rotation","Time":"2026-10-15T19:53:45.247198211Z","Type":"system","Attributes":{"io.podman.event.rotate":"end"}}
+{"ID":"bf8527eb54c3680e728d5b4b383a8ba730d72dae7236fbc8dff97ed6b224a731","Name":"docker.io/library/alpine:3.20","Status":"pull","Time":"2026-10-15T19:53:45.227701349Z","Type":"image","Attributes":null}
+{"ID":"96849430db577f3dcd28f1d835ca7e9ab4e658710b0ecbd26cab3986516e92b4","Image":"docker.io/library/alpine:3.20","Name":"fx_r2_30","Status":"create","Time":"2026-10-15T19:53:45.373814279Z","Type":"container","Attributes":{"supervisor_managed":""}}
+{"ID":"bf8527eb54c3680e728d5b4b383a8ba730d72dae7236fbc8dff97ed6b224a731","Name":"docker.io/library/alpine:3.20","Status":"pull","Time":"2026-10-15T19:53:45.354411545Z","Type":"image","Attributes":null}
+{"ID":"a2100b386faabf001bd56f5251c822ba07a578550e2f8f1a3ca5a6218425c0f7","Image":"docker.io/library/alpine:3.20","Name":"fx_r2_31","Status":"create","Time":"2026-10-15T19:53:55.763401809Z","Type":"container","Attributes":{"supervisor_managed":""}}
+{"ID":"bf8527eb54c3680e728d5b4b383a8ba730d72dae7236fbc8dff97ed6b224a731","Name":"docker.io/library/alpine:3.20","Status":"pull","Time":"2026-10-15T19:53:55.744062995Z","Type":"image","Attributes":null}
+{"Name":"/tmp/rot2/events.log","Status":"log-rotation","Time":"2026-10-15T19:53:55.909781374Z","Type":"system","Attributes":{"io.podman.event.rotate":"end"}}
+{"ID":"1588ac1a40ccc92bbc38865ffc3fa5b2bd15751f299160ae383afafe8391fd43","Image":"docker.io/library/alpine:3.20","Name":"fx_r2_32","Status":"create","Time":"2026-10-15T19:53:55.90959939Z","Type":"container","Attributes":{"supervisor_managed":""}}
+{"ID":"bf8527eb54c3680e728d5b4b383a8ba730d72dae7236fbc8dff97ed6b224a731","Name":"docker.io/library/alpine:3.20","Status":"pull","Time":"2026-10-15T19:53:55.890452429Z","Type":"image","Attributes":null}

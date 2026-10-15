@@ -25,7 +25,6 @@ defmodule Vagus.Runtime.Engine.Podman.LogFollow do
 
   @poll_ms 250
   @block_bytes 65_536
-  @max_tail 10_000
   @max_pending 1_048_576
 
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts)
@@ -39,7 +38,7 @@ defmodule Vagus.Runtime.Engine.Podman.LogFollow do
       owner_ref: Process.monitor(owner),
       name: Keyword.fetch!(opts, :name),
       engine_opts: Keyword.get(opts, :engine_opts, []),
-      tail: opts |> Keyword.get(:tail, 100) |> min(@max_tail) |> max(0),
+      tail: opts |> Keyword.get(:tail, 100) |> max(0),
       timestamps: Keyword.get(opts, :timestamps, false),
       poll_ms: Keyword.get(opts, :poll_ms, @poll_ms),
       fd: nil,

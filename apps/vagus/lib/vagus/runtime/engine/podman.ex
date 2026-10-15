@@ -357,7 +357,7 @@ defmodule Vagus.Runtime.Engine.Podman do
   @impl true
   def exec(name, argv, opts) do
     capture? = Keyword.get(opts, :capture, true)
-    cap = if capture?, do: [], else: [cap: @discard_cap, truncate: true]
+    cap = if capture?, do: [], else: [cap: @discard_cap, truncate: true, discard_stdout: true]
 
     with :ok <- valid_name(:exec, name) do
       case run(:exec, ["exec", "--", name | argv], cap ++ opts, @exec_ms) do
@@ -797,7 +797,7 @@ defmodule Vagus.Runtime.Engine.Podman do
 
     cmd_opts =
       opts
-      |> Keyword.take([:env, :cap, :truncate, :podman_bin])
+      |> Keyword.take([:env, :cap, :truncate, :discard_stdout, :podman_bin])
       |> Keyword.put(:host, host)
 
     Host.with_permit(host, opts[:class] || class(verb), max(deadline - now_ms(), 0), fn ->

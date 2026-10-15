@@ -33,7 +33,9 @@ defmodule Vagus.Runtime.Podman.Cmd do
   @doc """
   Options: `:timeout_ms` (required), `:cap` (bytes, default 1 MiB),
   `:truncate` (past the cap keep the head instead of failing with
-  `:output_too_large`), `:env` (`[{name, value}]`), `:podman_bin`, `:host`.
+  `:output_too_large`), `:discard_stdout` (stdout never leaves muontrap;
+  only stderr is returned), `:env` (`[{name, value}]`), `:podman_bin`,
+  `:host`.
   """
   @spec run([String.t()], keyword()) :: result()
   def run(args, opts) do
@@ -54,9 +56,19 @@ defmodule Vagus.Runtime.Podman.Cmd do
     window = if truncate?, do: @max_window, else: min(cap + 1, @max_window)
     env = Vagus.Runtime.Host.env(opts[:host]) ++ Keyword.get(opts, :env, [])
 
+    # Discarded stdout goes to /dev/null inside muontrap (muontrap.c, the
+    # `capture_stderr_only` branch of the child's setup), so none of it ever
+    # reaches the BEAM; stderr, where podman reports its own failures, is
+    # still read.
+    capture =
+      if Keyword.get(opts, :discard_stdout, false),
+        do: ["--capture-stderr-only"],
+        else: ["--capture-output", "--capture-stderr"]
+
     muontrap_args =
-      ["--capture-output", "--capture-stderr", "--delay-to-sigkill", "#{@sigkill_delay_ms}"] ++
-        ["--stdio-window", "#{window}", "--", path | argv]
+      capture ++
+        ["--delay-to-sigkill", "#{@sigkill_delay_ms}", "--stdio-window", "#{window}"] ++
+        ["--", path | argv]
 
     port =
       Port.open({:spawn_executable, Application.app_dir(:muontrap, ["priv", "muontrap"])}, [

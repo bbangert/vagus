@@ -110,6 +110,18 @@ defmodule Vagus.Runtime.Engine.Podman.LogFollowTest do
     assert List.last(lines) == "3000 " <> filler
   end
 
+  test "a tail past 10,000 lines is honoured", %{log: log} do
+    File.write!(
+      log,
+      records(for n <- 1..12_000, do: "2026-10-15T18:14:21.0+00:00 stdout F l#{n}")
+    )
+
+    {:ok, pid} = Engine.follow_logs("x", self(), [tail: 10_001] ++ engine(log, nil))
+    lines = collect(pid, []) |> String.split("\n", trim: true)
+    assert length(lines) == 10_001
+    assert hd(lines) == "l2000"
+  end
+
   test "a long record goes out in chunks of at most 64 KiB, each only after an ack",
        %{log: log} do
     long = String.duplicate("y", 100_000)
