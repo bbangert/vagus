@@ -8,13 +8,15 @@ defmodule Vagus.Core.Lifecycle do
   `.claude/plans/vagus-core-lifecycle/research/supervisor-semantics.md`
   §1-§2/§4). A plain functions module — no
   process, no state of its own; every op reads/writes through
-  `Vagus.Runtime.Docker` (the Engine-API client) and `Vagus.Core.Versions`
+  `Vagus.Runtime.Engine` and `Vagus.Core.Versions`
   (persisted installed version), both injectable per call.
 
   ## Options (every public op takes `opts \\\\ []`)
 
-    * `:docker` - keyword list threaded into every `Vagus.Runtime.Docker`
-      call (e.g. `[socket: path]`). Defaults to `[]` (the real socket).
+    * `:engine_opts` - keyword list that reaches every `Vagus.Runtime.Engine`
+      call this module makes (e.g. `[engine: Engine.Fake, fake: pid]`).
+      Defaults to `[]`. An engine `:busy` comes back as `{:engine, :busy}`,
+      never as the lock's bare `:busy`.
     * `:versions` - the `Vagus.Core.Versions` server ref. Defaults to
       `Vagus.Core.Versions`.
     * `:health` - zero-arity fn `-> :healthy | :timeout`, the health gate.
@@ -38,7 +40,7 @@ defmodule Vagus.Core.Lifecycle do
   | Op | Upstream (§1/§4) | v1 here |
   |---|---|---|
   | `adopt` | `attach()`: inspect by name, adopt as-is, no reconciliation | same — inspect by name, seed `Versions` from the running tag, never create |
-  | `start` | reuse if `ImageID` matches desired, else "extended start" (recreate) | reuse if `Config.Image` tag AND spec fingerprint match desired, else recreate; already-running is a no-op |
+  | `start` | reuse if `ImageID` matches desired, else "extended start" (recreate) | reuse if the image tag AND spec fingerprint match desired, else recreate; already-running is a no-op |
   | `stop` | `docker stop` (S6 timeout), `remove_container=False` by default | identical — keeps the container |
   | `restart` | `docker restart`, no recreate | identical |
   | `rebuild` | stop-with-remove then start (recreates from current spec) | stop + remove + create(installed) + start — the drift healer |
@@ -47,7 +49,7 @@ defmodule Vagus.Core.Lifecycle do
   ## v1 deviations (see plan "Locked decisions" for the full list)
 
   No image pull in `start/1` — a missing image is returned as an error
-  (`{:error, {:create_failed, ...}}`), not a landingpage fallback; `rebuild/1`
+  (`{:error, {:failed, :create, :image_not_found}}`), not a landingpage fallback; `rebuild/1`
   and `update/2` are the only ops that (re)create against a specific spec.
   No automatic backup before `update/2`. Rollback is always a re-create with
   the previous version (never a backup restore), matching upstream — but if
@@ -81,9 +83,9 @@ defmodule Vagus.Core.Lifecycle do
 
   ## The reuse-vs-recreate rule
 
-  A container is only ever **reused** (plain `docker start`/`restart`, no
+  A container is only ever **reused** (a plain engine start/restart, no
   create) when it already exists under the fixed name AND its
-  `Config.Image` equals `Vagus.Core.Container.image(desired_version)` AND
+  image equals `Vagus.Core.Container.image(desired_version)` AND
   its `Vagus.Core.Container.spec_fingerprint_label/0` label equals the
   fingerprint of the spec `create_config/2` would build right now —
   otherwise every op that needs the container running recreates it: stop
@@ -142,7 +144,7 @@ defmodule Vagus.Core.Lifecycle do
 
   It hangs off the two places this module hands Core's process a fresh
   start — `start_container/2` (every create+start, plain start and rollback
-  recreate) and `restart/1`'s in-place `docker restart` — because Core reads
+  recreate) and `restart/1`'s in-place restart — because Core reads
   that file once, at process start, and rewrites it from its in-memory
   config whenever it persists. Writing while Core is live is therefore both
   useless (it will not re-read) and lossy (its next persist wins, and the
@@ -152,7 +154,7 @@ defmodule Vagus.Core.Lifecycle do
   the only moment the rewrite could take effect anyway.
 
   `restart/1` is the one write issued against a container that is still up.
-  It is safe for the same reason it is necessary: `docker restart` stops
+  It is safe for the same reason it is necessary: an engine restart stops
   Core before starting it, so the rewrite is what that boot reads.
 
   A migration that fails, for any reason, is logged and ignored — it can
@@ -175,7 +177,7 @@ defmodule Vagus.Core.Lifecycle do
 
   The multi-step `update/2`/rollback sequence (stop → remove → create →
   start → `set_installed` → health-gate → maybe-rollback) is **not
-  atomic** — it's a sequence of independent Engine-API calls plus a
+  atomic** — it's a sequence of independent engine calls plus a
   `Versions.set_installed/2` persist, not a single transaction. A
   mid-sequence BEAM restart (crash, deploy, power loss) can leave
   `Vagus.Core.Versions.installed/1` and the actual container state
@@ -203,7 +205,7 @@ defmodule Vagus.Core.Lifecycle do
   `opts[:homeassistant_path]`, same key `Vagus.Backend.Host.DiskBreakdown`
   uses for the same volume).
 
-  The write happens before any container-affecting Engine-API call, and a
+  The write happens before any container-affecting engine call, and a
   write failure **aborts the whole op** (`{:error, {:safe_mode_marker,
   reason}}`) rather than falling through to an ordinary restart — a
   safe-mode request that silently restarts normally instead is exactly
@@ -252,24 +254,24 @@ defmodule Vagus.Core.Lifecycle do
   require Logger
 
   alias Vagus.Core.{Container, Health, HttpConfig, PortMigration, Transport, Versions}
-  alias Vagus.Runtime.Docker
+  alias Vagus.Runtime.Engine
 
   @fallback_stop_timeout_s 260
   # Twice an app's pull deadline (`Vagus.App.Policy`).
   @pull_deadline_ms 3_600_000
-  @gracetime_env_prefix "S6_SERVICES_GRACETIME="
+  @gracetime_env "S6_SERVICES_GRACETIME"
   @safe_mode_marker "safe-mode"
 
   @doc """
   Adopts the Core container by name, as-is — never creates.
 
-  `{:adopted, info}` (the full `docker inspect` map) on success, seeding
+  `{:adopted, container}` (a `Vagus.Runtime.Engine.Container`) on success, seeding
   `Vagus.Core.Versions.seed/2` from the running image's tag (the part after
-  the last `:` of `Config.Image`; skipped silently if unparseable).
+  the last `:` of its image; skipped silently if unparseable).
   `:absent` if no container exists under `Vagus.Core.Container.name/0`.
-  `{:error, term()}` on any other Engine-API failure.
+  `{:error, term()}` on any other engine failure.
   """
-  @spec adopt(keyword()) :: {:adopted, map()} | :absent | {:error, term()}
+  @spec adopt(keyword()) :: {:adopted, Engine.Container.t()} | :absent | {:error, term()}
   def adopt(opts \\ []) do
     with_lock(fn -> do_adopt(opts) end)
   end
@@ -278,7 +280,7 @@ defmodule Vagus.Core.Lifecycle do
   Starts the Core container at the desired version (`opts[:version]`,
   default `Vagus.Core.Versions.installed/1`).
 
-  Reuses the existing container (plain `docker start`) when its image tag
+  Reuses the existing container (a plain engine start) when its image tag
   already matches the desired version; recreates it (stop+remove+create+
   start) on a tag mismatch; creates+starts fresh if absent. Already-running
   is a no-op (`:ok`, no health gate). No image pull — a missing image
@@ -294,7 +296,7 @@ defmodule Vagus.Core.Lifecycle do
   the image's `S6_SERVICES_GRACETIME` env (ms): `20 + div(gracetime, 1000)`
   seconds, falling back to `#{@fallback_stop_timeout_s}`s if the container
   can't be inspected or the env var is absent/unparseable. Already-stopped
-  is `:ok` (Docker's 304).
+  is `:ok`.
   """
   @spec stop(keyword()) :: :ok | {:error, term()}
   def stop(opts \\ []) do
@@ -302,7 +304,7 @@ defmodule Vagus.Core.Lifecycle do
   end
 
   @doc """
-  Restarts the Core container in place (`docker restart`, no recreate),
+  Restarts the Core container in place (an engine restart, no recreate),
   then runs the health gate.
 
   `opts[:safe_mode]` (default `false`) touches Core's `safe-mode` marker
@@ -380,7 +382,7 @@ defmodule Vagus.Core.Lifecycle do
         seed_versions(info, opts)
         {:adopted, info}
 
-      {:error, {:http, 404, _message}} ->
+      {:error, :not_found} ->
         :absent
 
       {:error, reason} ->
@@ -396,9 +398,8 @@ defmodule Vagus.Core.Lifecycle do
   end
 
   # Tag = the part after the last ":" that follows the last "/", so a
-  # registry `host:port` prefix isn't mistaken for a tag (same rule
-  # `Vagus.Runtime.Docker.split_image/1` applies to write an image ref).
-  defp parse_tag(%{"Config" => %{"Image" => image}}) when is_binary(image) do
+  # registry `host:port` prefix isn't mistaken for a tag.
+  defp parse_tag(%Engine.Container{image: image}) when is_binary(image) do
     last_segment = image |> String.split("/") |> List.last()
 
     case String.split(last_segment, ":", parts: 2) do
@@ -415,14 +416,14 @@ defmodule Vagus.Core.Lifecycle do
     with {:ok, version} <- resolve_start_version(opts) do
       case inspect_container(opts) do
         {:ok, info} -> start_existing(info, version, opts)
-        {:error, {:http, 404, _message}} -> create_and_start(version, opts)
+        {:error, :not_found} -> create_and_start(version, opts)
         {:error, reason} -> {:error, reason}
       end
     end
   end
 
   defp start_existing(info, version, opts) do
-    desired_fingerprint = Container.spec_fingerprint(desired_spec(version, opts))
+    desired_fingerprint = fingerprint_of(desired_spec(version, opts))
 
     cond do
       image_of(info) != Container.image(version) ->
@@ -467,10 +468,7 @@ defmodule Vagus.Core.Lifecycle do
         {:error, _reason} -> @fallback_stop_timeout_s
       end
 
-    case Docker.stop_container(
-           Container.name(),
-           Keyword.merge(docker_opts(opts), timeout: timeout)
-         ) do
+    case engine(:stop, Container.name(), [timeout_s: timeout] ++ engine_opts(opts)) do
       :ok -> unlink_core_socket()
       {:error, reason} -> {:error, reason}
     end
@@ -481,7 +479,7 @@ defmodule Vagus.Core.Lifecycle do
   defp do_restart(opts) do
     with :ok <- maybe_write_safe_mode_marker(opts),
          :ok <- migrate_stored_port(opts),
-         :ok <- Docker.restart_container(Container.name(), docker_opts(opts)) do
+         :ok <- engine(:restart, Container.name(), engine_opts(opts)) do
       health_gate(opts)
     end
   end
@@ -533,7 +531,7 @@ defmodule Vagus.Core.Lifecycle do
   defp stop_if_present(opts) do
     case inspect_container(opts) do
       {:ok, info} -> stop_existing(info, opts)
-      {:error, {:http, 404, _message}} -> :ok
+      {:error, :not_found} -> :ok
       {:error, reason} -> {:error, reason}
     end
   end
@@ -550,7 +548,7 @@ defmodule Vagus.Core.Lifecycle do
          :ok <- pull_target(target, opts) do
       case inspect_container(opts) do
         {:ok, info} -> update_existing(info, target, installed, opts)
-        {:error, {:http, 404, _message}} -> finish_update(false, target, nil, opts)
+        {:error, :not_found} -> finish_update(false, target, nil, opts)
         {:error, reason} -> {:error, reason}
       end
     end
@@ -579,14 +577,13 @@ defmodule Vagus.Core.Lifecycle do
   defp check_not_installed(target, target), do: {:error, :version_installed}
   defp check_not_installed(_target, _installed), do: :ok
 
-  # The pull is the one Engine-API call here whose response is a stream, so
-  # the client's receive timeout does not bound it. Past the deadline the
-  # connection is closed and the update fails before anything is replaced.
+  # The pull is the one engine call here whose response is a stream, so only
+  # a deadline bounds it; past it the update fails before anything is
+  # replaced.
   defp pull_target(target, opts) do
-    deadline = System.monotonic_time(:millisecond) + pull_deadline_ms()
-    docker = Keyword.put_new(docker_opts(opts), :deadline, deadline)
+    engine_opts = Keyword.put_new(engine_opts(opts), :timeout_ms, pull_deadline_ms())
 
-    case Docker.pull_image(Container.image(target), docker) do
+    case engine(:pull, Container.image(target), engine_opts) do
       :ok -> :ok
       {:error, reason} -> {:error, {:pull, reason}}
     end
@@ -652,7 +649,7 @@ defmodule Vagus.Core.Lifecycle do
   end
 
   defp rollback(rollback_version, opts) do
-    with :ok <- Docker.stop_container(Container.name(), docker_opts(opts)),
+    with :ok <- engine(:stop, Container.name(), engine_opts(opts)),
          :ok <- remove_container(opts),
          :ok <- recreate_previous(rollback_version, opts) do
       {:error, {:health_timeout, :rolled_back}}
@@ -689,13 +686,13 @@ defmodule Vagus.Core.Lifecycle do
 
   ## Shared internals
 
-  defp inspect_container(opts), do: Docker.inspect_container(Container.name(), docker_opts(opts))
+  defp inspect_container(opts), do: engine(:inspect, Container.name(), engine_opts(opts))
 
   # Every remove goes through here so the socket the removed container
   # created can't outlive it — see the moduledoc's "The socket file outlives
   # Core" section.
   defp remove_container(opts) do
-    case Docker.remove_container(Container.name(), docker_opts(opts)) do
+    case engine(:remove, Container.name(), engine_opts(opts)) do
       :ok -> unlink_core_socket()
       {:error, reason} -> {:error, reason}
     end
@@ -730,17 +727,15 @@ defmodule Vagus.Core.Lifecycle do
     )
   end
 
-  defp do_create(version, opts) do
-    config = desired_spec(version, opts)
-    Docker.create_container(config, Keyword.merge(docker_opts(opts), name: Container.name()))
-  end
+  defp do_create(version, opts),
+    do: engine(:create, desired_spec(version, opts), engine_opts(opts))
 
   # Every container start in this module goes through here, so the stored-port
   # migration lands in the one window where it can take: the container is
   # freshly created or stopped, never live. See "Core's stored port".
   defp start_container(id, opts) do
     :ok = migrate_stored_port(opts)
-    Docker.start_container(id, docker_opts(opts))
+    engine(:start, id, engine_opts(opts))
   end
 
   # Always `:ok` — a migration cannot fail the op it runs from.
@@ -752,7 +747,7 @@ defmodule Vagus.Core.Lifecycle do
   # The spec a create would build right now — the fingerprint comparison in
   # `start_existing/3` and the create itself must read the exact same one.
   defp desired_spec(version, opts) do
-    Container.create_config(version, create_config_opts(opts))
+    Container.to_container_spec(version, create_config_opts(opts))
   end
 
   defp create_and_start(version, opts) do
@@ -764,7 +759,7 @@ defmodule Vagus.Core.Lifecycle do
 
   defp stop_existing(info, opts) do
     timeout = stop_timeout_s(info)
-    Docker.stop_container(Container.name(), Keyword.merge(docker_opts(opts), timeout: timeout))
+    engine(:stop, Container.name(), [timeout_s: timeout] ++ engine_opts(opts))
   end
 
   defp stop_timeout_s(info) do
@@ -774,19 +769,14 @@ defmodule Vagus.Core.Lifecycle do
     end
   end
 
-  defp gracetime_ms(%{"Config" => %{"Env" => env}}) when is_list(env) do
-    env
-    |> Enum.find_value(fn
-      @gracetime_env_prefix <> rest -> Integer.parse(rest)
-      _other -> nil
-    end)
-    |> case do
+  defp gracetime_ms(%Engine.Container{env: %{@gracetime_env => value}}) do
+    case Integer.parse(value) do
       {ms, _rest} -> {:ok, ms}
-      _not_found_or_unparseable -> :error
+      :error -> :error
     end
   end
 
-  defp gracetime_ms(_info), do: :error
+  defp gracetime_ms(_container), do: :error
 
   defp health_gate(opts) do
     health = Keyword.get(opts, :health, fn -> Health.await_healthy() end)
@@ -805,19 +795,16 @@ defmodule Vagus.Core.Lifecycle do
     :ok
   end
 
-  defp image_of(%{"Config" => %{"Image" => image}}), do: image
-  defp image_of(_info), do: nil
+  defp image_of(%Engine.Container{image: image}), do: image
 
   # `nil` for a container created before spec fingerprinting existed (or by
   # hand) — never equal to a real fingerprint, so it always recreates.
-  defp fingerprint_of(%{"Config" => %{"Labels" => labels}}) when is_map(labels) do
-    Map.get(labels, Container.spec_fingerprint_label())
-  end
+  defp fingerprint_of(%{labels: labels}) when is_map(labels),
+    do: Map.get(labels, Container.spec_fingerprint_label())
 
-  defp fingerprint_of(_info), do: nil
+  defp fingerprint_of(_container), do: nil
 
-  defp running?(%{"State" => %{"Running" => running}}), do: running == true
-  defp running?(_info), do: false
+  defp running?(container), do: Engine.Container.alive?(container)
 
   defp create_config_opts(opts) do
     case Keyword.get(opts, :token) do
@@ -826,7 +813,17 @@ defmodule Vagus.Core.Lifecycle do
     end
   end
 
-  defp docker_opts(opts), do: Keyword.get(opts, :docker, [])
+  defp engine_opts(opts), do: Keyword.get(opts, :engine_opts, [])
+
+  # A bare `{:error, :busy}` from this module means its lock is held, and
+  # callers act on that (the watchdog skips escalation, CoreUnit retries, the
+  # API answers 409); an engine refusing for its own lock must not read so.
+  defp engine(verb, target, engine_opts) do
+    case apply(Engine, verb, [target, engine_opts]) do
+      {:error, :busy} -> {:error, {:engine, :busy}}
+      result -> result
+    end
+  end
 
   defp versions_server(opts), do: Keyword.get(opts, :versions, Versions)
 

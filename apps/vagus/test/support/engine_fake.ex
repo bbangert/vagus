@@ -38,7 +38,14 @@ defmodule Vagus.Runtime.Engine.Fake do
 
   def start_link(_opts \\ []) do
     Agent.start_link(fn ->
-      %{images: MapSet.new(), containers: %{}, networks: MapSet.new(), fail: %{}, calls: []}
+      %{
+        images: MapSet.new(),
+        containers: %{},
+        networks: MapSet.new(),
+        fail: %{},
+        blocks: %{},
+        calls: []
+      }
     end)
   end
 
@@ -90,6 +97,20 @@ defmodule Vagus.Runtime.Engine.Fake do
   end
 
   def delay_next(fake, verb, ms), do: fail_next(fake, verb, {:delay, ms})
+
+  @doc """
+  Holds the next call of `verb` in its caller until `release/1`: the caller
+  sends `{:fake_blocked, verb, pid}` to the process that called this.
+  """
+  def block_next(fake, verb) do
+    notify = self()
+
+    Agent.update(fake, fn s ->
+      update_in(s, [:blocks, Access.key(verb, [])], &(&1 ++ [notify]))
+    end)
+  end
+
+  def release(blocked_pid), do: send(blocked_pid, :fake_release)
 
   def calls(fake),
     do:
@@ -207,7 +228,7 @@ defmodule Vagus.Runtime.Engine.Fake do
     force = Keyword.get(opts, :force, true)
 
     call(opts, :remove, [name], fn s ->
-      case s.containers[name] do
+      case s.containers[key(s, name)] do
         nil ->
           {:ok, s}
 
@@ -216,7 +237,7 @@ defmodule Vagus.Runtime.Engine.Fake do
           {{:error, {:failed, :remove, state}}, s}
 
         _entry ->
-          {:ok, %{s | containers: Map.delete(s.containers, name)}}
+          {:ok, %{s | containers: Map.delete(s.containers, key(s, name))}}
       end
     end)
   end
@@ -257,7 +278,8 @@ defmodule Vagus.Runtime.Engine.Fake do
            opts,
            :follow_logs,
            [name, owner],
-           &{(&1.containers[name] && lines(&1.containers[name].logs, opts)) || [], &1}
+           &{(&1.containers[key(&1, name)] && lines(&1.containers[key(&1, name)].logs, opts)) ||
+              [], &1}
          ) do
       {:error, error} -> {:error, error}
       chunks -> {:ok, spawn_link(fn -> stream(owner, Process.monitor(owner), chunks) end)}
@@ -292,8 +314,30 @@ defmodule Vagus.Runtime.Engine.Fake do
     call(opts, :ensure_network, [spec], &{:ok, %{&1 | networks: MapSet.put(&1.networks, net)}})
   end
 
+  # A container answers to its name or its id, as with Docker.
+  defp key(s, ref) do
+    if Map.has_key?(s.containers, ref),
+      do: ref,
+      else: Enum.find_value(s.containers, fn {name, e} -> e.container.id == ref && name end)
+  end
+
   defp call(opts, verb, args, fun) do
     fake = instance(opts)
+
+    case Agent.get_and_update(fake, &pop_block(&1, verb)) do
+      nil ->
+        :ok
+
+      notify ->
+        send(notify, {:fake_blocked, verb, self()})
+
+        receive do
+          :fake_release -> :ok
+        after
+          10_000 ->
+            raise "Engine.Fake: #{verb} blocked by block_next/2 was never released (call release/1)"
+        end
+    end
 
     Agent.get_and_update(fake, fn s ->
       entry = {verb, args, Keyword.drop(opts, [:engine, :fake])}
@@ -342,6 +386,13 @@ defmodule Vagus.Runtime.Engine.Fake do
   defp delay_ms({:delay, ms}), do: ms
   defp delay_ms(_failure), do: 0
 
+  defp pop_block(s, verb) do
+    case s.blocks do
+      %{^verb => [notify | rest]} -> {notify, put_in(s, [:blocks, verb], rest)}
+      _none -> {nil, s}
+    end
+  end
+
   defp pop_failure(s, verb) do
     case s.fail do
       %{^verb => [error | rest]} -> {error, put_in(s, [:fail, verb], rest)}
@@ -350,16 +401,16 @@ defmodule Vagus.Runtime.Engine.Fake do
   end
 
   defp read(s, name, fun) do
-    case s.containers[name] do
+    case s.containers[key(s, name)] do
       nil -> {{:error, :not_found}, s}
       entry -> {fun.(entry), s}
     end
   end
 
   defp update_container(s, name, fun) do
-    case s.containers[name] do
+    case key(s, name) do
       nil -> {{:error, :not_found}, s}
-      entry -> {:ok, put_in(s, [:containers, name, :container], fun.(entry.container))}
+      key -> {:ok, update_in(s, [:containers, key, :container], fun)}
     end
   end
 

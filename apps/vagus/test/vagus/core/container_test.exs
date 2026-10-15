@@ -219,6 +219,23 @@ defmodule Vagus.Core.ContainerTest do
     end
   end
 
+  # Literals produced by the pre-ContainerSpec `create_config/2` (the
+  # Docker-map builder), so a render that drifts from it — and would recreate
+  # Core on every board — fails here rather than echoing itself.
+  describe "create_config/2 parity with the Docker-map builder" do
+    @golden_body ~s({"Env":["SUPERVISOR=172.30.32.2","HASSIO=172.30.32.2","SUPERVISOR_TOKEN=t","HASSIO_TOKEN=t","SUPERVISOR_CORE_API_SOCKET=/run/supervisor/core.sock","TZ=UTC"],"HostConfig":{"ExtraHosts":["supervisor:172.30.32.2"],"Mounts":[{"BindOptions":{"ReadOnlyNonRecursive":true},"ReadOnly":true,"Source":"/dev","Target":"/dev","Type":"bind"},{"ReadOnly":true,"Source":"/run/dbus","Target":"/run/dbus","Type":"bind"},{"ReadOnly":true,"Source":"/run/udev","Target":"/run/udev","Type":"bind"},{"ReadOnly":false,"Source":"/run/supervisor","Target":"/run/supervisor","Type":"bind"},{"Source":"vagus-core-config","Target":"/config","Type":"volume"}],"NetworkMode":"host","OomScoreAdj":-300,"Privileged":true,"RestartPolicy":{"Name":"unless-stopped"},"Tmpfs":{"/tmp":""}},"Hostname":"homeassistant","Image":"ghcr.io/home-assistant/home-assistant:2026.7.0"})
+
+    test "the label-less body and its fingerprint are byte-identical" do
+      config = Container.create_config("2026.7.0", token: "t", tz: "UTC")
+
+      assert Jason.encode!(Map.delete(config, "Labels")) == @golden_body
+
+      assert config["Labels"] == %{
+               Container.spec_fingerprint_label() => "0f8bbae5ee839e67083a2877393670f7"
+             }
+    end
+  end
+
   describe "config_path/1" do
     test "defaults to <engine data root>/volumes/<config_volume>/_data" do
       assert Container.config_path() ==
