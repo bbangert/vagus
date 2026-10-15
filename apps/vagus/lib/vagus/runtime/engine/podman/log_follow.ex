@@ -13,6 +13,13 @@ defmodule Vagus.Runtime.Engine.Podman.LogFollow do
   `P` record is a fragment the next record continues. With `timestamps`,
   each line starts `<RFC3339 UTC> `, the form Docker's follow produced.
 
+  The log lives on tmpfs, capped per container: no SD-card writes, and
+  nothing lost by it, since every container is recreated at each boot.
+  At the cap conmon writes the full file out, then renames a fresh empty
+  file over it (conmon 2.2.1, `reopen_k8s_file`): the old file is read to
+  its end before the new inode is followed from its start, so no line is
+  read twice and none is skipped beyond what conmon itself drops.
+
   The follow ends, after one last read, when conmon has exited: it holds
   the log open for exactly the container's life and has no other observable
   end that costs nothing to check. A container that is absent or not
@@ -42,6 +49,8 @@ defmodule Vagus.Runtime.Engine.Podman.LogFollow do
       timestamps: Keyword.get(opts, :timestamps, false),
       poll_ms: Keyword.get(opts, :poll_ms, @poll_ms),
       fd: nil,
+      path: nil,
+      inode: nil,
       offset: 0,
       conmon: nil,
       timer: nil,
@@ -64,9 +73,9 @@ defmodule Vagus.Runtime.Engine.Podman.LogFollow do
   def handle_continue(:open, state) do
     with {:ok, %{path: path, conmon_pid: conmon}} <-
            Podman.log_target(state.name, state.engine_opts),
-         {:ok, fd} <- open(path),
-         {:ok, size} <- :file.position(fd, :eof) do
-      state = %{state | fd: fd, conmon: conmon, offset: tail_start(fd, size, state.tail)}
+         {:ok, fd, %File.Stat{inode: inode, size: size}} <- open(path) do
+      offset = tail_start(fd, size, state.tail)
+      state = %{state | fd: fd, path: path, inode: inode, conmon: conmon, offset: offset}
       {:noreply, schedule(state, 0)}
     else
       _absent -> eof(state)
@@ -93,9 +102,7 @@ defmodule Vagus.Runtime.Engine.Podman.LogFollow do
     state = %{state | timer: nil}
 
     case read(state) do
-      {:eof, %{pending: ""} = state} when gone? -> eof(state)
-      {:eof, state} when gone? -> {:noreply, deliver(cut_pending(state))}
-      {:eof, state} -> {:noreply, schedule(state, state.poll_ms)}
+      {:eof, state} -> at_end(state, gone?)
       # Bytes were read but no line finished: read on.
       {:data, %{out: ""} = state} -> {:noreply, schedule(state, 0)}
       {:data, state} -> {:noreply, deliver(state)}
@@ -104,9 +111,56 @@ defmodule Vagus.Runtime.Engine.Podman.LogFollow do
 
   def handle_info(_other, state), do: {:noreply, state}
 
+  # The old file is read to its end before a replacement is followed.
+  defp at_end(state, gone?) do
+    case replaced(state) do
+      {:ok, fd, inode} ->
+        File.close(state.fd)
+        {:noreply, schedule(%{state | fd: fd, inode: inode, offset: 0}, 0)}
+
+      :same ->
+        ended(state, gone?)
+    end
+  end
+
+  defp ended(state, gone?) do
+    case state do
+      %{pending: ""} when gone? -> eof(state)
+      _ when gone? -> {:noreply, deliver(cut_pending(state))}
+      _ -> {:noreply, schedule(state, state.poll_ms)}
+    end
+  end
+
+  # A new inode at the path, or this one cut below what was read.
+  defp replaced(state) do
+    case File.stat(state.path) do
+      {:ok, %File.Stat{inode: inode, size: size}}
+      when inode != state.inode or size < state.offset ->
+        case open(state.path) do
+          {:ok, fd, %File.Stat{inode: inode}} -> {:ok, fd, inode}
+          _ -> :same
+        end
+
+      _ ->
+        :same
+    end
+  end
+
   # The path comes from podman's inspect of a Vagus container.
   # sobelow_skip ["Traversal.FileModule"]
-  defp open(path) when is_binary(path) and path != "", do: File.open(path, [:read, :binary, :raw])
+  defp open(path) when is_binary(path) and path != "" do
+    with {:ok, fd} <- File.open(path, [:read, :binary, :raw]) do
+      case :file.read_file_info(fd, time: :posix) do
+        {:ok, info} ->
+          {:ok, fd, File.Stat.from_record(info)}
+
+        {:error, _} = error ->
+          File.close(fd)
+          error
+      end
+    end
+  end
+
   defp open(_no_path), do: {:error, :no_log}
 
   # A zombie has exited too. `pid` is an integer from podman's inspect.

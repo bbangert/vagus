@@ -32,6 +32,8 @@ defmodule Vagus.Runtime.HostTest do
       profile_override: Path.join(ctx.root, "podman-profile"),
       socket_dir: Path.join(ctx.root, "run/supervisor"),
       resolv_conf: Path.join(ctx.root, "resolv.conf"),
+      log_dir: Path.join(ctx.root, "run/vagus/logs"),
+      mountinfo: Path.join(ctx.root, "no-mountinfo"),
       name_servers: fn -> [{192, 168, 2, 1}] end,
       run: fn bin, args ->
         send(test, {:step, {bin, args}})
@@ -73,8 +75,9 @@ defmodule Vagus.Runtime.HostTest do
       assert_receive {:step, {"mount", ["--make-rshared", "/"]}}, 5_000
       assert_receive {:step, :probe}, 5_000
 
-      assert File.stat!(Path.join(ctx.root, "run/supervisor")).mode |> Bitwise.band(0o777) ==
-               0o700
+      for dir <- ["run/supervisor", "run/vagus/logs"] do
+        assert File.stat!(Path.join(ctx.root, dir)).mode |> Bitwise.band(0o777) == 0o700
+      end
 
       assert File.read!(Path.join(ctx.root, "resolv.conf")) == "nameserver 192.168.2.1\n"
       assert File.dir?(Path.join(ctx.root, "storage/tmp"))
@@ -150,6 +153,57 @@ defmodule Vagus.Runtime.HostTest do
     end
   end
 
+  describe "the logs' tmpfs" do
+    @opts "mode=0700,nosuid,nodev,noexec"
+
+    test "is mounted once at the log dir, 16 MiB on frugal", ctx do
+      start_host(ctx)
+      dir = Path.join(ctx.root, "run/vagus/logs")
+      args = ["-t", "tmpfs", "-o", "size=16777216," <> @opts, "tmpfs", dir]
+      assert_receive {:step, {"mount", ^args}}, 5_000
+    end
+
+    test "is 64 MiB on fast", ctx do
+      start_host(ctx, meminfo: meminfo(ctx.root, 8 * @gib_kb))
+      dir = Path.join(ctx.root, "run/vagus/logs")
+      args = ["-t", "tmpfs", "-o", "size=67108864," <> @opts, "tmpfs", dir]
+      assert_receive {:step, {"mount", ^args}}, 5_000
+    end
+
+    # A Vagus restart in the same boot: the mount is already in mountinfo
+    # (a space in the path is written there as \040).
+    test "is not mounted again over itself", ctx do
+      dir = Path.join(ctx.root, "run/vagus/log s")
+      mountinfo = Path.join(ctx.root, "mountinfo")
+
+      File.write!(mountinfo, """
+      22 1 0:21 / /run rw,nosuid,nodev,noexec - tmpfs tmpfs rw,size=48000k,mode=755
+      95 22 0:52 / #{String.replace(dir, " ", "\\040")} rw,nosuid,nodev,noexec - tmpfs tmpfs rw,size=16384k,mode=700
+      """)
+
+      start_host(ctx, log_dir: dir, mountinfo: mountinfo)
+      assert_receive {:step, {"mount", ["--make-rshared", "/"]}}, 5_000
+      refute_received {:step, {"mount", ["-t", "tmpfs" | _]}}
+    end
+
+    test "a failed mount leaves the plain directory and a ready Host", ctx do
+      test = self()
+
+      run = fn bin, args ->
+        send(test, {:step, {bin, args}})
+        if match?(["-t" | _], args), do: {"mount: permission denied", 32}, else: {"", 0}
+      end
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert start_host(ctx, run: run) == :ok
+        end)
+
+      assert log =~ "logs stay on /run"
+      assert File.dir?(Path.join(ctx.root, "run/vagus/logs"))
+    end
+  end
+
   describe "the profile" do
     test "below 2 GiB is frugal, from 2 GiB fast", ctx do
       assert Host.pick_profile(
@@ -198,6 +252,7 @@ defmodule Vagus.Runtime.HostTest do
       assert File.read!(conf) == """
              [engine]
              events_logger = "file"
+             events_logfile_max_size = 4194304
              image_parallel_copies = 1
              image_copy_tmp_dir = "#{Path.join(ctx.root, "storage/tmp")}"
              """
@@ -212,6 +267,9 @@ defmodule Vagus.Runtime.HostTest do
              ]
 
       assert permits(ctx.name, :ops) == 2
+
+      assert Host.log_config(ctx.name) ==
+               %{dir: Path.join(ctx.root, "run/vagus/logs"), max_bytes: 2_097_152}
     end
 
     test "fast: drop-in spooling on tmpfs, no Go limits, four ops permits", ctx do
@@ -221,12 +279,14 @@ defmodule Vagus.Runtime.HostTest do
       assert File.read!(conf) == """
              [engine]
              events_logger = "file"
+             events_logfile_max_size = 4194304
              image_copy_tmp_dir = "#{Path.join(ctx.root, "run/vagus/podman/spool")}"
              """
 
       assert File.dir?(Path.join(ctx.root, "run/vagus/podman/spool"))
       assert Host.env(ctx.name) == [{"CONTAINERS_CONF_OVERRIDE", conf}]
       assert permits(ctx.name, :ops) == 4
+      assert Host.log_config(ctx.name).max_bytes == 8_388_608
     end
 
     test "the env reaches every podman the runner spawns", ctx do

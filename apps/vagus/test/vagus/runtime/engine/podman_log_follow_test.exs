@@ -223,6 +223,31 @@ defmodule Vagus.Runtime.Engine.Podman.LogFollowTest do
     end
   end
 
+  # conmon 2.2.1 at max-size, as recorded on podman 6.1.4: it flushes the
+  # full file, creates `<path>.tmp` empty, renames it over the log (a new
+  # inode, no `.1` kept) and writes on there.
+  test "follows conmon's cap rotation: the old file to its end, then the new one",
+       %{log: log} do
+    File.write!(log, records(["2026-10-15T18:14:21.0+00:00 stdout F one"]))
+    conmon = conmon()
+    {:ok, pid} = Engine.follow_logs("x", self(), engine(log, conmon))
+    assert next_chunk(pid) == "one\n"
+
+    File.write!(log, records(["2026-10-15T18:14:22.0+00:00 stdout F two"]), [:append])
+    tmp = log <> ".tmp"
+    File.write!(tmp, "")
+    File.rename!(tmp, log)
+    File.write!(log, records(["2026-10-15T18:14:23.0+00:00 stdout F three"]), [:append])
+
+    assert next_chunk(pid) == "two\n"
+    assert next_chunk(pid) == "three\n"
+
+    File.write!(log, records(["2026-10-15T18:14:24.0+00:00 stdout F four"]), [:append])
+    kill(conmon)
+    assert next_chunk(pid) == "four\n"
+    assert_receive :log_eof, 10_000
+  end
+
   test "an owner that goes away stops the follow", %{log: log} do
     File.write!(log, "")
     opts = engine(log, conmon())

@@ -150,7 +150,15 @@ defmodule Vagus.Runtime.Engine.Podman do
 
     with :ok <- validate(spec),
          {:ok, out} <-
-           ok(:create, run(:create, render_create(spec), [env: secrets] ++ opts, @lifecycle_ms)) do
+           ok(
+             :create,
+             run(
+               :create,
+               render_create(spec, Host.log_config(opts[:host])),
+               [env: secrets] ++ opts,
+               @lifecycle_ms
+             )
+           ) do
       {:ok, out |> String.trim() |> String.split("\n") |> List.last()}
     end
   end
@@ -257,6 +265,7 @@ defmodule Vagus.Runtime.Engine.Podman do
       case unit(:remove, run(:remove, args, opts, @lifecycle_ms)) do
         result when result in [:ok, {:error, :not_found}] ->
           Host.forget_sample(opts[:host], name)
+          remove_log(Host.log_config(opts[:host]).dir, name)
           :ok
 
         other ->
@@ -264,6 +273,24 @@ defmodule Vagus.Runtime.Engine.Podman do
       end
     end
   end
+
+  # conmon appends to a log file it finds, so a container recreated under
+  # the same name would inherit the old one's lines; Docker's go with the
+  # container. The name was checked, so the path stays inside `dir`; a
+  # symlink there is removed, never followed.
+  # sobelow_skip ["Traversal.FileModule"]
+  defp remove_log(dir, name) do
+    path = log_path(dir, name)
+
+    case File.lstat(path) do
+      {:ok, %File.Stat{type: type}} when type in [:regular, :symlink] -> File.rm(path)
+      _ -> :ok
+    end
+
+    :ok
+  end
+
+  defp log_path(dir, name), do: Path.join(dir, name <> ".log")
 
   @impl true
   def inspect(name, opts) do
@@ -314,6 +341,8 @@ defmodule Vagus.Runtime.Engine.Podman do
     end
   end
 
+  # The log is the capped file on tmpfs `render_create/2` points conmon at:
+  # what survives is the newest stretch up to the cap, as since boot.
   @impl true
   def logs(name, opts) do
     stamps = if opts[:timestamps], do: ["--timestamps"], else: []
@@ -476,21 +505,27 @@ defmodule Vagus.Runtime.Engine.Podman do
   set, unlimited pids, a private IPC namespace, no injected
   `container=podman` or proxy env, no pull on create, Docker's tmpfs
   options, and on a bridge an `/etc/hosts` built from nothing but the
-  spec's entries.
+  spec's entries. The log goes to `log.dir` (tmpfs: no SD writes, and
+  nothing lost, as every container is recreated each boot), capped at
+  `log.max_bytes`, which podman reads as a number of bytes.
 
   A `secret_env` entry renders as a bare `--env NAME`, which podman fills
   from its own environment, so the value stays off the argv. The spec must
   have passed `validate/1`.
   """
-  @spec render_create(ContainerSpec.t()) :: [String.t()]
-  def render_create(%ContainerSpec{} = spec) do
+  @spec render_create(ContainerSpec.t(), %{dir: String.t(), max_bytes: pos_integer()}) ::
+          [String.t()]
+  def render_create(%ContainerSpec{} = spec, log \\ Host.log_config(nil)) do
     bridge = bridge_name(spec.network)
     pid_host? = spec.pid_mode == "host"
 
     # podman refuses a hostname inside the host's UTS namespace.
     # podman refuses an init binary outside a private PID namespace.
+    # On tmpfs and capped; conmon starts the file over past the cap.
     ["create", "--name", spec.name] ++
       ~w(--pull=never --pids-limit=-1 --ipc=private --unsetenv=container --http-proxy=false) ++
+      ["--log-driver", "k8s-file", "--log-opt", "path=" <> log_path(log.dir, spec.name)] ++
+      ["--log-opt", "max-size=#{log.max_bytes}"] ++
       flag("--hostname", if(spec.uts_mode != "host", do: spec.hostname)) ++
       bool("--interactive", spec.open_stdin) ++
       env(spec.env, spec.secret_env) ++

@@ -637,7 +637,7 @@ defmodule Vagus.Runtime.Engine.PodmanContractTest do
                ["image", "exists", "--", "ghcr.io/vagus/x:1"],
                ["rmi", "--ignore", "--", "ghcr.io/vagus/x:1"],
                ["network", "exists", "--", "hassio"],
-               Engine.Podman.render_create(C.spec())
+               Engine.Podman.render_create(C.spec(), Vagus.Runtime.Host.log_config(opts[:host]))
              ]
     end
 
@@ -713,6 +713,39 @@ defmodule Vagus.Runtime.Engine.PodmanContractTest do
       leak.()
       assert Engine.pull("ghcr.io/vagus/slow:1", [timeout_ms: 200] ++ opts) == {:error, :timeout}
       assert File.ls!(spool) == ["live"]
+    end
+
+    test "remove deletes the container's log, so a recreate starts it empty" do
+      root = Path.join(System.tmp_dir!(), "podman-logs-#{System.unique_integer([:positive])}")
+      fake = FakePodman.start([{"rm *", [{0, ""}]}])
+      host = FakePodman.start_host(fake.bin, root: root)
+      opts = [engine: Engine.Podman, host: host, podman_bin: fake.bin]
+      logs = Path.join(root, "logs")
+      outside = Path.join(root, "outside.log")
+      File.write!(outside, "keep")
+
+      File.write!(Path.join(logs, "addon_local_x.log"), "old lines")
+      File.ln_s!(outside, Path.join(logs, "addon_local_y.log"))
+      File.mkdir_p!(Path.join(logs, "addon_local_z.log"))
+      File.write!(Path.join(logs, "addon_local_w.log"), "another container's")
+
+      for name <- ~w(addon_local_x addon_local_y addon_local_z),
+          do: :ok = Engine.remove(name, opts)
+
+      # The link is gone and its target untouched; a directory is left be.
+      assert File.ls!(logs) |> Enum.sort() == ["addon_local_w.log", "addon_local_z.log"]
+      assert File.read!(outside) == "keep"
+    end
+
+    test "a failed remove keeps the log" do
+      root = Path.join(System.tmp_dir!(), "podman-logs-#{System.unique_integer([:positive])}")
+      fake = FakePodman.start([{"rm *", [{125, "Error: boom\n"}]}])
+      host = FakePodman.start_host(fake.bin, root: root)
+      opts = [engine: Engine.Podman, host: host, podman_bin: fake.bin]
+      File.write!(Path.join(root, "logs/addon_local_x.log"), "lines")
+
+      assert {:error, {:failed, :remove, _}} = Engine.remove("addon_local_x", opts)
+      assert File.exists?(Path.join(root, "logs/addon_local_x.log"))
     end
 
     test "a pull refused at shutdown is :busy" do

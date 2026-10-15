@@ -26,6 +26,12 @@ defmodule Vagus.Runtime.Engine.PodmanLiveTest do
     bin = System.get_env("VAGUS_PODMAN_BIN") || System.find_executable("podman") || "podman"
     root = Path.join(System.tmp_dir!(), "vagus-live-#{System.unique_integer([:positive])}")
     name = :vagus_live_host
+    logs = Path.join(root, "logs")
+    # Through the wrapper podman runs in another container, where conmon
+    # needs the log directory too.
+    in_container = String.ends_with?(bin, "podman_docker_exec.sh")
+    container = System.get_env("VAGUS_PODMAN_CONTAINER", "vagus-podman-fixtures")
+    if in_container, do: {_, 0} = System.cmd("docker", ["exec", container, "mkdir", "-p", logs])
 
     {:ok, pid} =
       Vagus.Runtime.Host.start_link(
@@ -35,6 +41,7 @@ defmodule Vagus.Runtime.Engine.PodmanLiveTest do
         run_dir: Path.join(root, "run"),
         socket_dir: Path.join(root, "supervisor"),
         resolv_conf: Path.join(root, "resolv.conf"),
+        log_dir: logs,
         run: fn _bin, _args -> {"", 0} end,
         shutting_down?: fn -> false end
       )
@@ -47,10 +54,11 @@ defmodule Vagus.Runtime.Engine.PodmanLiveTest do
       cleanup(opts)
       Process.exit(pid, :kill)
       File.rm_rf(root)
+      if in_container, do: System.cmd("docker", ["exec", container, "rm", "-rf", root])
     end)
 
     Enum.find(1..300, fn _ -> Engine.ready(opts) == :ok or (Process.sleep(50) && false) end)
-    %{opts: opts}
+    %{opts: opts, logs: logs}
   end
 
   defp cleanup(opts) do
@@ -126,6 +134,34 @@ defmodule Vagus.Runtime.Engine.PodmanLiveTest do
     assert :ok = Engine.remove(@x, opts)
     assert Engine.inspect(@x, opts) == {:error, :not_found}
     assert :ok = Engine.remove(@x, opts)
+  end
+
+  test "the rendered log path and cap are what podman uses", %{opts: opts, logs: logs} do
+    {:ok, _} = Engine.create(spec(), opts)
+    path = Path.join(logs, @x <> ".log")
+    assert {:ok, %{path: ^path}} = Engine.Podman.log_target(@x, opts)
+
+    {:ok, size} =
+      Cmd.run(["container", "inspect", "--format", "{{.HostConfig.LogConfig.Size}}", "--", @x],
+        timeout_ms: 30_000,
+        podman_bin: opts[:podman_bin]
+      )
+
+    # podman prints the byte cap in decimal units: 2 MiB is 2.097MB.
+    assert String.trim(size) in ["2.097MB", "8.389MB"]
+
+    :ok = Engine.start(@x, opts)
+    assert wait_for_logs(opts) =~ "line one"
+    :ok = Engine.remove(@x, opts)
+  end
+
+  defp wait_for_logs(opts) do
+    Enum.find_value(1..100, fn _ ->
+      case Engine.logs(@x, opts) do
+        {:ok, text} when text != "" -> text
+        _ -> Process.sleep(100) && nil
+      end
+    end) || flunk("no logs")
   end
 
   test "an absent container", %{opts: opts} do

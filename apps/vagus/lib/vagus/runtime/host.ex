@@ -40,6 +40,14 @@ defmodule Vagus.Runtime.Host do
 
   @frugal_below_kb 2 * 1024 * 1024
   @permits %{frugal: %{pull: 1, ops: 2, shutdown: 1}, fast: %{pull: 1, ops: 4, shutdown: 1}}
+  # Per container; conmon starts the file over once it would pass this.
+  @log_max_bytes %{frugal: 2 * 1_048_576, fast: 8 * 1_048_576}
+  @log_dir "/run/vagus/logs"
+  # The logs' own tmpfs, so they can never fill /run, where podman keeps its
+  # runroot: a 1 GB board's /run is only 5% of RAM.
+  @log_tmpfs_bytes %{frugal: 16 * 1_048_576, fast: 64 * 1_048_576}
+  # podman reads a bare number of bytes; it rotates the file past this.
+  @events_max_bytes 4 * 1_048_576
   @go_env %{
     frugal: [{"GOMAXPROCS", "1"}, {"GOMEMLIMIT", "32MiB"}, {"GOGC", "10"}],
     fast: []
@@ -64,7 +72,8 @@ defmodule Vagus.Runtime.Host do
   `:meminfo`, `:profile_override`, `:socket_dir`, `:resolv_conf`,
   `:name_servers` (0-arity fun), `:run` (`fn bin, args -> {out, status}`,
   for `mount`), `:probe` (`fn opts -> :ok | {:error, reason}`),
-  `:shutting_down?` (0-arity fun), `:prep_retry_ms`, `:permits`.
+  `:shutting_down?` (0-arity fun), `:prep_retry_ms`, `:permits`,
+  `:spool_quiet_ms`, `:log_dir`, `:mountinfo`.
   """
   def start_link(opts) do
     name = Keyword.get(opts, :name, __MODULE__)
@@ -88,6 +97,20 @@ defmodule Vagus.Runtime.Host do
 
   @spec profile(atom() | nil) :: profile() | nil
   def profile(host \\ nil), do: shared(host)[:profile]
+
+  @doc """
+  Where containers write their k8s-file logs and how large each may grow;
+  the device defaults (frugal) when no Host has published them.
+  """
+  @spec log_config(atom() | nil) :: %{dir: String.t(), max_bytes: pos_integer()}
+  def log_config(host \\ nil) do
+    shared = shared(host)
+
+    %{
+      dir: shared[:log_dir] || @log_dir,
+      max_bytes: shared[:log_max_bytes] || @log_max_bytes.frugal
+    }
+  end
 
   @doc """
   Removes the pull spools' stale entries: those with nothing written
@@ -297,9 +320,15 @@ defmodule Vagus.Runtime.Host do
   @impl true
   def handle_continue(:prepare, state) do
     make_root_shared(state.opts)
-    ensure_socket_dir(state.opts)
+
+    ensure_private_dir(
+      Keyword.get_lazy(state.opts, :socket_dir, &Vagus.Core.Container.socket_dir/0)
+    )
+
+    ensure_private_dir(log_dir(state.opts))
     write_resolv_conf(state.opts)
     state = state |> apply_profile() |> publish(:preparing)
+    mount_log_tmpfs(state.opts, state.profile)
     clear_spool_once(state.opts)
     {:noreply, start_probe(state)}
   end
@@ -414,7 +443,10 @@ defmodule Vagus.Runtime.Host do
       profile: state.profile,
       spools: [spool_dir(state.opts), Path.join(run_dir(state.opts), "spool")],
       pull_permits: state.permits[:pull],
-      spool_quiet_ms: Keyword.get(state.opts, :spool_quiet_ms, 120_000)
+      spool_quiet_ms: Keyword.get(state.opts, :spool_quiet_ms, 120_000),
+      log_dir: log_dir(state.opts),
+      log_max_bytes: state.profile && @log_max_bytes[state.profile],
+      log_tmpfs_bytes: state.profile && @log_tmpfs_bytes[state.profile]
     }
 
     if shared != state.published, do: :persistent_term.put({__MODULE__, state.name}, shared)
@@ -458,11 +490,58 @@ defmodule Vagus.Runtime.Host do
     end
   end
 
+  # A Vagus restart within one boot finds the tmpfs already there. A board
+  # that cannot mount it keeps the logs in the plain directory on /run.
+  defp mount_log_tmpfs(opts, profile) do
+    dir = log_dir(opts)
+
+    if mounted?(dir, Keyword.get(opts, :mountinfo, "/proc/self/mountinfo")) do
+      :ok
+    else
+      run = Keyword.get(opts, :run, &Vagus.Host.Cmd.run/2)
+      options = "size=#{@log_tmpfs_bytes[profile]},mode=0700,nosuid,nodev,noexec"
+
+      case run.("mount", ["-t", "tmpfs", "-o", options, "tmpfs", dir]) do
+        {_out, 0} ->
+          :ok
+
+        {out, status} ->
+          Logger.warning(
+            "Vagus.Runtime.Host: no tmpfs for #{dir} (#{status}): #{out}; logs stay on /run"
+          )
+      end
+    end
+  end
+
+  # mountinfo's fifth field is the mount point, with spaces and the like
+  # written as octal escapes.
+  # sobelow_skip ["Traversal.FileModule"]
+  defp mounted?(dir, mountinfo) do
+    case File.read(mountinfo) do
+      {:ok, text} ->
+        text
+        |> String.split("\n", trim: true)
+        |> Enum.any?(fn line ->
+          case String.split(line, " ") do
+            [_id, _parent, _dev, _root, point | _] -> unescape(point) == dir
+            _ -> false
+          end
+        end)
+
+      {:error, _} ->
+        false
+    end
+  end
+
+  defp unescape(point) do
+    Regex.replace(~r/\\([0-7]{3})/, point, fn _, octal ->
+      <<String.to_integer(octal, 8)>>
+    end)
+  end
+
   # The paths below are module defaults or a test's temp dir, never request input.
   # sobelow_skip ["Traversal.FileModule"]
-  defp ensure_socket_dir(opts) do
-    dir = Keyword.get_lazy(opts, :socket_dir, &Vagus.Core.Container.socket_dir/0)
-
+  defp ensure_private_dir(dir) do
     with :ok <- File.mkdir_p(dir), :ok <- File.chmod(dir, 0o700) do
       :ok
     else
@@ -543,6 +622,7 @@ defmodule Vagus.Runtime.Host do
     """
     [engine]
     events_logger = "file"
+    events_logfile_max_size = #{@events_max_bytes}
     image_parallel_copies = 1
     image_copy_tmp_dir = "#{spool_dir(opts)}"
     """
@@ -552,6 +632,7 @@ defmodule Vagus.Runtime.Host do
     """
     [engine]
     events_logger = "file"
+    events_logfile_max_size = #{@events_max_bytes}
     image_copy_tmp_dir = "#{Path.join(run_dir(opts), "spool")}"
     """
   end
@@ -583,6 +664,10 @@ defmodule Vagus.Runtime.Host do
     do: Path.join(Keyword.get(opts, :graphroot, "/root/containers/storage"), "tmp")
 
   defp run_dir(opts), do: Keyword.get(opts, :run_dir, "/run/vagus/podman")
+
+  # On tmpfs: container logs never touch the SD card, and they lose nothing
+  # there, since every container is recreated at each boot anyway.
+  defp log_dir(opts), do: Keyword.get(opts, :log_dir, @log_dir)
 
   defp shutting_down?(opts),
     do: Keyword.get(opts, :shutting_down?, &Vagus.Host.Shutdown.in_flight?/0).()
