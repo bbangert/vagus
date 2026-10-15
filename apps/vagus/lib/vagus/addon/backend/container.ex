@@ -13,7 +13,8 @@ defmodule Vagus.Addon.Backend.Container do
       the spec names a profile),
     * `Labels` always includes `supervisor_managed: ""`,
     * `OomScoreAdj: 200`,
-    * no `RestartPolicy` (the manager owns start/stop),
+    * `RestartPolicy: {Name: ""}`, i.e. never restarted by the engine (the
+      manager owns start/stop),
     * `Domainname: local.hass.io` when a hostname + DNS are set.
   """
 
@@ -28,37 +29,40 @@ defmodule Vagus.Addon.Backend.Container do
   @dns_suffix "local.hass.io"
   @secret_env ["SUPERVISOR_TOKEN", "HASSIO_TOKEN"]
 
-  # The callbacks' extra `opts` reach `Vagus.Runtime.Engine`; the behaviour's
-  # callers pass none, tests pass the engine to use.
+  # Every callback's `opts` reach `Vagus.Runtime.Engine`, with a nested
+  # `:engine_opts` flattened in. Steps passes its own opts to `stop`,
+  # `remove` and `remove_image`; it calls `pull`, `create`, `start` and
+  # `state` with none, so tests give those the engine directly.
 
   @impl true
   def pull(%Spec{image: image, platform: platform}, opts \\ []) do
-    Engine.pull(image, [platform: platform] ++ opts)
+    Engine.pull(image, [platform: platform] ++ engine(opts))
   end
 
   @impl true
-  def create(%Spec{} = spec, opts \\ []), do: Engine.create(to_container_spec(spec), opts)
+  def create(%Spec{} = spec, opts \\ []),
+    do: Engine.create(to_container_spec(spec), engine(opts))
 
   @impl true
-  def start(id, opts \\ []), do: Engine.start(id, opts)
+  def start(id, opts \\ []), do: Engine.start(id, engine(opts))
 
   @impl true
   def stop(id, opts \\ []) do
-    case Keyword.pop(opts, :timeout) do
+    case Keyword.pop(engine(opts), :timeout) do
       {nil, opts} -> Engine.stop(id, opts)
       {seconds, opts} -> Engine.stop(id, [timeout_s: seconds] ++ opts)
     end
   end
 
   @impl true
-  def remove(id, opts \\ []), do: Engine.remove(id, opts)
+  def remove(id, opts \\ []), do: Engine.remove(id, engine(opts))
 
   @impl true
-  def remove_image(image, opts \\ []), do: Engine.remove_image(image, opts)
+  def remove_image(image, opts \\ []), do: Engine.remove_image(image, engine(opts))
 
   @impl true
   def state(id, opts \\ []) do
-    case Engine.inspect(id, opts) do
+    case Engine.inspect(id, engine(opts)) do
       {:ok, container} -> {:ok, if(Container.alive?(container), do: :running, else: :stopped)}
       {:error, :not_found} -> {:ok, :unknown}
       {:error, reason} -> {:error, reason}
@@ -112,6 +116,11 @@ defmodule Vagus.Addon.Backend.Container do
     }
   end
 
+  defp engine(opts) do
+    {nested, opts} = Keyword.pop(opts, :engine_opts, [])
+    opts ++ nested
+  end
+
   defp security_opt(spec) do
     apparmor = if spec.apparmor, do: ["apparmor=#{spec.apparmor}"], else: []
     Enum.uniq(["seccomp=unconfined" | apparmor])
@@ -120,8 +129,8 @@ defmodule Vagus.Addon.Backend.Container do
   defp domainname(%Spec{hostname: h, dns: dns}) when is_binary(h) and dns != [], do: @dns_suffix
   defp domainname(_), do: nil
 
-  # A mount that asks for neither propagation nor the recursive-ro opt-out
-  # must serialize exactly as before, so `false` stays unset rather than sent.
+  # A mount asking for neither option must carry no `BindOptions`, so
+  # `false` stays unset rather than sent.
   defp mount(m) do
     %{
       type: :bind,
@@ -129,24 +138,11 @@ defmodule Vagus.Addon.Backend.Container do
       target: m.target,
       read_only: Map.get(m, :read_only, false),
       propagation: Map.get(m, :propagation),
-      read_only_non_recursive: Map.get(m, :read_only_non_recursive) == true or nil
+      read_only_non_recursive: if(Map.get(m, :read_only_non_recursive), do: true)
     }
   end
 
-  # Sorted as the rendered `K=V` strings, which is the order the engine has
-  # always been given (`VAR1=` sorts before `VAR=`, unlike the bare keys).
-  defp env_pairs(env) when is_map(env), do: env |> Enum.to_list() |> sort_rendered()
-
-  defp env_pairs(env) when is_list(env) do
-    env
-    |> Enum.map(fn entry ->
-      case String.split(entry, "=", parts: 2) do
-        [name, value] -> {name, value}
-        [name] -> {name, ""}
-      end
-    end)
-    |> sort_rendered()
-  end
-
-  defp sort_rendered(pairs), do: Enum.sort_by(pairs, fn {k, v} -> "#{k}=#{v}" end)
+  # `Env` is a sorted list of `K=V` strings, so sort as those (`VAR1=` comes
+  # before `VAR=`, unlike the bare keys).
+  defp env_pairs(env), do: Enum.sort_by(env, fn {k, v} -> "#{k}=#{v}" end)
 end

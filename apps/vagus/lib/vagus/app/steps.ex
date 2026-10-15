@@ -351,8 +351,8 @@ defmodule Vagus.App.Steps do
       %{container_id: id, ip: nil, healthcheck: false}
   end
 
-  # A nonzero exit fails as `{:exec, code}`, the reason a failed hook has
-  # always carried.
+  # A nonzero exit fails as `{:exec, code}`: Policy fails the backup on it and
+  # the API reports it as the hook's error.
   defp hook_result({:ok, %{exit_code: 0}}), do: :ok
   defp hook_result({:ok, %{exit_code: code}}), do: {:error, {:exec, code}}
   defp hook_result({:error, _reason} = error), do: error
@@ -868,17 +868,15 @@ defmodule Vagus.App.Steps do
     end
   end
 
-  # Image removal goes straight to `Vagus.Runtime.Engine`, not through the
-  # injectable `:backend`, since a native app has no image; best-effort: a config
-  # with no `image:` (raises building the spec) or a daemon that's already
-  # forgotten the image both just log and move on.
+  # Best-effort: a config with no `image:` (raises building the spec) or an
+  # engine refusing the removal both just log and move on.
   # Native add-ons have no image to remove (and `image_ref/2` is nil for them).
   defp remove_image_best_effort(%Config{backend: :native}, _opts), do: :ok
 
   defp remove_image_best_effort(config, opts) do
     case safe_image_ref(config, opts) do
       {:ok, image} ->
-        case Engine.remove_image(image, engine_opts(opts)) do
+        case backend(opts).remove_image(image, opts) do
           :ok ->
             :ok
 

@@ -400,7 +400,7 @@ defmodule Vagus.App do
 
       args =
         opts
-        |> Keyword.take([:job, :jobs_server, :backend, :data_root, :socket])
+        |> Keyword.take([:job, :jobs_server, :backend, :engine_opts, :data_root, :socket])
         |> Map.new()
         |> Map.put(:config, target)
 

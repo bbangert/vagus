@@ -768,6 +768,9 @@ defmodule Vagus.App.StepsTest do
 
       assert {:ok, :ok} = Steps.run(:exec_hook, hook)
       assert {:exec, ["addon_test_app", ["/bin/sh", "-c", "dump-db"]]} in Fake.calls(fake)
+      # Detached: a hook's output is never read, only its exit code.
+      assert {:exec, opts} = List.keyfind(Fake.call_opts(fake), :exec, 0)
+      assert opts[:capture] == false
 
       Fake.put_container(fake, "addon_test_app", exec: {3, "ignored"})
       assert {:error, {:exec, 3}} = Steps.run(:exec_hook, hook)
@@ -988,18 +991,18 @@ defmodule Vagus.App.StepsTest do
   describe "remove_app" do
     @describetag :tmp_dir
 
-    test "removes the app's image through the engine, tolerating a refusal", ctx do
-      {fake, engine_opts} = engine(%{})
+    test "removes the app's image through the backend, tolerating a refusal", ctx do
       image = "homeassistant/amd64-addon-test:3"
-      Fake.put_image(fake, image)
-      remove = input(ctx, %{engine_opts: engine_opts, arch: "amd64"})
 
-      assert {:ok, :ok} = Steps.run(:remove_app, remove)
-      assert {:remove_image, [^image]} = List.last(Fake.calls(fake))
-      refute Vagus.Runtime.Engine.image_present?(image, engine_opts)
+      assert {:ok, :ok} = Steps.run(:remove_app, input(ctx, %{arch: "amd64"}))
+      assert_received {:remove_image, ^image}
 
-      Fake.fail_next(fake, :remove_image, :in_use)
-      log = capture_log(fn -> assert {:ok, :ok} = Steps.run(:remove_app, remove) end)
+      log =
+        capture_log(fn ->
+          assert {:ok, :ok} =
+                   Steps.run(:remove_app, input(ctx, %{arch: "amd64", backend: RefusingBackend}))
+        end)
+
       assert log =~ "remove image #{image} failed (tolerated): :in_use"
     end
 

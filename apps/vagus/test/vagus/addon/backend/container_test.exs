@@ -41,7 +41,9 @@ defmodule Vagus.Addon.Backend.ContainerTest do
 
     test("OomScoreAdj is 200", %{host: host}, do: assert(host["OomScoreAdj"] == 200))
 
-    test("no restart policy", %{host: host}, do: assert(host["RestartPolicy"] == %{"Name" => ""}))
+    test("RestartPolicy names none, so the engine never restarts it", %{host: host},
+      do: assert(host["RestartPolicy"] == %{"Name" => ""})
+    )
 
     test "supervisor_managed label always present", %{cfg: cfg} do
       assert cfg["Labels"]["supervisor_managed"] == ""
@@ -167,8 +169,8 @@ defmodule Vagus.Addon.Backend.ContainerTest do
   end
 
   describe "to_container_spec/1" do
-    # The engine was always given these sorted as rendered strings, which is
-    # not the bare-key order once a key ends in a character below `=`/`:`.
+    # `Env`/`ExtraHosts` are sorted rendered strings, which is not the
+    # bare-key order once a key ends in a character below `=`/`:`.
     test "env and extra_hosts sort as their rendered strings" do
       cfg =
         Container.build_config(
@@ -238,6 +240,16 @@ defmodule Vagus.Addon.Backend.ContainerTest do
       # A 1 s timeout_ms alone would cut the stop; a 3 s grace never is.
       assert Container.stop("addon_x", [timeout: 3, timeout_ms: 1_000] ++ opts) == :ok
       assert Container.state("addon_x", opts) == {:ok, :stopped}
+    end
+
+    # Steps passes its own opts, with the engine nested under `:engine_opts`.
+    test "a nested :engine_opts reaches the engine", %{fake: fake, opts: opts} do
+      Fake.put_container(fake, "addon_x")
+      steps_opts = [backend: Container, data_root: "/data", timeout: 1, engine_opts: opts]
+
+      assert Container.stop("addon_x", steps_opts) == :ok
+      assert Container.remove("addon_x", steps_opts) == :ok
+      assert Container.state("addon_x", opts) == {:ok, :unknown}
     end
 
     test "stop of an absent container is :not_found; remove and remove_image of absent are :ok",
