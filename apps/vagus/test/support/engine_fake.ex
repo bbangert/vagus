@@ -175,8 +175,9 @@ defmodule Vagus.Runtime.Engine.Fake do
         nil ->
           {:ok, s}
 
-        %{container: %{state: :running}} when not force ->
-          {{:error, {:failed, :remove, :running}}, s}
+        %{container: %{state: state}}
+        when not force and state in [:running, :paused, :restarting] ->
+          {{:error, {:failed, :remove, state}}, s}
 
         _entry ->
           {:ok, %{s | containers: Map.delete(s.containers, name)}}
@@ -196,7 +197,7 @@ defmodule Vagus.Runtime.Engine.Fake do
     call(opts, :list, [], fn s ->
       containers =
         for {name, %{container: c}} <- Enum.sort(s.containers),
-            all or c.state == :running,
+            all or c.state in [:running, :paused, :restarting],
             String.starts_with?(name, prefix),
             do: summary(c)
 
@@ -335,7 +336,7 @@ defmodule Vagus.Runtime.Engine.Fake do
     %{c | state: :running, exit_code: nil, health: health, started_at: DateTime.utc_now()}
   end
 
-  defp halt(%Container{state: :running} = c),
+  defp halt(%Container{state: state} = c) when state in [:running, :paused, :restarting],
     do: %{c | state: :exited, exit_code: 0, finished_at: DateTime.utc_now()}
 
   defp halt(c), do: c

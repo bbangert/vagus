@@ -113,6 +113,28 @@ defmodule Vagus.Runtime.Engine.DockerContractTest.Leg do
     )
   end
 
+  defp p_summary do
+    summary(
+      "aa11bb22aa11bb22aa11bb22aa11bb22aa11bb22aa11bb22aa11bb22aa11bb22",
+      "addon_local_p",
+      "ghcr.io/vagus/aarch64-addon-x:1.2.0",
+      "paused",
+      "Up 2 hours (Paused)",
+      %{"supervisor_managed" => "", "io.hass.version" => "1.2.0"}
+    )
+  end
+
+  defp r_summary do
+    summary(
+      "cc33dd44cc33dd44cc33dd44cc33dd44cc33dd44cc33dd44cc33dd44cc33dd44",
+      "addon_local_r",
+      "ghcr.io/vagus/aarch64-addon-x:1.2.0",
+      "restarting",
+      "Restarting (1) 3 seconds ago",
+      %{"supervisor_managed" => "", "io.hass.version" => "1.2.0"}
+    )
+  end
+
   defp core_summary do
     summary(
       "77aa88bb77aa88bb77aa88bb77aa88bb77aa88bb77aa88bb77aa88bb77aa88bb",
@@ -162,8 +184,30 @@ defmodule Vagus.Runtime.Engine.DockerContractTest.Leg do
   defp script(:inspect_exited), do: [{200, exited_json()}]
 
   # A real daemon filters `all=false` itself.
-  defp script(:list),
-    do: [{200, [x_summary(), core_summary()]}, {200, [x_summary(), y_summary(), core_summary()]}]
+  defp script(:list) do
+    live = [x_summary(), p_summary(), r_summary()]
+    [{200, live ++ [core_summary()]}, {200, live ++ [y_summary(), core_summary()]}]
+  end
+
+  defp script({:remove_live, state}) do
+    message =
+      if state == :running,
+        do:
+          "You cannot remove a running container 4f1c. Stop the container before attempting removal or force remove",
+        else:
+          "You cannot remove a #{state} container 4f1c. Unpause and then stop the container before attempting removal or force remove"
+
+    [
+      {409, %{"message" => message}},
+      {200, running_json() |> put_in(["State", "Status"], to_string(state))}
+    ]
+  end
+
+  defp script({:stop_live, _state}), do: [{204, nil}, {200, exited_json(0)}]
+
+  defp script(:pull_failed_single_object) do
+    [{200, %{"errorDetail" => %{"message" => "manifest unknown"}, "error" => "manifest unknown"}}]
+  end
 
   defp script(:start_created), do: [{204, nil}, {200, running_json()}]
   defp script(:start_running), do: [{200, running_json()}, {304, nil}, {200, running_json()}]
@@ -485,6 +529,13 @@ defmodule Vagus.Runtime.Engine.DockerContractTest do
 
       assert body == Vagus.Network.config()
     end
+  end
+
+  test "a pull answered with one JSON error object is {:pull_failed, message}" do
+    opts = Leg.arrange(:pull_failed_single_object, %{})
+
+    assert Engine.pull("ghcr.io/vagus/missing:1.0", opts) ==
+             {:error, {:pull_failed, "manifest unknown"}}
   end
 
   test "a registry refusal is {:pull_failed, message} without its HTTP status" do

@@ -22,6 +22,8 @@ defmodule Vagus.Test.EngineContract do
 
   @running_id "4f1c2b3a4f1c2b3a4f1c2b3a4f1c2b3a4f1c2b3a4f1c2b3a4f1c2b3a4f1c2b3a"
   @exited_id "9d2e7f6a9d2e7f6a9d2e7f6a9d2e7f6a9d2e7f6a9d2e7f6a9d2e7f6a9d2e7f6a"
+  @paused_id "aa11bb22aa11bb22aa11bb22aa11bb22aa11bb22aa11bb22aa11bb22aa11bb22"
+  @restarting_id "cc33dd44cc33dd44cc33dd44cc33dd44cc33dd44cc33dd44cc33dd44cc33dd44"
   @core_id "77aa88bb77aa88bb77aa88bb77aa88bb77aa88bb77aa88bb77aa88bb77aa88bb"
 
   def running do
@@ -63,6 +65,11 @@ defmodule Vagus.Test.EngineContract do
       finished_at: ~U[2026-10-14 09:30:00Z]
     }
   end
+
+  def paused, do: %{running() | id: @paused_id, name: "addon_local_p", state: :paused}
+
+  def restarting,
+    do: %{running() | id: @restarting_id, name: "addon_local_r", state: :restarting}
 
   def core do
     %Container{
@@ -173,6 +180,7 @@ defmodule Vagus.Test.EngineContract do
      [
        __helpers__(leg),
        __container_tests__(),
+       __create_tests__(),
        __io_tests__(),
        __exec_tests__(),
        __failure_tests__()
@@ -279,13 +287,15 @@ defmodule Vagus.Test.EngineContract do
       end
 
       describe "list" do
-        test "running only by default; all + name_prefix includes exited", ctx do
+        test "live (running, paused, restarting) by default; all + name_prefix adds exited",
+             ctx do
           opts = arrange(:list, ctx)
+          live = [C.paused(), C.restarting(), C.running()]
 
-          assert sorted(Engine.list(opts)) == Enum.map([C.running(), C.core()], &C.summary/1)
+          assert sorted(Engine.list(opts)) == Enum.map(live ++ [C.core()], &C.summary/1)
 
           assert sorted(Engine.list([all: true, name_prefix: "addon_"] ++ opts)) ==
-                   Enum.map([C.running(), C.exited()], &C.summary/1)
+                   Enum.map(live ++ [C.exited()], &C.summary/1)
         end
       end
 
@@ -352,6 +362,28 @@ defmodule Vagus.Test.EngineContract do
           assert Engine.restart("ghost", arrange(:absent, ctx)) == {:error, :not_found}
         end
 
+        for state <- [:running, :paused, :restarting] do
+          @tag state: state
+          test "remove with force: false refuses a #{state} container and keeps it", ctx do
+            opts = arrange({:remove_live, ctx.state}, ctx)
+
+            assert {:error, {:failed, :remove, _}} =
+                     Engine.remove("addon_local_x", [force: false] ++ opts)
+
+            assert {:ok, %Container{state: state}} = Engine.inspect("addon_local_x", opts)
+            assert state == ctx.state
+          end
+        end
+
+        for state <- [:paused, :restarting] do
+          @tag state: state
+          test "stop of a #{state} container exits it", ctx do
+            opts = arrange({:stop_live, ctx.state}, ctx)
+            assert Engine.stop("addon_local_x", opts) == :ok
+            assert {:ok, %Container{state: :exited}} = Engine.inspect("addon_local_x", opts)
+          end
+        end
+
         test "remove deletes the container", ctx do
           opts = arrange(:remove, ctx)
           assert Engine.remove("addon_local_y", opts) == :ok
@@ -379,7 +411,12 @@ defmodule Vagus.Test.EngineContract do
                   [{"addon_local_d", {:failed, :stop, _}}]} = Engine.stop_all(names, 5, opts)
         end
       end
+    end
+  end
 
+  @doc false
+  def __create_tests__ do
+    quote do
       describe "create" do
         test "creates from a present image", ctx do
           assert {:ok, id} = Engine.create(C.spec(), arrange(:create, ctx))

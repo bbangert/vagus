@@ -90,6 +90,25 @@ defmodule Vagus.Runtime.DockerTest do
     end
   end
 
+  describe "pull_image/2 (hermetic — FakeEngine)" do
+    # FakeEngine sends a map as application/json, so the client gets it decoded.
+    test "a 200 whose body is one JSON error object is a pull failure, not a crash" do
+      engine =
+        FakeEngine.start([
+          {200,
+           %{"errorDetail" => %{"message" => "manifest unknown"}, "error" => "manifest unknown"}},
+          {200, %{"status" => "Status: Image is up to date for ghcr.io/vagus/x:1"}}
+        ])
+
+      on_exit(fn -> FakeEngine.stop(engine) end)
+
+      assert Docker.pull_image("ghcr.io/vagus/x:1", socket: engine.socket) ==
+               {:error, {:pull_failed, "manifest unknown"}}
+
+      assert Docker.pull_image("ghcr.io/vagus/x:1", socket: engine.socket) == :ok
+    end
+  end
+
   describe ":recv_timeout (hermetic — FakeEngine)" do
     test "bounds the daemon's silence per request" do
       engine = FakeEngine.start([{200, %{}, delay: 500}, {200, %{}, delay: 500}])

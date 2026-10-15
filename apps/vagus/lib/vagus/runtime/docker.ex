@@ -674,6 +674,14 @@ defmodule Vagus.Runtime.Docker do
 
   defp platform_query(opts), do: if(p = opts[:platform], do: [platform: p], else: [])
 
+  # A one-object stream arrives decoded (the daemon says application/json).
+  defp check_pull_stream(body) when is_map(body) or is_list(body) do
+    case Enum.find(List.wrap(body), &(is_map(&1) and (&1["error"] || &1["errorDetail"]))) do
+      nil -> :ok
+      failure -> {:error, {:pull_failed, failure["error"] || failure["errorDetail"]["message"]}}
+    end
+  end
+
   defp check_pull_stream(body) do
     # /images/create streams newline-delimited JSON status objects; an
     # errorDetail anywhere means the pull failed even though the HTTP status

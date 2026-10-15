@@ -23,8 +23,11 @@ defmodule Vagus.Runtime.Engine.FakeContractTest.Leg do
   defp setup(:inspect_exited, fake), do: put(fake, C.exited())
 
   defp setup(:list, fake) do
-    Enum.each([C.running(), C.exited(), C.core()], &put(fake, &1))
+    Enum.each([C.running(), C.paused(), C.restarting(), C.exited(), C.core()], &put(fake, &1))
   end
+
+  defp setup({:remove_live, state}, fake), do: put(fake, %{C.running() | state: state})
+  defp setup({:stop_live, state}, fake), do: put(fake, %{C.running() | state: state})
 
   defp setup(:start_created, fake), do: put(fake, %{C.running() | state: :created})
   defp setup(:start_running, fake), do: put(fake, C.running())
