@@ -1,0 +1,158 @@
+[
+  {
+    "AutoRemove": false,
+    "Command": [
+      "sleep",
+      "3600"
+    ],
+    "CreatedAt": "8 seconds ago",
+    "CIDFile": "",
+    "Exited": false,
+    "ExitedAt": -62135596800,
+    "ExitCode": 0,
+    "ExposedPorts": null,
+    "Id": "0592abe301c4b28c3f12696daf119c49fc87d7e39d5046fb217350aca63baf0a",
+    "Image": "docker.io/library/alpine:3.20",
+    "ImageID": "bf8527eb54c3680e728d5b4b383a8ba730d72dae7236fbc8dff97ed6b224a731",
+    "IsInfra": false,
+    "Labels": {
+      "io.hass.version": "1.2.0",
+      "supervisor_managed": ""
+    },
+    "Mounts": [],
+    "Names": [
+      "fx_running"
+    ],
+    "Namespaces": {
+      
+    },
+    "Networks": [
+      "hassio"
+    ],
+    "Pid": 3620,
+    "Pod": "",
+    "PodName": "",
+    "Ports": null,
+    "Restarts": 0,
+    "Size": null,
+    "StartedAt": 1792086171,
+    "State": "running",
+    "Status": "Up 8 seconds",
+    "Created": 1792086171
+  },
+  {
+    "AutoRemove": false,
+    "Command": [
+      "sh",
+      "-c",
+      "exit 3"
+    ],
+    "CreatedAt": "7 seconds ago",
+    "CIDFile": "",
+    "Exited": true,
+    "ExitedAt": 1792086171,
+    "ExitCode": 3,
+    "ExposedPorts": null,
+    "Id": "1793113d32b61fad2da22cebf140429dafe67c439d7cb2eb700948b7b89b9ac1",
+    "Image": "docker.io/library/alpine:3.20",
+    "ImageID": "bf8527eb54c3680e728d5b4b383a8ba730d72dae7236fbc8dff97ed6b224a731",
+    "IsInfra": false,
+    "Labels": null,
+    "Mounts": [],
+    "Names": [
+      "fx_exited"
+    ],
+    "Namespaces": {
+      
+    },
+    "Networks": [
+      "hassio"
+    ],
+    "Pid": 0,
+    "Pod": "",
+    "PodName": "",
+    "Ports": null,
+    "Restarts": 0,
+    "Size": null,
+    "StartedAt": 1792086171,
+    "State": "exited",
+    "Status": "Exited (3) 8 seconds ago",
+    "Created": 1792086171
+  },
+  {
+    "AutoRemove": false,
+    "Command": [
+      "sleep",
+      "3600"
+    ],
+    "CreatedAt": "7 seconds ago",
+    "CIDFile": "",
+    "Exited": true,
+    "ExitedAt": 1792086172,
+    "ExitCode": 137,
+    "ExposedPorts": null,
+    "Id": "42968d21d416629957a0607da7339d0254b3344c85bf143e67637965e0b27ff2",
+    "Image": "docker.io/library/alpine:3.20",
+    "ImageID": "bf8527eb54c3680e728d5b4b383a8ba730d72dae7236fbc8dff97ed6b224a731",
+    "IsInfra": false,
+    "Labels": null,
+    "Mounts": [],
+    "Names": [
+      "fx_stopped"
+    ],
+    "Namespaces": {
+      
+    },
+    "Networks": [
+      "hassio"
+    ],
+    "Pid": 0,
+    "Pod": "",
+    "PodName": "",
+    "Ports": null,
+    "Restarts": 0,
+    "Size": null,
+    "StartedAt": 1792086172,
+    "State": "exited",
+    "Status": "Exited (137) 7 seconds ago",
+    "Created": 1792086171
+  },
+  {
+    "AutoRemove": false,
+    "Command": [
+      "sleep",
+      "3600"
+    ],
+    "CreatedAt": "7 seconds ago",
+    "CIDFile": "",
+    "Exited": false,
+    "ExitedAt": -62135596800,
+    "ExitCode": 0,
+    "ExposedPorts": null,
+    "Id": "8ce29623f08e2b79721798c28e4df35b90ebdefd674bbe61cde00d43c4d013b0",
+    "Image": "docker.io/library/alpine:3.20",
+    "ImageID": "bf8527eb54c3680e728d5b4b383a8ba730d72dae7236fbc8dff97ed6b224a731",
+    "IsInfra": false,
+    "Labels": null,
+    "Mounts": [],
+    "Names": [
+      "fx_health"
+    ],
+    "Namespaces": {
+      
+    },
+    "Networks": [
+      "hassio"
+    ],
+    "Pid": 3766,
+    "Pod": "",
+    "PodName": "",
+    "Ports": null,
+    "Restarts": 0,
+    "Size": null,
+    "StartedAt": 1792086172,
+    "State": "running",
+    "Status": "Up 7 seconds (healthy)",
+    "Created": 1792086172
+  }
+]

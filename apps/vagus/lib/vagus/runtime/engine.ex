@@ -13,7 +13,8 @@ defmodule Vagus.Runtime.Engine do
       long as its owner wants): bounds the whole call; past it the call
       returns `{:error, :timeout}`.
     * `:timeout_s` (`stop`, `restart`, `stop_all`): the grace before kill;
-      `:timeout_ms` never cuts it short.
+      `:timeout_ms` never cuts it short, nor a stop below the engine's grace
+      floor when `:timeout_s` is absent.
     * `:force` (`remove`, default true): removes a running container.
     * `:all` (default false), `:name_prefix` (`list`).
     * `:tail` (default 100), `:timestamps` (`logs`, `follow_logs`).

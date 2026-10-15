@@ -20,6 +20,9 @@ Mox.stub_with(Vagus.Backend.OSMock, Vagus.Backend.OS.HostStub)
 # Tests tagged `:docker` need a running Docker/balena-engine daemon on the
 # host socket; they're opt-in via `mix test --include docker`.
 #
+# `:podman` runs Engine.Podman against a real podman (on PATH, or the one
+# VAGUS_PODMAN_BIN names); opt-in via `mix test --include podman`.
+#
 # `:block_device` needs a real block node under /dev, which the dev container
 # has none of (only /dev/null, /dev/zero and friends). Opt-in via
 # `mix test --include block_device` on a board or any host with a disk; when
@@ -27,7 +30,7 @@ Mox.stub_with(Vagus.Backend.OSMock, Vagus.Backend.OS.HostStub)
 #
 # `:known_failing` tests pin the intended behaviour of defects the per-app
 # lifecycle fixes; run them with `mix test --include known_failing`.
-ExUnit.start(exclude: [:docker, :block_device, :known_failing])
+ExUnit.start(exclude: [:docker, :podman, :block_device, :known_failing])
 
 # At VM exit rather than `ExUnit.after_suite/1`: that runs after every pass of
 # `--repeat-until-failure`, and the app processes started at boot read from it.

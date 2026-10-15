@@ -1,0 +1,14 @@
+[
+ {
+  "id": "0592abe301c4",
+  "name": "fx_running",
+  "cpu_time": "3.13ms",
+  "cpu_percent": "0.04%",
+  "avg_cpu": "0.04%",
+  "mem_usage": "0B / 201.7GB",
+  "mem_percent": "0.00%",
+  "net_io": "2.342kB / 628B",
+  "block_io": "0B / 0B",
+  "pids": "1"
+ }
+]

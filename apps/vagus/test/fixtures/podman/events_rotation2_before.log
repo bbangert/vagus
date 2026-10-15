@@ -1,0 +1,13 @@
+{"Name":"/tmp/rot2/events.log","Status":"log-rotation","Time":"2026-10-15T19:53:45.247129361Z","Type":"system","Attributes":{"io.podman.event.rotate":"begin"}}
+{"ID":"bf8527eb54c3680e728d5b4b383a8ba730d72dae7236fbc8dff97ed6b224a731","Name":"docker.io/library/alpine:3.20","Status":"pull","Time":"2026-10-15T19:53:44.854799695Z","Type":"image","Attributes":null}
+{"ID":"82e869846ac4092b172a5d7708141ea3d3438ca78c3bfd04a5b6592b56d0cf5d","Image":"docker.io/library/alpine:3.20","Name":"fx_r2_27","Status":"create","Time":"2026-10-15T19:53:44.995633658Z","Type":"container","Attributes":{"supervisor_managed":""}}
+{"ID":"bf8527eb54c3680e728d5b4b383a8ba730d72dae7236fbc8dff97ed6b224a731","Name":"docker.io/library/alpine:3.20","Status":"pull","Time":"2026-10-15T19:53:44.976665935Z","Type":"image","Attributes":null}
+{"ID":"8edf566eee57fe5b0f8610f0f87721c3ded1123a8508447e3b5cda50a50963c1","Image":"docker.io/library/alpine:3.20","Name":"fx_r2_28","Status":"create","Time":"2026-10-15T19:53:45.123476655Z","Type":"container","Attributes":{"supervisor_managed":""}}
+{"ID":"bf8527eb54c3680e728d5b4b383a8ba730d72dae7236fbc8dff97ed6b224a731","Name":"docker.io/library/alpine:3.20","Status":"pull","Time":"2026-10-15T19:53:45.104164191Z","Type":"image","Attributes":null}
+{"ID":"8d3ccd509a8b8b32fdccc8526eb1191c91b8bcb768b616f47c1931db0bda75dc","Image":"docker.io/library/alpine:3.20","Name":"fx_r2_29","Status":"create","Time":"2026-10-15T19:53:45.246871925Z","Type":"container","Attributes":{"supervisor_managed":""}}
+{"Name":"/tmp/rot2/events.log","Status":"log-rotation","Time":"2026-10-15T19:53:45.247198211Z","Type":"system","Attributes":{"io.podman.event.rotate":"end"}}
+{"ID":"bf8527eb54c3680e728d5b4b383a8ba730d72dae7236fbc8dff97ed6b224a731","Name":"docker.io/library/alpine:3.20","Status":"pull","Time":"2026-10-15T19:53:45.227701349Z","Type":"image","Attributes":null}
+{"ID":"96849430db577f3dcd28f1d835ca7e9ab4e658710b0ecbd26cab3986516e92b4","Image":"docker.io/library/alpine:3.20","Name":"fx_r2_30","Status":"create","Time":"2026-10-15T19:53:45.373814279Z","Type":"container","Attributes":{"supervisor_managed":""}}
+{"ID":"bf8527eb54c3680e728d5b4b383a8ba730d72dae7236fbc8dff97ed6b224a731","Name":"docker.io/library/alpine:3.20","Status":"pull","Time":"2026-10-15T19:53:45.354411545Z","Type":"image","Attributes":null}
+{"ID":"a2100b386faabf001bd56f5251c822ba07a578550e2f8f1a3ca5a6218425c0f7","Image":"docker.io/library/alpine:3.20","Name":"fx_r2_31","Status":"create","Time":"2026-10-15T19:53:55.763401809Z","Type":"container","Attributes":{"supervisor_managed":""}}
+{"ID":"bf8527eb54c3680e728d5b4b383a8ba730d72dae7236fbc8dff97ed6b224a731","Name":"docker.io/library/alpine:3.20","Status":"pull","Time":"2026-10-15T19:53:55.744062995Z","Type":"image","Attributes":null}

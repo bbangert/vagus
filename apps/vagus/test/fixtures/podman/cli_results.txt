@@ -1,0 +1,221 @@
+$ podman container inspect ghost
+[exit 125]
+[]
+Error: no such container "ghost"
+
+$ podman container exists ghost
+[exit 1]
+
+
+$ podman container exists fx_running
+[exit 0]
+
+
+$ podman image exists docker.io/library/nope:1
+[exit 1]
+
+
+$ podman image exists docker.io/library/alpine:3.20
+[exit 0]
+
+
+$ podman start ghost
+[exit 125]
+Error: no container with name or ID "ghost" found: no such container
+
+$ podman stop ghost
+[exit 125]
+Error: no container with name or ID "ghost" found: no such container
+
+$ podman stop --ignore -t 0 ghost
+[exit 0]
+
+
+$ podman stop -t 0 fx_stopped
+[exit 0]
+fx_stopped
+
+$ podman start fx_running
+[exit 0]
+fx_running
+
+$ podman rm ghost
+[exit 1]
+Error: no container with ID or name "ghost" found: no such container
+
+$ podman rm -f ghost
+[exit 0]
+
+
+$ podman rm -f --ignore -t 0 ghost
+[exit 0]
+
+
+$ podman rm fx_running
+[exit 2]
+Error: cannot remove container 0592abe301c4b28c3f12696daf119c49fc87d7e39d5046fb217350aca63baf0a as it is running - running or paused containers cannot be removed without force: container state improper
+
+$ podman restart ghost
+[exit 125]
+Error: no container with name or ID "ghost" found: no such container
+
+$ podman logs ghost
+[exit 125]
+Error: no container with name or ID "ghost" found: no such container
+
+$ podman stats --no-stream --no-reset --format '{{json .ContainerStats}}' ghost
+[exit 125]
+Error: unable to get list of containers: unable to look up container ghost: no container with name or ID "ghost" found: no such container
+
+$ podman exec ghost true
+[exit 125]
+Error: no container with name or ID "ghost" found: no such container
+
+$ podman exec fx_stopped true
+[exit 255]
+Error: can only create exec sessions on running containers: container state improper
+
+$ podman exec fx_running sh -c 'echo out; echo err >&2; exit 3'
+[exit 3]
+err
+out
+
+$ podman exec fx_running sh -c 'exit 125'
+[exit 125]
+
+
+$ podman exec fx_running nosuchcmd
+[exit 127]
+Error: crun: executable file `nosuchcmd` not found in $PATH: No such file or directory: OCI runtime attempted to invoke a command that was not found
+
+$ podman exec fx_running /etc/passwd
+[exit 126]
+Error: crun: the path `/etc/passwd` exists but it is not executable: Operation not permitted: OCI permission denied
+
+$ podman create --name fx_running --pull=never docker.io/library/alpine:3.20 true
+[exit 125]
+Error: creating container storage: the container name "fx_running" is already in use by 0592abe301c4b28c3f12696daf119c49fc87d7e39d5046fb217350aca63baf0a. You have to remove that container to be able to reuse that name: that name is already in use, or use --replace to instruct Podman to do so.
+
+$ podman create --name fx_nope --pull=never docker.io/library/nope:1 true
+[exit 125]
+Error: docker.io/library/nope:1: image not known
+
+$ podman create --name fx_nonet --pull=never --network nonet docker.io/library/alpine:3.20 true
+[exit 125]
+Error: unable to find network with name or ID nonet: network not found
+
+$ podman rmi docker.io/library/alpine:3.20
+[exit 2]
+Error: image used by 8ce29623f08e2b79721798c28e4df35b90ebdefd674bbe61cde00d43c4d013b0: image is in use by a container: consider listing external containers and force-removing image
+
+$ podman rmi docker.io/library/nope:1
+[exit 1]
+Error: docker.io/library/nope:1: image not known
+
+$ podman rmi --ignore docker.io/library/nope:1
+[exit 0]
+
+
+$ podman healthcheck run fx_running
+[exit 125]
+Error: container 0592abe301c4b28c3f12696daf119c49fc87d7e39d5046fb217350aca63baf0a has no defined healthcheck
+
+$ podman healthcheck run ghost
+[exit 125]
+Error: unable to look up ghost to perform a health check: no container with name or ID "ghost" found: no such container
+
+$ podman healthcheck run fx_stopped
+[exit 125]
+Error: container 42968d21d416629957a0607da7339d0254b3344c85bf143e67637965e0b27ff2 has no defined healthcheck
+
+$ podman healthcheck run fx_health
+[exit 0]
+
+
+$ podman network exists hassio
+[exit 0]
+
+
+$ podman network exists nonet
+[exit 1]
+
+
+$ podman network create --disable-dns --interface-name hassio --subnet 172.30.32.0/23 --gateway 172.30.32.1 --ip-range 172.30.33.0-172.30.33.255 --driver bridge hassio
+[exit 125]
+Error: netavark: network already exists hassio
+
+$ podman healthcheck run fx_unhealthy
+[exit 1]
+unhealthy
+
+$ podman healthcheck run fx_unhealthy
+[exit 1]
+unhealthy
+
+$ podman healthcheck run fx_unhealthy
+[exit 1]
+unhealthy
+
+$ podman healthcheck run fx_startp
+[exit 1]
+unhealthy
+
+$ podman healthcheck run fx_created
+[exit 125]
+Error: container ff9b9ee056389d218541df3e333bf2b5795af0cdf568a5d9130bfc45e9c20e4f is not running: can only create exec sessions on running containers: container state improper
+
+$ podman rm fx_paused
+[exit 2]
+Error: cannot remove container a00078f4bd2eb61c4b3f5076897f79bed7d0a401ab64f105a8abff1fb57365ba as it is paused - running or paused containers cannot be removed without force: container state improper
+
+$ podman stop -t 0 fx_paused
+[exit 125]
+Error: container a00078f4bd2eb61c4b3f5076897f79bed7d0a401ab64f105a8abff1fb57365ba is running or paused, refusing to clean up: container state improper
+
+$ podman container inspect --format '{{.State.Status}}' fx_paused
+[exit 0]
+paused
+
+$ podman rm -f -t 0 fx_paused
+[exit 0]
+fx_paused
+
+$ podman container inspect --format '{{.State.Status}} {{.State.Health.Status}}' fx_created
+[exit 0]
+created 
+
+$ podman container inspect --format '{{.State.Health.Status}}' fx_unhealthy
+[exit 0]
+unhealthy
+
+$ podman container inspect --format '{{.State.Health.Status}}' fx_startp
+[exit 0]
+starting
+
+$ podman stop --ignore -t 0 fx_health ghost fx_running
+[exit 0]
+fx_health
+fx_running
+
+$ podman logs --tail 5 --timestamps fx_running
+[exit 0]
+
+
+$ podman logs --tail 100 fx_logs
+[exit 0]
+line one
+line two
+
+$ podman logs --tail 100 --timestamps fx_logs
+[exit 0]
+2026-10-15T17:44:40.983305154Z line one
+2026-10-15T17:44:40.983356641Z line two
+
+$ podman logs --tail 1 fx_logs
+[exit 0]
+line two
+
+$ podman pull --quiet --retry 0 docker.io/library/nosuchimage-vagus:1
+[exit 125]
+Error: unable to copy from source docker://nosuchimage-vagus:1: initializing source docker://nosuchimage-vagus:1: reading manifest 1 in docker.io/library/nosuchimage-vagus: requested access to the resource is denied
+
