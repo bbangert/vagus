@@ -251,6 +251,59 @@ defmodule Vagus.Core.ContainerTest do
       assert Container.config_path(homeassistant_path: "/tmp/fake-core-config") ==
                "/tmp/fake-core-config"
     end
+
+    test "under podman, the migration's resolver decides" do
+      assert Container.config_path(engine: Vagus.Runtime.Engine.Podman) ==
+               Vagus.Runtime.Migration.core_config_path()
+    end
+  end
+
+  describe "the /config mount per engine" do
+    defp config_mounts(opts) do
+      "2026.7.0"
+      |> Container.to_container_spec([token: "t"] ++ opts)
+      |> Map.fetch!(:mounts)
+      |> Enum.filter(&(&1.target == "/config"))
+    end
+
+    test "podman binds the resolved host directory: a named volume would start empty" do
+      opts = [engine: Vagus.Runtime.Engine.Podman, homeassistant_path: "/tmp/core-config"]
+
+      assert config_mounts(opts) == [
+               %{type: :bind, source: "/tmp/core-config", target: "/config", read_only: false}
+             ]
+    end
+
+    test "balena-engine keeps the named volume, so its containers keep their fingerprint" do
+      assert config_mounts(engine: Vagus.Runtime.Engine.Docker) == [
+               %{type: :volume, source: "vagus-core-config", target: "/config"}
+             ]
+
+      assert Container.to_container_spec("2026.7.0",
+               token: "t",
+               engine: Vagus.Runtime.Engine.Docker
+             ) ==
+               Container.to_container_spec("2026.7.0", token: "t")
+    end
+
+    test "the podman spec passes the adapter's validation" do
+      spec =
+        Container.to_container_spec("2026.7.0",
+          token: "t",
+          engine: Vagus.Runtime.Engine.Podman,
+          homeassistant_path: "/root/vagus/core/config"
+        )
+
+      assert Vagus.Runtime.Engine.Podman.validate(spec) == :ok
+    end
+  end
+
+  describe "image?/1" do
+    test "any version of Core's image, and nothing else" do
+      assert Container.image?(Container.image("2026.7.0"))
+      refute Container.image?("ghcr.io/home-assistant/home-assistant-dev:1")
+      refute Container.image?("ghcr.io/home-assistant/aarch64-addon-mosquitto:6.5.0")
+    end
   end
 
   describe "image/1" do

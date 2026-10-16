@@ -95,6 +95,14 @@ defmodule Vagus.Runtime.Engine do
               {:ok, Container.health()} | {:error, :no_healthcheck | error()}
   @callback event_source() :: module()
 
+  @doc """
+  Whether the engine runs each container's healthcheck on its own schedule.
+  One that does not (podman without systemd) leaves the app process to call
+  `healthcheck/2`. Absent, it does.
+  """
+  @callback schedules_healthchecks?(keyword()) :: boolean()
+  @optional_callbacks schedules_healthchecks?: 1
+
   @doc "Creates the network unless it exists; losing a create race is `:ok`."
   @callback ensure_network(NetworkSpec.t(), keyword()) :: :ok | {:error, error()}
 
@@ -121,6 +129,19 @@ defmodule Vagus.Runtime.Engine do
 
   @spec event_source(keyword()) :: module()
   def event_source(opts \\ []), do: impl(opts).event_source()
+
+  @doc "Whether the engine in use (`opts[:engine]`, else the configured one) is podman."
+  @spec podman?(keyword()) :: boolean()
+  def podman?(opts \\ []), do: impl(opts) == Vagus.Runtime.Engine.Podman
+
+  @spec schedules_healthchecks?(keyword()) :: boolean()
+  def schedules_healthchecks?(opts \\ []) do
+    impl = impl(opts)
+
+    if Code.ensure_loaded?(impl) and function_exported?(impl, :schedules_healthchecks?, 1),
+      do: impl.schedules_healthchecks?(opts),
+      else: true
+  end
 
   defp impl(opts),
     do: opts[:engine] || Application.get_env(:vagus, :engine, Vagus.Runtime.Engine.Docker)

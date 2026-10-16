@@ -566,6 +566,20 @@ defmodule Vagus.Runtime.Engine.PodmanContractTest do
       assert Vagus.Runtime.Host.last_sample(opts[:host], "addon_local_x") == nil
     end
 
+    test "removing a container by its id forgets the sample its name keys", ctx do
+      {_fake, opts} =
+        engine(ctx, [
+          {"stats *", [{0, Leg.stats_line()}]},
+          {"container inspect *", [{0, Leg.inspect_out(Leg.running_json())}]},
+          {"rm *", [{0, ""}]}
+        ])
+
+      {:ok, _} = Engine.stats("addon_local_x", opts)
+      assert Vagus.Runtime.Host.last_sample(opts[:host], "addon_local_x") != nil
+      :ok = Engine.remove(Leg.running_json()["Id"], opts)
+      assert Vagus.Runtime.Host.last_sample(opts[:host], "addon_local_x") == nil
+    end
+
     test "a stopped container is all zeros", ctx do
       stopped = File.read!(Path.expand("../../../fixtures/podman/stats_stopped.json", __DIR__))
       {_fake, opts} = engine(ctx, [{"stats *", [{0, stopped}]}])
@@ -680,38 +694,39 @@ defmodule Vagus.Runtime.Engine.PodmanContractTest do
 
     test "a failed or killed pull empties the spool; a good one leaves it" do
       root = Path.join(System.tmp_dir!(), "podman-spool-#{System.unique_integer([:positive])}")
+      spool = Path.join(root, "storage/tmp")
+
+      # An interrupted pull's leftovers from an hour ago, made by podman
+      # itself: past the pull's preflight clear, and there before podman can
+      # answer or be killed.
+      leak = [
+        run:
+          ~s(d="#{spool}/layer-$$"; mkdir -p "$d"; touch -d @#{System.os_time(:second) - 3_600} "$d")
+      ]
 
       fake =
         FakePodman.start([
-          {"pull * docker://ghcr.io/vagus/good:1", [{0, "5b0e\n"}]},
-          {"pull * docker://ghcr.io/vagus/slow:1", [{0, "", delay_ms: 2_000}]},
-          {"pull *", [{125, "Error: initializing source docker://x: manifest unknown\n"}]}
+          {"pull * docker://ghcr.io/vagus/good:1", [{0, "5b0e\n", leak}]},
+          {"pull * docker://ghcr.io/vagus/slow:1", [{0, "", [hold: true] ++ leak}]},
+          {"pull *", [{125, "Error: initializing source docker://x: manifest unknown\n", leak}]}
         ])
 
       host = FakePodman.start_host(fake.bin, root: root)
       opts = [engine: Engine.Podman, host: host, podman_bin: fake.bin]
-      spool = Path.join(root, "storage/tmp")
 
-      # What an interrupted pull left an hour ago, and what a live one is
-      # writing now: only the first may go.
-      leak = fn ->
-        dir = Path.join(spool, "layer-#{System.unique_integer([:positive])}")
-        File.mkdir_p!(dir)
-        File.touch!(dir, System.os_time(:second) - 3_600)
-      end
-
+      # What a live pull is writing now: it stays.
       live = Path.join(spool, "live")
       File.mkdir_p!(live)
 
-      leak.()
-      :ok = Engine.pull("ghcr.io/vagus/good:1", opts)
+      assert Engine.pull("ghcr.io/vagus/good:1", opts) == :ok
       assert length(File.ls!(spool)) == 2
 
       {:error, {:pull_failed, _}} = Engine.pull("ghcr.io/vagus/bad:1", opts)
       assert File.ls!(spool) == ["live"]
 
-      leak.()
-      assert Engine.pull("ghcr.io/vagus/slow:1", [timeout_ms: 200] ++ opts) == {:error, :timeout}
+      assert Engine.pull("ghcr.io/vagus/slow:1", [timeout_ms: 1_000] ++ opts) ==
+               {:error, :timeout}
+
       assert File.ls!(spool) == ["live"]
     end
 
@@ -784,6 +799,270 @@ defmodule Vagus.Runtime.Engine.PodmanContractTest do
       assert Engine.pull("ghcr.io/vagus/x:1", opts) == {:error, :busy}
     end
 
+    test "a healthcheck refused at shutdown is :busy, and never runs podman" do
+      fake = FakePodman.start([{"healthcheck run *", [{0, ""}]}])
+      host = FakePodman.start_host(fake.bin, shutting_down?: fn -> true end)
+      opts = [engine: Engine.Podman, host: host, podman_bin: fake.bin]
+      assert Engine.healthcheck("addon_local_x", opts) == {:error, :busy}
+      refute Enum.any?(FakePodman.calls(fake), &("healthcheck" in &1))
+    end
+
+    test "a healthcheck that would take the last ops permit is skipped at once, not queued" do
+      fake = FakePodman.start([{"healthcheck run *", [{0, ""}]}])
+      host = FakePodman.start_host(fake.bin, permits: %{pull: 1, ops: 2, shutdown: 1})
+      opts = [engine: Engine.Podman, host: host, podman_bin: fake.bin, timeout_ms: 30_000]
+      {:ok, permit} = Vagus.Runtime.Host.checkout(host, :ops, 0)
+      assert Engine.healthcheck("addon_local_x", opts) == {:error, :busy}
+      Vagus.Runtime.Host.checkin(permit)
+      assert Engine.healthcheck("addon_local_x", opts) == {:ok, :healthy}
+    end
+
+    test "an unhealthy run's follow-up inspect skips rather than queue behind ops" do
+      fake =
+        FakePodman.start([
+          {"healthcheck run *", [{1, "unhealthy\n", hold: true}]},
+          {"container inspect *", [{0, Leg.inspect_out(Leg.running_json())}]}
+        ])
+
+      host = FakePodman.start_host(fake.bin, permits: %{pull: 1, ops: 2, shutdown: 1})
+      opts = [engine: Engine.Podman, host: host, podman_bin: fake.bin, timeout_ms: 20_000]
+      check = Task.async(fn -> Engine.healthcheck("addon_local_x", opts) end)
+
+      Enum.find(1..1_000, fn _ ->
+        Enum.any?(FakePodman.calls(fake), &("healthcheck" in &1)) or (Process.sleep(5) && false)
+      end) || flunk("the check never ran")
+
+      # The other permit taken, the holder queues behind the run and is
+      # handed the permit the run frees; only then does the run answer.
+      {:ok, _other} = Vagus.Runtime.Host.checkout(host, :ops, 0)
+      holder = Task.async(fn -> Vagus.Runtime.Host.checkout(host, :ops, 30_000) end)
+      await_waiter(host)
+      released = System.monotonic_time(:millisecond)
+      FakePodman.release(fake)
+
+      assert Task.await(check, 30_000) == {:error, :busy}
+      assert System.monotonic_time(:millisecond) - released < 10_000
+      refute Enum.any?(FakePodman.calls(fake), &("inspect" in &1))
+      assert {:ok, _permit} = Task.await(holder)
+    end
+
+    # The app process passes the image's declared timeout; podman's 35 s is
+    # only the default.
+    test "a healthcheck runs for the timeout_ms it is given, not a fixed deadline" do
+      fake = FakePodman.start([{"healthcheck run *", [{0, "", delay_ms: 1_000}]}])
+      host = FakePodman.start_host(fake.bin)
+      opts = [engine: Engine.Podman, host: host, podman_bin: fake.bin]
+
+      assert Engine.healthcheck("addon_local_x", [timeout_ms: 300] ++ opts) == {:error, :timeout}
+      assert Engine.healthcheck("addon_local_x", [timeout_ms: 10_000] ++ opts) == {:ok, :healthy}
+    end
+
+    test "podman? names the engine a call would use" do
+      assert Engine.podman?(engine: Engine.Podman)
+      refute Engine.podman?(engine: Vagus.Runtime.Engine.Docker)
+      refute Engine.podman?()
+    end
+
+    test "podman schedules no healthchecks; Docker does" do
+      refute Engine.schedules_healthchecks?(engine: Engine.Podman)
+      assert Engine.schedules_healthchecks?(engine: Vagus.Runtime.Engine.Docker)
+    end
+
+    test "Core's pull waits for the pull permit ahead of an app's" do
+      fake = FakePodman.start([{"pull *", [{0, "5b0e\n"}]}])
+      host = FakePodman.start_host(fake.bin)
+      opts = [engine: Engine.Podman, host: host, podman_bin: fake.bin]
+      {:ok, held} = Vagus.Runtime.Host.checkout(host, :pull, 0)
+
+      app = Task.async(fn -> Engine.pull("ghcr.io/vagus/app:1", opts) end)
+      await_waiter(host, :pull, 1)
+      core = Task.async(fn -> Engine.pull(Vagus.Core.Container.image("2026.7.3"), opts) end)
+      await_waiter(host, :pull, 2)
+
+      Vagus.Runtime.Host.checkin(held)
+      assert Task.await(core, 10_000) == :ok
+      assert Task.await(app, 10_000) == :ok
+
+      pulled = for ["pull" | args] <- FakePodman.verbs(fake), do: List.last(args)
+
+      assert pulled == [
+               "docker://ghcr.io/home-assistant/home-assistant:2026.7.3",
+               "docker://ghcr.io/vagus/app:1"
+             ]
+    end
+
+    test "the Provisioner's Core pull, through Lifecycle, also goes first" do
+      fake = FakePodman.start([{"pull *", [{0, "5b0e\n"}]}])
+      host = FakePodman.start_host(fake.bin)
+      opts = [engine: Engine.Podman, host: host, podman_bin: fake.bin]
+      {:ok, held} = Vagus.Runtime.Host.checkout(host, :pull, 0)
+
+      app = Task.async(fn -> Engine.pull("ghcr.io/vagus/app:1", opts) end)
+      await_waiter(host, :pull, 1)
+      core = Task.async(fn -> Vagus.Core.Lifecycle.pull("2026.7.3", engine_opts: opts) end)
+      await_waiter(host, :pull, 2)
+
+      Vagus.Runtime.Host.checkin(held)
+      assert Task.await(core, 10_000) == :ok
+      assert Task.await(app, 10_000) == :ok
+
+      assert [first | _] = for(["pull" | args] <- FakePodman.verbs(fake), do: List.last(args))
+      assert first == "docker://ghcr.io/home-assistant/home-assistant:2026.7.3"
+    end
+
+    test "an app's ensure-image pull the migration found no room for fails, without podman" do
+      root = Path.join(System.tmp_dir!(), "podman-nospace-#{System.unique_integer([:positive])}")
+      File.mkdir_p!(Path.join(root, "balena-engine"))
+      File.write!(Path.join(root, "mountinfo"), "")
+      on_exit(fn -> File.rm_rf(root) end)
+
+      df = fn _ ->
+        {"Filesystem 1K-blocks Used Available Use% Mounted on\n/dev/root 9999 1 10 1% /\n", 0}
+      end
+
+      fake = FakePodman.start([{"image exists *", [{1, ""}]}, {"pull *", [{0, "5b0e\n"}]}])
+
+      host =
+        FakePodman.start_host(fake.bin,
+          migration: [
+            legacy_root: Path.join(root, "balena-engine"),
+            marker: Path.join(root, "engine-migrated"),
+            config_dir: Path.join(root, "core/config"),
+            mountinfo: Path.join(root, "mountinfo"),
+            validated?: fn -> false end,
+            wanted_images: fn -> {:ok, ["ghcr.io/vagus/app:1"]} end,
+            core_image: fn -> nil end,
+            image_present?: fn _ -> false end,
+            notify: fn _ -> :ok end,
+            df: df
+          ]
+        )
+
+      spec = %Vagus.Addon.Backend.Spec{name: "addon_local_app", image: "ghcr.io/vagus/app:1"}
+      opts = [engine: Engine.Podman, host: host, podman_bin: fake.bin]
+
+      assert Vagus.Addon.Backend.Container.ensure_image(spec, opts) ==
+               {:error, {:pull, {:failed, :pull, :no_space}}}
+
+      refute Enum.any?(FakePodman.verbs(fake), &match?(["pull" | _], &1))
+    end
+
+    test "a stale spool an earlier pull left is cleared before the room check" do
+      root = Path.join(System.tmp_dir!(), "podman-stale-#{System.unique_integer([:positive])}")
+      File.mkdir_p!(Path.join(root, "balena-engine"))
+      File.write!(Path.join(root, "mountinfo"), "")
+      on_exit(fn -> File.rm_rf(root) end)
+
+      host_root = Path.join(root, "host")
+      leaked = Path.join(host_root, "storage/tmp/leaked")
+
+      # Room exists only once the leaked layers are gone.
+      df = fn _ ->
+        avail = if File.exists?(leaked), do: 10, else: 99_999_999
+
+        {"Filesystem 1K-blocks Used Available Use% Mounted on\n/dev/root 9999 1 #{avail} 1% /\n",
+         0}
+      end
+
+      fake = FakePodman.start([{"pull *", [{0, "5b0e\n"}]}])
+
+      host =
+        FakePodman.start_host(fake.bin,
+          root: host_root,
+          spool_quiet_ms: 60_000,
+          migration: [
+            legacy_root: Path.join(root, "balena-engine"),
+            marker: Path.join(root, "engine-migrated"),
+            config_dir: Path.join(root, "core/config"),
+            mountinfo: Path.join(root, "mountinfo"),
+            validated?: fn -> false end,
+            wanted_images: fn -> {:ok, ["ghcr.io/vagus/app:1"]} end,
+            core_image: fn -> nil end,
+            image_present?: fn _ -> false end,
+            notify: fn _ -> :ok end,
+            df: df
+          ]
+        )
+
+      File.mkdir_p!(leaked)
+      File.write!(Path.join(leaked, "layer"), "x")
+      hour_ago = "@#{System.os_time(:second) - 3_600}"
+      {_, 0} = System.cmd("find", [leaked, "-exec", "touch", "-h", "-d", hour_ago, "{}", "+"])
+
+      opts = [engine: Engine.Podman, host: host, podman_bin: fake.bin]
+
+      assert Engine.pull("ghcr.io/vagus/app:1", opts) == :ok
+      refute File.exists?(leaked)
+    end
+
+    test "an app asking first is refused the room Core still needs, and Core then pulls" do
+      root = Path.join(System.tmp_dir!(), "podman-room-#{System.unique_integer([:positive])}")
+      store = Path.join(root, "balena-engine/image/overlay2")
+      on_exit(fn -> File.rm_rf(root) end)
+
+      # balena holds Core as one 100 MiB layer and the app as one of 200 MiB.
+      # 350 MiB free: Core alone needs 150, the app alone 300, both 400.
+      core = Vagus.Core.Container.image("2026.7.3")
+      app = "ghcr.io/vagus/app:1"
+
+      tags =
+        for {ref, hex, size} <- [{core, "a", 100}, {app, "b", 200}], into: %{} do
+          diff = "sha256:" <> String.duplicate(hex, 64)
+          config = Jason.encode!(%{"rootfs" => %{"diff_ids" => [diff]}})
+          id = Base.encode16(:crypto.hash(:sha256, config), case: :lower)
+          File.mkdir_p!(Path.join(store, "imagedb/content/sha256"))
+          File.write!(Path.join(store, "imagedb/content/sha256/#{id}"), config)
+          layer = Path.join(store, "layerdb/sha256/" <> String.duplicate(hex, 64))
+          File.mkdir_p!(layer)
+          File.write!(Path.join(layer, "size"), "#{size * 1_048_576}")
+          {ref, "sha256:" <> id}
+        end
+
+      File.write!(
+        Path.join(store, "repositories.json"),
+        Jason.encode!(%{"Repositories" => %{"r" => tags}})
+      )
+
+      File.write!(Path.join(root, "mountinfo"), "")
+
+      df = fn _ ->
+        {"Filesystem 1K-blocks Used Available Use% Mounted on\n/dev/root 9999999 1 #{350 * 1024} 1% /\n",
+         0}
+      end
+
+      core_back = :atomics.new(1, [])
+      fake = FakePodman.start([{"pull *", [{0, "5b0e\n"}]}])
+
+      host =
+        FakePodman.start_host(fake.bin,
+          migration: [
+            legacy_root: Path.join(root, "balena-engine"),
+            marker: Path.join(root, "engine-migrated"),
+            config_dir: Path.join(root, "core/config"),
+            mountinfo: Path.join(root, "mountinfo"),
+            validated?: fn -> false end,
+            notify: fn _ -> :ok end,
+            core_image: fn -> core end,
+            image_present?: fn ref -> ref == core and :atomics.get(core_back, 1) == 1 end,
+            df: df
+          ]
+        )
+
+      opts = [engine: Engine.Podman, host: host, podman_bin: fake.bin]
+
+      # The pull permit is idle and the app asks first.
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert Engine.pull(app, opts) == {:error, {:failed, :pull, :no_space}}
+      end)
+
+      assert Engine.pull(core, opts) == :ok
+      :atomics.put(core_back, 1, 1)
+      assert Engine.pull(app, opts) == :ok
+
+      pulled = for ["pull" | args] <- FakePodman.verbs(fake), do: List.last(args)
+      assert pulled == ["docker://" <> core, "docker://" <> app]
+    end
+
     # The stop must outlast the 300 ms its permit wait may use.
     test "a stop waiting for its permit still gets its grace once granted" do
       fake = FakePodman.start([{"stop *", [{0, "addon_local_x\n", delay_ms: 1_000}]}])
@@ -800,14 +1079,30 @@ defmodule Vagus.Runtime.Engine.PodmanContractTest do
 
       assert_receive :held, 5_000
 
+      # The command gets its grace plus the margin (1.5 s here), not what
+      # `timeout_ms` left after the wait, and no more than that either.
       stop =
         Task.async(fn ->
-          Engine.stop("addon_local_x", [timeout_ms: 300, timeout_s: 0] ++ opts)
+          Engine.stop(
+            "addon_local_x",
+            [timeout_ms: 300, timeout_s: 0, stop_margin_ms: 1_500] ++ opts
+          )
         end)
 
       await_waiter(host)
       send(holder, :release)
       assert Task.await(stop, 30_000) == :ok
+    end
+
+    test "a stop past its grace and margin is cut off" do
+      fake = FakePodman.start([{"stop *", [{0, "addon_local_x\n", delay_ms: 5_000}]}])
+      host = FakePodman.start_host(fake.bin)
+      opts = [engine: Engine.Podman, host: host, podman_bin: fake.bin]
+
+      assert Engine.stop(
+               "addon_local_x",
+               [timeout_ms: 100, timeout_s: 0, stop_margin_ms: 1_000] ++ opts
+             ) == {:error, :timeout}
     end
 
     test "create refuses a port key that could name a host port, without podman" do
@@ -856,10 +1151,10 @@ defmodule Vagus.Runtime.Engine.PodmanContractTest do
     end
   end
 
-  defp await_waiter(host) do
+  defp await_waiter(host, class \\ :ops, n \\ 1) do
     Enum.find(1..1_000, fn _ ->
-      :queue.len(:sys.get_state(host).waiting.ops) == 1 or (Process.sleep(5) && false)
-    end) || flunk("the stop never queued for its permit")
+      :queue.len(:sys.get_state(host).waiting[class]) == n or (Process.sleep(5) && false)
+    end) || flunk("no #{n} #{class} waiter(s) queued")
   end
 
   describe "exec exit codes" do
@@ -888,9 +1183,15 @@ defmodule Vagus.Runtime.Engine.PodmanContractTest do
 
   test "the readiness of a Host still preparing is :unavailable" do
     fake = FakePodman.start([])
+    test_pid = self()
 
-    host =
-      FakePodman.start_host(fake.bin, await: false, probe: fn _ -> Process.sleep(:infinity) end)
+    # Answers once the test is over, so the probe task ends with it.
+    probe = fn _opts ->
+      ref = Process.monitor(test_pid)
+      receive do: ({:DOWN, ^ref, :process, _pid, _reason} -> {:error, :gone})
+    end
+
+    host = FakePodman.start_host(fake.bin, await: false, probe: probe)
 
     assert Engine.ready(engine: Engine.Podman, host: host) == {:error, :unavailable}
   end

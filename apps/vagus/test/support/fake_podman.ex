@@ -6,8 +6,12 @@ defmodule Vagus.Test.FakePodman do
   Rules match the argv after podman's global flags, joined by spaces, as a
   shell glob (`"container inspect *"`); the first matching rule answers.
   Each rule holds responses used in order, the last one repeating:
-  `{exit_status, output}`, or `{exit_status, output, delay_ms: n}`. An
-  output of `:killed` makes the fake SIGKILL itself. `info` answers 0
+  `{exit_status, output}`, or `{exit_status, output, delay_ms: n}`. With
+  `hold: true` the response waits until the test calls `release/1`, so a
+  call stays in flight for exactly as long as the test needs. `run:` is a
+  shell command the invocation runs before any delay or hold: a side effect
+  that has happened by the time podman can answer or be killed. An output of
+  `:killed` makes the fake SIGKILL itself. `info` answers 0
   unless a rule says otherwise; anything unscripted exits 125.
 
   Every invocation is logged: `calls/1` returns each argv (globals
@@ -29,22 +33,32 @@ defmodule Vagus.Test.FakePodman do
     File.write!(bin, """
     #!/bin/sh
     dir=#{dir}
-    printf '%s\\037' "$@" >> "$dir/calls"
-    printf '\\n' >> "$dir/calls"
-    for kv in #{log_env}; do printf '%s\\037' "$kv" >> "$dir/envs"; done
-    printf '\\n' >> "$dir/envs"
+    # One write per line, so lines of concurrent calls never interleave.
+    line=$(printf '%s\\037' "$@")
+    printf '%s\\n' "$line" >> "$dir/calls"
+    envs=""
+    for kv in #{log_env}; do envs="$envs$(printf '%s\\037' "$kv")"; done
+    printf '%s\\n' "$envs" >> "$dir/envs"
     while :; do
       case "$1" in
         --log-level=*|--transient-store) shift ;;
         *) break ;;
       esac
     done
+    # The rule's counter is read and bumped under a lock (mkdir is atomic),
+    # so concurrent calls each take their own response.
     answer() {
+      until mkdir "$dir/r$1.lock" 2>/dev/null; do :; done
       n=$(cat "$dir/r$1.n" 2>/dev/null || echo 0)
       n=$((n + 1))
       [ "$n" -gt "$2" ] && n=$2
       echo "$n" > "$dir/r$1.n"
+      rmdir "$dir/r$1.lock"
+      [ -f "$dir/r$1.$n.run" ] && . "$dir/r$1.$n.run"
       [ -f "$dir/r$1.$n.delay" ] && sleep "$(cat "$dir/r$1.$n.delay")"
+      if [ -f "$dir/r$1.$n.hold" ]; then
+        while [ ! -e "$dir/release" ]; do sleep 0.02; done
+      fi
       [ -f "$dir/r$1.$n.kill" ] && kill -9 $$
       cat "$dir/r$1.$n.out"
       exit "$(cat "$dir/r$1.$n.code")"
@@ -80,7 +94,12 @@ defmodule Vagus.Test.FakePodman do
     if output == :killed, do: File.write!(base <> ".kill", "")
     File.write!(base <> ".out", if(output == :killed, do: "", else: output))
     if ms = opts[:delay_ms], do: File.write!(base <> ".delay", to_string(ms / 1000))
+    if opts[:hold], do: File.write!(base <> ".hold", "")
+    if run = opts[:run], do: File.write!(base <> ".run", run)
   end
+
+  @doc "Lets every held response answer, now and from here on."
+  def release(%__MODULE__{dir: dir}), do: File.write!(Path.join(dir, "release"), "")
 
   def calls(%__MODULE__{dir: dir}), do: read_log(dir, "calls")
   def envs(%__MODULE__{dir: dir}), do: read_log(dir, "envs")
@@ -131,7 +150,13 @@ defmodule Vagus.Test.FakePodman do
           name_servers: fn -> [] end,
           run: fn _bin, _args -> {"", 0} end,
           shutting_down?: fn -> false end,
-          prep_retry_ms: 60_000
+          prep_retry_ms: 60_000,
+          migration: [
+            legacy_root: Path.join(root, "balena-engine"),
+            marker: Path.join(root, "engine-migrated"),
+            config_dir: Path.join(root, "core/config"),
+            notify: fn _ -> :ok end
+          ]
         ],
         opts
       )

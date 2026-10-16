@@ -14,7 +14,7 @@ defmodule Vagus.Network.Nat do
   (`Vagus.Core.Container`). Neither is configurable, so the port has to be
   served — by a destination rewrite rather than a listener.
 
-  ## The rules
+  ## Under balena-engine: an own chain
 
   Everything lives in an own chain (`VAGUS_NAT`) so it can be asserted,
   inspected and torn down without touching balena-engine's chains, which
@@ -34,10 +34,23 @@ defmodule Vagus.Network.Nat do
   host-network add-on, host process); a `PREROUTING`-only rule silently
   serves the bridged case and breaks Core.
 
-  `iptables-legacy` — not `iptables`/`nft` — is the binary: the target
-  systems are built without nftables (`shared/linux-containers.config`) and
-  ship the legacy userland via `vagus-balena-engine`. balena-engine itself
-  runs `--iptables=true` against the same legacy tables.
+  `iptables-legacy` is the binary under balena-engine, which runs
+  `--iptables=true` against the same legacy tables.
+
+  ## Under podman: one nft table
+
+  The podman system image ships no iptables. netavark keeps its own rules in
+  `table inet netavark` and never touches another table, so the same match
+  lives in Vagus's own `table ip vagus`, with a nat chain on each of the two
+  hooks above (`ruleset/1`). Both chains sit at priority -110, ahead of
+  netavark's DNAT (`dstnat`, -100): an app publishing host port 80 would
+  otherwise take `172.30.32.2:80` too, since netavark's port DNAT matches
+  every local address. At -100 the winner depends on which table loaded
+  first.
+
+  The table is loaded with one `nft -f`, which the kernel applies as a single
+  transaction, and the file starts by declaring and flushing the table, so a
+  reload replaces the rules instead of adding to them.
 
   ## Idempotence
 
@@ -55,8 +68,8 @@ defmodule Vagus.Network.Nat do
 
   Gated by `config :vagus, :supervisor_nat` (only `config/target.exs` sets
   it), the same target-only convention as `:ingress_source_ip` — `:host` and
-  `mix test` have neither a `172.30.32.2` nor an `iptables-legacy`, and
-  `ensure/1` is a no-op that shells out to nothing there.
+  `mix test` have neither a `172.30.32.2` nor the tools, and `ensure/1` is a
+  no-op that shells out to nothing there.
   """
 
   require Logger
@@ -77,6 +90,13 @@ defmodule Vagus.Network.Nat do
   @jump_chains ["PREROUTING", "OUTPUT"]
 
   @default_port 8888
+
+  @nft_table "vagus"
+  # Ahead of netavark's DNAT at -100; see the moduledoc.
+  @nft_priority -110
+  # nft -f is one netlink transaction and takes no lock, so it answers at once
+  # or not at all.
+  @nft_timeout_ms 10_000
 
   @doc "Whether DNAT management is switched on (`config :vagus, :supervisor_nat`)."
   @spec enabled?() :: boolean()
@@ -99,13 +119,18 @@ defmodule Vagus.Network.Nat do
       `config :vagus, :api_bind_ip`, else `Vagus.Network.supervisor_ip/0`)
     * `:port` — the port to rewrite to (default `config :vagus, :api_port`)
     * `:cmd` — 2-arity command runner `(binary, args) -> {output, status}`
+    * `:engine` — the engine adapter (default `config :vagus, :engine`);
+      `Vagus.Runtime.Engine.Podman` selects nft, as `:host_bridge` does
+      (`Vagus.Network.host_bridge?/1`)
+    * `:nft_dir` — where the ruleset file is written for `nft -f`
+      (default `/run/vagus`)
   """
   @spec ensure(keyword()) :: :ok | {:error, term()}
   def ensure(opts \\ []) do
-    if Keyword.get(opts, :enabled, enabled?()) do
-      with {:ok, rule} <- dnat_rule(opts), do: apply_rules(rule, runner(opts))
-    else
-      :ok
+    cond do
+      not Keyword.get(opts, :enabled, enabled?()) -> :ok
+      nft?(opts) -> with {:ok, text} <- ruleset(opts), do: load_nft(text, opts)
+      true -> with {:ok, rule} <- dnat_rule(opts), do: apply_rules(rule, runner(opts))
     end
   end
 
@@ -117,10 +142,40 @@ defmodule Vagus.Network.Nat do
   """
   @spec teardown(keyword()) :: :ok | {:error, term()}
   def teardown(opts \\ []) do
-    if Keyword.get(opts, :enabled, enabled?()) do
-      remove_rules(runner(opts))
-    else
-      :ok
+    cond do
+      not Keyword.get(opts, :enabled, enabled?()) -> :ok
+      # Declaring the table first makes the delete succeed when it is absent.
+      nft?(opts) -> load_nft("table ip #{@nft_table}\ndelete table ip #{@nft_table}\n", opts)
+      true -> remove_rules(runner(opts))
+    end
+  end
+
+  @doc """
+  The nft ruleset `ensure/1` loads under podman: it creates the table when
+  absent and flushes it before declaring the chains, so loading it again
+  leaves exactly one copy of each rule. Same match as `dnat_rule/1`.
+  """
+  @spec ruleset(keyword()) :: {:ok, String.t()} | {:error, term()}
+  def ruleset(opts \\ []) do
+    with {:ok, ip} <- target_ip(opts),
+         {:ok, port} <- target_port(opts) do
+      rule = "ip daddr #{ip} tcp dport #{@contract_port} dnat to #{ip}:#{port}"
+
+      {:ok,
+       """
+       table ip #{@nft_table}
+       flush table ip #{@nft_table}
+       table ip #{@nft_table} {
+       \tchain prerouting {
+       \t\ttype nat hook prerouting priority #{@nft_priority}; policy accept;
+       \t\t#{rule}
+       \t}
+       \tchain output {
+       \t\ttype nat hook output priority #{@nft_priority}; policy accept;
+       \t\t#{rule}
+       \t}
+       }
+       """}
     end
   end
 
@@ -264,6 +319,49 @@ defmodule Vagus.Network.Nat do
     end)
   end
 
+  ## nft
+
+  defp nft?(opts), do: Network.host_bridge?(opts)
+
+  # A file rather than `-f -`: neither System.cmd nor MuonTrap can close a
+  # child's stdin, which nft needs to see the end of the ruleset. One file per
+  # call, so two concurrent loads never read each other's half-written text,
+  # created exclusively so nothing placed there beforehand is written through.
+  # The directory is tmpfs owned by root (0700, made by the Host's
+  # preparation), never request input.
+  # sobelow_skip ["Traversal.FileModule"]
+  defp load_nft(text, opts) do
+    dir = Keyword.get(opts, :nft_dir, "/run/vagus")
+    path = Path.join(dir, "vagus-nat-#{System.unique_integer([:positive])}.nft")
+
+    with :ok <- File.mkdir_p(dir),
+         :ok <- File.write(path, text, [:exclusive]) do
+      try do
+        run(Keyword.get(opts, :cmd, &nft_cmd/2), "nft", ["-f", path])
+      after
+        File.rm(path)
+      end
+    else
+      {:error, reason} ->
+        Logger.warning("Vagus.Network.Nat: #{path} not written: #{inspect(reason)}")
+        {:error, {:nft_file, reason}}
+    end
+  end
+
+  # Bounded unlike the iptables path: a stuck call would hold the boot gate,
+  # and an abandoned nft still finishes or fails its one transaction alone.
+  # Not MuonTrap.cmd/3, whose output acks can race the child's exit and kill
+  # the caller with `:epipe` (see `Vagus.Runtime.Podman.Cmd`).
+  @doc false
+  @spec nft_cmd(String.t(), [String.t()]) :: {String.t(), non_neg_integer()}
+  def nft_cmd(bin, args) do
+    case Vagus.BoundedCall.run(fn -> Vagus.Host.Cmd.run(bin, args) end, @nft_timeout_ms) do
+      {out, status} when is_binary(out) -> {out, status}
+      {:error, :attempt_timeout} -> {"#{bin}: no answer in #{@nft_timeout_ms} ms", 124}
+      {:error, {:exit, reason}} -> {"#{bin}: #{inspect(reason)}", 1}
+    end
+  end
+
   ## Invocation
 
   # A probe: `-C`/`-S` answer "is it there" with the exit status, and a
@@ -272,14 +370,16 @@ defmodule Vagus.Network.Nat do
     match?({_out, 0}, cmd.(@binary, args))
   end
 
-  defp run(cmd, args) do
-    case cmd.(@binary, args) do
+  defp run(cmd, args), do: run(cmd, @binary, args)
+
+  defp run(cmd, bin, args) do
+    case cmd.(bin, args) do
       {_out, 0} ->
         :ok
 
       {out, status} ->
         Logger.warning(
-          "Vagus.Network.Nat: #{@binary} #{Enum.join(args, " ")} failed (#{status}): " <>
+          "Vagus.Network.Nat: #{bin} #{Enum.join(args, " ")} failed (#{status}): " <>
             String.trim(out)
         )
 

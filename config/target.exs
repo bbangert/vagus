@@ -149,8 +149,9 @@ config :vagus, :api_port, 8888
 config :vagus, :api_bind_ip, "172.30.32.2"
 
 # DNAT management for the port-80 add-on contract above
-# (`Vagus.Network.Nat`). Target-only: :host/:test have neither a
-# 172.30.32.2 nor an `iptables-legacy`.
+# (`Vagus.Network.Nat`): iptables-legacy under balena-engine, an nft table
+# under podman. Target-only: :host/:test have neither a 172.30.32.2 nor
+# those tools.
 config :vagus, :supervisor_nat, true
 config :vagus, :token_path, "/data/vagus/token"
 

@@ -12,6 +12,8 @@ defmodule Vagus.Runtime.Engine.Fake do
   `calls/1` logs each callback as `{verb, args}`; `call_opts/1` logs the same
   calls as `{verb, opts}`, without the dispatch keys.
   `fail_next(fake, :stop, e)` also fails the next stop inside `stop_all/3`.
+  `schedules_healthchecks: false` in a call's opts makes it answer as podman
+  does; `set_health/3` sets what `healthcheck/2` reports.
   `delay_next(fake, verb, ms)` makes the next call of `verb` take `ms`: one
   given a smaller `timeout_ms` is `:timeout` and changes nothing; no call
   actually sleeps.
@@ -85,6 +87,10 @@ defmodule Vagus.Runtime.Engine.Fake do
 
     entry = Map.merge(%{container: container, spec: nil, logs: "", stats: nil, exec: nil}, extras)
     Agent.update(fake, &put_in(&1, [:containers, name], entry))
+  end
+
+  def set_health(fake, name, health) do
+    Agent.update(fake, &put_in(&1, [:containers, name, :container, Access.key!(:health)], health))
   end
 
   def set_state(fake, name, state) do
@@ -315,6 +321,11 @@ defmodule Vagus.Runtime.Engine.Fake do
 
   @impl true
   def event_source, do: __MODULE__.EventSource
+
+  # Docker's answer unless a call says otherwise, so one test can stand in
+  # for podman.
+  @impl true
+  def schedules_healthchecks?(opts), do: Keyword.get(opts, :schedules_healthchecks, true)
 
   @impl true
   def ensure_network(%NetworkSpec{name: net} = spec, opts) do

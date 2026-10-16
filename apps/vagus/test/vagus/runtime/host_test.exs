@@ -1,6 +1,8 @@
 defmodule Vagus.Runtime.HostTest do
   use ExUnit.Case, async: true
 
+  import ExUnit.CaptureLog
+
   alias Vagus.Runtime.Host
   alias Vagus.Runtime.Podman.Cmd
   alias Vagus.Test.FakePodman
@@ -49,9 +51,21 @@ defmodule Vagus.Runtime.HostTest do
         send(test, {:step, :probe})
         :ok
       end,
-      shutting_down?: fn -> false end
+      shutting_down?: fn -> false end,
+      # A tree with no balena in it: no migration.
+      migration: migration_paths(ctx.root)
     ]
     |> Keyword.merge(extra)
+  end
+
+  defp migration_paths(root) do
+    [
+      legacy_root: Path.join(root, "root/balena-engine"),
+      marker: Path.join(root, "root/vagus/engine-migrated"),
+      config_dir: Path.join(root, "root/vagus/core/config"),
+      mountinfo: Path.join(root, "no-mounts"),
+      notify: fn _ -> :ok end
+    ]
   end
 
   defp start_host(ctx, extra \\ []) do
@@ -106,6 +120,12 @@ defmodule Vagus.Runtime.HostTest do
 
       start_host(ctx, probe: probe)
       assert_receive {:at_probe, true, true, true}, 5_000
+    end
+
+    test "makes /run/vagus readable by Vagus alone", ctx do
+      start_host(ctx)
+      %File.Stat{mode: mode} = File.stat!(Path.join(ctx.root, "run/vagus"))
+      assert Bitwise.band(mode, 0o777) == 0o700
     end
 
     test "is :preparing until the probe answers", ctx do
@@ -433,10 +453,36 @@ defmodule Vagus.Runtime.HostTest do
     |> length()
   end
 
+  # Each waiter is queued when the Host replies :queued to it; the Host's
+  # sends are traced, so the test wakes on those replies instead of polling.
   defp await_waiters(host, class, n) do
-    Enum.find(1..1_000, fn _ ->
-      :queue.len(:sys.get_state(host).waiting[class]) == n or (Process.sleep(5) && false)
-    end) || flunk("no #{n} #{class} waiter(s) queued")
+    pid = Process.whereis(host)
+    :erlang.trace(pid, true, [:send])
+
+    try do
+      await_queued(host, class, n)
+    after
+      :erlang.trace(pid, false, [:send])
+      flush_traces()
+    end
+  end
+
+  defp await_queued(host, class, n) do
+    unless :queue.len(:sys.get_state(host).waiting[class]) >= n do
+      receive do
+        {:trace, _, :send, {_tag, :queued}, _to} -> await_queued(host, class, n)
+      after
+        5_000 -> flunk("no #{n} #{class} waiter(s) queued")
+      end
+    end
+  end
+
+  defp flush_traces do
+    receive do
+      {:trace, _, _, _, _} -> flush_traces()
+    after
+      0 -> :ok
+    end
   end
 
   describe "permits" do
@@ -509,6 +555,93 @@ defmodule Vagus.Runtime.HostTest do
       assert {:ok, _} = Host.checkout(ctx.name, :shutdown, 0)
     end
 
+    test "a health check takes an ops permit, and never queues behind a full pool", ctx do
+      start_host(ctx)
+      {:ok, health} = Host.checkout(ctx.name, :health, 0)
+      {:ok, _ops} = Host.checkout(ctx.name, :ops, 0)
+      assert Host.checkout(ctx.name, :ops, 0) == {:error, :busy}
+      assert Host.checkout(ctx.name, :health, 10_000) == {:error, :busy}
+      assert :queue.is_empty(:sys.get_state(ctx.name).waiting.ops)
+      Host.checkin(health)
+      assert {:ok, _} = Host.checkout(ctx.name, :ops, 1_000)
+    end
+
+    test "a zero wait still gets a permit from a Host slow to answer", ctx do
+      start_host(ctx)
+      host = Process.whereis(ctx.name)
+      test = self()
+
+      caller =
+        spawn(fn ->
+          receive do: (:go -> send(test, {:result, Host.checkout(ctx.name, :ops, 0)}))
+        end)
+
+      # Held until its request is queued at the Host, well past a millisecond.
+      :sys.suspend(host)
+      :erlang.trace(caller, true, [:send])
+      send(caller, :go)
+
+      assert_receive {:trace, ^caller, :send, {:"$gen_call", _, {:acquire, :ops, _, _}}, ^host},
+                     5_000
+
+      :erlang.trace(caller, false, [:send])
+      Process.sleep(20)
+      :sys.resume(host)
+      assert_receive {:result, {:ok, _}}, 5_000
+    end
+
+    test "a health check never takes the last ops permit", ctx do
+      start_host(ctx)
+      {:ok, ops} = Host.checkout(ctx.name, :ops, 0)
+      assert Host.checkout(ctx.name, :health, 0) == {:error, :busy}
+      assert {:ok, last} = Host.checkout(ctx.name, :ops, 0)
+      Host.checkin(last)
+      Host.checkin(ops)
+      _ = :sys.get_state(ctx.name)
+      assert {:ok, health} = Host.checkout(ctx.name, :health, 0)
+      assert Host.checkout(ctx.name, :health, 0) == {:error, :busy}
+      Host.checkin(health)
+    end
+
+    test "Core's pull waits ahead of an app's queued before it", ctx do
+      start_host(ctx)
+      test = self()
+      {:ok, held} = Host.checkout(ctx.name, :pull, 0)
+
+      waiter = fn as, opts ->
+        Task.async(fn ->
+          result = Host.checkout(ctx.name, :pull, 30_000, opts)
+          send(test, {:granted, as})
+          receive do: (:release -> Host.checkin(elem(result, 1)))
+        end)
+      end
+
+      app = waiter.(:app, [])
+      await_waiters(ctx.name, :pull, 1)
+      core = waiter.(:core, priority: true)
+      await_waiters(ctx.name, :pull, 2)
+
+      Host.checkin(held)
+      assert_receive {:granted, :core}, 5_000
+      refute_received {:granted, :app}
+      send(core.pid, :release)
+      assert_receive {:granted, :app}, 5_000
+      send(app.pid, :release)
+      Enum.each([app, core], &Task.await/1)
+    end
+
+    test "new health checks and pulls are refused once a shutdown is in flight", ctx do
+      flag = :atomics.new(1, [])
+      start_host(ctx, shutting_down?: fn -> :atomics.get(flag, 1) == 1 end)
+      assert {:ok, health} = Host.checkout(ctx.name, :health, 0)
+      Host.checkin(health)
+      :atomics.put(flag, 1, 1)
+      assert Host.checkout(ctx.name, :health, 0) == {:error, :shutting_down}
+      assert Host.checkout(ctx.name, :pull, 0) == {:error, :shutting_down}
+      assert {:ok, _} = Host.checkout(ctx.name, :ops, 0)
+      assert {:ok, _} = Host.checkout(ctx.name, :shutdown, 0)
+    end
+
     test "a queued pull is refused once a shutdown has begun", ctx do
       flag = :atomics.new(1, [])
       start_host(ctx, shutting_down?: fn -> :atomics.get(flag, 1) == 1 end)
@@ -536,15 +669,22 @@ defmodule Vagus.Runtime.HostTest do
       await_waiters(ctx.name, :ops, 1)
 
       old = Process.whereis(ctx.name)
+
+      [supervisor | _] =
+        Process.info(old, :dictionary) |> elem(1) |> Keyword.fetch!(:"$ancestors")
+
       Process.exit(old, :kill)
       assert Task.await(waiter, 5_000) == {:error, :unavailable}
 
-      # The test supervisor restarts it; the new Host serves new requests.
-      assert Enum.find(1..1_000, fn _ ->
-               (Process.whereis(ctx.name) || old) != old or (Process.sleep(5) && false)
-             end)
+      # The test supervisor restarts it as it handles the exit, so its
+      # answer to a call made after shows the new Host.
+      assert {_, new, _, _} = List.keyfind(Supervisor.which_children(supervisor), ctx.name, 0)
+      assert is_pid(new) and new != old
 
-      assert {:ok, _} = Host.checkout(ctx.name, :ops, 5_000)
+      # Its preparation runs before it reads a request, and a loaded runner
+      # can stretch that past a checkout's 5 s; ready, it answers at once.
+      assert await_ready(ctx.name, true) == :ok
+      assert {:ok, _} = Host.checkout(ctx.name, :ops, 0)
     end
 
     test "an unknown class is :badarg and the Host lives on", ctx do
@@ -558,6 +698,421 @@ defmodule Vagus.Runtime.HostTest do
 
     test "no Host is :unavailable" do
       assert Host.checkout(:no_such_host, :ops, 0) == {:error, :unavailable}
+    end
+  end
+
+  describe "the balena migration" do
+    @core "ghcr.io/home-assistant/home-assistant:2026.7.3"
+
+    setup ctx do
+      legacy = Path.join(ctx.root, "root/balena-engine")
+      File.mkdir_p!(Path.join(legacy, "volumes/vagus-core-config/_data"))
+      File.write!(Path.join(ctx.root, "no-mounts"), "")
+      %{legacy: legacy, legacy_config: Path.join(legacy, "volumes/vagus-core-config/_data")}
+    end
+
+    defp df(free_mib) do
+      fn _path ->
+        {"Filesystem 1K-blocks Used Available Use% Mounted on\n" <>
+           "/dev/root 99999999 1 #{free_mib * 1024} 1% /root\n", 0}
+      end
+    end
+
+    # Every condition holds and the images fit unless `extra` says otherwise.
+    defp migration(ctx, extra) do
+      Keyword.merge(
+        migration_paths(ctx.root) ++
+          [
+            validated?: fn -> true end,
+            wanted_images: fn -> {:ok, [@core]} end,
+            image_present?: fn _ -> true end,
+            core_healthy?: fn -> true end,
+            notify: fn _ -> :ok end,
+            df: df(10_000)
+          ],
+        extra
+      )
+    end
+
+    # Each check task stops at its first look at the images until the test
+    # sends :go, and every check's result comes back as {:checked, result}:
+    # the test sets the pace.
+    defp stepped(ctx, extra, host_extra \\ []) do
+      test = self()
+
+      wanted = fn ->
+        unless Process.get(:stepped) do
+          send(test, {:check, self()})
+          receive do: (:go -> Process.put(:stepped, true))
+        end
+
+        {:ok, [@core]}
+      end
+
+      start_host(
+        ctx,
+        Keyword.merge(
+          [
+            migration_check_ms: 1,
+            on_migration_checked: &send(test, {:checked, &1}),
+            migration: migration(ctx, [wanted_images: wanted] ++ extra)
+          ],
+          host_extra
+        )
+      )
+    end
+
+    defp next_check do
+      assert_receive {:check, task}, 5_000
+      send(task, :go)
+      assert_receive {:checked, result}, 5_000
+      result
+    end
+
+    test "only the first preparation of a boot moves Core's config", ctx do
+      valid = :atomics.new(1, [])
+      validated? = fn -> :atomics.get(valid, 1) == 1 end
+
+      opts = [
+        migration: migration(ctx, validated?: validated?, image_present?: fn _ -> false end)
+      ]
+
+      start_host(ctx, opts)
+      assert File.dir?(ctx.legacy_config)
+
+      # Validated later in the same boot, then the Host restarts.
+      :atomics.put(valid, 1, 1)
+      stop_supervised!(ctx.name)
+      start_host(ctx, opts)
+      assert File.dir?(ctx.legacy_config)
+
+      # The next boot starts with an empty /run.
+      stop_supervised!(ctx.name)
+      File.rm_rf!(Path.join(ctx.root, "run"))
+      start_host(ctx, opts)
+      refute File.exists?(ctx.legacy_config)
+      assert File.dir?(Path.join(ctx.root, "root/vagus/core/config"))
+    end
+
+    test "a failed move is tried again by the next preparation of the same boot", ctx do
+      # A file where the new config's parent goes makes the move fail.
+      blocker = Path.join(ctx.root, "root/vagus/core")
+      File.mkdir_p!(Path.dirname(blocker))
+      File.write!(blocker, "")
+      opts = [migration: migration(ctx, image_present?: fn _ -> false end)]
+
+      capture_log(fn -> start_host(ctx, opts) end)
+      assert File.dir?(ctx.legacy_config)
+
+      File.rm!(blocker)
+      stop_supervised!(ctx.name)
+      start_host(ctx, opts)
+      refute File.exists?(ctx.legacy_config)
+    end
+
+    test "publishes its options for pulls while pending, and nil once done", ctx do
+      healthy = :atomics.new(1, [])
+      stepped(ctx, core_healthy?: fn -> :atomics.get(healthy, 1) == 1 end)
+      assert Host.migration(ctx.name)[:legacy_root] == ctx.legacy
+
+      assert %{cleanup: {:waiting, :core_healthy}} = next_check()
+      :atomics.put(healthy, 1, 1)
+      assert %{cleanup: :done} = next_check()
+
+      state = :sys.get_state(ctx.name)
+      assert state.migration == nil
+      assert state.migration_timer == nil
+      assert Host.migration(ctx.name) == nil
+      refute File.exists?(ctx.legacy)
+      assert File.exists?(Path.join(ctx.root, "root/vagus/engine-migrated"))
+    end
+
+    test "a deletion that keeps failing is checked again less and less often", ctx do
+      mountinfo = Path.join(ctx.root, "mounted")
+      File.write!(mountinfo, "40 22 0:50 / #{ctx.legacy}/x rw - tmpfs t rw\n")
+
+      capture_log(fn ->
+        stepped(ctx, [mountinfo: mountinfo], migration_check_ms: 1_000)
+        assert %{cleanup: {:error, {:mounted, _}}} = next_check()
+        {timer, tag} = :sys.get_state(ctx.name).migration_timer
+        first = Process.read_timer(timer)
+        send(ctx.name, {:migration_check, tag})
+        assert %{cleanup: {:error, {:mounted, _}}} = next_check()
+        {timer, _tag} = :sys.get_state(ctx.name).migration_timer
+        second = Process.read_timer(timer)
+
+        assert first > 1_000 and first <= 2_000
+        assert second > 2_000 and second <= 4_000
+      end)
+    end
+
+    test "logs what it waits on when that changes, not at every check", ctx do
+      healthy = :atomics.new(1, [])
+      present = :atomics.new(1, [])
+
+      log =
+        capture_log(fn ->
+          stepped(ctx,
+            image_present?: fn _ -> :atomics.get(present, 1) == 1 end,
+            core_healthy?: fn -> :atomics.get(healthy, 1) == 1 end
+          )
+
+          for _ <- 1..3, do: assert(%{cleanup: {:waiting, :images}} = next_check())
+          :atomics.put(present, 1, 1)
+          assert %{cleanup: {:waiting, :core_healthy}} = next_check()
+          :atomics.put(healthy, 1, 1)
+          assert %{cleanup: :done} = next_check()
+        end)
+
+      assert length(String.split(log, "waits on images")) == 2
+      assert length(String.split(log, "waits on core_healthy")) == 2
+    end
+
+    test "tells Home Assistant once while the images do not fit, and dismisses it after",
+         ctx do
+      test = self()
+      free = :atomics.new(1, [])
+      :atomics.put(free, 1, 10)
+
+      df = fn path -> df(:atomics.get(free, 1)).(path) end
+      notify = &(send(test, {:notify, &1}) && :ok)
+
+      capture_log(fn ->
+        stepped(ctx,
+          validated?: fn -> false end,
+          image_present?: fn _ -> false end,
+          df: df,
+          notify: fn event -> notify.(event) end
+        )
+
+        assert %{notice: %{need: _, free: _}} = next_check()
+        assert_received {:notify, {:raise, _need, free_bytes}}
+        assert free_bytes == 10 * 1_048_576
+
+        assert %{notice: %{}} = next_check()
+        refute_received {:notify, _}
+
+        :atomics.put(free, 1, 100_000)
+        assert %{notice: nil} = next_check()
+        assert_received {:notify, :dismiss}
+      end)
+    end
+
+    test "a restart before the cleanup still dismisses a warning shown before it", ctx do
+      test = self()
+      free = :atomics.new(1, [])
+      :atomics.put(free, 1, 10)
+      df = fn path -> df(:atomics.get(free, 1)).(path) end
+      notify = &(send(test, {:notify, &1}) && :ok)
+
+      capture_log(fn ->
+        opts = [
+          validated?: fn -> false end,
+          image_present?: fn _ -> false end,
+          df: df,
+          notify: fn event -> notify.(event) end
+        ]
+
+        stepped(ctx, opts, migration_check_ms: 60_000)
+        assert %{notice: %{}} = next_check()
+        assert_received {:notify, {:raise, _, _}}
+
+        stop_supervised!(ctx.name)
+        :atomics.put(free, 1, 100_000)
+        stepped(ctx, opts, migration_check_ms: 60_000)
+
+        assert %{cleanup: {:waiting, :validated}, notice: nil} = next_check()
+        assert_received {:notify, :dismiss}
+      end)
+    end
+
+    test "a notification Home Assistant did not take is tried again", ctx do
+      test = self()
+      up = :atomics.new(1, [])
+
+      notify = fn event ->
+        send(test, {:notify, event})
+        if :atomics.get(up, 1) == 1, do: :ok, else: {:error, :noproc}
+      end
+
+      capture_log(fn ->
+        stepped(ctx,
+          validated?: fn -> false end,
+          image_present?: fn _ -> false end,
+          df: df(10),
+          notify: notify
+        )
+
+        assert %{notice: :unknown} = next_check()
+        assert_received {:notify, {:raise, _, _}}
+        :atomics.put(up, 1, 1)
+        assert %{notice: %{}} = next_check()
+        assert_received {:notify, {:raise, _, _}}
+      end)
+    end
+
+    test "a check message from a timer no longer armed is ignored", ctx do
+      stepped(ctx, [core_healthy?: fn -> false end], migration_check_ms: 60_000)
+      assert %{cleanup: {:waiting, :core_healthy}} = next_check()
+      {_timer, tag} = :sys.get_state(ctx.name).migration_timer
+
+      send(ctx.name, {:migration_check, make_ref()})
+      assert %{migration_task: nil, migration_timer: {_, ^tag}} = :sys.get_state(ctx.name)
+      refute_received {:check, _}
+
+      send(ctx.name, {:migration_check, tag})
+      assert_receive {:check, _task}, 5_000
+    end
+
+    test "stays until Home Assistant has dismissed the warning, after the deletion", ctx do
+      test = self()
+      up = :atomics.new(1, [])
+      :atomics.put(up, 1, 1)
+
+      notify = fn event ->
+        send(test, {:notify, event})
+        if :atomics.get(up, 1) == 1, do: :ok, else: {:error, :core_down}
+      end
+
+      # Short of room throughout; a mount inside the store holds the
+      # deletion back at first.
+      mountinfo = Path.join(ctx.root, "mounts")
+      File.write!(mountinfo, "40 22 0:50 / #{ctx.legacy}/x rw - tmpfs t rw\n")
+
+      capture_log(fn ->
+        stepped(
+          ctx,
+          [image_present?: fn _ -> false end, df: df(10), mountinfo: mountinfo, notify: notify],
+          migration_check_ms: 60_000
+        )
+
+        assert %{cleanup: {:error, {:mounted, _}}, notice: %{}} = next_check()
+        assert_received {:notify, {:raise, _, _}}
+
+        # The deletion goes through, but Core is down for the dismissal.
+        File.write!(mountinfo, "")
+        :atomics.put(up, 1, 0)
+        send(ctx.name, {:migration_check, elem(:sys.get_state(ctx.name).migration_timer, 1)})
+        assert %{cleanup: :done, notice: %{}} = next_check()
+        refute File.exists?(ctx.legacy)
+        assert %{migration: [_ | _], migration_timer: {_, _}} = :sys.get_state(ctx.name)
+
+        # With the store gone no check looks at the images, so none is stepped.
+        :atomics.put(up, 1, 1)
+        send(ctx.name, {:migration_check, elem(:sys.get_state(ctx.name).migration_timer, 1)})
+        assert_receive {:checked, %{cleanup: :done, notice: nil}}, 5_000
+        assert_received {:notify, :dismiss}
+        assert %{migration: nil, migration_timer: nil} = :sys.get_state(ctx.name)
+      end)
+    end
+
+    test "cleanup failures before the deletion do not use up the dismissal's tries", ctx do
+      test = self()
+
+      notify = fn
+        :dismiss -> send(test, {:notify, :dismiss}) && {:error, :core_down}
+        _raise -> :ok
+      end
+
+      mountinfo = Path.join(ctx.root, "mounts")
+      File.write!(mountinfo, "40 22 0:50 / #{ctx.legacy}/x rw - tmpfs t rw\n")
+
+      log =
+        capture_log(fn ->
+          stepped(ctx,
+            image_present?: fn _ -> false end,
+            df: df(10),
+            mountinfo: mountinfo,
+            notify: notify
+          )
+
+          for _ <- 1..7, do: assert(%{cleanup: {:error, {:mounted, _}}} = next_check())
+
+          File.write!(mountinfo, "")
+          assert %{cleanup: :done, notice: %{}} = next_check()
+
+          # With the store gone no check looks at the images, so none is stepped.
+          for _ <- 2..8,
+              do: assert_receive({:checked, %{cleanup: :done, notice: %{}}}, 5_000)
+
+          assert %{migration: nil, migration_timer: nil} = :sys.get_state(ctx.name)
+        end)
+
+      assert log =~ "giving up"
+      for _ <- 1..8, do: assert_received({:notify, :dismiss})
+      refute_received {:checked, _}
+    end
+
+    test "with nothing to migrate, dismisses a warning left from before once, then stops",
+         ctx do
+      test = self()
+      File.rm_rf!(ctx.legacy)
+
+      start_host(ctx,
+        migration_check_ms: 1,
+        on_migration_checked: &send(test, {:checked, &1}),
+        migration: migration(ctx, notify: &(send(test, {:notify, &1}) && :ok))
+      )
+
+      assert_receive {:checked, %{cleanup: :done, notice: nil}}, 5_000
+      assert_received {:notify, :dismiss}
+      assert %{migration: nil, migration_timer: nil} = :sys.get_state(ctx.name)
+      assert Host.migration(ctx.name) == nil
+      refute_received {:notify, _}
+      assert File.dir?(Path.join(ctx.root, "root/vagus/core/config"))
+    end
+
+    test "a restart after a failed dismissal dismisses it", ctx do
+      test = self()
+      up = :atomics.new(1, [])
+
+      notify = fn event ->
+        send(test, {:notify, event})
+        if :atomics.get(up, 1) == 1, do: :ok, else: {:error, :core_down}
+      end
+
+      # The deletion went through before the restart; the dismissal did not.
+      File.rm_rf!(ctx.legacy)
+      File.mkdir_p!(Path.join(ctx.root, "root/vagus"))
+      File.write!(Path.join(ctx.root, "root/vagus/engine-migrated"), "")
+      :atomics.put(up, 1, 1)
+
+      start_host(ctx,
+        migration_check_ms: 60_000,
+        on_migration_checked: &send(test, {:checked, &1}),
+        migration: migration(ctx, notify: notify)
+      )
+
+      assert_receive {:checked, %{cleanup: :done, notice: nil}}, 5_000
+      assert_received {:notify, :dismiss}
+      assert %{migration: nil} = :sys.get_state(ctx.name)
+    end
+
+    test "gives up dismissing after a bounded number of tries", ctx do
+      test = self()
+      File.rm_rf!(ctx.legacy)
+
+      notify = fn event ->
+        send(test, {:notify, event})
+        {:error, :core_down}
+      end
+
+      log =
+        capture_log(fn ->
+          start_host(ctx,
+            migration_check_ms: 1,
+            on_migration_checked: &send(test, {:checked, &1}),
+            migration: migration(ctx, notify: notify)
+          )
+
+          for _ <- 1..8,
+              do: assert_receive({:checked, %{cleanup: :done, notice: :unknown}}, 5_000)
+
+          assert %{migration: nil, migration_timer: nil} = :sys.get_state(ctx.name)
+        end)
+
+      assert log =~ "giving up"
+      refute_received {:checked, _}
     end
   end
 end

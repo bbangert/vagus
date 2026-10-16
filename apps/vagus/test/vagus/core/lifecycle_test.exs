@@ -171,6 +171,235 @@ defmodule Vagus.Core.LifecycleTest do
     end
   end
 
+  describe "stops/0 and start/1's :stops_seen" do
+    test "a stop counts, and a start that saw an earlier count is refused under the lock" do
+      {fake, opts} = engine(core("2026.7.0", :running), ["2026.7.0"])
+      opts = opts ++ [versions: start_versions("2026.7.0"), health: health_fun()]
+      seen = Lifecycle.stops()
+
+      assert :ok = Lifecycle.stop(opts)
+      assert Lifecycle.stops() == seen + 1
+
+      assert {:error, :stopped} = Lifecycle.start([stops_seen: seen] ++ opts)
+      assert List.last(verbs(fake)) == :stop
+
+      assert :ok = Lifecycle.start([stops_seen: seen + 1] ++ opts)
+      assert List.last(verbs(fake)) == :start
+    end
+
+    test "a guarded start is refused while a shutdown is in flight; a plain one is not" do
+      {fake, opts} = engine(nil, ["2026.7.0"])
+      opts = opts ++ [versions: start_versions("2026.7.0"), health: health_fun()]
+      shutting_down = [shutting_down?: fn -> true end]
+
+      assert {:error, :shutting_down} =
+               Lifecycle.start([stops_seen: Lifecycle.stops()] ++ shutting_down ++ opts)
+
+      assert Fake.calls(fake) == []
+      assert :ok = Lifecycle.start(shutting_down ++ opts)
+      assert :create in verbs(fake)
+    end
+
+    test "a Core pull that finishes once a shutdown is in flight creates nothing" do
+      {fake, opts} = engine(nil, ["2026.7.0"])
+      in_flight = :atomics.new(1, [])
+      parent = self()
+
+      opts =
+        opts ++
+          [
+            versions: start_versions("2026.7.0"),
+            health: health_fun(),
+            shutting_down?: fn -> :atomics.get(in_flight, 1) == 1 end
+          ]
+
+      prev = Application.fetch_env(:vagus, :first_boot_provision)
+      Application.put_env(:vagus, :first_boot_provision, true)
+
+      on_exit(fn ->
+        case prev do
+          {:ok, value} -> Application.put_env(:vagus, :first_boot_provision, value)
+          :error -> Application.delete_env(:vagus, :first_boot_provision)
+        end
+      end)
+
+      ExUnit.CaptureLog.capture_log(fn ->
+        start_supervised!({Vagus.Provisioner,
+         steps: [:provision_core],
+         installed: fn -> "2026.7.0" end,
+         ping: fn -> :ok end,
+         image_present: fn _version -> false end,
+         connection: fn -> :internet end,
+         pull: fn _version ->
+           # The shutdown begins mid-pull, before its Core stop has run;
+           # that stop, Core absent, would end the recovery on its own.
+           :atomics.put(in_flight, 1, 1)
+           :ok
+         end,
+         start: fn seen ->
+           result = Lifecycle.start([stops_seen: seen] ++ opts)
+           send(parent, {:started, result})
+           result
+         end,
+         name: nil})
+
+        assert_receive {:started, {:error, :shutting_down}}, 2_000
+      end)
+
+      refute :create in verbs(fake)
+    end
+
+    test "a stop of an absent Core counts, its answer unchanged; one the engine fails does not" do
+      {fake, opts} = engine()
+      seen = Lifecycle.stops()
+      assert {:error, :not_found} = Lifecycle.stop(opts)
+      assert Lifecycle.stops() == seen + 1
+
+      Fake.put_container(fake, Container.name(), core("2026.7.0", :running))
+      Fake.fail_next(fake, :stop, {:failed, :stop, "boom"})
+      assert {:error, {:failed, :stop, "boom"}} = Lifecycle.stop(opts)
+      assert Lifecycle.stops() == seen + 1
+    end
+
+    test "a user stop while Core is absent cancels the recovery: the pull's start creates nothing" do
+      {fake, opts} = engine(nil, ["2026.7.0"])
+      opts = opts ++ [versions: start_versions("2026.7.0"), health: health_fun()]
+      parent = self()
+
+      prev = Application.fetch_env(:vagus, :first_boot_provision)
+      Application.put_env(:vagus, :first_boot_provision, true)
+
+      on_exit(fn ->
+        case prev do
+          {:ok, value} -> Application.put_env(:vagus, :first_boot_provision, value)
+          :error -> Application.delete_env(:vagus, :first_boot_provision)
+        end
+      end)
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          pid =
+            start_supervised!({Vagus.Provisioner,
+             steps: [:provision_core],
+             installed: fn -> "2026.7.0" end,
+             ping: fn -> :ok end,
+             image_present: fn _version -> false end,
+             connection: fn -> :internet end,
+             pull: fn _version ->
+               # The user's POST /core/stop, with Core absent, mid-pull.
+               send(parent, {:stopped, Lifecycle.stop(opts)})
+               :ok
+             end,
+             start: fn seen ->
+               result = Lifecycle.start([stops_seen: seen] ++ opts)
+               send(parent, {:started, result})
+               result
+             end,
+             name: nil})
+
+          assert_receive {:stopped, {:error, :not_found}}, 2_000
+          # The pull and the start it leads to run in one handler.
+          :sys.get_state(pid)
+          refute_received {:started, _}
+        end)
+
+      assert log =~ "not starting it"
+      refute :create in verbs(fake)
+    end
+  end
+
+  describe "image_present?/2 and pull/2" do
+    test "ask about and pull the given version's image, touching no container or version" do
+      {fake, opts} = engine(nil, ["2026.7.0"])
+      versions = start_versions("2026.7.0")
+      opts = opts ++ [versions: versions]
+
+      assert Lifecycle.image_present?("2026.7.0", opts)
+      refute Lifecycle.image_present?("2026.10.1", opts)
+      assert :ok = Lifecycle.pull("2026.10.1", opts)
+      assert Lifecycle.image_present?("2026.10.1", opts)
+      assert verbs(fake) == [:image_present?, :image_present?, :pull, :image_present?]
+      assert Versions.installed(versions) == "2026.7.0"
+    end
+
+    test "a failed pull is {:pull, reason}" do
+      {fake, opts} = engine()
+      Fake.fail_next(fake, :pull, {:pull_failed, "manifest unknown"})
+
+      assert {:error, {:pull, {:pull_failed, "manifest unknown"}}} =
+               Lifecycle.pull("2026.10.1", opts)
+    end
+  end
+
+  # Boot's Core unit over the real lifecycle: under a transient store the
+  # container is gone after every reboot, and the installed version brings it back.
+  describe "Vagus.App.CoreUnit.start/1 on an absent container" do
+    test "creates and starts it from the installed version" do
+      {fake, opts} = engine(nil, ["2026.7.0"])
+      versions = start_versions("2026.7.0")
+      opts = opts ++ [versions: versions, health: health_fun(), http_config: http_config_fun()]
+
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert :ok =
+                 Vagus.App.CoreUnit.start(
+                   adopt: fn -> Lifecycle.adopt(opts) end,
+                   installed: fn -> Versions.installed(versions) end,
+                   image_present?: &Lifecycle.image_present?(&1, opts),
+                   start: fn -> Lifecycle.start(opts) end,
+                   health: fn _opts -> :healthy end
+                 )
+      end)
+
+      assert verbs(fake) == [:inspect, :image_present?, :inspect, :create, :start]
+      assert {:ok, %{state: :running}} = Fake.inspect(Container.name(), opts[:engine_opts])
+    end
+
+    test "a stop that lands after boot's reading keeps Core from being created" do
+      {fake, opts} = engine(core("2026.7.0", :exited), ["2026.7.0"])
+      versions = start_versions("2026.7.0")
+      opts = opts ++ [versions: versions, health: health_fun()]
+      parent = self()
+
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert {:error, :stopped} =
+                 Vagus.App.CoreUnit.start(
+                   adopt: fn -> :absent end,
+                   installed: fn -> Versions.installed(versions) end,
+                   image_present?: fn _version -> true end,
+                   stops: fn ->
+                     seen = Lifecycle.stops()
+                     # The user's POST /core/stop, between the reading and the start.
+                     :ok = Lifecycle.stop(opts)
+                     seen
+                   end,
+                   start: &Lifecycle.start([stops_seen: &1] ++ opts),
+                   retry: fn seen -> send(parent, {:handed_off, seen}) end
+                 )
+      end)
+
+      assert verbs(fake) == [:inspect, :stop]
+      refute_received {:handed_off, _seen}
+    end
+
+    test "leaves it absent, and creates nothing, when the image is gone too" do
+      {fake, opts} = engine()
+      versions = start_versions("2026.7.0")
+      opts = opts ++ [versions: versions]
+
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert :ok =
+                 Vagus.App.CoreUnit.start(
+                   adopt: fn -> Lifecycle.adopt(opts) end,
+                   installed: fn -> Versions.installed(versions) end,
+                   image_present?: &Lifecycle.image_present?(&1, opts),
+                   start: fn -> Lifecycle.start(opts) end
+                 )
+      end)
+
+      assert verbs(fake) == [:inspect, :image_present?]
+    end
+  end
+
   ## start/1
 
   describe "start/1" do

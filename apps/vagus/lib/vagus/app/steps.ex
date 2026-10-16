@@ -5,9 +5,6 @@ defmodule Vagus.App.Steps do
   fact is the one thing the step produced. The input is everything the step
   needs (`Vagus.App.Policy.task_input/2`), so nothing here reads app state.
 
-  The container spec (`build_spec/2`, mounts, DSP, ports, image ref,
-  platform) and backend selection are carried from the module the app
-  process replaced.
   `input[:backend]`, `input[:data_root]` and `input[:socket]` override the
   configured backend, data root and engine socket; `input[:engine_opts]`
   reaches every direct `Vagus.Runtime.Engine` call.
@@ -20,11 +17,17 @@ defmodule Vagus.App.Steps do
   alias Vagus.DSP
   alias Vagus.Ingress.Panels
   alias Vagus.Network
-  alias Vagus.Runtime.Engine
+  alias Vagus.Runtime.{Engine, Host}
 
   @default_backend Vagus.Addon.Backend.Container
   @default_data_root "/data"
   @halt_timeout_s 30
+  @health_interval_ms 30_000
+  # Docker's default check timeout, a cap on what an image may declare, and
+  # the time podman takes around the check itself.
+  @health_timeout_ms 30_000
+  @health_timeout_cap_ms 300_000
+  @health_run_margin_ms 5_000
   @port_min 62_000
   @port_max 65_500
   @port_tries 100
@@ -51,7 +54,26 @@ defmodule Vagus.App.Steps do
     "addons" => "local_apps"
   }
 
+  @doc "Each container's grace at shutdown."
+  @spec halt_timeout_s() :: pos_integer()
+  def halt_timeout_s, do: @halt_timeout_s
+
+  # Once a shutdown is in flight no container is fetched or started: the
+  # group stop has already passed over its name, and its halt would get only
+  # what is left of the budget. A native app runs in the BEAM and is not
+  # halted.
   @spec run(atom(), map()) :: {:ok, term()} | {:error, term()}
+  def run(name, %{config: config} = input) when name in [:ensure_image, :start] do
+    shutting_down? = Map.get(input, :shutting_down?, &Vagus.Host.Shutdown.in_flight?/0)
+
+    if not native?(config) and shutting_down?.() do
+      {:error, :shutting_down}
+    else
+      report_stage(input)
+      step(name, input)
+    end
+  end
+
   def run(name, input) do
     report_stage(input)
     step(name, input)
@@ -73,6 +95,19 @@ defmodule Vagus.App.Steps do
 
     with :ok <- maybe_ensure_network(config, opts),
          :ok <- backend(opts).pull(spec) do
+      {:ok, spec.image}
+    end
+  end
+
+  # A backend with no image concept has nothing to fetch.
+  defp step(:ensure_image, %{config: config} = input) do
+    opts = opts(input)
+    backend = backend(opts)
+    spec = build_spec(config, Keyword.put(opts, :access_token, ""))
+
+    if Code.ensure_loaded?(backend) and function_exported?(backend, :ensure_image, 2) do
+      with :ok <- backend.ensure_image(spec, engine_opts(opts)), do: {:ok, spec.image}
+    else
       {:ok, spec.image}
     end
   end
@@ -339,17 +374,74 @@ defmodule Vagus.App.Steps do
           ip: bridge_ip(config, container),
           # Upstream reports `startup` until the first healthy event only for
           # an image that declares a healthcheck.
-          healthcheck: container.healthcheck != nil
+          healthcheck: container.healthcheck != nil,
+          health_check: health_check(container.healthcheck, engine_opts(opts))
         }
 
       {:error, _reason} ->
-        %{container_id: id, ip: nil, healthcheck: false}
+        unknown_health(id, opts)
     end
   rescue
     e ->
       Logger.warning("Vagus.App.Steps: inspect of #{config.slug} failed: #{inspect(e)}")
-      %{container_id: id, ip: nil, healthcheck: false}
+      unknown_health(id, opts)
   end
+
+  # Whether the container declares a check is unknown: an engine that runs
+  # none itself leaves the app process to inspect again for it.
+  defp unknown_health(id, opts) do
+    engine_opts = engine_opts(opts)
+
+    health_check =
+      if Engine.schedules_healthchecks?(engine_opts), do: nil, else: {:unknown, engine_opts, 0}
+
+    %{container_id: id, ip: nil, healthcheck: false, health_check: health_check}
+  end
+
+  @doc """
+  The healthcheck schedule of a started container, for an app process whose
+  start could not inspect it: `{:ok, nil}` when it declares no check.
+  """
+  @spec health_schedule(String.t(), keyword()) :: {:ok, map() | nil} | {:error, term()}
+  # On the health class, as the check's own inspect is: it never queues for
+  # a permit, and none is granted during a shutdown.
+  def health_schedule(id, engine_opts) do
+    case Engine.inspect(id, Keyword.put(engine_opts, :class, :health)) do
+      {:ok, container} -> {:ok, health_check(container.healthcheck, engine_opts)}
+      {:error, reason} -> {:error, reason}
+    end
+  rescue
+    e -> {:error, {:raised, e.__struct__}}
+  end
+
+  # Only for an engine that runs no checks itself. Docker's defaults stand in
+  # for an unset interval; the floor keeps a 1 s interval from costing a
+  # podman process a second on a small board. The first run waits out the
+  # start period, plus up to one interval of jitter so apps started together
+  # do not all check together.
+  defp health_check(nil, _engine_opts), do: nil
+
+  defp health_check(healthcheck, engine_opts) do
+    if Engine.schedules_healthchecks?(engine_opts) do
+      nil
+    else
+      floor = if Host.profile(engine_opts[:host]) == :fast, do: 10_000, else: 30_000
+      interval = max(positive(healthcheck[:interval_ms]) || @health_interval_ms, floor)
+      start_period = positive(healthcheck[:start_period_ms]) || 0
+
+      %{
+        first_ms: max(start_period, interval) + :rand.uniform(interval),
+        interval_ms: interval,
+        timeout_ms:
+          min(positive(healthcheck[:timeout_ms]) || @health_timeout_ms, @health_timeout_cap_ms) +
+            @health_run_margin_ms,
+        engine_opts: engine_opts
+      }
+    end
+  end
+
+  defp positive(ms) when is_integer(ms) and ms > 0, do: ms
+  defp positive(_ms), do: nil
 
   # A nonzero exit fails as `{:exec, code}`: Policy fails the backup on it and
   # the API reports it as the hook's error.
@@ -396,8 +488,8 @@ defmodule Vagus.App.Steps do
   # reboot or emulator restart, the previous session's container survives while
   # the in-memory add-on state does not, and `create` would 409 on the fixed
   # name. The real Supervisor's `DockerInterface.run` stops+removes any
-  # existing container before creating (§A1.4 — no restart policy, the manager
-  # owns the lifecycle), so do the same, tolerantly (absent/not-running is fine).
+  # existing container before creating (no restart policy: the manager owns
+  # the lifecycle), so do the same, tolerantly (absent/not-running is fine).
   defp remove_stale_container(spec, opts) do
     _ = backend(opts).stop(spec.name, [])
     _ = backend(opts).remove(spec.name, [])
@@ -474,7 +566,7 @@ defmodule Vagus.App.Steps do
 
   defp default_backend, do: Application.get_env(:vagus, :addon_backend, @default_backend)
 
-  # Per-add-on backend selection (M5): a `backend: native` add-on (the mqttx
+  # Per-add-on backend selection: a `backend: native` add-on (the mqttx
   # virtual add-on) routes every `backend(opts)` call site through
   # `Backend.Native` instead of the global `:addon_backend` default, while every
   # other add-on keeps the container default. `put_new` so an explicitly-injected
@@ -497,14 +589,14 @@ defmodule Vagus.App.Steps do
 
   defp maybe_ensure_network(%Config{host_network: true}, _opts), do: :ok
   # Native "virtual add-ons" have no container on the hassio bridge — nothing to
-  # attach, so don't stand the bridge up on their account (M5).
+  # attach, so don't stand the bridge up on their account.
   defp maybe_ensure_network(%Config{backend: :native}, _opts), do: :ok
 
   defp maybe_ensure_network(_config, opts) do
     case Network.ensure(engine_opts(opts)) do
       :ok ->
         # Bind the supervisor anchor (.2) to the freshly-ensured bridge so the
-        # host-networked emulator answers where the add-on reaches it (§A6).
+        # host-networked emulator answers where the add-on reaches it.
         Network.ensure_supervisor_ip()
         :ok
 

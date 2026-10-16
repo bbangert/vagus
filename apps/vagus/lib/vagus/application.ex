@@ -4,10 +4,11 @@ defmodule Vagus.Application do
   @moduledoc """
   Top-level supervisor for the `vagus` app.
 
-  On target (not `:host`) this starts the engine-supervision machinery: a
-  `DynamicSupervisor` to hold the balena-engine daemon once it's started, and
-  `Vagus.Engine.Manager`, which waits for VintageNet internet connectivity
-  before writing `/run/resolv.conf` and starting the daemon. See
+  On target (not `:host`) under Docker this starts the engine-supervision
+  machinery: a `DynamicSupervisor` to hold the balena-engine daemon once
+  it's started, and `Vagus.Engine.Manager`, which waits for VintageNet
+  internet connectivity before writing `/run/resolv.conf` and starting the
+  daemon. Under podman, `Vagus.Runtime.Host` replaces both. See
   `Vagus.Engine.Manager` and `Vagus.Engine` for the rest of the runtime engine
   -supervision skeleton (originally spiked in `vagus_spike`, plan.md Phase 2,
   tasks 2.1-2.3).
@@ -194,11 +195,8 @@ defmodule Vagus.Application do
   # Only under the podman engine: it prepares the board for podman and holds
   # the permits every podman call takes. Before the app processes, whose
   # calls need it, and stopped after them.
-  defp runtime_host_children do
-    if Application.get_env(:vagus, :engine) == Vagus.Runtime.Engine.Podman,
-      do: [Vagus.Runtime.Host],
-      else: []
-  end
+  defp runtime_host_children,
+    do: if(Vagus.Runtime.Engine.podman?(), do: [Vagus.Runtime.Host], else: [])
 
   # The `hassio` DNS server (M4-P1-T2), gated by `:dns_enabled` (false in
   # test.exs so `mix test` never binds :53). On :host dev the .3 anchor / :53
@@ -245,31 +243,40 @@ defmodule Vagus.Application do
       ]
     end
   else
-    defp target_children do
-      [
-        # Holds the balena-engine daemon once Vagus.Engine.Manager starts
-        # it. A dedicated DynamicSupervisor (rather than starting the
-        # MuonTrap.Daemon directly under Vagus.Supervisor) keeps the
-        # daemon's restart/crash-loop intensity isolated from the rest of
-        # the app's supervision tree.
-        {DynamicSupervisor,
-         name: Vagus.Engine.DaemonSupervisor,
-         strategy: :one_for_one,
-         max_restarts: 5,
-         max_seconds: 30},
+    defp target_children, do: balena_children() ++ [bluetooth_child()]
 
-        # Waits for VintageNet internet connectivity, then writes
-        # /run/resolv.conf and starts the balena-engine daemon. Only runs on
-        # the target — VintageNet isn't present/meaningful on :host.
-        {Vagus.Engine.Manager, []},
+    # podman runs no daemon: these would start balena-engine beside it.
+    defp balena_children do
+      if Vagus.Runtime.Engine.podman?() do
+        []
+      else
+        [
+          # Holds the balena-engine daemon once Vagus.Engine.Manager starts
+          # it. A dedicated DynamicSupervisor (rather than starting the
+          # MuonTrap.Daemon directly under Vagus.Supervisor) keeps the
+          # daemon's restart/crash-loop intensity isolated from the rest of
+          # the app's supervision tree.
+          {DynamicSupervisor,
+           name: Vagus.Engine.DaemonSupervisor,
+           strategy: :one_for_one,
+           max_restarts: 5,
+           max_seconds: 30},
 
-        # Bluetooth daemons (dbus-daemon --system + bluetoothd -E), the
-        # daemons-only slice of the Bluez stack. HA Core consumes the
-        # adapter through the /run/dbus bind on its container; Vagus runs
-        # no BLE clients of its own. `:ignore` when the system was built
-        # without BlueZ. See Vagus.Bluetooth.
-        Vagus.Bluetooth
-      ]
+          # Waits for VintageNet internet connectivity, then writes
+          # /run/resolv.conf and starts the balena-engine daemon. Only runs on
+          # the target — VintageNet isn't present/meaningful on :host.
+          {Vagus.Engine.Manager, []}
+        ]
+      end
+    end
+
+    defp bluetooth_child do
+      # Bluetooth daemons (dbus-daemon --system + bluetoothd -E), the
+      # daemons-only slice of the Bluez stack. HA Core consumes the
+      # adapter through the /run/dbus bind on its container; Vagus runs
+      # no BLE clients of its own. `:ignore` when the system was built
+      # without BlueZ. See Vagus.Bluetooth.
+      Vagus.Bluetooth
     end
   end
 end

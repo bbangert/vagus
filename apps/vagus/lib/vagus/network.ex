@@ -23,6 +23,7 @@ defmodule Vagus.Network do
   @subnet "172.30.32.0/23"
   @ip_range "172.30.33.0/24"
   @prefix "23"
+  @bridge_port "hassio-anchor"
 
   @loopback {127, 0, 0, 1}
 
@@ -248,9 +249,87 @@ defmodule Vagus.Network do
   @spec config() :: map()
   def config, do: Engine.Docker.render_network(spec())
 
-  @doc "Ensures the `hassio` bridge exists (idempotent). `opts` reach the engine."
+  @doc """
+  Ensures the `hassio` network exists (idempotent). `opts` reach the engine.
+
+  Under podman the bridge interface is also made here (`ensure_bridge/1`),
+  whatever the engine answered: it is the host's own from then on, and the
+  anchors need it even when podman does not run. `:host_bridge` overrides
+  `host_bridge?/1`.
+  """
   @spec ensure(keyword()) :: :ok | {:error, Engine.error()}
-  def ensure(opts \\ []), do: Engine.ensure_network(spec(), opts)
+  def ensure(opts \\ []) do
+    result = Engine.ensure_network(spec(), opts)
+
+    # Logged, not returned: netavark makes the bridge itself at a container's
+    # start, so a bridged app can still run; only the anchors' survival of
+    # the last container is lost.
+    with true <- host_bridge?(opts),
+         {:error, {args, out, status}} <- ensure_bridge(opts) do
+      Logger.warning(
+        "Vagus.Network: the hassio bridge is not kept: ip #{Enum.join(args, " ")} " <>
+          "failed (#{status}): #{out}"
+      )
+    end
+
+    result
+  end
+
+  @doc """
+  Whether Vagus, not the engine, keeps the `hassio` bridge interface: under
+  podman. netavark makes the bridge at a container's start and deletes it
+  with the last one, so a board running only Core and host-network apps
+  would never have the `.2` anchor Core reaches the Supervisor on.
+  """
+  @spec host_bridge?(keyword()) :: boolean()
+  def host_bridge?(opts \\ []),
+    do: Keyword.get_lazy(opts, :host_bridge, fn -> Engine.podman?(opts) end)
+
+  @doc """
+  Makes the `hassio` bridge with a dummy port and the gateway address, then
+  brings both up. Each step is idempotent: an interface or address that
+  already exists counts as done, so a bridge netavark made itself gains the
+  port as well.
+
+  The dummy port is what keeps the bridge, and the anchors on it, after the
+  last container leaves: netavark deletes only a bridge with no ports left.
+  netavark accepts the bridge as its own at the first container start. The
+  gateway goes on before the anchors so it stays the bridge's primary
+  address, the source the host uses towards containers, as under
+  balena-engine.
+
+  The commands are within busybox `ip` (1.38: `link add NAME type KIND`,
+  `link set DEV master BR up`). `:ip_cmd` replaces the runner
+  `(binary, args) -> {output, status}`. Returns the first failure.
+  """
+  @spec ensure_bridge(keyword()) :: :ok | {:error, {[String.t()], String.t(), integer()}}
+  def ensure_bridge(opts \\ []) do
+    cmd = Keyword.get(opts, :ip_cmd, &Vagus.Host.Cmd.run/2)
+
+    Enum.reduce_while(bridge_commands(), :ok, fn args, :ok ->
+      case cmd.("ip", args) do
+        {_out, 0} ->
+          {:cont, :ok}
+
+        {out, status} ->
+          if String.contains?(out, "File exists"),
+            do: {:cont, :ok},
+            else: {:halt, {:error, {args, String.trim(out), status}}}
+      end
+    end)
+  end
+
+  @doc "The `ip` invocations `ensure_bridge/1` runs, in order."
+  @spec bridge_commands() :: [[String.t()]]
+  def bridge_commands do
+    [
+      ["link", "add", @name, "type", "bridge"],
+      ["link", "add", @bridge_port, "type", "dummy"],
+      ["link", "set", @bridge_port, "master", @name, "up"],
+      ["addr", "add", "#{@anchors.gateway}/#{@prefix}", "dev", @name],
+      ["link", "set", @name, "up"]
+    ]
+  end
 
   @doc """
   Whether `ifname` is a container bridge the engine owns rather than a host
@@ -277,9 +356,10 @@ defmodule Vagus.Network do
   `172.30.32.3` — to the host `hassio` bridge interface, so the host-networked
   emulator (Bandit on `.2`, `Vagus.DNS` on `0.0.0.0:53`) answers there:
   `.2` is where bridged add-ons reach `http://supervisor` and `.3` is the
-  resolver they're configured with (§A6). The bridge driver already puts the
-  gateway `.1` on the interface; these are added beside it once the interface
-  exists (i.e. after `ensure/1` created the network).
+  resolver they're configured with (§A6). The bridge driver, or
+  `ensure_bridge/1` under podman, already puts the gateway `.1` on the
+  interface; these are added beside it once the interface exists (i.e. after
+  `ensure/1`).
 
   `.2` is also the address the API listener itself binds
   (`Vagus.API.Listener`, `config :vagus, :api_bind_ip`) — it is added here,
@@ -290,17 +370,16 @@ defmodule Vagus.Network do
   "File exists"), a missing interface, or a missing `ip` tool is logged and
   treated as `:ok` — never fatal to an add-on install.
   """
-  @spec ensure_supervisor_ip() :: :ok
-  def ensure_supervisor_ip do
-    bind_anchor(supervisor_ip())
-    bind_anchor(dns_ip())
+  @spec ensure_supervisor_ip(keyword()) :: :ok
+  def ensure_supervisor_ip(opts \\ []) do
+    cmd = Keyword.get(opts, :ip_cmd, &Vagus.Host.Cmd.run/2)
+    bind_anchor(cmd, supervisor_ip())
+    bind_anchor(cmd, dns_ip())
     :ok
   end
 
-  defp bind_anchor(ip) do
-    case System.cmd("ip", ["addr", "add", "#{ip}/#{@prefix}", "dev", @name],
-           stderr_to_stdout: true
-         ) do
+  defp bind_anchor(cmd, ip) do
+    case cmd.("ip", ["addr", "add", "#{ip}/#{@prefix}", "dev", @name]) do
       {_out, 0} ->
         :ok
 

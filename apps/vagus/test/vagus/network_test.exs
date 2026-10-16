@@ -272,6 +272,107 @@ defmodule Vagus.NetworkTest do
     end
   end
 
+  describe "the host-kept bridge (podman)" do
+    alias Vagus.Runtime.Engine.Fake
+
+    # Each `ip` call reports itself with the engine calls made before it.
+    defp ip_fake(fake, answer \\ fn _args -> {"", 0} end) do
+      test = self()
+
+      fn bin, args ->
+        send(test, {:ip, bin, args, Fake.calls(fake)})
+        answer.(args)
+      end
+    end
+
+    defp ip_calls do
+      receive do
+        {:ip, "ip", args, engine_calls} -> [{args, engine_calls} | ip_calls()]
+      after
+        0 -> []
+      end
+    end
+
+    setup do
+      %{fake: Fake.start()}
+    end
+
+    test "is on only for podman" do
+      assert Network.host_bridge?(engine: Vagus.Runtime.Engine.Podman)
+      refute Network.host_bridge?(engine: Vagus.Runtime.Engine.Docker)
+      refute Network.host_bridge?(engine: Fake)
+    end
+
+    test "the bridge, its dummy port, the gateway, then both up, in that order" do
+      assert Network.bridge_commands() == [
+               ["link", "add", "hassio", "type", "bridge"],
+               ["link", "add", "hassio-anchor", "type", "dummy"],
+               ["link", "set", "hassio-anchor", "master", "hassio", "up"],
+               ["addr", "add", "172.30.32.1/23", "dev", "hassio"],
+               ["link", "set", "hassio", "up"]
+             ]
+    end
+
+    test "ensure/1 makes the network first, then runs every bridge command",
+         %{fake: fake} do
+      assert Network.ensure(engine: Fake, fake: fake, host_bridge: true, ip_cmd: ip_fake(fake)) ==
+               :ok
+
+      calls = ip_calls()
+      assert Enum.map(calls, &elem(&1, 0)) == Network.bridge_commands()
+
+      for {_args, engine_calls} <- calls,
+          do: assert([{:ensure_network, [_spec]}] = engine_calls)
+    end
+
+    test "the bridge is made even when the engine could not make its network",
+         %{fake: fake} do
+      Fake.fail_next(fake, :ensure_network, :unavailable)
+      opts = [engine: Fake, fake: fake, host_bridge: true, ip_cmd: ip_fake(fake)]
+
+      assert Network.ensure(opts) == {:error, :unavailable}
+      assert length(ip_calls()) == length(Network.bridge_commands())
+    end
+
+    test "no bridge command under balena-engine", %{fake: fake} do
+      assert Network.ensure(engine: Fake, fake: fake, ip_cmd: ip_fake(fake)) == :ok
+      assert ip_calls() == []
+    end
+
+    test "what already exists counts as done", %{fake: fake} do
+      exists = fn _args -> {"ip: RTNETLINK answers: File exists\n", 2} end
+      assert Network.ensure_bridge(ip_cmd: ip_fake(fake, exists)) == :ok
+      assert length(ip_calls()) == length(Network.bridge_commands())
+    end
+
+    test "ensure/1 logs a bridge it could not keep and answers for the network",
+         %{fake: fake} do
+      fails = fn _args -> {"ip: RTNETLINK answers: Operation not supported\n", 2} end
+      opts = [engine: Fake, fake: fake, host_bridge: true, ip_cmd: ip_fake(fake, fails)]
+
+      log = ExUnit.CaptureLog.capture_log(fn -> assert Network.ensure(opts) == :ok end)
+      assert log =~ "the hassio bridge is not kept"
+      assert log =~ "Operation not supported"
+    end
+
+    test "a real failure stops the steps and is returned", %{fake: fake} do
+      no_bridge = fn
+        ["link", "add", "hassio", "type", "bridge"] ->
+          {"ip: RTNETLINK answers: Operation not supported\n", 2}
+
+        _args ->
+          {"", 0}
+      end
+
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert {:error, {["link", "add", "hassio", "type", "bridge"], "ip: RTNETLINK" <> _, 2}} =
+                 Network.ensure_bridge(ip_cmd: ip_fake(fake, no_bridge))
+      end)
+
+      assert length(ip_calls()) == 1
+    end
+  end
+
   describe "against a live daemon" do
     @describetag :docker
 

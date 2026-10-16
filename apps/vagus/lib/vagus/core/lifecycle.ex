@@ -1,12 +1,8 @@
 defmodule Vagus.Core.Lifecycle do
   @moduledoc """
   HA Core container lifecycle operations — `adopt/1`, `start/1`, `stop/1`,
-  `restart/1`, `rebuild/1`, `update/2` — the code that replaces the
-  hand-run balena-engine recipe
-  (`.claude/plans/vagus-core-lifecycle/plan.md` Phase 1, mirroring upstream
-  `homeassistant/core.py`/`docker/manager.py` per
-  `.claude/plans/vagus-core-lifecycle/research/supervisor-semantics.md`
-  §1-§2/§4). A plain functions module — no
+  `restart/1`, `rebuild/1`, `update/2` — mirroring upstream's
+  `homeassistant/core.py`/`docker/manager.py`. A plain functions module — no
   process, no state of its own; every op reads/writes through
   `Vagus.Runtime.Engine` and `Vagus.Core.Versions`
   (persisted installed version), both injectable per call.
@@ -30,6 +26,11 @@ defmodule Vagus.Core.Lifecycle do
       to its own real `Vagus.API.Token.get/0` default).
     * `:version` - (`start/1` only) the desired version; defaults to
       `Vagus.Core.Versions.installed/1`.
+    * `:stops_seen` - (`start/1` only) a `stops/0` reading; the start is
+      `{:error, :stopped}` if Core has been stopped since, and
+      `{:error, :shutting_down}` while a shutdown is in flight.
+    * `:shutting_down?` - zero-arity fn, the shutdown check that
+      `:stops_seen` implies. Defaults to `Vagus.Host.Shutdown.in_flight?/0`.
 
   The container name is always `Vagus.Core.Container.name/0` — every op
   targets the one fixed-name Core container, never an id passed in by the
@@ -37,7 +38,7 @@ defmodule Vagus.Core.Lifecycle do
 
   ## Parity table (op → upstream behavior)
 
-  | Op | Upstream (§1/§4) | v1 here |
+  | Op | Upstream | Here |
   |---|---|---|
   | `adopt` | `attach()`: inspect by name, adopt as-is, no reconciliation | same — inspect by name, seed `Versions` from the running tag, never create |
   | `start` | reuse if `ImageID` matches desired, else "extended start" (recreate) | reuse if the image tag AND spec fingerprint match desired, else recreate; already-running is a no-op |
@@ -46,7 +47,7 @@ defmodule Vagus.Core.Lifecycle do
   | `rebuild` | stop-with-remove then start (recreates from current spec) | stop + remove + create(installed) + start — the drift healer |
   | `update` | pull → start() only if was running → health check → rollback-recreate on failure | same shape, sync (no `background`/`job_id`) |
 
-  ## v1 deviations (see plan "Locked decisions" for the full list)
+  ## Deviations from upstream
 
   No image pull in `start/1` — a missing image is returned as an error
   (`{:error, {:failed, :create, :image_not_found}}`), not a landingpage fallback; `rebuild/1`
@@ -62,7 +63,7 @@ defmodule Vagus.Core.Lifecycle do
 
   A create/start failure recreating the **new** target version in
   `update/2` (after the old container has already been stopped+removed) is
-  treated the same as a health-gate timeout: v1 attempts the same
+  treated the same as a health-gate timeout: this attempts the same
   rollback-recreate of the previous version, returning
   `{:error, {:recreate_failed, reason, :rolled_back}}` on success or
   `{:error, {:recreate_failed, reason, :no_rollback_version}}` when there's
@@ -182,7 +183,7 @@ defmodule Vagus.Core.Lifecycle do
   mid-sequence BEAM restart (crash, deploy, power loss) can leave
   `Vagus.Core.Versions.installed/1` and the actual container state
   transiently out of sync — e.g. the version file already updated but the
-  container not yet started, or vice versa. v1's stance is
+  container not yet started, or vice versa. The stance here is
   reconcile-on-next-op, not crash-safety: the next `start/1`, `rebuild/1`,
   or `update/2` reads whatever `Versions.installed/1` and the container's
   actual state are at that moment and heals from there — the same
@@ -194,7 +195,7 @@ defmodule Vagus.Core.Lifecycle do
 
   `restart/1` and `rebuild/1` accept `opts[:safe_mode]` — the "Restart Home
   Assistant → advanced → safe mode" recovery flow the frontend exposes for
-  a boot-looping custom integration (audit E3). Upstream
+  a boot-looping custom integration. Upstream
   (`homeassistant/core.py`) touches an empty `safe-mode` file at the root
   of Core's `/config` before the restart it triggers; Core's bootstrap
   consumes (and deletes) that marker on its next boot, starting with
@@ -208,14 +209,14 @@ defmodule Vagus.Core.Lifecycle do
   The write happens before any container-affecting engine call, and a
   write failure **aborts the whole op** (`{:error, {:safe_mode_marker,
   reason}}`) rather than falling through to an ordinary restart — a
-  safe-mode request that silently restarts normally instead is exactly
-  the bug this closes, so a marker that can't be written must fail loud,
+  safe-mode request that silently restarts normally instead would look
+  like it worked, so a marker that can't be written must fail loud,
   not degrade quietly.
 
   `opts[:force]` is part of the same request body upstream defines
   (`{safe_mode: bool, force: bool}`) but is accepted-and-ignored: upstream
   uses it to bypass an in-progress offline database migration gate, and
-  Vagus has no such gate (nothing here blocks on one, audit D11). The
+  Vagus has no such gate (nothing here blocks on one). The
   router validates `force`'s type but never threads it down to this
   module.
 
@@ -235,11 +236,10 @@ defmodule Vagus.Core.Lifecycle do
       inconsistency a lock exists to prevent, and
       Core has only the one container to protect.
     * **Non-blocking (`retries: 0`), not blocking** — Core's `update/2` can run for minutes (a multi-GB
-      image pull + health gate on a slow device, per the plan's "long sync
-      update" risk); a caller blocking on `:global.trans` for that whole
+      image pull + health gate on a slow device); a caller blocking on `:global.trans` for that whole
       window would tie up a Bandit request worker for no benefit. Returning
       `{:error, :busy}` immediately instead lets the router surface a fast
-      409 (Phase 3) — "an update is already running, try again" is more
+      409 — "an update is already running, try again" is more
       useful to a client than a request that silently hangs for minutes.
 
   Because the lock is acquired **once per public call and never re-entered**
@@ -261,6 +261,7 @@ defmodule Vagus.Core.Lifecycle do
   @pull_deadline_ms 3_600_000
   @gracetime_env "S6_SERVICES_GRACETIME"
   @safe_mode_marker "safe-mode"
+  @stops {__MODULE__, :stops}
 
   @doc """
   Adopts the Core container by name, as-is — never creates.
@@ -365,6 +366,31 @@ defmodule Vagus.Core.Lifecycle do
     with_lock(fn -> do_update(version, opts) end)
   end
 
+  @doc """
+  Whether the engine holds `version`'s image; `{:error, reason}` when it
+  cannot say.
+  """
+  @spec image_present?(String.t(), keyword()) :: boolean() | {:error, term()}
+  def image_present?(version, opts \\ []) when is_binary(version),
+    do: Engine.image_present?(Container.image(version), engine_opts(opts))
+
+  @doc """
+  How many times Core has been stopped since the VM started, by the user or
+  by a shutdown, an absent Core's stop included. A caller that will start Core later, on its own account,
+  takes this first and passes it to `start/1` as `:stops_seen`; a stop since
+  then makes that start `{:error, :stopped}` rather than undo it.
+  """
+  @spec stops() :: non_neg_integer()
+  def stops, do: :persistent_term.get(@stops, 0)
+
+  @doc """
+  Pulls `version`'s image without touching the container or the recorded
+  version. Outside the lifecycle lock: a pull can take many minutes, and a
+  stop or update must not wait behind it.
+  """
+  @spec pull(String.t(), keyword()) :: :ok | {:error, {:pull, term()}}
+  def pull(version, opts \\ []) when is_binary(version), do: pull_target(version, opts)
+
   ## Locking — see moduledoc "Serialization" section.
 
   defp with_lock(fun) do
@@ -413,7 +439,8 @@ defmodule Vagus.Core.Lifecycle do
   ## start/1
 
   defp do_start(opts) do
-    with {:ok, version} <- resolve_start_version(opts) do
+    with :ok <- unattended_start_allowed(opts),
+         {:ok, version} <- resolve_start_version(opts) do
       case inspect_container(opts) do
         {:ok, info} -> start_existing(info, version, opts)
         {:error, :not_found} -> create_and_start(version, opts)
@@ -459,6 +486,27 @@ defmodule Vagus.Core.Lifecycle do
     end
   end
 
+  # Only a start a caller makes on its own account carries `:stops_seen`.
+  # Checked under the lock, so a stop that lands between that caller's check
+  # and its start still wins. A shutdown counts too: with Core absent its
+  # stop moves no counter, and a pull finishing then must not create Core
+  # beside apps being halted.
+  defp unattended_start_allowed(opts) do
+    cond do
+      opts[:stops_seen] == nil ->
+        :ok
+
+      Keyword.get(opts, :shutting_down?, &Vagus.Host.Shutdown.in_flight?/0).() ->
+        {:error, :shutting_down}
+
+      stops() == opts[:stops_seen] ->
+        :ok
+
+      true ->
+        {:error, :stopped}
+    end
+  end
+
   ## stop/1
 
   defp do_stop(opts) do
@@ -469,10 +517,22 @@ defmodule Vagus.Core.Lifecycle do
       end
 
     case engine(:stop, Container.name(), [timeout_s: timeout] ++ engine_opts(opts)) do
-      :ok -> unlink_core_socket()
-      {:error, reason} -> {:error, reason}
+      :ok ->
+        count_stop()
+        unlink_core_socket()
+
+      # Nothing to stop, but a recovery that would create Core (a pull or a
+      # start being retried) is cancelled all the same.
+      {:error, :not_found} = error ->
+        count_stop()
+        error
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
+
+  defp count_stop, do: :persistent_term.put(@stops, stops() + 1)
 
   ## restart/1
 
@@ -508,14 +568,12 @@ defmodule Vagus.Core.Lifecycle do
   # `mkdir_p` first: the volume's host-side directory (`Container.config_path/1`)
   # may not exist yet (Core never adopted/created on this device), and
   # `File.touch/1` alone does not create parents — without this, that
-  # ordinary case would abort the whole safe-mode op with `:enoent`
-  # (security-phase6.md S3). A failed `mkdir_p` still aborts, same as a
+  # ordinary case would abort the whole safe-mode op with `:enoent`. A failed `mkdir_p` still aborts, same as a
   # failed `touch` — see the moduledoc's "fail loud" contract.
   #
   # The path is config-derived (`Container.config_path/1`: engine data_root
   # + the constant volume name) joined with a constant filename — no
-  # request input reaches it; the `opts` seam is test-only (verified in
-  # security-phase6.md item 2).
+  # request input reaches it; the `opts` seam is test-only.
   # sobelow_skip ["Traversal.FileModule"]
   defp write_safe_mode_marker(opts) do
     path = Path.join(Container.config_path(opts), @safe_mode_marker)

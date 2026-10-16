@@ -1047,13 +1047,308 @@ defmodule Vagus.App.ServerTest do
     end
 
     test "is off with the watchdog off, and never runs while an operation does" do
+      app_deadlines(%{probe: 600_000, probe_deadline: 600_000})
       {_slug, pid} = started(@watched)
-      refute_receive {:probe, _, _, _}, 200
+      refute :probe in timers(pid)
 
       :ok = :gen_statem.call(pid, {:set, [watchdog: true]})
+      assert :probe in timers(pid)
+
       _stop = op(pid, {:stop, %{}})
       step(:stop)
-      refute_receive {:probe, _, _, _}, 200
+      refute :probe in timers(pid)
+      assert %{probe: nil} = data(pid)
+    end
+  end
+
+  describe "the image check before a create" do
+    setup do
+      prev = Application.fetch_env(:vagus, :app_steps_ensure_image)
+      Application.put_env(:vagus, :app_steps_ensure_image, :manual)
+
+      on_exit(fn ->
+        case prev do
+          {:ok, value} -> Application.put_env(:vagus, :app_steps_ensure_image, value)
+          :error -> Application.delete_env(:vagus, :app_steps_ensure_image)
+        end
+      end)
+    end
+
+    test "runs before the token is minted and the start is asked" do
+      {_slug, pid} = installed()
+      t = op(pid, {:start, %{}})
+      {input, task} = step(:ensure_image)
+      refute Map.has_key?(input, :token)
+      assert %{token: nil, token_hash: nil} = data(pid)
+      refute_received {:step, :start, _, _}
+
+      send(task, {:outcome, {:ok, "x/y:1"}})
+      input = answer(:start, {:ok, @started})
+      assert is_binary(input.token)
+      assert :ok = Task.await(t)
+      assert %{container_id: "c1", wanted: :started} = data(pid)
+    end
+
+    test "an app wanted started tries a failed pull again, whatever its watchdog" do
+      app_deadlines(%{retry: 1})
+      {_slug, pid} = installed(%{}, state: :started, watchdog: false)
+      t = op(pid, {:start, %{}})
+      answer(:ensure_image, {:error, {:pull, :timeout}})
+      assert {:error, {:pull, :timeout}} = Task.await(t)
+
+      answer(:ensure_image, {:ok, "x/y:1"})
+      answer(:start, {:ok, @started})
+      assert_eventually_idle(pid)
+      assert %{container_id: "c1", image_attempt: 0} = data(pid)
+    end
+
+    test "a failed pull fails the start as a failed start does" do
+      {_slug, pid} = installed()
+      t = op(pid, {:start, %{}})
+      answer(:ensure_image, {:error, {:pull, :timeout}})
+      assert {:error, {:pull, :timeout}} = Task.await(t)
+      image_failed = data(pid)
+
+      {_slug, pid} = installed()
+      t = op(pid, {:start, %{}})
+      answer(:ensure_image, {:ok, "x/y:1"})
+      answer(:start, {:error, {:pull, :timeout}})
+      assert {:error, {:pull, :timeout}} = Task.await(t)
+      start_failed = data(pid)
+
+      keys = [:last_event, :wanted, :token, :container_id, :attempt]
+      assert Map.take(image_failed, keys) == Map.take(start_failed, keys)
+      assert :idle = state(pid)
+    end
+  end
+
+  describe "the healthcheck the engine leaves to the app" do
+    alias Vagus.Runtime.Engine.Fake
+
+    # The restart a verdict arms never fires here: `attempt` counts them.
+    setup do
+      app_deadlines(%{retry: 600_000})
+      fake = Fake.start()
+      Fake.put_container(fake, "c1", healthcheck: %{test: ["CMD", "true"]}, health: :healthy)
+      %{fake: fake}
+    end
+
+    # Ticks every 1 ms; each check blocks in the engine until the test
+    # answers it, so the test sets the pace.
+    defp checked_start(fake, overrides \\ %{}, opts \\ []) do
+      check = %{first_ms: 1, interval_ms: 1, engine_opts: [engine: Fake, fake: fake]}
+      {slug, pid} = installed(overrides, opts)
+      Fake.block_next(fake, :healthcheck)
+      t = op(pid, {:start, %{}})
+      answer(:start, {:ok, Map.merge(@started, %{healthcheck: true, health_check: check})})
+      assert :ok = Task.await(t)
+      {slug, pid, next_check()}
+    end
+
+    defp next_check do
+      assert_receive {:fake_blocked, :healthcheck, blocked}, 2_000
+      blocked
+    end
+
+    # Once the next check is blocked, this one's result has been handled.
+    defp answer_check(fake, blocked, health) do
+      Fake.set_health(fake, "c1", health)
+      Fake.block_next(fake, :healthcheck)
+      Fake.release(blocked)
+      next_check()
+    end
+
+    defp status(pid, key) do
+      {:status, _pid, _mod, [_pdict, _sys, _parent, _debug, status]} = :sys.get_status(pid)
+      :proplists.get_value(key, status |> Keyword.get_values(:data) |> Enum.concat())
+    end
+
+    defp timers(pid) do
+      {_count, timeouts} = status(pid, ~c"Time-outs")
+      for {{:timeout, name}, _message} <- timeouts, do: name
+    end
+
+    defp await_postponed(pid, deadline \\ System.monotonic_time(:millisecond) + 2_000) do
+      cond do
+        Enum.any?(status(pid, ~c"Postponed"), &match?({{:timeout, :healthcheck}, _}, &1)) ->
+          :ok
+
+        System.monotonic_time(:millisecond) > deadline ->
+          flunk("no healthcheck tick postponed")
+
+        true ->
+          await_postponed(pid, deadline)
+      end
+    end
+
+    test "runs on its timer and feeds only changes of health", %{fake: fake} do
+      {_slug, pid, blocked} = checked_start(fake, %{}, watchdog: true)
+      assert %{last_event: {:running, true}} = data(pid)
+
+      Enum.reduce(
+        [healthy: 0, healthy: 0, unhealthy: 1, unhealthy: 1, healthy: 1, unhealthy: 2],
+        blocked,
+        fn {health, attempt}, blocked ->
+          blocked = answer_check(fake, blocked, health)
+          assert %{last_event: ^health, attempt: ^attempt} = data(pid)
+          blocked
+        end
+      )
+    end
+
+    test "an engine event and a check of the same change count once", %{fake: fake} do
+      {_slug, pid, blocked} = checked_start(fake, %{}, watchdog: true)
+      blocked = answer_check(fake, blocked, :healthy)
+
+      send(pid, {:engine_event, %Event{action: :health, health: :unhealthy, id: "c1"}})
+      assert %{last_event: :unhealthy, attempt: 1} = data(pid)
+
+      answer_check(fake, blocked, :unhealthy)
+      assert %{last_event: :unhealthy, attempt: 1} = data(pid)
+    end
+
+    test "is not run under an engine that schedules checks itself" do
+      {_slug, pid} = started()
+      refute :healthcheck in timers(pid)
+      assert %{health_check: nil, health: nil} = data(pid)
+    end
+
+    # The URL watchdog's verdict is the app's; the container's own passing
+    # check, repeated every interval, must not clear it.
+    test "an app the URL probe failed stays in error through passing container checks",
+         %{fake: fake} do
+      {slug, pid, blocked} = checked_start(fake)
+      blocked = answer_check(fake, blocked, :healthy)
+
+      :sys.replace_state(pid, fn {state, data} ->
+        {state, %{data | last_event: {:failed, :unhealthy}}}
+      end)
+
+      blocked = answer_check(fake, blocked, :healthy)
+      answer_check(fake, blocked, :healthy)
+      assert %{last_event: {:failed, :unhealthy}} = data(pid)
+      assert {:ok, %{state: :error}} = App.info(slug)
+    end
+
+    test "a start that could not inspect inspects again, then arms its checks", %{fake: fake} do
+      app_deadlines(%{retry: 600_000, healthcheck: 1})
+      engine_opts = [engine: Fake, fake: fake, schedules_healthchecks: false]
+      {_slug, pid} = installed()
+      Fake.fail_next(fake, :inspect, :timeout)
+      Fake.block_next(fake, :healthcheck)
+      t = op(pid, {:start, %{}})
+
+      answer(
+        :start,
+        {:ok, Map.merge(@started, %{health_check: {:unknown, engine_opts, 0}})}
+      )
+
+      assert :ok = Task.await(t)
+      assert is_pid(next_check())
+      assert %{health_check: %{interval_ms: 30_000}} = data(pid)
+      # The first re-inspect failed, the second found the check.
+      assert [{:inspect, ["c1"]}, {:inspect, ["c1"]}] = Fake.calls(fake)
+    end
+
+    test "a check gets the time its image declared, past the engine's and the task's defaults",
+         %{fake: fake} do
+      test_pid = self()
+
+      app_deadlines(%{
+        retry: 600_000,
+        health_deadline: fn ms -> send(test_pid, {:health_deadline, ms}) && 600_000 end
+      })
+
+      check = %{
+        first_ms: 1,
+        interval_ms: 1,
+        timeout_ms: 125_000,
+        engine_opts: [engine: Fake, fake: fake]
+      }
+
+      {_slug, pid} = installed()
+      # A 40 s check: within its declared 120 s, past both 35 s and 60 s.
+      Fake.delay_next(fake, :healthcheck, 40_000)
+      Fake.set_health(fake, "c1", :unhealthy)
+      Fake.block_next(fake, :healthcheck)
+      Fake.block_next(fake, :healthcheck)
+      t = op(pid, {:start, %{}})
+      answer(:start, {:ok, Map.merge(@started, %{healthcheck: true, health_check: check})})
+      assert :ok = Task.await(t)
+
+      Fake.release(next_check())
+      assert_receive {:health_deadline, 135_000}, 2_000
+      next_check()
+      assert %{last_event: :unhealthy} = data(pid)
+      assert [{:healthcheck, opts} | _] = Fake.call_opts(fake)
+      assert opts[:timeout_ms] == 125_000
+    end
+
+    test "a container that dies kills the check in flight, whose verdict never lands",
+         %{fake: fake} do
+      {_slug, pid, blocked} = checked_start(fake)
+      monitor = Process.monitor(blocked)
+      %{health: {^blocked, ref, "c1"}} = data(pid)
+
+      send(pid, {:engine_event, %Event{action: :die, id: "c1", exit_code: 3}})
+      assert_receive {:DOWN, ^monitor, :process, ^blocked, :killed}, 2_000
+
+      send(pid, {:health, ref, {:ok, :healthy}})
+      assert %{health: nil, last_event: {:exited, 3}} = data(pid)
+      refute :healthcheck in timers(pid)
+      refute :health_deadline in timers(pid)
+    end
+
+    test "stops when the app stops, and a check in flight is killed", %{fake: fake} do
+      {_slug, pid, blocked} = checked_start(fake)
+      monitor = Process.monitor(blocked)
+      assert :health_deadline in timers(pid)
+
+      stop = op(pid, {:stop, %{}})
+      assert_receive {:DOWN, ^monitor, :process, ^blocked, :killed}, 2_000
+      answer(:stop, {:ok, %{was_running: true}})
+      assert :ok = Task.await(stop)
+
+      assert timers(pid) -- [:healthcheck, :health_deadline] == timers(pid)
+      assert %{health: nil, container_id: nil} = data(pid)
+    end
+
+    test "never runs beside an operation: its tick waits the operation out", %{fake: fake} do
+      {_slug, pid, blocked} = checked_start(fake)
+      monitor = Process.monitor(blocked)
+
+      backup = op(pid, {:backup, %{staging_dir: "/nonexistent"}})
+      {_input, task} = step(:snapshot)
+      assert_receive {:DOWN, ^monitor, :process, ^blocked, :killed}, 2_000
+      Fake.block_next(fake, :healthcheck)
+      await_postponed(pid)
+      refute_received {:fake_blocked, :healthcheck, _}
+
+      send(task, {:outcome, {:ok, "/nonexistent/a.tar.gz"}})
+      assert {:ok, _path} = Task.await(backup)
+      assert is_pid(next_check())
+    end
+
+    test "a tick that waited out an operation replacing its container is dropped",
+         %{fake: fake} do
+      {slug, pid, blocked} = checked_start(fake, %{"version" => "1"})
+      monitor = Process.monitor(blocked)
+
+      update = op(pid, {:update, %{config: app_config(slug, %{"version" => "2"})}})
+      {_input, pull} = step(:pull)
+      assert_receive {:DOWN, ^monitor, :process, ^blocked, :killed}, 2_000
+      await_postponed(pid)
+      calls = length(Fake.calls(fake))
+
+      send(pull, {:outcome, {:ok, "x/y:2"}})
+      answer(:stop, {:ok, %{was_running: true}})
+      answer(:start, {:ok, %{@started | container_id: "c2"}})
+      answer(:reclaim_image, {:ok, :ok})
+      assert {:ok, %{to: "2"}} = Task.await(update)
+
+      assert %{container_id: "c2", health: nil} = data(pid)
+      assert length(Fake.calls(fake)) == calls
+      refute :healthcheck in timers(pid)
     end
   end
 
@@ -1250,6 +1545,21 @@ defmodule Vagus.App.ServerTest do
 
     assert_receive :held
     holder
+  end
+
+  # The retry's start is a call-less op: it is over once the process is
+  # idle again.
+  defp assert_eventually_idle(pid, deadline \\ System.monotonic_time(:millisecond) + 2_000) do
+    cond do
+      state(pid) == :idle ->
+        :ok
+
+      System.monotonic_time(:millisecond) > deadline ->
+        flunk("never idle: #{inspect(state(pid))}")
+
+      true ->
+        assert_eventually_idle(pid, deadline)
+    end
   end
 
   defp gone?(key, deadline \\ System.monotonic_time(:millisecond) + 1_000) do

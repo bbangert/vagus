@@ -95,8 +95,23 @@ defmodule Vagus.App.PolicyTest do
   defp running(extra \\ %{}),
     do: app(Map.merge(%{container_id: "c1", ip: @ip, last_event: {:running, false}}, extra))
 
-  defp begin(op, args, data), do: Policy.next(Policy.plan(op, args, data), :begin, data)
-  defp step(data, outcome), do: Policy.next(data.run, outcome, data)
+  defp begin(op, args, data),
+    do: past_image(Policy.next(Policy.plan(op, args, data), :begin, data))
+
+  defp step(data, outcome), do: past_image(Policy.next(data.run, outcome, data))
+
+  # The image is there in every test but those about its check, which call
+  # `Policy.next/3` themselves.
+  defp past_image({data, effects}) do
+    case List.last(effects) do
+      {:step, {:ensure_image, nil}} ->
+        {data, more} = Policy.next(data.run, {:ok, "image"}, data)
+        {data, Enum.drop(effects, -1) ++ more}
+
+      _other ->
+        {data, effects}
+    end
+  end
 
   describe "derive/2" do
     test "from the last event, upstream's mapping" do
@@ -283,6 +298,373 @@ defmodule Vagus.App.PolicyTest do
     end
   end
 
+  describe "health transitions" do
+    @check %{first_ms: 40_000, interval_ms: 30_000, engine_opts: []}
+
+    defp retries(effects), do: Enum.count(effects, &match?({:timer, :retry, _, _}, &1))
+
+    test "a repeated verdict is no event: healthy, unhealthy, healthy restarts once" do
+      data = running(%{last_event: {:running, true}})
+      health = &%Event{action: :health, health: &1, id: "c1"}
+
+      {data, e1} = Policy.on_event(health.(:healthy), data)
+      {data, e2} = Policy.on_event(health.(:healthy), data)
+      {data, e3} = Policy.on_event(health.(:unhealthy), data)
+      {data, e4} = Policy.on_event(health.(:unhealthy), data)
+      {data, e5} = Policy.on_event(health.(:healthy), data)
+      {data, e6} = Policy.on_event(health.(:healthy), data)
+
+      assert e1 == [{:emit, :started}]
+      assert {e2, e4, e6} == {[], [], []}
+      assert retries(e3) == 1
+      assert e5 == []
+      assert %{last_event: :healthy, attempt: 1} = data
+    end
+
+    test "an engine event and the app's own check of one transition count once, in either order" do
+      data = running(%{health_check: @check, last_event: :healthy})
+      event = %Event{action: :health, health: :unhealthy, id: "c1"}
+
+      {d1, from_event} = Policy.on_event(event, data)
+      {d1, from_check} = Policy.health_check({:ok, :unhealthy}, d1)
+      assert retries(from_event ++ from_check) == 1
+      assert d1.attempt == 1
+
+      {d2, from_check} = Policy.health_check({:ok, :unhealthy}, data)
+      {d2, from_event} = Policy.on_event(event, d2)
+      assert retries(from_check ++ from_event) == 1
+      assert d2.attempt == 1
+    end
+
+    test "every result arms the next tick for its container; none once a shutdown is in flight" do
+      data = running(%{health_check: @check, last_event: {:running, true}})
+      tick = {:timer, :healthcheck, 30_000, {:healthcheck, "c1"}}
+
+      for result <- [{:ok, :healthy}, {:ok, :starting}, {:error, :busy}, :skip] do
+        {_data, effects} = Policy.health_check(result, data)
+        assert List.last(effects) == tick
+      end
+
+      {_data, effects} = Policy.health_check({:ok, :healthy}, %{data | shutting_down: true})
+      refute Enum.any?(effects, &match?({:timer, :healthcheck, _, _}, &1))
+    end
+
+    test "no tick without a check of the app's own" do
+      assert Policy.health_check({:ok, :healthy}, running(%{last_event: {:running, true}})) ==
+               {running(%{last_event: :healthy, last_health: :healthy}), [{:emit, :started}]}
+    end
+
+    test "a start whose engine leaves checks to the app arms the first tick" do
+      {data, _} = begin(:start, %{}, app(%{wanted: :stopped}))
+
+      {_data, effects} =
+        step(data, {:ok, %{container_id: "c1", ip: @ip, healthcheck: true, health_check: @check}})
+
+      assert {:timer, :healthcheck, 40_000, {:healthcheck, "c1"}} in effects
+
+      {data, _} = begin(:start, %{}, app(%{wanted: :stopped}))
+      {_data, effects} = step(data, {:ok, %{container_id: "c1", ip: @ip, healthcheck: true}})
+      refute Enum.any?(effects, &match?({:timer, :healthcheck, _, _}, &1))
+    end
+
+    test "a stop or a crash cancels the tick, only for an app that runs its own checks" do
+      checked = running(%{health_check: @check})
+
+      {_data, effects} = Policy.on_event(%Event{action: :die, id: "c1", exit_code: 1}, checked)
+      assert {:cancel, :healthcheck} in effects
+
+      {_data, effects} = begin(:stop, %{}, checked)
+      assert {:cancel, :healthcheck} in effects
+
+      {_data, effects} = begin(:halt, %{}, checked)
+      assert {:cancel, :healthcheck} in effects
+
+      {_data, effects} = begin(:stop, %{}, running())
+      refute {:cancel, :healthcheck} in effects
+    end
+  end
+
+  describe "health beside the URL probe and a dead container" do
+    @check %{first_ms: 40_000, interval_ms: 30_000, engine_opts: []}
+
+    defp probe_failed(extra) do
+      data = running(Map.merge(%{watchdog: false, health_check: @check}, extra))
+      {data, _} = Policy.strike(:unhealthy, data)
+      {data, _} = Policy.strike(:unhealthy, data)
+      assert data.last_event == {:failed, :unhealthy}
+      data
+    end
+
+    test "a passing container check never clears the URL probe's failure" do
+      for last_health <- [nil, :healthy, :unhealthy] do
+        data = probe_failed(%{last_health: last_health})
+
+        {after_check, _} = Policy.health_check({:ok, :healthy}, data)
+        assert Policy.derive(:idle, after_check) == :error
+
+        event = %Event{action: :health, health: :healthy, id: "c1"}
+        {after_event, effects} = Policy.on_event(event, data)
+        assert Policy.derive(:idle, after_event) == :error
+        refute Enum.any?(effects, &match?({:emit, _}, &1))
+      end
+    end
+
+    test "no container verdict, unhealthy or healthy, replaces the URL probe's failure" do
+      data = probe_failed(%{last_health: :healthy})
+
+      {data, _} =
+        Policy.on_event(%Event{action: :health, health: :unhealthy, id: "c1"}, data)
+
+      assert %{last_event: {:failed, :unhealthy}, last_health: :unhealthy} = data
+      assert Policy.derive(:idle, data) == :error
+
+      {data, _} = Policy.health_check({:ok, :healthy}, data)
+      assert %{last_event: {:failed, :unhealthy}, last_health: :healthy} = data
+      assert Policy.derive(:idle, data) == :error
+    end
+
+    test "a container unhealthy under a URL failure still restarts by the ladder" do
+      data = probe_failed(%{last_health: :healthy})
+      data = %{data | watchdog: true}
+
+      {data, effects} =
+        Policy.on_event(%Event{action: :health, health: :unhealthy, id: "c1"}, data)
+
+      assert {:timer, :retry, 0, {:retry, "c1"}} in effects
+      assert data.attempt == 1
+      assert Policy.derive(:idle, data) == :error
+    end
+
+    test "a container check still runs while the probe reports the app failed" do
+      data = probe_failed(%{last_health: :healthy})
+      {_data, effects} = Policy.health_check({:ok, :healthy}, data)
+      assert {:timer, :healthcheck, 30_000, {:healthcheck, "c1"}} in effects
+    end
+
+    test "unhealthy, then the container replaced, then unhealthy again acts again" do
+      data = running(%{health_check: @check, last_event: :healthy, last_health: :healthy})
+      unhealthy = &%Event{action: :health, health: :unhealthy, id: &1}
+
+      {data, effects} = Policy.on_event(unhealthy.("c1"), data)
+      assert {:timer, :retry, 0, {:retry, "c1"}} in effects
+
+      {data, _} = begin(:start, %{retry: true}, data)
+      {data, _} = step(data, {:ok, %{container_id: "c2", ip: @ip, healthcheck: true}})
+      assert %{container_id: "c2", last_health: nil} = data
+
+      {data, effects} = Policy.on_event(unhealthy.("c2"), data)
+      assert {:timer, :retry, 10_000, {:retry, "c2"}} in effects
+      assert data.attempt == 2
+    end
+
+    test "a late verdict about a container that died changes nothing and arms no tick" do
+      data = running(%{health_check: @check, last_health: :healthy, last_event: :healthy})
+      {dead, effects} = Policy.on_event(%Event{action: :die, id: "c1", exit_code: 3}, data)
+      assert {:cancel, :healthcheck} in effects
+      assert dead.last_health == nil
+
+      for result <- [{:ok, :healthy}, {:ok, :unhealthy}, :skip] do
+        assert Policy.health_check(result, dead) == {dead, []}
+      end
+
+      assert Policy.health_timer(dead, :interval_ms) == []
+      assert Policy.health_timer(%{dead | container_id: nil}, :interval_ms) == []
+    end
+  end
+
+  describe "a start refused because a shutdown is in flight" do
+    test "ends as a halt would: the reply says so, and nothing is recorded or armed" do
+      for name <- [:ensure_image, :start] do
+        data = app(%{wanted: :started, watchdog: true, shutting_down: true, token_hash: "h"})
+        plan = Policy.plan(:start, %{retry: true}, data)
+        {data, _} = Policy.next(plan, :begin, data)
+        data = put_in(data.run.step, {name, nil})
+        before = data.last_event
+
+        {after_refusal, effects} = Policy.next(data.run, {:error, :shutting_down}, data)
+
+        assert {:reply, {:error, :shutting_down}} in effects
+        assert List.last(effects) == :idle
+        refute :persist in effects
+        refute Enum.any?(effects, &match?({:timer, _, _, _}, &1))
+        assert %{last_event: ^before, wanted: :started, token_hash: nil} = after_refusal
+      end
+    end
+  end
+
+  describe "a schedule the start could not inspect" do
+    @unknown {:unknown, [engine: :fake], 0}
+    @schedule %{first_ms: 40_000, interval_ms: 30_000, engine_opts: [engine: :fake]}
+
+    test "a start with an unknown schedule arms a re-inspect tick" do
+      {data, _} = begin(:start, %{}, app(%{wanted: :stopped}))
+
+      {data, effects} =
+        step(
+          data,
+          {:ok, %{container_id: "c1", ip: @ip, healthcheck: false, health_check: @unknown}}
+        )
+
+      assert {:timer, :healthcheck, 10_000, {:healthcheck, "c1"}} in effects
+      assert data.health_check == @unknown
+    end
+
+    test "an inspect that finds the check arms its first tick; one that finds none ends it" do
+      data = running(%{health_check: @unknown})
+
+      {data, effects} = Policy.health_check({:schedule, {:ok, @schedule}}, data)
+      assert data.health_check == @schedule
+      assert effects == [{:timer, :healthcheck, 40_000, {:healthcheck, "c1"}}]
+
+      assert Policy.health_check({:schedule, {:ok, nil}}, running(%{health_check: @unknown})) ==
+               {running(%{health_check: nil}), []}
+    end
+
+    test "a failed re-inspect tries again, five times in all, then gives up" do
+      data = running(%{health_check: @unknown})
+
+      {data, ticks} =
+        Enum.reduce(1..6, {data, []}, fn _, {data, ticks} ->
+          {data, effects} = Policy.health_check({:schedule, {:error, :timeout}}, data)
+          {data, ticks ++ effects}
+        end)
+
+      assert length(ticks) == 4
+      assert data.health_check == nil
+    end
+  end
+
+  describe "an image the start could not get" do
+    defp image_failure(data, reason) do
+      plan = Policy.plan(:start, %{retry: true}, data)
+      {data, [{:step, {:ensure_image, nil}}]} = Policy.next(plan, :begin, data)
+      Policy.next(data.run, {:error, {:pull, reason}}, data)
+    end
+
+    defp retry_timers(effects), do: for({:timer, :retry, ms, _} <- effects, do: ms)
+
+    test "is retried on a backoff whatever the watchdog, until it is there" do
+      data = app(%{wanted: :started, watchdog: false})
+
+      {data, waits} =
+        Enum.reduce(1..8, {data, []}, fn _, {data, waits} ->
+          {data, effects} = image_failure(data, :timeout)
+          {data, waits ++ retry_timers(effects)}
+        end)
+
+      assert waits == [
+               30_000,
+               60_000,
+               120_000,
+               240_000,
+               480_000,
+               960_000,
+               1_800_000,
+               1_800_000
+             ]
+
+      assert data.attempt == 0
+
+      plan = Policy.plan(:start, %{retry: true}, data)
+      {data, _} = Policy.next(plan, :begin, data)
+      {data, _} = Policy.next(data.run, {:ok, "x/y:1"}, data)
+      assert data.image_attempt == 0
+    end
+
+    test "from a boot start too, and after a pull that died at its deadline" do
+      data = app(%{wanted: :started, watchdog: false})
+      plan = Policy.plan(:start, %{}, data)
+      {data, _} = Policy.next(plan, :begin, data)
+      {data, effects} = Policy.next(data.run, {:error, :timeout}, data)
+      assert List.last(effects) == {:step, {:stop, :by_name}}
+
+      {data, effects} = Policy.next(data.run, {:ok, %{was_running: false}}, data)
+      assert retry_timers(effects) == [30_000]
+      assert Policy.derive(:idle, data) == :error
+    end
+
+    test "a presence check that failed is retried like a pull that did" do
+      data = app(%{wanted: :started, watchdog: false})
+      plan = Policy.plan(:start, %{}, data)
+      {data, _} = Policy.next(plan, :begin, data)
+      {_data, effects} = Policy.next(data.run, {:error, {:image_check, :timeout}}, data)
+      assert retry_timers(effects) == [30_000]
+    end
+
+    test "a registry that says the image is not there ends after three tries, the error showing" do
+      data = app(%{wanted: :started, watchdog: true})
+      refused = {:pull_failed, "manifest unknown"}
+
+      {data, waits} =
+        Enum.reduce(1..5, {data, []}, fn _, {data, waits} ->
+          {data, effects} = image_failure(data, refused)
+          {data, waits ++ retry_timers(effects)}
+        end)
+
+      assert waits == [30_000, 60_000]
+      assert data.last_event == {:failed, {:pull, refused}}
+      assert Policy.derive(:idle, data) == :error
+    end
+
+    test "not for an app the user did not want started, nor during a shutdown" do
+      for data <- [
+            app(%{wanted: :stopped, watchdog: true}),
+            app(%{wanted: :started, shutting_down: true})
+          ] do
+        {_data, effects} = image_failure(data, :timeout)
+        assert retry_timers(effects) == []
+      end
+    end
+  end
+
+  describe "the image check before every start" do
+    test "a start, restart, restore and update all check the image before the create" do
+      data = running()
+
+      for {op, args} <- [{:start, %{}}, {:restart, %{}}, {:restore, %{start?: true}}] do
+        steps = Policy.plan(op, args, data).steps
+
+        assert Enum.drop_while(steps, &(&1 != {:ensure_image, nil})) |> Enum.take(3) ==
+                 [{:ensure_image, nil}, {:mint_token, nil}, {:start, nil}],
+               "#{op}"
+      end
+    end
+
+    test "a native app has no image to check" do
+      native = app(%{config: native_config(), wanted: :stopped})
+      {_data, effects} = Policy.next(Policy.plan(:start, %{}, native), :begin, native)
+      assert List.last(effects) == {:step, {:start, nil}}
+    end
+
+    test "a failed check fails the start as a failed start does" do
+      data = app(%{wanted: :stopped})
+      plan = Policy.plan(:start, %{}, data)
+      {data, [{:step, {:ensure_image, nil}}]} = Policy.next(plan, :begin, data)
+
+      {image_failed, effects} = Policy.next(data.run, {:error, {:pull, :timeout}}, data)
+
+      {start_failed, start_effects} =
+        Policy.next(%{data.run | step: {:start, nil}}, {:error, {:pull, :timeout}}, data)
+
+      assert effects == start_effects
+      assert image_failed.last_event == start_failed.last_event
+      assert {:reply, {:error, {:pull, :timeout}}} in effects
+    end
+
+    test "a failed check of an update's new image rolls back to the old version" do
+      new = app_config(%{"version" => "2"})
+      {data, _} = begin(:update, %{config: new}, running())
+      {data, _} = step(data, {:ok, "image"})
+      {data, _} = Policy.next(data.run, {:ok, %{was_running: true}}, data)
+      assert {:ensure_image, nil} = data.run.step
+      assert data.config.version == "2"
+
+      {data, effects} = Policy.next(data.run, {:error, {:pull, :timeout}}, data)
+      assert data.config.version == "1.0.0"
+      assert List.last(effects) == {:step, {:ensure_image, nil}}
+    end
+  end
+
   describe "strike/2" do
     test "one miss is a strike; a hit clears it" do
       assert {%{strikes: 1}, [{:timer, :probe, _, :probe}]} = Policy.strike(:unhealthy, running())
@@ -451,9 +833,10 @@ defmodule Vagus.App.PolicyTest do
     test "the step list per op" do
       table = [
         {:install, %{config: app_config()}, [{:pull, nil}, {:port?, nil}, {:commit, nil}]},
-        {:start, %{}, [{:port?, nil}, {:mint_token, nil}, {:start, nil}]},
+        {:start, %{}, [{:port?, nil}, {:ensure_image, nil}, {:mint_token, nil}, {:start, nil}]},
         {:stop, %{}, [{:stop, nil}]},
-        {:restart, %{}, [{:stop, nil}, {:port?, nil}, {:mint_token, nil}, {:start, nil}]},
+        {:restart, %{},
+         [{:stop, nil}, {:port?, nil}, {:ensure_image, nil}, {:mint_token, nil}, {:start, nil}]},
         {:uninstall, %{}, [{:stop, nil}, {:delete_file, nil}, {:remove_app, nil}]},
         {:halt, %{}, [{:halt_stop, nil}]},
         {:restore, %{start?: false}, [{:stop, :strict}, {:swap_data, nil}, {:set_options, nil}]},
@@ -463,6 +846,7 @@ defmodule Vagus.App.PolicyTest do
            {:swap_data, nil},
            {:set_options, nil},
            {:port?, nil},
+           {:ensure_image, nil},
            {:mint_token, nil},
            {:start, nil}
          ]},
@@ -989,6 +1373,22 @@ defmodule Vagus.App.PolicyTest do
       {data, _} = begin(:backup, %{staging_dir: "/s"}, cold)
       {_data, effects} = step(data, {:error, :died})
       assert List.last(effects) == {:step, {:stop, :by_name}}
+    end
+
+    test "a cold backup whose restart cannot get its image answers the snapshot, then retries" do
+      cold = running(%{config: app_config(%{"backup" => "cold"}), watchdog: false})
+      {data, _} = begin(:backup, %{staging_dir: "/s"}, cold)
+      {data, _} = step(data, {:ok, %{was_running: true}})
+      {data, [{:step, {:ensure_image, nil}}]} = Policy.next(data.run, {:ok, "/s/a.tar.gz"}, data)
+
+      {data, effects} = Policy.next(data.run, {:error, {:image_check, :timeout}}, data)
+      assert {:reply, {:ok, "/s/a.tar.gz"}} in effects
+      assert {:timer, :retry, 30_000, {:retry, nil}} in effects
+      assert data.image_attempt == 1
+
+      {data, _} = begin(:start, %{retry: true}, data)
+      {data, _} = step(data, {:ok, %{container_id: "c2", ip: @ip}})
+      assert %{container_id: "c2", wanted: :started, image_attempt: 0} = data
     end
 
     test "backup cold of a crashed app that should run starts it, so its cancelled restart is not lost" do

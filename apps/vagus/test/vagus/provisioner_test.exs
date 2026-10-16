@@ -284,8 +284,76 @@ defmodule Vagus.ProvisionerTest do
     end)
   end
 
-  test "already installed -> full no-op, ping/connection never called, logged" do
+  test "already installed with its image -> no internet wait, no pull, nothing started, logged" do
     parent = self()
+
+    log =
+      capture_log(fn ->
+        pid =
+          start_supervised!(
+            {Provisioner,
+             steps: [:provision_core],
+             installed: fn -> "2026.7.3" end,
+             ping: fn -> :ok end,
+             image_present: fn version -> send(parent, {:image_present, version}) && true end,
+             connection: fn -> send(parent, :connection_called) && :internet end,
+             pull: fn _version -> send(parent, :pull_called) && :ok end,
+             update: fn -> send(parent, :update_called) && {:ok, "x"} end,
+             start: fn -> send(parent, :start_called) && :ok end,
+             name: nil}
+          )
+
+        assert_receive {:image_present, "2026.7.3"}, 1_000
+        # The handler that asked has finished.
+        :sys.get_state(pid)
+        refute_received :connection_called
+        refute_received :pull_called
+        refute_received :update_called
+        refute_received :start_called
+      end)
+
+    assert log =~ "already installed"
+  end
+
+  test "installed but its image gone -> waits for engine and internet, pulls the INSTALLED version, starts" do
+    parent = self()
+    present = :counters.new(1, [])
+
+    capture_log(fn ->
+      start_supervised!({Provisioner,
+       steps: [:provision_core],
+       installed: fn -> "2026.7.3" end,
+       ping: fn -> send(parent, :ping) && :ok end,
+       image_present: fn version ->
+         # Unknown once, as an engine still settling answers.
+         :counters.add(present, 1, 1)
+
+         if :counters.get(present, 1) == 1,
+           do: {:error, :timeout},
+           else: send(parent, {:image_present, version}) && false
+       end,
+       connection: fn -> send(parent, :connection) && :internet end,
+       pull: fn version -> send(parent, {:pull, version}) && :ok end,
+       update: fn -> send(parent, :update_called) && {:ok, "2099.1.0"} end,
+       start: fn -> send(parent, :start) && :ok end,
+       await_healthy: fn -> send(parent, :await_healthy) && :healthy end,
+       engine_interval: 1,
+       name: nil})
+
+      for message <- [:ping, :ping, {:image_present, "2026.7.3"}, :connection] do
+        assert_receive ^message, 1_000
+      end
+
+      assert_receive {:pull, "2026.7.3"}, 1_000
+      assert_receive :start, 1_000
+      assert_receive :await_healthy, 1_000
+      refute_received :update_called
+    end)
+  end
+
+  test "a failed image pull is retried with backoff, then Core starts" do
+    parent = self()
+    pulls = :counters.new(1, [])
 
     log =
       capture_log(fn ->
@@ -293,23 +361,235 @@ defmodule Vagus.ProvisionerTest do
           {Provisioner,
            steps: [:provision_core],
            installed: fn -> "2026.7.3" end,
-           ping: fn ->
-             send(parent, :ping_called)
-             :ok
+           ping: fn -> :ok end,
+           image_present: fn _version -> false end,
+           connection: fn -> :internet end,
+           pull: fn version ->
+             :counters.add(pulls, 1, 1)
+             send(parent, {:pull, version, :counters.get(pulls, 1)})
+             if :counters.get(pulls, 1) == 1, do: {:error, {:pull, :timeout}}, else: :ok
            end,
-           connection: fn ->
-             send(parent, :connection_called)
-             :internet
-           end,
+           start: fn -> send(parent, :start) && :ok end,
+           await_healthy: fn -> :healthy end,
+           retry_base: 1,
            name: nil}
         )
 
-        Process.sleep(20)
-        refute_received :ping_called
-        refute_received :connection_called
+        assert_receive {:pull, "2026.7.3", 1}, 1_000
+        assert_receive {:pull, "2026.7.3", 2}, 1_000
+        assert_receive :start, 1_000
       end)
 
-    assert log =~ "already installed"
+    assert log =~ "Core image pull failed ({:pull, :timeout}) — retrying in 1ms"
+  end
+
+  test "a stop of Core since provisioning began ends the start retries: nothing undoes it" do
+    parent = self()
+    stops = :atomics.new(1, [])
+
+    log =
+      capture_log(fn ->
+        pid =
+          start_supervised!({Provisioner,
+           steps: [:provision_core],
+           installed: fn -> nil end,
+           ping: fn -> :ok end,
+           connection: fn -> :internet end,
+           update: fn -> {:ok, "2026.7.3"} end,
+           stops: fn ->
+             count = :atomics.get(stops, 1)
+             send(parent, {:stops_read, count})
+             count
+           end,
+           start: fn stops_seen ->
+             send(parent, {:start, stops_seen})
+             # The user's POST /core/stop lands while this start fails.
+             :atomics.put(stops, 1, 1)
+             {:error, :busy}
+           end,
+           retry_base: 1,
+           name: nil})
+
+        assert_receive {:start, 0}, 1_000
+        # The retry's own read sees the stop, and goes no further.
+        assert_receive {:stops_read, 1}, 1_000
+        :sys.get_state(pid)
+        refute_received {:start, _}
+      end)
+
+    assert log =~ "Core was stopped since provisioning began — not starting it"
+  end
+
+  test "a start of ours that a stop overtakes is Lifecycle's :stopped, and not retried" do
+    parent = self()
+
+    log =
+      capture_log(fn ->
+        pid =
+          start_supervised!(
+            {Provisioner,
+             steps: [:provision_core],
+             installed: fn -> nil end,
+             ping: fn -> :ok end,
+             connection: fn -> :internet end,
+             update: fn -> {:ok, "2026.7.3"} end,
+             stops: fn -> 0 end,
+             start: fn _seen -> send(parent, :start) && {:error, :stopped} end,
+             retry_base: 1,
+             name: nil}
+          )
+
+        assert_receive :start, 1_000
+        :sys.get_state(pid)
+        refute_received :start
+      end)
+
+    assert log =~ "not starting it"
+    refute log =~ "retrying"
+  end
+
+  describe "a Core start boot handed over" do
+    # Nothing to provision: the installed image is there, so only the
+    # handed-over start runs.
+    defp idle_provisioner(stops, start) do
+      parent = self()
+
+      pid =
+        start_supervised!(
+          {Provisioner,
+           steps: [:provision_core],
+           installed: fn -> "2026.7.3" end,
+           ping: fn -> :ok end,
+           image_present: fn _version -> send(parent, :image_checked) && true end,
+           stops: fn ->
+             count = :atomics.get(stops, 1)
+             send(parent, {:stops_read, count})
+             count
+           end,
+           start: start,
+           await_healthy: fn -> send(parent, :healthy) && :healthy end,
+           retry_base: 1,
+           name: nil}
+        )
+
+      assert_receive :image_checked, 1_000
+      pid
+    end
+
+    test "is retried until it succeeds" do
+      parent = self()
+      stops = :atomics.new(1, [])
+      starts = :counters.new(1, [])
+
+      start = fn seen ->
+        :counters.add(starts, 1, 1)
+        send(parent, {:start, seen, :counters.get(starts, 1)})
+        if :counters.get(starts, 1) < 2, do: {:error, {:failed, :create, "boom"}}, else: :ok
+      end
+
+      capture_log(fn ->
+        pid = idle_provisioner(stops, start)
+        Provisioner.retry_core_start(0, pid)
+        assert_receive {:start, 0, 1}, 1_000
+        assert_receive {:start, 0, 2}, 1_000
+        assert_receive :healthy, 1_000
+      end)
+    end
+
+    test "ends once Core is stopped after the boot's attempt" do
+      parent = self()
+      stops = :atomics.new(1, [])
+
+      start = fn seen ->
+        send(parent, {:start, seen})
+        # The user's POST /core/stop lands while this start fails.
+        :atomics.put(stops, 1, 1)
+        {:error, :busy}
+      end
+
+      log =
+        capture_log(fn ->
+          pid = idle_provisioner(stops, start)
+          Provisioner.retry_core_start(0, pid)
+          assert_receive {:start, 0}, 1_000
+          # The retry's own read sees the stop, and goes no further.
+          assert_receive {:stops_read, 1}, 1_000
+          :sys.get_state(pid)
+          refute_received {:start, _}
+        end)
+
+      assert log =~ "not starting it"
+    end
+  end
+
+  test "a stop of Core while a failed pull backs off ends the pulls" do
+    parent = self()
+    stops = :atomics.new(1, [])
+
+    log =
+      capture_log(fn ->
+        pid =
+          start_supervised!(
+            {Provisioner,
+             steps: [:provision_core],
+             installed: fn -> "2026.7.3" end,
+             ping: fn -> :ok end,
+             image_present: fn _version -> false end,
+             connection: fn -> :internet end,
+             stops: fn ->
+               count = :atomics.get(stops, 1)
+               send(parent, {:stops_read, count})
+               count
+             end,
+             pull: fn version ->
+               send(parent, {:pull, version})
+               :atomics.put(stops, 1, 1)
+               {:error, {:pull, :timeout}}
+             end,
+             start: fn _seen -> send(parent, :start) && :ok end,
+             retry_base: 1,
+             name: nil}
+          )
+
+        assert_receive {:pull, "2026.7.3"}, 1_000
+        assert_receive {:stops_read, 1}, 1_000
+        :sys.get_state(pid)
+        refute_received {:pull, _}
+        refute_received :start
+      end)
+
+    assert log =~ "not starting it"
+  end
+
+  test "a start that fails after an install is retried until it succeeds" do
+    parent = self()
+    starts = :counters.new(1, [])
+
+    log =
+      capture_log(fn ->
+        start_supervised!(
+          {Provisioner,
+           steps: [:provision_core],
+           installed: fn -> nil end,
+           ping: fn -> :ok end,
+           connection: fn -> :internet end,
+           update: fn -> {:ok, "2026.7.3"} end,
+           start: fn ->
+             :counters.add(starts, 1, 1)
+             send(parent, {:start, :counters.get(starts, 1)})
+             if :counters.get(starts, 1) < 3, do: {:error, :busy}, else: :ok
+           end,
+           await_healthy: fn -> send(parent, :await_healthy) && :healthy end,
+           retry_base: 1,
+           name: nil}
+        )
+
+        for n <- 1..3, do: assert_receive({:start, ^n}, 1_000)
+        assert_receive :await_healthy, 1_000
+      end)
+
+    assert log =~ "Core start failed (:busy) — retrying in 1ms"
+    assert log =~ "Core start failed (:busy) — retrying in 2ms"
   end
 
   test "happy path: engine retries, net retries, update -> start -> await_healthy in order" do
@@ -346,24 +626,26 @@ defmodule Vagus.ProvisionerTest do
 
     log =
       capture_log(fn ->
-        start_supervised!(
-          {Provisioner,
-           steps: [:provision_core],
-           installed: fn -> nil end,
-           ping: ping,
-           connection: connection,
-           update: update,
-           start: start,
-           await_healthy: await_healthy,
-           engine_interval: 1,
-           net_interval: 1,
-           name: nil}
-        )
+        pid =
+          start_supervised!(
+            {Provisioner,
+             steps: [:provision_core],
+             installed: fn -> nil end,
+             ping: ping,
+             connection: connection,
+             update: update,
+             start: start,
+             await_healthy: await_healthy,
+             engine_interval: 1,
+             net_interval: 1,
+             name: nil}
+          )
 
         assert_receive :update_called, 1_000
         assert_receive :start_called, 1_000
         assert_receive :health_called, 1_000
-        Process.sleep(20)
+        # The handler that asked for health has logged by now.
+        :sys.get_state(pid)
       end)
 
     assert log =~ "provisioning complete"
@@ -426,18 +708,20 @@ defmodule Vagus.ProvisionerTest do
 
     log =
       capture_log(fn ->
-        start_supervised!(
-          {Provisioner,
-           steps: [:provision_core],
-           installed: fn -> nil end,
-           ping: fn -> :ok end,
-           connection: fn -> :internet end,
-           update: fn -> {:error, :version_installed} end,
-           start: start,
-           name: nil}
-        )
+        pid =
+          start_supervised!(
+            {Provisioner,
+             steps: [:provision_core],
+             installed: fn -> nil end,
+             ping: fn -> :ok end,
+             connection: fn -> :internet end,
+             update: fn -> send(parent, :update_called) && {:error, :version_installed} end,
+             start: start,
+             name: nil}
+          )
 
-        Process.sleep(20)
+        assert_receive :update_called, 1_000
+        :sys.get_state(pid)
         refute_received :start_called
       end)
 
@@ -462,12 +746,13 @@ defmodule Vagus.ProvisionerTest do
              ping: fn -> :ok end,
              connection: fn -> :internet end,
              update: fn -> {:ok, "2026.7.3"} end,
-             start: fn -> {:error, :boom} end,
+             start: fn -> send(parent, :start_called) && {:error, :boom} end,
              await_healthy: await_healthy,
              name: nil}
           )
 
-        Process.sleep(20)
+        assert_receive :start_called, 1_000
+        :sys.get_state(pid)
         refute_received :health_called
         assert Process.alive?(pid)
       end)
@@ -489,7 +774,7 @@ defmodule Vagus.ProvisionerTest do
     assert Process.alive?(pid)
   end
 
-  # --- issue #45: crash isolation ---------------------------------------
+  # --- crash isolation --------------------------------------------------
 
   test "default_cmd/2: nonexistent binary -> fake exit 127 with message, no raise, no logging" do
     bin = "vagus-test-no-such-binary-#{System.unique_integer([:positive])}"
@@ -529,10 +814,14 @@ defmodule Vagus.ProvisionerTest do
                send(parent, :installed_checked)
                "2026.7.3"
              end,
+             ping: fn -> :ok end,
+             image_present: fn _version -> send(parent, :image_checked) && true end,
              name: nil}
           )
 
         assert_receive :installed_checked, 1_000
+        assert_receive :image_checked, 1_000
+        :sys.get_state(pid)
         assert Process.alive?(pid)
       end)
 
@@ -549,7 +838,8 @@ defmodule Vagus.ProvisionerTest do
              steps: [:provision_core], installed: fn -> raise RuntimeError, "boom" end, name: nil}
           )
 
-        Process.sleep(20)
+        # The step runs in handle_continue, before any system message.
+        :sys.get_state(pid)
         assert Process.alive?(pid)
       end)
 
@@ -564,7 +854,7 @@ defmodule Vagus.ProvisionerTest do
             {Provisioner, steps: [:provision_core], installed: fn -> throw(:boom) end, name: nil}
           )
 
-        Process.sleep(20)
+        :sys.get_state(pid)
         assert Process.alive?(pid)
       end)
 

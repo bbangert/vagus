@@ -29,6 +29,7 @@ defmodule Vagus.App.Units do
       running: &running/0,
       inspect: &running?/1,
       halt: &App.halt/1,
+      stop_containers: if(Engine.podman?(), do: &stop_containers/2),
       core_start: &CoreUnit.start(deadline: &1),
       core_stop: &CoreUnit.stop(deadline: &1),
       gates: Gates.all(),
@@ -127,6 +128,29 @@ defmodule Vagus.App.Units do
       _unknown -> :unknown
     end
   end
+
+  @doc """
+  One engine call that stops a group's containers together, ahead of their
+  halts. Only for podman: each app's own `stop` is a podman process, and a
+  frugal board's two `:ops` permits would queue a group's stops past its
+  budget. `Engine.Podman.stop_all/3` takes the reserved shutdown permit.
+
+  The grace is what fits the budget once podman's kill margin is set aside
+  (`grace_s/1`): podman gives a stop its grace plus that margin whatever
+  `timeout_ms` says, so a longer grace would outlast the budget and be cut
+  off unkilled.
+  """
+  @spec stop_containers([String.t()], non_neg_integer(), keyword()) ::
+          {:ok, [String.t()], [{String.t(), term()}]}
+  def stop_containers(slugs, budget_ms, opts \\ []) do
+    names = for slug <- slugs, do: "addon_" <> slug
+    Engine.stop_all(names, grace_s(budget_ms), [timeout_ms: budget_ms] ++ opts)
+  end
+
+  @doc "The longest grace whose stop, kill margin included, ends within `budget_ms`."
+  @spec grace_s(non_neg_integer()) :: non_neg_integer()
+  def grace_s(budget_ms),
+    do: min(max(div(budget_ms - Engine.Podman.stop_margin_ms(), 1000), 0), Steps.halt_timeout_s())
 
   @spec report(atom(), [{String.t(), :ready | :failed | :pending}]) :: :ok
   def report(step, outcomes) do

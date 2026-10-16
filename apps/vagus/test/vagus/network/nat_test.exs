@@ -399,4 +399,103 @@ defmodule Vagus.Network.NatTest do
       assert calls.() == []
     end
   end
+
+  describe "under podman: one nft table" do
+    @ruleset """
+    table ip vagus
+    flush table ip vagus
+    table ip vagus {
+    \tchain prerouting {
+    \t\ttype nat hook prerouting priority -110; policy accept;
+    \t\tip daddr 172.30.32.2 tcp dport 80 dnat to 172.30.32.2:8888
+    \t}
+    \tchain output {
+    \t\ttype nat hook output priority -110; policy accept;
+    \t\tip daddr 172.30.32.2 tcp dport 80 dnat to 172.30.32.2:8888
+    \t}
+    }
+    """
+
+    setup do
+      dir = Path.join(System.tmp_dir!(), "vagus-nft-#{System.unique_integer([:positive])}")
+      on_exit(fn -> File.rm_rf(dir) end)
+      %{dir: dir}
+    end
+
+    # Records each call with the text of the file nft is handed, read while
+    # the file still exists.
+    defp nft_fake(answer) do
+      test = self()
+
+      fn bin, args ->
+        text = with ["-f", path] <- args, {:ok, text} <- File.read(path), do: text
+        send(test, {:nft, bin, args, text})
+        answer
+      end
+    end
+
+    defp podman_opts(dir, cmd),
+      do:
+        [enabled: true, engine: Vagus.Runtime.Engine.Podman, nft_dir: dir, cmd: cmd] ++
+          [ip: "172.30.32.2", port: 8888]
+
+    test "the ruleset: both hooks at -110, the iptables rule's exact match" do
+      assert Nat.ruleset(ip: "172.30.32.2", port: 8888) == {:ok, @ruleset}
+    end
+
+    test "ensure/1 loads the ruleset with one nft -f, then removes the file", %{dir: dir} do
+      assert Nat.ensure(podman_opts(dir, nft_fake({"", 0}))) == :ok
+      assert_received {:nft, "nft", ["-f", path], @ruleset}
+      refute_received {:nft, _, _, _}
+      refute File.exists?(path)
+      assert Path.dirname(path) == dir
+    end
+
+    test "a refused load is the error, with nft's message, and leaves no file", %{dir: dir} do
+      cmd = nft_fake({"Error: Could not process rule: No such file or directory\n", 1})
+
+      capture_log(fn ->
+        assert {:error, {["-f", path], "Error: Could not process rule" <> _, 1}} =
+                 Nat.ensure(podman_opts(dir, cmd))
+
+        refute File.exists?(path)
+      end)
+    end
+
+    test "never runs iptables-legacy", %{dir: dir} do
+      Nat.ensure(podman_opts(dir, nft_fake({"", 0})))
+      Nat.teardown(podman_opts(dir, nft_fake({"", 0})))
+      assert_received {:nft, "nft", _, _}
+      refute_received {:nft, "iptables-legacy", _, _}
+    end
+
+    test "teardown/1 declares the table before deleting it, so an absent table is fine",
+         %{dir: dir} do
+      assert Nat.teardown(podman_opts(dir, nft_fake({"", 0}))) == :ok
+      assert_received {:nft, "nft", ["-f", _], "table ip vagus\ndelete table ip vagus\n"}
+    end
+
+    test "the port-80 refusal holds here too", %{dir: dir} do
+      capture_log(fn ->
+        opts = Keyword.put(podman_opts(dir, nft_fake({"", 0})), :port, 80)
+        assert Nat.ensure(opts) == {:error, :no_rewrite_needed}
+      end)
+
+      refute_received {:nft, _, _, _}
+    end
+
+    test "nft_cmd/2 reports a missing binary as an exit, never a raise" do
+      assert {_msg, 127} = Nat.nft_cmd("vagus-no-such-nft", ["-f", "/dev/null"])
+    end
+  end
+
+  describe "under balena-engine" do
+    test "the engine Docker keeps iptables-legacy, and writes no nft file" do
+      {cmd, calls} = fake(absent())
+      opts = [engine: Vagus.Runtime.Engine.Docker, nft_dir: "/nonexistent"] ++ opts(cmd)
+      assert Nat.ensure(opts) == :ok
+      assert calls.() |> Enum.map(&elem(&1, 0)) |> Enum.uniq() == [@bin]
+      assert {@bin, ["-t", "nat", "-A", "VAGUS_NAT" | @rule]} in calls.()
+    end
+  end
 end

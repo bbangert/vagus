@@ -17,7 +17,11 @@ defmodule Vagus.Runtime.Engine.Podman do
   must be a registry reference: podman would also take `oci-archive:`,
   `dir:` and other transports, reading a host path an app's config named,
   and `create` imports such an archive even with `--pull=never`. Pulls go
-  through `docker://` so only a registry is ever contacted.
+  through `docker://` so only a registry is ever contacted. A pull of
+  Core's image waits for the pull permit ahead of the others, so a board
+  re-pulling everything (`Vagus.Runtime.Migration`) gets Core back first.
+  While that migration is pending, a pull whose image does not fit beside
+  balena's store is `{:error, {:failed, :pull, :no_space}}`, without podman.
 
   Idempotence comes from flags (`--ignore`, `rm -f -t 0`) rather than
   from parsing, except where podman has none.
@@ -95,6 +99,17 @@ defmodule Vagus.Runtime.Engine.Podman do
     "removing" => :removing
   }
 
+  # Without systemd podman never runs a check on its own.
+  @impl true
+  def schedules_healthchecks?(_opts), do: false
+
+  @doc """
+  The stop margin `grace/1` adds to a stop's grace: podman SIGKILLs only once
+  the grace is spent, so the command needs that long past it.
+  """
+  @spec stop_margin_ms() :: pos_integer()
+  def stop_margin_ms, do: @stop_margin_ms
+
   @impl true
   def ready(opts) do
     case Host.ready(opts[:host]) do
@@ -112,8 +127,12 @@ defmodule Vagus.Runtime.Engine.Podman do
     platform = if p = opts[:platform], do: ["--platform", p], else: []
     args = ["pull", "--quiet" | platform] ++ ["--", "docker://" <> image]
 
+    opts = Keyword.put(opts, :priority, Vagus.Core.Container.image?(image))
+
     case valid_image(:pull, image) do
       :ok ->
+        opts = Keyword.put(opts, :before_run, fn -> room_for(image, opts[:host]) end)
+
         case run(:pull, args, opts, @pull_ms, &clear_spool_on_failure(&1, opts[:host])) do
           {:ok, _id} -> :ok
           {:exit, 125, out} -> {:error, {:pull_failed, registry_message(out)}}
@@ -122,6 +141,26 @@ defmodule Vagus.Runtime.Engine.Podman do
 
       {:error, {:failed, :pull, reason}} ->
         {:error, {:pull_failed, reason}}
+    end
+  end
+
+  # Asked under the pull permit, so no other pull is filling the disk
+  # meanwhile. An unknown answer pulls: it must not keep Core away for good.
+  # A spool an interrupted pull left is cleared first: once stale it is free
+  # space, and a refused pull never reaches the post-failure clear.
+  defp room_for(image, host) do
+    Host.clear_spool(host)
+
+    with migration when is_list(migration) <- Host.migration(host),
+         {:short, need, free} <- Vagus.Runtime.Migration.pull_space(image, migration) do
+      Logger.warning(
+        "Vagus.Runtime.Engine.Podman: #{image} needs #{div(need, 1_048_576)} MiB, " <>
+          "#{div(free, 1_048_576)} MiB free beside balena-engine's store; not pulled"
+      )
+
+      {:error, :no_space}
+    else
+      _room_or_unknown -> :ok
     end
   end
 
@@ -266,20 +305,25 @@ defmodule Vagus.Runtime.Engine.Podman do
     opts = with_deadline(opts, @lifecycle_ms)
 
     with :ok <- valid_name(:remove, name) do
-      # The log is named for the container; a caller holding only its id
-      # (Steps, after a failed start) needs the name looked up first.
-      log_name = if id?(name), do: name_of(name, opts), else: name
+      # The log and the CPU sample are keyed by the container's name; a
+      # caller holding only its id (Steps, after a failed start) needs the
+      # name looked up first.
+      named = if id?(name), do: name_of(name, opts), else: name
 
       case unit(:remove, run(:remove, args, opts, @lifecycle_ms)) do
         result when result in [:ok, {:error, :not_found}] ->
-          Host.forget_sample(opts[:host], name)
-          if log_name, do: remove_log(Host.log_config(opts[:host]).dir, log_name)
+          if named, do: forget(named, opts[:host])
           :ok
 
         other ->
           other
       end
     end
+  end
+
+  defp forget(name, host) do
+    Host.forget_sample(host, name)
+    remove_log(Host.log_config(host).dir, name)
   end
 
   # conmon appends to a log file it finds, so a container recreated under
@@ -431,6 +475,12 @@ defmodule Vagus.Runtime.Engine.Podman do
   Runs the check once. A pass is `:healthy`; otherwise the verdict is the
   stored `Health.Status`, because `healthcheck run` reports this one probe
   while the status honours the start period and the retry count.
+
+  The run and an unhealthy run's follow-up inspect each take a `:health`
+  permit (an `:ops` permit that never queues), so a busy board skips the
+  tick. With none free the result is `{:error, :busy}`. During a shutdown
+  the Host refuses the permit with `:shutting_down`, which this adapter
+  reports as `{:error, :busy}`, as it does a refused pull.
   """
   @impl true
   def healthcheck(name, opts) do
@@ -447,7 +497,7 @@ defmodule Vagus.Runtime.Engine.Podman do
         {:ok, :healthy}
 
       {:exit, 1, _} ->
-        case inspect(name, opts) do
+        case inspect(name, Keyword.put(opts, :class, :health)) do
           {:ok, %Container{health: nil}} -> {:error, :no_healthcheck}
           {:ok, %Container{health: health}} -> {:ok, health}
           {:error, {:failed, :inspect, detail}} -> {:error, {:failed, :healthcheck, detail}}
@@ -816,6 +866,7 @@ defmodule Vagus.Runtime.Engine.Podman do
   end
 
   defp class(:pull), do: :pull
+  defp class(:healthcheck), do: :health
   defp class(:stop_all), do: :shutdown
   defp class(_verb), do: :ops
 
@@ -845,16 +896,25 @@ defmodule Vagus.Runtime.Engine.Podman do
     deadline = with_deadline(opts, default_ms)[:deadline]
     host = opts[:host]
     floor = opts[:floor_ms] || 1
+    before_run = opts[:before_run] || fn -> :ok end
 
     cmd_opts =
       opts
       |> Keyword.take([:env, :cap, :truncate, :discard_stdout, :podman_bin])
       |> Keyword.put(:host, host)
 
-    Host.with_permit(host, opts[:class] || class(verb), max(deadline - now_ms(), 0), fn ->
-      left = max(deadline - now_ms(), floor)
-      args |> Cmd.run(Keyword.put(cmd_opts, :timeout_ms, left)) |> after_run.()
-    end)
+    Host.with_permit(
+      host,
+      opts[:class] || class(verb),
+      max(deadline - now_ms(), 0),
+      fn ->
+        with :ok <- before_run.() do
+          left = max(deadline - now_ms(), floor)
+          args |> Cmd.run(Keyword.put(cmd_opts, :timeout_ms, left)) |> after_run.()
+        end
+      end,
+      priority: opts[:priority] == true
+    )
   end
 
   @doc false
