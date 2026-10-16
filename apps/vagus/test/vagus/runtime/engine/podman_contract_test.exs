@@ -697,9 +697,10 @@ defmodule Vagus.Runtime.Engine.PodmanContractTest do
 
       fake =
         FakePodman.start([
-          {"pull * docker://ghcr.io/vagus/good:1", [{0, "5b0e\n"}]},
+          {"pull * docker://ghcr.io/vagus/good:1", [{0, "5b0e\n", delay_ms: 1_000}]},
           {"pull * docker://ghcr.io/vagus/slow:1", [{0, "", delay_ms: 2_000}]},
-          {"pull *", [{125, "Error: initializing source docker://x: manifest unknown\n"}]}
+          {"pull *",
+           [{125, "Error: initializing source docker://x: manifest unknown\n", delay_ms: 1_000}]}
         ])
 
       host = FakePodman.start_host(fake.bin, root: root)
@@ -714,18 +715,30 @@ defmodule Vagus.Runtime.Engine.PodmanContractTest do
         File.touch!(dir, System.os_time(:second) - 3_600)
       end
 
+      pulls = fn -> Enum.count(FakePodman.verbs(fake), &match?(["pull" | _], &1)) end
+
+      # Leaked once podman runs, past the pull's own preflight clear.
+      pull_leaking = fn image, extra ->
+        n = pulls.()
+        task = Task.async(fn -> Engine.pull(image, extra ++ opts) end)
+
+        Enum.find(1..1_000, fn _ -> pulls.() > n or (Process.sleep(5) && false) end) ||
+          flunk("#{image} never reached podman")
+
+        leak.()
+        Task.await(task, 10_000)
+      end
+
       live = Path.join(spool, "live")
       File.mkdir_p!(live)
 
-      leak.()
-      :ok = Engine.pull("ghcr.io/vagus/good:1", opts)
+      assert pull_leaking.("ghcr.io/vagus/good:1", []) == :ok
       assert length(File.ls!(spool)) == 2
 
-      {:error, {:pull_failed, _}} = Engine.pull("ghcr.io/vagus/bad:1", opts)
+      {:error, {:pull_failed, _}} = pull_leaking.("ghcr.io/vagus/bad:1", [])
       assert File.ls!(spool) == ["live"]
 
-      leak.()
-      assert Engine.pull("ghcr.io/vagus/slow:1", [timeout_ms: 200] ++ opts) == {:error, :timeout}
+      assert pull_leaking.("ghcr.io/vagus/slow:1", timeout_ms: 1_000) == {:error, :timeout}
       assert File.ls!(spool) == ["live"]
     end
 
@@ -944,6 +957,54 @@ defmodule Vagus.Runtime.Engine.PodmanContractTest do
                {:error, {:pull, {:failed, :pull, :no_space}}}
 
       refute Enum.any?(FakePodman.verbs(fake), &match?(["pull" | _], &1))
+    end
+
+    test "a stale spool an earlier pull left is cleared before the room check" do
+      root = Path.join(System.tmp_dir!(), "podman-stale-#{System.unique_integer([:positive])}")
+      File.mkdir_p!(Path.join(root, "balena-engine"))
+      File.write!(Path.join(root, "mountinfo"), "")
+      on_exit(fn -> File.rm_rf(root) end)
+
+      host_root = Path.join(root, "host")
+      leaked = Path.join(host_root, "storage/tmp/leaked")
+
+      # Room exists only once the leaked layers are gone.
+      df = fn _ ->
+        avail = if File.exists?(leaked), do: 10, else: 99_999_999
+
+        {"Filesystem 1K-blocks Used Available Use% Mounted on\n/dev/root 9999 1 #{avail} 1% /\n",
+         0}
+      end
+
+      fake = FakePodman.start([{"pull *", [{0, "5b0e\n"}]}])
+
+      host =
+        FakePodman.start_host(fake.bin,
+          root: host_root,
+          spool_quiet_ms: 60_000,
+          migration: [
+            legacy_root: Path.join(root, "balena-engine"),
+            marker: Path.join(root, "engine-migrated"),
+            config_dir: Path.join(root, "core/config"),
+            mountinfo: Path.join(root, "mountinfo"),
+            validated?: fn -> false end,
+            wanted_images: fn -> {:ok, ["ghcr.io/vagus/app:1"]} end,
+            core_image: fn -> nil end,
+            image_present?: fn _ -> false end,
+            notify: fn _ -> :ok end,
+            df: df
+          ]
+        )
+
+      File.mkdir_p!(leaked)
+      File.write!(Path.join(leaked, "layer"), "x")
+      hour_ago = "@#{System.os_time(:second) - 3_600}"
+      {_, 0} = System.cmd("find", [leaked, "-exec", "touch", "-h", "-d", hour_ago, "{}", "+"])
+
+      opts = [engine: Engine.Podman, host: host, podman_bin: fake.bin]
+
+      assert Engine.pull("ghcr.io/vagus/app:1", opts) == :ok
+      refute File.exists?(leaked)
     end
 
     test "an app asking first is refused the room Core still needs, and Core then pulls" do

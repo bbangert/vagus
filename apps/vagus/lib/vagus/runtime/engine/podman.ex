@@ -146,7 +146,11 @@ defmodule Vagus.Runtime.Engine.Podman do
 
   # Asked under the pull permit, so no other pull is filling the disk
   # meanwhile. An unknown answer pulls: it must not keep Core away for good.
+  # A spool an interrupted pull left is cleared first: once stale it is free
+  # space, and a refused pull never reaches the post-failure clear.
   defp room_for(image, host) do
+    Host.clear_spool(host)
+
     with migration when is_list(migration) <- Host.migration(host),
          {:short, need, free} <- Vagus.Runtime.Migration.pull_space(image, migration) do
       Logger.warning(
