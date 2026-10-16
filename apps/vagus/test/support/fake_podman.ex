@@ -131,7 +131,12 @@ defmodule Vagus.Test.FakePodman do
           name_servers: fn -> [] end,
           run: fn _bin, _args -> {"", 0} end,
           shutting_down?: fn -> false end,
-          prep_retry_ms: 60_000
+          prep_retry_ms: 60_000,
+          migration: [
+            legacy_root: Path.join(root, "balena-engine"),
+            marker: Path.join(root, "engine-migrated"),
+            config_dir: Path.join(root, "core/config")
+          ]
         ],
         opts
       )

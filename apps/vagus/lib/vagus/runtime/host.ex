@@ -14,12 +14,29 @@ defmodule Vagus.Runtime.Host do
   The pull spool is emptied once per VM boot: a marker in `/run` keeps a
   Vagus restart from deleting the spool of a pull still running.
 
+  On a board coming from balena-engine, `Vagus.Runtime.Migration.prepare/1`
+  runs here too, so Core's config is moved, when it is due, before Core can
+  be created. Only the first preparation of a boot may move it: a Host
+  restarted later would move it from under a running Core.
+
+  ## Migration
+
+  While `Vagus.Runtime.Migration.pending?/1`, a task under
+  `Vagus.TaskSupervisor`, at low priority, runs `Migration.check/2` once
+  podman answers and then every `:migration_check_ms` (5 min) until the
+  migration is complete. The task polls what it needs (the slot's
+  validation, podman's images, Core's health), so nothing has to report
+  to it. Until its first check finds room for the images to pull,
+  `:pull` requests queue; while there is no room they are refused with
+  `:no_space`.
+
   ## Permits
 
   `:pull` (1), `:ops` (2 frugal, 4 fast) and one reserved `:shutdown` permit
   for `stop_all`. Holders and waiters are monitored, so a crashed holder
   frees its permit. Once `Vagus.Host.Shutdown.in_flight?/0` is true, new
-  and queued `:pull` requests are refused.
+  and queued `:pull` requests are refused. A request made with
+  `priority: true` (Core's pulls) waits at the head of its queue.
 
   A `:health` request takes an `:ops` permit but never queues: a scheduled
   check that would wait behind real work is better skipped, and the next
@@ -40,6 +57,7 @@ defmodule Vagus.Runtime.Host do
   require Logger
 
   alias Vagus.Engine.ResolvConf
+  alias Vagus.Runtime.Migration
   alias Vagus.Runtime.Podman.Cmd
 
   @frugal_below_kb 2 * 1024 * 1024
@@ -81,7 +99,8 @@ defmodule Vagus.Runtime.Host do
   `:name_servers` (0-arity fun), `:run` (`fn bin, args -> {out, status}`,
   for `mount`), `:probe` (`fn opts -> :ok | {:error, reason}`),
   `:shutting_down?` (0-arity fun), `:prep_retry_ms`, `:permits`,
-  `:spool_quiet_ms`, `:log_dir`, `:mountinfo`.
+  `:spool_quiet_ms`, `:log_dir`, `:mountinfo`, `:migration` (options for
+  `Vagus.Runtime.Migration`), `:migration_check_ms`, `:task_supervisor`.
   """
   def start_link(opts) do
     name = Keyword.get(opts, :name, __MODULE__)
@@ -215,29 +234,31 @@ defmodule Vagus.Runtime.Host do
   end
 
   @doc """
-  Takes a permit of `class`, waiting up to `wait_ms` behind other holders.
-  `{:error, :busy}` when the wait runs out (at once for `:health`),
-  `:shutting_down` for a `:pull` or `:health` during shutdown,
-  `:unavailable` when no Host runs.
+  Takes a permit of `class`, waiting up to `wait_ms` behind other holders,
+  or ahead of them with `priority: true`. `{:error, :busy}` when the wait
+  runs out (at once for `:health`), `:shutting_down` for a `:pull` or
+  `:health` during shutdown, `:no_space` for a `:pull` the migration found
+  no room for, `:unavailable` when no Host runs.
   """
-  @spec checkout(atom() | nil, class(), non_neg_integer()) ::
-          {:ok, permit()} | {:error, :busy | :shutting_down | :unavailable | :badarg}
-  def checkout(host, class, wait_ms) do
+  @spec checkout(atom() | nil, class(), non_neg_integer(), keyword()) ::
+          {:ok, permit()}
+          | {:error, :busy | :shutting_down | :no_space | :unavailable | :badarg}
+  def checkout(host, class, wait_ms, opts \\ []) do
     case GenServer.whereis(host || __MODULE__) do
       nil -> {:error, :unavailable}
-      pid -> checkout_from(pid, class, wait_ms)
+      pid -> checkout_from(pid, class, wait_ms, Keyword.get(opts, :priority, false))
     end
   end
 
   # Everything goes to this one Host: a restarted Host knows nothing of a
   # request made to the one before, so its death ends the wait.
-  defp checkout_from(pid, class, wait_ms) do
+  defp checkout_from(pid, class, wait_ms, priority?) do
     ref = make_ref()
     mon = Process.monitor(pid)
     deadline = System.monotonic_time(:millisecond) + wait_ms
 
     try do
-      GenServer.call(pid, {:acquire, class, ref}, max(wait_ms, 1))
+      GenServer.call(pid, {:acquire, class, ref, priority?}, max(wait_ms, 1))
     catch
       :exit, {:timeout, _} -> abandon(pid, ref)
       :exit, _ -> {:error, :unavailable}
@@ -264,11 +285,11 @@ defmodule Vagus.Runtime.Host do
   @spec checkin(permit()) :: :ok
   def checkin({host, ref}), do: GenServer.cast(host, {:release, ref})
 
-  @spec with_permit(atom() | nil, class(), non_neg_integer(), (-> result)) ::
-          result | {:error, :busy | :shutting_down | :unavailable}
+  @spec with_permit(atom() | nil, class(), non_neg_integer(), (-> result), keyword()) ::
+          result | {:error, :busy | :shutting_down | :no_space | :unavailable}
         when result: term()
-  def with_permit(host, class, wait_ms, fun) do
-    case checkout(host, class, wait_ms) do
+  def with_permit(host, class, wait_ms, fun, opts \\ []) do
+    case checkout(host, class, wait_ms, opts) do
       {:ok, permit} ->
         try do
           fun.()
@@ -319,6 +340,10 @@ defmodule Vagus.Runtime.Host do
       permits: Keyword.get(opts, :permits, @permits.frugal),
       free: %{},
       holders: %{},
+      migration: nil,
+      migration_task: nil,
+      space_errors: 0,
+      pull_gate: :open,
       waiting: %{pull: :queue.new(), ops: :queue.new(), shutdown: :queue.new()}
     }
 
@@ -339,11 +364,13 @@ defmodule Vagus.Runtime.Host do
     state = state |> apply_profile() |> publish(:preparing)
     mount_log_tmpfs(state.opts, state.profile)
     clear_spool_once(state.opts)
+    state = prepare_migration(state)
     {:noreply, start_probe(state)}
   end
 
   @impl true
-  def handle_call({:acquire, :health, ref}, {pid, _tag}, state) do
+  # Not behind the pull gate: a health check needs no disk.
+  def handle_call({:acquire, :health, ref, _priority?}, {pid, _tag}, state) do
     cond do
       shutting_down?(state.opts) -> {:reply, {:error, :shutting_down}, state}
       state.free[:ops] > 0 -> {:reply, :granted, grant(state, :ops, ref, pid)}
@@ -351,21 +378,25 @@ defmodule Vagus.Runtime.Host do
     end
   end
 
-  def handle_call({:acquire, class, _ref}, _from, state)
+  def handle_call({:acquire, class, _ref, _priority?}, _from, state)
       when not is_map_key(state.free, class),
       do: {:reply, {:error, :badarg}, state}
 
-  def handle_call({:acquire, class, ref}, {pid, _tag}, state) do
+  def handle_call({:acquire, class, ref, priority?}, {pid, _tag}, state) do
     cond do
       class == :pull and shutting_down?(state.opts) ->
         {:reply, {:error, :shutting_down}, state}
 
-      state.free[class] > 0 ->
+      class == :pull and match?({:short, _, _}, state.pull_gate) ->
+        {:reply, {:error, :no_space}, state}
+
+      state.free[class] > 0 and gate_open?(state, class) ->
         {:reply, :granted, grant(state, class, ref, pid)}
 
       true ->
         entry = {ref, pid, Process.monitor(pid)}
-        waiting = Map.update!(state.waiting, class, &:queue.in(entry, &1))
+        enqueue = if priority?, do: &:queue.in_r/2, else: &:queue.in/2
+        waiting = Map.update!(state.waiting, class, &enqueue.(entry, &1))
         {:reply, :queued, %{state | waiting: waiting}}
     end
   end
@@ -383,6 +414,21 @@ defmodule Vagus.Runtime.Host do
 
   def handle_info({:DOWN, ref, :process, _pid, reason}, %{probe: ref} = state),
     do: {:noreply, probed(%{state | probe: nil}, {:error, {:probe_crashed, reason}})}
+
+  def handle_info({ref, result}, %{migration_task: ref} = state) do
+    Process.demonitor(ref, [:flush])
+    {:noreply, migration_checked(%{state | migration_task: nil}, result)}
+  end
+
+  def handle_info({:DOWN, ref, :process, _pid, reason}, %{migration_task: ref} = state) do
+    Logger.error("Vagus.Runtime.Host: migration check crashed: #{inspect(reason)}")
+    crashed = {:error, {:crashed, reason}}
+
+    {:noreply,
+     migration_checked(%{state | migration_task: nil}, %{space: crashed, cleanup: crashed})}
+  end
+
+  def handle_info(:migration_check, state), do: {:noreply, start_migration_check(state)}
 
   def handle_info({:DOWN, mon, :process, _pid, _reason}, state) do
     held = for {ref, {_class, _pid, ^mon}} <- state.holders, do: ref
@@ -419,6 +465,22 @@ defmodule Vagus.Runtime.Host do
       {nil, _} ->
         drop_waiter(state, ref)
     end
+  end
+
+  defp gate_open?(state, :pull), do: state.pull_gate == :open
+  defp gate_open?(_state, _class), do: true
+
+  defp hand_over(%{pull_gate: :checking} = state, :pull), do: state
+
+  defp hand_over(%{pull_gate: {:short, _, _}} = state, :pull) do
+    {gone, waiting} = {state.waiting.pull, :queue.new()}
+
+    for {ref, pid, mon} <- :queue.to_list(gone) do
+      Process.demonitor(mon, [:flush])
+      send(pid, {__MODULE__, :refused, ref, :no_space})
+    end
+
+    %{state | waiting: Map.put(state.waiting, :pull, waiting)}
   end
 
   defp hand_over(state, class) do
@@ -479,7 +541,7 @@ defmodule Vagus.Runtime.Host do
     %{state | probe: Task.Supervisor.async_nolink(supervisor, fn -> probe.(opts) end).ref}
   end
 
-  defp probed(state, :ok), do: publish(state, :ready)
+  defp probed(state, :ok), do: state |> publish(:ready) |> start_migration_check()
 
   defp probed(state, {:error, reason}) do
     Logger.error("Vagus.Runtime.Host: podman probe failed: #{inspect(reason)}")
@@ -494,6 +556,106 @@ defmodule Vagus.Runtime.Host do
       {:error, reason} -> {:error, reason}
     end
   end
+
+  # The run marker is written whatever the outcome: a later preparation in
+  # this boot must never move the config under a Core created since.
+  # sobelow_skip ["Traversal.FileModule"]
+  defp prepare_migration(state) do
+    opts = migration_opts(state)
+    marker = Path.join(run_dir(state.opts), "migration-prepared")
+    Migration.prepare(Keyword.put(opts, :rename?, not File.exists?(marker)))
+    _ = File.write(marker, "")
+
+    if Migration.pending?(opts),
+      do: %{state | migration: opts, pull_gate: :checking},
+      else: state
+  end
+
+  defp migration_opts(state) do
+    Keyword.merge(
+      [host: state.name, graphroot: graphroot(state.opts)],
+      Keyword.get(state.opts, :migration, [])
+    )
+  end
+
+  defp start_migration_check(%{migration: opts, migration_task: nil} = state)
+       when opts != nil do
+    space? = state.pull_gate != :open
+    supervisor = Keyword.get(state.opts, :task_supervisor, Vagus.TaskSupervisor)
+
+    task =
+      Task.Supervisor.async_nolink(supervisor, fn ->
+        # Deleting balena's store walks a large tree; nothing waits on it.
+        Process.flag(:priority, :low)
+        Migration.check(opts, space?: space?)
+      end)
+
+    %{state | migration_task: task.ref}
+  end
+
+  defp start_migration_check(state), do: state
+
+  defp migration_checked(state, %{space: space, cleanup: cleanup}) do
+    state = gate_pulls(state, space)
+
+    case cleanup do
+      :done ->
+        %{state | migration: nil} |> open_pulls()
+
+      _waiting_or_failed ->
+        # Quick while pulls wait on the first answer, slow after.
+        delay =
+          if state.pull_gate == :checking,
+            do: Keyword.get(state.opts, :prep_retry_ms, 5_000),
+            else: Keyword.get(state.opts, :migration_check_ms, 300_000)
+
+        Process.send_after(self(), :migration_check, delay)
+        state
+    end
+  end
+
+  # After three unknown answers pulls go ahead: a df or a store that cannot
+  # be read must not keep Core from ever being pulled.
+  @space_errors_allowed 3
+
+  defp gate_pulls(state, nil), do: state
+  defp gate_pulls(state, :ok), do: open_pulls(state)
+
+  defp gate_pulls(state, {:short, need, free}) do
+    Logger.warning(
+      "Vagus.Runtime.Host: migration needs #{mib(need)} MiB for images, " <>
+        "#{mib(free)} MiB free beside balena's store; no image is pulled until there is room"
+    )
+
+    hand_over(%{state | pull_gate: {:short, need, free}}, :pull)
+  end
+
+  defp gate_pulls(state, {:error, reason}) do
+    errors = state.space_errors + 1
+
+    if errors >= @space_errors_allowed do
+      Logger.warning(
+        "Vagus.Runtime.Host: free space for the migration unknown (#{inspect(reason)}); pulling anyway"
+      )
+
+      open_pulls(%{state | space_errors: errors})
+    else
+      %{state | space_errors: errors}
+    end
+  end
+
+  defp open_pulls(state), do: drain(%{state | pull_gate: :open}, :pull)
+
+  defp drain(state, class) do
+    if state.free[class] > 0 and not :queue.is_empty(state.waiting[class]) do
+      next = hand_over(state, class)
+      if next == state, do: state, else: drain(next, class)
+    else
+      state
+    end
+  end
+
+  defp mib(bytes), do: div(bytes, 1_048_576)
 
   defp make_root_shared(opts) do
     run = Keyword.get(opts, :run, &Vagus.Host.Cmd.run/2)
@@ -695,8 +857,9 @@ defmodule Vagus.Runtime.Host do
     end
   end
 
-  defp spool_dir(opts),
-    do: Path.join(Keyword.get(opts, :graphroot, "/root/containers/storage"), "tmp")
+  defp spool_dir(opts), do: Path.join(graphroot(opts), "tmp")
+
+  defp graphroot(opts), do: Keyword.get(opts, :graphroot, "/root/containers/storage")
 
   defp run_dir(opts), do: Keyword.get(opts, :run_dir, "/run/vagus/podman")
 

@@ -43,7 +43,12 @@ defmodule Vagus.Runtime.Engine.PodmanLiveTest do
         resolv_conf: Path.join(root, "resolv.conf"),
         log_dir: logs,
         run: fn _bin, _args -> {"", 0} end,
-        shutting_down?: fn -> false end
+        shutting_down?: fn -> false end,
+        migration: [
+          legacy_root: Path.join(root, "balena-engine"),
+          marker: Path.join(root, "engine-migrated"),
+          config_dir: Path.join(root, "core/config")
+        ]
       )
 
     Process.unlink(pid)
