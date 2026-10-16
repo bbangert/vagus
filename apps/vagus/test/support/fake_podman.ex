@@ -6,8 +6,10 @@ defmodule Vagus.Test.FakePodman do
   Rules match the argv after podman's global flags, joined by spaces, as a
   shell glob (`"container inspect *"`); the first matching rule answers.
   Each rule holds responses used in order, the last one repeating:
-  `{exit_status, output}`, or `{exit_status, output, delay_ms: n}`. An
-  output of `:killed` makes the fake SIGKILL itself. `info` answers 0
+  `{exit_status, output}`, or `{exit_status, output, delay_ms: n}`. With
+  `hold: true` the response waits until the test calls `release/1`, so a
+  call stays in flight for exactly as long as the test needs. An output of
+  `:killed` makes the fake SIGKILL itself. `info` answers 0
   unless a rule says otherwise; anything unscripted exits 125.
 
   Every invocation is logged: `calls/1` returns each argv (globals
@@ -51,6 +53,9 @@ defmodule Vagus.Test.FakePodman do
       echo "$n" > "$dir/r$1.n"
       rmdir "$dir/r$1.lock"
       [ -f "$dir/r$1.$n.delay" ] && sleep "$(cat "$dir/r$1.$n.delay")"
+      if [ -f "$dir/r$1.$n.hold" ]; then
+        while [ ! -e "$dir/release" ]; do sleep 0.02; done
+      fi
       [ -f "$dir/r$1.$n.kill" ] && kill -9 $$
       cat "$dir/r$1.$n.out"
       exit "$(cat "$dir/r$1.$n.code")"
@@ -86,7 +91,11 @@ defmodule Vagus.Test.FakePodman do
     if output == :killed, do: File.write!(base <> ".kill", "")
     File.write!(base <> ".out", if(output == :killed, do: "", else: output))
     if ms = opts[:delay_ms], do: File.write!(base <> ".delay", to_string(ms / 1000))
+    if opts[:hold], do: File.write!(base <> ".hold", "")
   end
+
+  @doc "Lets every held response answer, now and from here on."
+  def release(%__MODULE__{dir: dir}), do: File.write!(Path.join(dir, "release"), "")
 
   def calls(%__MODULE__{dir: dir}), do: read_log(dir, "calls")
   def envs(%__MODULE__{dir: dir}), do: read_log(dir, "envs")

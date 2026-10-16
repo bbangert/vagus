@@ -819,13 +819,12 @@ defmodule Vagus.Runtime.Engine.PodmanContractTest do
     test "an unhealthy run's follow-up inspect skips rather than queue behind ops" do
       fake =
         FakePodman.start([
-          {"healthcheck run *", [{1, "unhealthy\n", delay_ms: 2_000}]},
+          {"healthcheck run *", [{1, "unhealthy\n", hold: true}]},
           {"container inspect *", [{0, Leg.inspect_out(Leg.running_json())}]}
         ])
 
       host = FakePodman.start_host(fake.bin, permits: %{pull: 1, ops: 2, shutdown: 1})
       opts = [engine: Engine.Podman, host: host, podman_bin: fake.bin, timeout_ms: 20_000]
-      started = System.monotonic_time(:millisecond)
       check = Task.async(fn -> Engine.healthcheck("addon_local_x", opts) end)
 
       Enum.find(1..1_000, fn _ ->
@@ -833,13 +832,15 @@ defmodule Vagus.Runtime.Engine.PodmanContractTest do
       end) || flunk("the check never ran")
 
       # The other permit taken, the holder queues behind the run and is
-      # handed the permit the run frees.
+      # handed the permit the run frees; only then does the run answer.
       {:ok, _other} = Vagus.Runtime.Host.checkout(host, :ops, 0)
       holder = Task.async(fn -> Vagus.Runtime.Host.checkout(host, :ops, 30_000) end)
       await_waiter(host)
+      released = System.monotonic_time(:millisecond)
+      FakePodman.release(fake)
 
       assert Task.await(check, 30_000) == {:error, :busy}
-      assert System.monotonic_time(:millisecond) - started < 10_000
+      assert System.monotonic_time(:millisecond) - released < 10_000
       refute Enum.any?(FakePodman.calls(fake), &("inspect" in &1))
       assert {:ok, _permit} = Task.await(holder)
     end
