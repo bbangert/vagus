@@ -676,6 +676,36 @@ defmodule Vagus.App.StepsTest do
     end
   end
 
+  describe "during a shutdown" do
+    @describetag :tmp_dir
+
+    test "a container app's start and image check refuse, and create or pull nothing", ctx do
+      down = %{shutting_down?: fn -> true end}
+
+      assert {:error, :shutting_down} = Steps.run(:start, input(ctx, down))
+      assert {:error, :shutting_down} = Steps.run(:ensure_image, input(ctx, down))
+      refute_received {:create, _spec}
+      refute_received {:stop, _id}
+      refute_received {:pull, _spec}
+      refute File.exists?(options_path(ctx.data_root))
+    end
+
+    test "a native app still starts: the BEAM runs it, and no halt stops it", ctx do
+      native = %{test_config(%{"slug" => "core_mqtt", "backend" => "native"}) | image: nil}
+
+      assert {:ok, %{container_id: "fake-id"}} =
+               Steps.run(
+                 :start,
+                 input(ctx, %{slug: "core_mqtt", config: native, shutting_down?: fn -> true end})
+               )
+    end
+
+    test "other steps are not refused", ctx do
+      assert {:ok, %{was_running: true}} =
+               Steps.run(:stop, input(ctx, %{shutting_down?: fn -> true end}))
+    end
+  end
+
   describe "ensure_image" do
     @describetag :tmp_dir
 
@@ -799,6 +829,8 @@ defmodule Vagus.App.StepsTest do
       assert fact.health_check == {:unknown, podman, 0}
 
       assert {:ok, %{interval_ms: 30_000}} = Steps.health_schedule("fake-id", podman)
+      assert {:inspect, inspect_opts} = List.last(Fake.call_opts(fake))
+      assert inspect_opts[:class] == :health
 
       Fake.fail_next(fake, :inspect, :timeout)
       {:ok, fact} = Steps.run(:start, input(ctx, %{engine_opts: engine_opts}))

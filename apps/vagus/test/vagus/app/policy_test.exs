@@ -472,6 +472,26 @@ defmodule Vagus.App.PolicyTest do
     end
   end
 
+  describe "a start refused because a shutdown is in flight" do
+    test "ends as a halt would: the reply says so, and nothing is recorded or armed" do
+      for name <- [:ensure_image, :start] do
+        data = app(%{wanted: :started, watchdog: true, shutting_down: true, token_hash: "h"})
+        plan = Policy.plan(:start, %{retry: true}, data)
+        {data, _} = Policy.next(plan, :begin, data)
+        data = put_in(data.run.step, {name, nil})
+        before = data.last_event
+
+        {after_refusal, effects} = Policy.next(data.run, {:error, :shutting_down}, data)
+
+        assert {:reply, {:error, :shutting_down}} in effects
+        assert List.last(effects) == :idle
+        refute :persist in effects
+        refute Enum.any?(effects, &match?({:timer, _, _, _}, &1))
+        assert %{last_event: ^before, wanted: :started, token_hash: nil} = after_refusal
+      end
+    end
+  end
+
   describe "a schedule the start could not inspect" do
     @unknown {:unknown, [engine: :fake], 0}
     @schedule %{first_ms: 40_000, interval_ms: 30_000, engine_opts: [engine: :fake]}

@@ -832,6 +832,15 @@ defmodule Vagus.App.Policy do
 
   defp on_outcome(_op, :pull, _, {:ok, _ref}, data), do: advance(data, [])
 
+  # Refused because a shutdown is in flight: the op ends as a halt would end
+  # it, replying `:shutting_down` and recording nothing, so the next boot
+  # starts what the app wanted and no restart is armed.
+  defp on_outcome(_op, name, _, {:error, :shutting_down}, data)
+       when name in [:ensure_image, :start] do
+    {data, effects} = drop_run_keys(data)
+    {data, effects ++ [{:reply, {:error, :shutting_down}}, :idle]}
+  end
+
   defp on_outcome(_op, :ensure_image, _, {:ok, _ref}, data),
     do: advance(%{data | image_attempt: 0}, [])
 

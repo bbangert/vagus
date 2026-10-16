@@ -53,7 +53,22 @@ defmodule Vagus.App.Steps do
   @spec halt_timeout_s() :: pos_integer()
   def halt_timeout_s, do: @halt_timeout_s
 
+  # Once a shutdown is in flight no container is fetched or started: the
+  # group stop has already passed over its name, and its halt would get only
+  # what is left of the budget. A native app runs in the BEAM and is not
+  # halted.
   @spec run(atom(), map()) :: {:ok, term()} | {:error, term()}
+  def run(name, %{config: config} = input) when name in [:ensure_image, :start] do
+    shutting_down? = Map.get(input, :shutting_down?, &Vagus.Host.Shutdown.in_flight?/0)
+
+    if not native?(config) and shutting_down?.() do
+      {:error, :shutting_down}
+    else
+      report_stage(input)
+      step(name, input)
+    end
+  end
+
   def run(name, input) do
     report_stage(input)
     step(name, input)
@@ -383,8 +398,10 @@ defmodule Vagus.App.Steps do
   start could not inspect it: `{:ok, nil}` when it declares no check.
   """
   @spec health_schedule(String.t(), keyword()) :: {:ok, map() | nil} | {:error, term()}
+  # On the health class, as the check's own inspect is: it never queues for
+  # a permit, and none is granted during a shutdown.
   def health_schedule(id, engine_opts) do
-    case Engine.inspect(id, engine_opts) do
+    case Engine.inspect(id, Keyword.put(engine_opts, :class, :health)) do
       {:ok, container} -> {:ok, health_check(container.healthcheck, engine_opts)}
       {:error, reason} -> {:error, reason}
     end
