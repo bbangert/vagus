@@ -1006,6 +1006,43 @@ defmodule Vagus.Runtime.HostTest do
       end)
     end
 
+    test "cleanup failures before the deletion do not use up the dismissal's tries", ctx do
+      test = self()
+
+      notify = fn
+        :dismiss -> send(test, {:notify, :dismiss}) && {:error, :core_down}
+        _raise -> :ok
+      end
+
+      mountinfo = Path.join(ctx.root, "mounts")
+      File.write!(mountinfo, "40 22 0:50 / #{ctx.legacy}/x rw - tmpfs t rw\n")
+
+      log =
+        capture_log(fn ->
+          stepped(ctx,
+            image_present?: fn _ -> false end,
+            df: df(10),
+            mountinfo: mountinfo,
+            notify: notify
+          )
+
+          for _ <- 1..7, do: assert(%{cleanup: {:error, {:mounted, _}}} = next_check())
+
+          File.write!(mountinfo, "")
+          assert %{cleanup: :done, notice: %{}} = next_check()
+
+          # With the store gone no check looks at the images, so none is stepped.
+          for _ <- 2..8,
+              do: assert_receive({:checked, %{cleanup: :done, notice: %{}}}, 5_000)
+
+          assert %{migration: nil, migration_timer: nil} = :sys.get_state(ctx.name)
+        end)
+
+      assert log =~ "giving up"
+      for _ <- 1..8, do: assert_received({:notify, :dismiss})
+      refute_received {:checked, _}
+    end
+
     test "with nothing to migrate, dismisses a warning left from before once, then stops",
          ctx do
       test = self()

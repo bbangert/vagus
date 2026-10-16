@@ -364,6 +364,7 @@ defmodule Vagus.Runtime.Host do
       migration_task: nil,
       migration_timer: nil,
       check_failures: 0,
+      dismissals: 0,
       notice: nil,
       waiting_logged: nil,
       waiting: %{pull: :queue.new(), ops: :queue.new(), shutdown: :queue.new()}
@@ -625,7 +626,7 @@ defmodule Vagus.Runtime.Host do
       :done when notice == nil ->
         finish_migration(state)
 
-      :done when state.check_failures + 1 >= @dismiss_attempts ->
+      :done when state.dismissals + 1 >= @dismiss_attempts ->
         Logger.warning(
           "Vagus.Runtime.Host: Home Assistant did not take the dismissal of the " <>
             "migration's space warning after #{@dismiss_attempts} tries; giving up"
@@ -633,9 +634,12 @@ defmodule Vagus.Runtime.Host do
 
         finish_migration(%{state | notice: nil})
 
-      # Checked on until Home Assistant has dismissed the warning too.
+      # Checked on until Home Assistant has dismissed the warning too. The
+      # cleanup errors before it neither use up the tries nor stretch their
+      # backoff.
       :done ->
-        schedule_check(%{state | check_failures: state.check_failures + 1})
+        dismissals = state.dismissals + 1
+        schedule_check(%{state | dismissals: dismissals, check_failures: dismissals})
 
       {:waiting, condition} ->
         %{log_waiting(state, condition) | check_failures: 0} |> schedule_check()
@@ -648,7 +652,7 @@ defmodule Vagus.Runtime.Host do
 
   defp finish_migration(state) do
     if state.migration_timer, do: Process.cancel_timer(elem(state.migration_timer, 0))
-    state = %{state | migration: nil, migration_timer: nil, check_failures: 0}
+    state = %{state | migration: nil, migration_timer: nil, check_failures: 0, dismissals: 0}
     publish(state, state.published.status)
   end
 

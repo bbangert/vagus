@@ -694,51 +694,39 @@ defmodule Vagus.Runtime.Engine.PodmanContractTest do
 
     test "a failed or killed pull empties the spool; a good one leaves it" do
       root = Path.join(System.tmp_dir!(), "podman-spool-#{System.unique_integer([:positive])}")
+      spool = Path.join(root, "storage/tmp")
+
+      # An interrupted pull's leftovers from an hour ago, made by podman
+      # itself: past the pull's preflight clear, and there before podman can
+      # answer or be killed.
+      leak = [
+        run:
+          ~s(d="#{spool}/layer-$$"; mkdir -p "$d"; touch -d @#{System.os_time(:second) - 3_600} "$d")
+      ]
 
       fake =
         FakePodman.start([
-          {"pull * docker://ghcr.io/vagus/good:1", [{0, "5b0e\n", delay_ms: 1_000}]},
-          {"pull * docker://ghcr.io/vagus/slow:1", [{0, "", delay_ms: 2_000}]},
-          {"pull *",
-           [{125, "Error: initializing source docker://x: manifest unknown\n", delay_ms: 1_000}]}
+          {"pull * docker://ghcr.io/vagus/good:1", [{0, "5b0e\n", leak}]},
+          {"pull * docker://ghcr.io/vagus/slow:1", [{0, "", [hold: true] ++ leak}]},
+          {"pull *", [{125, "Error: initializing source docker://x: manifest unknown\n", leak}]}
         ])
 
       host = FakePodman.start_host(fake.bin, root: root)
       opts = [engine: Engine.Podman, host: host, podman_bin: fake.bin]
-      spool = Path.join(root, "storage/tmp")
 
-      # What an interrupted pull left an hour ago, and what a live one is
-      # writing now: only the first may go.
-      leak = fn ->
-        dir = Path.join(spool, "layer-#{System.unique_integer([:positive])}")
-        File.mkdir_p!(dir)
-        File.touch!(dir, System.os_time(:second) - 3_600)
-      end
-
-      pulls = fn -> Enum.count(FakePodman.verbs(fake), &match?(["pull" | _], &1)) end
-
-      # Leaked once podman runs, past the pull's own preflight clear.
-      pull_leaking = fn image, extra ->
-        n = pulls.()
-        task = Task.async(fn -> Engine.pull(image, extra ++ opts) end)
-
-        Enum.find(1..1_000, fn _ -> pulls.() > n or (Process.sleep(5) && false) end) ||
-          flunk("#{image} never reached podman")
-
-        leak.()
-        Task.await(task, 10_000)
-      end
-
+      # What a live pull is writing now: it stays.
       live = Path.join(spool, "live")
       File.mkdir_p!(live)
 
-      assert pull_leaking.("ghcr.io/vagus/good:1", []) == :ok
+      assert Engine.pull("ghcr.io/vagus/good:1", opts) == :ok
       assert length(File.ls!(spool)) == 2
 
-      {:error, {:pull_failed, _}} = pull_leaking.("ghcr.io/vagus/bad:1", [])
+      {:error, {:pull_failed, _}} = Engine.pull("ghcr.io/vagus/bad:1", opts)
       assert File.ls!(spool) == ["live"]
 
-      assert pull_leaking.("ghcr.io/vagus/slow:1", timeout_ms: 1_000) == {:error, :timeout}
+      assert Engine.pull("ghcr.io/vagus/slow:1", [timeout_ms: 1_000] ++ opts) ==
+               {:error, :timeout}
+
       assert File.ls!(spool) == ["live"]
     end
 

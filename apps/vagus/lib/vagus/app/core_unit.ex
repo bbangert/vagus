@@ -57,7 +57,11 @@ defmodule Vagus.App.CoreUnit do
   end
 
   # A presence check that errors leaves the start to report what is wrong.
+  # The stops are read first: a stop that lands while the check waits on the
+  # engine must still refuse the create.
   defp start_absent(version, opts) do
+    stops_seen = Keyword.get(opts, :stops, &Lifecycle.stops/0).()
+
     case Keyword.get(opts, :image_present?, &Lifecycle.image_present?/1).(version) do
       false ->
         Logger.warning("Boot: Core #{version}'s image is absent; Vagus.Provisioner pulls it")
@@ -65,7 +69,6 @@ defmodule Vagus.App.CoreUnit do
 
       _present_or_unknown ->
         Logger.info("Boot: creating the Core #{version} container")
-        stops_seen = Keyword.get(opts, :stops, &Lifecycle.stops/0).()
 
         case start_unattended(opts, stops_seen) do
           :ok ->

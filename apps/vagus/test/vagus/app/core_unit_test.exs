@@ -164,6 +164,22 @@ defmodule Vagus.App.CoreUnitTest do
       assert_received {:start, 4}
     end
 
+    test "a stop that lands during the presence check refuses boot's create" do
+      stops = :counters.new(1, [])
+
+      assert CoreUnit.start(
+               adopt: fn -> :absent end,
+               installed: fn -> "2026.10.1" end,
+               image_present?: fn _version -> :counters.add(stops, 1, 1) && true end,
+               stops: fn -> :counters.get(stops, 1) end,
+               start: fn seen ->
+                 if seen == :counters.get(stops, 1), do: :ok, else: {:error, :stopped}
+               end,
+               health: fn _opts -> :healthy end,
+               retry: fn _seen -> flunk("handed off") end
+             ) == {:error, :stopped}
+    end
+
     test "a create that succeeds hands nothing off" do
       assert CoreUnit.start(
                adopt: fn -> :absent end,

@@ -8,7 +8,9 @@ defmodule Vagus.Test.FakePodman do
   Each rule holds responses used in order, the last one repeating:
   `{exit_status, output}`, or `{exit_status, output, delay_ms: n}`. With
   `hold: true` the response waits until the test calls `release/1`, so a
-  call stays in flight for exactly as long as the test needs. An output of
+  call stays in flight for exactly as long as the test needs. `run:` is a
+  shell command the invocation runs before any delay or hold: a side effect
+  that has happened by the time podman can answer or be killed. An output of
   `:killed` makes the fake SIGKILL itself. `info` answers 0
   unless a rule says otherwise; anything unscripted exits 125.
 
@@ -52,6 +54,7 @@ defmodule Vagus.Test.FakePodman do
       [ "$n" -gt "$2" ] && n=$2
       echo "$n" > "$dir/r$1.n"
       rmdir "$dir/r$1.lock"
+      [ -f "$dir/r$1.$n.run" ] && . "$dir/r$1.$n.run"
       [ -f "$dir/r$1.$n.delay" ] && sleep "$(cat "$dir/r$1.$n.delay")"
       if [ -f "$dir/r$1.$n.hold" ]; then
         while [ ! -e "$dir/release" ]; do sleep 0.02; done
@@ -92,6 +95,7 @@ defmodule Vagus.Test.FakePodman do
     File.write!(base <> ".out", if(output == :killed, do: "", else: output))
     if ms = opts[:delay_ms], do: File.write!(base <> ".delay", to_string(ms / 1000))
     if opts[:hold], do: File.write!(base <> ".hold", "")
+    if run = opts[:run], do: File.write!(base <> ".run", run)
   end
 
   @doc "Lets every held response answer, now and from here on."
