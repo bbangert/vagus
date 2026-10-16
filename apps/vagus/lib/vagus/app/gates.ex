@@ -39,8 +39,10 @@ defmodule Vagus.App.Gates do
   native apps would leave Core unable to reach the Supervisor. Under podman
   Vagus makes the bridge interface itself (`Vagus.Network.host_bridge?/1`),
   so the anchors have it whatever podman answered. Each step runs whatever
-  the one before returned, and the gate is always `:ok`, so a failure here
-  never holds the apps back. `opts` reach every step (tests).
+  the one before returned, and the gate is always `:ok`, so Core and
+  host-network apps are never held back here. A table that did not load
+  keeps bridged apps from starting instead (`Vagus.Network.Nat.ensure_loaded/1`
+  in their start, which retries the load). `opts` reach every step (tests).
   """
   @spec network(keyword()) :: :ok
   def network(opts \\ []) do
@@ -50,7 +52,11 @@ defmodule Vagus.App.Gates do
     )
 
     Network.ensure_supervisor_ip(opts)
-    warn_unless_ok(Nat.ensure(opts), "supervisor DNAT; apps may not reach http://supervisor/")
+
+    warn_unless_ok(
+      Nat.ensure(opts),
+      "supervisor DNAT and forward filter; bridged apps will not start until it loads"
+    )
 
     # The listener's bind address exists only from here, so its next bind
     # attempt is hurried. An optimisation only: the `api` gate still decides.

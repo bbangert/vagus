@@ -459,6 +459,31 @@ defmodule Vagus.App.StepsTest do
     %{data_root: data_root}
   end
 
+  # NAT switched on against a fake nft whose answer the test sets, with a
+  # load record of its own so no other test's load counts.
+  defp nat(ctx) do
+    test = self()
+    {:ok, answer} = Agent.start_link(fn -> {"", 0} end)
+    key = {__MODULE__, :nat_loaded, make_ref()}
+    on_exit(fn -> :persistent_term.erase(key) end)
+
+    cmd = fn "nft", args ->
+      send(test, {:nft, args})
+      Agent.get(answer, & &1)
+    end
+
+    opts = [
+      enabled: true,
+      cmd: cmd,
+      nft_dir: Path.join(ctx.tmp_dir, "nft"),
+      loaded_key: key,
+      ip: "172.30.32.2",
+      port: 8888
+    ]
+
+    {opts, answer}
+  end
+
   defp options_path(dr, slug \\ "test_app"),
     do: Path.join([dr, "addons", "data", slug, "options.json"])
 
@@ -550,6 +575,62 @@ defmodule Vagus.App.StepsTest do
 
       assert {:ok, %{ip: nil, healthcheck: false}} =
                Steps.run(:start, input(ctx, %{engine_opts: engine_opts}))
+    end
+
+    test "a bridged app is refused until the forward filter loads, then starts", ctx do
+      bridged = test_config(%{"host_network" => false})
+      {_fake, engine_opts} = engine(%{})
+      {nat_opts, answer} = nat(ctx)
+
+      Agent.update(answer, fn _ -> {"Error: Could not process rule\n", 1} end)
+
+      capture_log(fn ->
+        assert {:error, {:isolation_not_loaded, _}} =
+                 Steps.run(
+                   :start,
+                   input(ctx, %{config: bridged, engine_opts: engine_opts, nat_opts: nat_opts})
+                 )
+      end)
+
+      refute_received {:create, _}
+      assert_received {:nft, ["-f", _]}
+
+      Agent.update(answer, fn _ -> {"", 0} end)
+
+      assert {:ok, _} =
+               Steps.run(
+                 :start,
+                 input(ctx, %{config: bridged, engine_opts: engine_opts, nat_opts: nat_opts})
+               )
+
+      assert_received {:nft, ["-f", _]}
+      assert_received {:create, _}
+    end
+
+    test "once the filter has loaded, later bridged starts do not load it again", ctx do
+      bridged = test_config(%{"host_network" => false})
+      {_fake, engine_opts} = engine(%{})
+      {nat_opts, _answer} = nat(ctx)
+
+      for _ <- 1..2 do
+        assert {:ok, _} =
+                 Steps.run(
+                   :start,
+                   input(ctx, %{config: bridged, engine_opts: engine_opts, nat_opts: nat_opts})
+                 )
+      end
+
+      assert_received {:nft, ["-f", _]}
+      refute_received {:nft, _}
+    end
+
+    test "a host-network app starts whatever the forward filter does", ctx do
+      {nat_opts, answer} = nat(ctx)
+      Agent.update(answer, fn _ -> {"Error: Could not process rule\n", 1} end)
+
+      assert {:ok, _} = Steps.run(:start, input(ctx, %{nat_opts: nat_opts}))
+      assert_received {:create, _}
+      refute_received {:nft, _}
     end
 
     test "a native app answers on the supervisor anchor", ctx do

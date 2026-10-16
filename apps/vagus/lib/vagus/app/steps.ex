@@ -17,6 +17,7 @@ defmodule Vagus.App.Steps do
   alias Vagus.DSP
   alias Vagus.Ingress.Panels
   alias Vagus.Network
+  alias Vagus.Network.Nat
   alias Vagus.Runtime.{Engine, Host}
 
   @default_backend Vagus.Addon.Backend.Container
@@ -128,6 +129,7 @@ defmodule Vagus.App.Steps do
          :ok <- ensure_dsp_devices(config, opts),
          :ok <- write_options(config, data_root(opts), input[:user_options] || %{}),
          :ok <- maybe_ensure_network(config, opts),
+         :ok <- ensure_isolation(config, opts),
          :ok <- remove_stale_container(spec, opts),
          {:ok, id} <- backend(opts).create(spec),
          :ok <- start_or_cleanup(id, opts) do
@@ -346,7 +348,8 @@ defmodule Vagus.App.Steps do
         :engine_opts,
         :panels,
         :required_dsp_nodes,
-        :arch
+        :arch,
+        :nat_opts
       ])
       |> Keyword.new()
       |> put_backend(input.config)
@@ -602,6 +605,28 @@ defmodule Vagus.App.Steps do
 
       {:error, reason} ->
         {:error, {:network, reason}}
+    end
+  end
+
+  # Every bridged container is created here, whichever path starts it, so
+  # this is the one place that keeps one from running without the forward
+  # filter. Host-network containers are not behind the bridge's forward
+  # path, and are never held back by nft.
+  defp ensure_isolation(%Config{host_network: true}, _opts), do: :ok
+  defp ensure_isolation(%Config{backend: :native}, _opts), do: :ok
+
+  defp ensure_isolation(_config, opts) do
+    case Nat.ensure_loaded(Keyword.get(opts, :nat_opts, [])) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Logger.error(
+          "Vagus.App.Steps: bridged app not started: the hassio forward filter " <>
+            "(table ip vagus) is not loaded, so the LAN could reach it"
+        )
+
+        {:error, {:isolation_not_loaded, reason}}
     end
   end
 

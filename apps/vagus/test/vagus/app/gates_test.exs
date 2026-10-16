@@ -17,6 +17,8 @@ defmodule Vagus.App.GatesTest do
     end
 
     fake = Fake.start()
+    key = {__MODULE__, :nat_loaded, make_ref()}
+    on_exit(fn -> :persistent_term.erase(key) end)
 
     opts = [
       engine: Fake,
@@ -26,6 +28,7 @@ defmodule Vagus.App.GatesTest do
       cmd: record,
       enabled: true,
       nft_dir: dir,
+      loaded_key: key,
       ip: "172.30.32.2",
       port: 8888
     ]
@@ -63,7 +66,15 @@ defmodule Vagus.App.GatesTest do
     assert steps(ran()) == [:bridge, :anchor_supervisor, :anchor_dns, :nat]
   end
 
-  test "a refused nft load is logged, and the gate still passes", %{opts: opts} do
+  test "a load at boot is recorded, so bridged starts do not load again", %{opts: opts} do
+    assert Gates.network(opts) == :ok
+    ran()
+    assert Vagus.Network.Nat.ensure_loaded(opts) == :ok
+    assert ran() == []
+  end
+
+  test "a refused load is logged, boot goes on, and the next bridged start retries",
+       %{opts: opts} do
     test = self()
 
     refuse = fn bin, args ->
@@ -76,5 +87,11 @@ defmodule Vagus.App.GatesTest do
 
     assert log =~ "supervisor DNAT"
     assert steps(ran()) == [:bridge, :anchor_supervisor, :anchor_dns, :nat]
+
+    capture_log(fn ->
+      assert {:error, _} = Vagus.Network.Nat.ensure_loaded(Keyword.put(opts, :cmd, refuse))
+    end)
+
+    assert steps(ran()) == [:nat]
   end
 end

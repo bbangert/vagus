@@ -43,6 +43,9 @@ defmodule Vagus.Network.NatTest do
 
     dir = Path.join(System.tmp_dir!(), "vagus-nft-#{System.unique_integer([:positive])}")
     on_exit(fn -> File.rm_rf(dir) end)
+    # Each test's own load record: a shared one would let one test's load
+    # answer for another's.
+    on_exit(fn -> :persistent_term.erase({__MODULE__, dir}) end)
     %{dir: dir}
   end
 
@@ -59,7 +62,14 @@ defmodule Vagus.Network.NatTest do
   end
 
   defp opts(dir, cmd),
-    do: [enabled: true, nft_dir: dir, cmd: cmd, ip: "172.30.32.2", port: 8888]
+    do: [
+      enabled: true,
+      nft_dir: dir,
+      cmd: cmd,
+      ip: "172.30.32.2",
+      port: 8888,
+      loaded_key: {__MODULE__, dir}
+    ]
 
   describe "ensure/1" do
     test "the ruleset: both nat hooks at -110, and the forward filter" do
@@ -145,6 +155,12 @@ defmodule Vagus.Network.NatTest do
       assert Nat.ensure(cmd: cmd, nft_dir: dir) == :ok
       refute_received {:nft, _, _, _}
       refute File.exists?(dir)
+    end
+
+    test "ensure_loaded/1 is :ok with NAT off, and never loads", %{dir: dir} do
+      Application.put_env(:vagus, :supervisor_nat, false)
+      assert Nat.ensure_loaded(cmd: nft_fake({"boom", 1}), nft_dir: dir) == :ok
+      refute_received {:nft, _, _, _}
     end
 
     test "enabled?/0 follows :supervisor_nat" do

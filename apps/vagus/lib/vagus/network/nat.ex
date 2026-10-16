@@ -77,6 +77,8 @@ defmodule Vagus.Network.Nat do
   # or not at all.
   @nft_timeout_ms 10_000
 
+  @loaded_key {__MODULE__, :loaded}
+
   @doc "Whether DNAT management is switched on (`config :vagus, :supervisor_nat`)."
   @spec enabled?() :: boolean()
   def enabled?, do: Application.get_env(:vagus, :supervisor_nat, false) == true
@@ -100,13 +102,35 @@ defmodule Vagus.Network.Nat do
     * `:cmd` — 2-arity command runner `(binary, args) -> {output, status}`
     * `:nft_dir` — where the ruleset file is written for `nft -f`
       (default `/run/vagus`)
+    * `:loaded_key` — the `:persistent_term` key recording a successful load
+      (tests)
   """
   @spec ensure(keyword()) :: :ok | {:error, term()}
   def ensure(opts \\ []) do
     if Keyword.get(opts, :enabled, enabled?()) do
-      with {:ok, text} <- ruleset(opts), do: load_nft(text, opts)
+      with {:ok, text} <- ruleset(opts),
+           :ok <- load_nft(text, opts) do
+        :persistent_term.put(Keyword.get(opts, :loaded_key, @loaded_key), true)
+      end
     else
       :ok
+    end
+  end
+
+  @doc """
+  `:ok` once the table has loaded in this VM, else `ensure/1` now. The
+  start of a bridged container calls it: without the forward filter the LAN
+  reaches the container through netavark's accepting policy, so the start
+  fails instead, and the next start retries the load. Nothing removes the
+  table once loaded (netavark never touches another table), so a success
+  holds until the next boot. Same options as `ensure/1`.
+  """
+  @spec ensure_loaded(keyword()) :: :ok | {:error, term()}
+  def ensure_loaded(opts \\ []) do
+    cond do
+      not Keyword.get(opts, :enabled, enabled?()) -> :ok
+      :persistent_term.get(Keyword.get(opts, :loaded_key, @loaded_key), false) -> :ok
+      true -> ensure(opts)
     end
   end
 
