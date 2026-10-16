@@ -334,7 +334,7 @@ defmodule Vagus.App.OrchestratorTest do
   end
 
   test "an absent Core is ready, with a warning" do
-    core_start = &CoreUnit.start(adopt: fn -> :absent end, deadline: &1)
+    core_start = &CoreUnit.start(adopt: fn -> :absent end, installed: fn -> nil end, deadline: &1)
 
     log =
       capture_log(fn ->
@@ -390,6 +390,71 @@ defmodule Vagus.App.OrchestratorTest do
     assert [first, second, third, :core_stop, {:halt, "svc"}] = stops
     assert Enum.sort([first, second, third]) == [{:halt, "app"}, {:halt, "idle"}, {:halt, "once"}]
     assert %{phase: :stopping} = :sys.get_state(name)
+  end
+
+  describe "shutdown under podman" do
+    defp group_apps do
+      [
+        app("app", "application"),
+        app("once", "once"),
+        app("svc", "services"),
+        app("broker", "services", native: true, state: :started)
+      ]
+    end
+
+    test "stops each group's containers in one call, bounded by the group budget less 2 s, before its halts" do
+      test_pid = self()
+
+      stop_containers = fn slugs, budget ->
+        send(test_pid, {:stop_containers, Enum.sort(slugs), budget})
+        {:ok, slugs, []}
+      end
+
+      name = start_orchestrator(group_apps(), %{stop_containers: stop_containers}, boot: false)
+
+      assert Orchestrator.shutdown(name) == {{3, 3}, :ok}
+
+      stops =
+        Enum.filter(
+          drain(),
+          &(match?({tag, _} when tag == :halt, &1) or
+              match?({:stop_containers, _, _}, &1) or &1 == :core_stop)
+        )
+
+      assert [
+               {:stop_containers, ["app", "once"], 33_000},
+               h1,
+               h2,
+               :core_stop,
+               {:stop_containers, ["svc"], 33_000},
+               {:halt, "svc"}
+             ] = stops
+
+      assert Enum.sort([h1, h2]) == [{:halt, "app"}, {:halt, "once"}]
+    end
+
+    test "a group stop past its bound is cut off and the halts still run within the budget" do
+      test_pid = self()
+
+      stop_containers = fn _slugs, _budget ->
+        send(test_pid, {:stopping, self()})
+        Process.sleep(:infinity)
+      end
+
+      name =
+        start_orchestrator([app("app", "application")], %{stop_containers: stop_containers},
+          boot: false,
+          app_stop_timeout: 300,
+          halt_floor: 100
+        )
+
+      shutdown = Task.async(fn -> Orchestrator.shutdown(name) end)
+      assert_receive {:stopping, stopper}
+      ref = Process.monitor(stopper)
+      assert Task.await(shutdown, 5_000) == {{1, 1}, :ok}
+      assert_receive {:DOWN, ^ref, :process, ^stopper, :killed}
+      assert_receive {:halt, "app"}
+    end
   end
 
   test "shutdown ends a boot waiting out a gate interval at once" do

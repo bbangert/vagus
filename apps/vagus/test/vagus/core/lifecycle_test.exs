@@ -171,6 +171,71 @@ defmodule Vagus.Core.LifecycleTest do
     end
   end
 
+  describe "image_present?/2 and pull/2" do
+    test "ask about and pull the given version's image, touching no container or version" do
+      {fake, opts} = engine(nil, ["2026.7.0"])
+      versions = start_versions("2026.7.0")
+      opts = opts ++ [versions: versions]
+
+      assert Lifecycle.image_present?("2026.7.0", opts)
+      refute Lifecycle.image_present?("2026.10.1", opts)
+      assert :ok = Lifecycle.pull("2026.10.1", opts)
+      assert Lifecycle.image_present?("2026.10.1", opts)
+      assert verbs(fake) == [:image_present?, :image_present?, :pull, :image_present?]
+      assert Versions.installed(versions) == "2026.7.0"
+    end
+
+    test "a failed pull is {:pull, reason}" do
+      {fake, opts} = engine()
+      Fake.fail_next(fake, :pull, {:pull_failed, "manifest unknown"})
+
+      assert {:error, {:pull, {:pull_failed, "manifest unknown"}}} =
+               Lifecycle.pull("2026.10.1", opts)
+    end
+  end
+
+  # Boot's Core unit over the real lifecycle: under a transient store the
+  # container is gone after every reboot, and the installed version brings it back.
+  describe "Vagus.App.CoreUnit.start/1 on an absent container" do
+    test "creates and starts it from the installed version" do
+      {fake, opts} = engine(nil, ["2026.7.0"])
+      versions = start_versions("2026.7.0")
+      opts = opts ++ [versions: versions, health: health_fun(), http_config: http_config_fun()]
+
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert :ok =
+                 Vagus.App.CoreUnit.start(
+                   adopt: fn -> Lifecycle.adopt(opts) end,
+                   installed: fn -> Versions.installed(versions) end,
+                   image_present?: &Lifecycle.image_present?(&1, opts),
+                   start: fn -> Lifecycle.start(opts) end,
+                   health: fn _opts -> :healthy end
+                 )
+      end)
+
+      assert verbs(fake) == [:inspect, :image_present?, :inspect, :create, :start]
+      assert {:ok, %{state: :running}} = Fake.inspect(Container.name(), opts[:engine_opts])
+    end
+
+    test "leaves it absent, and creates nothing, when the image is gone too" do
+      {fake, opts} = engine()
+      versions = start_versions("2026.7.0")
+      opts = opts ++ [versions: versions]
+
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert :ok =
+                 Vagus.App.CoreUnit.start(
+                   adopt: fn -> Lifecycle.adopt(opts) end,
+                   installed: fn -> Versions.installed(versions) end,
+                   image_present?: &Lifecycle.image_present?(&1, opts),
+                   start: fn -> Lifecycle.start(opts) end
+                 )
+      end)
+
+      assert verbs(fake) == [:inspect, :image_present?]
+    end
+  end
+
   ## start/1
 
   describe "start/1" do

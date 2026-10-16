@@ -39,6 +39,22 @@ defmodule Vagus.Addon.Backend.Container do
     Engine.pull(image, [platform: platform] ++ engine(opts))
   end
 
+  # A presence check that errors leaves the create to report what is wrong,
+  # as it did before any check ran.
+  @impl true
+  def ensure_image(%Spec{image: image} = spec, opts \\ []) do
+    case Engine.image_present?(image, engine(opts)) do
+      false ->
+        case pull(spec, opts) do
+          :ok -> :ok
+          {:error, reason} -> {:error, {:pull, reason}}
+        end
+
+      _present_or_unknown ->
+        :ok
+    end
+  end
+
   @impl true
   def create(%Spec{} = spec, opts \\ []),
     do: Engine.create(to_container_spec(spec), engine(opts))

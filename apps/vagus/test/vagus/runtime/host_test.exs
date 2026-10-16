@@ -509,6 +509,29 @@ defmodule Vagus.Runtime.HostTest do
       assert {:ok, _} = Host.checkout(ctx.name, :shutdown, 0)
     end
 
+    test "a health check takes an ops permit, and never queues behind a full pool", ctx do
+      start_host(ctx)
+      {:ok, health} = Host.checkout(ctx.name, :health, 0)
+      {:ok, _ops} = Host.checkout(ctx.name, :ops, 0)
+      assert Host.checkout(ctx.name, :ops, 0) == {:error, :busy}
+      assert Host.checkout(ctx.name, :health, 10_000) == {:error, :busy}
+      assert :queue.is_empty(:sys.get_state(ctx.name).waiting.ops)
+      Host.checkin(health)
+      assert {:ok, _} = Host.checkout(ctx.name, :ops, 1_000)
+    end
+
+    test "new health checks and pulls are refused once a shutdown is in flight", ctx do
+      flag = :atomics.new(1, [])
+      start_host(ctx, shutting_down?: fn -> :atomics.get(flag, 1) == 1 end)
+      assert {:ok, health} = Host.checkout(ctx.name, :health, 0)
+      Host.checkin(health)
+      :atomics.put(flag, 1, 1)
+      assert Host.checkout(ctx.name, :health, 0) == {:error, :shutting_down}
+      assert Host.checkout(ctx.name, :pull, 0) == {:error, :shutting_down}
+      assert {:ok, _} = Host.checkout(ctx.name, :ops, 0)
+      assert {:ok, _} = Host.checkout(ctx.name, :shutdown, 0)
+    end
+
     test "a queued pull is refused once a shutdown has begun", ctx do
       flag = :atomics.new(1, [])
       start_host(ctx, shutting_down?: fn -> :atomics.get(flag, 1) == 1 end)

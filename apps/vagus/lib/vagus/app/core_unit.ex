@@ -2,9 +2,16 @@ defmodule Vagus.App.CoreUnit do
   @moduledoc """
   Home Assistant Core as one step of the boot and shutdown sequence.
 
-  Boot never creates Core: an absent container is left to an explicit
+  An absent container is created when a version is installed: under an
+  engine with a transient store (podman) nothing survives a reboot, so this
+  is every boot, and under Docker it repairs a recreate a shutdown cut
+  short. With no version installed it is left to an explicit
   `POST /core/start` or `/core/update`, or to `Vagus.Provisioner` on a first
-  boot. An adopted one is started whether or not it already runs: a running
+  boot. An installed version whose image the engine lacks is the
+  Provisioner's too: the pull needs the internet, which boot does not wait
+  for, and the Provisioner waits and retries, then starts Core itself.
+
+  An adopted container is started whether or not it already runs: a running
   container whose spec fingerprint matches costs only the adopt's and the
   start's inspects, and one that
   the engine revived from an older spec is how a spec change reaches a
@@ -14,15 +21,16 @@ defmodule Vagus.App.CoreUnit do
 
   require Logger
 
-  alias Vagus.Core.{Health, Lifecycle}
+  alias Vagus.Core.{Health, Lifecycle, Versions}
 
   @busy_retry_budget_ms 60_000
   @busy_backoff_ms 1_000
   @busy_backoff_cap_ms 8_000
 
   @doc """
-  `:ok` also when Core is absent, so a device without Core boots its apps.
-  `opts[:deadline]` bounds the wait for Core to answer once started.
+  `:ok` also when Core is absent and not created here, so a device without
+  Core boots its apps. `opts[:deadline]` bounds the wait for Core to answer
+  once started.
   """
   @spec start(keyword()) :: :ok | {:error, term()}
   def start(opts \\ []) do
@@ -35,11 +43,31 @@ defmodule Vagus.App.CoreUnit do
         end
 
       :absent ->
-        Logger.warning("Boot: no Core container; create it with POST /core/start or /core/update")
-        :ok
+        start_absent(Keyword.get(opts, :installed, &Versions.installed/0).(), opts)
 
       {:error, _reason} = error ->
         error
+    end
+  end
+
+  defp start_absent(nil, _opts) do
+    Logger.warning("Boot: no Core container; create it with POST /core/start or /core/update")
+    :ok
+  end
+
+  # A presence check that errors leaves the start to report what is wrong.
+  defp start_absent(version, opts) do
+    case Keyword.get(opts, :image_present?, &Lifecycle.image_present?/1).(version) do
+      false ->
+        Logger.warning("Boot: Core #{version}'s image is absent; Vagus.Provisioner pulls it")
+        :ok
+
+      _present_or_unknown ->
+        Logger.info("Boot: creating the Core #{version} container")
+
+        with :ok <- Keyword.get(opts, :start, &Lifecycle.start/0).() do
+          await_healthy(opts)
+        end
     end
   end
 

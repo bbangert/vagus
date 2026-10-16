@@ -284,8 +284,76 @@ defmodule Vagus.ProvisionerTest do
     end)
   end
 
-  test "already installed -> full no-op, ping/connection never called, logged" do
+  test "already installed with its image -> no internet wait, no pull, nothing started, logged" do
     parent = self()
+
+    log =
+      capture_log(fn ->
+        pid =
+          start_supervised!(
+            {Provisioner,
+             steps: [:provision_core],
+             installed: fn -> "2026.7.3" end,
+             ping: fn -> :ok end,
+             image_present: fn version -> send(parent, {:image_present, version}) && true end,
+             connection: fn -> send(parent, :connection_called) && :internet end,
+             pull: fn _version -> send(parent, :pull_called) && :ok end,
+             update: fn -> send(parent, :update_called) && {:ok, "x"} end,
+             start: fn -> send(parent, :start_called) && :ok end,
+             name: nil}
+          )
+
+        assert_receive {:image_present, "2026.7.3"}, 1_000
+        # The handler that asked has finished.
+        :sys.get_state(pid)
+        refute_received :connection_called
+        refute_received :pull_called
+        refute_received :update_called
+        refute_received :start_called
+      end)
+
+    assert log =~ "already installed"
+  end
+
+  test "installed but its image gone -> waits for engine and internet, pulls the INSTALLED version, starts" do
+    parent = self()
+    present = :counters.new(1, [])
+
+    capture_log(fn ->
+      start_supervised!({Provisioner,
+       steps: [:provision_core],
+       installed: fn -> "2026.7.3" end,
+       ping: fn -> send(parent, :ping) && :ok end,
+       image_present: fn version ->
+         # Unknown once, as an engine still settling answers.
+         :counters.add(present, 1, 1)
+
+         if :counters.get(present, 1) == 1,
+           do: {:error, :timeout},
+           else: send(parent, {:image_present, version}) && false
+       end,
+       connection: fn -> send(parent, :connection) && :internet end,
+       pull: fn version -> send(parent, {:pull, version}) && :ok end,
+       update: fn -> send(parent, :update_called) && {:ok, "2099.1.0"} end,
+       start: fn -> send(parent, :start) && :ok end,
+       await_healthy: fn -> send(parent, :await_healthy) && :healthy end,
+       engine_interval: 1,
+       name: nil})
+
+      for message <- [:ping, :ping, {:image_present, "2026.7.3"}, :connection] do
+        assert_receive ^message, 1_000
+      end
+
+      assert_receive {:pull, "2026.7.3"}, 1_000
+      assert_receive :start, 1_000
+      assert_receive :await_healthy, 1_000
+      refute_received :update_called
+    end)
+  end
+
+  test "a failed image pull is retried with backoff, then Core starts" do
+    parent = self()
+    pulls = :counters.new(1, [])
 
     log =
       capture_log(fn ->
@@ -293,23 +361,57 @@ defmodule Vagus.ProvisionerTest do
           {Provisioner,
            steps: [:provision_core],
            installed: fn -> "2026.7.3" end,
-           ping: fn ->
-             send(parent, :ping_called)
-             :ok
+           ping: fn -> :ok end,
+           image_present: fn _version -> false end,
+           connection: fn -> :internet end,
+           pull: fn version ->
+             :counters.add(pulls, 1, 1)
+             send(parent, {:pull, version, :counters.get(pulls, 1)})
+             if :counters.get(pulls, 1) == 1, do: {:error, {:pull, :timeout}}, else: :ok
            end,
-           connection: fn ->
-             send(parent, :connection_called)
-             :internet
-           end,
+           start: fn -> send(parent, :start) && :ok end,
+           await_healthy: fn -> :healthy end,
+           retry_base: 1,
            name: nil}
         )
 
-        Process.sleep(20)
-        refute_received :ping_called
-        refute_received :connection_called
+        assert_receive {:pull, "2026.7.3", 1}, 1_000
+        assert_receive {:pull, "2026.7.3", 2}, 1_000
+        assert_receive :start, 1_000
       end)
 
-    assert log =~ "already installed"
+    assert log =~ "Core image pull failed ({:pull, :timeout}) — retrying in 1ms"
+  end
+
+  test "a start that fails after an install is retried until it succeeds" do
+    parent = self()
+    starts = :counters.new(1, [])
+
+    log =
+      capture_log(fn ->
+        start_supervised!(
+          {Provisioner,
+           steps: [:provision_core],
+           installed: fn -> nil end,
+           ping: fn -> :ok end,
+           connection: fn -> :internet end,
+           update: fn -> {:ok, "2026.7.3"} end,
+           start: fn ->
+             :counters.add(starts, 1, 1)
+             send(parent, {:start, :counters.get(starts, 1)})
+             if :counters.get(starts, 1) < 3, do: {:error, :busy}, else: :ok
+           end,
+           await_healthy: fn -> send(parent, :await_healthy) && :healthy end,
+           retry_base: 1,
+           name: nil}
+        )
+
+        for n <- 1..3, do: assert_receive({:start, ^n}, 1_000)
+        assert_receive :await_healthy, 1_000
+      end)
+
+    assert log =~ "Core start failed (:busy) — retrying in 1ms"
+    assert log =~ "Core start failed (:busy) — retrying in 2ms"
   end
 
   test "happy path: engine retries, net retries, update -> start -> await_healthy in order" do
@@ -529,10 +631,14 @@ defmodule Vagus.ProvisionerTest do
                send(parent, :installed_checked)
                "2026.7.3"
              end,
+             ping: fn -> :ok end,
+             image_present: fn _version -> send(parent, :image_checked) && true end,
              name: nil}
           )
 
         assert_receive :installed_checked, 1_000
+        assert_receive :image_checked, 1_000
+        :sys.get_state(pid)
         assert Process.alive?(pid)
       end)
 

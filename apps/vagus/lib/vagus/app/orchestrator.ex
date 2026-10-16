@@ -38,16 +38,19 @@ defmodule Vagus.App.Orchestrator do
   A shutdown pre-empts a boot only at a step boundary: before a gate or a
   stage, or while a gate waits out its interval. A unit in flight is never
   killed: Core's start may be midway through stop, remove, create and start,
-  and a killed one leaves Core absent, which the next boot cannot repair
-  since boot never creates Core. Units are bounded on their own (a gate
-  check by `gate_timeout`, a stage by `stage_timeout`), so that is the
-  longest a shutdown waits; a unit still running past its stage budget is
-  left to finish beside the stop.
+  and a killed one leaves Core absent until the next boot creates it. Units
+  are bounded on their own (a gate check by `gate_timeout`, a stage by
+  `stage_timeout`), so that is the longest a shutdown waits; a unit still
+  running past its stage budget is left to finish beside the stop.
 
   Shutdown sends `halt` to the `application` stage, then stops Core, then
-  halts every earlier stage, each group all at once. A halted app stops its
-  container by name and keeps what it wants, so the next boot starts the
-  same apps; it refuses commands until `resume`. Core stops by a deadline
+  halts every earlier stage, each group all at once. Under podman each
+  group's containers are first stopped by one engine call
+  (`Vagus.App.Units.stop_containers/3`), bounded by the group's budget less
+  2 s, and the halts then find them stopped; the group as a whole keeps the
+  one budget. A halted app stops its container by name and keeps what it
+  wants, so the next boot starts the same apps; it refuses commands until
+  `resume`. Core stops by a deadline
   that leaves the earlier group its own bound within the caller's budget.
   Native apps keep running. The stop runs outside this process, so a crash
   here does not cut it short; a restart while `Vagus.Host.Shutdown` is in
@@ -90,6 +93,7 @@ defmodule Vagus.App.Orchestrator do
     gate_timeout: 10_000,
     stage_timeout: 120_000,
     app_stop_timeout: 35_000,
+    halt_floor: 2_000,
     stop_margin: 5_000,
     units: %{}
   ]
@@ -427,11 +431,10 @@ defmodule Vagus.App.Orchestrator do
   end
 
   defp stop_all(entries, cfg) do
-    tasks =
-      for %{config: %{slug: slug}} <- entries,
-          do: {slug, spawn_unit(fn -> cfg.units.halt.(slug) end)}
+    slugs = for %{config: %{slug: slug}} <- entries, do: slug
+    opts = [timeout: halt_budget(slugs, cfg), on_timeout: :kill_task]
+    tasks = for slug <- slugs, do: {slug, spawn_unit(fn -> cfg.units.halt.(slug) end)}
 
-    opts = [timeout: cfg.app_stop_timeout, on_timeout: :kill_task]
     results = Task.yield_many(Enum.map(tasks, &elem(&1, 1)), opts)
 
     Enum.zip_with(tasks, results, fn {slug, _}, {_, result} ->
@@ -439,5 +442,19 @@ defmodule Vagus.App.Orchestrator do
     end)
     |> Enum.count(&(&1 == true))
     |> then(&{&1, length(tasks)})
+  end
+
+  # What the halts get once the group's containers are stopped together:
+  # the rest of the group's budget, never under the floor. A stop still
+  # running at its bound is killed and the halts stop what it left.
+  defp halt_budget([], cfg), do: cfg.app_stop_timeout
+  defp halt_budget(_slugs, %{units: %{stop_containers: nil}} = cfg), do: cfg.app_stop_timeout
+
+  defp halt_budget(slugs, cfg) do
+    started = System.monotonic_time(:millisecond)
+    budget = max(cfg.app_stop_timeout - cfg.halt_floor, 0)
+    run_bounded(fn -> cfg.units.stop_containers.(slugs, budget) end, budget)
+    elapsed = System.monotonic_time(:millisecond) - started
+    max(cfg.app_stop_timeout - elapsed, cfg.halt_floor)
   end
 end

@@ -50,4 +50,12 @@ defmodule Vagus.Addon.Backend do
   update failure. Backends with no image concept (`Native`) return `:ok`.
   """
   @callback remove_image(image :: String.t(), opts :: keyword()) :: :ok | {:error, term()}
+
+  @doc """
+  Pulls the spec's image unless the engine already holds it. Optional: a
+  backend without it has nothing to fetch before a create.
+  """
+  @callback ensure_image(Spec.t(), opts :: keyword()) :: :ok | {:error, term()}
+
+  @optional_callbacks ensure_image: 2
 end

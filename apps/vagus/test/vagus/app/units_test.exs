@@ -28,7 +28,9 @@ defmodule Vagus.App.UnitsTest do
 
   test "every unit is a function of the arity the orchestrator calls it with" do
     units = Units.all()
-    assert Map.keys(units) |> Enum.sort() == Enum.sort([:gates | Map.keys(@arities)])
+
+    assert Map.keys(units) |> Enum.sort() ==
+             Enum.sort([:gates, :stop_containers | Map.keys(@arities)])
 
     for {key, arity} <- @arities do
       assert is_function(Map.fetch!(units, key), arity), "#{key}/#{arity}"
@@ -36,6 +38,38 @@ defmodule Vagus.App.UnitsTest do
 
     assert Map.keys(units.gates) |> Enum.sort() == [:api, :engine, :network, :tree]
     assert Enum.all?(Map.values(units.gates), &is_function(&1, 0))
+  end
+
+  describe "stop_containers" do
+    test "is no unit under Docker, whose halts stop each container as before" do
+      assert Units.all().stop_containers == nil
+    end
+
+    test "is a unit under podman" do
+      prev = Application.fetch_env(:vagus, :engine)
+      Application.put_env(:vagus, :engine, Vagus.Runtime.Engine.Podman)
+
+      on_exit(fn ->
+        case prev do
+          {:ok, engine} -> Application.put_env(:vagus, :engine, engine)
+          :error -> Application.delete_env(:vagus, :engine)
+        end
+      end)
+
+      assert is_function(Units.all().stop_containers, 2)
+    end
+
+    test "stops the group's containers in one engine call, with the halt grace, within the budget" do
+      fake = Vagus.Runtime.Engine.Fake.start()
+      opts = [engine: Vagus.Runtime.Engine.Fake, fake: fake]
+      Vagus.Runtime.Engine.Fake.put_container(fake, "addon_a")
+      Vagus.Runtime.Engine.Fake.put_container(fake, "addon_b")
+
+      assert {:ok, ["addon_a", "addon_b"], []} = Units.stop_containers(["a", "b"], 33_000, opts)
+      assert Vagus.Runtime.Engine.Fake.calls(fake) == [{:stop_all, [["addon_a", "addon_b"], 30]}]
+      assert [{:stop_all, call_opts}] = Vagus.Runtime.Engine.Fake.call_opts(fake)
+      assert call_opts[:timeout_ms] == 33_000
+    end
   end
 
   # The VM's own boot already set it; each test starts as if none had.
@@ -97,6 +131,28 @@ defmodule Vagus.App.UnitsTest do
 
   test "the tree gate passes once the application is started" do
     assert Gates.tree() == :ok
+  end
+
+  # Nothing here can answer for the internet: under podman the gate is the
+  # Host's preparation alone.
+  test "under podman the engine gate is the Host's readiness, with no internet wait" do
+    fake = Vagus.Test.FakePodman.start([])
+
+    test_pid = self()
+
+    # Answers only once the test is over, so the probe task ends with it.
+    still_probing = fn _opts ->
+      ref = Process.monitor(test_pid)
+      receive do: ({:DOWN, ^ref, :process, _pid, _reason} -> {:error, :gone})
+    end
+
+    preparing = Vagus.Test.FakePodman.start_host(fake.bin, await: false, probe: still_probing)
+    ready = Vagus.Test.FakePodman.start_host(fake.bin, probe: fn _ -> :ok end)
+    podman = [engine: Vagus.Runtime.Engine.Podman]
+
+    assert Gates.engine([host: preparing] ++ podman) == {:error, :unavailable}
+    assert Gates.engine([host: ready] ++ podman) == :ok
+    refute Enum.any?(Vagus.Test.FakePodman.calls(fake), &("pull" in &1))
   end
 
   test "the api gate passes while the API's port accepts, and fails once it does not" do

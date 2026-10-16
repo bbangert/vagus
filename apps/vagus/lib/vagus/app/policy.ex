@@ -133,6 +133,7 @@ defmodule Vagus.App.Policy do
 
   @deadlines %{
     pull: 1_800_000,
+    ensure_image: 1_800_000,
     port: 15_000,
     start: 120_000,
     stop: 60_000,
@@ -175,6 +176,7 @@ defmodule Vagus.App.Policy do
       token: nil,
       token_hash: nil,
       broker_pid: nil,
+      health_check: nil,
       last_event: nil,
       attempt: 0,
       strikes: 0,
@@ -254,6 +256,11 @@ defmodule Vagus.App.Policy do
   defp container_event(%{action: :die} = event, data),
     do: died(data, {:exited, event.exit_code})
 
+  # Only a change of health is an event: podman reports every check, and the
+  # app process's own checks repeat the verdict the engine's event carried.
+  defp container_event(%{action: :health, health: health}, %{last_event: health} = data),
+    do: {data, []}
+
   defp container_event(%{action: :health, health: :healthy}, data),
     do: observe(data, :healthy, [])
 
@@ -266,7 +273,7 @@ defmodule Vagus.App.Policy do
 
   defp died(data, event) do
     {data, effects} = drop_run_keys(data)
-    effects = effects ++ [{:cancel, :probe}, {:cancel, :settled}]
+    effects = effects ++ [{:cancel, :probe}, {:cancel, :settled}] ++ cancel_health(data)
     {data, effects} = observe(data, event, effects)
 
     if data.config.startup == "once" and event == {:exited, 0},
@@ -338,6 +345,29 @@ defmodule Vagus.App.Policy do
   @doc "The next URL-probe tick."
   @spec probe_timer() :: effect()
   def probe_timer, do: {:timer, :probe, @probe_interval_ms, :probe}
+
+  @doc """
+  One result of the app process's own healthcheck, for an engine that runs
+  none itself: a verdict goes through `on_event/2` as the engine's health
+  event would, and anything else (`:starting`, a skipped or failed run) only
+  waits for the next tick. None is armed once a shutdown is in flight.
+  """
+  @spec health_check({:ok, atom()} | {:error, term()} | :skip, map()) :: {map(), [effect()]}
+  def health_check({:ok, health}, %{container_id: id} = data)
+      when health in [:healthy, :unhealthy] and id != nil do
+    {data, effects} = on_event(%{action: :health, id: id, health: health}, data)
+    {data, effects ++ health_timer(data, :interval_ms)}
+  end
+
+  def health_check(_skipped, data), do: {data, health_timer(data, :interval_ms)}
+
+  @doc "The next healthcheck tick, or none: `[]` when the app runs no checks of its own."
+  @spec health_timer(map(), :first_ms | :interval_ms) :: [effect()]
+  def health_timer(%{health_check: %{} = check, container_id: id, shutting_down: false}, which)
+      when id != nil,
+      do: [{:timer, :healthcheck, Map.fetch!(check, which), {:healthcheck, id}}]
+
+  def health_timer(_data, _which), do: []
 
   @doc """
   Whether a command is taken in this state. Only `halt` pre-empts an
@@ -548,7 +578,9 @@ defmodule Vagus.App.Policy do
     end
   end
 
-  defp start_steps, do: [{:port?, nil}, {:mint_token, nil}, {:start, nil}]
+  # The image is checked before every create, not only at install: an engine
+  # whose store is reset (podman's after a migration) has none.
+  defp start_steps, do: [{:port?, nil}, {:ensure_image, nil}, {:mint_token, nil}, {:start, nil}]
 
   defp hook(%{config: config}, :pre) when is_binary(config.backup_pre), do: [{:exec_hook, :pre}]
 
@@ -606,8 +638,9 @@ defmodule Vagus.App.Policy do
   defp expand({:start?, _}, data),
     do: if(data.run.acc[:was_running], do: start_steps(), else: [])
 
-  # Native apps mint no token: they run in the BEAM and never call the API.
-  defp expand({:mint_token, _} = step, data),
+  # Native apps mint no token and have no image: they run in the BEAM and
+  # never call the API.
+  defp expand({name, _} = step, data) when name in [:mint_token, :ensure_image],
     do: if(Steps.native?(data.config), do: [], else: [step])
 
   defp expand({:set_options, _}, %{run: %{args: %{options: nil}}}), do: []
@@ -668,15 +701,17 @@ defmodule Vagus.App.Policy do
   # outlive it, and nothing it posts while stopping should land.
   defp before_task({:stop, nil}, %{run: %{op: :uninstall}} = data) do
     drop = Enum.map(tl(keys(data)), &key/1)
+    timers = cancel_timers(data)
     data = %{data | token: nil, token_hash: nil, ip: nil, wanted: :stopped}
     data = %{data | services: %{}, discovery: %{}}
-    {data, [{:keys, [], drop} | cancel_timers()]}
+    {data, [{:keys, [], drop} | timers]}
   end
 
   defp before_task({name, _}, data) when name in [:stop, :halt_stop] do
+    timers = cancel_timers(data)
     {data, effects} = drop_run_keys(data)
     data = if data.run.op == :stop, do: %{data | wanted: :stopped}, else: data
-    {data, effects ++ cancel_timers()}
+    {data, effects ++ timers}
   end
 
   defp before_task(_step, data), do: {data, []}
@@ -698,7 +733,12 @@ defmodule Vagus.App.Policy do
   defp key({{_kind, _name} = key, _value}), do: key
   defp key(key), do: key
 
-  defp cancel_timers, do: [{:cancel, :probe}, {:cancel, :settled}, {:cancel, :retry}]
+  defp cancel_timers(data),
+    do: [{:cancel, :probe}, {:cancel, :settled}, {:cancel, :retry}] ++ cancel_health(data)
+
+  # Only an app that runs its own checks can have a tick to cancel.
+  defp cancel_health(%{health_check: %{}}), do: [{:cancel, :healthcheck}]
+  defp cancel_health(_data), do: []
 
   defp settle(outcome, %{run: %{op: op, step: {name, arg}}} = data),
     do: on_outcome(op, name, arg, outcome, data)
@@ -717,6 +757,13 @@ defmodule Vagus.App.Policy do
     do: fail(put_acc(release(data), :cleaned, true), data.run.acc.cause, [])
 
   defp on_outcome(_op, :pull, _, {:ok, _ref}, data), do: advance(data, [])
+  defp on_outcome(_op, :ensure_image, _, {:ok, _ref}, data), do: advance(data, [])
+
+  # A start that cannot get its image fails as a start does, rollback and
+  # restart ladder included.
+  defp on_outcome(op, :ensure_image, arg, {:error, _reason} = outcome, data),
+    do: on_outcome(op, :start, arg, outcome, data)
+
   defp on_outcome(:install, :pull, _, {:error, reason}, data), do: fail(data, reason, [])
   defp on_outcome(:update, :pull, _, {:error, reason}, data), do: fail(data, {:pull, reason}, [])
 
@@ -853,6 +900,7 @@ defmodule Vagus.App.Policy do
       | container_id: fact.container_id,
         ip: fact[:ip],
         broker_pid: fact[:pid],
+        health_check: fact[:health_check],
         wanted: wanted,
         attempt: attempt,
         strikes: 0,
@@ -863,7 +911,8 @@ defmodule Vagus.App.Policy do
     monitor = if fact[:pid], do: [:monitor_broker], else: []
     probe = if is_binary(data.config.watchdog) and data.watchdog, do: [probe_timer()], else: []
     settled = if run.args[:retry], do: [{:timer, :settled, @settled_ms, :settled}], else: []
-    {data, [{:keys, dns, Enum.map(dns, &key/1)} | monitor] ++ probe ++ settled}
+    health = health_timer(data, :first_ms)
+    {data, [{:keys, dns, Enum.map(dns, &key/1)} | monitor] ++ probe ++ settled ++ health}
   end
 
   defp rolled_back(cause), do: {:error, {:rolled_back, cause}}

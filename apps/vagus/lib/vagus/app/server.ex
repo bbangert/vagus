@@ -22,6 +22,10 @@ defmodule Vagus.App.Server do
   that dies or overruns its deadline becomes an `{:error, :died | :timeout}`
   outcome on the same path as any other.
 
+  Under an engine that runs no healthchecks itself, the process runs its
+  container's check on a timer, as it runs the URL probe, and hands each
+  verdict to `Vagus.App.Policy.health_check/2`.
+
   Questions, settings writes and the app's own service and discovery posts
   are taken in every state, an operation in flight included. Container
   events and the native broker's `DOWN` wait until the operation ends.
@@ -39,9 +43,12 @@ defmodule Vagus.App.Server do
   alias Vagus.App.File, as: AppFile
   alias Vagus.Core.{EventPusher, Events}
   alias Vagus.Discovery.Push
+  alias Vagus.Runtime.Engine
 
   @new_ttl_ms 60_000
   @probe_deadline_ms 10_000
+  # Past the engine's own bound on a check (Engine.Podman's 35 s).
+  @health_deadline_ms 60_000
   @ops [
     :install,
     :start,
@@ -140,6 +147,7 @@ defmodule Vagus.App.Server do
     |> Policy.init_data(saved)
     |> Map.merge(%{
       probe: nil,
+      health: nil,
       broker_ref: nil,
       retired: false,
       killed: [],
@@ -287,6 +295,18 @@ defmodule Vagus.App.Server do
   defp event({:timeout, :probe_deadline}, ref, state, %{probe: {pid, ref}} = data),
     do: strike(:unhealthy, state, kill(pid, data))
 
+  defp event(:info, {:health, ref, result}, state, %{health: {pid, ref}} = data) do
+    Process.unlink(pid)
+    health_result(result, state, data)
+  end
+
+  defp event(:info, {:EXIT, pid, reason}, state, %{health: {pid, _ref}} = data)
+       when reason != :normal,
+       do: health_result(:skip, state, data)
+
+  defp event({:timeout, :health_deadline}, ref, state, %{health: {pid, ref}} = data),
+    do: health_result(:skip, state, kill(pid, data))
+
   defp event(:info, {:engine_event, _event}, {:busy, _op}, _data),
     do: {:keep_state_and_data, [:postpone]}
 
@@ -294,7 +314,7 @@ defmodule Vagus.App.Server do
     do: {:keep_state_and_data, [:postpone]}
 
   defp event({:timeout, name}, _message, {:busy, _op}, _data)
-       when name in [:retry, :settled, :probe],
+       when name in [:retry, :settled, :probe, :healthcheck],
        do: {:keep_state_and_data, [:postpone]}
 
   defp event(:info, {:engine_event, event}, state, data) when state != :new,
@@ -319,6 +339,14 @@ defmodule Vagus.App.Server do
     if data.container_id && data.watchdog == true && is_binary(data.config.watchdog),
       do: spawn_probe(data),
       else: :keep_state_and_data
+  end
+
+  # For the container it was armed against, as a retry is: one postponed
+  # through an operation that replaced or stopped that container is stale.
+  defp event({:timeout, :healthcheck}, {:healthcheck, id}, :idle, data) do
+    if data.shutting_down or id != data.container_id or data.health != nil,
+      do: :keep_state_and_data,
+      else: spawn_health(data)
   end
 
   defp event({:timeout, _name}, _message, _state, _data), do: :keep_state_and_data
@@ -400,8 +428,9 @@ defmodule Vagus.App.Server do
         {:keep_state_and_data, actions ++ [{:reply, from, {:error, reason}}]}
 
       run ->
+        {data, rearm} = stop_health(data)
         {data, effects} = Policy.next(%{run | from: from}, :begin, stop_probe(data))
-        run_effects(effects, {:busy, op}, data, actions ++ cancel_retry(op))
+        run_effects(effects, {:busy, op}, data, actions ++ cancel_retry(op) ++ rearm)
     end
   end
 
@@ -434,6 +463,11 @@ defmodule Vagus.App.Server do
   defp on_event(event, state, data) do
     {data, effects} = Policy.on_event(event, data)
     run_effects(effects, state, data)
+  end
+
+  defp health_result(result, state, data) do
+    {data, effects} = Policy.health_check(result, %{data | health: nil})
+    run_effects(effects, state, data, [{{:timeout, :health_deadline}, :cancel}])
   end
 
   defp strike(result, state, data) do
@@ -540,6 +574,28 @@ defmodule Vagus.App.Server do
      [{{:timeout, :probe_deadline}, deadline(:probe_deadline), ref}]}
   end
 
+  defp spawn_health(%{health_check: %{engine_opts: engine_opts}} = data) do
+    {ref, parent, id} = {make_ref(), self(), data.container_id}
+    pid = spawn_link(fn -> send(parent, {:health, ref, Engine.healthcheck(id, engine_opts)}) end)
+
+    {:keep_state, %{data | health: {pid, ref}},
+     [{{:timeout, :health_deadline}, deadline(:health_deadline), ref}]}
+  end
+
+  # An operation never runs beside a check either. The killed check's tick is
+  # armed again: an operation that keeps the container (a hot backup) would
+  # otherwise end its checks, and one that replaces or stops it cancels the
+  # tick or leaves it stale.
+  defp stop_health(%{health: {pid, _ref}} = data) do
+    rearm =
+      for {:timer, name, ms, msg} <- Policy.health_timer(data, :interval_ms),
+          do: {{:timeout, name}, deadline(name, ms), msg}
+
+    {%{kill(pid, data) | health: nil}, [{{:timeout, :health_deadline}, :cancel} | rearm]}
+  end
+
+  defp stop_health(data), do: {data, []}
+
   # An operation never runs beside a probe.
   defp stop_probe(%{probe: {pid, _ref}} = data), do: %{kill(pid, data) | probe: nil}
   defp stop_probe(data), do: data
@@ -628,6 +684,7 @@ defmodule Vagus.App.Server do
 
   defp default_deadline(:new), do: @new_ttl_ms
   defp default_deadline(:probe_deadline), do: @probe_deadline_ms
+  defp default_deadline(:health_deadline), do: @health_deadline_ms
   defp default_deadline(name), do: Policy.deadline(name)
 
   # Tokens, options, service payloads and discovery configs can carry

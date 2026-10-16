@@ -784,6 +784,29 @@ defmodule Vagus.Runtime.Engine.PodmanContractTest do
       assert Engine.pull("ghcr.io/vagus/x:1", opts) == {:error, :busy}
     end
 
+    test "a healthcheck refused at shutdown is :busy, and never runs podman" do
+      fake = FakePodman.start([{"healthcheck run *", [{0, ""}]}])
+      host = FakePodman.start_host(fake.bin, shutting_down?: fn -> true end)
+      opts = [engine: Engine.Podman, host: host, podman_bin: fake.bin]
+      assert Engine.healthcheck("addon_local_x", opts) == {:error, :busy}
+      refute Enum.any?(FakePodman.calls(fake), &("healthcheck" in &1))
+    end
+
+    test "a healthcheck with every ops permit held is skipped at once, not queued" do
+      fake = FakePodman.start([{"healthcheck run *", [{0, ""}]}])
+      host = FakePodman.start_host(fake.bin, permits: %{pull: 1, ops: 1, shutdown: 1})
+      opts = [engine: Engine.Podman, host: host, podman_bin: fake.bin, timeout_ms: 30_000]
+      {:ok, permit} = Vagus.Runtime.Host.checkout(host, :ops, 0)
+      assert Engine.healthcheck("addon_local_x", opts) == {:error, :busy}
+      Vagus.Runtime.Host.checkin(permit)
+      assert Engine.healthcheck("addon_local_x", opts) == {:ok, :healthy}
+    end
+
+    test "podman schedules no healthchecks; Docker does" do
+      refute Engine.schedules_healthchecks?(engine: Engine.Podman)
+      assert Engine.schedules_healthchecks?(engine: Vagus.Runtime.Engine.Docker)
+    end
+
     # The stop must outlast the 300 ms its permit wait may use.
     test "a stop waiting for its permit still gets its grace once granted" do
       fake = FakePodman.start([{"stop *", [{0, "addon_local_x\n", delay_ms: 1_000}]}])

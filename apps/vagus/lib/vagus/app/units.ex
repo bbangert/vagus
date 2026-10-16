@@ -29,6 +29,7 @@ defmodule Vagus.App.Units do
       running: &running/0,
       inspect: &running?/1,
       halt: &App.halt/1,
+      stop_containers: if(podman?(), do: &stop_containers/2),
       core_start: &CoreUnit.start(deadline: &1),
       core_stop: &CoreUnit.stop(deadline: &1),
       gates: Gates.all(),
@@ -127,6 +128,21 @@ defmodule Vagus.App.Units do
       _unknown -> :unknown
     end
   end
+
+  @doc """
+  One engine call that stops a group's containers together, ahead of their
+  halts. Only for podman: each app's own `stop` is a podman process, and a
+  frugal board's two `:ops` permits would queue a group's stops past its
+  budget. `Engine.Podman.stop_all/3` takes the reserved shutdown permit.
+  """
+  @spec stop_containers([String.t()], non_neg_integer(), keyword()) ::
+          {:ok, [String.t()], [{String.t(), term()}]}
+  def stop_containers(slugs, budget_ms, opts \\ []) do
+    names = for slug <- slugs, do: "addon_" <> slug
+    Engine.stop_all(names, Steps.halt_timeout_s(), [timeout_ms: budget_ms] ++ opts)
+  end
+
+  defp podman?, do: Application.get_env(:vagus, :engine) == Vagus.Runtime.Engine.Podman
 
   @spec report(atom(), [{String.t(), :ready | :failed | :pending}]) :: :ok
   def report(step, outcomes) do

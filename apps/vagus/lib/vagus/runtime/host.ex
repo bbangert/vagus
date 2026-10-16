@@ -21,6 +21,10 @@ defmodule Vagus.Runtime.Host do
   frees its permit. Once `Vagus.Host.Shutdown.in_flight?/0` is true, new
   and queued `:pull` requests are refused.
 
+  A `:health` request takes an `:ops` permit but never queues: a scheduled
+  check that would wait behind real work is better skipped, and the next
+  tick comes anyway. It is refused during a shutdown, like a pull.
+
   ## Shared state
 
   The env, the readiness status and the stats table id live in
@@ -58,7 +62,7 @@ defmodule Vagus.Runtime.Host do
   }
 
   @type profile :: :frugal | :fast
-  @type class :: :pull | :ops | :shutdown
+  @type class :: :pull | :ops | :shutdown | :health
   @type permit :: {GenServer.server(), reference()}
   @type status :: :preparing | :ready | {:prep_failed, term()}
 
@@ -212,8 +216,9 @@ defmodule Vagus.Runtime.Host do
 
   @doc """
   Takes a permit of `class`, waiting up to `wait_ms` behind other holders.
-  `{:error, :busy}` when the wait runs out, `:shutting_down` for a `:pull`
-  during shutdown, `:unavailable` when no Host runs.
+  `{:error, :busy}` when the wait runs out (at once for `:health`),
+  `:shutting_down` for a `:pull` or `:health` during shutdown,
+  `:unavailable` when no Host runs.
   """
   @spec checkout(atom() | nil, class(), non_neg_integer()) ::
           {:ok, permit()} | {:error, :busy | :shutting_down | :unavailable | :badarg}
@@ -338,6 +343,14 @@ defmodule Vagus.Runtime.Host do
   end
 
   @impl true
+  def handle_call({:acquire, :health, ref}, {pid, _tag}, state) do
+    cond do
+      shutting_down?(state.opts) -> {:reply, {:error, :shutting_down}, state}
+      state.free[:ops] > 0 -> {:reply, :granted, grant(state, :ops, ref, pid)}
+      true -> {:reply, {:error, :busy}, state}
+    end
+  end
+
   def handle_call({:acquire, class, _ref}, _from, state)
       when not is_map_key(state.free, class),
       do: {:reply, {:error, :badarg}, state}

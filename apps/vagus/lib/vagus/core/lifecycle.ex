@@ -365,6 +365,22 @@ defmodule Vagus.Core.Lifecycle do
     with_lock(fn -> do_update(version, opts) end)
   end
 
+  @doc """
+  Whether the engine holds `version`'s image; `{:error, reason}` when it
+  cannot say.
+  """
+  @spec image_present?(String.t(), keyword()) :: boolean() | {:error, term()}
+  def image_present?(version, opts \\ []) when is_binary(version),
+    do: Engine.image_present?(Container.image(version), engine_opts(opts))
+
+  @doc """
+  Pulls `version`'s image without touching the container or the recorded
+  version. Outside the lifecycle lock: a pull can take many minutes, and a
+  stop or update must not wait behind it.
+  """
+  @spec pull(String.t(), keyword()) :: :ok | {:error, {:pull, term()}}
+  def pull(version, opts \\ []) when is_binary(version), do: pull_target(version, opts)
+
   ## Locking — see moduledoc "Serialization" section.
 
   defp with_lock(fun) do

@@ -20,11 +20,12 @@ defmodule Vagus.App.Steps do
   alias Vagus.DSP
   alias Vagus.Ingress.Panels
   alias Vagus.Network
-  alias Vagus.Runtime.Engine
+  alias Vagus.Runtime.{Engine, Host}
 
   @default_backend Vagus.Addon.Backend.Container
   @default_data_root "/data"
   @halt_timeout_s 30
+  @health_interval_ms 30_000
   @port_min 62_000
   @port_max 65_500
   @port_tries 100
@@ -51,6 +52,10 @@ defmodule Vagus.App.Steps do
     "addons" => "local_apps"
   }
 
+  @doc "Each container's grace at shutdown."
+  @spec halt_timeout_s() :: pos_integer()
+  def halt_timeout_s, do: @halt_timeout_s
+
   @spec run(atom(), map()) :: {:ok, term()} | {:error, term()}
   def run(name, input) do
     report_stage(input)
@@ -73,6 +78,19 @@ defmodule Vagus.App.Steps do
 
     with :ok <- maybe_ensure_network(config, opts),
          :ok <- backend(opts).pull(spec) do
+      {:ok, spec.image}
+    end
+  end
+
+  # A backend with no image concept has nothing to fetch.
+  defp step(:ensure_image, %{config: config} = input) do
+    opts = opts(input)
+    backend = backend(opts)
+    spec = build_spec(config, Keyword.put(opts, :access_token, ""))
+
+    if Code.ensure_loaded?(backend) and function_exported?(backend, :ensure_image, 2) do
+      with :ok <- backend.ensure_image(spec, engine_opts(opts)), do: {:ok, spec.image}
+    else
       {:ok, spec.image}
     end
   end
@@ -339,7 +357,8 @@ defmodule Vagus.App.Steps do
           ip: bridge_ip(config, container),
           # Upstream reports `startup` until the first healthy event only for
           # an image that declares a healthcheck.
-          healthcheck: container.healthcheck != nil
+          healthcheck: container.healthcheck != nil,
+          health_check: health_check(container.healthcheck, engine_opts(opts))
         }
 
       {:error, _reason} ->
@@ -350,6 +369,32 @@ defmodule Vagus.App.Steps do
       Logger.warning("Vagus.App.Steps: inspect of #{config.slug} failed: #{inspect(e)}")
       %{container_id: id, ip: nil, healthcheck: false}
   end
+
+  # Only for an engine that runs no checks itself. Docker's defaults stand in
+  # for an unset interval; the floor keeps a 1 s interval from costing a
+  # podman process a second on a small board. The first run waits out the
+  # start period, plus up to one interval of jitter so apps started together
+  # do not all check together.
+  defp health_check(nil, _engine_opts), do: nil
+
+  defp health_check(healthcheck, engine_opts) do
+    if Engine.schedules_healthchecks?(engine_opts) do
+      nil
+    else
+      floor = if Host.profile(engine_opts[:host]) == :fast, do: 10_000, else: 30_000
+      interval = max(positive(healthcheck[:interval_ms]) || @health_interval_ms, floor)
+      start_period = positive(healthcheck[:start_period_ms]) || 0
+
+      %{
+        first_ms: max(start_period, interval) + :rand.uniform(interval),
+        interval_ms: interval,
+        engine_opts: engine_opts
+      }
+    end
+  end
+
+  defp positive(ms) when is_integer(ms) and ms > 0, do: ms
+  defp positive(_ms), do: nil
 
   # A nonzero exit fails as `{:exec, code}`: Policy fails the backup on it and
   # the API reports it as the hook's error.

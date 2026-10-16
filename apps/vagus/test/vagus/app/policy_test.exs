@@ -95,8 +95,23 @@ defmodule Vagus.App.PolicyTest do
   defp running(extra \\ %{}),
     do: app(Map.merge(%{container_id: "c1", ip: @ip, last_event: {:running, false}}, extra))
 
-  defp begin(op, args, data), do: Policy.next(Policy.plan(op, args, data), :begin, data)
-  defp step(data, outcome), do: Policy.next(data.run, outcome, data)
+  defp begin(op, args, data),
+    do: past_image(Policy.next(Policy.plan(op, args, data), :begin, data))
+
+  defp step(data, outcome), do: past_image(Policy.next(data.run, outcome, data))
+
+  # The image is there in every test but those about its check, which call
+  # `Policy.next/3` themselves.
+  defp past_image({data, effects}) do
+    case List.last(effects) do
+      {:step, {:ensure_image, nil}} ->
+        {data, more} = Policy.next(data.run, {:ok, "image"}, data)
+        {data, Enum.drop(effects, -1) ++ more}
+
+      _other ->
+        {data, effects}
+    end
+  end
 
   describe "derive/2" do
     test "from the last event, upstream's mapping" do
@@ -283,6 +298,140 @@ defmodule Vagus.App.PolicyTest do
     end
   end
 
+  describe "health transitions" do
+    @check %{first_ms: 40_000, interval_ms: 30_000, engine_opts: []}
+
+    defp retries(effects), do: Enum.count(effects, &match?({:timer, :retry, _, _}, &1))
+
+    test "a repeated verdict is no event: healthy, unhealthy, healthy restarts once" do
+      data = running(%{last_event: {:running, true}})
+      health = &%Event{action: :health, health: &1, id: "c1"}
+
+      {data, e1} = Policy.on_event(health.(:healthy), data)
+      {data, e2} = Policy.on_event(health.(:healthy), data)
+      {data, e3} = Policy.on_event(health.(:unhealthy), data)
+      {data, e4} = Policy.on_event(health.(:unhealthy), data)
+      {data, e5} = Policy.on_event(health.(:healthy), data)
+      {data, e6} = Policy.on_event(health.(:healthy), data)
+
+      assert e1 == [{:emit, :started}]
+      assert {e2, e4, e6} == {[], [], []}
+      assert retries(e3) == 1
+      assert e5 == []
+      assert %{last_event: :healthy, attempt: 1} = data
+    end
+
+    test "an engine event and the app's own check of one transition count once, in either order" do
+      data = running(%{health_check: @check, last_event: :healthy})
+      event = %Event{action: :health, health: :unhealthy, id: "c1"}
+
+      {d1, from_event} = Policy.on_event(event, data)
+      {d1, from_check} = Policy.health_check({:ok, :unhealthy}, d1)
+      assert retries(from_event ++ from_check) == 1
+      assert d1.attempt == 1
+
+      {d2, from_check} = Policy.health_check({:ok, :unhealthy}, data)
+      {d2, from_event} = Policy.on_event(event, d2)
+      assert retries(from_check ++ from_event) == 1
+      assert d2.attempt == 1
+    end
+
+    test "every result arms the next tick for its container; none once a shutdown is in flight" do
+      data = running(%{health_check: @check, last_event: {:running, true}})
+      tick = {:timer, :healthcheck, 30_000, {:healthcheck, "c1"}}
+
+      for result <- [{:ok, :healthy}, {:ok, :starting}, {:error, :busy}, :skip] do
+        {_data, effects} = Policy.health_check(result, data)
+        assert List.last(effects) == tick
+      end
+
+      {_data, effects} = Policy.health_check({:ok, :healthy}, %{data | shutting_down: true})
+      refute Enum.any?(effects, &match?({:timer, :healthcheck, _, _}, &1))
+    end
+
+    test "no tick without a check of the app's own" do
+      assert Policy.health_check({:ok, :healthy}, running(%{last_event: {:running, true}})) ==
+               {running(%{last_event: :healthy}), [{:emit, :started}]}
+    end
+
+    test "a start whose engine leaves checks to the app arms the first tick" do
+      {data, _} = begin(:start, %{}, app(%{wanted: :stopped}))
+
+      {_data, effects} =
+        step(data, {:ok, %{container_id: "c1", ip: @ip, healthcheck: true, health_check: @check}})
+
+      assert {:timer, :healthcheck, 40_000, {:healthcheck, "c1"}} in effects
+
+      {data, _} = begin(:start, %{}, app(%{wanted: :stopped}))
+      {_data, effects} = step(data, {:ok, %{container_id: "c1", ip: @ip, healthcheck: true}})
+      refute Enum.any?(effects, &match?({:timer, :healthcheck, _, _}, &1))
+    end
+
+    test "a stop or a crash cancels the tick, only for an app that runs its own checks" do
+      checked = running(%{health_check: @check})
+
+      {_data, effects} = Policy.on_event(%Event{action: :die, id: "c1", exit_code: 1}, checked)
+      assert {:cancel, :healthcheck} in effects
+
+      {_data, effects} = begin(:stop, %{}, checked)
+      assert {:cancel, :healthcheck} in effects
+
+      {_data, effects} = begin(:halt, %{}, checked)
+      assert {:cancel, :healthcheck} in effects
+
+      {_data, effects} = begin(:stop, %{}, running())
+      refute {:cancel, :healthcheck} in effects
+    end
+  end
+
+  describe "the image check before every start" do
+    test "a start, restart, restore and update all check the image before the create" do
+      data = running()
+
+      for {op, args} <- [{:start, %{}}, {:restart, %{}}, {:restore, %{start?: true}}] do
+        steps = Policy.plan(op, args, data).steps
+
+        assert Enum.drop_while(steps, &(&1 != {:ensure_image, nil})) |> Enum.take(3) ==
+                 [{:ensure_image, nil}, {:mint_token, nil}, {:start, nil}],
+               "#{op}"
+      end
+    end
+
+    test "a native app has no image to check" do
+      native = app(%{config: native_config(), wanted: :stopped})
+      {_data, effects} = Policy.next(Policy.plan(:start, %{}, native), :begin, native)
+      assert List.last(effects) == {:step, {:start, nil}}
+    end
+
+    test "a failed check fails the start as a failed start does" do
+      data = app(%{wanted: :stopped})
+      plan = Policy.plan(:start, %{}, data)
+      {data, [{:step, {:ensure_image, nil}}]} = Policy.next(plan, :begin, data)
+
+      {image_failed, effects} = Policy.next(data.run, {:error, {:pull, :timeout}}, data)
+
+      {start_failed, start_effects} =
+        Policy.next(%{data.run | step: {:start, nil}}, {:error, {:pull, :timeout}}, data)
+
+      assert effects == start_effects
+      assert image_failed.last_event == start_failed.last_event
+      assert {:reply, {:error, {:pull, :timeout}}} in effects
+    end
+
+    test "a failed check of an update's new image rolls back to the old version" do
+      new = app_config(%{"version" => "2"})
+      {data, _} = begin(:update, %{config: new}, running())
+      {data, _} = step(data, {:ok, "image"})
+      {data, _} = Policy.next(data.run, {:ok, %{was_running: true}}, data)
+      assert {:ensure_image, nil} = data.run.step
+      assert data.config.version == "2"
+
+      {data, effects} = Policy.next(data.run, {:error, {:pull, :timeout}}, data)
+      assert data.config.version == "1.0.0"
+      assert List.last(effects) == {:step, {:ensure_image, nil}}
+    end
+  end
+
   describe "strike/2" do
     test "one miss is a strike; a hit clears it" do
       assert {%{strikes: 1}, [{:timer, :probe, _, :probe}]} = Policy.strike(:unhealthy, running())
@@ -451,9 +600,10 @@ defmodule Vagus.App.PolicyTest do
     test "the step list per op" do
       table = [
         {:install, %{config: app_config()}, [{:pull, nil}, {:port?, nil}, {:commit, nil}]},
-        {:start, %{}, [{:port?, nil}, {:mint_token, nil}, {:start, nil}]},
+        {:start, %{}, [{:port?, nil}, {:ensure_image, nil}, {:mint_token, nil}, {:start, nil}]},
         {:stop, %{}, [{:stop, nil}]},
-        {:restart, %{}, [{:stop, nil}, {:port?, nil}, {:mint_token, nil}, {:start, nil}]},
+        {:restart, %{},
+         [{:stop, nil}, {:port?, nil}, {:ensure_image, nil}, {:mint_token, nil}, {:start, nil}]},
         {:uninstall, %{}, [{:stop, nil}, {:delete_file, nil}, {:remove_app, nil}]},
         {:halt, %{}, [{:halt_stop, nil}]},
         {:restore, %{start?: false}, [{:stop, :strict}, {:swap_data, nil}, {:set_options, nil}]},
@@ -463,6 +613,7 @@ defmodule Vagus.App.PolicyTest do
            {:swap_data, nil},
            {:set_options, nil},
            {:port?, nil},
+           {:ensure_image, nil},
            {:mint_token, nil},
            {:start, nil}
          ]},

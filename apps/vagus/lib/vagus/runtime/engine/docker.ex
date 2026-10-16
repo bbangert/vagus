@@ -31,6 +31,9 @@ defmodule Vagus.Runtime.Engine.Docker do
   }
 
   @impl true
+  def schedules_healthchecks?(_opts), do: true
+
+  @impl true
   def ready(opts) do
     opts = deadline(opts)
 

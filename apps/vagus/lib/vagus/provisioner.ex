@@ -6,6 +6,16 @@ defmodule Vagus.Provisioner do
   Runs an ordered, idempotent list of steps — today `[:expand_data,
   :provision_core]` — once per boot, retrying whatever isn't ready yet.
 
+  ## `:provision_core`
+
+  With no Core installed it installs the latest. With one installed it
+  checks, once the engine answers, that the engine still holds that
+  version's image; an engine with a transient store loses it to a store
+  reset or a migration. A missing one is pulled, the installed version and
+  never the latest, and Core is started; boot's Core stage leaves an absent
+  image to this. Each of install, pull and start is retried with backoff
+  until it succeeds.
+
   ## The 4Kn prohibition
 
   `fwup`'s `gpt_write()` is 512-LBA-only. Running the `expand-data` fwup task
@@ -131,6 +141,8 @@ defmodule Vagus.Provisioner do
       ping: Keyword.get(opts, :ping, &default_ping/0),
       connection: Keyword.get(opts, :connection, &default_connection/0),
       installed: Keyword.get(opts, :installed, &default_installed/0),
+      image_present: Keyword.get(opts, :image_present, &default_image_present/1),
+      pull: Keyword.get(opts, :pull, &default_pull/1),
       update: Keyword.get(opts, :update, &default_update/0),
       start: Keyword.get(opts, :start, &default_start/0),
       await_healthy: Keyword.get(opts, :await_healthy, &default_await_healthy/0),
@@ -144,6 +156,9 @@ defmodule Vagus.Provisioner do
       # to exercise `safe_run_step/2`'s normalization without needing a real
       # step to misbehave.
       run_step: Keyword.get(opts, :run_step, &default_run_step/2),
+      # The installed version whose image is being fetched; `nil` while
+      # installing the latest.
+      version: nil,
       retry_attempt: 0
     }
 
@@ -154,6 +169,10 @@ defmodule Vagus.Provisioner do
   def handle_continue(:run, state), do: {:noreply, run_steps(state.steps, state)}
 
   @impl GenServer
+  def handle_info({:provision_core, version}, state) do
+    {:noreply, safe_async(:await_engine, %{state | version: version}, &do_await_engine/1)}
+  end
+
   def handle_info(:await_engine, state) do
     {:noreply, safe_async(:await_engine, state, &do_await_engine/1)}
   end
@@ -166,11 +185,18 @@ defmodule Vagus.Provisioner do
     {:noreply, safe_async(:attempt_update, state, &attempt_update/1)}
   end
 
+  def handle_info(:attempt_pull, state) do
+    {:noreply, safe_async(:attempt_pull, state, &attempt_pull/1)}
+  end
+
+  def handle_info(:attempt_start, state) do
+    {:noreply, safe_async(:attempt_start, state, &start_and_await_healthy/1)}
+  end
+
   defp do_await_engine(state) do
     case state.ping.() do
       :ok ->
-        Logger.info("Vagus.Provisioner: engine ready — awaiting internet connectivity")
-        send(self(), :await_internet)
+        engine_ready(state)
 
       {:error, _reason} ->
         Process.send_after(self(), :await_engine, state.engine_interval)
@@ -179,11 +205,39 @@ defmodule Vagus.Provisioner do
     state
   end
 
+  defp engine_ready(%{version: nil}) do
+    Logger.info("Vagus.Provisioner: engine ready — awaiting internet connectivity")
+    send(self(), :await_internet)
+  end
+
+  # Only the engine can say whether the image survived: a podman store does
+  # not across a migration or a reset. A present image leaves Core to boot's
+  # Core stage, which creates it.
+  defp engine_ready(%{version: version} = state) do
+    case state.image_present.(version) do
+      true ->
+        Logger.info(
+          "Vagus.Provisioner: Core #{version} already installed — provisioning not needed"
+        )
+
+      false ->
+        Logger.info(
+          "Vagus.Provisioner: Core #{version}'s image is absent — awaiting internet to pull it"
+        )
+
+        send(self(), :await_internet)
+
+      {:error, _reason} ->
+        Process.send_after(self(), :await_engine, state.engine_interval)
+    end
+  end
+
   defp do_await_internet(state) do
     case state.connection.() do
       :internet ->
+        attempt = if state.version, do: :attempt_pull, else: :attempt_update
         Logger.info("Vagus.Provisioner: internet reachable — installing HA Core")
-        send(self(), :attempt_update)
+        send(self(), attempt)
 
       _not_yet ->
         Process.send_after(self(), :await_internet, state.net_interval)
@@ -486,28 +540,23 @@ defmodule Vagus.Provisioner do
 
   # --- :provision_core -----------------------------------------------------
 
+  # A step returns only its verdict, so the version rides the message that
+  # starts the continuation.
   defp provision_core(state) do
-    case state.installed.() do
-      nil ->
-        Logger.info("Vagus.Provisioner: no Core installed — starting first-boot provisioning")
-        send(self(), :await_engine)
-        :async
+    version = state.installed.()
 
-      version ->
-        Logger.info(
-          "Vagus.Provisioner: Core #{version} already installed — provisioning not needed"
-        )
+    if version == nil,
+      do: Logger.info("Vagus.Provisioner: no Core installed — starting first-boot provisioning")
 
-        :ok
-    end
+    send(self(), {:provision_core, version})
+    :async
   end
 
   defp attempt_update(state) do
     case state.update.() do
       {:ok, version} ->
         Logger.info("Vagus.Provisioner: Core #{version} installed — starting it")
-        start_and_await_healthy(state)
-        state
+        start_and_await_healthy(%{state | retry_attempt: 0})
 
       {:error, :version_installed} ->
         Logger.info("Vagus.Provisioner: Core install raced a concurrent install — already done")
@@ -515,25 +564,26 @@ defmodule Vagus.Provisioner do
         state
 
       {:error, reason} ->
-        delay = min(state.retry_base * Integer.pow(2, state.retry_attempt), state.retry_cap)
-
-        Logger.warning(
-          "Vagus.Provisioner: Core install failed (#{inspect(reason)}) — retrying in #{delay}ms"
-        )
-
-        Process.send_after(self(), :attempt_update, delay)
-        # Cap how far `retry_attempt` climbs once the delay has already
-        # hit `retry_cap` — otherwise it keeps growing forever on a
-        # persistently offline board and `2 ** retry_attempt` eventually
-        # becomes a needlessly huge bignum for no behavioral gain.
-        if delay < state.retry_cap do
-          %{state | retry_attempt: state.retry_attempt + 1}
-        else
-          state
-        end
+        retry_later(state, :attempt_update, "Core install failed (#{inspect(reason)})")
     end
   end
 
+  # The installed version, never the latest: an image gone from the store is
+  # not an update.
+  defp attempt_pull(state) do
+    case state.pull.(state.version) do
+      :ok ->
+        Logger.info("Vagus.Provisioner: Core #{state.version}'s image pulled — starting it")
+        start_and_await_healthy(%{state | retry_attempt: 0})
+
+      {:error, reason} ->
+        retry_later(state, :attempt_pull, "Core image pull failed (#{inspect(reason)})")
+    end
+  end
+
+  # A failed start is retried like a failed install: the image is there, and
+  # what failed it (the lifecycle lock held by a boot-time start, the engine
+  # still settling) usually passes.
   defp start_and_await_healthy(state) do
     case state.start.() do
       :ok ->
@@ -548,9 +598,24 @@ defmodule Vagus.Provisioner do
             )
         end
 
+        state
+
       {:error, reason} ->
-        Logger.warning("Vagus.Provisioner: Core start failed (#{inspect(reason)}), not retrying")
+        retry_later(state, :attempt_start, "Core start failed (#{inspect(reason)})")
     end
+  end
+
+  defp retry_later(state, message, what) do
+    delay = min(state.retry_base * Integer.pow(2, state.retry_attempt), state.retry_cap)
+    Logger.warning("Vagus.Provisioner: #{what} — retrying in #{delay}ms")
+    Process.send_after(self(), message, delay)
+    # Cap how far `retry_attempt` climbs once the delay has already
+    # hit `retry_cap` — otherwise it keeps growing forever on a
+    # persistently offline board and `2 ** retry_attempt` eventually
+    # becomes a needlessly huge bignum for no behavioral gain.
+    if delay < state.retry_cap,
+      do: %{state | retry_attempt: state.retry_attempt + 1},
+      else: state
   end
 
   # --- default seams ---------------------------------------------------
@@ -566,6 +631,10 @@ defmodule Vagus.Provisioner do
   defp default_ping, do: Vagus.Runtime.Engine.ready()
 
   defp default_installed, do: Vagus.Core.Versions.installed()
+
+  defp default_image_present(version), do: Vagus.Core.Lifecycle.image_present?(version)
+
+  defp default_pull(version), do: Vagus.Core.Lifecycle.pull(version)
 
   defp default_update, do: Vagus.Core.Lifecycle.update()
 

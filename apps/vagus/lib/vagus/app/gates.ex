@@ -25,9 +25,14 @@ defmodule Vagus.App.Gates do
       else: {:error, :starting}
   end
 
-  @doc "The engine starts only once the network reaches the internet."
-  @spec engine() :: :ok | {:error, term()}
-  def engine, do: Vagus.Runtime.Engine.ready()
+  @doc """
+  The engine answers. Under Docker that waits for the internet as well:
+  `Vagus.Engine.Manager` starts balena-engine only once the network reaches
+  it. Under podman it is `Vagus.Runtime.Host`'s preparation alone, since only
+  a pull needs the network.
+  """
+  @spec engine(keyword()) :: :ok | {:error, term()}
+  def engine(opts \\ []), do: Vagus.Runtime.Engine.ready(opts)
 
   @doc """
   Stands up the `hassio` bridge, binds the `.2`/`.3` anchors and asserts the

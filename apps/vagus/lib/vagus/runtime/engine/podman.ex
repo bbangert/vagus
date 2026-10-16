@@ -95,6 +95,10 @@ defmodule Vagus.Runtime.Engine.Podman do
     "removing" => :removing
   }
 
+  # Without systemd podman never runs a check on its own.
+  @impl true
+  def schedules_healthchecks?(_opts), do: false
+
   @impl true
   def ready(opts) do
     case Host.ready(opts[:host]) do
@@ -430,7 +434,9 @@ defmodule Vagus.Runtime.Engine.Podman do
   @doc """
   Runs the check once. A pass is `:healthy`; otherwise the verdict is the
   stored `Health.Status`, because `healthcheck run` reports this one probe
-  while the status honours the start period and the retry count.
+  while the status honours the start period and the retry count. Its
+  `:health` permit never queues: with no `:ops` permit free, or during a
+  shutdown, the check is `{:error, :busy}` and the caller skips that tick.
   """
   @impl true
   def healthcheck(name, opts) do
@@ -816,6 +822,7 @@ defmodule Vagus.Runtime.Engine.Podman do
   end
 
   defp class(:pull), do: :pull
+  defp class(:healthcheck), do: :health
   defp class(:stop_all), do: :shutdown
   defp class(_verb), do: :ops
 

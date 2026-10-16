@@ -676,6 +676,119 @@ defmodule Vagus.App.StepsTest do
     end
   end
 
+  describe "ensure_image" do
+    @describetag :tmp_dir
+
+    defp container_input(ctx, fake, extra \\ %{}) do
+      input(
+        ctx,
+        Map.merge(
+          %{
+            backend: Vagus.Addon.Backend.Container,
+            engine_opts: [engine: Fake, fake: fake],
+            arch: "amd64"
+          },
+          extra
+        )
+      )
+    end
+
+    @image "homeassistant/amd64-addon-test:3"
+
+    test "pulls an image the engine lacks, for the app's platform", ctx do
+      {fake, _opts} = engine(%{})
+
+      assert {:ok, @image} = Steps.run(:ensure_image, container_input(ctx, fake))
+      assert [{:image_present?, [@image]}, {:pull, [@image]}] = Fake.calls(fake)
+      assert [_, {:pull, pull_opts}] = Fake.call_opts(fake)
+      assert pull_opts[:platform] == "linux/amd64"
+    end
+
+    test "a present image costs one check and no pull", ctx do
+      {fake, _opts} = engine(%{})
+      Fake.put_image(fake, @image)
+
+      assert {:ok, @image} = Steps.run(:ensure_image, container_input(ctx, fake))
+      assert Fake.calls(fake) == [{:image_present?, [@image]}]
+    end
+
+    test "a failed pull fails the step", ctx do
+      {fake, _opts} = engine(%{})
+      Fake.fail_next(fake, :pull, {:pull_failed, "manifest unknown"})
+
+      assert {:error, {:pull, {:pull_failed, "manifest unknown"}}} =
+               Steps.run(:ensure_image, container_input(ctx, fake))
+    end
+
+    test "a presence check that errors leaves the create to report", ctx do
+      {fake, _opts} = engine(%{})
+      Fake.fail_next(fake, :image_present?, :timeout)
+
+      assert {:ok, @image} = Steps.run(:ensure_image, container_input(ctx, fake))
+      assert Fake.calls(fake) == [{:image_present?, [@image]}]
+    end
+
+    test "a backend with no image concept has nothing to fetch", ctx do
+      assert {:ok, _image} = Steps.run(:ensure_image, input(ctx))
+      refute_received {:pull, _spec}
+    end
+
+    test "a missing image is pulled, then the start creates from it", ctx do
+      fake = Fake.start_global()
+
+      assert {:ok, @image} = Steps.run(:ensure_image, container_input(ctx, fake))
+
+      assert {:ok, %{container_id: id}} =
+               Steps.run(:start, container_input(ctx, fake))
+
+      assert {:ok, %{image: @image, state: :running}} = Fake.inspect(id, fake: fake)
+
+      verbs = Enum.map(Fake.calls(fake), &elem(&1, 0))
+      assert Enum.take(verbs, 2) == [:image_present?, :pull]
+      assert :create in verbs
+    end
+  end
+
+  describe "the healthcheck an engine leaves to the app" do
+    @describetag :tmp_dir
+
+    defp started_fact(ctx, healthcheck, engine_extra) do
+      {_fake, engine_opts} = engine(%{"fake-id" => [healthcheck: healthcheck]})
+
+      {:ok, fact} =
+        Steps.run(:start, input(ctx, %{engine_opts: engine_opts ++ engine_extra}))
+
+      {fact, engine_opts ++ engine_extra}
+    end
+
+    test "is timed from the container's own check, after its start period", ctx do
+      hc = %{test: ["CMD", "true"], interval_ms: 45_000, start_period_ms: 60_000}
+      {fact, engine_opts} = started_fact(ctx, hc, schedules_healthchecks: false)
+
+      assert %{health_check: %{interval_ms: 45_000, first_ms: first, engine_opts: ^engine_opts}} =
+               fact
+
+      assert first in 60_001..105_000
+    end
+
+    test "takes Docker's 30 s for an unset interval, and floors a short one", ctx do
+      for interval <- [nil, 0, 1_000] do
+        hc = %{test: ["CMD", "true"], interval_ms: interval, start_period_ms: nil}
+        {fact, _} = started_fact(ctx, hc, schedules_healthchecks: false)
+        assert %{interval_ms: 30_000, first_ms: first} = fact.health_check
+        assert first in 30_001..60_000
+      end
+    end
+
+    test "is none under an engine that schedules checks itself, or with no check", ctx do
+      {fact, _} = started_fact(ctx, %{test: ["CMD", "true"]}, [])
+      assert %{healthcheck: true, health_check: nil} = fact
+
+      {fact, _} = started_fact(ctx, nil, schedules_healthchecks: false)
+      assert %{healthcheck: false, health_check: nil} = fact
+    end
+  end
+
   describe "stop, halt_stop, pull" do
     @describetag :tmp_dir
 
