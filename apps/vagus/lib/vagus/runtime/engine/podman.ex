@@ -798,6 +798,7 @@ defmodule Vagus.Runtime.Engine.Podman do
       interval_ms: ns_to_ms(hc["Interval"]),
       timeout_ms: ns_to_ms(hc["Timeout"]),
       start_period_ms: ns_to_ms(hc["StartPeriod"]),
+      start_interval_ms: ns_to_ms(hc["StartInterval"]),
       retries: hc["Retries"]
     }
   end

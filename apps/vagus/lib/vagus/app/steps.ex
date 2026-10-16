@@ -29,6 +29,7 @@ defmodule Vagus.App.Steps do
   @health_timeout_ms 30_000
   @health_timeout_cap_ms 300_000
   @health_run_margin_ms 5_000
+  @health_start_interval_floor_ms 5_000
   @port_min 62_000
   @port_max 65_500
   @port_tries 100
@@ -422,6 +423,13 @@ defmodule Vagus.App.Steps do
   # podman process a second on a small board. The first run waits out the
   # start period, plus up to one interval of jitter so apps started together
   # do not all check together.
+  #
+  # An image that declares a start interval is checked at that pace through
+  # its start period instead, as Docker 25 did: a 15 min interval would
+  # otherwise leave it starting for half an hour. The ticks are bounded by
+  # the start period, so the floor is a lower one. podman's own verdict keeps
+  # Docker's rules: a success in the start period is healthy at once, and a
+  # failure there counts for nothing.
   defp health_check(nil, _engine_opts), do: nil
 
   defp health_check(healthcheck, engine_opts) do
@@ -432,8 +440,20 @@ defmodule Vagus.App.Steps do
       interval = max(positive(healthcheck[:interval_ms]) || @health_interval_ms, floor)
       start_period = positive(healthcheck[:start_period_ms]) || 0
 
+      start_interval =
+        positive(healthcheck[:start_interval_ms]) &&
+          max(healthcheck[:start_interval_ms], @health_start_interval_floor_ms)
+
+      start_ticks = if start_interval, do: div(start_period, start_interval), else: 0
+
       %{
-        first_ms: max(start_period, interval) + :rand.uniform(interval),
+        first_ms:
+          if(start_ticks > 0,
+            do: start_interval,
+            else: max(start_period, interval) + :rand.uniform(interval)
+          ),
+        start_interval_ms: start_interval,
+        start_ticks: start_ticks,
         interval_ms: interval,
         timeout_ms:
           min(positive(healthcheck[:timeout_ms]) || @health_timeout_ms, @health_timeout_cap_ms) +
@@ -609,9 +629,10 @@ defmodule Vagus.App.Steps do
   end
 
   # Every bridged container is created here, whichever path starts it, so
-  # this is the one place that keeps one from running without the forward
-  # filter. Host-network containers are not behind the bridge's forward
-  # path, and are never held back by nft.
+  # this is the one place that keeps one from running without the bridge's
+  # filters and forwarding (`Vagus.Network.Nat.ensure_loaded/1`).
+  # Host-network containers are not behind the bridge's forward path, and
+  # are never held back by it.
   defp ensure_isolation(%Config{host_network: true}, _opts), do: :ok
   defp ensure_isolation(%Config{backend: :native}, _opts), do: :ok
 
@@ -622,8 +643,8 @@ defmodule Vagus.App.Steps do
 
       {:error, reason} ->
         Logger.error(
-          "Vagus.App.Steps: bridged app not started: the hassio forward filter " <>
-            "(table ip vagus) is not loaded, so the LAN could reach it"
+          "Vagus.App.Steps: bridged app not started: the hassio filters (table ip vagus) " <>
+            "or IPv4 forwarding are not in place: #{inspect(reason)}"
         )
 
         {:error, {:isolation_not_loaded, reason}}

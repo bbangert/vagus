@@ -17,6 +17,9 @@ defmodule Vagus.App.GatesTest do
     end
 
     fake = Fake.start()
+    # A /proc/sys stand-in where the hassio bridge exists.
+    sysctl_root = Path.join(dir, "sys")
+    File.mkdir_p!(Path.join(sysctl_root, "net/ipv4/conf/hassio"))
     key = {__MODULE__, :nat_loaded, make_ref()}
     on_exit(fn -> :persistent_term.erase(key) end)
 
@@ -28,6 +31,7 @@ defmodule Vagus.App.GatesTest do
       cmd: record,
       enabled: true,
       nft_dir: dir,
+      sysctl_root: sysctl_root,
       loaded_key: key,
       ip: "172.30.32.2",
       port: 8888

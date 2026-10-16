@@ -390,13 +390,24 @@ defmodule Vagus.App.Policy do
       match?({:ok, health} when health in [:healthy, :unhealthy], result) ->
         {:ok, health} = result
         event = %{action: :health, id: data.container_id, health: health}
-        {data, effects} = on_event(event, data)
+        {data, effects} = on_event(event, consume_start_tick(data, result))
         {data, effects ++ health_timer(data, :interval_ms)}
 
       true ->
+        data = consume_start_tick(data, result)
         {data, health_timer(data, :interval_ms)}
     end
   end
+
+  # A healthy verdict ends the start period's quicker ticks, as Docker's
+  # first success does.
+  defp consume_start_tick(%{health_check: %{start_ticks: n} = check} = data, result)
+       when n > 0 do
+    left = if result == {:ok, :healthy}, do: 0, else: n - 1
+    %{data | health_check: %{check | start_ticks: left}}
+  end
+
+  defp consume_start_tick(data, _result), do: data
 
   @doc """
   The next healthcheck tick, or none: `[]` when the app runs no checks of
@@ -413,6 +424,8 @@ defmodule Vagus.App.Policy do
   def health_timer(_data, _which), do: []
 
   defp tick_ms({:unknown, _engine_opts, _tries}, _which), do: @reinspect_ms
+
+  defp tick_ms(%{start_ticks: n, start_interval_ms: ms}, :interval_ms) when n > 0, do: ms
   defp tick_ms(check, which), do: Map.fetch!(check, which)
 
   # A start whose inspect failed left the schedule `{:unknown, engine_opts,

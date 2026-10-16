@@ -55,7 +55,7 @@ defmodule Vagus.App.Gates do
 
     warn_unless_ok(
       Nat.ensure(opts),
-      "supervisor DNAT and forward filter; bridged apps will not start until it loads"
+      "supervisor DNAT, bridge filters and forwarding; bridged apps will not start until they are in place"
     )
 
     # The listener's bind address exists only from here, so its next bind

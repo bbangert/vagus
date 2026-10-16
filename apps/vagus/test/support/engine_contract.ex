@@ -42,6 +42,7 @@ defmodule Vagus.Test.EngineContract do
         interval_ms: 30_000,
         timeout_ms: 5_000,
         start_period_ms: nil,
+        start_interval_ms: nil,
         retries: 3
       },
       started_at: ~U[2026-10-14 10:00:00.123456Z],

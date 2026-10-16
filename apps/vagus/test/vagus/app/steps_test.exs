@@ -465,6 +465,8 @@ defmodule Vagus.App.StepsTest do
     test = self()
     {:ok, answer} = Agent.start_link(fn -> {"", 0} end)
     key = {__MODULE__, :nat_loaded, make_ref()}
+    sysctl_root = Path.join(ctx.tmp_dir, "sys")
+    File.mkdir_p!(Path.join(sysctl_root, "net/ipv4/conf/hassio"))
     on_exit(fn -> :persistent_term.erase(key) end)
 
     cmd = fn "nft", args ->
@@ -476,6 +478,7 @@ defmodule Vagus.App.StepsTest do
       enabled: true,
       cmd: cmd,
       nft_dir: Path.join(ctx.tmp_dir, "nft"),
+      sysctl_root: sysctl_root,
       loaded_key: key,
       ip: "172.30.32.2",
       port: 8888
@@ -605,6 +608,23 @@ defmodule Vagus.App.StepsTest do
 
       assert_received {:nft, ["-f", _]}
       assert_received {:create, _}
+    end
+
+    test "a bridged app is refused while forwarding cannot be switched on", ctx do
+      bridged = test_config(%{"host_network" => false})
+      {_fake, engine_opts} = engine(%{})
+      {nat_opts, _answer} = nat(ctx)
+      File.rm_rf!(Path.join(nat_opts[:sysctl_root], "net/ipv4/conf/hassio"))
+
+      capture_log(fn ->
+        assert {:error, {:isolation_not_loaded, {:sysctl, _, :enoent}}} =
+                 Steps.run(
+                   :start,
+                   input(ctx, %{config: bridged, engine_opts: engine_opts, nat_opts: nat_opts})
+                 )
+      end)
+
+      refute_received {:create, _}
     end
 
     test "once the filter has loaded, later bridged starts do not load it again", ctx do
@@ -890,6 +910,29 @@ defmodule Vagus.App.StepsTest do
                fact
 
       assert first in 60_001..105_000
+    end
+
+    test "a declared start interval paces the start period: first check at it", ctx do
+      hc = %{
+        test: ["CMD", "/usr/local/bin/healthcheck.sh"],
+        interval_ms: 900_000,
+        timeout_ms: 5_000,
+        start_period_ms: 60_000,
+        start_interval_ms: 10_000,
+        retries: 6
+      }
+
+      {fact, _} = started_fact(ctx, hc, schedules_healthchecks: false)
+
+      assert %{first_ms: 10_000, start_interval_ms: 10_000, start_ticks: 6, interval_ms: 900_000} =
+               fact.health_check
+    end
+
+    test "without a start interval the first check still waits out the start period", ctx do
+      hc = %{test: ["CMD", "true"], interval_ms: 900_000, start_period_ms: 60_000}
+      {fact, _} = started_fact(ctx, hc, schedules_healthchecks: false)
+      assert %{start_ticks: 0, first_ms: first} = fact.health_check
+      assert first in 900_001..1_800_000
     end
 
     test "carries the check's declared timeout, Docker's 30 s when unset, capped at 5 min", ctx do

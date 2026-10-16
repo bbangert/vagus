@@ -1,8 +1,9 @@
 defmodule Vagus.Network.Nat do
   @moduledoc """
-  Vagus's own nft table: the DNAT that keeps `http://supervisor/` working
-  after the Supervisor-API listener moved off port 80, and the forward filter
-  that keeps the LAN off the `hassio` bridge.
+  Vagus's own nft table and the forwarding sysctls bridged apps need: the
+  DNAT that keeps `http://supervisor/` working after the Supervisor-API
+  listener moved off port 80, and the filters that let the board route for
+  the `hassio` bridge and nothing else.
 
   ## Why this exists
 
@@ -34,17 +35,35 @@ defmodule Vagus.Network.Nat do
   `172.30.32.2:80` too, since netavark's port DNAT matches every local
   address. At -100 the winner depends on which table loaded first.
 
-  ## Forward filter
+  ## Forwarding
 
-  netavark's `FORWARD` chain has policy accept and lets anything reach a
-  container's address, so a LAN host routing `172.30.32.0/23` via the board
-  could open connections to every bridged app (balena's `FORWARD` policy was
-  drop). The `forward` chain drops a new connection entering `hassio` from
-  another interface unless conntrack shows it was DNAT'd, i.e. a published
-  port. Traffic between containers, container egress and replies are not
-  new-from-outside and pass. The flag test is `ct status & dnat == 0`:
-  `ct status != dnat` compares the whole status word, matches nearly every
-  connection, and drops published ports too.
+  Nothing on the board turns IPv4 forwarding on (balena's daemon did), and
+  without it published ports and container egress are dead. netavark's
+  localhost port publishing (`127.0.0.1:<port>`) also needs
+  `route_localnet` on `hassio`, as the DNAT'd packet keeps its loopback
+  source. Both are written here (`:sysctl_root`), after the table is in
+  place, so forwarding never runs unfiltered.
+
+  The `forward` chain then stands in for balena's `FORWARD` policy drop,
+  since netavark's own chain accepts:
+
+    * forwarding between two interfaces neither of which is `hassio` (eth0
+      to wlan0, ...) is dropped: the board is no router;
+    * a new connection entering `hassio` from another interface is dropped
+      unless conntrack shows it was DNAT'd, i.e. a published port, so a LAN
+      host routing `172.30.32.0/23` via the board reaches no app directly.
+
+  Traffic between containers, container egress and replies pass. The flag
+  test is `ct status & dnat == 0`: `ct status != dnat` compares the whole
+  status word, matches nearly every connection, and drops published ports
+  too.
+
+  With `route_localnet` on, a container could reach the host's loopback
+  services by routing to `127.0.0.0/8` through its gateway. The
+  `prerouting_filter` chain drops what arrives on `hassio` for a loopback
+  address unless it belongs to a DNAT'd connection: the replies of a
+  localhost published port do. It runs after conntrack (-200), which it
+  reads, and before routing.
 
   The table is loaded with one `nft -f`, which the kernel applies as a single
   transaction, and the file starts by declaring and flushing the table, so a
@@ -73,6 +92,8 @@ defmodule Vagus.Network.Nat do
   # A drop in any base chain is final whatever netavark's accepts say, so the
   # order against netavark's own filter chain does not matter.
   @forward_priority "filter"
+  # After conntrack (-200) has attached the connection the rule reads.
+  @prerouting_filter_priority "mangle"
   # nft -f is one netlink transaction and takes no lock, so it answers at once
   # or not at all.
   @nft_timeout_ms 10_000
@@ -102,6 +123,8 @@ defmodule Vagus.Network.Nat do
     * `:cmd` — 2-arity command runner `(binary, args) -> {output, status}`
     * `:nft_dir` — where the ruleset file is written for `nft -f`
       (default `/run/vagus`)
+    * `:sysctl_root` — where the sysctl files are written (default
+      `/proc/sys`)
     * `:loaded_key` — the `:persistent_term` key recording a successful load
       (tests)
   """
@@ -109,7 +132,8 @@ defmodule Vagus.Network.Nat do
   def ensure(opts \\ []) do
     if Keyword.get(opts, :enabled, enabled?()) do
       with {:ok, text} <- ruleset(opts),
-           :ok <- load_nft(text, opts) do
+           :ok <- load_nft(text, opts),
+           :ok <- enable_forwarding(opts) do
         :persistent_term.put(Keyword.get(opts, :loaded_key, @loaded_key), true)
       end
     else
@@ -118,12 +142,13 @@ defmodule Vagus.Network.Nat do
   end
 
   @doc """
-  `:ok` once the table has loaded in this VM, else `ensure/1` now. The
-  start of a bridged container calls it: without the forward filter the LAN
-  reaches the container through netavark's accepting policy, so the start
-  fails instead, and the next start retries the load. Nothing removes the
-  table once loaded (netavark never touches another table), so a success
-  holds until the next boot. Same options as `ensure/1`.
+  `:ok` once `ensure/1` has succeeded in this VM, else `ensure/1` now. The
+  start of a bridged container calls it: without the filters the LAN
+  reaches the container through netavark's accepting policy, and without
+  the sysctls its ports and egress are dead, so the start fails instead and
+  the next start retries. Nothing undoes either within a boot (netavark
+  never touches another table, and Vagus's dummy port keeps the bridge), so
+  a success holds until the next boot. Same options as `ensure/1`.
   """
   @spec ensure_loaded(keyword()) :: :ok | {:error, term()}
   def ensure_loaded(opts \\ []) do
@@ -166,11 +191,42 @@ defmodule Vagus.Network.Nat do
        \t}
        \tchain forward {
        \t\ttype filter hook forward priority #{@forward_priority}; policy accept;
+       \t\tiifname != "#{bridge}" oifname != "#{bridge}" drop
        \t\toifname "#{bridge}" iifname != "#{bridge}" ct state new ct status & dnat == 0 drop
+       \t}
+       \tchain prerouting_filter {
+       \t\ttype filter hook prerouting priority #{@prerouting_filter_priority}; policy accept;
+       \t\tiifname "#{bridge}" ip daddr 127.0.0.0/8 ct status & dnat == 0 drop
        \t}
        }
        """}
     end
+  end
+
+  ## sysctls
+
+  # The bridge's own entry exists only once the bridge does: a start before
+  # that fails here and is retried with the next.
+  # sobelow_skip ["Traversal.FileModule"]
+  defp enable_forwarding(opts) do
+    root = Keyword.get(opts, :sysctl_root, "/proc/sys")
+
+    Enum.reduce_while(
+      ["net/ipv4/ip_forward", "net/ipv4/conf/#{Network.name()}/route_localnet"],
+      :ok,
+      fn key, :ok ->
+        path = Path.join(root, key)
+
+        case File.write(path, "1") do
+          :ok ->
+            {:cont, :ok}
+
+          {:error, reason} ->
+            Logger.warning("Vagus.Network.Nat: #{path} not set to 1: #{inspect(reason)}")
+            {:halt, {:error, {:sysctl, key, reason}}}
+        end
+      end
+    )
   end
 
   ## nft

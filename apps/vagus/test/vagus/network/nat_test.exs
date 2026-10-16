@@ -20,7 +20,12 @@ defmodule Vagus.Network.NatTest do
   \t}
   \tchain forward {
   \t\ttype filter hook forward priority filter; policy accept;
+  \t\tiifname != "hassio" oifname != "hassio" drop
   \t\toifname "hassio" iifname != "hassio" ct state new ct status & dnat == 0 drop
+  \t}
+  \tchain prerouting_filter {
+  \t\ttype filter hook prerouting priority mangle; policy accept;
+  \t\tiifname "hassio" ip daddr 127.0.0.0/8 ct status & dnat == 0 drop
   \t}
   }
   """
@@ -43,6 +48,7 @@ defmodule Vagus.Network.NatTest do
 
     dir = Path.join(System.tmp_dir!(), "vagus-nft-#{System.unique_integer([:positive])}")
     on_exit(fn -> File.rm_rf(dir) end)
+    on_exit(fn -> File.rm_rf(sysctl_root(dir)) end)
     # Each test's own load record: a shared one would let one test's load
     # answer for another's.
     on_exit(fn -> :persistent_term.erase({__MODULE__, dir}) end)
@@ -68,8 +74,18 @@ defmodule Vagus.Network.NatTest do
       cmd: cmd,
       ip: "172.30.32.2",
       port: 8888,
-      loaded_key: {__MODULE__, dir}
+      loaded_key: {__MODULE__, dir},
+      sysctl_root: sysctl_root(dir)
     ]
+
+  # A /proc/sys stand-in where the hassio bridge exists.
+  defp sysctl_root(dir) do
+    root = dir <> "-sys"
+    File.mkdir_p!(Path.join(root, "net/ipv4/conf/hassio"))
+    root
+  end
+
+  defp sysctl(dir, key), do: File.read(Path.join(sysctl_root(dir), key))
 
   describe "ensure/1" do
     test "the ruleset: both nat hooks at -110, and the forward filter" do
@@ -123,6 +139,39 @@ defmodule Vagus.Network.NatTest do
 
       assert log =~ "not written"
       refute_received {:nft, _, _, _}
+    end
+  end
+
+  describe "forwarding sysctls" do
+    test "ip_forward and the bridge's route_localnet are set once the table is loaded",
+         %{dir: dir} do
+      assert Nat.ensure(opts(dir, nft_fake({"", 0}))) == :ok
+      assert sysctl(dir, "net/ipv4/ip_forward") == {:ok, "1"}
+      assert sysctl(dir, "net/ipv4/conf/hassio/route_localnet") == {:ok, "1"}
+    end
+
+    test "never before the filter: a refused load leaves forwarding off", %{dir: dir} do
+      capture_log(fn -> Nat.ensure(opts(dir, nft_fake({"boom", 1}))) end)
+      assert {:error, :enoent} = sysctl(dir, "net/ipv4/ip_forward")
+    end
+
+    test "a bridge that does not exist yet fails the load and records nothing",
+         %{dir: dir} do
+      opts = opts(dir, nft_fake({"", 0}))
+      File.rm_rf!(Path.join(opts[:sysctl_root], "net/ipv4/conf/hassio"))
+
+      log =
+        capture_log(fn ->
+          assert {:error, {:sysctl, "net/ipv4/conf/hassio/route_localnet", :enoent}} =
+                   Nat.ensure(opts)
+        end)
+
+      assert log =~ "route_localnet not set"
+      refute :persistent_term.get(opts[:loaded_key], false)
+
+      File.mkdir_p!(Path.join(opts[:sysctl_root], "net/ipv4/conf/hassio"))
+      assert Nat.ensure_loaded(opts) == :ok
+      assert sysctl(dir, "net/ipv4/conf/hassio/route_localnet") == {:ok, "1"}
     end
   end
 

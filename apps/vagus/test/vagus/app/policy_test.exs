@@ -492,6 +492,58 @@ defmodule Vagus.App.PolicyTest do
     end
   end
 
+  describe "an image with a start interval" do
+    @quick %{
+      first_ms: 10_000,
+      start_interval_ms: 10_000,
+      start_ticks: 6,
+      interval_ms: 900_000,
+      engine_opts: []
+    }
+
+    defp tick(effects),
+      do:
+        Enum.find_value(effects, fn
+          {:timer, :healthcheck, ms, _} -> ms
+          _ -> nil
+        end)
+
+    test "is checked at the start interval while starting, and healthy on its first success" do
+      data = running(%{health_check: @quick, last_event: {:running, true}})
+
+      {data, effects} = Policy.health_check({:ok, :starting}, data)
+      assert tick(effects) == 10_000
+      assert Policy.derive(:idle, data) == :startup
+
+      {data, effects} = Policy.health_check({:ok, :healthy}, data)
+      assert {:emit, :started} in effects
+      assert data.last_event == :healthy
+      assert tick(effects) == 900_000
+      assert data.health_check.start_ticks == 0
+    end
+
+    test "goes over to the interval once the start period's ticks are spent" do
+      data = running(%{health_check: @quick, last_event: {:running, true}})
+
+      {data, ticks} =
+        Enum.reduce(1..7, {data, []}, fn _, {data, ticks} ->
+          {data, effects} = Policy.health_check({:ok, :starting}, data)
+          {data, ticks ++ [tick(effects)]}
+        end)
+
+      assert ticks == [10_000, 10_000, 10_000, 10_000, 10_000, 900_000, 900_000]
+      assert Policy.derive(:idle, data) == :startup
+    end
+
+    test "a schedule without one ticks at the interval from the first result" do
+      data =
+        running(%{health_check: Map.delete(@quick, :start_ticks), last_event: {:running, true}})
+
+      {_data, effects} = Policy.health_check({:ok, :starting}, data)
+      assert tick(effects) == 900_000
+    end
+  end
+
   describe "a schedule the start could not inspect" do
     @unknown {:unknown, [engine: :fake], 0}
     @schedule %{first_ms: 40_000, interval_ms: 30_000, engine_opts: [engine: :fake]}
