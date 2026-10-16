@@ -42,13 +42,13 @@ defmodule Vagus.App.Gates do
   the bridge is the host's own (`Vagus.Network.host_bridge?/1`), so the
   anchors and the DNAT go on even when the engine could not make its
   network. Best effort: always `:ok`, so a failure here never holds the apps
-  back.
+  back. `opts` reach every step (tests).
   """
-  @spec network() :: :ok
-  def network do
-    case Network.ensure() do
+  @spec network(keyword()) :: :ok
+  def network(opts \\ []) do
+    case Network.ensure(opts) do
       :ok ->
-        anchors_and_nat()
+        anchors_and_nat(opts)
 
       {:error, reason} ->
         warn_unless_ok(
@@ -56,7 +56,7 @@ defmodule Vagus.App.Gates do
           "hassio bridge; Core and bridged apps may not reach the Supervisor"
         )
 
-        if Network.host_bridge?(), do: anchors_and_nat()
+        if Network.host_bridge?(opts), do: anchors_and_nat(opts)
     end
 
     # The listener's bind address exists only from here, so its next bind
@@ -65,9 +65,9 @@ defmodule Vagus.App.Gates do
     :ok
   end
 
-  defp anchors_and_nat do
-    Network.ensure_supervisor_ip()
-    warn_unless_ok(Nat.ensure(), "supervisor DNAT; apps may not reach http://supervisor/")
+  defp anchors_and_nat(opts) do
+    Network.ensure_supervisor_ip(opts)
+    warn_unless_ok(Nat.ensure(opts), "supervisor DNAT; apps may not reach http://supervisor/")
   end
 
   @doc """

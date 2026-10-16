@@ -345,6 +345,16 @@ defmodule Vagus.NetworkTest do
       assert length(ip_calls()) == length(Network.bridge_commands())
     end
 
+    test "ensure/1 logs a bridge it could not keep and answers for the network",
+         %{fake: fake} do
+      fails = fn _args -> {"ip: RTNETLINK answers: Operation not supported\n", 2} end
+      opts = [engine: Fake, fake: fake, host_bridge: true, ip_cmd: ip_fake(fake, fails)]
+
+      log = ExUnit.CaptureLog.capture_log(fn -> assert Network.ensure(opts) == :ok end)
+      assert log =~ "the hassio bridge is not kept"
+      assert log =~ "Operation not supported"
+    end
+
     test "a real failure stops the steps and is returned", %{fake: fake} do
       no_bridge = fn
         ["link", "add", "hassio", "type", "bridge"] ->

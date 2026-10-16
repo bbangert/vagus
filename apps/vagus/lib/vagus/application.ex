@@ -195,9 +195,8 @@ defmodule Vagus.Application do
   # Only under the podman engine: it prepares the board for podman and holds
   # the permits every podman call takes. Before the app processes, whose
   # calls need it, and stopped after them.
-  defp runtime_host_children, do: if(podman?(), do: [Vagus.Runtime.Host], else: [])
-
-  defp podman?, do: Application.get_env(:vagus, :engine) == Vagus.Runtime.Engine.Podman
+  defp runtime_host_children,
+    do: if(Vagus.Runtime.Engine.podman?(), do: [Vagus.Runtime.Host], else: [])
 
   # The `hassio` DNS server (M4-P1-T2), gated by `:dns_enabled` (false in
   # test.exs so `mix test` never binds :53). On :host dev the .3 anchor / :53
@@ -248,7 +247,7 @@ defmodule Vagus.Application do
 
     # podman runs no daemon: these would start balena-engine beside it.
     defp balena_children do
-      if podman?() do
+      if Vagus.Runtime.Engine.podman?() do
         []
       else
         [

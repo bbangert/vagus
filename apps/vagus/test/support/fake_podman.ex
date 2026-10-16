@@ -29,21 +29,27 @@ defmodule Vagus.Test.FakePodman do
     File.write!(bin, """
     #!/bin/sh
     dir=#{dir}
-    printf '%s\\037' "$@" >> "$dir/calls"
-    printf '\\n' >> "$dir/calls"
-    for kv in #{log_env}; do printf '%s\\037' "$kv" >> "$dir/envs"; done
-    printf '\\n' >> "$dir/envs"
+    # One write per line, so lines of concurrent calls never interleave.
+    line=$(printf '%s\\037' "$@")
+    printf '%s\\n' "$line" >> "$dir/calls"
+    envs=""
+    for kv in #{log_env}; do envs="$envs$(printf '%s\\037' "$kv")"; done
+    printf '%s\\n' "$envs" >> "$dir/envs"
     while :; do
       case "$1" in
         --log-level=*|--transient-store) shift ;;
         *) break ;;
       esac
     done
+    # The rule's counter is read and bumped under a lock (mkdir is atomic),
+    # so concurrent calls each take their own response.
     answer() {
+      until mkdir "$dir/r$1.lock" 2>/dev/null; do :; done
       n=$(cat "$dir/r$1.n" 2>/dev/null || echo 0)
       n=$((n + 1))
       [ "$n" -gt "$2" ] && n=$2
       echo "$n" > "$dir/r$1.n"
+      rmdir "$dir/r$1.lock"
       [ -f "$dir/r$1.$n.delay" ] && sleep "$(cat "$dir/r$1.$n.delay")"
       [ -f "$dir/r$1.$n.kill" ] && kill -9 $$
       cat "$dir/r$1.$n.out"

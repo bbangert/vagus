@@ -20,6 +20,8 @@ defmodule Vagus.Runtime.Engine.Podman do
   through `docker://` so only a registry is ever contacted. A pull of
   Core's image waits for the pull permit ahead of the others, so a board
   re-pulling everything (`Vagus.Runtime.Migration`) gets Core back first.
+  While that migration is pending, a pull whose image does not fit beside
+  balena's store is `{:error, {:failed, :pull, :no_space}}`, without podman.
 
   Idempotence comes from flags (`--ignore`, `rm -f -t 0`) rather than
   from parsing, except where podman has none.
@@ -129,6 +131,8 @@ defmodule Vagus.Runtime.Engine.Podman do
 
     case valid_image(:pull, image) do
       :ok ->
+        opts = Keyword.put(opts, :before_run, fn -> room_for(image, opts[:host]) end)
+
         case run(:pull, args, opts, @pull_ms, &clear_spool_on_failure(&1, opts[:host])) do
           {:ok, _id} -> :ok
           {:exit, 125, out} -> {:error, {:pull_failed, registry_message(out)}}
@@ -137,6 +141,22 @@ defmodule Vagus.Runtime.Engine.Podman do
 
       {:error, {:failed, :pull, reason}} ->
         {:error, {:pull_failed, reason}}
+    end
+  end
+
+  # Asked under the pull permit, so no other pull is filling the disk
+  # meanwhile. An unknown answer pulls: it must not keep Core away for good.
+  defp room_for(image, host) do
+    with migration when is_list(migration) <- Host.migration(host),
+         {:short, need, free} <- Vagus.Runtime.Migration.pull_space(image, migration) do
+      Logger.warning(
+        "Vagus.Runtime.Engine.Podman: #{image} needs #{div(need, 1_048_576)} MiB, " <>
+          "#{div(free, 1_048_576)} MiB free beside balena-engine's store; not pulled"
+      )
+
+      {:error, :no_space}
+    else
+      _room_or_unknown -> :ok
     end
   end
 
@@ -872,6 +892,7 @@ defmodule Vagus.Runtime.Engine.Podman do
     deadline = with_deadline(opts, default_ms)[:deadline]
     host = opts[:host]
     floor = opts[:floor_ms] || 1
+    before_run = opts[:before_run] || fn -> :ok end
 
     cmd_opts =
       opts
@@ -883,8 +904,10 @@ defmodule Vagus.Runtime.Engine.Podman do
       opts[:class] || class(verb),
       max(deadline - now_ms(), 0),
       fn ->
-        left = max(deadline - now_ms(), floor)
-        args |> Cmd.run(Keyword.put(cmd_opts, :timeout_ms, left)) |> after_run.()
+        with :ok <- before_run.() do
+          left = max(deadline - now_ms(), floor)
+          args |> Cmd.run(Keyword.put(cmd_opts, :timeout_ms, left)) |> after_run.()
+        end
       end,
       priority: opts[:priority] == true
     )

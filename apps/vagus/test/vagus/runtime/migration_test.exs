@@ -141,6 +141,17 @@ defmodule Vagus.Runtime.MigrationTest do
       end
     end
 
+    test "waits while any wanted image is missing, the last included", %{opts: opts} do
+      renamed(opts)
+      third = "ghcr.io/x/z:1"
+      opts = Keyword.put(opts, :wanted_images, fn -> {:ok, [@core, @app, third]} end)
+
+      for missing <- [@core, @app, third] do
+        opts = Keyword.put(opts, :image_present?, &(&1 != missing))
+        assert Migration.cleanup(opts) == {:waiting, :images}
+      end
+    end
+
     test "waits on the rename", %{opts: opts, legacy: legacy} do
       assert Migration.cleanup(opts) == {:waiting, :config_renamed}
       assert File.dir?(legacy_config(opts))
@@ -299,10 +310,259 @@ defmodule Vagus.Runtime.MigrationTest do
       assert Migration.space(opts) == {:error, :df_failed}
     end
 
-    test "check/2 answers space only when asked", %{opts: opts} do
-      opts = Keyword.merge(opts, df: df_free(2000 * @mib), validated?: fn -> false end)
-      assert %{space: nil, cleanup: {:waiting, :validated}} = Migration.check(opts)
-      assert %{space: :ok} = Migration.check(opts, space?: true)
+    test "pull_space/2 asks room for that image alone", %{opts: opts} do
+      opts = Keyword.put(opts, :df, df_free(1100 * @mib))
+      # Core: its 1000 MiB plus half of itself; the app: 150 plus 75.
+      assert {:short, need, _} = Migration.pull_space(@core, opts)
+      assert need == 1500 * @mib
+      assert Migration.pull_space(@app, opts) == :ok
+
+      assert {:short, _, _} =
+               Migration.space(Keyword.put(opts, :image_present?, fn _ -> false end))
+    end
+
+    test "pull_space/2 asks nothing once the migration is done", %{opts: opts} do
+      File.mkdir_p!(Path.dirname(opts[:marker]))
+      File.write!(opts[:marker], "")
+      assert Migration.pull_space(@core, Keyword.put(opts, :df, df_free(1))) == :ok
+    end
+  end
+
+  describe "balena metadata that is not what it should be" do
+    setup %{legacy: legacy} do
+      %{dir: Path.join(legacy, "image/overlay2")}
+    end
+
+    defp repositories(dir, id) do
+      File.mkdir_p!(Path.join(dir, "imagedb/content/sha256"))
+
+      File.write!(
+        Path.join(dir, "repositories.json"),
+        Jason.encode!(%{"Repositories" => %{"r" => %{@app => id}}})
+      )
+    end
+
+    defp unknown, do: 1024 * @mib + 512 * @mib
+
+    test "an image id naming a path out of the store is unknown, and nothing is read",
+         %{opts: opts, dir: dir, root: root, legacy: legacy} do
+      # A readable config out there, with a layer the store does hold: were
+      # the id followed, the size would come out known.
+      store(legacy, [{"ghcr.io/x/other:1", [{diff(6), 10 * @mib}]}])
+
+      File.write!(
+        Path.join(root, "secret"),
+        Jason.encode!(%{"rootfs" => %{"diff_ids" => [diff(6)]}})
+      )
+
+      repositories(dir, "sha256:" <> String.duplicate("../", 7) <> "secret")
+
+      assert File.exists?(
+               Path.join([dir, "imagedb/content/sha256", String.duplicate("../", 7) <> "secret"])
+             )
+
+      assert Migration.need_bytes([@app], opts) == unknown()
+    end
+
+    test "a diff id that is no digest is unknown", %{opts: opts, dir: dir} do
+      for diff_ids <- [
+            [42],
+            ["sha256:../../x"],
+            ["md5:abc"],
+            "sha256:" <> String.duplicate("a", 64)
+          ] do
+        config = Jason.encode!(%{"rootfs" => %{"diff_ids" => diff_ids}})
+        id = Base.encode16(:crypto.hash(:sha256, config), case: :lower)
+        repositories(dir, "sha256:" <> id)
+        File.write!(Path.join([dir, "imagedb/content/sha256", id]), config)
+        assert Migration.need_bytes([@app], opts) == unknown()
+      end
+    end
+
+    test "a size that is no number is unknown", %{opts: opts, legacy: legacy} do
+      store(legacy, [{@app, [{diff(5), 10 * @mib}]}])
+
+      File.write!(
+        Path.join([legacy, "image/overlay2/layerdb/sha256", String.duplicate("5", 64), "size"]),
+        "12abc"
+      )
+
+      assert Migration.need_bytes([@app], opts) == unknown()
+    end
+
+    test "repositories of the wrong shape are unknown", %{opts: opts, dir: dir} do
+      File.mkdir_p!(dir)
+
+      for json <- [
+            ~s([]),
+            ~s({"Repositories": []}),
+            ~s({"Repositories": {"r": {"#{@app}": 7}}}),
+            "{"
+          ] do
+        File.write!(Path.join(dir, "repositories.json"), json)
+        assert Migration.need_bytes([@app], opts) == unknown()
+      end
+    end
+  end
+
+  describe "check/2 and the notification" do
+    defp notifier do
+      test = self()
+
+      fn event ->
+        send(test, {:notify, event})
+        :ok
+      end
+    end
+
+    setup %{opts: opts} do
+      %{opts: Keyword.merge(opts, notify: notifier(), image_present?: fn _ -> false end)}
+    end
+
+    test "raises one with what is needed while the images do not fit", %{opts: opts} do
+      opts = Keyword.merge(opts, validated?: fn -> false end, df: df_free(10 * @mib))
+      assert %{cleanup: {:waiting, :validated}, notice: notice} = Migration.check(opts)
+      assert_received {:notify, {:raise, need, free}}
+      assert notice == %{need: need, free: free}
+      assert free == 10 * @mib
+
+      assert %{notice: ^notice} = Migration.check(opts, notice: notice)
+      refute_received {:notify, _}
+    end
+
+    test "dismisses it once they fit", %{opts: opts} do
+      opts = Keyword.merge(opts, validated?: fn -> false end, df: df_free(100_000 * @mib))
+      assert %{notice: nil} = Migration.check(opts, notice: %{need: 1, free: 0})
+      assert_received {:notify, :dismiss}
+    end
+
+    test "keeps it while space is unknown", %{opts: opts} do
+      opts = Keyword.merge(opts, validated?: fn -> false end, df: fn _ -> {"", 1} end)
+      assert %{notice: %{need: 1}} = Migration.check(opts, notice: %{need: 1, free: 0})
+      refute_received {:notify, _}
+    end
+
+    test "says how much is needed and what the deletion gives up" do
+      %{"message" => message} = Migration.notification(1500 * @mib, 10 * @mib)
+      assert message =~ "1500 MiB"
+      assert message =~ "10 MiB"
+      assert message =~ "roll back"
+    end
+  end
+
+  describe "making room once validated" do
+    setup %{opts: opts} do
+      short =
+        Keyword.merge(opts,
+          df: df_free(1 * @mib),
+          image_present?: fn _ -> false end,
+          core_healthy?: fn -> false end,
+          notify: fn _ -> :ok end
+        )
+
+      %{short: short}
+    end
+
+    test "deletes the store before the images are back, keeping Core's config",
+         %{short: opts, legacy: legacy} do
+      renamed(opts)
+
+      capture_log(fn ->
+        assert %{cleanup: :done, notice: nil} = Migration.check(opts, notice: %{need: 1, free: 0})
+      end)
+
+      refute File.exists?(legacy)
+      assert File.exists?(opts[:marker])
+      assert File.read!(Path.join(new_config(opts), "configuration.yaml")) == "x: 1"
+    end
+
+    test "never before the slot is validated", %{short: opts, legacy: legacy} do
+      renamed(opts)
+      opts = Keyword.put(opts, :validated?, fn -> false end)
+      assert %{cleanup: {:waiting, :validated}} = Migration.check(opts)
+      assert File.dir?(legacy)
+    end
+
+    test "never before Core's config is out of the tree", %{short: opts, legacy: legacy} do
+      # Validated, but the move is still to come at the next preparation.
+      capture_log(fn -> Migration.check(opts) end)
+      assert File.read!(Path.join(legacy_config(opts), "configuration.yaml")) == "x: 1"
+      refute File.exists?(opts[:marker])
+    end
+  end
+
+  describe "the deletion" do
+    setup %{opts: opts} do
+      renamed(opts)
+      :ok
+    end
+
+    test "does not follow a directory swapped for a symlink before its listing",
+         %{opts: opts, root: root, legacy: legacy} do
+      outside = Path.join(root, "outside")
+      File.mkdir_p!(outside)
+      File.write!(Path.join(outside, "keep"), "k")
+      victim = Path.join(legacy, "overlay2")
+      File.mkdir_p!(victim)
+
+      swap = fn
+        ^victim ->
+          File.rm_rf!(victim)
+          File.ln_s!(outside, victim)
+
+        _other ->
+          :ok
+      end
+
+      capture_log(fn ->
+        assert {:error, {:changed, ^victim}} =
+                 Migration.cleanup(Keyword.put(opts, :walk_hook, swap))
+      end)
+
+      assert File.read!(Path.join(outside, "keep")) == "k"
+      refute File.exists?(opts[:marker])
+    end
+
+    test "leaves an entry on another filesystem alone", %{opts: opts, legacy: legacy} do
+      mounted = Path.join(legacy, "mnt")
+      File.mkdir_p!(mounted)
+      File.write!(Path.join(mounted, "keep"), "k")
+
+      lstat = fn path ->
+        with {:ok, stat} <- File.lstat(path) do
+          if path == mounted,
+            do: {:ok, %{stat | major_device: stat.major_device + 1}},
+            else: {:ok, stat}
+        end
+      end
+
+      capture_log(fn ->
+        assert {:error, {:other_filesystem, ^mounted}} =
+                 Migration.cleanup(Keyword.put(opts, :lstat, lstat))
+      end)
+
+      assert File.read!(Path.join(mounted, "keep")) == "k"
+      refute File.exists?(opts[:marker])
+    end
+
+    test "counts what another walk removed meanwhile as done, and logs no failure",
+         %{opts: opts, legacy: legacy} do
+      gone = Path.join(legacy, "overlay2/l1")
+      File.mkdir_p!(Path.join(gone, "diff"))
+      File.write!(Path.join(gone, "diff/f"), "")
+
+      race = fn
+        ^gone -> File.rm_rf!(gone)
+        _other -> :ok
+      end
+
+      log =
+        capture_log(fn ->
+          assert Migration.cleanup(Keyword.put(opts, :walk_hook, race)) == :done
+        end)
+
+      refute log =~ "[error]"
+      refute File.exists?(legacy)
     end
   end
 end

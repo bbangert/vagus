@@ -120,7 +120,8 @@ defmodule Vagus.Network.Nat do
     * `:port` — the port to rewrite to (default `config :vagus, :api_port`)
     * `:cmd` — 2-arity command runner `(binary, args) -> {output, status}`
     * `:engine` — the engine adapter (default `config :vagus, :engine`);
-      `Vagus.Runtime.Engine.Podman` selects nft
+      `Vagus.Runtime.Engine.Podman` selects nft, as `:host_bridge` does
+      (`Vagus.Network.host_bridge?/1`)
     * `:nft_dir` — where the ruleset file is written for `nft -f`
       (default `/run/vagus`)
   """
@@ -320,22 +321,21 @@ defmodule Vagus.Network.Nat do
 
   ## nft
 
-  defp nft?(opts),
-    do:
-      Keyword.get_lazy(opts, :engine, fn -> Application.get_env(:vagus, :engine) end) ==
-        Vagus.Runtime.Engine.Podman
+  defp nft?(opts), do: Network.host_bridge?(opts)
 
   # A file rather than `-f -`: neither System.cmd nor MuonTrap can close a
   # child's stdin, which nft needs to see the end of the ruleset. One file per
-  # call, so two concurrent loads never read each other's half-written text.
-  # The directory is tmpfs owned by root, never request input.
+  # call, so two concurrent loads never read each other's half-written text,
+  # created exclusively so nothing placed there beforehand is written through.
+  # The directory is tmpfs owned by root (0700, made by the Host's
+  # preparation), never request input.
   # sobelow_skip ["Traversal.FileModule"]
   defp load_nft(text, opts) do
     dir = Keyword.get(opts, :nft_dir, "/run/vagus")
     path = Path.join(dir, "vagus-nat-#{System.unique_integer([:positive])}.nft")
 
     with :ok <- File.mkdir_p(dir),
-         :ok <- File.write(path, text) do
+         :ok <- File.write(path, text, [:exclusive]) do
       try do
         run(Keyword.get(opts, :cmd, &nft_cmd/2), "nft", ["-f", path])
       after

@@ -122,7 +122,7 @@ defmodule Vagus.Core.Container do
   @spec config_path(keyword()) :: String.t()
   def config_path(opts \\ []) do
     Keyword.get_lazy(opts, :homeassistant_path, fn ->
-      if podman?(opts),
+      if Engine.podman?(opts),
         do: Migration.core_config_path(),
         else: Path.join([Vagus.Engine.Manager.data_root(), "volumes", config_volume(), "_data"])
     end)
@@ -233,11 +233,6 @@ defmodule Vagus.Core.Container do
     ]
   end
 
-  defp podman?(opts),
-    do:
-      Keyword.get_lazy(opts, :engine, fn -> Application.get_env(:vagus, :engine) end) ==
-        Engine.Podman
-
   defp mounts(opts) do
     [
       # ro-NON-recursive: recursively read-only would also lock down
@@ -260,7 +255,7 @@ defmodule Vagus.Core.Container do
   end
 
   defp config_mount(opts) do
-    if podman?(opts),
+    if Engine.podman?(opts),
       do: %{type: :bind, source: config_path(opts), target: "/config", read_only: false},
       else: %{type: :volume, source: config_volume(), target: "/config"}
   end

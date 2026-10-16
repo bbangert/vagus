@@ -260,7 +260,18 @@ defmodule Vagus.Network do
   @spec ensure(keyword()) :: :ok | {:error, Engine.error()}
   def ensure(opts \\ []) do
     result = Engine.ensure_network(spec(), opts)
-    if host_bridge?(opts), do: ensure_bridge(opts)
+
+    # Logged, not returned: netavark makes the bridge itself at a container's
+    # start, so a bridged app can still run; only the anchors' survival of
+    # the last container is lost.
+    with true <- host_bridge?(opts),
+         {:error, {args, out, status}} <- ensure_bridge(opts) do
+      Logger.warning(
+        "Vagus.Network: the hassio bridge is not kept: ip #{Enum.join(args, " ")} " <>
+          "failed (#{status}): #{out}"
+      )
+    end
+
     result
   end
 
@@ -271,12 +282,8 @@ defmodule Vagus.Network do
   would never have the `.2` anchor Core reaches the Supervisor on.
   """
   @spec host_bridge?(keyword()) :: boolean()
-  def host_bridge?(opts \\ []) do
-    Keyword.get_lazy(opts, :host_bridge, fn ->
-      Keyword.get_lazy(opts, :engine, fn -> Application.get_env(:vagus, :engine) end) ==
-        Engine.Podman
-    end)
-  end
+  def host_bridge?(opts \\ []),
+    do: Keyword.get_lazy(opts, :host_bridge, fn -> Engine.podman?(opts) end)
 
   @doc """
   Makes the `hassio` bridge with a dummy port and the gateway address, then
@@ -293,8 +300,7 @@ defmodule Vagus.Network do
 
   The commands are within busybox `ip` (1.38: `link add NAME type KIND`,
   `link set DEV master BR up`). `:ip_cmd` replaces the runner
-  `(binary, args) -> {output, status}`. Returns the first failure, already
-  logged.
+  `(binary, args) -> {output, status}`. Returns the first failure.
   """
   @spec ensure_bridge(keyword()) :: :ok | {:error, {[String.t()], String.t(), integer()}}
   def ensure_bridge(opts \\ []) do
@@ -306,15 +312,9 @@ defmodule Vagus.Network do
           {:cont, :ok}
 
         {out, status} ->
-          if String.contains?(out, "File exists") do
-            {:cont, :ok}
-          else
-            Logger.warning(
-              "Vagus.Network: ip #{Enum.join(args, " ")} failed (#{status}): #{String.trim(out)}"
-            )
-
-            {:halt, {:error, {args, String.trim(out), status}}}
-          end
+          if String.contains?(out, "File exists"),
+            do: {:cont, :ok},
+            else: {:halt, {:error, {args, String.trim(out), status}}}
       end
     end)
   end
@@ -370,17 +370,16 @@ defmodule Vagus.Network do
   "File exists"), a missing interface, or a missing `ip` tool is logged and
   treated as `:ok` — never fatal to an add-on install.
   """
-  @spec ensure_supervisor_ip() :: :ok
-  def ensure_supervisor_ip do
-    bind_anchor(supervisor_ip())
-    bind_anchor(dns_ip())
+  @spec ensure_supervisor_ip(keyword()) :: :ok
+  def ensure_supervisor_ip(opts \\ []) do
+    cmd = Keyword.get(opts, :ip_cmd, &Vagus.Host.Cmd.run/2)
+    bind_anchor(cmd, supervisor_ip())
+    bind_anchor(cmd, dns_ip())
     :ok
   end
 
-  defp bind_anchor(ip) do
-    case System.cmd("ip", ["addr", "add", "#{ip}/#{@prefix}", "dev", @name],
-           stderr_to_stdout: true
-         ) do
+  defp bind_anchor(cmd, ip) do
+    case cmd.("ip", ["addr", "add", "#{ip}/#{@prefix}", "dev", @name]) do
       {_out, 0} ->
         :ok
 
