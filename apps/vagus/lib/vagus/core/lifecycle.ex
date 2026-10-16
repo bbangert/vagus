@@ -375,8 +375,8 @@ defmodule Vagus.Core.Lifecycle do
     do: Engine.image_present?(Container.image(version), engine_opts(opts))
 
   @doc """
-  How many times Core has been stopped since the VM started: by the user, or
-  by a shutdown. A caller that will start Core later, on its own account,
+  How many times Core has been stopped since the VM started, by the user or
+  by a shutdown, an absent Core's stop included. A caller that will start Core later, on its own account,
   takes this first and passes it to `start/1` as `:stops_seen`; a stop since
   then makes that start `{:error, :stopped}` rather than undo it.
   """
@@ -518,13 +518,21 @@ defmodule Vagus.Core.Lifecycle do
 
     case engine(:stop, Container.name(), [timeout_s: timeout] ++ engine_opts(opts)) do
       :ok ->
-        :persistent_term.put(@stops, stops() + 1)
+        count_stop()
         unlink_core_socket()
+
+      # Nothing to stop, but a recovery that would create Core (a pull or a
+      # start being retried) is cancelled all the same.
+      {:error, :not_found} = error ->
+        count_stop()
+        error
 
       {:error, reason} ->
         {:error, reason}
     end
   end
+
+  defp count_stop, do: :persistent_term.put(@stops, stops() + 1)
 
   ## restart/1
 

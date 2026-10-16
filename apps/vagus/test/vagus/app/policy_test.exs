@@ -601,7 +601,7 @@ defmodule Vagus.App.PolicyTest do
           {data, waits ++ retry_timers(effects)}
         end)
 
-      assert waits == [30_000, 60_000, 120_000]
+      assert waits == [30_000, 60_000]
       assert data.last_event == {:failed, {:pull, refused}}
       assert Policy.derive(:idle, data) == :error
     end

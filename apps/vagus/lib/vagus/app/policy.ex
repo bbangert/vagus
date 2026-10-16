@@ -1065,7 +1065,7 @@ defmodule Vagus.App.Policy do
   # the error.
   defp image_retry(data, reason) do
     if data.wanted == :started and not data.shutting_down and
-         data.image_attempt < image_attempts(reason) do
+         data.image_attempt + 1 < image_attempts(reason) do
       ms = min(@image_retry_ms * 2 ** min(data.image_attempt, 6), @image_retry_cap_ms)
       timer = {:timer, :retry, ms, {:retry, data.container_id}}
       {%{data | image_attempt: data.image_attempt + 1}, [timer]}
