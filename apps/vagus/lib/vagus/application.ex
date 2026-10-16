@@ -4,14 +4,9 @@ defmodule Vagus.Application do
   @moduledoc """
   Top-level supervisor for the `vagus` app.
 
-  On target (not `:host`) under Docker this starts the engine-supervision
-  machinery: a `DynamicSupervisor` to hold the balena-engine daemon once
-  it's started, and `Vagus.Engine.Manager`, which waits for VintageNet
-  internet connectivity before writing `/run/resolv.conf` and starting the
-  daemon. Under podman, `Vagus.Runtime.Host` replaces both. See
-  `Vagus.Engine.Manager` and `Vagus.Engine` for the rest of the runtime engine
-  -supervision skeleton (originally spiked in `vagus_spike`, plan.md Phase 2,
-  tasks 2.1-2.3).
+  Under podman (the target engine), `Vagus.Runtime.Host` prepares the board
+  for podman and holds the permits every podman call takes; podman runs no
+  daemon of its own.
 
   On both `:host` and real targets, `Vagus.API.Supervisor` starts the
   Supervisor-API emulator's HTTP surface (see that module for the isolation
@@ -81,10 +76,9 @@ defmodule Vagus.Application do
         Vagus.Discovery.Push,
 
         # Holds the native "virtual add-on" BEAM subtrees (M5, the mqttx
-        # broker) once `Vagus.Addon.Backend.Native.start/1` starts them —
-        # mirrors `Vagus.Engine.DaemonSupervisor`. Started unconditionally on
-        # both :host and target (unlike the Docker engine, native add-ons run
-        # in dev/host too), empty until an add-on is started. A dedicated
+        # broker) once `Vagus.Addon.Backend.Native.start/1` starts them.
+        # Started unconditionally on both :host and target (native add-ons
+        # run in dev/host too), empty until an add-on is started. A dedicated
         # DynamicSupervisor keeps a broker crash-loop's restart intensity
         # isolated from the rest of the app's tree.
         {DynamicSupervisor,
@@ -184,17 +178,16 @@ defmodule Vagus.Application do
     # Explicit restart budget (was the OTP default 3/5s): the top level now
     # holds several independent failure sources (DNS, engine, ingress,
     # Vagus.Bluetooth, ...) that share this budget, and the isolated subtrees
-    # (Engine.DaemonSupervisor, Native.Supervisor, Vagus.Bluetooth) already
-    # budget their own crash-looping internally before escalating here —
+    # (Native.Supervisor, Vagus.Bluetooth) already budget their own
+    # crash-looping internally before escalating here —
     # 3-in-5s of *escalated* exits would take the whole app down too eagerly.
     # 5/30 mirrors the budget those isolation supervisors use themselves.
     opts = [strategy: :one_for_one, name: Vagus.Supervisor, max_restarts: 5, max_seconds: 30]
     Supervisor.start_link(children, opts)
   end
 
-  # Only under the podman engine: it prepares the board for podman and holds
-  # the permits every podman call takes. Before the app processes, whose
-  # calls need it, and stopped after them.
+  # Only under podman: host dev and tests run `Engine.Docker` or a fake.
+  # Before the app processes, whose calls need it, and stopped after them.
   defp runtime_host_children,
     do: if(Vagus.Runtime.Engine.podman?(), do: [Vagus.Runtime.Host], else: [])
 
@@ -243,32 +236,7 @@ defmodule Vagus.Application do
       ]
     end
   else
-    defp target_children, do: balena_children() ++ [bluetooth_child()]
-
-    # podman runs no daemon: these would start balena-engine beside it.
-    defp balena_children do
-      if Vagus.Runtime.Engine.podman?() do
-        []
-      else
-        [
-          # Holds the balena-engine daemon once Vagus.Engine.Manager starts
-          # it. A dedicated DynamicSupervisor (rather than starting the
-          # MuonTrap.Daemon directly under Vagus.Supervisor) keeps the
-          # daemon's restart/crash-loop intensity isolated from the rest of
-          # the app's supervision tree.
-          {DynamicSupervisor,
-           name: Vagus.Engine.DaemonSupervisor,
-           strategy: :one_for_one,
-           max_restarts: 5,
-           max_seconds: 30},
-
-          # Waits for VintageNet internet connectivity, then writes
-          # /run/resolv.conf and starts the balena-engine daemon. Only runs on
-          # the target — VintageNet isn't present/meaningful on :host.
-          {Vagus.Engine.Manager, []}
-        ]
-      end
-    end
+    defp target_children, do: [bluetooth_child()]
 
     defp bluetooth_child do
       # Bluetooth daemons (dbus-daemon --system + bluetoothd -E), the

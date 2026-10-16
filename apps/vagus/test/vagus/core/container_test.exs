@@ -237,14 +237,9 @@ defmodule Vagus.Core.ContainerTest do
   end
 
   describe "config_path/1" do
-    test "defaults to <engine data root>/volumes/<config_volume>/_data" do
+    test "under Docker, the named volume inside balena's old data root" do
       assert Container.config_path() ==
-               Path.join([
-                 Vagus.Engine.Manager.data_root(),
-                 "volumes",
-                 Container.config_volume(),
-                 "_data"
-               ])
+               "/root/balena-engine/volumes/#{Container.config_volume()}/_data"
     end
 
     test "opts[:homeassistant_path] overrides the whole path" do
@@ -274,7 +269,7 @@ defmodule Vagus.Core.ContainerTest do
              ]
     end
 
-    test "balena-engine keeps the named volume, so its containers keep their fingerprint" do
+    test "Docker keeps the named volume, so its containers keep their fingerprint" do
       assert config_mounts(engine: Vagus.Runtime.Engine.Docker) == [
                %{type: :volume, source: "vagus-core-config", target: "/config"}
              ]

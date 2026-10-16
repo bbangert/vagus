@@ -13,9 +13,8 @@ defmodule Vagus.API.Listener do
 
   That address does not exist at boot. It is added with `ip addr add` onto
   the `hassio` bridge interface (`Vagus.Network.ensure_supervisor_ip/0`),
-  which cannot happen before balena-engine is up and has created the
-  network — boot's `network` gate (`Vagus.App.Gates.network/0`) does it
-  after the engine answers, tens of seconds into a boot, long after `Vagus.Application`
+  which boot's `network` gate (`Vagus.App.Gates.network/0`) does after the
+  engine answers, tens of seconds into a boot, long after `Vagus.Application`
   starts this subtree. Binding a not-yet-configured address fails
   `:eaddrnotavail`, and a `Bandit` child that fails at `init` would take
   `Vagus.API.Supervisor` — and then, once its restart budget is spent, the
@@ -27,10 +26,8 @@ defmodule Vagus.API.Listener do
 
   So the listener is started *into* `Vagus.API.ListenerSupervisor` (a
   `DynamicSupervisor`) by this `GenServer`, which retries every
-  `:retry_ms` until the bind succeeds and monitors it afterwards — the same
-  shape `Vagus.Engine.Manager` uses for the balena-engine daemon, for the
-  same reason: a failure that will resolve on its own must back off, not
-  crash. Consequence to know: on target the API answers nothing at all
+  `:retry_ms` until the bind succeeds and monitors it afterwards: a failure
+  that will resolve on its own must back off, not crash. Consequence to know: on target the API answers nothing at all
   until the bridge is up. Nothing can reach it before then anyway — the
   address it would answer on is precisely what is missing.
 

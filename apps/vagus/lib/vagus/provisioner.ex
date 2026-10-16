@@ -689,7 +689,7 @@ defmodule Vagus.Provisioner do
 
   # `vintage_net` isn't compiled at all under MIX_TARGET=host, so a bare
   # `VintageNet.get/1` reference would break the host build — same split as
-  # `Vagus.Engine.Manager`. The Provisioner is never enabled on :host (see
+  # `Vagus.Runtime.Host`. The Provisioner is never enabled on :host (see
   # the module gate above), so this branch is dead in practice; tests always
   # inject `:connection` and never hit it.
   if Mix.target() == :host do

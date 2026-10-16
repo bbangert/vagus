@@ -459,6 +459,34 @@ defmodule Vagus.App.StepsTest do
     %{data_root: data_root}
   end
 
+  # NAT switched on against a fake nft whose answer the test sets, with a
+  # load record of its own so no other test's load counts.
+  defp nat(ctx) do
+    test = self()
+    {:ok, answer} = Agent.start_link(fn -> {"", 0} end)
+    key = {__MODULE__, :nat_loaded, make_ref()}
+    sysctl_root = Path.join(ctx.tmp_dir, "sys")
+    File.mkdir_p!(Path.join(sysctl_root, "net/ipv4/conf/hassio"))
+    on_exit(fn -> :persistent_term.erase(key) end)
+
+    cmd = fn "nft", args ->
+      send(test, {:nft, args})
+      Agent.get(answer, & &1)
+    end
+
+    opts = [
+      enabled: true,
+      cmd: cmd,
+      nft_dir: Path.join(ctx.tmp_dir, "nft"),
+      sysctl_root: sysctl_root,
+      loaded_key: key,
+      ip: "172.30.32.2",
+      port: 8888
+    ]
+
+    {opts, answer}
+  end
+
   defp options_path(dr, slug \\ "test_app"),
     do: Path.join([dr, "addons", "data", slug, "options.json"])
 
@@ -550,6 +578,97 @@ defmodule Vagus.App.StepsTest do
 
       assert {:ok, %{ip: nil, healthcheck: false}} =
                Steps.run(:start, input(ctx, %{engine_opts: engine_opts}))
+    end
+
+    test "a bridged app is refused until the forward filter loads, then starts", ctx do
+      bridged = test_config(%{"host_network" => false})
+      {_fake, engine_opts} = engine(%{})
+      {nat_opts, answer} = nat(ctx)
+
+      Agent.update(answer, fn _ -> {"Error: Could not process rule\n", 1} end)
+
+      capture_log(fn ->
+        assert {:error, {:isolation_not_loaded, _}} =
+                 Steps.run(
+                   :start,
+                   input(ctx, %{config: bridged, engine_opts: engine_opts, nat_opts: nat_opts})
+                 )
+      end)
+
+      refute_received {:create, _}
+      assert_received {:nft, ["-f", _]}
+
+      Agent.update(answer, fn _ -> {"", 0} end)
+
+      assert {:ok, _} =
+               Steps.run(
+                 :start,
+                 input(ctx, %{config: bridged, engine_opts: engine_opts, nat_opts: nat_opts})
+               )
+
+      assert_received {:nft, ["-f", _]}
+      assert_received {:create, _}
+    end
+
+    test "a bridged app is refused while forwarding cannot be switched on", ctx do
+      bridged = test_config(%{"host_network" => false})
+      {_fake, engine_opts} = engine(%{})
+      {nat_opts, _answer} = nat(ctx)
+      File.rm_rf!(Path.join(nat_opts[:sysctl_root], "net/ipv4/conf/hassio"))
+
+      capture_log(fn ->
+        assert {:error, {:isolation_not_loaded, {:sysctl, _, :enoent}}} =
+                 Steps.run(
+                   :start,
+                   input(ctx, %{config: bridged, engine_opts: engine_opts, nat_opts: nat_opts})
+                 )
+      end)
+
+      refute_received {:create, _}
+    end
+
+    test "once the filter has loaded, later bridged starts do not load it again", ctx do
+      bridged = test_config(%{"host_network" => false})
+      {_fake, engine_opts} = engine(%{})
+      {nat_opts, _answer} = nat(ctx)
+
+      for _ <- 1..2 do
+        assert {:ok, _} =
+                 Steps.run(
+                   :start,
+                   input(ctx, %{config: bridged, engine_opts: engine_opts, nat_opts: nat_opts})
+                 )
+      end
+
+      assert_received {:nft, ["-f", _]}
+      refute_received {:nft, _}
+    end
+
+    test "a native declaration outside the allowlist is a container, and is refused too", ctx do
+      declared = test_config(%{"host_network" => false, "backend" => "native"})
+      refute Steps.native?(declared)
+      {_fake, engine_opts} = engine(%{})
+      {nat_opts, answer} = nat(ctx)
+      Agent.update(answer, fn _ -> {"Error: Could not process rule\n", 1} end)
+
+      capture_log(fn ->
+        assert {:error, {:isolation_not_loaded, _}} =
+                 Steps.run(
+                   :start,
+                   input(ctx, %{config: declared, engine_opts: engine_opts, nat_opts: nat_opts})
+                 )
+      end)
+
+      refute_received {:create, _}
+    end
+
+    test "a host-network app starts whatever the forward filter does", ctx do
+      {nat_opts, answer} = nat(ctx)
+      Agent.update(answer, fn _ -> {"Error: Could not process rule\n", 1} end)
+
+      assert {:ok, _} = Steps.run(:start, input(ctx, %{nat_opts: nat_opts}))
+      assert_received {:create, _}
+      refute_received {:nft, _}
     end
 
     test "a native app answers on the supervisor anchor", ctx do
@@ -809,6 +928,79 @@ defmodule Vagus.App.StepsTest do
                fact
 
       assert first in 60_001..105_000
+    end
+
+    @matter_hc %{
+      test: ["CMD", "/usr/local/bin/healthcheck.sh"],
+      interval_ms: 900_000,
+      timeout_ms: 5_000,
+      start_period_ms: 60_000,
+      start_interval_ms: 10_000,
+      retries: 6
+    }
+
+    defp started_at_fact(ctx, started_at) do
+      {_fake, engine_opts} =
+        engine(%{"fake-id" => [healthcheck: @matter_hc, started_at: started_at]})
+
+      {:ok, fact} =
+        Steps.run(
+          :start,
+          input(ctx, %{engine_opts: engine_opts ++ [schedules_healthchecks: false]})
+        )
+
+      fact.health_check
+    end
+
+    defp ago(seconds), do: DateTime.add(DateTime.utc_now(), -seconds, :second)
+
+    test "a declared start interval paces the start period: first check at it", ctx do
+      {fact, _} = started_fact(ctx, @matter_hc, schedules_healthchecks: false)
+
+      assert %{first_ms: 10_000, start_interval_ms: 10_000, interval_ms: 900_000} =
+               fact.health_check
+
+      left = DateTime.diff(fact.health_check.start_until, DateTime.utc_now(), :millisecond)
+      assert left in 58_000..60_000
+    end
+
+    test "the start period runs from the container's own start, across an app restart", ctx do
+      check = started_at_fact(ctx, ago(55))
+      assert check.first_ms in 3_000..5_000
+      assert DateTime.diff(check.start_until, DateTime.utc_now(), :millisecond) in 3_000..5_000
+
+      check = started_at_fact(ctx, ago(120))
+      assert check.start_until == nil
+      assert check.first_ms in 900_001..1_800_000
+    end
+
+    test "a start period already over waits one interval, not the period again", ctx do
+      for start_interval <- [nil, 10_000] do
+        hc = %{
+          test: ["CMD", "true"],
+          interval_ms: 30_000,
+          start_period_ms: 60_000,
+          start_interval_ms: start_interval
+        }
+
+        {_fake, engine_opts} = engine(%{"fake-id" => [healthcheck: hc, started_at: ago(120)]})
+
+        {:ok, fact} =
+          Steps.run(
+            :start,
+            input(ctx, %{engine_opts: engine_opts ++ [schedules_healthchecks: false]})
+          )
+
+        assert %{start_until: nil, first_ms: first} = fact.health_check
+        assert first in 30_001..60_000
+      end
+    end
+
+    test "without a start interval the first check still waits out the start period", ctx do
+      hc = %{test: ["CMD", "true"], interval_ms: 900_000, start_period_ms: 60_000}
+      {fact, _} = started_fact(ctx, hc, schedules_healthchecks: false)
+      assert %{start_until: nil, first_ms: first} = fact.health_check
+      assert first in 900_001..1_800_000
     end
 
     test "carries the check's declared timeout, Docker's 30 s when unset, capped at 5 min", ctx do

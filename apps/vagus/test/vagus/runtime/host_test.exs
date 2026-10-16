@@ -103,6 +103,15 @@ defmodule Vagus.Runtime.HostTest do
       assert File.dir?(Path.join(ctx.root, "storage/tmp"))
     end
 
+    test "leaves a resolv.conf vintage_net already wrote", ctx do
+      path = Path.join(ctx.root, "resolv.conf")
+      File.write!(path, "search lan\nnameserver 192.168.2.53\n")
+
+      assert start_host(ctx) == :ok
+      assert_receive {:step, :probe}, 5_000
+      assert File.read!(path) == "search lan\nnameserver 192.168.2.53\n"
+    end
+
     test "the probe runs last: every file is in place when podman first runs", ctx do
       test = self()
       run_dir = Path.join(ctx.root, "run/vagus/podman")

@@ -390,13 +390,29 @@ defmodule Vagus.App.Policy do
       match?({:ok, health} when health in [:healthy, :unhealthy], result) ->
         {:ok, health} = result
         event = %{action: :health, id: data.container_id, health: health}
+        data = if health == :healthy, do: end_start_period(data), else: data
         {data, effects} = on_event(event, data)
-        {data, effects ++ health_timer(data, :interval_ms)}
+        {end_start_period_if_over(data), effects ++ health_timer(data, :interval_ms)}
 
       true ->
-        {data, health_timer(data, :interval_ms)}
+        {end_start_period_if_over(data), health_timer(data, :interval_ms)}
     end
   end
+
+  # A healthy verdict ends the start period's quicker checks, as Docker's
+  # first success does.
+  defp end_start_period(%{health_check: %{start_until: %DateTime{}} = check} = data),
+    do: %{data | health_check: %{check | start_until: nil}}
+
+  defp end_start_period(data), do: data
+
+  # Cleared only after the tick past the period is armed, which carries the
+  # jitter.
+  defp end_start_period_if_over(%{health_check: %{start_until: %DateTime{} = until}} = data) do
+    if DateTime.compare(DateTime.utc_now(), until) == :lt, do: data, else: end_start_period(data)
+  end
+
+  defp end_start_period_if_over(data), do: data
 
   @doc """
   The next healthcheck tick, or none: `[]` when the app runs no checks of
@@ -413,6 +429,19 @@ defmodule Vagus.App.Policy do
   def health_timer(_data, _which), do: []
 
   defp tick_ms({:unknown, _engine_opts, _tries}, _which), do: @reinspect_ms
+
+  # Within the start period the next check comes at the start interval, or
+  # at the period's end if that is sooner; the first one after it carries
+  # up to an interval of jitter, as a first check does, so apps started
+  # together do not keep checking together. Timed by the clock rather than
+  # by checks counted, as a slow check runs into the period's end.
+  defp tick_ms(%{start_until: %DateTime{} = until} = check, :interval_ms) do
+    case DateTime.diff(until, DateTime.utc_now(), :millisecond) do
+      left when left > 0 -> max(min(check.start_interval_ms, left), 1)
+      _over -> check.interval_ms + :rand.uniform(check.interval_ms)
+    end
+  end
+
   defp tick_ms(check, which), do: Map.fetch!(check, which)
 
   # A start whose inspect failed left the schedule `{:unknown, engine_opts,

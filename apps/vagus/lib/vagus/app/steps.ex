@@ -17,6 +17,7 @@ defmodule Vagus.App.Steps do
   alias Vagus.DSP
   alias Vagus.Ingress.Panels
   alias Vagus.Network
+  alias Vagus.Network.Nat
   alias Vagus.Runtime.{Engine, Host}
 
   @default_backend Vagus.Addon.Backend.Container
@@ -28,6 +29,7 @@ defmodule Vagus.App.Steps do
   @health_timeout_ms 30_000
   @health_timeout_cap_ms 300_000
   @health_run_margin_ms 5_000
+  @health_start_interval_floor_ms 5_000
   @port_min 62_000
   @port_max 65_500
   @port_tries 100
@@ -128,6 +130,7 @@ defmodule Vagus.App.Steps do
          :ok <- ensure_dsp_devices(config, opts),
          :ok <- write_options(config, data_root(opts), input[:user_options] || %{}),
          :ok <- maybe_ensure_network(config, opts),
+         :ok <- ensure_isolation(config, opts),
          :ok <- remove_stale_container(spec, opts),
          {:ok, id} <- backend(opts).create(spec),
          :ok <- start_or_cleanup(id, opts) do
@@ -346,7 +349,8 @@ defmodule Vagus.App.Steps do
         :engine_opts,
         :panels,
         :required_dsp_nodes,
-        :arch
+        :arch,
+        :nat_opts
       ])
       |> Keyword.new()
       |> put_backend(input.config)
@@ -375,7 +379,7 @@ defmodule Vagus.App.Steps do
           # Upstream reports `startup` until the first healthy event only for
           # an image that declares a healthcheck.
           healthcheck: container.healthcheck != nil,
-          health_check: health_check(container.healthcheck, engine_opts(opts))
+          health_check: health_check(container, engine_opts(opts))
         }
 
       {:error, _reason} ->
@@ -407,7 +411,7 @@ defmodule Vagus.App.Steps do
   # a permit, and none is granted during a shutdown.
   def health_schedule(id, engine_opts) do
     case Engine.inspect(id, Keyword.put(engine_opts, :class, :health)) do
-      {:ok, container} -> {:ok, health_check(container.healthcheck, engine_opts)}
+      {:ok, container} -> {:ok, health_check(container, engine_opts)}
       {:error, reason} -> {:error, reason}
     end
   rescue
@@ -419,9 +423,18 @@ defmodule Vagus.App.Steps do
   # podman process a second on a small board. The first run waits out the
   # start period, plus up to one interval of jitter so apps started together
   # do not all check together.
-  defp health_check(nil, _engine_opts), do: nil
+  #
+  # An image that declares a start interval is checked at that pace until
+  # its start period ends (`start_until`), as Docker 25 did: a 15 min interval
+  # would otherwise leave it starting for half an hour. The period runs from
+  # the container's own start, so an app process restarted part way keeps
+  # it, and from now for an engine that reports none. The checks are bounded
+  # by the period, so the floor is a lower one. podman's own verdict keeps
+  # Docker's rules: a success in the start period is healthy at once, and a
+  # failure there counts for nothing. `Vagus.App.Policy` paces the rest.
+  defp health_check(%{healthcheck: nil}, _engine_opts), do: nil
 
-  defp health_check(healthcheck, engine_opts) do
+  defp health_check(%{healthcheck: healthcheck} = container, engine_opts) do
     if Engine.schedules_healthchecks?(engine_opts) do
       nil
     else
@@ -429,8 +442,24 @@ defmodule Vagus.App.Steps do
       interval = max(positive(healthcheck[:interval_ms]) || @health_interval_ms, floor)
       start_period = positive(healthcheck[:start_period_ms]) || 0
 
+      start_interval =
+        positive(healthcheck[:start_interval_ms]) &&
+          max(healthcheck[:start_interval_ms], @health_start_interval_floor_ms)
+
+      period_end = DateTime.add(container.started_at || now(), start_period, :millisecond)
+      # What is left of the period, so a container found long after its start
+      # (an inspect retried, an app process restarted) waits only an interval.
+      left = max(DateTime.diff(period_end, now(), :millisecond), 0)
+      quick? = start_interval != nil and left > 0
+
       %{
-        first_ms: max(start_period, interval) + :rand.uniform(interval),
+        first_ms:
+          if(quick?,
+            do: min(start_interval, left),
+            else: max(left, interval) + :rand.uniform(interval)
+          ),
+        start_interval_ms: start_interval,
+        start_until: if(quick?, do: period_end),
         interval_ms: interval,
         timeout_ms:
           min(positive(healthcheck[:timeout_ms]) || @health_timeout_ms, @health_timeout_cap_ms) +
@@ -439,6 +468,8 @@ defmodule Vagus.App.Steps do
       }
     end
   end
+
+  defp now, do: DateTime.utc_now()
 
   defp positive(ms) when is_integer(ms) and ms > 0, do: ms
   defp positive(_ms), do: nil
@@ -588,11 +619,15 @@ defmodule Vagus.App.Steps do
   defp put_backend(opts, %Config{}), do: opts
 
   defp maybe_ensure_network(%Config{host_network: true}, _opts), do: :ok
-  # Native "virtual add-ons" have no container on the hassio bridge — nothing to
-  # attach, so don't stand the bridge up on their account.
-  defp maybe_ensure_network(%Config{backend: :native}, _opts), do: :ok
 
-  defp maybe_ensure_network(_config, opts) do
+  # Native "virtual add-ons" have no container on the hassio bridge — nothing to
+  # attach, so don't stand the bridge up on their account. A declared
+  # `native` outside the allowlist is a container (`put_backend/2`).
+  defp maybe_ensure_network(config, opts) do
+    if native?(config), do: :ok, else: ensure_network(opts)
+  end
+
+  defp ensure_network(opts) do
     case Network.ensure(engine_opts(opts)) do
       :ok ->
         # Bind the supervisor anchor (.2) to the freshly-ensured bridge so the
@@ -602,6 +637,35 @@ defmodule Vagus.App.Steps do
 
       {:error, reason} ->
         {:error, {:network, reason}}
+    end
+  end
+
+  # Every bridged container is created here, whichever path starts it, so
+  # this is the one place that keeps one from running without the bridge's
+  # filters and forwarding (`Vagus.Network.Nat.ensure_loaded/1`).
+  # Host-network containers are not behind the bridge's forward path, and
+  # are never held back by it.
+  defp ensure_isolation(%Config{host_network: true}, _opts), do: :ok
+
+  # By `native?/1`, not the declared backend: a store app outside the
+  # allowlist that declares `native` still runs as a container
+  # (`put_backend/2`).
+  defp ensure_isolation(config, opts) do
+    if native?(config), do: :ok, else: nat_loaded(opts)
+  end
+
+  defp nat_loaded(opts) do
+    case Nat.ensure_loaded(Keyword.get(opts, :nat_opts, [])) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Logger.error(
+          "Vagus.App.Steps: bridged app not started: the hassio filters (table ip vagus) " <>
+            "or IPv4 forwarding are not in place: #{inspect(reason)}"
+        )
+
+        {:error, {:isolation_not_loaded, reason}}
     end
   end
 

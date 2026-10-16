@@ -9,8 +9,7 @@ defmodule Vagus.Core.Supervisor do
   (persistent WS client manager), and `Vagus.Core.Users` (cached admin
   lookups over that WS).
 
-  Mirrors `Vagus.Engine.DaemonSupervisor`/`Vagus.API.Supervisor`'s
-  isolation rationale: a crash anywhere in this subtree has its own
+  Mirrors `Vagus.API.Supervisor`'s isolation rationale: a crash anywhere in this subtree has its own
   bounded restart budget (`max_restarts: 5, max_seconds: 30`) and can
   never escalate to take down the rest of `Vagus.Supervisor`.
 

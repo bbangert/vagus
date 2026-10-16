@@ -2,14 +2,10 @@ defmodule Vagus.Runtime.Docker do
   @moduledoc """
   Docker Engine API client over the daemon's Unix socket (Mint HTTP/1) — the
   real Engine-API driver the `docs/contract-2026.7-m4-addendum.md` §A1 calls
-  for, replacing `Vagus.Engine`'s spike-era CLI shelling.
+  for. Host development and tests only: the target runs podman.
 
-  balena-engine is a moby fork speaking the same Engine API, so this same
-  client drives both: on the host it talks to `/var/run/docker.sock` (regular
-  Docker, for development + tests); on target to
-  `/run/balena-engine.sock`. The socket path is
-  `config :vagus, :docker_socket` (default `/var/run/docker.sock`), overridable
-  per call via the `:socket` option.
+  The socket path is `config :vagus, :docker_socket` (default
+  `/var/run/docker.sock`), overridable per call via the `:socket` option.
 
   Transport: one short-lived Mint connection per request over the
   `{:local, socket}` address (Engine-API calls are add-on-lifecycle rate, not

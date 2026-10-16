@@ -5,14 +5,12 @@ defmodule Vagus.API.Supervisor do
   Holds the `Bandit` server (`plug: Vagus.API.Dispatcher` — see that module
   for why the entry point is a small dispatcher rather than
   `Vagus.API.Router` directly, `docs/contract-2026.7-m4b-ingress-watchdog.md`
-  §B2) under its own bounded restart budget, mirroring
-  `Vagus.Engine.DaemonSupervisor`'s isolation rationale: a Bandit
-  crash-loop must never escalate past this subtree and bring down the rest
-  of `Vagus.Supervisor`.
+  §B2) under its own bounded restart budget: a Bandit crash-loop must never
+  escalate past this subtree and bring down the rest of `Vagus.Supervisor`.
 
   Bandit itself is *not* a static child here: on target it binds an address
-  (`172.30.32.2`) that does not exist until balena-engine has created the
-  hassio bridge, so it is started — with retries — by `Vagus.API.Listener`
+  (`172.30.32.2`) that does not exist until boot has bound the anchors on
+  the hassio bridge (`Vagus.App.Gates.network/1`), so it is started — with retries — by `Vagus.API.Listener`
   into `Vagus.API.ListenerSupervisor`. See that module for the race.
 
   Also holds `Vagus.Ingress.Finch`, the connection pool the ingress
@@ -95,8 +93,7 @@ defmodule Vagus.API.Supervisor do
           # Holds the Bandit listener once `Vagus.API.Listener` has managed to
           # bind it. A dedicated `DynamicSupervisor` (rather than Bandit
           # directly under this supervisor) is what lets the bind be retried
-          # with a backoff instead of crash-looping this subtree — same shape
-          # as `Vagus.Engine.DaemonSupervisor`/`Vagus.Engine.Manager`.
+          # with a backoff instead of crash-looping this subtree.
           {DynamicSupervisor,
            name: Vagus.API.ListenerSupervisor,
            strategy: :one_for_one,

@@ -1102,6 +1102,26 @@ defmodule Vagus.App.ServerTest do
       assert %{container_id: "c1", image_attempt: 0} = data(pid)
     end
 
+    # A board's first podman boot: the engine still reports the app's old
+    # container, the new store has no image, and the network is not up yet.
+    test "a boot start whose pull fails before the network is up retries until it starts" do
+      app_deadlines(%{retry: 1})
+      {_slug, pid} = installed(%{}, state: :started, watchdog: false)
+      assert %{container_id: "fixture-" <> _ = stale} = data(pid)
+
+      boot = op(pid, {:boot_start, %{running?: false}})
+      refused = {:pull, {:pull_failed, "connection refused"}}
+      answer(:ensure_image, {:error, refused})
+      assert {:error, ^refused} = Task.await(boot)
+      assert %{container_id: ^stale, wanted: :started, image_attempt: 1} = data(pid)
+
+      answer(:ensure_image, {:error, refused})
+      answer(:ensure_image, {:ok, "x/y:1"})
+      answer(:start, {:ok, @started})
+      assert_eventually_idle(pid)
+      assert %{container_id: "c1", wanted: :started, image_attempt: 0} = data(pid)
+    end
+
     test "a failed pull fails the start as a failed start does" do
       {_slug, pid} = installed()
       t = op(pid, {:start, %{}})

@@ -298,6 +298,133 @@ defmodule Vagus.App.OrchestratorTest do
     assert log =~ "gate api failing after 2 tries"
   end
 
+  describe "apps and the primary interface" do
+    # Answers :no_primary for the first `fails` checks, then :ok.
+    defp primary_after(test_pid, fails) do
+      counter = :counters.new(1, [])
+
+      fn ->
+        :counters.add(counter, 1, 1)
+        send(test_pid, {:gate, :primary})
+        if :counters.get(counter, 1) <= fails, do: {:error, :no_primary}, else: :ok
+      end
+    end
+
+    defp with_primary(test_pid, primary),
+      do:
+        Map.new([:tree, :engine, :network, :api], &{&1, gate(test_pid, &1)})
+        |> Map.put(:primary, primary)
+
+    test "with none at the first app stage, Core starts and the apps wait for one, in stage order" do
+      apps = [app("s", "services"), app("i", "initialize"), app("a", "application")]
+
+      log =
+        capture_log(fn ->
+          start_orchestrator(apps, %{gates: with_primary(self(), primary_after(self(), 3))})
+          messages = collect_until(:complete)
+
+          starts = for {:boot_start, slug} <- messages, do: slug
+          assert starts == ["i", "s", "a"]
+
+          core = Enum.find_index(messages, &(&1 == :core_start))
+
+          primary_up =
+            messages
+            |> Enum.with_index()
+            |> Enum.filter(&(elem(&1, 0) == {:gate, :primary}))
+            |> List.last()
+            |> elem(1)
+
+          first_app = Enum.find_index(messages, &match?({:boot_start, _}, &1))
+
+          assert Enum.count(messages, &(&1 == {:gate, :primary})) == 4
+          assert core < primary_up and primary_up < first_app
+        end)
+
+      assert log =~ "no primary interface yet"
+      assert log =~ "primary interface up"
+    end
+
+    test "with one at the first app stage, apps start in their stages ahead of Core" do
+      start_orchestrator([app("s", "services")], %{
+        gates: with_primary(self(), primary_after(self(), 0))
+      })
+
+      messages = collect_until(:complete)
+
+      assert Enum.find_index(messages, &(&1 == {:boot_start, "s"})) <
+               Enum.find_index(messages, &(&1 == :core_start))
+
+      assert Enum.count(messages, &(&1 == {:gate, :primary})) == 1
+    end
+
+    test "after the bound the apps start anyway, with a warning" do
+      log =
+        capture_log(fn ->
+          start_orchestrator(
+            [app("s", "services")],
+            %{gates: with_primary(self(), primary_after(self(), 1_000_000))},
+            gate_interval: 10,
+            primary_timeout: 50
+          )
+
+          messages = collect_until(:complete)
+          assert {:boot_start, "s"} in messages
+        end)
+
+      assert log =~ "still no primary interface"
+    end
+
+    test "a shutdown during a put-off stage starts no later stage" do
+      test_pid = self()
+
+      start = fn
+        "init", _running? -> held(test_pid, :init).()
+        slug, _running? -> send(test_pid, {:boot_start, slug}) && :ok
+      end
+
+      apps = [app("init", "initialize"), app("app", "application")]
+
+      capture_log(fn ->
+        name =
+          start_orchestrator(
+            apps,
+            %{boot_start: start, gates: with_primary(test_pid, primary_after(test_pid, 1))},
+            stage_timeout: 60_000
+          )
+
+        assert_receive {:init, unit}, 5_000
+        assert_received :core_start
+        %{task: %Task{pid: boot}} = :sys.get_state(name)
+        boot_ref = Process.monitor(boot)
+
+        shutdown = Task.async(fn -> Orchestrator.shutdown(name) end)
+        await_phase(name, :cancelling)
+        send(unit, :release)
+
+        Task.await(shutdown)
+        assert_receive {:DOWN, ^boot_ref, :process, ^boot, :normal}, 5_000
+        messages = drain()
+        refute {:boot_start, "app"} in messages
+        refute :complete in messages
+      end)
+    end
+
+    test "Core is not held while the apps wait" do
+      capture_log(fn ->
+        start_orchestrator(
+          [app("s", "services")],
+          %{gates: with_primary(self(), primary_after(self(), 1_000_000))},
+          gate_interval: 10,
+          primary_timeout: 60_000
+        )
+
+        assert_receive :core_start, 1_000
+        refute_receive {:boot_start, _}, 200
+      end)
+    end
+  end
+
   test "a fresh default app is recorded wanted and started before the engine gate" do
     test_pid = self()
     broker = app("core_mqtt", "services", native: true, state: :stopped)

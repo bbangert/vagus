@@ -11,7 +11,14 @@ defmodule Vagus.App.Gates do
   alias Vagus.Network.Nat
 
   @spec all() :: %{atom() => (-> :ok | {:error, term()})}
-  def all, do: %{tree: &tree/0, engine: &engine/0, network: &network/0, api: &api/0}
+  def all,
+    do: %{
+      tree: &tree/0,
+      engine: &engine/0,
+      network: &network/0,
+      api: &api/0,
+      primary: &primary/0
+    }
 
   @doc """
   The rest of the application tree is up. The app tree starts before DNS,
@@ -26,38 +33,37 @@ defmodule Vagus.App.Gates do
   end
 
   @doc """
-  The engine answers. Under Docker that waits for the internet as well:
-  `Vagus.Engine.Manager` starts balena-engine only once the network reaches
-  it. Under podman it is `Vagus.Runtime.Host`'s preparation alone, since only
-  a pull needs the network.
+  The engine answers: under podman, `Vagus.Runtime.Host`'s preparation is
+  done. No wait for the internet, since only a pull needs the network.
   """
   @spec engine(keyword()) :: :ok | {:error, term()}
   def engine(opts \\ []), do: Vagus.Runtime.Engine.ready(opts)
 
   @doc """
-  Stands up the `hassio` bridge, binds the `.2`/`.3` anchors and asserts the
-  DNAT that serves port 80 on `.2`. All of it is lost on reboot, and only a
+  Stands up the `hassio` bridge, binds the `.2`/`.3` anchors and loads
+  `Vagus.Network.Nat`'s table. All of it is lost on reboot, and only a
   container app's start would redo it otherwise, so a device running only
   native apps would leave Core unable to reach the Supervisor. Under podman
-  the bridge is the host's own (`Vagus.Network.host_bridge?/1`), so the
-  anchors and the DNAT go on even when the engine could not make its
-  network. Best effort: always `:ok`, so a failure here never holds the apps
-  back. `opts` reach every step (tests).
+  Vagus makes the bridge interface itself (`Vagus.Network.host_bridge?/1`),
+  so the anchors have it whatever podman answered. Each step runs whatever
+  the one before returned, and the gate is always `:ok`, so Core and
+  host-network apps are never held back here. A table that did not load
+  keeps bridged apps from starting instead (`Vagus.Network.Nat.ensure_loaded/1`
+  in their start, which retries the load). `opts` reach every step (tests).
   """
   @spec network(keyword()) :: :ok
   def network(opts \\ []) do
-    case Network.ensure(opts) do
-      :ok ->
-        anchors_and_nat(opts)
+    warn_unless_ok(
+      Network.ensure(opts),
+      "hassio bridge; Core and bridged apps may not reach the Supervisor"
+    )
 
-      {:error, reason} ->
-        warn_unless_ok(
-          {:error, reason},
-          "hassio bridge; Core and bridged apps may not reach the Supervisor"
-        )
+    Network.ensure_supervisor_ip(opts)
 
-        if Network.host_bridge?(opts), do: anchors_and_nat(opts)
-    end
+    warn_unless_ok(
+      Nat.ensure(opts),
+      "supervisor DNAT, bridge filters and forwarding; bridged apps will not start until they are in place"
+    )
 
     # The listener's bind address exists only from here, so its next bind
     # attempt is hurried. An optimisation only: the `api` gate still decides.
@@ -65,9 +71,18 @@ defmodule Vagus.App.Gates do
     :ok
   end
 
-  defp anchors_and_nat(opts) do
-    Network.ensure_supervisor_ip(opts)
-    warn_unless_ok(Nat.ensure(opts), "supervisor DNAT; apps may not reach http://supervisor/")
+  @doc """
+  The host has a primary interface, exactly as `GET /network/info` shows it
+  to apps: some apps read it once at start and exit for good without one
+  (Matter Server: "No primary network interface found"). Not a gate of the
+  boot sequence, which must not hold Core: the orchestrator holds only the
+  app stages on it (`Vagus.App.Orchestrator`).
+  """
+  @spec primary() :: :ok | {:error, :no_primary}
+  def primary do
+    if Enum.any?(Vagus.Backend.network().info().interfaces, & &1.primary),
+      do: :ok,
+      else: {:error, :no_primary}
   end
 
   @doc """

@@ -23,10 +23,9 @@ defmodule Vagus.Core.EventPusher do
   `send_frame/2` call, so everything below this paragraph is transport-
   agnostic.
 
-  This module is the manager half of a monitor+backoff pair — mirroring
-  `Vagus.Engine.Manager`'s house pattern for supervising an external
-  resource without ever letting its restart intensity threaten the parent
-  supervisor's budget. Both connection modules are started unlinked
+  This module is the manager half of a monitor+backoff pair — the house
+  pattern for supervising an external resource without ever letting its
+  restart intensity threaten the parent supervisor's budget. Both connection modules are started unlinked
   (`Fresh.start/4`, `SocketConnection.start/1`) and monitored
   (`Process.monitor/1`), never added as supervised children directly.
 

@@ -18,6 +18,7 @@ defmodule Vagus.Runtime.Engine.Container do
           interval_ms: non_neg_integer() | nil,
           timeout_ms: non_neg_integer() | nil,
           start_period_ms: non_neg_integer() | nil,
+          start_interval_ms: non_neg_integer() | nil,
           retries: non_neg_integer() | nil
         }
 

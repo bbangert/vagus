@@ -36,7 +36,7 @@ defmodule Vagus.App.UnitsTest do
       assert is_function(Map.fetch!(units, key), arity), "#{key}/#{arity}"
     end
 
-    assert Map.keys(units.gates) |> Enum.sort() == [:api, :engine, :network, :tree]
+    assert Map.keys(units.gates) |> Enum.sort() == [:api, :engine, :network, :primary, :tree]
     assert Enum.all?(Map.values(units.gates), &is_function(&1, 0))
   end
 

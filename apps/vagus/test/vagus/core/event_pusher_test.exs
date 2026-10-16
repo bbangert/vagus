@@ -8,8 +8,7 @@ defmodule Vagus.Core.EventPusherTest do
   alias Vagus.Core.TokenStore
 
   # These exercise handle_cast/2 and handle_info/2 directly against
-  # hand-built state, with no live GenServer/Fresh connection involved —
-  # mirrors Vagus.Engine.ManagerTest's approach for the same reason: the
+  # hand-built state, with no live GenServer/Fresh connection involved: the
   # pure state-machine transitions (id sequencing, queue bounding,
   # backoff) are fully testable this way without ever reaching
   # Fresh.start/4's real network connection attempt. `conn_mod` is the TCP

@@ -58,6 +58,8 @@ defmodule Vagus.Runtime.Engine.PodmanRenderTest do
                  "type=bind,src=/run/supervisor,dst=/run/supervisor",
                  "--mount",
                  "type=volume,src=vagus-core-config,dst=/config",
+                 "--mount",
+                 "type=bind,src=/run/resolv.conf,dst=/etc/resolv.conf,ro=true",
                  "--tmpfs",
                  "/tmp:rw,noexec,nosuid,nodev,notmpcopyup",
                  "--privileged",
@@ -211,6 +213,8 @@ defmodule Vagus.Runtime.Engine.PodmanRenderTest do
                  "hassio:#{@ip}",
                  "--add-host",
                  "supervisor:#{@ip}",
+                 "--mount",
+                 "type=bind,src=/run/resolv.conf,dst=/etc/resolv.conf,ro=true",
                  "--tmpfs",
                  "/dev/shm:rw,noexec,nosuid,nodev,notmpcopyup",
                  "--cap-add",
@@ -242,6 +246,17 @@ defmodule Vagus.Runtime.Engine.PodmanRenderTest do
         struct!(%ContainerSpec{name: "n", image: "i", network: :host}, fields),
         @log
       )
+    end
+
+    test "the live resolv.conf goes only into a host-network container without its own" do
+      bind = ["--mount", "type=bind,src=/run/resolv.conf,dst=/etc/resolv.conf,ro=true"]
+      assert bind -- render([]) == []
+
+      bridged = render(network: {:bridge, "hassio"})
+      refute Enum.any?(bridged, &(&1 =~ "resolv.conf"))
+
+      own = %{type: :bind, source: "/data/resolv", target: "/etc/resolv.conf", read_only: true}
+      assert Enum.count(render(mounts: [own]), &(&1 =~ "dst=/etc/resolv.conf")) == 1
     end
 
     test "a secret's value never reaches the argv" do

@@ -407,6 +407,18 @@ defmodule Vagus.Runtime.Engine.DockerContractTest do
                Engine.inspect("addon_local_y", opts)
     end
 
+    test "a healthcheck's start interval is read beside its start period" do
+      raw =
+        update_in(Leg.running_json(), ["Config", "Healthcheck"], fn hc ->
+          Map.merge(hc, %{"StartPeriod" => 60_000_000_000, "StartInterval" => 10_000_000_000})
+        end)
+
+      {_engine, opts} = engine([{200, raw}])
+
+      assert {:ok, %Container{healthcheck: %{start_period_ms: 60_000, start_interval_ms: 10_000}}} =
+               Engine.inspect("addon_local_x", opts)
+    end
+
     test "a running container reports no exit code even though Docker says 0" do
       {_engine, opts} = engine([{200, Leg.running_json()}])
       assert {:ok, %Container{exit_code: nil}} = Engine.inspect("addon_local_x", opts)

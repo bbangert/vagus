@@ -63,10 +63,10 @@ defmodule Vagus.Runtime.Host do
 
   require Logger
 
-  alias Vagus.Engine.ResolvConf
   alias Vagus.Runtime.Migration
   alias Vagus.Runtime.Mountinfo
   alias Vagus.Runtime.Podman.Cmd
+  alias Vagus.Runtime.ResolvConf
 
   @frugal_below_kb 2 * 1024 * 1024
   # How long a checkout waits for the Host's answer, apart from any wait for
@@ -748,13 +748,15 @@ defmodule Vagus.Runtime.Host do
     end
   end
 
+  # Only a missing file: once vintage_net has written it (search domain
+  # included), a Host restarted within the boot must not replace it.
   # sobelow_skip ["Traversal.FileModule"]
   defp write_resolv_conf(opts) do
     path = Keyword.get(opts, :resolv_conf, ResolvConf.path())
     servers = Keyword.get(opts, :name_servers, &name_servers/0).()
 
-    case File.write(path, ResolvConf.build(servers)) do
-      :ok ->
+    case File.write(path, ResolvConf.build(servers), [:exclusive]) do
+      result when result in [:ok, {:error, :eexist}] ->
         :ok
 
       {:error, reason} ->

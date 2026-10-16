@@ -25,16 +25,19 @@ defmodule Vagus.App.DefaultBootTest do
     {{pid, ref}, log} =
       with_log(fn ->
         pid =
-          start_supervised!(
-            {Orchestrator,
-             name: name,
-             boot: true,
-             gate_tries: 1,
-             gate_interval: 0,
-             tree_interval: 0,
-             gate_timeout: 2_000,
-             stage_timeout: 2_000}
-          )
+          start_supervised!({
+            Orchestrator,
+            # The primary check reads the network backend, a Mox stub that
+            # another test's private mode can hide from this boot's tasks.
+            name: name,
+            boot: true,
+            gate_tries: 1,
+            gate_interval: 0,
+            tree_interval: 0,
+            gate_timeout: 2_000,
+            stage_timeout: 2_000,
+            primary_timeout: 0
+          })
 
         ref = Process.monitor(pid)
 

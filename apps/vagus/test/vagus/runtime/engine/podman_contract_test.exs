@@ -491,9 +491,26 @@ defmodule Vagus.Runtime.Engine.PodmanContractTest do
                  interval_ms: 30_000,
                  timeout_ms: 5_000,
                  start_period_ms: nil,
+                 start_interval_ms: nil,
                  retries: 3
                }
              } = checked
+    end
+
+    test "an image's start period and start interval reach the healthcheck", ctx do
+      # The shape podman 6.1.4 gives an image built with HEALTHCHECK
+      # --start-period=1m --start-interval=10s.
+      [raw] = Leg.fixture("inspect_health.json")
+
+      raw =
+        update_in(raw, ["Config", "Healthcheck"], fn hc ->
+          Map.merge(hc, %{"StartPeriod" => 60_000_000_000, "StartInterval" => 10_000_000_000})
+        end)
+
+      {_fake, opts} = engine(ctx, [{"container inspect *", [{0, Leg.inspect_out(raw)}]}])
+
+      assert {:ok, %Container{healthcheck: %{start_period_ms: 60_000, start_interval_ms: 10_000}}} =
+               Engine.inspect("fx_health", opts)
     end
 
     test "podman's stopped state is :exited", ctx do
