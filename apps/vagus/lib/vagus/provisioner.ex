@@ -1,9 +1,9 @@
 defmodule Vagus.Provisioner do
   @moduledoc """
-  First-boot provisioning (issue #40): flash → power → network →
+  First-boot provisioning: flash → power → network →
   `http://board/` shows the HA onboarding wizard (`:8123` 307-redirects there
   during onboarding), zero console commands.
-  Runs an ordered, idempotent list of steps — today `[:expand_data,
+  Runs an ordered, idempotent list of steps — `[:expand_data,
   :provision_core]` — once per boot, retrying whatever isn't ready yet.
 
   ## `:provision_core`
@@ -64,16 +64,16 @@ defmodule Vagus.Provisioner do
   and `mix test` never enable it; `start_link/1` returns `:ignore` rather
   than starting a GenServer with nothing to do.
 
-  ## Crash isolation (issue #45)
+  ## Crash isolation
 
   This GenServer is a direct child of `Vagus.Supervisor` (`one_for_one`,
   a small restart budget) sitting next to the engine, HA Core, and the API
   — an instant crash-loop here exhausts that budget and takes the whole
-  `:vagus` app down with it, not just first-boot provisioning. Device-verified:
-  `resize2fs` isn't shipped on rpi3_64, and `System.cmd/3` doesn't return a
+  `:vagus` app down with it, not just first-boot provisioning. `resize2fs`
+  isn't shipped on rpi3_64, and `System.cmd/3` doesn't return a
   nonzero-status tuple for a missing binary — it *raises* `ErlangError`
-  (`:enoent`), which bypassed every `{output, status}` clause below and took
-  the app down on first boot. Two independent guards close this off: `cmd`'s
+  (`:enoent`), past every `{output, status}` clause below. Two independent
+  guards close this off: `cmd`'s
   default implementation rescues that raise into a fake exit-127 tuple, so a
   missing/unusable host binary degrades through the same log-and-skip path
   as a real nonzero exit; and `run_steps/2` rescues/catches around each step
@@ -81,8 +81,8 @@ defmodule Vagus.Provisioner do
   cost the others their turn (`:provision_core` still runs) or the process
   its life. The guarantee doesn't end at that synchronous pass: once
   `:provision_core` goes `:async`, the `handle_info/2` continuation
-  (`:await_engine`'s ping, `:await_internet`'s connection check,
-  `:attempt_update`'s update/start/await-healthy chain) runs through
+  (`:await_engine`'s ping, `:await_internet`'s connection check, the
+  install, pull and start attempts) runs through
   `safe_async/3`, the same rescue/catch shape — a raise anywhere in that
   chain abandons first-boot provisioning for this boot (no reschedule)
   instead of crash-looping the GenServer the next time `handle_info`
@@ -132,7 +132,7 @@ defmodule Vagus.Provisioner do
       # On the expand-data first-boot path, no Core/add-ons are installed yet
       # in practice, so the facade's stop stages no-op fast — routed through
       # it anyway to keep the "no direct Nerves.Runtime reboot callers"
-      # invariant (issue #39).
+      # invariant.
       reboot: Keyword.get(opts, :reboot, &Vagus.Host.Shutdown.reboot/0),
       sysfs_root: Keyword.get(opts, :sysfs_root, @sysfs_root),
       rootdisk: Keyword.get(opts, :rootdisk, @rootdisk),
@@ -144,7 +144,8 @@ defmodule Vagus.Provisioner do
       image_present: Keyword.get(opts, :image_present, &default_image_present/1),
       pull: Keyword.get(opts, :pull, &default_pull/1),
       update: Keyword.get(opts, :update, &default_update/0),
-      start: Keyword.get(opts, :start, &default_start/0),
+      start: Keyword.get(opts, :start, &default_start/1),
+      stops: Keyword.get(opts, :stops, &Vagus.Core.Lifecycle.stops/0),
       await_healthy: Keyword.get(opts, :await_healthy, &default_await_healthy/0),
       engine_interval: Keyword.get(opts, :engine_interval, @engine_interval),
       net_interval: Keyword.get(opts, :net_interval, @net_interval),
@@ -159,6 +160,9 @@ defmodule Vagus.Provisioner do
       # The installed version whose image is being fetched; `nil` while
       # installing the latest.
       version: nil,
+      # `Lifecycle.stops/0` when provisioning began: a stop since is the
+      # user's (or a shutdown's), and a start of ours must not undo it.
+      stops_seen: nil,
       retry_attempt: 0
     }
 
@@ -169,8 +173,9 @@ defmodule Vagus.Provisioner do
   def handle_continue(:run, state), do: {:noreply, run_steps(state.steps, state)}
 
   @impl GenServer
-  def handle_info({:provision_core, version}, state) do
-    {:noreply, safe_async(:await_engine, %{state | version: version}, &do_await_engine/1)}
+  def handle_info({:provision_core, version, stops_seen}, state) do
+    state = %{state | version: version, stops_seen: stops_seen}
+    {:noreply, safe_async(:await_engine, state, &do_await_engine/1)}
   end
 
   def handle_info(:await_engine, state) do
@@ -246,13 +251,13 @@ defmodule Vagus.Provisioner do
     state
   end
 
-  # Extends the #45 crash-isolation guarantee past the synchronous step pass
+  # Extends the crash-isolation guarantee past the synchronous step pass
   # into the async continuation: once `:provision_core` goes `:async`, these
   # `handle_info/2` handlers call injected/side-effecting fns
   # (ping/connection/update/start/await_healthy) with no supervisor between
   # them and the GenServer — an unguarded raise here would crash-loop it
-  # exactly like the original bug (the next `handle_info` for the same
-  # message hits the same raise, burning the restart budget). A crash
+  # (the next `handle_info` for the same message hits the same raise,
+  # burning the restart budget). A crash
   # abandons first-boot provisioning for this boot with NO reschedule —
   # retrying the same crash on a timer is just a slower crash-loop; the
   # next real boot gets a clean attempt instead.
@@ -280,7 +285,7 @@ defmodule Vagus.Provisioner do
   # Runs `steps` in order. `:ok` continues to the next step; `:halt` stops
   # the runner (a reboot is in flight for `:expand_data`); `:async` stops
   # the runner too — the step continues via `handle_info` messages instead
-  # (there are no steps after `:provision_core` today, so nothing is lost).
+  # (no step follows `:provision_core`, so nothing is lost).
   defp run_steps([], state), do: state
 
   defp run_steps([step | rest], state) do
@@ -291,7 +296,7 @@ defmodule Vagus.Provisioner do
     end
   end
 
-  # Isolates one step's crash from the rest of the pipeline (issue #45): a
+  # Isolates one step's crash from the rest of the pipeline: a
   # bug in `:expand_data` must not cost `:provision_core` its turn, same
   # stage-isolation principle as `Vagus.Host.Shutdown.safe_stop_addons/1`. A
   # crashing step degrades to `:ok` — i.e. treated as done — so the runner
@@ -377,7 +382,7 @@ defmodule Vagus.Provisioner do
     :ok
   end
 
-  # Data-partition identity gate (issue #41): `<rootdisk>p5` is only the
+  # Data-partition identity gate: `<rootdisk>p5` is only the
   # data partition on p5-data layouts like the Q6A's. On rpi3_64, p5 is a
   # 133 MiB unrelated partition and the real data partition is p7 — nothing
   # below this gate is meaningful there, and running it anyway would (once
@@ -548,7 +553,7 @@ defmodule Vagus.Provisioner do
     if version == nil,
       do: Logger.info("Vagus.Provisioner: no Core installed — starting first-boot provisioning")
 
-    send(self(), {:provision_core, version})
+    send(self(), {:provision_core, version, state.stops.()})
     :async
   end
 
@@ -583,9 +588,14 @@ defmodule Vagus.Provisioner do
 
   # A failed start is retried like a failed install: the image is there, and
   # what failed it (the lifecycle lock held by a boot-time start, the engine
-  # still settling) usually passes.
+  # still settling) usually passes. Not once Core has been stopped: the
+  # check here ends a pending retry, and `Lifecycle.start/1` checks again
+  # under its lock for a stop that lands in between.
   defp start_and_await_healthy(state) do
-    case state.start.() do
+    result =
+      if state.stops.() == state.stops_seen, do: start_core(state), else: {:error, :stopped}
+
+    case result do
       :ok ->
         case state.await_healthy.() do
           :healthy ->
@@ -600,10 +610,22 @@ defmodule Vagus.Provisioner do
 
         state
 
+      {:error, :stopped} ->
+        Logger.info(
+          "Vagus.Provisioner: Core was stopped since provisioning began — not starting it"
+        )
+
+        state
+
       {:error, reason} ->
         retry_later(state, :attempt_start, "Core start failed (#{inspect(reason)})")
     end
   end
+
+  defp start_core(%{start: start} = state) when is_function(start, 1),
+    do: start.(state.stops_seen)
+
+  defp start_core(state), do: state.start.()
 
   defp retry_later(state, message, what) do
     delay = min(state.retry_base * Integer.pow(2, state.retry_attempt), state.retry_cap)
@@ -620,7 +642,7 @@ defmodule Vagus.Provisioner do
 
   # --- default seams ---------------------------------------------------
 
-  # Delegates to `Vagus.Host.Cmd.run/2` (which carries the issue-#45
+  # Delegates to `Vagus.Host.Cmd.run/2` (which carries the
   # missing-binary rescue) but stays here as a public function so
   # `ProvisionerTest`'s nonexistent-binary test and the `:cmd` seam default
   # keep the same names.
@@ -638,7 +660,7 @@ defmodule Vagus.Provisioner do
 
   defp default_update, do: Vagus.Core.Lifecycle.update()
 
-  defp default_start, do: Vagus.Core.Lifecycle.start()
+  defp default_start(stops_seen), do: Vagus.Core.Lifecycle.start(stops_seen: stops_seen)
 
   defp default_await_healthy, do: Vagus.Core.Health.await_healthy()
 

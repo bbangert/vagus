@@ -566,6 +566,20 @@ defmodule Vagus.Runtime.Engine.PodmanContractTest do
       assert Vagus.Runtime.Host.last_sample(opts[:host], "addon_local_x") == nil
     end
 
+    test "removing a container by its id forgets the sample its name keys", ctx do
+      {_fake, opts} =
+        engine(ctx, [
+          {"stats *", [{0, Leg.stats_line()}]},
+          {"container inspect *", [{0, Leg.inspect_out(Leg.running_json())}]},
+          {"rm *", [{0, ""}]}
+        ])
+
+      {:ok, _} = Engine.stats("addon_local_x", opts)
+      assert Vagus.Runtime.Host.last_sample(opts[:host], "addon_local_x") != nil
+      :ok = Engine.remove(Leg.running_json()["Id"], opts)
+      assert Vagus.Runtime.Host.last_sample(opts[:host], "addon_local_x") == nil
+    end
+
     test "a stopped container is all zeros", ctx do
       stopped = File.read!(Path.expand("../../../fixtures/podman/stats_stopped.json", __DIR__))
       {_fake, opts} = engine(ctx, [{"stats *", [{0, stopped}]}])
@@ -802,6 +816,38 @@ defmodule Vagus.Runtime.Engine.PodmanContractTest do
       assert Engine.healthcheck("addon_local_x", opts) == {:ok, :healthy}
     end
 
+    test "an unhealthy run's follow-up inspect skips rather than queue behind ops" do
+      fake =
+        FakePodman.start([
+          {"healthcheck run *", [{1, "unhealthy\n", delay_ms: 2_000}]},
+          {"container inspect *", [{0, Leg.inspect_out(Leg.running_json())}]}
+        ])
+
+      host = FakePodman.start_host(fake.bin, permits: %{pull: 1, ops: 1, shutdown: 1})
+      opts = [engine: Engine.Podman, host: host, podman_bin: fake.bin, timeout_ms: 20_000]
+      started = System.monotonic_time(:millisecond)
+      check = Task.async(fn -> Engine.healthcheck("addon_local_x", opts) end)
+
+      Enum.find(1..1_000, fn _ ->
+        Enum.any?(FakePodman.calls(fake), &("healthcheck" in &1)) or (Process.sleep(5) && false)
+      end) || flunk("the check never ran")
+
+      # Queued behind the run, so it is handed the ops permit the run frees.
+      holder = Task.async(fn -> Vagus.Runtime.Host.checkout(host, :ops, 30_000) end)
+      await_waiter(host)
+
+      assert Task.await(check, 30_000) == {:error, :busy}
+      assert System.monotonic_time(:millisecond) - started < 10_000
+      refute Enum.any?(FakePodman.calls(fake), &("inspect" in &1))
+      assert {:ok, _permit} = Task.await(holder)
+    end
+
+    test "podman? names the engine a call would use" do
+      assert Engine.podman?(engine: Engine.Podman)
+      refute Engine.podman?(engine: Vagus.Runtime.Engine.Docker)
+      refute Engine.podman?()
+    end
+
     test "podman schedules no healthchecks; Docker does" do
       refute Engine.schedules_healthchecks?(engine: Engine.Podman)
       assert Engine.schedules_healthchecks?(engine: Vagus.Runtime.Engine.Docker)
@@ -904,14 +950,30 @@ defmodule Vagus.Runtime.Engine.PodmanContractTest do
 
       assert_receive :held, 5_000
 
+      # The command gets its grace plus the margin (1.5 s here), not what
+      # `timeout_ms` left after the wait, and no more than that either.
       stop =
         Task.async(fn ->
-          Engine.stop("addon_local_x", [timeout_ms: 300, timeout_s: 0] ++ opts)
+          Engine.stop(
+            "addon_local_x",
+            [timeout_ms: 300, timeout_s: 0, stop_margin_ms: 1_500] ++ opts
+          )
         end)
 
       await_waiter(host)
       send(holder, :release)
       assert Task.await(stop, 30_000) == :ok
+    end
+
+    test "a stop past its grace and margin is cut off" do
+      fake = FakePodman.start([{"stop *", [{0, "addon_local_x\n", delay_ms: 5_000}]}])
+      host = FakePodman.start_host(fake.bin)
+      opts = [engine: Engine.Podman, host: host, podman_bin: fake.bin]
+
+      assert Engine.stop(
+               "addon_local_x",
+               [timeout_ms: 100, timeout_s: 0, stop_margin_ms: 1_000] ++ opts
+             ) == {:error, :timeout}
     end
 
     test "create refuses a port key that could name a host port, without podman" do
@@ -992,9 +1054,15 @@ defmodule Vagus.Runtime.Engine.PodmanContractTest do
 
   test "the readiness of a Host still preparing is :unavailable" do
     fake = FakePodman.start([])
+    test_pid = self()
 
-    host =
-      FakePodman.start_host(fake.bin, await: false, probe: fn _ -> Process.sleep(:infinity) end)
+    # Answers once the test is over, so the probe task ends with it.
+    probe = fn _opts ->
+      ref = Process.monitor(test_pid)
+      receive do: ({:DOWN, ^ref, :process, _pid, _reason} -> {:error, :gone})
+    end
+
+    host = FakePodman.start_host(fake.bin, await: false, probe: probe)
 
     assert Engine.ready(engine: Engine.Podman, host: host) == {:error, :unavailable}
   end

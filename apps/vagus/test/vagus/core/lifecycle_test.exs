@@ -171,6 +171,30 @@ defmodule Vagus.Core.LifecycleTest do
     end
   end
 
+  describe "stops/0 and start/1's :stops_seen" do
+    test "a stop counts, and a start that saw an earlier count is refused under the lock" do
+      {fake, opts} = engine(core("2026.7.0", :running), ["2026.7.0"])
+      opts = opts ++ [versions: start_versions("2026.7.0"), health: health_fun()]
+      seen = Lifecycle.stops()
+
+      assert :ok = Lifecycle.stop(opts)
+      assert Lifecycle.stops() == seen + 1
+
+      assert {:error, :stopped} = Lifecycle.start([stops_seen: seen] ++ opts)
+      assert List.last(verbs(fake)) == :stop
+
+      assert :ok = Lifecycle.start([stops_seen: seen + 1] ++ opts)
+      assert List.last(verbs(fake)) == :start
+    end
+
+    test "a stop that fails does not count" do
+      {_fake, opts} = engine()
+      seen = Lifecycle.stops()
+      assert {:error, :not_found} = Lifecycle.stop(opts)
+      assert Lifecycle.stops() == seen
+    end
+  end
+
   describe "image_present?/2 and pull/2" do
     test "ask about and pull the given version's image, touching no container or version" do
       {fake, opts} = engine(nil, ["2026.7.0"])

@@ -1047,13 +1047,17 @@ defmodule Vagus.App.ServerTest do
     end
 
     test "is off with the watchdog off, and never runs while an operation does" do
+      app_deadlines(%{probe: 600_000, probe_deadline: 600_000})
       {_slug, pid} = started(@watched)
-      refute_receive {:probe, _, _, _}, 200
+      refute :probe in timers(pid)
 
       :ok = :gen_statem.call(pid, {:set, [watchdog: true]})
+      assert :probe in timers(pid)
+
       _stop = op(pid, {:stop, %{}})
       step(:stop)
-      refute_receive {:probe, _, _, _}, 200
+      refute :probe in timers(pid)
+      assert %{probe: nil} = data(pid)
     end
   end
 
@@ -1073,11 +1077,29 @@ defmodule Vagus.App.ServerTest do
     test "runs before the token is minted and the start is asked" do
       {_slug, pid} = installed()
       t = op(pid, {:start, %{}})
-      answer(:ensure_image, {:ok, "x/y:1"})
+      {input, task} = step(:ensure_image)
+      refute Map.has_key?(input, :token)
+      assert %{token: nil, token_hash: nil} = data(pid)
+      refute_received {:step, :start, _, _}
+
+      send(task, {:outcome, {:ok, "x/y:1"}})
       input = answer(:start, {:ok, @started})
       assert is_binary(input.token)
       assert :ok = Task.await(t)
       assert %{container_id: "c1", wanted: :started} = data(pid)
+    end
+
+    test "an app wanted started tries a failed pull again, whatever its watchdog" do
+      app_deadlines(%{retry: 1})
+      {_slug, pid} = installed(%{}, state: :started, watchdog: false)
+      t = op(pid, {:start, %{}})
+      answer(:ensure_image, {:error, {:pull, :timeout}})
+      assert {:error, {:pull, :timeout}} = Task.await(t)
+
+      answer(:ensure_image, {:ok, "x/y:1"})
+      answer(:start, {:ok, @started})
+      assert_eventually_idle(pid)
+      assert %{container_id: "c1", image_attempt: 0} = data(pid)
     end
 
     test "a failed pull fails the start as a failed start does" do
@@ -1189,6 +1211,38 @@ defmodule Vagus.App.ServerTest do
       {_slug, pid} = started()
       refute :healthcheck in timers(pid)
       assert %{health_check: nil, health: nil} = data(pid)
+    end
+
+    # The URL watchdog's verdict is the app's; the container's own passing
+    # check, repeated every interval, must not clear it.
+    test "an app the URL probe failed stays in error through passing container checks",
+         %{fake: fake} do
+      {slug, pid, blocked} = checked_start(fake)
+      blocked = answer_check(fake, blocked, :healthy)
+
+      :sys.replace_state(pid, fn {state, data} ->
+        {state, %{data | last_event: {:failed, :unhealthy}}}
+      end)
+
+      blocked = answer_check(fake, blocked, :healthy)
+      answer_check(fake, blocked, :healthy)
+      assert %{last_event: {:failed, :unhealthy}} = data(pid)
+      assert {:ok, %{state: :error}} = App.info(slug)
+    end
+
+    test "a container that dies kills the check in flight, whose verdict never lands",
+         %{fake: fake} do
+      {_slug, pid, blocked} = checked_start(fake)
+      monitor = Process.monitor(blocked)
+      %{health: {^blocked, ref, "c1"}} = data(pid)
+
+      send(pid, {:engine_event, %Event{action: :die, id: "c1", exit_code: 3}})
+      assert_receive {:DOWN, ^monitor, :process, ^blocked, :killed}, 2_000
+
+      send(pid, {:health, ref, {:ok, :healthy}})
+      assert %{health: nil, last_event: {:exited, 3}} = data(pid)
+      refute :healthcheck in timers(pid)
+      refute :health_deadline in timers(pid)
     end
 
     test "stops when the app stops, and a check in flight is killed", %{fake: fake} do
@@ -1437,6 +1491,21 @@ defmodule Vagus.App.ServerTest do
 
     assert_receive :held
     holder
+  end
+
+  # The retry's start is a call-less op: it is over once the process is
+  # idle again.
+  defp assert_eventually_idle(pid, deadline \\ System.monotonic_time(:millisecond) + 2_000) do
+    cond do
+      state(pid) == :idle ->
+        :ok
+
+      System.monotonic_time(:millisecond) > deadline ->
+        flunk("never idle: #{inspect(state(pid))}")
+
+      true ->
+        assert_eventually_idle(pid, deadline)
+    end
   end
 
   defp gone?(key, deadline \\ System.monotonic_time(:millisecond) + 1_000) do

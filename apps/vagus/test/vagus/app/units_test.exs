@@ -59,16 +59,33 @@ defmodule Vagus.App.UnitsTest do
       assert is_function(Units.all().stop_containers, 2)
     end
 
-    test "stops the group's containers in one engine call, with the halt grace, within the budget" do
+    test "stops the group's containers in one engine call, its grace fitting the budget" do
       fake = Vagus.Runtime.Engine.Fake.start()
       opts = [engine: Vagus.Runtime.Engine.Fake, fake: fake]
       Vagus.Runtime.Engine.Fake.put_container(fake, "addon_a")
       Vagus.Runtime.Engine.Fake.put_container(fake, "addon_b")
 
       assert {:ok, ["addon_a", "addon_b"], []} = Units.stop_containers(["a", "b"], 33_000, opts)
-      assert Vagus.Runtime.Engine.Fake.calls(fake) == [{:stop_all, [["addon_a", "addon_b"], 30]}]
+      assert Vagus.Runtime.Engine.Fake.calls(fake) == [{:stop_all, [["addon_a", "addon_b"], 18]}]
       assert [{:stop_all, call_opts}] = Vagus.Runtime.Engine.Fake.call_opts(fake)
       assert call_opts[:timeout_ms] == 33_000
+    end
+
+    # podman gives a stop its grace plus its kill margin, whatever the
+    # deadline: the grace is what is left of the budget after that margin.
+    test "the grace plus podman's margin never outlasts the budget" do
+      for budget <- [0, 1_000, 14_999, 15_000, 16_000, 33_000, 45_000, 60_000, 120_000] do
+        grace = Units.grace_s(budget)
+        {_args, floor} = Vagus.Runtime.Engine.Podman.grace(timeout_s: grace)
+        assert grace >= 0
+        assert grace <= Vagus.App.Steps.halt_timeout_s()
+        assert floor <= max(budget, Vagus.Runtime.Engine.Podman.stop_margin_ms())
+      end
+
+      assert Units.grace_s(33_000) == 18
+      assert Units.grace_s(45_000) == 30
+      assert Units.grace_s(120_000) == 30
+      assert Units.grace_s(10_000) == 0
     end
   end
 

@@ -130,6 +130,10 @@ defmodule Vagus.Runtime.Engine do
   @spec event_source(keyword()) :: module()
   def event_source(opts \\ []), do: impl(opts).event_source()
 
+  @doc "Whether the engine in use (`opts[:engine]`, else the configured one) is podman."
+  @spec podman?(keyword()) :: boolean()
+  def podman?(opts \\ []), do: impl(opts) == Vagus.Runtime.Engine.Podman
+
   @spec schedules_healthchecks?(keyword()) :: boolean()
   def schedules_healthchecks?(opts \\ []) do
     impl = impl(opts)

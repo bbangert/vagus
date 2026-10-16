@@ -351,7 +351,7 @@ defmodule Vagus.App.PolicyTest do
 
     test "no tick without a check of the app's own" do
       assert Policy.health_check({:ok, :healthy}, running(%{last_event: {:running, true}})) ==
-               {running(%{last_event: :healthy}), [{:emit, :started}]}
+               {running(%{last_event: :healthy, last_health: :healthy}), [{:emit, :started}]}
     end
 
     test "a start whose engine leaves checks to the app arms the first tick" do
@@ -381,6 +381,143 @@ defmodule Vagus.App.PolicyTest do
 
       {_data, effects} = begin(:stop, %{}, running())
       refute {:cancel, :healthcheck} in effects
+    end
+  end
+
+  describe "health beside the URL probe and a dead container" do
+    @check %{first_ms: 40_000, interval_ms: 30_000, engine_opts: []}
+
+    defp probe_failed(extra) do
+      data = running(Map.merge(%{watchdog: false, health_check: @check}, extra))
+      {data, _} = Policy.strike(:unhealthy, data)
+      {data, _} = Policy.strike(:unhealthy, data)
+      assert data.last_event == {:failed, :unhealthy}
+      data
+    end
+
+    test "a passing container check never clears the URL probe's failure" do
+      for last_health <- [nil, :healthy, :unhealthy] do
+        data = probe_failed(%{last_health: last_health})
+
+        {after_check, _} = Policy.health_check({:ok, :healthy}, data)
+        assert Policy.derive(:idle, after_check) == :error
+
+        event = %Event{action: :health, health: :healthy, id: "c1"}
+        {after_event, effects} = Policy.on_event(event, data)
+        assert Policy.derive(:idle, after_event) == :error
+        refute Enum.any?(effects, &match?({:emit, _}, &1))
+      end
+    end
+
+    test "a container check still runs while the probe reports the app failed" do
+      data = probe_failed(%{last_health: :healthy})
+      {_data, effects} = Policy.health_check({:ok, :healthy}, data)
+      assert {:timer, :healthcheck, 30_000, {:healthcheck, "c1"}} in effects
+    end
+
+    test "unhealthy, then the container replaced, then unhealthy again acts again" do
+      data = running(%{health_check: @check, last_event: :healthy, last_health: :healthy})
+      unhealthy = &%Event{action: :health, health: :unhealthy, id: &1}
+
+      {data, effects} = Policy.on_event(unhealthy.("c1"), data)
+      assert {:timer, :retry, 0, {:retry, "c1"}} in effects
+
+      {data, _} = begin(:start, %{retry: true}, data)
+      {data, _} = step(data, {:ok, %{container_id: "c2", ip: @ip, healthcheck: true}})
+      assert %{container_id: "c2", last_health: nil} = data
+
+      {data, effects} = Policy.on_event(unhealthy.("c2"), data)
+      assert {:timer, :retry, 10_000, {:retry, "c2"}} in effects
+      assert data.attempt == 2
+    end
+
+    test "a late verdict about a container that died changes nothing and arms no tick" do
+      data = running(%{health_check: @check, last_health: :healthy, last_event: :healthy})
+      {dead, effects} = Policy.on_event(%Event{action: :die, id: "c1", exit_code: 3}, data)
+      assert {:cancel, :healthcheck} in effects
+      assert dead.last_health == nil
+
+      for result <- [{:ok, :healthy}, {:ok, :unhealthy}, :skip] do
+        assert Policy.health_check(result, dead) == {dead, []}
+      end
+
+      assert Policy.health_timer(dead, :interval_ms) == []
+      assert Policy.health_timer(%{dead | container_id: nil}, :interval_ms) == []
+    end
+  end
+
+  describe "an image the start could not get" do
+    defp image_failure(data, reason) do
+      plan = Policy.plan(:start, %{retry: true}, data)
+      {data, [{:step, {:ensure_image, nil}}]} = Policy.next(plan, :begin, data)
+      Policy.next(data.run, {:error, {:pull, reason}}, data)
+    end
+
+    defp retry_timers(effects), do: for({:timer, :retry, ms, _} <- effects, do: ms)
+
+    test "is retried on a backoff whatever the watchdog, until it is there" do
+      data = app(%{wanted: :started, watchdog: false})
+
+      {data, waits} =
+        Enum.reduce(1..8, {data, []}, fn _, {data, waits} ->
+          {data, effects} = image_failure(data, :timeout)
+          {data, waits ++ retry_timers(effects)}
+        end)
+
+      assert waits == [
+               30_000,
+               60_000,
+               120_000,
+               240_000,
+               480_000,
+               960_000,
+               1_800_000,
+               1_800_000
+             ]
+
+      assert data.attempt == 0
+
+      plan = Policy.plan(:start, %{retry: true}, data)
+      {data, _} = Policy.next(plan, :begin, data)
+      {data, _} = Policy.next(data.run, {:ok, "x/y:1"}, data)
+      assert data.image_attempt == 0
+    end
+
+    test "from a boot start too, and after a pull that died at its deadline" do
+      data = app(%{wanted: :started, watchdog: false})
+      plan = Policy.plan(:start, %{}, data)
+      {data, _} = Policy.next(plan, :begin, data)
+      {data, effects} = Policy.next(data.run, {:error, :timeout}, data)
+      assert List.last(effects) == {:step, {:stop, :by_name}}
+
+      {data, effects} = Policy.next(data.run, {:ok, %{was_running: false}}, data)
+      assert retry_timers(effects) == [30_000]
+      assert Policy.derive(:idle, data) == :error
+    end
+
+    test "a registry that says the image is not there ends after three tries, the error showing" do
+      data = app(%{wanted: :started, watchdog: true})
+      refused = {:pull_failed, "manifest unknown"}
+
+      {data, waits} =
+        Enum.reduce(1..5, {data, []}, fn _, {data, waits} ->
+          {data, effects} = image_failure(data, refused)
+          {data, waits ++ retry_timers(effects)}
+        end)
+
+      assert waits == [30_000, 60_000, 120_000]
+      assert data.last_event == {:failed, {:pull, refused}}
+      assert Policy.derive(:idle, data) == :error
+    end
+
+    test "not for an app the user did not want started, nor during a shutdown" do
+      for data <- [
+            app(%{wanted: :stopped, watchdog: true}),
+            app(%{wanted: :started, shutting_down: true})
+          ] do
+        {_data, effects} = image_failure(data, :timeout)
+        assert retry_timers(effects) == []
+      end
     end
   end
 

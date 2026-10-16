@@ -130,6 +130,10 @@ defmodule Vagus.App.Policy do
   # The ladder resets once a restart stays up, not when it merely starts, or a
   # container that dies a second after each start never runs out.
   @settled_ms 120_000
+  @image_retry_ms 30_000
+  @image_retry_cap_ms 1_800_000
+  @refused_image_attempts 3
+  @image_refused ~r/manifest unknown|not found|unauthorized|denied|does not exist/i
 
   @deadlines %{
     pull: 1_800_000,
@@ -177,6 +181,8 @@ defmodule Vagus.App.Policy do
       token_hash: nil,
       broker_pid: nil,
       health_check: nil,
+      last_health: nil,
+      image_attempt: 0,
       last_event: nil,
       attempt: 0,
       strikes: 0,
@@ -248,7 +254,7 @@ defmodule Vagus.App.Policy do
 
   defp container_event(%{action: :start, id: id}, %{container_id: nil} = data)
        when is_binary(id),
-       do: observe(%{data | container_id: id}, {:running, false}, [])
+       do: observe(%{data | container_id: id, last_health: nil}, {:running, false}, [])
 
   defp container_event(%{id: id}, %{container_id: current} = data) when id != current,
     do: {data, []}
@@ -256,23 +262,32 @@ defmodule Vagus.App.Policy do
   defp container_event(%{action: :die} = event, data),
     do: died(data, {:exited, event.exit_code})
 
-  # Only a change of health is an event: podman reports every check, and the
-  # app process's own checks repeat the verdict the engine's event carried.
-  defp container_event(%{action: :health, health: health}, %{last_event: health} = data),
+  # The container's own verdict is kept apart from `last_event`, and only a
+  # change of it is an event: podman reports every check, and the app
+  # process's own checks repeat what the engine's event carried. A passing
+  # container check says nothing about the URL the watchdog probes, so it
+  # never clears that probe's failure.
+  defp container_event(%{action: :health, health: health}, %{last_health: health} = data),
     do: {data, []}
 
+  defp container_event(
+         %{action: :health, health: :healthy},
+         %{last_event: {:failed, :unhealthy}} = data
+       ),
+       do: {%{data | last_health: :healthy}, []}
+
   defp container_event(%{action: :health, health: :healthy}, data),
-    do: observe(data, :healthy, [])
+    do: observe(%{data | last_health: :healthy}, :healthy, [])
 
   defp container_event(%{action: :health, health: :unhealthy}, data) do
-    {data, effects} = observe(data, :unhealthy, [])
+    {data, effects} = observe(%{data | last_health: :unhealthy}, :unhealthy, [])
     retry(data, effects)
   end
 
   defp container_event(_event, data), do: {data, []}
 
   defp died(data, event) do
-    {data, effects} = drop_run_keys(data)
+    {data, effects} = drop_run_keys(%{data | last_health: nil})
     effects = effects ++ [{:cancel, :probe}, {:cancel, :settled}] ++ cancel_health(data)
     {data, effects} = observe(data, event, effects)
 
@@ -353,21 +368,40 @@ defmodule Vagus.App.Policy do
   waits for the next tick. None is armed once a shutdown is in flight.
   """
   @spec health_check({:ok, atom()} | {:error, term()} | :skip, map()) :: {map(), [effect()]}
-  def health_check({:ok, health}, %{container_id: id} = data)
-      when health in [:healthy, :unhealthy] and id != nil do
-    {data, effects} = on_event(%{action: :health, id: id, health: health}, data)
-    {data, effects ++ health_timer(data, :interval_ms)}
+  def health_check(result, data) do
+    cond do
+      not alive?(data) ->
+        {data, []}
+
+      match?({:ok, health} when health in [:healthy, :unhealthy], result) ->
+        {:ok, health} = result
+        event = %{action: :health, id: data.container_id, health: health}
+        {data, effects} = on_event(event, data)
+        {data, effects ++ health_timer(data, :interval_ms)}
+
+      true ->
+        {data, health_timer(data, :interval_ms)}
+    end
   end
 
-  def health_check(_skipped, data), do: {data, health_timer(data, :interval_ms)}
-
-  @doc "The next healthcheck tick, or none: `[]` when the app runs no checks of its own."
+  @doc """
+  The next healthcheck tick, or none: `[]` when the app runs no checks of
+  its own, or its container is not up.
+  """
   @spec health_timer(map(), :first_ms | :interval_ms) :: [effect()]
-  def health_timer(%{health_check: %{} = check, container_id: id, shutting_down: false}, which)
-      when id != nil,
-      do: [{:timer, :healthcheck, Map.fetch!(check, which), {:healthcheck, id}}]
+  def health_timer(%{health_check: %{} = check, shutting_down: false} = data, which) do
+    if alive?(data),
+      do: [{:timer, :healthcheck, Map.fetch!(check, which), {:healthcheck, data.container_id}}],
+      else: []
+  end
 
   def health_timer(_data, _which), do: []
+
+  # A container the URL probe failed still runs.
+  defp alive?(%{container_id: id, last_event: event}) when id != nil,
+    do: from_event(event) in [:startup, :started] or event == {:failed, :unhealthy}
+
+  defp alive?(_data), do: false
 
   @doc """
   Whether a command is taken in this state. Only `halt` pre-empts an
@@ -579,7 +613,8 @@ defmodule Vagus.App.Policy do
   end
 
   # The image is checked before every create, not only at install: an engine
-  # whose store is reset (podman's after a migration) has none.
+  # whose store is reset (podman's after a migration) has none. Under Docker
+  # the image is there, and the check costs one image inspect per start.
   defp start_steps, do: [{:port?, nil}, {:ensure_image, nil}, {:mint_token, nil}, {:start, nil}]
 
   defp hook(%{config: config}, :pre) when is_binary(config.backup_pre), do: [{:exec_hook, :pre}]
@@ -757,12 +792,14 @@ defmodule Vagus.App.Policy do
     do: fail(put_acc(release(data), :cleaned, true), data.run.acc.cause, [])
 
   defp on_outcome(_op, :pull, _, {:ok, _ref}, data), do: advance(data, [])
-  defp on_outcome(_op, :ensure_image, _, {:ok, _ref}, data), do: advance(data, [])
 
-  # A start that cannot get its image fails as a start does, rollback and
-  # restart ladder included.
-  defp on_outcome(op, :ensure_image, arg, {:error, _reason} = outcome, data),
-    do: on_outcome(op, :start, arg, outcome, data)
+  defp on_outcome(_op, :ensure_image, _, {:ok, _ref}, data),
+    do: advance(%{data | image_attempt: 0}, [])
+
+  # A start that cannot get its image fails as a start does, rollback
+  # included, then comes back on `image_retry/2` rather than the crash ladder.
+  defp on_outcome(op, :ensure_image, arg, {:error, reason} = outcome, data),
+    do: on_outcome(op, :start, arg, outcome, put_acc(data, :image_failed, reason))
 
   defp on_outcome(:install, :pull, _, {:error, reason}, data), do: fail(data, reason, [])
   defp on_outcome(:update, :pull, _, {:error, reason}, data), do: fail(data, {:pull, reason}, [])
@@ -901,6 +938,7 @@ defmodule Vagus.App.Policy do
         ip: fact[:ip],
         broker_pid: fact[:pid],
         health_check: fact[:health_check],
+        last_health: nil,
         wanted: wanted,
         attempt: attempt,
         strikes: 0,
@@ -951,10 +989,39 @@ defmodule Vagus.App.Policy do
 
   defp close(%{run: run} = data, reply, effects) do
     {data, retry} =
-      if run.args[:retry] || run.acc[:cleaned], do: retry(data, []), else: {data, []}
+      cond do
+        Map.has_key?(run.acc, :image_failed) -> image_retry(data, run.acc.image_failed)
+        run.args[:retry] || run.acc[:cleaned] -> retry(data, [])
+        true -> {data, []}
+      end
 
     {data, effects ++ [:persist, {:reply, reply}] ++ retry ++ [:idle]}
   end
+
+  # An app that should run and could not get its image tries again whatever
+  # its watchdog flag: on the first boot after a store reset the engine is
+  # up before the internet, and a pull also waits out Core's on the one pull
+  # permit. 30 s doubling to 30 min, for as long as it is wanted started. A
+  # registry that answered that the image is not there or not ours has
+  # nothing to wait for, so that ends after a few tries and the app shows
+  # the error.
+  defp image_retry(data, reason) do
+    if data.wanted == :started and not data.shutting_down and
+         data.image_attempt < image_attempts(reason) do
+      ms = min(@image_retry_ms * 2 ** min(data.image_attempt, 6), @image_retry_cap_ms)
+      timer = {:timer, :retry, ms, {:retry, data.container_id}}
+      {%{data | image_attempt: data.image_attempt + 1}, [timer]}
+    else
+      {data, []}
+    end
+  end
+
+  defp image_attempts({:pull, {:pull_failed, detail}}) when is_binary(detail) do
+    if Regex.match?(@image_refused, detail), do: @refused_image_attempts, else: :infinity
+  end
+
+  defp image_attempts({:pull, :not_found}), do: @refused_image_attempts
+  defp image_attempts(_transient), do: :infinity
 
   defp put_steps(data, steps), do: put_in(data.run.steps, steps)
   defp put_acc(data, key, value), do: put_in(data.run.acc[key], value)

@@ -728,9 +728,14 @@ defmodule Vagus.App.StepsTest do
       assert Fake.calls(fake) == [{:image_present?, [@image]}]
     end
 
+    # FakeBackend reports a pull as `{:pull, spec}`, and the engine logs any
+    # call: neither the backend nor the engine is asked.
     test "a backend with no image concept has nothing to fetch", ctx do
-      assert {:ok, _image} = Steps.run(:ensure_image, input(ctx))
+      {fake, engine_opts} = engine(%{})
+
+      assert {:ok, _image} = Steps.run(:ensure_image, input(ctx, %{engine_opts: engine_opts}))
       refute_received {:pull, _spec}
+      assert Fake.calls(fake) == []
     end
 
     test "a missing image is pulled, then the start creates from it", ctx do

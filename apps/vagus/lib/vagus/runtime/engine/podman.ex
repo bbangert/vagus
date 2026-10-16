@@ -101,6 +101,13 @@ defmodule Vagus.Runtime.Engine.Podman do
   @impl true
   def schedules_healthchecks?(_opts), do: false
 
+  @doc """
+  The stop margin `grace/1` adds to a stop's grace: podman SIGKILLs only once
+  the grace is spent, so the command needs that long past it.
+  """
+  @spec stop_margin_ms() :: pos_integer()
+  def stop_margin_ms, do: @stop_margin_ms
+
   @impl true
   def ready(opts) do
     case Host.ready(opts[:host]) do
@@ -274,20 +281,25 @@ defmodule Vagus.Runtime.Engine.Podman do
     opts = with_deadline(opts, @lifecycle_ms)
 
     with :ok <- valid_name(:remove, name) do
-      # The log is named for the container; a caller holding only its id
-      # (Steps, after a failed start) needs the name looked up first.
-      log_name = if id?(name), do: name_of(name, opts), else: name
+      # The log and the CPU sample are keyed by the container's name; a
+      # caller holding only its id (Steps, after a failed start) needs the
+      # name looked up first.
+      named = if id?(name), do: name_of(name, opts), else: name
 
       case unit(:remove, run(:remove, args, opts, @lifecycle_ms)) do
         result when result in [:ok, {:error, :not_found}] ->
-          Host.forget_sample(opts[:host], name)
-          if log_name, do: remove_log(Host.log_config(opts[:host]).dir, log_name)
+          if named, do: forget(named, opts[:host])
           :ok
 
         other ->
           other
       end
     end
+  end
+
+  defp forget(name, host) do
+    Host.forget_sample(host, name)
+    remove_log(Host.log_config(host).dir, name)
   end
 
   # conmon appends to a log file it finds, so a container recreated under
@@ -438,9 +450,13 @@ defmodule Vagus.Runtime.Engine.Podman do
   @doc """
   Runs the check once. A pass is `:healthy`; otherwise the verdict is the
   stored `Health.Status`, because `healthcheck run` reports this one probe
-  while the status honours the start period and the retry count. Its
-  `:health` permit never queues: with no `:ops` permit free, or during a
-  shutdown, the check is `{:error, :busy}` and the caller skips that tick.
+  while the status honours the start period and the retry count.
+
+  The run and an unhealthy run's follow-up inspect each take a `:health`
+  permit (an `:ops` permit that never queues), so a busy board skips the
+  tick. With none free the result is `{:error, :busy}`. During a shutdown
+  the Host refuses the permit with `:shutting_down`, which this adapter
+  reports as `{:error, :busy}`, as it does a refused pull.
   """
   @impl true
   def healthcheck(name, opts) do
@@ -457,7 +473,7 @@ defmodule Vagus.Runtime.Engine.Podman do
         {:ok, :healthy}
 
       {:exit, 1, _} ->
-        case inspect(name, opts) do
+        case inspect(name, Keyword.put(opts, :class, :health)) do
           {:ok, %Container{health: nil}} -> {:error, :no_healthcheck}
           {:ok, %Container{health: health}} -> {:ok, health}
           {:error, {:failed, :inspect, detail}} -> {:error, {:failed, :healthcheck, detail}}

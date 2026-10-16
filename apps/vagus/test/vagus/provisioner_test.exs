@@ -383,6 +383,71 @@ defmodule Vagus.ProvisionerTest do
     assert log =~ "Core image pull failed ({:pull, :timeout}) — retrying in 1ms"
   end
 
+  test "a stop of Core since provisioning began ends the start retries: nothing undoes it" do
+    parent = self()
+    stops = :atomics.new(1, [])
+
+    log =
+      capture_log(fn ->
+        pid =
+          start_supervised!({Provisioner,
+           steps: [:provision_core],
+           installed: fn -> nil end,
+           ping: fn -> :ok end,
+           connection: fn -> :internet end,
+           update: fn -> {:ok, "2026.7.3"} end,
+           stops: fn ->
+             count = :atomics.get(stops, 1)
+             send(parent, {:stops_read, count})
+             count
+           end,
+           start: fn stops_seen ->
+             send(parent, {:start, stops_seen})
+             # The user's POST /core/stop lands while this start fails.
+             :atomics.put(stops, 1, 1)
+             {:error, :busy}
+           end,
+           retry_base: 1,
+           name: nil})
+
+        assert_receive {:start, 0}, 1_000
+        # The retry's own read sees the stop, and goes no further.
+        assert_receive {:stops_read, 1}, 1_000
+        :sys.get_state(pid)
+        refute_received {:start, _}
+      end)
+
+    assert log =~ "Core was stopped since provisioning began — not starting it"
+  end
+
+  test "a start of ours that a stop overtakes is Lifecycle's :stopped, and not retried" do
+    parent = self()
+
+    log =
+      capture_log(fn ->
+        pid =
+          start_supervised!(
+            {Provisioner,
+             steps: [:provision_core],
+             installed: fn -> nil end,
+             ping: fn -> :ok end,
+             connection: fn -> :internet end,
+             update: fn -> {:ok, "2026.7.3"} end,
+             stops: fn -> 0 end,
+             start: fn _seen -> send(parent, :start) && {:error, :stopped} end,
+             retry_base: 1,
+             name: nil}
+          )
+
+        assert_receive :start, 1_000
+        :sys.get_state(pid)
+        refute_received :start
+      end)
+
+    assert log =~ "not starting it"
+    refute log =~ "retrying"
+  end
+
   test "a start that fails after an install is retried until it succeeds" do
     parent = self()
     starts = :counters.new(1, [])
@@ -448,24 +513,26 @@ defmodule Vagus.ProvisionerTest do
 
     log =
       capture_log(fn ->
-        start_supervised!(
-          {Provisioner,
-           steps: [:provision_core],
-           installed: fn -> nil end,
-           ping: ping,
-           connection: connection,
-           update: update,
-           start: start,
-           await_healthy: await_healthy,
-           engine_interval: 1,
-           net_interval: 1,
-           name: nil}
-        )
+        pid =
+          start_supervised!(
+            {Provisioner,
+             steps: [:provision_core],
+             installed: fn -> nil end,
+             ping: ping,
+             connection: connection,
+             update: update,
+             start: start,
+             await_healthy: await_healthy,
+             engine_interval: 1,
+             net_interval: 1,
+             name: nil}
+          )
 
         assert_receive :update_called, 1_000
         assert_receive :start_called, 1_000
         assert_receive :health_called, 1_000
-        Process.sleep(20)
+        # The handler that asked for health has logged by now.
+        :sys.get_state(pid)
       end)
 
     assert log =~ "provisioning complete"
@@ -528,18 +595,20 @@ defmodule Vagus.ProvisionerTest do
 
     log =
       capture_log(fn ->
-        start_supervised!(
-          {Provisioner,
-           steps: [:provision_core],
-           installed: fn -> nil end,
-           ping: fn -> :ok end,
-           connection: fn -> :internet end,
-           update: fn -> {:error, :version_installed} end,
-           start: start,
-           name: nil}
-        )
+        pid =
+          start_supervised!(
+            {Provisioner,
+             steps: [:provision_core],
+             installed: fn -> nil end,
+             ping: fn -> :ok end,
+             connection: fn -> :internet end,
+             update: fn -> send(parent, :update_called) && {:error, :version_installed} end,
+             start: start,
+             name: nil}
+          )
 
-        Process.sleep(20)
+        assert_receive :update_called, 1_000
+        :sys.get_state(pid)
         refute_received :start_called
       end)
 
@@ -564,12 +633,13 @@ defmodule Vagus.ProvisionerTest do
              ping: fn -> :ok end,
              connection: fn -> :internet end,
              update: fn -> {:ok, "2026.7.3"} end,
-             start: fn -> {:error, :boom} end,
+             start: fn -> send(parent, :start_called) && {:error, :boom} end,
              await_healthy: await_healthy,
              name: nil}
           )
 
-        Process.sleep(20)
+        assert_receive :start_called, 1_000
+        :sys.get_state(pid)
         refute_received :health_called
         assert Process.alive?(pid)
       end)
@@ -591,7 +661,7 @@ defmodule Vagus.ProvisionerTest do
     assert Process.alive?(pid)
   end
 
-  # --- issue #45: crash isolation ---------------------------------------
+  # --- crash isolation --------------------------------------------------
 
   test "default_cmd/2: nonexistent binary -> fake exit 127 with message, no raise, no logging" do
     bin = "vagus-test-no-such-binary-#{System.unique_integer([:positive])}"
@@ -655,7 +725,8 @@ defmodule Vagus.ProvisionerTest do
              steps: [:provision_core], installed: fn -> raise RuntimeError, "boom" end, name: nil}
           )
 
-        Process.sleep(20)
+        # The step runs in handle_continue, before any system message.
+        :sys.get_state(pid)
         assert Process.alive?(pid)
       end)
 
@@ -670,7 +741,7 @@ defmodule Vagus.ProvisionerTest do
             {Provisioner, steps: [:provision_core], installed: fn -> throw(:boom) end, name: nil}
           )
 
-        Process.sleep(20)
+        :sys.get_state(pid)
         assert Process.alive?(pid)
       end)
 

@@ -5,9 +5,6 @@ defmodule Vagus.App.Steps do
   fact is the one thing the step produced. The input is everything the step
   needs (`Vagus.App.Policy.task_input/2`), so nothing here reads app state.
 
-  The container spec (`build_spec/2`, mounts, DSP, ports, image ref,
-  platform) and backend selection are carried from the module the app
-  process replaced.
   `input[:backend]`, `input[:data_root]` and `input[:socket]` override the
   configured backend, data root and engine socket; `input[:engine_opts]`
   reaches every direct `Vagus.Runtime.Engine` call.
@@ -441,8 +438,8 @@ defmodule Vagus.App.Steps do
   # reboot or emulator restart, the previous session's container survives while
   # the in-memory add-on state does not, and `create` would 409 on the fixed
   # name. The real Supervisor's `DockerInterface.run` stops+removes any
-  # existing container before creating (§A1.4 — no restart policy, the manager
-  # owns the lifecycle), so do the same, tolerantly (absent/not-running is fine).
+  # existing container before creating (no restart policy: the manager owns
+  # the lifecycle), so do the same, tolerantly (absent/not-running is fine).
   defp remove_stale_container(spec, opts) do
     _ = backend(opts).stop(spec.name, [])
     _ = backend(opts).remove(spec.name, [])
@@ -519,7 +516,7 @@ defmodule Vagus.App.Steps do
 
   defp default_backend, do: Application.get_env(:vagus, :addon_backend, @default_backend)
 
-  # Per-add-on backend selection (M5): a `backend: native` add-on (the mqttx
+  # Per-add-on backend selection: a `backend: native` add-on (the mqttx
   # virtual add-on) routes every `backend(opts)` call site through
   # `Backend.Native` instead of the global `:addon_backend` default, while every
   # other add-on keeps the container default. `put_new` so an explicitly-injected
@@ -542,14 +539,14 @@ defmodule Vagus.App.Steps do
 
   defp maybe_ensure_network(%Config{host_network: true}, _opts), do: :ok
   # Native "virtual add-ons" have no container on the hassio bridge — nothing to
-  # attach, so don't stand the bridge up on their account (M5).
+  # attach, so don't stand the bridge up on their account.
   defp maybe_ensure_network(%Config{backend: :native}, _opts), do: :ok
 
   defp maybe_ensure_network(_config, opts) do
     case Network.ensure(engine_opts(opts)) do
       :ok ->
         # Bind the supervisor anchor (.2) to the freshly-ensured bridge so the
-        # host-networked emulator answers where the add-on reaches it (§A6).
+        # host-networked emulator answers where the add-on reaches it.
         Network.ensure_supervisor_ip()
         :ok
 

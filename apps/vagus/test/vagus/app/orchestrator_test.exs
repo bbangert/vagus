@@ -75,7 +75,7 @@ defmodule Vagus.App.OrchestratorTest do
   defp await_boot(name) do
     with %{task: %Task{pid: pid}} <- :sys.get_state(name) do
       ref = Process.monitor(pid)
-      assert_receive {:DOWN, ^ref, :process, ^pid, _reason}
+      assert_receive {:DOWN, ^ref, :process, ^pid, _reason}, 5_000
     end
 
     :sys.get_state(name)
@@ -181,7 +181,7 @@ defmodule Vagus.App.OrchestratorTest do
 
     # The unwaited start may land on either side of the push.
     unless Enum.any?(messages, &match?({:once_started, _pid}, &1)),
-      do: assert_receive({:once_started, _pid})
+      do: assert_receive({:once_started, _pid}, 5_000)
   end
 
   describe "whether a container runs" do
@@ -239,8 +239,8 @@ defmodule Vagus.App.OrchestratorTest do
 
       assert %{phase: :up} = await_boot(name)
       Orchestrator.up("late", name)
-      assert_receive {:inspected, "late"}
-      assert_receive {:boot_start, "late", true}
+      assert_receive {:inspected, "late"}, 5_000
+      assert_receive {:boot_start, "late", true}, 5_000
     end
   end
 
@@ -362,7 +362,7 @@ defmodule Vagus.App.OrchestratorTest do
     ]
 
     name = start_orchestrator(apps, %{boot_start: start}, stage_timeout: 60_000)
-    assert_receive {:svc, unit}
+    assert_receive {:svc, unit}, 5_000
     %{task: %Task{pid: boot}} = :sys.get_state(name)
     boot_ref = Process.monitor(boot)
 
@@ -371,7 +371,7 @@ defmodule Vagus.App.OrchestratorTest do
     send(unit, :release)
 
     assert Task.await(shutdown) == {{4, 4}, :ok}
-    assert_receive {:DOWN, ^boot_ref, :process, ^boot, :normal}
+    assert_receive {:DOWN, ^boot_ref, :process, ^boot, :normal}, 5_000
     messages = drain()
 
     assert [{:svc, :returned} | after_unit] =
@@ -433,6 +433,27 @@ defmodule Vagus.App.OrchestratorTest do
       assert Enum.sort([h1, h2]) == [{:halt, "app"}, {:halt, "once"}]
     end
 
+    test "slugs the group stop failed to stop are still halted, each on its own" do
+      test_pid = self()
+
+      stop_containers = fn slugs, _budget ->
+        send(test_pid, :group_stop)
+        {:ok, [], Enum.map(slugs, &{"addon_" <> &1, {:failed, :stop, "boom"}})}
+      end
+
+      name =
+        start_orchestrator(
+          [app("app", "application"), app("once", "once")],
+          %{stop_containers: stop_containers},
+          boot: false
+        )
+
+      assert Orchestrator.shutdown(name) == {{2, 2}, :ok}
+      assert_receive :group_stop, 5_000
+      assert_receive {:halt, "app"}, 5_000
+      assert_receive {:halt, "once"}, 5_000
+    end
+
     test "a group stop past its bound is cut off and the halts still run within the budget" do
       test_pid = self()
 
@@ -449,11 +470,11 @@ defmodule Vagus.App.OrchestratorTest do
         )
 
       shutdown = Task.async(fn -> Orchestrator.shutdown(name) end)
-      assert_receive {:stopping, stopper}
+      assert_receive {:stopping, stopper}, 5_000
       ref = Process.monitor(stopper)
       assert Task.await(shutdown, 5_000) == {{1, 1}, :ok}
-      assert_receive {:DOWN, ^ref, :process, ^stopper, :killed}
-      assert_receive {:halt, "app"}
+      assert_receive {:DOWN, ^ref, :process, ^stopper, :killed}, 5_000
+      assert_receive {:halt, "app"}, 5_000
     end
   end
 
@@ -470,13 +491,13 @@ defmodule Vagus.App.OrchestratorTest do
         gate_tries: 2
       )
 
-    assert_receive {:gate, :engine}
+    assert_receive {:gate, :engine}, 5_000
     %{task: %Task{pid: boot}} = :sys.get_state(name)
     boot_ref = Process.monitor(boot)
 
     shutdown = Task.async(fn -> Orchestrator.shutdown(name) end)
     assert Task.await(shutdown, 5_000) == {{1, 1}, :ok}
-    assert_receive {:DOWN, ^boot_ref, :process, ^boot, :normal}
+    assert_receive {:DOWN, ^boot_ref, :process, ^boot, :normal}, 5_000
 
     messages = drain()
     assert {:halt, "a"} in messages
@@ -517,7 +538,7 @@ defmodule Vagus.App.OrchestratorTest do
     await_boot(name)
 
     shutdown = Task.async(fn -> Orchestrator.shutdown(name) end)
-    assert_receive {:halt, unit}
+    assert_receive {:halt, unit}, 5_000
     Orchestrator.resume(name)
     assert %{resume: true} = :sys.get_state(name)
     send(unit, :release)
@@ -570,15 +591,15 @@ defmodule Vagus.App.OrchestratorTest do
       )
 
     {:ok, _caller} = Task.start(fn -> Orchestrator.shutdown(name) end)
-    assert_receive {:halt, unit}
+    assert_receive {:halt, unit}, 5_000
     pid = Process.whereis(name)
     ref = Process.monitor(pid)
     Process.exit(pid, :kill)
-    assert_receive {:DOWN, ^ref, :process, ^pid, :killed}
+    assert_receive {:DOWN, ^ref, :process, ^pid, :killed}, 5_000
 
     send(unit, :release)
-    assert_receive {:halt, :returned}
-    assert_receive :core_stop
+    assert_receive {:halt, :returned}, 5_000
+    assert_receive :core_stop, 5_000
   end
 
   test "an orchestrator started mid-shutdown does not boot, and a resume boots it" do
@@ -653,7 +674,7 @@ defmodule Vagus.App.OrchestratorTest do
 
       start_orchestrator([app("a", "application")], %{core_start: core_start}, stage_timeout: 50)
 
-      assert_receive {:core_starting, unit}
+      assert_receive {:core_starting, unit}, 5_000
       messages = collect_until(:complete)
       assert {:report, :core, [{"core", :pending}]} in messages
       assert {:boot_start, "a"} in messages
@@ -721,7 +742,7 @@ defmodule Vagus.App.OrchestratorTest do
     gates = Map.put(gates, :tree, blocking(test_pid, :tree))
 
     name = start_orchestrator([], %{gates: gates}, gate_timeout: 60_000)
-    assert_receive {:tree, _pid}
+    assert_receive {:tree, _pid}, 5_000
 
     Orchestrator.up("late", name)
     assert %{phase: :booting} = :sys.get_state(name)
@@ -734,7 +755,7 @@ defmodule Vagus.App.OrchestratorTest do
     assert %{phase: :up} = await_boot(name)
 
     Orchestrator.up("late", name)
-    assert_receive {:boot_start, "late"}
+    assert_receive {:boot_start, "late"}, 5_000
   end
 
   test "with boot off, an app reported up is given no boot rule" do
