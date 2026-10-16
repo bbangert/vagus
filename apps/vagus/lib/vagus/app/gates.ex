@@ -33,27 +33,36 @@ defmodule Vagus.App.Gates do
   Stands up the `hassio` bridge, binds the `.2`/`.3` anchors and asserts the
   DNAT that serves port 80 on `.2`. All of it is lost on reboot, and only a
   container app's start would redo it otherwise, so a device running only
-  native apps would leave Core unable to reach the Supervisor. Best effort:
-  always `:ok`, so a failure here never holds the apps back.
+  native apps would leave Core unable to reach the Supervisor. Under podman
+  the bridge is the host's own (`Vagus.Network.host_bridge?/1`), so the
+  anchors and the DNAT go on even when the engine could not make its
+  network. Best effort: always `:ok`, so a failure here never holds the apps
+  back.
   """
   @spec network() :: :ok
   def network do
     case Network.ensure() do
       :ok ->
-        Network.ensure_supervisor_ip()
-        warn_unless_ok(Nat.ensure(), "supervisor DNAT; apps may not reach http://supervisor/")
+        anchors_and_nat()
 
       {:error, reason} ->
         warn_unless_ok(
           {:error, reason},
           "hassio bridge; Core and bridged apps may not reach the Supervisor"
         )
+
+        if Network.host_bridge?(), do: anchors_and_nat()
     end
 
     # The listener's bind address exists only from here, so its next bind
     # attempt is hurried. An optimisation only: the `api` gate still decides.
     Vagus.API.Listener.retry_now()
     :ok
+  end
+
+  defp anchors_and_nat do
+    Network.ensure_supervisor_ip()
+    warn_unless_ok(Nat.ensure(), "supervisor DNAT; apps may not reach http://supervisor/")
   end
 
   @doc """

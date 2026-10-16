@@ -17,7 +17,9 @@ defmodule Vagus.Runtime.Engine.Podman do
   must be a registry reference: podman would also take `oci-archive:`,
   `dir:` and other transports, reading a host path an app's config named,
   and `create` imports such an archive even with `--pull=never`. Pulls go
-  through `docker://` so only a registry is ever contacted.
+  through `docker://` so only a registry is ever contacted. A pull of
+  Core's image waits for the pull permit ahead of the others, so a board
+  re-pulling everything (`Vagus.Runtime.Migration`) gets Core back first.
 
   Idempotence comes from flags (`--ignore`, `rm -f -t 0`) rather than
   from parsing, except where podman has none.
@@ -111,6 +113,8 @@ defmodule Vagus.Runtime.Engine.Podman do
   def pull(image, opts) do
     platform = if p = opts[:platform], do: ["--platform", p], else: []
     args = ["pull", "--quiet" | platform] ++ ["--", "docker://" <> image]
+
+    opts = Keyword.put(opts, :priority, Vagus.Core.Container.image?(image))
 
     case valid_image(:pull, image) do
       :ok ->
@@ -851,10 +855,16 @@ defmodule Vagus.Runtime.Engine.Podman do
       |> Keyword.take([:env, :cap, :truncate, :discard_stdout, :podman_bin])
       |> Keyword.put(:host, host)
 
-    Host.with_permit(host, opts[:class] || class(verb), max(deadline - now_ms(), 0), fn ->
-      left = max(deadline - now_ms(), floor)
-      args |> Cmd.run(Keyword.put(cmd_opts, :timeout_ms, left)) |> after_run.()
-    end)
+    Host.with_permit(
+      host,
+      opts[:class] || class(verb),
+      max(deadline - now_ms(), 0),
+      fn ->
+        left = max(deadline - now_ms(), floor)
+        args |> Cmd.run(Keyword.put(cmd_opts, :timeout_ms, left)) |> after_run.()
+      end,
+      priority: opts[:priority] == true
+    )
   end
 
   @doc false

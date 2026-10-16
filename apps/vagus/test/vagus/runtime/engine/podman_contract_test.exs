@@ -784,6 +784,29 @@ defmodule Vagus.Runtime.Engine.PodmanContractTest do
       assert Engine.pull("ghcr.io/vagus/x:1", opts) == {:error, :busy}
     end
 
+    test "Core's pull waits for the pull permit ahead of an app's" do
+      fake = FakePodman.start([{"pull *", [{0, "5b0e\n"}]}])
+      host = FakePodman.start_host(fake.bin)
+      opts = [engine: Engine.Podman, host: host, podman_bin: fake.bin]
+      {:ok, held} = Vagus.Runtime.Host.checkout(host, :pull, 0)
+
+      app = Task.async(fn -> Engine.pull("ghcr.io/vagus/app:1", opts) end)
+      await_waiter(host, :pull, 1)
+      core = Task.async(fn -> Engine.pull(Vagus.Core.Container.image("2026.7.3"), opts) end)
+      await_waiter(host, :pull, 2)
+
+      Vagus.Runtime.Host.checkin(held)
+      assert Task.await(core, 10_000) == :ok
+      assert Task.await(app, 10_000) == :ok
+
+      pulled = for ["pull" | args] <- FakePodman.verbs(fake), do: List.last(args)
+
+      assert pulled == [
+               "docker://ghcr.io/home-assistant/home-assistant:2026.7.3",
+               "docker://ghcr.io/vagus/app:1"
+             ]
+    end
+
     # The stop must outlast the 300 ms its permit wait may use.
     test "a stop waiting for its permit still gets its grace once granted" do
       fake = FakePodman.start([{"stop *", [{0, "addon_local_x\n", delay_ms: 1_000}]}])
@@ -856,10 +879,10 @@ defmodule Vagus.Runtime.Engine.PodmanContractTest do
     end
   end
 
-  defp await_waiter(host) do
+  defp await_waiter(host, class \\ :ops, n \\ 1) do
     Enum.find(1..1_000, fn _ ->
-      :queue.len(:sys.get_state(host).waiting.ops) == 1 or (Process.sleep(5) && false)
-    end) || flunk("the stop never queued for its permit")
+      :queue.len(:sys.get_state(host).waiting[class]) == n or (Process.sleep(5) && false)
+    end) || flunk("no #{n} #{class} waiter(s) queued")
   end
 
   describe "exec exit codes" do

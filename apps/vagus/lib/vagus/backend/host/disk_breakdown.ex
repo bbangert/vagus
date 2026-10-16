@@ -18,11 +18,10 @@ defmodule Vagus.Backend.Host.DiskBreakdown do
   Everything lives under the add-on data root (`config :vagus,
   :addon_data_root` — `/root/vagus/addons` on target): `addons/data`
   (per-add-on data), `addon_configs`, `media`, `share`, `backup`, `ssl`.
-  The `homeassistant` entry is Core's config, which for Vagus is the
-  `vagus-core-config` docker volume — resolved via the engine data root
-  (`Vagus.Engine.Manager.data_root/0`); on `:host` dev that path simply
-  doesn't exist and honestly reports 0 bytes (upstream does the same for
-  a missing dir).
+  The `homeassistant` entry is Core's config, wherever
+  `Vagus.Core.Container.config_path/0` finds it for the engine; on `:host`
+  dev that path simply doesn't exist and honestly reports 0 bytes
+  (upstream does the same for a missing dir).
 
   `total_bytes`/`used_bytes` come from `df` on the data root; used =
   total - free so reserved blocks count as used (upstream deliberately
@@ -38,7 +37,6 @@ defmodule Vagus.Backend.Host.DiskBreakdown do
 
   alias Vagus.Backend.Host.DiskUsage
   alias Vagus.Core.Container
-  alias Vagus.Engine
 
   @default_data_root "/data"
 
@@ -50,8 +48,7 @@ defmodule Vagus.Backend.Host.DiskBreakdown do
     * `:max_depth` — how many directory levels of `children` to report
       (sizes are always fully recursive), default `1`.
     * `:data_root` — default `config :vagus, :addon_data_root`.
-    * `:homeassistant_path` — default the `vagus-core-config` volume's
-      host path under the engine data root.
+    * `:homeassistant_path` — default `Vagus.Core.Container.config_path/0`.
     * `:df` — arity-1 `path -> {total_bytes, free_bytes}`, default
       `DiskUsage.usage_bytes/1`.
   """
@@ -152,7 +149,5 @@ defmodule Vagus.Backend.Host.DiskBreakdown do
     Application.get_env(:vagus, :addon_data_root, @default_data_root)
   end
 
-  defp default_homeassistant_path do
-    Path.join([Engine.Manager.data_root(), "volumes", Container.config_volume(), "_data"])
-  end
+  defp default_homeassistant_path, do: Container.config_path()
 end

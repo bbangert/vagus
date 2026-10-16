@@ -63,6 +63,7 @@ defmodule Vagus.Core.Container do
   alias Vagus.Network
   alias Vagus.Runtime.Engine
   alias Vagus.Runtime.Engine.ContainerSpec
+  alias Vagus.Runtime.Migration
 
   @image_repo "ghcr.io/home-assistant/home-assistant"
   @default_name "homeassistant"
@@ -107,25 +108,33 @@ defmodule Vagus.Core.Container do
   def spec_fingerprint_label, do: @spec_fingerprint_label
 
   @doc """
-  Host path of Core's /config — the `vagus-core-config` named volume's
-  on-disk location, the docker "local" volume driver's fixed
-  `<data_root>/volumes/<name>/_data` layout (same convention
-  `Vagus.Backend.Host.DiskBreakdown` resolves for the disk-usage
-  breakdown's `homeassistant` node). `opts[:homeassistant_path]`
-  overrides the path outright — the real
-  `<Vagus.Engine.Manager.data_root()>/volumes/...` tree only exists on
-  target, so host tests point this at a tmp dir.
+  Host path of Core's /config.
+
+  Under balena-engine, the `vagus-core-config` named volume's on-disk
+  location, the docker "local" volume driver's fixed
+  `<data_root>/volumes/<name>/_data` layout. Under podman, Core binds a host
+  directory instead (a named volume would start empty in podman's own
+  store), and `Vagus.Runtime.Migration.core_config_path/1` picks it: the
+  legacy directory until it has been moved out of balena's tree.
+  `opts[:homeassistant_path]` overrides the path outright, since host tests
+  have neither tree.
   """
   @spec config_path(keyword()) :: String.t()
   def config_path(opts \\ []) do
     Keyword.get_lazy(opts, :homeassistant_path, fn ->
-      Path.join([Vagus.Engine.Manager.data_root(), "volumes", config_volume(), "_data"])
+      if podman?(opts),
+        do: Migration.core_config_path(),
+        else: Path.join([Vagus.Engine.Manager.data_root(), "volumes", config_volume(), "_data"])
     end)
   end
 
   @doc "The Core image reference for `version`, e.g. `ghcr.io/home-assistant/home-assistant:2026.7.0`."
   @spec image(String.t()) :: String.t()
   def image(version) when is_binary(version), do: @image_repo <> ":" <> version
+
+  @doc "Whether `ref` is a Core image at some version."
+  @spec image?(String.t()) :: boolean()
+  def image?(ref) when is_binary(ref), do: String.starts_with?(ref, @image_repo <> ":")
 
   @doc """
   Builds the Engine-API `POST /containers/create` body for HA Core at
@@ -137,6 +146,9 @@ defmodule Vagus.Core.Container do
       back to Vagus with. Defaults to `Vagus.API.Token.get/0`; injectable
       so tests never touch the real persisted/on-disk token.
     * `:tz` - the `TZ` env value. Defaults to `"UTC"`.
+    * `:engine` - the engine adapter the spec is for (default
+      `config :vagus, :engine`); under podman /config is a bind of
+      `config_path/1`, which `:homeassistant_path` overrides.
   """
   @spec create_config(String.t(), keyword()) :: map()
   def create_config(version, opts \\ []) when is_binary(version),
@@ -165,7 +177,7 @@ defmodule Vagus.Core.Container do
       restart: :unless_stopped,
       extra_hosts: [{"supervisor", ip}],
       tmpfs: %{"/tmp" => ""},
-      mounts: mounts()
+      mounts: mounts(opts)
     }
 
     fingerprint = spec |> Engine.Docker.render_container() |> spec_fingerprint()
@@ -221,7 +233,12 @@ defmodule Vagus.Core.Container do
     ]
   end
 
-  defp mounts do
+  defp podman?(opts),
+    do:
+      Keyword.get_lazy(opts, :engine, fn -> Application.get_env(:vagus, :engine) end) ==
+        Engine.Podman
+
+  defp mounts(opts) do
     [
       # ro-NON-recursive: recursively read-only would also lock down
       # anything bind-mounted *under* /dev (e.g. bluetooth device nodes
@@ -238,7 +255,13 @@ defmodule Vagus.Core.Container do
       # Writable: Core creates its Supervisor socket inside this directory
       # (see the moduledoc's "The Supervisor socket" section).
       %{type: :bind, source: @socket_dir, target: @socket_dir, read_only: false},
-      %{type: :volume, source: config_volume(), target: "/config"}
+      config_mount(opts)
     ]
+  end
+
+  defp config_mount(opts) do
+    if podman?(opts),
+      do: %{type: :bind, source: config_path(opts), target: "/config", read_only: false},
+      else: %{type: :volume, source: config_volume(), target: "/config"}
   end
 end
