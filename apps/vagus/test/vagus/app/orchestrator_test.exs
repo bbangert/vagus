@@ -375,6 +375,41 @@ defmodule Vagus.App.OrchestratorTest do
       assert log =~ "still no primary interface"
     end
 
+    test "a shutdown during a put-off stage starts no later stage" do
+      test_pid = self()
+
+      start = fn
+        "init", _running? -> held(test_pid, :init).()
+        slug, _running? -> send(test_pid, {:boot_start, slug}) && :ok
+      end
+
+      apps = [app("init", "initialize"), app("app", "application")]
+
+      capture_log(fn ->
+        name =
+          start_orchestrator(
+            apps,
+            %{boot_start: start, gates: with_primary(test_pid, primary_after(test_pid, 1))},
+            stage_timeout: 60_000
+          )
+
+        assert_receive {:init, unit}, 5_000
+        assert_received :core_start
+        %{task: %Task{pid: boot}} = :sys.get_state(name)
+        boot_ref = Process.monitor(boot)
+
+        shutdown = Task.async(fn -> Orchestrator.shutdown(name) end)
+        await_phase(name, :cancelling)
+        send(unit, :release)
+
+        Task.await(shutdown)
+        assert_receive {:DOWN, ^boot_ref, :process, ^boot, :normal}, 5_000
+        messages = drain()
+        refute {:boot_start, "app"} in messages
+        refute :complete in messages
+      end)
+    end
+
     test "Core is not held while the apps wait" do
       capture_log(fn ->
         start_orchestrator(

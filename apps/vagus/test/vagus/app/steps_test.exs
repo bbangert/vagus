@@ -644,6 +644,24 @@ defmodule Vagus.App.StepsTest do
       refute_received {:nft, _}
     end
 
+    test "a native declaration outside the allowlist is a container, and is refused too", ctx do
+      declared = test_config(%{"host_network" => false, "backend" => "native"})
+      refute Steps.native?(declared)
+      {_fake, engine_opts} = engine(%{})
+      {nat_opts, answer} = nat(ctx)
+      Agent.update(answer, fn _ -> {"Error: Could not process rule\n", 1} end)
+
+      capture_log(fn ->
+        assert {:error, {:isolation_not_loaded, _}} =
+                 Steps.run(
+                   :start,
+                   input(ctx, %{config: declared, engine_opts: engine_opts, nat_opts: nat_opts})
+                 )
+      end)
+
+      refute_received {:create, _}
+    end
+
     test "a host-network app starts whatever the forward filter does", ctx do
       {nat_opts, answer} = nat(ctx)
       Agent.update(answer, fn _ -> {"Error: Could not process rule\n", 1} end)
@@ -954,6 +972,28 @@ defmodule Vagus.App.StepsTest do
       check = started_at_fact(ctx, ago(120))
       assert check.start_until == nil
       assert check.first_ms in 900_001..1_800_000
+    end
+
+    test "a start period already over waits one interval, not the period again", ctx do
+      for start_interval <- [nil, 10_000] do
+        hc = %{
+          test: ["CMD", "true"],
+          interval_ms: 30_000,
+          start_period_ms: 60_000,
+          start_interval_ms: start_interval
+        }
+
+        {_fake, engine_opts} = engine(%{"fake-id" => [healthcheck: hc, started_at: ago(120)]})
+
+        {:ok, fact} =
+          Steps.run(
+            :start,
+            input(ctx, %{engine_opts: engine_opts ++ [schedules_healthchecks: false]})
+          )
+
+        assert %{start_until: nil, first_ms: first} = fact.health_check
+        assert first in 30_001..60_000
+      end
     end
 
     test "without a start interval the first check still waits out the start period", ctx do

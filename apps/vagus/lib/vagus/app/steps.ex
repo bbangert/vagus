@@ -446,19 +446,20 @@ defmodule Vagus.App.Steps do
         positive(healthcheck[:start_interval_ms]) &&
           max(healthcheck[:start_interval_ms], @health_start_interval_floor_ms)
 
-      start_until =
-        start_interval && DateTime.add(container.started_at || now(), start_period, :millisecond)
-
-      left = if start_until, do: DateTime.diff(start_until, now(), :millisecond), else: 0
+      period_end = DateTime.add(container.started_at || now(), start_period, :millisecond)
+      # What is left of the period, so a container found long after its start
+      # (an inspect retried, an app process restarted) waits only an interval.
+      left = max(DateTime.diff(period_end, now(), :millisecond), 0)
+      quick? = start_interval != nil and left > 0
 
       %{
         first_ms:
-          if(left > 0,
+          if(quick?,
             do: min(start_interval, left),
-            else: max(start_period, interval) + :rand.uniform(interval)
+            else: max(left, interval) + :rand.uniform(interval)
           ),
         start_interval_ms: start_interval,
-        start_until: if(left > 0, do: start_until),
+        start_until: if(quick?, do: period_end),
         interval_ms: interval,
         timeout_ms:
           min(positive(healthcheck[:timeout_ms]) || @health_timeout_ms, @health_timeout_cap_ms) +
@@ -618,11 +619,15 @@ defmodule Vagus.App.Steps do
   defp put_backend(opts, %Config{}), do: opts
 
   defp maybe_ensure_network(%Config{host_network: true}, _opts), do: :ok
-  # Native "virtual add-ons" have no container on the hassio bridge — nothing to
-  # attach, so don't stand the bridge up on their account.
-  defp maybe_ensure_network(%Config{backend: :native}, _opts), do: :ok
 
-  defp maybe_ensure_network(_config, opts) do
+  # Native "virtual add-ons" have no container on the hassio bridge — nothing to
+  # attach, so don't stand the bridge up on their account. A declared
+  # `native` outside the allowlist is a container (`put_backend/2`).
+  defp maybe_ensure_network(config, opts) do
+    if native?(config), do: :ok, else: ensure_network(opts)
+  end
+
+  defp ensure_network(opts) do
     case Network.ensure(engine_opts(opts)) do
       :ok ->
         # Bind the supervisor anchor (.2) to the freshly-ensured bridge so the
@@ -641,9 +646,15 @@ defmodule Vagus.App.Steps do
   # Host-network containers are not behind the bridge's forward path, and
   # are never held back by it.
   defp ensure_isolation(%Config{host_network: true}, _opts), do: :ok
-  defp ensure_isolation(%Config{backend: :native}, _opts), do: :ok
 
-  defp ensure_isolation(_config, opts) do
+  # By `native?/1`, not the declared backend: a store app outside the
+  # allowlist that declares `native` still runs as a container
+  # (`put_backend/2`).
+  defp ensure_isolation(config, opts) do
+    if native?(config), do: :ok, else: nat_loaded(opts)
+  end
+
+  defp nat_loaded(opts) do
     case Nat.ensure_loaded(Keyword.get(opts, :nat_opts, [])) do
       :ok ->
         :ok

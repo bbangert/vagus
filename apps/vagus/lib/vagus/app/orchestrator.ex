@@ -296,7 +296,13 @@ defmodule Vagus.App.Orchestrator do
 
   defp run_put_off(put_off, running, cfg) when is_list(put_off) and put_off != [] do
     await_primary(cfg, System.monotonic_time(:millisecond) + cfg.primary_timeout)
-    Enum.reduce(put_off, running, fn step, running -> step(step, running, cfg) end)
+
+    # Step boundaries as in the main sequence: a shutdown asked for while
+    # Core or an earlier put-off stage ran must not start the next stage.
+    Enum.reduce(put_off, running, fn step, running ->
+      checkpoint(0)
+      step(step, running, cfg)
+    end)
   end
 
   defp run_put_off(_put_off, _running, _cfg), do: :ok
