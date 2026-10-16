@@ -811,6 +811,14 @@ defmodule Vagus.App.StepsTest do
       assert first in 60_001..105_000
     end
 
+    test "carries the check's declared timeout, Docker's 30 s when unset, capped at 5 min", ctx do
+      for {declared, run_ms} <- [{nil, 35_000}, {120_000, 125_000}, {900_000, 305_000}] do
+        hc = %{test: ["CMD", "true"], timeout_ms: declared}
+        {fact, _} = started_fact(ctx, hc, schedules_healthchecks: false)
+        assert fact.health_check.timeout_ms == run_ms
+      end
+    end
+
     test "takes Docker's 30 s for an unset interval, and floors a short one", ctx do
       for interval <- [nil, 0, 1_000] do
         hc = %{test: ["CMD", "true"], interval_ms: interval, start_period_ms: nil}

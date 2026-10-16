@@ -1375,6 +1375,22 @@ defmodule Vagus.App.PolicyTest do
       assert List.last(effects) == {:step, {:stop, :by_name}}
     end
 
+    test "a cold backup whose restart cannot get its image answers the snapshot, then retries" do
+      cold = running(%{config: app_config(%{"backup" => "cold"}), watchdog: false})
+      {data, _} = begin(:backup, %{staging_dir: "/s"}, cold)
+      {data, _} = step(data, {:ok, %{was_running: true}})
+      {data, [{:step, {:ensure_image, nil}}]} = Policy.next(data.run, {:ok, "/s/a.tar.gz"}, data)
+
+      {data, effects} = Policy.next(data.run, {:error, {:image_check, :timeout}}, data)
+      assert {:reply, {:ok, "/s/a.tar.gz"}} in effects
+      assert {:timer, :retry, 30_000, {:retry, nil}} in effects
+      assert data.image_attempt == 1
+
+      {data, _} = begin(:start, %{retry: true}, data)
+      {data, _} = step(data, {:ok, %{container_id: "c2", ip: @ip}})
+      assert %{container_id: "c2", wanted: :started, image_attempt: 0} = data
+    end
+
     test "backup cold of a crashed app that should run starts it, so its cancelled restart is not lost" do
       cold = app(%{config: app_config(%{"backup" => "cold"}), last_event: {:exited, 1}})
       {data, effects} = begin(:backup, %{staging_dir: "/s"}, cold)

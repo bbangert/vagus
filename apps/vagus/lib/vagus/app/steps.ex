@@ -23,6 +23,11 @@ defmodule Vagus.App.Steps do
   @default_data_root "/data"
   @halt_timeout_s 30
   @health_interval_ms 30_000
+  # Docker's default check timeout, a cap on what an image may declare, and
+  # the time podman takes around the check itself.
+  @health_timeout_ms 30_000
+  @health_timeout_cap_ms 300_000
+  @health_run_margin_ms 5_000
   @port_min 62_000
   @port_max 65_500
   @port_tries 100
@@ -427,6 +432,9 @@ defmodule Vagus.App.Steps do
       %{
         first_ms: max(start_period, interval) + :rand.uniform(interval),
         interval_ms: interval,
+        timeout_ms:
+          min(positive(healthcheck[:timeout_ms]) || @health_timeout_ms, @health_timeout_cap_ms) +
+            @health_run_margin_ms,
         engine_opts: engine_opts
       }
     end

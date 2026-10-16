@@ -844,6 +844,17 @@ defmodule Vagus.Runtime.Engine.PodmanContractTest do
       assert {:ok, _permit} = Task.await(holder)
     end
 
+    # The app process passes the image's declared timeout; podman's 35 s is
+    # only the default.
+    test "a healthcheck runs for the timeout_ms it is given, not a fixed deadline" do
+      fake = FakePodman.start([{"healthcheck run *", [{0, "", delay_ms: 1_000}]}])
+      host = FakePodman.start_host(fake.bin)
+      opts = [engine: Engine.Podman, host: host, podman_bin: fake.bin]
+
+      assert Engine.healthcheck("addon_local_x", [timeout_ms: 300] ++ opts) == {:error, :timeout}
+      assert Engine.healthcheck("addon_local_x", [timeout_ms: 10_000] ++ opts) == {:ok, :healthy}
+    end
+
     test "podman? names the engine a call would use" do
       assert Engine.podman?(engine: Engine.Podman)
       refute Engine.podman?(engine: Vagus.Runtime.Engine.Docker)

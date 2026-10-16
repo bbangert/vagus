@@ -49,6 +49,9 @@ defmodule Vagus.App.Server do
   @probe_deadline_ms 10_000
   # Past the engine's own bound on a check (Engine.Podman's 35 s).
   @health_deadline_ms 60_000
+  # A schedule that names no timeout of its own gets Engine.Podman's.
+  @health_run_ms 35_000
+  @health_deadline_margin_ms 10_000
   @ops [
     :install,
     :start,
@@ -585,12 +588,17 @@ defmodule Vagus.App.Server do
      [{{:timeout, :probe_deadline}, deadline(:probe_deadline), ref}]}
   end
 
-  defp spawn_health(%{health_check: %{engine_opts: engine_opts}} = data) do
+  # The check gets the time its image declared; the task a little more, so
+  # the engine's own deadline answers first.
+  defp spawn_health(%{health_check: %{engine_opts: engine_opts} = check} = data) do
     {ref, parent, id} = {make_ref(), self(), data.container_id}
-    pid = spawn_link(fn -> send(parent, {:health, ref, Engine.healthcheck(id, engine_opts)}) end)
+    run_ms = Map.get(check, :timeout_ms, @health_run_ms)
+    opts = [timeout_ms: run_ms] ++ engine_opts
+    pid = spawn_link(fn -> send(parent, {:health, ref, Engine.healthcheck(id, opts)}) end)
+    task_ms = deadline(:health_deadline, run_ms + @health_deadline_margin_ms)
 
     {:keep_state, %{data | health: {pid, ref, id}},
-     [{{:timeout, :health_deadline}, deadline(:health_deadline), ref}]}
+     [{{:timeout, :health_deadline}, task_ms, ref}]}
   end
 
   # The start's inspect failed: this tick inspects again for the schedule.

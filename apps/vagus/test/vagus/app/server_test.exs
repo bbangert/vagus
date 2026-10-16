@@ -1250,6 +1250,40 @@ defmodule Vagus.App.ServerTest do
       assert [{:inspect, ["c1"]}, {:inspect, ["c1"]}] = Fake.calls(fake)
     end
 
+    test "a check gets the time its image declared, past the engine's and the task's defaults",
+         %{fake: fake} do
+      test_pid = self()
+
+      app_deadlines(%{
+        retry: 600_000,
+        health_deadline: fn ms -> send(test_pid, {:health_deadline, ms}) && 600_000 end
+      })
+
+      check = %{
+        first_ms: 1,
+        interval_ms: 1,
+        timeout_ms: 125_000,
+        engine_opts: [engine: Fake, fake: fake]
+      }
+
+      {_slug, pid} = installed()
+      # A 40 s check: within its declared 120 s, past both 35 s and 60 s.
+      Fake.delay_next(fake, :healthcheck, 40_000)
+      Fake.set_health(fake, "c1", :unhealthy)
+      Fake.block_next(fake, :healthcheck)
+      Fake.block_next(fake, :healthcheck)
+      t = op(pid, {:start, %{}})
+      answer(:start, {:ok, Map.merge(@started, %{healthcheck: true, health_check: check})})
+      assert :ok = Task.await(t)
+
+      Fake.release(next_check())
+      assert_receive {:health_deadline, 135_000}, 2_000
+      next_check()
+      assert %{last_event: :unhealthy} = data(pid)
+      assert [{:healthcheck, opts} | _] = Fake.call_opts(fake)
+      assert opts[:timeout_ms] == 125_000
+    end
+
     test "a container that dies kills the check in flight, whose verdict never lands",
          %{fake: fake} do
       {_slug, pid, blocked} = checked_start(fake)

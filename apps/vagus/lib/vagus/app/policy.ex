@@ -891,7 +891,7 @@ defmodule Vagus.App.Policy do
 
     cond do
       reason in [:died, :timeout] -> cleanup(data, reason, effects)
-      op == :backup -> finish(data, effects)
+      op == :backup -> finish_backup(data, effects)
       true -> fail(data, reason, effects)
     end
   end
@@ -1002,6 +1002,16 @@ defmodule Vagus.App.Policy do
   end
 
   defp rolled_back(cause), do: {:error, {:rolled_back, cause}}
+
+  # A cold backup's restart that failed still answers with the snapshot's
+  # result; its stop cancelled any restart, so an image it could not get
+  # comes back on the image retry like any start's.
+  defp finish_backup(%{run: %{acc: %{image_failed: reason}}} = data, effects) do
+    {data, retry} = image_retry(data, reason)
+    finish(data, effects ++ retry)
+  end
+
+  defp finish_backup(data, effects), do: finish(data, effects)
 
   defp cleanup(data, cause, effects) do
     data = data |> put_acc(:cause, cause) |> put_steps([{:stop, :by_name}])
