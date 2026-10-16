@@ -1,7 +1,8 @@
 defmodule Vagus.Network.Nat do
   @moduledoc """
-  The DNAT rules that keep `http://supervisor/` working after the
-  Supervisor-API listener moved off port 80.
+  Vagus's own nft table: the DNAT that keeps `http://supervisor/` working
+  after the Supervisor-API listener moved off port 80, and the forward filter
+  that keeps the LAN off the `hassio` bridge.
 
   ## Why this exists
 
@@ -33,6 +34,18 @@ defmodule Vagus.Network.Nat do
   `172.30.32.2:80` too, since netavark's port DNAT matches every local
   address. At -100 the winner depends on which table loaded first.
 
+  ## Forward filter
+
+  netavark's `FORWARD` chain has policy accept and lets anything reach a
+  container's address, so a LAN host routing `172.30.32.0/23` via the board
+  could open connections to every bridged app (balena's `FORWARD` policy was
+  drop). The `forward` chain drops a new connection entering `hassio` from
+  another interface unless conntrack shows it was DNAT'd, i.e. a published
+  port. Traffic between containers, container egress and replies are not
+  new-from-outside and pass. The flag test is `ct status & dnat == 0`:
+  `ct status != dnat` compares the whole status word, matches nearly every
+  connection, and drops published ports too.
+
   The table is loaded with one `nft -f`, which the kernel applies as a single
   transaction, and the file starts by declaring and flushing the table, so a
   reload replaces the rules instead of adding to them: `ensure/1` is safe to
@@ -57,6 +70,9 @@ defmodule Vagus.Network.Nat do
   @nft_table "vagus"
   # Ahead of netavark's DNAT at -100; see the moduledoc.
   @nft_priority -110
+  # A drop in any base chain is final whatever netavark's accepts say, so the
+  # order against netavark's own filter chain does not matter.
+  @forward_priority "filter"
   # nft -f is one netlink transaction and takes no lock, so it answers at once
   # or not at all.
   @nft_timeout_ms 10_000
@@ -94,17 +110,6 @@ defmodule Vagus.Network.Nat do
     end
   end
 
-  @doc "Deletes the table (idempotent). Same options and return shape as `ensure/1`."
-  @spec teardown(keyword()) :: :ok | {:error, term()}
-  def teardown(opts \\ []) do
-    if Keyword.get(opts, :enabled, enabled?()) do
-      # Declaring the table first makes the delete succeed when it is absent.
-      load_nft("table ip #{@nft_table}\ndelete table ip #{@nft_table}\n", opts)
-    else
-      :ok
-    end
-  end
-
   @doc """
   The nft ruleset `ensure/1` loads: it creates the table when absent and
   flushes it before declaring the chains, so loading it again leaves exactly
@@ -120,6 +125,7 @@ defmodule Vagus.Network.Nat do
     with {:ok, ip} <- target_ip(opts),
          {:ok, port} <- target_port(opts) do
       rule = "ip daddr #{ip} tcp dport #{@contract_port} dnat to #{ip}:#{port}"
+      bridge = Network.name()
 
       {:ok,
        """
@@ -134,6 +140,10 @@ defmodule Vagus.Network.Nat do
        \t\ttype nat hook output priority #{@nft_priority}; policy accept;
        \t\t#{rule}
        \t}
+       \tchain forward {
+       \t\ttype filter hook forward priority #{@forward_priority}; policy accept;
+       \t\toifname "#{bridge}" iifname != "#{bridge}" ct state new ct status & dnat == 0 drop
+       \t}
        }
        """}
     end
@@ -145,14 +155,15 @@ defmodule Vagus.Network.Nat do
   # child's stdin, which nft needs to see the end of the ruleset. One file per
   # call, so two concurrent loads never read each other's half-written text,
   # created exclusively so nothing placed there beforehand is written through.
-  # The directory is tmpfs owned by root (0700, made by the Host's
-  # preparation), never request input.
+  # The directory is tmpfs, never request input; it is made 0700 here as well
+  # because this can run before the Host's preparation does.
   # sobelow_skip ["Traversal.FileModule"]
   defp load_nft(text, opts) do
     dir = Keyword.get(opts, :nft_dir, "/run/vagus")
     path = Path.join(dir, "vagus-nat-#{System.unique_integer([:positive])}.nft")
 
     with :ok <- File.mkdir_p(dir),
+         :ok <- File.chmod(dir, 0o700),
          :ok <- File.write(path, text, [:exclusive]) do
       try do
         run(Keyword.get(opts, :cmd, &nft_cmd/2), "nft", ["-f", path])
@@ -171,11 +182,11 @@ defmodule Vagus.Network.Nat do
   # whose output acks can race the child's exit and kill the caller with
   # `:epipe` (see `Vagus.Runtime.Podman.Cmd`).
   @doc false
-  @spec nft_cmd(String.t(), [String.t()]) :: {String.t(), non_neg_integer()}
-  def nft_cmd(bin, args) do
-    case Vagus.BoundedCall.run(fn -> Vagus.Host.Cmd.run(bin, args) end, @nft_timeout_ms) do
+  @spec nft_cmd(String.t(), [String.t()], timeout()) :: {String.t(), non_neg_integer()}
+  def nft_cmd(bin, args, timeout_ms \\ @nft_timeout_ms) do
+    case Vagus.BoundedCall.run(fn -> Vagus.Host.Cmd.run(bin, args) end, timeout_ms) do
       {out, status} when is_binary(out) -> {out, status}
-      {:error, :attempt_timeout} -> {"#{bin}: no answer in #{@nft_timeout_ms} ms", 124}
+      {:error, :attempt_timeout} -> {"#{bin}: no answer in #{timeout_ms} ms", 124}
       {:error, {:exit, reason}} -> {"#{bin}: #{inspect(reason)}", 1}
     end
   end

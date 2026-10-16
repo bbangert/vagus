@@ -117,11 +117,14 @@ eMMC/NVMe.
 
 ## dragon_q6a: what is device-proven
 
-Full parity gate, 2026-07-27, on firmware built from merged `main`:
+Full parity gate, 2026-07-27, on firmware built from merged `main`. This
+predates the switch to podman (system v0.5.0): the engine row describes the
+balenaEngine stack of that time, and the podman stack has not yet passed the
+same gate.
 
 | Capability | Status |
 | --- | --- |
-| Container engine (balenaEngine v25) | daemon self-starts, builds `hassio`/`bridge` networks, programs NAT |
+| Container engine (balenaEngine v25, since replaced by podman) | daemon self-started, built `hassio`/`bridge` networks, programmed NAT |
 | HA Core cold start | 2.33 GB image pull → container running → `:healthy` on `:8123` (pre-0.6.0; Core binds `:80` since the port-80 move) |
 | hassio integration | all 20 coordinator endpoints 200; Core mints a `hassio_user`; `hassio: Supervisor` config entry `loaded` |
 | DNS | `Vagus.DNS` on `172.30.32.3:53`, resolves external and hassio-internal names |

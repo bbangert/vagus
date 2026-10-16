@@ -62,4 +62,19 @@ defmodule Vagus.App.GatesTest do
     capture_log(fn -> assert Gates.network(opts) == :ok end)
     assert steps(ran()) == [:bridge, :anchor_supervisor, :anchor_dns, :nat]
   end
+
+  test "a refused nft load is logged, and the gate still passes", %{opts: opts} do
+    test = self()
+
+    refuse = fn bin, args ->
+      send(test, {:ran, bin, args})
+      {"Error: Could not process rule\n", 1}
+    end
+
+    log =
+      capture_log(fn -> assert Gates.network(Keyword.put(opts, :cmd, refuse)) == :ok end)
+
+    assert log =~ "supervisor DNAT"
+    assert steps(ran()) == [:bridge, :anchor_supervisor, :anchor_dns, :nat]
+  end
 end

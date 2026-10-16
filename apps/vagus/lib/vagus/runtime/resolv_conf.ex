@@ -4,11 +4,15 @@ defmodule Vagus.Runtime.ResolvConf do
   `Vagus.Runtime.Host` each boot from vintage_net's name servers.
 
   `/etc/resolv.conf` on the target is a symlink to this path (in
-  `nerves_system_vagus`), but vintage_net's own `NameResolver` rewrites it
-  only as leases arrive; writing it in the Host's preparation means a file
-  exists before the first container starts. With no name servers reported
-  (a static interface with no DNS), a fallback is written rather than an
-  empty file.
+  `nerves_system_vagus`), but vintage_net's own `NameResolver` writes it
+  only as leases arrive; the Host creates it when missing so a file exists
+  before the first container starts, and leaves it to vintage_net after
+  that. With no name servers reported (a static interface with no DNS), a
+  fallback is written rather than an empty file.
+
+  `Vagus.Runtime.Engine.Podman` binds it into host-network containers:
+  vintage_net rewrites it in place, so they follow lease changes, where
+  podman's own copy would freeze whatever the file held at their start.
   """
 
   @path "/run/resolv.conf"

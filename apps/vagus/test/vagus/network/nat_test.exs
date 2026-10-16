@@ -18,6 +18,10 @@ defmodule Vagus.Network.NatTest do
   \t\ttype nat hook output priority -110; policy accept;
   \t\tip daddr 172.30.32.2 tcp dport 80 dnat to 172.30.32.2:8888
   \t}
+  \tchain forward {
+  \t\ttype filter hook forward priority filter; policy accept;
+  \t\toifname "hassio" iifname != "hassio" ct state new ct status & dnat == 0 drop
+  \t}
   }
   """
 
@@ -58,10 +62,19 @@ defmodule Vagus.Network.NatTest do
     do: [enabled: true, nft_dir: dir, cmd: cmd, ip: "172.30.32.2", port: 8888]
 
   describe "ensure/1" do
-    test "the ruleset: both hooks at -110, prerouting and output" do
+    test "the ruleset: both nat hooks at -110, and the forward filter" do
       # Core and every host-network app generate their packets locally, so a
       # prerouting-only rule serves bridged apps and silently breaks Core.
       assert Nat.ruleset(ip: "172.30.32.2", port: 8888) == {:ok, @ruleset}
+    end
+
+    test "the forward drop tests the dnat flag, never the whole status word" do
+      # `ct status != dnat` matches nearly every connection: published ports
+      # would be dropped with the rest.
+      {:ok, ruleset} = Nat.ruleset(ip: "172.30.32.2", port: 8888)
+      assert ruleset =~ ~s(oifname "hassio" iifname != "hassio" ct state new)
+      assert ruleset =~ "ct status & dnat == 0 drop"
+      refute ruleset =~ "ct status != dnat"
     end
 
     test "loads the ruleset with one nft -f, then removes the file", %{dir: dir} do
@@ -83,15 +96,43 @@ defmodule Vagus.Network.NatTest do
       end)
     end
 
-    test "nft_cmd/2 reports a missing binary as an exit, never a raise" do
-      assert {_msg, 127} = Nat.nft_cmd("vagus-no-such-nft", ["-f", "/dev/null"])
+    test "makes its directory 0700, as it can run before the Host does", %{dir: dir} do
+      assert Nat.ensure(opts(dir, nft_fake({"", 0}))) == :ok
+      assert Bitwise.band(File.stat!(dir).mode, 0o777) == 0o700
+    end
+
+    test "a ruleset file that cannot be written is the error, and nft never runs",
+         %{dir: dir} do
+      File.mkdir_p!(Path.dirname(dir))
+      File.write!(dir, "a file where the directory should be")
+
+      log =
+        capture_log(fn ->
+          assert {:error, {:nft_file, _reason}} = Nat.ensure(opts(dir, nft_fake({"", 0})))
+        end)
+
+      assert log =~ "not written"
+      refute_received {:nft, _, _, _}
     end
   end
 
-  describe "teardown/1" do
-    test "declares the table before deleting it, so an absent table is fine", %{dir: dir} do
-      assert Nat.teardown(opts(dir, nft_fake({"", 0}))) == :ok
-      assert_received {:nft, "nft", ["-f", _], "table ip vagus\ndelete table ip vagus\n"}
+  describe "nft_cmd/3" do
+    test "passes the command's output and status through" do
+      assert {"hi\n", 0} = Nat.nft_cmd("echo", ["hi"])
+      assert {_out, 1} = Nat.nft_cmd("false", [])
+    end
+
+    test "a missing binary is an exit, never a raise" do
+      assert {_msg, 127} = Nat.nft_cmd("vagus-no-such-nft", ["-f", "/dev/null"])
+    end
+
+    test "a command that does not answer in time is exit 124" do
+      assert {msg, 124} = Nat.nft_cmd("sleep", ["2"], 50)
+      assert msg =~ "no answer in 50 ms"
+    end
+
+    test "a runner that crashes is exit 1, never a raise" do
+      assert {_msg, 1} = Nat.nft_cmd("echo", [:not_a_string])
     end
   end
 
@@ -102,7 +143,6 @@ defmodule Vagus.Network.NatTest do
 
       assert Nat.enabled?() == false
       assert Nat.ensure(cmd: cmd, nft_dir: dir) == :ok
-      assert Nat.teardown(cmd: cmd, nft_dir: dir) == :ok
       refute_received {:nft, _, _, _}
       refute File.exists?(dir)
     end

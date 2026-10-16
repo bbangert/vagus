@@ -33,14 +33,14 @@ defmodule Vagus.App.Gates do
   def engine(opts \\ []), do: Vagus.Runtime.Engine.ready(opts)
 
   @doc """
-  Stands up the `hassio` bridge, binds the `.2`/`.3` anchors and asserts the
-  DNAT that serves port 80 on `.2`. All of it is lost on reboot, and only a
+  Stands up the `hassio` bridge, binds the `.2`/`.3` anchors and loads
+  `Vagus.Network.Nat`'s table. All of it is lost on reboot, and only a
   container app's start would redo it otherwise, so a device running only
-  native apps would leave Core unable to reach the Supervisor. The bridge
-  is the host's own (`Vagus.Network.host_bridge?/1`), so the anchors and the
-  DNAT go on even when the engine could not make its network. Best effort:
-  always `:ok`, so a failure here never holds the apps back. `opts` reach
-  every step (tests).
+  native apps would leave Core unable to reach the Supervisor. Under podman
+  Vagus makes the bridge interface itself (`Vagus.Network.host_bridge?/1`),
+  so the anchors have it whatever podman answered. Each step runs whatever
+  the one before returned, and the gate is always `:ok`, so a failure here
+  never holds the apps back. `opts` reach every step (tests).
   """
   @spec network(keyword()) :: :ok
   def network(opts \\ []) do

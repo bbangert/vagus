@@ -36,6 +36,7 @@ defmodule Vagus.Runtime.Engine.Podman do
   alias Vagus.Runtime.Engine.{Container, ContainerSpec, NetworkSpec}
   alias Vagus.Runtime.Host
   alias Vagus.Runtime.Podman.{Cmd, Error}
+  alias Vagus.Runtime.ResolvConf
 
   @query_ms 15_000
   @lifecycle_ms 60_000
@@ -570,8 +571,9 @@ defmodule Vagus.Runtime.Engine.Podman do
   spec it pins what differs from Docker's defaults: Docker's capability
   set, unlimited pids, a private IPC namespace, no injected
   `container=podman` or proxy env, no pull on create, Docker's tmpfs
-  options, and on a bridge an `/etc/hosts` built from nothing but the
-  spec's entries. The log goes to `log.dir`, capped at `log.max_bytes`,
+  options, on a bridge an `/etc/hosts` built from nothing but the spec's
+  entries, and on the host network a read-only bind of the live
+  `/run/resolv.conf`. The log goes to `log.dir`, capped at `log.max_bytes`,
   which podman reads as a number of bytes.
 
   A `secret_env` entry renders as a bare `--env NAME`, which podman fills
@@ -598,6 +600,7 @@ defmodule Vagus.Runtime.Engine.Podman do
       dns(bridge, spec),
       hosts(bridge, spec.extra_hosts),
       Enum.flat_map(spec.mounts || [], &["--mount", mount(&1)]),
+      resolv_conf(bridge, spec.mounts),
       Enum.flat_map(Enum.sort(spec.tmpfs || %{}), fn {dst, o} ->
         ["--tmpfs", "#{dst}:#{tmpfs(o)}"]
       end),
@@ -632,6 +635,26 @@ defmodule Vagus.Runtime.Engine.Podman do
     many("--dns", spec.dns) ++
       many("--dns-search", spec.dns_search) ++ many("--dns-option", spec.dns_options)
   end
+
+  # On the host network podman copies the host's resolv.conf at create, so a
+  # container made before the DHCP lease keeps the fallback servers until it
+  # is recreated. The file vintage_net rewrites in place is bound instead.
+  # A spec that binds its own is left alone.
+  defp resolv_conf(nil, mounts) do
+    if Enum.any?(mounts || [], &(&1.target == "/etc/resolv.conf")),
+      do: [],
+      else: [
+        "--mount",
+        mount(%{
+          type: :bind,
+          source: ResolvConf.path(),
+          target: "/etc/resolv.conf",
+          read_only: true
+        })
+      ]
+  end
+
+  defp resolv_conf(_bridge, _mounts), do: []
 
   defp network(nil, _aliases), do: ["--network", "host"]
   defp network(bridge, aliases), do: ["--network", bridge] ++ many("--network-alias", aliases)

@@ -573,6 +573,7 @@ defmodule Vagus.Runtime.MigrationTest do
           assert Migration.cleanup(Keyword.put(opts, :walk_hook, race)) == :done
         end)
 
+      assert log =~ "[info] Vagus.Runtime.Migration: #{legacy} deleted; migration complete"
       refute log =~ "[error]"
       refute File.exists?(legacy)
     end
