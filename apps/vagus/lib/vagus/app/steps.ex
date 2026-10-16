@@ -379,7 +379,7 @@ defmodule Vagus.App.Steps do
           # Upstream reports `startup` until the first healthy event only for
           # an image that declares a healthcheck.
           healthcheck: container.healthcheck != nil,
-          health_check: health_check(container.healthcheck, engine_opts(opts))
+          health_check: health_check(container, engine_opts(opts))
         }
 
       {:error, _reason} ->
@@ -411,7 +411,7 @@ defmodule Vagus.App.Steps do
   # a permit, and none is granted during a shutdown.
   def health_schedule(id, engine_opts) do
     case Engine.inspect(id, Keyword.put(engine_opts, :class, :health)) do
-      {:ok, container} -> {:ok, health_check(container.healthcheck, engine_opts)}
+      {:ok, container} -> {:ok, health_check(container, engine_opts)}
       {:error, reason} -> {:error, reason}
     end
   rescue
@@ -424,15 +424,17 @@ defmodule Vagus.App.Steps do
   # start period, plus up to one interval of jitter so apps started together
   # do not all check together.
   #
-  # An image that declares a start interval is checked at that pace through
-  # its start period instead, as Docker 25 did: a 15 min interval would
-  # otherwise leave it starting for half an hour. The ticks are bounded by
-  # the start period, so the floor is a lower one. podman's own verdict keeps
+  # An image that declares a start interval is checked at that pace until
+  # its start period ends (`start_until`), as Docker 25 did: a 15 min interval
+  # would otherwise leave it starting for half an hour. The period runs from
+  # the container's own start, so an app process restarted part way keeps
+  # it, and from now for an engine that reports none. The checks are bounded
+  # by the period, so the floor is a lower one. podman's own verdict keeps
   # Docker's rules: a success in the start period is healthy at once, and a
-  # failure there counts for nothing.
-  defp health_check(nil, _engine_opts), do: nil
+  # failure there counts for nothing. `Vagus.App.Policy` paces the rest.
+  defp health_check(%{healthcheck: nil}, _engine_opts), do: nil
 
-  defp health_check(healthcheck, engine_opts) do
+  defp health_check(%{healthcheck: healthcheck} = container, engine_opts) do
     if Engine.schedules_healthchecks?(engine_opts) do
       nil
     else
@@ -444,16 +446,19 @@ defmodule Vagus.App.Steps do
         positive(healthcheck[:start_interval_ms]) &&
           max(healthcheck[:start_interval_ms], @health_start_interval_floor_ms)
 
-      start_ticks = if start_interval, do: div(start_period, start_interval), else: 0
+      start_until =
+        start_interval && DateTime.add(container.started_at || now(), start_period, :millisecond)
+
+      left = if start_until, do: DateTime.diff(start_until, now(), :millisecond), else: 0
 
       %{
         first_ms:
-          if(start_ticks > 0,
-            do: start_interval,
+          if(left > 0,
+            do: min(start_interval, left),
             else: max(start_period, interval) + :rand.uniform(interval)
           ),
         start_interval_ms: start_interval,
-        start_ticks: start_ticks,
+        start_until: if(left > 0, do: start_until),
         interval_ms: interval,
         timeout_ms:
           min(positive(healthcheck[:timeout_ms]) || @health_timeout_ms, @health_timeout_cap_ms) +
@@ -462,6 +467,8 @@ defmodule Vagus.App.Steps do
       }
     end
   end
+
+  defp now, do: DateTime.utc_now()
 
   defp positive(ms) when is_integer(ms) and ms > 0, do: ms
   defp positive(_ms), do: nil

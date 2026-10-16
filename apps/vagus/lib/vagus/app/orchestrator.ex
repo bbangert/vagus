@@ -35,6 +35,14 @@ defmodule Vagus.App.Orchestrator do
     5. `supervisor_update` with `startup: complete`, which Core takes as the
        Supervisor having finished starting.
 
+  Apps also wait for the host's primary interface (`Vagus.App.Gates.primary/0`),
+  as they did when balena's daemon waited for the internet: some read it
+  once at start and exit for good without one. Core does not, so it comes
+  up from local images with no network. If there is none when the first
+  app stage comes, every app stage is put off, in order, until after Core,
+  and run once the interface appears or `primary_timeout` has passed; the
+  update in 5. follows them. Starts outside boot never wait.
+
   A shutdown pre-empts a boot only at a step boundary: before a gate or a
   stage, or while a gate waits out its interval. A unit in flight is never
   killed: Core's start may be midway through stop, remove, create and start,
@@ -92,6 +100,7 @@ defmodule Vagus.App.Orchestrator do
     tree_interval: 250,
     gate_timeout: 10_000,
     stage_timeout: 120_000,
+    primary_timeout: 90_000,
     app_stop_timeout: 35_000,
     halt_floor: 2_000,
     stop_margin: 5_000,
@@ -245,15 +254,70 @@ defmodule Vagus.App.Orchestrator do
   defp run_boot(cfg) do
     if slug = cfg.default_native_app, do: install_default(slug, cfg.units)
 
-    _running =
-      Enum.reduce(@plan, :unknown, fn step, running ->
+    {running, put_off} =
+      Enum.reduce(@plan, {:unknown, :undecided}, fn step, {running, put_off} ->
         checkpoint(0)
-        step(step, running, cfg)
+        put_off = decide(step, put_off, cfg)
+
+        if put_off?(step, put_off),
+          do: {running, put_off ++ [step]},
+          else: {step(step, running, cfg), put_off}
       end)
 
+    run_put_off(put_off, running, cfg)
     cfg.units.push_complete.()
   catch
     :cancelled -> :cancelled
+  end
+
+  @app_stages [:initialize, :system, :services, :application]
+
+  # Decided once, at the first app stage, so the stages keep their order
+  # whichever way it goes.
+  defp decide({:stage, stage}, :undecided, cfg) when stage in @app_stages do
+    case run_bounded(cfg.units.gates.primary, cfg.gate_timeout) do
+      :ok ->
+        :run
+
+      failure ->
+        Logger.info(
+          "Boot: no primary interface yet (#{inspect(failure)}); apps start after Core, " <>
+            "once one appears or after #{cfg.primary_timeout} ms"
+        )
+
+        []
+    end
+  end
+
+  defp decide(_step, put_off, _cfg), do: put_off
+
+  defp put_off?({:stage, stage}, put_off) when is_list(put_off), do: stage in @app_stages
+  defp put_off?(_step, _put_off), do: false
+
+  defp run_put_off(put_off, running, cfg) when is_list(put_off) and put_off != [] do
+    await_primary(cfg, System.monotonic_time(:millisecond) + cfg.primary_timeout)
+    Enum.reduce(put_off, running, fn step, running -> step(step, running, cfg) end)
+  end
+
+  defp run_put_off(_put_off, _running, _cfg), do: :ok
+
+  defp await_primary(cfg, deadline) do
+    case run_bounded(cfg.units.gates.primary, cfg.gate_timeout) do
+      :ok ->
+        Logger.info("Boot: primary interface up; starting apps")
+
+      failure ->
+        left = deadline - System.monotonic_time(:millisecond)
+
+        if left <= 0 do
+          Logger.warning(
+            "Boot: still no primary interface (#{inspect(failure)}); starting apps anyway"
+          )
+        else
+          checkpoint(min(cfg.gate_interval, left))
+          await_primary(cfg, deadline)
+        end
+    end
   end
 
   # A step boundary: where a shutdown's `:cancel` ends the boot.

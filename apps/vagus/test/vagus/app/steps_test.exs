@@ -912,26 +912,54 @@ defmodule Vagus.App.StepsTest do
       assert first in 60_001..105_000
     end
 
+    @matter_hc %{
+      test: ["CMD", "/usr/local/bin/healthcheck.sh"],
+      interval_ms: 900_000,
+      timeout_ms: 5_000,
+      start_period_ms: 60_000,
+      start_interval_ms: 10_000,
+      retries: 6
+    }
+
+    defp started_at_fact(ctx, started_at) do
+      {_fake, engine_opts} =
+        engine(%{"fake-id" => [healthcheck: @matter_hc, started_at: started_at]})
+
+      {:ok, fact} =
+        Steps.run(
+          :start,
+          input(ctx, %{engine_opts: engine_opts ++ [schedules_healthchecks: false]})
+        )
+
+      fact.health_check
+    end
+
+    defp ago(seconds), do: DateTime.add(DateTime.utc_now(), -seconds, :second)
+
     test "a declared start interval paces the start period: first check at it", ctx do
-      hc = %{
-        test: ["CMD", "/usr/local/bin/healthcheck.sh"],
-        interval_ms: 900_000,
-        timeout_ms: 5_000,
-        start_period_ms: 60_000,
-        start_interval_ms: 10_000,
-        retries: 6
-      }
+      {fact, _} = started_fact(ctx, @matter_hc, schedules_healthchecks: false)
 
-      {fact, _} = started_fact(ctx, hc, schedules_healthchecks: false)
-
-      assert %{first_ms: 10_000, start_interval_ms: 10_000, start_ticks: 6, interval_ms: 900_000} =
+      assert %{first_ms: 10_000, start_interval_ms: 10_000, interval_ms: 900_000} =
                fact.health_check
+
+      left = DateTime.diff(fact.health_check.start_until, DateTime.utc_now(), :millisecond)
+      assert left in 58_000..60_000
+    end
+
+    test "the start period runs from the container's own start, across an app restart", ctx do
+      check = started_at_fact(ctx, ago(55))
+      assert check.first_ms in 3_000..5_000
+      assert DateTime.diff(check.start_until, DateTime.utc_now(), :millisecond) in 3_000..5_000
+
+      check = started_at_fact(ctx, ago(120))
+      assert check.start_until == nil
+      assert check.first_ms in 900_001..1_800_000
     end
 
     test "without a start interval the first check still waits out the start period", ctx do
       hc = %{test: ["CMD", "true"], interval_ms: 900_000, start_period_ms: 60_000}
       {fact, _} = started_fact(ctx, hc, schedules_healthchecks: false)
-      assert %{start_ticks: 0, first_ms: first} = fact.health_check
+      assert %{start_until: nil, first_ms: first} = fact.health_check
       assert first in 900_001..1_800_000
     end
 

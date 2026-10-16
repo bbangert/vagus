@@ -11,7 +11,14 @@ defmodule Vagus.App.Gates do
   alias Vagus.Network.Nat
 
   @spec all() :: %{atom() => (-> :ok | {:error, term()})}
-  def all, do: %{tree: &tree/0, engine: &engine/0, network: &network/0, api: &api/0}
+  def all,
+    do: %{
+      tree: &tree/0,
+      engine: &engine/0,
+      network: &network/0,
+      api: &api/0,
+      primary: &primary/0
+    }
 
   @doc """
   The rest of the application tree is up. The app tree starts before DNS,
@@ -62,6 +69,20 @@ defmodule Vagus.App.Gates do
     # attempt is hurried. An optimisation only: the `api` gate still decides.
     Vagus.API.Listener.retry_now()
     :ok
+  end
+
+  @doc """
+  The host has a primary interface, exactly as `GET /network/info` shows it
+  to apps: some apps read it once at start and exit for good without one
+  (Matter Server: "No primary network interface found"). Not a gate of the
+  boot sequence, which must not hold Core: the orchestrator holds only the
+  app stages on it (`Vagus.App.Orchestrator`).
+  """
+  @spec primary() :: :ok | {:error, :no_primary}
+  def primary do
+    if Enum.any?(Vagus.Backend.network().info().interfaces, & &1.primary),
+      do: :ok,
+      else: {:error, :no_primary}
   end
 
   @doc """

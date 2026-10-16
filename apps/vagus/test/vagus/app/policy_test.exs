@@ -493,13 +493,15 @@ defmodule Vagus.App.PolicyTest do
   end
 
   describe "an image with a start interval" do
-    @quick %{
-      first_ms: 10_000,
-      start_interval_ms: 10_000,
-      start_ticks: 6,
-      interval_ms: 900_000,
-      engine_opts: []
-    }
+    defp quick(until_s, start_interval_ms \\ 10_000) do
+      %{
+        first_ms: start_interval_ms,
+        start_interval_ms: start_interval_ms,
+        start_until: until_s && DateTime.add(DateTime.utc_now(), until_s, :second),
+        interval_ms: 900_000,
+        engine_opts: []
+      }
+    end
 
     defp tick(effects),
       do:
@@ -509,7 +511,7 @@ defmodule Vagus.App.PolicyTest do
         end)
 
     test "is checked at the start interval while starting, and healthy on its first success" do
-      data = running(%{health_check: @quick, last_event: {:running, true}})
+      data = running(%{health_check: quick(25), last_event: {:running, true}})
 
       {data, effects} = Policy.health_check({:ok, :starting}, data)
       assert tick(effects) == 10_000
@@ -519,26 +521,33 @@ defmodule Vagus.App.PolicyTest do
       assert {:emit, :started} in effects
       assert data.last_event == :healthy
       assert tick(effects) == 900_000
-      assert data.health_check.start_ticks == 0
+      assert data.health_check.start_until == nil
     end
 
-    test "goes over to the interval once the start period's ticks are spent" do
-      data = running(%{health_check: @quick, last_event: {:running, true}})
+    test "a slow check that returns past the start period goes over to the interval" do
+      # 60 s period, 10 s start interval, 30 s checks: the second result is
+      # back at 80 s, with no period left however few checks have run.
+      data = running(%{health_check: quick(-20), last_event: {:running, true}})
 
-      {data, ticks} =
-        Enum.reduce(1..7, {data, []}, fn _, {data, ticks} ->
-          {data, effects} = Policy.health_check({:ok, :starting}, data)
-          {data, ticks ++ [tick(effects)]}
-        end)
+      {data, effects} = Policy.health_check({:ok, :starting}, data)
+      assert tick(effects) in 900_001..1_800_000
+      assert data.health_check.start_until == nil
 
-      assert ticks == [10_000, 10_000, 10_000, 10_000, 10_000, 900_000, 900_000]
-      assert Policy.derive(:idle, data) == :startup
+      {_data, effects} = Policy.health_check({:ok, :starting}, data)
+      assert tick(effects) == 900_000
+    end
+
+    test "a period the start interval does not divide gets a last check at its end" do
+      # 60 s period, 45 s start interval: at 45 s there are 15 s left.
+      data = running(%{health_check: quick(15, 45_000), last_event: {:running, true}})
+
+      {data, effects} = Policy.health_check({:ok, :starting}, data)
+      assert tick(effects) in 13_000..15_000
+      assert %DateTime{} = data.health_check.start_until
     end
 
     test "a schedule without one ticks at the interval from the first result" do
-      data =
-        running(%{health_check: Map.delete(@quick, :start_ticks), last_event: {:running, true}})
-
+      data = running(%{health_check: quick(nil), last_event: {:running, true}})
       {_data, effects} = Policy.health_check({:ok, :starting}, data)
       assert tick(effects) == 900_000
     end
