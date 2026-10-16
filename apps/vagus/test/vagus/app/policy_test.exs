@@ -563,6 +563,14 @@ defmodule Vagus.App.PolicyTest do
       assert Policy.derive(:idle, data) == :error
     end
 
+    test "a presence check that failed is retried like a pull that did" do
+      data = app(%{wanted: :started, watchdog: false})
+      plan = Policy.plan(:start, %{}, data)
+      {data, _} = Policy.next(plan, :begin, data)
+      {_data, effects} = Policy.next(data.run, {:error, {:image_check, :timeout}}, data)
+      assert retry_timers(effects) == [30_000]
+    end
+
     test "a registry that says the image is not there ends after three tries, the error showing" do
       data = app(%{wanted: :started, watchdog: true})
       refused = {:pull_failed, "manifest unknown"}

@@ -27,7 +27,10 @@ defmodule Vagus.Core.Lifecycle do
     * `:version` - (`start/1` only) the desired version; defaults to
       `Vagus.Core.Versions.installed/1`.
     * `:stops_seen` - (`start/1` only) a `stops/0` reading; the start is
-      `{:error, :stopped}` if Core has been stopped since.
+      `{:error, :stopped}` if Core has been stopped since, and
+      `{:error, :shutting_down}` while a shutdown is in flight.
+    * `:shutting_down?` - zero-arity fn, the shutdown check that
+      `:stops_seen` implies. Defaults to `Vagus.Host.Shutdown.in_flight?/0`.
 
   The container name is always `Vagus.Core.Container.name/0` — every op
   targets the one fixed-name Core container, never an id passed in by the
@@ -436,7 +439,7 @@ defmodule Vagus.Core.Lifecycle do
   ## start/1
 
   defp do_start(opts) do
-    with :ok <- not_stopped_since(opts[:stops_seen]),
+    with :ok <- unattended_start_allowed(opts),
          {:ok, version} <- resolve_start_version(opts) do
       case inspect_container(opts) do
         {:ok, info} -> start_existing(info, version, opts)
@@ -483,10 +486,26 @@ defmodule Vagus.Core.Lifecycle do
     end
   end
 
-  # Checked under the lock, so a stop that lands between a caller's own
-  # check and its start still wins.
-  defp not_stopped_since(nil), do: :ok
-  defp not_stopped_since(seen), do: if(stops() == seen, do: :ok, else: {:error, :stopped})
+  # Only a start a caller makes on its own account carries `:stops_seen`.
+  # Checked under the lock, so a stop that lands between that caller's check
+  # and its start still wins. A shutdown counts too: with Core absent its
+  # stop moves no counter, and a pull finishing then must not create Core
+  # beside apps being halted.
+  defp unattended_start_allowed(opts) do
+    cond do
+      opts[:stops_seen] == nil ->
+        :ok
+
+      Keyword.get(opts, :shutting_down?, &Vagus.Host.Shutdown.in_flight?/0).() ->
+        {:error, :shutting_down}
+
+      stops() == opts[:stops_seen] ->
+        :ok
+
+      true ->
+        {:error, :stopped}
+    end
+  end
 
   ## stop/1
 

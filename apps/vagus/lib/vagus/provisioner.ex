@@ -632,7 +632,7 @@ defmodule Vagus.Provisioner do
 
         state
 
-      {:error, :stopped} ->
+      {:error, refusal} when refusal in [:stopped, :shutting_down] ->
         stopped(state)
 
       {:error, reason} ->

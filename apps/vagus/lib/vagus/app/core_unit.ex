@@ -67,14 +67,27 @@ defmodule Vagus.App.CoreUnit do
         Logger.info("Boot: creating the Core #{version} container")
         stops_seen = Keyword.get(opts, :stops, &Lifecycle.stops/0).()
 
-        case Keyword.get(opts, :start, &Lifecycle.start/0).() do
+        case start_unattended(opts, stops_seen) do
           :ok ->
             await_healthy(opts)
+
+          # Refused for a stop or a shutdown: nothing to retry.
+          {:error, refusal} = error when refusal in [:stopped, :shutting_down] ->
+            error
 
           {:error, reason} = error ->
             hand_off(reason, stops_seen, opts)
             error
         end
+    end
+  end
+
+  # The create is boot's own, not the user's: a stop or a shutdown that lands
+  # after the reading wins under the lifecycle lock.
+  defp start_unattended(opts, stops_seen) do
+    case Keyword.get(opts, :start, &Lifecycle.start(stops_seen: &1)) do
+      start when is_function(start, 1) -> start.(stops_seen)
+      start -> start.()
     end
   end
 

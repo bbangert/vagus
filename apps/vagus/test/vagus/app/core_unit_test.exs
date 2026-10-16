@@ -149,6 +149,21 @@ defmodule Vagus.App.CoreUnitTest do
       assert log =~ "Vagus.Provisioner retries it"
     end
 
+    test "boot's create passes the stops it saw, so a stop since wins under the lock" do
+      test_pid = self()
+
+      assert CoreUnit.start(
+               adopt: fn -> :absent end,
+               installed: fn -> "2026.10.1" end,
+               image_present?: fn _version -> true end,
+               stops: fn -> 4 end,
+               start: fn seen -> send(test_pid, {:start, seen}) && :ok end,
+               health: fn _opts -> :healthy end
+             ) == :ok
+
+      assert_received {:start, 4}
+    end
+
     test "a create that succeeds hands nothing off" do
       assert CoreUnit.start(
                adopt: fn -> :absent end,

@@ -720,12 +720,17 @@ defmodule Vagus.App.StepsTest do
                Steps.run(:ensure_image, container_input(ctx, fake))
     end
 
-    test "a presence check that errors leaves the create to report", ctx do
+    test "a presence check that errors fails the step, and the next attempt pulls", ctx do
       {fake, _opts} = engine(%{})
       Fake.fail_next(fake, :image_present?, :timeout)
 
-      assert {:ok, @image} = Steps.run(:ensure_image, container_input(ctx, fake))
+      assert {:error, {:image_check, :timeout}} =
+               Steps.run(:ensure_image, container_input(ctx, fake))
+
       assert Fake.calls(fake) == [{:image_present?, [@image]}]
+
+      assert {:ok, @image} = Steps.run(:ensure_image, container_input(ctx, fake))
+      assert [_, {:image_present?, [@image]}, {:pull, [@image]}] = Fake.calls(fake)
     end
 
     # FakeBackend reports a pull as `{:pull, spec}`, and the engine logs any
