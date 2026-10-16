@@ -222,11 +222,12 @@ defmodule Vagus.Runtime.Migration do
   end
 
   # One not delivered (Core down, no token yet) is tried again at the next
-  # check.
-  defp tell({:short, need, free}, nil, opts) do
+  # check, and the uncertainty it leaves is kept. Raising again under the
+  # fixed id only replaces what Home Assistant shows.
+  defp tell({:short, need, free}, previous, opts) when previous in [nil, :unknown] do
     case notify(opts).({:raise, need, free}) do
       :ok -> %{need: need, free: free}
-      _not_delivered -> nil
+      _not_delivered -> previous
     end
   end
 

@@ -579,12 +579,11 @@ defmodule Vagus.Runtime.Host do
       _done -> File.write(marker, "")
     end
 
-    # Not pending: a warning raised before a restart may still be up, and the
-    # Host that raised it is gone. One dismissal per start settles it; one of
-    # a notification Home Assistant does not have changes nothing.
-    if Migration.pending?(opts),
-      do: %{state | migration: opts},
-      else: %{state | migration: opts, notice: :unknown}
+    # A warning raised before a restart may still be up, and the Host that
+    # knew is gone: the first check raises or dismisses it either way. A
+    # dismissal of a notification Home Assistant does not have changes
+    # nothing. Not pending, that check is a dismissal and the end of it.
+    %{state | migration: opts, notice: :unknown}
   end
 
   defp migration_opts(state) do

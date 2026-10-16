@@ -681,7 +681,10 @@ defmodule Vagus.Runtime.HostTest do
       assert {_, new, _, _} = List.keyfind(Supervisor.which_children(supervisor), ctx.name, 0)
       assert is_pid(new) and new != old
 
-      assert {:ok, _} = Host.checkout(ctx.name, :ops, 5_000)
+      # Its preparation runs before it reads a request, and a loaded runner
+      # can stretch that past a checkout's 5 s; ready, it answers at once.
+      assert await_ready(ctx.name, true) == :ok
+      assert {:ok, _} = Host.checkout(ctx.name, :ops, 0)
     end
 
     test "an unknown class is :badarg and the Host lives on", ctx do
@@ -895,6 +898,34 @@ defmodule Vagus.Runtime.HostTest do
       end)
     end
 
+    test "a restart before the cleanup still dismisses a warning shown before it", ctx do
+      test = self()
+      free = :atomics.new(1, [])
+      :atomics.put(free, 1, 10)
+      df = fn path -> df(:atomics.get(free, 1)).(path) end
+      notify = &(send(test, {:notify, &1}) && :ok)
+
+      capture_log(fn ->
+        opts = [
+          validated?: fn -> false end,
+          image_present?: fn _ -> false end,
+          df: df,
+          notify: fn event -> notify.(event) end
+        ]
+
+        stepped(ctx, opts, migration_check_ms: 60_000)
+        assert %{notice: %{}} = next_check()
+        assert_received {:notify, {:raise, _, _}}
+
+        stop_supervised!(ctx.name)
+        :atomics.put(free, 1, 100_000)
+        stepped(ctx, opts, migration_check_ms: 60_000)
+
+        assert %{cleanup: {:waiting, :validated}, notice: nil} = next_check()
+        assert_received {:notify, :dismiss}
+      end)
+    end
+
     test "a notification Home Assistant did not take is tried again", ctx do
       test = self()
       up = :atomics.new(1, [])
@@ -912,7 +943,7 @@ defmodule Vagus.Runtime.HostTest do
           notify: notify
         )
 
-        assert %{notice: nil} = next_check()
+        assert %{notice: :unknown} = next_check()
         assert_received {:notify, {:raise, _, _}}
         :atomics.put(up, 1, 1)
         assert %{notice: %{}} = next_check()
