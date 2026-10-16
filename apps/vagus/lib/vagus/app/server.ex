@@ -593,6 +593,20 @@ defmodule Vagus.App.Server do
      [{{:timeout, :health_deadline}, deadline(:health_deadline), ref}]}
   end
 
+  # The start's inspect failed: this tick inspects again for the schedule.
+  defp spawn_health(%{health_check: {:unknown, engine_opts, _tries}} = data) do
+    {ref, parent, id} = {make_ref(), self(), data.container_id}
+    steps = steps()
+
+    pid =
+      spawn_link(fn ->
+        send(parent, {:health, ref, {:schedule, steps.health_schedule(id, engine_opts)}})
+      end)
+
+    {:keep_state, %{data | health: {pid, ref, id}},
+     [{{:timeout, :health_deadline}, deadline(:health_deadline), ref}]}
+  end
+
   # A tick outliving the record that armed it (one rewritten mid-operation).
   defp spawn_health(_data), do: :keep_state_and_data
 

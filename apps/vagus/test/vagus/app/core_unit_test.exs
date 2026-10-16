@@ -130,6 +130,37 @@ defmodule Vagus.App.CoreUnitTest do
       assert log =~ "image is absent; Vagus.Provisioner pulls it"
     end
 
+    test "a create that fails is handed to the Provisioner's retries, with the stops seen before it" do
+      test_pid = self()
+
+      log =
+        capture_log(fn ->
+          assert CoreUnit.start(
+                   adopt: fn -> :absent end,
+                   installed: fn -> "2026.10.1" end,
+                   image_present?: fn _version -> true end,
+                   stops: fn -> 7 end,
+                   start: fn -> {:error, {:failed, :create, "boom"}} end,
+                   retry: fn seen -> send(test_pid, {:retry, seen}) end
+                 ) == {:error, {:failed, :create, "boom"}}
+        end)
+
+      assert_received {:retry, 7}
+      assert log =~ "Vagus.Provisioner retries it"
+    end
+
+    test "a create that succeeds hands nothing off" do
+      assert CoreUnit.start(
+               adopt: fn -> :absent end,
+               installed: fn -> "2026.10.1" end,
+               image_present?: fn _version -> true end,
+               stops: fn -> 0 end,
+               start: fn -> :ok end,
+               health: fn _opts -> :healthy end,
+               retry: fn _seen -> flunk("handed off") end
+             ) == :ok
+    end
+
     test "a presence check that errors still tries the create, which reports what is wrong" do
       assert CoreUnit.start(
                adopt: fn -> :absent end,

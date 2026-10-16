@@ -785,6 +785,21 @@ defmodule Vagus.App.StepsTest do
       end
     end
 
+    test "is unknown, for the app to inspect again, when the start's inspect fails", ctx do
+      {fake, engine_opts} = engine(%{"fake-id" => [healthcheck: %{test: ["CMD", "true"]}]})
+      Fake.fail_next(fake, :inspect, :timeout)
+      podman = engine_opts ++ [schedules_healthchecks: false]
+
+      {:ok, fact} = Steps.run(:start, input(ctx, %{engine_opts: podman}))
+      assert fact.health_check == {:unknown, podman, 0}
+
+      assert {:ok, %{interval_ms: 30_000}} = Steps.health_schedule("fake-id", podman)
+
+      Fake.fail_next(fake, :inspect, :timeout)
+      {:ok, fact} = Steps.run(:start, input(ctx, %{engine_opts: engine_opts}))
+      assert fact.health_check == nil
+    end
+
     test "is none under an engine that schedules checks itself, or with no check", ctx do
       {fact, _} = started_fact(ctx, %{test: ["CMD", "true"]}, [])
       assert %{healthcheck: true, health_check: nil} = fact

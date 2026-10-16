@@ -359,12 +359,37 @@ defmodule Vagus.App.Steps do
         }
 
       {:error, _reason} ->
-        %{container_id: id, ip: nil, healthcheck: false}
+        unknown_health(id, opts)
     end
   rescue
     e ->
       Logger.warning("Vagus.App.Steps: inspect of #{config.slug} failed: #{inspect(e)}")
-      %{container_id: id, ip: nil, healthcheck: false}
+      unknown_health(id, opts)
+  end
+
+  # Whether the container declares a check is unknown: an engine that runs
+  # none itself leaves the app process to inspect again for it.
+  defp unknown_health(id, opts) do
+    engine_opts = engine_opts(opts)
+
+    health_check =
+      if Engine.schedules_healthchecks?(engine_opts), do: nil, else: {:unknown, engine_opts, 0}
+
+    %{container_id: id, ip: nil, healthcheck: false, health_check: health_check}
+  end
+
+  @doc """
+  The healthcheck schedule of a started container, for an app process whose
+  start could not inspect it: `{:ok, nil}` when it declares no check.
+  """
+  @spec health_schedule(String.t(), keyword()) :: {:ok, map() | nil} | {:error, term()}
+  def health_schedule(id, engine_opts) do
+    case Engine.inspect(id, engine_opts) do
+      {:ok, container} -> {:ok, health_check(container.healthcheck, engine_opts)}
+      {:error, reason} -> {:error, reason}
+    end
+  rescue
+    e -> {:error, {:raised, e.__struct__}}
   end
 
   # Only for an engine that runs no checks itself. Docker's defaults stand in

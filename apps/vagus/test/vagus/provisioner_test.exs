@@ -448,6 +448,119 @@ defmodule Vagus.ProvisionerTest do
     refute log =~ "retrying"
   end
 
+  describe "a Core start boot handed over" do
+    # Nothing to provision: the installed image is there, so only the
+    # handed-over start runs.
+    defp idle_provisioner(stops, start) do
+      parent = self()
+
+      pid =
+        start_supervised!(
+          {Provisioner,
+           steps: [:provision_core],
+           installed: fn -> "2026.7.3" end,
+           ping: fn -> :ok end,
+           image_present: fn _version -> send(parent, :image_checked) && true end,
+           stops: fn ->
+             count = :atomics.get(stops, 1)
+             send(parent, {:stops_read, count})
+             count
+           end,
+           start: start,
+           await_healthy: fn -> send(parent, :healthy) && :healthy end,
+           retry_base: 1,
+           name: nil}
+        )
+
+      assert_receive :image_checked, 1_000
+      pid
+    end
+
+    test "is retried until it succeeds" do
+      parent = self()
+      stops = :atomics.new(1, [])
+      starts = :counters.new(1, [])
+
+      start = fn seen ->
+        :counters.add(starts, 1, 1)
+        send(parent, {:start, seen, :counters.get(starts, 1)})
+        if :counters.get(starts, 1) < 2, do: {:error, {:failed, :create, "boom"}}, else: :ok
+      end
+
+      capture_log(fn ->
+        pid = idle_provisioner(stops, start)
+        Provisioner.retry_core_start(0, pid)
+        assert_receive {:start, 0, 1}, 1_000
+        assert_receive {:start, 0, 2}, 1_000
+        assert_receive :healthy, 1_000
+      end)
+    end
+
+    test "ends once Core is stopped after the boot's attempt" do
+      parent = self()
+      stops = :atomics.new(1, [])
+
+      start = fn seen ->
+        send(parent, {:start, seen})
+        # The user's POST /core/stop lands while this start fails.
+        :atomics.put(stops, 1, 1)
+        {:error, :busy}
+      end
+
+      log =
+        capture_log(fn ->
+          pid = idle_provisioner(stops, start)
+          Provisioner.retry_core_start(0, pid)
+          assert_receive {:start, 0}, 1_000
+          # The retry's own read sees the stop, and goes no further.
+          assert_receive {:stops_read, 1}, 1_000
+          :sys.get_state(pid)
+          refute_received {:start, _}
+        end)
+
+      assert log =~ "not starting it"
+    end
+  end
+
+  test "a stop of Core while a failed pull backs off ends the pulls" do
+    parent = self()
+    stops = :atomics.new(1, [])
+
+    log =
+      capture_log(fn ->
+        pid =
+          start_supervised!(
+            {Provisioner,
+             steps: [:provision_core],
+             installed: fn -> "2026.7.3" end,
+             ping: fn -> :ok end,
+             image_present: fn _version -> false end,
+             connection: fn -> :internet end,
+             stops: fn ->
+               count = :atomics.get(stops, 1)
+               send(parent, {:stops_read, count})
+               count
+             end,
+             pull: fn version ->
+               send(parent, {:pull, version})
+               :atomics.put(stops, 1, 1)
+               {:error, {:pull, :timeout}}
+             end,
+             start: fn _seen -> send(parent, :start) && :ok end,
+             retry_base: 1,
+             name: nil}
+          )
+
+        assert_receive {:pull, "2026.7.3"}, 1_000
+        assert_receive {:stops_read, 1}, 1_000
+        :sys.get_state(pid)
+        refute_received {:pull, _}
+        refute_received :start
+      end)
+
+    assert log =~ "not starting it"
+  end
+
   test "a start that fails after an install is retried until it succeeds" do
     parent = self()
     starts = :counters.new(1, [])

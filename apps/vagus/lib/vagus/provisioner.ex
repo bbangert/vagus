@@ -125,6 +125,16 @@ defmodule Vagus.Provisioner do
     end
   end
 
+  @doc """
+  Takes over retrying a Core start that boot could not make, on the same
+  backoff as its own, until it succeeds or Core is stopped after the
+  `Vagus.Core.Lifecycle.stops/0` reading the caller took before its
+  attempt. A no-op where no Provisioner runs.
+  """
+  @spec retry_core_start(non_neg_integer(), GenServer.server()) :: :ok
+  def retry_core_start(stops_seen, server \\ __MODULE__),
+    do: GenServer.cast(server, {:retry_core_start, stops_seen})
+
   @impl GenServer
   def init(opts) do
     state = %{
@@ -171,6 +181,12 @@ defmodule Vagus.Provisioner do
 
   @impl GenServer
   def handle_continue(:run, state), do: {:noreply, run_steps(state.steps, state)}
+
+  @impl GenServer
+  def handle_cast({:retry_core_start, stops_seen}, state) do
+    state = %{state | stops_seen: stops_seen, retry_attempt: 0}
+    {:noreply, retry_later(state, :attempt_start, "Core start at boot failed")}
+  end
 
   @impl GenServer
   def handle_info({:provision_core, version, stops_seen}, state) do
@@ -575,7 +591,13 @@ defmodule Vagus.Provisioner do
 
   # The installed version, never the latest: an image gone from the store is
   # not an update.
-  defp attempt_pull(state) do
+  # A stop of Core while a pull backs off ends the pulls too: the start
+  # they lead to would not run.
+  defp attempt_pull(%{stops_seen: seen} = state) do
+    if state.stops.() == seen, do: pull_installed(state), else: stopped(state)
+  end
+
+  defp pull_installed(state) do
     case state.pull.(state.version) do
       :ok ->
         Logger.info("Vagus.Provisioner: Core #{state.version}'s image pulled — starting it")
@@ -611,15 +633,16 @@ defmodule Vagus.Provisioner do
         state
 
       {:error, :stopped} ->
-        Logger.info(
-          "Vagus.Provisioner: Core was stopped since provisioning began — not starting it"
-        )
-
-        state
+        stopped(state)
 
       {:error, reason} ->
         retry_later(state, :attempt_start, "Core start failed (#{inspect(reason)})")
     end
+  end
+
+  defp stopped(state) do
+    Logger.info("Vagus.Provisioner: Core was stopped since provisioning began — not starting it")
+    state
   end
 
   defp start_core(%{start: start} = state) when is_function(start, 1),

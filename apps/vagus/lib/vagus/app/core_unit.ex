@@ -7,7 +7,8 @@ defmodule Vagus.App.CoreUnit do
   is every boot, and under Docker it repairs a recreate a shutdown cut
   short. With no version installed it is left to an explicit
   `POST /core/start` or `/core/update`, or to `Vagus.Provisioner` on a first
-  boot. An installed version whose image the engine lacks is the
+  boot. A create that fails is handed to the Provisioner's start retries,
+  and an installed version whose image the engine lacks is the
   Provisioner's too: the pull needs the internet, which boot does not wait
   for, and the Provisioner waits and retries, then starts Core itself.
 
@@ -64,11 +65,26 @@ defmodule Vagus.App.CoreUnit do
 
       _present_or_unknown ->
         Logger.info("Boot: creating the Core #{version} container")
+        stops_seen = Keyword.get(opts, :stops, &Lifecycle.stops/0).()
 
-        with :ok <- Keyword.get(opts, :start, &Lifecycle.start/0).() do
-          await_healthy(opts)
+        case Keyword.get(opts, :start, &Lifecycle.start/0).() do
+          :ok ->
+            await_healthy(opts)
+
+          {:error, reason} = error ->
+            hand_off(reason, stops_seen, opts)
+            error
         end
     end
+  end
+
+  # Nothing else brings an absent Core back once boot moves on: the
+  # Provisioner retries the start on its backoff, until a stop since this
+  # attempt says otherwise.
+  defp hand_off(reason, stops_seen, opts) do
+    Logger.warning("Boot: Core create failed (#{inspect(reason)}); Vagus.Provisioner retries it")
+
+    Keyword.get(opts, :retry, &Vagus.Provisioner.retry_core_start/1).(stops_seen)
   end
 
   defp await_healthy(opts) do

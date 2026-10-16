@@ -409,6 +409,32 @@ defmodule Vagus.App.PolicyTest do
       end
     end
 
+    test "no container verdict, unhealthy or healthy, replaces the URL probe's failure" do
+      data = probe_failed(%{last_health: :healthy})
+
+      {data, _} =
+        Policy.on_event(%Event{action: :health, health: :unhealthy, id: "c1"}, data)
+
+      assert %{last_event: {:failed, :unhealthy}, last_health: :unhealthy} = data
+      assert Policy.derive(:idle, data) == :error
+
+      {data, _} = Policy.health_check({:ok, :healthy}, data)
+      assert %{last_event: {:failed, :unhealthy}, last_health: :healthy} = data
+      assert Policy.derive(:idle, data) == :error
+    end
+
+    test "a container unhealthy under a URL failure still restarts by the ladder" do
+      data = probe_failed(%{last_health: :healthy})
+      data = %{data | watchdog: true}
+
+      {data, effects} =
+        Policy.on_event(%Event{action: :health, health: :unhealthy, id: "c1"}, data)
+
+      assert {:timer, :retry, 0, {:retry, "c1"}} in effects
+      assert data.attempt == 1
+      assert Policy.derive(:idle, data) == :error
+    end
+
     test "a container check still runs while the probe reports the app failed" do
       data = probe_failed(%{last_health: :healthy})
       {_data, effects} = Policy.health_check({:ok, :healthy}, data)
@@ -443,6 +469,48 @@ defmodule Vagus.App.PolicyTest do
 
       assert Policy.health_timer(dead, :interval_ms) == []
       assert Policy.health_timer(%{dead | container_id: nil}, :interval_ms) == []
+    end
+  end
+
+  describe "a schedule the start could not inspect" do
+    @unknown {:unknown, [engine: :fake], 0}
+    @schedule %{first_ms: 40_000, interval_ms: 30_000, engine_opts: [engine: :fake]}
+
+    test "a start with an unknown schedule arms a re-inspect tick" do
+      {data, _} = begin(:start, %{}, app(%{wanted: :stopped}))
+
+      {data, effects} =
+        step(
+          data,
+          {:ok, %{container_id: "c1", ip: @ip, healthcheck: false, health_check: @unknown}}
+        )
+
+      assert {:timer, :healthcheck, 10_000, {:healthcheck, "c1"}} in effects
+      assert data.health_check == @unknown
+    end
+
+    test "an inspect that finds the check arms its first tick; one that finds none ends it" do
+      data = running(%{health_check: @unknown})
+
+      {data, effects} = Policy.health_check({:schedule, {:ok, @schedule}}, data)
+      assert data.health_check == @schedule
+      assert effects == [{:timer, :healthcheck, 40_000, {:healthcheck, "c1"}}]
+
+      assert Policy.health_check({:schedule, {:ok, nil}}, running(%{health_check: @unknown})) ==
+               {running(%{health_check: nil}), []}
+    end
+
+    test "a failed re-inspect tries again, five times in all, then gives up" do
+      data = running(%{health_check: @unknown})
+
+      {data, ticks} =
+        Enum.reduce(1..6, {data, []}, fn _, {data, ticks} ->
+          {data, effects} = Policy.health_check({:schedule, {:error, :timeout}}, data)
+          {data, ticks ++ effects}
+        end)
+
+      assert length(ticks) == 4
+      assert data.health_check == nil
     end
   end
 

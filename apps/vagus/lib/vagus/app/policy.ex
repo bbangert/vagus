@@ -131,6 +131,8 @@ defmodule Vagus.App.Policy do
   # container that dies a second after each start never runs out.
   @settled_ms 120_000
   @image_retry_ms 30_000
+  @reinspect_ms 10_000
+  @reinspect_tries 5
   @image_retry_cap_ms 1_800_000
   @refused_image_attempts 3
   @image_refused ~r/manifest unknown|not found|unauthorized|denied|does not exist/i
@@ -264,17 +266,20 @@ defmodule Vagus.App.Policy do
 
   # The container's own verdict is kept apart from `last_event`, and only a
   # change of it is an event: podman reports every check, and the app
-  # process's own checks repeat what the engine's event carried. A passing
-  # container check says nothing about the URL the watchdog probes, so it
-  # never clears that probe's failure.
+  # process's own checks repeat what the engine's event carried. The
+  # container's check says nothing about the URL the watchdog probes, so no
+  # verdict of it replaces that probe's failure; an unhealthy one still
+  # restarts the app as one always does.
   defp container_event(%{action: :health, health: health}, %{last_health: health} = data),
     do: {data, []}
 
   defp container_event(
-         %{action: :health, health: :healthy},
+         %{action: :health, health: health},
          %{last_event: {:failed, :unhealthy}} = data
-       ),
-       do: {%{data | last_health: :healthy}, []}
+       ) do
+    data = %{data | last_health: health}
+    if health == :unhealthy, do: retry(data, []), else: {data, []}
+  end
 
   defp container_event(%{action: :health, health: :healthy}, data),
     do: observe(%{data | last_health: :healthy}, :healthy, [])
@@ -367,11 +372,20 @@ defmodule Vagus.App.Policy do
   event would, and anything else (`:starting`, a skipped or failed run) only
   waits for the next tick. None is armed once a shutdown is in flight.
   """
-  @spec health_check({:ok, atom()} | {:error, term()} | :skip, map()) :: {map(), [effect()]}
+  @spec health_check(
+          {:ok, atom()}
+          | {:error, term()}
+          | :skip
+          | {:schedule, {:ok, map() | nil} | {:error, term()}},
+          map()
+        ) :: {map(), [effect()]}
   def health_check(result, data) do
     cond do
       not alive?(data) ->
         {data, []}
+
+      match?({:schedule, _}, result) ->
+        scheduled(elem(result, 1), data)
 
       match?({:ok, health} when health in [:healthy, :unhealthy], result) ->
         {:ok, health} = result
@@ -389,13 +403,38 @@ defmodule Vagus.App.Policy do
   its own, or its container is not up.
   """
   @spec health_timer(map(), :first_ms | :interval_ms) :: [effect()]
-  def health_timer(%{health_check: %{} = check, shutting_down: false} = data, which) do
+  def health_timer(%{health_check: check, shutting_down: false} = data, which)
+      when check != nil do
     if alive?(data),
-      do: [{:timer, :healthcheck, Map.fetch!(check, which), {:healthcheck, data.container_id}}],
+      do: [{:timer, :healthcheck, tick_ms(check, which), {:healthcheck, data.container_id}}],
       else: []
   end
 
   def health_timer(_data, _which), do: []
+
+  defp tick_ms({:unknown, _engine_opts, _tries}, _which), do: @reinspect_ms
+  defp tick_ms(check, which), do: Map.fetch!(check, which)
+
+  # A start whose inspect failed left the schedule `{:unknown, engine_opts,
+  # tries}`; each tick inspects again (`Vagus.App.Steps.health_schedule/2`),
+  # a few times, then the app runs without checks of its own.
+  defp scheduled({:ok, nil}, data), do: {%{data | health_check: nil}, []}
+
+  defp scheduled({:ok, schedule}, data) do
+    data = %{data | health_check: schedule}
+    {data, health_timer(data, :first_ms)}
+  end
+
+  defp scheduled({:error, _reason}, %{health_check: {:unknown, opts, tries}} = data) do
+    if tries + 1 < @reinspect_tries do
+      data = %{data | health_check: {:unknown, opts, tries + 1}}
+      {data, health_timer(data, :interval_ms)}
+    else
+      {%{data | health_check: nil}, []}
+    end
+  end
+
+  defp scheduled(_stale, data), do: {data, health_timer(data, :interval_ms)}
 
   # A container the URL probe failed still runs.
   defp alive?(%{container_id: id, last_event: event}) when id != nil,
@@ -772,7 +811,7 @@ defmodule Vagus.App.Policy do
     do: [{:cancel, :probe}, {:cancel, :settled}, {:cancel, :retry}] ++ cancel_health(data)
 
   # Only an app that runs its own checks can have a tick to cancel.
-  defp cancel_health(%{health_check: %{}}), do: [{:cancel, :healthcheck}]
+  defp cancel_health(%{health_check: check}) when check != nil, do: [{:cancel, :healthcheck}]
   defp cancel_health(_data), do: []
 
   defp settle(outcome, %{run: %{op: op, step: {name, arg}}} = data),

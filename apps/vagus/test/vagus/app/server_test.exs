@@ -1230,6 +1230,26 @@ defmodule Vagus.App.ServerTest do
       assert {:ok, %{state: :error}} = App.info(slug)
     end
 
+    test "a start that could not inspect inspects again, then arms its checks", %{fake: fake} do
+      app_deadlines(%{retry: 600_000, healthcheck: 1})
+      engine_opts = [engine: Fake, fake: fake, schedules_healthchecks: false]
+      {_slug, pid} = installed()
+      Fake.fail_next(fake, :inspect, :timeout)
+      Fake.block_next(fake, :healthcheck)
+      t = op(pid, {:start, %{}})
+
+      answer(
+        :start,
+        {:ok, Map.merge(@started, %{health_check: {:unknown, engine_opts, 0}})}
+      )
+
+      assert :ok = Task.await(t)
+      assert is_pid(next_check())
+      assert %{health_check: %{interval_ms: 30_000}} = data(pid)
+      # The first re-inspect failed, the second found the check.
+      assert [{:inspect, ["c1"]}, {:inspect, ["c1"]}] = Fake.calls(fake)
+    end
+
     test "a container that dies kills the check in flight, whose verdict never lands",
          %{fake: fake} do
       {_slug, pid, blocked} = checked_start(fake)

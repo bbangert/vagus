@@ -20,6 +20,8 @@ defmodule Vagus.App.StepsStub do
 
   def run(name, input), do: ask(name, input)
 
+  defdelegate health_schedule(id, engine_opts), to: Vagus.App.Steps
+
   defp ask(name, input) do
     send(Application.fetch_env!(:vagus, :app_steps_test_pid), {:step, name, input, self()})
 
