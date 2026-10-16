@@ -929,6 +929,7 @@ defmodule Vagus.Runtime.Engine.PodmanContractTest do
             mountinfo: Path.join(root, "mountinfo"),
             validated?: fn -> false end,
             wanted_images: fn -> {:ok, ["ghcr.io/vagus/app:1"]} end,
+            core_image: fn -> nil end,
             image_present?: fn _ -> false end,
             notify: fn _ -> :ok end,
             df: df
@@ -944,42 +945,42 @@ defmodule Vagus.Runtime.Engine.PodmanContractTest do
       refute Enum.any?(FakePodman.verbs(fake), &match?(["pull" | _], &1))
     end
 
-    test "the room is per image: Core's pull fits where an app's does not" do
+    test "an app asking first is refused the room Core still needs, and Core then pulls" do
       root = Path.join(System.tmp_dir!(), "podman-room-#{System.unique_integer([:positive])}")
       store = Path.join(root, "balena-engine/image/overlay2")
       on_exit(fn -> File.rm_rf(root) end)
 
-      # balena holds Core as one 100 MiB layer; the app it does not hold
-      # counts as 1 GiB.
+      # balena holds Core as one 100 MiB layer and the app as one of 200 MiB.
+      # 350 MiB free: Core alone needs 150, the app alone 300, both 400.
       core = Vagus.Core.Container.image("2026.7.3")
-      diff = "sha256:" <> String.duplicate("a", 64)
-      config = Jason.encode!(%{"rootfs" => %{"diff_ids" => [diff]}})
-      id = Base.encode16(:crypto.hash(:sha256, config), case: :lower)
-      File.mkdir_p!(Path.join(store, "imagedb/content/sha256"))
-      File.write!(Path.join(store, "imagedb/content/sha256/#{id}"), config)
-      File.mkdir_p!(Path.join(store, "layerdb/sha256/" <> String.duplicate("a", 64)))
+      app = "ghcr.io/vagus/app:1"
 
-      File.write!(
-        Path.join(store, "layerdb/sha256/#{String.duplicate("a", 64)}/size"),
-        "104857600"
-      )
+      tags =
+        for {ref, hex, size} <- [{core, "a", 100}, {app, "b", 200}], into: %{} do
+          diff = "sha256:" <> String.duplicate(hex, 64)
+          config = Jason.encode!(%{"rootfs" => %{"diff_ids" => [diff]}})
+          id = Base.encode16(:crypto.hash(:sha256, config), case: :lower)
+          File.mkdir_p!(Path.join(store, "imagedb/content/sha256"))
+          File.write!(Path.join(store, "imagedb/content/sha256/#{id}"), config)
+          layer = Path.join(store, "layerdb/sha256/" <> String.duplicate(hex, 64))
+          File.mkdir_p!(layer)
+          File.write!(Path.join(layer, "size"), "#{size * 1_048_576}")
+          {ref, "sha256:" <> id}
+        end
 
       File.write!(
         Path.join(store, "repositories.json"),
-        Jason.encode!(%{
-          "Repositories" => %{
-            "ghcr.io/home-assistant/home-assistant" => %{core => "sha256:" <> id}
-          }
-        })
+        Jason.encode!(%{"Repositories" => %{"r" => tags}})
       )
 
       File.write!(Path.join(root, "mountinfo"), "")
 
       df = fn _ ->
-        {"Filesystem 1K-blocks Used Available Use% Mounted on\n/dev/root 9999999 1 #{500 * 1024} 1% /\n",
+        {"Filesystem 1K-blocks Used Available Use% Mounted on\n/dev/root 9999999 1 #{350 * 1024} 1% /\n",
          0}
       end
 
+      core_back = :atomics.new(1, [])
       fake = FakePodman.start([{"pull *", [{0, "5b0e\n"}]}])
 
       host =
@@ -991,15 +992,25 @@ defmodule Vagus.Runtime.Engine.PodmanContractTest do
             mountinfo: Path.join(root, "mountinfo"),
             validated?: fn -> false end,
             notify: fn _ -> :ok end,
+            core_image: fn -> core end,
+            image_present?: fn ref -> ref == core and :atomics.get(core_back, 1) == 1 end,
             df: df
           ]
         )
 
       opts = [engine: Engine.Podman, host: host, podman_bin: fake.bin]
+
+      # The pull permit is idle and the app asks first.
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert Engine.pull(app, opts) == {:error, {:failed, :pull, :no_space}}
+      end)
+
       assert Engine.pull(core, opts) == :ok
-      assert Engine.pull("ghcr.io/vagus/app:1", opts) == {:error, {:failed, :pull, :no_space}}
-      assert [["pull" | args]] = Enum.filter(FakePodman.verbs(fake), &match?(["pull" | _], &1))
-      assert List.last(args) == "docker://" <> core
+      :atomics.put(core_back, 1, 1)
+      assert Engine.pull(app, opts) == :ok
+
+      pulled = for ["pull" | args] <- FakePodman.verbs(fake), do: List.last(args)
+      assert pulled == ["docker://" <> core, "docker://" <> app]
     end
 
     # The stop must outlast the 300 ms its permit wait may use.

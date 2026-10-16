@@ -20,8 +20,9 @@ defmodule Vagus.Runtime.Migration do
     3. Images are pulled again by their usual callers, Core's first (the
        Host serves Core's pull ahead of queued ones). Each pull goes ahead
        only when its own image fits beside balena's store (`pull_space/2`),
-       so Core's pull needs room for Core alone; a refused one is retried
-       by its caller.
+       so Core's pull needs room for Core alone, and any other leaves room
+       for Core until Core's image is back; a refused one is retried by its
+       caller.
     4. While the wanted images do not all fit, Home Assistant shows a
        notification saying how much room the migration needs; it is
        dismissed once they fit or the migration is done.
@@ -35,7 +36,8 @@ defmodule Vagus.Runtime.Migration do
   All paths and probes are options, defaulted for the device: `:legacy_root`,
   `:marker`, `:config_dir`, `:graphroot`, `:mountinfo`, `:validated?`
   (0-arity), `:wanted_images` (0-arity, `{:ok, refs} | {:error, reason}`),
-  `:image_present?` (1-arity, a boolean or an error), `:core_healthy?`
+  `:image_present?` (1-arity, a boolean or an error), `:core_image` (0-arity,
+  the installed Core's image or `nil`), `:core_healthy?`
   (0-arity), `:df` (as `Vagus.Backend.Host.DiskUsage` takes it), `:notify`
   (1-arity, `{:raise, need, free} | :dismiss`, `:ok` once Home Assistant has
   it), `:lstat` and `:walk_hook` (the deletion's stat, and a call between a
@@ -166,10 +168,34 @@ defmodule Vagus.Runtime.Migration do
   @doc """
   Whether one image fits, by the same estimate as `space/1`: the room one
   pull needs while a migration is pending. `:ok` once none is.
+
+  Until Core's image is back, any other image must leave room for it too:
+  an app pulled first could otherwise take the room Core needs, and before
+  the slot is validated nothing would free it.
   """
   @spec pull_space(String.t(), keyword()) :: space() | {:error, term()}
   def pull_space(image, opts) do
-    if pending?(opts), do: fits([image], opts), else: :ok
+    if pending?(opts), do: fits([image | reserved_for_core(image, opts)], opts), else: :ok
+  end
+
+  defp reserved_for_core(image, opts) do
+    case core_image(opts) do
+      nil -> []
+      ^image -> []
+      core -> if present?(core, opts), do: [], else: [core]
+    end
+  end
+
+  # nil while Core has no installed version: there is nothing to keep room for.
+  defp core_image(opts), do: Keyword.get(opts, :core_image, &default_core_image/0).()
+
+  defp default_core_image do
+    case Vagus.Core.Versions.installed() do
+      nil -> nil
+      version -> Vagus.Core.Container.image(version)
+    end
+  catch
+    :exit, _not_running -> nil
   end
 
   defp fits(images, opts) do

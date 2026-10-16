@@ -29,7 +29,8 @@ defmodule Vagus.Runtime.MigrationTest do
       validated?: fn -> true end,
       wanted_images: fn -> {:ok, [@core, @app]} end,
       image_present?: fn _image -> true end,
-      core_healthy?: fn -> true end
+      core_healthy?: fn -> true end,
+      core_image: fn -> @core end
     ]
 
     %{root: root, legacy: legacy, opts: opts}
@@ -308,6 +309,17 @@ defmodule Vagus.Runtime.MigrationTest do
     test "an unreadable df is unknown, not an empty disk", %{opts: opts} do
       opts = Keyword.merge(opts, image_present?: fn _ -> false end, df: fn _ -> {"", 1} end)
       assert Migration.space(opts) == {:error, :df_failed}
+    end
+
+    test "pull_space/2 keeps room for Core while Core's image is not back", %{opts: opts} do
+      opts = Keyword.merge(opts, df: df_free(1100 * @mib), image_present?: fn _ -> false end)
+      # The app with Core: every layer once (1050) plus half of Core (500).
+      assert {:short, need, _} = Migration.pull_space(@app, opts)
+      assert need == 1550 * @mib
+
+      # Core back, or no Core installed: the app alone (225).
+      assert Migration.pull_space(@app, Keyword.put(opts, :image_present?, &(&1 == @core))) == :ok
+      assert Migration.pull_space(@app, Keyword.put(opts, :core_image, fn -> nil end)) == :ok
     end
 
     test "pull_space/2 asks room for that image alone", %{opts: opts} do

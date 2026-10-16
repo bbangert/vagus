@@ -7,6 +7,11 @@ defmodule Vagus.Runtime.Engine.Podman.LogFollowTest do
 
   @fixtures Path.expand("../../../fixtures/podman", __DIR__)
 
+  # Each wait is for something that does come; a slow runner can take long
+  # over the larger streams (a 10,001-line backfill is scanned and sent in
+  # acked chunks), and a generous wait costs a passing run nothing.
+  @wait_ms 30_000
+
   setup do
     log = Path.join(System.tmp_dir!(), "podman-follow-#{System.unique_integer([:positive])}.log")
     on_exit(fn -> File.rm(log) end)
@@ -39,7 +44,7 @@ defmodule Vagus.Runtime.Engine.Podman.LogFollowTest do
   defp records(lines), do: Enum.map_join(lines, &(&1 <> "\n"))
 
   defp next_chunk(pid) do
-    assert_receive {:log_chunk, chunk}, 10_000
+    assert_receive {:log_chunk, chunk}, @wait_ms
     Follow.ack(pid)
     chunk
   end
@@ -57,7 +62,7 @@ defmodule Vagus.Runtime.Engine.Podman.LogFollowTest do
 
     {:ok, pid} = Engine.follow_logs("x", self(), engine(log, nil))
     assert next_chunk(pid) == "partial-rest\ntwo\n\n"
-    assert_receive :log_eof, 10_000
+    assert_receive :log_eof, @wait_ms
 
     {:ok, pid} = Engine.follow_logs("x", self(), [timestamps: true] ++ engine(log, nil))
 
@@ -71,14 +76,14 @@ defmodule Vagus.Runtime.Engine.Podman.LogFollowTest do
     File.write!(log, records(for n <- 1..5, do: "2026-10-15T18:14:21.0+00:00 stdout F l#{n}"))
     {:ok, pid} = Engine.follow_logs("x", self(), [tail: 2] ++ engine(log, nil))
     assert next_chunk(pid) == "l4\nl5\n"
-    assert_receive :log_eof, 10_000
+    assert_receive :log_eof, @wait_ms
   end
 
   test "lines appended later arrive, one chunk per ack; conmon's exit ends it", %{log: log} do
     File.write!(log, records(["2026-10-15T18:14:21.0+00:00 stdout F one"]))
     conmon = conmon()
     {:ok, pid} = Engine.follow_logs("x", self(), engine(log, conmon))
-    assert_receive {:log_chunk, "one\n"}, 10_000
+    assert_receive {:log_chunk, "one\n"}, @wait_ms
 
     File.write!(log, records(["2026-10-15T18:14:22.0+00:00 stdout P tw"]), [:append])
     # A tick while the chunk is un-acked reads nothing.
@@ -91,7 +96,7 @@ defmodule Vagus.Runtime.Engine.Podman.LogFollowTest do
     File.write!(log, records(["2026-10-15T18:14:22.0+00:00 stdout F o"]), [:append])
     kill(conmon)
     assert next_chunk(pid) == "o\n"
-    assert_receive :log_eof, 10_000
+    assert_receive :log_eof, @wait_ms
   end
 
   test "the backfill is found by scanning back across blocks, not by reading the log", %{log: log} do
@@ -145,6 +150,7 @@ defmodule Vagus.Runtime.Engine.Podman.LogFollowTest do
     end
   end
 
+  @tag timeout: 180_000
   test "a tail past 10,000 lines is honoured", %{log: log} do
     File.write!(
       log,
@@ -197,14 +203,14 @@ defmodule Vagus.Runtime.Engine.Podman.LogFollowTest do
       :log_eof ->
         Enum.reverse(acc)
     after
-      10_000 -> flunk("no :log_eof")
+      @wait_ms -> flunk("no :log_eof")
     end
   end
 
   defp receive_bytes(_pid, 0, acc), do: acc |> Enum.reverse() |> IO.iodata_to_binary()
 
   defp receive_bytes(pid, left, acc) do
-    assert_receive {:log_chunk, chunk}, 10_000
+    assert_receive {:log_chunk, chunk}, @wait_ms
     assert byte_size(chunk) <= 65_536
     Follow.ack(pid)
     receive_bytes(pid, left - byte_size(chunk), [chunk | acc])
@@ -219,7 +225,7 @@ defmodule Vagus.Runtime.Engine.Podman.LogFollowTest do
       :log_eof ->
         acc |> Enum.reverse() |> IO.iodata_to_binary()
     after
-      10_000 -> flunk("no :log_eof")
+      @wait_ms -> flunk("no :log_eof")
     end
   end
 
@@ -244,7 +250,7 @@ defmodule Vagus.Runtime.Engine.Podman.LogFollowTest do
       File.write!(log, records([stamp("one")]))
       conmon = conmon()
       {:ok, pid} = Engine.follow_logs("x", self(), engine(log, conmon))
-      assert_receive {:log_chunk, "one\n"}, 10_000
+      assert_receive {:log_chunk, "one\n"}, @wait_ms
 
       # B is unlinked by C's rename before the reader could reach it.
       File.write!(log, records([stamp("two")]), [:append])
@@ -306,7 +312,7 @@ defmodule Vagus.Runtime.Engine.Podman.LogFollowTest do
       rotate(log, [stamp("someone else's")])
       :sys.resume(pid)
 
-      assert_receive :log_eof, 10_000
+      assert_receive :log_eof, @wait_ms
       refute_received {:log_chunk, _}
     end
   end
@@ -342,7 +348,7 @@ defmodule Vagus.Runtime.Engine.Podman.LogFollowTest do
     File.write!(log, records(["2026-10-15T18:14:24.0+00:00 stdout F four"]), [:append])
     kill(conmon)
     assert next_chunk(pid) == "four\n"
-    assert_receive :log_eof, 10_000
+    assert_receive :log_eof, @wait_ms
   end
 
   test "an owner that goes away stops the follow", %{log: log} do
@@ -353,12 +359,12 @@ defmodule Vagus.Runtime.Engine.Podman.LogFollowTest do
     Process.unlink(pid)
     ref = Process.monitor(pid)
     Process.exit(owner, :kill)
-    assert_receive {:DOWN, ^ref, :process, ^pid, :normal}, 10_000
+    assert_receive {:DOWN, ^ref, :process, ^pid, :normal}, @wait_ms
   end
 
   test "a container without a log file is just :log_eof", %{log: log} do
     {:ok, _pid} = Engine.follow_logs("x", self(), engine(log, nil))
-    assert_receive :log_eof, 10_000
+    assert_receive :log_eof, @wait_ms
     refute_received {:log_chunk, _}
   end
 end
