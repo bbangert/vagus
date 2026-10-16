@@ -63,7 +63,8 @@ defmodule Vagus.Runtime.HostTest do
       legacy_root: Path.join(root, "root/balena-engine"),
       marker: Path.join(root, "root/vagus/engine-migrated"),
       config_dir: Path.join(root, "root/vagus/core/config"),
-      mountinfo: Path.join(root, "no-mounts")
+      mountinfo: Path.join(root, "no-mounts"),
+      notify: fn _ -> :ok end
     ]
   end
 
@@ -565,6 +566,30 @@ defmodule Vagus.Runtime.HostTest do
       assert {:ok, _} = Host.checkout(ctx.name, :ops, 1_000)
     end
 
+    test "a zero wait still gets a permit from a Host slow to answer", ctx do
+      start_host(ctx)
+      host = Process.whereis(ctx.name)
+      test = self()
+
+      caller =
+        spawn(fn ->
+          receive do: (:go -> send(test, {:result, Host.checkout(ctx.name, :ops, 0)}))
+        end)
+
+      # Held until its request is queued at the Host, well past a millisecond.
+      :sys.suspend(host)
+      :erlang.trace(caller, true, [:send])
+      send(caller, :go)
+
+      assert_receive {:trace, ^caller, :send, {:"$gen_call", _, {:acquire, :ops, _, _}}, ^host},
+                     5_000
+
+      :erlang.trace(caller, false, [:send])
+      Process.sleep(20)
+      :sys.resume(host)
+      assert_receive {:result, {:ok, _}}, 5_000
+    end
+
     test "a health check never takes the last ops permit", ctx do
       start_host(ctx)
       {:ok, ops} = Host.checkout(ctx.name, :ops, 0)
@@ -950,14 +975,76 @@ defmodule Vagus.Runtime.HostTest do
       end)
     end
 
-    test "a board without balena runs no check", ctx do
+    test "with nothing to migrate, dismisses a warning left from before once, then stops",
+         ctx do
+      test = self()
       File.rm_rf!(ctx.legacy)
-      start_host(ctx, migration_check_ms: 1, migration: migration(ctx, []))
 
-      state = :sys.get_state(ctx.name)
-      assert state.migration == nil and state.migration_task == nil
+      start_host(ctx,
+        migration_check_ms: 1,
+        on_migration_checked: &send(test, {:checked, &1}),
+        migration: migration(ctx, notify: &(send(test, {:notify, &1}) && :ok))
+      )
+
+      assert_receive {:checked, %{cleanup: :done, notice: nil}}, 5_000
+      assert_received {:notify, :dismiss}
+      assert %{migration: nil, migration_timer: nil} = :sys.get_state(ctx.name)
       assert Host.migration(ctx.name) == nil
+      refute_received {:notify, _}
       assert File.dir?(Path.join(ctx.root, "root/vagus/core/config"))
+    end
+
+    test "a restart after a failed dismissal dismisses it", ctx do
+      test = self()
+      up = :atomics.new(1, [])
+
+      notify = fn event ->
+        send(test, {:notify, event})
+        if :atomics.get(up, 1) == 1, do: :ok, else: {:error, :core_down}
+      end
+
+      # The deletion went through before the restart; the dismissal did not.
+      File.rm_rf!(ctx.legacy)
+      File.mkdir_p!(Path.join(ctx.root, "root/vagus"))
+      File.write!(Path.join(ctx.root, "root/vagus/engine-migrated"), "")
+      :atomics.put(up, 1, 1)
+
+      start_host(ctx,
+        migration_check_ms: 60_000,
+        on_migration_checked: &send(test, {:checked, &1}),
+        migration: migration(ctx, notify: notify)
+      )
+
+      assert_receive {:checked, %{cleanup: :done, notice: nil}}, 5_000
+      assert_received {:notify, :dismiss}
+      assert %{migration: nil} = :sys.get_state(ctx.name)
+    end
+
+    test "gives up dismissing after a bounded number of tries", ctx do
+      test = self()
+      File.rm_rf!(ctx.legacy)
+
+      notify = fn event ->
+        send(test, {:notify, event})
+        {:error, :core_down}
+      end
+
+      log =
+        capture_log(fn ->
+          start_host(ctx,
+            migration_check_ms: 1,
+            on_migration_checked: &send(test, {:checked, &1}),
+            migration: migration(ctx, notify: notify)
+          )
+
+          for _ <- 1..8,
+              do: assert_receive({:checked, %{cleanup: :done, notice: :unknown}}, 5_000)
+
+          assert %{migration: nil, migration_timer: nil} = :sys.get_state(ctx.name)
+        end)
+
+      assert log =~ "giving up"
+      refute_received {:checked, _}
     end
   end
 end

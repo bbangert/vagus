@@ -141,7 +141,8 @@ defmodule Vagus.Test.FakePodman do
           migration: [
             legacy_root: Path.join(root, "balena-engine"),
             marker: Path.join(root, "engine-migrated"),
-            config_dir: Path.join(root, "core/config")
+            config_dir: Path.join(root, "core/config"),
+            notify: fn _ -> :ok end
           ]
         ],
         opts

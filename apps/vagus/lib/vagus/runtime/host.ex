@@ -69,6 +69,11 @@ defmodule Vagus.Runtime.Host do
   alias Vagus.Runtime.Podman.Cmd
 
   @frugal_below_kb 2 * 1024 * 1024
+  # How long a checkout waits for the Host's answer, apart from any wait for
+  # a permit: the Host answers at once, but a loaded scheduler can take more
+  # than the millisecond a zero wait would otherwise allow, and a missed
+  # answer reads as a busy class.
+  @reply_ms 5_000
   @permits %{frugal: %{pull: 1, ops: 2, shutdown: 1}, fast: %{pull: 1, ops: 4, shutdown: 1}}
   # Per container; conmon starts the file over once it would pass this.
   @log_max_bytes %{frugal: 2 * 1_048_576, fast: 8 * 1_048_576}
@@ -273,7 +278,7 @@ defmodule Vagus.Runtime.Host do
     deadline = System.monotonic_time(:millisecond) + wait_ms
 
     try do
-      GenServer.call(pid, {:acquire, class, ref, priority?}, max(wait_ms, 1))
+      GenServer.call(pid, {:acquire, class, ref, priority?}, max(wait_ms, @reply_ms))
     catch
       :exit, {:timeout, _} -> abandon(pid, ref)
       :exit, _ -> {:error, :unavailable}
@@ -574,7 +579,12 @@ defmodule Vagus.Runtime.Host do
       _done -> File.write(marker, "")
     end
 
-    if Migration.pending?(opts), do: %{state | migration: opts}, else: state
+    # Not pending: a warning raised before a restart may still be up, and the
+    # Host that raised it is gone. One dismissal per start settles it; one of
+    # a notification Home Assistant does not have changes nothing.
+    if Migration.pending?(opts),
+      do: %{state | migration: opts},
+      else: %{state | migration: opts, notice: :unknown}
   end
 
   defp migration_opts(state) do
@@ -604,6 +614,9 @@ defmodule Vagus.Runtime.Host do
   # An hour at most between checks while the deletion keeps failing.
   @max_check_ms 3_600_000
   @waiting_log_ms 3_600_000
+  # Spread by the backoff over about six hours: long enough for Core to come
+  # up after a boot.
+  @dismiss_attempts 8
 
   defp migration_checked(state, %{cleanup: cleanup, notice: notice} = result) do
     if observe = Keyword.get(state.opts, :on_migration_checked), do: observe.(result)
@@ -611,12 +624,19 @@ defmodule Vagus.Runtime.Host do
 
     case cleanup do
       :done when notice == nil ->
-        if state.migration_timer, do: Process.cancel_timer(elem(state.migration_timer, 0))
-        publish(%{state | migration: nil, migration_timer: nil}, state.published.status)
+        finish_migration(state)
+
+      :done when state.check_failures + 1 >= @dismiss_attempts ->
+        Logger.warning(
+          "Vagus.Runtime.Host: Home Assistant did not take the dismissal of the " <>
+            "migration's space warning after #{@dismiss_attempts} tries; giving up"
+        )
+
+        finish_migration(%{state | notice: nil})
 
       # Checked on until Home Assistant has dismissed the warning too.
       :done ->
-        schedule_check(state)
+        schedule_check(%{state | check_failures: state.check_failures + 1})
 
       {:waiting, condition} ->
         %{log_waiting(state, condition) | check_failures: 0} |> schedule_check()
@@ -625,6 +645,12 @@ defmodule Vagus.Runtime.Host do
         Logger.error("Vagus.Runtime.Host: migration check failed: #{inspect(reason)}")
         schedule_check(%{state | check_failures: state.check_failures + 1})
     end
+  end
+
+  defp finish_migration(state) do
+    if state.migration_timer, do: Process.cancel_timer(elem(state.migration_timer, 0))
+    state = %{state | migration: nil, migration_timer: nil, check_failures: 0}
+    publish(state, state.published.status)
   end
 
   defp schedule_check(state) do

@@ -66,7 +66,8 @@ defmodule Vagus.Runtime.Migration do
 
   @type condition :: :validated | :config_renamed | :images | :core_healthy
   @type space :: :ok | {:short, need :: non_neg_integer(), free :: non_neg_integer()}
-  @type notice :: nil | %{need: non_neg_integer(), free: non_neg_integer()}
+  # :unknown: one may be up from before a restart, so a dismissal is due.
+  @type notice :: nil | :unknown | %{need: non_neg_integer(), free: non_neg_integer()}
 
   @spec pending?(keyword()) :: boolean()
   def pending?(opts \\ []) do
@@ -229,7 +230,7 @@ defmodule Vagus.Runtime.Migration do
     end
   end
 
-  defp tell(:ok, %{} = previous, opts) do
+  defp tell(:ok, previous, opts) when previous != nil do
     case notify(opts).(:dismiss) do
       :ok -> nil
       _not_delivered -> previous
