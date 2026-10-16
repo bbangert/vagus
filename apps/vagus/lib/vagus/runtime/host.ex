@@ -63,10 +63,10 @@ defmodule Vagus.Runtime.Host do
 
   require Logger
 
-  alias Vagus.Engine.ResolvConf
   alias Vagus.Runtime.Migration
   alias Vagus.Runtime.Mountinfo
   alias Vagus.Runtime.Podman.Cmd
+  alias Vagus.Runtime.ResolvConf
 
   @frugal_below_kb 2 * 1024 * 1024
   # How long a checkout waits for the Host's answer, apart from any wait for

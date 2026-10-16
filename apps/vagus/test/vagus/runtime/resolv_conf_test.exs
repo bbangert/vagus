@@ -1,7 +1,7 @@
-defmodule Vagus.Engine.ResolvConfTest do
+defmodule Vagus.Runtime.ResolvConfTest do
   use ExUnit.Case, async: true
 
-  alias Vagus.Engine.ResolvConf
+  alias Vagus.Runtime.ResolvConf
 
   describe "build/1" do
     test "renders one nameserver line per plain IP tuple" do

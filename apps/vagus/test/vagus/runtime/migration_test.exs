@@ -569,12 +569,24 @@ defmodule Vagus.Runtime.MigrationTest do
       end
 
       log =
-        capture_log(fn ->
+        own_log(fn ->
           assert Migration.cleanup(Keyword.put(opts, :walk_hook, race)) == :done
         end)
 
       refute log =~ "[error]"
       refute File.exists?(legacy)
     end
+  end
+
+  # capture_log takes every process's lines, and async tests elsewhere log
+  # errors of their own; the cleanup runs in this process, so keep its lines.
+  defp own_log(fun) do
+    me = "pid=#{:erlang.pid_to_list(self())} "
+
+    [format: "$metadata[$level] $message\n", metadata: [:pid]]
+    |> capture_log(fun)
+    |> String.split("\n")
+    |> Enum.filter(&String.starts_with?(&1, me))
+    |> Enum.join("\n")
   end
 end

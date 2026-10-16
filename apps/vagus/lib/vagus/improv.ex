@@ -11,10 +11,9 @@ defmodule Vagus.Improv do
       neither ethernet nor wifi (nor anything else vintage_net aggregates)
       has at least LAN connectivity; `Improv` then arms once per boot after
       its 20s grace and advertises "Vagus <suffix>" for the HA companion
-      app. HA Core needs no gating of its own: `Vagus.Engine.Manager`
-      already withholds the container engine (and with it the Core
-      container) until the aggregate connection reaches `:internet` — the
-      exact event a successful provision produces.
+      app. HA Core needs no gating of its own: `Vagus.Provisioner` already
+      waits for the aggregate connection to reach `:internet` before it
+      pulls Core — the exact event a successful provision produces.
     * `identify/0` — best-effort onboard-LED blink (runs fire-and-forget
       under `Improv.TaskSupervisor`; blocking is fine there).
     * `device_info` — firmware name/version from this app, hardware from
@@ -205,7 +204,7 @@ defmodule Vagus.Improv do
 
   # vintage_net is a target-only dep (`targets: @all_targets` in mix.exs);
   # compile-time branching keeps the reference out of the :host build, same
-  # as Vagus.Engine.Manager. Host stubs answer :disconnected — irrelevant
+  # as Vagus.Provisioner. Host stubs answer :disconnected — irrelevant
   # in practice since Vagus.Bluetooth (the only thing mounting improv)
   # never starts on :host.
   if Mix.target() == :host do

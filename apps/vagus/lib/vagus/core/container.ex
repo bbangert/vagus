@@ -26,10 +26,9 @@ defmodule Vagus.Core.Container do
   no bearer token).
 
   The directory lives on tmpfs and is therefore gone after every boot, which
-  is correct: the socket is per-boot state. `Vagus.Engine.Manager` recreates
-  it before it starts the balena-engine daemon — the daemon revives Core's
-  `unless-stopped` container immediately, and a bind mount whose source is
-  missing fails the container start outright.
+  is correct: the socket is per-boot state. `Vagus.Runtime.Host` recreates
+  it in its preparation, before Core is created: a bind mount whose source
+  is missing fails the container start outright.
 
   ## Deliberate v1 omissions vs. upstream `docker/homeassistant.py`
 
@@ -88,7 +87,7 @@ defmodule Vagus.Core.Container do
   @doc """
   The bind-mounted directory holding Core's Supervisor socket
   (`#{@socket_dir}`) — same path on both sides of the mount. Created per
-  boot by `Vagus.Engine.Manager` (see the moduledoc).
+  boot by `Vagus.Runtime.Host` (see the moduledoc).
   """
   @spec socket_dir() :: String.t()
   def socket_dir, do: @socket_dir
@@ -110,21 +109,20 @@ defmodule Vagus.Core.Container do
   @doc """
   Host path of Core's /config.
 
-  Under balena-engine, the `vagus-core-config` named volume's on-disk
-  location, the docker "local" volume driver's fixed
-  `<data_root>/volumes/<name>/_data` layout. Under podman, Core binds a host
-  directory instead (a named volume would start empty in podman's own
-  store), and `Vagus.Runtime.Migration.core_config_path/1` picks it: the
-  legacy directory until it has been moved out of balena's tree.
-  `opts[:homeassistant_path]` overrides the path outright, since host tests
-  have neither tree.
+  Under podman, Core binds a host directory (a named volume would start
+  empty in podman's own store), and `Vagus.Runtime.Migration.core_config_path/1`
+  picks it: the legacy directory until it has been moved out of balena's
+  tree. Under `Engine.Docker` (host dev and tests) it is that legacy path:
+  the docker "local" driver's `<data_root>/volumes/<name>/_data` for the
+  `vagus-core-config` named volume. `opts[:homeassistant_path]` overrides the
+  path outright, since host tests have neither tree.
   """
   @spec config_path(keyword()) :: String.t()
   def config_path(opts \\ []) do
     Keyword.get_lazy(opts, :homeassistant_path, fn ->
       if Engine.podman?(opts),
         do: Migration.core_config_path(),
-        else: Path.join([Vagus.Engine.Manager.data_root(), "volumes", config_volume(), "_data"])
+        else: Migration.legacy_config_dir()
     end)
   end
 

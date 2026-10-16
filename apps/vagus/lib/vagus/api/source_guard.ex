@@ -23,7 +23,7 @@ defmodule Vagus.API.SourceGuard do
     * **The anchor is not unreachable, only unrouted.** `172.30.32.2` is
       bound in the *host* network namespace of a host-networked device.
       Packets addressed to it are delivered locally, so they never traverse
-      `FORWARD` and no balena/docker filter rule applies: a LAN host that
+      `FORWARD` and no container-engine filter rule applies: a LAN host that
       adds a route for `172.30.32.0/23` via the board reaches both the
       listener and the DNAT'd port 80. Unrouted by default is a good deal
       weaker than unreachable.

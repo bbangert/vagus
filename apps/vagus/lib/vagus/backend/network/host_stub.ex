@@ -55,8 +55,7 @@ defmodule Vagus.Backend.Network.HostStub do
       # would then flag `Vagus.API.Router`'s generic `{:ok, ...}` clause
       # (needed for the real `Vagus.Backend.Network.VintageNet` backend,
       # which genuinely can return access points) as unreachable dead
-      # code under `--warnings-as-errors` on a `:host` build. Same
-      # reasoning as `Vagus.Engine.Manager`'s `Mix.target()` split.
+      # code under `--warnings-as-errors` on a `:host` build.
       if String.starts_with?(resolved, "wlan") do
         {:ok, []}
       else

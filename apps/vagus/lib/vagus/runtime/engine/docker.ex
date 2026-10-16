@@ -1,7 +1,7 @@
 defmodule Vagus.Runtime.Engine.Docker do
   @moduledoc """
   `Vagus.Runtime.Engine` over the Docker Engine API (`Vagus.Runtime.Docker`),
-  which balena-engine speaks too.
+  for host development and tests.
 
   `:timeout_ms` becomes the client's `:deadline` instant, so one value
   bounds every request a callback makes; the remaining opts pass through,

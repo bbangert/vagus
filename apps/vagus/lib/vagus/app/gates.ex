@@ -26,10 +26,8 @@ defmodule Vagus.App.Gates do
   end
 
   @doc """
-  The engine answers. Under Docker that waits for the internet as well:
-  `Vagus.Engine.Manager` starts balena-engine only once the network reaches
-  it. Under podman it is `Vagus.Runtime.Host`'s preparation alone, since only
-  a pull needs the network.
+  The engine answers: under podman, `Vagus.Runtime.Host`'s preparation is
+  done. No wait for the internet, since only a pull needs the network.
   """
   @spec engine(keyword()) :: :ok | {:error, term()}
   def engine(opts \\ []), do: Vagus.Runtime.Engine.ready(opts)
@@ -38,36 +36,26 @@ defmodule Vagus.App.Gates do
   Stands up the `hassio` bridge, binds the `.2`/`.3` anchors and asserts the
   DNAT that serves port 80 on `.2`. All of it is lost on reboot, and only a
   container app's start would redo it otherwise, so a device running only
-  native apps would leave Core unable to reach the Supervisor. Under podman
-  the bridge is the host's own (`Vagus.Network.host_bridge?/1`), so the
-  anchors and the DNAT go on even when the engine could not make its
-  network. Best effort: always `:ok`, so a failure here never holds the apps
-  back. `opts` reach every step (tests).
+  native apps would leave Core unable to reach the Supervisor. The bridge
+  is the host's own (`Vagus.Network.host_bridge?/1`), so the anchors and the
+  DNAT go on even when the engine could not make its network. Best effort:
+  always `:ok`, so a failure here never holds the apps back. `opts` reach
+  every step (tests).
   """
   @spec network(keyword()) :: :ok
   def network(opts \\ []) do
-    case Network.ensure(opts) do
-      :ok ->
-        anchors_and_nat(opts)
+    warn_unless_ok(
+      Network.ensure(opts),
+      "hassio bridge; Core and bridged apps may not reach the Supervisor"
+    )
 
-      {:error, reason} ->
-        warn_unless_ok(
-          {:error, reason},
-          "hassio bridge; Core and bridged apps may not reach the Supervisor"
-        )
-
-        if Network.host_bridge?(opts), do: anchors_and_nat(opts)
-    end
+    Network.ensure_supervisor_ip(opts)
+    warn_unless_ok(Nat.ensure(opts), "supervisor DNAT; apps may not reach http://supervisor/")
 
     # The listener's bind address exists only from here, so its next bind
     # attempt is hurried. An optimisation only: the `api` gate still decides.
     Vagus.API.Listener.retry_now()
     :ok
-  end
-
-  defp anchors_and_nat(opts) do
-    Network.ensure_supervisor_ip(opts)
-    warn_unless_ok(Nat.ensure(opts), "supervisor DNAT; apps may not reach http://supervisor/")
   end
 
   @doc """

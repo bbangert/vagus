@@ -51,22 +51,15 @@ defmodule Vagus.App.GatesTest do
     |> Enum.dedup()
   end
 
-  test "under podman: the bridge, then the anchors, then the nft table", %{opts: opts} do
+  test "the bridge, then the anchors, then the nft table", %{opts: opts} do
     assert Gates.network(opts) == :ok
     assert steps(ran()) == [:bridge, :anchor_supervisor, :anchor_dns, :nat]
   end
 
-  test "under podman the anchors and the NAT go on when the network create fails",
+  test "the anchors and the NAT go on when the network create fails",
        %{fake: fake, opts: opts} do
     Fake.fail_next(fake, :ensure_network, :unavailable)
     capture_log(fn -> assert Gates.network(opts) == :ok end)
     assert steps(ran()) == [:bridge, :anchor_supervisor, :anchor_dns, :nat]
-  end
-
-  test "under balena-engine a failed network create stops there", %{fake: fake, opts: opts} do
-    Fake.fail_next(fake, :ensure_network, :unavailable)
-    opts = Keyword.put(opts, :host_bridge, false)
-    capture_log(fn -> assert Gates.network(opts) == :ok end)
-    assert ran() == []
   end
 end

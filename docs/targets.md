@@ -73,7 +73,7 @@ Adding a board touches four places:
 
 Keep the per-target files minimal. Only genuinely board-specific settings
 belong there — currently the vintage_net interface list and `:machine`.
-Everything else (`/data/vagus/*` paths, `:docker_socket`, `:addon_data_root`,
+Everything else (`/data/vagus/*` paths, `:engine`, `:addon_data_root`,
 `:core_container`, the store repositories) is board-agnostic and stays in
 `config/target.exs`.
 

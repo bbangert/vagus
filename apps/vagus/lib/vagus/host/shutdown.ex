@@ -11,12 +11,12 @@ defmodule Vagus.Host.Shutdown do
   dance only protects against a crash *between* writes — it does nothing
   if the process is SIGKILLed mid-write. `erlinit`'s shutdown path sends
   every still-running container a hard kill (it doesn't know how to ask
-  balena-engine to gracefully `docker stop` its containers, and doesn't
-  wait around for it if it did) once the BEAM has exited, so a reboot or
+  the engine to gracefully stop its containers, and doesn't wait around
+  for it if it did) once the BEAM has exited, so a reboot or
   poweroff that races Core or an app mid-write to `.storage` truncates
   the file to zero bytes or leaves a lost rename — the exact bug this
-  module exists to close. The fix is to stop every container (real
-  `docker stop`, SIGTERM-then-grace-then-SIGKILL, *before* anything is
+  module exists to close. The fix is to stop every container (a real
+  engine stop, SIGTERM-then-grace-then-SIGKILL, *before* anything is
   mid-write) while the BEAM is still fully alive to run it.
 
   ## Why a call-site facade, not `prep_stop`/`terminate` hooks
@@ -34,19 +34,17 @@ defmodule Vagus.Host.Shutdown do
       defaults to ~10 seconds — nowhere near enough for Core's worst-case
       stop (up to ~260s, budget rationale below).
     * Application supervision trees stop children in *reverse start
-      order*. `Vagus.Engine.Manager` (the balena-engine daemon) is started
-      early and would therefore stop late in a `prep_stop`-driven
-      teardown — except a `terminate/2` hook trying to `docker stop`
-      *other* containers needs the engine's API socket to still be up,
-      and nothing guarantees it survives long enough into that teardown
+      order*. A `terminate/2` hook trying to `podman stop` *other*
+      containers needs `Vagus.Runtime.Host`'s permits still served, and
+      nothing guarantees the Host survives long enough into that teardown
       to be usable, or that heart is still being petted while `init.stop`
       unwinds the tree.
 
   Calling `reboot/1`/`poweroff/1` here instead — from the API route
   handler, the watchdog, the OTA success callback, wherever a shutdown is
   actually decided — runs all of this while the BEAM is fully alive, heart
-  is still being petted on the normal schedule, and the engine daemon is
-  definitely up. None of the above budgets or ordering constraints apply
+  is still being petted on the normal schedule, and the Host is definitely
+  up. None of the above budgets or ordering constraints apply
   until *after* this module hands off to `Nerves.Runtime`.
 
   ## Availability over cleanliness

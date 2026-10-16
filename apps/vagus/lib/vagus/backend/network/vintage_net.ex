@@ -15,8 +15,8 @@ defmodule Vagus.Backend.Network.VintageNet do
   side-effecting registrations of function clauses on this module) never
   execute on `:host`, leaving this module an empty shell there (no
   functions, no `@behaviour` declaration — so no "missing callback"
-  warnings either). Same pattern `Vagus.Engine.Manager` uses for its own
-  `VintageNet` references, just applied to the whole module instead of
+  warnings either). Same pattern `Vagus.Runtime.Host` uses for its own
+  `VintageNet` reference, just applied to the whole module instead of
   per-function, since every function here touches `VintageNet`.
 
   Never selected on `:host` regardless (`config/host.exs`'s `:backends`

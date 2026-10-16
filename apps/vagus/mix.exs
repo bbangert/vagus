@@ -134,8 +134,7 @@ defmodule Vagus.MixProject do
       # declare :nerves. Same pattern as vagus_platform's own declaration.
       {:nerves, "~> 1.13", runtime: false},
 
-      # Supervises the balena-engine daemon as an OS process (engine
-      # supervision, see Vagus.Engine.Manager).
+      # Its port binary runs every podman call (Vagus.Runtime.Podman.Cmd).
       {:muontrap, "~> 1.8"},
 
       # BlueZ stack bring-up (dbus-daemon + bluetoothd under MuonTrap).
@@ -145,11 +144,11 @@ defmodule Vagus.MixProject do
 
       # Improv-over-BLE Wi-Fi provisioning (bluetooth phase 2): on an
       # offline boot the Pi advertises the Improv service so the HA
-      # companion app can provision wlan0 before HA Core exists (the
-      # engine — and with it Core — is already gated on :internet by
-      # Vagus.Engine.Manager). Untargeted like :bluez: the host build
-      # needs it for the pure child-spec/gate tests; nothing starts it
-      # off-target. See Vagus.Improv.
+      # companion app can provision wlan0 before HA Core exists (Core's
+      # pull is already gated on :internet by Vagus.Provisioner).
+      # Untargeted like :bluez: the host build needs it for the pure
+      # child-spec/gate tests; nothing starts it off-target. See
+      # Vagus.Improv.
       #
       # >= 0.1.2 is required, not incidental: earlier versions hardcoded
       # `key_mgmt: :wpa_psk`, so a WPA3 (SAE-only) network could never be
@@ -168,11 +167,11 @@ defmodule Vagus.MixProject do
       # (locally and in CI).
       {:typedstruct, github: "saleyn/typedstruct", tag: "0.5.4", override: true, runtime: false},
 
-      # Vagus.Engine.Manager subscribes to vintage_net's aggregate
-      # ["connection"] property directly (compile-time `Mix.target()`
-      # branching keeps this reference out of the :host build — vintage_net
-      # itself is only ever pulled into the build for real targets, via
-      # vagus_platform's nerves_pack dependency).
+      # Vagus.Provisioner and Vagus.Runtime.Host read vintage_net properties
+      # directly (compile-time `Mix.target()` branching keeps those
+      # references out of the :host build — vintage_net itself is only ever
+      # pulled into the build for real targets, via vagus_platform's
+      # nerves_pack dependency).
       {:vintage_net, "~> 0.13.12", targets: @all_targets},
 
       # Test-only: Vagus.Backend.{Network,Host,OS} behaviours are mocked in

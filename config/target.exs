@@ -149,9 +149,8 @@ config :vagus, :api_port, 8888
 config :vagus, :api_bind_ip, "172.30.32.2"
 
 # DNAT management for the port-80 add-on contract above
-# (`Vagus.Network.Nat`): iptables-legacy under balena-engine, an nft table
-# under podman. Target-only: :host/:test have neither a 172.30.32.2 nor
-# those tools.
+# (`Vagus.Network.Nat`, an nft table). Target-only: :host/:test have neither
+# a 172.30.32.2 nor nft.
 config :vagus, :supervisor_nat, true
 config :vagus, :token_path, "/data/vagus/token"
 
@@ -252,9 +251,9 @@ config :vagus, :core_port_migration_marker, "/data/vagus/core_port_migration"
 # after the config-declared :store_repositories on boot.
 config :vagus, :store_repositories_path, "/data/vagus/store_repositories.json"
 
-# Add-on runtime (M4). The balena-engine daemon's control socket
-# (`Vagus.Engine.Manager`'s `--host`); `Vagus.Runtime.Docker` talks to it.
-config :vagus, :docker_socket, "/run/balena-engine.sock"
+# The system ships podman and no Docker-API engine; host dev and the test
+# suite keep `config.exs`'s Docker default.
+config :vagus, :engine, Vagus.Runtime.Engine.Podman
 
 # The HA Core container's name on the engine — the source behind the
 # /core (and /homeassistant alias) logs + stats routes. Was never set
@@ -264,8 +263,9 @@ config :vagus, :docker_socket, "/run/balena-engine.sock"
 config :vagus, :core_container, "homeassistant"
 
 # Add-on data/bind-source root. Use the REAL mount path (`/root`), not the
-# `/data` symlink — the same runc symlink hazard that blocked the engine
-# data-root (see Vagus.Engine.Manager) applies to bind sources.
+# `/data` symlink: the OCI runtime rejects a path with a symlink component
+# ("not an absolute path, or a symlink"), found on-device for the engine's
+# data root and true of bind sources too.
 config :vagus, :addon_data_root, "/root/vagus/addons"
 
 # Ingress source address (found during the Q6A phase-4 gate, 2026-07-27).
