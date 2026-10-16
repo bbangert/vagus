@@ -442,8 +442,12 @@ defmodule Vagus.Runtime.Host do
     {:noreply, migration_checked(%{state | migration_task: nil}, crashed)}
   end
 
-  def handle_info(:migration_check, state),
+  # A cancelled timer's message may already be queued: only the one armed
+  # last, named by its tag, runs a check.
+  def handle_info({:migration_check, tag}, %{migration_timer: {_timer, tag}} = state),
     do: {:noreply, start_migration_check(%{state | migration_timer: nil})}
+
+  def handle_info({:migration_check, _stale}, state), do: {:noreply, state}
 
   def handle_info({:DOWN, mon, :process, _pid, _reason}, state) do
     held = for {ref, {_class, _pid, ^mon}} <- state.holders, do: ref
@@ -606,9 +610,13 @@ defmodule Vagus.Runtime.Host do
     state = %{state | notice: notice}
 
     case cleanup do
-      :done ->
-        if state.migration_timer, do: Process.cancel_timer(state.migration_timer)
+      :done when notice == nil ->
+        if state.migration_timer, do: Process.cancel_timer(elem(state.migration_timer, 0))
         publish(%{state | migration: nil, migration_timer: nil}, state.published.status)
+
+      # Checked on until Home Assistant has dismissed the warning too.
+      :done ->
+        schedule_check(state)
 
       {:waiting, condition} ->
         %{log_waiting(state, condition) | check_failures: 0} |> schedule_check()
@@ -622,7 +630,9 @@ defmodule Vagus.Runtime.Host do
   defp schedule_check(state) do
     base = Keyword.get(state.opts, :migration_check_ms, 300_000)
     delay = min(base * Integer.pow(2, min(state.check_failures, 4)), max(base, @max_check_ms))
-    %{state | migration_timer: Process.send_after(self(), :migration_check, delay)}
+    tag = make_ref()
+    timer = Process.send_after(self(), {:migration_check, tag}, delay)
+    %{state | migration_timer: {timer, tag}}
   end
 
   defp log_waiting(state, condition) do

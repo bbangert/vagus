@@ -806,10 +806,12 @@ defmodule Vagus.Runtime.HostTest do
       capture_log(fn ->
         stepped(ctx, [mountinfo: mountinfo], migration_check_ms: 1_000)
         assert %{cleanup: {:error, {:mounted, _}}} = next_check()
-        first = Process.read_timer(:sys.get_state(ctx.name).migration_timer)
-        send(ctx.name, :migration_check)
+        {timer, tag} = :sys.get_state(ctx.name).migration_timer
+        first = Process.read_timer(timer)
+        send(ctx.name, {:migration_check, tag})
         assert %{cleanup: {:error, {:mounted, _}}} = next_check()
-        second = Process.read_timer(:sys.get_state(ctx.name).migration_timer)
+        {timer, _tag} = :sys.get_state(ctx.name).migration_timer
+        second = Process.read_timer(timer)
 
         assert first > 1_000 and first <= 2_000
         assert second > 2_000 and second <= 4_000
@@ -890,6 +892,61 @@ defmodule Vagus.Runtime.HostTest do
         :atomics.put(up, 1, 1)
         assert %{notice: %{}} = next_check()
         assert_received {:notify, {:raise, _, _}}
+      end)
+    end
+
+    test "a check message from a timer no longer armed is ignored", ctx do
+      stepped(ctx, [core_healthy?: fn -> false end], migration_check_ms: 60_000)
+      assert %{cleanup: {:waiting, :core_healthy}} = next_check()
+      {_timer, tag} = :sys.get_state(ctx.name).migration_timer
+
+      send(ctx.name, {:migration_check, make_ref()})
+      assert %{migration_task: nil, migration_timer: {_, ^tag}} = :sys.get_state(ctx.name)
+      refute_received {:check, _}
+
+      send(ctx.name, {:migration_check, tag})
+      assert_receive {:check, _task}, 5_000
+    end
+
+    test "stays until Home Assistant has dismissed the warning, after the deletion", ctx do
+      test = self()
+      up = :atomics.new(1, [])
+      :atomics.put(up, 1, 1)
+
+      notify = fn event ->
+        send(test, {:notify, event})
+        if :atomics.get(up, 1) == 1, do: :ok, else: {:error, :core_down}
+      end
+
+      # Short of room throughout; a mount inside the store holds the
+      # deletion back at first.
+      mountinfo = Path.join(ctx.root, "mounts")
+      File.write!(mountinfo, "40 22 0:50 / #{ctx.legacy}/x rw - tmpfs t rw\n")
+
+      capture_log(fn ->
+        stepped(
+          ctx,
+          [image_present?: fn _ -> false end, df: df(10), mountinfo: mountinfo, notify: notify],
+          migration_check_ms: 60_000
+        )
+
+        assert %{cleanup: {:error, {:mounted, _}}, notice: %{}} = next_check()
+        assert_received {:notify, {:raise, _, _}}
+
+        # The deletion goes through, but Core is down for the dismissal.
+        File.write!(mountinfo, "")
+        :atomics.put(up, 1, 0)
+        send(ctx.name, {:migration_check, elem(:sys.get_state(ctx.name).migration_timer, 1)})
+        assert %{cleanup: :done, notice: %{}} = next_check()
+        refute File.exists?(ctx.legacy)
+        assert %{migration: [_ | _], migration_timer: {_, _}} = :sys.get_state(ctx.name)
+
+        # With the store gone no check looks at the images, so none is stepped.
+        :atomics.put(up, 1, 1)
+        send(ctx.name, {:migration_check, elem(:sys.get_state(ctx.name).migration_timer, 1)})
+        assert_receive {:checked, %{cleanup: :done, notice: nil}}, 5_000
+        assert_received {:notify, :dismiss}
+        assert %{migration: nil, migration_timer: nil} = :sys.get_state(ctx.name)
       end)
     end
 
