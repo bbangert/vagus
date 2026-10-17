@@ -74,6 +74,11 @@ defmodule Vagus.Core.Container do
   @spec_fingerprint_label "io.vagus.spec-fingerprint"
   @spec_fingerprint_length 32
 
+  # The fields `fingerprint_body/1` renders in the Docker shape.
+  @shaped [:image, :hostname, :env, :network, :privileged, :oom_score_adj] ++
+            [:restart, :extra_hosts, :mounts, :tmpfs]
+  @unhashed [:name, :secret_env, :labels]
+
   @doc "The fixed Core container name (`homeassistant`) — upstream parity."
   @spec name() :: String.t()
   def name do
@@ -182,16 +187,13 @@ defmodule Vagus.Core.Container do
     binary_part(digest, 0, @spec_fingerprint_length)
   end
 
-  # The fields `fingerprint_body/1` renders in the Docker shape.
-  @shaped [:image, :hostname, :env, :network, :privileged, :oom_score_adj] ++
-            [:restart, :extra_hosts, :mounts, :tmpfs]
-  @unhashed [:name, :secret_env, :labels]
-
   # Every Core container carries a label hashed over this exact shape, the
   # Docker Engine-API create body the first fingerprints were computed from:
   # a different shape for the same spec would recreate Core on every board.
   # A field the shape lacks is hashed under its own name once set, so it
   # still changes the digest without moving any digest taken while unset.
+  # Only a host network and bind mounts have a shape: Core never had
+  # another, and a guessed one would be a digest no board ever carried.
   defp fingerprint_body(%ContainerSpec{} = spec) do
     host_config =
       drop_nil(%{
@@ -223,7 +225,6 @@ defmodule Vagus.Core.Container do
   defp pair({key, value}, separator), do: "#{key}#{separator}#{value}"
 
   defp network_mode(:host), do: "host"
-  defp network_mode({:bridge, name}), do: name
 
   defp restart_policy(nil), do: nil
   defp restart_policy(:no), do: %{"Name" => ""}
@@ -244,8 +245,6 @@ defmodule Vagus.Core.Container do
       "BindOptions" => if(bind_options != %{}, do: bind_options)
     })
   end
-
-  defp fingerprint_mount(m), do: Map.new(m, fn {key, value} -> {Atom.to_string(key), value} end)
 
   defp drop_nil(map), do: Map.reject(map, fn {_key, value} -> is_nil(value) end)
 

@@ -275,8 +275,15 @@ defmodule Vagus.NetworkTest do
       refute Network.host_bridge?()
       refute Network.host_bridge?(engine: Vagus.Runtime.Engine.Podman)
 
+      previous = Application.fetch_env(:vagus, :runtime_host)
       Application.put_env(:vagus, :runtime_host, true)
-      on_exit(fn -> Application.delete_env(:vagus, :runtime_host) end)
+
+      on_exit(fn ->
+        case previous do
+          {:ok, value} -> Application.put_env(:vagus, :runtime_host, value)
+          :error -> Application.delete_env(:vagus, :runtime_host)
+        end
+      end)
 
       assert Network.host_bridge?(engine: Fake)
       refute Network.host_bridge?(host_bridge: false)

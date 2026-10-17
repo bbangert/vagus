@@ -1096,9 +1096,9 @@ defmodule Vagus.API.IngressProxyTest do
     assert session =~ ~r/\A[0-9a-f]{128}\z/
   end
 
-  # `Vagus.App.ingress_target/1`'s bridge branch needs a real docker daemon
-  # (out of scope here), but the `host_network: true` branch short-circuits before
-  # the docker inspect. Both device-found 502s live in these two tests:
+  # `Vagus.App.ingress_target/1`'s bridge branch needs a real engine (out of
+  # scope here), but the `host_network: true` branch short-circuits before the
+  # engine inspect. Both device-found 502s live in these two tests:
   # ESPHome answers only on loopback, Music Assistant binds its ingress port
   # to the bridge gateway alone — so the listening port, not the network mode,
   # picks the address.

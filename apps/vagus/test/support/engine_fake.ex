@@ -384,19 +384,19 @@ defmodule Vagus.Runtime.Engine.Fake do
   end
 
   defp instance(opts) do
-    case {opts[:fake], Application.fetch_env(:vagus, :engine_fake)} do
-      {nil, {:ok, fake}} ->
+    case {opts[:fake], Application.fetch_env(:vagus, :engine_fake), opts[:engine]} do
+      {nil, {:ok, fake}, _engine} ->
         fake
 
-      {nil, :error} ->
-        if opts[:engine] == __MODULE__,
-          do:
-            raise(
-              ArgumentError,
+      {nil, :error, __MODULE__} ->
+        raise ArgumentError,
               "no Engine.Fake instance: pass fake: pid, or call start_global/0 in an async: false test"
-            )
 
-      {fake, _global} ->
+      # The suite's default engine with no instance: one that is not there.
+      {nil, :error, _default} ->
+        nil
+
+      {fake, _global, _engine} ->
         fake
     end
   end

@@ -34,7 +34,9 @@ config :nerves, source_date_epoch: "1784525674"
 config :vagus, :store_asset_mode, :auto
 
 # The `Vagus.Runtime.Engine` adapter; a call's `engine:` option overrides it.
-# Host dev runs no `Vagus.Runtime.Host`, so it just sees the engine unavailable.
+# Host dev runs no `Vagus.Runtime.Host`, so no podman command runs there: every
+# engine call answers `:unavailable`, while the event source still reports
+# ready and re-lists (to `:unavailable`) every 60 s.
 config :vagus, :engine, Vagus.Runtime.Engine.Podman
 
 if Mix.target() == :host do

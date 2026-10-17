@@ -132,7 +132,8 @@ defmodule Vagus.App.Units do
   @doc """
   One engine call that stops a group's containers together, ahead of their
   halts: each app's own `stop` is a podman process, and a frugal board's
-  two `:ops` permits would queue a group's stops past its budget. `Engine.Podman.stop_all/3` takes the reserved shutdown permit.
+  two `:ops` permits would queue a group's stops past its budget.
+  `Engine.Podman.stop_all/3` takes the reserved shutdown permit.
 
   The grace is what fits the budget once podman's kill margin is set aside
   (`grace_s/1`): podman gives a stop its grace plus that margin whatever

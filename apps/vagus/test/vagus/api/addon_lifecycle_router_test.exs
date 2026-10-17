@@ -6,7 +6,7 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
   `Vagus.Addon.Backend.Fake` (`test/support/fake_addon_backend.ex`) is wired
   in via `config :vagus, :addon_backend` for the whole test — the router
   passes no `:backend` opt, so this is the only way to keep these routes
-  hermetic (no real Docker daemon).
+  hermetic (no real container engine).
   """
   use ExUnit.Case, async: false
   use Plug.Test

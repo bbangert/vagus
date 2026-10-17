@@ -5,7 +5,7 @@ import Config
 # Imported at the very bottom of config/target.exs, so anything set here
 # OVERRIDES the shared target config. Keep it minimal: only settings that
 # genuinely differ between boards belong here. Everything else — the
-# `/data/vagus/*` paths, `:engine`, `:addon_data_root`,
+# `/data/vagus/*` paths, `:runtime_host`, `:addon_data_root`,
 # `:core_container`, the store repositories — is board-agnostic and stays in
 # target.exs.
 

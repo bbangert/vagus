@@ -3,8 +3,8 @@ defmodule Vagus.API.CoreLifecycleRouterTest.StubLifecycle do
   # Router seam target (`config :vagus, :core_lifecycle`) for
   # `Vagus.API.CoreLifecycleRouterTest` — swapped in for the real
   # `Vagus.Core.Lifecycle`. Lifecycle's own hermetic tests
-  # (`test/vagus/core/lifecycle_test.exs`, against the fake Docker socket)
-  # already cover the real Engine-API behavior; this stub only needs to
+  # (`test/vagus/core/lifecycle_test.exs`, against `Engine.Fake`) already
+  # cover the real engine behavior; this stub only needs to
   # prove the router calls the right op with the right args and maps
   # whatever comes back correctly.
   #
