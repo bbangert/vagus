@@ -874,6 +874,16 @@ defmodule Vagus.Runtime.Engine.PodmanContractTest do
       assert Engine.healthcheck("addon_local_x", [timeout_ms: 10_000] ++ opts) == {:ok, :healthy}
     end
 
+    # What `Engine.Fake` answers with no instance, which stands in for this.
+    test "with no Host, stop_all fails each name as unavailable" do
+      opts = [engine: Engine.Podman, host: :vagus_no_such_host]
+
+      assert Engine.stop_all(["addon_a", "addon_b"], 5, opts) ==
+               {:ok, [], [{"addon_a", :unavailable}, {"addon_b", :unavailable}]}
+
+      assert Engine.stop_all([], 5, opts) == {:ok, [], []}
+    end
+
     test "podman schedules no healthchecks" do
       refute Engine.schedules_healthchecks?(engine: Engine.Podman)
     end

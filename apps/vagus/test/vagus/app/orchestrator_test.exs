@@ -646,8 +646,11 @@ defmodule Vagus.App.OrchestratorTest do
     pid = Process.whereis(name)
     ref = Process.monitor(pid)
 
+    # The DOWN waits on two crash reports, the task's and the orchestrator's,
+    # each written by the dying process itself before it exits: a log write
+    # stalled on a loaded runner holds it back, however quick the stop is.
     assert_receive {:DOWN, ^ref, :process, ^pid, {:boot_crashed, {%RuntimeError{}, _stack}}},
-                   1_000
+                   5_000
 
     assert {:boot_start, "a"} in collect_until(:complete)
     assert %{phase: :up} = await_boot(name)

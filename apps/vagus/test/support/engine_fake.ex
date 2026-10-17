@@ -213,8 +213,16 @@ defmodule Vagus.Runtime.Engine.Fake do
     call(opts, :restart, [name], &update_container(&1, name, fn c -> run(c) end))
   end
 
+  # stop_all's result carries no error, so an engine that is not there fails
+  # each name instead, as `Engine.Podman` does with no Host.
   @impl true
   def stop_all(names, timeout_s, opts) do
+    if instance(opts),
+      do: stop_all_on(names, timeout_s, opts),
+      else: {:ok, [], Enum.map(names, &{&1, :unavailable})}
+  end
+
+  defp stop_all_on(names, timeout_s, opts) do
     # Delays add up, as sequential stops share one budget of every grace.
     floor = length(names) * grace_ms(timeout_s)
 
