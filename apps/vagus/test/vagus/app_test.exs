@@ -421,7 +421,7 @@ defmodule Vagus.AppTest do
   end
 
   describe "ingress_target/1" do
-    # A host-network app is reached without a docker inspect.
+    # A host-network app is reached without an engine inspect.
     setup do
       {:ok, listen} = :gen_tcp.listen(0, [:binary, ip: {127, 0, 0, 1}, active: false])
       on_exit(fn -> :gen_tcp.close(listen) end)

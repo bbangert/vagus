@@ -148,6 +148,15 @@ defmodule Vagus.Runtime.Engine.FakeContractTest do
       end
     end
 
+    test "with no instance it is an engine that is not there, stop_all keeping its shape" do
+      assert Fake.ready([]) == {:error, :unavailable}
+
+      assert Fake.stop_all(["addon_a", "addon_b"], 5, []) ==
+               {:ok, [], [{"addon_a", :unavailable}, {"addon_b", :unavailable}]}
+
+      assert Fake.stop_all([], 5, []) == {:ok, [], []}
+    end
+
     test "fail_next refuses stop_all, whose result cannot carry an error" do
       assert_raise ArgumentError, fn -> Fake.fail_next(Fake.start(), :stop_all, :busy) end
     end

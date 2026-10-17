@@ -243,16 +243,9 @@ defmodule Vagus.Network do
   end
 
   @doc """
-  The Engine-API `/networks/create` payload for the `hassio` bridge. Exposed so
-  the IP plan can be asserted without a daemon.
-  """
-  @spec config() :: map()
-  def config, do: Engine.Docker.render_network(spec())
-
-  @doc """
   Ensures the `hassio` network exists (idempotent). `opts` reach the engine.
 
-  Under podman the bridge interface is also made here (`ensure_bridge/1`),
+  On a board the bridge interface is also made here (`ensure_bridge/1`),
   whatever the engine answered: it is the host's own from then on, and the
   anchors need it even when podman does not run. `:host_bridge` overrides
   `host_bridge?/1`.
@@ -276,14 +269,16 @@ defmodule Vagus.Network do
   end
 
   @doc """
-  Whether Vagus, not the engine, keeps the `hassio` bridge interface: under
-  podman. netavark makes the bridge at a container's start and deletes it
-  with the last one, so a board running only Core and host-network apps
-  would never have the `.2` anchor Core reaches the Supervisor on.
+  Whether Vagus, not the engine, keeps the `hassio` bridge interface: on a
+  board (`Vagus.Runtime.Host.enabled?/0`), never on host dev or in the suite,
+  where `ip link` would change the machine's own interfaces. netavark makes
+  the bridge at a container's start and deletes it with the last one, so a
+  board running only Core and host-network apps would never have the `.2`
+  anchor Core reaches the Supervisor on.
   """
   @spec host_bridge?(keyword()) :: boolean()
   def host_bridge?(opts \\ []),
-    do: Keyword.get_lazy(opts, :host_bridge, fn -> Engine.podman?(opts) end)
+    do: Keyword.get_lazy(opts, :host_bridge, &Vagus.Runtime.Host.enabled?/0)
 
   @doc """
   Makes the `hassio` bridge with a dummy port and the gateway address, then
@@ -357,7 +352,7 @@ defmodule Vagus.Network do
   emulator (Bandit on `.2`, `Vagus.DNS` on `0.0.0.0:53`) answers there:
   `.2` is where bridged add-ons reach `http://supervisor` and `.3` is the
   resolver they're configured with (§A6). The bridge driver, or
-  `ensure_bridge/1` under podman, already puts the gateway `.1` on the
+  `ensure_bridge/1` on a board, already puts the gateway `.1` on the
   interface; these are added beside it once the interface exists (i.e. after
   `ensure/1`).
 

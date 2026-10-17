@@ -97,6 +97,15 @@ defmodule Vagus.Runtime.Host do
   @type permit :: {GenServer.server(), reference()}
   @type status :: :preparing | :ready | {:prep_failed, term()}
 
+  @doc """
+  Whether this is a board this Host prepares (`config :vagus, :runtime_host`,
+  set only in `target.exs`). Never inferred from the engine: host dev runs
+  `Engine.Podman` too, and must not have its mounts, sysctls or interfaces
+  changed.
+  """
+  @spec enabled?() :: boolean()
+  def enabled?, do: Application.get_env(:vagus, :runtime_host, false)
+
   def child_spec(opts) do
     %{
       id: Keyword.get(opts, :name, __MODULE__),

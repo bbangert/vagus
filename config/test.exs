@@ -10,10 +10,16 @@ config :vagus, :api_server_enabled, false
 # :api_server_enabled.
 config :vagus, :dns_enabled, false
 
-# Don't start the docker-events stream during `mix test` — there's no real
-# engine socket to connect to. Mirrors :dns_enabled; the events unit tests
-# start their own instance against a fake unix-socket server.
+# Don't start the engine-events stream during `mix test` — there's no real
+# engine to follow. Mirrors :dns_enabled; the events unit tests start their
+# own instance against a fake source.
 config :vagus, :events_enabled, false
+
+# Every engine call a test does not aim elsewhere goes to `Engine.Fake`,
+# never a real podman a CI runner may well have. Set here too because under
+# a MIX_TARGET config/target.exs loads first and turns the Host on.
+config :vagus, :engine, Vagus.Runtime.Engine.Fake
+config :vagus, :runtime_host, false
 
 # No Supervisor↔Core unix socket under `mix test`: `Vagus.Core.Transport`
 # would otherwise probe the on-device path (`/run/supervisor/core.sock`) and

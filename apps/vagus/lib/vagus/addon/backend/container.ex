@@ -7,15 +7,15 @@ defmodule Vagus.Addon.Backend.Container do
   `to_container_spec/1` is that pure translation, and is where the §A1.4
   cross-cutting invariants are stamped regardless of the spec:
 
-    * `Privileged: false` (add-on `privileged:` maps to `CapAdd`, never Docker
-      privileged),
-    * `SecurityOpt` always includes `seccomp=unconfined` (+ `apparmor=<x>` iff
-      the spec names a profile),
-    * `Labels` always includes `supervisor_managed: ""`,
-    * `OomScoreAdj: 200`,
-    * `RestartPolicy: {Name: ""}`, i.e. never restarted by the engine (the
-      manager owns start/stop),
-    * `Domainname: local.hass.io` when a hostname + DNS are set.
+    * `privileged: false` (add-on `privileged:` maps to `cap_add`, never a
+      privileged container),
+    * `security_opt` always includes `seccomp=unconfined` (+ `apparmor=<x>`
+      iff the spec names a profile),
+    * `labels` always include `supervisor_managed: ""`,
+    * `oom_score_adj: 200`,
+    * `restart: :no`, i.e. never restarted by the engine (the manager owns
+      start/stop),
+    * `domainname: local.hass.io` when a hostname + DNS are set.
   """
 
   @behaviour Vagus.Addon.Backend
@@ -89,14 +89,6 @@ defmodule Vagus.Addon.Backend.Container do
     end
   end
 
-  @doc """
-  Pure Spec → Engine-API `POST /containers/create` config map. Exposed for
-  testing the pinned run-param fidelity without a daemon.
-  """
-  @spec build_config(Spec.t()) :: map()
-  def build_config(%Spec{} = spec),
-    do: spec |> to_container_spec() |> Engine.Docker.render_container()
-
   @spec to_container_spec(Spec.t()) :: ContainerSpec.t()
   def to_container_spec(%Spec{} = spec) do
     bridge? = spec.network != :host
@@ -149,8 +141,8 @@ defmodule Vagus.Addon.Backend.Container do
   defp domainname(%Spec{hostname: h, dns: dns}) when is_binary(h) and dns != [], do: @dns_suffix
   defp domainname(_), do: nil
 
-  # A mount asking for neither option must carry no `BindOptions`, so
-  # `false` stays unset rather than sent.
+  # `false` stays unset, so a mount asking for neither option renders
+  # neither.
   defp mount(m) do
     %{
       type: :bind,
@@ -162,7 +154,7 @@ defmodule Vagus.Addon.Backend.Container do
     }
   end
 
-  # `Env` is a sorted list of `K=V` strings, so sort as those (`VAR1=` comes
-  # before `VAR=`, unlike the bare keys).
+  # Sorted as the `K=V` strings they render to (`VAR1=` comes before `VAR=`,
+  # unlike the bare keys).
   defp env_pairs(env), do: Enum.sort_by(env, fn {k, v} -> "#{k}=#{v}" end)
 end

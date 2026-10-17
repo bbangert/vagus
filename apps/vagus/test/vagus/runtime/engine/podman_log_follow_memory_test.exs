@@ -3,7 +3,6 @@ defmodule Vagus.Runtime.Engine.Podman.LogFollowMemoryTest do
   use ExUnit.Case, async: false
 
   alias Vagus.Runtime.Engine
-  alias Vagus.Runtime.Logs.Follow
   alias Vagus.Test.FakePodman
 
   @fixtures Path.expand("../../../fixtures/podman", __DIR__)
@@ -76,7 +75,7 @@ defmodule Vagus.Runtime.Engine.Podman.LogFollowMemoryTest do
     assert growth < 4 * 1_048_576,
            "the scan and first chunk grew binary memory by #{growth} bytes"
 
-    Follow.ack(pid)
+    Engine.ack_logs(pid)
     rest = collect(pid, [])
     assert byte_size(rest) == @record_bytes + byte_size("\nafter\n") - 65_536
     assert String.ends_with?(rest, "q\nafter\n")
@@ -85,7 +84,7 @@ defmodule Vagus.Runtime.Engine.Podman.LogFollowMemoryTest do
   defp collect(pid, acc) do
     receive do
       {:log_chunk, chunk} ->
-        Follow.ack(pid)
+        Engine.ack_logs(pid)
         collect(pid, [chunk | acc])
 
       :log_eof ->

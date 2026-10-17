@@ -83,7 +83,7 @@
           # Priority values are: `low, normal, high, higher`
           #
           # Disabled: this codebase deliberately fully-qualifies nested modules
-          # at call sites (Vagus.Runtime.Docker.request/3 etc.) rather than
+          # at call sites (Vagus.Runtime.Engine.Container.alive?/1 etc.) rather than
           # aliasing — 100 hits = house style, not oversight. Inline qualified
           # calls read fine here and aliasing every one adds header noise.
           {Credo.Check.Design.AliasUsage, false},

@@ -680,9 +680,9 @@ defmodule Vagus.App.Policy do
     end
   end
 
-  # The image is checked before every create, not only at install: an engine
-  # whose store is reset (podman's after a migration) has none. Under Docker
-  # the image is there, and the check costs one image inspect per start.
+  # The image is checked before every create, not only at install: podman's
+  # store is reset after a migration, and the check costs one image inspect
+  # per start.
   defp start_steps, do: [{:port?, nil}, {:ensure_image, nil}, {:mint_token, nil}, {:start, nil}]
 
   defp hook(%{config: config}, :pre) when is_binary(config.backup_pre), do: [{:exec_hook, :pre}]

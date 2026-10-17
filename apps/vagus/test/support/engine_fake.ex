@@ -5,10 +5,13 @@ defmodule Vagus.Runtime.Engine.Fake do
   takes no per-call opts (the router) reaches it through
   `config :vagus, engine: Fake, engine_fake: pid` instead, which is global:
   only `async: false` tests may use it.
+  With neither, a call is `{:error, :unavailable}`: `config/test.exs` makes
+  this the suite's engine, standing for one that is not there. A call that
+  names `engine: Fake` without an instance raises instead.
 
   Creating from an image the fake does not hold, or onto a bridge never
   `ensure_network`ed, is `{:failed, :create, :image_not_found |
-  :network_not_found}`, as `Engine.Docker` reports them.
+  :network_not_found}`, as `Engine.Podman` reports them.
   `calls/1` logs each callback as `{verb, args}`; `call_opts/1` logs the same
   calls as `{verb, opts}`, without the dispatch keys.
   `fail_next(fake, :stop, e)` also fails the next stop inside `stop_all/3`.
@@ -210,8 +213,16 @@ defmodule Vagus.Runtime.Engine.Fake do
     call(opts, :restart, [name], &update_container(&1, name, fn c -> run(c) end))
   end
 
+  # stop_all's result carries no error, so an engine that is not there fails
+  # each name instead, as `Engine.Podman` does with no Host.
   @impl true
   def stop_all(names, timeout_s, opts) do
+    if instance(opts),
+      do: stop_all_on(names, timeout_s, opts),
+      else: {:ok, [], Enum.map(names, &{&1, :unavailable})}
+  end
+
+  defp stop_all_on(names, timeout_s, opts) do
     # Delays add up, as sequential stops share one budget of every grace.
     floor = length(names) * grace_ms(timeout_s)
 
@@ -340,8 +351,13 @@ defmodule Vagus.Runtime.Engine.Fake do
   end
 
   defp call(opts, verb, args, fun) do
-    fake = instance(opts)
+    case instance(opts) do
+      nil -> {:error, :unavailable}
+      fake -> call(fake, opts, verb, args, fun)
+    end
+  end
 
+  defp call(fake, opts, verb, args, fun) do
     case Agent.get_and_update(fake, &pop_block(&1, verb)) do
       nil ->
         :ok
@@ -376,15 +392,19 @@ defmodule Vagus.Runtime.Engine.Fake do
   end
 
   defp instance(opts) do
-    case {opts[:fake], Application.fetch_env(:vagus, :engine_fake)} do
-      {nil, {:ok, fake}} ->
+    case {opts[:fake], Application.fetch_env(:vagus, :engine_fake), opts[:engine]} do
+      {nil, {:ok, fake}, _engine} ->
         fake
 
-      {nil, :error} ->
+      {nil, :error, __MODULE__} ->
         raise ArgumentError,
               "no Engine.Fake instance: pass fake: pid, or call start_global/0 in an async: false test"
 
-      {fake, _global} ->
+      # The suite's default engine with no instance: one that is not there.
+      {nil, :error, _default} ->
+        nil
+
+      {fake, _global, _engine} ->
         fake
     end
   end
@@ -392,7 +412,7 @@ defmodule Vagus.Runtime.Engine.Fake do
   defp timed_out?(opts, ms, floor),
     do: is_integer(opts[:timeout_ms]) and ms > max(opts[:timeout_ms], floor)
 
-  # The same floor Engine.Docker gives a stop: timeout_ms never cuts a grace short.
+  # timeout_ms never cuts a stop's grace short, whatever the adapter.
   defp grace_floor(verb, opts) when verb in [:stop, :restart] do
     if seconds = opts[:timeout_s], do: grace_ms(seconds), else: 0
   end

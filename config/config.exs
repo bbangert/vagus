@@ -33,9 +33,11 @@ config :nerves, source_date_epoch: "1784525674"
 # a board is ever misjudged. See `Vagus.Addon.Store.AssetMode`.
 config :vagus, :store_asset_mode, :auto
 
-# The `Vagus.Runtime.Engine` adapter for host dev and tests (`target.exs`
-# selects podman); a call's `engine:` option overrides it.
-config :vagus, :engine, Vagus.Runtime.Engine.Docker
+# The `Vagus.Runtime.Engine` adapter; a call's `engine:` option overrides it.
+# Host dev runs no `Vagus.Runtime.Host`, so no podman command runs there: every
+# engine call answers `:unavailable`, while the event source still reports
+# ready and re-lists (to `:unavailable`) every 60 s.
+config :vagus, :engine, Vagus.Runtime.Engine.Podman
 
 if Mix.target() == :host do
   import_config "host.exs"

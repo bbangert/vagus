@@ -20,7 +20,13 @@ defmodule Vagus.Runtime.Engine.PodmanRenderTest do
   end
 
   test "Core" do
-    spec = CoreContainer.to_container_spec("2026.7.0", token: "t", tz: "UTC")
+    spec =
+      CoreContainer.to_container_spec("2026.7.0",
+        token: "t",
+        tz: "UTC",
+        homeassistant_path: "/root/vagus/core/config"
+      )
+
     fingerprint = spec.labels[CoreContainer.spec_fingerprint_label()]
 
     assert Podman.render_create(spec, @log) ==
@@ -57,7 +63,7 @@ defmodule Vagus.Runtime.Engine.PodmanRenderTest do
                  "--mount",
                  "type=bind,src=/run/supervisor,dst=/run/supervisor",
                  "--mount",
-                 "type=volume,src=vagus-core-config,dst=/config",
+                 "type=bind,src=/root/vagus/core/config,dst=/config",
                  "--mount",
                  "type=bind,src=/run/resolv.conf,dst=/etc/resolv.conf,ro=true",
                  "--tmpfs",

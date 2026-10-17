@@ -29,7 +29,7 @@ defmodule Vagus.App.Units do
       running: &running/0,
       inspect: &running?/1,
       halt: &App.halt/1,
-      stop_containers: if(Engine.podman?(), do: &stop_containers/2),
+      stop_containers: &stop_containers/2,
       core_start: &CoreUnit.start(deadline: &1),
       core_stop: &CoreUnit.stop(deadline: &1),
       gates: Gates.all(),
@@ -131,9 +131,9 @@ defmodule Vagus.App.Units do
 
   @doc """
   One engine call that stops a group's containers together, ahead of their
-  halts. Only for podman: each app's own `stop` is a podman process, and a
-  frugal board's two `:ops` permits would queue a group's stops past its
-  budget. `Engine.Podman.stop_all/3` takes the reserved shutdown permit.
+  halts: each app's own `stop` is a podman process, and a frugal board's
+  two `:ops` permits would queue a group's stops past its budget.
+  `Engine.Podman.stop_all/3` takes the reserved shutdown permit.
 
   The grace is what fits the budget once podman's kill margin is set aside
   (`grace_s/1`): podman gives a stop its grace plus that margin whatever

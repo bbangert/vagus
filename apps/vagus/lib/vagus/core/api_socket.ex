@@ -18,9 +18,9 @@ defmodule Vagus.Core.ApiSocket do
 
   This is the no-Finch half of the transport: `Vagus.Core.Client` and
   friends ride the same socket through a Finch pool, but this one call runs
-  before/independently of that machinery, so it keeps its own short-lived
-  connection. Transport mirrors `Vagus.Runtime.Docker`: one short-lived
-  passive Mint connection per request, hard body cap, never raises.
+  before/independently of that machinery, so it keeps its own: one
+  short-lived passive Mint connection per request, hard body cap, never
+  raises.
   """
 
   alias Vagus.Core.Transport

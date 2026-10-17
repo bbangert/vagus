@@ -30,8 +30,8 @@ defmodule Vagus.Ingress.WSBridge do
   proxy leg (an orphaned upstream reconnecting silently, instead of the
   browser also seeing the drop, would violate close-code faithfulness) — see
   research §2's "Upstream" section for the full reasoning. Raw
-  `Mint.WebSocket`, hand-rolled in the same style as `Vagus.Runtime.Docker`/
-  `Vagus.Core.ApiSocket`, is used instead.
+  `Mint.WebSocket`, hand-rolled in the same style as `Vagus.Core.ApiSocket`,
+  is used instead.
 
   ## Linking + trapping exits (why, not just how)
 
@@ -323,7 +323,7 @@ defmodule Vagus.Ingress.WSBridge.Upstream do
   ## Connect + upgrade-request happen in `init/1`; the 101 response doesn't
 
   `Mint.HTTP.connect/4` (a real TCP connect, but to a container on the same
-  docker bridge network — fast) and `Mint.WebSocket.upgrade/5` (which only
+  `hassio` bridge — fast) and `Mint.WebSocket.upgrade/5` (which only
   *sends* the upgrade request, `Mint.HTTP.request/5` under the hood) both
   run synchronously inside `init/1`: both either succeed immediately or
   return an error tuple immediately, and `init/1` failing outright (`{:stop,

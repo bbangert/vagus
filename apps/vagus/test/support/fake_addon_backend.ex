@@ -2,8 +2,8 @@ defmodule Vagus.Addon.Backend.Fake do
   @moduledoc """
   A no-daemon `Vagus.Addon.Backend` for router-level lifecycle tests
   (`test/vagus/api/addon_lifecycle_router_test.exs`) — install/start/stop/
-  restart/uninstall all need a backend that succeeds without a real Docker
-  daemon. Injected via `config :vagus, :addon_backend` (read by
+  restart/uninstall all need a backend that succeeds without a real
+  container engine. Injected via `config :vagus, :addon_backend` (read by
   `Vagus.App.Steps`) rather than an explicit `:backend` opt, since the
   router passes no opts at all.
 

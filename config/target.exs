@@ -251,9 +251,9 @@ config :vagus, :core_port_migration_marker, "/data/vagus/core_port_migration"
 # after the config-declared :store_repositories on boot.
 config :vagus, :store_repositories_path, "/data/vagus/store_repositories.json"
 
-# The system ships podman and no Docker-API engine; host dev and the test
-# suite keep `config.exs`'s Docker default.
-config :vagus, :engine, Vagus.Runtime.Engine.Podman
+# `Vagus.Runtime.Host` prepares the board for podman (mounts, sysctls, the
+# hassio bridge interface); host dev and the test suite must never do that.
+config :vagus, :runtime_host, true
 
 # The HA Core container's name on the engine — the source behind the
 # /core (and /homeassistant alias) logs + stats routes. Was never set
