@@ -52,7 +52,7 @@ defmodule Vagus.App.Orchestrator do
   running past its stage budget is left to finish beside the stop.
 
   Shutdown sends `halt` to the `application` stage, then stops Core, then
-  halts every earlier stage, each group all at once. Under podman each
+  halts every earlier stage, each group all at once. Each
   group's containers are first stopped by one engine call
   (`Vagus.App.Units.stop_containers/3`), bounded by the group's budget less
   2 s, and the halts then find them stopped; the group as a whole keeps the
@@ -518,7 +518,6 @@ defmodule Vagus.App.Orchestrator do
   # the rest of the group's budget, never under the floor. A stop still
   # running at its bound is killed and the halts stop what it left.
   defp halt_budget([], cfg), do: cfg.app_stop_timeout
-  defp halt_budget(_slugs, %{units: %{stop_containers: nil}} = cfg), do: cfg.app_stop_timeout
 
   defp halt_budget(slugs, cfg) do
     started = System.monotonic_time(:millisecond)

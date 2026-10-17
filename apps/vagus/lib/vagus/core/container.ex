@@ -1,20 +1,21 @@
 defmodule Vagus.Core.Container do
   @moduledoc """
-  Pure builder for the HA Core container's Engine-API
-  `POST /containers/create` body — the device-proven real-Supervisor-parity
-  run spec settled during the bluetooth work (see
+  Pure builder for the HA Core container's
+  `Vagus.Runtime.Engine.ContainerSpec` — the device-proven
+  real-Supervisor-parity run spec settled during the bluetooth work (see
   `.claude/plans/vagus-core-lifecycle/research/supervisor-semantics.md`,
   mirroring upstream `supervisor/docker/homeassistant.py`).
 
   This is Core's OWN spec builder, deliberately separate from
-  `Vagus.Addon.Backend.Container.build_config/1`: the add-on builder
-  hard-stamps `Privileged: false` / `OomScoreAdj: 200` as a cross-cutting
-  add-on security invariant, and Core's `Privileged: true` spec must not
+  `Vagus.Addon.Backend.Container.to_container_spec/1`: the add-on builder
+  hard-stamps `privileged: false` / `oom_score_adj: 200` as a cross-cutting
+  add-on security invariant, and Core's `privileged: true` spec must not
   reuse (and thereby weaken) that seam.
 
-  `create_config/2` has no side effects beyond its `Token.get/0` default —
-  no processes, no Engine-API calls. `Vagus.Core.Lifecycle` (a later phase)
-  is what actually creates/starts/stops containers from this config.
+  `to_container_spec/2` has no side effects beyond its `Token.get/0` and
+  `Vagus.Runtime.Migration.core_config_path/1` defaults — no processes, no
+  engine calls. `Vagus.Core.Lifecycle` is what actually creates/starts/stops
+  containers from this spec.
 
   ## The Supervisor socket (`/run/supervisor`)
 
@@ -46,7 +47,7 @@ defmodule Vagus.Core.Container do
 
   ## Deliberate v1 deviations (kept, not omitted — see plan "Locked decisions")
 
-  * `RestartPolicy: unless-stopped` — upstream owns Core restarts itself
+  * `restart: :unless_stopped` — upstream owns Core restarts itself
     (container/API watchdogs); Vagus v1 has no Core watchdog yet, so the
     engine's own restart policy covers the crash-loop case until one lands.
   * No `:8888`-style port suffix on the `SUPERVISOR`/`HASSIO` env IPs —
@@ -60,7 +61,6 @@ defmodule Vagus.Core.Container do
 
   alias Vagus.API.Token
   alias Vagus.Network
-  alias Vagus.Runtime.Engine
   alias Vagus.Runtime.Engine.ContainerSpec
   alias Vagus.Runtime.Migration
 
@@ -79,10 +79,6 @@ defmodule Vagus.Core.Container do
   def name do
     Application.get_env(:vagus, :core_container) || @default_name
   end
-
-  @doc "The named docker volume holding Core's /config (see mounts/0)."
-  @spec config_volume() :: String.t()
-  def config_volume, do: "vagus-core-config"
 
   @doc """
   The bind-mounted directory holding Core's Supervisor socket
@@ -107,24 +103,15 @@ defmodule Vagus.Core.Container do
   def spec_fingerprint_label, do: @spec_fingerprint_label
 
   @doc """
-  Host path of Core's /config.
-
-  Under podman, Core binds a host directory (a named volume would start
-  empty in podman's own store), and `Vagus.Runtime.Migration.core_config_path/1`
-  picks it: the legacy directory until it has been moved out of balena's
-  tree. Under `Engine.Docker` (host dev and tests) it is that legacy path:
-  the docker "local" driver's `<data_root>/volumes/<name>/_data` for the
-  `vagus-core-config` named volume. `opts[:homeassistant_path]` overrides the
-  path outright, since host tests have neither tree.
+  Host path of Core's /config, which Core binds: a named volume would start
+  empty in podman's own store. `Vagus.Runtime.Migration.core_config_path/1`
+  picks it, the legacy directory until it has been moved out of balena's
+  tree. `opts[:homeassistant_path]` overrides it outright, since host tests
+  have neither tree.
   """
   @spec config_path(keyword()) :: String.t()
-  def config_path(opts \\ []) do
-    Keyword.get_lazy(opts, :homeassistant_path, fn ->
-      if Engine.podman?(opts),
-        do: Migration.core_config_path(),
-        else: Migration.legacy_config_dir()
-    end)
-  end
+  def config_path(opts \\ []),
+    do: Keyword.get_lazy(opts, :homeassistant_path, fn -> Migration.core_config_path() end)
 
   @doc "The Core image reference for `version`, e.g. `ghcr.io/home-assistant/home-assistant:2026.7.0`."
   @spec image(String.t()) :: String.t()
@@ -135,8 +122,8 @@ defmodule Vagus.Core.Container do
   def image?(ref) when is_binary(ref), do: String.starts_with?(ref, @image_repo <> ":")
 
   @doc """
-  Builds the Engine-API `POST /containers/create` body for HA Core at
-  `version`.
+  The spec for HA Core at `version`, stamped with its `spec_fingerprint/1`
+  label.
 
   Options:
 
@@ -144,18 +131,7 @@ defmodule Vagus.Core.Container do
       back to Vagus with. Defaults to `Vagus.API.Token.get/0`; injectable
       so tests never touch the real persisted/on-disk token.
     * `:tz` - the `TZ` env value. Defaults to `"UTC"`.
-    * `:engine` - the engine adapter the spec is for (default
-      `config :vagus, :engine`); under podman /config is a bind of
-      `config_path/1`, which `:homeassistant_path` overrides.
-  """
-  @spec create_config(String.t(), keyword()) :: map()
-  def create_config(version, opts \\ []) when is_binary(version),
-    do: version |> to_container_spec(opts) |> Engine.Docker.render_container()
-
-  @doc """
-  The engine-neutral spec behind `create_config/2`. The fingerprint label is
-  computed over the Docker render without it, so it matches every Core
-  container already stamped.
+    * `:homeassistant_path` - the /config bind source (see `config_path/1`).
   """
   @spec to_container_spec(String.t(), keyword()) :: ContainerSpec.t()
   def to_container_spec(version, opts \\ []) when is_binary(version) do
@@ -178,15 +154,13 @@ defmodule Vagus.Core.Container do
       mounts: mounts(opts)
     }
 
-    fingerprint = spec |> Engine.Docker.render_container() |> spec_fingerprint()
-    %{spec | labels: %{@spec_fingerprint_label => fingerprint}}
+    %{spec | labels: %{@spec_fingerprint_label => spec_fingerprint(spec)}}
   end
 
   @doc """
-  A deterministic digest of everything in a `create_config/2` map that a
-  running container would have to be recreated to pick up — the whole spec
-  (image, env, host config, mounts) except the `"Labels"` key the digest
-  itself is stamped into.
+  A deterministic digest of everything in `spec` that a running container
+  would have to be recreated to pick up — all of it but `labels` (the digest
+  itself is stamped there), `name` and `secret_env`.
 
   `Vagus.Core.Lifecycle` stamps this on every container it creates and
   compares it against the existing container's label before reusing one, so
@@ -194,15 +168,12 @@ defmodule Vagus.Core.Container do
   the same recreate an image/version mismatch does — a *missing* label (a
   container created before fingerprinting existed, or by hand) never matches
   and so always recreates.
-
-  Pure: same spec in, same digest out. Nested maps are canonicalized to
-  key-sorted pairs first so the digest can't depend on map iteration order.
   """
-  @spec spec_fingerprint(map()) :: String.t()
-  def spec_fingerprint(spec) when is_map(spec) do
+  @spec spec_fingerprint(ContainerSpec.t()) :: String.t()
+  def spec_fingerprint(%ContainerSpec{} = spec) do
     digest =
       spec
-      |> Map.delete("Labels")
+      |> fingerprint_body()
       |> canonical()
       |> Jason.encode!()
       |> then(&:crypto.hash(:sha256, &1))
@@ -210,6 +181,73 @@ defmodule Vagus.Core.Container do
 
     binary_part(digest, 0, @spec_fingerprint_length)
   end
+
+  # The fields `fingerprint_body/1` renders in the Docker shape.
+  @shaped [:image, :hostname, :env, :network, :privileged, :oom_score_adj] ++
+            [:restart, :extra_hosts, :mounts, :tmpfs]
+  @unhashed [:name, :secret_env, :labels]
+
+  # Every Core container carries a label hashed over this exact shape, the
+  # Docker Engine-API create body the first fingerprints were computed from:
+  # a different shape for the same spec would recreate Core on every board.
+  # A field the shape lacks is hashed under its own name once set, so it
+  # still changes the digest without moving any digest taken while unset.
+  defp fingerprint_body(%ContainerSpec{} = spec) do
+    host_config =
+      drop_nil(%{
+        "NetworkMode" => network_mode(spec.network),
+        "Privileged" => spec.privileged,
+        "OomScoreAdj" => spec.oom_score_adj,
+        "RestartPolicy" => restart_policy(spec.restart),
+        "ExtraHosts" => spec.extra_hosts && Enum.map(spec.extra_hosts, &pair(&1, ":")),
+        "Mounts" => spec.mounts && Enum.map(spec.mounts, &fingerprint_mount/1),
+        "Tmpfs" => spec.tmpfs
+      })
+
+    unshaped =
+      for {field, value} <- Map.from_struct(spec),
+          field not in @shaped and field not in @unhashed and value != nil,
+          into: %{},
+          do: {Atom.to_string(field), value}
+
+    %{
+      "Image" => spec.image,
+      "Hostname" => spec.hostname,
+      "Env" => spec.env && Enum.map(spec.env, &pair(&1, "=")),
+      "HostConfig" => host_config
+    }
+    |> drop_nil()
+    |> Map.merge(unshaped)
+  end
+
+  defp pair({key, value}, separator), do: "#{key}#{separator}#{value}"
+
+  defp network_mode(:host), do: "host"
+  defp network_mode({:bridge, name}), do: name
+
+  defp restart_policy(nil), do: nil
+  defp restart_policy(:no), do: %{"Name" => ""}
+  defp restart_policy(:unless_stopped), do: %{"Name" => "unless-stopped"}
+
+  defp fingerprint_mount(%{type: :bind} = m) do
+    bind_options =
+      drop_nil(%{
+        "Propagation" => Map.get(m, :propagation),
+        "ReadOnlyNonRecursive" => if(Map.get(m, :read_only_non_recursive), do: true)
+      })
+
+    drop_nil(%{
+      "Type" => "bind",
+      "Source" => m.source,
+      "Target" => m.target,
+      "ReadOnly" => Map.get(m, :read_only) || false,
+      "BindOptions" => if(bind_options != %{}, do: bind_options)
+    })
+  end
+
+  defp fingerprint_mount(m), do: Map.new(m, fn {key, value} -> {Atom.to_string(key), value} end)
+
+  defp drop_nil(map), do: Map.reject(map, fn {_key, value} -> is_nil(value) end)
 
   defp canonical(map) when is_map(map) do
     map
@@ -248,13 +286,7 @@ defmodule Vagus.Core.Container do
       # Writable: Core creates its Supervisor socket inside this directory
       # (see the moduledoc's "The Supervisor socket" section).
       %{type: :bind, source: @socket_dir, target: @socket_dir, read_only: false},
-      config_mount(opts)
+      %{type: :bind, source: config_path(opts), target: "/config", read_only: false}
     ]
-  end
-
-  defp config_mount(opts) do
-    if Engine.podman?(opts),
-      do: %{type: :bind, source: config_path(opts), target: "/config", read_only: false},
-      else: %{type: :volume, source: config_volume(), target: "/config"}
   end
 end

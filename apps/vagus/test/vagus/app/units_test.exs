@@ -41,21 +41,7 @@ defmodule Vagus.App.UnitsTest do
   end
 
   describe "stop_containers" do
-    test "is no unit under Docker, whose halts stop each container as before" do
-      assert Units.all().stop_containers == nil
-    end
-
-    test "is a unit under podman" do
-      prev = Application.fetch_env(:vagus, :engine)
-      Application.put_env(:vagus, :engine, Vagus.Runtime.Engine.Podman)
-
-      on_exit(fn ->
-        case prev do
-          {:ok, engine} -> Application.put_env(:vagus, :engine, engine)
-          :error -> Application.delete_env(:vagus, :engine)
-        end
-      end)
-
+    test "is a unit" do
       assert is_function(Units.all().stop_containers, 2)
     end
 

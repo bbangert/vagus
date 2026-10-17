@@ -1396,7 +1396,7 @@ defmodule Vagus.API.Router do
   # `:core_config_check` are per-request config seams (default
   # `Vagus.Core.Lifecycle`/`Vagus.Core.ConfigCheck`), resolved the same way
   # `core_container/0` resolves its config value — tests inject a stub module
-  # via `Application.put_env/3` instead of a real Docker socket/HTTP probe.
+  # via `Application.put_env/3` instead of a real engine/HTTP probe.
   # `/homeassistant/*` are the contract's alias of `/core/*` (same convention
   # as the logs routes above).
   #
@@ -1785,7 +1785,7 @@ defmodule Vagus.API.Router do
   # `check_config`'s log is bounded only by the engine adapter's
   # generic 16MB response ceiling (security-phase6.md W3) —
   # without this, a chatty custom-integration traceback becomes a 16MB
-  # JSON error body, with several unserialised copies (raw + demuxed +
+  # JSON error body, with several unserialised copies (raw + plain +
   # stripped + encoded) alive at once on a 1GB device. `String.byte_slice/3`,
   # not `String.slice/3`: the bound is in bytes, so the cut must be too — a
   # grapheme slice of a multibyte log can land several times over the
@@ -2127,7 +2127,7 @@ defmodule Vagus.API.Router do
 
   # -- logs helpers ----------------------------------------------------------
 
-  # Send a plain-text log body (§A5): the required headers, then the demuxed +
+  # Send a plain-text log body (§A5): the required headers, then the plain +
   # (optionally) de-colored container logs. No container / an engine error is an
   # honestly-empty 200, not a failure — a log poll must not error. `?lines=N`
   # tails, `?no_colors` strips ANSI.
@@ -2182,7 +2182,7 @@ defmodule Vagus.API.Router do
   defp log_body(nil, _lines, _no_colors, _verbose), do: ""
 
   # Native "virtual add-ons" have no container — serve the broker's telemetry log
-  # buffer (already text/plain, one entry per line) instead of Docker logs.
+  # buffer (already text/plain, one entry per line) instead of engine logs.
   # Verbose for native/broker lines is the plain line with the host/ident
   # prefix (no per-line source timestamp exists — documented approximation).
   defp log_body(ref, lines, no_colors, verbose) do
@@ -2195,7 +2195,7 @@ defmodule Vagus.API.Router do
         Enum.join(raw, "\n")
       end
     else
-      # verbose rides docker's own per-line RFC3339 stamps (timestamps=true).
+      # verbose rides the engine's own per-line RFC3339 stamps (timestamps: true).
       case Engine.logs(ref, tail: lines, timestamps: verbose) do
         {:ok, text} -> text |> maybe_strip(no_colors) |> maybe_verbose_body(ref, verbose)
         {:error, _reason} -> ""
@@ -2347,16 +2347,16 @@ defmodule Vagus.API.Router do
   end
 
   # An all-buffered (verbose partial-line) chunk still needs its ack or the
-  # Follow process would stall waiting for one.
+  # engine's streamer would stall waiting for one.
   defp deliver_chunk(conn, "", source, fmt, ack?) do
-    if ack?, do: Logs.Follow.ack(source_pid(source))
+    if ack?, do: Engine.ack_logs(source_pid(source))
     stream_loop(conn, source, fmt)
   end
 
   defp deliver_chunk(conn, data, source, fmt, ack?) do
     case chunk(conn, data) do
       {:ok, conn} ->
-        if ack?, do: Logs.Follow.ack(source_pid(source))
+        if ack?, do: Engine.ack_logs(source_pid(source))
         stream_loop(conn, source, fmt)
 
       {:error, _reason} ->
@@ -2396,10 +2396,10 @@ defmodule Vagus.API.Router do
     :exit, _ -> :ok
   end
 
-  # Plain mode passes docker chunks through untouched (bar the ANSI strip —
+  # Plain mode passes engine chunks through untouched (bar the ANSI strip —
   # NOTE: an escape split across two chunks can evade it; cosmetic, accepted).
   # Verbose mode line-buffers so the §A5 prefix lands on whole lines even
-  # when docker chunks split them; the buffered remainder is capped so a
+  # when engine chunks split them; the buffered remainder is capped so a
   # no-newline stream can't balloon memory.
   defp render_stream(data, %{verbose: false} = fmt) do
     {maybe_strip(data, fmt.no_colors), fmt}

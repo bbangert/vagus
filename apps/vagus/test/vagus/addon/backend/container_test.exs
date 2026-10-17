@@ -25,163 +25,146 @@ defmodule Vagus.Addon.Backend.ContainerTest do
     struct(base, overrides)
   end
 
-  describe "build_config/1 — pinned §A1.4 invariants" do
+  defp container_spec(overrides \\ []),
+    do: overrides |> mosquitto_spec() |> Container.to_container_spec()
+
+  describe "to_container_spec/1 — pinned §A1.4 invariants" do
     setup do
-      %{
-        cfg: Container.build_config(mosquitto_spec()),
-        host: Container.build_config(mosquitto_spec()) |> Map.fetch!("HostConfig")
-      }
+      %{spec: container_spec()}
     end
 
-    test("Privileged is always false", %{host: host}, do: assert(host["Privileged"] == false))
+    test("never privileged", %{spec: spec}, do: assert(spec.privileged == false))
 
-    test "SecurityOpt always includes seccomp=unconfined", %{host: host} do
-      assert host["SecurityOpt"] == ["seccomp=unconfined"]
+    test "security_opt always includes seccomp=unconfined", %{spec: spec} do
+      assert spec.security_opt == ["seccomp=unconfined"]
     end
 
-    test("OomScoreAdj is 200", %{host: host}, do: assert(host["OomScoreAdj"] == 200))
+    test("oom_score_adj is 200", %{spec: spec}, do: assert(spec.oom_score_adj == 200))
 
-    test("RestartPolicy names none, so the engine never restarts it", %{host: host},
-      do: assert(host["RestartPolicy"] == %{"Name" => ""})
+    test("restart is :no, so the engine never restarts it", %{spec: spec},
+      do: assert(spec.restart == :no)
     )
 
-    test "supervisor_managed label always present", %{cfg: cfg} do
-      assert cfg["Labels"]["supervisor_managed"] == ""
+    test "supervisor_managed label always present", %{spec: spec} do
+      assert spec.labels["supervisor_managed"] == ""
     end
 
-    test "ExtraHosts rendered name:ip and sorted", %{host: host} do
-      assert host["ExtraHosts"] == ["hassio:172.30.32.2", "supervisor:172.30.32.2"]
+    test "extra_hosts sorted", %{spec: spec} do
+      assert spec.extra_hosts == [{"hassio", "172.30.32.2"}, {"supervisor", "172.30.32.2"}]
     end
 
-    test "DNS wiring", %{host: host} do
-      assert host["Dns"] == ["172.30.32.3"]
-      assert host["DnsSearch"] == ["local.hass.io"]
-      assert host["DnsOptions"] == ["timeout:10"]
+    test "DNS wiring", %{spec: spec} do
+      assert spec.dns == ["172.30.32.3"]
+      assert spec.dns_search == ["local.hass.io"]
+      assert spec.dns_options == ["timeout:10"]
     end
 
-    test("Init reflects the spec", %{host: host}, do: assert(host["Init"] == false))
+    test("init reflects the spec", %{spec: spec}, do: assert(spec.init == false))
 
-    test "hostname + Domainname + bridge alias", %{cfg: cfg} do
-      assert cfg["Hostname"] == "core-mosquitto"
-      assert cfg["Domainname"] == "local.hass.io"
-      assert cfg["HostConfig"]["NetworkMode"] == "hassio"
-      assert cfg["NetworkingConfig"]["EndpointsConfig"]["hassio"]["Aliases"] == ["core-mosquitto"]
+    test "hostname + domainname + bridge alias", %{spec: spec} do
+      assert spec.hostname == "core-mosquitto"
+      assert spec.domainname == "local.hass.io"
+      assert spec.network == {:bridge, "hassio"}
+      assert spec.network_aliases == ["core-mosquitto"]
     end
 
-    test "ports → PortBindings + ExposedPorts", %{cfg: cfg} do
-      assert cfg["HostConfig"]["PortBindings"]["1883/tcp"] == [%{"HostPort" => "1883"}]
-      assert cfg["ExposedPorts"]["8883/tcp"] == %{}
+    test "ports pass through", %{spec: spec} do
+      assert spec.ports == %{"1883/tcp" => "1883", "8883/tcp" => "8883"}
     end
 
-    test "env map normalized to a sorted K=V list", %{cfg: cfg} do
-      assert cfg["Env"] == ["HASSIO_TOKEN=tok", "SUPERVISOR_TOKEN=tok", "TZ=UTC"]
+    test "env map normalized to a sorted pair list", %{spec: spec} do
+      assert spec.env == [{"HASSIO_TOKEN", "tok"}, {"SUPERVISOR_TOKEN", "tok"}, {"TZ", "UTC"}]
     end
 
-    test "mounts → bind mounts with propagation + read_only", %{host: host} do
-      assert %{"Type" => "bind", "Source" => "/data/ssl", "Target" => "/ssl", "ReadOnly" => false} in host[
-               "Mounts"
-             ]
-
-      share = Enum.find(host["Mounts"], &(&1["Target"] == "/share"))
-      assert share["BindOptions"] == %{"Propagation" => "rslave"}
+    test "mounts → bind mounts with propagation + read_only", %{spec: spec} do
+      assert [ssl, share] = spec.mounts
+      assert %{type: :bind, source: "/data/ssl", target: "/ssl", read_only: false} = ssl
+      assert share.propagation == "rslave"
     end
   end
 
-  describe "build_config/1 — variants" do
-    test "apparmor profile adds a SecurityOpt entry" do
-      cfg = Container.build_config(mosquitto_spec(apparmor: "addon_core_mosquitto"))
-
-      assert cfg["HostConfig"]["SecurityOpt"] == [
+  describe "to_container_spec/1 — variants" do
+    test "apparmor profile adds a security_opt entry" do
+      assert container_spec(apparmor: "addon_core_mosquitto").security_opt == [
                "seccomp=unconfined",
                "apparmor=addon_core_mosquitto"
              ]
     end
 
-    test "host network: NetworkMode host, no port publishing or networking config" do
-      cfg = Container.build_config(mosquitto_spec(network: :host))
-      assert cfg["HostConfig"]["NetworkMode"] == "host"
-      refute Map.has_key?(cfg["HostConfig"], "PortBindings")
-      refute Map.has_key?(cfg, "ExposedPorts")
-      refute Map.has_key?(cfg, "NetworkingConfig")
+    test "host network: no bridge and no alias" do
+      spec = container_spec(network: :host)
+      assert spec.network == :host
+      assert spec.network_aliases == nil
     end
 
-    test "no hostname → no Domainname/NetworkingConfig" do
-      cfg = Container.build_config(mosquitto_spec(hostname: nil))
-      refute Map.has_key?(cfg, "Domainname")
-      refute Map.has_key?(cfg, "NetworkingConfig")
+    test "no hostname → no domainname or alias" do
+      spec = container_spec(hostname: nil)
+      assert spec.domainname == nil
+      assert spec.network_aliases == nil
     end
   end
 
-  describe "build_config/1 — advanced fields" do
+  describe "to_container_spec/1 — advanced fields" do
     test "cap_add / tmpfs / pid_mode / uts_mode / open_stdin flow through" do
-      cfg =
-        Container.build_config(
-          mosquitto_spec(
-            cap_add: ["NET_ADMIN"],
-            tmpfs: %{"/tmp" => "", "/dev/shm" => ""},
-            pid_mode: "host",
-            uts_mode: "host",
-            open_stdin: true
-          )
+      spec =
+        container_spec(
+          cap_add: ["NET_ADMIN"],
+          tmpfs: %{"/tmp" => "", "/dev/shm" => ""},
+          pid_mode: "host",
+          uts_mode: "host",
+          open_stdin: true
         )
 
-      assert cfg["HostConfig"]["CapAdd"] == ["NET_ADMIN"]
-      assert cfg["HostConfig"]["Tmpfs"] == %{"/tmp" => "", "/dev/shm" => ""}
-      assert cfg["HostConfig"]["PidMode"] == "host"
-      assert cfg["HostConfig"]["UTSMode"] == "host"
-      assert cfg["OpenStdin"] == true
+      assert spec.cap_add == ["NET_ADMIN"]
+      assert spec.tmpfs == %{"/tmp" => "", "/dev/shm" => ""}
+      assert spec.pid_mode == "host"
+      assert spec.uts_mode == "host"
+      assert spec.open_stdin == true
     end
 
-    test "device_cgroup_rules reach DeviceCgroupRules, and the key is always present" do
-      cfg = Container.build_config(mosquitto_spec(device_cgroup_rules: ["c 1:3 rwm"]))
-      assert cfg["HostConfig"]["DeviceCgroupRules"] == ["c 1:3 rwm"]
+    test "device_cgroup_rules flow through, and are stated even when empty" do
+      assert container_spec(device_cgroup_rules: ["c 1:3 rwm"]).device_cgroup_rules ==
+               ["c 1:3 rwm"]
 
-      # `[]` rather than an absent key: an add-on granted nothing must still say
-      # so explicitly, same as CapAdd/Dns (D-C).
-      empty = Container.build_config(mosquitto_spec())
-      assert empty["HostConfig"]["DeviceCgroupRules"] == []
+      # `[]` rather than nil: an add-on granted nothing must still say so
+      # explicitly, same as cap_add/dns (D-C).
+      assert container_spec().device_cgroup_rules == []
     end
 
-    test "BindOptions carries propagation and ReadOnlyNonRecursive, and is omitted when neither applies" do
-      cfg =
-        Container.build_config(
-          mosquitto_spec(
-            mounts: [
-              %{source: "/a", target: "/a", read_only: true},
-              %{source: "/dev", target: "/dev", read_only: true, read_only_non_recursive: true},
-              %{source: "/b", target: "/b", read_only: false, propagation: "rslave"}
-            ]
-          )
+    test "a mount asking for neither bind option sets neither" do
+      spec =
+        container_spec(
+          mounts: [
+            %{source: "/a", target: "/a", read_only: true},
+            %{source: "/dev", target: "/dev", read_only: true, read_only_non_recursive: true},
+            %{source: "/b", target: "/b", read_only: false, propagation: "rslave"}
+          ]
         )
 
-      [plain, dev, prop] = cfg["HostConfig"]["Mounts"]
+      [plain, dev, prop] = spec.mounts
 
-      # Omitted, not empty: an existing mount's JSON must not change shape.
-      refute Map.has_key?(plain, "BindOptions")
-      assert dev["BindOptions"] == %{"ReadOnlyNonRecursive" => true}
-      assert prop["BindOptions"] == %{"Propagation" => "rslave"}
+      assert {plain.propagation, plain.read_only_non_recursive} == {nil, nil}
+      assert {dev.propagation, dev.read_only_non_recursive} == {nil, true}
+      assert {prop.propagation, prop.read_only_non_recursive} == {"rslave", nil}
     end
 
-    test "hostname set but empty dns → no Domainname" do
-      cfg = Container.build_config(mosquitto_spec(dns: []))
-      refute Map.has_key?(cfg, "Domainname")
+    test "hostname set but empty dns → no domainname" do
+      assert container_spec(dns: []).domainname == nil
     end
   end
 
   describe "to_container_spec/1" do
-    # `Env`/`ExtraHosts` are sorted rendered strings, which is not the
-    # bare-key order once a key ends in a character below `=`/`:`.
+    # Sorted as the `K=V` / `name:ip` strings they render to, which is not
+    # the bare-key order once a key ends in a character below `=`/`:`.
     test "env and extra_hosts sort as their rendered strings" do
-      cfg =
-        Container.build_config(
-          mosquitto_spec(
-            env: %{"VAR" => "b", "VAR1" => "a"},
-            extra_hosts: %{"h" => "2.2.2.2", "h-1" => "1.1.1.1"}
-          )
+      spec =
+        container_spec(
+          env: %{"VAR" => "b", "VAR1" => "a"},
+          extra_hosts: %{"h" => "2.2.2.2", "h-1" => "1.1.1.1"}
         )
 
-      assert cfg["Env"] == ["VAR1=a", "VAR=b"]
-      assert cfg["HostConfig"]["ExtraHosts"] == ["h-1:1.1.1.1", "h:2.2.2.2"]
+      assert spec.env == [{"VAR1", "a"}, {"VAR", "b"}]
+      assert spec.extra_hosts == [{"h-1", "1.1.1.1"}, {"h", "2.2.2.2"}]
     end
 
     test "the tokens are marked secret" do
@@ -257,26 +240,6 @@ defmodule Vagus.Addon.Backend.ContainerTest do
       assert Container.stop("addon_ghost", opts) == {:error, :not_found}
       assert Container.remove("addon_ghost", opts) == :ok
       assert Container.remove_image("ghcr.io/x/absent:1", opts) == :ok
-    end
-  end
-
-  describe "lifecycle via the backend (live daemon)" do
-    @describetag :docker
-
-    test "pull → create → start → state → stop → remove" do
-      name = "vagus-be-test-#{System.unique_integer([:positive])}"
-      on_exit(fn -> Container.remove(name, force: true) end)
-
-      spec = %Spec{name: name, image: "alpine:3", cmd: ["sleep", "30"], network: :host}
-
-      assert :ok = Container.pull(spec)
-      assert {:ok, _id} = Container.create(spec)
-      assert :ok = Container.start(name)
-      assert {:ok, :running} = Container.state(name)
-      assert :ok = Container.stop(name, timeout: 1)
-      assert {:ok, :stopped} = Container.state(name)
-      assert :ok = Container.remove(name)
-      assert {:ok, :unknown} = Container.state(name)
     end
   end
 end

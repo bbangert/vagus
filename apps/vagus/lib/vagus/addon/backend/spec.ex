@@ -3,12 +3,13 @@ defmodule Vagus.Addon.Backend.Spec do
   Runtime-neutral description of an add-on instance — the interface between the
   add-on manager (`Vagus.Addon`, which populates it from the add-on config +
   the pinned run params, §A1.4) and a `Vagus.Addon.Backend` (which translates
-  it to the concrete runtime, e.g. Docker JSON in `Backend.Container`).
+  it to the concrete runtime, e.g. a `Vagus.Runtime.Engine.ContainerSpec` in
+  `Backend.Container`).
 
   Only add-on-specific / config-derived fields live here. Cross-cutting
-  invariants the real Supervisor always applies — `Privileged: false`,
-  `SecurityOpt: seccomp=unconfined`, `Labels: supervisor_managed`,
-  `OomScoreAdj: 200`, no restart policy — are owned by the backend, not carried
+  invariants the real Supervisor always applies — not privileged,
+  `seccomp=unconfined`, the `supervisor_managed` label, OOM score adj 200,
+  no restart policy — are owned by the backend, not carried
   per-spec (see `Backend.Container`).
   """
 

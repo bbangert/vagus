@@ -36,6 +36,7 @@ defmodule Vagus.App.OrchestratorTest do
         in_flight?: fn -> false end,
         core_start: fn _deadline -> send(test_pid, :core_start) && :ok end,
         core_stop: fn _deadline -> send(test_pid, :core_stop) && :ok end,
+        stop_containers: fn _slugs, _budget -> {:ok, [], []} end,
         gates: Map.new([:tree, :engine, :network, :api], &{&1, gate(test_pid, &1)}),
         report: fn stage, outcomes -> send(test_pid, {:report, stage, outcomes}) end,
         push_complete: fn -> send(test_pid, :complete) end

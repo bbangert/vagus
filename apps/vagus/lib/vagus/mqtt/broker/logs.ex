@@ -3,11 +3,11 @@ defmodule Vagus.Mqtt.Broker.Logs do
   A bounded, in-memory log buffer for the native MQTT broker (M5, MQ-P3-T2).
 
   A native "virtual add-on" has no container, so `GET /addons/<slug>/logs` can't
-  read `Docker.container_logs`. This GenServer synthesizes an equivalent: it
+  read the engine's container logs. This GenServer synthesizes an equivalent: it
   attaches a `:telemetry` handler to mqttx's server events (connect / disconnect
   / subscribe / publish) and keeps the most recent `@max` formatted lines, which
   the router's native logs branch serves as `text/plain`, one entry per line —
-  the same shape `Vagus.Runtime.Logs.format/2` produces for a container.
+  the same shape the engine's `logs` gives for a container.
 
   Started as a child of the `Vagus.Mqtt.Broker` subtree (named `<broker>.Logs`),
   so it lives and dies with the broker. The telemetry callback runs in the

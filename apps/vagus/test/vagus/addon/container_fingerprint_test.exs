@@ -3,9 +3,9 @@ defmodule Vagus.Addon.ContainerFingerprintTest do
   Does an add-on Vagus starts *look from the inside* like one a real Supervisor
   started?
 
-  `Vagus.App.Steps.build_spec/2` and `Backend.Container.build_config/1` were written
-  against upstream's `docker/addon.py`, and the tests around them assert the
-  Docker JSON matches what we believe upstream asks for. Belief is the weak
+  `Vagus.App.Steps.build_spec/2` and `Backend.Container.to_container_spec/1` were
+  written against upstream's `docker/addon.py`, and the tests around them assert
+  the container spec matches what we believe upstream asks for. Belief is the weak
   part: every one of those assertions restates our own reading of upstream back
   to itself, so a misread stays green forever. This compares instead against
   `test/fixtures/haos-2026.07.5-container-fingerprint.json` — captured from
@@ -171,7 +171,7 @@ defmodule Vagus.Addon.ContainerFingerprintTest do
         tz: @tz
       )
 
-    %{spec: spec, host_config: Container.build_config(spec)["HostConfig"]}
+    %{spec: spec, container_spec: Container.to_container_spec(spec)}
   end
 
   test "the fixture records the Supervisor version its filename claims" do
@@ -368,19 +368,19 @@ defmodule Vagus.Addon.ContainerFingerprintTest do
 
   test "OomScoreAdj, seccomp and pid 1 match what the backend stamps", %{
     spec: spec,
-    host_config: host_config
+    container_spec: container_spec
   } do
-    assert @fingerprint["proc"]["oom_score_adj"] == host_config["OomScoreAdj"]
+    assert @fingerprint["proc"]["oom_score_adj"] == container_spec.oom_score_adj
 
     # /proc/self/status Seccomp: 0 is SECCOMP_MODE_DISABLED — the observable
     # consequence of `seccomp=unconfined`, which is what the backend stamps.
     assert @fingerprint["status"]["Seccomp"] == "0"
-    assert "seccomp=unconfined" in host_config["SecurityOpt"]
+    assert "seccomp=unconfined" in container_spec.security_opt
 
     # `init: false` means no docker-init shim, so the image's own entrypoint is
     # pid 1 — beam.smp here, which is only true if nothing was injected above it.
     assert spec.init == false
-    assert host_config["Init"] == false
+    assert container_spec.init == false
     assert @fingerprint["proc"]["pid1_comm"] == "beam.smp"
   end
 

@@ -2,7 +2,6 @@ defmodule Vagus.NetworkTest do
   use ExUnit.Case, async: false
 
   alias Vagus.Network
-  alias Vagus.Runtime.Docker
 
   describe "source_bind_opts/0 (ingress client-IP parity)" do
     # Regression guard for a device-found gap: Vagus runs on the host, so
@@ -187,32 +186,14 @@ defmodule Vagus.NetworkTest do
   end
 
   describe "IP plan (hermetic)" do
-    test "config/0 pins the hassio subnet, gateway, dynamic range + bridge name" do
-      cfg = Network.config()
-      assert cfg["Name"] == "hassio"
-      assert cfg["Driver"] == "bridge"
-      assert cfg["Options"]["com.docker.network.bridge.name"] == "hassio"
-
-      [ipam] = cfg["IPAM"]["Config"]
-      assert ipam["Subnet"] == "172.30.32.0/23"
-      assert ipam["Gateway"] == "172.30.32.1"
-      assert ipam["IPRange"] == "172.30.33.0/24"
-
-      # The whole create body as the Docker-map builder emitted it.
-      assert cfg == %{
-               "Name" => "hassio",
-               "Driver" => "bridge",
-               "IPAM" => %{
-                 "Driver" => "default",
-                 "Config" => [
-                   %{
-                     "Subnet" => "172.30.32.0/23",
-                     "Gateway" => "172.30.32.1",
-                     "IPRange" => "172.30.33.0/24"
-                   }
-                 ]
-               },
-               "Options" => %{"com.docker.network.bridge.name" => "hassio"}
+    test "spec/0 pins the hassio subnet, gateway, dynamic range + bridge name" do
+      assert Network.spec() == %Vagus.Runtime.Engine.NetworkSpec{
+               name: "hassio",
+               driver: :bridge,
+               subnet: "172.30.32.0/23",
+               gateway: "172.30.32.1",
+               ip_range: "172.30.33.0/24",
+               interface_name: "hassio"
              }
     end
 
@@ -230,13 +211,6 @@ defmodule Vagus.NetworkTest do
       assert Network.supervisor_ip() == "172.30.32.2"
       assert Network.dns_ip() == "172.30.32.3"
       assert Network.name() == "hassio"
-    end
-
-    test "ensure/1 surfaces a connect error on a dead socket, never raises" do
-      assert {:error, :unavailable} =
-               Network.ensure(
-                 socket: "/tmp/vagus-nonet-#{System.unique_integer([:positive])}.sock"
-               )
     end
   end
 
@@ -297,10 +271,15 @@ defmodule Vagus.NetworkTest do
       %{fake: Fake.start()}
     end
 
-    test "is on only for podman" do
-      assert Network.host_bridge?(engine: Vagus.Runtime.Engine.Podman)
-      refute Network.host_bridge?(engine: Vagus.Runtime.Engine.Docker)
-      refute Network.host_bridge?(engine: Fake)
+    test "is on only on a board, whatever the engine" do
+      refute Network.host_bridge?()
+      refute Network.host_bridge?(engine: Vagus.Runtime.Engine.Podman)
+
+      Application.put_env(:vagus, :runtime_host, true)
+      on_exit(fn -> Application.delete_env(:vagus, :runtime_host) end)
+
+      assert Network.host_bridge?(engine: Fake)
+      refute Network.host_bridge?(host_bridge: false)
     end
 
     test "the bridge, its dummy port, the gateway, then both up, in that order" do
@@ -370,51 +349,6 @@ defmodule Vagus.NetworkTest do
       end)
 
       assert length(ip_calls()) == 1
-    end
-  end
-
-  describe "against a live daemon" do
-    @describetag :docker
-
-    test "create_network → inspect (subnet/gateway) → remove" do
-      name = "vagus-net-test-#{System.unique_integer([:positive])}"
-      on_exit(fn -> Docker.remove_network(name) end)
-
-      cfg = %{
-        "Name" => name,
-        "Driver" => "bridge",
-        "IPAM" => %{"Config" => [%{"Subnet" => "172.31.240.0/24", "Gateway" => "172.31.240.1"}]}
-      }
-
-      assert {:ok, id} = Docker.create_network(cfg)
-      assert is_binary(id)
-
-      assert {:ok, %{"IPAM" => %{"Config" => [ipam]}}} = Docker.inspect_network(name)
-      assert ipam["Subnet"] == "172.31.240.0/24"
-      assert ipam["Gateway"] == "172.31.240.1"
-
-      assert :ok = Docker.remove_network(name)
-      assert {:error, {:http, 404, _}} = Docker.inspect_network(name)
-    end
-
-    test "remove of a missing network is idempotent :ok" do
-      assert :ok =
-               Docker.remove_network("vagus-net-missing-#{System.unique_integer([:positive])}")
-    end
-
-    test "Network.ensure/1 creates the hassio bridge and is idempotent" do
-      on_exit(fn -> Docker.remove_network(Network.name()) end)
-
-      assert :ok = Network.ensure()
-      assert {:ok, %{"Id" => id}} = Docker.inspect_network(Network.name())
-      # second call adopts the existing network (same id), does not recreate
-      assert :ok = Network.ensure()
-
-      assert {:ok, %{"Id" => ^id, "IPAM" => %{"Config" => [ipam]}}} =
-               Docker.inspect_network(Network.name())
-
-      assert ipam["Subnet"] == "172.30.32.0/23"
-      assert ipam["Gateway"] == "172.30.32.1"
     end
   end
 end

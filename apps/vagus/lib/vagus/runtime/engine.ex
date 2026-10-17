@@ -21,7 +21,7 @@ defmodule Vagus.Runtime.Engine do
     * `:capture` (`exec`, default true).
     * `:platform` (`pull`).
 
-  Any other key is adapter-specific (e.g. `socket:` for `Engine.Docker`).
+  Any other key is adapter-specific (e.g. `podman_bin:` for `Engine.Podman`).
   """
 
   import Kernel, except: [inspect: 2]
@@ -76,7 +76,7 @@ defmodule Vagus.Runtime.Engine do
   @callback logs(name(), keyword()) :: {:ok, binary()} | {:error, error()}
   @doc """
   Streams to `owner` as `{:log_chunk, binary}` then `:log_eof`, sending the
-  next chunk only after `owner` sends `:log_ack` (`Vagus.Runtime.Logs.Follow.ack/1`).
+  next chunk only after `owner` acks the last one (`ack_logs/1`).
   The streamer is linked to the caller, which stops it by unlinking and
   exiting it with `:shutdown`; a streamer holding an external handle (e.g. a
   Port's OS process) must trap exits and close it in `terminate/2`.
@@ -98,10 +98,9 @@ defmodule Vagus.Runtime.Engine do
   @doc """
   Whether the engine runs each container's healthcheck on its own schedule.
   One that does not (podman without systemd) leaves the app process to call
-  `healthcheck/2`. Absent, it does.
+  `healthcheck/2`.
   """
   @callback schedules_healthchecks?(keyword()) :: boolean()
-  @optional_callbacks schedules_healthchecks?: 1
 
   @doc "Creates the network unless it exists; losing a create race is `:ok`."
   @callback ensure_network(NetworkSpec.t(), keyword()) :: :ok | {:error, error()}
@@ -130,19 +129,16 @@ defmodule Vagus.Runtime.Engine do
   @spec event_source(keyword()) :: module()
   def event_source(opts \\ []), do: impl(opts).event_source()
 
-  @doc "Whether the engine in use (`opts[:engine]`, else the configured one) is podman."
-  @spec podman?(keyword()) :: boolean()
-  def podman?(opts \\ []), do: impl(opts) == Vagus.Runtime.Engine.Podman
-
-  @spec schedules_healthchecks?(keyword()) :: boolean()
-  def schedules_healthchecks?(opts \\ []) do
-    impl = impl(opts)
-
-    if Code.ensure_loaded?(impl) and function_exported?(impl, :schedules_healthchecks?, 1),
-      do: impl.schedules_healthchecks?(opts),
-      else: true
+  @doc "Acks a `follow_logs/3` streamer's last `{:log_chunk, _}`; the owner sends it once flushed."
+  @spec ack_logs(pid()) :: :ok
+  def ack_logs(streamer) do
+    send(streamer, :log_ack)
+    :ok
   end
 
+  @spec schedules_healthchecks?(keyword()) :: boolean()
+  def schedules_healthchecks?(opts \\ []), do: impl(opts).schedules_healthchecks?(opts)
+
   defp impl(opts),
-    do: opts[:engine] || Application.get_env(:vagus, :engine, Vagus.Runtime.Engine.Docker)
+    do: opts[:engine] || Application.get_env(:vagus, :engine, Vagus.Runtime.Engine.Podman)
 end

@@ -224,7 +224,7 @@ defmodule Vagus.Test.EngineContract do
           {:log_chunk, chunk} ->
             @leg.release(opts)
             refute_receive {:log_chunk, _}, 300
-            Vagus.Runtime.Logs.Follow.ack(pid)
+            Vagus.Runtime.Engine.ack_logs(pid)
             chunks_until_eof(pid, opts, [chunk | acc])
 
           :log_eof ->
@@ -247,7 +247,7 @@ defmodule Vagus.Test.EngineContract do
       defp collect(pid, acc) do
         receive do
           {:log_chunk, chunk} ->
-            Vagus.Runtime.Logs.Follow.ack(pid)
+            Vagus.Runtime.Engine.ack_logs(pid)
             collect(pid, [chunk | acc])
 
           :log_eof ->

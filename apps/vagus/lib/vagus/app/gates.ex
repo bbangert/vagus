@@ -33,7 +33,7 @@ defmodule Vagus.App.Gates do
   end
 
   @doc """
-  The engine answers: under podman, `Vagus.Runtime.Host`'s preparation is
+  The engine answers: on a board, `Vagus.Runtime.Host`'s preparation is
   done. No wait for the internet, since only a pull needs the network.
   """
   @spec engine(keyword()) :: :ok | {:error, term()}
@@ -43,7 +43,7 @@ defmodule Vagus.App.Gates do
   Stands up the `hassio` bridge, binds the `.2`/`.3` anchors and loads
   `Vagus.Network.Nat`'s table. All of it is lost on reboot, and only a
   container app's start would redo it otherwise, so a device running only
-  native apps would leave Core unable to reach the Supervisor. Under podman
+  native apps would leave Core unable to reach the Supervisor. On a board
   Vagus makes the bridge interface itself (`Vagus.Network.host_bridge?/1`),
   so the anchors have it whatever podman answered. Each step runs whatever
   the one before returned, and the gate is always `:ok`, so Core and

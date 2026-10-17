@@ -4,9 +4,9 @@ defmodule Vagus.Application do
   @moduledoc """
   Top-level supervisor for the `vagus` app.
 
-  Under podman (the target engine), `Vagus.Runtime.Host` prepares the board
-  for podman and holds the permits every podman call takes; podman runs no
-  daemon of its own.
+  On a board (`config :vagus, :runtime_host`), `Vagus.Runtime.Host` prepares
+  it for podman and holds the permits every podman call takes; podman runs
+  no daemon of its own.
 
   On both `:host` and real targets, `Vagus.API.Supervisor` starts the
   Supervisor-API emulator's HTTP surface (see that module for the isolation
@@ -186,10 +186,11 @@ defmodule Vagus.Application do
     Supervisor.start_link(children, opts)
   end
 
-  # Only under podman: host dev and tests run `Engine.Docker` or a fake.
-  # Before the app processes, whose calls need it, and stopped after them.
+  # Target-only: its preparation mounts, writes sysctls and deletes trees,
+  # none of which host dev or the suite may do. Before the app processes,
+  # whose calls need it, and stopped after them.
   defp runtime_host_children,
-    do: if(Vagus.Runtime.Engine.podman?(), do: [Vagus.Runtime.Host], else: [])
+    do: if(Vagus.Runtime.Host.enabled?(), do: [Vagus.Runtime.Host], else: [])
 
   # The `hassio` DNS server (M4-P1-T2), gated by `:dns_enabled` (false in
   # test.exs so `mix test` never binds :53). On :host dev the .3 anchor / :53

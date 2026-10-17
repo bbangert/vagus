@@ -7,80 +7,76 @@ defmodule Vagus.Core.ContainerTest do
   use ExUnit.Case, async: false
 
   alias Vagus.Core.Container
+  alias Vagus.Runtime.Engine.ContainerSpec
 
   @ip Vagus.Network.supervisor_ip()
 
-  describe "create_config/2" do
-    test "golden map: every parity field pinned" do
-      config = Container.create_config("2026.7.0", token: "test-token")
+  @config "/tmp/core-config"
 
-      assert config == %{
-               "Image" => "ghcr.io/home-assistant/home-assistant:2026.7.0",
-               "Hostname" => "homeassistant",
-               "Labels" => %{
-                 Container.spec_fingerprint_label() => Container.spec_fingerprint(config)
-               },
-               "Env" => [
-                 "SUPERVISOR=#{@ip}",
-                 "HASSIO=#{@ip}",
-                 "SUPERVISOR_TOKEN=test-token",
-                 "HASSIO_TOKEN=test-token",
-                 "SUPERVISOR_CORE_API_SOCKET=/run/supervisor/core.sock",
-                 "TZ=UTC"
+  defp spec(version \\ "2026.7.0", opts \\ []),
+    do:
+      Container.to_container_spec(
+        version,
+        Keyword.merge([token: "test-token", homeassistant_path: @config], opts)
+      )
+
+  describe "to_container_spec/2" do
+    test "golden spec: every parity field pinned" do
+      spec = spec()
+
+      assert spec == %ContainerSpec{
+               name: "homeassistant",
+               image: "ghcr.io/home-assistant/home-assistant:2026.7.0",
+               hostname: "homeassistant",
+               labels: %{Container.spec_fingerprint_label() => Container.spec_fingerprint(spec)},
+               env: [
+                 {"SUPERVISOR", @ip},
+                 {"HASSIO", @ip},
+                 {"SUPERVISOR_TOKEN", "test-token"},
+                 {"HASSIO_TOKEN", "test-token"},
+                 {"SUPERVISOR_CORE_API_SOCKET", "/run/supervisor/core.sock"},
+                 {"TZ", "UTC"}
                ],
-               "HostConfig" => %{
-                 "NetworkMode" => "host",
-                 "Privileged" => true,
-                 "OomScoreAdj" => -300,
-                 "RestartPolicy" => %{"Name" => "unless-stopped"},
-                 "ExtraHosts" => ["supervisor:#{@ip}"],
-                 "Tmpfs" => %{"/tmp" => ""},
-                 "Mounts" => [
-                   %{
-                     "Type" => "bind",
-                     "Source" => "/dev",
-                     "Target" => "/dev",
-                     "ReadOnly" => true,
-                     "BindOptions" => %{"ReadOnlyNonRecursive" => true}
-                   },
-                   %{
-                     "Type" => "bind",
-                     "Source" => "/run/dbus",
-                     "Target" => "/run/dbus",
-                     "ReadOnly" => true
-                   },
-                   %{
-                     "Type" => "bind",
-                     "Source" => "/run/udev",
-                     "Target" => "/run/udev",
-                     "ReadOnly" => true
-                   },
-                   %{
-                     "Type" => "bind",
-                     "Source" => "/run/supervisor",
-                     "Target" => "/run/supervisor",
-                     "ReadOnly" => false
-                   },
-                   %{
-                     "Type" => "volume",
-                     "Source" => "vagus-core-config",
-                     "Target" => "/config"
-                   }
-                 ]
-               }
+               secret_env: ["SUPERVISOR_TOKEN", "HASSIO_TOKEN"],
+               network: :host,
+               privileged: true,
+               oom_score_adj: -300,
+               restart: :unless_stopped,
+               extra_hosts: [{"supervisor", @ip}],
+               tmpfs: %{"/tmp" => ""},
+               mounts: [
+                 %{
+                   type: :bind,
+                   source: "/dev",
+                   target: "/dev",
+                   read_only: true,
+                   read_only_non_recursive: true
+                 },
+                 %{type: :bind, source: "/run/dbus", target: "/run/dbus", read_only: true},
+                 %{type: :bind, source: "/run/udev", target: "/run/udev", read_only: true},
+                 %{
+                   type: :bind,
+                   source: "/run/supervisor",
+                   target: "/run/supervisor",
+                   read_only: false
+                 },
+                 %{type: :bind, source: @config, target: "/config", read_only: false}
+               ]
              }
     end
 
     test "custom tz overrides the UTC default" do
-      config = Container.create_config("2026.7.0", token: "test-token", tz: "America/New_York")
-
-      assert "TZ=America/New_York" in config["Env"]
+      assert {"TZ", "America/New_York"} in spec("2026.7.0", tz: "America/New_York").env
     end
 
     test "omitting :token falls back to Vagus.API.Token.get/0" do
-      config = Container.create_config("2026.7.0")
+      spec = Container.to_container_spec("2026.7.0", homeassistant_path: @config)
 
-      assert "SUPERVISOR_TOKEN=#{Vagus.API.Token.get()}" in config["Env"]
+      assert {"SUPERVISOR_TOKEN", Vagus.API.Token.get()} in spec.env
+    end
+
+    test "passes the podman adapter's validation" do
+      assert Vagus.Runtime.Engine.Podman.validate(spec()) == :ok
     end
   end
 
@@ -94,23 +90,23 @@ defmodule Vagus.Core.ContainerTest do
     # bypasses the contract, and an explicit suffix was device-proven to break
     # Core outright during the bluetooth work.
     test "SUPERVISOR/HASSIO carry the bare anchor — never a port suffix" do
-      config = Container.create_config("2026.7.0", token: "test-token")
+      env = spec().env
 
-      assert "SUPERVISOR=172.30.32.2" in config["Env"]
-      assert "HASSIO=172.30.32.2" in config["Env"]
+      assert {"SUPERVISOR", "172.30.32.2"} in env
+      assert {"HASSIO", "172.30.32.2"} in env
 
-      refute Enum.any?(config["Env"], &(&1 =~ ~r/\A(SUPERVISOR|HASSIO)=[^=]*:\d+\z/))
+      refute Enum.any?(env, fn {key, value} ->
+               key in ["SUPERVISOR", "HASSIO"] and value =~ ~r/:\d+\z/
+             end)
     end
 
-    test "ExtraHosts maps `supervisor` to the anchor, portless by construction" do
-      config = Container.create_config("2026.7.0", token: "test-token")
-
-      assert config["HostConfig"]["ExtraHosts"] == ["supervisor:172.30.32.2"]
+    test "extra_hosts maps `supervisor` to the anchor, portless by construction" do
+      assert spec().extra_hosts == [{"supervisor", "172.30.32.2"}]
     end
 
     test "the anchor the env carries is Vagus.Network's, not a second copy" do
       assert Vagus.Network.supervisor_ip() == "172.30.32.2"
-      assert "SUPERVISOR=#{Vagus.Network.supervisor_ip()}" in Container.create_config("x")["Env"]
+      assert {"SUPERVISOR", Vagus.Network.supervisor_ip()} in spec("x").env
     end
   end
 
@@ -121,97 +117,62 @@ defmodule Vagus.Core.ContainerTest do
     end
 
     test "the socket dir is bind-mounted writable, same path on both sides" do
-      config = Container.create_config("2026.7.0", token: "test-token")
-
       assert %{
-               "Type" => "bind",
-               "Source" => "/run/supervisor",
-               "Target" => "/run/supervisor",
-               "ReadOnly" => false
-             } in config["HostConfig"]["Mounts"]
+               type: :bind,
+               source: "/run/supervisor",
+               target: "/run/supervisor",
+               read_only: false
+             } in spec().mounts
     end
 
     test "SUPERVISOR_CORE_API_SOCKET points at socket_path/0" do
-      config = Container.create_config("2026.7.0", token: "test-token")
-
-      assert "SUPERVISOR_CORE_API_SOCKET=#{Container.socket_path()}" in config["Env"]
+      assert {"SUPERVISOR_CORE_API_SOCKET", Container.socket_path()} in spec().env
     end
   end
 
   describe "spec_fingerprint/1" do
-    test "is pure: the same spec always hashes to the same value" do
-      config = Container.create_config("2026.7.0", token: "test-token")
-
-      assert Container.spec_fingerprint(config) == Container.spec_fingerprint(config)
-
-      assert Container.spec_fingerprint(config) ==
-               Container.spec_fingerprint(
-                 Container.create_config("2026.7.0", token: "test-token")
-               )
+    test "is a pure lowercase hex digest" do
+      assert Container.spec_fingerprint(spec()) == Container.spec_fingerprint(spec())
+      assert Container.spec_fingerprint(spec()) =~ ~r/\A[0-9a-f]{32}\z/
     end
 
-    test "is a lowercase hex digest" do
-      config = Container.create_config("2026.7.0", token: "test-token")
+    test "ignores the labels it is itself stamped into, the name and secret_env" do
+      fingerprint = Container.spec_fingerprint(spec())
 
-      assert Container.spec_fingerprint(config) =~ ~r/\A[0-9a-f]{32}\z/
+      for changed <- [
+            %{spec() | labels: nil},
+            %{spec() | labels: %{"other" => "value"}},
+            %{spec() | name: "homeassistant-dev"},
+            %{spec() | secret_env: []}
+          ] do
+        assert Container.spec_fingerprint(changed) == fingerprint
+      end
     end
 
-    test "ignores the Labels key it is itself stamped into" do
-      config = Container.create_config("2026.7.0", token: "test-token")
-
-      assert Container.spec_fingerprint(Map.delete(config, "Labels")) ==
-               Container.spec_fingerprint(config)
-
-      assert Container.spec_fingerprint(Map.put(config, "Labels", %{"other" => "value"})) ==
-               Container.spec_fingerprint(config)
-    end
-
-    test "ignores map key ordering (canonicalized before hashing)" do
-      config = Container.create_config("2026.7.0", token: "test-token")
-
-      reordered =
-        config
-        |> Map.delete("HostConfig")
-        |> Map.put("HostConfig", config["HostConfig"])
-
-      assert Container.spec_fingerprint(reordered) == Container.spec_fingerprint(config)
-    end
-
-    test "changes with the image, env, and mounts" do
-      base = Container.create_config("2026.7.0", token: "test-token")
+    test "changes with the image, env, mounts and any field the spec gains" do
+      base = spec()
       fingerprint = Container.spec_fingerprint(base)
 
-      refute Container.spec_fingerprint(Container.create_config("2026.8.0", token: "test-token")) ==
-               fingerprint
-
-      refute Container.spec_fingerprint(Container.create_config("2026.7.0", token: "other-token")) ==
-               fingerprint
-
-      refute Container.spec_fingerprint(
-               Container.create_config("2026.7.0", token: "test-token", tz: "Europe/Berlin")
-             ) == fingerprint
-
-      dropped_mount =
-        update_in(base, ["HostConfig", "Mounts"], fn [_socket | rest] -> rest end)
-
-      refute Container.spec_fingerprint(dropped_mount) == fingerprint
+      for changed <- [
+            spec("2026.8.0"),
+            spec("2026.7.0", token: "other-token"),
+            spec("2026.7.0", tz: "Europe/Berlin"),
+            spec("2026.7.0", homeassistant_path: "/tmp/elsewhere"),
+            %{base | mounts: tl(base.mounts)},
+            %{base | privileged: false},
+            %{base | cap_add: ["NET_ADMIN"]},
+            %{base | init: false},
+            %{base | security_opt: ["seccomp=unconfined"]}
+          ] do
+        refute Container.spec_fingerprint(changed) == fingerprint, inspect(changed)
+      end
     end
 
-    test "list order is significant (a reordered Env is a different spec)" do
-      config = Container.create_config("2026.7.0", token: "test-token")
-      reversed = Map.put(config, "Env", Enum.reverse(config["Env"]))
+    test "list order is significant (a reordered env is a different spec)" do
+      base = spec()
 
-      refute Container.spec_fingerprint(reversed) == Container.spec_fingerprint(config)
-    end
-  end
-
-  describe "create_config/2 fingerprint label" do
-    test "stamps the fingerprint of the spec it just built" do
-      config = Container.create_config("2026.7.0", token: "test-token")
-
-      assert config["Labels"] == %{
-               Container.spec_fingerprint_label() => Container.spec_fingerprint(config)
-             }
+      refute Container.spec_fingerprint(%{base | env: Enum.reverse(base.env)}) ==
+               Container.spec_fingerprint(base)
     end
 
     test "the label key is namespaced" do
@@ -219,77 +180,41 @@ defmodule Vagus.Core.ContainerTest do
     end
   end
 
-  # Literals produced by the pre-ContainerSpec `create_config/2` (the
-  # Docker-map builder), so a render that drifts from it — and would recreate
-  # Core on every board — fails here rather than echoing itself.
-  describe "create_config/2 parity with the Docker-map builder" do
-    @golden_body ~s({"Env":["SUPERVISOR=172.30.32.2","HASSIO=172.30.32.2","SUPERVISOR_TOKEN=t","HASSIO_TOKEN=t","SUPERVISOR_CORE_API_SOCKET=/run/supervisor/core.sock","TZ=UTC"],"HostConfig":{"ExtraHosts":["supervisor:172.30.32.2"],"Mounts":[{"BindOptions":{"ReadOnlyNonRecursive":true},"ReadOnly":true,"Source":"/dev","Target":"/dev","Type":"bind"},{"ReadOnly":true,"Source":"/run/dbus","Target":"/run/dbus","Type":"bind"},{"ReadOnly":true,"Source":"/run/udev","Target":"/run/udev","Type":"bind"},{"ReadOnly":false,"Source":"/run/supervisor","Target":"/run/supervisor","Type":"bind"},{"Source":"vagus-core-config","Target":"/config","Type":"volume"}],"NetworkMode":"host","OomScoreAdj":-300,"Privileged":true,"RestartPolicy":{"Name":"unless-stopped"},"Tmpfs":{"/tmp":""}},"Hostname":"homeassistant","Image":"ghcr.io/home-assistant/home-assistant:2026.7.0"})
+  # Literals 0.10.0 stamped on podman boards (computed over the Docker
+  # Engine-API create body it rendered), so a fingerprint that drifts from
+  # them — and would recreate Core on every board — fails here rather than
+  # echoing itself.
+  describe "fingerprint parity with 0.10.0" do
+    test "the boards' config path, a token and the default tz" do
+      assert fingerprint("2026.7.0", "t", "UTC", "/root/vagus/core/config") ==
+               "1548a524eb16e2cecf3ec8cb9dab5fb3"
 
-    test "the label-less body and its fingerprint are byte-identical" do
-      config = Container.create_config("2026.7.0", token: "t", tz: "UTC")
+      assert fingerprint("2026.10.1", "abc", "UTC", "/root/vagus/core/config") ==
+               "f4ab354997ccffb1adfa6a74487cc8fe"
+    end
 
-      assert Jason.encode!(Map.delete(config, "Labels")) == @golden_body
+    test "a board still on the legacy config path, with another tz" do
+      legacy = "/root/balena-engine/volumes/vagus-core-config/_data"
 
-      assert config["Labels"] == %{
-               Container.spec_fingerprint_label() => "0f8bbae5ee839e67083a2877393670f7"
-             }
+      assert fingerprint("2026.10.1", "tok123", "Europe/Berlin", legacy) ==
+               "d450c49453f44732f995f3d945c65b93"
+    end
+
+    defp fingerprint(version, token, tz, path) do
+      Container.to_container_spec(version, token: token, tz: tz, homeassistant_path: path).labels[
+        Container.spec_fingerprint_label()
+      ]
     end
   end
 
   describe "config_path/1" do
-    test "under Docker, the named volume inside balena's old data root" do
-      assert Container.config_path() ==
-               "/root/balena-engine/volumes/#{Container.config_volume()}/_data"
+    test "the migration's resolver decides" do
+      assert Container.config_path() == Vagus.Runtime.Migration.core_config_path()
     end
 
     test "opts[:homeassistant_path] overrides the whole path" do
       assert Container.config_path(homeassistant_path: "/tmp/fake-core-config") ==
                "/tmp/fake-core-config"
-    end
-
-    test "under podman, the migration's resolver decides" do
-      assert Container.config_path(engine: Vagus.Runtime.Engine.Podman) ==
-               Vagus.Runtime.Migration.core_config_path()
-    end
-  end
-
-  describe "the /config mount per engine" do
-    defp config_mounts(opts) do
-      "2026.7.0"
-      |> Container.to_container_spec([token: "t"] ++ opts)
-      |> Map.fetch!(:mounts)
-      |> Enum.filter(&(&1.target == "/config"))
-    end
-
-    test "podman binds the resolved host directory: a named volume would start empty" do
-      opts = [engine: Vagus.Runtime.Engine.Podman, homeassistant_path: "/tmp/core-config"]
-
-      assert config_mounts(opts) == [
-               %{type: :bind, source: "/tmp/core-config", target: "/config", read_only: false}
-             ]
-    end
-
-    test "Docker keeps the named volume, so its containers keep their fingerprint" do
-      assert config_mounts(engine: Vagus.Runtime.Engine.Docker) == [
-               %{type: :volume, source: "vagus-core-config", target: "/config"}
-             ]
-
-      assert Container.to_container_spec("2026.7.0",
-               token: "t",
-               engine: Vagus.Runtime.Engine.Docker
-             ) ==
-               Container.to_container_spec("2026.7.0", token: "t")
-    end
-
-    test "the podman spec passes the adapter's validation" do
-      spec =
-        Container.to_container_spec("2026.7.0",
-          token: "t",
-          engine: Vagus.Runtime.Engine.Podman,
-          homeassistant_path: "/root/vagus/core/config"
-        )
-
-      assert Vagus.Runtime.Engine.Podman.validate(spec) == :ok
     end
   end
 

@@ -46,7 +46,7 @@ defmodule Vagus.Core.ConfigCheck do
 
     * `:valid` — exit code 0, no yaml-error marker in the log.
     * `{:invalid, log}` — nonzero exit code or the marker matched; `log`
-      is the ANSI-stripped, demuxed combined stdout/stderr, meant to be
+      is the ANSI-stripped combined stdout/stderr, meant to be
       surfaced verbatim as the error response's message (upstream does
       the same — the log IS the error detail).
     * `{:not_running, message}` — Core's container is absent or stopped
@@ -81,8 +81,8 @@ defmodule Vagus.Core.ConfigCheck do
 
   defp run_check(_engine_opts, 0), do: {:error, :timeout}
 
-  # Only the deadline bounds the whole stream (the Docker client's 60 s cap
-  # is per receive); past it the command is left to exit in the container.
+  # Only the deadline bounds the whole run; past it the command is left to
+  # exit in the container.
   defp run_check(engine_opts, left_ms) do
     case Engine.exec(
            Container.name(),

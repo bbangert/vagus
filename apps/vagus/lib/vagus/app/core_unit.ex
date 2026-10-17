@@ -2,10 +2,8 @@ defmodule Vagus.App.CoreUnit do
   @moduledoc """
   Home Assistant Core as one step of the boot and shutdown sequence.
 
-  An absent container is created when a version is installed: under an
-  engine with a transient store (podman) nothing survives a reboot, so this
-  is every boot, and under Docker it repairs a recreate a shutdown cut
-  short. With no version installed it is left to an explicit
+  An absent container is created when a version is installed: podman's
+  store is transient, so nothing survives a reboot and this is every boot. With no version installed it is left to an explicit
   `POST /core/start` or `/core/update`, or to `Vagus.Provisioner` on a first
   boot. A create that fails is handed to the Provisioner's start retries,
   and an installed version whose image the engine lacks is the

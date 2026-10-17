@@ -874,15 +874,8 @@ defmodule Vagus.Runtime.Engine.PodmanContractTest do
       assert Engine.healthcheck("addon_local_x", [timeout_ms: 10_000] ++ opts) == {:ok, :healthy}
     end
 
-    test "podman? names the engine a call would use" do
-      assert Engine.podman?(engine: Engine.Podman)
-      refute Engine.podman?(engine: Vagus.Runtime.Engine.Docker)
-      refute Engine.podman?()
-    end
-
-    test "podman schedules no healthchecks; Docker does" do
+    test "podman schedules no healthchecks" do
       refute Engine.schedules_healthchecks?(engine: Engine.Podman)
-      assert Engine.schedules_healthchecks?(engine: Vagus.Runtime.Engine.Docker)
     end
 
     test "Core's pull waits for the pull permit ahead of an app's" do

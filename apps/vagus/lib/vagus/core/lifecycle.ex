@@ -21,7 +21,7 @@ defmodule Vagus.Core.Lifecycle do
       that Core is up, to re-pull Core's own HTTP parameters. Defaults to
       `fn -> Vagus.Core.HttpConfig.refresh() end`; its return value is
       ignored (see "HTTP-config refresh" below).
-    * `:token` - threaded into `Vagus.Core.Container.create_config/2` when
+    * `:token` - threaded into `Vagus.Core.Container.to_container_spec/2` when
       present (tests inject; production omits it, so `Container` falls back
       to its own real `Vagus.API.Token.get/0` default).
     * `:version` - (`start/1` only) the desired version; defaults to
@@ -88,10 +88,10 @@ defmodule Vagus.Core.Lifecycle do
   create) when it already exists under the fixed name AND its
   image equals `Vagus.Core.Container.image(desired_version)` AND
   its `Vagus.Core.Container.spec_fingerprint_label/0` label equals the
-  fingerprint of the spec `create_config/2` would build right now —
+  fingerprint of the spec `to_container_spec/2` would build right now —
   otherwise every op that needs the container running recreates it: stop
   the old one (S6-derived timeout, keeping upstream's grace period),
-  remove it, `create_config/2` a fresh one from the current spec, start it.
+  remove it, create a fresh one from the current spec, start it.
   This is exactly how drift gets healed: `adopt/1` never reconciles a
   running container's spec, so a hand-edited or stale-image container is
   left alone until the next `rebuild/1` (explicit) or a mismatched
@@ -805,7 +805,7 @@ defmodule Vagus.Core.Lifecycle do
   # The spec a create would build right now — the fingerprint comparison in
   # `start_existing/3` and the create itself must read the exact same one.
   defp desired_spec(version, opts) do
-    Container.to_container_spec(version, create_config_opts(opts))
+    Container.to_container_spec(version, spec_opts(opts))
   end
 
   defp create_and_start(version, opts) do
@@ -864,7 +864,7 @@ defmodule Vagus.Core.Lifecycle do
 
   defp running?(container), do: Engine.Container.alive?(container)
 
-  defp create_config_opts(opts) do
+  defp spec_opts(opts) do
     case Keyword.get(opts, :token) do
       nil -> []
       token -> [token: token]

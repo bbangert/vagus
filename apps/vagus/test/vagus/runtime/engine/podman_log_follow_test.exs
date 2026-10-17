@@ -2,7 +2,6 @@ defmodule Vagus.Runtime.Engine.Podman.LogFollowTest do
   use ExUnit.Case, async: true
 
   alias Vagus.Runtime.Engine
-  alias Vagus.Runtime.Logs.Follow
   alias Vagus.Test.FakePodman
 
   @fixtures Path.expand("../../../fixtures/podman", __DIR__)
@@ -45,7 +44,7 @@ defmodule Vagus.Runtime.Engine.Podman.LogFollowTest do
 
   defp next_chunk(pid) do
     assert_receive {:log_chunk, chunk}, @wait_ms
-    Follow.ack(pid)
+    Engine.ack_logs(pid)
     chunk
   end
 
@@ -90,7 +89,7 @@ defmodule Vagus.Runtime.Engine.Podman.LogFollowTest do
     send(pid, {:tick, :sys.get_state(pid).tick})
     _ = :sys.get_state(pid)
     refute_received {:log_chunk, _}
-    Follow.ack(pid)
+    Engine.ack_logs(pid)
     assert next_chunk(pid) == "tw"
 
     File.write!(log, records(["2026-10-15T18:14:22.0+00:00 stdout F o"]), [:append])
@@ -197,7 +196,7 @@ defmodule Vagus.Runtime.Engine.Podman.LogFollowTest do
         send(pid, {:tick, :sys.get_state(pid).tick})
         _ = :sys.get_state(pid)
         refute_received {:log_chunk, _}
-        Follow.ack(pid)
+        Engine.ack_logs(pid)
         gated_chunks(pid, [chunk | acc])
 
       :log_eof ->
@@ -212,14 +211,14 @@ defmodule Vagus.Runtime.Engine.Podman.LogFollowTest do
   defp receive_bytes(pid, left, acc) do
     assert_receive {:log_chunk, chunk}, @wait_ms
     assert byte_size(chunk) <= 65_536
-    Follow.ack(pid)
+    Engine.ack_logs(pid)
     receive_bytes(pid, left - byte_size(chunk), [chunk | acc])
   end
 
   defp collect(pid, acc) do
     receive do
       {:log_chunk, chunk} ->
-        Follow.ack(pid)
+        Engine.ack_logs(pid)
         collect(pid, [chunk | acc])
 
       :log_eof ->
@@ -259,7 +258,7 @@ defmodule Vagus.Runtime.Engine.Podman.LogFollowTest do
       rotate(log, [stamp("four")])
       await_queued(pid, 2)
 
-      Follow.ack(pid)
+      Engine.ack_logs(pid)
       assert next_chunk(pid) == "two\n"
       assert next_chunk(pid) == "three\n"
       assert next_chunk(pid) == "four\n"
