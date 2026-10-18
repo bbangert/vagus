@@ -749,6 +749,7 @@ defmodule Vagus.App.ServerTest do
       refute File.exists?(path)
       # The stub keeps what the image removal needs, and nothing it must not.
       assert {removal.config.image, removal.config.privileged} == {"x/y", []}
+      assert removal.refused
       assert :ok = Task.await(t)
       refute Enum.any?(App.list(), &(&1.config.slug == slug))
     end

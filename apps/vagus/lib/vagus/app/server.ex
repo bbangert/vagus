@@ -66,7 +66,16 @@ defmodule Vagus.App.Server do
     :resume,
     :boot_start
   ]
-  @questions [:info, :snapshot, :installed?, :identity, :token, :ingress_target, :discovery_list]
+  @questions [
+    :info,
+    :snapshot,
+    :installed?,
+    :refused?,
+    :identity,
+    :token,
+    :ingress_target,
+    :discovery_list
+  ]
   @settings [:ingress_panel, :watchdog, :ports, :boot, :auto_update, :protected]
   @redacted [:token, :token_hash, :ingress_token, :user_options, :services, :discovery]
 

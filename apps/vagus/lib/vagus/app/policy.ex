@@ -572,6 +572,7 @@ defmodule Vagus.App.Policy do
   def answer(:info, data), do: {:ok, snapshot(data)}
   def answer(:snapshot, data), do: snapshot(data)
   def answer(:installed?, _data), do: true
+  def answer(:refused?, data), do: data.refused
   def answer(:identity, data), do: {:ok, identity(data.config)}
   def answer(:token, %{token: token}) when is_binary(token), do: {:ok, token}
   def answer(:token, _data), do: :error
@@ -581,7 +582,7 @@ defmodule Vagus.App.Policy do
   def answer(:discovery_list, data), do: Map.values(data.discovery)
   def answer(_question, _data), do: {:error, :unknown_question}
 
-  defp uninstalled(:installed?), do: false
+  defp uninstalled(question) when question in [:installed?, :refused?], do: false
   defp uninstalled(:discovery_list), do: []
   defp uninstalled(:ingress_target), do: {:error, :not_found}
   defp uninstalled(_question), do: :error
@@ -1169,6 +1170,7 @@ defmodule Vagus.App.Policy do
 
   defp input(:set_options, _arg, data), do: %{options: data.run.args.options}
   defp input(:stop, :strict, _data), do: %{strict: true}
+  defp input(:remove_app, _arg, data), do: %{refused: data.refused}
   defp input(_name, _arg, _data), do: %{}
 
   # Coarse waypoints for the update job's progress bar.

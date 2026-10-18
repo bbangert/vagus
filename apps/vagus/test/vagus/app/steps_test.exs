@@ -1400,6 +1400,23 @@ defmodule Vagus.App.StepsTest do
       refute_received {:panel_push, _, _}
     end
 
+    # Its stub may have lost the ingress flag with the rest of the file.
+    test "a refused app pushes the panel DELETE whatever its stub says, except Vagus's own",
+         ctx do
+      :persistent_term.put({PanelSpy, :pid}, self())
+      refused = %{panels: PanelSpy, refused: true}
+
+      assert {:ok, :ok} = Steps.run(:remove_app, input(ctx, refused))
+      assert_received {:panel_push, "test_app", [method: :delete]}
+
+      reserved = %{test_config() | slug: "vagus"}
+
+      assert {:ok, :ok} =
+               Steps.run(:remove_app, input(ctx, Map.put(refused, :config, reserved)))
+
+      refute_received {:panel_push, _, _}
+    end
+
     # A name too long for the filesystem fails for root too, unlike a mode.
     # Its parent must exist: lookup stops at a missing one with `:enoent`,
     # which `rm_rf` takes as already removed.

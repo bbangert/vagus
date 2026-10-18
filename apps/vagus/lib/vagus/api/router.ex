@@ -2950,7 +2950,9 @@ defmodule Vagus.API.Router do
             Envelope.send_error(conn, "Addon #{resolved} does not exist", 404)
 
           {:ok, %{config: config}} ->
-            apply_addon_options(conn, resolved, config, conn.body_params)
+            if App.refused?(resolved),
+              do: send_refused(conn, resolved),
+              else: apply_addon_options(conn, resolved, config, conn.body_params)
         end
 
       {:error, :forbidden} ->
@@ -2995,20 +2997,30 @@ defmodule Vagus.API.Router do
   # until the caller restarts it.
   defp handle_addon_security(conn, slug) do
     supervisor_only(conn, fn ->
-      if App.installed?(slug) do
-        case validate_protected_key(conn.body_params) do
-          {:ok, action} ->
-            apply_protected_action(slug, action)
-            Envelope.send_ok(conn, %{})
+      cond do
+        not App.installed?(slug) ->
+          Envelope.send_error(conn, "Addon #{slug} does not exist", 404)
 
-          {:error, message} ->
-            Envelope.send_error(conn, message, 400)
-        end
-      else
-        Envelope.send_error(conn, "Addon #{slug} does not exist", 404)
+        App.refused?(slug) ->
+          send_refused(conn, slug)
+
+        true ->
+          case validate_protected_key(conn.body_params) do
+            {:ok, action} ->
+              apply_protected_action(slug, action)
+              Envelope.send_ok(conn, %{})
+
+            {:error, message} ->
+              Envelope.send_error(conn, message, 400)
+          end
       end
     end)
   end
+
+  # Its process refuses every write, so the setters below would report a
+  # save that never happened.
+  defp send_refused(conn, slug),
+    do: Envelope.send_error(conn, "App #{slug} cannot be loaded; uninstall it", 400)
 
   # `protected` must be a boolean when present; no key at all is a no-op —
   # upstream's `SCHEMA_SECURITY` marks it optional, so a body carrying only

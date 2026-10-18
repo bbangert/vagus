@@ -263,6 +263,38 @@ defmodule Vagus.AppTest do
       assert {:ok, %{state: :stopped, config: %{privileged: []}}} = app_info(slug)
     end
 
+    @tag :tmp_dir
+    test "an app the legacy import kept as it was is listed, never started, and uninstalls",
+         %{tmp_dir: tmp} do
+      valid = config()
+      slug = valid.slug
+      on_exit(fn -> forget_app(slug) end)
+      raw = valid |> Config.to_persistable() |> Map.put("privileged", ["ALL"])
+      legacy = Path.join(tmp, "addons.json")
+      entry = %{"config" => raw, "state" => "started"}
+      File.write!(legacy, Jason.encode!(%{"version" => 1, "addons" => %{slug => entry}}))
+
+      capture_log(fn -> assert {:ok, 1} = AppFile.import_once(Path.join(tmp, "apps"), legacy) end)
+      File.mkdir_p!(AppFile.dir())
+
+      File.cp!(
+        Path.join([tmp, "apps", slug <> ".json"]),
+        Path.join(AppFile.dir(), slug <> ".json")
+      )
+
+      Backend.Fake.reset_calls()
+
+      capture_log(fn -> assert {:ok, _pid} = Vagus.App.Instances.ensure(slug) end)
+      assert [%{state: :unknown}] = Enum.filter(App.list(), &(&1.config.slug == slug))
+      assert {:error, :refused} = App.start(slug)
+      assert :ok = App.boot_start(slug, false)
+      refute Enum.any?(Backend.Fake.calls_for("addon_#{slug}"), &match?({:create, _}, &1))
+
+      assert :ok = App.uninstall(slug)
+      assert {:remove, "addon_#{slug}"} in Backend.Fake.calls()
+      refute slug in App.slugs()
+    end
+
     test "an app whose file is corrupt uninstalls too" do
       slug = corrupt_file()
       on_exit(fn -> forget_app(slug) end)

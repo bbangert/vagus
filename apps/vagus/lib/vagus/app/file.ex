@@ -210,16 +210,36 @@ defmodule Vagus.App.File do
     staging = dir <> ".import"
     File.rm_rf!(staging)
 
-    for {slug, raw} <- entries,
-        {:ok, data} <- [decode(slug, Map.put(raw, "wanted", raw["state"]))],
-        do: :ok = write(data, staging)
-
     File.mkdir_p!(staging)
+    Enum.each(entries, fn {slug, raw} -> import_entry(staging, slug, raw) end)
     File.mkdir_p!(Path.dirname(dir))
     :ok = File.rename(staging, dir)
     count = length(saved(dir))
     Logger.info("Vagus.App.File: imported #{count} of #{map_size(entries)} apps from #{legacy}")
     {:ok, count}
+  end
+
+  # A record this release rejects is still an installed app, with a
+  # container and data behind it. Kept as it was, it loads refused: listed,
+  # never started, uninstallable. Dropped, nothing could remove it, since the
+  # import never runs again. Only a slug unsafe as a file name, or Vagus's
+  # own, has nowhere to go.
+  defp import_entry(staging, slug, raw) do
+    raw = Map.put(raw, "wanted", raw["state"])
+
+    case decode(slug, raw) do
+      {:ok, data} ->
+        :ok = write(data, staging)
+
+      {:error, _invalid} ->
+        if Config.valid_slug?(slug) and not Config.reserved_slug?(slug) do
+          {:ok, json} = Jason.encode(raw)
+          :ok = replace(path(staging, slug), json)
+          Logger.warning("Vagus.App.File: imported #{inspect(slug)} as it was; it will not start")
+        else
+          Logger.warning("Vagus.App.File: #{inspect(slug)} not imported: not a usable slug")
+        end
+    end
   end
 
   defp legacy_entries(nil), do: {:ok, %{}}

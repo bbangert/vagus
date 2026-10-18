@@ -293,7 +293,7 @@ defmodule Vagus.App.Steps do
   defp step(:remove_app, %{config: config} = input) do
     opts = opts(input)
     remove_image_best_effort(config, opts)
-    maybe_push_panel(config, opts)
+    maybe_push_panel(config, input[:refused] == true, opts)
 
     case remove_data_dir(config.slug, opts) do
       :ok -> {:ok, :ok}
@@ -1079,12 +1079,15 @@ defmodule Vagus.App.Steps do
   # panel itself at startup. Always a DELETE: the app's own process still
   # answers `info` while this runs, so letting `Panels` choose would read the
   # panel as still enabled.
-  defp maybe_push_panel(%Config{ingress: true, slug: slug}, opts) do
-    panels(opts).update_hass_panel(slug, method: :delete)
+  # A refused app's stub may not know it had ingress, so its panel goes by
+  # slug, a no-op on Core for one it never had. The reserved slug's panel
+  # is Vagus's own, never an app's.
+  defp maybe_push_panel(%Config{slug: slug} = config, refused?, opts) do
+    if (config.ingress or refused?) and not Config.reserved_slug?(slug),
+      do: panels(opts).update_hass_panel(slug, method: :delete)
+
     :ok
   end
-
-  defp maybe_push_panel(_config, _opts), do: :ok
 
   defp panels(opts), do: Keyword.get(opts, :panels, Panels)
 

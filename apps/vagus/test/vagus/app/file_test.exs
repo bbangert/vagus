@@ -348,16 +348,26 @@ defmodule Vagus.App.FileTest do
       refute "stray" in AppFile.saved(dir)
     end
 
-    test "a corrupt entry is skipped and the rest imported", %{dir: dir, legacy: legacy} do
+    test "a corrupt entry is kept as it was; one with no usable slug is skipped",
+         %{dir: dir, legacy: legacy} do
       addons = Jason.decode!(File.read!(legacy))["addons"]
-      addons = Map.put(addons, "broken", %{"config" => %{}, "state" => "started"})
+      broken = %{"config" => %{}, "state" => "started"}
+
+      addons =
+        Map.merge(addons, %{"broken" => broken, "vagus" => broken, "bad slug!" => broken})
+
       File.write!(legacy, Jason.encode!(%{"version" => 1, "addons" => addons}))
 
-      log = capture_log(fn -> assert {:ok, 3} = AppFile.import_once(dir, legacy) end)
-      assert log =~ "broken"
+      log = capture_log(fn -> assert {:ok, 4} = AppFile.import_once(dir, legacy) end)
+      assert log =~ ~s("vagus" not imported)
+      assert log =~ ~s("bad slug!" not imported)
+      assert "broken" in AppFile.saved(dir)
+      capture_log(fn -> assert {:error, :invalid} = AppFile.read("broken", dir) end)
     end
 
-    test "an entry asking for a capability outside the allowlist is not imported, with its reason",
+    # The import runs once: an app it left out could never be listed, so
+    # never uninstalled, while its container and data stay behind.
+    test "an entry asking for a capability outside the allowlist is kept as it was, owner-only",
          %{dir: dir, legacy: legacy} do
       %{"addons" => addons} = Jason.decode!(File.read!(legacy))
 
@@ -366,10 +376,15 @@ defmodule Vagus.App.FileTest do
 
       File.write!(legacy, Jason.encode!(%{"version" => 1, "addons" => addons}))
 
-      log = capture_log(fn -> assert {:ok, 2} = AppFile.import_once(dir, legacy) end)
-      assert log =~ ~s(skipping app "core_ssh")
+      log = capture_log(fn -> assert {:ok, 3} = AppFile.import_once(dir, legacy) end)
       assert log =~ ~s(unknown capability "CAP_SYS_ADMIN")
-      assert Enum.sort(AppFile.saved(dir)) == ["core_mqtt", "esphome_esphome"]
+      assert log =~ ~s(imported "core_ssh" as it was)
+
+      saved = Jason.decode!(File.read!(Path.join(dir, "core_ssh.json")))
+      assert saved["config"] == addons["core_ssh"]["config"]
+      assert saved["wanted"] == addons["core_ssh"]["state"]
+      assert (File.stat!(Path.join(dir, "core_ssh.json")).mode &&& 0o077) == 0
+      capture_log(fn -> assert {:error, :invalid} = AppFile.read("core_ssh", dir) end)
     end
 
     test "with no addons.json the directory is created empty", %{dir: dir, tmp_dir: tmp} do
