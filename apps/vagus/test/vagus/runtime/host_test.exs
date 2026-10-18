@@ -324,6 +324,22 @@ defmodule Vagus.Runtime.HostTest do
       assert [_once] = Regex.scan(~r/no tmpfs for #{Regex.escape(dir)}.*stays merged/, log)
     end
 
+    # Its snapshot outlives it; a split call would then leave a file no
+    # Host removes should its caller die.
+    test "is unavailable once the Host has stopped, and a split call fails closed", ctx do
+      start_host(ctx)
+      assert {:ok, _dir} = Host.out_dir(ctx.name)
+      stop_supervised!(ctx.name)
+      assert Host.out_dir(ctx.name) == :unavailable
+
+      assert Vagus.Runtime.Podman.Cmd.run(["ps"],
+               timeout_ms: 5_000,
+               podman_bin: "/bin/true",
+               stderr_apart: true,
+               host: ctx.name
+             ) == {:error, :unavailable}
+    end
+
     test "is not published before the Host has prepared it", ctx do
       run = fn
         "mount", ["--make-rshared", "/"] -> receive(do: (:go -> {"", 0}))

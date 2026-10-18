@@ -140,11 +140,16 @@ defmodule Vagus.Runtime.Host do
   `:unavailable` with no Host.
   """
   @spec out_dir(atom() | nil) :: {:ok, String.t()} | :unbounded | :unavailable
+  # The published snapshot outlives a stopped Host, which could then no
+  # longer remove a dead caller's file.
   def out_dir(host) do
-    case shared(host) do
-      %{out_dir: dir} when is_binary(dir) -> {:ok, dir}
-      %{status: _} -> :unbounded
-      _none -> :unavailable
+    host = host || __MODULE__
+
+    case {Process.whereis(host), shared(host)} do
+      {nil, _} -> :unavailable
+      {_pid, %{out_dir: dir}} when is_binary(dir) -> {:ok, dir}
+      {_pid, %{status: _}} -> :unbounded
+      {_pid, _none} -> :unavailable
     end
   end
 
