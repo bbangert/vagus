@@ -233,7 +233,8 @@ defmodule Vagus.Runtime.Engine.PodmanLiveTest do
     assert Engine.remove(ghost, opts) == :ok
   end
 
-  test "a removal podman refuses is an error, not :ok", %{opts: opts} do
+  # Regression cover for a 125; podman never gave a status 1 to provoke.
+  test "a removal refused for dependents (125) is an error", %{opts: opts} do
     {:ok, _} = Engine.create(spec(), opts)
 
     {:ok, _} =

@@ -771,7 +771,9 @@ defmodule Vagus.Runtime.Engine.PodmanContractTest do
       assert Engine.remove_image("docker.io/library/nope:1", opts) == :ok
     end
 
-    test "a refused removal is the verb's failure", ctx do
+    # Regression cover for statuses 125 and 2; the status-1 rule is the
+    # synthetic test below.
+    test "a refused removal (125, 2) is the verb's failure", ctx do
       {_fake, opts} =
         engine(ctx, [
           recorded("rm --force *", "rm --force --ignore --time 0 -- fx_parent"),
@@ -796,18 +798,20 @@ defmodule Vagus.Runtime.Engine.PodmanContractTest do
 
     # Synthetic: podman's own rule for status 1 (see Podman.Error), which no
     # --ignore run of ours has printed.
-    test "status 1 is :ok only when podman says the object is gone", ctx do
+    test "only a status 1 saying the object is gone is :ok", ctx do
       {_fake, opts} =
         engine(ctx, [
           {"rm *",
            [
              {1, "Error: no container with ID or name \"x\" found: no such container\n"},
-             {1, "Error: removing storage: permission denied\n"}
+             {1, "Error: removing storage: permission denied\n"},
+             {125, "Error: dependency y: no such container\n"}
            ]},
           {"rmi *",
            [
              {1, "Error: ghcr.io/vagus/x:1: image not known\n"},
-             {1, "Error: 08bc4e534116: layer not known\n"}
+             {1, "Error: 08bc4e534116: layer not known\n"},
+             {125, "Error: parent y: image not known\n"}
            ]}
         ])
 
@@ -820,6 +824,12 @@ defmodule Vagus.Runtime.Engine.PodmanContractTest do
 
       assert Engine.remove_image("ghcr.io/vagus/x:1", opts) ==
                {:error, {:failed, :remove_image, "Error: 08bc4e534116: layer not known"}}
+
+      assert Engine.remove("addon_local_x", opts) ==
+               {:error, {:failed, :remove, "Error: dependency y: no such container"}}
+
+      assert Engine.remove_image("ghcr.io/vagus/x:1", opts) ==
+               {:error, {:failed, :remove_image, "Error: parent y: image not known"}}
     end
   end
 

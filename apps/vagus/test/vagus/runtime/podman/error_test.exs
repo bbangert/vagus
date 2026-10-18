@@ -47,7 +47,7 @@ defmodule Vagus.Runtime.Podman.ErrorTest do
            ) == {:error, {:failed, :create, :network_not_found}}
   end
 
-  test "rmi: 2 is :in_use, 1 is :not_found" do
+  test "rmi: 2 is :in_use, 1 naming the image absent is :not_found" do
     assert classify(:remove_image, "rmi docker.io/library/alpine:3.20") == {:error, :in_use}
     assert classify(:remove_image, "rmi docker.io/library/nope:1") == {:error, :not_found}
 
@@ -60,9 +60,8 @@ defmodule Vagus.Runtime.Podman.ErrorTest do
     assert classify(:exists, "container exists -- ghost") == {:error, :not_found}
   end
 
-  # podman sets 1 for any error whose text mentions "no such container" (rm)
-  # or for a missing image or layer (rmi); the absent target itself already
-  # exits 0 under the --ignore Vagus always passes.
+  # --ignore makes an absent target exit 0, so a status 1 is a real error
+  # unless its text names the absent object.
   test "status 1 from rm or rmi is :not_found only when the text says so" do
     for cmd <- ["rm --ignore -- ghost", "rm --force --ignore --time 0 -- ghost"],
         do: assert({0, _} = PodmanRecorded.fetch!(cmd))
@@ -79,6 +78,24 @@ defmodule Vagus.Runtime.Podman.ErrorTest do
              Error.classify(:remove_image, 1, "Error: 08bc4e53: layer not known\n")
 
     assert {:error, {:failed, :remove_image, ""}} = Error.classify(:remove_image, 1, "")
+  end
+
+  test "an absence text at any other status is the removal's failure" do
+    for status <- [2, 125] do
+      assert {:error, {:failed, :remove, _}} =
+               Error.classify(:remove, status, "Error: dependency x: no such container\n")
+    end
+
+    # rmi's 2 is :in_use whatever it says.
+    for text <- ["Error: parent x: image not known\n", "Error: x: no such image\n"] do
+      assert {:error, {:failed, :remove_image, _}} = Error.classify(:remove_image, 125, text)
+    end
+  end
+
+  test "the absence texts still mean :not_found for the other verbs" do
+    assert Error.classify(:inspect, 125, "Error: no such container") == {:error, :not_found}
+    assert Error.classify(:inspect, 125, "Error: x:1: image not known") == {:error, :not_found}
+    assert Error.classify(:start, 125, "Error: no such image") == {:error, :not_found}
   end
 
   test "rm: dependents and a running container without force are the verb's failure" do
