@@ -52,6 +52,23 @@ MIX_TARGET=dragon_q6a mix firmware       # after: eval "$(mise env)"
 MIX_TARGET=dragon_q6a mix upload <device-ip>
 ```
 
+If `mix upload` hangs, or a raw upload reports `subsystem request failed on
+channel 0`, the client is sending environment variables. Debian/Ubuntu's
+default `/etc/ssh/ssh_config` has `SendEnv LANG LC_*`, and once a client has
+sent env, the board's OTP ssh refuses subsystem channels (fwup and sftp alike;
+plain `ssh <ip> '<expr>'` still works). `-o SendEnv=-*` did not stop it in
+testing. Upload without the system config instead:
+
+```sh
+cat ../../_build/dragon_q6a_dev/nerves/images/vagus_platform.fw |
+  env -u LANG -u LC_ALL ssh -F /dev/null -s <device-ip> fwup
+```
+
+The path follows the build's `MIX_ENV` (`dev` above; `_prod` for a
+`MIX_ENV=prod` build). `-F /dev/null` also skips your `~/.ssh/config`, so
+pass any key or user options it held on the command line; host keys are
+still checked against `~/.ssh/known_hosts`.
+
 The Nerves *system* build alone produces `rootfs.squashfs`, `Image` and
 `fwup.conf` — but **no `.fw` bundle**. That comes from `mix firmware` here,
 which is why a new board must be wired into `@all_targets` before it can be
