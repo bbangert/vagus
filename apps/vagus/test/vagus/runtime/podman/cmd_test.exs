@@ -227,15 +227,25 @@ defmodule Vagus.Runtime.Podman.CmdTest do
   end
 
   describe "stderr_apart" do
+    setup do
+      dir = Path.join(System.tmp_dir!(), "podman-out-#{System.unique_integer([:positive])}")
+      File.mkdir_p!(dir)
+      on_exit(fn -> File.rm_rf(dir) end)
+      %{out_dir: dir, apart: [stderr_apart: true, out_dir: dir]}
+    end
+
     # Stands in for podman's `--out`: stdout goes to the file it names.
     defp split_script(body) do
       script("""
-      for a; do case "$a" in --out=*) exec >"${a#--out=}" ;; esac; done
+      for a; do case "$a" in --out=*) out="${a#--out=}"; exec >"$out" ;; esac; done
       #{body}
       """)
     end
 
-    test "stdout comes back alone, whatever podman printed on stderr around it" do
+    defp run_apart(bin, ctx, opts \\ []),
+      do: Cmd.run([], [timeout_ms: 5_000, podman_bin: bin] ++ ctx.apart ++ opts)
+
+    test "stdout comes back alone, whatever podman printed on stderr around it", ctx do
       {bin, _dir} =
         split_script("""
         echo 'time="t" level=warning msg="before"' >&2
@@ -244,13 +254,19 @@ defmodule Vagus.Runtime.Podman.CmdTest do
         echo 'time="t" level=error msg="after"' >&2
         """)
 
-      assert Cmd.run(["ps"], timeout_ms: 5_000, podman_bin: bin, stderr_apart: true) ==
-               {:ok, ~s([{"Id":"a"}]\n)}
-
-      refute File.exists?(Cmd.out_path(nil))
+      assert run_apart(bin, ctx) == {:ok, ~s([{"Id":"a"}]\n)}
+      assert File.ls!(ctx.out_dir) == []
     end
 
-    test "a failure carries stderr alone, which the classifier reads" do
+    test "each call's file has a name of its own", ctx do
+      {bin, _dir} = split_script(~s(printf '%s' "$out"\n))
+      assert {:ok, first} = run_apart(bin, ctx)
+      assert {:ok, second} = run_apart(bin, ctx)
+      assert Path.dirname(first) == ctx.out_dir
+      refute first == second
+    end
+
+    test "a failure carries stderr alone, which the classifier reads", ctx do
       {bin, _dir} =
         split_script("""
         printf '[]\n'
@@ -258,35 +274,50 @@ defmodule Vagus.Runtime.Podman.CmdTest do
         exit 125
         """)
 
-      assert {:exit, 125, err} =
-               Cmd.run(["container", "inspect"],
-                 timeout_ms: 5_000,
-                 podman_bin: bin,
-                 stderr_apart: true
-               )
-
+      assert {:exit, 125, err} = run_apart(bin, ctx)
       assert err == ~s(Error: no such container "ghost"\n)
       assert Vagus.Runtime.Podman.Error.classify(:inspect, 125, err) == {:error, :not_found}
     end
 
-    test "a podman that never opened the file printed nothing" do
+    test "a podman that printed nothing answers empty", ctx do
       {bin, _dir} = script("exit 0\n")
-      assert Cmd.run([], timeout_ms: 5_000, podman_bin: bin, stderr_apart: true) == {:ok, ""}
+      assert run_apart(bin, ctx) == {:ok, ""}
     end
 
-    test "stdout past the cap fails" do
+    # A Host restarting mid-call sweeps the file away: not an empty answer.
+    test "a file removed under the call is :unavailable", ctx do
+      {bin, _dir} = split_script(~s(printf '[]\\n'; rm -f "$out"\n))
+      assert run_apart(bin, ctx) == {:error, :unavailable}
+    end
+
+    test "a file that cannot be read is an error, not an empty answer", ctx do
+      {bin, _dir} = split_script(~s(printf '[]\\n'; chmod 000 "$out"\n))
+      assert run_apart(bin, ctx) == {:error, {:out_file, :eacces}}
+    end
+
+    # podman exits 0 with its output cut at a page when the tmpfs fills;
+    # /dev/full stands in for the full tmpfs.
+    test "stdout cut short by a full filesystem is over the cap", ctx do
+      {bin, _dir} =
+        split_script("""
+        rm -f "$out"; ln -s /dev/full "$out"
+        printf '[{"Id":"a"}]\n' 2>/dev/null
+        exit 0
+        """)
+
+      assert run_apart(bin, ctx) == {:error, :output_too_large}
+    end
+
+    test "stdout past the cap fails", ctx do
       {bin, _dir} = split_script("printf '%5000s' '' | tr ' ' x\n")
-
-      assert Cmd.run([], timeout_ms: 5_000, podman_bin: bin, cap: 100, stderr_apart: true) ==
-               {:error, :output_too_large}
-
-      assert {:ok, out} = Cmd.run([], timeout_ms: 5_000, podman_bin: bin, stderr_apart: true)
+      assert run_apart(bin, ctx, cap: 100) == {:error, :output_too_large}
+      assert {:ok, out} = run_apart(bin, ctx)
       assert byte_size(out) == 5_000
     end
 
     # The file has no pipe to fill, so the cap is what stops the writer.
     @tag timeout: 60_000
-    test "a podman still writing past the cap is killed" do
+    test "a podman still writing past the cap is killed", ctx do
       {bin, dir} =
         split_script("""
         head -c 10000000 /dev/zero
@@ -295,27 +326,41 @@ defmodule Vagus.Runtime.Podman.CmdTest do
         """)
 
       started = System.monotonic_time(:millisecond)
-
-      assert Cmd.run([], timeout_ms: 20_000, podman_bin: bin, cap: 1_000, stderr_apart: true) ==
-               {:error, :output_too_large}
-
+      assert run_apart(bin, ctx, timeout_ms: 20_000, cap: 1_000) == {:error, :output_too_large}
       assert System.monotonic_time(:millisecond) - started < 10_000
       assert File.exists?(Path.join(dir, "written"))
-      refute File.exists?(Cmd.out_path(nil))
+      assert File.ls!(ctx.out_dir) == []
     end
 
     @tag timeout: 60_000
-    test "the deadline still SIGTERMs podman" do
+    test "the deadline still SIGTERMs podman", ctx do
       {bin, dir} = trapping_script(~s(echo term > "$d/term"; exit 0))
-
-      task =
-        Task.async(fn -> Cmd.run([], timeout_ms: 2_000, podman_bin: bin, stderr_apart: true) end)
-
+      task = Task.async(fn -> run_apart(bin, ctx, timeout_ms: 2_000) end)
       pid = await_file(Path.join(dir, "pid"))
 
       assert Task.await(task, 30_000) == {:error, :timeout}
       assert File.read!(Path.join(dir, "term")) == "term\n"
       refute alive?(pid), "podman #{pid} outlived run/2"
+    end
+
+    # Never a shared temp dir another user could plant files in.
+    test "with no Host prepared and no :out_dir, it fails closed" do
+      {bin, dir} = split_script(~s|: > "$(dirname "$0")/ran"\n|)
+
+      assert Cmd.run([],
+               timeout_ms: 5_000,
+               podman_bin: bin,
+               stderr_apart: true,
+               host: :vagus_no_such_host
+             ) == {:error, :unavailable}
+
+      refute File.exists?(Path.join(dir, "ran"))
+    end
+
+    test "with :discard_stdout or :truncate it raises", ctx do
+      for extra <- [[discard_stdout: true], [truncate: true]] do
+        assert_raise ArgumentError, fn -> run_apart("/bin/true", ctx, extra) end
+      end
     end
   end
 

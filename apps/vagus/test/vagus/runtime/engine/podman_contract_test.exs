@@ -573,19 +573,25 @@ defmodule Vagus.Runtime.Engine.PodmanContractTest do
       assert Engine.inspect("ghost", opts) == {:error, :not_found}
     end
 
+    # Only that caller's own file: another call's beside it is still live.
     test "a caller killed mid-call leaves no stdout file behind", ctx do
       {fake, opts} = engine(ctx, [{"ps *", [{0, "[]", hold: true}]}])
-      caller = spawn(fn -> Engine.list(opts) end)
-      out = Vagus.Runtime.Podman.Cmd.out_path(opts[:host], caller)
+      dir = Vagus.Runtime.Host.out_dir(opts[:host])
+      live = Path.join(dir, "podman-live.out")
+      File.write!(live, "")
+      {caller, ref} = spawn_monitor(fn -> Engine.list(opts) end)
 
-      Enum.find(1..1_000, fn _ -> File.exists?(out) or (Process.sleep(10) && false) end) ||
-        flunk("#{out} never appeared")
+      out =
+        Enum.find_value(1..1_000, fn _ ->
+          Enum.find(File.ls!(dir), &(&1 != "podman-live.out")) || (Process.sleep(10) && nil)
+        end) || flunk("no stdout file ever appeared in #{dir}")
 
       Process.exit(caller, :kill)
+      assert_receive {:DOWN, ^ref, :process, ^caller, :killed}
+      :sys.get_state(opts[:host])
 
-      Enum.find(1..500, fn _ -> not File.exists?(out) or (Process.sleep(10) && false) end) ||
-        flunk("#{out} outlived its caller")
-
+      refute File.exists?(Path.join(dir, out))
+      assert File.exists?(live)
       FakePodman.release(fake)
     end
   end

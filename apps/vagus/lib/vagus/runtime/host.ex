@@ -135,10 +135,17 @@ defmodule Vagus.Runtime.Host do
 
   @doc """
   Where split podman calls (`Runtime.Podman.Cmd`'s `:stderr_apart`) write
-  their stdout; the system temp dir when no Host has published one.
+  their stdout, once this Host has prepared it; `nil` before.
   """
-  @spec out_dir(atom() | nil) :: String.t()
-  def out_dir(host), do: shared(host)[:out_dir] || System.tmp_dir!()
+  @spec out_dir(atom() | nil) :: String.t() | nil
+  def out_dir(host), do: shared(host)[:out_dir]
+
+  @doc """
+  Records `path` as the calling permit holder's stdout file, removed should
+  the holder die before it can.
+  """
+  @spec track_out(atom() | nil, String.t()) :: :ok
+  def track_out(host, path), do: GenServer.cast(host || __MODULE__, {:out_file, self(), path})
 
   @spec ready(atom() | nil) :: :ok | {:error, :preparing | :unavailable | {:prep_failed, term()}}
   def ready(host \\ nil) do
@@ -376,6 +383,7 @@ defmodule Vagus.Runtime.Host do
       permits: Keyword.get(opts, :permits, @permits.frugal),
       free: %{},
       holders: %{},
+      out_dir: nil,
       migration: nil,
       migration_task: nil,
       migration_timer: nil,
@@ -404,7 +412,8 @@ defmodule Vagus.Runtime.Host do
     ensure_private_dir(out_dir_of(state.opts))
     write_resolv_conf(state.opts)
     state = state |> apply_profile() |> publish(:preparing)
-    mount_log_tmpfs(state.opts, state.profile)
+    mount_tmpfs(log_dir(state.opts), @log_tmpfs_bytes[state.profile], state.opts)
+    state = prepare_out_dir(state)
     clear_spool_once(state.opts)
     state = state |> prepare_migration() |> publish(:preparing)
     {:noreply, start_probe(state)}
@@ -444,6 +453,16 @@ defmodule Vagus.Runtime.Host do
   @impl true
   def handle_cast({:release, ref}, state), do: {:noreply, release(state, ref)}
 
+  def handle_cast({:out_file, pid, path}, state) do
+    holders =
+      Map.new(state.holders, fn
+        {ref, {class, ^pid, mon, _out}} -> {ref, {class, pid, mon, path}}
+        held -> held
+      end)
+
+    {:noreply, %{state | holders: holders}}
+  end
+
   @impl true
   def handle_info({ref, result}, %{probe: ref} = state) when is_reference(ref) do
     Process.demonitor(ref, [:flush])
@@ -473,9 +492,9 @@ defmodule Vagus.Runtime.Host do
   def handle_info({:migration_check, _stale}, state), do: {:noreply, state}
 
   def handle_info({:DOWN, mon, :process, _pid, _reason}, state) do
-    held = for {ref, {_class, pid, ^mon}} <- state.holders, do: {ref, pid}
-    Enum.each(held, fn {_ref, pid} -> drop_out_file(state, pid) end)
-    state = Enum.reduce(held, state, fn {ref, _pid}, state -> release(state, ref) end)
+    held = for {ref, {_class, _pid, ^mon, out}} <- state.holders, do: {ref, out}
+    Enum.each(held, fn {_ref, out} -> drop_out_file(out) end)
+    state = Enum.reduce(held, state, fn {ref, _out}, state -> release(state, ref) end)
 
     waiting =
       Map.new(state.waiting, fn {c, q} -> {c, :queue.filter(&(elem(&1, 2) != mon), q)} end)
@@ -491,13 +510,13 @@ defmodule Vagus.Runtime.Host do
   end
 
   defp grant(state, class, ref, pid) do
-    holders = Map.put(state.holders, ref, {class, pid, Process.monitor(pid)})
+    holders = Map.put(state.holders, ref, {class, pid, Process.monitor(pid), nil})
     %{state | holders: holders, free: Map.update!(state.free, class, &(&1 - 1))}
   end
 
   defp release(state, ref) do
     case Map.pop(state.holders, ref) do
-      {{class, _pid, mon}, holders} ->
+      {{class, _pid, mon, _out}, holders} ->
         Process.demonitor(mon, [:flush])
 
         hand_over(
@@ -551,7 +570,7 @@ defmodule Vagus.Runtime.Host do
       pull_permits: state.permits[:pull],
       spool_quiet_ms: Keyword.get(state.opts, :spool_quiet_ms, 120_000),
       log_dir: log_dir(state.opts),
-      out_dir: out_dir_of(state.opts),
+      out_dir: state.out_dir,
       log_max_bytes: state.profile && @log_max_bytes[state.profile],
       log_tmpfs_bytes: state.profile && @log_tmpfs_bytes[state.profile],
       migration: state.migration
@@ -710,25 +729,23 @@ defmodule Vagus.Runtime.Host do
 
   # A Vagus restart within one boot finds the tmpfs already there. A board
   # that cannot mount it, or whose directory already holds something,
-  # keeps the logs in the plain directory on /run: mounting over files
-  # would hide logs conmon is still writing.
-  defp mount_log_tmpfs(opts, profile) do
-    dir = log_dir(opts)
-
+  # keeps the plain directory on /run: mounting over files would hide logs
+  # conmon is still writing.
+  defp mount_tmpfs(dir, bytes, opts) do
     case mount_at(dir, Keyword.get(opts, :mountinfo, "/proc/self/mountinfo")) do
       {:ok, "tmpfs"} -> :ok
       {:ok, fstype} -> keep_plain(dir, "#{fstype} is mounted there")
       {:error, reason} -> keep_plain(dir, "mountinfo unreadable (#{inspect(reason)})")
-      :none -> mount_if_empty(dir, profile, opts)
+      :none -> mount_if_empty(dir, bytes, opts)
     end
   end
 
   # sobelow_skip ["Traversal.FileModule"]
-  defp mount_if_empty(dir, profile, opts) do
+  defp mount_if_empty(dir, bytes, opts) do
     case File.ls(dir) do
       {:ok, []} ->
         run = Keyword.get(opts, :run, &Vagus.Host.Cmd.run/2)
-        options = "size=#{@log_tmpfs_bytes[profile]},mode=0700,nosuid,nodev,noexec"
+        options = "size=#{bytes},mode=0700,nosuid,nodev,noexec"
 
         case run.("mount", ["-t", "tmpfs", "-o", options, "tmpfs", dir]) do
           {_out, 0} -> :ok
@@ -736,7 +753,7 @@ defmodule Vagus.Runtime.Host do
         end
 
       {:ok, _entries} ->
-        keep_plain(dir, "it already holds logs")
+        keep_plain(dir, "it already holds files")
 
       {:error, reason} ->
         keep_plain(dir, inspect(reason))
@@ -744,7 +761,27 @@ defmodule Vagus.Runtime.Host do
   end
 
   defp keep_plain(dir, why),
-    do: Logger.warning("Vagus.Runtime.Host: no tmpfs for #{dir}: #{why}; logs stay on /run")
+    do: Logger.warning("Vagus.Runtime.Host: no tmpfs for #{dir}: #{why}; it stays on /run")
+
+  # Split podman calls write stdout here with no pipe to hold them back, so
+  # a burst past the cap could fill /run, where podman keeps its runroot,
+  # before Cmd's poll stops it. Their own tmpfs bounds that: room for every
+  # permit's call at the cap at once (a health check holds an ops permit),
+  # and one more for a burst the poll has not caught yet. A fresh Host has
+  # no holders, so anything already there is an orphan: from a Host that
+  # died, or a podman that recreated its file after its dead caller's was
+  # removed.
+  # sobelow_skip ["Traversal.FileModule"]
+  defp prepare_out_dir(state) do
+    dir = out_dir_of(state.opts)
+
+    with {:ok, entries} <- File.ls(dir),
+         do: Enum.each(entries, &File.rm_rf(Path.join(dir, &1)))
+
+    calls = state.permits |> Map.values() |> Enum.sum()
+    mount_tmpfs(dir, (calls + 1) * Cmd.default_cap(), state.opts)
+    %{state | out_dir: dir}
+  end
 
   # The fstype of the last mount at `dir`, the one in view.
   defp mount_at(dir, mountinfo) do
@@ -887,12 +924,13 @@ defmodule Vagus.Runtime.Host do
   defp out_dir_of(opts), do: Path.join(run_dir(opts), "out")
 
   # A holder killed mid-call never reaches Cmd's own cleanup. Its podman
-  # may still be writing for up to muontrap's SIGKILL delay; unlinking an
-  # open file is harmless, and the space goes once podman exits.
+  # lives on for up to muontrap's SIGKILL delay: a file it already holds
+  # open keeps its space until it exits; one it has yet to open it creates
+  # again, which the next preparation's sweep removes. The path is one Cmd
+  # made in this Host's out dir.
+  defp drop_out_file(nil), do: :ok
   # sobelow_skip ["Traversal.FileModule"]
-  defp drop_out_file(state, pid) do
-    _ = File.rm(Cmd.out_path(state.name, pid))
-  end
+  defp drop_out_file(path), do: _ = File.rm(path)
 
   defp log_dir(opts), do: Keyword.get(opts, :log_dir, @log_dir)
 
