@@ -443,6 +443,7 @@ defmodule Vagus.Runtime.Engine.PodmanContractTest do
   alias Vagus.Runtime.Engine.PodmanContractTest.Leg
   alias Vagus.Test.EngineContract, as: C
   alias Vagus.Test.FakePodman
+  alias Vagus.Test.PodmanRecorded
 
   defp engine(ctx, rules) do
     opts = Leg.start(ctx, rules, [])
@@ -751,6 +752,84 @@ defmodule Vagus.Runtime.Engine.PodmanContractTest do
       stopped = File.read!(Path.expand("../../../fixtures/podman/stats_stopped.json", __DIR__))
       {_fake, opts} = engine(ctx, [{"stats *", [{0, stopped}]}])
       assert Engine.stats("fx_stopped", opts) == {:ok, Vagus.Runtime.Stats.zero()}
+    end
+  end
+
+  defp recorded(glob, cmd), do: {glob, [PodmanRecorded.fetch!(cmd)]}
+
+  describe "removal outcomes, from what podman 6.1.4 printed" do
+    test "an absent container or image is :ok", ctx do
+      {_fake, opts} =
+        engine(ctx, [
+          recorded("rm --force *", "rm --force --ignore --time 0 -- ghost"),
+          recorded("rm --ignore *", "rm --ignore -- ghost"),
+          recorded("rmi *", "rmi --ignore -- docker.io/library/nope:1")
+        ])
+
+      assert Engine.remove("ghost", opts) == :ok
+      assert Engine.remove("ghost", [force: false] ++ opts) == :ok
+      assert Engine.remove_image("docker.io/library/nope:1", opts) == :ok
+    end
+
+    # Regression cover for statuses 125 and 2; the status-1 rule is the
+    # synthetic test below.
+    test "a refused removal (125, 2) is the verb's failure", ctx do
+      {_fake, opts} =
+        engine(ctx, [
+          recorded("rm --force *", "rm --force --ignore --time 0 -- fx_parent"),
+          recorded("rm --ignore *", "rm --ignore -- fx_running")
+        ])
+
+      assert {:error, {:failed, :remove, detail}} = Engine.remove("fx_parent", opts)
+      assert detail =~ "has dependent containers"
+
+      assert {:error, {:failed, :remove, detail}} =
+               Engine.remove("fx_running", [force: false] ++ opts)
+
+      assert detail =~ "container state improper"
+    end
+
+    test "an image a container still uses is :in_use", ctx do
+      {_fake, opts} =
+        engine(ctx, [recorded("rmi *", "rmi --ignore -- docker.io/library/alpine:3.20")])
+
+      assert Engine.remove_image("docker.io/library/alpine:3.20", opts) == {:error, :in_use}
+    end
+
+    # Synthetic: podman's own rule for status 1 (see Podman.Error), which no
+    # --ignore run of ours has printed.
+    test "only a status 1 saying the object is gone is :ok", ctx do
+      {_fake, opts} =
+        engine(ctx, [
+          {"rm *",
+           [
+             {1, "Error: no container with ID or name \"x\" found: no such container\n"},
+             {1, "Error: removing storage: permission denied\n"},
+             {125, "Error: dependency y: no such container\n"}
+           ]},
+          {"rmi *",
+           [
+             {1, "Error: ghcr.io/vagus/x:1: image not known\n"},
+             {1, "Error: 08bc4e534116: layer not known\n"},
+             {125, "Error: parent y: image not known\n"}
+           ]}
+        ])
+
+      assert Engine.remove("addon_local_x", opts) == :ok
+
+      assert Engine.remove("addon_local_x", opts) ==
+               {:error, {:failed, :remove, "Error: removing storage: permission denied"}}
+
+      assert Engine.remove_image("ghcr.io/vagus/x:1", opts) == :ok
+
+      assert Engine.remove_image("ghcr.io/vagus/x:1", opts) ==
+               {:error, {:failed, :remove_image, "Error: 08bc4e534116: layer not known"}}
+
+      assert Engine.remove("addon_local_x", opts) ==
+               {:error, {:failed, :remove, "Error: dependency y: no such container"}}
+
+      assert Engine.remove_image("ghcr.io/vagus/x:1", opts) ==
+               {:error, {:failed, :remove_image, "Error: parent y: image not known"}}
     end
   end
 

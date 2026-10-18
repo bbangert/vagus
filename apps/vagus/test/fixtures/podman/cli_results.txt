@@ -219,3 +219,59 @@ $ podman pull --quiet --retry 0 docker.io/library/nosuchimage-vagus:1
 [exit 125]
 Error: unable to copy from source docker://nosuchimage-vagus:1: initializing source docker://nosuchimage-vagus:1: reading manifest 1 in docker.io/library/nosuchimage-vagus: requested access to the resource is denied
 
+$ podman container exists -- ghost
+[exit 1]
+
+
+$ podman container exists -- fx_stopped
+[exit 0]
+
+
+$ podman rm --ignore -- ghost
+[exit 0]
+
+
+$ podman rm --force --ignore --time 0 -- ghost
+[exit 0]
+
+
+$ podman rm --ignore -- fx_stopped
+[exit 0]
+fx_stopped
+
+$ podman rm --ignore -- fx_running
+[exit 2]
+Error: cannot remove container b7c05cf6843ee9e1d7663d0501bd6f51181a16327e271cdc70617e97a715a220 as it is running - running or paused containers cannot be removed without force: container state improper
+
+$ podman rm --force --ignore --time 0 -- fx_running
+[exit 0]
+fx_running
+
+$ podman rm --ignore -- fx_paused
+[exit 2]
+Error: cannot remove container 94df20cdfa30ab0d25897ecf2e6139ac64eade41ddd1162e38660a188a4f65fb as it is paused - running or paused containers cannot be removed without force: container state improper
+
+$ podman rm --force --ignore --time 0 -- fx_paused
+[exit 0]
+fx_paused
+
+$ podman rm --force --ignore --time 0 -- fx_parent
+[exit 125]
+Error: container 10342894a57e56ed473a2509d2eac2fb85f2a8b9b0a71a1bc174fdb94191b76d has dependent containers which must be removed before it: 0c77c65e34ba23c2466c23efab3f77f82b5415048025c44dde819da546eeacdf: container already exists
+
+$ podman rmi --ignore -- docker.io/library/nope:1
+[exit 0]
+
+
+$ podman rmi --ignore -- localhost/fx-unused:1
+[exit 0]
+Untagged: localhost/fx-unused:1
+
+$ podman rmi --ignore -- localhost/fx-used:1
+[exit 0]
+Untagged: localhost/fx-used:1
+
+$ podman rmi --ignore -- docker.io/library/alpine:3.20
+[exit 2]
+Error: image used by 3a0b8454ee9cc3d7f515a51bf694444fcf58af9396284f97b0b8e2ff9a50f6a5: image is in use by a container: consider listing external containers and force-removing image
+

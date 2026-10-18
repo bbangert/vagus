@@ -179,9 +179,11 @@ defmodule Vagus.Runtime.Engine.Podman do
   @impl true
   def remove_image(image, opts) do
     with :ok <- valid_image(:remove_image, image) do
-      case run(:remove_image, ["rmi", "--ignore", "--", image], opts, @lifecycle_ms) do
-        {:exit, 1, _} -> :ok
-        other -> unit(:remove_image, other)
+      result = run(:remove_image, ["rmi", "--ignore", "--", image], opts, @lifecycle_ms)
+
+      case unit(:remove_image, result) do
+        {:error, :not_found} -> :ok
+        other -> other
       end
     end
   end

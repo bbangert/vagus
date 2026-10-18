@@ -1,25 +1,14 @@
 defmodule Vagus.Runtime.Podman.ErrorTest do
   # Classifies what a real podman 6.1.4 printed: each case names a recorded
-  # command in cli_results.txt. The lock, signal and detail cases are
-  # synthetic; podman never printed them for us.
+  # command in cli_results.txt. The lock, signal, detail and rm/rmi status-1
+  # cases are synthetic; podman never printed them for us.
   use ExUnit.Case, async: true
 
   alias Vagus.Runtime.Podman.Error
-
-  @fixture Path.expand("../../../fixtures/podman/cli_results.txt", __DIR__)
-  @external_resource @fixture
-
-  @recorded @fixture
-            |> File.read!()
-            |> String.split(~r/^\$ podman /m, trim: true)
-            |> Map.new(fn entry ->
-              [cmd, "[exit " <> rest] = String.split(entry, "\n", parts: 2)
-              [code, output] = String.split(rest, "]\n", parts: 2)
-              {cmd, {String.to_integer(code), output}}
-            end)
+  alias Vagus.Test.PodmanRecorded
 
   defp classify(verb, cmd) do
-    {status, output} = Map.fetch!(@recorded, cmd)
+    {status, output} = PodmanRecorded.fetch!(cmd)
     Error.classify(verb, status, output)
   end
 
@@ -58,9 +47,67 @@ defmodule Vagus.Runtime.Podman.ErrorTest do
            ) == {:error, {:failed, :create, :network_not_found}}
   end
 
-  test "rmi: 2 is :in_use, 1 is :not_found" do
+  test "rmi: 2 is :in_use, 1 naming the image absent is :not_found" do
     assert classify(:remove_image, "rmi docker.io/library/alpine:3.20") == {:error, :in_use}
     assert classify(:remove_image, "rmi docker.io/library/nope:1") == {:error, :not_found}
+
+    assert classify(:remove_image, "rmi --ignore -- docker.io/library/alpine:3.20") ==
+             {:error, :in_use}
+  end
+
+  test "the exists verb's silent 1 is :not_found" do
+    assert {1, _blank} = PodmanRecorded.fetch!("container exists -- ghost")
+    assert classify(:exists, "container exists -- ghost") == {:error, :not_found}
+  end
+
+  # --ignore makes an absent target exit 0, so a status 1 is a real error
+  # unless its text names the absent object.
+  test "status 1 from rm or rmi is :not_found only when the text says so" do
+    for cmd <- ["rm --ignore -- ghost", "rm --force --ignore --time 0 -- ghost"],
+        do: assert({0, _} = PodmanRecorded.fetch!(cmd))
+
+    assert {0, _} = PodmanRecorded.fetch!("rmi --ignore -- docker.io/library/nope:1")
+
+    assert Error.classify(:remove, 1, "Error: no such container") == {:error, :not_found}
+    assert Error.classify(:remove_image, 1, "Error: x:1: image not known") == {:error, :not_found}
+
+    assert {:error, {:failed, :remove, "Error: removing storage: permission denied"}} =
+             Error.classify(:remove, 1, "Error: removing storage: permission denied\n")
+
+    assert {:error, {:failed, :remove_image, "Error: 08bc4e53: layer not known"}} =
+             Error.classify(:remove_image, 1, "Error: 08bc4e53: layer not known\n")
+
+    assert {:error, {:failed, :remove_image, ""}} = Error.classify(:remove_image, 1, "")
+  end
+
+  test "an absence text at any other status is the removal's failure" do
+    for status <- [2, 125] do
+      assert {:error, {:failed, :remove, _}} =
+               Error.classify(:remove, status, "Error: dependency x: no such container\n")
+    end
+
+    # rmi's 2 is :in_use whatever it says.
+    for text <- ["Error: parent x: image not known\n", "Error: x: no such image\n"] do
+      assert {:error, {:failed, :remove_image, _}} = Error.classify(:remove_image, 125, text)
+    end
+  end
+
+  test "the absence texts still mean :not_found for the other verbs" do
+    assert Error.classify(:inspect, 125, "Error: no such container") == {:error, :not_found}
+    assert Error.classify(:inspect, 125, "Error: x:1: image not known") == {:error, :not_found}
+    assert Error.classify(:start, 125, "Error: no such image") == {:error, :not_found}
+  end
+
+  test "rm: dependents and a running container without force are the verb's failure" do
+    assert {:error, {:failed, :remove, detail}} =
+             classify(:remove, "rm --force --ignore --time 0 -- fx_parent")
+
+    assert detail =~ "has dependent containers"
+
+    for cmd <- ["rm --ignore -- fx_running", "rm --ignore -- fx_paused"] do
+      assert {:error, {:failed, :remove, detail}} = classify(:remove, cmd)
+      assert detail =~ "container state improper"
+    end
   end
 
   test "an existing network is :ok for ensure_network" do

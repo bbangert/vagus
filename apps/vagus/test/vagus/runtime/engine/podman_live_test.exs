@@ -115,7 +115,9 @@ defmodule Vagus.Runtime.Engine.PodmanLiveTest do
   end
 
   defp cleanup(opts) do
-    for n <- [@x, @h, "vagus_live_y"], do: Engine.remove(n, opts)
+    # vagus_live_y first: it may share vagus_live_x's network namespace,
+    # and podman refuses to remove a container others depend on.
+    for n <- ["vagus_live_y", @x, @h], do: Engine.remove(n, opts)
   end
 
   defp spec do
@@ -139,6 +141,13 @@ defmodule Vagus.Runtime.Engine.PodmanLiveTest do
       security_opt: ["seccomp=unconfined"],
       restart: :no
     }
+  end
+
+  # Tests reuse the same few names, and a failed or partial one (the paused
+  # test leaves vagus_live_y behind) would make the next create conflict.
+  setup %{opts: opts} do
+    cleanup(opts)
+    :ok
   end
 
   test "the engine is ready", %{opts: opts} do
@@ -231,6 +240,26 @@ defmodule Vagus.Runtime.Engine.PodmanLiveTest do
     assert Engine.remove(ghost, opts) == :ok
   end
 
+  # Regression cover for a 125; podman never gave a status 1 to provoke.
+  test "a removal refused for dependents (125) is an error", %{opts: opts} do
+    {:ok, _} = Engine.create(spec(), opts)
+
+    {:ok, _} =
+      Cmd.run(
+        ["create", "--name", "vagus_live_y", "--network", "container:" <> @x, @image, "true"],
+        timeout_ms: 30_000,
+        podman_bin: opts[:podman_bin],
+        host: opts[:host]
+      )
+
+    assert {:error, {:failed, :remove, detail}} = Engine.remove(@x, opts)
+    assert detail =~ "has dependent containers"
+    assert {:ok, %Container{}} = Engine.inspect(@x, opts)
+
+    assert :ok = Engine.remove("vagus_live_y", opts)
+    assert :ok = Engine.remove(@x, opts)
+  end
+
   test "create failures", %{opts: opts} do
     assert Engine.create(
              %{spec() | name: "vagus_live_y", image: "docker.io/library/nope:1"},
@@ -251,7 +280,6 @@ defmodule Vagus.Runtime.Engine.PodmanLiveTest do
     # Only the run's own store may lose the image; on a real host's store it
     # can be in use, and the pull then only proves podman answered.
     if ctx.own_store? do
-      cleanup(opts)
       assert Engine.remove_image(@image, opts) == :ok
       assert Engine.image_present?(@image, opts) == false
     end
