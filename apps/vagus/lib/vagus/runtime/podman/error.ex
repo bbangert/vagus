@@ -1,8 +1,8 @@
 defmodule Vagus.Runtime.Podman.Error do
   @moduledoc """
   Maps a failed `podman` call onto `Vagus.Runtime.Engine`'s closed error
-  set. Exit codes first (podman 6.1.4: 125 generic; 1 absent for `rm` and
-  the `exists` verbs; 2 in use for `rmi`), then the stable sentinel texts
+  set. Exit codes first (podman 6.1.4: 125 generic; 1 absent for the
+  `exists` verbs; 2 in use for `rmi`), then the stable sentinel texts
   podman wraps its errors around, matched as substrings so a longer chain
   still matches. Every text here is pinned against output recorded from a
   real podman (`test/fixtures/podman/cli_results.txt`); re-record on every
@@ -39,7 +39,11 @@ defmodule Vagus.Runtime.Podman.Error do
   defp by_status(verb, status) when verb != :exec and status in 129..159,
     do: {:error, :unavailable}
 
-  defp by_status(verb, 1) when verb in [:remove, :exists, :remove_image], do: {:error, :not_found}
+  # `exists` prints nothing, so its status is all there is. `rm` and `rmi`
+  # run with `--ignore`, which already exits 0 for an absent object; their 1
+  # is any error whose text says "no such container", or for `rmi` also
+  # "layer not known" (a damaged store), so only the text can tell.
+  defp by_status(:exists, 1), do: {:error, :not_found}
   defp by_status(:remove_image, 2), do: {:error, :in_use}
   defp by_status(_verb, _status), do: nil
 

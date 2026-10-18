@@ -46,3 +46,15 @@ In `cli_results.txt`, `fx_unhealthy` ran `--health-cmd false --health-retries 2`
 paused, and `fx_logs` printed one line to stdout and one to stderr. Its
 `pull` entry was captured to a file inside the container, because
 `docker exec` of a `podman pull` returns early and loses the output and status.
+
+The entries from `container exists -- ghost` on are the removal verbs with
+the exact argv `Engine.Podman` passes, recorded later in a store of their
+own (`--root`/`--runroot` in a temp dir, image loaded from the default
+store). There `fx_stopped` was created and never started, `fx_running` and
+`fx_paused` ran `sleep 3600` (the latter then paused), `fx_child` was
+created with `--network container:fx_parent`, `localhost/fx-unused:1` and
+`localhost/fx-used:1` tagged `alpine:3.20`, and `fx_user` was created from
+`fx-used:1`; the last `rmi` ran once the other tags were gone. No `--ignore`
+run exited 1: per podman's source, `rm` sets 1 for any error whose text
+contains "no such container" and `rmi` for a missing image or layer, which
+the classifier therefore reads by text.

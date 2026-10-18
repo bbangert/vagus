@@ -115,7 +115,9 @@ defmodule Vagus.Runtime.Engine.PodmanLiveTest do
   end
 
   defp cleanup(opts) do
-    for n <- [@x, @h, "vagus_live_y"], do: Engine.remove(n, opts)
+    # vagus_live_y first: it may share vagus_live_x's network namespace,
+    # and podman refuses to remove a container others depend on.
+    for n <- ["vagus_live_y", @x, @h], do: Engine.remove(n, opts)
   end
 
   defp spec do
@@ -229,6 +231,25 @@ defmodule Vagus.Runtime.Engine.PodmanLiveTest do
     assert Engine.exec(ghost, ["true"], opts) == {:error, :not_found}
     assert Engine.healthcheck(ghost, opts) == {:error, :not_found}
     assert Engine.remove(ghost, opts) == :ok
+  end
+
+  test "a removal podman refuses is an error, not :ok", %{opts: opts} do
+    {:ok, _} = Engine.create(spec(), opts)
+
+    {:ok, _} =
+      Cmd.run(
+        ["create", "--name", "vagus_live_y", "--network", "container:" <> @x, @image, "true"],
+        timeout_ms: 30_000,
+        podman_bin: opts[:podman_bin],
+        host: opts[:host]
+      )
+
+    assert {:error, {:failed, :remove, detail}} = Engine.remove(@x, opts)
+    assert detail =~ "has dependent containers"
+    assert {:ok, %Container{}} = Engine.inspect(@x, opts)
+
+    assert :ok = Engine.remove("vagus_live_y", opts)
+    assert :ok = Engine.remove(@x, opts)
   end
 
   test "create failures", %{opts: opts} do
