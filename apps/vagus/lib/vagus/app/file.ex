@@ -10,9 +10,9 @@ defmodule Vagus.App.File do
   Loading never bricks a boot. `Config.parse/1` re-validates the config, so a
   file it rejects, or one that is not JSON, is logged and its app is not
   started; it is never taken for a slug with no file, which an install would
-  overwrite. Every other field decodes tolerantly to its default, except
-  `protected`, which falls back to `true` because it gates `full_access`,
-  `host_pid` and `docker_api`.
+  overwrite. `stub/2` is what such an app is uninstalled with. Every other
+  field decodes tolerantly to its default, except `protected`, which falls
+  back to `true` because it gates `full_access`, `host_pid` and `docker_api`.
 
   A decoded file whose ingress token had to be minted carries `rewrite:
   true`: its owner saves it once, or each read would mint another and the
@@ -43,6 +43,34 @@ defmodule Vagus.App.File do
            do: decode(slug, raw)
     else
       :error
+    end
+  end
+
+  @doc """
+  What uninstalling an app whose file `read/2` refuses needs: its slug, plus
+  the image, ingress flag and backend when the file still names them validly,
+  so the image and the Core panel go as a normal uninstall's do. Built
+  through `Config.parse/1`, so nothing the file says is used unvalidated, and
+  never started.
+  """
+  @spec stub(String.t(), String.t()) :: Config.t()
+  def stub(slug, dir \\ dir()) do
+    fields =
+      with {:ok, content} <- read_file(path(dir, slug)),
+           {:ok, %{"config" => raw}} when is_map(raw) <- Jason.decode(content) do
+        Map.take(raw, ~w(name version image ingress backend))
+      else
+        _unreadable -> %{}
+      end
+
+    base = %{"name" => slug, "version" => "unknown", "slug" => slug, "description" => slug}
+
+    case Config.parse(base |> Map.merge(fields) |> Map.put("arch", [])) do
+      {:ok, config} ->
+        config
+
+      {:error, _reason} ->
+        %Config{slug: slug, name: slug, version: "unknown", description: "", arch: []}
     end
   end
 

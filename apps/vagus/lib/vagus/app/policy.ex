@@ -192,6 +192,7 @@ defmodule Vagus.App.Policy do
       discovery: %{},
       released: [],
       gone: false,
+      refused: false,
       run: nil,
       shutting_down: false
     }
@@ -484,6 +485,12 @@ defmodule Vagus.App.Policy do
 
   defp do_admit(:install, :new), do: :ok
   defp do_admit(_op, :new), do: {:error, :not_installed}
+  # A file that no longer loads holds an app the user can only remove: its
+  # config is a stub, and acting on it would start or save something else.
+  defp do_admit(:uninstall, :refused), do: :ok
+  defp do_admit(op, :refused) when op in [:halt, :resume, :boot_start], do: :noop
+  defp do_admit(:install, :refused), do: {:error, :corrupt_file}
+  defp do_admit(_op, :refused), do: {:error, :refused}
   defp do_admit(:install, _state), do: {:error, :already_installed}
   defp do_admit(:halt, :shutting_down), do: :noop
   defp do_admit(:resume, :shutting_down), do: :ok
@@ -602,8 +609,10 @@ defmodule Vagus.App.Policy do
   `Addon.Info.render` and the router read.
   """
   @spec snapshot(map()) :: map()
-  def snapshot(data),
-    do: data |> Map.take(@persisted) |> Map.put(:state, derive(:idle, data))
+  def snapshot(data) do
+    state = if data[:refused], do: :unknown, else: derive(:idle, data)
+    data |> Map.take(@persisted) |> Map.put(:state, state)
+  end
 
   @doc """
   The run for `op`, or why it cannot begin: an update needs a newer version

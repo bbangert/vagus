@@ -217,6 +217,23 @@ defmodule Vagus.App.FileTest do
       assert "core_mosquitto" in AppFile.saved(dir)
     end
 
+    test "stub/2 keeps only what an uninstall needs, and only when it validates",
+         %{config: c, dir: dir} do
+      raw = c |> Config.to_persistable() |> Map.merge(%{"image" => "x/{arch}", "ingress" => true})
+      put_raw(dir, "core_mosquitto", %{"config" => Map.put(raw, "privileged", ["ALL"])})
+
+      assert %Config{slug: "core_mosquitto", image: "x/{arch}", version: "7.1.0", ingress: true} =
+               stub = AppFile.stub("core_mosquitto", dir)
+
+      assert {stub.privileged, stub.host_network, stub.full_access} == {[], false, false}
+
+      put_raw(dir, "core_mosquitto", %{"config" => %{raw | "version" => "../1"}})
+      assert %Config{image: nil, version: "unknown"} = AppFile.stub("core_mosquitto", dir)
+
+      File.write!(Path.join(dir, "core_mosquitto.json"), "{{{")
+      assert %Config{slug: "core_mosquitto", image: nil} = AppFile.stub("core_mosquitto", dir)
+    end
+
     test "a file that is not JSON is an error, not raised and not taken for no file", %{
       dir: dir
     } do

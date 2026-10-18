@@ -695,40 +695,80 @@ defmodule Vagus.App.ServerTest do
       assert {:ok, %{config: %{version: "2"}}} = AppFile.read(slug)
     end
 
-    test "a file that does not decode starts no process, and is logged" do
+    test "a file that does not decode comes up refused, and is logged" do
       slug = slug()
       path = Path.join(AppFile.dir(), slug <> ".json")
       File.mkdir_p!(AppFile.dir())
       File.write!(path, "{{{")
-      on_exit(fn -> File.rm(path) end)
+      on_exit(fn -> forget_app(slug) end)
 
-      assert ExUnit.CaptureLog.capture_log(fn -> assert :ignore = Instances.ensure(slug) end) =~
-               "cannot be read"
+      log = ExUnit.CaptureLog.capture_log(fn -> assert {:ok, pid} = Instances.ensure(slug) end)
+      assert log =~ "cannot be read"
+      assert :refused = state(pid_of(slug))
     end
 
     # The config is how an earlier release saved it, before `privileged:` was
     # checked: wanted started, so boot would otherwise start it with `ALL`.
-    test "a saved app asking for a capability outside the allowlist is refused, not started" do
+    test "a saved app asking for a capability outside the allowlist takes nothing but an uninstall" do
       slug = slug()
       path = Path.join(AppFile.dir(), slug <> ".json")
       raw = slug |> app_config() |> Vagus.Addon.Config.to_persistable()
       File.mkdir_p!(AppFile.dir())
-
-      File.write!(
-        path,
-        Jason.encode!(%{"config" => Map.put(raw, "privileged", ["ALL"]), "wanted" => "started"})
-      )
-
-      on_exit(fn -> File.rm(path) end)
+      body = %{"config" => Map.put(raw, "privileged", ["ALL"]), "wanted" => "started"}
+      File.write!(path, Jason.encode!(body))
+      on_exit(fn -> forget_app(slug) end)
 
       log =
-        ExUnit.CaptureLog.capture_log(fn -> assert :ignore = Instances.ensure(slug) end)
+        ExUnit.CaptureLog.capture_log(fn -> assert {:ok, _pid} = Instances.ensure(slug) end)
 
       assert log =~ ~s(unknown capability "ALL")
       assert log =~ "not started"
+      pid = pid_of(slug)
+
+      for {command, reply} <- [
+            {{:start, %{}}, {:error, :refused}},
+            {{:boot_start, %{running?: true}}, :ok},
+            {{:halt, %{}}, :ok},
+            {{:resume, %{}}, :ok},
+            {{:install, %{config: app_config(slug), wanted: :started}}, {:error, :corrupt_file}}
+          ],
+          do: assert({command, reply} == {command, :gen_statem.call(pid, command)})
+
+      assert {:error, :not_installed} = :gen_statem.call(pid, {:set, [watchdog: true]})
+      assert {:error, :unavailable} = :gen_statem.call(pid, {:provide_service, "mqtt", %{}})
+      send(pid, {:engine_event, %Event{action: :start, id: "x"}})
       refute_receive {:step, _name, _input, _task}, 100
-      assert [] = lookup({:slug, slug})
+      assert :refused = state(pid)
+      assert File.read!(path) == Jason.encode!(body)
       assert %{state: :unknown} = Enum.find(App.list(), &(&1.config.slug == slug))
+
+      t = op(pid, {:uninstall, %{}})
+      stop = answer(:stop, {:ok, %{was_running: false}})
+      assert stop.config.slug == slug
+      removal = answer(:remove_app, {:ok, :ok})
+      refute File.exists?(path)
+      # The stub keeps what the image removal needs, and nothing it must not.
+      assert {removal.config.image, removal.config.privileged} == {"x/y", []}
+      assert :ok = Task.await(t)
+      refute Enum.any?(App.list(), &(&1.config.slug == slug))
+    end
+
+    test "a refused app whose uninstall fails keeps its file as it was, and stays refused" do
+      slug = slug()
+      path = Path.join(AppFile.dir(), slug <> ".json")
+      File.mkdir_p!(AppFile.dir())
+      File.write!(path, "{{{")
+      on_exit(fn -> forget_app(slug) end)
+      ExUnit.CaptureLog.capture_log(fn -> {:ok, _pid} = Instances.ensure(slug) end)
+      pid = pid_of(slug)
+
+      t = op(pid, {:uninstall, %{}})
+      answer(:stop, {:error, :engine_down})
+      # The cleanup that follows a failed stop, by name.
+      answer(:stop, {:error, :engine_down})
+      assert {:error, {:stop, :engine_down}} = Task.await(t)
+      assert File.read!(path) == "{{{"
+      assert :refused = state(pid)
     end
 
     test "two apps that picked one dynamic port: the second to claim it fails its start" do
