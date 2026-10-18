@@ -807,10 +807,17 @@ defmodule Vagus.Core.LifecycleTest do
   describe "safe_mode marker over an existing entry" do
     test "an existing regular marker is left as-is" do
       dir = tmp_config_dir()
-      File.write!(Path.join(dir, "safe-mode"), "")
+      marker = Path.join(dir, "safe-mode")
+      File.write!(marker, "seeded")
+      File.touch!(marker, 1_000_000_000)
+      before = File.lstat!(marker, time: :posix)
 
       assert {:ok, [:restart]} = ok_verbs(safe_restart(dir))
-      assert_regular_empty_marker(dir)
+      after_op = File.lstat!(marker, time: :posix)
+      assert after_op.type == :regular
+      assert File.read!(marker) == "seeded"
+      assert after_op.mtime == before.mtime
+      assert after_op.inode == before.inode
     end
 
     test "a symlink at the marker name is replaced, its target untouched" do
