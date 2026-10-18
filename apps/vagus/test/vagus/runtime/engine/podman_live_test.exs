@@ -5,9 +5,10 @@ defmodule Vagus.Runtime.Engine.PodmanLiveTest do
   # present and a `hassio` network. The shared contract suite cannot run
   # here: it pins ids, timestamps and failures no real engine reproduces, so
   # this suite checks the same behaviours on real containers. It creates and
-  # removes only `vagus_live_*` containers. Log follow and the events source
-  # read files podman writes, which through the wrapper live in another
-  # container, so they are covered on recorded output only.
+  # removes only `vagus_live_*` containers (through the wrapper, in a store
+  # of the run's own, which it empties at the end). Log follow and the
+  # events source read files podman writes, which through the wrapper live
+  # in another container, so they are covered on recorded output only.
   use ExUnit.Case, async: false
 
   @moduletag :podman
@@ -18,20 +19,32 @@ defmodule Vagus.Runtime.Engine.PodmanLiveTest do
   alias Vagus.Runtime.Podman.Cmd
   alias Vagus.Test.EngineContract, as: C
 
+  require Logger
+
   @image "docker.io/library/alpine:3.20"
   @x "vagus_live_x"
   @h "vagus_live_h"
 
   setup_all do
     bin = System.get_env("VAGUS_PODMAN_BIN") || System.find_executable("podman") || "podman"
-    root = Path.join(System.tmp_dir!(), "vagus-live-#{System.unique_integer([:positive])}")
+    run = System.fetch_env!("VAGUS_PODMAN_RUN")
+    # The run id, not just a VM-local integer: through the wrapper this path
+    # also exists in the shared podman container.
+    root = Path.join(System.tmp_dir!(), "vagus-live-#{run}")
     name = :vagus_live_host
     logs = Path.join(root, "logs")
     # Through the wrapper podman runs in another container, where conmon
     # needs the log directory too.
     in_container = String.ends_with?(bin, "podman_docker_exec.sh")
     container = System.get_env("VAGUS_PODMAN_CONTAINER", "vagus-podman-fixtures")
-    if in_container, do: {_, 0} = System.cmd("docker", ["exec", container, "mkdir", "-p", logs])
+
+    # First, so a seed that fails part-way is still cleaned up.
+    on_exit(fn ->
+      File.rm_rf(root)
+      if in_container, do: drop_store(bin, container, run, root)
+    end)
+
+    if in_container, do: seed_store(bin, container, logs, root)
 
     {:ok, pid} =
       Vagus.Runtime.Host.start_link(
@@ -59,12 +72,46 @@ defmodule Vagus.Runtime.Engine.PodmanLiveTest do
     on_exit(fn ->
       cleanup(opts)
       Process.exit(pid, :kill)
-      File.rm_rf(root)
-      if in_container, do: System.cmd("docker", ["exec", container, "rm", "-rf", root])
     end)
 
     Enum.find(1..300, fn _ -> Engine.ready(opts) == :ok or (Process.sleep(50) && false) end)
-    %{opts: opts, logs: logs}
+    %{opts: opts, logs: logs, own_store?: in_container}
+  end
+
+  # The wrapper's per-run store starts empty, and every test but the pull
+  # expects the image already there; copying it from the container's
+  # default store spares each run a registry pull.
+  defp seed_store(bin, container, logs, root) do
+    tar = Path.join(root, "image.tar")
+    cmd!("docker", ["exec", container, "mkdir", "-p", logs])
+    cmd!(bin, ["save", "-o", tar, @image], env: [{"VAGUS_PODMAN_RUN", nil}])
+    cmd!(bin, ["load", "--quiet", "-i", tar])
+  end
+
+  defp cmd!(bin, args, opts \\ []) do
+    case System.cmd(bin, args, [stderr_to_stdout: true] ++ opts) do
+      {_, 0} -> :ok
+      {out, status} -> raise "#{Enum.join([bin | args], " ")} exited #{status}: #{out}"
+    end
+  end
+
+  # Not `podman system reset`: with `--root` it still deletes every network,
+  # and network configs are shared by all stores, the `hassio` one included.
+  # The directories are the ones the wrapper derives from the run id.
+  defp drop_store(bin, container, run, root) do
+    dirs = [root, "/var/lib/vagus-test/#{run}", "/run/vagus-test/#{run}"]
+
+    for {cmd, args} <- [
+          {bin, ["rm", "--all", "--force", "--time", "0"]},
+          {bin, ["rmi", "--all", "--force"]},
+          {"docker", ["exec", container, "rm", "-rf" | dirs]}
+        ] do
+      with {out, status} when status != 0 <- System.cmd(cmd, args, stderr_to_stdout: true),
+           do:
+             Logger.warning(
+               "drop_store: #{Enum.join([cmd | args], " ")} exited #{status}: #{out}"
+             )
+    end
   end
 
   defp cleanup(opts) do
@@ -198,7 +245,17 @@ defmodule Vagus.Runtime.Engine.PodmanLiveTest do
              {:error, {:failed, :create, :network_not_found}}
   end
 
-  test "a pull goes through docker:// and lands under the plain ref", %{opts: opts} do
+  test "a pull goes through docker:// and lands under the plain ref", ctx do
+    %{opts: opts} = ctx
+
+    # Only the run's own store may lose the image; on a real host's store it
+    # can be in use, and the pull then only proves podman answered.
+    if ctx.own_store? do
+      cleanup(opts)
+      assert Engine.remove_image(@image, opts) == :ok
+      assert Engine.image_present?(@image, opts) == false
+    end
+
     assert Engine.pull(@image, opts) == :ok
     assert Engine.image_present?(@image, opts) == true
     assert {:ok, %Container{image: @image}} = create_x(opts)

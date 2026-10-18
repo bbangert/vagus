@@ -29,6 +29,13 @@ Mox.stub_with(Vagus.Backend.OSMock, Vagus.Backend.OS.HostStub)
 # lifecycle fixes; run them with `mix test --include known_failing`.
 ExUnit.start(exclude: [:podman, :block_device, :known_failing])
 
+# Read by test/support/podman_docker_exec.sh, which gives each run its own
+# podman store: two suites at once would otherwise share container names.
+System.put_env(
+  "VAGUS_PODMAN_RUN",
+  "r#{System.pid()}-#{Base.encode16(:crypto.strong_rand_bytes(4), case: :lower)}"
+)
+
 # At VM exit rather than `ExUnit.after_suite/1`: that runs after every pass of
 # `--repeat-until-failure`, and the app processes started at boot read from it.
 System.at_exit(fn _status ->
