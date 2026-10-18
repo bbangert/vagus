@@ -143,6 +143,13 @@ defmodule Vagus.Runtime.Engine.PodmanLiveTest do
     }
   end
 
+  # Tests reuse the same few names, and a failed or partial one (the paused
+  # test leaves vagus_live_y behind) would make the next create conflict.
+  setup %{opts: opts} do
+    cleanup(opts)
+    :ok
+  end
+
   test "the engine is ready", %{opts: opts} do
     assert Engine.ready(opts) == :ok
   end
@@ -273,7 +280,6 @@ defmodule Vagus.Runtime.Engine.PodmanLiveTest do
     # Only the run's own store may lose the image; on a real host's store it
     # can be in use, and the pull then only proves podman answered.
     if ctx.own_store? do
-      cleanup(opts)
       assert Engine.remove_image(@image, opts) == :ok
       assert Engine.image_present?(@image, opts) == false
     end
