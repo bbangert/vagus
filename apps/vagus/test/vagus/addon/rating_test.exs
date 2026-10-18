@@ -43,7 +43,21 @@ defmodule Vagus.Addon.RatingTest do
       assert score(%{"privileged" => ["SYS_ADMIN"]}) == 4
       assert score(%{"privileged" => ["NET_RAW"]}) == 4
       # Not in upstream's tuple — the check is a named set, not "any capability".
-      assert score(%{"privileged" => ["CHOWN"]}) == 5
+      assert score(%{"privileged" => ["SYS_NICE"]}) == 5
+    end
+
+    # Upstream's tuple in `rating_security` (supervisor/apps/utils.py). Every
+    # capability the config accepts lands on exactly one side of it.
+    @dangerous ~w(BPF CHECKPOINT_RESTORE DAC_READ_SEARCH NET_ADMIN NET_RAW
+                  PERFMON SYS_ADMIN SYS_MODULE SYS_PTRACE SYS_RAWIO)
+
+    test "the dangerous set is upstream's, and inside the config's allowlist" do
+      assert @dangerous -- Config.capabilities() == []
+
+      for cap <- Config.capabilities() do
+        expected = if cap in @dangerous, do: 4, else: 5
+        assert {cap, score(%{"privileged" => [cap]})} == {cap, expected}
+      end
     end
 
     test "supervisor role derates by seniority" do

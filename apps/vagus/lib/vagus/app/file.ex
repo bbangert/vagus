@@ -235,7 +235,15 @@ defmodule Vagus.App.File do
          protected: decode_protected(raw)
        }}
     else
-      _ -> skip(slug)
+      # A config an earlier release accepted can fail a rule added since,
+      # e.g. a capability outside the allowlist; the reason is what the user
+      # needs to see why the app no longer starts.
+      {:error, reason} when is_binary(reason) ->
+        Logger.warning("Vagus.App.File: skipping app #{inspect(slug)}: #{reason}")
+        {:error, :invalid}
+
+      _ ->
+        skip(slug)
     end
   end
 

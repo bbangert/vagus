@@ -196,7 +196,25 @@ defmodule Vagus.App.FileTest do
               do: assert({:error, :invalid} = AppFile.read(slug, dir))
         end)
 
-      assert log =~ "skipping invalid or mismatched app \"vagus\""
+      assert log =~ ~s(skipping app "vagus": slug 'vagus' is reserved)
+    end
+
+    # An earlier release persisted `privileged:` without checking it. Such an
+    # app is refused, with the reason logged, and never started with the
+    # capability; its file stays, so the app is still listed as installed.
+    test "a saved config with a capability outside the allowlist is skipped with its reason",
+         %{config: c, dir: dir} do
+      body = file_body(c) |> put_in(["config", "privileged"], ["NET_ADMIN", "ALL"])
+      put_raw(dir, "core_mosquitto", body)
+
+      log =
+        capture_log(fn ->
+          assert {:error, :invalid} = AppFile.read("core_mosquitto", dir)
+        end)
+
+      assert log =~ ~s(skipping app "core_mosquitto")
+      assert log =~ ~s(unknown capability "ALL")
+      assert "core_mosquitto" in AppFile.saved(dir)
     end
 
     test "a file that is not JSON is an error, not raised and not taken for no file", %{
@@ -320,6 +338,21 @@ defmodule Vagus.App.FileTest do
 
       log = capture_log(fn -> assert {:ok, 3} = AppFile.import_once(dir, legacy) end)
       assert log =~ "broken"
+    end
+
+    test "an entry asking for a capability outside the allowlist is not imported, with its reason",
+         %{dir: dir, legacy: legacy} do
+      %{"addons" => addons} = Jason.decode!(File.read!(legacy))
+
+      addons =
+        put_in(addons, ["core_ssh", "config", "privileged"], ["SYS_ADMIN", "CAP_SYS_ADMIN"])
+
+      File.write!(legacy, Jason.encode!(%{"version" => 1, "addons" => addons}))
+
+      log = capture_log(fn -> assert {:ok, 2} = AppFile.import_once(dir, legacy) end)
+      assert log =~ ~s(skipping app "core_ssh")
+      assert log =~ ~s(unknown capability "CAP_SYS_ADMIN")
+      assert Enum.sort(AppFile.saved(dir)) == ["core_mqtt", "esphome_esphome"]
     end
 
     test "with no addons.json the directory is created empty", %{dir: dir, tmp_dir: tmp} do

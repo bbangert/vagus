@@ -94,6 +94,43 @@ defmodule Vagus.Addon.ConfigTest do
     end
   end
 
+  describe "privileged: capabilities" do
+    # Upstream's `Capabilities` enum (supervisor/docker/const.py), written out
+    # here rather than read from Config so a change to either side shows.
+    @upstream_caps ~w(AUDIT_WRITE BPF CHECKPOINT_RESTORE DAC_READ_SEARCH IPC_LOCK
+                      MKNOD NET_ADMIN NET_RAW PERFMON SETFCAP SYS_ADMIN SYS_MODULE
+                      SYS_NICE SYS_PTRACE SYS_RAWIO SYS_RESOURCE SYS_TIME)
+
+    test "the allowlist is exactly upstream's enum" do
+      assert Enum.sort(Config.capabilities()) == Enum.sort(@upstream_caps)
+    end
+
+    test "each upstream capability is accepted, alone and all together" do
+      for cap <- @upstream_caps do
+        assert {:ok, %Config{privileged: [^cap]}} =
+                 Config.parse(Map.put(@required, "privileged", [cap]))
+      end
+
+      assert {:ok, %Config{privileged: @upstream_caps}} =
+               Config.parse(Map.put(@required, "privileged", @upstream_caps))
+    end
+
+    test "a value outside the enum invalidates the config and is named" do
+      for bad <- ["ALL", "CAP_SYS_ADMIN", "sys_admin", "NOT_A_CAP", "CHOWN"] do
+        assert {:error, msg} = Config.parse(Map.put(@required, "privileged", [bad]))
+        assert msg =~ "privileged"
+        assert msg =~ inspect(bad)
+      end
+    end
+
+    test "one bad value among good ones still invalidates the config" do
+      assert {:error, msg} =
+               Config.parse(Map.put(@required, "privileged", ["NET_ADMIN", "ALL", "SYS_TIME"]))
+
+      assert msg =~ ~s("ALL")
+    end
+  end
+
   describe "ingress + panel config (§B3.1)" do
     test "new fields parse with their documented defaults" do
       assert {:ok, c} = Config.parse(@required)

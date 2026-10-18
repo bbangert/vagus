@@ -706,6 +706,31 @@ defmodule Vagus.App.ServerTest do
                "cannot be read"
     end
 
+    # The config is how an earlier release saved it, before `privileged:` was
+    # checked: wanted started, so boot would otherwise start it with `ALL`.
+    test "a saved app asking for a capability outside the allowlist is refused, not started" do
+      slug = slug()
+      path = Path.join(AppFile.dir(), slug <> ".json")
+      raw = slug |> app_config() |> Vagus.Addon.Config.to_persistable()
+      File.mkdir_p!(AppFile.dir())
+
+      File.write!(
+        path,
+        Jason.encode!(%{"config" => Map.put(raw, "privileged", ["ALL"]), "wanted" => "started"})
+      )
+
+      on_exit(fn -> File.rm(path) end)
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn -> assert :ignore = Instances.ensure(slug) end)
+
+      assert log =~ ~s(unknown capability "ALL")
+      assert log =~ "not started"
+      refute_receive {:step, _name, _input, _task}, 100
+      assert [] = lookup({:slug, slug})
+      assert %{state: :unknown} = Enum.find(App.list(), &(&1.config.slug == slug))
+    end
+
     test "two apps that picked one dynamic port: the second to claim it fails its start" do
       ingress = %{"ingress" => true, "ingress_port" => 0}
       {a, pa} = installed(ingress)
