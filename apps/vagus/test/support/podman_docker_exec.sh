@@ -147,6 +147,10 @@ until docker exec "$c" test -f "$id.rc"; do
   sleep 0.05
 done
 
+# podman has exited, so a signal from here on has nothing to cancel, and a
+# reap would leave `.cancel` behind for a launch that already finished.
+trap 'docker exec "$c" rm -f "$id.out" "$id.rc" "$id.pid" >/dev/null 2>&1; exit 143' TERM INT HUP
+
 if [ -n "$quiet" ]; then
   docker exec "$c" cat "$id.out" >&2
 else
