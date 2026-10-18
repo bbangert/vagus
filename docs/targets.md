@@ -60,13 +60,14 @@ plain `ssh <ip> '<expr>'` still works). `-o SendEnv=-*` did not stop it in
 testing. Upload without the system config instead:
 
 ```sh
-cat ../../_build/dragon_q6a_prod/nerves/images/vagus_platform.fw |
-  env -u LANG -u LC_ALL ssh -F /dev/null -o StrictHostKeyChecking=no \
-    -o UserKnownHostsFile=/dev/null -s <device-ip> fwup
+cat ../../_build/dragon_q6a_dev/nerves/images/vagus_platform.fw |
+  env -u LANG -u LC_ALL ssh -F /dev/null -s <device-ip> fwup
 ```
 
-`-F /dev/null` also skips your `~/.ssh/config`, so pass any key or user
-options it held on the command line.
+The path follows the build's `MIX_ENV` (`dev` above; `_prod` for a
+`MIX_ENV=prod` build). `-F /dev/null` also skips your `~/.ssh/config`, so
+pass any key or user options it held on the command line; host keys are
+still checked against `~/.ssh/known_hosts`.
 
 The Nerves *system* build alone produces `rootfs.squashfs`, `Image` and
 `fwup.conf` — but **no `.fw` bundle**. That comes from `mix firmware` here,
