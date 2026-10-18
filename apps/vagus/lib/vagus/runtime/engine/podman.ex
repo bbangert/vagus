@@ -201,8 +201,19 @@ defmodule Vagus.Runtime.Engine.Podman do
                @lifecycle_ms
              )
            ) do
-      {:ok, out |> String.trim() |> String.split("\n") |> List.last()}
+      created_id(out)
     end
+  end
+
+  # podman exits 0 even when the out tmpfs filled before it printed the id,
+  # and room freed by then hides that from Cmd: only the id's own shape
+  # tells a cut-short answer from a real one.
+  defp created_id(out) do
+    id = out |> String.trim() |> String.split("\n") |> List.last()
+
+    if Regex.match?(~r/\A[0-9a-f]{64}\z/, id),
+      do: {:ok, id},
+      else: {:error, {:failed, :create, {:bad_id, Error.detail(out)}}}
   end
 
   @impl true

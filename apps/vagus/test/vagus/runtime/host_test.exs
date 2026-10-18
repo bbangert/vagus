@@ -234,7 +234,7 @@ defmodule Vagus.Runtime.HostTest do
         end)
 
       assert log =~ "no tmpfs for #{dir}"
-      assert log =~ "it stays on /run"
+      assert log =~ "logs stay on /run"
       log
     end
 
@@ -275,7 +275,7 @@ defmodule Vagus.Runtime.HostTest do
           assert start_host(ctx, run: run) == :ok
         end)
 
-      assert log =~ "it stays on /run"
+      assert log =~ "logs stay on /run"
       assert File.dir?(Path.join(ctx.root, "run/vagus/logs"))
     end
   end
@@ -289,7 +289,7 @@ defmodule Vagus.Runtime.HostTest do
       start_host(ctx)
       args = ["-t", "tmpfs", "-o", "size=#{5 * 1_048_576}," <> @opts, "tmpfs", dir]
       assert_receive {:step, {"mount", ^args}}, 5_000
-      assert Host.out_dir(ctx.name) == dir
+      assert Host.out_dir(ctx.name) == {:ok, dir}
       assert File.stat!(dir).mode |> Bitwise.band(0o777) == 0o700
     end
 
@@ -310,6 +310,20 @@ defmodule Vagus.Runtime.HostTest do
       assert_receive {:step, {"mount", ["-t", "tmpfs", "-o", _, "tmpfs", ^dir]}}, 5_000
     end
 
+    # Split calls then stay merged, as they were before the out dir existed.
+    test "is not published when its tmpfs cannot be mounted, and says so once", ctx do
+      dir = Path.join(ctx.root, "run/vagus/podman/out")
+
+      run = fn
+        "mount", ["-t", "tmpfs", "-o", _, "tmpfs", ^dir] -> {"mount: permission denied", 32}
+        _bin, _args -> {"", 0}
+      end
+
+      log = ExUnit.CaptureLog.capture_log(fn -> assert start_host(ctx, run: run) == :ok end)
+      assert Host.out_dir(ctx.name) == :unbounded
+      assert [_once] = Regex.scan(~r/no tmpfs for #{Regex.escape(dir)}.*stays merged/, log)
+    end
+
     test "is not published before the Host has prepared it", ctx do
       run = fn
         "mount", ["--make-rshared", "/"] -> receive(do: (:go -> {"", 0}))
@@ -318,10 +332,10 @@ defmodule Vagus.Runtime.HostTest do
 
       pid = start_supervised!({Host, host_opts(ctx, run: run)})
       assert Host.ready(ctx.name) == {:error, :preparing}
-      refute Host.out_dir(ctx.name)
+      assert Host.out_dir(ctx.name) == :unbounded
       send(pid, :go)
       assert await_ready(ctx.name) == :ok
-      assert Host.out_dir(ctx.name) == Path.join(ctx.root, "run/vagus/podman/out")
+      assert Host.out_dir(ctx.name) == {:ok, Path.join(ctx.root, "run/vagus/podman/out")}
     end
   end
 

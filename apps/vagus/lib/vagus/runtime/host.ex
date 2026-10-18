@@ -135,10 +135,18 @@ defmodule Vagus.Runtime.Host do
 
   @doc """
   Where split podman calls (`Runtime.Podman.Cmd`'s `:stderr_apart`) write
-  their stdout, once this Host has prepared it; `nil` before.
+  their stdout: `{:ok, dir}` once this Host has its own bounded tmpfs
+  there, `:unbounded` while it has none (preparing, or the mount failed),
+  `:unavailable` with no Host.
   """
-  @spec out_dir(atom() | nil) :: String.t() | nil
-  def out_dir(host), do: shared(host)[:out_dir]
+  @spec out_dir(atom() | nil) :: {:ok, String.t()} | :unbounded | :unavailable
+  def out_dir(host) do
+    case shared(host) do
+      %{out_dir: dir} when is_binary(dir) -> {:ok, dir}
+      %{status: _} -> :unbounded
+      _none -> :unavailable
+    end
+  end
 
   @doc """
   Records `path` as the calling permit holder's stdout file, removed should
@@ -412,7 +420,7 @@ defmodule Vagus.Runtime.Host do
     ensure_private_dir(out_dir_of(state.opts))
     write_resolv_conf(state.opts)
     state = state |> apply_profile() |> publish(:preparing)
-    mount_tmpfs(log_dir(state.opts), @log_tmpfs_bytes[state.profile], state.opts)
+    mount_logs(state.opts, @log_tmpfs_bytes[state.profile])
     state = prepare_out_dir(state)
     clear_spool_once(state.opts)
     state = state |> prepare_migration() |> publish(:preparing)
@@ -734,8 +742,8 @@ defmodule Vagus.Runtime.Host do
   defp mount_tmpfs(dir, bytes, opts) do
     case mount_at(dir, Keyword.get(opts, :mountinfo, "/proc/self/mountinfo")) do
       {:ok, "tmpfs"} -> :ok
-      {:ok, fstype} -> keep_plain(dir, "#{fstype} is mounted there")
-      {:error, reason} -> keep_plain(dir, "mountinfo unreadable (#{inspect(reason)})")
+      {:ok, fstype} -> {:plain, "#{fstype} is mounted there"}
+      {:error, reason} -> {:plain, "mountinfo unreadable (#{inspect(reason)})"}
       :none -> mount_if_empty(dir, bytes, opts)
     end
   end
@@ -749,19 +757,23 @@ defmodule Vagus.Runtime.Host do
 
         case run.("mount", ["-t", "tmpfs", "-o", options, "tmpfs", dir]) do
           {_out, 0} -> :ok
-          {out, status} -> keep_plain(dir, "mount failed (#{status}): #{String.trim(out)}")
+          {out, status} -> {:plain, "mount failed (#{status}): #{String.trim(out)}"}
         end
 
       {:ok, _entries} ->
-        keep_plain(dir, "it already holds files")
+        {:plain, "it already holds files"}
 
       {:error, reason} ->
-        keep_plain(dir, inspect(reason))
+        {:plain, inspect(reason)}
     end
   end
 
-  defp keep_plain(dir, why),
-    do: Logger.warning("Vagus.Runtime.Host: no tmpfs for #{dir}: #{why}; it stays on /run")
+  defp mount_logs(opts, bytes) do
+    dir = log_dir(opts)
+
+    with {:plain, why} <- mount_tmpfs(dir, bytes, opts),
+         do: Logger.warning("Vagus.Runtime.Host: no tmpfs for #{dir}: #{why}; logs stay on /run")
+  end
 
   # Split podman calls write stdout here with no pipe to hold them back, so
   # a burst past the cap could fill /run, where podman keeps its runroot,
@@ -770,7 +782,9 @@ defmodule Vagus.Runtime.Host do
   # and one more for a burst the poll has not caught yet. A fresh Host has
   # no holders, so anything already there is an orphan: from a Host that
   # died, or a podman that recreated its file after its dead caller's was
-  # removed.
+  # removed. Without that bound the dir is never published, and split calls
+  # keep stderr merged as before, where the pipe holds podman back; failing
+  # them instead would stop every inspect, list and create.
   # sobelow_skip ["Traversal.FileModule"]
   defp prepare_out_dir(state) do
     dir = out_dir_of(state.opts)
@@ -779,8 +793,19 @@ defmodule Vagus.Runtime.Host do
          do: Enum.each(entries, &File.rm_rf(Path.join(dir, &1)))
 
     calls = state.permits |> Map.values() |> Enum.sum()
-    mount_tmpfs(dir, (calls + 1) * Cmd.default_cap(), state.opts)
-    %{state | out_dir: dir}
+
+    case mount_tmpfs(dir, (calls + 1) * Cmd.default_cap(), state.opts) do
+      :ok ->
+        %{state | out_dir: dir}
+
+      {:plain, why} ->
+        Logger.warning(
+          "Vagus.Runtime.Host: no tmpfs for #{dir}: #{why}; " <>
+            "podman's stderr stays merged with the stdout Vagus parses"
+        )
+
+        %{state | out_dir: nil}
+    end
   end
 
   # The fstype of the last mount at `dir`, the one in view.

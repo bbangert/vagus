@@ -19,9 +19,11 @@ defmodule Vagus.Runtime.Podman.Cmd do
   stderr comes through muontrap, whose one output stream cannot tell the two
   apart. A warning podman prints then never lands inside the JSON a caller
   parses, and podman's error text still reaches `Runtime.Podman.Error`. The
-  file lives on the Host's own small tmpfs (`Vagus.Runtime.Host.out_dir/1`);
-  with no Host prepared a split call is `:unavailable`. The Host removes a
-  holder's file should the holder die mid-call.
+  file lives on the Host's own small tmpfs (`Vagus.Runtime.Host.out_dir/1`).
+  While the Host has none the call is merged as any other, its pipe bounding
+  podman where a file on the shared /run would not; with no Host it is
+  `:unavailable`. The Host removes a holder's file should the holder die
+  mid-call.
 
   The environment is the Host's (`Vagus.Runtime.Host.env/1`: the profile's
   Go limits and `CONTAINERS_CONF_OVERRIDE`) plus `:env`, which carries
@@ -87,11 +89,16 @@ defmodule Vagus.Runtime.Podman.Cmd do
   # answer. The path is the Host's dir and a name made here, never input.
   # sobelow_skip ["Traversal.FileModule"]
   defp run_apart(path, args, opts) do
-    case opts[:out_dir] || Vagus.Runtime.Host.out_dir(opts[:host]) do
-      nil ->
+    dir = if d = opts[:out_dir], do: {:ok, d}, else: Vagus.Runtime.Host.out_dir(opts[:host])
+
+    case dir do
+      :unavailable ->
         {:error, :unavailable}
 
-      dir ->
+      :unbounded ->
+        spawn_podman(path, @global_args ++ args, opts)
+
+      {:ok, dir} ->
         name = "podman-#{System.pid()}-#{System.unique_integer([:positive])}.out"
         out = Path.join(dir, name)
         Vagus.Runtime.Host.track_out(opts[:host], out)
