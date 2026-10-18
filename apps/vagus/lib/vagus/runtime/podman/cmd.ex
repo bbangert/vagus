@@ -14,6 +14,17 @@ defmodule Vagus.Runtime.Podman.Cmd do
   64 running at once). Here muontrap's output window covers the whole cap,
   so nothing is ever written to it.
 
+  With `:stderr_apart`, stdout goes to a file instead (podman's own
+  `--out`, which replaces Go's `os.Stdout` before the verb runs) and only
+  stderr comes through muontrap, whose one output stream cannot tell the two
+  apart. A warning podman prints then never lands inside the JSON a caller
+  parses, and podman's error text still reaches `Runtime.Podman.Error`. The
+  file lives on the Host's own small tmpfs (`Vagus.Runtime.Host.out_dir/1`).
+  While the Host has none the call is merged as any other, its pipe bounding
+  podman where a file on the shared /run would not; with no Host it is
+  `:unavailable`. The Host removes a holder's file should the holder die
+  mid-call.
+
   The environment is the Host's (`Vagus.Runtime.Host.env/1`: the profile's
   Go limits and `CONTAINERS_CONF_OVERRIDE`) plus `:env`, which carries
   secret values so they never appear on the argv.
@@ -28,40 +39,112 @@ defmodule Vagus.Runtime.Podman.Cmd do
   @type result ::
           {:ok, binary()}
           | {:exit, pos_integer(), binary()}
-          | {:error, :timeout | :unavailable | :output_too_large | :invalid_argument}
+          | {:error,
+             :timeout
+             | :unavailable
+             | :output_too_large
+             | :invalid_argument
+             | {:out_file, File.posix()}}
+
+  # How often a split call with nothing arriving on stderr rechecks its
+  # stdout file against the cap.
+  @out_poll_ms 100
+  # Every page size Linux uses is a multiple of this.
+  @page_bytes 4096
+
+  @spec default_cap() :: pos_integer()
+  def default_cap, do: @default_cap
+
+  @doc "How long a podman can outlive the port it was started from."
+  @spec kill_budget_ms() :: pos_integer()
+  def kill_budget_ms, do: @sigkill_delay_ms + 2_000
 
   @doc """
   Options: `:timeout_ms` (required), `:cap` (bytes, default 1 MiB),
   `:truncate` (past the cap keep the head instead of failing with
   `:output_too_large`), `:discard_stdout` (stdout never leaves muontrap;
-  only stderr is returned), `:env` (`[{name, value}]`), `:podman_bin`,
-  `:host`.
+  only stderr is returned), `:stderr_apart` (stdout alone on success,
+  stderr alone on failure; raises with `:discard_stdout` or `:truncate`),
+  `:out_dir` (where its stdout file goes instead of the Host's; tests),
+  `:env` (`[{name, value}]`), `:podman_bin`, `:host`.
   """
   @spec run([String.t()], keyword()) :: result()
   def run(args, opts) do
-    argv = @global_args ++ args
+    apart? = Keyword.get(opts, :stderr_apart, false)
+
+    if apart? and (opts[:discard_stdout] || opts[:truncate]),
+      do: raise(ArgumentError, ":stderr_apart takes neither :discard_stdout nor :truncate")
 
     cond do
-      Enum.any?(argv, &String.contains?(&1, <<0>>)) -> {:error, :invalid_argument}
-      path = System.find_executable(bin(opts)) -> spawn_podman(path, argv, opts)
+      Enum.any?(args, &String.contains?(&1, <<0>>)) -> {:error, :invalid_argument}
+      path = System.find_executable(bin(opts)) -> start(path, args, apart?, opts)
       true -> {:error, :unavailable}
     end
   end
 
-  # The binary comes from config or a test's opts, never from a request.
-  # sobelow_skip ["CI.System"]
+  defp start(path, args, true, opts), do: run_apart(path, args, opts)
+  defp start(path, args, false, opts), do: spawn_podman(path, @global_args ++ args, opts)
+
+  # The name is unique, so the Host's cleanup after a dead caller can only
+  # ever remove that caller's file. The Host learns it before the file
+  # exists: a caller killed in between leaves nothing to remove. A Host that
+  # holds none of the caller's permits (one from a Host since replaced)
+  # would never remove it, so the call fails before making it. The file is
+  # made here, so a successful podman whose file is gone had it removed
+  # under it (a Host restarting mid-call sweeps the dir), not an empty
+  # answer.
+  defp run_apart(path, args, opts) do
+    dir = if d = opts[:out_dir], do: {:given, d}, else: Vagus.Runtime.Host.out_dir(opts[:host])
+
+    case dir do
+      :unavailable ->
+        {:error, :unavailable}
+
+      :unbounded ->
+        spawn_podman(path, @global_args ++ args, opts)
+
+      {how, dir} ->
+        name = "podman-#{System.pid()}-#{System.unique_integer([:positive])}.out"
+        out = Path.join(dir, name)
+        # A given dir is a test's own; the Host cleans up only its own.
+        tracked = if how == :ok, do: Vagus.Runtime.Host.track_out(opts[:host], out), else: :ok
+        write_and_spawn(tracked, path, out, args, opts)
+    end
+  end
+
+  defp write_and_spawn({:error, _} = untracked, _path, _out, _args, _opts), do: untracked
+
+  # The path is the Host's dir and a name made here, never input.
+  # sobelow_skip ["Traversal.FileModule"]
+  defp write_and_spawn(:ok, path, out, args, opts) do
+    case File.write(out, "", [:exclusive]) do
+      :ok ->
+        argv = @global_args ++ ["--out=" <> out] ++ args
+        spawn_podman(path, argv, Keyword.put(opts, :out, out))
+
+      {:error, :enospc} ->
+        {:error, :output_too_large}
+
+      {:error, reason} ->
+        {:error, {:out_file, reason}}
+    end
+  after
+    File.rm(out)
+  end
+
   defp spawn_podman(path, argv, opts) do
     cap = Keyword.get(opts, :cap, @default_cap)
     truncate? = Keyword.get(opts, :truncate, false)
     window = if truncate?, do: @max_window, else: min(cap + 1, @max_window)
     env = Vagus.Runtime.Host.env(opts[:host]) ++ Keyword.get(opts, :env, [])
 
+    # A split call's podman writes stdout to its `--out` file, not fd 1.
     # Discarded stdout goes to /dev/null inside muontrap (muontrap.c, the
     # `capture_stderr_only` branch of the child's setup), so none of it ever
     # reaches the BEAM; stderr, where podman reports its own failures, is
     # still read.
     capture =
-      if Keyword.get(opts, :discard_stdout, false),
+      if Keyword.get(opts, :discard_stdout, false) or opts[:out] != nil,
         do: ["--capture-stderr-only"],
         else: ["--capture-output", "--capture-stderr"]
 
@@ -89,7 +172,7 @@ defmodule Vagus.Runtime.Podman.Cmd do
     deadline = now_ms() + Keyword.fetch!(opts, :timeout_ms)
 
     try do
-      collect(port, deadline, %{cap: cap, truncate?: truncate?, size: 0, acc: []})
+      collect(port, deadline, %{cap: cap, truncate?: truncate?, size: 0, acc: [], out: opts[:out]})
     after
       flush(port)
     end
@@ -107,11 +190,18 @@ defmodule Vagus.Runtime.Podman.Cmd do
   end
 
   # The deadline is checked before every receive: `after` only fires on an
-  # empty mailbox, so queued output would otherwise outrun it.
+  # empty mailbox, so queued output would otherwise outrun it. A split
+  # call's stdout file is checked there too: no pipe blocks a podman writing
+  # past the cap into it.
   defp collect(port, deadline, out) do
     case deadline - now_ms() do
-      left when left <= 0 -> close(port, {:error, :timeout})
-      left -> await(port, deadline, out, left)
+      left when left <= 0 ->
+        close(port, {:error, :timeout})
+
+      left ->
+        if over_cap?(out),
+          do: close(port, {:error, :output_too_large}),
+          else: await(port, deadline, out, left)
     end
   end
 
@@ -124,12 +214,61 @@ defmodule Vagus.Runtime.Podman.Cmd do
         end
 
       {^port, {:exit_status, 0}} ->
-        {:ok, output(out)}
+        if out.out, do: read_out(out), else: {:ok, output(out)}
 
       {^port, {:exit_status, status}} ->
         {:exit, status, output(out)}
     after
-      left -> close(port, {:error, :timeout})
+      wait(out, left) ->
+        if out.out, do: collect(port, deadline, out), else: close(port, {:error, :timeout})
+    end
+  end
+
+  defp wait(%{out: nil}, left), do: left
+  defp wait(_out, left), do: min(left, @out_poll_ms)
+
+  defp over_cap?(%{out: nil}), do: false
+
+  defp over_cap?(%{out: path, cap: cap}) do
+    case File.stat(path) do
+      {:ok, %{size: size}} -> size > cap
+      {:error, _} -> false
+    end
+  end
+
+  # The path is one run_apart/3 made, never input.
+  # sobelow_skip ["Traversal.FileModule"]
+  defp read_out(%{out: path, cap: cap}) do
+    with {:ok, %{size: size}} <- File.stat(path),
+         true <- size <= cap || {:error, :too_large},
+         {:ok, result} <- File.open(path, [:read, :append, :binary, :raw], &read_whole(&1, size)) do
+      result
+    else
+      {:error, :too_large} -> {:error, :output_too_large}
+      {:error, :enoent} -> {:error, :unavailable}
+      {:error, reason} -> {:error, {:out_file, reason}}
+    end
+  end
+
+  # podman exits 0 when its stdout hits a full filesystem, leaving the
+  # output cut short at a page boundary, as nothing else ends it. Such a
+  # file is probed with one more byte: ENOSPC means the cut was the tmpfs
+  # filling, not the end of podman's answer.
+  defp read_whole(fd, size) do
+    with {:ok, data} <- read_bytes(fd, size),
+         :ok <- if(rem(byte_size(data), @page_bytes) == 0, do: :file.write(fd, <<0>>), else: :ok) do
+      {:ok, data}
+    else
+      {:error, :enospc} -> {:error, :output_too_large}
+      {:error, reason} -> {:error, {:out_file, reason}}
+    end
+  end
+
+  defp read_bytes(fd, size) do
+    case :file.read(fd, size) do
+      {:ok, data} -> {:ok, data}
+      :eof -> {:ok, ""}
+      {:error, _} = error -> error
     end
   end
 
@@ -150,7 +289,7 @@ defmodule Vagus.Runtime.Podman.Cmd do
   defp close(port, result) do
     muontrap = Port.info(port, :os_pid)
     Port.close(port)
-    with {:os_pid, pid} <- muontrap, do: await_exit(pid, @sigkill_delay_ms + 2_000)
+    with {:os_pid, pid} <- muontrap, do: await_exit(pid, kill_budget_ms())
     result
   rescue
     ArgumentError -> result

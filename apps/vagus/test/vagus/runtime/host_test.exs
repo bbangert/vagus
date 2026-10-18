@@ -196,7 +196,7 @@ defmodule Vagus.Runtime.HostTest do
       dir = Path.join(ctx.root, "run/vagus/logs")
       args = ["-t", "tmpfs", "-o", "size=16777216," <> @opts, "tmpfs", dir]
       assert_receive {:step, {"mount", ^args}}, 5_000
-      refute_received {:step, {"mount", ["-t" | _]}}
+      refute_received {:step, {"mount", ["-t", "tmpfs", "-o", _, "tmpfs", ^dir]}}
     end
 
     test "is 64 MiB on fast", ctx do
@@ -219,18 +219,21 @@ defmodule Vagus.Runtime.HostTest do
 
       start_host(ctx, log_dir: dir, mountinfo: mountinfo)
       assert_receive {:step, {"mount", ["--make-rshared", "/"]}}, 5_000
-      refute_received {:step, {"mount", ["-t", "tmpfs" | _]}}
+      refute_received {:step, {"mount", ["-t", "tmpfs", "-o", _, "tmpfs", ^dir]}}
     end
 
     # Each of these keeps the plain directory and says why.
     defp refuses_to_mount(ctx, extra) do
+      dir = Keyword.get(extra, :log_dir, Path.join(ctx.root, "run/vagus/logs"))
+
       log =
         ExUnit.CaptureLog.capture_log(fn ->
           assert start_host(ctx, extra) == :ok
           assert_receive {:step, {"mount", ["--make-rshared", "/"]}}, 5_000
-          refute_received {:step, {"mount", ["-t" | _]}}
+          refute_received {:step, {"mount", ["-t", "tmpfs", "-o", _, "tmpfs", ^dir]}}
         end)
 
+      assert log =~ "no tmpfs for #{dir}"
       assert log =~ "logs stay on /run"
       log
     end
@@ -255,7 +258,7 @@ defmodule Vagus.Runtime.HostTest do
       dir = Path.join(ctx.root, "run/vagus/logs")
       File.mkdir_p!(dir)
       File.write!(Path.join(dir, "addon_local_x.log"), "live lines")
-      assert refuses_to_mount(ctx, []) =~ "already holds logs"
+      assert refuses_to_mount(ctx, []) =~ "already holds files"
       assert File.read!(Path.join(dir, "addon_local_x.log")) == "live lines"
     end
 
@@ -274,6 +277,116 @@ defmodule Vagus.Runtime.HostTest do
 
       assert log =~ "logs stay on /run"
       assert File.dir?(Path.join(ctx.root, "run/vagus/logs"))
+    end
+  end
+
+  describe "the split calls' stdout dir" do
+    @opts "mode=0700,nosuid,nodev,noexec"
+
+    # Every permit's call at the default 1 MiB cap, plus one.
+    test "gets a tmpfs sized for every permit's call at the cap, plus one", ctx do
+      dir = Path.join(ctx.root, "run/vagus/podman/out")
+      start_host(ctx)
+      args = ["-t", "tmpfs", "-o", "size=#{5 * 1_048_576}," <> @opts, "tmpfs", dir]
+      assert_receive {:step, {"mount", ^args}}, 5_000
+      assert Host.out_dir(ctx.name) == {:ok, dir}
+      assert File.stat!(dir).mode |> Bitwise.band(0o777) == 0o700
+    end
+
+    test "follows the permits it is given", ctx do
+      dir = Path.join(ctx.root, "run/vagus/podman/out")
+      start_host(ctx, permits: %{pull: 1, ops: 4, shutdown: 1})
+      args = ["-t", "tmpfs", "-o", "size=#{7 * 1_048_576}," <> @opts, "tmpfs", dir]
+      assert_receive {:step, {"mount", ^args}}, 5_000
+    end
+
+    # A fresh Host has no holders: whatever is there, nobody is writing.
+    test "is swept of earlier files when the Host prepares", ctx do
+      dir = Path.join(ctx.root, "run/vagus/podman/out")
+      File.mkdir_p!(dir)
+      File.write!(Path.join(dir, "podman-1-1.out"), "orphan")
+      start_host(ctx)
+      assert File.ls!(dir) == []
+      assert_receive {:step, {"mount", ["-t", "tmpfs", "-o", _, "tmpfs", ^dir]}}, 5_000
+    end
+
+    # Split calls then stay merged, as they were before the out dir existed.
+    test "is not published when its tmpfs cannot be mounted, and says so once", ctx do
+      dir = Path.join(ctx.root, "run/vagus/podman/out")
+
+      run = fn
+        "mount", ["-t", "tmpfs", "-o", _, "tmpfs", ^dir] -> {"mount: permission denied", 32}
+        _bin, _args -> {"", 0}
+      end
+
+      log = ExUnit.CaptureLog.capture_log(fn -> assert start_host(ctx, run: run) == :ok end)
+      assert Host.out_dir(ctx.name) == :unbounded
+      assert [_once] = Regex.scan(~r/no tmpfs for #{Regex.escape(dir)}.*stays merged/, log)
+    end
+
+    # Its snapshot outlives it; a split call would then leave a file no
+    # Host removes should its caller die.
+    test "is unavailable once the Host has stopped, and a split call fails closed", ctx do
+      start_host(ctx)
+      assert {:ok, _dir} = Host.out_dir(ctx.name)
+      stop_supervised!(ctx.name)
+      assert Host.out_dir(ctx.name) == :unavailable
+
+      assert Vagus.Runtime.Podman.Cmd.run(["ps"],
+               timeout_ms: 5_000,
+               podman_bin: "/bin/true",
+               stderr_apart: true,
+               host: ctx.name
+             ) == {:error, :unavailable}
+    end
+
+    # The holder outlived the Host it checked out from; the new Host knows
+    # nothing of its permit, so would never remove its file.
+    test "a holder of a replaced Host's permit fails closed and leaves no file", ctx do
+      dir = Path.join(ctx.root, "run/vagus/podman/out")
+      split = [timeout_ms: 5_000, podman_bin: "/bin/true", stderr_apart: true, host: ctx.name]
+      test = self()
+      start_host(ctx)
+
+      holder =
+        spawn(fn ->
+          {:ok, _stale} = Host.checkout(ctx.name, :ops, 0)
+          send(test, :held)
+          receive(do: (:run -> send(test, {:ran, Vagus.Runtime.Podman.Cmd.run(["ps"], split)})))
+          receive(do: (:never -> :ok))
+        end)
+
+      assert_receive :held, 5_000
+      stop_supervised!(ctx.name)
+      start_host(ctx)
+      send(holder, :run)
+      assert_receive {:ran, {:error, :unavailable}}, 5_000
+      assert File.ls!(dir) == []
+
+      ref = Process.monitor(holder)
+      Process.exit(holder, :kill)
+      assert_receive {:DOWN, ^ref, :process, ^holder, :killed}
+      :sys.get_state(ctx.name)
+      assert File.ls!(dir) == []
+
+      # The same call from a holder of this Host's own permit goes ahead.
+      {:ok, permit} = Host.checkout(ctx.name, :ops, 0)
+      assert Vagus.Runtime.Podman.Cmd.run(["ps"], split) == {:ok, ""}
+      Host.checkin(permit)
+    end
+
+    test "is not published before the Host has prepared it", ctx do
+      run = fn
+        "mount", ["--make-rshared", "/"] -> receive(do: (:go -> {"", 0}))
+        _bin, _args -> {"", 0}
+      end
+
+      pid = start_supervised!({Host, host_opts(ctx, run: run)})
+      assert Host.ready(ctx.name) == {:error, :preparing}
+      assert Host.out_dir(ctx.name) == :unbounded
+      send(pid, :go)
+      assert await_ready(ctx.name) == :ok
+      assert Host.out_dir(ctx.name) == {:ok, Path.join(ctx.root, "run/vagus/podman/out")}
     end
   end
 

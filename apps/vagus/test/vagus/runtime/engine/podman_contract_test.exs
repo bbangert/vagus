@@ -313,7 +313,10 @@ defmodule Vagus.Runtime.Engine.PodmanContractTest.Leg do
     ]
   end
 
-  defp script(:create), do: [{"create *", [{0, "c0ffee\n"}]}]
+  defp script(:create),
+    do: [
+      {"create *", [{0, "c0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ff\n"}]}
+    ]
 
   defp script(:create_conflict) do
     [
@@ -541,6 +544,153 @@ defmodule Vagus.Runtime.Engine.PodmanContractTest do
       {_fake, opts} = engine(ctx, [{"ps *", [{0, Jason.encode!([paused])}]}])
       assert {:ok, [%Container{name: "p", state: :paused}]} = Engine.list(opts)
     end
+
+    # podman prints its warnings on stderr; merged into stdout, one after
+    # the JSON made it unparseable.
+    test "warnings podman prints on stderr, before and after, never reach the JSON", ctx do
+      fixture = &File.read!(Path.expand("../../../fixtures/podman/#{&1}", __DIR__))
+
+      around = [
+        run: ~s(echo 'time="t" level=warning msg="before"' >&2),
+        stderr: ~s(time="t" level=error msg="after"\n)
+      ]
+
+      {_fake, opts} =
+        engine(ctx, [
+          {"container inspect *", [{0, fixture.("inspect_running.json"), around}]},
+          {"ps *", [{0, fixture.("ps_all.json"), around}]},
+          {"stats *", [{0, fixture.("stats_sample1.json"), around}]},
+          {"create *",
+           [{0, "c0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ff\n", around}]}
+        ])
+
+      assert {:ok, %Container{name: "fx_running"}} = Engine.inspect("fx_running", opts)
+      assert {:ok, [_ | _]} = Engine.list([all: true] ++ opts)
+      assert {:ok, %{}} = Engine.stats("fx_running", opts)
+
+      assert Engine.create(C.spec(), opts) ==
+               {:ok, "c0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ff"}
+    end
+
+    test "the error podman prints on stderr is still classified", ctx do
+      {_fake, opts} =
+        engine(ctx, [{"container inspect *", [{125, ~s(Error: no such container "ghost"\n)}]}])
+
+      assert Engine.inspect("ghost", opts) == {:error, :not_found}
+    end
+
+    # Only that caller's own file: another call's beside it is still live.
+    # The Host frees a dead holder's permit only once it has removed the
+    # file, so with the spare ops permit held, getting one back proves it.
+    test "a caller killed mid-call leaves no stdout file behind", ctx do
+      {fake, opts} = engine(ctx, [{"ps *", [{0, "[]", hold: true}]}])
+      host = opts[:host]
+      {:ok, dir} = Vagus.Runtime.Host.out_dir(host)
+      live = Path.join(dir, "podman-live.out")
+      File.write!(live, "")
+      caller = spawn(fn -> Engine.list(opts) end)
+
+      out =
+        Enum.find_value(1..1_000, fn _ ->
+          Enum.find(File.ls!(dir), &(&1 != "podman-live.out")) || (Process.sleep(10) && nil)
+        end) || flunk("no stdout file ever appeared in #{dir}")
+
+      {:ok, spare} = Vagus.Runtime.Host.checkout(host, :ops, 0)
+      Process.exit(caller, :kill)
+      assert {:ok, freed} = Vagus.Runtime.Host.checkout(host, :ops, 5_000)
+
+      refute File.exists?(Path.join(dir, out))
+      assert File.exists?(live)
+      Enum.each([spare, freed], &Vagus.Runtime.Host.checkin/1)
+      FakePodman.release(fake)
+    end
+
+    # A podman that opens `--out` only after its dead caller's file was
+    # removed creates it again; TERM ignored, it lives until muontrap's
+    # SIGKILL. The Host removes the path once more past that.
+    @tag timeout: 60_000
+    test "a file a killed caller's podman creates again is removed too" do
+      dir = Path.join(System.tmp_dir!(), "podman-late-#{System.unique_integer([:positive])}")
+      File.mkdir_p!(dir)
+      on_exit(fn -> File.rm_rf(dir) end)
+      bin = Path.join(dir, "podman")
+
+      File.write!(bin, """
+      #!/bin/sh
+      trap '' TERM
+      for a; do case "$a" in --out=*) out="${a#--out=}" ;; info) exit 0 ;; esac; done
+      : > "#{dir}/started"
+      while [ ! -e "#{dir}/released" ]; do sleep 0.02; done
+      printf '[]\\n' > "$out"
+      : > "#{dir}/wrote"
+      sleep 30
+      """)
+
+      File.chmod!(bin, 0o755)
+      host = FakePodman.start_host(bin)
+      {:ok, out_dir} = Vagus.Runtime.Host.out_dir(host)
+      opts = [engine: Engine.Podman, host: host, podman_bin: bin]
+      caller = spawn(fn -> Engine.list(opts) end)
+      await_path(Path.join(dir, "started"), 1_000)
+
+      {:ok, spare} = Vagus.Runtime.Host.checkout(host, :ops, 0)
+      Process.exit(caller, :kill)
+      assert {:ok, freed} = Vagus.Runtime.Host.checkout(host, :ops, 5_000)
+      assert File.ls!(out_dir) == []
+
+      File.write!(Path.join(dir, "released"), "")
+      await_path(Path.join(dir, "wrote"), 1_000)
+      assert [_recreated] = File.ls!(out_dir)
+
+      Enum.find(1..1_000, fn _ -> File.ls!(out_dir) == [] or (Process.sleep(10) && false) end) ||
+        flunk("the recreated file outlived its podman")
+
+      Enum.each([spare, freed], &Vagus.Runtime.Host.checkin/1)
+    end
+
+    test "with no tmpfs of its own, a split call is merged and still parses" do
+      fake = FakePodman.start([{"ps *", [{0, "[]\n"}]}])
+
+      run = fn
+        "mount", ["-t" | _] -> {"mount: permission denied", 32}
+        _bin, _args -> {"", 0}
+      end
+
+      {host, _log} =
+        ExUnit.CaptureLog.with_log(fn -> FakePodman.start_host(fake.bin, run: run) end)
+
+      assert Vagus.Runtime.Host.out_dir(host) == :unbounded
+      opts = [engine: Engine.Podman, host: host, podman_bin: fake.bin]
+      assert Engine.list([all: true] ++ opts) == {:ok, []}
+      refute fake |> FakePodman.calls() |> List.flatten() |> Enum.any?(&(&1 =~ "--out="))
+    end
+
+    # The JSON verbs need no check of their own: a cut-short document never
+    # decodes.
+    test "inspect, list and stats cut short are :bad_json", ctx do
+      cut = ~s([{"Id":"a", "Names)
+
+      {_fake, opts} =
+        engine(ctx, [
+          {"container inspect *", [{0, cut}]},
+          {"ps *", [{0, cut}]},
+          {"stats *", [{0, cut}]}
+        ])
+
+      assert Engine.inspect("x", opts) == {:error, {:failed, :inspect, :bad_json}}
+      assert Engine.list(opts) == {:error, {:failed, :list, :bad_json}}
+      assert Engine.stats("x", opts) == {:error, {:failed, :stats, :bad_json}}
+    end
+
+    # A create whose id never reached its file (the out tmpfs filled, then
+    # emptied before Cmd looked) must not pass for a container with no id.
+    test "a create that printed no whole id fails", ctx do
+      for printed <- ["", "c0ffee\n"] do
+        {_fake, opts} = engine(ctx, [{"create *", [{0, printed}]}])
+
+        assert {:error, {:failed, :create, {:bad_id, _}}} = Engine.create(C.spec(), opts)
+      end
+    end
   end
 
   describe "podman stats" do
@@ -611,7 +761,8 @@ defmodule Vagus.Runtime.Engine.PodmanContractTest do
           {"container inspect *", [{0, Leg.inspect_out(Leg.running_json())}]},
           {"ps *", [{0, "[]"}]},
           {"stats *", [{0, Leg.stats_line()}]},
-          {"create *", [{0, "c0ffee\n"}]},
+          {"create *",
+           [{0, "c0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ff\n"}]},
           {"*", [{0, ""}]}
         ])
 
@@ -633,7 +784,9 @@ defmodule Vagus.Runtime.Engine.PodmanContractTest do
       true = Engine.image_present?("ghcr.io/vagus/x:1", opts)
       :ok = Engine.remove_image("ghcr.io/vagus/x:1", opts)
       :ok = Engine.ensure_network(C.hassio(), opts)
-      {:ok, "c0ffee"} = Engine.create(C.spec(), opts)
+
+      {:ok, "c0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ff"} =
+        Engine.create(C.spec(), opts)
 
       assert FakePodman.verbs(fake) -- [["info", "--format", "{{.Version.Version}}"]] == [
                ["start", "--", x],
@@ -691,7 +844,15 @@ defmodule Vagus.Runtime.Engine.PodmanContractTest do
     end
 
     test "create puts a secret in podman's env, never on the argv", ctx do
-      fake = FakePodman.start([{"create *", [{0, "c0ffee\n"}]}], log_env: ["SUPERVISOR_TOKEN"])
+      fake =
+        FakePodman.start(
+          [
+            {"create *",
+             [{0, "c0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ff\n"}]}
+          ],
+          log_env: ["SUPERVISOR_TOKEN"]
+        )
+
       host = Leg.start_host(ctx, fake.bin)
       opts = [engine: Engine.Podman, host: host, podman_bin: fake.bin]
       spec = Vagus.Core.Container.to_container_spec("2026.7.0", token: "s3cret-token", tz: "UTC")
@@ -1126,7 +1287,11 @@ defmodule Vagus.Runtime.Engine.PodmanContractTest do
     end
 
     test "create refuses a port key that could name a host port, without podman" do
-      {fake, opts} = engine(%{}, [{"create *", [{0, "c0ffee\n"}]}])
+      {fake, opts} =
+        engine(%{}, [
+          {"create *",
+           [{0, "c0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ff\n"}]}
+        ])
 
       for key <- ["8123:8123/tcp", "0.0.0.0:80:80/tcp", "1-1024", "80/xyz"] do
         spec = %{C.spec() | ports: %{key => nil}}
@@ -1136,7 +1301,9 @@ defmodule Vagus.Runtime.Engine.PodmanContractTest do
       refute Enum.any?(FakePodman.verbs(fake), &match?(["create" | _], &1))
 
       spec = %{C.spec() | ports: %{"8080/tcp" => 8080, "53/udp" => nil, "9000" => 9000}}
-      assert {:ok, "c0ffee"} = Engine.create(spec, opts)
+
+      assert {:ok, "c0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ffeec0ff"} =
+               Engine.create(spec, opts)
     end
 
     test "an image ref naming a transport or a bad name never reaches podman" do
@@ -1169,6 +1336,11 @@ defmodule Vagus.Runtime.Engine.PodmanContractTest do
 
       assert FakePodman.verbs(fake) == [["info", "--format", "{{.Version.Version}}"]]
     end
+  end
+
+  defp await_path(path, tries) do
+    Enum.find(1..tries, fn _ -> File.exists?(path) or (Process.sleep(10) && false) end) ||
+      flunk("#{path} never appeared")
   end
 
   defp await_waiter(host, class \\ :ops, n \\ 1) do

@@ -197,12 +197,23 @@ defmodule Vagus.Runtime.Engine.Podman do
              run(
                :create,
                render_create(spec, Host.log_config(opts[:host])),
-               [env: secrets] ++ opts,
+               apart([env: secrets] ++ opts),
                @lifecycle_ms
              )
            ) do
-      {:ok, out |> String.trim() |> String.split("\n") |> List.last()}
+      created_id(out)
     end
+  end
+
+  # podman exits 0 even when the out tmpfs filled before it printed the id,
+  # and room freed by then hides that from Cmd: only the id's own shape
+  # tells a cut-short answer from a real one.
+  defp created_id(out) do
+    id = out |> String.trim() |> String.split("\n") |> List.last()
+
+    if Regex.match?(~r/\A[0-9a-f]{64}\z/, id),
+      do: {:ok, id},
+      else: {:error, {:failed, :create, {:bad_id, Error.detail(out)}}}
   end
 
   @impl true
@@ -362,7 +373,10 @@ defmodule Vagus.Runtime.Engine.Podman do
   defp inspect_raw(name, opts) do
     with :ok <- valid_name(:inspect, name),
          {:ok, out} <-
-           ok(:inspect, run(:inspect, ["container", "inspect", "--", name], opts, @query_ms)),
+           ok(
+             :inspect,
+             run(:inspect, ["container", "inspect", "--", name], apart(opts), @query_ms)
+           ),
          {:ok, [raw | _]} <- decode(:inspect, out) do
       {:ok, raw}
     else
@@ -392,7 +406,8 @@ defmodule Vagus.Runtime.Engine.Podman do
   # `ps` without `--all` hides paused containers, which Docker lists as live.
   @impl true
   def list(opts) do
-    with {:ok, out} <- ok(:list, run(:list, ["ps", "--all", "--format", "json"], opts, @query_ms)),
+    with {:ok, out} <-
+           ok(:list, run(:list, ["ps", "--all", "--format", "json"], apart(opts), @query_ms)),
          {:ok, raw} when is_list(raw) <- decode(:list, out) do
       containers = Enum.map(raw, &parse_summary/1)
       live = if opts[:all], do: containers, else: Enum.filter(containers, &Container.alive?/1)
@@ -435,7 +450,7 @@ defmodule Vagus.Runtime.Engine.Podman do
     ]
 
     with :ok <- valid_name(:stats, name),
-         {:ok, out} <- ok(:stats, run(:stats, args, opts, @query_ms)),
+         {:ok, out} <- ok(:stats, run(:stats, args, apart(opts), @query_ms)),
          {:ok, raw} when is_map(raw) <- decode(:stats, out) do
       {:ok, compute_stats(raw, opts[:host])}
     else
@@ -924,7 +939,7 @@ defmodule Vagus.Runtime.Engine.Podman do
 
     cmd_opts =
       opts
-      |> Keyword.take([:env, :cap, :truncate, :discard_stdout, :podman_bin])
+      |> Keyword.take([:env, :cap, :truncate, :discard_stdout, :stderr_apart, :podman_bin])
       |> Keyword.put(:host, host)
 
     Host.with_permit(
@@ -995,6 +1010,10 @@ defmodule Vagus.Runtime.Engine.Podman do
   end
 
   defp valid_image(verb, image), do: {:error, {:failed, verb, {:invalid_image, image}}}
+
+  # For the verbs whose stdout is parsed: a warning podman prints can then
+  # never land inside it.
+  defp apart(opts), do: Keyword.put(opts, :stderr_apart, true)
 
   defp ok(_verb, {:ok, out}), do: {:ok, out}
   defp ok(verb, other), do: unit(verb, other)

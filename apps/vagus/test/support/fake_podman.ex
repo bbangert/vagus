@@ -6,7 +6,10 @@ defmodule Vagus.Test.FakePodman do
   Rules match the argv after podman's global flags, joined by spaces, as a
   shell glob (`"container inspect *"`); the first matching rule answers.
   Each rule holds responses used in order, the last one repeating:
-  `{exit_status, output}`, or `{exit_status, output, delay_ms: n}`. With
+  `{exit_status, output}`, or `{exit_status, output, delay_ms: n}`. As with
+  podman, the output goes to stdout on a zero exit and to stderr otherwise;
+  `stderr:` adds text on stderr 0.1 s after it. `--out=FILE` sends stdout to
+  FILE, as podman's own flag does. With
   `hold: true` the response waits until the test calls `release/1`, so a
   call stays in flight for exactly as long as the test needs. `run:` is a
   shell command the invocation runs before any delay or hold: a side effect
@@ -42,6 +45,7 @@ defmodule Vagus.Test.FakePodman do
     while :; do
       case "$1" in
         --log-level=*|--transient-store) shift ;;
+        --out=*) exec >"${1#--out=}"; shift ;;
         *) break ;;
       esac
     done
@@ -60,8 +64,11 @@ defmodule Vagus.Test.FakePodman do
         while [ ! -e "$dir/release" ]; do sleep 0.02; done
       fi
       [ -f "$dir/r$1.$n.kill" ] && kill -9 $$
-      cat "$dir/r$1.$n.out"
-      exit "$(cat "$dir/r$1.$n.code")"
+      code=$(cat "$dir/r$1.$n.code")
+      if [ "$code" = 0 ]; then cat "$dir/r$1.$n.out"; else cat "$dir/r$1.$n.out" >&2; fi
+      # Late enough that a merged capture would read it after stdout.
+      [ -f "$dir/r$1.$n.err" ] && sleep 0.1 && cat "$dir/r$1.$n.err" >&2
+      exit "$code"
     }
     case "$*" in
     #{cases}
@@ -96,6 +103,7 @@ defmodule Vagus.Test.FakePodman do
     if ms = opts[:delay_ms], do: File.write!(base <> ".delay", to_string(ms / 1000))
     if opts[:hold], do: File.write!(base <> ".hold", "")
     if run = opts[:run], do: File.write!(base <> ".run", run)
+    if err = opts[:stderr], do: File.write!(base <> ".err", err)
   end
 
   @doc "Lets every held response answer, now and from here on."
@@ -115,7 +123,10 @@ defmodule Vagus.Test.FakePodman do
   end
 
   @doc "The calls without podman's global flags."
-  def verbs(fake), do: Enum.map(calls(fake), &Enum.drop(&1, 2))
+  def verbs(fake), do: Enum.map(calls(fake), &Enum.drop_while(&1, fn a -> global?(a) end))
+
+  defp global?(arg),
+    do: arg in ["--log-level=error", "--transient-store"] or String.starts_with?(arg, "--out=")
 
   @doc """
   A `Vagus.Runtime.Host` under the test's supervisor, preparing in a temp

@@ -8,6 +8,24 @@
 # each other's containers or names.
 c=${VAGUS_PODMAN_CONTAINER:-vagus-podman-fixtures}
 
+# Cmd's `--out=FILE` names a file on the BEAM side, which podman in the
+# container cannot reach: it is taken off the global flags here, and
+# podman's stdout is copied to FILE once it has exited.
+out=""
+in_globals=1
+first=1
+for a in "$@"; do
+  [ -n "$first" ] && set -- && first=""
+  if [ -n "$in_globals" ]; then
+    case "$a" in
+      --out=*) out=${a#--out=}; continue ;;
+      --log-level=*|--transient-store) ;;
+      *) in_globals="" ;;
+    esac
+  fi
+  set -- "$@" "$a"
+done
+
 envs=""
 for name in GOMAXPROCS GOMEMLIMIT GOGC; do
   eval "isset=\${$name+x}"
@@ -53,13 +71,18 @@ fi
 id="/tmp/vw.$$.$(date +%s%N)"
 
 # Cmd's stderr-only capture points stdout at /dev/null; then only stderr
-# may come back, as with muontrap running podman itself.
-if [ "$(readlink "/proc/$$/fd/1")" = /dev/null ]; then
-  quiet=1
+# may come back, as with muontrap running podman itself. With `--out`
+# stdout is kept apart for FILE.
+if [ -n "$out" ]; then
+  mode=apart
+  # shellcheck disable=SC2016
+  redir='>"$0.out" 2>"$0.err"'
+elif [ "$(readlink "/proc/$$/fd/1")" = /dev/null ]; then
+  mode=quiet
   # shellcheck disable=SC2016
   redir='>/dev/null 2>"$0.out"'
 else
-  quiet=""
+  mode=merged
   # shellcheck disable=SC2016
   redir='>"$0.out" 2>&1'
 fi
@@ -75,7 +98,7 @@ exec podman \"\$@\"" "$0" "$@" '"$redir"' &
 wait $!
 echo $? > "$0.rc.tmp"
 mv "$0.rc.tmp" "$0.rc"
-[ -e "$0.cancel" ] && rm -f "$0.out" "$0.pid" "$0.rc" "$0.cancel"'
+[ -e "$0.cancel" ] && rm -f "$0.out" "$0.err" "$0.pid" "$0.rc" "$0.cancel"'
 
 # Returns only once podman is gone: Cmd waits for muontrap, whose child is
 # this script, so returning early would free the Host permit under a live
@@ -101,7 +124,7 @@ if [ -n "$p" ]; then
   fi
   end=$(($(ms) + 300))
   while [ ! -e "$f.rc" ] && [ "$(ms)" -lt "$end" ]; do sleep 0.02; done
-  [ -e "$f.rc" ] && rm -f "$f.out" "$f.pid" "$f.rc" "$f.cancel"
+  [ -e "$f.rc" ] && rm -f "$f.out" "$f.err" "$f.pid" "$f.rc" "$f.cancel"
 fi
 touch "$f.reaped"
 sleep 3
@@ -149,14 +172,17 @@ done
 
 # podman has exited, so a signal from here on has nothing to cancel, and a
 # reap would leave `.cancel` behind for a launch that already finished.
-trap 'docker exec "$c" rm -f "$id.out" "$id.rc" "$id.pid" >/dev/null 2>&1; exit 143' TERM INT HUP
+trap 'docker exec "$c" rm -f "$id.out" "$id.err" "$id.rc" "$id.pid" >/dev/null 2>&1; exit 143' TERM INT HUP
 
-if [ -n "$quiet" ]; then
-  docker exec "$c" cat "$id.out" >&2
-else
-  docker exec "$c" cat "$id.out"
-fi
+case "$mode" in
+  apart)
+    docker exec "$c" cat "$id.out" >"$out"
+    docker exec "$c" cat "$id.err" >&2
+    ;;
+  quiet) docker exec "$c" cat "$id.out" >&2 ;;
+  *) docker exec "$c" cat "$id.out" ;;
+esac
 # shellcheck disable=SC2016
-rc=$(docker exec "$c" sh -c 'cat "$0.rc"; rm -f "$0.out" "$0.rc" "$0.pid"' "$id")
+rc=$(docker exec "$c" sh -c 'cat "$0.rc"; rm -f "$0.out" "$0.err" "$0.rc" "$0.pid"' "$id")
 # Empty when the container went away under the call.
 exit "${rc:-125}"
