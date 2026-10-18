@@ -145,6 +145,7 @@ defmodule Vagus.App.Steps do
   defp step(:stop, %{config: config} = input) do
     opts = opts(input)
     id = container_name(config.slug)
+    :ok = stop_refused_native(input, id)
     was_running = match?({:ok, :running}, backend(opts).state(id))
 
     with :ok <- stop_and_remove_container(id, opts, input[:strict] == true),
@@ -1005,6 +1006,16 @@ defmodule Vagus.App.Steps do
       :ok
     end
   end
+
+  # A refused app's stub can lose `backend` with the rest of its file, which
+  # would leave a running broker listening after its file and data are gone.
+  # An allowlisted slug may be either runtime, so the native one is stopped
+  # too; stopping one that is not there is a no-op.
+  defp stop_refused_native(%{refused: true, config: %Config{slug: slug}}, id) do
+    if native_allowed?(slug), do: Vagus.Addon.Backend.Native.stop(id), else: :ok
+  end
+
+  defp stop_refused_native(_input, _id), do: :ok
 
   defp stop_container(id, opts, strict?) do
     case backend(opts).stop(id, opts) do

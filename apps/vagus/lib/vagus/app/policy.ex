@@ -1169,6 +1169,7 @@ defmodule Vagus.App.Policy do
   defp input(:swap_data, _arg, data), do: %{staging_dir: data.run.args.staging_dir}
 
   defp input(:set_options, _arg, data), do: %{options: data.run.args.options}
+  defp input(:stop, _arg, %{refused: true}), do: %{refused: true}
   defp input(:stop, :strict, _data), do: %{strict: true}
   defp input(:remove_app, _arg, data), do: %{refused: data.refused}
   defp input(_name, _arg, _data), do: %{}

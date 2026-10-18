@@ -295,6 +295,45 @@ defmodule Vagus.AppTest do
       refute slug in App.slugs()
     end
 
+    # The stub of a corrupt file cannot say the app was native, so nothing
+    # but the allowlist tells the uninstall a broker may still be running.
+    @tag :tmp_dir
+    test "a refused allowlisted native app's running broker is stopped by its uninstall",
+         %{tmp_dir: tmp} do
+      slug = corrupt_file()
+      on_exit(fn -> forget_app(slug) end)
+
+      for {key, value} <- [native_addon_slugs: [slug], addon_data_root: tmp] do
+        previous = Application.fetch_env(:vagus, key)
+        Application.put_env(:vagus, key, value)
+
+        on_exit(fn ->
+          case previous do
+            {:ok, old} -> Application.put_env(:vagus, key, old)
+            :error -> Application.delete_env(:vagus, key)
+          end
+        end)
+      end
+
+      name = Backend.Native.broker_name("addon_" <> slug)
+
+      {:ok, broker} =
+        DynamicSupervisor.start_child(
+          Backend.Native.Supervisor,
+          %{id: name, start: {Agent, :start_link, [fn -> nil end, [name: name]]}}
+        )
+
+      ref = Process.monitor(broker)
+      data_dir = Path.join([tmp, "addons", "data", slug])
+      File.mkdir_p!(data_dir)
+      capture_log(fn -> assert {:ok, _pid} = Vagus.App.Instances.ensure(slug) end)
+
+      assert :ok = App.uninstall(slug)
+      assert_receive {:DOWN, ^ref, :process, ^broker, _reason}
+      refute File.exists?(Path.join(AppFile.dir(), slug <> ".json"))
+      refute File.exists?(data_dir)
+    end
+
     test "an app whose file is corrupt uninstalls too" do
       slug = corrupt_file()
       on_exit(fn -> forget_app(slug) end)
