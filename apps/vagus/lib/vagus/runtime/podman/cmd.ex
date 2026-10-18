@@ -87,13 +87,14 @@ defmodule Vagus.Runtime.Podman.Cmd do
 
   # The name is unique, so the Host's cleanup after a dead caller can only
   # ever remove that caller's file. The Host learns it before the file
-  # exists: a caller killed in between leaves nothing to remove. The file is
+  # exists: a caller killed in between leaves nothing to remove. A Host that
+  # holds none of the caller's permits (one from a Host since replaced)
+  # would never remove it, so the call fails before making it. The file is
   # made here, so a successful podman whose file is gone had it removed
   # under it (a Host restarting mid-call sweeps the dir), not an empty
-  # answer. The path is the Host's dir and a name made here, never input.
-  # sobelow_skip ["Traversal.FileModule"]
+  # answer.
   defp run_apart(path, args, opts) do
-    dir = if d = opts[:out_dir], do: {:ok, d}, else: Vagus.Runtime.Host.out_dir(opts[:host])
+    dir = if d = opts[:out_dir], do: {:given, d}, else: Vagus.Runtime.Host.out_dir(opts[:host])
 
     case dir do
       :unavailable ->
@@ -102,27 +103,33 @@ defmodule Vagus.Runtime.Podman.Cmd do
       :unbounded ->
         spawn_podman(path, @global_args ++ args, opts)
 
-      {:ok, dir} ->
+      {how, dir} ->
         name = "podman-#{System.pid()}-#{System.unique_integer([:positive])}.out"
         out = Path.join(dir, name)
-        Vagus.Runtime.Host.track_out(opts[:host], out)
-
-        try do
-          case File.write(out, "", [:exclusive]) do
-            :ok ->
-              argv = @global_args ++ ["--out=" <> out] ++ args
-              spawn_podman(path, argv, Keyword.put(opts, :out, out))
-
-            {:error, :enospc} ->
-              {:error, :output_too_large}
-
-            {:error, reason} ->
-              {:error, {:out_file, reason}}
-          end
-        after
-          File.rm(out)
-        end
+        # A given dir is a test's own; the Host cleans up only its own.
+        tracked = if how == :ok, do: Vagus.Runtime.Host.track_out(opts[:host], out), else: :ok
+        write_and_spawn(tracked, path, out, args, opts)
     end
+  end
+
+  defp write_and_spawn({:error, _} = untracked, _path, _out, _args, _opts), do: untracked
+
+  # The path is the Host's dir and a name made here, never input.
+  # sobelow_skip ["Traversal.FileModule"]
+  defp write_and_spawn(:ok, path, out, args, opts) do
+    case File.write(out, "", [:exclusive]) do
+      :ok ->
+        argv = @global_args ++ ["--out=" <> out] ++ args
+        spawn_podman(path, argv, Keyword.put(opts, :out, out))
+
+      {:error, :enospc} ->
+        {:error, :output_too_large}
+
+      {:error, reason} ->
+        {:error, {:out_file, reason}}
+    end
+  after
+    File.rm(out)
   end
 
   defp spawn_podman(path, argv, opts) do

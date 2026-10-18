@@ -243,7 +243,7 @@ defmodule Vagus.Runtime.Podman.CmdTest do
     end
 
     defp run_apart(bin, ctx, opts \\ []),
-      do: Cmd.run([], [timeout_ms: 5_000, podman_bin: bin] ++ ctx.apart ++ opts)
+      do: Cmd.run([], Keyword.merge([timeout_ms: 5_000, podman_bin: bin] ++ ctx.apart, opts))
 
     test "stdout comes back alone, whatever podman printed on stderr around it", ctx do
       {bin, _dir} =
@@ -335,10 +335,17 @@ defmodule Vagus.Runtime.Podman.CmdTest do
     @tag timeout: 60_000
     test "the deadline still SIGTERMs podman", ctx do
       {bin, dir} = trapping_script(~s(echo term > "$d/term"; exit 0))
-      task = Task.async(fn -> run_apart(bin, ctx, timeout_ms: 2_000) end)
+
+      task =
+        Task.async(fn ->
+          started = System.monotonic_time(:millisecond)
+          {run_apart(bin, ctx, timeout_ms: 2_000), System.monotonic_time(:millisecond) - started}
+        end)
+
       pid = await_file(Path.join(dir, "pid"))
 
-      assert Task.await(task, 30_000) == {:error, :timeout}
+      assert {{:error, :timeout}, took} = Task.await(task, 30_000)
+      assert took in 2_000..4_500
       assert File.read!(Path.join(dir, "term")) == "term\n"
       refute alive?(pid), "podman #{pid} outlived run/2"
     end

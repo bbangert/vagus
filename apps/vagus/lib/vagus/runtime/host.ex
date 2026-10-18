@@ -155,10 +155,16 @@ defmodule Vagus.Runtime.Host do
 
   @doc """
   Records `path` as the calling permit holder's stdout file, removed should
-  the holder die before it can.
+  the holder die before it can. `{:error, :unavailable}` when this Host
+  holds no permit of the caller's: a permit from a Host since replaced
+  leaves nobody to remove the file.
   """
-  @spec track_out(atom() | nil, String.t()) :: :ok
-  def track_out(host, path), do: GenServer.cast(host || __MODULE__, {:out_file, self(), path})
+  @spec track_out(atom() | nil, String.t()) :: :ok | {:error, :unavailable}
+  def track_out(host, path) do
+    GenServer.call(host || __MODULE__, {:out_file, path}, @reply_ms)
+  catch
+    :exit, _ -> {:error, :unavailable}
+  end
 
   @spec ready(atom() | nil) :: :ok | {:error, :preparing | :unavailable | {:prep_failed, term()}}
   def ready(host \\ nil) do
@@ -463,18 +469,22 @@ defmodule Vagus.Runtime.Host do
 
   def handle_call({:cancel, ref}, _from, state), do: {:reply, :ok, release(state, ref)}
 
+  def handle_call({:out_file, path}, {pid, _tag}, state) do
+    if Enum.any?(state.holders, &match?({_ref, {_class, ^pid, _mon, _out}}, &1)) do
+      holders =
+        Map.new(state.holders, fn
+          {ref, {class, ^pid, mon, _out}} -> {ref, {class, pid, mon, path}}
+          held -> held
+        end)
+
+      {:reply, :ok, %{state | holders: holders}}
+    else
+      {:reply, {:error, :unavailable}, state}
+    end
+  end
+
   @impl true
   def handle_cast({:release, ref}, state), do: {:noreply, release(state, ref)}
-
-  def handle_cast({:out_file, pid, path}, state) do
-    holders =
-      Map.new(state.holders, fn
-        {ref, {class, ^pid, mon, _out}} -> {ref, {class, pid, mon, path}}
-        held -> held
-      end)
-
-    {:noreply, %{state | holders: holders}}
-  end
 
   @impl true
   def handle_info({ref, result}, %{probe: ref} = state) when is_reference(ref) do

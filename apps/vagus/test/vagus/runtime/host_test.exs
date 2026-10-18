@@ -340,6 +340,41 @@ defmodule Vagus.Runtime.HostTest do
              ) == {:error, :unavailable}
     end
 
+    # The holder outlived the Host it checked out from; the new Host knows
+    # nothing of its permit, so would never remove its file.
+    test "a holder of a replaced Host's permit fails closed and leaves no file", ctx do
+      dir = Path.join(ctx.root, "run/vagus/podman/out")
+      split = [timeout_ms: 5_000, podman_bin: "/bin/true", stderr_apart: true, host: ctx.name]
+      test = self()
+      start_host(ctx)
+
+      holder =
+        spawn(fn ->
+          {:ok, _stale} = Host.checkout(ctx.name, :ops, 0)
+          send(test, :held)
+          receive(do: (:run -> send(test, {:ran, Vagus.Runtime.Podman.Cmd.run(["ps"], split)})))
+          receive(do: (:never -> :ok))
+        end)
+
+      assert_receive :held, 5_000
+      stop_supervised!(ctx.name)
+      start_host(ctx)
+      send(holder, :run)
+      assert_receive {:ran, {:error, :unavailable}}, 5_000
+      assert File.ls!(dir) == []
+
+      ref = Process.monitor(holder)
+      Process.exit(holder, :kill)
+      assert_receive {:DOWN, ^ref, :process, ^holder, :killed}
+      :sys.get_state(ctx.name)
+      assert File.ls!(dir) == []
+
+      # The same call from a holder of this Host's own permit goes ahead.
+      {:ok, permit} = Host.checkout(ctx.name, :ops, 0)
+      assert Vagus.Runtime.Podman.Cmd.run(["ps"], split) == {:ok, ""}
+      Host.checkin(permit)
+    end
+
     test "is not published before the Host has prepared it", ctx do
       run = fn
         "mount", ["--make-rshared", "/"] -> receive(do: (:go -> {"", 0}))
