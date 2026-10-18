@@ -133,6 +133,13 @@ defmodule Vagus.Runtime.Host do
   @spec env(atom() | nil) :: [{String.t(), String.t()}]
   def env(host), do: shared(host)[:env] || []
 
+  @doc """
+  Where split podman calls (`Runtime.Podman.Cmd`'s `:stderr_apart`) write
+  their stdout; the system temp dir when no Host has published one.
+  """
+  @spec out_dir(atom() | nil) :: String.t()
+  def out_dir(host), do: shared(host)[:out_dir] || System.tmp_dir!()
+
   @spec ready(atom() | nil) :: :ok | {:error, :preparing | :unavailable | {:prep_failed, term()}}
   def ready(host \\ nil) do
     host = host || __MODULE__
@@ -394,6 +401,7 @@ defmodule Vagus.Runtime.Host do
     )
 
     ensure_private_dir(log_dir(state.opts))
+    ensure_private_dir(out_dir_of(state.opts))
     write_resolv_conf(state.opts)
     state = state |> apply_profile() |> publish(:preparing)
     mount_log_tmpfs(state.opts, state.profile)
@@ -465,8 +473,9 @@ defmodule Vagus.Runtime.Host do
   def handle_info({:migration_check, _stale}, state), do: {:noreply, state}
 
   def handle_info({:DOWN, mon, :process, _pid, _reason}, state) do
-    held = for {ref, {_class, _pid, ^mon}} <- state.holders, do: ref
-    state = Enum.reduce(held, state, &release(&2, &1))
+    held = for {ref, {_class, pid, ^mon}} <- state.holders, do: {ref, pid}
+    Enum.each(held, fn {_ref, pid} -> drop_out_file(state, pid) end)
+    state = Enum.reduce(held, state, fn {ref, _pid}, state -> release(state, ref) end)
 
     waiting =
       Map.new(state.waiting, fn {c, q} -> {c, :queue.filter(&(elem(&1, 2) != mon), q)} end)
@@ -542,6 +551,7 @@ defmodule Vagus.Runtime.Host do
       pull_permits: state.permits[:pull],
       spool_quiet_ms: Keyword.get(state.opts, :spool_quiet_ms, 120_000),
       log_dir: log_dir(state.opts),
+      out_dir: out_dir_of(state.opts),
       log_max_bytes: state.profile && @log_max_bytes[state.profile],
       log_tmpfs_bytes: state.profile && @log_tmpfs_bytes[state.profile],
       migration: state.migration
@@ -874,6 +884,15 @@ defmodule Vagus.Runtime.Host do
   defp graphroot(opts), do: Keyword.get(opts, :graphroot, "/root/containers/storage")
 
   defp run_dir(opts), do: Keyword.get(opts, :run_dir, "/run/vagus/podman")
+  defp out_dir_of(opts), do: Path.join(run_dir(opts), "out")
+
+  # A holder killed mid-call never reaches Cmd's own cleanup. Its podman
+  # may still be writing for up to muontrap's SIGKILL delay; unlinking an
+  # open file is harmless, and the space goes once podman exits.
+  # sobelow_skip ["Traversal.FileModule"]
+  defp drop_out_file(state, pid) do
+    _ = File.rm(Cmd.out_path(state.name, pid))
+  end
 
   defp log_dir(opts), do: Keyword.get(opts, :log_dir, @log_dir)
 

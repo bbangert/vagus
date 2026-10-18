@@ -14,6 +14,14 @@ defmodule Vagus.Runtime.Podman.Cmd do
   64 running at once). Here muontrap's output window covers the whole cap,
   so nothing is ever written to it.
 
+  With `:stderr_apart`, stdout goes to a file instead (podman's own
+  `--out`, which replaces Go's `os.Stdout` before the verb runs) and only
+  stderr comes through muontrap, whose one output stream cannot tell the two
+  apart. A warning podman prints then never lands inside the JSON a caller
+  parses, and podman's error text still reaches `Runtime.Podman.Error`. The
+  file lives in the Host's private run dir (tmpfs); the Host removes a
+  holder's file should the holder die mid-call.
+
   The environment is the Host's (`Vagus.Runtime.Host.env/1`: the profile's
   Go limits and `CONTAINERS_CONF_OVERRIDE`) plus `:env`, which carries
   secret values so they never appear on the argv.
@@ -30,22 +38,49 @@ defmodule Vagus.Runtime.Podman.Cmd do
           | {:exit, pos_integer(), binary()}
           | {:error, :timeout | :unavailable | :output_too_large | :invalid_argument}
 
+  # How often a split call with nothing arriving on stderr rechecks its
+  # stdout file against the cap.
+  @out_poll_ms 100
+
   @doc """
   Options: `:timeout_ms` (required), `:cap` (bytes, default 1 MiB),
   `:truncate` (past the cap keep the head instead of failing with
   `:output_too_large`), `:discard_stdout` (stdout never leaves muontrap;
-  only stderr is returned), `:env` (`[{name, value}]`), `:podman_bin`,
-  `:host`.
+  only stderr is returned), `:stderr_apart` (stdout alone on success,
+  stderr alone on failure; not with `:discard_stdout` or `:truncate`),
+  `:env` (`[{name, value}]`), `:podman_bin`, `:host`.
   """
   @spec run([String.t()], keyword()) :: result()
+  # The out file is the Host's run dir and this process's pid, never input.
+  # sobelow_skip ["Traversal.FileModule"]
   def run(args, opts) do
-    argv = @global_args ++ args
+    out = if opts[:stderr_apart], do: out_path(opts[:host])
+    argv = @global_args ++ if(out, do: ["--out=" <> out], else: []) ++ args
 
     cond do
-      Enum.any?(argv, &String.contains?(&1, <<0>>)) -> {:error, :invalid_argument}
-      path = System.find_executable(bin(opts)) -> spawn_podman(path, argv, opts)
-      true -> {:error, :unavailable}
+      Enum.any?(args, &String.contains?(&1, <<0>>)) ->
+        {:error, :invalid_argument}
+
+      path = System.find_executable(bin(opts)) ->
+        try do
+          spawn_podman(path, argv, Keyword.put(opts, :out, out))
+        after
+          if out, do: File.rm(out)
+        end
+
+      true ->
+        {:error, :unavailable}
     end
+  end
+
+  @doc """
+  The stdout file of a split call made by `pid`. One per process: a caller
+  runs one call at a time.
+  """
+  @spec out_path(atom() | nil, pid()) :: String.t()
+  def out_path(host, pid \\ self()) do
+    id = pid |> :erlang.pid_to_list() |> List.to_string() |> String.trim("<") |> String.trim(">")
+    Path.join(Vagus.Runtime.Host.out_dir(host), "podman-" <> id <> ".out")
   end
 
   # The binary comes from config or a test's opts, never from a request.
@@ -56,12 +91,13 @@ defmodule Vagus.Runtime.Podman.Cmd do
     window = if truncate?, do: @max_window, else: min(cap + 1, @max_window)
     env = Vagus.Runtime.Host.env(opts[:host]) ++ Keyword.get(opts, :env, [])
 
+    # A split call's podman writes stdout to its `--out` file, not fd 1.
     # Discarded stdout goes to /dev/null inside muontrap (muontrap.c, the
     # `capture_stderr_only` branch of the child's setup), so none of it ever
     # reaches the BEAM; stderr, where podman reports its own failures, is
     # still read.
     capture =
-      if Keyword.get(opts, :discard_stdout, false),
+      if Keyword.get(opts, :discard_stdout, false) or opts[:out] != nil,
         do: ["--capture-stderr-only"],
         else: ["--capture-output", "--capture-stderr"]
 
@@ -89,7 +125,7 @@ defmodule Vagus.Runtime.Podman.Cmd do
     deadline = now_ms() + Keyword.fetch!(opts, :timeout_ms)
 
     try do
-      collect(port, deadline, %{cap: cap, truncate?: truncate?, size: 0, acc: []})
+      collect(port, deadline, %{cap: cap, truncate?: truncate?, size: 0, acc: [], out: opts[:out]})
     after
       flush(port)
     end
@@ -107,11 +143,17 @@ defmodule Vagus.Runtime.Podman.Cmd do
   end
 
   # The deadline is checked before every receive: `after` only fires on an
-  # empty mailbox, so queued output would otherwise outrun it.
+  # empty mailbox, so queued output would otherwise outrun it. So is a split
+  # call's stdout file, which has no pipe to block podman once it is full.
   defp collect(port, deadline, out) do
     case deadline - now_ms() do
-      left when left <= 0 -> close(port, {:error, :timeout})
-      left -> await(port, deadline, out, left)
+      left when left <= 0 ->
+        close(port, {:error, :timeout})
+
+      left ->
+        if over_cap?(out),
+          do: close(port, {:error, :output_too_large}),
+          else: await(port, deadline, out, left)
     end
   end
 
@@ -124,12 +166,41 @@ defmodule Vagus.Runtime.Podman.Cmd do
         end
 
       {^port, {:exit_status, 0}} ->
-        {:ok, output(out)}
+        if out.out, do: read_out(out), else: {:ok, output(out)}
 
       {^port, {:exit_status, status}} ->
         {:exit, status, output(out)}
     after
-      left -> close(port, {:error, :timeout})
+      wait(out, left) ->
+        if out.out, do: collect(port, deadline, out), else: close(port, {:error, :timeout})
+    end
+  end
+
+  defp wait(%{out: nil}, left), do: left
+  defp wait(_out, left), do: min(left, @out_poll_ms)
+
+  defp over_cap?(%{out: nil}), do: false
+
+  defp over_cap?(%{out: path, cap: cap}) do
+    case File.stat(path) do
+      {:ok, %{size: size}} -> size > cap
+      {:error, _} -> false
+    end
+  end
+
+  # One read of at most cap + 1 bytes, whatever the file grew to. A podman
+  # that failed before opening it printed nothing.
+  # sobelow_skip ["Traversal.FileModule"]
+  defp read_out(%{out: path, cap: cap}) do
+    case File.open(path, [:read, :binary, :raw], &IO.binread(&1, cap + 1)) do
+      {:ok, data} when is_binary(data) and byte_size(data) > cap ->
+        {:error, :output_too_large}
+
+      {:ok, data} when is_binary(data) ->
+        {:ok, data}
+
+      _eof_or_missing ->
+        {:ok, ""}
     end
   end
 

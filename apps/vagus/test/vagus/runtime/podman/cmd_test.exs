@@ -49,10 +49,10 @@ defmodule Vagus.Runtime.Podman.CmdTest do
   end
 
   test "a non-zero exit carries the merged output" do
-    fake = FakePodman.start([{"start *", [{125, "Error: no such container\n"}]}])
+    fake = FakePodman.start([{"start *", [{125, "Error: no such container\n", run: "echo out"}]}])
 
     assert Cmd.run(["start", "--", "x"], timeout_ms: 5_000, podman_bin: fake.bin) ==
-             {:exit, 125, "Error: no such container\n"}
+             {:exit, 125, "out\nError: no such container\n"}
   end
 
   test "a missing binary is :unavailable" do
@@ -224,6 +224,99 @@ defmodule Vagus.Runtime.Podman.CmdTest do
       |> Enum.map(fn {:ok, reason} -> reason end)
 
     assert Enum.frequencies(reasons) == %{normal: 640}
+  end
+
+  describe "stderr_apart" do
+    # Stands in for podman's `--out`: stdout goes to the file it names.
+    defp split_script(body) do
+      script("""
+      for a; do case "$a" in --out=*) exec >"${a#--out=}" ;; esac; done
+      #{body}
+      """)
+    end
+
+    test "stdout comes back alone, whatever podman printed on stderr around it" do
+      {bin, _dir} =
+        split_script("""
+        echo 'time="t" level=warning msg="before"' >&2
+        printf '[{"Id":"a"}]\n'
+        sleep 0.1
+        echo 'time="t" level=error msg="after"' >&2
+        """)
+
+      assert Cmd.run(["ps"], timeout_ms: 5_000, podman_bin: bin, stderr_apart: true) ==
+               {:ok, ~s([{"Id":"a"}]\n)}
+
+      refute File.exists?(Cmd.out_path(nil))
+    end
+
+    test "a failure carries stderr alone, which the classifier reads" do
+      {bin, _dir} =
+        split_script("""
+        printf '[]\n'
+        echo 'Error: no such container "ghost"' >&2
+        exit 125
+        """)
+
+      assert {:exit, 125, err} =
+               Cmd.run(["container", "inspect"],
+                 timeout_ms: 5_000,
+                 podman_bin: bin,
+                 stderr_apart: true
+               )
+
+      assert err == ~s(Error: no such container "ghost"\n)
+      assert Vagus.Runtime.Podman.Error.classify(:inspect, 125, err) == {:error, :not_found}
+    end
+
+    test "a podman that never opened the file printed nothing" do
+      {bin, _dir} = script("exit 0\n")
+      assert Cmd.run([], timeout_ms: 5_000, podman_bin: bin, stderr_apart: true) == {:ok, ""}
+    end
+
+    test "stdout past the cap fails" do
+      {bin, _dir} = split_script("printf '%5000s' '' | tr ' ' x\n")
+
+      assert Cmd.run([], timeout_ms: 5_000, podman_bin: bin, cap: 100, stderr_apart: true) ==
+               {:error, :output_too_large}
+
+      assert {:ok, out} = Cmd.run([], timeout_ms: 5_000, podman_bin: bin, stderr_apart: true)
+      assert byte_size(out) == 5_000
+    end
+
+    # The file has no pipe to fill, so the cap is what stops the writer.
+    @tag timeout: 60_000
+    test "a podman still writing past the cap is killed" do
+      {bin, dir} =
+        split_script("""
+        head -c 10000000 /dev/zero
+        : > "$(dirname "$0")/written"
+        sleep 30
+        """)
+
+      started = System.monotonic_time(:millisecond)
+
+      assert Cmd.run([], timeout_ms: 20_000, podman_bin: bin, cap: 1_000, stderr_apart: true) ==
+               {:error, :output_too_large}
+
+      assert System.monotonic_time(:millisecond) - started < 10_000
+      assert File.exists?(Path.join(dir, "written"))
+      refute File.exists?(Cmd.out_path(nil))
+    end
+
+    @tag timeout: 60_000
+    test "the deadline still SIGTERMs podman" do
+      {bin, dir} = trapping_script(~s(echo term > "$d/term"; exit 0))
+
+      task =
+        Task.async(fn -> Cmd.run([], timeout_ms: 2_000, podman_bin: bin, stderr_apart: true) end)
+
+      pid = await_file(Path.join(dir, "pid"))
+
+      assert Task.await(task, 30_000) == {:error, :timeout}
+      assert File.read!(Path.join(dir, "term")) == "term\n"
+      refute alive?(pid), "podman #{pid} outlived run/2"
+    end
   end
 
   describe "decode/1" do

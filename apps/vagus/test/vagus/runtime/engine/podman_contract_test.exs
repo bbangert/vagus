@@ -541,6 +541,53 @@ defmodule Vagus.Runtime.Engine.PodmanContractTest do
       {_fake, opts} = engine(ctx, [{"ps *", [{0, Jason.encode!([paused])}]}])
       assert {:ok, [%Container{name: "p", state: :paused}]} = Engine.list(opts)
     end
+
+    # podman prints its warnings on stderr; merged into stdout, one after
+    # the JSON made it unparseable.
+    test "warnings podman prints on stderr, before and after, never reach the JSON", ctx do
+      fixture = &File.read!(Path.expand("../../../fixtures/podman/#{&1}", __DIR__))
+
+      around = [
+        run: ~s(echo 'time="t" level=warning msg="before"' >&2),
+        stderr: ~s(time="t" level=error msg="after"\n)
+      ]
+
+      {_fake, opts} =
+        engine(ctx, [
+          {"container inspect *", [{0, fixture.("inspect_running.json"), around}]},
+          {"ps *", [{0, fixture.("ps_all.json"), around}]},
+          {"stats *", [{0, fixture.("stats_sample1.json"), around}]},
+          {"create *", [{0, "c0ffee\n", around}]}
+        ])
+
+      assert {:ok, %Container{name: "fx_running"}} = Engine.inspect("fx_running", opts)
+      assert {:ok, [_ | _]} = Engine.list([all: true] ++ opts)
+      assert {:ok, %{}} = Engine.stats("fx_running", opts)
+      assert Engine.create(C.spec(), opts) == {:ok, "c0ffee"}
+    end
+
+    test "the error podman prints on stderr is still classified", ctx do
+      {_fake, opts} =
+        engine(ctx, [{"container inspect *", [{125, ~s(Error: no such container "ghost"\n)}]}])
+
+      assert Engine.inspect("ghost", opts) == {:error, :not_found}
+    end
+
+    test "a caller killed mid-call leaves no stdout file behind", ctx do
+      {fake, opts} = engine(ctx, [{"ps *", [{0, "[]", hold: true}]}])
+      caller = spawn(fn -> Engine.list(opts) end)
+      out = Vagus.Runtime.Podman.Cmd.out_path(opts[:host], caller)
+
+      Enum.find(1..1_000, fn _ -> File.exists?(out) or (Process.sleep(10) && false) end) ||
+        flunk("#{out} never appeared")
+
+      Process.exit(caller, :kill)
+
+      Enum.find(1..500, fn _ -> not File.exists?(out) or (Process.sleep(10) && false) end) ||
+        flunk("#{out} outlived its caller")
+
+      FakePodman.release(fake)
+    end
   end
 
   describe "podman stats" do
