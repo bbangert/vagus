@@ -314,7 +314,7 @@ defmodule Vagus.Core.Lifecycle do
   Restarts the Core container in place (an engine restart, no recreate),
   then runs the health gate.
 
-  `opts[:safe_mode]` (default `false`) touches Core's `safe-mode` marker
+  `opts[:safe_mode]` (default `false`) writes Core's `safe-mode` marker
   (see the moduledoc "Safe mode" section) BEFORE issuing the restart —
   Core's bootstrap consumes it on the boot this restart triggers.
   `opts[:force]` is accepted by the router but has no effect here (see

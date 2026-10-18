@@ -729,7 +729,7 @@ defmodule Vagus.Core.LifecycleTest do
   ## safe_mode marker (audit E3) — restart/1 and rebuild/1
 
   describe "restart/1 safe_mode marker" do
-    test "safe_mode: true touches an empty safe-mode file before the restart" do
+    test "safe_mode: true writes an empty safe-mode file before the restart" do
       dir = tmp_config_dir()
       {fake, opts} = engine(core("2026.7.0", :running))
 
@@ -864,7 +864,7 @@ defmodule Vagus.Core.LifecycleTest do
   end
 
   describe "rebuild/1 safe_mode marker" do
-    test "safe_mode: true touches the marker after the version resolves, before stop/remove/create" do
+    test "safe_mode: true writes the marker after the version resolves, before stop/remove/create" do
       dir = tmp_config_dir()
       {_fake, opts} = engine(core("2026.6.0", :running), ["2026.7.0"])
 
