@@ -5,9 +5,10 @@ defmodule Vagus.Runtime.Engine.PodmanLiveTest do
   # present and a `hassio` network. The shared contract suite cannot run
   # here: it pins ids, timestamps and failures no real engine reproduces, so
   # this suite checks the same behaviours on real containers. It creates and
-  # removes only `vagus_live_*` containers. Log follow and the events source
-  # read files podman writes, which through the wrapper live in another
-  # container, so they are covered on recorded output only.
+  # removes only `vagus_live_*` containers (through the wrapper, in a store
+  # of the run's own, which it empties at the end). Log follow and the
+  # events source read files podman writes, which through the wrapper live
+  # in another container, so they are covered on recorded output only.
   use ExUnit.Case, async: false
 
   @moduletag :podman
@@ -24,14 +25,17 @@ defmodule Vagus.Runtime.Engine.PodmanLiveTest do
 
   setup_all do
     bin = System.get_env("VAGUS_PODMAN_BIN") || System.find_executable("podman") || "podman"
-    root = Path.join(System.tmp_dir!(), "vagus-live-#{System.unique_integer([:positive])}")
+    run = System.fetch_env!("VAGUS_PODMAN_RUN")
+    # The run id, not just a VM-local integer: through the wrapper this path
+    # also exists in the shared podman container.
+    root = Path.join(System.tmp_dir!(), "vagus-live-#{run}")
     name = :vagus_live_host
     logs = Path.join(root, "logs")
     # Through the wrapper podman runs in another container, where conmon
     # needs the log directory too.
     in_container = String.ends_with?(bin, "podman_docker_exec.sh")
     container = System.get_env("VAGUS_PODMAN_CONTAINER", "vagus-podman-fixtures")
-    if in_container, do: {_, 0} = System.cmd("docker", ["exec", container, "mkdir", "-p", logs])
+    if in_container, do: seed_store(bin, container, logs, root)
 
     {:ok, pid} =
       Vagus.Runtime.Host.start_link(
@@ -60,11 +64,28 @@ defmodule Vagus.Runtime.Engine.PodmanLiveTest do
       cleanup(opts)
       Process.exit(pid, :kill)
       File.rm_rf(root)
-      if in_container, do: System.cmd("docker", ["exec", container, "rm", "-rf", root])
+      if in_container, do: drop_store(bin, container, run, root)
     end)
 
     Enum.find(1..300, fn _ -> Engine.ready(opts) == :ok or (Process.sleep(50) && false) end)
     %{opts: opts, logs: logs}
+  end
+
+  # The wrapper's per-run store starts empty, and the suite runs offline,
+  # so the image is copied in from the container's default store.
+  defp seed_store(bin, container, logs, root) do
+    {_, 0} = System.cmd("docker", ["exec", container, "mkdir", "-p", logs])
+    tar = Path.join(root, "image.tar")
+    {_, 0} = System.cmd(bin, ["save", "-o", tar, @image], env: [{"VAGUS_PODMAN_RUN", nil}])
+    {_, 0} = System.cmd(bin, ["load", "--quiet", "-i", tar])
+  end
+
+  # Best effort: these are the paths the wrapper derives from the run id.
+  defp drop_store(bin, container, run, root) do
+    System.cmd(bin, ["rm", "--all", "--force", "--time", "0"], stderr_to_stdout: true)
+    System.cmd(bin, ["rmi", "--all", "--force"], stderr_to_stdout: true)
+    dirs = [root, "/var/lib/vagus-test/#{run}", "/run/vagus-test/#{run}"]
+    System.cmd("docker", ["exec", container, "rm", "-rf" | dirs])
   end
 
   defp cleanup(opts) do
