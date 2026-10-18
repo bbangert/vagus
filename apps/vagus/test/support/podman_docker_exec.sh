@@ -47,8 +47,9 @@ if [ "$sub" = events ] || [ "$sub" = attach ] || [ -n "$follow" ]; then
   exec docker exec $envs "$c" podman $store "$@"
 fi
 
-# `docker exec` can return before podman exits, losing output and status,
-# so podman runs detached, to files inside the container that are polled.
+# Here `docker exec` returns after about 0.5 s whatever the process is
+# doing, with status 0 and no output, so anything longer runs detached, to
+# files inside the container that are polled.
 id="/tmp/vw.$$.$(date +%s%N)"
 
 # Cmd's stderr-only capture points stdout at /dev/null; then only stderr
@@ -63,10 +64,10 @@ else
   redir='>"$0.out" 2>&1'
 fi
 
-# The cancel marker closes both races with cancel() below: a cancel before
-# the pid is written still kills podman, and whichever side runs last
-# removes the files. The status is renamed into place so a poll never reads
-# a half-written one.
+# The cancel marker closes the race with cancel() below: a cancel before
+# the pid is written still kills podman. The status is renamed into place
+# so a poll never reads a half-written one, and cancel() removes the files
+# only once it is there, after which this never writes again.
 # shellcheck disable=SC2016
 inner='podman "$@" '"$redir"' &
 echo $! > "$0.pid"
@@ -76,21 +77,52 @@ echo $? > "$0.rc.tmp"
 mv "$0.rc.tmp" "$0.rc"
 [ -e "$0.cancel" ] && rm -f "$0.out" "$0.pid" "$0.rc" "$0.cancel"'
 
-# Cmd's own kill, SIGTERM then SIGKILL 3 s on: `podman run` passes a TERM
-# to the container, whose PID 1 may ignore it. Detached, because muontrap
-# SIGKILLs this script on the same 3 s.
+# Returns only once podman is gone: Cmd waits for muontrap, whose child is
+# this script, so returning early would free the Host permit under a live
+# podman. `podman run` passes a TERM to the container, whose PID 1 may
+# ignore it, hence the KILL. muontrap SIGKILLs this script 3 s after its
+# TERM; the reap's waits add up to at most 2.1 s (TERM grace 1.2 s), and
+# each poll costs about 0.05 s.
+# shellcheck disable=SC2016
+reap='f=$0
+ms() { echo $(($(date +%s%N) / 1000000)); }
+touch "$f.cancel"
+end=$(($(ms) + 300))
+while [ ! -s "$f.pid" ] && [ ! -e "$f.rc" ] && [ "$(ms)" -lt "$end" ]; do sleep 0.02; done
+p=$(cat "$f.pid" 2>/dev/null)
+if [ -n "$p" ] && [ ! -e "$f.rc" ]; then
+  kill "$p" 2>/dev/null
+  end=$(($(ms) + 1200))
+  while kill -0 "$p" 2>/dev/null && [ "$(ms)" -lt "$end" ]; do sleep 0.02; done
+  kill -9 "$p" 2>/dev/null
+  end=$(($(ms) + 300))
+  while kill -0 "$p" 2>/dev/null && [ "$(ms)" -lt "$end" ]; do sleep 0.02; done
+fi
+end=$(($(ms) + 300))
+while [ -e "$f.pid" ] && [ ! -e "$f.rc" ] && [ "$(ms)" -lt "$end" ]; do sleep 0.02; done
+rm -f "$f.out" "$f.pid" "$f.rc" "$f.rc.tmp" "$f.cancel"
+touch "$f.reaped"
+sleep 3
+rm -f "$f.reaped"'
+
+# Not `%3N`: some dates (uutils) ignore its width and print nanoseconds.
+now_ms() { echo $(($(date +%s%N) / 1000000)); }
+
+# The reap runs detached and is polled for, like podman itself; its marker
+# also removes itself, should this script be killed before it can.
 cancel() {
-  # shellcheck disable=SC2016
-  docker exec -d "$c" sh -c 'touch "$0.cancel"
-    [ -f "$0.pid" ] && kill "$(cat "$0.pid")" 2>/dev/null
-    [ -e "$0.rc" ] && rm -f "$0.out" "$0.pid" "$0.rc" "$0.cancel"
-    sleep 3
-    [ -f "$0.pid" ] && kill -9 "$(cat "$0.pid")" 2>/dev/null' "$id" >/dev/null 2>&1
+  docker exec -d "$c" sh -c "$reap" "$id" >/dev/null 2>&1 || return
+  end=$(($(now_ms) + 2600))
+  until docker exec "$c" test -e "$id.reaped"; do
+    [ "$(now_ms)" -ge "$end" ] && return
+    sleep 0.05
+  done
+  docker exec "$c" rm -f "$id.reaped"
 }
 
-# Cmd's deadline SIGTERMs this script; the podman inside must get it too,
-# or it outlives the caller's permit. The trap runs once the foreground
-# docker exec or sleep returns, so at most a poll late.
+# Cmd's deadline SIGTERMs this script; the podman inside must get it too.
+# The trap runs once the foreground docker exec or sleep returns, so at
+# most a poll late.
 trap 'cancel; exit 143' TERM INT HUP
 
 # shellcheck disable=SC2086
