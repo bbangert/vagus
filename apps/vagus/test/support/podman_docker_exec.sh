@@ -64,65 +64,44 @@ else
   redir='>"$0.out" 2>&1'
 fi
 
-# A launch and a cancel race to create `.go`, which mkdir does atomically:
-# a launch that loses never starts podman and, being the last to look,
-# removes the markers. One that wins still checks `.cancel` before podman
-# starts and again once its pid is published, so a cancel at any point
-# is seen. The status
-# is renamed into place so a poll never reads a half-written one.
+# The child publishes its pid and checks `.cancel` before it execs, so the
+# pid it publishes is podman's: either it sees `.cancel` and never becomes
+# podman, or cancel() sees the pid and kills it. The pid and the status
+# are renamed into place so nothing ever reads half of one.
 # shellcheck disable=SC2016
-inner='mkdir "$0.go" 2>/dev/null || { rm -f "$0.cancel"; rmdir "$0.go"; exit 0; }
-if [ -e "$0.cancel" ]; then
-  rm -f "$0.cancel"
-  rmdir "$0.go"
-  exit 0
-fi
-podman "$@" '"$redir"' &
-p=$!
-echo $p > "$0.pid"
-if [ -e "$0.cancel" ]; then
-  kill $p
-  (sleep 1.2; kill -9 $p 2>/dev/null) &
-fi
-wait $p
+inner='sh -c "echo \$\$ > \"\$0.pid.tmp\" && mv \"\$0.pid.tmp\" \"\$0.pid\"
+[ -e \"\$0.cancel\" ] && exit 130
+exec podman \"\$@\"" "$0" "$@" '"$redir"' &
+wait $!
 echo $? > "$0.rc.tmp"
 mv "$0.rc.tmp" "$0.rc"
-if [ -e "$0.cancel" ]; then
-  rm -f "$0.out" "$0.pid" "$0.rc" "$0.cancel"
-  rmdir "$0.go" 2>/dev/null
-fi'
+[ -e "$0.cancel" ] && rm -f "$0.out" "$0.pid" "$0.rc" "$0.cancel"'
 
 # Returns only once podman is gone: Cmd waits for muontrap, whose child is
 # this script, so returning early would free the Host permit under a live
-# podman. `podman run` passes a TERM to the container, whose PID 1 may
-# ignore it, hence the KILL. muontrap SIGKILLs this script 3 s after its
-# TERM, so the reap ends within 2.1 s, polls cost about 0.05 s, and a late
-# pid shortens the TERM grace (at most 1.2 s) rather than the KILL's 0.3 s.
-# `.cancel` stays until the status is in place: a launch slower than all
-# that still has to see it.
+# podman. `.cancel` is set before the pid is read, the reverse of the
+# child's order, so no pid read empty can ever become podman; such a late
+# launch clears the markers itself. `podman run` passes a TERM to the
+# container, whose PID 1 may ignore it, hence the KILL. muontrap SIGKILLs
+# this script 3 s after its TERM, so the reap ends within 1.8 s (TERM
+# grace 1.2 s) and polls cost about 0.05 s.
 # shellcheck disable=SC2016
 reap='f=$0
 ms() { echo $(($(date +%s%N) / 1000000)); }
-hard=$(($(ms) + 2100))
 touch "$f.cancel"
-if ! mkdir "$f.go" 2>/dev/null; then
-  while [ -d "$f.go" ] && [ ! -s "$f.pid" ] && [ ! -e "$f.rc" ] && [ "$(ms)" -lt $((hard - 500)) ]; do
-    sleep 0.02
-  done
-  p=$(cat "$f.pid" 2>/dev/null)
-  if [ -n "$p" ] && [ ! -e "$f.rc" ]; then
+p=$(cat "$f.pid" 2>/dev/null)
+if [ -n "$p" ]; then
+  if [ ! -e "$f.rc" ]; then
     kill "$p" 2>/dev/null
     end=$(($(ms) + 1200))
-    [ "$end" -gt $((hard - 300)) ] && end=$((hard - 300))
     while kill -0 "$p" 2>/dev/null && [ "$(ms)" -lt "$end" ]; do sleep 0.02; done
     kill -9 "$p" 2>/dev/null
-    while kill -0 "$p" 2>/dev/null && [ "$(ms)" -lt "$hard" ]; do sleep 0.02; done
+    end=$(($(ms) + 300))
+    while kill -0 "$p" 2>/dev/null && [ "$(ms)" -lt "$end" ]; do sleep 0.02; done
   fi
-  while [ -e "$f.pid" ] && [ ! -e "$f.rc" ] && [ "$(ms)" -lt "$hard" ]; do sleep 0.02; done
-  if [ -e "$f.rc" ]; then
-    rm -f "$f.out" "$f.pid" "$f.rc" "$f.cancel"
-    rmdir "$f.go" 2>/dev/null
-  fi
+  end=$(($(ms) + 300))
+  while [ ! -e "$f.rc" ] && [ "$(ms)" -lt "$end" ]; do sleep 0.02; done
+  [ -e "$f.rc" ] && rm -f "$f.out" "$f.pid" "$f.rc" "$f.cancel"
 fi
 touch "$f.reaped"
 sleep 3
@@ -174,6 +153,6 @@ else
   docker exec "$c" cat "$id.out"
 fi
 # shellcheck disable=SC2016
-rc=$(docker exec "$c" sh -c 'cat "$0.rc"; rm -f "$0.out" "$0.rc" "$0.pid"; rmdir "$0.go"' "$id")
+rc=$(docker exec "$c" sh -c 'cat "$0.rc"; rm -f "$0.out" "$0.rc" "$0.pid"' "$id")
 # Empty when the container went away under the call.
 exit "${rc:-125}"
