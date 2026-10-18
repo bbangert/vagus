@@ -507,12 +507,26 @@ defmodule Vagus.Runtime.Host do
   def handle_info({:DOWN, mon, :process, _pid, _reason}, state) do
     held = for {ref, {_class, _pid, ^mon, out}} <- state.holders, do: {ref, out}
     Enum.each(held, fn {_ref, out} -> drop_out_file(out) end)
+
+    # The caller's death does not end its podman, which may yet open `--out`
+    # and so create the file again; once muontrap's kill budget has passed
+    # it is gone, and that second removal is final. The path is unique to
+    # its call, so it never takes a later call's file.
+    for {_ref, out} <- held, out != nil do
+      Process.send_after(self(), {:drop_out, make_ref(), out}, Cmd.kill_budget_ms())
+    end
+
     state = Enum.reduce(held, state, fn {ref, _out}, state -> release(state, ref) end)
 
     waiting =
       Map.new(state.waiting, fn {c, q} -> {c, :queue.filter(&(elem(&1, 2) != mon), q)} end)
 
     {:noreply, %{state | waiting: waiting}}
+  end
+
+  def handle_info({:drop_out, ref, path}, state) when is_reference(ref) do
+    drop_out_file(path)
+    {:noreply, state}
   end
 
   def handle_info(:probe, state), do: {:noreply, start_probe(state)}
@@ -785,11 +799,10 @@ defmodule Vagus.Runtime.Host do
   # before Cmd's poll stops it. Their own tmpfs bounds that: room for every
   # permit's call at the cap at once (a health check holds an ops permit),
   # and one more for a burst the poll has not caught yet. A fresh Host has
-  # no holders, so anything already there is an orphan: from a Host that
-  # died, or a podman that recreated its file after its dead caller's was
-  # removed. Without that bound the dir is never published, and split calls
-  # keep stderr merged as before, where the pipe holds podman back; failing
-  # them instead would stop every inspect, list and create.
+  # no holders, so anything already there is an orphan of a Host that died
+  # with removals still due. Without that bound the dir is never published,
+  # and split calls keep stderr merged as before, where the pipe holds podman
+  # back; failing them instead would stop every inspect, list and create.
   # sobelow_skip ["Traversal.FileModule"]
   defp prepare_out_dir(state) do
     dir = out_dir_of(state.opts)
@@ -953,11 +966,9 @@ defmodule Vagus.Runtime.Host do
   defp run_dir(opts), do: Keyword.get(opts, :run_dir, "/run/vagus/podman")
   defp out_dir_of(opts), do: Path.join(run_dir(opts), "out")
 
-  # A holder killed mid-call never reaches Cmd's own cleanup. Its podman
-  # lives on for up to muontrap's SIGKILL delay: a file it already holds
-  # open keeps its space until it exits; one it has yet to open it creates
-  # again, which the next preparation's sweep removes. The path is one Cmd
-  # made in this Host's out dir.
+  # A holder killed mid-call never reaches Cmd's own cleanup. A file its
+  # podman already holds open keeps its space until podman exits. The path
+  # is one Cmd made in this Host's out dir.
   defp drop_out_file(nil), do: :ok
   # sobelow_skip ["Traversal.FileModule"]
   defp drop_out_file(path), do: _ = File.rm(path)

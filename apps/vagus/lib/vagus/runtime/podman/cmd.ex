@@ -55,6 +55,10 @@ defmodule Vagus.Runtime.Podman.Cmd do
   @spec default_cap() :: pos_integer()
   def default_cap, do: @default_cap
 
+  @doc "How long a podman can outlive the port it was started from."
+  @spec kill_budget_ms() :: pos_integer()
+  def kill_budget_ms, do: @sigkill_delay_ms + 2_000
+
   @doc """
   Options: `:timeout_ms` (required), `:cap` (bytes, default 1 MiB),
   `:truncate` (past the cap keep the head instead of failing with
@@ -278,7 +282,7 @@ defmodule Vagus.Runtime.Podman.Cmd do
   defp close(port, result) do
     muontrap = Port.info(port, :os_pid)
     Port.close(port)
-    with {:os_pid, pid} <- muontrap, do: await_exit(pid, @sigkill_delay_ms + 2_000)
+    with {:os_pid, pid} <- muontrap, do: await_exit(pid, kill_budget_ms())
     result
   rescue
     ArgumentError -> result

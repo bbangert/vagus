@@ -605,6 +605,49 @@ defmodule Vagus.Runtime.Engine.PodmanContractTest do
       FakePodman.release(fake)
     end
 
+    # A podman that opens `--out` only after its dead caller's file was
+    # removed creates it again; TERM ignored, it lives until muontrap's
+    # SIGKILL. The Host removes the path once more past that.
+    @tag timeout: 60_000
+    test "a file a killed caller's podman creates again is removed too" do
+      dir = Path.join(System.tmp_dir!(), "podman-late-#{System.unique_integer([:positive])}")
+      File.mkdir_p!(dir)
+      on_exit(fn -> File.rm_rf(dir) end)
+      bin = Path.join(dir, "podman")
+
+      File.write!(bin, """
+      #!/bin/sh
+      trap '' TERM
+      for a; do case "$a" in --out=*) out="${a#--out=}" ;; info) exit 0 ;; esac; done
+      : > "#{dir}/started"
+      while [ ! -e "#{dir}/released" ]; do sleep 0.02; done
+      printf '[]\\n' > "$out"
+      : > "#{dir}/wrote"
+      sleep 30
+      """)
+
+      File.chmod!(bin, 0o755)
+      host = FakePodman.start_host(bin)
+      {:ok, out_dir} = Vagus.Runtime.Host.out_dir(host)
+      opts = [engine: Engine.Podman, host: host, podman_bin: bin]
+      caller = spawn(fn -> Engine.list(opts) end)
+      await_path(Path.join(dir, "started"), 1_000)
+
+      {:ok, spare} = Vagus.Runtime.Host.checkout(host, :ops, 0)
+      Process.exit(caller, :kill)
+      assert {:ok, freed} = Vagus.Runtime.Host.checkout(host, :ops, 5_000)
+      assert File.ls!(out_dir) == []
+
+      File.write!(Path.join(dir, "released"), "")
+      await_path(Path.join(dir, "wrote"), 1_000)
+      assert [_recreated] = File.ls!(out_dir)
+
+      Enum.find(1..1_000, fn _ -> File.ls!(out_dir) == [] or (Process.sleep(10) && false) end) ||
+        flunk("the recreated file outlived its podman")
+
+      Enum.each([spare, freed], &Vagus.Runtime.Host.checkin/1)
+    end
+
     test "with no tmpfs of its own, a split call is merged and still parses" do
       fake = FakePodman.start([{"ps *", [{0, "[]\n"}]}])
 
@@ -1293,6 +1336,11 @@ defmodule Vagus.Runtime.Engine.PodmanContractTest do
 
       assert FakePodman.verbs(fake) == [["info", "--format", "{{.Version.Version}}"]]
     end
+  end
+
+  defp await_path(path, tries) do
+    Enum.find(1..tries, fn _ -> File.exists?(path) or (Process.sleep(10) && false) end) ||
+      flunk("#{path} never appeared")
   end
 
   defp await_waiter(host, class \\ :ops, n \\ 1) do
