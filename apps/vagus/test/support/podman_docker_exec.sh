@@ -64,43 +64,66 @@ else
   redir='>"$0.out" 2>&1'
 fi
 
-# The cancel marker closes the race with cancel() below: a cancel before
-# the pid is written still kills podman. The status is renamed into place
-# so a poll never reads a half-written one, and cancel() removes the files
-# only once it is there, after which this never writes again.
+# A launch and a cancel race to create `.go`, which mkdir does atomically:
+# a launch that loses never starts podman and, being the last to look,
+# removes the markers. One that wins still checks `.cancel` before podman
+# starts and again once its pid is published, so a cancel at any point
+# is seen. The status
+# is renamed into place so a poll never reads a half-written one.
 # shellcheck disable=SC2016
-inner='podman "$@" '"$redir"' &
-echo $! > "$0.pid"
-[ -e "$0.cancel" ] && kill $!
-wait $!
+inner='mkdir "$0.go" 2>/dev/null || { rm -f "$0.cancel"; rmdir "$0.go"; exit 0; }
+if [ -e "$0.cancel" ]; then
+  rm -f "$0.cancel"
+  rmdir "$0.go"
+  exit 0
+fi
+podman "$@" '"$redir"' &
+p=$!
+echo $p > "$0.pid"
+if [ -e "$0.cancel" ]; then
+  kill $p
+  (sleep 1.2; kill -9 $p 2>/dev/null) &
+fi
+wait $p
 echo $? > "$0.rc.tmp"
 mv "$0.rc.tmp" "$0.rc"
-[ -e "$0.cancel" ] && rm -f "$0.out" "$0.pid" "$0.rc" "$0.cancel"'
+if [ -e "$0.cancel" ]; then
+  rm -f "$0.out" "$0.pid" "$0.rc" "$0.cancel"
+  rmdir "$0.go" 2>/dev/null
+fi'
 
 # Returns only once podman is gone: Cmd waits for muontrap, whose child is
 # this script, so returning early would free the Host permit under a live
 # podman. `podman run` passes a TERM to the container, whose PID 1 may
 # ignore it, hence the KILL. muontrap SIGKILLs this script 3 s after its
-# TERM; the reap's waits add up to at most 2.1 s (TERM grace 1.2 s), and
-# each poll costs about 0.05 s.
+# TERM, so the reap ends within 2.1 s, polls cost about 0.05 s, and a late
+# pid shortens the TERM grace (at most 1.2 s) rather than the KILL's 0.3 s.
+# `.cancel` stays until the status is in place: a launch slower than all
+# that still has to see it.
 # shellcheck disable=SC2016
 reap='f=$0
 ms() { echo $(($(date +%s%N) / 1000000)); }
+hard=$(($(ms) + 2100))
 touch "$f.cancel"
-end=$(($(ms) + 300))
-while [ ! -s "$f.pid" ] && [ ! -e "$f.rc" ] && [ "$(ms)" -lt "$end" ]; do sleep 0.02; done
-p=$(cat "$f.pid" 2>/dev/null)
-if [ -n "$p" ] && [ ! -e "$f.rc" ]; then
-  kill "$p" 2>/dev/null
-  end=$(($(ms) + 1200))
-  while kill -0 "$p" 2>/dev/null && [ "$(ms)" -lt "$end" ]; do sleep 0.02; done
-  kill -9 "$p" 2>/dev/null
-  end=$(($(ms) + 300))
-  while kill -0 "$p" 2>/dev/null && [ "$(ms)" -lt "$end" ]; do sleep 0.02; done
+if ! mkdir "$f.go" 2>/dev/null; then
+  while [ -d "$f.go" ] && [ ! -s "$f.pid" ] && [ ! -e "$f.rc" ] && [ "$(ms)" -lt $((hard - 500)) ]; do
+    sleep 0.02
+  done
+  p=$(cat "$f.pid" 2>/dev/null)
+  if [ -n "$p" ] && [ ! -e "$f.rc" ]; then
+    kill "$p" 2>/dev/null
+    end=$(($(ms) + 1200))
+    [ "$end" -gt $((hard - 300)) ] && end=$((hard - 300))
+    while kill -0 "$p" 2>/dev/null && [ "$(ms)" -lt "$end" ]; do sleep 0.02; done
+    kill -9 "$p" 2>/dev/null
+    while kill -0 "$p" 2>/dev/null && [ "$(ms)" -lt "$hard" ]; do sleep 0.02; done
+  fi
+  while [ -e "$f.pid" ] && [ ! -e "$f.rc" ] && [ "$(ms)" -lt "$hard" ]; do sleep 0.02; done
+  if [ -e "$f.rc" ]; then
+    rm -f "$f.out" "$f.pid" "$f.rc" "$f.cancel"
+    rmdir "$f.go" 2>/dev/null
+  fi
 fi
-end=$(($(ms) + 300))
-while [ -e "$f.pid" ] && [ ! -e "$f.rc" ] && [ "$(ms)" -lt "$end" ]; do sleep 0.02; done
-rm -f "$f.out" "$f.pid" "$f.rc" "$f.rc.tmp" "$f.cancel"
 touch "$f.reaped"
 sleep 3
 rm -f "$f.reaped"'
@@ -151,6 +174,6 @@ else
   docker exec "$c" cat "$id.out"
 fi
 # shellcheck disable=SC2016
-rc=$(docker exec "$c" sh -c 'cat "$0.rc"; rm -f "$0.out" "$0.rc" "$0.pid"' "$id")
+rc=$(docker exec "$c" sh -c 'cat "$0.rc"; rm -f "$0.out" "$0.rc" "$0.pid"; rmdir "$0.go"' "$id")
 # Empty when the container went away under the call.
 exit "${rc:-125}"
