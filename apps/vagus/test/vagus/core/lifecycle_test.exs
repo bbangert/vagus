@@ -776,6 +776,93 @@ defmodule Vagus.Core.LifecycleTest do
     end
   end
 
+  defp safe_restart(dir) do
+    {fake, opts} = engine(core("2026.7.0", :running))
+
+    result =
+      Lifecycle.restart(opts ++ [health: health_fun(), safe_mode: true, homeassistant_path: dir])
+
+    {result, fake}
+  end
+
+  defp outside_file do
+    path = Path.join(System.tmp_dir!(), "vagus_test_lifecycle_outside_#{unique()}")
+    File.write!(path, "host data")
+    File.touch!(path, 1_000_000_000)
+    on_exit(fn -> File.rm(path) end)
+    path
+  end
+
+  defp assert_regular_empty_marker(dir) do
+    marker = Path.join(dir, "safe-mode")
+    assert {:ok, %File.Stat{type: :regular}} = File.lstat(marker)
+    assert File.read!(marker) == ""
+  end
+
+  defp ok_verbs({result, fake}) do
+    assert_receive :health_called
+    {result, verbs(fake)}
+  end
+
+  describe "safe_mode marker over an existing entry" do
+    test "an existing regular marker is left as-is" do
+      dir = tmp_config_dir()
+      File.write!(Path.join(dir, "safe-mode"), "")
+
+      assert {:ok, [:restart]} = ok_verbs(safe_restart(dir))
+      assert_regular_empty_marker(dir)
+    end
+
+    test "a symlink at the marker name is replaced, its target untouched" do
+      dir = tmp_config_dir()
+      target = outside_file()
+      before = File.stat!(target, time: :posix)
+      File.ln_s!(target, Path.join(dir, "safe-mode"))
+
+      assert {:ok, [:restart]} = ok_verbs(safe_restart(dir))
+      assert_regular_empty_marker(dir)
+      assert File.read!(target) == "host data"
+      assert File.stat!(target, time: :posix).mtime == before.mtime
+    end
+
+    test "a dangling symlink is replaced and its target never created" do
+      dir = tmp_config_dir()
+      target = Path.join(System.tmp_dir!(), "vagus_test_lifecycle_dangling_#{unique()}")
+      on_exit(fn -> File.rm(target) end)
+      File.ln_s!(target, Path.join(dir, "safe-mode"))
+
+      assert {:ok, [:restart]} = ok_verbs(safe_restart(dir))
+      assert_regular_empty_marker(dir)
+      refute File.exists?(target)
+    end
+
+    test "an empty directory at the marker name is replaced" do
+      dir = tmp_config_dir()
+      File.mkdir!(Path.join(dir, "safe-mode"))
+
+      assert {:ok, [:restart]} = ok_verbs(safe_restart(dir))
+      assert_regular_empty_marker(dir)
+    end
+
+    test "a non-empty directory aborts the restart before any engine call" do
+      dir = tmp_config_dir()
+      File.mkdir_p!(Path.join([dir, "safe-mode", "inner"]))
+
+      assert {{:error, {:safe_mode_marker, _reason}}, fake} = safe_restart(dir)
+      assert Fake.calls(fake) == []
+      assert File.dir?(Path.join([dir, "safe-mode", "inner"]))
+    end
+
+    test "a fifo at the marker name is replaced" do
+      dir = tmp_config_dir()
+      marker = Path.join(dir, "safe-mode")
+      {_, 0} = System.cmd("mkfifo", [marker])
+
+      assert {:ok, [:restart]} = ok_verbs(safe_restart(dir))
+      assert_regular_empty_marker(dir)
+    end
+  end
+
   describe "rebuild/1 safe_mode marker" do
     test "safe_mode: true touches the marker after the version resolves, before stop/remove/create" do
       dir = tmp_config_dir()

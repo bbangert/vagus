@@ -199,12 +199,18 @@ defmodule Vagus.Core.Lifecycle do
   (`homeassistant/core.py`) touches an empty `safe-mode` file at the root
   of Core's `/config` before the restart it triggers; Core's bootstrap
   consumes (and deletes) that marker on its next boot, starting with
-  custom components disabled. This module does the same: `File.touch/1` on
-  `Vagus.Core.Container.config_path/1` joined with `"safe-mode"` —
-  Core's `/config` is the `vagus-core-config` named volume, and
-  `config_path/1` resolves its host-side directory (injectable via
+  custom components disabled. This module does the same: it creates an
+  empty `"safe-mode"` file in `Vagus.Core.Container.config_path/1`, the
+  host-side directory bound as Core's `/config` (injectable via
   `opts[:homeassistant_path]`, same key `Vagus.Backend.Host.DiskBreakdown`
-  uses for the same volume).
+  uses for the same directory).
+
+  Core controls that directory's contents, so the marker is never written
+  through whatever already sits at that name: the file is created with
+  `O_CREAT|O_EXCL`, an existing regular file counts as the marker already
+  being there, and any other entry (a symlink, an empty directory, a fifo)
+  is unlinked first. Unlinking a symlink removes the link, never its
+  target. A non-empty directory can't be unlinked and aborts the op.
 
   The write happens before any container-affecting engine call, and a
   write failure **aborts the whole op** (`{:error, {:safe_mode_marker,
@@ -565,25 +571,52 @@ defmodule Vagus.Core.Lifecycle do
     end
   end
 
-  # `mkdir_p` first: the volume's host-side directory (`Container.config_path/1`)
-  # may not exist yet (Core never adopted/created on this device), and
-  # `File.touch/1` alone does not create parents — without this, that
-  # ordinary case would abort the whole safe-mode op with `:enoent`. A failed `mkdir_p` still aborts, same as a
-  # failed `touch` — see the moduledoc's "fail loud" contract.
+  # `mkdir_p` first: the directory may not exist yet (Core never created on
+  # this device), and the exclusive create doesn't make parents.
   #
-  # The path is config-derived (`Container.config_path/1`: engine data_root
-  # + the constant volume name) joined with a constant filename — no
-  # request input reaches it; the `opts` seam is test-only.
+  # The path is config-derived (`Container.config_path/1`) joined with a
+  # constant filename — no request input reaches it; the `opts` seam is
+  # test-only.
   # sobelow_skip ["Traversal.FileModule"]
   defp write_safe_mode_marker(opts) do
     path = Path.join(Container.config_path(opts), @safe_mode_marker)
 
     with :ok <- File.mkdir_p(Path.dirname(path)),
-         :ok <- File.touch(path) do
+         :ok <- create_marker(path) do
       :ok
     else
       {:error, reason} -> {:error, {:safe_mode_marker, reason}}
     end
+  end
+
+  defp create_marker(path) do
+    case create_exclusive(path) do
+      {:error, :eexist} -> reuse_or_replace(path)
+      other -> other
+    end
+  end
+
+  # Removing junk rather than refusing keeps the recovery flow working for a
+  # Core whose own breakage left something at this name.
+  # sobelow_skip ["Traversal.FileModule"]
+  defp reuse_or_replace(path) do
+    case File.lstat(path) do
+      {:ok, %File.Stat{type: :regular}} -> :ok
+      {:ok, %File.Stat{type: :directory}} -> replace_with(&File.rmdir/1, path)
+      {:ok, %File.Stat{}} -> replace_with(&File.rm/1, path)
+      {:error, :enoent} -> create_exclusive(path)
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  # A second `:eexist` means something raced the unlink; fail rather than loop.
+  defp replace_with(unlink, path) do
+    with :ok <- unlink.(path), do: create_exclusive(path)
+  end
+
+  # sobelow_skip ["Traversal.FileModule"]
+  defp create_exclusive(path) do
+    with {:ok, fd} <- File.open(path, [:write, :exclusive, :raw]), do: File.close(fd)
   end
 
   defp stop_if_present(opts) do
