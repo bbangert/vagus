@@ -72,6 +72,10 @@ defmodule Vagus.App do
   @spec installed?(String.t()) :: boolean()
   def installed?(slug), do: match?({:ok, true}, ask_healing(slug, :installed?))
 
+  @doc "Installed, but its file does not load: listed and uninstallable, nothing else."
+  @spec refused?(String.t()) :: boolean()
+  def refused?(slug), do: match?({:ok, true}, ask_healing(slug, :refused?))
+
   @spec slugs() :: [String.t()]
   def slugs, do: Enum.sort(AppFile.saved())
 

@@ -837,6 +837,50 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
     end
   end
 
+  # Saved by an earlier release, before `privileged:` was checked: listed
+  # and installed, but its process takes no write.
+  describe "settings routes on an app whose file does not load" do
+    setup do
+      slug = "core_refused"
+      path = Path.join(AppFile.dir(), slug <> ".json")
+      raw = fixture_config("refused") |> Map.put(:slug, slug) |> Config.to_persistable()
+
+      body =
+        Jason.encode!(%{"config" => Map.put(raw, "privileged", ["ALL"]), "wanted" => "stopped"})
+
+      File.mkdir_p!(AppFile.dir())
+      File.write!(path, body)
+      on_exit(fn -> forget_app(slug) end)
+      ExUnit.CaptureLog.capture_log(fn -> {:ok, _pid} = Vagus.App.Instances.ensure(slug) end)
+      %{path: path, saved: body}
+    end
+
+    for {name, change} <- [
+          options: %{"options" => %{"greeting" => "hello"}},
+          watchdog: %{"watchdog" => true},
+          ingress_panel: %{"ingress_panel" => true},
+          network: %{"network" => %{}},
+          boot: %{"boot" => "manual"},
+          auto_update: %{"auto_update" => true}
+        ] do
+      test "options #{name} is refused with a 400, nothing saved", %{path: path, saved: saved} do
+        conn =
+          supervisor_call(:post, "/addons/core_refused/options", unquote(Macro.escape(change)))
+
+        assert conn.status == 400
+        assert body(conn)["message"] == "App core_refused cannot be loaded; uninstall it"
+        assert File.read!(path) == saved
+      end
+    end
+
+    test "security is refused with a 400, nothing saved", %{path: path, saved: saved} do
+      conn = supervisor_call(:post, "/addons/core_refused/security", %{"protected" => false})
+      assert conn.status == 400
+      assert body(conn)["message"] == "App core_refused cannot be loaded; uninstall it"
+      assert File.read!(path) == saved
+    end
+  end
+
   describe "GET /addons" do
     test "reflects installed add-ons from State" do
       config = fixture_config("listed") |> Map.put(:slug, "core_listed")

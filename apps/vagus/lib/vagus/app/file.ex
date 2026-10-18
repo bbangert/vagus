@@ -10,9 +10,9 @@ defmodule Vagus.App.File do
   Loading never bricks a boot. `Config.parse/1` re-validates the config, so a
   file it rejects, or one that is not JSON, is logged and its app is not
   started; it is never taken for a slug with no file, which an install would
-  overwrite. Every other field decodes tolerantly to its default, except
-  `protected`, which falls back to `true` because it gates `full_access`,
-  `host_pid` and `docker_api`.
+  overwrite. `stub/2` is what such an app is uninstalled with. Every other
+  field decodes tolerantly to its default, except `protected`, which falls
+  back to `true` because it gates `full_access`, `host_pid` and `docker_api`.
 
   A decoded file whose ingress token had to be minted carries `rewrite:
   true`: its owner saves it once, or each read would mint another and the
@@ -43,6 +43,34 @@ defmodule Vagus.App.File do
            do: decode(slug, raw)
     else
       :error
+    end
+  end
+
+  @doc """
+  What uninstalling an app whose file `read/2` refuses needs: its slug, plus
+  the image, ingress flag and backend when the file still names them validly,
+  so the image and the Core panel go as a normal uninstall's do. Built
+  through `Config.parse/1`, so nothing the file says is used unvalidated, and
+  never started.
+  """
+  @spec stub(String.t(), String.t()) :: Config.t()
+  def stub(slug, dir \\ dir()) do
+    fields =
+      with {:ok, content} <- read_file(path(dir, slug)),
+           {:ok, %{"config" => raw}} when is_map(raw) <- Jason.decode(content) do
+        Map.take(raw, ~w(name version image ingress backend))
+      else
+        _unreadable -> %{}
+      end
+
+    base = %{"name" => slug, "version" => "unknown", "slug" => slug, "description" => slug}
+
+    case Config.parse(base |> Map.merge(fields) |> Map.put("arch", [])) do
+      {:ok, config} ->
+        config
+
+      {:error, _reason} ->
+        %Config{slug: slug, name: slug, version: "unknown", description: "", arch: []}
     end
   end
 
@@ -182,16 +210,36 @@ defmodule Vagus.App.File do
     staging = dir <> ".import"
     File.rm_rf!(staging)
 
-    for {slug, raw} <- entries,
-        {:ok, data} <- [decode(slug, Map.put(raw, "wanted", raw["state"]))],
-        do: :ok = write(data, staging)
-
     File.mkdir_p!(staging)
+    Enum.each(entries, fn {slug, raw} -> import_entry(staging, slug, raw) end)
     File.mkdir_p!(Path.dirname(dir))
     :ok = File.rename(staging, dir)
     count = length(saved(dir))
     Logger.info("Vagus.App.File: imported #{count} of #{map_size(entries)} apps from #{legacy}")
     {:ok, count}
+  end
+
+  # A record this release rejects is still an installed app, with a
+  # container and data behind it. Kept as it was, it loads refused: listed,
+  # never started, uninstallable. Dropped, nothing could remove it, since the
+  # import never runs again. Only a slug unsafe as a file name, or Vagus's
+  # own, has nowhere to go.
+  defp import_entry(staging, slug, raw) do
+    raw = Map.put(raw, "wanted", raw["state"])
+
+    case decode(slug, raw) do
+      {:ok, data} ->
+        :ok = write(data, staging)
+
+      {:error, _invalid} ->
+        if Config.valid_slug?(slug) and not Config.reserved_slug?(slug) do
+          {:ok, json} = Jason.encode(raw)
+          :ok = replace(path(staging, slug), json)
+          Logger.warning("Vagus.App.File: imported #{inspect(slug)} as it was; it will not start")
+        else
+          Logger.warning("Vagus.App.File: #{inspect(slug)} not imported: not a usable slug")
+        end
+    end
   end
 
   defp legacy_entries(nil), do: {:ok, %{}}
@@ -235,7 +283,15 @@ defmodule Vagus.App.File do
          protected: decode_protected(raw)
        }}
     else
-      _ -> skip(slug)
+      # A config an earlier release accepted can fail a rule added since,
+      # e.g. a capability outside the allowlist; the reason is what the user
+      # needs to see why the app no longer starts.
+      {:error, reason} when is_binary(reason) ->
+        Logger.warning("Vagus.App.File: skipping app #{inspect(slug)}: #{reason}")
+        {:error, :invalid}
+
+      _ ->
+        skip(slug)
     end
   end
 

@@ -179,6 +179,35 @@ defmodule Vagus.Addon.StoreTest do
     assert map_size(catalog) == 1
   end
 
+  test "a config asking for a capability outside the allowlist never reaches the catalog" do
+    defmodule CapsFetcher do
+      def fetch(%{slug: "core"}) do
+        {:ok,
+         [
+           {"mosquitto/config.yaml", Vagus.Addon.StoreTest.mosquitto_yaml()},
+           {"greedy/config.yaml",
+            """
+            name: Greedy
+            version: "1.0.0"
+            slug: greedy
+            description: asks for everything
+            arch: [aarch64]
+            privileged: [NET_ADMIN, ALL]
+            """}
+         ]}
+      end
+    end
+
+    log =
+      capture_log(fn ->
+        catalog = Store.build_catalog(@repos, CapsFetcher)
+        assert Map.keys(catalog) == ["core_mosquitto"]
+      end)
+
+    assert log =~ "greedy/config.yaml"
+    assert log =~ ~s(unknown capability \\"ALL\\")
+  end
+
   test "the Store GenServer reloads + serves the catalog" do
     srv = start_supervised!({Store, name: nil, fetcher: FixtureFetcher, repositories: @repos})
 

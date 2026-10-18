@@ -145,6 +145,7 @@ defmodule Vagus.App.Steps do
   defp step(:stop, %{config: config} = input) do
     opts = opts(input)
     id = container_name(config.slug)
+    :ok = stop_refused_native(input, id)
     was_running = match?({:ok, :running}, backend(opts).state(id))
 
     with :ok <- stop_and_remove_container(id, opts, input[:strict] == true),
@@ -293,7 +294,7 @@ defmodule Vagus.App.Steps do
   defp step(:remove_app, %{config: config} = input) do
     opts = opts(input)
     remove_image_best_effort(config, opts)
-    maybe_push_panel(config, opts)
+    maybe_push_panel(config, input[:refused] == true, opts)
 
     case remove_data_dir(config.slug, opts) do
       :ok -> {:ok, :ok}
@@ -1006,6 +1007,16 @@ defmodule Vagus.App.Steps do
     end
   end
 
+  # A refused app's stub can lose `backend` with the rest of its file, which
+  # would leave a running broker listening after its file and data are gone.
+  # An allowlisted slug may be either runtime, so the native one is stopped
+  # too; stopping one that is not there is a no-op.
+  defp stop_refused_native(%{refused: true, config: %Config{slug: slug}}, id) do
+    if native_allowed?(slug), do: Vagus.Addon.Backend.Native.stop(id), else: :ok
+  end
+
+  defp stop_refused_native(_input, _id), do: :ok
+
   defp stop_container(id, opts, strict?) do
     case backend(opts).stop(id, opts) do
       result when result in [:ok, {:error, :not_found}] ->
@@ -1079,12 +1090,15 @@ defmodule Vagus.App.Steps do
   # panel itself at startup. Always a DELETE: the app's own process still
   # answers `info` while this runs, so letting `Panels` choose would read the
   # panel as still enabled.
-  defp maybe_push_panel(%Config{ingress: true, slug: slug}, opts) do
-    panels(opts).update_hass_panel(slug, method: :delete)
+  # A refused app's stub may not know it had ingress, so its panel goes by
+  # slug, a no-op on Core for one it never had. The reserved slug's panel
+  # is Vagus's own, never an app's.
+  defp maybe_push_panel(%Config{slug: slug} = config, refused?, opts) do
+    if (config.ingress or refused?) and not Config.reserved_slug?(slug),
+      do: panels(opts).update_hass_panel(slug, method: :delete)
+
     :ok
   end
-
-  defp maybe_push_panel(_config, _opts), do: :ok
 
   defp panels(opts), do: Keyword.get(opts, :panels, Panels)
 

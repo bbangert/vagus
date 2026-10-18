@@ -30,7 +30,7 @@ defmodule Vagus.Addon.Config do
   `Vagus.Addon.Availability`: `homeassistant` is a nilable version-floor
   string (`opt_str`, same shape as `watchdog`/`webui`/`image` — an opaque
   tag, not something this module orders); `machine` is a plain list of
-  strings (`str_list`, same shape as `discovery`/`privileged`/`devices` —
+  strings (`str_list`, same shape as `discovery`/`devices` —
   no charset enforcement here either, matching this module's existing
   looseness on every other bare string-list field). Neither field is
   otherwise interpreted by `parse/1` itself; `Availability` owns what they
@@ -77,6 +77,10 @@ defmodule Vagus.Addon.Config do
   @roles ~w(default homeassistant backup manager admin)
   @backup_modes ~w(hot cold)
   @stages ~w(stable experimental deprecated)
+  # Mirrors upstream's `Capabilities` enum (supervisor/docker/const.py), matched by exact value.
+  @capabilities ~w(AUDIT_WRITE BPF CHECKPOINT_RESTORE DAC_READ_SEARCH IPC_LOCK
+                   MKNOD NET_ADMIN NET_RAW PERFMON SETFCAP SYS_ADMIN SYS_MODULE
+                   SYS_NICE SYS_PTRACE SYS_RAWIO SYS_RESOURCE SYS_TIME)
 
   @type mapping :: %{type: String.t(), read_only: boolean(), path: String.t() | nil}
 
@@ -204,6 +208,9 @@ defmodule Vagus.Addon.Config do
   end
 
   def parse(_raw), do: {:error, "config must be a map"}
+
+  @spec capabilities() :: [String.t()]
+  def capabilities, do: @capabilities
 
   @doc """
   The shared "is this slug safe to interpolate into a filesystem path" check
@@ -372,7 +379,7 @@ defmodule Vagus.Addon.Config do
     |> put(:host_pid, boolean(raw, "host_pid", false))
     |> put(:host_ipc, boolean(raw, "host_ipc", false))
     |> put(:host_uts, boolean(raw, "host_uts", false))
-    |> put(:privileged, str_list(raw, "privileged"))
+    |> put(:privileged, privileged(raw))
     |> put(:full_access, boolean(raw, "full_access", false))
     |> put(:devices, str_list(raw, "devices"))
     |> put(:dsp, boolean(raw, "dsp", false))
@@ -556,6 +563,17 @@ defmodule Vagus.Addon.Config do
 
       other ->
         invalid("field '#{key}' must be a list, got #{inspect(other)}")
+    end
+  end
+
+  # `privileged:` becomes `--cap-add` verbatim, so a value outside the
+  # allowlist (`ALL`, say) would hand the container that capability.
+  defp privileged(raw) do
+    caps = str_list(raw, "privileged")
+
+    case Enum.reject(caps, &(&1 in @capabilities)) do
+      [] -> caps
+      [bad | _] -> invalid("field 'privileged' has unknown capability #{inspect(bad)}")
     end
   end
 

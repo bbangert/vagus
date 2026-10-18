@@ -31,6 +31,13 @@ defmodule Vagus.Addon.Rating do
   @dangerous_caps ~w(BPF CHECKPOINT_RESTORE DAC_READ_SEARCH NET_ADMIN NET_RAW
                      PERFMON SYS_ADMIN SYS_MODULE SYS_PTRACE SYS_RAWIO)
 
+  # A name outside the allowlist could never match a parsed config, so a typo
+  # here would silently stop derating.
+  unless Enum.all?(@dangerous_caps, &(&1 in Config.capabilities())) do
+    raise CompileError,
+      description: "@dangerous_caps must be a subset of Vagus.Addon.Config.capabilities/0"
+  end
+
   @doc """
   Scores `config` on upstream's ladder: start at 5, adjust, clamp to 1..8.
 

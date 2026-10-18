@@ -192,6 +192,7 @@ defmodule Vagus.App.Policy do
       discovery: %{},
       released: [],
       gone: false,
+      refused: false,
       run: nil,
       shutting_down: false
     }
@@ -484,6 +485,12 @@ defmodule Vagus.App.Policy do
 
   defp do_admit(:install, :new), do: :ok
   defp do_admit(_op, :new), do: {:error, :not_installed}
+  # A file that no longer loads holds an app the user can only remove: its
+  # config is a stub, and acting on it would start or save something else.
+  defp do_admit(:uninstall, :refused), do: :ok
+  defp do_admit(op, :refused) when op in [:halt, :resume, :boot_start], do: :noop
+  defp do_admit(:install, :refused), do: {:error, :corrupt_file}
+  defp do_admit(_op, :refused), do: {:error, :refused}
   defp do_admit(:install, _state), do: {:error, :already_installed}
   defp do_admit(:halt, :shutting_down), do: :noop
   defp do_admit(:resume, :shutting_down), do: :ok
@@ -565,6 +572,7 @@ defmodule Vagus.App.Policy do
   def answer(:info, data), do: {:ok, snapshot(data)}
   def answer(:snapshot, data), do: snapshot(data)
   def answer(:installed?, _data), do: true
+  def answer(:refused?, data), do: data.refused
   def answer(:identity, data), do: {:ok, identity(data.config)}
   def answer(:token, %{token: token}) when is_binary(token), do: {:ok, token}
   def answer(:token, _data), do: :error
@@ -574,7 +582,7 @@ defmodule Vagus.App.Policy do
   def answer(:discovery_list, data), do: Map.values(data.discovery)
   def answer(_question, _data), do: {:error, :unknown_question}
 
-  defp uninstalled(:installed?), do: false
+  defp uninstalled(question) when question in [:installed?, :refused?], do: false
   defp uninstalled(:discovery_list), do: []
   defp uninstalled(:ingress_target), do: {:error, :not_found}
   defp uninstalled(_question), do: :error
@@ -602,8 +610,10 @@ defmodule Vagus.App.Policy do
   `Addon.Info.render` and the router read.
   """
   @spec snapshot(map()) :: map()
-  def snapshot(data),
-    do: data |> Map.take(@persisted) |> Map.put(:state, derive(:idle, data))
+  def snapshot(data) do
+    state = if data[:refused], do: :unknown, else: derive(:idle, data)
+    data |> Map.take(@persisted) |> Map.put(:state, state)
+  end
 
   @doc """
   The run for `op`, or why it cannot begin: an update needs a newer version
@@ -1159,7 +1169,9 @@ defmodule Vagus.App.Policy do
   defp input(:swap_data, _arg, data), do: %{staging_dir: data.run.args.staging_dir}
 
   defp input(:set_options, _arg, data), do: %{options: data.run.args.options}
+  defp input(:stop, _arg, %{refused: true}), do: %{refused: true}
   defp input(:stop, :strict, _data), do: %{strict: true}
+  defp input(:remove_app, _arg, data), do: %{refused: data.refused}
   defp input(_name, _arg, _data), do: %{}
 
   # Coarse waypoints for the update job's progress bar.

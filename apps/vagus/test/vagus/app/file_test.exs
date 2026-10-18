@@ -196,7 +196,42 @@ defmodule Vagus.App.FileTest do
               do: assert({:error, :invalid} = AppFile.read(slug, dir))
         end)
 
-      assert log =~ "skipping invalid or mismatched app \"vagus\""
+      assert log =~ ~s(skipping app "vagus": slug 'vagus' is reserved)
+    end
+
+    # An earlier release persisted `privileged:` without checking it. Such an
+    # app is refused, with the reason logged, and never started with the
+    # capability; its file stays, so the app is still listed as installed.
+    test "a saved config with a capability outside the allowlist is skipped with its reason",
+         %{config: c, dir: dir} do
+      body = file_body(c) |> put_in(["config", "privileged"], ["NET_ADMIN", "ALL"])
+      put_raw(dir, "core_mosquitto", body)
+
+      log =
+        capture_log(fn ->
+          assert {:error, :invalid} = AppFile.read("core_mosquitto", dir)
+        end)
+
+      assert log =~ ~s(skipping app "core_mosquitto")
+      assert log =~ ~s(unknown capability "ALL")
+      assert "core_mosquitto" in AppFile.saved(dir)
+    end
+
+    test "stub/2 keeps only what an uninstall needs, and only when it validates",
+         %{config: c, dir: dir} do
+      raw = c |> Config.to_persistable() |> Map.merge(%{"image" => "x/{arch}", "ingress" => true})
+      put_raw(dir, "core_mosquitto", %{"config" => Map.put(raw, "privileged", ["ALL"])})
+
+      assert %Config{slug: "core_mosquitto", image: "x/{arch}", version: "7.1.0", ingress: true} =
+               stub = AppFile.stub("core_mosquitto", dir)
+
+      assert {stub.privileged, stub.host_network, stub.full_access} == {[], false, false}
+
+      put_raw(dir, "core_mosquitto", %{"config" => %{raw | "version" => "../1"}})
+      assert %Config{image: nil, version: "unknown"} = AppFile.stub("core_mosquitto", dir)
+
+      File.write!(Path.join(dir, "core_mosquitto.json"), "{{{")
+      assert %Config{slug: "core_mosquitto", image: nil} = AppFile.stub("core_mosquitto", dir)
     end
 
     test "a file that is not JSON is an error, not raised and not taken for no file", %{
@@ -313,13 +348,43 @@ defmodule Vagus.App.FileTest do
       refute "stray" in AppFile.saved(dir)
     end
 
-    test "a corrupt entry is skipped and the rest imported", %{dir: dir, legacy: legacy} do
+    test "a corrupt entry is kept as it was; one with no usable slug is skipped",
+         %{dir: dir, legacy: legacy} do
       addons = Jason.decode!(File.read!(legacy))["addons"]
-      addons = Map.put(addons, "broken", %{"config" => %{}, "state" => "started"})
+      broken = %{"config" => %{}, "state" => "started"}
+
+      addons =
+        Map.merge(addons, %{"broken" => broken, "vagus" => broken, "bad slug!" => broken})
+
+      File.write!(legacy, Jason.encode!(%{"version" => 1, "addons" => addons}))
+
+      log = capture_log(fn -> assert {:ok, 4} = AppFile.import_once(dir, legacy) end)
+      assert log =~ ~s("vagus" not imported)
+      assert log =~ ~s("bad slug!" not imported)
+      assert "broken" in AppFile.saved(dir)
+      capture_log(fn -> assert {:error, :invalid} = AppFile.read("broken", dir) end)
+    end
+
+    # The import runs once: an app it left out could never be listed, so
+    # never uninstalled, while its container and data stay behind.
+    test "an entry asking for a capability outside the allowlist is kept as it was, owner-only",
+         %{dir: dir, legacy: legacy} do
+      %{"addons" => addons} = Jason.decode!(File.read!(legacy))
+
+      addons =
+        put_in(addons, ["core_ssh", "config", "privileged"], ["SYS_ADMIN", "CAP_SYS_ADMIN"])
+
       File.write!(legacy, Jason.encode!(%{"version" => 1, "addons" => addons}))
 
       log = capture_log(fn -> assert {:ok, 3} = AppFile.import_once(dir, legacy) end)
-      assert log =~ "broken"
+      assert log =~ ~s(unknown capability "CAP_SYS_ADMIN")
+      assert log =~ ~s(imported "core_ssh" as it was)
+
+      saved = Jason.decode!(File.read!(Path.join(dir, "core_ssh.json")))
+      assert saved["config"] == addons["core_ssh"]["config"]
+      assert saved["wanted"] == addons["core_ssh"]["state"]
+      assert (File.stat!(Path.join(dir, "core_ssh.json")).mode &&& 0o077) == 0
+      capture_log(fn -> assert {:error, :invalid} = AppFile.read("core_ssh", dir) end)
     end
 
     test "with no addons.json the directory is created empty", %{dir: dir, tmp_dir: tmp} do

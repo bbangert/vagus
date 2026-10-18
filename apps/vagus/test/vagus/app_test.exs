@@ -213,6 +213,136 @@ defmodule Vagus.AppTest do
       assert {:error, {:reserved_slug, "vagus"}} = App.install(config)
       assert :error = app_info("vagus")
     end
+
+    # Saved by an earlier release, before `privileged:` was checked. The file
+    # no longer loads, so only an uninstall gets the user out, and it must
+    # leave nothing for a reinstall to trip over.
+    @tag :tmp_dir
+    test "a refused app uninstalls like any other, and its slug installs again", %{tmp_dir: tmp} do
+      previous = Application.fetch_env(:vagus, :addon_data_root)
+      Application.put_env(:vagus, :addon_data_root, tmp)
+
+      on_exit(fn ->
+        case previous do
+          {:ok, root} -> Application.put_env(:vagus, :addon_data_root, root)
+          :error -> Application.delete_env(:vagus, :addon_data_root)
+        end
+      end)
+
+      valid = config()
+      slug = valid.slug
+      on_exit(fn -> forget_app(slug) end)
+      path = Path.join(AppFile.dir(), slug <> ".json")
+      raw = valid |> Config.to_persistable() |> Map.put("privileged", ["ALL"])
+      File.mkdir_p!(AppFile.dir())
+      File.write!(path, Jason.encode!(%{"config" => raw, "wanted" => "started"}))
+      data_dir = Path.join([tmp, "addons", "data", slug])
+      File.mkdir_p!(data_dir)
+      File.write!(Path.join(data_dir, "state"), "kept by the app")
+      Backend.Fake.reset_calls()
+
+      capture_log(fn -> assert {:ok, pid} = Vagus.App.Instances.ensure(slug) end)
+      [{pid, _}] = Elixir.Registry.lookup(Directory, {:slug, slug})
+      ref = Process.monitor(pid)
+      assert [%{state: :unknown}] = Enum.filter(App.list(), &(&1.config.slug == slug))
+      assert :ok = App.boot_start(slug, false)
+      assert {:error, :corrupt_file} = App.install(valid)
+      assert Backend.Fake.calls_for("addon_#{slug}") == []
+
+      assert :ok = App.uninstall(slug)
+      assert_receive {:DOWN, ^ref, :process, ^pid, :normal}
+      refute File.exists?(path)
+      refute File.exists?(data_dir)
+      calls = Backend.Fake.calls()
+      assert {:stop, "addon_#{slug}"} in calls
+      assert {:remove, "addon_#{slug}"} in calls
+      assert {:remove_image, "x/y:1.0"} in calls
+      refute Enum.any?(App.list(), &(&1.config.slug == slug))
+
+      assert :ok = App.install(valid)
+      assert {:ok, %{state: :stopped, config: %{privileged: []}}} = app_info(slug)
+    end
+
+    @tag :tmp_dir
+    test "an app the legacy import kept as it was is listed, never started, and uninstalls",
+         %{tmp_dir: tmp} do
+      valid = config()
+      slug = valid.slug
+      on_exit(fn -> forget_app(slug) end)
+      raw = valid |> Config.to_persistable() |> Map.put("privileged", ["ALL"])
+      legacy = Path.join(tmp, "addons.json")
+      entry = %{"config" => raw, "state" => "started"}
+      File.write!(legacy, Jason.encode!(%{"version" => 1, "addons" => %{slug => entry}}))
+
+      capture_log(fn -> assert {:ok, 1} = AppFile.import_once(Path.join(tmp, "apps"), legacy) end)
+      File.mkdir_p!(AppFile.dir())
+
+      File.cp!(
+        Path.join([tmp, "apps", slug <> ".json"]),
+        Path.join(AppFile.dir(), slug <> ".json")
+      )
+
+      Backend.Fake.reset_calls()
+
+      capture_log(fn -> assert {:ok, _pid} = Vagus.App.Instances.ensure(slug) end)
+      assert [%{state: :unknown}] = Enum.filter(App.list(), &(&1.config.slug == slug))
+      assert {:error, :refused} = App.start(slug)
+      assert :ok = App.boot_start(slug, false)
+      refute Enum.any?(Backend.Fake.calls_for("addon_#{slug}"), &match?({:create, _}, &1))
+
+      assert :ok = App.uninstall(slug)
+      assert {:remove, "addon_#{slug}"} in Backend.Fake.calls()
+      refute slug in App.slugs()
+    end
+
+    # The stub of a corrupt file cannot say the app was native, so nothing
+    # but the allowlist tells the uninstall a broker may still be running.
+    @tag :tmp_dir
+    test "a refused allowlisted native app's running broker is stopped by its uninstall",
+         %{tmp_dir: tmp} do
+      slug = corrupt_file()
+      on_exit(fn -> forget_app(slug) end)
+
+      for {key, value} <- [native_addon_slugs: [slug], addon_data_root: tmp] do
+        previous = Application.fetch_env(:vagus, key)
+        Application.put_env(:vagus, key, value)
+
+        on_exit(fn ->
+          case previous do
+            {:ok, old} -> Application.put_env(:vagus, key, old)
+            :error -> Application.delete_env(:vagus, key)
+          end
+        end)
+      end
+
+      name = Backend.Native.broker_name("addon_" <> slug)
+
+      {:ok, broker} =
+        DynamicSupervisor.start_child(
+          Backend.Native.Supervisor,
+          %{id: name, start: {Agent, :start_link, [fn -> nil end, [name: name]]}}
+        )
+
+      ref = Process.monitor(broker)
+      data_dir = Path.join([tmp, "addons", "data", slug])
+      File.mkdir_p!(data_dir)
+      capture_log(fn -> assert {:ok, _pid} = Vagus.App.Instances.ensure(slug) end)
+
+      assert :ok = App.uninstall(slug)
+      assert_receive {:DOWN, ^ref, :process, ^broker, _reason}
+      refute File.exists?(Path.join(AppFile.dir(), slug <> ".json"))
+      refute File.exists?(data_dir)
+    end
+
+    test "an app whose file is corrupt uninstalls too" do
+      slug = corrupt_file()
+      on_exit(fn -> forget_app(slug) end)
+      capture_log(fn -> assert {:ok, _pid} = Vagus.App.Instances.ensure(slug) end)
+
+      assert :ok = App.uninstall(slug)
+      refute slug in App.slugs()
+      assert :ok = App.install(config(%{"slug" => slug}))
+    end
   end
 
   describe "update/2 with a backup" do

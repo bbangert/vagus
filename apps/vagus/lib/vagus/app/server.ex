@@ -10,10 +10,11 @@ defmodule Vagus.App.Server do
   old process).
 
   States: `:new` (no file yet; it expires unless an install arrives),
-  `:idle`, `{:busy, op}` and `:shutting_down`. The step an operation is on is
-  deliberately not in the state: a state change replays postponed events and
-  cancels the state timeout, and both must happen once, when the operation
-  ends, not at every step.
+  `:idle`, `{:busy, op}`, `:shutting_down` and `:refused` (a file that does
+  not load: the app is listed and can be uninstalled, nothing else). The
+  step an operation is on is deliberately not in the state: a state change
+  replays postponed events and cancels the state timeout, and both must
+  happen once, when the operation ends, not at every step.
 
   An operation is a run of steps planned by `Vagus.App.Policy`; this process
   only spawns each task step and interprets the effects `Policy.next/3`
@@ -65,7 +66,16 @@ defmodule Vagus.App.Server do
     :resume,
     :boot_start
   ]
-  @questions [:info, :snapshot, :installed?, :identity, :token, :ingress_target, :discovery_list]
+  @questions [
+    :info,
+    :snapshot,
+    :installed?,
+    :refused?,
+    :identity,
+    :token,
+    :ingress_target,
+    :discovery_list
+  ]
   @settings [:ingress_panel, :watchdog, :ports, :boot, :auto_update, :protected]
   @redacted [:token, :token_hash, :ingress_token, :user_options, :services, :discovery]
 
@@ -91,9 +101,16 @@ defmodule Vagus.App.Server do
         {:ok, :new, fresh(slug, nil), [{:state_timeout, deadline(:new), :expire}]}
 
       # Not a fresh slug: an install over it would replace what the user had.
+      # The process stays so the app can still be uninstalled, with a stub
+      # config that is never saved, keyed or started.
       {:error, reason} ->
-        Logger.error("App #{slug}: its file cannot be read (#{inspect(reason)}); not started")
-        :ignore
+        Logger.error(
+          "App #{slug}: its file cannot be read (#{inspect(reason)}); not started, " <>
+            "only an uninstall is taken"
+        )
+
+        data = %{fresh(slug, %{config: AppFile.stub(slug)}) | refused: true}
+        {:ok, :refused, data}
 
       {:ok, saved} ->
         {data, rewrite?} = claim_port(fresh(slug, saved), saved[:rewrite] == true)
@@ -175,7 +192,7 @@ defmodule Vagus.App.Server do
   # Nothing to write before an install commits, nor once an uninstall began:
   # a write then would bring its file back.
   defp event({:call, from}, {:set, _changes}, _state, data)
-       when data.config == nil or data.retired,
+       when data.config == nil or data.retired or data.refused,
        do: {:keep_state_and_data, [{:reply, from, {:error, :not_installed}}]}
 
   # Validated and on disk before the reply, so a reboot right after it keeps
@@ -194,7 +211,8 @@ defmodule Vagus.App.Server do
   end
 
   defp event({:call, from}, {write, _name, _payload}, state, data)
-       when write in [:provide_service, :add_discovery] and (state == :new or data.retired),
+       when write in [:provide_service, :add_discovery] and
+              (state == :new or data.retired or data.refused),
        do: {:keep_state_and_data, [{:reply, from, {:error, :unavailable}}]}
 
   # The app's own re-post is refused too, as upstream refuses any second
@@ -321,7 +339,7 @@ defmodule Vagus.App.Server do
        when name in [:retry, :settled, :probe, :healthcheck],
        do: {:keep_state_and_data, [:postpone]}
 
-  defp event(:info, {:engine_event, event}, state, data) when state != :new,
+  defp event(:info, {:engine_event, event}, state, data) when state not in [:new, :refused],
     do: on_event(event, state, data)
 
   defp event(:info, {:DOWN, ref, :process, _pid, reason}, state, %{broker_ref: ref} = data),
@@ -336,7 +354,7 @@ defmodule Vagus.App.Server do
       else: begin_op(:start, %{retry: true}, nil, :idle, data)
   end
 
-  defp event({:timeout, :settled}, :settled, state, data) when state != :new,
+  defp event({:timeout, :settled}, :settled, state, data) when state not in [:new, :refused],
     do: on_event(:settled, state, data)
 
   defp event({:timeout, :probe}, :probe, :idle, data) do
@@ -381,6 +399,11 @@ defmodule Vagus.App.Server do
     data = kill(data.run.task, data)
     begin_op(:halt, args, from, {:busy, :halt}, %{data | run: nil}, parked)
   end
+
+  # Reached from `:shutting_down` too, which a halt mid-uninstall leaves.
+  defp command(op, _args, from, _state, %{refused: true} = data)
+       when op in [:resume, :boot_start],
+       do: {:next_state, :refused, data, [{:reply, from, :ok}]}
 
   defp command(op, args, from, _state, data) when op in [:resume, :boot_start],
     do: boot(from, Map.get(args, :running?, :unknown), data)
@@ -525,6 +548,10 @@ defmodule Vagus.App.Server do
 
   defp effect(effect, acc), do: {:cont, apply_effect(effect, acc)}
 
+  # A refused app's stub must never replace the file it could not load: a
+  # failed uninstall keeps the app, and its file as it was.
+  defp persist(%{refused: true}), do: :ok
+
   defp persist(data) do
     with {:error, reason} <- AppFile.write(data) do
       Logger.warning("App #{data.slug}: not saved (#{inspect(reason)})")
@@ -556,7 +583,9 @@ defmodule Vagus.App.Server do
     do: {st, d, acts ++ [{{:timeout, name}, :cancel}]}
 
   defp apply_effect(:monitor_broker, {st, d, acts}), do: {st, monitor_broker(d), acts}
-  defp apply_effect(:idle, {_st, d, acts}), do: {:idle, %{d | run: nil, retired: false}, acts}
+
+  defp apply_effect(:idle, {_st, d, acts}),
+    do: {if(d.refused, do: :refused, else: :idle), %{d | run: nil, retired: false}, acts}
 
   defp apply_effect(:shutting_down, {_st, d, acts}),
     do: {:shutting_down, %{d | run: nil, retired: false}, acts}
