@@ -198,7 +198,7 @@ defmodule Vagus.Runtime.Podman.CmdTest do
     refute fake |> FakePodman.calls() |> List.flatten() |> Enum.any?(&(&1 =~ "s3cret"))
   end
 
-  # MuonTrap.cmd/3's output acks kill a caller with :epipe now and then;
+  # An output ack racing muontrap's exit once killed a caller with :epipe;
   # under this load it lost about 1 call in 20.
   @tag timeout: 120_000
   test "many quick calls at once never kill their callers" do
@@ -224,6 +224,40 @@ defmodule Vagus.Runtime.Podman.CmdTest do
       |> Enum.map(fn {:ok, reason} -> reason end)
 
     assert Enum.frequencies(reasons) == %{normal: 640}
+  end
+
+  # muontrap waits up to 10 s for every forwarded byte to be acknowledged
+  # before it exits, so one byte left unacked shows up as a stall. The
+  # output is past muontrap's 10 KB window, in many small writes on both
+  # streams.
+  @tag timeout: 60_000
+  test "a call with many small chunks of output returns promptly" do
+    {bin, _dir} =
+      script("""
+      i=0
+      while [ $i -lt 3000 ]; do printf 'o%06d\n' $i; printf 'e%06d\n' $i >&2; i=$((i+1)); done
+      exit 4
+      """)
+
+    {elapsed_us, {:exit, 4, out}} =
+      :timer.tc(fn -> Cmd.run([], timeout_ms: 30_000, podman_bin: bin) end)
+
+    assert byte_size(out) == 6_000 * 8
+    assert elapsed_us < 5_000_000, "took #{div(elapsed_us, 1000)} ms"
+  end
+
+  # Output dropped past the cap is acked too, or muontrap stalls at exit.
+  @tag timeout: 60_000
+  test "a truncated call far past its cap returns promptly with the head" do
+    {bin, _dir} = script("head -c 200000 /dev/zero | tr '\\0' x\n")
+
+    {elapsed_us, result} =
+      :timer.tc(fn ->
+        Cmd.run([], timeout_ms: 30_000, podman_bin: bin, cap: 100, truncate: true)
+      end)
+
+    assert result == {:ok, String.duplicate("x", 100)}
+    assert elapsed_us < 5_000_000, "took #{div(elapsed_us, 1000)} ms"
   end
 
   describe "stderr_apart" do

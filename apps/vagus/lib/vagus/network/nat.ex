@@ -258,9 +258,7 @@ defmodule Vagus.Network.Nat do
   end
 
   # Bounded: a stuck call would hold the boot gate, and an abandoned nft
-  # still finishes or fails its one transaction alone. Not MuonTrap.cmd/3,
-  # whose output acks can race the child's exit and kill the caller with
-  # `:epipe` (see `Vagus.Runtime.Podman.Cmd`).
+  # still finishes or fails its one transaction alone.
   @doc false
   @spec nft_cmd(String.t(), [String.t()], timeout()) :: {String.t(), non_neg_integer()}
   def nft_cmd(bin, args, timeout_ms \\ @nft_timeout_ms) do
