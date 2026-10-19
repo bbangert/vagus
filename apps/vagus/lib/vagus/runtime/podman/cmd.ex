@@ -8,11 +8,13 @@ defmodule Vagus.Runtime.Podman.Cmd do
   SIGKILL 3 s later. The same kill runs if the caller dies, so a killed
   task never orphans a podman.
 
-  Not `MuonTrap.cmd/3`: it acknowledges every chunk of output by writing to
-  muontrap's stdin, and an ack racing muontrap's exit closes the port with
-  `:epipe`, an exit signal that kills the caller (about 1 in 20 calls with
-  64 running at once). Here muontrap's output window covers the whole cap,
-  so nothing is ever written to it.
+  Not `MuonTrap.cmd/3`: it blocks until podman exits, so it can neither
+  stop at the cap nor check a split call's stdout file against it, and its
+  timeout returns without waiting for podman to die. Every byte muontrap
+  forwards is still acknowledged on its stdin, as `MuonTrap.cmd/3` does:
+  muontrap exits only once all of them are, or 10 s after podman did. The
+  port is unlinked, so an ack that loses a race with muontrap's exit
+  (`:epipe`) never kills the caller.
 
   With `:stderr_apart`, stdout goes to a file instead (podman's own
   `--out`, which replaces Go's `os.Stdout` before the verb runs) and only
@@ -33,8 +35,6 @@ defmodule Vagus.Runtime.Podman.Cmd do
   @global_args ["--log-level=error", "--transient-store"]
   @sigkill_delay_ms 3_000
   @default_cap 1_048_576
-  # muontrap's window is a C int.
-  @max_window 2_147_483_647
 
   @type result ::
           {:ok, binary()}
@@ -135,7 +135,6 @@ defmodule Vagus.Runtime.Podman.Cmd do
   defp spawn_podman(path, argv, opts) do
     cap = Keyword.get(opts, :cap, @default_cap)
     truncate? = Keyword.get(opts, :truncate, false)
-    window = if truncate?, do: @max_window, else: min(cap + 1, @max_window)
     env = Vagus.Runtime.Host.env(opts[:host]) ++ Keyword.get(opts, :env, [])
 
     # A split call's podman writes stdout to its `--out` file, not fd 1.
@@ -150,7 +149,7 @@ defmodule Vagus.Runtime.Podman.Cmd do
 
     muontrap_args =
       capture ++
-        ["--delay-to-sigkill", "#{@sigkill_delay_ms}", "--stdio-window", "#{window}"] ++
+        ["--delay-to-sigkill", "#{@sigkill_delay_ms}"] ++
         ["--", path | argv]
 
     port =
@@ -208,6 +207,8 @@ defmodule Vagus.Runtime.Podman.Cmd do
   defp await(port, deadline, out, left) do
     receive do
       {^port, {:data, data}} ->
+        ack(port, byte_size(data))
+
         case keep(out, data) do
           {:ok, out} -> collect(port, deadline, out)
           :overflow -> close(port, {:error, :output_too_large})
@@ -222,6 +223,15 @@ defmodule Vagus.Runtime.Podman.Cmd do
       wait(out, left) ->
         if out.out, do: collect(port, deadline, out), else: close(port, {:error, :timeout})
     end
+  end
+
+  # One ack byte acknowledges its value plus one bytes.
+  defp ack(port, bytes) do
+    full = :binary.copy(<<255>>, div(bytes, 256))
+    acks = if rem(bytes, 256) == 0, do: full, else: [full, rem(bytes, 256) - 1]
+    Port.command(port, acks)
+  rescue
+    ArgumentError -> :ok
   end
 
   defp wait(%{out: nil}, left), do: left

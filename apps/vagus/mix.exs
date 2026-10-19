@@ -135,7 +135,7 @@ defmodule Vagus.MixProject do
       {:nerves, "~> 1.13", runtime: false},
 
       # Its port binary runs every podman call (Vagus.Runtime.Podman.Cmd).
-      {:muontrap, "~> 1.8"},
+      {:muontrap, "~> 2.0"},
 
       # BlueZ stack bring-up (dbus-daemon + bluetoothd under MuonTrap).
       # Vagus starts only the daemon slice of its tree — HA Core is the BLE
