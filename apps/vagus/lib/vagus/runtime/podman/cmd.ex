@@ -12,9 +12,11 @@ defmodule Vagus.Runtime.Podman.Cmd do
   stop at the cap nor check a split call's stdout file against it, and its
   timeout returns without waiting for podman to die. Every byte muontrap
   forwards is still acknowledged on its stdin, as `MuonTrap.cmd/3` does:
-  muontrap exits only once all of them are, or 10 s after podman did. The
-  port is unlinked, so an ack that loses a race with muontrap's exit
-  (`:epipe`) never kills the caller.
+  muontrap exits only once all of them are, giving up after 10 s with no
+  ack arriving (each ack restarts that wait). Should it give up first, the
+  late ack hits `:epipe`; the port is unlinked, so that never kills the
+  caller, but it closes without an `{:exit_status, _}` and the call ends
+  as `{:error, :timeout}` at its deadline.
 
   With `:stderr_apart`, stdout goes to a file instead (podman's own
   `--out`, which replaces Go's `os.Stdout` before the verb runs) and only
@@ -225,13 +227,17 @@ defmodule Vagus.Runtime.Podman.Cmd do
     end
   end
 
-  # One ack byte acknowledges its value plus one bytes.
+  # Exactly what arrived: muontrap treats acks past what it sent as fatal.
   defp ack(port, bytes) do
     full = :binary.copy(<<255>>, div(bytes, 256))
     acks = if rem(bytes, 256) == 0, do: full, else: [full, rem(bytes, 256) - 1]
-    Port.command(port, acks)
-  rescue
-    ArgumentError -> :ok
+
+    try do
+      Port.command(port, acks)
+    rescue
+      # Already closed: muontrap exited first, or the deadline closed it.
+      ArgumentError -> :ok
+    end
   end
 
   defp wait(%{out: nil}, left), do: left

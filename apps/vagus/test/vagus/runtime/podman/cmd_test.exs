@@ -246,6 +246,20 @@ defmodule Vagus.Runtime.Podman.CmdTest do
     assert elapsed_us < 5_000_000, "took #{div(elapsed_us, 1000)} ms"
   end
 
+  # Output dropped past the cap is acked too, or muontrap stalls at exit.
+  @tag timeout: 60_000
+  test "a truncated call far past its cap returns promptly with the head" do
+    {bin, _dir} = script("head -c 200000 /dev/zero | tr '\\0' x\n")
+
+    {elapsed_us, result} =
+      :timer.tc(fn ->
+        Cmd.run([], timeout_ms: 30_000, podman_bin: bin, cap: 100, truncate: true)
+      end)
+
+    assert result == {:ok, String.duplicate("x", 100)}
+    assert elapsed_us < 5_000_000, "took #{div(elapsed_us, 1000)} ms"
+  end
+
   describe "stderr_apart" do
     setup do
       dir = Path.join(System.tmp_dir!(), "podman-out-#{System.unique_integer([:positive])}")
