@@ -252,10 +252,8 @@ defmodule Vagus.Application do
       [
         bluetooth_child(),
         Vagus.Devices.Watcher,
-        Vagus.Network.Lab,
-        # NFS and USBIP return :ignore unless Vagus.Flavor.agent?(); USBIP subscribes to the Watcher.
-        Vagus.NFS,
-        Vagus.USBIP
+        # After the Watcher: USBIP subscribes to it.
+        Vagus.LabServices
       ]
     end
 

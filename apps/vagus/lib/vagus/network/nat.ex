@@ -135,11 +135,11 @@ defmodule Vagus.Network.Nat do
       (default `/run/vagus`)
     * `:sysctl_root` — where the sysctl files are written (default
       `/proc/sys`)
-    * `:loaded_key` — the `:persistent_term` key recording a successful load
-      (tests)
     * `:lab` — `{lab_ifname, primary_ifname}` pairs to forward and masquerade
-      (default: the list `set_lab/2` stored)
-    * `:lab_key` — the `:persistent_term` key holding that list (tests)
+      (default: the list `set_lab/2` stored); a name failing `valid_ifname?/1`
+      is `{:error, :invalid_ifname}` and nothing is loaded
+
+  Test seams: `:loaded_key`, `:lab_key`.
   """
   @spec ensure(keyword()) :: :ok | {:error, term()}
   def ensure(opts \\ []) do
@@ -155,33 +155,46 @@ defmodule Vagus.Network.Nat do
   end
 
   @doc """
-  Stores the lab pairs every later render uses and reloads the table with
-  them. On a failed load the previous list is put back, so the stored list
-  never claims rules a load refused.
+  Loads the table with `lab` and, once it is in, stores the list every later
+  render uses. A failed load leaves the stored list as it was.
   """
   @spec set_lab([{String.t(), String.t()}], keyword()) :: :ok | {:error, term()}
   def set_lab(lab, opts \\ []) when is_list(lab) do
     key = Keyword.get(opts, :lab_key, @lab_key)
     previous = :persistent_term.get(key, [])
-    :persistent_term.put(key, lab)
 
-    case ensure(Keyword.put(opts, :lab, lab)) do
-      :ok ->
-        :ok
+    with :ok <- check_lab(lab),
+         :ok <- ensure(Keyword.put(opts, :lab, lab)) do
+      :persistent_term.put(key, lab)
+    else
+      {:error, :invalid_ifname} = error ->
+        error
 
       {:error, _} = error ->
-        :persistent_term.put(key, previous)
+        # The table has three writers (the boot gate, a bridged start's
+        # ensure_loaded, Lab), and a load that failed after nft (the sysctl
+        # step) leaves the new rules in the kernel: put the old list back
+        # there too so it matches the stored one. Best effort.
+        _ = ensure(Keyword.put(opts, :lab, previous))
         error
     end
   end
 
-  @doc "The lab pairs `set_lab/2` stored."
   @spec lab(keyword()) :: [{String.t(), String.t()}]
   def lab(opts \\ []),
     do:
       Keyword.get_lazy(opts, :lab, fn ->
         :persistent_term.get(Keyword.get(opts, :lab_key, @lab_key), [])
       end)
+
+  # Names are interpolated into the nft ruleset. 15 is IFNAMSIZ minus the
+  # NUL; the leading alphanumeric rules out "." and "..", which the kernel
+  # refuses as names.
+  @ifname ~r/\A[A-Za-z0-9][A-Za-z0-9_.-]{0,14}\z/
+
+  @spec valid_ifname?(term()) :: boolean()
+  def valid_ifname?(name) when is_binary(name), do: Regex.match?(@ifname, name)
+  def valid_ifname?(_), do: false
 
   @doc """
   `:ok` once `ensure/1` has succeeded in this VM, else `ensure/1` now. The
@@ -213,11 +226,13 @@ defmodule Vagus.Network.Nat do
   """
   @spec ruleset(keyword()) :: {:ok, String.t()} | {:error, term()}
   def ruleset(opts \\ []) do
-    with {:ok, ip} <- target_ip(opts),
+    lab = lab(opts)
+
+    with :ok <- check_lab(lab),
+         {:ok, ip} <- target_ip(opts),
          {:ok, port} <- target_port(opts) do
       rule = "ip daddr #{ip} tcp dport #{@contract_port} dnat to #{ip}:#{port}"
       bridge = Network.name()
-      lab = lab(opts)
 
       {:ok,
        """
@@ -244,6 +259,15 @@ defmodule Vagus.Network.Nat do
        #{lab_postrouting(lab)}}
        """}
     end
+  end
+
+  defp check_lab(lab) do
+    valid? = fn
+      {lab_if, primary} -> valid_ifname?(lab_if) and valid_ifname?(primary)
+      _ -> false
+    end
+
+    if Enum.all?(lab, valid?), do: :ok, else: {:error, :invalid_ifname}
   end
 
   defp lab_forward(lab) do

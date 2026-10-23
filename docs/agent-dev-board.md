@@ -86,23 +86,33 @@ store, and don't copy the cookie anywhere.
 
 ## Lab services
 
-Phase 8 calls for wiring a target board to the dev board. All four are lost on
-reboot by design; the orchestrator re-applies them.
+Phase 8 calls for wiring a target board to the dev board. Lab, NFS and USB/IP
+are agent flavor only. Their state survives a Vagus restart (Lab keeps it in
+`persistent_term`, NFS adopts `/run/nfs/etab`, USB/IP re-reads which devices
+`usbip-host` holds) but not a reboot, by design; the orchestrator re-applies
+them.
 
 **Target network.** `Vagus.Network.Lab.up(ifname, cidr)` gives an extra USB NIC
 a static address (not persisted) and adds an nft forward plus masquerade to the
 primary interface only while it is up. `down/1` undoes both and `status/0`
-reports. It refuses `eth0`, `wlan0` and `hassio*`. DHCP, TFTP and PXE for the
-target run in a worker, since `dnsmasq-base` is in the base image:
+reports. It refuses `eth0`, `wlan0`, `usb0`, `hassio*`, any interface
+VintageNet already configures, and a cidr that overlaps the LAN or
+`172.30.32.0/23`. DHCP, TFTP and PXE for the target run in a worker, since
+`dnsmasq-base` is in the base image. The worker is on the host network, so
+`--interface` must name the lab NIC, never `eth0` or `wlan0`, or it answers
+DHCP on the LAN:
 
     podman run -d --name lab-dnsmasq --network=host --cap-add=NET_ADMIN,NET_RAW <base image> \
-      dnsmasq --keep-in-foreground --interface=<if> --bind-interfaces \
+      dnsmasq --keep-in-foreground --interface=<lab NIC> --bind-interfaces \
       --dhcp-range=10.42.0.50,10.42.0.150,12h --enable-tftp --tftp-root=/data/tftp \
       --dhcp-boot=<bootfile>
 
 **NFS root.** `Vagus.NFS.export(path, client_cidr)`, `unexport/1` and
 `status/0`, agent flavor only. Paths must be under `/data/vagus/nfs/`, and
-the server speaks NFSv4 only. Kernel args for the target:
+the server speaks NFSv4 only. Kernel nfsd listens on every interface, so the
+per-export client CIDR is the only access control; a `/0` client is refused.
+Exports use `subtree_check`, so a client cannot reach outside the exported
+directory. Kernel args for the target:
 
     root=/dev/nfs nfsroot=10.42.0.1:/data/vagus/nfs/<target>,vers=4,tcp rw ip=dhcp
 
@@ -113,12 +123,16 @@ base image. On the laptop:
 
     sudo modprobe vhci-hcd && usbip list -r <board-ip> && sudo usbip attach -r <board-ip> -b 1-1.4
 
-The share drops when the device is unplugged. The board must not open a shared
-device itself.
+The share drops when the device is unplugged. USB/IP has no authentication:
+anyone on the LAN who can reach port 3240 can attach a shared device, so share
+only for as long as a task needs it. The board must not open a shared device
+itself.
 
 **Power.** `Vagus.Power.mqtt(topic, payload)` publishes to the board's own
 broker (QoS 1, `retain: true` and `qos:` are options), so smart plugs need no
-worker. Tasmota takes `cmnd/<device>/Power` with `ON` or `OFF`; Shelly Gen1
+worker. `:ok` means the message was sent, not acknowledged. Do not use
+`retain: true` for plug commands: a retained `ON` fires again whenever the
+plug reconnects. Tasmota takes `cmnd/<device>/Power` with `ON` or `OFF`; Shelly Gen1
 takes `shellies/<id>/relay/0/command` with `on` or `off`. It returns
 `{:error, :no_broker}` when the broker app is not running. Two recipes live in
 a worker instead:

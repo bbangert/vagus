@@ -11,8 +11,13 @@ defmodule Vagus.PowerTest do
 
   defmodule Collector do
     @moduledoc false
-    def handle_mqtt_event(:message, {topic, payload, _packet}, %{pid: pid} = state) do
-      send(pid, {:mqtt_message, topic, payload})
+    def handle_mqtt_event(:message, {topic, payload, packet}, %{pid: pid} = state) do
+      send(pid, {:mqtt_message, topic, payload, Map.take(packet, [:qos, :retain])})
+      state
+    end
+
+    def handle_mqtt_event(:connected, _data, %{pid: pid, id: id} = state) do
+      send(pid, {:mqtt_connected, id})
       state
     end
 
@@ -44,26 +49,26 @@ defmodule Vagus.PowerTest do
       %{port: port}
     end
 
-    test "a published message reaches a subscriber", %{port: port} do
-      {:ok, @slug, %{"password" => pass}} = App.service("mqtt")
-
-      {:ok, sub} =
-        MqttX.Client.connect(
-          host: "127.0.0.1",
-          port: port,
-          client_id: "power-sub",
-          protocol_version: 4,
-          username: "addons",
-          password: pass,
-          handler: Collector,
-          handler_state: %{pid: self()}
-        )
-
-      await(sub)
+    test "a published message reaches a subscriber at QoS 1", %{port: port} do
+      sub = subscriber(port, "power-sub")
       {:ok, _} = MqttX.Client.subscribe(sub, "cmnd/plug1/Power", qos: 1)
 
       assert :ok = Vagus.Power.mqtt("cmnd/plug1/Power", "ON")
-      assert_receive {:mqtt_message, ["cmnd", "plug1", "Power"], "ON"}, 2_000
+
+      assert_receive {:mqtt_message, ["cmnd", "plug1", "Power"], "ON", %{qos: 1, retain: false}},
+                     2_000
+    end
+
+    # A live delivery always has retain cleared, so the flag is only
+    # observable on a subscribe that arrives after the publish.
+    test "retain: true is stored by the broker", %{port: port} do
+      assert :ok = Vagus.Power.mqtt("stat/plug1/Power", "OFF", retain: true)
+
+      sub = subscriber(port, "power-late-sub")
+      {:ok, _} = MqttX.Client.subscribe(sub, "stat/plug1/Power", qos: 1)
+
+      assert_receive {:mqtt_message, ["stat", "plug1", "Power"], "OFF", %{retain: true}},
+                     2_000
     end
   end
 
@@ -71,24 +76,43 @@ defmodule Vagus.PowerTest do
     assert {:error, :no_broker} = Vagus.Power.mqtt("t", "p", service: fn -> :error end)
   end
 
-  test "an unreachable broker is a connect error or times out" do
+  test "an unreachable broker is a connect timeout" do
     creds = %{"port" => free_port(), "username" => "u", "password" => "p"}
 
-    assert {:error, reason} =
+    assert {:error, {:connect, :timeout}} =
              Vagus.Power.mqtt("t", "p",
                service: fn -> {:ok, "x", creds} end,
                timeout_ms: 500
              )
-
-    assert reason == :timeout or match?({:connect, _}, reason)
   end
 
-  defp await(client, tries \\ 80) do
-    cond do
-      MqttX.Client.connected?(client) -> :ok
-      tries == 0 -> flunk("client never connected")
-      true -> Process.sleep(25) && await(client, tries - 1)
-    end
+  test "a refused connect does not echo the password" do
+    password = "s3cret-#{System.unique_integer([:positive])}"
+    creds = %{"port" => free_port(), "username" => "u", "password" => password}
+
+    assert {:error, reason} =
+             Vagus.Power.mqtt("t", "p", service: fn -> {:ok, "x", creds} end, timeout_ms: 300)
+
+    refute inspect(reason) =~ password
+  end
+
+  defp subscriber(port, client_id) do
+    {:ok, @slug, %{"password" => pass}} = App.service("mqtt")
+
+    {:ok, sub} =
+      MqttX.Client.connect(
+        host: "127.0.0.1",
+        port: port,
+        client_id: client_id,
+        protocol_version: 4,
+        username: "addons",
+        password: pass,
+        handler: Collector,
+        handler_state: %{pid: self(), id: client_id}
+      )
+
+    assert_receive {:mqtt_connected, ^client_id}, 2_000
+    sub
   end
 
   defp forget_app do

@@ -15,9 +15,10 @@ defmodule Vagus.NFS do
   runtime and their addresses are not known at start, so knfsd listens on
   every interface and each export's client CIDR is the access control.
 
-  The export table lives only in this process. If it dies the next
-  incarnation unexports everything the kernel still holds, so the
-  orchestrator re-exports what it needs.
+  Exports outlive this process: the kernel and `etab` keep them, a new
+  incarnation adopts `etab`, and a crashed mountd is restarted, so an
+  nfsroot target keeps its root. Only a mountd that keeps crashing makes
+  the server give up and drop every export.
 
   Never starts on the appliance flavor (`Vagus.Flavor.agent?/0`).
   """
@@ -31,10 +32,22 @@ defmodule Vagus.NFS do
   # read-only rootfs does not ship, so mountd and exportfs must both use the
   # compiled-in NFS_STATEDIR. It is under /run, so it is tmpfs.
   @default_state_dir "/run/nfs"
-  @default_options ~w(sync no_root_squash no_subtree_check insecure)
+  # nfsroot targets run as root, so squashing would make their root
+  # filesystem unwritable.
+  # `insecure`: target userspace (and some bootloaders) mount from
+  # unprivileged source ports.
+  @base_options ~w(sync no_root_squash)
+  @tail_options ~w(insecure)
+  @mountd_args ["-F", "-N", "2", "-N", "3"]
+  @max_restarts 3
+  @restart_window_ms 60_000
   @cmd_timeout_ms 10_000
-  # A start runs up to four bounded commands.
-  @call_timeout_ms 60_000
+  # The longest call (a first export whose exportfs fails) runs modprobe,
+  # mount, rpc.nfsd, exportfs and `rpc.nfsd 0`, each bounded, plus a mountd
+  # start and stop.
+  @max_cmds_per_call 5
+  @daemon_margin_ms 10_000
+  @call_timeout_ms @cmd_timeout_ms * @max_cmds_per_call + @daemon_margin_ms
 
   @type export_entry :: %{path: String.t(), client: String.t(), options: String.t()}
   @type status :: %{running: boolean(), exports: [export_entry()]}
@@ -49,13 +62,17 @@ defmodule Vagus.NFS do
   end
 
   @doc """
-  Exports `path` to `client_cidr` (an IPv4 address or CIDR). `ro: true`
-  exports read-only. Exporting a path again with the same client and
+  Exports `path` to `client_cidr` (an IPv4 address or a CIDR of /8 or
+  narrower). `ro: true` exports read-only; `subtree_check: false` drops
+  the subtree check, which otherwise stops a client from forging a handle
+  outside the export. Exporting a path again with the same client and
   options is a no-op; with different ones it is `{:error, {:already_exported, entry}}`.
   """
   @spec export(String.t(), String.t(), keyword()) :: :ok | {:error, term()}
   def export(path, client_cidr, opts \\ []) do
-    call(opts, {:export, path, client_cidr, Keyword.get(opts, :ro, false)})
+    ro? = Keyword.get(opts, :ro, false)
+    subtree? = Keyword.get(opts, :subtree_check, true)
+    call(opts, {:export, path, client_cidr, options(ro?, subtree?)})
   end
 
   @spec unexport(String.t(), keyword()) :: :ok | {:error, term()}
@@ -67,7 +84,11 @@ defmodule Vagus.NFS do
   # Dist callers get a value back, never an exit, whether the server is
   # absent (appliance flavor) or slow.
   defp call(opts, msg) do
-    GenServer.call(Keyword.get(opts, :server, __MODULE__), msg, @call_timeout_ms)
+    GenServer.call(
+      Keyword.get(opts, :server, __MODULE__),
+      msg,
+      Keyword.get(opts, :timeout, @call_timeout_ms)
+    )
   catch
     :exit, {:noproc, _} -> {:error, :not_running}
     :exit, {{:nodedown, _}, _} -> {:error, :not_running}
@@ -88,35 +109,26 @@ defmodule Vagus.NFS do
       daemon: Keyword.get(opts, :daemon, &default_daemon/2),
       nfsd_mounted?: Keyword.get(opts, :nfsd_mounted?, &nfsd_mounted?/0),
       mountd: nil,
+      restarts: [],
       exports: %{}
     }
 
-    {:ok, state, {:continue, :reset_stale}}
+    {:ok, state, {:continue, :adopt}}
   end
 
-  # A non-empty etab means a previous incarnation died with exports in the
-  # kernel; drop them so the kernel matches the (empty) table here.
   @impl GenServer
-  # sobelow_skip ["Traversal.FileModule"]
-  def handle_continue(:reset_stale, state) do
-    case File.read(Path.join(state.state_dir, "etab")) do
-      {:ok, etab} when etab != "" ->
-        Logger.warning("Vagus.NFS: dropping exports left by a previous instance")
-        state.cmd.("exportfs", ["-ua"])
-        state.cmd.("rpc.nfsd", ["0"])
-
-      _ ->
-        :ok
+  def handle_continue(:adopt, state) do
+    case state.state_dir |> read_etab() |> parse_etab() do
+      [] -> {:noreply, state}
+      entries -> {:noreply, adopt(entries, state)}
     end
-
-    {:noreply, state}
   end
 
   @impl GenServer
-  def handle_call({:export, path, client, ro?}, _from, state) do
+  def handle_call({:export, path, client, options}, _from, state) do
     with {:ok, path} <- validate_path(path, state.root),
          {:ok, client} <- validate_client(client) do
-      entry = %{path: path, client: client, options: options(ro?)}
+      entry = %{path: path, client: client, options: options}
 
       case Map.fetch(state.exports, path) do
         {:ok, ^entry} -> {:reply, :ok, state}
@@ -142,11 +154,105 @@ defmodule Vagus.NFS do
 
   @impl GenServer
   def handle_info({:EXIT, pid, reason}, %{mountd: pid} = state) do
-    Logger.error("Vagus.NFS: rpc.mountd exited: #{inspect(reason)}")
-    {:stop, {:mountd_exited, reason}, %{state | mountd: nil}}
+    state = %{state | mountd: nil}
+
+    if map_size(state.exports) == 0 do
+      Logger.warning("Vagus.NFS: idle rpc.mountd exited: #{inspect(reason)}")
+      {_result, state} = stop_server(state)
+      {:noreply, state}
+    else
+      {:noreply, restart_mountd(reason, state)}
+    end
   end
 
   def handle_info({:EXIT, _pid, _reason}, state), do: {:noreply, state}
+
+  # The kernel export table survives mountd; only its upcalls fail until a
+  # new mountd (which re-reads etab) is up.
+  defp restart_mountd(reason, state) do
+    now = System.monotonic_time(:millisecond)
+    recent = Enum.filter(state.restarts, &(now - &1 < @restart_window_ms))
+
+    with true <- length(recent) < @max_restarts,
+         {:ok, pid} <- start_mountd(state) do
+      Logger.warning("Vagus.NFS: rpc.mountd exited (#{inspect(reason)}); restarted it")
+      %{state | mountd: pid, restarts: [now | recent]}
+    else
+      _ ->
+        Logger.error("Vagus.NFS: rpc.mountd keeps exiting (#{inspect(reason)}); dropping exports")
+        give_up(state)
+    end
+  end
+
+  defp give_up(state) do
+    run(state, "exportfs", ["-ua"])
+    {_result, state} = stop_server(state)
+    %{state | exports: %{}, restarts: []}
+  end
+
+  defp adopt(entries, state) do
+    {keep, drop} = Enum.split_with(entries, &adoptable?(&1, state.root))
+    Enum.each(drop, &run(state, "exportfs", ["-u", spec(&1)]))
+
+    case keep do
+      [] -> state
+      keep -> start_adopted(keep, state)
+    end
+  end
+
+  defp start_adopted(keep, state) do
+    case ensure_started(state) do
+      {:ok, state} ->
+        Logger.info("Vagus.NFS: adopted #{length(keep)} export(s) from etab")
+        resync(%{state | exports: Map.new(keep, &{&1.path, &1})})
+
+      error ->
+        Logger.error("Vagus.NFS: adopting etab failed (#{inspect(error)}); dropping exports")
+        state = with {:error, _reason, state} <- error, do: state
+        give_up(state)
+    end
+  end
+
+  # `-f` flushes the kernel's export cache so its next upcalls are answered
+  # from etab; `-r` would skip etab and rebuild from the absent /etc/exports,
+  # unexporting everything. A failed flush only leaves stale cache entries.
+  defp resync(state) do
+    with {:error, reason} <- run(state, "exportfs", ["-f"]) do
+      Logger.warning("Vagus.NFS: export cache flush failed: #{inspect(reason)}")
+    end
+
+    state
+  end
+
+  defp adoptable?(entry, root) do
+    match?({:ok, _}, validate_path(entry.path, root)) and
+      match?({:ok, _}, validate_client(entry.client))
+  end
+
+  # sobelow_skip ["Traversal.FileModule"]
+  defp read_etab(dir) do
+    case File.read(Path.join(dir, "etab")) do
+      {:ok, etab} -> etab
+      {:error, _} -> ""
+    end
+  end
+
+  # putexportent() in nfs-utils support/nfs/exports.c writes
+  # `<path>\t<client>(<flag>,...)`, octal-escaping odd path bytes as \ooo.
+  defp parse_etab(etab) do
+    for line <- String.split(etab, "\n", trim: true),
+        [path, rest] <- [String.split(line, "\t", parts: 2)],
+        [client, flags] <- [String.split(rest, "(", parts: 2)] do
+      flags = flags |> String.trim_trailing(")") |> String.split(",")
+      ro? = "ro" in flags
+      subtree? = "subtree_check" in flags
+      %{path: unescape(path), client: client, options: options(ro?, subtree?)}
+    end
+  end
+
+  defp unescape(path) do
+    Regex.replace(~r/\\([0-7]{3})/, path, fn _, oct -> <<String.to_integer(oct, 8)>> end)
+  end
 
   defp add_export(entry, state) do
     case ensure_started(state) do
@@ -222,7 +328,7 @@ defmodule Vagus.NFS do
   end
 
   defp start_mountd(state) do
-    case state.daemon.(:start, ["-F", "-N", "2", "-N", "3"]) do
+    case state.daemon.(:start, @mountd_args) do
       {:ok, pid} -> {:ok, pid}
       {:error, reason} -> {:error, {"rpc.mountd", reason}}
     end
@@ -266,20 +372,43 @@ defmodule Vagus.NFS do
 
   defp spec(entry), do: "#{entry.client}:#{entry.path}"
 
-  defp options(ro?), do: Enum.join([if(ro?, do: "ro", else: "rw") | @default_options], ",")
+  defp options(ro?, subtree?) do
+    subtree = if subtree?, do: "subtree_check", else: "no_subtree_check"
+    Enum.join([if(ro?, do: "ro", else: "rw")] ++ @base_options ++ [subtree | @tail_options], ",")
+  end
 
-  # The leaf is lstat'ed so a symlink cannot stand in for a directory.
+  # exportfs splits `client:path` at the first ':' (utils/exportfs/exportfs.c:334),
+  # as does the target's `nfsroot=server:path`; whitespace and control bytes
+  # come back octal-escaped from etab. Refusing them keeps every form of the
+  # path unambiguous.
   defp validate_path(path, root) when is_binary(path) do
-    path = Path.expand(path)
-
     cond do
-      not String.starts_with?(path, root <> "/") -> {:error, :outside_root}
-      match?({:ok, %File.Stat{type: :directory}}, File.lstat(path)) -> {:ok, path}
-      true -> {:error, :not_a_directory}
+      not String.valid?(path) or String.match?(path, ~r/[:\s\x00-\x1f\x7f]/u) ->
+        {:error, :invalid_path}
+
+      not String.starts_with?(Path.expand(path), root <> "/") ->
+        {:error, :outside_root}
+
+      true ->
+        walk(root, Path.expand(path) |> Path.relative_to(root) |> Path.split())
     end
   end
 
   defp validate_path(_path, _root), do: {:error, :outside_root}
+
+  # Every component is lstat'ed: a symlink anywhere below the root could
+  # point the export outside it.
+  defp walk(dir, []), do: {:ok, dir}
+
+  defp walk(dir, [name | rest]) do
+    path = Path.join(dir, name)
+
+    case File.lstat(path) do
+      {:ok, %File.Stat{type: :directory}} -> walk(path, rest)
+      {:ok, %File.Stat{type: :symlink}} -> {:error, :symlink}
+      _ -> {:error, :not_a_directory}
+    end
+  end
 
   defp validate_client(client) when is_binary(client) do
     case String.split(client, "/") do
@@ -303,9 +432,10 @@ defmodule Vagus.NFS do
     end
   end
 
+  # Anything wider than /8 is close enough to "everyone" to be a mistake.
   defp prefix(bits) do
     case Integer.parse(bits) do
-      {n, ""} when n in 0..32 -> {:ok, n}
+      {n, ""} when n in 8..32 -> {:ok, n}
       _ -> {:error, :invalid_client}
     end
   end
@@ -324,7 +454,7 @@ defmodule Vagus.NFS do
   end
 
   defp default_daemon(:stop, pid) do
-    GenServer.stop(pid)
+    GenServer.stop(pid, :normal, @cmd_timeout_ms)
   catch
     :exit, _ -> :ok
   end

@@ -105,7 +105,7 @@ needs `--net host --cap-add NET_ADMIN,NET_RAW` and runs its own `bluetoothd`.
 `dnsmasq` is in the base image if the target needs DHCP (run it in the worker).
 
 ## Lab services
-Lost on reboot: re-apply them at the start of a task.
+They survive a Vagus restart but not a reboot: re-apply them at the start of a task.
 
     vagus eval 'Vagus.Network.Lab.up("eth1", "10.42.0.1/24")'   # down/1, status/0
     vagus eval 'Vagus.NFS.export("/data/vagus/nfs/<target>", "10.42.0.0/24")'   # unexport/1, status/0
@@ -113,15 +113,19 @@ Lost on reboot: re-apply them at the start of a task.
     vagus eval 'Vagus.Power.mqtt("cmnd/<device>/Power", "ON")'  # Shelly Gen1: shellies/<id>/relay/0/command on|off
 
 - `Lab.up` addresses an extra NIC and forwards it to the primary interface (nft
-  masquerade) while up. DHCP/TFTP/PXE for the target is `dnsmasq` in a worker:
+  masquerade) while up. It refuses `eth0`, `wlan0`, `usb0`, `hassio*`, a NIC
+  VintageNet already configures, and a cidr overlapping the LAN or `172.30.32.0/23`. DHCP/TFTP/PXE for the target is `dnsmasq` in a worker:
   `--network=host --cap-add NET_ADMIN,NET_RAW`, `dnsmasq --keep-in-foreground
-  --interface=<if> --bind-interfaces --dhcp-range=10.42.0.50,10.42.0.150,12h
+  --interface=<lab NIC> --bind-interfaces --dhcp-range=10.42.0.50,10.42.0.150,12h
   --enable-tftp --tftp-root=/data/tftp --dhcp-boot=<bootfile>`.
-- NFS is NFSv4 only, paths under `/data/vagus/nfs/`; target kernel args:
+- NFS is NFSv4 only, paths under `/data/vagus/nfs/`. nfsd listens on every
+  interface, so the client CIDR is the only access control (no `/0`); exports use
+  `subtree_check`. Target kernel args:
   `root=/dev/nfs nfsroot=10.42.0.1:/data/vagus/nfs/<target>,vers=4,tcp rw ip=dhcp`.
 - A shared USB device is attached from Ben's laptop:
   `sudo modprobe vhci-hcd && usbip list -r <board-ip> && sudo usbip attach -r <board-ip> -b 1-1.4`.
-  The share drops when the device is unplugged.
+  The share drops when the device is unplugged. Port 3240 has no authentication:
+  anyone on the LAN can attach it, so `unshare/1` when done.
 - Hubs with per-port power: `uhubctl -l <hub> -p <port> -a off|on` in a worker with
   `/dev/bus/usb`. GPIO relays: Python `gpiod` or `Circuits.GPIO` with
   `--device /dev/gpiochipN`; record the header pin names in the task notes.
@@ -130,6 +134,8 @@ Lost on reboot: re-apply them at the start of a task.
 - `:init.stop`, `System.halt`, `:net_kernel.stop` on the board node.
 - `Nerves.Runtime.reboot()` unless Ben asks for a reboot.
 - `VintageNet.configure` or `Lab.up` on `eth0` or `wlan0`: that is how the board stays reachable.
+- `dnsmasq` with `--interface` other than the lab NIC: on `eth0`/`wlan0` it serves DHCP to the LAN.
+- `retain: true` on a plug command: a retained `ON` re-fires whenever the plug reconnects.
 - Open a `usbip`-shared device on the board itself while it is shared.
 - Stop, restart or uninstall `agent_orchestrator` (you), or touch any `addon_*` container.
 - Delete anything under `/root/containers` (podman's store).

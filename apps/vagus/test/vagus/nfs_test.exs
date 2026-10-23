@@ -1,10 +1,12 @@
 defmodule Vagus.NFSTest do
   use ExUnit.Case, async: true
+  @moduletag :capture_log
 
   alias Vagus.NFS
 
   @nfsd_start ["-N", "2", "-N", "3", "--no-udp", "-G", "10", "4"]
-  @rw "rw,sync,no_root_squash,no_subtree_check,insecure"
+  @mountd_args ["-F", "-N", "2", "-N", "3"]
+  @rw "rw,sync,no_root_squash,subtree_check,insecure"
 
   setup do
     base = Path.join(System.tmp_dir!(), "vagus-nfs-#{System.unique_integer([:positive])}")
@@ -16,24 +18,37 @@ defmodule Vagus.NFSTest do
     %{base: base, root: root, target: target, state_dir: Path.join(base, "state")}
   end
 
-  # `fail` maps {bin, args} to a canned non-zero result.
+  # `fail` maps {bin, args} to a canned result; `block` names a bin whose
+  # call waits for :release. The fake mountd is a real process spawned (and
+  # so linked) inside the server, so killing it reaches the EXIT path.
   defp start_nfs(ctx, extra \\ []) do
     test = self()
     fail = Keyword.get(extra, :fail, %{})
+    block = Keyword.get(extra, :block)
 
     cmd = fn bin, args ->
       send(test, {:cmd, bin, args})
+      if bin == block, do: receive(do: (:release -> :ok))
       Map.get(fail, {bin, args}, {"", 0})
     end
 
     daemon = fn
       :start, args ->
-        pid = spawn(fn -> Process.sleep(:infinity) end)
-        send(test, {:daemon_start, args, pid})
-        Keyword.get(extra, :daemon_result, {:ok, pid})
+        case Keyword.get(extra, :daemon_result) do
+          nil ->
+            pid = spawn_link(fn -> Process.sleep(:infinity) end)
+            send(test, {:daemon_start, args, pid})
+            {:ok, pid}
+
+          result ->
+            send(test, {:daemon_start, args, nil})
+            result
+        end
 
       :stop, pid ->
         send(test, {:daemon_stop, pid})
+        Process.unlink(pid)
+        Process.exit(pid, :kill)
         :ok
     end
 
@@ -55,6 +70,30 @@ defmodule Vagus.NFSTest do
 
   defp assert_cmd(bin, args), do: assert_received({:cmd, ^bin, ^args})
 
+  # Fake runner messages in arrival order; daemon pids reduced to the args.
+  defp events(acc \\ []) do
+    receive do
+      {:cmd, bin, args} -> events([{bin, args} | acc])
+      {:daemon_start, args, _pid} -> events([{:mountd_start, args} | acc])
+      {:daemon_stop, _pid} -> events([:mountd_stop | acc])
+    after
+      0 -> Enum.reverse(acc)
+    end
+  end
+
+  defp mountd_pid(s) do
+    s[:server] |> :sys.get_state() |> Map.fetch!(:mountd)
+  end
+
+  defp kill_mountd(s) do
+    pid = mountd_pid(s)
+    ref = Process.monitor(pid)
+    Process.exit(pid, :kill)
+    assert_receive {:DOWN, ^ref, :process, ^pid, :killed}
+    # status/1 is served after the EXIT, which was queued first.
+    NFS.status(s)
+  end
+
   test "start_link/1 is :ignore when not enabled (the default on the host flavor)" do
     assert NFS.start_link([]) == :ignore
     assert NFS.start_link(enabled: false) == :ignore
@@ -67,16 +106,28 @@ defmodule Vagus.NFSTest do
     assert NFS.unexport("/data/vagus/nfs/x", server) == {:error, :not_running}
   end
 
+  test "a call that outlives its timeout is {:error, :timeout}", ctx do
+    s = start_nfs(ctx, block: "modprobe")
+
+    assert NFS.export(ctx.target, "10.0.0.1", Keyword.put(s, :timeout, 50)) ==
+             {:error, :timeout}
+
+    send(GenServer.whereis(s[:server]), :release)
+    assert %{running: true} = NFS.status(s)
+  end
+
   test "the first export starts the server, in order", ctx do
     s = start_nfs(ctx)
 
     assert NFS.export(ctx.target, "10.42.0.0/24", s) == :ok
 
-    assert_cmd("modprobe", ["nfsd"])
-    assert_cmd("mount", ["-t", "nfsd", "nfsd", "/proc/fs/nfsd"])
-    assert_received {:daemon_start, ["-F", "-N", "2", "-N", "3"], _pid}
-    assert_cmd("rpc.nfsd", @nfsd_start)
-    assert_cmd("exportfs", ["-o", @rw, "10.42.0.0/24:" <> ctx.target])
+    assert events() == [
+             {"modprobe", ["nfsd"]},
+             {"mount", ["-t", "nfsd", "nfsd", "/proc/fs/nfsd"]},
+             {:mountd_start, @mountd_args},
+             {"rpc.nfsd", @nfsd_start},
+             {"exportfs", ["-o", @rw, "10.42.0.0/24:" <> ctx.target]}
+           ]
 
     assert Bitwise.band(File.stat!(ctx.state_dir).mode, 0o777) == 0o700
     assert File.exists?(Path.join(ctx.state_dir, "etab"))
@@ -94,7 +145,7 @@ defmodule Vagus.NFSTest do
     refute_received {:cmd, "mount", _}
   end
 
-  test "a second export reuses the running server; ro flips rw", ctx do
+  test "a second export reuses the running server; ro and subtree_check: false apply", ctx do
     s = start_nfs(ctx)
     other = Path.join(ctx.root, "t2")
     File.mkdir_p!(other)
@@ -102,16 +153,17 @@ defmodule Vagus.NFSTest do
     :ok = NFS.export(ctx.target, "10.42.0.7", s)
     flush()
 
-    assert NFS.export(other, "10.42.0.8", Keyword.put(s, :ro, true)) == :ok
+    assert NFS.export(other, "10.42.0.8", Keyword.merge(s, ro: true, subtree_check: false)) == :ok
 
-    assert_cmd("exportfs", [
-      "-o",
-      "ro,sync,no_root_squash,no_subtree_check,insecure",
-      "10.42.0.8:" <> other
-    ])
+    assert events() == [
+             {"exportfs",
+              [
+                "-o",
+                "ro,sync,no_root_squash,no_subtree_check,insecure",
+                "10.42.0.8:" <> other
+              ]}
+           ]
 
-    refute_received {:cmd, "modprobe", _}
-    refute_received {:daemon_start, _, _}
     assert length(NFS.status(s).exports) == 2
   end
 
@@ -133,20 +185,20 @@ defmodule Vagus.NFSTest do
     File.mkdir_p!(other)
     :ok = NFS.export(ctx.target, "10.42.0.7", s)
     :ok = NFS.export(other, "10.42.0.8", s)
-    assert_received {:daemon_start, _, mountd}
     flush()
 
     assert NFS.unexport(other, s) == :ok
-    assert_cmd("exportfs", ["-u", "10.42.0.8:" <> other])
-    refute_received {:cmd, "rpc.nfsd", _}
-    refute_received {:daemon_stop, _}
+    assert events() == [{"exportfs", ["-u", "10.42.0.8:" <> other]}]
 
     assert NFS.unexport(ctx.target, s) == :ok
-    assert_cmd("exportfs", ["-u", "10.42.0.7:" <> ctx.target])
-    assert_cmd("rpc.nfsd", ["0"])
-    assert_received {:daemon_stop, ^mountd}
-    assert NFS.status(s) == %{running: false, exports: []}
 
+    assert events() == [
+             {"exportfs", ["-u", "10.42.0.7:" <> ctx.target]},
+             {"rpc.nfsd", ["0"]},
+             :mountd_stop
+           ]
+
+    assert NFS.status(s) == %{running: false, exports: []}
     assert NFS.unexport(ctx.target, s) == {:error, :not_exported}
   end
 
@@ -163,11 +215,31 @@ defmodule Vagus.NFSTest do
     assert NFS.export(ctx.root <> "-evil/x", "10.0.0.1", s) == {:error, :outside_root}
     assert NFS.export(Path.join(ctx.root, "missing"), "10.0.0.1", s) == {:error, :not_a_directory}
     assert NFS.export(file, "10.0.0.1", s) == {:error, :not_a_directory}
-    assert NFS.export(link, "10.0.0.1", s) == {:error, :not_a_directory}
+    assert NFS.export(link, "10.0.0.1", s) == {:error, :symlink}
     refute_received {:cmd, _, _}
   end
 
-  test "clients must be an IPv4 address or CIDR", ctx do
+  test "a symlink anywhere below the root is refused", ctx do
+    s = start_nfs(ctx)
+    File.mkdir_p!(Path.join(ctx.base, "outside/etc"))
+    File.ln_s!(Path.join(ctx.base, "outside"), Path.join(ctx.root, "link"))
+
+    assert NFS.export(Path.join(ctx.root, "link/etc"), "10.0.0.1", s) == {:error, :symlink}
+    refute_received {:cmd, _, _}
+  end
+
+  test "paths with ':', whitespace or control bytes are refused", ctx do
+    s = start_nfs(ctx)
+
+    for name <- ["a:b", "a b", "a\tb", "a\nb", <<"a", 0, "b">>, <<"a", 0xFF>>] do
+      dir = Path.join(ctx.root, name)
+      assert NFS.export(dir, "10.0.0.1", s) == {:error, :invalid_path}, inspect(name)
+    end
+
+    refute_received {:cmd, _, _}
+  end
+
+  test "clients must be an IPv4 address or a CIDR of /8 or narrower", ctx do
     s = start_nfs(ctx)
 
     for bad <- [
@@ -176,6 +248,9 @@ defmodule Vagus.NFSTest do
           "host.lan",
           "10.0.0.256",
           "10.0.0.0/33",
+          "0.0.0.0/0",
+          "10.0.0.0/0",
+          "10.0.0.0/7",
           "10.0.0.0/",
           "10.0.0.0/8/1",
           "::1",
@@ -222,6 +297,20 @@ defmodule Vagus.NFSTest do
     assert NFS.status(s) == %{running: false, exports: []}
   end
 
+  test "a failed exportfs leaves the other exports and the server alone", ctx do
+    other = Path.join(ctx.root, "t2")
+    File.mkdir_p!(other)
+    spec = "10.0.0.2:" <> other
+    s = start_nfs(ctx, fail: %{{"exportfs", ["-o", @rw, spec]} => {"bad", 1}})
+    :ok = NFS.export(ctx.target, "10.0.0.1", s)
+    flush()
+
+    assert NFS.export(other, "10.0.0.2", s) == {:error, {"exportfs", ["-o", @rw, spec], "bad", 1}}
+    assert events() == [{"exportfs", ["-o", @rw, spec]}]
+    assert %{running: true, exports: [%{path: path}]} = NFS.status(s)
+    assert path == ctx.target
+  end
+
   test "a failed exportfs -u keeps the export", ctx do
     spec = "10.0.0.1:" <> ctx.target
     s = start_nfs(ctx, fail: %{{"exportfs", ["-u", spec]} => {"busy", 1}})
@@ -237,21 +326,72 @@ defmodule Vagus.NFSTest do
     refute_received {:cmd, "rpc.nfsd", _}
   end
 
-  test "exports left by a previous instance are dropped at start", ctx do
-    File.mkdir_p!(ctx.state_dir)
-    File.write!(Path.join(ctx.state_dir, "etab"), "/data/vagus/nfs/t1\t10.0.0.1(rw)\n")
-
+  test "a mountd that exits is restarted and the exports kept", ctx do
     s = start_nfs(ctx)
-    # status/1 is served after handle_continue, so the reset has run.
-    assert NFS.status(s) == %{running: false, exports: []}
-    assert_cmd("exportfs", ["-ua"])
-    assert_cmd("rpc.nfsd", ["0"])
+    :ok = NFS.export(ctx.target, "10.0.0.1", s)
+    old = mountd_pid(s)
+    flush()
+
+    assert %{running: true, exports: [%{path: path}]} = kill_mountd(s)
+    assert path == ctx.target
+    assert events() == [{:mountd_start, @mountd_args}]
+    assert mountd_pid(s) not in [nil, old]
   end
 
-  test "no reset runs on a clean start", ctx do
+  test "a mountd that keeps exiting makes the server give up", ctx do
+    s = start_nfs(ctx)
+    :ok = NFS.export(ctx.target, "10.0.0.1", s)
+
+    for _ <- 1..3, do: assert(%{running: true} = kill_mountd(s))
+    flush()
+
+    assert kill_mountd(s) == %{running: false, exports: []}
+    assert events() == [{"exportfs", ["-ua"]}, {"rpc.nfsd", ["0"]}]
+  end
+
+  test "exports in a previous instance's etab are adopted", ctx do
+    File.mkdir_p!(ctx.state_dir)
+    gone = Path.join(ctx.root, "gone")
+
+    # The shape putexportent() writes, trimmed of trailing flags.
+    File.write!(Path.join(ctx.state_dir, "etab"), """
+    #{ctx.target}\t10.42.0.0/24(rw,sync,wdelay,hide,nocrossmnt,insecure,no_root_squash,no_all_squash,subtree_check,secure_locks,acl,no_pnfs,anonuid=65534,anongid=65534,sec=sys,rw,insecure,no_root_squash,no_all_squash)
+    #{gone}\t10.42.0.9(ro,sync,wdelay,hide,nocrossmnt,insecure,no_root_squash,no_all_squash,no_subtree_check,secure_locks,acl,no_pnfs,anonuid=65534,anongid=65534,sec=sys,ro,insecure,no_root_squash,no_all_squash)
+    """)
+
+    s = start_nfs(ctx)
+
+    # status/1 is served after handle_continue, so adoption has run.
+    assert NFS.status(s) == %{
+             running: true,
+             exports: [%{path: ctx.target, client: "10.42.0.0/24", options: @rw}]
+           }
+
+    assert events() == [
+             {"exportfs", ["-u", "10.42.0.9:" <> gone]},
+             {"modprobe", ["nfsd"]},
+             {"mount", ["-t", "nfsd", "nfsd", "/proc/fs/nfsd"]},
+             {:mountd_start, @mountd_args},
+             {"rpc.nfsd", @nfsd_start},
+             {"exportfs", ["-f"]}
+           ]
+
+    assert NFS.export(ctx.target, "10.42.0.0/24", s) == :ok
+    refute_received {:cmd, _, _}
+  end
+
+  test "an empty etab starts nothing", ctx do
+    File.mkdir_p!(ctx.state_dir)
+    File.write!(Path.join(ctx.state_dir, "etab"), "")
+    s = start_nfs(ctx)
+    assert NFS.status(s) == %{running: false, exports: []}
+    assert events() == []
+  end
+
+  test "nothing runs on a clean start", ctx do
     s = start_nfs(ctx)
     NFS.status(s)
-    refute_received {:cmd, _, _}
+    assert events() == []
   end
 
   defp flush do

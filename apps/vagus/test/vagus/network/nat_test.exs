@@ -166,23 +166,79 @@ defmodule Vagus.Network.NatTest do
       assert Nat.ruleset(ip: "172.30.32.2", port: 8888, lab: []) == {:ok, @ruleset}
     end
 
-    test "set_lab/2 stores the list for later renders, and restores it on a refused load",
-         %{dir: dir} do
-      opts = opts(dir, nft_fake({"", 0})) ++ [lab_key: {__MODULE__, :lab, dir}]
-      on_exit(fn -> :persistent_term.erase({__MODULE__, :lab, dir}) end)
+    test "set_lab/2 stores the list for later renders once it is loaded", %{dir: dir} do
+      opts = lab_opts(dir, nft_fake({"", 0}))
 
       assert Nat.set_lab([{"eth1", "eth0"}], opts) == :ok
       assert_received {:nft, "nft", _, text}
       assert text =~ "masquerade"
       assert {:ok, later} = Nat.ruleset(opts)
       assert later =~ "masquerade"
+    end
+
+    test "a refused load keeps the stored list and re-renders it", %{dir: dir} do
+      opts = lab_opts(dir, nft_fake({"", 0}))
+      :ok = Nat.set_lab([{"eth1", "eth0"}], opts)
+      assert_received {:nft, _, _, _}
 
       capture_log(fn ->
-        failing = Keyword.put(opts, :cmd, nft_fake({"boom", 1}))
-        assert {:error, _} = Nat.set_lab([], failing)
+        assert {:error, _} = Nat.set_lab([], Keyword.put(opts, :cmd, nft_fake({"boom", 1})))
       end)
 
+      assert [{:nft, _, _, new}, {:nft, _, _, old}] = receive_all()
+      refute new =~ "eth1"
+      assert old =~ ~s(iifname "eth1" oifname "eth0" masquerade)
       assert Nat.lab(opts) == [{"eth1", "eth0"}]
+    end
+
+    test "nft loaded but the sysctl step failed: the old list goes back in", %{dir: dir} do
+      opts = lab_opts(dir, nft_fake({"", 0}))
+      no_sysctl = Keyword.put(opts, :sysctl_root, dir <> "-absent")
+
+      capture_log(fn ->
+        assert {:error, {:sysctl, _, _}} = Nat.set_lab([{"eth1", "eth0"}], no_sysctl)
+      end)
+
+      assert [{:nft, _, _, new}, {:nft, _, _, old}] = receive_all()
+      assert new =~ "eth1"
+      refute old =~ "eth1"
+      assert Nat.lab(opts) == []
+    end
+
+    test "every interface name is checked before it reaches the ruleset" do
+      for pair <- [{"..", "eth0"}, {".", "eth0"}, {"eth1", ~s(eth0" accept)}, {"eth1", ".."}],
+          do:
+            assert(
+              Nat.ruleset(ip: "172.30.32.2", port: 8888, lab: [pair]) ==
+                {:error, :invalid_ifname}
+            )
+
+      assert Nat.valid_ifname?("enx001122334455")
+      assert Nat.valid_ifname?("eth1.100")
+      refute Nat.valid_ifname?("a234567890123456")
+      refute Nat.valid_ifname?("-eth1")
+      refute Nat.valid_ifname?("")
+      refute Nat.valid_ifname?(:eth1)
+    end
+
+    test "an invalid name loads nothing", %{dir: dir} do
+      opts = lab_opts(dir, nft_fake({"", 0}))
+      assert Nat.set_lab([{"..", "eth0"}], opts) == {:error, :invalid_ifname}
+      assert receive_all() == []
+      assert Nat.lab(opts) == []
+    end
+  end
+
+  defp lab_opts(dir, cmd) do
+    on_exit(fn -> :persistent_term.erase({__MODULE__, :lab, dir}) end)
+    opts(dir, cmd) ++ [lab_key: {__MODULE__, :lab, dir}]
+  end
+
+  defp receive_all(acc \\ []) do
+    receive do
+      msg -> receive_all([msg | acc])
+    after
+      0 -> Enum.reverse(acc)
     end
   end
 

@@ -13,11 +13,17 @@ defmodule Vagus.USBIPTest do
     "vagus-usbipd",
     "--privileged",
     "--network=host",
+    "--user",
+    "root",
     "--entrypoint",
     "usbipd",
     "img:test"
   ]
   @stop_argv ["stop", "-t", "5", "--ignore", "vagus-usbipd"]
+  @inspect_argv ["container", "inspect", "-f", "{{.State.Running}}", "vagus-usbipd"]
+  @drv "bus/usb/drivers"
+  # Generous: under a loaded full suite the server can be slow to subscribe.
+  @receive_ms 2_000
 
   setup do
     ctx = DevicesFixtures.tmp_root("usbip")
@@ -42,7 +48,6 @@ defmodule Vagus.USBIPTest do
   end
 
   defp sysfs(ctx, rel), do: Path.join(ctx.sysfs_root, rel)
-  defp read(ctx, rel), do: File.read!(sysfs(ctx, rel))
 
   # The kernel's side of a bind: the device's `driver` link.
   defp bind_driver(ctx, busid, driver) do
@@ -51,12 +56,38 @@ defmodule Vagus.USBIPTest do
     File.ln_s!(sysfs(ctx, "bus/usb/drivers/#{driver}"), link)
   end
 
+  # Every sysfs write so far, in the order the server made them. The sysfs
+  # files keep only the last value, so sequences are only visible here.
+  defp writes do
+    receive do
+      {:sysfs_write, path, value} -> [{path, value} | writes()]
+    after
+      0 -> []
+    end
+  end
+
+  defp captured(ctx, busid) do
+    bind_driver(ctx, busid, "usbip-host")
+
+    File.ln_s!(
+      sysfs(ctx, "bus/usb/devices/#{busid}"),
+      sysfs(ctx, "bus/usb/drivers/usbip-host/#{busid}")
+    )
+  end
+
   defp start(ctx, opts \\ []) do
     test = self()
     {podman_rules, opts} = Keyword.pop(opts, :podman_rules, [])
 
     fake =
-      FakePodman.start(podman_rules ++ [{"run *", [{0, "cid\n"}]}, {"stop *", [{0, ""}]}])
+      FakePodman.start(
+        podman_rules ++
+          [
+            {"run *", [{0, "cid\n"}]},
+            {"stop *", [{0, ""}]},
+            {"container inspect *", [{0, "true\n"}]}
+          ]
+      )
 
     {cmd_result, opts} = Keyword.pop(opts, :modprobe, {"", 0})
     name = :"usbip_#{System.unique_integer([:positive])}"
@@ -72,6 +103,7 @@ defmodule Vagus.USBIPTest do
         cmd_result
       end,
       watcher: :"watcher_#{name}",
+      trace: test,
       subscribe: fn server -> send(test, {:subscribed, server}) end
     ]
 
@@ -80,18 +112,21 @@ defmodule Vagus.USBIPTest do
     %{server: name, pid: pid, fake: fake}
   end
 
-  test "share binds the device the way usbip bind does and starts usbipd", ctx do
+  test "share binds the device the way usbip bind does and starts usbipd as root", ctx do
     s = start(ctx)
-    assert_receive {:subscribed, _}
+    assert_receive {:subscribed, _}, @receive_ms
 
     assert USBIP.share("usb:1-1.4", server: s.server) == :ok
     assert_received {:cmd, "modprobe", ["usbip-host"]}
 
-    assert read(ctx, "bus/usb/drivers/usb/unbind") == "1-1.4"
-    assert read(ctx, "bus/usb/drivers/usbip-host/match_busid") == "add 1-1.4"
-    assert read(ctx, "bus/usb/drivers/usbip-host/bind") == "1-1.4"
-    assert read(ctx, "bus/usb/drivers_probe") == ""
-    assert FakePodman.verbs(s.fake) == [@run_argv]
+    assert writes() == [
+             {"#{@drv}/usb/unbind", "1-1.4"},
+             {"#{@drv}/usbip-host/match_busid", "add 1-1.4"},
+             {"#{@drv}/usbip-host/bind", "1-1.4"}
+           ]
+
+    assert FakePodman.verbs(s.fake) == [@stop_argv, @run_argv]
+    assert ["--user", "root"] in Enum.chunk_every(@run_argv, 2, 1)
 
     assert USBIP.shared(server: s.server) == [
              %{id: "usb:1-1.4", busid: "1-1.4", vid_pid: "0403:6001"}
@@ -108,7 +143,21 @@ defmodule Vagus.USBIPTest do
              {:error, {:ambiguous, ["usb:1-1.4", "usb:1-1.5"]}}
 
     assert Enum.map(USBIP.shared(server: s.server), & &1.busid) == ["1-1.4", "1-1.5"]
-    assert FakePodman.verbs(s.fake) == [@run_argv]
+    assert FakePodman.verbs(s.fake) == [@stop_argv, @run_argv, @inspect_argv]
+  end
+
+  test "a usbipd found dead is started again on the next share", ctx do
+    s = start(ctx, podman_rules: [{"container inspect *", [{125, "Error: no such container\n"}]}])
+    :ok = USBIP.share("usb:1-1.4", server: s.server)
+    :ok = USBIP.share("usb:1-1.5", server: s.server)
+    assert FakePodman.verbs(s.fake) == [@stop_argv, @run_argv, @inspect_argv, @run_argv]
+
+    stop_supervised!(USBIP)
+    Process.unregister(:"watcher_#{s.server}")
+    s = start(ctx, podman_rules: [{"container inspect *", [{0, "false\n"}]}])
+    :ok = USBIP.share("usb:1-1.4", server: s.server)
+    :ok = USBIP.share("usb:1-1.5", server: s.server)
+    assert FakePodman.verbs(s.fake) == [@stop_argv, @run_argv, @inspect_argv, @run_argv]
   end
 
   test "a device already on usbip-host is refused", ctx do
@@ -123,30 +172,103 @@ defmodule Vagus.USBIPTest do
     :ok = USBIP.share("usb:1-1.5", server: s.server)
     bind_driver(ctx, "1-1.4", "usbip-host")
     bind_driver(ctx, "1-1.5", "usbip-host")
+    _ = writes()
 
     assert USBIP.unshare("usb:1-1.4", server: s.server) == :ok
-    assert read(ctx, "bus/usb/drivers/usbip-host/unbind") == "1-1.4"
-    assert read(ctx, "bus/usb/drivers/usbip-host/match_busid") == "del 1-1.4"
-    assert read(ctx, "bus/usb/drivers/usbip-host/rebind") == "1-1.4"
-    assert FakePodman.verbs(s.fake) == [@run_argv]
+
+    assert writes() == [
+             {"#{@drv}/usbip-host/unbind", "1-1.4"},
+             {"#{@drv}/usbip-host/match_busid", "del 1-1.4"},
+             {"#{@drv}/usbip-host/rebind", "1-1.4"}
+           ]
+
+    assert FakePodman.verbs(s.fake) == [@stop_argv, @run_argv, @inspect_argv]
 
     assert USBIP.unshare("1-1.5", server: s.server) == :ok
-    assert read(ctx, "bus/usb/drivers/usbip-host/rebind") == "1-1.5"
-    assert FakePodman.verbs(s.fake) == [@run_argv, @stop_argv]
+    assert {"#{@drv}/usbip-host/rebind", "1-1.5"} in writes()
+    assert FakePodman.verbs(s.fake) == [@stop_argv, @run_argv, @inspect_argv, @stop_argv]
     assert USBIP.shared(server: s.server) == []
 
     bind_driver(ctx, "1-1.4", "usb")
     assert USBIP.unshare("usb:1-1.4", server: s.server) == {:error, :not_shared}
   end
 
-  test "an unplugged device is forgotten and its match_busid entry dropped", ctx do
+  test "a failed del still rebinds, and its error is the result", ctx do
     s = start(ctx)
     :ok = USBIP.share("usb:1-1.4", server: s.server)
+    bind_driver(ctx, "1-1.4", "usbip-host")
+    match = sysfs(ctx, "bus/usb/drivers/usbip-host/match_busid")
+    File.rm!(match)
+    File.mkdir!(match)
+    _ = writes()
+
+    assert USBIP.unshare("usb:1-1.4", server: s.server) == {:error, {:sysfs, match, :enoent}}
+
+    assert writes() == [
+             {"#{@drv}/usbip-host/unbind", "1-1.4"},
+             {"#{@drv}/usbip-host/match_busid", "del 1-1.4"},
+             {"#{@drv}/usbip-host/rebind", "1-1.4"}
+           ]
+
+    assert USBIP.shared(server: s.server) == []
+  end
+
+  test "a failed rebind falls back to drivers_probe", ctx do
+    s = start(ctx)
+    :ok = USBIP.share("usb:1-1.4", server: s.server)
+    bind_driver(ctx, "1-1.4", "usbip-host")
+    rebind = sysfs(ctx, "bus/usb/drivers/usbip-host/rebind")
+    File.rm!(rebind)
+    _ = writes()
+
+    assert USBIP.unshare("usb:1-1.4", server: s.server) == {:error, {:sysfs, rebind, :enoent}}
+
+    assert writes() == [
+             {"#{@drv}/usbip-host/unbind", "1-1.4"},
+             {"#{@drv}/usbip-host/match_busid", "del 1-1.4"},
+             {"#{@drv}/usbip-host/rebind", "1-1.4"},
+             {"bus/usb/drivers_probe", "1-1.4"}
+           ]
+  end
+
+  test "an unplugged device is forgotten; one its port later captures is released", ctx do
+    s = start(ctx)
+    :ok = USBIP.share("usb:1-1.4", server: s.server)
+    _ = writes()
 
     send(s.pid, {:device, :removed, "usb:1-1.4"})
     assert USBIP.shared(server: s.server) == []
-    assert read(ctx, "bus/usb/drivers/usbip-host/match_busid") == "del 1-1.4"
-    assert FakePodman.verbs(s.fake) == [@run_argv, @stop_argv]
+    assert writes() == [{"#{@drv}/usbip-host/match_busid", "del 1-1.4"}]
+    assert FakePodman.verbs(s.fake) == [@stop_argv, @run_argv, @stop_argv]
+
+    captured(ctx, "1-1.4")
+    send(s.pid, {:device, :added, %{id: "usb:1-1.4"}})
+    assert USBIP.shared(server: s.server) == []
+
+    assert writes() == [
+             {"#{@drv}/usbip-host/unbind", "1-1.4"},
+             {"#{@drv}/usbip-host/match_busid", "del 1-1.4"},
+             {"#{@drv}/usbip-host/rebind", "1-1.4"}
+           ]
+
+    send(s.pid, {:device, :added, %{id: "usb:1-1.5"}})
+    assert USBIP.shared(server: s.server) == []
+    assert writes() == []
+  end
+
+  test "a resubscribe forgets shares whose device left meanwhile", ctx do
+    s = start(ctx)
+    assert_receive {:subscribed, _}, @receive_ms
+    :ok = USBIP.share("usb:1-1.4", server: s.server)
+    :ok = USBIP.share("usb:1-1.5", server: s.server)
+    File.rm_rf!(sysfs(ctx, "bus/usb/devices/1-1.4"))
+    _ = writes()
+
+    # What the Watcher's :DOWN arms; the monitor here is on the test process.
+    send(s.pid, :resubscribe)
+    assert_receive {:subscribed, _}, @receive_ms
+    assert Enum.map(USBIP.shared(server: s.server), & &1.busid) == ["1-1.5"]
+    assert writes() == [{"#{@drv}/usbip-host/match_busid", "del 1-1.4"}]
   end
 
   test "a failed bind rolls back match_busid, re-probes, and stops usbipd", ctx do
@@ -156,10 +278,16 @@ defmodule Vagus.USBIPTest do
     s = start(ctx)
 
     assert USBIP.share("usb:1-1.4", server: s.server) == {:error, {:sysfs, bind, :enoent}}
-    assert read(ctx, "bus/usb/drivers/usb/unbind") == "1-1.4"
-    assert read(ctx, "bus/usb/drivers/usbip-host/match_busid") == "del 1-1.4"
-    assert read(ctx, "bus/usb/drivers_probe") == "1-1.4"
-    assert FakePodman.verbs(s.fake) == [@run_argv, @stop_argv]
+
+    assert writes() == [
+             {"#{@drv}/usb/unbind", "1-1.4"},
+             {"#{@drv}/usbip-host/match_busid", "add 1-1.4"},
+             {"#{@drv}/usbip-host/bind", "1-1.4"},
+             {"#{@drv}/usbip-host/match_busid", "del 1-1.4"},
+             {"bus/usb/drivers_probe", "1-1.4"}
+           ]
+
+    assert FakePodman.verbs(s.fake) == [@stop_argv, @run_argv, @stop_argv]
     assert USBIP.shared(server: s.server) == []
   end
 
@@ -168,9 +296,12 @@ defmodule Vagus.USBIPTest do
     s = start(ctx)
 
     assert {:error, {:sysfs, _, :enoent}} = USBIP.share("usb:1-1.4", server: s.server)
-    assert read(ctx, "bus/usb/drivers/usb/unbind") == "1-1.4"
-    assert read(ctx, "bus/usb/drivers/usbip-host/bind") == ""
-    assert read(ctx, "bus/usb/drivers_probe") == "1-1.4"
+
+    assert writes() == [
+             {"#{@drv}/usb/unbind", "1-1.4"},
+             {"#{@drv}/usbip-host/match_busid", "add 1-1.4"},
+             {"bus/usb/drivers_probe", "1-1.4"}
+           ]
   end
 
   test "an unknown device touches nothing", ctx do
@@ -178,7 +309,8 @@ defmodule Vagus.USBIPTest do
     assert USBIP.share("usb:9-9", server: s.server) == {:error, :not_found}
     assert USBIP.share("nope", server: s.server) == {:error, :not_found}
     refute_received {:cmd, _, _}
-    assert FakePodman.verbs(s.fake) == []
+    assert FakePodman.verbs(s.fake) == [@stop_argv]
+    assert writes() == []
   end
 
   test "a busid that is not a port path is refused before any sysfs path is built", ctx do
@@ -186,11 +318,11 @@ defmodule Vagus.USBIPTest do
     assert USBIP.share("../../etc", server: s.server) == {:error, :invalid_busid}
     assert USBIP.share("usb:../1-1.4", server: s.server) == {:error, :invalid_busid}
     assert USBIP.unshare("../../etc", server: s.server) == {:error, :invalid_busid}
+    assert USBIP.share(:"1-1.4", server: s.server) == {:error, :invalid_busid}
+    assert USBIP.unshare(~c"1-1.4", server: s.server) == {:error, :invalid_busid}
     refute_received {:cmd, _, _}
-    assert FakePodman.verbs(s.fake) == []
-
-    for attr <- ["usb/unbind", "usbip-host/match_busid", "usbip-host/bind", "usbip-host/unbind"],
-        do: assert(read(ctx, "bus/usb/drivers/#{attr}") == "")
+    assert FakePodman.verbs(s.fake) == [@stop_argv]
+    assert writes() == []
   end
 
   test "a driver link that is not one plain segment is refused", ctx do
@@ -200,7 +332,7 @@ defmodule Vagus.USBIPTest do
     s = start(ctx)
 
     assert USBIP.share("usb:1-1.4", server: s.server) == {:error, :invalid_driver}
-    assert read(ctx, "bus/usb/drivers/usbip-host/match_busid") == ""
+    assert writes() == []
   end
 
   test "a failed modprobe or podman run leaves sysfs alone", ctx do
@@ -209,7 +341,7 @@ defmodule Vagus.USBIPTest do
     assert USBIP.share("usb:1-1.4", server: s.server) ==
              {:error, {:cmd, "modprobe", 1, "modprobe: FATAL: Module usbip-host not found"}}
 
-    assert FakePodman.verbs(s.fake) == []
+    assert FakePodman.verbs(s.fake) == [@stop_argv]
 
     stop_supervised!(USBIP)
     Process.unregister(:"watcher_#{s.server}")
@@ -218,18 +350,11 @@ defmodule Vagus.USBIPTest do
     assert USBIP.share("usb:1-1.4", server: s.server) ==
              {:error, {:podman, {125, "Error: no image"}}}
 
-    assert read(ctx, "bus/usb/drivers/usb/unbind") == ""
-    assert read(ctx, "bus/usb/drivers/usbip-host/match_busid") == ""
+    assert writes() == []
   end
 
   test "devices left on usbip-host by an earlier server are adopted", ctx do
-    bind_driver(ctx, "1-1.4", "usbip-host")
-
-    File.ln_s!(
-      sysfs(ctx, "bus/usb/devices/1-1.4"),
-      sysfs(ctx, "bus/usb/drivers/usbip-host/1-1.4")
-    )
-
+    captured(ctx, "1-1.4")
     s = start(ctx)
 
     assert USBIP.shared(server: s.server) == [
@@ -241,9 +366,19 @@ defmodule Vagus.USBIPTest do
     assert FakePodman.verbs(s.fake) == [@run_argv, @stop_argv]
   end
 
+  test "usbipd that failed to start at adoption is started by the next share", ctx do
+    captured(ctx, "1-1.4")
+    s = start(ctx, podman_rules: [{"run *", [{125, "Error: boom\n"}, {0, "cid\n"}]}])
+
+    assert Enum.map(USBIP.shared(server: s.server), & &1.busid) == ["1-1.4"]
+    assert USBIP.share("usb:1-1.5", server: s.server) == :ok
+    assert FakePodman.verbs(s.fake) == [@run_argv, @run_argv]
+  end
+
   test "disabled is :ignore, and a missing server answers rather than exits" do
     assert USBIP.start_link(enabled: false) == :ignore
-    assert USBIP.share("usb:1-1.4", server: :no_such_usbip) == {:error, :unavailable}
-    assert USBIP.shared(server: :no_such_usbip) == {:error, :unavailable}
+    assert USBIP.share("usb:1-1.4", server: :no_such_usbip) == {:error, :not_running}
+    assert USBIP.unshare("usb:1-1.4", server: :no_such_usbip) == {:error, :not_running}
+    assert USBIP.shared(server: :no_such_usbip) == {:error, :not_running}
   end
 end

@@ -15,12 +15,13 @@ defmodule Vagus.Network.LabTest do
     sysctl_root = dir <> "-sys"
     File.mkdir_p!(Path.join(sysctl_root, "net/ipv4/conf/hassio"))
 
-    nft = :atomics.new(1, [])
+    # Index 1: nft fails when set; 2: deconfigure fails when set.
+    fail = :atomics.new(2, [])
     test = self()
 
     cmd = fn _bin, ["-f", path] ->
       send(test, {:nft, File.read!(path)})
-      if :atomics.get(nft, 1) == 0, do: {"", 0}, else: {"boom", 1}
+      if :atomics.get(fail, 1) == 0, do: {"", 0}, else: {"boom", 1}
     end
 
     nat_opts = [
@@ -34,86 +35,148 @@ defmodule Vagus.Network.LabTest do
       lab_key: {__MODULE__, :lab, id}
     ]
 
+    state_key = {__MODULE__, :ifaces, id}
+
     on_exit(fn ->
       File.rm_rf(dir)
       File.rm_rf(sysctl_root)
       :persistent_term.erase(nat_opts[:loaded_key])
       :persistent_term.erase(nat_opts[:lab_key])
+      :persistent_term.erase(state_key)
     end)
 
-    %{nat_opts: nat_opts, nft: nft, name: :"lab_#{id}"}
+    %{nat_opts: nat_opts, fail: fail, name: :"lab_#{id}", state_key: state_key}
   end
 
   defp start(ctx, extra \\ []) do
     test = self()
+    fail = ctx.fail
 
     opts =
       [
+        enabled: true,
         name: ctx.name,
+        state_key: ctx.state_key,
         nat_opts: ctx.nat_opts,
         primary: fn -> "eth0" end,
+        configured: fn -> [] end,
+        addresses: fn _ -> [] end,
         configure: fn ifname, config ->
           send(test, {:configure, ifname, config})
           :ok
         end,
         deconfigure: fn ifname ->
           send(test, {:deconfigure, ifname})
-          :ok
+          if :atomics.get(fail, 2) == 0, do: :ok, else: {:error, :busy}
         end
       ]
       |> Keyword.merge(extra)
 
     start_supervised!({Lab, opts})
+    # The adopt continue runs before any call is served.
+    _ = Lab.status(server: ctx.name)
     [server: ctx.name]
   end
 
-  test "up configures a non-persisted static address and forwards out the primary", ctx do
+  defp receive_all(acc \\ []) do
+    receive do
+      msg -> receive_all([msg | acc])
+    after
+      0 -> Enum.reverse(acc)
+    end
+  end
+
+  test "up configures a non-persisted static address, then forwards out the primary", ctx do
     s = start(ctx)
     assert Lab.up("eth1", "10.42.0.1/24", s) == :ok
 
-    assert_received {:configure, "eth1",
-                     %{
-                       type: VintageNetEthernet,
-                       ipv4: %{method: :static, address: "10.42.0.1", prefix_length: 24}
-                     }}
+    assert [
+             {:configure, "eth1",
+              %{
+                type: VintageNetEthernet,
+                ipv4: %{method: :static, address: "10.42.0.1", prefix_length: 24}
+              }},
+             {:nft, text}
+           ] = receive_all()
 
-    assert_received {:nft, text}
     assert text =~ @accept
     assert text =~ @return
     assert text =~ @masquerade
     assert Lab.status(s) == [%{ifname: "eth1", cidr: "10.42.0.1/24", primary: "eth0"}]
 
+    assert :persistent_term.get(ctx.state_key) == %{
+             "eth1" => %{cidr: "10.42.0.1/24", primary: "eth0"}
+           }
+
     # A bridged start's load keeps the rules.
     :persistent_term.erase(ctx.nat_opts[:loaded_key])
     assert Nat.ensure_loaded(Keyword.delete(ctx.nat_opts, :lab)) == :ok
-    assert_received {:nft, again}
+    assert [{:nft, again}] = receive_all()
     assert again =~ @masquerade
   end
 
-  test "down removes the rules and the address", ctx do
+  test "down removes the rules, then the address", ctx do
     s = start(ctx)
     :ok = Lab.up("eth1", "10.42.0.1/24", s)
-    assert_received {:nft, _}
+    _ = receive_all()
 
     assert Lab.down("eth1", s) == :ok
-    assert_received {:nft, text}
+    assert [{:nft, text}, {:deconfigure, "eth1"}] = receive_all()
     refute text =~ "eth1"
     refute text =~ "postrouting"
-    assert_received {:deconfigure, "eth1"}
     assert Lab.status(s) == []
+    assert :persistent_term.get(ctx.state_key) == %{}
     assert Lab.down("eth1", s) == {:error, :not_up}
+  end
+
+  test "a failed deconfigure keeps the entry, and the next down retries both steps", ctx do
+    s = start(ctx)
+    :ok = Lab.up("eth1", "10.42.0.1/24", s)
+    _ = receive_all()
+    :atomics.put(ctx.fail, 2, 1)
+
+    assert Lab.down("eth1", s) == {:error, {:vintage_net, :busy}}
+    assert [{:nft, _}, {:deconfigure, "eth1"}] = receive_all()
+    assert [%{ifname: "eth1"}] = Lab.status(s)
+
+    :atomics.put(ctx.fail, 2, 0)
+    assert Lab.down("eth1", s) == :ok
+    assert [{:nft, text}, {:deconfigure, "eth1"}] = receive_all()
+    refute text =~ "eth1"
+    assert Lab.status(s) == []
+  end
+
+  test "a refused nft load on down keeps the entry and the address", ctx do
+    s = start(ctx)
+    :ok = Lab.up("eth1", "10.42.0.1/24", s)
+    _ = receive_all()
+    :atomics.put(ctx.fail, 1, 1)
+
+    capture_log(fn ->
+      assert {:error, {:nat, {["-f", _], "boom", 1}}} = Lab.down("eth1", s)
+    end)
+
+    # The refused load, then Nat's re-render of the old list; no deconfigure.
+    assert [{:nft, _}, {:nft, _}] = receive_all()
+    assert [%{ifname: "eth1"}] = Lab.status(s)
+    assert Nat.lab(lab_key: ctx.nat_opts[:lab_key]) == [{"eth1", "eth0"}]
+
+    :atomics.put(ctx.fail, 1, 0)
+    assert Lab.down("eth1", s) == :ok
   end
 
   test "protected and malformed names are refused before anything runs", ctx do
     s = start(ctx)
 
-    for name <- ["eth0", "wlan0", "lo", "hassio", "hassio0"] do
+    for name <- ["eth0", "wlan0", "lo", "usb0", "hassio", "hassio-anchor"] do
       assert Lab.up(name, "10.42.0.1/24", s) == {:error, :protected}
     end
 
-    assert Lab.up(~s(eth1" accept), "10.42.0.1/24", s) == {:error, :invalid_ifname}
-    refute_received {:configure, _, _}
-    refute_received {:nft, _}
+    for name <- [~s(eth1" accept), "..", ".", "a234567890123456", :eth1] do
+      assert Lab.up(name, "10.42.0.1/24", s) == {:error, :invalid_ifname}
+    end
+
+    assert receive_all() == []
   end
 
   test "malformed cidrs are refused", ctx do
@@ -123,47 +186,118 @@ defmodule Vagus.Network.LabTest do
       assert Lab.up("eth1", cidr, s) == {:error, :invalid_cidr}
     end
 
-    refute_received {:configure, _, _}
+    assert receive_all() == []
   end
 
   test "the primary interface itself is refused", ctx do
     s = start(ctx, primary: fn -> "eth1" end)
     assert Lab.up("eth1", "10.42.0.1/24", s) == {:error, :primary}
-    refute_received {:configure, _, _}
+    assert receive_all() == []
+  end
+
+  test "without the nat module up refuses rather than forward nothing", ctx do
+    s = start(ctx, nat_opts: Keyword.put(ctx.nat_opts, :enabled, false))
+    assert Lab.up("eth1", "10.42.0.1/24", s) == {:error, :nat_disabled}
+    assert receive_all() == []
+  end
+
+  test "an interface VintageNet already configures is refused", ctx do
+    s = start(ctx, configured: fn -> ["usb1", "eth1"] end)
+    assert Lab.up("eth1", "10.42.0.1/24", s) == {:error, :configured}
+    assert receive_all() == []
+  end
+
+  test "a cidr overlapping the hassio bridge or the primary's subnet is refused", ctx do
+    addresses = fn
+      "eth0" ->
+        [
+          %{family: :inet6, address: {65_152, 0, 0, 0, 0, 0, 0, 1}, prefix_length: 64},
+          %{
+            family: :inet,
+            address: {192, 168, 2, 10},
+            netmask: {255, 255, 255, 0},
+            prefix_length: 24
+          },
+          %{family: :inet, address: {10, 9, 0, 1}, netmask: {255, 255, 0, 0}}
+        ]
+    end
+
+    s = start(ctx, addresses: addresses)
+
+    for cidr <- [
+          "172.30.33.1/24",
+          "172.30.32.1/30",
+          "172.16.0.1/12",
+          "192.168.2.200/28",
+          "10.9.200.1/24",
+          "10.0.0.1/8"
+        ] do
+      assert Lab.up("eth1", cidr, s) == {:error, :overlap}, cidr
+    end
+
+    assert receive_all() == []
+    assert Lab.up("eth1", "172.30.34.1/24", s) == :ok
   end
 
   test "a refused nft load rolls the address back", ctx do
     s = start(ctx)
-    :atomics.put(ctx.nft, 1, 1)
+    :atomics.put(ctx.fail, 1, 1)
 
     capture_log(fn ->
       assert {:error, {:nat, {["-f", _], "boom", 1}}} = Lab.up("eth1", "10.42.0.1/24", s)
     end)
 
-    assert_received {:deconfigure, "eth1"}
+    assert [{:configure, "eth1", _}, {:nft, new}, {:nft, old}, {:deconfigure, "eth1"}] =
+             receive_all()
+
+    assert new =~ @masquerade
+    refute old =~ "eth1"
     assert Lab.status(s) == []
     assert Nat.lab(lab_key: ctx.nat_opts[:lab_key]) == []
+    assert :persistent_term.get(ctx.state_key, :unset) == :unset
   end
 
   test "a VintageNet refusal never touches nft", ctx do
     s = start(ctx, configure: fn _, _ -> {:error, :bad} end)
     assert Lab.up("eth1", "10.42.0.1/24", s) == {:error, {:vintage_net, :bad}}
-    refute_received {:nft, _}
+    assert receive_all() == []
   end
 
-  test "init clears a lab list left by a previous instance", ctx do
+  test "init adopts a previous instance's interfaces and renders their rules", ctx do
+    :persistent_term.put(ctx.state_key, %{"eth1" => %{cidr: "10.42.0.1/24", primary: "eth0"}})
+    s = start(ctx)
+
+    assert Lab.status(s) == [%{ifname: "eth1", cidr: "10.42.0.1/24", primary: "eth0"}]
+    assert [{:nft, text}] = receive_all()
+    assert text =~ @masquerade
+    assert Nat.lab(lab_key: ctx.nat_opts[:lab_key]) == [{"eth1", "eth0"}]
+    assert Lab.up("eth1", "10.42.0.1/24", s) == :ok
+  end
+
+  test "init drops rules no adopted interface accounts for", ctx do
     :persistent_term.put(ctx.nat_opts[:lab_key], [{"eth1", "eth0"}])
     s = start(ctx)
 
     assert Lab.status(s) == []
-    assert_received {:nft, text}
+    assert [{:nft, text}] = receive_all()
     refute text =~ "eth1"
     assert Nat.lab(lab_key: ctx.nat_opts[:lab_key]) == []
   end
 
-  test "init with no stored list runs nothing", ctx do
+  test "init with nothing stored runs nothing", ctx do
     s = start(ctx)
     assert Lab.status(s) == []
-    refute_received {:nft, _}
+    assert receive_all() == []
+  end
+
+  test "calls with no server return an error instead of exiting" do
+    s = [server: :"lab_absent_#{System.unique_integer([:positive])}"]
+    assert Lab.up("eth1", "10.42.0.1/24", s) == {:error, :not_running}
+    assert Lab.down("eth1", s) == {:error, :not_running}
+    assert Lab.status(s) == {:error, :not_running}
+  end
+
+  test "start_link is :ignore unless enabled" do
+    assert Lab.start_link(enabled: false) == :ignore
   end
 end
