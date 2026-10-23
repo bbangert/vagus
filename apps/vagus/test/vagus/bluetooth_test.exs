@@ -35,7 +35,7 @@ defmodule Vagus.BluetoothTest.Harness do
 
   def fake_os_pid(id), do: 1_000_000 + :erlang.phash2(id, 1_000_000)
 
-  def stack_name(name), do: Module.concat(name, Vagus.Bluetooth.Stack)
+  def stack_name(name), do: Module.concat(name, "Stack")
 
   def start_tree(ctx, ids \\ all_ids()) do
     name = Module.concat([ctx.module, "Sup#{System.unique_integer([:positive])}"])
@@ -170,11 +170,16 @@ defmodule Vagus.BluetoothTest do
       assert log =~ "/nonexistent/dbus-daemon"
     end
 
+    test "the production name registers the stack where the Reaper looks" do
+      assert Vagus.Bluetooth.stack_name(Vagus.Bluetooth) == Vagus.Bluetooth.Stack
+    end
+
     test "nests the stack as the single child", ctx do
       name = start_tree(ctx)
 
       assert [{Vagus.Bluetooth.Stack, stack, :supervisor, _}] = Supervisor.which_children(name)
       assert stack == Process.whereis(stack_name(name))
+      assert stack == Process.whereis(Module.concat(name, "Stack"))
 
       assert stack |> Supervisor.which_children() |> Enum.map(&elem(&1, 0)) ==
                Enum.reverse(all_ids())

@@ -141,7 +141,7 @@ defmodule Vagus.Improv.Reaper do
   # another pass. Public with the supervisor injectable purely so the
   # happy/idempotent paths are unit-testable against a toy supervisor.
   @spec reap(Supervisor.supervisor(), non_neg_integer()) :: :ok
-  def reap(supervisor \\ Vagus.Bluetooth.Stack, attempts_left \\ 1) do
+  def reap(supervisor \\ Vagus.Bluetooth.stack_name(Vagus.Bluetooth), attempts_left \\ 1) do
     with :ok <- Supervisor.terminate_child(supervisor, Improv.Supervisor),
          :ok <- Supervisor.delete_child(supervisor, Improv.Supervisor) do
       :ok

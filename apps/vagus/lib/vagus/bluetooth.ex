@@ -85,9 +85,14 @@ defmodule Vagus.Bluetooth do
     end
   end
 
+  # A string segment: aliasing `Stack` here would nest the full module name
+  # under `name` and no longer match the Reaper's default target.
+  @spec stack_name(module()) :: module()
+  def stack_name(name), do: Module.concat(name, "Stack")
+
   @impl Supervisor
   def init(opts) do
-    stack_name = Module.concat(Keyword.get(opts, :name, __MODULE__), Stack)
+    stack_name = stack_name(Keyword.get(opts, :name, __MODULE__))
 
     # The crash-loop budget is the Stack's own (10 in 60 s). Zero here keeps
     # escalation as it was before the split: a Stack that gives up takes
