@@ -17,6 +17,7 @@ defmodule Vagus.USBIPTest do
     "root",
     "--entrypoint",
     "usbipd",
+    "--pull=never",
     "img:test"
   ]
   @stop_argv ["stop", "-t", "5", "--ignore", "vagus-usbipd"]
@@ -104,6 +105,15 @@ defmodule Vagus.USBIPTest do
       end,
       watcher: :"watcher_#{name}",
       trace: test,
+      image_present?: fn _image, _ms -> true end,
+      pull: fn image, _ms ->
+        send(test, {:pull, image})
+        :ok
+      end,
+      with_permit: fn wait_ms, fun ->
+        send(test, {:permit, wait_ms})
+        fun.()
+      end,
       # The grace timer fires only when a test delivers it.
       send_after: fn pid, msg, ms ->
         send(test, {:send_after, pid, msg, ms})
@@ -494,6 +504,58 @@ defmodule Vagus.USBIPTest do
     assert writes() == []
     assert FakePodman.verbs(s.fake) == [@stop_argv, @run_argv, @stop_argv]
     assert USBIP.shared(server: s.server) == []
+  end
+
+  test "a different device on an attached share's port is released, not lent", ctx do
+    s = start(ctx)
+    :ok = USBIP.share("usb:1-1.4", server: s.server)
+    # Unplugged before the Watcher announced it: no :removed ever came.
+    swap(ctx, "1-1.4", "ttyUSB4")
+    _ = writes()
+
+    send(s.pid, {:device, :added, %{id: "usb:1-1.4"}})
+    assert USBIP.shared(server: s.server) == []
+    assert writes() == @released
+  end
+
+  test "a missing image is pulled through the engine, then run under a permit", ctx do
+    s = start(ctx, image_present?: fn "img:test", _ms -> false end)
+    assert USBIP.share("usb:1-1.4", server: s.server) == :ok
+    {:messages, msgs} = Process.info(self(), :messages)
+    # Both come from the server, so their order is the order it ran them.
+    assert [{:pull, "img:test"}, {:permit, _}] =
+             Enum.filter(msgs, &match?({tag, _} when tag in [:pull, :permit], &1))
+
+    assert FakePodman.verbs(s.fake) == [@stop_argv, @run_argv]
+  end
+
+  test "a present image is not pulled", ctx do
+    s = start(ctx)
+    assert USBIP.share("usb:1-1.4", server: s.server) == :ok
+    refute_received {:pull, _}
+    assert_received {:permit, _}
+  end
+
+  test "a failed pull runs nothing and touches no sysfs", ctx do
+    s =
+      start(ctx,
+        image_present?: fn _image, _ms -> false end,
+        pull: fn _image, _ms -> {:error, {:pull_failed, "denied"}} end
+      )
+
+    assert USBIP.share("usb:1-1.4", server: s.server) ==
+             {:error, {:pull, {:pull_failed, "denied"}}}
+
+    refute_received {:permit, _}
+    assert FakePodman.verbs(s.fake) == [@stop_argv]
+    assert writes() == []
+  end
+
+  test "a refused permit fails the share before any sysfs write", ctx do
+    s = start(ctx, with_permit: fn _wait, _fun -> {:error, :shutting_down} end)
+    assert USBIP.share("usb:1-1.4", server: s.server) == {:error, {:podman, :shutting_down}}
+    assert FakePodman.verbs(s.fake) == [@stop_argv]
+    assert writes() == []
   end
 
   test "a failed bind rolls back match_busid, re-probes, and stops usbipd", ctx do

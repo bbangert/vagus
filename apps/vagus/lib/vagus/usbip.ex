@@ -25,6 +25,7 @@ defmodule Vagus.USBIP do
   require Logger
 
   alias Vagus.{Devices, Resubscribe}
+  alias Vagus.Runtime.{Engine, Host}
   alias Vagus.Runtime.Podman.Cmd, as: PodmanCmd
 
   @container "vagus-usbipd"
@@ -34,17 +35,21 @@ defmodule Vagus.USBIP do
   @driver "usbip-host"
   @cmd_timeout_ms 10_000
   @inspect_timeout_ms 10_000
-  # The first `run` may pull the image.
-  @run_timeout_ms 120_000
+  # Covers the engine's wait for the single pull permit as well as the pull.
+  @pull_timeout_ms 120_000
+  @permit_wait_ms 30_000
+  @run_timeout_ms 30_000
   @stop_timeout_ms 30_000
   # Binding can make a device re-enumerate (the onboard AIC8800 does; DFU and
   # some JTAG adapters reset on bind), so it detaches and comes back on the
   # same busid about a second later. A real unplug never returns this fast.
   @reattach_ms 5_000
   # The longest call is a share that finds usbipd dead and then fails its
-  # bind: modprobe, the liveness inspect, `podman run`, then the stop.
-  @call_timeout_ms @cmd_timeout_ms + @inspect_timeout_ms + @run_timeout_ms +
-                     @stop_timeout_ms + 3 * PodmanCmd.kill_budget_ms() + 5_000
+  # bind: modprobe, the liveness inspect, the image check and pull, the
+  # permit wait and `podman run`, then the stop.
+  @call_timeout_ms @cmd_timeout_ms + 2 * @inspect_timeout_ms + @pull_timeout_ms +
+                     @permit_wait_ms + @run_timeout_ms + @stop_timeout_ms +
+                     4 * PodmanCmd.kill_budget_ms() + 5_000
 
   @type share :: %{
           id: String.t(),
@@ -66,6 +71,7 @@ defmodule Vagus.USBIP do
           | :invalid_driver
           | {:sysfs, String.t(), File.posix()}
           | {:podman, term()}
+          | {:pull, term()}
           | {:cmd, String.t(), non_neg_integer(), String.t()}
 
   @spec start_link(keyword()) :: GenServer.on_start() | :ignore
@@ -120,6 +126,10 @@ defmodule Vagus.USBIP do
           Application.get_env(:vagus, __MODULE__, [])[:image] || @default_image
         end),
       watcher: Keyword.get(opts, :watcher, Devices.Watcher),
+      image_present?:
+        Keyword.get(opts, :image_present?, &Engine.image_present?(&1, timeout_ms: &2)),
+      pull: Keyword.get(opts, :pull, &Engine.pull(&1, timeout_ms: &2)),
+      with_permit: Keyword.get(opts, :with_permit, &Host.with_permit(nil, :ops, &1, &2)),
       # The Watcher is :ignore exactly when NervesUEvent is absent; otherwise a
       # missing one is mid-restart and must be retried, or no event is heard.
       watcher_expected?:
@@ -177,8 +187,17 @@ defmodule Vagus.USBIP do
     {:noreply, detach(busid, state)}
   end
 
+  # An attached share is checked too: a device unplugged before the Watcher
+  # announced it never gets a :removed, so its replacement arrives as a bare
+  # :added on a still-armed port.
   def handle_info({:device, :added, %{id: "usb:" <> busid}}, state) do
-    state = if detached?(busid, state), do: reattach(busid, state), else: state
+    state =
+      cond do
+        detached?(busid, state) -> reattach(busid, state)
+        not Map.has_key?(state.shares, busid) -> state
+        same_device?(state.shares[busid], state) -> state
+        true -> replaced(busid, state)
+      end
 
     if busid?(busid) and not Map.has_key?(state.shares, busid) and
          driver(busid, state) == @driver,
@@ -624,13 +643,34 @@ defmodule Vagus.USBIP do
       "root",
       "--entrypoint",
       "usbipd",
+      "--pull=never",
       state.image
     ]
 
-    case PodmanCmd.run(args, podman_opts(@run_timeout_ms, state)) do
-      {:ok, _} -> {:ok, %{state | daemon: :up}}
-      {:exit, status, out} -> {:error, {:podman, {status, String.trim(out)}}, state}
-      {:error, reason} -> {:error, {:podman, reason}, state}
+    run = fn -> PodmanCmd.run(args, podman_opts(@run_timeout_ms, state)) end
+
+    with :ok <- ensure_image(state) do
+      case state.with_permit.(@permit_wait_ms, run) do
+        {:ok, _} -> {:ok, %{state | daemon: :up}}
+        {:exit, status, out} -> {:error, {:podman, {status, String.trim(out)}}, state}
+        {:error, reason} -> {:error, {:podman, reason}, state}
+      end
+    end
+  end
+
+  # A pull goes through the engine so it takes the single pull permit, the
+  # migration space check and the shutdown refusal every other pull does;
+  # `--pull=never` keeps `run` from pulling around them.
+  defp ensure_image(state) do
+    case state.image_present?.(state.image, @inspect_timeout_ms) do
+      true ->
+        :ok
+
+      _absent_or_unknown ->
+        case state.pull.(state.image, @pull_timeout_ms) do
+          :ok -> :ok
+          {:error, reason} -> {:error, {:pull, reason}, state}
+        end
     end
   end
 

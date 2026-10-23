@@ -18,7 +18,8 @@ defmodule Vagus.NFSTest do
     %{base: base, root: root, target: target, state_dir: Path.join(base, "state")}
   end
 
-  # `fail` maps {bin, args} to a canned result; `block` names a bin whose
+  # `fail` maps {bin, args} to a canned result (or is an Agent holding that
+  # map, so a test can change it); `block` names a bin whose
   # call waits for :release. The fake mountd is a real process spawned (and
   # so linked) inside the server, so killing it reaches the EXIT path.
   defp start_nfs(ctx, extra \\ []) do
@@ -29,7 +30,8 @@ defmodule Vagus.NFSTest do
     cmd = fn bin, args ->
       send(test, {:cmd, bin, args})
       if bin == block, do: receive(do: (:release -> :ok))
-      Map.get(fail, {bin, args}, {"", 0})
+      failures = if is_pid(fail), do: Agent.get(fail, & &1), else: fail
+      Map.get(failures, {bin, args}, {"", 0})
     end
 
     daemon = fn
@@ -525,6 +527,69 @@ defmodule Vagus.NFSTest do
     assert {:error, {"exportfs", _, "", 124}} = NFS.unexport(ctx.target, s)
     assert NFS.status(s) == %{running: false, exports: []}
     assert events() == [{"exportfs", ["-u", spec]}, {"rpc.nfsd", ["0"]}, :mountd_stop]
+  end
+
+  test "a failed cleanup keeps the exports and blocks every start until a retry succeeds",
+       ctx do
+    ua = {"exportfs", ["-ua"]}
+    {:ok, fail} = Agent.start_link(fn -> %{ua => {"busy", 1}} end)
+    s = start_nfs(ctx, fail: fail)
+    other = Path.join(ctx.root, "t2")
+    File.mkdir_p!(other)
+    :ok = NFS.export(ctx.target, "10.0.0.1", s)
+
+    for _ <- 1..3, do: kill_mountd(s)
+    unclean = {"exportfs", ["-ua"], "busy", 1}
+
+    assert kill_mountd(s) == %{
+             running: false,
+             exports: [
+               %{path: ctx.target, export_path: ctx.target, client: "10.0.0.1", options: @rw}
+             ],
+             cleanup_failed: unclean
+           }
+
+    flush()
+    assert NFS.export(other, "10.0.0.2", s) == {:error, {:unclean, unclean}}
+    assert NFS.unexport(ctx.target, s) == {:error, {:unclean, unclean}}
+    assert events() == [ua, {"rpc.nfsd", ["0"]}, ua, {"rpc.nfsd", ["0"]}]
+
+    Agent.update(fail, fn _ -> %{} end)
+    assert NFS.export(other, "10.0.0.2", s) == :ok
+    assert [^ua, {"rpc.nfsd", ["0"]}, {"modprobe", ["nfsd"]} | _] = events()
+
+    assert NFS.status(s) == %{
+             running: true,
+             exports: [%{path: other, export_path: other, client: "10.0.0.2", options: @rw}]
+           }
+  end
+
+  test "a rejected etab entry that stays exported stops adoption", ctx do
+    gone = Path.join(ctx.root, "gone")
+    write_etab(ctx, [{ctx.target, "10.0.0.1"}, {gone, "10.0.0.9"}])
+    s = start_nfs(ctx, fail: %{{"exportfs", ["-u", "10.0.0.9:" <> gone]} => {"busy", 1}})
+
+    assert %{running: false, exports: [%{export_path: path}], cleanup_failed: _} = NFS.status(s)
+    assert path == ctx.target
+    assert events() == [{"exportfs", ["-u", "10.0.0.9:" <> gone]}, {"rpc.nfsd", ["0"]}]
+
+    # The retry's `-ua` removes the rejected entry too, so the export proceeds.
+    assert NFS.export(ctx.target, "10.0.0.1", s) == :ok
+    assert [{"exportfs", ["-ua"]}, {"rpc.nfsd", ["0"]}, {"modprobe", ["nfsd"]} | _] = events()
+    refute Map.has_key?(NFS.status(s), :cleanup_failed)
+  end
+
+  test "adoption that fails before mountd starts drops the exports", ctx do
+    write_etab(ctx, [{ctx.target, "10.0.0.1"}])
+    s = start_nfs(ctx, fail: %{{"modprobe", ["nfsd"]} => {"no module", 1}})
+
+    assert NFS.status(s) == %{running: false, exports: []}
+
+    assert events() == [
+             {"modprobe", ["nfsd"]},
+             {"exportfs", ["-ua"]},
+             {"rpc.nfsd", ["0"]}
+           ]
   end
 
   test "an empty etab starts nothing", ctx do

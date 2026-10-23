@@ -129,6 +129,30 @@ defmodule Vagus.Network.LabTest do
     assert Lab.down("eth1", s) == {:error, :not_up}
   end
 
+  test "down checkpoints the entry as broken while VintageNet removes the address", ctx do
+    test = self()
+
+    s =
+      start(ctx,
+        deconfigure: fn ifname ->
+          send(test, {:deconfiguring, self()})
+          receive do: (:go -> send(test, {:deconfigure, ifname}))
+          :ok
+        end
+      )
+
+    :ok = Lab.up("eth1", "10.42.0.1/24", s)
+    _ = receive_all()
+
+    task = Task.async(fn -> Lab.down("eth1", s) end)
+    assert_receive {:deconfiguring, pid}
+    assert %{"eth1" => %{state: :broken}} = :persistent_term.get(ctx.state_key)
+
+    send(pid, :go)
+    assert Task.await(task) == :ok
+    assert :persistent_term.get(ctx.state_key) == %{}
+  end
+
   test "a failed deconfigure after the rules are gone marks the entry broken", ctx do
     s = start(ctx)
     :ok = Lab.up("eth1", "10.42.0.1/24", s)

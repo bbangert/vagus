@@ -123,7 +123,8 @@ defmodule Vagus.NFS do
       nfsd_mounted?: Keyword.get(opts, :nfsd_mounted?, &nfsd_mounted?/0),
       mountd: nil,
       restarts: [],
-      exports: %{}
+      exports: %{},
+      unclean: nil
     }
 
     {:ok, state, {:continue, :adopt}}
@@ -142,6 +143,24 @@ defmodule Vagus.NFS do
   def handle_info(msg, state) do
     {:noreply, state} = info(msg, settle(state))
     {:noreply, settle(state)}
+  end
+
+  defp command({:export, _path, _client, _options} = msg, %{unclean: reason} = state)
+       when reason != nil do
+    case retry_cleanup(state) do
+      {:ok, state} -> command(msg, state)
+      error -> error
+    end
+  end
+
+  defp command({:unexport, path}, %{unclean: reason} = state) when reason != nil do
+    tracked? = find_export(path, state) != nil
+
+    case retry_cleanup(state) do
+      {:ok, state} when tracked? -> {:reply, :ok, state}
+      {:ok, state} -> {:reply, {:error, :not_exported}, state}
+      error -> error
+    end
   end
 
   defp command({:export, path, client, options}, state) do
@@ -174,7 +193,9 @@ defmodule Vagus.NFS do
 
   defp command(:status, state) do
     exports = state.exports |> Map.values() |> Enum.sort_by(& &1.export_path)
-    {:reply, %{running: state.mountd != nil, exports: exports}, state}
+    status = %{running: state.mountd != nil, exports: exports}
+    status = if state.unclean, do: Map.put(status, :cleanup_failed, state.unclean), else: status
+    {:reply, status, state}
   end
 
   defp info({:EXIT, pid, reason}, %{mountd: pid} = state) do
@@ -196,7 +217,9 @@ defmodule Vagus.NFS do
   # run/3 flags the timeout here because it is called deep in paths that do
   # not thread state back.
   defp settle(state) do
-    if Process.delete(@stale_key), do: reconcile(state), else: state
+    if Process.delete(@stale_key) == true and state.unclean == nil,
+      do: reconcile(state),
+      else: state
   end
 
   # The kernel export table survives mountd; only its upcalls fail until a
@@ -216,16 +239,36 @@ defmodule Vagus.NFS do
     end
   end
 
+  # An export left in etab would be served again by the next mountd, so a
+  # failed cleanup keeps the exports tracked and `unclean` blocks every start
+  # until a retry succeeds.
   defp give_up(state) do
-    run(state, "exportfs", ["-ua"])
-    {_result, state} = stop_server(state)
-    %{state | exports: %{}, restarts: []}
+    unexported = run(state, "exportfs", ["-ua"])
+    {stopped, state} = stop_server(state)
+    state = %{state | restarts: []}
+
+    case {unexported, stopped} do
+      {:ok, :ok} -> %{state | exports: %{}, unclean: nil}
+      {{:error, reason}, _} -> %{state | unclean: reason}
+      {:ok, {:error, reason}} -> %{state | unclean: reason}
+    end
+  end
+
+  defp retry_cleanup(state) do
+    case give_up(state) do
+      %{unclean: nil} = state -> {:ok, state}
+      state -> {:reply, {:error, {:unclean, state.unclean}}, state}
+    end
   end
 
   defp reconcile(state) do
     entries = state.state_dir |> read_etab() |> parse_etab()
     {keep, drop} = Enum.split_with(entries, &adoptable?(&1, state.root))
-    Enum.each(drop, &run(state, "exportfs", ["-u", spec(&1)]))
+
+    rejected =
+      drop
+      |> Enum.map(&run(state, "exportfs", ["-u", spec(&1)]))
+      |> Enum.find(:ok, &match?({:error, _}, &1))
 
     exports =
       Map.new(keep, fn entry ->
@@ -235,9 +278,18 @@ defmodule Vagus.NFS do
         end
       end)
 
-    case keep do
-      [] -> stop_if_idle(%{state | exports: %{}})
-      keep -> start_adopted(keep, exports, state)
+    case {rejected, keep} do
+      # nfsd may have outlived the previous incarnation, still serving it.
+      {{:error, reason}, _} ->
+        Logger.error("Vagus.NFS: a rejected etab entry stayed exported: #{inspect(reason)}")
+        {_result, state} = stop_server(state)
+        %{state | exports: exports, unclean: reason}
+
+      {:ok, []} ->
+        stop_if_idle(%{state | exports: %{}})
+
+      {:ok, keep} ->
+        start_adopted(keep, exports, state)
     end
   end
 
@@ -249,8 +301,14 @@ defmodule Vagus.NFS do
 
       error ->
         Logger.error("Vagus.NFS: adopting etab failed (#{inspect(error)}); dropping exports")
-        state = with {:error, _reason, state} <- error, do: state
-        give_up(state)
+
+        state =
+          case error do
+            {:error, _reason, state} -> state
+            {:error, _reason} -> state
+          end
+
+        give_up(%{state | exports: exports})
     end
   end
 
