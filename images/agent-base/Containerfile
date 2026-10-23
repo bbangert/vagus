@@ -38,7 +38,7 @@ RUN apt-get update \
       libtinfo6 libstdc++6 libssl3 zlib1g libsctp1 \
       ca-certificates curl bash tmux git jq ripgrep procps tini util-linux less nano \
       file xz-utils unzip socat iproute2 iputils-ping \
-      bluez picocom usbutils dnsmasq-base openocd adb fastboot openssh-server \
+      bluez picocom usbutils usbip dnsmasq-base openocd adb fastboot openssh-server \
       python3 python3-venv libusb-1.0-0 \
  && rm -f /etc/ssh/ssh_host_* \
  && apt-get clean \

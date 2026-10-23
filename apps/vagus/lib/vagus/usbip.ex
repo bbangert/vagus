@@ -1,0 +1,385 @@
+defmodule Vagus.USBIP do
+  @moduledoc """
+  Lends a USB device plugged into the board to another machine over USB/IP,
+  for the agent-dev-board flavor: an agent calls
+  `:erpc.call(board, Vagus.USBIP, :share, ["usb:1-1.4"])`, then the laptop
+  runs `usbip attach -r <board> -b 1-1.4`.
+
+  The host half is the sysfs sequence `usbip bind`/`usbip unbind` perform
+  (Linux `tools/usb/usbip/src/usbip_bind.c`, `usbip_unbind.c`, `utils.c`),
+  done here because the userland is not in the firmware: Buildroot's package
+  needs udev. `usbipd`, the TCP server on port 3240, runs in a privileged
+  host-network container (`vagus-usbipd`) from the first share to the last.
+  Its name has no `addon_` prefix, so nothing treats it as an app.
+
+  A device that is unplugged is forgotten; its port's `match_busid` entry is
+  dropped too, or usbip-host would claim whatever is plugged in there next.
+  Devices already bound to usbip-host when this server starts (it crashed)
+  are adopted, so they can still be unshared.
+  """
+
+  use GenServer
+  require Logger
+
+  alias Vagus.{Devices, Resubscribe}
+  alias Vagus.Runtime.Podman.Cmd, as: PodmanCmd
+
+  @container "vagus-usbipd"
+  @default_image "ghcr.io/bbangert/vagus-agent-base:0.2.0"
+  @driver "usbip-host"
+  # The first `run` may pull the image.
+  @run_timeout_ms 120_000
+  @stop_timeout_ms 30_000
+  @call_timeout_ms @run_timeout_ms + PodmanCmd.kill_budget_ms() + 10_000
+  @cmd_timeout_ms 10_000
+
+  @type share :: %{id: String.t(), busid: String.t(), vid_pid: String.t() | nil}
+  @type error ::
+          :not_found
+          | {:ambiguous, [String.t()]}
+          | :already_shared
+          | :not_shared
+          | :bind_loop
+          | :invalid_busid
+          | :invalid_driver
+          | :unavailable
+          | {:sysfs, String.t(), File.posix()}
+          | {:podman, term()}
+          | {:cmd, String.t(), non_neg_integer(), String.t()}
+
+  @spec start_link(keyword()) :: GenServer.on_start() | :ignore
+  def start_link(opts \\ []) do
+    if Keyword.get_lazy(opts, :enabled, &Vagus.Flavor.agent?/0) do
+      GenServer.start_link(__MODULE__, opts, name: Keyword.get(opts, :name, __MODULE__))
+    else
+      :ignore
+    end
+  end
+
+  @doc """
+  Shares a device: its `id` (`"usb:1-1.4"`), its bare busid (`"1-1.4"`),
+  or any key `Vagus.Devices.find/2` resolves. A failure leaves sysfs as it
+  found it.
+  """
+  @spec share(String.t(), keyword()) :: :ok | {:error, error()}
+  def share(key, opts \\ []) when is_binary(key), do: call(opts, {:share, key})
+
+  @spec unshare(String.t(), keyword()) :: :ok | {:error, error()}
+  def unshare(key, opts \\ []) when is_binary(key), do: call(opts, {:unshare, key})
+
+  @spec shared(keyword()) :: [share()] | {:error, :unavailable}
+  def shared(opts \\ []), do: call(opts, :shared)
+
+  # A caller over dist gets a value, never an exit.
+  defp call(opts, msg) do
+    GenServer.call(Keyword.get(opts, :server, __MODULE__), msg, @call_timeout_ms)
+  catch
+    :exit, _reason -> {:error, :unavailable}
+  end
+
+  @impl GenServer
+  def init(opts) do
+    state = %{
+      sysfs: Keyword.get(opts, :sysfs_root, "/sys"),
+      cmd: Keyword.get(opts, :cmd, &default_cmd/2),
+      podman: Keyword.get(opts, :podman, []),
+      image:
+        Keyword.get_lazy(opts, :image, fn ->
+          Application.get_env(:vagus, __MODULE__, [])[:image] || @default_image
+        end),
+      watcher: Keyword.get(opts, :watcher, Devices.Watcher),
+      subscribe: Keyword.get(opts, :subscribe, &Devices.Watcher.subscribe/1),
+      devices_opts:
+        Keyword.get_lazy(opts, :devices_opts, fn -> Keyword.take(opts, [:sysfs_root]) end),
+      watcher_ref: nil,
+      shares: %{}
+    }
+
+    {:ok, state, {:continue, :start}}
+  end
+
+  @impl GenServer
+  def handle_continue(:start, state) do
+    state = adopt(state)
+    {:noreply, subscribe(state, &Resubscribe.start(&1, &2, :resubscribe, false))}
+  end
+
+  @impl GenServer
+  def handle_call(:shared, _from, state) do
+    {:reply, state.shares |> Map.values() |> Enum.sort_by(& &1.busid), state}
+  end
+
+  def handle_call({:share, key}, _from, state) do
+    with :ok <- check_key(key),
+         {:ok, device} <- resolve(key, state),
+         busid = busid(device.id),
+         :ok <- not_shared(busid, state),
+         :ok <-
+           if(String.contains?(device.sysfs, "vhci_hcd"), do: {:error, :bind_loop}, else: :ok),
+         :ok <- modprobe(state),
+         :ok <- daemon_up(state),
+         :ok <- stop_if_idle(bind(busid, state), state) do
+      share = %{id: device.id, busid: busid, vid_pid: device.vid_pid}
+      {:reply, :ok, put_in(state.shares[busid], share)}
+    else
+      {:error, _} = error -> {:reply, error, state}
+    end
+  end
+
+  def handle_call({:unshare, key}, _from, state) do
+    busid = busid(key)
+
+    cond do
+      not busid?(busid) -> {:reply, {:error, :invalid_busid}, state}
+      Map.has_key?(state.shares, busid) -> unshare_busid(busid, state)
+      driver(busid, state) == @driver -> unshare_busid(busid, state)
+      true -> {:reply, {:error, :not_shared}, state}
+    end
+  end
+
+  @impl GenServer
+  def handle_info({:device, :removed, "usb:" <> busid}, %{shares: shares} = state)
+      when is_map_key(shares, busid) do
+    {:noreply, forget(busid, state)}
+  end
+
+  def handle_info({:device, _event, _}, state), do: {:noreply, state}
+
+  def handle_info({:DOWN, ref, :process, _, _}, %{watcher_ref: ref} = state) do
+    {:noreply, %{state | watcher_ref: Resubscribe.down(state.watcher, :resubscribe)}}
+  end
+
+  def handle_info(:resubscribe, state) do
+    {:noreply, subscribe(state, &Resubscribe.retry(&1, &2, :resubscribe))}
+  end
+
+  def handle_info(_msg, state), do: {:noreply, state}
+
+  defp subscribe(state, how) do
+    case how.(state.watcher, state.subscribe) do
+      nil -> state
+      ref -> reconcile(%{state | watcher_ref: ref})
+    end
+  end
+
+  # Removals that happened while unsubscribed were never heard.
+  defp reconcile(state) do
+    state.shares
+    |> Map.keys()
+    |> Enum.reject(&File.exists?(device_path(&1, state)))
+    |> Enum.reduce(state, &forget/2)
+  end
+
+  defp forget(busid, state) do
+    # ENODEV once the kernel has dropped the entry itself; nothing to undo.
+    _ = write(match_busid(state), "del " <> busid)
+    state = %{state | shares: Map.delete(state.shares, busid)}
+    if state.shares == %{}, do: daemon_down(state)
+    state
+  end
+
+  defp adopt(state) do
+    bound =
+      case File.ls(driver_path(@driver, state)) do
+        {:ok, entries} -> Enum.filter(entries, &busid?/1)
+        {:error, _} -> []
+      end
+
+    shares =
+      Map.new(bound, fn busid ->
+        vid_pid =
+          case Devices.find("usb:" <> busid, state.devices_opts) do
+            {:ok, device} -> device.vid_pid
+            {:error, _} -> nil
+          end
+
+        {busid, %{id: "usb:" <> busid, busid: busid, vid_pid: vid_pid}}
+      end)
+
+    if shares != %{} do
+      Logger.info("Vagus.USBIP: adopted #{Enum.join(Map.keys(shares), ", ")}")
+
+      with {:error, reason} <- daemon_up(state),
+           do: Logger.warning("Vagus.USBIP: usbipd not started: #{inspect(reason)}")
+    end
+
+    %{state | shares: shares}
+  end
+
+  defp resolve(key, state) do
+    key = if busid?(key), do: "usb:" <> key, else: key
+
+    case Devices.find(key, state.devices_opts) do
+      {:ok, %{kind: :usb} = device} -> {:ok, device}
+      {:ok, _sys} -> {:error, :not_found}
+      {:error, _} = error -> error
+    end
+  end
+
+  defp busid(id), do: String.replace_prefix(id, "usb:", "")
+
+  # Every sysfs path is built from a busid, so one is only ever the kernel's
+  # port-path shape. A `/dev` node path is still a valid `Devices.find/2` key.
+  defp busid?(busid), do: Devices.usb_id(busid) != nil
+
+  defp check_key("usb:" <> busid), do: if(busid?(busid), do: :ok, else: {:error, :invalid_busid})
+
+  defp check_key(key) do
+    if String.contains?(key, "/") and not String.starts_with?(key, "/dev/"),
+      do: {:error, :invalid_busid},
+      else: :ok
+  end
+
+  defp not_shared(busid, state) do
+    if Map.has_key?(state.shares, busid) or driver(busid, state) == @driver,
+      do: {:error, :already_shared},
+      else: :ok
+  end
+
+  # usbip_bind.c bind_device(): unbind_other() releases the device (not its
+  # interfaces) from its driver, then `match_busid` "add", then `bind`; a
+  # failed bind takes the match back out. Every value is written without a
+  # newline: match_busid_store() keeps everything after "add " as the busid.
+  defp bind(busid, state) do
+    original = driver(busid, state)
+
+    with :ok <- release(original, busid, state),
+         :ok <- or_reprobe(write(match_busid(state), "add " <> busid), original, busid, state) do
+      case write(attr(@driver, "bind", state), busid) do
+        :ok ->
+          :ok
+
+        error ->
+          _ = write(match_busid(state), "del " <> busid)
+          or_reprobe(error, original, busid, state)
+      end
+    end
+  end
+
+  defp release(nil, _busid, _state), do: :ok
+  defp release(:invalid, _busid, _state), do: {:error, :invalid_driver}
+  defp release(driver, busid, state), do: write(attr(driver, "unbind", state), busid)
+
+  # usbip_bind.c leaves a device it released driverless when the bind
+  # fails; `drivers_probe` hands it back to whichever driver claims it.
+  defp or_reprobe(:ok, _original, _busid, _state), do: :ok
+  defp or_reprobe(error, nil, _busid, _state), do: error
+
+  defp or_reprobe(error, _original, busid, state) do
+    _ = write(Path.join([state.sysfs, "bus", "usb", "drivers_probe"]), busid)
+    error
+  end
+
+  # usbip_unbind.c unbind_device(): `unbind`, `match_busid` "del", then
+  # usbip-host's own `rebind`, which re-attaches the device to its driver.
+  # Past the unbind the device is no longer lent, so it is forgotten even if
+  # a later step fails.
+  defp unshare_busid(busid, state) do
+    unbind =
+      if driver(busid, state) == @driver,
+        do: write(attr(@driver, "unbind", state), busid),
+        else: :ok
+
+    case unbind do
+      :ok ->
+        result =
+          with :ok <- write(match_busid(state), "del " <> busid),
+               do: write(attr(@driver, "rebind", state), busid)
+
+        state = %{state | shares: Map.delete(state.shares, busid)}
+        if state.shares == %{}, do: daemon_down(state)
+        {:reply, result, state}
+
+      error ->
+        {:reply, error, state}
+    end
+  end
+
+  defp driver(busid, state) do
+    case File.read_link(Path.join(device_path(busid, state), "driver")) do
+      {:ok, target} -> driver_name(Path.basename(target))
+      {:error, _} -> nil
+    end
+  end
+
+  # It names a directory under `drivers/`, so it must be one plain segment.
+  defp driver_name(name) do
+    if name not in ["", ".", ".."] and Regex.match?(~r/^[\w.-]+$/, name), do: name, else: :invalid
+  end
+
+  defp device_path(busid, state), do: Path.join([state.sysfs, "bus", "usb", "devices", busid])
+  defp driver_path(driver, state), do: Path.join([state.sysfs, "bus", "usb", "drivers", driver])
+  defp attr(driver, name, state), do: Path.join(driver_path(driver, state), name)
+  defp match_busid(state), do: attr(@driver, "match_busid", state)
+
+  # File.write would create a missing attribute (O_CREAT), which on sysfs
+  # fails with a misleading EACCES and in a test tree silently succeeds.
+  # Every segment is a checked busid or driver name under the configured root.
+  # sobelow_skip ["Traversal.FileModule"]
+  defp write(path, value) do
+    result = if File.regular?(path), do: File.write(path, value), else: {:error, :enoent}
+
+    case result do
+      :ok -> :ok
+      {:error, posix} -> {:error, {:sysfs, path, posix}}
+    end
+  end
+
+  defp modprobe(state) do
+    case state.cmd.("modprobe", [@driver]) do
+      {_out, 0} -> :ok
+      {out, status} -> {:error, {:cmd, "modprobe", status, String.trim(out)}}
+    end
+  end
+
+  defp default_cmd(bin, args) do
+    case Vagus.BoundedCall.run(fn -> Vagus.Host.Cmd.run(bin, args) end, @cmd_timeout_ms) do
+      {out, status} when is_binary(out) -> {out, status}
+      {:error, reason} -> {"#{bin}: #{inspect(reason)}", 1}
+    end
+  end
+
+  defp stop_if_idle(:ok, _state), do: :ok
+
+  defp stop_if_idle(error, state) do
+    if state.shares == %{}, do: daemon_down(state)
+    error
+  end
+
+  # Foreground `usbipd` (no -D), so the container lives exactly as long as
+  # the daemon. `--replace` clears a container a crashed server left behind.
+  # Privileged mounts /sys read-write, which usbipd needs to hand each
+  # accepted socket to usbip-host through `usbip_sockfd`.
+  defp daemon_up(%{shares: shares}) when shares != %{}, do: :ok
+
+  defp daemon_up(state) do
+    args = [
+      "run",
+      "-d",
+      "--rm",
+      "--replace",
+      "--name",
+      @container,
+      "--privileged",
+      "--network=host",
+      "--entrypoint",
+      "usbipd",
+      state.image
+    ]
+
+    case PodmanCmd.run(args, Keyword.merge([timeout_ms: @run_timeout_ms], state.podman)) do
+      {:ok, _} -> :ok
+      {:exit, status, out} -> {:error, {:podman, {status, String.trim(out)}}}
+      {:error, reason} -> {:error, {:podman, reason}}
+    end
+  end
+
+  defp daemon_down(state) do
+    args = ["stop", "-t", "5", "--ignore", @container]
+
+    case PodmanCmd.run(args, Keyword.merge([timeout_ms: @stop_timeout_ms], state.podman)) do
+      {:ok, _} -> :ok
+      other -> Logger.warning("Vagus.USBIP: podman stop #{@container}: #{inspect(other)}")
+    end
+  end
+end

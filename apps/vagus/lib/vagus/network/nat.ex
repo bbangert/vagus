@@ -65,6 +65,15 @@ defmodule Vagus.Network.Nat do
   localhost published port do. It runs after conntrack (-200), which it
   reads, and before routing.
 
+  ## Lab interfaces
+
+  `Vagus.Network.Lab` routes a device wired to an extra NIC out through the
+  primary interface: per `{lab, primary}` pair the forward chain accepts
+  `lab -> primary` and its replies ahead of the drops, and a `postrouting`
+  chain masquerades it. The list lives in `:persistent_term` (`set_lab/2`)
+  so every later render, including the one `ensure_loaded/1` makes for a
+  bridged start, keeps the rules; an empty list renders the baseline table.
+
   The table is loaded with one `nft -f`, which the kernel applies as a single
   transaction, and the file starts by declaring and flushing the table, so a
   reload replaces the rules instead of adding to them: `ensure/1` is safe to
@@ -99,6 +108,7 @@ defmodule Vagus.Network.Nat do
   @nft_timeout_ms 10_000
 
   @loaded_key {__MODULE__, :loaded}
+  @lab_key {__MODULE__, :lab}
 
   @doc "Whether DNAT management is switched on (`config :vagus, :supervisor_nat`)."
   @spec enabled?() :: boolean()
@@ -127,6 +137,9 @@ defmodule Vagus.Network.Nat do
       `/proc/sys`)
     * `:loaded_key` — the `:persistent_term` key recording a successful load
       (tests)
+    * `:lab` — `{lab_ifname, primary_ifname}` pairs to forward and masquerade
+      (default: the list `set_lab/2` stored)
+    * `:lab_key` — the `:persistent_term` key holding that list (tests)
   """
   @spec ensure(keyword()) :: :ok | {:error, term()}
   def ensure(opts \\ []) do
@@ -140,6 +153,35 @@ defmodule Vagus.Network.Nat do
       :ok
     end
   end
+
+  @doc """
+  Stores the lab pairs every later render uses and reloads the table with
+  them. On a failed load the previous list is put back, so the stored list
+  never claims rules a load refused.
+  """
+  @spec set_lab([{String.t(), String.t()}], keyword()) :: :ok | {:error, term()}
+  def set_lab(lab, opts \\ []) when is_list(lab) do
+    key = Keyword.get(opts, :lab_key, @lab_key)
+    previous = :persistent_term.get(key, [])
+    :persistent_term.put(key, lab)
+
+    case ensure(Keyword.put(opts, :lab, lab)) do
+      :ok ->
+        :ok
+
+      {:error, _} = error ->
+        :persistent_term.put(key, previous)
+        error
+    end
+  end
+
+  @doc "The lab pairs `set_lab/2` stored."
+  @spec lab(keyword()) :: [{String.t(), String.t()}]
+  def lab(opts \\ []),
+    do:
+      Keyword.get_lazy(opts, :lab, fn ->
+        :persistent_term.get(Keyword.get(opts, :lab_key, @lab_key), [])
+      end)
 
   @doc """
   `:ok` once `ensure/1` has succeeded in this VM, else `ensure/1` now. The
@@ -175,6 +217,7 @@ defmodule Vagus.Network.Nat do
          {:ok, port} <- target_port(opts) do
       rule = "ip daddr #{ip} tcp dport #{@contract_port} dnat to #{ip}:#{port}"
       bridge = Network.name()
+      lab = lab(opts)
 
       {:ok,
        """
@@ -191,16 +234,35 @@ defmodule Vagus.Network.Nat do
        \t}
        \tchain forward {
        \t\ttype filter hook forward priority #{@forward_priority}; policy accept;
-       \t\tiifname != "#{bridge}" oifname != "#{bridge}" drop
+       #{lab_forward(lab)}\t\tiifname != "#{bridge}" oifname != "#{bridge}" drop
        \t\toifname "#{bridge}" iifname != "#{bridge}" ct state new ct status & dnat == 0 drop
        \t}
        \tchain prerouting_filter {
        \t\ttype filter hook prerouting priority #{@prerouting_filter_priority}; policy accept;
        \t\tiifname "#{bridge}" ip daddr 127.0.0.0/8 ct status & dnat == 0 drop
        \t}
-       }
+       #{lab_postrouting(lab)}}
        """}
     end
+  end
+
+  defp lab_forward(lab) do
+    Enum.map_join(lab, fn {lab_if, primary} ->
+      ~s(\t\tiifname "#{lab_if}" oifname "#{primary}" accept\n) <>
+        ~s(\t\tiifname "#{primary}" oifname "#{lab_if}" ct state established,related accept\n)
+    end)
+  end
+
+  defp lab_postrouting([]), do: ""
+
+  defp lab_postrouting(lab) do
+    rules =
+      Enum.map_join(lab, fn {lab_if, primary} ->
+        ~s(\t\tiifname "#{lab_if}" oifname "#{primary}" masquerade\n)
+      end)
+
+    "\tchain postrouting {\n\t\ttype nat hook postrouting priority srcnat; policy accept;\n" <>
+      rules <> "\t}\n"
   end
 
   ## sysctls

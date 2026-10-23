@@ -153,7 +153,9 @@ defmodule Vagus.Backend.Network.VintageNet do
       end
     end
 
-    defp primary_interface do
+    @doc "The connected interface carrying the aggregate `[\"connection\"]`, or `nil`."
+    @spec primary_interface() :: String.t() | nil
+    def primary_interface do
       best_connection = VintageNet.get(["connection"], :disconnected)
 
       Enum.find(configured_interfaces(), fn ifname ->

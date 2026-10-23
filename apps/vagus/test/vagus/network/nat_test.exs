@@ -142,6 +142,50 @@ defmodule Vagus.Network.NatTest do
     end
   end
 
+  describe "lab interfaces" do
+    test "forward accepts and masquerade, ahead of the drops, only while listed" do
+      {:ok, ruleset} =
+        Nat.ruleset(ip: "172.30.32.2", port: 8888, lab: [{"eth1", "eth0"}])
+
+      assert ruleset =~
+               """
+               \t\ttype filter hook forward priority filter; policy accept;
+               \t\tiifname "eth1" oifname "eth0" accept
+               \t\tiifname "eth0" oifname "eth1" ct state established,related accept
+               \t\tiifname != "hassio" oifname != "hassio" drop
+               """
+
+      assert String.ends_with?(ruleset, """
+             \tchain postrouting {
+             \t\ttype nat hook postrouting priority srcnat; policy accept;
+             \t\tiifname "eth1" oifname "eth0" masquerade
+             \t}
+             }
+             """)
+
+      assert Nat.ruleset(ip: "172.30.32.2", port: 8888, lab: []) == {:ok, @ruleset}
+    end
+
+    test "set_lab/2 stores the list for later renders, and restores it on a refused load",
+         %{dir: dir} do
+      opts = opts(dir, nft_fake({"", 0})) ++ [lab_key: {__MODULE__, :lab, dir}]
+      on_exit(fn -> :persistent_term.erase({__MODULE__, :lab, dir}) end)
+
+      assert Nat.set_lab([{"eth1", "eth0"}], opts) == :ok
+      assert_received {:nft, "nft", _, text}
+      assert text =~ "masquerade"
+      assert {:ok, later} = Nat.ruleset(opts)
+      assert later =~ "masquerade"
+
+      capture_log(fn ->
+        failing = Keyword.put(opts, :cmd, nft_fake({"boom", 1}))
+        assert {:error, _} = Nat.set_lab([], failing)
+      end)
+
+      assert Nat.lab(opts) == [{"eth1", "eth0"}]
+    end
+  end
+
   describe "forwarding sysctls" do
     test "ip_forward and the bridge's route_localnet are set once the table is loaded",
          %{dir: dir} do

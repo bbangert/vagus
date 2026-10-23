@@ -248,7 +248,16 @@ defmodule Vagus.Application do
     end
   else
     # Target only: on host NervesUEvent runs too, and the watcher would announce the dev machine's devices.
-    defp target_children, do: [bluetooth_child(), Vagus.Devices.Watcher]
+    defp target_children do
+      [
+        bluetooth_child(),
+        Vagus.Devices.Watcher,
+        Vagus.Network.Lab,
+        # NFS and USBIP return :ignore unless Vagus.Flavor.agent?(); USBIP subscribes to the Watcher.
+        Vagus.NFS,
+        Vagus.USBIP
+      ]
+    end
 
     defp bluetooth_child do
       # Bluetooth daemons (dbus-daemon --system + bluetoothd -E), the
