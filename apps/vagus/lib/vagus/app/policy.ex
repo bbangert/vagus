@@ -466,11 +466,12 @@ defmodule Vagus.App.Policy do
 
   defp scheduled(_stale, data), do: {data, health_timer(data, :interval_ms)}
 
-  # A container the URL probe failed still runs.
-  defp alive?(%{container_id: id, last_event: event}) when id != nil,
+  @doc "Whether the container still runs: one the URL probe failed reads `error` but does."
+  @spec alive?(map()) :: boolean()
+  def alive?(%{container_id: id, last_event: event}) when id != nil,
     do: from_event(event) in [:startup, :started] or event == {:failed, :unhealthy}
 
-  defp alive?(_data), do: false
+  def alive?(_data), do: false
 
   @doc """
   Whether a command is taken in this state. Only `halt` pre-empts an
@@ -606,13 +607,20 @@ defmodule Vagus.App.Policy do
   defp ingress_ip(_data), do: {:error, :no_container_ip}
 
   @doc """
-  The app's saved facts plus its reported `state`, the shape
-  `Addon.Info.render` and the router read.
+  The app's saved facts plus its reported `state`, `alive?` and `busy`, the
+  shape `Addon.Info.render` and the router read. `alive?` rides along because
+  `state` alone hides a container that outlived a failed URL probe; `busy`
+  (the operation in flight, else `nil`) because events are postponed during
+  one, so a start's container can run while `state` still reads `:stopped`.
   """
   @spec snapshot(map()) :: map()
   def snapshot(data) do
     state = if data[:refused], do: :unknown, else: derive(:idle, data)
-    data |> Map.take(@persisted) |> Map.put(:state, state)
+    busy = with %{op: op} <- data[:run], do: op
+
+    data
+    |> Map.take(@persisted)
+    |> Map.merge(%{state: state, alive?: alive?(data), busy: busy})
   end
 
   @doc """

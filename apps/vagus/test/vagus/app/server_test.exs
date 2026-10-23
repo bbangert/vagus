@@ -297,6 +297,20 @@ defmodule Vagus.App.ServerTest do
       assert :ok = Task.await(t)
     end
 
+    test "a snapshot taken mid-start names the operation, before any event says it runs" do
+      {slug, pid} = installed()
+      assert {:ok, %{busy: nil}} = App.info(slug)
+      t = op(pid, {:start, %{}})
+      {_input, task} = step(:start)
+
+      assert {:ok, %{state: :stopped, alive?: false, busy: :start}} = App.info(slug)
+      assert [%{busy: :start}] = Enum.filter(App.list(), &(&1.config.slug == slug))
+
+      send(task, {:outcome, {:ok, @started}})
+      assert :ok = Task.await(t)
+      assert {:ok, %{busy: nil}} = App.info(slug)
+    end
+
     test "a result carrying another step's ref is dropped" do
       {_slug, pid} = installed()
       t = op(pid, {:start, %{}})
