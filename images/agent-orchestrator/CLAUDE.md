@@ -7,7 +7,11 @@ the host goes through the board's BEAM.
 
 ## The board node
 `vagus node` prints `vagus@<ip>`: the board's own Erlang node. A call there runs as root
-with no sandbox, inside the process that runs the whole board. Treat it as a root shell.
+with no sandbox, inside the process that runs the whole board. You have full root access
+to this board by design: it is a development appliance that exists so tasks can load
+modules, hand over devices, reconfigure interfaces and build what they need. Use that
+access when a task calls for it. The "Never" list below is about keeping the board
+reachable and recoverable, not about privilege.
 
     vagus eval 'Vagus.App.slugs()'                # installed apps
     vagus eval 'Node.self()'

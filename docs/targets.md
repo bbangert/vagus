@@ -186,6 +186,16 @@ Assistant Core. The rest of the stack (apps, MQTT broker, podman) is
 unchanged. It is selected at build time by `VAGUS_FLAVOR=agent-dev-board`; an
 unknown value fails the build.
 
+Root by design: on this flavor the Claude agent (the orchestrator container
+and, through it, its workers) has full root access to the board, through
+Erlang distribution and podman. That is intentional and desired: a hardware
+task may need kernel modules loaded, devices handed over, network interfaces
+reconfigured or packages built, and the board exists for that work. The
+guard rails are about keeping the board reachable and recoverable (the A/B
+slot, heart, the playbook's never-do list), not about limiting privilege. A
+board on this flavor is a development appliance, never a shared or exposed
+one. The stock flavor is unaffected.
+
 Disabled: the Core stage is skipped at boot even if a Core version is
 installed, there is no Core watchdog and no Core provisioning. `/data` still
 expands. The Core HTTP routes (`POST /core/start` etc.) are not guarded, so a
