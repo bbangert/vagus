@@ -102,10 +102,15 @@ VintageNet already configures, and a cidr that overlaps the LAN or
 `--interface` must name the lab NIC, never `eth0` or `wlan0`, or it answers
 DHCP on the LAN:
 
-    podman run -d --name lab-dnsmasq --network=host --cap-add=NET_ADMIN,NET_RAW <base image> \
+    podman run -d --name lab-dnsmasq --network=host --cap-add=NET_ADMIN,NET_RAW \
+      -v /data/vagus/tftp/<target>:/data/tftp:ro <base image> \
       dnsmasq --keep-in-foreground --interface=<lab NIC> --bind-interfaces \
       --dhcp-range=10.42.0.50,10.42.0.150,12h --enable-tftp --tftp-root=/data/tftp \
       --dhcp-boot=<bootfile>
+
+The base image has no `/data/tftp`, so populate the bind-mounted directory
+first with the target's kernel, initrd and bootloader. `/data/vagus/tftp/` is
+the suggested place, beside `/data/vagus/nfs/`.
 
 **NFS root.** `Vagus.NFS.export(path, client_cidr)`, `unexport/1` and
 `status/0`, agent flavor only. Paths must be under `/data/vagus/nfs/`, and

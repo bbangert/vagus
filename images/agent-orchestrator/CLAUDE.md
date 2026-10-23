@@ -115,9 +115,10 @@ They survive a Vagus restart but not a reboot: re-apply them at the start of a t
 - `Lab.up` addresses an extra NIC and forwards it to the primary interface (nft
   masquerade) while up. It refuses `eth0`, `wlan0`, `usb0`, `hassio*`, a NIC
   VintageNet already configures, and a cidr overlapping the LAN or `172.30.32.0/23`. DHCP/TFTP/PXE for the target is `dnsmasq` in a worker:
-  `--network=host --cap-add NET_ADMIN,NET_RAW`, `dnsmasq --keep-in-foreground
+  `--network=host --cap-add NET_ADMIN,NET_RAW -v /data/vagus/tftp/<target>:/data/tftp:ro`, `dnsmasq --keep-in-foreground
   --interface=<lab NIC> --bind-interfaces --dhcp-range=10.42.0.50,10.42.0.150,12h
-  --enable-tftp --tftp-root=/data/tftp --dhcp-boot=<bootfile>`.
+  --enable-tftp --tftp-root=/data/tftp --dhcp-boot=<bootfile>`. The base image has no `/data/tftp`: populate
+  `/data/vagus/tftp/<target>` first (kernel, initrd, bootloader), beside `/data/vagus/nfs/`.
 - NFS is NFSv4 only, paths under `/data/vagus/nfs/`. nfsd listens on every
   interface, so the client CIDR is the only access control (no `/0`); exports use
   `subtree_check`. The target mounts the `export_path` that `status/0` reports
