@@ -840,7 +840,7 @@ defmodule Vagus.API.CoreProxyWSDispatchTest do
       end)
 
     assert log =~
-             "a supervisor/api call raised FunctionClauseError in Plug.Crypto.secure_compare/2"
+             "a supervisor/api call raised ArgumentError in Plug.Crypto.secure_compare/2"
 
     assert log =~ "a supervisor/api call raised KeyError in "
     assert log =~ "a supervisor/api call raised RuntimeError in "
