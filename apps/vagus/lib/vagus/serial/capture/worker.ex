@@ -9,6 +9,7 @@ defmodule Vagus.Serial.Capture.Worker do
   require Logger
 
   @default_max_bytes 8 * 1024 * 1024
+  @warn_every_ms 60_000
 
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts)
 
@@ -27,7 +28,6 @@ defmodule Vagus.Serial.Capture.Worker do
     label = Keyword.fetch!(opts, :label)
 
     with :ok <- claim(table, [{:node, node}, {:label, label}]),
-         :ok <- not_in_use(node, Keyword.get(opts, :proc_root, "/proc")),
          {:ok, state} <- open_file(opts),
          {:ok, state} <- open_uart(state, opts) do
       {:ok, state}
@@ -40,7 +40,7 @@ defmodule Vagus.Serial.Capture.Worker do
 
   @impl true
   def handle_call(:info, _from, state) do
-    info = Map.take(state, [:label, :node, :baud, :file, :bytes, :since])
+    info = Map.take(state, [:label, :node, :baud, :file, :bytes, :since, :dropped])
     {:reply, Map.put(info, :state, :capturing), state}
   end
 
@@ -99,33 +99,9 @@ defmodule Vagus.Serial.Capture.Worker do
   defp release(table, node, label) do
     :ets.delete_object(table, {{:node, node}, self()})
     :ets.delete_object(table, {{:label, label}, self()})
-  end
-
-  # Only a /proc fd scan can tell on Nerves (no udev, no lsof), and it is
-  # TOCTOU: a process can open the node between this scan and our open.
-  # Linux ttys have no mandatory exclusive open, so this is a courtesy check
-  # against clobbering someone's interactive session, not a lock.
-  @doc false
-  def holders(node, proc_root) do
-    entries =
-      case File.ls(proc_root) do
-        {:ok, entries} -> entries
-        {:error, _} -> []
-      end
-
-    for pid <- entries,
-        pid =~ ~r/\A\d+\z/,
-        fd_dir = Path.join([proc_root, pid, "fd"]),
-        {:ok, fds} <- [File.ls(fd_dir)],
-        Enum.any?(fds, &(File.read_link(Path.join(fd_dir, &1)) == {:ok, node})),
-        do: String.to_integer(pid)
-  end
-
-  defp not_in_use(node, proc_root) do
-    case holders(node, proc_root) do
-      [] -> :ok
-      pids -> {:error, {:in_use, Enum.sort(pids)}}
-    end
+  rescue
+    # The table went with the supervisor; so did every claim in it.
+    ArgumentError -> true
   end
 
   # path is `root` (config/opts) + a label checked by
@@ -136,6 +112,9 @@ defmodule Vagus.Serial.Capture.Worker do
     file = Path.join(root, Keyword.fetch!(opts, :label) <> ".log")
 
     with :ok <- File.mkdir_p(root),
+         :ok <- File.chmod(root, 0o700),
+         :ok <- File.touch(file),
+         :ok <- File.chmod(file, 0o600),
          {:ok, io} <- File.open(file, [:append, :binary, :raw]) do
       bytes =
         case File.stat(file) do
@@ -154,6 +133,9 @@ defmodule Vagus.Serial.Capture.Worker do
          bytes: bytes,
          max_bytes: Keyword.get(opts, :max_bytes, @default_max_bytes),
          since: DateTime.utc_now(),
+         dropped: 0,
+         warned_at: nil,
+         rotate_failed: false,
          uart_mod: Keyword.get(opts, :uart_mod, Circuits.UART),
          uart: nil
        }}
@@ -175,10 +157,14 @@ defmodule Vagus.Serial.Capture.Worker do
       rx_framing_timeout: Keyword.get(opts, :flush_ms, 500)
     ]
 
-    with {:ok, uart} <- state.uart_mod.start_link(),
-         state = %{state | uart: uart},
-         :ok <- open_or_stop(state, uart_opts) do
-      {:ok, state}
+    case state.uart_mod.start_link() do
+      {:ok, uart} ->
+        state = %{state | uart: uart}
+        with :ok <- open_or_stop(state, uart_opts), do: {:ok, state}
+
+      {:error, _} = error ->
+        _ = File.close(state.io)
+        error
     end
   end
 
@@ -201,26 +187,64 @@ defmodule Vagus.Serial.Capture.Worker do
     state = maybe_rotate(state, size)
 
     case :file.write(state.io, line) do
-      :ok ->
-        %{state | bytes: state.bytes + size}
-
-      {:error, reason} ->
-        Logger.warning("serial capture #{state.label}: write failed (#{inspect(reason)})")
-        state
+      :ok -> %{state | bytes: state.bytes + size}
+      {:error, reason} -> dropped(%{state | dropped: state.dropped + 1}, reason)
     end
   end
 
+  # A failing /data is shared with the durable log, so a warning per dropped
+  # line would feed the same disk: one now, then one a minute at most.
+  defp dropped(state, reason) do
+    now = System.monotonic_time(:millisecond)
+
+    if is_nil(state.warned_at) or now - state.warned_at >= @warn_every_ms do
+      Logger.warning(
+        "serial capture #{state.label}: write failed (#{inspect(reason)}), " <>
+          "#{state.dropped} line(s) dropped so far"
+      )
+
+      %{state | warned_at: now}
+    else
+      state
+    end
+  end
+
+  # Renamed while still open, so a failed rename or reopen leaves the handle
+  # writing on: a log that outgrows its cap beats a truncated one. The
+  # warning comes once until a rotation succeeds.
   # path is the worker's own validated log file
   # sobelow_skip ["Traversal.FileModule"]
   defp maybe_rotate(%{bytes: bytes, max_bytes: max} = state, size)
        when bytes > 0 and bytes + size > max do
-    _ = File.close(state.io)
-    _ = File.rename(state.file, state.file <> ".1")
-    {:ok, io} = File.open(state.file, [:write, :binary, :raw])
-    %{state | io: io, bytes: 0}
+    rotated = state.file <> ".1"
+
+    with :ok <- File.rename(state.file, rotated),
+         {:ok, io} <- reopen(state.file, rotated) do
+      _ = File.close(state.io)
+      _ = File.chmod(state.file, 0o600)
+      %{state | io: io, bytes: 0, rotate_failed: false}
+    else
+      {:error, reason} ->
+        if not state.rotate_failed,
+          do:
+            Logger.warning("serial capture #{state.label}: rotation failed (#{inspect(reason)})")
+
+        %{state | rotate_failed: true}
+    end
   end
 
   defp maybe_rotate(state, _size), do: state
+
+  # The handle still writes to the renamed file; renaming it back keeps the
+  # name and the handle on one file, so the next rotation can try again.
+  # path is the worker's own validated log file
+  # sobelow_skip ["Traversal.FileModule"]
+  defp reopen(file, rotated) do
+    with {:error, _} = error <- File.open(file, [:write, :binary, :raw]) do
+      _ = File.rename(rotated, file)
+      error
+    end
+  end
 
   defp safe(fun) do
     fun.()

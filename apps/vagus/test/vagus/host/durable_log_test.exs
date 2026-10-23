@@ -40,7 +40,8 @@ defmodule Vagus.Host.DurableLogTest do
     assert contents =~
              ~r/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z \[info\] module=Vagus\.Host\.DurableLogTest durable hello$/m
 
-    assert List.last(DurableLog.tail(1)) =~ "durable hello"
+    assert {:ok, [last]} = DurableLog.tail(1)
+    assert last =~ "durable hello"
   end
 
   test "drops events below the configured level" do
@@ -86,11 +87,25 @@ defmodule Vagus.Host.DurableLogTest do
     assert {:error, {:not_found, :vagus_durable}} = :logger.get_handler_config(:vagus_durable)
   end
 
-  test "unset config is :ignore and adds no handler" do
+  test "unset or false config is :ignore and adds no handler" do
     Application.delete_env(:vagus, :durable_log)
-
     assert DurableLog.start_link([]) == :ignore
+
+    Application.put_env(:vagus, :durable_log, false)
+    assert DurableLog.start_link([]) == :ignore
+
     assert {:error, {:not_found, :vagus_durable}} = :logger.get_handler_config(:vagus_durable)
+  end
+
+  test "true config means the defaults" do
+    Application.put_env(:vagus, :durable_log, true)
+    assert DurableLog.path() == "/data/vagus/log/vagus.log"
+  end
+
+  test "syncs to disk every second" do
+    start_supervised!(DurableLog)
+    {:ok, %{config: config}} = :logger.get_handler_config(:vagus_durable)
+    assert config.filesync_repeat_interval == 1_000
   end
 
   test "terminate removes the handler" do
@@ -102,15 +117,30 @@ defmodule Vagus.Host.DurableLogTest do
     assert {:error, {:not_found, :vagus_durable}} = :logger.get_handler_config(:vagus_durable)
   end
 
-  test "a handler left by a killed owner is adopted" do
+  test "a handler left by a killed owner is taken over with this config", %{tmp_dir: tmp_dir} do
+    Application.put_env(:vagus, :durable_log, dir: tmp_dir, level: :warning)
     pid = start_supervised!(DurableLog, restart: :temporary)
     Process.exit(pid, :kill)
-    assert {:ok, _} = :logger.get_handler_config(:vagus_durable)
+    assert {:ok, %{level: :warning}} = :logger.get_handler_config(:vagus_durable)
 
-    {:ok, _} = DurableLog.start_link(name: :durable_log_second_owner)
-    Logger.info("durable after adopt")
+    Application.put_env(:vagus, :durable_log, dir: tmp_dir)
+    start_supervised!({DurableLog, name: :durable_log_second_owner}, id: :second)
+    assert {:ok, %{level: :info}} = :logger.get_handler_config(:vagus_durable)
+
+    Logger.info("durable after take-over")
     sync()
+    assert File.read!(DurableLog.path()) =~ "durable after take-over"
+  end
 
-    assert File.read!(DurableLog.path()) =~ "durable after adopt"
+  test "a left handler writing elsewhere is replaced", %{tmp_dir: tmp_dir} do
+    Application.put_env(:vagus, :durable_log, dir: Path.join(tmp_dir, "old"))
+    pid = start_supervised!(DurableLog, restart: :temporary)
+    Process.exit(pid, :kill)
+
+    Application.put_env(:vagus, :durable_log, dir: tmp_dir)
+    start_supervised!({DurableLog, name: :durable_log_second_owner}, id: :second)
+
+    {:ok, %{config: config}} = :logger.get_handler_config(:vagus_durable)
+    assert config.file == String.to_charlist(Path.join(tmp_dir, "vagus.log"))
   end
 end

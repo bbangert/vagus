@@ -29,8 +29,15 @@ defmodule Vagus.Host.DurableLog do
   never cost the rest of the tree: any failure to create the directory or
   open the file logs one warning and returns `:ignore`.
 
-  The process exists only so that `terminate/2` removes the handler: without
-  it a `:vagus` restart would leave a handler pointing at the old config.
+  Writes reach the disk within a second (`filesync_repeat_interval`, down
+  from logger_std_h's 5 s): a power cut is the outage this file explains, so
+  it loses at most the last second. The cost on an SD card is one sync a
+  second, and only in seconds when something was logged.
+
+  The process exists so the handler, and its open file, go when `:vagus`
+  stops or restarts cleanly: `terminate/2` removes it. An owner killed
+  before `terminate/2` leaves its handler behind; the next start takes it
+  over with this config.
   """
 
   use GenServer
@@ -67,7 +74,7 @@ defmodule Vagus.Host.DurableLog do
   def path, do: path(config())
 
   @doc "The last `n` lines of the current log file, for `vagus eval` over ssh."
-  @spec tail(pos_integer()) :: [String.t()] | {:error, File.posix()}
+  @spec tail(pos_integer()) :: {:ok, [String.t()]} | {:error, File.posix()}
   # path is config-derived, not request input
   # sobelow_skip ["Traversal.FileModule"]
   def tail(n \\ 100) when is_integer(n) and n > 0 do
@@ -75,7 +82,7 @@ defmodule Vagus.Host.DurableLog do
     _ = :logger_std_h.filesync(@handler)
 
     case File.read(path()) do
-      {:ok, contents} -> contents |> String.split("\n", trim: true) |> Enum.take(-n)
+      {:ok, contents} -> {:ok, contents |> String.split("\n", trim: true) |> Enum.take(-n)}
       {:error, _} = error -> error
     end
   end
@@ -87,8 +94,10 @@ defmodule Vagus.Host.DurableLog do
         file: opts |> path() |> String.to_charlist(),
         max_no_bytes: Keyword.fetch!(opts, :max_no_bytes),
         max_no_files: Keyword.fetch!(opts, :max_no_files),
-        compress_on_rotate: Keyword.fetch!(opts, :compress_on_rotate)
+        compress_on_rotate: Keyword.fetch!(opts, :compress_on_rotate),
+        filesync_repeat_interval: 1_000
       },
+      # Pattern names are lowercase, so the `T` and `Z` around `$time` are text.
       formatter:
         Logger.Formatter.new(
           format: "$dateT$timeZ [$level] $metadata$message\n",
@@ -100,9 +109,22 @@ defmodule Vagus.Host.DurableLog do
 
     case :logger.add_handler(@handler, :logger_std_h, config) do
       :ok -> :ok
-      # Left behind by an owner that was killed before terminate/2 ran.
-      {:error, {:already_exist, @handler}} -> :ok
+      {:error, {:already_exist, @handler}} -> take_over(config)
       {:error, _} = error -> error
+    end
+  end
+
+  # Left by an owner killed before terminate/2 ran, with whatever config it
+  # had. Updated in place it keeps its open file; logger_std_h's file is
+  # write-once, though, so a different file means replacing the handler.
+  defp take_over(config) do
+    case :logger.update_handler_config(@handler, config) do
+      :ok ->
+        :ok
+
+      {:error, _} ->
+        _ = :logger.remove_handler(@handler)
+        :logger.add_handler(@handler, :logger_std_h, config)
     end
   end
 

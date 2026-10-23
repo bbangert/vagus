@@ -212,6 +212,14 @@ config :vagus, :memory_monitor, true
 # flavor. The cap is small because rpi3_64 boards write it to an SD card.
 config :vagus, :durable_log, true
 
+# At the default :debug level Elixir's crash-report translator appends the
+# crashed process's whole `State:`, which the durable log keeps on /data
+# across reboots, secrets included. :info drops it (`Last message:` stays
+# at every level). The cost is RingLogger losing debug lines on boards;
+# `Logger.configure(level: :debug)` brings them back (and the `State:`)
+# until the next reboot.
+config :logger, level: :info
+
 # Real /os/update (build-order #4): GitHub-releases OTA firmware updates
 # (`Vagus.OS.Updater` — :ignore when unset, same target-only convention
 # as :core_watchdog/:first_boot_provision above; there is no

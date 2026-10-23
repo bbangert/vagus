@@ -19,10 +19,27 @@ defmodule Vagus.Devices.Watcher do
 
   ## Losing the table
 
-  The table's subscriptions live in its own registry, so a restart of
-  `NervesUEvent` drops this one. The table is monitored and
-  re-subscribed with `Vagus.Resubscribe`, and the inventory is re-read then,
-  announcing whatever changed while nobody was listening.
+  The table's subscriptions live in its registry's partition, which links
+  every subscriber. That partition can restart on its own (the table's
+  supervisor keeps running) or with the whole table; either way the
+  subscription is gone. Both the partition's exit and the table's `:DOWN`
+  re-subscribe with `Vagus.Resubscribe`, and the inventory is re-read then,
+  announcing whatever changed while nobody was listening. Re-subscribing
+  twice would register twice and deliver every uevent twice, so a retry
+  that finds a live subscription does nothing.
+
+  ## Subscribers
+
+  Subscribers are held in this process only: they do not survive its
+  restart. A subscriber that must keep hearing monitors the watcher and
+  subscribes again (`Vagus.Resubscribe` against the registered name does
+  that, `{Vagus.Devices.Watcher, node}` included). Devices that settle while
+  the watcher is away are part of its successor's starting inventory and
+  are never announced `:added`.
+
+  The starting inventory is read in `init/1` rather than a `handle_continue`:
+  it has to sit between the subscribe and the first uevent handled, and it is
+  a few dozen sysfs reads.
 
   `:ignore` when the table is not running: on host and in tests, and on a
   system built without nerves_uevent.
@@ -59,6 +76,8 @@ defmodule Vagus.Devices.Watcher do
         table: table,
         devices_opts: Keyword.take(opts, [:sysfs_root, :dev_root]),
         settle_ms: Keyword.get(opts, :settle_ms, @settle_ms),
+        # Test seam: lets a test decide when a settle fires.
+        send_after: Keyword.get(opts, :send_after, &Process.send_after/3),
         table_ref: nil,
         known: %{},
         pending: %{},
@@ -72,7 +91,7 @@ defmodule Vagus.Devices.Watcher do
 
       # Subscribe before reading, so a plug between the two is a uevent we
       # get rather than a device we never hear about.
-      ref = Resubscribe.subscribe(table, &subscribe_table/1)
+      ref = Resubscribe.start(table, &subscribe_table/1, :resubscribe, true)
       {:ok, %{state | table_ref: ref, known: inventory(state)}}
     else
       :ignore
@@ -117,8 +136,19 @@ defmodule Vagus.Devices.Watcher do
     {:noreply, %{state | subscribers: Map.delete(state.subscribers, pid)}}
   end
 
-  # The registry's link; its monitor above is what acts on the loss.
-  def handle_info({:EXIT, _pid, _reason}, state), do: {:noreply, state}
+  # The registry partition is this process's only link (parent exits never
+  # reach handle_info), and the subscription died with it. A nil table_ref
+  # means a retry is already armed.
+  def handle_info({:EXIT, _partition, _reason}, %{table_ref: nil} = state),
+    do: {:noreply, state}
+
+  def handle_info({:EXIT, _partition, _reason}, state) do
+    Process.demonitor(state.table_ref, [:flush])
+    {:noreply, %{state | table_ref: Resubscribe.down(state.table, :resubscribe)}}
+  end
+
+  def handle_info(:resubscribe, %{table_ref: ref} = state) when ref != nil,
+    do: {:noreply, state}
 
   def handle_info(:resubscribe, state) do
     case Resubscribe.retry(state.table, &subscribe_table/1, :resubscribe) do
@@ -127,7 +157,14 @@ defmodule Vagus.Devices.Watcher do
     end
   end
 
-  defp subscribe_table(table), do: PropertyTable.subscribe(table, ["devices"])
+  # The table's name is registered before its registry starts and while it
+  # restarts, and a missing registry raises; it is the table being away, so
+  # it goes the way of a dead name (an exit Resubscribe retries).
+  defp subscribe_table(table) do
+    PropertyTable.subscribe(table, ["devices"])
+  rescue
+    ArgumentError -> exit(:no_registry)
+  end
 
   # A device's own uevent starts (or ends) its story; every other uevent
   # only matters as a sign that a pending device's drivers are still
@@ -154,14 +191,15 @@ defmodule Vagus.Devices.Watcher do
     {timer, _token} = Map.get(state.pending, path, {nil, nil})
     if timer, do: Process.cancel_timer(timer)
     token = make_ref()
-    timer = Process.send_after(self(), {:settled, path, token}, state.settle_ms)
+    timer = state.send_after.(self(), {:settled, path, token}, state.settle_ms)
     %{state | pending: Map.put(state.pending, path, {timer, token})}
   end
 
+  # Every pending ancestor, not just one: a hub plugged with a device behind
+  # it has both pending, and the device's tty must hold back the device.
   defp rearm_ancestor(path, state) do
-    case Enum.find(Map.keys(state.pending), &:lists.prefix(&1, path)) do
-      nil -> state
-      device_path -> arm(device_path, state)
+    for key <- Map.keys(state.pending), :lists.prefix(key, path), reduce: state do
+      state -> arm(key, state)
     end
   end
 
@@ -179,6 +217,8 @@ defmodule Vagus.Devices.Watcher do
     end
   end
 
+  # A device already known as this same plug (a table restart replays every
+  # device's uevent) is not news.
   defp settle(path, state) do
     id = path |> List.last() |> Devices.usb_id()
 
@@ -187,10 +227,18 @@ defmodule Vagus.Devices.Watcher do
         state
 
       device ->
-        broadcast(state, {:device, :added, device})
+        if not same_plug?(Map.get(state.known, id), device),
+          do: broadcast(state, {:device, :added, device})
+
         %{state | known: Map.put(state.known, id, device)}
     end
   end
+
+  defp same_plug?(nil, _device), do: false
+
+  defp same_plug?(known, device),
+    do:
+      Map.take(known, [:sysfs, :busnum, :devnum]) == Map.take(device, [:sysfs, :busnum, :devnum])
 
   defp resync(state) do
     now = inventory(state)

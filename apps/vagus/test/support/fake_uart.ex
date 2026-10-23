@@ -1,9 +1,9 @@
 defmodule Vagus.Test.FakeUART do
   @moduledoc """
   Stands in for `Circuits.UART` behind `Vagus.Serial.Capture`'s `:uart_mod`
-  seam. Tests drive the capture by sending `{:circuits_uart, node, data}` to
-  the worker, the same message shape the real UART delivers to its owner.
-  A node whose name contains `FAIL` refuses to open with `:enoent`.
+  seam. `deliver/2` sends `{:circuits_uart, node, data}` to the process that
+  opened it, with the node as it was opened, as the real UART does. A node
+  whose name contains `FAIL` refuses to open with `:enoent`.
   """
 
   use GenServer
@@ -14,6 +14,7 @@ defmodule Vagus.Test.FakeUART do
   def configure(pid, opts), do: GenServer.call(pid, {:configure, opts})
   def close(pid), do: GenServer.call(pid, :close)
   def opened(pid), do: GenServer.call(pid, :opened)
+  def deliver(pid, data), do: GenServer.call(pid, {:deliver, data})
 
   @impl true
   def init(nil), do: {:ok, %{node: nil, opts: [], owner: nil}}
@@ -30,4 +31,10 @@ defmodule Vagus.Test.FakeUART do
 
   def handle_call(:close, _from, state), do: {:reply, :ok, %{state | node: nil}}
   def handle_call(:opened, _from, state), do: {:reply, state, state}
+
+  def handle_call({:deliver, data}, _from, %{owner: owner, node: node} = state)
+      when is_pid(owner) and is_binary(node) do
+    send(owner, {:circuits_uart, node, data})
+    {:reply, :ok, state}
+  end
 end

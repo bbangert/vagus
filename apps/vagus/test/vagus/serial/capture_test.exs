@@ -1,6 +1,9 @@
 defmodule Vagus.Serial.CaptureTest do
   use ExUnit.Case, async: true
 
+  import ExUnit.CaptureLog
+
+  alias Vagus.DevicesFixtures
   alias Vagus.Serial.Capture
   alias Vagus.Test.FakeUART
 
@@ -16,22 +19,24 @@ defmodule Vagus.Serial.CaptureTest do
     File.mkdir_p!(proc)
     on_exit(fn -> File.rm_rf!(root) end)
     logs = Path.join(root, "serial")
+    # No USB devices, so labels default to the node's basename.
+    sysfs = Path.join(root, "sys")
 
     start = fn node, opts ->
-      Capture.start(
-        node,
-        [supervisor: sup, root: logs, proc_root: proc, uart_mod: FakeUART] ++ opts
-      )
+      defaults = [supervisor: sup, root: logs, proc_root: proc, sysfs_root: sysfs]
+      Capture.start(node, defaults |> Keyword.put(:uart_mod, FakeUART) |> Keyword.merge(opts))
     end
 
-    %{sup: sup, logs: logs, proc: proc, start: start}
+    %{sup: sup, logs: logs, proc: proc, root: root, start: start}
   end
 
   defp feed(pid, data) do
-    send(pid, {:circuits_uart, "/dev/ttyUSB0", data})
-    # A call after the send orders it: the worker has handled the data.
+    :ok = FakeUART.deliver(:sys.get_state(pid).uart, data)
+    # A call after the delivery orders it: the worker has handled the data.
     _ = :sys.get_state(pid)
   end
+
+  defp mode(path), do: Bitwise.band(File.stat!(path).mode, 0o777)
 
   defp lines(path), do: path |> File.read!() |> String.split("\n", trim: true)
 
@@ -155,19 +160,25 @@ defmodule Vagus.Serial.CaptureTest do
     assert {:ok, _} = start.("ttyUSB2", [])
   end
 
-  test "an unplug ends the capture and it is not restarted", %{start: start, sup: sup} do
-    {:ok, pid} = start.("ttyUSB0", [])
-    uart = :sys.get_state(pid).uart
-    ref = Process.monitor(pid)
-    uart_ref = Process.monitor(uart)
+  for reason <- [:eio, :ebadf, :enxio] do
+    test "an unplug (#{reason}) ends the capture and it is not restarted", %{
+      start: start,
+      sup: sup
+    } do
+      reason = unquote(reason)
+      {:ok, pid} = start.("ttyUSB0", [])
+      uart = :sys.get_state(pid).uart
+      ref = Process.monitor(pid)
+      uart_ref = Process.monitor(uart)
 
-    send(pid, {:circuits_uart, "/dev/ttyUSB0", {:error, :eio}})
+      FakeUART.deliver(uart, {:error, reason})
 
-    assert_receive {:DOWN, ^ref, _, _, {:shutdown, {:port_closed, :eio}}}
-    assert_receive {:DOWN, ^uart_ref, _, _, _}
-    assert %{active: 0, workers: 0} = DynamicSupervisor.count_children(sup)
-    assert Capture.status(sup) == []
-    assert {:ok, _} = start.("ttyUSB0", [])
+      assert_receive {:DOWN, ^ref, _, _, {:shutdown, {:port_closed, ^reason}}}
+      assert_receive {:DOWN, ^uart_ref, _, _, _}
+      assert %{active: 0, workers: 0} = DynamicSupervisor.count_children(sup)
+      assert Capture.status(sup) == []
+      assert {:ok, _} = start.("ttyUSB0", [])
+    end
   end
 
   test "an open failure leaves nothing behind", %{start: start, sup: sup} do
@@ -182,10 +193,114 @@ defmodule Vagus.Serial.CaptureTest do
       assert {:error, :invalid_label} = Capture.tail(bad, 1, root: logs)
     end
 
-    for bad <- ["/dev/../etc/passwd", "../ttyUSB0", "/dev/serial/by-id/x", "/dev/.."] do
+    for bad <- [
+          "/dev/../etc/passwd",
+          "../ttyUSB0",
+          "/dev/serial/by-id/x",
+          "/dev/..",
+          "/dev/pts/0",
+          "watchdog0",
+          "/dev/mmcblk0",
+          "tty",
+          "/dev/tty../x"
+        ] do
       assert {:error, :invalid_node} = start.(bad, name: "ok")
     end
 
     assert {:error, :enoent} = Capture.tail("never", 1, root: logs)
+  end
+
+  test "the label defaults to the owning device's stable id", %{
+    start: start,
+    root: root,
+    logs: logs
+  } do
+    ctx = DevicesFixtures.bench(%{sysfs_root: Path.join(root, "bench"), dev_root: "/dev"})
+
+    {:ok, pid} = start.("ttyUSB0", sysfs_root: ctx.sysfs_root, dev_root: "/dev")
+    assert :sys.get_state(pid).label == "usb-1-1.2"
+    assert File.exists?(Path.join(logs, "usb-1-1.2.log"))
+
+    {:ok, pid} = start.("ttyS0", sysfs_root: ctx.sysfs_root, dev_root: "/dev")
+    assert :sys.get_state(pid).label == "ttyS0"
+  end
+
+  test "logs are private to root", %{start: start, logs: logs} do
+    {:ok, pid} = start.("ttyUSB0", max_bytes: 40)
+    log = Path.join(logs, "ttyUSB0.log")
+    assert mode(logs) == 0o700
+    assert mode(log) == 0o600
+
+    feed(pid, "payload-1")
+    feed(pid, "payload-2")
+    assert File.exists?(log <> ".1")
+    assert mode(log) == 0o600
+    assert mode(log <> ".1") == 0o600
+  end
+
+  test "max_bytes is clamped to 64 MiB", %{start: start} do
+    {:ok, pid} = start.("ttyUSB0", max_bytes: 1024 * 1024 * 1024)
+    assert :sys.get_state(pid).max_bytes == 64 * 1024 * 1024
+  end
+
+  test "a failed rotation keeps the live log and warns once", %{start: start, logs: logs} do
+    {:ok, pid} = start.("ttyUSB0", max_bytes: 40)
+    log = Path.join(logs, "ttyUSB0.log")
+    # A non-empty directory in .1's place: rename fails, even as root.
+    File.mkdir_p!(Path.join(log <> ".1", "x"))
+
+    output =
+      capture_log(fn ->
+        for i <- 1..4, do: feed(pid, "payload-#{i}")
+      end)
+
+    assert Enum.map(lines(log), &split_ts/1) == for(i <- 1..4, do: "payload-#{i}")
+    assert length(Regex.scan(~r/rotation failed/, output)) == 1
+  end
+
+  test "write failures are counted and warned about once", %{start: start, sup: sup} do
+    {:ok, pid} = start.("ttyUSB0", [])
+    :sys.replace_state(pid, fn state -> File.close(state.io) && state end)
+
+    output =
+      capture_log(fn ->
+        for i <- 1..3, do: feed(pid, "lost-#{i}")
+      end)
+
+    assert [%{dropped: 3}] = Capture.status(sup)
+    assert length(Regex.scan(~r/write failed/, output)) == 1
+  end
+
+  test "tail reads the last lines of large files and spans the rotation", %{logs: logs} do
+    File.mkdir_p!(logs)
+    log = Path.join(logs, "big.log")
+    # Lines straddle the 64 KiB read chunks.
+    File.write!(log <> ".1", Enum.map(1..20_000, &"old #{&1}\n"))
+    File.write!(log, Enum.map(1..20_000, &"new #{&1}\n"))
+
+    assert {:ok, ["new 19999", "new 20000"]} = Capture.tail("big", 2, root: logs)
+
+    assert {:ok, tail} = Capture.tail("big", 20_002, root: logs)
+    assert Enum.take(tail, 3) == ["old 19999", "old 20000", "new 1"]
+    assert List.last(tail) == "new 20000"
+
+    File.rm!(log)
+    assert {:ok, ["old 20000"]} = Capture.tail("big", 1, root: logs)
+  end
+
+  test "an absent supervisor is an error, not a raise", %{start: start} do
+    assert {:error, :absent} = Capture.status(:no_such_capture)
+    assert {:error, :absent} = Capture.stop("ttyUSB0", :no_such_capture)
+    assert {:error, :absent} = start.("ttyUSB0", supervisor: :no_such_capture)
+  end
+
+  test "a worker outliving its supervisor's table stops cleanly", %{start: start} do
+    # Not restarted, so no new table of the same name can stand in for it.
+    sup = :"capture_#{System.unique_integer([:positive])}"
+    start_supervised!({Capture, name: sup}, id: :temporary_capture, restart: :temporary)
+    {:ok, pid} = start.("ttyUSB0", supervisor: sup)
+    ref = Process.monitor(pid)
+    Process.exit(Process.whereis(sup), :kill)
+    assert_receive {:DOWN, ^ref, _, _, :killed}, 2_000
   end
 end
