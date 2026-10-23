@@ -70,9 +70,10 @@ defmodule Vagus.BluetoothTest.Harness do
     end
   end
 
-  def app(slug, host_dbus, state, alive? \\ false),
+  def app(slug, host_dbus, state, alive? \\ false, busy \\ nil),
     do: %{
       alive?: alive?,
+      busy: busy,
       config: %Vagus.Addon.Config{
         slug: slug,
         name: slug,
@@ -325,7 +326,7 @@ defmodule Vagus.BluetoothTest do
       assert :ok = Task.await(stopper)
       refute File.exists?(socket)
 
-      assert :ok = Bluetooth.start(server: name)
+      assert :ok = Bluetooth.start(toggle_opts(name, tmp))
       assert_received :prepared
       assert File.exists?(socket)
     end
@@ -366,6 +367,18 @@ defmodule Vagus.BluetoothTest do
       assert {:error, {:in_use, ["probe_failed"]}} =
                Bluetooth.stop(toggle_opts(name, tmp, apps_fun: fn -> apps end))
 
+      assert Bluetooth.status(server: name) == :running
+    end
+
+    test "a host_dbus app mid-start blocks though it still reads stopped",
+         %{tmp_dir: tmp} = ctx do
+      name = start_tree(ctx)
+      apps = [app("starting", true, :stopped, false, :start), app("idle", true, :stopped)]
+
+      assert {:error, {:in_use, ["starting"]}} =
+               Bluetooth.stop(toggle_opts(name, tmp, apps_fun: fn -> apps end))
+
+      assert received() == []
       assert Bluetooth.status(server: name) == :running
     end
 
@@ -430,6 +443,31 @@ defmodule Vagus.BluetoothTest do
       assert :ok = Bluetooth.start(opts)
       assert received() == [:prepared | Enum.map(all_ids(), &{:started, &1})]
       assert Bluetooth.status(server: name) == :running
+    end
+
+    test "after a timed-out stop it starts nothing until the old daemon has exited",
+         %{tmp_dir: tmp} = ctx do
+      name = start_tree(ctx)
+      up = :atomics.new(1, [])
+      :atomics.put(up, 1, 1)
+
+      opts =
+        toggle_opts(name, tmp,
+          proc_alive_fun: fn _ -> true end,
+          live_daemons_fun: fn -> if :atomics.get(up, 1) == 1, do: [:dbus_daemon], else: [] end,
+          os_exit_timeout_ms: 100
+        )
+
+      assert {:error, {:still_running, _}} = Bluetooth.stop(opts)
+      _ = received()
+
+      assert {:error, {:still_running, :dbus_daemon}} = Bluetooth.start(opts)
+      assert received() == []
+      assert Bluetooth.status(server: name) == :stopped
+
+      :atomics.put(up, 1, 0)
+      assert :ok = Bluetooth.start(opts)
+      assert received() == [:prepared | Enum.map(all_ids(), &{:started, &1})]
     end
 
     test "is idempotent and leaves a running stack's runtime alone", %{tmp_dir: tmp} = ctx do

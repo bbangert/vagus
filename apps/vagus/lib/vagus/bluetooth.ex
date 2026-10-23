@@ -56,6 +56,9 @@ defmodule Vagus.Bluetooth do
   # container may well be up, so it blocks like a started one. Any other
   # state blocks only while the container still runs (`alive?`): an `:error`
   # app whose URL probe failed is not stopped when the watchdog cannot act.
+  # An operation in flight (`busy`) blocks whatever the state reads: the app
+  # process postpones engine events until it ends, so a start can already
+  # have its container up while the snapshot still says `:stopped`.
   @in_use_states [:startup, :started, :unknown]
 
   # Past muontrap's SIGTERM -> 500 ms -> SIGKILL -> reap sequence, so only a
@@ -159,8 +162,8 @@ defmodule Vagus.Bluetooth do
   `:ok` when already stopped, whatever apps run, once no daemon this VM
   started is left (a retry after `:still_running` waits again); otherwise
   `{:error, {:in_use, slugs}}` while an app other than the orchestrator
-  has `host_dbus: true` and is starting, started, unanswering, or in any
-  other state with its container still up — the orchestrator must stop those
+  has `host_dbus: true` and is starting, started, unanswering, mid-operation,
+  or in any other state with its container still up — the orchestrator must stop those
   (upstream's Matter Server and Terminal & SSH both set it) before taking
   Bluetooth. The orchestrator itself is exempt: its bind is a convenience,
   it does not need the host bluetoothd. The refusal is not mirrored on app
@@ -355,14 +358,26 @@ defmodule Vagus.Bluetooth do
   @doc """
   Starts the stack again in boot order, the Improv tail included. `:ok`
   when already running; `{:error, :busy}` while the supervisor is retrying
-  a failed restart of it or while a `stop/1` holds the transition.
+  a failed restart of it or while a `stop/1` holds the transition;
+  `{:error, {:still_running, id}}` while a daemon a timed-out `stop/1` left
+  behind has not exited, since its replacement would contend for the bus
+  and the adapter.
 
-  Opts: `:server`, `:lock_retries`.
+  Opts: `:server`, `:lock_retries`, and `stop/1`'s `:socket_path`,
+  `:live_daemons_fun`, `:os_exit_timeout_ms`.
   """
-  @spec start(keyword()) :: :ok | {:error, :absent | :busy | term()}
+  @spec start(keyword()) ::
+          :ok | {:error, :absent | :busy | {:still_running, atom()} | term()}
   def start(opts \\ []) do
     server = Keyword.get(opts, :server, __MODULE__)
-    transition(server, opts, fn -> restart(server) end)
+
+    transition(server, opts, fn ->
+      case stack(server) do
+        {:ok, :undefined} -> with :ok <- settle(opts), do: restart(server)
+        {:ok, _running_or_restarting} -> restart(server)
+        error -> error
+      end
+    end)
   end
 
   defp restart(server) do
@@ -404,7 +419,8 @@ defmodule Vagus.Bluetooth do
     with {:ok, apps} <- list_apps(apps_fun) do
       slugs =
         for %{config: %{slug: slug, host_dbus: true}, state: state} = app <- apps,
-            state in @in_use_states or Map.get(app, :alive?, false),
+            state in @in_use_states or Map.get(app, :alive?, false) or
+              Map.get(app, :busy) != nil,
             not Vagus.App.orchestrator?(slug),
             do: slug
 
