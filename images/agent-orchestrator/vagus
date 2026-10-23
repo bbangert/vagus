@@ -79,9 +79,12 @@ case System.fetch_env!("VAGUS_CMD") do
 end
 '
 
-# Distinct per call so concurrent invocations never collide on one node name.
+# `$$` keeps concurrent calls (one pid namespace) off each other's node name. Hidden so a
+# call never joins the board's Node.list(). Each call holds one port of 9106-9125 (the
+# board uses 9100-9105 in the same netns), so at most 20 run at once.
 VAGUS_NODE=$node VAGUS_CMD=$cmd VAGUS_EXPR=${1:-} exec elixir \
   --name "agent-$$@$host" \
   --cookie "$cookie" \
-  --erl "-kernel inet_dist_listen_min 9106 inet_dist_listen_max 9110" \
+  --hidden \
+  --erl "-kernel inet_dist_listen_min 9106 inet_dist_listen_max 9125" \
   -e "$script"

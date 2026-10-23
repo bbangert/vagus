@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# A worker gets its own config dir with only the login in it: the orchestrator's own
+# dir holds every session transcript (so every `vagus eval` result), and a live session
+# must not share its config dir with another CLI.
+set -euo pipefail
+: "${CLAUDE_CONFIG_DIR:?}"
+
+[ $# -eq 1 ] && [[ $1 =~ ^[A-Za-z0-9_.-]+$ ]] && [[ $1 != .* ]] \
+  || { echo "usage: worker-config <task>   (letters, digits, _ . -)" >&2; exit 64; }
+task=$1
+dir=/data/tasks/$task/claude
+creds=$CLAUDE_CONFIG_DIR/.credentials.json
+[ -r "$creds" ] || { echo "worker-config: no login at $creds" >&2; exit 1; }
+
+umask 077
+mkdir -p "$dir/projects"
+chmod 0700 "$dir"
+
+# Re-running refreshes only the login; the worker's own state is left alone.
+install -m 0600 "$creds" "$dir/.credentials.json"
+if [ ! -f "$dir/.claude.json" ]; then
+  jq -n '{hasCompletedOnboarding: true, remoteDialogSeen: true,
+          projects: {"/work": {hasTrustDialogAccepted: true}}}' > "$dir/.claude.json"
+fi
+
+# Ownership matters only when run as root (`podman exec` without `--user agent`).
+if [ "$(id -u)" = 0 ]; then
+  chown 1000:1000 /data/tasks "/data/tasks/$task"
+  chown -R 1000:1000 "$dir"
+fi
+
+echo "/data/addons/data/agent_orchestrator/tasks/$task/claude"

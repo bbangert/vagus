@@ -38,14 +38,24 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # The input goes through env, never into the script text. A dispatch must not
+      # overwrite `latest`, which only a tag push publishes.
       - name: Resolve version tag
         id: ver
+        env:
+          TAG: ${{ inputs.tag }}
         run: |
           if [ "$GITHUB_REF_TYPE" = tag ]; then
             echo "tag=${GITHUB_REF_NAME#images-v}" >> "$GITHUB_OUTPUT"
             echo "latest=true" >> "$GITHUB_OUTPUT"
           else
-            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+            TAG=${TAG#"${TAG%%[![:space:]]*}"}
+            TAG=${TAG%"${TAG##*[![:space:]]}"}
+            if [ -z "$TAG" ] || [ "$TAG" = latest ]; then
+              echo "::error::dispatch tag must be non-empty and not 'latest'"
+              exit 1
+            fi
+            echo "tag=$TAG" >> "$GITHUB_OUTPUT"
             echo "latest=false" >> "$GITHUB_OUTPUT"
           fi
 
@@ -60,7 +70,8 @@ jobs:
             type=sha,format=short
             type=raw,value=latest,enable=${{ steps.ver.outputs.latest == 'true' }}
 
-      - uses: docker/build-push-action@v6
+      - id: base_build
+        uses: docker/build-push-action@v6
         with:
           context: images/agent-base
           file: images/agent-base/Containerfile
@@ -82,15 +93,14 @@ jobs:
             type=sha,format=short
             type=raw,value=latest,enable=${{ steps.ver.outputs.latest == 'true' }}
 
-      # Pulls the base just pushed above, so the tag must be the version tag,
-      # not the sha one.
+      # By digest: exactly the base pushed above, never a tag re-resolved since.
       - uses: docker/build-push-action@v6
         with:
           context: images/agent-orchestrator
           file: images/agent-orchestrator/Containerfile
           platforms: linux/arm64
           push: true
-          build-args: BASE=${{ env.BASE_IMAGE }}:${{ steps.ver.outputs.tag }}
+          build-args: BASE=${{ env.BASE_IMAGE }}@${{ steps.base_build.outputs.digest }}
           tags: ${{ steps.orch_meta.outputs.tags }}
           labels: ${{ steps.orch_meta.outputs.labels }}
           cache-from: type=gha,scope=agent-orchestrator

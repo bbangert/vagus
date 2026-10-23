@@ -78,9 +78,12 @@ ENV DISABLE_UPDATES=1 DISABLE_AUTOUPDATER=1
 ENV PATH=/home/agent/.local/bin:$PATH
 
 # Guarded so a QEMU cross build, where the native binary may not execute, can skip it.
+# The output is `<version> (Claude Code)`; matching the version plus its space keeps
+# 2.1.2890 from passing for 2.1.289.
 RUN if [ "$VERIFY_CLAUDE" = 1 ]; then \
-      claude --version | grep -qF "$CLAUDE_VERSION" \
-        || { echo "claude version mismatch: wanted $CLAUDE_VERSION, got $(claude --version)" >&2; exit 1; }; \
+      v=$(claude --version); \
+      case "$v" in "$CLAUDE_VERSION "*) ;; \
+        *) echo "claude version mismatch: wanted $CLAUDE_VERSION, got $v" >&2; exit 1 ;; esac; \
     fi
 
 USER agent

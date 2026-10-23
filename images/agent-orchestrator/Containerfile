@@ -7,6 +7,7 @@ USER root
 COPY --chmod=0755 entrypoint.sh /usr/local/bin/entrypoint
 COPY --chmod=0755 claude-loop.sh /usr/local/bin/claude-loop
 COPY --chmod=0755 vagus /usr/local/bin/vagus
+COPY --chmod=0755 worker-config /usr/local/bin/worker-config
 COPY --chown=agent:agent CLAUDE.md /work/CLAUDE.md
 
 ENV CLAUDE_CONFIG_DIR=/data/claude \
