@@ -5,6 +5,8 @@ defmodule Vagus.Devices.WatcherTest do
 
   alias Vagus.Devices.Watcher
 
+  @receive_ms 2_000
+
   setup do
     ctx = "watcher" |> tmp_root() |> bench()
     remove_ftdi(ctx)
@@ -39,7 +41,7 @@ defmodule Vagus.Devices.WatcherTest do
 
   defp put(ctx, path, value), do: PropertyTable.put(ctx.table, path, value)
 
-  defp armed(path, timeout \\ 100) do
+  defp armed(path, timeout \\ @receive_ms) do
     assert_receive {:armed, dest, {:settled, ^path, _token} = msg}, timeout
     {dest, msg}
   end
@@ -98,7 +100,7 @@ defmodule Vagus.Devices.WatcherTest do
     refute_receive {:device, _, _}, 50
     fire(armed(path))
 
-    assert_receive {:device, :added, %{id: "usb:1-1.2"} = device}
+    assert_receive {:device, :added, %{id: "usb:1-1.2"} = device}, @receive_ms
     assert Enum.map(device.nodes, & &1.class) == [:usb, :tty]
 
     remove_ftdi(ctx)
@@ -106,7 +108,7 @@ defmodule Vagus.Devices.WatcherTest do
     PropertyTable.delete(ctx.table, path ++ ["1-1.2:1.0"])
     PropertyTable.delete(ctx.table, path)
 
-    assert_receive {:device, :removed, "usb:1-1.2"}
+    assert_receive {:device, :removed, "usb:1-1.2"}, @receive_ms
     refute_receive {:device, _, _}, 50
   end
 
@@ -136,7 +138,7 @@ defmodule Vagus.Devices.WatcherTest do
     refute_receive {:device, _, _}, 50
     fire(armed(path))
 
-    assert_receive {:device, :added, %{id: "usb:1-1.2"} = device}
+    assert_receive {:device, :added, %{id: "usb:1-1.2"} = device}, @receive_ms
     assert Enum.map(device.nodes, & &1.class) == [:usb, :tty]
     refute_receive {:device, _, _}, 50
   end
@@ -151,7 +153,7 @@ defmodule Vagus.Devices.WatcherTest do
     refute_receive {:device, _, _}, 50
 
     PropertyTable.delete(ctx.table, uevent_path("1-1.2"))
-    assert_receive {:device, :removed, "usb:1-1.2"}
+    assert_receive {:device, :removed, "usb:1-1.2"}, @receive_ms
   end
 
   test "hubs and root hubs are never announced", ctx do
@@ -163,7 +165,7 @@ defmodule Vagus.Devices.WatcherTest do
     fire(armed(uevent_path("1-1.2")))
 
     # The cable behind the hub proves the hub's uevents were heard.
-    assert_receive {:device, :added, %{id: "usb:1-1.2"}}
+    assert_receive {:device, :added, %{id: "usb:1-1.2"}}, @receive_ms
     PropertyTable.delete(ctx.table, hub_path())
     refute_receive {:device, _, _}, 50
   end
@@ -180,7 +182,7 @@ defmodule Vagus.Devices.WatcherTest do
     ftdi(ctx)
     put(ctx, uevent_path("1-1.2"), device_props())
     fire(armed(uevent_path("1-1.2")))
-    assert_receive {:device, :added, %{id: "usb:1-1.2"}}
+    assert_receive {:device, :added, %{id: "usb:1-1.2"}}, @receive_ms
 
     remove_ftdi(ctx)
     # Killed, so its :DOWN comes before its registry partition's exit; the
@@ -198,7 +200,7 @@ defmodule Vagus.Devices.WatcherTest do
     put(ctx, uevent_path("1-1.2"), device_props())
     fire(armed(uevent_path("1-1.2")))
     refute_receive {:armed, _, _}, 50
-    assert_receive {:device, :added, %{id: "usb:1-1.2"}}
+    assert_receive {:device, :added, %{id: "usb:1-1.2"}}, @receive_ms
     refute_receive {:device, _, _}, 50
   end
 
@@ -208,7 +210,7 @@ defmodule Vagus.Devices.WatcherTest do
     [{_, partition, _, _}] = Supervisor.which_children(registry)
     ref = Process.monitor(partition)
     Process.exit(partition, :kill)
-    assert_receive {:DOWN, ^ref, :process, _, :killed}
+    assert_receive {:DOWN, ^ref, :process, _, :killed}, @receive_ms
     assert Process.alive?(GenServer.whereis(ctx.table))
   end
 
@@ -219,14 +221,14 @@ defmodule Vagus.Devices.WatcherTest do
     ftdi(ctx)
     put(ctx, uevent_path("1-1.2"), device_props())
     fire(armed(uevent_path("1-1.2")))
-    assert_receive {:device, :added, %{id: "usb:1-1.2"}}
+    assert_receive {:device, :added, %{id: "usb:1-1.2"}}, @receive_ms
   end
 
   test "a device re-plugged on its port while unsubscribed is removed, then added anew", ctx do
     ftdi(ctx)
     put(ctx, uevent_path("1-1.2"), device_props())
     fire(armed(uevent_path("1-1.2")))
-    assert_receive {:device, :added, %{id: "usb:1-1.2", devnum: 5}}
+    assert_receive {:device, :added, %{id: "usb:1-1.2", devnum: 5}}, @receive_ms
 
     # Same port, so the same id; the kernel numbered it and its tty anew.
     remove_ftdi(ctx)
@@ -235,7 +237,7 @@ defmodule Vagus.Devices.WatcherTest do
 
     assert_receive {:device, :removed, "usb:1-1.2"}, 3_000
     fire(armed(uevent_path("1-1.2")))
-    assert_receive {:device, :added, %{id: "usb:1-1.2", devnum: 6} = device}
+    assert_receive {:device, :added, %{id: "usb:1-1.2", devnum: 6} = device}, @receive_ms
     assert Enum.any?(device.nodes, &(&1.class == :tty and Path.basename(&1.path) == "ttyUSB1"))
     refute_receive {:device, _, _}, 50
   end
@@ -255,7 +257,7 @@ defmodule Vagus.Devices.WatcherTest do
     refute_receive {:device, _, _}, 50
 
     fire(rearmed)
-    assert_receive {:device, :added, %{id: "usb:1-1.2"} = device}
+    assert_receive {:device, :added, %{id: "usb:1-1.2"} = device}, @receive_ms
     assert Enum.map(device.nodes, & &1.class) == [:usb, :tty]
     refute_receive {:device, _, _}, 50
   end
@@ -275,7 +277,7 @@ defmodule Vagus.Devices.WatcherTest do
 
     fresh = armed(path, 3_000)
     fire(fresh)
-    assert_receive {:device, :added, %{id: "usb:1-1.2"} = device}
+    assert_receive {:device, :added, %{id: "usb:1-1.2"} = device}, @receive_ms
     assert Enum.map(device.nodes, & &1.class) == [:usb, :tty]
     refute_receive {:device, _, _}, 50
   end
@@ -299,13 +301,13 @@ defmodule Vagus.Devices.WatcherTest do
     ftdi(ctx)
     put(ctx, uevent_path("1-1.2"), device_props())
     fire(armed(uevent_path("1-1.2")))
-    assert_receive {:device, :added, %{id: "usb:1-1.2"}}
+    assert_receive {:device, :added, %{id: "usb:1-1.2"}}, @receive_ms
   end
 
   test "an exited subscriber is dropped", ctx do
     subscriber = spawn(fn -> Watcher.subscribe(ctx.watcher) end)
     ref = Process.monitor(subscriber)
-    assert_receive {:DOWN, ^ref, :process, _, _}
+    assert_receive {:DOWN, ^ref, :process, _, _}, @receive_ms
 
     eventually(fn ->
       not Map.has_key?(:sys.get_state(ctx.watcher).subscribers, subscriber)

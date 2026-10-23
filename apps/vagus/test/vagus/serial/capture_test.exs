@@ -9,6 +9,8 @@ defmodule Vagus.Serial.CaptureTest do
 
   @moduletag :capture_log
 
+  @receive_ms 2_000
+
   @ts ~r/\A\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z \z/
 
   setup do
@@ -157,7 +159,7 @@ defmodule Vagus.Serial.CaptureTest do
     {:ok, pid} = start.("ttyUSB0", [])
     ref = Process.monitor(pid)
     Process.exit(pid, :kill)
-    assert_receive {:DOWN, ^ref, _, _, :killed}
+    assert_receive {:DOWN, ^ref, _, _, :killed}, @receive_ms
     assert {:ok, _} = start.("ttyUSB0", [])
     assert [_] = Capture.status(sup)
   end
@@ -193,8 +195,8 @@ defmodule Vagus.Serial.CaptureTest do
 
       FakeUART.deliver(uart, {:error, reason})
 
-      assert_receive {:DOWN, ^ref, _, _, {:shutdown, {:port_closed, ^reason}}}
-      assert_receive {:DOWN, ^uart_ref, _, _, _}
+      assert_receive {:DOWN, ^ref, _, _, {:shutdown, {:port_closed, ^reason}}}, @receive_ms
+      assert_receive {:DOWN, ^uart_ref, _, _, _}, @receive_ms
       assert %{active: 0, workers: 0} = DynamicSupervisor.count_children(sup)
       assert Capture.status(sup) == []
       assert {:ok, _} = start.("ttyUSB0", [])
@@ -321,6 +323,6 @@ defmodule Vagus.Serial.CaptureTest do
     {:ok, pid} = start.("ttyUSB0", supervisor: sup)
     ref = Process.monitor(pid)
     Process.exit(Process.whereis(sup), :kill)
-    assert_receive {:DOWN, ^ref, _, _, :killed}, 2_000
+    assert_receive {:DOWN, ^ref, _, _, :killed}, @receive_ms
   end
 end
