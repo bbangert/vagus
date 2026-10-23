@@ -27,6 +27,13 @@ defmodule Vagus.Application do
 
     children =
       [
+        # Durable log copy on /data (RingLogger is RAM-only). First, so the rest
+        # of boot is in the file and it stops last on shutdown. Nerves mounts
+        # /data before any application starts. `:ignore` unless
+        # `config :vagus, :durable_log` (target only) and whenever /data cannot
+        # be written — it never takes the tree down.
+        Vagus.Host.DurableLog,
+
         # Fire-and-forget and bounded work that must not be a bare spawn
         # (crash visibility): `Vagus.DNS`'s upstream relays.
         {Task.Supervisor, name: Vagus.TaskSupervisor},
@@ -62,6 +69,9 @@ defmodule Vagus.Application do
         {Task.Supervisor, name: Vagus.Jobs.TaskSupervisor, max_children: 8},
         Vagus.Backups,
         Vagus.Auth,
+
+        # Serial console captures of target boards; empty until Vagus.Serial.Capture.start/2.
+        Vagus.Serial.Capture,
 
         # Persisted POST /supervisor/options fields (timezone/country/
         # diagnostics, audit E5) that GET /supervisor/info and GET /info
@@ -237,7 +247,8 @@ defmodule Vagus.Application do
       ]
     end
   else
-    defp target_children, do: [bluetooth_child()]
+    # Target only: on host NervesUEvent runs too, and the watcher would announce the dev machine's devices.
+    defp target_children, do: [bluetooth_child(), Vagus.Devices.Watcher]
 
     defp bluetooth_child do
       # Bluetooth daemons (dbus-daemon --system + bluetoothd -E), the

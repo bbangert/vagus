@@ -329,6 +329,15 @@ defmodule Vagus.API.Router do
     Envelope.send_ok(conn, HardwareInfo.build!(Backend.Host.Hardware.info()))
   end
 
+  # Not an upstream route: the USB inventory (`Vagus.Devices`), with serials
+  # and the device nodes a container can be handed. Core-only, like every
+  # route Vagus adds rather than mirrors.
+  get "/hardware/devices" do
+    supervisor_only(conn, fn ->
+      Envelope.send_ok(conn, %{devices: Vagus.Devices.list()})
+    end)
+  end
+
   get "/network/info" do
     Envelope.send_ok(conn, NetworkInfo.build!(Backend.network().info()))
   end

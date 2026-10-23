@@ -206,6 +206,12 @@ config :vagus, :host_swap, true
 # and RingLogger is the only history a board keeps.
 config :vagus, :memory_monitor, true
 
+# Durable log (`Vagus.Host.DurableLog` — :ignore when unset, same target-only
+# convention). RingLogger lives in RAM, so a reboot erases the history of
+# whatever caused it; this keeps a small rotating copy on /data on every
+# flavor. The cap is small because rpi3_64 boards write it to an SD card.
+config :vagus, :durable_log, true
+
 # Real /os/update (build-order #4): GitHub-releases OTA firmware updates
 # (`Vagus.OS.Updater` — :ignore when unset, same target-only convention
 # as :core_watchdog/:first_boot_provision above; there is no

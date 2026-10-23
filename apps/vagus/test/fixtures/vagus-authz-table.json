@@ -10,6 +10,7 @@
     {"method": "GET", "route": "/host/info", "path": "/host/info", "requirement": "default", "predicates": {}, "upstream_tier": "default", "classification": "parity"},
     {"method": "GET", "route": "/host/disks/default/usage", "path": "/host/disks/default/usage", "requirement": "supervisor", "predicates": {}, "upstream_tier": "manager", "classification": "stricter", "reason": "Core-only since before the table existed; kept"},
     {"method": "GET", "route": "/hardware/info", "path": "/hardware/info", "requirement": "default", "predicates": {}, "upstream_tier": "default", "classification": "parity"},
+    {"method": "GET", "route": "/hardware/devices", "path": "/hardware/devices", "requirement": "supervisor", "predicates": {}, "upstream_tier": "manager", "classification": "stricter", "reason": "Vagus-only route exposing device serials and nodes; Core-only"},
     {"method": "GET", "route": "/network/info", "path": "/network/info", "requirement": "default", "predicates": {}, "upstream_tier": "default", "classification": "parity"},
     {"method": "GET", "route": "/network/interface/:ifname/info", "path": "/network/interface/eth0/info", "requirement": "default", "predicates": {}, "upstream_tier": "default", "classification": "parity"},
     {"method": "GET", "route": "/network/interface/:ifname/accesspoints", "path": "/network/interface/eth0/accesspoints", "requirement": "manager", "predicates": {}, "upstream_tier": "manager", "classification": "parity"},

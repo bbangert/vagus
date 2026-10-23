@@ -134,6 +134,11 @@ defmodule Vagus.MixProject do
       # declare :nerves. Same pattern as vagus_platform's own declaration.
       {:nerves, "~> 1.13", runtime: false},
 
+      # Vagus.Serial.Capture logs a target board's serial console to /data.
+      # Untargeted: its C port builds on :host, and the capture tests run
+      # there against a fake behind the `:uart_mod` seam.
+      {:circuits_uart, "~> 1.7"},
+
       # Its port binary runs every podman call (Vagus.Runtime.Podman.Cmd).
       {:muontrap, "~> 2.0"},
 

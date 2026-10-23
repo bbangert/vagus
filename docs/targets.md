@@ -12,6 +12,8 @@ replacements for it.
 
 Swap is configured at boot by `Vagus.Host.Swap` based on the root medium: `mmcblk*` roots get zram (sized at 50% of RAM with LZ4 compression and `vm.swappiness=150`/`vm.page-cluster=0`), while `sd*`/`nvme*`/`vd*` roots use `/data/swapfile` (33% of RAM, clamped to 1–4 GiB, with zswap and `vm.swappiness=10`). The kernel builds both backends on every target but activates neither by default, so a board running a vagus release without `Vagus.Host.Swap` has no swap at all. The swapfile counts toward `/host/disks/default/usage` (the same `df -k /data` figure as on HAOS), but never appears in add-on backups — they tar per-add-on data directories, not `/data` wholesale.
 
+Logs survive a reboot on every target and flavor: alongside the in-RAM RingLogger, `Vagus.Host.DurableLog` writes `info` and above to `/data/vagus/log/vagus.log`, one line per event (`2026-10-23T05:21:23.456Z [info] module=Vagus.Foo message`, kernel and syslog lines included). It rotates at 2 MB into at most five gzipped files (`vagus.log.0.gz` is the newest), so it never holds more than 12 MB even uncompressed; the cap is small because rpi3_64 boards write it to an SD card. To read it over ssh, run `Vagus.Host.DurableLog.tail(200)` for the last 200 lines of the current file; the rotated files are plain gzip. If `/data` cannot be written, the board logs one warning and runs without the file.
+
 All three are aarch64 on the same toolchain, so `arch` is `aarch64`
 everywhere and Core runs the generic `ghcr.io/home-assistant/home-assistant`
 image on all of them (no per-machine image).
