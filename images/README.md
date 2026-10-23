@@ -30,8 +30,8 @@ The match is by OTP release, not erts patch: hexpm's OTP 29.0.3 ships erts 17.0.
 ## Local test builds
 
 ```sh
-docker build --platform linux/arm64 -t agent-base images/agent-base   # needs QEMU/binfmt
-docker build --platform linux/arm64 --build-arg BASE=agent-base -t agent-orchestrator images/agent-orchestrator
+docker build --platform linux/arm64 -f images/agent-base/Containerfile -t agent-base images/agent-base   # needs QEMU/binfmt
+docker build --platform linux/arm64 -f images/agent-orchestrator/Containerfile --build-arg BASE=agent-base -t agent-orchestrator images/agent-orchestrator
 
 # directly on a board
 podman build --network=host --platform linux/arm64 -t agent-base images/agent-base
