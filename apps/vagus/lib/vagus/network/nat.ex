@@ -65,6 +65,15 @@ defmodule Vagus.Network.Nat do
   localhost published port do. It runs after conntrack (-200), which it
   reads, and before routing.
 
+  ## Lab interfaces
+
+  `Vagus.Network.Lab` routes a device wired to an extra NIC out through the
+  primary interface: per `{lab, primary}` pair the forward chain accepts
+  `lab -> primary` and its replies ahead of the drops, and a `postrouting`
+  chain masquerades it. The list lives in `:persistent_term` (`set_lab/2`)
+  so every later render, including the one `ensure_loaded/1` makes for a
+  bridged start, keeps the rules; an empty list renders the baseline table.
+
   The table is loaded with one `nft -f`, which the kernel applies as a single
   transaction, and the file starts by declaring and flushing the table, so a
   reload replaces the rules instead of adding to them: `ensure/1` is safe to
@@ -97,8 +106,12 @@ defmodule Vagus.Network.Nat do
   # nft -f is one netlink transaction and takes no lock, so it answers at once
   # or not at all.
   @nft_timeout_ms 10_000
+  @sigkill_delay_ms 1_000
+  @kill_budget_ms @sigkill_delay_ms + 1_000
 
   @loaded_key {__MODULE__, :loaded}
+  @lab_key {__MODULE__, :lab}
+  @lock_retries 8
 
   @doc "Whether DNAT management is switched on (`config :vagus, :supervisor_nat`)."
   @spec enabled?() :: boolean()
@@ -125,21 +138,89 @@ defmodule Vagus.Network.Nat do
       (default `/run/vagus`)
     * `:sysctl_root` — where the sysctl files are written (default
       `/proc/sys`)
-    * `:loaded_key` — the `:persistent_term` key recording a successful load
-      (tests)
+    * `:lab` — `{lab_ifname, primary_ifname}` pairs to forward and masquerade
+      (default: the list `set_lab/2` stored); a name failing `valid_ifname?/1`
+      is `{:error, :invalid_ifname}` and nothing is loaded
+
+  `{:error, :busy}` when another load holds the table past `:lock_retries`.
+
+  Test seams: `:loaded_key`, `:lab_key`.
   """
   @spec ensure(keyword()) :: :ok | {:error, term()}
   def ensure(opts \\ []) do
-    if Keyword.get(opts, :enabled, enabled?()) do
-      with {:ok, text} <- ruleset(opts),
-           :ok <- load_nft(text, opts),
-           :ok <- enable_forwarding(opts) do
-        :persistent_term.put(Keyword.get(opts, :loaded_key, @loaded_key), true)
-      end
-    else
-      :ok
+    if Keyword.get(opts, :enabled, enabled?()),
+      do: serialized(opts, fn -> load(opts) end),
+      else: :ok
+  end
+
+  @doc """
+  Loads the table with `lab` and, once it is in, stores the list every later
+  render uses. A failed load leaves the stored list as it was.
+  """
+  @spec set_lab([{String.t(), String.t()}], keyword()) :: :ok | {:error, term()}
+  def set_lab(lab, opts \\ []) when is_list(lab) do
+    key = Keyword.get(opts, :lab_key, @lab_key)
+
+    with :ok <- check_lab(lab) do
+      serialized(opts, fn ->
+        previous = :persistent_term.get(key, [])
+
+        case maybe_load(Keyword.put(opts, :lab, lab)) do
+          :ok ->
+            :persistent_term.put(key, lab)
+
+          {:error, _} = error ->
+            # A load that failed after nft (the sysctl step) leaves the new
+            # rules in the kernel: put the old list back there too so it
+            # matches the stored one. Best effort.
+            _ = maybe_load(Keyword.put(opts, :lab, previous))
+            error
+        end
+      end)
     end
   end
+
+  defp maybe_load(opts),
+    do: if(Keyword.get(opts, :enabled, enabled?()), do: load(opts), else: :ok)
+
+  defp load(opts) do
+    with {:ok, text} <- ruleset(opts),
+         :ok <- load_nft(text, opts),
+         :ok <- enable_forwarding(opts) do
+      :persistent_term.put(Keyword.get(opts, :loaded_key, @loaded_key), true)
+    end
+  end
+
+  # The table has three writers (the boot gate, a bridged start's
+  # ensure_loaded, Lab), and each renders the stored list before its load
+  # lands: unserialized, a render taken before another writer's commit loads
+  # after it and the kernel no longer matches the list. The retries' backoff
+  # (~16 s on average, 32 s at most for the default) outlasts one bounded
+  # nft run with its kill (12 s).
+  defp serialized(opts, fun) do
+    lock = {{__MODULE__, Keyword.get(opts, :lab_key, @lab_key)}, self()}
+
+    case :global.trans(lock, fun, [node()], Keyword.get(opts, :lock_retries, @lock_retries)) do
+      :aborted -> {:error, :busy}
+      result -> result
+    end
+  end
+
+  @spec lab(keyword()) :: [{String.t(), String.t()}]
+  def lab(opts \\ []),
+    do:
+      Keyword.get_lazy(opts, :lab, fn ->
+        :persistent_term.get(Keyword.get(opts, :lab_key, @lab_key), [])
+      end)
+
+  # Names are interpolated into the nft ruleset. 15 is IFNAMSIZ minus the
+  # NUL; the leading alphanumeric rules out "." and "..", which the kernel
+  # refuses as names.
+  @ifname ~r/\A[A-Za-z0-9][A-Za-z0-9_.-]{0,14}\z/
+
+  @spec valid_ifname?(term()) :: boolean()
+  def valid_ifname?(name) when is_binary(name), do: Regex.match?(@ifname, name)
+  def valid_ifname?(_), do: false
 
   @doc """
   `:ok` once `ensure/1` has succeeded in this VM, else `ensure/1` now. The
@@ -171,7 +252,10 @@ defmodule Vagus.Network.Nat do
   """
   @spec ruleset(keyword()) :: {:ok, String.t()} | {:error, term()}
   def ruleset(opts \\ []) do
-    with {:ok, ip} <- target_ip(opts),
+    lab = lab(opts)
+
+    with :ok <- check_lab(lab),
+         {:ok, ip} <- target_ip(opts),
          {:ok, port} <- target_port(opts) do
       rule = "ip daddr #{ip} tcp dport #{@contract_port} dnat to #{ip}:#{port}"
       bridge = Network.name()
@@ -191,16 +275,44 @@ defmodule Vagus.Network.Nat do
        \t}
        \tchain forward {
        \t\ttype filter hook forward priority #{@forward_priority}; policy accept;
-       \t\tiifname != "#{bridge}" oifname != "#{bridge}" drop
+       #{lab_forward(lab)}\t\tiifname != "#{bridge}" oifname != "#{bridge}" drop
        \t\toifname "#{bridge}" iifname != "#{bridge}" ct state new ct status & dnat == 0 drop
        \t}
        \tchain prerouting_filter {
        \t\ttype filter hook prerouting priority #{@prerouting_filter_priority}; policy accept;
        \t\tiifname "#{bridge}" ip daddr 127.0.0.0/8 ct status & dnat == 0 drop
        \t}
-       }
+       #{lab_postrouting(lab)}}
        """}
     end
+  end
+
+  defp check_lab(lab) do
+    valid? = fn
+      {lab_if, primary} -> valid_ifname?(lab_if) and valid_ifname?(primary)
+      _ -> false
+    end
+
+    if Enum.all?(lab, valid?), do: :ok, else: {:error, :invalid_ifname}
+  end
+
+  defp lab_forward(lab) do
+    Enum.map_join(lab, fn {lab_if, primary} ->
+      ~s(\t\tiifname "#{lab_if}" oifname "#{primary}" accept\n) <>
+        ~s(\t\tiifname "#{primary}" oifname "#{lab_if}" ct state established,related accept\n)
+    end)
+  end
+
+  defp lab_postrouting([]), do: ""
+
+  defp lab_postrouting(lab) do
+    rules =
+      Enum.map_join(lab, fn {lab_if, primary} ->
+        ~s(\t\tiifname "#{lab_if}" oifname "#{primary}" masquerade\n)
+      end)
+
+    "\tchain postrouting {\n\t\ttype nat hook postrouting priority srcnat; policy accept;\n" <>
+      rules <> "\t}\n"
   end
 
   ## sysctls
@@ -257,15 +369,41 @@ defmodule Vagus.Network.Nat do
     end
   end
 
-  # Bounded: a stuck call would hold the boot gate, and an abandoned nft
-  # still finishes or fails its one transaction alone.
+  # Under muontrap, so a timed-out nft is killed rather than left to commit
+  # its transaction after the caller has rolled back or released the table
+  # lock: closing a plain port only closes its pipes. The port closes without
+  # waiting for the child, so a timeout waits out the kill before answering.
+  # BoundedCall stays as the outer bound (MuonTrap's own timeout has been
+  # seen not to fire, see `Vagus.Dist`); killing its task closes the port,
+  # which kills the child too.
   @doc false
   @spec nft_cmd(String.t(), [String.t()], timeout()) :: {String.t(), non_neg_integer()}
   def nft_cmd(bin, args, timeout_ms \\ @nft_timeout_ms) do
-    case Vagus.BoundedCall.run(fn -> Vagus.Host.Cmd.run(bin, args) end, timeout_ms) do
-      {out, status} when is_binary(out) -> {out, status}
-      {:error, :attempt_timeout} -> {"#{bin}: no answer in #{timeout_ms} ms", 124}
-      {:error, {:exit, reason}} -> {"#{bin}: #{inspect(reason)}", 1}
+    fun = fn ->
+      MuonTrap.cmd(bin, args,
+        stderr_to_stdout: true,
+        timeout: timeout_ms,
+        delay_to_sigkill: @sigkill_delay_ms
+      )
+    end
+
+    case Vagus.BoundedCall.run(fun, timeout_ms + @kill_budget_ms) do
+      {out, status} when is_integer(status) ->
+        {out, status}
+
+      {_out, :timeout} ->
+        Process.sleep(@kill_budget_ms)
+        {"#{bin}: no answer in #{timeout_ms} ms", 124}
+
+      {:error, :attempt_timeout} ->
+        Process.sleep(@kill_budget_ms)
+        {"#{bin}: no answer in #{timeout_ms} ms", 124}
+
+      {:error, {:exit, {%ErlangError{original: reason}, _stack}}} ->
+        {"#{bin}: #{inspect(reason)}", 127}
+
+      {:error, {:exit, reason}} ->
+        {"#{bin}: #{inspect(reason)}", 1}
     end
   end
 

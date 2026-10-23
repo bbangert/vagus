@@ -142,6 +142,204 @@ defmodule Vagus.Network.NatTest do
     end
   end
 
+  describe "lab interfaces" do
+    test "forward accepts and masquerade, ahead of the drops, only while listed" do
+      {:ok, ruleset} =
+        Nat.ruleset(ip: "172.30.32.2", port: 8888, lab: [{"eth1", "eth0"}])
+
+      assert ruleset =~
+               """
+               \t\ttype filter hook forward priority filter; policy accept;
+               \t\tiifname "eth1" oifname "eth0" accept
+               \t\tiifname "eth0" oifname "eth1" ct state established,related accept
+               \t\tiifname != "hassio" oifname != "hassio" drop
+               """
+
+      assert String.ends_with?(ruleset, """
+             \tchain postrouting {
+             \t\ttype nat hook postrouting priority srcnat; policy accept;
+             \t\tiifname "eth1" oifname "eth0" masquerade
+             \t}
+             }
+             """)
+
+      assert Nat.ruleset(ip: "172.30.32.2", port: 8888, lab: []) == {:ok, @ruleset}
+    end
+
+    test "set_lab/2 stores the list for later renders once it is loaded", %{dir: dir} do
+      opts = lab_opts(dir, nft_fake({"", 0}))
+
+      assert Nat.set_lab([{"eth1", "eth0"}], opts) == :ok
+      assert_received {:nft, "nft", _, text}
+      assert text =~ "masquerade"
+      assert {:ok, later} = Nat.ruleset(opts)
+      assert later =~ "masquerade"
+    end
+
+    test "a refused load keeps the stored list and re-renders it", %{dir: dir} do
+      opts = lab_opts(dir, nft_fake({"", 0}))
+      :ok = Nat.set_lab([{"eth1", "eth0"}], opts)
+      assert_received {:nft, _, _, _}
+
+      capture_log(fn ->
+        assert {:error, _} = Nat.set_lab([], Keyword.put(opts, :cmd, nft_fake({"boom", 1})))
+      end)
+
+      assert [{:nft, _, _, new}, {:nft, _, _, old}] = receive_all()
+      refute new =~ "eth1"
+      assert old =~ ~s(iifname "eth1" oifname "eth0" masquerade)
+      assert Nat.lab(opts) == [{"eth1", "eth0"}]
+    end
+
+    test "nft loaded but the sysctl step failed: the old list goes back in", %{dir: dir} do
+      opts = lab_opts(dir, nft_fake({"", 0}))
+      no_sysctl = Keyword.put(opts, :sysctl_root, dir <> "-absent")
+
+      capture_log(fn ->
+        assert {:error, {:sysctl, _, _}} = Nat.set_lab([{"eth1", "eth0"}], no_sysctl)
+      end)
+
+      assert [{:nft, _, _, new}, {:nft, _, _, old}] = receive_all()
+      assert new =~ "eth1"
+      refute old =~ "eth1"
+      assert Nat.lab(opts) == []
+    end
+
+    test "every interface name is checked before it reaches the ruleset" do
+      for pair <- [{"..", "eth0"}, {".", "eth0"}, {"eth1", ~s(eth0" accept)}, {"eth1", ".."}],
+          do:
+            assert(
+              Nat.ruleset(ip: "172.30.32.2", port: 8888, lab: [pair]) ==
+                {:error, :invalid_ifname}
+            )
+
+      assert Nat.valid_ifname?("enx001122334455")
+      assert Nat.valid_ifname?("eth1.100")
+      refute Nat.valid_ifname?("a234567890123456")
+      refute Nat.valid_ifname?("-eth1")
+      refute Nat.valid_ifname?("")
+      refute Nat.valid_ifname?(:eth1)
+    end
+
+    test "writers are serialized: a boot-gate load waits out a set_lab and renders its list",
+         %{dir: dir} do
+      {cmd, release} = blocking_nft()
+      opts = lab_opts(dir, cmd)
+
+      setter = Task.async(fn -> Nat.set_lab([{"eth1", "eth0"}], opts) end)
+      assert_receive {:nft_blocked, first}
+      gate = Task.async(fn -> Nat.ensure(opts) end)
+      refute_receive {:nft_blocked, _}, 300
+
+      release.(first)
+      assert Task.await(setter) == :ok
+      assert_receive {:nft_blocked, second}, 5_000
+      release.(second)
+      assert Task.await(gate, 10_000) == :ok
+
+      second_text = nft_text(second)
+      assert second_text =~ ~s(iifname "eth1" oifname "eth0" masquerade)
+      assert Nat.ruleset(opts) == {:ok, second_text}
+    end
+
+    test "two concurrent set_lab calls leave the kernel holding the stored list",
+         %{dir: dir} do
+      {cmd, release} = blocking_nft()
+      opts = lab_opts(dir, cmd)
+
+      a = Task.async(fn -> Nat.set_lab([{"eth1", "eth0"}], opts) end)
+      assert_receive {:nft_blocked, first}
+      b = Task.async(fn -> Nat.set_lab([{"eth2", "eth0"}], opts) end)
+      refute_receive {:nft_blocked, _}, 300
+
+      release.(first)
+      assert_receive {:nft_blocked, second}, 5_000
+      release.(second)
+      assert Task.await(a) == :ok
+      assert Task.await(b, 10_000) == :ok
+
+      assert Nat.ruleset(opts) == {:ok, nft_text(second)}
+    end
+
+    test "a load that cannot take the table in time is :busy", %{dir: dir} do
+      {cmd, release} = blocking_nft()
+      opts = lab_opts(dir, cmd)
+
+      a = Task.async(fn -> Nat.set_lab([{"eth1", "eth0"}], opts) end)
+      assert_receive {:nft_blocked, first}
+      assert Nat.ensure(Keyword.put(opts, :lock_retries, 0)) == {:error, :busy}
+      assert Nat.set_lab([], Keyword.put(opts, :lock_retries, 0)) == {:error, :busy}
+
+      release.(first)
+      assert Task.await(a) == :ok
+      assert Nat.lab(opts) == [{"eth1", "eth0"}]
+    end
+
+    test "a timed-out load keeps the stored list, and rolls back only after it answered",
+         %{dir: dir} do
+      test = self()
+      calls = :counters.new(1, [])
+
+      cmd = fn _bin, ["-f", path] ->
+        :counters.add(calls, 1, 1)
+        text = File.read!(path)
+        send(test, {:start, text})
+        Process.sleep(50)
+        send(test, {:done, text})
+        if :counters.get(calls, 1) == 1, do: {"nft: no answer in 10000 ms", 124}, else: {"", 0}
+      end
+
+      opts = lab_opts(dir, cmd)
+
+      capture_log(fn ->
+        assert {:error, {_, _, 124}} = Nat.set_lab([{"eth1", "eth0"}], opts)
+      end)
+
+      assert [{:start, new}, {:done, new}, {:start, old}, {:done, old}] = receive_all()
+      assert new =~ "eth1"
+      refute old =~ "eth1"
+      assert Nat.lab(opts) == []
+    end
+
+    test "an invalid name loads nothing", %{dir: dir} do
+      opts = lab_opts(dir, nft_fake({"", 0}))
+      assert Nat.set_lab([{"..", "eth0"}], opts) == {:error, :invalid_ifname}
+      assert receive_all() == []
+      assert Nat.lab(opts) == []
+    end
+  end
+
+  # Each nft call parks with its ruleset text until the test releases it.
+  defp blocking_nft do
+    test = self()
+
+    cmd = fn _bin, ["-f", path] ->
+      ref = make_ref()
+      send(test, {:nft_blocked, {self(), ref, File.read!(path)}})
+
+      receive do
+        {:release, ^ref} -> {"", 0}
+      end
+    end
+
+    {cmd, fn {pid, ref, _text} -> send(pid, {:release, ref}) end}
+  end
+
+  defp nft_text({_pid, _ref, text}), do: text
+
+  defp lab_opts(dir, cmd) do
+    on_exit(fn -> :persistent_term.erase({__MODULE__, :lab, dir}) end)
+    opts(dir, cmd) ++ [lab_key: {__MODULE__, :lab, dir}]
+  end
+
+  defp receive_all(acc \\ []) do
+    receive do
+      msg -> receive_all([msg | acc])
+    after
+      0 -> Enum.reverse(acc)
+    end
+  end
+
   describe "forwarding sysctls" do
     test "ip_forward and the bridge's route_localnet are set once the table is loaded",
          %{dir: dir} do
@@ -188,6 +386,15 @@ defmodule Vagus.Network.NatTest do
     test "a command that does not answer in time is exit 124" do
       assert {msg, 124} = Nat.nft_cmd("sleep", ["2"], 50)
       assert msg =~ "no answer in 50 ms"
+    end
+
+    test "a timed-out command is killed before the answer, never left to finish", %{dir: dir} do
+      File.mkdir_p!(dir)
+      marker = Path.join(dir, "late")
+
+      assert {_msg, 124} = Nat.nft_cmd("sh", ["-c", "sleep 0.5; touch #{marker}"], 50)
+      Process.sleep(800)
+      refute File.exists?(marker)
     end
 
     test "a runner that crashes is exit 1, never a raise" do
