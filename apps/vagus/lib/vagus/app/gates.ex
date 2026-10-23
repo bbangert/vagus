@@ -10,12 +10,13 @@ defmodule Vagus.App.Gates do
   alias Vagus.Network
   alias Vagus.Network.Nat
 
-  @spec all() :: %{atom() => (-> :ok | {:error, term()})}
+  @spec all() :: %{atom() => (-> :ok | {:error, term()} | {:fatal, term()})}
   def all,
     do: %{
       tree: &tree/0,
       engine: &engine/0,
       network: &network/0,
+      dist: &dist/0,
       api: &api/0,
       primary: &primary/0
     }
@@ -69,6 +70,34 @@ defmodule Vagus.App.Gates do
     # attempt is hurried. An optimisation only: the `api` gate still decides.
     Vagus.API.Listener.retry_now()
     :ok
+  end
+
+  @doc """
+  Starts distribution and exports the session (`Vagus.Dist.enable/1`,
+  `Vagus.Dist.export/2`); the agent-dev-board flavor's only, where the
+  orchestrator app is useless without it. A claim in flight (`:starting`)
+  and a LAN lease not yet there (`:no_address`) are retried; any other
+  failure is `{:fatal, reason}` and halts the boot, since `Vagus.Dist` wants
+  a reboot rather than a retry after a failed bring-up.
+
+  Not read-only, unlike the others, yet killed past `gate_timeout` like
+  them: one killed mid bring-up keeps the claim, and every later try
+  answers `:starting` until the tries run out. `opts`: `:enable`, `:dir`
+  and `:gid` (tests).
+  """
+  @spec dist(keyword()) :: :ok | {:error, :starting | :no_address} | {:fatal, term()}
+  def dist(opts \\ []) do
+    enable = Keyword.get(opts, :enable, &Vagus.Dist.enable/0)
+
+    with {:ok, session} <- enable.(),
+         :ok <- Vagus.Dist.export(session, Keyword.take(opts, [:dir, :gid])) do
+      :ok
+    else
+      {:error, reason} when reason in [:starting, :no_address] -> {:error, reason}
+      {:error, reason} -> {:fatal, reason}
+    end
+  catch
+    kind, reason -> {:fatal, {kind, reason}}
   end
 
   @doc """

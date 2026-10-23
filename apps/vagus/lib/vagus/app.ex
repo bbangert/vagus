@@ -276,13 +276,19 @@ defmodule Vagus.App do
   it returns; `:error` when the slug is not installed, even with nothing to
   write. Every key is checked first: an unknown one raises `ArgumentError`.
   """
-  @spec set(String.t(), keyword()) :: :ok | :error
+  @spec set(String.t(), keyword()) :: :ok | :error | {:error, :protected}
   def set(slug, changes) when is_list(changes) do
     Enum.each(changes, fn {key, _value} ->
       unless key == :options or key in @settings,
         do: raise(ArgumentError, "unknown app setting #{inspect(key)}")
     end)
 
+    if Keyword.has_key?(changes, :boot) or Keyword.has_key?(changes, :watchdog),
+      do: unprotected(slug, fn -> do_set(slug, changes) end),
+      else: do_set(slug, changes)
+  end
+
+  defp do_set(slug, changes) do
     case ask_healing(slug, {:set, changes}) do
       {:ok, :ok} -> :ok
       _not_written -> :error
@@ -342,22 +348,53 @@ defmodule Vagus.App do
   def start(slug), do: slug |> command(:start, %{}) |> started(slug)
 
   @spec stop(String.t()) :: :ok | {:error, term()}
-  def stop(slug), do: command(slug, :stop, %{})
+  def stop(slug), do: unprotected(slug, fn -> command(slug, :stop, %{}) end)
 
   @spec restart(String.t()) :: {:ok, map()} | {:error, term()}
-  def restart(slug), do: slug |> command(:restart, %{}) |> started(slug)
+  def restart(slug),
+    do: unprotected(slug, fn -> slug |> command(:restart, %{}) |> started(slug) end)
 
   @spec uninstall(String.t()) :: :ok | {:error, term()}
-  def uninstall(slug), do: command(slug, :uninstall, %{})
+  def uninstall(slug), do: unprotected(slug, fn -> command(slug, :uninstall, %{}) end)
+
+  @doc """
+  The agent flavor's orchestrator app, which holds the board's agent login
+  and makes its workers. A request may not stop, restart or uninstall it,
+  nor change its `boot` or `watchdog`: from inside the board that is the
+  agent cutting off its own control. Shutdown halts it through units, not
+  through these.
+  """
+  @spec orchestrator?(String.t()) :: boolean()
+  def orchestrator?(slug) do
+    orchestrator = Application.get_env(:vagus, :orchestrator_app)
+    orchestrator != nil and slug == orchestrator
+  end
+
+  defp unprotected(slug, fun), do: if(orchestrator?(slug), do: {:error, :protected}, else: fun.())
 
   @doc """
   Pulls the image and records the app installed, wanted `:stopped` unless
   `wanted: :started` says boot should start it. An installed slug is refused
   by its process before any pull, as upstream does.
+
+  `settings:` are per-install settings committed with the install itself.
+  They skip `set/2`'s protection, which guards against requests and would
+  otherwise leave the orchestrator app with no way to get its boot and
+  watchdog; no request reaches this option.
   """
   @spec install(Config.t(), keyword()) :: :ok | {:error, :already_installed | term()}
   def install(%Config{slug: slug} = config, opts \\ []) do
-    args = %{config: config, wanted: Keyword.get(opts, :wanted, :stopped)}
+    settings = Keyword.get(opts, :settings, [])
+
+    Enum.each(settings, fn {key, _value} ->
+      unless key in @settings, do: raise(ArgumentError, "unknown app setting #{inspect(key)}")
+    end)
+
+    args = %{
+      config: config,
+      wanted: Keyword.get(opts, :wanted, :stopped),
+      settings: Map.new(settings)
+    }
 
     case Instances.ensure(slug) do
       {:ok, pid} -> call_op(pid, {:install, args})

@@ -769,12 +769,16 @@ defmodule Vagus.App.Policy do
   defp run_step({:commit, _}, %{run: %{op: :install, args: %{config: config}}} = data, effects) do
     token = data.ingress_token || Base.url_encode64(:crypto.strong_rand_bytes(32), padding: false)
 
-    data = %{
-      data
-      | config: config,
-        ingress_token: token,
-        wanted: data.run.args[:wanted] || :stopped
-    }
+    data =
+      Map.merge(
+        %{
+          data
+          | config: config,
+            ingress_token: token,
+            wanted: data.run.args[:wanted] || :stopped
+        },
+        Map.get(data.run.args, :settings, %{})
+      )
 
     token_key = Enum.filter(ingress_keys(data), &match?({:ingress_token, _}, &1))
     keys = if token_key == [], do: [], else: [{:keys, token_key, []}]

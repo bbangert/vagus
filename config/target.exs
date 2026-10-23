@@ -167,9 +167,10 @@ config :vagus, :legacy_addons_json, "/data/vagus/addons.json"
 
 # Boot starts apps and Core (`Vagus.App.Orchestrator`); off on :host/:test,
 # where there is no engine to wait on and no reboot to come back from. The
-# default native app is installed and started on its first boot, independent
-# of the container engine; afterwards it boots like any other app.
-config :vagus, Vagus.App.Orchestrator, boot: true, default_native_app: "core_mqtt"
+# default apps are installed and started on their first boot (a native one
+# independent of the container engine); afterwards each boots like any other
+# app. config/flavor.exs may replace the list.
+config :vagus, Vagus.App.Orchestrator, boot: true, default_apps: ["core_mqtt"]
 
 # Core watchdog pair (CW-P2-T2): API probe + crash-loop event half
 # (`Vagus.Core.Watchdog.Supervisor` returns :ignore when unset — same
@@ -311,7 +312,7 @@ config :vagus, :dns_upstream, "1.1.1.1"
 # and delegates the git-backed ones to the HTTP fetcher. The containerized
 # Mosquitto (`core_mosquitto`, from the official repo) stays in the catalog as a
 # reference but is never auto-installed (only `core_mqtt` is — see the
-# Orchestrator's `:default_native_app`); both can't own `:1883`/the mqtt service at once.
+# Orchestrator's `:default_apps`); both can't own `:1883`/the mqtt service at once.
 config :vagus, :store_fetcher, Vagus.Addon.Store.BuiltinFetcher
 
 # The default set mirrors upstream's `BuiltinRepository`

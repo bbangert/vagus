@@ -10,7 +10,8 @@ defmodule Vagus.Dist do
   > reasoning about what a half-finished attempt left behind.
 
   `enable/0` starts distribution and returns the node, cookie and port range.
-  Nothing is enabled until someone asks, and a reboot turns it back off — there
+  Nothing is enabled until someone asks (on the agent-dev-board flavor, boot
+  does: `Vagus.App.Gates.dist/1`), and a reboot turns it back off — there
   is no gate file, no config flag and no supervised process, so there is also no
   `disable/0` that has to stop a live node without stranding it under a secret
   it has already deleted.
@@ -51,6 +52,14 @@ defmodule Vagus.Dist do
   @port_max 9105
   @table :vagus_dist
   @session_key :session
+  # A plain directory on the `/run` tmpfs, like the rest of `/run/vagus`
+  # (`Vagus.Runtime.Host` only makes that one 0700; its own tmpfs is the logs
+  # subdirectory). Gone at reboot with the session it describes.
+  @export_dir "/run/vagus/dist"
+  # The orchestrator image runs `claude` and the `vagus` CLI as its `agent`
+  # user, gid 1000, and rootful podman maps ids 1:1: the group is what lets
+  # that user read the read-only bind.
+  @agent_gid 1000
 
   @type session :: %{node: node(), cookie: String.t(), ports: Range.t()}
 
@@ -63,9 +72,11 @@ defmodule Vagus.Dist do
   rather than racing it.
 
   Raises if bring-up fails, having stopped distribution first. Reboot rather
-  than retrying into a state nobody has reasoned about.
+  than retrying into a state nobody has reasoned about. The one exception is
+  `{:error, :no_address}`: it is known before anything starts, and at boot
+  the LAN lease can simply be late, so it is answered and the claim released.
   """
-  @spec enable(keyword()) :: {:ok, session()} | {:error, :starting | :node_gone}
+  @spec enable(keyword()) :: {:ok, session()} | {:error, :starting | :node_gone | :no_address}
   def enable(opts \\ []) do
     system = system(opts)
 
@@ -81,6 +92,52 @@ defmodule Vagus.Dist do
       # listener is gone would send an operator to a dead port.
       {:recorded, session} ->
         if system.alive_fun.(), do: {:ok, session}, else: {:error, :node_gone}
+    end
+  end
+
+  @doc """
+  Writes the session's node and cookie, and nothing else, to `node.json` in
+  `/run/vagus/dist` (`:dir`), for the agent-dev-board's orchestrator app,
+  which mounts that directory read-only and connects back.
+
+  The directory is 0750 and the file 0640, both root and group 1000 (`:gid`),
+  the image's `agent` user. The file's mode and group are set before the
+  cookie is written, then it is renamed into place, so a reader never sees a
+  partial file or one readable beyond that group. Nothing here logs: the
+  error carries only the reason.
+  """
+  @spec export(session(), keyword()) :: :ok | {:error, {:export, File.posix()}}
+  # sobelow_skip ["Traversal.FileModule"]
+  def export(%{node: node, cookie: cookie}, opts \\ []) do
+    dir = Keyword.get(opts, :dir, @export_dir)
+    gid = Keyword.get(opts, :gid, @agent_gid)
+    tmp = Path.join(dir, ".node.json.#{System.unique_integer([:positive])}")
+    json = Jason.encode!(%{node: Atom.to_string(node), cookie: cookie})
+
+    with :ok <- File.mkdir_p(dir),
+         :ok <- File.chmod(dir, 0o750),
+         :ok <- File.chgrp(dir, gid),
+         :ok <- write_private(tmp, json, gid),
+         :ok <- File.rename(tmp, Path.join(dir, "node.json")) do
+      :ok
+    else
+      {:error, reason} ->
+        File.rm(tmp)
+        {:error, {:export, reason}}
+    end
+  end
+
+  # `:exclusive` so nothing placed at the name beforehand is written through.
+  # sobelow_skip ["Traversal.FileModule"]
+  defp write_private(path, data, gid) do
+    with {:ok, io} <- File.open(path, [:write, :exclusive, :binary]) do
+      try do
+        with :ok <- File.chmod(path, 0o640),
+             :ok <- File.chgrp(path, gid),
+             do: IO.binwrite(io, data)
+      after
+        File.close(io)
+      end
     end
   end
 
@@ -140,6 +197,17 @@ defmodule Vagus.Dist do
     fun.()
   end
 
+  defp bring_up(system) do
+    case address(system) do
+      {:ok, address} ->
+        start(system, address)
+
+      {:error, :no_address} = error ->
+        system.session_reset_fun.()
+        error
+    end
+  end
+
   # Failures are caught HERE, in the calling process, rather than watched from
   # outside it. That is the whole reason this is simple: an earlier version
   # spawned a worker and a monitoring guard because an interactive IEx session
@@ -154,8 +222,7 @@ defmodule Vagus.Dist do
   # `random_cookie/3`'s LCG, because this target passes no `-setcookie`.
   # Everything else a failure leaves behind is cleared by the reboot the tester
   # does next.
-  defp bring_up(system) do
-    {:ok, address} = address(system)
+  defp start(system, address) do
     :ok = pin_ports(system)
     :ok = start_epmd(system)
     {:ok, start_node(system, node_name(address))}

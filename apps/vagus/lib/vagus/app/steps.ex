@@ -568,11 +568,15 @@ defmodule Vagus.App.Steps do
       name: container_name(config.slug),
       image: image_ref(config, arch),
       hostname: if(host?, do: nil, else: hostname(config.slug)),
-      env: %{
-        "TZ" => Keyword.get(opts, :tz, "UTC"),
-        "SUPERVISOR_TOKEN" => token,
-        "HASSIO_TOKEN" => token
-      },
+      env:
+        Map.merge(
+          %{
+            "TZ" => Keyword.get(opts, :tz, "UTC"),
+            "SUPERVISOR_TOKEN" => token,
+            "HASSIO_TOKEN" => token
+          },
+          orchestrator_env(config)
+        ),
       network: if(host?, do: :host, else: :hassio),
       network_name: Network.name(),
       extra_hosts: %{"supervisor" => Network.supervisor_ip(), "hassio" => Network.supervisor_ip()},
@@ -718,7 +722,8 @@ defmodule Vagus.App.Steps do
       |> Enum.map(&map_mount(&1, data_root, config.slug))
       |> Enum.reject(&is_nil/1)
 
-    [data_mount | mapped] ++ host_dbus_mount(config) ++ dsp_mount(config) ++ [dev_mount()]
+    [data_mount | mapped] ++
+      host_dbus_mount(config) ++ dist_mount(config) ++ dsp_mount(config) ++ [dev_mount()]
   end
 
   # `dsp: true` — two read-only binds, because reaching the Hexagon DSP needs
@@ -855,6 +860,35 @@ defmodule Vagus.App.Steps do
     ]
 
   defp host_dbus_mount(_config), do: []
+
+  # The orchestrator app reaches this node over raw dist, so it needs the
+  # node file `Vagus.Dist` mints on tmpfs each boot. The directory is bound so
+  # a file re-minted while the container runs is the one it reads, and the
+  # cookie stays out of env and `podman inspect`. `system: true` for the
+  # `/run/dbus` reason: an absent dir means dist never came up, and the
+  # engine's refusal of the missing source is the loud failure.
+  defp dist_mount(%Config{slug: slug}) do
+    if Vagus.App.orchestrator?(slug),
+      do: [
+        %{
+          source: "/run/vagus/dist",
+          target: "/run/vagus-dist",
+          read_only: true,
+          propagation: nil,
+          system: true
+        }
+      ],
+      else: []
+  end
+
+  defp orchestrator_env(%Config{slug: slug}) do
+    if Vagus.App.orchestrator?(slug),
+      do: %{
+        "CLAUDE_CONFIG_DIR" => "/data/claude",
+        "VAGUS_DIST_FILE" => "/run/vagus-dist/node.json"
+      },
+      else: %{}
+  end
 
   defp drop_superseded_maps(maps) do
     declared = MapSet.new(maps, & &1.type)

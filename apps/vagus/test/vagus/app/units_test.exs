@@ -3,7 +3,9 @@ defmodule Vagus.App.UnitsTest do
   use ExUnit.Case, async: false
 
   import ExUnit.CaptureLog
-  import Vagus.AppFixtures, only: [app_config: 2, install_app: 1, listening_api_port: 0]
+
+  import Vagus.AppFixtures,
+    only: [app_config: 2, app_info: 1, forget_app: 1, install_app: 1, listening_api_port: 0]
 
   alias Vagus.App.{Gates, Units}
   alias Vagus.Core.EventPusher
@@ -15,6 +17,7 @@ defmodule Vagus.App.UnitsTest do
     ensure: 1,
     in_flight?: 0,
     install_default: 1,
+    builtin_native?: 1,
     native?: 1,
     boot_start: 2,
     running: 0,
@@ -37,7 +40,15 @@ defmodule Vagus.App.UnitsTest do
       assert is_function(Map.fetch!(units, key), arity), "#{key}/#{arity}"
     end
 
-    assert Map.keys(units.gates) |> Enum.sort() == [:api, :engine, :network, :primary, :tree]
+    assert Map.keys(units.gates) |> Enum.sort() == [
+             :api,
+             :dist,
+             :engine,
+             :network,
+             :primary,
+             :tree
+           ]
+
     assert Enum.all?(Map.values(units.gates), &is_function(&1, 0))
   end
 
@@ -171,6 +182,107 @@ defmodule Vagus.App.UnitsTest do
     slug = "units_#{System.unique_integer([:positive])}"
     install_app(app_config(slug, %{}))
     assert Units.install_default(slug) == :present
+  end
+
+  describe "builtin default apps" do
+    test "the agent orchestrator parses as a host-network container app" do
+      assert {:ok, config} = Units.builtin_config("agent_orchestrator")
+
+      assert %{
+               slug: "agent_orchestrator",
+               name: "Agent orchestrator",
+               image: "ghcr.io/bbangert/vagus-agent-orchestrator",
+               version: "0.1.0",
+               backend: :container,
+               startup: "application",
+               boot: "auto",
+               init: false,
+               host_network: true,
+               host_dbus: true,
+               arch: ["aarch64"],
+               map: [%{type: "data", read_only: false}]
+             } = config
+
+      refute Units.builtin_native?("agent_orchestrator")
+    end
+
+    test "the broker is native under its installed slug, and anything else has no builtin" do
+      assert {:ok, %{slug: "core_mqtt", backend: :native}} = Units.builtin_config("core_mqtt")
+      assert Units.builtin_native?("core_mqtt")
+      assert Units.builtin_config("other") == {:error, :no_builtin}
+      refute Units.builtin_native?("other")
+    end
+  end
+
+  describe "installing the agent orchestrator" do
+    setup do
+      prev = Application.get_env(:vagus, :orchestrator_app)
+      prev_backend = Application.get_env(:vagus, :addon_backend)
+      Application.put_env(:vagus, :addon_backend, Vagus.Addon.Backend.Fake)
+      Application.put_env(:vagus, :orchestrator_app, "agent_orchestrator")
+
+      on_exit(fn ->
+        forget_app("agent_orchestrator")
+
+        for {key, value} <- [orchestrator_app: prev, addon_backend: prev_backend] do
+          if value,
+            do: Application.put_env(:vagus, key, value),
+            else: Application.delete_env(:vagus, key)
+        end
+      end)
+    end
+
+    test "records it booting and revived after a crash, which no request then changes" do
+      assert Units.install_default("agent_orchestrator") == :installed
+
+      assert {:ok, %{boot: "auto", watchdog: true, wanted: :started}} =
+               app_info("agent_orchestrator")
+
+      assert {:error, :protected} = Vagus.App.set("agent_orchestrator", watchdog: false)
+      assert {:error, :protected} = Vagus.App.set("agent_orchestrator", boot: "manual")
+      assert {:ok, %{boot: "auto", watchdog: true}} = app_info("agent_orchestrator")
+
+      {:ok, saved} = Vagus.App.File.read("agent_orchestrator")
+      data = Vagus.App.Policy.init_data("agent_orchestrator", saved)
+      assert Vagus.App.Policy.restart?(data, false)
+    end
+  end
+
+  describe "the dist gate" do
+    setup do
+      dir = Path.join(System.tmp_dir!(), "units_dist_#{System.unique_integer([:positive])}")
+      on_exit(fn -> File.rm_rf(dir) end)
+      {gid, 0} = System.cmd("id", ["-g"])
+      %{dir: dir, gid: String.to_integer(String.trim(gid))}
+    end
+
+    @session %{node: :"vagus@192.168.2.58", cookie: String.duplicate("ab", 32), ports: 9100..9105}
+
+    test "passes once the session is exported", %{dir: dir, gid: gid} do
+      assert Gates.dist(enable: fn -> {:ok, @session} end, dir: dir, gid: gid) == :ok
+      assert %{"cookie" => _} = dir |> Path.join("node.json") |> File.read!() |> Jason.decode!()
+    end
+
+    test "retries a claim in flight and a missing address", %{dir: dir} do
+      for reason <- [:starting, :no_address] do
+        assert Gates.dist(enable: fn -> {:error, reason} end, dir: dir) == {:error, reason}
+      end
+
+      refute File.exists?(dir)
+    end
+
+    test "any other failure, a raise or an unwritable export is fatal", %{dir: dir} do
+      assert Gates.dist(enable: fn -> {:error, :node_gone} end, dir: dir) ==
+               {:fatal, :node_gone}
+
+      assert {:fatal, {:error, %RuntimeError{}}} =
+               Gates.dist(enable: fn -> raise "bring-up failed" end, dir: dir)
+
+      File.write!(dir, "")
+
+      assert {:fatal, {:export, _reason}} =
+               Gates.dist(enable: fn -> {:ok, @session} end, dir: dir)
+    end
   end
 
   test "no default app is installed while a failed import left no apps directory" do

@@ -335,15 +335,20 @@ Orchestrator, and its restart simply boots again.
 **The boot plan** (`handle_continue(:boot, _)`), skipped if a shutdown is in
 flight:
 
-1. the default native app (`:default_native_app`) is installed if missing,
-   and on that fresh install recorded wanted `:started`;
+1. each native one of the default apps (`:default_apps`, a list, in order)
+   is installed if missing, and on that fresh install recorded wanted
+   `:started`. A container one is installed the same way after the last gate
+   (step 3), since its install pulls an image; it is also recorded with
+   `boot: "auto"` and `watchdog: true`;
 2. gate `tree` (the rest of the application is up), then the `native`
    stage: native apps need no engine, so an offline boot still brings the
    broker up;
 3. gates `engine`, `network` and `api` (`Vagus.App.Gates`): each check
    bounded by `gate_timeout` (10 s), retried every 5 s for 60 tries, then
    carried past with a warning. `api` exists because an app's s6 init asks
-   `/addons/self/info` first and a refused connection exits it for good;
+   `/addons/self/info` first and a refused connection exits it for good. In
+   the agent-dev-board flavor `dist` sits between `network` and `api`; a gate
+   answering `{:fatal, reason}` halts the boot there, logged;
 4. one engine listing of running app containers, taken right after the
    `engine` gate (`:unknown` if it fails) and carried through the stages;
 5. the stages `initialize`, `system`, `services`, `core`, `application`

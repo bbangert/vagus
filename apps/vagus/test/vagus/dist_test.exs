@@ -205,16 +205,23 @@ defmodule Vagus.DistTest do
     end
   end
 
+  describe "no usable address" do
+    # Nothing has started, so it is an answer rather than a raise: at boot the
+    # LAN lease can simply be late, and the gate retries.
+    test "is answered, before epmd or net_kernel, with the claim released", %{vm: vm} do
+      assert {:error, :no_address} = Dist.enable(system(vm, ifaddrs_fun: fn -> [] end))
+      assert steps(vm) == [:session_reset]
+      assert Agent.get(vm, & &1.session) == :not_requested
+
+      assert {:ok, %{node: :"vagus@192.168.2.58"}} = Dist.enable(system(vm))
+    end
+  end
+
   describe "every failure stops distribution and raises" do
     # Caught in the calling process, so it does not matter that IEx catches the
     # exception afterwards and keeps its evaluator alive — our catch runs first.
     defp fails_with(vm, overrides) do
       assert_raise MatchError, fn -> Dist.enable(system(vm, overrides)) end
-    end
-
-    test "no usable address", %{vm: vm} do
-      fails_with(vm, ifaddrs_fun: fn -> [] end)
-      refute Enum.any?(steps(vm), &match?({:epmd, _}, &1))
     end
 
     test "epmd will not start", %{vm: vm} do
@@ -238,7 +245,7 @@ defmodule Vagus.DistTest do
     end
 
     test "the claim is released, so a retry needs no reboot", %{vm: vm} do
-      fails_with(vm, ifaddrs_fun: fn -> [] end)
+      fails_with(vm, epmd_fun: fn _args, _env -> {"port 4369 in use", 1} end)
       assert Agent.get(vm, & &1.session) == :not_requested
 
       assert {:ok, %{node: :"vagus@192.168.2.58"}} = Dist.enable(system(vm))
@@ -372,6 +379,85 @@ defmodule Vagus.DistTest do
       {:ok, _} = Dist.enable(system(vm))
 
       refute Map.has_key?(Dist.status(system(vm)), :cookie)
+    end
+  end
+
+  describe "export/2" do
+    setup do
+      base = Path.join(System.tmp_dir!(), "dist_export_#{System.unique_integer([:positive])}")
+      on_exit(fn -> File.rm_rf(base) end)
+      # The test user cannot chgrp to the board's gid 1000 unless it is in it.
+      {gid, 0} = System.cmd("id", ["-g"])
+      %{dir: Path.join(base, "dist"), gid: String.to_integer(String.trim(gid))}
+    end
+
+    defp mode(path), do: Bitwise.band(File.stat!(path).mode, 0o777)
+
+    test "writes only the node and cookie, readable by the agent group", %{
+      vm: vm,
+      dir: dir,
+      gid: gid
+    } do
+      {:ok, session} = Dist.enable(system(vm))
+      assert Dist.export(session, dir: dir, gid: gid) == :ok
+
+      path = Path.join(dir, "node.json")
+
+      assert Jason.decode!(File.read!(path)) == %{
+               "node" => "vagus@192.168.2.58",
+               "cookie" => session.cookie
+             }
+
+      assert mode(dir) == 0o750
+      assert mode(path) == 0o640
+      assert File.stat!(dir).gid == gid
+      assert File.stat!(path).gid == gid
+    end
+
+    test "replaces an earlier file by rename, leaving nothing beside it", %{
+      vm: vm,
+      dir: dir,
+      gid: gid
+    } do
+      {:ok, session} = Dist.enable(system(vm))
+      File.mkdir_p!(dir)
+      File.write!(Path.join(dir, "node.json"), "stale")
+      File.chmod!(dir, 0o755)
+
+      assert Dist.export(session, dir: dir, gid: gid) == :ok
+      assert File.ls!(dir) == ["node.json"]
+      assert File.read!(Path.join(dir, "node.json")) =~ session.cookie
+      assert mode(dir) == 0o750
+    end
+
+    # The cookie is written only into a temp file that is renamed whole, so a
+    # rename that fails leaves what was there and no temp file beside it.
+    test "a failed rename leaves the earlier entry and no temp file", %{
+      vm: vm,
+      dir: dir,
+      gid: gid
+    } do
+      {:ok, session} = Dist.enable(system(vm))
+      File.mkdir_p!(Path.join([dir, "node.json", "held"]))
+
+      assert {:error, {:export, _reason}} = Dist.export(session, dir: dir, gid: gid)
+      assert File.ls!(dir) == ["node.json"]
+      assert File.ls!(Path.join(dir, "node.json")) == ["held"]
+    end
+
+    test "logs nothing that carries the cookie", %{vm: vm, dir: dir, gid: gid} do
+      {:ok, session} = Dist.enable(system(vm))
+
+      log =
+        ExUnit.CaptureLog.capture_log([level: :debug], fn ->
+          assert Dist.export(session, dir: dir, gid: gid) == :ok
+          File.write!(Path.join(dir, "blocker"), "")
+
+          assert {:error, {:export, _}} =
+                   Dist.export(session, dir: Path.join(dir, "blocker"), gid: gid)
+        end)
+
+      refute log =~ session.cookie
     end
   end
 

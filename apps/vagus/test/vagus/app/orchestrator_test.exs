@@ -27,6 +27,7 @@ defmodule Vagus.App.OrchestratorTest do
         slugs: fn -> Agent.get(apps, &Enum.map(&1, fn a -> a.config.slug end)) end,
         list: fn -> Agent.get(apps, & &1) end,
         install_default: fn _slug -> :present end,
+        builtin_native?: &(&1 == "core_mqtt"),
         native?: & &1.native,
         boot_start: fn slug, _running? -> report.(:boot_start, slug) end,
         running: fn -> {:ok, MapSet.new()} end,
@@ -38,7 +39,7 @@ defmodule Vagus.App.OrchestratorTest do
         core_start: fn _deadline -> send(test_pid, :core_start) && :ok end,
         core_stop: fn _deadline -> send(test_pid, :core_stop) && :ok end,
         stop_containers: fn _slugs, _budget -> {:ok, [], []} end,
-        gates: Map.new([:tree, :engine, :network, :api], &{&1, gate(test_pid, &1)}),
+        gates: Map.new([:tree, :engine, :network, :dist, :api], &{&1, gate(test_pid, &1)}),
         report: fn stage, outcomes -> send(test_pid, {:report, stage, outcomes}) end,
         push_complete: fn -> send(test_pid, :complete) end
       },
@@ -432,7 +433,7 @@ defmodule Vagus.App.OrchestratorTest do
     broker = app("core_mqtt", "services", native: true, state: :stopped)
 
     install = fn slug -> send(test_pid, {:install, slug}) && :installed end
-    start_orchestrator([broker], %{install_default: install}, default_native_app: "core_mqtt")
+    start_orchestrator([broker], %{install_default: install}, default_apps: ["core_mqtt"])
 
     messages = collect_until({:gate, :engine})
     assert [{:install, "core_mqtt"}, {:gate, :tree}, {:boot_start, "core_mqtt"} | _] = messages
@@ -442,7 +443,7 @@ defmodule Vagus.App.OrchestratorTest do
     test_pid = self()
     broker = app("core_mqtt", "services", native: true)
     install = fn slug -> send(test_pid, {:install, slug}) && :present end
-    start_orchestrator([broker], %{install_default: install}, default_native_app: "core_mqtt")
+    start_orchestrator([broker], %{install_default: install}, default_apps: ["core_mqtt"])
 
     messages = collect_until(:complete)
     assert {:install, "core_mqtt"} in messages
@@ -453,7 +454,7 @@ defmodule Vagus.App.OrchestratorTest do
     log =
       capture_log(fn ->
         start_orchestrator([], %{install_default: fn _slug -> {:error, :no_builtin} end},
-          default_native_app: "core_mqtt"
+          default_apps: ["core_mqtt"]
         )
 
         assert :complete in collect_until(:complete)
@@ -827,6 +828,7 @@ defmodule Vagus.App.OrchestratorTest do
                    {:report, :native, []},
                    {:gate, :engine},
                    {:gate, :network},
+                   {:gate, :dist},
                    {:gate, :api},
                    {:report, :initialize, []},
                    {:report, :system, []},
@@ -843,6 +845,79 @@ defmodule Vagus.App.OrchestratorTest do
       assert log =~ "Boot: Core stage skipped (agent-dev-board flavor)"
       refute_received :core_start
     end
+
+    test "the default flavor runs no dist gate" do
+      start_orchestrator([])
+      messages = collect_until(:complete)
+      assert {:gate, :api} in messages
+      refute {:gate, :dist} in messages
+    end
+
+    defp dist_gates(test_pid, dist),
+      do:
+        Map.new([:tree, :engine, :network, :api], &{&1, gate(test_pid, &1)})
+        |> Map.put(:dist, dist)
+
+    test "a dist claim still starting is retried, and api waits for it" do
+      test_pid = self()
+      counter = :counters.new(1, [])
+
+      dist = fn ->
+        :counters.add(counter, 1, 1)
+        send(test_pid, {:gate, :dist})
+        if :counters.get(counter, 1) < 3, do: {:error, :starting}, else: :ok
+      end
+
+      start_orchestrator([], %{agent?: fn -> true end, gates: dist_gates(test_pid, dist)})
+      messages = collect_until(:complete)
+
+      assert [{:gate, :network}, {:gate, :dist}, {:gate, :dist}, {:gate, :dist}, {:gate, :api}] =
+               Enum.filter(
+                 messages,
+                 &match?({:gate, name} when name in [:network, :dist, :api], &1)
+               )
+    end
+
+    test "a fatal dist failure halts the boot before api, loudly" do
+      test_pid = self()
+      dist = fn -> send(test_pid, {:gate, :dist}) && {:fatal, :node_gone} end
+
+      log =
+        capture_log([level: :error], fn ->
+          name =
+            start_orchestrator([app("a", "application")], %{
+              agent?: fn -> true end,
+              gates: dist_gates(test_pid, dist)
+            })
+
+          assert %{phase: :up, task: nil} = await_boot(name)
+        end)
+
+      messages = drain()
+      assert Enum.count(messages, &(&1 == {:gate, :dist})) == 1
+      refute {:gate, :api} in messages
+      refute {:boot_start, "a"} in messages
+      refute :complete in messages
+      assert log =~ "Boot: gate dist failed (:node_gone); boot halted"
+    end
+  end
+
+  test "default apps install once each in order: native before the tree gate, container after the gates" do
+    test_pid = self()
+    install = fn slug -> send(test_pid, {:install, slug}) && :installed end
+
+    start_orchestrator([], %{install_default: install},
+      default_apps: ["core_mqtt", "agent_orchestrator"]
+    )
+
+    messages = collect_until(:complete)
+    installs = for {:install, slug} <- messages, do: slug
+    assert installs == ["core_mqtt", "agent_orchestrator"]
+
+    assert [{:install, "core_mqtt"}, {:gate, :tree} | _] = messages
+
+    assert Enum.find_index(messages, &(&1 == {:install, "agent_orchestrator"})) ==
+             Enum.find_index(messages, &(&1 == {:gate, :api})) + 1
   end
 
   test "a failed or hung app stop is counted, and does not hold the rest back" do
@@ -871,9 +946,7 @@ defmodule Vagus.App.OrchestratorTest do
     broker = app("core_mqtt", "services", native: true)
     overrides = %{sweep: sweep, ensure: ensure, install_default: install}
 
-    start_orchestrator([broker, app("a", "initialize")], overrides,
-      default_native_app: "core_mqtt"
-    )
+    start_orchestrator([broker, app("a", "initialize")], overrides, default_apps: ["core_mqtt"])
 
     assert [:sweep, {:ensure, "core_mqtt"}, {:ensure, "a"}, {:install, "core_mqtt"} | rest] =
              collect_until(:complete)

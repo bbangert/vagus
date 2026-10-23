@@ -12,12 +12,18 @@ defmodule Vagus.App.Orchestrator do
 
   Boot:
 
-    1. the default native app is installed if missing, and on that fresh
-       install recorded as wanted started;
+    1. each native one of `default_apps` is installed if missing, in order,
+       and on that fresh install recorded as wanted started; a container one
+       is installed the same way once the gates are behind, since its install
+       pulls an image;
     2. the `tree` gate, then native apps get their boot rule: they need no
        engine, so an offline boot still brings the broker up;
     3. the `engine`, `network` and `api` gates (`Vagus.App.Gates`), each
-       retried until it passes or its tries run out, then carried past;
+       retried until it passes or its tries run out, then carried past; in
+       the agent-dev-board flavor `dist` sits between `network` (its node
+       name carries the LAN address) and `api`, so the orchestrator app finds
+       the session exported when its stage comes. A gate answering
+       `{:fatal, reason}` halts the boot there, logged;
     4. the stages, each awaited up to its budget, then carried past:
 
        | config `startup`      | stage         |
@@ -87,15 +93,30 @@ defmodule Vagus.App.Orchestrator do
     "once" => :application
   }
 
-  @plan [gate: :tree, stage: :native, gate: :engine, gate: :network, gate: :api] ++
-          for(
-            stage <- [:initialize, :system, :services, :core, :application],
-            do: {:stage, stage}
-          )
+  @stages for stage <- [:initialize, :system, :services, :core, :application],
+              do: {:stage, stage}
+
+  @plan [
+          gate: :tree,
+          stage: :native,
+          gate: :engine,
+          gate: :network,
+          gate: :api,
+          install: :container
+        ] ++ @stages
+  @agent_plan [
+                gate: :tree,
+                stage: :native,
+                gate: :engine,
+                gate: :network,
+                gate: :dist,
+                gate: :api,
+                install: :container
+              ] ++ @stages
 
   @defaults [
     boot: false,
-    default_native_app: nil,
+    default_apps: [],
     gate_tries: 60,
     gate_interval: 5_000,
     tree_interval: 250,
@@ -253,10 +274,14 @@ defmodule Vagus.App.Orchestrator do
   end
 
   defp run_boot(cfg) do
-    if slug = cfg.default_native_app, do: install_default(slug, cfg.units)
+    cfg.default_apps
+    |> Enum.filter(cfg.units.builtin_native?)
+    |> Enum.each(&install_default(&1, cfg.units))
+
+    plan = if cfg.units.agent?.(), do: @agent_plan, else: @plan
 
     {running, put_off} =
-      Enum.reduce(@plan, {:unknown, :undecided}, fn step, {running, put_off} ->
+      Enum.reduce(plan, {:unknown, :undecided}, fn step, {running, put_off} ->
         checkpoint(0)
         put_off = decide(step, put_off, cfg)
 
@@ -269,6 +294,7 @@ defmodule Vagus.App.Orchestrator do
     cfg.units.push_complete.()
   catch
     :cancelled -> :cancelled
+    :halted -> :halted
   end
 
   @app_stages [:initialize, :system, :services, :application]
@@ -350,6 +376,14 @@ defmodule Vagus.App.Orchestrator do
     if name == :engine, do: listing(cfg), else: running
   end
 
+  defp step({:install, :container}, running, cfg) do
+    cfg.default_apps
+    |> Enum.reject(cfg.units.builtin_native?)
+    |> Enum.each(&install_default(&1, cfg.units))
+
+    running
+  end
+
   # Not gated on whether a Core is installed: a board converted to the
   # agent-dev-board flavor keeps the Core it had, and must not start it at
   # boot. The Core HTTP routes are unguarded, so a deliberate call can still
@@ -401,6 +435,10 @@ defmodule Vagus.App.Orchestrator do
     case run_bounded(check, cfg.gate_timeout) do
       :ok ->
         Logger.info("Boot: gate #{name} passed")
+
+      {:fatal, reason} ->
+        Logger.error("Boot: gate #{name} failed (#{inspect(reason)}); boot halted")
+        throw(:halted)
 
       failure when tries >= cfg.gate_tries ->
         Logger.warning(

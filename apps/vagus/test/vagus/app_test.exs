@@ -64,6 +64,68 @@ defmodule Vagus.AppTest do
     end
   end
 
+  describe "the orchestrator app" do
+    setup do
+      prev = Application.get_env(:vagus, :orchestrator_app)
+      prev_backend = Application.get_env(:vagus, :addon_backend)
+      prev_root = Application.get_env(:vagus, :addon_data_root)
+      root = Path.join(System.tmp_dir!(), "app-test-#{System.unique_integer([:positive])}")
+      Application.put_env(:vagus, :addon_backend, Backend.Fake)
+      Application.put_env(:vagus, :addon_data_root, root)
+
+      on_exit(fn ->
+        for {key, value} <- [
+              orchestrator_app: prev,
+              addon_backend: prev_backend,
+              addon_data_root: prev_root
+            ] do
+          if value,
+            do: Application.put_env(:vagus, key, value),
+            else: Application.delete_env(:vagus, key)
+        end
+
+        File.rm_rf(root)
+      end)
+
+      slug = track(config(), state: :started)
+      Application.put_env(:vagus, :orchestrator_app, slug)
+      %{slug: slug}
+    end
+
+    test "is not stopped, restarted or uninstalled", %{slug: slug} do
+      assert {:error, :protected} = App.stop(slug)
+      assert {:error, :protected} = App.restart(slug)
+      assert {:error, :protected} = App.uninstall(slug)
+      assert {:ok, %{state: :started}} = app_info(slug)
+    end
+
+    test "keeps its boot and watchdog, and takes its other settings", %{slug: slug} do
+      assert {:error, :protected} = App.set(slug, boot: "manual")
+      assert {:error, :protected} = App.set(slug, options: %{"a" => 1}, watchdog: true)
+      assert {:ok, %{boot: nil, watchdog: false, user_options: %{}}} = app_info(slug)
+
+      assert :ok = App.set(slug, options: %{"a" => 1}, auto_update: true)
+      assert {:ok, %{user_options: %{"a" => 1}, auto_update: true}} = app_info(slug)
+    end
+
+    test "another app is not protected", %{slug: slug} do
+      other = track(config(), state: :started)
+      assert App.orchestrator?(slug)
+      refute App.orchestrator?(other)
+      assert :ok = App.set(other, boot: "manual", watchdog: true)
+      assert :ok = App.stop(other)
+    end
+
+    test "nothing is protected with the key unset", %{slug: slug} do
+      Application.put_env(:vagus, :orchestrator_app, nil)
+      refute App.orchestrator?(slug)
+      assert :ok = App.set(slug, boot: "manual", watchdog: true)
+      assert {:ok, _} = App.restart(slug)
+      assert :ok = App.stop(slug)
+      assert :ok = App.uninstall(slug)
+    end
+  end
+
   describe "identity_for_token/1" do
     setup do
       config = config()

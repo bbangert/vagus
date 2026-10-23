@@ -230,6 +230,48 @@ defmodule Vagus.App.StepsTest do
       assert Enum.any?(dbus_spec.mounts, &(&1.target == "/data"))
     end
 
+    test "the orchestrator app gets the node file dir and its env; no other app does" do
+      prev = Application.get_env(:vagus, :orchestrator_app)
+
+      on_exit(fn ->
+        if prev,
+          do: Application.put_env(:vagus, :orchestrator_app, prev),
+          else: Application.delete_env(:vagus, :orchestrator_app)
+      end)
+
+      spec = fn slug ->
+        {:ok, config} = Config.parse(%{mosquitto_raw() | "slug" => slug})
+        Steps.build_spec(config, access_token: "t", arch: "amd64")
+      end
+
+      dist_env = %{
+        "CLAUDE_CONFIG_DIR" => "/data/claude",
+        "VAGUS_DIST_FILE" => "/run/vagus-dist/node.json"
+      }
+
+      Application.put_env(:vagus, :orchestrator_app, "agent_orchestrator")
+      orchestrator = spec.("agent_orchestrator")
+
+      # `system: true`: a missing /run/vagus/dist fails the create rather than
+      # binding an empty dir.
+      assert %{source: "/run/vagus/dist", read_only: true, propagation: nil, system: true} =
+               Enum.find(orchestrator.mounts, &(&1.target == "/run/vagus-dist"))
+
+      assert Map.take(orchestrator.env, Map.keys(dist_env)) == dist_env
+      assert orchestrator.env["SUPERVISOR_TOKEN"] == "t"
+
+      for slug <- ["core_mosquitto", "agent_orchestrator_2"] do
+        other = spec.(slug)
+        refute Enum.any?(other.mounts, &(&1.target == "/run/vagus-dist"))
+        assert Map.take(other.env, Map.keys(dist_env)) == %{}
+      end
+
+      Application.put_env(:vagus, :orchestrator_app, nil)
+      unset = spec.("agent_orchestrator")
+      refute Enum.any?(unset.mounts, &(&1.target == "/run/vagus-dist"))
+      assert Map.take(unset.env, Map.keys(dist_env)) == %{}
+    end
+
     test "host_network add-on: NetworkMode host, no ports/hostname", %{} do
       {:ok, hostcfg} =
         Config.parse(%{
