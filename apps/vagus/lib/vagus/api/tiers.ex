@@ -230,6 +230,7 @@ defmodule Vagus.API.Tiers do
     # than left to fall through because the family rules below would otherwise
     # widen them to `:manager`.
     {["os", "datadisk", "list"], :supervisor},
+    {["hardware", "devices"], :supervisor},
     {["host", "disks", "default", "usage"], :supervisor},
     {["store", "addons", :_, "changelog"], :supervisor},
     {["store", "addons", :_, "documentation"], :supervisor},

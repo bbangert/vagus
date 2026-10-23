@@ -43,6 +43,8 @@ defmodule Vagus.Backend.Host.Hardware do
        from the same dialog.
   """
 
+  alias Vagus.Sysfs
+
   @doc """
   Builds the `/hardware/info` data map.
 
@@ -63,11 +65,13 @@ defmodule Vagus.Backend.Host.Hardware do
   end
 
   defp devices(sys_class, dev_root) do
-    for subsystem <- ls(sys_class),
-        name <- ls(Path.join(sys_class, subsystem)) do
+    for subsystem <- Sysfs.ls(sys_class),
+        name <- Sysfs.ls(Path.join(sys_class, subsystem)) do
       entry = Path.join([sys_class, subsystem, name])
-      sysfs = canonical_sysfs(entry)
-      attributes = read_uevent(sysfs)
+      sysfs = Sysfs.canonical(entry)
+      # DEVNAME here is what makes dev_path honest for nested nodes (e.g.
+      # "input/event0").
+      attributes = Sysfs.uevent(sysfs)
 
       %{
         name: name,
@@ -90,48 +94,6 @@ defmodule Vagus.Backend.Host.Hardware do
 
   defp keep_device?(%{sysfs: sysfs}),
     do: not Regex.match?(@hide_virtual_sysfs, sysfs)
-
-  defp ls(path) do
-    case File.ls(path) do
-      {:ok, entries} -> Enum.sort(entries)
-      {:error, _reason} -> []
-    end
-  end
-
-  # /sys/class entries are symlinks into /sys/devices — resolve to the
-  # canonical path like udev's device.sys_path. A non-symlink (or
-  # unreadable) entry keeps its literal path.
-  defp canonical_sysfs(entry) do
-    case File.read_link(entry) do
-      {:ok, target} -> Path.expand(target, Path.dirname(entry))
-      {:error, _reason} -> entry
-    end
-  end
-
-  # The kernel's own udev-property subset. DEVNAME here is what makes
-  # dev_path honest for nested nodes (e.g. "input/event0").
-  #
-  # `sysfs` is built from /sys/class directory enumeration + symlink
-  # resolution — never request input — so no user-controlled traversal
-  # is possible.
-  # sobelow_skip ["Traversal.FileModule"]
-  defp read_uevent(sysfs) do
-    case File.read(Path.join(sysfs, "uevent")) do
-      {:ok, contents} ->
-        contents
-        |> String.split("\n", trim: true)
-        |> Enum.flat_map(fn line ->
-          case String.split(line, "=", parts: 2) do
-            [key, value] -> [{key, value}]
-            _other -> []
-          end
-        end)
-        |> Map.new()
-
-      {:error, _reason} ->
-        %{}
-    end
-  end
 
   defp dev_path(%{"DEVNAME" => devname}, _name, dev_root),
     do: Path.join(dev_root, devname)

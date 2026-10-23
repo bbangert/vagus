@@ -27,7 +27,10 @@ Mox.stub_with(Vagus.Backend.OSMock, Vagus.Backend.OS.HostStub)
 #
 # `:known_failing` tests pin the intended behaviour of defects the per-app
 # lifecycle fixes; run them with `mix test --include known_failing`.
-ExUnit.start(exclude: [:podman, :block_device, :known_failing])
+#
+# `:pty` runs serial capture against a socat pty pair; opt-in via
+# `mix test --include pty`, skipped when socat is not on PATH.
+ExUnit.start(exclude: [:podman, :block_device, :known_failing, :pty])
 
 # Read by test/support/podman_docker_exec.sh, which gives each run its own
 # podman store: two suites at once would otherwise share container names.
