@@ -37,7 +37,8 @@ defmodule Vagus.BluetoothTest.Harness do
 
   def stack_name(name), do: Module.concat(name, "Stack")
 
-  def start_tree(ctx, ids \\ all_ids()) do
+  # `on_prepare` runs inside the Stack's init, before `:prepared` is sent.
+  def start_tree(ctx, ids \\ all_ids(), on_prepare \\ fn -> :ok end) do
     name = Module.concat([ctx.module, "Sup#{System.unique_integer([:positive])}"])
     test = self()
 
@@ -46,7 +47,10 @@ defmodule Vagus.BluetoothTest.Harness do
        name: name,
        dbus_daemon_path: __ENV__.file,
        bluetoothd_path: __ENV__.file,
-       prepare_runtime: fn -> send(test, :prepared) end,
+       prepare_runtime: fn ->
+         on_prepare.()
+         send(test, :prepared)
+       end,
        children: Enum.map(ids, &%{id: &1, start: {Recorder, :start_link, [{&1, test}]}})}
     )
 
@@ -66,8 +70,9 @@ defmodule Vagus.BluetoothTest.Harness do
     end
   end
 
-  def app(slug, host_dbus, state),
+  def app(slug, host_dbus, state, alive? \\ false),
     do: %{
+      alive?: alive?,
       config: %Vagus.Addon.Config{
         slug: slug,
         name: slug,
@@ -85,7 +90,8 @@ defmodule Vagus.BluetoothTest.Harness do
         server: name,
         socket_path: Path.join(tmp, "system_bus_socket"),
         apps_fun: fn -> [] end,
-        proc_alive_fun: fn _os_pid -> false end
+        proc_alive_fun: fn _os_pid -> false end,
+        live_daemons_fun: fn -> [] end
       ],
       overrides
     )
@@ -229,6 +235,101 @@ defmodule Vagus.BluetoothTest do
       assert File.exists?(opts[:socket_path])
     end
 
+    test "a retry after a timed-out wait still waits, and drops the socket only once the daemon is gone",
+         %{tmp_dir: tmp} = ctx do
+      name = start_tree(ctx)
+      up = :atomics.new(1, [])
+      :atomics.put(up, 1, 1)
+
+      opts =
+        toggle_opts(name, tmp,
+          proc_alive_fun: fn _ -> true end,
+          live_daemons_fun: fn -> if :atomics.get(up, 1) == 1, do: [:bluetoothd], else: [] end,
+          os_exit_timeout_ms: 100
+        )
+
+      File.write!(opts[:socket_path], "")
+
+      assert {:error, {:still_running, _}} = Bluetooth.stop(opts)
+      assert Bluetooth.status(server: name) == :stopped
+
+      assert {:error, {:still_running, :bluetoothd}} = Bluetooth.stop(opts)
+      assert File.exists?(opts[:socket_path])
+
+      :atomics.put(up, 1, 0)
+      assert :ok = Bluetooth.stop(opts)
+      refute File.exists?(opts[:socket_path])
+    end
+
+    test "the default scan finds a daemon this VM spawned, by name and ancestry",
+         %{tmp_dir: tmp} = ctx do
+      name = start_tree(ctx)
+      :ok = Bluetooth.stop(toggle_opts(name, tmp))
+      fake = Path.join(tmp, "bluetoothd")
+      # A script, since coreutils' multicall `sleep` refuses a renamed argv[0];
+      # the kernel names the process after the script file.
+      File.write!(fake, "#!/bin/sh\nwhile :; do sleep 1; done\n")
+      File.chmod!(fake, 0o755)
+
+      # Orphaned by its exiting shell, so outside this VM's tree, as a
+      # container's bluetoothd is.
+      {orphan, 0} = System.cmd("sh", ["-c", "#{fake} >/dev/null 2>&1 & echo $!"])
+      orphan = String.trim(orphan)
+      port = Port.open({:spawn_executable, fake}, [])
+      {:os_pid, os_pid} = Port.info(port, :os_pid)
+
+      on_exit(fn ->
+        System.cmd("kill", ["-9", orphan, "#{os_pid}"], stderr_to_stdout: true)
+      end)
+
+      opts =
+        name |> toggle_opts(tmp, os_exit_timeout_ms: 100) |> Keyword.delete(:live_daemons_fun)
+
+      File.write!(opts[:socket_path], "")
+      {_, 0} = System.cmd("kill", ["-0", orphan])
+
+      assert {:error, {:still_running, :bluetoothd}} = Bluetooth.stop(opts)
+      assert File.exists?(opts[:socket_path])
+
+      {_, 0} = System.cmd("kill", ["-9", "#{os_pid}"])
+      assert :ok = Bluetooth.stop(Keyword.put(opts, :os_exit_timeout_ms, 2_000))
+      refute File.exists?(opts[:socket_path])
+      {_, 0} = System.cmd("kill", ["-0", orphan])
+    end
+
+    test "a start during the exit wait is refused, so the stop never unlinks its socket",
+         %{tmp_dir: tmp} = ctx do
+      socket = Path.join(tmp, "system_bus_socket")
+      name = start_tree(ctx, all_ids(), fn -> File.write!(socket, "") end)
+      test = self()
+      up = :atomics.new(1, [])
+      :atomics.put(up, 1, 1)
+
+      alive = fn _os_pid ->
+        send(test, :waiting)
+        :atomics.get(up, 1) == 1
+      end
+
+      stopper =
+        Task.async(fn -> Bluetooth.stop(toggle_opts(name, tmp, proc_alive_fun: alive)) end)
+
+      assert_receive :waiting
+      _ = received()
+
+      assert {:error, :busy} =
+               Task.async(fn -> Bluetooth.start(server: name, lock_retries: 0) end)
+               |> Task.await()
+
+      refute_received :prepared
+      :atomics.put(up, 1, 0)
+      assert :ok = Task.await(stopper)
+      refute File.exists?(socket)
+
+      assert :ok = Bluetooth.start(server: name)
+      assert_received :prepared
+      assert File.exists?(socket)
+    end
+
     test "is idempotent", %{tmp_dir: tmp} = ctx do
       name = start_tree(ctx)
       opts = toggle_opts(name, tmp)
@@ -254,6 +355,17 @@ defmodule Vagus.BluetoothTest do
                Bluetooth.stop(toggle_opts(name, tmp, apps_fun: fn -> apps end))
 
       assert received() == []
+      assert Bluetooth.status(server: name) == :running
+    end
+
+    test "an error-state host_dbus app whose container still runs blocks",
+         %{tmp_dir: tmp} = ctx do
+      name = start_tree(ctx)
+      apps = [app("probe_failed", true, :error, true), app("exited", true, :error)]
+
+      assert {:error, {:in_use, ["probe_failed"]}} =
+               Bluetooth.stop(toggle_opts(name, tmp, apps_fun: fn -> apps end))
+
       assert Bluetooth.status(server: name) == :running
     end
 

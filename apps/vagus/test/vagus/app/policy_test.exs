@@ -134,6 +134,17 @@ defmodule Vagus.App.PolicyTest do
       assert Policy.derive(:new, running()) == :unknown
     end
 
+    test "the snapshot carries whether the container still runs, an error state included" do
+      assert %{state: :error, alive?: true} =
+               Policy.snapshot(running(%{last_event: {:failed, :unhealthy}}))
+
+      assert %{state: :error, alive?: false} =
+               Policy.snapshot(running(%{last_event: {:exited, 137}}))
+
+      assert %{state: :started, alive?: true} = Policy.snapshot(running())
+      assert %{state: :stopped, alive?: false} = Policy.snapshot(app())
+    end
+
     test "a once app's clean exit is stopped" do
       once = app(%{config: app_config(%{"startup" => "once"}), last_event: {:exited, 0}})
       assert Policy.derive(:idle, once) == :stopped

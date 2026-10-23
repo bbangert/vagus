@@ -73,6 +73,7 @@ defmodule Vagus.App.ImportTest do
       assert new == %{
                config: config,
                state: wanted,
+               alive?: wanted == :started,
                wanted: wanted,
                user_options: raw["user_options"],
                ports: raw["network"],
