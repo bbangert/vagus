@@ -265,7 +265,7 @@ defmodule Vagus.Network.LabTest do
     refute old =~ "eth1"
     assert Lab.status(s) == []
     assert Nat.lab(lab_key: ctx.nat_opts[:lab_key]) == []
-    assert :persistent_term.get(ctx.state_key, :unset) == :unset
+    assert :persistent_term.get(ctx.state_key) == %{}
   end
 
   test "nft and the rollback's deconfigure both refused: the entry is kept as broken", ctx do
@@ -355,6 +355,47 @@ defmodule Vagus.Network.LabTest do
     assert text =~ @masquerade
     assert Nat.lab(lab_key: ctx.nat_opts[:lab_key]) == [{"eth1", "eth0"}]
     assert Lab.up("eth1", "10.42.0.1/24", s) == :ok
+  end
+
+  test "the entry is checkpointed as pending while VintageNet configures it", ctx do
+    test = self()
+
+    s =
+      start(ctx,
+        configure: fn ifname, _config ->
+          send(test, {:configuring, self()})
+          receive do: (:go -> send(test, {:configure, ifname, :done}))
+          :ok
+        end
+      )
+
+    task = Task.async(fn -> Lab.up("eth1", "10.42.0.1/24", s) end)
+    assert_receive {:configuring, pid}
+    assert %{"eth1" => %{state: :pending}} = :persistent_term.get(ctx.state_key)
+
+    send(pid, :go)
+    assert Task.await(task) == :ok
+    assert %{"eth1" => %{state: :up}} = :persistent_term.get(ctx.state_key)
+  end
+
+  test "init undoes an interrupted bring-up, or keeps it as broken if that fails", ctx do
+    pending = %{cidr: "10.42.0.1/24", primary: "eth0", state: :pending}
+    :persistent_term.put(ctx.state_key, %{"eth1" => pending})
+
+    log = capture_log(fn -> start(ctx) end)
+    assert log =~ "interrupted bring-up of eth1 undone"
+    assert [{:deconfigure, "eth1"}] = receive_all()
+    assert Lab.status(server: ctx.name) == []
+    assert :persistent_term.get(ctx.state_key) == %{}
+    assert Lab.up("eth1", "10.42.0.1/24", server: ctx.name) == :ok
+
+    stop_supervised!(Lab)
+    _ = receive_all()
+    :persistent_term.put(ctx.state_key, %{"eth2" => pending})
+    :atomics.put(ctx.fail, 2, 1)
+    capture_log(fn -> start(ctx) end)
+
+    assert [%{ifname: "eth2", state: :broken}] = Lab.status(server: ctx.name)
   end
 
   test "init drops rules no adopted interface accounts for", ctx do

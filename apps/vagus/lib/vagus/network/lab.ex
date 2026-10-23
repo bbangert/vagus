@@ -20,7 +20,9 @@ defmodule Vagus.Network.Lab do
   still carries its address: the entry is kept as `state: :broken`, no rules
   forward for it, and `up/3` returns `{:error, {:nat, reason, {:rollback,
   deconfigure_reason}}}`. `down/1` then deconfigures it, and `up/3` on it
-  tries the whole bring-up again.
+  tries the whole bring-up again. A bring-up interrupted by this server's
+  death (`state: :pending`) is undone by its replacement, so `status/1`
+  never shows it.
   """
 
   use GenServer
@@ -35,9 +37,9 @@ defmodule Vagus.Network.Lab do
 
   @bridge {{172, 30, 32, 0}, 23}
 
-  # A configure, Nat's lock wait (~24 s at most) and a bounded nft load (10 s)
-  # with its rollback load, and the deconfigure.
-  @change_timeout_ms 60_000
+  # A configure, Nat's lock wait (32 s at most) and a bounded nft load (12 s
+  # with its kill) with its rollback load, and the deconfigure.
+  @change_timeout_ms 75_000
   @status_timeout_ms 5_000
 
   # Survives this process but not the VM, which is exactly the "not
@@ -48,7 +50,7 @@ defmodule Vagus.Network.Lab do
           ifname: String.t(),
           cidr: String.t(),
           primary: String.t(),
-          state: :up | :broken
+          state: :up | :broken | :pending
         }
 
   @spec start_link(keyword()) :: GenServer.on_start() | :ignore
@@ -123,6 +125,7 @@ defmodule Vagus.Network.Lab do
   # run is needed.
   @impl true
   def handle_continue(:adopt, state) do
+    state = reconcile_pending(state)
     # A `:lab` in nat_opts would answer for itself instead of the stored list.
     stored = Nat.lab(Keyword.delete(state.nat_opts, :lab))
 
@@ -137,6 +140,35 @@ defmodule Vagus.Network.Lab do
     end
 
     {:noreply, state}
+  end
+
+  # A previous instance died mid bring-up, with or without the address
+  # applied: undo it so up/3 starts clean. If that fails the address may
+  # still be there, so the entry stays owned, as broken.
+  defp reconcile_pending(state) do
+    up =
+      Map.new(state.up, fn
+        {ifname, %{state: :pending} = entry} ->
+          case state.deconfigure.(ifname) do
+            :ok ->
+              Logger.warning("Vagus.Network.Lab: interrupted bring-up of #{ifname} undone")
+              {ifname, nil}
+
+            {:error, reason} ->
+              Logger.warning(
+                "Vagus.Network.Lab: interrupted bring-up of #{ifname} not undone: " <>
+                  inspect(reason)
+              )
+
+              {ifname, %{entry | state: :broken}}
+          end
+
+        other ->
+          other
+      end)
+      |> Map.reject(fn {_ifname, entry} -> is_nil(entry) end)
+
+    if up == state.up, do: state, else: store(state, up)
   end
 
   @impl true
@@ -195,33 +227,36 @@ defmodule Vagus.Network.Lab do
          :ok <- check_nat(state),
          :ok <- check_configured(ifname, state),
          :ok <- check_overlap(ifname, address, prefix, primary, state) do
-      up = Map.put(state.up, ifname, %{cidr: cidr, primary: primary, state: :up})
-
-      with {:vintage_net, :ok} <-
-             {:vintage_net, state.configure.(ifname, config(address, prefix))},
-           {:nat, :ok} <- {:nat, Nat.set_lab(pairs(up), state.nat_opts)} do
-        {:reply, :ok, store(state, up)}
-      else
-        {:vintage_net, {:error, reason}} ->
-          {:reply, {:error, {:vintage_net, reason}}, state}
-
-        {:nat, {:error, reason}} ->
-          case state.deconfigure.(ifname) do
-            :ok ->
-              {:reply, {:error, {:nat, reason}}, forget(state, ifname)}
-
-            {:error, rollback} ->
-              broken = Map.put(state.up, ifname, %{cidr: cidr, primary: primary, state: :broken})
-              {:reply, {:error, {:nat, reason, {:rollback, rollback}}}, store(state, broken)}
-          end
-      end
+      bring_up(ifname, %{cidr: cidr, primary: primary}, config(address, prefix), state)
     else
       error -> {:reply, error, state}
     end
   end
 
-  defp forget(state, ifname) do
-    if Map.has_key?(state.up, ifname), do: store(state, Map.delete(state.up, ifname)), else: state
+  # The pending checkpoint lets a replacement instance find a NIC this one
+  # was configuring when it died.
+  defp bring_up(ifname, entry, config, state) do
+    prior = state.up
+    state = store(state, Map.put(prior, ifname, Map.put(entry, :state, :pending)))
+    up = Map.put(prior, ifname, Map.put(entry, :state, :up))
+
+    with {:vintage_net, :ok} <- {:vintage_net, state.configure.(ifname, config)},
+         {:nat, :ok} <- {:nat, Nat.set_lab(pairs(up), state.nat_opts)} do
+      {:reply, :ok, store(state, up)}
+    else
+      {:vintage_net, {:error, reason}} ->
+        {:reply, {:error, {:vintage_net, reason}}, store(state, prior)}
+
+      {:nat, {:error, reason}} ->
+        case state.deconfigure.(ifname) do
+          :ok ->
+            {:reply, {:error, {:nat, reason}}, store(state, Map.delete(prior, ifname))}
+
+          {:error, rollback} ->
+            broken = Map.put(prior, ifname, Map.put(entry, :state, :broken))
+            {:reply, {:error, {:nat, reason, {:rollback, rollback}}}, store(state, broken)}
+        end
+    end
   end
 
   defp store(state, up) do

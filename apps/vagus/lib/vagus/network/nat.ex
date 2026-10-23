@@ -106,10 +106,12 @@ defmodule Vagus.Network.Nat do
   # nft -f is one netlink transaction and takes no lock, so it answers at once
   # or not at all.
   @nft_timeout_ms 10_000
+  @sigkill_delay_ms 1_000
+  @kill_budget_ms @sigkill_delay_ms + 1_000
 
   @loaded_key {__MODULE__, :loaded}
   @lab_key {__MODULE__, :lab}
-  @lock_retries 7
+  @lock_retries 8
 
   @doc "Whether DNAT management is switched on (`config :vagus, :supervisor_nat`)."
   @spec enabled?() :: boolean()
@@ -193,7 +195,8 @@ defmodule Vagus.Network.Nat do
   # ensure_loaded, Lab), and each renders the stored list before its load
   # lands: unserialized, a render taken before another writer's commit loads
   # after it and the kernel no longer matches the list. The retries' backoff
-  # (~12 s on average for the default) outlasts one bounded nft run.
+  # (~16 s on average, 32 s at most for the default) outlasts one bounded
+  # nft run with its kill (12 s).
   defp serialized(opts, fun) do
     lock = {{__MODULE__, Keyword.get(opts, :lab_key, @lab_key)}, self()}
 
@@ -366,15 +369,41 @@ defmodule Vagus.Network.Nat do
     end
   end
 
-  # Bounded: a stuck call would hold the boot gate, and an abandoned nft
-  # still finishes or fails its one transaction alone.
+  # Under muontrap, so a timed-out nft is killed rather than left to commit
+  # its transaction after the caller has rolled back or released the table
+  # lock: closing a plain port only closes its pipes. The port closes without
+  # waiting for the child, so a timeout waits out the kill before answering.
+  # BoundedCall stays as the outer bound (MuonTrap's own timeout has been
+  # seen not to fire, see `Vagus.Dist`); killing its task closes the port,
+  # which kills the child too.
   @doc false
   @spec nft_cmd(String.t(), [String.t()], timeout()) :: {String.t(), non_neg_integer()}
   def nft_cmd(bin, args, timeout_ms \\ @nft_timeout_ms) do
-    case Vagus.BoundedCall.run(fn -> Vagus.Host.Cmd.run(bin, args) end, timeout_ms) do
-      {out, status} when is_binary(out) -> {out, status}
-      {:error, :attempt_timeout} -> {"#{bin}: no answer in #{timeout_ms} ms", 124}
-      {:error, {:exit, reason}} -> {"#{bin}: #{inspect(reason)}", 1}
+    fun = fn ->
+      MuonTrap.cmd(bin, args,
+        stderr_to_stdout: true,
+        timeout: timeout_ms,
+        delay_to_sigkill: @sigkill_delay_ms
+      )
+    end
+
+    case Vagus.BoundedCall.run(fun, timeout_ms + @kill_budget_ms) do
+      {out, status} when is_integer(status) ->
+        {out, status}
+
+      {_out, :timeout} ->
+        Process.sleep(@kill_budget_ms)
+        {"#{bin}: no answer in #{timeout_ms} ms", 124}
+
+      {:error, :attempt_timeout} ->
+        Process.sleep(@kill_budget_ms)
+        {"#{bin}: no answer in #{timeout_ms} ms", 124}
+
+      {:error, {:exit, {%ErlangError{original: reason}, _stack}}} ->
+        {"#{bin}: #{inspect(reason)}", 127}
+
+      {:error, {:exit, reason}} ->
+        {"#{bin}: #{inspect(reason)}", 1}
     end
   end
 

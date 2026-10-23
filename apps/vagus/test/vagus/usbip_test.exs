@@ -484,6 +484,18 @@ defmodule Vagus.USBIPTest do
     assert_receive {:subscribed, ^watcher}, 3_000
   end
 
+  test "a device swapped on its port while usbipd starts is not bound", ctx do
+    product = sysfs(ctx, "bus/usb/devices/1-1.4/idProduct")
+
+    s =
+      start(ctx, podman_rules: [{"run *", [{0, "cid\n", run: "printf '6015\\n' > #{product}"}]}])
+
+    assert USBIP.share("usb:1-1.4", server: s.server) == {:error, :device_changed}
+    assert writes() == []
+    assert FakePodman.verbs(s.fake) == [@stop_argv, @run_argv, @stop_argv]
+    assert USBIP.shared(server: s.server) == []
+  end
+
   test "a failed bind rolls back match_busid, re-probes, and stops usbipd", ctx do
     bind = sysfs(ctx, "bus/usb/drivers/usbip-host/bind")
     File.rm!(bind)

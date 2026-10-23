@@ -275,6 +275,32 @@ defmodule Vagus.Network.NatTest do
       assert Nat.lab(opts) == [{"eth1", "eth0"}]
     end
 
+    test "a timed-out load keeps the stored list, and rolls back only after it answered",
+         %{dir: dir} do
+      test = self()
+      calls = :counters.new(1, [])
+
+      cmd = fn _bin, ["-f", path] ->
+        :counters.add(calls, 1, 1)
+        text = File.read!(path)
+        send(test, {:start, text})
+        Process.sleep(50)
+        send(test, {:done, text})
+        if :counters.get(calls, 1) == 1, do: {"nft: no answer in 10000 ms", 124}, else: {"", 0}
+      end
+
+      opts = lab_opts(dir, cmd)
+
+      capture_log(fn ->
+        assert {:error, {_, _, 124}} = Nat.set_lab([{"eth1", "eth0"}], opts)
+      end)
+
+      assert [{:start, new}, {:done, new}, {:start, old}, {:done, old}] = receive_all()
+      assert new =~ "eth1"
+      refute old =~ "eth1"
+      assert Nat.lab(opts) == []
+    end
+
     test "an invalid name loads nothing", %{dir: dir} do
       opts = lab_opts(dir, nft_fake({"", 0}))
       assert Nat.set_lab([{"..", "eth0"}], opts) == {:error, :invalid_ifname}
@@ -360,6 +386,15 @@ defmodule Vagus.Network.NatTest do
     test "a command that does not answer in time is exit 124" do
       assert {msg, 124} = Nat.nft_cmd("sleep", ["2"], 50)
       assert msg =~ "no answer in 50 ms"
+    end
+
+    test "a timed-out command is killed before the answer, never left to finish", %{dir: dir} do
+      File.mkdir_p!(dir)
+      marker = Path.join(dir, "late")
+
+      assert {_msg, 124} = Nat.nft_cmd("sh", ["-c", "sleep 0.5; touch #{marker}"], 50)
+      Process.sleep(800)
+      refute File.exists?(marker)
     end
 
     test "a runner that crashes is exit 1, never a raise" do

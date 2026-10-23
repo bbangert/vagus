@@ -61,6 +61,7 @@ defmodule Vagus.USBIP do
           | :already_shared
           | :not_shared
           | :bind_loop
+          | :device_changed
           | :invalid_busid
           | :invalid_driver
           | {:sysfs, String.t(), File.posix()}
@@ -214,7 +215,8 @@ defmodule Vagus.USBIP do
          :ok <- not_shared(busid, state),
          :ok <- not_imported(device),
          :ok <- modprobe(state),
-         {:ok, state} <- ensure_daemon(state) do
+         {:ok, state} <- ensure_daemon(state),
+         :ok <- still_selected(device, state) do
       case bind(busid, state) do
         :ok ->
           share = %{
@@ -231,8 +233,18 @@ defmodule Vagus.USBIP do
           {:error, reason, stop_if_idle(state)}
       end
     else
+      {:error, :device_changed} -> {:error, :device_changed, stop_if_idle(state)}
       {:error, reason, state} -> {:error, reason, state}
       {:error, reason} -> {:error, reason, state}
+    end
+  end
+
+  # Starting usbipd can take a pull's worth of time, during which the port
+  # may get another device; binding the busid then would lend that one.
+  defp still_selected(device, state) do
+    case Devices.find(device.id, state.devices_opts) do
+      {:ok, now} when {now.vid_pid, now.serial} == {device.vid_pid, device.serial} -> :ok
+      _ -> {:error, :device_changed}
     end
   end
 
