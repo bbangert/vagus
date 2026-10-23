@@ -191,6 +191,8 @@ installed, there is no Core watchdog and no Core provisioning. `/data` still
 expands. The Core HTTP routes (`POST /core/start` etc.) are not guarded, so a
 deliberate call can still install or start Core (follow-up).
 
+A board still carrying a balena-engine store (pre-0.10.0) can be flashed straight into the flavor; the podman migration then finishes without Core.
+
 Build locally (`NERVES_FW_MISC` is what the system's `fwup.conf` writes into
 the slot KV `nerves_fw_misc`; stock builds leave it empty):
 

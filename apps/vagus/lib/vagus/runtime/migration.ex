@@ -189,10 +189,15 @@ defmodule Vagus.Runtime.Migration do
   # nil while Core has no installed version: there is nothing to keep room for.
   defp core_image(opts), do: Keyword.get(opts, :core_image, &default_core_image/0).()
 
+  # The agent flavor never starts Core: nothing to keep room for or wait on.
   defp default_core_image do
-    case Vagus.Core.Versions.installed() do
-      nil -> nil
-      version -> Vagus.Core.Container.image(version)
+    if Vagus.Flavor.agent?() do
+      nil
+    else
+      case Vagus.Core.Versions.installed() do
+        nil -> nil
+        version -> Vagus.Core.Container.image(version)
+      end
     end
   catch
     :exit, _not_running -> nil
@@ -356,7 +361,12 @@ defmodule Vagus.Runtime.Migration do
     do: Vagus.Runtime.Engine.image_present?(image, host: opts[:host])
 
   defp core_healthy?(opts) do
-    Keyword.get(opts, :core_healthy?, fn -> Vagus.Core.Health.check() == :healthy end).()
+    Keyword.get(opts, :core_healthy?, &default_core_healthy?/0).()
+  end
+
+  # Core never starts in the agent flavor, so it can never answer healthy.
+  defp default_core_healthy? do
+    Vagus.Flavor.agent?() or Vagus.Core.Health.check() == :healthy
   end
 
   defp validated?(opts), do: Keyword.get(opts, :validated?, &firmware_valid?/0).() == true
@@ -543,10 +553,14 @@ defmodule Vagus.Runtime.Migration do
   """
   @spec default_wanted_images() :: {:ok, [String.t()]} | {:error, term()}
   def default_wanted_images do
+    # Not default_core_image/0: that swallows a Versions exit, which here must
+    # stay an error so the migration never judges the images done without Core's.
     core =
-      case Vagus.Core.Versions.installed() do
-        nil -> []
-        version -> [Vagus.Core.Container.image(version)]
+      with false <- Vagus.Flavor.agent?(),
+           version when not is_nil(version) <- Vagus.Core.Versions.installed() do
+        [Vagus.Core.Container.image(version)]
+      else
+        _none -> []
       end
 
     {:ok, core ++ wanted_app_images()}

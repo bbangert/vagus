@@ -591,3 +591,109 @@ defmodule Vagus.Runtime.MigrationTest do
     |> Enum.join("\n")
   end
 end
+
+defmodule Vagus.Runtime.MigrationAgentFlavorTest do
+  use ExUnit.Case, async: false
+
+  @moduletag :capture_log
+
+  alias Vagus.Core.Container
+  alias Vagus.Runtime.Migration
+
+  @core Container.image("2026.7.3")
+  @app "ghcr.io/home-assistant/aarch64-addon-mosquitto:6.5.0"
+  @mib 1_048_576
+
+  setup do
+    prev = Application.fetch_env(:vagus, :flavor)
+
+    on_exit(fn ->
+      case prev do
+        {:ok, value} -> Application.put_env(:vagus, :flavor, value)
+        :error -> Application.delete_env(:vagus, :flavor)
+      end
+    end)
+
+    root =
+      Path.join(System.tmp_dir!(), "vagus-migration-agent-#{System.unique_integer([:positive])}")
+
+    legacy = Path.join(root, "root/balena-engine")
+    File.mkdir_p!(Path.join(legacy, "volumes/vagus-core-config/_data"))
+    File.mkdir_p!(Path.join(legacy, "image/overlay2/layerdb/sha256"))
+    on_exit(fn -> File.rm_rf(root) end)
+
+    mountinfo = Path.join(root, "mountinfo")
+    File.write!(mountinfo, "22 1 179:2 / / rw - ext4 /dev/root rw\n")
+
+    # The defaults for :core_image, :wanted_images and :core_healthy? are under
+    # test; Core is installed and its image absent from podman's store. The
+    # default probes read the globally named Versions, so swap it for ours.
+    :ok = Supervisor.terminate_child(Vagus.Core.Supervisor, Vagus.Core.Versions)
+    on_exit(fn -> Supervisor.restart_child(Vagus.Core.Supervisor, Vagus.Core.Versions) end)
+
+    start_supervised!(
+      {Vagus.Core.Versions,
+       path: Path.join(root, "versions.json"), fetch: fn -> {:error, :off} end}
+    )
+
+    :ok = Vagus.Core.Versions.set_installed("2026.7.3")
+
+    opts = [
+      legacy_root: legacy,
+      marker: Path.join(root, "root/vagus/engine-migrated"),
+      config_dir: Path.join(root, "root/vagus/core/config"),
+      graphroot: Path.join(root, "root/containers/storage"),
+      mountinfo: mountinfo,
+      validated?: fn -> true end,
+      image_present?: fn image -> image != @core end,
+      df: fn _path ->
+        {"Filesystem 1K-blocks Used Available Use% Mounted on\n" <>
+           "/dev/root 99999999 1 #{div(2000 * @mib, 1024)} 1% /root\n", 0}
+      end
+    ]
+
+    %{opts: opts, legacy: legacy}
+  end
+
+  describe "default flavor" do
+    setup do
+      Application.put_env(:vagus, :flavor, :default)
+    end
+
+    test "Core's image is wanted, reserved for, and waited on", %{opts: opts} do
+      assert {:ok, [@core]} = Migration.default_wanted_images()
+      # Unknown to balena's store: the app 1 GiB, Core 1 GiB, half of one more.
+      assert {:short, _, _} = Migration.pull_space(@app, opts)
+
+      assert Migration.prepare(opts) == :renamed
+      assert Migration.cleanup(opts) == {:waiting, :images}
+
+      opts = Keyword.put(opts, :image_present?, fn _ -> true end)
+
+      assert Migration.cleanup(Keyword.put(opts, :core_healthy?, fn -> false end)) ==
+               {:waiting, :core_healthy}
+    end
+  end
+
+  describe "agent-dev-board flavor" do
+    setup do
+      Application.put_env(:vagus, :flavor, :agent_dev_board)
+    end
+
+    test "default_wanted_images/0 holds no Core image" do
+      assert Migration.default_wanted_images() == {:ok, []}
+    end
+
+    test "pull_space/2 reserves no room for Core", %{opts: opts} do
+      assert Migration.pull_space(@app, opts) == :ok
+    end
+
+    test "cleanup/2 waits on neither Core's image nor its health",
+         %{opts: opts, legacy: legacy} do
+      assert Migration.prepare(opts) == :renamed
+      assert Migration.cleanup(opts) == :done
+      refute File.exists?(legacy)
+      assert File.exists?(opts[:marker])
+    end
+  end
+end
