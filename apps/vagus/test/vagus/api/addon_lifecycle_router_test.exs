@@ -502,6 +502,26 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
                app_info("agent_orchestrator")
     end
 
+    test "a start while it runs is 200 and leaves its container alone" do
+      Vagus.Addon.Backend.Fake.reset_calls()
+
+      assert supervisor_call(:post, "/addons/agent_orchestrator/start").status == 200
+      assert addon_call(:post, "/addons/self/start", "agent_orchestrator").status == 200
+
+      assert Vagus.Addon.Backend.Fake.calls_for("addon_agent_orchestrator") == []
+      assert {:ok, %{state: :started}} = app_info("agent_orchestrator")
+    end
+
+    test "its info offers the embedded version no store lists" do
+      {:ok, builtin} = Vagus.App.Units.builtin_config("agent_orchestrator")
+      install_app(%{builtin | version: "0.0.9"}, state: :started)
+
+      info = body(supervisor_call(:get, "/addons/agent_orchestrator/info"))["data"]
+      assert info["version"] == "0.0.9"
+      assert info["version_latest"] == builtin.version
+      assert info["update_available"] == true
+    end
+
     test "with the key unset the same app stops" do
       Application.delete_env(:vagus, :orchestrator_app)
 

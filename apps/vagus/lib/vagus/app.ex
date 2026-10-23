@@ -12,7 +12,7 @@ defmodule Vagus.App do
   require Logger
 
   alias Vagus.Addon.{Config, Store}
-  alias Vagus.App.{Directory, Instances, Policy}
+  alias Vagus.App.{Directory, Instances, Policy, Units}
   alias Vagus.App.File, as: AppFile
   alias Vagus.Network
 
@@ -517,11 +517,26 @@ defmodule Vagus.App do
   # The store entry's own `config.slug` is the bare app slug; installed apps
   # run under the store slug, as `handle_install` renames it.
   defp store_target(slug) do
-    case Store.get(slug) do
-      {:ok, %{config: config}} -> {:ok, %{config | slug: slug}}
+    case latest_config(slug) do
+      {:ok, config} -> {:ok, %{config | slug: slug}}
       :error -> {:error, :not_in_store}
     end
   end
+
+  @doc """
+  The config an update of `slug` would install: the store's entry, else a
+  default app's embedded config, which no store lists and which a newer
+  firmware carries at a newer version.
+  """
+  @spec latest_config(String.t()) :: {:ok, Config.t()} | :error
+  def latest_config(slug) do
+    with :error <- entry_config(Store.get(slug)),
+         {:error, _no_builtin} <- Units.builtin_config(slug),
+         do: :error
+  end
+
+  defp entry_config({:ok, %{config: config}}), do: {:ok, config}
+  defp entry_config(:error), do: :error
 
   defp report_stage(opts, stage, progress) do
     Vagus.Jobs.update(

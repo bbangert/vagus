@@ -702,7 +702,9 @@ defmodule Vagus.App.Policy do
 
   defp hook(_data, _which), do: []
 
-  defp running?(%{container_id: id, last_event: event}),
+  @doc "Whether the app's current container was last seen up."
+  @spec running?(map()) :: boolean()
+  def running?(%{container_id: id, last_event: event}),
     do: id != nil and from_event(event) in [:startup, :started]
 
   @doc """

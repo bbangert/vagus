@@ -2503,8 +2503,15 @@ defmodule Vagus.API.Router do
   # error.
   defp store_facts(store_slug) do
     case Store.get(store_slug) do
-      {:ok, %{config: %{version: version}} = entry} -> {version, Map.get(entry, :assets) || %{}}
-      :error -> {nil, %{}}
+      {:ok, %{config: %{version: version}} = entry} ->
+        {version, Map.get(entry, :assets) || %{}}
+
+      # A default app no store lists is offered what `App.update/2` would install.
+      :error ->
+        case App.latest_config(store_slug) do
+          {:ok, %{version: version}} -> {version, %{}}
+          :error -> {nil, %{}}
+        end
     end
   end
 
