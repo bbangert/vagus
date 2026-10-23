@@ -1,0 +1,97 @@
+# The agent images are built here, not on the board: a board only builds thin
+# per-task layers on top of them. arm64 only, since that is every target we run.
+# The Claude Code pin is the CLAUDE_VERSION build arg in
+# images/agent-base/Containerfile, so a bump is a one-line edit plus a tag.
+name: images
+
+on:
+  push:
+    tags: ["images-v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Image tag to publish (test builds)
+        default: dev
+
+permissions:
+  contents: read
+
+env:
+  BASE_IMAGE: ghcr.io/bbangert/vagus-agent-base
+  ORCH_IMAGE: ghcr.io/bbangert/vagus-agent-orchestrator
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve version tag
+        id: ver
+        run: |
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            echo "tag=${GITHUB_REF_NAME#images-v}" >> "$GITHUB_OUTPUT"
+            echo "latest=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+            echo "latest=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Base tags
+        id: base_meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.BASE_IMAGE }}
+          flavor: latest=false
+          tags: |
+            type=raw,value=${{ steps.ver.outputs.tag }}
+            type=sha,format=short
+            type=raw,value=latest,enable=${{ steps.ver.outputs.latest == 'true' }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: images/agent-base
+          file: images/agent-base/Containerfile
+          platforms: linux/arm64
+          push: true
+          tags: ${{ steps.base_meta.outputs.tags }}
+          labels: ${{ steps.base_meta.outputs.labels }}
+          cache-from: type=gha,scope=agent-base
+          cache-to: type=gha,scope=agent-base,mode=max
+
+      - name: Orchestrator tags
+        id: orch_meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.ORCH_IMAGE }}
+          flavor: latest=false
+          tags: |
+            type=raw,value=${{ steps.ver.outputs.tag }}
+            type=sha,format=short
+            type=raw,value=latest,enable=${{ steps.ver.outputs.latest == 'true' }}
+
+      # Pulls the base just pushed above, so the tag must be the version tag,
+      # not the sha one.
+      - uses: docker/build-push-action@v6
+        with:
+          context: images/agent-orchestrator
+          file: images/agent-orchestrator/Containerfile
+          platforms: linux/arm64
+          push: true
+          build-args: BASE=${{ env.BASE_IMAGE }}:${{ steps.ver.outputs.tag }}
+          tags: ${{ steps.orch_meta.outputs.tags }}
+          labels: ${{ steps.orch_meta.outputs.labels }}
+          cache-from: type=gha,scope=agent-orchestrator
+          cache-to: type=gha,scope=agent-orchestrator,mode=max

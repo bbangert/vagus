@@ -105,7 +105,7 @@ Everything else (`/data/vagus/*` paths, `:engine`, `:addon_data_root`,
 | Board | Interfaces |
 | --- | --- |
 | `rpi3_64` | `usb0` (VintageNetDirect, USB gadget), `eth0`, `wlan0` |
-| `dragon_q6a` | `eth0` (RTL8125 2.5 GbE), `wlan0` (onboard AIC8800D80) — **no `usb0`**, the board has no USB gadget controller |
+| `dragon_q6a` | `eth0` (RTL8125 2.5 GbE), `wlan0` (onboard AIC8800D80) — **no `usb0`**: the USB-C port is power-only; the OTG-capable controller (`usb_1`, the blue USB-A 3.x port, also the EDL port) is wired `dr_mode = "host"`, and a gadget there would cost the only SuperSpeed host port |
 | `rubik_pi3` | `eth0` (USB3-attached ASIX AX88179B, `ax88179_178a`, behind a UPD720201 USB3 controller), `wlan0` (AMPAK AP6256/BCM43456-class SDIO, `brcmfmac`) — **no `usb0`**, the board has no USB gadget controller |
 
 ### Why `generic-aarch64` for the Q6A and the Rubik Pi 3

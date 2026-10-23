@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# Runs Elixir on the board's own node over distribution.
+set -euo pipefail
+
+dist_file=${VAGUS_DIST_FILE:-/run/vagus-dist/node.json}
+
+usage() {
+  cat >&2 <<'USAGE'
+usage: vagus eval '<elixir expression>'   evaluate on the board node, print the value
+       vagus ping                         Node.ping the board node
+       vagus node                         print the board node name
+env:   VAGUS_TIMEOUT  eval timeout in ms (default 60000)
+USAGE
+  exit 64
+}
+
+die() { echo "vagus: $*" >&2; exit 1; }
+
+[ $# -ge 1 ] || usage
+cmd=$1
+shift
+case $cmd in
+  eval) [ $# -eq 1 ] || usage ;;
+  ping | node) [ $# -eq 0 ] || usage ;;
+  *) usage ;;
+esac
+
+[ -r "$dist_file" ] || die "cannot read $dist_file (is distribution enabled on the board?)"
+node=$(jq -er '.node | strings' "$dist_file") || die "no .node in $dist_file"
+cookie=$(jq -er '.cookie | strings' "$dist_file") || die "no .cookie in $dist_file"
+host=${node#*@}
+[ "$host" != "$node" ] && [ -n "$host" ] || die "node name '$node' has no host part"
+
+if [ "$cmd" = node ]; then
+  printf '%s\n' "$node"
+  exit 0
+fi
+
+# The expression and node go through the environment, never into the script text, so no
+# quoting of user input is involved. The cookie is on argv: visible in `ps`, but only
+# inside this container, which already holds the file it came from.
+# shellcheck disable=SC2016
+script='
+node = String.to_atom(System.fetch_env!("VAGUS_NODE"))
+
+connect = fn ->
+  case Node.connect(node) do
+    true -> :ok
+    other ->
+      IO.puts(:stderr, "vagus: cannot connect to #{node} (Node.connect returned #{inspect(other)}); check the cookie, the node name and that distribution is enabled")
+      System.halt(2)
+  end
+end
+
+case System.fetch_env!("VAGUS_CMD") do
+  "ping" ->
+    result = Node.ping(node)
+    IO.puts(result)
+    System.halt(if result == :pong, do: 0, else: 2)
+
+  "eval" ->
+    connect.()
+    expr = System.fetch_env!("VAGUS_EXPR")
+    timeout = String.to_integer(System.get_env("VAGUS_TIMEOUT", "60000"))
+
+    try do
+      {value, _binding} = :erpc.call(node, Code, :eval_string, [expr], timeout)
+      IO.puts(inspect(value, pretty: true, limit: :infinity, printable_limit: :infinity))
+    catch
+      # erpc re-raises a remote raise as {:exception, reason, remote_stacktrace}.
+      :error, {:exception, reason, stack} ->
+        IO.puts(:stderr, Exception.format(:error, reason, stack))
+        System.halt(1)
+
+      kind, reason ->
+        IO.puts(:stderr, Exception.format(kind, reason, __STACKTRACE__))
+        System.halt(1)
+    end
+end
+'
+
+# Distinct per call so concurrent invocations never collide on one node name.
+VAGUS_NODE=$node VAGUS_CMD=$cmd VAGUS_EXPR=${1:-} exec elixir \
+  --name "agent-$$@$host" \
+  --cookie "$cookie" \
+  --erl "-kernel inet_dist_listen_min 9106 inet_dist_listen_max 9110" \
+  -e "$script"

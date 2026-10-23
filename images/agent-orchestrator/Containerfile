@@ -1,0 +1,16 @@
+ARG BASE=ghcr.io/bbangert/vagus-agent-base:latest
+FROM ${BASE}
+
+# The entrypoint chowns the root-owned /data bind mount before dropping to agent.
+USER root
+
+COPY --chmod=0755 entrypoint.sh /usr/local/bin/entrypoint
+COPY --chmod=0755 claude-loop.sh /usr/local/bin/claude-loop
+COPY --chmod=0755 vagus /usr/local/bin/vagus
+COPY --chown=agent:agent CLAUDE.md /work/CLAUDE.md
+
+ENV CLAUDE_CONFIG_DIR=/data/claude \
+    VAGUS_DIST_FILE=/run/vagus-dist/node.json
+
+# tini: without a reaper, sleep loops have hit the 10 s stop kill (exit 137).
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/entrypoint"]
