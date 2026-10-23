@@ -67,13 +67,12 @@ defmodule Vagus.DistTest do
       self_node_fun: fn -> Agent.get(vm, & &1.node) end,
       # get_and_update is atomic, which is what makes this a faithful stand-in
       # for :ets.select_replace/2 rather than a check-then-set that would hide
-      # the very race the real one exists to close.
-      session_claim_fun: fn ->
+      # the very race the real one exists to close. The decision is Dist's own.
+      session_claim_fun: fn claimant ->
         Agent.get_and_update(vm, fn st ->
-          case st.session do
-            :not_requested -> {:claimed, %{st | session: :starting}}
-            :starting -> {:starting, st}
-            session -> {{:recorded, session}, st}
+          case Dist.claim_decision(st.session) do
+            :take -> {:claimed, %{st | session: {:starting, claimant}}}
+            answer -> {answer, st}
           end
         end)
       end,
@@ -205,16 +204,23 @@ defmodule Vagus.DistTest do
     end
   end
 
+  describe "no usable address" do
+    # Nothing has started, so it is an answer rather than a raise: at boot the
+    # LAN lease can simply be late, and the gate retries.
+    test "is answered, before epmd or net_kernel, with the claim released", %{vm: vm} do
+      assert {:error, :no_address} = Dist.enable(system(vm, ifaddrs_fun: fn -> [] end))
+      assert steps(vm) == [:session_reset]
+      assert Agent.get(vm, & &1.session) == :not_requested
+
+      assert {:ok, %{node: :"vagus@192.168.2.58"}} = Dist.enable(system(vm))
+    end
+  end
+
   describe "every failure stops distribution and raises" do
     # Caught in the calling process, so it does not matter that IEx catches the
     # exception afterwards and keeps its evaluator alive — our catch runs first.
     defp fails_with(vm, overrides) do
       assert_raise MatchError, fn -> Dist.enable(system(vm, overrides)) end
-    end
-
-    test "no usable address", %{vm: vm} do
-      fails_with(vm, ifaddrs_fun: fn -> [] end)
-      refute Enum.any?(steps(vm), &match?({:epmd, _}, &1))
     end
 
     test "epmd will not start", %{vm: vm} do
@@ -238,7 +244,7 @@ defmodule Vagus.DistTest do
     end
 
     test "the claim is released, so a retry needs no reboot", %{vm: vm} do
-      fails_with(vm, ifaddrs_fun: fn -> [] end)
+      fails_with(vm, epmd_fun: fn _args, _env -> {"port 4369 in use", 1} end)
       assert Agent.get(vm, & &1.session) == :not_requested
 
       assert {:ok, %{node: :"vagus@192.168.2.58"}} = Dist.enable(system(vm))
@@ -320,10 +326,94 @@ defmodule Vagus.DistTest do
       # Claiming is atomic, so only the winner reaches bring-up. Without it the
       # loser hits already_started before the winner has set its cookie and
       # records one that never authenticates.
-      Agent.update(vm, &%{&1 | session: :starting})
+      claimant = spawn(fn -> Process.sleep(:infinity) end)
+      on_exit(fn -> Process.exit(claimant, :kill) end)
+      Agent.update(vm, &%{&1 | session: {:starting, claimant}})
 
       assert {:error, :starting} = Dist.enable(system(vm))
       assert steps(vm) == []
+    end
+  end
+
+  describe "a bring-up outside the caller" do
+    # Blocks the bring-up at `tag` until the test sends `:go` to it.
+    defp held_at(vm, key, test_pid) do
+      original = Keyword.fetch!(system(vm), key)
+
+      held =
+        case key do
+          :epmd_fun ->
+            fn args, env ->
+              send(test_pid, {:held, self()})
+              receive do: (:go -> original.(args, env))
+            end
+
+          :set_cookie_fun ->
+            fn cookie ->
+              send(test_pid, {:held, self()})
+              receive do: (:go -> original.(cookie))
+            end
+        end
+
+      system(vm, [{key, held}, wait_ms: 50])
+    end
+
+    test "one that outlives the caller's wait finishes, and the next call gets its session",
+         %{vm: vm} do
+      assert {:error, :starting} = Dist.enable(held_at(vm, :epmd_fun, self()))
+      assert_receive {:held, bring_up}
+      ref = Process.monitor(bring_up)
+      send(bring_up, :go)
+      assert_receive {:DOWN, ^ref, :process, ^bring_up, _reason}
+
+      assert {:ok, %{cookie: cookie}} = Dist.enable(system(vm))
+      assert {:ok, %{cookie: ^cookie}} = Dist.enable(system(vm))
+      assert Agent.get(vm, & &1.cookie) == String.to_atom(cookie)
+      assert Enum.count(steps(vm), &match?({:net_kernel_start, _, _}, &1)) == 1
+    end
+
+    test "a caller killed while it waits does not cut the bring-up short", %{vm: vm} do
+      test_pid = self()
+      opts = Keyword.put(held_at(vm, :epmd_fun, test_pid), :wait_ms, 60_000)
+      caller = spawn(fn -> Dist.enable(opts) end)
+      assert_receive {:held, bring_up}
+      Process.exit(caller, :kill)
+
+      ref = Process.monitor(bring_up)
+      send(bring_up, :go)
+      assert_receive {:DOWN, ^ref, :process, ^bring_up, :normal}
+
+      assert %{session: %{cookie: cookie}} = Agent.get(vm, & &1)
+      assert Agent.get(vm, & &1.cookie) == String.to_atom(cookie)
+    end
+
+    test "one killed after net_kernel started is taken over, under a fresh cookie", %{vm: vm} do
+      assert {:error, :starting} = Dist.enable(held_at(vm, :set_cookie_fun, self()))
+      assert_receive {:held, bring_up}
+      # The node is up under the cookie OTP invented, and the claim names
+      # a process about to die.
+      ref = Process.monitor(bring_up)
+      Process.exit(bring_up, :kill)
+      assert_receive {:DOWN, ^ref, :process, ^bring_up, :killed}
+      assert {:starting, ^bring_up} = Agent.get(vm, & &1.session)
+
+      assert {:ok, %{cookie: cookie}} = Dist.enable(system(vm))
+      assert Agent.get(vm, & &1.cookie) == String.to_atom(cookie)
+
+      assert [{:net_kernel_start, _, _}, {:net_kernel_start, _, _}] =
+               Enum.filter(steps(vm), &match?({:net_kernel_start, _, _}, &1))
+    end
+
+    test "a live claimant is waited on, a dead one is evicted" do
+      live = spawn(fn -> Process.sleep(:infinity) end)
+      dead = spawn(fn -> :ok end)
+      ref = Process.monitor(dead)
+      assert_receive {:DOWN, ^ref, :process, ^dead, _reason}
+      on_exit(fn -> Process.exit(live, :kill) end)
+
+      assert Dist.claim_decision(:not_requested) == :take
+      assert Dist.claim_decision({:starting, live}) == :starting
+      assert Dist.claim_decision({:starting, dead}) == :take
     end
   end
 
@@ -333,6 +423,10 @@ defmodule Vagus.DistTest do
         Dist.status(Keyword.put(system(vm), :alive_func, fn -> true end))
       end
     end
+  end
+
+  test "the export's group is the orchestrator image's agent user" do
+    assert Dist.agent_gid() == 1000
   end
 
   describe "the real :vagus_dist table" do
@@ -372,6 +466,117 @@ defmodule Vagus.DistTest do
       {:ok, _} = Dist.enable(system(vm))
 
       refute Map.has_key?(Dist.status(system(vm)), :cookie)
+    end
+  end
+
+  describe "export/2" do
+    setup do
+      base = Path.join(System.tmp_dir!(), "dist_export_#{System.unique_integer([:positive])}")
+      on_exit(fn -> File.rm_rf(base) end)
+      # The test user cannot chgrp to the board's gid 1000 unless it is in it.
+      {gid, 0} = System.cmd("id", ["-g"])
+      %{dir: Path.join(base, "dist"), gid: String.to_integer(String.trim(gid))}
+    end
+
+    defp mode(path), do: Bitwise.band(File.stat!(path).mode, 0o777)
+
+    test "writes only the node and cookie, readable by the agent group", %{
+      vm: vm,
+      dir: dir,
+      gid: gid
+    } do
+      {:ok, session} = Dist.enable(system(vm))
+      assert Dist.export(session, dir: dir, gid: gid) == :ok
+
+      path = Path.join(dir, "node.json")
+
+      assert Jason.decode!(File.read!(path)) == %{
+               "node" => "vagus@192.168.2.58",
+               "cookie" => session.cookie
+             }
+
+      assert mode(dir) == 0o750
+      assert mode(path) == 0o640
+      assert File.stat!(dir).gid == gid
+      assert File.stat!(path).gid == gid
+    end
+
+    test "replaces an earlier file by rename, leaving nothing beside it", %{
+      vm: vm,
+      dir: dir,
+      gid: gid
+    } do
+      {:ok, session} = Dist.enable(system(vm))
+      File.mkdir_p!(dir)
+      File.write!(Path.join(dir, "node.json"), "stale")
+      File.chmod!(dir, 0o755)
+
+      assert Dist.export(session, dir: dir, gid: gid) == :ok
+      assert File.ls!(dir) == ["node.json"]
+      assert File.read!(Path.join(dir, "node.json")) =~ session.cookie
+      assert mode(dir) == 0o750
+    end
+
+    # The cookie is written only into a temp file that is renamed whole, so a
+    # rename that fails leaves what was there and no temp file beside it.
+    test "a failed rename leaves the earlier entry and no temp file", %{
+      vm: vm,
+      dir: dir,
+      gid: gid
+    } do
+      {:ok, session} = Dist.enable(system(vm))
+      File.mkdir_p!(Path.join([dir, "node.json", "held"]))
+
+      assert {:error, {:export, _reason}} = Dist.export(session, dir: dir, gid: gid)
+      assert File.ls!(dir) == ["node.json"]
+      assert File.ls!(Path.join(dir, "node.json")) == ["held"]
+    end
+
+    # A write error on the real tmpfs cannot be forced from a test, so this
+    # fails the open instead and pins the tagged-error and no-leftover contract.
+    test "a failed temp write is tagged, leaves no temp file and keeps node.json", %{
+      vm: vm,
+      dir: dir,
+      gid: gid
+    } do
+      {:ok, session} = Dist.enable(system(vm))
+      File.mkdir_p!(dir)
+      File.write!(Path.join(dir, "node.json"), "earlier")
+
+      assert {:error, {:export, :enoent}} =
+               Dist.export(session, dir: dir, gid: gid, temp_suffix: fn -> "missing/x" end)
+
+      assert File.ls!(dir) == ["node.json"]
+      assert File.read!(Path.join(dir, "node.json")) == "earlier"
+    end
+
+    test "a temp file left at the name it picks is removed and the write retried", %{
+      vm: vm,
+      dir: dir,
+      gid: gid
+    } do
+      {:ok, session} = Dist.enable(system(vm))
+      File.mkdir_p!(dir)
+      File.write!(Path.join(dir, ".node.json.stale"), "left by a killed export")
+
+      assert Dist.export(session, dir: dir, gid: gid, temp_suffix: fn -> "stale" end) == :ok
+      assert File.ls!(dir) == ["node.json"]
+      assert File.read!(Path.join(dir, "node.json")) =~ session.cookie
+    end
+
+    test "logs nothing that carries the cookie", %{vm: vm, dir: dir, gid: gid} do
+      {:ok, session} = Dist.enable(system(vm))
+
+      log =
+        ExUnit.CaptureLog.capture_log([level: :debug], fn ->
+          assert Dist.export(session, dir: dir, gid: gid) == :ok
+          File.write!(Path.join(dir, "blocker"), "")
+
+          assert {:error, {:export, _}} =
+                   Dist.export(session, dir: Path.join(dir, "blocker"), gid: gid)
+        end)
+
+      refute log =~ session.cookie
     end
   end
 

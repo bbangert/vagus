@@ -95,7 +95,7 @@ config :vagus, :backends, %{
 
 # config/host.exs imports flavor.exs, so a stray VAGUS_FLAVOR in a dev shell
 # would otherwise change the suite's config; flavor tests set the env themselves.
-config :vagus, flavor: :default, provision_core: true
+config :vagus, flavor: :default, provision_core: true, orchestrator_app: nil
 
 # Per-run app files, and no `addons.json` to import. The Orchestrator's boot
 # is off, so the app's own Orchestrator only brings up app processes: tests
@@ -103,7 +103,7 @@ config :vagus, flavor: :default, provision_core: true
 # a MIX_TARGET config/target.exs loads first and turns them on.
 config :vagus, :legacy_addons_json, nil
 config :vagus, :app_files_dir, Path.join(System.tmp_dir!(), "vagus-apps-#{System.pid()}")
-config :vagus, Vagus.App.Orchestrator, boot: false, default_native_app: nil
+config :vagus, Vagus.App.Orchestrator, boot: false, default_apps: []
 
 # Store assets stay in memory during `mix test` regardless of how much RAM
 # the CI runner or dev box happens to have — `:auto` would make the store's

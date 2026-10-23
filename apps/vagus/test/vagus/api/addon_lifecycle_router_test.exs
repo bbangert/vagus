@@ -435,6 +435,101 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
     end
   end
 
+  describe "the orchestrator app is protected" do
+    setup do
+      config = fixture_config("agent_orchestrator")
+      install_app(config, state: :started)
+
+      prev = Application.get_env(:vagus, :orchestrator_app)
+      Application.put_env(:vagus, :orchestrator_app, "agent_orchestrator")
+
+      on_exit(fn ->
+        if prev,
+          do: Application.put_env(:vagus, :orchestrator_app, prev),
+          else: Application.delete_env(:vagus, :orchestrator_app)
+      end)
+
+      %{config: config}
+    end
+
+    test "stop, restart and uninstall are 400 protected and leave it running" do
+      for action <- ["stop", "restart", "uninstall"] do
+        conn = supervisor_call(:post, "/addons/agent_orchestrator/#{action}")
+        assert conn.status == 400
+        assert body(conn)["message"] =~ "protected"
+      end
+
+      assert {:ok, %{state: :started}} = app_info("agent_orchestrator")
+    end
+
+    test "its own token saying `self` is refused the same" do
+      for action <- ["stop", "restart", "uninstall"] do
+        conn = addon_call(:post, "/addons/self/#{action}", "agent_orchestrator")
+        assert conn.status == 400, action
+        assert body(conn)["message"] =~ "protected"
+      end
+
+      assert {:ok, %{state: :started}} = app_info("agent_orchestrator")
+    end
+
+    test "boot or watchdog in an options body is 400 and nothing in it is applied" do
+      for body <- [%{"boot" => "manual"}, %{"watchdog" => true}] do
+        conn =
+          supervisor_call(
+            :post,
+            "/addons/agent_orchestrator/options",
+            Map.put(body, "options", %{"greeting" => "hey"})
+          )
+
+        assert conn.status == 400
+        assert body(conn)["message"] =~ "protected"
+      end
+
+      assert {:ok, %{boot: nil, watchdog: false, user_options: %{}}} =
+               app_info("agent_orchestrator")
+    end
+
+    test "its other options still save" do
+      conn =
+        supervisor_call(:post, "/addons/agent_orchestrator/options", %{
+          "options" => %{"greeting" => "hey"},
+          "auto_update" => true
+        })
+
+      assert conn.status == 200
+
+      assert {:ok, %{user_options: %{"greeting" => "hey"}, auto_update: true}} =
+               app_info("agent_orchestrator")
+    end
+
+    test "a start while it runs is 200 and leaves its container alone" do
+      Vagus.Addon.Backend.Fake.reset_calls()
+
+      assert supervisor_call(:post, "/addons/agent_orchestrator/start").status == 200
+      assert addon_call(:post, "/addons/self/start", "agent_orchestrator").status == 200
+
+      assert Vagus.Addon.Backend.Fake.calls_for("addon_agent_orchestrator") == []
+      assert {:ok, %{state: :started}} = app_info("agent_orchestrator")
+    end
+
+    test "its info offers the embedded version no store lists" do
+      {:ok, builtin} = Vagus.App.Units.builtin_config("agent_orchestrator")
+      install_app(%{builtin | version: "0.0.9"}, state: :started)
+
+      info = body(supervisor_call(:get, "/addons/agent_orchestrator/info"))["data"]
+      assert info["version"] == "0.0.9"
+      assert info["version_latest"] == builtin.version
+      assert info["update_available"] == true
+    end
+
+    test "with the key unset the same app stops" do
+      Application.delete_env(:vagus, :orchestrator_app)
+
+      assert supervisor_call(:post, "/addons/agent_orchestrator/stop").status == 200
+      assert {:ok, %{state: :stopped}} = app_info("agent_orchestrator")
+    end
+  end
+
   describe "POST /addons/:slug/options/validate" do
     # The config page pre-flights every save through this and throws on
     # anything but `valid: true`, so a missing route makes Save fail for every

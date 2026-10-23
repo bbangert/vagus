@@ -2503,8 +2503,15 @@ defmodule Vagus.API.Router do
   # error.
   defp store_facts(store_slug) do
     case Store.get(store_slug) do
-      {:ok, %{config: %{version: version}} = entry} -> {version, Map.get(entry, :assets) || %{}}
-      :error -> {nil, %{}}
+      {:ok, %{config: %{version: version}} = entry} ->
+        {version, Map.get(entry, :assets) || %{}}
+
+      # A default app no store lists is offered what `App.update/2` would install.
+      :error ->
+        case App.latest_config(store_slug) do
+          {:ok, %{version: version}} -> {version, %{}}
+          :error -> {nil, %{}}
+        end
     end
   end
 
@@ -2927,6 +2934,9 @@ defmodule Vagus.API.Router do
   # Upstream's per-app job group refuses a second job outright.
   defp busy_message(slug), do: "Another job is running for job group app_#{slug}"
 
+  @protected_message "The agent orchestrator app is protected: it cannot be stopped, " <>
+                       "restarted, uninstalled or restored, nor its boot or watchdog changed"
+
   # The container did what was asked; the host failed to record it or to
   # clean up after it, which is no fault of the request.
   defp app_failure({:persist, reason}),
@@ -2934,6 +2944,8 @@ defmodule Vagus.API.Router do
 
   defp app_failure({:remove_data_dir, reason}),
     do: {500, "The app was uninstalled but its data could not be removed (#{inspect(reason)})"}
+
+  defp app_failure(:protected), do: {400, @protected_message}
 
   defp app_failure(reason), do: {400, inspect(reason)}
 
@@ -3062,7 +3074,8 @@ defmodule Vagus.API.Router do
   # reverted on the next read, because nothing persisted it — the same bug
   # class `network` was previously fixed for, above.
   defp apply_addon_options(conn, slug, config, body) do
-    with {:ok, options_action} <- validate_options_key(body, config),
+    with :ok <- validate_protected_settings(slug, body),
+         {:ok, options_action} <- validate_options_key(body, config),
          {:ok, watchdog_action} <- validate_watchdog_key(body),
          {:ok, ingress_panel_action} <- validate_ingress_panel_key(body),
          {:ok, network_action} <- validate_network_key(body, config),
@@ -3078,6 +3091,14 @@ defmodule Vagus.API.Router do
     else
       {:error, message} -> Envelope.send_error(conn, message, 400)
     end
+  end
+
+  # Checked here as well as in `App.set/2` so a refused `boot` cannot leave
+  # the body's other keys applied.
+  defp validate_protected_settings(slug, body) do
+    if App.orchestrator?(slug) and (Map.has_key?(body, "boot") or Map.has_key?(body, "watchdog")),
+      do: {:error, @protected_message},
+      else: :ok
   end
 
   # `options: nil` resets to no user options; a map is validated (merged over
@@ -3455,12 +3476,19 @@ defmodule Vagus.API.Router do
              :ok <- reject_password(params),
              :ok <- reject_homeassistant(params, "Core restore not supported"),
              :ok <- reject_folders(params),
-             {:ok, addon_slugs} <- require_addons_list(params) do
+             {:ok, addon_slugs} <- require_addons_list(params),
+             :ok <- reject_protected_restore(addon_slugs) do
           run_backup_restore(conn, slug, addon_slugs)
         else
           {:error, message} -> Envelope.send_error(conn, message, 400)
         end
     end
+  end
+
+  # Restore runs per slug in order, so a protected slug late in the list would
+  # be refused only after the earlier ones were already overwritten.
+  defp reject_protected_restore(addon_slugs) do
+    if Enum.any?(addon_slugs, &App.orchestrator?/1), do: {:error, @protected_message}, else: :ok
   end
 
   defp run_backup_restore(conn, slug, addon_slugs) do
@@ -3499,6 +3527,7 @@ defmodule Vagus.API.Router do
 
   defp restore_error_message(message) when is_binary(message), do: message
   defp restore_error_message({:restore, addon_slug, :busy}), do: busy_message(addon_slug)
+  defp restore_error_message({:restore, _addon_slug, :protected}), do: @protected_message
 
   defp restore_error_message({:restore, addon_slug, :shutting_down}),
     do: "Restore of addon #{addon_slug} was interrupted: the system is shutting down"

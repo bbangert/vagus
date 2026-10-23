@@ -64,6 +64,116 @@ defmodule Vagus.AppTest do
     end
   end
 
+  describe "the orchestrator app" do
+    setup do
+      prev = Application.get_env(:vagus, :orchestrator_app)
+      prev_backend = Application.get_env(:vagus, :addon_backend)
+      prev_root = Application.get_env(:vagus, :addon_data_root)
+      root = Path.join(System.tmp_dir!(), "app-test-#{System.unique_integer([:positive])}")
+      Application.put_env(:vagus, :addon_backend, Backend.Fake)
+      Application.put_env(:vagus, :addon_data_root, root)
+
+      on_exit(fn ->
+        for {key, value} <- [
+              orchestrator_app: prev,
+              addon_backend: prev_backend,
+              addon_data_root: prev_root
+            ] do
+          if value,
+            do: Application.put_env(:vagus, key, value),
+            else: Application.delete_env(:vagus, key)
+        end
+
+        File.rm_rf(root)
+      end)
+
+      slug = track(config(), state: :started)
+      Application.put_env(:vagus, :orchestrator_app, slug)
+      %{slug: slug}
+    end
+
+    test "is not stopped, restarted or uninstalled", %{slug: slug} do
+      assert {:error, :protected} = App.stop(slug)
+      assert {:error, :protected} = App.restart(slug)
+      assert {:error, :protected} = App.uninstall(slug)
+      assert {:ok, %{state: :started}} = app_info(slug)
+    end
+
+    test "keeps its boot and watchdog, and takes its other settings", %{slug: slug} do
+      assert {:error, :protected} = App.set(slug, boot: "manual")
+      assert {:error, :protected} = App.set(slug, options: %{"a" => 1}, watchdog: true)
+      assert {:ok, %{boot: nil, watchdog: false, user_options: %{}}} = app_info(slug)
+
+      assert :ok = App.set(slug, options: %{"a" => 1}, auto_update: true)
+      assert {:ok, %{user_options: %{"a" => 1}, auto_update: true}} = app_info(slug)
+    end
+
+    test "another app is not protected", %{slug: slug} do
+      other = track(config(), state: :started)
+      assert App.orchestrator?(slug)
+      refute App.orchestrator?(other)
+      assert :ok = App.set(other, boot: "manual", watchdog: true)
+      assert :ok = App.stop(other)
+    end
+
+    test "is not restored, which would stop it and could leave it stopped", %{slug: slug} do
+      assert {:error, :protected} = App.restore(slug, "/nonexistent", nil, false)
+      assert {:ok, %{state: :started}} = app_info(slug)
+    end
+
+    test "a start while it runs is :ok and leaves its container alone", %{slug: slug} do
+      Backend.Fake.reset_calls()
+
+      assert {:ok, %{slug: ^slug}} = App.start(slug)
+      assert Backend.Fake.calls_for("addon_" <> slug) == []
+      assert {:ok, %{state: :started}} = app_info(slug)
+    end
+
+    test "a start while it is stopped starts it" do
+      stopped = track(config())
+      Application.put_env(:vagus, :orchestrator_app, stopped)
+      Backend.Fake.reset_calls()
+
+      assert {:ok, %{slug: ^stopped}} = App.start(stopped)
+      assert {:create, "addon_" <> ^stopped} = List.keyfind(Backend.Fake.calls(), :create, 0)
+      assert {:ok, %{state: :started}} = app_info(stopped)
+    end
+
+    test "another app's start while it runs replaces its container" do
+      other = track(config(), state: :started)
+      Backend.Fake.reset_calls()
+
+      assert {:ok, _} = App.start(other)
+      assert {:create, "addon_" <> ^other} = List.keyfind(Backend.Fake.calls(), :create, 0)
+    end
+
+    test "is not anything, nor is nil, with the key unset", %{slug: slug} do
+      Application.delete_env(:vagus, :orchestrator_app)
+      refute App.orchestrator?(slug)
+      refute App.orchestrator?(nil)
+    end
+
+    test "nothing is protected with the key unset", %{slug: slug} do
+      Application.put_env(:vagus, :orchestrator_app, nil)
+      refute App.orchestrator?(slug)
+      assert :ok = App.set(slug, boot: "manual", watchdog: true)
+      assert {:ok, _} = App.restart(slug)
+      assert :ok = App.stop(slug)
+      assert :ok = App.uninstall(slug)
+    end
+  end
+
+  test "install/2 refuses an unknown per-install setting before anything is written" do
+    config = config()
+
+    assert_raise ArgumentError, ~r/unknown app setting :bogus/, fn ->
+      App.install(config, settings: [bogus: 1])
+    end
+
+    refute config.slug in App.slugs()
+    assert App.info(config.slug) == :error
+  end
+
   describe "identity_for_token/1" do
     setup do
       config = config()
@@ -342,6 +452,41 @@ defmodule Vagus.AppTest do
       assert :ok = App.uninstall(slug)
       refute slug in App.slugs()
       assert :ok = App.install(config(%{"slug" => slug}))
+    end
+  end
+
+  describe "update/2 of a default app no store lists" do
+    setup do
+      prev_backend = Application.get_env(:vagus, :addon_backend)
+      prev_root = Application.get_env(:vagus, :addon_data_root)
+      root = Path.join(System.tmp_dir!(), "app-test-#{System.unique_integer([:positive])}")
+      Application.put_env(:vagus, :addon_backend, Backend.Fake)
+      Application.put_env(:vagus, :addon_data_root, root)
+
+      on_exit(fn ->
+        for {key, value} <- [addon_backend: prev_backend, addon_data_root: prev_root] do
+          if value,
+            do: Application.put_env(:vagus, key, value),
+            else: Application.delete_env(:vagus, key)
+        end
+
+        File.rm_rf(root)
+      end)
+    end
+
+    test "installs the embedded config" do
+      {:ok, builtin} = Vagus.App.Units.builtin_config("agent_orchestrator")
+      assert Store.get("agent_orchestrator") == :error
+      install_app(%{builtin | version: "0.0.9"}, state: :started)
+
+      assert {:ok, %{from: "0.0.9", to: to}} = App.update("agent_orchestrator", [])
+      assert to == builtin.version
+      assert {:ok, %{config: %{version: ^to}, state: :started}} = app_info("agent_orchestrator")
+    end
+
+    test "a slug neither the store nor the builtins know is not in the store" do
+      slug = track(config())
+      assert App.update(slug, []) == {:error, :not_in_store}
     end
   end
 

@@ -24,8 +24,10 @@ defmodule Vagus.App.Units do
       ensure: &ensure/1,
       in_flight?: &Vagus.Host.Shutdown.in_flight?/0,
       install_default: &install_default/1,
+      builtin_native?: &builtin_native?/1,
       native?: &native?/1,
       boot_start: &App.boot_start/2,
+      start: &App.start/1,
       running: &running/0,
       inspect: &running?/1,
       halt: &App.halt/1,
@@ -78,11 +80,16 @@ defmodule Vagus.App.Units do
     end
   end
 
-  @doc "A fresh install is wanted started, so boot starts it; a present one is left as the user set it."
+  @doc """
+  A fresh install is wanted started, so boot starts it; a present one is left
+  as the user set it, except that a container one gets its protected settings
+  back (`install_settings/1`).
+  """
   @spec install_default(String.t()) :: :installed | :present | {:error, term()}
   def install_default(slug) do
     cond do
       slug in App.slugs() ->
+        ensure_settings(slug)
         :present
 
       # Its file would create the apps directory, and a legacy file whose
@@ -92,20 +99,69 @@ defmodule Vagus.App.Units do
 
       true ->
         with {:ok, config} <- builtin_config(slug),
-             :ok <- App.install(config, wanted: :started),
+             :ok <- App.install(config, wanted: :started, settings: install_settings(config)),
              do: :installed
     end
   end
 
-  # The only builtin native app is the mqttx broker. Its config comes from the
-  # embedded source, so boot needs no store reload, under the installed slug
-  # as the store-install route writes it.
-  defp builtin_config(slug) do
-    case BuiltinFetcher.config(:mqtt) do
-      nil -> {:error, :no_builtin}
-      raw -> with {:ok, config} <- Config.parse(raw), do: {:ok, %{config | slug: slug}}
+  # A container default app is revived after a crash and started at boot,
+  # which a request cannot later change for the orchestrator app (`App.set/2`).
+  # The native broker is revived by its boot rule alone (`Policy.restart?/2`).
+  defp install_settings(config) do
+    if Steps.native?(config), do: [], else: [boot: "auto", watchdog: true]
+  end
+
+  # An orchestrator installed before it was protected, or by a store install,
+  # lacks them, and `App.set/2` refuses them to every request.
+  defp ensure_settings(slug) do
+    with {:ok, config} <- builtin_config(slug),
+         [_ | _] = settings <- install_settings(config),
+         {:ok, entry} <- App.info(slug),
+         [_ | _] = stale <- Enum.reject(settings, fn {key, value} -> entry[key] == value end),
+         :error <- App.put_settings(slug, stale) do
+      Logger.warning("Boot: default app #{slug} settings #{inspect(stale)} not written")
     end
   end
+
+  @doc "Whether a default app's builtin config runs natively; one with none is not."
+  @spec builtin_native?(String.t()) :: boolean()
+  def builtin_native?(slug) do
+    case builtin_config(slug) do
+      {:ok, config} -> Steps.native?(config)
+      {:error, _reason} -> false
+    end
+  end
+
+  # No `watchdog`: in a config it is the URL a probe checks, and this app
+  # serves none; the crash-restart flag is a per-install setting.
+  @agent_orchestrator %{
+    "name" => "Agent orchestrator",
+    "version" => "0.1.0",
+    "slug" => "agent_orchestrator",
+    "description" => "Claude Code orchestrator for the agent-dev-board, on the board's own node.",
+    "arch" => ["aarch64"],
+    "image" => "ghcr.io/bbangert/vagus-agent-orchestrator",
+    "startup" => "application",
+    "boot" => "auto",
+    "init" => false,
+    "host_network" => true,
+    "host_dbus" => true
+  }
+
+  @doc """
+  A default app's config, embedded so boot needs no store reload. The mqttx
+  broker's is the store's own source, under the installed slug as the
+  store-install route writes it.
+  """
+  @spec builtin_config(String.t()) :: {:ok, Config.t()} | {:error, term()}
+  def builtin_config("agent_orchestrator"), do: Config.parse(@agent_orchestrator)
+
+  def builtin_config("core_mqtt" = slug) do
+    with {:ok, config} <- Config.parse(BuiltinFetcher.config(:mqtt)),
+         do: {:ok, %{config | slug: slug}}
+  end
+
+  def builtin_config(_slug), do: {:error, :no_builtin}
 
   # The allowlist and not the config's `backend` tag alone: a non-allowlisted
   # `backend: native` config runs in a container, which must still be halted.

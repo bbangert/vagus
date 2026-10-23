@@ -415,6 +415,14 @@ defmodule Vagus.App.Server do
     begin_op(:uninstall, args, from, state, %{data | retired: true})
   end
 
+  # Every start replaces the container, and the running orchestrator's holds
+  # the agent's live session; a start of a stopped one is its recovery.
+  defp command(:start, args, from, state, data) do
+    if Vagus.App.orchestrator?(data.slug) and Policy.running?(data),
+      do: {:keep_state_and_data, [{:reply, from, :ok}]},
+      else: begin_op(:start, args, from, state, data)
+  end
+
   defp command(op, args, from, state, data), do: begin_op(op, args, from, state, data)
 
   defp boot(from, reported, data) do

@@ -12,7 +12,7 @@ defmodule Vagus.App do
   require Logger
 
   alias Vagus.Addon.{Config, Store}
-  alias Vagus.App.{Directory, Instances, Policy}
+  alias Vagus.App.{Directory, Instances, Policy, Units}
   alias Vagus.App.File, as: AppFile
   alias Vagus.Network
 
@@ -276,13 +276,32 @@ defmodule Vagus.App do
   it returns; `:error` when the slug is not installed, even with nothing to
   write. Every key is checked first: an unknown one raises `ArgumentError`.
   """
-  @spec set(String.t(), keyword()) :: :ok | :error
+  @spec set(String.t(), keyword()) :: :ok | :error | {:error, :protected}
   def set(slug, changes) when is_list(changes) do
-    Enum.each(changes, fn {key, _value} ->
-      unless key == :options or key in @settings,
-        do: raise(ArgumentError, "unknown app setting #{inspect(key)}")
-    end)
+    validate_settings!(Keyword.delete(changes, :options))
 
+    if Keyword.has_key?(changes, :boot) or Keyword.has_key?(changes, :watchdog),
+      do: unprotected(slug, fn -> do_set(slug, changes) end),
+      else: do_set(slug, changes)
+  end
+
+  @doc """
+  `set/2` for per-install settings without its protection, for boot's own
+  default apps (`Vagus.App.Units.install_default/1`); no request reaches it.
+  """
+  @spec put_settings(String.t(), keyword()) :: :ok | :error
+  def put_settings(slug, settings) when is_list(settings) do
+    validate_settings!(settings)
+    do_set(slug, settings)
+  end
+
+  defp validate_settings!(settings) do
+    Enum.each(settings, fn {key, _value} ->
+      unless key in @settings, do: raise(ArgumentError, "unknown app setting #{inspect(key)}")
+    end)
+  end
+
+  defp do_set(slug, changes) do
     case ask_healing(slug, {:set, changes}) do
       {:ok, :ok} -> :ok
       _not_written -> :error
@@ -342,22 +361,51 @@ defmodule Vagus.App do
   def start(slug), do: slug |> command(:start, %{}) |> started(slug)
 
   @spec stop(String.t()) :: :ok | {:error, term()}
-  def stop(slug), do: command(slug, :stop, %{})
+  def stop(slug), do: unprotected(slug, fn -> command(slug, :stop, %{}) end)
 
   @spec restart(String.t()) :: {:ok, map()} | {:error, term()}
-  def restart(slug), do: slug |> command(:restart, %{}) |> started(slug)
+  def restart(slug),
+    do: unprotected(slug, fn -> slug |> command(:restart, %{}) |> started(slug) end)
 
   @spec uninstall(String.t()) :: :ok | {:error, term()}
-  def uninstall(slug), do: command(slug, :uninstall, %{})
+  def uninstall(slug), do: unprotected(slug, fn -> command(slug, :uninstall, %{}) end)
+
+  @doc """
+  The agent flavor's orchestrator app, which holds the board's agent login
+  and makes its workers. A request may not stop, restart, uninstall or
+  restore it, nor change its `boot` or `watchdog`: from inside the board
+  that is the agent cutting off its own control. `update/2` stays allowed,
+  since an image bump is legitimate and starts it again. Shutdown halts it
+  through units, not through these.
+  """
+  @spec orchestrator?(String.t() | nil) :: boolean()
+  def orchestrator?(slug) do
+    orchestrator = Application.get_env(:vagus, :orchestrator_app)
+    orchestrator != nil and slug == orchestrator
+  end
+
+  defp unprotected(slug, fun), do: if(orchestrator?(slug), do: {:error, :protected}, else: fun.())
 
   @doc """
   Pulls the image and records the app installed, wanted `:stopped` unless
   `wanted: :started` says boot should start it. An installed slug is refused
   by its process before any pull, as upstream does.
+
+  `settings:` are per-install settings committed with the install itself.
+  They skip `set/2`'s protection, which guards against requests and would
+  otherwise leave the orchestrator app with no way to get its boot and
+  watchdog; no request reaches this option.
   """
   @spec install(Config.t(), keyword()) :: :ok | {:error, :already_installed | term()}
   def install(%Config{slug: slug} = config, opts \\ []) do
-    args = %{config: config, wanted: Keyword.get(opts, :wanted, :stopped)}
+    settings = Keyword.get(opts, :settings, [])
+    validate_settings!(settings)
+
+    args = %{
+      config: config,
+      wanted: Keyword.get(opts, :wanted, :stopped),
+      settings: Map.new(settings)
+    }
 
     case Instances.ensure(slug) do
       {:ok, pid} -> call_op(pid, {:install, args})
@@ -469,11 +517,26 @@ defmodule Vagus.App do
   # The store entry's own `config.slug` is the bare app slug; installed apps
   # run under the store slug, as `handle_install` renames it.
   defp store_target(slug) do
-    case Store.get(slug) do
-      {:ok, %{config: config}} -> {:ok, %{config | slug: slug}}
+    case latest_config(slug) do
+      {:ok, config} -> {:ok, %{config | slug: slug}}
       :error -> {:error, :not_in_store}
     end
   end
+
+  @doc """
+  The config an update of `slug` would install: the store's entry, else a
+  default app's embedded config, which no store lists and which a newer
+  firmware carries at a newer version.
+  """
+  @spec latest_config(String.t()) :: {:ok, Config.t()} | :error
+  def latest_config(slug) do
+    with :error <- entry_config(Store.get(slug)),
+         {:error, _no_builtin} <- Units.builtin_config(slug),
+         do: :error
+  end
+
+  defp entry_config({:ok, %{config: config}}), do: {:ok, config}
+  defp entry_config(:error), do: :error
 
   defp report_stage(opts, stage, progress) do
     Vagus.Jobs.update(
@@ -511,7 +574,7 @@ defmodule Vagus.App do
       |> Map.new()
       |> Map.merge(%{staging_dir: staging_dir, options: options, start?: start?})
 
-    command(slug, :restore, args)
+    unprotected(slug, fn -> command(slug, :restore, args) end)
   end
 
   # The container was started as asked, and boot would report a running app

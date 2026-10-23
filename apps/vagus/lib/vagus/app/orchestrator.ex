@@ -12,12 +12,21 @@ defmodule Vagus.App.Orchestrator do
 
   Boot:
 
-    1. the default native app is installed if missing, and on that fresh
-       install recorded as wanted started;
+    1. each native one of `default_apps` is installed if missing, in order,
+       and on that fresh install recorded as wanted started; a container one
+       is installed once the gates are behind, since its install pulls an
+       image, in a unit that is spawned and never awaited, which starts it
+       once installed. One that fails is logged and tried again next boot;
     2. the `tree` gate, then native apps get their boot rule: they need no
        engine, so an offline boot still brings the broker up;
     3. the `engine`, `network` and `api` gates (`Vagus.App.Gates`), each
-       retried until it passes or its tries run out, then carried past;
+       retried until it passes or its tries run out, then carried past; in
+       the agent-dev-board flavor `dist` sits between `network` (its node
+       name carries the LAN address) and `api`, so the orchestrator app finds
+       the session exported when its stage comes. A gate answering
+       `{:fatal, reason}` halts the boot there, logged, and so does `dist`
+       running out of tries: the flavor is no use without it. A halted boot
+       starts nothing more, and sends no `startup: complete`;
     4. the stages, each awaited up to its budget, then carried past:
 
        | config `startup`      | stage         |
@@ -49,8 +58,9 @@ defmodule Vagus.App.Orchestrator do
   killed: Core's start may be midway through stop, remove, create and start,
   and a killed one leaves Core absent until the next boot creates it. Units
   are bounded on their own (a gate check by `gate_timeout`, a stage by
-  `stage_timeout`), so that is the longest a shutdown waits; a unit still
-  running past its stage budget is left to finish beside the stop.
+  `stage_timeout`; a container default app's install is not awaited at all),
+  so that is the longest a shutdown waits; a unit still running past its
+  stage budget is left to finish beside the stop.
 
   Shutdown sends `halt` to the `application` stage, then stops Core, then
   halts every earlier stage, each group all at once. Each
@@ -87,15 +97,33 @@ defmodule Vagus.App.Orchestrator do
     "once" => :application
   }
 
-  @plan [gate: :tree, stage: :native, gate: :engine, gate: :network, gate: :api] ++
-          for(
-            stage <- [:initialize, :system, :services, :core, :application],
-            do: {:stage, stage}
-          )
+  @stages for stage <- [:initialize, :system, :services, :core, :application],
+              do: {:stage, stage}
+
+  @plan [
+          gate: :tree,
+          stage: :native,
+          gate: :engine,
+          gate: :network,
+          gate: :api,
+          install: :container
+        ] ++ @stages
+  @agent_plan [
+                gate: :tree,
+                stage: :native,
+                gate: :engine,
+                gate: :network,
+                gate: :dist,
+                gate: :api,
+                install: :container
+              ] ++ @stages
+
+  # Not carried past when their tries run out: the boot is useless without them.
+  @required_gates [:dist]
 
   @defaults [
     boot: false,
-    default_native_app: nil,
+    default_apps: [],
     gate_tries: 60,
     gate_interval: 5_000,
     tree_interval: 250,
@@ -252,11 +280,17 @@ defmodule Vagus.App.Orchestrator do
     %{state | phase: :stopping, task: task}
   end
 
+  # Classified once: a transient fetch failure on a second look would move a
+  # native app past the native stage.
   defp run_boot(cfg) do
-    if slug = cfg.default_native_app, do: install_default(slug, cfg.units)
+    {native, container} = Enum.split_with(cfg.default_apps, cfg.units.builtin_native?)
+    Enum.each(native, &install_default(&1, cfg.units))
+    cfg = Map.put(cfg, :container_defaults, container)
+
+    plan = if cfg.units.agent?.(), do: @agent_plan, else: @plan
 
     {running, put_off} =
-      Enum.reduce(@plan, {:unknown, :undecided}, fn step, {running, put_off} ->
+      Enum.reduce(plan, {:unknown, :undecided}, fn step, {running, put_off} ->
         checkpoint(0)
         put_off = decide(step, put_off, cfg)
 
@@ -269,6 +303,7 @@ defmodule Vagus.App.Orchestrator do
     cfg.units.push_complete.()
   catch
     :cancelled -> :cancelled
+    :halted -> :halted
   end
 
   @app_stages [:initialize, :system, :services, :application]
@@ -343,11 +378,47 @@ defmodule Vagus.App.Orchestrator do
     end
   end
 
+  # The stages have run or are running without it, so it starts itself.
+  defp install_and_start(slug, units) do
+    case units.install_default.(slug) do
+      :installed ->
+        case units.start.(slug) do
+          {:ok, _started} ->
+            Logger.info("Boot: default app #{slug} installed and started")
+
+          failure ->
+            Logger.warning(
+              "Boot: default app #{slug} installed, not started: #{inspect(failure)}"
+            )
+        end
+
+      :present ->
+        :ok
+
+      error ->
+        Logger.warning(
+          "Boot: default app #{slug} not installed: #{inspect(error)}; the next boot retries"
+        )
+    end
+  end
+
   # `running` is the engine's one listing of app containers, taken once the
   # engine gate is behind and carried through the stages.
   defp step({:gate, name}, running, cfg) do
     gate(name, Map.fetch!(cfg.units.gates, name), cfg, 1)
     if name == :engine, do: listing(cfg), else: running
+  end
+
+  # Not awaited: the pull can take minutes, and nothing after it needs the
+  # app. A shutdown does not wait on it either. An app mid-install has no
+  # saved file, so the stop does not list it and its pull runs on beside the
+  # stop; its start is refused once the shutdown is in flight.
+  defp step({:install, :container}, running, cfg) do
+    Enum.each(cfg.container_defaults, fn slug ->
+      spawn_unit(fn -> install_and_start(slug, cfg.units) end)
+    end)
+
+    running
   end
 
   # Not gated on whether a Core is installed: a board converted to the
@@ -402,6 +473,13 @@ defmodule Vagus.App.Orchestrator do
       :ok ->
         Logger.info("Boot: gate #{name} passed")
 
+      {:fatal, reason} ->
+        halt_boot(name, reason)
+
+      failure when tries >= cfg.gate_tries and name in @required_gates ->
+        Logger.warning("Boot: gate #{name} failing after #{tries} tries (#{inspect(failure)})")
+        halt_boot(name, {name, :tries_exhausted})
+
       failure when tries >= cfg.gate_tries ->
         Logger.warning(
           "Boot: gate #{name} failing after #{tries} tries (#{inspect(failure)}); carrying on"
@@ -414,7 +492,13 @@ defmodule Vagus.App.Orchestrator do
     end
   end
 
-  # A gate check only reads, so one past its timeout is killed.
+  defp halt_boot(name, reason) do
+    Logger.error("Boot: gate #{name} failed (#{inspect(reason)}); boot halted")
+    throw(:halted)
+  end
+
+  # The kill is the bound. Every gate tolerates it: `dist`, the one that
+  # writes, does its bring-up in a process of its own (`Vagus.Dist.enable/1`).
   defp run_bounded(fun, timeout) do
     task = spawn_unit(fun)
 
