@@ -124,12 +124,21 @@ defmodule Vagus.OS.Updater do
 
   @doc """
   The exact-name asset matcher for the legacy (unsigned) install path:
-  picks `vagus_<nerves_fw_platform>.fw` from the release's assets —
-  the names `.github/workflows/release.yml` uploads.
+  picks `vagus_<nerves_fw_platform>.fw`, or `vagus_<nerves_fw_platform>-agent.fw`
+  in the agent-dev-board flavor (`Vagus.Flavor`), from the release's assets —
+  `.github/workflows/release.yml` uploads both names. Exact names, so an agent
+  board never updates into the stock image, nor a stock board into the agent
+  one; a release missing this flavor's asset is `:no_asset_for_target`.
   """
   @spec match_firmware_asset(String.t(), [map()]) :: {:ok, map()} | {:error, atom()}
   def match_firmware_asset(_tag, assets) do
-    name = "vagus_#{FirmwareKV.platform(FirmwareKV.active_slot())}.fw"
+    platform = FirmwareKV.platform(FirmwareKV.active_slot())
+
+    name =
+      case Vagus.Flavor.get() do
+        :default -> "vagus_#{platform}.fw"
+        :agent_dev_board -> "vagus_#{platform}-agent.fw"
+      end
 
     case Enum.find(assets, fn asset -> asset.name == name end) do
       nil -> {:error, :no_asset_for_target}
@@ -196,7 +205,7 @@ defmodule Vagus.OS.Updater do
   Errors: `:busy` (check/install already in flight), `{:check_failed,
   reason}` (the fresh check errored — never falls back to a stale cache),
   `:no_release_cached` (feed has no release), `:no_asset_for_target`
-  (release lacks `vagus_<target>.fw`), `{:version_mismatch, latest}`,
+  (release lacks this target and flavor's `.fw`), `{:version_mismatch, latest}`,
   `{:insufficient_space, needed, free}`, `:free_space_unknown` (the free
   space could not be read in time).
   """

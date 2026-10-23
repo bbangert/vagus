@@ -34,6 +34,7 @@ defmodule Vagus.App.OrchestratorTest do
         halt: &report.(:halt, &1),
         ensure: fn _slug -> :ok end,
         in_flight?: fn -> false end,
+        agent?: fn -> false end,
         core_start: fn _deadline -> send(test_pid, :core_start) && :ok end,
         core_stop: fn _deadline -> send(test_pid, :core_stop) && :ok end,
         stop_containers: fn _slugs, _budget -> {:ok, [], []} end,
@@ -810,6 +811,37 @@ defmodule Vagus.App.OrchestratorTest do
       assert {:report, :core, [{"core", :pending}]} in messages
       assert {:boot_start, "a"} in messages
       assert Process.alive?(unit)
+    end
+  end
+
+  describe "agent-dev-board flavor" do
+    test "skips the Core stage, logged, and the later stages still run" do
+      apps = [app("svc", "services"), app("app", "application")]
+
+      log =
+        capture_log(fn ->
+          name = start_orchestrator(apps, %{agent?: fn -> true end})
+
+          assert collect_until(:complete) == [
+                   {:gate, :tree},
+                   {:report, :native, []},
+                   {:gate, :engine},
+                   {:gate, :network},
+                   {:gate, :api},
+                   {:report, :initialize, []},
+                   {:report, :system, []},
+                   {:boot_start, "svc"},
+                   {:report, :services, [{"svc", :ready}]},
+                   {:boot_start, "app"},
+                   {:report, :application, [{"app", :ready}]},
+                   :complete
+                 ]
+
+          assert %{phase: :up, task: nil} = await_boot(name)
+        end)
+
+      assert log =~ "Boot: Core stage skipped (agent-dev-board flavor)"
+      refute_received :core_start
     end
   end
 

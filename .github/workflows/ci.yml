@@ -73,6 +73,18 @@ jobs:
       - name: Compile (warnings as errors)
         run: mix compile --warnings-as-errors
 
+      # Exercises the flavor branch of config/flavor.exs, which stock compiles
+      # never reach; an unknown flavor must fail the build, not fall back.
+      - name: Compile agent-dev-board flavor
+        run: |
+          VAGUS_FLAVOR=agent-dev-board mix compile --warnings-as-errors
+          out=$(VAGUS_FLAVOR=bogus mix compile 2>&1) || true
+          if ! grep -q 'Unknown VAGUS_FLAVOR' <<<"$out"; then
+            echo "VAGUS_FLAVOR=bogus did not fail with the parser's message:" >&2
+            echo "$out" >&2
+            exit 1
+          fi
+
       - name: Format check
         run: mix format --check-formatted
 

@@ -23,7 +23,8 @@ defmodule Vagus.App.UnitsTest do
     core_start: 1,
     core_stop: 1,
     report: 2,
-    push_complete: 0
+    push_complete: 0,
+    agent?: 0
   }
 
   test "every unit is a function of the arity the orchestrator calls it with" do
