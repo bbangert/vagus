@@ -194,7 +194,10 @@ reconfigured or packages built, and the board exists for that work. The
 guard rails are about keeping the board reachable and recoverable (the A/B
 slot, heart, the playbook's never-do list), not about limiting privilege. A
 board on this flavor is a development appliance, never a shared or exposed
-one. The stock flavor is unaffected.
+one, and it is expendable: any error, from a wedged service to a board that no
+longer boots, is recovered by re-flashing it (over the network while it
+boots, or over EDL when it does not), not by design constraints that would get
+in the way of the work. The stock flavor is unaffected.
 
 Disabled: the Core stage is skipped at boot even if a Core version is
 installed, there is no Core watchdog and no Core provisioning. `/data` still

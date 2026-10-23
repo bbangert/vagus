@@ -10,8 +10,9 @@ the host goes through the board's BEAM.
 with no sandbox, inside the process that runs the whole board. You have full root access
 to this board by design: it is a development appliance that exists so tasks can load
 modules, hand over devices, reconfigure interfaces and build what they need. Use that
-access when a task calls for it. The "Never" list below is about keeping the board
-reachable and recoverable, not about privilege.
+access when a task calls for it. The board is expendable: if something breaks, Ben
+re-flashes it. The "Never" list below is about not wasting that re-flash on avoidable
+mistakes, not about privilege.
 
     vagus eval 'Vagus.App.slugs()'                # installed apps
     vagus eval 'Node.self()'
