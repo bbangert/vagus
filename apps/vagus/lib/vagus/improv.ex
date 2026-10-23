@@ -2,7 +2,7 @@ defmodule Vagus.Improv do
   @moduledoc """
   Improv-over-BLE Wi-Fi provisioning glue (bluetooth phase 2).
 
-  Builds the `Improv.Supervisor` child that `Vagus.Bluetooth` mounts at the
+  Builds the `Improv.Supervisor` child that `Vagus.Bluetooth.Stack` mounts at the
   tail of its `:rest_for_one` tree (the improv mounting contract: appended
   last, so a `bluetoothd` restart rebuilds the group while an Improv fault
   disturbs nothing before it) and supplies every app-side callback:
@@ -45,7 +45,7 @@ defmodule Vagus.Improv do
   @blink_half_period_ms 250
 
   @doc """
-  The `{Improv.Supervisor, opts}` child `Vagus.Bluetooth` mounts after the
+  The `{Improv.Supervisor, opts}` child `Vagus.Bluetooth.Stack` mounts after the
   BlueZ daemons.
   """
   @spec supervisor_child() :: {module(), keyword()}

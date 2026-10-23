@@ -20,33 +20,34 @@ defmodule Vagus.Bluetooth do
   `BR2_PACKAGE_BLUEZ5_UTILS`) so a misbuilt firmware degrades to "no
   Bluetooth" instead of an app-toppling supervision crash loop.
 
-  Phase 2 (vagus-improv): the tree's tail carries the Improv-over-BLE
-  Wi-Fi provisioning group + its reaper (see `Vagus.Improv` /
-  `Vagus.Improv.Reaper`), mounted per improv's contract — appended last
-  under `:rest_for_one`, so a `bluetoothd` restart rebuilds the group
-  while an Improv fault never disturbs the daemons. The group idles
-  disarmed on an online boot and is reaped once the network is up;
-  disable entirely with `improv: false` in opts.
+  The tree is this `:one_for_one` supervisor holding a single child,
+  `Vagus.Bluetooth.Stack` (`:rest_for_one`), which holds the daemon slice
+  and then the Improv-over-BLE Wi-Fi provisioning group + its reaper (see
+  `Vagus.Improv` / `Vagus.Improv.Reaper`), mounted per improv's contract:
+  appended last, so a `bluetoothd` restart rebuilds the group while an
+  Improv fault never disturbs the daemons. The group idles disarmed on an
+  online boot and is reaped once the network is up; disable entirely with
+  `improv: false` in opts.
 
   `stop/1` / `start/1` / `status/1` let the agent-dev-board orchestrator
   release the host stack over distribution so a worker container can own
   `hci0` with its own `bluetoothd`, then take it back. Stopping takes the
-  whole daemon slice down, `dbus-daemon` included, and removes its
+  whole stack down, `dbus-daemon` included, and removes its
   `/run/dbus/system_bus_socket` (dbus-daemon leaves the file behind on
   SIGTERM): every `/run/dbus` bind — HA Core's and each `host_dbus: true`
   app's — then holds no bus until `start/1`, which is why `stop/1` refuses
-  while such an app is started. The Improv tail is stopped AND deleted with
-  the daemons, not kept: it registers its GATT service through bluetoothd
-  so it cannot outlive it, and a board reached over distribution is online,
-  the state in which `Vagus.Improv.Reaper` would have removed it anyway.
-  The stopped state lives in this supervisor only — a restart of
-  `Vagus.Bluetooth` itself (or a reboot) brings the daemons back. This is a
-  consistency API for a root agent, not a guard against it.
+  while such an app is started. `start/1` brings the Improv tail back with
+  the daemons; it cannot arm again this boot and the Reaper removes it once
+  the network is up. The stopped state lives in this supervisor only — a
+  restart of `Vagus.Bluetooth` itself (or a reboot) brings the stack back.
+  This is a consistency API for a root agent, not a guard against it.
   """
 
   use Supervisor
 
   require Logger
+
+  alias Vagus.Bluetooth.Stack
 
   @default_dbus_daemon "/usr/bin/dbus-daemon"
   @default_bluetoothd "/usr/libexec/bluetooth/bluetoothd"
@@ -55,12 +56,16 @@ defmodule Vagus.Bluetooth do
   # container may well be up, so it blocks like a started one.
   @in_use_states [:startup, :started, :unknown]
 
+  # Past muontrap's SIGTERM -> 500 ms -> SIGKILL -> reap sequence, so only a
+  # wedged wrapper runs into it.
+  @os_exit_timeout_ms 3_000
+  @os_exit_poll_ms 50
+
   def start_link(opts \\ []) do
     # Normalize the daemon paths INTO opts before anything reads them, so the
-    # existence check here and the child specs `Bluez.children/1` builds in
-    # `init/1` can never disagree — Bluez applies its own defaults for these
-    # keys, which happen to match @default_* today but aren't contractually
-    # tied to them (Copilot review, PR #4).
+    # existence check here and the child specs `Bluez.children/1` builds can
+    # never disagree — Bluez applies its own defaults for these keys, which
+    # happen to match @default_* today but aren't contractually tied to them.
     opts =
       opts
       |> Keyword.put_new(:dbus_daemon_path, @default_dbus_daemon)
@@ -82,23 +87,23 @@ defmodule Vagus.Bluetooth do
 
   @impl Supervisor
   def init(opts) do
-    # Creates /run/dbus (+ machine-id, stale-socket cleanup) and
-    # /data/bluetooth before the daemons launch; idempotent per restart.
-    Keyword.get(opts, :prepare_runtime, &Bluez.prepare_runtime/0).()
+    stack_name = Module.concat(Keyword.get(opts, :name, __MODULE__), Stack)
 
-    # Same explicit budget as the upstream tree: a daemon crash-loop
-    # escalates to Vagus.Supervisor within a minute instead of cycling
-    # silently forever.
-    Supervisor.init(Keyword.get_lazy(opts, :children, fn -> children(opts) end),
-      strategy: :rest_for_one,
-      max_restarts: 10,
-      max_seconds: 60
+    # The crash-loop budget is the Stack's own (10 in 60 s). Zero here keeps
+    # escalation as it was before the split: a Stack that gives up takes
+    # this supervisor down at once, so Vagus.Supervisor sees one exit and
+    # spends one restart of its own. `terminate_child`/`restart_child` from
+    # stop/start count against neither.
+    Supervisor.init([{Stack, Keyword.put(opts, :stack_name, stack_name)}],
+      strategy: :one_for_one,
+      max_restarts: 0,
+      max_seconds: 1
     )
   end
 
   @doc """
-  The full child list: the daemon slice plus (unless `improv: false`) the
-  Improv provisioning tail. Public for child-order tests.
+  The Stack's full child list: the daemon slice plus (unless `improv: false`)
+  the Improv provisioning tail. Public for child-order tests.
   """
   @spec children(keyword()) :: [Supervisor.child_spec() | {module(), term()} | module()]
   def children(opts \\ []) do
@@ -136,143 +141,181 @@ defmodule Vagus.Bluetooth do
   defp child_id(_), do: nil
 
   @doc """
-  Stops the daemon slice and drops the Improv tail (see the moduledoc).
-  `:ok` when already stopped; `{:error, {:in_use, slugs}}` while a started
-  app other than the orchestrator has `host_dbus: true` — the orchestrator
-  must stop those (upstream's Matter Server and Terminal & SSH both set
-  it) before taking Bluetooth. The orchestrator itself is
-  exempt: its bind is a convenience, it does not need the host bluetoothd.
+  Stops the whole stack (see the moduledoc) and returns once both daemons'
+  OS processes have exited, so the caller can hand `hci0` on immediately.
+  `:ok` when already stopped, whatever apps run; otherwise
+  `{:error, {:in_use, slugs}}` while a started app other than the
+  orchestrator has `host_dbus: true` — the orchestrator must stop those
+  (upstream's Matter Server and Terminal & SSH both set it) before taking
+  Bluetooth. The orchestrator itself is exempt: its bind is a convenience,
+  it does not need the host bluetoothd. The refusal is not mirrored on app
+  start. `{:error, {:still_running, id}}` when a daemon outlives the wait.
 
   Opts: `:server`, `:apps_fun` (default `Vagus.App.list/0`),
-  `:socket_path` (default `Bluez.socket_path/0`).
+  `:socket_path` (default `Bluez.socket_path/0`), `:os_pid_fun` (default
+  `MuonTrap.Daemon.os_pid/1`), `:proc_alive_fun`, `:os_exit_timeout_ms`.
   """
-  @spec stop(keyword()) :: :ok | {:error, :absent | {:in_use, [String.t()]} | term()}
-  # The socket path is Bluez's constant unless a test injects one; nothing
-  # request-derived reaches it.
-  # sobelow_skip ["Traversal.FileModule"]
+  @spec stop(keyword()) ::
+          :ok
+          | {:error,
+             :absent | {:in_use, [String.t()]} | {:apps, term()} | {:still_running, atom()}}
   def stop(opts \\ []) do
     server = Keyword.get(opts, :server, __MODULE__)
 
-    serialized(server, fn ->
-      with {:ok, children} <- children_of(server),
-           :ok <- refuse_in_use(Keyword.get(opts, :apps_fun, &Vagus.App.list/0)) do
-        {tail, daemons} = split(children)
-
-        with :ok <- each(tail, &drop(server, &1)),
-             :ok <- each(ids(daemons), &Supervisor.terminate_child(server, &1)) do
-          _ = File.rm(Keyword.get(opts, :socket_path, Bluez.socket_path()))
-          :ok
-        end
-      end
-    end)
-  end
-
-  @doc """
-  Restarts the stopped daemon children in their original order and
-  positions, so `:rest_for_one` semantics are as at boot (minus Improv,
-  which `stop/1` dropped for good). `:ok` when already running.
-
-  Opts: `:server`, `:prepare_runtime` (default `Bluez.prepare_runtime/0`).
-  """
-  @spec start(keyword()) :: :ok | {:error, :absent | {term(), term()}}
-  def start(opts \\ []) do
-    server = Keyword.get(opts, :server, __MODULE__)
-
-    serialized(server, fn ->
-      with {:ok, children} <- children_of(server) do
-        {_tail, daemons} = split(children)
-        stopped = for {id, :undefined, _type, _mods} <- daemons, do: id
-
-        # A worker's own dbus-daemon on a shared /run/dbus may have left its
-        # socket; a stale file waves BusReady through to ECONNREFUSED. Only
-        # when dbus itself restarts — never unlink a live daemon's socket.
-        if :dbus_daemon in stopped,
-          do: Keyword.get(opts, :prepare_runtime, &Bluez.prepare_runtime/0).()
-
-        stopped |> Enum.reverse() |> each(&restart(server, &1))
-      end
-    end)
-  end
-
-  @doc "`:absent` when `start_link/1` returned `:ignore` (or the tree is down)."
-  @spec status(keyword()) :: :running | :stopped | :absent
-  def status(opts \\ []) do
-    case children_of(Keyword.get(opts, :server, __MODULE__)) do
-      {:ok, children} ->
-        if Enum.any?(children, &match?({:bluetoothd, pid, _, _} when is_pid(pid), &1)),
-          do: :running,
-          else: :stopped
-
-      {:error, :absent} ->
-        :absent
+    # No lock: the parent supervisor serialises terminate_child and
+    # restart_child, so a concurrent start/1 lands between whole calls; the
+    # socket is removed only if the stack is still stopped after the wait,
+    # so a start that won the race keeps its fresh socket.
+    case stack(server) do
+      {:ok, :undefined} -> :ok
+      {:ok, state} -> stop_running(server, state, opts)
+      error -> error
     end
   end
 
-  # Concurrent stop/start over distribution would interleave their
-  # per-child calls and leave a half-torn tree.
-  defp serialized(server, fun), do: :global.trans({{__MODULE__, server}, self()}, fun, [node()])
+  defp stop_running(server, state, opts) do
+    with :ok <- refuse_in_use(Keyword.get(opts, :apps_fun, &Vagus.App.list/0)) do
+      # Read before terminating: once the Daemon GenServers are gone nothing
+      # on the BEAM side still knows the OS pids.
+      os_pids = os_pids(state, Keyword.get(opts, :os_pid_fun, &MuonTrap.Daemon.os_pid/1))
 
-  defp children_of(server) do
-    if GenServer.whereis(server),
-      do: {:ok, Supervisor.which_children(server)},
-      else: {:error, :absent}
+      with :ok <- terminate(server),
+           :ok <- await_exit(os_pids, opts) do
+        if stack(server) == {:ok, :undefined},
+          do: remove_socket(Keyword.get(opts, :socket_path, Bluez.socket_path()))
+
+        :ok
+      end
+    end
+  end
+
+  # The socket path is Bluez's constant unless a test injects one; nothing
+  # request-derived reaches it.
+  # sobelow_skip ["Traversal.FileModule"]
+  defp remove_socket(path), do: _ = File.rm(path)
+
+  defp terminate(server) do
+    case Supervisor.terminate_child(server, Stack) do
+      :ok -> :ok
+      {:error, :not_found} -> {:error, :absent}
+    end
   catch
     :exit, _ -> {:error, :absent}
   end
 
-  # which_children lists newest-first, so everything before :bluetoothd is
-  # the tail started after it, and the rest is the daemon slice in reverse
-  # start order — the order to stop it in (bluetoothd before dbus).
-  defp split(children) do
-    {tail, daemons} = Enum.split_while(children, &(elem(&1, 0) != :bluetoothd))
-    {ids(tail), daemons}
+  defp os_pids(stack, os_pid_fun) when is_pid(stack) do
+    for {id, pid, _type, _mods} <- which_children(stack),
+        id in [:dbus_daemon, :bluetoothd] and is_pid(pid),
+        os_pid = safe_os_pid(os_pid_fun, pid),
+        is_integer(os_pid),
+        do: {id, os_pid}
   end
 
-  defp ids(children), do: Enum.map(children, &elem(&1, 0))
+  defp os_pids(_restarting, _os_pid_fun), do: []
 
-  defp refuse_in_use(apps_fun) do
-    slugs =
-      for %{config: %{slug: slug, host_dbus: true}, state: state} <- apps_fun.(),
-          state in @in_use_states,
-          not Vagus.App.orchestrator?(slug),
-          do: slug
-
-    if slugs == [], do: :ok, else: {:error, {:in_use, Enum.sort(slugs)}}
+  defp which_children(sup) do
+    Supervisor.which_children(sup)
+  catch
+    :exit, _ -> []
   end
 
-  # Deleted, not just terminated: a kept spec would come back on the next
-  # bluetoothd cascade. `:not_found` is the Reaper having got there first.
-  defp drop(server, id) do
-    case Supervisor.terminate_child(server, id) do
-      :ok -> delete(server, id)
-      {:error, :not_found} -> :ok
+  # A daemon exiting between which_children and the call has no OS pid
+  # left to wait for.
+  defp safe_os_pid(fun, pid) do
+    fun.(pid)
+  catch
+    :exit, _ -> nil
+  end
+
+  # The pid is the muontrap wrapper's, which exits only after reaping its
+  # daemon, so its /proc entry vanishing means the daemon is gone too.
+  defp await_exit(os_pids, opts) do
+    alive? = Keyword.get(opts, :proc_alive_fun, &proc_alive?/1)
+    timeout = Keyword.get(opts, :os_exit_timeout_ms, @os_exit_timeout_ms)
+    await_exit(os_pids, alive?, System.monotonic_time(:millisecond) + timeout)
+  end
+
+  defp await_exit(os_pids, alive?, deadline) do
+    case Enum.filter(os_pids, fn {_id, os_pid} -> alive?.(os_pid) end) do
+      [] ->
+        :ok
+
+      [{id, _} | _] = alive ->
+        if System.monotonic_time(:millisecond) >= deadline do
+          {:error, {:still_running, id}}
+        else
+          Process.sleep(@os_exit_poll_ms)
+          await_exit(alive, alive?, deadline)
+        end
     end
   end
 
-  defp delete(server, id) do
-    case Supervisor.delete_child(server, id) do
-      :ok -> :ok
-      {:error, :not_found} -> :ok
-      {:error, reason} -> {:error, {id, reason}}
-    end
-  end
+  # An OS pid read from the port, never request-derived.
+  # sobelow_skip ["Traversal.FileModule"]
+  defp proc_alive?(os_pid), do: File.exists?("/proc/#{os_pid}")
 
-  defp restart(server, id) do
-    case Supervisor.restart_child(server, id) do
+  @doc """
+  Starts the stack again in boot order, the Improv tail included. `:ok`
+  when already running; `{:error, :busy}` while the supervisor is retrying
+  a failed restart of it.
+
+  Opts: `:server`.
+  """
+  @spec start(keyword()) :: :ok | {:error, :absent | :busy | term()}
+  def start(opts \\ []) do
+    case Supervisor.restart_child(Keyword.get(opts, :server, __MODULE__), Stack) do
       {:ok, _pid} -> :ok
       {:ok, _pid, _info} -> :ok
       {:error, :running} -> :ok
-      {:error, reason} -> {:error, {id, reason}}
+      {:error, :restarting} -> {:error, :busy}
+      {:error, :not_found} -> {:error, :absent}
+      {:error, reason} -> {:error, reason}
+    end
+  catch
+    :exit, _ -> {:error, :absent}
+  end
+
+  @doc """
+  `:running` also while the supervisor is retrying a failed restart;
+  `:absent` when `start_link/1` returned `:ignore` (or the tree is down).
+  """
+  @spec status(keyword()) :: :running | :stopped | :absent
+  def status(opts \\ []) do
+    case stack(Keyword.get(opts, :server, __MODULE__)) do
+      {:ok, :undefined} -> :stopped
+      {:ok, _pid_or_restarting} -> :running
+      {:error, :absent} -> :absent
     end
   end
 
-  defp each(ids, fun) do
-    Enum.reduce_while(ids, :ok, fn id, :ok ->
-      case fun.(id) do
-        :ok -> {:cont, :ok}
-        {:error, :not_found} -> {:cont, :ok}
-        error -> {:halt, error}
-      end
-    end)
+  defp stack(server) do
+    case List.keyfind(Supervisor.which_children(server), Stack, 0) do
+      {Stack, state, _type, _mods} -> {:ok, state}
+      nil -> {:error, :absent}
+    end
+  catch
+    :exit, _ -> {:error, :absent}
+  end
+
+  defp refuse_in_use(apps_fun) do
+    with {:ok, apps} <- list_apps(apps_fun) do
+      slugs =
+        for %{config: %{slug: slug, host_dbus: true}, state: state} <- apps,
+            state in @in_use_states,
+            not Vagus.App.orchestrator?(slug),
+            do: slug
+
+      if slugs == [], do: :ok, else: {:error, {:in_use, Enum.sort(slugs)}}
+    end
+  end
+
+  # The listing calls every app's process; a failure there is the caller's
+  # answer, not a crash in the erpc handler.
+  defp list_apps(apps_fun) do
+    {:ok, apps_fun.()}
+  rescue
+    error -> {:error, {:apps, error}}
+  catch
+    :exit, reason -> {:error, {:apps, reason}}
   end
 end

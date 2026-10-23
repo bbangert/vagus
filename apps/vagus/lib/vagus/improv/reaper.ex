@@ -10,7 +10,7 @@ defmodule Vagus.Improv.Reaper do
   whole `:one_for_all` group is dead weight. This GenServer waits for
   exactly that state, then `Supervisor.terminate_child/2` +
   `Supervisor.delete_child/2` the `Improv.Supervisor` child out of
-  `Vagus.Bluetooth` and stops itself (`:normal`, `restart: :transient`).
+  `Vagus.Bluetooth.Stack` and stops itself (`:normal`, `restart: :transient`).
 
   Supervision notes:
 
@@ -18,7 +18,7 @@ defmodule Vagus.Improv.Reaper do
       `:rest_for_one` cascade (that's crash-restart behavior only), and
       `delete_child` removes the spec, so a later `bluetoothd` restart
       cannot resurrect the group.
-    * Positioned last in `Vagus.Bluetooth`'s tree — after the Improv group
+    * Positioned last in `Vagus.Bluetooth.Stack`'s tree — after the Improv group
       it reaps — so terminating an EARLIER sibling is safe, and its own
       normal exit disturbs nothing.
     * The disarmed-check answers `:disarmed` when the Improv manager isn't
@@ -132,7 +132,7 @@ defmodule Vagus.Improv.Reaper do
   # resurrect the group via the :rest_for_one cascade before the spec is
   # deleted, making delete_child answer {:error, :running} — so every
   # non-:ok return is handled (a bare `:ok =` match here would crash the
-  # reaper and spend Vagus.Bluetooth restart budget on a benign race;
+  # reaper and spend Vagus.Bluetooth.Stack restart budget on a benign race;
   # Copilot review, PR #5). The cascade has fully completed by the time
   # our own call returns, so ONE retry of the pair closes the window; if
   # something still holds the group alive after that, log and leave it —
@@ -141,7 +141,7 @@ defmodule Vagus.Improv.Reaper do
   # another pass. Public with the supervisor injectable purely so the
   # happy/idempotent paths are unit-testable against a toy supervisor.
   @spec reap(Supervisor.supervisor(), non_neg_integer()) :: :ok
-  def reap(supervisor \\ Vagus.Bluetooth, attempts_left \\ 1) do
+  def reap(supervisor \\ Vagus.Bluetooth.Stack, attempts_left \\ 1) do
     with :ok <- Supervisor.terminate_child(supervisor, Improv.Supervisor),
          :ok <- Supervisor.delete_child(supervisor, Improv.Supervisor) do
       :ok
