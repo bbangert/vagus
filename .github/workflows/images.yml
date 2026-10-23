@@ -52,8 +52,10 @@ jobs:
           else
             TAG=${TAG#"${TAG%%[![:space:]]*}"}
             TAG=${TAG%"${TAG##*[![:space:]]}"}
-            if [ -z "$TAG" ] || [ "$TAG" = latest ]; then
-              echo "::error::dispatch tag must be non-empty and not 'latest'"
+            # metadata-action parses the tag line as CSV, so `a,value=latest` would
+            # smuggle in a second value past the latest gate.
+            if ! [[ $TAG =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]] || [ "$TAG" = latest ]; then
+              echo "::error::dispatch tag must be a valid Docker tag (A-Za-z0-9_.-, max 128, no leading . or -) and not 'latest'"
               exit 1
             fi
             echo "tag=$TAG" >> "$GITHUB_OUTPUT"

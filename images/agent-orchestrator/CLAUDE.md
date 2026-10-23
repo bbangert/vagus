@@ -25,9 +25,10 @@ returns data over many small ones (each call starts a fresh BEAM here). At most 
 Only through `Vagus.Runtime.Podman.Cmd.run(args, opts)`; `:timeout_ms` is required.
 It returns `{:ok, output}`, `{:exit, code, output}` (podman failed; output has its error)
 or `{:error, :timeout | :unavailable | :output_too_large | ...}`. Output is capped at
-1 MiB (`cap: bytes`; `truncate: true` keeps the head instead of failing). Add
-`stderr_apart: true` when you parse stdout as JSON; it raises combined with `truncate`
-or `discard_stdout`, but takes `cap`.
+1 MiB (`cap: bytes`; `truncate: true` keeps the head instead of failing). Do not pass
+`stderr_apart` from `vagus eval` (it needs a Host permit the eval does not hold). Stdout
+and stderr come back merged, so when parsing stream-json keep only lines that start with
+`{`, or have the worker write its result to a file under `/work` and read that.
 
     vagus eval 'Vagus.Runtime.Podman.Cmd.run(["ps", "-a", "--format", "{{.Names}} {{.Status}}"], timeout_ms: 30_000)'
     VAGUS_TIMEOUT=960000 vagus eval 'Vagus.Runtime.Podman.Cmd.run(["pull", "ghcr.io/bbangert/vagus-agent-base:<tag>"], timeout_ms: 900_000)'
@@ -77,7 +78,7 @@ Always `--user agent -e HOME=/home/agent`; a root exec leaves root-owned files b
     VAGUS_TIMEOUT=3660000 vagus eval 'Vagus.Runtime.Podman.Cmd.run(["exec", "--user", "agent", "-e", "HOME=/home/agent", "-e", "CLAUDE_CONFIG_DIR=/claude",
       "-w", "/work", "task-x", "claude", "-p", "<task>", "--output-format", "stream-json",
       "--verbose", "--permission-mode", "auto", "--permission-prompts", "none"],
-      timeout_ms: 3_600_000, cap: 16_000_000, stderr_apart: true)'
+      timeout_ms: 3_600_000, cap: 16_000_000)'
 
 The last stream-json line is the result and carries `session_id`; continue with
 `"--resume", "<session_id>"` in the same container. A stream past the cap is
