@@ -48,7 +48,7 @@ env:
   # must be the same ref. Bump when the systems cut a new release.
   # rubik_pi3 is in the build matrix, so the tag's release must include its
   # prebuilt artifact too.
-  SYSTEM_RELEASE_TAG: v0.5.0
+  SYSTEM_RELEASE_TAG: v0.6.0
   NERVES_DL_DIR: /home/runner/.nerves/dl
   GH_TOKEN: ${{ github.token }}
   # The operator's SSH public keys (newline-separated authorized_keys
