@@ -109,6 +109,7 @@ defmodule Vagus.Network.Nat do
 
   @loaded_key {__MODULE__, :loaded}
   @lab_key {__MODULE__, :lab}
+  @lock_retries 7
 
   @doc "Whether DNAT management is switched on (`config :vagus, :supervisor_nat`)."
   @spec enabled?() :: boolean()
@@ -139,19 +140,15 @@ defmodule Vagus.Network.Nat do
       (default: the list `set_lab/2` stored); a name failing `valid_ifname?/1`
       is `{:error, :invalid_ifname}` and nothing is loaded
 
+  `{:error, :busy}` when another load holds the table past `:lock_retries`.
+
   Test seams: `:loaded_key`, `:lab_key`.
   """
   @spec ensure(keyword()) :: :ok | {:error, term()}
   def ensure(opts \\ []) do
-    if Keyword.get(opts, :enabled, enabled?()) do
-      with {:ok, text} <- ruleset(opts),
-           :ok <- load_nft(text, opts),
-           :ok <- enable_forwarding(opts) do
-        :persistent_term.put(Keyword.get(opts, :loaded_key, @loaded_key), true)
-      end
-    else
-      :ok
-    end
+    if Keyword.get(opts, :enabled, enabled?()),
+      do: serialized(opts, fn -> load(opts) end),
+      else: :ok
   end
 
   @doc """
@@ -161,22 +158,48 @@ defmodule Vagus.Network.Nat do
   @spec set_lab([{String.t(), String.t()}], keyword()) :: :ok | {:error, term()}
   def set_lab(lab, opts \\ []) when is_list(lab) do
     key = Keyword.get(opts, :lab_key, @lab_key)
-    previous = :persistent_term.get(key, [])
 
-    with :ok <- check_lab(lab),
-         :ok <- ensure(Keyword.put(opts, :lab, lab)) do
-      :persistent_term.put(key, lab)
-    else
-      {:error, :invalid_ifname} = error ->
-        error
+    with :ok <- check_lab(lab) do
+      serialized(opts, fn ->
+        previous = :persistent_term.get(key, [])
 
-      {:error, _} = error ->
-        # The table has three writers (the boot gate, a bridged start's
-        # ensure_loaded, Lab), and a load that failed after nft (the sysctl
-        # step) leaves the new rules in the kernel: put the old list back
-        # there too so it matches the stored one. Best effort.
-        _ = ensure(Keyword.put(opts, :lab, previous))
-        error
+        case maybe_load(Keyword.put(opts, :lab, lab)) do
+          :ok ->
+            :persistent_term.put(key, lab)
+
+          {:error, _} = error ->
+            # A load that failed after nft (the sysctl step) leaves the new
+            # rules in the kernel: put the old list back there too so it
+            # matches the stored one. Best effort.
+            _ = maybe_load(Keyword.put(opts, :lab, previous))
+            error
+        end
+      end)
+    end
+  end
+
+  defp maybe_load(opts),
+    do: if(Keyword.get(opts, :enabled, enabled?()), do: load(opts), else: :ok)
+
+  defp load(opts) do
+    with {:ok, text} <- ruleset(opts),
+         :ok <- load_nft(text, opts),
+         :ok <- enable_forwarding(opts) do
+      :persistent_term.put(Keyword.get(opts, :loaded_key, @loaded_key), true)
+    end
+  end
+
+  # The table has three writers (the boot gate, a bridged start's
+  # ensure_loaded, Lab), and each renders the stored list before its load
+  # lands: unserialized, a render taken before another writer's commit loads
+  # after it and the kernel no longer matches the list. The retries' backoff
+  # (~12 s on average for the default) outlasts one bounded nft run.
+  defp serialized(opts, fun) do
+    lock = {{__MODULE__, Keyword.get(opts, :lab_key, @lab_key)}, self()}
+
+    case :global.trans(lock, fun, [node()], Keyword.get(opts, :lock_retries, @lock_retries)) do
+      :aborted -> {:error, :busy}
+      result -> result
     end
   end
 

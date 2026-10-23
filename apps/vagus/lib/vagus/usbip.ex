@@ -12,9 +12,11 @@ defmodule Vagus.USBIP do
   host-network container (`vagus-usbipd`) from the first share to the last.
   Its name has no `addon_` prefix, so nothing treats it as an app.
 
-  A device that is unplugged is forgotten. The kernel keeps its port armed
-  (see `forget/2`), so a device that later appears on usbip-host without
-  being shared is handed back to its own driver. Devices already bound to
+  A shared device that detaches is kept for a grace period (see
+  `@reattach_ms`) and picked up again if it comes back on the same busid;
+  one that stays gone is forgotten. The kernel keeps its port armed (see
+  `forget/2`), so a device that later appears on usbip-host without being
+  shared is handed back to its own driver. Devices already bound to
   usbip-host when this server starts (it crashed) are adopted, so they can
   still be unshared.
   """
@@ -35,12 +37,22 @@ defmodule Vagus.USBIP do
   # The first `run` may pull the image.
   @run_timeout_ms 120_000
   @stop_timeout_ms 30_000
+  # Binding can make a device re-enumerate (the onboard AIC8800 does; DFU and
+  # some JTAG adapters reset on bind), so it detaches and comes back on the
+  # same busid about a second later. A real unplug never returns this fast.
+  @reattach_ms 5_000
   # The longest call is a share that finds usbipd dead and then fails its
   # bind: modprobe, the liveness inspect, `podman run`, then the stop.
   @call_timeout_ms @cmd_timeout_ms + @inspect_timeout_ms + @run_timeout_ms +
                      @stop_timeout_ms + 3 * PodmanCmd.kill_budget_ms() + 5_000
 
-  @type share :: %{id: String.t(), busid: String.t(), vid_pid: String.t() | nil}
+  @type share :: %{
+          id: String.t(),
+          busid: String.t(),
+          vid_pid: String.t() | nil,
+          serial: String.t() | nil,
+          state: :attached | :detached
+        }
   @type call_error :: :not_running | :timeout | {:exit, term()}
   @type error ::
           call_error()
@@ -107,10 +119,18 @@ defmodule Vagus.USBIP do
           Application.get_env(:vagus, __MODULE__, [])[:image] || @default_image
         end),
       watcher: Keyword.get(opts, :watcher, Devices.Watcher),
+      # The Watcher is :ignore exactly when NervesUEvent is absent; otherwise a
+      # missing one is mid-restart and must be retried, or no event is heard.
+      watcher_expected?:
+        Keyword.get_lazy(opts, :watcher_expected?, fn -> Process.whereis(NervesUEvent) != nil end),
       subscribe: Keyword.get(opts, :subscribe, &Devices.Watcher.subscribe/1),
       devices_opts:
         Keyword.get_lazy(opts, :devices_opts, fn -> Keyword.take(opts, [:sysfs_root]) end),
       trace: Keyword.get(opts, :trace),
+      send_after: Keyword.get(opts, :send_after, &Process.send_after/3),
+      reattach_ms: Keyword.get(opts, :reattach_ms, @reattach_ms),
+      # busid => token of the grace timer armed when that share detached.
+      timers: %{},
       watcher_ref: nil,
       daemon: :down,
       shares: %{}
@@ -122,9 +142,9 @@ defmodule Vagus.USBIP do
   @impl GenServer
   def handle_continue(:start, state) do
     state = adopt(state)
-    # Not expected: the Watcher is :ignore wherever nerves_uevent is absent,
-    # and there a missing Watcher is the idle case, not one to retry.
-    {:noreply, subscribe(state, &Resubscribe.start(&1, &2, :resubscribe, false))}
+
+    {:noreply,
+     subscribe(state, &Resubscribe.start(&1, &2, :resubscribe, state.watcher_expected?))}
   end
 
   @impl GenServer
@@ -153,13 +173,26 @@ defmodule Vagus.USBIP do
   @impl GenServer
   def handle_info({:device, :removed, "usb:" <> busid}, %{shares: shares} = state)
       when is_map_key(shares, busid) do
-    {:noreply, forget(busid, state)}
+    {:noreply, detach(busid, state)}
   end
 
-  def handle_info({:device, :added, %{id: "usb:" <> busid}}, %{shares: shares} = state)
-      when not is_map_key(shares, busid) do
-    if busid?(busid) and driver(busid, state) == @driver, do: release_captured(busid, state)
+  def handle_info({:device, :added, %{id: "usb:" <> busid}}, state) do
+    state = if detached?(busid, state), do: reattach(busid, state), else: state
+
+    if busid?(busid) and not Map.has_key?(state.shares, busid) and
+         driver(busid, state) == @driver,
+       do: release_captured(busid, state)
+
     {:noreply, state}
+  end
+
+  def handle_info({:reattach_timeout, busid, token}, state) do
+    if detached?(busid, state) and state.timers[busid] == token do
+      Logger.info("Vagus.USBIP: #{busid} did not come back; forgetting it")
+      {:noreply, forget(busid, state)}
+    else
+      {:noreply, state}
+    end
   end
 
   def handle_info({:device, _event, _}, state), do: {:noreply, state}
@@ -183,8 +216,19 @@ defmodule Vagus.USBIP do
          :ok <- modprobe(state),
          {:ok, state} <- ensure_daemon(state) do
       case bind(busid, state) do
-        :ok -> {:ok, %{id: device.id, busid: busid, vid_pid: device.vid_pid}, state}
-        {:error, reason} -> {:error, reason, stop_if_idle(state)}
+        :ok ->
+          share = %{
+            id: device.id,
+            busid: busid,
+            vid_pid: device.vid_pid,
+            serial: device.serial,
+            state: :attached
+          }
+
+          {:ok, share, state}
+
+        {:error, reason} ->
+          {:error, reason, stop_if_idle(state)}
       end
     else
       {:error, reason, state} -> {:error, reason, state}
@@ -206,13 +250,29 @@ defmodule Vagus.USBIP do
     end
   end
 
-  # Plugs and unplugs that happened while unsubscribed were never heard.
+  # Plugs and unplugs that happened while unsubscribed were never heard, and
+  # a restarted Watcher inventories a swapped device without replaying them,
+  # so a present share is checked to still be the device that was lent. A
+  # detached share whose device is back missed its :added; one still gone is
+  # left to its grace timer. A forgotten share's captured device is released
+  # below.
   defp reconcile(state) do
     state =
-      state.shares
-      |> Map.keys()
-      |> Enum.reject(&File.exists?(device_path(&1, state)))
-      |> Enum.reduce(state, &forget/2)
+      Enum.reduce(state.shares, state, fn {busid, share}, state ->
+        case {share.state, File.exists?(device_path(busid, state))} do
+          {:attached, false} ->
+            forget(busid, state)
+
+          {:attached, true} ->
+            if same_device?(share, state), do: state, else: replaced(busid, state)
+
+          {:detached, true} ->
+            reattach(busid, state)
+
+          {:detached, false} ->
+            state
+        end
+      end)
 
     for busid <- bound(state),
         not Map.has_key?(state.shares, busid),
@@ -231,7 +291,67 @@ defmodule Vagus.USBIP do
   # disconnect returned early and left ALLOC: that it turns into REMOV.
   defp forget(busid, state) do
     _ = write(match_busid(state), "del " <> busid, state)
-    stop_if_idle(%{state | shares: Map.delete(state.shares, busid)})
+    stop_if_idle(drop(busid, state))
+  end
+
+  defp drop(busid, state) do
+    %{state | shares: Map.delete(state.shares, busid), timers: Map.delete(state.timers, busid)}
+  end
+
+  defp detached?(busid, state), do: match?(%{state: :detached}, state.shares[busid])
+
+  # usbipd stays up: the share is still lent while it is away.
+  defp detach(busid, state) do
+    token = make_ref()
+    _ = state.send_after.(self(), {:reattach_timeout, busid, token}, state.reattach_ms)
+    state = put_in(state.shares[busid].state, :detached)
+    put_in(state.timers[busid], token)
+  end
+
+  # A kernel entry that survived the re-enumeration already captured it;
+  # one that did not (the device came back on its own driver) is re-armed.
+  defp reattach(busid, state) do
+    cond do
+      not same_device?(state.shares[busid], state) -> replaced(busid, state)
+      driver(busid, state) == @driver -> attached(busid, state)
+      true -> rebind_share(busid, state)
+    end
+  end
+
+  defp rebind_share(busid, state) do
+    case bind(busid, state) do
+      :ok ->
+        attached(busid, state)
+
+      {:error, reason} ->
+        Logger.warning("Vagus.USBIP: rebinding #{busid} after re-enumeration: #{inspect(reason)}")
+
+        forget(busid, state)
+    end
+  end
+
+  # devnum changes with every enumeration, so a device is told apart by what
+  # it says it is. An adopted share whose device could not be read has no
+  # identity to compare, and a device not readable now is not a different one.
+  defp same_device?(share, state) do
+    case Devices.find(share.id, state.devices_opts) do
+      {:ok, device} when share.vid_pid != nil ->
+        {device.vid_pid, device.serial} == {share.vid_pid, share.serial}
+
+      _ ->
+        true
+    end
+  end
+
+  # The caller releases it if the share's armed entry captured it.
+  defp replaced(busid, state) do
+    Logger.warning("Vagus.USBIP: #{busid} is now a different device; forgetting its share")
+    forget(busid, state)
+  end
+
+  defp attached(busid, state) do
+    state = put_in(state.shares[busid].state, :attached)
+    %{state | timers: Map.delete(state.timers, busid)}
   end
 
   # The armed entry of an unplugged share claimed a new device on its port;
@@ -265,13 +385,13 @@ defmodule Vagus.USBIP do
   end
 
   defp adopted(busid, state) do
-    vid_pid =
+    {vid_pid, serial} =
       case Devices.find("usb:" <> busid, state.devices_opts) do
-        {:ok, device} -> device.vid_pid
-        {:error, _} -> nil
+        {:ok, device} -> {device.vid_pid, device.serial}
+        {:error, _} -> {nil, nil}
       end
 
-    %{id: "usb:" <> busid, busid: busid, vid_pid: vid_pid}
+    %{id: "usb:" <> busid, busid: busid, vid_pid: vid_pid, serial: serial, state: :attached}
   end
 
   defp bound(state) do
@@ -334,7 +454,9 @@ defmodule Vagus.USBIP do
 
   defp release(nil, _busid, _state), do: :ok
   defp release(:invalid, _busid, _state), do: {:error, :invalid_driver}
-  defp release(driver, busid, state), do: write(attr(driver, "unbind", state), busid, state)
+
+  defp release(driver, busid, state),
+    do: device_write(attr(driver, "unbind", state), busid, state)
 
   # usbip_bind.c leaves a device it released driverless when the bind
   # fails; `drivers_probe` hands it back to whichever driver claims it.
@@ -342,21 +464,21 @@ defmodule Vagus.USBIP do
   defp or_reprobe(error, nil, _busid, _state), do: error
 
   defp or_reprobe(error, _original, busid, state) do
-    _ = write(drivers_probe(state), busid, state)
+    _ = device_write(drivers_probe(state), busid, state)
     error
   end
 
   # Past the unbind the device is no longer lent, so it is forgotten even if
-  # a later step fails.
+  # a later step fails. A device unplugged before its :removed arrived gets
+  # only the `del` (see `device_write/4`).
   defp unshare_busid(busid, state) do
-    {unbind, result} = restore(busid, state)
-
-    state =
-      if unbind == :ok,
-        do: stop_if_idle(%{state | shares: Map.delete(state.shares, busid)}),
-        else: state
-
-    {:reply, result, state}
+    if File.dir?(device_path(busid, state)) do
+      {unbind, result} = restore(busid, state)
+      state = if unbind == :ok, do: stop_if_idle(drop(busid, state)), else: state
+      {:reply, result, state}
+    else
+      {:reply, :ok, forget(busid, state)}
+    end
   end
 
   # usbip_unbind.c unbind_device(): `unbind`, `match_busid` "del", then
@@ -365,22 +487,35 @@ defmodule Vagus.USBIP do
   # disarms it: it sets STUB_BUSID_OTHER, re-attaches the device to its own
   # driver, then deletes the entry. A failed rebind leaves the device
   # driverless, so `drivers_probe` is tried. Each step runs whatever the
-  # previous one returned; the first failure is the result.
+  # previous one returned; the first failure is the result. A device that
+  # leaves midway skips the rest of its writes: nothing is left to hand back.
   defp restore(busid, state) do
     unbind =
       if driver(busid, state) == @driver,
-        do: write(attr(@driver, "unbind", state), busid, state),
+        do: device_write(attr(@driver, "unbind", state), busid, state),
         else: :ok
 
     del = write(match_busid(state), "del " <> busid, state)
 
     rebind =
-      with {:error, _} = error <- write(attr(@driver, "rebind", state), busid, state) do
-        _ = write(drivers_probe(state), busid, state)
+      with {:error, {:sysfs, _, _}} = error <-
+             device_write(attr(@driver, "rebind", state), busid, state) do
+        _ = device_write(drivers_probe(state), busid, state)
         error
       end
 
-    {unbind, Enum.find([unbind, del, rebind], :ok, &(&1 != :ok))}
+    results = Enum.map([unbind, del, rebind], &if(&1 == {:error, :not_found}, do: :ok, else: &1))
+    {hd(results), Enum.find(results, :ok, &(&1 != :ok))}
+  end
+
+  # rebind_store() on a device that has gone dereferences its freed udev (see
+  # `forget/2`), so each device-targeted write checks that it is still
+  # there. What remains is the kernel's own window between this check and the
+  # write; a notified unplug never gets here (it detaches the share).
+  defp device_write(path, busid, state) do
+    if File.dir?(device_path(busid, state)),
+      do: write(path, busid, state),
+      else: {:error, :not_found}
   end
 
   defp driver(busid, state) do

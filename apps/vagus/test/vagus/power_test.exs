@@ -59,6 +59,12 @@ defmodule Vagus.PowerTest do
                      2_000
     end
 
+    test "the client is killed, not left running, after a publish" do
+      before = connections()
+      assert :ok = Vagus.Power.mqtt("cmnd/plug1/Power", "ON")
+      assert eventually_equal(before)
+    end
+
     # A live delivery always has retain cleared, so the flag is only
     # observable on a subscribe that arrives after the publish.
     test "retain: true is stored by the broker", %{port: port} do
@@ -94,6 +100,76 @@ defmodule Vagus.PowerTest do
              Vagus.Power.mqtt("t", "p", service: fn -> {:ok, "x", creds} end, timeout_ms: 300)
 
     refute inspect(reason) =~ password
+  end
+
+  test "qos 2 is rejected" do
+    assert {:error, :unsupported_qos} =
+             Vagus.Power.mqtt("t", "p", qos: 2, service: fn -> flunk("looked up") end)
+  end
+
+  test "a connect timeout leaves no client behind" do
+    before = connections()
+    creds = %{"port" => free_port(), "username" => "u", "password" => "p"}
+
+    assert {:error, {:connect, :timeout}} =
+             Vagus.Power.mqtt("t", "p", service: fn -> {:ok, "x", creds} end, timeout_ms: 300)
+
+    assert eventually_equal(before)
+  end
+
+  test "the caller survives the client crashing while it awaits the CONNACK" do
+    # Accepts at the TCP level (backlog) but never answers, so the CONNACK wait stalls.
+    {:ok, silent} = :gen_tcp.listen(0, ip: {127, 0, 0, 1}, active: false)
+    {:ok, port} = :inet.port(silent)
+    on_exit(fn -> :gen_tcp.close(silent) end)
+
+    before = connections()
+    creds = %{"port" => port, "username" => "u", "password" => "p"}
+    parent = self()
+
+    {caller, mon} =
+      spawn_monitor(fn ->
+        send(
+          parent,
+          {:result,
+           Vagus.Power.mqtt("t", "p", service: fn -> {:ok, "x", creds} end, timeout_ms: 5_000)}
+        )
+      end)
+
+    [client] = wait_for_new(before)
+    Process.exit(client, :kill)
+
+    assert_receive {:result, {:error, {:connect, :crashed}}}, 2_000
+    assert_receive {:DOWN, ^mon, :process, ^caller, :normal}, 1_000
+    assert eventually_equal(before)
+  end
+
+  defp connections do
+    for pid <- Process.list(),
+        match?(
+          {_, {MqttX.Client.Connection, :init, 1}},
+          Process.info(pid, :dictionary) |> dict_initial_call()
+        ),
+        into: MapSet.new(),
+        do: pid
+  end
+
+  defp dict_initial_call({:dictionary, dict}), do: {:ok, dict[:"$initial_call"]}
+  defp dict_initial_call(nil), do: nil
+
+  defp wait_for_new(before, tries \\ 80) do
+    case MapSet.to_list(MapSet.difference(connections(), before)) do
+      [] when tries > 0 -> Process.sleep(25) && wait_for_new(before, tries - 1)
+      found -> found
+    end
+  end
+
+  defp eventually_equal(before, tries \\ 40) do
+    cond do
+      connections() == before -> true
+      tries == 0 -> false
+      true -> Process.sleep(25) && eventually_equal(before, tries - 1)
+    end
   end
 
   defp subscriber(port, client_id) do

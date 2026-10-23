@@ -299,7 +299,11 @@ defmodule Vagus.NFS do
       # Grace exists for clients reclaiming state across a server restart;
       # nothing here persists client state, so the 90 s default would only
       # stall every target's first OPENs. 10 is the kernel minimum.
-      case run(state, "rpc.nfsd", ["-N", "2", "-N", "3", "--no-udp", "-G", "10", "4"]) do
+      # NFSv2 is compiled out (`-N 2` errors) and the rootfs has no
+      # /etc/services, so the port must be numeric; -V 4.0 keeps nfsroot's v4.0.
+      argv = ["-N", "3", "-V", "4.0", "--no-udp", "-G", "10", "-p", "2049", "4"]
+
+      case run(state, "rpc.nfsd", argv) do
         :ok -> {:ok, state}
         {:error, reason} -> {:error, reason, stop_mountd(state)}
       end
@@ -390,14 +394,15 @@ defmodule Vagus.NFS do
         {:error, :outside_root}
 
       true ->
-        walk(root, Path.expand(path) |> Path.relative_to(root) |> Path.split())
+        ["/" | parts] = path |> Path.expand() |> Path.split()
+        walk("/", parts)
     end
   end
 
   defp validate_path(_path, _root), do: {:error, :outside_root}
 
-  # Every component is lstat'ed: a symlink anywhere below the root could
-  # point the export outside it.
+  # Every component from `/` is lstat'ed, the root and its ancestors included:
+  # whoever provisions /data creates the root, so it is not trusted either.
   defp walk(dir, []), do: {:ok, dir}
 
   defp walk(dir, [name | rest]) do

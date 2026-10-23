@@ -102,10 +102,10 @@ defmodule Vagus.Network.LabTest do
     assert text =~ @accept
     assert text =~ @return
     assert text =~ @masquerade
-    assert Lab.status(s) == [%{ifname: "eth1", cidr: "10.42.0.1/24", primary: "eth0"}]
+    assert Lab.status(s) == [%{ifname: "eth1", cidr: "10.42.0.1/24", primary: "eth0", state: :up}]
 
     assert :persistent_term.get(ctx.state_key) == %{
-             "eth1" => %{cidr: "10.42.0.1/24", primary: "eth0"}
+             "eth1" => %{cidr: "10.42.0.1/24", primary: "eth0", state: :up}
            }
 
     # A bridged start's load keeps the rules.
@@ -257,6 +257,75 @@ defmodule Vagus.Network.LabTest do
     assert :persistent_term.get(ctx.state_key, :unset) == :unset
   end
 
+  test "nft and the rollback's deconfigure both refused: the entry is kept as broken", ctx do
+    s = start(ctx)
+    :atomics.put(ctx.fail, 1, 1)
+    :atomics.put(ctx.fail, 2, 1)
+
+    capture_log(fn ->
+      assert {:error, {:nat, {["-f", _], "boom", 1}, {:rollback, :busy}}} =
+               Lab.up("eth1", "10.42.0.1/24", s)
+    end)
+
+    _ = receive_all()
+    broken = %{ifname: "eth1", cidr: "10.42.0.1/24", primary: "eth0", state: :broken}
+    assert Lab.status(s) == [broken]
+    assert %{"eth1" => %{state: :broken}} = :persistent_term.get(ctx.state_key)
+    assert Nat.lab(lab_key: ctx.nat_opts[:lab_key]) == []
+  end
+
+  test "down on a broken entry only deconfigures, and keeps it while that fails", ctx do
+    s = start(ctx)
+    :atomics.put(ctx.fail, 1, 1)
+    :atomics.put(ctx.fail, 2, 1)
+    capture_log(fn -> {:error, {:nat, _, _}} = Lab.up("eth1", "10.42.0.1/24", s) end)
+    _ = receive_all()
+    :atomics.put(ctx.fail, 1, 0)
+
+    assert Lab.down("eth1", s) == {:error, {:vintage_net, :busy}}
+    assert receive_all() == [{:deconfigure, "eth1"}]
+    assert [%{state: :broken}] = Lab.status(s)
+
+    :atomics.put(ctx.fail, 2, 0)
+    assert Lab.down("eth1", s) == :ok
+    assert receive_all() == [{:deconfigure, "eth1"}]
+    assert Lab.status(s) == []
+    assert :persistent_term.get(ctx.state_key) == %{}
+  end
+
+  test "up on a broken entry retries the bring-up instead of refusing it", ctx do
+    # VintageNet reports the address the failed rollback left behind.
+    held = :atomics.new(1, [])
+    s = start(ctx, configured: fn -> if :atomics.get(held, 1) == 1, do: ["eth1"], else: [] end)
+    :atomics.put(ctx.fail, 1, 1)
+    :atomics.put(ctx.fail, 2, 1)
+    capture_log(fn -> {:error, {:nat, _, _}} = Lab.up("eth1", "10.42.0.1/24", s) end)
+    _ = receive_all()
+    :atomics.put(held, 1, 1)
+    :atomics.put(ctx.fail, 1, 0)
+    :atomics.put(ctx.fail, 2, 0)
+
+    assert Lab.up("eth1", "10.42.0.1/24", s) == :ok
+    assert [{:configure, "eth1", _}, {:nft, text}] = receive_all()
+    assert text =~ @masquerade
+    assert [%{ifname: "eth1", state: :up}] = Lab.status(s)
+    assert Nat.lab(lab_key: ctx.nat_opts[:lab_key]) == [{"eth1", "eth0"}]
+  end
+
+  test "a cidr overlapping another lab interface's is refused, broken or not", ctx do
+    s = start(ctx)
+    :ok = Lab.up("eth1", "10.42.0.1/24", s)
+    _ = receive_all()
+
+    assert Lab.up("eth2", "10.42.0.2/24", s) == {:error, :overlap}
+    assert Lab.up("eth2", "10.0.0.1/8", s) == {:error, :overlap}
+    assert receive_all() == []
+    assert Lab.up("eth2", "10.43.0.1/24", s) == :ok
+
+    :sys.replace_state(ctx.name, fn st -> put_in(st.up["eth2"].state, :broken) end)
+    assert Lab.up("eth3", "10.43.0.9/24", s) == {:error, :overlap}
+  end
+
   test "a VintageNet refusal never touches nft", ctx do
     s = start(ctx, configure: fn _, _ -> {:error, :bad} end)
     assert Lab.up("eth1", "10.42.0.1/24", s) == {:error, {:vintage_net, :bad}}
@@ -264,10 +333,13 @@ defmodule Vagus.Network.LabTest do
   end
 
   test "init adopts a previous instance's interfaces and renders their rules", ctx do
-    :persistent_term.put(ctx.state_key, %{"eth1" => %{cidr: "10.42.0.1/24", primary: "eth0"}})
+    :persistent_term.put(ctx.state_key, %{
+      "eth1" => %{cidr: "10.42.0.1/24", primary: "eth0", state: :up}
+    })
+
     s = start(ctx)
 
-    assert Lab.status(s) == [%{ifname: "eth1", cidr: "10.42.0.1/24", primary: "eth0"}]
+    assert Lab.status(s) == [%{ifname: "eth1", cidr: "10.42.0.1/24", primary: "eth0", state: :up}]
     assert [{:nft, text}] = receive_all()
     assert text =~ @masquerade
     assert Nat.lab(lab_key: ctx.nat_opts[:lab_key]) == [{"eth1", "eth0"}]

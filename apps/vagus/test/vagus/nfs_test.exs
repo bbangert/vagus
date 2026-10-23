@@ -4,7 +4,7 @@ defmodule Vagus.NFSTest do
 
   alias Vagus.NFS
 
-  @nfsd_start ["-N", "2", "-N", "3", "--no-udp", "-G", "10", "4"]
+  @nfsd_start ["-N", "3", "-V", "4.0", "--no-udp", "-G", "10", "-p", "2049", "4"]
   @mountd_args ["-F", "-N", "2", "-N", "3"]
   @rw "rw,sync,no_root_squash,subtree_check,insecure"
 
@@ -225,6 +225,15 @@ defmodule Vagus.NFSTest do
     File.ln_s!(Path.join(ctx.base, "outside"), Path.join(ctx.root, "link"))
 
     assert NFS.export(Path.join(ctx.root, "link/etc"), "10.0.0.1", s) == {:error, :symlink}
+    refute_received {:cmd, _, _}
+  end
+
+  test "a symlinked root is refused", ctx do
+    link_root = Path.join(ctx.base, "linkroot")
+    File.ln_s!(ctx.root, link_root)
+    s = start_nfs(%{ctx | root: link_root})
+
+    assert NFS.export(Path.join(link_root, "t1"), "10.0.0.1", s) == {:error, :symlink}
     refute_received {:cmd, _, _}
   end
 

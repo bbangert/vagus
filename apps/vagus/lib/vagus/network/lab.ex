@@ -13,7 +13,14 @@ defmodule Vagus.Network.Lab do
 
   `up/3` refuses an interface VintageNet already holds a configuration for
   (`:configured`), and a cidr overlapping the `hassio` bridge's
-  `172.30.32.0/23` or the primary interface's own subnet (`:overlap`).
+  `172.30.32.0/23`, the primary interface's own subnet or another lab
+  interface's (`:overlap`).
+
+  When the nft load fails and so does the rollback's deconfigure, the NIC
+  still carries its address: the entry is kept as `state: :broken`, no rules
+  forward for it, and `up/3` returns `{:error, {:nat, reason, {:rollback,
+  deconfigure_reason}}}`. `down/1` then deconfigures it, and `up/3` on it
+  tries the whole bring-up again.
   """
 
   use GenServer
@@ -28,15 +35,21 @@ defmodule Vagus.Network.Lab do
 
   @bridge {{172, 30, 32, 0}, 23}
 
-  # A configure plus a bounded nft load (10 s) and its rollback.
-  @change_timeout_ms 30_000
+  # A configure, Nat's lock wait (~24 s at most) and a bounded nft load (10 s)
+  # with its rollback load, and the deconfigure.
+  @change_timeout_ms 60_000
   @status_timeout_ms 5_000
 
   # Survives this process but not the VM, which is exactly the "not
   # persisted across reboot" contract, and writes are rare (one per up/down).
   @state_key {__MODULE__, :ifaces}
 
-  @type entry :: %{ifname: String.t(), cidr: String.t(), primary: String.t()}
+  @type entry :: %{
+          ifname: String.t(),
+          cidr: String.t(),
+          primary: String.t(),
+          state: :up | :broken
+        }
 
   @spec start_link(keyword()) :: GenServer.on_start() | :ignore
   def start_link(opts \\ []) do
@@ -61,7 +74,8 @@ defmodule Vagus.Network.Lab do
              | :not_running
              | :timeout
              | {:vintage_net, term()}
-             | {:nat, term()}}
+             | {:nat, term()}
+             | {:nat, term(), {:rollback, term()}}}
   def up(ifname, cidr, opts \\ []) do
     with :ok <- check_ifname(ifname),
          {:ok, address, prefix} <- parse_cidr(cidr) do
@@ -128,6 +142,7 @@ defmodule Vagus.Network.Lab do
   @impl true
   def handle_call({:up, ifname, cidr, address, prefix}, _from, state) do
     case Map.fetch(state.up, ifname) do
+      {:ok, %{state: :broken}} -> do_up(ifname, cidr, address, prefix, state)
       {:ok, %{cidr: ^cidr}} -> {:reply, :ok, state}
       {:ok, _other} -> {:reply, {:error, :already_up}, state}
       :error -> do_up(ifname, cidr, address, prefix, state)
@@ -138,6 +153,13 @@ defmodule Vagus.Network.Lab do
     case Map.pop(state.up, ifname) do
       {nil, _} ->
         {:reply, {:error, :not_up}, state}
+
+      # No rules forward for it, so only the address is left to remove.
+      {%{state: :broken}, rest} ->
+        case state.deconfigure.(ifname) do
+          :ok -> {:reply, :ok, store(state, rest)}
+          {:error, reason} -> {:reply, {:error, {:vintage_net, reason}}, state}
+        end
 
       {_entry, rest} ->
         # Rules first, so forwarding stops before the address goes away. Any
@@ -167,8 +189,8 @@ defmodule Vagus.Network.Lab do
     with :ok <- check_primary(ifname, primary),
          :ok <- check_nat(state),
          :ok <- check_configured(ifname, state),
-         :ok <- check_overlap(address, prefix, primary, state) do
-      up = Map.put(state.up, ifname, %{cidr: cidr, primary: primary})
+         :ok <- check_overlap(ifname, address, prefix, primary, state) do
+      up = Map.put(state.up, ifname, %{cidr: cidr, primary: primary, state: :up})
 
       with {:vintage_net, :ok} <-
              {:vintage_net, state.configure.(ifname, config(address, prefix))},
@@ -179,12 +201,22 @@ defmodule Vagus.Network.Lab do
           {:reply, {:error, {:vintage_net, reason}}, state}
 
         {:nat, {:error, reason}} ->
-          state.deconfigure.(ifname)
-          {:reply, {:error, {:nat, reason}}, state}
+          case state.deconfigure.(ifname) do
+            :ok ->
+              {:reply, {:error, {:nat, reason}}, forget(state, ifname)}
+
+            {:error, rollback} ->
+              broken = Map.put(state.up, ifname, %{cidr: cidr, primary: primary, state: :broken})
+              {:reply, {:error, {:nat, reason, {:rollback, rollback}}}, store(state, broken)}
+          end
       end
     else
       error -> {:reply, error, state}
     end
+  end
+
+  defp forget(state, ifname) do
+    if Map.has_key?(state.up, ifname), do: store(state, Map.delete(state.up, ifname)), else: state
   end
 
   defp store(state, up) do
@@ -203,13 +235,27 @@ defmodule Vagus.Network.Lab do
       else: {:error, :nat_disabled}
   end
 
+  # A broken entry's configuration is the one this server made.
   defp check_configured(ifname, state) do
-    if ifname in state.configured.(), do: {:error, :configured}, else: :ok
+    cond do
+      Map.has_key?(state.up, ifname) -> :ok
+      ifname in state.configured.() -> {:error, :configured}
+      true -> :ok
+    end
   end
 
-  defp check_overlap(address, prefix, primary, state) do
+  defp check_overlap(ifname, address, prefix, primary, state) do
     {:ok, ip} = :inet.parse_ipv4strict_address(String.to_charlist(address))
-    taken = [@bridge | ipv4_subnets(state.addresses.(primary))]
+
+    # Broken entries count: their address is still on the NIC.
+    labs =
+      for {other, %{cidr: cidr}} <- state.up,
+          other != ifname,
+          {:ok, net, bits} <- [parse_cidr(cidr)],
+          {:ok, net_ip} <- [to_ip(net)],
+          do: {net_ip, bits}
+
+    taken = [@bridge | ipv4_subnets(state.addresses.(primary))] ++ labs
 
     if Enum.any?(taken, fn {net, bits} -> overlap?(ip, prefix, net, bits) end),
       do: {:error, :overlap},
@@ -249,7 +295,9 @@ defmodule Vagus.Network.Lab do
 
   defp to_int({a, b, c, d}), do: Bitwise.bsl(a, 24) + Bitwise.bsl(b, 16) + Bitwise.bsl(c, 8) + d
 
-  defp pairs(up), do: up |> Enum.sort() |> Enum.map(fn {ifname, e} -> {ifname, e.primary} end)
+  defp pairs(up) do
+    for {ifname, %{state: :up} = e} <- Enum.sort(up), do: {ifname, e.primary}
+  end
 
   defp config(address, prefix) do
     %{

@@ -27,21 +27,38 @@ defmodule Vagus.Power do
   acknowledged it: `MqttX.Client.publish/4` replies before the PUBACK and
   offers no ack-aware variant, so QoS 1 only buys broker-side redelivery.
 
+  `qos:` is 0 or 1 (default 1); 2 is `{:error, :unsupported_qos}` because the
+  client is dropped right after the PUBLISH is written, before a QoS 2
+  handshake could finish.
+
   Error reasons never carry connect options (the broker password): library
   reasons are reduced to an atom or the exception module.
   """
   @spec mqtt(String.t(), iodata(), keyword()) ::
           :ok
           | {:error,
-             :no_broker | :timeout | :crashed | {:connect, reason()} | {:publish, reason()}}
+             :no_broker
+             | :timeout
+             | :crashed
+             | :unsupported_qos
+             | {:connect, reason()}
+             | {:publish, reason()}}
   def mqtt(topic, payload, opts \\ []) do
+    if Keyword.get(opts, :qos, 1) in [0, 1] do
+      bounded(topic, payload, opts)
+    else
+      {:error, :unsupported_qos}
+    end
+  end
+
+  defp bounded(topic, payload, opts) do
     service = Keyword.get(opts, :service, fn -> Vagus.App.service("mqtt") end)
     timeout = Keyword.get(opts, :timeout_ms, @default_timeout_ms)
 
     case BoundedCall.run(fn -> run(service, topic, payload, opts, timeout) end, timeout) do
       {:error, :attempt_timeout} -> {:error, :timeout}
-      # Only a crash of the linked connection process lands here; its exit
-      # reason can embed the connection state, password included.
+      # The exit reason of a crashed connection can embed its state, password
+      # included, so it is never passed on.
       {:error, {:exit, _reason}} -> {:error, :crashed}
       other -> other
     end
@@ -51,11 +68,17 @@ defmodule Vagus.Power do
   # which phase stalled; the remaining fifth covers the service lookup and
   # the disconnect.
   defp run(service, topic, payload, opts, timeout) do
+    # MqttX links the connection to this task, which BoundedCall links to the
+    # caller: without trapping, a connection crash would kill the task and
+    # signal the caller. The link stays so a timeout's brutal kill of this
+    # task also takes the (non-trapping) connection with it.
+    Process.flag(:trap_exit, true)
+
     case service.() do
       {:ok, _slug, creds} ->
         with {:ok, client} <- connect(creds, div(timeout * 3, 5)) do
           result = publish(client, topic, payload, opts, div(timeout, 5))
-          close(client, result)
+          close(client)
           result
         end
 
@@ -89,10 +112,14 @@ defmodule Vagus.Power do
         # connect/1 returns before the TCP connect and retries a refused or
         # rejected attempt forever, so the CONNACK event is the only signal.
         receive do
-          {^ref, :connected} -> {:ok, client}
+          {^ref, :connected} ->
+            {:ok, client}
+
+          {:EXIT, ^client, _reason} ->
+            {:error, {:connect, :crashed}}
         after
           deadline_ms ->
-            close(client, :unconnected)
+            close(client)
             {:error, {:connect, :timeout}}
         end
 
@@ -102,7 +129,7 @@ defmodule Vagus.Power do
   end
 
   defp publish(client, topic, payload, opts, deadline_ms) do
-    publish_opts = [qos: opts[:qos] || 1, retain: opts[:retain] || false]
+    publish_opts = [qos: Keyword.get(opts, :qos, 1), retain: opts[:retain] || false]
 
     case BoundedCall.run(
            fn ->
@@ -117,15 +144,13 @@ defmodule Vagus.Power do
     end
   end
 
-  # disconnect/1 is a cast that writes DISCONNECT unconditionally, which
-  # crashes a client whose socket is gone and logs its state, password
-  # included; it is only sent after a publish proved the socket live. Any
-  # other client may be blocked in its own TCP connect (connected?/1 would
-  # block with it), so it is killed, unlinked first so the kill does not
-  # take this process along.
-  defp close(client, :ok), do: MqttX.Client.disconnect(client)
-
-  defp close(client, _not_ok) do
+  # Never disconnect/1: it is a cast that writes DISCONNECT unconditionally,
+  # which crashes a client whose socket the broker already closed and logs
+  # its state, password included. Publish has returned once the bytes are
+  # written, so the broker only needs to see the TCP close. The client may
+  # also be blocked in its own TCP connect, so it is killed, unlinked first
+  # so the exit signal does not reach this task.
+  defp close(client) do
     Process.unlink(client)
     Process.exit(client, :kill)
   end

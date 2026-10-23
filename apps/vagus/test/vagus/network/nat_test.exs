@@ -221,6 +221,60 @@ defmodule Vagus.Network.NatTest do
       refute Nat.valid_ifname?(:eth1)
     end
 
+    test "writers are serialized: a boot-gate load waits out a set_lab and renders its list",
+         %{dir: dir} do
+      {cmd, release} = blocking_nft()
+      opts = lab_opts(dir, cmd)
+
+      setter = Task.async(fn -> Nat.set_lab([{"eth1", "eth0"}], opts) end)
+      assert_receive {:nft_blocked, first}
+      gate = Task.async(fn -> Nat.ensure(opts) end)
+      refute_receive {:nft_blocked, _}, 300
+
+      release.(first)
+      assert Task.await(setter) == :ok
+      assert_receive {:nft_blocked, second}, 5_000
+      release.(second)
+      assert Task.await(gate, 10_000) == :ok
+
+      second_text = nft_text(second)
+      assert second_text =~ ~s(iifname "eth1" oifname "eth0" masquerade)
+      assert Nat.ruleset(opts) == {:ok, second_text}
+    end
+
+    test "two concurrent set_lab calls leave the kernel holding the stored list",
+         %{dir: dir} do
+      {cmd, release} = blocking_nft()
+      opts = lab_opts(dir, cmd)
+
+      a = Task.async(fn -> Nat.set_lab([{"eth1", "eth0"}], opts) end)
+      assert_receive {:nft_blocked, first}
+      b = Task.async(fn -> Nat.set_lab([{"eth2", "eth0"}], opts) end)
+      refute_receive {:nft_blocked, _}, 300
+
+      release.(first)
+      assert_receive {:nft_blocked, second}, 5_000
+      release.(second)
+      assert Task.await(a) == :ok
+      assert Task.await(b, 10_000) == :ok
+
+      assert Nat.ruleset(opts) == {:ok, nft_text(second)}
+    end
+
+    test "a load that cannot take the table in time is :busy", %{dir: dir} do
+      {cmd, release} = blocking_nft()
+      opts = lab_opts(dir, cmd)
+
+      a = Task.async(fn -> Nat.set_lab([{"eth1", "eth0"}], opts) end)
+      assert_receive {:nft_blocked, first}
+      assert Nat.ensure(Keyword.put(opts, :lock_retries, 0)) == {:error, :busy}
+      assert Nat.set_lab([], Keyword.put(opts, :lock_retries, 0)) == {:error, :busy}
+
+      release.(first)
+      assert Task.await(a) == :ok
+      assert Nat.lab(opts) == [{"eth1", "eth0"}]
+    end
+
     test "an invalid name loads nothing", %{dir: dir} do
       opts = lab_opts(dir, nft_fake({"", 0}))
       assert Nat.set_lab([{"..", "eth0"}], opts) == {:error, :invalid_ifname}
@@ -228,6 +282,24 @@ defmodule Vagus.Network.NatTest do
       assert Nat.lab(opts) == []
     end
   end
+
+  # Each nft call parks with its ruleset text until the test releases it.
+  defp blocking_nft do
+    test = self()
+
+    cmd = fn _bin, ["-f", path] ->
+      ref = make_ref()
+      send(test, {:nft_blocked, {self(), ref, File.read!(path)}})
+
+      receive do
+        {:release, ^ref} -> {"", 0}
+      end
+    end
+
+    {cmd, fn {pid, ref, _text} -> send(pid, {:release, ref}) end}
+  end
+
+  defp nft_text({_pid, _ref, text}), do: text
 
   defp lab_opts(dir, cmd) do
     on_exit(fn -> :persistent_term.erase({__MODULE__, :lab, dir}) end)
