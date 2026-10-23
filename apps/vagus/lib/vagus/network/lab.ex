@@ -161,15 +161,20 @@ defmodule Vagus.Network.Lab do
           {:error, reason} -> {:reply, {:error, {:vintage_net, reason}}, state}
         end
 
-      {_entry, rest} ->
-        # Rules first, so forwarding stops before the address goes away. Any
-        # failure keeps the entry: both steps are idempotent, so the next
-        # down retries them.
+      {entry, rest} ->
+        # Rules first, so forwarding stops before the address goes away. A
+        # refused load keeps the entry as it was; a refused deconfigure after
+        # the rules are gone marks it broken, so up/3 restores them.
         with {:nat, :ok} <- {:nat, Nat.set_lab(pairs(rest), state.nat_opts)},
              {:vintage_net, :ok} <- {:vintage_net, state.deconfigure.(ifname)} do
           {:reply, :ok, store(state, rest)}
         else
-          {step, {:error, reason}} -> {:reply, {:error, {step, reason}}, state}
+          {:nat, {:error, reason}} ->
+            {:reply, {:error, {:nat, reason}}, state}
+
+          {:vintage_net, {:error, reason}} ->
+            broken = Map.put(state.up, ifname, %{entry | state: :broken})
+            {:reply, {:error, {:vintage_net, reason}}, store(state, broken)}
         end
     end
   end

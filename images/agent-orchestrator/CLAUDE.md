@@ -109,7 +109,7 @@ They survive a Vagus restart but not a reboot: re-apply them at the start of a t
 
     vagus eval 'Vagus.Network.Lab.up("eth1", "10.42.0.1/24")'   # down/1, status/0
     vagus eval 'Vagus.NFS.export("/data/vagus/nfs/<target>", "10.42.0.0/24")'   # unexport/1, status/0
-    vagus eval 'Vagus.USBIP.share("usb:1-1.4")'                 # unshare/1, shared/0
+    vagus eval 'Vagus.USBIP.share("usb:1-1.2")'                 # unshare/1, shared/0; id from Vagus.Devices.list() / GET /hardware/devices
     vagus eval 'Vagus.Power.mqtt("cmnd/<device>/Power", "ON")'  # Shelly Gen1: shellies/<id>/relay/0/command on|off
 
 - `Lab.up` addresses an extra NIC and forwards it to the primary interface (nft
@@ -120,12 +120,17 @@ They survive a Vagus restart but not a reboot: re-apply them at the start of a t
   --enable-tftp --tftp-root=/data/tftp --dhcp-boot=<bootfile>`.
 - NFS is NFSv4 only, paths under `/data/vagus/nfs/`. nfsd listens on every
   interface, so the client CIDR is the only access control (no `/0`); exports use
-  `subtree_check`. Target kernel args:
-  `root=/dev/nfs nfsroot=10.42.0.1:/data/vagus/nfs/<target>,vers=4,tcp rw ip=dhcp`.
+  `subtree_check`. The target mounts the `export_path` that `status/0` reports
+  (NFSv4 walks the real tree; `/data` is a symlink to `/root`), so the kernel args are
+  `root=/dev/nfs nfsroot=10.42.0.1:/root/vagus/nfs/<target>,vers=4,tcp rw ip=dhcp`.
 - A shared USB device is attached from Ben's laptop:
-  `sudo modprobe vhci-hcd && usbip list -r <board-ip> && sudo usbip attach -r <board-ip> -b 1-1.4`.
+  `sudo modprobe vhci-hcd && usbip list -r <board-ip> && sudo usbip attach -r <board-ip> -b 1-1.2`.
   The share drops when the device is unplugged. Port 3240 has no authentication:
-  anyone on the LAN can attach it, so `unshare/1` when done.
+  anyone on the LAN can attach it, so `unshare/1` when done. The board's onboard
+  WiFi/Bluetooth device (`usb:1-1.4`, the AIC8800 on the dragon_q6a) cannot be
+  shared: the chip disconnects and re-enumerates itself whenever `usbip-host`
+  claims it, so the share is dropped within seconds and the device returns to its
+  own driver. Share only devices plugged into the board's USB ports.
 - Hubs with per-port power: `uhubctl -l <hub> -p <port> -a off|on` in a worker with
   `/dev/bus/usb`. GPIO relays: Python `gpiod` or `Circuits.GPIO` with
   `--device /dev/gpiochipN`; record the header pin names in the task notes.

@@ -64,7 +64,7 @@ defmodule Vagus.NFSTest do
       nfsd_mounted?: fn -> Keyword.get(extra, :mounted, false) end
     ]
 
-    start_supervised!({NFS, opts})
+    start_supervised!(Supervisor.child_spec({NFS, opts}, id: name))
     [server: name]
   end
 
@@ -135,7 +135,9 @@ defmodule Vagus.NFSTest do
 
     assert NFS.status(s) == %{
              running: true,
-             exports: [%{path: ctx.target, client: "10.42.0.0/24", options: @rw}]
+             exports: [
+               %{path: ctx.target, export_path: ctx.target, client: "10.42.0.0/24", options: @rw}
+             ]
            }
   end
 
@@ -228,13 +230,97 @@ defmodule Vagus.NFSTest do
     refute_received {:cmd, _, _}
   end
 
-  test "a symlinked root is refused", ctx do
+  test "a root that is itself a symlink exports the physical path", ctx do
     link_root = Path.join(ctx.base, "linkroot")
     File.ln_s!(ctx.root, link_root)
     s = start_nfs(%{ctx | root: link_root})
+    caller = Path.join(link_root, "t1")
 
-    assert NFS.export(Path.join(link_root, "t1"), "10.0.0.1", s) == {:error, :symlink}
+    assert NFS.export(caller, "10.0.0.1", s) == :ok
+    assert_cmd("exportfs", ["-o", @rw, "10.0.0.1:" <> ctx.target])
+    assert [%{path: ^caller, export_path: export_path}] = NFS.status(s).exports
+    assert export_path == ctx.target
+  end
+
+  # The Nerves layout: /data -> /root.
+  defp symlinked_ancestor(ctx) do
+    real = Path.join(ctx.base, "real")
+    File.mkdir_p!(Path.join(real, "vagus/nfs/t"))
+    File.ln_s!("real", Path.join(ctx.base, "data"))
+
+    %{
+      root: Path.join(ctx.base, "data/vagus/nfs"),
+      caller: Path.join(ctx.base, "data/vagus/nfs/t"),
+      physical: Path.join(real, "vagus/nfs/t")
+    }
+  end
+
+  test "a root reached through a symlinked ancestor exports the physical path", ctx do
+    l = symlinked_ancestor(ctx)
+    s = start_nfs(%{ctx | root: l.root})
+
+    assert NFS.export(l.caller, "10.0.0.1", s) == :ok
+    assert events() |> List.last() == {"exportfs", ["-o", @rw, "10.0.0.1:" <> l.physical]}
+
+    assert NFS.status(s).exports == [
+             %{path: l.caller, export_path: l.physical, client: "10.0.0.1", options: @rw}
+           ]
+
+    assert NFS.export(l.caller, "10.0.0.1", s) == :ok
+    assert NFS.export(l.physical, "10.0.0.1", s) == :ok
     refute_received {:cmd, _, _}
+
+    assert {:error, {:already_exported, _}} = NFS.export(l.physical, "10.0.0.2", s)
+
+    assert NFS.unexport(l.physical, s) == :ok
+    assert_cmd("exportfs", ["-u", "10.0.0.1:" <> l.physical])
+  end
+
+  test "below a symlinked ancestor, a symlink is still refused", ctx do
+    l = symlinked_ancestor(ctx)
+    File.mkdir_p!(Path.join(ctx.base, "outside/etc"))
+    File.ln_s!(Path.join(ctx.base, "outside"), Path.join(l.root, "link"))
+    s = start_nfs(%{ctx | root: l.root})
+
+    assert NFS.export(Path.join(l.root, "link/etc"), "10.0.0.1", s) == {:error, :symlink}
+
+    assert NFS.export(Path.join(l.root, "../../../outside"), "10.0.0.1", s) ==
+             {:error, :outside_root}
+
+    refute_received {:cmd, _, _}
+  end
+
+  test "a missing or looping root is invalid", ctx do
+    loop = Path.join(ctx.base, "loop")
+    File.ln_s!(loop, loop)
+
+    for root <- [Path.join(ctx.base, "missing"), Path.join(loop, "nfs")] do
+      s = start_nfs(%{ctx | root: root})
+      assert NFS.export(Path.join(root, "t1"), "10.0.0.1", s) == {:error, :invalid_root}
+    end
+
+    refute_received {:cmd, _, _}
+  end
+
+  test "etab entries are adopted by their physical path only", ctx do
+    l = symlinked_ancestor(ctx)
+    other = Path.join(ctx.base, "real/vagus/nfs/u")
+    File.mkdir_p!(other)
+    File.mkdir_p!(ctx.state_dir)
+
+    File.write!(Path.join(ctx.state_dir, "etab"), """
+    #{l.physical}\t10.0.0.1(rw,sync,insecure,no_root_squash,subtree_check)
+    #{Path.join(l.root, "u")}\t10.0.0.2(rw,sync,insecure,no_root_squash,subtree_check)
+    """)
+
+    s = start_nfs(%{ctx | root: l.root})
+
+    assert NFS.status(s).exports == [
+             %{path: l.physical, export_path: l.physical, client: "10.0.0.1", options: @rw}
+           ]
+
+    assert_cmd("exportfs", ["-u", "10.0.0.2:" <> Path.join(l.root, "u")])
+    assert NFS.export(l.caller, "10.0.0.1", s) == :ok
   end
 
   test "paths with ':', whitespace or control bytes are refused", ctx do
@@ -373,7 +459,9 @@ defmodule Vagus.NFSTest do
     # status/1 is served after handle_continue, so adoption has run.
     assert NFS.status(s) == %{
              running: true,
-             exports: [%{path: ctx.target, client: "10.42.0.0/24", options: @rw}]
+             exports: [
+               %{path: ctx.target, export_path: ctx.target, client: "10.42.0.0/24", options: @rw}
+             ]
            }
 
     assert events() == [
@@ -387,6 +475,56 @@ defmodule Vagus.NFSTest do
 
     assert NFS.export(ctx.target, "10.42.0.0/24", s) == :ok
     refute_received {:cmd, _, _}
+  end
+
+  defp write_etab(ctx, entries) do
+    File.mkdir_p!(ctx.state_dir)
+
+    etab =
+      Enum.map_join(entries, fn {path, client} ->
+        "#{path}\t#{client}(rw,sync,insecure,no_root_squash,subtree_check)\n"
+      end)
+
+    File.write!(Path.join(ctx.state_dir, "etab"), etab)
+  end
+
+  test "an exportfs that times out leaves state matching a re-read etab", ctx do
+    spec = "10.0.0.1:" <> ctx.target
+    s = start_nfs(ctx, fail: %{{"exportfs", ["-o", @rw, spec]} => {"", 124}})
+    # The killed exportfs had already written etab.
+    write_etab(ctx, [{ctx.target, "10.0.0.1"}])
+
+    assert NFS.export(ctx.target, "10.0.0.1", s) ==
+             {:error, {"exportfs", ["-o", @rw, spec], "", 124}}
+
+    assert NFS.status(s) == %{
+             running: true,
+             exports: [
+               %{path: ctx.target, export_path: ctx.target, client: "10.0.0.1", options: @rw}
+             ]
+           }
+
+    assert events() |> Enum.drop(5) == [
+             {"rpc.nfsd", ["0"]},
+             :mountd_stop,
+             {"modprobe", ["nfsd"]},
+             {"mount", ["-t", "nfsd", "nfsd", "/proc/fs/nfsd"]},
+             {:mountd_start, @mountd_args},
+             {"rpc.nfsd", @nfsd_start},
+             {"exportfs", ["-f"]}
+           ]
+  end
+
+  test "an exportfs -u that times out after landing drops the export", ctx do
+    spec = "10.0.0.1:" <> ctx.target
+    s = start_nfs(ctx, fail: %{{"exportfs", ["-u", spec]} => {"", 124}})
+    :ok = NFS.export(ctx.target, "10.0.0.1", s)
+    write_etab(ctx, [])
+    flush()
+
+    assert {:error, {"exportfs", _, "", 124}} = NFS.unexport(ctx.target, s)
+    assert NFS.status(s) == %{running: false, exports: []}
+    assert events() == [{"exportfs", ["-u", spec]}, {"rpc.nfsd", ["0"]}, :mountd_stop]
   end
 
   test "an empty etab starts nothing", ctx do

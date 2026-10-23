@@ -129,20 +129,31 @@ defmodule Vagus.Network.LabTest do
     assert Lab.down("eth1", s) == {:error, :not_up}
   end
 
-  test "a failed deconfigure keeps the entry, and the next down retries both steps", ctx do
+  test "a failed deconfigure after the rules are gone marks the entry broken", ctx do
     s = start(ctx)
     :ok = Lab.up("eth1", "10.42.0.1/24", s)
     _ = receive_all()
     :atomics.put(ctx.fail, 2, 1)
 
     assert Lab.down("eth1", s) == {:error, {:vintage_net, :busy}}
-    assert [{:nft, _}, {:deconfigure, "eth1"}] = receive_all()
-    assert [%{ifname: "eth1"}] = Lab.status(s)
-
-    :atomics.put(ctx.fail, 2, 0)
-    assert Lab.down("eth1", s) == :ok
     assert [{:nft, text}, {:deconfigure, "eth1"}] = receive_all()
     refute text =~ "eth1"
+    assert [%{ifname: "eth1", state: :broken}] = Lab.status(s)
+    assert %{"eth1" => %{state: :broken}} = :persistent_term.get(ctx.state_key)
+
+    # down again only has the address left to remove.
+    assert Lab.down("eth1", s) == {:error, {:vintage_net, :busy}}
+    assert receive_all() == [{:deconfigure, "eth1"}]
+
+    # up with the same cidr restores the rules instead of answering :ok.
+    :atomics.put(ctx.fail, 2, 0)
+    assert Lab.up("eth1", "10.42.0.1/24", s) == :ok
+    assert [{:configure, "eth1", _}, {:nft, text}] = receive_all()
+    assert text =~ @masquerade
+    assert [%{ifname: "eth1", state: :up}] = Lab.status(s)
+
+    assert Lab.down("eth1", s) == :ok
+    assert [{:nft, _}, {:deconfigure, "eth1"}] = receive_all()
     assert Lab.status(s) == []
   end
 

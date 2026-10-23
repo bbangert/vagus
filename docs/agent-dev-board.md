@@ -112,16 +112,26 @@ DHCP on the LAN:
 the server speaks NFSv4 only. Kernel nfsd listens on every interface, so the
 per-export client CIDR is the only access control; a `/0` client is refused.
 Exports use `subtree_check`, so a client cannot reach outside the exported
-directory. Kernel args for the target:
+directory. The target mounts the path `status/0` reports as `export_path`,
+not the one passed to `export/2`: NFSv4 clients walk the server's real
+directory tree, and on Nerves `/data` is a symlink to `/root`, so that is
+`/root/vagus/nfs/<target>`. Kernel args for the target:
 
-    root=/dev/nfs nfsroot=10.42.0.1:/data/vagus/nfs/<target>,vers=4,tcp rw ip=dhcp
+    root=/dev/nfs nfsroot=10.42.0.1:/root/vagus/nfs/<target>,vers=4,tcp rw ip=dhcp
 
-**USB/IP.** `Vagus.USBIP.share("usb:1-1.4")`, `unshare/1` and `shared/0`, agent
-flavor only. The host side binds the device to `usbip-host` through sysfs;
+**USB/IP.** `Vagus.USBIP.share("usb:1-1.2")` (the id comes from
+`Vagus.Devices.list()` / `GET /hardware/devices`), `unshare/1` and `shared/0`,
+agent flavor only. The host side binds the device to `usbip-host` through sysfs;
 `usbipd` runs in the privileged host-network container `vagus-usbipd`, from the
 base image. On the laptop:
 
-    sudo modprobe vhci-hcd && usbip list -r <board-ip> && sudo usbip attach -r <board-ip> -b 1-1.4
+    sudo modprobe vhci-hcd && usbip list -r <board-ip> && sudo usbip attach -r <board-ip> -b 1-1.2
+
+The board's onboard WiFi/Bluetooth device (`usb:1-1.4`, the AIC8800 on the
+dragon_q6a) cannot be shared: the chip disconnects and re-enumerates itself
+whenever `usbip-host` claims it, so the share is dropped within seconds and the
+device returns to its own driver. Share only devices plugged into the board's
+USB ports.
 
 The share drops when the device is unplugged. USB/IP has no authentication:
 anyone on the LAN who can reach port 3240 can attach a shared device, so share
