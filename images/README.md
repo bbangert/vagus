@@ -17,6 +17,10 @@ Push a tag `images-vX.Y.Z` (publishes `X.Y.Z`, `sha-<short>` and `latest`), or r
 
 Edit `ARG CLAUDE_VERSION` in `images/agent-base/Containerfile`, confirm the native installer offers that version, then tag a new `images-v*`.
 
+## Python pins
+
+`agent-base/requirements.txt` pins every Python dependency except `edlclient`. Regenerate it from a built image: `docker run --rm vagus-agent-base:<tag> /opt/venv/bin/pip freeze | grep -v '^edlclient'`.
+
 ## Bumping the BEAM
 
 The `BEAM_IMAGE` build arg (a `hexpm/elixir` tag) must match the OTP and Elixir pinned in `.github/workflows/release.yml` (`OTP_VERSION`, `ELIXIR_VERSION`).

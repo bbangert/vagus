@@ -39,13 +39,14 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       # The input goes through env, never into the script text. A dispatch must not
-      # overwrite `latest`, which only a tag push publishes.
+      # overwrite `latest`, which only a tag push publishes; a dispatch run with
+      # --ref <tag> still has GITHUB_REF_TYPE=tag, so the event name decides.
       - name: Resolve version tag
         id: ver
         env:
           TAG: ${{ inputs.tag }}
         run: |
-          if [ "$GITHUB_REF_TYPE" = tag ]; then
+          if [ "$GITHUB_EVENT_NAME" = push ] && [ "$GITHUB_REF_TYPE" = tag ]; then
             echo "tag=${GITHUB_REF_NAME#images-v}" >> "$GITHUB_OUTPUT"
             echo "latest=true" >> "$GITHUB_OUTPUT"
           else

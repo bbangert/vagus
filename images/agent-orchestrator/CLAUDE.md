@@ -14,6 +14,8 @@ with no sandbox, inside the process that runs the whole board. Treat it as a roo
     vagus ping                                    # pong | pang
     VAGUS_TIMEOUT=600000 vagus eval '<long call>' # default 60 s
 
+`VAGUS_TIMEOUT` must exceed any `timeout_ms` inside the call, or the CLI gives up first.
+
 `vagus eval` prints the value with `inspect`; a raise or exit prints to stderr, exit 1.
 Single-quote the expression; inside it use Elixir double quotes. Prefer one call that
 returns data over many small ones (each call starts a fresh BEAM here). At most 20
@@ -28,7 +30,7 @@ or `{:error, :timeout | :unavailable | :output_too_large | ...}`. Output is capp
 or `discard_stdout`, but takes `cap`.
 
     vagus eval 'Vagus.Runtime.Podman.Cmd.run(["ps", "-a", "--format", "{{.Names}} {{.Status}}"], timeout_ms: 30_000)'
-    vagus eval 'Vagus.Runtime.Podman.Cmd.run(["pull", "ghcr.io/bbangert/vagus-agent-base:<tag>"], timeout_ms: 900_000)'
+    VAGUS_TIMEOUT=960000 vagus eval 'Vagus.Runtime.Podman.Cmd.run(["pull", "ghcr.io/bbangert/vagus-agent-base:<tag>"], timeout_ms: 900_000)'
 
 The store is transient: every container is gone after a reboot. Re-create, don't restart.
 
@@ -47,7 +49,7 @@ board, so `-v` sources are board paths:
 Name every worker `task-<x>`. Never `addon_*`: that prefix belongs to Vagus's apps.
 Run `worker-config x` first.
 
-    vagus eval 'Vagus.Runtime.Podman.Cmd.run(["run", "-d", "--name", "task-x", "--memory", "4g",
+    VAGUS_TIMEOUT=180000 vagus eval 'Vagus.Runtime.Podman.Cmd.run(["run", "-d", "--name", "task-x", "--memory", "4g",
       "--device", "/dev/ttyUSB0",
       "-v", "/data/addons/data/agent_orchestrator/tasks/x/claude:/claude",
       "-v", "/data/addons/data/agent_orchestrator/tasks/x:/work",
@@ -65,17 +67,17 @@ Run `worker-config x` first.
   No udev: a re-plugged device gets a new node, so remove and re-create the worker.
 - A per-task layer: write a Containerfile `FROM ghcr.io/bbangert/vagus-agent-base:<tag>`
   under `/data/tasks/<x>` and build on the board:
-  `Cmd.run(["build", "-t", "localhost/task-x", "<board path>"], timeout_ms: 1_800_000)`;
+  `VAGUS_TIMEOUT=1860000 vagus eval 'Vagus.Runtime.Podman.Cmd.run(["build", "-t", "localhost/task-x", "<board path>"], timeout_ms: 1_800_000)'`;
   add `"--network=host"` only when a build step needs the board's LAN.
 - Remove when done: `Cmd.run(["rm", "-f", "task-x"], timeout_ms: 60_000)`.
 
 ## Running a headless worker
 Always `--user agent -e HOME=/home/agent`; a root exec leaves root-owned files behind.
 
-    Cmd.run(["exec", "--user", "agent", "-e", "HOME=/home/agent", "-e", "CLAUDE_CONFIG_DIR=/claude",
+    VAGUS_TIMEOUT=3660000 vagus eval 'Vagus.Runtime.Podman.Cmd.run(["exec", "--user", "agent", "-e", "HOME=/home/agent", "-e", "CLAUDE_CONFIG_DIR=/claude",
       "-w", "/work", "task-x", "claude", "-p", "<task>", "--output-format", "stream-json",
       "--verbose", "--permission-mode", "auto", "--permission-prompts", "none"],
-      timeout_ms: 3_600_000, cap: 16_000_000, stderr_apart: true)
+      timeout_ms: 3_600_000, cap: 16_000_000, stderr_apart: true)'
 
 The last stream-json line is the result and carries `session_id`; continue with
 `"--resume", "<session_id>"` in the same container. A stream past the cap is
