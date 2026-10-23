@@ -31,7 +31,8 @@ defmodule Vagus.App.Orchestrator do
        each app is sent `boot_start` with whether its container runs, from
        one listing taken after the `engine` gate (`:unknown` if it fails),
        and applies its own boot rule (`Vagus.App.Policy.boot/2`); `once`
-       apps are not awaited;
+       apps are not awaited; the `core` stage is skipped outright in the
+       agent-dev-board flavor (`Vagus.Flavor`);
     5. `supervisor_update` with `startup: complete`, which Core takes as the
        Supervisor having finished starting.
 
@@ -349,9 +350,15 @@ defmodule Vagus.App.Orchestrator do
     if name == :engine, do: listing(cfg), else: running
   end
 
+  # Not gated on whether a Core is installed: a board converted to the
+  # agent-dev-board flavor keeps the Core it had, and must not start it at
+  # boot. The Core HTTP routes are unguarded, so a deliberate call can still
+  # start it.
   defp step({:stage, :core}, running, cfg) do
-    task = spawn_unit(fn -> ready("Core", cfg.units.core_start.(cfg.stage_timeout)) end)
-    await(:core, [{"core", task}], cfg)
+    if cfg.units.agent?.(),
+      do: Logger.info("Boot: Core stage skipped (agent-dev-board flavor)"),
+      else: core_stage(cfg)
+
     running
   end
 
@@ -366,6 +373,11 @@ defmodule Vagus.App.Orchestrator do
     tasks = for %{config: %{slug: slug}} <- awaited, do: {slug, start.(slug)}
     await(stage, tasks, cfg)
     running
+  end
+
+  defp core_stage(cfg) do
+    task = spawn_unit(fn -> ready("Core", cfg.units.core_start.(cfg.stage_timeout)) end)
+    await(:core, [{"core", task}], cfg)
   end
 
   defp listing(cfg) do

@@ -890,6 +890,62 @@ defmodule Vagus.ProvisionerTest do
     assert log =~ "step :expand_data returned unexpected :skip — treating as :ok"
   end
 
+  test "provision_core: false (the agent-dev-board flavor) -> only :expand_data runs" do
+    prev = Application.get_env(:vagus, :provision_core)
+    Application.put_env(:vagus, :provision_core, false)
+    on_exit(fn -> restore_env(:provision_core, prev) end)
+
+    parent = self()
+
+    run_step = fn step, _state ->
+      send(parent, {:step, step})
+      :ok
+    end
+
+    pid = start_supervised!({Provisioner, run_step: run_step, name: nil})
+
+    assert_receive {:step, :expand_data}, 1_000
+    # A call is answered only after handle_continue/2 has run every step.
+    _ = :sys.get_state(pid)
+    refute_received {:step, :provision_core}
+  end
+
+  test "an explicit :steps opt wins over provision_core: false" do
+    prev = Application.get_env(:vagus, :provision_core)
+    Application.put_env(:vagus, :provision_core, false)
+    on_exit(fn -> restore_env(:provision_core, prev) end)
+
+    parent = self()
+
+    run_step = fn step, _state ->
+      send(parent, {:step, step})
+      :ok
+    end
+
+    start_supervised!({Provisioner, run_step: run_step, steps: [:provision_core], name: nil})
+
+    assert_receive {:step, :provision_core}, 1_000
+    refute_received {:step, :expand_data}
+  end
+
+  test "provision_core unset -> both steps run, in order" do
+    prev = Application.get_env(:vagus, :provision_core)
+    Application.delete_env(:vagus, :provision_core)
+    on_exit(fn -> restore_env(:provision_core, prev) end)
+
+    parent = self()
+
+    run_step = fn step, _state ->
+      send(parent, {:step, step})
+      :ok
+    end
+
+    start_supervised!({Provisioner, run_step: run_step, name: nil})
+
+    assert_receive {:step, :expand_data}, 1_000
+    assert_receive {:step, :provision_core}, 1_000
+  end
+
   # --- issue #41: data-partition identity gate --------------------------
 
   @tag :tmp_dir

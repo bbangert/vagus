@@ -106,3 +106,6 @@ config :nerves_runtime,
 # reports that board's machine string. Per-target values live in
 # config/rpi3_64.exs and config/dragon_q6a.exs.
 config :vagus, :machine, "raspberrypi3-64"
+
+# Parsed on host too, so a bad VAGUS_FLAVOR fails a host compile in CI.
+import_config "flavor.exs"

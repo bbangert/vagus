@@ -93,6 +93,10 @@ config :vagus, :backends, %{
   os: Vagus.Backend.OSMock
 }
 
+# config/host.exs imports flavor.exs, so a stray VAGUS_FLAVOR in a dev shell
+# would otherwise change the suite's config; flavor tests set the env themselves.
+config :vagus, flavor: :default, provision_core: true
+
 # Per-run app files, and no `addons.json` to import. The Orchestrator's boot
 # is off, so the app's own Orchestrator only brings up app processes: tests
 # that boot start their own with injected units. Set here too because under

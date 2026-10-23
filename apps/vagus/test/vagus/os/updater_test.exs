@@ -301,3 +301,46 @@ defmodule Vagus.OS.UpdaterTest do
 
   defp plenty_of_space, do: 10 * 1024 * 1024 * 1024
 end
+
+defmodule Vagus.OS.UpdaterFlavorTest do
+  # Separate and not async: these tests set the global `:flavor` env, which
+  # the async module above reads when matching the default asset name.
+  use ExUnit.Case, async: false
+
+  alias Vagus.OS.Updater
+
+  # The host KV's platform is "host"; see the moduledoc above.
+  @stock %{name: "vagus_host.fw", size: 1024}
+  @agent %{name: "vagus_host-agent.fw", size: 2048}
+
+  setup do
+    prev = Application.fetch_env(:vagus, :flavor)
+
+    on_exit(fn ->
+      case prev do
+        {:ok, value} -> Application.put_env(:vagus, :flavor, value)
+        :error -> Application.delete_env(:vagus, :flavor)
+      end
+    end)
+  end
+
+  test "the default flavor picks the stock asset when both are published" do
+    Application.put_env(:vagus, :flavor, :default)
+    assert Updater.match_firmware_asset("0.11.0", [@agent, @stock]) == {:ok, @stock}
+  end
+
+  test "the agent flavor picks the agent asset when both are published" do
+    Application.put_env(:vagus, :flavor, :agent_dev_board)
+    assert Updater.match_firmware_asset("0.11.0", [@stock, @agent]) == {:ok, @agent}
+  end
+
+  test "the agent flavor never falls back to the stock asset" do
+    Application.put_env(:vagus, :flavor, :agent_dev_board)
+    assert Updater.match_firmware_asset("0.11.0", [@stock]) == {:error, :no_asset_for_target}
+  end
+
+  test "the default flavor never takes the agent asset" do
+    Application.put_env(:vagus, :flavor, :default)
+    assert Updater.match_firmware_asset("0.11.0", [@agent]) == {:error, :no_asset_for_target}
+  end
+end

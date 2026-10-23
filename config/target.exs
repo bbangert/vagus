@@ -176,6 +176,7 @@ config :vagus, Vagus.App.Orchestrator, boot: true, default_native_app: "core_mqt
 # target-only convention as the Orchestrator's boot above; there is no real Core
 # container to watch on :host/:test). Runtime on/off lives separately in
 # the persisted TokenStore `watchdog` option (POST /core/options).
+# config/flavor.exs, imported last, may turn it off.
 config :vagus, :core_watchdog, true
 
 # First-boot provisioning (issue #40): auto-expand /data + auto-install/
@@ -358,3 +359,6 @@ config :vagus, :backends, %{
 # config/dragon_q6a.exs. A missing file for a selected target is a hard
 # failure at config load, so adding a board means adding its file here too.
 import_config "#{Mix.target()}.exs"
+
+# Last, so a flavor's overrides beat both the shared and per-target values.
+import_config "flavor.exs"

@@ -4,7 +4,9 @@ defmodule Vagus.Provisioner do
   `http://board/` shows the HA onboarding wizard (`:8123` 307-redirects there
   during onboarding), zero console commands.
   Runs an ordered, idempotent list of steps — `[:expand_data,
-  :provision_core]` — once per boot, retrying whatever isn't ready yet.
+  :provision_core]`, or only `[:expand_data]` under `config :vagus,
+  :provision_core, false` — once per boot, retrying whatever isn't ready
+  yet.
 
   ## `:provision_core`
 
@@ -161,7 +163,7 @@ defmodule Vagus.Provisioner do
       net_interval: Keyword.get(opts, :net_interval, @net_interval),
       retry_base: Keyword.get(opts, :retry_base, @retry_base),
       retry_cap: Keyword.get(opts, :retry_cap, @retry_cap),
-      steps: Keyword.get(opts, :steps, @steps),
+      steps: Keyword.get_lazy(opts, :steps, &default_steps/0),
       # Injectable like every other seam above — mainly so tests can make a
       # step return something other than `:ok | :halt | :async` directly,
       # to exercise `safe_run_step/2`'s normalization without needing a real
@@ -177,6 +179,13 @@ defmodule Vagus.Provisioner do
     }
 
     {:ok, state, {:continue, :run}}
+  end
+
+  # The agent-dev-board flavor never provisions Core, so it only expands /data.
+  defp default_steps do
+    if Application.get_env(:vagus, :provision_core, true),
+      do: @steps,
+      else: List.delete(@steps, :provision_core)
   end
 
   @impl GenServer

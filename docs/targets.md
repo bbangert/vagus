@@ -179,6 +179,40 @@ cannot take ingress down.
 This bites any host-run Supervisor emulator, not just this board — it was
 found on the Q6A but rpi3_64 had the identical latent gap.
 
+## agent-dev-board flavor (dragon_q6a)
+
+A dragon_q6a firmware that hosts Claude Code agent containers instead of Home
+Assistant Core. The rest of the stack (apps, MQTT broker, podman) is
+unchanged. It is selected at build time by `VAGUS_FLAVOR=agent-dev-board`; an
+unknown value fails the build.
+
+Disabled: the Core stage is skipped at boot even if a Core version is
+installed, there is no Core watchdog and no Core provisioning. `/data` still
+expands. The Core HTTP routes (`POST /core/start` etc.) are not guarded, so a
+deliberate call can still install or start Core (follow-up).
+
+A board still carrying a balena-engine store (pre-0.10.0) can be flashed straight into the flavor; the podman migration then finishes without Core.
+
+Build locally (`NERVES_FW_MISC` is what the system's `fwup.conf` writes into
+the slot KV `nerves_fw_misc`; stock builds leave it empty):
+
+```sh
+VAGUS_FLAVOR=agent-dev-board NERVES_FW_MISC=agent-dev-board \
+  mise run firmware -- dragon_q6a
+```
+
+CI publishes `vagus_dragon_q6a-agent.fw` next to the stock asset; only
+dragon_q6a is built with the flavor.
+
+OTA: the updater matches `vagus_<platform>-agent.fw` when running the flavor,
+so flavors never cross over. Returning a board to stock is a manual `fwup`
+upload of a stock build (see the upload recipe under Building); the next boot
+runs Core again.
+
+To tell what a board runs: `Vagus.Flavor.get()` over ssh, or `nerves_fw_misc`
+in the firmware KV (set for CI builds). The agent container images and their
+lifecycle are documented separately.
+
 ## rubik_pi3: what is pending
 
 App wiring only, so far — device bring-up (Phase 3) has not run yet, and

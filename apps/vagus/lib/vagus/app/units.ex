@@ -30,6 +30,7 @@ defmodule Vagus.App.Units do
       inspect: &running?/1,
       halt: &App.halt/1,
       stop_containers: &stop_containers/2,
+      agent?: &Vagus.Flavor.agent?/0,
       core_start: &CoreUnit.start(deadline: &1),
       core_stop: &CoreUnit.stop(deadline: &1),
       gates: Gates.all(),

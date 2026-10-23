@@ -4,7 +4,10 @@ name: release
 # builds `mix firmware` for every hardware target and attaches the .fw
 # files to the GitHub release for that tag. These assets are what
 # `Vagus.OS.Updater` (nerves_github_updater) feeds on — asset names are
-# `vagus_<target>.fw` and MUST stay in sync with its `:asset_matcher`.
+# `vagus_<target>.fw` and MUST stay in sync with its `:asset_matcher`. The
+# `agent-dev-board` flavor (dragon_q6a only) ships as `vagus_<target>-agent.fw`;
+# the updater matches that suffix only when running the flavor, so a stock
+# board never picks the agent asset and vice versa.
 #
 # Tags are BARE semver (no `v` prefix) — nerves_github_updater's
 # VersionCompare parses tag names as semver directly.
@@ -57,12 +60,21 @@ env:
 
 jobs:
   build:
+    name: ${{ matrix.target }}${{ matrix.flavor && format(' ({0})', matrix.flavor) || '' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     strategy:
       fail-fast: false
+      # Include-only on purpose: an include entry that overwrites no original
+      # value is merged into the matching combination, which would swallow the
+      # agent job and leave a three-job matrix.
       matrix:
-        target: [rpi3_64, dragon_q6a, rubik_pi3]
+        include:
+          - target: rpi3_64
+          - target: dragon_q6a
+          - target: rubik_pi3
+          - target: dragon_q6a
+            flavor: agent-dev-board
     defaults:
       run:
         working-directory: vagus
@@ -136,23 +148,26 @@ jobs:
         run: mix deps.get
         env:
           MIX_TARGET: ${{ matrix.target }}
+          VAGUS_FLAVOR: ${{ matrix.flavor }}
 
       - name: Build firmware
         run: mix firmware
         working-directory: vagus/apps/vagus_platform
         env:
           MIX_TARGET: ${{ matrix.target }}
+          VAGUS_FLAVOR: ${{ matrix.flavor }}
+          NERVES_FW_MISC: ${{ matrix.flavor }}
 
       - name: Rename firmware asset
         run: |
           cp "_build/${{ matrix.target }}_prod/nerves/images/vagus_platform.fw" \
-            "vagus_${{ matrix.target }}.fw"
+            "vagus_${{ matrix.target }}${{ matrix.flavor == 'agent-dev-board' && '-agent' || '' }}.fw"
 
-      # Both matrix jobs race to create the release; the loser's create
+      # All matrix jobs race to create the release; the loser's create
       # fails ("already exists") and falls through to the upload.
       - name: Upload to GitHub release
         run: |
           gh release create "$GITHUB_REF_NAME" \
             --verify-tag --title "$GITHUB_REF_NAME" --generate-notes || true
           gh release upload "$GITHUB_REF_NAME" \
-            "vagus_${{ matrix.target }}.fw" --clobber
+            "vagus_${{ matrix.target }}${{ matrix.flavor == 'agent-dev-board' && '-agent' || '' }}.fw" --clobber
