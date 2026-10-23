@@ -260,6 +260,26 @@ defmodule Vagus.Devices.WatcherTest do
     refute_receive {:device, _, _}, 50
   end
 
+  test "a settle timer firing while unsubscribed announces nothing until the resync", ctx do
+    path = uevent_path("1-1.2")
+    ftdi(ctx)
+    File.rm!(Path.join(ctx.sysfs_root, "class/tty/ttyUSB0"))
+    put(ctx, path, device_props())
+    stale = armed(path)
+
+    kill_partition(ctx)
+    eventually(fn -> :sys.get_state(ctx.watcher).table_ref == nil end)
+    ftdi_tty(ctx)
+    fire(stale)
+    refute_receive {:device, _, _}, 50
+
+    fresh = armed(path, 3_000)
+    fire(fresh)
+    assert_receive {:device, :added, %{id: "usb:1-1.2"} = device}
+    assert Enum.map(device.nodes, & &1.class) == [:usb, :tty]
+    refute_receive {:device, _, _}, 50
+  end
+
   test "a table found without its registry at start is retried", ctx do
     stop_supervised!(:watcher)
     stop_supervised!(ctx.table)

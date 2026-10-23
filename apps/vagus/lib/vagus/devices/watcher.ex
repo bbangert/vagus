@@ -120,6 +120,12 @@ defmodule Vagus.Devices.Watcher do
   def handle_info(%PropertyTable.Event{table: table} = event, %{table: table} = state),
     do: {:noreply, uevent(event, state)}
 
+  # The uevents that would have re-armed this timer were missed with the
+  # subscription, so settling now could announce a device before its nodes
+  # exist. The entry stays: resync re-arms every unannounced device.
+  def handle_info({:settled, _path, _token}, %{table_ref: nil} = state),
+    do: {:noreply, state}
+
   def handle_info({:settled, path, token}, state) do
     case Map.get(state.pending, path) do
       {_timer, ^token} ->
