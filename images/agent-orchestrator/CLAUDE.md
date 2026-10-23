@@ -42,9 +42,9 @@ board, so `-v` sources are board paths:
 - your own config dir (`/data/claude`): never mount it into a worker
 - per-task work dir: create `/data/tasks/<x>` here (`mkdir -p`, you are uid 1000 like the
   worker's `agent`), mount board `.../agent_orchestrator/tasks/<x>`
-- per-task worker config: `worker-config <x>` creates `/data/tasks/<x>/claude` holding
+- per-task worker config: `worker-config <x>` creates `/data/worker-configs/<x>` holding
   only a copy of the login and prints the board path to mount; re-run it to refresh the
-  login copy
+  login copy. It lives outside the work dir because the worker can write there
 
 ## Creating a worker
 Name every worker `task-<x>`. Never `addon_*`: that prefix belongs to Vagus's apps.
@@ -52,7 +52,7 @@ Run `worker-config x` first.
 
     VAGUS_TIMEOUT=180000 vagus eval 'Vagus.Runtime.Podman.Cmd.run(["run", "-d", "--name", "task-x", "--memory", "4g",
       "--device", "/dev/ttyUSB0",
-      "-v", "/data/addons/data/agent_orchestrator/tasks/x/claude:/claude",
+      "-v", "/data/addons/data/agent_orchestrator/worker-configs/x:/claude",
       "-v", "/data/addons/data/agent_orchestrator/tasks/x:/work",
       "ghcr.io/bbangert/vagus-agent-base:<tag>", "sleep", "infinity"], timeout_ms: 120_000)'
 
@@ -107,6 +107,8 @@ needs `--net host --cap-add NET_ADMIN,NET_RAW` and runs its own `bluetoothd`.
 - Print or copy the cookie by any route: the node file (`/run/vagus-dist/node.json`),
   `Node.get_cookie()`, `env`, `ps`, `podman inspect` of your own container.
 - Mount your own config dir (`/data/claude`) into a worker.
+- Mount a worker-config dir into any worker other than its own, or anything under `/data`
+  except that one task's work dir and its config dir.
 
 ## Logs
 - This loop: `/data/claude-loop.log`.

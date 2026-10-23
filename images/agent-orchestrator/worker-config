@@ -8,12 +8,29 @@ set -euo pipefail
 [ $# -eq 1 ] && [[ $1 =~ ^[A-Za-z0-9_.-]+$ ]] && [[ $1 != .* ]] \
   || { echo "usage: worker-config <task>   (letters, digits, _ . -)" >&2; exit 64; }
 task=$1
-dir=/data/tasks/$task/claude
+root=/data/worker-configs
+dir=$root/$task
 creds=$CLAUDE_CONFIG_DIR/.credentials.json
 [ -r "$creds" ] || { echo "worker-config: no login at $creds" >&2; exit 1; }
 
 umask 077
+mkdir -p "$root"
+
+# Unlike the task work dir (mounted rw at /work, so the worker controls what is in it),
+# nothing under $root is worker-writable except that one worker's own /claude. A
+# symlink here means something replaced a path we own; fail rather than follow or heal it.
+refuse_symlink() {
+  [ ! -L "$1" ] || { echo "worker-config: $1 is a symlink, refusing" >&2; exit 1; }
+}
+refuse_symlink "$root"
+mkdir -p "$dir"
+refuse_symlink "$dir"
+refuse_symlink "$dir/.credentials.json"
+refuse_symlink "$dir/.claude.json"
+[[ $(readlink -f "$dir") == "$root/$task" ]] \
+  || { echo "worker-config: $dir resolves outside $root, refusing" >&2; exit 1; }
 mkdir -p "$dir/projects"
+refuse_symlink "$dir/projects"
 chmod 0700 "$dir"
 
 # Re-running refreshes only the login; the worker's own state is left alone.
@@ -25,8 +42,8 @@ fi
 
 # Ownership matters only when run as root (`podman exec` without `--user agent`).
 if [ "$(id -u)" = 0 ]; then
-  chown 1000:1000 /data/tasks "/data/tasks/$task"
+  chown 1000:1000 "$root" "$dir"
   chown -R 1000:1000 "$dir"
 fi
 
-echo "/data/addons/data/agent_orchestrator/tasks/$task/claude"
+echo "/data/addons/data/agent_orchestrator/worker-configs/$task"
