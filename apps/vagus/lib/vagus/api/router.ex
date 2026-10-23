@@ -3469,12 +3469,19 @@ defmodule Vagus.API.Router do
              :ok <- reject_password(params),
              :ok <- reject_homeassistant(params, "Core restore not supported"),
              :ok <- reject_folders(params),
-             {:ok, addon_slugs} <- require_addons_list(params) do
+             {:ok, addon_slugs} <- require_addons_list(params),
+             :ok <- reject_protected_restore(addon_slugs) do
           run_backup_restore(conn, slug, addon_slugs)
         else
           {:error, message} -> Envelope.send_error(conn, message, 400)
         end
     end
+  end
+
+  # Restore runs per slug in order, so a protected slug late in the list would
+  # be refused only after the earlier ones were already overwritten.
+  defp reject_protected_restore(addon_slugs) do
+    if Enum.any?(addon_slugs, &App.orchestrator?/1), do: {:error, @protected_message}, else: :ok
   end
 
   defp run_backup_restore(conn, slug, addon_slugs) do

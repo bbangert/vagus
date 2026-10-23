@@ -201,16 +201,21 @@ defmodule Vagus.Dist do
 
   # `:exclusive` so nothing placed at the name beforehand is written through.
   # The file is created under the umask, so its mode and group are fixed
-  # while it is still empty, before the cookie goes in.
+  # while it is still empty, before the cookie goes in. `:raw` +
+  # `:file.write/2` because `IO.binwrite/2` raises on a write error (tmpfs
+  # full), which would skip the tagged error and the temp-file cleanup.
   # sobelow_skip ["Traversal.FileModule"]
   defp write_private(path, data, gid) do
-    with {:ok, io} <- File.open(path, [:write, :exclusive, :binary]) do
-      try do
+    with {:ok, fd} <- File.open(path, [:write, :exclusive, :raw, :binary]) do
+      result =
         with :ok <- File.chmod(path, 0o640),
              :ok <- File.chgrp(path, gid),
-             do: IO.binwrite(io, data)
-      after
-        File.close(io)
+             :ok <- :file.write(fd, data),
+             do: :file.sync(fd)
+
+      case File.close(fd) do
+        :ok -> result
+        {:error, _reason} = error -> if result == :ok, do: error, else: result
       end
     end
   end

@@ -163,8 +163,8 @@ defmodule Vagus.API.BackupRouterTest do
     parts_body <> "--#{boundary}--\r\n"
   end
 
-  defp create_backup(slug) do
-    conn = supervisor_call(:post, "/backups/new/partial", %{"addons" => [slug]})
+  defp create_backup(slug, more \\ []) do
+    conn = supervisor_call(:post, "/backups/new/partial", %{"addons" => [slug | List.wrap(more)]})
     assert conn.status == 200
     body(conn)["data"]["slug"]
   end
@@ -219,6 +219,35 @@ defmodule Vagus.API.BackupRouterTest do
       assert job["errors"] == []
       assert {:ok, %{backup: b}} = Backups.get(job["reference"])
       assert Enum.any?(b["addons"], &(&1["slug"] == "core_partial_bg"))
+    end
+
+    test "a protected slug anywhere in the list refuses the whole request untouched", %{
+      data_root: dr
+    } do
+      install("core_restore_a", dr)
+      install("core_restore_orch", dr)
+      slug = create_backup("core_restore_a", "core_restore_orch")
+
+      data_dir = Path.join([dr, "addons", "data", "core_restore_a"])
+      File.write!(Path.join(data_dir, "f.txt"), "mutated")
+
+      prev = Application.get_env(:vagus, :orchestrator_app)
+      Application.put_env(:vagus, :orchestrator_app, "core_restore_orch")
+
+      on_exit(fn ->
+        if prev,
+          do: Application.put_env(:vagus, :orchestrator_app, prev),
+          else: Application.delete_env(:vagus, :orchestrator_app)
+      end)
+
+      conn =
+        supervisor_call(:post, "/backups/#{slug}/restore/partial", %{
+          "addons" => ["core_restore_a", "core_restore_orch"]
+        })
+
+      assert conn.status == 400
+      assert body(conn)["message"] =~ "protected"
+      assert File.read!(Path.join(data_dir, "f.txt")) == "mutated"
     end
 
     test "a non-empty password -> 400" do

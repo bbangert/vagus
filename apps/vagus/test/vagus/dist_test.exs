@@ -532,6 +532,24 @@ defmodule Vagus.DistTest do
       assert File.ls!(Path.join(dir, "node.json")) == ["held"]
     end
 
+    # A write error on the real tmpfs cannot be forced from a test, so this
+    # fails the open instead and pins the tagged-error and no-leftover contract.
+    test "a failed temp write is tagged, leaves no temp file and keeps node.json", %{
+      vm: vm,
+      dir: dir,
+      gid: gid
+    } do
+      {:ok, session} = Dist.enable(system(vm))
+      File.mkdir_p!(dir)
+      File.write!(Path.join(dir, "node.json"), "earlier")
+
+      assert {:error, {:export, :enoent}} =
+               Dist.export(session, dir: dir, gid: gid, temp_suffix: fn -> "missing/x" end)
+
+      assert File.ls!(dir) == ["node.json"]
+      assert File.read!(Path.join(dir, "node.json")) == "earlier"
+    end
+
     test "a temp file left at the name it picks is removed and the write retried", %{
       vm: vm,
       dir: dir,
