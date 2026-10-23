@@ -23,8 +23,10 @@ defmodule Vagus.Devices.Watcher do
   every subscriber. That partition can restart on its own (the table's
   supervisor keeps running) or with the whole table; either way the
   subscription is gone. Both the partition's exit and the table's `:DOWN`
-  re-subscribe with `Vagus.Resubscribe`, and the inventory is re-read then,
-  announcing whatever changed while nobody was listening. Re-subscribing
+  re-subscribe with `Vagus.Resubscribe`, and the inventory is re-read then:
+  what left (or was re-plugged on the same port) while nobody was listening
+  is announced `:removed`, and what arrived settles as a fresh plug would
+  before its `:added`. Re-subscribing
   twice would register twice and deliver every uevent twice, so a retry
   that finds a live subscription does nothing.
 
@@ -235,23 +237,34 @@ defmodule Vagus.Devices.Watcher do
   end
 
   defp same_plug?(nil, _device), do: false
+  defp same_plug?(_known, nil), do: false
 
   defp same_plug?(known, device),
     do:
       Map.take(known, [:sysfs, :busnum, :devnum]) == Map.take(device, [:sysfs, :busnum, :devnum])
 
+  # A device whose plug changed while nobody was listening (re-plugged on
+  # the same port, so the same id) is a removal and a new plug. New plugs
+  # settle like any other rather than being announced from this read: one
+  # that appeared just before the resubscribe may still be creating nodes.
   defp resync(state) do
     now = inventory(state)
 
-    for {id, _device} <- state.known,
-        not Map.has_key?(now, id),
-        do: broadcast(state, {:device, :removed, id})
+    gone =
+      for {id, device} <- state.known, not same_plug?(device, Map.get(now, id)), do: id
 
-    for {id, device} <- now,
-        not Map.has_key?(state.known, id),
-        do: broadcast(state, {:device, :added, device})
+    for id <- gone, do: broadcast(state, {:device, :removed, id})
+    state = %{state | known: Map.drop(state.known, gone)}
 
-    %{state | known: now}
+    for {id, device} <- now, not Map.has_key?(state.known, id), reduce: state do
+      state -> arm(uevent_path(device, state), state)
+    end
+  end
+
+  # The table's key for the device: its sysfs path below the sysfs root.
+  defp uevent_path(device, state) do
+    root = state.devices_opts |> Devices.sysfs_root() |> Path.expand()
+    device.sysfs |> Path.relative_to(root) |> Path.split()
   end
 
   defp inventory(state) do

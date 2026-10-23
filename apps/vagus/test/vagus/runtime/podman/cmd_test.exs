@@ -349,20 +349,26 @@ defmodule Vagus.Runtime.Podman.CmdTest do
       assert byte_size(out) == 5_000
     end
 
-    # The file has no pipe to fill, so the cap is what stops the writer.
+    # The file has no pipe to fill, so the cap is what stops the writer: it
+    # never ends on its own, and the deadline is far past the bound.
     @tag timeout: 60_000
     test "a podman still writing past the cap is killed", ctx do
-      {bin, dir} =
-        split_script("""
-        head -c 10000000 /dev/zero
-        : > "$(dirname "$0")/written"
-        sleep 30
-        """)
+      {bin, _dir} = split_script("while :; do head -c 4096 /dev/zero; done\n")
 
       started = System.monotonic_time(:millisecond)
       assert run_apart(bin, ctx, timeout_ms: 20_000, cap: 1_000) == {:error, :output_too_large}
       assert System.monotonic_time(:millisecond) - started < 10_000
-      assert File.exists?(Path.join(dir, "written"))
+      assert File.ls!(ctx.out_dir) == []
+    end
+
+    # Stopped writing but still running: the cap is noticed on a later poll.
+    @tag timeout: 60_000
+    test "a podman idle past the cap is killed", ctx do
+      {bin, _dir} = split_script("head -c 2000 /dev/zero\nsleep 30\n")
+
+      started = System.monotonic_time(:millisecond)
+      assert run_apart(bin, ctx, timeout_ms: 20_000, cap: 1_000) == {:error, :output_too_large}
+      assert System.monotonic_time(:millisecond) - started < 10_000
       assert File.ls!(ctx.out_dir) == []
     end
 

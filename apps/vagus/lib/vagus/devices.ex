@@ -175,6 +175,10 @@ defmodule Vagus.Devices do
     if Regex.match?(@usb_device_name, name), do: "usb:" <> name
   end
 
+  @doc false
+  @spec sysfs_root(keyword()) :: Path.t()
+  def sysfs_root(opts \\ []), do: opts |> roots() |> elem(0)
+
   defp roots(opts) do
     opts = Keyword.merge(Application.get_env(:vagus, __MODULE__, []), opts)
     {Keyword.get(opts, :sysfs_root, "/sys"), Keyword.get(opts, :dev_root, "/dev")}

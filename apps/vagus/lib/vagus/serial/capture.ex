@@ -44,6 +44,7 @@ defmodule Vagus.Serial.Capture do
   @default_root "/data/vagus/serial"
   @max_bytes_cap 64 * 1024 * 1024
   @tail_chunk 64 * 1024
+  @tail_attempts 3
 
   @type entry :: %{
           label: String.t(),
@@ -149,17 +150,63 @@ defmodule Vagus.Serial.Capture do
   def tail(label, n, opts \\ []) when is_integer(n) and n > 0 do
     with {:ok, label} <- validate_label(label) do
       base = Path.join(Keyword.get(opts, :root, root()), label <> ".log")
-
-      # The live file is briefly missing while it rotates; .1 then holds it all.
-      case {last_lines(base, n), last_lines(base <> ".1", n)} do
-        {{:error, _}, {:error, _}} -> {:error, :enoent}
-        {current, rotated} -> {:ok, Enum.take(ok_lines(rotated) ++ ok_lines(current), -n)}
-      end
+      # Test seam: runs between the two opens, where a rotation would land.
+      between = Keyword.get(opts, :between_opens, fn -> :ok end)
+      tail_pair(base, n, between, @tail_attempts)
     end
   end
 
-  defp ok_lines({:ok, lines}), do: lines
-  defp ok_lines({:error, _}), do: []
+  # Once both handles are open no rotation can change what they read, so
+  # only a rotation between the two opens can pair the wrong halves (the
+  # live file read twice, or out of order). An open file's inode cannot be
+  # reused, so `.log` still naming the first handle's inode after the second
+  # open rules that out. Out of attempts, the live file alone is still
+  # consistent, only shorter.
+  defp tail_pair(base, n, between, attempts) do
+    current = open_log(base)
+    between.()
+    rotated = open_log(base <> ".1")
+
+    result =
+      try do
+        cond do
+          consistent?(base, current, rotated) -> read_pair(current, rotated, n)
+          attempts > 1 -> :retry
+          true -> read_pair(current, {:error, :rotating}, n)
+        end
+      after
+        for {:ok, io} <- [current, rotated], do: File.close(io)
+      end
+
+    if result == :retry, do: tail_pair(base, n, between, attempts - 1), else: result
+  end
+
+  defp read_pair({:error, _}, {:error, _}, _n), do: {:error, :enoent}
+
+  defp read_pair(current, rotated, n),
+    do: {:ok, Enum.take(last_lines(rotated, n) ++ last_lines(current, n), -n)}
+
+  # The live file is briefly missing while it rotates; `.1` then holds it all.
+  defp consistent?(_base, {:error, _}, _rotated), do: true
+
+  defp consistent?(base, {:ok, io}, rotated) do
+    inode = inode(io)
+
+    # A failed reopen renames `.1` back to the live name, leaving `.log` on
+    # the first handle's inode with the second handle on the same file.
+    match?({:ok, %File.Stat{inode: ^inode}}, File.stat(base)) and
+      not same_file?(rotated, inode)
+  end
+
+  defp same_file?({:ok, io}, inode), do: inode(io) == inode
+  defp same_file?({:error, _}, _inode), do: false
+
+  defp inode(io) do
+    case :file.read_file_info(io) do
+      {:ok, info} -> File.Stat.from_record(info).inode
+      {:error, _} -> nil
+    end
+  end
 
   @doc false
   def root, do: Application.get_env(:vagus, __MODULE__, [])[:root] || @default_root
@@ -253,16 +300,14 @@ defmodule Vagus.Serial.Capture do
 
   # path is `root` + a label checked by validate_label/1, not request input
   # sobelow_skip ["Traversal.FileModule"]
-  defp last_lines(path, n) do
-    with {:ok, io} <- File.open(path, [:read, :binary, :raw]) do
-      try do
-        {:ok, size} = :file.position(io, :eof)
-        {:ok, read_back(io, size, n, "", 0)}
-      after
-        File.close(io)
-      end
-    end
+  defp open_log(path), do: File.open(path, [:read, :binary, :raw])
+
+  defp last_lines({:ok, io}, n) do
+    {:ok, size} = :file.position(io, :eof)
+    read_back(io, size, n, "", 0)
   end
+
+  defp last_lines({:error, _}, _n), do: []
 
   # n + 1 newlines in hand means the n lines after the (possibly cut) first
   # one are complete.

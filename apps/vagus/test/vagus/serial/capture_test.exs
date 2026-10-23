@@ -126,6 +126,26 @@ defmodule Vagus.Serial.CaptureTest do
     assert Enum.map(tail, &split_ts/1) == ["payload-5", "payload-6", "payload-7"]
   end
 
+  test "a rotation between tail's two opens is neither repeated nor reordered", %{
+    start: start,
+    logs: logs
+  } do
+    # 35 bytes a line: payload-3 rotates 1 and 2 out to .log.1.
+    {:ok, pid} = start.("ttyUSB0", max_bytes: 100)
+    for i <- 1..2, do: feed(pid, "payload-#{i}")
+
+    rotate_once = fn ->
+      if not Process.get(:rotated, false) do
+        Process.put(:rotated, true)
+        for i <- 3..4, do: feed(pid, "payload-#{i}")
+      end
+    end
+
+    assert {:ok, tail} = Capture.tail("ttyUSB0", 4, root: logs, between_opens: rotate_once)
+    assert Process.get(:rotated)
+    assert Enum.map(tail, &split_ts/1) == ["payload-1", "payload-2", "payload-3", "payload-4"]
+  end
+
   test "a second capture of the same node or label is busy", %{start: start, sup: sup} do
     {:ok, _} = start.("ttyUSB0", [])
     assert {:error, :busy} = start.("/dev/ttyUSB0", name: "other")
