@@ -278,14 +278,27 @@ defmodule Vagus.App do
   """
   @spec set(String.t(), keyword()) :: :ok | :error | {:error, :protected}
   def set(slug, changes) when is_list(changes) do
-    Enum.each(changes, fn {key, _value} ->
-      unless key == :options or key in @settings,
-        do: raise(ArgumentError, "unknown app setting #{inspect(key)}")
-    end)
+    validate_settings!(Keyword.delete(changes, :options))
 
     if Keyword.has_key?(changes, :boot) or Keyword.has_key?(changes, :watchdog),
       do: unprotected(slug, fn -> do_set(slug, changes) end),
       else: do_set(slug, changes)
+  end
+
+  @doc """
+  `set/2` for per-install settings without its protection, for boot's own
+  default apps (`Vagus.App.Units.install_default/1`); no request reaches it.
+  """
+  @spec put_settings(String.t(), keyword()) :: :ok | :error
+  def put_settings(slug, settings) when is_list(settings) do
+    validate_settings!(settings)
+    do_set(slug, settings)
+  end
+
+  defp validate_settings!(settings) do
+    Enum.each(settings, fn {key, _value} ->
+      unless key in @settings, do: raise(ArgumentError, "unknown app setting #{inspect(key)}")
+    end)
   end
 
   defp do_set(slug, changes) do
@@ -359,12 +372,13 @@ defmodule Vagus.App do
 
   @doc """
   The agent flavor's orchestrator app, which holds the board's agent login
-  and makes its workers. A request may not stop, restart or uninstall it,
-  nor change its `boot` or `watchdog`: from inside the board that is the
-  agent cutting off its own control. Shutdown halts it through units, not
-  through these.
+  and makes its workers. A request may not stop, restart, uninstall or
+  restore it, nor change its `boot` or `watchdog`: from inside the board
+  that is the agent cutting off its own control. `update/2` stays allowed,
+  since an image bump is legitimate and starts it again. Shutdown halts it
+  through units, not through these.
   """
-  @spec orchestrator?(String.t()) :: boolean()
+  @spec orchestrator?(String.t() | nil) :: boolean()
   def orchestrator?(slug) do
     orchestrator = Application.get_env(:vagus, :orchestrator_app)
     orchestrator != nil and slug == orchestrator
@@ -385,10 +399,7 @@ defmodule Vagus.App do
   @spec install(Config.t(), keyword()) :: :ok | {:error, :already_installed | term()}
   def install(%Config{slug: slug} = config, opts \\ []) do
     settings = Keyword.get(opts, :settings, [])
-
-    Enum.each(settings, fn {key, _value} ->
-      unless key in @settings, do: raise(ArgumentError, "unknown app setting #{inspect(key)}")
-    end)
+    validate_settings!(settings)
 
     args = %{
       config: config,
@@ -548,7 +559,7 @@ defmodule Vagus.App do
       |> Map.new()
       |> Map.merge(%{staging_dir: staging_dir, options: options, start?: start?})
 
-    command(slug, :restore, args)
+    unprotected(slug, fn -> command(slug, :restore, args) end)
   end
 
   # The container was started as asked, and boot would report a running app

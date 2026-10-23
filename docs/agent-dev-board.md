@@ -128,14 +128,23 @@ board-level actions.
 
 For the orchestrator slug (`config :vagus, :orchestrator_app`, set only on
 this flavor), `POST /addons/<slug>/stop`, `restart` and `uninstall` return
-400 "protected". So does an options POST that carries `boot` or `watchdog`,
-and nothing else in that body is applied. The other options still save. The
-same holds when the app names itself `self`, and for `Vagus.App.stop/1`,
-`restart/1`, `uninstall/1` and `set/2` called directly, which return
-`{:error, :protected}`.
+400 "protected", and so does a partial backup restore that names it. So does
+an options POST that carries `boot` or `watchdog`, and nothing else in that
+body is applied. The other options still save. The same holds when the app
+names itself `self`, and for `Vagus.App.stop/1`, `restart/1`, `uninstall/1`,
+`restore/5` and `set/2` called directly, which return `{:error, :protected}`.
+An update stays allowed: an image bump is legitimate, and it starts the app
+again.
 
-The app is installed with `boot: "auto"` and `watchdog: true`, so it starts
-at every boot and is restarted after a crash; the protection keeps it so.
+The app is installed with `boot: "auto"` and `watchdog: true`, and every boot
+puts them back if they are missing. Within that:
+
+- the watchdog gives up after 5 consecutive restarts, leaving the app stopped
+  until the next boot;
+- a boot whose `dist` gate fails, or runs out of tries, halts there, and the
+  app is not started until the next boot;
+- the install pulls an image beside the boot, so a pull that fails (an
+  offline first boot) leaves no app until a later boot's install succeeds.
 
 Shutdown is unaffected. The boot sequencer halts the app and stops its
 container through its own units, not through these calls.
@@ -152,9 +161,14 @@ are new after every boot.
 
 - Root by design (D7). Whoever drives the orchestrator owns the board.
 - The cookie exists only on tmpfs, in a file only root and the image's
-  `agent` group (gid 1000) can read, and in the BEAM. It
-  is never on `/data`, in env or in `podman inspect`. The `vagus` CLI puts it
-  on its own argv, which is visible only inside the orchestrator container.
+  `agent` group (gid 1000) can read, and in the BEAM. It is never on `/data`,
+  in env or in `podman inspect`. The `vagus` CLI puts it on its own argv,
+  though, and argv (`/proc/<pid>/cmdline`) is readable by any process that
+  shares the host PID namespace: every host process, an app with `host_pid`
+  (were the orchestrator's protection lifted, through it too), and a worker
+  started with `--pid=host`. Never start a worker with `--pid=host`. The next
+  orchestrator image reads the cookie at runtime instead of passing it on
+  argv (a follow-up).
 - The credentials dir (`/data/claude`) belongs to one board's login. It is
   never copied to another board and never mounted into a worker. Workers get
   `worker-config` copies.

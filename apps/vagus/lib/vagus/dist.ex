@@ -52,6 +52,9 @@ defmodule Vagus.Dist do
   @port_max 9105
   @table :vagus_dist
   @session_key :session
+  # Under the boot gate's 10 s `gate_timeout`, so the gate answers before it
+  # is killed.
+  @wait_ms 5_000
   # A plain directory on the `/run` tmpfs, like the rest of `/run/vagus`
   # (`Vagus.Runtime.Host` only makes that one 0700; its own tmpfs is the logs
   # subdirectory). Gone at reboot with the session it describes.
@@ -71,6 +74,14 @@ defmodule Vagus.Dist do
   A caller that arrives while a claim is in flight gets `{:error, :starting}`
   rather than racing it.
 
+  The bring-up runs in a process of its own under `Vagus.TaskSupervisor`, which
+  the claim names (`{:starting, pid}`). The caller waits up to `:wait_ms`
+  (5 s) for it and otherwise answers `{:error, :starting}` while it runs on, so
+  a caller killed on a deadline, as a boot gate is, cannot cut a bring-up off
+  between `net_kernel` starting and the cookie being ours. A claim whose
+  process is dead is taken over by the next caller, which meets the node, if
+  it came up, through the `already_started` recovery.
+
   Raises if bring-up fails, having stopped distribution first. Reboot rather
   than retrying into a state nobody has reasoned about. The one exception is
   `{:error, :no_address}`: it is known before anything starts, and at boot
@@ -78,9 +89,25 @@ defmodule Vagus.Dist do
   """
   @spec enable(keyword()) :: {:ok, session()} | {:error, :starting | :node_gone | :no_address}
   def enable(opts \\ []) do
+    {wait_ms, opts} = Keyword.pop(opts, :wait_ms, @wait_ms)
     system = system(opts)
 
-    case system.session_claim_fun.() do
+    task =
+      Task.Supervisor.async_nolink(Vagus.TaskSupervisor, fn -> claim_and_bring_up(system) end)
+
+    case Task.yield(task, wait_ms) || Task.ignore(task) do
+      {:ok, {:raised, kind, reason, stacktrace}} -> :erlang.raise(kind, reason, stacktrace)
+      {:ok, result} -> result
+      # Killed from outside: its claim names a dead pid, which the next call takes over.
+      {:exit, _reason} -> {:error, :starting}
+      nil -> {:error, :starting}
+    end
+  end
+
+  # Everything is caught so the caller, not this process, raises: a crash
+  # here would surface as an exit, which the boot gate retries.
+  defp claim_and_bring_up(system) do
+    case system.session_claim_fun.(self()) do
       :claimed ->
         bring_up(system)
 
@@ -93,12 +120,28 @@ defmodule Vagus.Dist do
       {:recorded, session} ->
         if system.alive_fun.(), do: {:ok, session}, else: {:error, :node_gone}
     end
+  catch
+    kind, reason -> {:raised, kind, reason, __STACKTRACE__}
   end
+
+  @doc false
+  # What a claim attempt by `claimant` makes of the row; `:take` means it may
+  # replace the row with its own `{:starting, claimant}`. Shared with the
+  # tests' fake table so the eviction rule they exercise is this one.
+  @spec claim_decision(term()) :: :take | :starting | {:recorded, session()}
+  def claim_decision(:not_requested), do: :take
+  def claim_decision({:starting, pid}), do: if(Process.alive?(pid), do: :starting, else: :take)
+  def claim_decision(session), do: {:recorded, session}
+
+  @doc false
+  @spec agent_gid() :: non_neg_integer()
+  def agent_gid, do: @agent_gid
 
   @doc """
   Writes the session's node and cookie, and nothing else, to `node.json` in
   `/run/vagus/dist` (`:dir`), for the agent-dev-board's orchestrator app,
-  which mounts that directory read-only and connects back.
+  which mounts that directory read-only and connects back. `:temp_suffix`
+  names the temp file (tests).
 
   The directory is 0750 and the file 0640, both root and group 1000 (`:gid`),
   the image's `agent` user. The file's mode and group are set before the
@@ -111,23 +154,54 @@ defmodule Vagus.Dist do
   def export(%{node: node, cookie: cookie}, opts \\ []) do
     dir = Keyword.get(opts, :dir, @export_dir)
     gid = Keyword.get(opts, :gid, @agent_gid)
-    tmp = Path.join(dir, ".node.json.#{System.unique_integer([:positive])}")
+    suffix = Keyword.get(opts, :temp_suffix, &temp_suffix/0)
     json = Jason.encode!(%{node: Atom.to_string(node), cookie: cookie})
 
     with :ok <- File.mkdir_p(dir),
          :ok <- File.chmod(dir, 0o750),
          :ok <- File.chgrp(dir, gid),
-         :ok <- write_private(tmp, json, gid),
-         :ok <- File.rename(tmp, Path.join(dir, "node.json")) do
+         {:ok, tmp} <- write_temp(dir, json, gid, suffix, 2),
+         :ok <- rename_or_remove(tmp, Path.join(dir, "node.json")) do
       :ok
     else
-      {:error, reason} ->
+      {:error, reason} -> {:error, {:export, reason}}
+    end
+  end
+
+  # Random, not `System.unique_integer/1`, which restarts with the VM: a temp
+  # file a killed export left on this tmpfs could otherwise be named again.
+  # One `:eexist` is removed and retried, so a leftover never halts a boot.
+  # sobelow_skip ["Traversal.FileModule"]
+  defp write_temp(dir, json, gid, suffix, tries) do
+    tmp = Path.join(dir, ".node.json." <> suffix.())
+
+    case write_private(tmp, json, gid) do
+      :ok ->
+        {:ok, tmp}
+
+      {:error, :eexist} when tries > 1 ->
         File.rm(tmp)
-        {:error, {:export, reason}}
+        write_temp(dir, json, gid, suffix, tries - 1)
+
+      {:error, _reason} = error ->
+        File.rm(tmp)
+        error
+    end
+  end
+
+  defp temp_suffix, do: Base.encode16(:crypto.strong_rand_bytes(8), case: :lower)
+
+  # sobelow_skip ["Traversal.FileModule"]
+  defp rename_or_remove(tmp, path) do
+    with {:error, _reason} = error <- File.rename(tmp, path) do
+      File.rm(tmp)
+      error
     end
   end
 
   # `:exclusive` so nothing placed at the name beforehand is written through.
+  # The file is created under the umask, so its mode and group are fixed
+  # while it is still empty, before the cookie goes in.
   # sobelow_skip ["Traversal.FileModule"]
   defp write_private(path, data, gid) do
     with {:ok, io} <- File.open(path, [:write, :exclusive, :binary]) do
@@ -208,12 +282,10 @@ defmodule Vagus.Dist do
     end
   end
 
-  # Failures are caught HERE, in the calling process, rather than watched from
-  # outside it. That is the whole reason this is simple: an earlier version
-  # spawned a worker and a monitoring guard because an interactive IEx session
-  # catches `MatchError` and keeps its evaluator alive, so nothing outside could
-  # tell that a step had failed. Our own `catch` runs first, before IEx ever
-  # sees the exception, so watching from outside was never necessary.
+  # Failures are caught HERE, in the bring-up process, rather than watched from
+  # outside it: our own `catch` runs before anything else sees the exception
+  # (an interactive IEx session would catch a `MatchError` and keep going).
+  # No caller's deadline kills this process, so the cleanup below runs.
   #
   # The steps themselves assert. The only cleanup that matters is stopping
   # `net_kernel`: after it starts, the node is live under the cookie OTP
@@ -352,7 +424,7 @@ defmodule Vagus.Dist do
       disconnect_fun: &Node.disconnect/1,
       net_kernel_stop_fun: &:net_kernel.stop/0,
       self_node_fun: &Node.self/0,
-      session_claim_fun: &default_session_claim/0,
+      session_claim_fun: &default_session_claim/1,
       session_get_fun: &default_session_get/0,
       session_put_fun: &default_session_put/1,
       session_reset_fun: &default_session_reset/0
@@ -361,22 +433,23 @@ defmodule Vagus.Dist do
   end
 
   # `select_replace/2` is the atomic compare-and-swap: exactly one concurrent
-  # caller can move the row off `:not_requested`, so only that one proceeds to
+  # caller can move the row off what it read, so only that one proceeds to
   # `net_kernel.start`. Without it a second caller reaches `already_started`
   # while the first has not yet set its cookie, and records one that never
-  # authenticates.
-  defp default_session_claim do
-    claim = [{{@session_key, :not_requested}, [], [{{@session_key, :starting}}]}]
+  # authenticates. A lost swap reads the row again.
+  defp default_session_claim(claimant) do
+    current = default_session_get()
 
-    case :ets.select_replace(@table, claim) do
-      1 ->
-        :claimed
+    case claim_decision(current) do
+      :take ->
+        swap = [{{@session_key, current}, [], [{:const, {@session_key, {:starting, claimant}}}]}]
 
-      0 ->
-        case default_session_get() do
-          :starting -> :starting
-          session -> {:recorded, session}
-        end
+        if :ets.select_replace(@table, swap) == 1,
+          do: :claimed,
+          else: default_session_claim(claimant)
+
+      answer ->
+        answer
     end
   end
 

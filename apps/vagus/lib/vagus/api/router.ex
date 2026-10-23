@@ -2928,7 +2928,7 @@ defmodule Vagus.API.Router do
   defp busy_message(slug), do: "Another job is running for job group app_#{slug}"
 
   @protected_message "The agent orchestrator app is protected: it cannot be stopped, " <>
-                       "restarted or uninstalled, nor its boot or watchdog changed"
+                       "restarted, uninstalled or restored, nor its boot or watchdog changed"
 
   # The container did what was asked; the host failed to record it or to
   # clean up after it, which is no fault of the request.
@@ -3513,6 +3513,7 @@ defmodule Vagus.API.Router do
 
   defp restore_error_message(message) when is_binary(message), do: message
   defp restore_error_message({:restore, addon_slug, :busy}), do: busy_message(addon_slug)
+  defp restore_error_message({:restore, _addon_slug, :protected}), do: @protected_message
 
   defp restore_error_message({:restore, addon_slug, :shutting_down}),
     do: "Restore of addon #{addon_slug} was interrupted: the system is shutting down"

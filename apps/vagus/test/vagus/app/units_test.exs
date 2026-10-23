@@ -5,7 +5,14 @@ defmodule Vagus.App.UnitsTest do
   import ExUnit.CaptureLog
 
   import Vagus.AppFixtures,
-    only: [app_config: 2, app_info: 1, forget_app: 1, install_app: 1, listening_api_port: 0]
+    only: [
+      app_config: 2,
+      app_info: 1,
+      forget_app: 1,
+      install_app: 1,
+      install_app: 2,
+      listening_api_port: 0
+    ]
 
   alias Vagus.App.{Gates, Units}
   alias Vagus.Core.EventPusher
@@ -20,6 +27,7 @@ defmodule Vagus.App.UnitsTest do
     builtin_native?: 1,
     native?: 1,
     boot_start: 2,
+    start: 1,
     running: 0,
     inspect: 1,
     halt: 1,
@@ -200,7 +208,7 @@ defmodule Vagus.App.UnitsTest do
                host_network: true,
                host_dbus: true,
                arch: ["aarch64"],
-               map: [%{type: "data", read_only: false}]
+               map: []
              } = config
 
       refute Units.builtin_native?("agent_orchestrator")
@@ -246,6 +254,14 @@ defmodule Vagus.App.UnitsTest do
       data = Vagus.App.Policy.init_data("agent_orchestrator", saved)
       assert Vagus.App.Policy.restart?(data, false)
     end
+
+    test "one already installed without its protected settings gets them back" do
+      {:ok, config} = Units.builtin_config("agent_orchestrator")
+      install_app(config, boot: "manual", watchdog: false)
+
+      assert Units.install_default("agent_orchestrator") == :present
+      assert {:ok, %{boot: "auto", watchdog: true}} = app_info("agent_orchestrator")
+    end
   end
 
   describe "the dist gate" do
@@ -254,6 +270,11 @@ defmodule Vagus.App.UnitsTest do
       on_exit(fn -> File.rm_rf(dir) end)
       {gid, 0} = System.cmd("id", ["-g"])
       %{dir: dir, gid: String.to_integer(String.trim(gid))}
+    end
+
+    test "retries an exit, which a raise or a throw is not", %{dir: dir} do
+      assert Gates.dist(enable: fn -> exit(:table_restarting) end, dir: dir) ==
+               {:error, {:exit, :table_restarting}}
     end
 
     @session %{node: :"vagus@192.168.2.58", cookie: String.duplicate("ab", 32), ports: 9100..9105}
@@ -277,6 +298,8 @@ defmodule Vagus.App.UnitsTest do
 
       assert {:fatal, {:error, %RuntimeError{}}} =
                Gates.dist(enable: fn -> raise "bring-up failed" end, dir: dir)
+
+      assert {:fatal, {:throw, :stuck}} = Gates.dist(enable: fn -> throw(:stuck) end, dir: dir)
 
       File.write!(dir, "")
 

@@ -463,9 +463,12 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
     end
 
     test "its own token saying `self` is refused the same" do
-      conn = addon_call(:post, "/addons/self/stop", "agent_orchestrator")
-      assert conn.status == 400
-      assert body(conn)["message"] =~ "protected"
+      for action <- ["stop", "restart", "uninstall"] do
+        conn = addon_call(:post, "/addons/self/#{action}", "agent_orchestrator")
+        assert conn.status == 400, action
+        assert body(conn)["message"] =~ "protected"
+      end
+
       assert {:ok, %{state: :started}} = app_info("agent_orchestrator")
     end
 

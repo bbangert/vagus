@@ -116,6 +116,17 @@ defmodule Vagus.AppTest do
       assert :ok = App.stop(other)
     end
 
+    test "is not restored, which would stop it and could leave it stopped", %{slug: slug} do
+      assert {:error, :protected} = App.restore(slug, "/nonexistent", nil, false)
+      assert {:ok, %{state: :started}} = app_info(slug)
+    end
+
+    test "is not anything, nor is nil, with the key unset", %{slug: slug} do
+      Application.delete_env(:vagus, :orchestrator_app)
+      refute App.orchestrator?(slug)
+      refute App.orchestrator?(nil)
+    end
+
     test "nothing is protected with the key unset", %{slug: slug} do
       Application.put_env(:vagus, :orchestrator_app, nil)
       refute App.orchestrator?(slug)
@@ -124,6 +135,17 @@ defmodule Vagus.AppTest do
       assert :ok = App.stop(slug)
       assert :ok = App.uninstall(slug)
     end
+  end
+
+  test "install/2 refuses an unknown per-install setting before anything is written" do
+    config = config()
+
+    assert_raise ArgumentError, ~r/unknown app setting :bogus/, fn ->
+      App.install(config, settings: [bogus: 1])
+    end
+
+    refute config.slug in App.slugs()
+    assert App.info(config.slug) == :error
   end
 
   describe "identity_for_token/1" do

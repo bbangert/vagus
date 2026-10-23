@@ -30,6 +30,7 @@ defmodule Vagus.App.OrchestratorTest do
         builtin_native?: &(&1 == "core_mqtt"),
         native?: & &1.native,
         boot_start: fn slug, _running? -> report.(:boot_start, slug) end,
+        start: fn slug -> send(test_pid, {:start, slug}) && {:ok, %{slug: slug}} end,
         running: fn -> {:ok, MapSet.new()} end,
         inspect: fn _slug -> false end,
         halt: &report.(:halt, &1),
@@ -900,6 +901,115 @@ defmodule Vagus.App.OrchestratorTest do
       refute :complete in messages
       assert log =~ "Boot: gate dist failed (:node_gone); boot halted"
     end
+
+    test "dist running out of tries halts the boot, where another gate is carried past" do
+      test_pid = self()
+      dist = fn -> send(test_pid, {:gate, :dist}) && {:error, :starting} end
+
+      log =
+        capture_log([level: :warning], fn ->
+          name =
+            start_orchestrator([app("a", "application")], %{
+              agent?: fn -> true end,
+              gates: dist_gates(test_pid, dist)
+            })
+
+          assert %{phase: :up, task: nil} = await_boot(name)
+        end)
+
+      messages = drain()
+      assert Enum.count(messages, &(&1 == {:gate, :dist})) == 3
+      refute {:gate, :api} in messages
+      refute {:boot_start, "a"} in messages
+      refute :complete in messages
+      assert log =~ "Boot: gate dist failed ({:dist, :tries_exhausted}); boot halted"
+    end
+
+    test "the container default app is installed only once dist and api are behind" do
+      test_pid = self()
+      install = fn slug -> send(test_pid, {:install, slug}) && :installed end
+
+      start_orchestrator([], %{agent?: fn -> true end, install_default: install},
+        default_apps: ["agent_orchestrator"]
+      )
+
+      messages = collect_until({:start, "agent_orchestrator"})
+      install_at = Enum.find_index(messages, &(&1 == {:install, "agent_orchestrator"}))
+
+      assert install_at > Enum.find_index(messages, &(&1 == {:gate, :dist}))
+      assert install_at > Enum.find_index(messages, &(&1 == {:gate, :api}))
+    end
+  end
+
+  describe "a container default app" do
+    test "is installed beside the boot, which completes without awaiting the pull" do
+      test_pid = self()
+
+      install = fn
+        "agent_orchestrator" = slug -> held(test_pid, {:install, slug}, :installed).()
+        _native -> :present
+      end
+
+      start_orchestrator([], %{install_default: install},
+        default_apps: ["core_mqtt", "agent_orchestrator"]
+      )
+
+      assert_receive {{:install, "agent_orchestrator"}, pulling}, 5_000
+      assert :complete in collect_until(:complete)
+      refute_received {:start, "agent_orchestrator"}
+
+      send(pulling, :release)
+      assert_receive {:start, "agent_orchestrator"}, 5_000
+    end
+
+    test "already installed is left alone" do
+      test_pid = self()
+      install = fn slug -> send(test_pid, {:install, slug}) && :present end
+
+      log =
+        capture_log(fn ->
+          start_orchestrator([], %{install_default: install},
+            default_apps: ["agent_orchestrator"]
+          )
+
+          assert {:install, "agent_orchestrator"} in collect_until(
+                   {:install, "agent_orchestrator"}
+                 )
+
+          assert :complete in collect_until(:complete)
+          refute_receive {:start, "agent_orchestrator"}, 100
+        end)
+
+      refute log =~ "default app"
+    end
+
+    test "that fails to install is logged, for the next boot to retry" do
+      test_pid = self()
+
+      install = fn _slug ->
+        send(test_pid, {:installing, self()})
+        {:error, :pull_failed}
+      end
+
+      log =
+        capture_log(fn ->
+          start_orchestrator([], %{install_default: install},
+            default_apps: ["agent_orchestrator"]
+          )
+
+          assert_receive {:installing, unit}, 5_000
+          # The unit logs after the install answers, then ends.
+          ref = Process.monitor(unit)
+          assert_receive {:DOWN, ^ref, :process, ^unit, _reason}, 5_000
+          assert :complete in collect_until(:complete)
+        end)
+
+      assert log =~
+               "Boot: default app agent_orchestrator not installed: {:error, :pull_failed}; " <>
+                 "the next boot retries"
+
+      refute_received {:start, "agent_orchestrator"}
+    end
   end
 
   test "default apps install once each in order: native before the tree gate, container after the gates" do
@@ -910,14 +1020,31 @@ defmodule Vagus.App.OrchestratorTest do
       default_apps: ["core_mqtt", "agent_orchestrator"]
     )
 
-    messages = collect_until(:complete)
+    messages = collect_until({:start, "agent_orchestrator"})
     installs = for {:install, slug} <- messages, do: slug
     assert installs == ["core_mqtt", "agent_orchestrator"]
 
     assert [{:install, "core_mqtt"}, {:gate, :tree} | _] = messages
 
-    assert Enum.find_index(messages, &(&1 == {:install, "agent_orchestrator"})) ==
-             Enum.find_index(messages, &(&1 == {:gate, :api})) + 1
+    assert Enum.find_index(messages, &(&1 == {:install, "agent_orchestrator"})) >
+             Enum.find_index(messages, &(&1 == {:gate, :api}))
+  end
+
+  test "a default app's kind is asked once, so a second answer cannot move it" do
+    test_pid = self()
+    install = fn slug -> send(test_pid, {:install, slug}) && :present end
+
+    native? = fn slug ->
+      send(test_pid, {:native?, slug})
+      slug == "core_mqtt"
+    end
+
+    start_orchestrator([], %{install_default: install, builtin_native?: native?},
+      default_apps: ["core_mqtt", "agent_orchestrator"]
+    )
+
+    messages = collect_until(:complete)
+    assert Enum.count(messages, &match?({:native?, _}, &1)) == 2
   end
 
   test "a failed or hung app stop is counted, and does not hold the rest back" do

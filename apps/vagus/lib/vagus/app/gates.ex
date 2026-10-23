@@ -75,17 +75,19 @@ defmodule Vagus.App.Gates do
   @doc """
   Starts distribution and exports the session (`Vagus.Dist.enable/1`,
   `Vagus.Dist.export/2`); the agent-dev-board flavor's only, where the
-  orchestrator app is useless without it. A claim in flight (`:starting`)
-  and a LAN lease not yet there (`:no_address`) are retried; any other
-  failure is `{:fatal, reason}` and halts the boot, since `Vagus.Dist` wants
-  a reboot rather than a retry after a failed bring-up.
+  orchestrator app is useless without it. A bring-up still running
+  (`:starting`) and a LAN lease not yet there (`:no_address`) are retried,
+  as is an exit; a raise, a throw or any other failure is `{:fatal, reason}`
+  and halts the boot, since `Vagus.Dist` wants a reboot rather than a retry
+  after a failed bring-up. Running out of tries halts it too
+  (`Vagus.App.Orchestrator`).
 
-  Not read-only, unlike the others, yet killed past `gate_timeout` like
-  them: one killed mid bring-up keeps the claim, and every later try
-  answers `:starting` until the tries run out. `opts`: `:enable`, `:dir`
-  and `:gid` (tests).
+  The bring-up runs in its own process and `enable/1` answers within its
+  `:wait_ms`, under `gate_timeout`, so the kill that bounds a gate never
+  lands inside it. `opts`: `:enable`, `:dir` and `:gid` (tests).
   """
-  @spec dist(keyword()) :: :ok | {:error, :starting | :no_address} | {:fatal, term()}
+  @spec dist(keyword()) ::
+          :ok | {:error, :starting | :no_address | {:exit, term()}} | {:fatal, term()}
   def dist(opts \\ []) do
     enable = Keyword.get(opts, :enable, &Vagus.Dist.enable/0)
 
@@ -97,6 +99,8 @@ defmodule Vagus.App.Gates do
       {:error, reason} -> {:fatal, reason}
     end
   catch
+    # A transient race, such as a table or supervisor mid-restart.
+    :exit, reason -> {:error, {:exit, reason}}
     kind, reason -> {:fatal, {kind, reason}}
   end
 

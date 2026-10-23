@@ -67,13 +67,12 @@ defmodule Vagus.DistTest do
       self_node_fun: fn -> Agent.get(vm, & &1.node) end,
       # get_and_update is atomic, which is what makes this a faithful stand-in
       # for :ets.select_replace/2 rather than a check-then-set that would hide
-      # the very race the real one exists to close.
-      session_claim_fun: fn ->
+      # the very race the real one exists to close. The decision is Dist's own.
+      session_claim_fun: fn claimant ->
         Agent.get_and_update(vm, fn st ->
-          case st.session do
-            :not_requested -> {:claimed, %{st | session: :starting}}
-            :starting -> {:starting, st}
-            session -> {{:recorded, session}, st}
+          case Dist.claim_decision(st.session) do
+            :take -> {:claimed, %{st | session: {:starting, claimant}}}
+            answer -> {answer, st}
           end
         end)
       end,
@@ -327,10 +326,94 @@ defmodule Vagus.DistTest do
       # Claiming is atomic, so only the winner reaches bring-up. Without it the
       # loser hits already_started before the winner has set its cookie and
       # records one that never authenticates.
-      Agent.update(vm, &%{&1 | session: :starting})
+      claimant = spawn(fn -> Process.sleep(:infinity) end)
+      on_exit(fn -> Process.exit(claimant, :kill) end)
+      Agent.update(vm, &%{&1 | session: {:starting, claimant}})
 
       assert {:error, :starting} = Dist.enable(system(vm))
       assert steps(vm) == []
+    end
+  end
+
+  describe "a bring-up outside the caller" do
+    # Blocks the bring-up at `tag` until the test sends `:go` to it.
+    defp held_at(vm, key, test_pid) do
+      original = Keyword.fetch!(system(vm), key)
+
+      held =
+        case key do
+          :epmd_fun ->
+            fn args, env ->
+              send(test_pid, {:held, self()})
+              receive do: (:go -> original.(args, env))
+            end
+
+          :set_cookie_fun ->
+            fn cookie ->
+              send(test_pid, {:held, self()})
+              receive do: (:go -> original.(cookie))
+            end
+        end
+
+      system(vm, [{key, held}, wait_ms: 50])
+    end
+
+    test "one that outlives the caller's wait finishes, and the next call gets its session",
+         %{vm: vm} do
+      assert {:error, :starting} = Dist.enable(held_at(vm, :epmd_fun, self()))
+      assert_receive {:held, bring_up}
+      ref = Process.monitor(bring_up)
+      send(bring_up, :go)
+      assert_receive {:DOWN, ^ref, :process, ^bring_up, _reason}
+
+      assert {:ok, %{cookie: cookie}} = Dist.enable(system(vm))
+      assert {:ok, %{cookie: ^cookie}} = Dist.enable(system(vm))
+      assert Agent.get(vm, & &1.cookie) == String.to_atom(cookie)
+      assert Enum.count(steps(vm), &match?({:net_kernel_start, _, _}, &1)) == 1
+    end
+
+    test "a caller killed while it waits does not cut the bring-up short", %{vm: vm} do
+      test_pid = self()
+      opts = Keyword.put(held_at(vm, :epmd_fun, test_pid), :wait_ms, 60_000)
+      caller = spawn(fn -> Dist.enable(opts) end)
+      assert_receive {:held, bring_up}
+      Process.exit(caller, :kill)
+
+      ref = Process.monitor(bring_up)
+      send(bring_up, :go)
+      assert_receive {:DOWN, ^ref, :process, ^bring_up, :normal}
+
+      assert %{session: %{cookie: cookie}} = Agent.get(vm, & &1)
+      assert Agent.get(vm, & &1.cookie) == String.to_atom(cookie)
+    end
+
+    test "one killed after net_kernel started is taken over, under a fresh cookie", %{vm: vm} do
+      assert {:error, :starting} = Dist.enable(held_at(vm, :set_cookie_fun, self()))
+      assert_receive {:held, bring_up}
+      # The node is up under the cookie OTP invented, and the claim names
+      # a process about to die.
+      ref = Process.monitor(bring_up)
+      Process.exit(bring_up, :kill)
+      assert_receive {:DOWN, ^ref, :process, ^bring_up, :killed}
+      assert {:starting, ^bring_up} = Agent.get(vm, & &1.session)
+
+      assert {:ok, %{cookie: cookie}} = Dist.enable(system(vm))
+      assert Agent.get(vm, & &1.cookie) == String.to_atom(cookie)
+
+      assert [{:net_kernel_start, _, _}, {:net_kernel_start, _, _}] =
+               Enum.filter(steps(vm), &match?({:net_kernel_start, _, _}, &1))
+    end
+
+    test "a live claimant is waited on, a dead one is evicted" do
+      live = spawn(fn -> Process.sleep(:infinity) end)
+      dead = spawn(fn -> :ok end)
+      ref = Process.monitor(dead)
+      assert_receive {:DOWN, ^ref, :process, ^dead, _reason}
+      on_exit(fn -> Process.exit(live, :kill) end)
+
+      assert Dist.claim_decision(:not_requested) == :take
+      assert Dist.claim_decision({:starting, live}) == :starting
+      assert Dist.claim_decision({:starting, dead}) == :take
     end
   end
 
@@ -340,6 +423,10 @@ defmodule Vagus.DistTest do
         Dist.status(Keyword.put(system(vm), :alive_func, fn -> true end))
       end
     end
+  end
+
+  test "the export's group is the orchestrator image's agent user" do
+    assert Dist.agent_gid() == 1000
   end
 
   describe "the real :vagus_dist table" do
@@ -443,6 +530,20 @@ defmodule Vagus.DistTest do
       assert {:error, {:export, _reason}} = Dist.export(session, dir: dir, gid: gid)
       assert File.ls!(dir) == ["node.json"]
       assert File.ls!(Path.join(dir, "node.json")) == ["held"]
+    end
+
+    test "a temp file left at the name it picks is removed and the write retried", %{
+      vm: vm,
+      dir: dir,
+      gid: gid
+    } do
+      {:ok, session} = Dist.enable(system(vm))
+      File.mkdir_p!(dir)
+      File.write!(Path.join(dir, ".node.json.stale"), "left by a killed export")
+
+      assert Dist.export(session, dir: dir, gid: gid, temp_suffix: fn -> "stale" end) == :ok
+      assert File.ls!(dir) == ["node.json"]
+      assert File.read!(Path.join(dir, "node.json")) =~ session.cookie
     end
 
     test "logs nothing that carries the cookie", %{vm: vm, dir: dir, gid: gid} do

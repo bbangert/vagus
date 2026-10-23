@@ -27,6 +27,7 @@ defmodule Vagus.App.Units do
       builtin_native?: &builtin_native?/1,
       native?: &native?/1,
       boot_start: &App.boot_start/2,
+      start: &App.start/1,
       running: &running/0,
       inspect: &running?/1,
       halt: &App.halt/1,
@@ -79,11 +80,16 @@ defmodule Vagus.App.Units do
     end
   end
 
-  @doc "A fresh install is wanted started, so boot starts it; a present one is left as the user set it."
+  @doc """
+  A fresh install is wanted started, so boot starts it; a present one is left
+  as the user set it, except that a container one gets its protected settings
+  back (`install_settings/1`).
+  """
   @spec install_default(String.t()) :: :installed | :present | {:error, term()}
   def install_default(slug) do
     cond do
       slug in App.slugs() ->
+        ensure_settings(slug)
         :present
 
       # Its file would create the apps directory, and a legacy file whose
@@ -103,6 +109,18 @@ defmodule Vagus.App.Units do
   # The native broker is revived by its boot rule alone (`Policy.restart?/2`).
   defp install_settings(config) do
     if Steps.native?(config), do: [], else: [boot: "auto", watchdog: true]
+  end
+
+  # An orchestrator installed before it was protected, or by a store install,
+  # lacks them, and `App.set/2` refuses them to every request.
+  defp ensure_settings(slug) do
+    with {:ok, config} <- builtin_config(slug),
+         [_ | _] = settings <- install_settings(config),
+         {:ok, entry} <- App.info(slug),
+         [_ | _] = stale <- Enum.reject(settings, fn {key, value} -> entry[key] == value end),
+         :error <- App.put_settings(slug, stale) do
+      Logger.warning("Boot: default app #{slug} settings #{inspect(stale)} not written")
+    end
   end
 
   @doc "Whether a default app's builtin config runs natively; one with none is not."
@@ -127,8 +145,7 @@ defmodule Vagus.App.Units do
     "boot" => "auto",
     "init" => false,
     "host_network" => true,
-    "host_dbus" => true,
-    "map" => ["data:rw"]
+    "host_dbus" => true
   }
 
   @doc """
