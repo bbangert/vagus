@@ -105,7 +105,7 @@ Everything else (`/data/vagus/*` paths, `:engine`, `:addon_data_root`,
 | Board | Interfaces |
 | --- | --- |
 | `rpi3_64` | `usb0` (VintageNetDirect, USB gadget), `eth0`, `wlan0` |
-| `dragon_q6a` | `eth0` (RTL8125 2.5 GbE), `wlan0` (onboard AIC8800D80) — **no `usb0`**, the board has no USB gadget controller |
+| `dragon_q6a` | `eth0` (RTL8125 2.5 GbE), `wlan0` (onboard AIC8800D80) — **no `usb0`**: the USB-C port is power-only; the OTG-capable controller (`usb_1`, the blue USB-A 3.x port, also the EDL port) is wired `dr_mode = "host"`, and a gadget there would cost the only SuperSpeed host port |
 | `rubik_pi3` | `eth0` (USB3-attached ASIX AX88179B, `ax88179_178a`, behind a UPD720201 USB3 controller), `wlan0` (AMPAK AP6256/BCM43456-class SDIO, `brcmfmac`) — **no `usb0`**, the board has no USB gadget controller |
 
 ### Why `generic-aarch64` for the Q6A and the Rubik Pi 3
@@ -185,6 +185,20 @@ A dragon_q6a firmware that hosts Claude Code agent containers instead of Home
 Assistant Core. The rest of the stack (apps, MQTT broker, podman) is
 unchanged. It is selected at build time by `VAGUS_FLAVOR=agent-dev-board`; an
 unknown value fails the build.
+
+Root by design: on this flavor the Claude agent (the orchestrator container
+and, through it, its workers) has full root access to the board, through
+Erlang distribution and podman. That is intentional and desired: a hardware
+task may need kernel modules loaded, devices handed over, network interfaces
+reconfigured or packages built, and the board exists for that work. The
+guard rails are about keeping the board reachable and recoverable (the A/B
+slot, heart, the playbook's never-do list), not about limiting privilege. A
+board on this flavor is a development appliance, never a shared or exposed
+one, and it is expendable: the agent cannot build or flash firmware, so the
+firmware slots are never at risk, and anything it does break on the running
+system is recovered by a reboot, a revert to the other A/B slot, or a fresh
+OTA from the operator's machine, not by design constraints that would get in
+the way of the work. The stock flavor is unaffected.
 
 Disabled: the Core stage is skipped at boot even if a Core version is
 installed, there is no Core watchdog and no Core provisioning. `/data` still
