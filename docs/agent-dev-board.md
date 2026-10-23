@@ -39,8 +39,10 @@ picked at build time and runs no Core.
 orchestrator creates them through `Vagus.Runtime.Podman.Cmd` over dist. They
 are outside the app lifecycle, and none is ever named `addon_*`.
 
-**D6, Bluetooth on demand.** Vagus's Bluetooth stack can be stopped and
-started over dist, so a worker can take the adapter. It runs by default.
+**D6, Bluetooth on demand (planned).** Vagus's Bluetooth stack will be
+stoppable and startable over dist (`Vagus.Bluetooth.stop/0` and `start/0`,
+a later phase), so a worker can take the adapter; it runs by default. Until
+then the playbook marks those calls "when available", like D8's loader.
 
 **D7, root by design.** The agent (the orchestrator and, through it, its
 workers) is root on the board, and that is intended. Tasks load kernel
