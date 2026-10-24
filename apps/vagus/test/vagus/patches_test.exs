@@ -455,6 +455,28 @@ defmodule Vagus.PatchesTest do
       eventually(fn -> match?({:done, _}, Patches.boot_status(s)) end)
     end
 
+    test "a later patch is refused over old code an earlier one left", %{root: root, n: n} do
+      proto = mod(n, "Proto")
+      impl = Module.concat(proto, Integer)
+      wait = "send(#{pid_literal()}, {:entered, self()}) && receive(do: (:stop -> :ok))"
+
+      impl_src = fn v ->
+        "defimpl #{inspect(proto)}, for: Integer do\n  def a(_), do: #{v} && #{wait}\nend\n"
+      end
+
+      # The release's version, which a process is running.
+      Code.compile_string("defprotocol #{inspect(proto)} do\n  def a(x)\nend\n" <> impl_src.(0))
+      {holder, _ref} = spawn_monitor(fn -> proto.a(1) end)
+      assert_receive {:entered, ^holder}
+
+      patch(root, "a", [{"b.ex", impl_src.(1)}], enabled: true)
+      patch(root, "b", [{"b.ex", impl_src.(2)}], enabled: true)
+
+      assert %{"a" => :ok, "b" => {:error, {:in_use, [^impl]}}} = booted(start(root))
+      assert Process.alive?(holder)
+      send(holder, :stop)
+    end
+
     test "a compile past its bound times out alone", %{root: root, n: n} do
       s = start(root, compile_timeout_ms: 50)
       ok = mod(n, "Ok")

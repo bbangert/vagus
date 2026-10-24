@@ -358,23 +358,22 @@ defmodule Vagus.Patches do
 
   # Writes the inventory itself, which it alone mutates while it runs, so a
   # server that restarts before adopting the result still finds it.
+  # Checkpointed per patch, partial failures included, so the next one's
+  # old-code check covers what this one emitted.
   defp run_boot(names, cfg) do
     outcomes =
-      Map.new(names, fn name ->
-        guarded = guarded_modules(:persistent_term.get(inventory(cfg.root), %{}), %{})
-        {name, load_files(name, cfg.root, guarded, cfg.compile_timeout_ms)}
+      Enum.map(names, fn name ->
+        patches = :persistent_term.get(inventory(cfg.root), %{})
+        guarded = guarded_modules(patches, %{})
+        {result, modules} = load_files(name, cfg.root, guarded, cfg.compile_timeout_ms)
+        patches = remember_in(patches, name, modules, with_ok(result))
+        :persistent_term.put(inventory(cfg.root), patches)
+        {name, {result, modules}}
       end)
 
     results = Map.new(outcomes, fn {name, {result, _}} -> {name, with_ok(result)} end)
     write_boot(cfg.root, names, results, false)
     loaded = Map.new(outcomes, fn {name, {_, modules}} -> {name, modules} end)
-
-    patches =
-      Enum.reduce(outcomes, :persistent_term.get(inventory(cfg.root), %{}), fn
-        {name, {result, modules}}, patches -> remember_in(patches, name, modules, with_ok(result))
-      end)
-
-    :persistent_term.put(inventory(cfg.root), patches)
     at = System.monotonic_time(:millisecond)
     :persistent_term.put(marker(cfg.root), {:done, results, loaded, at})
   end
