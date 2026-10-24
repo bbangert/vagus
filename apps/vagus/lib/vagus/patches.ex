@@ -10,11 +10,19 @@ defmodule Vagus.Patches do
 
   A patch that kills the VM would kill it on every boot, and heart would
   reboot into it forever, so `<root>/.boot` records each boot that loaded
-  patches and a breaker skips them all once when the last such boot was
-  never marked good. Good means the orchestrator's plan completed and the
-  node stayed up `:good_after_ms` after the load, or this server stopped
-  cleanly. Nerves' firmware validation cannot serve: every slot is flashed
+  patches and a breaker skips them all once, recording why in
+  `<root>/.skipped`, when the last such boot was never marked good. Good
+  means the orchestrator's plan completed and `:good_after_ms` passed since
+  the load; nothing else counts, since a supervisor giving up on crashing
+  children also stops this server cleanly. A clean reboot inside that
+  window trips the breaker once on the next boot: a false alarm, the safe
+  one. Nerves' firmware validation cannot serve: every slot is flashed
   already validated.
+
+  Code a load replaces stays loaded as old code until no process runs it,
+  since purging it would kill those processes; such modules show `in_use`
+  in `list/1`, and a load or unload that would replace them again is
+  refused, because loading over old code purges it.
   """
 
   use GenServer
@@ -23,19 +31,32 @@ defmodule Vagus.Patches do
 
   @default_root "/data/vagus/patches"
   @name_pattern ~r/\A[A-Za-z0-9_-]+\z/
+  # How late past `good_after_ms` a boot gets marked; a poll is one local call.
   @poll_ms 5_000
-  # Compiling several patches on a small board takes seconds.
-  @call_timeout_ms 60_000
+  # A crash-looping patch takes the node down within a minute; a longer wait
+  # only makes a legitimate reboot soon after the load trip the breaker.
+  @good_after_ms 60_000
+  # Compiling one patch on a small board takes seconds; this bounds a hang.
+  @compile_timeout_ms 60_000
+  @call_timeout_ms @compile_timeout_ms + 5_000
+  # A process leaves old code at its next call into the module, so seconds
+  # in practice; two minutes before giving up on it.
+  @purge_ms 5_000
+  @purge_tries 24
   @boot_file ".boot"
   @skipped_file ".skipped"
 
   @type result :: :ok | {:error, term()}
+  @type boot_status ::
+          :not_started | :running | {:done, %{String.t() => result()}} | {:skipped, String.t()}
   @type patch :: %{
           name: String.t(),
           enabled?: boolean(),
           modules: [module()],
           loaded?: boolean(),
-          last_result: result() | nil
+          last_result: result() | nil,
+          in_use: [module()],
+          purged?: boolean()
         }
 
   @spec start_link(keyword()) :: GenServer.on_start() | :ignore
@@ -52,8 +73,8 @@ defmodule Vagus.Patches do
 
   @doc """
   Compiles and loads every `*.ex` of the patch, in name order, stopping at
-  the first file that fails; modules from the files before it stay loaded,
-  since compiling loads them.
+  the first file that fails; modules loaded before the failure stay loaded
+  and are recorded, since compiling loads them.
   """
   @spec load(String.t(), keyword()) :: {:ok, [module()]} | {:error, term()}
   def load(name, opts \\ []), do: call(opts, {:load, name})
@@ -72,14 +93,21 @@ defmodule Vagus.Patches do
   def disable(name, opts \\ []), do: call(opts, {:disable, name})
 
   @doc """
-  Loads every enabled patch, each on its own so one failure never stops the
-  rest, unless the breaker trips. Once per server: a repeat answers the
-  first result, since a second pass would find its own unmarked `.boot` and
-  trip the breaker.
+  Starts loading every enabled patch, each on its own so one failure never
+  stops the rest, unless the breaker trips (`{:ok, :skipped}`). Once per VM
+  boot, even across a restart of this server: a second pass would find its
+  own unmarked `.boot` and trip the breaker. `boot_status/1` follows it.
   """
-  @spec boot_load(keyword()) ::
-          {:ok, %{String.t() => result()}} | {:ok, :skipped} | {:error, term()}
+  @spec boot_load(keyword()) :: {:ok, :started | :skipped} | {:error, term()}
   def boot_load(opts \\ []), do: call(opts, :boot_load)
+
+  @spec boot_status(keyword()) :: boot_status() | {:error, term()}
+  def boot_status(opts \\ []), do: call(opts, :boot_status)
+
+  @doc "The breaker's records, and whether the boot load is still running."
+  @spec status(keyword()) ::
+          %{boot: map() | nil, skipped: map() | nil, running?: boolean()} | {:error, term()}
+  def status(opts \\ []), do: call(opts, :status)
 
   @spec mark_good(keyword()) :: :ok | {:error, term()}
   def mark_good(opts \\ []), do: call(opts, :mark_good)
@@ -101,27 +129,38 @@ defmodule Vagus.Patches do
 
   @impl GenServer
   def init(opts) do
-    # So a supervisor's shutdown reaches terminate/2, which marks the boot good.
+    # So a supervisor's shutdown reaches terminate/2, and a compile's crash
+    # is its result rather than this server's.
     Process.flag(:trap_exit, true)
 
-    {:ok,
-     %{
-       root: opts |> Keyword.get(:root, @default_root) |> Path.expand(),
-       good_after_ms: Keyword.get(opts, :good_after_ms, 60_000),
-       poll_ms: Keyword.get(opts, :poll_ms, @poll_ms),
-       boot_complete?: Keyword.get(opts, :boot_complete?),
-       patches: %{},
-       boot_reply: nil,
-       pending_since: nil
-     }}
+    state = %{
+      root: opts |> Keyword.get(:root, @default_root) |> Path.expand(),
+      good_after_ms: Keyword.get(opts, :good_after_ms, @good_after_ms),
+      poll_ms: Keyword.get(opts, :poll_ms, @poll_ms),
+      purge_ms: Keyword.get(opts, :purge_ms, @purge_ms),
+      purge_tries: Keyword.get(opts, :purge_tries, @purge_tries),
+      compile_timeout_ms: Keyword.get(opts, :compile_timeout_ms, @compile_timeout_ms),
+      boot_complete?: Keyword.get(opts, :boot_complete?),
+      patches: %{},
+      in_use: %{},
+      purge_timer?: false,
+      boot: :not_started,
+      boot_task: nil,
+      pending_since: nil,
+      good_ready: false
+    }
+
+    {:ok, resume(state)}
   end
 
   @impl GenServer
   def handle_call(:list, _from, state), do: {:reply, list_patches(state), state}
 
   def handle_call({:load, name}, _from, state) do
-    {reply, state} = load_patch(name, state)
-    {:reply, reply, state}
+    known = known_modules(state, name)
+    {result, modules} = load_files(name, state.root, known, state.compile_timeout_ms)
+    state = state |> remember(name, modules, with_ok(result)) |> release(modules)
+    {:reply, result, state}
   end
 
   def handle_call({:unload, name}, _from, state) do
@@ -135,72 +174,223 @@ defmodule Vagus.Patches do
   def handle_call({:disable, name}, _from, state),
     do: {:reply, with_patch(name, state, &rm_marker/1), state}
 
-  def handle_call(:boot_load, _from, %{boot_reply: nil} = state) do
-    {reply, state} = run_boot_load(state)
-    {:reply, reply, %{state | boot_reply: reply}}
+  def handle_call(:boot_load, _from, %{boot: :not_started} = state) do
+    state = start_boot(state)
+    {:reply, boot_reply(state.boot), state}
   end
 
-  def handle_call(:boot_load, _from, state), do: {:reply, state.boot_reply, state}
+  def handle_call(:boot_load, _from, state), do: {:reply, boot_reply(state.boot), state}
 
-  def handle_call(:mark_good, _from, state),
-    do: {:reply, write_good(state.root), %{state | pending_since: nil}}
+  def handle_call(:boot_status, _from, state), do: {:reply, state.boot, state}
+
+  def handle_call(:status, _from, state) do
+    status = %{
+      boot: ok_or_nil(read_json(state.root, @boot_file)),
+      skipped: ok_or_nil(read_json(state.root, @skipped_file)),
+      running?: state.boot == :running
+    }
+
+    {:reply, status, state}
+  end
+
+  def handle_call(:mark_good, _from, state) do
+    case write_good(state.root) do
+      :ok -> {:reply, :ok, %{state | pending_since: nil, good_ready: true}}
+      error -> {:reply, error, state}
+    end
+  end
 
   @impl GenServer
   def handle_info(:check_good, %{pending_since: nil} = state), do: {:noreply, state}
 
   def handle_info(:check_good, state) do
-    elapsed = System.monotonic_time(:millisecond) - state.pending_since
+    state = latch_good(state)
+    state = if state.good_ready, do: try_write_good(state), else: state
+    if state.pending_since, do: Process.send_after(self(), :check_good, state.poll_ms)
+    {:noreply, state}
+  end
 
-    if elapsed >= state.good_after_ms and boot_complete?(state) do
-      write_good(state.root)
-      Logger.info("Patches: boot marked good")
-      {:noreply, %{state | pending_since: nil}}
-    else
-      Process.send_after(self(), :check_good, state.poll_ms)
-      {:noreply, state}
+  def handle_info(:retry_purge, state) do
+    in_use = Enum.reduce(state.in_use, %{}, &retry_purge/2)
+    {:noreply, schedule_purge(%{state | in_use: in_use, purge_timer?: false})}
+  end
+
+  def handle_info({:DOWN, ref, :process, _pid, reason}, %{boot_task: {ref, names}} = state) do
+    case :persistent_term.get(marker(state.root), nil) do
+      {:done, results, loaded, at} ->
+        {:noreply, adopt(state, results, loaded, at)}
+
+      _running ->
+        Logger.error("Patches: boot load died (#{inspect(reason)})")
+        results = Map.new(names, &{&1, {:error, {:boot_task, reason}}})
+        at = System.monotonic_time(:millisecond)
+        :persistent_term.put(marker(state.root), {:done, results, %{}, at})
+        {:noreply, adopt(state, results, %{}, at)}
     end
   end
 
   def handle_info(_msg, state), do: {:noreply, state}
 
-  # A clean stop means the patches did not take the VM down.
+  # Only a latched boot: any stop before it, `:shutdown` included, may be a
+  # supervisor giving up on what the patches broke.
   @impl GenServer
-  def terminate(reason, %{pending_since: since} = state) when since != nil do
-    if reason in [:normal, :shutdown] or match?({:shutdown, _}, reason),
-      do: write_good(state.root)
-  end
+  def terminate(_reason, %{good_ready: true, pending_since: since} = state) when since != nil,
+    do: try_write_good(state)
 
   def terminate(_reason, _state), do: :ok
 
-  # Resolved per call rather than captured in init/1: the orchestrator
-  # starts after this server.
-  defp boot_complete?(%{boot_complete?: nil}), do: Vagus.App.Orchestrator.complete?()
+  # Keyed by root, and in `:persistent_term` because it must outlive this
+  # server within one VM boot: a restarted server that ran `boot_load`
+  # again would trip the breaker on the `.boot` its predecessor armed.
+  defp marker(root), do: {__MODULE__, :boot_done, root}
 
-  defp boot_complete?(%{boot_complete?: fun}), do: fun.() == true
+  defp resume(state) do
+    case :persistent_term.get(marker(state.root), nil) do
+      nil ->
+        state
 
-  defp run_boot_load(state) do
-    case previous_boot(state.root) do
-      {:not_good, previous} -> {trip(state.root, previous), state}
-      _good_or_none -> load_enabled(state)
+      {:skipped, reason} ->
+        %{state | boot: {:skipped, reason}}
+
+      {:running, pid, names} ->
+        %{state | boot: :running, boot_task: {Process.monitor(pid), names}}
+
+      {:done, results, loaded, at} ->
+        adopt(state, results, loaded, at)
     end
   end
 
-  # Paths under the configured root; patch names are checked by valid_name/1.
-  # sobelow_skip ["Traversal.FileModule"]
-  defp previous_boot(root) do
-    case File.read(Path.join(root, @boot_file)) do
-      {:error, :enoent} ->
-        :none
+  defp boot_reply({:skipped, _reason}), do: {:ok, :skipped}
+  defp boot_reply(_boot), do: {:ok, :started}
 
-      {:ok, body} ->
-        case Jason.decode(body) do
-          {:ok, %{"good" => true}} -> :good
-          {:ok, %{} = previous} -> {:not_good, previous}
-          _ -> {:not_good, %{"unreadable" => "not JSON"}}
-        end
+  defp start_boot(state) do
+    names = state |> list_patches() |> Enum.filter(& &1.enabled?) |> Enum.map(& &1.name)
+
+    case {names, previous_boot(state.root)} do
+      # Nothing enabled is nothing to protect.
+      {[], _previous} ->
+        write_boot(state.root, [], %{}, true)
+        finish_boot(state, {:done, %{}})
+
+      {_names, {:not_good, previous}} ->
+        finish_boot(state, trip(state.root, previous))
+
+      {names, _good_or_none} ->
+        arm_and_load(state, names)
+    end
+  end
+
+  defp finish_boot(state, {:skipped, _} = boot) do
+    :persistent_term.put(marker(state.root), boot)
+    %{state | boot: boot}
+  end
+
+  defp finish_boot(state, {:done, results}) do
+    at = System.monotonic_time(:millisecond)
+    :persistent_term.put(marker(state.root), {:done, results, %{}, at})
+    %{state | boot: {:done, results}}
+  end
+
+  # Fails closed: a `.boot` that does not say this boot is loading would let
+  # a VM-killing patch load on every boot.
+  defp arm_and_load(state, names) do
+    case write_boot(state.root, names, %{}, false) do
+      :ok ->
+        start_task(state, names)
 
       {:error, reason} ->
-        {:not_good, %{"unreadable" => inspect(reason)}}
+        Logger.error("Patches: none loaded; the boot record could not be armed")
+        finish_boot(state, {:done, Map.new(names, &{&1, {:error, {:arm, reason}}})})
+    end
+  end
+
+  # Unlinked so this server's crash does not take a half-done load with it;
+  # a restarted server finds the task through the marker. It waits for `:go`
+  # so its `:done` marker can never be overwritten by the `:running` one.
+  defp start_task(state, names) do
+    cfg = Map.take(state, [:root, :compile_timeout_ms])
+
+    {:ok, pid} =
+      Task.start(fn ->
+        receive do
+          :go -> run_boot(names, cfg)
+        end
+      end)
+
+    ref = Process.monitor(pid)
+    :persistent_term.put(marker(state.root), {:running, pid, names})
+    send(pid, :go)
+    %{state | boot: :running, boot_task: {ref, names}}
+  end
+
+  defp run_boot(names, cfg) do
+    Process.flag(:trap_exit, true)
+
+    outcomes =
+      Map.new(names, fn name ->
+        {name, load_files(name, cfg.root, [], cfg.compile_timeout_ms)}
+      end)
+
+    results = Map.new(outcomes, fn {name, {result, _}} -> {name, with_ok(result)} end)
+    write_boot(cfg.root, names, results, false)
+    loaded = Map.new(outcomes, fn {name, {_, modules}} -> {name, modules} end)
+    at = System.monotonic_time(:millisecond)
+    :persistent_term.put(marker(cfg.root), {:done, results, loaded, at})
+  end
+
+  # `at` is monotonic and from the marker, so a restarted server keeps the
+  # original delay; `.boot`'s wall-clock `loaded_at` may predate NTP.
+  defp adopt(state, results, loaded, at) do
+    state =
+      Enum.reduce(loaded, state, fn {name, modules}, state ->
+        state |> remember(name, modules, results[name]) |> release(modules)
+      end)
+
+    state = %{state | boot: {:done, results}, boot_task: nil}
+
+    case read_json(state.root, @boot_file) do
+      {:ok, %{"good" => false, "patches" => [_ | _]}} ->
+        Process.send_after(self(), :check_good, state.poll_ms)
+        %{state | pending_since: at}
+
+      _good_or_unreadable ->
+        state
+    end
+  end
+
+  defp latch_good(%{good_ready: true} = state), do: state
+
+  defp latch_good(state) do
+    elapsed = System.monotonic_time(:millisecond) - state.pending_since
+    %{state | good_ready: elapsed >= state.good_after_ms and boot_complete?(state)}
+  end
+
+  defp try_write_good(state) do
+    case write_good(state.root) do
+      :ok ->
+        Logger.info("Patches: boot marked good")
+        %{state | pending_since: nil}
+
+      {:error, reason} ->
+        Logger.error("Patches: could not mark the boot good (#{inspect(reason)}); retrying")
+        state
+    end
+  end
+
+  # Resolved per call rather than captured in init/1: the orchestrator
+  # starts after this server, and restarts on its own.
+  defp boot_complete?(%{boot_complete?: fun}) do
+    if fun, do: fun.() == true, else: Vagus.App.Orchestrator.complete?()
+  catch
+    :exit, _reason -> false
+  end
+
+  defp previous_boot(root) do
+    case read_json(root, @boot_file) do
+      {:error, :enoent} -> :none
+      {:ok, %{"good" => true}} -> :good
+      {:ok, previous} -> {:not_good, previous}
+      {:error, reason} -> {:not_good, %{"unreadable" => inspect(reason)}}
     end
   end
 
@@ -210,55 +400,63 @@ defmodule Vagus.Patches do
         "#{inspect(previous["patches"])} was never marked good (#{Path.join(root, @skipped_file)})"
     )
 
-    write_json(root, @skipped_file, %{
-      "at" => now(),
-      "reason" => "previous boot not marked good",
-      "previous" => previous
-    })
-
+    reason = "previous boot not marked good"
+    write_json(root, @skipped_file, %{"at" => now(), "reason" => reason, "previous" => previous})
     # Good at once: the skip is the recovery, so the next boot loads the
     # enabled patches again.
     write_boot(root, [], %{}, true)
-    {:ok, :skipped}
-  end
-
-  defp load_enabled(state) do
-    case state |> list_patches() |> Enum.filter(& &1.enabled?) |> Enum.map(& &1.name) do
-      [] ->
-        write_boot(state.root, [], %{}, true)
-        {{:ok, %{}}, state}
-
-      names ->
-        # Before the first load, so a VM that dies mid-load trips the breaker.
-        write_boot(state.root, names, %{}, false)
-
-        {results, state} =
-          Enum.reduce(names, {%{}, state}, fn name, {acc, state} ->
-            {result, state} = load_patch(name, state)
-            {Map.put(acc, name, with_ok(result)), state}
-          end)
-
-        write_boot(state.root, names, results, false)
-        Process.send_after(self(), :check_good, state.poll_ms)
-        {{:ok, results}, %{state | pending_since: System.monotonic_time(:millisecond)}}
-    end
+    {:skipped, reason}
   end
 
   defp with_ok({:ok, _modules}), do: :ok
   defp with_ok(error), do: error
 
-  defp load_patch(name, state) do
+  defp load_files(name, root, known, timeout) do
     {result, modules} =
-      try do
-        compile_patch(name, state.root)
-      rescue
-        exception -> {{:error, {:raise, Exception.message(exception)}}, []}
-      catch
-        kind, reason -> {{:error, {kind, reason}}, []}
+      with :ok <- valid_name(name),
+           dir = Path.join(root, name),
+           :ok <- exists(dir, :not_found),
+           :ok <- exists(Path.join(dir, "NOTES.md"), :no_notes),
+           [_ | _] = sources <- sources(dir),
+           :ok <- old_code_free(known ++ parse_modules(dir)) do
+        compile_bounded(sources, timeout)
+      else
+        [] -> {{:error, :no_sources}, []}
+        error -> {error, []}
       end
 
     log_load(name, result, modules)
-    {result, remember(state, name, modules, with_ok(result))}
+    {result, modules}
+  end
+
+  # Loading over old code purges it, killing whatever still runs it.
+  defp old_code_free(modules) do
+    case modules |> Enum.uniq() |> Enum.reject(&:code.soft_purge/1) do
+      [] -> :ok
+      in_use -> {:error, {:in_use, in_use}}
+    end
+  end
+
+  defp compile_bounded(sources, timeout) do
+    task = Task.async(fn -> compile_files(sources) end)
+
+    case Task.yield(task, timeout) || Task.shutdown(task, :brutal_kill) do
+      {:ok, outcome} -> outcome
+      {:exit, reason} -> {{:error, {:exit, reason}}, Enum.flat_map(sources, &loaded_from/1)}
+      nil -> {{:error, :timeout}, Enum.flat_map(sources, &loaded_from/1)}
+    end
+  end
+
+  defp compile_files(sources) do
+    Enum.reduce_while(sources, {{:ok, []}, []}, fn file, {_result, loaded} ->
+      case compile_file(file) do
+        {:ok, modules} ->
+          {:cont, {{:ok, loaded ++ modules}, loaded ++ modules}}
+
+        error ->
+          {:halt, {error, Enum.uniq(loaded ++ loaded_from(file))}}
+      end
+    end)
   end
 
   defp log_load(name, {:ok, modules}, _loaded),
@@ -281,27 +479,10 @@ defmodule Vagus.Patches do
     put_in(state, [:patches, name], entry)
   end
 
-  defp compile_patch(name, root) do
-    with :ok <- valid_name(name),
-         dir = Path.join(root, name),
-         :ok <- exists(dir, :not_found),
-         :ok <- exists(Path.join(dir, "NOTES.md"), :no_notes),
-         [_ | _] = sources <- sources(dir) do
-      Enum.reduce_while(sources, {{:ok, []}, []}, fn file, {{:ok, _}, loaded} ->
-        case compile_file(file) do
-          {:ok, modules} -> {:cont, {{:ok, loaded ++ modules}, loaded ++ modules}}
-          error -> {:halt, {error, loaded}}
-        end
-      end)
-    else
-      [] -> {{:error, :no_sources}, []}
-      error -> {error, []}
-    end
-  end
-
-  # Compiling loads the modules; the explicit load records the patch's file
-  # as their origin and drops whatever older version lingered. Diagnostics are
-  # captured so a failure carries its reason instead of printing to stderr.
+  # The patch's source runs at compile time, so whatever it raises, throws
+  # or exits is that file's result. Compiling loads the modules; the code
+  # they replace becomes old, left to release/2. Diagnostics are captured so
+  # a failure carries its reason instead of printing to stderr.
   # Compiling a patch's sources is the point; its name passed valid_name/1.
   # sobelow_skip ["RCE.CodeModule"]
   defp compile_file(file) do
@@ -309,21 +490,14 @@ defmodule Vagus.Patches do
       Code.with_diagnostics(fn ->
         try do
           {:ok, Code.compile_file(file)}
-        rescue
-          exception -> {:error, Exception.message(exception)}
+        catch
+          kind, reason -> {:error, Exception.format_banner(kind, reason)}
         end
       end)
 
     case compiled do
       {:ok, pairs} ->
-        Enum.reduce_while(pairs, {:ok, []}, fn {mod, bin}, {:ok, mods} ->
-          :code.purge(mod)
-
-          case :code.load_binary(mod, String.to_charlist(file), bin) do
-            {:module, ^mod} -> {:cont, {:ok, mods ++ [mod]}}
-            {:error, reason} -> {:halt, {:error, {:load, mod, reason}}}
-          end
-        end)
+        {:ok, Enum.map(pairs, &elem(&1, 0))}
 
       {:error, message} ->
         errors = for %{severity: :error, message: m} <- diagnostics, do: m
@@ -333,37 +507,102 @@ defmodule Vagus.Patches do
 
   defp unload_patch(name, state) do
     with :ok <- valid_name(name),
-         modules when modules != [] <- known_modules(state, name) do
-      Enum.each(modules, &restore/1)
+         [_ | _] = modules <- known_modules(state, name),
+         :ok <- old_code_free(modules),
+         {:ok, restored} <- restore_all(modules) do
       Logger.warning("Patches: #{name} unloaded, restoring #{inspect(modules)}")
       entry = %{modules: modules, loaded?: false, last_result: last_result(state, name)}
-      {{:ok, modules}, put_in(state, [:patches, name], entry)}
+      {{:ok, restored}, state |> put_in([:patches, name], entry) |> release(restored)}
     else
       [] -> {{:error, :not_found}, state}
+      {:error, {:restore, _mod, _reason}, _restored} = error -> restore_failed(error, state)
       error -> {error, state}
     end
   end
 
+  defp restore_failed({:error, reason, restored}, state) do
+    Logger.error("Patches: restore failed (#{inspect(reason)}); restored #{inspect(restored)}")
+    {{:error, reason}, release(state, restored)}
+  end
+
+  defp restore_all(modules) do
+    Enum.reduce_while(modules, {:ok, []}, fn mod, {:ok, done} ->
+      case restore(mod) do
+        :ok -> {:cont, {:ok, done ++ [mod]}}
+        {:error, reason} -> {:halt, {:error, {:restore, mod, reason}, done}}
+      end
+    end)
+  end
+
   # The release's `.beam` is found on the code path whatever is loaded now.
   defp restore(mod) do
-    :code.purge(mod)
-
     case :code.get_object_code(mod) do
-      {^mod, bin, file} -> :code.load_binary(mod, file, bin)
-      :error -> :code.delete(mod)
+      {^mod, bin, file} ->
+        case :code.load_binary(mod, file, bin) do
+          {:module, ^mod} -> :ok
+          {:error, reason} -> {:error, reason}
+        end
+
+      :error ->
+        :code.delete(mod)
+        :ok
     end
   end
+
+  defp release(state, modules) do
+    in_use =
+      modules
+      |> Enum.uniq()
+      |> Enum.reduce(state.in_use, fn mod, in_use ->
+        if :code.soft_purge(mod),
+          do: Map.delete(in_use, mod),
+          else: Map.put(in_use, mod, state.purge_tries)
+      end)
+
+    schedule_purge(%{state | in_use: in_use})
+  end
+
+  defp retry_purge({mod, 0}, acc), do: Map.put(acc, mod, 0)
+
+  defp retry_purge({mod, tries}, acc) do
+    cond do
+      :code.soft_purge(mod) ->
+        acc
+
+      tries == 1 ->
+        Logger.error("Patches: old code of #{inspect(mod)} still running; left loaded")
+        Map.put(acc, mod, 0)
+
+      true ->
+        Map.put(acc, mod, tries - 1)
+    end
+  end
+
+  defp schedule_purge(%{purge_timer?: false} = state) do
+    if Enum.any?(state.in_use, fn {_mod, tries} -> tries > 0 end) do
+      Process.send_after(self(), :retry_purge, state.purge_ms)
+      %{state | purge_timer?: true}
+    else
+      state
+    end
+  end
+
+  defp schedule_purge(state), do: state
 
   defp list_patches(state) do
     for name <- patch_names(state.root) do
       dir = Path.join(state.root, name)
+      modules = known_modules(state, name)
+      in_use = Enum.filter(modules, &Map.has_key?(state.in_use, &1))
 
       %{
         name: name,
         enabled?: File.exists?(enabled_path(dir)),
-        modules: known_modules(state, name),
+        modules: modules,
         loaded?: loaded?(state, name),
-        last_result: last_result(state, name)
+        last_result: last_result(state, name),
+        in_use: in_use,
+        purged?: in_use == []
       }
     end
   end
@@ -390,18 +629,53 @@ defmodule Vagus.Patches do
   defp loaded?(state, name), do: get_in(state.patches, [name, :loaded?]) || false
   defp last_result(state, name), do: get_in(state.patches, [name, :last_result])
 
+  defp parse_modules(dir), do: dir |> sources() |> Enum.flat_map(&parse_file/1) |> Enum.uniq()
+
+  # A file that failed part way may have loaded the modules before it.
+  defp loaded_from(file), do: file |> parse_file() |> Enum.filter(&:code.is_loaded/1)
+
   # Best effort, before any load has said which modules a patch defines.
   # The names are interned: the sources are root's, and compiling them
-  # would intern them anyway.
-  # Paths under the configured root; patch names are checked by valid_name/1.
+  # would intern them anyway. A file that does not parse defined nothing.
+  # Patch names are checked by valid_name/1 before any file is listed.
   # sobelow_skip ["Traversal.FileModule"]
-  defp parse_modules(dir) do
-    for file <- sources(dir),
-        {:ok, body} = File.read(file),
-        [_, mod] <- Regex.scan(~r/^\s*defmodule\s+([A-Z][A-Za-z0-9_.]*)/m, body),
-        uniq: true,
-        do: Module.concat([mod])
+  defp parse_file(file) do
+    with {:ok, body} <- File.read(file),
+         {:ok, ast} <- Code.string_to_quoted(body) do
+      ast |> defined_modules(nil) |> Enum.uniq()
+    else
+      _unreadable -> []
+    end
   end
+
+  defp defined_modules({:defmodule, _meta, [name, opts]}, parent) when is_list(opts) do
+    case module_name(name, parent) do
+      nil -> defined_modules(opts, parent)
+      mod -> [mod | defined_modules(opts, mod)]
+    end
+  end
+
+  defp defined_modules({form, _meta, args}, parent) when is_list(args),
+    do: defined_modules([form | args], parent)
+
+  defp defined_modules({left, right}, parent), do: defined_modules([left, right], parent)
+
+  defp defined_modules(list, parent) when is_list(list),
+    do: Enum.flat_map(list, &defined_modules(&1, parent))
+
+  defp defined_modules(_ast, _parent), do: []
+
+  # Nesting prefixes the parent, as the compiler does, unless the name is
+  # spelled from `Elixir.`.
+  defp module_name({:__aliases__, _meta, [:"Elixir" | _] = parts}, _parent),
+    do: if(Enum.all?(parts, &is_atom/1), do: Module.concat(parts))
+
+  defp module_name({:__aliases__, _meta, parts}, parent) do
+    if Enum.all?(parts, &is_atom/1), do: Module.concat(List.wrap(parent) ++ parts)
+  end
+
+  defp module_name(name, _parent) when is_atom(name) and name not in [nil, true, false], do: name
+  defp module_name(_name, _parent), do: nil
 
   defp sources(dir), do: dir |> Path.join("*.ex") |> Path.wildcard() |> Enum.sort()
 
@@ -413,7 +687,7 @@ defmodule Vagus.Patches do
     end
   end
 
-  # Paths under the configured root; patch names are checked by valid_name/1.
+  # Patch names are checked by valid_name/1 in with_patch/3.
   # sobelow_skip ["Traversal.FileModule"]
   defp rm_marker(dir) do
     case File.rm(enabled_path(dir)) do
@@ -443,24 +717,45 @@ defmodule Vagus.Patches do
   defp encode_result(:ok), do: "ok"
   defp encode_result(error), do: inspect(error)
 
-  # Paths under the configured root; patch names are checked by valid_name/1.
-  # sobelow_skip ["Traversal.FileModule"]
   defp write_good(root) do
-    path = Path.join(root, @boot_file)
-
-    with {:ok, body} <- File.read(path),
-         {:ok, %{} = boot} <- Jason.decode(body) do
-      write_json(root, @boot_file, Map.put(boot, "good", true))
+    with {:ok, boot} <- read_json(root, @boot_file),
+         :ok <- write_json(root, @boot_file, Map.put(boot, "good", true)) do
+      if boot["patches"] not in [nil, []], do: clear_skipped(root)
+      :ok
     else
       {:error, :enoent} -> {:error, :no_boot}
-      {:error, reason} -> {:error, reason}
-      _ -> {:error, :unreadable}
+      error -> error
+    end
+  end
+
+  # A later patch-loading boot marked good means the skip is history.
+  # Fixed file names under the configured root.
+  # sobelow_skip ["Traversal.FileModule"]
+  defp clear_skipped(root) do
+    case File.rm(Path.join(root, @skipped_file)) do
+      :ok -> :ok
+      {:error, :enoent} -> :ok
+      error -> Logger.error("Patches: could not clear #{@skipped_file}: #{inspect(error)}")
+    end
+  end
+
+  defp ok_or_nil({:ok, data}), do: data
+  defp ok_or_nil(_error), do: nil
+
+  # Fixed file names under the configured root.
+  # sobelow_skip ["Traversal.FileModule"]
+  defp read_json(root, file) do
+    with {:ok, body} <- File.read(Path.join(root, file)) do
+      case Jason.decode(body) do
+        {:ok, %{} = data} -> {:ok, data}
+        _ -> {:error, :unreadable}
+      end
     end
   end
 
   # Renamed into place, so a power cut never leaves a torn record the
   # breaker would read as a bad boot.
-  # Paths under the configured root; patch names are checked by valid_name/1.
+  # Fixed file names under the configured root.
   # sobelow_skip ["Traversal.FileModule"]
   defp write_json(root, file, data) do
     path = Path.join(root, file)
@@ -472,6 +767,7 @@ defmodule Vagus.Patches do
       :ok
     else
       error ->
+        File.rm(tmp)
         Logger.error("Patches: could not write #{path}: #{inspect(error)}")
         error
     end

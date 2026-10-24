@@ -34,18 +34,24 @@ defmodule Vagus.App.Gates do
       else: {:error, :starting}
   end
 
-  @doc """
-  Loads the enabled hot patches (`Vagus.Patches.boot_load/1`); the
-  agent-dev-board flavor's only. A patch that fails is that patch's result,
-  never the boot's, so any answer passes; only a server that does not
-  answer is retried. The call is bounded under `gate_timeout`, and a retry
-  gets the first load's answer. `opts`: `:server`, `:timeout` (tests).
-  """
+  # After `:tree` so `Vagus` is started, and before `stage: :native` so
+  # patched modules are in place before any app runs; in the agent plan only,
+  # since the stock appliance never hot-patches. A failed patch is that
+  # patch's result, never the boot's. Not a required gate: a stuck load is
+  # logged and the boot carries on.
   @spec patches(keyword()) :: :ok | {:error, term()}
   def patches(opts \\ []) do
-    case Vagus.Patches.boot_load(Keyword.put_new(opts, :timeout, 8_000)) do
-      {:error, reason} -> {:error, reason}
-      {:ok, _results} -> :ok
+    # Both calls fit the orchestrator's 10 s gate bound, so its kill never
+    # lands mid-call.
+    opts = Keyword.put_new(opts, :timeout, 4_000)
+
+    with {:ok, _started_or_skipped} <- Vagus.Patches.boot_load(opts) do
+      case Vagus.Patches.boot_status(opts) do
+        {:done, _results} -> :ok
+        {:skipped, _reason} -> :ok
+        {:error, reason} -> {:error, reason}
+        _running -> {:error, :loading}
+      end
     end
   end
 

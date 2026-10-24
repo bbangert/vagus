@@ -108,7 +108,8 @@ defmodule Vagus.App.Orchestrator do
           gate: :api,
           install: :container
         ] ++ @stages
-  # Patches go live right after the tree, before any app or later gate runs.
+  # After :tree so Vagus is up, before :native so patched modules are in place
+  # before any app starts.
   @agent_plan [
                 gate: :tree,
                 gate: :patches,
@@ -173,6 +174,7 @@ defmodule Vagus.App.Orchestrator do
   """
   @spec complete?(GenServer.server()) :: boolean()
   def complete?(server \\ __MODULE__) do
+    # Cheap read for a poller: a stalled orchestrator must not stall Patches.
     GenServer.call(server, :complete?, 1_000)
   catch
     :exit, _reason -> false

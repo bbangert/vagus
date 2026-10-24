@@ -111,15 +111,30 @@ Also: `list/0` returns `[%{name, enabled?, modules, loaded?, last_result}]`,
 release's own `.beam` when there is one, else purges it.
 
 **Boot.** A `:patches` gate right after the tree gate loads every enabled
-patch before apps start and records them in `/data/vagus/patches/.boot`. The
-boot is marked good in `.boot` once the boot plan has completed and the node
-has stayed up a minute after loading the patches, or when Vagus shuts down
-cleanly. If the previous boot was never marked good (the board rebooted or
-heart killed the VM before that), the
-gate skips ALL patches once, logs loudly and writes
-`/data/vagus/patches/.skipped`. That file means a patch is the likely cause.
-Recover with `list/0` to see what was enabled, fix the patch or `disable/1`
-it, then reboot. The next boot loads the patches again.
+patch before apps start and records them in `/data/vagus/patches/.boot`. A
+boot is marked good in `.boot` once the boot plan has completed and a minute
+has passed, or at a clean shutdown after that point. A boot that never gets
+there makes the next boot skip ALL patches once, log loudly and write
+`/data/vagus/patches/.skipped`. The file means the LAST patch-loading boot
+was not marked good; it is removed once a later patch-loading boot is marked
+good.
+
+What trips the breaker: a VM death, a heart or watchdog reset, a power cut,
+or a reboot before the plan completed plus one minute. A clean reboot inside
+that window is a safe false alarm: patches are skipped once, then load
+again. A halted boot (a gate failed fatally) is never marked good, so
+patches are skipped once after it. Recover with `list/0`, fix the patch or
+`disable/1` it, then reboot.
+
+A patch that kills the VM only AFTER that window loops forever. Recover over
+ssh: `Vagus.Patches.disable("<name>")` or remove
+`/data/vagus/patches/<name>/enabled`, then reboot.
+
+A slow or hanging compile at boot does not block the boot: the gate retries
+for 5 minutes, then the boot carries on and the patch finishes loading in the
+background. `Vagus.Patches.status()` shows `running?`. Modules still running
+old code after a load are reported `in_use` and soft-purged later; nothing is
+killed.
 
 **OTA.** Hot-loaded code is lost by an OTA. The patch dir survives, but the
 patch was written against the old commit: compare the commit in `NOTES.md`

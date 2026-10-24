@@ -146,7 +146,10 @@ You may replace whole modules in the running Vagus node. Patches live in
 3. Write `NOTES.md` first: why, modules, the commit, and your session as author.
 4. Write `<Module>.ex` into the patch dir, then `vagus eval 'Vagus.Patches.load("<name>")'` and test.
 5. Only then `Vagus.Patches.enable("<name>")`, and prove it through a reboot (ask Ben).
-6. `list/0`, `disable/1`, `unload/1` undo it. If `/data/vagus/patches/.skipped` exists, the last boot was never marked good (it died or rebooted within a minute of loading patches) and ALL patches were skipped: `list/0`, fix or `disable/1` the culprit, reboot.
+6. `list/0`, `disable/1`, `unload/1` undo it. If `/data/vagus/patches/.skipped` exists, the LAST patch-loading boot was not marked good and ALL patches were skipped once: `list/0`, fix or `disable/1` the culprit, reboot. The file goes away when a later patch-loading boot is marked good. A boot is marked good once the plan completed and a minute passed; a VM death, heart or watchdog reset, power cut, a halted boot, or a reboot inside that window trips it (a clean reboot inside it is a safe false alarm: skipped once, then loaded again).
+   - A patch that kills the VM only AFTER that window loops forever. Over ssh: `Vagus.Patches.disable("<name>")` or remove `/data/vagus/patches/<name>/enabled`, then reboot.
+   - A slow compile at boot does not block it: the gate retries for 5 minutes, then the boot carries on and the patch finishes in the background. `Vagus.Patches.status()` shows `running?`.
+   - `in_use` modules still run old code; it is soft-purged later and nothing is killed.
 7. An OTA drops hot-loaded code. Re-check NOTES.md's commit against the new one, re-fetch, re-diff, re-apply.
 8. Patches are not PRs. If one is worth keeping, tell Ben.
 
