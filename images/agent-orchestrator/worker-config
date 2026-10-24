@@ -46,17 +46,27 @@ trap 'rm -rf "$scratch"' EXIT
 cfg=$scratch/in.json
 if [ -e "$dir/.claude.json" ] || [ -L "$dir/.claude.json" ]; then
   src=$dir/.claude.json
-  [ ! -L "$src" ] || { echo "worker-config: $src is a symlink, refusing" >&2; exit 1; }
-  # O_RDWR never blocks on a FIFO (a plain read open would hang on an unwritten one), and
-  # checking the opened descriptor, not the path, leaves no swap window before the read.
-  exec 3<>"$src"
-  if [ "$(stat -L -c %F /dev/fd/3)" != "regular file" ]; then
-    exec 3<&-
-    echo "worker-config: $src is not a regular file, refusing" >&2
-    exit 1
-  fi
-  cat <&3 > "$cfg"
-  exec 3<&-
+  # Bash cannot open O_NOFOLLOW, so a symlink swapped in after any shell check would be
+  # followed. O_NONBLOCK keeps an unwritten FIFO from hanging the open.
+  rc=0
+  python3 -I -c '
+import os, stat, sys
+try:
+    fd = os.open(sys.argv[1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+except OSError:
+    sys.exit(2)
+if not stat.S_ISREG(os.fstat(fd).st_mode):
+    sys.exit(3)
+data = os.read(fd, (1 << 20) + 1)
+if len(data) > 1 << 20:
+    sys.exit(4)
+sys.stdout.buffer.write(data)
+' "$src" > "$cfg" || rc=$?
+  case $rc in
+    0) ;;
+    4) echo "worker-config: $src is larger than 1 MiB, refusing" >&2; exit 1 ;;
+    *) echo "worker-config: $src is a symlink or not a regular file, refusing" >&2; exit 1 ;;
+  esac
 else
   jq -n '{hasCompletedOnboarding: true, remoteDialogSeen: true,
           projects: {"/work": {hasTrustDialogAccepted: true}}}' > "$cfg"
