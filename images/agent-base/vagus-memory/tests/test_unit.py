@@ -1,6 +1,14 @@
 import pytest
 
-from vagus_memory.store import keyword_sql, rrf, schema_ddl, semantic_sql, vector_literal
+from vagus_memory.store import (
+    candidate_pool,
+    clamp_k,
+    keyword_sql,
+    rrf,
+    schema_ddl,
+    semantic_sql,
+    vector_literal,
+)
 
 
 def test_rrf_rewards_agreement_over_a_single_top_rank() -> None:
@@ -57,3 +65,29 @@ def test_schema_ddl_rejects_bad_dims(bad) -> None:
 
 def test_vector_literal() -> None:
     assert vector_literal([1, 0.5, -2]) == "[1.0,0.5,-2.0]"
+
+
+def test_rrf_with_non_default_k() -> None:
+    assert rrf([[7, 8]], k=10) == [(7, pytest.approx(1 / 11)), (8, pytest.approx(1 / 12))]
+
+
+@pytest.mark.parametrize(("k", "expected"), [(0, 1), (1, 1), (100, 100), (500, 100), (-3, 1)])
+def test_clamp_k(k: int, expected: int) -> None:
+    assert clamp_k(k) == expected
+
+
+def test_candidate_pool_floor_and_ceiling() -> None:
+    assert candidate_pool(1) == 200
+    assert candidate_pool(clamp_k(500)) == 1000
+
+
+def test_semantic_sql_resorts_relaxed_candidates() -> None:
+    assert semantic_sql(False).endswith("SELECT id FROM c ORDER BY d")
+
+
+def test_embed_module_does_not_import_fastembed() -> None:
+    import sys
+
+    import vagus_memory.embed  # noqa: F401
+
+    assert "fastembed" not in sys.modules

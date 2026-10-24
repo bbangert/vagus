@@ -539,13 +539,46 @@ defmodule Vagus.Runtime.Engine.Podman do
 
     case run(:ensure_network, ["network", "exists", "--", name], opts, @query_ms) do
       {:ok, _} ->
-        :ok
+        if spec.internal, do: ensure_internal(spec, opts), else: :ok
 
       {:exit, 1, _} ->
-        unit(:ensure_network, run(:ensure_network, render_network(spec), opts, @lifecycle_ms))
+        create_network(spec, opts)
 
       other ->
         unit(:ensure_network, other)
+    end
+  end
+
+  defp create_network(spec, opts),
+    do: unit(:ensure_network, run(:ensure_network, render_network(spec), opts, @lifecycle_ms))
+
+  # `exists` says nothing of how a network was made, and one made without
+  # `--internal` would masquerade its containers out. It is remade, which
+  # podman refuses while a container is attached: then it is an error,
+  # never a silently routed network.
+  defp ensure_internal(%NetworkSpec{name: name} = spec, opts) do
+    argv = ["network", "inspect", "--format", "{{.Internal}}", "--", name]
+
+    case run(:ensure_network, argv, opts, @query_ms) do
+      {:ok, out} ->
+        if String.trim(out) == "true", do: :ok, else: recreate_internal(spec, opts)
+
+      other ->
+        unit(:ensure_network, other)
+    end
+  end
+
+  defp recreate_internal(%NetworkSpec{name: name} = spec, opts) do
+    case run(:ensure_network, ["network", "rm", "--", name], opts, @lifecycle_ms) do
+      {:ok, _} ->
+        create_network(spec, opts)
+
+      other ->
+        Logger.warning(
+          "Engine.Podman: network #{name} is not internal and cannot be remade: #{inspect(other)}"
+        )
+
+        {:error, {:failed, :ensure_network, :not_internal}}
     end
   end
 

@@ -228,6 +228,7 @@ defmodule Vagus.App.UnitsTest do
                init: false,
                host_network: false,
                backup: "cold",
+               watchdog: "tcp://[HOST]:5432",
                arch: ["aarch64"],
                ports: %{}
              } = config

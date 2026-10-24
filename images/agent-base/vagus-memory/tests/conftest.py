@@ -5,6 +5,7 @@ import os
 import re
 import uuid
 from collections.abc import Iterator, Sequence
+from urllib.parse import quote
 
 import psycopg
 import pytest
@@ -29,12 +30,15 @@ CONCEPTS = {
 class FakeEmbedder:
     model = "fake-concepts"
 
-    def __init__(self, fail: bool = False) -> None:
+    def __init__(self, fail: bool = False, dims: int = DIMS) -> None:
         self.fail = fail
+        self.dims = dims
 
     def _vec(self, text: str) -> list[float]:
         if self.fail:
             raise RuntimeError("embedder down")
+        if self.dims != DIMS:
+            return [1.0] * self.dims
         v = [0.0] * DIMS
         v[DIMS - 1] = 0.1  # never the zero vector, whose cosine distance is NaN
         for w in re.findall(r"[a-z]+", text.lower()):
@@ -52,19 +56,35 @@ class FakeEmbedder:
 
 
 @pytest.fixture
-def dsn() -> Iterator[str]:
+def base_dsn() -> str:
     base = os.environ.get("VAGUS_MEMORY_TEST_DSN")
     if not base:
         pytest.skip("set VAGUS_MEMORY_TEST_DSN to a throwaway pgvector Postgres to run")
-    # A fresh schema per test isolates tables while the vector extension stays shared.
-    schema = f"t_{uuid.uuid4().hex[:12]}"
-    with psycopg.connect(base, autocommit=True) as c:
-        c.execute("CREATE EXTENSION IF NOT EXISTS vector")
-        c.execute(f"CREATE SCHEMA {schema}")
+    return base
+
+
+def with_options(base: str, options: str) -> str:
     sep = "&" if "?" in base else "?"
-    yield f"{base}{sep}options=-csearch_path%3D{schema},public"
-    with psycopg.connect(base, autocommit=True) as c:
-        c.execute(f"DROP SCHEMA {schema} CASCADE")
+    return f"{base}{sep}options={quote(options)}"
+
+
+@pytest.fixture
+def schema(base_dsn: str) -> Iterator[str]:
+    # A fresh schema per test isolates tables while the vector extension stays shared.
+    name = f"t_{uuid.uuid4().hex[:12]}"
+    try:
+        with psycopg.connect(base_dsn, autocommit=True) as c:
+            c.execute("CREATE EXTENSION IF NOT EXISTS vector")
+            c.execute(f"CREATE SCHEMA {name}")
+        yield name
+    finally:
+        with psycopg.connect(base_dsn, autocommit=True) as c:
+            c.execute(f"DROP SCHEMA IF EXISTS {name} CASCADE")
+
+
+@pytest.fixture
+def dsn(base_dsn: str, schema: str) -> str:
+    return with_options(base_dsn, f"-csearch_path={schema},public")
 
 
 @pytest.fixture

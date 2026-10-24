@@ -295,19 +295,27 @@ defmodule Vagus.App.StepsTest do
       assert %{source: "/d/addons/data/agent_memory"} =
                Enum.find(memory.mounts, &(&1.target == "/data"))
 
-      assert Map.take(memory.env, ["POSTGRES_HOST_AUTH_METHOD", "PGDATA", "POSTGRES_DB"]) == %{
-               "POSTGRES_HOST_AUTH_METHOD" => "trust",
-               "PGDATA" => "/data/pgdata",
-               "POSTGRES_DB" => "memory"
-             }
+      assert %{source: "/d/addons/data/agent_memory/pgdata", read_only: false} =
+               Enum.find(memory.mounts, &(&1.target == "/var/lib/postgresql/data"))
 
-      assert memory.env["SUPERVISOR_TOKEN"] == "t"
+      assert Map.take(memory.env, ["POSTGRES_HOST_AUTH_METHOD", "POSTGRES_DB", "POSTGRES_USER"]) ==
+               %{
+                 "POSTGRES_HOST_AUTH_METHOD" => "trust",
+                 "POSTGRES_DB" => "memory",
+                 "POSTGRES_USER" => "agent"
+               }
+
+      refute Map.has_key?(memory.env, "PGDATA")
+      refute Map.has_key?(memory.env, "SUPERVISOR_TOKEN")
+      refute Map.has_key?(memory.env, "HASSIO_TOKEN")
 
       for slug <- ["core_mosquitto", "agent_orchestrator"] do
         other = spec.(slug)
         assert %{network_name: "hassio", ip: nil, dns: ["172.30.32.3"]} = other
         assert other.extra_hosts["supervisor"] == "172.30.32.2"
-        refute Map.has_key?(other.env, "PGDATA")
+        assert other.env["SUPERVISOR_TOKEN"] == "t"
+        refute Map.has_key?(other.env, "POSTGRES_HOST_AUTH_METHOD")
+        refute Enum.any?(other.mounts, &(&1.target == "/var/lib/postgresql/data"))
       end
 
       Application.put_env(:vagus, :memory_app, nil)
@@ -664,7 +672,8 @@ defmodule Vagus.App.StepsTest do
                Steps.run(:start, input(ctx, %{engine_opts: engine_opts}))
     end
 
-    test "the memory app's start ensures agentnet, not hassio", ctx do
+    test "the memory app's start ensures agentnet and its rule, makes pgdata, and reports its address",
+         ctx do
       prev = Application.get_env(:vagus, :memory_app)
       Application.put_env(:vagus, :memory_app, "agent_memory")
 
@@ -675,18 +684,33 @@ defmodule Vagus.App.StepsTest do
       end)
 
       memory = test_config(%{"host_network" => false, "slug" => "agent_memory", "map" => []})
-      {fake, engine_opts} = engine(%{})
+      {fake, engine_opts} = engine(%{"fake-id" => [ips: %{"agentnet" => "172.30.40.2"}]})
+      {nat_opts, _answer} = nat(ctx)
+      test = self()
 
-      assert {:ok, _} =
-               Steps.run(
-                 :start,
-                 input(ctx, %{slug: "agent_memory", config: memory, engine_opts: engine_opts})
-               )
+      # The file is gone once the load answers, so it is read here.
+      cmd = fn "nft", ["-f", path] ->
+        send(test, {:nft_text, File.read!(path)})
+        {"", 0}
+      end
+
+      input =
+        input(ctx, %{
+          slug: "agent_memory",
+          config: memory,
+          engine_opts: engine_opts,
+          nat_opts: Keyword.put(nat_opts, :cmd, cmd)
+        })
+
+      assert {:ok, %{ip: "172.30.40.2"}} = Steps.run(:start, input)
 
       assert [{:ensure_network, [%{name: "agentnet", internal: true}]}] =
                Enum.filter(Fake.calls(fake), &match?({:ensure_network, _}, &1))
 
       assert_received {:create, %{network_name: "agentnet", ip: "172.30.40.2"}}
+      assert_received {:nft_text, text}
+      assert text =~ ~s(oifname "agentnet" iifname != "agentnet" ct state new drop)
+      assert File.dir?(Path.join([ctx.data_root, "addons", "data", "agent_memory", "pgdata"]))
     end
 
     test "a bridged app is refused until the forward filter loads, then starts", ctx do

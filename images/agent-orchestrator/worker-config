@@ -36,24 +36,37 @@ chmod 0700 "$dir"
 
 # Re-running refreshes only the login; the worker's own state is left alone.
 install -m 0600 "$creds" "$dir/.credentials.json"
-if [ ! -f "$dir/.claude.json" ]; then
+# $dir is the one place the worker can write, so it can swap a path for a symlink after
+# any check above. Everything is therefore read from a private copy made with `cp -P`
+# (never follows) and written to a scratch file beside $dir, then renamed over the target:
+# a rename replaces a symlink instead of following it.
+scratch=$(mktemp -d "$root/.wc.XXXXXX")
+trap 'rm -rf "$scratch"' EXIT
+cfg=$scratch/in.json
+if [ -e "$dir/.claude.json" ] || [ -L "$dir/.claude.json" ]; then
+  cp -P "$dir/.claude.json" "$cfg"
+  { [ -f "$cfg" ] && [ ! -L "$cfg" ]; } \
+    || { echo "worker-config: $dir/.claude.json is not a regular file, refusing" >&2; exit 1; }
+else
   jq -n '{hasCompletedOnboarding: true, remoteDialogSeen: true,
-          projects: {"/work": {hasTrustDialogAccepted: true}}}' > "$dir/.claude.json"
+          projects: {"/work": {hasTrustDialogAccepted: true}}}' > "$cfg"
 fi
 
-# Applied on every run, not just creation, so configs made before the memory DB existed
-# pick it up; `=` on this one key leaves the rest of the worker's state alone. The DB is
-# board-local and trust-auth, so the DSN carries no secret.
+# Applied on every run, with `=`, so a changed DSN or older configs (made before the
+# memory DB existed) are refreshed; the rest of the worker's state is left alone. The DB
+# is board-local and trust-auth, so the DSN carries no secret.
+# The default must match Vagus.Network.Agentnet.memory_ip/0.
 dsn=${VAGUS_MEMORY_DSN:-postgresql://agent@172.30.40.2/memory}
-tmp=$(mktemp "$dir/.claude.json.XXXXXX")
+out=$(mktemp "$scratch/out.XXXXXX")
 jq --arg dsn "$dsn" --arg task "$task" \
   '.mcpServers["vagus-memory"] = {command: "vagus-memory",
-     env: {VAGUS_MEMORY_DSN: $dsn, VAGUS_TASK: $task}}' "$dir/.claude.json" > "$tmp"
-mv "$tmp" "$dir/.claude.json"
+     env: {VAGUS_MEMORY_DSN: $dsn, VAGUS_TASK: $task}}' "$cfg" > "$out"
+mv "$out" "$dir/.claude.json"
 
 # User-scope memory file of this CLAUDE_CONFIG_DIR: the one place a worker reads rules
 # from that its writable /work cannot shadow. Rewritten each run so the rule stays current.
-cat > "$dir/CLAUDE.md" <<'RULES'
+out=$(mktemp "$scratch/out.XXXXXX")
+cat > "$out" <<'RULES'
 # Board memory
 
 The `vagus-memory` MCP server is this board's shared, persistent memory.
@@ -63,6 +76,7 @@ The `vagus-memory` MCP server is this board's shared, persistent memory.
 - Before you report, `remember` what you learned that the next task would need.
 - Never store secrets in memory: no passwords, tokens, keys or cookies.
 RULES
+mv "$out" "$dir/CLAUDE.md"
 
 # Ownership matters only when run as root (`podman exec` without `--user agent`).
 if [ "$(id -u)" = 0 ]; then

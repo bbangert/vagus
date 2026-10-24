@@ -169,14 +169,16 @@ defmodule Vagus.API.BackupRouterTest do
     body(conn)["data"]["slug"]
   end
 
-  defp protect(slugs) do
-    prev = Application.get_env(:vagus, :protected_apps)
-    Application.put_env(:vagus, :protected_apps, slugs)
+  defp protect(slugs), do: put_env_for_test(:protected_apps, slugs)
+
+  defp put_env_for_test(key, value) do
+    prev = Application.get_env(:vagus, key)
+    Application.put_env(:vagus, key, value)
 
     on_exit(fn ->
       if prev,
-        do: Application.put_env(:vagus, :protected_apps, prev),
-        else: Application.delete_env(:vagus, :protected_apps)
+        do: Application.put_env(:vagus, key, prev),
+        else: Application.delete_env(:vagus, key)
     end)
   end
 
@@ -232,7 +234,7 @@ defmodule Vagus.API.BackupRouterTest do
       assert Enum.any?(b["addons"], &(&1["slug"] == "core_partial_bg"))
     end
 
-    test "a protected slug anywhere in the list refuses the whole request untouched", %{
+    test "the orchestrator anywhere in the list refuses the whole request untouched", %{
       data_root: dr
     } do
       install("core_restore_a", dr)
@@ -243,6 +245,7 @@ defmodule Vagus.API.BackupRouterTest do
       File.write!(Path.join(data_dir, "f.txt"), "mutated")
 
       protect(["core_restore_orch"])
+      put_env_for_test(:orchestrator_app, "core_restore_orch")
 
       conn =
         supervisor_call(:post, "/backups/#{slug}/restore/partial", %{
@@ -250,8 +253,28 @@ defmodule Vagus.API.BackupRouterTest do
         })
 
       assert conn.status == 400
-      assert body(conn)["message"] =~ "protected"
+      assert body(conn)["message"] =~ "orchestrator app cannot be restored"
       assert File.read!(Path.join(data_dir, "f.txt")) == "mutated"
+    end
+
+    test "the protected memory app is restored: its backup is its recovery", %{data_root: dr} do
+      install("agent_memory", dr)
+      slug = create_backup("agent_memory")
+      data_dir = Path.join([dr, "addons", "data", "agent_memory"])
+      File.write!(Path.join(data_dir, "f.txt"), "mutated")
+
+      protect(["agent_orchestrator", "agent_memory"])
+      put_env_for_test(:orchestrator_app, "agent_orchestrator")
+
+      conn =
+        supervisor_call(:post, "/backups/#{slug}/restore/partial", %{"addons" => ["agent_memory"]})
+
+      assert conn.status == 200, conn.resp_body
+      job = body(supervisor_call(:get, "/jobs/#{body(conn)["data"]["job_id"]}"))["data"]
+      assert job["done"] == true
+      assert job["errors"] == []
+      assert File.read!(Path.join(data_dir, "f.txt")) == "hello"
+      assert {:ok, %{state: :started}} = app_info("agent_memory")
     end
 
     test "a non-empty password -> 400" do

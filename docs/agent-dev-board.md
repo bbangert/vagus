@@ -226,13 +226,23 @@ meaning. The cost is one more app to protect and back up.
 
 The `agent_memory` app runs `pgvector/pgvector:pg17` on `agentnet`, a private
 podman bridge (`172.30.40.0/24`, internal, no masquerade) at the static
-address `172.30.40.2:5432`, database `memory`, user `agent`. `pg_hba` trusts
-that subnet only and the port is not published, so nothing off the board can
-connect. It is protected like the orchestrator: stop, restart and uninstall
-are refused. Workers join with `--network agentnet`. The orchestrator is on
-the host network and reaches the DB through the host's bridge address
-`172.30.40.1`; the default DSN, `postgresql://agent@172.30.40.2/memory`, works
-for both (`VAGUS_MEMORY_DSN` overrides it).
+address `172.30.40.2:5432`, database `memory`, user `agent`. The port is not
+published. The image runs with `POSTGRES_HOST_AUTH_METHOD=trust` and
+`listen_addresses='*'`, so the real boundary is network reachability: the DB is
+reachable only from `agentnet` and from processes on the host network, which
+owns the bridge address `172.30.40.1`. Everything on the host network (the
+orchestrator, every worker, host-network apps such as ESPHome) connects as the
+`agent` superuser; bridged hassio apps and the LAN cannot reach it (internal
+bridge plus nft). This is an accepted consequence of D7 and D9. The app is
+protected like the orchestrator: stop, restart and uninstall are refused.
+
+Workers run on the host network by default and reach the DB through
+`172.30.40.1`. `agentnet` is internal (no default route, no DNS, agentnet to
+LAN dropped), so a worker started with `--network agentnet` alone has no
+Claude API access and cannot run `claude -p`; that mode is only for containers
+that need nothing but the DB. The default DSN,
+`postgresql://agent@172.30.40.2/memory`, works for every case
+(`VAGUS_MEMORY_DSN` overrides it).
 
 The base image ships the `vagus-memory` MCP stdio server and a `memory` CLI.
 `worker-config` registers the server in each worker's `.claude.json`
@@ -256,7 +266,12 @@ Schema v1:
 
 **Backup.** Cold: Vagus stops the app, tars PGDATA and restarts it, so the
 database is unavailable for a few seconds. A file copy of a running cluster
-would not be consistent, which is why it is not taken live.
+would not be consistent, which is why it is not taken live. Open MCP
+connections drop and the server reconnects on the next call.
+
+**Restore.** The memory app can be restored through the API (only the
+orchestrator cannot be): `POST /backups/<backup-slug>/restore/partial` with
+`{"addons": ["agent_memory"]}`.
 
 **Embedder.** It loads lazily at the first embed (about 0.6 s, roughly 200 MB
 RSS in the worker), so give memory-using workers headroom under `--memory`.

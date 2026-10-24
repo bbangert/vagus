@@ -45,10 +45,9 @@ defmodule Vagus.Network.AgentnetTest do
   end
 
   test "off the agent flavor it does nothing", %{fake: fake, ip: ip} do
-    refute Agentnet.enabled?()
-
-    assert Agentnet.ensure(engine: Fake, fake: fake, host_bridge: true, ip_cmd: ip.(&ok/1)) ==
-             :ok
+    refute Agentnet.enabled?(agentnet: false)
+    opts = [agentnet: false, engine: Fake, fake: fake, host_bridge: true, ip_cmd: ip.(&ok/1)]
+    assert Agentnet.ensure(opts) == :ok
 
     assert Fake.calls(fake) == []
     assert ip_calls() == []
@@ -99,6 +98,99 @@ defmodule Vagus.Network.AgentnetTest do
 
     assert Agentnet.ensure(opts) == {:error, :unavailable}
     assert length(ip_calls()) == 5
+  end
+
+  describe "on podman" do
+    alias Vagus.Test.FakePodman
+
+    defp podman(rules) do
+      fake = FakePodman.start(rules)
+      host = FakePodman.start_host(fake.bin)
+
+      {fake,
+       [agentnet: true, engine: Vagus.Runtime.Engine.Podman, host: host, podman_bin: fake.bin]}
+    end
+
+    defp verbs(fake), do: Enum.map(FakePodman.verbs(fake), &Enum.take(&1, 2))
+
+    test "an existing internal network is kept" do
+      {fake, opts} =
+        podman([
+          {"network exists *", [{0, ""}]},
+          {"network inspect *", [{0, "true\n"}]}
+        ])
+
+      assert Agentnet.ensure(opts) == :ok
+
+      assert ["network", "inspect", "--format", "{{.Internal}}", "--", "agentnet"] in FakePodman.verbs(
+               fake
+             )
+
+      refute ["network", "create"] in verbs(fake)
+    end
+
+    test "an existing network that is not internal is remade internal" do
+      {fake, opts} =
+        podman([
+          {"network exists *", [{0, ""}]},
+          {"network inspect *", [{0, "false\n"}]},
+          {"network rm *", [{0, "agentnet\n"}]},
+          {"network create *", [{0, "agentnet\n"}]}
+        ])
+
+      assert Agentnet.ensure(opts) == :ok
+      assert ["network", "rm", "--", "agentnet"] in FakePodman.verbs(fake)
+      create = Enum.find(FakePodman.verbs(fake), &match?(["network", "create" | _], &1))
+      assert "--internal" in create
+    end
+
+    test "one that cannot be remade, a container still on it, is an error" do
+      {fake, opts} =
+        podman([
+          {"network exists *", [{0, ""}]},
+          {"network inspect *", [{0, "false\n"}]},
+          {"network rm *", [{2, "Error: network agentnet is being used\n"}]}
+        ])
+
+      log =
+        capture_log(fn ->
+          assert Agentnet.ensure(opts) == {:error, {:failed, :ensure_network, :not_internal}}
+        end)
+
+      assert log =~ "not internal"
+      refute ["network", "create"] in verbs(fake)
+    end
+
+    test "two ensures at once make it once" do
+      {fake, opts} =
+        podman([
+          {"network exists *", [{1, ""}, {0, ""}]},
+          {"network create *", [{0, "agentnet\n", hold: true}]},
+          {"network inspect *", [{0, "true\n"}]}
+        ])
+
+      first = Task.async(fn -> Agentnet.ensure(opts) end)
+      wait_until(fn -> ["network", "create"] in verbs(fake) end)
+      second = Task.async(fn -> Agentnet.ensure(opts) end)
+
+      # The second waits on the lock, never reaching podman while the
+      # create is in flight.
+      Process.sleep(200)
+      assert length(FakePodman.verbs(fake) |> Enum.filter(&match?(["network" | _], &1))) == 2
+
+      FakePodman.release(fake)
+      assert Task.await(first) == :ok
+      assert Task.await(second) == :ok
+      assert Enum.count(verbs(fake), &(&1 == ["network", "create"])) == 1
+    end
+
+    defp wait_until(fun, tries \\ 100) do
+      cond do
+        fun.() -> :ok
+        tries == 0 -> flunk("condition never held")
+        true -> Process.sleep(20) && wait_until(fun, tries - 1)
+      end
+    end
   end
 
   defp ok(_args), do: {"", 0}

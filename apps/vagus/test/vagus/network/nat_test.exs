@@ -154,7 +154,20 @@ defmodule Vagus.Network.NatTest do
       assert text == String.replace(@ruleset, baseline_drop, agentnet <> baseline_drop)
 
       assert Nat.ruleset(ip: "172.30.32.2", port: 8888, agentnet: false) == {:ok, @ruleset}
+    end
+
+    # A reload with no opts (a bridged start, `set_lab/2`) must keep the rule.
+    test "unset, it follows the flavor" do
+      prev = Application.get_env(:vagus, :flavor)
+      on_exit(fn -> Application.put_env(:vagus, :flavor, prev || :default) end)
+
+      Application.put_env(:vagus, :flavor, :default)
       assert Nat.ruleset(ip: "172.30.32.2", port: 8888) == {:ok, @ruleset}
+
+      Application.put_env(:vagus, :flavor, :agent_dev_board)
+      assert Vagus.Network.Agentnet.enabled?()
+      {:ok, text} = Nat.ruleset(ip: "172.30.32.2", port: 8888)
+      assert text =~ ~s(oifname "agentnet" iifname != "agentnet" ct state new drop)
     end
   end
 

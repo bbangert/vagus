@@ -386,12 +386,15 @@ defmodule Vagus.App do
 
   @doc """
   The agent flavor's own apps (`:protected_apps`: the orchestrator and its
-  memory DB). A request may not stop, restart, uninstall or restore one,
-  nor change its `boot` or `watchdog`: from inside the board that is the
-  agent cutting off its own control or memory. `update/2` stays allowed,
-  since an image bump is legitimate and starts it again. Shutdown and a
-  cold backup halt one through units and the backup policy, not through
-  these.
+  memory DB). A request may not stop, restart or uninstall one, nor change
+  its `boot` or `watchdog`: from inside the board that is the agent
+  cutting off its own control or memory. `update/2` stays allowed, since
+  an image bump is legitimate and starts it again. Shutdown and a cold
+  backup halt one through units and the backup policy, not through these.
+
+  `restore/5` is refused for the orchestrator alone: it would overwrite the
+  live login under it, while the memory DB's backup is how it is
+  recovered.
   """
   @spec protected?(String.t() | nil) :: boolean()
   def protected?(slug), do: slug in Application.get_env(:vagus, :protected_apps, [])
@@ -586,7 +589,9 @@ defmodule Vagus.App do
       |> Map.new()
       |> Map.merge(%{staging_dir: staging_dir, options: options, start?: start?})
 
-    unprotected(slug, fn -> command(slug, :restore, args) end)
+    if orchestrator?(slug),
+      do: {:error, :protected},
+      else: command(slug, :restore, args)
   end
 
   # The container was started as asked, and boot would report a running app

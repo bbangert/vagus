@@ -27,7 +27,9 @@ jq '.hasCompletedOnboarding //= true
 chown agent:agent "$tmp"
 mv "$tmp" "$state"
 
-# Same server the workers get, with the orchestrator as its provenance.
+# `//=` so the orchestrator's own edits to this entry survive a restart; worker-config
+# uses `=` because it owns its workers' entries. The DSN default must match
+# Vagus.Network.Agentnet.memory_ip/0.
 tmp=$(mktemp "$CLAUDE_CONFIG_DIR/.claude.json.XXXXXX")
 jq --arg dsn "${VAGUS_MEMORY_DSN:-postgresql://agent@172.30.40.2/memory}" \
   '.mcpServers["vagus-memory"] //= {command: "vagus-memory",

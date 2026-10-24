@@ -3,7 +3,7 @@ defmodule Vagus.Network.Nat do
   Vagus's own nft table and the forwarding sysctls bridged apps need: the
   DNAT that keeps `http://supervisor/` working after the Supervisor-API
   listener moved off port 80, and the filters that let the board route for
-  the `hassio` bridge and nothing else.
+  the `hassio` bridge and nothing else, and that keep `agentnet` private.
 
   ## Why this exists
 
@@ -52,6 +52,9 @@ defmodule Vagus.Network.Nat do
     * a new connection entering `hassio` from another interface is dropped
       unless conntrack shows it was DNAT'd, i.e. a published port, so a LAN
       host routing `172.30.32.0/23` via the board reaches no app directly.
+    * on the agent flavor, a new connection entering `agentnet`
+      (`Vagus.Network.Agentnet`) from any other interface is dropped, so
+      no `hassio` app reaches the memory DB.
 
   Traffic between containers, container egress and replies pass. The flag
   test is `ct status & dnat == 0`: `ct status != dnat` compares the whole

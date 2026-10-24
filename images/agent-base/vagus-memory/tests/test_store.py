@@ -1,3 +1,5 @@
+import logging
+import string
 import threading
 
 import psycopg
@@ -5,7 +7,7 @@ import pytest
 
 from vagus_memory.store import Store
 
-from .conftest import DIMS, FakeEmbedder
+from .conftest import DIMS, FakeEmbedder, with_options
 
 
 def ids(hits):
@@ -87,7 +89,7 @@ def test_schema_idempotent(dsn: str) -> None:
 
 def test_concurrent_schema_init(dsn: str) -> None:
     n = 6
-    barrier = threading.Barrier(n)
+    barrier = threading.Barrier(n, timeout=10)
     errors: list[BaseException] = []
     stores = [Store(dsn, FakeEmbedder(), task=f"w{i}") for i in range(n)]
 
@@ -102,9 +104,95 @@ def test_concurrent_schema_init(dsn: str) -> None:
     for t in threads:
         t.start()
     for t in threads:
-        t.join()
+        t.join(timeout=30)
+    assert not any(t.is_alive() for t in threads)
     for s in stores:
         s.close()
     assert errors == []
     with psycopg.connect(dsn) as c:
         assert c.execute("SELECT count(*) FROM schema_version").fetchone() == (1,)
+
+
+def test_scoped_semantic_recall_past_the_hnsw_candidate_window(base_dsn: str, schema: str) -> None:
+    # A selective scope is served by the scope index; the HNSW path (scope filtered
+    # after the scan) is what the planner takes for a broad one. Dropping that index and
+    # seq scans forces the HNSW path on a test-sized table.
+    dsn = with_options(base_dsn, f"-csearch_path={schema},public -cenable_seqscan=off")
+    s = Store(dsn, FakeEmbedder(), task="t")
+    s.conn().execute("DROP INDEX memories_live_scope")
+    letters = string.ascii_lowercase
+    # More near neighbours than the default ef_search (40) returns, all in another scope.
+    for i in range(300):
+        s.remember("fact", "other", f"board reboots z{letters[i % 26]}{letters[i // 26]}")
+    s.remember("fact", "mine", "wifi association needs the regulatory domain set")
+    target = s.remember("gotcha", "mine", "the board reboots when the fan spins up")
+    hits = s.recall("device restarts", scope="mine")
+    s.close()
+    assert hits and hits[0]["id"] == target
+
+
+def test_reconnects_after_the_session_is_killed(base_dsn: str, store: Store) -> None:
+    store.remember("fact", "x", "before")
+    pid = store.conn().info.backend_pid
+    with psycopg.connect(base_dsn, autocommit=True) as c:
+        c.execute("SELECT pg_terminate_backend(%s)", (pid,))
+    mid = store.remember("fact", "x", "after the restart")
+    assert store.conn().info.backend_pid != pid
+    assert mid in ids(store.recall("restart"))
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda s: s.remember("fact", "x", "a" * (64 * 1024 + 1)),
+        lambda s: s.journal("t", "é" * (32 * 1024 + 1)),
+        lambda s: s.device_note("dev", "a" * (64 * 1024 + 1)),
+        lambda s: s.recall("a" * (64 * 1024 + 1)),
+        lambda s: s.remember("fact", "", "empty scope"),
+        lambda s: s.remember("fact", "x", "refs", [str(i) for i in range(65)]),
+    ],
+)
+def test_oversized_or_empty_input_is_refused(store: Store, call) -> None:
+    with pytest.raises(ValueError):
+        call(store)
+    assert store.status()["counts"]["live"] == 0
+
+
+def test_text_at_the_limit_is_accepted(store: Store) -> None:
+    assert store.remember("fact", "x", "a" * (64 * 1024)) > 0
+
+
+def test_tombstone_kind_is_reserved(store: Store) -> None:
+    with pytest.raises(ValueError, match="reserved"):
+        store.remember("tombstone", "x", "forge a tombstone")
+
+
+def test_dims_mismatch_stores_null_with_warning(dsn: str, caplog) -> None:
+    Store(dsn, FakeEmbedder(), task="t").conn().close()
+    s = Store(dsn, FakeEmbedder(dims=DIMS + 1), task="t")
+    with caplog.at_level(logging.WARNING, logger="vagus_memory"):
+        mid = s.remember("fact", "q6a", "picocom needs the dialout group")
+    row = s.conn().execute("SELECT embedding FROM memories WHERE id = %s", (mid,)).fetchone()
+    assert row == {"embedding": None}
+    assert any("dims" in r.getMessage() for r in caplog.records)
+    assert ids(s.recall("picocom")) == [mid]
+    s.close()
+
+
+def test_mixed_null_and_embedded_rows(dsn: str) -> None:
+    healthy = Store(dsn, FakeEmbedder(), task="t")
+    healthy.conn()
+    broken = Store(dsn, FakeEmbedder(fail=True), task="t")
+    unembedded = broken.remember("fact", "q6a", "the fan header is ufshc adjacent")
+    broken.close()
+    paraphrase = healthy.remember("gotcha", "q6a", "the board reboots when the cooler spins")
+    hits = ids(healthy.recall("ufshc or device restarts"))
+    healthy.close()
+    assert set(hits) == {unembedded, paraphrase}
+
+
+@pytest.mark.parametrize(("k", "expected"), [(0, 1), (1, 1), (100, 100), (500, 100)])
+def test_k_is_clamped(store: Store, k: int, expected: int) -> None:
+    for i in range(120):
+        store.remember("fact", "x", f"ufshc note {i}")
+    assert len(store.recall("ufshc", k=k)) == expected

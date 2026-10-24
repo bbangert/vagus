@@ -2,10 +2,10 @@ name: ci
 
 # Host-side gates for the emulator (apps/vagus), one parallel job each:
 # compile (warnings as errors) + format, tests, Credo, Dialyzer, Sobelow, a
-# dependency audit, and Argus. Everything runs at MIX_TARGET=host — the
-# Nerves system / firmware build is target-only (targets:-gated deps) and
-# lives in the nerves_system_vagus repo's own CI, so nothing here pulls
-# Buildroot.
+# dependency audit, and Argus, plus the vagus-memory Python checks. The Elixir
+# jobs run at MIX_TARGET=host — the Nerves system / firmware build is
+# target-only (targets:-gated deps) and lives in the nerves_system_vagus repo's
+# own CI, so nothing here pulls Buildroot.
 #
 # Every job repeats the same setup (native build deps, BEAM, hex/rebar/
 # nerves_bootstrap, deps cache under its own key prefix, deps.get).
@@ -423,3 +423,30 @@ jobs:
       - name: Check findings against the reviewed baseline
         working-directory: apps/vagus
         run: elixir ../../scripts/argus_baseline.exs argus.json .argus-baseline.exs
+
+  python-memory:
+    name: vagus-memory (Python)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: images/agent-base/vagus-memory
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # Unit layer only: the DB tests skip without VAGUS_MEMORY_TEST_DSN, and the fake
+      # embedder keeps fastembed (and its ONNX runtime) out of the install. Versions
+      # track images/agent-base/requirements.txt.
+      - name: Install
+        run: pip install "psycopg[binary]==3.2.9" mcp==1.30.0 pytest==9.1.1 ruff==0.17.2
+
+      - name: Ruff
+        run: |
+          ruff check .
+          ruff format --check .
+
+      - name: Unit tests
+        run: pytest -q tests/test_unit.py

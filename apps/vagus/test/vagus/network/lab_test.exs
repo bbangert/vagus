@@ -203,7 +203,16 @@ defmodule Vagus.Network.LabTest do
   test "protected and malformed names are refused before anything runs", ctx do
     s = start(ctx)
 
-    for name <- ["eth0", "wlan0", "lo", "usb0", "hassio", "hassio-anchor"] do
+    for name <- [
+          "eth0",
+          "wlan0",
+          "lo",
+          "usb0",
+          "hassio",
+          "hassio-anchor",
+          "agentnet",
+          "agentnet-anchor"
+        ] do
       assert Lab.up(name, "10.42.0.1/24", s) == {:error, :protected}
     end
 
@@ -242,7 +251,7 @@ defmodule Vagus.Network.LabTest do
     assert receive_all() == []
   end
 
-  test "a cidr overlapping the hassio bridge or the primary's subnet is refused", ctx do
+  test "a cidr overlapping a container bridge or the primary's subnet is refused", ctx do
     addresses = fn
       "eth0" ->
         [
@@ -262,6 +271,8 @@ defmodule Vagus.Network.LabTest do
     for cidr <- [
           "172.30.33.1/24",
           "172.30.32.1/30",
+          "172.30.40.9/28",
+          "172.30.40.1/23",
           "172.16.0.1/12",
           "192.168.2.200/28",
           "10.9.200.1/24",
@@ -272,6 +283,7 @@ defmodule Vagus.Network.LabTest do
 
     assert receive_all() == []
     assert Lab.up("eth1", "172.30.34.1/24", s) == :ok
+    assert Lab.up("eth2", "172.30.41.1/24", s) == :ok
   end
 
   test "a refused nft load rolls the address back", ctx do

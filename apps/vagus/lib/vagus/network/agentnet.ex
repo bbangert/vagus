@@ -18,7 +18,13 @@ defmodule Vagus.Network.Agentnet do
   @gateway "172.30.40.1"
   @prefix "24"
   @memory_ip "172.30.40.2"
+  # A dummy port keeps the bridge, and the host's `.1`, while no container
+  # is attached: netavark deletes a portless bridge, and the host-networked
+  # orchestrator would lose its route to the DB. 15 characters, IFNAMSIZ's
+  # limit.
   @bridge_port "agentnet-anchor"
+  # As `Vagus.Network.Nat`'s: a backoff that outlasts one network create.
+  @lock_retries 8
 
   @spec name() :: String.t()
   def name, do: @name
@@ -46,11 +52,24 @@ defmodule Vagus.Network.Agentnet do
   @doc """
   Ensures the network and, on a board, its host-kept bridge. A no-op off
   the agent flavor; `:agentnet` overrides `Vagus.Flavor.agent?/0` and
-  `:host_bridge` `Vagus.Network.host_bridge?/1`.
+  `:host_bridge` `Vagus.Network.host_bridge?/1`. `{:error, :busy}` when
+  another ensure holds it past `:lock_retries`.
   """
   @spec ensure(keyword()) :: :ok | {:error, Engine.error()}
   def ensure(opts \\ []) do
-    if enabled?(opts), do: do_ensure(opts), else: :ok
+    if enabled?(opts), do: serialized(opts, fn -> do_ensure(opts) end), else: :ok
+  end
+
+  # The boot gate and the memory app's start both ensure it; unserialized,
+  # both see it absent and the second create fails, or one remakes it
+  # (`--internal` repair) under the other.
+  defp serialized(opts, fun) do
+    lock = {__MODULE__, self()}
+
+    case :global.trans(lock, fun, [node()], Keyword.get(opts, :lock_retries, @lock_retries)) do
+      :aborted -> {:error, :busy}
+      result -> result
+    end
   end
 
   @spec enabled?(keyword()) :: boolean()
