@@ -74,6 +74,36 @@ if authorized_keys == [],
 config :nerves_ssh,
   authorized_keys: authorized_keys
 
+# Nerves exposes no config key for this: fwup.conf reads it from the
+# environment of `mix firmware`, so it must be exported here (this file is
+# evaluated in that process). CI passes the full sha; local builds fall back
+# to git and mark uncommitted changes, since a clean sha would otherwise
+# vouch for code the image doesn't contain. Blank when git is unavailable.
+git = fn args ->
+  try do
+    case System.cmd("git", args, stderr_to_stdout: true) do
+      {out, 0} -> String.trim(out)
+      _ -> nil
+    end
+  rescue
+    ErlangError -> nil
+  end
+end
+
+vcs_identifier =
+  case System.get_env("NERVES_FW_VCS_IDENTIFIER") do
+    id when id not in [nil, ""] ->
+      id
+
+    _ ->
+      case git.(["rev-parse", "--short=12", "HEAD"]) do
+        nil -> ""
+        sha -> if git.(["status", "--porcelain"]) in [nil, ""], do: sha, else: sha <> "-dirty"
+      end
+  end
+
+System.put_env("NERVES_FW_VCS_IDENTIFIER", vcs_identifier)
+
 # `ssh_subsystem_fwup`'s DEFAULT success_callback is
 # `{Nerves.Runtime, :reboot, []}`, so every OTA `mix upload` reboot would
 # bypass the graceful-stop facade and keep corrupting Core's .storage (issue

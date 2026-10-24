@@ -40,7 +40,8 @@ defmodule Vagus.App.OrchestratorTest do
         core_start: fn _deadline -> send(test_pid, :core_start) && :ok end,
         core_stop: fn _deadline -> send(test_pid, :core_stop) && :ok end,
         stop_containers: fn _slugs, _budget -> {:ok, [], []} end,
-        gates: Map.new([:tree, :engine, :network, :dist, :api], &{&1, gate(test_pid, &1)}),
+        gates:
+          Map.new([:tree, :patches, :engine, :network, :dist, :api], &{&1, gate(test_pid, &1)}),
         report: fn stage, outcomes -> send(test_pid, {:report, stage, outcomes}) end,
         push_complete: fn -> send(test_pid, :complete) end
       },
@@ -826,6 +827,7 @@ defmodule Vagus.App.OrchestratorTest do
 
           assert collect_until(:complete) == [
                    {:gate, :tree},
+                   {:gate, :patches},
                    {:report, :native, []},
                    {:gate, :engine},
                    {:gate, :network},
@@ -841,22 +843,24 @@ defmodule Vagus.App.OrchestratorTest do
                  ]
 
           assert %{phase: :up, task: nil} = await_boot(name)
+          assert Orchestrator.complete?(name)
         end)
 
       assert log =~ "Boot: Core stage skipped (agent-dev-board flavor)"
       refute_received :core_start
     end
 
-    test "the default flavor runs no dist gate" do
+    test "the default flavor runs no dist or patches gate" do
       start_orchestrator([])
       messages = collect_until(:complete)
       assert {:gate, :api} in messages
       refute {:gate, :dist} in messages
+      refute {:gate, :patches} in messages
     end
 
     defp dist_gates(test_pid, dist),
       do:
-        Map.new([:tree, :engine, :network, :api], &{&1, gate(test_pid, &1)})
+        Map.new([:tree, :patches, :engine, :network, :api], &{&1, gate(test_pid, &1)})
         |> Map.put(:dist, dist)
 
     test "a dist claim still starting is retried, and api waits for it" do
@@ -892,6 +896,7 @@ defmodule Vagus.App.OrchestratorTest do
             })
 
           assert %{phase: :up, task: nil} = await_boot(name)
+          refute Orchestrator.complete?(name)
         end)
 
       messages = drain()

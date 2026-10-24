@@ -14,6 +14,7 @@ defmodule Vagus.App.Gates do
   def all,
     do: %{
       tree: &tree/0,
+      patches: &patches/0,
       engine: &engine/0,
       network: &network/0,
       dist: &dist/0,
@@ -31,6 +32,21 @@ defmodule Vagus.App.Gates do
     if List.keymember?(Application.started_applications(), :vagus, 0),
       do: :ok,
       else: {:error, :starting}
+  end
+
+  @doc """
+  Loads the enabled hot patches (`Vagus.Patches.boot_load/1`); the
+  agent-dev-board flavor's only. A patch that fails is that patch's result,
+  never the boot's, so any answer passes; only a server that does not
+  answer is retried. The call is bounded under `gate_timeout`, and a retry
+  gets the first load's answer. `opts`: `:server`, `:timeout` (tests).
+  """
+  @spec patches(keyword()) :: :ok | {:error, term()}
+  def patches(opts \\ []) do
+    case Vagus.Patches.boot_load(Keyword.put_new(opts, :timeout, 8_000)) do
+      {:error, reason} -> {:error, reason}
+      {:ok, _results} -> :ok
+    end
   end
 
   @doc """

@@ -157,6 +157,7 @@ jobs:
           MIX_TARGET: ${{ matrix.target }}
           VAGUS_FLAVOR: ${{ matrix.flavor }}
           NERVES_FW_MISC: ${{ matrix.flavor }}
+          NERVES_FW_VCS_IDENTIFIER: ${{ github.sha }}
 
       - name: Rename firmware asset
         run: |

@@ -53,6 +53,7 @@ defmodule Vagus.App.UnitsTest do
              :dist,
              :engine,
              :network,
+             :patches,
              :primary,
              :tree
            ]
@@ -261,6 +262,37 @@ defmodule Vagus.App.UnitsTest do
 
       assert Units.install_default("agent_orchestrator") == :present
       assert {:ok, %{boot: "auto", watchdog: true}} = app_info("agent_orchestrator")
+    end
+  end
+
+  describe "the patches gate" do
+    setup do
+      root = Path.join(System.tmp_dir!(), "units_patches_#{System.unique_integer([:positive])}")
+      on_exit(fn -> File.rm_rf(root) end)
+      server = :"units_patches_#{System.unique_integer([:positive])}"
+      %{root: root, server: server}
+    end
+
+    test "passes once the server answered", %{root: root, server: server} do
+      start_supervised!({Vagus.Patches, name: server, enabled: true, root: root})
+      assert Gates.patches(server: server) == :ok
+      assert %{"good" => true} = root |> Path.join(".boot") |> File.read!() |> Jason.decode!()
+    end
+
+    test "passes when patches failed, which are their own results", %{root: root, server: server} do
+      dir = Path.join(root, "broken")
+      File.mkdir_p!(dir)
+      File.write!(Path.join(dir, "NOTES.md"), "")
+      File.write!(Path.join(dir, "x.ex"), "defmodule")
+      File.touch!(Path.join(dir, "enabled"))
+      start_supervised!({Vagus.Patches, name: server, enabled: true, root: root})
+
+      assert Gates.patches(server: server) == :ok
+      assert {:ok, %{"broken" => {:error, _}}} = Vagus.Patches.boot_load(server: server)
+    end
+
+    test "retries a server that is not running", %{server: server} do
+      assert Gates.patches(server: server) == {:error, :not_running}
     end
   end
 
