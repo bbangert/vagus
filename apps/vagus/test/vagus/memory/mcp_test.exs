@@ -95,6 +95,29 @@ defmodule Vagus.Memory.MCPTest do
     assert JSON.decode!(text) == %{"error" => "invalid_argument: kind"}
   end
 
+  test "a call over the task limit is answered busy without starting a task" do
+    tasks = Module.concat(__MODULE__, "FullTasks")
+    start_supervised!({Task.Supervisor, name: tasks, max_children: 1}, id: tasks)
+    {:ok, _blocker} = Task.Supervisor.start_child(tasks, fn -> receive do: (:never -> :ok) end)
+    opts = MCP.init(store: Module.concat(__MODULE__, "NoStore"), tasks: tasks)
+
+    body =
+      JSON.encode!(%{
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/call",
+        params: %{name: "recall", arguments: %{query: "kettle"}}
+      })
+
+    conn = post(body, opts)
+    assert conn.status == 503
+
+    assert %{"id" => 1, "error" => %{"code" => -32_000, "message" => "busy"}} =
+             JSON.decode!(conn.resp_body)
+
+    assert length(Task.Supervisor.children(tasks)) == 1
+  end
+
   test "an unknown tool is invalid params", %{opts: opts} do
     assert %{"error" => %{"code" => -32_602}} =
              rpc("tools/call", %{name: "drop_tables", arguments: %{}}, opts)

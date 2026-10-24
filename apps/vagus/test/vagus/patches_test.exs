@@ -80,9 +80,9 @@ defmodule Vagus.PatchesTest do
     end
   end
 
-  defp booted(s) do
+  defp booted(s, tries \\ 400) do
     assert {:ok, :started} = Patches.boot_load(s)
-    eventually(fn -> match?({:done, _}, Patches.boot_status(s)) end)
+    eventually(fn -> match?({:done, _}, Patches.boot_status(s)) end, tries)
     {:done, results} = Patches.boot_status(s)
     results
   end
@@ -523,7 +523,9 @@ defmodule Vagus.PatchesTest do
     end
 
     test "a compile past its bound times out alone", %{root: root, n: n} do
-      s = start(root, compile_timeout_ms: 50)
+      # The hang never ends, so any bound trips it; 5 s leaves a real compile
+      # room on a loaded runner.
+      s = start(root, compile_timeout_ms: 5_000)
       ok = mod(n, "Ok")
 
       patch(root, "a_hangs", [{"m.ex", hook(mod(n, "Hangs"), "Process.sleep(:infinity)")}],
@@ -532,7 +534,7 @@ defmodule Vagus.PatchesTest do
 
       patch(root, "b_ok", [{"m.ex", source(ok, :ok)}], enabled: true)
 
-      assert %{"a_hangs" => {:error, :timeout}, "b_ok" => :ok} = booted(s)
+      assert %{"a_hangs" => {:error, :timeout}, "b_ok" => :ok} = booted(s, 6_000)
       assert ok.marker() == :ok
     end
 

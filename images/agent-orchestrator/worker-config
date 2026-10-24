@@ -45,9 +45,18 @@ scratch=$(mktemp -d "$root/.wc.XXXXXX")
 trap 'rm -rf "$scratch"' EXIT
 cfg=$scratch/in.json
 if [ -e "$dir/.claude.json" ] || [ -L "$dir/.claude.json" ]; then
-  cp -P "$dir/.claude.json" "$cfg"
-  { [ -f "$cfg" ] && [ ! -L "$cfg" ]; } \
-    || { echo "worker-config: $dir/.claude.json is not a regular file, refusing" >&2; exit 1; }
+  src=$dir/.claude.json
+  [ ! -L "$src" ] || { echo "worker-config: $src is a symlink, refusing" >&2; exit 1; }
+  # O_RDWR never blocks on a FIFO (a plain read open would hang on an unwritten one), and
+  # checking the opened descriptor, not the path, leaves no swap window before the read.
+  exec 3<>"$src"
+  if [ "$(stat -L -c %F /dev/fd/3)" != "regular file" ]; then
+    exec 3<&-
+    echo "worker-config: $src is not a regular file, refusing" >&2
+    exit 1
+  fi
+  cat <&3 > "$cfg"
+  exec 3<&-
 else
   jq -n '{hasCompletedOnboarding: true, remoteDialogSeen: true,
           projects: {"/work": {hasTrustDialogAccepted: true}}}' > "$cfg"

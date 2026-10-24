@@ -109,32 +109,62 @@ defmodule Vagus.Memory.MCP do
   defp request("tools/call", %{"name" => name} = params, conn, opts) when is_binary(name) do
     arguments = Map.get(params, "arguments") || %{}
 
-    if Tools.known?(name),
-      do: {:ok, result(run(name, arguments, context(conn, opts), opts))},
-      else: {:error, -32_602, "Unknown tool: #{name}"}
+    if Tools.known?(name) do
+      case run(name, arguments, context(conn, opts), opts) do
+        :busy -> {:busy, -32_000, "busy"}
+        outcome -> {:ok, result(outcome)}
+      end
+    else
+      {:error, -32_602, "Unknown tool: #{name}"}
+    end
   end
 
   defp request("tools/call", _params, _conn, _opts), do: {:error, -32_602, "Invalid params"}
   defp request(_method, _params, _conn, _opts), do: {:error, -32_601, "Method not found"}
 
   # In a task so the budget covers a hung embedder as well as the database.
+  # `start_child` rather than `async_nolink`, which raises on a full
+  # supervisor: a full one is `:busy`, with no task started.
   defp run(name, arguments, context, opts) do
-    task =
-      Task.Supervisor.async_nolink(opts[:tasks], fn -> Tools.call(name, arguments, context) end)
+    caller = self()
+    ref = make_ref()
 
-    case Task.yield(task, @call_ms) || Task.shutdown(task, :brutal_kill) do
-      {:ok, outcome} ->
-        outcome
-
-      {:exit, reason} ->
-        Logger.error("Vagus.Memory.MCP: tool #{name} crashed: #{inspect(reason)}")
-        {:error, :internal}
-
-      nil ->
-        {:error, :timeout}
+    case Task.Supervisor.start_child(opts[:tasks], fn ->
+           send(caller, {ref, Tools.call(name, arguments, context)})
+         end) do
+      {:ok, pid} -> await(pid, ref, name)
+      {:error, :max_children} -> :busy
     end
   catch
     :exit, _reason -> {:error, :unavailable}
+  end
+
+  defp await(pid, ref, name) do
+    monitor = Process.monitor(pid)
+
+    receive do
+      {^ref, outcome} ->
+        Process.demonitor(monitor, [:flush])
+        outcome
+
+      {:DOWN, ^monitor, :process, ^pid, reason} ->
+        Logger.error("Vagus.Memory.MCP: tool #{name} crashed: #{inspect(reason)}")
+        {:error, :internal}
+    after
+      @call_ms ->
+        Process.exit(pid, :kill)
+        Process.demonitor(monitor, [:flush])
+
+        # A reply sent just before the kill would otherwise sit in this
+        # connection's mailbox for its lifetime.
+        receive do
+          {^ref, _outcome} -> :ok
+        after
+          0 -> :ok
+        end
+
+        {:error, :timeout}
+    end
   end
 
   defp result({:ok, value}),
@@ -173,13 +203,17 @@ defmodule Vagus.Memory.MCP do
         {:ok, result} ->
           %{jsonrpc: "2.0", id: id, result: result}
 
-        {:error, code, message} ->
+        {_error, code, message} ->
           %{jsonrpc: "2.0", id: id, error: %{code: code, message: message}}
       end
 
+    # Busy is a 503: HTTP clients and MCP transports retry a 503 with
+    # backoff, where a JSON-RPC error over 200 reads as a final answer.
+    status = if match?({:busy, _code, _message}, outcome), do: 503, else: 200
+
     conn
     |> put_resp_content_type("application/json")
-    |> send_resp(200, JSON.encode!(body))
+    |> send_resp(status, JSON.encode!(body))
   end
 
   defp server_version, do: to_string(Application.spec(:vagus, :vsn) || "0.0.0")

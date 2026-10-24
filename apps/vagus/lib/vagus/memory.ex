@@ -40,8 +40,10 @@ defmodule Vagus.Memory do
 
   @doc """
   Options (tests): `:repo`, `:store`, `:tasks` names; `:db` Postgrex
-  options merged over the agentnet DB's; `:embedder`; `:retry_ms`, the
-  first schema-init retry; `:listen`, default `Vagus.Flavor.agent?/0`.
+  options merged over the agentnet DB's and config's `:db`; `:pool`, false
+  to start no pool (config's, default true), so every operation is
+  `:db_unavailable`; `:embedder`; `:retry_ms`, the first schema-init
+  retry; `:listen`, default `Vagus.Flavor.agent?/0`.
   """
   @impl Supervisor
   def init(opts) do
@@ -49,19 +51,31 @@ defmodule Vagus.Memory do
     store = Keyword.get(opts, :store, Store)
     tasks = Keyword.get(opts, :tasks, __MODULE__.TaskSupervisor)
 
-    embedder =
-      Keyword.get_lazy(opts, :embedder, fn ->
-        Application.get_env(:vagus, __MODULE__, [])[:embedder] || Embedder.None
-      end)
+    config = Application.get_env(:vagus, __MODULE__, [])
+    embedder = Keyword.get_lazy(opts, :embedder, fn -> config[:embedder] || Embedder.None end)
+
+    db =
+      repo
+      |> db_options()
+      |> Keyword.merge(Keyword.get(config, :db, []))
+      |> Keyword.merge(Keyword.get(opts, :db, []))
+
+    pool =
+      if Keyword.get(opts, :pool, Keyword.get(config, :pool, true)),
+        do: [{Postgrex, db}],
+        else: []
 
     children =
-      [
-        {Postgrex, Keyword.merge(db_options(repo), Keyword.get(opts, :db, []))},
-        {Store, [name: store, repo: repo, embedder: embedder] ++ Keyword.take(opts, [:retry_ms])},
-        # Unbounded by count: each tool call holds one HTTP connection
-        # while its task runs, and the call kills its task at its timeout.
-        {Task.Supervisor, name: tasks}
-      ] ++
+      pool ++
+        [
+          {Store,
+           [name: store, repo: repo, embedder: embedder] ++ Keyword.take(opts, [:retry_ms])},
+          # The admission bound for MCP tool calls: the pool's two
+          # connections serve two at a time and each call is killed at
+          # 15 s, so more waiting tasks than a short queue are only memory.
+          # A call over it is answered busy at once (`Vagus.Memory.MCP`).
+          {Task.Supervisor, name: tasks, max_children: 8}
+        ] ++
         if(Keyword.get_lazy(opts, :listen, &Vagus.Flavor.agent?/0),
           do: listeners(store, tasks),
           else: []

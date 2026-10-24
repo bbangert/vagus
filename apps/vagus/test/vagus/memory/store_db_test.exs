@@ -54,7 +54,7 @@ defmodule Vagus.Memory.StoreDBTest do
     names = for key <- [:name, :repo, :store, :tasks], do: {key, :"memory_db_#{key}_#{n}"}
 
     start_supervised!(
-      {Memory, names ++ [db: db, embedder: embedder, listen: false, retry_ms: 20]},
+      {Memory, names ++ [db: db, pool: true, embedder: embedder, listen: false, retry_ms: 20]},
       id: names[:name]
     )
 

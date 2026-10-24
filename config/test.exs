@@ -128,3 +128,8 @@ config :vagus, :core_ws_handoff_timeout, 60_000
 config :vagus, :core_ws_send_timeout, 60_000
 config :vagus, :ingress_ws_handoff_timeout, 60_000
 config :vagus, :ingress_ws_send_timeout, 60_000
+
+# No Postgres on a test host: the memory server starts without its pool, so
+# a test that starts it never dials agentnet's DB. The `:db` tests pass
+# their own pool and DSN.
+config :vagus, Vagus.Memory, pool: false
