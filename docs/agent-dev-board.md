@@ -275,8 +275,11 @@ Schema v1:
 
 **Backup.** Cold: Vagus stops the app, tars PGDATA and restarts it, so the
 database is unavailable for a few seconds. A file copy of a running cluster
-would not be consistent, which is why it is not taken live. Open MCP
-connections drop and the server reconnects on the next call.
+would not be consistent, which is why it is not taken live. A memory call
+during that window can fail; the next one succeeds. A snapshot is refused past
+the 256 MiB a restore can inflate in memory, so a cluster beyond about 240 MiB
+(WAL included) needs a restore streamed to disk before it can be backed up: a
+follow-up.
 
 **Off-board copy.** Backups default to `/data/backup`, the same `/data` the
 database lives on. The memory survives container churn, reboots and Vagus

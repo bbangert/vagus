@@ -52,6 +52,14 @@ defmodule Vagus.Backup do
   # generous enough never to reject something that guard would accept.
   @max_inner_compressed @max_inner_uncompressed + 1_048_576
 
+  # An app's snapshot is refused at the size its restore can inflate
+  # (`@max_inner_uncompressed`), counted in tar bytes, so no backup is made
+  # that cannot be restored. Each entry is charged its header, a worst-case
+  # PAX header for its name, and its 512-byte padding; the trailer is at
+  # most a padding block and two zero blocks.
+  @tar_block 512
+  @tar_trailer 3 * @tar_block
+
   # Heap ceiling for the tar-reading child processes (`bounded/1`), in WORDS
   # — 32M words ≈ 256MB on a 64-bit VM, matching `@max_inner_uncompressed`
   # (the largest member any read path legitimately materialises).
@@ -346,8 +354,13 @@ defmodule Vagus.Backup do
           "state" => Map.get(addon, :state, "started")
         })
 
+      left =
+        Map.get(addon, :max_bytes, @max_inner_uncompressed) - @tar_trailer -
+          entry_cost("./addon.json", byte_size(addon_json))
+
+      if left < 0, do: throw(:too_large)
       add!(tar, addon_json, ~c"./addon.json")
-      add_dir(tar, addon.data_dir, Map.get(addon, :max_bytes, @max_outer))
+      add_dir(tar, addon.data_dir, left)
     end)
     |> case do
       {:error, {:raised, msg}} -> {:error, {:addon_tar, addon.slug, msg}}
@@ -363,12 +376,12 @@ defmodule Vagus.Backup do
   # In that window the app can rename a symlink over a name already lstat'd:
   # a file is read only through a descriptor that is still the lstat'd file,
   # and a directory swapped that way (the BEAM has no `openat`) is bounded by
-  # `max_bytes` across the walk rather than copying the host into the backup.
+  # `budget` across the walk rather than copying the host into the backup.
   # path is internal/config-derived, not request input
   # sobelow_skip ["Traversal.FileModule"]
-  defp add_dir(tar, dir, max_bytes) do
+  defp add_dir(tar, dir, budget) do
     case File.lstat(dir) do
-      {:ok, %File.Stat{type: :directory}} -> with_stand_in(&add_tree(tar, dir, [], max_bytes, &1))
+      {:ok, %File.Stat{type: :directory}} -> with_stand_in(&add_tree(tar, dir, [], budget, &1))
       {:ok, %File.Stat{}} -> :ok
       {:error, :enoent} -> :ok
       {:error, reason} -> throw({:read, ".", reason})
@@ -412,17 +425,17 @@ defmodule Vagus.Backup do
 
       case File.lstat(path) do
         {:ok, %File.Stat{type: :directory, mode: mode}} ->
+          left = charge(left, member, 0)
           add_dir_entry(tar, stand_in, member, mode)
           add_tree(tar, root, member, left, stand_in)
 
-        {:ok, %File.Stat{type: :regular, size: size}} when size > left ->
-          throw(:too_large)
-
         {:ok, %File.Stat{type: :regular} = seen} ->
+          left = charge(left, member, seen.size)
+
           case read_regular(path, seen) do
             {:ok, content} ->
               add!(tar, content, String.to_charlist("./data/" <> Path.join(member)))
-              left - seen.size
+              left
 
             :skip ->
               skipped(member, left)
@@ -443,6 +456,18 @@ defmodule Vagus.Backup do
       end
     end)
   end
+
+  defp charge(left, member, size) do
+    case left - entry_cost("./data/" <> Path.join(member), size) do
+      rest when rest < 0 -> throw(:too_large)
+      rest -> rest
+    end
+  end
+
+  defp entry_cost(name, size),
+    do: @tar_block + @tar_block + padded(byte_size(name) + 64) + padded(size)
+
+  defp padded(bytes), do: div(bytes + @tar_block - 1, @tar_block) * @tar_block
 
   defp skipped(member, left) do
     Logger.warning("Vagus.Backup: #{Path.join(member)} changed while read; not backed up")

@@ -164,18 +164,37 @@ defmodule Vagus.BackupTest do
     end
   end
 
-  test "an app's data beyond the byte cap fails the snapshot rather than filling memory", %{
-    data: data
-  } do
+  # The cap is in tar bytes, so the restore's inflation cap, the same
+  # number, always takes what the snapshot made.
+  test "a snapshot over the cap is refused, and one under it inflates within it", %{data: data} do
+    File.mkdir_p!(Path.join(data, "empty"))
+    File.mkdir_p!(Path.join(data, String.duplicate("long", 40)))
+    File.write!(Path.join([data, String.duplicate("long", 40), "f"]), String.duplicate("x", 700))
+    for i <- 1..20, do: File.write!(Path.join(data, "small#{i}"), "#{i}")
+
     addon = %{slug: "x", version: "1", data_dir: data}
-    total = byte_size(~s({"require_certificate":false})) + byte_size("nested content")
     path = Path.join(Path.dirname(data), "x.tar.gz")
+    write = &Backup.write_addon_tar(Map.put(addon, :max_bytes, &1), path)
 
-    assert :ok = Backup.write_addon_tar(Map.put(addon, :max_bytes, total), path)
+    # The smallest cap that takes it.
+    cap =
+      Stream.unfold({0, 4_000_000}, fn
+        {lo, hi} when lo >= hi ->
+          nil
 
-    assert {:error, :too_large} =
-             Backup.write_addon_tar(Map.put(addon, :max_bytes, total - 1), path)
+        {lo, hi} ->
+          mid = div(lo + hi, 2)
+          next = if write.(mid) == :ok, do: {lo, mid}, else: {mid + 1, hi}
+          {next, next}
+      end)
+      |> Enum.reduce(fn x, _ -> x end)
+      |> elem(0)
 
+    assert write.(cap) == :ok
+    {:ok, tar} = Vagus.Targz.gunzip_capped(File.read!(path), cap)
+    assert byte_size(tar) <= cap
+
+    assert write.(cap - 1) == {:error, :too_large}
     refute File.exists?(path)
   end
 

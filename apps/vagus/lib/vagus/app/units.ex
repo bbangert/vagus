@@ -151,6 +151,9 @@ defmodule Vagus.App.Units do
   # Cold, not a hot tar: a tar of a live cluster's PGDATA is not restorable,
   # and pg_dump plus `backup_exclude` would need the exclude applied, which
   # backups do not do yet. Its env is a per-slug hook (`Vagus.App.Steps`).
+  # A snapshot is refused past the 256 MiB a restore can inflate in memory,
+  # so a cluster beyond about 240 MiB (WAL included) needs a restore
+  # streamed to disk before it can be backed up.
   # The watchdog dials Postgres's port, so a hung server is restarted.
   @agent_memory %{
     "name" => "Agent memory",

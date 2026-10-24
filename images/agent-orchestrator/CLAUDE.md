@@ -127,7 +127,8 @@ connects as the `agent` superuser with no password, so treat the DB as fully wri
 every worker.
 
 Backups are cold: Vagus stops the app for a few seconds. A call during a backup can fail
-once; retry it. A backup lands in `/data/backup` on the board, so Ben must download it
+once; retry it. A cluster beyond about 240 MiB (WAL included) is refused
+as a snapshot (restore memory limit); streamed restore is a follow-up. A backup lands in `/data/backup` on the board, so Ben must download it
 (`GET /backups/<slug>/download`) for the memory to survive losing `/data` itself.
 
 ## Bluetooth
