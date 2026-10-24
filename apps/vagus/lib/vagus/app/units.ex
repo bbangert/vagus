@@ -166,6 +166,24 @@ defmodule Vagus.App.Units do
     "backup" => "cold"
   }
 
+  # Native, so it runs only where `:native_addon_slugs` allows it (the agent
+  # flavor); its image is a placeholder that is never pulled.
+  @vagus_memory %{
+    "name" => "Agent memory server",
+    "version" => "1.0.0",
+    "slug" => "vagus_memory",
+    "description" => "MCP memory tools for the board's containers, over the agent memory DB.",
+    "arch" => ["amd64", "aarch64", "armv7", "armhf", "i386"],
+    "backend" => "native",
+    "image" => "local/vagus_memory",
+    "startup" => "services",
+    "boot" => "auto",
+    "init" => false,
+    "host_network" => false,
+    "options" => %{},
+    "schema" => %{}
+  }
+
   @doc """
   A default app's config, embedded so boot needs no store reload. The mqttx
   broker's is the store's own source, under the installed slug as the
@@ -174,6 +192,7 @@ defmodule Vagus.App.Units do
   @spec builtin_config(String.t()) :: {:ok, Config.t()} | {:error, term()}
   def builtin_config("agent_orchestrator"), do: Config.parse(@agent_orchestrator)
   def builtin_config("agent_memory"), do: Config.parse(@agent_memory)
+  def builtin_config("vagus_memory"), do: Config.parse(@vagus_memory)
 
   def builtin_config("core_mqtt" = slug) do
     with {:ok, config} <- Config.parse(BuiltinFetcher.config(:mqtt)),

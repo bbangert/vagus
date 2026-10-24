@@ -553,8 +553,9 @@ defmodule Vagus.Runtime.Engine.Podman do
     do: unit(:ensure_network, run(:ensure_network, render_network(spec), opts, @lifecycle_ms))
 
   # `exists` says nothing of how a network was made: one made without
-  # `--internal` would masquerade its containers out, and one with another
-  # lease range could hand a reserved address to a dynamic container. A
+  # `--internal` would masquerade its containers out, one with another lease
+  # range could hand a reserved address to a dynamic container, and one on
+  # another interface would leave the host's gateway off its bridge. A
   # leftover that differs is remade, which podman refuses while a container
   # is attached: then it is an error, never a silently different network.
   # Only internal specs are checked, so `hassio` is never remade under its
@@ -578,14 +579,15 @@ defmodule Vagus.Runtime.Engine.Podman do
     end
   end
 
-  defp as_specified?(%{"internal" => internal, "subnets" => [subnet]}, spec) do
+  defp as_specified?(%{"internal" => internal, "subnets" => [subnet]} = network, spec) do
     range =
       case subnet["lease_range"] do
         %{"start_ip" => first, "end_ip" => last} -> "#{first}-#{last}"
         _none -> nil
       end
 
-    internal == spec.internal and subnet["subnet"] == spec.subnet and
+    internal == spec.internal and network["network_interface"] == spec.interface_name and
+      subnet["subnet"] == spec.subnet and
       subnet["gateway"] == spec.gateway and range == (spec.ip_range && ip_range(spec.ip_range))
   end
 

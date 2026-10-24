@@ -4,11 +4,12 @@ defmodule Vagus.Addon.Backend.Native do
   supervised BEAM subtree instead of a container, presented to Home Assistant
   Core as ordinary add-ons behind the same behaviour `Container` implements.
 
-  The only native add-on today is the embedded mqttx broker
-  (`Vagus.Mqtt.Broker`). Each native add-on's subtree is started as a child of
+  The native apps are the embedded mqttx broker (`Vagus.Mqtt.Broker`,
+  `core_mqtt`) and, on the agent flavor, the memory server (`Vagus.Memory`,
+  `vagus_memory`). Each native add-on's subtree is started as a child of
   the app-level `Vagus.Addon.Backend.Native.Supervisor` (`DynamicSupervisor`)
   under a **deterministic registered name** derived from the add-on id
-  (`broker_name/1`), so `state/1`, `stop/2`, and `remove/2` re-derive the handle
+  (`subtree_name/1`), so `state/1`, `stop/2`, and `remove/2` re-derive the handle
   from the id alone — no pid table to keep. A BEAM subtree has no Docker
   `die` event, so the app's process monitors the subtree's root and revives
   it when OTP supervision gives up.
@@ -35,7 +36,7 @@ defmodule Vagus.Addon.Backend.Native do
   def start(id) do
     slug = slug_from_id(id)
 
-    case DynamicSupervisor.start_child(Native.Supervisor, broker_child_spec(id, slug)) do
+    case DynamicSupervisor.start_child(Native.Supervisor, child_spec(id, slug)) do
       {:ok, _pid} -> :ok
       {:error, {:already_started, _pid}} -> :ok
       {:error, reason} -> {:error, reason}
@@ -44,7 +45,7 @@ defmodule Vagus.Addon.Backend.Native do
 
   @impl Vagus.Addon.Backend
   def stop(id, _opts \\ []) do
-    case Process.whereis(broker_name(id)) do
+    case Process.whereis(subtree_name(id)) do
       nil ->
         :ok
 
@@ -65,7 +66,7 @@ defmodule Vagus.Addon.Backend.Native do
 
   @impl Vagus.Addon.Backend
   def state(id) do
-    case Process.whereis(broker_name(id)) do
+    case Process.whereis(subtree_name(id)) do
       pid when is_pid(pid) -> {:ok, :running}
       nil -> {:ok, :stopped}
     end
@@ -83,7 +84,7 @@ defmodule Vagus.Addon.Backend.Native do
   """
   @spec stats(Vagus.Addon.Backend.id()) :: map()
   def stats(id) do
-    case Process.whereis(broker_name(id)) do
+    case Process.whereis(subtree_name(id)) do
       pid when is_pid(pid) -> %{Vagus.Runtime.Stats.zero() | memory_usage: subtree_memory(pid)}
       nil -> Vagus.Runtime.Stats.zero()
     end
@@ -117,18 +118,30 @@ defmodule Vagus.Addon.Backend.Native do
   @spec broker_name(Vagus.Addon.Backend.id()) :: atom()
   def broker_name(id), do: Module.concat(Broker, id)
 
+  @doc "The registered name of the subtree a native add-on `id` runs."
+  @spec subtree_name(Vagus.Addon.Backend.id()) :: atom()
+  def subtree_name("addon_vagus_memory" = id), do: Module.concat(Vagus.Memory, id)
+  def subtree_name(id), do: broker_name(id)
+
   @doc "The add-on slug embedded in a native id: addon_<slug> becomes <slug>."
   @spec slug_from_id(Vagus.Addon.Backend.id()) :: String.t()
   def slug_from_id("addon_" <> slug), do: slug
   def slug_from_id(id), do: id
 
-  # `restart: :temporary` bounds the blast radius: the broker's OWN supervisor
-  # (`Vagus.Mqtt.Broker`, 5/30) absorbs transient child crashes, and if IT
+  # `restart: :temporary` bounds the blast radius: the subtree's OWN supervisor
+  # (`Vagus.Mqtt.Broker` 5/30, `Vagus.Memory`) absorbs transient child crashes, and if IT
   # exhausts its budget and terminates, the shared `Native.Supervisor` neither
   # restarts it nor counts it against its own budget — so one crash-looping
   # native app can't take its siblings down with it. The app's process then
   # sees the permanent death and revives it.
-  defp broker_child_spec(id, slug) do
+  defp child_spec("addon_vagus_memory" = id, _slug) do
+    Supervisor.child_spec({Vagus.Memory, name: subtree_name(id)},
+      id: subtree_name(id),
+      restart: :temporary
+    )
+  end
+
+  defp child_spec(id, slug) do
     Supervisor.child_spec(
       {
         Broker,

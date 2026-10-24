@@ -23,15 +23,17 @@ flavor =
 config :vagus, :flavor, flavor
 
 # The agent-dev-board never runs Core. `:first_boot_provision` stays on so
-# /data still expands. The memory DB is listed before the orchestrator that
-# uses it. The Orchestrator's keyword list deep-merges, so `default_apps`
-# replaces config/target.exs's list and keeps its `boot`.
+# /data still expands. The memory DB and its native server are listed before
+# the orchestrator that uses them. The Orchestrator's keyword list
+# deep-merges, so `default_apps` replaces config/target.exs's list and keeps
+# its `boot`.
 if flavor == :agent_dev_board do
   config :vagus, core_watchdog: false, provision_core: false
   config :vagus, :orchestrator_app, "agent_orchestrator"
   config :vagus, :memory_app, "agent_memory"
-  config :vagus, :protected_apps, ["agent_orchestrator", "agent_memory"]
+  config :vagus, :protected_apps, ["agent_orchestrator", "agent_memory", "vagus_memory"]
+  config :vagus, :native_addon_slugs, ["core_mqtt", "vagus_memory"]
 
   config :vagus, Vagus.App.Orchestrator,
-    default_apps: ["core_mqtt", "agent_memory", "agent_orchestrator"]
+    default_apps: ["core_mqtt", "agent_memory", "vagus_memory", "agent_orchestrator"]
 end

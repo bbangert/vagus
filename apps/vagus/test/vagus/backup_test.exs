@@ -2,6 +2,8 @@ defmodule Vagus.BackupTest do
   @moduledoc "P6-T1: unprotected backup create/read/extract round-trip."
   use ExUnit.Case, async: true
 
+  import ExUnit.CaptureLog
+
   alias Vagus.Backup
 
   setup do
@@ -568,6 +570,27 @@ defmodule Vagus.BackupTest do
     )
 
     path
+  end
+
+  describe "directories/2" do
+    test "a directory-heavy tar past the heap bound is an error, not an OOM" do
+      root = Path.join(System.tmp_dir!(), "vagus-dirs-#{System.unique_integer([:positive])}")
+      for i <- 1..2_000, do: File.mkdir_p!(Path.join([root, "data", "d#{i}"]))
+      on_exit(fn -> File.rm_rf(root) end)
+
+      path = Path.join(root, "inner.tar")
+      {:ok, t} = :erl_tar.open(String.to_charlist(path), [:write])
+      :ok = :erl_tar.add(t, String.to_charlist(Path.join(root, "data")), ~c"./data", [])
+      :ok = :erl_tar.close(t)
+      tar = File.read!(path)
+
+      assert {:ok, dirs} = Backup.directories(tar)
+      assert length(dirs) == 2_000
+
+      capture_log(fn ->
+        assert {:error, {:tar_read_failed, _}} = Backup.directories(tar, 10_000)
+      end)
+    end
   end
 
   describe "bounded/2 deadline" do

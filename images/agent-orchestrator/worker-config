@@ -53,15 +53,14 @@ else
           projects: {"/work": {hasTrustDialogAccepted: true}}}' > "$cfg"
 fi
 
-# Applied on every run, with `=`, so a changed DSN or older configs (made before the
-# memory DB existed) are refreshed; the rest of the worker's state is left alone. The DB
-# is board-local and trust-auth, so the DSN carries no secret.
-# The default must match Vagus.Network.Agentnet.memory_ip/0.
-dsn=${VAGUS_MEMORY_DSN:-postgresql://agent@172.30.40.2/memory}
+# Applied on every run, with `=`, so older configs (stdio, or made before the memory
+# server existed) are refreshed; the rest of the worker's state is left alone. The task
+# header is how the server records provenance. Workers are host-network, so they use the
+# gateway address; it must match Vagus.Network.Agentnet's host IP.
 out=$(mktemp "$scratch/out.XXXXXX")
-jq --arg dsn "$dsn" --arg task "$task" \
-  '.mcpServers["vagus-memory"] = {command: "vagus-memory",
-     env: {VAGUS_MEMORY_DSN: $dsn, VAGUS_TASK: $task}}' "$cfg" > "$out"
+jq --arg task "$task" \
+  '.mcpServers["vagus-memory"] = {type: "http", url: "http://172.30.40.1:8890/mcp",
+     headers: {"X-Vagus-Task": $task}}' "$cfg" > "$out"
 mv -T -- "$out" "$dir/.claude.json"
 
 # User-scope memory file of this CLAUDE_CONFIG_DIR: the one place a worker reads rules

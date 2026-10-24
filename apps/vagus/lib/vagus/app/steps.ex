@@ -356,7 +356,7 @@ defmodule Vagus.App.Steps do
       |> Keyword.new()
       |> put_backend(input.config)
 
-  # A native app's address is the supervisor anchor its broker listens on.
+  # A native app's address is the supervisor anchor its subtree listens on.
   # A container's is read once here; a failed inspect leaves no DNS record
   # and no ingress target, and the app still runs.
   defp started(%Config{} = config, id, opts) do
@@ -364,7 +364,7 @@ defmodule Vagus.App.Steps do
       %{
         container_id: id,
         ip: Network.supervisor_ip(),
-        pid: Process.whereis(Native.broker_name(id))
+        pid: Process.whereis(Native.subtree_name(id))
       }
     else
       inspect_started(config, id, opts)

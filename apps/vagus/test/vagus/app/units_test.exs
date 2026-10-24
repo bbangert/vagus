@@ -239,6 +239,18 @@ defmodule Vagus.App.UnitsTest do
       refute Units.builtin_native?("agent_memory")
     end
 
+    test "the memory server is native only where the allowlist names it" do
+      assert {:ok, %{slug: "vagus_memory", backend: :native, boot: "auto", version: "1.0.0"}} =
+               Units.builtin_config("vagus_memory")
+
+      refute Units.builtin_native?("vagus_memory")
+
+      Application.put_env(:vagus, :native_addon_slugs, ["core_mqtt", "vagus_memory"])
+      on_exit(fn -> Application.delete_env(:vagus, :native_addon_slugs) end)
+
+      assert Units.builtin_native?("vagus_memory")
+    end
+
     test "the broker is native under its installed slug, and anything else has no builtin" do
       assert {:ok, %{slug: "core_mqtt", backend: :native}} = Units.builtin_config("core_mqtt")
       assert Units.builtin_native?("core_mqtt")

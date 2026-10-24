@@ -27,13 +27,17 @@ jq '.hasCompletedOnboarding //= true
 chown agent:agent "$tmp"
 mv -T -- "$tmp" "$state"
 
-# `//=` so the orchestrator's own edits to this entry survive a restart; worker-config
-# uses `=` because it owns its workers' entries. The DSN default must match
-# Vagus.Network.Agentnet.memory_ip/0.
+# The orchestrator's own edits to an HTTP entry survive a restart; only an absent entry
+# or the retired stdio shape (`command`) is replaced, else an upgraded board never
+# gets the HTTP server. worker-config owns its workers' entries and always rewrites.
+# Loopback, not the gateway: this container is host-network.
 tmp=$(mktemp "$CLAUDE_CONFIG_DIR/.claude.json.XXXXXX")
-jq --arg dsn "${VAGUS_MEMORY_DSN:-postgresql://agent@172.30.40.2/memory}" \
-  '.mcpServers["vagus-memory"] //= {command: "vagus-memory",
-     env: {VAGUS_MEMORY_DSN: $dsn, VAGUS_TASK: "orchestrator"}}' "$state" > "$tmp"
+jq 'if (.mcpServers["vagus-memory"] | type == "object")
+       and (.mcpServers["vagus-memory"] | has("command") | not)
+    then .
+    else .mcpServers["vagus-memory"] = {type: "http", url: "http://127.0.0.1:8890/mcp",
+           headers: {"X-Vagus-Task": "orchestrator"}}
+    end' "$state" > "$tmp"
 chown agent:agent "$tmp"
 mv -T -- "$tmp" "$state"
 

@@ -236,21 +236,30 @@ orchestrator, every worker, host-network apps such as ESPHome) connects as the
 bridge plus nft). This is an accepted consequence of D7 and D9. The app is
 protected like the orchestrator: stop, restart and uninstall are refused.
 
-Workers run on the host network by default and reach the DB through
-`172.30.40.1`. `agentnet` is internal (no default route, no DNS, agentnet to
-LAN dropped), so a worker started with `--network agentnet` alone has no
-Claude API access and cannot run `claude -p`; that mode is only for containers
-that need nothing but the DB. The default DSN,
-`postgresql://agent@172.30.40.2/memory`, works for every case
-(`VAGUS_MEMORY_DSN` overrides it).
+Workers run on the host network by default and reach the DB (and the memory
+server below) through `172.30.40.1`. `agentnet` is internal (no default route,
+no DNS, agentnet to LAN dropped), so a worker started with `--network agentnet`
+alone has no Claude API access and cannot run `claude -p`; that mode is only
+for containers that need nothing but the DB or the memory server.
 
-The base image ships the `vagus-memory` MCP stdio server and a `memory` CLI.
-`worker-config` registers the server in each worker's `.claude.json`
-(`mcpServers.vagus-memory`, with `VAGUS_TASK=<task>` for provenance) and
-writes the usage rule into the worker's config-dir `CLAUDE.md`; the
-orchestrator's entrypoint does the same for itself. Embeddings are computed
-inside the server with a model baked into the base image, so no text leaves
-the board and nothing is downloaded.
+**D10, one native memory server in Vagus.** The memory tools are served by an
+optional Elixir app, `vagus_memory`, in Vagus's own supervision tree (agent
+flavor only), with the pgvector container as the store. Why: no extra running
+apps, one embedder in RAM instead of one per worker, and no Python. It speaks
+MCP's Streamable HTTP transport at `http://172.30.40.1:8890/mcp` (host-network
+containers may use `http://127.0.0.1:8890/mcp`). There is no auth: the bind
+addresses (gateway and loopback) are the boundary, the same one that guards the
+DB. The server records `source_task` from the `X-Vagus-Task` header (fallback
+`?task=`). Tools: `remember(kind, scope, text, refs?)`, `recall(query, scope?,
+k?)`, `journal(task, entry)`, `device_note(device_id, text)`,
+`capture_register(path, meta)`, `forget(id, reason)`.
+
+`worker-config` registers it in each worker's `.claude.json`
+(`mcpServers.vagus-memory` as `{"type": "http", "url": ..., "headers":
+{"X-Vagus-Task": "<task>"}}`) and writes the usage rule into the worker's
+config-dir `CLAUDE.md`; the orchestrator's entrypoint does the same for itself.
+The embedding model runs inside Vagus; nothing leaves the board. The engine is
+decided separately.
 
 Schema v1:
 
@@ -269,15 +278,18 @@ database is unavailable for a few seconds. A file copy of a running cluster
 would not be consistent, which is why it is not taken live. Open MCP
 connections drop and the server reconnects on the next call.
 
+**Off-board copy.** Backups default to `/data/backup`, the same `/data` the
+database lives on. The memory survives container churn, reboots and Vagus
+restarts as is; to survive the loss of `/data` itself, download the backup off
+the board (`GET /backups/<slug>/download`).
+
 **Restore.** The memory app can be restored through the API (only the
 orchestrator cannot be): `POST /backups/<backup-slug>/restore/partial` with
 `{"addons": ["agent_memory"]}`.
 
-**Embedder.** It loads lazily at the first embed (about 0.6 s, roughly 200 MB
-RSS in the worker), so give memory-using workers headroom under `--memory`.
-
-**By hand.** From the orchestrator: `memory recall "<query>"` (`--json` for scripts), `memory status`,
-or `psql postgresql://agent@172.30.40.2/memory` for raw queries. Never store
+**By hand.** From the orchestrator: call the MCP tools, `vagus eval
+'Vagus.Memory.recall("<query>")'` over dist, or `psql
+postgresql://agent@172.30.40.2/memory` for raw queries. Never store
 credentials in it, and never drop or truncate its tables.
 
 ## Logging in

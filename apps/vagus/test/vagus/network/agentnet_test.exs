@@ -128,6 +128,7 @@ defmodule Vagus.Network.AgentnetTest do
       network = %{
         "name" => "agentnet",
         "internal" => Map.get(overrides, :internal, true),
+        "network_interface" => Map.get(overrides, :interface, "agentnet"),
         "subnets" => [subnet]
       }
 
@@ -147,9 +148,10 @@ defmodule Vagus.Network.AgentnetTest do
       refute ["network", "create"] in verbs(fake)
     end
 
-    test "a leftover not internal, or on another subnet or lease range, is remade" do
+    test "a leftover not internal, or on another subnet, lease range or interface, is remade" do
       for leftover <- [
             %{internal: false},
+            %{interface: "podman3"},
             %{subnet: %{"subnet" => "172.30.40.0/23"}},
             %{
               subnet: %{

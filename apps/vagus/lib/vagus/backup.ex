@@ -179,15 +179,21 @@ defmodule Vagus.Backup do
          {:ok, addon_json} <- fetch_member(inner, "addon.json"),
          {:ok, addon} <- Jason.decode(addon_json),
          {:ok, data} <- collect_data(inner),
-         {:ok, dirs} <- collect_dirs(tar) do
+         {:ok, dirs} <- directories(tar) do
       {:ok, %{addon: addon, data: data, dirs: dirs}}
     end
   end
 
+  @doc false
   # Memory extraction drops directory members, so they are read from the
   # table: `[{relative_path, mode}]`, guarded as `collect_data/1` is. The
-  # tar is already decompressed and capped, and extraction just parsed the
-  # same headers.
+  # cap bounds the tar's bytes, not the names and tuples a directory-heavy
+  # one makes, so the pass runs `bounded/3`. `heap_words` is for tests.
+  @spec directories(binary(), pos_integer()) ::
+          {:ok, [{String.t(), integer()}]} | {:error, term()}
+  def directories(tar, heap_words \\ @tar_read_heap_words),
+    do: bounded(fn -> collect_dirs(tar) end, @tar_read_timeout_ms, heap_words)
+
   defp collect_dirs(tar) do
     case :erl_tar.table({:binary, tar}, [:verbose]) do
       {:ok, entries} ->
@@ -650,16 +656,17 @@ defmodule Vagus.Backup do
   # process spawn, not a data copy. Public (`@doc false`) only so the timeout
   # path can be tested with a short deadline.
   @doc false
-  @spec bounded((-> result), timeout()) :: result | {:error, {:tar_read_failed, term()}}
+  @spec bounded((-> result), timeout(), pos_integer()) ::
+          result | {:error, {:tar_read_failed, term()}}
         when result: term()
-  def bounded(fun, timeout_ms \\ @tar_read_timeout_ms) do
+  def bounded(fun, timeout_ms \\ @tar_read_timeout_ms, heap_words \\ @tar_read_heap_words) do
     parent = self()
     ref = make_ref()
 
     {pid, monitor} =
       :erlang.spawn_opt(fn -> send(parent, {ref, fun.()}) end, [
         :monitor,
-        {:max_heap_size, %{size: @tar_read_heap_words, kill: true, error_logger: true}}
+        {:max_heap_size, %{size: heap_words, kill: true, error_logger: true}}
       ])
 
     receive do

@@ -30,7 +30,19 @@ Mox.stub_with(Vagus.Backend.OSMock, Vagus.Backend.OS.HostStub)
 #
 # `:pty` runs serial capture against a socat pty pair; opt-in via
 # `mix test --include pty`, skipped when socat is not on PATH.
-ExUnit.start(exclude: [:podman, :block_device, :known_failing, :pty])
+#
+# `:db` runs the memory store against the Postgres + pgvector that
+# VAGUS_MEMORY_TEST_DSN names (postgres://agent@127.0.0.1:5432/memory);
+# excluded when it is unset.
+db_excluded =
+  if System.get_env("VAGUS_MEMORY_TEST_DSN") in [nil, ""] do
+    IO.puts("Excluding :db tests: set VAGUS_MEMORY_TEST_DSN to run them")
+    [:db]
+  else
+    []
+  end
+
+ExUnit.start(exclude: [:podman, :block_device, :known_failing, :pty] ++ db_excluded)
 
 # Read by test/support/podman_docker_exec.sh, which gives each run its own
 # podman store: two suites at once would otherwise share container names.
