@@ -11,7 +11,7 @@ defmodule Vagus.Runtime.HostTest do
 
   setup do
     root = Path.join(System.tmp_dir!(), "vagus-host-#{System.unique_integer([:positive])}")
-    File.mkdir_p!(root)
+    File.mkdir_p!(Path.join(root, "dev"))
     on_exit(fn -> File.rm_rf(root) end)
     %{root: root, name: :"host_#{System.unique_integer([:positive])}"}
   end
@@ -40,6 +40,7 @@ defmodule Vagus.Runtime.HostTest do
       profile_override: Path.join(ctx.root, "podman-profile"),
       socket_dir: Path.join(ctx.root, "run/supervisor"),
       resolv_conf: Path.join(ctx.root, "resolv.conf"),
+      dev_root: Path.join(ctx.root, "dev"),
       log_dir: Path.join(ctx.root, "run/vagus/logs"),
       mountinfo: mountinfo(ctx.root, ""),
       name_servers: fn -> [{192, 168, 2, 1}] end,
@@ -90,6 +91,25 @@ defmodule Vagus.Runtime.HostTest do
     do: [profile_override: Path.join(root, "no-override")] ++ extra
 
   describe "preparation" do
+    test "the /dev links the host lacks are made, and one already there is left alone", ctx do
+      dev = Path.join(ctx.root, "dev")
+      File.write!(Path.join(dev, "stdin"), "mine")
+
+      assert Vagus.Runtime.Host.ensure_dev_links(dev) == :ok
+      assert File.read_link!(Path.join(dev, "fd")) == "/proc/self/fd"
+      assert File.read_link!(Path.join(dev, "stdout")) == "/proc/self/fd/1"
+      assert File.read_link!(Path.join(dev, "stderr")) == "/proc/self/fd/2"
+      assert File.read!(Path.join(dev, "stdin")) == "mine"
+
+      assert Vagus.Runtime.Host.ensure_dev_links(dev) == :ok
+      assert File.read_link!(Path.join(dev, "fd")) == "/proc/self/fd"
+    end
+
+    test "the host's preparation makes them", ctx do
+      start_host(ctx)
+      assert File.read_link!(Path.join([ctx.root, "dev", "fd"])) == "/proc/self/fd"
+    end
+
     test "runs its steps in order, then is ready", ctx do
       assert start_host(ctx) == :ok
       assert_receive {:step, {"mount", ["--make-rshared", "/"]}}, 5_000

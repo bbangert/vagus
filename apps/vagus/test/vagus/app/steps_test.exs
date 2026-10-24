@@ -305,6 +305,8 @@ defmodule Vagus.App.StepsTest do
                  "POSTGRES_USER" => "agent"
                }
 
+      refute Enum.any?(memory.mounts, &(&1.target == "/dev"))
+      assert memory.tmpfs == %{"/dev/shm" => ""}
       refute Map.has_key?(memory.env, "PGDATA")
       refute Map.has_key?(memory.env, "SUPERVISOR_TOKEN")
       refute Map.has_key?(memory.env, "HASSIO_TOKEN")
@@ -316,6 +318,7 @@ defmodule Vagus.App.StepsTest do
         assert other.env["SUPERVISOR_TOKEN"] == "t"
         refute Map.has_key?(other.env, "POSTGRES_HOST_AUTH_METHOD")
         refute Enum.any?(other.mounts, &(&1.target == "/var/lib/postgresql/data"))
+        assert Enum.any?(other.mounts, &(&1.target == "/dev"))
       end
 
       Application.put_env(:vagus, :memory_app, nil)

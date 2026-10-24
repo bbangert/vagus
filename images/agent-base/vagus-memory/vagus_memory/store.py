@@ -27,7 +27,9 @@ MAX_TEXT_BYTES = 64 * 1024
 MAX_LABEL_CHARS = 256
 MAX_REFS = 64
 MAX_K = 100
+REEMBED_BATCH = 64
 SCHEMA_VERSION = 1
+SCHEMA_ROW_SQL = "SELECT version, model, dims FROM schema_version ORDER BY version DESC LIMIT 1"
 # "vagusmem"; every process initialising the schema must use the same key.
 SCHEMA_LOCK_KEY = 0x76616775736D656D
 # Reciprocal rank fusion constant from Cormack et al.; damps the weight of top ranks
@@ -90,13 +92,15 @@ def _live_filter(scoped: bool) -> str:
 
 def semantic_sql(scoped: bool) -> str:
     # relaxed_order iterative scans may return rows slightly out of distance order, so
-    # the candidates are materialised and re-sorted, as pgvector's docs prescribe.
+    # the candidates are materialised and re-sorted, as pgvector's docs prescribe. The
+    # `+ 0` is pgvector's PostgreSQL 17+ workaround: without it the planner may reuse the
+    # CTE's (relaxed) ordering and drop the outer sort.
     return (
         "WITH c AS MATERIALIZED ("
         "SELECT id, embedding <=> %(qvec)s::vector AS d FROM memories"
         f" WHERE {_live_filter(scoped)} AND embedding IS NOT NULL"
         " ORDER BY d LIMIT %(pool)s"
-        ") SELECT id FROM c ORDER BY d"
+        ") SELECT id FROM c ORDER BY d + 0"
     )
 
 
@@ -157,6 +161,7 @@ class Store:
         self._conn: psycopg.Connection[dict[str, Any]] | None = None
         self.dims: int | None = None
         self.model: str | None = None
+        self._warned: tuple[str, str] | None = None
 
     def conn(self) -> psycopg.Connection[dict[str, Any]]:
         # Connect on first use, not at server start, so the MCP server still comes up
@@ -166,8 +171,10 @@ class Store:
             # ping fails on a dead session without side effects, so the real statement
             # then runs once on a fresh connection; retrying the statement itself could
             # duplicate a write whose commit outcome was lost with the connection.
+            # The ping re-reads schema_version, so a `memory reembed` run by another
+            # process takes effect here without a restart.
             try:
-                self._conn.execute("SELECT 1")
+                self._adopt(self._conn.execute(SCHEMA_ROW_SQL).fetchone())
                 return self._conn
             except psycopg.OperationalError:
                 log.warning("memory connection lost; reconnecting")
@@ -209,9 +216,7 @@ class Store:
                     applied_at timestamptz NOT NULL DEFAULT now()
                 )"""
             )
-            row = c.execute(
-                "SELECT version, model, dims FROM schema_version ORDER BY version DESC LIMIT 1"
-            ).fetchone()
+            row = c.execute(SCHEMA_ROW_SQL).fetchone()
             if row is None:
                 # The vector column needs its width up front, so the first worker to
                 # create the schema pays one embed to learn the model's dims.
@@ -223,18 +228,33 @@ class Store:
                     (SCHEMA_VERSION, self.embedder.model, dims),
                 )
                 row = {"version": SCHEMA_VERSION, "model": self.embedder.model, "dims": dims}
+        self._adopt(row)
+
+    def _adopt(self, row: dict[str, Any] | None) -> None:
+        assert row is not None
         self.dims, self.model = row["dims"], row["model"]
-        if self.model != self.embedder.model:
+        pair = (self.model, self.embedder.model)
+        if self.model != self.embedder.model and self._warned != pair:
+            self._warned = pair
             log.warning(
-                "schema was built for %s but embedder is %s; vectors from a different "
-                "model are not comparable",
+                "stored vectors are from %s but this process embeds with %s; vectors are "
+                "disabled (keyword-only recall) until `memory reembed --model %s` is run",
                 self.model,
                 self.embedder.model,
+                self.embedder.model,
             )
+
+    @property
+    def vectors_enabled(self) -> bool:
+        # Two models with equal dims would still write vectors into one index that are
+        # not comparable, so any model mismatch disables the vector side entirely.
+        return self.model == self.embedder.model
 
     def _vector(self, fn: Any, arg: Any, fallback: str) -> str | None:
         # A failed embed must not lose the write: the row is kept without a vector and
         # recall still reaches it through full-text search.
+        if not self.vectors_enabled:
+            return None
         try:
             vec = fn(arg)
         except Exception:
@@ -374,11 +394,58 @@ class Store:
             )
         return int(tomb["id"])
 
+    def reembed(self, batch: int = REEMBED_BATCH) -> int:
+        """Switch the stored vectors to this process's embedder model.
+
+        Safe to rerun: an interrupted run resumes by filling the rows still NULL.
+        """
+        c = self.conn()
+        dims = len(self.embedder.embed(["dimension probe"])[0])
+        with c.transaction():
+            c.execute("SELECT pg_advisory_xact_lock(%s)", (SCHEMA_LOCK_KEY,))
+            # Rebuilding the index can outlast the per-statement bound.
+            c.execute("SELECT set_config('statement_timeout', '10min', true)")
+            current = c.execute(SCHEMA_ROW_SQL).fetchone()
+            assert current is not None
+            if (current["model"], current["dims"]) != (self.embedder.model, dims):
+                # Clearing every vector in the same commit as the model switch means no
+                # reader ever ranks a new-model query against old-model vectors.
+                c.execute("DROP INDEX IF EXISTS memories_embedding_hnsw")
+                c.execute(
+                    f"ALTER TABLE memories ALTER COLUMN embedding TYPE vector({int(dims)})"
+                    " USING NULL"
+                )
+                c.execute(schema_ddl(dims)[1])
+                c.execute(
+                    "UPDATE schema_version SET model = %s, dims = %s WHERE version = %s",
+                    (self.embedder.model, dims, current["version"]),
+                )
+        self._adopt(c.execute(SCHEMA_ROW_SQL).fetchone())
+        done, last = 0, 0
+        while True:
+            rows = c.execute(
+                f"""SELECT id, text FROM memories
+                    WHERE {_live_filter(False)} AND embedding IS NULL AND id > %(last)s
+                    ORDER BY id LIMIT %(n)s""",
+                {"last": last, "n": batch},
+            ).fetchall()
+            if not rows:
+                return done
+            last = rows[-1]["id"]
+            vecs = self.embedder.embed([r["text"] for r in rows])
+            with c.transaction():
+                for r, v in zip(rows, vecs, strict=True):
+                    if len(v) != dims:
+                        raise RuntimeError(f"embedder returned {len(v)} dims, expected {dims}")
+                    c.execute(
+                        "UPDATE memories SET embedding = %s::vector WHERE id = %s",
+                        (vector_literal(v), r["id"]),
+                    )
+            done += len(rows)
+
     def status(self) -> dict[str, Any]:
         c = self.conn()
-        sv = c.execute(
-            "SELECT version, model, dims FROM schema_version ORDER BY version DESC LIMIT 1"
-        ).fetchone()
+        sv = c.execute(SCHEMA_ROW_SQL).fetchone()
         counts = c.execute(
             """SELECT
                  count(*) FILTER (WHERE superseded_by IS NULL AND kind <> %(t)s) AS live,
@@ -391,4 +458,9 @@ class Store:
                FROM memories""",
             {"t": TOMBSTONE},
         ).fetchone()
-        return {"schema": sv, "embedder": self.embedder.model, "counts": counts}
+        return {
+            "schema": sv,
+            "embedder": self.embedder.model,
+            "vectors_enabled": self.vectors_enabled,
+            "counts": counts,
+        }

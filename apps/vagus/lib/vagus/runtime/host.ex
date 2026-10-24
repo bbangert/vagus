@@ -117,7 +117,7 @@ defmodule Vagus.Runtime.Host do
   @doc """
   Options (all defaulted for the device): `:name`, `:podman_bin`,
   `:graphroot`, `:run_dir` (drop-in, fast spool and the spool marker),
-  `:meminfo`, `:profile_override`, `:socket_dir`, `:resolv_conf`,
+  `:meminfo`, `:profile_override`, `:socket_dir`, `:resolv_conf`, `:dev_root`,
   `:name_servers` (0-arity fun), `:run` (`fn bin, args -> {out, status}`,
   for `mount`), `:probe` (`fn opts -> :ok | {:error, reason}`),
   `:shutting_down?` (0-arity fun), `:prep_retry_ms`, `:permits`,
@@ -430,6 +430,7 @@ defmodule Vagus.Runtime.Host do
     ensure_private_dir(log_dir(state.opts))
     ensure_private_dir(out_dir_of(state.opts))
     write_resolv_conf(state.opts)
+    ensure_dev_links(Keyword.get(state.opts, :dev_root, "/dev"))
     state = state |> apply_profile() |> publish(:preparing)
     mount_logs(state.opts, @log_tmpfs_bytes[state.profile])
     state = prepare_out_dir(state)
@@ -855,6 +856,36 @@ defmodule Vagus.Runtime.Host do
       {:error, reason} ->
         Logger.error("Vagus.Runtime.Host: #{dir} not made 0700 (#{inspect(reason)})")
     end
+  end
+
+  # Apps get the host's `/dev` bound in, and the Nerves host has none of
+  # these, so bash process substitution (`<(…)`, `/dev/fd/63`) and
+  # `/dev/stdin` fail in every app. Made before any container can start;
+  # one already there, of whatever kind, is left alone.
+  @dev_links [
+    {"fd", "/proc/self/fd"},
+    {"stdin", "/proc/self/fd/0"},
+    {"stdout", "/proc/self/fd/1"},
+    {"stderr", "/proc/self/fd/2"}
+  ]
+
+  @doc false
+  # sobelow_skip ["Traversal.FileModule"]
+  @spec ensure_dev_links(Path.t()) :: :ok
+  def ensure_dev_links(dev_root) do
+    for {name, target} <- @dev_links do
+      link = Path.join(dev_root, name)
+
+      case File.ln_s(target, link) do
+        result when result in [:ok, {:error, :eexist}] ->
+          :ok
+
+        {:error, reason} ->
+          Logger.error("Vagus.Runtime.Host: #{link} not linked (#{inspect(reason)})")
+      end
+    end
+
+    :ok
   end
 
   # Only a missing file: once vintage_net has written it (search domain

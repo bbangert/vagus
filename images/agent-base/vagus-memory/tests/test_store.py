@@ -196,3 +196,62 @@ def test_k_is_clamped(store: Store, k: int, expected: int) -> None:
     for i in range(120):
         store.remember("fact", "x", f"ufshc note {i}")
     assert len(store.recall("ufshc", k=k)) == expected
+
+
+def test_model_mismatch_disables_vectors_until_reembed(dsn: str, caplog) -> None:
+    old = Store(dsn, FakeEmbedder(), task="t")
+    para = old.remember("gotcha", "q6a", "the board reboots when the fan spins up")
+    old.close()
+
+    # Same width on purpose: only the model name tells these vectors apart.
+    new_embedder = FakeEmbedder(model="fake-v2")
+    s = Store(dsn, new_embedder, task="t")
+    with caplog.at_level(logging.WARNING, logger="vagus_memory"):
+        kw = s.remember("fact", "q6a", "picocom needs the dialout group")
+        s.remember("fact", "q6a", "picocom twice")
+    assert sum("memory reembed" in r.getMessage() for r in caplog.records) == 1
+    row = s.conn().execute("SELECT embedding FROM memories WHERE id = %s", (kw,)).fetchone()
+    assert row == {"embedding": None}
+    assert ids(s.recall("picocom dialout")) == [kw]
+    assert para not in ids(s.recall("device restarts"))
+
+    assert s.reembed(batch=1) == 3
+    assert s.reembed() == 0
+    st = s.status()
+    assert st["schema"]["model"] == "fake-v2" and st["schema"]["dims"] == DIMS
+    assert st["vectors_enabled"] and st["counts"]["unembedded"] == 0
+    assert ids(s.recall("device restarts"))[0] == para
+    s.close()
+
+    # A worker still on the old model notices the switch on its next call.
+    stale = Store(dsn, FakeEmbedder(), task="t")
+    stale.conn()
+    mid = stale.remember("fact", "q6a", "written by a stale worker")
+    row = stale.conn().execute("SELECT embedding FROM memories WHERE id = %s", (mid,)).fetchone()
+    assert row == {"embedding": None}
+    stale.close()
+
+
+def test_running_worker_adopts_a_reembed(dsn: str) -> None:
+    worker = Store(dsn, FakeEmbedder(), task="w")
+    worker.remember("fact", "x", "first")
+    Store(dsn, FakeEmbedder(model="fake-v2"), task="m").reembed()
+    mid = worker.remember("fact", "x", "after the switch")
+    row = worker.conn().execute("SELECT embedding FROM memories WHERE id = %s", (mid,)).fetchone()
+    assert row == {"embedding": None}
+    worker.close()
+
+
+def test_reembed_changes_the_vector_width(dsn: str) -> None:
+    Store(dsn, FakeEmbedder(), task="t").remember("gotcha", "q6a", "the board reboots")
+    s = Store(dsn, FakeEmbedder(dims=DIMS + 8, model="fake-wide"), task="t")
+    assert s.reembed() == 1
+    assert s.status()["schema"]["dims"] == DIMS + 8
+    assert len(s.recall("device restarts")) == 1
+    q = (
+        "SELECT format_type(atttypid, atttypmod) AS t FROM pg_attribute"
+        " WHERE attrelid = 'memories'::regclass AND attname = 'embedding'"
+    )
+    typ = s.conn().execute(q).fetchone()
+    assert typ == {"t": f"vector({DIMS + 8})"}
+    s.close()

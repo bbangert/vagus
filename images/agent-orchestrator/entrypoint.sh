@@ -25,7 +25,7 @@ jq '.hasCompletedOnboarding //= true
     | .remoteDialogSeen //= true
     | .projects["/work"].hasTrustDialogAccepted //= true' "$state" > "$tmp"
 chown agent:agent "$tmp"
-mv "$tmp" "$state"
+mv -T -- "$tmp" "$state"
 
 # `//=` so the orchestrator's own edits to this entry survive a restart; worker-config
 # uses `=` because it owns its workers' entries. The DSN default must match
@@ -35,7 +35,7 @@ jq --arg dsn "${VAGUS_MEMORY_DSN:-postgresql://agent@172.30.40.2/memory}" \
   '.mcpServers["vagus-memory"] //= {command: "vagus-memory",
      env: {VAGUS_MEMORY_DSN: $dsn, VAGUS_TASK: "orchestrator"}}' "$state" > "$tmp"
 chown agent:agent "$tmp"
-mv "$tmp" "$state"
+mv -T -- "$tmp" "$state"
 
 as_agent() {
   setpriv --reuid=agent --regid=agent --init-groups \

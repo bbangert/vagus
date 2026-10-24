@@ -28,23 +28,20 @@ CONCEPTS = {
 
 
 class FakeEmbedder:
-    model = "fake-concepts"
-
-    def __init__(self, fail: bool = False, dims: int = DIMS) -> None:
+    def __init__(self, fail: bool = False, dims: int = DIMS, model: str = "fake-concepts") -> None:
         self.fail = fail
         self.dims = dims
+        self.model = model
 
     def _vec(self, text: str) -> list[float]:
         if self.fail:
             raise RuntimeError("embedder down")
-        if self.dims != DIMS:
-            return [1.0] * self.dims
-        v = [0.0] * DIMS
-        v[DIMS - 1] = 0.1  # never the zero vector, whose cosine distance is NaN
+        v = [0.0] * self.dims
+        v[self.dims - 1] = 0.1  # never the zero vector, whose cosine distance is NaN
         for w in re.findall(r"[a-z]+", text.lower()):
             i = CONCEPTS.get(w)
             if i is None:
-                i = 3 + int(hashlib.sha1(w.encode()).hexdigest(), 16) % (DIMS - 4)
+                i = 3 + int(hashlib.sha1(w.encode()).hexdigest(), 16) % (self.dims - 4)
             v[i] += 1.0
         return v
 

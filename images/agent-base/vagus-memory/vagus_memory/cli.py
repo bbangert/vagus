@@ -5,6 +5,7 @@ import json
 import logging
 import sys
 
+from .embed import FastEmbedder
 from .store import Store
 
 
@@ -27,10 +28,12 @@ def main(argv: list[str] | None = None) -> int:
     f.add_argument("id", type=int)
     f.add_argument("reason")
     sub.add_parser("status")
+    e = sub.add_parser("reembed", help="re-embed every live memory with a new model")
+    e.add_argument("--model", help="defaults to VAGUS_MEMORY_MODEL")
     a = p.parse_args(argv)
 
     logging.basicConfig(stream=sys.stderr, level=logging.WARNING)
-    store = Store()
+    store = Store(embedder=FastEmbedder(a.model)) if a.cmd == "reembed" else Store()
     try:
         if a.cmd == "recall":
             hits = store.recall(a.query, a.scope, a.k)
@@ -48,6 +51,8 @@ def main(argv: list[str] | None = None) -> int:
             print(store.journal(a.task, a.entry))
         elif a.cmd == "forget":
             print(store.forget(a.id, a.reason))
+        elif a.cmd == "reembed":
+            print(f"re-embedded {store.reembed()} memories with {store.embedder.model}")
         else:
             print(json.dumps(store.status(), indent=2, default=str))
     except LookupError as e:

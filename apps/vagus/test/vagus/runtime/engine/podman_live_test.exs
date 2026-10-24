@@ -46,6 +46,8 @@ defmodule Vagus.Runtime.Engine.PodmanLiveTest do
 
     if in_container, do: seed_store(bin, container, logs, root)
 
+    File.mkdir_p!(Path.join(root, "dev"))
+
     {:ok, pid} =
       Vagus.Runtime.Host.start_link(
         name: name,
@@ -54,6 +56,7 @@ defmodule Vagus.Runtime.Engine.PodmanLiveTest do
         run_dir: Path.join(root, "run"),
         socket_dir: Path.join(root, "supervisor"),
         resolv_conf: Path.join(root, "resolv.conf"),
+        dev_root: Path.join(root, "dev"),
         log_dir: logs,
         run: fn _bin, _args -> {"", 0} end,
         shutting_down?: fn -> false end,

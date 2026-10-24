@@ -156,6 +156,7 @@ defmodule Vagus.Test.FakePodman do
           profile_override: Path.join(root, "no-override"),
           socket_dir: Path.join(root, "supervisor"),
           resolv_conf: Path.join(root, "resolv.conf"),
+          dev_root: Path.join(root, "dev"),
           log_dir: Path.join(root, "logs"),
           mountinfo: empty_mountinfo(root),
           name_servers: fn -> [] end,
@@ -172,6 +173,7 @@ defmodule Vagus.Test.FakePodman do
         opts
       )
 
+    File.mkdir_p!(Path.join(root, "dev"))
     ExUnit.Callbacks.start_supervised!({Vagus.Runtime.Host, host_opts})
     if await?, do: await_answer(name)
     name

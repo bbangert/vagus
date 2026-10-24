@@ -34,7 +34,7 @@ defmodule Vagus.Network.AgentnetTest do
              driver: :bridge,
              subnet: "172.30.40.0/24",
              gateway: "172.30.40.1",
-             ip_range: nil,
+             ip_range: "172.30.40.128-172.30.40.254",
              interface_name: "agentnet",
              internal: true
            }
@@ -113,51 +113,80 @@ defmodule Vagus.Network.AgentnetTest do
 
     defp verbs(fake), do: Enum.map(FakePodman.verbs(fake), &Enum.take(&1, 2))
 
+    # `podman network inspect`'s shape (test/fixtures/podman/network_inspect_hassio.json).
+    defp inspect_out(overrides \\ %{}) do
+      subnet =
+        Map.merge(
+          %{
+            "subnet" => "172.30.40.0/24",
+            "gateway" => "172.30.40.1",
+            "lease_range" => %{"start_ip" => "172.30.40.128", "end_ip" => "172.30.40.254"}
+          },
+          Map.get(overrides, :subnet, %{})
+        )
+
+      network = %{
+        "name" => "agentnet",
+        "internal" => Map.get(overrides, :internal, true),
+        "subnets" => [subnet]
+      }
+
+      Jason.encode!([network]) <> "\n"
+    end
+
     test "an existing internal network is kept" do
       {fake, opts} =
         podman([
           {"network exists *", [{0, ""}]},
-          {"network inspect *", [{0, "true\n"}]}
+          {"network inspect *", [{0, inspect_out()}]}
         ])
 
       assert Agentnet.ensure(opts) == :ok
-
-      assert ["network", "inspect", "--format", "{{.Internal}}", "--", "agentnet"] in FakePodman.verbs(
-               fake
-             )
+      assert ["network", "inspect", "--", "agentnet"] in FakePodman.verbs(fake)
 
       refute ["network", "create"] in verbs(fake)
     end
 
-    test "an existing network that is not internal is remade internal" do
-      {fake, opts} =
-        podman([
-          {"network exists *", [{0, ""}]},
-          {"network inspect *", [{0, "false\n"}]},
-          {"network rm *", [{0, "agentnet\n"}]},
-          {"network create *", [{0, "agentnet\n"}]}
-        ])
+    test "a leftover not internal, or on another subnet or lease range, is remade" do
+      for leftover <- [
+            %{internal: false},
+            %{subnet: %{"subnet" => "172.30.40.0/23"}},
+            %{
+              subnet: %{
+                "lease_range" => %{"start_ip" => "172.30.40.1", "end_ip" => "172.30.40.254"}
+              }
+            },
+            %{subnet: %{"lease_range" => nil}}
+          ] do
+        {fake, opts} =
+          podman([
+            {"network exists *", [{0, ""}]},
+            {"network inspect *", [{0, inspect_out(leftover)}]},
+            {"network rm *", [{0, "agentnet\n"}]},
+            {"network create *", [{0, "agentnet\n"}]}
+          ])
 
-      assert Agentnet.ensure(opts) == :ok
-      assert ["network", "rm", "--", "agentnet"] in FakePodman.verbs(fake)
-      create = Enum.find(FakePodman.verbs(fake), &match?(["network", "create" | _], &1))
-      assert "--internal" in create
+        assert Agentnet.ensure(opts) == :ok, inspect(leftover)
+        assert ["network", "rm", "--", "agentnet"] in FakePodman.verbs(fake)
+        create = Enum.find(FakePodman.verbs(fake), &match?(["network", "create" | _], &1))
+        assert ["--internal", "--ip-range", "172.30.40.128-172.30.40.254"] -- create == []
+      end
     end
 
     test "one that cannot be remade, a container still on it, is an error" do
       {fake, opts} =
         podman([
           {"network exists *", [{0, ""}]},
-          {"network inspect *", [{0, "false\n"}]},
+          {"network inspect *", [{0, inspect_out(%{internal: false})}]},
           {"network rm *", [{2, "Error: network agentnet is being used\n"}]}
         ])
 
       log =
         capture_log(fn ->
-          assert Agentnet.ensure(opts) == {:error, {:failed, :ensure_network, :not_internal}}
+          assert Agentnet.ensure(opts) == {:error, {:failed, :ensure_network, :mismatch}}
         end)
 
-      assert log =~ "not internal"
+      assert log =~ "not as specified"
       refute ["network", "create"] in verbs(fake)
     end
 
@@ -166,7 +195,7 @@ defmodule Vagus.Network.AgentnetTest do
         podman([
           {"network exists *", [{1, ""}, {0, ""}]},
           {"network create *", [{0, "agentnet\n", hold: true}]},
-          {"network inspect *", [{0, "true\n"}]}
+          {"network inspect *", [{0, inspect_out()}]}
         ])
 
       first = Task.async(fn -> Agentnet.ensure(opts) end)

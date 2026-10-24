@@ -615,6 +615,10 @@ defmodule Vagus.App.Steps do
   # dir, so the app's cold backup copies it, and initdb finds it empty on a
   # fresh install (`ensure_mount_sources/1` makes it).
   #
+  # No host `/dev` bind: the DB uses no host device, and podman's private
+  # `/dev` has the `/dev/fd` the entrypoint's process substitution needs
+  # (its `--tmpfs /dev/shm` stays).
+  #
   # Config has no `environment` key, so the env lives here. Trust auth: the
   # only routes to the DB are the internal bridge and the host.
   defp memory_spec(spec, %Config{slug: slug}, data_root) do
@@ -642,7 +646,7 @@ defmodule Vagus.App.Steps do
               "POSTGRES_DB" => "memory",
               "POSTGRES_USER" => "agent"
             }),
-          mounts: spec.mounts ++ [pgdata]
+          mounts: Enum.reject(spec.mounts, &(&1.target == "/dev")) ++ [pgdata]
       }
     else
       spec

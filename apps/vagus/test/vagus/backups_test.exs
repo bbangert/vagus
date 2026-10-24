@@ -448,6 +448,36 @@ defmodule Vagus.BackupsTest do
       assert Enum.any?(calls, &match?({:start, _}, &1))
     end
 
+    test "empty directories come back, with their permission bits", %{
+      data_root: dr,
+      server: server
+    } do
+      slug = "core_restore_dirs"
+      install(slug, dr, :stopped)
+      dd = data_dir(dr, slug)
+      File.mkdir_p!(Path.join(dd, "pgdata/pg_replslot"))
+      File.write!(Path.join(dd, "pgdata/PG_VERSION"), "17")
+      File.chmod!(Path.join(dd, "pgdata"), 0o700)
+      File.chmod!(Path.join(dd, "pgdata/pg_replslot"), 0o750)
+
+      {:ok, backup_slug} = Backups.create_partial(nil, [slug], server: server, data_root: dr)
+      File.rm_rf!(Path.join(dd, "pgdata"))
+
+      assert :ok =
+               Backups.restore_partial(backup_slug, [slug],
+                 server: server,
+                 data_root: dr,
+                 backend: @backend
+               )
+
+      mode = &Bitwise.band(File.stat!(Path.join(dd, &1)).mode, 0o777)
+      assert File.dir?(Path.join(dd, "pgdata/pg_replslot"))
+      assert File.ls!(Path.join(dd, "pgdata/pg_replslot")) == []
+      assert mode.("pgdata") == 0o700
+      assert mode.("pgdata/pg_replslot") == 0o750
+      assert File.read!(Path.join(dd, "pgdata/PG_VERSION")) == "17"
+    end
+
     # Intended, not incidental: `protected` is a per-install security setting,
     # not add-on data, so a restore of the add-on's `/data` must not silently
     # re-grant (or revoke) device access the user set independently. Only

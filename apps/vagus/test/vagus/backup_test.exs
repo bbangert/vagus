@@ -82,6 +82,20 @@ defmodule Vagus.BackupTest do
     assert map["sub/nested.txt"] == "nested content"
   end
 
+  test "every directory is an entry with its mode, an empty one included", %{data: data} do
+    File.mkdir_p!(Path.join(data, "sub/empty"))
+    File.chmod!(Path.join(data, "sub/empty"), 0o700)
+    File.ln_s!(Path.dirname(data), Path.join(data, "linked"))
+
+    tar = create!(spec(data))
+    {:ok, %{data: files, dirs: dirs}} = Backup.extract_addon(tar, "core_mosquitto")
+
+    dirs = Map.new(dirs, fn {rel, mode} -> {rel, Bitwise.band(mode, 0o777)} end)
+    assert Map.keys(dirs) |> Enum.sort() == ["sub", "sub/empty"]
+    assert dirs["sub/empty"] == 0o700
+    assert Map.new(files)["sub/nested.txt"] == "nested content"
+  end
+
   test "symlinks the app planted are skipped, never followed to host files", %{data: data} do
     host = Path.join(Path.dirname(data), "host")
     File.mkdir_p!(host)

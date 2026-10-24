@@ -131,12 +131,14 @@ defmodule Vagus.Backup do
   end
 
   @doc """
-  Extracts one add-on from a backup: the decoded `addon.json` plus its `data/`
-  files as `[{relative_path, content}]`. Returns `{:error, :not_in_backup}` if
+  Extracts one add-on from a backup: the decoded `addon.json`, its `data/`
+  files as `[{relative_path, content}]` and its directories as
+  `[{relative_path, mode}]`. Returns `{:error, :not_in_backup}` if
   the add-on's inner tar is absent.
   """
   @spec extract_addon(binary(), String.t()) ::
-          {:ok, %{addon: term(), data: [{String.t(), binary()}]}} | {:error, term()}
+          {:ok, %{addon: term(), data: [{String.t(), binary()}], dirs: [{String.t(), integer()}]}}
+          | {:error, term()}
   def extract_addon(tar, slug) when is_binary(tar) do
     with :ok <- guard_outer_size(tar),
          {:ok, entries} <- untar_plain(tar),
@@ -155,7 +157,8 @@ defmodule Vagus.Backup do
   never the whole outer tar.
   """
   @spec extract_addon_file(Path.t(), String.t()) ::
-          {:ok, %{addon: term(), data: [{String.t(), binary()}]}} | {:error, term()}
+          {:ok, %{addon: term(), data: [{String.t(), binary()}], dirs: [{String.t(), integer()}]}}
+          | {:error, term()}
   def extract_addon_file(path, slug) do
     with {:ok, entries} <- table(path),
          {:ok, {name, size}} <- find_table_entry(entries, "#{slug}.tar.gz"),
@@ -171,11 +174,41 @@ defmodule Vagus.Backup do
   # The shared inner half of `extract_addon/2` and `extract_addon_file/2`:
   # capped gunzip, `addon.json`, zip-slip-guarded `data/` collection.
   defp decode_addon_inner(inner_gz) do
-    with {:ok, inner} <- Vagus.Targz.extract_capped(inner_gz, @max_inner_uncompressed),
+    with {:ok, tar} <- Vagus.Targz.gunzip_capped(inner_gz, @max_inner_uncompressed),
+         {:ok, inner} <- untar_plain(tar),
          {:ok, addon_json} <- fetch_member(inner, "addon.json"),
          {:ok, addon} <- Jason.decode(addon_json),
-         {:ok, data} <- collect_data(inner) do
-      {:ok, %{addon: addon, data: data}}
+         {:ok, data} <- collect_data(inner),
+         {:ok, dirs} <- collect_dirs(tar) do
+      {:ok, %{addon: addon, data: data, dirs: dirs}}
+    end
+  end
+
+  # Memory extraction drops directory members, so they are read from the
+  # table: `[{relative_path, mode}]`, guarded as `collect_data/1` is. The
+  # tar is already decompressed and capped, and extraction just parsed the
+  # same headers.
+  defp collect_dirs(tar) do
+    case :erl_tar.table({:binary, tar}, [:verbose]) do
+      {:ok, entries} ->
+        entries
+        |> Enum.filter(&match?({_name, :directory, _, _, _, _, _}, &1))
+        |> Enum.reduce_while({:ok, []}, fn {name, _, _, _, mode, _, _}, {:ok, acc} ->
+          rel = name |> to_string() |> strip_dot() |> String.trim_trailing("/")
+
+          cond do
+            not String.starts_with?(rel, "data/") -> {:cont, {:ok, acc}}
+            unsafe_path?(rel) -> {:halt, {:error, {:unsafe_path, rel}}}
+            true -> {:cont, {:ok, [{String.replace_prefix(rel, "data/", ""), mode} | acc]}}
+          end
+        end)
+        |> case do
+          {:ok, dirs} -> {:ok, Enum.reverse(dirs)}
+          error -> error
+        end
+
+      {:error, reason} ->
+        {:error, {:untar, reason}}
     end
   end
 
@@ -329,15 +362,40 @@ defmodule Vagus.Backup do
   # sobelow_skip ["Traversal.FileModule"]
   defp add_dir(tar, dir, max_bytes) do
     case File.lstat(dir) do
-      {:ok, %File.Stat{type: :directory}} -> add_tree(tar, dir, [], max_bytes)
+      {:ok, %File.Stat{type: :directory}} -> with_stand_in(&add_tree(tar, dir, [], max_bytes, &1))
       {:ok, %File.Stat{}} -> :ok
       {:error, :enoent} -> :ok
       {:error, reason} -> throw({:read, ".", reason})
     end
   end
 
+  # erl_tar writes a directory's own header only when handed an empty one,
+  # and recurses into any other without the walk's guards. Every directory
+  # is therefore entered through this stand-in, always empty and chmod'ed to
+  # the directory's mode first, so a restore recreates the empty ones (a
+  # Postgres cluster will not start without its `pg_*` dirs) with their mode.
   # sobelow_skip ["Traversal.FileModule"]
-  defp add_tree(tar, root, rel, left) do
+  defp with_stand_in(fun) do
+    stand_in =
+      Path.join(System.tmp_dir!(), "vagus-backup-dir-#{System.unique_integer([:positive])}")
+
+    File.mkdir_p!(stand_in)
+
+    try do
+      fun.(stand_in)
+    after
+      File.rm_rf(stand_in)
+    end
+  end
+
+  # sobelow_skip ["Traversal.FileModule"]
+  defp add_dir_entry(tar, stand_in, member, mode) do
+    File.chmod!(stand_in, Bitwise.band(mode, 0o7777))
+    add!(tar, String.to_charlist(stand_in), String.to_charlist("./data/" <> Path.join(member)))
+  end
+
+  # sobelow_skip ["Traversal.FileModule"]
+  defp add_tree(tar, root, rel, left, stand_in) do
     [root | rel]
     |> Path.join()
     |> File.ls!()
@@ -347,8 +405,9 @@ defmodule Vagus.Backup do
       path = Path.join([root | member])
 
       case File.lstat(path) do
-        {:ok, %File.Stat{type: :directory}} ->
-          add_tree(tar, root, member, left)
+        {:ok, %File.Stat{type: :directory, mode: mode}} ->
+          add_dir_entry(tar, stand_in, member, mode)
+          add_tree(tar, root, member, left, stand_in)
 
         {:ok, %File.Stat{type: :regular, size: size}} when size > left ->
           throw(:too_large)

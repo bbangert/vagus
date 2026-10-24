@@ -552,33 +552,57 @@ defmodule Vagus.Runtime.Engine.Podman do
   defp create_network(spec, opts),
     do: unit(:ensure_network, run(:ensure_network, render_network(spec), opts, @lifecycle_ms))
 
-  # `exists` says nothing of how a network was made, and one made without
-  # `--internal` would masquerade its containers out. It is remade, which
-  # podman refuses while a container is attached: then it is an error,
-  # never a silently routed network.
+  # `exists` says nothing of how a network was made: one made without
+  # `--internal` would masquerade its containers out, and one with another
+  # lease range could hand a reserved address to a dynamic container. A
+  # leftover that differs is remade, which podman refuses while a container
+  # is attached: then it is an error, never a silently different network.
+  # Only internal specs are checked, so `hassio` is never remade under its
+  # apps.
   defp ensure_internal(%NetworkSpec{name: name} = spec, opts) do
-    argv = ["network", "inspect", "--format", "{{.Internal}}", "--", name]
-
-    case run(:ensure_network, argv, opts, @query_ms) do
+    case run(:ensure_network, ["network", "inspect", "--", name], opts, @query_ms) do
       {:ok, out} ->
-        if String.trim(out) == "true", do: :ok, else: recreate_internal(spec, opts)
+        case decode(:ensure_network, out) do
+          {:ok, [network]} ->
+            if as_specified?(network, spec), do: :ok, else: recreate(spec, opts)
+
+          {:ok, _other} ->
+            {:error, {:failed, :ensure_network, :bad_json}}
+
+          error ->
+            error
+        end
 
       other ->
         unit(:ensure_network, other)
     end
   end
 
-  defp recreate_internal(%NetworkSpec{name: name} = spec, opts) do
+  defp as_specified?(%{"internal" => internal, "subnets" => [subnet]}, spec) do
+    range =
+      case subnet["lease_range"] do
+        %{"start_ip" => first, "end_ip" => last} -> "#{first}-#{last}"
+        _none -> nil
+      end
+
+    internal == spec.internal and subnet["subnet"] == spec.subnet and
+      subnet["gateway"] == spec.gateway and range == (spec.ip_range && ip_range(spec.ip_range))
+  end
+
+  defp as_specified?(_network, _spec), do: false
+
+  defp recreate(%NetworkSpec{name: name} = spec, opts) do
     case run(:ensure_network, ["network", "rm", "--", name], opts, @lifecycle_ms) do
       {:ok, _} ->
         create_network(spec, opts)
 
       other ->
         Logger.warning(
-          "Engine.Podman: network #{name} is not internal and cannot be remade: #{inspect(other)}"
+          "Engine.Podman: network #{name} is not as specified and cannot be remade: " <>
+            inspect(other)
         )
 
-        {:error, {:failed, :ensure_network, :not_internal}}
+        {:error, {:failed, :ensure_network, :mismatch}}
     end
   end
 

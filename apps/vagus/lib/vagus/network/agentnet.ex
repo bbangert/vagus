@@ -35,8 +35,10 @@ defmodule Vagus.Network.Agentnet do
   @spec memory_ip() :: String.t()
   def memory_ip, do: @memory_ip
 
-  # No ip_range: the only container with an address of its own asks for it
-  # (`--ip`); workers take any free one.
+  # Dynamic leases stay in the top half, so a worker can never take the
+  # DB's `.2` while the DB is down (a cold backup removes its container). A
+  # start-end, not `.128/25`: rendered as a CIDR range it would end on the
+  # /24's broadcast address.
   @spec spec() :: NetworkSpec.t()
   def spec do
     %NetworkSpec{
@@ -44,6 +46,7 @@ defmodule Vagus.Network.Agentnet do
       driver: :bridge,
       subnet: @subnet,
       gateway: @gateway,
+      ip_range: "172.30.40.128-172.30.40.254",
       interface_name: @name,
       internal: true
     }

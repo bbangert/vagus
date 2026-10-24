@@ -39,7 +39,8 @@ install -m 0600 "$creds" "$dir/.credentials.json"
 # $dir is the one place the worker can write, so it can swap a path for a symlink after
 # any check above. Everything is therefore read from a private copy made with `cp -P`
 # (never follows) and written to a scratch file beside $dir, then renamed over the target:
-# a rename replaces a symlink instead of following it.
+# a rename replaces a symlink instead of following it (`mv -T`: a directory symlink at the
+# target must not swallow the file).
 scratch=$(mktemp -d "$root/.wc.XXXXXX")
 trap 'rm -rf "$scratch"' EXIT
 cfg=$scratch/in.json
@@ -61,7 +62,7 @@ out=$(mktemp "$scratch/out.XXXXXX")
 jq --arg dsn "$dsn" --arg task "$task" \
   '.mcpServers["vagus-memory"] = {command: "vagus-memory",
      env: {VAGUS_MEMORY_DSN: $dsn, VAGUS_TASK: $task}}' "$cfg" > "$out"
-mv "$out" "$dir/.claude.json"
+mv -T -- "$out" "$dir/.claude.json"
 
 # User-scope memory file of this CLAUDE_CONFIG_DIR: the one place a worker reads rules
 # from that its writable /work cannot shadow. Rewritten each run so the rule stays current.
@@ -76,7 +77,7 @@ The `vagus-memory` MCP server is this board's shared, persistent memory.
 - Before you report, `remember` what you learned that the next task would need.
 - Never store secrets in memory: no passwords, tokens, keys or cookies.
 RULES
-mv "$out" "$dir/CLAUDE.md"
+mv -T -- "$out" "$dir/CLAUDE.md"
 
 # Ownership matters only when run as root (`podman exec` without `--user agent`).
 if [ "$(id -u)" = 0 ]; then

@@ -341,7 +341,7 @@ defmodule Vagus.Runtime.Engine.PodmanRenderTest do
     assert ["--log-opt", "path=/x/n.log", "--log-opt", "max-size=8388608"] -- argv == []
   end
 
-  test "the agentnet network is internal and has no ip range" do
+  test "the agentnet network is internal, its leases in the top half" do
     assert Podman.render_network(Vagus.Network.Agentnet.spec()) == [
              "network",
              "create",
@@ -352,6 +352,8 @@ defmodule Vagus.Runtime.Engine.PodmanRenderTest do
              "172.30.40.0/24",
              "--gateway",
              "172.30.40.1",
+             "--ip-range",
+             "172.30.40.128-172.30.40.254",
              "--interface-name",
              "agentnet",
              "--internal",

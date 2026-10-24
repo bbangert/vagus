@@ -82,7 +82,7 @@ def test_candidate_pool_floor_and_ceiling() -> None:
 
 
 def test_semantic_sql_resorts_relaxed_candidates() -> None:
-    assert semantic_sql(False).endswith("SELECT id FROM c ORDER BY d")
+    assert semantic_sql(False).endswith("SELECT id FROM c ORDER BY d + 0")
 
 
 def test_embed_module_does_not_import_fastembed() -> None:
