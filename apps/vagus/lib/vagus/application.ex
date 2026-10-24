@@ -99,6 +99,10 @@ defmodule Vagus.Application do
       ] ++
         runtime_host_children() ++
         [
+          # Before the app tree: the orchestrator's `patches` gate calls it.
+          # `:ignore` off the agent-dev-board flavor.
+          Vagus.Patches,
+
           # One process per installed app, each holding every fact about its
           # app, brought up from the apps' files before anything that reads
           # apps: DNS, the events stream, ingress and the API all ask it.

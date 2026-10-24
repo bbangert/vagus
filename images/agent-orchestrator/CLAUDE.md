@@ -136,7 +136,26 @@ They survive a Vagus restart but not a reboot: re-apply them at the start of a t
   `/dev/bus/usb`. GPIO relays: Python `gpiod` or `Circuits.GPIO` with
   `--device /dev/gpiochipN`; record the header pin names in the task notes.
 
+## Hot patches
+You may replace whole modules in the running Vagus node. Patches live in
+`/data/vagus/patches/<name>/` on the board: `NOTES.md`, full-module `*.ex` files, and an
+`enabled` marker (present = loaded at boot by `Vagus.Patches`).
+
+1. The release has no sources. Get the running commit: `vagus eval 'Nerves.Runtime.KV.get_active("nerves_fw_vcs_identifier")'`; fetch the module at that commit from `bbangert/vagus` (public GitHub) in your container.
+2. Edit the WHOLE module, not a fragment.
+3. Write `NOTES.md` first: why, modules, the commit, and your session as author.
+4. Write `<Module>.ex` into the patch dir, then `vagus eval 'Vagus.Patches.load("<name>")'` and test.
+5. Only then `Vagus.Patches.enable("<name>")`, and prove it through a reboot (ask Ben).
+6. `list/0`, `disable/1`, `unload/1` undo it. If `/data/vagus/patches/.skipped` exists, the LAST patch-loading boot was not marked good and ALL patches were skipped once: `list/0`, fix or `disable/1` the culprit, reboot. The file goes away when a later patch-loading boot is marked good. A boot is marked good once the plan completed and a minute passed; a VM death, heart or watchdog reset, power cut, a halted boot, or a reboot inside that window trips it (a clean reboot inside it is a safe false alarm: skipped once, then loaded again).
+   - A patch that kills the VM only AFTER that window loops forever. Over ssh: `Vagus.Patches.disable("<name>")` or remove `/data/vagus/patches/<name>/enabled`, then reboot.
+   - A slow compile at boot does not block it: the gate retries for 5 minutes, then the boot carries on and the patch finishes in the background. `Vagus.Patches.status()` shows `running?`.
+   - `in_use` modules still run old code; it is soft-purged later and nothing is killed.
+7. An OTA drops hot-loaded code. Re-check NOTES.md's commit against the new one, re-fetch, re-diff, re-apply.
+8. Patches are not PRs. If one is worth keeping, tell Ben.
+
 ## Never
+- Load a patch without a `NOTES.md` beside it.
+- Leave a patch enabled that you have not tested through a reboot.
 - `:init.stop`, `System.halt`, `:net_kernel.stop` on the board node.
 - `Nerves.Runtime.reboot()` unless Ben asks for a reboot.
 - `VintageNet.configure` or `Lab.up` on `eth0` or `wlan0`: that is how the board stays reachable.

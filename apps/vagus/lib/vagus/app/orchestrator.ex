@@ -108,8 +108,11 @@ defmodule Vagus.App.Orchestrator do
           gate: :api,
           install: :container
         ] ++ @stages
+  # After :tree so Vagus is up, before :native so patched modules are in place
+  # before any app starts.
   @agent_plan [
                 gate: :tree,
+                gate: :patches,
                 stage: :native,
                 gate: :engine,
                 gate: :network,
@@ -164,6 +167,19 @@ defmodule Vagus.App.Orchestrator do
   @spec up(String.t(), GenServer.server()) :: :ok
   def up(slug, server \\ __MODULE__), do: GenServer.cast(server, {:up, slug})
 
+  @doc """
+  Whether a boot sequence has run to its end in this incarnation;
+  `Vagus.Patches` waits on it before it calls patches good. A halted or
+  cancelled boot does not count.
+  """
+  @spec complete?(GenServer.server()) :: boolean()
+  def complete?(server \\ __MODULE__) do
+    # Cheap read for a poller: a stalled orchestrator must not stall Patches.
+    GenServer.call(server, :complete?, 1_000)
+  catch
+    :exit, _reason -> false
+  end
+
   @impl GenServer
   def init(opts) do
     # A crash of the linked boot task arrives as a message, so it can stop
@@ -185,7 +201,16 @@ defmodule Vagus.App.Orchestrator do
     ensure = Map.get(cfg.units, :ensure, &Units.ensure/1)
     Enum.each(Map.get(cfg.units, :slugs, &Vagus.App.slugs/0).(), ensure)
 
-    state = %{phase: :up, task: nil, waiters: [], resume: false, deadline: :infinity, cfg: cfg}
+    state = %{
+      phase: :up,
+      task: nil,
+      waiters: [],
+      resume: false,
+      deadline: :infinity,
+      complete: false,
+      cfg: cfg
+    }
+
     {:ok, state, {:continue, :boot}}
   end
 
@@ -204,6 +229,8 @@ defmodule Vagus.App.Orchestrator do
   end
 
   @impl GenServer
+  def handle_call(:complete?, _from, state), do: {:reply, state.complete, state}
+
   def handle_call({:shutdown, _budget}, from, %{phase: phase, task: %Task{}} = state)
       when phase in [:stopping, :cancelling],
       do: {:noreply, %{state | waiters: [from | state.waiters]}}
@@ -263,6 +290,11 @@ defmodule Vagus.App.Orchestrator do
     state = %{state | waiters: []}
     if state.resume, do: {:noreply, boot(%{state | resume: false})}, else: {:noreply, state}
   end
+
+  defp finish(result, %{phase: :booting} = state),
+    do:
+      {:noreply,
+       %{state | phase: :up, complete: state.complete or result not in [:cancelled, :halted]}}
 
   defp finish(_result, state), do: {:noreply, %{state | phase: :up}}
 

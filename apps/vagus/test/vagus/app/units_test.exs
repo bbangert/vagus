@@ -53,6 +53,7 @@ defmodule Vagus.App.UnitsTest do
              :dist,
              :engine,
              :network,
+             :patches,
              :primary,
              :tree
            ]
@@ -261,6 +262,90 @@ defmodule Vagus.App.UnitsTest do
 
       assert Units.install_default("agent_orchestrator") == :present
       assert {:ok, %{boot: "auto", watchdog: true}} = app_info("agent_orchestrator")
+    end
+  end
+
+  describe "the patches gate" do
+    setup do
+      n = System.unique_integer([:positive])
+      root = Path.join(System.tmp_dir!(), "units_patches_#{n}")
+      # unique_integer repeats across VMs, and a VM killed mid-run leaves its roots.
+      File.rm_rf!(root)
+
+      on_exit(fn ->
+        :persistent_term.erase({Vagus.Patches, :boot_done, root})
+        File.rm_rf(root)
+      end)
+
+      %{root: root, server: :"units_patches_#{n}", n: n}
+    end
+
+    defp patch(root, name, source) do
+      dir = Path.join(root, name)
+      File.mkdir_p!(dir)
+      File.write!(Path.join(dir, "NOTES.md"), "")
+      File.write!(Path.join(dir, "x.ex"), source)
+      File.touch!(Path.join(dir, "enabled"))
+    end
+
+    defp start_patches(root, server),
+      do: start_supervised!({Vagus.Patches, name: server, enabled: true, root: root})
+
+    defp gate_until_ok(server, tries \\ 400) do
+      case Gates.patches(server: server) do
+        :ok -> :ok
+        _loading when tries > 0 -> Process.sleep(5) && gate_until_ok(server, tries - 1)
+        other -> flunk("gate never passed: #{inspect(other)}")
+      end
+    end
+
+    test "passes at once with nothing enabled", %{root: root, server: server} do
+      start_patches(root, server)
+      assert Gates.patches(server: server) == :ok
+      assert %{"good" => true} = root |> Path.join(".boot") |> File.read!() |> Jason.decode!()
+    end
+
+    test "answers loading until the load is done", %{root: root, server: server, n: n} do
+      test_pid = ~c"#{:erlang.pid_to_list(self())}"
+
+      # The module body runs at compile time: it holds the load open.
+      patch(root, "slow", """
+      defmodule Vagus.UnitsPatch.Slow#{n} do
+        send(:erlang.list_to_pid(#{inspect(test_pid)}), {:compiling, self()})
+        receive do: (:go -> :ok)
+      end
+      """)
+
+      start_patches(root, server)
+      assert Gates.patches(server: server) == {:error, :loading}
+      assert_receive {:compiling, compiler}, 1_000
+      assert Gates.patches(server: server) == {:error, :loading}
+      assert Vagus.Patches.boot_status(server: server) == :running
+
+      send(compiler, :go)
+      gate_until_ok(server)
+      assert Vagus.Patches.boot_status(server: server) == {:done, %{"slow" => :ok}}
+    end
+
+    test "passes when patches failed, which are their own results", %{root: root, server: server} do
+      patch(root, "broken", "defmodule")
+      start_patches(root, server)
+
+      gate_until_ok(server)
+      assert {:done, %{"broken" => {:error, _}}} = Vagus.Patches.boot_status(server: server)
+    end
+
+    test "passes when the breaker skipped the patches", %{root: root, server: server} do
+      patch(root, "p", "defmodule")
+      File.write!(Path.join(root, ".boot"), Jason.encode!(%{"good" => false, "patches" => ["p"]}))
+      start_patches(root, server)
+
+      assert Gates.patches(server: server) == :ok
+      assert {:skipped, _reason} = Vagus.Patches.boot_status(server: server)
+    end
+
+    test "retries a server that is not running", %{server: server} do
+      assert Gates.patches(server: server) == {:error, :not_running}
     end
   end
 

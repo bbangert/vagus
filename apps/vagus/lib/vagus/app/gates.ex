@@ -14,6 +14,7 @@ defmodule Vagus.App.Gates do
   def all,
     do: %{
       tree: &tree/0,
+      patches: &patches/0,
       engine: &engine/0,
       network: &network/0,
       dist: &dist/0,
@@ -31,6 +32,27 @@ defmodule Vagus.App.Gates do
     if List.keymember?(Application.started_applications(), :vagus, 0),
       do: :ok,
       else: {:error, :starting}
+  end
+
+  # After `:tree` so `Vagus` is started, and before `stage: :native` so
+  # patched modules are in place before any app runs; in the agent plan only,
+  # since the stock appliance never hot-patches. A failed patch is that
+  # patch's result, never the boot's. Not a required gate: a stuck load is
+  # logged and the boot carries on.
+  @spec patches(keyword()) :: :ok | {:error, term()}
+  def patches(opts \\ []) do
+    # Both calls fit the orchestrator's 10 s gate bound, so its kill never
+    # lands mid-call.
+    opts = Keyword.put_new(opts, :timeout, 4_000)
+
+    with {:ok, _started_or_skipped} <- Vagus.Patches.boot_load(opts) do
+      case Vagus.Patches.boot_status(opts) do
+        {:done, _results} -> :ok
+        {:skipped, _reason} -> :ok
+        {:error, reason} -> {:error, reason}
+        _running -> {:error, :loading}
+      end
+    end
   end
 
   @doc """

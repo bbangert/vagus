@@ -54,8 +54,8 @@ are never at risk. Anything it breaks on the running system is fixed by a
 reboot, a revert to the other slot, or a fresh OTA.
 
 **D8, hot patches.** The agent may hot-load changed modules into the running
-Vagus node. Patches will be kept under `/data`, each with a note, and loaded
-at boot. Vagus's loader for them arrives in a later phase.
+Vagus node. Patches are kept under `/data`, each with a note, and loaded at
+boot by `Vagus.Patches` (see [Hot patches](#hot-patches)).
 
 ## The node file
 
@@ -83,6 +83,65 @@ Bluetooth stop and start, `VintageNet.configure/3` for a target NIC, and the
 board's logs. It also has the never-do list: don't stop the node, don't
 reconfigure `eth0` or `wlan0`, don't touch `addon_*` containers or podman's
 store, and don't copy the cookie anywhere.
+
+## Hot patches
+
+The agent may replace whole modules in the running Vagus node (D8). A patch is
+a directory `/data/vagus/patches/<name>/` holding `NOTES.md` (required: why,
+the modules, the source commit, the author session), one or more `*.ex` files
+with FULL module sources, and an `enabled` marker (present = load at boot).
+
+The release has no `.ex` sources on the board. Fetch the source for the
+running commit from the public `bbangert/vagus` repo, inside the container.
+Read the commit with
+`vagus eval 'Nerves.Runtime.KV.get_active("nerves_fw_vcs_identifier")'`.
+
+1. Fetch the module's source at that commit.
+2. Edit the whole module.
+3. Write `NOTES.md` first.
+4. Write `<Module>.ex` under `/data/vagus/patches/<name>/`.
+5. `vagus eval 'Vagus.Patches.load("<name>")'` compiles every `*.ex` and
+   hot-loads the modules: `{:ok, modules} | {:error, reason}`. Any module is
+   allowed; the load is logged.
+6. Test it on the running node.
+7. `vagus eval 'Vagus.Patches.enable("<name>")'`.
+
+Also: `list/0` returns `[%{name, enabled?, modules, loaded?, last_result}]`,
+`disable/1` removes the marker, and `unload/1` restores the module from the
+release's own `.beam` when there is one, else purges it.
+
+**Boot.** A `:patches` gate right after the tree gate loads every enabled
+patch before apps start and records them in `/data/vagus/patches/.boot`. A
+boot is marked good in `.boot` once the boot plan has completed and a minute
+has passed, or at a clean shutdown after that point. A boot that never gets
+there makes the next boot skip ALL patches once, log loudly and write
+`/data/vagus/patches/.skipped`. The file means the LAST patch-loading boot
+was not marked good; it is removed once a later patch-loading boot is marked
+good.
+
+What trips the breaker: a VM death, a heart or watchdog reset, a power cut,
+or a reboot before the plan completed plus one minute. A clean reboot inside
+that window is a safe false alarm: patches are skipped once, then load
+again. A halted boot (a gate failed fatally) is never marked good, so
+patches are skipped once after it. Recover with `list/0`, fix the patch or
+`disable/1` it, then reboot.
+
+A patch that kills the VM only AFTER that window loops forever. Recover over
+ssh: `Vagus.Patches.disable("<name>")` or remove
+`/data/vagus/patches/<name>/enabled`, then reboot.
+
+A slow or hanging compile at boot does not block the boot: the gate retries
+for 5 minutes, then the boot carries on and the patch finishes loading in the
+background. `Vagus.Patches.status()` shows `running?`. Modules still running
+old code after a load are reported `in_use` and soft-purged later; nothing is
+killed.
+
+**OTA.** Hot-loaded code is lost by an OTA. The patch dir survives, but the
+patch was written against the old commit: compare the commit in `NOTES.md`
+with the new one, re-fetch the source, re-diff and re-apply.
+
+**Not a PR.** Patches are a per-board record. If one is worth keeping,
+tell Ben.
 
 ## Lab services
 
@@ -229,8 +288,9 @@ container through its own units, not through these calls.
 
 The updater only installs the `-agent` asset on this flavor and the stock one
 on stock, so an OTA never switches flavors. An OTA restarts the node, which
-drops any hot-loaded code until a boot-time loader exists (D8). `/data` is
-kept, along with the login and the task dirs. The node file and the cookie
+drops any hot-loaded code; enabled patches reload at boot but need re-checking
+against the new commit ([Hot patches](#hot-patches)). `/data` is kept, along
+with the login and the task dirs. The node file and the cookie
 are new after every boot.
 
 ## Security

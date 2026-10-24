@@ -40,7 +40,8 @@ defmodule Vagus.App.OrchestratorTest do
         core_start: fn _deadline -> send(test_pid, :core_start) && :ok end,
         core_stop: fn _deadline -> send(test_pid, :core_stop) && :ok end,
         stop_containers: fn _slugs, _budget -> {:ok, [], []} end,
-        gates: Map.new([:tree, :engine, :network, :dist, :api], &{&1, gate(test_pid, &1)}),
+        gates:
+          Map.new([:tree, :patches, :engine, :network, :dist, :api], &{&1, gate(test_pid, &1)}),
         report: fn stage, outcomes -> send(test_pid, {:report, stage, outcomes}) end,
         push_complete: fn -> send(test_pid, :complete) end
       },
@@ -816,6 +817,42 @@ defmodule Vagus.App.OrchestratorTest do
     end
   end
 
+  describe "complete?/0" do
+    test "is false while the boot runs, true once the default plan completes" do
+      test_pid = self()
+
+      gates =
+        Map.new([:network, :engine, :api], &{&1, gate(test_pid, &1)})
+        |> Map.put(:tree, held(test_pid, :tree))
+
+      name = start_orchestrator([], %{gates: gates})
+      assert_receive {:tree, tree}, 5_000
+      refute Orchestrator.complete?(name)
+
+      send(tree, :release)
+      assert_receive :complete, 5_000
+      await_boot(name)
+      assert Orchestrator.complete?(name)
+    end
+
+    test "is false after a cancelled boot" do
+      test_pid = self()
+      engine = fn -> send(test_pid, {:gate, :engine}) && {:error, :down} end
+
+      gates =
+        Map.new([:tree, :network, :api], &{&1, gate(test_pid, &1)}) |> Map.put(:engine, engine)
+
+      name = start_orchestrator([], %{gates: gates}, gate_interval: 60_000, gate_tries: 2)
+      assert_receive {:gate, :engine}, 5_000
+      Orchestrator.shutdown(name)
+      refute Orchestrator.complete?(name)
+    end
+
+    test "is false, not a raise, when the server is dead" do
+      refute Orchestrator.complete?(:no_such_orchestrator)
+    end
+  end
+
   describe "agent-dev-board flavor" do
     test "skips the Core stage, logged, and the later stages still run" do
       apps = [app("svc", "services"), app("app", "application")]
@@ -826,6 +863,7 @@ defmodule Vagus.App.OrchestratorTest do
 
           assert collect_until(:complete) == [
                    {:gate, :tree},
+                   {:gate, :patches},
                    {:report, :native, []},
                    {:gate, :engine},
                    {:gate, :network},
@@ -841,22 +879,44 @@ defmodule Vagus.App.OrchestratorTest do
                  ]
 
           assert %{phase: :up, task: nil} = await_boot(name)
+          assert Orchestrator.complete?(name)
         end)
 
       assert log =~ "Boot: Core stage skipped (agent-dev-board flavor)"
       refute_received :core_start
     end
 
-    test "the default flavor runs no dist gate" do
+    test "a patches gate that never finishes is carried past, and the order holds" do
+      test_pid = self()
+      patches = fn -> send(test_pid, {:gate, :patches}) && {:error, :loading} end
+
+      gates =
+        Map.new([:tree, :engine, :network, :dist, :api], &{&1, gate(test_pid, &1)})
+        |> Map.put(:patches, patches)
+
+      name = start_orchestrator([], %{agent?: fn -> true end, gates: gates})
+      messages = collect_until(:complete)
+
+      assert Enum.count(messages, &(&1 == {:gate, :patches})) == 3
+
+      assert [:tree, :patches, :engine, :network, :dist, :api] =
+               for({:gate, g} <- messages, uniq: true, do: g)
+
+      await_boot(name)
+      assert Orchestrator.complete?(name)
+    end
+
+    test "the default flavor runs no dist or patches gate" do
       start_orchestrator([])
       messages = collect_until(:complete)
       assert {:gate, :api} in messages
       refute {:gate, :dist} in messages
+      refute {:gate, :patches} in messages
     end
 
     defp dist_gates(test_pid, dist),
       do:
-        Map.new([:tree, :engine, :network, :api], &{&1, gate(test_pid, &1)})
+        Map.new([:tree, :patches, :engine, :network, :api], &{&1, gate(test_pid, &1)})
         |> Map.put(:dist, dist)
 
     test "a dist claim still starting is retried, and api waits for it" do
@@ -892,6 +952,7 @@ defmodule Vagus.App.OrchestratorTest do
             })
 
           assert %{phase: :up, task: nil} = await_boot(name)
+          refute Orchestrator.complete?(name)
         end)
 
       messages = drain()
