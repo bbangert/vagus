@@ -275,7 +275,7 @@ defmodule Vagus.Network.Nat do
        \t}
        \tchain forward {
        \t\ttype filter hook forward priority #{@forward_priority}; policy accept;
-       #{lab_forward(lab)}\t\tiifname != "#{bridge}" oifname != "#{bridge}" drop
+       #{lab_forward(lab)}#{agentnet_forward(opts)}\t\tiifname != "#{bridge}" oifname != "#{bridge}" drop
        \t\toifname "#{bridge}" iifname != "#{bridge}" ct state new ct status & dnat == 0 drop
        \t}
        \tchain prerouting_filter {
@@ -301,6 +301,22 @@ defmodule Vagus.Network.Nat do
       ~s(\t\tiifname "#{lab_if}" oifname "#{primary}" accept\n) <>
         ~s(\t\tiifname "#{primary}" oifname "#{lab_if}" ct state established,related accept\n)
     end)
+  end
+
+  # The baseline already drops every other interface into `agentnet`, but
+  # lets `hassio` route there: no `hassio` app may reach the memory DB. The
+  # host itself goes out through OUTPUT and is untouched. Intra-bridge
+  # traffic is accepted first in case `br_netfilter` hands it to this hook,
+  # where the baseline would drop it.
+  defp agentnet_forward(opts) do
+    if Vagus.Network.Agentnet.enabled?(opts) do
+      net = Vagus.Network.Agentnet.name()
+
+      ~s(\t\tiifname "#{net}" oifname "#{net}" accept\n) <>
+        ~s(\t\toifname "#{net}" iifname != "#{net}" ct state new drop\n)
+    else
+      ""
+    end
   end
 
   defp lab_postrouting([]), do: ""

@@ -142,6 +142,22 @@ defmodule Vagus.Network.NatTest do
     end
   end
 
+  describe "agentnet" do
+    test "hassio may not open connections into agentnet, only on the agent flavor" do
+      {:ok, text} = Nat.ruleset(ip: "172.30.32.2", port: 8888, agentnet: true)
+
+      agentnet =
+        ~s(\t\tiifname "agentnet" oifname "agentnet" accept\n) <>
+          ~s(\t\toifname "agentnet" iifname != "agentnet" ct state new drop\n)
+
+      baseline_drop = ~s(\t\tiifname != "hassio" oifname != "hassio" drop\n)
+      assert text == String.replace(@ruleset, baseline_drop, agentnet <> baseline_drop)
+
+      assert Nat.ruleset(ip: "172.30.32.2", port: 8888, agentnet: false) == {:ok, @ruleset}
+      assert Nat.ruleset(ip: "172.30.32.2", port: 8888) == {:ok, @ruleset}
+    end
+  end
+
   describe "lab interfaces" do
     test "forward accepts and masquerade, ahead of the drops, only while listed" do
       {:ok, ruleset} =

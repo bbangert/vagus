@@ -370,21 +370,33 @@ defmodule Vagus.App do
   @spec uninstall(String.t()) :: :ok | {:error, term()}
   def uninstall(slug), do: unprotected(slug, fn -> command(slug, :uninstall, %{}) end)
 
-  @doc """
-  The agent flavor's orchestrator app, which holds the board's agent login
-  and makes its workers. A request may not stop, restart, uninstall or
-  restore it, nor change its `boot` or `watchdog`: from inside the board
-  that is the agent cutting off its own control. `update/2` stays allowed,
-  since an image bump is legitimate and starts it again. Shutdown halts it
-  through units, not through these.
-  """
+  @doc "The agent flavor's orchestrator app, which holds the board's agent login and makes its workers."
   @spec orchestrator?(String.t() | nil) :: boolean()
   def orchestrator?(slug) do
     orchestrator = Application.get_env(:vagus, :orchestrator_app)
     orchestrator != nil and slug == orchestrator
   end
 
-  defp unprotected(slug, fun), do: if(orchestrator?(slug), do: {:error, :protected}, else: fun.())
+  @doc "The agent flavor's memory DB app, on the internal `agentnet` (`Vagus.Network.Agentnet`)."
+  @spec memory_app?(String.t() | nil) :: boolean()
+  def memory_app?(slug) do
+    memory = Application.get_env(:vagus, :memory_app)
+    memory != nil and slug == memory
+  end
+
+  @doc """
+  The agent flavor's own apps (`:protected_apps`: the orchestrator and its
+  memory DB). A request may not stop, restart, uninstall or restore one,
+  nor change its `boot` or `watchdog`: from inside the board that is the
+  agent cutting off its own control or memory. `update/2` stays allowed,
+  since an image bump is legitimate and starts it again. Shutdown and a
+  cold backup halt one through units and the backup policy, not through
+  these.
+  """
+  @spec protected?(String.t() | nil) :: boolean()
+  def protected?(slug), do: slug in Application.get_env(:vagus, :protected_apps, [])
+
+  defp unprotected(slug, fun), do: if(protected?(slug), do: {:error, :protected}, else: fun.())
 
   @doc """
   Pulls the image and records the app installed, wanted `:stopped` unless

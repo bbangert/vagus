@@ -560,7 +560,8 @@ defmodule Vagus.Runtime.Engine.Podman do
       flag("--subnet", spec.subnet) ++
       flag("--gateway", spec.gateway) ++
       flag("--ip-range", spec.ip_range && ip_range(spec.ip_range)) ++
-      flag("--interface-name", spec.interface_name) ++ ["--", spec.name]
+      flag("--interface-name", spec.interface_name) ++
+      bool("--internal", spec.internal) ++ ["--", spec.name]
   end
 
   # A CIDR range would start at network + 1; the start-end form keeps the
@@ -614,6 +615,7 @@ defmodule Vagus.Runtime.Engine.Podman do
       env(spec.env, spec.secret_env),
       Enum.flat_map(Enum.sort(spec.labels || %{}), fn {k, v} -> ["--label", "#{k}=#{v}"] end),
       network(bridge, spec.network_aliases),
+      if(bridge, do: flag("--ip", spec.ip), else: []),
       dns(bridge, spec),
       hosts(bridge, spec.extra_hosts),
       Enum.flat_map(spec.mounts || [], &["--mount", mount(&1)]),

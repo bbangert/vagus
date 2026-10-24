@@ -7,7 +7,8 @@ defmodule Vagus.Runtime.Engine.NetworkSpec do
           subnet: String.t() | nil,
           gateway: String.t() | nil,
           ip_range: String.t() | nil,
-          interface_name: String.t() | nil
+          interface_name: String.t() | nil,
+          internal: boolean()
         }
 
   @enforce_keys [:name]
@@ -16,5 +17,6 @@ defmodule Vagus.Runtime.Engine.NetworkSpec do
             subnet: nil,
             gateway: nil,
             ip_range: nil,
-            interface_name: nil
+            interface_name: nil,
+            internal: false
 end

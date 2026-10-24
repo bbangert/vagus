@@ -217,6 +217,54 @@ a worker instead:
   The worker needs `--device /dev/gpiochipN`. Header pin names are
   board-specific, so record them in the task notes.
 
+## Memory
+
+**D9, one board-local memory database.** All the board's containers share one
+Postgres, reachable only from the board, instead of per-container file mounts:
+a mount means picking which worker may see which file, and cannot search by
+meaning. The cost is one more app to protect and back up.
+
+The `agent_memory` app runs `pgvector/pgvector:pg17` on `agentnet`, a private
+podman bridge (`172.30.40.0/24`, internal, no masquerade) at the static
+address `172.30.40.2:5432`, database `memory`, user `agent`. `pg_hba` trusts
+that subnet only and the port is not published, so nothing off the board can
+connect. It is protected like the orchestrator: stop, restart and uninstall
+are refused. Workers join with `--network agentnet`. The orchestrator is on
+the host network and reaches the DB through the host's bridge address
+`172.30.40.1`; the default DSN, `postgresql://agent@172.30.40.2/memory`, works
+for both (`VAGUS_MEMORY_DSN` overrides it).
+
+The base image ships the `vagus-memory` MCP stdio server and a `memory` CLI.
+`worker-config` registers the server in each worker's `.claude.json`
+(`mcpServers.vagus-memory`, with `VAGUS_TASK=<task>` for provenance) and
+writes the usage rule into the worker's config-dir `CLAUDE.md`; the
+orchestrator's entrypoint does the same for itself. Embeddings are computed
+inside the server with a model baked into the base image, so no text leaves
+the board and nothing is downloaded.
+
+Schema v1:
+
+- `schema_version(version, model, dims)`: the embedding dims are learned from
+  the model on first connect
+- `memories(id, kind, scope, text, refs jsonb, embedding vector(dims), tsv,
+  source_task, created_at, superseded_by)`: `forget` sets `superseded_by`
+  instead of deleting
+- `tasks(id, name unique, started_at, finished_at, summary)`
+- `journal(id, task_id, at, entry)`: per-task running entries
+- `devices(id text, notes, updated_at)`: facts per device id
+- `captures(id, path, task_id, meta jsonb, created_at)`
+
+**Backup.** Cold: Vagus stops the app, tars PGDATA and restarts it, so the
+database is unavailable for a few seconds. A file copy of a running cluster
+would not be consistent, which is why it is not taken live.
+
+**Embedder.** It loads lazily at the first embed (about 0.6 s, roughly 200 MB
+RSS in the worker), so give memory-using workers headroom under `--memory`.
+
+**By hand.** From the orchestrator: `memory recall "<query>"` (`--json` for scripts), `memory status`,
+or `psql postgresql://agent@172.30.40.2/memory` for raw queries. Never store
+credentials in it, and never drop or truncate its tables.
+
 ## Logging in
 
 The login is done once per board by the owner. It is a paste-code flow. From

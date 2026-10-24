@@ -17,7 +17,7 @@ defmodule Vagus.App.Steps do
   alias Vagus.DSP
   alias Vagus.Ingress.Panels
   alias Vagus.Network
-  alias Vagus.Network.Nat
+  alias Vagus.Network.{Agentnet, Nat}
   alias Vagus.Runtime.{Engine, Host}
 
   @default_backend Vagus.Addon.Backend.Container
@@ -575,7 +575,7 @@ defmodule Vagus.App.Steps do
             "SUPERVISOR_TOKEN" => token,
             "HASSIO_TOKEN" => token
           },
-          orchestrator_env(config)
+          orchestrator_env(config) |> Map.merge(memory_env(config))
         ),
       network: if(host?, do: :host, else: :hassio),
       network_name: Network.name(),
@@ -596,6 +596,24 @@ defmodule Vagus.App.Steps do
       uts_mode: if(config.host_uts, do: "host", else: nil),
       platform: platform(arch)
     }
+    |> memory_network(config)
+  end
+
+  # The memory DB sits alone at a fixed address on the internal `agentnet`
+  # (`Vagus.Network.Agentnet`), where the Supervisor and its DNS are out of
+  # reach, so neither is handed to it.
+  defp memory_network(spec, %Config{slug: slug}) do
+    if Vagus.App.memory_app?(slug),
+      do: %{
+        spec
+        | network_name: Agentnet.name(),
+          ip: Agentnet.memory_ip(),
+          dns: [],
+          dns_search: [],
+          dns_options: [],
+          extra_hosts: %{}
+      },
+      else: spec
   end
 
   defp backend(opts), do: Keyword.get(opts, :backend, default_backend())
@@ -629,7 +647,20 @@ defmodule Vagus.App.Steps do
   # attach, so don't stand the bridge up on their account. A declared
   # `native` outside the allowlist is a container (`put_backend/2`).
   defp maybe_ensure_network(config, opts) do
-    if native?(config), do: :ok, else: ensure_network(opts)
+    cond do
+      native?(config) -> :ok
+      Vagus.App.memory_app?(config.slug) -> ensure_agentnet(opts)
+      true -> ensure_network(opts)
+    end
+  end
+
+  # Forced on: the memory app is installed only on the agent flavor, and a
+  # missing network is the failure to surface, not a no-op.
+  defp ensure_agentnet(opts) do
+    case Agentnet.ensure(Keyword.put(engine_opts(opts), :agentnet, true)) do
+      :ok -> :ok
+      {:error, reason} -> {:error, {:network, reason}}
+    end
   end
 
   defp ensure_network(opts) do
@@ -886,6 +917,21 @@ defmodule Vagus.App.Steps do
       do: %{
         "CLAUDE_CONFIG_DIR" => "/data/claude",
         "VAGUS_DIST_FILE" => "/run/vagus-dist/node.json"
+      },
+      else: %{}
+  end
+
+  # Config has no `environment` key, so the memory app's lives here. Trust
+  # auth: the only routes to the DB are the internal bridge and the host.
+  # PGDATA under `/data` puts the cluster in the app's data dir, so the
+  # app's cold backup (`stop` → snapshot → `start`) copies it consistently.
+  defp memory_env(%Config{slug: slug}) do
+    if Vagus.App.memory_app?(slug),
+      do: %{
+        "POSTGRES_HOST_AUTH_METHOD" => "trust",
+        "POSTGRES_DB" => "memory",
+        "POSTGRES_USER" => "agent",
+        "PGDATA" => "/data/pgdata"
       },
       else: %{}
   end

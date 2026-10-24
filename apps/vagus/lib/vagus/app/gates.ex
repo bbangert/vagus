@@ -63,7 +63,7 @@ defmodule Vagus.App.Gates do
   def engine(opts \\ []), do: Vagus.Runtime.Engine.ready(opts)
 
   @doc """
-  Stands up the `hassio` bridge, binds the `.2`/`.3` anchors and loads
+  Stands up the `hassio` bridge (and the agent flavor's `agentnet`), binds the `.2`/`.3` anchors and loads
   `Vagus.Network.Nat`'s table. All of it is lost on reboot, and only a
   container app's start would redo it otherwise, so a device running only
   native apps would leave Core unable to reach the Supervisor. On a board
@@ -79,6 +79,11 @@ defmodule Vagus.App.Gates do
     warn_unless_ok(
       Network.ensure(opts),
       "hassio bridge; Core and bridged apps may not reach the Supervisor"
+    )
+
+    warn_unless_ok(
+      Vagus.Network.Agentnet.ensure(opts),
+      "agentnet bridge; the agent memory app may not start"
     )
 
     Network.ensure_supervisor_ip(opts)

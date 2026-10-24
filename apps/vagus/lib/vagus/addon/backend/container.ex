@@ -106,6 +106,7 @@ defmodule Vagus.Addon.Backend.Container do
       labels: Map.put(spec.labels, @managed_label, ""),
       network: if(bridge?, do: {:bridge, spec.network_name}, else: :host),
       network_aliases: if(bridge? and is_binary(spec.hostname), do: [spec.hostname]),
+      ip: if(bridge?, do: spec.ip),
       dns: spec.dns,
       dns_search: spec.dns_search,
       dns_options: spec.dns_options,

@@ -265,6 +265,15 @@ defmodule Vagus.Runtime.Engine.PodmanRenderTest do
       assert Enum.count(render(mounts: [own]), &(&1 =~ "dst=/etc/resolv.conf")) == 1
     end
 
+    test "a static address follows the bridge it is on, and never the host network" do
+      argv = render(network: {:bridge, "agentnet"}, ip: "172.30.40.2")
+
+      assert ["--network", "agentnet", "--ip", "172.30.40.2"] in Enum.chunk_every(argv, 4, 1)
+
+      refute "--ip" in render(ip: "172.30.40.2")
+      refute "--ip" in render(network: {:bridge, "hassio"})
+    end
+
     test "a secret's value never reaches the argv" do
       argv = render(env: [{"TOKEN", "s3cret"}, {"TZ", "UTC"}], secret_env: ["TOKEN"])
       assert ["--env", "TOKEN", "--env", "TZ=UTC"] -- argv == []
@@ -330,6 +339,25 @@ defmodule Vagus.Runtime.Engine.PodmanRenderTest do
       })
 
     assert ["--log-opt", "path=/x/n.log", "--log-opt", "max-size=8388608"] -- argv == []
+  end
+
+  test "the agentnet network is internal and has no ip range" do
+    assert Podman.render_network(Vagus.Network.Agentnet.spec()) == [
+             "network",
+             "create",
+             "--driver",
+             "bridge",
+             "--disable-dns",
+             "--subnet",
+             "172.30.40.0/24",
+             "--gateway",
+             "172.30.40.1",
+             "--interface-name",
+             "agentnet",
+             "--internal",
+             "--",
+             "agentnet"
+           ]
   end
 
   test "the hassio network" do

@@ -215,6 +215,29 @@ defmodule Vagus.App.UnitsTest do
       refute Units.builtin_native?("agent_orchestrator")
     end
 
+    test "the agent memory parses as a cold-backup bridged container app" do
+      assert {:ok, config} = Units.builtin_config("agent_memory")
+
+      assert %{
+               slug: "agent_memory",
+               image: "docker.io/pgvector/pgvector",
+               version: "pg17",
+               backend: :container,
+               startup: "application",
+               boot: "auto",
+               init: false,
+               host_network: false,
+               backup: "cold",
+               arch: ["aarch64"],
+               ports: %{}
+             } = config
+
+      assert Vagus.App.Steps.build_spec(config, arch: "aarch64").image ==
+               "docker.io/pgvector/pgvector:pg17"
+
+      refute Units.builtin_native?("agent_memory")
+    end
+
     test "the broker is native under its installed slug, and anything else has no builtin" do
       assert {:ok, %{slug: "core_mqtt", backend: :native}} = Units.builtin_config("core_mqtt")
       assert Units.builtin_native?("core_mqtt")
@@ -223,17 +246,26 @@ defmodule Vagus.App.UnitsTest do
     end
   end
 
-  describe "installing the agent orchestrator" do
+  describe "installing the agent apps" do
     setup do
-      prev = Application.get_env(:vagus, :orchestrator_app)
+      prev = Application.get_env(:vagus, :protected_apps)
+      prev_memory = Application.get_env(:vagus, :memory_app)
       prev_backend = Application.get_env(:vagus, :addon_backend)
+      # The memory app is bridged, so its start ensures agentnet.
+      Vagus.Runtime.Engine.Fake.start_global()
       Application.put_env(:vagus, :addon_backend, Vagus.Addon.Backend.Fake)
-      Application.put_env(:vagus, :orchestrator_app, "agent_orchestrator")
+      Application.put_env(:vagus, :protected_apps, ["agent_orchestrator", "agent_memory"])
+      Application.put_env(:vagus, :memory_app, "agent_memory")
 
       on_exit(fn ->
         forget_app("agent_orchestrator")
+        forget_app("agent_memory")
 
-        for {key, value} <- [orchestrator_app: prev, addon_backend: prev_backend] do
+        for {key, value} <- [
+              protected_apps: prev,
+              memory_app: prev_memory,
+              addon_backend: prev_backend
+            ] do
           if value,
             do: Application.put_env(:vagus, key, value),
             else: Application.delete_env(:vagus, key)
@@ -241,27 +273,29 @@ defmodule Vagus.App.UnitsTest do
       end)
     end
 
-    test "records it booting and revived after a crash, which no request then changes" do
-      assert Units.install_default("agent_orchestrator") == :installed
+    test "records each booting and revived after a crash, which no request then changes" do
+      for slug <- ["agent_orchestrator", "agent_memory"] do
+        assert Units.install_default(slug) == :installed
+        assert {:ok, %{boot: "auto", watchdog: true, wanted: :started}} = app_info(slug)
 
-      assert {:ok, %{boot: "auto", watchdog: true, wanted: :started}} =
-               app_info("agent_orchestrator")
+        assert {:error, :protected} = Vagus.App.set(slug, watchdog: false)
+        assert {:error, :protected} = Vagus.App.set(slug, boot: "manual")
+        assert {:ok, %{boot: "auto", watchdog: true}} = app_info(slug)
 
-      assert {:error, :protected} = Vagus.App.set("agent_orchestrator", watchdog: false)
-      assert {:error, :protected} = Vagus.App.set("agent_orchestrator", boot: "manual")
-      assert {:ok, %{boot: "auto", watchdog: true}} = app_info("agent_orchestrator")
-
-      {:ok, saved} = Vagus.App.File.read("agent_orchestrator")
-      data = Vagus.App.Policy.init_data("agent_orchestrator", saved)
-      assert Vagus.App.Policy.restart?(data, false)
+        {:ok, saved} = Vagus.App.File.read(slug)
+        data = Vagus.App.Policy.init_data(slug, saved)
+        assert Vagus.App.Policy.restart?(data, false)
+      end
     end
 
     test "one already installed without its protected settings gets them back" do
-      {:ok, config} = Units.builtin_config("agent_orchestrator")
-      install_app(config, boot: "manual", watchdog: false)
+      for slug <- ["agent_orchestrator", "agent_memory"] do
+        {:ok, config} = Units.builtin_config(slug)
+        install_app(config, boot: "manual", watchdog: false)
 
-      assert Units.install_default("agent_orchestrator") == :present
-      assert {:ok, %{boot: "auto", watchdog: true}} = app_info("agent_orchestrator")
+        assert Units.install_default(slug) == :present
+        assert {:ok, %{boot: "auto", watchdog: true}} = app_info(slug)
+      end
     end
   end
 

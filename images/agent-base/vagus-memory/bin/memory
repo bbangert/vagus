@@ -1,0 +1,4 @@
+#!/bin/sh
+# -I keeps the cwd (an agent workspace) off sys.path, so a stray module there cannot
+# shadow the package or its deps.
+exec /opt/venv/bin/python3 -I -m vagus_memory.cli "$@"

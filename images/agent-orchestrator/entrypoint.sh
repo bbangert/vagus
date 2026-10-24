@@ -27,6 +27,14 @@ jq '.hasCompletedOnboarding //= true
 chown agent:agent "$tmp"
 mv "$tmp" "$state"
 
+# Same server the workers get, with the orchestrator as its provenance.
+tmp=$(mktemp "$CLAUDE_CONFIG_DIR/.claude.json.XXXXXX")
+jq --arg dsn "${VAGUS_MEMORY_DSN:-postgresql://agent@172.30.40.2/memory}" \
+  '.mcpServers["vagus-memory"] //= {command: "vagus-memory",
+     env: {VAGUS_MEMORY_DSN: $dsn, VAGUS_TASK: "orchestrator"}}' "$state" > "$tmp"
+chown agent:agent "$tmp"
+mv "$tmp" "$state"
+
 as_agent() {
   setpriv --reuid=agent --regid=agent --init-groups \
     env HOME=/home/agent USER=agent TERM=xterm-256color "$@"

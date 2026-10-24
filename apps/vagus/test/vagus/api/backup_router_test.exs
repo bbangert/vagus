@@ -169,6 +169,17 @@ defmodule Vagus.API.BackupRouterTest do
     body(conn)["data"]["slug"]
   end
 
+  defp protect(slugs) do
+    prev = Application.get_env(:vagus, :protected_apps)
+    Application.put_env(:vagus, :protected_apps, slugs)
+
+    on_exit(fn ->
+      if prev,
+        do: Application.put_env(:vagus, :protected_apps, prev),
+        else: Application.delete_env(:vagus, :protected_apps)
+    end)
+  end
+
   describe "POST /backups/new/partial" do
     test "happy path: creates a backup listing the add-on, returns slug + job_id", %{
       data_root: dr
@@ -231,14 +242,7 @@ defmodule Vagus.API.BackupRouterTest do
       data_dir = Path.join([dr, "addons", "data", "core_restore_a"])
       File.write!(Path.join(data_dir, "f.txt"), "mutated")
 
-      prev = Application.get_env(:vagus, :orchestrator_app)
-      Application.put_env(:vagus, :orchestrator_app, "core_restore_orch")
-
-      on_exit(fn ->
-        if prev,
-          do: Application.put_env(:vagus, :orchestrator_app, prev),
-          else: Application.delete_env(:vagus, :orchestrator_app)
-      end)
+      protect(["core_restore_orch"])
 
       conn =
         supervisor_call(:post, "/backups/#{slug}/restore/partial", %{
@@ -303,6 +307,22 @@ defmodule Vagus.API.BackupRouterTest do
       assert {:ok, %{state: :started}} = app_info("core_rt_cold")
 
       assert Fake.calls_for("addon_core_rt_hot") == []
+    end
+
+    test "a protected cold app is still stopped and started by its own backup", %{data_root: dr} do
+      install("core_rt_pcold", dr, :started, %{"backup" => "cold"})
+      protect(["core_rt_pcold"])
+      Fake.reset_calls()
+
+      conn = supervisor_call(:post, "/backups/new/partial", %{"addons" => ["core_rt_pcold"]})
+
+      assert conn.status == 200, conn.resp_body
+
+      assert [:stop, :remove | started] =
+               Enum.map(Fake.calls_for("addon_core_rt_pcold"), &elem(&1, 0))
+
+      assert :start in started
+      assert {:ok, %{state: :started}} = app_info("core_rt_pcold")
     end
 
     test "a busy app fails the backup with upstream's busy text naming it", %{data_root: dr} do

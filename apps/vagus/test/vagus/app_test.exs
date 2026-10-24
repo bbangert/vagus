@@ -64,9 +64,9 @@ defmodule Vagus.AppTest do
     end
   end
 
-  describe "the orchestrator app" do
+  describe "a protected app" do
     setup do
-      prev = Application.get_env(:vagus, :orchestrator_app)
+      prev = Application.get_env(:vagus, :protected_apps)
       prev_backend = Application.get_env(:vagus, :addon_backend)
       prev_root = Application.get_env(:vagus, :addon_data_root)
       root = Path.join(System.tmp_dir!(), "app-test-#{System.unique_integer([:positive])}")
@@ -75,7 +75,7 @@ defmodule Vagus.AppTest do
 
       on_exit(fn ->
         for {key, value} <- [
-              orchestrator_app: prev,
+              protected_apps: prev,
               addon_backend: prev_backend,
               addon_data_root: prev_root
             ] do
@@ -88,7 +88,7 @@ defmodule Vagus.AppTest do
       end)
 
       slug = track(config(), state: :started)
-      Application.put_env(:vagus, :orchestrator_app, slug)
+      Application.put_env(:vagus, :protected_apps, [slug])
       %{slug: slug}
     end
 
@@ -110,8 +110,8 @@ defmodule Vagus.AppTest do
 
     test "another app is not protected", %{slug: slug} do
       other = track(config(), state: :started)
-      assert App.orchestrator?(slug)
-      refute App.orchestrator?(other)
+      assert App.protected?(slug)
+      refute App.protected?(other)
       assert :ok = App.set(other, boot: "manual", watchdog: true)
       assert :ok = App.stop(other)
     end
@@ -131,7 +131,7 @@ defmodule Vagus.AppTest do
 
     test "a start while it is stopped starts it" do
       stopped = track(config())
-      Application.put_env(:vagus, :orchestrator_app, stopped)
+      Application.put_env(:vagus, :protected_apps, [stopped])
       Backend.Fake.reset_calls()
 
       assert {:ok, %{slug: ^stopped}} = App.start(stopped)
@@ -148,18 +148,55 @@ defmodule Vagus.AppTest do
     end
 
     test "is not anything, nor is nil, with the key unset", %{slug: slug} do
-      Application.delete_env(:vagus, :orchestrator_app)
-      refute App.orchestrator?(slug)
-      refute App.orchestrator?(nil)
+      Application.delete_env(:vagus, :protected_apps)
+      refute App.protected?(slug)
+      refute App.protected?(nil)
     end
 
     test "nothing is protected with the key unset", %{slug: slug} do
-      Application.put_env(:vagus, :orchestrator_app, nil)
-      refute App.orchestrator?(slug)
+      Application.put_env(:vagus, :protected_apps, [])
+      refute App.protected?(slug)
       assert :ok = App.set(slug, boot: "manual", watchdog: true)
       assert {:ok, _} = App.restart(slug)
       assert :ok = App.stop(slug)
       assert :ok = App.uninstall(slug)
+    end
+
+    test "both agent apps are protected, and protection does not refuse an update", %{slug: slug} do
+      memory = track(config(%{"backup" => "cold"}), state: :started)
+      Application.put_env(:vagus, :protected_apps, [slug, memory])
+
+      for app <- [slug, memory] do
+        assert App.protected?(app)
+        assert {:error, :protected} = App.stop(app)
+        assert {:error, :protected} = App.restart(app)
+        assert {:error, :protected} = App.uninstall(app)
+        assert {:error, :protected} = App.restore(app, "/nonexistent", nil, false)
+        assert {:error, :protected} = App.set(app, boot: "manual")
+        assert App.update(app, []) == {:error, :not_in_store}
+      end
+    end
+
+    # The guard is on requests: the backup's own stop is the app's process's.
+    test "a cold backup still stops and starts it" do
+      memory = track(config(%{"backup" => "cold"}), state: :started)
+      Application.put_env(:vagus, :protected_apps, [memory])
+
+      staging =
+        Path.join(System.tmp_dir!(), "app-test-cold-#{System.unique_integer([:positive])}")
+
+      File.mkdir_p!(staging)
+      on_exit(fn -> File.rm_rf(staging) end)
+      stub_app_steps()
+
+      backup = Task.async(fn -> App.backup(memory, staging) end)
+      answer(:stop, {:ok, %{was_running: true}})
+      answer_snapshot(memory)
+      answer(:start, {:ok, %{container_id: "c2"}})
+
+      assert {:ok, path} = Task.await(backup)
+      assert path == Path.join(staging, memory <> ".tar.gz")
+      assert {:ok, %{state: :started}} = app_info(memory)
     end
   end
 

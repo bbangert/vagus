@@ -39,12 +39,14 @@ defmodule Vagus.FlavorConfigTest do
     vagus = read_vagus()
 
     refute Keyword.has_key?(vagus, :orchestrator_app)
+    refute Keyword.has_key?(vagus, :memory_app)
+    refute Keyword.has_key?(vagus, :protected_apps)
     refute Keyword.has_key?(vagus, Vagus.App.Orchestrator)
   end
 
   # config/target.exs imports flavor.exs last; the Orchestrator's keyword list
   # deep-merges, so the flavor's list must replace the target's and keep `boot`.
-  test "agent-dev-board adds the orchestrator app to target.exs's default apps" do
+  test "agent-dev-board adds its memory and orchestrator apps to target.exs's default apps" do
     System.put_env("VAGUS_FLAVOR", "agent-dev-board")
     target = Path.join(System.tmp_dir!(), "flavor_merge_#{System.unique_integer([:positive])}")
     File.mkdir_p!(target)
@@ -66,9 +68,15 @@ defmodule Vagus.FlavorConfigTest do
     vagus = Config.Reader.read!(Path.join(target, "target.exs"))[:vagus]
 
     assert vagus[:orchestrator_app] == "agent_orchestrator"
+    assert vagus[:memory_app] == "agent_memory"
+    assert vagus[:protected_apps] == ["agent_orchestrator", "agent_memory"]
 
+    # The DB ahead of the orchestrator that uses it.
     assert Enum.sort(vagus[Vagus.App.Orchestrator]) ==
-             Enum.sort(boot: true, default_apps: ["core_mqtt", "agent_orchestrator"])
+             Enum.sort(
+               boot: true,
+               default_apps: ["core_mqtt", "agent_memory", "agent_orchestrator"]
+             )
   end
 
   test "an unknown VAGUS_FLAVOR fails the build instead of falling back" do
