@@ -5,7 +5,7 @@ name: release
 # files to the GitHub release for that tag. These assets are what
 # `Vagus.OS.Updater` (nerves_github_updater) feeds on — asset names are
 # `vagus_<target>.fw` and MUST stay in sync with its `:asset_matcher`. The
-# `agent-dev-board` flavor (dragon_q6a only) ships as `vagus_<target>-agent.fw`;
+# `agent-dev-board` flavor (dragon_q6a, rubik_pi3) ships as `vagus_<target>-agent.fw`;
 # the updater matches that suffix only when running the flavor, so a stock
 # board never picks the agent asset and vice versa.
 #
@@ -48,7 +48,7 @@ env:
   # must be the same ref. Bump when the systems cut a new release.
   # rubik_pi3 is in the build matrix, so the tag's release must include its
   # prebuilt artifact too.
-  SYSTEM_RELEASE_TAG: v0.6.0
+  SYSTEM_RELEASE_TAG: v0.7.0
   NERVES_DL_DIR: /home/runner/.nerves/dl
   GH_TOKEN: ${{ github.token }}
   # The operator's SSH public keys (newline-separated authorized_keys
@@ -67,13 +67,15 @@ jobs:
       fail-fast: false
       # Include-only on purpose: an include entry that overwrites no original
       # value is merged into the matching combination, which would swallow the
-      # agent job and leave a three-job matrix.
+      # agent jobs and leave a three-job matrix.
       matrix:
         include:
           - target: rpi3_64
           - target: dragon_q6a
           - target: rubik_pi3
           - target: dragon_q6a
+            flavor: agent-dev-board
+          - target: rubik_pi3
             flavor: agent-dev-board
     defaults:
       run:

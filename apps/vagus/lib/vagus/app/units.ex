@@ -136,7 +136,7 @@ defmodule Vagus.App.Units do
   # serves none; the crash-restart flag is a per-install setting.
   @agent_orchestrator %{
     "name" => "Agent orchestrator",
-    "version" => "0.1.0",
+    "version" => "0.2.0",
     "slug" => "agent_orchestrator",
     "description" => "Claude Code orchestrator for the agent-dev-board, on the board's own node.",
     "arch" => ["aarch64"],
