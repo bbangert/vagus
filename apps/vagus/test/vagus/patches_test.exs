@@ -252,6 +252,51 @@ defmodule Vagus.PatchesTest do
       eventually(fn -> match?([%{in_use: [], purged?: true}], Patches.list(s)) end)
     end
 
+    test "a file defining a module twice is refused before it loads", %{root: root, n: n} do
+      s = start(root)
+      m = mod(n)
+      first = mod(n, "First")
+
+      wait =
+        "def wait, do: send(#{pid_literal()}, {:entered, self()}) && receive(do: (:stop -> :ok))"
+
+      # The release's version, which a process is running.
+      Code.compile_string(hook(m, "def v, do: 0\n  #{wait}"))
+      {holder, _ref} = spawn_monitor(fn -> m.wait() end)
+      assert_receive {:entered, ^holder}
+
+      patch(root, "p", [
+        {"a.ex", source(first, :one)},
+        {"b.ex", hook(m, "def v, do: 1") <> hook(m, "def v, do: 2")}
+      ])
+
+      assert Patches.load("p", s) == {:error, {:duplicate_module, "b.ex", m}}
+      assert m.v() == 0
+      assert Process.alive?(holder)
+      assert [%{modules: [^first], loaded?: true}] = Patches.list(s)
+      send(holder, :stop)
+    end
+
+    test "a module a macro emits twice is reported", %{root: root, n: n} do
+      s = start(root)
+      mac = mod(n, "Mac")
+      twice = mod(n, "Twice")
+
+      macro =
+        "defmacro twice(name) do\n    quote do\n      defmodule unquote(name) do\n      end\n\n" <>
+          "      defmodule unquote(name) do\n      end\n    end\n  end"
+
+      patch(root, "p", [
+        {"a.ex", hook(mac, macro)},
+        {"b.ex", "require #{inspect(mac)}\n#{inspect(mac)}.twice(#{inspect(twice)})\n"}
+      ])
+
+      assert Patches.load("p", s) == {:error, {:repeated_module, [twice]}}
+
+      assert [%{last_result: {:error, {:repeated_module, [^twice]}}, loaded?: true}] =
+               Patches.list(s)
+    end
+
     test "a patch without notes is refused", %{root: root, n: n} do
       s = start(root)
       patch(root, "p", [{"m.ex", source(mod(n), :one)}], notes: false)

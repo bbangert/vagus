@@ -28,10 +28,17 @@ defmodule Vagus.Patches do
   defmodule Tracer do
     @moduledoc false
     # Reports every module a patch compile emits, `defimpl` and macro-made
-    # ones included, to the process that set the sink.
+    # ones included, to the process that set the sink, and any emitted twice.
+    # It fires after the module is loaded, too late to stop a repeat.
     @spec trace(tuple(), Macro.Env.t()) :: :ok
     def trace({:on_module, _bytecode, _ignore}, env) do
-      if sink = Process.get({Vagus.Patches, :sink}), do: send(sink, {:patch_module, env.module})
+      if sink = Process.get({Vagus.Patches, :sink}) do
+        seen = Process.get({Vagus.Patches, :seen}, MapSet.new())
+        if env.module in seen, do: send(sink, {:patch_repeat, env.module})
+        Process.put({Vagus.Patches, :seen}, MapSet.put(seen, env.module))
+        send(sink, {:patch_module, env.module})
+      end
+
       :ok
     end
 
@@ -502,10 +509,12 @@ defmodule Vagus.Patches do
         nil -> {:error, :timeout}
       end
 
-    emitted = drain_emitted([])
+    {emitted, repeated} = drain_emitted([], [])
 
-    case result do
-      {:ok, modules} -> {result, modules}
+    case {result, repeated} do
+      {{:ok, modules}, []} -> {result, modules}
+      # Loaded, but its first version's processes may have been purged.
+      {{:ok, modules}, repeated} -> {{:error, {:repeated_module, Enum.uniq(repeated)}}, modules}
       _error -> {result, emitted |> Enum.uniq() |> Enum.filter(&:code.is_loaded/1)}
     end
   end
@@ -517,11 +526,12 @@ defmodule Vagus.Patches do
     unless Tracer in tracers, do: Code.put_compiler_option(:tracers, [Tracer | tracers])
   end
 
-  defp drain_emitted(acc) do
+  defp drain_emitted(emitted, repeated) do
     receive do
-      {:patch_module, mod} -> drain_emitted([mod | acc])
+      {:patch_module, mod} -> drain_emitted([mod | emitted], repeated)
+      {:patch_repeat, mod} -> drain_emitted(emitted, [mod | repeated])
     after
-      0 -> Enum.reverse(acc)
+      0 -> {Enum.reverse(emitted), Enum.reverse(repeated)}
     end
   end
 
@@ -530,12 +540,22 @@ defmodule Vagus.Patches do
   defp compile_files(sources) do
     Enum.reduce_while(sources, {:ok, []}, fn file, {:ok, loaded} ->
       with :ok <- old_code_free(loaded),
+           :ok <- defined_once(file),
            {:ok, modules} <- compile_file(file) do
         {:cont, {:ok, loaded ++ modules}}
       else
         error -> {:halt, error}
       end
     end)
+  end
+
+  # A module a file defines twice would have its second definition purge the
+  # first's old code under its processes, before any check could run.
+  defp defined_once(file) do
+    case file |> file_modules() |> Enum.frequencies() |> Enum.find(fn {_m, n} -> n > 1 end) do
+      nil -> :ok
+      {mod, _n} -> {:error, {:duplicate_module, Path.basename(file), mod}}
+    end
   end
 
   defp log_load(name, {:ok, modules}, _loaded),
@@ -732,14 +752,16 @@ defmodule Vagus.Patches do
   # would intern them anyway. A file that does not parse defined nothing.
   # Patch names are checked by valid_name/1 before any file is listed.
   # sobelow_skip ["Traversal.FileModule"]
-  defp parse_file(file) do
+  defp file_modules(file) do
     with {:ok, body} <- File.read(file),
          {:ok, ast} <- Code.string_to_quoted(body) do
-      ast |> defined_modules(nil) |> Enum.uniq()
+      defined_modules(ast, nil)
     else
       _unreadable -> []
     end
   end
+
+  defp parse_file(file), do: file |> file_modules() |> Enum.uniq()
 
   defp defined_modules({:defmodule, _meta, [name, opts]}, parent) when is_list(opts) do
     case module_name(name, parent) do
