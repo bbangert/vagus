@@ -2,10 +2,10 @@ name: ci
 
 # Host-side gates for the emulator (apps/vagus), one parallel job each:
 # compile (warnings as errors) + format, tests, Credo, Dialyzer, Sobelow, a
-# dependency audit, and Argus. Everything runs at MIX_TARGET=host — the
-# Nerves system / firmware build is target-only (targets:-gated deps) and
-# lives in the nerves_system_vagus repo's own CI, so nothing here pulls
-# Buildroot.
+# dependency audit, and Argus, plus the memory store's tests against a real
+# Postgres. The jobs run at MIX_TARGET=host — the Nerves system / firmware build is
+# target-only (targets:-gated deps) and lives in the nerves_system_vagus repo's
+# own CI, so nothing here pulls Buildroot.
 #
 # Every job repeats the same setup (native build deps, BEAM, hex/rebar/
 # nerves_bootstrap, deps cache under its own key prefix, deps.get).
@@ -423,3 +423,64 @@ jobs:
       - name: Check findings against the reviewed baseline
         working-directory: apps/vagus
         run: elixir ../../scripts/argus_baseline.exs argus.json .argus-baseline.exs
+
+  memory-db:
+    name: Memory store (Postgres)
+    runs-on: ubuntu-24.04
+    # The `:db` tests run Vagus.Memory against the same Postgres + pgvector
+    # the agent board's `agent_memory` app runs.
+    services:
+      postgres:
+        image: pgvector/pgvector:0.8.7-pg17
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_DB: memory
+          POSTGRES_USER: agent
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U agent -d memory"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      VAGUS_MEMORY_TEST_DSN: postgres://agent@127.0.0.1:5432/memory
+    steps:
+      - uses: actions/checkout@v4
+
+      # nerves_uevent compiles a C port that #includes <libmnl/libmnl.h>, and
+      # it's pulled into the host build too — the runner needs the netlink dev
+      # headers (build-essential is already on the image).
+      - name: Install native build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libmnl-dev
+
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ env.OTP_VERSION }}
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+
+      - name: Cache deps and _build
+        id: mix-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            deps
+            _build
+          key: mix-test-${{ runner.os }}-otp${{ env.OTP_VERSION }}-ex${{ env.ELIXIR_VERSION }}-${{ hashFiles('mix.lock', 'vendor/**', 'mix.exs', 'apps/*/mix.exs') }}
+          restore-keys: |
+            mix-test-${{ runner.os }}-otp${{ env.OTP_VERSION }}-ex${{ env.ELIXIR_VERSION }}-
+
+      - name: Install hex, rebar, nerves_bootstrap
+        run: |
+          mix local.hex --force
+          mix local.rebar --force
+          mix archive.install hex nerves_bootstrap --force
+
+      - name: Fetch deps
+        run: mix deps.get
+
+      - name: Memory DB tests
+        working-directory: apps/vagus
+        run: mix test --only db

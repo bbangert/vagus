@@ -3,7 +3,7 @@ defmodule Vagus.Network.Nat do
   Vagus's own nft table and the forwarding sysctls bridged apps need: the
   DNAT that keeps `http://supervisor/` working after the Supervisor-API
   listener moved off port 80, and the filters that let the board route for
-  the `hassio` bridge and nothing else.
+  the `hassio` bridge and nothing else, and that keep `agentnet` private.
 
   ## Why this exists
 
@@ -52,6 +52,9 @@ defmodule Vagus.Network.Nat do
     * a new connection entering `hassio` from another interface is dropped
       unless conntrack shows it was DNAT'd, i.e. a published port, so a LAN
       host routing `172.30.32.0/23` via the board reaches no app directly.
+    * on the agent flavor, a new connection entering `agentnet`
+      (`Vagus.Network.Agentnet`) from any other interface is dropped, so
+      no `hassio` app reaches the memory DB.
 
   Traffic between containers, container egress and replies pass. The flag
   test is `ct status & dnat == 0`: `ct status != dnat` compares the whole
@@ -275,7 +278,7 @@ defmodule Vagus.Network.Nat do
        \t}
        \tchain forward {
        \t\ttype filter hook forward priority #{@forward_priority}; policy accept;
-       #{lab_forward(lab)}\t\tiifname != "#{bridge}" oifname != "#{bridge}" drop
+       #{lab_forward(lab)}#{agentnet_forward(opts)}\t\tiifname != "#{bridge}" oifname != "#{bridge}" drop
        \t\toifname "#{bridge}" iifname != "#{bridge}" ct state new ct status & dnat == 0 drop
        \t}
        \tchain prerouting_filter {
@@ -301,6 +304,22 @@ defmodule Vagus.Network.Nat do
       ~s(\t\tiifname "#{lab_if}" oifname "#{primary}" accept\n) <>
         ~s(\t\tiifname "#{primary}" oifname "#{lab_if}" ct state established,related accept\n)
     end)
+  end
+
+  # The baseline already drops every other interface into `agentnet`, but
+  # lets `hassio` route there: no `hassio` app may reach the memory DB. The
+  # host itself goes out through OUTPUT and is untouched. Intra-bridge
+  # traffic is accepted first in case `br_netfilter` hands it to this hook,
+  # where the baseline would drop it.
+  defp agentnet_forward(opts) do
+    if Vagus.Network.Agentnet.enabled?(opts) do
+      net = Vagus.Network.Agentnet.name()
+
+      ~s(\t\tiifname "#{net}" oifname "#{net}" accept\n) <>
+        ~s(\t\toifname "#{net}" iifname != "#{net}" ct state new drop\n)
+    else
+      ""
+    end
   end
 
   defp lab_postrouting([]), do: ""

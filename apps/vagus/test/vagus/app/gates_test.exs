@@ -63,6 +63,38 @@ defmodule Vagus.App.GatesTest do
     assert steps(ran()) == [:bridge, :anchor_supervisor, :anchor_dns, :nat]
   end
 
+  test "the agent flavor also stands up agentnet and keeps hassio out of it",
+       %{fake: fake, opts: opts} do
+    test = self()
+
+    # The gate's own table, read before nft's file is removed.
+    nft = fn
+      "nft", ["-f", path] ->
+        send(test, {:nft_text, File.read!(path)})
+        {"", 0}
+
+      bin, args ->
+        send(test, {:ran, bin, args})
+        {"", 0}
+    end
+
+    rule = ~s(oifname "agentnet" iifname != "agentnet" ct state new drop)
+    opts = Keyword.put(opts, :cmd, nft)
+
+    assert Gates.network(Keyword.put(opts, :agentnet, false)) == :ok
+    refute Enum.any?(Fake.calls(fake), &match?({:ensure_network, [%{name: "agentnet"}]}, &1))
+    refute Enum.any?(ran(), &match?({"ip", ["link", "add", "agentnet" | _]}, &1))
+    assert_received {:nft_text, off}
+    refute off =~ rule
+
+    assert Gates.network(Keyword.put(opts, :agentnet, true)) == :ok
+
+    assert {:ensure_network, [Vagus.Network.Agentnet.spec()]} in Fake.calls(fake)
+    assert {"ip", ["link", "add", "agentnet", "type", "bridge"]} in ran()
+    assert_received {:nft_text, on}
+    assert on =~ rule
+  end
+
   test "the anchors and the NAT go on when the network create fails",
        %{fake: fake, opts: opts} do
     Fake.fail_next(fake, :ensure_network, :unavailable)

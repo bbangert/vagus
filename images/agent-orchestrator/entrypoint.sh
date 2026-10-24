@@ -25,7 +25,21 @@ jq '.hasCompletedOnboarding //= true
     | .remoteDialogSeen //= true
     | .projects["/work"].hasTrustDialogAccepted //= true' "$state" > "$tmp"
 chown agent:agent "$tmp"
-mv "$tmp" "$state"
+mv -T -- "$tmp" "$state"
+
+# The orchestrator's own edits to an HTTP entry survive a restart; only an absent entry
+# or the retired stdio shape (`command`) is replaced, else an upgraded board never
+# gets the HTTP server. worker-config owns its workers' entries and always rewrites.
+# Loopback, not the gateway: this container is host-network.
+tmp=$(mktemp "$CLAUDE_CONFIG_DIR/.claude.json.XXXXXX")
+jq 'if (.mcpServers["vagus-memory"] | type == "object")
+       and (.mcpServers["vagus-memory"] | has("command") | not)
+    then .
+    else .mcpServers["vagus-memory"] = {type: "http", url: "http://127.0.0.1:8890/mcp",
+           headers: {"X-Vagus-Task": "orchestrator"}}
+    end' "$state" > "$tmp"
+chown agent:agent "$tmp"
+mv -T -- "$tmp" "$state"
 
 as_agent() {
   setpriv --reuid=agent --regid=agent --init-groups \

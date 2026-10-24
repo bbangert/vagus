@@ -44,6 +44,21 @@ RUN apt-get update \
  && apt-get clean \
  && rm -rf /var/lib/apt/lists/* /var/cache/apt/* /var/log/apt /var/log/dpkg.log
 
+# bookworm only ships psql 15, older than the board's Postgres 17 memory app (`psql` for raw queries). The PGDG key
+# is checked by hash so a swapped key on the mirror fails the build instead of being trusted.
+ARG PGDG_KEY_SHA256=0144068502a1eddd2a0280ede10ef607d1ec592ce819940991203941564e8e76
+RUN install -d /usr/share/postgresql-common/pgdg \
+ && curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+      https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+ && echo "$PGDG_KEY_SHA256  /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc" | sha256sum -c - \
+ && echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt bookworm-pgdg main" \
+      > /etc/apt/sources.list.d/pgdg.list \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends postgresql-client-17 \
+ && psql --version | grep -q ' 17\.' \
+ && apt-get clean \
+ && rm -rf /var/lib/apt/lists/* /var/cache/apt/* /var/log/apt /var/log/dpkg.log
+
 COPY --from=beam /usr/local/lib/erlang /usr/local/lib/erlang
 COPY --from=beam /usr/local/lib/elixir /usr/local/lib/elixir
 RUN for b in erl erlc escript epmd run_erl to_erl ct_run dialyzer typer; do \

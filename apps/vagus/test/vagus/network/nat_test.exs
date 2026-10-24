@@ -142,6 +142,35 @@ defmodule Vagus.Network.NatTest do
     end
   end
 
+  describe "agentnet" do
+    test "hassio may not open connections into agentnet, only on the agent flavor" do
+      {:ok, text} = Nat.ruleset(ip: "172.30.32.2", port: 8888, agentnet: true)
+
+      agentnet =
+        ~s(\t\tiifname "agentnet" oifname "agentnet" accept\n) <>
+          ~s(\t\toifname "agentnet" iifname != "agentnet" ct state new drop\n)
+
+      baseline_drop = ~s(\t\tiifname != "hassio" oifname != "hassio" drop\n)
+      assert text == String.replace(@ruleset, baseline_drop, agentnet <> baseline_drop)
+
+      assert Nat.ruleset(ip: "172.30.32.2", port: 8888, agentnet: false) == {:ok, @ruleset}
+    end
+
+    # A reload with no opts (a bridged start, `set_lab/2`) must keep the rule.
+    test "unset, it follows the flavor" do
+      prev = Application.get_env(:vagus, :flavor)
+      on_exit(fn -> Application.put_env(:vagus, :flavor, prev || :default) end)
+
+      Application.put_env(:vagus, :flavor, :default)
+      assert Nat.ruleset(ip: "172.30.32.2", port: 8888) == {:ok, @ruleset}
+
+      Application.put_env(:vagus, :flavor, :agent_dev_board)
+      assert Vagus.Network.Agentnet.enabled?()
+      {:ok, text} = Nat.ruleset(ip: "172.30.32.2", port: 8888)
+      assert text =~ ~s(oifname "agentnet" iifname != "agentnet" ct state new drop)
+    end
+  end
+
   describe "lab interfaces" do
     test "forward accepts and masquerade, ahead of the drops, only while listed" do
       {:ok, ruleset} =

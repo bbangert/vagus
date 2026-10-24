@@ -435,31 +435,34 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
     end
   end
 
-  describe "the orchestrator app is protected" do
+  describe "the agent apps are protected" do
     setup do
       config = fixture_config("agent_orchestrator")
       install_app(config, state: :started)
+      install_app(fixture_config("agent_memory"), state: :started)
 
-      prev = Application.get_env(:vagus, :orchestrator_app)
-      Application.put_env(:vagus, :orchestrator_app, "agent_orchestrator")
+      prev = Application.get_env(:vagus, :protected_apps)
+      Application.put_env(:vagus, :protected_apps, ["agent_orchestrator", "agent_memory"])
 
       on_exit(fn ->
         if prev,
-          do: Application.put_env(:vagus, :orchestrator_app, prev),
-          else: Application.delete_env(:vagus, :orchestrator_app)
+          do: Application.put_env(:vagus, :protected_apps, prev),
+          else: Application.delete_env(:vagus, :protected_apps)
       end)
 
       %{config: config}
     end
 
-    test "stop, restart and uninstall are 400 protected and leave it running" do
-      for action <- ["stop", "restart", "uninstall"] do
-        conn = supervisor_call(:post, "/addons/agent_orchestrator/#{action}")
+    test "stop, restart and uninstall are 400 protected and leave each running" do
+      for slug <- ["agent_orchestrator", "agent_memory"],
+          action <- ["stop", "restart", "uninstall"] do
+        conn = supervisor_call(:post, "/addons/#{slug}/#{action}")
         assert conn.status == 400
-        assert body(conn)["message"] =~ "protected"
+        assert body(conn)["message"] =~ "The agent apps are protected"
       end
 
       assert {:ok, %{state: :started}} = app_info("agent_orchestrator")
+      assert {:ok, %{state: :started}} = app_info("agent_memory")
     end
 
     test "its own token saying `self` is refused the same" do
@@ -473,20 +476,19 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
     end
 
     test "boot or watchdog in an options body is 400 and nothing in it is applied" do
-      for body <- [%{"boot" => "manual"}, %{"watchdog" => true}] do
+      for slug <- ["agent_orchestrator", "agent_memory"],
+          body <- [%{"boot" => "manual"}, %{"watchdog" => true}] do
         conn =
           supervisor_call(
             :post,
-            "/addons/agent_orchestrator/options",
+            "/addons/#{slug}/options",
             Map.put(body, "options", %{"greeting" => "hey"})
           )
 
         assert conn.status == 400
         assert body(conn)["message"] =~ "protected"
+        assert {:ok, %{boot: nil, watchdog: false, user_options: %{}}} = app_info(slug)
       end
-
-      assert {:ok, %{boot: nil, watchdog: false, user_options: %{}}} =
-               app_info("agent_orchestrator")
     end
 
     test "its other options still save" do
@@ -522,11 +524,13 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
       assert info["update_available"] == true
     end
 
-    test "with the key unset the same app stops" do
-      Application.delete_env(:vagus, :orchestrator_app)
+    test "with the key unset the same apps stop" do
+      Application.delete_env(:vagus, :protected_apps)
 
-      assert supervisor_call(:post, "/addons/agent_orchestrator/stop").status == 200
-      assert {:ok, %{state: :stopped}} = app_info("agent_orchestrator")
+      for slug <- ["agent_orchestrator", "agent_memory"] do
+        assert supervisor_call(:post, "/addons/#{slug}/stop").status == 200
+        assert {:ok, %{state: :stopped}} = app_info(slug)
+      end
     end
   end
 

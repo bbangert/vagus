@@ -169,6 +169,19 @@ defmodule Vagus.API.BackupRouterTest do
     body(conn)["data"]["slug"]
   end
 
+  defp protect(slugs), do: put_env_for_test(:protected_apps, slugs)
+
+  defp put_env_for_test(key, value) do
+    prev = Application.get_env(:vagus, key)
+    Application.put_env(:vagus, key, value)
+
+    on_exit(fn ->
+      if prev,
+        do: Application.put_env(:vagus, key, prev),
+        else: Application.delete_env(:vagus, key)
+    end)
+  end
+
   describe "POST /backups/new/partial" do
     test "happy path: creates a backup listing the add-on, returns slug + job_id", %{
       data_root: dr
@@ -221,7 +234,7 @@ defmodule Vagus.API.BackupRouterTest do
       assert Enum.any?(b["addons"], &(&1["slug"] == "core_partial_bg"))
     end
 
-    test "a protected slug anywhere in the list refuses the whole request untouched", %{
+    test "the orchestrator anywhere in the list refuses the whole request untouched", %{
       data_root: dr
     } do
       install("core_restore_a", dr)
@@ -231,14 +244,8 @@ defmodule Vagus.API.BackupRouterTest do
       data_dir = Path.join([dr, "addons", "data", "core_restore_a"])
       File.write!(Path.join(data_dir, "f.txt"), "mutated")
 
-      prev = Application.get_env(:vagus, :orchestrator_app)
-      Application.put_env(:vagus, :orchestrator_app, "core_restore_orch")
-
-      on_exit(fn ->
-        if prev,
-          do: Application.put_env(:vagus, :orchestrator_app, prev),
-          else: Application.delete_env(:vagus, :orchestrator_app)
-      end)
+      protect(["core_restore_orch"])
+      put_env_for_test(:orchestrator_app, "core_restore_orch")
 
       conn =
         supervisor_call(:post, "/backups/#{slug}/restore/partial", %{
@@ -246,8 +253,28 @@ defmodule Vagus.API.BackupRouterTest do
         })
 
       assert conn.status == 400
-      assert body(conn)["message"] =~ "protected"
+      assert body(conn)["message"] =~ "orchestrator app cannot be restored"
       assert File.read!(Path.join(data_dir, "f.txt")) == "mutated"
+    end
+
+    test "the protected memory app is restored: its backup is its recovery", %{data_root: dr} do
+      install("agent_memory", dr)
+      slug = create_backup("agent_memory")
+      data_dir = Path.join([dr, "addons", "data", "agent_memory"])
+      File.write!(Path.join(data_dir, "f.txt"), "mutated")
+
+      protect(["agent_orchestrator", "agent_memory"])
+      put_env_for_test(:orchestrator_app, "agent_orchestrator")
+
+      conn =
+        supervisor_call(:post, "/backups/#{slug}/restore/partial", %{"addons" => ["agent_memory"]})
+
+      assert conn.status == 200, conn.resp_body
+      job = body(supervisor_call(:get, "/jobs/#{body(conn)["data"]["job_id"]}"))["data"]
+      assert job["done"] == true
+      assert job["errors"] == []
+      assert File.read!(Path.join(data_dir, "f.txt")) == "hello"
+      assert {:ok, %{state: :started}} = app_info("agent_memory")
     end
 
     test "a non-empty password -> 400" do
@@ -303,6 +330,22 @@ defmodule Vagus.API.BackupRouterTest do
       assert {:ok, %{state: :started}} = app_info("core_rt_cold")
 
       assert Fake.calls_for("addon_core_rt_hot") == []
+    end
+
+    test "a protected cold app is still stopped and started by its own backup", %{data_root: dr} do
+      install("core_rt_pcold", dr, :started, %{"backup" => "cold"})
+      protect(["core_rt_pcold"])
+      Fake.reset_calls()
+
+      conn = supervisor_call(:post, "/backups/new/partial", %{"addons" => ["core_rt_pcold"]})
+
+      assert conn.status == 200, conn.resp_body
+
+      assert [:stop, :remove | started] =
+               Enum.map(Fake.calls_for("addon_core_rt_pcold"), &elem(&1, 0))
+
+      assert :start in started
+      assert {:ok, %{state: :started}} = app_info("core_rt_pcold")
     end
 
     test "a busy app fails the backup with upstream's busy text naming it", %{data_root: dr} do

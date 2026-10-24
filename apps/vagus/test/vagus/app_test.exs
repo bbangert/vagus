@@ -64,9 +64,10 @@ defmodule Vagus.AppTest do
     end
   end
 
-  describe "the orchestrator app" do
+  describe "a protected app" do
     setup do
-      prev = Application.get_env(:vagus, :orchestrator_app)
+      prev = Application.get_env(:vagus, :protected_apps)
+      prev_orchestrator = Application.get_env(:vagus, :orchestrator_app)
       prev_backend = Application.get_env(:vagus, :addon_backend)
       prev_root = Application.get_env(:vagus, :addon_data_root)
       root = Path.join(System.tmp_dir!(), "app-test-#{System.unique_integer([:positive])}")
@@ -75,7 +76,8 @@ defmodule Vagus.AppTest do
 
       on_exit(fn ->
         for {key, value} <- [
-              orchestrator_app: prev,
+              protected_apps: prev,
+              orchestrator_app: prev_orchestrator,
               addon_backend: prev_backend,
               addon_data_root: prev_root
             ] do
@@ -88,6 +90,7 @@ defmodule Vagus.AppTest do
       end)
 
       slug = track(config(), state: :started)
+      Application.put_env(:vagus, :protected_apps, [slug])
       Application.put_env(:vagus, :orchestrator_app, slug)
       %{slug: slug}
     end
@@ -110,13 +113,14 @@ defmodule Vagus.AppTest do
 
     test "another app is not protected", %{slug: slug} do
       other = track(config(), state: :started)
-      assert App.orchestrator?(slug)
-      refute App.orchestrator?(other)
+      assert App.protected?(slug)
+      refute App.protected?(other)
       assert :ok = App.set(other, boot: "manual", watchdog: true)
       assert :ok = App.stop(other)
     end
 
-    test "is not restored, which would stop it and could leave it stopped", %{slug: slug} do
+    test "the orchestrator is not restored, which would overwrite its live login",
+         %{slug: slug} do
       assert {:error, :protected} = App.restore(slug, "/nonexistent", nil, false)
       assert {:ok, %{state: :started}} = app_info(slug)
     end
@@ -131,7 +135,7 @@ defmodule Vagus.AppTest do
 
     test "a start while it is stopped starts it" do
       stopped = track(config())
-      Application.put_env(:vagus, :orchestrator_app, stopped)
+      Application.put_env(:vagus, :protected_apps, [stopped])
       Backend.Fake.reset_calls()
 
       assert {:ok, %{slug: ^stopped}} = App.start(stopped)
@@ -148,18 +152,60 @@ defmodule Vagus.AppTest do
     end
 
     test "is not anything, nor is nil, with the key unset", %{slug: slug} do
-      Application.delete_env(:vagus, :orchestrator_app)
-      refute App.orchestrator?(slug)
-      refute App.orchestrator?(nil)
+      Application.delete_env(:vagus, :protected_apps)
+      refute App.protected?(slug)
+      refute App.protected?(nil)
     end
 
     test "nothing is protected with the key unset", %{slug: slug} do
-      Application.put_env(:vagus, :orchestrator_app, nil)
-      refute App.orchestrator?(slug)
+      Application.put_env(:vagus, :protected_apps, [])
+      refute App.protected?(slug)
       assert :ok = App.set(slug, boot: "manual", watchdog: true)
       assert {:ok, _} = App.restart(slug)
       assert :ok = App.stop(slug)
       assert :ok = App.uninstall(slug)
+    end
+
+    test "both agent apps are protected; only the orchestrator is refused a restore", %{
+      slug: slug
+    } do
+      memory = track(config(%{"backup" => "cold"}), state: :started)
+      Application.put_env(:vagus, :protected_apps, [slug, memory])
+
+      for app <- [slug, memory] do
+        assert App.protected?(app)
+        assert {:error, :protected} = App.stop(app)
+        assert {:error, :protected} = App.restart(app)
+        assert {:error, :protected} = App.uninstall(app)
+        assert {:error, :protected} = App.set(app, boot: "manual")
+        assert App.update(app, []) == {:error, :not_in_store}
+      end
+
+      # The memory DB's backup is how it is recovered.
+      assert {:error, :protected} = App.restore(slug, "/nonexistent", nil, false)
+      assert {:error, :bad_staging} = App.restore(memory, "/nonexistent", nil, false)
+    end
+
+    # The guard is on requests: the backup's own stop is the app's process's.
+    test "a cold backup still stops and starts it" do
+      memory = track(config(%{"backup" => "cold"}), state: :started)
+      Application.put_env(:vagus, :protected_apps, [memory])
+
+      staging =
+        Path.join(System.tmp_dir!(), "app-test-cold-#{System.unique_integer([:positive])}")
+
+      File.mkdir_p!(staging)
+      on_exit(fn -> File.rm_rf(staging) end)
+      stub_app_steps()
+
+      backup = Task.async(fn -> App.backup(memory, staging) end)
+      answer(:stop, {:ok, %{was_running: true}})
+      answer_snapshot(memory)
+      answer(:start, {:ok, %{container_id: "c2"}})
+
+      assert {:ok, path} = Task.await(backup)
+      assert path == Path.join(staging, memory <> ".tar.gz")
+      assert {:ok, %{state: :started}} = app_info(memory)
     end
   end
 
@@ -487,6 +533,24 @@ defmodule Vagus.AppTest do
     test "a slug neither the store nor the builtins know is not in the store" do
       slug = track(config())
       assert App.update(slug, []) == {:error, :not_in_store}
+    end
+
+    test "a protected app is updated" do
+      # Bridged, so its start ensures a network.
+      Vagus.Runtime.Engine.Fake.start_global()
+      prev = Application.get_env(:vagus, :protected_apps)
+      Application.put_env(:vagus, :protected_apps, ["agent_memory"])
+
+      on_exit(fn ->
+        App.uninstall("agent_memory")
+        Application.put_env(:vagus, :protected_apps, prev || [])
+      end)
+
+      {:ok, builtin} = Vagus.App.Units.builtin_config("agent_memory")
+      install_app(%{builtin | version: "pg16"}, state: :started)
+
+      assert {:ok, %{from: "pg16", to: "pg17"}} = App.update("agent_memory", [])
+      assert {:ok, %{config: %{version: "pg17"}, state: :started}} = app_info("agent_memory")
     end
   end
 

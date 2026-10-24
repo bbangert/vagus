@@ -217,6 +217,84 @@ a worker instead:
   The worker needs `--device /dev/gpiochipN`. Header pin names are
   board-specific, so record them in the task notes.
 
+## Memory
+
+**D9, one board-local memory database.** All the board's containers share one
+Postgres, reachable only from the board, instead of per-container file mounts:
+a mount means picking which worker may see which file, and cannot search by
+meaning. The cost is one more app to protect and back up.
+
+The `agent_memory` app runs `pgvector/pgvector:pg17` on `agentnet`, a private
+podman bridge (`172.30.40.0/24`, internal, no masquerade) at the static
+address `172.30.40.2:5432`, database `memory`, user `agent`. The port is not
+published. The image runs with `POSTGRES_HOST_AUTH_METHOD=trust` and
+`listen_addresses='*'`, so the real boundary is network reachability: the DB is
+reachable only from `agentnet` and from processes on the host network, which
+owns the bridge address `172.30.40.1`. Everything on the host network (the
+orchestrator, every worker, host-network apps such as ESPHome) connects as the
+`agent` superuser; bridged hassio apps and the LAN cannot reach it (internal
+bridge plus nft). This is an accepted consequence of D7 and D9. The app is
+protected like the orchestrator: stop, restart and uninstall are refused.
+
+Workers run on the host network by default and reach the DB (and the memory
+server below) through `172.30.40.1`. `agentnet` is internal (no default route,
+no DNS, agentnet to LAN dropped), so a worker started with `--network agentnet`
+alone has no Claude API access and cannot run `claude -p`; that mode is only
+for containers that need nothing but the DB or the memory server.
+
+**D10, one native memory server in Vagus.** The memory tools are served by an
+optional Elixir app, `vagus_memory`, in Vagus's own supervision tree (agent
+flavor only), with the pgvector container as the store. Why: no extra running
+apps, one embedder in RAM instead of one per worker, and no Python. It speaks
+MCP's Streamable HTTP transport at `http://172.30.40.1:8890/mcp` (host-network
+containers may use `http://127.0.0.1:8890/mcp`). There is no auth: the bind
+addresses (gateway and loopback) are the boundary, the same one that guards the
+DB. The server records `source_task` from the `X-Vagus-Task` header (fallback
+`?task=`). Tools: `remember(kind, scope, text, refs?)`, `recall(query, scope?,
+k?)`, `journal(task, entry)`, `device_note(device_id, text)`,
+`capture_register(path, meta)`, `forget(id, reason)`.
+
+`worker-config` registers it in each worker's `.claude.json`
+(`mcpServers.vagus-memory` as `{"type": "http", "url": ..., "headers":
+{"X-Vagus-Task": "<task>"}}`) and writes the usage rule into the worker's
+config-dir `CLAUDE.md`; the orchestrator's entrypoint does the same for itself.
+The embedding model runs inside Vagus; nothing leaves the board. The engine is
+decided separately.
+
+Schema v1:
+
+- `schema_version(version, model, dims)`: the embedding dims are learned from
+  the model on first connect
+- `memories(id, kind, scope, text, refs jsonb, embedding vector(dims), tsv,
+  source_task, created_at, superseded_by)`: `forget` sets `superseded_by`
+  instead of deleting
+- `tasks(id, name unique, started_at, finished_at, summary)`
+- `journal(id, task_id, at, entry)`: per-task running entries
+- `devices(id text, notes, updated_at)`: facts per device id
+- `captures(id, path, task_id, meta jsonb, created_at)`
+
+**Backup.** Cold: Vagus stops the app, tars PGDATA and restarts it, so the
+database is unavailable for a few seconds. A file copy of a running cluster
+would not be consistent, which is why it is not taken live. A memory call
+during that window can fail; the next one succeeds. A snapshot is refused past
+the 256 MiB a restore can inflate in memory, so a cluster beyond about 240 MiB
+(WAL included) needs a restore streamed to disk before it can be backed up: a
+follow-up.
+
+**Off-board copy.** Backups default to `/data/backup`, the same `/data` the
+database lives on. The memory survives container churn, reboots and Vagus
+restarts as is; to survive the loss of `/data` itself, download the backup off
+the board (`GET /backups/<slug>/download`).
+
+**Restore.** The memory app can be restored through the API (only the
+orchestrator cannot be): `POST /backups/<backup-slug>/restore/partial` with
+`{"addons": ["agent_memory"]}`.
+
+**By hand.** From the orchestrator: call the MCP tools, `vagus eval
+'Vagus.Memory.recall("<query>")'` over dist, or `psql
+postgresql://agent@172.30.40.2/memory` for raw queries. Never store
+credentials in it, and never drop or truncate its tables.
+
 ## Logging in
 
 The login is done once per board by the owner. It is a paste-code flow. From

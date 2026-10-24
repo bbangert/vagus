@@ -105,13 +105,13 @@ defmodule Vagus.App.Units do
   end
 
   # A container default app is revived after a crash and started at boot,
-  # which a request cannot later change for the orchestrator app (`App.set/2`).
+  # which a request cannot later change for a protected app (`App.set/2`).
   # The native broker is revived by its boot rule alone (`Policy.restart?/2`).
   defp install_settings(config) do
     if Steps.native?(config), do: [], else: [boot: "auto", watchdog: true]
   end
 
-  # An orchestrator installed before it was protected, or by a store install,
+  # A protected app installed before it was protected, or by a store install,
   # lacks them, and `App.set/2` refuses them to every request.
   defp ensure_settings(slug) do
     with {:ok, config} <- builtin_config(slug),
@@ -148,6 +148,45 @@ defmodule Vagus.App.Units do
     "host_dbus" => true
   }
 
+  # Cold, not a hot tar: a tar of a live cluster's PGDATA is not restorable,
+  # and pg_dump plus `backup_exclude` would need the exclude applied, which
+  # backups do not do yet. Its env is a per-slug hook (`Vagus.App.Steps`).
+  # A snapshot is refused past the 256 MiB a restore can inflate in memory,
+  # so a cluster beyond about 240 MiB (WAL included) needs a restore
+  # streamed to disk before it can be backed up.
+  # The watchdog dials Postgres's port, so a hung server is restarted.
+  @agent_memory %{
+    "name" => "Agent memory",
+    "version" => "pg17",
+    "slug" => "agent_memory",
+    "description" => "Postgres 17 with pgvector: the agents' memory, on the board-only agentnet.",
+    "arch" => ["aarch64"],
+    "image" => "docker.io/pgvector/pgvector",
+    "startup" => "application",
+    "boot" => "auto",
+    "init" => false,
+    "watchdog" => "tcp://[HOST]:5432",
+    "backup" => "cold"
+  }
+
+  # Native, so it runs only where `:native_addon_slugs` allows it (the agent
+  # flavor); its image is a placeholder that is never pulled.
+  @vagus_memory %{
+    "name" => "Agent memory server",
+    "version" => "1.0.0",
+    "slug" => "vagus_memory",
+    "description" => "MCP memory tools for the board's containers, over the agent memory DB.",
+    "arch" => ["amd64", "aarch64", "armv7", "armhf", "i386"],
+    "backend" => "native",
+    "image" => "local/vagus_memory",
+    "startup" => "services",
+    "boot" => "auto",
+    "init" => false,
+    "host_network" => false,
+    "options" => %{},
+    "schema" => %{}
+  }
+
   @doc """
   A default app's config, embedded so boot needs no store reload. The mqttx
   broker's is the store's own source, under the installed slug as the
@@ -155,6 +194,8 @@ defmodule Vagus.App.Units do
   """
   @spec builtin_config(String.t()) :: {:ok, Config.t()} | {:error, term()}
   def builtin_config("agent_orchestrator"), do: Config.parse(@agent_orchestrator)
+  def builtin_config("agent_memory"), do: Config.parse(@agent_memory)
+  def builtin_config("vagus_memory"), do: Config.parse(@vagus_memory)
 
   def builtin_config("core_mqtt" = slug) do
     with {:ok, config} <- Config.parse(BuiltinFetcher.config(:mqtt)),

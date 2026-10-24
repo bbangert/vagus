@@ -2943,8 +2943,11 @@ defmodule Vagus.API.Router do
   # Upstream's per-app job group refuses a second job outright.
   defp busy_message(slug), do: "Another job is running for job group app_#{slug}"
 
-  @protected_message "The agent orchestrator app is protected: it cannot be stopped, " <>
-                       "restarted, uninstalled or restored, nor its boot or watchdog changed"
+  @protected_message "The agent apps are protected: they cannot be stopped, " <>
+                       "restarted or uninstalled, nor their boot or watchdog changed"
+
+  @restore_protected_message "The agent orchestrator app cannot be restored: " <>
+                               "its live session would be overwritten"
 
   # The container did what was asked; the host failed to record it or to
   # clean up after it, which is no fault of the request.
@@ -3105,7 +3108,7 @@ defmodule Vagus.API.Router do
   # Checked here as well as in `App.set/2` so a refused `boot` cannot leave
   # the body's other keys applied.
   defp validate_protected_settings(slug, body) do
-    if App.orchestrator?(slug) and (Map.has_key?(body, "boot") or Map.has_key?(body, "watchdog")),
+    if App.protected?(slug) and (Map.has_key?(body, "boot") or Map.has_key?(body, "watchdog")),
       do: {:error, @protected_message},
       else: :ok
   end
@@ -3497,7 +3500,9 @@ defmodule Vagus.API.Router do
   # Restore runs per slug in order, so a protected slug late in the list would
   # be refused only after the earlier ones were already overwritten.
   defp reject_protected_restore(addon_slugs) do
-    if Enum.any?(addon_slugs, &App.orchestrator?/1), do: {:error, @protected_message}, else: :ok
+    if Enum.any?(addon_slugs, &App.orchestrator?/1),
+      do: {:error, @restore_protected_message},
+      else: :ok
   end
 
   defp run_backup_restore(conn, slug, addon_slugs) do
@@ -3536,7 +3541,9 @@ defmodule Vagus.API.Router do
 
   defp restore_error_message(message) when is_binary(message), do: message
   defp restore_error_message({:restore, addon_slug, :busy}), do: busy_message(addon_slug)
-  defp restore_error_message({:restore, _addon_slug, :protected}), do: @protected_message
+
+  defp restore_error_message({:restore, _addon_slug, :protected}),
+    do: @restore_protected_message
 
   defp restore_error_message({:restore, addon_slug, :shutting_down}),
     do: "Restore of addon #{addon_slug} was interrupted: the system is shutting down"

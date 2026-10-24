@@ -27,6 +27,7 @@ mkdir -p "$dir"
 refuse_symlink "$dir"
 refuse_symlink "$dir/.credentials.json"
 refuse_symlink "$dir/.claude.json"
+refuse_symlink "$dir/CLAUDE.md"
 [[ $(readlink -f "$dir") == "$root/$task" ]] \
   || { echo "worker-config: $dir resolves outside $root, refusing" >&2; exit 1; }
 mkdir -p "$dir/projects"
@@ -35,10 +36,66 @@ chmod 0700 "$dir"
 
 # Re-running refreshes only the login; the worker's own state is left alone.
 install -m 0600 "$creds" "$dir/.credentials.json"
-if [ ! -f "$dir/.claude.json" ]; then
+# $dir is the one place the worker can write, so it can swap a path for a symlink after
+# any check above. Everything is therefore read from a private copy made with `cp -P`
+# (never follows) and written to a scratch file beside $dir, then renamed over the target:
+# a rename replaces a symlink instead of following it (`mv -T`: a directory symlink at the
+# target must not swallow the file).
+scratch=$(mktemp -d "$root/.wc.XXXXXX")
+trap 'rm -rf "$scratch"' EXIT
+cfg=$scratch/in.json
+if [ -e "$dir/.claude.json" ] || [ -L "$dir/.claude.json" ]; then
+  src=$dir/.claude.json
+  # Bash cannot open O_NOFOLLOW, so a symlink swapped in after any shell check would be
+  # followed. O_NONBLOCK keeps an unwritten FIFO from hanging the open.
+  rc=0
+  python3 -I -c '
+import os, stat, sys
+try:
+    fd = os.open(sys.argv[1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+except OSError:
+    sys.exit(2)
+if not stat.S_ISREG(os.fstat(fd).st_mode):
+    sys.exit(3)
+data = os.read(fd, (1 << 20) + 1)
+if len(data) > 1 << 20:
+    sys.exit(4)
+sys.stdout.buffer.write(data)
+' "$src" > "$cfg" || rc=$?
+  case $rc in
+    0) ;;
+    4) echo "worker-config: $src is larger than 1 MiB, refusing" >&2; exit 1 ;;
+    *) echo "worker-config: $src is a symlink or not a regular file, refusing" >&2; exit 1 ;;
+  esac
+else
   jq -n '{hasCompletedOnboarding: true, remoteDialogSeen: true,
-          projects: {"/work": {hasTrustDialogAccepted: true}}}' > "$dir/.claude.json"
+          projects: {"/work": {hasTrustDialogAccepted: true}}}' > "$cfg"
 fi
+
+# Applied on every run, with `=`, so older configs (stdio, or made before the memory
+# server existed) are refreshed; the rest of the worker's state is left alone. The task
+# header is how the server records provenance. Workers are host-network, so they use the
+# gateway address; it must match Vagus.Network.Agentnet's host IP.
+out=$(mktemp "$scratch/out.XXXXXX")
+jq --arg task "$task" \
+  '.mcpServers["vagus-memory"] = {type: "http", url: "http://172.30.40.1:8890/mcp",
+     headers: {"X-Vagus-Task": $task}}' "$cfg" > "$out"
+mv -T -- "$out" "$dir/.claude.json"
+
+# User-scope memory file of this CLAUDE_CONFIG_DIR: the one place a worker reads rules
+# from that its writable /work cannot shadow. Rewritten each run so the rule stays current.
+out=$(mktemp "$scratch/out.XXXXXX")
+cat > "$out" <<'RULES'
+# Board memory
+
+The `vagus-memory` MCP server is this board's shared, persistent memory.
+
+- Before you start, `recall` what earlier tasks learned about this work.
+- As you go, `journal` what you tried and what happened, so a restart can resume.
+- Before you report, `remember` what you learned that the next task would need.
+- Never store secrets in memory: no passwords, tokens, keys or cookies.
+RULES
+mv -T -- "$out" "$dir/CLAUDE.md"
 
 # Ownership matters only when run as root (`podman exec` without `--user agent`).
 if [ "$(id -u)" = 0 ]; then

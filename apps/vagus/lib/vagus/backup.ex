@@ -52,6 +52,14 @@ defmodule Vagus.Backup do
   # generous enough never to reject something that guard would accept.
   @max_inner_compressed @max_inner_uncompressed + 1_048_576
 
+  # An app's snapshot is refused at the size its restore can inflate
+  # (`@max_inner_uncompressed`), counted in tar bytes, so no backup is made
+  # that cannot be restored. Each entry is charged its header, a worst-case
+  # PAX header for its name, and its 512-byte padding; the trailer is at
+  # most a padding block and two zero blocks.
+  @tar_block 512
+  @tar_trailer 3 * @tar_block
+
   # Heap ceiling for the tar-reading child processes (`bounded/1`), in WORDS
   # — 32M words ≈ 256MB on a 64-bit VM, matching `@max_inner_uncompressed`
   # (the largest member any read path legitimately materialises).
@@ -131,12 +139,14 @@ defmodule Vagus.Backup do
   end
 
   @doc """
-  Extracts one add-on from a backup: the decoded `addon.json` plus its `data/`
-  files as `[{relative_path, content}]`. Returns `{:error, :not_in_backup}` if
+  Extracts one add-on from a backup: the decoded `addon.json`, its `data/`
+  files as `[{relative_path, content}]` and its directories as
+  `[{relative_path, mode}]`. Returns `{:error, :not_in_backup}` if
   the add-on's inner tar is absent.
   """
   @spec extract_addon(binary(), String.t()) ::
-          {:ok, %{addon: term(), data: [{String.t(), binary()}]}} | {:error, term()}
+          {:ok, %{addon: term(), data: [{String.t(), binary()}], dirs: [{String.t(), integer()}]}}
+          | {:error, term()}
   def extract_addon(tar, slug) when is_binary(tar) do
     with :ok <- guard_outer_size(tar),
          {:ok, entries} <- untar_plain(tar),
@@ -155,7 +165,8 @@ defmodule Vagus.Backup do
   never the whole outer tar.
   """
   @spec extract_addon_file(Path.t(), String.t()) ::
-          {:ok, %{addon: term(), data: [{String.t(), binary()}]}} | {:error, term()}
+          {:ok, %{addon: term(), data: [{String.t(), binary()}], dirs: [{String.t(), integer()}]}}
+          | {:error, term()}
   def extract_addon_file(path, slug) do
     with {:ok, entries} <- table(path),
          {:ok, {name, size}} <- find_table_entry(entries, "#{slug}.tar.gz"),
@@ -171,11 +182,47 @@ defmodule Vagus.Backup do
   # The shared inner half of `extract_addon/2` and `extract_addon_file/2`:
   # capped gunzip, `addon.json`, zip-slip-guarded `data/` collection.
   defp decode_addon_inner(inner_gz) do
-    with {:ok, inner} <- Vagus.Targz.extract_capped(inner_gz, @max_inner_uncompressed),
+    with {:ok, tar} <- Vagus.Targz.gunzip_capped(inner_gz, @max_inner_uncompressed),
+         {:ok, inner} <- untar_plain(tar),
          {:ok, addon_json} <- fetch_member(inner, "addon.json"),
          {:ok, addon} <- Jason.decode(addon_json),
-         {:ok, data} <- collect_data(inner) do
-      {:ok, %{addon: addon, data: data}}
+         {:ok, data} <- collect_data(inner),
+         {:ok, dirs} <- directories(tar) do
+      {:ok, %{addon: addon, data: data, dirs: dirs}}
+    end
+  end
+
+  @doc false
+  # Memory extraction drops directory members, so they are read from the
+  # table: `[{relative_path, mode}]`, guarded as `collect_data/1` is. The
+  # cap bounds the tar's bytes, not the names and tuples a directory-heavy
+  # one makes, so the pass runs `bounded/3`. `heap_words` is for tests.
+  @spec directories(binary(), pos_integer()) ::
+          {:ok, [{String.t(), integer()}]} | {:error, term()}
+  def directories(tar, heap_words \\ @tar_read_heap_words),
+    do: bounded(fn -> collect_dirs(tar) end, @tar_read_timeout_ms, heap_words)
+
+  defp collect_dirs(tar) do
+    case :erl_tar.table({:binary, tar}, [:verbose]) do
+      {:ok, entries} ->
+        entries
+        |> Enum.filter(&match?({_name, :directory, _, _, _, _, _}, &1))
+        |> Enum.reduce_while({:ok, []}, fn {name, _, _, _, mode, _, _}, {:ok, acc} ->
+          rel = name |> to_string() |> strip_dot() |> String.trim_trailing("/")
+
+          cond do
+            not String.starts_with?(rel, "data/") -> {:cont, {:ok, acc}}
+            unsafe_path?(rel) -> {:halt, {:error, {:unsafe_path, rel}}}
+            true -> {:cont, {:ok, [{String.replace_prefix(rel, "data/", ""), mode} | acc]}}
+          end
+        end)
+        |> case do
+          {:ok, dirs} -> {:ok, Enum.reverse(dirs)}
+          error -> error
+        end
+
+      {:error, reason} ->
+        {:error, {:untar, reason}}
     end
   end
 
@@ -307,8 +354,13 @@ defmodule Vagus.Backup do
           "state" => Map.get(addon, :state, "started")
         })
 
+      left =
+        Map.get(addon, :max_bytes, @max_inner_uncompressed) - @tar_trailer -
+          entry_cost("./addon.json", byte_size(addon_json))
+
+      if left < 0, do: throw(:too_large)
       add!(tar, addon_json, ~c"./addon.json")
-      add_dir(tar, addon.data_dir, Map.get(addon, :max_bytes, @max_outer))
+      add_dir(tar, addon.data_dir, left)
     end)
     |> case do
       {:error, {:raised, msg}} -> {:error, {:addon_tar, addon.slug, msg}}
@@ -324,20 +376,45 @@ defmodule Vagus.Backup do
   # In that window the app can rename a symlink over a name already lstat'd:
   # a file is read only through a descriptor that is still the lstat'd file,
   # and a directory swapped that way (the BEAM has no `openat`) is bounded by
-  # `max_bytes` across the walk rather than copying the host into the backup.
+  # `budget` across the walk rather than copying the host into the backup.
   # path is internal/config-derived, not request input
   # sobelow_skip ["Traversal.FileModule"]
-  defp add_dir(tar, dir, max_bytes) do
+  defp add_dir(tar, dir, budget) do
     case File.lstat(dir) do
-      {:ok, %File.Stat{type: :directory}} -> add_tree(tar, dir, [], max_bytes)
+      {:ok, %File.Stat{type: :directory}} -> with_stand_in(&add_tree(tar, dir, [], budget, &1))
       {:ok, %File.Stat{}} -> :ok
       {:error, :enoent} -> :ok
       {:error, reason} -> throw({:read, ".", reason})
     end
   end
 
+  # erl_tar writes a directory's own header only when handed an empty one,
+  # and recurses into any other without the walk's guards. Every directory
+  # is therefore entered through this stand-in, always empty and chmod'ed to
+  # the directory's mode first, so a restore recreates the empty ones (a
+  # Postgres cluster will not start without its `pg_*` dirs) with their mode.
   # sobelow_skip ["Traversal.FileModule"]
-  defp add_tree(tar, root, rel, left) do
+  defp with_stand_in(fun) do
+    stand_in =
+      Path.join(System.tmp_dir!(), "vagus-backup-dir-#{System.unique_integer([:positive])}")
+
+    File.mkdir_p!(stand_in)
+
+    try do
+      fun.(stand_in)
+    after
+      File.rm_rf(stand_in)
+    end
+  end
+
+  # sobelow_skip ["Traversal.FileModule"]
+  defp add_dir_entry(tar, stand_in, member, mode) do
+    File.chmod!(stand_in, Bitwise.band(mode, 0o7777))
+    add!(tar, String.to_charlist(stand_in), String.to_charlist("./data/" <> Path.join(member)))
+  end
+
+  # sobelow_skip ["Traversal.FileModule"]
+  defp add_tree(tar, root, rel, left, stand_in) do
     [root | rel]
     |> Path.join()
     |> File.ls!()
@@ -347,17 +424,18 @@ defmodule Vagus.Backup do
       path = Path.join([root | member])
 
       case File.lstat(path) do
-        {:ok, %File.Stat{type: :directory}} ->
-          add_tree(tar, root, member, left)
-
-        {:ok, %File.Stat{type: :regular, size: size}} when size > left ->
-          throw(:too_large)
+        {:ok, %File.Stat{type: :directory, mode: mode}} ->
+          left = charge(left, member, 0)
+          add_dir_entry(tar, stand_in, member, mode)
+          add_tree(tar, root, member, left, stand_in)
 
         {:ok, %File.Stat{type: :regular} = seen} ->
+          left = charge(left, member, seen.size)
+
           case read_regular(path, seen) do
             {:ok, content} ->
               add!(tar, content, String.to_charlist("./data/" <> Path.join(member)))
-              left - seen.size
+              left
 
             :skip ->
               skipped(member, left)
@@ -378,6 +456,18 @@ defmodule Vagus.Backup do
       end
     end)
   end
+
+  defp charge(left, member, size) do
+    case left - entry_cost("./data/" <> Path.join(member), size) do
+      rest when rest < 0 -> throw(:too_large)
+      rest -> rest
+    end
+  end
+
+  defp entry_cost(name, size),
+    do: @tar_block + @tar_block + padded(byte_size(name) + 64) + padded(size)
+
+  defp padded(bytes), do: div(bytes + @tar_block - 1, @tar_block) * @tar_block
 
   defp skipped(member, left) do
     Logger.warning("Vagus.Backup: #{Path.join(member)} changed while read; not backed up")
@@ -591,16 +681,17 @@ defmodule Vagus.Backup do
   # process spawn, not a data copy. Public (`@doc false`) only so the timeout
   # path can be tested with a short deadline.
   @doc false
-  @spec bounded((-> result), timeout()) :: result | {:error, {:tar_read_failed, term()}}
+  @spec bounded((-> result), timeout(), pos_integer()) ::
+          result | {:error, {:tar_read_failed, term()}}
         when result: term()
-  def bounded(fun, timeout_ms \\ @tar_read_timeout_ms) do
+  def bounded(fun, timeout_ms \\ @tar_read_timeout_ms, heap_words \\ @tar_read_heap_words) do
     parent = self()
     ref = make_ref()
 
     {pid, monitor} =
       :erlang.spawn_opt(fn -> send(parent, {ref, fun.()}) end, [
         :monitor,
-        {:max_heap_size, %{size: @tar_read_heap_words, kill: true, error_logger: true}}
+        {:max_heap_size, %{size: heap_words, kill: true, error_logger: true}}
       ])
 
     receive do

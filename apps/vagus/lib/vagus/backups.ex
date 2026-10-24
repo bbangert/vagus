@@ -389,9 +389,10 @@ defmodule Vagus.Backups do
   defp preflight_addon(path, slug) do
     with :ok <- validate_slug(slug),
          :ok <- installed(slug),
-         {:ok, %{addon: addon, data: files}} <- Vagus.Backup.extract_addon_file(path, slug),
+         {:ok, %{addon: addon, data: data, dirs: dirs}} <-
+           Vagus.Backup.extract_addon_file(path, slug),
          {:ok, options, start?} <- addon_fields(addon) do
-      {:ok, {slug, options, start?, files}}
+      {:ok, {slug, options, start?, {dirs, data}}}
     else
       {:error, {:invalid_slug, _}} -> {:error, "Addon #{slug} not in backup"}
       {:error, :not_installed} -> {:error, "Addon #{slug} is not installed"}
@@ -483,14 +484,34 @@ defmodule Vagus.Backups do
   # `Vagus.Backup.extract_addon/2` already zip-slip-guards these relative
   # paths, so materializing them under `dir` is safe. Non-bang `File` calls,
   # so a disk-full or permission failure is an error rather than a 500.
+  # Directories first, so an empty one comes back too, with its permission
+  # bits. Owners are not kept: all of it is root's. An app that drops to a
+  # user of its own re-owns its tree at start (the Postgres entrypoint
+  # chowns its PGDATA as root before dropping to uid 999).
   # path is internal/config-derived, not request input
   # sobelow_skip ["Traversal.FileModule"]
-  defp materialize(dir, files) do
-    Enum.reduce_while(files, :ok, fn {rel, content}, :ok ->
+  defp materialize(dir, {dirs, files}) do
+    with :ok <- make_dirs(dir, dirs) do
+      Enum.reduce_while(files, :ok, fn {rel, content}, :ok ->
+        path = Path.join(dir, rel)
+
+        with :ok <- File.mkdir_p(Path.dirname(path)),
+             :ok <- File.write(path, content) do
+          {:cont, :ok}
+        else
+          {:error, _reason} = error -> {:halt, error}
+        end
+      end)
+    end
+  end
+
+  # sobelow_skip ["Traversal.FileModule"]
+  defp make_dirs(dir, dirs) do
+    Enum.reduce_while(dirs, :ok, fn {rel, mode}, :ok ->
       path = Path.join(dir, rel)
 
-      with :ok <- File.mkdir_p(Path.dirname(path)),
-           :ok <- File.write(path, content) do
+      with :ok <- File.mkdir_p(path),
+           :ok <- File.chmod(path, Bitwise.band(mode, 0o777)) do
         {:cont, :ok}
       else
         {:error, _reason} = error -> {:halt, error}

@@ -86,6 +86,12 @@ defmodule Vagus.MixProject do
       {:fresh, path: "../../vendor/fresh"},
       {:jason, "~> 1.4"},
 
+      # The agent flavor's memory server (`Vagus.Memory`) talks to the
+      # board's Postgres + pgvector app directly; no Ecto. `pgvector` adds
+      # the `vector` Postgrex extension.
+      {:postgrex, "~> 0.22"},
+      {:pgvector, "~> 0.4"},
+
       # Native MQTT broker (M5, vagus-mqtt): pure-Elixir MQTT 5.0
       # client/server/codec, embedded as a BEAM-subtree "virtual add-on"
       # behind the `Vagus.Addon.Backend.Native` seam — replaces the

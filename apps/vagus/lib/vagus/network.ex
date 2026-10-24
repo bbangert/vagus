@@ -298,10 +298,16 @@ defmodule Vagus.Network do
   `(binary, args) -> {output, status}`. Returns the first failure.
   """
   @spec ensure_bridge(keyword()) :: :ok | {:error, {[String.t()], String.t(), integer()}}
-  def ensure_bridge(opts \\ []) do
+  def ensure_bridge(opts \\ []), do: run_ip(bridge_commands(), opts)
+
+  @doc false
+  # Shared with `Vagus.Network.Agentnet`, whose bridge is kept the same way.
+  @spec run_ip([[String.t()]], keyword()) ::
+          :ok | {:error, {[String.t()], String.t(), integer()}}
+  def run_ip(commands, opts) do
     cmd = Keyword.get(opts, :ip_cmd, &Vagus.Host.Cmd.run/2)
 
-    Enum.reduce_while(bridge_commands(), :ok, fn args, :ok ->
+    Enum.reduce_while(commands, :ok, fn args, :ok ->
       case cmd.("ip", args) do
         {_out, 0} ->
           {:cont, :ok}
@@ -316,13 +322,18 @@ defmodule Vagus.Network do
 
   @doc "The `ip` invocations `ensure_bridge/1` runs, in order."
   @spec bridge_commands() :: [[String.t()]]
-  def bridge_commands do
+  def bridge_commands,
+    do: bridge_commands(@name, @bridge_port, "#{@anchors.gateway}/#{@prefix}")
+
+  @doc false
+  @spec bridge_commands(String.t(), String.t(), String.t()) :: [[String.t()]]
+  def bridge_commands(bridge, port, gateway_cidr) do
     [
-      ["link", "add", @name, "type", "bridge"],
-      ["link", "add", @bridge_port, "type", "dummy"],
-      ["link", "set", @bridge_port, "master", @name, "up"],
-      ["addr", "add", "#{@anchors.gateway}/#{@prefix}", "dev", @name],
-      ["link", "set", @name, "up"]
+      ["link", "add", bridge, "type", "bridge"],
+      ["link", "add", port, "type", "dummy"],
+      ["link", "set", port, "master", bridge, "up"],
+      ["addr", "add", gateway_cidr, "dev", bridge],
+      ["link", "set", bridge, "up"]
     ]
   end
 
@@ -332,8 +343,8 @@ defmodule Vagus.Network do
   entirety, so excluding it would strand a board on an ordinary
   `172.20.x.x` LAN.
 
-  OBSERVED on a dragon_q6a: `hassio` (the one network Vagus creates) and
-  `balena0` (balenaEngine's default bridge); `br-` covers any further bridge
+  OBSERVED on a dragon_q6a: `hassio` (the network Vagus creates; the agent
+  flavor adds `agentnet`, `Vagus.Network.Agentnet`) and `balena0` (balenaEngine's default bridge); `br-` covers any further bridge
   balena names for itself. podman's netavark names its bridges `podman0`,
   `podman1`, …; its host-side veth peers carry no IPv4. There is no
   `docker0` because this product does not run plain Docker.
@@ -342,7 +353,7 @@ defmodule Vagus.Network do
   def container_interface?(ifname) do
     name = to_string(ifname)
 
-    name in ["hassio", "balena0"] or String.starts_with?(name, "br-") or
+    name in ["hassio", "agentnet", "balena0"] or String.starts_with?(name, "br-") or
       Regex.match?(~r/\Apodman\d+\z/, name)
   end
 

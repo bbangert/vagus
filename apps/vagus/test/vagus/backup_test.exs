@@ -2,6 +2,8 @@ defmodule Vagus.BackupTest do
   @moduledoc "P6-T1: unprotected backup create/read/extract round-trip."
   use ExUnit.Case, async: true
 
+  import ExUnit.CaptureLog
+
   alias Vagus.Backup
 
   setup do
@@ -82,6 +84,20 @@ defmodule Vagus.BackupTest do
     assert map["sub/nested.txt"] == "nested content"
   end
 
+  test "every directory is an entry with its mode, an empty one included", %{data: data} do
+    File.mkdir_p!(Path.join(data, "sub/empty"))
+    File.chmod!(Path.join(data, "sub/empty"), 0o700)
+    File.ln_s!(Path.dirname(data), Path.join(data, "linked"))
+
+    tar = create!(spec(data))
+    {:ok, %{data: files, dirs: dirs}} = Backup.extract_addon(tar, "core_mosquitto")
+
+    dirs = Map.new(dirs, fn {rel, mode} -> {rel, Bitwise.band(mode, 0o777)} end)
+    assert Map.keys(dirs) |> Enum.sort() == ["sub", "sub/empty"]
+    assert dirs["sub/empty"] == 0o700
+    assert Map.new(files)["sub/nested.txt"] == "nested content"
+  end
+
   test "symlinks the app planted are skipped, never followed to host files", %{data: data} do
     host = Path.join(Path.dirname(data), "host")
     File.mkdir_p!(host)
@@ -148,18 +164,37 @@ defmodule Vagus.BackupTest do
     end
   end
 
-  test "an app's data beyond the byte cap fails the snapshot rather than filling memory", %{
-    data: data
-  } do
+  # The cap is in tar bytes, so the restore's inflation cap, the same
+  # number, always takes what the snapshot made.
+  test "a snapshot over the cap is refused, and one under it inflates within it", %{data: data} do
+    File.mkdir_p!(Path.join(data, "empty"))
+    File.mkdir_p!(Path.join(data, String.duplicate("long", 40)))
+    File.write!(Path.join([data, String.duplicate("long", 40), "f"]), String.duplicate("x", 700))
+    for i <- 1..20, do: File.write!(Path.join(data, "small#{i}"), "#{i}")
+
     addon = %{slug: "x", version: "1", data_dir: data}
-    total = byte_size(~s({"require_certificate":false})) + byte_size("nested content")
     path = Path.join(Path.dirname(data), "x.tar.gz")
+    write = &Backup.write_addon_tar(Map.put(addon, :max_bytes, &1), path)
 
-    assert :ok = Backup.write_addon_tar(Map.put(addon, :max_bytes, total), path)
+    # The smallest cap that takes it.
+    cap =
+      Stream.unfold({0, 4_000_000}, fn
+        {lo, hi} when lo >= hi ->
+          nil
 
-    assert {:error, :too_large} =
-             Backup.write_addon_tar(Map.put(addon, :max_bytes, total - 1), path)
+        {lo, hi} ->
+          mid = div(lo + hi, 2)
+          next = if write.(mid) == :ok, do: {lo, mid}, else: {mid + 1, hi}
+          {next, next}
+      end)
+      |> Enum.reduce(fn x, _ -> x end)
+      |> elem(0)
 
+    assert write.(cap) == :ok
+    {:ok, tar} = Vagus.Targz.gunzip_capped(File.read!(path), cap)
+    assert byte_size(tar) <= cap
+
+    assert write.(cap - 1) == {:error, :too_large}
     refute File.exists?(path)
   end
 
@@ -554,6 +589,27 @@ defmodule Vagus.BackupTest do
     )
 
     path
+  end
+
+  describe "directories/2" do
+    test "a directory-heavy tar past the heap bound is an error, not an OOM" do
+      root = Path.join(System.tmp_dir!(), "vagus-dirs-#{System.unique_integer([:positive])}")
+      for i <- 1..2_000, do: File.mkdir_p!(Path.join([root, "data", "d#{i}"]))
+      on_exit(fn -> File.rm_rf(root) end)
+
+      path = Path.join(root, "inner.tar")
+      {:ok, t} = :erl_tar.open(String.to_charlist(path), [:write])
+      :ok = :erl_tar.add(t, String.to_charlist(Path.join(root, "data")), ~c"./data", [])
+      :ok = :erl_tar.close(t)
+      tar = File.read!(path)
+
+      assert {:ok, dirs} = Backup.directories(tar)
+      assert length(dirs) == 2_000
+
+      capture_log(fn ->
+        assert {:error, {:tar_read_failed, _}} = Backup.directories(tar, 10_000)
+      end)
+    end
   end
 
   describe "bounded/2 deadline" do

@@ -539,13 +539,72 @@ defmodule Vagus.Runtime.Engine.Podman do
 
     case run(:ensure_network, ["network", "exists", "--", name], opts, @query_ms) do
       {:ok, _} ->
-        :ok
+        if spec.internal, do: ensure_internal(spec, opts), else: :ok
 
       {:exit, 1, _} ->
-        unit(:ensure_network, run(:ensure_network, render_network(spec), opts, @lifecycle_ms))
+        create_network(spec, opts)
 
       other ->
         unit(:ensure_network, other)
+    end
+  end
+
+  defp create_network(spec, opts),
+    do: unit(:ensure_network, run(:ensure_network, render_network(spec), opts, @lifecycle_ms))
+
+  # `exists` says nothing of how a network was made: one made without
+  # `--internal` would masquerade its containers out, one with another lease
+  # range could hand a reserved address to a dynamic container, and one on
+  # another interface would leave the host's gateway off its bridge. A
+  # leftover that differs is remade, which podman refuses while a container
+  # is attached: then it is an error, never a silently different network.
+  # Only internal specs are checked, so `hassio` is never remade under its
+  # apps.
+  defp ensure_internal(%NetworkSpec{name: name} = spec, opts) do
+    case run(:ensure_network, ["network", "inspect", "--", name], opts, @query_ms) do
+      {:ok, out} ->
+        case decode(:ensure_network, out) do
+          {:ok, [network]} ->
+            if as_specified?(network, spec), do: :ok, else: recreate(spec, opts)
+
+          {:ok, _other} ->
+            {:error, {:failed, :ensure_network, :bad_json}}
+
+          error ->
+            error
+        end
+
+      other ->
+        unit(:ensure_network, other)
+    end
+  end
+
+  defp as_specified?(%{"internal" => internal, "subnets" => [subnet]} = network, spec) do
+    range =
+      case subnet["lease_range"] do
+        %{"start_ip" => first, "end_ip" => last} -> "#{first}-#{last}"
+        _none -> nil
+      end
+
+    internal == spec.internal and network["network_interface"] == spec.interface_name and
+      subnet["subnet"] == spec.subnet and
+      subnet["gateway"] == spec.gateway and range == (spec.ip_range && ip_range(spec.ip_range))
+  end
+
+  defp as_specified?(_network, _spec), do: false
+
+  defp recreate(%NetworkSpec{name: name} = spec, opts) do
+    case run(:ensure_network, ["network", "rm", "--", name], opts, @lifecycle_ms) do
+      {:ok, _} ->
+        create_network(spec, opts)
+
+      other ->
+        Logger.warning(
+          "Engine.Podman: network #{name} is not as specified and cannot be remade: " <>
+            inspect(other)
+        )
+
+        {:error, {:failed, :ensure_network, :mismatch}}
     end
   end
 
@@ -560,7 +619,8 @@ defmodule Vagus.Runtime.Engine.Podman do
       flag("--subnet", spec.subnet) ++
       flag("--gateway", spec.gateway) ++
       flag("--ip-range", spec.ip_range && ip_range(spec.ip_range)) ++
-      flag("--interface-name", spec.interface_name) ++ ["--", spec.name]
+      flag("--interface-name", spec.interface_name) ++
+      bool("--internal", spec.internal) ++ ["--", spec.name]
   end
 
   # A CIDR range would start at network + 1; the start-end form keeps the
@@ -614,6 +674,7 @@ defmodule Vagus.Runtime.Engine.Podman do
       env(spec.env, spec.secret_env),
       Enum.flat_map(Enum.sort(spec.labels || %{}), fn {k, v} -> ["--label", "#{k}=#{v}"] end),
       network(bridge, spec.network_aliases),
+      if(bridge, do: flag("--ip", spec.ip), else: []),
       dns(bridge, spec),
       hosts(bridge, spec.extra_hosts),
       Enum.flat_map(spec.mounts || [], &["--mount", mount(&1)]),

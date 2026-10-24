@@ -216,7 +216,7 @@ defmodule Vagus.NetworkTest do
 
   describe "container_interface?/1" do
     test "names the engines' bridges, and only those" do
-      for name <- ["hassio", "balena0", "br-3f2a", "podman0", "podman12", ~c"podman1"] do
+      for name <- ["hassio", "agentnet", "balena0", "br-3f2a", "podman0", "podman12", ~c"podman1"] do
         assert Network.container_interface?(name), inspect(name)
       end
 

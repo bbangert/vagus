@@ -17,7 +17,7 @@ defmodule Vagus.App.Steps do
   alias Vagus.DSP
   alias Vagus.Ingress.Panels
   alias Vagus.Network
-  alias Vagus.Network.Nat
+  alias Vagus.Network.{Agentnet, Nat}
   alias Vagus.Runtime.{Engine, Host}
 
   @default_backend Vagus.Addon.Backend.Container
@@ -356,7 +356,7 @@ defmodule Vagus.App.Steps do
       |> Keyword.new()
       |> put_backend(input.config)
 
-  # A native app's address is the supervisor anchor its broker listens on.
+  # A native app's address is the supervisor anchor its subtree listens on.
   # A container's is read once here; a failed inspect leaves no DNS record
   # and no ingress target, and the app still runs.
   defp started(%Config{} = config, id, opts) do
@@ -364,7 +364,7 @@ defmodule Vagus.App.Steps do
       %{
         container_id: id,
         ip: Network.supervisor_ip(),
-        pid: Process.whereis(Native.broker_name(id))
+        pid: Process.whereis(Native.subtree_name(id))
       }
     else
       inspect_started(config, id, opts)
@@ -482,7 +482,11 @@ defmodule Vagus.App.Steps do
   defp hook_result({:error, _reason} = error), do: error
 
   defp bridge_ip(%Config{host_network: true}, _container), do: nil
-  defp bridge_ip(_config, container), do: (container.ips || %{})[Network.name()]
+  # The memory app's address is on agentnet; it is what its watchdog dials.
+  defp bridge_ip(config, container) do
+    network = if Vagus.App.memory_app?(config.slug), do: Agentnet.name(), else: Network.name()
+    (container.ips || %{})[network]
+  end
 
   defp pick_port(_directory, _probe, _rand, 0), do: {:error, :no_free_port}
 
@@ -596,6 +600,57 @@ defmodule Vagus.App.Steps do
       uts_mode: if(config.host_uts, do: "host", else: nil),
       platform: platform(arch)
     }
+    |> memory_spec(config, data_root)
+  end
+
+  # The memory DB sits alone at a fixed address on the internal `agentnet`
+  # (`Vagus.Network.Agentnet`), where the Supervisor and its DNS are out of
+  # reach, so neither they nor the Supervisor token are handed to it.
+  #
+  # The cluster gets its own bind at the image's PGDATA rather than a
+  # subdir of `/data`: the entrypoint drops to uid 999, which cannot
+  # traverse the root-owned 0700 `/data`, while it chowns its own PGDATA
+  # mount itself. The bind also takes the place of the image's anonymous
+  # VOLUME, which would leak a volume per create. It is a subdir of the data
+  # dir, so the app's cold backup copies it, and initdb finds it empty on a
+  # fresh install (`ensure_mount_sources/1` makes it).
+  #
+  # No host `/dev` bind: the DB uses no host device, and podman's private
+  # `/dev` has the `/dev/fd` the entrypoint's process substitution needs
+  # (its `--tmpfs /dev/shm` stays).
+  #
+  # Config has no `environment` key, so the env lives here. Trust auth: the
+  # only routes to the DB are the internal bridge and the host.
+  defp memory_spec(spec, %Config{slug: slug}, data_root) do
+    if Vagus.App.memory_app?(slug) do
+      pgdata = %{
+        source: Path.join(data_dir(data_root, slug), "pgdata"),
+        target: "/var/lib/postgresql/data",
+        read_only: false,
+        propagation: nil
+      }
+
+      %{
+        spec
+        | network_name: Agentnet.name(),
+          ip: Agentnet.memory_ip(),
+          dns: [],
+          dns_search: [],
+          dns_options: [],
+          extra_hosts: %{},
+          env:
+            spec.env
+            |> Map.drop(["SUPERVISOR_TOKEN", "HASSIO_TOKEN"])
+            |> Map.merge(%{
+              "POSTGRES_HOST_AUTH_METHOD" => "trust",
+              "POSTGRES_DB" => "memory",
+              "POSTGRES_USER" => "agent"
+            }),
+          mounts: Enum.reject(spec.mounts, &(&1.target == "/dev")) ++ [pgdata]
+      }
+    else
+      spec
+    end
   end
 
   defp backend(opts), do: Keyword.get(opts, :backend, default_backend())
@@ -629,7 +684,20 @@ defmodule Vagus.App.Steps do
   # attach, so don't stand the bridge up on their account. A declared
   # `native` outside the allowlist is a container (`put_backend/2`).
   defp maybe_ensure_network(config, opts) do
-    if native?(config), do: :ok, else: ensure_network(opts)
+    cond do
+      native?(config) -> :ok
+      Vagus.App.memory_app?(config.slug) -> ensure_agentnet(opts)
+      true -> ensure_network(opts)
+    end
+  end
+
+  # Forced on: the memory app is installed only on the agent flavor, and a
+  # missing network is the failure to surface, not a no-op.
+  defp ensure_agentnet(opts) do
+    case Agentnet.ensure(Keyword.put(engine_opts(opts), :agentnet, true)) do
+      :ok -> :ok
+      {:error, reason} -> {:error, {:network, reason}}
+    end
   end
 
   defp ensure_network(opts) do
@@ -656,8 +724,17 @@ defmodule Vagus.App.Steps do
   # allowlist that declares `native` still runs as a container
   # (`put_backend/2`).
   defp ensure_isolation(config, opts) do
-    if native?(config), do: :ok, else: nat_loaded(opts)
+    cond do
+      native?(config) -> :ok
+      Vagus.App.memory_app?(config.slug) -> nat_loaded(force_agentnet_rule(opts))
+      true -> nat_loaded(opts)
+    end
   end
+
+  # As `ensure_agentnet/1` forces the bridge on, a table this start loads
+  # carries the rule that keeps `hassio` out of it.
+  defp force_agentnet_rule(opts),
+    do: Keyword.update(opts, :nat_opts, [agentnet: true], &Keyword.put(&1, :agentnet, true))
 
   defp nat_loaded(opts) do
     case Nat.ensure_loaded(Keyword.get(opts, :nat_opts, [])) do

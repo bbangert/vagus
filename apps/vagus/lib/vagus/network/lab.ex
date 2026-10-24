@@ -13,7 +13,7 @@ defmodule Vagus.Network.Lab do
 
   `up/3` refuses an interface VintageNet already holds a configuration for
   (`:configured`), and a cidr overlapping the `hassio` bridge's
-  `172.30.32.0/23`, the primary interface's own subnet or another lab
+  `172.30.32.0/23`, `agentnet`'s `172.30.40.0/24`, the primary interface's own subnet or another lab
   interface's (`:overlap`).
 
   When the nft load fails and so does the rollback's deconfigure, the NIC
@@ -35,7 +35,7 @@ defmodule Vagus.Network.Lab do
   # rpi boards (config/rpi3_64.exs).
   @protected ["eth0", "wlan0", "lo", "usb0"]
 
-  @bridge {{172, 30, 32, 0}, 23}
+  @bridges [{{172, 30, 32, 0}, 23}, {{172, 30, 40, 0}, 24}]
 
   # A configure, Nat's lock wait (32 s at most) and a bounded nft load (12 s
   # with its kill) with its rollback load, and the deconfigure.
@@ -297,7 +297,7 @@ defmodule Vagus.Network.Lab do
           {:ok, net_ip} <- [to_ip(net)],
           do: {net_ip, bits}
 
-    taken = [@bridge | ipv4_subnets(state.addresses.(primary))] ++ labs
+    taken = @bridges ++ ipv4_subnets(state.addresses.(primary)) ++ labs
 
     if Enum.any?(taken, fn {net, bits} -> overlap?(ip, prefix, net, bits) end),
       do: {:error, :overlap},
@@ -350,10 +350,15 @@ defmodule Vagus.Network.Lab do
 
   defp check_ifname(ifname) when is_binary(ifname) do
     cond do
-      # hassio* is the app bridge and its anchor port.
-      ifname in @protected or String.starts_with?(ifname, "hassio") -> {:error, :protected}
-      Nat.valid_ifname?(ifname) -> :ok
-      true -> {:error, :invalid_ifname}
+      # hassio* and agentnet* are the container bridges and their anchor ports.
+      ifname in @protected or String.starts_with?(ifname, ["hassio", "agentnet"]) ->
+        {:error, :protected}
+
+      Nat.valid_ifname?(ifname) ->
+        :ok
+
+      true ->
+        {:error, :invalid_ifname}
     end
   end
 
