@@ -145,11 +145,16 @@ defmodule Vagus.PatchesTest do
     test "old code a process still runs is reported, never purged", %{root: root, n: n} do
       s = start(root, purge_ms: 5, purge_tries: 1_000)
       m = mod(n)
-      wait = "def wait, do: receive(do: (:stop -> :ok))"
+
+      wait =
+        "def wait, do: send(#{pid_literal()}, {:entered, self()}) && receive(do: (:stop -> :ok))"
+
       dir = patch(root, "p", [{"m.ex", hook(m, "def v, do: 1\n  #{wait}")}])
       {:ok, [^m]} = Patches.load("p", s)
 
       {pid, ref} = spawn_monitor(fn -> m.wait() end)
+      # Entered before the reload, so it runs what becomes the old code.
+      assert_receive {:entered, ^pid}
       File.write!(Path.join(dir, "m.ex"), hook(m, "def v, do: 2\n  #{wait}"))
       assert Patches.load("p", s) == {:ok, [m]}
       assert m.v() == 2
@@ -292,6 +297,24 @@ defmodule Vagus.PatchesTest do
       assert {:done, %{"p" => {:error, {:arm, _reason}}}} = Patches.boot_status(s)
       refute Code.ensure_loaded?(m)
       assert File.ls!(root) == ["p"]
+    end
+
+    test "load and unload wait for the boot load", %{root: root, n: n} do
+      m = mod(n)
+      held = "send(#{pid_literal()}, {:compiling, self()})\n  receive(do: (:go -> :ok))"
+      patch(root, "a_held", [{"m.ex", hook(mod(n, "Held"), held)}], enabled: true)
+      patch(root, "b", [{"m.ex", source(m, :one)}])
+      s = start(root)
+
+      assert {:ok, :started} = Patches.boot_load(s)
+      assert_receive {:compiling, compiler}, 1_000
+      assert Patches.load("b", s) == {:error, :boot_loading}
+      assert Patches.unload("b", s) == {:error, :boot_loading}
+      refute Code.ensure_loaded?(m)
+
+      send(compiler, :go)
+      eventually(fn -> match?({:done, _}, Patches.boot_status(s)) end)
+      assert Patches.load("b", s) == {:ok, [m]}
     end
 
     test "a compile past its bound times out alone", %{root: root, n: n} do

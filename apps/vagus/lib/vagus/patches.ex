@@ -156,6 +156,11 @@ defmodule Vagus.Patches do
   @impl GenServer
   def handle_call(:list, _from, state), do: {:reply, list_patches(state), state}
 
+  # The boot task is the only other code mutator: while it runs, a load of
+  # ours could be overwritten by it, or purge code it is mid-way replacing.
+  def handle_call({op, _name}, _from, %{boot: :running} = state) when op in [:load, :unload],
+    do: {:reply, {:error, :boot_loading}, state}
+
   def handle_call({:load, name}, _from, state) do
     known = known_modules(state, name)
     {result, modules} = load_files(name, state.root, known, state.compile_timeout_ms)
@@ -754,7 +759,9 @@ defmodule Vagus.Patches do
   end
 
   # Renamed into place, so a power cut never leaves a torn record the
-  # breaker would read as a bad boot.
+  # breaker would read as a bad boot, and synced, file then directory, before
+  # it counts as written: the arming record is the breaker, and a power cut
+  # right after arming is exactly the case it guards.
   # Fixed file names under the configured root.
   # sobelow_skip ["Traversal.FileModule"]
   defp write_json(root, file, data) do
@@ -762,8 +769,9 @@ defmodule Vagus.Patches do
     tmp = path <> ".tmp"
 
     with :ok <- File.mkdir_p(root),
-         :ok <- File.write(tmp, Jason.encode!(data)),
-         :ok <- File.rename(tmp, path) do
+         :ok <- write_synced(tmp, Jason.encode!(data)),
+         :ok <- File.rename(tmp, path),
+         :ok <- sync_dir(root) do
       :ok
     else
       error ->
@@ -772,6 +780,33 @@ defmodule Vagus.Patches do
         error
     end
   end
+
+  defp write_synced(path, body) do
+    case :file.open(path, [:write, :raw, :binary]) do
+      {:ok, fd} ->
+        written = with :ok <- :file.write(fd, body), do: :file.sync(fd)
+        closed = :file.close(fd)
+        persisted(if written == :ok, do: closed, else: written)
+
+      error ->
+        error
+    end
+  end
+
+  defp sync_dir(dir) do
+    case :file.open(dir, [:read, :raw, :directory]) do
+      {:ok, fd} ->
+        synced = :file.sync(fd)
+        :file.close(fd)
+        persisted(synced)
+
+      error ->
+        persisted(error)
+    end
+  end
+
+  defp persisted(:ok), do: :ok
+  defp persisted({:error, reason}), do: {:error, {:persist, reason}}
 
   defp now, do: DateTime.utc_now() |> DateTime.to_iso8601()
 end
