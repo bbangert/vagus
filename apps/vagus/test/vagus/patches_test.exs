@@ -180,6 +180,78 @@ defmodule Vagus.PatchesTest do
       assert Patches.load("p", s) == {:ok, [m]}
     end
 
+    test "any old code still running refuses every load", %{root: root, n: n} do
+      s = start(root)
+      proto = mod(n, "Proto")
+      impl = Module.concat(proto, Integer)
+      wait = "send(#{pid_literal()}, {:entered, self()}) && receive(do: (:stop -> :ok))"
+
+      impl_src = fn v ->
+        "defimpl #{inspect(proto)}, for: Integer do\n  def a(_), do: #{v} && #{wait}\nend\n"
+      end
+
+      patch(root, "proto", [{"a.ex", "defprotocol #{inspect(proto)} do\n  def a(x)\nend\n"}])
+      dir = patch(root, "one", [{"b.ex", impl_src.(1)}])
+      patch(root, "two", [{"b.ex", impl_src.(2)}])
+      {:ok, _} = Patches.load("proto", s)
+      {:ok, [^impl]} = Patches.load("one", s)
+
+      {holder, _ref} = spawn_monitor(fn -> proto.a(1) end)
+      assert_receive {:entered, ^holder}
+      File.write!(Path.join(dir, "b.ex"), impl_src.(3))
+      {:ok, [^impl]} = Patches.load("one", s)
+
+      # Its defimpl is unknown to "two" before compiling, and would purge the holder's code.
+      assert Patches.load("two", s) == {:error, {:in_use, [impl]}}
+      assert Process.alive?(holder)
+      send(holder, :stop)
+    end
+
+    test "a later file redefining a module is refused while its old code runs", %{
+      root: root,
+      n: n
+    } do
+      s = start(root)
+      m = mod(n)
+
+      wait =
+        "def wait, do: send(#{pid_literal()}, {:entered, self()}) && receive(do: (:stop -> :ok))"
+
+      patch(root, "base", [{"m.ex", hook(m, "def v, do: 0\n  #{wait}")}])
+      {:ok, [^m]} = Patches.load("base", s)
+      {holder, _ref} = spawn_monitor(fn -> m.wait() end)
+      assert_receive {:entered, ^holder}
+
+      patch(root, "p", [{"a.ex", hook(m, "def v, do: 1")}, {"b.ex", hook(m, "def v, do: 2")}])
+      assert Patches.load("p", s) == {:error, {:in_use, [m]}}
+      assert m.v() == 1
+      assert Process.alive?(holder)
+      assert [_base, %{name: "p", modules: [^m], loaded?: true}] = Patches.list(s)
+      send(holder, :stop)
+    end
+
+    test "a restart keeps tracking old code a process still runs", %{root: root, n: n} do
+      [server: name] = s = start(root, purge_ms: 5, purge_tries: 1_000)
+      m = mod(n)
+
+      wait =
+        "def wait, do: send(#{pid_literal()}, {:entered, self()}) && receive(do: (:stop -> :ok))"
+
+      dir = patch(root, "p", [{"m.ex", hook(m, "def v, do: 1\n  #{wait}")}])
+      {:ok, [^m]} = Patches.load("p", s)
+      {holder, ref} = spawn_monitor(fn -> m.wait() end)
+      assert_receive {:entered, ^holder}
+      File.write!(Path.join(dir, "m.ex"), hook(m, "def v, do: 2\n  #{wait}"))
+      {:ok, [^m]} = Patches.load("p", s)
+
+      restart(name)
+      assert [%{in_use: [^m], purged?: false}] = Patches.list(s)
+
+      send(holder, :stop)
+      assert_receive {:DOWN, ^ref, :process, ^holder, :normal}
+      eventually(fn -> match?([%{in_use: [], purged?: true}], Patches.list(s)) end)
+    end
+
     test "a patch without notes is refused", %{root: root, n: n} do
       s = start(root)
       patch(root, "p", [{"m.ex", source(mod(n), :one)}], notes: false)

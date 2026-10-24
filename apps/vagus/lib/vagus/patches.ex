@@ -166,7 +166,7 @@ defmodule Vagus.Patches do
       good_ready: false
     }
 
-    {:ok, resume(state)}
+    {:ok, state |> track_old_code() |> resume()}
   end
 
   @impl GenServer
@@ -178,8 +178,8 @@ defmodule Vagus.Patches do
     do: {:reply, {:error, :boot_loading}, state}
 
   def handle_call({:load, name}, _from, state) do
-    known = known_modules(state, name)
-    {result, modules} = load_files(name, state.root, known, state.compile_timeout_ms)
+    guarded = known_modules(state, name) ++ guarded_modules(state.patches, state.in_use)
+    {result, modules} = load_files(name, state.root, guarded, state.compile_timeout_ms)
     state = state |> remember(name, modules, with_ok(result)) |> release(modules)
     {:reply, result, checkpoint(state)}
   end
@@ -361,7 +361,8 @@ defmodule Vagus.Patches do
   defp run_boot(names, cfg) do
     outcomes =
       Map.new(names, fn name ->
-        {name, load_files(name, cfg.root, [], cfg.compile_timeout_ms)}
+        guarded = guarded_modules(:persistent_term.get(inventory(cfg.root), %{}), %{})
+        {name, load_files(name, cfg.root, guarded, cfg.compile_timeout_ms)}
       end)
 
     results = Map.new(outcomes, fn {name, {result, _}} -> {name, with_ok(result)} end)
@@ -383,6 +384,7 @@ defmodule Vagus.Patches do
   defp adopt(state, results, loaded, at) do
     patches = :persistent_term.get(inventory(state.root), %{})
     state = release(%{state | patches: patches}, loaded |> Map.values() |> Enum.concat())
+    state = track_old_code(state)
     state = %{state | boot: {:done, results}, boot_task: nil}
 
     case read_json(state.root, @boot_file) do
@@ -448,14 +450,14 @@ defmodule Vagus.Patches do
   defp with_ok({:ok, _modules}), do: :ok
   defp with_ok(error), do: error
 
-  defp load_files(name, root, known, timeout) do
+  defp load_files(name, root, guarded, timeout) do
     {result, modules} =
       with :ok <- valid_name(name),
            dir = Path.join(root, name),
            :ok <- exists(dir, :not_found),
            :ok <- exists(Path.join(dir, "NOTES.md"), :no_notes),
            [_ | _] = sources <- sources(dir),
-           :ok <- old_code_free(known ++ parse_modules(dir)) do
+           :ok <- old_code_free(guarded ++ parse_modules(dir)) do
         compile_bounded(sources, timeout)
       else
         [] -> {{:error, :no_sources}, []}
@@ -466,7 +468,15 @@ defmodule Vagus.Patches do
     {result, modules}
   end
 
-  # Loading over old code purges it, killing whatever still runs it.
+  # OTP 29 hard-purges lingering old code when it loads over it, killing
+  # whatever still runs it, and the modules a compile emits (a `defimpl`, a
+  # macro's) are unknown until it has loaded them. So the only safe
+  # precondition is no old code anywhere this server knows of.
+  defp guarded_modules(patches, in_use) do
+    inventory = Enum.flat_map(patches, fn {_name, entry} -> entry.modules end)
+    Enum.uniq(Map.keys(in_use) ++ inventory)
+  end
+
   defp old_code_free(modules) do
     case modules |> Enum.uniq() |> Enum.reject(&:code.soft_purge/1) do
       [] -> :ok
@@ -516,10 +526,14 @@ defmodule Vagus.Patches do
     end
   end
 
+  # Rechecked per file: a later file that redefines a module an earlier one
+  # just replaced would purge the old code under its processes.
   defp compile_files(sources) do
     Enum.reduce_while(sources, {:ok, []}, fn file, {:ok, loaded} ->
-      case compile_file(file) do
-        {:ok, modules} -> {:cont, {:ok, loaded ++ modules}}
+      with :ok <- old_code_free(loaded),
+           {:ok, modules} <- compile_file(file) do
+        {:cont, {:ok, loaded ++ modules}}
+      else
         error -> {:halt, error}
       end
     end)
@@ -577,7 +591,7 @@ defmodule Vagus.Patches do
   defp unload_patch(name, state) do
     with :ok <- valid_name(name),
          [_ | _] = modules <- known_modules(state, name),
-         :ok <- old_code_free(modules),
+         :ok <- old_code_free(modules ++ guarded_modules(state.patches, state.in_use)),
          {:ok, restored} <- restore_all(modules) do
       Logger.warning("Patches: #{name} unloaded, restoring #{inspect(modules)}")
       entry = %{modules: modules, loaded?: false, last_result: last_result(state, name)}
@@ -627,6 +641,20 @@ defmodule Vagus.Patches do
           do: Map.delete(in_use, mod),
           else: Map.put(in_use, mod, state.purge_tries)
       end)
+
+    schedule_purge(%{state | in_use: in_use})
+  end
+
+  # A restarted server starts with no purge tracking; the inventory says
+  # which modules a patch replaced, and the VM which still have old code.
+  defp track_old_code(state) do
+    in_use =
+      for {_name, entry} <- state.patches,
+          mod <- entry.modules,
+          not Map.has_key?(state.in_use, mod),
+          :erlang.check_old_code(mod),
+          into: state.in_use,
+          do: {mod, state.purge_tries}
 
     schedule_purge(%{state | in_use: in_use})
   end
