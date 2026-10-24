@@ -181,11 +181,11 @@ cannot take ingress down.
 This bites any host-run Supervisor emulator, not just this board — it was
 found on the Q6A but rpi3_64 had the identical latent gap.
 
-## agent-dev-board flavor (dragon_q6a)
+## agent-dev-board flavor
 
-A dragon_q6a firmware that hosts Claude Code agent containers instead of Home
-Assistant Core. The rest of the stack (apps, MQTT broker, podman) is
-unchanged. It is selected at build time by `VAGUS_FLAVOR=agent-dev-board`; an
+A dragon_q6a or rubik_pi3 firmware that hosts Claude Code agent containers
+instead of Home Assistant Core. The rest of the stack (apps, MQTT broker,
+podman) is unchanged. It is selected at build time by `VAGUS_FLAVOR=agent-dev-board`; an
 unknown value fails the build.
 
 Root by design: on this flavor the Claude agent (the orchestrator container
@@ -214,11 +214,11 @@ the slot KV `nerves_fw_misc`; stock builds leave it empty):
 
 ```sh
 VAGUS_FLAVOR=agent-dev-board NERVES_FW_MISC=agent-dev-board \
-  mise run firmware -- dragon_q6a
+  mise run firmware -- dragon_q6a   # or rubik_pi3
 ```
 
-CI publishes `vagus_dragon_q6a-agent.fw` next to the stock asset; only
-dragon_q6a is built with the flavor.
+CI publishes `vagus_dragon_q6a-agent.fw` and `vagus_rubik_pi3-agent.fw` next
+to the stock assets; rpi3_64 is not built with the flavor.
 
 OTA: the updater matches `vagus_<platform>-agent.fw` when running the flavor,
 so flavors never cross over. Returning a board to stock is a manual `fwup`

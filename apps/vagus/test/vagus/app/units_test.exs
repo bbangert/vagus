@@ -201,7 +201,7 @@ defmodule Vagus.App.UnitsTest do
                slug: "agent_orchestrator",
                name: "Agent orchestrator",
                image: "ghcr.io/bbangert/vagus-agent-orchestrator",
-               version: "0.1.0",
+               version: "0.2.0",
                backend: :container,
                startup: "application",
                boot: "auto",
