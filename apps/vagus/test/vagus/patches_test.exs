@@ -21,8 +21,18 @@ defmodule Vagus.PatchesTest do
     %{root: root, n: n}
   end
 
-  # What a reboot clears: the marker that says this VM already ran boot_load.
-  defp new_vm_boot(root), do: :persistent_term.erase({Patches, :boot_done, Path.expand(root)})
+  # What a reboot clears: the marker that says this VM already ran boot_load,
+  # and the inventory of what is loaded.
+  defp new_vm_boot(root) do
+    :persistent_term.erase({Patches, :boot_done, Path.expand(root)})
+    :persistent_term.erase({Patches, :inventory, Path.expand(root)})
+  end
+
+  defp restart(name) do
+    pid = GenServer.whereis(name)
+    Process.exit(pid, :kill)
+    eventually(fn -> GenServer.whereis(name) not in [nil, pid] end)
+  end
 
   defp start(root, opts \\ []) do
     name = :"patches_#{System.unique_integer([:positive])}"
@@ -227,6 +237,47 @@ defmodule Vagus.PatchesTest do
       for m <- modules, do: assert(:code.is_loaded(m) == false)
     end
 
+    test "modules a macro emitted before a failure are recorded", %{root: root, n: n} do
+      s = start(root)
+      proto = mod(n, "Proto")
+      impl = Module.concat(proto, Integer)
+
+      patch(root, "p", [
+        {"a.ex", "defprotocol #{inspect(proto)} do\n  def a(x)\nend\n"},
+        {"b.ex",
+         "defimpl #{inspect(proto)}, for: Integer do\n  def a(x), do: x\nend\nraise \"boom\"\n"}
+      ])
+
+      assert {:error, {:compile, "b.ex", _}} = Patches.load("p", s)
+      assert [%{modules: modules}] = Patches.list(s)
+      assert Enum.sort(modules) == Enum.sort([proto, impl])
+
+      assert Patches.unload("p", s) == {:ok, modules}
+      assert :code.is_loaded(impl) == false
+    end
+
+    test "a restart keeps what live loads and unloads changed", %{root: root, n: n} do
+      a = mod(n, "A")
+      b = mod(n, "B")
+      dir = patch(root, "p", [{"a.ex", source(a, :one)}], enabled: true)
+      patch(root, "q", [{"m.ex", source(mod(n, "Q"), :one)}])
+      [server: name] = s = start(root)
+      booted(s)
+
+      File.write!(Path.join(dir, "b.ex"), source(b, :one))
+      assert {:ok, _} = Patches.load("p", s)
+      {:ok, _} = Patches.load("q", s)
+      {:ok, _} = Patches.unload("q", s)
+      restart(name)
+
+      assert [%{name: "p", loaded?: true, modules: modules}, %{name: "q", loaded?: false}] =
+               Patches.list(s)
+
+      assert Enum.sort(modules) == Enum.sort([a, b])
+      assert {:ok, _} = Patches.unload("p", s)
+      assert :code.is_loaded(b) == false
+    end
+
     test "a source that cannot be read defines nothing", %{root: root, n: n} do
       s = start(root)
       m = mod(n)
@@ -317,6 +368,21 @@ defmodule Vagus.PatchesTest do
       assert Patches.load("b", s) == {:ok, [m]}
     end
 
+    test "runs under the task supervisor", %{root: root, n: n} do
+      sup = :"patches_tasks_#{n}"
+      start_supervised!({Task.Supervisor, name: sup})
+      held = "send(#{pid_literal()}, {:compiling, self()})\n  receive(do: (:go -> :ok))"
+      patch(root, "p", [{"m.ex", hook(mod(n), held)}], enabled: true)
+      s = start(root, task_supervisor: sup)
+
+      assert {:ok, :started} = Patches.boot_load(s)
+      assert_receive {:compiling, compiler}, 1_000
+      assert [_task] = Task.Supervisor.children(sup)
+
+      send(compiler, :go)
+      eventually(fn -> match?({:done, _}, Patches.boot_status(s)) end)
+    end
+
     test "a compile past its bound times out alone", %{root: root, n: n} do
       s = start(root, compile_timeout_ms: 50)
       ok = mod(n, "Ok")
@@ -397,9 +463,7 @@ defmodule Vagus.PatchesTest do
         s = start(root, boot_complete?: fn -> :atomics.get(flag, 1) == 1 end, good_after_ms: 0)
 
       results = booted(s)
-      pid = GenServer.whereis(name)
-      Process.exit(pid, :kill)
-      eventually(fn -> GenServer.whereis(name) not in [nil, pid] end)
+      restart(name)
 
       assert Patches.boot_load(s) == {:ok, :started}
       assert Patches.boot_status(s) == {:done, results}

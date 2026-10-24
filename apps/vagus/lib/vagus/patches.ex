@@ -25,6 +25,19 @@ defmodule Vagus.Patches do
   refused, because loading over old code purges it.
   """
 
+  defmodule Tracer do
+    @moduledoc false
+    # Reports every module a patch compile emits, `defimpl` and macro-made
+    # ones included, to the process that set the sink.
+    @spec trace(tuple(), Macro.Env.t()) :: :ok
+    def trace({:on_module, _bytecode, _ignore}, env) do
+      if sink = Process.get({Vagus.Patches, :sink}), do: send(sink, {:patch_module, env.module})
+      :ok
+    end
+
+    def trace(_event, _env), do: :ok
+  end
+
   use GenServer
 
   require Logger
@@ -133,15 +146,18 @@ defmodule Vagus.Patches do
     # is its result rather than this server's.
     Process.flag(:trap_exit, true)
 
+    root = opts |> Keyword.get(:root, @default_root) |> Path.expand()
+
     state = %{
-      root: opts |> Keyword.get(:root, @default_root) |> Path.expand(),
+      root: root,
       good_after_ms: Keyword.get(opts, :good_after_ms, @good_after_ms),
       poll_ms: Keyword.get(opts, :poll_ms, @poll_ms),
       purge_ms: Keyword.get(opts, :purge_ms, @purge_ms),
       purge_tries: Keyword.get(opts, :purge_tries, @purge_tries),
       compile_timeout_ms: Keyword.get(opts, :compile_timeout_ms, @compile_timeout_ms),
       boot_complete?: Keyword.get(opts, :boot_complete?),
-      patches: %{},
+      task_supervisor: Keyword.get(opts, :task_supervisor, Vagus.TaskSupervisor),
+      patches: :persistent_term.get(inventory(root), %{}),
       in_use: %{},
       purge_timer?: false,
       boot: :not_started,
@@ -165,12 +181,12 @@ defmodule Vagus.Patches do
     known = known_modules(state, name)
     {result, modules} = load_files(name, state.root, known, state.compile_timeout_ms)
     state = state |> remember(name, modules, with_ok(result)) |> release(modules)
-    {:reply, result, state}
+    {:reply, result, checkpoint(state)}
   end
 
   def handle_call({:unload, name}, _from, state) do
     {reply, state} = unload_patch(name, state)
-    {:reply, reply, state}
+    {:reply, reply, checkpoint(state)}
   end
 
   def handle_call({:enable, name}, _from, state),
@@ -249,6 +265,16 @@ defmodule Vagus.Patches do
   # again would trip the breaker on the `.boot` its predecessor armed.
   defp marker(root), do: {__MODULE__, :boot_done, root}
 
+  # Which modules each patch put in place, kept as long as the code itself
+  # (this VM boot), so a restarted server still unloads what is loaded.
+  # Updated per load or unload only: each update costs a global GC pass.
+  defp inventory(root), do: {__MODULE__, :inventory, root}
+
+  defp checkpoint(state) do
+    :persistent_term.put(inventory(state.root), state.patches)
+    state
+  end
+
   defp resume(state) do
     case :persistent_term.get(marker(state.root), nil) do
       nil ->
@@ -309,14 +335,16 @@ defmodule Vagus.Patches do
     end
   end
 
-  # Unlinked so this server's crash does not take a half-done load with it;
-  # a restarted server finds the task through the marker. It waits for `:go`
-  # so its `:done` marker can never be overwritten by the `:running` one.
+  # Under the application's task supervisor, not linked to this server: its
+  # crash does not take a half-done load with it, and a restarted server
+  # finds the task through the marker, while stopping the application still
+  # stops it. It waits for `:go` so its `:done` marker can never be
+  # overwritten by the `:running` one.
   defp start_task(state, names) do
     cfg = Map.take(state, [:root, :compile_timeout_ms])
 
     {:ok, pid} =
-      Task.start(fn ->
+      Task.Supervisor.start_child(state.task_supervisor, fn ->
         receive do
           :go -> run_boot(names, cfg)
         end
@@ -328,9 +356,9 @@ defmodule Vagus.Patches do
     %{state | boot: :running, boot_task: {ref, names}}
   end
 
+  # Writes the inventory itself, which it alone mutates while it runs, so a
+  # server that restarts before adopting the result still finds it.
   defp run_boot(names, cfg) do
-    Process.flag(:trap_exit, true)
-
     outcomes =
       Map.new(names, fn name ->
         {name, load_files(name, cfg.root, [], cfg.compile_timeout_ms)}
@@ -339,6 +367,13 @@ defmodule Vagus.Patches do
     results = Map.new(outcomes, fn {name, {result, _}} -> {name, with_ok(result)} end)
     write_boot(cfg.root, names, results, false)
     loaded = Map.new(outcomes, fn {name, {_, modules}} -> {name, modules} end)
+
+    patches =
+      Enum.reduce(outcomes, :persistent_term.get(inventory(cfg.root), %{}), fn
+        {name, {result, modules}}, patches -> remember_in(patches, name, modules, with_ok(result))
+      end)
+
+    :persistent_term.put(inventory(cfg.root), patches)
     at = System.monotonic_time(:millisecond)
     :persistent_term.put(marker(cfg.root), {:done, results, loaded, at})
   end
@@ -346,11 +381,8 @@ defmodule Vagus.Patches do
   # `at` is monotonic and from the marker, so a restarted server keeps the
   # original delay; `.boot`'s wall-clock `loaded_at` may predate NTP.
   defp adopt(state, results, loaded, at) do
-    state =
-      Enum.reduce(loaded, state, fn {name, modules}, state ->
-        state |> remember(name, modules, results[name]) |> release(modules)
-      end)
-
+    patches = :persistent_term.get(inventory(state.root), %{})
+    state = release(%{state | patches: patches}, loaded |> Map.values() |> Enum.concat())
     state = %{state | boot: {:done, results}, boot_task: nil}
 
     case read_json(state.root, @boot_file) do
@@ -442,24 +474,53 @@ defmodule Vagus.Patches do
     end
   end
 
+  # A failure, a crash or a timeout part way leaves loaded whatever the
+  # tracer saw emitted before it.
   defp compile_bounded(sources, timeout) do
-    task = Task.async(fn -> compile_files(sources) end)
+    ensure_tracer()
+    sink = self()
 
-    case Task.yield(task, timeout) || Task.shutdown(task, :brutal_kill) do
-      {:ok, outcome} -> outcome
-      {:exit, reason} -> {{:error, {:exit, reason}}, Enum.flat_map(sources, &loaded_from/1)}
-      nil -> {{:error, :timeout}, Enum.flat_map(sources, &loaded_from/1)}
+    task =
+      Task.async(fn ->
+        Process.put({__MODULE__, :sink}, sink)
+        compile_files(sources)
+      end)
+
+    result =
+      case Task.yield(task, timeout) || Task.shutdown(task, :brutal_kill) do
+        {:ok, result} -> result
+        {:exit, reason} -> {:error, {:exit, reason}}
+        nil -> {:error, :timeout}
+      end
+
+    emitted = drain_emitted([])
+
+    case result do
+      {:ok, modules} -> {result, modules}
+      _error -> {result, emitted |> Enum.uniq() |> Enum.filter(&:code.is_loaded/1)}
+    end
+  end
+
+  # Left installed: compiler options are VM-wide, so taking it out again
+  # would race another load; outside a patch compile it sees no sink.
+  defp ensure_tracer do
+    tracers = Code.get_compiler_option(:tracers)
+    unless Tracer in tracers, do: Code.put_compiler_option(:tracers, [Tracer | tracers])
+  end
+
+  defp drain_emitted(acc) do
+    receive do
+      {:patch_module, mod} -> drain_emitted([mod | acc])
+    after
+      0 -> Enum.reverse(acc)
     end
   end
 
   defp compile_files(sources) do
-    Enum.reduce_while(sources, {{:ok, []}, []}, fn file, {_result, loaded} ->
+    Enum.reduce_while(sources, {:ok, []}, fn file, {:ok, loaded} ->
       case compile_file(file) do
-        {:ok, modules} ->
-          {:cont, {{:ok, loaded ++ modules}, loaded ++ modules}}
-
-        error ->
-          {:halt, {error, Enum.uniq(loaded ++ loaded_from(file))}}
+        {:ok, modules} -> {:cont, {:ok, loaded ++ modules}}
+        error -> {:halt, error}
       end
     end)
   end
@@ -470,18 +531,21 @@ defmodule Vagus.Patches do
   defp log_load(name, error, loaded),
     do: Logger.warning("Patches: #{name} failed (#{inspect(error)}); loaded #{inspect(loaded)}")
 
-  defp remember(state, _name, [], {:error, reason})
-       when reason in [:invalid_name, :not_found, :no_notes, :no_sources],
-       do: state
+  defp remember(state, name, modules, result),
+    do: %{state | patches: remember_in(state.patches, name, modules, result)}
 
-  defp remember(state, name, modules, result) do
+  defp remember_in(patches, _name, [], {:error, reason})
+       when reason in [:invalid_name, :not_found, :no_notes, :no_sources],
+       do: patches
+
+  defp remember_in(patches, name, modules, result) do
     entry = %{
-      modules: Enum.uniq(modules ++ (get_in(state.patches, [name, :modules]) || [])),
-      loaded?: modules != [] or loaded?(state, name),
+      modules: Enum.uniq(modules ++ (get_in(patches, [name, :modules]) || [])),
+      loaded?: modules != [] or (get_in(patches, [name, :loaded?]) || false),
       last_result: result
     }
 
-    put_in(state, [:patches, name], entry)
+    Map.put(patches, name, entry)
   end
 
   # The patch's source runs at compile time, so whatever it raises, throws
@@ -635,9 +699,6 @@ defmodule Vagus.Patches do
   defp last_result(state, name), do: get_in(state.patches, [name, :last_result])
 
   defp parse_modules(dir), do: dir |> sources() |> Enum.flat_map(&parse_file/1) |> Enum.uniq()
-
-  # A file that failed part way may have loaded the modules before it.
-  defp loaded_from(file), do: file |> parse_file() |> Enum.filter(&:code.is_loaded/1)
 
   # Best effort, before any load has said which modules a patch defines.
   # The names are interned: the sources are root's, and compiling them
