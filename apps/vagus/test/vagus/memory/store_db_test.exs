@@ -278,6 +278,57 @@ defmodule Vagus.Memory.StoreDBTest do
     assert {:ok, %{model: "fake-b", counts: %{unembedded: 0}}} = Memory.status(opts)
   end
 
+  defp paused_recall(opts, stage, query) do
+    test = self()
+
+    hook = fn
+      ^stage ->
+        send(test, {:paused, self()})
+        receive do: (:go -> :ok)
+
+      _other ->
+        :ok
+    end
+
+    task = Task.async(fn -> Memory.recall(query, [embedder: A, hook: hook] ++ opts) end)
+    assert_receive {:paused, pid}, 5_000
+    {task, pid}
+  end
+
+  test "a switch waits for a recall holding the model", %{db: db} do
+    opts = start_memory(db, A)
+
+    {:ok, _} =
+      Memory.remember("fact", nil, "the kettle boils water quickly", [embedder: A] ++ opts)
+
+    {task, pid} = paused_recall(opts, :locked, "kettle water heating")
+
+    reembed = Task.async(fn -> Memory.reembed("fake-narrow", [embedder: Narrow] ++ opts) end)
+    refute Task.yield(reembed, 300)
+
+    send(pid, :go)
+    assert texts(Task.await(task)) == ["the kettle boils water quickly"]
+    assert {:ok, %{switched: true, dims: 32}} = Task.await(reembed)
+  end
+
+  test "a recall embedded before a width switch falls back to keywords", %{db: db} do
+    opts = start_memory(db, A)
+
+    {:ok, _} =
+      Memory.remember("fact", nil, "the kettle boils water quickly", [embedder: A] ++ opts)
+
+    {:ok, _} =
+      Memory.remember("fact", nil, "kettle water heating takes power", [embedder: A] ++ opts)
+
+    {task, pid} = paused_recall(opts, :embedded, "kettle water heating")
+
+    assert {:ok, %{switched: true, dims: 32}} =
+             Memory.reembed("fake-narrow", [embedder: Narrow] ++ opts)
+
+    send(pid, :go)
+    assert texts(Task.await(task)) == ["kettle water heating takes power"]
+  end
+
   test "a schema dropped under a running store is reapplied", %{db: db} do
     opts = start_memory(db, A)
     sql(db, "DROP TABLE captures, journal, devices, tasks, memories, schema_version CASCADE")

@@ -90,15 +90,24 @@ defmodule Vagus.Memory.Store do
          :ok <- optional_name(scope),
          :ok <- if(is_integer(k) and k in 1..100, do: :ok, else: {:error, :invalid}),
          {:ok, ctx} <- context(opts) do
+      # Embedded before the transaction, so the lock below is never held
+      # for the engine's time.
       vector = embed(ctx, query)
+      hook(opts, :embedded)
       # Enough candidates that a row both lists rank lowly can still fuse
       # into the top k; 1000 is ef_search's ceiling and k's at 100.
       pool = max(10 * k, 200)
       scoped = if scope, do: [scope], else: []
 
+      # FOR SHARE holds the model through both queries: a `reembed/2`
+      # switch waits for this recall, and one that committed first makes
+      # the vector unusable, so the call is keyword-only.
       transaction(ctx, fn conn ->
+        vector = usable(conn, ctx, vector, SQL.model_for_share())
+        hook(opts, :locked)
+
         vector_ids =
-          case usable(conn, ctx, vector, "SELECT model, dims FROM schema_version") do
+          case vector do
             nil ->
               []
 
