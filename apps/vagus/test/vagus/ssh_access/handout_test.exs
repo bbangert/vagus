@@ -252,14 +252,87 @@ defmodule Vagus.SSHAccess.HandoutTest do
     assert File.read!(opts[:claimed_path]) == "first\n"
   end
 
-  test "on_login returns :ok when the latch cannot be written", %{opts: opts} do
+  test "a login whose latch cannot be written still closes the handout", %{opts: opts} do
+    start_handout(opts)
+    server = Module.concat(opts[:name], Server)
+    ref = Process.monitor(Process.whereis(server))
     dir = Path.dirname(opts[:claimed_path])
     File.mkdir_p!(dir)
     File.chmod!(dir, 0o500)
     on_exit(fn -> File.chmod(dir, 0o700) end)
 
-    assert :ok = Handout.on_login(~c"root", {{127, 0, 0, 1}, 1}, ~c"publickey")
+    assert :ok = Handout.on_login(~c"root", {{127, 0, 0, 1}, 1}, ~c"publickey", server)
+    assert_receive {:DOWN, ^ref, :process, _, :normal}
     refute File.exists?(opts[:claimed_path])
+  end
+
+  test "a login whose latch raises still closes the handout", %{opts: opts} do
+    start_handout(opts)
+    server = Module.concat(opts[:name], Server)
+    ref = Process.monitor(Process.whereis(server))
+    # Not a path: every file call on it raises.
+    Application.put_env(:vagus, :ssh_handout, claimed_path: 123)
+
+    assert :ok = Handout.on_login(~c"root", {{127, 0, 0, 1}, 1}, ~c"publickey", server)
+    assert_receive {:DOWN, ^ref, :process, _, :normal}
+  end
+
+  test "a latch whose write fails after the create is partial", %{opts: opts} do
+    # Not iodata, so the write fails once the exclusive create has succeeded.
+    assert {:error, {:partial, :badarg}} = Latch.write(opts[:claimed_path], [:not_iodata])
+    assert File.exists?(opts[:claimed_path])
+  end
+
+  test "a request in flight when the handout closes gets no key", %{opts: opts} do
+    port = start_handout(opts)
+    server = Module.concat(opts[:name], Server)
+    ref = Process.monitor(Process.whereis(server))
+    {:ok, socket} = :gen_tcp.connect({127, 0, 0, 1}, port, [:binary, active: false], 1_000)
+    on_exit(fn -> :gen_tcp.close(socket) end)
+    :ok = :gen_tcp.send(socket, "GET /key HTTP/1.1\r\nhost: 127.0.0.1\r\n")
+
+    assert :ok = Handout.on_login(~c"root", {{127, 0, 0, 1}, 1}, ~c"publickey", server)
+    assert_receive {:DOWN, ^ref, :process, _, :normal}
+
+    case :gen_tcp.send(socket, "\r\n") do
+      :ok ->
+        case recv_all(socket, "") do
+          "" ->
+            :closed
+
+          response ->
+            assert response =~ ~r{\AHTTP/1.1 410 }
+            refute response =~ "PRIVATE KEY"
+        end
+
+      {:error, reason} ->
+        assert reason in [:closed, :econnreset]
+    end
+  end
+
+  test "the plug refuses the key past the deadline or once latched", %{opts: opts} do
+    open = [ssh_access: opts[:ssh_access], claimed_path: opts[:claimed_path]]
+    now = System.monotonic_time(:millisecond)
+
+    past = Handout.Plug.init([deadline: now] ++ open)
+    conn = Handout.Plug.call(Plug.Test.conn(:get, "/key"), past)
+    assert conn.status == 410
+    assert Plug.Conn.get_resp_header(conn, "cache-control") == ["no-store"]
+    assert conn.resp_body == "handout closed\n"
+
+    future = Handout.Plug.init([deadline: now + 60_000] ++ open)
+    assert Handout.Plug.call(Plug.Test.conn(:get, "/key"), future).status == 200
+
+    File.mkdir_p!(Path.dirname(opts[:claimed_path]))
+    File.write!(opts[:claimed_path], "claimed\n")
+    assert Handout.Plug.call(Plug.Test.conn(:get, "/key"), future).status == 410
+  end
+
+  defp recv_all(socket, acc) do
+    case :gen_tcp.recv(socket, 0, 1_000) do
+      {:ok, data} -> recv_all(socket, acc <> data)
+      {:error, _} -> acc
+    end
   end
 
   # The Listener binds in its handle_continue; a sys call returns only after

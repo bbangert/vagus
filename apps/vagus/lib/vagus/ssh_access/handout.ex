@@ -59,6 +59,7 @@ defmodule Vagus.SSHAccess.Handout do
       Logger.error("SSH key handout: login hook failed: #{Exception.format(kind, reason)}")
   end
 
+  # Contains its own failures so the cast that closes the handout still runs.
   defp latch do
     path = claimed_path(Application.get_env(:vagus, :ssh_handout, []))
 
@@ -77,6 +78,12 @@ defmodule Vagus.SSHAccess.Handout do
           )
       end
     end
+  catch
+    kind, reason ->
+      Logger.error(
+        "SSH key handout: latch failed, it will reopen next boot: " <>
+          Exception.format(kind, reason)
+      )
   end
 
   defp who(user, peer, method), do: "#{inspect(user)} from #{peer_ip(peer)} (#{inspect(method)})"
@@ -106,7 +113,12 @@ defmodule Vagus.SSHAccess.Handout do
       :ignore
     else
       listener_supervisor = Module.concat(name, ListenerSupervisor)
-      plug = {__MODULE__.Plug, ssh_access: Keyword.get(opts, :ssh_access, Vagus.SSHAccess)}
+
+      plug =
+        {__MODULE__.Plug,
+         ssh_access: Keyword.get(opts, :ssh_access, Vagus.SSHAccess),
+         deadline: deadline,
+         claimed_path: claimed_path}
 
       children = [
         {DynamicSupervisor, name: listener_supervisor, strategy: :one_for_one},

@@ -46,10 +46,12 @@ defmodule Vagus.SSHAccess.Handout.Latch do
     end
   end
 
+  # `:raw` + `:file.write/2`: on Elixir 1.20 `IO.binwrite/2` raises on a write
+  # error, which would skip the `{:partial, _}` result for a file that exists.
   # sobelow_skip ["Traversal.FileModule"]
   defp create_synced(path, content) do
-    case File.open(path, [:write, :binary, :exclusive], fn io ->
-           with :ok <- IO.binwrite(io, content), do: :file.datasync(io)
+    case File.open(path, [:write, :binary, :exclusive, :raw], fn io ->
+           with :ok <- :file.write(io, content), do: :file.datasync(io)
          end) do
       {:ok, :ok} -> :ok
       {:ok, {:error, reason}} -> {:error, {:partial, reason}}
