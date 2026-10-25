@@ -11,6 +11,30 @@ defmodule Vagus.SSHAccess.HandoutTest do
   alias Vagus.SSHAccess.Handout
   alias Vagus.SSHAccess.Handout.Latch
 
+  # Answers `Vagus.SSHAccess.private_key/1` only when the test says so.
+  defmodule BlockingKey do
+    use GenServer
+
+    def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: opts[:name])
+
+    def release(server), do: send(server, :release)
+
+    @impl true
+    def init(opts), do: {:ok, %{test: opts[:test], from: nil}}
+
+    @impl true
+    def handle_call(:private_key, from, state) do
+      send(state.test, {:key_requested, self()})
+      {:noreply, %{state | from: from}}
+    end
+
+    @impl true
+    def handle_info(:release, state) do
+      GenServer.reply(state.from, {:ok, "-----BEGIN OPENSSH PRIVATE KEY-----\n"})
+      {:noreply, state}
+    end
+  end
+
   setup do
     n = System.unique_integer([:positive])
     dir = Path.join(System.tmp_dir!(), "ssh_handout_test_#{n}")
@@ -27,6 +51,13 @@ defmodule Vagus.SSHAccess.HandoutTest do
 
     on_exit(fn -> File.rm_rf!(dir) end)
 
+    name = :"ssh_handout_#{n}"
+
+    on_exit(fn ->
+      :persistent_term.erase(closed_key(name))
+      :persistent_term.erase(closed_key(Handout))
+    end)
+
     # `on_login/3,4` latches at the configured path, as on a board.
     claimed_path = Path.join([dir, "latch", "ssh_handout.claimed"])
     prev = Application.fetch_env(:vagus, :ssh_handout)
@@ -41,7 +72,7 @@ defmodule Vagus.SSHAccess.HandoutTest do
 
     {:ok,
      opts: [
-       name: :"ssh_handout_#{n}",
+       name: name,
        ssh_access: ssh_access,
        port: 0,
        ip: {127, 0, 0, 1},
@@ -284,6 +315,91 @@ defmodule Vagus.SSHAccess.HandoutTest do
   end
 
   test "a request in flight when the handout closes gets no key", %{opts: opts} do
+    assert_in_flight_refused(opts)
+  end
+
+  test "a request in flight when an unlatchable login closes it gets no key", %{opts: opts} do
+    dir = Path.dirname(opts[:claimed_path])
+    File.mkdir_p!(dir)
+    File.chmod!(dir, 0o500)
+    on_exit(fn -> File.chmod(dir, 0o700) end)
+
+    assert_in_flight_refused(opts)
+    refute File.exists?(opts[:claimed_path])
+  end
+
+  test "a key fetch that waits out the closure is refused", %{opts: opts} do
+    stand_in = :"#{opts[:name]}_blocking_key"
+    start_supervised!({BlockingKey, name: stand_in, test: self()})
+    port = start_handout(Keyword.put(opts, :ssh_access, stand_in))
+    server = Module.concat(opts[:name], Server)
+    ref = Process.monitor(Process.whereis(server))
+
+    request =
+      Task.async(fn -> Req.get("http://127.0.0.1:#{port}/key", retry: false) end)
+
+    assert_receive {:key_requested, _}
+    assert :ok = Handout.on_login(~c"root", {{127, 0, 0, 1}, 1}, ~c"publickey", server)
+    assert_receive {:DOWN, ^ref, :process, _, :normal}
+    BlockingKey.release(stand_in)
+
+    case Task.await(request) do
+      {:ok, resp} ->
+        assert resp.status == 410
+        refute resp.body =~ "PRIVATE KEY"
+
+      {:error, _closed} ->
+        :ok
+    end
+  end
+
+  test "a closed window refuses the key with no latch on disk", %{opts: opts} do
+    start_handout(opts)
+    server = Process.whereis(Module.concat(opts[:name], Server))
+    ref = Process.monitor(server)
+    send(server, :window_elapsed)
+    assert_receive {:DOWN, ^ref, :process, _, :normal}
+
+    assert :persistent_term.get(closed_key(opts[:name])) == true
+    refute File.exists?(opts[:claimed_path])
+
+    plug =
+      Handout.Plug.init(
+        ssh_access: opts[:ssh_access],
+        claimed_path: opts[:claimed_path],
+        deadline: System.monotonic_time(:millisecond) + 60_000,
+        closed_key: closed_key(opts[:name])
+      )
+
+    assert Handout.Plug.call(Plug.Test.conn(:get, "/key"), plug).status == 410
+  end
+
+  test "the plug refuses the key past the deadline or once latched", %{opts: opts} do
+    open = [
+      ssh_access: opts[:ssh_access],
+      claimed_path: opts[:claimed_path],
+      closed_key: closed_key(opts[:name])
+    ]
+
+    now = System.monotonic_time(:millisecond)
+
+    past = Handout.Plug.init([deadline: now] ++ open)
+    conn = Handout.Plug.call(Plug.Test.conn(:get, "/key"), past)
+    assert conn.status == 410
+    assert Plug.Conn.get_resp_header(conn, "cache-control") == ["no-store"]
+    assert conn.resp_body == "handout closed\n"
+
+    future = Handout.Plug.init([deadline: now + 60_000] ++ open)
+    assert Handout.Plug.call(Plug.Test.conn(:get, "/key"), future).status == 200
+
+    File.mkdir_p!(Path.dirname(opts[:claimed_path]))
+    File.write!(opts[:claimed_path], "claimed\n")
+    assert Handout.Plug.call(Plug.Test.conn(:get, "/key"), future).status == 410
+  end
+
+  # The request's headers are unfinished when the handout closes, so the plug
+  # runs only afterwards.
+  defp assert_in_flight_refused(opts) do
     port = start_handout(opts)
     server = Module.concat(opts[:name], Server)
     ref = Process.monitor(Process.whereis(server))
@@ -310,23 +426,7 @@ defmodule Vagus.SSHAccess.HandoutTest do
     end
   end
 
-  test "the plug refuses the key past the deadline or once latched", %{opts: opts} do
-    open = [ssh_access: opts[:ssh_access], claimed_path: opts[:claimed_path]]
-    now = System.monotonic_time(:millisecond)
-
-    past = Handout.Plug.init([deadline: now] ++ open)
-    conn = Handout.Plug.call(Plug.Test.conn(:get, "/key"), past)
-    assert conn.status == 410
-    assert Plug.Conn.get_resp_header(conn, "cache-control") == ["no-store"]
-    assert conn.resp_body == "handout closed\n"
-
-    future = Handout.Plug.init([deadline: now + 60_000] ++ open)
-    assert Handout.Plug.call(Plug.Test.conn(:get, "/key"), future).status == 200
-
-    File.mkdir_p!(Path.dirname(opts[:claimed_path]))
-    File.write!(opts[:claimed_path], "claimed\n")
-    assert Handout.Plug.call(Plug.Test.conn(:get, "/key"), future).status == 410
-  end
+  defp closed_key(name), do: {Handout, name, :closed}
 
   defp recv_all(socket, acc) do
     case :gen_tcp.recv(socket, 0, 1_000) do

@@ -104,6 +104,7 @@ defmodule Vagus.SSHAccess.Handout do
     name = Keyword.get(opts, :name, __MODULE__)
     port = Keyword.get(opts, :port, @default_port)
     claimed_path = claimed_path(opts)
+    closed_key = {__MODULE__, name, :closed}
 
     deadline =
       System.monotonic_time(:millisecond) + Keyword.get(opts, :window_ms, @default_window_ms)
@@ -118,7 +119,8 @@ defmodule Vagus.SSHAccess.Handout do
         {__MODULE__.Plug,
          ssh_access: Keyword.get(opts, :ssh_access, Vagus.SSHAccess),
          deadline: deadline,
-         claimed_path: claimed_path}
+         claimed_path: claimed_path,
+         closed_key: closed_key}
 
       children = [
         {DynamicSupervisor, name: listener_supervisor, strategy: :one_for_one},
@@ -136,7 +138,8 @@ defmodule Vagus.SSHAccess.Handout do
            name: Module.concat(name, Server),
            port: port,
            deadline: deadline,
-           claimed_path: claimed_path},
+           claimed_path: claimed_path,
+           closed_key: closed_key},
           restart: :transient,
           significant: true
         )

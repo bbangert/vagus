@@ -22,6 +22,7 @@ defmodule Vagus.SSHAccess.Handout.Server do
       port: Keyword.fetch!(opts, :port),
       deadline: Keyword.fetch!(opts, :deadline),
       claimed_path: Keyword.fetch!(opts, :claimed_path),
+      closed_key: Keyword.fetch!(opts, :closed_key),
       timer: nil
     }
 
@@ -34,7 +35,7 @@ defmodule Vagus.SSHAccess.Handout.Server do
   def handle_continue(:open, state) do
     if Latch.present?(state.claimed_path) do
       Logger.info("SSH key handout closed: latched (#{state.claimed_path})")
-      {:stop, :normal, state}
+      close(state)
     else
       remaining = max(state.deadline - System.monotonic_time(:millisecond), 0)
       timer = Process.send_after(self(), :window_elapsed, remaining)
@@ -51,12 +52,20 @@ defmodule Vagus.SSHAccess.Handout.Server do
   @impl true
   def handle_info(:window_elapsed, state) do
     Logger.info("SSH key handout closed: window elapsed with no SSH login, reopens next boot")
-    {:stop, :normal, state}
+    close(state)
   end
 
   @impl true
   def handle_cast({:login, who}, state) do
     Logger.info("SSH key handout closed: SSH login by #{who}")
+    close(state)
+  end
+
+  # The plug's closure signal when no latch could be written. A
+  # `:persistent_term` because the request process reads it without a call,
+  # it outlives this Server, and it lasts exactly this boot.
+  defp close(state) do
+    :persistent_term.put(state.closed_key, true)
     {:stop, :normal, state}
   end
 end

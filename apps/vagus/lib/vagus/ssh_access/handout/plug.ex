@@ -17,7 +17,8 @@ defmodule Vagus.SSHAccess.Handout.Plug do
     %{
       ssh_access: Keyword.get(opts, :ssh_access, Vagus.SSHAccess),
       deadline: Keyword.fetch!(opts, :deadline),
-      claimed_path: Keyword.fetch!(opts, :claimed_path)
+      claimed_path: Keyword.fetch!(opts, :claimed_path),
+      closed_key: Keyword.fetch!(opts, :closed_key)
     }
   end
 
@@ -28,14 +29,7 @@ defmodule Vagus.SSHAccess.Handout.Plug do
   def call(%Plug.Conn{method: "GET", path_info: ["key"]} = conn, opts) do
     conn = put_resp_header(conn, "connection", "close")
 
-    if closed?(opts) do
-      conn
-      |> put_resp_content_type("text/plain")
-      |> put_resp_header("cache-control", "no-store")
-      |> send_resp(410, "handout closed\n")
-    else
-      send_key(conn, opts.ssh_access)
-    end
+    if closed?(opts), do: refuse(conn), else: send_key(conn, opts)
   end
 
   def call(%Plug.Conn{path_info: ["key"]} = conn, _opts) do
@@ -47,18 +41,32 @@ defmodule Vagus.SSHAccess.Handout.Plug do
   def call(conn, _opts), do: send_resp(conn, 404, "")
 
   defp closed?(opts) do
-    System.monotonic_time(:millisecond) >= opts.deadline or Latch.present?(opts.claimed_path)
+    :persistent_term.get(opts.closed_key, false) or
+      System.monotonic_time(:millisecond) >= opts.deadline or
+      Latch.present?(opts.claimed_path)
   end
 
-  defp send_key(conn, ssh_access) do
-    case Vagus.SSHAccess.private_key(ssh_access) do
-      {:ok, pem} ->
-        Logger.warning("SSH access key fetched by #{:inet.ntoa(conn.remote_ip)}")
+  defp refuse(conn) do
+    conn
+    |> put_resp_content_type("text/plain")
+    |> put_resp_header("cache-control", "no-store")
+    |> send_resp(410, "handout closed\n")
+  end
 
-        conn
-        |> put_resp_content_type("text/plain")
-        |> put_resp_header("cache-control", "no-store")
-        |> send_resp(200, pem)
+  defp send_key(conn, opts) do
+    case Vagus.SSHAccess.private_key(opts.ssh_access) do
+      {:ok, pem} ->
+        # The call can wait out a closure, so check again before the key leaves.
+        if closed?(opts) do
+          refuse(conn)
+        else
+          Logger.warning("SSH access key fetched by #{:inet.ntoa(conn.remote_ip)}")
+
+          conn
+          |> put_resp_content_type("text/plain")
+          |> put_resp_header("cache-control", "no-store")
+          |> send_resp(200, pem)
+        end
 
       {:error, :unavailable} ->
         conn
