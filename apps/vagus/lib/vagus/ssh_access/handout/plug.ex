@@ -13,8 +13,12 @@ defmodule Vagus.SSHAccess.Handout.Plug do
   @impl true
   def init(opts), do: Keyword.get(opts, :ssh_access, Vagus.SSHAccess)
 
+  # `connection: close`: the listener's long keep-alive would otherwise let an
+  # open connection fetch again while the closed handout drains.
   @impl true
   def call(%Plug.Conn{method: "GET", path_info: ["key"]} = conn, ssh_access) do
+    conn = put_resp_header(conn, "connection", "close")
+
     case Vagus.SSHAccess.private_key(ssh_access) do
       {:ok, pem} ->
         Logger.warning("SSH access key fetched by #{:inet.ntoa(conn.remote_ip)}")

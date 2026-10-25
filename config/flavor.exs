@@ -22,11 +22,10 @@ flavor =
 
 config :vagus, :flavor, flavor
 
-# The agent-dev-board never runs Core. `:first_boot_provision` stays on so
-# /data still expands. The memory DB and its native server are listed before
-# the orchestrator that uses them. The Orchestrator's keyword list
-# deep-merges, so `default_apps` replaces config/target.exs's list and keeps
-# its `boot`.
+# The agent-dev-board never runs Core; `:first_boot_provision` stays on so
+# /data still expands. The memory DB and its server precede the orchestrator
+# that uses them. The Orchestrator's keyword list deep-merges, so
+# `default_apps` replaces config/target.exs's list and keeps its `boot`.
 if flavor == :agent_dev_board do
   config :vagus, core_watchdog: false, provision_core: false
   config :vagus, :orchestrator_app, "agent_orchestrator"
@@ -38,12 +37,10 @@ if flavor == :agent_dev_board do
     default_apps: ["core_mqtt", "agent_memory", "vagus_memory", "agent_orchestrator"]
 
   # No Core admin panel to hand the SSH access key out through, so
-  # `Vagus.SSHAccess.Handout` serves it until the first login. A remote
-  # capture survives the release's sys.config round-trip (`~tp` then
-  # `:file.consult`); a local fun would not. `authorized_keys` from
-  # config/target.exs is a different key and merges.
+  # `Vagus.SSHAccess.Handout` serves it until the first login. An MFA, which
+  # nerves_ssh converts: it documents function refs in app config misbehaving.
   config :vagus, :ssh_handout, enabled: true
 
   config :nerves_ssh,
-    daemon_option_overrides: [connectfun: &Vagus.SSHAccess.Handout.on_login/3]
+    daemon_option_overrides: [connectfun: {Vagus.SSHAccess.Handout, :on_login, 3}]
 end

@@ -60,6 +60,8 @@ defmodule Vagus.FlavorConfigTest do
       |> String.split("\n")
       |> Enum.find(&String.starts_with?(&1, "config :vagus, Vagus.App.Orchestrator,"))
 
+    assert orchestrator, "config/target.exs no longer has its Orchestrator line; update this test"
+
     File.write!(Path.join(target, "target.exs"), """
     import Config
     #{orchestrator}
@@ -88,7 +90,7 @@ defmodule Vagus.FlavorConfigTest do
     assert config[:vagus][:ssh_handout][:enabled] == true
 
     assert config[:nerves_ssh][:daemon_option_overrides][:connectfun] ==
-             (&Vagus.SSHAccess.Handout.on_login/3)
+             {Vagus.SSHAccess.Handout, :on_login, 3}
   end
 
   test "an unset VAGUS_FLAVOR leaves the SSH key handout off" do
@@ -116,7 +118,9 @@ defmodule Vagus.FlavorConfigTest do
     nerves_ssh = Config.Reader.read!(Path.join(target, "target.exs"))[:nerves_ssh]
 
     assert nerves_ssh[:authorized_keys] == ["ssh-ed25519 AAAA operator"]
-    assert is_function(nerves_ssh[:daemon_option_overrides][:connectfun], 3)
+
+    assert nerves_ssh[:daemon_option_overrides][:connectfun] ==
+             {Vagus.SSHAccess.Handout, :on_login, 3}
   end
 
   describe "target.exs authorized_keys" do
@@ -135,6 +139,10 @@ defmodule Vagus.FlavorConfigTest do
       on_exit(fn -> File.rm_rf(dir) end)
 
       lines = @target_exs |> File.read!() |> String.split("\n")
+
+      assert "authorized_keys =" in lines and "  authorized_keys: authorized_keys" in lines,
+             "config/target.exs's authorized_keys block moved or was reformatted; update this test"
+
       {_, from} = Enum.split_while(lines, &(&1 != "authorized_keys ="))
       {block, [last | _]} = Enum.split_while(from, &(&1 != "  authorized_keys: authorized_keys"))
 
@@ -153,21 +161,37 @@ defmodule Vagus.FlavorConfigTest do
                ["ssh-ed25519 AAAA a", "ssh-ed25519 BBBB b"]
     end
 
-    # `System.user_home!/0` is fixed at VM start, so the empty home needs a
-    # fresh VM.
+    # `System.user_home!/0` is fixed at VM start, so a fake home needs a
+    # fresh VM. Resolved first: a mise shim breaks under a fake HOME.
+    defp read_in_home(exs, home) do
+      elixir = System.find_executable("elixir")
+
+      System.cmd(
+        elixir,
+        ["-e", "IO.inspect(Config.Reader.read!(#{inspect(exs)})[:nerves_ssh][:authorized_keys])"],
+        env: [{"HOME", home}, {"NERVES_AUTHORIZED_KEYS", nil}],
+        stderr_to_stdout: true
+      )
+    end
+
     test "an unset NERVES_AUTHORIZED_KEYS with no ~/.ssh keys fails the build",
          %{exs: exs, dir: dir} do
       home = Path.join(dir, "home")
       File.mkdir_p!(home)
 
-      {out, status} =
-        System.cmd("elixir", ["-e", "Config.Reader.read!(#{inspect(exs)})"],
-          env: [{"HOME", home}, {"NERVES_AUTHORIZED_KEYS", nil}],
-          stderr_to_stdout: true
-        )
+      {out, status} = read_in_home(exs, home)
 
       assert status != 0
       assert out =~ "No SSH public keys found in ~/.ssh"
+    end
+
+    test "an unset NERVES_AUTHORIZED_KEYS bakes the ~/.ssh keys", %{exs: exs, dir: dir} do
+      home = Path.join(dir, "home")
+      File.mkdir_p!(Path.join(home, ".ssh"))
+      File.write!(Path.join(home, ".ssh/id_ed25519.pub"), "ssh-ed25519 AAAA home\n")
+
+      assert {out, 0} = read_in_home(exs, home)
+      assert out == inspect(["ssh-ed25519 AAAA home\n"]) <> "\n"
     end
   end
 

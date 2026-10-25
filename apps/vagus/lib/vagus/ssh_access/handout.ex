@@ -6,22 +6,14 @@ defmodule Vagus.SSHAccess.Handout do
   the key through, and released images bake no operator keys, so without
   this nobody could log in.
 
-  Any successful SSH login (any key; nerves_ssh calls `on_login/3` as the
-  daemon's `connectfun`) writes a latch file and closes the handout if it is
-  open, and a latched device never opens it again. That holds for a login
-  after the window too: it still latches, so the next boot stays shut. A
-  window that ends with nobody logged in writes nothing, so the next boot
-  reopens it instead of stranding the board.
+  Any successful SSH login, with any key and even after the window, writes a
+  latch file, and a latched device never opens the handout again. A window
+  that ends with nobody logged in writes nothing, so the next boot reopens
+  it instead of stranding the board. The window's deadline is fixed when
+  this supervisor starts, so a Server crash does not extend it.
 
   Anyone on the LAN during the window can take the key and with it root.
   Accepted: the board is an expendable development appliance.
-
-  Closing is the tree's job: the Server is a significant `:transient` child
-  under `auto_shutdown: :any_significant`, so its clean stop shuts this
-  supervisor and the listener down, and this supervisor is `:transient`
-  itself so its parent does not reopen it. A crash restarts and re-arms a
-  full window. Running out of restart intensity also exits `:shutdown`,
-  which closes the handout for the rest of that boot.
   """
 
   use Supervisor
@@ -54,25 +46,29 @@ defmodule Vagus.SSHAccess.Handout do
   The daemon's `connectfun`, run in the SSH connection process after every
   successful authentication. It latches here rather than in the Server
   because the Server is gone once the window has elapsed, and a lookup
-  before a cast cannot tell whether the cast will land. Never raises: a
+  before a cast cannot tell whether the cast will land. The latch is written
+  before anything formats the attacker-chosen user name. Never raises: a
   failure only means the next boot reopens the handout.
   """
   @spec on_login(charlist(), term(), charlist(), GenServer.server()) :: :ok
   def on_login(user, peer, method, server \\ @server) do
-    who = "#{user} from #{peer_ip(peer)} (#{method})"
-    latch(who)
-    GenServer.cast(server, {:login, who})
+    latch()
+    GenServer.cast(server, {:login, who(user, peer, method)})
   catch
-    kind, reason -> log_crash(kind, reason)
+    kind, reason ->
+      Logger.error("SSH key handout: login hook failed: #{Exception.format(kind, reason)}")
   end
 
-  defp latch(who) do
+  defp latch do
     path = claimed_path(Application.get_env(:vagus, :ssh_handout, []))
 
     unless Latch.present?(path) do
-      case Latch.write(path, "#{DateTime.to_iso8601(DateTime.utc_now())} #{who}\n") do
+      case Latch.write(path, "#{DateTime.to_iso8601(DateTime.utc_now())}\n") do
         :ok ->
           :ok
+
+        {:error, {:partial, reason}} ->
+          Logger.error("SSH key handout: latched, but #{path} is incomplete (#{inspect(reason)})")
 
         {:error, reason} ->
           Logger.error(
@@ -81,27 +77,29 @@ defmodule Vagus.SSHAccess.Handout do
           )
       end
     end
-
-    :ok
-  catch
-    kind, reason -> log_crash(kind, reason)
   end
 
-  defp log_crash(kind, reason) do
-    Logger.error("SSH key handout: login hook failed: #{Exception.format(kind, reason)}")
+  defp who(user, peer, method), do: "#{inspect(user)} from #{peer_ip(peer)} (#{inspect(method)})"
+
+  defp peer_ip({ip, _port}) when is_tuple(ip) do
+    case :inet.ntoa(ip) do
+      {:error, _} -> inspect(ip)
+      address -> List.to_string(address)
+    end
   end
+
+  defp peer_ip(peer), do: inspect(peer)
 
   defp claimed_path(opts), do: Keyword.get(opts, :claimed_path, @default_claimed_path)
-
-  # `:ssh` passes `{ip, port}`.
-  defp peer_ip({ip, _port}) when is_tuple(ip), do: :inet.ntoa(ip)
-  defp peer_ip(peer), do: inspect(peer)
 
   @impl true
   def init(opts) do
     name = Keyword.get(opts, :name, __MODULE__)
     port = Keyword.get(opts, :port, @default_port)
     claimed_path = claimed_path(opts)
+
+    deadline =
+      System.monotonic_time(:millisecond) + Keyword.get(opts, :window_ms, @default_window_ms)
 
     if Latch.present?(claimed_path) do
       Logger.info("SSH key handout not started: already claimed (#{claimed_path})")
@@ -119,11 +117,14 @@ defmodule Vagus.SSHAccess.Handout do
          plug: plug,
          port: port,
          ip: Keyword.get(opts, :ip, {0, 0, 0, 0})},
+        # Its clean stop closes the handout: `:any_significant` shuts this
+        # supervisor, which is `:transient` so its parent leaves it down.
         Supervisor.child_spec(
           {__MODULE__.Server,
            name: Module.concat(name, Server),
            port: port,
-           window_ms: Keyword.get(opts, :window_ms, @default_window_ms)},
+           deadline: deadline,
+           claimed_path: claimed_path},
           restart: :transient,
           significant: true
         )
