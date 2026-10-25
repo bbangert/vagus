@@ -16,7 +16,6 @@ defmodule Vagus.SSHAccess.Handout.Plug do
   def init(opts) do
     %{
       ssh_access: Keyword.get(opts, :ssh_access, Vagus.SSHAccess),
-      deadline: Keyword.fetch!(opts, :deadline),
       claimed_path: Keyword.fetch!(opts, :claimed_path),
       closed_key: Keyword.fetch!(opts, :closed_key)
     }
@@ -41,9 +40,7 @@ defmodule Vagus.SSHAccess.Handout.Plug do
   def call(conn, _opts), do: send_resp(conn, 404, "")
 
   defp closed?(opts) do
-    :persistent_term.get(opts.closed_key, false) or
-      System.monotonic_time(:millisecond) >= opts.deadline or
-      Latch.present?(opts.claimed_path)
+    :persistent_term.get(opts.closed_key, false) or Latch.present?(opts.claimed_path)
   end
 
   defp refuse(conn) do

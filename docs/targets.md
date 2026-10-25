@@ -225,20 +225,20 @@ so flavors never cross over. Returning a board to stock is a manual `fwup`
 upload of a stock build (see the upload recipe under Building); the next boot
 runs Core again.
 
-SSH access: released images of either flavor bake no operator keys. For 5
-minutes after boot an agent board serves its device SSH key (the one a stock
-board hands out through the admin panel) over plain HTTP:
+SSH access: released images of either flavor bake no operator keys. From
+boot an agent board serves its device SSH key (the one a stock board hands
+out through the admin panel) over plain HTTP until an operator claims it:
 
 ```sh
 curl -fsS http://<board-ip>:8891/key -o vagus_key && chmod 600 vagus_key
 ssh -i vagus_key root@<board-ip>
+iex> Vagus.SSHAccess.Handout.drop()
 ```
 
-Any successful SSH login, even after the window, latches it shut for good
-(`/data/vagus/ssh_handout.claimed`). If the window ends with nobody logged
-in, it reopens on the next boot. Anyone on the LAN during the window can take
-the key and get root; accepted for an expendable dev board. Details in
-[agent-dev-board.md](agent-dev-board.md#ssh-key-handout).
+`drop/0` latches the device shut for good (`/data/vagus/ssh_handout.claimed`).
+Nothing closes the handout automatically, so an unclaimed board keeps offering
+the key, and with it root, to anyone on the LAN; accepted for an expendable
+dev board. Details in [agent-dev-board.md](agent-dev-board.md#ssh-key-handout).
 
 To tell what a board runs: `Vagus.Flavor.get()` over ssh, or `nerves_fw_misc`
 in the firmware KV (set for CI builds). The agent container images and their

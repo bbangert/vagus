@@ -37,10 +37,6 @@ if flavor == :agent_dev_board do
     default_apps: ["core_mqtt", "agent_memory", "vagus_memory", "agent_orchestrator"]
 
   # No Core admin panel to hand the SSH access key out through, so
-  # `Vagus.SSHAccess.Handout` serves it until the first login. An MFA, which
-  # nerves_ssh converts: it documents function refs in app config misbehaving.
+  # `Vagus.SSHAccess.Handout` serves it until an operator drops it.
   config :vagus, :ssh_handout, enabled: true
-
-  config :nerves_ssh,
-    daemon_option_overrides: [connectfun: {Vagus.SSHAccess.Handout, :on_login, 3}]
 end

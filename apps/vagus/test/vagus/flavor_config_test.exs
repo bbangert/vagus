@@ -83,14 +83,11 @@ defmodule Vagus.FlavorConfigTest do
              )
   end
 
-  test "agent-dev-board enables the SSH key handout and wires its login hook" do
+  test "agent-dev-board enables the SSH key handout" do
     System.put_env("VAGUS_FLAVOR", "agent-dev-board")
     config = Config.Reader.read!(@flavor_exs)
 
     assert config[:vagus][:ssh_handout][:enabled] == true
-
-    assert config[:nerves_ssh][:daemon_option_overrides][:connectfun] ==
-             {Vagus.SSHAccess.Handout, :on_login, 3}
   end
 
   test "an unset VAGUS_FLAVOR leaves the SSH key handout off" do
@@ -99,28 +96,6 @@ defmodule Vagus.FlavorConfigTest do
 
     refute Keyword.has_key?(config[:vagus], :ssh_handout)
     refute Keyword.has_key?(config, :nerves_ssh)
-  end
-
-  # target.exs sets `config :nerves_ssh, authorized_keys:` before importing
-  # flavor.exs; the override is a sibling key, so both must survive.
-  test "the handout's nerves_ssh override keeps target.exs's authorized_keys" do
-    System.put_env("VAGUS_FLAVOR", "agent-dev-board")
-    target = Path.join(System.tmp_dir!(), "flavor_ssh_#{System.unique_integer([:positive])}")
-    File.mkdir_p!(target)
-    on_exit(fn -> File.rm_rf(target) end)
-
-    File.write!(Path.join(target, "target.exs"), """
-    import Config
-    config :nerves_ssh, authorized_keys: ["ssh-ed25519 AAAA operator"]
-    import_config #{inspect(@flavor_exs)}
-    """)
-
-    nerves_ssh = Config.Reader.read!(Path.join(target, "target.exs"))[:nerves_ssh]
-
-    assert nerves_ssh[:authorized_keys] == ["ssh-ed25519 AAAA operator"]
-
-    assert nerves_ssh[:daemon_option_overrides][:connectfun] ==
-             {Vagus.SSHAccess.Handout, :on_login, 3}
   end
 
   describe "target.exs authorized_keys" do
