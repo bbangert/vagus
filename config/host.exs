@@ -41,6 +41,12 @@ config :vagus, :app_files_dir, Path.expand("../.dev/apps", __DIR__)
 # :core_token_path above; config/target.exs puts it on /data.
 config :vagus, :ssh_access_path, Path.expand("../.dev/ssh_access.dets", __DIR__)
 
+# `Vagus.SSHAccess.Handout`'s one-shot latch; its default is the target path.
+# Loopback so a host run with VAGUS_FLAVOR set never serves the key on the LAN.
+config :vagus, :ssh_handout,
+  claimed_path: Path.expand("../.dev/ssh_handout.claimed", __DIR__),
+  ip: {127, 0, 0, 1}
+
 # Base URL Vagus.Core.Client/EventPusher use to reach Core itself (distinct
 # from :api_port above, which is the port THIS emulator listens on for
 # Core to call INTO). On a device this is only a fallback — every real call

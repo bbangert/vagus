@@ -295,6 +295,29 @@ orchestrator cannot be): `POST /backups/<backup-slug>/restore/partial` with
 postgresql://agent@172.30.40.2/memory` for raw queries. Never store
 credentials in it, and never drop or truncate its tables.
 
+## SSH key handout
+
+Released images bake no operator SSH keys, and there is no Core admin panel to
+hand out the device key (`Vagus.SSHAccess`) through. So for 5 minutes after
+boot `Vagus.SSHAccess.Handout` serves that key's private half, unauthenticated,
+on port 8891:
+
+```sh
+curl -fsS http://<board-ip>:8891/key -o vagus_key && chmod 600 vagus_key
+ssh -i vagus_key root@<board-ip>
+```
+
+Any successful SSH login, with any key and even after the window, writes
+`/data/vagus/ssh_handout.claimed` and shuts the listener if it is still open;
+once that file exists the handout never starts again. If the window ends with
+nobody logged in, nothing is written and the next boot reopens it, so a missed
+window does not strand the board. Every fetch is logged with the client's
+address. To reopen it on a board you can still reach, delete the latch and
+reboot.
+
+Anyone on the LAN during the window can take the key and get root. That is
+accepted: the board is expendable and never on an untrusted network.
+
 ## Logging in
 
 The login is done once per board by the owner. It is a paste-code flow. From
@@ -390,3 +413,5 @@ are new after every boot.
   the board's loopback, so host networking is only for tasks that need it.
 - The board is a development appliance. Never share it or expose it to an
   untrusted network.
+- For the first 5 minutes of every boot until someone logs in, the SSH key is
+  free to anyone on the LAN ([SSH key handout](#ssh-key-handout)).

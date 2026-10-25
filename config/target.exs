@@ -44,32 +44,35 @@ config :nerves, :erlinit, update_clock: true, env: "PLUG_TMPDIR=/root/tmp"
 # * See https://nerves-ssh.hexdocs.pm/readme.html for general SSH configuration
 # * See https://ssh-subsystem-fwup.hexdocs.pm/readme.html for firmware updates
 
-# Sourced from the NERVES_AUTHORIZED_KEYS env var (newline-separated
-# authorized_keys lines) when set — CI release builds have no ~/.ssh, so
-# release.yml injects the operator's public keys from a repo Actions
-# variable; the keys baked into a CI build MUST match the local-build
-# keys or an OTA would strip SSH access to the fleet. Local builds keep
-# the conventional ~/.ssh glob.
+# NERVES_AUTHORIZED_KEYS (newline-separated authorized_keys lines) wins
+# when set, even empty: release.yml sets it empty so released images bake no
+# keys. Unset (a local build) bakes the developer's own ~/.ssh keys so a
+# locally flashed board stays reachable. Neither has to match the other
+# across an OTA: what survives one is the device key `Vagus.SSHAccess`
+# persists in /data.
 authorized_keys =
   case System.get_env("NERVES_AUTHORIZED_KEYS") do
     nil ->
-      System.user_home!()
-      |> Path.join(".ssh/id_{rsa,ecdsa,ed25519}.pub")
-      |> Path.wildcard()
-      |> Enum.map(&File.read!/1)
+      keys =
+        System.user_home!()
+        |> Path.join(".ssh/id_{rsa,ecdsa,ed25519}.pub")
+        |> Path.wildcard()
+        |> Enum.map(&File.read!/1)
+
+      if keys == [],
+        do:
+          Mix.raise("""
+          No SSH public keys found in ~/.ssh and NERVES_AUTHORIZED_KEYS is
+          unset. A local build bakes your own key so you can log into the
+          board; set NERVES_AUTHORIZED_KEYS="" to build one with none.
+          See your project's config/target.exs for this error message.
+          """)
+
+      keys
 
     env_keys ->
       String.split(env_keys, "\n", trim: true)
   end
-
-if authorized_keys == [],
-  do:
-    Mix.raise("""
-    No SSH public keys found in ~/.ssh and NERVES_AUTHORIZED_KEYS is unset
-    or empty. An ssh authorized key is needed to log into the Nerves device
-    and update firmware on it using ssh.
-    See your project's config/target.exs for this error message.
-    """)
 
 config :nerves_ssh,
   authorized_keys: authorized_keys
