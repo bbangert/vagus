@@ -29,8 +29,8 @@ defmodule Vagus.SSHAccess.Handout.Latch do
   end
 
   @doc """
-  Creates the latch, synced so a power cut soon after the first login cannot
-  lose it. An existing latch is success: another login won the race.
+  Creates the latch, synced so a power cut soon after the drop cannot lose
+  it. An existing latch is success and is left untouched.
   `{:error, {:partial, reason}}` means the file exists, so the device is
   latched, but its content or mode is not what was asked for.
   """

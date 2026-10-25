@@ -1,5 +1,5 @@
 defmodule Vagus.SSHAccess.HandoutTest do
-  # Tests calling `on_login/3` use the default names and the global app env.
+  # `drop/1` reads the latch path from the global app env.
   use ExUnit.Case, async: false
 
   @moduletag :capture_log
@@ -53,12 +53,9 @@ defmodule Vagus.SSHAccess.HandoutTest do
 
     name = :"ssh_handout_#{n}"
 
-    on_exit(fn ->
-      :persistent_term.erase(closed_key(name))
-      :persistent_term.erase(closed_key(Handout))
-    end)
+    on_exit(fn -> :persistent_term.erase(closed_key(name)) end)
 
-    # `on_login/3,4` latches at the configured path, as on a board.
+    # `drop/1` latches at the configured path, as on a board.
     claimed_path = Path.join([dir, "latch", "ssh_handout.claimed"])
     prev = Application.fetch_env(:vagus, :ssh_handout)
     Application.put_env(:vagus, :ssh_handout, claimed_path: claimed_path)
@@ -76,13 +73,12 @@ defmodule Vagus.SSHAccess.HandoutTest do
        ssh_access: ssh_access,
        port: 0,
        ip: {127, 0, 0, 1},
-       window_ms: 60_000,
        claimed_path: claimed_path
      ],
      ssh_access: ssh_access}
   end
 
-  test "serves the access key with no-store inside the window", %{opts: opts, ssh_access: sa} do
+  test "serves the access key with no-store", %{opts: opts, ssh_access: sa} do
     port = start_handout(opts)
 
     {resp, log} = with_log(fn -> Req.get!("http://127.0.0.1:#{port}/key", retry: false) end)
@@ -131,33 +127,72 @@ defmodule Vagus.SSHAccess.HandoutTest do
     assert Handout.child_spec([]).restart == :transient
   end
 
-  test "the window elapsing closes the listener for good", %{opts: opts} do
+  test "drop latches the device and closes the listener for good", %{opts: opts} do
     {wrapper, port} = start_wrapped_handout(opts)
     handout_ref = Process.monitor(Process.whereis(opts[:name]))
-    server = Process.whereis(Module.concat(opts[:name], Server))
-    server_ref = Process.monitor(server)
+    server_ref = Process.monitor(Process.whereis(Module.concat(opts[:name], Server)))
 
-    send(server, :window_elapsed)
+    {result, log} = with_log(fn -> Handout.drop(opts[:name]) end)
 
+    assert result == :ok
+    assert log =~ "SSH key handout closed: dropped by operator"
     assert_receive {:DOWN, ^server_ref, :process, _, :normal}
     assert_receive {:DOWN, ^handout_ref, :process, _, :shutdown}
     assert [{Handout, :undefined, :supervisor, _}] = Supervisor.which_children(wrapper)
+    assert :persistent_term.get(closed_key(opts[:name])) == true
+
+    assert {:ok, %File.Stat{mode: mode}} = File.stat(opts[:claimed_path])
+    assert band(mode, 0o777) == 0o600
+
+    assert {:ok, _, _} =
+             opts[:claimed_path] |> File.read!() |> String.trim() |> DateTime.from_iso8601()
 
     assert_refused(port)
-
     refute Process.whereis(Module.concat(opts[:name], "Listener.Bandit"))
+    assert :ignore = Handout.start_link(opts)
+  end
+
+  test "drop again leaves the latch alone", %{opts: opts} do
+    start_handout(opts)
+    assert :ok = Handout.drop(opts[:name])
+    File.touch!(opts[:claimed_path], {{2020, 1, 1}, {0, 0, 0}})
+    before = File.stat!(opts[:claimed_path])
+    content = File.read!(opts[:claimed_path])
+
+    assert :ok = Handout.drop(opts[:name])
+
+    assert File.stat!(opts[:claimed_path]).mtime == before.mtime
+    assert File.read!(opts[:claimed_path]) == content
+  end
+
+  test "drop with no handout running still latches", %{opts: opts} do
+    refute Process.whereis(Module.concat(opts[:name], Server))
+
+    assert :ok = Handout.drop(opts[:name])
+    assert File.exists?(opts[:claimed_path])
+  end
+
+  test "drop whose latch cannot be written still closes this boot's handout", %{opts: opts} do
+    start_handout(opts)
+    ref = Process.monitor(Process.whereis(Module.concat(opts[:name], Server)))
+    dir = Path.dirname(opts[:claimed_path])
+    File.mkdir_p!(dir)
+    File.chmod!(dir, 0o500)
+    on_exit(fn -> File.chmod(dir, 0o700) end)
+
+    {result, log} = with_log(fn -> Handout.drop(opts[:name]) end)
+
+    assert {:error, _reason} = result
+    assert log =~ "it will reopen next boot"
+    assert_receive {:DOWN, ^ref, :process, _, :normal}
+    assert :persistent_term.get(closed_key(opts[:name])) == true
     refute File.exists?(opts[:claimed_path])
   end
 
-  test "a Server crash keeps the original deadline", %{opts: opts} do
-    start_handout(opts)
+  test "a Server crash while open keeps serving", %{opts: opts} do
+    port = start_handout(opts)
     name = Module.concat(opts[:name], Server)
     old = Process.whereis(name)
-    old_state = :sys.get_state(old)
-    remaining = Process.read_timer(old_state.timer)
-
-    # A re-armed full window only outlasts the original once time has passed.
-    Process.sleep(20)
     ref = Process.monitor(old)
     Process.exit(old, :kill)
     assert_receive {:DOWN, ^ref, :process, _, :killed}
@@ -166,14 +201,12 @@ defmodule Vagus.SSHAccess.HandoutTest do
     Supervisor.which_children(opts[:name])
     new = Process.whereis(name)
     assert is_pid(new) and new != old
-    new_state = :sys.get_state(new)
+    :sys.get_state(new)
 
-    assert new_state.deadline == old_state.deadline
-    # 20 ms passed since `remaining`; 10 of slack covers ms rounding.
-    assert Process.read_timer(new_state.timer) <= remaining - 10
+    assert %{status: 200} = Req.get!("http://127.0.0.1:#{port}/key", retry: false)
   end
 
-  test "a Server restarted after a login whose cast missed it closes", %{opts: opts} do
+  test "a Server restarted after a drop that missed it closes", %{opts: opts} do
     start_handout(opts)
     handout_ref = Process.monitor(Process.whereis(opts[:name]))
     File.mkdir_p!(Path.dirname(opts[:claimed_path]))
@@ -183,31 +216,6 @@ defmodule Vagus.SSHAccess.HandoutTest do
 
     assert_receive {:DOWN, ^handout_ref, :process, _, :shutdown}
     refute Process.whereis(Module.concat(opts[:name], "Listener.Bandit"))
-  end
-
-  test "an SSH login latches the handout shut", %{opts: opts} do
-    # Default names: `on_login/3` is exactly what the daemon calls.
-    opts = Keyword.delete(opts, :name)
-    port = start_handout(opts)
-    ref = Process.monitor(Process.whereis(Handout))
-
-    {:ok, log} =
-      with_log(fn ->
-        assert :ok = Handout.on_login(~c"root", {{192, 168, 1, 5}, 50_000}, ~c"publickey")
-        assert_receive {:DOWN, ^ref, :process, _, :shutdown}, 2_000
-        :ok
-      end)
-
-    assert log =~ ~s[SSH login by ~c"root" from 192.168.1.5 (~c"publickey")]
-    assert {:ok, %File.Stat{mode: mode}} = File.stat(opts[:claimed_path])
-    assert band(mode, 0o777) == 0o600
-
-    assert {:ok, _, _} =
-             opts[:claimed_path] |> File.read!() |> String.trim() |> DateTime.from_iso8601()
-
-    assert_refused(port)
-
-    refute Process.whereis(Handout.Listener.Bandit)
   end
 
   test "a latched device starts no listener", %{opts: opts} do
@@ -229,83 +237,14 @@ defmodule Vagus.SSHAccess.HandoutTest do
     File.write!(Path.dirname(opts[:claimed_path]), "not a dir")
 
     assert :ignore = Handout.start_link(opts)
-    assert :ok = Handout.on_login(~c"root", {{127, 0, 0, 1}, 1}, ~c"publickey")
   end
 
-  test "a login after the window closed still latches", %{opts: opts} do
-    start_supervised!({Handout, opts})
-    server = Module.concat(opts[:name], Server)
-    pid = Process.whereis(server)
-    ref = Process.monitor(pid)
-    send(pid, :window_elapsed)
-    assert_receive {:DOWN, ^ref, :process, _, :normal}
-    refute File.exists?(opts[:claimed_path])
-
-    assert :ok = Handout.on_login(~c"root", {{10, 0, 0, 9}, 4_000}, ~c"publickey", server)
-
-    assert {:ok, %File.Stat{mode: mode}} = File.stat(opts[:claimed_path])
-    assert band(mode, 0o777) == 0o600
-    assert :ignore = Handout.start_link(opts)
-  end
-
-  test "on_login/3 with no handout running still latches", %{opts: opts} do
-    refute Process.whereis(Handout.Server)
-    assert :ok = Handout.on_login(~c"root", {{127, 0, 0, 1}, 1}, ~c"publickey")
-    assert File.exists?(opts[:claimed_path])
-  end
-
-  test "on_login latches whatever the peer and user look like", %{opts: opts} do
-    server = Module.concat(opts[:name], Server)
-
-    assert :ok = Handout.on_login(~c"root", :garbage, ~c"password", server)
-    assert File.exists?(opts[:claimed_path])
-
-    assert :ok = Handout.on_login([0x110000, ?\n], {{1, 2, 3}, 1}, ~c"password", server)
-  end
-
-  test "on_login with the latch already present leaves it alone", %{opts: opts} do
-    File.mkdir_p!(Path.dirname(opts[:claimed_path]))
-    File.write!(opts[:claimed_path], "first\n")
-    File.touch!(opts[:claimed_path], {{2020, 1, 1}, {0, 0, 0}})
-    before = File.stat!(opts[:claimed_path])
-
-    assert :ok = Handout.on_login(~c"root", {{127, 0, 0, 1}, 1}, ~c"publickey")
-
-    assert File.stat!(opts[:claimed_path]).mtime == before.mtime
-    assert File.read!(opts[:claimed_path]) == "first\n"
-  end
-
-  test "a latch another login already created is success", %{opts: opts} do
+  test "a latch another drop already created is success", %{opts: opts} do
     File.mkdir_p!(Path.dirname(opts[:claimed_path]))
     File.write!(opts[:claimed_path], "first\n")
 
     assert :ok = Latch.write(opts[:claimed_path], "second\n")
     assert File.read!(opts[:claimed_path]) == "first\n"
-  end
-
-  test "a login whose latch cannot be written still closes the handout", %{opts: opts} do
-    start_handout(opts)
-    server = Module.concat(opts[:name], Server)
-    ref = Process.monitor(Process.whereis(server))
-    dir = Path.dirname(opts[:claimed_path])
-    File.mkdir_p!(dir)
-    File.chmod!(dir, 0o500)
-    on_exit(fn -> File.chmod(dir, 0o700) end)
-
-    assert :ok = Handout.on_login(~c"root", {{127, 0, 0, 1}, 1}, ~c"publickey", server)
-    assert_receive {:DOWN, ^ref, :process, _, :normal}
-    refute File.exists?(opts[:claimed_path])
-  end
-
-  test "a login whose latch raises still closes the handout", %{opts: opts} do
-    start_handout(opts)
-    server = Module.concat(opts[:name], Server)
-    ref = Process.monitor(Process.whereis(server))
-    # Not a path: every file call on it raises.
-    Application.put_env(:vagus, :ssh_handout, claimed_path: 123)
-
-    assert :ok = Handout.on_login(~c"root", {{127, 0, 0, 1}, 1}, ~c"publickey", server)
-    assert_receive {:DOWN, ^ref, :process, _, :normal}
   end
 
   test "a latch whose write fails after the create is partial", %{opts: opts} do
@@ -314,11 +253,11 @@ defmodule Vagus.SSHAccess.HandoutTest do
     assert File.exists?(opts[:claimed_path])
   end
 
-  test "a request in flight when the handout closes gets no key", %{opts: opts} do
+  test "a request in flight when the handout is dropped gets no key", %{opts: opts} do
     assert_in_flight_refused(opts)
   end
 
-  test "a request in flight when an unlatchable login closes it gets no key", %{opts: opts} do
+  test "a request in flight when an unlatchable drop closes it gets no key", %{opts: opts} do
     dir = Path.dirname(opts[:claimed_path])
     File.mkdir_p!(dir)
     File.chmod!(dir, 0o500)
@@ -328,18 +267,17 @@ defmodule Vagus.SSHAccess.HandoutTest do
     refute File.exists?(opts[:claimed_path])
   end
 
-  test "a key fetch that waits out the closure is refused", %{opts: opts} do
+  test "a key fetch that waits out the drop is refused", %{opts: opts} do
     stand_in = :"#{opts[:name]}_blocking_key"
     start_supervised!({BlockingKey, name: stand_in, test: self()})
     port = start_handout(Keyword.put(opts, :ssh_access, stand_in))
-    server = Module.concat(opts[:name], Server)
-    ref = Process.monitor(Process.whereis(server))
+    ref = Process.monitor(Process.whereis(Module.concat(opts[:name], Server)))
 
     request =
       Task.async(fn -> Req.get("http://127.0.0.1:#{port}/key", retry: false) end)
 
     assert_receive {:key_requested, _}
-    assert :ok = Handout.on_login(~c"root", {{127, 0, 0, 1}, 1}, ~c"publickey", server)
+    assert :ok = Handout.drop(opts[:name])
     assert_receive {:DOWN, ^ref, :process, _, :normal}
     BlockingKey.release(stand_in)
 
@@ -353,61 +291,38 @@ defmodule Vagus.SSHAccess.HandoutTest do
     end
   end
 
-  test "a closed window refuses the key with no latch on disk", %{opts: opts} do
-    start_handout(opts)
-    server = Process.whereis(Module.concat(opts[:name], Server))
-    ref = Process.monitor(server)
-    send(server, :window_elapsed)
-    assert_receive {:DOWN, ^ref, :process, _, :normal}
-
-    assert :persistent_term.get(closed_key(opts[:name])) == true
-    refute File.exists?(opts[:claimed_path])
-
+  test "the plug refuses the key once flagged or latched", %{opts: opts} do
     plug =
       Handout.Plug.init(
         ssh_access: opts[:ssh_access],
         claimed_path: opts[:claimed_path],
-        deadline: System.monotonic_time(:millisecond) + 60_000,
         closed_key: closed_key(opts[:name])
       )
 
-    assert Handout.Plug.call(Plug.Test.conn(:get, "/key"), plug).status == 410
-  end
+    assert Handout.Plug.call(Plug.Test.conn(:get, "/key"), plug).status == 200
 
-  test "the plug refuses the key past the deadline or once latched", %{opts: opts} do
-    open = [
-      ssh_access: opts[:ssh_access],
-      claimed_path: opts[:claimed_path],
-      closed_key: closed_key(opts[:name])
-    ]
-
-    now = System.monotonic_time(:millisecond)
-
-    past = Handout.Plug.init([deadline: now] ++ open)
-    conn = Handout.Plug.call(Plug.Test.conn(:get, "/key"), past)
+    :persistent_term.put(closed_key(opts[:name]), true)
+    conn = Handout.Plug.call(Plug.Test.conn(:get, "/key"), plug)
     assert conn.status == 410
     assert Plug.Conn.get_resp_header(conn, "cache-control") == ["no-store"]
     assert conn.resp_body == "handout closed\n"
 
-    future = Handout.Plug.init([deadline: now + 60_000] ++ open)
-    assert Handout.Plug.call(Plug.Test.conn(:get, "/key"), future).status == 200
-
+    :persistent_term.erase(closed_key(opts[:name]))
     File.mkdir_p!(Path.dirname(opts[:claimed_path]))
     File.write!(opts[:claimed_path], "claimed\n")
-    assert Handout.Plug.call(Plug.Test.conn(:get, "/key"), future).status == 410
+    assert Handout.Plug.call(Plug.Test.conn(:get, "/key"), plug).status == 410
   end
 
   # The request's headers are unfinished when the handout closes, so the plug
   # runs only afterwards.
   defp assert_in_flight_refused(opts) do
     port = start_handout(opts)
-    server = Module.concat(opts[:name], Server)
-    ref = Process.monitor(Process.whereis(server))
+    ref = Process.monitor(Process.whereis(Module.concat(opts[:name], Server)))
     {:ok, socket} = :gen_tcp.connect({127, 0, 0, 1}, port, [:binary, active: false], 1_000)
     on_exit(fn -> :gen_tcp.close(socket) end)
     :ok = :gen_tcp.send(socket, "GET /key HTTP/1.1\r\nhost: 127.0.0.1\r\n")
 
-    assert :ok = Handout.on_login(~c"root", {{127, 0, 0, 1}, 1}, ~c"publickey", server)
+    Handout.drop(opts[:name])
     assert_receive {:DOWN, ^ref, :process, _, :normal}
 
     case :gen_tcp.send(socket, "\r\n") do

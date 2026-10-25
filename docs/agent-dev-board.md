@@ -298,25 +298,26 @@ credentials in it, and never drop or truncate its tables.
 ## SSH key handout
 
 Released images bake no operator SSH keys, and there is no Core admin panel to
-hand out the device key (`Vagus.SSHAccess`) through. So for 5 minutes after
-boot `Vagus.SSHAccess.Handout` serves that key's private half, unauthenticated,
-on port 8891:
+hand out the device key (`Vagus.SSHAccess`) through. So from boot
+`Vagus.SSHAccess.Handout` serves that key's private half, unauthenticated, on
+port 8891, until you claim the board:
 
 ```sh
 curl -fsS http://<board-ip>:8891/key -o vagus_key && chmod 600 vagus_key
 ssh -i vagus_key root@<board-ip>
+iex> Vagus.SSHAccess.Handout.drop()
 ```
 
-Any successful SSH login, with any key and even after the window, writes
-`/data/vagus/ssh_handout.claimed` and shuts the listener if it is still open;
-once that file exists the handout never starts again. If the window ends with
-nobody logged in, nothing is written and the next boot reopens it, so a missed
-window does not strand the board. Every fetch is logged with the client's
-address. To reopen it on a board you can still reach, delete the latch and
-reboot.
+`drop/0` writes `/data/vagus/ssh_handout.claimed` and shuts the listener; once
+that file exists the handout never starts again. Nothing else closes it: not
+a login, not a timeout. If `drop/0` returns `{:error, reason}` the latch could
+not be written; the key stays withheld for the rest of that boot, but the next
+boot reopens the handout. Every fetch is logged with the client's address. To
+reopen it on a board you can still reach, delete the latch and reboot.
 
-Anyone on the LAN during the window can take the key and get root. That is
-accepted: the board is expendable and never on an untrusted network.
+Until someone runs `drop/0`, anyone on the LAN can take the key and get root,
+however long the board sits unclaimed. That is accepted: the board is
+expendable and never on an untrusted network.
 
 ## Logging in
 
@@ -413,5 +414,5 @@ are new after every boot.
   the board's loopback, so host networking is only for tasks that need it.
 - The board is a development appliance. Never share it or expose it to an
   untrusted network.
-- For the first 5 minutes of every boot until someone logs in, the SSH key is
+- Until an operator runs `Vagus.SSHAccess.Handout.drop/0`, the SSH key is
   free to anyone on the LAN ([SSH key handout](#ssh-key-handout)).
