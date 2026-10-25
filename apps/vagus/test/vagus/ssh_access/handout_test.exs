@@ -197,10 +197,7 @@ defmodule Vagus.SSHAccess.HandoutTest do
     Process.exit(old, :kill)
     assert_receive {:DOWN, ^ref, :process, _, :killed}
 
-    # On one node the kill's EXIT is queued at the supervisor before this call.
-    Supervisor.which_children(opts[:name])
-    new = Process.whereis(name)
-    assert is_pid(new) and new != old
+    new = await_restart(name, old)
     :sys.get_state(new)
 
     assert %{status: 200} = Req.get!("http://127.0.0.1:#{port}/key", retry: false)
@@ -216,6 +213,25 @@ defmodule Vagus.SSHAccess.HandoutTest do
 
     assert_receive {:DOWN, ^handout_ref, :process, _, :shutdown}
     refute Process.whereis(Module.concat(opts[:name], "Listener.Bandit"))
+  end
+
+  test "a Server restarted after an unlatchable drop that missed it closes", %{opts: opts} do
+    port = start_handout(opts)
+    handout_ref = Process.monitor(Process.whereis(opts[:name]))
+    server = Process.whereis(Module.concat(opts[:name], Server))
+    server_ref = Process.monitor(server)
+    :persistent_term.put(closed_key(opts[:name]), true)
+
+    {_, log} =
+      with_log(fn ->
+        Process.exit(server, :kill)
+        assert_receive {:DOWN, ^server_ref, :process, _, :killed}
+        assert_receive {:DOWN, ^handout_ref, :process, _, :shutdown}
+      end)
+
+    assert log =~ "SSH key handout closed: dropped by operator"
+    refute File.exists?(opts[:claimed_path])
+    assert_refused(port)
   end
 
   test "a latched device starts no listener", %{opts: opts} do
@@ -365,6 +381,19 @@ defmodule Vagus.SSHAccess.HandoutTest do
   defp assert_refused(port) do
     assert {:error, reason} = :gen_tcp.connect({127, 0, 0, 1}, port, [active: false], 500)
     assert reason in [:econnrefused, :econnreset]
+  end
+
+  # The supervisor's EXIT from the killed Server and the test's DOWN come from
+  # different senders, so nothing orders the restart before a later call.
+  defp await_restart(name, old, tries \\ 100) do
+    case Process.whereis(name) do
+      pid when is_pid(pid) and pid != old ->
+        pid
+
+      _ when tries > 0 ->
+        Process.sleep(10)
+        await_restart(name, old, tries - 1)
+    end
   end
 
   # Under a supervisor the test can ask whether it restarted the handout.

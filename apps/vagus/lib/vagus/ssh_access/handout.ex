@@ -23,6 +23,8 @@ defmodule Vagus.SSHAccess.Handout do
   @default_port 8891
   @default_claimed_path "/data/vagus/ssh_handout.claimed"
 
+  # Restart-intensity exhaustion also exits `:shutdown`, so it too leaves the
+  # handout down for this boot (fails closed); unlatched, it reopens next boot.
   def child_spec(opts) do
     %{
       id: __MODULE__,
@@ -80,8 +82,10 @@ defmodule Vagus.SSHAccess.Handout do
   defp stop_server(name) do
     GenServer.call(Module.concat(name, Server), :drop)
   catch
-    # No Server: not running, already closed, or mid-restart, where the
-    # replacement sees the flag and closes.
+    # Every exit still ends closed, as the flag is already set: `:noproc` (not
+    # running), `:normal` or a crash mid-call (the replacement closes in its
+    # continue), `:timeout` (stuck on a hung `/data` stat; it handles the
+    # queued `:drop` once the stat returns, and the plug checks the flag first).
     :exit, _reason -> :ok
   end
 
