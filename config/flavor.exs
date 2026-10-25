@@ -36,4 +36,14 @@ if flavor == :agent_dev_board do
 
   config :vagus, Vagus.App.Orchestrator,
     default_apps: ["core_mqtt", "agent_memory", "vagus_memory", "agent_orchestrator"]
+
+  # No Core admin panel to hand the SSH access key out through, so
+  # `Vagus.SSHAccess.Handout` serves it until the first login. A remote
+  # capture survives the release's sys.config round-trip (`~tp` then
+  # `:file.consult`); a local fun would not. `authorized_keys` from
+  # config/target.exs is a different key and merges.
+  config :vagus, :ssh_handout, enabled: true
+
+  config :nerves_ssh,
+    daemon_option_overrides: [connectfun: &Vagus.SSHAccess.Handout.on_login/3]
 end

@@ -81,6 +81,96 @@ defmodule Vagus.FlavorConfigTest do
              )
   end
 
+  test "agent-dev-board enables the SSH key handout and wires its login hook" do
+    System.put_env("VAGUS_FLAVOR", "agent-dev-board")
+    config = Config.Reader.read!(@flavor_exs)
+
+    assert config[:vagus][:ssh_handout][:enabled] == true
+
+    assert config[:nerves_ssh][:daemon_option_overrides][:connectfun] ==
+             (&Vagus.SSHAccess.Handout.on_login/3)
+  end
+
+  test "an unset VAGUS_FLAVOR leaves the SSH key handout off" do
+    System.delete_env("VAGUS_FLAVOR")
+    config = Config.Reader.read!(@flavor_exs)
+
+    refute Keyword.has_key?(config[:vagus], :ssh_handout)
+    refute Keyword.has_key?(config, :nerves_ssh)
+  end
+
+  # target.exs sets `config :nerves_ssh, authorized_keys:` before importing
+  # flavor.exs; the override is a sibling key, so both must survive.
+  test "the handout's nerves_ssh override keeps target.exs's authorized_keys" do
+    System.put_env("VAGUS_FLAVOR", "agent-dev-board")
+    target = Path.join(System.tmp_dir!(), "flavor_ssh_#{System.unique_integer([:positive])}")
+    File.mkdir_p!(target)
+    on_exit(fn -> File.rm_rf(target) end)
+
+    File.write!(Path.join(target, "target.exs"), """
+    import Config
+    config :nerves_ssh, authorized_keys: ["ssh-ed25519 AAAA operator"]
+    import_config #{inspect(@flavor_exs)}
+    """)
+
+    nerves_ssh = Config.Reader.read!(Path.join(target, "target.exs"))[:nerves_ssh]
+
+    assert nerves_ssh[:authorized_keys] == ["ssh-ed25519 AAAA operator"]
+    assert is_function(nerves_ssh[:daemon_option_overrides][:connectfun], 3)
+  end
+
+  describe "target.exs authorized_keys" do
+    setup do
+      prev = System.get_env("NERVES_AUTHORIZED_KEYS")
+
+      on_exit(fn ->
+        if prev,
+          do: System.put_env("NERVES_AUTHORIZED_KEYS", prev),
+          else: System.delete_env("NERVES_AUTHORIZED_KEYS")
+      end)
+
+      # Only the block itself: the whole file needs a board's environment.
+      dir = Path.join(System.tmp_dir!(), "authorized_keys_#{System.unique_integer([:positive])}")
+      File.mkdir_p!(dir)
+      on_exit(fn -> File.rm_rf(dir) end)
+
+      lines = @target_exs |> File.read!() |> String.split("\n")
+      {_, from} = Enum.split_while(lines, &(&1 != "authorized_keys ="))
+      {block, [last | _]} = Enum.split_while(from, &(&1 != "  authorized_keys: authorized_keys"))
+
+      exs = Path.join(dir, "keys.exs")
+      File.write!(exs, Enum.join(["import Config" | block] ++ [last], "\n"))
+      {:ok, exs: exs, dir: dir}
+    end
+
+    test "an empty NERVES_AUTHORIZED_KEYS bakes no keys and does not raise", %{exs: exs} do
+      System.put_env("NERVES_AUTHORIZED_KEYS", "")
+      assert Config.Reader.read!(exs)[:nerves_ssh][:authorized_keys] == []
+
+      System.put_env("NERVES_AUTHORIZED_KEYS", "ssh-ed25519 AAAA a\nssh-ed25519 BBBB b\n")
+
+      assert Config.Reader.read!(exs)[:nerves_ssh][:authorized_keys] ==
+               ["ssh-ed25519 AAAA a", "ssh-ed25519 BBBB b"]
+    end
+
+    # `System.user_home!/0` is fixed at VM start, so the empty home needs a
+    # fresh VM.
+    test "an unset NERVES_AUTHORIZED_KEYS with no ~/.ssh keys fails the build",
+         %{exs: exs, dir: dir} do
+      home = Path.join(dir, "home")
+      File.mkdir_p!(home)
+
+      {out, status} =
+        System.cmd("elixir", ["-e", "Config.Reader.read!(#{inspect(exs)})"],
+          env: [{"HOME", home}, {"NERVES_AUTHORIZED_KEYS", nil}],
+          stderr_to_stdout: true
+        )
+
+      assert status != 0
+      assert out =~ "No SSH public keys found in ~/.ssh"
+    end
+  end
+
   test "an unknown VAGUS_FLAVOR fails the build instead of falling back" do
     System.put_env("VAGUS_FLAVOR", "bogus")
     assert_raise Mix.Error, ~r/Unknown VAGUS_FLAVOR "bogus"/, &read_vagus/0

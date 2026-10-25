@@ -10,10 +10,10 @@ defmodule Vagus.SSHAccess do
 
       ssh -i vagus_key root@<hostname>.local
 
-  This is **additive** to any operator keys baked in at build time via
-  `NERVES_AUTHORIZED_KEYS` (see `config/target.exs`). `NervesSSH.add_authorized_key/1`
-  de-duplicates and appends; this feature must never remove or replace
-  existing authorized keys.
+  Released images bake no other key, so on them this is the way in; baked
+  keys exist only in local developer builds (see `config/target.exs`). It is
+  **additive** to them: `NervesSSH.add_authorized_key/1` de-duplicates and
+  appends; this feature must never remove or replace existing authorized keys.
 
   The keypair is generated once and reused across reboots and firmware
   updates — it lives in a DETS file whose path is config-driven
@@ -222,8 +222,8 @@ defmodule Vagus.SSHAccess do
   # implementation this module was ported from, which serves it anyway
   # ("usable this boot, regenerated next boot"): an honestly-unavailable key
   # beats a silently-ephemeral credential that an operator may wire into their
-  # tooling and come to depend on, and `NERVES_AUTHORIZED_KEYS` remains the
-  # rescue path into the device.
+  # tooling and come to depend on. Released images bake no other key, so on
+  # them an unavailable key means no SSH until the store recovers.
   defp load_or_generate(state) do
     case :dets.lookup(state.table, @key) do
       [{@key, %{public_key: pub, private_key: priv, fingerprint: fp}}]

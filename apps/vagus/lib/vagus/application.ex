@@ -236,7 +236,16 @@ defmodule Vagus.Application do
   # isn't target-only work) since the DETS-backed keypair is useful in dev
   # too. Tests start their own instance with a private name/table/dets_path.
   defp ssh_access_children do
-    if Application.get_env(:vagus, :ssh_access_enabled, true), do: [Vagus.SSHAccess], else: []
+    if Application.get_env(:vagus, :ssh_access_enabled, true),
+      do: [Vagus.SSHAccess | ssh_handout_children()],
+      else: []
+  end
+
+  # Agent flavor only (config/flavor.exs): it hands out the key above.
+  defp ssh_handout_children do
+    if Keyword.get(Application.get_env(:vagus, :ssh_handout, []), :enabled, false),
+      do: [Vagus.SSHAccess.Handout],
+      else: []
   end
 
   # List all child processes to be supervised
