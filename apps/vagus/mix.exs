@@ -151,7 +151,7 @@ defmodule Vagus.MixProject do
       # BlueZ stack bring-up (dbus-daemon + bluetoothd under MuonTrap).
       # Vagus starts only the daemon slice of its tree — HA Core is the BLE
       # consumer via the /run/dbus bind (see Vagus.Bluetooth).
-      {:bluez, "~> 0.3.0"},
+      {:bluez, "~> 0.4.0"},
 
       # Improv-over-BLE Wi-Fi provisioning (bluetooth phase 2): on an
       # offline boot the Pi advertises the Improv service so the HA
