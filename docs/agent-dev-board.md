@@ -342,6 +342,16 @@ Remote Control connects on the loop's next start.
 The login expires like any other: the CLI warns 3 days ahead, and the same
 procedure renews it.
 
+## Remote Control
+
+`claude-loop` runs plain `claude remote-control` in `/work`. If the previous
+server stopped within about four hours (Claude Code's own record), that brings
+back every session it was serving; otherwise it starts a fresh multi-session
+server. Several sessions can be open on one board at once (default capacity
+32). They share `/work`, but mostly drive worker containers and the memory MCP.
+`RC_ARGS` adds flags to the command. The loop does not use `--continue`, which
+restores only one session and leaves a server that cannot open more.
+
 ## Headless workers
 
 1. `worker-config <task>` (inside the orchestrator) creates
