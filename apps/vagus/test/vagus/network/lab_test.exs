@@ -145,7 +145,9 @@ defmodule Vagus.Network.LabTest do
     _ = receive_all()
 
     task = Task.async(fn -> Lab.down("eth1", s) end)
-    assert_receive {:deconfiguring, pid}
+    # Lab.down rewrites the nft ruleset before it deconfigures, so on a loaded
+    # runner this can take well past assert_receive's default 100ms.
+    assert_receive {:deconfiguring, pid}, 5_000
     assert %{"eth1" => %{state: :broken}} = :persistent_term.get(ctx.state_key)
 
     send(pid, :go)
