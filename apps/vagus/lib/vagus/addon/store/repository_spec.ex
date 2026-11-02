@@ -132,6 +132,8 @@ defmodule Vagus.Addon.Store.RepositorySpec do
   are different repositories to the store and must land on different slugs.
   """
   @spec slug(String.t()) :: String.t()
+  # sha1 only derives upstream's display slug, not a security hash.
+  # sobelow_skip ["Crypto.WeakHash"]
   def slug(full_repository_string) do
     full_repository_string
     |> String.downcase()

@@ -109,6 +109,8 @@ defmodule Vagus.Addon.Backend.Native do
   `/logs/follow` (the router calls `Broker.Logs.subscribe/1` on it).
   """
   @spec logs_server(Vagus.Addon.Backend.id()) :: pid() | nil
+  # Same slug-derived id as broker_name/1; callers gate on running?/1 first.
+  # sobelow_skip ["DOS.ModuleConcat"]
   def logs_server(id) do
     # "Logs" string segment matches how `Vagus.Mqtt.Broker` names the child.
     Process.whereis(Module.concat(broker_name(id), "Logs"))
@@ -116,10 +118,14 @@ defmodule Vagus.Addon.Backend.Native do
 
   @doc "The registered name of the broker subtree for a native add-on `id`."
   @spec broker_name(Vagus.Addon.Backend.id()) :: atom()
+  # ids are app ids; only Core's own token can name an arbitrary slug here.
+  # sobelow_skip ["DOS.ModuleConcat"]
   def broker_name(id), do: Module.concat(Broker, id)
 
   @doc "The registered name of the subtree a native add-on `id` runs."
   @spec subtree_name(Vagus.Addon.Backend.id()) :: atom()
+  # Fixed id; the other clause delegates to broker_name/1.
+  # sobelow_skip ["DOS.ModuleConcat"]
   def subtree_name("addon_vagus_memory" = id), do: Module.concat(Vagus.Memory, id)
   def subtree_name(id), do: broker_name(id)
 

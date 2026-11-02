@@ -586,7 +586,7 @@ defmodule Vagus.Patches do
   # they replace becomes old, left to release/2. Diagnostics are captured so
   # a failure carries its reason instead of printing to stderr.
   # Compiling a patch's sources is the point; its name passed valid_name/1.
-  # sobelow_skip ["RCE.CodeModule"]
+  # sobelow_skip ["RCE.CodeModule", "RCE.Compile"]
   defp compile_file(file) do
     {compiled, diagnostics} =
       Code.with_diagnostics(fn ->
@@ -782,9 +782,13 @@ defmodule Vagus.Patches do
 
   # Nesting prefixes the parent, as the compiler does, unless the name is
   # spelled from `Elixir.`.
+  # Names come from patch source that compile_file/1 runs anyway, not request input.
+  # sobelow_skip ["DOS.ModuleConcat"]
   defp module_name({:__aliases__, _meta, [:"Elixir" | _] = parts}, _parent),
     do: if(Enum.all?(parts, &is_atom/1), do: Module.concat(parts))
 
+  # Names come from patch source that compile_file/1 runs anyway, not request input.
+  # sobelow_skip ["DOS.ModuleConcat"]
   defp module_name({:__aliases__, _meta, parts}, parent) do
     if Enum.all?(parts, &is_atom/1), do: Module.concat(List.wrap(parent) ++ parts)
   end

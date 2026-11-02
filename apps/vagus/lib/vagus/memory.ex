@@ -111,6 +111,8 @@ defmodule Vagus.Memory do
   # gateway serves the workers; loopback the host-networked orchestrator
   # and Vagus's own tools. The gateway exists only once agentnet's bridge
   # does, so it is bound with the API listener's `:eaddrnotavail` retry.
+  # Names come from a fixed keyword list, not request input.
+  # sobelow_skip ["DOS.ModuleConcat"]
   defp listeners(store, tasks) do
     plug = {MCP, store: store, tasks: tasks}
 
