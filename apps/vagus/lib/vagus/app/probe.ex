@@ -92,6 +92,8 @@ defmodule Vagus.App.Probe do
     end
   end
 
+  # In-network health probe of an app's self-signed endpoint; only the status is read.
+  # sobelow_skip ["Config.TLSVerify"]
   defp connect_opts(:https, timeout),
     do: [mode: :passive, timeout: timeout, transport_opts: [verify: :verify_none]]
 

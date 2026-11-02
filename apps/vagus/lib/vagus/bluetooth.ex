@@ -99,6 +99,8 @@ defmodule Vagus.Bluetooth do
   # A string segment: aliasing `Stack` here would nest the full module name
   # under `name` and no longer match the Reaper's default target.
   @spec stack_name(module()) :: module()
+  # name is the start-up :name option, not request input.
+  # sobelow_skip ["DOS.ModuleConcat"]
   def stack_name(name), do: Module.concat(name, "Stack")
 
   @impl Supervisor

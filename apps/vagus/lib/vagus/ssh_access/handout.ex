@@ -79,6 +79,8 @@ defmodule Vagus.SSHAccess.Handout do
     end
   end
 
+  # name is the start-up :name option, not request input.
+  # sobelow_skip ["DOS.ModuleConcat"]
   defp stop_server(name) do
     GenServer.call(Module.concat(name, Server), :drop)
   catch
@@ -95,6 +97,8 @@ defmodule Vagus.SSHAccess.Handout do
   defp closed_key(name), do: {__MODULE__, name, :closed}
 
   @impl true
+  # Child names derive from the start-up :name option, not request input.
+  # sobelow_skip ["DOS.ModuleConcat"]
   def init(opts) do
     name = Keyword.get(opts, :name, __MODULE__)
     port = Keyword.get(opts, :port, @default_port)

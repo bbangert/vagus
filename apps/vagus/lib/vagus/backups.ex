@@ -363,6 +363,8 @@ defmodule Vagus.Backups do
 
   # Mirrors the real Supervisor's slug derivation (§A4/plan): first 8 hex
   # chars of sha1(date <> name).
+  # sha1 only derives upstream's display slug, not a security hash.
+  # sobelow_skip ["Crypto.WeakHash"]
   defp derive_slug(date, name) do
     :crypto.hash(:sha, date <> name) |> Base.encode16(case: :lower) |> binary_part(0, 8)
   end

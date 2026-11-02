@@ -70,6 +70,8 @@ defmodule Vagus.Mqtt.Broker do
   end
 
   @impl Supervisor
+  # Child names derive from the start-up :name option, not request input.
+  # sobelow_skip ["DOS.ModuleConcat"]
   def init(opts) do
     name = Keyword.get(opts, :name, __MODULE__)
     subs_name = Keyword.get(opts, :subscriptions_name, Module.concat(name, Subscriptions))
@@ -167,6 +169,8 @@ defmodule Vagus.Mqtt.Broker do
   # so it publishes with the listener up.
   defp provider_child(_name, _port, nil), do: []
 
+  # name is the start-up :name option, not request input.
+  # sobelow_skip ["DOS.ModuleConcat"]
   defp provider_child(name, port, provider) do
     [
       {Provider,
