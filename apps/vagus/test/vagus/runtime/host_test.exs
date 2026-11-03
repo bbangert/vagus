@@ -652,22 +652,25 @@ defmodule Vagus.Runtime.HostTest do
              "needs /proc and bash"
     test "sees a live pull through the real /proc", %{spool: spool} = ctx do
       stop_supervised!(ctx.name)
-      start_host(ctx, spool_quiet_ms: 60_000, proc_dir: "/proc", podman_bin: "podman")
+      # Unique name: a real `podman pull` elsewhere on the machine would
+      # otherwise be seen in the real /proc and keep the spool.
+      bin = "vagus-test-pull-#{System.unique_integer([:positive])}"
+      start_host(ctx, spool_quiet_ms: 60_000, proc_dir: "/proc", podman_bin: bin)
       spool |> tree("leaked", ["layer"]) |> age()
 
-      # argv ["podman", "-f", "pull"]: the first non-flag is "pull".
+      # argv [bin, "-f", "pull"]: the first non-flag is "pull".
       File.write!(Path.join(ctx.root, "pull"), "")
 
       port =
         Port.open({:spawn_executable, System.find_executable("bash")}, [
           :binary,
-          args: ["-c", "cd '#{ctx.root}' && exec -a podman tail -f pull"]
+          args: ["-c", "cd '#{ctx.root}' && exec -a #{bin} tail -f pull"]
         ])
 
       {:os_pid, os_pid} = Port.info(port, :os_pid)
       pid = Integer.to_string(os_pid)
       on_exit(fn -> System.cmd("kill", ["-9", pid], stderr_to_stdout: true) end)
-      await(fn -> File.read!("/proc/#{pid}/cmdline") == "podman\0-f\0pull\0" end)
+      await(fn -> File.read!("/proc/#{pid}/cmdline") == "#{bin}\0-f\0pull\0" end)
 
       Host.clear_spool(ctx.name)
       assert File.ls!(spool) == ["leaked"]
