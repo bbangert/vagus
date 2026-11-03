@@ -116,7 +116,7 @@ defmodule Vagus.Runtime.Host do
 
   @doc """
   Options (all defaulted for the device): `:name`, `:podman_bin`,
-  `:graphroot`, `:run_dir` (drop-in, fast spool and the spool marker),
+  `:graphroot`, `:run_dir` (drop-in and the spool marker),
   `:meminfo`, `:profile_override`, `:socket_dir`, `:resolv_conf`, `:dev_root`,
   `:name_servers` (0-arity fun), `:run` (`fn bin, args -> {out, status}`,
   for `mount`), `:probe` (`fn opts -> :ok | {:error, reason}`),
@@ -203,7 +203,7 @@ defmodule Vagus.Runtime.Host do
   end
 
   @doc """
-  Removes the pull spools' stale entries: those with nothing written
+  Removes the pull spool's stale entries: those with nothing written
   anywhere inside for `:spool_quiet_ms` (default 2 min). Permits alone
   cannot prove no pull is writing: a restarted Host forgets its holders,
   and a holder's podman can outlive the holder by its SIGKILL delay. A
@@ -212,9 +212,8 @@ defmodule Vagus.Runtime.Host do
   """
   @spec clear_spool(atom() | nil) :: :ok
   def clear_spool(host) do
-    with %{spools: spools, pull_permits: 1, spool_quiet_ms: quiet_ms} <- shared(host) do
-      cutoff = System.os_time(:second) - div(quiet_ms, 1000)
-      Enum.each(spools, &remove_stale(&1, cutoff))
+    with %{spool: spool, pull_permits: 1, spool_quiet_ms: quiet_ms} <- shared(host) do
+      remove_stale(spool, System.os_time(:second) - div(quiet_ms, 1000))
     end
 
     :ok
@@ -604,7 +603,7 @@ defmodule Vagus.Runtime.Host do
       env: state.env,
       stats: state.stats,
       profile: state.profile,
-      spools: [spool_dir(state.opts), Path.join(run_dir(state.opts), "spool")],
+      spool: spool_dir(state.opts),
       pull_permits: state.permits[:pull],
       spool_quiet_ms: Keyword.get(state.opts, :spool_quiet_ms, 120_000),
       log_dir: log_dir(state.opts),
@@ -957,6 +956,10 @@ defmodule Vagus.Runtime.Host do
     end
   end
 
+  # Both profiles spool on disk: a tmpfs spool is bounded by `/run`, whose
+  # size does not scale with RAM, and a Core pull stages hundreds of MB of
+  # compressed blobs there until the image commits. The override merges
+  # per key, so fast inherits the baked `image_parallel_copies = 1`.
   @spec containers_conf(profile(), keyword()) :: String.t()
   def containers_conf(:frugal, opts) do
     """
@@ -973,7 +976,7 @@ defmodule Vagus.Runtime.Host do
     [engine]
     events_logger = "file"
     events_logfile_max_size = #{@events_max_bytes}
-    image_copy_tmp_dir = "#{Path.join(run_dir(opts), "spool")}"
+    image_copy_tmp_dir = "#{spool_dir(opts)}"
     """
   end
 
@@ -982,13 +985,11 @@ defmodule Vagus.Runtime.Host do
     with :ok <- File.mkdir_p(Path.dirname(path)), do: File.write(path, content)
   end
 
-  # Both spools are made: the fast one may hold a pull's layers, and
-  # podman stats `<graphroot>/tmp` even when it spools elsewhere.
+  # podman does not create the spool dir itself.
   # sobelow_skip ["Traversal.FileModule"]
   defp clear_spool_once(opts) do
     spool = spool_dir(opts)
     marker = Path.join(run_dir(opts), "spool-cleared")
-    _ = File.mkdir_p(Path.join(run_dir(opts), "spool"))
 
     with :ok <- File.mkdir_p(spool),
          false <- File.exists?(marker) do

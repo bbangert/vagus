@@ -478,7 +478,7 @@ defmodule Vagus.Runtime.HostTest do
                %{dir: Path.join(ctx.root, "run/vagus/logs"), max_bytes: 2_097_152}
     end
 
-    test "fast: drop-in spooling on tmpfs, no Go limits, four ops permits", ctx do
+    test "fast: drop-in spooling on disk, no Go limits, four ops permits", ctx do
       start_host(ctx, meminfo: meminfo(ctx.root, 8 * @gib_kb))
       conf = Path.join(ctx.root, "run/vagus/podman/containers.conf")
 
@@ -486,13 +486,26 @@ defmodule Vagus.Runtime.HostTest do
              [engine]
              events_logger = "file"
              events_logfile_max_size = 4194304
-             image_copy_tmp_dir = "#{Path.join(ctx.root, "run/vagus/podman/spool")}"
+             image_copy_tmp_dir = "#{Path.join(ctx.root, "storage/tmp")}"
              """
 
-      assert File.dir?(Path.join(ctx.root, "run/vagus/podman/spool"))
+      assert File.dir?(Path.join(ctx.root, "storage/tmp"))
       assert Host.env(ctx.name) == [{"CONTAINERS_CONF_OVERRIDE", conf}]
       assert permits(ctx.name, :ops) == 4
       assert Host.log_config(ctx.name).max_bytes == 8_388_608
+    end
+
+    # /run is a fixed-size tmpfs; a Core pull's blobs outgrow it.
+    test "no profile spools under the run dir", ctx do
+      opts = host_opts(ctx)
+      run_dir = Keyword.fetch!(opts, :run_dir)
+
+      for profile <- [:frugal, :fast] do
+        [_, dir] =
+          Regex.run(~r/^image_copy_tmp_dir = "(.*)"$/m, Host.containers_conf(profile, opts))
+
+        refute String.starts_with?(dir, run_dir), "#{profile} spools in #{dir}"
+      end
     end
 
     test "the env reaches every podman the runner spawns", ctx do
