@@ -17,7 +17,7 @@ mise install
 # mise shim fails with "No version is set for shim: mix" and the image build
 # dies at target-post-image.
 mise settings set experimental true
-mise use -g erlang@29.0.3 elixir@1.20.2-otp-29
+mise use -g erlang@29.1.2 elixir@1.20.2-otp-29
 
 # Export tool paths for the rest of this script (mise activate relies on
 # prompt hooks which don't fire in non-interactive scripts)

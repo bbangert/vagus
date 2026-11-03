@@ -33,7 +33,7 @@ permissions:
 
 env:
   # Must track .mise.toml (same pairing as ci.yml).
-  OTP_VERSION: "29.0.3"
+  OTP_VERSION: "29.1.2"
   ELIXIR_VERSION: "1.20.2-otp-29"
   MIX_ENV: prod
   # Pinned because this archive decides whether prebuilt artifacts are
