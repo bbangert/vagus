@@ -614,17 +614,21 @@ defmodule Vagus.Runtime.HostTest do
         flunk("spool never became #{inspect(expected)}: #{inspect(File.ls!(spool))}")
     end
 
-    defp await_sweeps(host, n) do
+    # Runs `check` once each of `n` sweeps has been handled: the trace shows
+    # the message arriving, and the call behind it waits out the handler.
+    defp after_sweeps(host, n, check) do
       pid = Process.whereis(host)
       :erlang.trace(pid, true, [:receive])
 
       try do
         for _ <- 1..n do
           receive do
-            {:trace, ^pid, :receive, :sweep_spool} -> :ok
+            {:trace, ^pid, :receive, :sweep_spool} -> :sys.get_state(host)
           after
             5_000 -> flunk("no spool sweep")
           end
+
+          check.()
         end
       after
         :erlang.trace(pid, false, [:receive])
@@ -639,23 +643,41 @@ defmodule Vagus.Runtime.HostTest do
     end
 
     test "removes an entry once it has been quiet for the period", %{spool: spool} = ctx do
-      File.write!(Path.join(spool, "killed-pull"), "x")
+      path = Path.join(spool, "killed-pull")
+      File.write!(path, "blob")
       Host.clear_spool(ctx.name)
-      assert File.ls!(spool) == ["killed-pull"]
+      assert File.read!(path) == "blob"
 
       await_spool(spool, [])
     end
 
+    # touch recreates a deleted file empty, so the contents prove it was kept.
     test "keeps an entry still written to, and removes it once quiet", %{spool: spool} = ctx do
       path = Path.join(spool, "pulling")
-      File.write!(path, "x")
+      File.write!(path, "blob")
       writer = Task.async(fn -> keep_touching(path) end)
 
       Host.clear_spool(ctx.name)
-      await_sweeps(ctx.name, 2)
-      assert File.ls!(spool) == ["pulling"]
+      after_sweeps(ctx.name, 2, fn -> assert File.read!(path) == "blob" end)
 
       Task.shutdown(writer, :brutal_kill)
+      await_spool(spool, [])
+    end
+  end
+
+  describe "a Host restarted within the boot" do
+    test "sweeps a killed pull's fresh entry once quiet, with no pull failing", ctx do
+      run_dir = Path.join(ctx.root, "run/vagus/podman")
+      File.mkdir_p!(run_dir)
+      File.write!(Path.join(run_dir, "spool-cleared"), "")
+      spool = Path.join(ctx.root, "storage/tmp")
+      path = Path.join(spool, "killed-pull")
+      File.mkdir_p!(spool)
+      File.write!(path, "blob")
+
+      start_host(ctx, spool_quiet_ms: 1_000)
+      assert File.read!(path) == "blob"
+
       await_spool(spool, [])
     end
   end
