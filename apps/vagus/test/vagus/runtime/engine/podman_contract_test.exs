@@ -987,6 +987,23 @@ defmodule Vagus.Runtime.Engine.PodmanContractTest do
       assert File.ls!(spool) == ["live"]
     end
 
+    test "a pull sweeps a stale spool before its podman starts" do
+      root = Path.join(System.tmp_dir!(), "podman-pre-#{System.unique_integer([:positive])}")
+      leaked = Path.join(root, "storage/tmp/killed-pull")
+
+      # podman fails if the leftovers are still there when it starts.
+      fake =
+        FakePodman.start([{"pull *", [{0, "5b0e\n", run: ~s([ -e "#{leaked}" ] && exit 9)}]}])
+
+      host = FakePodman.start_host(fake.bin, root: root)
+      File.mkdir_p!(leaked)
+      File.touch!(leaked, System.os_time(:second) - 3_600)
+      opts = [engine: Engine.Podman, host: host, podman_bin: fake.bin]
+
+      assert Engine.pull("ghcr.io/vagus/app:1", opts) == :ok
+      refute File.exists?(leaked)
+    end
+
     test "remove deletes the container's log, so a recreate starts it empty" do
       root = Path.join(System.tmp_dir!(), "podman-logs-#{System.unique_integer([:positive])}")
       fake = FakePodman.start([{"rm *", [{0, ""}]}])

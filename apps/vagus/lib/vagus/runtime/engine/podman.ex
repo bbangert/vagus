@@ -148,7 +148,8 @@ defmodule Vagus.Runtime.Engine.Podman do
   # Asked under the pull permit, so no other pull is filling the disk
   # meanwhile. An unknown answer pulls: it must not keep Core away for good.
   # A spool an interrupted pull left is cleared first: once stale it is free
-  # space, and a refused pull never reaches the post-failure clear.
+  # space, and neither a refused pull nor a killed one reaches the
+  # post-failure clear.
   defp room_for(image, host) do
     Host.clear_spool(host)
 
@@ -982,8 +983,9 @@ defmodule Vagus.Runtime.Engine.Podman do
 
   defp now_ms, do: System.monotonic_time(:millisecond)
 
-  # A failed or killed pull leaves its layers in the spool. It runs under
-  # the only pull permit, so no other pull's spool can be there.
+  # A failed or timed-out pull leaves its layers in the spool. Its podman
+  # has exited by now, so any pull `Host.clear_spool/1` still sees is not
+  # this one.
   defp clear_spool_on_failure({:ok, _} = result, _host), do: result
 
   defp clear_spool_on_failure(result, host) do

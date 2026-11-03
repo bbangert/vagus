@@ -12,8 +12,8 @@ defmodule Vagus.Runtime.Host do
   containers, so those log and go on.
 
   The pull spool is emptied once per VM boot: a marker in `/run` keeps a
-  Vagus restart from deleting the spool of a pull still running, and such
-  a restart sweeps only the stale entries, as `clear_spool/1` does.
+  Vagus restart from deleting the spool of a pull still running. Later,
+  only a pull sweeps it, inside its permit (`clear_spool/1`).
 
   On a board coming from balena-engine, `Vagus.Runtime.Migration.prepare/1`
   runs here too, so Core's config is moved, when it is due, before Core can
@@ -122,7 +122,7 @@ defmodule Vagus.Runtime.Host do
   `:name_servers` (0-arity fun), `:run` (`fn bin, args -> {out, status}`,
   for `mount`), `:probe` (`fn opts -> :ok | {:error, reason}`),
   `:shutting_down?` (0-arity fun), `:prep_retry_ms`, `:permits`,
-  `:spool_quiet_ms`, `:log_dir`, `:mountinfo`, `:migration` (options for
+  `:spool_quiet_ms`, `:proc_dir`, `:log_dir`, `:mountinfo`, `:migration` (options for
   `Vagus.Runtime.Migration`), `:migration_check_ms`, `:task_supervisor`,
   `:on_migration_checked` (1-arity, each check's result; tests).
   """
@@ -210,36 +210,59 @@ defmodule Vagus.Runtime.Host do
   and a holder's podman can outlive the holder by its SIGKILL delay. A
   live pull writes continuously, so its entry is never stale; one an
   interrupted pull leaked is. Only while a single pull permit exists.
-  While an entry is kept, the Host sweeps again once it could be stale,
-  so the fresh leftovers of a killed pull do not wait for the next failure.
+
+  The pull path calls it inside that permit, before its podman starts and
+  after a failed one exited, so any `podman pull` alive then is one the
+  Host does not track (a holder of a crashed Host's permit): while one
+  runs, nothing is swept. A killed pull's leftovers go at the next pull.
   """
   @spec clear_spool(atom() | nil) :: :ok
   def clear_spool(host) do
-    with %{spool: spool, pull_permits: 1, spool_quiet_ms: quiet_ms} <- shared(host),
-         kept when kept > 0 <- remove_stale(spool, quiet_ms) do
-      GenServer.cast(host || __MODULE__, :sweep_spool_later)
+    with %{spool: spool, pull_permits: 1, spool_quiet_ms: quiet_ms, proc_dir: proc} <-
+           shared(host) do
+      if podman_pulling?(proc),
+        do: Logger.debug("Vagus.Runtime.Host: a podman pull runs; spool kept"),
+        else: remove_stale(spool, System.os_time(:second) - div(quiet_ms, 1000))
     end
 
     :ok
   end
 
-  # The count of entries kept.
   # sobelow_skip ["Traversal.FileModule"]
-  defp remove_stale(dir, quiet_ms) do
-    cutoff = System.os_time(:second) - div(quiet_ms, 1000)
-
+  defp remove_stale(dir, cutoff) do
     case File.ls(dir) do
       {:ok, entries} ->
-        {stale, kept} =
-          entries
-          |> Enum.map(&Path.join(dir, &1))
-          |> Enum.split_with(&(newest_mtime(&1) < cutoff))
-
-        Enum.each(stale, &File.rm_rf/1)
-        length(kept)
+        for entry <- entries,
+            path = Path.join(dir, entry),
+            newest_mtime(path) < cutoff,
+            do: File.rm_rf(path)
 
       {:error, _} ->
-        0
+        :ok
+    end
+  end
+
+  # An unreadable proc dir proves nothing, so it counts as a pull.
+  defp podman_pulling?(proc) do
+    case File.ls(proc) do
+      {:ok, entries} -> Enum.any?(entries, &podman_pull?(Path.join([proc, &1, "cmdline"])))
+      {:error, _} -> true
+    end
+  end
+
+  # The path is a `File.ls/1` entry of the fixed proc dir. A process gone
+  # meanwhile, or not a pid, has no cmdline to read.
+  # sobelow_skip ["Traversal.FileModule"]
+  defp podman_pull?(cmdline) do
+    case File.read(cmdline) do
+      {:ok, argv} ->
+        case String.split(argv, <<0>>, trim: true) do
+          [bin | args] -> Path.basename(bin) == "podman" and "pull" in args
+          [] -> false
+        end
+
+      {:error, _} ->
+        false
     end
   end
 
@@ -415,7 +438,6 @@ defmodule Vagus.Runtime.Host do
       migration: nil,
       migration_task: nil,
       migration_timer: nil,
-      spool_timer: nil,
       check_failures: 0,
       dismissals: 0,
       notice: nil,
@@ -444,7 +466,7 @@ defmodule Vagus.Runtime.Host do
     state = state |> apply_profile() |> publish(:preparing)
     mount_logs(state.opts, @log_tmpfs_bytes[state.profile])
     state = prepare_out_dir(state)
-    state = clear_spool_once(state)
+    clear_spool_once(state.opts)
     state = state |> prepare_migration() |> publish(:preparing)
     {:noreply, start_probe(state)}
   end
@@ -496,13 +518,6 @@ defmodule Vagus.Runtime.Host do
 
   @impl true
   def handle_cast({:release, ref}, state), do: {:noreply, release(state, ref)}
-
-  # One timer at most: a sweep already armed re-arms itself while anything
-  # is kept, which covers the entries this request is about.
-  def handle_cast(:sweep_spool_later, %{spool_timer: nil} = state),
-    do: {:noreply, arm_spool_sweep(state)}
-
-  def handle_cast(:sweep_spool_later, state), do: {:noreply, state}
 
   @impl true
   def handle_info({ref, result}, %{probe: ref} = state) when is_reference(ref) do
@@ -559,23 +574,9 @@ defmodule Vagus.Runtime.Host do
 
   def handle_info(:probe, state), do: {:noreply, start_probe(state)}
 
-  def handle_info(:sweep_spool, state) do
-    state = %{state | spool_timer: nil}
-    %{spool: spool, spool_quiet_ms: quiet_ms} = state.published
-
-    if remove_stale(spool, quiet_ms) > 0,
-      do: {:noreply, arm_spool_sweep(state)},
-      else: {:noreply, state}
-  end
-
   def handle_info(msg, state) do
     Logger.debug("Vagus.Runtime.Host: ignored #{inspect(msg)}")
     {:noreply, state}
-  end
-
-  defp arm_spool_sweep(state) do
-    timer = Process.send_after(self(), :sweep_spool, state.published.spool_quiet_ms)
-    %{state | spool_timer: timer}
   end
 
   defp grant(state, class, ref, pid) do
@@ -638,6 +639,7 @@ defmodule Vagus.Runtime.Host do
       spool: spool_dir(state.opts),
       pull_permits: state.permits[:pull],
       spool_quiet_ms: Keyword.get(state.opts, :spool_quiet_ms, 120_000),
+      proc_dir: Keyword.get(state.opts, :proc_dir, "/proc"),
       log_dir: log_dir(state.opts),
       out_dir: state.out_dir,
       log_max_bytes: state.profile && @log_max_bytes[state.profile],
@@ -1017,28 +1019,19 @@ defmodule Vagus.Runtime.Host do
     with :ok <- File.mkdir_p(Path.dirname(path)), do: File.write(path, content)
   end
 
-  # podman does not create the spool dir itself. A restart within the boot
-  # may follow a killed pull whose sweep timer died with the old Host, so it
-  # sweeps; the quiet period spares a pull the old Host's podman still runs.
+  # podman does not create the spool dir itself.
   # sobelow_skip ["Traversal.FileModule"]
-  defp clear_spool_once(state) do
-    spool = spool_dir(state.opts)
-    marker = Path.join(run_dir(state.opts), "spool-cleared")
+  defp clear_spool_once(opts) do
+    spool = spool_dir(opts)
+    marker = Path.join(run_dir(opts), "spool-cleared")
 
     with :ok <- File.mkdir_p(spool),
          false <- File.exists?(marker) do
       empty_dir(spool)
       File.write(marker, "")
-      state
     else
-      true ->
-        if remove_stale(spool, state.published.spool_quiet_ms) > 0,
-          do: arm_spool_sweep(state),
-          else: state
-
-      {:error, reason} ->
-        Logger.error("Vagus.Runtime.Host: spool #{spool}: #{inspect(reason)}")
-        state
+      true -> :ok
+      {:error, reason} -> Logger.error("Vagus.Runtime.Host: spool #{spool}: #{inspect(reason)}")
     end
   end
 
