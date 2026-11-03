@@ -12,7 +12,8 @@ defmodule Vagus.Runtime.Host do
   containers, so those log and go on.
 
   The pull spool is emptied once per VM boot: a marker in `/run` keeps a
-  Vagus restart from deleting the spool of a pull still running.
+  Vagus restart from deleting the spool of a pull still running, and such
+  a restart sweeps only the stale entries, as `clear_spool/1` does.
 
   On a board coming from balena-engine, `Vagus.Runtime.Migration.prepare/1`
   runs here too, so Core's config is moved, when it is due, before Core can
@@ -443,7 +444,7 @@ defmodule Vagus.Runtime.Host do
     state = state |> apply_profile() |> publish(:preparing)
     mount_logs(state.opts, @log_tmpfs_bytes[state.profile])
     state = prepare_out_dir(state)
-    clear_spool_once(state.opts)
+    state = clear_spool_once(state)
     state = state |> prepare_migration() |> publish(:preparing)
     {:noreply, start_probe(state)}
   end
@@ -1016,19 +1017,28 @@ defmodule Vagus.Runtime.Host do
     with :ok <- File.mkdir_p(Path.dirname(path)), do: File.write(path, content)
   end
 
-  # podman does not create the spool dir itself.
+  # podman does not create the spool dir itself. A restart within the boot
+  # may follow a killed pull whose sweep timer died with the old Host, so it
+  # sweeps; the quiet period spares a pull the old Host's podman still runs.
   # sobelow_skip ["Traversal.FileModule"]
-  defp clear_spool_once(opts) do
-    spool = spool_dir(opts)
-    marker = Path.join(run_dir(opts), "spool-cleared")
+  defp clear_spool_once(state) do
+    spool = spool_dir(state.opts)
+    marker = Path.join(run_dir(state.opts), "spool-cleared")
 
     with :ok <- File.mkdir_p(spool),
          false <- File.exists?(marker) do
       empty_dir(spool)
       File.write(marker, "")
+      state
     else
-      true -> :ok
-      {:error, reason} -> Logger.error("Vagus.Runtime.Host: spool #{spool}: #{inspect(reason)}")
+      true ->
+        if remove_stale(spool, state.published.spool_quiet_ms) > 0,
+          do: arm_spool_sweep(state),
+          else: state
+
+      {:error, reason} ->
+        Logger.error("Vagus.Runtime.Host: spool #{spool}: #{inspect(reason)}")
+        state
     end
   end
 
