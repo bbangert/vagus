@@ -611,7 +611,7 @@ defmodule Vagus.Runtime.HostTest do
     test "sweeps nothing while a podman pull it does not hold runs", %{spool: spool} = ctx do
       spool |> tree("leaked", ["layer"]) |> age()
       process(ctx, "1", ["/sbin/init"])
-      process(ctx, "4242", ["/usr/bin/podman", "--root", "x", "pull", "img"])
+      process(ctx, "4242", ["/usr/bin/podman", "--root=x", "pull", "img"])
 
       Host.clear_spool(ctx.name)
       assert File.ls!(spool) == ["leaked"]
@@ -623,6 +623,70 @@ defmodule Vagus.Runtime.HostTest do
 
       Host.clear_spool(ctx.name)
       assert File.ls!(spool) == []
+    end
+
+    test "a pull word past the subcommand is not a pull", %{spool: spool} = ctx do
+      spool |> tree("leaked", ["layer"]) |> age()
+      process(ctx, "4242", ["podman", "--root=x", "create", "--name", "n", "img", "git", "pull"])
+
+      Host.clear_spool(ctx.name)
+      assert File.ls!(spool) == []
+    end
+
+    test "knows a pull by the configured podman's name", %{spool: spool} = ctx do
+      stop_supervised!(ctx.name)
+      start_host(ctx, spool_quiet_ms: 60_000, podman_bin: "/opt/bin/fakepod")
+      spool |> tree("leaked", ["layer"]) |> age()
+      process(ctx, "4242", ["fakepod", "pull", "img"])
+
+      Host.clear_spool(ctx.name)
+      assert File.ls!(spool) == ["leaked"]
+
+      process(ctx, "4242", ["podman", "pull", "img"])
+      Host.clear_spool(ctx.name)
+      assert File.ls!(spool) == []
+    end
+
+    @tag skip:
+           not (File.dir?("/proc/self") and System.find_executable("bash") != nil) &&
+             "needs /proc and bash"
+    test "sees a live pull through the real /proc", %{spool: spool} = ctx do
+      stop_supervised!(ctx.name)
+      start_host(ctx, spool_quiet_ms: 60_000, proc_dir: "/proc", podman_bin: "podman")
+      spool |> tree("leaked", ["layer"]) |> age()
+
+      # argv ["podman", "-f", "pull"]: the first non-flag is "pull".
+      File.write!(Path.join(ctx.root, "pull"), "")
+
+      port =
+        Port.open({:spawn_executable, System.find_executable("bash")}, [
+          :binary,
+          args: ["-c", "cd '#{ctx.root}' && exec -a podman tail -f pull"]
+        ])
+
+      {:os_pid, os_pid} = Port.info(port, :os_pid)
+      pid = Integer.to_string(os_pid)
+      on_exit(fn -> System.cmd("kill", ["-9", pid], stderr_to_stdout: true) end)
+      await(fn -> File.read!("/proc/#{pid}/cmdline") == "podman\0-f\0pull\0" end)
+
+      Host.clear_spool(ctx.name)
+      assert File.ls!(spool) == ["leaked"]
+
+      {_, 0} = System.cmd("kill", [pid])
+      await(fn -> not File.exists?("/proc/#{pid}") end)
+      Host.clear_spool(ctx.name)
+      assert File.ls!(spool) == []
+    end
+
+    defp await(check) do
+      Enum.find(1..500, fn _ -> safe(check) or (Process.sleep(10) && false) end) ||
+        flunk("condition never held")
+    end
+
+    defp safe(check) do
+      check.()
+    rescue
+      File.Error -> false
     end
   end
 

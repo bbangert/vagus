@@ -218,9 +218,9 @@ defmodule Vagus.Runtime.Host do
   """
   @spec clear_spool(atom() | nil) :: :ok
   def clear_spool(host) do
-    with %{spool: spool, pull_permits: 1, spool_quiet_ms: quiet_ms, proc_dir: proc} <-
+    with %{spool: spool, pull_permits: 1, spool_quiet_ms: quiet_ms, proc_dir: proc, podman: bin} <-
            shared(host) do
-      if podman_pulling?(proc),
+      if podman_pulling?(proc, bin),
         do: Logger.debug("Vagus.Runtime.Host: a podman pull runs; spool kept"),
         else: remove_stale(spool, System.os_time(:second) - div(quiet_ms, 1000))
     end
@@ -243,22 +243,28 @@ defmodule Vagus.Runtime.Host do
   end
 
   # An unreadable proc dir proves nothing, so it counts as a pull.
-  defp podman_pulling?(proc) do
+  defp podman_pulling?(proc, bin) do
     case File.ls(proc) do
-      {:ok, entries} -> Enum.any?(entries, &podman_pull?(Path.join([proc, &1, "cmdline"])))
+      {:ok, entries} -> Enum.any?(entries, &podman_pull?(Path.join([proc, &1, "cmdline"]), bin))
       {:error, _} -> true
     end
   end
 
   # The path is a `File.ls/1` entry of the fixed proc dir. A process gone
   # meanwhile, or not a pid, has no cmdline to read.
+  # Every global flag `Podman.Cmd` passes is `--flag=value` or bare, so the
+  # first non-flag argument is the subcommand.
   # sobelow_skip ["Traversal.FileModule"]
-  defp podman_pull?(cmdline) do
+  defp podman_pull?(cmdline, bin) do
     case File.read(cmdline) do
       {:ok, argv} ->
         case String.split(argv, <<0>>, trim: true) do
-          [bin | args] -> Path.basename(bin) == "podman" and "pull" in args
-          [] -> false
+          [argv0 | args] ->
+            Path.basename(argv0) == bin and
+              Enum.find(args, &(not String.starts_with?(&1, "-"))) == "pull"
+
+          [] ->
+            false
         end
 
       {:error, _} ->
@@ -640,6 +646,7 @@ defmodule Vagus.Runtime.Host do
       pull_permits: state.permits[:pull],
       spool_quiet_ms: Keyword.get(state.opts, :spool_quiet_ms, 120_000),
       proc_dir: Keyword.get(state.opts, :proc_dir, "/proc"),
+      podman: Path.basename(podman_bin(state.opts)),
       log_dir: log_dir(state.opts),
       out_dir: state.out_dir,
       log_max_bytes: state.profile && @log_max_bytes[state.profile],
@@ -1034,6 +1041,10 @@ defmodule Vagus.Runtime.Host do
       {:error, reason} -> Logger.error("Vagus.Runtime.Host: spool #{spool}: #{inspect(reason)}")
     end
   end
+
+  # The binary `Podman.Cmd` launches, by the same fallback.
+  defp podman_bin(opts),
+    do: opts[:podman_bin] || Application.get_env(:vagus, :podman_bin, "podman")
 
   defp spool_dir(opts), do: Path.join(graphroot(opts), "tmp")
 
