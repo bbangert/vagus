@@ -209,27 +209,36 @@ defmodule Vagus.Runtime.Host do
   and a holder's podman can outlive the holder by its SIGKILL delay. A
   live pull writes continuously, so its entry is never stale; one an
   interrupted pull leaked is. Only while a single pull permit exists.
+  While an entry is kept, the Host sweeps again once it could be stale,
+  so the fresh leftovers of a killed pull do not wait for the next failure.
   """
   @spec clear_spool(atom() | nil) :: :ok
   def clear_spool(host) do
-    with %{spool: spool, pull_permits: 1, spool_quiet_ms: quiet_ms} <- shared(host) do
-      remove_stale(spool, System.os_time(:second) - div(quiet_ms, 1000))
+    with %{spool: spool, pull_permits: 1, spool_quiet_ms: quiet_ms} <- shared(host),
+         kept when kept > 0 <- remove_stale(spool, quiet_ms) do
+      GenServer.cast(host || __MODULE__, :sweep_spool_later)
     end
 
     :ok
   end
 
+  # The count of entries kept.
   # sobelow_skip ["Traversal.FileModule"]
-  defp remove_stale(dir, cutoff) do
+  defp remove_stale(dir, quiet_ms) do
+    cutoff = System.os_time(:second) - div(quiet_ms, 1000)
+
     case File.ls(dir) do
       {:ok, entries} ->
-        for entry <- entries,
-            path = Path.join(dir, entry),
-            newest_mtime(path) < cutoff,
-            do: File.rm_rf(path)
+        {stale, kept} =
+          entries
+          |> Enum.map(&Path.join(dir, &1))
+          |> Enum.split_with(&(newest_mtime(&1) < cutoff))
+
+        Enum.each(stale, &File.rm_rf/1)
+        length(kept)
 
       {:error, _} ->
-        :ok
+        0
     end
   end
 
@@ -405,6 +414,7 @@ defmodule Vagus.Runtime.Host do
       migration: nil,
       migration_task: nil,
       migration_timer: nil,
+      spool_timer: nil,
       check_failures: 0,
       dismissals: 0,
       notice: nil,
@@ -486,6 +496,13 @@ defmodule Vagus.Runtime.Host do
   @impl true
   def handle_cast({:release, ref}, state), do: {:noreply, release(state, ref)}
 
+  # One timer at most: a sweep already armed re-arms itself while anything
+  # is kept, which covers the entries this request is about.
+  def handle_cast(:sweep_spool_later, %{spool_timer: nil} = state),
+    do: {:noreply, arm_spool_sweep(state)}
+
+  def handle_cast(:sweep_spool_later, state), do: {:noreply, state}
+
   @impl true
   def handle_info({ref, result}, %{probe: ref} = state) when is_reference(ref) do
     Process.demonitor(ref, [:flush])
@@ -541,9 +558,23 @@ defmodule Vagus.Runtime.Host do
 
   def handle_info(:probe, state), do: {:noreply, start_probe(state)}
 
+  def handle_info(:sweep_spool, state) do
+    state = %{state | spool_timer: nil}
+    %{spool: spool, spool_quiet_ms: quiet_ms} = state.published
+
+    if remove_stale(spool, quiet_ms) > 0,
+      do: {:noreply, arm_spool_sweep(state)},
+      else: {:noreply, state}
+  end
+
   def handle_info(msg, state) do
     Logger.debug("Vagus.Runtime.Host: ignored #{inspect(msg)}")
     {:noreply, state}
+  end
+
+  defp arm_spool_sweep(state) do
+    timer = Process.send_after(self(), :sweep_spool, state.published.spool_quiet_ms)
+    %{state | spool_timer: timer}
   end
 
   defp grant(state, class, ref, pid) do

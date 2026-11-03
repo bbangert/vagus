@@ -601,6 +601,65 @@ defmodule Vagus.Runtime.HostTest do
     end
   end
 
+  describe "the spool sweep after clear_spool/1 kept an entry" do
+    setup ctx do
+      start_host(ctx, spool_quiet_ms: 1_000)
+      %{spool: Path.join(ctx.root, "storage/tmp")}
+    end
+
+    defp await_spool(spool, expected) do
+      Enum.find_value(1..500, fn _ ->
+        File.ls!(spool) == expected || (Process.sleep(10) && nil)
+      end) ||
+        flunk("spool never became #{inspect(expected)}: #{inspect(File.ls!(spool))}")
+    end
+
+    defp await_sweeps(host, n) do
+      pid = Process.whereis(host)
+      :erlang.trace(pid, true, [:receive])
+
+      try do
+        for _ <- 1..n do
+          receive do
+            {:trace, ^pid, :receive, :sweep_spool} -> :ok
+          after
+            5_000 -> flunk("no spool sweep")
+          end
+        end
+      after
+        :erlang.trace(pid, false, [:receive])
+        flush_traces()
+      end
+    end
+
+    defp keep_touching(path) do
+      File.touch!(path)
+      Process.sleep(50)
+      keep_touching(path)
+    end
+
+    test "removes an entry once it has been quiet for the period", %{spool: spool} = ctx do
+      File.write!(Path.join(spool, "killed-pull"), "x")
+      Host.clear_spool(ctx.name)
+      assert File.ls!(spool) == ["killed-pull"]
+
+      await_spool(spool, [])
+    end
+
+    test "keeps an entry still written to, and removes it once quiet", %{spool: spool} = ctx do
+      path = Path.join(spool, "pulling")
+      File.write!(path, "x")
+      writer = Task.async(fn -> keep_touching(path) end)
+
+      Host.clear_spool(ctx.name)
+      await_sweeps(ctx.name, 2)
+      assert File.ls!(spool) == ["pulling"]
+
+      Task.shutdown(writer, :brutal_kill)
+      await_spool(spool, [])
+    end
+  end
+
   # Takes every free permit of `class` with try-style zero waits.
   defp permits(host, class) do
     Stream.repeatedly(fn -> Host.checkout(host, class, 0) end)
