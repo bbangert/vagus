@@ -12,7 +12,8 @@ defmodule Vagus.Runtime.Host do
   containers, so those log and go on.
 
   The pull spool is emptied once per VM boot: a marker in `/run` keeps a
-  Vagus restart from deleting the spool of a pull still running.
+  Vagus restart from deleting the spool of a pull still running. Later,
+  only a pull sweeps it, inside its permit (`clear_spool/1`).
 
   On a board coming from balena-engine, `Vagus.Runtime.Migration.prepare/1`
   runs here too, so Core's config is moved, when it is due, before Core can
@@ -116,12 +117,12 @@ defmodule Vagus.Runtime.Host do
 
   @doc """
   Options (all defaulted for the device): `:name`, `:podman_bin`,
-  `:graphroot`, `:run_dir` (drop-in, fast spool and the spool marker),
+  `:graphroot`, `:run_dir` (drop-in and the spool marker),
   `:meminfo`, `:profile_override`, `:socket_dir`, `:resolv_conf`, `:dev_root`,
   `:name_servers` (0-arity fun), `:run` (`fn bin, args -> {out, status}`,
   for `mount`), `:probe` (`fn opts -> :ok | {:error, reason}`),
   `:shutting_down?` (0-arity fun), `:prep_retry_ms`, `:permits`,
-  `:spool_quiet_ms`, `:log_dir`, `:mountinfo`, `:migration` (options for
+  `:spool_quiet_ms`, `:proc_dir`, `:log_dir`, `:mountinfo`, `:migration` (options for
   `Vagus.Runtime.Migration`), `:migration_check_ms`, `:task_supervisor`,
   `:on_migration_checked` (1-arity, each check's result; tests).
   """
@@ -203,18 +204,25 @@ defmodule Vagus.Runtime.Host do
   end
 
   @doc """
-  Removes the pull spools' stale entries: those with nothing written
+  Removes the pull spool's stale entries: those with nothing written
   anywhere inside for `:spool_quiet_ms` (default 2 min). Permits alone
   cannot prove no pull is writing: a restarted Host forgets its holders,
   and a holder's podman can outlive the holder by its SIGKILL delay. A
   live pull writes continuously, so its entry is never stale; one an
   interrupted pull leaked is. Only while a single pull permit exists.
+
+  The pull path calls it inside that permit, before its podman starts and
+  after a failed one exited, so any `podman pull` alive then is one the
+  Host does not track (a holder of a crashed Host's permit): while one
+  runs, nothing is swept. A killed pull's leftovers go at the next pull.
   """
   @spec clear_spool(atom() | nil) :: :ok
   def clear_spool(host) do
-    with %{spools: spools, pull_permits: 1, spool_quiet_ms: quiet_ms} <- shared(host) do
-      cutoff = System.os_time(:second) - div(quiet_ms, 1000)
-      Enum.each(spools, &remove_stale(&1, cutoff))
+    with %{spool: spool, pull_permits: 1, spool_quiet_ms: quiet_ms, proc_dir: proc, podman: bin} <-
+           shared(host) do
+      if podman_pulling?(proc, bin),
+        do: Logger.debug("Vagus.Runtime.Host: a podman pull runs; spool kept"),
+        else: remove_stale(spool, System.os_time(:second) - div(quiet_ms, 1000))
     end
 
     :ok
@@ -231,6 +239,36 @@ defmodule Vagus.Runtime.Host do
 
       {:error, _} ->
         :ok
+    end
+  end
+
+  # An unreadable proc dir proves nothing, so it counts as a pull.
+  defp podman_pulling?(proc, bin) do
+    case File.ls(proc) do
+      {:ok, entries} -> Enum.any?(entries, &podman_pull?(Path.join([proc, &1, "cmdline"]), bin))
+      {:error, _} -> true
+    end
+  end
+
+  # The path is a `File.ls/1` entry of the fixed proc dir. A process gone
+  # meanwhile, or not a pid, has no cmdline to read.
+  # Every global flag `Podman.Cmd` passes is `--flag=value` or bare, so the
+  # first non-flag argument is the subcommand.
+  # sobelow_skip ["Traversal.FileModule"]
+  defp podman_pull?(cmdline, bin) do
+    case File.read(cmdline) do
+      {:ok, argv} ->
+        case String.split(argv, <<0>>, trim: true) do
+          [argv0 | args] ->
+            Path.basename(argv0) == bin and
+              Enum.find(args, &(not String.starts_with?(&1, "-"))) == "pull"
+
+          [] ->
+            false
+        end
+
+      {:error, _} ->
+        false
     end
   end
 
@@ -604,9 +642,11 @@ defmodule Vagus.Runtime.Host do
       env: state.env,
       stats: state.stats,
       profile: state.profile,
-      spools: [spool_dir(state.opts), Path.join(run_dir(state.opts), "spool")],
+      spool: spool_dir(state.opts),
       pull_permits: state.permits[:pull],
       spool_quiet_ms: Keyword.get(state.opts, :spool_quiet_ms, 120_000),
+      proc_dir: Keyword.get(state.opts, :proc_dir, "/proc"),
+      podman: Path.basename(podman_bin(state.opts)),
       log_dir: log_dir(state.opts),
       out_dir: state.out_dir,
       log_max_bytes: state.profile && @log_max_bytes[state.profile],
@@ -957,6 +997,10 @@ defmodule Vagus.Runtime.Host do
     end
   end
 
+  # Both profiles spool on disk: a tmpfs spool is bounded by `/run`, whose
+  # size does not scale with RAM, and a Core pull stages hundreds of MB of
+  # compressed blobs there until the image commits. The override merges
+  # per key, so fast inherits the baked `image_parallel_copies = 1`.
   @spec containers_conf(profile(), keyword()) :: String.t()
   def containers_conf(:frugal, opts) do
     """
@@ -973,7 +1017,7 @@ defmodule Vagus.Runtime.Host do
     [engine]
     events_logger = "file"
     events_logfile_max_size = #{@events_max_bytes}
-    image_copy_tmp_dir = "#{Path.join(run_dir(opts), "spool")}"
+    image_copy_tmp_dir = "#{spool_dir(opts)}"
     """
   end
 
@@ -982,13 +1026,11 @@ defmodule Vagus.Runtime.Host do
     with :ok <- File.mkdir_p(Path.dirname(path)), do: File.write(path, content)
   end
 
-  # Both spools are made: the fast one may hold a pull's layers, and
-  # podman stats `<graphroot>/tmp` even when it spools elsewhere.
+  # podman does not create the spool dir itself.
   # sobelow_skip ["Traversal.FileModule"]
   defp clear_spool_once(opts) do
     spool = spool_dir(opts)
     marker = Path.join(run_dir(opts), "spool-cleared")
-    _ = File.mkdir_p(Path.join(run_dir(opts), "spool"))
 
     with :ok <- File.mkdir_p(spool),
          false <- File.exists?(marker) do
@@ -999,6 +1041,10 @@ defmodule Vagus.Runtime.Host do
       {:error, reason} -> Logger.error("Vagus.Runtime.Host: spool #{spool}: #{inspect(reason)}")
     end
   end
+
+  # The binary `Podman.Cmd` launches, by the same fallback.
+  defp podman_bin(opts),
+    do: opts[:podman_bin] || Application.get_env(:vagus, :podman_bin, "podman")
 
   defp spool_dir(opts), do: Path.join(graphroot(opts), "tmp")
 

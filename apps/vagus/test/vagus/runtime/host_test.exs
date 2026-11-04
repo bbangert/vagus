@@ -12,6 +12,7 @@ defmodule Vagus.Runtime.HostTest do
   setup do
     root = Path.join(System.tmp_dir!(), "vagus-host-#{System.unique_integer([:positive])}")
     File.mkdir_p!(Path.join(root, "dev"))
+    File.mkdir_p!(Path.join(root, "proc"))
     on_exit(fn -> File.rm_rf(root) end)
     %{root: root, name: :"host_#{System.unique_integer([:positive])}"}
   end
@@ -41,6 +42,7 @@ defmodule Vagus.Runtime.HostTest do
       socket_dir: Path.join(ctx.root, "run/supervisor"),
       resolv_conf: Path.join(ctx.root, "resolv.conf"),
       dev_root: Path.join(ctx.root, "dev"),
+      proc_dir: Path.join(ctx.root, "proc"),
       log_dir: Path.join(ctx.root, "run/vagus/logs"),
       mountinfo: mountinfo(ctx.root, ""),
       name_servers: fn -> [{192, 168, 2, 1}] end,
@@ -478,7 +480,7 @@ defmodule Vagus.Runtime.HostTest do
                %{dir: Path.join(ctx.root, "run/vagus/logs"), max_bytes: 2_097_152}
     end
 
-    test "fast: drop-in spooling on tmpfs, no Go limits, four ops permits", ctx do
+    test "fast: drop-in spooling on disk, no Go limits, four ops permits", ctx do
       start_host(ctx, meminfo: meminfo(ctx.root, 8 * @gib_kb))
       conf = Path.join(ctx.root, "run/vagus/podman/containers.conf")
 
@@ -486,13 +488,26 @@ defmodule Vagus.Runtime.HostTest do
              [engine]
              events_logger = "file"
              events_logfile_max_size = 4194304
-             image_copy_tmp_dir = "#{Path.join(ctx.root, "run/vagus/podman/spool")}"
+             image_copy_tmp_dir = "#{Path.join(ctx.root, "storage/tmp")}"
              """
 
-      assert File.dir?(Path.join(ctx.root, "run/vagus/podman/spool"))
+      assert File.dir?(Path.join(ctx.root, "storage/tmp"))
       assert Host.env(ctx.name) == [{"CONTAINERS_CONF_OVERRIDE", conf}]
       assert permits(ctx.name, :ops) == 4
       assert Host.log_config(ctx.name).max_bytes == 8_388_608
+    end
+
+    # /run is a fixed-size tmpfs; a Core pull's blobs outgrow it.
+    test "no profile spools under the run dir", ctx do
+      opts = host_opts(ctx)
+      run_dir = Keyword.fetch!(opts, :run_dir)
+
+      for profile <- [:frugal, :fast] do
+        [_, dir] =
+          Regex.run(~r/^image_copy_tmp_dir = "(.*)"$/m, Host.containers_conf(profile, opts))
+
+        refute String.starts_with?(dir, run_dir), "#{profile} spools in #{dir}"
+      end
     end
 
     test "the env reaches every podman the runner spawns", ctx do
@@ -585,6 +600,96 @@ defmodule Vagus.Runtime.HostTest do
       Host.clear_spool(ctx.name)
       assert File.ls!(spool) == []
       assert File.read!(Path.join(outside, "recent")) == "x"
+    end
+
+    defp process(ctx, pid, argv) do
+      dir = Path.join([ctx.root, "proc", pid])
+      File.mkdir_p!(dir)
+      File.write!(Path.join(dir, "cmdline"), Enum.map(argv, &[&1, 0]))
+    end
+
+    test "sweeps nothing while a podman pull it does not hold runs", %{spool: spool} = ctx do
+      spool |> tree("leaked", ["layer"]) |> age()
+      process(ctx, "1", ["/sbin/init"])
+      process(ctx, "4242", ["/usr/bin/podman", "--root=x", "pull", "img"])
+
+      Host.clear_spool(ctx.name)
+      assert File.ls!(spool) == ["leaked"]
+    end
+
+    test "sweeps while podman runs anything but a pull", %{spool: spool} = ctx do
+      spool |> tree("leaked", ["layer"]) |> age()
+      process(ctx, "4242", ["podman", "ps"])
+
+      Host.clear_spool(ctx.name)
+      assert File.ls!(spool) == []
+    end
+
+    test "a pull word past the subcommand is not a pull", %{spool: spool} = ctx do
+      spool |> tree("leaked", ["layer"]) |> age()
+      process(ctx, "4242", ["podman", "--root=x", "create", "--name", "n", "img", "git", "pull"])
+
+      Host.clear_spool(ctx.name)
+      assert File.ls!(spool) == []
+    end
+
+    test "knows a pull by the configured podman's name", %{spool: spool} = ctx do
+      stop_supervised!(ctx.name)
+      start_host(ctx, spool_quiet_ms: 60_000, podman_bin: "/opt/bin/fakepod")
+      spool |> tree("leaked", ["layer"]) |> age()
+      process(ctx, "4242", ["fakepod", "pull", "img"])
+
+      Host.clear_spool(ctx.name)
+      assert File.ls!(spool) == ["leaked"]
+
+      process(ctx, "4242", ["podman", "pull", "img"])
+      Host.clear_spool(ctx.name)
+      assert File.ls!(spool) == []
+    end
+
+    @tag skip:
+           not (File.dir?("/proc/self") and System.find_executable("bash") != nil) &&
+             "needs /proc and bash"
+    test "sees a live pull through the real /proc", %{spool: spool} = ctx do
+      stop_supervised!(ctx.name)
+      # Unique name: a real `podman pull` elsewhere on the machine would
+      # otherwise be seen in the real /proc and keep the spool.
+      bin = "vagus-test-pull-#{System.unique_integer([:positive])}"
+      start_host(ctx, spool_quiet_ms: 60_000, proc_dir: "/proc", podman_bin: bin)
+      spool |> tree("leaked", ["layer"]) |> age()
+
+      # argv [bin, "-f", "pull"]: the first non-flag is "pull".
+      File.write!(Path.join(ctx.root, "pull"), "")
+
+      port =
+        Port.open({:spawn_executable, System.find_executable("bash")}, [
+          :binary,
+          args: ["-c", "cd '#{ctx.root}' && exec -a #{bin} tail -f pull"]
+        ])
+
+      {:os_pid, os_pid} = Port.info(port, :os_pid)
+      pid = Integer.to_string(os_pid)
+      on_exit(fn -> System.cmd("kill", ["-9", pid], stderr_to_stdout: true) end)
+      await(fn -> File.read!("/proc/#{pid}/cmdline") == "#{bin}\0-f\0pull\0" end)
+
+      Host.clear_spool(ctx.name)
+      assert File.ls!(spool) == ["leaked"]
+
+      {_, 0} = System.cmd("kill", [pid])
+      await(fn -> not File.exists?("/proc/#{pid}") end)
+      Host.clear_spool(ctx.name)
+      assert File.ls!(spool) == []
+    end
+
+    defp await(check) do
+      Enum.find(1..500, fn _ -> safe(check) or (Process.sleep(10) && false) end) ||
+        flunk("condition never held")
+    end
+
+    defp safe(check) do
+      check.()
+    rescue
+      File.Error -> false
     end
   end
 
