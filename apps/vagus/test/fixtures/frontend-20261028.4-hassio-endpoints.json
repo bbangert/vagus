@@ -1,0 +1,435 @@
+{
+  "_frontend": "20261028.4",
+  "_source": "home-assistant/frontend src/**/*.ts at tag 20261028.4",
+  "endpoints": [
+    {
+      "method": "GET",
+      "path": "/addons",
+      "source": "src/data/hassio/addon.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/addons",
+      "source": "src/data/supervisor/supervisor.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/addons/{param}/logs",
+      "source": "src/data/hassio/supervisor.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/addons/{param}/logs/boots/{param}",
+      "source": "src/data/hassio/supervisor.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/addons/{param}/logs/boots/{param}/follow",
+      "source": "src/data/hassio/supervisor.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/addons/{param}/logs/follow",
+      "source": "src/data/hassio/supervisor.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/addons/{slug}/changelog",
+      "source": "src/data/hassio/addon.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/addons/{slug}/documentation",
+      "source": "src/data/hassio/addon.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/addons/{slug}/icon",
+      "source": "src/components/ha-app-icon.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/addons/{slug}/info",
+      "source": "src/data/hassio/addon.ts"
+    },
+    {
+      "method": "POST",
+      "path": "/addons/{slug}/install",
+      "source": "src/data/hassio/addon.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/addons/{slug}/logo",
+      "source": "src/panels/config/apps/app-view/info/supervisor-app-info.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/addons/{slug}/logs",
+      "source": "src/data/hassio/addon.ts"
+    },
+    {
+      "method": "POST",
+      "path": "/addons/{slug}/options",
+      "source": "src/data/hassio/addon.ts"
+    },
+    {
+      "method": "POST",
+      "path": "/addons/{slug}/options/validate",
+      "source": "src/data/hassio/addon.ts"
+    },
+    {
+      "method": "POST",
+      "path": "/addons/{slug}/rebuild",
+      "source": "src/data/hassio/addon.ts"
+    },
+    {
+      "method": "POST",
+      "path": "/addons/{slug}/restart",
+      "source": "src/data/hassio/addon.ts"
+    },
+    {
+      "method": "POST",
+      "path": "/addons/{slug}/security",
+      "source": "src/data/hassio/addon.ts"
+    },
+    {
+      "method": "POST",
+      "path": "/addons/{slug}/start",
+      "source": "src/data/hassio/addon.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/addons/{slug}/stats",
+      "source": "src/panels/config/apps/app-view/info/supervisor-app-info.ts"
+    },
+    {
+      "method": "POST",
+      "path": "/addons/{slug}/stop",
+      "source": "src/data/hassio/addon.ts"
+    },
+    {
+      "method": "POST",
+      "path": "/addons/{slug}/uninstall",
+      "source": "src/data/hassio/addon.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/core/info",
+      "source": "src/data/hassio/supervisor.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/core/info",
+      "source": "src/data/supervisor/supervisor.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/core/logs/latest",
+      "source": "src/data/error_log.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/core/logs/latest",
+      "source": "src/data/hassio/supervisor.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/core/stats",
+      "source": "src/panels/config/repairs/dialog-system-information.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/docker/registries",
+      "source": "src/data/hassio/docker.ts"
+    },
+    {
+      "method": "POST",
+      "path": "/docker/registries",
+      "source": "src/data/hassio/docker.ts"
+    },
+    {
+      "method": "DELETE",
+      "path": "/docker/registries/{param}",
+      "source": "src/data/hassio/docker.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/hardware/audio",
+      "source": "src/data/hassio/hardware.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/hardware/info",
+      "source": "src/data/hassio/hardware.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/host/disks",
+      "source": "src/data/hassio/host.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/host/disks/{param}/usage",
+      "source": "src/data/hassio/host.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/host/info",
+      "source": "src/data/hassio/host.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/host/info",
+      "source": "src/data/supervisor/supervisor.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/host/logs/boots",
+      "source": "src/data/hassio/supervisor.ts"
+    },
+    {
+      "method": "POST",
+      "path": "/host/options",
+      "source": "src/data/hassio/host.ts"
+    },
+    {
+      "method": "POST",
+      "path": "/host/reboot",
+      "source": "src/data/hassio/host.ts"
+    },
+    {
+      "method": "POST",
+      "path": "/host/shutdown",
+      "source": "src/data/hassio/host.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/info",
+      "source": "src/data/hassio/supervisor.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/info",
+      "source": "src/data/supervisor/supervisor.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/ingress/panels",
+      "source": "src/data/hassio/ingress.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/mounts",
+      "source": "src/data/supervisor/mounts.ts"
+    },
+    {
+      "method": "POST",
+      "path": "/mounts",
+      "source": "src/data/supervisor/mounts.ts"
+    },
+    {
+      "method": "POST",
+      "path": "/mounts/options",
+      "source": "src/data/supervisor/mounts.ts"
+    },
+    {
+      "method": "DELETE",
+      "path": "/mounts/{param}",
+      "source": "src/data/supervisor/mounts.ts"
+    },
+    {
+      "method": "PUT",
+      "path": "/mounts/{param}",
+      "source": "src/data/supervisor/mounts.ts"
+    },
+    {
+      "method": "POST",
+      "path": "/mounts/{param}/reload",
+      "source": "src/data/supervisor/mounts.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/network/info",
+      "source": "src/data/hassio/network.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/network/info",
+      "source": "src/data/supervisor/supervisor.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/network/interface/{param}/accesspoints",
+      "source": "src/data/hassio/network.ts"
+    },
+    {
+      "method": "POST",
+      "path": "/network/interface/{param}/update",
+      "source": "src/data/hassio/network.ts"
+    },
+    {
+      "method": "POST",
+      "path": "/os/config/sync",
+      "source": "src/data/hassio/host.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/os/datadisk/list",
+      "source": "src/data/hassio/host.ts"
+    },
+    {
+      "method": "POST",
+      "path": "/os/datadisk/move",
+      "source": "src/data/hassio/host.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/os/info",
+      "source": "src/data/hassio/host.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/os/info",
+      "source": "src/data/supervisor/supervisor.ts"
+    },
+    {
+      "method": "POST",
+      "path": "/os/update",
+      "source": "src/data/hassio/host.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/resolution/info",
+      "source": "src/data/hassio/resolution.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/resolution/info",
+      "source": "src/data/supervisor/supervisor.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/store",
+      "source": "src/data/supervisor/store.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/store",
+      "source": "src/data/supervisor/supervisor.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/store/addons/{slug}",
+      "source": "src/data/hassio/addon.ts"
+    },
+    {
+      "method": "POST",
+      "path": "/store/reload",
+      "source": "src/data/hassio/addon.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/store/repositories",
+      "source": "src/data/supervisor/store.ts"
+    },
+    {
+      "method": "POST",
+      "path": "/store/repositories",
+      "source": "src/data/supervisor/store.ts"
+    },
+    {
+      "method": "DELETE",
+      "path": "/store/repositories/{param}",
+      "source": "src/data/supervisor/store.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/supervisor/info",
+      "source": "src/data/hassio/supervisor.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/supervisor/info",
+      "source": "src/data/supervisor/supervisor.ts"
+    },
+    {
+      "method": "POST",
+      "path": "/supervisor/options",
+      "source": "src/data/hassio/supervisor.ts"
+    },
+    {
+      "method": "POST",
+      "path": "/supervisor/reload",
+      "source": "src/data/hassio/supervisor.ts"
+    },
+    {
+      "method": "POST",
+      "path": "/supervisor/restart",
+      "source": "src/data/hassio/supervisor.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/supervisor/stats",
+      "source": "src/panels/config/repairs/dialog-system-information.ts"
+    },
+    {
+      "method": "POST",
+      "path": "/supervisor/update",
+      "source": "src/data/hassio/supervisor.ts"
+    },
+    {
+      "method": "GET",
+      "path": "`${ provider.includes(\"_\") ? `addons/${provider}` : provider }/logs${boot !== 0 ? `/boots/${boot}` : \"\"}?lines=${lines}`",
+      "raw": true,
+      "source": "src/data/hassio/supervisor.ts"
+    },
+    {
+      "method": "GET",
+      "path": "`${provider.includes(\"_\") ? `addons/${provider}` : provider}/logs`",
+      "raw": true,
+      "source": "src/data/hassio/supervisor.ts"
+    },
+    {
+      "method": "GET",
+      "path": "`/${container}/stats`",
+      "raw": true,
+      "source": "src/data/hassio/common.ts"
+    },
+    {
+      "method": "GET",
+      "path": "`hassio/${provider.includes(\"_\") ? `addons/${provider}` : provider}/logs${boot !== 0 ? `/boots/${boot}` : \"\"}/follow?lines=${lines}`",
+      "raw": true,
+      "source": "src/data/hassio/supervisor.ts"
+    },
+    {
+      "method": "GET",
+      "path": "`hassio/${provider.includes(\"_\") ? `addons/${provider}` : provider}/logs${boot !== 0 ? `/boots/${boot}` : \"\"}/follow`",
+      "raw": true,
+      "source": "src/data/hassio/supervisor.ts"
+    },
+    {
+      "method": "GET",
+      "path": "`hassio/${provider.includes(\"_\") ? `addons/${provider}` : provider}/logs${boot !== 0 ? `/boots/${boot}` : \"\"}`",
+      "raw": true,
+      "source": "src/data/hassio/supervisor.ts"
+    },
+    {
+      "method": "GET",
+      "path": "`hassio/${provider.includes(\"_\") ? `addons/${provider}` : provider}/logs`",
+      "raw": true,
+      "source": "src/data/hassio/supervisor.ts"
+    },
+    {
+      "method": "GET",
+      "path": "{ endpoint }",
+      "raw": true,
+      "source": "src/data/supervisor/supervisor.ts"
+    },
+    {
+      "method": "UNKNOWN",
+      "path": "{ endpoint }",
+      "raw": true,
+      "source": "src/data/supervisor/common.ts"
+    }
+  ]
+}
