@@ -144,6 +144,53 @@ defmodule Vagus.App.DefaultBootTest do
     assert Vagus.Addon.Backend.Native.running?("addon_vagus")
   end
 
+  # Boot installs a default app only on a flavor that lists it, but a panel
+  # kept from another flavor is still the firmware's.
+  @tag :tmp_dir
+  test "an installed panel from an older firmware is brought to this one's version on the agent flavor",
+       %{tmp_dir: tmp} do
+    Vagus.AppFixtures.listening_api_port()
+    Application.put_env(:vagus, :addon_data_root, tmp)
+    Application.put_env(:vagus, :native_addon_slugs, agent_flavor()[:native_addon_slugs])
+    name = :"orchestrator_#{System.unique_integer([:positive])}"
+
+    on_exit(fn ->
+      Application.delete_env(:vagus, :addon_data_root)
+      Application.delete_env(:vagus, :native_addon_slugs)
+      Vagus.AppFixtures.forget_app("vagus")
+      Vagus.Addon.Backend.Native.stop("addon_vagus")
+    end)
+
+    config = Vagus.AppFixtures.admin_panel_config()
+    Vagus.AppFixtures.install_app(%{config | version: "0.0.1"}, process: false)
+
+    with_log(fn ->
+      start_supervised!({
+        Orchestrator,
+        name: name,
+        boot: true,
+        default_apps: [],
+        gate_tries: 1,
+        gate_interval: 0,
+        tree_interval: 0,
+        gate_timeout: 2_000,
+        stage_timeout: 2_000,
+        primary_timeout: 0
+      })
+
+      with %{task: %Task{pid: task_pid}} <- :sys.get_state(name) do
+        task_ref = Process.monitor(task_pid)
+        assert_receive {:DOWN, ^task_ref, :process, ^task_pid, _reason}, 10_000
+      end
+    end)
+
+    assert {:ok, %{config: %{version: saved}}} = Vagus.App.info("vagus")
+    assert saved == config.version
+    assert {:ok, %{version: latest}} = Vagus.App.latest_config("vagus")
+    assert latest == saved
+    refute Vagus.Version.update_available?(saved, latest)
+  end
+
   defp agent_flavor do
     prev = System.get_env("VAGUS_FLAVOR")
     System.put_env("VAGUS_FLAVOR", "agent-dev-board")

@@ -24,6 +24,7 @@ defmodule Vagus.App.UnitsTest do
     ensure: 1,
     in_flight?: 0,
     install_default: 1,
+    follow_firmware: 1,
     builtin_native?: 1,
     native?: 1,
     boot_start: 2,
@@ -355,7 +356,7 @@ defmodule Vagus.App.UnitsTest do
       {:ok, config} = Units.builtin_config("vagus")
       install_app(%{config | version: "0.0.1"})
 
-      assert Units.install_default("vagus") == :present
+      assert Units.follow_firmware("vagus") == :ok
       assert {:ok, %{config: %{version: version}}} = app_info("vagus")
       assert version == config.version
     end

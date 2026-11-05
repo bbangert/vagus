@@ -25,6 +25,7 @@ defmodule Vagus.App.Units do
       ensure: &ensure/1,
       in_flight?: &Vagus.Host.Shutdown.in_flight?/0,
       install_default: &install_default/1,
+      follow_firmware: &follow_firmware/1,
       builtin_native?: &builtin_native?/1,
       native?: &native?/1,
       boot_start: &App.boot_start/2,
@@ -84,15 +85,13 @@ defmodule Vagus.App.Units do
   @doc """
   A fresh install is wanted started, so boot starts it; a present one is left
   as the user set it, except that a container one gets its protected settings
-  back (`protected_settings/1`), and the admin panel is brought to the
-  firmware's version.
+  back (`protected_settings/1`).
   """
   @spec install_default(String.t()) :: :installed | :present | {:error, term()}
   def install_default(slug) do
     cond do
       slug in App.slugs() ->
         ensure_settings(slug)
-        follow_firmware(slug)
         :present
 
       # Its file would create the apps directory, and a legacy file whose
@@ -135,16 +134,21 @@ defmodule Vagus.App.Units do
     end
   end
 
-  # The panel ships with the firmware and no store offers it, so its version
-  # is the firmware's: left behind, Core would offer an update to the version
-  # already running.
-  defp follow_firmware(slug) do
+  @doc """
+  The panel ships with the firmware and no store offers it, so its version
+  is the firmware's: left behind, Core would offer an update to the version
+  already running. Any other slug is left alone.
+  """
+  @spec follow_firmware(String.t()) :: :ok
+  def follow_firmware(slug) do
     with true <- Config.reserved_slug?(slug),
          {:ok, %{config: %{version: installed}}} <- App.info(slug),
          {:ok, %{version: firmware}} when firmware != installed <- builtin_config(slug),
          {:error, reason} <- App.update(slug, []) do
       Logger.warning("Boot: app #{slug} not moved to #{firmware}: #{inspect(reason)}")
     end
+
+    :ok
   end
 
   @doc "Whether a default app's builtin config runs natively; one with none is not."
