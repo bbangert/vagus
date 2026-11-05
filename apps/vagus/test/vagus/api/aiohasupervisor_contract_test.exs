@@ -9,7 +9,7 @@ defmodule Vagus.API.AiohasupervisorContractTest do
   and `Vagus.API.Models.OSInfo` had both missed. `test/vagus/api/router_test.exs`
   pins key lists TRANSCRIBED from that same doc, so it caught nothing —
   the doc and the code drifted together. This test instead checks against
-  `test/fixtures/aiohasupervisor-0.6.0-contract.json`, a field list dumped
+  `test/fixtures/aiohasupervisor-<version>-contract.json`, a field list dumped
   directly from `dataclasses.fields()` on the REAL client classes running
   on-device, independent of anything we hand-wrote.
 
@@ -17,43 +17,17 @@ defmodule Vagus.API.AiohasupervisorContractTest do
 
   Required on every Core/aiohasupervisor version bump (`homeassistant/
   components/hassio/manifest.json`'s `aiohasupervisor==` pin). Run
-  read-only from this devcontainer against a live board (writes no state):
+  read-only against a live board (writes no state), from the repo root:
 
   ```
-  ssh <board-ip> 'System.cmd("balena-engine", ["exec", "homeassistant",
-    "python3", "-c", "<PY>"], stderr_to_stdout: true) |> elem(0) |> IO.puts()'
+  scp scripts/dump_aiohasupervisor_contract.py <board-ip>:/tmp/dump_models.py
+  ssh <board-ip> 'System.cmd("sh", ["-c",
+    "podman exec -i homeassistant python3 - < /tmp/dump_models.py"]) |> elem(0) |> IO.puts()'
   ```
 
-  where `<PY>` is:
-
-  ```python
-  import dataclasses, json
-  from aiohasupervisor.models import root, homeassistant, supervisor, os as os_mod, host, addons, network, mounts
-  models = {
-      "root.RootInfo": root.RootInfo,
-      "homeassistant.HomeAssistantInfo": homeassistant.HomeAssistantInfo,
-      "supervisor.SupervisorInfo": supervisor.SupervisorInfo,
-      "os.OSInfo": os_mod.OSInfo,
-      "host.HostInfo": host.HostInfo,
-      "addons.StoreInfo": addons.StoreInfo,
-      "network.NetworkInfo": network.NetworkInfo,
-      "mounts.MountsInfo": mounts.MountsInfo,
-  }
-  out = {
-      key: [
-          {"n": f.name, "req": f.default is dataclasses.MISSING and f.default_factory is dataclasses.MISSING}
-          for f in dataclasses.fields(cls)
-      ]
-      for key, cls in models.items()
-  }
-  out["_version"] = __import__("aiohasupervisor").__version__
-  print(json.dumps(out))
-  ```
-
-  `StoreInfo` lives in `aiohasupervisor.models.addons`, NOT a `models.store`
-  module (there isn't one in 0.6.0) — a naive `from aiohasupervisor.models
-  import StoreInfo; print(StoreInfo.__module__)` is the way to re-confirm
-  that if it ever needs re-checking. Save the output to
+  The script dumps every dataclass in the 8 `aiohasupervisor.models` modules
+  the coordinator touches, not just the models wired into `@model_endpoints`,
+  so wiring in another endpoint needs no new dump. Save the output to
   `test/fixtures/aiohasupervisor-<new version>-contract.json` and update
   `@fixture_path` below to match — `@client_version` derives from that
   path, and the "records its own `_version`" test asserts it equals the
@@ -62,11 +36,13 @@ defmodule Vagus.API.AiohasupervisorContractTest do
   silently redefining the contract.
   """
 
-  use ExUnit.Case, async: true
+  use ExUnit.Case, async: false
 
   import Plug.Test
   import Plug.Conn
+  import Vagus.AppFixtures
 
+  alias Vagus.Addon.Config
   alias Vagus.API.{Router, Token}
 
   @opts Router.init([])
@@ -76,13 +52,13 @@ defmodule Vagus.API.AiohasupervisorContractTest do
                   "..",
                   "..",
                   "fixtures",
-                  "aiohasupervisor-0.6.0-contract.json"
+                  "aiohasupervisor-0.8.1-contract.json"
                 ])
   @external_resource @fixture_path
   @fixture @fixture_path |> File.read!() |> Jason.decode!()
 
   # Derived from the fixture's own versioned filename (e.g. "0.6.0" out of
-  # "aiohasupervisor-0.6.0-contract.json") so the two can be cross-checked
+  # "aiohasupervisor-0.8.1-contract.json") so the two can be cross-checked
   # below — a fixture regenerated from the wrong environment (a different
   # aiohasupervisor than the filename claims) fails loudly instead of
   # silently redefining the contract.
@@ -100,20 +76,44 @@ defmodule Vagus.API.AiohasupervisorContractTest do
     {"host.HostInfo", "/host/info"},
     {"addons.StoreInfo", "/store"},
     {"network.NetworkInfo", "/network/info"},
-    {"mounts.MountsInfo", "/mounts"}
+    {"mounts.MountsInfo", "/mounts"},
+    # Core 2026.11.0's `supervisor/ingress/info` parses this one through the
+    # typed client, which is what opening any app's sidebar panel goes
+    # through — the synthetic `vagus` panel included.
+    {"addons.InstalledAddonComplete", "/addons/vagus/info"},
+    {"addons.InstalledAddonComplete", "/addons/contract_app/info"}
   ]
+
+  # Model field name => wire key, for fields mashumaro reads under an alias.
+  @wire_aliases %{"supervisor_api" => "hassio_api", "supervisor_role" => "hassio_role"}
+
+  # Needs the app process (`App.info/1`), hence `async: false`.
+  setup do
+    {:ok, config} =
+      Config.parse(%{
+        "name" => "Contract app",
+        "version" => "1.0.0",
+        "slug" => "contract_app",
+        "description" => "An installed app for the contract check",
+        "arch" => ["aarch64"],
+        "ingress" => true
+      })
+
+    install_app(config, state: :started)
+    :ok
+  end
 
   defp call(conn), do: Router.call(conn, @opts)
   defp authed(conn), do: put_req_header(conn, "authorization", "Bearer " <> Token.get())
   defp json_body(conn), do: Jason.decode!(conn.resp_body)
 
-  describe "every required aiohasupervisor 0.6.0 field is present on the wire" do
+  describe "every required aiohasupervisor field is present on the wire" do
     for {fixture_key, path} <- @model_endpoints do
       required_fields =
         @fixture
         |> Map.fetch!(fixture_key)
         |> Enum.filter(& &1["req"])
-        |> Enum.map(& &1["n"])
+        |> Enum.map(&Map.get(@wire_aliases, &1["n"], &1["n"]))
 
       test "GET #{path} response includes every required #{fixture_key} field" do
         conn = conn(:get, unquote(path)) |> authed() |> call()
@@ -135,9 +135,10 @@ defmodule Vagus.API.AiohasupervisorContractTest do
     end
   end
 
-  test "the fixture itself covers exactly the 8 models Core's hassio coordinator gathers" do
-    assert Map.keys(@fixture) |> Enum.reject(&(&1 == "_version")) |> Enum.sort() ==
-             Enum.map(@model_endpoints, &elem(&1, 0)) |> Enum.sort()
+  test "the fixture covers every model this test checks" do
+    for {fixture_key, _path} <- @model_endpoints do
+      assert Map.has_key?(@fixture, fixture_key), "fixture has no #{fixture_key}"
+    end
   end
 
   test "the fixture records the aiohasupervisor version its filename claims" do

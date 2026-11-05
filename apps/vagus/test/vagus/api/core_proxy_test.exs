@@ -193,7 +193,7 @@ defmodule Vagus.API.CoreProxyTest do
 
   @opts Dispatcher.init([])
 
-  @reserved_views Path.expand("../../fixtures/core-2026.8.1-hassio-views.json", __DIR__)
+  @reserved_views Path.expand("../../fixtures/core-2026.11.0-hassio-views.json", __DIR__)
   @external_resource @reserved_views
   @reserved_urls @reserved_views |> File.read!() |> Jason.decode!() |> Map.fetch!("urls")
   @client_finch Vagus.API.CoreProxyTest.ClientFinch

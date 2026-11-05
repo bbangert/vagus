@@ -4,12 +4,12 @@ defmodule Vagus.Core.Reserved do
   which nothing but Vagus itself may address.
 
   Core reserves the `hassio` prefix for the views its Supervisor integration
-  registers. As of Core 2026.8.1 that is `/api/hassio/{path:.+}` (Core's
+  registers. As of Core 2026.11.0 that is `/api/hassio/{path:.+}` (Core's
   proxy back into the Supervisor API), `/api/hassio_auth`,
   `/api/hassio_auth/password_reset`, `/api/hassio_push/panel/{addon}`,
   `/api/hassio_push/discovery/{uuid}` and
   `/api/hassio_ingress/{token}/{path:.*}` — pinned in
-  `test/fixtures/core-2026.8.1-hassio-views.json`.
+  `test/fixtures/core-2026.11.0-hassio-views.json`.
 
   They do NOT share one authorization rule, and the reservation does not
   claim they do: the two `hassio_auth` views check "are you the Supervisor"
