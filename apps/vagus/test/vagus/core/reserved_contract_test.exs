@@ -57,7 +57,7 @@ defmodule Vagus.Core.ReservedContractTest do
                   "..",
                   "..",
                   "fixtures",
-                  "core-2026.8.1-hassio-views.json"
+                  "core-2026.11.0-hassio-views.json"
                 ])
   @external_resource @fixture_path
   @fixture @fixture_path |> File.read!() |> Jason.decode!()
