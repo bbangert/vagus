@@ -31,12 +31,12 @@ defmodule Vagus.API.AiohasupervisorContractTest do
   `_endpoints`, every request the app-facing clients make, read from the
   client's source at the same version (`Vagus.API.ClientEndpointsRouteTest`
   checks each is routed). Save the output to
-  `test/fixtures/aiohasupervisor-<new version>-contract.json` and update
-  `@fixture_path` below to match — `@client_version` derives from that
-  path, and the "records its own `_version`" test asserts it equals the
-  fixture's own `_version` key, so a fixture saved under the wrong
-  filename (or dumped from the wrong environment) fails loudly instead of
-  silently redefining the contract.
+  `test/fixtures/aiohasupervisor-<new version>-contract.json`, replacing the
+  old file (`Vagus.Test.ContractFixture` requires exactly one, and both this
+  test and the route guard follow it; nothing else needs editing). The
+  "records its own `_version`" test asserts the fixture's `_version` key
+  equals its filename's version, so a fixture saved under the wrong filename
+  (or dumped from the wrong environment) fails loudly.
   """
 
   use ExUnit.Case, async: false
@@ -50,25 +50,14 @@ defmodule Vagus.API.AiohasupervisorContractTest do
 
   @opts Router.init([])
 
-  @fixture_path Path.join([
-                  __DIR__,
-                  "..",
-                  "..",
-                  "fixtures",
-                  "aiohasupervisor-0.8.1-contract.json"
-                ])
+  @fixture_path Vagus.Test.ContractFixture.path()
   @external_resource @fixture_path
-  @fixture @fixture_path |> File.read!() |> Jason.decode!()
+  @fixture Vagus.Test.ContractFixture.load()
 
-  # Derived from the fixture's own versioned filename (e.g. "0.6.0" out of
-  # "aiohasupervisor-0.8.1-contract.json") so the two can be cross-checked
-  # below — a fixture regenerated from the wrong environment (a different
-  # aiohasupervisor than the filename claims) fails loudly instead of
-  # silently redefining the contract.
-  @client_version @fixture_path
-                  |> Path.basename()
-                  |> String.replace_prefix("aiohasupervisor-", "")
-                  |> String.replace_suffix("-contract.json", "")
+  # Cross-checked against the fixture's own `_version` below: a fixture
+  # regenerated from the wrong environment fails loudly instead of silently
+  # redefining the contract.
+  @client_version Vagus.Test.ContractFixture.version()
 
   # {fixture key, router path} or {fixture key, router path, where}. A path
   # is a GET unless written `{:post, path}`. `where` names the payload's

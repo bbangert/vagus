@@ -17,9 +17,9 @@ defmodule Vagus.API.ClientEndpointsRouteTest do
 
   alias Vagus.RouterRoutes
 
-  @fixture_path Path.expand("../../fixtures/aiohasupervisor-0.8.1-contract.json", __DIR__)
+  @fixture_path Vagus.Test.ContractFixture.path()
   @external_resource @fixture_path
-  @endpoints @fixture_path |> File.read!() |> Jason.decode!() |> Map.fetch!("_endpoints")
+  @endpoints Vagus.Test.ContractFixture.load() |> Map.fetch!("_endpoints")
 
   @placeholders %{"{slug}" => "core_example", "{version}" => "1.0.0"}
 
