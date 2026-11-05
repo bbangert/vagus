@@ -68,6 +68,11 @@ jobs:
           [ -n "$tag" ] || { echo "::error::could not resolve the frontend pinned by Core $CORE_VERSION"; exit 1; }
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
+      # The diff below is only as good as the extractor: these pin that what it
+      # cannot resolve surfaces as a raw entry instead of vanishing.
+      - name: Test the frontend endpoint extractor
+        run: python3 -I scripts/test_frontend_hassio_endpoints.py
+
       - name: Diff the frontend's Supervisor endpoints against the pinned fixture
         env:
           FRONTEND_TAG: ${{ steps.frontend.outputs.tag }}

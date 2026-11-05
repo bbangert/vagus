@@ -18,10 +18,15 @@ There is no TypeScript parser in the stdlib, so this lexes rather than parses;
 it understands enough (nested template literals, ternaries) to expand the log
 URLs, which branch on the provider and the boot inside one template.
 
-FAILS VISIBLY. An endpoint whose path or method cannot be read out of the
-source — a variable endpoint, a first segment chosen at runtime — is emitted
-with `"raw": true` and its source text, never dropped: a dropped endpoint reads
-exactly like "the frontend does not call this".
+FAILS CLOSED. An endpoint whose path or method cannot be read out of the
+source — a variable endpoint or verb, a first segment chosen at runtime, a
+spread that may add a path or override one — is emitted with `"raw": true` and
+its source text (and a `reason` where the text alone does not say why), never
+dropped: a dropped endpoint reads exactly like "the frontend does not call
+this". scripts/test_frontend_hassio_endpoints.py pins each such case, and
+core-contract-drift.yml runs it:
+
+  python3 -I scripts/test_frontend_hassio_endpoints.py
 """
 
 import json
@@ -267,6 +272,9 @@ def normalise(pieces, require_hassio):
         return RAW
     path = "".join(pieces).split("?", 1)[0]
     if require_hassio:
+        # `${base}/x` may well be `hassio/x`.
+        if path.lstrip("/").startswith("{"):
+            return RAW
         if not path.startswith("hassio/"):
             return None
         path = path[len("hassio/") :]
@@ -301,18 +309,27 @@ def call_args(toks, pairs, i):
     return split_top(toks[j + 1 : pairs[j]], ",")
 
 
-def object_keys(toks):
-    """Top-level `key: value` pairs of an object literal's inner tokens."""
-    keys = {}
+def object_entries(toks):
+    """An object literal's top-level entries, in order: ("key", name, value) or
+    ("spread", tokens). Shorthand `{ a }` keeps `a`'s own token as its value."""
+    entries = []
     for entry in split_top(toks, ","):
-        if len(entry) >= 2 and entry[0].kind in "is" and entry[1].is_p(":"):
-            keys[entry[0].value] = entry[2:]
+        if entry and entry[0].is_p("..."):
+            entries.append(("spread", entry[1:]))
+        elif len(entry) >= 2 and entry[0].kind in "is" and entry[1].is_p(":"):
+            entries.append(("key", entry[0].value, entry[2:]))
         elif len(entry) == 1 and entry[0].kind == "i":
-            keys[entry[0].value] = None
-    return keys
+            entries.append(("key", entry[0].value, entry))
+    return entries
+
+
+def object_keys(toks):
+    return {e[1]: e[2] for e in object_entries(toks) if e[0] == "key"}
 
 
 def method_of(value):
+    """None (omitted) is GET, as Core's WS schema defaults it; any non-literal
+    is unknowable (None back), shorthand `{ method }` included."""
     if value is None:
         return "GET"
     if len(value) == 1 and value[0].kind == "s":
@@ -320,10 +337,22 @@ def method_of(value):
     return None
 
 
+REQUEST_KEYS = ("type", "endpoint", "method")
+
+
 class Extractor:
-    def __init__(self, text, where, constants):
-        self.text, self.where, self.constants = text, where, constants
+    def __init__(self, text, where, tables, strings):
+        self.text, self.where, self.tables, self.strings = text, where, tables, strings
+        # A file that reaches the Supervisor any other way may build its
+        # `hassio/` HTTP path anywhere: one that cannot be read must not be dropped.
+        self.supervisor_file = any(t in text for t in TRIGGERS)
         self.found = []
+
+    def raw(self, method, path, reason=None):
+        entry = {"method": method or "UNKNOWN", "path": path, "raw": True, "source": self.where}
+        if reason:
+            entry["reason"] = reason
+        self.found.append(entry)
 
     def emit(self, method, expr, alts, require_hassio=False, suffix=""):
         for alt in alts:
@@ -331,21 +360,48 @@ class Extractor:
             if path is None:
                 continue
             if path is RAW or method is None:
-                self.found.append(
-                    {
-                        "method": method or "UNKNOWN",
-                        "path": source_text(self.text, expr) + suffix,
-                        "raw": True,
-                        "source": self.where,
-                    }
-                )
+                self.raw(method, source_text(self.text, expr) + suffix)
             else:
                 self.found.append({"method": method, "path": path, "source": self.where})
 
+    def table(self, name, seen=()):
+        """(key -> value tokens, unresolved spread sources) of a named literal
+        object, following spreads of other named objects in the file."""
+        if name in seen or name not in self.tables or self.tables[name] is None:
+            return None
+        keys, unresolved = {}, []
+        for entry in self.tables[name]:
+            if entry[0] == "key":
+                keys[entry[1]] = entry[2]
+                continue
+            spread = entry[1]
+            inner = self.table(spread[0].value, seen + (name,)) if len(spread) == 1 and spread[0].kind == "i" else None
+            if inner is None:
+                unresolved.append(source_text(self.text, entry[1]))
+            else:
+                keys.update(inner[0])
+                unresolved += inner[1]
+        return keys, unresolved
+
     def endpoint_alts(self, value):
-        # `endpoint: table[key]` names a module-level object of literal paths.
-        if len(value) >= 2 and value[0].kind == "i" and value[1].is_p("[") and value[0].value in self.constants:
-            return [[v] for v in self.constants[value[0].value]]
+        """`table[key]` as the WHOLE expression reads a named object of literal
+        paths; anything more (`table[key] + "/x"`) is not that lookup."""
+        if (
+            len(value) >= 4
+            and value[0].kind == "i"
+            and value[1].is_p("[")
+            and value[-1].is_p("]")
+            and matching(value).get(1) == len(value) - 1
+        ):
+            table = self.table(value[0].value)
+            if table and all(len(v) == 1 and v[0].kind == "s" for v in table[0].values()):
+                for spread in table[1]:
+                    self.raw(
+                        None,
+                        source_text(self.text, value),
+                        f"`...{spread}` in `{value[0].value}` adds paths no source names",
+                    )
+                return [[v[0].value] for v in table[0].values()]
         return alternatives(value)
 
     def walk(self, toks):
@@ -360,21 +416,71 @@ class Extractor:
             elif tok.kind == "i":
                 self.call(toks, pairs, i)
 
+    def spread_keys(self, toks):
+        """What a spread contributes: a dict when every request key it can set
+        is known (a named literal object, or inline literals that set none),
+        else None."""
+        if len(toks) == 1 and toks[0].kind == "i":
+            table = self.table(toks[0].value)
+            return table[0] if table and not table[1] else None
+        while len(toks) >= 2 and toks[0].is_p("(") and toks[-1].is_p(")"):
+            toks = toks[1:-1]
+        split = ternary(toks)
+        branches = [split[1], split[2]] if split else [toks]
+        for branch in branches:
+            if not (branch and branch[0].is_p("{") and branch[-1].is_p("}")):
+                return None
+            if any(k in REQUEST_KEYS for k in object_keys(branch[1:-1])):
+                return None
+        return {}
+
+    def resolve(self, entries):
+        """(request keys, unresolved spreads that may set the endpoint or method).
+
+        An unknown spread forgets the endpoint and method before it, not the
+        `type`: it can only turn a supervisor/api request into something else,
+        and flagging that is the safe side."""
+        keys, unresolved = {}, []
+        for entry in entries:
+            if entry[0] == "key":
+                keys[entry[1]] = entry[2]
+            else:
+                spread = self.spread_keys(entry[1])
+                if spread is None:
+                    unresolved.append(source_text(self.text, entry[1]))
+                    keys.pop("endpoint", None)
+                    keys.pop("method", None)
+                else:
+                    keys.update(spread)
+            if "endpoint" in keys and "method" in keys:
+                unresolved = []
+        return keys, unresolved
+
     def request_object(self, toks, pairs, i):
-        keys = object_keys(toks[i + 1 : pairs[i]])
+        keys, unresolved = self.resolve(object_entries(toks[i + 1 : pairs[i]]))
         kind = keys.get("type")
         if kind and len(kind) == 1 and kind[0].kind == "s" and kind[0].value == "supervisor/api":
-            self.request(keys)
+            declared = toks[i - 2].value if i >= 2 and toks[i - 1].is_p("=") and toks[i - 2].kind == "i" else None
+            self.request(keys, unresolved, declared)
 
-    def request(self, keys):
+    def request(self, keys, unresolved, declared=None):
+        if unresolved:
+            spreads = ", ".join(f"...{s}" for s in unresolved)
+            where = f"the endpoint-free base command `{declared}`" if declared else "a supervisor/api call site"
+            value = keys.get("endpoint")
+            path = source_text(self.text, value) if value else spreads
+            method = method_of(keys["method"]) if "method" in keys else None
+            self.raw(method, path, f"`{spreads}` in {where} can set the endpoint or method")
+            return
         if "endpoint" not in keys:
+            # A shared `{type, method}` the call sites spread; not itself a call.
+            if not declared:
+                self.raw(method_of(keys.get("method")), "{}", "a supervisor/api call site with no endpoint")
             return
         value = keys["endpoint"]
         method = method_of(keys.get("method"))
-        if value is None:
-            self.found.append(
-                {"method": method or "UNKNOWN", "path": "{ endpoint }", "raw": True, "source": self.where}
-            )
+        if len(value) == 1 and value[0].kind == "i" and value[0].value == "endpoint":
+            self.raw(method, "{ endpoint }")
         else:
             self.emit(method, value, self.endpoint_alts(value))
 
@@ -395,21 +501,28 @@ class Extractor:
         if name == "supervisorApiWsRequest" and len(args) >= 2:
             # Its object carries no `type`: the helper merges that in.
             if args[1] and args[1][0].is_p("{") and args[1][-1].is_p("}"):
-                self.request(object_keys(args[1][1:-1]))
+                self.request(*self.resolve(object_entries(args[1][1:-1])))
             else:
                 self.emit(None, args[1], [[RAW]])
         elif name == "supervisorApiCall" and len(args) >= 2:
             method = "GET"
-            if len(args) >= 3 and args[2] and args[2][0].is_p("{"):
-                method = method_of(object_keys(args[2][1:-1]).get("method"))
+            if len(args) >= 3 and args[2] and args[2][0].is_p("{") and args[2][-1].is_p("}"):
+                options, unresolved = self.resolve(object_entries(args[2][1:-1]))
+                method = None if unresolved else method_of(options.get("method"))
             elif len(args) >= 3 and args[2]:
                 method = None
             self.emit(method, args[1], alternatives(args[1]))
         elif name in ("callApi", "callApiRaw") and len(args) >= 2:
-            alts = alternatives(args[1])
-            if any(RAW in alt for alt in alts) and "hassio" not in source_text(self.text, args[1]):
+            path = args[1]
+            if len(path) == 1 and path[0].kind == "i" and path[0].value in self.strings:
+                alts = [[self.strings[path[0].value]]]
+            else:
+                alts = alternatives(path)
+            # `${base}/x` could be `hassio/x`: as unreadable as a bare variable.
+            unread = any(RAW in alt or "".join(alt).lstrip("/").startswith("{") for alt in alts)
+            if unread and not self.supervisor_file and "hassio" not in source_text(self.text, path):
                 return
-            self.emit(method_of(args[0]), args[1], alts, require_hassio=True)
+            self.emit(method_of(args[0]), path, alts, require_hassio=True)
         elif name == "supervisorUrl":
             self.emit("GET", args[0], alternatives(args[0]))
         elif name == "fetchHassioStats" and len(args) >= 2:
@@ -417,14 +530,55 @@ class Extractor:
 
 
 def literal_tables(toks):
-    """`const NAME = { key: "literal", … }` at any depth, by name."""
+    """`NAME = { … }` at any depth, by name, as object_entries. A name bound to
+    two objects maps to None: which one a lookup reads is not knowable here."""
     pairs, tables = matching(toks), {}
     for i in range(len(toks) - 3):
         if toks[i].kind == "i" and toks[i + 1].is_p("=") and toks[i + 2].is_p("{") and (i + 2) in pairs:
-            values = object_keys(toks[i + 3 : pairs[i + 2]]).values()
-            if values and all(v and len(v) == 1 and v[0].kind == "s" for v in values):
-                tables[toks[i].value] = [v[0].value for v in values]
+            name = toks[i].value
+            tables[name] = None if name in tables else object_entries(toks[i + 3 : pairs[i + 2]])
     return tables
+
+
+def string_constants(toks):
+    """`const NAME = "literal"` that nothing else in the file can rebind.
+
+    A second declaration, or the name as a parameter, key or assignment target
+    (`name:`, `name =`, `name =>`, `name) =>`, `name?`), could shadow it at the call site,
+    so such a name stays unresolved."""
+    decls, rebound = {}, set()
+    for i, tok in enumerate(toks):
+        if tok.kind != "i":
+            continue
+        prev = toks[i - 1] if i else None
+        nxt = toks[i + 1] if i + 1 < len(toks) else None
+        if prev is not None and prev.kind == "i" and prev.value in ("const", "let", "var"):
+            after = toks[i + 3] if i + 3 < len(toks) else None
+            ends = after is None or after.kind != "p" or after.value in (";", ",", "}")
+            literal = (
+                prev.value == "const"
+                and nxt is not None
+                and nxt.is_p("=")
+                and i + 2 < len(toks)
+                and toks[i + 2].kind == "s"
+                and ends
+            )
+            decls.setdefault(tok.value, []).append(toks[i + 2].value if literal else None)
+        elif nxt is not None and nxt.kind == "p" and nxt.value in (":", "=", "=>", "?", ")"):
+            if nxt.value != ")" or (i + 2 < len(toks) and toks[i + 2].is_p("=>")):
+                rebound.add(tok.value)
+    return {
+        name: values[0]
+        for name, values in decls.items()
+        if len(values) == 1 and values[0] is not None and name not in rebound
+    }
+
+
+def extract(text, where):
+    toks, _ = lex(text)
+    extractor = Extractor(text, where, literal_tables(toks), string_constants(toks))
+    extractor.walk(toks)
+    return extractor.found
 
 
 def main() -> int:
@@ -438,11 +592,9 @@ def main() -> int:
         if not any(t in text for t in TRIGGERS):
             continue
         where = str(path.relative_to(root))
-        toks, _ = lex(text)
-        extractor = Extractor(text, where, literal_tables(toks))
-        extractor.walk(toks)
-        endpoints += extractor.found
-        if '"supervisor/api"' in text and not extractor.found:
+        found = extract(text, where)
+        endpoints += found
+        if '"supervisor/api"' in text and not found:
             silent.append(where)
 
     # A module that builds `supervisor/api` requests but yielded none means the
