@@ -15,7 +15,7 @@ import inspect
 import json
 from importlib.metadata import version
 
-MODULES = ["root", "homeassistant", "supervisor", "os", "host", "addons", "network", "mounts"]
+MODULES = ["root", "homeassistant", "supervisor", "os", "host", "addons", "network", "mounts", "ingress"]
 
 out = {}
 for name in MODULES:
