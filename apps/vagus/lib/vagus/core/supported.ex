@@ -76,10 +76,15 @@ defmodule Vagus.Core.Supported do
       else: :ok
   end
 
-  @doc "Whether `feed` is being withheld from `installed`."
+  @doc """
+  Whether `feed` is being withheld from `installed`. Only a feed above both
+  the ceiling and the installed version is held: an upstream rollback below
+  the ceiling must dismiss the notice, not claim an older release is held.
+  """
   @spec held?(String.t() | nil, String.t() | nil) :: boolean()
-  def held?(installed, feed),
-    do: is_binary(feed) and feed != installed and latest(installed, feed) != feed
+  def held?(installed, feed) do
+    enforce?() and is_binary(feed) and newer?(feed) and above_installed?(feed, installed)
+  end
 
   @spec warn_if_unenforced() :: :ok
   def warn_if_unenforced do
@@ -91,6 +96,15 @@ defmodule Vagus.Core.Supported do
     end
 
     :ok
+  end
+
+  defp above_installed?(feed, installed) do
+    with {:ok, f} <- parse(feed),
+         {:ok, i} <- parse(installed) do
+      Version.compare(f, i) == :gt
+    else
+      :error -> feed != installed
+    end
   end
 
   defp below?(v) do

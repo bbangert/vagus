@@ -68,6 +68,25 @@ defmodule Vagus.Core.SupportedTest do
     end
   end
 
+  describe "held?/2" do
+    test "needs a feed above the ceiling and above the installed version" do
+      assert Supported.held?("2026.10.0", "2026.12.1")
+      assert Supported.held?(@ceiling, "2026.12.1")
+      assert Supported.held?(nil, "2026.12.1")
+    end
+
+    test "an upstream rollback below the ceiling is not held" do
+      refute Supported.held?(@ceiling, "2026.10.2")
+      refute Supported.held?("2026.12.0", "2026.10.2")
+      refute Supported.held?("2026.10.0", "2026.10.2")
+    end
+
+    test "a feed at or below the installed version is not held" do
+      refute Supported.held?("2026.12.1", "2026.12.1")
+      refute Supported.held?("2027.1.0", "2026.12.1")
+    end
+  end
+
   describe "permit/2" do
     test "refuses a target above the ceiling" do
       assert Supported.permit("2026.12.0", "2026.10.0") ==

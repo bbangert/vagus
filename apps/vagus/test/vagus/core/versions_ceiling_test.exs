@@ -115,6 +115,17 @@ defmodule Vagus.Core.VersionsCeilingTest do
       refute_receive {:notify, _}
     end
 
+    test "a rollback below the ceiling dismisses even when installed is at the ceiling" do
+      ctx = start_versions(@above, installed: @ceiling)
+      Versions.latest(ctx.server)
+      assert_receive {:notify, {:hold, @above}}
+
+      settled(ctx.server)
+      new_feed(ctx, "2026.10.2")
+      Versions.latest(ctx.server)
+      assert_receive {:notify, :dismiss}
+    end
+
     test "is dismissed once Core reaches the feed version" do
       ctx = start_versions(@above, installed: "2026.10.0")
       Versions.latest(ctx.server)
