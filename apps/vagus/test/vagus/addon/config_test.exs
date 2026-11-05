@@ -307,9 +307,17 @@ defmodule Vagus.Addon.ConfigTest do
   end
 
   describe "reserved slugs" do
-    test "the synthetic panel's slug is rejected by parse/1" do
+    test "the panel's slug is rejected by parse/1" do
       assert {:error, msg} = Config.parse(%{@required | "slug" => "vagus"})
       assert msg =~ "reserved"
+    end
+
+    test "reserved: :allow accepts it, and nothing else parses differently" do
+      assert {:ok, %Config{slug: "vagus"}} =
+               Config.parse(%{@required | "slug" => "vagus"}, reserved: :allow)
+
+      assert Config.parse(@required, reserved: :allow) == Config.parse(@required)
+      assert {:error, _} = Config.parse(%{@required | "slug" => "a b"}, reserved: :allow)
     end
 
     # `Vagus.Addon.Config` can't reference `Vagus.API.AdminPanel` (that would
