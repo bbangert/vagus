@@ -111,5 +111,15 @@
       "Vagus.API.CoreProxy.WSBridge monitors processes from its callbacks and also terminates them on purpose, without demonitoring first. The {:DOWN, ...} for a death this server caused is delivered like any other — into the clause written for crashes, which may restart, reconnect or log what was a deliberate stop.",
     reason:
       "False positive: the two are different processes. The only Process.monitor/1 in the bridge is on a dispatch task (dispatch/3), and the bridge never stops, exits or kills a task. The only process it terminates is Upstream (GenServer.stop/3 in terminate/2), which it links and does not monitor, and after terminate/2 no message is handled. The {:DOWN, ...} clause looks the monitor reference up among its dispatches, so any other DOWN falls through to {:ok, state} (test \"a result for a call this socket never made is dropped\")."
+  },
+  %{
+    analysis: "startup",
+    file: "lib/vagus/core/supervisor.ex",
+    title: "Child starts before its dependency",
+    at_label: "supervision tree defined here",
+    detail:
+      "Vagus.Core.Versions starts before Vagus.Core.Client under Vagus.Core.Supervisor, yet depends on it. During startup, Vagus.Core.Versions can run while Vagus.Core.Client is not yet alive — calls into it fail until the tree finishes booting.",
+    reason:
+      "Versions reaches Client only to post or dismiss the held-update notification, from a one-shot process spawned after an upstream fetch succeeds, never from init/1. Vagus.Core.Notification turns a missing Client (:noproc exit) into {:error, _} and Versions retries at its next latest/update_available? call. Ordering Versions after Client would only couple it to Client's restarts under :rest_for_one, dropping its cache and in-flight callers for no gain."
   }
 ]

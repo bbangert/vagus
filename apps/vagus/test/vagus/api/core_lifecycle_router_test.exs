@@ -773,4 +773,106 @@ defmodule Vagus.API.CoreLifecycleRouterTest do
       assert data["ssl"] == true
     end
   end
+
+  ## -- the supported-Core ceiling ----------------------------------------------
+
+  describe "the supported-Core ceiling" do
+    @ceiling Vagus.Core.Supported.version()
+
+    defp versions_with(installed, feed) do
+      name = :"core_versions_ceiling_rt_#{System.unique_integer([:positive])}"
+      path = Path.join(System.tmp_dir!(), "#{name}.json")
+
+      start_supervised!(%{
+        id: name,
+        start:
+          {Versions, :start_link,
+           [[name: name, path: path, fetch: fn -> {:ok, feed} end, notify: fn _ -> :ok end]]}
+      })
+
+      if installed, do: :ok = Versions.set_installed(installed, name)
+      prev_server = Application.get_env(:vagus, :core_versions_server)
+      Application.put_env(:vagus, :core_versions_server, name)
+
+      on_exit(fn ->
+        if prev_server,
+          do: Application.put_env(:vagus, :core_versions_server, prev_server),
+          else: Application.delete_env(:vagus, :core_versions_server)
+
+        File.rm(path)
+      end)
+    end
+
+    defp core_info do
+      conn(:get, "/core/info") |> authed() |> call() |> json_body() |> Map.fetch!("data")
+    end
+
+    for {installed, feed, latest, available?} <- [
+          {"2026.10.0", "2026.12.1", @ceiling, true},
+          {"2026.10.0", "2026.10.2", "2026.10.2", true},
+          {nil, "2026.12.1", @ceiling, false},
+          {@ceiling, "2026.12.1", @ceiling, false},
+          {@ceiling, @ceiling, @ceiling, false},
+          {"2026.12.0", "2027.1.0", "2026.12.0", false}
+        ] do
+      test "GET /core/info: installed #{inspect(installed)}, feed #{feed} -> version_latest #{latest}" do
+        versions_with(unquote(installed), unquote(feed))
+
+        assert %{"version_latest" => unquote(latest), "update_available" => unquote(available?)} =
+                 core_info()
+      end
+    end
+
+    for path <- ["/core/update", "/homeassistant/update"] do
+      test "POST #{path} above the ceiling -> 400 naming both versions, Lifecycle untouched" do
+        versions_with("2026.10.0", "2026.12.1")
+
+        for body <- [
+              %{"version" => "2026.12.0"},
+              %{"version" => "2026.12.0", "background" => true}
+            ] do
+          conn = post_(unquote(path), body)
+
+          assert conn.status == 400
+
+          assert json_body(conn)["message"] ==
+                   "Home Assistant Core 2026.12.0 is newer than this Vagus release was " <>
+                     "validated against (#{@ceiling}); update Vagus first"
+        end
+
+        refute_received {:core_lifecycle_call, :update, _opts}
+      end
+    end
+
+    test "POST /core/update to the ceiling, a downgrade, or the installed version reaches Lifecycle" do
+      versions_with("2026.12.0", "2027.1.0")
+
+      for version <- [@ceiling, "2026.9.0", "2026.12.0"] do
+        conn = post_("/core/update", %{"version" => version})
+        assert conn.status == 200
+        assert_received {:core_lifecycle_call, :update, opts}
+        assert Keyword.get(opts, :version) == version
+      end
+    end
+
+    test "Lifecycle's own refusal maps to the same 400" do
+      versions_with("2026.10.0", "2026.12.1")
+      stub_response(:update, {:error, {:unsupported_core, "2026.12.1", @ceiling}})
+
+      conn = post_("/core/update", %{})
+
+      assert conn.status == 400
+      assert json_body(conn)["message"] =~ "Home Assistant Core 2026.12.1 is newer than"
+    end
+
+    test "enforce: false lets it through and offers the raw feed" do
+      Application.put_env(:vagus, Vagus.Core.Supported, enforce: false)
+      on_exit(fn -> Application.delete_env(:vagus, Vagus.Core.Supported) end)
+      versions_with("2026.10.0", "2026.12.1")
+
+      assert %{"version_latest" => "2026.12.1", "update_available" => true} = core_info()
+      assert post_("/core/update", %{"version" => "2026.12.0"}).status == 200
+      assert_received {:core_lifecycle_call, :update, _opts}
+    end
+  end
 end

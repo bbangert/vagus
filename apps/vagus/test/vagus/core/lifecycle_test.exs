@@ -1099,6 +1099,62 @@ defmodule Vagus.Core.LifecycleTest do
     end
   end
 
+  describe "update/2 against the supported-Core ceiling" do
+    @ceiling Vagus.Core.Supported.version()
+
+    defp start_versions_with_feed(installed, feed) do
+      name = :"lifecycle_versions_#{unique()}"
+      path = Path.join(System.tmp_dir!(), "#{name}.json")
+      on_exit(fn -> File.rm(path) end)
+
+      start_supervised!(%{
+        id: name,
+        start:
+          {Versions, :start_link,
+           [[name: name, path: path, fetch: fn -> {:ok, feed} end, notify: fn _ -> :ok end]]}
+      })
+
+      :ok = Versions.set_installed(installed, name)
+      name
+    end
+
+    test "a target above the ceiling is refused before any engine call" do
+      {fake, opts} = engine(core("2026.10.0", :running))
+      versions = start_versions("2026.10.0")
+
+      assert Lifecycle.update("2026.12.0", opts ++ [versions: versions]) ==
+               {:error, {:unsupported_core, "2026.12.0", @ceiling}}
+
+      assert Fake.calls(fake) == []
+      assert Versions.installed(versions) == "2026.10.0"
+    end
+
+    test "the ceiling itself and a downgrade are allowed" do
+      {_fake, opts} = engine()
+      versions = start_versions("2026.10.0")
+      assert {:ok, @ceiling} = Lifecycle.update(@ceiling, opts ++ [versions: versions])
+      assert {:ok, "2026.9.0"} = Lifecycle.update("2026.9.0", opts ++ [versions: versions])
+    end
+
+    test "with no target, a feed above the ceiling resolves to the ceiling" do
+      {fake, opts} = engine()
+      versions = start_versions_with_feed("2026.10.0", "2026.12.1")
+
+      assert {:ok, @ceiling} = Lifecycle.update(nil, opts ++ [versions: versions])
+      assert {:pull, [image]} = hd(Fake.calls(fake))
+      assert image == Container.image(@ceiling)
+    end
+
+    test "enforce: false lets it through" do
+      Application.put_env(:vagus, Vagus.Core.Supported, enforce: false)
+      on_exit(fn -> Application.delete_env(:vagus, Vagus.Core.Supported) end)
+      {_fake, opts} = engine()
+
+      assert {:ok, "2026.12.0"} =
+               Lifecycle.update("2026.12.0", opts ++ [versions: start_versions("2026.10.0")])
+    end
+  end
+
   ## Serialization
 
   describe "the single non-blocking lock" do

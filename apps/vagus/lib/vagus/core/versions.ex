@@ -82,6 +82,22 @@ defmodule Vagus.Core.Versions do
   `in_flight` — they always reply immediately regardless of what `latest`
   is doing.
 
+  ## The supported-Core ceiling
+
+  `latest/1` and `update_available?/1` answer with what Vagus offers, not
+  what upstream serves: `Vagus.Core.Supported.latest/2` clamps the feed to
+  the newest Core this release was validated against. `feed/1` is the raw
+  upstream value.
+
+  While the feed is held back, Home Assistant shows one persistent
+  notification (`vagus_core_update_held`) naming both versions; it is
+  dismissed once nothing is held. What it last showed is kept in memory and
+  starts `:unknown`, so the first known feed after a boot dismisses a notice
+  an older release left behind. It is sent from a one-shot spawned process
+  for the same reason the fetch is: Core's API may be slow or down. A send
+  that fails, or a change that lands while one is in flight, is caught up at
+  the next `latest`/`update_available?` call (Core polls `/core/info`).
+
   ## Options (all injectable)
 
     * `:name` - GenServer name, defaults to `__MODULE__`.
@@ -96,17 +112,23 @@ defmodule Vagus.Core.Versions do
       never blocks the server loop" above). Defaults to a Finch GET
       through the `Vagus.Core.Finch` pool with a 10s receive timeout.
       Tests inject a stub so `latest/1` never makes a real HTTP call.
+    * `:notify` - one-arity function raising (`{:hold, feed}`) or
+      dismissing (`:dismiss`) the held-update notification, returning `:ok`
+      on delivery. Defaults to `Vagus.Core.Notification` through Core.
   """
 
   use GenServer
 
   require Logger
 
+  alias Vagus.Core.{Notification, Supported}
+
   @default_finch Vagus.Core.Finch
   @stable_url "https://version.home-assistant.io/stable.json"
   @fetch_receive_timeout 10_000
   @cache_ttl_ms 24 * 60 * 60 * 1_000
   @default_machine_key "default"
+  @notification_id "vagus_core_update_held"
 
   # G2 audit: `installed/1`/`latest/1`/`update_available?/1` are ordinary
   # `GenServer.call/3`s, whose default 5s timeout is SHORTER than
@@ -158,16 +180,23 @@ defmodule Vagus.Core.Versions do
   end
 
   @doc """
-  Returns the latest upstream HA Core version, using a 24h in-memory cache.
-  `nil` if never successfully fetched (fresh start + offline, or an
-  unrecognized upstream response shape).
+  The Core version Vagus offers: the upstream feed (24h in-memory cache)
+  clamped by `Vagus.Core.Supported.latest/2`. `nil` if the feed was never
+  successfully fetched (fresh start + offline, or an unrecognized upstream
+  response shape).
   """
   @spec latest(GenServer.server()) :: String.t() | nil
   def latest(server \\ __MODULE__) do
     GenServer.call(server, :latest, @call_timeout)
   end
 
-  @doc "`true` iff both an installed and a latest version are known and they differ."
+  @doc "The unclamped upstream feed value, from the same cache as `latest/1`."
+  @spec feed(GenServer.server()) :: String.t() | nil
+  def feed(server \\ __MODULE__) do
+    GenServer.call(server, :feed, @call_timeout)
+  end
+
+  @doc "`true` iff both an installed and a `latest/1` version are known and they differ."
   @spec update_available?(GenServer.server()) :: boolean()
   def update_available?(server \\ __MODULE__) do
     GenServer.call(server, :update_available?, @call_timeout)
@@ -193,24 +222,42 @@ defmodule Vagus.Core.Versions do
     GenServer.cast(server, :invalidate)
   end
 
+  @doc "The persistent notification Home Assistant shows while `feed` is held back."
+  @spec notification(String.t()) :: map()
+  def notification(feed) do
+    %{
+      "notification_id" => @notification_id,
+      "title" => "Home Assistant Core update held",
+      "message" =>
+        "Home Assistant Core #{feed} is available; this Vagus release supports up to " <>
+          "#{Supported.version()}. It will be offered after the next Vagus update."
+    }
+  end
+
   ## GenServer callbacks
 
   @impl GenServer
   def init(opts) do
     path = Keyword.get(opts, :path, versions_path())
+    Supported.warn_if_unenforced()
 
     state = %{
       path: path,
       installed: read_persisted_version(path),
       now: Keyword.get(opts, :now, &default_now/0),
       fetch: Keyword.get(opts, :fetch, &default_fetch/0),
+      notify: Keyword.get(opts, :notify, &default_notify/1),
       # `nil` (never fetched) or `%{value: String.t() | nil, fetched_at: integer()}`.
       latest_cache: nil,
-      # Callers queued behind an in-flight fetch: `{GenServer.from(), :latest | :update_available?}`.
+      # Callers queued behind an in-flight fetch:
+      # `{GenServer.from(), :latest | :feed | :update_available?}`.
       pending: [],
       # `nil` or `%{pid: pid(), correlation_ref: reference(), monitor_ref: reference()}`
       # for the one fetch process allowed to run at a time.
-      in_flight: nil
+      in_flight: nil,
+      # `shown`: the feed version the held notice names, `nil` for none, or
+      # `:unknown`. `sending`: `nil` or the one in-flight send.
+      notice: %{shown: :unknown, sending: nil}
     }
 
     {:ok, state}
@@ -223,7 +270,7 @@ defmodule Vagus.Core.Versions do
 
   def handle_call({:set_installed, version}, _from, state) do
     persist(state.path, version)
-    {:reply, :ok, %{state | installed: version}}
+    {:reply, :ok, reconcile_notice(%{state | installed: version})}
   end
 
   def handle_call({:seed, _version}, _from, %{installed: installed} = state)
@@ -233,20 +280,13 @@ defmodule Vagus.Core.Versions do
 
   def handle_call({:seed, version}, _from, state) do
     persist(state.path, version)
-    {:reply, :ok, %{state | installed: version}}
+    {:reply, :ok, reconcile_notice(%{state | installed: version})}
   end
 
-  def handle_call(:latest, from, state) do
+  def handle_call(kind, from, state) when kind in [:latest, :feed, :update_available?] do
     case fresh_cache_value(state) do
-      {:fresh, value} -> {:reply, value, state}
-      :stale -> {:noreply, enqueue_and_maybe_fetch(state, from, :latest)}
-    end
-  end
-
-  def handle_call(:update_available?, from, state) do
-    case fresh_cache_value(state) do
-      {:fresh, value} -> {:reply, update_available_result(state.installed, value), state}
-      :stale -> {:noreply, enqueue_and_maybe_fetch(state, from, :update_available?)}
+      {:fresh, value} -> {:reply, answer(kind, state.installed, value), reconcile_notice(state)}
+      :stale -> {:noreply, enqueue_and_maybe_fetch(state, from, kind)}
     end
   end
 
@@ -263,7 +303,7 @@ defmodule Vagus.Core.Versions do
     Process.demonitor(monitor_ref, [:flush])
     state = apply_fetch_result(state, result)
     reply_waiters(state)
-    {:noreply, %{state | pending: [], in_flight: nil}}
+    {:noreply, reconcile_notice(%{state | pending: [], in_flight: nil})}
   end
 
   def handle_info(
@@ -272,6 +312,22 @@ defmodule Vagus.Core.Versions do
       ) do
     reply_waiters(state)
     {:noreply, %{state | pending: [], in_flight: nil}}
+  end
+
+  def handle_info(
+        {:versions_notice_result, ref, result},
+        %{notice: %{sending: %{ref: ref, monitor_ref: monitor_ref, want: want}} = notice} = state
+      ) do
+    Process.demonitor(monitor_ref, [:flush])
+    shown = if result == :ok, do: want, else: notice.shown
+    {:noreply, %{state | notice: %{shown: shown, sending: nil}}}
+  end
+
+  def handle_info(
+        {:DOWN, monitor_ref, :process, _pid, _reason},
+        %{notice: %{sending: %{monitor_ref: monitor_ref}} = notice} = state
+      ) do
+    {:noreply, %{state | notice: %{notice | sending: nil}}}
   end
 
   def handle_info(msg, state) do
@@ -348,20 +404,45 @@ defmodule Vagus.Core.Versions do
   defp reply_waiters(state) do
     latest_value = cached_value_or_nil(state.latest_cache)
 
-    Enum.each(state.pending, fn
-      {from, :latest} ->
-        GenServer.reply(from, latest_value)
-
-      {from, :update_available?} ->
-        GenServer.reply(from, update_available_result(state.installed, latest_value))
+    Enum.each(state.pending, fn {from, kind} ->
+      GenServer.reply(from, answer(kind, state.installed, latest_value))
     end)
   end
 
-  # Delegates to the shared comparator so add-ons and Core can't drift apart
-  # on what "an update is available" means. Behaviour here is unchanged.
-  defp update_available_result(installed, latest_value) do
-    Vagus.Version.update_available?(installed, latest_value)
+  defp answer(:feed, _installed, feed), do: feed
+  defp answer(:latest, installed, feed), do: Supported.latest(installed, feed)
+
+  # The shared comparator, so add-ons and Core can't drift apart on what
+  # "an update is available" means.
+  defp answer(:update_available?, installed, feed),
+    do: Vagus.Version.update_available?(installed, Supported.latest(installed, feed))
+
+  ## Internals — held-update notice
+
+  defp reconcile_notice(%{notice: %{sending: sending}} = state) when sending != nil, do: state
+
+  defp reconcile_notice(%{latest_cache: %{value: feed}} = state) when is_binary(feed) do
+    want = if Supported.held?(state.installed, feed), do: feed
+
+    if want == state.notice.shown, do: state, else: send_notice(state, want)
   end
+
+  defp reconcile_notice(state), do: state
+
+  defp send_notice(state, want) do
+    ref = make_ref()
+    parent = self()
+    notify = state.notify
+    event = if want, do: {:hold, want}, else: :dismiss
+
+    {_pid, monitor_ref} =
+      spawn_monitor(fn -> send(parent, {:versions_notice_result, ref, notify.(event)}) end)
+
+    put_in(state.notice.sending, %{ref: ref, monitor_ref: monitor_ref, want: want})
+  end
+
+  defp default_notify({:hold, feed}), do: Notification.create(notification(feed))
+  defp default_notify(:dismiss), do: Notification.dismiss(@notification_id)
 
   defp cached_value_or_nil(%{value: value}), do: value
   defp cached_value_or_nil(nil), do: nil

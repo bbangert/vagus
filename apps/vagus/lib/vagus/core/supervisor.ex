@@ -20,9 +20,10 @@ defmodule Vagus.Core.Supervisor do
   its first HTTP call — though not at `Client`'s own `init/1`, since the
   token exchange is lazy. `Versions` is placed right after `Finch`, the
   first point at which its own (lazy, on-demand) upstream fetch could use
-  the pool — it has no dependency on `TokenStore` or `Client` and nothing
-  downstream depends on it either, so its exact position among the
-  Finch-dependent children doesn't matter beyond "after Finch".
+  the pool. It reaches `Client` only at runtime, to post the held-update
+  notification, and tolerates it being absent, so it does not sit after
+  `Client` (which would restart it with `Client` for nothing); nothing
+  downstream depends on it.
   `HttpConfig` sits right next to it for the same reason: its pull rides
   the socket with no credential of any kind (`Vagus.Core.Transport`'s
   implicit auth), so `Finch` is its only prerequisite too.
