@@ -614,6 +614,78 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
     end
   end
 
+  describe "POST /addons/:slug/rebuild and /stdin" do
+    setup do
+      install_app(fixture_config("core_unsup"))
+      :ok
+    end
+
+    test "rebuild of an installed app is 400 in upstream's words" do
+      conn = supervisor_call(:post, "/addons/core_unsup/rebuild", %{"force" => true})
+      assert conn.status == 400
+      assert body(conn)["message"] == "Cannot rebuild app Test Addon, it is image-based"
+    end
+
+    test "stdin to an installed app is 400 in upstream's words" do
+      conn = supervisor_call(:post, "/addons/core_unsup/stdin")
+      assert conn.status == 400
+      assert body(conn)["message"] == "App core_unsup does not support writing to stdin"
+    end
+
+    test "a never-installed slug is a 404" do
+      for verb <- ~w(rebuild stdin) do
+        conn = supervisor_call(:post, "/addons/never_installed/#{verb}")
+        assert conn.status == 404
+        assert body(conn)["message"] == "Addon never_installed does not exist"
+      end
+    end
+
+    test "an add-on caller is refused with 403, for another slug or its own" do
+      for verb <- ~w(rebuild stdin), slug <- ~w(core_unsup self) do
+        assert addon_call(:post, "/addons/#{slug}/#{verb}", "core_unsup").status == 403
+      end
+    end
+  end
+
+  describe "GET /store/addons/:slug/availability" do
+    test "an app that can run here is 200 with empty data" do
+      seed_store("core_avail", fixture_config("avail"))
+
+      conn = supervisor_call(:get, "/store/addons/core_avail/availability")
+      assert conn.status == 200
+      assert body(conn) == %{"result" => "ok", "data" => %{}}
+    end
+
+    test "an app that cannot is 400 with the install gate's reason" do
+      {:ok, config} =
+        Config.parse(%{
+          "name" => "x86 Only",
+          "version" => "1",
+          "slug" => "x86avail",
+          "description" => "d",
+          "arch" => ["amd64"]
+        })
+
+      seed_store("core_x86avail", config)
+
+      conn = supervisor_call(:get, "/store/addons/core_x86avail/availability")
+      assert conn.status == 400
+      assert body(conn)["message"] =~ "not supported on this platform"
+      assert body(conn)["message"] =~ "amd64"
+    end
+
+    test "a slug the store does not list is a 404" do
+      conn = supervisor_call(:get, "/store/addons/never_listed/availability")
+      assert conn.status == 404
+      assert body(conn)["message"] == "Addon never_listed does not exist in the store"
+    end
+
+    test "an add-on caller is refused with 403" do
+      seed_store("core_avail2", fixture_config("avail2"))
+      assert addon_call(:get, "/store/addons/core_avail2/availability", "other").status == 403
+    end
+  end
+
   describe "POST /addons/:slug/options" do
     setup do
       config = fixture_config("opts") |> Map.put(:slug, "core_opts")

@@ -181,9 +181,10 @@ defmodule Vagus.API.Tiers do
     #
     # Enumerated, an `/addons/self/X` nobody thought about falls through to
     # `["addons", :_, :+]` ⇒ `:manager` — closed, the same invariant every
-    # other row keeps. Upstream serves more of these than Vagus does
-    # (`rebuild`, `stdin`, …); when a route for one lands, add it here
-    # deliberately rather than discovering it was already open.
+    # other row keeps. Upstream bypasses more of these than Vagus does
+    # (`rebuild` and `stdin` are routed but supervisor-only, below); when a
+    # route for another lands, add it here deliberately rather than
+    # discovering it was already open.
     {["addons", "self", "info"], :bypass},
     {["addons", "self", "options"], :bypass},
     {["addons", "self", "logs"], :bypass},
@@ -234,6 +235,7 @@ defmodule Vagus.API.Tiers do
     {["host", "disks", "default", "usage"], :supervisor},
     {["store", "addons", :_, "changelog"], :supervisor},
     {["store", "addons", :_, "documentation"], :supervisor},
+    {["store", "addons", :_, "availability"], :supervisor},
     {["store", "addons", :_, "install"], :supervisor},
     {["store", "addons", :_, "update", :*], :supervisor},
     {["addons", :_, "changelog"], :supervisor},
@@ -249,6 +251,8 @@ defmodule Vagus.API.Tiers do
     {["addons", :_, "stop"], :supervisor},
     {["addons", :_, "restart"], :supervisor},
     {["addons", :_, "uninstall"], :supervisor},
+    {["addons", :_, "rebuild"], :supervisor},
+    {["addons", :_, "stdin"], :supervisor},
     {["addons", :_, "options"], :supervisor},
     {["core", "start"], :supervisor},
     {["core", "stop"], :supervisor},
