@@ -26,17 +26,8 @@ defmodule Vagus.API.ClientEndpointsRouteTest do
   defp concrete(path) do
     path
     |> String.split("/", trim: true)
-    |> Enum.map(&Map.get(@placeholders, &1, &1))
+    |> Enum.map_join("/", &Map.get(@placeholders, &1, &1))
   end
-
-  defp matches?(pattern, segments),
-    do: segments_match?(String.split(pattern, "/", trim: true), segments)
-
-  defp segments_match?([], []), do: true
-  defp segments_match?(["*" <> _glob], _rest), do: true
-  defp segments_match?([":" <> _param | pattern], [_ | rest]), do: segments_match?(pattern, rest)
-  defp segments_match?([same | pattern], [same | rest]), do: segments_match?(pattern, rest)
-  defp segments_match?(_pattern, _segments), do: false
 
   test "the fixture lists each client's endpoints" do
     assert Map.keys(@endpoints) |> Enum.sort() == ~w(addons ingress store)
@@ -49,9 +40,7 @@ defmodule Vagus.API.ClientEndpointsRouteTest do
     unrouted =
       for {_client, endpoints} <- @endpoints,
           [method, path] <- endpoints,
-          not Enum.any?(routes, fn {verb, pattern} ->
-            verb == method and matches?(pattern, concrete(path))
-          end),
+          not RouterRoutes.routed?(routes, method, concrete(path)),
           do: "#{method} #{path}"
 
     assert unrouted == [], "client endpoints with no route: #{inspect(unrouted)}"

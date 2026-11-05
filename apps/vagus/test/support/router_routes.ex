@@ -72,6 +72,22 @@ defmodule Vagus.RouterRoutes do
     :ok
   end
 
+  @doc "Whether some `{method, pattern}` in `routes` serves the concrete `path`."
+  @spec routed?([{String.t(), String.t()}], String.t(), String.t()) :: boolean()
+  def routed?(routes, method, path) do
+    segments = String.split(path, "/", trim: true)
+
+    Enum.any?(routes, fn {verb, pattern} ->
+      verb == method and segments_match?(String.split(pattern, "/", trim: true), segments)
+    end)
+  end
+
+  defp segments_match?([], []), do: true
+  defp segments_match?(["*" <> _glob], _rest), do: true
+  defp segments_match?([":" <> _param | pattern], [_ | rest]), do: segments_match?(pattern, rest)
+  defp segments_match?([same | pattern], [same | rest]), do: segments_match?(pattern, rest)
+  defp segments_match?(_pattern, _segments), do: false
+
   @doc "`{method, pattern, path}` with every `:param` filled in."
   @spec instances() :: [{String.t(), String.t(), String.t()}]
   def instances do
