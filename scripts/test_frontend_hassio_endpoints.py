@@ -1,6 +1,7 @@
 """The extractor backs a drift guard, so anything it cannot resolve must come
-out as a raw entry. Each case runs a snippet and the same snippet mutated the
-way that once left the output unchanged, and asserts the output now moves."""
+out as a raw entry carrying its source. Each case runs a snippet and the same
+snippet mutated the way that once left the output unchanged, and asserts the
+output now moves."""
 
 import sys
 import unittest
@@ -34,16 +35,21 @@ def resolved(found):
     return {(e["method"], e["path"]) for e in found if not e.get("raw")}
 
 
-class SpreadTest(unittest.TestCase):
+class Case(unittest.TestCase):
+    def assertMoves(self, base, mutated):
+        self.assertNotEqual(run(base), run(mutated))
+
+
+class SpreadTest(Case):
     def test_spread_in_table_is_raw(self):
         before = run(COLLECTION % ("", "supervisorCollection[key]"))
         after = run(COLLECTION % ("\n  ...extra,", "supervisorCollection[key]"))
         self.assertEqual(resolved(before), {("GET", "/host/info"), ("GET", "/store")})
         self.assertEqual(raws(before), [])
-        self.assertEqual(resolved(after), resolved(before))
+        self.assertEqual(resolved(after), set())
         [raw] = raws(after)
-        self.assertIn("...extra", raw["reason"])
         self.assertIn("supervisorCollection", raw["reason"])
+        self.assertIn("...extra", raw["source_text"])
 
     def test_spread_request_at_call_site_is_raw(self):
         base = 'supervisorApiWsRequest(conn, { endpoint: "/host/info" });\n'
@@ -52,15 +58,17 @@ class SpreadTest(unittest.TestCase):
         self.assertEqual(resolved(after), resolved(before))
         self.assertEqual(raws(before), [])
         [raw] = raws(after)
-        self.assertEqual((raw["method"], raw["path"]), ("UNKNOWN", "...request"))
-        self.assertIn("call site", raw["reason"])
+        self.assertEqual(raw["method"], "UNKNOWN")
+        self.assertIn("`request`", raw["reason"])
+        self.assertEqual(raw["source_text"], "supervisorApiWsRequest(conn, {...request})")
 
     def test_spread_into_base_command_declaration_is_raw(self):
         before = run('const base = { type: "supervisor/api", method: "GET" };\n')
         after = run('const base = { type: "supervisor/api", ...defaults };\n')
         self.assertEqual(before, [])
         [raw] = raws(after)
-        self.assertIn("base command `base`", raw["reason"])
+        self.assertIn("`defaults`", raw["reason"])
+        self.assertIn("...defaults", raw["source_text"])
 
     def test_spread_of_known_base_command_is_resolved(self):
         found = run(
@@ -79,13 +87,15 @@ class SpreadTest(unittest.TestCase):
         self.assertEqual(raws(found), [])
 
 
-class ShorthandMethodTest(unittest.TestCase):
-    def test_shorthand_method_is_unknown(self):
+class ShorthandMethodTest(Case):
+    def test_shorthand_method_is_not_the_default(self):
         before = run('supervisorApiCall(hass, "/store");\n')
-        after = run('const method = "post"; supervisorApiCall(hass, "/store", { method });\n')
+        const = run('const method = "post"; supervisorApiCall(hass, "/store", { method });\n')
+        param = run('const f = (method) => supervisorApiCall(hass, "/store", { method });\n')
         self.assertEqual(resolved(before), {("GET", "/store")})
-        self.assertEqual(resolved(after), set())
-        [raw] = raws(after)
+        self.assertEqual(resolved(const), {("POST", "/store")})
+        self.assertEqual(resolved(param), set())
+        [raw] = raws(param)
         self.assertEqual((raw["method"], raw["path"]), ("UNKNOWN", '"/store"'))
 
     def test_shorthand_method_in_request_object_is_unknown(self):
@@ -94,7 +104,7 @@ class ShorthandMethodTest(unittest.TestCase):
         self.assertEqual(raws(found)[0]["method"], "UNKNOWN")
 
 
-class TableLookupTest(unittest.TestCase):
+class TableLookupTest(Case):
     def test_lookup_must_be_the_whole_expression(self):
         before = run(COLLECTION % ("", "supervisorCollection[key]"))
         after = run(COLLECTION % ("", 'supervisorCollection[key] + "/unrouted"'))
@@ -104,7 +114,7 @@ class TableLookupTest(unittest.TestCase):
         self.assertEqual(raw["path"], 'supervisorCollection[key] + "/unrouted"')
 
 
-class UnresolvedHttpPathTest(unittest.TestCase):
+class UnresolvedHttpPathTest(Case):
     BASE = 'supervisorApiCall(hass, "/store");\n'
 
     def test_const_path_is_resolved(self):
@@ -147,6 +157,48 @@ class UnresolvedHttpPathTest(unittest.TestCase):
 
     def test_unrelated_file_still_ignored(self):
         self.assertEqual(extract('api.callApi("GET", url);\n', "src/data/other.ts"), [])
+
+
+class UnlistedSyntaxTest(Case):
+    """Copilot's second round: each construct is outside the whitelist."""
+
+    def test_computed_member_in_table_is_raw(self):
+        base = COLLECTION % ("", "supervisorCollection[key]")
+        mutated = COLLECTION % ('\n  [newKey]: "/addons/unserved",', "supervisorCollection[key]")
+        self.assertMoves(base, mutated)
+        self.assertEqual(resolved(run(mutated)), set())
+        [raw] = raws(run(mutated))
+        self.assertIn('[newKey]: "/addons/unserved"', raw["source_text"])
+
+    def test_nested_spread_is_raw(self):
+        base = 'supervisorApiWsRequest(conn, { endpoint: "/host/info" });\n'
+        for spread in ("...{...request}", "...(flag ? {} : {...request})"):
+            mutated = 'supervisorApiWsRequest(conn, { endpoint: "/host/info", %s });\n' % spread
+            self.assertMoves(base, mutated)
+            self.assertEqual(resolved(run(mutated)), set())
+            self.assertIn(spread, raws(run(mutated))[0]["source_text"])
+
+    HELPER = """
+export const supervisorApiCall = async <T>(hass, endpoint: string, options?) =>
+  hass.callWS<T>({
+    type: "supervisor/api",
+    endpoint,
+    method: options?.method || %s,
+  });
+"""
+
+    def test_helper_default_verb_is_in_the_output(self):
+        self.assertMoves(self.HELPER % '"get"', self.HELPER % '"post"')
+        [raw] = raws(run(self.HELPER % '"post"'))
+        self.assertIn('options?.method || "post"', raw["source_text"])
+
+    def test_raw_source_text_tracks_its_expression(self):
+        snippet = 'callWS({ type: "supervisor/api", endpoint: ep, method: "get", data: %s });\n'
+        [before] = run(snippet % "a")
+        [after] = run(snippet % "b")
+        self.assertTrue(before["raw"])
+        self.assertEqual({k: v for k, v in before.items() if k != "source_text"}, {k: v for k, v in after.items() if k != "source_text"})
+        self.assertNotEqual(before["source_text"], after["source_text"])
 
 
 if __name__ == "__main__":
