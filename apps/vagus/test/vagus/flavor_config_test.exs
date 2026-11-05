@@ -75,7 +75,7 @@ defmodule Vagus.FlavorConfigTest do
     assert vagus[:orchestrator_app] == "agent_orchestrator"
     assert vagus[:memory_app] == "agent_memory"
     assert vagus[:protected_apps] == ["agent_orchestrator", "agent_memory", "vagus_memory"]
-    assert vagus[:native_addon_slugs] == ["core_mqtt", "vagus_memory"]
+    assert vagus[:native_addon_slugs] == ["core_mqtt", "vagus", "vagus_memory"]
 
     refute "vagus" in vagus[Vagus.App.Orchestrator][:default_apps]
 

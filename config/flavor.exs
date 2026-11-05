@@ -31,9 +31,10 @@ if flavor == :agent_dev_board do
   config :vagus, :orchestrator_app, "agent_orchestrator"
   config :vagus, :memory_app, "agent_memory"
   config :vagus, :protected_apps, ["agent_orchestrator", "agent_memory", "vagus_memory"]
-  # No `vagus` here or in `default_apps`: the panel is an ingress app for
-  # Core's UI, and this flavor installs none, so nothing needs it native.
-  config :vagus, :native_addon_slugs, ["core_mqtt", "vagus_memory"]
+  # The panel is an ingress app for Core's UI, so this flavor does not
+  # install it, but a board converted from the stock flavor keeps its
+  # installed one, which runs only natively.
+  config :vagus, :native_addon_slugs, ["core_mqtt", "vagus", "vagus_memory"]
 
   config :vagus, Vagus.App.Orchestrator,
     default_apps: ["core_mqtt", "agent_memory", "vagus_memory", "agent_orchestrator"]
