@@ -7,8 +7,10 @@ defmodule Vagus.API.FrontendEndpointsRouteTest do
   untyped `supervisor/api` WS proxy and `/api/hassio/<path>` view, so
   `Vagus.API.ClientEndpointsRouteTest` cannot see it. The list is extracted
   from the frontend's source at the tag Core pins, by
-  `scripts/frontend-hassio-endpoints.sh`; `core-contract-drift.yml` fails when
-  Core moves to a frontend whose list differs.
+  `scripts/frontend-hassio-endpoints.sh`, which also pins the SHA-256 of every
+  source file that can reach the Supervisor. `core-contract-drift.yml` fails
+  when Core moves to a frontend where any of those files, or the list, differs:
+  the hashes fail closed where the extractor cannot read a construct.
   """
 
   use ExUnit.Case, async: true
@@ -62,6 +64,9 @@ defmodule Vagus.API.FrontendEndpointsRouteTest do
     "src/data/hassio/supervisor.ts" =>
       {6,
        "log URLs whose first segment `provider` picks at runtime (`addons/<slug>`, core, supervisor, host); every family's /logs, /logs/follow and /logs/boots/:bootid routes are served"},
+    "src/data/config_flow.ts" =>
+      {1,
+       "`config/config_entries/flow_handlers` with an optional `?type=`; Core's own API, not a `hassio/` path"},
     "src/data/hassio/common.ts" =>
       {1, "fetchHassioStats's own body; its callers are extracted as <prefix>/stats"},
     "src/data/supervisor/common.ts" =>
@@ -69,7 +74,7 @@ defmodule Vagus.API.FrontendEndpointsRouteTest do
        "supervisorApiCall's own body (`options?.method || \"get\"`); its callers are extracted, a missing method as GET"},
     "src/data/supervisor/supervisor.ts" =>
       {2,
-       "getSupervisorEventCollection's endpoint argument, which nothing calls; supervisorApiWsRequest's own body (`...request`), whose callers are extracted"}
+       "getSupervisorEventCollection's endpoint parameter, whose callers are extracted (none at this tag); supervisorApiWsRequest's own body (`...request`), whose callers are extracted"}
   }
 
   defp concrete(path) do
@@ -80,6 +85,20 @@ defmodule Vagus.API.FrontendEndpointsRouteTest do
 
   test "the fixture is the frontend its name says" do
     assert @fixture["_frontend"] == ContractFixture.frontend_tag()
+  end
+
+  test "every endpoint was read from a pinned source" do
+    sources = @fixture["sources"]
+    assert is_map(sources) and map_size(sources) > 0
+
+    unpinned =
+      @endpoints
+      |> Enum.map(& &1["source"])
+      |> Enum.uniq()
+      |> Enum.reject(&Map.has_key?(sources, &1))
+
+    assert unpinned == [],
+           "endpoints read from files the fixture does not hash: #{inspect(unpinned)}"
   end
 
   test "every endpoint the frontend can call is routed" do

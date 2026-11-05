@@ -68,12 +68,15 @@ jobs:
           [ -n "$tag" ] || { echo "::error::could not resolve the frontend pinned by Core $CORE_VERSION"; exit 1; }
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
-      # The diff below is only as good as the extractor: these pin that what it
-      # cannot resolve surfaces as a raw entry instead of vanishing.
+      # The endpoint diff is only as good as the extractor: these pin that what
+      # it cannot resolve surfaces as a raw entry instead of vanishing.
       - name: Test the frontend endpoint extractor
         run: python3 -I scripts/test_frontend_hassio_endpoints.py
 
-      - name: Diff the frontend's Supervisor endpoints against the pinned fixture
+      # `sources` fails closed: no lexer reads every way TypeScript can build a
+      # request, so any change to a file that can reach the Supervisor (or to
+      # which files can) is drift. `endpoints` says what a reviewer should read.
+      - name: Diff the frontend's Supervisor sources and endpoints against the pinned fixture
         env:
           FRONTEND_TAG: ${{ steps.frontend.outputs.tag }}
         run: |
@@ -83,10 +86,16 @@ jobs:
 
           ./scripts/frontend-hassio-endpoints.sh "$FRONTEND_TAG" > /tmp/frontend.json
 
-          # Endpoints only: a frontend release that calls nothing new is not drift.
-          if diff <(jq -S '.endpoints' "$fixture") <(jq -S '.endpoints' /tmp/frontend.json); then
-            echo "no drift: frontend $FRONTEND_TAG calls the same Supervisor endpoints as $pinned_tag"
+          drift=0
+          echo "sources (sha256 path):"
+          diff <(jq -r '.sources | to_entries[] | "\(.value) \(.key)"' "$fixture" | sort -k2) \
+               <(jq -r '.sources | to_entries[] | "\(.value) \(.key)"' /tmp/frontend.json | sort -k2) || drift=1
+          echo "endpoints:"
+          diff <(jq -S '.endpoints' "$fixture") <(jq -S '.endpoints' /tmp/frontend.json) || drift=1
+
+          if [ "$drift" = 0 ]; then
+            echo "no drift: frontend $FRONTEND_TAG has the same Supervisor-reaching sources as $pinned_tag"
           else
-            echo "::error::frontend $FRONTEND_TAG changed the Supervisor endpoints it calls (diff above). Regenerate: git rm $fixture && scripts/frontend-hassio-endpoints.sh $FRONTEND_TAG > apps/vagus/test/fixtures/frontend-$FRONTEND_TAG-hassio-endpoints.json, then route or allowlist each new entry in frontend_endpoints_route_test.exs."
+            echo "::error::frontend $FRONTEND_TAG changed a source that can reach the Supervisor, or the endpoints it calls (diffs above). Regenerate: git rm $fixture && scripts/frontend-hassio-endpoints.sh $FRONTEND_TAG > apps/vagus/test/fixtures/frontend-$FRONTEND_TAG-hassio-endpoints.json, review the endpoint diff, then route or allowlist each new entry in frontend_endpoints_route_test.exs."
             exit 1
           fi

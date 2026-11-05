@@ -1,7 +1,8 @@
-"""The extractor backs a drift guard, so anything it cannot resolve must come
-out as a raw entry carrying its source. Each case runs a snippet and the same
-snippet mutated the way that once left the output unchanged, and asserts the
-output now moves."""
+"""The fixture's `sources` hashes are the fail-closed drift guard; the
+endpoint list these cover is the review aid that says what moved. It is only
+useful if what it cannot resolve comes out as a raw entry carrying its
+source. Each case runs a snippet and the same snippet mutated the way that
+once left the output unchanged, and asserts the output now moves."""
 
 import sys
 import unittest
@@ -199,6 +200,23 @@ export const supervisorApiCall = async <T>(hass, endpoint: string, options?) =>
         self.assertTrue(before["raw"])
         self.assertEqual({k: v for k, v in before.items() if k != "source_text"}, {k: v for k, v in after.items() if k != "source_text"})
         self.assertNotEqual(before["source_text"], after["source_text"])
+
+
+class ReviewAidTest(Case):
+    """Copilot's third round, where a cheap fix makes the summary say more."""
+
+    BASE = 'supervisorApiWsRequest(conn, { endpoint: "/host/info" });\n'
+
+    def test_event_collection_caller_is_extracted(self):
+        mutated = self.BASE + 'getSupervisorEventCollection(conn, "addons", "/addons/unserved");\n'
+        self.assertMoves(self.BASE, mutated)
+        self.assertEqual(resolved(run(mutated)) - resolved(run(self.BASE)), {("GET", "/addons/unserved")})
+
+    def test_unresolved_const_quotes_its_initializer(self):
+        snippet = 'const endpoint = pathFor(%s); api.callApi("POST", endpoint);\n'
+        self.assertMoves(self.BASE + snippet % '"a"', self.BASE + snippet % '"b"')
+        [raw] = raws(run(self.BASE + snippet % '"b"'))
+        self.assertIn('endpoint = pathFor("b")', raw["source_text"])
 
 
 if __name__ == "__main__":

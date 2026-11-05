@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Print every Supervisor endpoint the Home Assistant frontend can request at a
-# tag, as the JSON apps/vagus/test/fixtures/frontend-<tag>-hassio-endpoints.json
-# holds.
+# Print the hashes of the Home Assistant frontend sources that can reach the
+# Supervisor at a tag, and the endpoints read out of them, as the JSON
+# apps/vagus/test/fixtures/frontend-<tag>-hassio-endpoints.json holds.
 #
 # Both the fixture and .github/workflows/core-contract-drift.yml run THIS
 # script, so a regeneration can never disagree with the check that demanded it.

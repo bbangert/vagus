@@ -1,7 +1,20 @@
-"""Extract every Supervisor endpoint the Home Assistant frontend can request.
+"""Pin the frontend sources that reach the Supervisor, and summarise what
+they request.
 
 Reads a checkout of the frontend's src/ and prints the JSON that
-apps/vagus/test/fixtures/frontend-<tag>-hassio-endpoints.json holds.
+apps/vagus/test/fixtures/frontend-<tag>-hassio-endpoints.json holds:
+
+  sources     the SHA-256 of every src/**/*.ts that matches TRIGGERS
+  endpoints   the Supervisor requests read out of those files
+
+`sources` is the drift guard. A lexer cannot follow every way TypeScript can
+build a request (a helper gaining a caller, a request object mutated before
+it is sent, a type assertion on a literal), so the endpoint list alone could
+miss a change; any edit to a matched file, and any file starting or stopping
+to match, changes `sources` instead. `endpoints` is the review aid: what to
+read in the diff, and what frontend_endpoints_route_test.exs grades.
+Regenerating is the same either way: run scripts/frontend-hassio-endpoints.sh,
+replace the fixture, review the endpoint diff.
 
 The frontend reaches the Supervisor through Core without a typed client: the
 untyped `supervisor/api` WS proxy and the `/api/hassio/<path>` HTTP view. So
@@ -13,6 +26,7 @@ there is no model to dump, only call sites to read. The forms read here:
   callApi / callApiRaw("METHOD", "hassio/<path>")
   supervisorUrl("<path>")                               an <img>/download GET
   fetchHassioStats(callWS, "<prefix>")                  GET <prefix>/stats
+  getSupervisorEventCollection(conn, key, "<path>")     GET <path>
 
 There is no TypeScript parser in the stdlib, so this lexes rather than parses.
 
@@ -26,13 +40,14 @@ never-mutated literal object, or of inline object literals (`...(c ? {} :
 such an object whose members are all `key: "literal"`. Anything else fails
 closed: the whole construct becomes one `"raw": true` entry whose
 `source_text` is its source (and any declaration it read) with whitespace
-collapsed, so editing an unresolved construct always changes the output.
-scripts/test_frontend_hassio_endpoints.py pins this, and
-core-contract-drift.yml runs it:
+collapsed (plus the initializer of any variable it named), so the entry
+shows a reviewer what to read. scripts/test_frontend_hassio_endpoints.py pins
+this, and core-contract-drift.yml runs it:
 
   python3 -I scripts/test_frontend_hassio_endpoints.py
 """
 
+import hashlib
 import json
 import re
 import sys
@@ -45,8 +60,16 @@ TRIGGERS = (
     "supervisorApiWsRequest",
     "supervisorUrl",
     "fetchHassioStats",
+    "getSupervisorEventCollection",
     "hassio/",
 )
+
+
+def triggered(text):
+    """Whether a file can reach the Supervisor; such a file's hash is pinned.
+    `callApi` with `hassio` anywhere covers a path assembled away from the call."""
+    return any(t in text for t in TRIGGERS) or ("callApi" in text and "hassio" in text)
+
 
 PUNCT3 = ("===", "!==", "...", "??=", "**=", "||=", "&&=")
 PUNCT2 = ("=>", "?.", "??", "==", "!=", "&&", "||", "<=", ">=", "++", "--", "+=", "-=")
@@ -240,7 +263,15 @@ class Unresolved(Exception):
 REQUEST_KEYS = ("type", "endpoint", "method")
 VERBS = ("GET", "POST", "PUT", "DELETE", "PATCH", "HEAD")
 ASSIGN = ("=", "+=", "-=", "**=", "??=", "||=", "&&=")
-CALLS = ("supervisorApiCall", "supervisorApiWsRequest", "callApi", "callApiRaw", "supervisorUrl", "fetchHassioStats")
+CALLS = (
+    "supervisorApiCall",
+    "supervisorApiWsRequest",
+    "callApi",
+    "callApiRaw",
+    "supervisorUrl",
+    "fetchHassioStats",
+    "getSupervisorEventCollection",
+)
 
 
 def collapse(text, toks):
@@ -306,8 +337,23 @@ def call_args(toks, pairs, i):
     return split_top(toks[j + 1 : pairs[j]], ","), pairs[j]
 
 
+def initializer_end(toks, pairs, start):
+    """Index of the last token of the expression starting at toks[start]."""
+    j = start
+    while j < len(toks):
+        tok = toks[j]
+        if tok.kind == "p" and tok.value in "([{" and j in pairs:
+            j = pairs[j] + 1
+            continue
+        if tok.kind == "p" and tok.value in (";", ",", ")", "]", "}"):
+            break
+        j += 1
+    return j - 1
+
+
 def constants(toks, pairs):
-    """(const strings, literal objects, every `NAME = {…}` span) by name.
+    """(const strings, literal objects, every `NAME = {…}` span, every
+    declaration's span) by name.
 
     A string or object is trusted only when declared exactly once, as `const
     NAME = <literal>`, and never rebound: a second declaration, or the name as
@@ -316,7 +362,7 @@ def constants(toks, pairs):
     `NAME[ident]` (never assigned through), `...NAME` or `typeof NAME`: any
     other use could mutate it. The spans, trusted or not, let a raw entry
     quote what it read."""
-    decls, rebound, uses, spans = {}, set(), {}, {}
+    decls, rebound, uses, spans, inits = {}, set(), {}, {}, {}
     for i, tok in enumerate(toks):
         # Everything in a `(…)` followed by `=>`, `{` or `:` may be a parameter
         # (over-matching `if (…) {` only leaves more raw), and everything in a
@@ -335,6 +381,8 @@ def constants(toks, pairs):
         if nxt is not None and nxt.is_p("=") and i + 2 < len(toks) and toks[i + 2].is_p("{") and (i + 2) in pairs:
             spans.setdefault(tok.value, []).append((i, pairs[i + 2]))
         if prev is not None and prev.kind == "i" and prev.value in ("const", "let", "var"):
+            if nxt is not None and nxt.is_p("=") and i + 2 < len(toks):
+                inits.setdefault(tok.value, []).append((i, initializer_end(toks, pairs, i + 2)))
             decl = None
             if prev.value == "const" and nxt is not None and nxt.is_p("=") and i + 2 < len(toks):
                 init = toks[i + 2]
@@ -368,7 +416,7 @@ def constants(toks, pairs):
             strings[name] = (value, start, end)
         elif all(object_use(u) for u in uses.get(name, [])):
             objects[name] = (value, start, end)
-    return strings, objects, spans
+    return strings, objects, spans, inits
 
 
 def object_entries(toks):
@@ -395,10 +443,10 @@ class Extractor:
         self.text, self.where = text, where
         self.toks, _ = lex(text)
         self.pairs = matching(self.toks)
-        self.strings, self.objects, self.spans = constants(self.toks, self.pairs)
+        self.strings, self.objects, self.spans, self.inits = constants(self.toks, self.pairs)
         # A file that reaches the Supervisor any other way may build its
         # `hassio/` HTTP path anywhere: one that cannot be read must not be dropped.
-        self.supervisor_file = any(t in text for t in TRIGGERS)
+        self.supervisor_file = triggered(text)
         self.found = []
         self.deps = []
 
@@ -413,6 +461,8 @@ class Extractor:
 
     def const_string(self, name):
         if name not in self.strings:
+            for start, end in self.inits.get(name, []):
+                self.read(start, end)
             raise Unresolved(f"`{name}` is not a once-declared, never-rebound const string")
         value, start, end = self.strings[name]
         self.read(start, end)
@@ -640,6 +690,8 @@ class Extractor:
             self.emit(construct, lambda: self.resolve("GET", args[0]), None, args[0], method="GET")
         elif name == "fetchHassioStats" and arg(1):
             self.emit(construct, lambda: self.resolve("GET", arg(1), suffix="/stats"), None, arg(1), method="GET")
+        elif name == "getSupervisorEventCollection" and arg(2):
+            self.emit(construct, lambda: self.resolve("GET", arg(2)), None, arg(2), method="GET")
 
 
 def extract(text, where):
@@ -648,18 +700,19 @@ def extract(text, where):
     return extractor.found
 
 
-
 def main() -> int:
     src = Path(sys.argv[1])
     tag = sys.argv[2]
     root = src.parent
 
-    endpoints, silent = [], []
+    endpoints, silent, sources = [], [], {}
     for path in sorted(src.rglob("*.ts")):
-        text = path.read_text(errors="ignore")
-        if not any(t in text for t in TRIGGERS):
+        data = path.read_bytes()
+        text = data.decode(errors="ignore")
+        if not triggered(text):
             continue
         where = str(path.relative_to(root))
+        sources[where] = hashlib.sha256(data).hexdigest()
         found = extract(text, where)
         endpoints += found
         if '"supervisor/api"' in text and not found:
@@ -681,6 +734,7 @@ def main() -> int:
             "_frontend": tag,
             "_source": f"home-assistant/frontend src/**/*.ts at tag {tag}",
             "endpoints": ordered,
+            "sources": sources,
         },
         sys.stdout,
         indent=2,
