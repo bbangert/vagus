@@ -27,6 +27,7 @@ defmodule Vagus.Core.EventPusherTest do
         retry_ref: nil,
         ready_ref: nil,
         ready_timeout_ms: 60_000,
+        on_ready: fn -> :ok end,
         ready: false,
         next_id: 1,
         pending: %{},
@@ -148,6 +149,17 @@ defmodule Vagus.Core.EventPusherTest do
       assert new_state.ready == true
       assert new_state.queue_size == 0
       assert received_frame()["data"] == %{"n" => 1}
+    end
+
+    test "tells Versions that Core came up, once per ready" do
+      test = self()
+      state = base_state(%{connection_pid: self(), on_ready: fn -> send(test, :core_up) end})
+
+      EventPusher.handle_info({:event_pusher_connection, :ready, self()}, state)
+      assert_received :core_up
+
+      EventPusher.handle_info({:event_pusher_connection, :ready, spawn(fn -> :ok end)}, state)
+      refute_received :core_up
     end
 
     test "is a no-op for a stale connection pid" do

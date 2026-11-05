@@ -213,6 +213,46 @@ defmodule Vagus.Core.VersionsCeilingTest do
       assert_receive {:notify, :dismiss}
     end
 
+    test "is raised again after a Core restart, once" do
+      ctx = start_versions(@above, installed: "2026.10.0")
+      Versions.latest(ctx.server)
+      assert_receive {:notify, {:hold, @above}}
+
+      ctx.server |> settled() |> Versions.latest()
+      refute_receive {:notify, _}
+
+      Versions.core_restarted(ctx.server)
+      assert_receive {:notify, {:hold, @above}}
+
+      ctx.server |> settled() |> Versions.latest()
+      refute_receive {:notify, _}
+    end
+
+    test "a restart during a send is raised again at the next call" do
+      test = self()
+
+      notify = fn event ->
+        send(test, {:notify, event, self()})
+
+        receive do
+          :go -> :ok
+        end
+      end
+
+      ctx = start_versions(@above, installed: "2026.10.0", notify: notify)
+      Versions.latest(ctx.server)
+      assert_receive {:notify, {:hold, @above}, sender}
+
+      Versions.core_restarted(ctx.server)
+      send(sender, :go)
+      ctx.server |> settled() |> Versions.latest()
+      assert_receive {:notify, {:hold, @above}, sender}
+      send(sender, :go)
+
+      ctx.server |> settled() |> Versions.latest()
+      refute_receive {:notify, _, _}
+    end
+
     test "nothing is sent before a feed is known" do
       %{server: s} =
         start_versions(nil, installed: "2026.10.0", fetch: fn -> {:error, :offline} end)

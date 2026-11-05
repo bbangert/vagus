@@ -101,6 +101,11 @@ defmodule Vagus.Core.Versions do
   that fails, or a change that lands while one is in flight, is caught up at
   the next `latest`/`update_available?` call (Core polls `/core/info`).
 
+  Core keeps persistent notifications in memory only, so a Core restart
+  loses the notice while `shown` still names it. `core_restarted/1` (called
+  by `Vagus.Core.EventPusher` each time Core's WS comes up) forgets what was
+  shown, including what an in-flight send would record, and reconciles.
+
   ## Options (all injectable)
 
     * `:name` - GenServer name, defaults to `__MODULE__`.
@@ -225,6 +230,15 @@ defmodule Vagus.Core.Versions do
     GenServer.cast(server, :invalidate)
   end
 
+  @doc """
+  Core came (back) up: the held notice it showed is gone with its memory, so
+  reassert it. A cast, so the WS manager calling it never waits on this.
+  """
+  @spec core_restarted(GenServer.server()) :: :ok
+  def core_restarted(server \\ __MODULE__) do
+    GenServer.cast(server, :core_restarted)
+  end
+
   @doc "The persistent notification Home Assistant shows while `feed` is held back."
   @spec notification(String.t()) :: map()
   def notification(feed) do
@@ -296,6 +310,10 @@ defmodule Vagus.Core.Versions do
   @impl GenServer
   def handle_cast(:invalidate, state) do
     {:noreply, %{state | latest_cache: nil}}
+  end
+
+  def handle_cast(:core_restarted, state) do
+    {:noreply, state |> forget_notice() |> reconcile_notice()}
   end
 
   @impl GenServer
@@ -431,6 +449,14 @@ defmodule Vagus.Core.Versions do
   end
 
   defp reconcile_notice(state), do: state
+
+  # An in-flight send may have reached the Core that just went away, so its
+  # result can no longer say what is shown.
+  defp forget_notice(%{notice: %{sending: nil}} = state), do: put_in(state.notice.shown, :unknown)
+
+  defp forget_notice(state) do
+    %{state | notice: %{shown: :unknown, sending: %{state.notice.sending | want: :unknown}}}
+  end
 
   defp send_notice(state, want) do
     ref = make_ref()

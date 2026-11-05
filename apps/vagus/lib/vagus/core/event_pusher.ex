@@ -118,6 +118,11 @@ defmodule Vagus.Core.EventPusher do
       without reporting `:ready` before the manager kills it, defaults to
       `config :vagus, :event_pusher_ready_timeout` and then to
       `#{@ready_timeout}`.
+    * `:on_ready` - zero-arity fun run each time a connection reports
+      `:ready`, defaults to `Vagus.Core.Versions.core_restarted/0`. A Core
+      restart always drops this socket, so a fresh `:ready` is the one
+      signal that also covers restarts outside `Vagus.Core.Lifecycle` (the
+      container's own `unless-stopped` policy).
   """
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts \\ []) do
@@ -191,6 +196,7 @@ defmodule Vagus.Core.EventPusher do
       retry_ref: nil,
       ready_ref: nil,
       ready_timeout_ms: ready_timeout(opts),
+      on_ready: Keyword.get(opts, :on_ready, &Vagus.Core.Versions.core_restarted/0),
       ready: false,
       next_id: 1,
       pending: %{},
@@ -240,6 +246,7 @@ defmodule Vagus.Core.EventPusher do
   end
 
   def handle_info({:event_pusher_connection, :ready, pid}, %{connection_pid: pid} = state) do
+    state.on_ready.()
     {:noreply, flush(%{clear_ready_timeout(state) | ready: true})}
   end
 
