@@ -1,0 +1,523 @@
+{
+  "_frontend": "20261028.4",
+  "_source": "home-assistant/frontend src/**/*.ts at tag 20261028.4",
+  "endpoints": [
+    {
+      "method": "UNKNOWN",
+      "path": "",
+      "raw": true,
+      "reason": "`request` is not a once-declared, never-mutated literal object",
+      "source": "src/data/supervisor/supervisor.ts",
+      "source_text": "{ ...supervisorWSbaseCommand, ...request } where supervisorWSbaseCommand = { type: \"supervisor/api\", method: \"GET\", }"
+    },
+    {
+      "method": "GET",
+      "path": "/addons",
+      "source": "src/data/hassio/addon.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/addons",
+      "source": "src/data/supervisor/supervisor.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/addons/{slug}/changelog",
+      "source": "src/data/hassio/addon.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/addons/{slug}/documentation",
+      "source": "src/data/hassio/addon.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/addons/{slug}/icon",
+      "source": "src/components/ha-app-icon.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/addons/{slug}/info",
+      "source": "src/data/hassio/addon.ts"
+    },
+    {
+      "method": "POST",
+      "path": "/addons/{slug}/install",
+      "source": "src/data/hassio/addon.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/addons/{slug}/logo",
+      "source": "src/panels/config/apps/app-view/info/supervisor-app-info.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/addons/{slug}/logs",
+      "source": "src/data/hassio/addon.ts"
+    },
+    {
+      "method": "POST",
+      "path": "/addons/{slug}/options",
+      "source": "src/data/hassio/addon.ts"
+    },
+    {
+      "method": "POST",
+      "path": "/addons/{slug}/options/validate",
+      "source": "src/data/hassio/addon.ts"
+    },
+    {
+      "method": "POST",
+      "path": "/addons/{slug}/rebuild",
+      "source": "src/data/hassio/addon.ts"
+    },
+    {
+      "method": "POST",
+      "path": "/addons/{slug}/restart",
+      "source": "src/data/hassio/addon.ts"
+    },
+    {
+      "method": "POST",
+      "path": "/addons/{slug}/security",
+      "source": "src/data/hassio/addon.ts"
+    },
+    {
+      "method": "POST",
+      "path": "/addons/{slug}/start",
+      "source": "src/data/hassio/addon.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/addons/{slug}/stats",
+      "source": "src/panels/config/apps/app-view/info/supervisor-app-info.ts"
+    },
+    {
+      "method": "POST",
+      "path": "/addons/{slug}/stop",
+      "source": "src/data/hassio/addon.ts"
+    },
+    {
+      "method": "POST",
+      "path": "/addons/{slug}/uninstall",
+      "source": "src/data/hassio/addon.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/core/info",
+      "source": "src/data/hassio/supervisor.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/core/info",
+      "source": "src/data/supervisor/supervisor.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/core/logs/latest",
+      "source": "src/data/error_log.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/core/logs/latest",
+      "source": "src/data/hassio/supervisor.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/core/stats",
+      "source": "src/panels/config/repairs/dialog-system-information.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/docker/registries",
+      "source": "src/data/hassio/docker.ts"
+    },
+    {
+      "method": "POST",
+      "path": "/docker/registries",
+      "source": "src/data/hassio/docker.ts"
+    },
+    {
+      "method": "DELETE",
+      "path": "/docker/registries/{param}",
+      "source": "src/data/hassio/docker.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/hardware/audio",
+      "source": "src/data/hassio/hardware.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/hardware/info",
+      "source": "src/data/hassio/hardware.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/host/disks",
+      "source": "src/data/hassio/host.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/host/disks/{param}/usage",
+      "source": "src/data/hassio/host.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/host/info",
+      "source": "src/data/hassio/host.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/host/info",
+      "source": "src/data/supervisor/supervisor.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/host/logs/boots",
+      "source": "src/data/hassio/supervisor.ts"
+    },
+    {
+      "method": "POST",
+      "path": "/host/options",
+      "source": "src/data/hassio/host.ts"
+    },
+    {
+      "method": "POST",
+      "path": "/host/reboot",
+      "source": "src/data/hassio/host.ts"
+    },
+    {
+      "method": "POST",
+      "path": "/host/shutdown",
+      "source": "src/data/hassio/host.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/info",
+      "source": "src/data/hassio/supervisor.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/info",
+      "source": "src/data/supervisor/supervisor.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/ingress/panels",
+      "source": "src/data/hassio/ingress.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/mounts",
+      "source": "src/data/supervisor/mounts.ts"
+    },
+    {
+      "method": "POST",
+      "path": "/mounts",
+      "source": "src/data/supervisor/mounts.ts"
+    },
+    {
+      "method": "POST",
+      "path": "/mounts/options",
+      "source": "src/data/supervisor/mounts.ts"
+    },
+    {
+      "method": "DELETE",
+      "path": "/mounts/{param}",
+      "source": "src/data/supervisor/mounts.ts"
+    },
+    {
+      "method": "PUT",
+      "path": "/mounts/{param}",
+      "source": "src/data/supervisor/mounts.ts"
+    },
+    {
+      "method": "POST",
+      "path": "/mounts/{param}/reload",
+      "source": "src/data/supervisor/mounts.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/network/info",
+      "source": "src/data/hassio/network.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/network/info",
+      "source": "src/data/supervisor/supervisor.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/network/interface/{param}/accesspoints",
+      "source": "src/data/hassio/network.ts"
+    },
+    {
+      "method": "POST",
+      "path": "/network/interface/{param}/update",
+      "source": "src/data/hassio/network.ts"
+    },
+    {
+      "method": "POST",
+      "path": "/os/config/sync",
+      "source": "src/data/hassio/host.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/os/datadisk/list",
+      "source": "src/data/hassio/host.ts"
+    },
+    {
+      "method": "POST",
+      "path": "/os/datadisk/move",
+      "source": "src/data/hassio/host.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/os/info",
+      "source": "src/data/hassio/host.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/os/info",
+      "source": "src/data/supervisor/supervisor.ts"
+    },
+    {
+      "method": "POST",
+      "path": "/os/update",
+      "source": "src/data/hassio/host.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/resolution/info",
+      "source": "src/data/hassio/resolution.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/resolution/info",
+      "source": "src/data/supervisor/supervisor.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/store",
+      "source": "src/data/supervisor/store.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/store",
+      "source": "src/data/supervisor/supervisor.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/store/addons/{slug}",
+      "source": "src/data/hassio/addon.ts"
+    },
+    {
+      "method": "POST",
+      "path": "/store/reload",
+      "source": "src/data/hassio/addon.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/store/repositories",
+      "source": "src/data/supervisor/store.ts"
+    },
+    {
+      "method": "POST",
+      "path": "/store/repositories",
+      "source": "src/data/supervisor/store.ts"
+    },
+    {
+      "method": "DELETE",
+      "path": "/store/repositories/{param}",
+      "source": "src/data/supervisor/store.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/supervisor/info",
+      "source": "src/data/hassio/supervisor.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/supervisor/info",
+      "source": "src/data/supervisor/supervisor.ts"
+    },
+    {
+      "method": "POST",
+      "path": "/supervisor/options",
+      "source": "src/data/hassio/supervisor.ts"
+    },
+    {
+      "method": "POST",
+      "path": "/supervisor/reload",
+      "source": "src/data/hassio/supervisor.ts"
+    },
+    {
+      "method": "POST",
+      "path": "/supervisor/restart",
+      "source": "src/data/hassio/supervisor.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/supervisor/stats",
+      "source": "src/panels/config/repairs/dialog-system-information.ts"
+    },
+    {
+      "method": "POST",
+      "path": "/supervisor/update",
+      "source": "src/data/hassio/supervisor.ts"
+    },
+    {
+      "method": "GET",
+      "path": "`${ provider.includes(\"_\") ? `addons/${provider}` : provider }/logs${boot !== 0 ? `/boots/${boot}` : \"\"}?lines=${lines}`",
+      "raw": true,
+      "reason": "`${provider.includes(\"_\") ? `addons/${provider}` : provider}` is not an identifier or `a.b` chain",
+      "source": "src/data/hassio/supervisor.ts",
+      "source_text": "supervisorUrl( `${ provider.includes(\"_\") ? `addons/${provider}` : provider }/logs${boot !== 0 ? `/boots/${boot}` : \"\"}?lines=${lines}` )"
+    },
+    {
+      "method": "GET",
+      "path": "`${provider.includes(\"_\") ? `addons/${provider}` : provider}/logs`",
+      "raw": true,
+      "reason": "`${provider.includes(\"_\") ? `addons/${provider}` : provider}` is not an identifier or `a.b` chain",
+      "source": "src/data/hassio/supervisor.ts",
+      "source_text": "supervisorUrl( `${provider.includes(\"_\") ? `addons/${provider}` : provider}/logs` )"
+    },
+    {
+      "method": "GET",
+      "path": "`/${container}/stats`",
+      "raw": true,
+      "reason": "the first path segment is chosen at runtime",
+      "source": "src/data/hassio/common.ts",
+      "source_text": "{ type: \"supervisor/api\", endpoint: `/${container}/stats`, method: \"get\", }"
+    },
+    {
+      "method": "GET",
+      "path": "`config/config_entries/flow_handlers${type ? `?type=${type}` : \"\"}`",
+      "raw": true,
+      "reason": "`${type ? `?type=${type}` : \"\"}` is not an identifier or `a.b` chain",
+      "source": "src/data/config_flow.ts",
+      "source_text": "callApi<string[]>( \"GET\", `config/config_entries/flow_handlers${type ? `?type=${type}` : \"\"}` )"
+    },
+    {
+      "method": "GET",
+      "path": "`hassio/${provider.includes(\"_\") ? `addons/${provider}` : provider}/logs${boot !== 0 ? `/boots/${boot}` : \"\"}/follow?lines=${lines}`",
+      "raw": true,
+      "reason": "`${provider.includes(\"_\") ? `addons/${provider}` : provider}` is not an identifier or `a.b` chain",
+      "source": "src/data/hassio/supervisor.ts",
+      "source_text": "callApiRaw( \"GET\", `hassio/${provider.includes(\"_\") ? `addons/${provider}` : provider}/logs${boot !== 0 ? `/boots/${boot}` : \"\"}/follow?lines=${lines}`, undefined, undefined, signal )"
+    },
+    {
+      "method": "GET",
+      "path": "`hassio/${provider.includes(\"_\") ? `addons/${provider}` : provider}/logs${boot !== 0 ? `/boots/${boot}` : \"\"}/follow`",
+      "raw": true,
+      "reason": "`${provider.includes(\"_\") ? `addons/${provider}` : provider}` is not an identifier or `a.b` chain",
+      "source": "src/data/hassio/supervisor.ts",
+      "source_text": "callApiRaw( \"GET\", `hassio/${provider.includes(\"_\") ? `addons/${provider}` : provider}/logs${boot !== 0 ? `/boots/${boot}` : \"\"}/follow`, undefined, { Range: `entries=${cursor}:${skipLines}:${lines}`, }, signal )"
+    },
+    {
+      "method": "GET",
+      "path": "`hassio/${provider.includes(\"_\") ? `addons/${provider}` : provider}/logs${boot !== 0 ? `/boots/${boot}` : \"\"}`",
+      "raw": true,
+      "reason": "`${provider.includes(\"_\") ? `addons/${provider}` : provider}` is not an identifier or `a.b` chain",
+      "source": "src/data/hassio/supervisor.ts",
+      "source_text": "callApiRaw( \"GET\", `hassio/${provider.includes(\"_\") ? `addons/${provider}` : provider}/logs${boot !== 0 ? `/boots/${boot}` : \"\"}`, undefined, range ? { Range: range, } : undefined )"
+    },
+    {
+      "method": "GET",
+      "path": "`hassio/${provider.includes(\"_\") ? `addons/${provider}` : provider}/logs`",
+      "raw": true,
+      "reason": "`${provider.includes(\"_\") ? `addons/${provider}` : provider}` is not an identifier or `a.b` chain",
+      "source": "src/data/hassio/supervisor.ts",
+      "source_text": "callApi<string>( \"GET\", `hassio/${provider.includes(\"_\") ? `addons/${provider}` : provider}/logs` )"
+    },
+    {
+      "method": "UNKNOWN",
+      "path": "endpoint",
+      "raw": true,
+      "reason": "`options?.method || \"get\"` is not a string literal",
+      "source": "src/data/supervisor/common.ts",
+      "source_text": "{ type: \"supervisor/api\", endpoint, method: options?.method || \"get\", timeout: options?.timeout ?? null, data: options?.data, }"
+    },
+    {
+      "method": "UNKNOWN",
+      "path": "endpoint",
+      "raw": true,
+      "reason": "`endpoint` is not a once-declared, never-rebound const string",
+      "source": "src/data/supervisor/supervisor.ts",
+      "source_text": "supervisorApiWsRequest(conn2, { endpoint })"
+    }
+  ],
+  "sources": {
+    "src/components/ha-addon-picker.ts": "a6c73f937553caab2fd90c8b053f876899d38b940bb1b99a0fa596f5bfa9d403",
+    "src/components/ha-app-icon.ts": "eaa76ab86c67e3f9d3ceb935d174a39ac68cdc1b2e8d3f71fd1879fc941becd9",
+    "src/components/ha-navigation-picker.ts": "c4d53605e2fa547d9f903be6c5555828b1ed3db5ec8bf70a05b76c6f499f5872",
+    "src/components/media-player/dialog-join-media-players.ts": "b66ae81c133dd998ad690871bd2545be37fef94f9c68c1c6004b181715203553",
+    "src/data/compute-navigation-path-info.ts": "4ff3f7ba3812392bc1821b0a75836a45c882364953e49e53c9544bf9d251d72b",
+    "src/data/config_flow.ts": "96b497743218b831fd5ae21483266cbceb7b02fa64d5752be21fa4977a7bcd5f",
+    "src/data/error_log.ts": "5343f19bfb54a977fd394c72706edb9c8c113356d39e236c373cd1ec93e423eb",
+    "src/data/hassio/addon.ts": "6944e10b12fbb1eae1aa0dcddb6d19ea25034d5c813a69be962fec4353559d02",
+    "src/data/hassio/common.ts": "fbf945e3375414a255f503904b8c215c51e3c9698c10d55dcda3537dfc98d095",
+    "src/data/hassio/docker.ts": "cb16c8406c524b90df0f8a6dac86ee05bebd0abc2943b03dc39ca32412ef185e",
+    "src/data/hassio/hardware.ts": "f4a5c5a9081a95d1d27fdf9d6dd3908e1b7bb81d066bfd3cf88abcf6081f5e92",
+    "src/data/hassio/host.ts": "348144c82517d07d2dc870c441cb45cf77a18f355663572c883227aaebb19494",
+    "src/data/hassio/ingress.ts": "0d644940cfabc6d04a95bd30a6bced163c7436a0a25c64854b99b5c347aae9d4",
+    "src/data/hassio/network.ts": "2141fce63458d4a89f5a133f5cc0765b6e6ce19240f31b7307cf0f00a60249ec",
+    "src/data/hassio/resolution.ts": "632cd5fc905bb1e87a4a6eb71541ad045349ebdc53b29a31135562dbebbf0afc",
+    "src/data/hassio/supervisor.ts": "7496eb6bf4cc6682a30ac4fda79c09f1c796593e3da3e8d0a99d96e11bec43fc",
+    "src/data/quick_bar.ts": "dfb380a2eaf74884656e4d5e2a1c7c3cd9575291ddeac46b48194395fd611b91",
+    "src/data/supervisor/common.ts": "598609a5d975082422a7530aeff7268b6aed58d90564788fcecd1d57af635380",
+    "src/data/supervisor/core.ts": "f6b8c790f27a92903511f7aecc4708e5ceeb56c036f8310b163e5dff6d11e229",
+    "src/data/supervisor/mounts.ts": "13a6333b3025e14050a87f5eb651f82a0d5c6ddd9046047c622741504abb4ed4",
+    "src/data/supervisor/store.ts": "e241ae62c96fba1acc534271adcc5151313248ef5d6505698ef1e0c87adcd4b8",
+    "src/data/supervisor/supervisor.ts": "9e6f00b261f6b79a9f2ab6fff0f564dc0a882bc31bf8007c1b507e1bbb2df1b3",
+    "src/data/supervisor/update.ts": "9fbcbce5c0a3758d579cfcfd71c1add74d8cea28ae10007ff1b2af8a50965e0b",
+    "src/dialogs/quick-bar/ha-quick-bar.ts": "9dd6baec618ed51877aaabc97dca191e49898961213dc83944bd204ff4f6a265",
+    "src/dialogs/restart/dialog-restart.ts": "34ffa22583a2ba3aa8696bf69c1003b983690ec46102f13cfc9d74247e401c6c",
+    "src/dialogs/voice-assistant-setup/voice-assistant-setup-step-local.ts": "49712793b2fa843415968f86f372caf0b3402fdf4e2b85867639142ed7dd7ef4",
+    "src/panels/app/ha-panel-app.ts": "bc2a33348b0840b4e3b11813a1acd3025f3b471ecd1c1d0680655a0a41aae322",
+    "src/panels/config/apps/app-view/config/supervisor-app-audio.ts": "8c47124b8235d1fb331ee2a51ecb63d8f13f6c72a18feaadedeaecf2f3e44481",
+    "src/panels/config/apps/app-view/config/supervisor-app-config-tab.ts": "427b8400d44bd664be352bddfbf4b41071239ac5de88f45f0c821e69c331c527",
+    "src/panels/config/apps/app-view/config/supervisor-app-config.ts": "40ff67c0f3fd9df1717f55f3a1455709c1555349b32563aaaead760cc2891f4b",
+    "src/panels/config/apps/app-view/config/supervisor-app-network.ts": "9eb3427d516f6ef3ab7e0f68fb331cd968a5ffb604fe7b54c96170f4e939ea43",
+    "src/panels/config/apps/app-view/dialogs/suggestSupervisorAppRestart.ts": "09cfec177cbf1bfcb40eb6abb15d914c3a0e32627f0986018693ff05fca446d0",
+    "src/panels/config/apps/app-view/documentation/supervisor-app-documentation-tab.ts": "a25cbd1fcb4bb1e5460d0dab8c6e45bc75311a58783720d0b7ec0a132447579e",
+    "src/panels/config/apps/app-view/info/supervisor-app-info-tab.ts": "f876c78442303395940e0caa4c95f4617be4c0d13b04e3f9c2855d95a56dcaa4",
+    "src/panels/config/apps/app-view/info/supervisor-app-info.ts": "654e98c60b2587129098626e75ecbb29d1c8d0e903fe382a7e886069727e0d97",
+    "src/panels/config/apps/app-view/log/supervisor-app-log-tab.ts": "05e6a2c9ff1becc79bb854ae7735bccd66ab4d316b8a88191b6c77e9437af744",
+    "src/panels/config/apps/app-view/supervisor-app-router.ts": "0b01c3f3442d378145b966d78e8fde9144405c57fdb6615ec40eecc47afa49d4",
+    "src/panels/config/apps/app-view/util/supervisor-app.ts": "ddbb60e697a4f6ccf7a184caad78d4303fda4c01710bcef49f6c8bfa2f904f9d",
+    "src/panels/config/apps/common/app.ts": "bd8f806dd3a93f1f9e7a2b59087332a25b3c24ebc8248b1dfa399fc2716685e4",
+    "src/panels/config/apps/common/check-for-updates.ts": "4736c03d5038dfb0ef14699fc1929d1ecbb89134cb21659e05dbce605e2b5008",
+    "src/panels/config/apps/components/supervisor-apps-card-content.ts": "56ef720e631bd40c8f991a333b09d15e80910246fa0ab5d042e8ed4036094182",
+    "src/panels/config/apps/components/supervisor-apps-state.ts": "c25b77b782621e77a25b7fcd4432f2985953d367ea0ab0df82c2c8c254047977",
+    "src/panels/config/apps/dialogs/registries/dialog-registries.ts": "cf5680fdda2ff7d1ecd53cac194d46e959c6afab427cf2c7e469a46234394b74",
+    "src/panels/config/apps/ha-config-app-dashboard.ts": "828d13ef447e986041c6dcdaf5dc19b1355f09dde87c08b4b6c15eb60dcb7e0e",
+    "src/panels/config/apps/ha-config-apps-available.ts": "c93cfc7c38906164121573324f802be52c838e66f4123d6c4b8e8d42f8aacf08",
+    "src/panels/config/apps/ha-config-apps-installed.ts": "5f9970a5e14189599e7d0bb3571e9509ad63d652854dd44155ca88703b384200",
+    "src/panels/config/apps/ha-config-apps-registries.ts": "3084cea373071e021514c3c021d05379b2d90c805ba1192deace0f2b20029176",
+    "src/panels/config/apps/ha-config-apps-repositories.ts": "d6a9afb8058cede07c657a23bc8218356d743c3841e1540f51bc2413627513b7",
+    "src/panels/config/apps/supervisor-apps-repository.ts": "585c42af2d3559116ab31ab5ace3f7241a3202d57f8ffab8623f1068b12e8ff8",
+    "src/panels/config/backup/components/config/ha-backup-config-data.ts": "f16b5976678f81b0e96de61b431211f14596ab0fab05f79226c36294f4ca00f0",
+    "src/panels/config/backup/components/ha-backup-data-picker.ts": "11050c8872c78e8184703d393cec7ac8cc8200d6319544301fe0e4798e8cc832",
+    "src/panels/config/backup/dialogs/dialog-local-backup-location.ts": "207887dc4d29ddcd3f3787239a8008bc60ee78e3f35282f97fe7403f1e1ee8bd",
+    "src/panels/config/backup/ha-config-backup-backups.ts": "f622496d556dea1ef2d8e4483e3efbd716acf6de5e64b1b2c22b5cd7286ef19b",
+    "src/panels/config/core/ha-config-section-updates.ts": "e116dc2612c2632374195e605c418ece6fcefb23bca7279718b2a0408cea80ee",
+    "src/panels/config/core/ha-config-system-navigation.ts": "6f359961b659236ba2ca535c5dc1370f925af47ccd831d42be8737eb1a6f0fd8",
+    "src/panels/config/hardware/ha-config-hardware-all.ts": "754419df3cff5197dfc80e0ed1cc6ec6d67eb4dd17663496ca4125a7696d324a",
+    "src/panels/config/hardware/ha-config-hardware-overview.ts": "f085c08805cf6bf4b80ed3afc5045ace16bfe7ca492a1cde83905a1abeca0313",
+    "src/panels/config/info/ha-config-info.ts": "129a457bd2311b70f77ba240a160a927e7599a86f51516f73c3111c63e29bd1d",
+    "src/panels/config/logs/dialog-download-logs.ts": "af070646add907216849b8a34b859c0d178b8768337f65c3b85168d3dc4f59d5",
+    "src/panels/config/logs/dialog-logs.ts": "1c5f03841eb5d8089402c22c972843cfe958f10cad15d4fefe53c58a839d42bd",
+    "src/panels/config/logs/error-log-card.ts": "0595959d1937b08f59ff2d3739a7ac451634f14ec9e3a77bdd86ac7c3a65b694",
+    "src/panels/config/logs/ha-config-logs.ts": "001496cf11a21f623645ba5047bb340fd919248cfa31c04358d2751a36af4269",
+    "src/panels/config/network/ha-config-network.ts": "348c0ff75fd46b639d2c4a7473292b934a73ffd7523188f2b8d3ac2183da8e10",
+    "src/panels/config/network/supervisor-hostname.ts": "569a30aa2ac6bf4cfa81cbc8279df4a82cf4e0a11c78b4987cf8a0717c2ecc9b",
+    "src/panels/config/network/supervisor-network.ts": "64592afd9f7b2309f331ffe247a6a516a1c1b38e6cd7a3889fe4635398ab580e",
+    "src/panels/config/repairs/dialog-system-information.ts": "ae8680bc0d897ea56020e8b81e510fedc18a4016402943e64b3bb95d878c94e8",
+    "src/panels/config/storage/dialog-mount-view.ts": "bc01c4813a4873a9fc17648e56237da5c863d63cced575b5a0f5bb2d6b5c36e9",
+    "src/panels/config/storage/dialog-move-datadisk.ts": "945921f84edf9529e1ba0fd7cd5f3e27067b424361597aded923c60ca6e08568",
+    "src/panels/config/storage/ha-config-section-storage.ts": "62b348b9e7e0582c96ee11a915d5513f0126afc7d191461fdcb50012c5fde7e0",
+    "src/panels/config/storage/show-dialog-move-datadisk.ts": "0592c99a073b52f0dfe500cef03ec7dfbb9764594120705afa1a7a05e58b46d5",
+    "src/panels/config/storage/storage-breakdown-chart.ts": "fcc601fd39bf9040a85ed89f5952208c52ebfa1d183f519571fd25ec3f92793f",
+    "src/state/quick-bar-mixin.ts": "2f2c0e4a6b560af817b5e02d04da2482e14432d4fdb7ea8f27e893370288a54a"
+  }
+}
