@@ -4,10 +4,11 @@
   "endpoints": [
     {
       "method": "UNKNOWN",
-      "path": "...request",
+      "path": "",
       "raw": true,
-      "reason": "`...request` in a supervisor/api call site can set the endpoint or method",
-      "source": "src/data/supervisor/supervisor.ts"
+      "reason": "`request` is not a once-declared, never-mutated literal object",
+      "source": "src/data/supervisor/supervisor.ts",
+      "source_text": "{ ...supervisorWSbaseCommand, ...request } where supervisorWSbaseCommand = { type: \"supervisor/api\", method: \"GET\", }"
     },
     {
       "method": "GET",
@@ -18,26 +19,6 @@
       "method": "GET",
       "path": "/addons",
       "source": "src/data/supervisor/supervisor.ts"
-    },
-    {
-      "method": "GET",
-      "path": "/addons/{param}/logs",
-      "source": "src/data/hassio/supervisor.ts"
-    },
-    {
-      "method": "GET",
-      "path": "/addons/{param}/logs/boots/{param}",
-      "source": "src/data/hassio/supervisor.ts"
-    },
-    {
-      "method": "GET",
-      "path": "/addons/{param}/logs/boots/{param}/follow",
-      "source": "src/data/hassio/supervisor.ts"
-    },
-    {
-      "method": "GET",
-      "path": "/addons/{param}/logs/follow",
-      "source": "src/data/hassio/supervisor.ts"
     },
     {
       "method": "GET",
@@ -388,55 +369,73 @@
       "method": "GET",
       "path": "`${ provider.includes(\"_\") ? `addons/${provider}` : provider }/logs${boot !== 0 ? `/boots/${boot}` : \"\"}?lines=${lines}`",
       "raw": true,
-      "source": "src/data/hassio/supervisor.ts"
+      "reason": "`${provider.includes(\"_\") ? `addons/${provider}` : provider}` is not an identifier or `a.b` chain",
+      "source": "src/data/hassio/supervisor.ts",
+      "source_text": "supervisorUrl( `${ provider.includes(\"_\") ? `addons/${provider}` : provider }/logs${boot !== 0 ? `/boots/${boot}` : \"\"}?lines=${lines}` )"
     },
     {
       "method": "GET",
       "path": "`${provider.includes(\"_\") ? `addons/${provider}` : provider}/logs`",
       "raw": true,
-      "source": "src/data/hassio/supervisor.ts"
+      "reason": "`${provider.includes(\"_\") ? `addons/${provider}` : provider}` is not an identifier or `a.b` chain",
+      "source": "src/data/hassio/supervisor.ts",
+      "source_text": "supervisorUrl( `${provider.includes(\"_\") ? `addons/${provider}` : provider}/logs` )"
     },
     {
       "method": "GET",
       "path": "`/${container}/stats`",
       "raw": true,
-      "source": "src/data/hassio/common.ts"
+      "reason": "the first path segment is chosen at runtime",
+      "source": "src/data/hassio/common.ts",
+      "source_text": "{ type: \"supervisor/api\", endpoint: `/${container}/stats`, method: \"get\", }"
     },
     {
       "method": "GET",
       "path": "`hassio/${provider.includes(\"_\") ? `addons/${provider}` : provider}/logs${boot !== 0 ? `/boots/${boot}` : \"\"}/follow?lines=${lines}`",
       "raw": true,
-      "source": "src/data/hassio/supervisor.ts"
+      "reason": "`${provider.includes(\"_\") ? `addons/${provider}` : provider}` is not an identifier or `a.b` chain",
+      "source": "src/data/hassio/supervisor.ts",
+      "source_text": "callApiRaw( \"GET\", `hassio/${provider.includes(\"_\") ? `addons/${provider}` : provider}/logs${boot !== 0 ? `/boots/${boot}` : \"\"}/follow?lines=${lines}`, undefined, undefined, signal )"
     },
     {
       "method": "GET",
       "path": "`hassio/${provider.includes(\"_\") ? `addons/${provider}` : provider}/logs${boot !== 0 ? `/boots/${boot}` : \"\"}/follow`",
       "raw": true,
-      "source": "src/data/hassio/supervisor.ts"
+      "reason": "`${provider.includes(\"_\") ? `addons/${provider}` : provider}` is not an identifier or `a.b` chain",
+      "source": "src/data/hassio/supervisor.ts",
+      "source_text": "callApiRaw( \"GET\", `hassio/${provider.includes(\"_\") ? `addons/${provider}` : provider}/logs${boot !== 0 ? `/boots/${boot}` : \"\"}/follow`, undefined, { Range: `entries=${cursor}:${skipLines}:${lines}`, }, signal )"
     },
     {
       "method": "GET",
       "path": "`hassio/${provider.includes(\"_\") ? `addons/${provider}` : provider}/logs${boot !== 0 ? `/boots/${boot}` : \"\"}`",
       "raw": true,
-      "source": "src/data/hassio/supervisor.ts"
+      "reason": "`${provider.includes(\"_\") ? `addons/${provider}` : provider}` is not an identifier or `a.b` chain",
+      "source": "src/data/hassio/supervisor.ts",
+      "source_text": "callApiRaw( \"GET\", `hassio/${provider.includes(\"_\") ? `addons/${provider}` : provider}/logs${boot !== 0 ? `/boots/${boot}` : \"\"}`, undefined, range ? { Range: range, } : undefined )"
     },
     {
       "method": "GET",
       "path": "`hassio/${provider.includes(\"_\") ? `addons/${provider}` : provider}/logs`",
       "raw": true,
-      "source": "src/data/hassio/supervisor.ts"
-    },
-    {
-      "method": "GET",
-      "path": "{ endpoint }",
-      "raw": true,
-      "source": "src/data/supervisor/supervisor.ts"
+      "reason": "`${provider.includes(\"_\") ? `addons/${provider}` : provider}` is not an identifier or `a.b` chain",
+      "source": "src/data/hassio/supervisor.ts",
+      "source_text": "callApi<string>( \"GET\", `hassio/${provider.includes(\"_\") ? `addons/${provider}` : provider}/logs` )"
     },
     {
       "method": "UNKNOWN",
-      "path": "{ endpoint }",
+      "path": "endpoint",
       "raw": true,
-      "source": "src/data/supervisor/common.ts"
+      "reason": "`options?.method || \"get\"` is not a string literal",
+      "source": "src/data/supervisor/common.ts",
+      "source_text": "{ type: \"supervisor/api\", endpoint, method: options?.method || \"get\", timeout: options?.timeout ?? null, data: options?.data, }"
+    },
+    {
+      "method": "UNKNOWN",
+      "path": "endpoint",
+      "raw": true,
+      "reason": "`endpoint` is not a once-declared, never-rebound const string",
+      "source": "src/data/supervisor/supervisor.ts",
+      "source_text": "supervisorApiWsRequest(conn2, { endpoint })"
     }
   ]
 }

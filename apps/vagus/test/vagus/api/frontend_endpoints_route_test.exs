@@ -55,16 +55,18 @@ defmodule Vagus.API.FrontendEndpointsRouteTest do
       "GET /os/datadisk/list offers no device, so the move dialog has nothing to submit"
   }
 
-  # Raw entries: the extractor could not resolve them to one path. Counted per
-  # file so a new one fails here and gets read, instead of being skipped.
+  # Raw entries: constructs outside the extractor's whitelist, each with its
+  # source text, so editing one fails the drift check. Counted per file so a
+  # new one fails here and gets read, instead of being skipped.
   @raw_reviewed %{
     "src/data/hassio/supervisor.ts" =>
       {6,
-       "log URLs whose first segment is the non-app provider (core, supervisor, host); the app branch is extracted as /addons/{param}/logs…"},
+       "log URLs whose first segment `provider` picks at runtime (`addons/<slug>`, core, supervisor, host); every family's /logs, /logs/follow and /logs/boots/:bootid routes are served"},
     "src/data/hassio/common.ts" =>
       {1, "fetchHassioStats's own body; its callers are extracted as <prefix>/stats"},
     "src/data/supervisor/common.ts" =>
-      {1, "supervisorApiCall's own body; its callers are extracted"},
+      {1,
+       "supervisorApiCall's own body (`options?.method || \"get\"`); its callers are extracted, a missing method as GET"},
     "src/data/supervisor/supervisor.ts" =>
       {2,
        "getSupervisorEventCollection's endpoint argument, which nothing calls; supervisorApiWsRequest's own body (`...request`), whose callers are extracted"}
