@@ -66,7 +66,8 @@ defmodule Vagus.API.FrontendEndpointsRouteTest do
     "src/data/supervisor/common.ts" =>
       {1, "supervisorApiCall's own body; its callers are extracted"},
     "src/data/supervisor/supervisor.ts" =>
-      {1, "getSupervisorEventCollection's endpoint argument, which nothing calls"}
+      {2,
+       "getSupervisorEventCollection's endpoint argument, which nothing calls; supervisorApiWsRequest's own body (`...request`), whose callers are extracted"}
   }
 
   defp concrete(path) do

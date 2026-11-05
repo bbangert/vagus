@@ -3,6 +3,13 @@
   "_source": "home-assistant/frontend src/**/*.ts at tag 20261028.4",
   "endpoints": [
     {
+      "method": "UNKNOWN",
+      "path": "...request",
+      "raw": true,
+      "reason": "`...request` in a supervisor/api call site can set the endpoint or method",
+      "source": "src/data/supervisor/supervisor.ts"
+    },
+    {
       "method": "GET",
       "path": "/addons",
       "source": "src/data/hassio/addon.ts"
