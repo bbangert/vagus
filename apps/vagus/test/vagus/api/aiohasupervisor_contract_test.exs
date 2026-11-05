@@ -42,7 +42,7 @@ defmodule Vagus.API.AiohasupervisorContractTest do
   import Plug.Conn
   import Vagus.AppFixtures
 
-  alias Vagus.Addon.Config
+  alias Vagus.Addon.{Config, Store}
   alias Vagus.API.{Router, Token}
 
   @opts Router.init([])
@@ -67,7 +67,11 @@ defmodule Vagus.API.AiohasupervisorContractTest do
                   |> String.replace_prefix("aiohasupervisor-", "")
                   |> String.replace_suffix("-contract.json", "")
 
-  # {fixture key, router path}
+  # {fixture key, router path} or {fixture key, router path, where}. A path
+  # is a GET unless written `{:post, path}`. `where` names the payload's
+  # model instances: `each: key` for every element of the list under `key`,
+  # `each_value: key` for every value of the map under `key`; without it the
+  # payload itself is the instance.
   @model_endpoints [
     {"root.RootInfo", "/info"},
     {"homeassistant.HomeAssistantInfo", "/core/info"},
@@ -81,7 +85,13 @@ defmodule Vagus.API.AiohasupervisorContractTest do
     # typed client, which is what opening any app's sidebar panel goes
     # through — the synthetic `vagus` panel included.
     {"addons.InstalledAddonComplete", "/addons/vagus/info"},
-    {"addons.InstalledAddonComplete", "/addons/contract_app/info"}
+    {"addons.InstalledAddonComplete", "/addons/contract_app/info"},
+    {"addons.InstalledAddon", "/addons", each: "addons"},
+    {"addons.StoreAddon", "/store", each: "addons"},
+    {"addons.Repository", "/store", each: "repositories"},
+    {"ingress.IngressPanel", "/ingress/panels", each_value: "panels"},
+    {"addons.AddonsStats", "/addons/contract_app/stats"},
+    {"addons.AddonsConfigValidate", {:post, "/addons/contract_app/options/validate"}}
   ]
 
   # Model field name => wire key, for fields mashumaro reads under an alias.
@@ -100,6 +110,22 @@ defmodule Vagus.API.AiohasupervisorContractTest do
       })
 
     install_app(config, state: :started)
+
+    # An empty store would pass `each:` vacuously.
+    original = :sys.get_state(Store)
+
+    :sys.replace_state(Store, fn state ->
+      %{
+        state
+        | catalog: %{"contract_app" => %{config: config, repository: "core"}},
+          repositories: [
+            %{slug: "core", url: "https://github.com/home-assistant/addons", source: "core"}
+          ]
+      }
+    end)
+
+    on_exit(fn -> :sys.replace_state(Store, fn _state -> original end) end)
+
     :ok
   end
 
@@ -107,36 +133,59 @@ defmodule Vagus.API.AiohasupervisorContractTest do
   defp authed(conn), do: put_req_header(conn, "authorization", "Bearer " <> Token.get())
   defp json_body(conn), do: Jason.decode!(conn.resp_body)
 
+  defp request({:post, path}),
+    do: conn(:post, path, "{}") |> put_req_header("content-type", "application/json")
+
+  defp request(path), do: conn(:get, path)
+
+  # `List.wrap/1`, not `[data]`: a literal non-empty list makes the compiler
+  # flag the emptiness check below as always true.
+  defp instances(data, []), do: List.wrap(data)
+  defp instances(data, each: key), do: Map.fetch!(data, key)
+  defp instances(data, each_value: key), do: data |> Map.fetch!(key) |> Map.values()
+
   describe "every required aiohasupervisor field is present on the wire" do
-    for {fixture_key, path} <- @model_endpoints do
+    for row <- @model_endpoints do
+      {fixture_key, path, where} =
+        case row do
+          {key, path} -> {key, path, []}
+          {key, path, where} -> {key, path, where}
+        end
+
+      {method, url} = if is_tuple(path), do: path, else: {:get, path}
+
       required_fields =
         @fixture
         |> Map.fetch!(fixture_key)
         |> Enum.filter(& &1["req"])
         |> Enum.map(&Map.get(@wire_aliases, &1["n"], &1["n"]))
 
-      test "GET #{path} response includes every required #{fixture_key} field" do
-        conn = conn(:get, unquote(path)) |> authed() |> call()
+      test "#{method |> Atom.to_string() |> String.upcase()} #{url} #{inspect(where)} " <>
+             "includes every required #{fixture_key} field" do
+        conn = unquote(Macro.escape(path)) |> request() |> authed() |> call()
 
         assert conn.status == 200
-        data = json_body(conn)["data"]
+        instances = instances(json_body(conn)["data"], unquote(where))
+        assert instances != [], "#{unquote(url)} has no #{unquote(fixture_key)} to check"
 
-        present = MapSet.new(Map.keys(data))
         required = MapSet.new(unquote(required_fields))
-        missing = MapSet.difference(required, present)
 
-        assert MapSet.size(missing) == 0,
-               "#{unquote(path)} is missing required aiohasupervisor field(s) " <>
-                 "#{inspect(MapSet.to_list(missing))} — Core's mashumaro deserializer " <>
-                 "will crash with MissingField on these; see this module's moduledoc " <>
-                 "to regenerate the fixture if aiohasupervisor bumped again, or fix the " <>
-                 "payload builder/model otherwise"
+        for instance <- instances do
+          missing = MapSet.difference(required, MapSet.new(Map.keys(instance)))
+
+          assert MapSet.size(missing) == 0,
+                 "#{unquote(url)} is missing required aiohasupervisor field(s) " <>
+                   "#{inspect(MapSet.to_list(missing))} — Core's mashumaro deserializer " <>
+                   "will crash with MissingField on these; see this module's moduledoc " <>
+                   "to regenerate the fixture if aiohasupervisor bumped again, or fix the " <>
+                   "payload builder/model otherwise"
+        end
       end
     end
   end
 
   test "the fixture covers every model this test checks" do
-    for {fixture_key, _path} <- @model_endpoints do
+    for row <- @model_endpoints, fixture_key = elem(row, 0) do
       assert Map.has_key?(@fixture, fixture_key), "fixture has no #{fixture_key}"
     end
   end
