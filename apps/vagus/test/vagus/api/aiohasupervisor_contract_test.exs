@@ -27,7 +27,10 @@ defmodule Vagus.API.AiohasupervisorContractTest do
 
   The script dumps every dataclass in the 8 `aiohasupervisor.models` modules
   the coordinator touches, not just the models wired into `@model_endpoints`,
-  so wiring in another endpoint needs no new dump. Save the output to
+  so wiring in another endpoint needs no new dump. It also writes
+  `_endpoints`, every request the app-facing clients make, read from the
+  client's source at the same version (`Vagus.API.ClientEndpointsRouteTest`
+  checks each is routed). Save the output to
   `test/fixtures/aiohasupervisor-<new version>-contract.json` and update
   `@fixture_path` below to match — `@client_version` derives from that
   path, and the "records its own `_version`" test asserts it equals the
