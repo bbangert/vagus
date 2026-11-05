@@ -449,6 +449,21 @@ defmodule Vagus.API.Router do
     end
   end
 
+  # The install gate's verdict without the install: 200 with empty data when
+  # the app can run here, else the same 400 reason an install would get.
+  get "/store/addons/:slug/availability" do
+    case Store.get(slug) do
+      {:ok, %{config: config}} ->
+        case Availability.check(%{config | slug: slug}) do
+          {true, nil} -> Envelope.send_ok(conn, %{})
+          {false, reason} -> Envelope.send_error(conn, reason, 400)
+        end
+
+      :error ->
+        Envelope.send_error(conn, "Addon #{slug} does not exist in the store", 404)
+    end
+  end
+
   # -- Store repositories (issue #5) ------------------------------------------
   #
   # The frontend's Apps → ⋮ → Repositories dialog. `store_repositories/0`
@@ -907,6 +922,17 @@ defmodule Vagus.API.Router do
   # refuse the save whenever `sys_security.force` is on.
   post "/addons/:slug/options/validate" do
     handle_addon_options_validate(conn, slug)
+  end
+
+  # Every app here runs a prebuilt image and none has a stdin pipe, so both
+  # are refusals for any installed app, worded as upstream's
+  # `AppRebuildImageBasedError` and `AppNotSupportedWriteStdinError`.
+  post "/addons/:slug/rebuild" do
+    refuse_unsupported(conn, slug, &"Cannot rebuild app #{&1.name}, it is image-based")
+  end
+
+  post "/addons/:slug/stdin" do
+    refuse_unsupported(conn, slug, &"App #{&1.slug} does not support writing to stdin")
   end
 
   # -- Stats coordinator (60s) -----------------------------------------------
@@ -2933,6 +2959,19 @@ defmodule Vagus.API.Router do
           {:error, reason} ->
             {status, message} = app_failure(reason)
             Envelope.send_error(conn, message, status)
+        end
+
+      {:error, :forbidden} ->
+        Envelope.send_error(conn, "unauthorized", 403)
+    end
+  end
+
+  defp refuse_unsupported(conn, slug, message) do
+    case resolve_info_slug(slug, conn.assigns.caller) do
+      {:ok, resolved} ->
+        case App.info(resolved) do
+          {:ok, %{config: config}} -> Envelope.send_error(conn, message.(config), 400)
+          :error -> Envelope.send_error(conn, "Addon #{resolved} does not exist", 404)
         end
 
       {:error, :forbidden} ->

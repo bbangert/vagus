@@ -55,7 +55,7 @@ defmodule Vagus.API.TiersTest do
     {"/os/ssh/x", :manager},
     {"/os/datadisk/x", :manager},
     {"/addons/reload", :manager},
-    {"/addons/core_mqtt/rebuild", :manager},
+    {"/addons/core_mqtt/ports", :manager},
     {"/addons/self/updatefoo", :manager},
     # Upstream's `(?!...)` is a lookahead, so it excludes whatever starts so.
     {"/os/ssh/authorized_keys/extra", :admin},
@@ -78,7 +78,7 @@ defmodule Vagus.API.TiersTest do
     {"/addons/core_mqtt/securit", :manager},
     {"/addons/core_mqtt/x/security", :manager},
     # The raw spelling of a slug a manager app percent-encodes.
-    {"/addons/%63ore_mqtt/rebuild", :manager},
+    {"/addons/%63ore_mqtt/ports", :manager},
     # Upstream gives a manager `/time/.+`. Nothing is served there.
     {"/time/options", :admin},
     {"/time/info", :default}
@@ -475,15 +475,14 @@ defmodule Vagus.API.TiersTest do
 
       # Every segment Vagus holds supervisor-only for a normal slug must hold
       # it for `self` as well.
-      for segment <- ~w(install update security changelog documentation sys_options) do
+      for segment <- ~w(install update security changelog documentation sys_options rebuild stdin) do
         assert Tiers.required(["addons", "self", segment]) == :supervisor,
                "/addons/self/#{segment} graded below :supervisor"
       end
 
       # And anything nobody has thought about falls to the manager family,
-      # never to :bypass. `rebuild`/`stdin`/`ports` are real upstream routes
-      # Vagus does not serve yet; they are the concrete form of "added later".
-      for segment <- ~w(rebuild stdin ports brand_new_route) do
+      # never to :bypass: these stand for a route added later.
+      for segment <- ~w(ports brand_new_route) do
         refute Tiers.required(["addons", "self", segment]) == :bypass,
                "/addons/self/#{segment} was open by default"
 
