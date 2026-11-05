@@ -397,8 +397,9 @@ defmodule Vagus.App do
   an image bump is legitimate and starts it again. Shutdown and a cold
   backup halt one through units and the backup policy, not through these.
 
-  `restore/5` is refused for the orchestrator alone: it would overwrite the
-  live login under it, while the memory DB's backup is how it is
+  `restore/5` is refused for the orchestrator, as it would overwrite the
+  live login under it, and for the panel, whose backed-up `wanted` could
+  leave it stopped across reboots; the memory DB's backup is how it is
   recovered.
   """
   @spec protected?(String.t() | nil) :: boolean()
@@ -597,9 +598,11 @@ defmodule Vagus.App do
       |> Map.new()
       |> Map.merge(%{staging_dir: staging_dir, options: options, start?: start?})
 
-    if orchestrator?(slug),
-      do: {:error, :protected},
-      else: command(slug, :restore, args)
+    cond do
+      Config.reserved_slug?(slug) -> {:error, :system_app}
+      orchestrator?(slug) -> {:error, :protected}
+      true -> command(slug, :restore, args)
+    end
   end
 
   # The container was started as asked, and boot would report a running app

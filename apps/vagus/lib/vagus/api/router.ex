@@ -2998,6 +2998,9 @@ defmodule Vagus.API.Router do
   @restore_protected_message "The agent orchestrator app cannot be restored: " <>
                                "its live session would be overwritten"
 
+  defp restore_system_app_message,
+    do: "App #{AdminPanel.name()} is part of the device and cannot be restored"
+
   # The container did what was asked; the host failed to record it or to
   # clean up after it, which is no fault of the request.
   defp app_failure({:persist, reason}),
@@ -3552,9 +3555,11 @@ defmodule Vagus.API.Router do
   # Restore runs per slug in order, so a protected slug late in the list would
   # be refused only after the earlier ones were already overwritten.
   defp reject_protected_restore(addon_slugs) do
-    if Enum.any?(addon_slugs, &App.orchestrator?/1),
-      do: {:error, @restore_protected_message},
-      else: :ok
+    cond do
+      AdminPanel.slug() in addon_slugs -> {:error, restore_system_app_message()}
+      Enum.any?(addon_slugs, &App.orchestrator?/1) -> {:error, @restore_protected_message}
+      true -> :ok
+    end
   end
 
   defp run_backup_restore(conn, slug, addon_slugs) do
@@ -3596,6 +3601,9 @@ defmodule Vagus.API.Router do
 
   defp restore_error_message({:restore, _addon_slug, :protected}),
     do: @restore_protected_message
+
+  defp restore_error_message({:restore, _addon_slug, :system_app}),
+    do: restore_system_app_message()
 
   defp restore_error_message({:restore, addon_slug, :shutting_down}),
     do: "Restore of addon #{addon_slug} was interrupted: the system is shutting down"

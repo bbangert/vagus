@@ -710,6 +710,14 @@ defmodule Vagus.AppTest do
       assert {:ok, %{user_options: %{"a" => 1}}} = app_info(slug)
     end
 
+    test "the panel is refused before anything stops it" do
+      install_app(admin_panel_config(), state: :started)
+
+      assert {:error, :system_app} = App.restore("vagus", "/staging", nil, false)
+      refute_received {:step, :stop, _input, _task}
+      assert {:ok, %{state: :started, wanted: :started}} = app_info("vagus")
+    end
+
     test "a busy app refuses it, and an uninstall is refused mid-restore" do
       slug = track(config(), state: :started)
       restore = Task.async(fn -> App.restore(slug, "/staging", nil, false) end)
