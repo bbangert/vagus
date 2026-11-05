@@ -40,17 +40,16 @@ defmodule Vagus.Ingress do
 
   ## Token → slug resolution (§B2.2 step 2)
 
-  `resolve_token/2` first compares against the synthetic admin panel's token
+  `resolve_token/2` first compares against the admin panel's token
   (see "Admin panel token" below), then looks up the token's hash in
   `Vagus.App.Directory`, where each ingress app's process registers it with
   its slug. The key goes with the process, so no entry can outlive its app.
 
   ## Admin panel token
 
-  `Vagus.API.AdminPanel` is a synthetic ingress panel with no app process,
-  so it has no `ingress_token` in the directory. One is minted here at
-  `init/1` instead and matched *first* by `resolve_token/2`, so the reserved
-  `vagus` slug can never be shadowed by an app that happens to share it.
+  `Vagus.API.AdminPanel`'s app registers no `ingress_token` in the
+  directory (`Vagus.App.Policy` skips the reserved slug's). One is minted
+  here at `init/1` instead and matched *first* by `resolve_token/2`.
 
   Like sessions, this token is **per-boot and in-memory only**: restarting
   this GenServer mints a new one, which invalidates the previous panel URL.
@@ -120,7 +119,7 @@ defmodule Vagus.Ingress do
   everything else (unknown token, or a token belonging to a non-ingress
   add-on) is `:error`.
 
-  The synthetic admin panel's token (see the moduledoc) resolves to
+  The admin panel's token (see the moduledoc) resolves to
   `Vagus.API.AdminPanel.slug/0` and is checked before any add-on.
   """
   @spec resolve_token(String.t(), GenServer.server()) :: {:ok, String.t()} | :error
@@ -129,7 +128,7 @@ defmodule Vagus.Ingress do
   end
 
   @doc """
-  The synthetic admin panel's ingress token, minted at `init/1` — the
+  The admin panel's ingress token, minted at `init/1` — the
   `<token>` in `Vagus.API.AdminPanel`'s `ingress_url`.
 
   `{:error, :unavailable}` when this GenServer isn't running
@@ -226,11 +225,8 @@ defmodule Vagus.Ingress do
     {:reply, {:ok, state.admin_token}, state}
   end
 
-  # The synthetic panel wins over any add-on that managed to claim the same
-  # slug — matching `Vagus.Ingress.Panels.list/1` and `Vagus.API.Router`'s
-  # own precedence for the reserved slug. Compared in constant time: this
-  # token is a bearer capability for a page that hands out the device's SSH
-  # private key.
+  # Compared in constant time: this token is a bearer capability for a page
+  # that hands out the device's SSH private key.
   def handle_call({:resolve_token, ingress_token}, _from, state) do
     if Plug.Crypto.secure_compare(ingress_token, state.admin_token) do
       {:reply, {:ok, AdminPanel.slug()}, state}

@@ -368,7 +368,11 @@ defmodule Vagus.App do
     do: unprotected(slug, fn -> slug |> command(:restart, %{}) |> started(slug) end)
 
   @spec uninstall(String.t()) :: :ok | {:error, term()}
-  def uninstall(slug), do: unprotected(slug, fn -> command(slug, :uninstall, %{}) end)
+  def uninstall(slug) do
+    if Config.reserved_slug?(slug),
+      do: {:error, :system_app},
+      else: unprotected(slug, fn -> command(slug, :uninstall, %{}) end)
+  end
 
   @doc "The agent flavor's orchestrator app, which holds the board's agent login and makes its workers."
   @spec orchestrator?(String.t() | nil) :: boolean()
@@ -386,18 +390,21 @@ defmodule Vagus.App do
 
   @doc """
   The agent flavor's own apps (`:protected_apps`: the orchestrator and its
-  memory DB). A request may not stop, restart or uninstall one, nor change
-  its `boot` or `watchdog`: from inside the board that is the agent
-  cutting off its own control or memory. `update/2` stays allowed, since
+  memory DB), and Vagus's own admin panel. A request may not stop, restart
+  or uninstall one, nor change its `boot` or `watchdog`: from inside the
+  board that is the agent cutting off its own control or memory, and for
+  the panel, the operator's way to the device's SSH key. `update/2` stays allowed, since
   an image bump is legitimate and starts it again. Shutdown and a cold
   backup halt one through units and the backup policy, not through these.
 
-  `restore/5` is refused for the orchestrator alone: it would overwrite the
-  live login under it, while the memory DB's backup is how it is
+  `restore/5` is refused for the orchestrator, as it would overwrite the
+  live login under it, and for the panel, whose backed-up `wanted` could
+  leave it stopped across reboots; the memory DB's backup is how it is
   recovered.
   """
   @spec protected?(String.t() | nil) :: boolean()
-  def protected?(slug), do: slug in Application.get_env(:vagus, :protected_apps, [])
+  def protected?(slug),
+    do: Config.reserved_slug?(slug) or slug in Application.get_env(:vagus, :protected_apps, [])
 
   defp unprotected(slug, fun), do: if(protected?(slug), do: {:error, :protected}, else: fun.())
 
@@ -409,7 +416,8 @@ defmodule Vagus.App do
   `settings:` are per-install settings committed with the install itself.
   They skip `set/2`'s protection, which guards against requests and would
   otherwise leave the orchestrator app with no way to get its boot and
-  watchdog; no request reaches this option.
+  watchdog; no request reaches this option. Nor `builtin: true`, which lets
+  boot's default install take Vagus's reserved slug.
   """
   @spec install(Config.t(), keyword()) :: :ok | {:error, :already_installed | term()}
   def install(%Config{slug: slug} = config, opts \\ []) do
@@ -419,7 +427,8 @@ defmodule Vagus.App do
     args = %{
       config: config,
       wanted: Keyword.get(opts, :wanted, :stopped),
-      settings: Map.new(settings)
+      settings: Map.new(settings),
+      builtin: Keyword.get(opts, :builtin, false)
     }
 
     case Instances.ensure(slug) do
@@ -589,9 +598,11 @@ defmodule Vagus.App do
       |> Map.new()
       |> Map.merge(%{staging_dir: staging_dir, options: options, start?: start?})
 
-    if orchestrator?(slug),
-      do: {:error, :protected},
-      else: command(slug, :restore, args)
+    cond do
+      Config.reserved_slug?(slug) -> {:error, :system_app}
+      orchestrator?(slug) -> {:error, :protected}
+      true -> command(slug, :restore, args)
+    end
   end
 
   # The container was started as asked, and boot would report a running app

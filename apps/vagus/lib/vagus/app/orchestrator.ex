@@ -16,7 +16,9 @@ defmodule Vagus.App.Orchestrator do
        and on that fresh install recorded as wanted started; a container one
        is installed once the gates are behind, since its install pulls an
        image, in a unit that is spawned and never awaited, which starts it
-       once installed. One that fails is logged and tried again next boot;
+       once installed. One that fails is logged and tried again next boot.
+       Any installed admin panel is then brought to the firmware's version,
+       whether or not it is a default app;
     2. the `tree` gate, then native apps get their boot rule: they need no
        engine, so an offline boot still brings the broker up;
     3. the `engine`, `network` and `api` gates (`Vagus.App.Gates`), each
@@ -317,6 +319,9 @@ defmodule Vagus.App.Orchestrator do
   defp run_boot(cfg) do
     {native, container} = Enum.split_with(cfg.default_apps, cfg.units.builtin_native?)
     Enum.each(native, &install_default(&1, cfg.units))
+    # Every installed panel, not only a default one: a flavor that leaves it
+    # out of `default_apps` may still have one kept from another.
+    Enum.each(cfg.units.slugs.(), cfg.units.follow_firmware)
     cfg = Map.put(cfg, :container_defaults, container)
 
     plan = if cfg.units.agent?.(), do: @agent_plan, else: @plan

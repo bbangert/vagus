@@ -33,6 +33,13 @@ defmodule Vagus.AppFixtures do
     config
   end
 
+  @doc "The admin panel app's config, as boot's default install takes it."
+  @spec admin_panel_config() :: Config.t()
+  def admin_panel_config do
+    {:ok, config} = Config.parse(Vagus.API.AdminPanel.app_config(), reserved: :allow)
+    config
+  end
+
   @doc """
   Writes the app's file and (re)starts its process, which reads it.
   Installing a slug again keeps its ingress token, user options and settings,

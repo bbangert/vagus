@@ -177,26 +177,25 @@ defmodule Vagus.App.FileTest do
       assert {entry.user_options, entry.ports} == {%{}, %{"8883/tcp" => nil}}
     end
 
-    test "a file whose config fails to parse, names another slug, or is reserved is skipped",
+    test "a file whose config fails to parse, names another slug, or says no wanted is skipped",
          %{config: c, dir: dir} do
       put_raw(dir, "bad", %{"config" => %{"not" => "a config"}, "wanted" => "started"})
       put_raw(dir, "other", file_body(c))
-
-      put_raw(
-        dir,
-        "vagus",
-        file_body(%{c | slug: "vagus"}) |> put_in(["config", "slug"], "vagus")
-      )
-
       put_raw(dir, "core_mosquitto", file_body(c, %{"wanted" => "running"}))
 
-      log =
-        capture_log(fn ->
-          for slug <- ["bad", "other", "vagus", "core_mosquitto"],
-              do: assert({:error, :invalid} = AppFile.read(slug, dir))
-        end)
+      capture_log(fn ->
+        for slug <- ["bad", "other", "core_mosquitto"],
+            do: assert({:error, :invalid} = AppFile.read(slug, dir))
+      end)
+    end
 
-      assert log =~ ~s(skipping app "vagus": slug 'vagus' is reserved)
+    # The panel's slug is one `Config.parse/1` refuses to every store config.
+    test "Vagus's own admin panel app round-trips", %{dir: dir} do
+      {:ok, panel} = Config.parse(Vagus.API.AdminPanel.app_config(), reserved: :allow)
+      assert :ok = AppFile.write(data(panel), dir)
+
+      assert {:ok, %{config: ^panel, ingress_panel: true}} = AppFile.read("vagus", dir)
+      assert %Config{slug: "vagus", backend: :native} = AppFile.stub("vagus", dir)
     end
 
     # An earlier release persisted `privileged:` without checking it. Such an
@@ -353,13 +352,18 @@ defmodule Vagus.App.FileTest do
       addons = Jason.decode!(File.read!(legacy))["addons"]
       broken = %{"config" => %{}, "state" => "started"}
 
+      # A legacy record the panel's own config would decode, were it read.
+      {:ok, panel} = Config.parse(Vagus.API.AdminPanel.app_config(), reserved: :allow)
+      vagus = %{"config" => Config.to_persistable(panel), "state" => "started"}
+
       addons =
-        Map.merge(addons, %{"broken" => broken, "vagus" => broken, "bad slug!" => broken})
+        Map.merge(addons, %{"broken" => broken, "vagus" => vagus, "bad slug!" => broken})
 
       File.write!(legacy, Jason.encode!(%{"version" => 1, "addons" => addons}))
 
       log = capture_log(fn -> assert {:ok, 4} = AppFile.import_once(dir, legacy) end)
       assert log =~ ~s("vagus" not imported)
+      refute "vagus" in AppFile.saved(dir)
       assert log =~ ~s("bad slug!" not imported)
       assert "broken" in AppFile.saved(dir)
       capture_log(fn -> assert {:error, :invalid} = AppFile.read("broken", dir) end)

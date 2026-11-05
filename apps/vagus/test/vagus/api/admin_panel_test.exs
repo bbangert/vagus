@@ -1,9 +1,9 @@
 defmodule Vagus.API.AdminPanelTest do
   @moduledoc """
-  `Vagus.API.AdminPanel` — the synthetic `vagus` ingress panel.
+  `Vagus.API.AdminPanel` — the `vagus` admin panel app.
 
   The panel leg needs no Finch/Bandit: `Vagus.API.IngressProxy.call/2` is a
-  plain Plug and the synthetic slug never reaches the reverse-proxy path, so
+  plain Plug and the panel's slug never reaches the reverse-proxy path, so
   a `Plug.Test` conn exercises the real end-to-end route (session cookie →
   token resolution → page/key) in-process.
 
@@ -26,6 +26,7 @@ defmodule Vagus.API.AdminPanelTest do
 
   import Vagus.AppFixtures
 
+  alias Vagus.Addon.Backend.Native
   alias Vagus.Addon.Config
   alias Vagus.API.{AdminPanel, IngressProxy, Router, Token}
   alias Vagus.DSP
@@ -35,6 +36,7 @@ defmodule Vagus.API.AdminPanelTest do
   @router_opts Router.init([])
 
   @admin_user "01ab23cd45ef67890123456789abcdef"
+  @panel_id "addon_vagus"
   @boundary "vagus-panel-dsp-boundary"
 
   # ELF32 header size and the table entry sizes a Hexagon object uses.
@@ -68,6 +70,11 @@ defmodule Vagus.API.AdminPanelTest do
 
     {:ok, session} = Vagus.Ingress.create_session(Vagus.Ingress, user_id: @admin_user)
     {:ok, token} = Vagus.Ingress.admin_token()
+
+    # As boot's default install leaves it: installed, its subtree running.
+    install_app(admin_panel_config(), state: :started, ingress_panel: true)
+    :ok = Native.start(@panel_id)
+    on_exit(fn -> Native.stop(@panel_id) end)
 
     %{session: session, token: token}
   end
@@ -128,6 +135,16 @@ defmodule Vagus.API.AdminPanelTest do
     |> Router.call(@router_opts)
   end
 
+  defp supervisor_post(path, body \\ %{}) do
+    :post
+    |> conn(path, Jason.encode!(body))
+    |> put_req_header("authorization", "Bearer #{Token.get()}")
+    |> put_req_header("content-type", "application/json")
+    |> Router.call(@router_opts)
+  end
+
+  defp message(conn), do: Jason.decode!(conn.resp_body)["message"]
+
   defp addon_call(path, token) do
     :get
     |> conn(path)
@@ -143,7 +160,7 @@ defmodule Vagus.API.AdminPanelTest do
   defp data(conn), do: Jason.decode!(conn.resp_body)["data"]
 
   describe "Vagus.Ingress.Panels.list/0" do
-    test "advertises the synthetic panel with the four keys aiohasupervisor requires" do
+    test "advertises the panel with the four keys aiohasupervisor requires" do
       entry = Panels.list()["vagus"]
 
       assert Map.keys(entry) |> Enum.sort() == ["admin", "enable", "icon", "title"]
@@ -151,6 +168,19 @@ defmodule Vagus.API.AdminPanelTest do
       assert entry["enable"] == true
       assert is_binary(entry["title"]) and entry["title"] != ""
       assert is_binary(entry["icon"]) and entry["icon"] != ""
+    end
+
+    test "the user hiding the panel hides it" do
+      assert supervisor_post("/addons/vagus/options", %{"ingress_panel" => false}).status == 200
+
+      assert Panels.list()["vagus"]["enable"] == false
+      assert {:ok, %{ingress_panel: false}} = app_info("vagus")
+    end
+
+    test "before boot installs the app, the static entry stands in" do
+      forget_app("vagus")
+
+      assert Panels.list()["vagus"] == AdminPanel.panel_entry()
     end
 
     test "still lists real ingress add-ons alongside it" do
@@ -446,6 +476,15 @@ defmodule Vagus.API.AdminPanelTest do
   end
 
   describe "GET /addons/vagus/info" do
+    # Its saved token is the app process's, and opens nothing.
+    test "the app's saved ingress token is never a capability", %{token: token} do
+      {:ok, %{ingress_token: saved}} = app_info("vagus")
+
+      assert saved != token
+      assert Vagus.Ingress.resolve_token(saved) == :error
+      refute data(supervisor_call("/addons/vagus/info"))["ingress_url"] =~ saved
+    end
+
     test "returns the payload ha-panel-app needs" do
       conn = supervisor_call("/addons/vagus/info")
       assert conn.status == 200
@@ -492,15 +531,132 @@ defmodule Vagus.API.AdminPanelTest do
     end
   end
 
-  describe "GET /addons regression" do
-    test "the synthetic slug is absent from the strictly-modelled add-on list" do
-      slugs = Enum.map(data(supervisor_call("/addons"))["addons"], & &1["slug"])
-      refute "vagus" in slugs
+  describe "GET /addons" do
+    test "lists the panel as an installed, started, up-to-date app", %{token: token} do
+      conn = supervisor_call("/addons")
+      entry = Enum.find(data(conn)["addons"], &(&1["slug"] == "vagus"))
+
+      assert %{
+               "name" => "Vagus admin panel",
+               "state" => "started",
+               "update_available" => false,
+               "repository" => "core"
+             } = entry
+
+      assert entry["version"] == entry["version_latest"]
+      refute conn.resp_body =~ token
+    end
+  end
+
+  describe "the panel's app lifecycle" do
+    test "stop and restart are refused, and the panel keeps serving", ctx do
+      for action <- ["stop", "restart"] do
+        conn = supervisor_post("/addons/vagus/#{action}")
+
+        assert conn.status == 400
+        assert message(conn) =~ "Vagus admin panel is part of the device"
+      end
+
+      assert Native.running?(@panel_id)
+      assert ingress_call("/ingress/#{ctx.token}/", session: ctx.session).status == 200
+    end
+
+    test "boot and watchdog cannot be changed; the panel toggle can" do
+      conn = supervisor_post("/addons/vagus/options", %{"boot" => "manual"})
+      assert conn.status == 400
+      assert message(conn) =~ "Vagus admin panel is part of the device"
+
+      assert supervisor_post("/addons/vagus/options", %{"ingress_panel" => true}).status == 200
+    end
+
+    test "uninstall is refused, naming why" do
+      conn = supervisor_post("/addons/vagus/uninstall")
+
+      assert conn.status == 400
+
+      assert message(conn) ==
+               "App Vagus admin panel is part of the device and cannot be uninstalled"
+
+      assert {:ok, _entry} = app_info("vagus")
+    end
+
+    test "install, from the store or not, is already installed" do
+      for path <- ["/addons/vagus/install", "/store/addons/vagus/install"] do
+        conn = supervisor_post(path)
+
+        assert conn.status == 400
+        assert message(conn) == "App Vagus admin panel is already installed"
+      end
+    end
+
+    test "update has none to offer" do
+      conn = supervisor_post("/store/addons/vagus/update")
+
+      assert conn.status == 400
+      assert message(conn) == "No update available for this addon"
+    end
+
+    test "rebuild and stdin are refused as for any image-based app" do
+      assert supervisor_post("/addons/vagus/rebuild").status == 400
+      assert supervisor_post("/addons/vagus/stdin").status == 400
+    end
+
+    test "options validate, and the protection mode saves" do
+      conn = supervisor_post("/addons/vagus/options/validate")
+      assert %{"valid" => true} = data(conn)
+
+      assert supervisor_post("/addons/vagus/security", %{"protected" => false}).status == 200
+      assert {:ok, %{protected: false}} = app_info("vagus")
+    end
+
+    # Its root is a worker, which a supervisor's `which_children` call kills.
+    test "stats are the subtree's memory, and reading them leaves it running" do
+      root = Process.whereis(Native.subtree_name(@panel_id))
+
+      assert data(supervisor_call("/addons/vagus/stats"))["memory_usage"] > 0
+      assert Process.alive?(root)
+    end
+
+    test "with its subtree down, the panel is 503 and its stats are zero", ctx do
+      :ok = Native.stop(@panel_id)
+
+      assert ingress_call("/ingress/#{ctx.token}/", session: ctx.session).status == 503
+      assert data(supervisor_call("/addons/vagus/stats"))["memory_usage"] == 0
+    end
+  end
+
+  describe "the panel's log" do
+    test "records what was asked for, by whom and the answer, never the token", ctx do
+      stub_admin({:ok, true})
+      ingress_call("/ingress/#{ctx.token}/key?t=#{ctx.token}", session: ctx.session)
+      stub_admin({:ok, false})
+      ingress_call("/ingress/#{ctx.token}/#{ctx.token}", session: ctx.session)
+
+      lines = await_log_lines(2)
+      log = supervisor_call("/addons/vagus/logs").resp_body
+
+      assert [key, denied] = lines
+      assert key =~ ~s|key user="#{@admin_user}" 200|
+      assert denied =~ ~s|other user="#{@admin_user}" denied (not_admin)|
+      assert log =~ key
+      refute log =~ ctx.token
+    end
+  end
+
+  # The handler casts; the line lands after the request returns.
+  defp await_log_lines(n, tries \\ 50) do
+    case Native.logs(@panel_id) do
+      lines when length(lines) >= n or tries == 0 ->
+        lines
+
+      _fewer ->
+        Process.sleep(10)
+        await_log_lines(n, tries - 1)
     end
   end
 
   describe "Vagus.Ingress.resolve_token/2" do
-    test "the admin token resolves to the synthetic slug", %{token: token} do
+    test "the admin token resolves to the panel's slug", %{token: token} do
       assert {:ok, "vagus"} = Vagus.Ingress.resolve_token(token)
       assert AdminPanel.slug() == "vagus"
     end

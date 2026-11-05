@@ -257,6 +257,32 @@ defmodule Vagus.API.BackupRouterTest do
       assert File.read!(Path.join(data_dir, "f.txt")) == "mutated"
     end
 
+    test "the panel is backed up but refused a restore, the whole request untouched", %{
+      data_root: dr
+    } do
+      install("core_restore_a", dr)
+      install_app(admin_panel_config(), state: :started)
+      slug = create_backup("core_restore_a", "vagus")
+      assert {:ok, %{backup: b}} = Backups.get(slug)
+      assert Enum.any?(b["addons"], &(&1["slug"] == "vagus"))
+
+      data_dir = Path.join([dr, "addons", "data", "core_restore_a"])
+      File.write!(Path.join(data_dir, "f.txt"), "mutated")
+
+      conn =
+        supervisor_call(:post, "/backups/#{slug}/restore/partial", %{
+          "addons" => ["core_restore_a", "vagus"]
+        })
+
+      assert conn.status == 400
+
+      assert body(conn)["message"] ==
+               "App Vagus admin panel is part of the device and cannot be restored"
+
+      assert File.read!(Path.join(data_dir, "f.txt")) == "mutated"
+      assert {:ok, %{state: :started, wanted: :started}} = app_info("vagus")
+    end
+
     test "the protected memory app is restored: its backup is its recovery", %{data_root: dr} do
       install("agent_memory", dr)
       slug = create_backup("agent_memory")

@@ -518,7 +518,7 @@ defmodule Vagus.App.Steps do
 
   @spec native_allowed?(String.t()) :: boolean()
   def native_allowed?(slug),
-    do: slug in Application.get_env(:vagus, :native_addon_slugs, ["core_mqtt"])
+    do: slug in Application.get_env(:vagus, :native_addon_slugs, ["core_mqtt", "vagus"])
 
   # A container named `addon_<slug>` may already exist — e.g. after a device
   # reboot or emulator restart, the previous session's container survives while
@@ -666,7 +666,7 @@ defmodule Vagus.App.Steps do
   #
   # SECURITY: `backend:` comes from UNTRUSTED store `config.yaml`. Native add-ons
   # run un-sandboxed (no container/apparmor/caps), so `:native` is honoured ONLY
-  # for a first-party allowlist (`:native_addon_slugs`, default `["core_mqtt"]`).
+  # for a first-party allowlist (`:native_addon_slugs`, default `["core_mqtt", "vagus"]`).
   # A store add-on that declares `backend: native` on any other slug silently
   # falls back to the container backend — it can't escape the sandbox or
   # impersonate the built-in broker.

@@ -1,36 +1,28 @@
 defmodule Vagus.API.AdminPanel do
   @moduledoc """
-  The **synthetic** `vagus` ingress panel — an admin page in the Home
-  Assistant sidebar that is backed by no add-on container at all.
+  The `vagus` admin panel — a page in the Home Assistant sidebar showing
+  the device's SSH access key (`Vagus.SSHAccess`) fingerprint plus usage
+  instructions, serving the matching private key as a download, and taking
+  the operator's DSP skel upload.
 
-  It shows the device's SSH access key (`Vagus.SSHAccess`) fingerprint plus
-  usage instructions, and serves the matching private key as a download.
+  ## A native app
 
-  ## How Core sees it
+  Core reaches an app's slug from `GET /addons`, `GET /ingress/panels` and
+  every per-slug route, each parsed by `aiohasupervisor`'s strict models, so
+  the panel is installed as an ordinary native app (`app_config/0`, by
+  boot's default install, `Vagus.App.Units`) and answers all of them through
+  the same code as any other app. What stays its own:
 
-  Three Core-facing surfaces, all pointed here:
-
-    * `GET /ingress/panels` (`Vagus.Ingress.Panels.list/0`) advertises
-      `panel_entry/0` under the `vagus` slug. That response is parsed by
-      `aiohasupervisor`'s strict `IngressPanel` model, so all four of
-      `title`/`icon`/`admin`/`enable` must be present — a missing key breaks
-      panel registration for *every* add-on, not just this one.
-    * `GET /addons/vagus/info` (`Vagus.API.Router`) returns `info/0`. Core's
-      frontend panel component (`ha-panel-app`) builds its iframe `src`
-      solely from `ingress_url`, refuses to render on a falsy `version`, and
-      offers to start the add-on unless `state` is `"startup"`/`"started"`.
-      Since Core 2026.11.0 the frontend reaches it through WS
-      `supervisor/ingress/info`, which parses it with `aiohasupervisor`'s
-      strict `InstalledAddonComplete` model — so it is rendered by
-      `Vagus.Addon.Info`, the same as a real app's, and a missing field is
-      a `MissingField` that leaves the sidebar entry dead.
-    * `GET /ingress/<token>/…` (`Vagus.API.IngressProxy`) is served by
-      `serve/2` instead of being reverse-proxied to a container.
-
-  The synthetic slug deliberately does **not** appear in `GET /addons`:
-  that response IS strictly modelled (`InstalledAddon` →
-  `InstalledAddonComplete`, 73 required fields), and a synthetic entry
-  there would break the whole add-on coordinator.
+    * its subtree is only its log buffer (`Vagus.Addon.Backend.Native`): the
+      page itself is served in-process by `serve/2`, which
+      `Vagus.API.IngressProxy` calls instead of proxying, and answers 503
+      for while the app is not running;
+    * its capability is `Vagus.Ingress`'s per-boot admin token, which
+      `info_settings/1` puts in `ingress_url` in place of the app's saved
+      token, which opens nothing;
+    * it is protected (`Vagus.App.protected?/1`) and cannot be uninstalled;
+    * `panel_entry/0` lists it in `GET /ingress/panels` until boot has
+      installed it.
 
   ## Security posture
 
@@ -82,21 +74,27 @@ defmodule Vagus.API.AdminPanel do
 
   require Logger
 
-  alias Vagus.Addon.{Config, Info}
   alias Vagus.API.StaticData
   alias Vagus.{DSP, SSHAccess}
 
   @slug "vagus"
+  @name "Vagus admin panel"
   @title "Vagus"
   @icon "mdi:key-chain"
+  @log_event [:vagus, :admin_panel, :request]
 
-  @doc "The reserved slug of the synthetic panel."
+  @doc "The reserved slug of the panel's app."
   @spec slug() :: String.t()
   def slug, do: @slug
 
+  @doc "The app's name, as Core names its device and update entity."
+  @spec name() :: String.t()
+  def name, do: @name
+
   @doc """
-  The `GET /ingress/panels` entry for this panel — exactly the four
-  string keys `aiohasupervisor`'s `IngressPanel` model requires.
+  The `GET /ingress/panels` entry for the window before boot installs the
+  app — exactly the four string keys `aiohasupervisor`'s `IngressPanel`
+  model requires.
   """
   @spec panel_entry() :: %{String.t() => String.t() | boolean()}
   def panel_entry do
@@ -104,51 +102,71 @@ defmodule Vagus.API.AdminPanel do
   end
 
   @doc """
-  The `GET /addons/vagus/info` payload: a full `InstalledAddonComplete`
-  describing this panel as an app that is always started.
-
-  The trailing slash on `ingress_url` is load-bearing — relative links
-  inside the iframe resolve against it.
-
-  `ingress_url`/`ingress_entry` are `nil` when `Vagus.Ingress` isn't running
-  (e.g. `:ingress_enabled false`); the frontend then reports "no ingress"
-  rather than rendering a broken iframe.
+  The app's raw config, for `Vagus.Addon.Config.parse(raw, reserved:
+  :allow)`. Its version is the firmware's, so the app is never offered an
+  update of its own.
   """
-  @spec info() :: %{String.t() => term()}
-  def info do
-    settings =
-      case Vagus.Ingress.admin_token() do
-        {:ok, token} -> %{ingress_token: token, ingress_panel: true}
-        {:error, :unavailable} -> %{ingress_panel: true}
-      end
-
-    Info.render(config(), :started, %{}, settings)
-  end
-
-  # Describes the panel, not a container: no ports, no options form, and
-  # `apparmor: false` because it runs inside Vagus itself, under no profile.
-  # The board's own arch/machine make it `available` wherever it runs.
-  defp config do
-    %Config{
-      name: @title,
-      version: version(),
-      slug: @slug,
-      description: "Device administration: SSH access key and DSP setup",
-      arch: [StaticData.arch()],
-      machine: [StaticData.machine()],
-      startup: "system",
-      stage: "stable",
-      url: "https://github.com/bbangert/vagus",
-      apparmor: false,
-      ingress: true,
-      # 0 is `Info`'s "no port" sentinel; the panel is served in-process.
-      ingress_port: 0,
-      panel_icon: @icon,
-      panel_title: @title,
-      panel_admin: true,
-      schema: false
+  @spec app_config() :: %{String.t() => term()}
+  def app_config do
+    %{
+      "name" => @name,
+      "version" => version(),
+      "slug" => @slug,
+      "description" => "Device administration: SSH access key and DSP setup",
+      "arch" => [StaticData.arch()],
+      "machine" => [StaticData.machine()],
+      "url" => "https://github.com/bbangert/vagus",
+      "backend" => "native",
+      # A placeholder, as for every native app: nothing is ever pulled.
+      "image" => "local/vagus",
+      "startup" => "system",
+      "boot" => "auto",
+      "init" => false,
+      # It runs inside Vagus itself, under no profile.
+      "apparmor" => false,
+      "ingress" => true,
+      # Served in-process, so nothing dials it; 0 would have install pick a
+      # dynamic port for it.
+      "ingress_port" => Application.get_env(:vagus, :api_port, 8888),
+      "panel_icon" => @icon,
+      "panel_title" => @title,
+      "panel_admin" => true,
+      "options" => %{},
+      "schema" => false
     }
   end
+
+  @doc """
+  The app's `Vagus.Addon.Info.render/4` settings with the per-boot admin
+  token in place of its saved one. The trailing slash on the rendered
+  `ingress_url` is load-bearing — relative links inside the iframe resolve
+  against it. With `Vagus.Ingress` not running (`:ingress_enabled false`)
+  there is no token, and the frontend reports "no ingress" rather than
+  rendering a broken iframe.
+  """
+  @spec info_settings(map()) :: map()
+  def info_settings(settings) do
+    case Vagus.Ingress.admin_token() do
+      {:ok, token} -> Map.put(settings, :ingress_token, token)
+      {:error, :unavailable} -> Map.delete(settings, :ingress_token)
+    end
+  end
+
+  @doc "The telemetry event `serve/2` emits once per request, for the app's log."
+  @spec log_event() :: :telemetry.event_name()
+  def log_event, do: @log_event
+
+  @doc """
+  The app's log line for a request: what was asked for, by which Core user,
+  and the answer. Never the path, query, headers or body: the path carries
+  the admin token, and the answer to `key` is the device's root key.
+  """
+  @spec log_line(:telemetry.event_name(), map(), map()) :: String.t()
+  def log_line(@log_event, _measurements, %{kind: kind, user_id: user_id, outcome: outcome}),
+    do: "#{kind} user=#{inspect(user_id)} #{outcome(outcome)}"
+
+  defp outcome({:denied, reason}), do: "denied (#{reason})"
+  defp outcome(status), do: to_string(status)
 
   @doc """
   Serves the panel itself. `rest` is `conn.path_info` with the leading
@@ -163,11 +181,36 @@ defmodule Vagus.API.AdminPanel do
   """
   @spec serve(Plug.Conn.t(), [String.t()]) :: Plug.Conn.t()
   def serve(conn, rest) do
-    case authorize(conn) do
-      :ok -> serve_authorized(conn, rest)
-      {:denied, reason, user_id} -> deny(conn, reason, user_id)
-    end
+    {conn, user_id, outcome} =
+      case authorize(conn) do
+        {:ok, user_id} ->
+          conn = serve_authorized(conn, rest)
+          {conn, user_id, conn.status}
+
+        {:denied, reason, user_id} ->
+          {deny(conn, reason, user_id), user_id, {:denied, reason_tag(reason)}}
+      end
+
+    :telemetry.execute(@log_event, %{}, %{
+      kind: kind(conn.method, rest),
+      user_id: user_id,
+      outcome: outcome
+    })
+
+    conn
   end
+
+  # A fixed vocabulary: the request's own path segments never reach the log.
+  defp kind(method, rest) when method in ["GET", "HEAD"] and rest in [[], [""], ["index.html"]],
+    do: :page
+
+  defp kind(method, ["key"]) when method in ["GET", "HEAD"], do: :key
+  defp kind("POST", ["dsp"]), do: :dsp_upload
+  defp kind(_method, _rest), do: :other
+
+  # The tag alone: an unresolved verdict's reason is Core's error term.
+  defp reason_tag({tag, _detail}), do: tag
+  defp reason_tag(tag), do: tag
 
   defp serve_authorized(%Plug.Conn{method: method} = conn, rest)
        when method in ["GET", "HEAD"] do
@@ -208,7 +251,7 @@ defmodule Vagus.API.AdminPanel do
 
   defp authorize_user(user_id) do
     case users_mod().admin?(user_id) do
-      {:ok, true} -> :ok
+      {:ok, true} -> {:ok, user_id}
       {:ok, false} -> {:denied, :not_admin, user_id}
       {:error, reason} -> {:denied, {:unresolved, reason}, user_id}
       other -> {:denied, {:unresolved, {:unexpected_result, other}}, user_id}

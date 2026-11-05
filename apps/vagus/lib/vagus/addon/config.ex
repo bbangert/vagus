@@ -14,11 +14,10 @@ defmodule Vagus.Addon.Config do
   `{:error, reason}` for anything malformed — never raises.
 
   `parse/1` also rejects the slugs Vagus reserves for itself
-  (`reserved_slug?/1` — currently just `vagus`, the synthetic admin panel).
-  That covers a saved app too: `Vagus.App.File` decodes through `parse/1`,
-  so a file carrying a `vagus` app from before the reservation is skipped
-  with a warning and the other apps still load, since a corrupt file must
-  never brick the device.
+  (`reserved_slug?/1` — currently just `vagus`, the admin panel), so no store
+  or uploaded config can claim one. `parse(raw, reserved: :allow)` accepts
+  them, for Vagus's own builtin config of the panel (`Vagus.App.Units`) and
+  the app file it is saved in (`Vagus.App.File`).
 
   `ingress_entry`/`ingress_stream`/`panel_icon`/`panel_title`/`panel_admin`
   (`docs/contract-2026.7-m4b-ingress-watchdog.md` §B3.1) round out the
@@ -200,14 +199,16 @@ defmodule Vagus.Addon.Config do
   and validating required fields + field formats. Returns `{:error, reason}` on
   any malformed input.
   """
-  @spec parse(map()) :: {:ok, t()} | {:error, String.t()}
-  def parse(raw) when is_map(raw) do
-    {:ok, build(raw)}
+  @spec parse(map(), keyword()) :: {:ok, t()} | {:error, String.t()}
+  def parse(raw, opts \\ [])
+
+  def parse(raw, opts) when is_map(raw) do
+    {:ok, build(raw, Keyword.get(opts, :reserved, :reject))}
   catch
     {:invalid, message} -> {:error, message}
   end
 
-  def parse(_raw), do: {:error, "config must be a map"}
+  def parse(_raw, _opts), do: {:error, "config must be a map"}
 
   @spec capabilities() :: [String.t()]
   def capabilities, do: @capabilities
@@ -233,16 +234,12 @@ defmodule Vagus.Addon.Config do
   def valid_slug?(_slug), do: false
 
   @doc """
-  Whether `slug` is reserved by Vagus itself (the synthetic `vagus` admin
-  panel, `Vagus.API.AdminPanel`) and so may not name an add-on.
+  Whether `slug` is reserved by Vagus itself (the `vagus` admin panel,
+  `Vagus.API.AdminPanel`) and so may name no app but Vagus's own.
 
   Deliberately separate from `valid_slug?/1`, which is a *filesystem*-safety
-  guard (`Vagus.App.Steps`' uninstall `rm_rf`, `Vagus.Backups`):
-  a reserved slug that somehow got installed must still be cleanable, so
-  that check must keep accepting it.
-
-  `Vagus.App.Policy` uses this to reject an install whose slug comes from
-  the URL rather than from a parsed config.
+  guard (`Vagus.App.Steps`' `rm_rf`, `Vagus.Backups`) the panel's own data
+  dir must pass.
   """
   @spec reserved_slug?(term()) :: boolean()
   def reserved_slug?(slug) when is_binary(slug), do: slug in @reserved_slugs
@@ -352,11 +349,11 @@ defmodule Vagus.Addon.Config do
 
   ## Internals
 
-  defp build(raw) do
+  defp build(raw, reserved) do
     %__MODULE__{
       name: req_str(raw, "name"),
       version: version(raw),
-      slug: slug(raw),
+      slug: slug(raw, reserved),
       description: req_str(raw, "description"),
       arch: arch(raw)
     }
@@ -438,12 +435,12 @@ defmodule Vagus.Addon.Config do
     end
   end
 
-  defp slug(raw) do
+  defp slug(raw, reserved) do
     slug = req_str(raw, "slug")
 
     cond do
       not Regex.match?(@slug_re, slug) -> invalid("slug '#{slug}' has invalid characters")
-      slug in @reserved_slugs -> invalid("slug '#{slug}' is reserved")
+      slug in @reserved_slugs and reserved != :allow -> invalid("slug '#{slug}' is reserved")
       true -> slug
     end
   end
