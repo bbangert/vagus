@@ -164,6 +164,55 @@ defmodule Vagus.Core.VersionsCeilingTest do
       refute_receive {:notify, _}
     end
 
+    test "a failed create followed by a feed drop still dismisses" do
+      test = self()
+      {:ok, attempts} = Agent.start_link(fn -> 0 end)
+
+      notify = fn event ->
+        send(test, {:notify, event})
+        n = Agent.get_and_update(attempts, &{&1, &1 + 1})
+        if n == 0, do: :ok, else: if(n == 1, do: {:error, :timeout}, else: :ok)
+      end
+
+      ctx = start_versions("2026.10.2", installed: "2026.10.0", notify: notify)
+      Versions.latest(ctx.server)
+      assert_receive {:notify, :dismiss}
+
+      settled(ctx.server)
+      new_feed(ctx, @above)
+      Versions.latest(ctx.server)
+      assert_receive {:notify, {:hold, @above}}
+
+      settled(ctx.server)
+      new_feed(ctx, "2026.10.2")
+      Versions.latest(ctx.server)
+      assert_receive {:notify, :dismiss}
+    end
+
+    test "a sender that dies without a result marks the notice unknown" do
+      test = self()
+      {:ok, attempts} = Agent.start_link(fn -> 0 end)
+
+      notify = fn event ->
+        send(test, {:notify, event})
+        if Agent.get_and_update(attempts, &{&1, &1 + 1}) == 1, do: exit(:boom), else: :ok
+      end
+
+      ctx = start_versions("2026.10.2", installed: "2026.10.0", notify: notify)
+      Versions.latest(ctx.server)
+      assert_receive {:notify, :dismiss}
+
+      settled(ctx.server)
+      new_feed(ctx, @above)
+      Versions.latest(ctx.server)
+      assert_receive {:notify, {:hold, @above}}
+      assert :unknown == ctx.server |> settled() |> :sys.get_state() |> get_in([:notice, :shown])
+
+      new_feed(ctx, "2026.10.2")
+      Versions.latest(ctx.server)
+      assert_receive {:notify, :dismiss}
+    end
+
     test "nothing is sent before a feed is known" do
       %{server: s} =
         start_versions(nil, installed: "2026.10.0", fetch: fn -> {:error, :offline} end)

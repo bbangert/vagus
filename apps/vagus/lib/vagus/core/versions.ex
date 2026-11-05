@@ -93,7 +93,10 @@ defmodule Vagus.Core.Versions do
   notification (`vagus_core_update_held`) naming both versions; it is
   dismissed once nothing is held. What it last showed is kept in memory and
   starts `:unknown`, so the first known feed after a boot dismisses a notice
-  an older release left behind. It is sent from a one-shot spawned process
+  an older release left behind. A failed or timed-out send also resets it to
+  `:unknown`: Core may have applied the request without acknowledging it, so
+  the next reconcile reasserts the desired state rather than trusting the
+  old value. It is sent from a one-shot spawned process
   for the same reason the fetch is: Core's API may be slow or down. A send
   that fails, or a change that lands while one is in flight, is caught up at
   the next `latest`/`update_available?` call (Core polls `/core/info`).
@@ -316,18 +319,18 @@ defmodule Vagus.Core.Versions do
 
   def handle_info(
         {:versions_notice_result, ref, result},
-        %{notice: %{sending: %{ref: ref, monitor_ref: monitor_ref, want: want}} = notice} = state
+        %{notice: %{sending: %{ref: ref, monitor_ref: monitor_ref, want: want}}} = state
       ) do
     Process.demonitor(monitor_ref, [:flush])
-    shown = if result == :ok, do: want, else: notice.shown
+    shown = if result == :ok, do: want, else: :unknown
     {:noreply, %{state | notice: %{shown: shown, sending: nil}}}
   end
 
   def handle_info(
         {:DOWN, monitor_ref, :process, _pid, _reason},
-        %{notice: %{sending: %{monitor_ref: monitor_ref}} = notice} = state
+        %{notice: %{sending: %{monitor_ref: monitor_ref}}} = state
       ) do
-    {:noreply, %{state | notice: %{notice | sending: nil}}}
+    {:noreply, %{state | notice: %{shown: :unknown, sending: nil}}}
   end
 
   def handle_info(msg, state) do
