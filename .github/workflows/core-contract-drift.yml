@@ -53,3 +53,35 @@ jobs:
             echo "::error::Core $CORE_VERSION changed its Supervisor-reserved surface (diff above). Regenerate: scripts/core-hassio-surface.sh $CORE_VERSION > apps/vagus/test/fixtures/core-$CORE_VERSION-hassio-views.json, then point @fixture_path in reserved_contract_test.exs at it."
             exit 1
           fi
+
+      # The frontend reaches the Supervisor through Core's untyped
+      # `supervisor/api` proxy and `/api/hassio/` view, so no typed client pins
+      # what it calls; frontend_endpoints_route_test.exs grades the fixture.
+      - name: Resolve the frontend that Core release pins
+        id: frontend
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CORE_VERSION: ${{ steps.core.outputs.version }}
+        run: |
+          tag=$(gh api "repos/home-assistant/core/contents/homeassistant/components/frontend/manifest.json?ref=${CORE_VERSION}" --jq .content \
+            | base64 -d | jq -r '.requirements[] | select(startswith("home-assistant-frontend==")) | ltrimstr("home-assistant-frontend==")')
+          [ -n "$tag" ] || { echo "::error::could not resolve the frontend pinned by Core $CORE_VERSION"; exit 1; }
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Diff the frontend's Supervisor endpoints against the pinned fixture
+        env:
+          FRONTEND_TAG: ${{ steps.frontend.outputs.tag }}
+        run: |
+          fixture=$(ls apps/vagus/test/fixtures/frontend-*-hassio-endpoints.json)
+          pinned_tag=$(jq -r '._frontend' "$fixture")
+          echo "fixture pins frontend $pinned_tag; Core stable pins $FRONTEND_TAG"
+
+          ./scripts/frontend-hassio-endpoints.sh "$FRONTEND_TAG" > /tmp/frontend.json
+
+          # Endpoints only: a frontend release that calls nothing new is not drift.
+          if diff <(jq -S '.endpoints' "$fixture") <(jq -S '.endpoints' /tmp/frontend.json); then
+            echo "no drift: frontend $FRONTEND_TAG calls the same Supervisor endpoints as $pinned_tag"
+          else
+            echo "::error::frontend $FRONTEND_TAG changed the Supervisor endpoints it calls (diff above). Regenerate: git rm $fixture && scripts/frontend-hassio-endpoints.sh $FRONTEND_TAG > apps/vagus/test/fixtures/frontend-$FRONTEND_TAG-hassio-endpoints.json, then route or allowlist each new entry in frontend_endpoints_route_test.exs."
+            exit 1
+          fi
