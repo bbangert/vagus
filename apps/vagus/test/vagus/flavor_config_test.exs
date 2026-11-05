@@ -43,6 +43,8 @@ defmodule Vagus.FlavorConfigTest do
     refute Keyword.has_key?(vagus, :protected_apps)
     refute Keyword.has_key?(vagus, :native_addon_slugs)
     refute Keyword.has_key?(vagus, Vagus.App.Orchestrator)
+
+    assert File.read!(@target_exs) =~ ~s(default_apps: ["core_mqtt", "vagus"])
   end
 
   # config/target.exs imports flavor.exs last; the Orchestrator's keyword list
@@ -73,19 +75,15 @@ defmodule Vagus.FlavorConfigTest do
     assert vagus[:orchestrator_app] == "agent_orchestrator"
     assert vagus[:memory_app] == "agent_memory"
     assert vagus[:protected_apps] == ["agent_orchestrator", "agent_memory", "vagus_memory"]
-    assert vagus[:native_addon_slugs] == ["core_mqtt", "vagus", "vagus_memory"]
+    assert vagus[:native_addon_slugs] == ["core_mqtt", "vagus_memory"]
+
+    refute "vagus" in vagus[Vagus.App.Orchestrator][:default_apps]
 
     # The DB and its server ahead of the orchestrator that uses them.
     assert Enum.sort(vagus[Vagus.App.Orchestrator]) ==
              Enum.sort(
                boot: true,
-               default_apps: [
-                 "core_mqtt",
-                 "vagus",
-                 "agent_memory",
-                 "vagus_memory",
-                 "agent_orchestrator"
-               ]
+               default_apps: ["core_mqtt", "agent_memory", "vagus_memory", "agent_orchestrator"]
              )
   end
 
