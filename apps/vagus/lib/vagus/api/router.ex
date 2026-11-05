@@ -40,7 +40,6 @@ defmodule Vagus.API.Router do
   alias Vagus.Backups
   alias Vagus.Core.{ConfigCheck, Lifecycle, TokenStore, Versions}
   alias Vagus.Jobs
-  alias Vagus.Mqtt.Broker
   alias Vagus.Runtime.{Engine, Logs, Stats}
 
   alias Vagus.API.Models.{
@@ -987,7 +986,7 @@ defmodule Vagus.API.Router do
   # held open. Container families ride a per-connection engine follow
   # (`Vagus.Runtime.Engine.follow_logs/3`; its tail=N carries the backfill on
   # the SAME stream, so no separate backfill write — no gap, no duplication). The native broker
-  # subscribes to its Broker.Logs buffer. Sourceless families stream an
+  # subscribes to its Native.Logs buffer. Sourceless families stream an
   # honest empty body and close. ---------------------------------------------
 
   get "/addons/:slug/logs/follow" do
@@ -2342,8 +2341,8 @@ defmodule Vagus.API.Router do
           # across incarnations; Copilot review, PR #6) and serialize
           # through that GenServer, so the worst case is one line appearing
           # in both (preferred over a silent gap).
-          :ok = Broker.Logs.subscribe(logs_pid)
-          {:native, logs_pid, Broker.Logs.tail(logs_pid, lines)}
+          :ok = Native.Logs.subscribe(logs_pid)
+          {:native, logs_pid, Native.Logs.tail(logs_pid, lines)}
       end
     else
       # Linked on purpose: if this request process dies abnormally, the link
@@ -2369,7 +2368,7 @@ defmodule Vagus.API.Router do
         {out, fmt} = render_stream(data, fmt)
         deliver_chunk(conn, out, source, fmt, _ack? = true)
 
-      {:broker_log, line} ->
+      {:native_log, line} ->
         deliver_chunk(conn, render_line(line, fmt), source, fmt, _ack? = false)
 
       :log_eof ->
@@ -2426,7 +2425,7 @@ defmodule Vagus.API.Router do
   # can restart/stop while a follow is open — unsubscribing a dead server
   # exits :noproc, and the subscription died with the server anyway.
   defp teardown({:native, logs_pid}) do
-    Broker.Logs.unsubscribe(logs_pid)
+    Native.Logs.unsubscribe(logs_pid)
   catch
     :exit, _ -> :ok
   end

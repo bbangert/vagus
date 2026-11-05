@@ -91,22 +91,21 @@ defmodule Vagus.Addon.Backend.Native do
   end
 
   @doc """
-  The native broker's recent log lines (MQ-P3-T2), newest last. `opts[:lines]`
-  bounds the count (default 100). `[]` when the broker (hence its log buffer)
-  isn't running.
+  The native app's recent log lines (MQ-P3-T2), newest last. `opts[:lines]`
+  bounds the count (default 100). `[]` when the app (hence its log buffer)
+  isn't running, or keeps none.
   """
   @spec logs(Vagus.Addon.Backend.id(), keyword()) :: [String.t()]
   def logs(id, opts \\ []) do
     case logs_server(id) do
-      pid when is_pid(pid) -> Broker.Logs.tail(pid, Keyword.get(opts, :lines, 100))
+      pid when is_pid(pid) -> Native.Logs.tail(pid, Keyword.get(opts, :lines, 100))
       nil -> []
     end
   end
 
   @doc """
-  The broker's `Broker.Logs` buffer process for a native add-on `id`, or
-  `nil` when the broker isn't running — the subscribe target for
-  `/logs/follow` (the router calls `Broker.Logs.subscribe/1` on it).
+  The app's `Native.Logs` buffer process, or `nil` when it isn't running —
+  the subscribe target for `/logs/follow`.
   """
   @spec logs_server(Vagus.Addon.Backend.id()) :: pid() | nil
   # Same slug-derived id as broker_name/1; callers gate on running?/1 first.

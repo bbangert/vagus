@@ -1,32 +1,37 @@
-defmodule Vagus.Mqtt.Broker.LogsTest do
+defmodule Vagus.Addon.Backend.Native.LogsTest do
   use ExUnit.Case, async: true
 
-  alias Vagus.Mqtt.Broker.Logs
+  alias Vagus.Addon.Backend.Native.Logs
 
-  # Telemetry-independent: lines are cast directly ({:append, line}), the
-  # same message the telemetry callback produces. Each test gets its own
+  # Lines are cast directly ({:append, line}), the same message the
+  # telemetry callback produces. Each test gets its own
   # named instance (the test name atom) so async cases can't collide on the
   # default singleton name or its telemetry handler id.
   defp start_logs(ctx) do
-    pid = start_supervised!({Logs, name: ctx.test})
+    pid =
+      start_supervised!({Logs, name: ctx.test, events: [[ctx.test]], format: &__MODULE__.fmt/3})
+
     %{logs: pid}
   end
+
+  def fmt(_event, _measurements, %{line: line}), do: line
+  def fmt(_event, _measurements, _metadata), do: nil
 
   setup :start_logs
 
   defp append(pid, line), do: GenServer.cast(pid, {:append, line})
 
-  test "subscribe -> append delivers {:broker_log, line}", %{logs: logs} do
+  test "subscribe -> append delivers {:native_log, line}", %{logs: logs} do
     assert :ok = Logs.subscribe(logs)
     append(logs, "CONNECT c1")
-    assert_receive {:broker_log, "CONNECT c1"}
+    assert_receive {:native_log, "CONNECT c1"}
   end
 
   test "unsubscribe stops delivery", %{logs: logs} do
     :ok = Logs.subscribe(logs)
     :ok = Logs.unsubscribe(logs)
     append(logs, "line")
-    refute_receive {:broker_log, _}, 100
+    refute_receive {:native_log, _}, 100
   end
 
   test "a dead subscriber is pruned on :DOWN and does not leak", %{logs: logs} do
@@ -70,8 +75,8 @@ defmodule Vagus.Mqtt.Broker.LogsTest do
     :ok = Logs.subscribe(logs)
     :ok = Logs.subscribe(logs)
     append(logs, "once")
-    assert_receive {:broker_log, "once"}
-    refute_receive {:broker_log, "once"}, 50
+    assert_receive {:native_log, "once"}
+    refute_receive {:native_log, "once"}, 50
 
     assert %{subscribers: subs} = :sys.get_state(logs)
     assert map_size(subs) == 1
@@ -87,8 +92,8 @@ defmodule Vagus.Mqtt.Broker.LogsTest do
     :ok = Logs.subscribe(logs)
     append(logs, "a")
     append(logs, "b")
-    assert_receive {:broker_log, "a"}
-    assert_receive {:broker_log, "b"}
+    assert_receive {:native_log, "a"}
+    assert_receive {:native_log, "b"}
     assert Logs.tail(logs, 10) == ["a", "b"]
   end
 
@@ -105,4 +110,14 @@ defmodule Vagus.Mqtt.Broker.LogsTest do
 
   defp handler_attached?(handler_id),
     do: Enum.any?(:telemetry.list_handlers([]), &(&1.id == handler_id))
+
+  test "a telemetry event is formatted, stamped and kept; a nil format drops it", ctx do
+    :ok = Logs.subscribe(ctx.logs)
+    :telemetry.execute([ctx.test], %{}, %{line: "hello"})
+    :telemetry.execute([ctx.test], %{}, %{})
+
+    assert_receive {:native_log, line}
+    assert line =~ ~r/^\[\d\d:\d\d:\d\d\] hello$/
+    assert [^line] = Logs.tail(ctx.logs, 10)
+  end
 end
