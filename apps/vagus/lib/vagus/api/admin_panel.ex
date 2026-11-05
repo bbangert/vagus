@@ -19,14 +19,17 @@ defmodule Vagus.API.AdminPanel do
       frontend panel component (`ha-panel-app`) builds its iframe `src`
       solely from `ingress_url`, refuses to render on a falsy `version`, and
       offers to start the add-on unless `state` is `"startup"`/`"started"`.
-      This call travels Core's *untyped* WS proxy, so the minimal payload
-      here is safe.
+      Since Core 2026.11.0 the frontend reaches it through WS
+      `supervisor/ingress/info`, which parses it with `aiohasupervisor`'s
+      strict `InstalledAddonComplete` model — so it is rendered by
+      `Vagus.Addon.Info`, the same as a real app's, and a missing field is
+      a `MissingField` that leaves the sidebar entry dead.
     * `GET /ingress/<token>/…` (`Vagus.API.IngressProxy`) is served by
       `serve/2` instead of being reverse-proxied to a container.
 
   The synthetic slug deliberately does **not** appear in `GET /addons`:
   that response IS strictly modelled (`InstalledAddon` →
-  `InstalledAddonComplete`, ~60 required fields), and a synthetic entry
+  `InstalledAddonComplete`, 73 required fields), and a synthetic entry
   there would break the whole add-on coordinator.
 
   ## Security posture
@@ -79,6 +82,8 @@ defmodule Vagus.API.AdminPanel do
 
   require Logger
 
+  alias Vagus.Addon.{Config, Info}
+  alias Vagus.API.StaticData
   alias Vagus.{DSP, SSHAccess}
 
   @slug "vagus"
@@ -99,25 +104,49 @@ defmodule Vagus.API.AdminPanel do
   end
 
   @doc """
-  The `GET /addons/vagus/info` payload the frontend's `ha-panel-app` needs:
-  a truthy `version`, a `state` it won't offer to "start", and the
-  `ingress_url` it builds the iframe `src` from.
+  The `GET /addons/vagus/info` payload: a full `InstalledAddonComplete`
+  describing this panel as an app that is always started.
 
   The trailing slash on `ingress_url` is load-bearing — relative links
   inside the iframe resolve against it.
 
-  `ingress_url` is `nil` when `Vagus.Ingress` isn't running (e.g.
-  `:ingress_enabled false`); the frontend then reports "no ingress" rather
-  than rendering a broken iframe.
+  `ingress_url`/`ingress_entry` are `nil` when `Vagus.Ingress` isn't running
+  (e.g. `:ingress_enabled false`); the frontend then reports "no ingress"
+  rather than rendering a broken iframe.
   """
   @spec info() :: %{String.t() => term()}
   def info do
-    %{
-      "slug" => @slug,
-      "name" => @title,
-      "version" => version(),
-      "state" => "started",
-      "ingress_url" => ingress_url()
+    settings =
+      case Vagus.Ingress.admin_token() do
+        {:ok, token} -> %{ingress_token: token, ingress_panel: true}
+        {:error, :unavailable} -> %{ingress_panel: true}
+      end
+
+    Info.render(config(), :started, %{}, settings)
+  end
+
+  # Describes the panel, not a container: no ports, no options form, and
+  # `apparmor: false` because it runs inside Vagus itself, under no profile.
+  # The board's own arch/machine make it `available` wherever it runs.
+  defp config do
+    %Config{
+      name: @title,
+      version: version(),
+      slug: @slug,
+      description: "Device administration: SSH access key and DSP setup",
+      arch: [StaticData.arch()],
+      machine: [StaticData.machine()],
+      startup: "system",
+      stage: "stable",
+      url: "https://github.com/bbangert/vagus",
+      apparmor: false,
+      ingress: true,
+      # 0 is `Info`'s "no port" sentinel; the panel is served in-process.
+      ingress_port: 0,
+      panel_icon: @icon,
+      panel_title: @title,
+      panel_admin: true,
+      schema: false
     }
   end
 
@@ -397,13 +426,6 @@ defmodule Vagus.API.AdminPanel do
     case Application.spec(:vagus, :vsn) do
       nil -> "0.0.0"
       vsn -> to_string(vsn)
-    end
-  end
-
-  defp ingress_url do
-    case Vagus.Ingress.admin_token() do
-      {:ok, token} -> "/api/hassio_ingress/#{token}/"
-      {:error, :unavailable} -> nil
     end
   end
 

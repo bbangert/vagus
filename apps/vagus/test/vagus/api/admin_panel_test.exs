@@ -463,6 +463,16 @@ defmodule Vagus.API.AdminPanelTest do
       assert info["ingress_url"] == "/api/hassio_ingress/#{token}/"
     end
 
+    test "describes an available, started ingress panel", %{token: token} do
+      info = data(supervisor_call("/addons/vagus/info"))
+
+      assert info["ingress"] == true
+      assert info["ingress_panel"] == true
+      assert info["ingress_entry"] == "/api/hassio_ingress/#{token}"
+      assert info["available"] == true
+      assert info["apparmor"] in ~w(disable default profile)
+    end
+
     # That `ingress_url` is a bearer capability for the device's SSH private
     # key, so the reserved slug is supervisor-only — and it denies exactly the
     # way any other slug an add-on may not read does, leaking nothing by the
