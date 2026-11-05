@@ -55,4 +55,47 @@ defmodule Vagus.App.DefaultBootTest do
     assert %{phase: :up, task: nil} = :sys.get_state(name)
     assert @complete in :queue.to_list(:sys.get_state(EventPusher).queue)
   end
+
+  # The native stage, ahead of every gate an offline board can fail.
+  @tag :tmp_dir
+  test "the native stage installs the admin panel wanted started and starts its subtree", %{
+    tmp_dir: tmp
+  } do
+    Vagus.AppFixtures.listening_api_port()
+    # Its start makes its data dir, which its backups then hold.
+    Application.put_env(:vagus, :addon_data_root, tmp)
+    name = :"orchestrator_#{System.unique_integer([:positive])}"
+
+    on_exit(fn ->
+      Application.delete_env(:vagus, :addon_data_root)
+      Vagus.AppFixtures.forget_app("vagus")
+      Vagus.Addon.Backend.Native.stop("addon_vagus")
+    end)
+
+    with_log(fn ->
+      start_supervised!({
+        Orchestrator,
+        name: name,
+        boot: true,
+        default_apps: ["vagus"],
+        gate_tries: 1,
+        gate_interval: 0,
+        tree_interval: 0,
+        gate_timeout: 2_000,
+        stage_timeout: 2_000,
+        primary_timeout: 0
+      })
+
+      with %{task: %Task{pid: task_pid}} <- :sys.get_state(name) do
+        task_ref = Process.monitor(task_pid)
+        assert_receive {:DOWN, ^task_ref, :process, ^task_pid, _reason}, 10_000
+      end
+    end)
+
+    assert {:ok, %{wanted: :started, ingress_panel: true, state: :started}} =
+             Vagus.App.info("vagus")
+
+    assert Vagus.Addon.Backend.Native.running?("addon_vagus")
+    assert File.dir?(Path.join([tmp, "addons", "data", "vagus"]))
+  end
 end

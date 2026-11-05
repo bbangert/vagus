@@ -65,7 +65,7 @@ defmodule Vagus.App.File do
 
     base = %{"name" => slug, "version" => "unknown", "slug" => slug, "description" => slug}
 
-    case Config.parse(base |> Map.merge(fields) |> Map.put("arch", [])) do
+    case Config.parse(base |> Map.merge(fields) |> Map.put("arch", []), reserved: :allow) do
       {:ok, config} ->
         config
 
@@ -223,11 +223,12 @@ defmodule Vagus.App.File do
   # container and data behind it. Kept as it was, it loads refused: listed,
   # never started, uninstallable. Dropped, nothing could remove it, since the
   # import never runs again. Only a slug unsafe as a file name, or Vagus's
-  # own, has nowhere to go.
+  # own, has nowhere to go: a legacy record never held the panel, which boot
+  # installs, and decoding one would load it as the panel.
   defp import_entry(staging, slug, raw) do
     raw = Map.put(raw, "wanted", raw["state"])
 
-    case decode(slug, raw) do
+    case if(Config.reserved_slug?(slug), do: {:error, :reserved}, else: decode(slug, raw)) do
       {:ok, data} ->
         :ok = write(data, staging)
 
@@ -262,7 +263,7 @@ defmodule Vagus.App.File do
 
   defp decode(slug, raw) when is_map(raw) do
     with %{"config" => config_raw, "wanted" => wanted_raw} <- raw,
-         {:ok, config} <- Config.parse(config_raw),
+         {:ok, config} <- Config.parse(config_raw, reserved: :allow),
          true <- config.slug == slug,
          {:ok, wanted} <- decode_wanted(wanted_raw) do
       token = decode_ingress_token(raw)

@@ -8,6 +8,7 @@ defmodule Vagus.App.Units do
 
   alias Vagus.Addon.Config
   alias Vagus.Addon.Store.BuiltinFetcher
+  alias Vagus.API.AdminPanel
   alias Vagus.App
   alias Vagus.App.{CoreUnit, Gates, Instances, Steps}
   alias Vagus.App.File, as: AppFile
@@ -83,13 +84,15 @@ defmodule Vagus.App.Units do
   @doc """
   A fresh install is wanted started, so boot starts it; a present one is left
   as the user set it, except that a container one gets its protected settings
-  back (`install_settings/1`).
+  back (`protected_settings/1`), and the admin panel is brought to the
+  firmware's version.
   """
   @spec install_default(String.t()) :: :installed | :present | {:error, term()}
   def install_default(slug) do
     cond do
       slug in App.slugs() ->
         ensure_settings(slug)
+        follow_firmware(slug)
         :present
 
       # Its file would create the apps directory, and a legacy file whose
@@ -99,15 +102,24 @@ defmodule Vagus.App.Units do
 
       true ->
         with {:ok, config} <- builtin_config(slug),
-             :ok <- App.install(config, wanted: :started, settings: install_settings(config)),
+             :ok <- App.install(config, install_opts(config)),
              do: :installed
     end
   end
 
+  # The panel shows in the sidebar from its first boot; the user may hide it
+  # after, which the next boot keeps.
+  defp install_opts(%Config{slug: slug} = config) do
+    reserved? = Config.reserved_slug?(slug)
+    panel = if reserved?, do: [ingress_panel: true], else: []
+
+    [wanted: :started, settings: protected_settings(config) ++ panel, builtin: reserved?]
+  end
+
   # A container default app is revived after a crash and started at boot,
   # which a request cannot later change for a protected app (`App.set/2`).
-  # The native broker is revived by its boot rule alone (`Policy.restart?/2`).
-  defp install_settings(config) do
+  # A native one is revived by its boot rule alone (`Policy.restart?/2`).
+  defp protected_settings(config) do
     if Steps.native?(config), do: [], else: [boot: "auto", watchdog: true]
   end
 
@@ -115,11 +127,23 @@ defmodule Vagus.App.Units do
   # lacks them, and `App.set/2` refuses them to every request.
   defp ensure_settings(slug) do
     with {:ok, config} <- builtin_config(slug),
-         [_ | _] = settings <- install_settings(config),
+         [_ | _] = settings <- protected_settings(config),
          {:ok, entry} <- App.info(slug),
          [_ | _] = stale <- Enum.reject(settings, fn {key, value} -> entry[key] == value end),
          :error <- App.put_settings(slug, stale) do
       Logger.warning("Boot: default app #{slug} settings #{inspect(stale)} not written")
+    end
+  end
+
+  # The panel ships with the firmware and no store offers it, so its version
+  # is the firmware's: left behind, Core would offer an update to the version
+  # already running.
+  defp follow_firmware(slug) do
+    with true <- Config.reserved_slug?(slug),
+         {:ok, %{config: %{version: installed}}} <- App.info(slug),
+         {:ok, %{version: firmware}} when firmware != installed <- builtin_config(slug),
+         {:error, reason} <- App.update(slug, []) do
+      Logger.warning("Boot: app #{slug} not moved to #{firmware}: #{inspect(reason)}")
     end
   end
 
@@ -196,6 +220,7 @@ defmodule Vagus.App.Units do
   def builtin_config("agent_orchestrator"), do: Config.parse(@agent_orchestrator)
   def builtin_config("agent_memory"), do: Config.parse(@agent_memory)
   def builtin_config("vagus_memory"), do: Config.parse(@vagus_memory)
+  def builtin_config("vagus"), do: Config.parse(AdminPanel.app_config(), reserved: :allow)
 
   def builtin_config("core_mqtt" = slug) do
     with {:ok, config} <- Config.parse(BuiltinFetcher.config(:mqtt)),

@@ -547,11 +547,14 @@ defmodule Vagus.App.Policy do
 
   defp dns_keys(_data), do: []
 
+  # The panel's capability is `Vagus.Ingress`'s per-boot admin token, which
+  # `resolve_token/2` matches first; its saved token must open nothing.
   defp ingress_keys(%{config: %Config{} = config} = data) do
     token =
-      if config.ingress and data.ingress_token,
-        do: [{:ingress_token, hash(data.ingress_token)}],
-        else: []
+      if config.ingress and is_binary(data.ingress_token) and
+           not Config.reserved_slug?(config.slug),
+         do: [{:ingress_token, hash(data.ingress_token)}],
+         else: []
 
     port =
       if config.ingress_port == 0 and is_integer(data.ingress_port),
@@ -636,8 +639,11 @@ defmodule Vagus.App.Policy do
     end
   end
 
-  defp precheck(:install, %{config: config}, _data) do
-    if Config.reserved_slug?(config.slug), do: {:error, {:reserved_slug, config.slug}}, else: :ok
+  # Only boot's own default install (`Vagus.App.Units`) may take a reserved slug.
+  defp precheck(:install, %{config: config} = args, _data) do
+    if Config.reserved_slug?(config.slug) and args[:builtin] != true,
+      do: {:error, {:reserved_slug, config.slug}},
+      else: :ok
   end
 
   defp precheck(:update, %{config: %{version: version}}, %{config: %{version: version}}),

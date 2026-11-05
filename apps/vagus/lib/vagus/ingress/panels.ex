@@ -13,8 +13,9 @@ defmodule Vagus.Ingress.Panels do
   `"enable"` reflects the per-install `ingress_panel` toggle and is present
   (`false`) even for an ingress add-on whose panel isn't enabled.
 
-  Plus `Vagus.API.AdminPanel`'s synthetic `vagus` entry, which has no add-on
-  behind it and so is merged in independently of the installed apps.
+  `Vagus.API.AdminPanel`'s `vagus` app is listed like any other, so a user
+  can hide it; its static `panel_entry/0` stands in only until boot has
+  installed it.
 
   All four keys (`title`/`icon`/`admin`/`enable`) must be present on every
   entry: `aiohasupervisor` parses this response with a strict model, and one
@@ -50,13 +51,11 @@ defmodule Vagus.Ingress.Panels do
   alias Vagus.API.AdminPanel
   alias Vagus.Core.Client
 
-  @admin_slug AdminPanel.slug()
-
   @doc """
   The §B4.1 panels map: `%{slug => %{"title", "icon", "admin", "enable"}}`,
   one entry per installed add-on with `config.ingress == true`, plus
-  `Vagus.API.AdminPanel`'s synthetic entry. `panel_title` falls back to the
-  add-on's `name` when unset.
+  `Vagus.API.AdminPanel`'s static entry while its app is not installed.
+  `panel_title` falls back to the add-on's `name` when unset.
   """
   @spec list() :: %{String.t() => map()}
   def list do
@@ -71,12 +70,7 @@ defmodule Vagus.Ingress.Panels do
          "enable" => ingress_panel
        }}
     end)
-    # Merged last, so the reserved slug always resolves to the synthetic
-    # panel even if an add-on claims it. Same precedence as
-    # `Vagus.Ingress.resolve_token/2` and `Vagus.API.Router`'s
-    # `/addons/:slug/info`: an add-on can never shadow `vagus`, in any of
-    # the three places the slug is interpreted.
-    |> Map.put(AdminPanel.slug(), AdminPanel.panel_entry())
+    |> Map.put_new(AdminPanel.slug(), AdminPanel.panel_entry())
   end
 
   @doc """
@@ -122,11 +116,6 @@ defmodule Vagus.Ingress.Panels do
       :error -> is_pid(Process.whereis(Client))
     end
   end
-
-  # Defensive: the synthetic panel is not an installed app, so the
-  # clause below would resolve it to a DELETE and un-register our own
-  # sidebar panel if anything ever pushed for this slug.
-  defp push_method(@admin_slug), do: :post
 
   defp push_method(slug) do
     case Vagus.App.info(slug) do

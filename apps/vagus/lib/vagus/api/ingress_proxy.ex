@@ -24,12 +24,12 @@ defmodule Vagus.API.IngressProxy do
   2. `{token}` (the path segment right after `/ingress/`) →
      `Vagus.Ingress.resolve_token/2` → add-on slug; unresolvable → 503
      (upstream: `HTTPServiceUnavailable`).
-  2b. The reserved `vagus` slug is `Vagus.API.AdminPanel`'s synthetic panel,
-     which has no container: it is served in-process by `AdminPanel.serve/2`
-     and skips steps 3–5 entirely. It is reached only *after* step 1, so the
-     session cookie gates it exactly like a real add-on — and it then
-     imposes an admin-only gate of its own on top (403), which no add-on
-     path has.
+  2b. The reserved `vagus` slug is `Vagus.API.AdminPanel`'s native app,
+     which has no container: while it runs it is served in-process by
+     `AdminPanel.serve/2` and skips steps 3–5 entirely (503 while it does
+     not). It is reached only *after* step 1, so the session cookie gates it
+     exactly like a real add-on — and it then imposes an admin-only gate of
+     its own on top (403), which no add-on path has.
   3. slug → `{ip, port, stream?}` via `config :vagus, :ingress_target_fun`
      (default `&Vagus.App.ingress_target/1`, injectable so tests can point
      at a fake add-on without a real docker daemon/container) → resolution
@@ -85,6 +85,7 @@ defmodule Vagus.API.IngressProxy do
 
   import Plug.Conn
 
+  alias Vagus.Addon.Backend.Native
   alias Vagus.API.AdminPanel
   alias Vagus.Network
 
@@ -173,14 +174,19 @@ defmodule Vagus.API.IngressProxy do
     end
   end
 
-  # `Vagus.API.AdminPanel` is a synthetic panel with no container behind it,
-  # so it skips target resolution and the proxy leg entirely — but only
-  # AFTER `check_session/1` above, exactly as for a real add-on. Unlike a
+  # `Vagus.API.AdminPanel` is served in-process, with no container behind
+  # it, so it skips target resolution and the proxy leg entirely — but only
+  # AFTER `check_session/1` above, exactly as for a real add-on, and only
+  # while its app runs, as a stopped container's would refuse. Unlike a
   # real add-on it then applies a *second* gate of its own (Core admin
   # status, 403 — see that module's "Security posture"): a valid session
   # proves authentication, not privilege, and this panel serves the device's
   # root SSH key.
-  defp route(conn, @admin_slug, rest), do: AdminPanel.serve(conn, rest)
+  defp route(conn, @admin_slug, rest) do
+    if Native.running?("addon_" <> @admin_slug),
+      do: AdminPanel.serve(conn, rest),
+      else: send_plain(conn, 503, "Service Unavailable")
+  end
 
   defp route(conn, slug, rest) do
     case resolve_target(slug) do

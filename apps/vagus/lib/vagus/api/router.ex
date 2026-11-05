@@ -684,37 +684,20 @@ defmodule Vagus.API.Router do
   # its own info gets its resolved dynamic `ingress_port` back exactly the way
   # `bashio::addon.ingress_port` expects (§B3.2 fact 5) — no separate path
   # needed for the self-read case.
-  # The reserved `vagus` slug is `Vagus.API.AdminPanel`'s synthetic panel,
-  # which has no app process to render from. It is matched on
-  # the literal URL segment and wins over any add-on that claims the slug —
-  # the same precedence `Vagus.Ingress.Panels.list/0` and
-  # `Vagus.Ingress.resolve_token/2` apply.
   #
-  # The synthetic payload is supervisor-only. Its `ingress_url` embeds the
-  # panel's per-boot ingress token — a bearer capability for the device's SSH
-  # private key — so an add-on token must never reach it. Gating on
-  # `:supervisor` costs the frontend nothing: Core's `HassIO.send_command`
-  # proxies every WS `supervisor/api` call with `$SUPERVISOR_TOKEN`, so even a
-  # non-admin Home Assistant user's read arrives here as `:supervisor` (Core
-  # whitelists `/addons/*/info` in `WS_NO_ADMIN_ENDPOINTS`, which is why this
-  # must not require more than that).
+  # The admin panel's (`Vagus.API.AdminPanel`) `ingress_url` embeds the
+  # per-boot admin token — a bearer capability for the device's SSH private
+  # key — so its info is supervisor-only: `Vagus.API.Tiers`'
+  # `["addons", "vagus", "info"]` row refuses every app token, `self` cannot
+  # resolve to it, and an app reads only its own. Gating on `:supervisor`
+  # costs the frontend nothing: Core's `HassIO.send_command` proxies every WS
+  # `supervisor/api` call with `$SUPERVISOR_TOKEN`, so even a non-admin Home
+  # Assistant user's read arrives here as `:supervisor` (Core whitelists
+  # `/addons/*/info` in `WS_NO_ADMIN_ENDPOINTS`, which is why this must not
+  # require more than that).
   get "/addons/:slug/info" do
-    caller = conn.assigns.caller
-
-    if slug == AdminPanel.slug() do
-      synthetic_info(conn, caller)
-    else
-      addon_info(conn, slug, caller)
-    end
+    addon_info(conn, slug, conn.assigns.caller)
   end
-
-  # Non-supervisor callers get the byte-identical 403 a foreign slug produces,
-  # so the reserved slug is indistinguishable from any other unauthorized one.
-  # `Vagus.API.Tiers`' `["addons", "vagus", "info"]` row answers it first.
-  defp synthetic_info(conn, :supervisor), do: Envelope.send_ok(conn, AdminPanel.info())
-
-  defp synthetic_info(conn, _caller),
-    do: refuse(conn, :not_this_app)
 
   defp addon_info(conn, slug, caller) do
     with {:ok, resolved} <- resolve_info_slug(slug, caller),
@@ -731,12 +714,17 @@ defmodule Vagus.API.Router do
         entry
         |> info_settings()
         |> Map.put(:long_description, long_description(resolved))
+        |> admin_token(resolved)
 
       Envelope.send_ok(conn, Vagus.Addon.Info.render(config, state, options, settings))
     else
       {:error, :forbidden} -> refuse(conn, :not_this_app)
       _ -> uninstalled_addon_info(conn, slug)
     end
+  end
+
+  defp admin_token(settings, slug) do
+    if slug == AdminPanel.slug(), do: AdminPanel.info_settings(settings), else: settings
   end
 
   # V1's legacy store fallback. `GET /addons/{slug}/info` is the ONLY call the
@@ -2762,33 +2750,45 @@ defmodule Vagus.API.Router do
     |> Map.put(:ports, Map.get(entry, :ports) || %{})
   end
 
+  # Installed first, as upstream's `AppManager.install` checks: an app no
+  # store lists, a default or Vagus's own panel, is still already installed.
   defp handle_install(conn, slug) do
     if conn.assigns.caller == :supervisor do
-      case Store.get(slug) do
-        {:ok, %{config: entry_config}} ->
-          # The store entry's own `config.slug` is the add-on's bare slug
-          # (e.g. "mosquitto"); installed add-ons run under the store slug
-          # (e.g. "core_mosquitto" — see `Vagus.Addon.Store`'s moduledoc).
-          config = %{entry_config | slug: slug}
-
-          case Availability.check(config) do
-            {true, nil} ->
-              do_install(conn, config)
-
-            {false, reason} ->
-              # Refused BEFORE any image pull (audit G1) — upstream's own
-              # `_validate_availability` runs at the very top of install,
-              # for the same reason: a pull for the wrong architecture is a
-              # slow, confusing way to fail something `arch`/`machine`/
-              # `homeassistant` already answer for free.
-              Envelope.send_error(conn, reason, 400)
-          end
+      case App.info(slug) do
+        {:ok, %{config: installed}} ->
+          Envelope.send_error(conn, "App #{installed.name} is already installed", 400)
 
         :error ->
-          Envelope.send_error(conn, "Addon #{slug} does not exist in the store", 404)
+          install_from_store(conn, slug)
       end
     else
       Envelope.send_error(conn, "unauthorized", 403)
+    end
+  end
+
+  defp install_from_store(conn, slug) do
+    case Store.get(slug) do
+      {:ok, %{config: entry_config}} ->
+        # The store entry's own `config.slug` is the add-on's bare slug
+        # (e.g. "mosquitto"); installed add-ons run under the store slug
+        # (e.g. "core_mosquitto" — see `Vagus.Addon.Store`'s moduledoc).
+        config = %{entry_config | slug: slug}
+
+        case Availability.check(config) do
+          {true, nil} ->
+            do_install(conn, config)
+
+          {false, reason} ->
+            # Refused BEFORE any image pull (audit G1) — upstream's own
+            # `_validate_availability` runs at the very top of install,
+            # for the same reason: a pull for the wrong architecture is a
+            # slow, confusing way to fail something `arch`/`machine`/
+            # `homeassistant` already answer for free.
+            Envelope.send_error(conn, reason, 400)
+        end
+
+      :error ->
+        Envelope.send_error(conn, "Addon #{slug} does not exist in the store", 404)
     end
   end
 
@@ -2955,6 +2955,9 @@ defmodule Vagus.API.Router do
           {:error, :busy} ->
             Envelope.send_error(conn, busy_message(resolved), 400)
 
+          {:error, :protected} ->
+            Envelope.send_error(conn, protected_message(resolved), 400)
+
           {:error, reason} ->
             {status, message} = app_failure(reason)
             Envelope.send_error(conn, message, status)
@@ -2984,6 +2987,14 @@ defmodule Vagus.API.Router do
   @protected_message "The agent apps are protected: they cannot be stopped, " <>
                        "restarted or uninstalled, nor their boot or watchdog changed"
 
+  defp protected_message(slug) do
+    if slug == AdminPanel.slug(),
+      do:
+        "App #{AdminPanel.name()} is part of the device: it cannot be stopped or " <>
+          "restarted, nor its boot or watchdog changed",
+      else: @protected_message
+  end
+
   @restore_protected_message "The agent orchestrator app cannot be restored: " <>
                                "its live session would be overwritten"
 
@@ -2996,6 +3007,9 @@ defmodule Vagus.API.Router do
     do: {500, "The app was uninstalled but its data could not be removed (#{inspect(reason)})"}
 
   defp app_failure(:protected), do: {400, @protected_message}
+
+  defp app_failure(:system_app),
+    do: {400, "App #{AdminPanel.name()} is part of the device and cannot be uninstalled"}
 
   defp app_failure(reason), do: {400, inspect(reason)}
 
@@ -3147,7 +3161,7 @@ defmodule Vagus.API.Router do
   # the body's other keys applied.
   defp validate_protected_settings(slug, body) do
     if App.protected?(slug) and (Map.has_key?(body, "boot") or Map.has_key?(body, "watchdog")),
-      do: {:error, @protected_message},
+      do: {:error, protected_message(slug)},
       else: :ok
   end
 

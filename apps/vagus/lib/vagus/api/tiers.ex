@@ -283,7 +283,7 @@ defmodule Vagus.API.Tiers do
     # never shorter than `/`, which upstream therefore grades admin.
     #
     # Upstream lets a default-role app read any app's info. Here an app reads
-    # its own, and the synthetic panel's is Core's alone: it carries the
+    # its own, and the admin panel's is Core's alone: it carries the
     # panel's ingress token (see `Vagus.API.AdminPanel`).
     {["addons", "vagus", "info"], :default, caller: :supervisor, answer: @not_this_app},
     {["addons", :_, "info"], :default, subject: :self, answer: @not_this_app},

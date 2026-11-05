@@ -75,8 +75,10 @@ defmodule Vagus.API.AiohasupervisorContractTest do
     {"mounts.MountsInfo", "/mounts"},
     # Core 2026.11.0's `supervisor/ingress/info` parses this one through the
     # typed client, which is what opening any app's sidebar panel goes
-    # through — the synthetic `vagus` panel included.
+    # through — the `vagus` admin panel included.
     {"addons.InstalledAddonComplete", "/addons/vagus/info"},
+    {"addons.AddonsStats", "/addons/vagus/stats"},
+    {"addons.AddonsConfigValidate", {:post, "/addons/vagus/options/validate"}},
     {"addons.InstalledAddonComplete", "/addons/contract_app/info"},
     {"addons.InstalledAddon", "/addons", each: "addons"},
     {"addons.StoreAddon", "/store", each: "addons"},
@@ -102,6 +104,7 @@ defmodule Vagus.API.AiohasupervisorContractTest do
       })
 
     install_app(config, state: :started)
+    install_app(admin_panel_config(), state: :started, ingress_panel: true)
 
     # An empty store would pass `each:` vacuously.
     original = :sys.get_state(Store)
@@ -174,6 +177,15 @@ defmodule Vagus.API.AiohasupervisorContractTest do
         end
       end
     end
+  end
+
+  # Core makes one device and update entity per listed slug.
+  test "GET /addons lists the admin panel among the apps the each: row checks" do
+    conn = "/addons" |> request() |> authed() |> call()
+
+    states = Map.new(json_body(conn)["data"]["addons"], &{&1["slug"], &1["state"]})
+    # A file its process could not load would be listed too, as `unknown`.
+    assert %{"vagus" => "started", "contract_app" => "started"} = states
   end
 
   test "the fixture covers every model this test checks" do

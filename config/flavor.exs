@@ -31,10 +31,10 @@ if flavor == :agent_dev_board do
   config :vagus, :orchestrator_app, "agent_orchestrator"
   config :vagus, :memory_app, "agent_memory"
   config :vagus, :protected_apps, ["agent_orchestrator", "agent_memory", "vagus_memory"]
-  config :vagus, :native_addon_slugs, ["core_mqtt", "vagus_memory"]
+  config :vagus, :native_addon_slugs, ["core_mqtt", "vagus", "vagus_memory"]
 
   config :vagus, Vagus.App.Orchestrator,
-    default_apps: ["core_mqtt", "agent_memory", "vagus_memory", "agent_orchestrator"]
+    default_apps: ["core_mqtt", "vagus", "agent_memory", "vagus_memory", "agent_orchestrator"]
 
   # No Core admin panel to hand the SSH access key out through, so
   # `Vagus.SSHAccess.Handout` serves it until an operator drops it.

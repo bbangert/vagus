@@ -73,13 +73,19 @@ defmodule Vagus.FlavorConfigTest do
     assert vagus[:orchestrator_app] == "agent_orchestrator"
     assert vagus[:memory_app] == "agent_memory"
     assert vagus[:protected_apps] == ["agent_orchestrator", "agent_memory", "vagus_memory"]
-    assert vagus[:native_addon_slugs] == ["core_mqtt", "vagus_memory"]
+    assert vagus[:native_addon_slugs] == ["core_mqtt", "vagus", "vagus_memory"]
 
     # The DB and its server ahead of the orchestrator that uses them.
     assert Enum.sort(vagus[Vagus.App.Orchestrator]) ==
              Enum.sort(
                boot: true,
-               default_apps: ["core_mqtt", "agent_memory", "vagus_memory", "agent_orchestrator"]
+               default_apps: [
+                 "core_mqtt",
+                 "vagus",
+                 "agent_memory",
+                 "vagus_memory",
+                 "agent_orchestrator"
+               ]
              )
   end
 

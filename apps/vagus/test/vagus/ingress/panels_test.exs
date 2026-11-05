@@ -144,9 +144,8 @@ defmodule Vagus.Ingress.PanelsTest do
 
       panels = Panels.list()
 
-      # `vagus` is `Vagus.API.AdminPanel`'s synthetic entry, merged in
-      # independently of `State` — see `Vagus.API.AdminPanelTest` for its
-      # own shape assertions.
+      # `vagus` is `Vagus.API.AdminPanel`'s static entry while its app is not
+      # installed — see `Vagus.API.AdminPanelTest` for its own shape.
       assert Map.keys(panels) |> Enum.sort() == ["core_esphome", "core_other", "vagus"]
 
       assert panels["core_esphome"] == %{
@@ -165,12 +164,36 @@ defmodule Vagus.Ingress.PanelsTest do
              }
     end
 
-    test "only the synthetic admin panel when no add-ons are installed" do
+    test "only the admin panel's static entry when no apps are installed" do
       assert Panels.list() == %{"vagus" => AdminPanel.panel_entry()}
+    end
+
+    test "the installed admin panel's entry is its app's, so hiding it hides it" do
+      install_app(admin_panel_config(), ingress_panel: false)
+
+      assert Panels.list()["vagus"] == %{
+               "title" => "Vagus",
+               "icon" => "mdi:key-chain",
+               "admin" => true,
+               "enable" => false
+             }
     end
   end
 
   describe "update_hass_panel/2 (§B4.2, sync: true)" do
+    test "the admin panel's push follows its app's toggle like any other's" do
+      base_url = start_fake_core(self())
+      client = start_client(base_url)
+
+      install_app(admin_panel_config(), ingress_panel: false)
+      :ok = Panels.update_hass_panel("vagus", client: client, sync: true)
+      assert_received {:panel_push, "DELETE", "vagus"}
+
+      set_app("vagus", ingress_panel: true)
+      :ok = Panels.update_hass_panel("vagus", client: client, sync: true)
+      assert_received {:panel_push, "POST", "vagus"}
+    end
+
     test "POSTs when ingress_panel is true" do
       base_url = start_fake_core(self())
       client = start_client(base_url)

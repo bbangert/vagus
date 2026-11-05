@@ -5,8 +5,10 @@ defmodule Vagus.Addon.Backend.Native do
   Core as ordinary add-ons behind the same behaviour `Container` implements.
 
   The native apps are the embedded mqttx broker (`Vagus.Mqtt.Broker`,
-  `core_mqtt`) and, on the agent flavor, the memory server (`Vagus.Memory`,
-  `vagus_memory`). Each native add-on's subtree is started as a child of
+  `core_mqtt`), the admin panel (`Vagus.API.AdminPanel`, `vagus`, whose
+  subtree is its log buffer alone: the panel itself is served in the API's
+  request processes) and, on the agent flavor, the memory server
+  (`Vagus.Memory`, `vagus_memory`). Each native add-on's subtree is started as a child of
   the app-level `Vagus.Addon.Backend.Native.Supervisor` (`DynamicSupervisor`)
   under a **deterministic registered name** derived from the add-on id
   (`subtree_name/1`), so `state/1`, `stop/2`, and `remove/2` re-derive the handle
@@ -24,6 +26,7 @@ defmodule Vagus.Addon.Backend.Native do
 
   alias Vagus.Addon.Backend.Native
   alias Vagus.Addon.Backend.Spec
+  alias Vagus.API.AdminPanel
   alias Vagus.Mqtt.Broker
 
   @impl Vagus.Addon.Backend
@@ -78,15 +81,18 @@ defmodule Vagus.Addon.Backend.Native do
 
   @doc """
   Process-derived stats for a native add-on, in `Vagus.Runtime.Stats` shape
-  (MQ-P3-T1): `memory_usage` is the summed memory of the broker subtree's
-  processes; cpu/network/block are best-effort zero (an in-BEAM broker has no
-  cgroup accounting). All-zeros when the broker isn't running.
+  (MQ-P3-T1): `memory_usage` is the summed memory of the app's subtree
+  processes; cpu/network/block are best-effort zero (an in-BEAM app has no
+  cgroup accounting). All-zeros when the app isn't running.
   """
   @spec stats(Vagus.Addon.Backend.id()) :: map()
   def stats(id) do
     case Process.whereis(subtree_name(id)) do
-      pid when is_pid(pid) -> %{Vagus.Runtime.Stats.zero() | memory_usage: subtree_memory(pid)}
-      nil -> Vagus.Runtime.Stats.zero()
+      pid when is_pid(pid) ->
+        %{Vagus.Runtime.Stats.zero() | memory_usage: subtree_memory(id, pid)}
+
+      nil ->
+        Vagus.Runtime.Stats.zero()
     end
   end
 
@@ -108,6 +114,8 @@ defmodule Vagus.Addon.Backend.Native do
   the subscribe target for `/logs/follow`.
   """
   @spec logs_server(Vagus.Addon.Backend.id()) :: pid() | nil
+  def logs_server("addon_vagus" = id), do: Process.whereis(subtree_name(id))
+
   # Same slug-derived id as broker_name/1; callers gate on running?/1 first.
   # sobelow_skip ["DOS.ModuleConcat"]
   def logs_server(id) do
@@ -126,6 +134,7 @@ defmodule Vagus.Addon.Backend.Native do
   # Fixed id; the other clause delegates to broker_name/1.
   # sobelow_skip ["DOS.ModuleConcat"]
   def subtree_name("addon_vagus_memory" = id), do: Module.concat(Vagus.Memory, id)
+  def subtree_name("addon_vagus"), do: AdminPanel.Logs
   def subtree_name(id), do: broker_name(id)
 
   @doc "The add-on slug embedded in a native id: addon_<slug> becomes <slug>."
@@ -141,6 +150,15 @@ defmodule Vagus.Addon.Backend.Native do
   # sees the permanent death and revives it.
   defp child_spec("addon_vagus_memory" = id, _slug) do
     Supervisor.child_spec({Vagus.Memory, name: subtree_name(id)},
+      id: subtree_name(id),
+      restart: :temporary
+    )
+  end
+
+  defp child_spec("addon_vagus" = id, _slug) do
+    Supervisor.child_spec(
+      {Native.Logs,
+       name: subtree_name(id), events: [AdminPanel.log_event()], format: &AdminPanel.log_line/3},
       id: subtree_name(id),
       restart: :temporary
     )
@@ -162,12 +180,13 @@ defmodule Vagus.Addon.Backend.Native do
   # Fixed 1883 in production; overridable so hermetic tests bind a free port.
   defp broker_port, do: Application.get_env(:vagus, :mqtt_broker_port, 1883)
 
-  # Sum `:memory` across the broker supervisor and every process below it
-  # (Subscriptions, AuthCache, the ThousandIsland listener tree + its live
-  # connections, the log buffer). Only recurses into children typed `:supervisor`
-  # so `which_children` is never called on a plain worker.
-  defp subtree_memory(root) do
-    [root | descendants(root)]
+  # Sum `:memory` across the subtree's root and every process below it
+  # (for the broker: Subscriptions, AuthCache, the ThousandIsland listener
+  # tree + its live connections, the log buffer). Only recurses into
+  # supervisors, since `which_children` on a worker is a call it does not
+  # answer and crashes on; the panel's root is its worker.
+  defp subtree_memory(id, root) do
+    if(id == "addon_vagus", do: [root], else: [root | descendants(root)])
     |> Enum.reduce(0, fn pid, acc ->
       case Process.info(pid, :memory) do
         {:memory, bytes} -> acc + bytes

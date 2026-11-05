@@ -312,6 +312,55 @@ defmodule Vagus.App.UnitsTest do
     end
   end
 
+  describe "installing the admin panel" do
+    setup do
+      on_exit(fn -> forget_app("vagus") end)
+    end
+
+    test "its builtin is a native app on the reserved slug, at the firmware's version" do
+      assert {:ok, config} = Units.builtin_config("vagus")
+
+      assert %{
+               slug: "vagus",
+               name: "Vagus admin panel",
+               backend: :native,
+               startup: "system",
+               ingress: true,
+               panel_title: "Vagus",
+               schema: false
+             } = config
+
+      assert config.version == to_string(Application.spec(:vagus, :vsn))
+      assert config.ingress_port == Application.get_env(:vagus, :api_port, 8888)
+      assert Units.builtin_native?("vagus")
+    end
+
+    test "boot installs it wanted started with its panel shown, and keeps the user's hiding" do
+      assert Units.install_default("vagus") == :installed
+      assert {:ok, %{wanted: :started, ingress_panel: true}} = app_info("vagus")
+
+      :ok = Vagus.App.set("vagus", ingress_panel: false)
+      assert Units.install_default("vagus") == :present
+      assert {:ok, %{ingress_panel: false}} = app_info("vagus")
+    end
+
+    test "no install but boot's may take the reserved slug" do
+      {:ok, config} = Units.builtin_config("vagus")
+
+      assert Vagus.App.install(config) == {:error, {:reserved_slug, "vagus"}}
+      assert app_info("vagus") == :error
+    end
+
+    test "an install from an older firmware is brought to this one's version" do
+      {:ok, config} = Units.builtin_config("vagus")
+      install_app(%{config | version: "0.0.1"})
+
+      assert Units.install_default("vagus") == :present
+      assert {:ok, %{config: %{version: version}}} = app_info("vagus")
+      assert version == config.version
+    end
+  end
+
   describe "the patches gate" do
     setup do
       n = System.unique_integer([:positive])

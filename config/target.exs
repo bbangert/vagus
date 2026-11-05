@@ -210,7 +210,7 @@ config :vagus, :legacy_addons_json, "/data/vagus/addons.json"
 # default apps are installed and started on their first boot (a native one
 # independent of the container engine); afterwards each boots like any other
 # app. config/flavor.exs may replace the list.
-config :vagus, Vagus.App.Orchestrator, boot: true, default_apps: ["core_mqtt"]
+config :vagus, Vagus.App.Orchestrator, boot: true, default_apps: ["core_mqtt", "vagus"]
 
 # Core watchdog pair (CW-P2-T2): API probe + crash-loop event half
 # (`Vagus.Core.Watchdog.Supervisor` returns :ignore when unset — same
