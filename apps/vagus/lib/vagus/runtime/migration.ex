@@ -290,26 +290,9 @@ defmodule Vagus.Runtime.Migration do
   end
 
   defp notify_core({:raise, need, free}),
-    do: post("/api/services/persistent_notification/create", notification(need, free))
+    do: Vagus.Core.Notification.create(notification(need, free))
 
-  defp notify_core(:dismiss),
-    do:
-      post("/api/services/persistent_notification/dismiss", %{
-        "notification_id" => @notification_id
-      })
-
-  defp post(path, body) do
-    case Vagus.Core.Client.request(:post, path,
-           headers: [{"content-type", "application/json"}],
-           body: Jason.encode!(body)
-         ) do
-      {:ok, %Finch.Response{status: status}} when status in 200..299 -> :ok
-      other -> {:error, other}
-    end
-  catch
-    # An unstarted Core.Client exits :noproc.
-    :exit, reason -> {:error, {:exit, reason}}
-  end
+  defp notify_core(:dismiss), do: Vagus.Core.Notification.dismiss(@notification_id)
 
   defp mib(bytes), do: div(bytes, 1_048_576)
 

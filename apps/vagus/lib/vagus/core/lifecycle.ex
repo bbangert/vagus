@@ -259,7 +259,7 @@ defmodule Vagus.Core.Lifecycle do
 
   require Logger
 
-  alias Vagus.Core.{Container, Health, HttpConfig, PortMigration, Transport, Versions}
+  alias Vagus.Core.{Container, Health, HttpConfig, PortMigration, Supported, Transport, Versions}
   alias Vagus.Runtime.Engine
 
   @fallback_stop_timeout_s 260
@@ -347,6 +347,8 @@ defmodule Vagus.Core.Lifecycle do
 
   `{:error, :no_version}` if no target can be resolved.
   `{:error, :version_installed}` if `target == installed` already.
+  `{:error, {:unsupported_core, target, ceiling}}` if `target` is newer than
+  `Vagus.Core.Supported` allows. The default target is already clamped to it.
   Pulls the target image first — a pull failure returns
   `{:error, {:pull, reason}}` with the old Core container untouched.
   Then, if a container exists, stops+removes it; recreates+starts at the
@@ -635,6 +637,7 @@ defmodule Vagus.Core.Lifecycle do
 
     with {:ok, target} <- resolve_target(version_arg, versions),
          :ok <- check_not_installed(target, installed),
+         :ok <- Supported.permit(target, installed),
          :ok <- report_stage(opts, "pull_image", 10),
          :ok <- pull_target(target, opts) do
       case inspect_container(opts) do

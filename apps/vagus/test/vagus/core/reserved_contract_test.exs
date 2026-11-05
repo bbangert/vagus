@@ -18,20 +18,20 @@ defmodule Vagus.Core.ReservedContractTest do
 
   ## What tells us Core moved
 
-  Nothing in this repo pins a Core version — `Vagus.Core.Versions` reports
-  whatever `version.home-assistant.io/stable.json` currently serves — so
-  this fixture cannot detect drift on its own, and a test asserting only
-  that it agrees with its own filename would go stale silently along with
-  it. `.github/workflows/core-contract-drift.yml` is the part that notices:
-  weekly (and on demand), it re-derives both lists from whatever Core stable
+  Boards only run Core up to `Vagus.Core.Supported`'s ceiling, which a test
+  pins to this fixture's tag, but upstream keeps releasing past it, and a
+  test asserting only that the fixture agrees with its own filename would go
+  stale silently along with it. `.github/workflows/core-contract-drift.yml`
+  is the part that notices: weekly (and on demand), it re-derives both lists from whatever Core stable
   serves *today* and fails when they differ from this fixture.
 
   ## Regenerating the fixture
 
   `scripts/core-hassio-surface.sh <tag>` prints the JSON — the same script
   the drift workflow runs, so a regeneration cannot disagree with the check
-  that demanded it. Save as `test/fixtures/core-<tag>-hassio-views.json` and
-  point `@fixture_path` at it.
+  that demanded it. Save as `test/fixtures/core-<tag>-hassio-views.json`,
+  replacing the old file (`Vagus.Test.ContractFixture` requires exactly one),
+  then raise `Vagus.Core.Supported` (its moduledoc has the full procedure).
 
   Scanning Core's source rather than a running instance is deliberate: it
   needs no device, it is reproducible from a tag by anyone, and a view
@@ -52,13 +52,7 @@ defmodule Vagus.Core.ReservedContractTest do
   alias Vagus.Core.{Reserved, Transport}
   alias Vagus.ReservedSpellings
 
-  @fixture_path Path.join([
-                  __DIR__,
-                  "..",
-                  "..",
-                  "fixtures",
-                  "core-2026.11.0-hassio-views.json"
-                ])
+  @fixture_path Vagus.Test.ContractFixture.core_views_path()
   @external_resource @fixture_path
   @fixture @fixture_path |> File.read!() |> Jason.decode!()
   @urls @fixture["urls"]
@@ -67,10 +61,7 @@ defmodule Vagus.Core.ReservedContractTest do
   # Same cross-check the aiohasupervisor contract test uses: a fixture saved
   # under a filename that disagrees with the version it was dumped from
   # fails loudly instead of silently redefining the contract.
-  @core_version @fixture_path
-                |> Path.basename()
-                |> String.replace_prefix("core-", "")
-                |> String.replace_suffix("-hassio-views.json", "")
+  @core_version Vagus.Test.ContractFixture.core_views_tag()
 
   test "the fixture records the Core version its filename claims" do
     assert @fixture["_core_version"] == @core_version

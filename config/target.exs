@@ -281,6 +281,9 @@ config :vagus, :core_base_url, "http://localhost:8123"
 # for the rationale, identical on target.
 config :vagus, :core_versions_path, "/data/vagus/core.json"
 
+# false offers and installs Core newer than `Vagus.Core.Supported` allows.
+config :vagus, Vagus.Core.Supported, enforce: true
+
 # Persisted POST supervisor/options fields (audit E5) — see config/host.exs
 # for the rationale, identical on target.
 config :vagus, :supervisor_options_path, "/data/vagus/supervisor_options.json"

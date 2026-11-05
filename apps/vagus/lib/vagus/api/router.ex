@@ -38,7 +38,7 @@ defmodule Vagus.API.Router do
   alias Vagus.App.Policy
   alias Vagus.Backend
   alias Vagus.Backups
-  alias Vagus.Core.{ConfigCheck, Lifecycle, TokenStore, Versions}
+  alias Vagus.Core.{ConfigCheck, Lifecycle, Supported, TokenStore, Versions}
   alias Vagus.Jobs
   alias Vagus.Runtime.{Engine, Logs, Stats}
 
@@ -1841,12 +1841,25 @@ defmodule Vagus.API.Router do
   defp core_update_action(conn) do
     supervisor_only(conn, fn ->
       with {:ok, version} <- validate_core_update_version(conn.body_params),
-           :ok <- validate_core_update_backup(conn.body_params) do
+           :ok <- validate_core_update_backup(conn.body_params),
+           :ok <- permit_core_update(version) do
         run_core_update(conn, version)
       else
         {:error, message} -> Envelope.send_error(conn, message, 400)
       end
     end)
+  end
+
+  # `Lifecycle.update/2` refuses too; checking here as well keeps a
+  # `background: true` caller from getting a job id for an update that can
+  # only fail.
+  defp permit_core_update(nil), do: :ok
+
+  defp permit_core_update(version) do
+    case Supported.permit(version, Versions.installed(core_versions_server())) do
+      :ok -> :ok
+      {:error, reason} -> {:error, core_lifecycle_error_message(reason)}
+    end
   end
 
   defp validate_core_update_backup(params) do
@@ -1964,6 +1977,11 @@ defmodule Vagus.API.Router do
   defp core_lifecycle_error_message({:recreate_failed, reason, :no_rollback_version}),
     do:
       "Failed to start the new Core version (#{inspect(reason)}): no previous version to roll back to"
+
+  defp core_lifecycle_error_message({:unsupported_core, target, ceiling}),
+    do:
+      "Home Assistant Core #{target} is newer than this Vagus release was validated " <>
+        "against (#{ceiling}); update Vagus first"
 
   defp core_lifecycle_error_message(reason), do: inspect(reason)
 

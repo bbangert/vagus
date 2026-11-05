@@ -5,10 +5,12 @@ defmodule Vagus.Test.ContractFixture do
 
     * `aiohasupervisor-<version>-contract.json` — the typed client Core uses
     * `frontend-<tag>-hassio-endpoints.json` — the frontend's untyped calls
+    * `core-<tag>-hassio-views.json` — Core's reserved `/api/hassio*` surface
   """
 
   @client "aiohasupervisor-*-contract.json"
   @frontend "frontend-*-hassio-endpoints.json"
+  @core_views "core-*-hassio-views.json"
 
   @spec path() :: Path.t()
   def path, do: only!(@client)
@@ -36,6 +38,17 @@ defmodule Vagus.Test.ContractFixture do
     |> Path.basename()
     |> String.replace_prefix("frontend-", "")
     |> String.replace_suffix("-hassio-endpoints.json", "")
+  end
+
+  @spec core_views_path() :: Path.t()
+  def core_views_path, do: only!(@core_views)
+
+  @spec core_views_tag() :: String.t()
+  def core_views_tag do
+    core_views_path()
+    |> Path.basename()
+    |> String.replace_prefix("core-", "")
+    |> String.replace_suffix("-hassio-views.json", "")
   end
 
   # Exactly one: a leftover old fixture would otherwise let a test keep

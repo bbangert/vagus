@@ -4,8 +4,9 @@ defmodule Vagus.Core.Reserved do
   which nothing but Vagus itself may address.
 
   Core reserves the `hassio` prefix for the views its Supervisor integration
-  registers. As of Core 2026.11.0 that is `/api/hassio/{path:.+}` (Core's
-  proxy back into the Supervisor API), `/api/hassio_auth`,
+  registers. As of Core 2026.11.0 (`Vagus.Core.Supported`'s ceiling) that
+  is `/api/hassio/{path:.+}` (Core's proxy back into the Supervisor API),
+  `/api/hassio_auth`,
   `/api/hassio_auth/password_reset`, `/api/hassio_push/panel/{addon}`,
   `/api/hassio_push/discovery/{uuid}` and
   `/api/hassio_ingress/{token}/{path:.*}` — pinned in
