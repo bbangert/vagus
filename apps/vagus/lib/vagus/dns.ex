@@ -107,12 +107,14 @@ defmodule Vagus.DNS do
   # UDP and TCP come up together or not at all: a client told to retry over
   # TCP must find it there.
   defp try_bind(%{ip: ip, port: port} = state) do
+    # Port 0 (tests) takes whatever UDP is given, and TCP the same.
     with {:ok, socket} <-
            :gen_udp.open(port, [:binary, :inet, {:ip, ip}, active: true, reuseaddr: true]),
+         {:ok, port} <- :inet.port(socket),
          {:ok, listen} <- listen_tcp(socket, ip, port) do
       Vagus.DNS.TCP.start_acceptor(listen, self())
       Logger.info("Vagus.DNS: listening on #{fmt(ip)}:#{port} (UDP and TCP)")
-      %{state | socket: socket, listen: listen}
+      %{state | socket: socket, listen: listen, port: port}
     else
       {:error, reason} ->
         Logger.warning(

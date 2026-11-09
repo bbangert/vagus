@@ -6,14 +6,15 @@ defmodule Vagus.DNSTest do
   alias Vagus.DNS.Message
 
   setup do
-    port = 15_300 + rem(System.unique_integer([:positive]), 2000)
     directory = :"dns_test_directory_#{System.unique_integer([:positive])}"
     start_supervised!({Registry, keys: :unique, name: directory})
 
     server =
       start_supervised!(
-        {DNS, name: nil, ip: {127, 0, 0, 1}, port: port, upstream: nil, directory: directory}
+        {DNS, name: nil, ip: {127, 0, 0, 1}, port: 0, upstream: nil, directory: directory}
       )
+
+    port = bound_port(server)
 
     {:ok, sock} = :gen_udp.open(0, [:binary, active: false])
     on_exit(fn -> :gen_udp.close(sock) end)
@@ -135,13 +136,14 @@ defmodule Vagus.DNSTest do
   end
 
   test "with no directory to read, the anchors still answer" do
-    port = 17_400 + rem(System.unique_integer([:positive]), 2000)
+    server =
+      start_supervised!(
+        {DNS,
+         name: nil, ip: {127, 0, 0, 1}, port: 0, upstream: nil, directory: :no_such_directory},
+        id: :no_directory
+      )
 
-    start_supervised!(
-      {DNS,
-       name: nil, ip: {127, 0, 0, 1}, port: port, upstream: nil, directory: :no_such_directory},
-      id: :no_directory
-    )
+    port = bound_port(server)
 
     {:ok, sock} = :gen_udp.open(0, [:binary, active: false])
     on_exit(fn -> :gen_udp.close(sock) end)
@@ -161,19 +163,19 @@ defmodule Vagus.DNSTest do
   test "a relay that cannot start (task supervisor down) drops the query, not the server", %{
     directory: d
   } do
-    port = 17_400 + rem(System.unique_integer([:positive]), 2000)
-
     server =
       start_supervised!(
         {DNS,
          name: nil,
          ip: {127, 0, 0, 1},
-         port: port,
+         port: 0,
          upstream: "127.0.0.6",
          task_supervisor: :vagus_dns_test_no_such_supervisor,
          directory: d},
         id: :no_task_supervisor
       )
+
+    port = bound_port(server)
 
     {:ok, sock} = :gen_udp.open(0, [:binary, active: false])
     on_exit(fn -> :gen_udp.close(sock) end)
@@ -189,7 +191,6 @@ defmodule Vagus.DNSTest do
   end
 
   test "a relay killed from outside is counted out of the in-flight set" do
-    port = 17_400 + rem(System.unique_integer([:positive]), 2000)
     sup = start_supervised!({Task.Supervisor, name: :vagus_dns_test_relays})
 
     # The query goes out but no answer ever comes, so the relay sits in its
@@ -201,12 +202,14 @@ defmodule Vagus.DNSTest do
         {DNS,
          name: nil,
          ip: {127, 0, 0, 1},
-         port: port,
+         port: 0,
          upstream: "127.0.0.6",
          upstream_port: upstream_port,
          task_supervisor: :vagus_dns_test_relays},
         id: :relay_kill
       )
+
+    port = bound_port(server)
 
     {:ok, sock} = :gen_udp.open(0, [:binary, active: false])
     on_exit(fn -> :gen_udp.close(sock) end)
@@ -233,6 +236,17 @@ defmodule Vagus.DNSTest do
     {:ok, s} = :gen_udp.open(port, [:binary, {:ip, ip}, active: false])
     on_exit(fn -> :gen_udp.close(s) end)
     s
+  end
+
+  defp bound_port(server), do: :sys.get_state(server).port
+
+  # Free for the fake upstreams, unlike a fixed range another run on the
+  # machine may hold.
+  defp free_port do
+    {:ok, l} = :gen_tcp.listen(0, ip: {127, 0, 0, 1})
+    {:ok, port} = :inet.port(l)
+    :gen_tcp.close(l)
+    port
   end
 
   defp tcp_client(port) do
@@ -340,8 +354,7 @@ defmodule Vagus.DNSTest do
     end
 
     defp forwarding_server(name_servers, upstream, extra \\ []) do
-      port = 19_400 + rem(System.unique_integer([:positive]), 2000)
-      upstream_port = 21_400 + rem(System.unique_integer([:positive]), 2000)
+      upstream_port = free_port()
       start_supervised!({Task.Supervisor, name: :vagus_dns_forward_relays})
 
       server =
@@ -350,7 +363,7 @@ defmodule Vagus.DNSTest do
            [
              name: nil,
              ip: {127, 0, 0, 1},
-             port: port,
+             port: 0,
              upstream: upstream,
              upstream_port: upstream_port,
              name_servers: name_servers,
@@ -362,7 +375,7 @@ defmodule Vagus.DNSTest do
 
       {:ok, sock} = :gen_udp.open(0, [:binary, active: false])
       on_exit(fn -> :gen_udp.close(sock) end)
-      %{server: server, port: port, upstream_port: upstream_port, sock: sock}
+      %{server: server, port: bound_port(server), upstream_port: upstream_port, sock: sock}
     end
 
     test "a miss goes to the LAN's name servers, not the fallback" do
