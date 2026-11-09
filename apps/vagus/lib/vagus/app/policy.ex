@@ -553,6 +553,12 @@ defmodule Vagus.App.Policy do
 
   defp dns_keys(_data), do: []
 
+  # A host-network app's name is dropped whatever its liveness reads by
+  # then, so no order of the steps around a stop can leak it; unregistering
+  # a key this process does not hold is a no-op.
+  defp dns_drop(%{config: %{host_network: true}, slug: slug}), do: [{:dns, dns_name(slug)}]
+  defp dns_drop(data), do: Enum.map(dns_keys(data), &key/1)
+
   # The panel's capability is `Vagus.Ingress`'s per-boot admin token, which
   # `resolve_token/2` matches first; its saved token must open nothing.
   defp ingress_keys(%{config: %Config{} = config} = data) do
@@ -840,7 +846,7 @@ defmodule Vagus.App.Policy do
   # The credential goes before the container: a stopped app's token must not
   # outlive it, and nothing it posts while stopping should land.
   defp before_task({:stop, nil}, %{run: %{op: :uninstall}} = data) do
-    drop = Enum.map(tl(keys(data)), &key/1)
+    drop = Enum.uniq(Enum.map(tl(keys(data)), &key/1) ++ dns_drop(data))
     timers = cancel_timers(data)
     data = %{data | token: nil, token_hash: nil, ip: nil, wanted: :stopped}
     data = %{data | services: %{}, discovery: %{}}
@@ -857,7 +863,7 @@ defmodule Vagus.App.Policy do
   defp before_task(_step, data), do: {data, []}
 
   defp drop_run_keys(data) do
-    drop = Enum.map(dns_keys(data), &key/1)
+    drop = dns_drop(data)
     drop = if data.token_hash, do: [{:token, data.token_hash} | drop], else: drop
     effects = if drop == [], do: [], else: [{:keys, [], drop}]
     {%{data | token: nil, token_hash: nil, ip: nil}, effects}

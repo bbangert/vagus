@@ -1053,6 +1053,19 @@ defmodule Vagus.App.PolicyTest do
       assert {:keys, [], [{:token, data.token_hash}, {:dns, "app-one"}]} in effects
     end
 
+    test "2i. a host-network app's stop drops its record whatever its liveness reads" do
+      config = app_config(%{"host_network" => true})
+      dead = running(%{config: config, ip: nil, last_event: {:exited, 1}})
+      refute Policy.alive?(dead)
+
+      {_data, effects} = begin(:stop, %{}, dead)
+      assert {:keys, [], [{:dns, "app-one"}]} in effects
+
+      {_data, effects} = begin(:uninstall, %{}, dead)
+      assert {:keys, [], drop} = Enum.find(effects, &match?({:keys, [], _}, &1))
+      assert {:dns, "app-one"} in drop
+    end
+
     test "3. start/start timed out: token revoked, one cleanup stop by name, then the ladder" do
       {data, _} = begin(:start, %{retry: true}, app(%{attempt: 1}))
       hash = data.token_hash

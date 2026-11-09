@@ -8,8 +8,8 @@ defmodule Vagus.DNS do
   localhost → `127.0.0.1`), each also under the `.local.hass.io` search suffix,
   plus one record per running app (`<slug-with-dashes>`). Names we don't own
   are forwarded verbatim to the board's LAN name servers, as upstream's
-  CoreDNS forwards to the host's; with none, to the configured fallback
-  (`:dns_upstream`), and with neither we answer `NXDOMAIN`.
+  CoreDNS forwards to the host's, then to the configured fallback
+  (`:dns_upstream`); with neither we answer `NXDOMAIN`.
 
   Every container that asks for DNS resolves here, Core and host-network apps
   included: bridged ones through podman's `--dns`, host-network ones through
@@ -35,10 +35,16 @@ defmodule Vagus.DNS do
   alias Vagus.DNS.Message
   alias Vagus.Network
 
-  @forward_timeout 2_000
+  # The stub's `timeout:10` is musl's whole budget, resent every 5 s (two
+  # attempts): a relay done within 4 s never overlaps the resend of its own
+  # query. Within that, 1.5 s per server covers a LAN resolver recursing
+  # cold, and leaves a dead first server time for two more.
+  @relay_ms 4_000
+  @per_server_ms 1_500
   # Cap concurrent upstream relays so a flood of un-owned queries can't exhaust
   # processes/file descriptors.
   @max_inflight 64
+  @drop_report_ms 60_000
 
   def start_link(opts \\ []) do
     name = Keyword.get(opts, :name, __MODULE__)
@@ -77,7 +83,12 @@ defmodule Vagus.DNS do
       fallback:
         parse_upstream(Keyword.get(opts, :upstream, Application.get_env(:vagus, :dns_upstream))),
       name_servers: Keyword.get(opts, :name_servers, &lan_name_servers/0),
-      upstream_port: Keyword.get(opts, :upstream_port, 53)
+      upstream_port: Keyword.get(opts, :upstream_port, 53),
+      # The upstream that last answered, tried first.
+      preferred: nil,
+      # Queries shed at the cap since the last report, one report per interval.
+      dropped: 0,
+      drop_report_ms: Keyword.get(opts, :drop_report_ms, @drop_report_ms)
     }
 
     {:ok, try_bind(state)}
@@ -114,6 +125,17 @@ defmodule Vagus.DNS do
   def handle_info({:DOWN, ref, :process, _pid, _reason}, %{relays: relays} = state)
       when is_map_key(relays, ref) do
     {:noreply, %{state | relays: Map.delete(relays, ref)}}
+  end
+
+  def handle_info({:answered_by, ip}, state), do: {:noreply, %{state | preferred: ip}}
+
+  def handle_info(:report_drops, state) do
+    Logger.warning(
+      "Vagus.DNS: #{state.dropped} queries dropped at the #{@max_inflight}-relay cap " <>
+        "in the last #{div(state.drop_report_ms, 1000)}s"
+    )
+
+    {:noreply, %{state | dropped: 0}}
   end
 
   def handle_info(:retry_bind, %{socket: nil} = state), do: {:noreply, try_bind(state)}
@@ -164,18 +186,19 @@ defmodule Vagus.DNS do
   # Read per query, not subscribed to: the property is an ETS read, and a
   # lease change then reaches the very next query with no state to keep in
   # step. Only IPv4 servers, which the relay's socket can reach, and never
-  # this server itself, which would relay to itself.
+  # this server itself, which would relay to itself. The fallback goes last,
+  # as CoreDNS's does, so a LAN whose servers all fail still resolves.
   defp upstreams(state) do
     own = [state.ip, to_ip(Network.dns_ip())]
 
-    lan =
-      for server <- state.name_servers.(),
+    all =
+      for server <- state.name_servers.() ++ List.wrap(state.fallback),
           {_, _, _, _} = ip <- [server_ip(server)],
           ip not in own,
           uniq: true,
           do: ip
 
-    if lan == [], do: List.wrap(state.fallback), else: lan
+    if state.preferred in all, do: [state.preferred | all -- [state.preferred]], else: all
   end
 
   defp server_ip(%{address: ip}), do: ip
@@ -184,25 +207,31 @@ defmodule Vagus.DNS do
 
   # Relay the raw query from a throwaway (supervised, so a crash is logged)
   # task so a slow upstream never blocks the server; the answer goes back out
-  # our socket. Each upstream is tried in turn until one answers, so one dead
-  # LAN server costs a query its timeout, not its answer.
+  # our socket. Each upstream is tried in turn until one answers, all within
+  # one deadline, so a dead server costs a query a slice, not its answer.
   # Bounded by `@max_inflight` (drop over the cap) so a flood of misses can't
   # exhaust processes/FDs; the ephemeral socket is always closed (`try/after`,
   # and the port dies with the relay if it is killed). The server monitors
   # each relay and counts it out on its `:DOWN`, however it ended.
   defp forward(_packet, _host, _port, _upstreams, %{relays: relays} = state)
-       when map_size(relays) >= @max_inflight,
-       do: state
+       when map_size(relays) >= @max_inflight do
+    if state.dropped == 0, do: Process.send_after(self(), :report_drops, state.drop_report_ms)
+    %{state | dropped: state.dropped + 1}
+  end
 
   defp forward(packet, host, port, upstreams, %{socket: socket} = state) do
     upstream_port = state.upstream_port
+    server = self()
 
     relay = fn ->
       case :gen_udp.open(0, [:binary, active: false]) do
         {:ok, s} ->
           try do
-            with {:ok, resp} <- ask_upstreams(s, upstreams, upstream_port, packet) do
+            deadline = System.monotonic_time(:millisecond) + @relay_ms
+
+            with {:ok, ip, resp} <- ask_upstreams(s, upstreams, upstream_port, packet, deadline) do
               :gen_udp.send(socket, host, port, resp)
+              if ip != hd(upstreams), do: send(server, {:answered_by, ip})
             end
           after
             :gen_udp.close(s)
@@ -216,16 +245,21 @@ defmodule Vagus.DNS do
     start_relay(state, relay)
   end
 
-  defp ask_upstreams(_s, [], _port, _packet), do: :error
-
   # One socket for every try: a late answer from a server already given up
-  # on answers the same query, so it is as good as the one waited for.
-  defp ask_upstreams(s, [upstream | rest], port, packet) do
-    with :ok <- :gen_udp.send(s, upstream, port, packet),
-         {:ok, {_ip, _p, resp}} <- :gen_udp.recv(s, 0, @forward_timeout) do
-      {:ok, resp}
+  # on answers the same query, so it is as good as the one waited for, and
+  # the last server asked keeps whatever time is left.
+  defp ask_upstreams(s, [upstream | rest], port, packet, deadline) do
+    left = deadline - System.monotonic_time(:millisecond)
+    wait = if rest == [], do: left, else: min(@per_server_ms, left)
+
+    with true <- left > 0,
+         :ok <- :gen_udp.send(s, upstream, port, packet),
+         {:ok, {ip, _p, resp}} <- :gen_udp.recv(s, 0, max(wait, 0)) do
+      {:ok, ip, resp}
     else
-      _ -> ask_upstreams(s, rest, port, packet)
+      false -> :error
+      _ when rest == [] -> :error
+      _ -> ask_upstreams(s, rest, port, packet, deadline)
     end
   end
 

@@ -204,6 +204,19 @@ defmodule Vagus.Runtime.HostTest do
       assert await_ready(ctx.name, true) == :ok
     end
 
+    test "a DNS stub it cannot write is {:prep_failed, _}, retried until written", ctx do
+      dir = Path.join(ctx.root, "run/vagus/podman/resolv")
+      File.mkdir_p!(Path.dirname(dir))
+      File.write!(dir, "in the way")
+
+      start_supervised!({Host, host_opts(ctx, prep_retry_ms: 50)})
+      assert {:error, {:prep_failed, {:dns_stub, _}}} = await_ready(ctx.name)
+
+      File.rm!(dir)
+      assert await_ready(ctx.name, true) == :ok
+      assert [_stub] = File.ls!(dir)
+    end
+
     test "the default probe is podman info through the runner", ctx do
       fake = FakePodman.start([])
       opts = host_opts(ctx, podman_bin: fake.bin) |> Keyword.delete(:probe)

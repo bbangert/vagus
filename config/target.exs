@@ -355,9 +355,9 @@ config :vagus, :store_boot_refresh, true
 
 # Add-on DNS (M4-P1-T2). `Vagus.DNS` binds the hassio `dns` anchor
 # (172.30.32.3:53) and forwards names it doesn't own to the LAN's name
-# servers; this is the fallback while vintage_net reports none. Every app
-# and Core resolve through it, so without one they would resolve nothing
-# but its own records.
+# servers, then to this fallback, tried last as CoreDNS does. Every app
+# and Core resolve through it, so a LAN reporting no server, or only dead
+# ones, would otherwise leave them nothing but its own records.
 config :vagus, :dns_upstream, "1.1.1.1"
 
 # Add-on store repositories (M4-P2-T3). The official "core" add-ons repo;

@@ -7,9 +7,11 @@ defmodule Vagus.Runtime.Host do
 
   Runs in `handle_continue/2`, so no permit is granted before the board is
   set up. Every step is idempotent, and only the readiness probe
-  (`podman info`, run in a task and retried every `:prep_retry_ms`) can
-  fail preparation: a board missing an earlier step still runs most
-  containers, so those log and go on.
+  (`podman info`, run in a task and retried every `:prep_retry_ms`) and the
+  hassio DNS stub written after it can fail preparation: a board missing an
+  earlier step still runs most containers, so those log and go on, while
+  Core's container, started again after a reboot rather than created, fails
+  outright without its stub.
 
   The pull spool is emptied once per VM boot: a marker in `/run` keeps a
   Vagus restart from deleting the spool of a pull still running. Later,
@@ -476,7 +478,6 @@ defmodule Vagus.Runtime.Host do
     ensure_private_dir(log_dir(state.opts))
     ensure_private_dir(out_dir_of(state.opts))
     write_resolv_conf(state.opts)
-    write_dns_stub(state.opts)
     ensure_dev_links(Keyword.get(state.opts, :dev_root, "/dev"))
     state = state |> apply_profile() |> publish(:preparing)
     mount_logs(state.opts, @log_tmpfs_bytes[state.profile])
@@ -677,7 +678,12 @@ defmodule Vagus.Runtime.Host do
     %{state | probe: Task.Supervisor.async_nolink(supervisor, fn -> probe.(opts) end).ref}
   end
 
-  defp probed(state, :ok), do: state |> publish(:ready) |> start_migration_check()
+  defp probed(state, :ok) do
+    case write_dns_stub(state.opts) do
+      :ok -> state |> publish(:ready) |> start_migration_check()
+      {:error, reason} -> probed(state, {:error, {:dns_stub, reason}})
+    end
+  end
 
   defp probed(state, {:error, reason}) do
     Logger.error("Vagus.Runtime.Host: podman probe failed: #{inspect(reason)}")
@@ -959,13 +965,9 @@ defmodule Vagus.Runtime.Host do
   defp write_dns_stub(opts) do
     dns = Network.container_dns()
 
-    case ResolvConf.write_stub(resolv_dir_of(opts), dns.dns, dns.dns_search, dns.dns_options) do
-      {:ok, _path} ->
-        :ok
-
-      {:error, reason} ->
-        Logger.error("Vagus.Runtime.Host: DNS stub not written (#{inspect(reason)})")
-    end
+    with {:ok, _path} <-
+           ResolvConf.write_stub(resolv_dir_of(opts), dns.dns, dns.dns_search, dns.dns_options),
+         do: :ok
   end
 
   defp apply_profile(state) do

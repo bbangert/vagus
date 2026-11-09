@@ -169,7 +169,7 @@ defmodule Vagus.DNSTest do
          name: nil,
          ip: {127, 0, 0, 1},
          port: port,
-         upstream: "127.0.0.1",
+         upstream: "127.0.0.6",
          task_supervisor: :vagus_dns_test_no_such_supervisor,
          directory: d},
         id: :no_task_supervisor
@@ -192,15 +192,18 @@ defmodule Vagus.DNSTest do
     port = 17_400 + rem(System.unique_integer([:positive]), 2000)
     sup = start_supervised!({Task.Supervisor, name: :vagus_dns_test_relays})
 
-    # TEST-NET-1 upstream: the query goes out but no answer ever comes, so
-    # the relay sits in its recv until killed.
+    # The query goes out but no answer ever comes, so the relay sits in its
+    # recv until killed.
+    upstream_port = black_hole({127, 0, 0, 6})
+
     server =
       start_supervised!(
         {DNS,
          name: nil,
          ip: {127, 0, 0, 1},
          port: port,
-         upstream: "192.0.2.1",
+         upstream: "127.0.0.6",
+         upstream_port: upstream_port,
          task_supervisor: :vagus_dns_test_relays},
         id: :relay_kill
       )
@@ -217,6 +220,15 @@ defmodule Vagus.DNSTest do
     # An external kill skips the relay's own cleanup; the monitor still sees it.
     Process.exit(relay, :kill)
     assert wait_for(fn -> map_size(:sys.get_state(server).relays) end, &(&1 == 0)) == 0
+  end
+
+  # A bound socket that never reads, so a query to it is never answered and
+  # never refused. `port` defaults to a fresh one.
+  defp black_hole(ip, port \\ 0) do
+    {:ok, s} = :gen_udp.open(port, [:binary, {:ip, ip}, active: false])
+    on_exit(fn -> :gen_udp.close(s) end)
+    {:ok, port} = :inet.port(s)
+    port
   end
 
   defp wait_for(fun, done?, tries \\ 50) do
@@ -269,21 +281,23 @@ defmodule Vagus.DNSTest do
       serve(s, answer)
     end
 
-    defp forwarding_server(name_servers, upstream) do
+    defp forwarding_server(name_servers, upstream, extra \\ []) do
       port = 19_400 + rem(System.unique_integer([:positive]), 2000)
       upstream_port = 21_400 + rem(System.unique_integer([:positive]), 2000)
       start_supervised!({Task.Supervisor, name: :vagus_dns_forward_relays})
 
       start_supervised!(
         {DNS,
-         name: nil,
-         ip: {127, 0, 0, 1},
-         port: port,
-         upstream: upstream,
-         upstream_port: upstream_port,
-         name_servers: name_servers,
-         task_supervisor: :vagus_dns_forward_relays,
-         directory: :no_such_directory},
+         [
+           name: nil,
+           ip: {127, 0, 0, 1},
+           port: port,
+           upstream: upstream,
+           upstream_port: upstream_port,
+           name_servers: name_servers,
+           task_supervisor: :vagus_dns_forward_relays,
+           directory: :no_such_directory
+         ] ++ extra},
         id: :forwarding
       )
 
@@ -326,14 +340,79 @@ defmodule Vagus.DNSTest do
 
     test "a LAN server that never answers gives way to the next" do
       %{port: p, upstream_port: up, sock: s} =
-        forwarding_server(fn -> [{192, 0, 2, 1}, {127, 0, 0, 2}] end, nil)
+        forwarding_server(fn -> [{127, 0, 0, 7}, {127, 0, 0, 2}] end, nil)
 
+      black_hole({127, 0, 0, 7}, up)
       fake_upstream({127, 0, 0, 2}, up, {10, 0, 0, 2})
 
-      packet = <<0x5555::16, 0x0100::16, 1::16, 0::16, 0::16, 0::16, 3, "nas", 0, 1::16, 1::16>>
-      :ok = :gen_udp.send(s, {127, 0, 0, 1}, p, packet)
-      assert {:ok, {_, _, resp}} = :gen_udp.recv(s, 0, 4_000)
-      assert :binary.part(resp, byte_size(resp), -4) == <<10, 0, 0, 2>>
+      assert ask_raw(s, p, 3_000) =~ <<10, 0, 0, 2>>
     end
+
+    test "with every LAN server dead, the fallback still answers" do
+      %{port: p, upstream_port: up, sock: s} =
+        forwarding_server(fn -> [{127, 0, 0, 7}] end, "127.0.0.4")
+
+      black_hole({127, 0, 0, 7}, up)
+      fake_upstream({127, 0, 0, 4}, up, {10, 0, 0, 4})
+
+      assert ask_raw(s, p, 3_000) =~ <<10, 0, 0, 4>>
+    end
+
+    test "the server that answered last is asked first" do
+      %{port: p, upstream_port: up, sock: s} =
+        forwarding_server(fn -> [{127, 0, 0, 7}, {127, 0, 0, 2}] end, nil)
+
+      black_hole({127, 0, 0, 7}, up)
+      fake_upstream({127, 0, 0, 2}, up, {10, 0, 0, 2})
+
+      assert ask_raw(s, p, 3_000) =~ <<10, 0, 0, 2>>
+      # Well inside the dead server's slice: it was not asked first again.
+      assert ask_raw(s, p, 500) =~ <<10, 0, 0, 2>>
+    end
+
+    test "one relay's deadline bounds every server it tries" do
+      dead = for n <- 7..9, do: {127, 0, 0, n}
+      %{port: p, upstream_port: up, sock: s} = forwarding_server(fn -> dead end, nil)
+      Enum.each(dead, &black_hole(&1, up))
+
+      started = System.monotonic_time(:millisecond)
+      :ok = :gen_udp.send(s, {127, 0, 0, 1}, p, query("nas"))
+      wait_for(fn -> relays() end, &(&1 == 1))
+      wait_for(fn -> relays() end, &(&1 == 0), 400)
+      elapsed = System.monotonic_time(:millisecond) - started
+
+      # Three dead servers at a full slice each would be 4.5 s.
+      assert relays() == 0
+      assert elapsed < 4_400
+    end
+
+    test "queries shed at the in-flight cap are counted into one warning" do
+      %{port: p, upstream_port: up, sock: s} =
+        forwarding_server(fn -> [{127, 0, 0, 7}] end, nil, drop_report_ms: 200)
+
+      black_hole({127, 0, 0, 7}, up)
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          for _ <- 1..67, do: :ok = :gen_udp.send(s, {127, 0, 0, 1}, p, query("nas"))
+          Process.sleep(500)
+        end)
+
+      assert [_one] = Regex.scan(~r/queries dropped/, log)
+      assert log =~ "3 queries dropped at the 64-relay cap"
+    end
+  end
+
+  defp relays, do: length(Task.Supervisor.children(:vagus_dns_forward_relays))
+
+  defp query(name),
+    do:
+      <<0x5555::16, 0x0100::16, 1::16, 0::16, 0::16, 0::16, byte_size(name), name::binary, 0,
+        1::16, 1::16>>
+
+  defp ask_raw(s, port, timeout) do
+    :ok = :gen_udp.send(s, {127, 0, 0, 1}, port, query("nas"))
+    {:ok, {_, _, resp}} = :gen_udp.recv(s, 0, timeout)
+    resp
   end
 end
