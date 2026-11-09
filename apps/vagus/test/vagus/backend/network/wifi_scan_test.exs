@@ -113,6 +113,23 @@ defmodule Vagus.Backend.Network.WifiScanTest do
     assert log =~ "WiFi scan on wlan0 failed"
   end
 
+  test "waits on the scan already in progress when wpa_supplicant answers FAIL-BUSY", %{
+    store: store
+  } do
+    me = self()
+
+    Process.put(:on_scan, fn ->
+      spawn(fn ->
+        Process.sleep(50)
+        publish(store, me, [:ap1])
+      end)
+
+      {:error, "FAIL-BUSY"}
+    end)
+
+    assert WifiScan.access_points("wlan0", FakeVintageNet, settle_ms: 50) == [:ap1]
+  end
+
   test "answers the cache when the interface process is not running" do
     Process.put(:on_scan, fn -> exit({:noproc, {:gen_statem, :call, []}}) end)
 

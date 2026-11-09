@@ -49,6 +49,9 @@ defmodule Vagus.Backend.Network.WifiScan do
     case vintage_net.scan(ifname) do
       :ok -> :ok
       {:ok, _} -> :ok
+      # wpa_supplicant's trimmed `SCAN` reply when one is already running;
+      # that scan's results still land on the property.
+      {:error, "FAIL-BUSY"} -> :ok
       {:error, reason} -> scan_failed(ifname, reason)
     end
   catch
