@@ -6,7 +6,7 @@ defmodule Vagus.Backend.Network.WifiScan do
   wpa_supplicant scans on its own, which it never does with no network
   configured, so reading the property alone answers an empty list. Upstream
   (`NetworkManager.scan_wifi`) requests a scan, sleeps 5 s, then reads; this
-  keeps the same 5 s bound but returns once updates stop arriving.
+  waits on the property instead and returns once updates stop arriving.
 
   `vintage_net` is a parameter (the real `VintageNet` on target) because the
   dependency is absent from `:host`, where the tests run.
@@ -14,7 +14,12 @@ defmodule Vagus.Backend.Network.WifiScan do
 
   require Logger
 
-  @timeout_ms 5_000
+  # Upstream's 5 s is too short here: the first scan after boot took longer
+  # than 5 s on an aic8800 board. The settle window keeps a normal scan near
+  # 2 s. Nothing in the call chain times out under 10 s: the frontend sends
+  # `timeout: null` (no timeout in Core's `supervisor/api`), and
+  # `Vagus.API.CoreProxy.WSDispatch` maps a nil timeout to 900 s.
+  @timeout_ms 10_000
 
   # wpa_supplicant publishes one property update per `CTRL-EVENT-BSS-ADDED`,
   # then a full refresh on `CTRL-EVENT-SCAN-RESULTS`, so the first update is
