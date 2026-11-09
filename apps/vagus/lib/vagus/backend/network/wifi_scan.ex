@@ -28,7 +28,11 @@ defmodule Vagus.Backend.Network.WifiScan do
     property = ["interface", ifname, "wifi", "access_points"]
     deadline = System.monotonic_time(:millisecond) + timeout_ms
 
-    # Subscribe before the scan so no update can land in between.
+    # A previous call in this process can still receive a late dispatch
+    # (see `flush/1`); left in the mailbox it would count as this scan's
+    # first update. Subscribe before the scan so no update can land in
+    # between.
+    flush(property)
     :ok = vintage_net.subscribe(property)
 
     try do
@@ -75,8 +79,9 @@ defmodule Vagus.Backend.Network.WifiScan do
     end
   end
 
-  # A dispatch can race the unsubscribe; the caller is a request process
-  # that must not keep it.
+  # `PropertyTable` reads its Registry and then sends, so a dispatch can
+  # still arrive after this. A keep-alive connection's next scan runs in the
+  # same process, hence the flush before subscribing too.
   defp flush(property) do
     receive do
       {VintageNet, ^property, _old, _new, _meta} -> flush(property)

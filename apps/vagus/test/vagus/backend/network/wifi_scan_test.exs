@@ -111,6 +111,44 @@ defmodule Vagus.Backend.Network.WifiScanTest do
       end)
 
     assert log =~ "WiFi scan on wlan0 failed"
+    assert {:unsubscribe, @property} in Process.get(:calls)
+  end
+
+  test "a stale dispatch from an earlier call does not end the wait", %{store: store} do
+    me = self()
+    send(me, {VintageNet, @property, [], [:cached], %{}})
+
+    Process.put(:on_scan, fn ->
+      spawn(fn ->
+        Process.sleep(150)
+        publish(store, me, [:fresh])
+      end)
+
+      :ok
+    end)
+
+    assert WifiScan.access_points("wlan0", FakeVintageNet, settle_ms: 50) == [:fresh]
+  end
+
+  test "the deadline holds while updates keep arriving", %{store: store} do
+    me = self()
+
+    publisher =
+      spawn(fn ->
+        for n <- 1..100 do
+          publish(store, me, [n])
+          Process.sleep(20)
+        end
+      end)
+
+    on_exit(fn -> Process.exit(publisher, :kill) end)
+
+    {_result, elapsed} =
+      timed(fn ->
+        WifiScan.access_points("wlan0", FakeVintageNet, timeout_ms: 200, settle_ms: 500)
+      end)
+
+    assert elapsed < 700
   end
 
   test "waits on the scan already in progress when wpa_supplicant answers FAIL-BUSY", %{
