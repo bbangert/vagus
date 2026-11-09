@@ -32,7 +32,7 @@ defmodule Vagus.Backend.Network.VintageNet do
   if Mix.target() != :host do
     @behaviour Vagus.Backend.Network
 
-    alias Vagus.Backend.Network.{Builder, WireConfig}
+    alias Vagus.Backend.Network.{Builder, WifiScan, WireConfig}
 
     @docker_network %{
       interface: "docker0",
@@ -184,8 +184,8 @@ defmodule Vagus.Backend.Network.VintageNet do
     defp name_servers, do: VintageNet.get(["name_servers"], [])
 
     defp scan_access_points(ifname) do
-      ["interface", ifname, "wifi", "access_points"]
-      |> VintageNet.get([])
+      ifname
+      |> WifiScan.access_points(VintageNet)
       |> Enum.map(fn ap ->
         %{
           mode: "infrastructure",
