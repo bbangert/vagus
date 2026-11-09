@@ -440,7 +440,9 @@ defmodule Vagus.Runtime.Engine.PodmanContractTest do
     leg: Vagus.Runtime.Engine.PodmanContractTest.Leg,
     async: true
 
+  alias Vagus.Core.Container, as: CoreContainer
   alias Vagus.Runtime.Engine.PodmanContractTest.Leg
+  alias Vagus.Runtime.Host
   alias Vagus.Runtime.ResolvConf
   alias Vagus.Test.EngineContract, as: C
   alias Vagus.Test.FakePodman
@@ -945,9 +947,9 @@ defmodule Vagus.Runtime.Engine.PodmanContractTest do
 
     test "a host-network create writes the DNS stub it binds", ctx do
       {fake, opts} = engine(ctx, [{"create *", [{0, String.duplicate("c0ffee00", 8) <> "\n"}]}])
-      dir = Vagus.Runtime.Host.resolv_dir(opts[:host])
+      dir = Host.resolv_dir(opts[:host])
       File.rm_rf!(dir)
-      spec = Vagus.Core.Container.to_container_spec("2026.7.0", token: "t", tz: "UTC")
+      spec = CoreContainer.to_container_spec("2026.7.0", token: "t", tz: "UTC")
       stub = ResolvConf.stub_path(dir, spec.dns, spec.dns_search, spec.dns_options)
 
       {:ok, _} = Engine.create(spec, opts)
@@ -959,10 +961,10 @@ defmodule Vagus.Runtime.Engine.PodmanContractTest do
 
     test "a host-network create whose stub cannot be written fails without podman", ctx do
       {fake, opts} = engine(ctx, [{"create *", [{0, String.duplicate("c0ffee00", 8) <> "\n"}]}])
-      dir = Vagus.Runtime.Host.resolv_dir(opts[:host])
+      dir = Host.resolv_dir(opts[:host])
       File.rm_rf!(dir)
       File.write!(dir, "not a directory")
-      spec = Vagus.Core.Container.to_container_spec("2026.7.0", token: "t", tz: "UTC")
+      spec = CoreContainer.to_container_spec("2026.7.0", token: "t", tz: "UTC")
 
       assert {:error, {:failed, :create, "resolv.conf stub: " <> _}} = Engine.create(spec, opts)
       refute Enum.any?(FakePodman.verbs(fake), &match?(["create" | _], &1))
