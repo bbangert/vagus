@@ -5,6 +5,7 @@ defmodule Vagus.App.ServerTest do
 
   import Vagus.AppFixtures
 
+  alias Vagus.API.{Router, Token}
   alias Vagus.App
   alias Vagus.App.File, as: AppFile
   alias Vagus.App.{Instances, Policy, Server}
@@ -183,6 +184,25 @@ defmodule Vagus.App.ServerTest do
       assert %{ingress_port: nil} = data(pid_of(b))
       assert {:ok, %{ingress_port: nil, rewrite: false}} = AppFile.read(b)
       assert {:ok, %{ingress_port: 62_124}} = AppFile.read(a)
+    end
+  end
+
+  describe "info" do
+    defp ip_address(slug) do
+      Plug.Test.conn(:get, "/addons/#{slug}/info")
+      |> Plug.Conn.put_req_header("authorization", "Bearer #{Token.get()}")
+      |> Router.call(Router.init([]))
+      |> Map.fetch!(:resp_body)
+      |> Jason.decode!()
+      |> get_in(["data", "ip_address"])
+    end
+
+    test "a bridged app reports its container's bridge address while it runs" do
+      {slug, _pid} = installed()
+      assert ip_address(slug) == "0.0.0.0"
+
+      {slug, _pid} = started()
+      assert ip_address(slug) == @started.ip
     end
   end
 

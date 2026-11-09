@@ -39,6 +39,9 @@ defmodule Vagus.Core.ContainerTest do
                ],
                secret_env: ["SUPERVISOR_TOKEN", "HASSIO_TOKEN"],
                network: :host,
+               dns: ["172.30.32.3"],
+               dns_search: ["local.hass.io"],
+               dns_options: ["timeout:10"],
                privileged: true,
                oom_score_adj: -300,
                restart: :unless_stopped,
@@ -162,7 +165,8 @@ defmodule Vagus.Core.ContainerTest do
             %{base | privileged: false},
             %{base | cap_add: ["NET_ADMIN"]},
             %{base | init: false},
-            %{base | security_opt: ["seccomp=unconfined"]}
+            %{base | security_opt: ["seccomp=unconfined"]},
+            %{base | dns: nil}
           ] do
         refute Container.spec_fingerprint(changed) == fingerprint, inspect(changed)
       end
@@ -183,7 +187,8 @@ defmodule Vagus.Core.ContainerTest do
   # Literals 0.10.0 stamped on podman boards (computed over the Docker
   # Engine-API create body it rendered), so a fingerprint that drifts from
   # them — and would recreate Core on every board — fails here rather than
-  # echoing itself.
+  # echoing itself. The DNS settings came later and recreate Core once on
+  # purpose (its resolv.conf bind changed); without them the shape is 0.10.0's.
   describe "fingerprint parity with 0.10.0" do
     test "the boards' config path, a token and the default tz" do
       assert fingerprint("2026.7.0", "t", "UTC", "/root/vagus/core/config") ==
@@ -201,9 +206,8 @@ defmodule Vagus.Core.ContainerTest do
     end
 
     defp fingerprint(version, token, tz, path) do
-      Container.to_container_spec(version, token: token, tz: tz, homeassistant_path: path).labels[
-        Container.spec_fingerprint_label()
-      ]
+      spec = Container.to_container_spec(version, token: token, tz: tz, homeassistant_path: path)
+      Container.spec_fingerprint(%{spec | dns: nil, dns_search: nil, dns_options: nil})
     end
   end
 

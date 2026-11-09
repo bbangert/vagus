@@ -75,6 +75,7 @@ defmodule Vagus.App.ImportTest do
                state: wanted,
                alive?: wanted == :started,
                busy: nil,
+               ip: nil,
                wanted: wanted,
                user_options: raw["user_options"],
                ports: raw["network"],

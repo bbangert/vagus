@@ -325,23 +325,17 @@ defmodule Vagus.App.StepsTest do
       assert %{network_name: "hassio", ip: nil} = spec.("agent_memory")
     end
 
-    test "host_network add-on: NetworkMode host, no ports/hostname", %{} do
-      {:ok, hostcfg} =
-        Config.parse(%{
-          "name" => "N",
-          "version" => "1",
-          "slug" => "hostnet",
-          "description" => "d",
-          "arch" => ["amd64"],
-          "image" => "x/y",
-          "host_network" => true,
-          "ports" => %{"9/tcp" => 9}
-        })
-
-      s = Steps.build_spec(hostcfg, access_token: "t", arch: "amd64")
+    test "host_network add-on: NetworkMode host, no ports, its own hostname", %{} do
+      s = Steps.build_spec(host_config(%{}), access_token: "t", arch: "amd64")
       assert s.network == :host
-      assert s.hostname == nil
+      assert s.hostname == "core-host-net"
       assert s.ports == %{}
+    end
+
+    test "host_uts add-on: the host's hostname, none of its own" do
+      s = Steps.build_spec(host_config(%{"host_uts" => true}), arch: "amd64")
+      assert s.hostname == nil
+      assert s.uts_mode == "host"
     end
 
     test "device_cgroup_rules: declared devices resolve; none declared stays empty", %{spec: s} do
@@ -1650,5 +1644,26 @@ defmodule Vagus.App.StepsTest do
       send(:persistent_term.get({__MODULE__, :pid}), {:panel_push, slug, opts})
       :ok
     end
+  end
+
+  defp host_config(extra) do
+    {:ok, config} =
+      Config.parse(
+        Map.merge(
+          %{
+            "name" => "N",
+            "version" => "1",
+            "slug" => "core_host_net",
+            "description" => "d",
+            "arch" => ["amd64"],
+            "image" => "x/y",
+            "host_network" => true,
+            "ports" => %{"9/tcp" => 9}
+          },
+          extra
+        )
+      )
+
+    config
   end
 end

@@ -29,6 +29,7 @@ defmodule Vagus.Addon.Info do
   """
 
   alias Vagus.Addon.{Availability, Config, OptionsSchema, Rating}
+  alias Vagus.Network
 
   @doc """
   Builds the info map for `config` in lifecycle `state` (`:started`/`:stopped`,
@@ -70,6 +71,7 @@ defmodule Vagus.Addon.Info do
       false, which is what the frontend needs to hear: it requests an asset
       only when the payload advertises one, so a detached add-on stops asking
       rather than showing a broken image.
+    * `:ip` — the running container's bridge address, behind `ip_address`.
     * `:long_description` — the add-on's `README.md`, which the frontend
       renders as markdown for the body of its page. Supplied only by the
       single-add-on info route; `GET /addons` leaves it out, since reading one
@@ -177,7 +179,7 @@ defmodule Vagus.Addon.Info do
       "audio_input" => nil,
       "audio_output" => nil,
       "auto_update" => Map.get(settings, :auto_update) || false,
-      "ip_address" => "0.0.0.0",
+      "ip_address" => ip_address(config, settings),
       "watchdog" => Map.get(settings, :watchdog) || false,
       # The real list, not `[]`: since `Vagus.Addon.Devices` these entries are
       # granted cgroup rules, so an empty literal here would be the consent
@@ -187,6 +189,15 @@ defmodule Vagus.Addon.Info do
       "system_managed_config_entry" => nil
     }
   end
+
+  # bashio's `addon.ip_address`, which apps pass to `--listen-address`. Upstream
+  # (`docker/app.py`) answers the gateway for a host-network app, the host's
+  # own address on the bridge: `0.0.0.0` there makes an app that also binds
+  # loopback (Matter Server) fail `EADDRINUSE`. Otherwise the container's
+  # bridge address, `0.0.0.0` while it has none.
+  defp ip_address(%Config{host_network: true}, _settings), do: Network.gateway()
+  defp ip_address(_config, %{ip: ip}) when is_binary(ip), do: ip
+  defp ip_address(_config, _settings), do: "0.0.0.0"
 
   # §B3.4: `/api/hassio_ingress/{ingress_token}` — no trailing content. `nil`
   # for a non-ingress add-on, or an ingress one whose token isn't known yet

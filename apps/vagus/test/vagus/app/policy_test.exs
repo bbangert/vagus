@@ -145,6 +145,11 @@ defmodule Vagus.App.PolicyTest do
       assert %{state: :stopped, alive?: false} = Policy.snapshot(app())
     end
 
+    test "the snapshot carries the running container's address, none before a start" do
+      assert %{ip: @ip} = Policy.snapshot(running())
+      assert %{ip: nil} = Policy.snapshot(app())
+    end
+
     test "a once app's clean exit is stopped" do
       once = app(%{config: app_config(%{"startup" => "once"}), last_event: {:exited, 0}})
       assert Policy.derive(:idle, once) == :stopped
@@ -806,9 +811,13 @@ defmodule Vagus.App.PolicyTest do
                [{:slug, "app_one"}, {:token, "h"}, {{:dns, "app-one"}, @ip}]
     end
 
-    test "a host-network app has no DNS record" do
-      data = running(%{config: app_config(%{"host_network" => true})})
-      assert Policy.keys(data) == [{:slug, "app_one"}]
+    test "a running host-network app's record is the gateway; a stopped one has none" do
+      config = app_config(%{"host_network" => true})
+
+      assert Policy.keys(running(%{config: config, ip: nil})) ==
+               [{:slug, "app_one"}, {{:dns, "app-one"}, "172.30.32.1"}]
+
+      assert Policy.keys(app(%{config: config})) == [{:slug, "app_one"}]
     end
 
     test "a native app's record is the supervisor IP it was started with" do
@@ -1029,6 +1038,32 @@ defmodule Vagus.App.PolicyTest do
              ]
 
       assert %{container_id: "c1", ip: @ip, wanted: :started, attempt: 0} = data
+    end
+
+    test "2h. a host-network app's start registers its gateway record; its death drops it" do
+      config = app_config(%{"host_network" => true})
+      {data, _} = begin(:start, %{}, app(%{config: config}))
+
+      {data, effects} = step(data, {:ok, %{container_id: "c1", ip: nil}})
+
+      assert {:keys, [{{:dns, "app-one"}, "172.30.32.1"}], [{:dns, "app-one"}]} in effects
+      assert data.ip == nil
+
+      {_data, effects} = Policy.on_event(%Event{action: :die, id: "c1", exit_code: 1}, data)
+      assert {:keys, [], [{:token, data.token_hash}, {:dns, "app-one"}]} in effects
+    end
+
+    test "2i. a host-network app's stop drops its record whatever its liveness reads" do
+      config = app_config(%{"host_network" => true})
+      dead = running(%{config: config, ip: nil, last_event: {:exited, 1}})
+      refute Policy.alive?(dead)
+
+      {_data, effects} = begin(:stop, %{}, dead)
+      assert {:keys, [], [{:dns, "app-one"}]} in effects
+
+      {_data, effects} = begin(:uninstall, %{}, dead)
+      assert {:keys, [], drop} = Enum.find(effects, &match?({:keys, [], _}, &1))
+      assert {:dns, "app-one"} in drop
     end
 
     test "3. start/start timed out: token revoked, one cleanup stop by name, then the ladder" do

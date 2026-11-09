@@ -17,6 +17,7 @@ defmodule Vagus.App.Policy do
 
   alias Vagus.Addon.{Config, OptionsSchema}
   alias Vagus.App.Steps
+  alias Vagus.Network
 
   @type message :: %{uuid: String.t(), addon: String.t(), service: String.t(), config: map()}
   @type caller :: :supervisor | {:addon, map()} | term()
@@ -529,8 +530,7 @@ defmodule Vagus.App.Policy do
 
   @doc """
   Every directory key the data implies; a `{key, value}` item carries a
-  value. A host-network app has no DNS record, and only a dynamically
-  assigned ingress port is unique to its app.
+  value. Only a dynamically assigned ingress port is unique to its app.
   """
   @spec keys(map()) :: [term()]
   def keys(data) do
@@ -545,7 +545,19 @@ defmodule Vagus.App.Policy do
   defp dns_keys(%{ip: ip, config: %{host_network: false}, slug: slug}) when is_binary(ip),
     do: [{{:dns, dns_name(slug)}, ip}]
 
+  # Upstream's record for a host-network app is the gateway, its
+  # `ip_address`; it has no `ip` of its own, so its liveness stands in.
+  defp dns_keys(%{ip: nil, config: %{host_network: true}, slug: slug} = data) do
+    if alive?(data), do: [{{:dns, dns_name(slug)}, Network.gateway()}], else: []
+  end
+
   defp dns_keys(_data), do: []
+
+  # A host-network app's name is dropped whatever its liveness reads by
+  # then, so no order of the steps around a stop can leak it; unregistering
+  # a key this process does not hold is a no-op.
+  defp dns_drop(%{config: %{host_network: true}, slug: slug}), do: [{:dns, dns_name(slug)}]
+  defp dns_drop(data), do: Enum.map(dns_keys(data), &key/1)
 
   # The panel's capability is `Vagus.Ingress`'s per-boot admin token, which
   # `resolve_token/2` matches first; its saved token must open nothing.
@@ -610,11 +622,12 @@ defmodule Vagus.App.Policy do
   defp ingress_ip(_data), do: {:error, :no_container_ip}
 
   @doc """
-  The app's saved facts plus its reported `state`, `alive?` and `busy`, the
-  shape `Addon.Info.render` and the router read. `alive?` rides along because
-  `state` alone hides a container that outlived a failed URL probe; `busy`
-  (the operation in flight, else `nil`) because events are postponed during
-  one, so a start's container can run while `state` still reads `:stopped`.
+  The app's saved facts plus its reported `state`, `alive?`, `busy` and the
+  running container's `ip`, the shape `Addon.Info.render` and the router
+  read. `alive?` rides along because `state` alone hides a container that
+  outlived a failed URL probe; `busy` (the operation in flight, else `nil`)
+  because events are postponed during one, so a start's container can run
+  while `state` still reads `:stopped`.
   """
   @spec snapshot(map()) :: map()
   def snapshot(data) do
@@ -623,7 +636,7 @@ defmodule Vagus.App.Policy do
 
     data
     |> Map.take(@persisted)
-    |> Map.merge(%{state: state, alive?: alive?(data), busy: busy})
+    |> Map.merge(%{state: state, alive?: alive?(data), busy: busy, ip: data[:ip]})
   end
 
   @doc """
@@ -833,7 +846,7 @@ defmodule Vagus.App.Policy do
   # The credential goes before the container: a stopped app's token must not
   # outlive it, and nothing it posts while stopping should land.
   defp before_task({:stop, nil}, %{run: %{op: :uninstall}} = data) do
-    drop = Enum.map(tl(keys(data)), &key/1)
+    drop = Enum.uniq(Enum.map(tl(keys(data)), &key/1) ++ dns_drop(data))
     timers = cancel_timers(data)
     data = %{data | token: nil, token_hash: nil, ip: nil, wanted: :stopped}
     data = %{data | services: %{}, discovery: %{}}
@@ -850,7 +863,7 @@ defmodule Vagus.App.Policy do
   defp before_task(_step, data), do: {data, []}
 
   defp drop_run_keys(data) do
-    drop = Enum.map(dns_keys(data), &key/1)
+    drop = dns_drop(data)
     drop = if data.token_hash, do: [{:token, data.token_hash} | drop], else: drop
     effects = if drop == [], do: [], else: [{:keys, [], drop}]
     {%{data | token: nil, token_hash: nil, ip: nil}, effects}

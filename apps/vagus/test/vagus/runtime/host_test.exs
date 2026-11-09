@@ -5,6 +5,7 @@ defmodule Vagus.Runtime.HostTest do
 
   alias Vagus.Runtime.Host
   alias Vagus.Runtime.Podman.Cmd
+  alias Vagus.Runtime.ResolvConf
   alias Vagus.Test.FakePodman
 
   @gib_kb 1024 * 1024
@@ -134,6 +135,18 @@ defmodule Vagus.Runtime.HostTest do
       assert File.read!(path) == "search lan\nnameserver 192.168.2.53\n"
     end
 
+    test "the hassio DNS stub is written where the engine binds it", ctx do
+      dns = Vagus.Network.container_dns()
+      dir = Path.join(ctx.root, "run/vagus/podman/resolv")
+      stub = ResolvConf.stub_path(dir, dns.dns, dns.dns_search, dns.dns_options)
+
+      assert start_host(ctx) == :ok
+      assert Host.resolv_dir(ctx.name) == dir
+
+      assert File.read!(stub) ==
+               "nameserver 172.30.32.3\nsearch local.hass.io\noptions timeout:10\n"
+    end
+
     test "the probe runs last: every file is in place when podman first runs", ctx do
       test = self()
       run_dir = Path.join(ctx.root, "run/vagus/podman")
@@ -189,6 +202,19 @@ defmodule Vagus.Runtime.HostTest do
       assert_receive :probed, 5_000
       assert_receive :probed, 5_000
       assert await_ready(ctx.name, true) == :ok
+    end
+
+    test "a DNS stub it cannot write is {:prep_failed, _}, retried until written", ctx do
+      dir = Path.join(ctx.root, "run/vagus/podman/resolv")
+      File.mkdir_p!(Path.dirname(dir))
+      File.write!(dir, "in the way")
+
+      start_supervised!({Host, host_opts(ctx, prep_retry_ms: 50)})
+      assert {:error, {:prep_failed, {:dns_stub, _}}} = await_ready(ctx.name)
+
+      File.rm!(dir)
+      assert await_ready(ctx.name, true) == :ok
+      assert [_stub] = File.ls!(dir)
     end
 
     test "the default probe is podman info through the runner", ctx do

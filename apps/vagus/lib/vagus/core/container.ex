@@ -143,6 +143,7 @@ defmodule Vagus.Core.Container do
     ip = Network.supervisor_ip()
     token = Keyword.get_lazy(opts, :token, &Token.get/0)
     tz = Keyword.get(opts, :tz, @default_tz)
+    dns = Network.container_dns()
 
     spec = %ContainerSpec{
       name: name(),
@@ -151,6 +152,12 @@ defmodule Vagus.Core.Container do
       env: env(ip, token, tz),
       secret_env: ["SUPERVISOR_TOKEN", "HASSIO_TOKEN"],
       network: :host,
+      # Upstream's Core resolves through the Supervisor's DNS too, which is
+      # what makes a host-network app's name (Matter Server's discovery)
+      # resolvable from Core.
+      dns: dns.dns,
+      dns_search: dns.dns_search,
+      dns_options: dns.dns_options,
       privileged: true,
       oom_score_adj: -300,
       restart: :unless_stopped,

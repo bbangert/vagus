@@ -440,7 +440,10 @@ defmodule Vagus.Runtime.Engine.PodmanContractTest do
     leg: Vagus.Runtime.Engine.PodmanContractTest.Leg,
     async: true
 
+  alias Vagus.Core.Container, as: CoreContainer
   alias Vagus.Runtime.Engine.PodmanContractTest.Leg
+  alias Vagus.Runtime.Host
+  alias Vagus.Runtime.ResolvConf
   alias Vagus.Test.EngineContract, as: C
   alias Vagus.Test.FakePodman
   alias Vagus.Test.PodmanRecorded
@@ -940,6 +943,31 @@ defmodule Vagus.Runtime.Engine.PodmanContractTest do
 
       assert List.last(FakePodman.envs(fake)) == ["SUPERVISOR_TOKEN=s3cret-token"]
       refute fake |> FakePodman.calls() |> List.flatten() |> Enum.any?(&(&1 =~ "s3cret"))
+    end
+
+    test "a host-network create writes the DNS stub it binds", ctx do
+      {fake, opts} = engine(ctx, [{"create *", [{0, String.duplicate("c0ffee00", 8) <> "\n"}]}])
+      dir = Host.resolv_dir(opts[:host])
+      File.rm_rf!(dir)
+      spec = CoreContainer.to_container_spec("2026.7.0", token: "t", tz: "UTC")
+      stub = ResolvConf.stub_path(dir, spec.dns, spec.dns_search, spec.dns_options)
+
+      {:ok, _} = Engine.create(spec, opts)
+
+      assert File.read!(stub) =~ "nameserver 172.30.32.3\n"
+      assert [create] = Enum.filter(FakePodman.verbs(fake), &match?(["create" | _], &1))
+      assert "type=bind,src=#{stub},dst=/etc/resolv.conf,ro=true" in create
+    end
+
+    test "a host-network create whose stub cannot be written fails without podman", ctx do
+      {fake, opts} = engine(ctx, [{"create *", [{0, String.duplicate("c0ffee00", 8) <> "\n"}]}])
+      dir = Host.resolv_dir(opts[:host])
+      File.rm_rf!(dir)
+      File.write!(dir, "not a directory")
+      spec = CoreContainer.to_container_spec("2026.7.0", token: "t", tz: "UTC")
+
+      assert {:error, {:failed, :create, "resolv.conf stub: " <> _}} = Engine.create(spec, opts)
+      refute Enum.any?(FakePodman.verbs(fake), &match?(["create" | _], &1))
     end
 
     test "a create whose mount path holds a comma fails without running podman", ctx do

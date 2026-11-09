@@ -2761,7 +2761,8 @@ defmodule Vagus.API.Router do
       :watchdog,
       :boot,
       :auto_update,
-      :protected
+      :protected,
+      :ip
     ])
     |> Map.put(:version_latest, version_latest)
     |> Map.put(:assets, assets)

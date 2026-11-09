@@ -7,9 +7,11 @@ defmodule Vagus.Runtime.Host do
 
   Runs in `handle_continue/2`, so no permit is granted before the board is
   set up. Every step is idempotent, and only the readiness probe
-  (`podman info`, run in a task and retried every `:prep_retry_ms`) can
-  fail preparation: a board missing an earlier step still runs most
-  containers, so those log and go on.
+  (`podman info`, run in a task and retried every `:prep_retry_ms`) and the
+  hassio DNS stub written after it can fail preparation: a board missing an
+  earlier step still runs most containers, so those log and go on, while
+  Core's container, started again after a reboot rather than created, fails
+  outright without its stub.
 
   The pull spool is emptied once per VM boot: a marker in `/run` keeps a
   Vagus restart from deleting the spool of a pull still running. Later,
@@ -64,6 +66,7 @@ defmodule Vagus.Runtime.Host do
 
   require Logger
 
+  alias Vagus.Network
   alias Vagus.Runtime.Migration
   alias Vagus.Runtime.Mountinfo
   alias Vagus.Runtime.Podman.Cmd
@@ -188,6 +191,13 @@ defmodule Vagus.Runtime.Host do
 
   @spec profile(atom() | nil) :: profile() | nil
   def profile(host \\ nil), do: shared(host)[:profile]
+
+  @doc """
+  Where `Vagus.Runtime.Engine.Podman` keeps the resolv.conf stubs it binds
+  into host-network containers (`Vagus.Runtime.ResolvConf.write_stub/4`).
+  """
+  @spec resolv_dir(atom() | nil) :: String.t()
+  def resolv_dir(host \\ nil), do: shared(host)[:resolv_dir] || resolv_dir_of([])
 
   @doc """
   Where containers write their k8s-file logs and how large each may grow;
@@ -648,6 +658,7 @@ defmodule Vagus.Runtime.Host do
       proc_dir: Keyword.get(state.opts, :proc_dir, "/proc"),
       podman: Path.basename(podman_bin(state.opts)),
       log_dir: log_dir(state.opts),
+      resolv_dir: resolv_dir_of(state.opts),
       out_dir: state.out_dir,
       log_max_bytes: state.profile && @log_max_bytes[state.profile],
       log_tmpfs_bytes: state.profile && @log_tmpfs_bytes[state.profile],
@@ -667,7 +678,12 @@ defmodule Vagus.Runtime.Host do
     %{state | probe: Task.Supervisor.async_nolink(supervisor, fn -> probe.(opts) end).ref}
   end
 
-  defp probed(state, :ok), do: state |> publish(:ready) |> start_migration_check()
+  defp probed(state, :ok) do
+    case write_dns_stub(state.opts) do
+      :ok -> state |> publish(:ready) |> start_migration_check()
+      {:error, reason} -> probed(state, {:error, {:dns_stub, reason}})
+    end
+  end
 
   defp probed(state, {:error, reason}) do
     Logger.error("Vagus.Runtime.Host: podman probe failed: #{inspect(reason)}")
@@ -944,6 +960,16 @@ defmodule Vagus.Runtime.Host do
     end
   end
 
+  # /run is empty after a reboot, and Core's container outlives one: its
+  # stub must be back before the engine gate lets Core start it again.
+  defp write_dns_stub(opts) do
+    dns = Network.container_dns()
+
+    with {:ok, _path} <-
+           ResolvConf.write_stub(resolv_dir_of(opts), dns.dns, dns.dns_search, dns.dns_options),
+         do: :ok
+  end
+
   defp apply_profile(state) do
     opts = state.opts
     profile = pick_profile(opts)
@@ -1052,6 +1078,7 @@ defmodule Vagus.Runtime.Host do
 
   defp run_dir(opts), do: Keyword.get(opts, :run_dir, "/run/vagus/podman")
   defp out_dir_of(opts), do: Path.join(run_dir(opts), "out")
+  defp resolv_dir_of(opts), do: Path.join(run_dir(opts), "resolv")
 
   # A holder killed mid-call never reaches Cmd's own cleanup. A file its
   # podman already holds open keeps its space until podman exits. The path
