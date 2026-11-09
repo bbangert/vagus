@@ -16,6 +16,10 @@ defmodule Vagus.DNS do
   the resolv.conf `Vagus.Runtime.Engine.Podman` binds in. So LAN-local names
   keep resolving for Core only because the forward follows the LAN.
 
+  It answers over TCP too, on the same address and port, as CoreDNS does: a
+  reply too large for UDP comes back truncated, and the client asks again
+  over TCP (`Vagus.DNS.TCP`).
+
   Bind address/port and upstream are configurable (`opts`/`config :vagus, :dns_*`)
   so the server is unit-testable on loopback without `CAP_NET_BIND_SERVICE`.
 
@@ -37,13 +41,15 @@ defmodule Vagus.DNS do
 
   # The stub's `timeout:10` is musl's whole budget, resent every 5 s (two
   # attempts): a relay done within 4 s never overlaps the resend of its own
-  # query. Within that, 1.5 s per server covers a LAN resolver recursing
-  # cold, and leaves a dead first server time for two more.
+  # query. The budget is shared out among the servers not yet tried, so the
+  # fallback, last, still gets a real slice after dead LAN servers; the floor
+  # keeps a long list from slicing it too thin for any of them to answer.
   @relay_ms 4_000
-  @per_server_ms 1_500
-  # Cap concurrent upstream relays so a flood of un-owned queries can't exhaust
-  # processes/file descriptors.
+  @min_slice_ms 250
+  # Cap concurrent upstream relays and TCP connections so a flood can't
+  # exhaust processes/file descriptors.
   @max_inflight 64
+  @max_tcp 16
   @drop_report_ms 60_000
 
   def start_link(opts \\ []) do
@@ -70,6 +76,10 @@ defmodule Vagus.DNS do
     # failed bind is retried rather than fatal.
     state = %{
       socket: nil,
+      listen: nil,
+      # Monitor ref -> pid of each TCP connection's task.
+      conns: %{},
+      tcp_idle_ms: Keyword.get(opts, :tcp_idle_ms, Vagus.DNS.TCP.idle_ms()),
       ip:
         to_ip(Keyword.get(opts, :ip, Application.get_env(:vagus, :dns_bind_ip, Network.dns_ip()))),
       port: Keyword.get(opts, :port, Application.get_env(:vagus, :dns_port, 53)),
@@ -84,9 +94,9 @@ defmodule Vagus.DNS do
         parse_upstream(Keyword.get(opts, :upstream, Application.get_env(:vagus, :dns_upstream))),
       name_servers: Keyword.get(opts, :name_servers, &lan_name_servers/0),
       upstream_port: Keyword.get(opts, :upstream_port, 53),
-      # The upstream that last answered, tried first.
+      # The LAN server that last answered, tried first among them.
       preferred: nil,
-      # Queries shed at the cap since the last report, one report per interval.
+      # Queries shed at a cap since the last report, one report per interval.
       dropped: 0,
       drop_report_ms: Keyword.get(opts, :drop_report_ms, @drop_report_ms)
     }
@@ -94,12 +104,16 @@ defmodule Vagus.DNS do
     {:ok, try_bind(state)}
   end
 
+  # UDP and TCP come up together or not at all: a client told to retry over
+  # TCP must find it there.
   defp try_bind(%{ip: ip, port: port} = state) do
-    case :gen_udp.open(port, [:binary, :inet, {:ip, ip}, active: true, reuseaddr: true]) do
-      {:ok, socket} ->
-        Logger.info("Vagus.DNS: listening on #{fmt(ip)}:#{port}")
-        %{state | socket: socket}
-
+    with {:ok, socket} <-
+           :gen_udp.open(port, [:binary, :inet, {:ip, ip}, active: true, reuseaddr: true]),
+         {:ok, listen} <- listen_tcp(socket, ip, port) do
+      Vagus.DNS.TCP.start_acceptor(listen, self())
+      Logger.info("Vagus.DNS: listening on #{fmt(ip)}:#{port} (UDP and TCP)")
+      %{state | socket: socket, listen: listen}
+    else
       {:error, reason} ->
         Logger.warning(
           "Vagus.DNS: bind #{fmt(ip)}:#{port} failed (#{inspect(reason)}), retrying in #{@bind_retry_ms}ms"
@@ -107,6 +121,17 @@ defmodule Vagus.DNS do
 
         Process.send_after(self(), :retry_bind, @bind_retry_ms)
         state
+    end
+  end
+
+  defp listen_tcp(socket, ip, port) do
+    case Vagus.DNS.TCP.listen(ip, port) do
+      {:ok, listen} ->
+        {:ok, listen}
+
+      {:error, _reason} = error ->
+        :gen_udp.close(socket)
+        error
     end
   end
 
@@ -127,11 +152,25 @@ defmodule Vagus.DNS do
     {:noreply, %{state | relays: Map.delete(relays, ref)}}
   end
 
+  def handle_info({:DOWN, ref, :process, _pid, _reason}, %{conns: conns} = state)
+      when is_map_key(conns, ref) do
+    {:noreply, %{state | conns: Map.delete(conns, ref)}}
+  end
+
+  def handle_info({:tcp_accepted, sock}, %{conns: conns} = state)
+      when map_size(conns) >= @max_tcp do
+    :gen_tcp.close(sock)
+    {:noreply, shed(state)}
+  end
+
+  def handle_info({:tcp_accepted, sock}, state), do: {:noreply, serve_tcp(sock, state)}
+
   def handle_info({:answered_by, ip}, state), do: {:noreply, %{state | preferred: ip}}
 
   def handle_info(:report_drops, state) do
     Logger.warning(
-      "Vagus.DNS: #{state.dropped} queries dropped at the #{@max_inflight}-relay cap " <>
+      "Vagus.DNS: #{state.dropped} queries shed at the in-flight caps " <>
+        "(#{@max_inflight} relays, #{@max_tcp} TCP connections) " <>
         "in the last #{div(state.drop_report_ms, 1000)}s"
     )
 
@@ -147,58 +186,69 @@ defmodule Vagus.DNS do
 
   # Returns the (possibly inflight-incremented) state.
   defp handle_packet(packet, host, port, state) do
-    case Message.parse_query(packet) do
-      {:ok, %{qtype: qtype} = query} ->
-        case lookup(strip_suffix(query.qname), state) do
-          {:ok, ip} ->
-            # We're authoritative for this name: answer A with the record, and
-            # any other type (e.g. AAAA) as NOERROR-with-no-answers. Never
-            # forward an owned name — a stub resolver doing A+AAAA would take
-            # upstream's NXDOMAIN for the AAAA as "the name doesn't exist".
-            ips = if qtype == Message.type_a(), do: [ip], else: []
-            reply(state.socket, host, port, Message.answer(query, ips))
+    case local_answer(packet, state) do
+      {:answer, resp} ->
+        reply(state.socket, host, port, resp)
+        state
+
+      {:forward, nxdomain} ->
+        case upstreams(state) do
+          [] ->
+            if nxdomain, do: reply(state.socket, host, port, nxdomain)
             state
 
-          :error ->
-            forward_or_nxdomain(packet, query, host, port, state)
-        end
-
-      {:error, _reason} ->
-        # Unparseable (e.g. multi-question) — forward raw if we can, else drop.
-        case upstreams(state) do
-          [] -> state
-          upstreams -> forward(packet, host, port, upstreams, state)
+          upstreams ->
+            forward(packet, host, port, upstreams, state)
         end
     end
   end
 
-  defp forward_or_nxdomain(packet, query, host, port, state) do
-    case upstreams(state) do
-      [] ->
-        reply(state.socket, host, port, Message.nxdomain(query))
-        state
+  @doc false
+  # Owned names are answered here: A with the record, and any other type
+  # (e.g. AAAA) as NOERROR-with-no-answers. Never forward an owned name — a
+  # stub resolver doing A+AAAA would take upstream's NXDOMAIN for the AAAA as
+  # "the name doesn't exist". Anything else is `{:forward, nxdomain}`, with
+  # the NXDOMAIN to send when there is nobody to forward to; an unparseable
+  # query (e.g. multi-question) has none and is dropped then.
+  @spec local_answer(binary(), %{static: map(), directory: atom()}) ::
+          {:answer, binary()} | {:forward, binary() | nil}
+  def local_answer(packet, zone) do
+    case Message.parse_query(packet) do
+      {:ok, %{qtype: qtype} = query} ->
+        case lookup(strip_suffix(query.qname), zone) do
+          {:ok, ip} ->
+            ips = if qtype == Message.type_a(), do: [ip], else: []
+            {:answer, Message.answer(query, ips)}
 
-      upstreams ->
-        forward(packet, host, port, upstreams, state)
+          :error ->
+            {:forward, Message.nxdomain(query)}
+        end
+
+      {:error, _reason} ->
+        {:forward, nil}
     end
   end
 
   # Read per query, not subscribed to: the property is an ETS read, and a
   # lease change then reaches the very next query with no state to keep in
   # step. Only IPv4 servers, which the relay's socket can reach, and never
-  # this server itself, which would relay to itself. The fallback goes last,
-  # as CoreDNS's does, so a LAN whose servers all fail still resolves.
+  # this server itself, which would relay to itself. The fallback is always
+  # last, as CoreDNS's is: a public resolver knows no LAN-only name, so its
+  # NXDOMAIN must never come before a LAN server's answer, and the preference
+  # for the server that last answered applies among the LAN's alone.
   defp upstreams(state) do
     own = [state.ip, to_ip(Network.dns_ip())]
 
-    all =
-      for server <- state.name_servers.() ++ List.wrap(state.fallback),
+    lan =
+      for server <- state.name_servers.(),
           {_, _, _, _} = ip <- [server_ip(server)],
           ip not in own,
           uniq: true,
           do: ip
 
-    if state.preferred in all, do: [state.preferred | all -- [state.preferred]], else: all
+    lan = if state.preferred in lan, do: [state.preferred | lan -- [state.preferred]], else: lan
+    fallback = if state.fallback in own, do: [], else: List.wrap(state.fallback)
+    lan ++ (fallback -- lan)
   end
 
   defp server_ip(%{address: ip}), do: ip
@@ -214,10 +264,8 @@ defmodule Vagus.DNS do
   # and the port dies with the relay if it is killed). The server monitors
   # each relay and counts it out on its `:DOWN`, however it ended.
   defp forward(_packet, _host, _port, _upstreams, %{relays: relays} = state)
-       when map_size(relays) >= @max_inflight do
-    if state.dropped == 0, do: Process.send_after(self(), :report_drops, state.drop_report_ms)
-    %{state | dropped: state.dropped + 1}
-  end
+       when map_size(relays) >= @max_inflight,
+       do: shed(state)
 
   defp forward(packet, host, port, upstreams, %{socket: socket} = state) do
     upstream_port = state.upstream_port
@@ -227,11 +275,9 @@ defmodule Vagus.DNS do
       case :gen_udp.open(0, [:binary, active: false]) do
         {:ok, s} ->
           try do
-            deadline = System.monotonic_time(:millisecond) + @relay_ms
-
-            with {:ok, ip, resp} <- ask_upstreams(s, upstreams, upstream_port, packet, deadline) do
+            with {:ok, ip, resp} <- ask_upstreams(s, upstreams, upstream_port, packet, deadline()) do
               :gen_udp.send(socket, host, port, resp)
-              if ip != hd(upstreams), do: send(server, {:answered_by, ip})
+              answered(server, upstreams, ip)
             end
           after
             :gen_udp.close(s)
@@ -246,21 +292,82 @@ defmodule Vagus.DNS do
   end
 
   # One socket for every try: a late answer from a server already given up
-  # on answers the same query, so it is as good as the one waited for, and
-  # the last server asked keeps whatever time is left.
-  defp ask_upstreams(s, [upstream | rest], port, packet, deadline) do
-    left = deadline - System.monotonic_time(:millisecond)
-    wait = if rest == [], do: left, else: min(@per_server_ms, left)
-
-    with true <- left > 0,
+  # on answers the same query, so it is as good as the one waited for.
+  defp ask_upstreams(s, [upstream | rest] = untried, port, packet, deadline) do
+    with wait when wait > 0 <- slice(deadline, length(untried)),
          :ok <- :gen_udp.send(s, upstream, port, packet),
-         {:ok, {ip, _p, resp}} <- :gen_udp.recv(s, 0, max(wait, 0)) do
+         {:ok, {ip, _p, resp}} <- :gen_udp.recv(s, 0, wait) do
       {:ok, ip, resp}
     else
-      false -> :error
+      0 -> :error
       _ when rest == [] -> :error
       _ -> ask_upstreams(s, rest, port, packet, deadline)
     end
+  end
+
+  @doc false
+  @spec deadline() :: integer()
+  def deadline, do: System.monotonic_time(:millisecond) + @relay_ms
+
+  @doc false
+  # The wait one server gets: an equal share of what is left among the
+  # servers not yet tried, so the last one keeps all that remains.
+  @spec slice(integer(), pos_integer()) :: non_neg_integer()
+  def slice(deadline, untried) do
+    left = max(deadline - System.monotonic_time(:millisecond), 0)
+    if untried == 1, do: left, else: min(max(div(left, untried), @min_slice_ms), left)
+  end
+
+  @doc false
+  # Only a change of first choice is news, and it reaches the one process
+  # that keeps it.
+  @spec answered(pid(), [:inet.ip4_address()], :inet.ip4_address()) :: :ok
+  def answered(server, [first | _], ip) do
+    if ip != first, do: send(server, {:answered_by, ip})
+    :ok
+  end
+
+  defp shed(state) do
+    if state.dropped == 0, do: Process.send_after(self(), :report_drops, state.drop_report_ms)
+    %{state | dropped: state.dropped + 1}
+  end
+
+  # The task runs under the same supervisor as the relays and is counted
+  # here like one; it owns the socket from here on, so the socket closes
+  # with it however it ends.
+  defp serve_tcp(sock, state) do
+    conn = %{
+      static: state.static,
+      directory: state.directory,
+      upstreams: upstreams(state),
+      upstream_port: state.upstream_port,
+      server: self(),
+      idle_ms: state.tcp_idle_ms
+    }
+
+    case Task.Supervisor.start_child(state.task_supervisor, fn -> Vagus.DNS.TCP.serve(conn) end) do
+      {:ok, pid} ->
+        :ok = handover(sock, pid)
+        %{state | conns: Map.put(state.conns, Process.monitor(pid), pid)}
+
+      {:error, reason} ->
+        :gen_tcp.close(sock)
+        relay_not_started(reason, state)
+    end
+  catch
+    :exit, reason ->
+      :gen_tcp.close(sock)
+      relay_not_started(reason, state)
+  end
+
+  # A task that died before the handover leaves the socket here: closed.
+  defp handover(sock, pid) do
+    case :gen_tcp.controlling_process(sock, pid) do
+      :ok -> send(pid, {:socket, sock})
+      {:error, _reason} -> :gen_tcp.close(sock)
+    end
+
+    :ok
   end
 
   # No relay started means nothing to count: drop the query. start_child *exits* (rather than
@@ -287,8 +394,8 @@ defmodule Vagus.DNS do
   defp reply(nil, _host, _port, _packet), do: :ok
   defp reply(socket, host, port, packet), do: :gen_udp.send(socket, host, port, packet)
 
-  defp lookup(name, %{static: static} = state) do
-    case app_ip(name, state.directory) || Map.get(static, name) do
+  defp lookup(name, %{static: static, directory: directory}) do
+    case app_ip(name, directory) || Map.get(static, name) do
       nil -> :error
       ip -> {:ok, ip}
     end
