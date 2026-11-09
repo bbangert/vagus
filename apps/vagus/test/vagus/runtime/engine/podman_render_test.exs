@@ -7,10 +7,13 @@ defmodule Vagus.Runtime.Engine.PodmanRenderTest do
   alias Vagus.Addon.Backend.Spec
   alias Vagus.Core.Container, as: CoreContainer
   alias Vagus.Runtime.Engine.{ContainerSpec, Podman}
+  alias Vagus.Runtime.ResolvConf
 
   @ip "172.30.32.2"
   @fixed ~w(--pull=never --pids-limit=-1 --ipc=private --unsetenv=container --http-proxy=false)
   @log %{dir: "/run/vagus/logs", max_bytes: 2_097_152}
+  # The stub of the hassio DNS settings every container is created with.
+  @stub "/run/vagus/podman/resolv/48123d1372ec047e.conf"
 
   # On tmpfs, capped at the frugal profile's 2 MiB, in the byte count podman
   # reads.
@@ -65,7 +68,7 @@ defmodule Vagus.Runtime.Engine.PodmanRenderTest do
                  "--mount",
                  "type=bind,src=/root/vagus/core/config,dst=/config",
                  "--mount",
-                 "type=bind,src=/run/resolv.conf,dst=/etc/resolv.conf,ro=true",
+                 "type=bind,src=#{@stub},dst=/etc/resolv.conf,ro=true",
                  "--tmpfs",
                  "/tmp:rw,noexec,nosuid,nodev,notmpcopyup",
                  "--privileged",
@@ -220,7 +223,7 @@ defmodule Vagus.Runtime.Engine.PodmanRenderTest do
                  "--add-host",
                  "supervisor:#{@ip}",
                  "--mount",
-                 "type=bind,src=/run/resolv.conf,dst=/etc/resolv.conf,ro=true",
+                 "type=bind,src=#{@stub},dst=/etc/resolv.conf,ro=true",
                  "--tmpfs",
                  "/dev/shm:rw,noexec,nosuid,nodev,notmpcopyup",
                  "--cap-add",
@@ -257,12 +260,27 @@ defmodule Vagus.Runtime.Engine.PodmanRenderTest do
     test "the live resolv.conf goes only into a host-network container without its own" do
       bind = ["--mount", "type=bind,src=/run/resolv.conf,dst=/etc/resolv.conf,ro=true"]
       assert bind -- render([]) == []
+      assert bind -- render(dns: []) == []
 
       bridged = render(network: {:bridge, "hassio"})
       refute Enum.any?(bridged, &(&1 =~ "resolv.conf"))
 
       own = %{type: :bind, source: "/data/resolv", target: "/etc/resolv.conf", read_only: true}
       assert Enum.count(render(mounts: [own]), &(&1 =~ "dst=/etc/resolv.conf")) == 1
+      assert Enum.count(render(mounts: [own], dns: ["1.2.3.4"]), &(&1 =~ "resolv.conf")) == 1
+    end
+
+    test "a host-network container with DNS settings binds their stub, and only it" do
+      argv = render(dns: ["172.30.32.3"], dns_search: ["local.hass.io"])
+
+      stub =
+        ResolvConf.stub_path("/run/vagus/podman/resolv", ["172.30.32.3"], ["local.hass.io"], nil)
+
+      assert ["--mount", "type=bind,src=#{stub},dst=/etc/resolv.conf,ro=true"] -- argv == []
+      assert Enum.count(argv, &(&1 =~ "resolv")) == 1
+
+      other = render(dns: ["172.30.32.3"], dns_search: ["elsewhere"])
+      refute Enum.any?(other, &(&1 =~ stub))
     end
 
     test "a static address follows the bridge it is on, and never the host network" do
@@ -316,7 +334,7 @@ defmodule Vagus.Runtime.Engine.PodmanRenderTest do
       refute Enum.any?(["AUDIT_WRITE", "MKNOD", "NET_RAW"], &(&1 in argv))
     end
 
-    test "DNS settings render on a bridge only: the host network keeps the host's resolv.conf" do
+    test "DNS flags render on a bridge only: the host network binds its stub instead" do
       dns = [dns: ["172.30.32.3"], dns_search: ["local.hass.io"], dns_options: ["timeout:10"]]
 
       for flag <- ~w(--dns --dns-search --dns-option) do

@@ -245,4 +245,95 @@ defmodule Vagus.DNSTest do
     assert {:ok, {172, 30, 32, 3}} = DNS.resolve("dns", srv)
     assert :error = DNS.resolve("whatever", srv)
   end
+
+  describe "forwarding" do
+    # A resolver on `ip`:`port` answering every A query with `answer`.
+    defp fake_upstream(ip, port, answer) do
+      test = self()
+
+      pid =
+        spawn(fn ->
+          {:ok, s} = :gen_udp.open(port, [:binary, {:ip, ip}, active: false])
+          send(test, :upstream_ready)
+          serve(s, answer)
+        end)
+
+      assert_receive :upstream_ready
+      on_exit(fn -> Process.exit(pid, :kill) end)
+    end
+
+    defp serve(s, answer) do
+      {:ok, {host, port, packet}} = :gen_udp.recv(s, 0)
+      {:ok, query} = Message.parse_query(packet)
+      :ok = :gen_udp.send(s, host, port, Message.answer(query, [answer]))
+      serve(s, answer)
+    end
+
+    defp forwarding_server(name_servers, upstream) do
+      port = 19_400 + rem(System.unique_integer([:positive]), 2000)
+      upstream_port = 21_400 + rem(System.unique_integer([:positive]), 2000)
+      start_supervised!({Task.Supervisor, name: :vagus_dns_forward_relays})
+
+      start_supervised!(
+        {DNS,
+         name: nil,
+         ip: {127, 0, 0, 1},
+         port: port,
+         upstream: upstream,
+         upstream_port: upstream_port,
+         name_servers: name_servers,
+         task_supervisor: :vagus_dns_forward_relays,
+         directory: :no_such_directory},
+        id: :forwarding
+      )
+
+      {:ok, sock} = :gen_udp.open(0, [:binary, active: false])
+      on_exit(fn -> :gen_udp.close(sock) end)
+      %{port: port, upstream_port: upstream_port, sock: sock}
+    end
+
+    test "a miss goes to the LAN's name servers, not the fallback" do
+      lan = [%{address: {127, 0, 0, 2}, from: ["eth0"]}]
+      %{port: p, upstream_port: up, sock: s} = forwarding_server(fn -> lan end, "127.0.0.4")
+      fake_upstream({127, 0, 0, 2}, up, {10, 0, 0, 2})
+      fake_upstream({127, 0, 0, 4}, up, {10, 0, 0, 4})
+
+      assert ask(s, p, "nas.lan").addr == [10, 0, 0, 2]
+    end
+
+    test "a lease change reaches the next query" do
+      servers = Agent.start_link(fn -> [{127, 0, 0, 2}] end) |> elem(1)
+      read = fn -> Agent.get(servers, & &1) end
+      %{port: p, upstream_port: up, sock: s} = forwarding_server(read, nil)
+      fake_upstream({127, 0, 0, 2}, up, {10, 0, 0, 2})
+      fake_upstream({127, 0, 0, 3}, up, {10, 0, 0, 3})
+
+      assert ask(s, p, "nas.lan").addr == [10, 0, 0, 2]
+      Agent.update(servers, fn _ -> [{127, 0, 0, 3}] end)
+      assert ask(s, p, "nas.lan").addr == [10, 0, 0, 3]
+    end
+
+    test "with no LAN server but itself, the fallback answers" do
+      own = [{127, 0, 0, 1}, {172, 30, 32, 3}, {0x2606, 0x4700, 0, 0, 0, 0, 0, 0x1111}]
+
+      %{port: p, upstream_port: up, sock: s} =
+        forwarding_server(fn -> Enum.map(own, &%{address: &1}) end, "127.0.0.4")
+
+      fake_upstream({127, 0, 0, 4}, up, {10, 0, 0, 4})
+
+      assert ask(s, p, "example.com").addr == [10, 0, 0, 4]
+    end
+
+    test "a LAN server that never answers gives way to the next" do
+      %{port: p, upstream_port: up, sock: s} =
+        forwarding_server(fn -> [{192, 0, 2, 1}, {127, 0, 0, 2}] end, nil)
+
+      fake_upstream({127, 0, 0, 2}, up, {10, 0, 0, 2})
+
+      packet = <<0x5555::16, 0x0100::16, 1::16, 0::16, 0::16, 0::16, 3, "nas", 0, 1::16, 1::16>>
+      :ok = :gen_udp.send(s, {127, 0, 0, 1}, p, packet)
+      assert {:ok, {_, _, resp}} = :gen_udp.recv(s, 0, 4_000)
+      assert :binary.part(resp, byte_size(resp), -4) == <<10, 0, 0, 2>>
+    end
+  end
 end

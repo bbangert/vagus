@@ -63,6 +63,18 @@ defmodule Vagus.Network do
   def dns_ip, do: @anchors.dns
 
   @doc """
+  The DNS settings every container is created with, host-network ones
+  included, as upstream's `docker/manager.py` does.
+  """
+  @spec container_dns() :: %{
+          dns: [String.t()],
+          dns_search: [String.t()],
+          dns_options: [String.t()]
+        }
+  def container_dns,
+    do: %{dns: [dns_ip()], dns_search: ["local.hass.io"], dns_options: ["timeout:10"]}
+
+  @doc """
   Which host address a `host_network: true` add-on's `port` is reached on:
   loopback when something is listening there, the bridge gateway otherwise.
 

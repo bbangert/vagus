@@ -357,8 +357,8 @@ defmodule Vagus.App.Steps do
       |> put_backend(input.config)
 
   # A native app's address is the supervisor anchor its subtree listens on.
-  # A container's is read once here; a failed inspect leaves no DNS record
-  # and no ingress target, and the app still runs.
+  # A container's is read once here; a failed inspect leaves a bridged app
+  # no DNS record and no ingress target, and the app still runs.
   defp started(%Config{} = config, id, opts) do
     if native?(config) do
       %{
@@ -571,7 +571,10 @@ defmodule Vagus.App.Steps do
     %Spec{
       name: container_name(config.slug),
       image: image_ref(config, arch),
-      hostname: if(host?, do: nil, else: hostname(config.slug)),
+      # Upstream names a host-network container too, and Core dials the
+      # name a host-network app reports as its own (Matter Server's
+      # discovery). Only a shared UTS namespace keeps the host's.
+      hostname: if(config.host_uts, do: nil, else: hostname(config.slug)),
       env:
         Map.merge(
           %{
@@ -584,9 +587,9 @@ defmodule Vagus.App.Steps do
       network: if(host?, do: :host, else: :hassio),
       network_name: Network.name(),
       extra_hosts: %{"supervisor" => Network.supervisor_ip(), "hassio" => Network.supervisor_ip()},
-      dns: [Network.dns_ip()],
-      dns_search: ["local.hass.io"],
-      dns_options: ["timeout:10"],
+      dns: Network.container_dns().dns,
+      dns_search: Network.container_dns().dns_search,
+      dns_options: Network.container_dns().dns_options,
       init: config.init,
       cap_add: config.privileged,
       tmpfs: if(config.host_ipc, do: %{}, else: %{"/dev/shm" => ""}),

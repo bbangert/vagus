@@ -17,6 +17,7 @@ defmodule Vagus.App.Policy do
 
   alias Vagus.Addon.{Config, OptionsSchema}
   alias Vagus.App.Steps
+  alias Vagus.Network
 
   @type message :: %{uuid: String.t(), addon: String.t(), service: String.t(), config: map()}
   @type caller :: :supervisor | {:addon, map()} | term()
@@ -529,8 +530,7 @@ defmodule Vagus.App.Policy do
 
   @doc """
   Every directory key the data implies; a `{key, value}` item carries a
-  value. A host-network app has no DNS record, and only a dynamically
-  assigned ingress port is unique to its app.
+  value. Only a dynamically assigned ingress port is unique to its app.
   """
   @spec keys(map()) :: [term()]
   def keys(data) do
@@ -544,6 +544,12 @@ defmodule Vagus.App.Policy do
 
   defp dns_keys(%{ip: ip, config: %{host_network: false}, slug: slug}) when is_binary(ip),
     do: [{{:dns, dns_name(slug)}, ip}]
+
+  # Upstream's record for a host-network app is the gateway, its
+  # `ip_address`; it has no `ip` of its own, so its liveness stands in.
+  defp dns_keys(%{ip: nil, config: %{host_network: true}, slug: slug} = data) do
+    if alive?(data), do: [{{:dns, dns_name(slug)}, Network.gateway()}], else: []
+  end
 
   defp dns_keys(_data), do: []
 

@@ -7,13 +7,14 @@ defmodule Vagus.DNS do
   homeassistant/home-assistant → gateway `.1`, dns → `.3`, observer → `.6`,
   localhost → `127.0.0.1`), each also under the `.local.hass.io` search suffix,
   plus one record per running app (`<slug-with-dashes>`). Names we don't own
-  are forwarded verbatim to the configured upstream resolver (`locals`); with
-  no upstream we answer `NXDOMAIN`.
+  are forwarded verbatim to the board's LAN name servers, as upstream's
+  CoreDNS forwards to the host's; with none, to the configured fallback
+  (`:dns_upstream`), and with neither we answer `NXDOMAIN`.
 
-  Bridged add-ons already get `Dns=[172.30.32.3]` injected into their
-  `/etc/resolv.conf` (the Spec builder, P1-T3), so once this server is up they
-  resolve each other and the supervisor by name. A host-networked Core is
-  pointed here with `--dns 172.30.32.3`.
+  Every container that asks for DNS resolves here, Core and host-network apps
+  included: bridged ones through podman's `--dns`, host-network ones through
+  the resolv.conf `Vagus.Runtime.Engine.Podman` binds in. So LAN-local names
+  keep resolving for Core only because the forward follows the LAN.
 
   Bind address/port and upstream are configurable (`opts`/`config :vagus, :dns_*`)
   so the server is unit-testable on loopback without `CAP_NET_BIND_SERVICE`.
@@ -21,7 +22,7 @@ defmodule Vagus.DNS do
   An app's record is its process's `{:dns, name}` key in
   `Vagus.App.Directory`, valued with its IP, read on each query: it goes
   with the process, and this server holds none of it. A running container
-  app has one; a host-network app has none; a native app's is the
+  app has one, the gateway for a host-network app; a native app's is the
   supervisor's address. An app record wins over an anchor of the same name.
   `foo_bar` and `foo-bar` share a name, and the directory's unique keys give
   it to whichever app started first; the second runs without one.
@@ -73,8 +74,10 @@ defmodule Vagus.DNS do
       relays: %{},
       # Where upstream relays run (a test seam for the supervisor-down path).
       task_supervisor: Keyword.get(opts, :task_supervisor, Vagus.TaskSupervisor),
-      upstream:
-        parse_upstream(Keyword.get(opts, :upstream, Application.get_env(:vagus, :dns_upstream)))
+      fallback:
+        parse_upstream(Keyword.get(opts, :upstream, Application.get_env(:vagus, :dns_upstream))),
+      name_servers: Keyword.get(opts, :name_servers, &lan_name_servers/0),
+      upstream_port: Keyword.get(opts, :upstream_port, 53)
     }
 
     {:ok, try_bind(state)}
@@ -140,37 +143,65 @@ defmodule Vagus.DNS do
 
       {:error, _reason} ->
         # Unparseable (e.g. multi-question) — forward raw if we can, else drop.
-        if state.upstream, do: forward(packet, host, port, state), else: state
+        case upstreams(state) do
+          [] -> state
+          upstreams -> forward(packet, host, port, upstreams, state)
+        end
     end
   end
 
   defp forward_or_nxdomain(packet, query, host, port, state) do
-    if state.upstream do
-      forward(packet, host, port, state)
-    else
-      reply(state.socket, host, port, Message.nxdomain(query))
-      state
+    case upstreams(state) do
+      [] ->
+        reply(state.socket, host, port, Message.nxdomain(query))
+        state
+
+      upstreams ->
+        forward(packet, host, port, upstreams, state)
     end
   end
 
-  # Relay the raw query to the upstream resolver from a throwaway (supervised,
-  # so a crash is logged) task so a slow upstream never blocks the server; the
-  # answer goes back out our socket.
+  # Read per query, not subscribed to: the property is an ETS read, and a
+  # lease change then reaches the very next query with no state to keep in
+  # step. Only IPv4 servers, which the relay's socket can reach, and never
+  # this server itself, which would relay to itself.
+  defp upstreams(state) do
+    own = [state.ip, to_ip(Network.dns_ip())]
+
+    lan =
+      for server <- state.name_servers.(),
+          {_, _, _, _} = ip <- [server_ip(server)],
+          ip not in own,
+          uniq: true,
+          do: ip
+
+    if lan == [], do: List.wrap(state.fallback), else: lan
+  end
+
+  defp server_ip(%{address: ip}), do: ip
+  defp server_ip(ip) when is_tuple(ip), do: ip
+  defp server_ip(_other), do: nil
+
+  # Relay the raw query from a throwaway (supervised, so a crash is logged)
+  # task so a slow upstream never blocks the server; the answer goes back out
+  # our socket. Each upstream is tried in turn until one answers, so one dead
+  # LAN server costs a query its timeout, not its answer.
   # Bounded by `@max_inflight` (drop over the cap) so a flood of misses can't
   # exhaust processes/FDs; the ephemeral socket is always closed (`try/after`,
   # and the port dies with the relay if it is killed). The server monitors
   # each relay and counts it out on its `:DOWN`, however it ended.
-  defp forward(_packet, _host, _port, %{relays: relays} = state)
+  defp forward(_packet, _host, _port, _upstreams, %{relays: relays} = state)
        when map_size(relays) >= @max_inflight,
        do: state
 
-  defp forward(packet, host, port, %{socket: socket, upstream: upstream} = state) do
+  defp forward(packet, host, port, upstreams, %{socket: socket} = state) do
+    upstream_port = state.upstream_port
+
     relay = fn ->
       case :gen_udp.open(0, [:binary, active: false]) do
         {:ok, s} ->
           try do
-            with :ok <- :gen_udp.send(s, upstream, 53, packet),
-                 {:ok, {_ip, _p, resp}} <- :gen_udp.recv(s, 0, @forward_timeout) do
+            with {:ok, resp} <- ask_upstreams(s, upstreams, upstream_port, packet) do
               :gen_udp.send(socket, host, port, resp)
             end
           after
@@ -183,6 +214,19 @@ defmodule Vagus.DNS do
     end
 
     start_relay(state, relay)
+  end
+
+  defp ask_upstreams(_s, [], _port, _packet), do: :error
+
+  # One socket for every try: a late answer from a server already given up
+  # on answers the same query, so it is as good as the one waited for.
+  defp ask_upstreams(s, [upstream | rest], port, packet) do
+    with :ok <- :gen_udp.send(s, upstream, port, packet),
+         {:ok, {_ip, _p, resp}} <- :gen_udp.recv(s, 0, @forward_timeout) do
+      {:ok, resp}
+    else
+      _ -> ask_upstreams(s, rest, port, packet)
+    end
   end
 
   # No relay started means nothing to count: drop the query. start_child *exits* (rather than
@@ -266,4 +310,10 @@ defmodule Vagus.DNS do
   end
 
   defp fmt(ip), do: ip |> :inet.ntoa() |> to_string()
+
+  if Mix.target() == :host do
+    defp lan_name_servers, do: []
+  else
+    defp lan_name_servers, do: VintageNet.get(["name_servers"], [])
+  end
 end

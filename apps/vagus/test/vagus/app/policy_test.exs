@@ -811,9 +811,13 @@ defmodule Vagus.App.PolicyTest do
                [{:slug, "app_one"}, {:token, "h"}, {{:dns, "app-one"}, @ip}]
     end
 
-    test "a host-network app has no DNS record" do
-      data = running(%{config: app_config(%{"host_network" => true})})
-      assert Policy.keys(data) == [{:slug, "app_one"}]
+    test "a running host-network app's record is the gateway; a stopped one has none" do
+      config = app_config(%{"host_network" => true})
+
+      assert Policy.keys(running(%{config: config, ip: nil})) ==
+               [{:slug, "app_one"}, {{:dns, "app-one"}, "172.30.32.1"}]
+
+      assert Policy.keys(app(%{config: config})) == [{:slug, "app_one"}]
     end
 
     test "a native app's record is the supervisor IP it was started with" do
@@ -1034,6 +1038,19 @@ defmodule Vagus.App.PolicyTest do
              ]
 
       assert %{container_id: "c1", ip: @ip, wanted: :started, attempt: 0} = data
+    end
+
+    test "2h. a host-network app's start registers its gateway record; its death drops it" do
+      config = app_config(%{"host_network" => true})
+      {data, _} = begin(:start, %{}, app(%{config: config}))
+
+      {data, effects} = step(data, {:ok, %{container_id: "c1", ip: nil}})
+
+      assert {:keys, [{{:dns, "app-one"}, "172.30.32.1"}], [{:dns, "app-one"}]} in effects
+      assert data.ip == nil
+
+      {_data, effects} = Policy.on_event(%Event{action: :die, id: "c1", exit_code: 1}, data)
+      assert {:keys, [], [{:token, data.token_hash}, {:dns, "app-one"}]} in effects
     end
 
     test "3. start/start timed out: token revoked, one cleanup stop by name, then the ladder" do

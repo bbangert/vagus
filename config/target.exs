@@ -354,9 +354,10 @@ config :vagus, :api_source_guard, true
 config :vagus, :store_boot_refresh, true
 
 # Add-on DNS (M4-P1-T2). `Vagus.DNS` binds the hassio `dns` anchor
-# (172.30.32.3:53) and forwards names it doesn't own to this upstream
-# (`locals`); 1.1.1.1 keeps it a complete resolver for a host-networked Core
-# pointed at .3 with `--dns` and for add-ons resolving external hosts.
+# (172.30.32.3:53) and forwards names it doesn't own to the LAN's name
+# servers; this is the fallback while vintage_net reports none. Every app
+# and Core resolve through it, so without one they would resolve nothing
+# but its own records.
 config :vagus, :dns_upstream, "1.1.1.1"
 
 # Add-on store repositories (M4-P2-T3). The official "core" add-ons repo;

@@ -64,6 +64,7 @@ defmodule Vagus.Runtime.Host do
 
   require Logger
 
+  alias Vagus.Network
   alias Vagus.Runtime.Migration
   alias Vagus.Runtime.Mountinfo
   alias Vagus.Runtime.Podman.Cmd
@@ -188,6 +189,13 @@ defmodule Vagus.Runtime.Host do
 
   @spec profile(atom() | nil) :: profile() | nil
   def profile(host \\ nil), do: shared(host)[:profile]
+
+  @doc """
+  Where `Vagus.Runtime.Engine.Podman` keeps the resolv.conf stubs it binds
+  into host-network containers (`Vagus.Runtime.ResolvConf.write_stub/4`).
+  """
+  @spec resolv_dir(atom() | nil) :: String.t()
+  def resolv_dir(host \\ nil), do: shared(host)[:resolv_dir] || resolv_dir_of([])
 
   @doc """
   Where containers write their k8s-file logs and how large each may grow;
@@ -468,6 +476,7 @@ defmodule Vagus.Runtime.Host do
     ensure_private_dir(log_dir(state.opts))
     ensure_private_dir(out_dir_of(state.opts))
     write_resolv_conf(state.opts)
+    write_dns_stub(state.opts)
     ensure_dev_links(Keyword.get(state.opts, :dev_root, "/dev"))
     state = state |> apply_profile() |> publish(:preparing)
     mount_logs(state.opts, @log_tmpfs_bytes[state.profile])
@@ -648,6 +657,7 @@ defmodule Vagus.Runtime.Host do
       proc_dir: Keyword.get(state.opts, :proc_dir, "/proc"),
       podman: Path.basename(podman_bin(state.opts)),
       log_dir: log_dir(state.opts),
+      resolv_dir: resolv_dir_of(state.opts),
       out_dir: state.out_dir,
       log_max_bytes: state.profile && @log_max_bytes[state.profile],
       log_tmpfs_bytes: state.profile && @log_tmpfs_bytes[state.profile],
@@ -944,6 +954,20 @@ defmodule Vagus.Runtime.Host do
     end
   end
 
+  # /run is empty after a reboot, and Core's container outlives one: its
+  # stub must be back before the engine gate lets Core start it again.
+  defp write_dns_stub(opts) do
+    dns = Network.container_dns()
+
+    case ResolvConf.write_stub(resolv_dir_of(opts), dns.dns, dns.dns_search, dns.dns_options) do
+      {:ok, _path} ->
+        :ok
+
+      {:error, reason} ->
+        Logger.error("Vagus.Runtime.Host: DNS stub not written (#{inspect(reason)})")
+    end
+  end
+
   defp apply_profile(state) do
     opts = state.opts
     profile = pick_profile(opts)
@@ -1052,6 +1076,7 @@ defmodule Vagus.Runtime.Host do
 
   defp run_dir(opts), do: Keyword.get(opts, :run_dir, "/run/vagus/podman")
   defp out_dir_of(opts), do: Path.join(run_dir(opts), "out")
+  defp resolv_dir_of(opts), do: Path.join(run_dir(opts), "resolv")
 
   # A holder killed mid-call never reaches Cmd's own cleanup. A file its
   # podman already holds open keeps its space until podman exits. The path

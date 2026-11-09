@@ -192,14 +192,16 @@ defmodule Vagus.Runtime.Engine.Podman do
   @impl true
   def create(%ContainerSpec{} = spec, opts) do
     secrets = for {k, v} <- spec.env || [], k in spec.secret_env, do: {k, v}
+    resolv_dir = Host.resolv_dir(opts[:host])
 
     with :ok <- validate(spec),
+         :ok <- write_dns_stub(spec, resolv_dir),
          {:ok, out} <-
            ok(
              :create,
              run(
                :create,
-               render_create(spec, Host.log_config(opts[:host])),
+               render_create(spec, Host.log_config(opts[:host]), resolv_dir),
                apart([env: secrets] ++ opts),
                @lifecycle_ms
              )
@@ -207,6 +209,22 @@ defmodule Vagus.Runtime.Engine.Podman do
       created_id(out)
     end
   end
+
+  defp write_dns_stub(spec, dir) do
+    if dns_stub?(spec) do
+      case ResolvConf.write_stub(dir, spec.dns, spec.dns_search, spec.dns_options) do
+        {:ok, _path} -> :ok
+        {:error, reason} -> {:error, {:failed, :create, "resolv.conf stub: #{reason}"}}
+      end
+    else
+      :ok
+    end
+  end
+
+  defp dns_stub?(spec),
+    do: spec.network == :host and spec.dns not in [nil, []] and not own_resolv_conf?(spec.mounts)
+
+  defp own_resolv_conf?(mounts), do: Enum.any?(mounts || [], &(&1.target == "/etc/resolv.conf"))
 
   # podman exits 0 even when the out tmpfs filled before it printed the id,
   # and room freed by then hides that from Cmd: only the id's own shape
@@ -650,17 +668,26 @@ defmodule Vagus.Runtime.Engine.Podman do
   set, unlimited pids, a private IPC namespace, no injected
   `container=podman` or proxy env, no pull on create, Docker's tmpfs
   options, on a bridge an `/etc/hosts` built from nothing but the spec's
-  entries, and on the host network a read-only bind of the live
-  `/run/resolv.conf`. The log goes to `log.dir`, capped at `log.max_bytes`,
-  which podman reads as a number of bytes.
+  entries, and on the host network a read-only bind of a resolv.conf: the
+  stub of the spec's DNS settings under `resolv_dir` when it has any, else
+  the live `/run/resolv.conf` (`Vagus.Runtime.ResolvConf`). The log goes to
+  `log.dir`, capped at `log.max_bytes`, which podman reads as a number of
+  bytes.
 
   A `secret_env` entry renders as a bare `--env NAME`, which podman fills
   from its own environment, so the value stays off the argv. The spec must
   have passed `validate/1`.
   """
-  @spec render_create(ContainerSpec.t(), %{dir: String.t(), max_bytes: pos_integer()}) ::
-          [String.t()]
-  def render_create(%ContainerSpec{} = spec, log \\ Host.log_config(nil)) do
+  @spec render_create(
+          ContainerSpec.t(),
+          %{dir: String.t(), max_bytes: pos_integer()},
+          String.t()
+        ) :: [String.t()]
+  def render_create(
+        %ContainerSpec{} = spec,
+        log \\ Host.log_config(nil),
+        resolv_dir \\ Host.resolv_dir(nil)
+      ) do
     bridge = bridge_name(spec.network)
     pid_host? = spec.pid_mode == "host"
 
@@ -679,7 +706,7 @@ defmodule Vagus.Runtime.Engine.Podman do
       dns(bridge, spec),
       hosts(bridge, spec.extra_hosts),
       Enum.flat_map(spec.mounts || [], &["--mount", mount(&1)]),
-      resolv_conf(bridge, spec.mounts),
+      resolv_conf(spec, resolv_dir),
       Enum.flat_map(Enum.sort(spec.tmpfs || %{}), fn {dst, o} ->
         ["--tmpfs", "#{dst}:#{tmpfs(o)}"]
       end),
@@ -706,8 +733,9 @@ defmodule Vagus.Runtime.Engine.Podman do
     end)
   end
 
-  # Docker ignores these on the host network, where the container reads the
-  # host's resolv.conf; podman would write them over it.
+  # On the host network the spec's settings reach the container through the
+  # bound stub instead (`resolv_conf/2`): podman's own file from these flags
+  # would be a writable copy.
   defp dns(nil, _spec), do: []
 
   defp dns(_bridge, spec) do
@@ -716,24 +744,29 @@ defmodule Vagus.Runtime.Engine.Podman do
   end
 
   # On the host network podman copies the host's resolv.conf at create, so a
-  # container made before the DHCP lease keeps the fallback servers until it
-  # is recreated. The file vintage_net rewrites in place is bound instead.
-  # A spec that binds its own is left alone.
-  defp resolv_conf(nil, mounts) do
-    if Enum.any?(mounts || [], &(&1.target == "/etc/resolv.conf")),
-      do: [],
-      else: [
-        "--mount",
-        mount(%{
-          type: :bind,
-          source: ResolvConf.path(),
-          target: "/etc/resolv.conf",
-          read_only: true
-        })
-      ]
+  # container made before the DHCP lease would keep the fallback servers
+  # until it is recreated. One without DNS settings gets the file vintage_net
+  # rewrites in place instead. A spec that binds its own is left alone.
+  defp resolv_conf(%ContainerSpec{network: :host} = spec, resolv_dir) do
+    cond do
+      own_resolv_conf?(spec.mounts) ->
+        []
+
+      dns_stub?(spec) ->
+        resolv_bind(ResolvConf.stub_path(resolv_dir, spec.dns, spec.dns_search, spec.dns_options))
+
+      true ->
+        resolv_bind(ResolvConf.path())
+    end
   end
 
-  defp resolv_conf(_bridge, _mounts), do: []
+  defp resolv_conf(_spec, _resolv_dir), do: []
+
+  defp resolv_bind(source),
+    do: [
+      "--mount",
+      mount(%{type: :bind, source: source, target: "/etc/resolv.conf", read_only: true})
+    ]
 
   defp network(nil, _aliases), do: ["--network", "host"]
   defp network(bridge, aliases), do: ["--network", bridge] ++ many("--network-alias", aliases)

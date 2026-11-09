@@ -30,6 +30,40 @@ defmodule Vagus.Runtime.ResolvConfTest do
     end
   end
 
+  describe "the DNS stub" do
+    @tag :tmp_dir
+    test "holds the spec's settings alone, and is written once", %{tmp_dir: dir} do
+      {:ok, path} = ResolvConf.write_stub(dir, ["172.30.32.3"], ["local.hass.io"], ["timeout:10"])
+
+      assert path == ResolvConf.stub_path(dir, ["172.30.32.3"], ["local.hass.io"], ["timeout:10"])
+
+      assert File.read!(path) ==
+               "nameserver 172.30.32.3\nsearch local.hass.io\noptions timeout:10\n"
+
+      File.write!(path, "kept")
+
+      assert {:ok, ^path} =
+               ResolvConf.write_stub(dir, ["172.30.32.3"], ["local.hass.io"], ["timeout:10"])
+
+      assert File.read!(path) == "kept"
+      assert File.ls!(dir) == [Path.basename(path)]
+    end
+
+    @tag :tmp_dir
+    test "other settings are another file, and absent ones no line", %{tmp_dir: dir} do
+      {:ok, a} = ResolvConf.write_stub(dir, ["172.30.32.3"], nil, [])
+      {:ok, b} = ResolvConf.write_stub(dir, ["172.30.32.3"], ["local.hass.io"], nil)
+
+      refute a == b
+      assert File.read!(a) == "nameserver 172.30.32.3\n"
+      assert File.read!(b) == "nameserver 172.30.32.3\nsearch local.hass.io\n"
+    end
+
+    test "a directory it cannot make is the error, not a crash" do
+      assert {:error, _} = ResolvConf.write_stub("/proc/no-such/dir", ["172.30.32.3"], nil, nil)
+    end
+  end
+
   test "path/0 is /run/resolv.conf" do
     assert ResolvConf.path() == "/run/resolv.conf"
   end
