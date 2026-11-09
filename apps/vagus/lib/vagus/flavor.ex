@@ -1,8 +1,8 @@
 defmodule Vagus.Flavor do
   @moduledoc """
   The firmware's build-time flavor: `:default`, the Home Assistant
-  appliance, or `:agent_dev_board`, a dragon_q6a or rubik_pi3 image that never
-  starts Home Assistant Core at boot and never provisions or watches it. The Core
+  appliance, or `:agent_dev_board`, a dragon_q6a, rubik_pi3 or rock_4d image
+  that never starts Home Assistant Core at boot and never provisions or watches it. The Core
   HTTP routes (`POST /core/start` etc.) are not guarded, so a deliberate call
   can still install or start Core (follow-up). Set by `VAGUS_FLAVOR` through `config/flavor.exs`.
 

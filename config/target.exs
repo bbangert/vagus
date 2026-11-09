@@ -413,9 +413,10 @@ config :vagus, :backends, %{
 # of this file so it overrides the configuration defined above.
 #
 # One file per entry in `@all_targets` (apps/vagus/mix.exs,
-# apps/vagus_platform/mix.exs) — currently config/rpi3_64.exs and
-# config/dragon_q6a.exs. A missing file for a selected target is a hard
-# failure at config load, so adding a board means adding its file here too.
+# apps/vagus_platform/mix.exs) — currently config/rpi3_64.exs,
+# config/dragon_q6a.exs, config/rubik_pi3.exs and config/rock_4d.exs. A
+# missing file for a selected target is a hard failure at config load, so
+# adding a board means adding its file here too.
 import_config "#{Mix.target()}.exs"
 
 # Last, so a flavor's overrides beat both the shared and per-target values.

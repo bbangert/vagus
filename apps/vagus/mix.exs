@@ -1,7 +1,7 @@
 defmodule Vagus.MixProject do
   use Mix.Project
 
-  @all_targets [:rpi3_64, :dragon_q6a, :rubik_pi3]
+  @all_targets [:rpi3_64, :dragon_q6a, :rubik_pi3, :rock_4d]
 
   def project do
     [
