@@ -50,6 +50,12 @@ defmodule Vagus.Backend.Network.WifiScanTest do
     {result, System.monotonic_time(:millisecond) - started}
   end
 
+  # A scan that sees no update must answer before a caller on the default
+  # `supervisor/api` deadline gives up, with room for the request around it.
+  test "the scan deadline leaves headroom under the supervisor/api default" do
+    assert WifiScan.timeout_ms() + 1_000 <= Vagus.API.CoreProxy.WSDispatch.default_timeout_ms()
+  end
+
   test "subscribes, then requests a scan of the interface, then unsubscribes" do
     WifiScan.access_points("wlan0", FakeVintageNet, timeout_ms: 0)
 

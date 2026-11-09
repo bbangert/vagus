@@ -46,6 +46,9 @@ defmodule Vagus.API.CoreProxy.WSDispatch do
   # reads from the client, not how long an HTTP caller waits for a handler.
   @max_timeout_ms 900_000
 
+  @doc false
+  def default_timeout_ms, do: @default_timeout_ms
+
   @authz_ctx %{leg: :core_api, decoded_segments: nil}
 
   @router_opts Router.init([])

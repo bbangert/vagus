@@ -16,10 +16,14 @@ defmodule Vagus.Backend.Network.WifiScan do
 
   # Upstream's 5 s is too short here: the first scan after boot took longer
   # than 5 s on an aic8800 board. The settle window keeps a normal scan near
-  # 2 s. Nothing in the call chain times out under 10 s: the frontend sends
-  # `timeout: null` (no timeout in Core's `supervisor/api`), and
-  # `Vagus.API.CoreProxy.WSDispatch` maps a nil timeout to 900 s.
-  @timeout_ms 10_000
+  # 2 s. Kept under the 10 s `supervisor/api` default (Core's, and
+  # `Vagus.API.CoreProxy.WSDispatch`'s for a frame without `timeout`) so a
+  # scan that sees no update still answers the cache before the caller gives
+  # up. The deadline also covers the scan ioctl's own call.
+  @timeout_ms 8_000
+
+  @doc false
+  def timeout_ms, do: @timeout_ms
 
   # wpa_supplicant publishes one property update per `CTRL-EVENT-BSS-ADDED`,
   # then a full refresh on `CTRL-EVENT-SCAN-RESULTS`, so the first update is
