@@ -5,9 +5,10 @@ name: release
 # files to the GitHub release for that tag. These assets are what
 # `Vagus.OS.Updater` (nerves_github_updater) feeds on — asset names are
 # `vagus_<target>.fw` and MUST stay in sync with its `:asset_matcher`. The
-# `agent-dev-board` flavor (dragon_q6a, rubik_pi3, rock_4d) ships as `vagus_<target>-agent.fw`;
-# the updater matches that suffix only when running the flavor, so a stock
-# board never picks the agent asset and vice versa.
+# `agent-dev-board` flavor (dragon_q6a, rubik_pi3, rock_4d) ships as
+# `vagus_<target>-agent.fw`; the updater matches that suffix only when
+# running the flavor, so a stock board never picks the agent asset and vice
+# versa.
 #
 # Tags are BARE semver (no `v` prefix) — nerves_github_updater's
 # VersionCompare parses tag names as semver directly.
