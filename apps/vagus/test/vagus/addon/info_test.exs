@@ -57,6 +57,32 @@ defmodule Vagus.Addon.InfoTest do
     assert Map.has_key?(info, "system_managed_config_entry")
   end
 
+  describe "ip_address" do
+    # bashio's `addon.ip_address`: Matter Server listens on it AND on
+    # 127.0.0.1, so `0.0.0.0` for a host-network app kills it with EADDRINUSE.
+    test "a host-network app gets the bridge gateway, whatever its container reports" do
+      {:ok, host} =
+        Config.parse(%{
+          "name" => "Matter Server",
+          "version" => "9.3.0",
+          "slug" => "core_matter_server",
+          "description" => "d",
+          "arch" => ["aarch64"],
+          "host_network" => true
+        })
+
+      assert Info.render(host, :started, %{})["ip_address"] == "172.30.32.1"
+      assert Info.render(host, :started, %{}, %{ip: "172.30.33.9"})["ip_address"] == "172.30.32.1"
+    end
+
+    test "a bridged app gets its container's bridge address, 0.0.0.0 while it has none", %{
+      config: c
+    } do
+      assert Info.render(c, :started, %{}, %{ip: "172.30.33.9"})["ip_address"] == "172.30.33.9"
+      assert Info.render(c, :stopped, %{}, %{ip: nil})["ip_address"] == "0.0.0.0"
+    end
+  end
+
   test "enum-typed fields use accepted string values", %{config: c} do
     info = Info.render(c, :started, %{})
     assert info["stage"] in ["stable", "experimental", "deprecated"]

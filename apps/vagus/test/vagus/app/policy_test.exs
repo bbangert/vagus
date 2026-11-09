@@ -145,6 +145,11 @@ defmodule Vagus.App.PolicyTest do
       assert %{state: :stopped, alive?: false} = Policy.snapshot(app())
     end
 
+    test "the snapshot carries the running container's address, none before a start" do
+      assert %{ip: @ip} = Policy.snapshot(running())
+      assert %{ip: nil} = Policy.snapshot(app())
+    end
+
     test "a once app's clean exit is stopped" do
       once = app(%{config: app_config(%{"startup" => "once"}), last_event: {:exited, 0}})
       assert Policy.derive(:idle, once) == :stopped

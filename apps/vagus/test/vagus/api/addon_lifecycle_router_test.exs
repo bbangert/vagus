@@ -122,6 +122,17 @@ defmodule Vagus.API.AddonLifecycleRouterTest do
     on_exit(fn -> File.rm_rf!(blocker) end)
   end
 
+  describe "GET /addons/self/info" do
+    # What `bashio::addon.ip_address` reads; Matter Server binds it beside
+    # 127.0.0.1, so it must be the host's bridge address, not `0.0.0.0`.
+    test "a host-network app is told the bridge gateway as its address" do
+      conn = addon_call(:get, "/addons/self/info", "core_selfip")
+
+      assert conn.status == 200
+      assert body(conn)["data"]["ip_address"] == Vagus.Network.gateway()
+    end
+  end
+
   describe "POST /store/addons/:slug/install (+ legacy /addons/:slug/install alias)" do
     test "installs a store entry: config slug rewritten to the store slug, State records :stopped" do
       seed_store("core_testaddon", fixture_config("testaddon"))
