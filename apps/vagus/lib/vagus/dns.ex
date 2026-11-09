@@ -36,7 +36,7 @@ defmodule Vagus.DNS do
 
   require Logger
 
-  alias Vagus.DNS.Message
+  alias Vagus.DNS.{Message, TCP}
   alias Vagus.Network
 
   # The stub's `timeout:10` is musl's whole budget, resent every 5 s (two
@@ -79,7 +79,7 @@ defmodule Vagus.DNS do
       listen: nil,
       # Monitor ref -> pid of each TCP connection's task.
       conns: %{},
-      tcp_idle_ms: Keyword.get(opts, :tcp_idle_ms, Vagus.DNS.TCP.idle_ms()),
+      tcp_idle_ms: Keyword.get(opts, :tcp_idle_ms, TCP.idle_ms()),
       ip:
         to_ip(Keyword.get(opts, :ip, Application.get_env(:vagus, :dns_bind_ip, Network.dns_ip()))),
       port: Keyword.get(opts, :port, Application.get_env(:vagus, :dns_port, 53)),
@@ -105,17 +105,22 @@ defmodule Vagus.DNS do
   end
 
   # UDP and TCP come up together or not at all: a client told to retry over
-  # TCP must find it there.
-  defp try_bind(%{ip: ip, port: port} = state) do
-    # Port 0 (tests) takes whatever UDP is given, and TCP the same.
-    with {:ok, socket} <-
-           :gen_udp.open(port, [:binary, :inet, {:ip, ip}, active: true, reuseaddr: true]),
-         {:ok, port} <- :inet.port(socket),
-         {:ok, listen} <- listen_tcp(socket, ip, port) do
-      Vagus.DNS.TCP.start_acceptor(listen, self())
-      Logger.info("Vagus.DNS: listening on #{fmt(ip)}:#{port} (UDP and TCP)")
-      %{state | socket: socket, listen: listen, port: port}
-    else
+  # TCP must find it there. Port 0 (tests) takes whatever UDP is given, and
+  # TCP the same, which TCP may already be using: another is drawn then.
+  defp try_bind(state, draws \\ 5)
+
+  defp try_bind(%{ip: ip, port: 0} = state, draws) when draws > 1 do
+    case bind(ip, 0) do
+      {:ok, bound} -> bound_to(state, bound)
+      {:error, _reason} -> try_bind(state, draws - 1)
+    end
+  end
+
+  defp try_bind(%{ip: ip, port: port} = state, _draws) do
+    case bind(ip, port) do
+      {:ok, bound} ->
+        bound_to(state, bound)
+
       {:error, reason} ->
         Logger.warning(
           "Vagus.DNS: bind #{fmt(ip)}:#{port} failed (#{inspect(reason)}), retrying in #{@bind_retry_ms}ms"
@@ -126,8 +131,23 @@ defmodule Vagus.DNS do
     end
   end
 
+  defp bound_to(state, {socket, listen, port}) do
+    TCP.start_acceptor(listen, self())
+    Logger.info("Vagus.DNS: listening on #{fmt(state.ip)}:#{port} (UDP and TCP)")
+    %{state | socket: socket, listen: listen, port: port}
+  end
+
+  defp bind(ip, port) do
+    with {:ok, socket} <-
+           :gen_udp.open(port, [:binary, :inet, {:ip, ip}, active: true, reuseaddr: true]),
+         {:ok, port} <- :inet.port(socket),
+         {:ok, listen} <- listen_tcp(socket, ip, port) do
+      {:ok, {socket, listen, port}}
+    end
+  end
+
   defp listen_tcp(socket, ip, port) do
-    case Vagus.DNS.TCP.listen(ip, port) do
+    case TCP.listen(ip, port) do
       {:ok, listen} ->
         {:ok, listen}
 
@@ -194,14 +214,18 @@ defmodule Vagus.DNS do
         state
 
       {:forward, nxdomain} ->
-        case upstreams(state) do
-          [] ->
-            if nxdomain, do: reply(state.socket, host, port, nxdomain)
-            state
+        forward_or_nxdomain(packet, nxdomain, host, port, state)
+    end
+  end
 
-          upstreams ->
-            forward(packet, host, port, upstreams, state)
-        end
+  defp forward_or_nxdomain(packet, nxdomain, host, port, state) do
+    case upstreams(state) do
+      [] ->
+        if nxdomain, do: reply(state.socket, host, port, nxdomain)
+        state
+
+      upstreams ->
+        forward(packet, host, port, upstreams, state)
     end
   end
 
@@ -216,14 +240,10 @@ defmodule Vagus.DNS do
           {:answer, binary()} | {:forward, binary() | nil}
   def local_answer(packet, zone) do
     case Message.parse_query(packet) do
-      {:ok, %{qtype: qtype} = query} ->
+      {:ok, query} ->
         case lookup(strip_suffix(query.qname), zone) do
-          {:ok, ip} ->
-            ips = if qtype == Message.type_a(), do: [ip], else: []
-            {:answer, Message.answer(query, ips)}
-
-          :error ->
-            {:forward, Message.nxdomain(query)}
+          {:ok, ip} -> {:answer, owned(query, ip)}
+          :error -> {:forward, Message.nxdomain(query)}
         end
 
       {:error, _reason} ->
@@ -252,6 +272,9 @@ defmodule Vagus.DNS do
     fallback = if state.fallback in own, do: [], else: List.wrap(state.fallback)
     lan ++ (fallback -- lan)
   end
+
+  defp owned(%{qtype: qtype} = query, ip),
+    do: Message.answer(query, if(qtype == Message.type_a(), do: [ip], else: []))
 
   defp server_ip(%{address: ip}), do: ip
   defp server_ip(ip) when is_tuple(ip), do: ip
@@ -347,7 +370,7 @@ defmodule Vagus.DNS do
       idle_ms: state.tcp_idle_ms
     }
 
-    case Task.Supervisor.start_child(state.task_supervisor, fn -> Vagus.DNS.TCP.serve(conn) end) do
+    case Task.Supervisor.start_child(state.task_supervisor, fn -> TCP.serve(conn) end) do
       {:ok, pid} ->
         :ok = handover(sock, pid)
         %{state | conns: Map.put(state.conns, Process.monitor(pid), pid)}

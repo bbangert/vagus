@@ -78,15 +78,16 @@ defmodule Vagus.DNS.TCP do
   end
 
   defp loop(sock, conn) do
-    with {:ok, packet} <- :gen_tcp.recv(sock, 0, conn.idle_ms) do
-      case answer(packet, conn) do
-        nil -> loop(sock, conn)
-        resp -> with :ok <- :gen_tcp.send(sock, resp), do: loop(sock, conn)
-      end
+    with {:ok, packet} <- :gen_tcp.recv(sock, 0, conn.idle_ms),
+         :ok <- respond(sock, answer(packet, conn)) do
+      loop(sock, conn)
+    else
+      _closed_or_idle -> :ok
     end
-
-    :ok
   end
+
+  defp respond(_sock, nil), do: :ok
+  defp respond(sock, resp), do: :gen_tcp.send(sock, resp)
 
   # Unanswered, the client times out and asks again, as over UDP.
   defp answer(packet, conn) do
