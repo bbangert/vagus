@@ -236,7 +236,11 @@ defmodule Vagus.DNS do
   # "the name doesn't exist". Anything else is `{:forward, nxdomain}`, with
   # the NXDOMAIN to send when there is nobody to forward to; an unparseable
   # query (e.g. multi-question) has none and is dropped then.
-  @spec local_answer(binary(), %{static: map(), directory: atom()}) ::
+  @spec local_answer(binary(), %{
+          :static => map(),
+          :directory => atom(),
+          optional(atom()) => any()
+        }) ::
           {:answer, binary()} | {:forward, binary() | nil}
   def local_answer(packet, zone) do
     case Message.parse_query(packet) do
