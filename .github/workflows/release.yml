@@ -49,7 +49,7 @@ env:
   # must be the same ref. Bump when the systems cut a new release.
   # Every target in the build matrix needs its prebuilt artifact in that
   # release (rock_4d first appears in v0.9.0).
-  SYSTEM_RELEASE_TAG: v0.9.0
+  SYSTEM_RELEASE_TAG: v0.9.1
   NERVES_DL_DIR: /home/runner/.nerves/dl
   GH_TOKEN: ${{ github.token }}
   # A public image bakes no operator SSH keys; boards hand out their device
