@@ -162,6 +162,20 @@ defmodule Vagus.DNS do
     {:reply, lookup(strip_suffix(name), state), state}
   end
 
+  # The reply is the acceptor's go-ahead: it accepts nothing more until this
+  # connection is admitted or refused, so the cap bounds the open sockets.
+  def handle_call({:tcp_accepted, sock}, _from, %{conns: conns} = state)
+      when map_size(conns) >= @max_tcp do
+    :gen_tcp.close(sock)
+    {:reply, :ok, shed(state)}
+  end
+
+  def handle_call({:tcp_accepted, sock}, _from, state),
+    do: {:reply, :ok, serve_tcp(sock, state)}
+
+  # Asked per query, so a connection that outlives a lease change follows it.
+  def handle_call(:upstreams, _from, state), do: {:reply, upstreams(state), state}
+
   @impl GenServer
   def handle_info({:udp, socket, host, port, packet}, %{socket: socket} = state) do
     {:noreply, handle_packet(packet, host, port, state)}
@@ -178,14 +192,6 @@ defmodule Vagus.DNS do
       when is_map_key(conns, ref) do
     {:noreply, %{state | conns: Map.delete(conns, ref)}}
   end
-
-  def handle_info({:tcp_accepted, sock}, %{conns: conns} = state)
-      when map_size(conns) >= @max_tcp do
-    :gen_tcp.close(sock)
-    {:noreply, shed(state)}
-  end
-
-  def handle_info({:tcp_accepted, sock}, state), do: {:noreply, serve_tcp(sock, state)}
 
   def handle_info({:answered_by, ip}, state), do: {:noreply, %{state | preferred: ip}}
 
@@ -368,7 +374,6 @@ defmodule Vagus.DNS do
     conn = %{
       static: state.static,
       directory: state.directory,
-      upstreams: upstreams(state),
       upstream_port: state.upstream_port,
       server: self(),
       idle_ms: state.tcp_idle_ms

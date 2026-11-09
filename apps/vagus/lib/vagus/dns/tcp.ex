@@ -26,6 +26,9 @@ defmodule Vagus.DNS.TCP do
   # RFC 7766 §6.2.3 asks for an idle timeout of seconds, not minutes.
   @idle_ms 10_000
   @opts [:binary, packet: 2, active: false]
+  # A client that stops reading must not hold its task, and its slot, past
+  # the idle bound a silent one gets.
+  @send_opts [send_timeout: @idle_ms, send_timeout_close: true]
 
   @doc "How long a connection may sit without a whole frame."
   @spec idle_ms() :: pos_integer()
@@ -33,11 +36,13 @@ defmodule Vagus.DNS.TCP do
 
   @spec listen(:inet.ip4_address(), :inet.port_number()) ::
           {:ok, :gen_tcp.socket()} | {:error, term()}
-  def listen(ip, port), do: :gen_tcp.listen(port, @opts ++ [ip: ip, reuseaddr: true])
+  def listen(ip, port),
+    do: :gen_tcp.listen(port, @opts ++ @send_opts ++ [ip: ip, reuseaddr: true])
 
   @doc """
   Starts the acceptor, linked to the caller. It hands each connection to
-  `server` as `{:tcp_accepted, socket}`, owned by `server`.
+  `server`, owned by `server`, and waits for it to be admitted or refused
+  before accepting the next.
   """
   @spec start_acceptor(:gen_tcp.socket(), pid()) :: {:ok, pid()}
   def start_acceptor(listen, server), do: Task.start_link(fn -> accept(listen, server) end)
@@ -47,7 +52,8 @@ defmodule Vagus.DNS.TCP do
     case :gen_tcp.accept(listen) do
       {:ok, sock} ->
         :ok = :gen_tcp.controlling_process(sock, server)
-        send(server, {:tcp_accepted, sock})
+        # No timeout: linked to the server, it goes down with it anyway.
+        :ok = GenServer.call(server, {:tcp_accepted, sock}, :infinity)
         accept(listen, server)
 
       {:error, :closed} ->
@@ -60,8 +66,8 @@ defmodule Vagus.DNS.TCP do
 
   @doc """
   A connection's task: waits for its socket, then answers frame by frame.
-  `conn` carries the zone, the upstreams in the order the server chose at
-  admission, and where to report the one that answered.
+  `conn` carries the zone and the server, which orders the upstreams for
+  each query and hears which one answered.
   """
   @spec serve(map()) :: :ok
   def serve(conn) do
@@ -95,18 +101,21 @@ defmodule Vagus.DNS.TCP do
       {:answer, resp} ->
         resp
 
-      {:forward, nxdomain} when conn.upstreams == [] ->
-        nxdomain
+      {:forward, nxdomain} ->
+        forward(GenServer.call(conn.server, :upstreams), packet, nxdomain, conn)
+    end
+  end
 
-      {:forward, _nxdomain} ->
-        case ask(conn.upstreams, conn.upstreams, packet, conn.upstream_port, DNS.deadline()) do
-          {:ok, ip, resp} ->
-            DNS.answered(conn.server, conn.upstreams, ip)
-            resp
+  defp forward([], _packet, nxdomain, _conn), do: nxdomain
 
-          :error ->
-            nil
-        end
+  defp forward(upstreams, packet, _nxdomain, conn) do
+    case ask(upstreams, upstreams, packet, conn.upstream_port, DNS.deadline()) do
+      {:ok, ip, resp} ->
+        DNS.answered(conn.server, upstreams, ip)
+        resp
+
+      :error ->
+        nil
     end
   end
 

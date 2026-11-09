@@ -543,6 +543,26 @@ defmodule Vagus.DNSTest do
       assert Bitwise.band(flags, 0x000F) == 3
     end
 
+    test "one connection follows a lease change between its queries" do
+      {:ok, servers} = Agent.start_link(fn -> [{127, 0, 0, 2}] end)
+
+      %{port: p, upstream_port: up} =
+        forwarding_server(fn -> Agent.get(servers, & &1) end, nil)
+
+      tcp_upstream({127, 0, 0, 2}, up, {10, 0, 0, 2})
+      tcp_upstream({127, 0, 0, 3}, up, {10, 0, 0, 3})
+      tcp = tcp_client(p)
+
+      :ok = :gen_tcp.send(tcp, query("nas"))
+      assert {:ok, resp} = :gen_tcp.recv(tcp, 0, 3_000)
+      assert :binary.part(resp, byte_size(resp), -4) == <<10, 0, 0, 2>>
+
+      Agent.update(servers, fn _ -> [{127, 0, 0, 3}] end)
+      :ok = :gen_tcp.send(tcp, query("nas"))
+      assert {:ok, resp} = :gen_tcp.recv(tcp, 0, 3_000)
+      assert :binary.part(resp, byte_size(resp), -4) == <<10, 0, 0, 3>>
+    end
+
     test "an idle connection, or one whose frame never arrives whole, is closed" do
       %{port: p} = forwarding_server(fn -> [] end, nil, tcp_idle_ms: 200)
 
