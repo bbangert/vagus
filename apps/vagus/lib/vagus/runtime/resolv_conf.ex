@@ -71,9 +71,10 @@ defmodule Vagus.Runtime.ResolvConf do
   end
 
   @doc """
-  Writes the stub of these settings under `dir`, unless it is there already,
-  and returns its path. Through a rename, so a create running beside another
-  never binds a half-written file, and so one there is whole.
+  Writes the stub of these settings under `dir`, unless it is there already
+  (then only its mode is set), and returns its path. Through a rename, so a
+  create running beside another never binds a half-written file, and so one
+  there is whole.
 
   One there is never rewritten: a bind holds the inode it was made on, so a
   replaced file would leave every running container reading the old one,
