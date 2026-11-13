@@ -59,6 +59,26 @@ defmodule Vagus.Runtime.ResolvConfTest do
       assert File.read!(b) == "nameserver 172.30.32.3\nsearch local.hass.io\n"
     end
 
+    @tag :tmp_dir
+    test "a fresh stub is world-readable whatever the umask", %{tmp_dir: dir} do
+      {:ok, path} = ResolvConf.write_stub(dir, ["172.30.32.3"], nil, nil)
+
+      assert Bitwise.band(File.stat!(path).mode, 0o777) == 0o644
+    end
+
+    @tag :tmp_dir
+    test "a stub written 0600 is healed in place", %{tmp_dir: dir} do
+      {:ok, path} = ResolvConf.write_stub(dir, ["172.30.32.3"], nil, nil)
+      File.chmod!(path, 0o600)
+      inode = File.stat!(path).inode
+
+      assert {:ok, ^path} = ResolvConf.write_stub(dir, ["172.30.32.3"], nil, nil)
+
+      stat = File.stat!(path)
+      assert Bitwise.band(stat.mode, 0o777) == 0o644
+      assert stat.inode == inode
+    end
+
     test "a directory it cannot make is the error, not a crash" do
       assert {:error, _} = ResolvConf.write_stub("/proc/no-such/dir", ["172.30.32.3"], nil, nil)
     end
