@@ -201,9 +201,10 @@ would instead run the whole session silently on the CPU. `ensure_dsp_store/1`
 turns the refusal into a sentence naming the panel; the engine remains the
 backstop.
 
-**Inert on `rpi3_64`**, where `:dsp_root` is unset — `Vagus.DSP.status/0`
-reports `:unsupported`, the panel section says so and offers no form, and no
-mount or rule is emitted.
+**Refused on a board without a DSP** (`rpi3_64`, where `:dsp_root` is unset):
+`Vagus.DSP.status/0` reports `:unsupported`, the panel section says so and
+offers no form, and a `dsp: true` app's start fails with
+`:dsp_unsupported` rather than running without the DSP.
 
 All of the above is measured, not reasoned: see
 [`device-gate-dsp-2026-08-16.md`](device-gate-dsp-2026-08-16.md), including a
@@ -215,6 +216,35 @@ from the store path, and the no-skel control failing outright.
 Supervisor add-on, which has no `dsp:` — so these two mounts never appear in
 that spec and cannot be registered there without failing its "each declared
 divergence is still real" assertion. They are ledgered here instead.
+
+---
+
+## `devicetree: true` also exposes `/sys/firmware/devicetree`
+
+Upstream honours the key with one read-only bind of
+`/sys/firmware/devicetree/base` at `/device-tree`. Vagus does that and
+additionally unmasks `/sys/firmware` and masks every sibling of `devicetree`
+present when the container is created, so that `/proc/device-tree/*` resolves
+inside the app. It is a symlink into `/sys/firmware/devicetree/base`, which the
+engine masks by default, and the bind alone does not make it resolve. Software
+that detects its SoC there (Rockchip's MPP reads `/proc/device-tree/compatible`)
+finds nothing without it.
+
+The engine cannot unmask a single child of a masked directory, hence the
+unmask and re-mask pair (`efi`, `acpi`, `dmi`, `fdt`, ...). The siblings' names
+remain visible, as empty read-only directories (an empty file for `fdt`), but
+nothing behind them is. An entry that appears under `/sys/firmware` after the
+container is created is not masked; it stays visible until the app's next
+start, which creates the container again. An entry whose name cannot be written
+safely into the engine's colon-separated option, or a listing that fails, leaves
+`/sys/firmware` masked, with a warning in the log. A host without
+`/sys/firmware/devicetree/base` gets neither the bind nor the unmask, also with
+a warning. An app without the key is created exactly as before.
+
+The content is the same device tree upstream already exposes at `/device-tree`,
+now also reachable at its kernel path: model, `compatible`, serial number,
+factory MAC addresses and whatever else the firmware put there. The exposure is
+opt-in per app.
 
 ---
 

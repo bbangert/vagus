@@ -67,8 +67,8 @@ defmodule Vagus.Addon.Devices do
   # Paths, not numbers, because the minors are dynamically allocated and differ
   # between two boards of the same model (`fastrpc-cdsp-secure` measured 10:262
   # and 10:260 the same day) — a hardcoded rule passes on one and silently
-  # grants nothing on the other. A target with no fastrpc nodes (rpi3_64) needs
-  # no special case: every path skips as ENOENT and `dsp: true` emits nothing.
+  # grants nothing on the other. A target with no fastrpc nodes (rpi3_64) gets
+  # no rules here, and `dsp: true` is refused before a container is created.
   @dsp_nodes [
     "/dev/fastrpc-cdsp-secure",
     "/dev/fastrpc-cdsp",

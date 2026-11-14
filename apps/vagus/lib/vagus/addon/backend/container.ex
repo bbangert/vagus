@@ -125,7 +125,8 @@ defmodule Vagus.Addon.Backend.Container do
       restart: :no,
       ports: spec.ports,
       pid_mode: spec.pid_mode,
-      uts_mode: spec.uts_mode
+      uts_mode: spec.uts_mode,
+      devicetree: spec.devicetree
     }
   end
 

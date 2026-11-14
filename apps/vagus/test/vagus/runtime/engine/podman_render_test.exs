@@ -249,6 +249,151 @@ defmodule Vagus.Runtime.Engine.PodmanRenderTest do
                ]
   end
 
+  describe "devicetree" do
+    import ExUnit.CaptureLog
+
+    @describetag :tmp_dir
+
+    setup %{tmp_dir: dir} do
+      File.mkdir_p!(Path.join(dir, "devicetree/base"))
+      %{fw: dir}
+    end
+
+    defp dt_spec(fields),
+      do: struct!(%ContainerSpec{name: "n", image: "i", network: :host}, fields)
+
+    defp render_dt(fields, fw, opts \\ []) do
+      spec = dt_spec(fields)
+      args = Podman.devicetree_args(spec, [firmware_dir: fw] ++ opts)
+      Podman.render_create(spec, @log, "/run/resolv", args)
+    end
+
+    defp adjacent(argv, flag, value),
+      do: Enum.any?(Enum.chunk_every(argv, 2, 1, :discard), &(&1 == [flag, value]))
+
+    defp bound?(argv, fw),
+      do:
+        adjacent(argv, "--mount", "type=bind,src=#{fw}/devicetree/base,dst=/device-tree,ro=true")
+
+    defp security_opts(argv),
+      do: for({"--security-opt", v} <- Enum.zip(argv, tl(argv)), do: v)
+
+    defp seed(fw, names), do: Enum.each(names, &File.mkdir_p!(Path.join(fw, &1)))
+
+    test "unset renders exactly the golden argv, whatever the host has", %{fw: fw} do
+      seed(fw, ~w(efi acpi dmi))
+
+      golden =
+        ["create", "--name", "n"] ++
+          @fixed ++
+          log_opts("n") ++
+          [
+            "--network",
+            "host",
+            "--mount",
+            "type=bind,src=/run/resolv.conf,dst=/etc/resolv.conf,ro=true",
+            "--cap-add",
+            "AUDIT_WRITE",
+            "--cap-add",
+            "MKNOD",
+            "--cap-add",
+            "NET_RAW",
+            "--security-opt",
+            "seccomp=unconfined",
+            "--",
+            "i"
+          ]
+
+      for unset <- [[], [devicetree: nil], [devicetree: false]] do
+        fields = [security_opt: ["seccomp=unconfined"]] ++ unset
+        assert Podman.devicetree_args(dt_spec(fields), firmware_dir: fw) == {[], []}
+        assert render_dt(fields, fw) == golden
+      end
+    end
+
+    test "set binds the base read-only, unmasks /sys/firmware and re-masks the rest", %{fw: fw} do
+      seed(fw, ~w(efi acpi dmi fdt))
+      argv = render_dt([devicetree: true, security_opt: ["seccomp=unconfined"]], fw)
+
+      assert bound?(argv, fw)
+
+      assert security_opts(argv) == [
+               "seccomp=unconfined",
+               "unmask=/sys/firmware",
+               "mask=/sys/firmware/acpi:/sys/firmware/dmi:/sys/firmware/efi:/sys/firmware/fdt"
+             ]
+
+      assert adjacent(argv, "--security-opt", "unmask=/sys/firmware")
+    end
+
+    test "devicetree itself is never masked", %{fw: fw} do
+      seed(fw, ~w(efi))
+      argv = render_dt([devicetree: true], fw)
+      assert "mask=/sys/firmware/efi" in argv
+      refute Enum.any?(argv, &(&1 =~ "mask=" and &1 =~ "devicetree"))
+    end
+
+    test "nothing else in /sys/firmware means unmask alone", %{fw: fw} do
+      argv = render_dt([devicetree: true], fw)
+      assert security_opts(argv) == ["unmask=/sys/firmware"]
+    end
+
+    test "a host without a device tree gets no mount and no unmask, and a warning", %{fw: fw} do
+      File.rm_rf!(Path.join(fw, "devicetree"))
+      seed(fw, ~w(efi))
+
+      log =
+        capture_log(fn ->
+          assert Podman.devicetree_args(dt_spec(devicetree: true), firmware_dir: fw) == {[], []}
+        end)
+
+      assert log =~ "[warning]"
+      assert log =~ "Vagus.Runtime.Engine.Podman: n asked for the device tree"
+      assert length(String.split(log, "asked for the device tree")) == 2
+    end
+
+    test "a failed listing keeps /sys/firmware masked but still binds, and says why", %{fw: fw} do
+      log =
+        capture_log(fn ->
+          argv = render_dt([devicetree: true], fw, ls: fn _ -> {:error, :eacces} end)
+          assert bound?(argv, fw)
+          assert security_opts(argv) == []
+        end)
+
+      assert log =~ "n keeps /sys/firmware masked"
+      assert log =~ "could not be listed: :eacces"
+    end
+
+    test "an entry name that cannot sit in a mask= value keeps /sys/firmware masked", %{fw: fw} do
+      for bad <- ["a:b", "a,b", "a b", "efi\n", "", "../x"] do
+        log =
+          capture_log(fn ->
+            argv = render_dt([devicetree: true], fw, ls: fn _ -> {:ok, ["efi", bad]} end)
+            assert bound?(argv, fw), "bind missing for #{inspect(bad)}"
+            assert security_opts(argv) == [], "#{inspect(bad)} was let through"
+          end)
+
+        assert log =~ "cannot be masked safely: #{inspect(bad)}"
+      end
+    end
+
+    test "the app backend's spec renders through the same path", %{fw: fw} do
+      seed(fw, ~w(efi))
+      spec = AppContainer.to_container_spec(%Spec{name: "n", image: "i", devicetree: true})
+
+      argv =
+        Podman.render_create(
+          spec,
+          @log,
+          "/run/resolv",
+          Podman.devicetree_args(spec, firmware_dir: fw)
+        )
+
+      assert bound?(argv, fw)
+      assert adjacent(argv, "--security-opt", "unmask=/sys/firmware")
+    end
+  end
+
   describe "single fields" do
     defp render(fields) do
       Podman.render_create(

@@ -8,6 +8,9 @@ defmodule Vagus.Runtime.Engine.ContainerSpec do
   sorts them itself. `ports` and `network_aliases` only apply to a bridged
   container and render only when non-empty.
 
+  `devicetree: true` exposes the host's device tree read-only; what that takes
+  is resolved against the host when the create args are rendered.
+
   `secret_env` names the `env` entries whose values are secrets, so an
   engine driven through argv can pass them some other way.
   """
@@ -51,7 +54,8 @@ defmodule Vagus.Runtime.Engine.ContainerSpec do
           restart: nil | :no | :unless_stopped,
           ports: %{optional(String.t()) => non_neg_integer() | String.t() | nil} | nil,
           pid_mode: String.t() | nil,
-          uts_mode: String.t() | nil
+          uts_mode: String.t() | nil,
+          devicetree: boolean() | nil
         }
 
   @enforce_keys [:name, :image, :network]
@@ -82,5 +86,6 @@ defmodule Vagus.Runtime.Engine.ContainerSpec do
             restart: nil,
             ports: nil,
             pid_mode: nil,
-            uts_mode: nil
+            uts_mode: nil,
+            devicetree: nil
 end

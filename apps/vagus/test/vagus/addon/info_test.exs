@@ -23,6 +23,11 @@ defmodule Vagus.Addon.InfoTest do
     %{config: c}
   end
 
+  test "devicetree reports the config's value", %{config: c} do
+    assert Info.render(c, :started, %{})["devicetree"] == false
+    assert Info.render(%{c | devicetree: true}, :started, %{})["devicetree"] == true
+  end
+
   test "renders the fields Core's discovery + the model need", %{config: c} do
     info = Info.render(c, :started, %{"require_certificate" => false})
 

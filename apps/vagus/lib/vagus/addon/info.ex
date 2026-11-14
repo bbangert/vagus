@@ -158,7 +158,7 @@ defmodule Vagus.Addon.Info do
       "usb" => false,
       "uart" => false,
       "kernel_modules" => false,
-      "devicetree" => false,
+      "devicetree" => config.devicetree,
       "udev" => false,
       "video" => false,
       "audio" => false,

@@ -105,6 +105,12 @@ defmodule Vagus.Addon.Backend.ContainerTest do
   end
 
   describe "to_container_spec/1 — advanced fields" do
+    test "devicetree flows through, and is false unless the spec says so" do
+      refute Container.to_container_spec(%Spec{name: "n", image: "i"}).devicetree
+
+      assert Container.to_container_spec(%Spec{name: "n", image: "i", devicetree: true}).devicetree
+    end
+
     test "cap_add / tmpfs / pid_mode / uts_mode / open_stdin flow through" do
       spec =
         container_spec(
