@@ -131,9 +131,12 @@ jobs:
       - name: Fetch deps
         run: mix deps.get
 
-      # Full suite — no exclusions.
+      # Full suite — no exclusions. The device BEAM runs with umask 0077, so a
+      # file mode a test asserts is only checked under it.
       - name: Tests
-        run: mix test
+        run: |
+          umask 077
+          mix test
 
   credo:
     name: Credo

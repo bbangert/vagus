@@ -71,13 +71,17 @@ defmodule Vagus.Runtime.ResolvConf do
   end
 
   @doc """
-  Writes the stub of these settings under `dir`, unless it is there already,
-  and returns its path. Through a rename, so a create running beside another
-  never binds a half-written file, and so one there is whole.
+  Writes the stub of these settings under `dir`, unless it is there already
+  (then only its mode is set), and returns its path. Through a rename, so a
+  create running beside another never binds a half-written file, and so one
+  there is whole.
 
   One there is never rewritten: a bind holds the inode it was made on, so a
   replaced file would leave every running container reading the old one,
   and its name already fixes its content.
+
+  The mode is forced to 0644: the device's umask is 0077, and non-root
+  container users must be able to read the bound file.
   """
   # sobelow_skip ["Traversal.FileModule"]
   @spec write_stub(String.t(), [String.t()] | nil, [String.t()] | nil, [String.t()] | nil) ::
@@ -92,7 +96,8 @@ defmodule Vagus.Runtime.ResolvConf do
       {:ok, path}
     else
       true ->
-        {:ok, path}
+        # chmod keeps the inode, so running binds are unaffected.
+        with :ok <- File.chmod(path, 0o644), do: {:ok, path}
 
       {:error, _reason} = error ->
         _ = File.rm(tmp)
@@ -102,7 +107,10 @@ defmodule Vagus.Runtime.ResolvConf do
 
   # sobelow_skip ["Traversal.FileModule"]
   defp write_new(dir, tmp, path, content) do
-    with :ok <- File.mkdir_p(dir), :ok <- File.write(tmp, content), do: File.rename(tmp, path)
+    with :ok <- File.mkdir_p(dir),
+         :ok <- File.write(tmp, content),
+         :ok <- File.chmod(tmp, 0o644),
+         do: File.rename(tmp, path)
   end
 
   defp line(_key, empty) when empty in [nil, []], do: ""

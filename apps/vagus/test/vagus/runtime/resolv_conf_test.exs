@@ -59,10 +59,32 @@ defmodule Vagus.Runtime.ResolvConfTest do
       assert File.read!(b) == "nameserver 172.30.32.3\nsearch local.hass.io\n"
     end
 
+    # Only discriminates under a restrictive umask, which is why CI runs the suite under 077.
+    @tag :tmp_dir
+    test "a fresh stub is 0644", %{tmp_dir: dir} do
+      {:ok, path} = ResolvConf.write_stub(dir, ["172.30.32.3"], nil, nil)
+
+      assert mode(path) == 0o644
+    end
+
+    @tag :tmp_dir
+    test "a stub written 0600 is healed in place", %{tmp_dir: dir} do
+      {:ok, path} = ResolvConf.write_stub(dir, ["172.30.32.3"], nil, nil)
+      File.chmod!(path, 0o600)
+      inode = File.stat!(path).inode
+
+      assert {:ok, ^path} = ResolvConf.write_stub(dir, ["172.30.32.3"], nil, nil)
+
+      assert mode(path) == 0o644
+      assert File.stat!(path).inode == inode
+    end
+
     test "a directory it cannot make is the error, not a crash" do
       assert {:error, _} = ResolvConf.write_stub("/proc/no-such/dir", ["172.30.32.3"], nil, nil)
     end
   end
+
+  defp mode(path), do: Bitwise.band(File.stat!(path).mode, 0o777)
 
   test "path/0 is /run/resolv.conf" do
     assert ResolvConf.path() == "/run/resolv.conf"
