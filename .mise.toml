@@ -24,7 +24,7 @@ description = "Run tests with MIX_TARGET=host"
 run = "MIX_TARGET=host mix test"
 
 # Valid targets are the @all_targets in apps/vagus/mix.exs and
-# apps/vagus_platform/mix.exs: rpi3_64, dragon_q6a, rubik_pi3, and rock_4d.
+# apps/vagus_platform/mix.exs: rpi3_64, dragon_q6a, rubik_pi3, rock_4d, and ha_green.
 [tasks.firmware]
 description = "Build firmware for a target: mise run firmware -- dragon_q6a"
 # `mix firmware` must run from the platform app: the umbrella root defines
