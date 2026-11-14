@@ -201,9 +201,10 @@ would instead run the whole session silently on the CPU. `ensure_dsp_store/1`
 turns the refusal into a sentence naming the panel; the engine remains the
 backstop.
 
-**Inert on `rpi3_64`**, where `:dsp_root` is unset — `Vagus.DSP.status/0`
-reports `:unsupported`, the panel section says so and offers no form, and no
-mount or rule is emitted.
+**Refused on a board without a DSP** (`rpi3_64`, where `:dsp_root` is unset):
+`Vagus.DSP.status/0` reports `:unsupported`, the panel section says so and
+offers no form, and a `dsp: true` app's start fails with
+`:dsp_unsupported` rather than running without the DSP.
 
 All of the above is measured, not reasoned: see
 [`device-gate-dsp-2026-08-16.md`](device-gate-dsp-2026-08-16.md), including a
@@ -215,6 +216,31 @@ from the store path, and the no-skel control failing outright.
 Supervisor add-on, which has no `dsp:` — so these two mounts never appear in
 that spec and cannot be registered there without failing its "each declared
 divergence is still real" assertion. They are ledgered here instead.
+
+---
+
+## `devicetree: true` also exposes `/sys/firmware/devicetree`
+
+Upstream honours the key with one read-only bind of
+`/sys/firmware/devicetree/base` at `/device-tree`. Vagus does that and
+additionally unmasks `/sys/firmware/devicetree`, so that `/proc/device-tree/*`
+resolves inside the app: it is a symlink into `/sys/firmware/devicetree/base`,
+which the engine masks by default, and software that detects its SoC there
+(Rockchip's MPP reads `/proc/device-tree/compatible`) finds nothing without it.
+
+Unmasking is per directory. The engine masks `/sys/firmware` as a whole, so
+Vagus unmasks it and masks every other entry of the host's `/sys/firmware`
+again (`efi`, `acpi`, `dmi`, `fdt`, ...), listed when the container is created.
+Only `devicetree` becomes visible. An entry whose name cannot be written safely
+into the engine's colon-separated option leaves `/sys/firmware` masked rather
+than exposed. A host without `/sys/firmware/devicetree/base` gets neither the
+bind nor the unmask, and one log line. An app without the key is created
+exactly as before.
+
+What an app with the key can now read: the board model and `compatible`
+strings, the serial number, the factory MAC addresses, and the kernel command
+line (`/chosen/bootargs`), plus whatever else the firmware put in the tree.
+The exposure is opt-in per app.
 
 ---
 
