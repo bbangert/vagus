@@ -72,6 +72,29 @@ decision, not a property of the `/dev` bind.
 
 ---
 
+## Core gets no `/run/dbus` bind on a firmware without D-Bus
+
+**Upstream:** always bind-mounts the host system bus read-only into Core
+(`MOUNT_DBUS`); HAOS always runs a bus.
+
+**Vagus:** the same bind, except on a firmware that ships no `dbus-daemon` or
+`bluetoothd` (the `ha_green` target has neither; `Vagus.Bluetooth` is the only
+thing that makes `/run/dbus`). There Core's spec simply omits it, because the
+engine refuses a bind whose source is missing and Core would never be created.
+On every other target the spec is byte-identical to before, which a pinned
+fingerprint test holds.
+
+**Why keyed on the firmware.** A check for the directory's existence at spec
+time would race the Bluetooth stack at boot on a BlueZ board and could drop the
+bind until the next recreate.
+
+**Apps are not treated the same.** A `host_dbus: true` app keeps its bind on
+such a firmware, and Vagus does not create the directory for it, so its start is
+refused by the engine instead of running against an empty, daemon-less mount.
+That refusal is deliberate and the same on every flavor and start order.
+
+---
+
 ## System storage is refused for `devices:` grants
 
 **Upstream:** refuses a block device that `disk.is_used_by_system/1` claims —

@@ -18,8 +18,9 @@ What Vagus does differently on this board:
   `green`. Core maps board `green` to its `homeassistant_green` integration,
   which calls `/os/boards/green` (the LED and board settings), and Vagus does
   not serve that.
-- RAM is about 3.58 GiB, so the runtime takes the `fast` profile, and the root
-  disk is `mmcblk0`, so swap is zram. Nothing here depends on an SD card; one,
+- RAM is about 3.58 GiB, so the runtime should take the `fast` profile, and the
+  root disk is `mmcblk0`, so swap should be zram (both follow from the code and
+  have not been checked on the board). Nothing here depends on an SD card; one,
   when present, is `mmcblk1`.
 
 ## Installing and recovering
@@ -36,15 +37,21 @@ OS and what is never written.
 The Green has no WiFi or Bluetooth. The firmware carries no BlueZ or D-Bus, so
 `Vagus.Bluetooth` and the Improv provisioning it hosts do not start (one
 warning at boot says why), and the WiFi endpoints have no interface to act on.
-Home Assistant Core's Bluetooth integrations find no adapter. USB WiFi or
-Bluetooth dongles are not supported.
+USB WiFi or Bluetooth dongles are not supported.
 
-Core's LED and board settings are absent, for the reason above.
+With no system bus, Core's container gets no host D-Bus mount, and an app with
+`host_dbus: true` is refused at start (see
+[the divergences entry](divergences.md#core-gets-no-rundbus-bind-on-a-firmware-without-d-bus)).
+Nobody has run Core on this board yet, so what it does without a bus is not
+established; expect its Bluetooth integrations to find no adapter. Vagus
+does not serve Core's LED and board settings here either (no
+`/os/boards/green`), so expect them to be absent.
 
 ## What an app can be given
 
-All nodes below are root-only (there are no udev rules), so the app must run
-as root. List the ones an app needs under `devices:`.
+The nodes below are owned by root, and the system ships no rules opening them
+to other users or groups, so an app must run as root to use them. List the
+ones an app needs under `devices:`.
 
 | Node | What |
 | --- | --- |

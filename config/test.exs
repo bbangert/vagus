@@ -115,7 +115,7 @@ config :vagus, :store_asset_mode, :memory
 # optional: `StaticData` reads it with `fetch_env!/2` and raises if it is
 # missing, so that a target which forgets to set it fails loudly instead of
 # silently reporting some other board. Pinned here so the suite has a known
-# value to assert against. See config/rpi3_64.exs and config/dragon_q6a.exs.
+# value to assert against. See config/<target>.exs.
 config :vagus, :machine, "raspberrypi3-64"
 
 # issue #1: production-sized WS deadlines (10s/5s) fire mid-test on a

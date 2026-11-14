@@ -1,7 +1,7 @@
 # Agent dev board
 
-The agent-dev-board flavor of the dragon_q6a and rubik_pi3 firmware runs Claude
-Code on the board instead of Home Assistant Core. Build, OTA and how to tell a
+The agent-dev-board flavor of the dragon_q6a, rubik_pi3, rock_4d and ha_green
+firmware runs Claude Code on the board instead of Home Assistant Core. Build, OTA and how to tell a
 board's flavor are in [targets.md](targets.md#agent-dev-board-flavor).
 
 ## Two layers
