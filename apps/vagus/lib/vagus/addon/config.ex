@@ -112,6 +112,7 @@ defmodule Vagus.Addon.Config do
           full_access: boolean(),
           devices: [String.t()],
           dsp: boolean(),
+          devicetree: boolean(),
           apparmor: boolean(),
           ingress: boolean(),
           ingress_port: non_neg_integer(),
@@ -162,6 +163,7 @@ defmodule Vagus.Addon.Config do
             full_access: false,
             devices: [],
             dsp: false,
+            devicetree: false,
             apparmor: true,
             ingress: false,
             ingress_port: 8099,
@@ -318,6 +320,7 @@ defmodule Vagus.Addon.Config do
       "full_access" => c.full_access,
       "devices" => c.devices,
       "dsp" => c.dsp,
+      "devicetree" => c.devicetree,
       "apparmor" => c.apparmor,
       "ingress" => c.ingress,
       "ingress_port" => c.ingress_port,
@@ -380,6 +383,7 @@ defmodule Vagus.Addon.Config do
     |> put(:full_access, boolean(raw, "full_access", false))
     |> put(:devices, str_list(raw, "devices"))
     |> put(:dsp, boolean(raw, "dsp", false))
+    |> put(:devicetree, boolean(raw, "devicetree", false))
     |> put(:apparmor, boolean(raw, "apparmor", true))
     |> put(:ingress, boolean(raw, "ingress", false))
     |> put_ingress_port(raw)

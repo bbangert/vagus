@@ -30,6 +30,7 @@ defmodule Vagus.Addon.ConfigTest do
       assert c.panel_admin == true
       assert c.apparmor == true
       assert c.dsp == false
+      assert c.devicetree == false
       assert c.backup == "hot"
       assert c.timeout == 10
       assert c.image == nil
@@ -494,6 +495,7 @@ defmodule Vagus.Addon.ConfigTest do
         "full_access" => true,
         "devices" => ["/dev/ttyUSB0"],
         "dsp" => true,
+        "devicetree" => true,
         "apparmor" => false,
         "ingress" => true,
         "ingress_port" => 8123,
@@ -517,6 +519,13 @@ defmodule Vagus.Addon.ConfigTest do
 
       assert {:ok, c} = Config.parse(raw)
       assert Config.parse(Config.to_persistable(c)) == {:ok, c}
+    end
+
+    test "devicetree: true survives the persisted round trip and a non-boolean is refused" do
+      assert {:ok, c} = Config.parse(Map.put(@required, "devicetree", true))
+      assert c.devicetree == true
+      assert Config.to_persistable(c)["devicetree"] == true
+      assert {:error, _} = Config.parse(Map.put(@required, "devicetree", "yes"))
     end
 
     test "a config with nil optional fields (image/watchdog/webui/backup hooks) round-trips" do
