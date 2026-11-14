@@ -32,21 +32,16 @@ and Vagus never writes the SPI NOR or eMMC LBA 64-16383. Follow the
 in the system repository, which covers installing, returning to Home Assistant
 OS and what is never written.
 
-## No radio
+## No onboard radio
 
-The Green has no WiFi or Bluetooth. The firmware carries no BlueZ or D-Bus, so
-`Vagus.Bluetooth` and the Improv provisioning it hosts do not start (one
-warning at boot says why), and the WiFi endpoints have no interface to act on.
-USB WiFi or Bluetooth dongles are not supported.
+The Green has no WiFi or Bluetooth hardware, so the WiFi endpoints have no
+interface to act on. D-Bus and BlueZ ship in the firmware, so apps that need the
+host bus (Matter Server) work and a USB Bluetooth dongle can be used. No dongle
+has been tested on this board. The firmware carries Realtek, Intel, MediaTek and
+Qualcomm 6174A dongle firmware; Atheros AR3012 and Broadcom `.hcd`-firmware
+dongles are not covered. USB WiFi dongles are not supported.
 
-With no system bus, Core's container gets no host D-Bus mount, and an app with
-`host_dbus: true` is refused at start (see
-[the divergences entry](divergences.md#core-gets-no-rundbus-bind-on-a-firmware-without-d-bus)).
-On the agent-dev-board flavor the built-in orchestrator is installed without the
-host-bus request for the same reason, so it can still start.
-Nobody has run Core on this board yet, so what it does without a bus is not
-established; expect its Bluetooth integrations to find no adapter. Vagus
-does not serve Core's LED and board settings here either (no
+Vagus does not serve Core's LED and board settings here (no
 `/os/boards/green`), so expect them to be absent.
 
 ## What an app can be given
