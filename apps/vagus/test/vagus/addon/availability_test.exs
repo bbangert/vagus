@@ -79,6 +79,29 @@ defmodule Vagus.Addon.AvailabilityTest do
     end
   end
 
+  describe "on the Home Assistant Green (machine \"green\")" do
+    test "an app that lists green is available" do
+      c = config(%{"machine" => ["green", "yellow"]})
+      assert {true, nil} = Availability.check(c, "aarch64", "green", nil)
+    end
+
+    test "an app that negates green is not, even when it lists green too" do
+      c = config(%{"machine" => ["green", "!green"]})
+      assert {false, _reason} = Availability.check(c, "aarch64", "green", nil)
+    end
+
+    test "an app that only negates green is not (upstream reads an only-negated list as no match)" do
+      c = config(%{"machine" => ["!green"]})
+      assert {false, _reason} = Availability.check(c, "aarch64", "green", nil)
+    end
+
+    test "an app that allow-lists only other machines is unavailable" do
+      c = config(%{"machine" => ["generic-aarch64"]})
+      assert {false, reason} = Availability.check(c, "aarch64", "green", nil)
+      assert reason =~ "generic-aarch64"
+    end
+  end
+
   describe "Home Assistant version floor" do
     test "no floor declared -> available regardless of installed version" do
       c = config()
