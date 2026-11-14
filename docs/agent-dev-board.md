@@ -4,6 +4,10 @@ The agent-dev-board flavor of the dragon_q6a, rubik_pi3, rock_4d and ha_green
 firmware runs Claude Code on the board instead of Home Assistant Core. Build, OTA and how to tell a
 board's flavor are in [targets.md](targets.md#agent-dev-board-flavor).
 
+On a firmware with no D-Bus daemon (`ha_green`) the built-in orchestrator is installed
+without the host-bus mount, since the engine refuses a missing bus source and it
+would never start. Elsewhere its config is unchanged.
+
 ## Two layers
 
 1. **Vagus on the board.** The same release as stock, minus Core. On this

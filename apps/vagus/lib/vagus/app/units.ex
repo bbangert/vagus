@@ -172,8 +172,7 @@ defmodule Vagus.App.Units do
     "startup" => "application",
     "boot" => "auto",
     "init" => false,
-    "host_network" => true,
-    "host_dbus" => true
+    "host_network" => true
   }
 
   # Cold, not a hot tar: a tar of a live cluster's PGDATA is not restorable,
@@ -219,19 +218,35 @@ defmodule Vagus.App.Units do
   A default app's config, embedded so boot needs no store reload. The mqttx
   broker's is the store's own source, under the installed slug as the
   store-install route writes it.
-  """
-  @spec builtin_config(String.t()) :: {:ok, Config.t()} | {:error, term()}
-  def builtin_config("agent_orchestrator"), do: Config.parse(@agent_orchestrator)
-  def builtin_config("agent_memory"), do: Config.parse(@agent_memory)
-  def builtin_config("vagus_memory"), do: Config.parse(@vagus_memory)
-  def builtin_config("vagus"), do: Config.parse(AdminPanel.app_config(), reserved: :allow)
 
-  def builtin_config("core_mqtt" = slug) do
+  The orchestrator asks for the host bus only where the firmware ships a bus
+  (`:dbus?`, default `Vagus.Bluetooth.daemons_present?/0`): the bind is
+  `system: true`, so on a firmware without one the engine would refuse the
+  create and the orchestrator could never start. The answer is a property of
+  the firmware, fixed for a boot and read on the device. It is consulted only
+  when the app is installed (the record keeps what it got) and nothing compares
+  the record with it afterwards, so it cannot make an update appear.
+  """
+  @spec builtin_config(String.t(), keyword()) :: {:ok, Config.t()} | {:error, term()}
+  def builtin_config(slug, opts \\ [])
+
+  def builtin_config("agent_orchestrator", opts) do
+    dbus? = Keyword.get(opts, :dbus?, Vagus.Bluetooth.daemons_present?())
+    Config.parse(Map.put(@agent_orchestrator, "host_dbus", dbus?))
+  end
+
+  def builtin_config("agent_memory", _opts), do: Config.parse(@agent_memory)
+  def builtin_config("vagus_memory", _opts), do: Config.parse(@vagus_memory)
+
+  def builtin_config("vagus", _opts),
+    do: Config.parse(AdminPanel.app_config(), reserved: :allow)
+
+  def builtin_config("core_mqtt" = slug, _opts) do
     with {:ok, config} <- Config.parse(BuiltinFetcher.config(:mqtt)),
          do: {:ok, %{config | slug: slug}}
   end
 
-  def builtin_config(_slug), do: {:error, :no_builtin}
+  def builtin_config(_slug, _opts), do: {:error, :no_builtin}
 
   # The allowlist and not the config's `backend` tag alone: a non-allowlisted
   # `backend: native` config runs in a container, which must still be halted.

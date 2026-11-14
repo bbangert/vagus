@@ -42,6 +42,8 @@ USB WiFi or Bluetooth dongles are not supported.
 With no system bus, Core's container gets no host D-Bus mount, and an app with
 `host_dbus: true` is refused at start (see
 [the divergences entry](divergences.md#core-gets-no-rundbus-bind-on-a-firmware-without-d-bus)).
+On the agent-dev-board flavor the built-in orchestrator is installed without the
+host-bus request for the same reason, so it can still start.
 Nobody has run Core on this board yet, so what it does without a bus is not
 established; expect its Bluetooth integrations to find no adapter. Vagus
 does not serve Core's LED and board settings here either (no
