@@ -193,6 +193,7 @@ defmodule Vagus.Runtime.Engine.Podman do
   def create(%ContainerSpec{} = spec, opts) do
     secrets = for {k, v} <- spec.env || [], k in spec.secret_env, do: {k, v}
     resolv_dir = Host.resolv_dir(opts[:host])
+    devicetree = devicetree_args(spec)
 
     with :ok <- validate(spec),
          :ok <- write_dns_stub(spec, resolv_dir),
@@ -201,7 +202,7 @@ defmodule Vagus.Runtime.Engine.Podman do
              :create,
              run(
                :create,
-               render_create(spec, Host.log_config(opts[:host]), resolv_dir),
+               render_create(spec, Host.log_config(opts[:host]), resolv_dir, devicetree),
                apart([env: secrets] ++ opts),
                @lifecycle_ms
              )
@@ -677,21 +678,24 @@ defmodule Vagus.Runtime.Engine.Podman do
   A `secret_env` entry renders as a bare `--env NAME`, which podman fills
   from its own environment, so the value stays off the argv. The spec must
   have passed `validate/1`.
+
+  `devicetree` is what `devicetree_args/2` resolved for the spec; rendering
+  itself never looks at the host.
   """
   @spec render_create(
           ContainerSpec.t(),
           %{dir: String.t(), max_bytes: pos_integer()},
-          String.t()
+          String.t(),
+          {[ContainerSpec.mount()], [String.t()]}
         ) :: [String.t()]
   def render_create(
         %ContainerSpec{} = spec,
         log \\ Host.log_config(nil),
         resolv_dir \\ Host.resolv_dir(nil),
-        firmware_dir \\ "/sys/firmware"
+        {dt_mounts, dt_security} \\ {[], []}
       ) do
     bridge = bridge_name(spec.network)
     pid_host? = spec.pid_mode == "host"
-    {dt_mounts, dt_security} = devicetree(spec, firmware_dir)
 
     Enum.concat([
       ["create", "--name", spec.name],
@@ -728,46 +732,66 @@ defmodule Vagus.Runtime.Engine.Podman do
     ])
   end
 
-  # Upstream binds only `/device-tree`. `/proc/device-tree` is a symlink into
-  # `/sys/firmware/devicetree/base`, which podman masks along with the rest of
-  # `/sys/firmware`, so it is unmasked and every sibling is masked again:
-  # `efi`, `acpi` and `dmi` stay hidden.
-  #
-  # An entry that cannot be written into a colon-separated `mask=` safely
-  # leaves `/sys/firmware` masked rather than exposed unmasked. A privileged
-  # container has no default masks, and a mask there would only hide.
-  defp devicetree(%ContainerSpec{devicetree: true} = spec, firmware_dir) do
-    base = Path.join(firmware_dir, "devicetree/base")
+  @doc """
+  The extra mounts and `--security-opt` values a `devicetree: true` spec needs
+  on this host, for `render_create/4`.
+
+  Upstream binds only `/device-tree`. `/proc/device-tree` is a symlink into
+  `/sys/firmware/devicetree/base`, which podman masks along with the rest of
+  `/sys/firmware`, so `/sys/firmware` is unmasked and every sibling present now
+  is masked again (podman unmasks per path and cannot unmask just one child).
+
+  A sibling that cannot be written into a colon-separated `mask=` safely, or a
+  listing that fails, leaves `/sys/firmware` masked rather than exposed whole.
+  `:firmware_dir` and `:ls` exist for tests.
+  """
+  @spec devicetree_args(ContainerSpec.t(), keyword()) :: {[ContainerSpec.mount()], [String.t()]}
+  def devicetree_args(spec, opts \\ [])
+
+  def devicetree_args(%ContainerSpec{devicetree: true} = spec, opts) do
+    dir = Keyword.get(opts, :firmware_dir, "/sys/firmware")
+    base = Path.join(dir, "devicetree/base")
 
     if File.dir?(base) do
       mount = %{type: :bind, source: base, target: "/device-tree", read_only: true}
-      {[mount], if(spec.privileged, do: [], else: unmask_firmware(firmware_dir))}
+      {[mount], unmask_firmware(spec.name, dir, Keyword.get(opts, :ls, &File.ls/1))}
     else
-      Logger.info("devicetree requested but #{base} is absent; skipping")
+      Logger.warning(
+        "Vagus.Runtime.Engine.Podman: #{spec.name} asked for the device tree " <>
+          "but #{base} is absent; creating it without"
+      )
+
       {[], []}
     end
   end
 
-  defp devicetree(_spec, _firmware_dir), do: {[], []}
+  def devicetree_args(_spec, _opts), do: {[], []}
 
-  defp unmask_firmware(firmware_dir) do
-    others =
-      case File.ls(firmware_dir) do
-        {:ok, entries} -> entries |> List.delete("devicetree") |> Enum.sort()
-        {:error, _} -> :error
-      end
+  defp unmask_firmware(name, dir, ls) do
+    with {:ok, entries} <- ls.(dir),
+         others = entries |> List.delete("devicetree") |> Enum.sort(),
+         nil <- Enum.find(others, &(not safe_mask_name?(&1))) do
+      ["unmask=/sys/firmware" | mask_opt(others)]
+    else
+      {:error, reason} ->
+        fail_closed(name, "#{dir} could not be listed: #{inspect(reason)}")
 
-    cond do
-      others == :error or not Enum.all?(others, &Regex.match?(~r/\A[A-Za-z0-9._-]+\z/, &1)) ->
-        Logger.warning("cannot enumerate #{firmware_dir} safely; leaving it masked")
-        []
-
-      others == [] ->
-        ["unmask=/sys/firmware"]
-
-      true ->
-        ["unmask=/sys/firmware", "mask=" <> Enum.map_join(others, ":", &"/sys/firmware/#{&1}")]
+      bad when is_binary(bad) ->
+        fail_closed(name, "#{dir} has an entry that cannot be masked safely: #{inspect(bad)}")
     end
+  end
+
+  defp mask_opt([]), do: []
+  defp mask_opt(others), do: ["mask=" <> Enum.map_join(others, ":", &"/sys/firmware/#{&1}")]
+
+  # `:` separates paths inside one `mask=` and `,` would split a `--security-opt`
+  # list; anything outside this set is refused rather than escaped.
+  defp safe_mask_name?(name), do: Regex.match?(~r/\A[A-Za-z0-9._-]+\z/, name)
+
+  defp fail_closed(name, why) do
+    Logger.warning("Vagus.Runtime.Engine.Podman: #{name} keeps /sys/firmware masked: #{why}")
+
+    []
   end
 
   defp env(nil, _secret), do: []

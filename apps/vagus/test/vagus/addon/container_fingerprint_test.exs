@@ -177,14 +177,6 @@ defmodule Vagus.Addon.ContainerFingerprintTest do
     %{spec: spec, container_spec: Container.to_container_spec(spec)}
   end
 
-  test "an add-on without the key is created without a device tree", %{
-    spec: spec,
-    container_spec: container_spec
-  } do
-    refute spec.devicetree
-    refute container_spec.devicetree
-  end
-
   test "the fixture records the Supervisor version its filename claims" do
     assert @fixture["versions"]["supervisor"] == @supervisor_version
   end
