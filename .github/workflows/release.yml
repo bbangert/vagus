@@ -161,6 +161,20 @@ jobs:
           cp "_build/${{ matrix.target }}_prod/nerves/images/vagus_platform.fw" \
             "vagus_${{ matrix.target }}${{ matrix.flavor == 'agent-dev-board' && '-agent' || '' }}.fw"
 
+      # The firmware's platform is what `/os/info` reports as `board`, and the
+      # updater derives the release asset name from it. On ha_green it must
+      # not be `green`, or Core loads its Green hardware integration and calls
+      # `/os/boards/green`, which Vagus does not serve. fwup is the one the
+      # "Install native build deps" step installed and `mix firmware` just ran.
+      - name: Verify firmware platform matches the target
+        run: |
+          fw="vagus_${{ matrix.target }}${{ matrix.flavor == 'agent-dev-board' && '-agent' || '' }}.fw"
+          platform="$(fwup -m -i "$fw" | sed -n 's/^meta-platform=//p')"
+          if [ "$platform" != "${{ matrix.target }}" ]; then
+            echo "$fw has meta-platform '$platform', expected '${{ matrix.target }}'" >&2
+            exit 1
+          fi
+
       # All matrix jobs race to create the release; the loser's create
       # fails ("already exists") and falls through to the upload.
       - name: Upload to GitHub release
