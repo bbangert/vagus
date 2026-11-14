@@ -17,7 +17,7 @@ defmodule Vagus.Core.ContainerTest do
     do:
       Container.to_container_spec(
         version,
-        Keyword.merge([token: "test-token", homeassistant_path: @config], opts)
+        Keyword.merge([token: "test-token", homeassistant_path: @config, dbus?: true], opts)
       )
 
   describe "to_container_spec/2" do
@@ -66,6 +66,28 @@ defmodule Vagus.Core.ContainerTest do
                  %{type: :bind, source: @config, target: "/config", read_only: false}
                ]
              }
+    end
+
+    # A firmware without the Bluetooth daemons never has /run/dbus, and the
+    # engine refuses a bind whose source is missing.
+    test "no host system-bus bind on a firmware without D-Bus; the rest is unchanged" do
+      with_bus = spec()
+      without_bus = spec("2026.7.0", dbus?: false)
+
+      refute Enum.any?(without_bus.mounts, &(&1.target == "/run/dbus"))
+      assert without_bus.mounts == Enum.reject(with_bus.mounts, &(&1.target == "/run/dbus"))
+
+      assert Enum.map(without_bus.mounts, & &1.target) ==
+               ["/dev", "/run/udev", "/run/supervisor", "/config"]
+
+      assert without_bus.labels != with_bus.labels
+    end
+
+    test "the bus default follows the firmware's daemon probe" do
+      spec = Container.to_container_spec("2026.7.0", token: "t", homeassistant_path: @config)
+
+      assert Enum.any?(spec.mounts, &(&1.target == "/run/dbus")) ==
+               Vagus.Bluetooth.daemons_present?()
     end
 
     test "custom tz overrides the UTC default" do
@@ -206,7 +228,14 @@ defmodule Vagus.Core.ContainerTest do
     end
 
     defp fingerprint(version, token, tz, path) do
-      spec = Container.to_container_spec(version, token: token, tz: tz, homeassistant_path: path)
+      spec =
+        Container.to_container_spec(version,
+          token: token,
+          tz: tz,
+          homeassistant_path: path,
+          dbus?: true
+        )
+
       Container.spec_fingerprint(%{spec | dns: nil, dns_search: nil, dns_options: nil})
     end
   end

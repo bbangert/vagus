@@ -14,7 +14,8 @@ defmodule Vagus.App.UnitsTest do
       listening_api_port: 0
     ]
 
-  alias Vagus.App.{Gates, Units}
+  alias Vagus.Addon.Config
+  alias Vagus.App.{Gates, Steps, Units}
   alias Vagus.Core.EventPusher
 
   @arities %{
@@ -196,7 +197,7 @@ defmodule Vagus.App.UnitsTest do
 
   describe "builtin default apps" do
     test "the agent orchestrator parses as a host-network container app" do
-      assert {:ok, config} = Units.builtin_config("agent_orchestrator")
+      assert {:ok, config} = Units.builtin_config("agent_orchestrator", dbus?: true)
 
       assert %{
                slug: "agent_orchestrator",
@@ -214,6 +215,60 @@ defmodule Vagus.App.UnitsTest do
              } = config
 
       refute Units.builtin_native?("agent_orchestrator")
+    end
+
+    test "the orchestrator's config is unchanged on a firmware with the daemons" do
+      assert {:ok, with_bus} = Units.builtin_config("agent_orchestrator", dbus?: true)
+
+      assert {:ok, expected} =
+               Config.parse(%{
+                 "name" => "Agent orchestrator",
+                 "version" => "0.3.0",
+                 "slug" => "agent_orchestrator",
+                 "description" =>
+                   "Claude Code orchestrator for the agent-dev-board, on the board's own node.",
+                 "arch" => ["aarch64"],
+                 "image" => "ghcr.io/bbangert/vagus-agent-orchestrator",
+                 "startup" => "application",
+                 "boot" => "auto",
+                 "init" => false,
+                 "host_network" => true,
+                 "host_dbus" => true
+               })
+
+      assert with_bus == expected
+    end
+
+    test "the orchestrator asks for no host bus on a firmware without D-Bus, and mounts none" do
+      assert {:ok, config} = Units.builtin_config("agent_orchestrator", dbus?: false)
+      refute config.host_dbus
+
+      spec = Steps.build_spec(config, access_token: "t", arch: "aarch64")
+      refute Enum.any?(spec.mounts, &(&1.target == "/run/dbus"))
+    end
+
+    # The orchestrator's firmware-dependent request is its own: any other app
+    # that asks for the bus still gets the `system: true` bind, which the engine
+    # refuses when the bus is not there.
+    test "another app's explicit host_dbus keeps its strict bind, whatever the firmware" do
+      {:ok, config} =
+        Config.parse(%{
+          "name" => "N",
+          "version" => "1",
+          "slug" => "wants_dbus",
+          "description" => "d",
+          "arch" => ["aarch64"],
+          "image" => "x/y",
+          "host_dbus" => true
+        })
+
+      spec = Steps.build_spec(config, access_token: "t", arch: "aarch64")
+      assert %{system: true} = Enum.find(spec.mounts, &(&1.target == "/run/dbus"))
+    end
+
+    test "the default probe follows the firmware's daemons" do
+      assert {:ok, config} = Units.builtin_config("agent_orchestrator")
+      assert config.host_dbus == Vagus.Bluetooth.daemons_present?()
     end
 
     test "the agent memory parses as a cold-backup bridged container app" do

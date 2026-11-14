@@ -22,8 +22,8 @@ defmodule Vagus.API.StaticData do
   `[]`, never `nil`.
 
   `machine` is the one board-varying value here and is read from config
-  (`config :vagus, :machine`) rather than pinned — `"raspberrypi3-64"` on
-  rpi3_64, `"generic-aarch64"` on dragon_q6a.
+  (`config :vagus, :machine`) rather than pinned; each `config/<target>.exs`
+  sets it.
 
   `arch/0` and `machine/0` are public (not just used internally by
   `root_info/0`/`core_info/0`) because `Vagus.Addon.Availability` (phase 6
@@ -43,9 +43,8 @@ defmodule Vagus.API.StaticData do
   def arch, do: @arch
 
   # The board identity, read at runtime (not a compile-time attribute) so
-  # each target — and :host/:test — sets it independently in config. See
-  # config/rpi3_64.exs ("raspberrypi3-64") and config/dragon_q6a.exs
-  # ("generic-aarch64"); both values are real HAOS machines, which matters
+  # each target — and :host/:test — sets it independently in config
+  # (config/<target>.exs). The values are real HAOS machines, which matters
   # because Supervisor validates add-on `machine:` allowlists against a
   # fixed regex.
   #
@@ -53,7 +52,7 @@ defmodule Vagus.API.StaticData do
   # let a new board that forgets `config :vagus, :machine` silently report
   # some other board's identity to Core — the exact failure this indirection
   # exists to prevent. Every config path that can reach this code
-  # (rpi3_64, dragon_q6a, host, test) sets the key, so raising here means a
+  # (every target, host, test) sets the key, so raising here means a
   # genuine misconfiguration, not a missing convenience.
   @doc "This device's board/machine identity. See the moduledoc."
   @spec machine() :: String.t()
