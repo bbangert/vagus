@@ -223,24 +223,28 @@ divergence is still real" assertion. They are ledgered here instead.
 
 Upstream honours the key with one read-only bind of
 `/sys/firmware/devicetree/base` at `/device-tree`. Vagus does that and
-additionally unmasks `/sys/firmware/devicetree`, so that `/proc/device-tree/*`
-resolves inside the app: it is a symlink into `/sys/firmware/devicetree/base`,
-which the engine masks by default, and software that detects its SoC there
-(Rockchip's MPP reads `/proc/device-tree/compatible`) finds nothing without it.
+additionally unmasks `/sys/firmware` and masks every sibling of `devicetree`
+present when the container is created, so that `/proc/device-tree/*` resolves
+inside the app. It is a symlink into `/sys/firmware/devicetree/base`, which the
+engine masks by default, and the bind alone does not make it resolve. Software
+that detects its SoC there (Rockchip's MPP reads `/proc/device-tree/compatible`)
+finds nothing without it.
 
-Unmasking is per directory. The engine masks `/sys/firmware` as a whole, so
-Vagus unmasks it and masks every other entry of the host's `/sys/firmware`
-again (`efi`, `acpi`, `dmi`, `fdt`, ...), listed when the container is created.
-Only `devicetree` becomes visible. An entry whose name cannot be written safely
-into the engine's colon-separated option leaves `/sys/firmware` masked rather
-than exposed. A host without `/sys/firmware/devicetree/base` gets neither the
-bind nor the unmask, and one log line. An app without the key is created
-exactly as before.
+The engine cannot unmask a single child of a masked directory, hence the
+unmask and re-mask pair (`efi`, `acpi`, `dmi`, `fdt`, ...). The siblings' names
+remain visible, as empty read-only directories (an empty file for `fdt`), but
+nothing behind them is. An entry that appears under `/sys/firmware` after the
+container is created is not masked; it stays visible until the app's next
+start, which creates the container again. An entry whose name cannot be written
+safely into the engine's colon-separated option, or a listing that fails, leaves
+`/sys/firmware` masked, with a warning in the log. A host without
+`/sys/firmware/devicetree/base` gets neither the bind nor the unmask, also with
+a warning. An app without the key is created exactly as before.
 
-What an app with the key can now read: the board model and `compatible`
-strings, the serial number, the factory MAC addresses, and the kernel command
-line (`/chosen/bootargs`), plus whatever else the firmware put in the tree.
-The exposure is opt-in per app.
+The content is the same device tree upstream already exposes at `/device-tree`,
+now also reachable at its kernel path: model, `compatible`, serial number,
+factory MAC addresses and whatever else the firmware put there. The exposure is
+opt-in per app.
 
 ---
 
