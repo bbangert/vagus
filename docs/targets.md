@@ -1,20 +1,20 @@
 # Build targets
 
-Vagus builds for three Nerves targets. **All three are first-class** —
-`dragon_q6a` and `rubik_pi3` were added alongside `rpi3_64`, not as
-replacements for it.
+Vagus builds for several Nerves targets. **All are first-class** — the newer
+boards were added alongside `rpi3_64`, not as replacements for it.
 
 | Target | Board | Kernel | Swap | Boot chain | `machine` reported to Core |
 | --- | --- | --- | --- | --- | --- |
 | `rpi3_64` | Raspberry Pi 3 A+/B/B+ (64-bit) | 6.18 | zram (SD root, `mmcblk*`) | bootcode → `config.txt` → A/B | `raspberrypi3-64` |
 | `dragon_q6a` | Radxa Dragon Q6A (QCS6490) | 7.2.10 | `/data` swapfile + zswap (UFS/NVMe root) | EDK2 UEFI → GRUB arm64-efi → A/B | `generic-aarch64` |
 | `rubik_pi3` | Thundercomm Rubik Pi 3 (QCS6490) | 7.2.10 (mainline) | `/data` swapfile + zswap (UFS root) | PBL → XBL (SPI NOR) → EDK2 UEFI → GRUB (ESP on UFS) → kernel | `generic-aarch64` |
+| `ha_green` | Home Assistant Green (RK3566) | 6.1 (Rockchip vendor) | zram (eMMC root, `mmcblk*`) | stock first stage → U-Boot (SD or eMMC) → A/B; see [ha-green.md](ha-green.md) | `green` |
 
 Swap is configured at boot by `Vagus.Host.Swap` based on the root medium: `mmcblk*` roots get zram (sized at 50% of RAM with LZ4 compression and `vm.swappiness=150`/`vm.page-cluster=0`), while `sd*`/`nvme*`/`vd*` roots use `/data/swapfile` (33% of RAM, clamped to 1–4 GiB, with zswap and `vm.swappiness=10`). The kernel builds both backends on every target but activates neither by default, so a board running a vagus release without `Vagus.Host.Swap` has no swap at all. The swapfile counts toward `/host/disks/default/usage` (the same `df -k /data` figure as on HAOS), but never appears in add-on backups — they tar per-add-on data directories, not `/data` wholesale.
 
 Logs survive a reboot on every target and flavor: alongside the in-RAM RingLogger, `Vagus.Host.DurableLog` writes `info` and above to `/data/vagus/log/vagus.log`, one line per event (`2026-10-23T05:21:23.456Z [info] module=Vagus.Foo message`, kernel and syslog lines included). It rotates at 2 MB into at most five gzipped files (`vagus.log.0.gz` is the newest), so it never holds more than 12 MB even uncompressed; the cap is small because rpi3_64 boards write it to an SD card. It syncs to disk every second, so a power cut loses at most the last second. To read it over ssh, run `Vagus.Host.DurableLog.tail(200)` for `{:ok, lines}`, the last 200 lines of the current file; the rotated files are plain gzip. If `/data` cannot be written, the board logs one warning and runs without the file. The board's Logger level is `info` (debug lines are not kept, in RingLogger either), so crash reports do not carry the crashed process's state onto `/data`; `Logger.configure(level: :debug)` turns debug back on until the next reboot, and with it the state in crash reports.
 
-All three are aarch64 on the same toolchain, so `arch` is `aarch64`
+All of them are aarch64 on the same toolchain, so `arch` is `aarch64`
 everywhere and Core runs the generic `ghcr.io/home-assistant/home-assistant`
 image on all of them (no per-machine image).
 
@@ -32,7 +32,7 @@ happens automatically. The Supervisor API itself now listens only on
 ## Building
 
 ```sh
-mise run firmware -- rpi3_64        # or: dragon_q6a, rubik_pi3
+mise run firmware -- rpi3_64        # or: dragon_q6a, rubik_pi3, ha_green
 mise run mix-for -- dragon_q6a deps.get
 mise run test                       # host tests
 ```
@@ -109,6 +109,7 @@ Everything else (`/data/vagus/*` paths, `:engine`, `:addon_data_root`,
 | `rpi3_64` | `usb0` (VintageNetDirect, USB gadget), `eth0`, `wlan0` |
 | `dragon_q6a` | `eth0` (RTL8125 2.5 GbE), `wlan0` (onboard AIC8800D80) — **no `usb0`**: the USB-C port is power-only; the OTG-capable controller (`usb_1`, the blue USB-A 3.x port, also the EDL port) is wired `dr_mode = "host"`, and a gadget there would cost the only SuperSpeed host port |
 | `rubik_pi3` | `eth0` (USB3-attached ASIX AX88179B, `ax88179_178a`, behind a UPD720201 USB3 controller), `wlan0` (AMPAK AP6256/BCM43456-class SDIO, `brcmfmac`) — **no `usb0`**, the board has no USB gadget controller |
+| `ha_green` | `eth0` only — no `wlan0` (no WiFi) and no `usb0` (host-only USB); see [ha-green.md](ha-green.md) |
 
 ### Why `generic-aarch64` for the Q6A and the Rubik Pi 3
 
@@ -133,6 +134,10 @@ loudly instead of silently claiming to be a Raspberry Pi.
 rationale — it boots through the same EDK2 UEFI → GRUB arm64-efi chain, just
 with XBL in SPI NOR ahead of EDK2 and the ESP living on UFS rather than
 eMMC/NVMe.
+
+`ha_green` reports `green`, the machine HAOS itself names this board (it is in
+Supervisor's machine regex and `arch.json`). Its `/os/info` board is still not
+`green`: see [ha-green.md](ha-green.md).
 
 ## dragon_q6a: what is device-proven
 
@@ -217,8 +222,9 @@ VAGUS_FLAVOR=agent-dev-board NERVES_FW_MISC=agent-dev-board \
   mise run firmware -- dragon_q6a   # or rubik_pi3
 ```
 
-CI publishes `vagus_dragon_q6a-agent.fw` and `vagus_rubik_pi3-agent.fw` next
-to the stock assets; rpi3_64 is not built with the flavor.
+CI publishes `vagus_dragon_q6a-agent.fw`, `vagus_rubik_pi3-agent.fw`,
+`vagus_rock_4d-agent.fw` and `vagus_ha_green-agent.fw` next to the stock
+assets; rpi3_64 is not built with the flavor.
 
 OTA: the updater matches `vagus_<platform>-agent.fw` when running the flavor,
 so flavors never cross over. Returning a board to stock is a manual `fwup`
