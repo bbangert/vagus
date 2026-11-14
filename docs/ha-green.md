@@ -28,7 +28,7 @@ What Vagus does differently on this board:
 Install is an SD-booted Vagus image plus one command on the board, and
 recovery needs no serial console. The stock first-stage loader stays untouched,
 and Vagus never writes the SPI NOR or eMMC LBA 64-16383. Follow the
-[install guide](https://github.com/bbangert/nerves_system_vagus/blob/v0.10.1/docs/ha-green-install.md)
+[install guide](https://github.com/bbangert/nerves_system_vagus/blob/v0.10.2/docs/ha-green-install.md)
 in the system repository, which covers installing, returning to Home Assistant
 OS and what is never written.
 
