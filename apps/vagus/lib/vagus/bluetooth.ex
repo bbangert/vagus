@@ -82,18 +82,26 @@ defmodule Vagus.Bluetooth do
       |> Keyword.put_new(:dbus_daemon_path, @default_dbus_daemon)
       |> Keyword.put_new(:bluetoothd_path, @default_bluetoothd)
 
-    dbus_daemon = Keyword.fetch!(opts, :dbus_daemon_path)
-    bluetoothd = Keyword.fetch!(opts, :bluetoothd_path)
-
-    if File.exists?(dbus_daemon) and File.exists?(bluetoothd) do
+    if daemons_present?(opts) do
       Supervisor.start_link(__MODULE__, opts, name: Keyword.get(opts, :name, __MODULE__))
     else
       Logger.warning(
-        "Vagus.Bluetooth: #{dbus_daemon} or #{bluetoothd} missing; Bluetooth daemons not started"
+        "Vagus.Bluetooth: #{opts[:dbus_daemon_path]} or #{opts[:bluetoothd_path]} missing; Bluetooth daemons not started"
       )
 
       :ignore
     end
+  end
+
+  @doc """
+  Whether the firmware ships both daemons, which is what decides that this
+  stack starts and so that a system bus appears at `/run/dbus`. Takes the same
+  `:dbus_daemon_path`/`:bluetoothd_path` options as `start_link/1`.
+  """
+  @spec daemons_present?(keyword()) :: boolean()
+  def daemons_present?(opts \\ []) do
+    File.exists?(Keyword.get(opts, :dbus_daemon_path, @default_dbus_daemon)) and
+      File.exists?(Keyword.get(opts, :bluetoothd_path, @default_bluetoothd))
   end
 
   # A string segment: aliasing `Stack` here would nest the full module name

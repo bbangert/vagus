@@ -161,6 +161,16 @@ defmodule Vagus.BluetoothTest do
     end
   end
 
+  describe "daemons_present?/1" do
+    test "needs both binaries" do
+      here = __ENV__.file
+
+      assert Bluetooth.daemons_present?(dbus_daemon_path: here, bluetoothd_path: here)
+      refute Bluetooth.daemons_present?(dbus_daemon_path: here, bluetoothd_path: "/nonexistent")
+      refute Bluetooth.daemons_present?(dbus_daemon_path: "/nonexistent", bluetoothd_path: here)
+    end
+  end
+
   describe "start_link/1" do
     import ExUnit.CaptureLog
 

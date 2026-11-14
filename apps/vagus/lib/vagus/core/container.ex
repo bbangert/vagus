@@ -137,6 +137,8 @@ defmodule Vagus.Core.Container do
       so tests never touch the real persisted/on-disk token.
     * `:tz` - the `TZ` env value. Defaults to `"UTC"`.
     * `:homeassistant_path` - the /config bind source (see `config_path/1`).
+    * `:dbus?` - whether Core gets the host system-bus bind. Defaults to
+      `Vagus.Bluetooth.daemons_present?/0`.
   """
   @spec to_container_spec(String.t(), keyword()) :: ContainerSpec.t()
   def to_container_spec(version, opts \\ []) when is_binary(version) do
@@ -275,24 +277,38 @@ defmodule Vagus.Core.Container do
     ]
   end
 
+  # `/run/dbus` is made only by `Vagus.Bluetooth`, so a firmware without the
+  # daemons never has it, and the engine refuses a bind whose source is
+  # missing. Keyed on the firmware rather than on whether the directory exists
+  # right now, which would race the Bluetooth stack at boot and could drop the
+  # bind until the next recreate. Apps with `host_dbus: true` keep their bind
+  # and fail at create on such a firmware, by design (see `Vagus.App.Steps`).
+  defp dbus_mount(opts) do
+    if Keyword.get(opts, :dbus?, Vagus.Bluetooth.daemons_present?()),
+      do: %{type: :bind, source: "/run/dbus", target: "/run/dbus", read_only: true}
+  end
+
   defp mounts(opts) do
-    [
-      # ro-NON-recursive: recursively read-only would also lock down
-      # anything bind-mounted *under* /dev (e.g. bluetooth device nodes
-      # attached after container start) — load-bearing for bluetooth.
-      %{
-        type: :bind,
-        source: "/dev",
-        target: "/dev",
-        read_only: true,
-        read_only_non_recursive: true
-      },
-      %{type: :bind, source: "/run/dbus", target: "/run/dbus", read_only: true},
-      %{type: :bind, source: "/run/udev", target: "/run/udev", read_only: true},
-      # Writable: Core creates its Supervisor socket inside this directory
-      # (see the moduledoc's "The Supervisor socket" section).
-      %{type: :bind, source: @socket_dir, target: @socket_dir, read_only: false},
-      %{type: :bind, source: config_path(opts), target: "/config", read_only: false}
-    ]
+    Enum.reject(
+      [
+        # ro-NON-recursive: recursively read-only would also lock down
+        # anything bind-mounted *under* /dev (e.g. bluetooth device nodes
+        # attached after container start) — load-bearing for bluetooth.
+        %{
+          type: :bind,
+          source: "/dev",
+          target: "/dev",
+          read_only: true,
+          read_only_non_recursive: true
+        },
+        dbus_mount(opts),
+        %{type: :bind, source: "/run/udev", target: "/run/udev", read_only: true},
+        # Writable: Core creates its Supervisor socket inside this directory
+        # (see the moduledoc's "The Supervisor socket" section).
+        %{type: :bind, source: @socket_dir, target: @socket_dir, read_only: false},
+        %{type: :bind, source: config_path(opts), target: "/config", read_only: false}
+      ],
+      &is_nil/1
+    )
   end
 end

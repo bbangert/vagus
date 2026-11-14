@@ -27,6 +27,7 @@ defmodule Vagus.Runtime.Engine.PodmanRenderTest do
       CoreContainer.to_container_spec("2026.7.0",
         token: "t",
         tz: "UTC",
+        dbus?: true,
         homeassistant_path: "/root/vagus/core/config"
       )
 
