@@ -249,6 +249,106 @@ defmodule Vagus.Runtime.Engine.PodmanRenderTest do
                ]
   end
 
+  describe "devicetree" do
+    import ExUnit.CaptureLog
+
+    @describetag :tmp_dir
+    setup %{tmp_dir: dir} do
+      File.mkdir_p!(Path.join(dir, "devicetree/base"))
+      %{fw: dir}
+    end
+
+    defp render_dt(fields, fw) do
+      spec = struct!(%ContainerSpec{name: "n", image: "i", network: :host}, fields)
+      Podman.render_create(spec, @log, "/run/resolv", fw)
+    end
+
+    defp bind(fw), do: ["--mount", "type=bind,src=#{fw}/devicetree/base,dst=/device-tree,ro=true"]
+
+    defp security_opts(argv),
+      do: for({"--security-opt", v} <- Enum.zip(argv, tl(argv)), do: v)
+
+    defp seed(fw, names), do: Enum.each(names, &File.mkdir_p!(Path.join(fw, &1)))
+
+    test "unset renders exactly what it did before, whatever the host has", %{fw: fw} do
+      seed(fw, ~w(efi acpi dmi))
+      base = render_dt([security_opt: ["seccomp=unconfined"]], fw)
+
+      assert render_dt([security_opt: ["seccomp=unconfined"], devicetree: false], fw) == base
+      assert render_dt([security_opt: ["seccomp=unconfined"], devicetree: nil], fw) == base
+      refute Enum.any?(base, &(&1 =~ "device-tree" or &1 =~ "mask="))
+    end
+
+    test "set binds the base read-only, unmasks /sys/firmware and re-masks the rest", %{fw: fw} do
+      seed(fw, ~w(efi acpi dmi fdt))
+      argv = render_dt([devicetree: true, security_opt: ["seccomp=unconfined"]], fw)
+
+      assert bind(fw) -- argv == []
+
+      assert security_opts(argv) == [
+               "seccomp=unconfined",
+               "unmask=/sys/firmware",
+               "mask=/sys/firmware/acpi:/sys/firmware/dmi:/sys/firmware/efi:/sys/firmware/fdt"
+             ]
+    end
+
+    test "devicetree itself is never masked", %{fw: fw} do
+      seed(fw, ~w(efi))
+      argv = render_dt([devicetree: true], fw)
+      assert "mask=/sys/firmware/efi" in argv
+      refute Enum.any?(argv, &(&1 =~ "mask=" and &1 =~ "devicetree"))
+    end
+
+    test "nothing else in /sys/firmware means unmask alone", %{fw: fw} do
+      argv = render_dt([devicetree: true], fw)
+      assert "unmask=/sys/firmware" in argv
+      refute Enum.any?(argv, &String.starts_with?(&1, "mask="))
+    end
+
+    test "a host without a device tree gets no mount, no unmask and one log line", %{fw: fw} do
+      File.rm_rf!(Path.join(fw, "devicetree"))
+      seed(fw, ~w(efi))
+      plain = render_dt([], fw)
+
+      log =
+        capture_log(fn ->
+          assert render_dt([devicetree: true], fw) == plain
+        end)
+
+      assert length(String.split(log, "devicetree requested", trim: false)) == 2
+    end
+
+    test "an entry that cannot sit in a colon-separated mask leaves /sys/firmware masked", %{
+      fw: fw
+    } do
+      seed(fw, ["efi", "x:/proc/kcore"])
+
+      log =
+        capture_log(fn ->
+          argv = render_dt([devicetree: true], fw)
+          assert bind(fw) -- argv == []
+          refute Enum.any?(argv, &(&1 =~ "mask="))
+        end)
+
+      assert log =~ "leaving it masked"
+    end
+
+    test "a privileged container gets the bind but no mask options", %{fw: fw} do
+      seed(fw, ~w(efi))
+      argv = render_dt([devicetree: true, privileged: true], fw)
+      assert bind(fw) -- argv == []
+      refute Enum.any?(argv, &(&1 =~ "mask="))
+    end
+
+    test "an app config with devicetree: true renders through the app backend", %{fw: fw} do
+      seed(fw, ~w(efi))
+      spec = AppContainer.to_container_spec(%Spec{name: "n", image: "i", devicetree: true})
+      argv = Podman.render_create(spec, @log, "/run/resolv", fw)
+      assert bind(fw) -- argv == []
+      assert "unmask=/sys/firmware" in argv
+    end
+  end
+
   describe "single fields" do
     defp render(fields) do
       Podman.render_create(

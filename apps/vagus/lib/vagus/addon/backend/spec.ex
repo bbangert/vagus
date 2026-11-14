@@ -57,6 +57,7 @@ defmodule Vagus.Addon.Backend.Spec do
           ports: %{optional(String.t()) => String.t() | non_neg_integer() | nil},
           pid_mode: String.t() | nil,
           uts_mode: String.t() | nil,
+          devicetree: boolean(),
           labels: %{optional(String.t()) => String.t()},
           platform: String.t() | nil
         }
@@ -84,6 +85,7 @@ defmodule Vagus.Addon.Backend.Spec do
             ports: %{},
             pid_mode: nil,
             uts_mode: nil,
+            devicetree: false,
             labels: %{},
             platform: nil
 end

@@ -105,6 +105,9 @@ defmodule Vagus.Addon.ContainerFingerprintTest do
   # the fixture is a real Supervisor add-on, which has no `dsp:`, so the spec
   # under test never declares them and the "still real" assertion below would
   # fail on the entry. They are ledgered in docs/divergences.md instead.
+  # `devicetree: true` is the same: upstream's `/device-tree` bind and Vagus's
+  # unmask of `/sys/firmware` are in the engine's create args, not the spec's
+  # mounts, and the fixture's add-on does not set the key.
   @vagus_only_mounts %{}
 
   @accepted_mounts %{
@@ -172,6 +175,14 @@ defmodule Vagus.Addon.ContainerFingerprintTest do
       )
 
     %{spec: spec, container_spec: Container.to_container_spec(spec)}
+  end
+
+  test "an add-on without the key is created without a device tree", %{
+    spec: spec,
+    container_spec: container_spec
+  } do
+    refute spec.devicetree
+    refute container_spec.devicetree
   end
 
   test "the fixture records the Supervisor version its filename claims" do

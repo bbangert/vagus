@@ -686,10 +686,12 @@ defmodule Vagus.Runtime.Engine.Podman do
   def render_create(
         %ContainerSpec{} = spec,
         log \\ Host.log_config(nil),
-        resolv_dir \\ Host.resolv_dir(nil)
+        resolv_dir \\ Host.resolv_dir(nil),
+        firmware_dir \\ "/sys/firmware"
       ) do
     bridge = bridge_name(spec.network)
     pid_host? = spec.pid_mode == "host"
+    {dt_mounts, dt_security} = devicetree(spec, firmware_dir)
 
     Enum.concat([
       ["create", "--name", spec.name],
@@ -705,7 +707,7 @@ defmodule Vagus.Runtime.Engine.Podman do
       if(bridge, do: flag("--ip", spec.ip), else: []),
       dns(bridge, spec),
       hosts(bridge, spec.extra_hosts),
-      Enum.flat_map(spec.mounts || [], &["--mount", mount(&1)]),
+      Enum.flat_map((spec.mounts || []) ++ dt_mounts, &["--mount", mount(&1)]),
       resolv_conf(spec, resolv_dir),
       Enum.flat_map(Enum.sort(spec.tmpfs || %{}), fn {dst, o} ->
         ["--tmpfs", "#{dst}:#{tmpfs(o)}"]
@@ -717,12 +719,55 @@ defmodule Vagus.Runtime.Engine.Podman do
       bool("--init", spec.init == true and not pid_host?),
       flag("--oom-score-adj", spec.oom_score_adj && to_string(spec.oom_score_adj)),
       many("--security-opt", spec.security_opt),
+      many("--security-opt", dt_security),
       flag("--restart", restart(spec.restart)),
       if(bridge, do: publish(spec.ports), else: []),
       flag("--pid", spec.pid_mode),
       flag("--uts", spec.uts_mode),
       ["--", spec.image | spec.cmd || []]
     ])
+  end
+
+  # Upstream binds only `/device-tree`. `/proc/device-tree` is a symlink into
+  # `/sys/firmware/devicetree/base`, which podman masks along with the rest of
+  # `/sys/firmware`, so it is unmasked and every sibling is masked again:
+  # `efi`, `acpi` and `dmi` stay hidden.
+  #
+  # An entry that cannot be written into a colon-separated `mask=` safely
+  # leaves `/sys/firmware` masked rather than exposed unmasked. A privileged
+  # container has no default masks, and a mask there would only hide.
+  defp devicetree(%ContainerSpec{devicetree: true} = spec, firmware_dir) do
+    base = Path.join(firmware_dir, "devicetree/base")
+
+    if File.dir?(base) do
+      mount = %{type: :bind, source: base, target: "/device-tree", read_only: true}
+      {[mount], if(spec.privileged, do: [], else: unmask_firmware(firmware_dir))}
+    else
+      Logger.info("devicetree requested but #{base} is absent; skipping")
+      {[], []}
+    end
+  end
+
+  defp devicetree(_spec, _firmware_dir), do: {[], []}
+
+  defp unmask_firmware(firmware_dir) do
+    others =
+      case File.ls(firmware_dir) do
+        {:ok, entries} -> entries |> List.delete("devicetree") |> Enum.sort()
+        {:error, _} -> :error
+      end
+
+    cond do
+      others == :error or not Enum.all?(others, &Regex.match?(~r/\A[A-Za-z0-9._-]+\z/, &1)) ->
+        Logger.warning("cannot enumerate #{firmware_dir} safely; leaving it masked")
+        []
+
+      others == [] ->
+        ["unmask=/sys/firmware"]
+
+      true ->
+        ["unmask=/sys/firmware", "mask=" <> Enum.map_join(others, ":", &"/sys/firmware/#{&1}")]
+    end
   end
 
   defp env(nil, _secret), do: []

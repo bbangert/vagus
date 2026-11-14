@@ -601,6 +601,7 @@ defmodule Vagus.App.Steps do
       ports: if(host?, do: %{}, else: Ports.effective(config, Keyword.get(opts, :ports, %{}))),
       pid_mode: if(not protected and config.host_pid, do: "host", else: nil),
       uts_mode: if(config.host_uts, do: "host", else: nil),
+      devicetree: config.devicetree,
       platform: platform(arch)
     }
     |> memory_spec(config, data_root)

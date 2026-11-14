@@ -359,6 +359,11 @@ defmodule Vagus.App.StepsTest do
       assert unprotected.pid_mode == "host"
     end
 
+    test "devicetree reaches the spec only when the config sets it" do
+      refute Steps.build_spec(device_config([]), arch: "amd64").devicetree
+      assert Steps.build_spec(device_config(devicetree: true), arch: "amd64").devicetree
+    end
+
     test "dsp: false declares neither dsp mount", %{spec: s} do
       refute Enum.any?(s.mounts, &(&1.target in ["/usr/lib/dsp", "/usr/lib/rfsa/adsp"]))
     end
