@@ -2,8 +2,9 @@ name: release
 
 # Tag-driven firmware release: pushing a bare-semver tag (e.g. `0.4.0`)
 # builds `mix firmware` for every hardware target and attaches the .fw
-# files to the GitHub release for that tag. These assets are what
-# `Vagus.OS.Updater` (nerves_github_updater) feeds on — asset names are
+# files to the GitHub release for that tag, which stays a draft until every
+# build has uploaded. These assets are what `Vagus.OS.Updater`
+# (nerves_github_updater) feeds on — asset names are
 # `vagus_<target>.fw` and MUST stay in sync with its `:asset_matcher`. The
 # `agent-dev-board` flavor (dragon_q6a, rubik_pi3, rock_4d, ha_green) ships as
 # `vagus_<target>-agent.fw`; the updater matches that suffix only when
@@ -59,17 +60,17 @@ env:
 
 jobs:
   # Created once, ahead of the matrix: when every build job tried to create
-  # it, two could both succeed and leave two releases for one tag, and
-  # `releases/latest` then served the empty one. Checking first keeps a
-  # workflow re-run from creating another.
+  # it, two could both succeed and leave two releases for one tag. A draft,
+  # so `releases/latest` never serves a release before its firmware is
+  # uploaded. Checking first keeps a workflow re-run from creating another.
   release:
     runs-on: ubuntu-24.04
     steps:
-      - name: Create GitHub release
+      - name: Create draft GitHub release
         run: |
           gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 ||
             gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
-              --verify-tag --title "$GITHUB_REF_NAME" --generate-notes
+              --draft --verify-tag --title "$GITHUB_REF_NAME" --generate-notes
 
   build:
     needs: release
@@ -193,3 +194,12 @@ jobs:
         run: |
           gh release upload "$GITHUB_REF_NAME" \
             "vagus_${{ matrix.target }}${{ matrix.flavor == 'agent-dev-board' && '-agent' || '' }}.fw" --clobber
+
+  # A failed matrix job skips this, leaving the release a draft that no board
+  # sees; re-running the failed jobs then lets this one publish it.
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Publish the release
+        run: gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false
