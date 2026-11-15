@@ -64,15 +64,47 @@ The numbering is the same with no monitor attached; only `/dev/fb0` is absent.
 
 The kernel provides drivers and device nodes only. The userspace pieces
 (`librknnrt`, the Mali userspace driver, MPP and RGA libraries) must be in the
-app's image. As of the system's README, no inference job, GPU context, video
-encode or decode, or RGA job has been run on the board: the nodes exist and the
-drivers probe, and nothing more is claimed.
+app's image.
+
+Every accelerator below was exercised from inside an app container, with the
+public [`rockchip_probe`](https://github.com/bbangert/ha-bench-addons/tree/main/rockchip_probe)
+bench app installed from the app store, on a board running kernel 6.1.172 with
+HDMI unplugged. The sizes were 720p and 1080p test inputs; these are capability
+results, not general performance claims.
+
+| Accelerator | Measured from an app |
+| --- | --- |
+| NPU | RKNPU driver 0.9.8 with `librknnrt` / `rknn-toolkit-lite2` 2.3.2. Rockchip's resnet18 example returns the reference top-5, about 70 inferences per second in a loop. `/proc/rknpu/load` is readable in the container. A separate bench with INT8 640x640 detection models through the Python lite API (inference call only, no post-processing) took about 59 ms (YOLOv8n), 105 ms (YOLOv8s), 85 ms (YOLO11n) and 140 ms (YOLO11s) |
+| GPU | Mali-G52, kernel driver and userspace library both g29p1. OpenGL ES 3.2 works through the GBM platform on `/dev/dri/card0` with no display connected: complete FBO, exact pixel read-back |
+| Video (MPP 1.1.0) | Hardware H.264 decode (`h264d_vdpu34x`) and H.265 decode (`h265d_vdpu34x`) of 720p clips, all frames; hardware H.264 encode (`hal_h264e_vepu541`). CMA free memory did not move during 720p decode and encode |
+| RGA (RGA2, librga 1.10.5) | With dma-buf buffers: copy, resize, NV12 to RGB888 (BT.601 limited and full), crop, rotate, flip and fill all match a CPU reference. 1080p NV12 to 640x640 RGB888 with padding takes about 5 ms; 500 consecutive jobs gave identical verified output. Driver limits: input up to 8192x8192, output up to 4096x4096, scale 1/16 to 16 |
+
+Not measured: the probe app after a boot with no display attached (it ran with
+HDMI unplugged from a running board), the `agent-dev-board` flavor on this
+board, sustained or thermal behaviour (runs were under a minute, at about
+30 C), the accuracy of quantized detection models, and the decoder-to-RGA
+zero-copy handoff.
+
+### What a consumer must do
+
+- **GPU: use the GBM platform on `/dev/dri/card0`.** The surfaceless EGL platform
+  fails with this library, and the GBM path fails when the app has only the
+  render node, so the app must list the card node.
+- **RGA: pass dma-buf fds.** The kernel driver refuses buffers passed as
+  ordinary user memory (a virtual address): it requires user memory to map as
+  one contiguous segment, which pageable memory does not. This is a property of
+  the vendor RGA2 driver on RK356x, not of this board's memory layout. Use
+  dma-heap allocations or the decoder's frame buffers.
+- **Video and NPU: set `devicetree: true`** (next section).
 
 ### `devicetree: true`
 
-Software that detects the SoC through `/proc/device-tree` (Rockchip's MPP reads
-`compatible` there) needs `devicetree: true` in the app's config. Without it the
-path does not resolve in the container. Vagus does slightly more than upstream
+Software that detects the SoC through `/proc/device-tree` needs
+`devicetree: true` in the app's config. Without it the path does not resolve in
+the container. Rockchip's MPP reads only `/proc/device-tree/compatible`, so
+without the key it cannot identify the SoC and registers no decoder or encoder,
+and the RKNN runtime fails to initialise. The GPU and RGA work without it.
+Vagus does slightly more than upstream
 to make it work; see
 [the divergences entry](divergences.md#devicetree-true-also-exposes-sysfirmwaredevicetree).
 
@@ -87,5 +119,5 @@ must say so.
 
 The RGA2 core has no IOMMU and reaches only the first 4 GiB of RAM. To keep
 every buffer addressable the system keeps usable RAM below 4 GiB physical, which
-costs 256 MiB: about 3.58 GiB of the 4 GB is usable. No scaling job has been run
-yet, so RGA scaling is unproven.
+costs 256 MiB: about 3.58 GiB of the 4 GB is usable. No RGA job was refused for
+its address.
