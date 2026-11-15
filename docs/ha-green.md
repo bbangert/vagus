@@ -90,9 +90,10 @@ zero-copy handoff.
 - **GPU: use the GBM platform on `/dev/dri/card0`.** The surfaceless EGL platform
   fails with this library, and the GBM path fails when the app has only the
   render node, so the app must list the card node.
-- **RGA: pass dma-buf fds.** The kernel driver refuses buffers passed as
-  ordinary user memory (a virtual address): it requires user memory to map as
-  one contiguous segment, which pageable memory does not. This is a property of
+- **RGA: pass dma-buf fds.** The kernel driver refused the tested
+  buffers passed as user memory (a virtual address): it requires user memory to
+  map as a single contiguous segment, which ordinary page-backed allocations do
+  not. This is a property of
   the vendor RGA2 driver on RK356x, not of this board's memory layout. Use
   dma-heap allocations or the decoder's frame buffers.
 - **Video and NPU: set `devicetree: true`** (next section).
