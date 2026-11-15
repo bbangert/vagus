@@ -58,7 +58,21 @@ env:
   NERVES_AUTHORIZED_KEYS: ""
 
 jobs:
+  # Created once, ahead of the matrix: when every build job tried to create
+  # it, two could both succeed and leave two releases for one tag, and
+  # `releases/latest` then served the empty one. Checking first keeps a
+  # workflow re-run from creating another.
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Create GitHub release
+        run: |
+          gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 ||
+            gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+              --verify-tag --title "$GITHUB_REF_NAME" --generate-notes
+
   build:
+    needs: release
     name: ${{ matrix.target }}${{ matrix.flavor && format(' ({0})', matrix.flavor) || '' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -175,11 +189,7 @@ jobs:
             exit 1
           fi
 
-      # All matrix jobs race to create the release; the loser's create
-      # fails ("already exists") and falls through to the upload.
       - name: Upload to GitHub release
         run: |
-          gh release create "$GITHUB_REF_NAME" \
-            --verify-tag --title "$GITHUB_REF_NAME" --generate-notes || true
           gh release upload "$GITHUB_REF_NAME" \
             "vagus_${{ matrix.target }}${{ matrix.flavor == 'agent-dev-board' && '-agent' || '' }}.fw" --clobber
