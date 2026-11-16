@@ -186,7 +186,8 @@ defmodule Vagus.Addon.Info do
       # surface understating what the add-on asked for.
       "devices" => config.devices,
       "system_managed" => false,
-      "system_managed_config_entry" => nil
+      "system_managed_config_entry" => nil,
+      "log_format" => config.log_format
     }
   end
 
