@@ -303,9 +303,11 @@ is not queued for an absent client. Unlike Mosquitto:
 - Sessions never reach disk: they end when the broker app or the board
   restarts.
 - A session lasts at most 86 400 s after its connection (a v5 client asking
-  for more is told so). The broker keeps at most 1 000 sessions, connected or
+  for more is told so). The broker keeps about 1 000 sessions, connected or
   not; a CONNECT that needs another is refused with reason code 0x97 (MQTT 5.0)
-  or return code 5 (3.1.1).
+  or return code 5 (3.1.1). It bounds memory rather than being an exact quota:
+  CONNECTs arriving at the same moment can each pass the check before any of
+  their sessions is stored.
 - Each session queues at most 1 000 messages; past that each further message
   is dropped with one warning in the system log (not the broker's log buffer).
   A connected session that outlives its connection is served through the same

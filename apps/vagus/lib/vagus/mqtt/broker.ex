@@ -45,9 +45,12 @@ defmodule Vagus.Mqtt.Broker do
   @default_max_connections 200
 
   # Bounds on what clients that went away can make the broker keep: a session
-  # lives at most a day after its connection, the listener keeps at most this
-  # many, and each queues at most this many QoS 1/2 messages (the newest past
-  # it are dropped). The queue default matches Mosquitto's max_queued_messages.
+  # lives at most a day after its connection, the listener keeps about this
+  # many (a memory bound, not an exact quota: CONNECTs admitted at the same
+  # moment can each pass mqttx's check before any of their sessions is
+  # stored), and each queues at most this many QoS 1/2 messages (the newest
+  # past it are dropped). The queue default matches Mosquitto's
+  # max_queued_messages.
   @max_session_expiry_s 86_400
   @default_max_sessions 1_000
   @default_max_queued 1_000
@@ -66,8 +69,11 @@ defmodule Vagus.Mqtt.Broker do
       table, and with `:provider` the published service login, are injected.
     * `:max_connections` — new connections/second before excess CONNECTs are
       rate-limited (default `#{@default_max_connections}`)
-    * `:max_sessions` — sessions the listener keeps, connected or not, before a
-      CONNECT that needs a new one is refused (default `#{@default_max_sessions}`)
+    * `:max_sessions` — about how many sessions the listener keeps, connected
+      or not, before a CONNECT that needs a new one is refused; simultaneous
+      CONNECTs can overshoot it (default `#{@default_max_sessions}`)
+    * `:max_idle_timeout` — ms without inbound data before mqttx closes a
+      connection regardless of its keep-alive (default `:infinity`: off)
     * `:max_queued` — QoS 1/2 messages queued per session
       (default `#{@default_max_queued}`)
   """
@@ -91,6 +97,7 @@ defmodule Vagus.Mqtt.Broker do
     max_connections = Keyword.get(opts, :max_connections, @default_max_connections)
     max_sessions = Keyword.get(opts, :max_sessions, @default_max_sessions)
     max_queued = Keyword.get(opts, :max_queued, @default_max_queued)
+    max_idle_timeout = Keyword.get(opts, :max_idle_timeout, :infinity)
 
     provider = provider_opts(Keyword.get(opts, :provider))
 
@@ -125,6 +132,12 @@ defmodule Vagus.Mqtt.Broker do
                    max_session_expiry_interval: @max_session_expiry_s,
                    max_sessions: max_sessions,
                    max_outbound_queue: max_queued,
+                   # Keep-alive is the only liveness rule, as before: mqttx's
+                   # 15-minute idle ceiling would cut a quiet client with a
+                   # keep-alive of 0 or over 900 s and publish its Will. A
+                   # keep-alive-0 client on a dead TCP link lingers, as it
+                   # always did.
+                   max_idle_timeout: max_idle_timeout,
                    # Home Assistant subscribes to each entity's topics one by
                    # one, a few per device; this leaves a large install ample
                    # room while one client cannot grow the index without

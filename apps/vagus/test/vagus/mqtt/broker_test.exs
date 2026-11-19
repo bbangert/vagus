@@ -255,6 +255,15 @@ defmodule Vagus.Mqtt.BrokerTest do
     end
   end
 
+  # mqttx's 15-minute default would cut a quiet client whose keep-alive is 0
+  # or longer; the shortened ceiling in broker_wire_test.exs shows the cut.
+  test "the listener has no idle ceiling, only keep-alive" do
+    {:ok, {_flags, children}} = Broker.init([])
+    listener = Enum.find(children, &match?(%{id: :listener}, &1))
+    {MqttX.Server, :start_link, [_handler, handler_opts, _transport]} = listener.start
+    assert handler_opts[:transport_opts].max_idle_timeout == :infinity
+  end
+
   defp listener_options(opts) do
     {:ok, {_flags, children}} = Broker.init(opts)
     listener = Enum.find(children, &match?(%{id: :listener}, &1))

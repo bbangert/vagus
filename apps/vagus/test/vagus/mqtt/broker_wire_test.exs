@@ -244,6 +244,14 @@ defmodule Vagus.Mqtt.Broker.WireTest do
     end
   end
 
+  # The ceiling itself, shortened, so the test that the broker turns it off
+  # rests on a mechanism shown to cut a keep-alive-0 client.
+  test "an idle ceiling, when set, closes a quiet keep-alive-0 client" do
+    ctx = start_broker(max_idle_timeout: 200)
+    {sock, _} = connect(ctx.port, 4, keep_alive: 0)
+    assert recv(sock, 4, @wait) == :closed
+  end
+
   # Clean Start 0 sessions: mqttx keeps them, routes to them and queues for
   # them, so session_present 1 always comes with the subscriptions and the
   # messages the client missed.
@@ -633,7 +641,7 @@ defmodule Vagus.Mqtt.Broker.WireTest do
       protocol_version: version,
       client_id: Keyword.get(opts, :client_id, "raw-#{System.unique_integer([:positive])}"),
       clean_session: Keyword.get(opts, :clean_session, true),
-      keep_alive: 60,
+      keep_alive: Keyword.get(opts, :keep_alive, 60),
       username: Keyword.get(opts, :username),
       password: Keyword.get(opts, :password),
       properties: Keyword.get(opts, :properties, %{})
