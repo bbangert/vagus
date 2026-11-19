@@ -114,7 +114,6 @@ defmodule Vagus.Mqtt.Broker.AuthTest do
       start_supervised!(
         {Broker,
          name: unique(:broker),
-         subscriptions_name: unique(:subs),
          port: port,
          ip: {127, 0, 0, 1},
          auth: [
@@ -129,70 +128,50 @@ defmodule Vagus.Mqtt.Broker.AuthTest do
     end
 
     test "a valid HA user connects (exit-0 analog)", %{port: port} do
-      assert connected_within?(client(port, "alice", "s3cret"))
+      assert {:ok, client} = connect(port, "alice", "s3cret")
+      assert MqttX.Client.connected?(client)
     end
 
     test "an accepted service user connects", %{port: port} do
-      assert connected_within?(client(port, "svcuser", "svcpass"))
+      assert {:ok, client} = connect(port, "svcuser", "svcpass")
+      assert MqttX.Client.connected?(client)
     end
 
     @tag :capture_log
     test "a wrong password is rejected — never connects (exit-5 analog)", %{port: port} do
-      refute connected_within?(client(port, "alice", "wrong"), 12)
+      assert {:error, {:connack_error, 0x05, _}} = connect(port, "alice", "wrong")
     end
 
     @tag :capture_log
     test "an unknown user is rejected", %{port: port} do
-      refute connected_within?(client(port, "mallory", "letmein"), 12)
+      assert {:error, {:connack_error, 0x05, _}} = connect(port, "mallory", "letmein")
     end
 
+    # The client reports the code its CONNACK carried: 5 is the byte the
+    # mosquitto_pub exit-5 gate checks; a v5 CONNACK has no 0x05 and says 0x87.
     @tag :capture_log
-    test "a rejected CONNECT gets CONNACK reason code 0x05 (not authorised)", %{port: port} do
-      handler_id = "connack-#{System.unique_integer([:positive])}"
-      test_pid = self()
-
-      :telemetry.attach(
-        handler_id,
-        [:mqttx, :server, :client_connect, :exception],
-        fn _event, _measure, meta, _cfg ->
-          send(test_pid, {:connack_reject, meta[:reason_code]})
-        end,
-        nil
-      )
-
-      on_exit(fn -> :telemetry.detach(handler_id) end)
-
-      client(port, "alice", "wrong")
-      # The server emits the connect-exception with the reason code it put in the
-      # CONNACK — assert it's 0x05, the byte the P6 mosquitto_pub exit-5 gate checks.
-      assert_receive {:connack_reject, 0x05}, 1_000
+    test "a rejected CONNECT is Not authorized on the wire for both versions",
+         %{port: port} do
+      assert {:error, {:connack_error, 0x05, _}} = connect(port, "alice", "wrong", 4)
+      assert {:error, {:connack_error, 0x87, _}} = connect(port, "alice", "wrong", 5)
     end
   end
 
   # ---------- helpers ----------
 
-  defp client(port, username, password) do
-    {:ok, client} =
-      MqttX.Client.connect(
-        host: "127.0.0.1",
-        port: port,
-        client_id: "c-#{System.unique_integer([:positive])}",
-        protocol_version: 4,
-        clean_session: true,
-        retry_interval: 200,
-        username: username,
-        password: password
-      )
-
-    client
-  end
-
-  defp connected_within?(client, tries \\ 40) do
-    cond do
-      MqttX.Client.connected?(client) -> true
-      tries == 0 -> false
-      true -> Process.sleep(25) && connected_within?(client, tries - 1)
-    end
+  # `await_connect: true` returns the CONNACK's verdict; a rejected client
+  # stops itself instead of retrying.
+  defp connect(port, username, password, version \\ 4) do
+    MqttX.Client.connect(
+      host: "127.0.0.1",
+      port: port,
+      client_id: "c-#{System.unique_integer([:positive])}",
+      protocol_version: version,
+      clean_session: true,
+      await_connect: true,
+      username: username,
+      password: password
+    )
   end
 
   defp free_port do

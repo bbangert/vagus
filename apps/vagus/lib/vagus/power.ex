@@ -41,7 +41,7 @@ defmodule Vagus.Power do
              | :timeout
              | :crashed
              | :unsupported_qos
-             | {:connect, reason()}
+             | {:connect, :rejected | reason()}
              | {:publish, reason()}}
   def mqtt(topic, payload, opts \\ []) do
     if Keyword.get(opts, :qos, 1) in [0, 1] do
@@ -109,11 +109,15 @@ defmodule Vagus.Power do
 
     case guard(fn -> MqttX.Client.connect(connect_opts) end) do
       {:ok, client} ->
-        # connect/1 returns before the TCP connect and retries a refused or
-        # rejected attempt forever, so the CONNACK event is the only signal.
+        # connect/1 returns before the TCP connect and retries a refused
+        # attempt forever, so the CONNACK event is the only success signal; a
+        # CONNACK refusal stops the client normally instead.
         receive do
           {^ref, :connected} ->
             {:ok, client}
+
+          {:EXIT, ^client, :normal} ->
+            {:error, {:connect, :rejected}}
 
           {:EXIT, ^client, _reason} ->
             {:error, {:connect, :crashed}}

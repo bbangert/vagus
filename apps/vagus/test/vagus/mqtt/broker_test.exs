@@ -26,11 +26,7 @@ defmodule Vagus.Mqtt.BrokerTest do
         # These exercise routing, not auth; opt into anonymous connects so the
         # credential-less test clients are accepted (auth is covered in
         # broker_auth_test.exs).
-        name: unique(:broker),
-        subscriptions_name: unique(:subs),
-        port: port,
-        ip: {127, 0, 0, 1},
-        auth: [allow_anonymous: true]
+        name: unique(:broker), port: port, ip: {127, 0, 0, 1}, auth: [allow_anonymous: true]
       })
 
     %{broker: broker, port: port}
@@ -41,8 +37,7 @@ defmodule Vagus.Mqtt.BrokerTest do
     sub = connect_client!(port, "sub")
     pub = connect_client!(port, "pub")
 
-    # Wildcard filter proves mqttx's trie router is actually wired into our
-    # fan-out (the framework never wires it itself).
+    # A wildcard filter, so delivery goes through the subscription index.
     {:ok, _granted} = MqttX.Client.subscribe(sub, "home/+/temp", qos: 1)
 
     :ok = MqttX.Client.publish(pub, "home/kitchen/temp", "21.5", qos: 0)
@@ -129,8 +124,8 @@ defmodule Vagus.Mqtt.BrokerTest do
 
     :ok = MqttX.Client.disconnect(sub)
 
-    # After the subscriber's connection process exits, its subscription is gone
-    # (Subscriptions monitors the connection pid) — the publish reaches no one.
+    # A clean-session subscriber's session, subscriptions included, ends with
+    # its connection — the publish reaches no one.
     :ok = MqttX.Client.publish(pub, "reap/me", "after", qos: 0)
     refute_receive {:mqtt_message, ["reap", "me"], "after"}, 750
   end
@@ -167,7 +162,6 @@ defmodule Vagus.Mqtt.BrokerTest do
         client_id: "#{tag}-#{System.unique_integer([:positive])}",
         protocol_version: version,
         clean_session: true,
-        retry_interval: 100,
         handler: Collector,
         handler_state: %{pid: owner || self()}
       )
@@ -259,6 +253,15 @@ defmodule Vagus.Mqtt.BrokerTest do
       assert listener_options([])[:ip] == {127, 0, 0, 1}
       assert listener_options(ip: {0, 0, 0, 0})[:ip] == {0, 0, 0, 0}
     end
+  end
+
+  # mqttx's 15-minute default would cut a quiet client whose keep-alive is 0
+  # or longer; the shortened ceiling in broker_wire_test.exs shows the cut.
+  test "the listener has no idle ceiling, only keep-alive" do
+    {:ok, {_flags, children}} = Broker.init([])
+    listener = Enum.find(children, &match?(%{id: :listener}, &1))
+    {MqttX.Server, :start_link, [_handler, handler_opts, _transport]} = listener.start
+    assert handler_opts[:transport_opts].max_idle_timeout == :infinity
   end
 
   defp listener_options(opts) do

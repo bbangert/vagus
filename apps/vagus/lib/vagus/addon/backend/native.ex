@@ -181,16 +181,41 @@ defmodule Vagus.Addon.Backend.Native do
   defp broker_port, do: Application.get_env(:vagus, :mqtt_broker_port, 1883)
 
   # Sum `:memory` across the subtree's root and every process below it
-  # (for the broker: Subscriptions, AuthCache, the ThousandIsland listener
-  # tree + its live connections, the log buffer). Only recurses into
-  # supervisors, since `which_children` on a worker is a call it does not
-  # answer and crashes on; the panel's root is its worker.
+  # (for the broker: AuthCache, the ThousandIsland listener
+  # tree + its live connections, the log buffer), plus the ETS tables those
+  # processes own: the broker's sessions, queues and retained messages live in
+  # tables its supervisor owns, which no process's `:memory` includes. Only
+  # recurses into supervisors, since `which_children` on a worker is a call it
+  # does not answer and crashes on; the panel's root is its worker.
   defp subtree_memory(id, root) do
-    if(id == "addon_vagus", do: [root], else: [root | descendants(root)])
-    |> Enum.reduce(0, fn pid, acc ->
-      case Process.info(pid, :memory) do
-        {:memory, bytes} -> acc + bytes
-        nil -> acc
+    pids = if(id == "addon_vagus", do: [root], else: [root | descendants(root)])
+
+    process =
+      Enum.reduce(pids, 0, fn pid, acc ->
+        case Process.info(pid, :memory) do
+          {:memory, bytes} -> acc + bytes
+          nil -> acc
+        end
+      end)
+
+    process + owned_table_bytes(pids)
+  end
+
+  @doc false
+  # Binaries over 64 bytes are stored outside the table, so large payloads
+  # are not counted here, as they are not in a process's `:memory`.
+  @spec owned_table_bytes([pid()]) :: non_neg_integer()
+  def owned_table_bytes(pids) do
+    owners = MapSet.new(pids)
+    word = :erlang.system_info(:wordsize)
+
+    Enum.reduce(:ets.all(), 0, fn table, acc ->
+      with owner when is_pid(owner) <- :ets.info(table, :owner),
+           true <- MapSet.member?(owners, owner),
+           words when is_integer(words) <- :ets.info(table, :memory) do
+        acc + words * word
+      else
+        _ -> acc
       end
     end)
   end

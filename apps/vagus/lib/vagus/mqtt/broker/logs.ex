@@ -15,7 +15,8 @@ defmodule Vagus.Mqtt.Broker.Logs do
     [:mqttx, :server, :client_connect, :start],
     [:mqttx, :server, :client_disconnect],
     [:mqttx, :server, :subscribe],
-    [:mqttx, :server, :publish]
+    [:mqttx, :server, :publish],
+    [:vagus, :mqtt, :session_expired]
   ]
 
   @spec child_spec(keyword()) :: Supervisor.child_spec()
@@ -41,6 +42,9 @@ defmodule Vagus.Mqtt.Broker.Logs do
     "PUBLISH #{cid(meta)} #{topic(meta)} " <>
       "(#{Map.get(measure, :payload_size, 0)} bytes, qos #{Map.get(meta, :qos, 0)})"
   end
+
+  def format([:vagus, :mqtt, :session_expired], _measure, meta),
+    do: "SESSION EXPIRED #{cid(meta)}"
 
   def format(_event, _measure, _meta), do: nil
 
