@@ -145,7 +145,7 @@ defmodule Vagus.Network.LabTest do
     _ = receive_all()
 
     task = Task.async(fn -> Lab.down("eth1", s) end)
-    assert_receive {:deconfiguring, pid}
+    assert_receive {:deconfiguring, pid}, 2_000
     assert %{"eth1" => %{state: :broken}} = :persistent_term.get(ctx.state_key)
 
     send(pid, :go)
@@ -406,7 +406,7 @@ defmodule Vagus.Network.LabTest do
       )
 
     task = Task.async(fn -> Lab.up("eth1", "10.42.0.1/24", s) end)
-    assert_receive {:configuring, pid}
+    assert_receive {:configuring, pid}, 2_000
     assert %{"eth1" => %{state: :pending}} = :persistent_term.get(ctx.state_key)
 
     send(pid, :go)
