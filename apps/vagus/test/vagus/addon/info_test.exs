@@ -218,6 +218,22 @@ defmodule Vagus.Addon.InfoTest do
       assert info["advanced"] == true
       assert info["url"] == "https://beta.esphome.io/"
     end
+
+    test "log_format comes from the installed config", %{config: c} do
+      assert Info.render(c, :started, %{})["log_format"] == "plain"
+
+      {:ok, verbose} =
+        Config.parse(%{
+          "name" => "n",
+          "version" => "1",
+          "slug" => "verbose_app",
+          "description" => "d",
+          "arch" => ["aarch64"],
+          "log_format" => "verbose"
+        })
+
+      assert Info.render(verbose, :started, %{})["log_format"] == "verbose"
+    end
   end
 
   describe "ingress rendering (§B3.4) + watchdog (§B8)" do

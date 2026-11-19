@@ -1,6 +1,6 @@
 {
-  "_core_version": "2026.11.0",
-  "_source": "homeassistant/components/hassio/**/*.py at tag 2026.11.0",
+  "_core_version": "2026.11.1",
+  "_source": "homeassistant/components/hassio/**/*.py at tag 2026.11.1",
   "urls": [
     "/api/hassio/{path:.+}",
     "/api/hassio_auth",

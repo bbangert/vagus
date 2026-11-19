@@ -32,6 +32,7 @@ defmodule Vagus.Addon.ConfigTest do
       assert c.dsp == false
       assert c.devicetree == false
       assert c.backup == "hot"
+      assert c.log_format == "plain"
       assert c.timeout == 10
       assert c.image == nil
       assert c.ports == %{}
@@ -73,6 +74,18 @@ defmodule Vagus.Addon.ConfigTest do
     test "bad enum (startup) rejected" do
       assert {:error, msg} = Config.parse(Map.put(@required, "startup", "whenever"))
       assert msg =~ "startup"
+    end
+
+    test "log_format accepts each upstream value" do
+      for fmt <- ~w(plain timestamp verbose) do
+        assert {:ok, c} = Config.parse(Map.put(@required, "log_format", fmt))
+        assert c.log_format == fmt
+      end
+    end
+
+    test "bad log_format rejected" do
+      assert {:error, msg} = Config.parse(Map.put(@required, "log_format", "json"))
+      assert msg =~ "log_format"
     end
 
     test "wrong-typed field rejected (init not bool)" do
@@ -513,11 +526,13 @@ defmodule Vagus.Addon.ConfigTest do
         "backup_post" => "post.sh",
         "backup_exclude" => ["**/*.log"],
         "timeout" => 30,
+        "log_format" => "verbose",
         "homeassistant" => "2026.7.0",
         "machine" => ["raspberrypi3-64", "!qemux86"]
       }
 
       assert {:ok, c} = Config.parse(raw)
+      assert c.log_format == "verbose"
       assert Config.parse(Config.to_persistable(c)) == {:ok, c}
     end
 

@@ -76,6 +76,7 @@ defmodule Vagus.Addon.Config do
   @roles ~w(default homeassistant backup manager admin)
   @backup_modes ~w(hot cold)
   @stages ~w(stable experimental deprecated)
+  @log_formats ~w(plain timestamp verbose)
   # Mirrors upstream's `Capabilities` enum (supervisor/docker/const.py), matched by exact value.
   @capabilities ~w(AUDIT_WRITE BPF CHECKPOINT_RESTORE DAC_READ_SEARCH IPC_LOCK
                    MKNOD NET_ADMIN NET_RAW PERFMON SETFCAP SYS_ADMIN SYS_MODULE
@@ -190,6 +191,7 @@ defmodule Vagus.Addon.Config do
             stage: "stable",
             advanced: false,
             url: nil,
+            log_format: "plain",
             # Availability (G1): a nilable Core-version floor and a machine
             # whitelist, both parsed but otherwise uninterpreted here — see
             # `Vagus.Addon.Availability`.
@@ -339,6 +341,7 @@ defmodule Vagus.Addon.Config do
       "backup_exclude" => c.backup_exclude,
       "timeout" => c.timeout,
       "stage" => c.stage,
+      "log_format" => c.log_format,
       "advanced" => c.advanced,
       "url" => c.url,
       "homeassistant" => c.homeassistant,
@@ -402,6 +405,7 @@ defmodule Vagus.Addon.Config do
     |> put(:backup_exclude, str_list(raw, "backup_exclude"))
     |> put(:timeout, int(raw, "timeout", 10))
     |> put(:stage, enum(raw, "stage", @stages, "stable"))
+    |> put(:log_format, enum(raw, "log_format", @log_formats, "plain"))
     |> put(:advanced, boolean(raw, "advanced", false))
     |> put(:url, opt_str(raw, "url"))
     |> put(:homeassistant, opt_str(raw, "homeassistant"))
