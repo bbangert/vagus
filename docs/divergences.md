@@ -321,6 +321,11 @@ is not queued for an absent client. Unlike Mosquitto:
   connect with another client's id and take its session, queued messages
   included. Every CONNECT is authenticated before its session is resumed; the
   broker has no per-topic rights.
+- On resume, mqttx re-sends every unacknowledged QoS 1/2 delivery at once,
+  ignoring a Receive Maximum the v5 client lowered since; a client that then
+  disconnects with 0x93 gets the same replay each time it resumes, until it
+  acknowledges them, connects with Clean Start 1, or the session expires.
+  Queued messages wait for the client's Receive Maximum as they should.
 - A clean-session subscriber that stops reading is sent to directly, so its
   connection's mailbox grows without bound, as it did before sessions.
 
