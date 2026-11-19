@@ -219,6 +219,47 @@ defmodule Vagus.Addon.Backend.NativeTest do
       assert Native.stats(@id) == Vagus.Runtime.Stats.zero()
     end
 
+    # Retained messages live in a table the broker supervisor owns; the figure
+    # must count it, not only process memory.
+    test "stats count the tables the broker owns", %{port: port} do
+      # The provider publishes the service from its handle_continue, which runs
+      # before it answers any call.
+      _ = :sys.get_state(Module.concat(Native.broker_name(@id), "Provider"))
+      {:ok, @slug, %{"password" => pass}} = Vagus.App.service("mqtt")
+      {:ok, sock} = :gen_tcp.connect({127, 0, 0, 1}, port, [:binary, active: false])
+
+      send_raw(sock, %{
+        type: :connect,
+        protocol_version: 4,
+        client_id: "fill",
+        clean_session: true,
+        keep_alive: 60,
+        username: "addons",
+        password: pass
+      })
+
+      {:ok, <<0x20, 2, 0, 0>>} = :gen_tcp.recv(sock, 4, 5_000)
+
+      for i <- 1..20_000 do
+        send_raw(sock, %{type: :publish, topic: "fill/#{i}", payload: "v", qos: 0, retain: true})
+      end
+
+      # Handled in order, so its PUBACK means every retained write is done.
+      send_raw(sock, %{
+        type: :publish,
+        topic: "fill/last",
+        payload: "v",
+        qos: 1,
+        packet_id: 1,
+        retain: true
+      })
+
+      {:ok, <<0x40, 2, 0, 1>>} = :gen_tcp.recv(sock, 4, 5_000)
+
+      tables = Native.owned_table_bytes([Process.whereis(Native.broker_name(@id))])
+      assert Native.stats(@id).memory_usage >= tables
+    end
+
     test "liveness follows the broker subtree" do
       assert Native.running?(@id)
       assert :ok = App.stop(@slug)
@@ -462,6 +503,11 @@ defmodule Vagus.Addon.Backend.NativeTest do
       tries == 0 -> false
       true -> Process.sleep(25) && connected_within?(client, tries - 1)
     end
+  end
+
+  defp send_raw(sock, packet) do
+    {:ok, data} = MqttX.Packet.Codec.encode(4, packet)
+    :ok = :gen_tcp.send(sock, data)
   end
 
   defp restore_env(key, nil), do: Application.delete_env(:vagus, key)
