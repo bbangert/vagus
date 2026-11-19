@@ -293,6 +293,38 @@ has no in-process app. The broker is what every other app's MQTT leans on,
 and nothing outside the BEAM restarts it, so an `auto` native app is retried
 5 s after a crash, then every 30 s, indefinitely.
 
+**The native broker keeps sessions in memory, for a day at most.** Like the
+Mosquitto app, a Clean Start 0 client (or a 3.1.1 CleanSession 0 one, such as
+Home Assistant on 3.1.1 after its first connect) gets its session back with
+`session_present: 1`: its subscriptions, its unacknowledged QoS 1/2 deliveries
+(re-sent with DUP) and the QoS 1/2 messages published while it was away. QoS 0
+is not queued for an absent client. Unlike Mosquitto:
+
+- Sessions never reach disk: they end when the broker app or the board
+  restarts.
+- A session lasts at most 86 400 s after its connection (a v5 client asking
+  for more is told so). The broker keeps at most 1 000 sessions, connected or
+  not; a CONNECT that needs another is refused with reason code 0x97 (MQTT 5.0)
+  or return code 5 (3.1.1).
+- Each session queues at most 1 000 messages; past that each further message
+  is dropped with one warning in the system log (not the broker's log buffer).
+  A connected session that outlives its connection is served through the same
+  queue, so QoS 0 messages queue for it too.
+- A restart of the broker's listener (after a crash) ends every connection
+  without closing its session, Clean Start 1 ones included. Those sessions
+  never expire, keep queuing QoS 1/2 messages and each hold one of the 1 000
+  slots until a client with the same client id connects again (Clean Start 1
+  then discards it) or the broker app restarts.
+- A session belongs to its client id alone: any login that authenticates can
+  connect with another client's id and take its session, queued messages
+  included. Every CONNECT is authenticated before its session is resumed; the
+  broker has no per-topic rights.
+- A clean-session subscriber that stops reading is sent to directly, so its
+  connection's mailbox grows without bound, as it did before sessions.
+
+Home Assistant over MQTT 5.0 connects with Clean Start 1, so its session never
+outlives a connection.
+
 **The app's API token is never persisted, so a restarted app process
 replaces its running container.** Upstream keeps `access_token` in the app's
 persisted data (`self.persist[ATTR_ACCESS_TOKEN]` in `supervisor/apps/app.py`)

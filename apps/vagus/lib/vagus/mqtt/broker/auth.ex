@@ -19,9 +19,9 @@ defmodule Vagus.Mqtt.Broker.Auth do
        add-on's own options (empty until the options schema lands).
 
   Anonymous connects (no username) are rejected unless `allow_anonymous` is set.
-  A miss returns `:error`, which the handler maps to CONNACK reason code `0x05`
-  ("not authorised", MQTT 3.1.1 §3.2.2.3) — matching Mosquitto's `mosquitto_pub`
-  exit-5 behaviour the conformance gate checks.
+  A miss returns `:error`, which the handler answers with CONNACK "Not
+  authorized": reason code `0x87` to an MQTT 5.0 client, return code `0x05` to
+  a 3.1.1 one — Mosquitto's `mosquitto_pub` exit-5 case.
 
   Local credential comparisons (service creds, options logins) use
   `Plug.Crypto.secure_compare/2` to avoid a timing oracle; the HA-user path's

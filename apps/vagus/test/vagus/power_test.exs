@@ -76,6 +76,14 @@ defmodule Vagus.PowerTest do
       assert_receive {:mqtt_message, ["stat", "plug1", "Power"], "OFF", %{retain: true}},
                      2_000
     end
+
+    @tag :capture_log
+    test "a CONNACK refusal is :rejected, not a timeout", %{port: port} do
+      creds = %{"port" => port, "username" => "addons", "password" => "wrong"}
+
+      assert {:error, {:connect, :rejected}} =
+               Vagus.Power.mqtt("t", "p", service: fn -> {:ok, "x", creds} end, timeout_ms: 2_000)
+    end
   end
 
   test "no broker service" do

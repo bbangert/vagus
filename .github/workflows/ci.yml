@@ -208,7 +208,7 @@ jobs:
 
       # The Dialyzer PLT lives under _build, so a warm _build cache also skips
       # the (slow) first-run PLT build. vendor/** is in the key because
-      # vendored path deps (mqttx, fresh) aren't in mix.lock but must
+      # the vendored path dep (fresh) isn't in mix.lock but must
       # invalidate the PLT like any other dep change. The mix.exs files are in
       # the key too: plt_add_apps lives in apps/vagus/mix.exs, and a
       # PLT-affecting edit there must bust the cache so the drop-guard below

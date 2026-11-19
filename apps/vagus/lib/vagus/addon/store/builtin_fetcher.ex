@@ -22,8 +22,7 @@ defmodule Vagus.Addon.Store.BuiltinFetcher do
       "name" => "MQTT Broker (native)",
       "version" => "1.0.0",
       "slug" => "mqtt",
-      "description" =>
-        "In-process MQTT 3.1.1 broker (mqttx) — a native virtual add-on, no container.",
+      "description" => "In-process MQTT 5.0 / 3.1.1 broker (mqttx) — a native app, no container.",
       "arch" => ["amd64", "aarch64", "armv7", "armhf", "i386"],
       "backend" => "native",
       "image" => "local/core_mqtt",

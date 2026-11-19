@@ -248,8 +248,7 @@ defmodule Vagus.Addon.Backend.NativeTest do
           host: "127.0.0.1",
           port: port,
           client_id: "logs-probe",
-          protocol_version: 4,
-          retry_interval: 500
+          protocol_version: 4
         )
 
       lines = eventually(fn -> Native.logs(@id) end, &(&1 != []))
@@ -450,8 +449,7 @@ defmodule Vagus.Addon.Backend.NativeTest do
           client_id: "c-#{System.unique_integer([:positive])}",
           protocol_version: 4,
           username: user,
-          password: pass,
-          retry_interval: 300
+          password: pass
         ] ++ extra
       )
 

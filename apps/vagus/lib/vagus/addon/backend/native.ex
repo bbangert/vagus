@@ -181,7 +181,7 @@ defmodule Vagus.Addon.Backend.Native do
   defp broker_port, do: Application.get_env(:vagus, :mqtt_broker_port, 1883)
 
   # Sum `:memory` across the subtree's root and every process below it
-  # (for the broker: Subscriptions, AuthCache, the ThousandIsland listener
+  # (for the broker: AuthCache, the ThousandIsland listener
   # tree + its live connections, the log buffer). Only recurses into
   # supervisors, since `which_children` on a worker is a call it does not
   # answer and crashes on; the panel's root is its worker.

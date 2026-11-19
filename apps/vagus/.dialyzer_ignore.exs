@@ -75,12 +75,4 @@
   # Confirmed with `:dialyzer.plt_info/1`: 0 mix beams, 43 ssh beams.
   {"lib/mix/tasks/vagus.probe.diff.ex", :callback_info_missing},
   {"lib/mix/tasks/vagus.probe.diff.ex", :unknown_function}
-
-  # ── (removed) Root 4: mqttx type/callback info gaps ─────────────────────
-  # The three mqttx-related filters (handler.ex :callback_info_missing,
-  # subscriptions.ex :unknown_type/:unknown_function) became UNUSED once the
-  # bluetooth work (vagus-bluetooth) added the bluez/typedstruct deps and the
-  # PLT was rebuilt fresh — `list_unused_filters: true` then fails the build
-  # on the stale entries, exactly as designed. Re-baseline here if a future
-  # dep change resurfaces them.
 ]

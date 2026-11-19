@@ -212,7 +212,8 @@ worker. `:ok` means the message was sent, not acknowledged. Do not use
 `retain: true` for plug commands: a retained `ON` fires again whenever the
 plug reconnects. Tasmota takes `cmnd/<device>/Power` with `ON` or `OFF`; Shelly Gen1
 takes `shellies/<id>/relay/0/command` with `on` or `off`. It returns
-`{:error, :no_broker}` when the broker app is not running. Two recipes live in
+`{:error, :no_broker}` when the broker app is not running and
+`{:error, {:connect, :rejected}}` when it refuses the login. Two recipes live in
 a worker instead:
 
 - `uhubctl -l <hub> -p <port> -a off|on` for hubs with per-port power
