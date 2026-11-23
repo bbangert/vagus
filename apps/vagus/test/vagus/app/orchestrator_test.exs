@@ -75,6 +75,18 @@ defmodule Vagus.App.OrchestratorTest do
     end
   end
 
+  # A stage starts its units as concurrent tasks, so the `:boot_start`s of
+  # one stage arrive in no fixed order; sort each run of them so the
+  # assertion pins the stage order, not the scheduler's.
+  defp sort_start_runs(messages) do
+    messages
+    |> Enum.chunk_by(&match?({:boot_start, _}, &1))
+    |> Enum.flat_map(fn
+      [{:boot_start, _} | _] = run -> Enum.sort(run)
+      other -> other
+    end)
+  end
+
   # The boot task's reply reaches the orchestrator before the task exits, so
   # once the task is down the orchestrator has seen the end of the boot.
   defp await_boot(name) do
@@ -135,7 +147,7 @@ defmodule Vagus.App.OrchestratorTest do
 
     name = start_orchestrator(apps)
 
-    assert collect_until(:complete) == [
+    assert sort_start_runs(collect_until(:complete)) == [
              {:gate, :tree},
              {:boot_start, "broker"},
              {:report, :native, [{"broker", :ready}]},
@@ -146,8 +158,8 @@ defmodule Vagus.App.OrchestratorTest do
              {:report, :initialize, [{"init", :ready}]},
              {:boot_start, "sys"},
              {:report, :system, [{"sys", :ready}]},
-             {:boot_start, "svc"},
              {:boot_start, "broker"},
+             {:boot_start, "svc"},
              {:report, :services, [{"svc", :ready}, {"broker", :ready}]},
              :core_start,
              {:report, :core, [{"core", :ready}]},
