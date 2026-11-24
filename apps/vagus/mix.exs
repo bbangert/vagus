@@ -69,7 +69,7 @@ defmodule Vagus.MixProject do
       # WebSocket client to Core).
       {:plug, "~> 1.20"},
       {:bandit, "~> 1.13"},
-      {:finch, "~> 0.24.0"},
+      {:finch, "~> 0.25.0"},
       # Ingress reverse proxy (M4b): websock_adapter provides the
       # Plug-side WebSocket upgrade (`WebSockAdapter.upgrade/4`) for the
       # browser leg of the ingress WS bridge; mint_web_socket (previously
