@@ -28,19 +28,19 @@ defmodule Vagus.API.ListenerLogTest do
   @long String.duplicate(@marker, 2_000)
 
   @rejected [
-    garbage_request_line: {"#{@marker} #{@marker}\r\n\r\n", "HTTP/1.0 400"},
-    header_without_colon: {"GET /info HTTP/1.1\r\nhost: x\r\n#{@marker}\r\n\r\n", "HTTP/1.0 400"},
-    oversize_request_line: {"GET /#{@long} HTTP/1.1\r\nhost: x\r\n\r\n", "HTTP/1.0 414"},
-    oversize_header: {"GET /info HTTP/1.1\r\nhost: x\r\nx-big: #{@long}\r\n\r\n", "HTTP/1.0 431"},
+    garbage_request_line: {"#{@marker} #{@marker}\r\n\r\n", "HTTP/1.1 400"},
+    header_without_colon: {"GET /info HTTP/1.1\r\nhost: x\r\n#{@marker}\r\n\r\n", "HTTP/1.1 400"},
+    oversize_request_line: {"GET /#{@long} HTTP/1.1\r\nhost: x\r\n\r\n", "HTTP/1.1 414"},
+    oversize_header: {"GET /info HTTP/1.1\r\nhost: x\r\nx-big: #{@long}\r\n\r\n", "HTTP/1.1 431"},
     # Bandit rejects control bytes in a field value (400) before it counts
     # headers, so the repeated header carries a marker without the escape.
     too_many_headers:
       {"GET /info HTTP/1.1\r\nhost: x\r\n#{String.duplicate("x-h: zz-marker\r\n", 200)}\r\n",
-       "HTTP/1.0 431"},
-    unknown_http_version: {"GET /#{@marker} HTTP/9.9\r\nhost: x\r\n\r\n", "HTTP/1.0 400"},
-    no_host_header: {"GET /#{@marker} HTTP/1.1\r\n\r\n", "HTTP/1.0 400"},
+       "HTTP/1.1 431"},
+    unknown_http_version: {"GET /#{@marker} HTTP/9.9\r\nhost: x\r\n\r\n", "HTTP/1.1 400"},
+    no_host_header: {"GET /#{@marker} HTTP/1.1\r\n\r\n", "HTTP/1.1 400"},
     bad_content_length:
-      {"POST /info HTTP/1.1\r\nhost: x\r\ncontent-length: #{@marker}\r\n\r\n", "HTTP/1.0 400"},
+      {"POST /info HTTP/1.1\r\nhost: x\r\ncontent-length: #{@marker}\r\n\r\n", "HTTP/1.1 400"},
     bad_chunk_size:
       {"POST /supervisor/options HTTP/1.1\r\nhost: x\r\ncontent-type: application/json\r\n" <>
          "transfer-encoding: chunked\r\n\r\nZZ#{@marker}\r\n", "HTTP/1.1 400"}
