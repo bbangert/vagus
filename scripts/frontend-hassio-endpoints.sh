@@ -6,7 +6,7 @@
 # Both the fixture and .github/workflows/core-contract-drift.yml run THIS
 # script, so a regeneration can never disagree with the check that demanded it.
 #
-#   scripts/frontend-hassio-endpoints.sh 20261028.6
+#   scripts/frontend-hassio-endpoints.sh 20261028.8
 #
 # The tag Core pins is the `home-assistant-frontend==` requirement in
 # homeassistant/components/frontend/manifest.json.
