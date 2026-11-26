@@ -22,7 +22,7 @@ defmodule Vagus.Core.SupportedTest do
   describe "newer?/1" do
     test "orders HA's YYYY.M.P numerically, not as strings" do
       assert Supported.newer?("2026.12.0")
-      assert Supported.newer?("2026.11.3")
+      assert Supported.newer?("2026.11.4")
       assert Supported.newer?("2027.1.0")
       refute Supported.newer?(@ceiling)
       refute Supported.newer?("2026.10.3")

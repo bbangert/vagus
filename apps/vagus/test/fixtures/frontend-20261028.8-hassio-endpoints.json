@@ -1,6 +1,6 @@
 {
-  "_frontend": "20261028.6",
-  "_source": "home-assistant/frontend src/**/*.ts at tag 20261028.6",
+  "_frontend": "20261028.8",
+  "_source": "home-assistant/frontend src/**/*.ts at tag 20261028.8",
   "endpoints": [
     {
       "method": "UNKNOWN",
