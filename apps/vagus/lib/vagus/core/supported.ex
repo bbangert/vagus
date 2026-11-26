@@ -27,7 +27,7 @@ defmodule Vagus.Core.Supported do
 
   require Logger
 
-  @version "2026.11.1"
+  @version "2026.11.2"
 
   # HA tags are `YYYY.M.P` with an optional `bN`/`rcN`/`.devN` suffix, which
   # Version.parse/1 rejects. Pre-release ranks follow PEP 440: dev < b < rc.
