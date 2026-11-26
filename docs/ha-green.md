@@ -18,6 +18,9 @@ What Vagus does differently on this board:
   `green`. Core maps board `green` to its `homeassistant_green` integration,
   which calls `/os/boards/green` (the LED and board settings), and Vagus does
   not serve that.
+- The kernel's default cpufreq governor is `performance` and the PCF8563 is the
+  only RTC (the RK809's own RTC driver is not built), as Home Assistant OS
+  defines them for the Green.
 - RAM is about 3.58 GiB, so the runtime should take the `fast` profile, and the
   root disk is `mmcblk0`, so swap should be zram (both follow from the code and
   have not been checked on the board). Nothing here depends on an SD card; one,
@@ -28,7 +31,7 @@ What Vagus does differently on this board:
 Install is an SD-booted Vagus image plus one command on the board, and
 recovery needs no serial console. The stock first-stage loader stays untouched,
 and Vagus never writes the SPI NOR or eMMC LBA 64-16383. Follow the
-[install guide](https://github.com/bbangert/nerves_system_vagus/blob/v0.10.3/docs/ha-green-install.md)
+[install guide](https://github.com/bbangert/nerves_system_vagus/blob/v0.10.4/docs/ha-green-install.md)
 in the system repository, which covers installing, returning to Home Assistant
 OS and what is never written.
 
